@@ -4647,7 +4647,13 @@ fn run_one_tick(
             let pf_batch = true;
             let cap = b.min(slots.len());
             let backend = e.step_backend();
-            let mixed_pack = has_decode && !slo_on && e.mixed_pack_ready();
+            // PLOW_AMD_MIXED_RIDE_MAX: a rider row in a packed prefill launch costs about a
+            // millisecond (isl1024 c128: 4-prompt pack 235 ms alone, 332 ms with ~100 riders,
+            // against a 49 ms B=128 decode step), so many riders step separately instead.
+            let mixed_pack = has_decode
+                && !slo_on
+                && e.mixed_pack_ready()
+                && rt.amd.mixed_ride_max.is_none_or(|max| decode_rows <= max as usize);
             // PLOW_PF_HOLD: while enough rows decode, fresh prompts wait for a wide pack.
             let hold = amd_pf_hold(
                 rt.pf_hold().filter(|_| !slo_on),

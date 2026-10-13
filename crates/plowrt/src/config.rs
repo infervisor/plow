@@ -1703,6 +1703,11 @@ pub struct AmdRuntimeConfig {
     #[arg(long = "amd-pack-fill", env = "PLOW_AMD_PACK_FILL", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
     pub pack_fill: bool,
 
+    /// Decode rows ride a packed prefill launch (`PLOW_AMD_MIXED_PACK`) only while at most this
+    /// many rows decode; more step as a separate decode launch. Unset = no cap.
+    #[arg(long = "amd-mixed-ride-max", env = "PLOW_AMD_MIXED_RIDE_MAX", global = true)]
+    pub mixed_ride_max: Option<u32>,
+
     /// Per-segment all-rank barrier timing for prefill (diagnostic; disables segment-major).
     #[arg(long = "amd-prefill-seg-timing", env = "PLOW_PREFILL_SEG_TIMING", hide = true, default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
     pub prefill_seg_timing: bool,
