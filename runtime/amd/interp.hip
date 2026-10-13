@@ -1208,6 +1208,12 @@ extern "C" __device__ unsigned plow_glm_hc_pre_tail_arm = 1;
 #ifndef PLOW_GEMM_SMALL_SPLITK
 #define PLOW_GEMM_SMALL_SPLITK 0
 #endif
+#ifndef PLOW_DSA_KPOOL_MFMA
+#define PLOW_DSA_KPOOL_MFMA 1
+#endif
+#ifndef PLOW_DSA_QQUANT_WAVE
+#define PLOW_DSA_QQUANT_WAVE 1
+#endif
 #ifndef PLOW_GEMM_F32_DEC_TILE
 #define PLOW_GEMM_F32_DEC_TILE 1
 #endif
@@ -4297,24 +4303,139 @@ __device__ static void plow_exec(CInst in_v, unsigned slice, CTens T_v, plow_sme
                              in->i[2], in->i[3], slice, nblk);
             break;
         case PLOW_DOP_DSA_POOL_COMPRESS:
+            /* Packed prefill (i6 = 1): per span, the complete pools whose first token lies in
+             * the span (kv_row0 pool-aligned; a pool straddling an unaligned span start is not
+             * written) into the span slot's cache, i5 = pools per slot. */
+            if (in->i[6] == 1u) {
+                if (!plow_packed_prefill_enabled(prog_meta)) __builtin_trap();
+                const unsigned ps = in->i[1], hd = in->i[2];
+                for (unsigned si = 0; si < prog_meta->n_prefill_spans; si++) {
+                    const PlowPrefillSpan* sp = prog_meta->prefill_spans + si;
+                    const unsigned kv0 = sp->kv_row0, end = kv0 + sp->n_rows;
+                    const unsigned p0 = (kv0 + ps - 1u) / ps, p1 = end / ps;
+                    if (p1 <= p0) continue;
+                    const size_t r0 = sp->row0 + (p0 * ps - kv0);
+                    __syncthreads();
+                    d_dsa_pool_compress((uint8_t*)TEN(0) + (size_t)sp->slot * in->i[5] * hd,
+                                        (float*)TEN(1) + (size_t)sp->slot * in->i[5],
+                                        (const bf16*)TEN(2) + r0 * hd,
+                                        (const bf16*)TEN(3) + r0 * hd, (const float*)TEN(4),
+                                        p1 - p0, ps, hd, slice, nblk, (float*)sm->raw, sm->part,
+                                        nullptr, p0 * ps);
+                }
+                break;
+            }
+            /* Batched decode (i4 = rows > 1): row r is decode slot r — its ring, pos[r] and its
+             * slot's pool cache (i5 = pools per slot). Per row, the single-row decode call. */
+            /* i7 = 1 (PLOW_GLM_DSA_FUSE): the row's stash (t6 = cur_k, t7 = cur_score) runs
+             * here first, on the same workgroup, then the compress reads the ring back. */
+            if (in->i[4] > 1u || in->i[7] == 1u) {
+                const size_t ring = (size_t)in->i[1] * in->i[2];
+                const unsigned rows = in->i[4] > 1u ? in->i[4] : 1u;
+                for (unsigned r = slice; r < rows; r += nblk) {
+                    __syncthreads();
+                    if (in->i[7] == 1u) {
+                        d_dsa_pool_stash((bf16*)TEN(2) + r * ring, (bf16*)TEN(3) + r * ring,
+                                         (const bf16*)TEN(6), (const bf16*)TEN(7),
+                                         (const int*)TEN(5), in->i[1], in->i[2], r);
+                        __syncthreads();
+                        asm volatile("buffer_inv" ::: "memory");
+                        __syncthreads();
+                    }
+                    d_dsa_pool_compress((uint8_t*)TEN(0) + (size_t)r * in->i[5] * in->i[2],
+                                        (float*)TEN(1) + (size_t)r * in->i[5],
+                                        (const bf16*)TEN(2) + r * ring,
+                                        (const bf16*)TEN(3) + r * ring, (const float*)TEN(4), 1u,
+                                        in->i[1], in->i[2], 0u, 1u, (float*)sm->raw, sm->part,
+                                        (const int*)TEN(5) + r, 0u);
+                }
+                break;
+            }
             d_dsa_pool_compress((uint8_t*)TEN(0), (float*)TEN(1), (const bf16*)TEN(2),
                                 (const bf16*)TEN(3), (const float*)TEN(4), in->i[0], in->i[1],
                                 in->i[2], slice, nblk, (float*)sm->raw, sm->part,
                                 (const int*)TEN(5), in->i[3]);
             break;
         case PLOW_DOP_DSA_POOL_EXPAND:
+            /* Decode (i3 = 1): every row is its own sequence, length kv_len[row]. COMPACT: the
+             * min(pools, n_groups) selected pools (op 118's -1 pads trail) expand first, the tail
+             * follows them, -1 after — so the gather's first min(width, kv_len) slots hold every
+             * selected token and any -1 is masked there. */
+            if (in->i[3] == 1u) {
+                const unsigned ng = in->i[1], ps = in->i[2], cols = ng * ps + ps - 1u;
+                for (unsigned r = 0; r < in->i[0]; r++)
+                    dsa_pool_expand_row((int32_t*)TEN(0) + (size_t)r * cols,
+                                        (const int32_t*)TEN(1) + (size_t)r * ng,
+                                        ((const int*)TEN(2))[r], ng, ps,
+                                        slice * PLOW_THREADS + threadIdx.x, nblk * PLOW_THREADS);
+                break;
+            }
             d_dsa_pool_expand((int32_t*)TEN(0), (const int32_t*)TEN(1), (const int32_t*)TEN(2),
                               in->i[0], in->i[1], in->i[2], slice, nblk);
             break;
         case PLOW_DOP_DSA_POOL_STASH:
+            /* Packed prefill (i4 = 1): each span's trailing incomplete-pool rows into its slot's
+             * ring at pos % pool_size (the per-span twin of the baked tail-seed stashes). */
+            if (in->i[4] == 1u) {
+                if (!plow_packed_prefill_enabled(prog_meta)) __builtin_trap();
+                const unsigned ps = in->i[0], hd = in->i[1], d = threadIdx.x;
+                for (unsigned si = slice; si < prog_meta->n_prefill_spans; si += nblk) {
+                    const PlowPrefillSpan* sp = prog_meta->prefill_spans + si;
+                    const unsigned kv0 = sp->kv_row0, end = kv0 + sp->n_rows;
+                    const unsigned t0 = end / ps * ps > kv0 ? end / ps * ps : kv0;
+                    if (d >= hd) continue;
+                    for (unsigned p = t0; p < end; p++) {
+                        const size_t src = (size_t)(sp->row0 + p - kv0) * hd + d;
+                        const size_t dst = ((size_t)sp->slot * ps + p % ps) * hd + d;
+                        ((bf16*)TEN(0))[dst] = ((const bf16*)TEN(2))[src];
+                        ((bf16*)TEN(1))[dst] = ((const bf16*)TEN(3))[src];
+                    }
+                }
+                break;
+            }
+            /* Batched decode (i3 = rows > 1): row r stashes into slot r's ring. */
+            if (in->i[3] > 1u) {
+                const size_t ring = (size_t)in->i[0] * in->i[1];
+                for (unsigned r = slice; r < in->i[3]; r += nblk)
+                    d_dsa_pool_stash((bf16*)TEN(0) + r * ring, (bf16*)TEN(1) + r * ring,
+                                     (const bf16*)TEN(2), (const bf16*)TEN(3), (const int*)TEN(4),
+                                     in->i[0], in->i[1], r);
+                break;
+            }
             d_dsa_pool_stash((bf16*)TEN(0), (bf16*)TEN(1), (const bf16*)TEN(2), (const bf16*)TEN(3),
                              (const int*)TEN(4), in->i[0], in->i[1], in->i[2]);
             break;
         case PLOW_DOP_DSA_Q_QUANT:
+#if PLOW_DSA_QQUANT_WAVE
+            if (in->i[1] == 128u) {
+                d_dsa_q_quant_wave((uint8_t*)TEN(0), (float*)TEN(1), (const bf16*)TEN(2), in->i[0],
+                                   slice, nblk);
+                break;
+            }
+#endif
             d_dsa_q_quant((uint8_t*)TEN(0), (float*)TEN(1), (const bf16*)TEN(2), in->i[0], in->i[1],
                           slice, nblk, (float*)sm->raw, sm->part);
             break;
         case PLOW_DOP_INDEX_SCORE_KPOOL:
+#if PLOW_DSA_KPOOL_MFMA
+            if (in->i[3] == 128u && in->i[1] == 32u) {
+                constexpr int DI_ = 128, HI_ = 32;
+                constexpr int QSTRIDE = DI_ + FA_PAD, KSTRIDE = DI_ + FA_PAD;
+                constexpr int TILE_N = (PLOW_CDNA4 ? PLOW_WAVES : (PLOW_WAVES < 4 ? PLOW_WAVES : 4)) * 32;
+                static_assert((HI_ * QSTRIDE + TILE_N * KSTRIDE) * sizeof(bf16)
+                                  + (HI_ + TILE_N) * sizeof(float) <= sizeof(sm->raw),
+                              "pooled DSA score tiles exceed interpreter LDS");
+                bf16* qlds = (bf16*)sm->raw;
+                bf16* ktile = qlds + HI_ * QSTRIDE;
+                float* wlds = (float*)(ktile + TILE_N * KSTRIDE);
+                d_index_score_kpool_mfma<DI_, HI_, TILE_N>(
+                    (float*)TEN(0), (const uint8_t*)TEN(1), (const float*)TEN(2),
+                    (const uint8_t*)TEN(3), (const float*)TEN(4), (const float*)TEN(5),
+                    (const int*)TEN(6), in->i[0], in->i[2], in->i[4], in->i[5] != 0, in->fj[0].f,
+                    slice, nblk, qlds, ktile, wlds, wlds + HI_);
+                break;
+            }
+#endif
             /* t6/kv_len is TOKEN-granular (i4=pool_size divides internally) — see
              * d_index_score_kpool's header comment for why this cannot be pool-granular
              * at the packet level (the runtime patches kv_len once per decode step, the
@@ -5529,6 +5650,29 @@ __device__ static void plow_exec(CInst in_v, unsigned slice, CTens T_v, plow_sme
                 break;
             }
 #endif
+            /* Batched pooled decode (i4 = 4): one workgroup per row (i5 rows), the per-row exact
+             * radix of op 118 over row r's pool scores; kv_len[r] is token-granular, i2 = pool. */
+            if (in->i[4] == 4u) {
+                const unsigned pool_size = in->i[2] ? in->i[2] : 1u;
+                for (unsigned r = slice; r < in->i[5]; r += nblk) {
+                    __syncthreads();
+                    d_index_select_pf<true>((int*)TEN(0) + (size_t)r * in->i[1],
+                                            (const float*)TEN(1) + (size_t)r * in->i[0],
+                                            (const int*)TEN(4) + r, 1u, in->i[1], in->i[0], 0u, 1u,
+                                            lh, lh + 256, pool_size);
+                    /* i6 = 1 (PLOW_GLM_DSA_FUSE): this row's compact expand into t5. */
+                    if (in->i[6] == 1u) {
+                        __syncthreads();
+                        asm volatile("buffer_inv" ::: "memory");
+                        __syncthreads();
+                        dsa_pool_expand_row((int*)TEN(5) + (size_t)r * (in->i[1] * pool_size + pool_size - 1u),
+                                            (const int*)TEN(0) + (size_t)r * in->i[1],
+                                            ((const int*)TEN(4))[r], in->i[1], pool_size,
+                                            threadIdx.x, PLOW_THREADS);
+                    }
+                }
+                break;
+            }
 #if defined(__gfx942__)
             if (in->i[4] == 1u) {
                 const unsigned row = in->i[3] + slice;

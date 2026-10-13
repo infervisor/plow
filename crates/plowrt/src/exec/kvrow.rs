@@ -286,6 +286,11 @@ pub(crate) const PREFILL_ROW_FIELDS: &[(DevOp, RowField)] = &[
     (DevOp::IndexScorePf, RowField::Rows(0)),
     (DevOp::IndexSelectPf, RowField::Rows(0)),
     (DevOp::IndexUnionPf, RowField::Rows(0)),
+    // The pooled chain derives each row's causal length from `kv_len[0] - rows`, like the three
+    // above; at the bucket width a ragged chunk's rows sat before position 0.
+    (DevOp::IndexScoreKpool, RowField::Rows(0)),
+    (DevOp::DsaPoolExpand, RowField::Rows(0)),
+    (DevOp::DsaQQuant, RowField::RowsTimes(0)),
     (DevOp::MlaMergeFold, RowField::Rows(0)),
     (DevOp::MoeRouterTopkPf, RowField::Rows(4)),
     (DevOp::MoeAlignPf, RowField::Rows(0)),
@@ -383,7 +388,8 @@ pub(crate) fn rebase_chunk_rows(
         } else if op == DevOp::DsaPoolCompress as u16 {
             let pool_size = d.i[1].max(1);
             d.i[0] = clen / pool_size;
-        } else if op == DevOp::DsaPoolStash as u16 {
+        } else if op == DevOp::DsaPoolStash as u16 && d.i[4] != 1 {
+            // `i[4] = 1` is the per-span packed form; it addresses rows through the span table.
             let pool_size = d.i[0].max(1);
             let pad = t.saturating_sub(clen);
             let complete = (clen / pool_size) * pool_size;
@@ -853,7 +859,7 @@ mod row_field_tests {
     /// the field must BE the row count; `RowsTimes` rescales, so its field is rows times a
     /// per-instruction width.
     const ROW_NAMES: &[&str] = &["rows", "ntok", "n_tok", "T", "M", "n_batch"];
-    const ELEM_NAMES: &[&str] = &["n", "H"];
+    const ELEM_NAMES: &[&str] = &["n", "H", "n_rows"];
 
     /// Every entry's field index must name a row field in the slot table.
     ///
