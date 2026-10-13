@@ -650,7 +650,8 @@ The packet from config + index alone (no weights) is 70 MB: 4 prefill buckets + 
   `PLOW_KDA_DECODE_WIDE` (default on): at batched rungs each KDA layer's Conv3 -> StateStepG ->
   GatedNorm runs as one standalone op-125 v3 launch (`kda_decode_wide.hip`, one 512-thread
   workgroup per (row, head), 69 VGPR / occ 7, the interpreter's own bodies). Streams equal base at
-  r1/B8/B32/B128; B=8/32/128 23.98/27.02/36.87 -> 22.02/25.89/34.04 ms/step; rung 1 keeps the
+  r1/B8/B32/B128, with a distinct prompt per slot at B32/B128 (30.92/44.44 -> 29.36/41.42 ms) and
+  for 4k/16k prompts; B=8/32/128 23.98/27.02/36.87 -> 22.00/25.92/34.03 ms/step; rung 1 keeps the
   fused arm (a segment boundary costs ~7 us, more than a raw kernel saves on 8 workgroups). An
   agent-scope `__threadfence` in that kernel made B=128 47.5 ms (L2 writeback per workgroup);
   workgroup-scope ordering is enough because the intermediates never leave the workgroup.
