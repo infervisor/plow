@@ -1058,7 +1058,8 @@ pub struct EmitConfig {
     pub glm_kda_qkvg_r1: bool,
 
     /// PLOW_GLM_HC_FUSE_DEC body variant bits: 1 = register-resident pre + norm tail, 2 = the
-    /// rows arm walks W eight steps per load batch. Bit-identical.
+    /// rows arm walks W eight steps per load batch, 4 = one row per unit (units loop over the
+    /// grid) instead of two rows per tail. Bit-identical.
     #[arg(long, env = "PLOW_GLM_HC_FUSE_VARIANT")]
     pub glm_hc_fuse_variant: Option<u32>,
 

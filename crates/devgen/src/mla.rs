@@ -769,11 +769,16 @@ fn emit_glm53_hc_pre(
         && (rows > 1 || emit_config::active().glm_hc_fuse_r1)
         && post_fold.is_some()
         && emit_config::active().glm_hc_fuse_dec
-        && c.hidden % 512 == 0)
+        && c.hidden % 1024 == 0)
         .then(|| {
             if rows * 24 <= b.n_cu() {
                 Some(0)
             } else {
+                // Variant bit 4: one row per unit even past the grid (units loop over
+                // workgroups), so no tail runs two rows serially.
+                if emit_config::active().glm_hc_fuse_variant.unwrap_or(0) & 4 != 0 {
+                    return Some(1);
+                }
                 [1u32, 2, 4].into_iter().find(|&r| rows.div_ceil(r) * 3 <= b.n_cu())
             }
         })
@@ -1027,7 +1032,11 @@ fn emit_glm53_program(
     let post_fold_on = !prefill
         && bv.is_none()
         && emit_config::active().glm_hc_post_fold
-        && (rows * 24 <= b.n_cu() || (rows > 1 && emit_config::active().glm_hc_fuse_dec));
+        && (rows * 24 <= b.n_cu()
+            || (rows > 1
+                && emit_config::active().glm_hc_fuse_dec
+                && c.hidden % 1024 == 0
+                && rows.div_ceil(4) * 3 <= b.n_cu()));
     let mut pending_post: Option<(u32, u32)> = None;
     let xr_hcpost = !prefill && bv.is_none() && c.tp > 1 && emit_config::active().glm_xr_hcpost;
     for l in 0..c.layers as usize {

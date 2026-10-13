@@ -677,11 +677,11 @@ fn shapes(m: &Model) -> Shapes {
                 }
                 DevOp::AddNorm if inst.i[2] == 1 => s.glm_fuse_seam_rn = true,
                 DevOp::HyperConnPre if inst.i[4] == 1 => s.glm_hc_norm_fold = true,
-                DevOp::GemmSmall if inst.i[6] > 1 => s.gemm_small_splitk = true,
                 DevOp::GemmSmall if inst.i[7] >= 3 => {
                     s.gemm_small_splitk = true;
                     s.gemm_small_group = true;
                 }
+                DevOp::GemmSmall if inst.i[6] > 1 => s.gemm_small_splitk = true,
                 DevOp::GemvF32 if inst.i[3] == 1 || inst.i[4] != 0 => {
                     s.glm_hc_post_fold |= inst.i[3] == 1;
                     s.glm_hc_pre_tail |= inst.i[4] != 0;

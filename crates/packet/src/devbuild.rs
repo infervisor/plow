@@ -1072,7 +1072,7 @@ impl Builder {
         for (g, (&(c, a, w, n, k), &s)) in segs.iter().zip(&ss).enumerate() {
             let part = if s > 1 {
                 self.tensor(
-                    &format!("act.splitk.{id}.g{g}.m{m}n{n}s{s}.part"),
+                    &format!("act.splitk.{id}.g{g}.m{m}n{n}k{k}s{s}.part"),
                     u64::from(s) * u64::from(m) * u64::from(n) * 4,
                 )
             } else {
@@ -1081,7 +1081,7 @@ impl Builder {
             words.extend([c, a, w, n, k, s, part]);
         }
         let bytes: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
-        let desc = self.tensor_init(&format!("act.gemm_group.{id}.desc"), bytes);
+        let desc = self.tensor_init(&format!("act.gemm_group.m{m}.{id}.desc"), bytes);
         let (c0, a0, w0, n0, k0) = segs[0];
         let cus: Vec<u32> = (0..self.n_cu).collect();
         let part = self.emit(DevOp::GemmSmall, cus.clone(), deps, |d| {

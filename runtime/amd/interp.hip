@@ -3389,9 +3389,12 @@ __device__ __forceinline__ void hc_fuse_tail(CInst in, CTens T, unsigned group, 
     __shared__ unsigned hcf_last;
     __syncthreads();
     if (threadIdx.x == 0) {
-        const unsigned old = __hip_atomic_fetch_add((unsigned*)T[desc[PLOW_HCT_CTR]] + group, 1u,
-                                                    __ATOMIC_ACQ_REL, __HIP_MEMORY_SCOPE_AGENT);
-        hcf_last = (old % arrivals) == arrivals - 1u;
+        unsigned* const ctr = (unsigned*)T[desc[PLOW_HCT_CTR]] + group;
+        const unsigned old =
+            __hip_atomic_fetch_add(ctr, 1u, __ATOMIC_ACQ_REL, __HIP_MEMORY_SCOPE_AGENT);
+        hcf_last = old == arrivals - 1u;
+        /* Every arrival of this step is in; the next bump is the next step's (a later launch). */
+        if (hcf_last) __hip_atomic_store(ctr, 0u, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
     }
     __syncthreads();
     if (!hcf_last) return;
