@@ -104,16 +104,16 @@ case "${PLOW_MERGE_UNROLL4:-0}" in
   1) DEC_KNOBS="$DEC_KNOBS -DFA_MERGE_UNROLL4=1" ;;
   *) echo "PLOW_MERGE_UNROLL4 must be 0 or 1" >&2; exit 2 ;;
 esac
-# PLOW_XR_TAGGED=1: decode one-shot XReduce publishes tagged data words and spins on the tags
-# instead of the xctr gate (op_collective.h; the CMake build's default). Bit-identical. A message
-# wider than the tag slot (batched rungs) keeps the gate one-shot.
-case "${PLOW_XR_TAGGED:-0}" in
+# PLOW_XR_TAGGED (default 1; 0 = rollback): decode one-shot XReduce publishes tagged data words and
+# spins on the tags instead of the xctr gate (op_collective.h; the CMake build's default).
+# Bit-identical. A message wider than the tag slot (batched rungs) keeps the gate one-shot.
+case "${PLOW_XR_TAGGED:-1}" in
   0) ;;
   1) DEC_KNOBS="$DEC_KNOBS -DPLOW_XR_TAGGED=1" ;;
   *) echo "PLOW_XR_TAGGED must be 0 or 1" >&2; exit 2 ;;
 esac
-# PLOW_XR_DEC_AGG=1: device-local aggregation of the two-shot's all-gather signal (PLOW_XR_AGG,
-# build_gfx942.sh's default) in the decode objects, for packets emitted with
+# PLOW_XR_DEC_AGG (default 1; 0 = rollback): device-local aggregation of the two-shot's all-gather
+# signal (PLOW_XR_AGG, build_gfx942.sh's default) in the decode objects, for packets emitted with
 # PLOW_XR_DEC_TWOSHOT_MIN. Bit-identical; inert without decode two-shots.
 # PLOW_FA_DEC_KL=8: decode flash K-phase with eight lanes per KV row (gfx942's map; one 128-byte
 # line per row per instruction instead of 64 rows per instruction) plus the interleaved row->wave
@@ -123,16 +123,16 @@ case "${PLOW_FA_DEC_KL:-1}" in
   8) DEC_KNOBS="$DEC_KNOBS -DFA_DEC_KL=8 -DFA_DEC_ILV=1" ;;
   *) echo "PLOW_FA_DEC_KL must be 1 or 8" >&2; exit 2 ;;
 esac
-# PLOW_XR_DEC_MLP=1: the peer-batched reduce (PLOW_XR_MLP, op_collective.h) in the decode objects
-# only. Measured null for gfx942's bandwidth-bound prefill reduce-scatter; a decode one-shot past
+# PLOW_XR_DEC_MLP (default 1; 0 = rollback): the peer-batched reduce (PLOW_XR_MLP, op_collective.h)
+# in the decode objects only. Measured null for gfx942's bandwidth-bound prefill reduce-scatter; a decode one-shot past
 # the tag slot (B=8: 64 KiB, one element per thread) is the latency-bound case it was written for.
-# Bit-identical.
-case "${PLOW_XR_DEC_MLP:-0}" in
+# Bit-identical; B=8 all-reduce 25.2 -> 18.5 us (gfx950 TP8 trace).
+case "${PLOW_XR_DEC_MLP:-1}" in
   0) ;;
   1) DEC_KNOBS="$DEC_KNOBS -DPLOW_XR_MLP=1" ;;
   *) echo "PLOW_XR_DEC_MLP must be 0 or 1" >&2; exit 2 ;;
 esac
-case "${PLOW_XR_DEC_AGG:-0}" in
+case "${PLOW_XR_DEC_AGG:-1}" in
   0) ;;
   1) DEC_KNOBS="$DEC_KNOBS -DPLOW_XR_AGG=1" ;;
   *) echo "PLOW_XR_DEC_AGG must be 0 or 1" >&2; exit 2 ;;

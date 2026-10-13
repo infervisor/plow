@@ -556,10 +556,11 @@ pub struct EmitConfig {
     #[arg(long, env = "PLOW_GLM_GF")]
     pub glm_gf: Option<u32>,
 
-    /// Batched dense MLA decode rungs split the KV only to one work item per CU (rows x
-    /// head-groups x nsplit <= n_cu) instead of the max-ctx split count. Not bit-identical
-    /// (the online-softmax partials regroup); rung 1 is unchanged.
-    #[arg(long, env = "PLOW_GLM_MLA_NS_ROWS", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
+    /// Batched dense MLA decode rungs on gfx950 split the KV only to one work item per CU (rows x
+    /// head-groups x nsplit <= n_cu) instead of the max-ctx split count. Not bit-identical (the
+    /// online-softmax partials regroup); GLM-5.3-Flash TP8 greedy streams matched at B=8/32/128.
+    /// Rung 1 is unchanged. `=0` is the rollback.
+    #[arg(long, env = "PLOW_GLM_MLA_NS_ROWS", default_value_t = true, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
     pub glm_mla_ns_rows: bool,
 
     /// Vocab-column-parallel lm_head.
@@ -1601,7 +1602,7 @@ impl EmitConfig {
             glm_dsa: env_str("PLOW_GLM_DSA"),
             glm_gf: env_u32("PLOW_GLM_GF"),
             glm_shard_head: env_bool("GLM_SHARD_HEAD"),
-            glm_mla_ns_rows: env_bool("PLOW_GLM_MLA_NS_ROWS"),
+            glm_mla_ns_rows: env_bool_default_true("PLOW_GLM_MLA_NS_ROWS"),
             glm_moe_coresident: env_u32("GLM_MOE_CORESIDENT"),
             glm_shared_cus: env_u32("GLM_SHARED_CUS"),
             glm_spine_cus: env_str("GLM_SPINE_CUS"),

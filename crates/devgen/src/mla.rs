@@ -5385,7 +5385,11 @@ pub(crate) fn emit_glm_mla(
     //   ONLY the top_k rows via n.iidx (constant work ~ top_k regardless of ctx).
     let ns_attn = if dsa {
         glm_dsa_decode_nsplit(rows, nh_l, glm_gf(ctx, nh_l), b.n_cu())
-    } else if rows > 1 && emit_config::active().glm_mla_ns_rows {
+    } else if rows > 1
+        && emit_config::active().glm_mla_ns_rows
+        && crate::emit_is_amd()
+        && crate::amd_target::active().1 == hwspec::IsaLevel::Gfx950
+    {
         glm_rows_nsplit(ctx, rows, nh_l, b.n_cu())
     } else {
         glm_nsplit(ctx, nh_l)
@@ -12220,6 +12224,11 @@ fn emit_glm_tail(
     } else if let Some(tile) =
         (nb > 0).then(|| glm_decode_gemm_tile(rows, vocab_l, c.hidden, b.n_cu())).flatten()
     {
+        // GemmSmall only: the GLM_SHARD_HEAD B=128 shard (N = vocab/8) picked GemmMed, the one
+        // GemmMed in any decode program, and on the gfx950 decode object it ran in 8 us (floor
+        // ~30 us) and every sequence sampled garbage. The replicated head and the B=32 shard
+        // already take GemmSmall.
+        let tile = if tile == DevOp::GemmMed { DevOp::GemmSmall } else { tile };
         b.emit(tile, all, &[c_f], |d| {
             d.t[0] = n.logits;
             d.t[1] = n.xn;
