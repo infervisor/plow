@@ -709,7 +709,7 @@ impl GpuEngine {
         let att = kv.try_attach_keyed(b, prompt, key.or(staged))?;
         let attached = att.is_some();
         let att_rows = att.as_ref().map(|a| a.rows).unwrap_or(0);
-        tracing::info!(
+        tracing::debug!(
             slot = b,
             prompt = prompt.len(),
             attached,
@@ -743,7 +743,7 @@ impl GpuEngine {
         // appended by prefill completion (full prompt) or per decode feed.
         self.seq_tokens[b].clear();
         self.seq_tokens[b].extend_from_slice(&prompt[..a.rows as usize]);
-        tracing::info!(
+        tracing::debug!(
             slot = b,
             rows = a.rows,
             prompt = prompt.len(),
@@ -826,7 +826,7 @@ impl GpuEngine {
             return false;
         }
         if !v.slide.is_empty() && rows - p_a > v.ring as u32 - g.window {
-            tracing::info!(
+            tracing::debug!(
                 slot = b,
                 rows,
                 p_a,
@@ -853,7 +853,7 @@ impl GpuEngine {
             tracing::info!(error = %e, slot = b, p_a, "vmm: publish_boundary skipped");
             false
         } else {
-            tracing::info!(slot = b, p_a, snap_bytes, "vmm: published successfully");
+            tracing::debug!(slot = b, p_a, snap_bytes, "vmm: published successfully");
             true
         }
     }
@@ -881,7 +881,7 @@ impl GpuEngine {
             max_rows
         };
         let p_a = (rows.min(max_rows) / 32) * 32;
-        tracing::info!(
+        tracing::debug!(
             slot = b,
             rows,
             toks_len = toks.len(),
@@ -892,7 +892,7 @@ impl GpuEngine {
             "vmm_publish entered"
         );
         if rows == 0 || toks.len() != rows as usize {
-            tracing::info!(
+            tracing::debug!(
                 slot = b,
                 rows,
                 toks_len = toks.len(),
@@ -901,7 +901,7 @@ impl GpuEngine {
             return;
         }
         if p_a == 0 {
-            tracing::info!(slot = b, p_a, "vmm_publish skipped: p_a == 0");
+            tracing::debug!(slot = b, p_a, "vmm_publish skipped: p_a == 0");
             return;
         }
         if session {
