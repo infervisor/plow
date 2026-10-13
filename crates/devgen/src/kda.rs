@@ -849,7 +849,7 @@ fn emit_kda_mixer_ex(
             d.i[..8].copy_from_slice(&[t, hi, p, p, p, hd, hd, nh]);
         });
         b.isolate(c);
-        let c_gb = gemv(b, g_raw, ga, g_b_proj, p, hd, c);
+        let c_gb = emit_pf_gemm_route(b, g_raw, ga, g_b_proj, t, p, hd, &[c]);
         (c, c_gb)
     });
     let (c_q, c_k, c_v, c_g) = if let Some((c, c_gb)) = group {
@@ -945,6 +945,8 @@ fn emit_kda_mixer_ex(
     // gate is full rank; that asymmetry is `use_full_rank_gate`'s and it is easy to get backwards.
     let c_fb = if fb_fold {
         c_fa
+    } else if group.is_some() {
+        emit_pf_gemm_route(b, f_raw, fa, w.f_b_proj, t, p, hd, &[c_fa])
     } else {
         gemv(b, f_raw, fa, w.f_b_proj, p, hd, c_fa)
     };
