@@ -1208,6 +1208,9 @@ extern "C" __device__ unsigned plow_glm_hc_pre_tail_arm = 1;
 #ifndef PLOW_GEMM_SMALL_SPLITK
 #define PLOW_GEMM_SMALL_SPLITK 0
 #endif
+#ifndef PLOW_DSA_KPOOL_MFMA
+#define PLOW_DSA_KPOOL_MFMA 1
+#endif
 #ifndef PLOW_GEMM_F32_DEC_TILE
 #define PLOW_GEMM_F32_DEC_TILE 1
 #endif
@@ -4408,6 +4411,25 @@ __device__ static void plow_exec(CInst in_v, unsigned slice, CTens T_v, plow_sme
                           slice, nblk, (float*)sm->raw, sm->part);
             break;
         case PLOW_DOP_INDEX_SCORE_KPOOL:
+#if PLOW_DSA_KPOOL_MFMA
+            if (in->i[3] == 128u && in->i[1] == 32u) {
+                constexpr int DI_ = 128, HI_ = 32;
+                constexpr int QSTRIDE = DI_ + FA_PAD, KSTRIDE = DI_ + FA_PAD;
+                constexpr int TILE_N = (PLOW_CDNA4 ? PLOW_WAVES : (PLOW_WAVES < 4 ? PLOW_WAVES : 4)) * 32;
+                static_assert((HI_ * QSTRIDE + TILE_N * KSTRIDE) * sizeof(bf16)
+                                  + (HI_ + TILE_N) * sizeof(float) <= sizeof(sm->raw),
+                              "pooled DSA score tiles exceed interpreter LDS");
+                bf16* qlds = (bf16*)sm->raw;
+                bf16* ktile = qlds + HI_ * QSTRIDE;
+                float* wlds = (float*)(ktile + TILE_N * KSTRIDE);
+                d_index_score_kpool_mfma<DI_, HI_, TILE_N>(
+                    (float*)TEN(0), (const uint8_t*)TEN(1), (const float*)TEN(2),
+                    (const uint8_t*)TEN(3), (const float*)TEN(4), (const float*)TEN(5),
+                    (const int*)TEN(6), in->i[0], in->i[2], in->i[4], in->i[5] != 0, in->fj[0].f,
+                    slice, nblk, qlds, ktile, wlds, wlds + HI_);
+                break;
+            }
+#endif
             /* t6/kv_len is TOKEN-granular (i4=pool_size divides internally) — see
              * d_index_score_kpool's header comment for why this cannot be pool-granular
              * at the packet level (the runtime patches kv_len once per decode step, the

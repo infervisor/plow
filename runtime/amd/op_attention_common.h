@@ -5216,6 +5216,99 @@ __device__ void d_index_score_kpool(float* __restrict__ Score, const uint8_t* __
     }
 }
 
+/* Pooled (kpool) index score on MFMA (PLOW_DSA_KPOOL_MFMA). Same logit as d_index_score_kpool:
+ *   logit[b][p] = scale * sum_h W[b][h]*Qscale[b][h] * relu(bf16(q_fp8[b][h].k_fp8[p]) * Kscale[p])
+ * The fp8 q and pooled keys are exact in bf16, so the [32 heads x 128].[128 x 32 pools] dot runs as
+ * d_index_score_mfma's 32x32x16 bf16 MFMA (fp32 accumulate; only the summation order differs from
+ * the scalar body). Work items are (row b, TILE_N-pool slab) over `slice`; a row's query tile is
+ * restaged only when the item's row changes. Decode: K row base b*pool_stride, len = kv_len[b] /
+ * pool_size. Prefill: every row reads the one chunk cache, len = causal row length / pool_size. */
+template <int DI, int HIc, int TILE_N = PLOW_WAVES * 32>
+__device__ void d_index_score_kpool_mfma(float* __restrict__ Score, const uint8_t* __restrict__ Qfp8,
+                                         const float* __restrict__ Qscale,
+                                         const uint8_t* __restrict__ Kfp8,
+                                         const float* __restrict__ Kscale, const float* __restrict__ W,
+                                         const int* __restrict__ kv_len, unsigned n_batch,
+                                         unsigned pool_stride, unsigned pool_size, bool prefill,
+                                         float scale, unsigned slice, unsigned nblk, bf16* qlds,
+                                         bf16* ktile, float* wlds, float* kslds) {
+    static_assert(HIc == 32 && DI % 16 == 0, "32 heads, whole MFMA k-steps");
+    constexpr int NK = DI / MFMA_K;
+    constexpr int QSTRIDE = DI + FA_PAD, KSTRIDE = DI + FA_PAD;
+    auto* const Sc = as_glob(Score);
+    const auto* const Qg = as_glob(Qfp8);
+    const auto* const Qs = as_glob(Qscale);
+    const auto* const Kg = as_glob(Kfp8);
+    const auto* const Ks = as_glob(Kscale);
+    const auto* const Wg = as_glob(W);
+    const unsigned tid = threadIdx.x;
+    const unsigned lane = tid & 63, wave = tid >> 6;
+    const unsigned frow = mfma_frag_row(lane);
+    const unsigned nslab = (pool_stride + TILE_N - 1) / TILE_N;
+    unsigned staged = ~0u;
+    bf16x8 qf[NK];
+    for (unsigned it = slice; it < n_batch * nslab; it += nblk) {
+        const unsigned b = it / nslab, base = (it % nslab) * TILE_N;
+        const unsigned tok = prefill ? (unsigned)(kv_len[0] - (int)n_batch + (int)b + 1)
+                                     : (unsigned)kv_len[b];
+        const unsigned len = tok / pool_size;
+        if (base >= len) continue;
+        const size_t kb = prefill ? 0u : (size_t)b * pool_stride;
+        __syncthreads();
+        if (b != staged) {
+            for (unsigned e = tid; e < (unsigned)HIc * (DI / 8); e += PLOW_THREADS) {
+                const unsigned h = e / (DI / 8), c8 = (e % (DI / 8)) * 8;
+                *(bf16v8*)&qlds[h * QSTRIDE + c8] =
+                    fp8v8_to_bf16v8(ld_glob_fp8v8(&Qg[(size_t)b * HIc * DI + h * DI + c8]));
+            }
+            for (unsigned i = tid; i < (unsigned)HIc; i += PLOW_THREADS)
+                wlds[i] = Wg[(size_t)b * HIc + i] * Qs[(size_t)b * HIc + i];
+        }
+        for (unsigned c = tid; c < (unsigned)TILE_N * (DI / 8); c += PLOW_THREADS) {
+            const unsigned row = c / (DI / 8), c8 = (c % (DI / 8)) * 8;
+            const unsigned p = base + row;
+            *(bf16v8*)&ktile[row * KSTRIDE + c8] =
+                (p < len) ? fp8v8_to_bf16v8(ld_glob_fp8v8(&Kg[(kb + p) * DI + c8])) : bf16v8_zero();
+        }
+        for (unsigned r = tid; r < (unsigned)TILE_N; r += PLOW_THREADS)
+            kslds[r] = (base + r < len) ? Ks[kb + base + r] : 0.0f;
+        __syncthreads();
+        if (b != staged) {
+#pragma unroll
+            for (int s = 0; s < NK; s++) {
+                const unsigned d0 = mfma_frag_k(lane, s * MFMA_K);
+                qf[s] = __builtin_bit_cast(bf16x8, ld_lds8(&qlds[frow * QSTRIDE + d0]));
+            }
+            staged = b;
+        }
+        if (wave < TILE_N / 32 && base + wave * 32 < len) {
+            const unsigned krow0 = wave * 32;
+            f32x16 acc = (f32x16)(0.0f);
+#pragma unroll
+            for (int s = 0; s < NK; s++) {
+                const unsigned d0 = mfma_frag_k(lane, s * MFMA_K);
+                const bf16x8 kf =
+                    __builtin_bit_cast(bf16x8, ld_lds8(&ktile[(krow0 + frow) * KSTRIDE + d0]));
+                acc = plow_mfma_bf16_32x32(qf[s], kf, acc);
+            }
+            const unsigned mbase = 4 * (lane / 32);
+            const float ks = kslds[krow0 + (lane & 31)];
+            float part = 0.0f;
+#pragma unroll
+            for (int i = 0; i < 16; i++) {
+                const unsigned h = mbase + (i % 4) + 8 * (i / 4);
+                const float d = bf2f(f2bf(acc[i])) * ks;
+                part += wlds[h] * (d > 0.0f ? d : 0.0f);
+            }
+            part += __shfl_xor(part, 32, PLOW_WAVE);
+            if (lane < 32) {
+                const unsigned p = base + krow0 + lane;
+                if (p < len) st_act<float>(&Sc[(size_t)b * pool_stride + p], part * scale);
+            }
+        }
+    }
+}
+
 /* DSA top-k SELECT via radix threshold (G4 — the hard selector).               [DSA]
  * Consumes the f32 indexer scores in HBM (d_index_score output) and writes the top_k position
  * indices (idx[b*top_k + slot]) the gather flash reads. Uses the SAME monotone packed key as
