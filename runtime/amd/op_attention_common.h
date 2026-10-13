@@ -5256,7 +5256,9 @@ __device__ void d_index_score_kpool_mfma(float* __restrict__ Score, const uint8_
     unsigned staged = ~0u;
     bf16x8 qf[NK];
     for (unsigned it = slice; it < ngrp * nslab; it += nblk) {
-        const unsigned g = it / nslab, base = (it % nslab) * TILE_N;
+        /* Slab-major: a row-major order with nblk a multiple of nslab pinned every workgroup to one
+         * slab index, so the few workgroups owning slab 0 ran every row (4.8 ms vs 76 us median). */
+        const unsigned g = it % ngrp, base = (it / ngrp) * TILE_N;
         const unsigned b0 = g * rg;
         const unsigned b1 = (b0 + rg < n_batch ? b0 + rg : n_batch);
         /* Prefill rows grow by one token per row, so the group's last row is its longest. */
