@@ -732,6 +732,9 @@ pub(super) const DECODE_ARM_MARKERS: &[(&str, &[&str])] = &[
     // i7 = k). An object without the arm publishes the plain partial slot, which no packet
     // wrote — stale data, no trap. A BUILD axis (`#if PLOW_XR_COMBINE_FOLD`).
     ("PLOW_XR_COMBINE_FOLD", &["plow_xr_combine_fold_1"]),
+    // The GLM-5.3-Flash HyperConnPost folded into the batched decode XReduce (t2..t5, j0 =
+    // hidden). An object without the arm never writes the new residual stream. `#if PLOW_XR_HCPOST`.
+    ("PLOW_XR_HCPOST", &["plow_xr_hcpost_1"]),
     // The K3 f_b GEMV folded into KdaStateStepG's prologue (flags bit 2, t4 = f_a, j1 = W_fb).
     // An object without the arm reads f_a's 128 values as the head's gate logits — finite,
     // no trap, wrong. A BUILD axis (`#if PLOW_KDA_FB_FOLD`).
@@ -1116,6 +1119,11 @@ pub(super) fn packet_decode_arm_requirements<'a>(
     }
     if insts().any(|inst| inst.op == DevOp::XReduce as u16 && inst.i[7] != 0) {
         requires.push("PLOW_XR_COMBINE_FOLD=1".to_owned());
+    }
+    if insts()
+        .any(|inst| inst.op == DevOp::XReduce as u16 && inst.t[2] != packet::dev::TENSOR_NONE16)
+    {
+        requires.push("PLOW_XR_HCPOST=1".to_owned());
     }
     if insts().any(|inst| inst.op == DevOp::KdaStateStepG as u16 && inst.i[4] & 4 != 0) {
         requires.push("PLOW_KDA_FB_FOLD=1".to_owned());

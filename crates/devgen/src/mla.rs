@@ -821,6 +821,45 @@ fn emit_glm53_hc_post(
     )
 }
 
+/// PLOW_GLM_XR_HCPOST: fold the HyperConnPost of a batched decode block into the one-shot
+/// XReduce `dep` that wrote its `raw` input (t2..t5 = the post's operands, j0 = hidden).
+/// Only a plain gate one-shot qualifies (no gather, no combine fold, `rows > 1` so the message
+/// outgrows the tagged slot, `rows * hidden` elements). Returns the XReduce, now the post's completion.
+#[allow(clippy::too_many_arguments)]
+fn glm53_xr_hcpost(
+    b: &mut Builder,
+    c: &GlmCfg,
+    s: &Glm53State,
+    out: u32,
+    raw: u32,
+    residual: u32,
+    rows: u32,
+    dep: u32,
+) -> Option<u32> {
+    let d = b.inst(dep);
+    let fits = d.op == DevOp::XReduce as u16
+        && d.t[0] == raw
+        && d.t[1] == packet::TENSOR_NONE
+        && d.t[2] == packet::TENSOR_NONE
+        && d.i[5] == 0
+        && d.i[7] == 0
+        && d.j[0] == 0
+        && d.i[0] == rows * c.hidden
+        && rows > 1
+        && c.hidden % 8 == 0;
+    if !fits {
+        return None;
+    }
+    b.patch(dep, |d| {
+        d.t[2] = out;
+        d.t[3] = residual;
+        d.t[4] = s.post_mix;
+        d.t[5] = s.comb_mix;
+        d.j[0] = c.hidden;
+    });
+    Some(dep)
+}
+
 #[allow(clippy::too_many_arguments)]
 fn emit_glm53_program(
     b: &mut Builder,
@@ -889,6 +928,7 @@ fn emit_glm53_program(
         && emit_config::active().glm_hc_post_fold
         && rows * 24 <= b.n_cu();
     let mut pending_post: Option<(u32, u32)> = None;
+    let xr_hcpost = !prefill && bv.is_none() && c.tp > 1 && emit_config::active().glm_xr_hcpost;
     for l in 0..c.layers as usize {
         let residual = s.residual[ri];
         let next = s.residual[ri ^ 1];
@@ -1006,6 +1046,11 @@ fn emit_glm53_program(
         let raw = bv.map_or(n.attn, |v| v.og);
         let (c_post, attn_post) = if post_fold_on {
             (c_attn, Some((raw, residual)))
+        } else if let Some(x) = xr_hcpost
+            .then(|| glm53_xr_hcpost(b, c, s, next, raw, residual, rows, c_attn))
+            .flatten()
+        {
+            (x, None)
         } else {
             (emit_glm53_hc_post(b, c, s, next, raw, residual, rows, c_attn, bv), None)
         };
@@ -1069,6 +1114,11 @@ fn emit_glm53_program(
         if post_fold_on && l + 1 < c.layers as usize {
             pending_post = Some((raw, residual));
             dep = c_ffn;
+        } else if let Some(x) = xr_hcpost
+            .then(|| glm53_xr_hcpost(b, c, s, next, raw, residual, rows, c_ffn))
+            .flatten()
+        {
+            dep = x;
         } else {
             dep = emit_glm53_hc_post(b, c, s, next, raw, residual, rows, c_ffn, bv);
         }

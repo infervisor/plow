@@ -1007,6 +1007,11 @@ pub struct EmitConfig {
     #[arg(long, env = "PLOW_GLM_HC_POST_FOLD", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
     pub glm_hc_post_fold: bool,
 
+    /// GLM-5.3-Flash batched decode (rungs the HyperConnPost fold does not cover): fold each
+    /// HyperConnPost into the one-shot XReduce that produces its block output. Bit-identical.
+    #[arg(long, env = "PLOW_GLM_XR_HCPOST", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
+    pub glm_xr_hcpost: bool,
+
     /// GLM batched decode: the shared expert's elementwise Glu spans rows * I / 512 workgroups
     /// instead of one. Bit-identical.
     #[arg(long, env = "PLOW_GLM_DECODE_GLU_ROWS", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
@@ -1720,6 +1725,7 @@ impl EmitConfig {
             glm_ofold: env_bool("PLOW_GLM_OFOLD"),
             glm_hc_norm_fold: env_bool("PLOW_GLM_HC_NORM_FOLD"),
             glm_hc_post_fold: env_bool("PLOW_GLM_HC_POST_FOLD"),
+            glm_xr_hcpost: env_bool("PLOW_GLM_XR_HCPOST"),
             glm_decode_glu_rows: env_bool("PLOW_GLM_DECODE_GLU_ROWS"),
             glm_pf_ns: env_u32("PLOW_GLM_PF_NS"),
             glm_router_overlap: env_u32("PLOW_GLM_ROUTER_OVERLAP"),

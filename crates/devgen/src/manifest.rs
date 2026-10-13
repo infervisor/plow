@@ -366,6 +366,10 @@ struct Shapes {
     /// tagged publish (PLOW_XR_COMBINE_FOLD). An object without the arm publishes the unwritten
     /// plain slot: finite, stale, wrong.
     xr_combine_fold: bool,
+    /// Any XReduce with `t[2]` set — the GLM-5.3-Flash HyperConnPost folded into the batched
+    /// decode one-shot (PLOW_GLM_XR_HCPOST). An object without the arm never writes the new
+    /// residual stream: stale data, no trap.
+    xr_hcpost: bool,
     /// Widest head dim of a merge-folded `FlashDecode` (`j2` != 0; nv_decode_merge_fold), 0 if
     /// none. The fold traps in an object without the row-group body for that width.
     flash_fold_hd: u32,
@@ -505,6 +509,7 @@ fn shapes(m: &Model) -> Shapes {
             }
             match op {
                 DevOp::XReduce if inst.i[7] != 0 => s.xr_combine_fold = true,
+                DevOp::XReduce if inst.t[2] != packet::TENSOR_NONE => s.xr_hcpost = true,
                 DevOp::KdaStateStepG if inst.i[4] & 12 != 0 => {
                     s.kda_fb_fold |= inst.i[4] & 4 != 0;
                     s.kda_decode_fused_arm |= inst.i[4] & 8 != 0;
@@ -991,6 +996,9 @@ fn encoding_features(f: &mut Map<String, Value>, s: &Shapes) {
     f.insert("moe_aiter_flat".into(), json!(s.moe_aiter_flat));
     f.insert("moe_pf_a8".into(), json!(s.moe_pf_a8));
     f.insert("xr_combine_fold".into(), json!(s.xr_combine_fold));
+    if s.xr_hcpost {
+        f.insert("xr_hcpost".into(), json!(true));
+    }
     f.insert("kda_fb_fold".into(), json!(s.kda_fb_fold));
     f.insert("kda_decode_fused_arm".into(), json!(s.kda_decode_fused_arm));
     // L8 is packet-inert (loads only), so it is an EMIT setting surfaced here for the paired
@@ -1651,6 +1659,9 @@ fn backend_amd(
     // L4 combine fold: a BUILD axis of the tagged decode object (`#if PLOW_XR_COMBINE_FOLD`).
     if on("xr_combine_fold") {
         req.push("PLOW_XR_COMBINE_FOLD=1".into());
+    }
+    if on("xr_hcpost") {
+        req.push("PLOW_XR_HCPOST=1".into());
     }
     // L3 f_b fold: a BUILD axis of the decode object (`#if PLOW_KDA_FB_FOLD`).
     if on("kda_fb_fold") {
@@ -2940,6 +2951,13 @@ pub fn config_header(manifest: &Value) -> String {
         "#define PLOW_PACKET_REQUIRES_XR_COMBINE_FOLD {0}\n#ifndef PLOW_XR_COMBINE_FOLD\n#define PLOW_XR_COMBINE_FOLD {0}\n#endif\n",
         if xr_combine_fold { 1 } else { 0 }
     ));
+    let xr_hcpost = manifest
+        .pointer("/features/xr_hcpost")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    if xr_hcpost {
+        out.push_str("#ifndef PLOW_XR_HCPOST\n#define PLOW_XR_HCPOST 1\n#endif\n");
+    }
     let attnres_decode_mwg = manifest
         .pointer("/features/attnres_decode_mwg")
         .and_then(Value::as_bool)

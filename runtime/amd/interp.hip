@@ -625,6 +625,83 @@ __device__ __forceinline__ void d_xreduce_add_norm_mega(
     }
 }
 
+
+#ifndef PLOW_XR_HCPOST
+#define PLOW_XR_HCPOST 0
+#endif
+#if PLOW_XR_HCPOST
+/* XReduce with the mHC HyperConnPost (op 129, n = 4, mode 0) folded in
+ * (PLOW_GLM_XR_HCPOST, batched decode rungs). Same rendezvous as d_xreduce_mega; each thread
+ * then reduces 8 consecutive channels of one row over r = 0..N-1 in f32 (d_xreduce's order),
+ * rounds to bf16, stores them to `out` as the standalone XReduce did, and runs hc_post4_8 on
+ * exactly those bf16 values — the arithmetic of d_hyperconn_post's vector path. Bit-identical
+ * to the [XReduce -> HyperConnPost] pair. Requires hidden % 8 == 0 and n % hidden == 0
+ * (asserted at emit). */
+extern "C" __device__ unsigned plow_xr_hcpost_1 = 1;
+__device__ __forceinline__ void d_xreduce_hcpost_mega(
+    bf16* out, const void* const* peer_scratch, uint32_t nranks, uint32_t rank, uint32_t n,
+    uint32_t slot_bytes, size_t xctr_byte_off, uint32_t gate_id, uint64_t deadline_ticks,
+    uint32_t* status, unsigned slice, unsigned nblk, bf16* new_residual, const bf16* residual,
+    const float* post_mix, const float* comb_mix, uint32_t hidden) {
+    __shared__ int xhp_bailed;
+    if (threadIdx.x == 0) xhp_bailed = 0;
+    __syncthreads();
+    if (slice == 0 && threadIdx.x == 0)
+        for (uint32_t r = 0; r < nranks; r++)
+            xctr_signal(PLOW_CTR((uint32_t*)((char*)peer_scratch[r] + xctr_byte_off), gate_id));
+    if (threadIdx.x == 0) {
+        uint32_t* lg = PLOW_CTR((uint32_t*)((char*)peer_scratch[rank] + xctr_byte_off), gate_id);
+        const uint64_t t0 = __builtin_amdgcn_s_memrealtime();
+        while (xctr_poll(lg) < nranks) {
+            if (__builtin_amdgcn_s_memrealtime() - t0 > deadline_ticks) {
+                if (status) *status = 0xDEAD0000u | rank;
+                xhp_bailed = 1;
+                break;
+            }
+            __builtin_amdgcn_s_sleep(2);
+        }
+        if (!xhp_bailed) xctr_acquire();
+    }
+    __syncthreads();
+    if (xhp_bailed) return;
+    const uint32_t nv = n / 8u, hv = hidden / 8u;
+    for (uint32_t w = slice * PLOW_THREADS + threadIdx.x; w < nv; w += nblk * PLOW_THREADS) {
+        const uint32_t t = w / hv, d = (w - t * hv) * 8u;
+        bf16v8 v[8];
+#pragma unroll
+        for (uint32_t r = 0; r < 8u; r++)
+            if (r < nranks)
+                v[r] = ld_glob8(as_glob((const bf16*)((const char*)peer_scratch[r] + slot_bytes)) +
+                                (size_t)w * 8u);
+        bf16v8 xv;
+#pragma unroll
+        for (uint32_t e = 0; e < 8u; e++) {
+            float acc = 0.0f;
+#pragma unroll
+            for (uint32_t r = 0; r < 8u; r++)
+                if (r < nranks) acc += bf2f(v[r][e]);
+            xv[e] = f2bf(acc);
+        }
+        st_glob8(as_glob(out) + (size_t)w * 8u, xv);
+        const float* pm = post_mix + (size_t)t * 4u;
+        const float* cm = comb_mix + (size_t)t * 16u;
+        float c[16], p[4];
+#pragma unroll
+        for (unsigned k = 0; k < 16; k++) c[k] = cm[k];
+#pragma unroll
+        for (unsigned k = 0; k < 4; k++) p[k] = pm[k];
+        const bf16* rrow = residual + (size_t)t * 4u * hidden;
+        bf16* orow = new_residual + (size_t)t * 4u * hidden;
+        bf16v8 rv[4];
+#pragma unroll
+        for (unsigned i = 0; i < 4; i++) rv[i] = ld_glob8(rrow + (size_t)i * hidden + d);
+#pragma unroll
+        for (unsigned j = 0; j < 4; j++)
+            st_glob8(orow + (size_t)j * hidden + d, hc_post4_8(c, p, j, rv, xv));
+    }
+}
+#endif
+
 #endif
 
 /* The KV-ENCODING axis, made observable the same way and for a STRICTER reason.  [MLA-FP8-KV]
@@ -6544,6 +6621,18 @@ __attribute__((amdgpu_waves_per_eu(PLOW_WPE, PLOW_WPE))) void PLOW_INTERP_NAME(P
             const size_t xoff =
                 (const char*)prog.xctr - (const char*)prog.peer_scratch[prog.rank];
             uint32_t* const xaudit = plow_xaudit_status(prog, in);
+#if PLOW_XR_HCPOST
+            /* t2..t5 = HyperConnPost operands (new_residual, residual, post_mix, comb_mix),
+             * j0 = hidden: the fold, always the gate one-shot (batched rungs only). */
+            if (in->t[2] != PLOW_TENSOR_NONE) {
+                d_xreduce_hcpost_mega((bf16*)tens[in->t[0]], prog.peer_scratch, prog.n_gpu,
+                                      prog.rank, in->i[0], in->i[2], xoff, in->i[3],
+                                      PLOW_XCTR_DEADLINE_TICKS, xaudit, e.slice, in->blocks,
+                                      (bf16*)tens[in->t[2]], (const bf16*)tens[in->t[3]],
+                                      (const float*)tens[in->t[4]],
+                                      (const float*)tens[in->t[5]], in->fj[1].u);
+            } else
+#endif
 #if PLOW_XR_TAGGED
             /* Tagged one-shot (op_collective.h): the arrival signal rides in the data. The
              * region sits right after the compact-audit status line, whose id the TP loader

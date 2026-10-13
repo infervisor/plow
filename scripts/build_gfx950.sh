@@ -143,6 +143,20 @@ case "${PLOW_XR_DEC_MLP:-1}" in
   1) DEC_KNOBS="$DEC_KNOBS -DPLOW_XR_MLP=1" ;;
   *) echo "PLOW_XR_DEC_MLP must be 0 or 1" >&2; exit 2 ;;
 esac
+# PLOW_XR_DEC_VEC (default 0 = off; 2/4/8): the decode one-shot reduce loads that many bf16 per
+# peer per thread (PLOW_XR_VEC, op_collective.h) for the batched rungs' gate path. Bit-identical.
+case "${PLOW_XR_DEC_VEC:-0}" in
+  0) ;;
+  2|4|8) DEC_KNOBS="$DEC_KNOBS -DPLOW_XR_VEC=$PLOW_XR_DEC_VEC" ;;
+  *) echo "PLOW_XR_DEC_VEC must be 0, 2, 4 or 8" >&2; exit 2 ;;
+esac
+# PLOW_XR_TAG_SLOT (default 20480; bytes, multiple of 256): the tagged one-shot slot of the decode
+# objects. 90112 lets B=8 x hidden 4096 take the tagged path. Serve with the same PLOW_XR_TAG_SLOT.
+case "${PLOW_XR_TAG_SLOT:-20480}" in
+  20480) ;;
+  *[!0-9]*) echo "PLOW_XR_TAG_SLOT must be a byte count" >&2; exit 2 ;;
+  *) DEC_KNOBS="$DEC_KNOBS -DPLOW_XR_TAG_SLOT_BYTES=${PLOW_XR_TAG_SLOT}u -DPLOW_XR_TAG_SLOT_BYTES_N=$PLOW_XR_TAG_SLOT" ;;
+esac
 case "${PLOW_XR_DEC_AGG:-1}" in
   0) ;;
   1) DEC_KNOBS="$DEC_KNOBS -DPLOW_XR_AGG=1" ;;
@@ -1086,6 +1100,13 @@ case "${PLOW_K3_PF_XR_SCHED:-0}" in
   0) ;;
   aiter) K3_PF_MOE="$K3_PF_MOE -DPLOW_XR_SCHED_AITER=1 -DPLOW_XR_SCHED_NWG=${PLOW_XR_SCHED_NWG:-48} -DPLOW_XR_SCHED_NWG_RS=${PLOW_XR_SCHED_NWG_RS:-16} -DPLOW_XR_SCHED_NWG_SRS=${PLOW_XR_SCHED_NWG_SRS:-16} -DPLOW_XR_SCHED_NWG_SAG=${PLOW_XR_SCHED_NWG_SAG:-48}" ;;
   *) echo "PLOW_K3_PF_XR_SCHED must be 0 or aiter" >&2; exit 2 ;;
+esac
+# PLOW_K3_PF_SP_VEC (default 0; 2/4/8): the seq-par seam reduce-scatter/all-gather (ops 25/26)
+# move that many bf16 per peer access (PLOW_XR_SP_VEC, op_collective.h). Bit-identical.
+case "${PLOW_K3_PF_SP_VEC:-0}" in
+  0) ;;
+  2|4|8) K3_PF_MOE="$K3_PF_MOE -DPLOW_XR_SP_VEC=$PLOW_K3_PF_SP_VEC" ;;
+  *) echo "PLOW_K3_PF_SP_VEC must be 0, 2, 4 or 8" >&2; exit 2 ;;
 esac
 case "${PLOW_K3_PF_FOLD_TB:-8}" in
   0|1) ;;

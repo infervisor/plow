@@ -1819,7 +1819,13 @@ typedef struct {
  * it from the packet's status id (fj[2]) and this constant, so PlowProgram is unchanged; the
  * host lays it out (`PeerLayout`) and refuses a hidden width wider than 3 bf16 per 8-byte
  * word can hold (3 * 20480 / 8 = 7680). */
+#define PLOW_XR_TAG_SLOT_BYTES_DEFAULT 20480u
+/* -DPLOW_XR_TAG_SLOT_BYTES=<N> (build_gfx950.sh PLOW_XR_TAG_SLOT): a wider slot lets batched
+ * decode rungs take the tagged one-shot too (B=8 x 4096 needs 87384 B). The object then exports
+ * `plow_xr_tag_slot_<N>` and plowrt must run with PLOW_XR_TAG_SLOT=<N>. */
+#ifndef PLOW_XR_TAG_SLOT_BYTES
 #define PLOW_XR_TAG_SLOT_BYTES 20480u
+#endif
 
 /* Workgroup geometry of the persistent interpreter. The HOST needs this to size
  * the dispatch, the DEVICE needs it to stride its loops, and Rust needs it to build
