@@ -339,51 +339,16 @@ pub fn cmd_pack(
     checkpoint_dir: Option<&std::path::Path>,
     out: &std::path::Path,
 ) -> Result<(), Err> {
-    use plow_asset::dist::{Bundle, ObjSet};
-
-    let bundle_bytes = std::fs::read(bundle_path)?;
-    let bundle: Bundle = serde_json::from_slice(&bundle_bytes)
-        .map_err(|e| format!("{}: {e}", bundle_path.display()))?;
-    bundle
-        .validate()
-        .map_err(|e| format!("{}: {e}", bundle_path.display()))?;
-
-    // A bundle that names an objset must ship it; a runtime-compiled one
-    // (no objset in the bundle) must not be handed one.
-    let objset = match (&bundle.objset, objset_path) {
-        (Some(_), None) => return Err("the bundle names an objset: pass --objset".into()),
-        (None, Some(p)) => {
-            return Err(format!("{}: the bundle has no objset to pair it with", p.display()).into())
-        }
-        (None, None) => None,
-        (Some(_), Some(objset_path)) => {
-            let objset_bytes = std::fs::read(objset_path)?;
-            let objset: ObjSet = serde_json::from_slice(&objset_bytes)
-                .map_err(|e| format!("{}: {e}", objset_path.display()))?;
-            objset
-                .validate()
-                .map_err(|e| format!("{}: {e}", objset_path.display()))?;
-            objset
-                .pairs_with(bundle.pairing_hash.as_deref())
-                .map_err(|e| format!("{}: {e}", objset_path.display()))?;
-            Some((objset, objset_bytes))
-        }
-    };
-
     // Every argument is checked before --out is created or truncated.
+    let PackArgs {
+        bundle_bytes,
+        bundle,
+        objset,
+        checkpoint_in,
+    } = pack_args(bundle_path, objset_path, objects, checkpoint_dir)?;
     let objects_in = match (&objset, objects) {
-        (Some(_), None) => return Err("the objset's objects need --objects".into()),
         (Some((objset, _)), Some(dir)) => objset.objects.iter().map(|o| (o, dir)).collect(),
-        (None, _) => Vec::new(),
-    };
-    let checkpoint_in = match (bundle.checkpoint.files.is_empty(), checkpoint_dir) {
-        (false, None) => {
-            return Err("the bundle carries its checkpoint: pass --checkpoint-dir".into())
-        }
-        (true, Some(p)) => {
-            return Err(format!("{}: the bundle's checkpoint lists no files", p.display()).into())
-        }
-        (_, dir) => dir,
+        _ => Vec::new(),
     };
 
     let file = std::fs::File::create(out)?;
@@ -492,6 +457,82 @@ fn copy_hashed(path: &std::path::Path, w: &mut impl Write) -> Result<(String, u6
     Ok((format!("{:x}", h.finalize()), n))
 }
 
+/// What `pack` reads from its arguments, every one of them checked.
+#[cfg(feature = "dist")]
+struct PackArgs<'a> {
+    bundle_bytes: Vec<u8>,
+    bundle: plow_asset::dist::Bundle,
+    objset: Option<(plow_asset::dist::ObjSet, Vec<u8>)>,
+    checkpoint_in: Option<&'a std::path::Path>,
+}
+
+/// Check `pack`'s arguments against the bundle: `publish` runs this before it
+/// asks the registry anything, so a wrong argument never reads as "already
+/// published".
+#[cfg(feature = "dist")]
+fn pack_args<'a>(
+    bundle_path: &std::path::Path,
+    objset_path: Option<&std::path::Path>,
+    objects: Option<&std::path::Path>,
+    checkpoint_dir: Option<&'a std::path::Path>,
+) -> Result<PackArgs<'a>, Err> {
+    use plow_asset::dist::{Bundle, ObjSet};
+
+    let bundle_bytes = std::fs::read(bundle_path)?;
+    let bundle: Bundle = serde_json::from_slice(&bundle_bytes)
+        .map_err(|e| format!("{}: {e}", bundle_path.display()))?;
+    bundle
+        .validate()
+        .map_err(|e| format!("{}: {e}", bundle_path.display()))?;
+
+    // A bundle that names an objset must ship it; a runtime-compiled one
+    // (no objset in the bundle) must not be handed one.
+    let objset = match (&bundle.objset, objset_path) {
+        (Some(_), None) => return Err("the bundle names an objset: pass --objset".into()),
+        (None, Some(p)) => {
+            return Err(format!("{}: the bundle has no objset to pair it with", p.display()).into())
+        }
+        (None, None) => None,
+        (Some(_), Some(objset_path)) => {
+            let objset_bytes = std::fs::read(objset_path)?;
+            let objset: ObjSet = serde_json::from_slice(&objset_bytes)
+                .map_err(|e| format!("{}: {e}", objset_path.display()))?;
+            objset
+                .validate()
+                .map_err(|e| format!("{}: {e}", objset_path.display()))?;
+            objset
+                .pairs_with(bundle.pairing_hash.as_deref())
+                .map_err(|e| format!("{}: {e}", objset_path.display()))?;
+            Some((objset, objset_bytes))
+        }
+    };
+    if objset.is_some() && objects.is_none() {
+        return Err("the objset's objects need --objects".into());
+    }
+    let checkpoint_in = checkpoint_arg(&bundle, checkpoint_dir)?;
+    Ok(PackArgs {
+        bundle_bytes,
+        bundle,
+        objset,
+        checkpoint_in,
+    })
+}
+
+/// `--checkpoint-dir`, given exactly when the bundle carries its checkpoint.
+#[cfg(feature = "dist")]
+fn checkpoint_arg<'a>(
+    bundle: &plow_asset::dist::Bundle,
+    checkpoint_dir: Option<&'a std::path::Path>,
+) -> Result<Option<&'a std::path::Path>, Err> {
+    match (bundle.checkpoint.files.is_empty(), checkpoint_dir) {
+        (false, None) => Err("the bundle carries its checkpoint: pass --checkpoint-dir".into()),
+        (true, Some(p)) => {
+            Err(format!("{}: the bundle's checkpoint lists no files", p.display()).into())
+        }
+        (_, dir) => Ok(dir),
+    }
+}
+
 #[cfg(feature = "dist")]
 /// Where `publish` sends a packed bundle.
 pub struct PublishTo<'a> {
@@ -521,16 +562,19 @@ pub fn cmd_publish(
     if to.status == Some("validated") && to.tok_s.is_none() {
         return Err("--status validated needs the measurement: pass --tok-s".into());
     }
+    // Every argument is checked before the registry is asked anything: a
+    // wrong one must fail, not read as "already published".
+    let local = pack_args(bundle_path, objset_path, objects, checkpoint_dir)?.bundle;
+    if local.checkpoint.source == "dist" && to.hf.is_none() {
+        return Err(
+            "the bundle's checkpoint is `dist`: pass --hf <org>/<repo> for the index".into(),
+        );
+    }
     let dir = private_temp_dir()?;
     let sent = (|| {
         let Some(bundle) = next_generation(bundle_path, to)? else {
             return Ok(());
         };
-        if bundle.checkpoint.source == "dist" && to.hf.is_none() {
-            return Err(
-                "the bundle's checkpoint is `dist`: pass --hf <org>/<repo> for the index".into(),
-            );
-        }
         let bundle_out = dir.join("bundle.json");
         std::fs::write(&bundle_out, serde_json::to_vec_pretty(&bundle)?)?;
         let zip_path = dir.join("bundle.zip");
@@ -848,6 +892,64 @@ mod tests {
         }))
         .unwrap();
         assert_eq!(super::variant_id(&b), "b49b5c9cf598");
+    }
+
+    /// `publish` against a registry that is not there: what fails must be
+    /// the argument, never the registry (nor "already published").
+    fn publish_refuses(checkpoint: serde_json::Value, ckpt_dir: bool, hf: Option<&str>) -> String {
+        let dir = std::env::temp_dir().join(format!(
+            "plowrt-publish-args-{}-{}",
+            std::process::id(),
+            checkpoint["source"]
+                .as_str()
+                .unwrap()
+                .replace([':', '/'], "_")
+                + &ckpt_dir.to_string()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let bundle = dir.join("bundle.json");
+        std::fs::write(&bundle, serde_json::to_vec(&serde_json::json!({
+            "schema": "plow.dist.bundle.v1", "namespace": "infervisor", "name": "m",
+            "label": "l", "generation": 0, "variant_id": "", "plow_git": "abc", "network": "m",
+            "target": {"vendor": "apple", "isa": "metal3", "sku": "Apple M4 Pro", "units": 16, "mem_bytes": 1},
+            "parallel": {"mode": "tp", "n": 1}, "max_ctx": 2048,
+            "files": [{"name": "model.pkt", "role": "packet", "bytes": 1, "sha256": "0".repeat(64)},
+                      {"name": "t", "role": "tokenizer", "bytes": 1, "sha256": "0".repeat(64)}],
+            "tokenizer": {"file": "t", "generator": "plow", "sha256": "0".repeat(64), "source": "derived", "verified": false},
+            "checkpoint": checkpoint
+        })).unwrap()).unwrap();
+        let to = super::PublishTo {
+            url: "http://127.0.0.1:9",
+            api_key: "k",
+            status: None,
+            description: None,
+            hf,
+            tok_s: None,
+            concurrency: None,
+        };
+        let ckpt = ckpt_dir.then_some(dir.as_path());
+        let err = super::cmd_publish(&bundle, None, &dir, None, ckpt, &to).unwrap_err();
+        std::fs::remove_dir_all(&dir).ok();
+        err.to_string()
+    }
+
+    #[test]
+    fn publish_checks_its_arguments_before_the_registry() {
+        let hf = serde_json::json!({"source": "hf:o/m", "revision": "main", "shards": 0, "layout": "x", "bytes": 0});
+        let dist = serde_json::json!({"source": "dist", "revision": "v1", "shards": 1, "layout": "hf-safetensors", "bytes": 1,
+            "files": [{"name": "model.safetensors", "bytes": 1, "sha256": "0".repeat(64)}]});
+        let e = publish_refuses(hf, true, None);
+        assert!(
+            e.contains("lists no files"),
+            "hf bundle + --checkpoint-dir: {e}"
+        );
+        let e = publish_refuses(dist.clone(), false, Some("o/m"));
+        assert!(
+            e.contains("pass --checkpoint-dir"),
+            "dist bundle without its checkpoint: {e}"
+        );
+        let e = publish_refuses(dist, true, None);
+        assert!(e.contains("pass --hf"), "dist bundle without --hf: {e}");
     }
 
     #[test]
