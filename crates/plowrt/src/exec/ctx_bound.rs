@@ -823,6 +823,7 @@ mod tests {
                     stride: ctx,
                     window: 0,
                     mask: u32::MAX,
+                    layout: 0,
                 },
                 plow_asset::live_kv::Cache {
                     pair: [5, 6],
@@ -832,6 +833,7 @@ mod tests {
                     stride: 8192,
                     window: 1024,
                     mask: 8191,
+                    layout: 0,
                 },
             ],
             maps: Vec::new(),

@@ -156,6 +156,11 @@ impl GpuEngine {
             block_hint,
         )?;
         kv.enable_block_recycling(crate::memory::vmm::kv_pool_cap());
+        // Retiring a sequence unmapped its windows inline on the engine thread: Qwen3.8-27B 4K
+        // c32 paid 8-11 ms of idle GPU per retire (256 blocks), ~1 s of a 47 s run.
+        if config.vmm_deferred_reclaim() {
+            kv.enable_deferred_reclaim();
+        }
         let tensor_tracks = layout
             .full_tensors
             .iter()

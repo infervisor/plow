@@ -150,7 +150,8 @@ client = "vllm 0.28.0 bench serve (repro_gemma26b_h100.sh st4k, 2 repeats, packe
 #                      ref 33d40bc35d09f4d9...), G26_FP8_FP32_VLLM = the vLLM 0.28 capture against it (8a926298ee6ff3e5...)
 #   llm_fp32_ref_long  G26_FP8_FP32_REF_LONG = the 20-case long-context reference to 32768 tokens
 #                      (prompts sha256 0edf0983b7428138), G26_FP8_FP32_VLLM_LONG = vLLM at --max-model-len 131072
-# Thresholds: fp32_ref_gate.py DEFAULTS (docs/bringup/agent-tools.md section 5).
+# Thresholds: fp32_ref_gate.py DEFAULTS (docs/bringup/agent-tools.md section 5) except the two
+# measured c16 margins below.
 [gates]
 python = "{env:PYREF}"
 [gates.llm_fp32_ref]
@@ -158,6 +159,14 @@ reference = "{env:G26_FP8_FP32_REF}"
 vllm_capture = "{env:G26_FP8_FP32_VLLM}"
 concurrency = 16
 timeout_s = 2400
+# Measured c16 margins (2026-10-13, seven runs of the production packet 5ce87bd28db1 and its b44ca43f
+# re-emit 2df5a8b84f05 on the d550daaf and 6af0b02c plowrts, one vLLM peer capture): positions over
+# 0.1 nat 209-224 of 1175 against the peer's 206 (the 0.005 default is 6 positions, below the FP8
+# c16 re-roll), decisive free-run flips 35-39 cases of 46 against the peer's 37 (two cases). Every
+# run holds kl_mean 0.195-0.231 vs 0.202, trimmed 0.124-0.153 vs 0.124, p95 0.91-1.03 vs 0.89,
+# needles 18/18; one unpinned-algorithm run missed top1_decisive by 0.004 beyond its margin.
+kl_over_slack = 0.02
+cont_decisive_drop_max = 0.045
 [gates.llm_fp32_ref_long]
 reference = "{env:G26_FP8_FP32_REF_LONG}"
 vllm_capture = "{env:G26_FP8_FP32_VLLM_LONG}"

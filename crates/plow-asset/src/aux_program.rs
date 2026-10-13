@@ -326,6 +326,13 @@ fn integer_tensor_handles_valid(op: DevOp, inst: &DevInst64, tensor_count: usize
     let optional =
         |slot: usize| inst.i[slot] == TENSOR_NONE_I || (inst.i[slot] as usize) < tensor_count;
     match op {
+        // Folded residual + RMSNorm prologue (devgen `Fold::fields`): i[6] = 0 means no addend.
+        DevOp::Gemv if inst.i[3] == 4 => {
+            required(5) && required(7) && (inst.i[6] == 0 || required(6))
+        }
+        DevOp::GemvGlu if inst.i[3] == 4 => {
+            required(4) && required(7) && (inst.i[6] == 0 || required(6))
+        }
         DevOp::GemvGluFp8 if inst.fj[2] != 0 => [3, 4, 6, 7].into_iter().all(required),
         DevOp::FlashMlaDecode if inst.t[7] != TENSOR_NONE16 => required(6),
         DevOp::GemvQkvg => required(6),

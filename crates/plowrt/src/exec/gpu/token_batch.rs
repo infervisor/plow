@@ -61,7 +61,11 @@ impl CudaTokenBatch {
             && e.be.compute_capability() == (9, 0)
             && e.packed_prefill.is_some()
             && e.has_packed_terminal()
-            && e.recurrent.is_none()
+            // A recurrent chain packs only through its per-request state gather / varlen scan /
+            // scatter, so a one-row decode request is a continuing chunk of length 1; the split
+            // attention riders never arm on it (`riders.rs`), the rows attend through the
+            // prefill attention's request table.
+            && (e.recurrent.is_none() || e.qwen_initstate.is_some())
             && e.mixed_step.is_none()
             // Host rows spliced by launch row (overlay) or a decode-only embedding (position
             // base): the batch embeds decode rows through the prefill program, in its own order.
@@ -181,7 +185,11 @@ impl GpuEngine {
                         slot: pending.slot as usize,
                         tokens: request.tokens,
                         c0: pending.expected_frontier as usize,
-                        prompt_len: pending.new_frontier as usize,
+                        // The chunk's own end bounds decode rows (their end is past the
+                        // prompt); a prefill chunk carries the real prompt length so the
+                        // KV pre-map hint can look one bucket ahead of this chunk.
+                        prompt_len: (pending.new_frontier as usize)
+                            .max(request.prompt_len as usize),
                     }
                 })
                 .collect();

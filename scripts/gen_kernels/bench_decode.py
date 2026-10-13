@@ -1,15 +1,18 @@
 """Standalone GQA decode attention: the TileLang kernel (attn_decode.py) vs FlashInfer, E4B heads.
 Timing: a CUDA graph over rotating cold K/V buffers (> L2), us per call; error = rel. L2 vs an
 fp32 reference on sampled rows. Needs torch, tilelang, flashinfer and one leased GPU.
-  bench_decode.py HD WINDOW B CTX BLOCK_N STAGES [NSPLIT] [THREADS] [HSPLIT]
-  bench_decode.py grid fi|nofi HD,WINDOW,B,CTX,BLOCK_N,STAGES[,NSPLIT,THREADS,HSPLIT] ...
+  bench_decode.py HD WINDOW B CTX BLOCK_N STAGES [NSPLIT] [THREADS]
+  bench_decode.py grid fi|nofi HD,WINDOW,B,CTX,BLOCK_N,STAGES[,NSPLIT,THREADS] ...
+NSPLIT 0 = the runtime's split policy (build_catalog.pick_nsplit). Rows read K/V at a permuted
+slot table, as plowrt launches the catalog object.
 """
 import sys, math, os, torch
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import attn_decode as ad
+from build_catalog import pick_nsplit
 
 dev = "cuda"
-H, KVH = 8, 2
+H, KVH = [int(x) for x in os.environ.get("BENCH_HEADS", "8,2").split(",")]  # q heads, KV heads
 
 
 def graph_time(fns, reps=5):
@@ -39,30 +42,34 @@ def graph_time(fns, reps=5):
     return ts[len(ts) // 2]
 
 
-def ref_out(q, k, v, lens, b, window, mask):
+def ref_out(q, k, v, lens, slot, b, window, mask):
     n = int(lens[b])
     lo = n - window if window and n > window else 0
     pos = torch.arange(lo, n, device=dev)
     rows = pos & mask if mask != -1 else pos
+    s = int(slot[b])
     out = []
     for h in range(H):
         hk = h // (H // KVH)
-        kk = k[b, hk, rows].float()
-        vv = v[b, hk, rows].float()
-        s = kk @ q[b, h].float()
-        p = torch.softmax(s, 0)
+        kk = k[s, hk, rows].float()
+        vv = v[s, hk, rows].float()
+        p = torch.softmax(kk @ q[b, h].float(), 0)
         out.append(p @ vv)
     return torch.stack(out)
 
 
-def run(hd, window, B, ctx, bn, stages, nsplit=1, threads=128, hsplit=1, do_fi=True):
+def run(hd, window, B, ctx, bn, stages, nsplit=0, threads=128, do_fi=True):
     S = 1024 if window else ctx
     mask = S - 1 if window else -1
     span = min(ctx, window) if window else ctx
     kv_bytes = B * KVH * span * hd * 2 * 2
     n = max(2, min(16, math.ceil(160e6 / kv_bytes)))
-    kern = ad.compile(hd, H // KVH, bn, stages, threads=threads, nsplit=nsplit, hsplit=hsplit)
+    if not nsplit:
+        nsplit = pick_nsplit(B, KVH, -(-span // bn), ad.NSPLIT_MAX)
+    assert nsplit <= ad.NSPLIT_MAX, f"nsplit {nsplit} > NSPLIT_MAX {ad.NSPLIT_MAX}"
+    kern = ad.compile(hd, H // KVH, bn, stages, threads=threads)
     lens = torch.tensor([ctx - (b % 7) for b in range(B)], device=dev, dtype=torch.int32)
+    slot = torch.tensor([(b * 5 + 3) % B for b in range(B)], device=dev, dtype=torch.int32)
     bufs = []
     for i in range(n):
         q = torch.randn(B, H, hd, device=dev, dtype=torch.bfloat16)
@@ -70,17 +77,18 @@ def run(hd, window, B, ctx, bn, stages, nsplit=1, threads=128, hsplit=1, do_fi=T
         v = torch.randn(B, KVH, S, hd, device=dev, dtype=torch.bfloat16)
         bufs.append((q, k, v))
     out = torch.empty(B, H, hd, device=dev, dtype=torch.bfloat16)
-    opart = torch.empty(B, H, nsplit, hd, device=dev, dtype=torch.float32)
-    ml = torch.empty(B, H, nsplit, 2, device=dev, dtype=torch.float32)
+    opart = torch.empty(B, H, ad.NSPLIT_MAX, hd, device=dev, dtype=torch.float32)
+    ml = torch.empty(B, H, ad.NSPLIT_MAX, 2, device=dev, dtype=torch.float32)
     ctr = torch.zeros(B, KVH, device=dev, dtype=torch.int32)
     scale = 1.0
-    call = lambda q, k, v: kern(q, k, v, lens, out, opart, ml, ctr, window, mask, scale)
+    call = lambda q, k, v: kern(q, k, v, lens, slot, out, opart, ml, ctr, window, mask, nsplit,
+                                scale)
     q, k, v = bufs[0]
     call(q, k, v)
     torch.cuda.synchronize()
     err = 0.0
     for b in range(0, B, max(1, B // 6)):
-        r = ref_out(q, k, v, lens, b, window, mask)
+        r = ref_out(q, k, v, lens, slot, b, window, mask)
         g = out[b].float()
         err = max(err, ((g - r).norm() / r.norm()).item())
     t = graph_time([(lambda q=q, k=k, v=v: call(q, k, v)) for q, k, v in bufs])
@@ -111,7 +119,7 @@ def run(hd, window, B, ctx, bn, stages, nsplit=1, threads=128, hsplit=1, do_fi=T
         except Exception as e:
             res += f" | flashinfer err {str(e)[:80]}"
     floor = kv_bytes / 3.35e12 * 1e6
-    print(f"hd{hd} win{window} B{B} ctx{ctx} bn{bn} st{stages} ns{nsplit} thr{threads} hs{hsplit}: "
+    print(f"hd{hd} win{window} B{B} ctx{ctx} bn{bn} st{stages} ns{nsplit} thr{threads}: "
           f"floor {floor:.2f} | {res}", flush=True)
     torch.cuda.empty_cache()
 

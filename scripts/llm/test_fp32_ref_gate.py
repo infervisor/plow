@@ -107,6 +107,15 @@ def make_cap(ref, arm, flip_tie=False, flip_decisive=False):
 
 
 class ScoreTests(unittest.TestCase):
+    def test_near_tie_free_run_flip_is_not_decisive(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            ref = make_ref(tmp)
+            tie = g.score(ref, make_cap(ref, "p", flip_tie=True))
+            self.assertLess(tie["cont_frac"], 1.0)
+            self.assertEqual(tie["cont_decisive_frac"], 1.0)
+            dec = g.score(ref, make_cap(ref, "p", flip_decisive=True))
+            self.assertEqual(dec["cont_decisive_frac"], 0.5)
+
     def test_near_tie_flip_does_not_cost_top1(self):
         with tempfile.TemporaryDirectory() as tmp:
             ref = make_ref(tmp)
@@ -143,17 +152,67 @@ class ScoreTests(unittest.TestCase):
 
 
 class VerdictTests(unittest.TestCase):
-    peer = dict(missing_positions=0, kl_mean=0.02, kl_p99=0.2, top1_decisive=0.99, cont_frac=0.8, needle_acc=1.0)
+    peer = dict(missing_positions=0, kl_mean=0.02, kl_trim_mean=0.01, kl_p95=0.08, kl_p99=0.2, kl_over=0,
+                kl_over_frac=0.0, top1_decisive=0.99, cont_frac=0.8, cont_decisive_frac=1.0, needle_acc=1.0)
 
     def test_within_peer_passes(self):
-        cand = dict(self.peer, kl_mean=0.024, kl_p99=0.25, top1_decisive=0.985, cont_frac=0.76)
+        cand = dict(self.peer, kl_mean=0.024, kl_trim_mean=0.012, kl_p95=0.1, kl_p99=0.25, kl_over=3,
+                    kl_over_frac=0.004, top1_decisive=0.985, cont_frac=0.76)
         self.assertEqual(g.verdict(cand, self.peer), [])
 
     def test_each_metric_can_fail(self):
-        for k, v in (("kl_mean", 0.03), ("kl_p99", 0.3), ("top1_decisive", 0.97), ("cont_frac", 0.7),
-                     ("needle_acc", 0.9), ("missing_positions", 1)):
+        for k, v in (("kl_mean", 0.03), ("kl_trim_mean", 0.02), ("kl_p95", 0.2), ("kl_over_frac", 0.01),
+                     ("top1_decisive", 0.97), ("cont_frac", 0.7), ("cont_decisive_frac", 0.95), ("needle_acc", 0.9),
+                     ("missing_positions", 1)):
             why = g.verdict(dict(self.peer, **{k: v}), self.peer)
             self.assertEqual(len(why), 1, (k, why))
+
+    def test_p99_is_reported_not_gated(self):
+        self.assertEqual(g.verdict(dict(self.peer, kl_p99=5.0), self.peer), [])
+
+    def test_tail_statistics(self):
+        ref = dict(sha256="x", cases=[dict(id=str(i), kind="natural", prompt_ids=[1], cont=[5],
+                                           pos=[dict(top=dist((5, 0.9), (9, 0.1)), margin=2.2)]) for i in range(200)])
+        # 198 exact positions, one mild and one gross disagreement
+        cases = {str(i): dict(free=[5], free_text="", pos={"0": dist((5, 0.9), (9, 0.1))}) for i in range(200)}
+        cases["0"]["pos"]["0"] = dist((5, 0.6), (9, 0.4))
+        cases["1"]["pos"]["0"] = dist((9, 0.9), (5, 0.1))
+        s = g.score(ref, dict(arm="a", ref_sha256="x", cases=cases))
+        self.assertEqual(s["positions"], 200)
+        self.assertEqual(s["kl_over"], 2)  # both > 0.1 nat
+        self.assertAlmostEqual(s["kl_over_frac"], 0.01)
+        self.assertLess(s["kl_trim_mean"], s["kl_mean"])  # the gross outlier is trimmed
+        self.assertEqual(s["kl_p95"], 0.0)
+        self.assertGreater(s["kl_p99"], 0.0)
+
+    def test_scoring_stops_at_the_reference_stop_token(self):
+        # cont = [5, 7(stop), 9]: the position after the stop token is neither scored nor part of the
+        # continuation; a free-run divergence there is not a decisive divergence.
+        pos = [dict(top=dist((5, 0.9), (9, 0.1)), margin=2.2), dict(top=dist((7, 0.9), (9, 0.1)), margin=2.2),
+               dict(top=dist((9, 0.9), (5, 0.1)), margin=2.2)]
+        ref = dict(sha256="x", meta=dict(eos=[7]), cases=[dict(id="a", kind="chat", prompt_ids=[1], cont=[5, 7, 9], pos=pos)])
+        cap = dict(arm="a", ref_sha256="x", cases={"a": dict(
+            free=[5, 7, 5], free_text="", pos={"0": pos[0]["top"], "1": pos[1]["top"], "2": dist((5, 0.9), (9, 0.1))})})
+        s = g.score(ref, cap)
+        self.assertEqual((s["positions"], s["kl_over"], s["cont_frac"], s["cont_decisive_frac"]), (2, 0, 1.0, 1.0))
+        self.assertEqual(g.score(ref, cap, eos=[9])["positions"], 3)  # an override scores through its own stop
+        self.assertEqual(g.score(dict(ref, meta={}), cap)["positions"], 3)  # no stop id: every position
+        self.assertEqual(g.scored_len([5, 7, 9], {7}), 2)
+        self.assertEqual(g.scored_len([5, 9], {7}), 2)
+
+    def test_trimming_keeps_a_position(self):
+        # one scored position (an immediate stop token): trimming never empties the sample, and
+        # the capture scores against itself; a zero fraction trims nothing.
+        pos = [dict(top=dist((7, 0.9), (9, 0.1)), margin=2.2)]
+        ref = dict(sha256="x", meta=dict(eos=[7]), cases=[dict(id="a", kind="chat", prompt_ids=[1], cont=[7], pos=pos)])
+        cap = dict(arm="a", ref_sha256="x", cases={"a": dict(free=[7], free_text="", pos={"0": pos[0]["top"]})})
+        s = g.score(ref, cap)
+        self.assertEqual((s["positions"], s["kl_trim_mean"], s["kl_mean"]), (1, 0.0, 0.0))
+        self.assertEqual(g.verdict(s, s), [])
+        ref["cases"][0].update(cont=[5, 7], pos=[dict(top=dist((5, 0.6), (9, 0.4)), margin=0.4), pos[0]])
+        cap["cases"]["a"].update(free=[5, 7], pos={"0": dist((9, 0.9), (5, 0.1)), "1": pos[0]["top"]})
+        self.assertGreater(g.score(ref, cap, kl_trim_frac=0.0)["kl_trim_mean"], 0.0)  # nothing trimmed
+        self.assertEqual(g.score(ref, cap, kl_trim_frac=0.01)["kl_trim_mean"], 0.0)  # the one outlier
 
     def test_needle_floor_is_absolute(self):
         peer = dict(self.peer, needle_acc=0.5)
@@ -193,6 +252,51 @@ class CampaignScoreTests(unittest.TestCase):
             up, down = campaign.gate_steps("llm_fp32_ref", dict(reference="/r.json", vllm_capture="/v.json"),
                                            "python3", Path(tmp), Path(tmp))
             self.assertEqual(down, [])
+            self.assertIn("--out " + str(Path(tmp) / "llm_fp32_ref" / "plow.json"), up[0])
+
+    def test_gate_steps_capture_each_concurrency(self):
+        import campaign
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = dict(reference="/r.json", vllm_hf="/hf", concurrency=[1, 8, 32])
+            up, down = campaign.gate_steps("llm_fp32_ref", cfg, "python3", Path(tmp), Path(tmp))
+            self.assertEqual(len(up), 3)
+            self.assertIn("--arm plow-c8 --concurrency 8", up[1])
+            self.assertIn("plow-c32.json", up[2])
+            self.assertEqual(len(down), 1)
+            self.assertIn("--arm vllm-c1 --concurrency 1", down[0])
+            self.assertIn("--arm vllm-c32 --concurrency 32", down[0])
+
+    def test_gate_score_per_concurrency(self):
+        import campaign
+        with tempfile.TemporaryDirectory() as tmp:
+            ref = make_ref(tmp)
+            d = Path(tmp) / "llm_fp32_ref"
+            d.mkdir()
+            (d / "plow-c1.json").write_text(json.dumps(make_cap(ref, "plow-c1")))
+            (d / "plow-c8.json").write_text(json.dumps(make_cap(ref, "plow-c8", flip_decisive=True)))
+            (Path(tmp) / "v1.json").write_text(json.dumps(make_cap(ref, "vllm-c1")))
+            (Path(tmp) / "v8.json").write_text(json.dumps(make_cap(ref, "vllm-c8")))
+            cfg = dict(reference=str(Path(tmp) / "ref.json"), needle_min=0.5, cont_drop_max=0.3, concurrency=[1, 8],
+                       vllm_capture={"c1": str(Path(tmp) / "v1.json"), "c8": str(Path(tmp) / "v8.json")})
+            res = campaign.gate_score("llm_fp32_ref", cfg, d)
+            self.assertFalse(res["pass"])
+            self.assertTrue(res["by_concurrency"]["c1"]["pass"])
+            self.assertFalse(res["by_concurrency"]["c8"]["pass"])
+            self.assertTrue(all(w.startswith("c8:") for w in res["why"]), res["why"])
+            self.assertEqual(res["top1_decisive"], 1.0)  # headline = c1
+            # a missing same-concurrency peer fails the gate (a c1 peer is not the c8 distribution)
+            cfg["vllm_capture"] = {"c1": str(Path(tmp) / "v1.json")}
+            res = campaign.gate_score("llm_fp32_ref", cfg, d)
+            self.assertFalse(res["pass"])
+            self.assertEqual(res["why"], ["peer at c8 missing in vllm_capture"])
+            # a capture recorded at another concurrency than the one it is scored as fails
+            cfg["vllm_capture"] = {"c1": str(Path(tmp) / "v1.json"), "c8": str(Path(tmp) / "v8.json")}
+            (d / "plow-c8.json").write_text(json.dumps(dict(make_cap(ref, "plow-c8"), concurrency=1)))
+            res = campaign.gate_score("llm_fp32_ref", cfg, d)
+            self.assertFalse(res["pass"])
+            self.assertEqual(res["why"], ["c8: plow-c8.json captured at c1, scored as c8"])
+            (d / "plow-c8.json").write_text(json.dumps(dict(make_cap(ref, "plow-c8"), concurrency=8)))
+            self.assertTrue(campaign.gate_score("llm_fp32_ref", cfg, d)["pass"])
 
 
 class ScaledTensorTests(unittest.TestCase):

@@ -51,6 +51,8 @@
 #define plow_sm120_rider_flash256 plow_sm90a_rider_flash256
 #define plow_sm120_rider_flash512 plow_sm90a_rider_flash512
 #define plow_sm120_rider_merge plow_sm90a_rider_merge
+#define plow_sm120_state_copy plow_sm90a_state_copy
+#define plow_sm120_gdn_ride plow_sm90a_gdn_ride
 
 #include "interp_sm120.cu"
 

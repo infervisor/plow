@@ -56,7 +56,11 @@ def load(resdir):
         rows = [dict(zip(head, map(float, ln.split("\t")))) for ln in f if ln.strip()]
     cells = {}
     for ln in open(f"{resdir}/cells.log"):
-        k, tag, t = ln.split()
+        # CELL_BEGIN/CELL_END only; a CELL_RETRY line carries the attempt and its count.
+        parts = ln.split()
+        if len(parts) != 3:
+            continue
+        k, tag, t = parts
         cells.setdefault(tag, {})[k] = float(t)
     return rows, cells
 

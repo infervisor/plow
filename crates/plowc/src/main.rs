@@ -2251,9 +2251,11 @@ fn build_cubin_from_manifest(
         args.push("-DPLOW_SM120_CUBIN_SEG=ON".into());
     }
     // A required hd128 GQA grouping is correctness (the kernel traps on GF not dividing gqa).
+    // The Qwen GDN arms have no CMake option; without the define the prefill object reports
+    // `plow_qwen_prefill_arm = 0` and plowrt refuses the packet.
     let mut extra: Vec<String> = req
         .iter()
-        .filter(|d| d.starts_with("PLOW_NV_FA_GF="))
+        .filter(|d| d.starts_with("PLOW_NV_FA_GF=") || d.starts_with("PLOW_NV_QWEN_GDN="))
         .map(|d| format!("-D{d}"))
         .collect();
     for d in &rec {

@@ -1,0 +1,125 @@
+# Default-on LLM recipe template, H100 SXM5 (sm_90a), one GPU. Copy it to start a new model's
+# campaign; the first `campaign.py build` carries EVERY route plowrt already has. The campaign then
+# measures taking routes away, one at a time, and never discovers "a new technique" that was a
+# knob all along. Model-specific lines are marked `# <--`; everything else stays as it is unless a
+# measurement says otherwise, and that measurement is recorded next to the line it changed.
+#
+#   cp scripts/campaign/recipes/templates/llm-sm90a-default-on.toml scripts/campaign/recipes/<model>.h100.<prec>.toml
+#   nix develop --command python3 scripts/campaign/campaign.py build <that recipe> --out <fresh dir>
+#   nix develop --command scripts/bench/plowbench-doctor.sh <out>/assets <out>/assets <plowrt> sm_90a
+#
+# The doctor's capability inventory ([8]) fails on any route the built packet does NOT carry
+# unless this recipe waives it in [capabilities] with the measured reason. Promotion to
+# recipes/infervisor/<model>/<cell>.toml keeps the waivers and their reasons.
+#
+# What a packet can lack and why that is allowed (the only accepted waiver reasons):
+#   prefix_cache      recurrent state (GDN/Mamba) without a boundary snapshot (plowrt refuses it)
+#   token_batch       no packed prefill or no compact terminal on the packet (decode rows ride the
+#                     packed launch; a recurrent chain also needs the packed scan's init-state scratch)
+#   decode_ladder     a model whose decode is bound by one rung at every width (show the step grid)
+#   cublaslt_prefill  the interpreter GEMM measured at or above Lt on every bucket (route matrix)
+#   generated_kernels no generated role for the model's attention geometry (name the geometry)
+# "Not measured yet" is not a waiver.
+
+schema = "plow.recipe.v1"
+namespace = "infervisor"
+name = "MODEL"                                      # <-- e.g. "qwen3.8-27b"
+label = "sm90a-h100-tp1"
+status = "trial"
+network = "NETWORK"                                 # <-- devgen network id, e.g. "qwen3.5", "gemma4"
+
+[target]
+vendor = "nvidia"
+isa = "sm_90a"
+sku = "H100 SXM5"
+units = 132
+num_gpus = 1
+parallel = "tp"
+max_ctx = 16384                                     # <-- the served context; prompts pad to a bucket
+toolchain = "cuda-12.9-nix"
+
+[checkpoint]
+source = "hf:ORG/MODEL"                             # <--
+layout = "hf-bf16"                                  # <-- hf-bf16 | hf-fp8
+
+[cell]
+name = "MODEL.h100.bf16-16k"                        # <--
+model = "ORG/MODEL"                                 # <--
+revision = "local"
+hf_dir = "{env:MODEL_CHECKPOINT}"                   # <--
+gpu = "H100 SXM5"
+arch = "sm_90a"
+n_cu = 132
+max_ctx = 16384
+precision = "bf16"                                  # <--
+
+[emit]
+emit = "devblob+cubin"
+args = []
+[emit.env]
+# Prefill buckets: prompts pad to the next bucket; the widest equals max_ctx or the request chunk.
+# The knob is per network: PLOW_QWEN_PREFILL (qwen3.5), PLOW_PF_LADDER / PLOW_PF_LADDER_APPEND
+# (gemma4, the default ladder plus extra rungs). Keep the 8192 rung (plans: always-8K prefill).
+PLOW_QWEN_PREFILL = "128,1024,4096,8192"            # <--
+# Packed prefill: concurrent prompts share one launch (masked padding); the compact terminal takes
+# the first token from the prefill launch instead of a decode step.
+PLOW_EMIT_PACKED_PREFILL = "1"
+PLOW_MAX_REQUEST_CHUNK = "4096"
+# Decode ladder: one program per width; plowrt picks the smallest rung that fits the batch.
+PLOW_DECODE_BATCH_LADDER = "1,2,4,8,16,32,48,64"    # <-- top rung = the slot budget the planner reports
+# Dense projections on cuBLASLt where the interpreter GEMM is slower (prefill always; decode from
+# the measured width — the Gemma 12B/E4B rows in recipes/infervisor say 128 and 1).
+PLOW_EMIT_PREFILL_CUBLASLT = "1"
+PLOW_EMIT_DECODE_CUBLASLT = "1"
+PLOW_EMIT_DECODE_CUBLASLT_MIN_ROWS = "128"
+PLOW_EMIT_DECODE_CUBLASLT_HEAD = "1"
+# Generated role kernels for the model's attention geometry (scripts/gen_kernels/build_catalog.py names).
+PLOW_EMIT_GEN_KERNELS = "attn_pf_hd256_causal"      # <-- hd128/hd256 causal, sliding, fp8kv variants
+PLOW_FUSE_ARGMAX = "1"
+
+# Generated role objects: either a [[prep]] step that runs scripts/gen_kernels/build_catalog.py for the names
+# above (recipes/infervisor/qwen3.8-27b), or [objects] role_files + PLOW_BUILD_GEN_KERNELS when the
+# model's segment script builds them (recipes/infervisor/gemma-4-e4b).         # <--
+
+[serve.env]
+# Live KV: KV reserved virtually at the ceiling, committed per slot as the frontier grows.
+PLOW_VMM_LIVE = "1"
+# Prefix reuse (VMM prefix pool). Recurrent networks: plowrt refuses it; waive it below.
+PLOW_PREFIX_CACHE = "1"
+PLOW_VMM_PREFIX = "1"
+# Decode rows ride prefill launches (token batch): packed prefill + compact terminal on the packet.
+PLOW_TOKEN_BATCH = "1"
+
+# Routes the packet does not carry, with the measured reason (see the header). Empty means the
+# doctor requires every route on.
+[capabilities]
+
+[bench]
+backend = "openai"
+in_lens = "128 1024 4096"
+concs = "1"
+nprompt = 32
+outlen = 128
+warmups = 2
+seed = 42
+tokenizer = "{env:MODEL_CHECKPOINT}"                # <--
+
+[bench.profiles.realtime]
+in_lens = "128 1024 4096"
+concs = "1 4"
+nprompt = 32
+
+[bench.profiles.high_concurrency]
+in_lens = "128 1024 4096 7000 15000"
+concs = "16 32 64 128"
+nprompt = 384
+
+# FP32-reference gate (scripts/llm/fp32_ref_gate.py): plow within vLLM's distance to FP32 at c1 AND
+# at the serving concurrencies, each against the vLLM capture taken at the same concurrency
+# (docs/bringup/agent-tools.md §5). Build ref.json once; capture vLLM at 1, 8 and 32 in one lease.
+[gates]
+python = "{env:PYREF}"
+[gates.llm_fp32_ref]
+reference = "{env:MODEL_FP32_REF}"                  # <--
+concurrency = [1, 8, 32]
+vllm_capture = { c1 = "{env:MODEL_FP32_VLLM_C1}", c8 = "{env:MODEL_FP32_VLLM_C8}", c32 = "{env:MODEL_FP32_VLLM_C32}" }   # <--

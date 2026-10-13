@@ -1462,6 +1462,33 @@ pub struct NvidiaRuntimeConfig {
     #[arg(long = "tb-split-attn", env = "PLOW_TB_SPLIT_ATTN", default_value_t = true, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
     pub tb_split_attn: bool,
 
+    /// Riders attend through the packet's generated flash-decode object (catalog
+    /// `gen_flash_decode_v1`, one launch per site) when it carries one at the site's geometry;
+    /// `=false` keeps the decode object's `rider_*` split-KV kernels.
+    #[arg(long = "tb-gen-decode", env = "PLOW_TB_GEN_DECODE", default_value_t = true, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
+    pub tb_gen_decode: bool,
+
+    /// Decode rungs of at least this many rows run each attention pair the packet declares
+    /// with the generated decode role (an isolated FlashDecode + FlashMerge) as one launch of
+    /// the generated flash-decode object between interpreter windows; narrower rungs, and 0,
+    /// run the untouched interpreter pair in one launch. 4: the object wins from four rows
+    /// (Qwen3.8-27B H100, knob_spec evidence); at one or two rows the interpreter's single
+    /// launch is as fast or faster.
+    #[arg(
+        long = "gen-decode-step",
+        env = "PLOW_GEN_DECODE_STEP",
+        default_value_t = 4,
+        global = true
+    )]
+    pub gen_decode_step: u32,
+
+    /// The generated flash decode's split count is the SM cover alone (it no longer drops with
+    /// the step's widest KV length below two tiles per split), so a routed rung's launch
+    /// arguments are static and the rung is graph-captured. Off: the split count follows the KV
+    /// length and the rung enqueues its chain every step.
+    #[arg(long = "gen-decode-pin-nsplit", env = "PLOW_GEN_DECODE_PIN_NSPLIT", default_value_t = true, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
+    pub gen_decode_pin_nsplit: bool,
+
     /// Gemma hd256 light attention levels run `plow_<arch>_light_attn_s` (hd256 bodies only,
     /// two blocks per SM, twice the blocks): E4B B=64/128 ctx 1024 7.63/9.70 -> 7.56/9.54 ms,
     /// digests equal. Off: they run `light_attn`, one block per SM.
@@ -1473,10 +1500,38 @@ pub struct NvidiaRuntimeConfig {
     #[arg(long = "decode-head-argmax", env = "PLOW_DECODE_HEAD_ARGMAX", default_value_t = true, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
     pub decode_head_argmax: bool,
 
+    /// The packed compact terminal's lm_head (the pack's gathered last rows) runs as one cuBLASLt
+    /// matmul at the terminal's capacity between its gather/norm and argmax windows.
+    #[arg(long = "terminal-lt", env = "PLOW_TERMINAL_LT", default_value_t = true, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
+    pub terminal_lt: bool,
+
     /// A prefill bucket's lone RmsNorm / Residual / SiLU Glu segments run as ordinary launches
     /// of the decode object's `plow_<arch>_light_pf` kernel instead of interpreter windows.
     #[arg(long = "prefill-light", env = "PLOW_PREFILL_LIGHT", default_value_t = true, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
     pub prefill_light: bool,
+
+    /// The Qwen3.5 chain's pointwise prefill segments (buckets of >= 1024 rows) run as launches
+    /// of the prefill object's `plow_<arch>_light_pf` kernel on this many blocks per SM instead
+    /// of interpreter windows. 0 = windows.
+    #[arg(
+        long = "qwen-light-occ",
+        env = "PLOW_QWEN_LIGHT_OCC",
+        default_value_t = 4,
+        global = true
+    )]
+    pub qwen_light_occ: u32,
+
+    /// A cuBLASLt-routed decode rung's Qwen3.5 pointwise windows (norms, gates, rope) run as
+    /// `plow_<arch>_light_pf` launches on the `--qwen-light-occ` grid instead of interpreter
+    /// windows (the same block-per-row bodies: the outputs are the window's).
+    #[arg(long = "qwen-light-decode", env = "PLOW_QWEN_LIGHT_DECODE", default_value_t = true, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
+    pub qwen_light_decode: bool,
+
+    /// A packed Qwen3.5 prefill chunk's segments between its per-tick launches (the external GDN
+    /// segments, the rider attention) replay as CUDA graph pieces captured once per bucket
+    /// (needs `--pf-seg-graph`).
+    #[arg(long = "qwen-pf-graph", env = "PLOW_QWEN_PF_GRAPH", default_value_t = true, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
+    pub qwen_pf_graph: bool,
 
     /// A routed decode rung's q, k and v projections run as one cuBLASLt matmul when their
     /// weights are contiguous and a light attention launch reads the three outputs.
@@ -2399,7 +2454,18 @@ impl RuntimeConfig {
     /// KV admission budget from the device's `free`/`total` bytes after load: the headroom share
     /// of free, capped by `--kv-mem-util` of the device when that is set.
     pub(crate) fn kv_admit_budget(&self, free: u64, total: u64) -> u64 {
-        let budget = (free as f64 * self.kv_admit_headroom()) as u64;
+        self.kv_admit_capped((free as f64 * self.kv_admit_headroom()) as u64, free, total)
+    }
+
+    /// The live admission share of `free`: everything above the absolute `reserve` fixed at load
+    /// (free-after-load minus the load-time budget). A fraction of the *current* free would hand
+    /// out 90% of whatever is left on every re-read and leave no margin for the blocks already
+    /// promised to live sequences; the reserve keeps that margin constant.
+    pub(crate) fn kv_admit_live(&self, free: u64, total: u64, reserve: u64) -> u64 {
+        self.kv_admit_capped(free.saturating_sub(reserve), free, total)
+    }
+
+    fn kv_admit_capped(&self, budget: u64, free: u64, total: u64) -> u64 {
         let util = select_compat(
             self.amd.kv_mem_util,
             Self::env_parse("PLOW_KV_MEM_UTIL"),

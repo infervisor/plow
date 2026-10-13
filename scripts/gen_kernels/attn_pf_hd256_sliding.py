@@ -85,7 +85,7 @@ def wgmma_inc():
     return head + "".join(qk(n) for n in (32, 64)) + "".join(pv(bn) for bn in (32, 64))
 
 
-def digest(cfg, fp8=False, span=False):
+def digest(cfg, fp8=False, span=False, ilv=False):
     """Generator identity of one config: the template sources plus the defines."""
     import hashlib
     h = hashlib.sha256()
@@ -94,12 +94,16 @@ def digest(cfg, fp8=False, span=False):
     h.update(json.dumps(cfg, sort_keys=True).encode())
     if span:
         h.update(b"GEN_MEDIA_SPAN=1")
+    if ilv:
+        h.update(b"GEN_KV_ILV=1")
     return h.hexdigest()
 
 
-def build(out, cfg, fp8=False, span=False):
-    """`span` compiles the FP8-KV media-span twin (GEN_MEDIA_SPAN=1)."""
+def build(out, cfg, fp8=False, span=False, ilv=False):
+    """`span` compiles the FP8-KV media-span twin (GEN_MEDIA_SPAN=1); `ilv` the head-interleaved
+    KV twin (GEN_KV_ILV=1, bf16 KV only)."""
     assert fp8 or not span, "media spans are FP8-KV only"
+    assert not (fp8 and ilv), "the head-interleaved KV twin is bf16 only"
     nvcc = os.environ.get("PLOW_NVCC", "/usr/local/cuda-12.9/bin/nvcc")
     cmd = [nvcc, "-ccbin", os.environ.get("PLOW_CXX", "/usr/bin/g++-14"), "-std=c++17",
            "-gencode", "arch=compute_90a,code=sm_90a", "-O3", "-cubin", "-Xptxas=-v",
@@ -107,6 +111,7 @@ def build(out, cfg, fp8=False, span=False):
            f"-DGEN_BN={cfg['bn']}", f"-DGEN_KSTAGES={cfg['kstages']}",
            f"-DGEN_VSTAGES={cfg['vstages']}", f"-DGEN_PREG={cfg['preg']}",
            f"-DGEN_CREG={creg(cfg['preg'])}", *(["-DGEN_MEDIA_SPAN=1"] if span else []),
+           *(["-DGEN_KV_ILV=1"] if ilv else []),
            "-o", str(out), str(SOURCE_FP8 if fp8 else SOURCE)]
     res = subprocess.run(cmd, capture_output=True, text=True)
     if res.returncode:
@@ -634,11 +639,11 @@ def tune_row(log=print, fp8=False, span=False):
             "packed_check": best[2], "spill_bytes": 0}
 
 
-def catalog_build(cfg, out, fp8=False, span=False):
+def catalog_build(cfg, out, fp8=False, span=False, ilv=False):
     """build_catalog.py hook: compile one config, return its generator digest."""
-    if build(out, cfg, fp8, span):
+    if build(out, cfg, fp8, span, ilv):
         raise RuntimeError(f"attn_pf_hd256_sliding{'_fp8kv' if fp8 else ''} {cfg} spills")
-    return digest(cfg, fp8, span)
+    return digest(cfg, fp8, span, ilv)
 
 
 def cmd_tune(a):
