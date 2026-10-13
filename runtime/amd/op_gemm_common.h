@@ -349,13 +349,20 @@ __device__ __forceinline__ unsigned gm_remap(unsigned lin, unsigned n_tiles, uns
 #ifndef PLOW_GLM_FUSE_POST
 #define PLOW_GLM_FUSE_POST 0
 #endif
+/* ROUTE (d_gemm_t): output columns [off_g, off_g + n[g]) of the N-wide product land row-major in
+ * c[g] (width n[g]); the products and their K order are the plain path's. */
+#define PLOW_GEMM_ROUTES 6
+struct PlowGemmRoute {
+    bf16* c[PLOW_GEMM_ROUTES];
+    unsigned n[PLOW_GEMM_ROUTES];
+};
 template <int BM, int BN, int BK, int WM, int WN, bool NORM, int SWZ = GM_SWZ, int WGM = GM_WGM,
           bool PP = (GM_PP != 0), bool KEXACT = true, bool GLU = false, bool WFP4 = false,
           bool WFP8BLK = false, bool CF32 = false
 #if PLOW_GLM_FUSE_POST
           , bool ROPE = false
 #endif
-          , bool SPLITK = false>
+          , bool SPLITK = false, bool ROUTE = false>
 __device__ void d_gemm_t(bf16* __restrict__ C, const bf16* __restrict__ A,
                          const bf16* __restrict__ B, const float* __restrict__ rms,
                          const bf16* __restrict__ gamma, unsigned M, unsigned N, unsigned K,
@@ -369,7 +376,8 @@ __device__ void d_gemm_t(bf16* __restrict__ C, const bf16* __restrict__ A,
                          const float* __restrict__ rsin = nullptr,
                          const int* __restrict__ rpos = nullptr, unsigned roff = 0
 #endif
-                         , unsigned ldk = 0) {
+                         , unsigned ldk = 0, const PlowGemmRoute* route = nullptr) {
+    (void)route;
     /* SPLITK: A and B are already offset to this K slice and K is the slice length; the row
      * stride stays the full K (`ldk`). Off, LDK folds to K and the codegen is unchanged. */
     const unsigned LDK = SPLITK ? ldk : K;
@@ -1012,7 +1020,12 @@ __device__ void d_gemm_t(bf16* __restrict__ C, const bf16* __restrict__ A,
                 for (int e = 0; e < 16; e++) {
                     const unsigned mm = m0 + wm * (BM / WM) + i * MFMA_M + mfma_acc_m(lane, e);
                     if (mm < M) {
-                        if constexpr (CF32)
+                        if constexpr (ROUTE) {
+                            unsigned g = 0, col = nn;
+                            while (g + 1 < PLOW_GEMM_ROUTES && col >= route->n[g]) col -= route->n[g++];
+                            st_act1(&as_glob(route->c[g])[(size_t)mm * route->n[g] + col],
+                                    f2bf(acc[i][j][e]));
+                        } else if constexpr (CF32)
                             as_glob(reinterpret_cast<float*>(C))[(size_t)mm * N + nn] =
                                 acc[i][j][e];
                         else
@@ -2513,7 +2526,10 @@ template <bool SCATTER = false>
 __device__ void d_quant_fp8_block128(unsigned char* __restrict__ xq_,
                                     const bf16* __restrict__ x_, float* __restrict__ scale_,
                                     unsigned M, unsigned K, unsigned slice, unsigned nblk,
-                                    const unsigned* row_partidx = nullptr, unsigned slots = 0) {
+                                    const unsigned* row_partidx = nullptr, unsigned slots = 0,
+                                    unsigned pitch = 0) {
+    /* pitch: the scale grid's row stride when it must not follow M (0 = M). */
+    const unsigned spitch = SCATTER ? slots : (pitch ? pitch : M);
     const auto* x = as_glob(x_);
     auto* xq = as_glob(xq_);
     auto* scale = as_glob(scale_);
@@ -2537,7 +2553,7 @@ __device__ void d_quant_fp8_block128(unsigned char* __restrict__ xq_,
         amax = fmaxf(amax, __shfl_xor(amax, 2, 4));
         const float s = amax * (1.0f / 448.0f);
         const float inv = 1.0f / s;
-        if (lane == 0) st_act<float>(&scale[(size_t)(group % groups) * (SCATTER ? slots : M) + dst], s);
+        if (lane == 0) st_act<float>(&scale[(size_t)(group % groups) * spitch + dst], s);
 #pragma unroll
         for (unsigned j = 0; j < 32; j += 2) {
             const unsigned packed = PLOW_GM_FP8_PACK2(bf2f(values[j]) * inv, bf2f(values[j + 1]) * inv);

@@ -169,6 +169,7 @@ impl AmdEngine {
                 PrefillSegmentRoute::KdaChunkCarryKeyfeed { .. } => {
                     return "kda_carry_keyfeed";
                 }
+                PrefillSegmentRoute::GemmGroup { .. } => return "gemm_group",
                 PrefillSegmentRoute::KdaChunkKeyFactorWu { .. }
                     if self.k_kda_key_factor_wu.is_some() =>
                 {

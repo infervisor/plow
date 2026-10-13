@@ -966,6 +966,11 @@ mod tests {
     const ASSERT_SITES: &[(&str, &str, Site)] = &[
         (
             "mla.rs",
+            "PLOW_MOE_DEC_W8A8 requires PLOW_MOE_PF_W8A8",
+            Site::Encoded("moe_dec_w8a8_contract"),
+        ),
+        (
+            "mla.rs",
             "PLOW_MOE_PF_W8A8_SPLIT requires PLOW_MOE_PF_W8A8",
             Site::Encoded("moe_pf_w8a8_split_contract"),
         ),

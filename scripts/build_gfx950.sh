@@ -417,6 +417,7 @@ rm -f i_prefill.co i_decode.co i_flash.co tk.co \
       i_prefill_mla_moe.co i_prefill_mla_moe_gq.co \
       interp_prefill_mla_moe.elf interp_prefill_mla_moe_gq.elf \
       kda_decode_fused_gfx950.co kda_decode_fused_gfx950.elf \
+      kda_decode_wide_gfx950.co kda_decode_wide_gfx950.elf \
       kda_chunk_intra_cached_gfx950.co kda_chunk_intra_cached_gfx950.elf \
       kda_chunk_intra_wave_items_gfx950.co kda_chunk_intra_wave_items_gfx950.elf \
       attn_res_f32mix_gfx950.co attn_res_f32mix_gfx950.elf \
@@ -571,6 +572,18 @@ if [ "$ARCH" = gfx950 ] && [ "$need_kda_wu_lean" = 1 ]; then
   KDA_WU_LEAN_ELFS="kda_chunk_wu_lean_gfx950.elf"
 fi
 
+# DevOp::GemmGroupPf: the grouped prefill projection segment (packet-required only).
+GEMM_GROUP_ELFS=""
+if [ "$ARCH" = gfx950 ] && [ -n "${PLOW_HSACO_CONFIG:-}" ] &&
+   grep -qx '#define PLOW_PACKET_REQUIRES_GEMM_GROUP_PF 1' "$PLOW_HSACO_CONFIG"; then
+  bash "$R/cmake/hipcc_hsaco.sh" hipcc "$BUN" "$ARCH" \
+    "$OUT/gemm_group_pf_gfx950.elf" \
+    plow_gemm_group_pf_gfx950 256 2 \
+    $INC -DPLOW_LEAN_OBJECT=1 -DPLOW_REQUIRED_MARKER=plow_gemm_group_pf_abi_1 \
+    "$R/amd/gemm_group_pf.hip"
+  GEMM_GROUP_ELFS="gemm_group_pf_gfx950.elf"
+fi
+
 KDA_CARRY_KEYFEED_ELFS=""
 case "${PLOW_KDA_CARRY_KEYFEED:-0}" in
   0|1) ;;
@@ -660,7 +673,14 @@ if [ "$ARCH" = gfx950 ] && [ "$need_kda_fused" = 1 ]; then
     $INC -DPLOW_LEAN_OBJECT=1 -DPLOW_NO_SPILL=1 \
     -DPLOW_REQUIRED_MARKER=plow_kda_decode_fused_256x16_2 \
     "$R/amd/kda_decode_fused.hip"
-  KDA_FUSED_ELFS="kda_decode_fused_gfx950.elf"
+  # Descriptor version 3 (PLOW_KDA_DECODE_WIDE): the batched-rung chain through the decode
+  # object's own bodies, so it carries the decode object's bit-identical body defines.
+  bash "$R/cmake/hipcc_hsaco.sh" hipcc "$BUN" "$ARCH" \
+    "$OUT/kda_decode_wide_gfx950.elf" plow_kda_decode_wide_v3 128 2 \
+    $INC -DPLOW_LEAN_OBJECT=1 -DPLOW_NO_SPILL=1 -DPLOW_BUCKET_DECODE=1 -DPLOW_KDA_WIDE_PF=1 \
+    -DPLOW_WAVE_RED_DPP=1 -DPLOW_REQUIRED_MARKER=plow_kda_decode_wide_3 \
+    "$R/amd/kda_decode_wide.hip"
+  KDA_FUSED_ELFS="kda_decode_fused_gfx950.elf kda_decode_wide_gfx950.elf"
 fi
 
 # Opt-in lean MoE body variants requested at emit (PLOW_MOE_STAGE1_BODY / PLOW_MOE_STAGE2_BODY).
@@ -1466,7 +1486,7 @@ if [ "$BUILD_GEMMA_MOE" = 1 ]; then
   fi
 fi
 
-ALL_ELFS="interp_prefill.elf interp_decode.elf interp_flash.elf test_kernels.elf $K3_ELFS $DECODE_MLA_ELFS $KDA_FUSED_ELFS $KDA_INTRA_CACHED_ELFS $KDA_INTRA_WAVE_ITEMS_ELFS $ATTN_RES_F32MIX_ELFS $KDA_CARRY_REGSTATE_ELFS $KDA_WU_LEAN_ELFS $KDA_CARRY_KEYFEED_ELFS $MLA_PF_DENSE_ELFS $KDA_KEY_FACTOR_ELFS $XR_ATTNRES_ELFS $MOE_STAGE1_ELFS $MOE_STAGE2_ELFS $MOE_COMBINE_ELFS $MOE_EP_ELFS $MOE_DECODE_GROUPED_ELFS $MLA_MATERIALIZED_ELFS $GQ_ELFS $FP8_ELFS $FP8KV_ELFS $MXFP4_ELFS $MLA_ELFS $MOE_ELFS $GMOE_ELFS"
+ALL_ELFS="interp_prefill.elf interp_decode.elf interp_flash.elf test_kernels.elf $K3_ELFS $DECODE_MLA_ELFS $KDA_FUSED_ELFS $KDA_INTRA_CACHED_ELFS $KDA_INTRA_WAVE_ITEMS_ELFS $ATTN_RES_F32MIX_ELFS $KDA_CARRY_REGSTATE_ELFS $KDA_WU_LEAN_ELFS $GEMM_GROUP_ELFS $KDA_CARRY_KEYFEED_ELFS $MLA_PF_DENSE_ELFS $KDA_KEY_FACTOR_ELFS $XR_ATTNRES_ELFS $MOE_STAGE1_ELFS $MOE_STAGE2_ELFS $MOE_COMBINE_ELFS $MOE_EP_ELFS $MOE_DECODE_GROUPED_ELFS $MLA_MATERIALIZED_ELFS $GQ_ELFS $FP8_ELFS $FP8KV_ELFS $MXFP4_ELFS $MLA_ELFS $MOE_ELFS $GMOE_ELFS"
 
 # Every interpreter is compiled against the packed-prefill PlowProgram tail. This is an ABI
 # marker, not a claim that descriptor-consuming math arms are enabled.

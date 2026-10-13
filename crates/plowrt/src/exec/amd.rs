@@ -61,7 +61,7 @@ use object::{
     required_qwen_gdn_op, resolve_flash_object_load, sparse_fp8, BF16_KV_OPS, FP8_KV_OPS,
     FP8_KV_SYM, FP8_WEIGHT_OPS, GATE_HIER_SYM, KDA_CARRY_KEYFEED_MARKERS, KDA_CARRY_REGSTATE_LDS,
     KDA_CHUNK_QPRE_SYM, KDA_CONV_STEP_DB_REPLACED_OPS, KDA_FAMILY_SEG_SYM, KDA_WU_LEAN_LDS,
-    KDA_WU_LEAN_MARKERS, L2_DISPATCH_SYM, MLA_PF_V2_FP8_SYM, MLA_PF_V2_SYM, MOE_ENC_MXFP4,
+    KDA_WU_LEAN_MARKERS, GEMM_GROUP_LDS, L2_DISPATCH_SYM, MLA_PF_V2_FP8_SYM, MLA_PF_V2_SYM, MOE_ENC_MXFP4,
     MOE_GEMMA_OPS, MOE_GEMMA_PF_OPS, PACKED_PREFILL_ABI_SYM, PACKED_PREFILL_BAND_SYM,
     PACKED_PREFILL_KDA_CHUNK_SEG_SYM, PACKED_PREFILL_KDA_SEG_SYM, PACKED_PREFILL_MLA_FLASH_SEG_SYM,
     PACKED_PREFILL_MLA_NOPE_SYM, PACKED_PREFILL_MLA_NORM_SEG_SYM, XR_ATTNRES_RESOURCE_SYM, XR_ATTNRES_SEG_SYM, XR_TAGGED_SYM,
@@ -560,6 +560,23 @@ struct KdaDecodeFusedArgs {
 
 const _: () = assert!(std::mem::size_of::<KdaDecodeFusedArgs>() == 184);
 
+/// Op 125 descriptor version 3 (`kda_decode_wide.hip`): version 2's operands plus the chain's
+/// bf16 intermediates, which the standalone object still round-trips so it can run the
+/// interpreter's bodies verbatim.
+#[derive(Clone, Copy, Debug)]
+#[repr(C)]
+struct KdaDecodeWideArgs {
+    base: KdaDecodeFusedArgs,
+    mix_q: u64,
+    mix_k: u64,
+    mix_v: u64,
+    o: u64,
+}
+
+// The kernel's parameter list places `mq` right after `norm_eps`, at 184.
+const _: () = assert!(std::mem::offset_of!(KdaDecodeWideArgs, mix_q) == 184);
+const _: () = assert!(std::mem::size_of::<KdaDecodeWideArgs>() == 216);
+
 #[derive(Clone, Copy, Debug)]
 #[repr(C)]
 struct GroupedMoeGluArgs {
@@ -740,6 +757,20 @@ struct KdaChunkWuLeanArgs {
 }
 
 const _: () = assert!(std::mem::size_of::<KdaChunkWuLeanArgs>() == 104);
+
+/// Kernarg of `plow_gemm_group_pf_gfx950` (runtime/amd/gemm_group_pf.hip).
+#[derive(Clone, Copy, Debug)]
+#[repr(C)]
+struct GemmGroupArgs {
+    x: u64,
+    w: u64,
+    c: [u64; 6],
+    n: [u32; 6],
+    t: u32,
+    k: u32,
+}
+
+const _: () = assert!(std::mem::size_of::<GemmGroupArgs>() == 96);
 
 #[derive(Clone, Copy, Debug)]
 #[repr(C)]
@@ -1068,6 +1099,14 @@ enum PrefillSegmentRoute {
     /// Lean four-wave Wu; `args.key_hi != 0` selects the key-emitting object.
     KdaChunkWuLean {
         args: KdaChunkWuLeanArgs,
+        grid: u32,
+        tens: [u16; 8],
+    },
+    /// [`DevOp::GemmGroupPf`]: grouped prefill projection, one workgroup per output tile.
+    /// `tens`: the instruction's operand handles; their addresses are re-read from the live
+    /// tensor table at each launch (band views rebind per chunk).
+    GemmGroup {
+        args: GemmGroupArgs,
         grid: u32,
         tens: [u16; 8],
     },
@@ -1808,6 +1847,73 @@ fn promote_kda_carry_regstate_routes(
                 _pad: 0,
             },
             grid: kda_carry_regstate_grid(d.i[1]),
+            tens: d.t,
+        };
+    }
+    Ok(())
+}
+
+/// Workgroups of a [`DevOp::GemmGroupPf`] launch at `t` rows: one per 128x384 tile of the
+/// concatenated width.
+fn gemm_group_grid(t: u32, n: &[u32; 6]) -> u32 {
+    t.div_ceil(128) * n.iter().sum::<u32>().div_ceil(384)
+}
+
+fn promote_gemm_group_routes(
+    prog: &DevProg,
+    segments: usize,
+    devp: &[DeviceMem],
+    routes: &mut [PrefillSegmentRoute],
+) -> Result<()> {
+    let native = |i: &DevInst64| i.op == DevOp::GemmGroupPf as u16;
+    if !prog.insts.iter().any(native) {
+        return Ok(());
+    }
+    let owners = amd_gemm_lt::segment_owners(prog, segments, native)?;
+    let addr = |h: u16| -> Result<u64> {
+        devp.get(h as usize).map(|m| m.base).ok_or_else(|| {
+            RuntimeError::Device(format!("grouped GEMM operand handle {h} is invalid"))
+        })
+    };
+    for (ix, d) in prog.insts.iter().enumerate() {
+        if !native(d) {
+            continue;
+        }
+        let seg = owners[ix].ok_or_else(|| {
+            RuntimeError::Device(format!("grouped GEMM instruction {ix} has no segment"))
+        })?;
+        if !matches!(routes[seg], PrefillSegmentRoute::Interpreter) {
+            return Err(RuntimeError::Device(
+                "grouped GEMM overlaps another native route".into(),
+            ));
+        }
+        let n: [u32; 6] = d.i[2..8].try_into().unwrap();
+        let used = n.iter().take_while(|&&n| n != 0).count();
+        if d.i[0] == 0
+            || d.i[1] == 0
+            || d.i[1] % 64 != 0
+            || used == 0
+            || n[used..].iter().any(|&n| n != 0)
+            || d.t[..2 + used].contains(&packet::dev::TENSOR_NONE16)
+        {
+            return Err(RuntimeError::Device(format!(
+                "grouped GEMM instruction {ix} has invalid geometry/operands"
+            )));
+        }
+        let mut c = [0u64; 6];
+        for g in 0..used {
+            c[g] = addr(d.t[2 + g])?;
+        }
+        routes[seg] = PrefillSegmentRoute::GemmGroup {
+            args: GemmGroupArgs {
+                x: addr(d.t[0])?,
+                w: addr(d.t[1])?,
+                c,
+                t: d.i[0],
+                k: d.i[1],
+                n,
+            },
+            grid: gemm_group_grid(d.i[0], &n),
             tens: d.t,
         };
     }
@@ -2751,6 +2857,7 @@ enum DecodeSegmentRoute {
     Interpreter,
     MlaAttention,
     KdaDecodeFused(KdaDecodeFusedArgs),
+    KdaDecodeWide(KdaDecodeWideArgs),
     MoeAiter(amd_moe_aiter::Route),
     GemmLt(amd_gemm_lt::Route),
     SparseMlaDecode(amd_sparse_mla::DecodeRoute),
@@ -2916,6 +3023,12 @@ fn decode_segment_routes(
         let lower_bound = f32::from_bits(d.fj[1]);
         let scale = f32::from_bits(d.fj[0]);
         let norm_eps = f32::from_bits(d.fj[2]);
+        if version == 3 {
+            routes.push(DecodeSegmentRoute::KdaDecodeWide(kda_decode_wide_args(
+                inst_ix, d, tensors, init, devp,
+            )?));
+            continue;
+        }
         if !matches!(rows, 1 | 8)
             || heads == 0
             || dim != 128
@@ -3025,6 +3138,117 @@ fn decode_segment_routes(
         routes.push(DecodeSegmentRoute::KdaDecodeFused(a));
     }
     Ok(routes)
+}
+
+/// Op 125 descriptor version 3: the batched-rung chain (`kda_decode_wide.hip`, grid rows*heads).
+fn kda_decode_wide_args(
+    inst_ix: usize,
+    d: &DevInst64,
+    tensors: &[crate::asset::devblob::DevTensor],
+    init: &[u8],
+    devp: &[DeviceMem],
+) -> Result<KdaDecodeWideArgs> {
+    let (rows, heads, dim, bv, conv_w, flags, gate_mode) =
+        (d.i[0], d.i[1], d.i[2], d.i[3], d.i[4], d.i[5], d.i[6]);
+    let lower_bound = f32::from_bits(d.fj[1]);
+    let scale = f32::from_bits(d.fj[0]);
+    let norm_eps = f32::from_bits(d.fj[2]);
+    if rows < 2
+        || heads == 0
+        || dim != 128
+        || bv == 0
+        || !(1..=8).contains(&conv_w)
+        || flags != 3
+        || rows.checked_mul(heads).is_none()
+        || heads.checked_mul(dim).and_then(|p| p.checked_mul(dim)).is_none()
+        || gate_mode > 1
+        || !lower_bound.is_finite()
+        || !scale.is_finite()
+        || !norm_eps.is_finite()
+    {
+        return Err(RuntimeError::Device(format!(
+            "KdaDecodeFused v3 instruction {inst_ix} has unsupported geometry: rows={rows} H={heads} \
+             D={dim} BV={bv} W={conv_w} flags={flags:#x} gate={gate_mode}"
+        )));
+    }
+    const WORDS: usize = 15;
+    let desc_h = d.t[7] as usize;
+    let desc = tensors.get(desc_h).ok_or_else(|| {
+        RuntimeError::Device(format!(
+            "KdaDecodeFused v3 descriptor handle {desc_h} is outside {} tensors",
+            tensors.len()
+        ))
+    })?;
+    let bytes = desc
+        .init
+        .clone()
+        .and_then(|range| init.get(range))
+        .filter(|b| desc.bytes as usize == WORDS * 4 && b.len() == WORDS * 4)
+        .ok_or_else(|| {
+            RuntimeError::Device(format!(
+                "KdaDecodeFused v3 descriptor `{}` is not an initialized {}-byte handle table",
+                desc.name,
+                WORDS * 4
+            ))
+        })?;
+    let mut h = [0u32; WORDS];
+    for (slot, word) in h.iter_mut().zip(bytes.chunks_exact(4)) {
+        *slot = u32::from_le_bytes(word.try_into().expect("4"));
+    }
+    let addr = |h: u32, what: &str, optional: bool| -> Result<u64> {
+        if h == packet::dev::TENSOR_NONE_I {
+            return if optional {
+                Ok(0)
+            } else {
+                Err(RuntimeError::Device(format!(
+                    "KdaDecodeFused v3 required operand `{what}` is absent"
+                )))
+            };
+        }
+        devp.get(h as usize).map(|m| m.base).ok_or_else(|| {
+            RuntimeError::Device(format!(
+                "KdaDecodeFused v3 operand `{what}` handle {h} is outside {} tensors",
+                devp.len()
+            ))
+        })
+    };
+    let direct = |slot: usize, what: &str| addr(d.t[slot] as u32, what, false);
+    Ok(KdaDecodeWideArgs {
+        base: KdaDecodeFusedArgs {
+            y: direct(0, "y")?,
+            q_raw: direct(1, "q_raw")?,
+            k_raw: direct(2, "k_raw")?,
+            v_raw: direct(3, "v_raw")?,
+            wq: addr(h[0], "wq", false)?,
+            wk: addr(h[1], "wk", false)?,
+            wv: addr(h[2], "wv", false)?,
+            csq: addr(h[3], "csq", false)?,
+            csk: addr(h[4], "csk", false)?,
+            csv: addr(h[5], "csv", false)?,
+            forget_raw: direct(4, "forget_raw")?,
+            beta_raw: direct(5, "beta_raw")?,
+            output_gate_raw: addr(h[9], "output_gate_raw", false)?,
+            a_log: addr(h[6], "A_log", false)?,
+            dt_bias: addr(h[7], "dt_bias", false)?,
+            state: direct(6, "state")?,
+            norm_w: addr(h[8], "norm_w", false)?,
+            parked: addr(h[10], "parked", true)?,
+            rows,
+            heads,
+            dim,
+            bv,
+            conv_w,
+            flags,
+            gate_mode,
+            lower_bound,
+            scale,
+            norm_eps,
+        },
+        mix_q: addr(h[11], "mix_q", false)?,
+        mix_k: addr(h[12], "mix_k", false)?,
+        mix_v: addr(h[13], "mix_v", false)?,
+        o: addr(h[14], "o", false)?,
+    })
 }
 
 /// Sanity bound on `seg`, so a corrupt stream cannot make the host allocate
@@ -5215,6 +5439,47 @@ fn kv_skips_zeroing(name: &str) -> bool {
 /// bf16 would round away most of what the multiply just computed, and the packet
 /// declares f32 for that reason. There is no TP axis here — `[hidden]` is
 /// replicated on every rank — so this runs identically at any `--num-gpus`.
+/// `PLOW_KDA_PF_GROUP_GEMM`'s `…derived.in_proj_cat.weight`: this rank's slices of q|k|v|g_a|f_a|b
+/// stacked by rows (`DevOp::GemmGroupPf`'s weight). Each part shards as its own checkpoint name.
+/// `None` unless `name` is that derived name.
+fn kda_in_proj_cat(
+    c: &crate::asset::checkpoint::Checkpoint,
+    name: &str,
+    rank: u32,
+    n_gpu: u32,
+) -> Option<Result<Vec<u8>>> {
+    use crate::asset::shard::{shard_of, slice_for, Shard};
+    const KDA: &[&str] = &["q_proj", "k_proj", "v_proj", "g_a_proj", "f_a_proj", "b_proj"];
+    const QKVA: &[&str] = &["q_a_proj", "derived.kv_a_latent"];
+    let (stem, parts) = match name.strip_suffix("derived.in_proj_cat.weight") {
+        Some(stem) => (stem, KDA),
+        None => (name.strip_suffix("derived.qkv_a_cat.weight")?, QKVA),
+    };
+    let mut out = Vec::new();
+    for part in parts {
+        let pn = format!("{stem}{part}.weight");
+        let Some((src, shape)) = c.tensor_ex(&pn) else {
+            return Some(Err(RuntimeError::Device(format!(
+                "MISSING WEIGHT: {name} is DERIVED and needs `{pn}`"
+            ))));
+        };
+        let want = match shard_of(&pn) {
+            Shard::Replicated => src.len() as u64,
+            Shard::Column => src.len() as u64 / u64::from(n_gpu),
+            other => {
+                return Some(Err(RuntimeError::Device(format!(
+                    "{name}: part `{pn}` shards as {other:?}, not row-stackable"
+                ))))
+            }
+        };
+        match slice_for(&pn, src, shape, want, rank, n_gpu) {
+            Ok(slice) => out.extend_from_slice(&slice),
+            Err(e) => return Some(Err(e)),
+        }
+    }
+    Some(Ok(out))
+}
+
 fn fold_res_score(c: &crate::asset::checkpoint::Checkpoint, name: &str) -> Option<Result<Vec<u8>>> {
     let stem = name.strip_suffix("_res_score.weight")?;
     let bf16 = |n: &str| -> Option<Vec<f32>> {
@@ -5289,7 +5554,10 @@ fn preflight_weights(
         // DERIVED, and in no checkpoint by design — `fold_res_score` builds it from a norm
         // and a proj. Without this exemption a Kimi-K3 load reports 186 false MISSING
         // WEIGHTs before it starts.
-        if stripped.ends_with("_res_score.weight") {
+        if stripped.ends_with("_res_score.weight")
+            || stripped.ends_with(".derived.in_proj_cat.weight")
+            || stripped.ends_with(".derived.qkv_a_cat.weight")
+        {
             continue;
         }
         let Some((src, shape)) = c.tensor_ex(&td.name).or_else(|| c.tensor_ex(stripped)) else {
@@ -6182,6 +6450,7 @@ pub struct AmdEngine {
     /// Packet-paired interpreter containing only FlashMlaDecode+MlaMergeFold.
     k_decode_mla: Option<HsaKernel>,
     k_kda_decode_fused: Option<HsaKernel>,
+    k_kda_decode_wide: Option<HsaKernel>,
     k_grouped_moe_glu: Option<HsaKernel>,
     k_grouped_moe_down: Option<HsaKernel>,
     k_kda_chunk_intra_cached: Option<HsaKernel>,
@@ -6192,6 +6461,7 @@ pub struct AmdEngine {
     /// One reusable `[hi | lo]` BF16 key-factor pair, sized for the widest eligible program.
     _kda_key_factor_scratch: Option<DeviceMem>,
     k_kda_chunk_wu_lean: Option<HsaKernel>,
+    k_gemm_group: Option<HsaKernel>,
     k_mla_pf_dense: Option<HsaKernel>,
     k_mla_pf_gather: Option<HsaKernel>,
     k_kda_chunk_wu_lean_keys: Option<HsaKernel>,
@@ -6881,7 +7151,14 @@ impl AmdEngine {
         let need_qwen_prefill = required_qwen_gdn_op(blob.prefill_phase());
         let need_kda_chunk_decode = required_kda_chunk(blob.decode_phase());
         let need_kda_chunk_prefill = required_kda_chunk(blob.prefill_phase());
-        let need_kda_decode_fused = first_op_in(blob.decode_phase(), &[DevOp::KdaDecodeFused]);
+        // Op 125 descriptor version 3 is the batched-rung chain's own object.
+        let kda_decode_fused = |wide: bool| {
+            blob.decode_phase()
+                .flat_map(|p| p.insts.iter())
+                .any(|i| i.op == DevOp::KdaDecodeFused as u16 && (i.i[7] == 3) == wide)
+        };
+        let need_kda_decode_fused = kda_decode_fused(false).then_some(());
+        let need_kda_decode_wide = kda_decode_fused(true);
         let need_decode_mla_segments = blob.decode_phase().try_fold(false, |need, p| {
             Ok::<_, RuntimeError>(
                 need || decode_segment_kinds(p)?
@@ -6929,6 +7206,9 @@ impl AmdEngine {
             })
         };
         let need_kda_wu_lean = blob.prefill_phase().any(|p| marked_wu(p, false));
+        let need_gemm_group = blob
+            .prefill_phase()
+            .any(|p| p.insts.iter().any(|i| i.op == DevOp::GemmGroupPf as u16));
         let need_kda_carry_keyfeed = blob.prefill_phase().any(|p| marked_wu(p, true));
         if let Some(p) = blob
             .prefill_phase()
@@ -8216,6 +8496,47 @@ impl AmdEngine {
             None
         };
 
+        let k_kda_decode_wide = if need_kda_decode_wide {
+            if arch != "gfx950" {
+                return Err(RuntimeError::Device(format!(
+                    "KdaDecodeFused v3 requires gfx950, but this device is {arch}"
+                )));
+            }
+            const NAME: &str = "kda_decode_wide_gfx950.elf";
+            const MARKER: &str = "plow_kda_decode_wide_3";
+            const SYMBOL: &str = "plow_kda_decode_wide_v3";
+            let path = hsaco_dir.join(NAME);
+            let image = std::fs::read(&path).map_err(|e| {
+                RuntimeError::Device(format!(
+                    "op 125 v3 requires standalone object {}: {e}",
+                    path.display()
+                ))
+            })?;
+            if !elf_symbol_names(&image).contains(&MARKER) {
+                return Err(RuntimeError::Device(format!(
+                    "standalone KDA object {} does not advertise `{MARKER}`; refusing a stale object",
+                    path.display()
+                )));
+            }
+            let module = EngineDevice::module_load(&*be, &image)
+                .map_err(|e| RuntimeError::Device(format!("{}: {e}", path.display())))?;
+            let kernel = EngineDevice::get_function(&*be, &module, SYMBOL)
+                .map_err(|e| RuntimeError::Device(format!("{NAME}: no symbol {SYMBOL}: {e}")))?;
+            const IMPLICIT: u32 = 256;
+            let want = (std::mem::size_of::<KdaDecodeWideArgs>() as u32 + 7) & !7;
+            let got = kernel.kernarg_size();
+            if got != want && got != want + IMPLICIT {
+                return Err(RuntimeError::Device(format!(
+                    "{NAME}: kernarg segment is {got} B; the v3 ABI needs {want} (or {})",
+                    want + IMPLICIT
+                )));
+            }
+            modules.push(module);
+            Some(kernel)
+        } else {
+            None
+        };
+
         let (k_grouped_moe_glu, k_grouped_moe_down) = if need_grouped_moe {
             if arch != "gfx950" {
                 return Err(RuntimeError::Device(format!(
@@ -8477,6 +8798,18 @@ impl AmdEngine {
             tracing::info!(object = %path.display(), symbol, "{what} object accepted");
             modules.push(module);
             Ok(kernel)
+        };
+        let k_gemm_group = if need_gemm_group {
+            Some(load_kda_lean(
+                "gemm_group_pf_gfx950.elf",
+                "plow_gemm_group_pf_gfx950",
+                "grouped prefill GEMM",
+                &["plow_gemm_group_pf_abi_1"],
+                std::mem::size_of::<GemmGroupArgs>() as u32,
+                GEMM_GROUP_LDS,
+            )?)
+        } else {
+            None
         };
         let k_kda_chunk_wu_lean = if need_kda_wu_lean {
             Some(load_kda_lean(
@@ -9816,7 +10149,9 @@ impl AmdEngine {
                 // tensor, and skipping it would shift every later tensor's index
                 // against the table the packet was compiled with.
                 let folded = match src_ckpt {
-                    Some(c) => fold_res_score(c, &td.name).transpose()?,
+                    Some(c) => fold_res_score(c, &td.name)
+                        .or_else(|| kda_in_proj_cat(c, &td.name, rank, n_gpu))
+                        .transpose()?,
                     None => None,
                 };
                 if let Some(folded) = folded {
@@ -10367,6 +10702,7 @@ impl AmdEngine {
                     &mut prefill_routes,
                     kda_keyfeed_scratch,
                 )?;
+                promote_gemm_group_routes(p, seg_class.len(), &devp, &mut prefill_routes)?;
                 if k_mla_pf_dense.is_some() {
                     let mut promoted = 0usize;
                     for (seg, route) in amd_mla_pf_dense::routes(p, &devp, seg_class.len())?
@@ -11397,6 +11733,7 @@ impl AmdEngine {
             k_decode,
             k_decode_mla,
             k_kda_decode_fused,
+            k_kda_decode_wide,
             k_grouped_moe_glu,
             k_grouped_moe_down,
             k_kda_chunk_intra_cached,
@@ -11406,6 +11743,7 @@ impl AmdEngine {
             k_kda_key_factor_carry,
             _kda_key_factor_scratch: d_kda_key_factor_scratch,
             k_kda_chunk_wu_lean,
+            k_gemm_group,
             k_mla_pf_dense,
             k_mla_pf_gather,
             k_kda_chunk_wu_lean_keys,
@@ -12751,6 +13089,39 @@ impl AmdEngine {
             self.seg_launches += 3;
             return Ok(());
         }
+        // Class A (row-pure over the dense live rows): runs whether or not a packed binding is
+        // staged, like the hipBLASLt route below.
+        if let Some(PrefillSegmentRoute::GemmGroup { args, grid, tens }) =
+            self.progs[p].prefill_routes.get(seg).copied()
+        {
+            let kernel = self.k_gemm_group.ok_or_else(|| {
+                RuntimeError::Device("grouped GEMM segment has no validated object".into())
+            })?;
+            let grid = self.seg_route_grid(p, seg, grid);
+            let addr = |h: u16| {
+                let at = usize::from(h) * 8;
+                u64::from_le_bytes(self.tens_table[at..at + 8].try_into().unwrap())
+            };
+            let mut args = args;
+            args.x = addr(tens[0]);
+            args.w = addr(tens[1]);
+            for g in 0..6 {
+                if args.n[g] != 0 {
+                    args.c[g] = addr(tens[2 + g]);
+                }
+            }
+            EngineDevice::launch_kernel(
+                &*self.be,
+                kernel,
+                grid,
+                512,
+                0,
+                as_bytes(std::slice::from_ref(&args)),
+                None,
+            )?;
+            self.seg_launches += 1;
+            return Ok(());
+        }
         if let Some(PrefillSegmentRoute::GemmLt(route)) =
             self.progs[p].prefill_routes.get(seg).copied()
         {
@@ -13623,6 +13994,22 @@ impl AmdEngine {
                     None,
                 )?;
             }
+            DecodeSegmentRoute::KdaDecodeWide(args) => {
+                let kernel = self.k_kda_decode_wide.ok_or_else(|| {
+                    RuntimeError::Device(
+                        "KdaDecodeFused v3 segment has no validated standalone object".into(),
+                    )
+                })?;
+                EngineDevice::launch_kernel(
+                    &*self.be,
+                    kernel,
+                    args.base.rows * args.base.heads,
+                    WG_THREADS_8,
+                    0,
+                    as_bytes(std::slice::from_ref(&args)),
+                    None,
+                )?;
+            }
             DecodeSegmentRoute::GroupedMoeMxfp4 { glu, down, grid } => {
                 let glu_kernel = self.k_grouped_moe_glu.ok_or_else(|| {
                     RuntimeError::Device(
@@ -14321,6 +14708,9 @@ impl AmdEngine {
             }
             if let PrefillSegmentRoute::IndexTp(route) = route {
                 route.rebase(rows)?;
+            }
+            if let PrefillSegmentRoute::GemmGroup { args, .. } = route {
+                args.t = rows;
             }
             if let PrefillSegmentRoute::GemmLt(route) = route {
                 route.rebase(rows)?;

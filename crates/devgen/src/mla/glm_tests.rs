@@ -4465,6 +4465,7 @@ fn moe_pf_w8a8_marks_grouped_pair_and_quantizes_input() {
     let _guard = crate::test_env::env_guard();
     let _env = crate::test_env::EnvScope::set(&[
         ("PLOW_MOE_PF_W8A8", "1"),
+        ("PLOW_MOE_PF_W8A8_FQ", "0"),
         ("PLOW_UNISEG", "1"),
         ("PLOW_GLM_DSA", "0"),
     ]);
@@ -4557,6 +4558,50 @@ fn moe_pf_w8a8_split_reads_bf16_input_without_quant() {
     );
     let down = p.insts.iter().find(|d| d.op == DevOp::MoeGroupDownPf as u16).unwrap();
     assert_eq!((down.t[1], down.t[5], down.i[7]), (n.fu_g, n.fu_scale, 4));
+}
+
+#[test]
+fn moe_pf_w8a8_fq_quantizes_in_the_glu() {
+    let _guard = crate::test_env::env_guard();
+    let _env = crate::test_env::EnvScope::set(&[
+        ("PLOW_MOE_PF_W8A8", "1"),
+        ("PLOW_UNISEG", "1"),
+        ("PLOW_GLM_DSA", "0"),
+    ]);
+    let mut c = glm_ref_cfg();
+    c.tp = 8;
+    let inter = c.moe_inter / 8;
+    let rows = 128;
+    let mut decl = Builder::new(256);
+    let n = declare_glm_rows_batched(&mut decl, &c, 512, &[3], rows, rows, MoeEnc::Fp8Blk);
+    let tensors = decl.tensors();
+    let mut b = Builder::new(256);
+    b.adopt_tensors(tensors);
+    let all = b.all();
+    emit_glm_block_prefill(
+        &mut b,
+        &c,
+        &n,
+        0,
+        512,
+        rows,
+        MoeEnc::Fp8Blk,
+        n.x,
+        n.xnext,
+        &[],
+        &mut 0,
+        &all,
+        None,
+    );
+    let p = b.finish();
+    assert!(!p.insts.iter().any(|d| d.op == DevOp::QuantFp8Block128 as u16 && d.t[1] == n.xn2));
+    let glu = p.insts.iter().find(|d| d.op == DevOp::MoeGroupGluPf as u16).unwrap();
+    assert_eq!(
+        (glu.t[1], glu.t[7], glu.i[0], glu.i[4], glu.i[7]),
+        (n.xn2, n.fu_scale, inter, rows, 6)
+    );
+    let down = p.insts.iter().find(|d| d.op == DevOp::MoeGroupDownPf as u16).unwrap();
+    assert_eq!((down.t[1], down.t[5], down.i[7]), (n.fu_g, n.fu_scale, 2));
 }
 
 #[test]
