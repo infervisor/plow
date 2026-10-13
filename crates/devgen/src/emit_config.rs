@@ -1318,6 +1318,18 @@ pub struct EmitConfig {
     #[arg(long, env = "PLOW_MOE_PF_W8A8_SPLIT", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
     pub moe_pf_w8a8_split: bool,
 
+    /// `PLOW_MOE_PF_W8A8` on the grouped DECODE rungs too (rows > 1): routed MoE and dense FFN
+    /// ops 85/86 run the W8A8 arm (1x128 activation quant at the rung's pitch). Rung 1 keeps its
+    /// per-expert W8A16 GEMVs. Requires PLOW_MOE_PF_W8A8.
+    #[arg(long, env = "PLOW_MOE_DEC_W8A8", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
+    pub moe_dec_w8a8: bool,
+
+    /// `PLOW_MOE_PF_W8A8` single-term GLU quantizes its bf16 input rows in the A staging (GLU
+    /// i[7] = 6) instead of a separate QuantFp8Block128: bit-identical, one op and the xq/xs
+    /// round trip fewer per MoE/dense layer. Default on; `=0` restores the quant op.
+    #[arg(long, env = "PLOW_MOE_PF_W8A8_FQ", default_value_t = true, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
+    pub moe_pf_w8a8_fq: bool,
+
     /// Build the lean gfx950 MoE stage-1 A4-reuse object with the K256 register-B body
     /// (`-DPLOW_MOE1_BODY=1`, bit-identical output). Opt-in; packets are unchanged, the
     /// manifest config header carries the object request.
@@ -1825,6 +1837,8 @@ impl EmitConfig {
             moe_pf_det: env_bool("PLOW_MOE_PF_DET"),
             moe_pf_w8a8: env_bool("PLOW_MOE_PF_W8A8"),
             moe_pf_w8a8_split: env_bool("PLOW_MOE_PF_W8A8_SPLIT"),
+            moe_dec_w8a8: env_bool("PLOW_MOE_DEC_W8A8"),
+            moe_pf_w8a8_fq: env_bool_default_true("PLOW_MOE_PF_W8A8_FQ"),
             moe_stage1_body: env_bool("PLOW_MOE_STAGE1_BODY"),
             moe_stage2_body: env_bool("PLOW_MOE_STAGE2_BODY"),
             no_glu_fuse: env_bool("PLOW_NO_GLU_FUSE"),

@@ -2218,6 +2218,16 @@ fn glm_moe_pf_w8a8(c: &GlmCfg, enc: MoeEnc, native_moe: bool, tk: u32, imoe_e: u
     true
 }
 
+/// `PLOW_MOE_DEC_W8A8`: the grouped decode rungs (rows > 1) take the W8A8 pair too.
+fn glm_moe_dec_w8a8() -> bool {
+    let on = emit_config::active().moe_dec_w8a8;
+    assert!(
+        !on || emit_config::active().moe_pf_w8a8,
+        "PLOW_MOE_DEC_W8A8 requires PLOW_MOE_PF_W8A8"
+    );
+    on
+}
+
 /// `PLOW_MOE_PF_W8A8_SPLIT`: the W8A8 pair runs two-term (hi + lo/16) fp8 activations.
 fn glm_moe_pf_w8a8_split() -> bool {
     let on = emit_config::active().moe_pf_w8a8_split;
@@ -9818,7 +9828,8 @@ fn emit_glm_moe_ffn_prefill(
         // Same predicate as the scratch declaration (`rows > 1`), or the tensors are absent.
         let pf_w8a8 = t > 1 && glm_moe_pf_w8a8(c, enc, native_moe, tk, imoe_e, h);
         let pf_split = pf_w8a8 && glm_moe_pf_w8a8_split();
-        let c_x = if pf_w8a8 && !pf_split {
+        let pf_fq = pf_w8a8 && !pf_split && emit_config::active().moe_pf_w8a8_fq;
+        let c_x = if pf_w8a8 && !pf_split && !pf_fq {
             b.emit(
                 DevOp::QuantFp8Block128,
                 glm_quant128_cus(&all, t, h),
@@ -9857,10 +9868,10 @@ fn emit_glm_moe_ffn_prefill(
             // W8A8: A = the 1x128 fp8 rows + their [H/128][T] scales; the GLU writes fp8 `fu_g`
             // and its own 1x128 scales into `fu_scale`.
             // SPLIT: A stays the bf16 `xn2`; `fu_g` (bf16-sized) takes the [hi | lo] fp8 rows.
-            if pf_split {
+            if pf_split || pf_fq {
                 d.t[7] = n.fu_scale;
                 d.i[4] = t;
-                d.i[7] = 4;
+                d.i[7] = if pf_split { 4 } else { 6 };
             } else if pf_w8a8 {
                 d.t[1] = n.routed_xq;
                 d.t[6] = n.routed_xs;
@@ -11009,7 +11020,26 @@ fn emit_glm_moe_ffn_rows(
         b.isolate(counter);
         counter
     } else {
-        let c_g = b.emit(DevOp::MoeGroupGluPf, all.clone(), &[c_routes, c_rn2], |d| {
+        let pf_w8a8 = !dfold
+            && !det
+            && glm_moe_dec_w8a8()
+            && glm_moe_pf_w8a8(c, enc, false, tk, imoe_e, h);
+        let pf_split = pf_w8a8 && glm_moe_pf_w8a8_split();
+        let pf_fq = pf_w8a8 && !pf_split && emit_config::active().moe_pf_w8a8_fq;
+        let c_x = if pf_w8a8 && !pf_split && !pf_fq {
+            b.emit(
+                DevOp::QuantFp8Block128,
+                glm_quant128_cus(&all, rows, h),
+                &[c_rn2],
+                |d| {
+                    d.t[..3].copy_from_slice(&[n.routed_xq, n.xn2, n.routed_xs]);
+                    d.i[..3].copy_from_slice(&[rows, h, rows]);
+                },
+            )
+        } else {
+            c_rn2
+        };
+        let c_g = b.emit(DevOp::MoeGroupGluPf, all.clone(), &[c_routes, c_x], |d| {
             d.t[0] = n.fu_g;
             d.t[1] = n.xn2;
             d.t[2] = w.ewt;
@@ -11027,6 +11057,17 @@ fn emit_glm_moe_ffn_rows(
             let (act, limit) = glm_glu_act(c);
             d.i[5] = act;
             d.f[1] = limit;
+            if pf_split || pf_fq {
+                d.t[7] = n.fu_scale;
+                d.i[4] = rows;
+                d.i[7] = if pf_split { 4 } else { 6 };
+            } else if pf_w8a8 {
+                d.t[1] = n.routed_xq;
+                d.t[6] = n.routed_xs;
+                d.t[7] = n.fu_scale;
+                d.i[4] = rows;
+                d.i[7] = 2;
+            }
         });
         b.emit(DevOp::MoeGroupDownPf, all.clone(), &[c_g], |d| {
             d.t[0] = n.part;
@@ -11045,6 +11086,10 @@ fn emit_glm_moe_ffn_rows(
             d.i[MoeEnc::PREFILL_SLOT] = enc.code();
             if det {
                 d.i[5] = tk.trailing_zeros() + 1;
+            }
+            if pf_w8a8 {
+                d.t[5] = n.fu_scale;
+                d.i[7] = if pf_split { 4 } else { 2 };
             }
         })
     };
@@ -11895,9 +11940,12 @@ fn emit_glm_dense_ffn_rows(
     // PLOW_MOE_PF_W8A8 covers the dense FFN of a PREFILL program too (vLLM runs layers 0-2 W8A8
     // like the experts): the same op pair over one expert on the routed scratch. Never decode:
     // decode objects carry no W8A8 arm.
-    let pf_w8a8 = prefill && rows > 1 && glm_moe_pf_w8a8(c, enc, false, DENSE_TOP_K, di_l, h);
+    let pf_w8a8 = (prefill || glm_moe_dec_w8a8())
+        && rows > 1
+        && glm_moe_pf_w8a8(c, enc, false, DENSE_TOP_K, di_l, h);
     let pf_split = pf_w8a8 && glm_moe_pf_w8a8_split();
-    let c_x = if pf_w8a8 && !pf_split {
+    let pf_fq = pf_w8a8 && !pf_split && emit_config::active().moe_pf_w8a8_fq;
+    let c_x = if pf_w8a8 && !pf_split && !pf_fq {
         b.emit(
             DevOp::QuantFp8Block128,
             glm_quant128_cus(&all, rows, h),
@@ -11928,10 +11976,10 @@ fn emit_glm_dense_ffn_rows(
         let (act, limit) = glm_glu_act(c);
         d.i[5] = act;
         d.f[1] = limit;
-        if pf_split {
+        if pf_split || pf_fq {
             d.t[7] = n.fu_scale;
             d.i[4] = rows;
-            d.i[7] = 4;
+            d.i[7] = if pf_split { 4 } else { 6 };
         } else if pf_w8a8 {
             d.t[1] = n.routed_xq;
             d.t[6] = n.routed_xs;

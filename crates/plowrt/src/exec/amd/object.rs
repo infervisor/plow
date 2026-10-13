@@ -408,6 +408,8 @@ pub(super) const PREFILL_ARM_MARKERS: &[(&str, &[&str])] = &[
     ("PLOW_MOE_PF_W8A8", &["plow_moe_pf_w8a8_arm"]),
     // i[7] >= 4: the two-term SPLIT arm. An object predating it runs i[7] = 4 as W8A16 on fp8 rows.
     ("PLOW_MOE_PF_W8A8_SPLIT", &["plow_moe_pf_w8a8_split_arm"]),
+    // GLU i[7] = 6: the staging-quant single-term arm (PLOW_MOE_PF_W8A8_FQ).
+    ("PLOW_MOE_PF_W8A8_FQ", &["plow_moe_pf_w8a8_fq_arm"]),
     // DSA indexer prep (HeadNormRope pair_mode 3). An object without the arm runs it as the plain
     // rope on the un-normed key: no trap. A BUILD axis (`#if PLOW_DSA_PREP`).
     ("PLOW_DSA_PREP", &["plow_dsa_prep_arm"]),
@@ -707,6 +709,11 @@ pub(super) fn check_materialized_residual_input<'a>(
 pub(super) const XR_TAGGED_SYM: &str = "plow_xr_tagged_1";
 
 pub(super) const DECODE_ARM_MARKERS: &[(&str, &[&str])] = &[
+    // PLOW_MOE_DEC_W8A8: grouped decode MoE/dense ops 85/86 with i[7] >= 2 (>= 4: SPLIT). Without
+    // the arm the W8A16 body reads fp8 rows as bf16: wrong, no trap.
+    ("PLOW_MOE_PF_W8A8", &["plow_moe_pf_w8a8_arm"]),
+    ("PLOW_MOE_PF_W8A8_SPLIT", &["plow_moe_pf_w8a8_split_arm"]),
+    ("PLOW_MOE_PF_W8A8_FQ", &["plow_moe_pf_w8a8_fq_arm"]),
     ("PLOW_DSA_SELECT_LOCAL", &["plow_dsa_select_local_arm"]),
     // DCP owner gather (ops 181-183): without the arm the flash reads unwritten gather buffers.
     ("PLOW_DCP_GATHER", &["plow_dcp_gather_1"]),
@@ -1102,6 +1109,19 @@ pub(super) fn packet_decode_arm_requirements<'a>(
 ) -> Vec<String> {
     let insts = || progs.clone().into_iter().flat_map(|p| &p.insts);
     let mut requires = Vec::new();
+    let w8a8 = |inst: &DevInst64| {
+        (inst.op == DevOp::MoeGroupGluPf as u16 || inst.op == DevOp::MoeGroupDownPf as u16)
+            && inst.i[7] >= 2
+    };
+    if insts().any(|inst| w8a8(inst)) {
+        requires.push("PLOW_MOE_PF_W8A8=1".to_owned());
+    }
+    if insts().any(|inst| w8a8(inst) && (inst.i[7] == 4 || inst.i[7] == 5)) {
+        requires.push("PLOW_MOE_PF_W8A8_SPLIT=1".to_owned());
+    }
+    if insts().any(|inst| w8a8(inst) && inst.i[7] == 6) {
+        requires.push("PLOW_MOE_PF_W8A8_FQ=1".to_owned());
+    }
     if insts().any(|inst| inst.op == DevOp::IndexSelect as u16 && inst.i[4] == 1) {
         requires.push("PLOW_DSA_SELECT_LOCAL=1".to_owned());
     }
@@ -1189,8 +1209,11 @@ pub(super) fn packet_prefill_arm_requirements<'a>(
     if insts().any(|inst| inst.op == DevOp::MoeGroupGluPf as u16 && inst.i[7] != 0 && !w8a8(inst)) {
         requires.push("PLOW_MOE_PF_A8=1".to_owned());
     }
-    if insts().any(|inst| w8a8(inst) && inst.i[7] >= 4) {
+    if insts().any(|inst| w8a8(inst) && (inst.i[7] == 4 || inst.i[7] == 5)) {
         requires.push("PLOW_MOE_PF_W8A8_SPLIT=1".to_owned());
+    }
+    if insts().any(|inst| w8a8(inst) && inst.i[7] == 6) {
+        requires.push("PLOW_MOE_PF_W8A8_FQ=1".to_owned());
     }
     if insts().any(|inst| w8a8(inst)) {
         requires.push("PLOW_MOE_PF_W8A8=1".to_owned());
