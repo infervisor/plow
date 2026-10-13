@@ -1053,19 +1053,20 @@ case "${PLOW_K3_PF_ALIGN_WAVES:-1}" in
   1) K3_PF_MOE="$K3_PF_MOE -DPLOW_MOE_ALIGN_WAVES=1" ;;
   *) echo "PLOW_K3_PF_ALIGN_WAVES must be 0 or 1" >&2; exit 2 ;;
 esac
-# Opt-in K3 prefill arms (default off): PLOW_K3_PF_XR_SCHED=aiter, the 16-byte collective schedule
-# (bit-identical data movement, op_collective.h) on capped workgroups — two-shot NWG/NWG_RS, seam
-# reduce-scatter NWG_SRS, seam all-gather NWG_SAG; PLOW_K3_PF_FOLD_TB=<2|4|8>, the token-blocked
-# MlaMergeFold (op_attention_common.h; the gfx950 V=128 oracle saw packed-FMA rounding moves, so
-# it stays behind the knob until a stream check passes).
+# PLOW_K3_PF_XR_SCHED=aiter (opt-in, default off): the 16-byte collective schedule (bit-identical
+# data movement, op_collective.h) on capped workgroups — two-shot NWG/NWG_RS, seam reduce-scatter
+# NWG_SRS, seam all-gather NWG_SAG. PLOW_K3_PF_FOLD_TB (default 8; 0 rolls back): the token-blocked
+# MlaMergeFold (op_attention_common.h). The gfx950 V=128 oracle saw packed-FMA rounding moves, so
+# it is qualified per model: GLM-5.3-Flash (V=256) validate streams byte-equal at every rung and
+# 4k-60k prompts, fold 9.8 -> 3.8 ms at 4k.
 case "${PLOW_K3_PF_XR_SCHED:-0}" in
   0) ;;
   aiter) K3_PF_MOE="$K3_PF_MOE -DPLOW_XR_SCHED_AITER=1 -DPLOW_XR_SCHED_NWG=${PLOW_XR_SCHED_NWG:-48} -DPLOW_XR_SCHED_NWG_RS=${PLOW_XR_SCHED_NWG_RS:-16} -DPLOW_XR_SCHED_NWG_SRS=${PLOW_XR_SCHED_NWG_SRS:-16} -DPLOW_XR_SCHED_NWG_SAG=${PLOW_XR_SCHED_NWG_SAG:-48}" ;;
   *) echo "PLOW_K3_PF_XR_SCHED must be 0 or aiter" >&2; exit 2 ;;
 esac
-case "${PLOW_K3_PF_FOLD_TB:-0}" in
+case "${PLOW_K3_PF_FOLD_TB:-8}" in
   0|1) ;;
-  2|4|8) K3_PF_MOE="$K3_PF_MOE -DPLOW_MLA_FOLD_TB=$PLOW_K3_PF_FOLD_TB" ;;
+  2|4|8) K3_PF_MOE="$K3_PF_MOE -DPLOW_MLA_FOLD_TB=${PLOW_K3_PF_FOLD_TB:-8}" ;;
   *) echo "PLOW_K3_PF_FOLD_TB must be 0, 2, 4 or 8" >&2; exit 2 ;;
 esac
 # PLOW_MOE_PF_DEEP (default 1; =0 rolls back): two raw register stages over the LDS ping-pong in
@@ -1094,8 +1095,9 @@ esac
 # PLOW_GEMM_PF_SM_BK=128: the 64x128 GemmSmall rung (and its fp32 router twin) at BK=128 in the K3
 # prefill objects only -- half the k-tiles for the N<=256, K=4096 projections that run on 64-128
 # workgroups. Arithmetic-preserving (BK only moves the k-tile barriers; op_gemm_common.h). Default
-# 64 until gemm_tile_sweep prices e2 (64x128x128) against c4 on gfx950.
-case "${PLOW_GEMM_PF_SM_BK:-64}" in
+# 128 (=64 rolls back): gemm_tile_sweep on MI350X put e2 (64x128x128) 5-25% ahead of c4 on every
+# N<=256, K=4096 GLM-5.3-Flash shape, and validate streams stayed byte-equal.
+case "${PLOW_GEMM_PF_SM_BK:-128}" in
   64) ;;
   128) K3_PF_MOE="$K3_PF_MOE -DGM_SM_BK=128" ;;
   *) echo "PLOW_GEMM_PF_SM_BK must be 64 or 128" >&2; exit 2 ;;
