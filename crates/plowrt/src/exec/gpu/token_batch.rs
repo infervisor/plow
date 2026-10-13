@@ -185,7 +185,11 @@ impl GpuEngine {
                         slot: pending.slot as usize,
                         tokens: request.tokens,
                         c0: pending.expected_frontier as usize,
-                        prompt_len: pending.new_frontier as usize,
+                        // The chunk's own end bounds decode rows (their end is past the
+                        // prompt); a prefill chunk carries the real prompt length so the
+                        // KV pre-map hint can look one bucket ahead of this chunk.
+                        prompt_len: (pending.new_frontier as usize)
+                            .max(request.prompt_len as usize),
                     }
                 })
                 .collect();

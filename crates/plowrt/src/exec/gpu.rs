@@ -12873,16 +12873,23 @@ impl GpuEngine {
                     "pf-batch: pack of {total} rows exceeds the largest bucket"
                 ))
             })?;
+        let lookahead = self.prefill[bi].t as usize;
         if let (Some(plan), Some(v)) = (&request_plan, &mut self.vmm) {
             for &(slot, end) in &plan.mapped_ends {
                 if let Some(rings) = &mut v.rings {
                     rings.ensure_slot(slot)?;
                 }
                 v.ensure_rows(slot, end)?;
-                // A chunk ending near a block boundary (a prompt of exactly 4096 rows): the
-                // pre-mapper maps the next block during the launch, not the first decode step's
-                // synchronous backstop (~6 ms of idle GPU per admitted 4K request).
-                v.advise(slot, end);
+            }
+            // Hint the row the NEXT pack can reach (one bucket ahead, capped at the prompt) so
+            // the pre-mapper maps that block while this pack runs. Hinting the chunk end only
+            // covered a chunk ending within 128 rows of a block boundary; every other chunk
+            // crossing into a new block mapped it synchronously here: 32 map+set_access calls,
+            // ~2 ms of idle GPU per 1024-row chunk (nsys, Qwen3.8-27B 4K c32).
+            for r in reqs {
+                let end = r.c0.saturating_add(r.tokens.len());
+                let next = end.saturating_add(lookahead).min(r.prompt_len);
+                v.advise(r.slot, u32::try_from(next).unwrap_or(u32::MAX));
             }
         }
         self.ensure_batch_patch(bi)?;
