@@ -137,6 +137,8 @@ impl AmdEngine {
             PrefillSegmentRoute::GemmLt(_) => return "gemm_lt",
             PrefillSegmentRoute::GemmBlk(_) => return "gemm_blk",
             PrefillSegmentRoute::MlaFold(_) => return "mla_fold",
+            PrefillSegmentRoute::MlaPfDense(_) if active => return "mla_pf_dense_spans",
+            PrefillSegmentRoute::MlaPfDense(_) => return "mla_pf_dense",
             _ => {}
         }
         if !active {
