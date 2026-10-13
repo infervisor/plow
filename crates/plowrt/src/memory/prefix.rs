@@ -125,6 +125,11 @@ pub struct PrefixCache {
     /// `head_dim × elem_bytes` — the stride of one token row inside a head-slot.
     token_bytes: u64,
     nodes: Vec<Node>,
+    /// Tombstoned ids ([`Self::evict_lru`], [`Self::evict_tail`]) for [`Self::insert`] to
+    /// reuse: a tombstone is unlinked from its parent and was a leaf, so no map or `parent`
+    /// names it. Without reuse `nodes` grew by one entry per eviction for the process
+    /// lifetime (serving: a 4096-token block per node).
+    free: Vec<NodeId>,
     roots: FxHashMap<BlockHash, NodeId>,
     tick: u64,
     /// Hash collisions caught by token verification (each one was a would-be
@@ -149,6 +154,7 @@ impl PrefixCache {
             block_tokens,
             token_bytes,
             nodes: Vec::new(),
+            free: Vec::new(),
             roots: FxHashMap::default(),
             tick: 0,
             collisions: 0,
@@ -369,8 +375,7 @@ impl PrefixCache {
                 cur = Some(n);
                 continue;
             }
-            let id = self.nodes.len() as NodeId;
-            self.nodes.push(Node {
+            let node = Node {
                 parent: cur,
                 children: FxHashMap::default(),
                 tokens: blk.into(),
@@ -380,7 +385,17 @@ impl PrefixCache {
                 last_used: tick,
                 pinned_until: None,
                 evicted: false,
-            });
+            };
+            let id = match self.free.pop() {
+                Some(id) => {
+                    self.nodes[id as usize] = node;
+                    id
+                }
+                None => {
+                    self.nodes.push(node);
+                    (self.nodes.len() - 1) as NodeId
+                }
+            };
             match cur {
                 None => {
                     self.roots.insert(h, id);
@@ -478,9 +493,7 @@ impl PrefixCache {
         // The node itself is left in `nodes` as a tombstone: node ids are indices
         // held by `children` maps elsewhere, so compacting the vector would
         // invalidate them. It is unreachable and holds no storage claim.
-        self.nodes[victim as usize].refs = 0;
-        self.nodes[victim as usize].children.clear();
-        self.nodes[victim as usize].evicted = true;
+        self.tombstone(victim);
         Some((owner, blk))
     }
 
@@ -528,16 +541,24 @@ impl PrefixCache {
                 Some(p) => self.nodes[p as usize].children.retain(|_, v| *v != id),
                 None => self.roots.retain(|_, v| *v != id),
             }
-            self.nodes[id as usize].refs = 0;
-            self.nodes[id as usize].children.clear();
-            self.nodes[id as usize].evicted = true;
+            self.tombstone(id);
             evicted.push((owner, blk));
             path.pop();
         }
         evicted
     }
 
-    /// Number of nodes ever allocated (including evicted tombstones).
+    /// Mark an unlinked leaf dead, drop its token copy and offer its id to [`Self::insert`].
+    fn tombstone(&mut self, id: NodeId) {
+        let n = &mut self.nodes[id as usize];
+        n.refs = 0;
+        n.children.clear();
+        n.tokens = Box::default();
+        n.evicted = true;
+        self.free.push(id);
+    }
+
+    /// Number of node slots allocated (live nodes plus tombstones awaiting reuse).
     pub fn len(&self) -> usize {
         self.nodes.len()
     }
@@ -582,6 +603,22 @@ mod tests {
         // (kv, head) boundary. That geometry must be refused, not resolved.
         assert!(PrefixCache::new(qwen3_pool(), 8192, 256).is_none());
         assert!(PrefixCache::new(qwen3_pool(), 4256, 256).is_some());
+    }
+
+    /// Eviction frees the node's token copy and its slot is reused by the next insert, so the
+    /// node table does not grow with the eviction count.
+    #[test]
+    fn evicted_node_slots_are_reused() {
+        let mut c = cache();
+        c.insert(&[1, 2], &toks(&[1, 2]), 0, 0);
+        c.release(&[1, 2], 2);
+        assert_eq!(c.len(), 2);
+        assert_eq!(c.evict_lru(), Some((0, 1)));
+        assert!(c.nodes[1].tokens.is_empty());
+        c.insert(&[1, 3], &toks(&[1, 3]), 1, 1);
+        assert_eq!(c.len(), 2, "the tombstone slot was reused");
+        assert_eq!(c.lookup(&[1, 3], &toks(&[1, 3])).blocks, 2);
+        assert_eq!(c.lookup(&[1, 2], &toks(&[1, 2])).blocks, 1);
     }
 
     #[test]

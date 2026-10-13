@@ -4931,8 +4931,10 @@ fn run_one_tick(
                                 b2b_failed = true;
                                 note_fault(&mut tick_fault, &err);
                                 let msg = err.to_string();
-                                for span in &packed {
-                                    let i = span.slot as usize;
+                                for i in amd_failed_pack_slots(
+                                    packed.iter().map(|span| span.slot as usize),
+                                    &feeds,
+                                ) {
                                     if let Some(taken) = slots[i].take() {
                                         release_kv(&arena, taken.kv);
                                         let _ = taken
@@ -5899,6 +5901,20 @@ fn amd_packed_frontier_updates(
     members
         .into_iter()
         .map(|slot| frontier(slot).map(|value| (slot, value)).ok_or(slot))
+        .collect()
+}
+
+/// Slots a failed packed launch terminates: its prefill members and every decode feed offered
+/// to ride it, since the launch may have advanced a rider's KV and recurrent state before its
+/// position or sampled token reached the host.
+#[cfg(any(feature = "hsa", feature = "cpu"))]
+fn amd_failed_pack_slots(
+    members: impl IntoIterator<Item = usize>,
+    feeds: &[(usize, u32)],
+) -> Vec<usize> {
+    members
+        .into_iter()
+        .chain(feeds.iter().map(|&(slot, _)| slot))
         .collect()
 }
 
@@ -9789,6 +9805,13 @@ mod tests {
             amd_packed_frontier_updates([2, 0, 3], |slot| (slot != 0).then_some(slot + 10)),
             Err(0)
         );
+    }
+
+    #[cfg(feature = "hsa")]
+    #[test]
+    fn a_failed_mixed_pack_terminates_its_decode_riders_too() {
+        assert_eq!(amd_failed_pack_slots([4, 5], &[(0, 7), (2, 9)]), [4, 5, 0, 2]);
+        assert_eq!(amd_failed_pack_slots([4, 5], &[]), [4, 5]);
     }
 
     #[cfg(any(feature = "cuda", feature = "hsa", feature = "cpu"))]

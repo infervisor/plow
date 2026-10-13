@@ -8342,3 +8342,14 @@ fn glm5_next_cfg_reads_root_quantization_and_clamped_swiglu() {
     assert_eq!(glu.f[1], 10.0);
     std::fs::remove_dir_all(&dir).ok();
 }
+
+#[test]
+fn glm_decode_projections_never_take_gemm_med() {
+    // The GLM_SHARD_HEAD B=128 shard is a prefill GemmMed pick; the decode route must not keep it.
+    let shard = pick_tile(128, 154880 / 8, 4096, 256, kernelcaps::QuantScheme::None);
+    assert_eq!(shard, DevOp::GemmMed);
+    assert_eq!(glm_decode_tile_of(shard), DevOp::GemmSmall);
+    assert_eq!(glm_decode_tile_of(DevOp::Gemm), DevOp::Gemm);
+    assert_eq!(glm_decode_tile_of(DevOp::GemmSmall), DevOp::GemmSmall);
+    assert_eq!(glm_decode_tile_of(DevOp::GemmWide), DevOp::GemmSmall);
+}

@@ -1727,13 +1727,13 @@ __device__ __forceinline__ void exec_flash_decode(CInst in, CTens T,
      * not required and `t6` stays free for the fp8-KV scale it means on the dense emit path.
      * The span table is narrowed to the DECODE partition here and to its complement in the
      * flash-prefill arm; both call plow_tb_decode_spans, so the two cannot disagree. */
-#define PLOW_AMD_FLASH_DECODE(DD)                                                               \
+#define PLOW_AMD_FLASH_DECODE(DD, GG)                                                           \
     do {                                                                                        \
         const PlowTokenBatchView tbv_ = plow_tb_view(tbprog);                                   \
         const PlowTokenBatchView dec_ =                                                         \
             plow_tb_span_range(tbv_, 0u, plow_tb_decode_spans(tbv_));                           \
         if (dec_.n_spans)                                                                       \
-            d_flash_decode<DD, PLOW_FA_GF(DD), false, false, /*SLOTMAP=*/false, /*TB=*/true>(   \
+            d_flash_decode<DD, GG, false, false, /*SLOTMAP=*/false, /*TB=*/true>(   \
                 (float*)TEN(0), (float*)TEN(1), (const bf16*)TEN(2), (const bf16*)TEN(3),       \
                 (const bf16*)TEN(4), (const int*)TEN(5), dec_.n_spans, in->i[1], in->i[2],     \
                 in->i[3], in->i[4], in->fj[0].f, in->i[5], in->i[7], slice, nblk, lds, nullptr, \
@@ -1741,28 +1741,41 @@ __device__ __forceinline__ void exec_flash_decode(CInst in, CTens T,
                 nullptr, nullptr, nullptr, dec_);                                               \
     } while (0)
 #else
-#define PLOW_AMD_FLASH_DECODE(DD)                                                               \
+#define PLOW_AMD_FLASH_DECODE(DD, GG)                                                           \
     do {                                                                                        \
         if (TEN(6))                                                                             \
-            d_flash_decode_slots<DD, PLOW_FA_GF(DD)>(                                           \
+            d_flash_decode_slots<DD, GG>(                                                       \
                 (float*)TEN(0), (float*)TEN(1), (const bf16*)TEN(2), (const bf16*)TEN(3),       \
                 (const bf16*)TEN(4), (const int*)TEN(5), n_batch_runtime, in->i[1], in->i[2],         \
                 in->i[3], in->i[4], in->fj[0].f, in->i[5], in->i[7], slice, nblk, lds,         \
                 (const int*)TEN(6));                                                            \
         else                                                                                    \
-            d_flash_decode<DD, PLOW_FA_GF(DD)>(                                                 \
+            d_flash_decode<DD, GG>(                                                             \
                 (float*)TEN(0), (float*)TEN(1), (const bf16*)TEN(2), (const bf16*)TEN(3),       \
                 (const bf16*)TEN(4), (const int*)TEN(5), n_batch_runtime, in->i[1], in->i[2],         \
                 in->i[3], in->i[4], in->fj[0].f, in->i[5], in->i[7], slice, nblk, lds);         \
     } while (0)
 #endif
-    if (hd == 128) PLOW_AMD_FLASH_DECODE(128);
-    else if (hd == 256) PLOW_AMD_FLASH_DECODE(256);
-    else if (hd == 512) PLOW_AMD_FLASH_DECODE(512);
+    /* A work item's GF heads share ONE KV head (h0 / gqa), which needs GF | gqa. A group the
+     * kernel's GF does not divide — MHA (gqa 1: Llama-68M, SmolLM2) or an odd group (gqa 3) —
+     * runs GF=1, as plowc already sized nsplit for at gqa < 2; GF=2 there attended every odd
+     * head over its even neighbour's KV. */
+    const unsigned gqa = in->i[1] / in->i[2];
+#define PLOW_AMD_FLASH_DECODE_GQA(DD)                                                           \
+    do {                                                                                        \
+        if (gqa % PLOW_FA_GF(DD))                                                               \
+            PLOW_AMD_FLASH_DECODE(DD, 1);                                                       \
+        else                                                                                    \
+            PLOW_AMD_FLASH_DECODE(DD, PLOW_FA_GF(DD));                                          \
+    } while (0)
+    if (hd == 128) PLOW_AMD_FLASH_DECODE_GQA(128);
+    else if (hd == 256) PLOW_AMD_FLASH_DECODE_GQA(256);
+    else if (hd == 512) PLOW_AMD_FLASH_DECODE_GQA(512);
 #if !PLOW_FP8_KV
-    else if (hd == 64) PLOW_AMD_FLASH_DECODE(64); /* GPT-OSS; see exec_flash_prefill */
+    else if (hd == 64) PLOW_AMD_FLASH_DECODE_GQA(64); /* GPT-OSS; see exec_flash_prefill */
 #endif
     else __builtin_trap(); /* see the head-dim refusal note in exec_flash_prefill */
+#undef PLOW_AMD_FLASH_DECODE_GQA
 #undef PLOW_AMD_FLASH_DECODE
 #undef TEN
 }
@@ -3728,11 +3741,18 @@ __device__ static void plow_exec(CInst in_v, unsigned slice, CTens T_v, plow_sme
                 break;
 #endif
             /* HD=64 is GLM-5.2's partial-rope slice, and GLM applies INTERLEAVED (GPT-J) RoPE there
-             * (dynamic per-step q_rope + shared k_rope for multi-token decode). No other arch uses
-             * HD=64, so HD==64 selects the interleaved template; every 128/256/512 path stays
-             * bit-identical (INTERLEAVE defaults false). See op_norm.h + rope_interleave_glm_test.c. */
+             * (dynamic per-step q_rope + shared k_rope for multi-token decode), so HD==64 stays
+             * interleaved unless the packet asks for the half split (i5 = ROPE_PAIR_HALF = 2): a
+             * NeoX-style model with 64-wide heads (Llama/Qwen-family small models). Every
+             * 128/256/512 path stays bit-identical. See op_norm.h + rope_interleave_glm_test.c. */
 #if PLOW_HAS_HEADNORM_HD64
             case 64:
+                if (in->i[5] == 2)
+                    d_headnorm_rope<64>((bf16*)TEN(0), (const bf16*)TEN(1), (const bf16*)TEN(2),
+                                        (const float*)TEN(3), (const float*)TEN(4), (const int*)TEN(5),
+                                        PLOW_RUNTIME_ROWS(in->i[0]), in->i[1], in->fj[0].f, in->i[3], in->fj[1].u, in->fj[2].u,
+                                        in->i[4], slice, nblk, in->i[6] PLOW_HEADNORM_ARGS);
+                else
                 d_headnorm_rope<64, /*INTERLEAVE=*/true>(
                                      (bf16*)TEN(0), (const bf16*)TEN(1), (const bf16*)TEN(2),
                                      (const float*)TEN(3), (const float*)TEN(4), (const int*)TEN(5),
@@ -3766,9 +3786,15 @@ __device__ static void plow_exec(CInst in_v, unsigned slice, CTens T_v, plow_sme
                                      PLOW_RUNTIME_ROWS(in->i[0]), in->i[1], in->fj[0].f, in->i[3], in->fj[1].u, in->fj[2].u,
                                      in->i[4], slice, nblk, in->i[6] PLOW_HEADNORM_ARGS);
             /* HD=64 is GLM-5.2's partial-rope slice, and GLM applies INTERLEAVED (GPT-J) RoPE there
-             * (dynamic per-step q_rope + shared k_rope for multi-token decode). No other arch uses
-             * HD=64, so HD==64 selects the interleaved template; every 128/256/512 path stays
-             * bit-identical (INTERLEAVE defaults false). See op_norm.h + rope_interleave_glm_test.c. */
+             * (dynamic per-step q_rope + shared k_rope for multi-token decode), so HD==64 stays
+             * interleaved unless the packet asks for the half split (i5 = ROPE_PAIR_HALF = 2): a
+             * NeoX-style model with 64-wide heads (Llama/Qwen-family small models). Every
+             * 128/256/512 path stays bit-identical. See op_norm.h + rope_interleave_glm_test.c. */
+            else if (in->i[2] == 64 && in->i[5] == 2)
+                d_headnorm_rope<64>((bf16*)TEN(0), (const bf16*)TEN(1), (const bf16*)TEN(2),
+                                    (const float*)TEN(3), (const float*)TEN(4), (const int*)TEN(5),
+                                    PLOW_RUNTIME_ROWS(in->i[0]), in->i[1], in->fj[0].f, in->i[3], in->fj[1].u, in->fj[2].u,
+                                    in->i[4], slice, nblk, in->i[6] PLOW_HEADNORM_ARGS);
             else if (in->i[2] == 64)
                 d_headnorm_rope<64, /*INTERLEAVE=*/true>(
                                      (bf16*)TEN(0), (const bf16*)TEN(1), (const bf16*)TEN(2),

@@ -232,7 +232,7 @@ checksum = "72b3254f16251a8381aa12e40e3c4d2f0199f8c6508fbecb9d91f575e0fbb8c6"
 
 [[package]]
 name = "bench-ib"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "inference-benchmarker",
 ]
@@ -551,7 +551,7 @@ checksum = "773648b94d0e5d620f64f280777445740e61fe701025087ec8b57f45c791888b"
 
 [[package]]
 name = "costmodel"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "hwspec",
  "nn-graph",
@@ -853,7 +853,7 @@ dependencies = [
 
 [[package]]
 name = "devgen"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "clap",
  "costmodel",
@@ -1619,7 +1619,7 @@ checksum = "15cdd26707701c53297e2fa6afb323d55fbc1d0810c3aec078ae3ef0424c3c15"
 
 [[package]]
 name = "hwspec"
-version = "0.1.1"
+version = "0.1.2"
 
 [[package]]
 name = "hyper"
@@ -2091,7 +2091,7 @@ dependencies = [
 
 [[package]]
 name = "kernelcaps"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "hwspec",
  "packet",
@@ -2105,7 +2105,7 @@ checksum = "bbd2bcb4c963f2ddae06a2efc7e9f3591312473c50c6685e1f298068316e66fe"
 
 [[package]]
 name = "lean_verify"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "libc",
  "packet",
@@ -2405,7 +2405,7 @@ dependencies = [
 
 [[package]]
 name = "nn-graph"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "hf-hub",
  "serde",
@@ -2761,7 +2761,7 @@ dependencies = [
 
 [[package]]
 name = "packet"
-version = "0.1.1"
+version = "0.1.2"
 
 [[package]]
 name = "papergrid"
@@ -2878,7 +2878,7 @@ checksum = "19f132c84eca552bf34cab8ec81f1c1dcc229b811638f9d283dceabe58c5569e"
 
 [[package]]
 name = "plow-asset"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "packet",
  "serde",
@@ -2888,7 +2888,7 @@ dependencies = [
 
 [[package]]
 name = "plowc"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "clap",
  "costmodel",
@@ -2912,7 +2912,7 @@ dependencies = [
 
 [[package]]
 name = "plowrt"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "axum",
  "base64 0.22.1",
@@ -3419,7 +3419,7 @@ dependencies = [
 
 [[package]]
 name = "rewrite"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "costmodel",
  "egglog",
@@ -3569,7 +3569,7 @@ dependencies = [
 
 [[package]]
 name = "schedule"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "costmodel",
  "hwspec",
@@ -4578,7 +4578,7 @@ checksum = "e421abadd41a4225275504ea4d6566923418b7f05506fbc9c0fe86ba7396114b"
 
 [[package]]
 name = "tunedb"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "hwspec",
  "kernelcaps",

@@ -5582,6 +5582,11 @@ __device__ void d_gemv(bf16* C, const bf16* x, const bf16* W, const float* rms,
  * legitimate fp32-vs-f64 reduction-order noise reads as a large relative error against a
  * true value close to zero from ~300-term cancellation; the absolute differences across
  * every output stayed under 4e-6). */
+/* PLOW_GEMV_F32_VEC=1: d_gemv_f32 and d_gemv_bf16_f32 walk K eight elements per lane when
+ * K % 8 == 0 (reassociated f32 sums). d_gemv_f32_tile and d_gemv_f32_wg reproduce that order. */
+#ifndef PLOW_GEMV_F32_VEC
+#define PLOW_GEMV_F32_VEC 0
+#endif
 __device__ void d_gemv_f32(float* __restrict__ C, const bf16* __restrict__ x,
                            const float* __restrict__ W, unsigned M, unsigned N, unsigned K,
                            unsigned slice, unsigned nblk) {
@@ -5590,18 +5595,20 @@ __device__ void d_gemv_f32(float* __restrict__ C, const bf16* __restrict__ x,
     /* One wave per (row, column) OUTPUT, row-major so a block's waves share one x row. The
      * column-only walk this replaced left every wave past the N-th idle and ran M serially:
      * GLM-5.3-Flash's mHC mix (N=24, K=16384) took ~800 ms per layer at T=8192, 92% of the
-     * prefill. M=1 maps exactly as before, so the decode and indexer results are bit-identical. */
+     * prefill. Each output keeps its lane-strided walk, so without PLOW_GEMV_F32_VEC the
+     * results are bit-identical to the column walk. */
     for (size_t output = slice * PLOW_WAVES + wave; output < (size_t)M * N;
          output += nblk * PLOW_WAVES) {
         const unsigned m = output / N, n = output % N;
         const bf16* const xm = x + (size_t)m * K;
         const float* const wn = W + (size_t)n * K;
         float acc = 0.0f;
-        if ((K & 7u) == 0u) {
+        if (PLOW_GEMV_F32_VEC && (K & 7u) == 0u) {
             /* 8 elements per lane per step with several steps in flight. The scalar walk below
              * issued one dependent 2 B + 4 B pair per step, K/64 steps deep: ~130 us per
              * packet at K=16384 (latency, not bandwidth), 90 packets on the serial mHC chain
-             * of every decode step. f32 accumulation, reassociated. */
+             * of every decode step. f32 accumulation, reassociated: a different sum than the
+             * scalar walk, so only packets qualified on it (GLM-5.3-Flash gfx950) build it. */
 #pragma unroll 4
             for (unsigned k = lane * 8u; k < K; k += PLOW_WAVE * 8u) {
                 const bf16v8 xv = ld_glob8(xm + k);
@@ -5742,7 +5749,7 @@ __device__ void d_gemv_bf16_f32(float* __restrict__ C, const bf16* __restrict__ 
         const bf16* const xm = x + (size_t)m * K;
         const bf16* const wn = W + (size_t)n * K;
         float acc = 0.0f;
-        if ((K & 7u) == 0u) {
+        if (PLOW_GEMV_F32_VEC && (K & 7u) == 0u) {
             /* Same latency argument as d_gemv_f32 above: the GLM router (N=288, K=4096)
              * spent ~78 us per packet on a 64-step dependent scalar walk. */
 #pragma unroll 4
