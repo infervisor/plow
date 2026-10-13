@@ -2749,6 +2749,21 @@ __device__ __forceinline__ bf16v8 mpf_ld_w8(const unsigned char* p) {
 #ifndef PLOW_MOE_PF_BRAW
 #define PLOW_MOE_PF_BRAW 0
 #endif
+/* PLOW_MOE_PF_DEEP (CDNA4 single-stage loop, opt-in build axis): the grouped k-loop with TWO raw
+ * register stages over the LDS ping-pong, so tile kt+2's loads issue before tile kt's MFMAs and
+ * commit after tile kt+1's. The shipped loop gave every load one k-tile of MFMA (8 per wave,
+ * ~0.2 us) against a 1-2 us load latency at two waves per SIMD: GLM-5.3-Flash's GLU ran at ~13%
+ * of the bf16 MFMA bound. Scale reads move ahead of the fetches and every fetch is unconditional
+ * (rows past N and pad rows load a clamped address and mask to zero; the last pair re-reads its
+ * own tile), so no wait drains the stage behind it. Same bytes to the same LDS cells, same MFMA
+ * and promotion order: bit-identical. Requires PLOW_MOE_PF_GH (a per-k-tile dependent index load
+ * would drain the pipeline); odd NT, K % BK != 0 or a8 A rows take the shipped loop. */
+#ifndef PLOW_MOE_PF_DEEP
+#define PLOW_MOE_PF_DEEP 0
+#endif
+#if PLOW_MOE_PF_DEEP && !PLOW_MOE_PF_GH
+#error "PLOW_MOE_PF_DEEP needs PLOW_MOE_PF_GH (the A-gather index hoist)"
+#endif
 #if PLOW_CDNA4
 #define MPF_W_HALF 0
 /* CDNA4 twins of the halved helpers below, SAME signatures and element order, so the fetch
@@ -3389,6 +3404,133 @@ __device__ void d_moe_group_pf_t(void* __restrict__ Cout, const bf16* __restrict
         }                                                                                       \
     }
 
+#if PLOW_MOE_PF_DEEP
+        /* ---- PLOW_MOE_PF_DEEP: two raw register stages over the CDNA4 LDS ping-pong ----
+         * See the PLOW_MOE_PF_DEEP header note. Tile kt+2 is fetched before tile kt's MFMAs and
+         * committed after tile kt+1's, so every load has two MFMA phases to land; loads are
+         * unconditional (clamped tile / row, masked to zero) so the waits stay partial. */
+        bool deep_done = false;
+        if constexpr (FP8 && DB == 2) {
+            if ((NT & 1u) == 0u && (K % MPF_BK) == 0u && !(GLU && a8)) {
+                deep_done = true;
+                fp8v16 da0[APASS], da1[APASS], dw0[BPASS / 2], dw1[BPASS / 2];
+                float dsc[SN];
+#define MPF_DFETCH(k0, RA, RW)                                                                 \
+    _Pragma("unroll") for (int it = 0; it < APASS; it++) {                                      \
+        const unsigned el = threadIdx.x * 8 + it * (PLOW_THREADS * 8);                          \
+        const unsigned r = el / MPF_BK, kk = (k0) + (el % MPF_BK);                              \
+        MPF_A_SRC(it, r)                                                                        \
+        const unsigned srcc = (src != PLOW_EXPERT_UNUSED) ? src : 0u;                          \
+        RA[it] = ld_glob_fp8v16((const unsigned char*)(A + (size_t)srcc * K + kk));             \
+    }                                                                                           \
+    _Pragma("unroll") for (int it = 0; it < BPASS / 2; it++) {                                  \
+        const unsigned el = threadIdx.x * 16 + it * (PLOW_THREADS * 16);                        \
+        const unsigned br = el / MPF_BK, kk = (k0) + (el % MPF_BK);                             \
+        unsigned r = n0 + br;                                                                   \
+        const unsigned char* wsrc = W0;                                                         \
+        if constexpr (GLU) {                                                                    \
+            const bool up = (br >= MPF_BN / 2);                                                 \
+            wsrc = up ? W1 : W0;                                                                \
+            r = n0 + (up ? br - MPF_BN / 2 : br);                                               \
+        }                                                                                       \
+        const unsigned rc = (r < N) ? r : 0u;                                                   \
+        const unsigned char* wp =                                                               \
+            shuf ? MPF_SHUF_WP(wsrc, k0, el, kk, rc) : wsrc + (size_t)rc * K + kk;              \
+        RW[it] = ld_glob_fp8v16(wp);                                                            \
+    }
+#define MPF_DCOMMIT(buf, RA, RW)                                                               \
+    _Pragma("unroll") for (int it = 0; it < APASS; it++) {                                      \
+        const unsigned el = threadIdx.x * 8 + it * (PLOW_THREADS * 8);                          \
+        const unsigned r = el / MPF_BK;                                                         \
+        MPF_A_SRC(it, r)                                                                        \
+        const fp8v16 av = RA[it] & ((src != PLOW_EXPERT_UNUSED) ? ~0u : 0u);                    \
+        __builtin_memcpy(&MPF_ASM(buf)[(el / MPF_BK) * MPF_STRIDE +                             \
+                                       MPF_XORSWZ(el / MPF_BK, el % MPF_BK)],                   \
+                         &av, 16);                                                              \
+    }                                                                                           \
+    _Pragma("unroll") for (int it = 0; it < BPASS / 2; it++) {                                  \
+        const unsigned el = threadIdx.x * 16 + it * (PLOW_THREADS * 16);                        \
+        const unsigned br = el / MPF_BK, kk = el % MPF_BK;                                      \
+        unsigned r = n0 + br;                                                                   \
+        if constexpr (GLU) r = n0 + (br >= MPF_BN / 2 ? br - MPF_BN / 2 : br);                  \
+        const fp8v16 bw = RW[it] & ((r < N) ? ~0u : 0u);                                        \
+        bf16v8 blo, bhi;                                                                        \
+        if constexpr (MPF_W_HALF) mpf_fp8v16_to_bf16_h(bw, blo, bhi);                           \
+        else fp8_to_bf16v8(bw, blo, bhi);                                                       \
+        __builtin_memcpy(&MPF_BSM(buf)[br * MPF_STRIDE + MPF_XORSWZ(br, kk)], &blo, 16);        \
+        __builtin_memcpy(&MPF_BSM(buf)[br * MPF_STRIDE + MPF_XORSWZ(br, kk + 8)], &bhi, 16);    \
+    }
+#define MPF_DMFMA(buf)                                                                         \
+    _Pragma("unroll") for (int q = 0; q < MPF_BK / MFMA_K; q++) {                               \
+        bf16x8 af[SM], bfr[SN];                                                                 \
+        _Pragma("unroll") for (int i = 0; i < SM; i++) {                                        \
+            const unsigned arow = wm * (MPF_BM / MPF_WM) + i * MFMA_M + frow;                   \
+            __builtin_memcpy(&af[i],                                                            \
+                             &MPF_ASM(buf)[arow * MPF_STRIDE +                                  \
+                                           MPF_XORSWZ(arow, mfma_frag_k(lane, q * MFMA_K))],    \
+                             16);                                                               \
+        }                                                                                       \
+        _Pragma("unroll") for (int j = 0; j < SN; j++) {                                        \
+            const unsigned brow = (GLU ? j * (MPF_BN / 2) + wn * MFMA_N                         \
+                                       : wn * (MPF_BN / MPF_WN) + j * MFMA_N) +                 \
+                                  frow;                                                         \
+            __builtin_memcpy(&bfr[j],                                                           \
+                             &MPF_BSM(buf)[brow * MPF_STRIDE +                                  \
+                                           MPF_XORSWZ(brow, mfma_frag_k(lane, q * MFMA_K))],    \
+                             16);                                                               \
+        }                                                                                       \
+        __builtin_amdgcn_s_setprio(1);                                                          \
+        _Pragma("unroll") for (int i = 0; i < SM; i++)                                          \
+            _Pragma("unroll") for (int j = 0; j < SN; j++)                                       \
+                acc[i][j] = plow_mfma_bf16_32x32(af[i], bfr[j], acc[i][j]);                      \
+        __builtin_amdgcn_s_setprio(0);                                                          \
+    }
+                __syncthreads(); /* the previous tile's fragment readers are done with the LDS */
+                MPF_DFETCH(0u, da0, dw0)
+                MPF_DFETCH((unsigned)MPF_BK, da1, dw1)
+                MPF_DCOMMIT(0, da0, dw0)
+                __syncthreads();
+                for (unsigned kt = 0; kt < NT; kt += 2u) {
+                    /* EVEN: buffer 0 holds kt, stage 1 holds kt+1 (in flight), stage 0 is free.
+                     * The scale block kt/2 is read first so its wait never covers the fetches. */
+                    const unsigned kb = kt >> 1;
+#pragma unroll
+                    for (int j = 0; j < SN; j++)
+                        dsc[j] = as_glob((GLU && j == 1) ? S1 : S0)[(size_t)nblk_row[j] * KB + kb];
+                    {
+                        const unsigned kf = (kt + 2u < NT ? kt + 2u : NT - 1u) * MPF_BK;
+                        MPF_DFETCH(kf, da0, dw0)
+                    }
+                    __builtin_amdgcn_sched_barrier(0);
+                    MPF_DMFMA(0)
+                    MPF_DCOMMIT(1, da1, dw1)
+                    __syncthreads();
+                    /* ODD: buffer 1 holds kt+1, stage 0 holds kt+2; stage 1 refills for kt+3. */
+                    {
+                        const unsigned kf = (kt + 3u < NT ? kt + 3u : NT - 1u) * MPF_BK;
+                        MPF_DFETCH(kf, da1, dw1)
+                    }
+                    __builtin_amdgcn_sched_barrier(0);
+                    MPF_DMFMA(1)
+                    /* PROMOTION: the 128-wide scale block ends on the odd tile (NT is even). */
+#pragma unroll
+                    for (int i = 0; i < SM; i++)
+#pragma unroll
+                        for (int j = 0; j < SN; j++) {
+                            const float bs = dsc[j] * (MPF_W_HALF ? 2.0f : 1.0f);
+                            accf[i][j] += acc[i][j] * bs;
+                            acc[i][j] = (f32x16)(0.0f);
+                        }
+                    if (kt + 2u < NT) { MPF_DCOMMIT(0, da0, dw0) }
+                    __syncthreads();
+                }
+#undef MPF_DFETCH
+#undef MPF_DCOMMIT
+#undef MPF_DMFMA
+            }
+        }
+        if (!deep_done) {
+#endif
         __syncthreads(); /* the previous tile's fragment readers must be done with the LDS */
         MPF_FETCH_A(0)
         MPF_FETCH_B(0)
@@ -3493,6 +3635,9 @@ __device__ void d_moe_group_pf_t(void* __restrict__ Cout, const bf16* __restrict
             __syncthreads();
             if constexpr (DB == 2) buf ^= 1u;
         }
+#if PLOW_MOE_PF_DEEP
+        } /* !deep_done */
+#endif
 #endif /* PLOW_MOE_PF_PIPE */
         if constexpr (!FP8) {
 #pragma unroll

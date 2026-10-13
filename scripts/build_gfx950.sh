@@ -1050,6 +1050,14 @@ case "${PLOW_K3_PF_FOLD_TB:-0}" in
   2|4|8) K3_PF_MOE="$K3_PF_MOE -DPLOW_MLA_FOLD_TB=$PLOW_K3_PF_FOLD_TB" ;;
   *) echo "PLOW_K3_PF_FOLD_TB must be 0, 2, 4 or 8" >&2; exit 2 ;;
 esac
+# PLOW_MOE_PF_DEEP (default 1; =0 rolls back): two raw register stages over the LDS ping-pong in
+# the grouped k-loop, with the A-gather index hoisted per tile (PLOW_MOE_PF_GH=1), so each load
+# has two MFMA phases to land instead of one. Bit-identical (same LDS bytes, same MFMA order).
+case "${PLOW_MOE_PF_DEEP:-1}" in
+  0) ;;
+  1) K3_PF_MOE="$K3_PF_MOE -DPLOW_MOE_PF_GH=1 -DPLOW_MOE_PF_DEEP=1" ;;
+  *) echo "PLOW_MOE_PF_DEEP must be 0 or 1" >&2; exit 2 ;;
+esac
 K3_ELFS=""
 if [ -n "${PLOW_HSACO_CONFIG:-}" ] &&
    grep -Eq '^#define PLOW_PACKET_OBJECT_REQUIRES "([^"]* )?PLOW_K3=1( |")' "$PLOW_HSACO_CONFIG"; then
