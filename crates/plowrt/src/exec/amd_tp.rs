@@ -2447,6 +2447,7 @@ const XR_FOLD_MAX_K: u32 = 16;
 fn check_xr_tagged_insts(pi: usize, insts: &[packet::dev::DevInst64], hidden: u32) -> Result<()> {
     use packet::dev::DevOp;
     let max_w = PeerLayout::xr_tag_max_width_cfg();
+    let widened = max_w > PeerLayout::XR_TAG_MAX_WIDTH;
     {
         let mut prev: Option<u32> = None;
         for d in insts {
@@ -2458,26 +2459,38 @@ fn check_xr_tagged_insts(pi: usize, insts: &[packet::dev::DevInst64], hidden: u3
                 continue;
             }
             let (n, gate, gcols, row_w) = (d.i[0], d.i[3], d.i[5], d.i[6]);
-            // A plain collective wider than the slot (a batched decode rung's [rows, hidden])
-            // runs the gate one-shot on the device (`xrt_fits`) and owns no tagged slot.
-            if n > max_w && gcols == 0 && d.i[7] == 0 {
-                continue;
-            }
-            // A plain batched message (`rows * hidden`) may ride a widened slot.
-            let bad = n == 0
-                || (n > hidden && (gcols != 0 || d.i[7] != 0 || n % hidden != 0))
-                || hidden > max_w
-                || gcols > hidden
-                || (gcols != 0 && row_w != n)
-                || (d.i[7] != 0 && d.t[1] == packet::dev::TENSOR_NONE16)
-                || d.i[7] > XR_FOLD_MAX_K
-                || gate >= 0xffff;
-            if bad {
-                return Err(RuntimeError::Device(format!(
-                    "program {pi}: XReduce n={n} gate={gate} gcols={gcols} row_w={row_w} is \
-                     outside the tagged one-shot contract (hidden={hidden}, slot holds {})",
-                    max_w
-                )));
+            let plain = gcols == 0 && d.i[7] == 0;
+            if n > max_w && plain {
+                // A plain collective wider than the slot (a batched decode rung's [rows, hidden])
+                // runs the gate one-shot on the device (`xrt_fits`). Under a widened slot a
+                // ragged batch (kvrow rescales i0 to live rows) can shrink it into the tagged
+                // range, so its gate still takes part in the parity contract there.
+                if !widened || hidden == 0 || n % hidden != 0 || hidden > max_w {
+                    continue;
+                }
+                if gate >= 0xffff {
+                    return Err(RuntimeError::Device(format!(
+                        "program {pi}: XReduce n={n} gate={gate} does not fit the 16-bit tag"
+                    )));
+                }
+            } else {
+                // A plain batched message (`rows * hidden`) may ride a widened slot.
+                let bad = n == 0
+                    || hidden == 0
+                    || (n > hidden && (!plain || n % hidden != 0))
+                    || hidden > max_w
+                    || gcols > hidden
+                    || (gcols != 0 && row_w != n)
+                    || (d.i[7] != 0 && d.t[1] == packet::dev::TENSOR_NONE16)
+                    || d.i[7] > XR_FOLD_MAX_K
+                    || gate >= 0xffff;
+                if bad {
+                    return Err(RuntimeError::Device(format!(
+                        "program {pi}: XReduce n={n} gate={gate} gcols={gcols} row_w={row_w} is \
+                         outside the tagged one-shot contract (hidden={hidden}, slot holds {})",
+                        max_w
+                    )));
+                }
             }
             if let Some(g) = prev {
                 if (g ^ gate) & 1 == 0 {
@@ -2866,7 +2879,9 @@ mod tests {
         // The HyperConnPost fold (t2) always runs the gate one-shot: outside the contract.
         let mut fold = xr(2 * 4096, 0, 0, 0);
         fold.t[2] = 7;
-        assert!(check_xr_tagged_insts(0, &[xr(4096, 0, 0, 0), fold, xr(4096, 1, 0, 0)], 4096).is_ok());
+        assert!(
+            check_xr_tagged_insts(0, &[xr(4096, 0, 0, 0), fold, xr(4096, 1, 0, 0)], 4096).is_ok()
+        );
     }
 
     #[test]
