@@ -446,8 +446,8 @@ pub struct Builder {
     lean_moe_stage1_segments: bool,
     /// Isolate fixed-order f32 grouped-MoE prefill combines.
     lean_moe_combine_segments: bool,
-    /// Isolate block-fp8 W8A16 grouped-MoE prefill GLU / down / k=8 combine packets for the
-    /// dedicated gfx950 object (`moe_fp8_pf_gfx950.elf`).
+    /// Isolate block-fp8 W8A16 grouped-MoE prefill GLU / down packets for the dedicated gfx950
+    /// object (`moe_fp8_pf_gfx950.elf`).
     lean_moe_fp8_segments: bool,
     /// Rewrite eligible replicated-input grouped-MoE prefill boundaries to whole-expert/full-I.
     moe_prefill_ep_degree: Option<u32>,
@@ -630,19 +630,6 @@ pub fn lean_moe_fp8_down_inst(d: &DevInst) -> bool {
         && d.t[5] == TENSOR_NONE
         && d.t[6] != TENSOR_NONE
         && d.t[7] != TENSOR_NONE
-}
-
-/// The k = 8 f32 combine with a null residual, whole chunk, no det/part16/native arms.
-pub fn lean_moe_fp8_combine_inst(d: &DevInst) -> bool {
-    d.op == DevOp::MoeCombinePf as u16
-        && d.t[0] != TENSOR_NONE
-        && d.t[1] == TENSOR_NONE
-        && d.t[3] != TENSOR_NONE
-        && d.i[0] != 0
-        && d.i[0].is_multiple_of(8)
-        && d.i[1] == 8
-        && d.i[2] != 0
-        && d.i[3..].iter().all(|&v| v == 0)
 }
 
 fn lean_moe_combine_inst(inst: &DevInst) -> bool {
@@ -2612,13 +2599,11 @@ impl Builder {
             {
                 24
             } else if lean_moe_fp8 && lean_moe_fp8_glu_inst(&self.ops[i].inst) {
-                // The dedicated block-fp8 grouped-MoE object owns each of these three packets
-                // as its own segment (bit-identical to the interpreter arms).
+                // The dedicated block-fp8 grouped-MoE object owns each of these two packets as
+                // its own segment (bit-identical to the interpreter arms).
                 28
             } else if lean_moe_fp8 && lean_moe_fp8_down_inst(&self.ops[i].inst) {
                 29
-            } else if lean_moe_fp8 && lean_moe_fp8_combine_inst(&self.ops[i].inst) {
-                30
             } else if lean_moe_stage2 && lean_moe_stage2_pair(&self.ops, i) {
                 // The standalone gfx950 kernel owns exactly the deterministic Down scatter.
                 // Combine stays in the following interpreter segment and preserves fixed-order

@@ -50,6 +50,24 @@ extern "C" __global__ __launch_bounds__(512, 1) void ref_down(
                         PLOW_MOE_ENC_FP8BLK, blockIdx.x, gridDim.x, sm);
 }
 
+#if PLOW_MOE_PF_DET || PLOW_MOE_PF_ATOMIC
+/* The interpreter's fused down -> combine arms (f64 fixed-point / f32 atomic into [T,H]). */
+extern "C" __global__ __launch_bounds__(512, 1) void ref_down_acc(
+    void* acc, const bf16* fu, const unsigned long long* wtab, const unsigned long long* stab,
+    const int* meta, const unsigned* row_partidx, const float* row_gate, unsigned H, unsigned I,
+    unsigned E) {
+    extern __shared__ __align__(16) bf16 sm[];
+    d_moe_group_down_pf((float*)acc, fu, wtab, stab, meta, row_partidx, row_gate, H, I, E,
+                        PLOW_MOE_ENC_FP8BLK, blockIdx.x, gridDim.x, sm, nullptr, 0, 0,
+#if PLOW_MOE_PF_ATOMIC
+                        4u
+#else
+                        4u
+#endif
+    );
+}
+#endif
+
 extern "C" __global__ __launch_bounds__(512, 1) void ref_combine(bf16* out, const bf16* shared,
                                                                  const float* part, unsigned H,
                                                                  unsigned k, unsigned T) {
@@ -209,8 +227,19 @@ int main(int argc, char** argv) {
     timeit("new_glu", [&] { plow_moe_fp8_glu_pf_gfx950<<<grid_n, 512>>>(fu_n, dx, dwt, dst, dmeta, drt, I, H, E, act, beta, lbeta); });
     timeit("ref_down", [&] { ref_down<<<NCU, 512, ref_lds>>>(part_r, fu_r, dwt, dst, dmeta, drp, drg, H, I, E); });
     timeit("new_down", [&] { plow_moe_fp8_down_pf_gfx950<<<grid_n, 512>>>(part_n, fu_r, dwt, dst, dmeta, drp, drg, H, I, E, 0); });
+#if PLOW_MOE_PF_DET || PLOW_MOE_PF_ATOMIC
+    {
+        void* acc;
+        const size_t acc_b = (size_t)T * H * (PLOW_MOE_PF_DET ? 8 : 4);
+        HC(hipMalloc(&acc, acc_b));
+        HC(hipFuncSetAttribute((const void*)ref_down_acc, hipFuncAttributeMaxDynamicSharedMemorySize, ref_lds));
+        timeit("acc_memset", [&] { HC(hipMemsetAsync(acc, 0, acc_b)); });
+        timeit("ref_down_acc", [&] { ref_down_acc<<<NCU, 512, ref_lds>>>(acc, fu_r, dwt, dst, dmeta, drp, drg, H, I, E); });
+        HC(hipFree(acc));
+    }
+#endif
     timeit("ref_combine", [&] { ref_combine<<<NCU, 512>>>(out_r, dsh, part_r, H, K8, T); });
-    timeit("new_combine", [&] { plow_moe_fp8_combine_k8_gfx950<<<2048, 256>>>(out_n, dsh, part_r, H, K8, T, 0); });
+    timeit("ref_combine_n", [&] { ref_combine<<<NCU, 512>>>(out_n, dsh, part_n, H, K8, T); });
     HC(hipDeviceSynchronize());
 
     /* compare */

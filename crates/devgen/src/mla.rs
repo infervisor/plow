@@ -1384,6 +1384,7 @@ pub(crate) fn glm53_emit_full(
             gfx950 && ec.kda_chunk_qpre && (ec.kda_wu_lean || ec.kda_carry_keyfeed),
         );
         b.set_kda_carry_keyfeed_segments(ec.kda_carry_keyfeed);
+        b.set_lean_moe_fp8_segments(gfx950 && ec.moe_fp8_pf_lean);
         emit_glm53_program(&mut b, &c, &n, &s, ctx, rows, dbatch, enc, true);
         let prog = b.finish();
         tensors = prog.tensors.clone();
@@ -12204,7 +12205,6 @@ fn glm_emit_full(
         pb.set_lean_moe_combine_segments(
             crate::emit_is_amd() && emit_config::active().moe_combine_lean,
         );
-        pb.set_lean_moe_fp8_segments(crate::emit_is_amd() && emit_config::active().moe_fp8_pf_lean);
         pb.set_moe_prefill_ep_degree(
             (crate::emit_is_amd() && emit_config::active().moe_prefill_ep).then_some(c.tp),
         );
@@ -12939,7 +12939,6 @@ fn glm_build_block_pf_rungs(
         pb.set_lean_moe_combine_segments(
             crate::emit_is_amd() && emit_config::active().moe_combine_lean,
         );
-        pb.set_lean_moe_fp8_segments(crate::emit_is_amd() && emit_config::active().moe_fp8_pf_lean);
         pb.set_moe_prefill_ep_degree(
             (crate::emit_is_amd() && emit_config::active().moe_prefill_ep).then_some(c.tp),
         );

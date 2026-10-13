@@ -1264,7 +1264,7 @@ pub struct EmitConfig {
     #[arg(long, env = "PLOW_MOE_COMBINE_LEAN", default_value_t = true, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
     pub moe_combine_lean: bool,
 
-    /// Isolate block-fp8 W8A16 grouped-MoE prefill GLU / down / k=8 combine packets for the
+    /// Isolate block-fp8 W8A16 grouped-MoE prefill GLU / down packets for the
     /// dedicated gfx950 object (`moe_fp8_pf_gfx950.elf`, bit-identical to the interpreter arms).
     #[arg(long, env = "PLOW_MOE_FP8_PF_LEAN", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
     pub moe_fp8_pf_lean: bool,

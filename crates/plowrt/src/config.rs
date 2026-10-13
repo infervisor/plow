@@ -2177,7 +2177,7 @@ pub struct AmdRuntimeConfig {
     #[arg(long = "amd-moe-stage1-a4-reuse", env = "PLOW_MOE_STAGE1_A4_REUSE", default_value_t = true, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
     pub moe_stage1_a4_reuse: bool,
 
-    /// Run isolated block-fp8 grouped-MoE prefill GLU / down / k=8 combine segments on the
+    /// Run isolated block-fp8 grouped-MoE prefill GLU / down segments on the
     /// dedicated `moe_fp8_pf_gfx950.elf` object (bit-identical). `=0` runs them on the interpreter.
     #[arg(long = "amd-moe-fp8-pf", env = "PLOW_MOE_FP8_PF", default_value_t = true, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
     pub moe_fp8_pf: bool,

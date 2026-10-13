@@ -929,20 +929,6 @@ struct MoeFp8DownArgs {
 
 const _: () = assert!(std::mem::size_of::<MoeFp8DownArgs>() == 72);
 
-/// `plow_moe_fp8_combine_k8_gfx950`.
-#[derive(Clone, Copy, Debug)]
-#[repr(C)]
-struct MoeFp8CombineArgs {
-    out: u64,
-    shared: u64,
-    part: u64,
-    hidden: u32,
-    topk: u32,
-    tokens: u32,
-    reserved: u32,
-}
-
-const _: () = assert!(std::mem::size_of::<MoeFp8CombineArgs>() == 40);
 
 #[derive(Clone, Copy, Debug)]
 #[repr(C)]
@@ -1140,10 +1126,6 @@ enum PrefillSegmentRoute {
     },
     MoeFp8Down {
         args: MoeFp8DownArgs,
-        grid: u32,
-    },
-    MoeFp8Combine {
-        args: MoeFp8CombineArgs,
         grid: u32,
     },
     MoeEpAlign(MoeEpAlignRoute),
@@ -2140,7 +2122,7 @@ fn has_moe_combine_segment(prog: &DevProg) -> bool {
         .any(|set| set.len() == 1 && moe_combine_inst(&prog.insts[*set.first().unwrap()]))
 }
 
-/// Host twins of `packet::devbuild::lean_moe_fp8_*_inst`: the packets the dedicated
+/// Host twins of `packet::devbuild::lean_moe_fp8_{glu,down}_inst`: the packets the dedicated
 /// block-fp8 grouped-MoE prefill object owns.
 fn moe_fp8_glu_inst(d: &DevInst64) -> bool {
     use packet::dev::TENSOR_NONE16 as NONE;
@@ -2175,19 +2157,6 @@ fn moe_fp8_down_inst(d: &DevInst64) -> bool {
         && d.t[5] == NONE
         && d.t[6] != NONE
         && d.t[7] != NONE
-}
-
-fn moe_fp8_combine_inst(d: &DevInst64) -> bool {
-    use packet::dev::TENSOR_NONE16 as NONE;
-    d.op == DevOp::MoeCombinePf as u16
-        && d.t[0] != NONE
-        && d.t[1] == NONE
-        && d.t[3] != NONE
-        && d.i[0] != 0
-        && d.i[0].is_multiple_of(8)
-        && d.i[1] == 8
-        && d.i[2] != 0
-        && d.i[3..].iter().all(|&v| v == 0)
 }
 
 fn has_moe_fp8_segment(prog: &DevProg) -> bool {
@@ -2261,23 +2230,6 @@ fn add_moe_fp8_pf_routes(
                     reserved: 0,
                 },
                 grid,
-            };
-        } else if moe_fp8_combine_inst(d) {
-            routes[seg] = PrefillSegmentRoute::MoeFp8Combine {
-                args: MoeFp8CombineArgs {
-                    out: addr(d.t[0], "out")?,
-                    shared: if d.t[2] == packet::dev::TENSOR_NONE16 {
-                        0
-                    } else {
-                        addr(d.t[2], "shared")?
-                    },
-                    part: addr(d.t[3], "part")?,
-                    hidden: d.i[0],
-                    topk: d.i[1],
-                    tokens: d.i[2],
-                    reserved: 0,
-                },
-                grid: 2048,
             };
         }
     }
@@ -6408,8 +6360,8 @@ pub struct AmdEngine {
     _moe_stage1_a4_scratch: Option<DeviceMem>,
     k_moe_stage2_mxfp4: Option<HsaKernel>,
     k_moe_combine: Option<HsaKernel>,
-    /// GLU, down, combine of `moe_fp8_pf_gfx950.elf`.
-    k_moe_fp8_pf: Option<[HsaKernel; 3]>,
+    /// GLU and down of `moe_fp8_pf_gfx950.elf`.
+    k_moe_fp8_pf: Option<[HsaKernel; 2]>,
     /// The f32-mix AttnRes object and the workgroup size it advertises.
     k_attn_res_f32mix: Option<(HsaKernel, u32)>,
     k_moe_ep_align: Option<HsaKernel>,
@@ -9030,10 +8982,9 @@ impl AmdEngine {
 
         let k_moe_fp8_pf = if arch == "gfx950" && need_moe_fp8_pf {
             const NAME: &str = "moe_fp8_pf_gfx950.elf";
-            const SYMBOLS: [(&str, usize); 3] = [
+            const SYMBOLS: [(&str, usize); 2] = [
                 ("plow_moe_fp8_glu_pf_gfx950", std::mem::size_of::<MoeFp8GluArgs>()),
                 ("plow_moe_fp8_down_pf_gfx950", std::mem::size_of::<MoeFp8DownArgs>()),
-                ("plow_moe_fp8_combine_k8_gfx950", std::mem::size_of::<MoeFp8CombineArgs>()),
             ];
             let path = hsaco_dir.join(NAME);
             if !path.exists() {
@@ -9050,7 +9001,7 @@ impl AmdEngine {
                     )));
                 }
                 let module = EngineDevice::module_load(&*be, &image)?;
-                let mut ks = Vec::with_capacity(3);
+                let mut ks = Vec::with_capacity(2);
                 for (sym, want) in SYMBOLS {
                     let kernel = EngineDevice::get_function(&*be, &module, sym).map_err(|e| {
                         RuntimeError::Device(format!("{NAME}: no symbol {sym}: {e}"))
@@ -9065,7 +9016,7 @@ impl AmdEngine {
                     ks.push(kernel);
                 }
                 modules.push(module);
-                Some([ks[0], ks[1], ks[2]])
+                Some([ks[0], ks[1]])
             }
         } else {
             None
@@ -13288,18 +13239,6 @@ impl AmdEngine {
                             ks[1],
                             grid,
                             512,
-                            0,
-                            as_bytes(std::slice::from_ref(&args)),
-                            None,
-                        )?;
-                        true
-                    }
-                    Some(PrefillSegmentRoute::MoeFp8Combine { args, grid }) => {
-                        EngineDevice::launch_kernel(
-                            &*self.be,
-                            ks[2],
-                            grid,
-                            256,
                             0,
                             as_bytes(std::slice::from_ref(&args)),
                             None,
