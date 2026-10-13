@@ -2258,6 +2258,13 @@ pub enum DevOp {
     /// [`DevOp::FlashPrefillFp8`] sites read it (their `i7` high half).
     /// `t0=out(u32[rows]) t1=ids(u32[rows])` · `i0=rows`.
     MmSpanExtent = 210,
+    /// Prefill grouped bf16 GEMM over one concatenated weight: `C_g[T, N_g] = x[T, K] .
+    /// W[r_g .. r_g + N_g, K]^T` for up to six column groups (`r_g` = sum of the earlier `N_g`),
+    /// each written row-major to its own output. A standalone segment route
+    /// (`gemm_group_pf_gfx950`), never an interpreter case.
+    /// `t0=x t1=weight t2=out0 t3=out1? t4=out2? t5=out3? t6=out4? t7=out5?` ·
+    /// `i0=T i1=K i2=N0 i3=N1 i4=N2 i5=N3 i6=N4 i7=N5` (`N=0`: unused group).
+    GemmGroupPf = 211,
 }
 
 /// [`DevOp::FlashPrefillFp8`]'s split count (`i7` low half).
@@ -2531,6 +2538,7 @@ impl DevOp {
         DevOp::ChunkAttentionF32,
         DevOp::MmRowsBf16,
         DevOp::MmSpanExtent,
+        DevOp::GemmGroupPf,
     ];
 
     /// Recover the opcode from its wire discriminant, or `None` for a value no
@@ -2762,6 +2770,7 @@ impl DevOp {
             DevOp::ChunkAttentionF32 => "PLOW_DOP_CHUNK_ATTENTION_F32",
             DevOp::MmRowsBf16 => "PLOW_DOP_MM_ROWS_BF16",
             DevOp::MmSpanExtent => "PLOW_DOP_MM_SPAN_EXTENT",
+            DevOp::GemmGroupPf => "PLOW_DOP_GEMM_GROUP_PF",
         }
     }
 
@@ -2820,7 +2829,8 @@ impl DevOp {
     /// 206 -> 210 for `RmsNormF32 = 206` .. `MmRowsBf16 = 209` (multimodal towers and LM
     /// soft-token rows).
     /// 210 -> 211 for `MmSpanExtent = 210` (bidirectional media spans).
-    pub const COUNT: u16 = 211;
+    /// 211 -> 212 for `GemmGroupPf = 211` (grouped prefill projection route).
+    pub const COUNT: u16 = 212;
 
     /// The `(M, N, K, quant)` a decode-GEMV opcode carries, or `None` if this is not one.
     ///

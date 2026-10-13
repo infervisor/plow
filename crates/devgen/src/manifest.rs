@@ -2947,6 +2947,10 @@ pub fn config_header(manifest: &Value) -> String {
         if kda_wu_lean_required { 1 } else { 0 }
     ));
     out.push_str(&format!(
+        "#define PLOW_PACKET_REQUIRES_GEMM_GROUP_PF {}\n",
+        u8::from(ops.contains("GemmGroupPf"))
+    ));
+    out.push_str(&format!(
         "#define PLOW_PACKET_REQUIRES_KDA_CARRY_KEYFEED {}\n",
         if kda_carry_keyfeed_required { 1 } else { 0 }
     ));

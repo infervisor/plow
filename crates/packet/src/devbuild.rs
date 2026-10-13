@@ -2808,6 +2808,7 @@ impl Builder {
                 || op.inst.op == DevOp::IndexFp8Prefill as u16
                 || op.inst.op == DevOp::GemmLtPf as u16
                 || op.inst.op == DevOp::GemmBlkPf as u16
+                || op.inst.op == DevOp::GemmGroupPf as u16
                 || (op.inst.op == DevOp::MlaMergeFold as u16 && op.inst.i[5] == 1)
                 || (op.inst.op == DevOp::FlashMlaDecodeFp8 as u16 && op.isolated)
         }) || native_gemma4_glu

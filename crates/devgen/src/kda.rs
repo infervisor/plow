@@ -285,6 +285,40 @@ pub struct KdaWeights {
     /// `[D]` f32, SHARED by all `H` heads.
     pub o_norm: u32,
     pub ln_w: u32,
+    /// `PLOW_KDA_PF_GROUP_GEMM`: the loader-built `[q | k | v | g_a | f_a | b]` row concatenation
+    /// of this rank's slices (`derived.in_proj_cat.weight`), or `TENSOR_NONE`.
+    pub in_cat: u32,
+}
+
+/// One bf16 prefill projection `out[t, n] = x[t, k] . w[n, k]^T` as its own [`DevOp::GemmGroupPf`]
+/// segment (one group).
+#[allow(clippy::too_many_arguments)]
+pub fn emit_pf_gemm_route(
+    b: &mut Builder,
+    out: u32,
+    x: u32,
+    w: u32,
+    t: u32,
+    n: u32,
+    k: u32,
+    deps: &[u32],
+) -> u32 {
+    let c = b.emit(DevOp::GemmGroupPf, vec![0], deps, |d| {
+        d.t[..3].copy_from_slice(&[x, w, out]);
+        d.t[3..].fill(crate::TENSOR_NONE);
+        d.i[..3].copy_from_slice(&[t, k, n]);
+    });
+    b.isolate(c);
+    c
+}
+
+/// `PLOW_KDA_PF_GROUP_GEMM`: a prefill (`t > 1`, not batched decode) low-rank-gate KDA layer runs
+/// its six input projections as ONE [`DevOp::GemmGroupPf`] segment over [`KdaWeights::in_cat`].
+pub fn pf_group_gemm(c: &KdaCfg) -> bool {
+    !c.full_rank_gate
+        && crate::emit_config::active().kda_pf_group_gemm
+        && crate::emit_is_amd()
+        && crate::amd_target::active().1 == hwspec::IsaLevel::Gfx950
 }
 
 /// Declare one KDA layer's 14 checkpoint tensors under `prefix`.
@@ -351,6 +385,15 @@ pub fn declare_kda_weights(
         dt_bias: f32t(b, format!("{prefix}dt_bias"), p),
         o_norm: f32t(b, format!("{prefix}o_norm.weight"), hd),
         ln_w: bf(b, format!("{ln_prefix}input_layernorm.weight"), h),
+        in_cat: if pf_group_gemm(c) {
+            bf(
+                b,
+                format!("{prefix}derived.in_proj_cat.weight"),
+                (3 * p + 2 * hd + c.heads as u64) * h,
+            )
+        } else {
+            crate::TENSOR_NONE
+        },
     }
 }
 
@@ -830,7 +873,27 @@ fn emit_kda_mixer_ex(
     // safe direction and the LDS bound that decides it; P5/P6 stay separate because their weights
     // (`[128,7168]` and `[96,7168]`) are 1/128th and 1/96th of a projection each — concatenating
     // them onto a 49152-wide sweep would buy two gates and hand two of the 256 CUs a ragged tail.
-    let (c_q, c_k, c_v, c_g) = match (w.gate, fuse_qkvg(t, hi)) {
+    let group = (t > 1 && !seq_rows && w.in_cat != crate::TENSOR_NONE).then(|| {
+        let OutputGate::LowRank { g_b_proj, .. } = w.gate else {
+            unreachable!("in_cat is declared only for the low-rank gate")
+        };
+        let ga = bft(b, format!("{a}g_a"), tt * hd as u64);
+        let c = b.emit(DevOp::GemmGroupPf, vec![0], &[c_ln], |d| {
+            d.t[..8].copy_from_slice(&[x, w.in_cat, raw[0], raw[1], raw[2], ga, fa, b_raw]);
+            d.i[..8].copy_from_slice(&[t, hi, p, p, p, hd, hd, nh]);
+        });
+        b.isolate(c);
+        let c_gb = if crate::emit_config::active().pf_gemm_route_all {
+            emit_pf_gemm_route(b, g_raw, ga, g_b_proj, t, p, hd, &[c])
+        } else {
+            gemv(b, g_raw, ga, g_b_proj, p, hd, c)
+        };
+        (c, c_gb)
+    });
+    let (c_q, c_k, c_v, c_g) = if let Some((c, c_gb)) = group {
+        (c, c, c, c_gb)
+    } else {
+        match (w.gate, fuse_qkvg(t, hi)) {
         (OutputGate::FullRank { g_proj }, true) => {
             let f = b.emit(DevOp::GemvQkvg, all.clone(), &[c_ln], |d| {
                 d.t[0] = raw[0];
@@ -951,9 +1014,12 @@ fn emit_kda_mixer_ex(
             };
             (cq, ck, cv, c_gb)
         }
+    }
     };
     let (c_fa, c_bb) = if let Some((g1, _)) = kda_group {
         (g1, g1)
+    } else if let Some((c, _)) = group {
+        (c, c)
     } else {
         emit_control_linears(
         b,
@@ -978,6 +1044,8 @@ fn emit_kda_mixer_ex(
         g2
     } else if fb_fold {
         c_fa
+    } else if group.is_some() && crate::emit_config::active().pf_gemm_route_all {
+        emit_pf_gemm_route(b, f_raw, fa, w.f_b_proj, t, p, hd, &[c_fa])
     } else {
         gemv(b, f_raw, fa, w.f_b_proj, p, hd, c_fa)
     };
@@ -1467,7 +1535,11 @@ fn emit_kda_mixer_ex(
     });
 
     // P12 — out projection. The residual is NOT here: see `emit_kda_layer`.
-    let c_o = gemv(b, attn, y, w.o_proj, hi, p, c_norm);
+    let c_o = if group.is_some() && crate::emit_config::active().pf_gemm_route_all {
+        emit_pf_gemm_route(b, attn, y, w.o_proj, t, hi, p, &[c_norm])
+    } else {
+        gemv(b, attn, y, w.o_proj, hi, p, c_norm)
+    };
     (c_o, attn)
 }
 

@@ -593,6 +593,15 @@ pub struct EmitConfig {
     /// Experimental TP8 CDNA4 original Q-B and FP8 MLA projections.
     #[arg(long, env = "PLOW_GLM_MLA_W8A8", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
     pub glm_mla_w8a8: bool,
+    /// GLM-5.3-Flash KDA prefill: q|k|v|g_a|f_a|b as one grouped GEMM segment.
+    #[arg(long, env = "PLOW_KDA_PF_GROUP_GEMM", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
+    pub kda_pf_group_gemm: bool,
+    /// GLM-5.3-Flash MLA prefill: q_a|kv_a as one grouped GEMM segment.
+    #[arg(long, env = "PLOW_GLM_PF_QKVA_GROUP", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
+    pub glm_pf_qkva_group: bool,
+    /// With the grouped prefill GEMMs: also route KDA o_proj/g_b/f_b and MLA q_absorb/o_proj.
+    #[arg(long, env = "PLOW_PF_GEMM_ROUTE_ALL", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
+    pub pf_gemm_route_all: bool,
     /// MLA W8A8 prefill in the expanded (MHA) form vLLM runs: kv_b GEMM + D=256 flash.
     #[arg(long, env = "PLOW_GLM_MLA_MHA", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
     pub glm_mla_mha: bool,
@@ -1729,6 +1738,9 @@ impl EmitConfig {
             glm_oproj_w8a8: env_bool("PLOW_GLM_OPROJ_W8A8"),
             glm_qkva_w8a8: env_bool("PLOW_GLM_QKVA_W8A8"),
             glm_mla_w8a8: env_bool("PLOW_GLM_MLA_W8A8"),
+            kda_pf_group_gemm: env_bool("PLOW_KDA_PF_GROUP_GEMM"),
+            glm_pf_qkva_group: env_bool("PLOW_GLM_PF_QKVA_GROUP"),
+            pf_gemm_route_all: env_bool("PLOW_PF_GEMM_ROUTE_ALL"),
             glm_mla_mha: env_bool("PLOW_GLM_MLA_MHA"),
             glm_decode_shared_fold: env_bool("PLOW_GLM_DECODE_SHARED_FOLD"),
             glm_norm_q128: env_bool("PLOW_GLM_NORM_Q128"),

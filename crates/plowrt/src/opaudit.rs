@@ -310,6 +310,7 @@ pub fn classify(op: DevOp) -> OpClass {
         DevOp::RopeAxialF32 => a_rows("i0=rows, t1=positions per row"),
         DevOp::MmRowsBf16 => a_rows("i0=rows, t1=ids per row"),
         DevOp::MmSpanExtent => a_rows("i0=rows, t1=ids per row; runs clipped per request by the attention"),
+        DevOp::GemmGroupPf => a_rows("i0=T, row-pure grouped GEMM"),
         DevOp::ScaledAddF32 => a_elem("i0=n"),
         DevOp::GluF32 => a_rows("i0=rows"),
         DevOp::SiluF32 => a_elem("i0=n"),

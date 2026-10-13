@@ -963,6 +963,8 @@ pub(super) const KDA_WU_LEAN_MARKERS: [&str; 6] = [
     "plow_kda_wu_lean_vgpr_le_256",
 ];
 pub(super) const KDA_WU_LEAN_LDS: u32 = 46_080;
+/// `gemm_group_pf.hip`'s static LDS: the 128x384 double-buffered stage.
+pub(super) const GEMM_GROUP_LDS: u32 = 147_456;
 
 pub(super) const KDA_CARRY_KEYFEED_MARKERS: [&str; 7] = [
     "plow_kda_carry_keyfeed_abi_1",
