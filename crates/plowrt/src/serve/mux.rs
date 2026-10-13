@@ -4083,6 +4083,18 @@ fn run_one_tick(
                 .filter(|slot| slot.as_ref().is_some_and(|slot| slot.step > 0))
                 .count();
             let has_decode = decode_rows > 0;
+            let _trace = if crate::obs::tick::trace_on() {
+                let (waiting, rows) = slots[..b.min(slots.len())]
+                    .iter()
+                    .flatten()
+                    .filter(|s| s.step == 0)
+                    .fold((0u32, 0u32), |(n, r), s| {
+                        (n + 1, r + s.prompt_ids.len().saturating_sub(s.pf_pos) as u32)
+                    });
+                crate::obs::tick::trace_begin(decode_rows as u32, waiting, rows)
+            } else {
+                None
+            };
             let tick_max = amd_prefill_tick_cap(
                 has_decode || co_scheduled,
                 rt.pf_defer_decode && !co_scheduled,
@@ -4635,17 +4647,39 @@ fn run_one_tick(
             let pf_batch = true;
             let cap = b.min(slots.len());
             let backend = e.step_backend();
-            let full_budget = tick_max.min(backend.step_budget);
+            let mixed_pack = has_decode && !slo_on && e.mixed_pack_ready();
+            // PLOW_PF_HOLD: while enough rows decode, fresh prompts wait for a wide pack.
+            let hold = amd_pf_hold(
+                rt.pf_hold().filter(|_| !slo_on),
+                decode_rows,
+                slots[..cap]
+                    .iter()
+                    .flatten()
+                    .filter(|s| s.step == 0 && !s.respond.is_closed())
+                    .map(|s| {
+                        (
+                            s.prompt_ids.len().saturating_sub(s.pf_pos),
+                            s.arrived.elapsed().as_secs_f64() * 1e3,
+                        )
+                    }),
+            );
+            if hold == PfHold::Held {
+                crate::obs::tick::trace_held();
+            }
+            let tick_budget = match hold {
+                PfHold::Release(rows) => tick_max.max(rows),
+                _ => tick_max,
+            };
+            let full_budget = tick_budget.min(backend.step_budget);
             // PLOW_PF_BACK_TO_BACK: re-plan after each pass until the tick's row budget is spent,
             // so a prompt's chunks and further waiting prompts run before the decode step. Later
             // passes admit only cursors whose next chunk is known and fits what is left.
             let b2b = rt.pf_back_to_back && !slo_on;
-            let mixed_pack = has_decode && !slo_on && e.mixed_pack_ready();
             let mut decoded_in_pack = false;
             let mut b2b_used = 0u32;
             let mut b2b_pass = 0u32;
             let mut b2b_failed = false;
-            loop {
+            while hold != PfHold::Held {
                 let now = Instant::now();
                 if b2b_pass > 0 {
                     let fresh = (0..cap)
@@ -4716,7 +4750,7 @@ fn run_one_tick(
                     cap_rows: if b2b_pass > 0 {
                         full_budget.saturating_sub(b2b_used)
                     } else {
-                        tick_max
+                        tick_budget
                     },
                     packing: pf_batch,
                     rotate: rt.pf_rotate(),
@@ -4797,6 +4831,7 @@ fn run_one_tick(
                                 .expect("packed candidate still occupies its slot");
                             crate::obs::ttft::QUEUE.add(slot.arrived.elapsed().as_nanos() as u64);
                         }
+                        crate::obs::tick::trace_launch(if ride { "mixed" } else { "packed" });
                         let t_pf = Instant::now();
                         let mut result = {
                             let members: Vec<_> = packed
@@ -4822,6 +4857,12 @@ fn run_one_tick(
                         };
                         crate::obs::ttft::PREFILL.add(t_pf.elapsed().as_nanos() as u64);
                         let pack_rows: u32 = packed.iter().map(|span| span.n_rows).sum();
+                        crate::obs::tick::trace_launch_done(
+                            Some(if rode_now { "mixed" } else { "packed" }),
+                            pack_rows,
+                            packed.len() as u32,
+                            if rode_now { feeds.len() as u32 } else { 0 },
+                        );
                         b2b_used = b2b_used.saturating_add(pack_rows);
                         crate::obs::tick::prefill(t_pf.elapsed().as_nanos() as u64, pack_rows);
                         // Prompts the pack completed have no cursor left; their sampled
@@ -4894,7 +4935,7 @@ fn run_one_tick(
                                 for span in &packed {
                                     let i = span.slot as usize;
                                     if let Some(s) = slots[i].as_mut() {
-                                        s.cached_tokens = e.cached_rows(i);
+                                        set_cached(s, e.cached_rows(i));
                                     }
                                 }
                                 for (i, token) in finished {
@@ -4972,6 +5013,7 @@ fn run_one_tick(
                         // dispatcher wake, the formation hold, admission, and the
                         // engine-thread handoff.
                         crate::obs::ttft::QUEUE.add(slot_ref.arrived.elapsed().as_nanos() as u64);
+                        crate::obs::tick::trace_launch("lone");
                         let t_pf = std::time::Instant::now();
                         // ONE CHUNK, not the whole prompt. `Ok(None)` means this slot has more chunks to
                         // go; it stays `step == 0` for a later tick. Planned against the FULL tick cap,
@@ -5004,8 +5046,9 @@ fn run_one_tick(
                             frontier.saturating_sub(slot_ref.pf_pos.max(e.cached_rows(i))) as u32;
                         b2b_used = b2b_used.saturating_add(ran_rows);
                         crate::obs::tick::prefill(t_pf.elapsed().as_nanos() as u64, ran_rows);
+                        crate::obs::tick::trace_launch_done(None, ran_rows, 1, 0);
                         if let Some(s) = slots[i].as_mut() {
-                            s.cached_tokens = e.cached_rows(i);
+                            set_cached(s, e.cached_rows(i));
                         }
                         crate::obs::ttft::PREFILL.add(t_pf.elapsed().as_nanos() as u64);
                         match pf {
@@ -5129,8 +5172,10 @@ fn run_one_tick(
             let mut deferred = std::mem::take(&mut obs.host.slot_tokens);
             let t_dec = (crate::obs::tick::on() || slo_on).then(Instant::now);
             let t_call = crate::obs::host::on().then(Instant::now);
+            crate::obs::tick::trace_launch("decode");
             let step_result = if let Some(quantum) = multi {
                 let call_res = e.multi_step(&feeds, quantum, &mut deferred);
+                crate::obs::tick::trace_launch_done(None, 0, 0, feeds.len() as u32);
                 let t_emit = host_engine_call(t_call, feeds.len(), tokens_this_tick);
                 let res = call_res.and_then(|quantum| {
                     for &(i, _) in &feeds {
@@ -5160,6 +5205,7 @@ fn run_one_tick(
                 res
             } else {
                 let call_res = e.step_batch(&feeds);
+                crate::obs::tick::trace_launch_done(None, 0, 0, feeds.len() as u32);
                 let t_emit = host_engine_call(t_call, feeds.len(), tokens_this_tick);
                 let res = call_res.map(|out| {
                     for (i, token) in out {
@@ -5644,6 +5690,40 @@ fn amd_prefill_tick_cap(has_decode: bool, defer_decode: bool, interleave: u32) -
         u32::MAX
     } else {
         interleave
+    }
+}
+
+#[cfg(any(feature = "hsa", feature = "cpu"))]
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum PfHold {
+    Off,
+    /// Fresh prompts wait this tick; only decode runs.
+    Held,
+    /// The pending prompts run now under a tick budget of this many rows.
+    Release(u32),
+}
+
+/// `PLOW_PF_HOLD` for one tick. `pending` is `(rows not yet prefilled, ms since arrival)` per
+/// waiting prompt. With at least `min_decode` decode rows, prompts wait until three quarters of
+/// `rows` are pending (a pack that fills most of a `rows`-wide rung, with room left for the
+/// decode riders) or the oldest has waited `ms`; the release tick may then pack `rows`.
+#[cfg(any(feature = "hsa", feature = "cpu"))]
+fn amd_pf_hold(
+    spec: Option<(u32, f64, usize)>,
+    decode_rows: usize,
+    pending: impl Iterator<Item = (usize, f64)>,
+) -> PfHold {
+    let Some((rows, ms, min_decode)) = spec else {
+        return PfHold::Off;
+    };
+    if decode_rows == 0 || decode_rows < min_decode {
+        return PfHold::Off;
+    }
+    let (sum, oldest) = pending.fold((0usize, 0.0f64), |(n, o), (r, w)| (n + r, o.max(w)));
+    if sum > 0 && sum < rows as usize * 3 / 4 && oldest < ms {
+        PfHold::Held
+    } else {
+        PfHold::Release(rows)
     }
 }
 
@@ -7276,6 +7356,13 @@ fn incremental_delta(
 /// Shared by the batched, fallback, and GPU paths so error/exit semantics
 /// stay identical. `stop_ids` overrides the reference path's newline-byte
 /// heuristic with the model's real eos set (GPU path).
+/// `cached_tokens = rows`, tracing the newly cached rows as prefix hits.
+#[cfg(any(feature = "hsa", feature = "cpu"))]
+fn set_cached(slot: &mut Slot, rows: usize) {
+    crate::obs::tick::trace_hit(rows.saturating_sub(slot.cached_tokens));
+    slot.cached_tokens = rows;
+}
+
 fn handle_produced_token(
     slot_opt: &mut Option<Slot>,
     arena: &Option<SharedKvState>,
@@ -7292,6 +7379,7 @@ fn handle_produced_token(
     if let Some(telemetry) = slot.telemetry.as_mut() {
         telemetry.token(slot.cached_tokens);
     }
+    crate::obs::tick::trace_token(slot.arrived, slot.step == 0);
     slot.out_ids.push(token);
     slot.executed += exec;
     slot.step += 1;
@@ -9635,6 +9723,24 @@ mod tests {
     }
 
     #[cfg(any(feature = "hsa", feature = "cpu"))]
+    #[test]
+    fn pf_hold_waits_for_rows_or_age_and_only_under_decode() {
+        use super::{amd_pf_hold, PfHold};
+        let spec = Some((8192u32, 400.0, 16usize));
+        let ones = |n: usize| std::iter::repeat((1024usize, 1.0f64)).take(n);
+        assert_eq!(amd_pf_hold(None, 128, ones(1)), PfHold::Off);
+        assert_eq!(amd_pf_hold(spec, 8, ones(1)), PfHold::Off);
+        assert_eq!(amd_pf_hold(spec, 128, ones(5)), PfHold::Held);
+        assert_eq!(amd_pf_hold(spec, 128, ones(6)), PfHold::Release(8192));
+        assert_eq!(
+            amd_pf_hold(spec, 128, [(1024, 10.0), (1024, 401.0)].into_iter()),
+            PfHold::Release(8192)
+        );
+        assert_eq!(amd_pf_hold(spec, 128, [(4096, 1.0)].into_iter()), PfHold::Held);
+        assert_eq!(amd_pf_hold(spec, 128, [(4096, 1.0), (4096, 1.0)].into_iter()), PfHold::Release(8192));
+        assert_eq!(amd_pf_hold(spec, 128, std::iter::empty()), PfHold::Release(8192));
+    }
+
     #[test]
     fn amd_prefill_scheduler_controls_are_bounded() {
         assert_eq!(amd_prefill_tick_cap(false, false, 2048), u32::MAX);

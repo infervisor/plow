@@ -871,6 +871,19 @@ pub struct RuntimeConfig {
     #[arg(long = "tick-log", env = "PLOW_TICK_LOG", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
     pub tick_log: bool,
 
+    /// AMD serve tick timeline: one JSON line per tick (launch kinds, rows, rungs, enqueue and
+    /// drain timestamps, per-rank drain skew, emitted slots) appended to this path
+    /// (`PLOW_TICK_TRACE=<path>`). `scripts/bench/tick_trace_report.py` turns it into a table.
+    #[arg(long = "tick-trace", env = "PLOW_TICK_TRACE", hide = true, global = true)]
+    pub tick_trace: Option<std::path::PathBuf>,
+
+    /// AMD prefill hold (`PLOW_PF_HOLD=rows[,ms[,min_decode]]`): while at least `min_decode`
+    /// (default 16) rows decode, waiting prompts wait until 3/4 of `rows` prompt rows are pending
+    /// or the oldest has waited `ms` (default 400), so they run as one wide pack instead of one
+    /// lone padded launch per arrival. The tick budget is raised to `rows` on release. Unset = off.
+    #[arg(long = "pf-hold", env = "PLOW_PF_HOLD", hide = true, global = true)]
+    pub pf_hold: Option<String>,
+
     /// Decode-step host-phase breakdown (`PLOW_DSTEP_LOG=1`).
     #[arg(long = "dstep-log", env = "PLOW_DSTEP_LOG", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
     pub dstep_log: bool,
@@ -1560,6 +1573,12 @@ impl RuntimeConfig {
         self.pf_interleave.unwrap_or(0)
     }
 
+    /// `PLOW_PF_HOLD=rows[,ms[,min_decode]]` as `(rows, ms, min_decode)`; unset, empty, `0` or
+    /// malformed = off.
+    pub fn pf_hold(&self) -> Option<(u32, f64, usize)> {
+        parse_pf_hold(self.pf_hold.as_deref()?)
+    }
+
     /// AMD per-rank NUMA-local kernarg ring and host staging (`PLOW_AMD_NUMA_HOST_POOLS`). Unset →
     /// on; `=0` → the single first-CPU-agent placement.
     pub fn amd_numa_host_pools(&self) -> bool {
@@ -1672,6 +1691,12 @@ pub struct AmdRuntimeConfig {
     /// Enqueue prefill segments in segment-major rank order and drain once per chunk.
     #[arg(long = "amd-tp-prefill-segment-major", env = "PLOW_TP_PREFILL_SEGMENT_MAJOR", default_value_t = true, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
     pub tp_prefill_segment_major: bool,
+
+    /// Packed (multi-prompt / mixed) prefill chunks enqueue every segment on every rank and
+    /// drain once, as isolated chunks do under `PLOW_TP_PREFILL_SEGMENT_MAJOR`; off = a host
+    /// drain after every segment.
+    #[arg(long = "amd-packed-seg-major", env = "PLOW_AMD_PACKED_SEG_MAJOR", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
+    pub packed_seg_major: bool,
 
     /// Per-segment all-rank barrier timing for prefill (diagnostic; disables segment-major).
     #[arg(long = "amd-prefill-seg-timing", env = "PLOW_PREFILL_SEG_TIMING", hide = true, default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
@@ -2659,6 +2684,20 @@ pub fn is_secret_env(name: &str) -> bool {
             .any(|suffix| upper.ends_with(suffix))
 }
 
+fn parse_pf_hold(spec: &str) -> Option<(u32, f64, usize)> {
+    let mut it = spec.split(',').map(str::trim);
+    let rows: u32 = it.next()?.parse().ok().filter(|&r| r > 0)?;
+    let ms: f64 = match it.next() {
+        Some(v) => v.parse().ok().filter(|m: &f64| m.is_finite() && *m >= 0.0)?,
+        None => 400.0,
+    };
+    let min_decode: usize = match it.next() {
+        Some(v) => v.parse().ok()?,
+        None => 16,
+    };
+    it.next().is_none().then_some((rows, ms, min_decode))
+}
+
 #[cfg(test)]
 mod tests {
     /// Serve knobs the Gemma-4 H100 recipes used to pin: unset follows the engine or the packet,
@@ -3245,6 +3284,17 @@ mod tests {
             .expect("explicit state-clear rollback");
         let config = super::AmdRuntimeConfig::from_arg_matches(&matches).expect("AMD config");
         assert!(!config.state_clear_device);
+    }
+
+    #[test]
+    fn pf_hold_parses_rows_ms_and_min_decode() {
+        assert_eq!(super::parse_pf_hold("8192"), Some((8192, 400.0, 16)));
+        assert_eq!(super::parse_pf_hold("4096, 250"), Some((4096, 250.0, 16)));
+        assert_eq!(super::parse_pf_hold("2048,100,8"), Some((2048, 100.0, 8)));
+        assert_eq!(super::parse_pf_hold("0"), None);
+        assert_eq!(super::parse_pf_hold(""), None);
+        assert_eq!(super::parse_pf_hold("8192,x"), None);
+        assert_eq!(super::parse_pf_hold("8192,1,2,3"), None);
     }
 
     #[test]

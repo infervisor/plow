@@ -509,8 +509,19 @@ impl AmdTpGroup {
     }
 
     fn finish_ranks(&self) -> Result<()> {
-        let result =
-            super::chain_admission::finish_all(self.ranks.len(), |rank| self.ranks[rank].drain());
+        let result = if crate::obs::tick::trace_on() {
+            let start = std::time::Instant::now();
+            let mut done = Vec::with_capacity(self.ranks.len());
+            let result = super::chain_admission::finish_all(self.ranks.len(), |rank| {
+                let r = self.ranks[rank].drain();
+                done.push(std::time::Instant::now());
+                r
+            });
+            crate::obs::tick::trace_drain(start, &done);
+            result
+        } else {
+            super::chain_admission::finish_all(self.ranks.len(), |rank| self.ranks[rank].drain())
+        };
         if result.is_err() {
             for rank in &self.ranks {
                 rank.abort_replay();
@@ -1225,6 +1236,7 @@ impl AmdTpGroup {
         if let Some(z) = launched_at {
             dstep::ENQUEUE.add(z.elapsed().as_nanos() as u64);
         }
+        crate::obs::tick::trace_enqueued();
         let in_flight_enqueued = crate::obs::tick::on().then(|| self.ranks[0].in_flight());
         // Do not put this work inside the launch closure: every rank must be
         // resident before ~1.5 ms of TP8 counter clears can begin. These are
@@ -2046,6 +2058,8 @@ impl AmdTpGroup {
             }
             let enqueue_ns = t.elapsed().as_nanos() as u64;
             ttft::PF_ENQUEUE.add(enqueue_ns);
+            crate::obs::tick::trace_enqueued();
+            crate::obs::tick::trace_rung(self.ranks[0].prog_t(step.prog));
 
             // The GPU is ~1 s behind the host here: map the next KV block on every rank now,
             // not in the decode that follows the chunk (`AmdEngine::prefill_map_ahead`).
@@ -2060,6 +2074,8 @@ impl AmdTpGroup {
 
             let t = std::time::Instant::now();
             let mut rank_drain_ns = Vec::with_capacity(if tick_log { self.ranks.len() } else { 0 });
+            let trace = crate::obs::tick::trace_on();
+            let mut rank_done = Vec::with_capacity(if trace { self.ranks.len() } else { 0 });
             // Drain EVERY rank even after one fails: `?` on the first error returned with ranks
             // 1..n still running, the same rebase-under-in-flight-work hazard as above.
             let mut drain_err = None;
@@ -2070,6 +2086,12 @@ impl AmdTpGroup {
                 if tick_log {
                     rank_drain_ns.push(t.elapsed().as_nanos() as u64);
                 }
+                if trace {
+                    rank_done.push(std::time::Instant::now());
+                }
+            }
+            if trace {
+                crate::obs::tick::trace_drain(t, &rank_done);
             }
             if let Some(err) = drain_err {
                 for rank in &self.ranks {
@@ -2320,13 +2342,31 @@ impl AmdTpGroup {
 
         let launches = self.ranks[0].prog_dispatch(prog).launches();
         ttft::PF_SEGMENTS.tally(launches as u64);
-        for seg in 0..launches {
+        crate::obs::tick::trace_rung(rung);
+        // PLOW_AMD_PACKED_SEG_MAJOR: every segment on every rank, one drain, as the isolated
+        // chunk's segment-major path; each rank's queue keeps its local segment order.
+        if crate::config::RuntimeConfig::get().amd.packed_seg_major
+            && self.prefill_capture.is_none()
+        {
             let t = std::time::Instant::now();
-            self.enqueue_segment_all(prog, seg)?;
+            for seg in 0..launches {
+                self.enqueue_segment_all(prog, seg)?;
+            }
             ttft::PF_ENQUEUE.add(t.elapsed().as_nanos() as u64);
+            crate::obs::tick::trace_enqueued();
             let t = std::time::Instant::now();
             self.finish_ranks()?;
             ttft::PF_DRAIN.add(t.elapsed().as_nanos() as u64);
+        } else {
+            for seg in 0..launches {
+                let t = std::time::Instant::now();
+                self.enqueue_segment_all(prog, seg)?;
+                ttft::PF_ENQUEUE.add(t.elapsed().as_nanos() as u64);
+                crate::obs::tick::trace_enqueued();
+                let t = std::time::Instant::now();
+                self.finish_ranks()?;
+                ttft::PF_DRAIN.add(t.elapsed().as_nanos() as u64);
+            }
         }
         if self.audit {
             self.group.audit_xctr(&self.gate_expect[prog])?;

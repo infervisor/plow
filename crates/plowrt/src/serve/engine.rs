@@ -4189,6 +4189,7 @@ mod amd_serve {
                         tracing::info!(rung = w, occupied = rows, "decode ladder rung");
                         self.last_rung = w;
                     }
+                    crate::obs::tick::trace_rung(w);
                     e.upload_parked(&self.parked_stage)?;
                     e.seed_ids(&self.next_id)?;
                     let started = measure_dispatch.then(std::time::Instant::now);
@@ -4209,6 +4210,7 @@ mod amd_serve {
                         tracing::info!(rung = w, occupied = rows, "decode ladder rung");
                         self.last_rung = w;
                     }
+                    crate::obs::tick::trace_rung(w);
                     let run = g.decode_prog_advancing(dp, &self.kvlen_stage, &self.parked_stage);
                     if g.rank(0).prog_dense_exact(run) {
                         park_kvlen(&mut self.kvlen_stage, &self.parked_stage);
