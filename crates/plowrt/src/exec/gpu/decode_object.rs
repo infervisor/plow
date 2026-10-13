@@ -163,9 +163,10 @@ pub(super) fn bind_module(
 }
 
 /// The packet's `<stem>_gw.cubin`: the decode interpreter without the single-row GEMV kernels and
-/// with the wide-rung GEMV arm, launched for the batched rungs — `(narrow, full)`
-/// claims, the full one for rungs wider than GV_MM_MAX (the arm's ring). `None` when the packet
-/// ships none; one whose pairing or ABI differs from the main decode object is refused.
+/// with the wide-rung GEMV arm, launched for the batched rungs — the first rung the arm takes
+/// (`plow_gw_min_rows`, default GV_MM_MAX + 1) and the `(narrow, full)` claims, the full one from
+/// that rung on (the arm's ring). `None` when the packet ships none; one whose pairing or ABI
+/// differs from the main decode object is refused.
 pub(super) fn load_gemv_wide(
     be: &Arc<CudaBackend>,
     assets: &Path,
@@ -173,7 +174,7 @@ pub(super) fn load_gemv_wide(
     rows64: bool,
     main: &Module,
     grid: u32,
-) -> Result<Option<(Arc<BoundDecodeObject>, Arc<BoundDecodeObject>)>> {
+) -> Result<Option<(u32, (Arc<BoundDecodeObject>, Arc<BoundDecodeObject>))>> {
     let kv_abi = be.module_global_u32(main, "plow_fp8_kv_abi")?;
     let file = format!(
         "{stem}_gw{}{}.cubin",
@@ -209,13 +210,23 @@ pub(super) fn load_gemv_wide(
     let narrow = be
         .module_global_u32(&module, "plow_arena_bytes_narrow_gw")?
         .map_or(smem, |narrow| narrow.min(smem));
+    let min_rows = match be.module_global_u32(&module, "plow_gw_min_rows_gw")? {
+        Some(rows) => rows,
+        None => be.module_global_u32(main, "plow_gemv_mm_cap")?.unwrap_or(0) + 1,
+    };
     be.set_max_dynamic_smem(function, smem)?;
     if be.occupancy_blocks_per_sm(function, BLOCK, smem as usize)? * be.sm_count() < grid {
         return Err(reject(&format!(
             "{file}: cannot hold the decode grid {grid}"
         )));
     }
-    tracing::info!(file, smem, narrow, "batched-rung decode object loaded");
+    tracing::info!(
+        file,
+        smem,
+        narrow,
+        min_rows,
+        "batched-rung decode object loaded"
+    );
     let object = |smem| {
         Arc::new(BoundDecodeObject {
             function,
@@ -225,7 +236,7 @@ pub(super) fn load_gemv_wide(
             _module: Arc::clone(&module),
         })
     };
-    Ok(Some((object(narrow), object(smem))))
+    Ok(Some((min_rows, (object(narrow), object(smem)))))
 }
 
 impl BoundDecodeObject {

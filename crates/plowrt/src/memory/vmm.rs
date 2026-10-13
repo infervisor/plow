@@ -732,14 +732,20 @@ impl LiveKvLayout {
         for c in &m.caches {
             cache_tensors.extend(c.pair.map(usize::from));
             let elem = if c.scales.is_some() { 1 } else { 2 };
+            // A row-interleaved cache is one `heads * hd` head window per slot: a row maps as one
+            // unit, so the allocator charges whole rows instead of a block per head.
+            let (heads, hd) = match c.layout {
+                plow_asset::live_kv::LAYOUT_ROW_INTERLEAVED => (1, c.heads * c.hd),
+                _ => (c.heads, c.hd),
+            };
             if c.window == 0 {
-                if full_shape.is_some_and(|shape| shape != (c.heads, c.hd, elem)) {
+                if full_shape.is_some_and(|shape| shape != (heads, hd, elem)) {
                     return Err(RuntimeError::Rejected(
                         "LIVE allocator requires uniform full-cache head geometry and encoding"
                             .into(),
                     ));
                 }
-                full_shape = Some((c.heads, c.hd, elem));
+                full_shape = Some((heads, hd, elem));
                 full_tensors.push(c.pair.map(usize::from));
             } else {
                 for tensor in c.pair.map(usize::from) {
@@ -2639,6 +2645,28 @@ impl VmmKv {
 
     pub fn stats(&self) -> VmmStats {
         stats_of(&self.shared)
+    }
+
+    /// Device bytes of every physical block alive now (mapped, cached, pooled). A retired block
+    /// leaves the live count for the pool but keeps its device memory: admission counts it here,
+    /// or it is neither held nor free and a request the pool could serve is refused.
+    pub fn mapped_bytes(&self) -> u64 {
+        let s = stats_of(&self.shared);
+        (s.blocks_live + s.blocks_pooled) * self.shared.block_bytes
+    }
+
+    pub fn block_bytes(&self) -> u64 {
+        self.shared.block_bytes
+    }
+
+    /// Sequences by mapped block columns: `[0, 1, 2, 3+]` (diagnostics).
+    pub fn seq_blocks_hist(&self) -> [u32; 4] {
+        let inner = self.shared.inner.lock();
+        let mut hist = [0u32; 4];
+        for &blocks in &inner.seq_blocks {
+            hist[(blocks as usize).min(3)] += 1;
+        }
+        hist
     }
 
     /// Cloneable stats reader for exporters. Takes only the POOL mutex
@@ -4875,6 +4903,21 @@ mod tests {
         assert_eq!(layout.geometry.kvh_full, 1);
         assert_eq!(layout.geometry.hd_full, 256);
         assert_eq!(layout.geometry.full_tensor_bytes(), 4 * 1024 * 256 * 2);
+    }
+
+    // A row-interleaved cache maps one heads*hd row per position: one head window per slot.
+    #[test]
+    fn row_interleaved_caches_are_one_head_window() {
+        let blob = live_blob();
+        let mut m = blob.with_packet_view(plow_asset::live_kv::emit).unwrap();
+        for c in &mut m.caches {
+            (c.heads, c.hd, c.layout) = (4, 64, plow_asset::live_kv::LAYOUT_ROW_INTERLEAVED);
+        }
+        let g = LiveKvLayout::from_validated_manifest(&blob, &m)
+            .unwrap()
+            .geometry;
+        assert_eq!((g.kvh_full, g.hd_full, g.row_bytes()), (1, 256, 512));
+        assert_eq!(g.full_tensor_bytes(), 4 * 1024 * 4 * 64 * 2);
     }
 
     #[test]

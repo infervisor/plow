@@ -326,6 +326,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     if let Some((lo, hi, step)) = seg_sweep {
         let base_pos: Vec<usize> = (0..slots).map(|_| ctx + warmup).collect();
+        for b in 0..slots {
+            e.snapshot_slot(b)?;
+        }
         let base_last = last.clone();
         for n in (lo..=hi).step_by(step.max(1)) {
             e.capture_debug_decode_prefix(n)?;
@@ -350,6 +353,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     if let Some((lo, hi)) = sweep {
         let base_pos: Vec<usize> = (0..slots).map(|_| ctx + warmup).collect();
+        // Recurrent (GDN) state is restored with the position at every cap.
+        for b in 0..slots {
+            e.snapshot_slot(b)?;
+        }
         let base_last = last.clone();
         for cap in (lo..=hi).chain([u32::MAX]) {
             e.set_debug_max_inst(cap, slots)?;
@@ -538,6 +545,14 @@ fn ride_bench(
         .collect();
     for i in 0..fills.len() {
         e.begin_slot(first + i, prompt.len() + 1)?;
+    }
+    // A recurrent chain rewinds through the state snapshot taken at the rewind position: the
+    // decode slots at ctx, the prefill slots fresh at 0.
+    for b in 0..wmax {
+        e.snapshot_slot(b)?;
+    }
+    for i in 0..fills.len() {
+        e.snapshot_slot(first + i)?;
     }
     if let Some(dir) = dump {
         std::fs::create_dir_all(dir)?;

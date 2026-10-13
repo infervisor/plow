@@ -125,6 +125,9 @@ impl Manifest {
         match DevOp::from_u16(d.op) {
             Some(DevOp::HeadNormRope) => d.t[6] = slot,
             Some(DevOp::HeadNormRopeFp8) => d.t[7] = slot,
+            // Qwen3.5: the KV writer's per-row slot table, the conv prefill's request table.
+            Some(DevOp::QwenHeadNormRope) => d.t[7] = slot,
+            Some(DevOp::QwenGdnConvPrefill) => d.t[5] = request,
             Some(DevOp::FlashPrefill) => {
                 d.t[6] = request;
                 for map in &self.maps {
@@ -285,32 +288,32 @@ impl Manifest {
             "descriptor table coverage",
         )?;
         need(
-            !p.programs.iter().flat_map(|g| g.insts).any(|d| {
-                matches!(
-                    DevOp::from_u16(d.op),
-                    Some(
-                        DevOp::KdaConv
-                            | DevOp::KdaGate
-                            | DevOp::KdaStateStep
-                            | DevOp::KdaGatedNorm
-                            | DevOp::KdaConv3
-                            | DevOp::KdaStateStepG
-                            | DevOp::KdaConvStateStepG
-                            | DevOp::KdaChunkPrepare
-                            | DevOp::KdaChunkIntra
-                            | DevOp::KdaChunkWu
-                            | DevOp::KdaChunkCarry
-                            | DevOp::KdaDecodeFused
-                            | DevOp::QwenGdnConv
-                            | DevOp::QwenGdnStep
-                            | DevOp::QwenGdnConvPrefill
-                            | DevOp::QwenGdnQkvPrep
-                            | DevOp::QwenGdnGatePrep
-                            | DevOp::QwenGdnPrefill
+            // Prefill programs only: a hybrid's decode programs step their recurrent state.
+            !p.programs[..p.prefill_count]
+                .iter()
+                .flat_map(|g| g.insts)
+                .any(|d| {
+                    matches!(
+                        DevOp::from_u16(d.op),
+                        Some(
+                            DevOp::KdaConv
+                                | DevOp::KdaGate
+                                | DevOp::KdaStateStep
+                                | DevOp::KdaGatedNorm
+                                | DevOp::KdaConv3
+                                | DevOp::KdaStateStepG
+                                | DevOp::KdaConvStateStepG
+                                | DevOp::KdaChunkPrepare
+                                | DevOp::KdaChunkIntra
+                                | DevOp::KdaChunkWu
+                                | DevOp::KdaChunkCarry
+                                | DevOp::KdaDecodeFused
+                                | DevOp::QwenGdnConv
+                                | DevOp::QwenGdnStep
+                        )
                     )
-                )
-            }),
-            "recurrent state is unsupported",
+                }),
+            "recurrent decode state is unsupported",
         )?;
         for (pi, g) in p.programs.iter().enumerate() {
             let mut flash_sites = 0usize;
@@ -423,6 +426,16 @@ impl Manifest {
                         "merge request operand",
                     )?;
                 }
+                // Qwen3.5 prefill: the KV writer takes the slot table in t7, the conv prefill the
+                // request table in t5 (each request is its own sequence with its slot's history);
+                // the recurrent scan itself runs host-side over the same table.
+                if op == DevOp::QwenHeadNormRope {
+                    need(d.t[7] == TENSOR_NONE16, "existing slot map")?;
+                    slot_writers += usize::from(d.i[4] != 0);
+                }
+                if op == DevOp::QwenGdnConvPrefill {
+                    need(d.t[5] == TENSOR_NONE16, "existing request table")?;
+                }
             }
             if pi < p.prefill_count {
                 need(
@@ -442,10 +455,11 @@ fn is_attention(d: &DevInst64) -> bool {
 }
 
 fn is_cache_writer(d: &DevInst64) -> bool {
-    matches!(
-        DevOp::from_u16(d.op),
-        Some(DevOp::HeadNormRope | DevOp::HeadNormRopeFp8)
-    ) && d.fj[1] != 0
+    match DevOp::from_u16(d.op) {
+        Some(DevOp::HeadNormRope | DevOp::HeadNormRopeFp8) => d.fj[1] != 0,
+        Some(DevOp::QwenHeadNormRope) => d.i[4] != 0,
+        _ => false,
+    }
 }
 
 /// Stage of each staged site of a prefill program, by position. A cache pair read by several

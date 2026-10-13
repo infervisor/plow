@@ -9,6 +9,7 @@ mod chain_admission;
 #[cfg(any(feature = "hsa", feature = "cuda"))]
 mod kv_layout;
 pub(crate) mod tensor_bindings;
+pub(crate) mod terminal_layout;
 
 /// The AMD/gfx950 serving engine — a port of the proven `gemma4_chat.c` driver,
 /// deliberately separate from the CUDA engine because the two differ in kind

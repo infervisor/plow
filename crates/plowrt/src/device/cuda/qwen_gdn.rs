@@ -7,7 +7,12 @@ use std::{ffi::c_void, path::Path, sync::Arc};
 
 const MAX_TOKENS: usize = 8192;
 const MAP_BYTES: u64 = 16896;
-const STATE_BYTES: u64 = 48 * 128 * 128 * 4;
+/// Per-sequence recurrent state `[HV=48, V=128, K=128]` f32, the library's fixed geometry.
+pub(crate) const STATE_BYTES: u64 = 48 * 128 * 128 * 4;
+/// Bytes per row of the conv core tensors (`validate_n` sizes 2 and 3).
+pub(crate) const CORE_ROW_BYTES: u64 = 12288;
+/// Packed sequences one launch takes (cu_seqlens entries - 1).
+pub(crate) const MAX_SEQS: usize = 64;
 type Create = unsafe extern "C" fn(i32, *mut *mut c_void) -> i32;
 type Destroy = unsafe extern "C" fn(*mut c_void) -> i32;
 type Run = unsafe extern "C" fn(
@@ -25,14 +30,36 @@ type Run = unsafe extern "C" fn(
     i32,
     *mut c_void,
 ) -> i32;
+type RunVarlen = unsafe extern "C" fn(
+    *mut c_void,
+    *mut c_void,
+    *mut c_void,
+    *mut c_void,
+    *mut c_void,
+    *mut c_void,
+    *mut c_void,
+    *mut c_void,
+    *mut c_void,
+    *mut c_void,
+    *mut c_void,
+    i32,
+    i32,
+    *mut c_void,
+) -> i32;
 
 pub(crate) struct NativeGdn {
     _library: libloading::Library,
     handle: usize,
     destroy: Destroy,
     run: Run,
+    /// `plow_gdn_run_varlen`: libraries built before the packed chain lack it.
+    run_varlen: Option<RunVarlen>,
     maps: DeviceMem,
     offsets: DeviceMem,
+    /// cu_seqlens of the current packed launch (device, MAX_SEQS + 1 i64) and its host image,
+    /// which the async upload reads until the caller's stream synchronize.
+    cu: DeviceMem,
+    cu_host: Vec<i64>,
     stream: Option<usize>,
     backend: Arc<CudaBackend>,
 }
@@ -62,6 +89,10 @@ impl NativeGdn {
             .map_err(|e| RuntimeError::Device(format!("resolve plow_gdn_destroy: {e}")))?;
         let run = *unsafe { library.get::<Run>(b"plow_gdn_run\0") }
             .map_err(|e| RuntimeError::Device(format!("resolve plow_gdn_run: {e}")))?;
+        let run_varlen = unsafe { library.get::<RunVarlen>(b"plow_gdn_run_varlen\0") }
+            .ok()
+            .map(|f| *f);
+        let cu = backend.alloc(backend.device_ordinal, ((MAX_SEQS + 1) * 8) as u64)?;
         let maps = backend.alloc(backend.device_ordinal, MAP_BYTES)?;
         if maps.base % 128 != 0 {
             return Err(RuntimeError::Device(
@@ -90,8 +121,11 @@ impl NativeGdn {
             handle: handle as usize,
             destroy,
             run,
+            run_varlen,
             maps,
             offsets,
+            cu,
+            cu_host: Vec::with_capacity(MAX_SEQS + 1),
             stream: None,
             backend,
         })
@@ -145,9 +179,19 @@ impl NativeGdn {
 }
 
 fn validate(tensors: &[&DeviceMem; 8], tokens: usize) -> Result<()> {
+    validate_n(tensors, tokens, 1)
+}
+
+/// `tensors[6]` / `[7]` hold `nseq` contiguous state slots.
+fn validate_n(tensors: &[&DeviceMem; 8], tokens: usize, nseq: usize) -> Result<()> {
     if !(1..=MAX_TOKENS).contains(&tokens) {
         return Err(RuntimeError::Device(
             "native GDN tokens must be in 1..=8192".into(),
+        ));
+    }
+    if !(1..=MAX_SEQS).contains(&nseq) || nseq > tokens {
+        return Err(RuntimeError::Device(
+            "native GDN packed sequences must be in 1..=64 and non-empty".into(),
         ));
     }
     let t = tokens as u64;
@@ -158,8 +202,8 @@ fn validate(tensors: &[&DeviceMem; 8], tokens: usize) -> Result<()> {
         t * 12288,
         t * 192,
         t * 192,
-        STATE_BYTES,
-        STATE_BYTES,
+        nseq as u64 * STATE_BYTES,
+        nseq as u64 * STATE_BYTES,
     ];
     let mut ends = [0; 8];
     for (i, tensor) in tensors.iter().enumerate() {
@@ -184,6 +228,81 @@ fn validate(tensors: &[&DeviceMem; 8], tokens: usize) -> Result<()> {
         }
     }
     Ok(())
+}
+
+impl NativeGdn {
+    pub(crate) fn varlen(&self) -> bool {
+        self.run_varlen.is_some()
+    }
+
+    /// `lens.len()` packed sequences, rows contiguous in `lens` order; `tensors[6]` / `[7]` are
+    /// `lens.len()` contiguous final / initial state slots (the caller gathers and scatters the
+    /// per-slot states; nothing is copied back here).
+    ///
+    /// # Safety
+    /// As [`Self::launch`]; the caller synchronizes the stream before the next packed launch
+    /// (the cu_seqlens upload reads a host buffer owned by the adapter).
+    pub(crate) unsafe fn launch_varlen(
+        &mut self,
+        tensors: [&DeviceMem; 8],
+        lens: &[u32],
+        stream: &CudaStream,
+    ) -> Result<()> {
+        let run = self.run_varlen.ok_or_else(|| {
+            RuntimeError::Device("native GDN library lacks plow_gdn_run_varlen".into())
+        })?;
+        if lens.iter().any(|&l| l == 0) {
+            return Err(RuntimeError::Device(
+                "native GDN packed sequence of 0 rows".into(),
+            ));
+        }
+        let tokens: usize = lens.iter().map(|&l| l as usize).sum();
+        validate_n(&tensors, tokens, lens.len())?;
+        if stream.keep.ctx != self.backend.ctx || self.stream.is_some_and(|s| s != stream.raw) {
+            return Err(RuntimeError::Device(
+                "native GDN requires one stream in its selected context".into(),
+            ));
+        }
+        self.backend.bind()?;
+        self.stream = Some(stream.raw);
+        self.cu_host.clear();
+        self.cu_host.push(0);
+        let mut end = 0i64;
+        for &l in lens {
+            end += i64::from(l);
+            self.cu_host.push(end);
+        }
+        // SAFETY: cu_host lives on self until the caller's stream synchronize.
+        unsafe {
+            self.backend.memcpy_htod_async(
+                self.cu.base,
+                bytemuck::cast_slice(&self.cu_host),
+                stream,
+            )?;
+        }
+        let p = tensors.map(|t| t.base as *mut c_void);
+        check(
+            unsafe {
+                run(
+                    self.handle as *mut c_void,
+                    p[0],
+                    p[1],
+                    p[2],
+                    p[3],
+                    p[4],
+                    p[5],
+                    p[6],
+                    p[7],
+                    self.maps.base as *mut c_void,
+                    self.cu.base as *mut c_void,
+                    tokens as i32,
+                    lens.len() as i32,
+                    stream.raw as *mut c_void,
+                )
+            },
+            "plow_gdn_run_varlen",
+        )
+    }
 }
 
 impl Drop for NativeGdn {

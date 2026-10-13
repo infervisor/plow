@@ -1,0 +1,97 @@
+# Trial: Qwen3.8-27B (qwen3_5 hybrid GDN + GQA hd256) BF16 on H100 SXM5, 16K context, decode B4,
+# prefill buckets 128/1024/4096 (+8192 always rung). Bring-up cell; the production TOML is
+# recipes/infervisor/qwen3.8-27b/sm90a-h100-tp1.toml once the per-rung choices qualify.
+#
+#   PYREF=/opt/pytorch/bin/python3 PLOW_NVCC=/usr/local/cuda-12.9/bin/nvcc \
+#   NVCC_PREPEND_FLAGS='-ccbin /usr/bin/g++-14' PLOW_CAMPAIGN_NO_NIX=1 \
+#   python3 scripts/campaign/campaign.py build scripts/campaign/recipes/qwen38-27b.h100.bf16.toml --out <dir>
+
+[cell]
+name = "qwen38-27b.h100.bf16"
+model = "Qwen/Qwen3.8-27B"
+revision = "local"
+hf_dir = "{env:QWEN38_CHECKPOINT}"
+gpu = "H100 SXM5"
+arch = "sm_90a"
+n_cu = 132
+max_ctx = 16384
+precision = "bf16"
+
+# GDN prefill runs host-side from <assets>/libplow_gdn_prefill.so (exec/gpu.rs NativeGdn); the
+# FlashInfer CuTe DSL export needs the vLLM python (flashinfer 0.6.16 + cutlass 4.6.2).
+[[prep]]
+name = "gdn-prefill-lib"
+script = "scripts/build_sm90a_qwen_gdn.py"
+python = "{env:PYREF}"
+args = ["{out}/assets"]
+
+# The hd256 causal generated prefill-attention role (tuning/nvidia/sm_90a/h100-sxm5/gen_kernels.json;
+# the interpreter's hd256 body ran the 16 full-attention layers at ~8 TFLOP/s: 1024-row prefill
+# 196 -> 151 ms). A hand-parameterized entry: nvcc only (PLOW_NVCC), no TileLang.
+[[prep]]
+name = "gen-kernels"
+script = "scripts/gen_kernels/build_catalog.py"
+python = "python3"
+args = ["build", "{out}/assets", "--entries", "attn_pf_hd256_causal"]
+
+[emit]
+emit = "devblob+cubin"
+args = []
+[emit.env]
+PLOW_QWEN_PREFILL = "128,1024,4096"
+# One decode program per rung. The live-KV allocator (serve.env PLOW_VMM_LIVE) commits KV per
+# admitted slot; the recurrent state (151 MB per slot) is still flat, and 64 slots left the
+# planner 0.5 GiB short on the 80 GB part, so the ladder tops at 48.
+PLOW_DECODE_BATCH_LADDER = "1,2,4,8,16,32,48"
+# Dense projections of every prefill bucket as cuBLASLt segments (the generic interpreter GEMM ran
+# the 1024-row bucket at 14% of the roofline floor).
+PLOW_EMIT_PREFILL_CUBLASLT = "1"
+PLOW_EMIT_GEN_KERNELS = "attn_pf_hd256_causal"
+# Decode: residual + RMSNorm folded into the consuming projection on rungs <= 4 (PLOW_QWEN_FOLD_MAX
+# default; every block redoing all rows loses from B8: 34.5 vs 31.5 ms), z/a/b and k/v as one
+# multi-output walk each, the MLP as one GEMV_GLU; the GDN step's serial 8-row body. ctx 1K step ms
+# B1/2/4/8/16/32/48: 24.2/25.6/28.3/31.5/38.7/58.1/66.8 (unfused 27.4/28.2/29.8/33.2/40.2/60.8/69.9).
+PLOW_QWEN_FOLD_NORM = "1"
+PLOW_QWEN_FUSE_AB = "1"
+PLOW_QWEN_FUSE_MLP = "1"
+
+# Prefix caching stays off: plowrt rejects it with recurrent (GDN) state ("recurrent state does not
+# support prefix caching"); the hybrid would need a GDN-state snapshot at the prefix boundary.
+# PLOW_VMM_LIVE: KV reserved virtually at the ceiling, physical commit per admitted slot and rows
+# (flat KV is 1 GiB per slot at 16K).
+[serve.env]
+PLOW_VMM_LIVE = "1"
+PLOW_PREFIX_CACHE = "0"
+
+[bench]
+backend = "openai"
+in_lens = "128 1024 4096"
+concs = "1"
+nprompt = 32
+outlen = 128
+warmups = 2
+seed = 42
+tokenizer = "{env:QWEN38_CHECKPOINT}"
+model_id = "checkpoint"
+gate_prompt = "<|im_start|>user\nWhat is the capital of France? Answer in one short sentence.<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
+
+[bench.profiles.realtime]
+in_lens = "128 1024 4096 7000 15000"
+concs = "1 4"
+nprompt = 32
+
+[bench.profiles.high_concurrency]
+in_lens = "128 1024 4096 7000 15000"
+concs = "16 32 64 128"
+nprompt = 384
+
+# FP32-reference gate (scripts/llm/fp32_ref_gate.py, offload reference of the bf16 checkpoint):
+# QWEN38_FP32_REF = ref.json, QWEN38_FP32_VLLM = the vLLM 0.28 capture against it.
+[gates]
+python = "{env:PYREF}"
+[gates.llm_fp32_ref]
+reference = "{env:QWEN38_FP32_REF}"
+# Each concurrency against the vLLM capture at the same concurrency (batch composition moves the
+# KL of either arm by more than the gate's slack).
+concurrency = [1, 8, 32]
+vllm_capture = { c1 = "{env:QWEN38_FP32_VLLM}", c8 = "{env:QWEN38_FP32_VLLM_C8}", c32 = "{env:QWEN38_FP32_VLLM_C32}" }

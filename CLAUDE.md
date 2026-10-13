@@ -34,6 +34,12 @@ environment failures on leased GPUs.
   scratch outside the repo. Do not scatter raw results under `docs/`, `scripts/` or `perf-data/`.
   Keep one serving-comparison CSV per campaign in its designated results directory; record only
   qualified wins and their evidence links in `comparison.md`.
+* A new model starts from the full plowrt route set (template
+  `scripts/campaign/recipes/templates/llm-sm90a-default-on.toml`); the campaign measures removing
+  routes, never discovers them. `plowbench-doctor.sh` fails on a route the packet lacks unless the
+  recipe's `[capabilities]` table waives it with the measured reason.
+* Qualify numerics at c1 and at the serving concurrencies (`concurrency = [1, 8, 32]`, same-
+  concurrency vLLM peers); the gate uses trimmed mean / p95 / over-limit count, p99 is informational.
 * Before a full-model performance run, measure every affected prefill/decode rung at its actual
   shape, precision, flags and context. Check output accuracy, object resources (registers, spills,
   stack and shared memory), and measured time against a calibrated bandwidth/compute roofline.

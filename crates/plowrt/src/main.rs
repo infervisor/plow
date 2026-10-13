@@ -9,7 +9,7 @@
 //! name (the API slug). The default build uses the CPU reference backend; the
 //! `cuda` / `hsa` features select a GPU backend.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use clap::{CommandFactory, FromArgMatches, Parser, Subcommand};
@@ -533,6 +533,19 @@ enum Cmd {
         format: String,
     },
 
+    /// Static capability inventory of a packet: which plowrt routes it declares (packed
+    /// prefill, masked padding, compact terminal, live KV, segment roles, decode ladder, ...)
+    /// with the reason each is on, off or not applicable. CPU only; the doctor refuses an
+    /// `off` the recipe does not waive.
+    Inventory {
+        /// `model.pkt`, or an asset directory containing one (the directory also supplies the
+        /// generated roles, the sampler object and the emit replay).
+        assets: PathBuf,
+        /// `text` (default) or `json`.
+        #[arg(long, default_value = "text")]
+        format: String,
+    },
+
     /// Lean receipt qualification of every `*.pkt` in each directory: derives the required
     /// obligations from the packet, matches receipts, checks verifier approval and (unless
     /// `--no-replay`) replays them. CPU only. Exits non-zero when a packet does not qualify.
@@ -860,9 +873,11 @@ async fn async_main(
     // `op-audit --format json` writes a document to stdout; the startup banner
     // would land inside it. Same reason `bench` logs to stderr.
     let structured_output = match &cli.cmd {
-        Cmd::Bench { .. } | Cmd::OpAudit { .. } | Cmd::KnobScope { .. } | Cmd::Qualify { .. } => {
-            true
-        }
+        Cmd::Bench { .. }
+        | Cmd::OpAudit { .. }
+        | Cmd::Inventory { .. }
+        | Cmd::KnobScope { .. }
+        | Cmd::Qualify { .. } => true,
         // A node's check-in parses this array; the banner must not precede it.
         Cmd::Ls { json: true, .. } => true,
         #[cfg(any(
@@ -1120,6 +1135,7 @@ async fn async_main(
             no_replay,
             format,
         } => qualify_cmd(assets, !no_replay, &format),
+        Cmd::Inventory { assets, format } => inventory_cmd(&assets, &format),
         Cmd::Devices {
             tp,
             hidden,
@@ -3105,6 +3121,28 @@ fn knob_scope_cmd(
         )
         .into())
     }
+}
+
+fn inventory_cmd(assets: &Path, format: &str) -> Result<(), Box<dyn std::error::Error>> {
+    use plowrt::asset::devblob::DevBlob;
+    let (dir, file) = if assets.is_dir() {
+        (Some(assets), assets.join("model.pkt"))
+    } else {
+        (assets.parent(), assets.to_path_buf())
+    };
+    let buf = std::fs::read(&file).map_err(|e| format!("read {}: {e}", file.display()))?;
+    let magic: Option<&[u8; 8]> = buf.get(..8).and_then(|s| s.try_into().ok());
+    if !magic.is_some_and(packet::devbuild::is_blob_magic) {
+        return Err(format!("{}: not a PLOWDEV blob", file.display()).into());
+    }
+    let blob = DevBlob::parse_l2(&buf, true)?;
+    let items = plowrt::inventory::inventory(&blob, &buf, dir)?;
+    match format {
+        "json" => println!("{}", serde_json::to_string_pretty(&items)?),
+        "text" => print!("{}", plowrt::inventory::text(&items)),
+        other => return Err(format!("--format wants text|json, got `{other}`").into()),
+    }
+    Ok(())
 }
 
 fn op_audit_cmd(

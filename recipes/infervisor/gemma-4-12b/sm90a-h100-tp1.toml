@@ -8,6 +8,11 @@
 # vs vLLM 0.28 fp8_per_token_head KV on every 4K/15K/agentic16k/open-loop cell; FP32-reference gate
 # PASS, KL mean 0.105 vs vLLM 0.128. docs/bringup/results/gemma12b-fp8-20260930/comparison.md.
 # plow_git rebuild (packet ab1c1d583f8d) changes only the hd512 FP8-KV attention object; gate PASS.
+# plow_git 597c56d6 (packet 06da7686, 2026-10-10) again changes only that object: fp16 MMA operands
+# (docs/runtime/kernel-generators.md "FP8-KV entries"); step_bench packed prefill of one 15360-row
+# request 753 -> 702 ms against the same checkout's previous object, token digests identical;
+# FP32-reference gate PASS (c1 KL 0.105 / top1 0.988 / needle 1; c16 KL 0.094). The served
+# comparison above predates it and has not been re-run.
 # vLLM with BF16 KV (FLASH_ATTN) is still faster than this packet: same doc, Caveats.
 #
 # Routes (per-rung evidence: docs/runtime/kernel-generators.md "Gemma-4 12B FP8 per-rung routes"):
@@ -28,7 +33,7 @@ namespace = "infervisor"
 name = "gemma-4-12b"
 label = "sm90a-h100-tp1"
 status = "validated"
-plow_git = "e93e0a640b731f1262fca8687995c5d9109953ec"
+plow_git = "597c56d6a13d1e40823224fac02138ad12391405"
 network = "gemma4"
 
 [target]

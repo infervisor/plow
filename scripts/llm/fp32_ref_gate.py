@@ -34,9 +34,18 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 TOP = 20
+# Stop ids of a reference whose meta carries none (Gemma's, before `reference` read them from the
+# checkpoint). A reference's continuation ends at its first stop token, and scoring stops there too:
+# a served stack never produces the tokens after it, and the post-stop distribution is ill-conditioned
+# (Qwen3.8 kept emitting <|im_start|><|im_end|> for 36 tokens past <|im_end|>, where FP32 was decisive
+# with 1.6 nats and bf16 stacks disagreed by up to 1.2 nats of KL).
 EOS = (1, 50, 106)
 DEFAULTS = dict(tie_margin=1.0, kl_ratio_max=1.25, kl_slack_max=0.002, top1_drop_max=0.01,
-                cont_drop_max=0.05, needle_drop_max=0.0, needle_min=0.9)
+                cont_drop_max=0.05, cont_decisive_drop_max=0.0, needle_drop_max=0.0, needle_min=0.9,
+                kl_trim_frac=0.01, kl_over_at=0.1, kl_over_slack=0.005)
+# Gated KL statistics. kl_p99 is reported, not gated: on 1414 positions it is the 14th-worst position,
+# and one co-batching flip at serving concurrency moves it by 60% while the trimmed mean and p95 hold.
+KL_GATED = ("kl_mean", "kl_trim_mean", "kl_p95")
 
 
 def ids_sha(ids):
@@ -88,23 +97,52 @@ def agree_len(free, cont):
     return n
 
 
-def score(ref, cap, tie_margin=DEFAULTS["tie_margin"]):
-    """Metrics of one capture against the FP32 reference, overall and per prompt kind."""
+def model_eos(hf):
+    """The checkpoint's stop ids: generation_config.json's eos_token_id (an id or a list), else config.json's."""
+    for name in ("generation_config.json", "config.json"):
+        p = Path(hf) / name
+        if p.is_file():
+            e = json.loads(p.read_text()).get("eos_token_id")
+            if e is not None:
+                return sorted({int(x) for x in (e if isinstance(e, list) else [e])})
+    raise SystemExit(f"{hf}: no eos_token_id in generation_config.json or config.json")
+
+
+def scored_len(cont, eos):
+    """Positions scored of a reference continuation: through its first stop token, else all of them."""
+    for i, t in enumerate(cont):
+        if t in eos:
+            return i + 1
+    return len(cont)
+
+
+def score(ref, cap, tie_margin=DEFAULTS["tie_margin"], kl_trim_frac=DEFAULTS["kl_trim_frac"],
+          kl_over_at=DEFAULTS["kl_over_at"], eos=None):
+    """Metrics of one capture against the FP32 reference, overall and per prompt kind.
+
+    The scored positions are the reference's teacher-forced positions through its first stop token
+    (`eos`, else the reference's meta, else EOS), the same set for every arm; a position the capture
+    lacks counts as missing (and fails the gate), never as a smaller sample.
+    """
     if cap.get("ref_sha256") != ref["sha256"]:
         raise ValueError(f"capture {cap.get('arm')} was taken against another reference")
+    eos = set(eos if eos is not None else ref.get("meta", {}).get("eos", EOS))
     groups = {}
     missing = 0
     for case in ref["cases"]:
         c = cap["cases"].get(case["id"])
-        g = groups.setdefault(case["kind"], dict(kl=[], dec=0, dec_ok=0, cont=[], full=0, n=0, needle=[]))
+        g = groups.setdefault(case["kind"], dict(kl=[], dec=0, dec_ok=0, cont=[], cont_dec=[], full=0, n=0, needle=[]))
         g["n"] += 1
+        L = scored_len(case["cont"], eos)
+        cont, pos = case["cont"][:L], case["pos"][:L]
         if c is None or c.get("error"):
-            missing += len(case["pos"])
+            missing += L
             g["cont"].append(0.0)
+            g["cont_dec"].append(False)
             if "expect" in case:
                 g["needle"].append(False)
             continue
-        for k, p in enumerate(case["pos"]):
+        for k, p in enumerate(pos):
             top = c["pos"].get(str(k))
             if top is None:
                 missing += 1
@@ -113,9 +151,13 @@ def score(ref, cap, tie_margin=DEFAULTS["tie_margin"]):
             if p["margin"] > tie_margin:
                 g["dec"] += 1
                 g["dec_ok"] += top[0][0] == p["top"][0][0]
-        n = agree_len(c["free"], case["cont"])
-        g["cont"].append(n / len(case["cont"]))
-        g["full"] += n == len(case["cont"])
+        n = agree_len(c["free"], cont)
+        g["cont"].append(n / L)
+        g["full"] += n == L
+        # A free-run divergence at a near tie (FP32 top-1/top-2 margin <= tie_margin) is rounding
+        # luck, and greedy decoding makes everything after it incomparable; a divergence where FP32
+        # was decisive is a real disagreement at an identical history.
+        g["cont_dec"].append(n >= L or pos[n]["margin"] <= tie_margin)
         if "expect" in case:
             g["needle"].append(case["expect"] in c["free_text"])
 
@@ -123,11 +165,21 @@ def score(ref, cap, tie_margin=DEFAULTS["tie_margin"]):
         kl = [x for g in gs for x in g["kl"]]
         dec, dec_ok = sum(g["dec"] for g in gs), sum(g["dec_ok"] for g in gs)
         cont = [x for g in gs for x in g["cont"]]
+        cont_dec = [x for g in gs for x in g["cont_dec"]]
         needle = [x for g in gs for x in g["needle"]]
+        srt = sorted(kl)
+        # At least one position trimmed when a fraction is asked for, none at 0, and never the
+        # last one (a one-position reference, e.g. an immediate stop token, still scores).
+        cut = 0 if kl_trim_frac <= 0 else max(1, round(kl_trim_frac * len(srt)))
+        trim = srt[: len(srt) - min(cut, len(srt) - 1)] if srt else []
+        over = sum(x > kl_over_at for x in kl)
         out = dict(positions=len(kl), kl_mean=sum(kl) / len(kl) if kl else float("nan"),
-                   kl_p99=percentile(kl, 0.99), kl_max=max(kl, default=float("nan")),
+                   kl_trim_mean=sum(trim) / len(trim) if trim else float("nan"),
+                   kl_p95=percentile(kl, 0.95), kl_p99=percentile(kl, 0.99), kl_max=max(kl, default=float("nan")),
+                   kl_over=over, kl_over_frac=over / len(kl) if kl else float("nan"),
                    decisive=dec, top1_decisive=dec_ok / dec if dec else float("nan"),
                    cont_frac=sum(cont) / len(cont) if cont else float("nan"),
+                   cont_decisive_frac=sum(cont_dec) / len(cont_dec) if cont_dec else float("nan"),
                    cont_full=sum(g["full"] for g in gs), cases=sum(g["n"] for g in gs))
         if needle:
             out["needle_acc"] = sum(needle) / len(needle)
@@ -148,14 +200,23 @@ def verdict(cand, peer, th=None):
         why.append(f"candidate missing {cand['missing_positions']} scored positions")
     if peer["missing_positions"]:
         why.append(f"peer missing {peer['missing_positions']} scored positions")
-    for m in ("kl_mean", "kl_p99"):
+    for m in KL_GATED:
         lim = peer[m] * t["kl_ratio_max"] + t["kl_slack_max"]
         if not cand[m] <= lim:
             why.append(f"{m} {cand[m]:.4g} > peer {peer[m]:.4g} x {t['kl_ratio_max']} + {t['kl_slack_max']}")
+    # Outlier count at a fixed KL: a handful of large disagreements that the mean and the quantiles
+    # absorb still has to stay within the peer's count plus an absolute allowance.
+    lim = peer["kl_over_frac"] + t["kl_over_slack"]
+    if not cand["kl_over_frac"] <= lim:
+        why.append(f"kl_over_frac {cand['kl_over_frac']:.4g} ({cand.get('kl_over', '?')} positions > {t['kl_over_at']}) "
+                   f"> peer {peer['kl_over_frac']:.4g} + {t['kl_over_slack']}")
     if not cand["top1_decisive"] >= peer["top1_decisive"] - t["top1_drop_max"]:
         why.append(f"top1_decisive {cand['top1_decisive']:.4f} < peer {peer['top1_decisive']:.4f} - {t['top1_drop_max']}")
     if not cand["cont_frac"] >= peer["cont_frac"] - t["cont_drop_max"]:
         why.append(f"cont_frac {cand['cont_frac']:.4f} < peer {peer['cont_frac']:.4f} - {t['cont_drop_max']}")
+    if not cand["cont_decisive_frac"] >= peer["cont_decisive_frac"] - t["cont_decisive_drop_max"]:
+        why.append(f"cont_decisive_frac {cand['cont_decisive_frac']:.4f} < peer {peer['cont_decisive_frac']:.4f} "
+                   f"- {t['cont_decisive_drop_max']} (free-run diverged where FP32 was decisive)")
     if "needle_acc" in peer:
         c = cand.get("needle_acc", 0.0)
         if c < peer["needle_acc"] - t["needle_drop_max"]:
@@ -257,7 +318,8 @@ def cmd_prompts(a):
     for name in a.natural:
         for i, n in enumerate(lens):
             off = (i + 1) * 20011 % max(len(corpora[name]) - n, 1)  # distinct windows: no shared prefixes
-            ids = [tok.bos_token_id] + corpora[name][off:off + n - 1]
+            bos = [] if tok.bos_token_id is None else [tok.bos_token_id]  # Qwen has no BOS
+            ids = bos + corpora[name][off:off + n - len(bos)]
             cases.append(dict(id=f"nat-{name}-{n}", kind="natural", prompt_ids=ids, max_new=a.natural_new))
     for cid, (msgs, tools) in chats(text_of).items():
         text = tok.apply_chat_template(msgs, tools=tools, add_generation_prompt=True, tokenize=False, enable_thinking=False)
@@ -385,7 +447,8 @@ def scaled_tensors(files, device="cuda"):
         where = {k: f for f in shards for k in f.keys()}
         for f in shards:
             for k in sorted(f.keys()):
-                if not k.startswith("model.language_model.") or k.endswith("weight_scale"):
+                # The text tower, plus an untied output head (Qwen3.5: top-level lm_head.weight).
+                if (not k.startswith("model.language_model.") and k != "lm_head.weight") or k.endswith("weight_scale"):
                     continue
                 # Experts: <...>.experts.gate_up_proj + ".weight_scale"; dense: <...>.weight + "_scale".
                 sk = k + (".weight_scale" if k.rpartition(".")[0].endswith(".experts") else "_scale")
@@ -468,6 +531,8 @@ def load_fp32(hf, device="cuda", compact=None, headroom_gib=40.0):
         if moe:
             modeling_gemma4.Gemma4TextExperts = compact_experts_class()
         model_class = modeling_gemma4.Gemma4ForCausalLM
+    elif cfg.model_type in ("qwen3_5", "qwen3_5_text"):  # Qwen3.5/3.8 hybrid GDN + GQA; text tower of the VL wrapper
+        from transformers.models.qwen3_5.modeling_qwen3_5 import Qwen3_5ForCausalLM as model_class
     else:
         from transformers.models.gemma4_unified.modeling_gemma4_unified import Gemma4UnifiedForCausalLM as model_class
     cfg._attn_implementation = "sdpa"
@@ -482,7 +547,7 @@ def load_fp32(hf, device="cuda", compact=None, headroom_gib=40.0):
     experts = 0
     files = sorted(Path(hf).glob("*.safetensors"))
     for k, w, scale in scaled_tensors(files, device):
-        name = "model." + k.removeprefix("model.language_model.")
+        name = k if k == "lm_head.weight" else "model." + k.removeprefix("model.language_model.")
         parent, _, leaf = name.rpartition(".")
         if moe and leaf in ("gate_up_proj", "down_proj") and parent.endswith(".experts"):
             model.get_submodule(parent).load(leaf, w, scale)
@@ -507,7 +572,8 @@ def load_fp32(hf, device="cuda", compact=None, headroom_gib=40.0):
         params[name].data.copy_(w.reshape(params[name].shape))
         loaded.add(name)
     model.tie_weights()
-    loaded.add("lm_head.weight")
+    if getattr(cfg, "tie_word_embeddings", True):
+        loaded.add("lm_head.weight")
     unset = [n for n, _ in model.named_parameters() if n not in loaded]
     if unset:
         raise SystemExit(f"FP32 parameters not loaded from the checkpoint: {unset[:8]}")
@@ -527,6 +593,7 @@ def cmd_reference(a):
     torch.set_float32_matmul_precision("highest")
     from transformers import AutoTokenizer
     tok = AutoTokenizer.from_pretrained(a.hf, local_files_only=True)
+    eos = model_eos(a.hf)
     prompts = json.loads(Path(a.prompts).read_text())
     model, weights = load_fp32(a.hf, a.device, headroom_gib=a.offload_headroom_gib)
     # HF's sliding cache keeps its last-window slice as a view of the whole prefill K/V, so every
@@ -557,7 +624,7 @@ def cmd_reference(a):
             while True:
                 t = int(out.logits[0, -1].argmax())
                 cont.append(t)
-                if t in EOS or len(cont) == c["max_new"]:
+                if t in eos or len(cont) == c["max_new"]:
                     break
                 out = model(input_ids=torch.tensor([[t]], device=dev), past_key_values=out.past_key_values,
                             attention_mask=masks, use_cache=True)
@@ -583,7 +650,7 @@ def cmd_reference(a):
                 weights=weights, dtype="float32", tf32=False, attention="fp32 chunked math",
                 dequant="fp8_e4m3 weight x per-channel scale in fp32", torch=torch.__version__,
                 transformers=transformers.__version__, device=(torch.cuda.get_device_name() + (" + host offload" if a.device == "offload" else "")) if dev == "cuda" else f"cpu ({torch.get_num_threads()} threads)",
-                utc=time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), top=TOP)
+                utc=time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), top=TOP, eos=eos)
     Path(a.out).write_text(json.dumps(dict(meta=meta, cases=cases)))
     print(f"reference: {len(cases)} cases -> {a.out} sha256 {file_sha(a.out)}")
 
@@ -677,8 +744,8 @@ def fmt(v):
     return f"{v:.4g}" if isinstance(v, float) else str(v)
 
 
-COLS = ("positions", "kl_mean", "kl_p99", "kl_max", "decisive", "top1_decisive", "cont_frac", "cont_full",
-        "cases", "needle_acc")
+COLS = ("positions", "kl_mean", "kl_trim_mean", "kl_p95", "kl_p99", "kl_max", "kl_over", "decisive",
+        "top1_decisive", "cont_frac", "cont_decisive_frac", "cont_full", "cases", "needle_acc")
 
 
 def table(scores):
@@ -690,15 +757,24 @@ def table(scores):
 
 
 def thresholds(a):
-    return {k: getattr(a, k) for k in DEFAULTS if getattr(a, k, None) is not None}
+    th = {k: getattr(a, k) for k in DEFAULTS if getattr(a, k, None) is not None}
+    if getattr(a, "eos", None):
+        th["eos"] = [int(x) for x in a.eos.split(",")]
+    return th
+
+
+def score_with(ref, cap, th):
+    """score() under a threshold dict (tie margin, trim fraction, outlier level, stop ids)."""
+    return score(ref, cap, th["tie_margin"], th["kl_trim_frac"], th["kl_over_at"], th.get("eos"))
 
 
 def cmd_score(a):
     ref = load_ref(a.ref)
+    th = dict(DEFAULTS, **thresholds(a))
     scores = {}
     for path in a.captures:
         cap = json.loads(Path(path).read_text())
-        scores[cap["arm"]] = score(ref, cap, a.tie_margin if a.tie_margin is not None else DEFAULTS["tie_margin"])
+        scores[cap["arm"]] = score_with(ref, cap, th)
     print(table(scores))
 
 
@@ -706,7 +782,7 @@ def cmd_gate(a):
     ref = load_ref(a.ref)
     th = dict(DEFAULTS, **thresholds(a))
     cand, peer = (json.loads(Path(p).read_text()) for p in (a.cand, a.peer))
-    sc, sp = score(ref, cand, th["tie_margin"]), score(ref, peer, th["tie_margin"])
+    sc, sp = score_with(ref, cand, th), score_with(ref, peer, th)
     why = verdict(sc, sp, th)
     rec = {"pass": not why, "why": why, "thresholds": th, "ref_sha256": ref["sha256"],
            "candidate": dict(arm=cand["arm"], **sc), "peer": dict(arm=peer["arm"], **sp)}
@@ -754,7 +830,9 @@ def main():
     cp.set_defaults(f=cmd_capture)
     sc = sp.add_parser("score")
     sc.add_argument("--ref", required=True)
-    sc.add_argument("--tie-margin", type=float)
+    for k in ("tie_margin", "kl_trim_frac", "kl_over_at"):
+        sc.add_argument("--" + k.replace("_", "-"), type=float, dest=k)
+    sc.add_argument("--eos", help="comma-separated stop ids for a reference whose meta carries none")
     sc.add_argument("captures", nargs="+")
     sc.set_defaults(f=cmd_score)
     ga = sp.add_parser("gate")
@@ -764,6 +842,7 @@ def main():
     ga.add_argument("--out")
     for k in DEFAULTS:
         ga.add_argument("--" + k.replace("_", "-"), type=float, dest=k)
+    ga.add_argument("--eos", help="comma-separated stop ids for a reference whose meta carries none")
     ga.set_defaults(f=cmd_gate)
     a = p.parse_args()
     return a.f(a) or 0

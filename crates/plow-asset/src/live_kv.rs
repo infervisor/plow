@@ -26,6 +26,18 @@ pub struct Cache {
     pub stride: u32,
     pub window: u32,
     pub mask: u32,
+    /// Row layout: [`LAYOUT_HEAD_MAJOR`] or [`LAYOUT_ROW_INTERLEAVED`], declared by the cache
+    /// writer (`QwenHeadNormRope` i7).
+    #[serde(default, skip_serializing_if = "is_head_major")]
+    pub layout: u32,
+}
+/// `[slot][head][stride][hd]`.
+pub const LAYOUT_HEAD_MAJOR: u32 = 0;
+/// `[slot][stride][head][hd]`: one position's heads are contiguous, so a slot's live rows are
+/// one prefix of its extent (the live-KV allocator charges `heads * hd` bytes per row).
+pub const LAYOUT_ROW_INTERLEAVED: u32 = 1;
+fn is_head_major(layout: &u32) -> bool {
+    *layout == LAYOUT_HEAD_MAJOR
 }
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -131,6 +143,11 @@ pub fn emit(packet: &Packet<'_>) -> Result<Manifest> {
             stride: d.i[3],
             window: d.i[4],
             mask: d.i[7],
+            layout: widest
+                .insts
+                .iter()
+                .find(|w| w.op == DevOp::QwenHeadNormRope as u16 && w.t[0] == d.t[3])
+                .map_or(LAYOUT_HEAD_MAJOR, |w| w.i[7]),
         })
     {
         // KV sharing (Gemma-4 E-series): later layers read an earlier layer's cache with the same
@@ -235,6 +252,11 @@ impl Manifest {
                     && c.heads > 0
                     && matches!(c.hd, 64 | 128 | 256 | 512)
                     && c.stride > 0
+                    && match c.layout {
+                        LAYOUT_HEAD_MAJOR => true,
+                        LAYOUT_ROW_INTERLEAVED => c.scales.is_none() && c.window == 0,
+                        _ => false,
+                    }
                     && if c.window == 0 {
                         c.stride == self.max_ctx && c.mask == u32::MAX
                     } else {
@@ -324,6 +346,7 @@ impl Manifest {
                         && g.ctx == c.stride
                         && g.hd == c.hd
                         && g.frac == c.heads as f64
+                        && g.low == c.layout as f64
                         && matches!(box_rows, 16 | 32 | 64)
                         && c.stride % box_rows == 0
                         && tensor(g.tensor as u16)?.bytes == 256
@@ -497,6 +520,7 @@ impl Manifest {
                                 && packet.kv_row_insts.contains(&(pc as u32));
                             require(
                                 encoding
+                                    && c.layout == LAYOUT_HEAD_MAJOR
                                     && d.i[0] == p.rows
                                     && d.i[1] == c.heads
                                     && d.i[2] == c.hd
@@ -524,6 +548,33 @@ impl Manifest {
                                     })
                                     && (writes.insert(h) || staged(pc)),
                                 "cache writer contract",
+                            )?;
+                        }
+                        // Qwen3.5 KV writer (devgen qwen35.rs `headnorm`, cache = true): t0 = the
+                        // cache, t1 = source, t2 = gamma, t3/t4 = cos/sin, t5 = position,
+                        // t6 = per-slot active flags; i0 = kv heads, i1 = hd, i2 = rotary dims,
+                        // i3 = rows, i4 = per-slot row stride (the context: full attention only,
+                        // no ring), i5 = normalize, i6 = prefill, i7 = the cache's layout. BF16
+                        // cache, one writer per half.
+                        DevOp::QwenHeadNormRope if slot == 0 => {
+                            let c = self
+                                .caches
+                                .iter()
+                                .find(|c| c.pair.contains(&h))
+                                .ok_or("Qwen cache writer targets scale")?;
+                            require(
+                                c.scales.is_none()
+                                    && c.window == 0
+                                    && d.i[0] == c.heads
+                                    && d.i[1] == c.hd
+                                    && d.i[3] == p.rows
+                                    && d.i[4] == c.stride
+                                    && d.i[6] == u32::from(prefill)
+                                    && d.i[7] == c.layout
+                                    && d.t[5] == self.position
+                                    && d.t[7] == TENSOR_NONE16
+                                    && (writes.insert(h) || staged(pc)),
+                                "Qwen cache writer contract",
                             )?;
                         }
                         _ => return Err("unsupported cache operand access".into()),
@@ -736,6 +787,21 @@ fn direct_operands(op: DevOp, d: &DevInst64, packet: &Packet<'_>) -> Result<()> 
                 | DevOp::MoeExpertDownGemmaFp8
                 | DevOp::MoeGroupGluGemmaPfW8a8
                 | DevOp::MoeGroupDownGemmaPfW8a8
+                // Qwen3.5 Gated DeltaNet (136-146): activations, weights, the per-slot
+                // `state.qwen.*` recurrent/conv state (slot-strided, never a declared pair),
+                // `in.active` and `in.pos`. QwenHeadNormRope is the one that names a KV cache
+                // (slot 0; the writer arm above audits it). None takes a generated tensor map.
+                | DevOp::QwenGdnConv
+                | DevOp::QwenGdnStep
+                | DevOp::QwenGatedNorm
+                | DevOp::QwenQGateSplit
+                | DevOp::QwenSigmoidGate
+                | DevOp::QwenRmsNorm
+                | DevOp::QwenHeadNormRope
+                | DevOp::QwenGdnConvPrefill
+                | DevOp::QwenGdnQkvPrep
+                | DevOp::QwenGdnGatePrep
+                | DevOp::QwenGdnPrefill
         ),
         "opcode has no audited direct-operand access contract",
     )

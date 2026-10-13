@@ -263,13 +263,14 @@ impl DownstreamCredit {
     }
 }
 
-/// KV rows a sequence still has promised: its prompt plus the generation it has not produced yet.
+/// KV rows a sequence holds once it finishes: its prompt plus its whole generation budget.
 ///
-/// The charge only ever shrinks, so subtracting `generated_tokens` is safe without preemption.
+/// Generated rows stay resident, so the charge never shrinks while the sequence lives. Crediting
+/// them back admitted past the budget: on block-granular KV a sequence whose prompt + budget
+/// straddles a block boundary dropped to one block's charge while it mapped two (Qwen3.8-27B at
+/// 4K c32 under PLOW_KV_MEM_UTIL 0.91: 31 slots, 15.9 GiB mapped against an 11.3 GiB budget).
 pub fn reserved_kv_rows(prompt_tokens: usize, max_tokens: usize, generated_tokens: usize) -> u64 {
-    prompt_tokens
-        .saturating_add(max_tokens.max(1))
-        .saturating_sub(generated_tokens) as u64
+    prompt_tokens.saturating_add(max_tokens.max(generated_tokens).max(1)) as u64
 }
 
 /// THE seat decision, in one place and in this order: liveness, then a slot, then the whole-device

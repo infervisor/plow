@@ -338,19 +338,81 @@ and the packed request table rides the op's `i[4]` handle (bit 31).
   v_scale on P before PV, both fp32. BN64, K/V rings 2+2, producer 72 regs, 0 spills. The packet
   arg block lives in dynamic smem (static + dynamic would exceed 232448 B). rungs ≥ 128.
 - `attn_pf_hd512_fp8kv` (role 21): TileLang body over e4m3 K/V (`flash_prefill_body_fp8kv`),
-  wrapper `gen_flash_prefill.cu` with `PLOW_GEN_FP8_KV=1`. BM64 BN32, 1 stage, 0 spills.
-  rungs ≥ 128.
+  wrapper `gen_flash_prefill.cu` with `PLOW_GEN_FP8_KV=1`. The staged e4m3 tiles become **fp16**
+  MMA operands (2026-10-10): sm_90 converts an e4m3 pair to f16x2 in one `cvt`, while bf16 needs
+  that plus two `cvt.rn.bf16.f16`, and with BM64 BN32 the convert matched the wgmma time (123 vs
+  243 TF/s for the bf16 body). fp16 holds every e4m3 value exactly; k_scale stays on the f32
+  scores, v_scale multiplies the V tile during the convert so P stays in [0, 1] (P × v_scale in
+  fp16 flushes below 6e-8: flat 15K attention with small V rows), and the exp2 carries +15 so the
+  fp16 P tile holds P × 2¹⁵ (subnormal only below P = 2e-9; the row sum carries the same factor
+  and the final division cancels it; free). The v_scale multiply runs in f32 and rounds once: with
+  v_scale itself cast to fp16 (2-3% faster) the scale is subnormal below a row amax of 0.027,
+  which real V rows reach — the deterministic FP32-reference gate on the 12B model moved from KL
+  0.0921 to 0.0990, and the standalone fp32-output probe from 3.3e-4 to 4.8e-3 rel-L2 at amax
+  0.002 (the Gaussian probe rows, amax ≈ 4, never showed it). With fp32 output the kernel's own
+  rounding is 2.8e-4 rel-L2 at every attention sharpness and every V amplitude, against
+  1.5-1.6e-3 for the bf16 math (its P × v_scale rounding). Bounds: |Q| and |V| < 65504. BM64
+  BN32, 1 stage, 0 spills; bn48 fits now but is slower. rungs ≥ 128.
 
 Standalone vs FP32 over the dequantized cache (rel-L2), µs:
 
 | entry | 1024 | 4096 | 1024 after 7K | 1024 after 14K | packed check |
 |---|---|---|---|---|---|
 | hd256 sliding FP8-KV | 64 (2.4e-3) | 240 | 71.7 | - | 2.3e-3 |
-| hd512 global FP8-KV | 158.6 (1.4e-3) | 1962 (1.2e-3) | 1828 (2.4e-3) | 3444 (2.4e-3) | 1.9e-3 |
+| hd512 global FP8-KV, fp16 operands | 135.4 (1.4e-3) | 1504 (1.2e-3) | 1342 (1.7e-3) | 2540 (1.7e-3) | 1.9e-3 |
+| hd512 global FP8-KV, bf16 operands (until 2026-10-10) | 158.6 (1.4e-3) | 1962 (1.2e-3) | 1828 (2.4e-3) | 3444 (2.4e-3) | 1.9e-3 |
 
-The interpreter FP8 arms it replaces: hd256 px23 178 µs at 1024, packed 16×128 363-1423 µs vs
-generated 137-142 µs. TileLang in the nix shell needs a host g++ ≤ 14 (`-ccbin=/usr/bin/g++-14`
-in `NVCC_APPEND_FLAGS`; the system g++ 15 fails in `cuda_fp16.h`).
+Rejected on the way to the fp16 body (standalone TileLang, 4096 / 1024-after-14336 µs; the bf16
+body measured 2240 / 3554 there): converting K/V on the way from global memory instead of staging
+e4m3 in smem, bn32 2473 / 4198, bn64 2452 / 4443; fp16 with bn48 1998 / 3119; two stages 1712 /
+2655. The interpreter FP8 arms it replaces: hd256 px23 178 µs at 1024, packed 16×128 363-1423 µs vs
+generated 137-142 µs. nvcc 12.9 needs a host g++ ≤ 14 (`-ccbin=/usr/bin/g++-14` in
+`NVCC_APPEND_FLAGS` outside nix). Inside the plow `nix develop` shell TileLang's own nvcc call
+fails in `cuda_fp16.hpp` (`_NV_IF__NV_TARGET_BOOL_NV_IS_DEVICE` undefined) whatever the host
+compiler: the shell's `NIX_CFLAGS_COMPILE(_FOR_BUILD)` add `-isystem` for the ROCm tree, whose
+`nv/target` shadows CUDA's. Run `tune`/`build` under `env -i` with `NVCC_PREPEND_FLAGS` kept
+(what `build_sm90a_cubin.sh` does), or in `nix develop .#tilelang`, which has no ROCm.
+
+In the 12B FP8-KV model (two packets from one checkout, `campaign.py build` of the production
+recipe; the control packet is byte-identical to the 2026-10-06 bundle's, so the arms differ only
+in this role object): `step_bench --packed-prefill`, one request, 4096-row request chunks,
+`PLOW_PF_SEG_TIME=1` on both arms, medians of 4 runs, ms per chunk (control → fp16 body):
+
+| ctx | chunk at prefix | control | fp16 | Δ |
+|---|---|---|---|---|
+| 4096 | 0 | 154.2 | 151.0 | −2.1% |
+| 15360 | 0 / 4096 / 8192 / 12288 | 151.3 / 179.8 / 208.9 / 212.8 | 147.2 / 169.6 / 190.9 / 194.4 | −2.7 / −5.7 / −8.6 / −8.6% |
+| 15360 | whole prompt | 752.8 | 702.2 | −6.7% |
+
+(The 2-3% faster body with v_scale in fp16 measured 670.5 ms here, −11%; it lost precision on
+small V rows, see above.) The gemm and FA classes are equal; the fat class carries the whole
+delta (65.3 → 62.1 ms at 4K, 123.9 → 105.9 at the 8192-prefix chunk). Token digests are identical between the arms at both
+contexts. The gain grows with the KV length because the hd512 global layers are the only ones
+that attend over the whole context.
+
+FP32-reference gate (`campaign.py gate`, 46 cases): PASS on every run. Its KL mean does not
+resolve this kernel's precision: the budget is W8A8/FP8 quantization (control 0.082-0.092 over
+five c16 runs, two of them bit-identical back to back; vLLM 0.128), and the c16 capture's batch
+composition moves it by ±0.005, a faster prefill included. With `--concurrency 1` (deterministic)
+the control scores KL 0.0921 / p99 1.95 / top1 0.9862 and the fp16 body 0.1046 / 2.79 /
+**0.9882**, cont_frac equal (0.607 / 0.606), needle 1.0 both; c16 on the fp16 body 0.0943. The
+kernel-level numbers above (fp32-output rel-L2 2.8e-4 vs 1.5-1.6e-3) are the precision evidence.
+
+### Where the FP8-KV 4096-row chunk goes (2026-10-10, 12B FP8-KV bundle of 2026-10-06)
+
+`step_bench --packed-prefill`, one request, `segtime_table.py` on the `PLOW_PF_SEG_TIME=1` log;
+wall without SEG_TIME 140-142 ms, with it 156 ms, so the timer costs ≈ 20 µs per segment (856
+segments). Shares of the attributed 139.8 ms: opcode 33 **GemmFp8** 72.3 ms (328 launches,
+≈ 1.36 PFLOP/s ≈ 69% of the fp8 peak), opcode 39 **FlashPrefillFp8** 27.7 ms (the generated
+roles; the 8 hd512 layers at 1.96 ms each are 22 ms of it, 140 TF/s), light ops 39.5 ms
+(NormResidual+QuantFp8+RmsNorm ×95 17.1, QuantFp8 ×96 10.0, HeadNormRope(+Fp8) ×48 6.2,
+HeadNormRopeFp8 ×120 6.2; 4-6x over their HBM floor after the timer cost). The "light 73 ms"
+of the table above is the fat *class* (attention roles + light ops), not the light ops.
+
+Refuted: a FATLITE build of the FP8-KV light object (`interp_sm90a_pfpackedseg_fp8kv.cubin`,
+megakernel 255 regs / 952 B stack → 128 regs / 48 B) changes nothing (fat class 14.2 → 15.2 ms
+at 1024, 67.3 → 69.0 at 4096, digests identical): the light class is per-segment cost, not
+register pressure. Not adopted.
 
 ## Gemma-4 12B FP8 per-rung routes (H100, FP8 KV, 16K, 128 slots)
 

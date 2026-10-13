@@ -42,14 +42,16 @@ args = (q, k, v, o, alpha, beta, state, initial, None, None, maps, offsets,
 def entry(q: cute.Tensor, k: cute.Tensor, v: cute.Tensor, o: cute.Tensor,
           alpha: cute.Tensor, beta: cute.Tensor, state: cute.Tensor,
           initial: cute.Tensor, maps: cute.Tensor, offsets: cute.Tensor,
-          scale: cutlass.Float32, stream: cuda_driver.CUstream):
+          scale: cutlass.Float32, nseq: cutlass.Int32, stream: cuda_driver.CUstream):
     kernel(q, k, v, o, alpha, beta, state, initial, None, None, maps, offsets,
            scale, cutlass.Int32(16), cutlass.Int32(16), cutlass.Int32(48),
-           cutlass.Int32(48), cutlass.Int32(1), cutlass.Int32(1), cutlass.Int32(0),
-           48, stream)
+           cutlass.Int32(48), nseq, cutlass.Int32(1), cutlass.Int32(0),
+           nseq * cutlass.Int32(48), stream)
 
+# nseq sequences share one launch: cu_seqlens has nseq + 1 entries, the states nseq slots
+# ([seq][head][128][128] f32) and the grid nseq x 48 blocks.
 args = (q, k, v, o, alpha, beta, state, initial, maps, offsets,
-        cutlass.Float32(128 ** -0.5), make_fake_stream())
+        cutlass.Float32(128 ** -0.5), cutlass.Int32(1), make_fake_stream())
 print("Compiling SM90a with fake tensors; no kernel invocation", flush=True)
 compiled = cute.compile(entry, *args, options="--gpu-arch=sm_90a")
 compiled.export_to_c(str(out), "gdn_sm90", "plow_gdn_sm90")

@@ -38,6 +38,11 @@
 #ifndef PLOW_NV_GEMV_MMA_PAIR
 #define PLOW_NV_GEMV_MMA_PAIR 0
 #endif
+/* The last wave of each walk splits its leftover row blocks over K (manifest `gemv_rem_split`,
+ * recipe opt-in: it reorders those sums). */
+#ifndef PLOW_NV_GEMV_REM_SPLIT
+#define PLOW_NV_GEMV_REM_SPLIT 0
+#endif
 /* k32 steps in flight per lane: UNB x (NW x 16 B) of weight loads before the first mma.
  * 12, measured on h100-sxm5 (step_bench ms at B=1/4/16): Gemma-4-12B 11.93/13.16/16.03 at 8,
  * 11.18/12.58/15.25 at 12, 11.52/12.93/15.77 at 16; 26B 5.79/10.06/15.89, 5.80/9.93/15.62,
@@ -249,6 +254,20 @@ __device__ __forceinline__ gvmma_range gvmma_partition(unsigned N, unsigned slic
     return {rb0, rb1};
 }
 
+/* REMAINDER SPLIT-K, shared by the three walks' tails. After the whole waves of one row block per
+ * warp, rem (1..7) row blocks remain; up to 4 of them are cut into S K-spans with rem * S <= 8
+ * units, one per warp, so the last wave keeps every warp streaming instead of 1..4 of 8. Parts > 0
+ * park their fragments in the 7 reduction slots and part 0 sums them in order (bit-stable).
+ * 27B B1 on 132 blocks: GemvGlu's 17 row blocks per block ran a third wave on one warp (72% of
+ * HBM), qkv's 10 a second on two (53%), the fused k/v's 2 one wave on two. step_bench ctx 1K
+ * B1/8/16 23.75/27.47/31.50 -> 22.94/26.96/31.20 ms (GEMV and GLU tails 0.47 ms each at B1),
+ * decode object stack 240 -> 256. A tile under `if (live)` spilled it to 480..1152 instead. */
+__device__ __forceinline__ unsigned gvmma_rem_split(unsigned rem, unsigned nkb) {
+    unsigned S = rem == 1u ? 8u : rem == 2u ? 4u : rem <= 4u ? 2u : 1u;
+    while (S > 1u && (nkb % S) != 0u) S >>= 1;
+    return S;
+}
+
 /* Two adjacent bf16 of one C row as a 4-byte store: n is even, so the pair is aligned whenever
  * the row start m*N is. An odd N (a 156951-row vocab head) leaves odd rows at odd elements. */
 __device__ __forceinline__ void gvmma_store2(__nv_bfloat16* C, unsigned N, unsigned m, unsigned n,
@@ -412,6 +431,45 @@ __device__ __forceinline__ void gemv_rows_mma(__nv_bfloat16* __restrict__ C,
         __syncthreads(); /* red is reused by the next call on this block */
         return;
     }
+    /* Waves of one row block per warp; a short last wave splits its row blocks over K. MT 1 only:
+     * the two-tile instantiation held across the barriers spilled the decode object. */
+#if PLOW_NV_GEMV_REM_SPLIT
+    if constexpr (MT == 1) {
+    for (unsigned base = 0u; base < per; base += PLOW_NV_WARPS) {
+        const unsigned left = per - base;
+        const unsigned S = left >= PLOW_NV_WARPS ? 1u : gvmma_rem_split(left, nkb);
+        const unsigned grp = warp / S, part = warp % S, span = nkb / S;
+        const bool live = grp < left;
+        /* Dead warps walk the wave's first row block and store nothing: an unconditional
+         * tile keeps the arm's registers where the split-K arms' are. */
+        const unsigned rb = r.rb0 + base + (live ? grp : 0u);
+        float acc[1][MT][4];
+        gvmma_tile<1, MT, ONE>(acc, x, W1, rb << 3, rows, N, K, part * span, (part + 1u) * span);
+        if (S > 1u) {
+            gvmma_red_t<MT>& red = gvmma_red<MT>();
+            if (part != 0u) {
+#pragma unroll
+                for (int mt = 0; mt < MT; mt++)
+#pragma unroll
+                    for (int j = 0; j < 4; j++) red.v[warp - 1u - grp][lane][mt * 4 + j] = acc[0][mt][j];
+            }
+            __syncthreads();
+            if (live && part == 0u) {
+                for (unsigned p = 1u; p < S; p++) {
+                    const unsigned slot = (grp * S + p) - 1u - grp;
+#pragma unroll
+                    for (int mt = 0; mt < MT; mt++)
+#pragma unroll
+                        for (int j = 0; j < 4; j++) acc[0][mt][j] += red.v[slot][lane][mt * 4 + j];
+                }
+            }
+            __syncthreads(); /* red is reused by the next wave / call on this block */
+        }
+        if (live && part == 0u) gvmma_store_tile<BIAS, MT>(C, acc[0], rb << 3, rows, N, bias);
+    }
+    return;
+    }
+#endif
     for (unsigned rb = r.rb0 + warp; rb < r.rb1; rb += PLOW_NV_WARPS) {
         float acc[1][MT][4];
         gvmma_tile<1, MT, ONE>(acc, x, W1, rb << 3, rows, N, K);
@@ -488,6 +546,49 @@ __device__ __forceinline__ void gemv_glu_rows_mma(__nv_bfloat16* __restrict__ C,
         return;
     }
 #endif
+    /* Waves of one row block per warp; a short last wave splits its row blocks over K, gate and
+     * up reducing one after the other through the one-stream slots. MT 1 only (see gemv_rows_mma). */
+#if PLOW_NV_GEMV_REM_SPLIT
+    if constexpr (MT == 1) {
+    const unsigned per_g = r.rb1 - r.rb0, nkb_g = K >> 5;
+    for (unsigned base = 0u; base < per_g; base += PLOW_NV_WARPS) {
+        const unsigned left = per_g - base;
+        const unsigned S = left >= PLOW_NV_WARPS ? 1u : gvmma_rem_split(left, nkb_g);
+        const unsigned grp = warp / S, part = warp % S, span = nkb_g / S;
+        const bool live = grp < left;
+        /* Dead warps walk the wave's first row block and store nothing: an unconditional
+         * tile keeps the arm's registers where the split-K arms' are. */
+        const unsigned rb = r.rb0 + base + (live ? grp : 0u);
+        float acc[2][MT][4];
+        gvmma_tile<2, MT, ONE>(acc, x, W2, rb << 3, rows, N, K, part * span, (part + 1u) * span);
+        if (S > 1u) {
+            gvmma_red_t<MT>& red = gvmma_red<MT>();
+#pragma unroll
+            for (int i = 0; i < 2; i++) {
+                if (part != 0u) {
+#pragma unroll
+                    for (int mt = 0; mt < MT; mt++)
+#pragma unroll
+                        for (int j = 0; j < 4; j++) red.v[warp - 1u - grp][lane][mt * 4 + j] = acc[i][mt][j];
+                }
+                __syncthreads();
+                if (live && part == 0u) {
+                    for (unsigned p = 1u; p < S; p++) {
+                        const unsigned slot = (grp * S + p) - 1u - grp;
+#pragma unroll
+                        for (int mt = 0; mt < MT; mt++)
+#pragma unroll
+                            for (int j = 0; j < 4; j++) acc[i][mt][j] += red.v[slot][lane][mt * 4 + j];
+                    }
+                }
+                __syncthreads(); /* red is reused by the up stream / the next call on this block */
+            }
+        }
+        if (live && part == 0u) store(acc, rb);
+    }
+    return;
+    }
+#endif
     for (unsigned rb = r.rb0 + warp; rb < r.rb1; rb += PLOW_NV_WARPS) {
         float acc[2][MT][4];
         gvmma_tile<2, MT, ONE>(acc, x, W2, rb << 3, rows, N, K);
@@ -508,6 +609,67 @@ __device__ __forceinline__ void gemv_qkv_rows_mma(
     const unsigned warp = threadIdx.x >> PLOW_NV_WARP_SHIFT;
     const unsigned g = lane >> 2, t = lane & 3;
     const gvmma_range r = gvmma_partition(Nq + Nk + Nv, slice, nblk);
+    /* Waves of one row block per warp; a short last wave splits its row blocks over K. MT 1 only
+     * (see gemv_rows_mma). */
+#if PLOW_NV_GEMV_REM_SPLIT
+    if constexpr (MT == 1) {
+    const unsigned per = r.rb1 - r.rb0, nkb = K >> 5;
+    for (unsigned base = 0u; base < per; base += PLOW_NV_WARPS) {
+        const unsigned left = per - base;
+        const unsigned S = left >= PLOW_NV_WARPS ? 1u : gvmma_rem_split(left, nkb);
+        const unsigned grp = warp / S, part = warp % S, span = nkb / S;
+        const bool live = grp < left;
+        /* Dead warps walk the wave's first row block and store nothing: an unconditional
+         * tile keeps the arm's registers where the split-K arms' are. */
+        const unsigned rb = r.rb0 + base + (live ? grp : 0u);
+        const unsigned gn = rb << 3;
+        const __nv_bfloat16* W;
+        __nv_bfloat16* C;
+        const __nv_bfloat16* bias;
+        unsigned Nx, n0;
+        if (gn < Nq) { W = Wq; C = Cq; Nx = Nq; n0 = 0u; bias = bq; }
+        else if (gn < Nq + Nk) { W = Wk; C = Ck; Nx = Nk; n0 = Nq; bias = bk; }
+        else { W = Wv; C = Cv; Nx = Nv; n0 = Nq + Nk; bias = bv; }
+        const __nv_bfloat16* const W1[1] = {W};
+        float acc[1][MT][4];
+        gvmma_tile<1, MT, ONE>(acc, x, W1, gn - n0, rows, Nx, K, part * span, (part + 1u) * span);
+        if (S > 1u) {
+            gvmma_red_t<MT>& red = gvmma_red<MT>();
+            if (part != 0u) {
+#pragma unroll
+                for (int mt = 0; mt < MT; mt++)
+#pragma unroll
+                    for (int j = 0; j < 4; j++) red.v[warp - 1u - grp][lane][mt * 4 + j] = acc[0][mt][j];
+            }
+            __syncthreads();
+            if (live && part == 0u) {
+                for (unsigned p = 1u; p < S; p++) {
+                    const unsigned slot = (grp * S + p) - 1u - grp;
+#pragma unroll
+                    for (int mt = 0; mt < MT; mt++)
+#pragma unroll
+                        for (int j = 0; j < 4; j++) acc[0][mt][j] += red.v[slot][lane][mt * 4 + j];
+                }
+            }
+            __syncthreads(); /* red is reused by the next wave / call on this block */
+        }
+        if (!(live && part == 0u)) continue;
+        const unsigned n = (gn - n0) + 2u * t;
+        float b0 = 0.0f, b1 = 0.0f;
+        if constexpr (BIAS) {
+            b0 = (n < Nx) ? __bfloat162float(bias[n]) : 0.0f;
+            b1 = (n + 1u < Nx) ? __bfloat162float(bias[n + 1u]) : 0.0f;
+        }
+#pragma unroll
+        for (int mt = 0; mt < MT; mt++) {
+            const unsigned m0 = 16u * mt + g;
+            if (m0 < rows) gvmma_store2(C, Nx, m0, n, acc[0][mt][0] + b0, acc[0][mt][1] + b1);
+            if (m0 + 8u < rows) gvmma_store2(C, Nx, m0 + 8u, n, acc[0][mt][2] + b0, acc[0][mt][3] + b1);
+        }
+    }
+    return;
+    }
+#endif
     for (unsigned rb = r.rb0 + warp; rb < r.rb1; rb += PLOW_NV_WARPS) {
         const unsigned gn = rb << 3;
         const __nv_bfloat16* W;

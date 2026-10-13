@@ -21,8 +21,11 @@ precedence. There are **two** executors, with two different gates:
   weights are armed; FP8 KV is not.
 * **CUDA (`crates/plowrt/src/exec/gpu/token_batch.rs`, `CudaTokenBatch::load`)** — armed when
   `token_batch && !fusion`, compute capability is exactly **(9, 0)** (H100/sm_90a), the packet
-  carries packed-prefill metadata and a packed terminal, and the engine has no recurrent state
-  and no mixed step. `GpuEngine::token_batch_step` and `token_batch_step_pipelined` are its
+  carries packed-prefill metadata and a packed terminal, and there is no mixed step. A
+  recurrent chain (Qwen 3.5 GDN) arms too when the packet carries the packed scan's
+  init-state scratch: its decode rows ride as one-row continuing requests of the packed
+  launch (per-request state gather, varlen scan, scatter), not through the split-attention
+  riders below, which skip hybrid buckets. `GpuEngine::token_batch_step` and `token_batch_step_pipelined` are its
   entry points. **The default therefore does enable token batching on H100.**
   Decode rows riding a launch (the leading single-row `Phase::Decode` spans) use **split
   attention** (`exec/gpu/riders.rs`, default on, `PLOW_TB_SPLIT_ATTN=0` is the rollback): the

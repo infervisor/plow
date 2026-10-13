@@ -169,6 +169,31 @@ def cost(op, p, rows, ctx, wb, kvb):
         return 8 * g("n"), 0
     if op in ("Argmax", "ArgmaxFin"):
         return 4 * g("n", 0), 0
+    # Qwen3.5 hybrid (qwen35.rs): B = decode rows, T = prefill rows; elementwise ops are byte floors.
+    if op == "QwenRmsNorm":
+        return 4 * g("B", rows) * g("width"), 0
+    if op == "QwenHeadNormRope":
+        return 4 * g("rows", rows) * g("H") * g("D"), 0
+    if op == "QwenQGateSplit":  # packed [q | gate] read, both halves written
+        return 4 * g("B", rows) * 2 * g("H") * g("D"), 0
+    if op == "QwenSigmoidGate":
+        return 6 * g("B", rows) * g("width"), 0
+    if op == "QwenGatedNorm":  # core and z read, gated written
+        return 6 * g("B", rows) * g("HV") * g("V"), 0
+    if op in ("QwenGdnConv", "QwenGdnConvPrefill"):
+        n = g("B", rows) if op == "QwenGdnConv" else g("T", rows)
+        return 4 * n * g("C") + 2 * (g("W") - 1) * g("C") * (1 if op == "QwenGdnConvPrefill" else n), 0
+    if op == "QwenGdnQkvPrep":  # packed conv output read, q/k/v written
+        return 4 * g("T", rows) * (2 * g("HK") * g("K") + g("HV") * g("V")), 0
+    if op == "QwenGdnGatePrep":
+        return 16 * g("T", rows) * g("HV"), 0
+    if op == "QwenGdnStep":  # per row: FP32 state read + written, q/k/v read; 4 HV K V FLOPs
+        hv, k, v = g("HV"), g("K"), g("V")
+        n = g("B", rows)
+        return n * (8 * hv * k * v + 2 * (2 * g("HK") * k + hv * v)), 4 * n * hv * k * v
+    if op == "QwenGdnPrefill":  # chunked delta rule: state in/out, q/k/v/o rows, ~6 HV K V per token
+        hv, k, v, t = g("HV"), g("K"), g("V"), g("T", rows)
+        return 8 * hv * k * v + 2 * t * (2 * g("HK") * k + 2 * hv * v), 6 * t * hv * k * v
     return None
 
 

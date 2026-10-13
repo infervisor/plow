@@ -1,4 +1,5 @@
 use super::*;
+use crate::exec::terminal_layout::layout;
 use packet::dev::{StreamEnt, Wait};
 
 pub(super) struct PackedTerminal {
@@ -20,56 +21,6 @@ pub(super) struct PackedTerminal {
     host_ids: PinnedHost,
     /// The next launch's ids and logits are already in place (the KV-shared tail ran the head).
     skip: bool,
-}
-
-fn layout(insts: &[DevInst64], rows: u32, logits: usize, ids: usize) -> Option<[DevInst64; 5]> {
-    let last = insts.get(insts.len().checked_sub(4)?..)?;
-    let tail: [DevInst64; 5] = if last[0].op == DevOp::RmsNorm as u16 {
-        let nop = DevInst64 {
-            op: DevOp::Nop as u16,
-            blocks: 1,
-            ..Default::default()
-        };
-        [last[0], last[1], nop, last[2], last[3]]
-    } else {
-        insts.get(insts.len().checked_sub(5)?..)?.try_into().ok()?
-    };
-    let [norm, head, cap, max, fin] = tail;
-    let softcap = cap.op == DevOp::SoftCap as u16;
-    if rows == 0
-        || [norm.op, head.op, cap.op, max.op, fin.op]
-            != [
-                DevOp::RmsNorm,
-                DevOp::Gemm,
-                if softcap { DevOp::SoftCap } else { DevOp::Nop },
-                DevOp::Argmax,
-                DevOp::ArgmaxFin,
-            ]
-            .map(|op| op as u16)
-        || norm.i[0] != rows
-        || norm.i[1] == 0
-        || head.i[0] != 1
-        || head.i[1] == 0
-        || head.i[2] != norm.i[1]
-        || head.i[4] != rows - 1
-        || (head.i[6] == 0) != (head.i[7] == 0)
-        || head.t[1] != norm.t[0]
-        || head.t[0] as usize != logits
-        || (softcap && (cap.t[0] != head.t[0] || cap.t[1] != head.t[0] || cap.i[0] != head.i[1]))
-        || max.t[1] != head.t[0]
-        || max.i[0] != head.i[1]
-        || max.i[1] > 1
-        || fin.t[1] != max.t[0]
-        || fin.t[0] as usize != ids
-        || fin.i[0] != max.blocks as u32
-        || fin.i[1] > 1
-        || norm.t[1] == norm.t[0]
-        || norm.t[1] == head.t[0]
-        || norm.t[1] == max.t[0]
-    {
-        return None;
-    }
-    Some(tail)
 }
 
 pub(super) fn chain(
@@ -130,11 +81,11 @@ pub(super) fn chain(
 impl PackedTerminal {
     pub(super) fn patch_discarded_tail(&self, bucket: &mut PrefillBucket, discard: bool) {
         let end = bucket.h_inst.len();
-        let len = if self.template[2].op == DevOp::Nop as u16 {
-            4
-        } else {
-            5
-        };
+        let len = self
+            .template
+            .iter()
+            .filter(|inst| inst.op != DevOp::Nop as u16)
+            .count();
         for (inst, original) in bucket.h_inst[end - len..].iter_mut().zip(
             self.template
                 .iter()
@@ -151,6 +102,11 @@ impl PackedTerminal {
 
     pub(super) fn load(e: &GpuEngine) -> Result<Option<Self>> {
         if e.packed_prefill.is_none() || e.pf_batch.is_none() {
+            tracing::info!(
+                packed = e.packed_prefill.is_some(),
+                pf_batch = e.pf_batch.is_some(),
+                "compact terminal off: no packed prefill batch"
+            );
             return Ok(None);
         }
         let Some(first) = e
@@ -158,10 +114,12 @@ impl PackedTerminal {
             .first()
             .and_then(|b| layout(&b.h_inst, b.t, e.t_logits, e.t_ids))
         else {
+            tracing::info!("compact terminal off: the prefill tail is not a terminal layout");
             return Ok(None);
         };
         for bucket in &e.prefill {
             let Some(mut tail) = layout(&bucket.h_inst, bucket.t, e.t_logits, e.t_ids) else {
+                tracing::info!(rows = bucket.t, "compact terminal off: bucket tail differs");
                 return Ok(None);
             };
             tail[0].i[0] = first[0].i[0];
@@ -170,6 +128,10 @@ impl PackedTerminal {
             tail[1].i[6] = first[1].i[6];
             tail[1].i[7] = first[1].i[7];
             if tail != first {
+                tracing::info!(
+                    rows = bucket.t,
+                    "compact terminal off: bucket tail fields differ"
+                );
                 return Ok(None);
             }
         }
@@ -177,19 +139,32 @@ impl PackedTerminal {
             RuntimeError::Rejected("compact terminal requires a prefill object".into())
         })?;
         if e.be.module_global_u32(module, "plow_row_gather_1")? != Some(1) {
+            tracing::info!("compact terminal off: the prefill object has no row-gather arm");
             return Ok(None);
         }
         let [norm, head, _, max, _] = first;
-        let source = &e.devp[norm.t[1] as usize];
+        let post_norm = norm.op == DevOp::Nop as u16;
+        let (source_id, hidden) = if post_norm {
+            (head.t[1], head.i[2])
+        } else {
+            (norm.t[1], norm.i[1])
+        };
+        let source = &e.devp[source_id as usize];
         for id in [norm.t[0], head.t[0], max.t[0], first[4].t[0]] {
+            if id == TENSOR_NONE16 {
+                continue;
+            }
             let destination = &e.devp[id as usize];
             if source.base < destination.base + destination.len
                 && destination.base < source.base + source.len
             {
+                tracing::info!(
+                    tensor = id,
+                    "compact terminal off: tail output overlaps its source"
+                );
                 return Ok(None);
             }
         }
-        let hidden = norm.i[1];
         let capacity = e.batch;
         let blocks = u16::try_from(capacity)
             .ok()
@@ -212,8 +187,11 @@ impl PackedTerminal {
             })?;
         pointers.extend([selected.base, normalized.base, rows.base]);
         for (id, bytes) in [
-            (norm.t[1], e.pf_max_rows() as u64 * hidden as u64 * 2),
-            (norm.t[2], hidden as u64 * 2),
+            (source_id, e.pf_max_rows() as u64 * hidden as u64 * 2),
+            (
+                if post_norm { source_id } else { norm.t[2] },
+                hidden as u64 * 2,
+            ),
             (head.t[2], head.i[1] as u64 * hidden as u64 * 2),
             (head.t[0], capacity as u64 * head.i[1] as u64 * 2),
             (max.t[0], capacity as u64 * max.blocks as u64 * 8),
@@ -233,15 +211,19 @@ impl PackedTerminal {
             t: [TENSOR_NONE16; 8],
             ..Default::default()
         };
-        gather.t[..3].copy_from_slice(&[handle, norm.t[1], handle + 2]);
+        gather.t[..3].copy_from_slice(&[handle, source_id, handle + 2]);
         gather.i[..3].copy_from_slice(&[capacity as u32, hidden, e.pf_max_rows() as u32]);
         let mut insts = vec![gather];
         insts.extend(first);
-        insts[1].t[0] = handle + 1;
-        insts[1].t[1] = handle;
-        insts[1].i[0] = capacity as u32;
-        insts[1].blocks = blocks;
-        insts[2].t[1] = handle + 1;
+        if post_norm {
+            insts[2].t[1] = handle;
+        } else {
+            insts[1].t[0] = handle + 1;
+            insts[1].t[1] = handle;
+            insts[1].i[0] = capacity as u32;
+            insts[1].blocks = blocks;
+            insts[2].t[1] = handle + 1;
+        }
         insts[2].i[0] = capacity as u32;
         insts[2].i[4] = 0;
         // The gathered activation buffer does not match the packet's tensor map.
@@ -259,6 +241,7 @@ impl PackedTerminal {
         .map_err(RuntimeError::Rejected)?;
         let (arg, _, counter_bytes, tables) =
             super::mixed_step::upload_program(&e.be, &program, tensors.base, 0, 0)?;
+        tracing::info!(capacity, hidden, post_norm, "compact terminal on");
         Ok(Some(Self {
             template: first,
             capacity,
@@ -517,6 +500,31 @@ mod tests {
         .validate(7)
         .unwrap();
         ops[1].i[7] = 0;
+        assert!(layout(&ops, 128, 4, 0).is_none());
+    }
+
+    #[test]
+    fn compact_tail_accepts_a_post_norm_head_and_gathers_its_input() {
+        // A packet whose final norm is not the generic RmsNorm ends [head, argmax, fin].
+        let mut ops = tail();
+        ops.remove(2);
+        ops[0].op = DevOp::QwenRmsNorm as u16;
+        let parsed = layout(&ops, 128, 4, 0).unwrap();
+        assert_eq!(parsed[0].op, DevOp::Nop as u16);
+        assert_eq!(parsed[1], ops[1]);
+        assert_eq!(parsed[2].op, DevOp::Nop as u16);
+        assert_eq!(parsed[3..], ops[2..]);
+        for head in [DevOp::GemmSmall, DevOp::GemmMed] {
+            ops[1].op = head as u16;
+            assert!(layout(&ops, 128, 4, 0).is_some());
+        }
+        ops[1].op = DevOp::Gemv as u16;
+        assert!(layout(&ops, 128, 4, 0).is_none());
+        ops[1].op = DevOp::Gemm as u16;
+        ops[1].i[4] = 0;
+        assert!(layout(&ops, 128, 4, 0).is_none());
+        ops[1].i[4] = 127;
+        ops[1].t[1] = ops[1].t[0];
         assert!(layout(&ops, 128, 4, 0).is_none());
     }
 

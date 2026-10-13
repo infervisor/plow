@@ -1,5 +1,6 @@
 #include <cuda_runtime.h>
 #include "../common/dev_isa.h"
+#include "../nvidia/sm120_common.cuh" /* block_sum, which the Qwen norms reduce through */
 #include "../nvidia/op_qwen_gdn.cuh"
 #include "../nvidia/op_gemm.cuh"
 #include "../nvidia/op_norm.cuh"
@@ -74,10 +75,10 @@ switch(op) {
             (const __nv_bfloat16*)TEN(2), (const __nv_bfloat16*)TEN(3), TEN(4),
             (const __nv_bfloat16*)TEN(5), (float*)TEN(6), (const int*)TEN(7),
             in->i[0], in->i[1], in->i[2], in->i[3], in->i[4], in->fj[0].f,
-            in->fj[1].f, in->i[5], slice, nblk);
+            in->fj[1].f, in->i[5], slice, nblk, (float*)arena, 8192u);
         break;
     case PLOW_DOP_QWEN_GATED_NORM:
-        d_qwen_gated_norm((__nv_bfloat16*)TEN(0), (const __nv_bfloat16*)TEN(1),
+        d_qwen_gated_norm<false>((__nv_bfloat16*)TEN(0), (const __nv_bfloat16*)TEN(1),
             (const __nv_bfloat16*)TEN(2), (const __nv_bfloat16*)TEN(3), (const int*)TEN(4),
             in->i[0], in->i[1], in->i[2], in->fj[0].f, slice, nblk);
         break;
@@ -93,7 +94,7 @@ switch(op) {
     case PLOW_DOP_QWEN_RMSNORM:
         d_qwen_rmsnorm((__nv_bfloat16*)TEN(0), (const __nv_bfloat16*)TEN(1),
             (const __nv_bfloat16*)TEN(2), (const int*)TEN(3), in->i[0], in->i[1],
-            in->fj[0].f, in->fj[1].f, slice, nblk);
+            in->fj[0].f, in->fj[1].f, slice, nblk, (float*)arena);
         break;
     case PLOW_DOP_QWEN_HEADNORM_ROPE:
         d_qwen_headnorm_rope((__nv_bfloat16*)TEN(0), (const __nv_bfloat16*)TEN(1),
@@ -102,12 +103,12 @@ switch(op) {
             in->i[3], in->i[4], in->i[5], in->fj[0].f, in->fj[1].f, slice, nblk, in->i[6]);
         break;
     case PLOW_DOP_QWEN_GDN_CONV_PREFILL:
-        d_qwen_gdn_conv_prefill((__nv_bfloat16*)TEN(0), (const __nv_bfloat16*)TEN(1),
+        d_qwen_gdn_conv_prefill<false>((__nv_bfloat16*)TEN(0), (const __nv_bfloat16*)TEN(1),
             (const __nv_bfloat16*)TEN(2), (__nv_bfloat16*)TEN(3), in->i[0], in->i[1],
-            in->i[2], slice, nblk);
+            in->i[2], in->i[3], slice, nblk);
         break;
     case PLOW_DOP_QWEN_GDN_QKV_PREP:
-        d_qwen_gdn_qkv_prep((__nv_bfloat16*)TEN(0), (__nv_bfloat16*)TEN(1),
+        d_qwen_gdn_qkv_prep<false>((__nv_bfloat16*)TEN(0), (__nv_bfloat16*)TEN(1),
             (__nv_bfloat16*)TEN(2), (const __nv_bfloat16*)TEN(3), in->i[0], in->i[1],
             in->i[2], in->i[3], in->i[4], in->fj[0].f, slice, nblk);
         break;
@@ -132,5 +133,5 @@ const unsigned gemm_smem = PGM90_TMA_ARENA * sizeof(__nv_bfloat16);
 #else
 const unsigned gemm_smem = (PLOW_NV_FP8_M1_XCACHE ? (PLOW_NV_FP8_M1_TMA ? 205840 : 205824) : PLOW_NV_FP8_M1_BK1024 ? 74752 : PLOW_NV_FP8_M1_BK512 ? 37888 : PLOW_NV_FP8_M1_BK256 ? 19456 : 12352);
 #endif
-run<<<132,256,op == PLOW_DOP_GEMM_FP8 ? gemm_smem : (op == PLOW_DOP_RMSNORM || op == PLOW_DOP_NORM_RESIDUAL || op == PLOW_DOP_NORM_RESIDUAL_NORM ? 32 : 0),(cudaStream_t)stream>>>(op,a);return (int)cudaGetLastError();
+run<<<132,256,op == PLOW_DOP_GEMM_FP8 ? gemm_smem : op == PLOW_DOP_QWEN_GDN_STEP ? 32768 : (op == PLOW_DOP_RMSNORM || op == PLOW_DOP_NORM_RESIDUAL || op == PLOW_DOP_NORM_RESIDUAL_NORM || op == PLOW_DOP_QWEN_RMSNORM ? 32 : 0),(cudaStream_t)stream>>>(op,a);return (int)cudaGetLastError();
 }

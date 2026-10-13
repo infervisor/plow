@@ -331,6 +331,11 @@ pub struct EmitConfig {
     #[arg(long, env = "PLOW_NV_DENSE_TUNE", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
     pub nv_dense_tune: bool,
 
+    /// The mma row-block GEMV walks split the leftover row blocks of their last wave over K across
+    /// the idle warps (op_gemv_mma.cuh). Reorders those sums; a recipe opts in after its gate.
+    #[arg(long, env = "PLOW_NV_GEMV_REM_SPLIT", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
+    pub nv_gemv_rem_split: bool,
+
     /// S3Gen voice caches pre-formatted for the 3xFP16 cached attention (sm_90 speech object).
     #[arg(long, env = "PLOW_EMIT_S3GEN_ATTN_H16", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
     pub s3gen_attn_h16: bool,
@@ -344,9 +349,25 @@ pub struct EmitConfig {
     pub nv_fa_mma_hd128: bool,
 
     /// NVIDIA hd <= 128 dense packets: the one-row decode rung also takes the `gemv_k8` walk, with
-    /// two k32 steps in flight on its one-tile arm (`gemv_k8_min` 1, `gemv_k8_unb1` 2).
+    /// two k32 steps in flight on its one-tile arm (`gemv_k8_min` 1, `gemv_k8_unb1` 2). On the
+    /// Qwen3.5 hybrid the walk also runs on the ordinary object (rungs 1..4), not `_gw` only.
     #[arg(long, env = "PLOW_NV_GEMV_K8_B1", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
     pub nv_gemv_k8_b1: bool,
+
+    /// NVIDIA hd256/512 flash decode on the row-group body (`fa_rg_wide`) for packets outside the
+    /// measured E-series default (PLOW_NV_FA_RG_WIDE).
+    #[arg(long, env = "PLOW_NV_FA_RG_WIDE", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
+    pub nv_fa_rg_wide: bool,
+
+    /// Rows per warp in flight on the row-group flash decode body (`fa_rg_u`; the kernel's own
+    /// default is 4). Candidate for long-context decode (PLOW_NV_FA_RG_U).
+    #[arg(long, env = "PLOW_NV_FA_RG_U")]
+    pub nv_fa_rg_u: Option<u32>,
+
+    /// The ring-staged row-group flash decode body (`fa_rgt`: cp.async.bulk K/V rings per warp)
+    /// on the arms that take the row-group body (PLOW_NV_FA_RGT).
+    #[arg(long, env = "PLOW_NV_FA_RGT", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
+    pub nv_fa_rgt: bool,
 
     /// sm_90a v3 flash prefill splits the KV of launches with few items across CTAs (riders,
     /// short session suffixes) through the `fa_ws` workspace.
@@ -1363,6 +1384,12 @@ pub struct EmitConfig {
     #[arg(long, env = "PLOW_QWEN_FUSE_MLP", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
     pub qwen_fuse_mlp: bool,
 
+    #[arg(long, env = "PLOW_QWEN_FOLD_NORM", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
+    pub qwen_fold_norm: bool,
+
+    #[arg(long, env = "PLOW_QWEN_FOLD_MAX")]
+    pub qwen_fold_max: Option<u32>,
+
     #[arg(long, env = "PLOW_QWEN_PROJECTION_DAG", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
     pub qwen_projection_dag: bool,
 
@@ -1371,6 +1398,12 @@ pub struct EmitConfig {
 
     #[arg(long, env = "PLOW_QWEN_AB_BLOCKS")]
     pub qwen_ab_blocks: Option<u32>,
+
+    #[arg(long, env = "PLOW_QWEN_GDN_ISOLATE")]
+    pub qwen_gdn_isolate: Option<u32>,
+
+    #[arg(long, env = "PLOW_QWEN_KV_INTERLEAVE", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
+    pub qwen_kv_interleave: bool,
 
     #[arg(long, env = "PLOW_QWEN_PREFILL")]
     pub qwen_prefill: Option<String>,
@@ -1526,10 +1559,14 @@ impl EmitConfig {
             nv_fa_fold_wide: env_bool_default_true("PLOW_NV_FA_FOLD_WIDE"),
             nv_fa_fold: env_bool("PLOW_NV_FA_FOLD"),
             nv_dense_tune: env_bool("PLOW_NV_DENSE_TUNE"),
+            nv_gemv_rem_split: env_bool("PLOW_NV_GEMV_REM_SPLIT"),
             packed_prefill_small_hd: env_bool("PLOW_EMIT_PACKED_PREFILL_SMALL_HD"),
             s3gen_attn_h16: env_bool("PLOW_EMIT_S3GEN_ATTN_H16"),
             nv_fa_mma_hd128: env_bool("PLOW_NV_FA_MMA_HD128"),
             nv_gemv_k8_b1: env_bool("PLOW_NV_GEMV_K8_B1"),
+            nv_fa_rg_wide: env_bool("PLOW_NV_FA_RG_WIDE"),
+            nv_fa_rg_u: env_u32("PLOW_NV_FA_RG_U"),
+            nv_fa_rgt: env_bool("PLOW_NV_FA_RGT"),
             nv_fa_split_prefill: env_bool_default_true("PLOW_NV_FA_SPLIT_PREFILL"),
             hn_split: env_bool("PLOW_HN_SPLIT"),
             fuse_kv_hnr: env_bool("PLOW_FUSE_KV_HNR"),
@@ -1748,11 +1785,17 @@ impl EmitConfig {
             decode_native_tc: env_bool("PLOW_EMIT_DECODE_NATIVE_TC"),
             qwen_fuse_ab: env_bool("PLOW_QWEN_FUSE_AB"),
             qwen_fuse_mlp: env_bool("PLOW_QWEN_FUSE_MLP"),
+            qwen_fold_norm: env_bool("PLOW_QWEN_FOLD_NORM"),
+            qwen_fold_max: std::env::var("PLOW_QWEN_FOLD_MAX")
+                .ok()
+                .map(|v| v.parse().expect("Qwen fold rung cap")),
             qwen_projection_dag: env_bool("PLOW_QWEN_PROJECTION_DAG"),
             qwen_share_quant: env_bool("PLOW_QWEN_SHARE_QUANT"),
             qwen_ab_blocks: std::env::var("PLOW_QWEN_AB_BLOCKS")
                 .ok()
                 .map(|v| v.parse().expect("Qwen a/b block count")),
+            qwen_gdn_isolate: env_u32("PLOW_QWEN_GDN_ISOLATE"),
+            qwen_kv_interleave: env_bool("PLOW_QWEN_KV_INTERLEAVE"),
             qwen_prefill: std::env::var("PLOW_QWEN_PREFILL").ok(),
             pf_gfuse: env_bool("PLOW_PF_GFUSE"),
             uniseg_max_t: env_u32("PLOW_UNISEG_MAX_T"),

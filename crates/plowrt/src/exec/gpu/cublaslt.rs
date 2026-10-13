@@ -178,6 +178,12 @@ pub(super) enum LibraryRoute {
     Projection(CublasLtDecodeRoute),
     Moe(moe_lt::MoeLtRoute),
     Light(LightRoute),
+    /// The generated flash-decode object on an isolated FlashDecode segment (`gen_decode.rs`).
+    Gen(super::gen_decode::GenDecodeRoute),
+    /// The decode object's GDN step kernel on an isolated QwenGdnStep segment (`gen_decode.rs`).
+    GdnStep(super::gen_decode::GdnStepRoute),
+    /// A segment an earlier route already executed (the FlashMerge the object folds in).
+    Skip,
 }
 
 impl LibraryRoute {
@@ -186,6 +192,9 @@ impl LibraryRoute {
             Self::Projection(route) => route.run(stream),
             Self::Moe(route) => route.run(stream),
             Self::Light(route) => route.run(stream),
+            Self::Gen(route) => route.run(stream),
+            Self::GdnStep(route) => route.run(stream),
+            Self::Skip => Ok(()),
         }
     }
 }
@@ -282,6 +291,12 @@ struct LightLaunch {
 
 impl LightRoute {
     pub(super) fn run(&self, stream: &CudaStream) -> Result<()> {
+        self.run_with(stream, self.kernarg.tensors)
+    }
+
+    /// `tensors`: the launch's tensor table. A per-slot prefill chunk selects slot b's shifted
+    /// table (kv.*, recurrent state) through its kernarg; the route's own copy is slot 0's.
+    pub(super) fn run_with(&self, stream: &CudaStream, tensors: u64) -> Result<()> {
         for launch in &self.launches {
             if let Some(span) = &launch.direct {
                 let mut span = **span;
@@ -301,6 +316,7 @@ impl LightRoute {
                 continue;
             }
             let mut arg = self.kernarg;
+            arg.tensors = tensors;
             let mut instruction = launch.instruction;
             let (mut count, mut hnr) = match launch.kind {
                 LightKind::Attn(n) => (n, [0; 4]),
@@ -648,6 +664,47 @@ pub(super) fn prefill_light_segments(
     g: &DevProg,
     library: &[Option<usize>],
 ) -> Vec<(usize, Vec<usize>)> {
+    let none = packet::dev::TENSOR_NONE16;
+    light_segments_matching(g, library, 3, |d| match DevOp::from_u16(d.op) {
+        Some(DevOp::RmsNorm) => d.t[3] == none && d.t[4] == none,
+        Some(DevOp::Residual) => true,
+        Some(DevOp::Glu) => d.i[1] == 1,
+        _ => false,
+    })
+}
+
+/// The Qwen3.5 chain's interpreter segments made only of its prefill pointwise arms (and SiLU
+/// Glu / Residual), at most four instructions: `plow_<arch>_light_pf` of the PREFILL object runs
+/// them one launch each in program order (`qwen_light_route`).
+pub(super) fn qwen_light_segments(
+    g: &DevProg,
+    library: &[Option<usize>],
+) -> Vec<(usize, Vec<usize>)> {
+    light_segments_matching(g, library, 4, |d| match DevOp::from_u16(d.op) {
+        Some(
+            DevOp::QwenRmsNorm
+            | DevOp::QwenGatedNorm
+            | DevOp::QwenQGateSplit
+            | DevOp::QwenSigmoidGate
+            | DevOp::QwenHeadNormRope
+            | DevOp::QwenGdnConvPrefill
+            | DevOp::QwenGdnQkvPrep
+            | DevOp::QwenGdnGatePrep
+            | DevOp::Residual,
+        ) => true,
+        Some(DevOp::Glu) => d.i[1] == 1,
+        _ => false,
+    })
+}
+
+/// Segments of 1..=`max` whole instructions (every slice, ascending, in program order) that
+/// `allow` accepts, skipping `library` segments.
+fn light_segments_matching(
+    g: &DevProg,
+    library: &[Option<usize>],
+    max: usize,
+    allow: impl Fn(&DevInst64) -> bool,
+) -> Vec<(usize, Vec<usize>)> {
     (0..g.gq_seg_ofs.len().saturating_sub(1))
         .filter(|&seg| library.get(seg).copied().flatten().is_none())
         .filter_map(|seg| {
@@ -658,8 +715,7 @@ pub(super) fn prefill_light_segments(
                     insts.push(e.inst as usize);
                 }
             }
-            let none = packet::dev::TENSOR_NONE16;
-            let ok = (1..=3).contains(&insts.len())
+            let ok = (1..=max).contains(&insts.len())
                 && insts.windows(2).all(|w| w[0] < w[1])
                 && insts.iter().all(|&inst| {
                     let d = &g.insts[inst];
@@ -667,12 +723,7 @@ pub(super) fn prefill_light_segments(
                     d.blocks != 0
                         && own.len() == d.blocks as usize
                         && own.iter().enumerate().all(|(i, e)| e.slice as usize == i)
-                        && match DevOp::from_u16(d.op) {
-                            Some(DevOp::RmsNorm) => d.t[3] == none && d.t[4] == none,
-                            Some(DevOp::Residual) => true,
-                            Some(DevOp::Glu) => d.i[1] == 1,
-                            _ => false,
-                        }
+                        && allow(d)
                 });
             ok.then_some((seg, insts))
         })
@@ -758,6 +809,24 @@ pub(super) fn prefill_light_route(
             .collect(),
         _scratch: None,
     }
+}
+
+/// `prefill_light_route` on `grid` blocks per launch instead of the instruction's one per SM:
+/// the Qwen pointwise bodies stride by gridDim, and the interpreter's one 256-thread block per
+/// SM (its entry sits at the register cap) left them issue-bound.
+pub(super) fn qwen_light_route(
+    be: &Arc<CudaBackend>,
+    function: KernelFn,
+    kernarg: DevProgram,
+    g: &DevProg,
+    insts: &[usize],
+    grid: u32,
+) -> LightRoute {
+    let mut route = prefill_light_route(be, function, kernarg, g, insts);
+    for launch in &mut route.launches {
+        launch.blocks = grid;
+    }
+    route
 }
 
 /// The cached GLU quant kernel strides rows by `gridDim`: one CTA per row instead of the
@@ -1383,6 +1452,9 @@ fn glue_kernels<'a>(routes: impl Iterator<Item = &'a LibraryRoute>) -> Vec<Kerne
         .filter_map(|route| match route {
             LibraryRoute::Moe(route) => Some(route.glue().collect::<Vec<_>>()),
             LibraryRoute::Light(route) => Some(route.launches.iter().map(|l| l.function).collect()),
+            LibraryRoute::Gen(route) => Some(vec![route.function()]),
+            LibraryRoute::GdnStep(route) => Some(vec![route.function()]),
+            LibraryRoute::Skip => Some(Vec::new()),
             LibraryRoute::Projection(_) => None,
         })
         .flatten()
@@ -1928,7 +2000,32 @@ pub(super) fn prepare_routes(
 pub(super) struct CublasLtDecodeGraph {
     be: Arc<CudaBackend>,
     graph: Option<crate::device::cuda::GraphExec>,
-    _routes: Vec<Option<LibraryRoute>>,
+    /// Not captured: the routes' launch arguments change per step (the generated decode
+    /// object's split width), so every step enqueues the chain itself.
+    direct: Option<(DevProgram, KernelFn, u32, u32)>,
+    routes: Vec<Option<LibraryRoute>>,
+}
+
+fn enqueue_routes(
+    be: &CudaBackend,
+    stream: &CudaStream,
+    base: DevProgram,
+    function: KernelFn,
+    grid: u32,
+    smem: u32,
+    routes: &[Option<LibraryRoute>],
+) -> Result<()> {
+    for (seg, route) in routes.iter().enumerate() {
+        if let Some(route) = route {
+            route.run(stream)?;
+            continue;
+        }
+        let mut arg = base;
+        segment_window(&mut arg, &base, seg, false);
+        let mut params = [&mut arg as *mut DevProgram as *mut std::ffi::c_void];
+        be.launch_cooperative(function, grid, BLOCK, smem, &mut params, Some(stream))?;
+    }
+    Ok(())
 }
 
 impl CublasLtDecodeGraph {
@@ -1943,26 +2040,36 @@ impl CublasLtDecodeGraph {
     ) -> Result<Self> {
         let untouched = glue_kernels(routes.iter().flatten());
         let graph = be.graph_capture_hoisting(stream, &untouched, || {
-            for (seg, route) in routes.iter().enumerate() {
-                if let Some(route) = route {
-                    route.run(stream)?;
-                    continue;
-                }
-                let mut arg = base;
-                segment_window(&mut arg, &base, seg, false);
-                let mut params = [&mut arg as *mut DevProgram as *mut std::ffi::c_void];
-                be.launch_cooperative(function, grid, BLOCK, smem, &mut params, Some(stream))?;
-            }
-            Ok(())
+            enqueue_routes(be, stream, base, function, grid, smem, &routes)
         })?;
         Ok(Self {
             be: Arc::clone(be),
             graph: Some(graph),
-            _routes: routes,
+            direct: None,
+            routes,
         })
     }
 
+    pub(super) fn direct(
+        be: &Arc<CudaBackend>,
+        base: DevProgram,
+        function: KernelFn,
+        grid: u32,
+        smem: u32,
+        routes: Vec<Option<LibraryRoute>>,
+    ) -> Self {
+        Self {
+            be: Arc::clone(be),
+            graph: None,
+            direct: Some((base, function, grid, smem)),
+            routes,
+        }
+    }
+
     pub(super) fn launch(&self, stream: &CudaStream) -> Result<()> {
+        if let Some((base, function, grid, smem)) = self.direct {
+            return enqueue_routes(&self.be, stream, base, function, grid, smem, &self.routes);
+        }
         self.be
             .graph_launch(self.graph.as_ref().expect("captured decode graph"), stream)
     }

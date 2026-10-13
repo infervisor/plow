@@ -140,6 +140,26 @@ const PRESSURE_EVICTION_DEFAULT: Status = Status::Candidate {
     ],
 };
 
+/// Decode rungs from this many rows run each declared FlashDecode + FlashMerge pair as one
+/// launch of the packet's generated flash-decode object; the interpreter pair stays for the
+/// narrower rungs, where its one launch beats the object's extra window boundary.
+const GEN_DECODE_STEP_DEFAULT: Status = Status::Candidate {
+    evidence: &[
+        "scripts/gen_kernels/bench_decode.py (k1tune2, H100): the generated hd256 GQA6 flash decode 59 / 200 / 356 / 288 us at B8x4K / B16x8K / B16x15K / B48x4K; the interpreter FlashDecode runs 3.8x the HBM floor at B16x8K",
+        "plans/qwen38-27b-h100.md (ab71/ab72, build71/72, step_bench ms, interpreter pair vs object, 4K / 15K): B1 23.85 vs 24.18 / 24.30 vs 25.20; B2 25.08 vs 25.10 / 26.01 vs 26.02; B4 26.90 vs 26.49 / 28.74 vs 27.40; B8 28.21 vs 27.39 / 31.82 vs 29.44; B16 33.46 vs 31.56 / 40.71 vs 35.56; B32 42.78 vs 38.32 (4K): the object from 4 rows",
+        "`=0` is the rollback to the interpreter pair",
+    ],
+};
+/// The Qwen3.5 chain's pointwise prefill segments as light launches of the prefill object, four
+/// blocks per SM. The interpreter window runs one 256-thread block per SM (its entry is at the
+/// register cap), which left the issue-bound pointwise arms at 10-30% of their byte floors.
+const QWEN_LIGHT_DEFAULT: Status = Status::Candidate {
+    evidence: &[
+        "plans/qwen38-27b-h100.md (segtime62, build59): the chain's pointwise class 24.4 / 74.2 ms per 1024 / 4096 rows as interpreter windows, 16.7 / 52.0 as light launches at occ 2 or 4 (two blocks per SM, the chunk's own tensor table); digests B1 / B8 = build50",
+        "`=0` is the rollback to interpreter windows",
+    ],
+};
+
 /// Runtime knobs change no packet byte; their scope is the route a workload takes.
 /// G1 (review log #85) skips union segments inside the sparse prefill programs; the packet does not
 /// change, so the route is its whole scope.
@@ -583,9 +603,12 @@ pub const RUNTIME: &[KnobSpec] = &[
     KnobSpec::new("rt.decode_light", Some("PLOW_DECODE_LIGHT"), Layer::Runtime, Domain::Bool, ON, PROMOTED),
     KnobSpec::new("rt.decode_light_flash", Some("PLOW_DECODE_LIGHT_FLASH"), Layer::Runtime, Domain::Bool, ON, PROMOTED),
     KnobSpec::new("rt.tb_split_attn", Some("PLOW_TB_SPLIT_ATTN"), Layer::Runtime, Domain::Bool, ON, PROMOTED),
+    KnobSpec::new("rt.tb_gen_decode", Some("PLOW_TB_GEN_DECODE"), Layer::Runtime, Domain::Bool, ON, PROMOTED),
+    KnobSpec::new("rt.gen_decode_step", Some("PLOW_GEN_DECODE_STEP"), Layer::Runtime, U32, Default::Static(Val::Nat(4)), GEN_DECODE_STEP_DEFAULT),
     KnobSpec::new("rt.decode_light_attn_s", Some("PLOW_DECODE_LIGHT_ATTN_S"), Layer::Runtime, Domain::Bool, ON, PROMOTED),
     KnobSpec::new("rt.decode_head_argmax", Some("PLOW_DECODE_HEAD_ARGMAX"), Layer::Runtime, Domain::Bool, ON, PROMOTED),
     KnobSpec::new("rt.prefill_light", Some("PLOW_PREFILL_LIGHT"), Layer::Runtime, Domain::Bool, ON, PROMOTED),
+    KnobSpec::new("rt.qwen_light_occ", Some("PLOW_QWEN_LIGHT_OCC"), Layer::Runtime, U32, Default::Static(Val::Nat(4)), QWEN_LIGHT_DEFAULT),
     KnobSpec::new("rt.decode_lt_qkv", Some("PLOW_DECODE_LT_QKV"), Layer::Runtime, Domain::Bool, ON, PROMOTED),
     KnobSpec::new("rt.moe_pf_lt", Some("PLOW_MOE_PF_LT"), Layer::Runtime, U32, UNSET, MOE_LT_QUALIFIED),
     KnobSpec::new("rt.moe_dec_lt", Some("PLOW_MOE_DEC_LT"), Layer::Runtime, U32, UNSET, MOE_LT_QUALIFIED),

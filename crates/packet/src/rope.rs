@@ -264,8 +264,10 @@ pub const GEN_TMAP_E4M3: u32 = 5;
 /// rides in one buffer). Each map: bf16, rank-3 {hd, ring_rows, n_kv_head}, 128B swizzle,
 /// box {64, BKV, 1}. Field reuse: `ctx` = ring rows, `hd` = head_dim, `aux` = K tensor
 /// handle, `scale` = V tensor handle, `frac` = n_kv_head and `factor` = BKV. Legacy
-/// recipes carry `factor=0`, meaning BKV=32. Same zero-placeholder contract as the other
-/// TMAP kinds.
+/// recipes carry `factor=0`, meaning BKV=32. `low` = the cache's live-KV layout: 1 is
+/// row-interleaved (`[ring_rows][n_kv_head][hd]`), mapped as rank-3 {hd, n_kv_head, ring_rows}
+/// with box {64, 1, BKV} (same shared-memory image). Same zero-placeholder contract as the
+/// other TMAP kinds.
 pub const GEN_TMAP_KV_PAIR: u32 = 6;
 pub const GEN_AMD_ROPE_BF16_COS: u32 = 7;
 pub const GEN_AMD_ROPE_BF16_SIN: u32 = 8;

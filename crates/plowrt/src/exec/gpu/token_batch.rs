@@ -61,7 +61,11 @@ impl CudaTokenBatch {
             && e.be.compute_capability() == (9, 0)
             && e.packed_prefill.is_some()
             && e.has_packed_terminal()
-            && e.recurrent.is_none()
+            // A recurrent chain packs only through its per-request state gather / varlen scan /
+            // scatter, so a one-row decode request is a continuing chunk of length 1; the split
+            // attention riders never arm on it (`riders.rs`), the rows attend through the
+            // prefill attention's request table.
+            && (e.recurrent.is_none() || e.qwen_initstate.is_some())
             && e.mixed_step.is_none()
             // Host rows spliced by launch row (overlay) or a decode-only embedding (position
             // base): the batch embeds decode rows through the prefill program, in its own order.

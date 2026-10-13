@@ -1420,8 +1420,12 @@ def cmd_sweep(a: argparse.Namespace) -> None:
 #   llm_fp32_ref      plow AND vLLM vs a cached FP32 reference (scripts/llm/fp32_ref_gate.py); plow must
 #                     stay within vLLM's distance to FP32. `reference` (ref.json), then `vllm_capture` (cached)
 #                     or `vllm_hf` [+ `vllm_args`, `vllm_python`] to capture vLLM in the same lease:
-#                     kl_ratio_max, kl_slack_max, top1_drop_max, cont_drop_max, needle_drop_max,
-#                     needle_min, tie_margin (docs/bringup/agent-tools.md §5)
+#                     kl_ratio_max, kl_slack_max, kl_trim_frac, kl_over_at, kl_over_slack, top1_drop_max,
+#                     cont_drop_max, needle_drop_max, needle_min, tie_margin (docs/bringup/agent-tools.md §5).
+#                     `concurrency` = 1 or a list such as [1, 8, 32]: every concurrency is captured
+#                     (plow-c<N>.json) and must pass against the peer at the same concurrency —
+#                     `vllm_capture` is then a table { c1 = "...", c8 = "...", c32 = "..." } (a string
+#                     is one peer for every concurrency); with `vllm_hf` the lease captures vLLM at each.
 # Each may set `python` (default [gates].python, else python3), `args` (extra client args) and
 # `timeout_s`. Placeholders as in `build`, plus {assets}, {target} (cargo target dir) and {out}.
 # A table named <kind>_<suffix> (e.g. [gates.llm_fp32_ref_long], a second reference set) runs as
@@ -1454,9 +1458,11 @@ def gate_steps(key: str, g: dict, py: str, out: Path, assets: Path) -> tuple[lis
                 [f"{q(py)} {sc('scripts/llm/gemma_logit_parity.py')} hf {hf} {d}/plow.json {d}/hf.json > {d}/hf.log 2>&1",
                  f"{q(py)} {sc('scripts/llm/gemma_logit_parity.py')} report {d}/plow.json {d}/hf.json > {d}/parity.md 2>&1"])
     if kind == "llm_fp32_ref":
-        cap = lambda arm: (f"{q(py)} {sc('scripts/llm/fp32_ref_gate.py')} capture --url \"http://127.0.0.1:$PB_SERVER_PORT\" "
-                           f"--ref {q(g['reference'])} --arm {arm} --concurrency {int(g.get('concurrency', 16))} "
-                           f"--out {d}/{arm}.json > {d}/{arm}.log 2>&1")
+        concs = fp32_concurrencies(g)
+        name = lambda arm, c: fp32_capture_name(arm, c, concs)
+        cap = lambda arm, c: (f"{q(py)} {sc('scripts/llm/fp32_ref_gate.py')} capture --url \"http://127.0.0.1:$PB_SERVER_PORT\" "
+                              f"--ref {q(g['reference'])} --arm {name(arm, c)} --concurrency {c} "
+                              f"--out {d}/{name(arm, c)}.json > {d}/{name(arm, c)}.log 2>&1")
         down = []
         if not g.get("vllm_capture"):
             if not g.get("vllm_hf"):
@@ -1467,8 +1473,9 @@ def gate_steps(key: str, g: dict, py: str, out: Path, assets: Path) -> tuple[lis
             down = [f"( PB_SERVER_PORT=$(pb_free_port); PB_SERVER_LOG={d}/vllm-server.log; "
                     f"env -u LD_LIBRARY_PATH {vpy} -m vllm.entrypoints.cli.main serve {q(g['vllm_hf'])} "
                     f"--port \"$PB_SERVER_PORT\" {vargs} > \"$PB_SERVER_LOG\" 2>&1 & PB_SERVER_PID=$!; "
-                    f"trap pb_serve_stop EXIT; pb_serve_wait {int(g.get('vllm_ready_s', 900))} && {cap('vllm')} )"]
-        return [cap("plow")], down
+                    f"trap pb_serve_stop EXIT; pb_serve_wait {int(g.get('vllm_ready_s', 900))} && "
+                    + " && ".join(cap("vllm", c) for c in concs) + " )"]
+        return [cap("plow", c) for c in concs], down
     if kind == "asr_wer":
         return ([f"{q(py)} {sc('scripts/asr/nvidia/served_bench.py')} --url \"http://127.0.0.1:$PB_SERVER_PORT\" "
                  f"--model \"$MODEL\" --manifest {q(g['manifest'])} --conc {q(str(g.get('conc', '1,16')))} {args} "
@@ -1533,6 +1540,36 @@ def gate_pre(key: str, g: dict, out: Path) -> list[str]:
             f"--cases {q(cases)} --max-new {int(g.get('max_new', 48))} > {q(str(out / key / 'hf_ref.log'))} 2>&1"]
 
 
+def fp32_concurrencies(g: dict) -> list[int]:
+    c = g.get("concurrency", 16)
+    return [int(x) for x in c] if isinstance(c, list) else [int(c)]
+
+
+def fp32_capture_name(arm: str, c: int, concs: list[int]) -> str:
+    """plow.json / vllm.json for the single-concurrency gate (unchanged layout); plow-c8.json for a list."""
+    return arm if len(concs) == 1 else f"{arm}-c{c}"
+
+
+def fp32_peer_path(g: dict, c: int, concs: list[int], d: Path) -> tuple[Path | None, str]:
+    """(peer capture for concurrency c, note). The peer is the same-concurrency vLLM capture: a
+    `vllm_capture` table lacking c{c} yields None (the gate fails; a c1 peer is a different,
+    quieter distribution and must not stand in), one path for several concurrencies is noted."""
+    vc = g.get("vllm_capture")
+    if isinstance(vc, dict):
+        if f"c{c}" in vc:
+            return Path(vc[f"c{c}"]), ""
+        return None, f"peer at c{c} missing in vllm_capture"
+    if vc:
+        return Path(vc), "" if len(concs) == 1 else f"one vllm_capture for every concurrency ({Path(vc).name})"
+    return d / f"{fp32_capture_name('vllm', c, concs)}.json", ""
+
+
+def fp32_capture_concurrency(cap: dict, c: int, name: str) -> list[str]:
+    """Why a capture is not the c{c} arm it is scored as (captures record their concurrency)."""
+    rec = cap.get("concurrency")
+    return [f"{name} captured at c{rec}, scored as c{c}"] if rec is not None and int(rec) != c else []
+
+
 def fp32_ref_module():
     spec = importlib.util.spec_from_file_location("fp32_ref_gate", REPO / "scripts/llm/fp32_ref_gate.py")
     mod = importlib.util.module_from_spec(spec)
@@ -1558,17 +1595,36 @@ def gate_score(key: str, g: dict, d: Path) -> dict:
         lim("kl_max", float(m[5]), "kl_max_max")
     elif kind == "llm_fp32_ref":
         mod = fp32_ref_module()
-        caps = [d / "plow.json", Path(g.get("vllm_capture") or d / "vllm.json")]
-        absent = [str(p) for p in [Path(g["reference"]), *caps] if not p.is_file()]
+        concs = fp32_concurrencies(g)
+        plan = [(c, d / f"{fp32_capture_name('plow', c, concs)}.json", *fp32_peer_path(g, c, concs, d)) for c in concs]
+        no_peer = [note for _, _, peer, note in plan if peer is None]
+        if no_peer:
+            return {"pass": False, "why": no_peer}
+        absent = [str(p) for p in [Path(g["reference"]), *(p for _, cand, peer, _ in plan for p in (cand, peer))]
+                  if not p.is_file()]
         if absent:
-            return {"pass": False, "why": [f"missing {', '.join(absent)} (see plow.log / vllm.log)"]}
+            return {"pass": False, "why": [f"missing {', '.join(sorted(set(absent)))} (see plow*.log / vllm*.log)"]}
         ref = mod.load_ref(g["reference"])
         th = dict(mod.DEFAULTS, **{k: g[k] for k in mod.DEFAULTS if k in g})
-        cand, vllm = (mod.score(ref, json.loads(p.read_text()), th["tie_margin"]) for p in caps)
-        why += mod.verdict(cand, vllm, th)
-        for m in ("kl_mean", "kl_p99", "top1_decisive", "cont_frac", "needle_acc"):
-            res[m], res["vllm_" + m] = cand.get(m), vllm.get(m)
-        (d / "fp32_ref.md").write_text(mod.table({"plow": cand, "vllm": vllm}) + "\n")
+        if "eos" in g:  # stop ids for a reference made before `reference` recorded them
+            th["eos"] = [int(x) for x in g["eos"]]
+        metrics = ("kl_mean", "kl_trim_mean", "kl_p95", "kl_p99", "kl_over", "top1_decisive", "cont_frac", "needle_acc")
+        table, by_c = {}, {}
+        for i, (c, cand_p, peer_p, note) in enumerate(plan):
+            caps = [json.loads(p.read_text()) for p in (cand_p, peer_p)]
+            cand, vllm = (mod.score_with(ref, cap, th) for cap in caps)
+            bad = mod.verdict(cand, vllm, th)
+            bad += fp32_capture_concurrency(caps[0], c, cand_p.name) + fp32_capture_concurrency(caps[1], c, peer_p.name)
+            why += [f"c{c}: {w}" for w in bad] if len(concs) > 1 else bad
+            row = {m: cand.get(m) for m in metrics} | {"vllm_" + m: vllm.get(m) for m in metrics}
+            row.update({"pass": not bad, "why": bad, "peer": str(peer_p), **({"note": note} if note else {})})
+            by_c[f"c{c}"] = row
+            if i == 0:  # the headline metrics stay those of the first (lowest) concurrency
+                res.update({k: v for k, v in row.items() if k not in ("pass", "why", "peer", "note")})
+            table[f"plow c{c}"], table[f"vllm c{c}"] = cand, vllm
+        if len(concs) > 1:
+            res["by_concurrency"] = by_c
+        (d / "fp32_ref.md").write_text(mod.table(table) + "\n")
     elif kind == "asr_wer":
         rows = [json.loads(ln) for ln in txt("served.jsonl").splitlines() if ln.startswith("{")]
         if not rows:
@@ -1654,8 +1710,13 @@ def cmd_gate(a: argparse.Namespace) -> None:
     target = os.environ.get("CARGO_TARGET_DIR", str(REPO / "target"))
     def x(v):  # score-only does not demand the run's env or snapshots
         return expand(str(v).replace("{assets}", str(assets)).replace("{target}", target), out, lenient=a.score_only)
-    cfg = {k: {kk: ([x(i) for i in vv] if isinstance(vv, list) else x(vv) if isinstance(vv, str) else vv)
-               for kk, vv in gates[k].items()} for k in kinds}
+    def xv(vv):  # strings, lists and one level of table (vllm_capture = { c1 = ..., c8 = ... })
+        if isinstance(vv, list):
+            return [xv(i) for i in vv]
+        if isinstance(vv, dict):
+            return {kk: xv(i) for kk, i in vv.items()}
+        return x(vv) if isinstance(vv, str) else vv
+    cfg = {k: {kk: xv(vv) for kk, vv in gates[k].items()} for k in kinds}
     pkt = assets / gates.get("packet", "model.pkt")
     # serving_comparison.py render accepts the gate only for the exact packet the Infervisor arm served,
     # so the packet hash is the one captured with the run, never the --assets of a later re-score.
@@ -1731,10 +1792,13 @@ def cmd_gate(a: argparse.Namespace) -> None:
                   **{"pass": all(v["pass"] for v in scores.values())})
     (out / "gates.json").write_text(json.dumps(record, indent=1) + "\n")
     print("| gate | result | metrics | why |\n|---|---|---|---|")
+    skip = ("pass", "why", "cer_lang", "by_concurrency", "peer", "note")
+    fmt = lambda v: ", ".join(f"{m}={val:.4g}" if isinstance(val, float) else f"{m}={val}"
+                              for m, val in v.items() if m not in skip)
     for k, v in scores.items():
-        metrics = ", ".join(f"{m}={val:.4g}" if isinstance(val, float) else f"{m}={val}"
-                            for m, val in v.items() if m not in ("pass", "why", "cer_lang"))
-        print(f"| {k} | {'PASS' if v['pass'] else '**FAIL**'} | {metrics} | {'; '.join(v['why'])} |")
+        print(f"| {k} | {'PASS' if v['pass'] else '**FAIL**'} | {fmt(v)} | {'; '.join(v['why'])} |")
+        for c, row in v.get("by_concurrency", {}).items():
+            print(f"| {k} @{c} | {'PASS' if row['pass'] else '**FAIL**'} | {fmt(row)} | {'; '.join(row['why'] + ([row['note']] if row.get('note') else []))} |")
     if not record["pass"]:
         sys.exit(1)
 
