@@ -1012,6 +1012,11 @@ pub struct EmitConfig {
     #[arg(long, env = "PLOW_GLM_HC_PRE_TAIL", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
     pub glm_hc_pre_tail: bool,
 
+    /// GLM-5.3-Flash batched decode (rows > 1): largest split-K factor for the bf16 GemmSmall
+    /// projections whose 64x128 tiles leave most workgroups idle (0 = off). NOT bit-identical.
+    #[arg(long, env = "PLOW_GLM_DEC_SPLITK")]
+    pub glm_dec_splitk: Option<u32>,
+
     /// GLM batched decode: the shared expert's elementwise Glu spans rows * I / 512 workgroups
     /// instead of one. Bit-identical.
     #[arg(long, env = "PLOW_GLM_DECODE_GLU_ROWS", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
@@ -1726,6 +1731,7 @@ impl EmitConfig {
             glm_hc_norm_fold: env_bool("PLOW_GLM_HC_NORM_FOLD"),
             glm_hc_post_fold: env_bool("PLOW_GLM_HC_POST_FOLD"),
             glm_hc_pre_tail: env_bool("PLOW_GLM_HC_PRE_TAIL"),
+            glm_dec_splitk: env_u32("PLOW_GLM_DEC_SPLITK"),
             glm_decode_glu_rows: env_bool("PLOW_GLM_DECODE_GLU_ROWS"),
             glm_pf_ns: env_u32("PLOW_GLM_PF_NS"),
             glm_router_overlap: env_u32("PLOW_GLM_ROUTER_OVERLAP"),
