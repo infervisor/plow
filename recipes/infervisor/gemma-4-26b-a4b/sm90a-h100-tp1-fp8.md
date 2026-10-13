@@ -81,6 +81,7 @@ nix develop --command env \
 #   timeout_s = 2400
 #   kl_over_slack = 0.02
 #   cont_decisive_drop_max = 0.045
+#   top1_drop_max = 0.015
 
 # llm_fp32_ref_long
 #   reference = {env:G26_FP8_FP32_REF_LONG}
