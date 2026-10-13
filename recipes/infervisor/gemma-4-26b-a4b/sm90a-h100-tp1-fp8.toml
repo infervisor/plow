@@ -159,14 +159,16 @@ reference = "{env:G26_FP8_FP32_REF}"
 vllm_capture = "{env:G26_FP8_FP32_VLLM}"
 concurrency = 16
 timeout_s = 2400
-# Measured c16 margins (2026-10-13, seven runs of the production packet 5ce87bd28db1 and its b44ca43f
-# re-emit 2df5a8b84f05 on the d550daaf and 6af0b02c plowrts, one vLLM peer capture): positions over
-# 0.1 nat 209-224 of 1175 against the peer's 206 (the 0.005 default is 6 positions, below the FP8
-# c16 re-roll), decisive free-run flips 35-39 cases of 46 against the peer's 37 (two cases). Every
-# run holds kl_mean 0.195-0.231 vs 0.202, trimmed 0.124-0.153 vs 0.124, p95 0.91-1.03 vs 0.89,
-# needles 18/18; one unpinned-algorithm run missed top1_decisive by 0.004 beyond its margin.
+# Measured c16 margins (2026-10-13, nine runs of the production packet 5ce87bd28db1 and its re-emit
+# 2df5a8b84f05 on the d550daaf, 6af0b02c and dd373818 plowrts, one vLLM peer capture): positions
+# over 0.1 nat 209-224 of 1175 against the peer's 206 (the 0.005 default is 6 positions, below the
+# FP8 c16 re-roll), decisive free-run flips 35-39 cases of 46 against the peer's 37 (two cases),
+# top1_decisive 0.9522-0.9632 against the peer's 0.9662 (3-14 of 1005 decisive positions; the 0.01
+# default failed 2 of 9 runs by 1 and 4 positions). Every run holds kl_mean 0.195-0.231 vs 0.202,
+# trimmed 0.124-0.153 vs 0.124, p95 0.91-1.08 vs 0.89, needles 18/18.
 kl_over_slack = 0.02
 cont_decisive_drop_max = 0.045
+top1_drop_max = 0.015
 [gates.llm_fp32_ref_long]
 reference = "{env:G26_FP8_FP32_REF_LONG}"
 vllm_capture = "{env:G26_FP8_FP32_VLLM_LONG}"
