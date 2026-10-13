@@ -697,6 +697,7 @@ pub const RUNTIME: &[KnobSpec] = &[
     KnobSpec::new("rt.lm_row0", Some("PLOW_LM_ROW0"), Layer::Runtime, Domain::Bool, OFF, DIAG),
     KnobSpec::new("rt.mla_pf_v2", Some("PLOW_MLA_PF_V2"), Layer::Runtime, Domain::Bool, ON, PROMOTED).with(C_MLA_PF_V2),
     KnobSpec::new("rt.mla_pf_aiter", Some("PLOW_MLA_PF_AITER"), Layer::Runtime, Domain::Bool, OFF, OPT_IN),
+    KnobSpec::new("rt.mla_pf_dense", Some("PLOW_MLA_PF_DENSE"), Layer::Runtime, Domain::Bool, OFF, OPT_IN),
     KnobSpec::new("rt.moe_aiter_tile64", Some("PLOW_MOE_AITER_TILE64"), Layer::Runtime, Domain::Bool, UNSET, OPT_IN),
     KnobSpec::new("rt.moe_aiter_xcd", Some("PLOW_MOE_AITER_XCD"), Layer::Runtime, Domain::Bool, UNSET, OPT_IN),
     KnobSpec::new("rt.moe_stage1_a4_reuse", Some("PLOW_MOE_STAGE1_A4_REUSE"), Layer::Runtime, Domain::Bool, ON, PROMOTED),
@@ -963,6 +964,11 @@ mod tests {
     /// Every `cannot combine` / `requires PLOW_` site in devgen and plowrt, and what encodes it.
     /// The asserts stay as defence; this keeps a new one from landing unencoded.
     const ASSERT_SITES: &[(&str, &str, Site)] = &[
+        (
+            "mla.rs",
+            "PLOW_MOE_DEC_W8A8 requires PLOW_MOE_PF_W8A8",
+            Site::Encoded("moe_dec_w8a8_contract"),
+        ),
         (
             "mla.rs",
             "PLOW_MOE_PF_W8A8_SPLIT requires PLOW_MOE_PF_W8A8",

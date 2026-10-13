@@ -760,9 +760,47 @@ fn emit_glm53_hc_pre(
                 && steps % sp == 0
                 && rows * 24 * sp <= b.n_cu()
         });
-    let tail = (band.is_none() && rows == 1 && emit_config::active().glm_hc_pre_tail).then(|| {
+    // PLOW_GLM_HC_FUSE_DEC (batched decode, post folded): the pre runs per row group on the
+    // mix's last-arriving workgroup. fuse_r = 0: a workgroup per output (rows * 24 <= CUs);
+    // R > 0: a workgroup per (R rows, 8 outputs) with ceil(rows / R) * 3 <= CUs.
+    // PLOW_GLM_HC_FUSE_R1: the one-row program takes the same arm (24 workgroups, the 232 idle
+    // ones no longer bump the tail counter) instead of the pre tail on the whole grid.
+    let fuse_r = (band.is_none()
+        && (rows > 1 || emit_config::active().glm_hc_fuse_r1)
+        && post_fold.is_some()
+        && emit_config::active().glm_hc_fuse_dec
+        && c.hidden % 1024 == 0)
+        .then(|| {
+            if rows * 24 <= b.n_cu() {
+                // Variant bit 16: narrow batched rungs keep the post fold + pre packet.
+                let v = emit_config::active().glm_hc_fuse_variant.unwrap_or(0);
+                (rows == 1 || v & 16 == 0).then_some(0)
+            } else {
+                // Variant bit 4: one row per unit even past the grid (units loop over
+                // workgroups), so no tail runs two rows serially.
+                if emit_config::active().glm_hc_fuse_variant.unwrap_or(0) & 4 != 0 {
+                    return Some(1);
+                }
+                [1u32, 2, 4].into_iter().find(|&r| rows.div_ceil(r) * 3 <= b.n_cu())
+            }
+        })
+        .flatten();
+    // Variant bit 8 (rows arm only): post + mix in the fused packet, the pre as its own packet
+    // (i4 = 4), so no workgroup bumps a tail counter and no tail runs rows serially.
+    let no_tail = fuse_r.is_some_and(|r| r > 0)
+        && emit_config::active().glm_hc_fuse_variant.unwrap_or(0) & 8 != 0;
+    let tail = (band.is_none()
+        && ((rows == 1 && emit_config::active().glm_hc_pre_tail) || fuse_r.is_some())
+        && !no_tail)
+    .then(|| {
         let side = if ffn { "ffn" } else { "attn" };
-        let ctr = b.tensor(&format!("act.hc_pre_tail.{layer}.{side}.ctr"), 4);
+        let ctr = match fuse_r {
+            None => b.tensor(&format!("act.hc_pre_tail.{layer}.{side}.ctr"), 4),
+            Some(r) => b.tensor(
+                &format!("act.hc_fuse.{rows}.{layer}.{side}.ctr"),
+                u64::from(rows.div_ceil(r.max(1))) * 4,
+            ),
+        };
         let (fold, nout, gamma) = norm_fold.map_or((0, 0, 0), |(o, g)| (1, o, g));
         let words = [
             post_mix,
@@ -786,12 +824,18 @@ fn emit_glm53_hc_pre(
             words.extend([part, sp]);
         }
         let bytes: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
-        b.tensor_init(&format!("act.hc_pre_tail.{layer}.{side}.desc"), bytes)
+        let name = match fuse_r {
+            None => format!("act.hc_pre_tail.{layer}.{side}.desc"),
+            Some(_) => format!("act.hc_fuse.{rows}.{layer}.{side}.desc"),
+        };
+        b.tensor_init(&name, bytes)
     });
     // PLOW_GLM_HC_MIX_SPLIT=S: a folded mix packet runs on the workgroups that own an output
     // (rows * 24) instead of the whole grid; with the one-row pre tail each output's K steps are
     // also split over S workgroups (i4 = 2) and reduced in step order by the last one.
     let cus = match (split, tail, post_fold) {
+        _ if fuse_r == Some(0) => (0..rows * 24).collect(),
+        _ if fuse_r.is_some() => (0..rows.div_ceil(fuse_r.unwrap_or(1)) * 3).collect(),
         (Some(sp), Some(_), Some(_)) => (0..24 * sp).collect(),
         (Some(_), None, Some(_)) => (0..rows * 24).collect(),
         _ => b.all(),
@@ -812,8 +856,20 @@ fn emit_glm53_hc_pre(
             d.t[5] = post_mix;
             d.t[6] = comb_mix;
         }
+        if no_tail {
+            d.i[4] = 4;
+            d.i[5] = fuse_r.unwrap_or(1);
+            d.i[6] = emit_config::active().glm_hc_fuse_variant.unwrap_or(0) & 2;
+        }
         if let Some(desc) = tail {
             d.i[4] = if split.is_some() && post_fold.is_some() { 2 } else { 1 };
+            if let Some(r) = fuse_r {
+                d.i[4] = 3;
+                d.i[5] = r;
+                // PLOW_GLM_HC_FUSE_VARIANT bits: 1 = register-resident pre + norm tail,
+                // 2 = W walked 8 steps per batch (rows arm). Both bit-identical.
+                d.i[6] = emit_config::active().glm_hc_fuse_variant.unwrap_or(0);
+            }
             d.t[7] = desc;
         }
     });
@@ -988,7 +1044,11 @@ fn emit_glm53_program(
     let post_fold_on = !prefill
         && bv.is_none()
         && emit_config::active().glm_hc_post_fold
-        && rows * 24 <= b.n_cu();
+        && (rows * 24 <= b.n_cu()
+            || (rows > 1
+                && emit_config::active().glm_hc_fuse_dec
+                && c.hidden % 1024 == 0
+                && rows.div_ceil(4) * 3 <= b.n_cu()));
     let mut pending_post: Option<(u32, u32)> = None;
     let xr_hcpost = !prefill && bv.is_none() && c.tp > 1 && emit_config::active().glm_xr_hcpost;
     for l in 0..c.layers as usize {
@@ -1184,7 +1244,11 @@ fn emit_glm53_program(
                 },
             )
         };
-        let c_ffn = if c.is_dense(l as u32) {
+        let c_ffn = if c.is_dense(l as u32) && prefill && rows > 1 {
+            emit_glm_dense_ffn_rows(
+                b, c, n, l, rows, enc, n.xnext, c_norm, &mut xgate, &xr, true, true,
+            )
+        } else if c.is_dense(l as u32) {
             emit_glm_dense_ffn(
                 b, c, n, l, rows, enc, n.xnext, c_norm, &mut xgate, &xr, true,
             )
@@ -1416,6 +1480,7 @@ pub(crate) fn glm53_emit_full(
             b.set_gemm_small_splitk(ec.glm_dec_splitk.unwrap_or(0));
             b.set_gemm_small_splitk_2p(ec.glm_dec_splitk_2p);
         }
+        b.set_gemm_small_group_s(ec.glm_kda_proj_group_s.unwrap_or(0));
         emit_glm53_program(&mut b, &c, &n, &s, ctx, rows, dbatch, enc, false);
         let prog = b.finish();
         tensors = prog.tensors.clone();
@@ -2214,6 +2279,16 @@ fn glm_moe_pf_w8a8(c: &GlmCfg, enc: MoeEnc, native_moe: bool, tk: u32, imoe_e: u
     true
 }
 
+/// `PLOW_MOE_DEC_W8A8`: the grouped decode rungs (rows > 1) take the W8A8 pair too.
+fn glm_moe_dec_w8a8() -> bool {
+    let on = emit_config::active().moe_dec_w8a8;
+    assert!(
+        !on || emit_config::active().moe_pf_w8a8,
+        "PLOW_MOE_DEC_W8A8 requires PLOW_MOE_PF_W8A8"
+    );
+    on
+}
+
 /// `PLOW_MOE_PF_W8A8_SPLIT`: the W8A8 pair runs two-term (hi + lo/16) fp8 activations.
 fn glm_moe_pf_w8a8_split() -> bool {
     let on = emit_config::active().moe_pf_w8a8_split;
@@ -2631,6 +2706,8 @@ struct GlmLW {
     qad_s: u32,
     qkva: u32,
     qkva_s: u32,
+    /// `PLOW_GLM_PF_QKVA_GROUP`: `[q_a | kv_a_latent]` bf16 rows (loader-stacked), NoPE only.
+    qkva_cat: u32,
     qb: u32,
     qb_s: u32,
     wk: u32,
@@ -4409,6 +4486,24 @@ fn declare_glm_rows_batched_for_prefill(
             } else {
                 TENSOR_NONE
             },
+            qkva_cat: if mla
+                && emit_config::active().glm_pf_qkva_group
+                && dr == 0
+                && !qkva_w8a8
+                && !blk.any()
+                && enc != MoeEnc::Mxfp4
+                && !c.quark_mixed
+                && crate::emit_is_amd()
+                && crate::amd_target::active().1 == hwspec::IsaLevel::Gfx950
+            {
+                t(
+                    b,
+                    "self_attn.derived.qkv_a_cat.weight",
+                    (ql + dk) as u64 * h as u64 * BF16,
+                )
+            } else {
+                TENSOR_NONE
+            },
             qkva_s: if mla && qkva_w8a8 {
                 q8s(
                     b,
@@ -5260,6 +5355,24 @@ pub(crate) fn emit_glm_mla(
             }
         });
         (c_fa, c_fa, c_fa)
+    } else if let Some(g) = (dr == 0
+        && !mx
+        && emit_config::active().glm_kda_proj_group
+        && !glm_decode_lt_routes(rows, [ql, h])
+        && !glm_decode_lt_routes(rows, [dk, h])
+        && glm_decode_gemm_tile(rows, ql, h, b.n_cu()) == Some(DevOp::GemmSmall)
+        && glm_decode_gemm_tile(rows, dk, h, b.n_cu()) == Some(DevOp::GemmSmall))
+    .then(|| {
+        // PLOW_GLM_KDA_PROJ_GROUP: the NoPE q_a / kv_a pair (both from xn) as one group.
+        b.emit_gemm_small_group(
+            rows,
+            &[(n.qlr, n.xn, w.qad, ql, h), (n.ckvraw, n.xn, w.ckvd, dk, h)],
+            &[c_rn1],
+        )
+    })
+    .flatten()
+    {
+        (g, g, g)
     } else {
         (
             gemv(b, n.qlr, n.xn, w.qad, w.qad_s, ql, h, &[c_rn1]),
@@ -8584,6 +8697,22 @@ pub(crate) fn emit_glm_mla_prefill(
             }
         });
         (done, done, norm)
+    } else if w.qkva_cat != TENSOR_NONE && t > 1 {
+        let g = b.emit(DevOp::GemmGroupPf, vec![0], &[c_rn1], |d| {
+            d.t[..4].copy_from_slice(&[n.xn, w.qkva_cat, n.qlr, n.ckvraw]);
+            d.t[4..].fill(TENSOR_NONE);
+            d.i[..4].copy_from_slice(&[t, h, ql, dk]);
+        });
+        b.isolate(g);
+        let c_rnq = b.emit(DevOp::RmsNorm, pf_wide_cus(n_cu, t), &[g], |d| {
+            d.t[0] = n.qlat;
+            d.t[1] = n.qlr;
+            d.t[2] = w.gqa;
+            d.i[0] = t;
+            d.i[1] = ql;
+            d.f[0] = eps;
+        });
+        (g, g, c_rnq)
     } else {
         let blk_qad = emit_glm_blk_gemm(
             b,
@@ -8674,6 +8803,18 @@ pub(crate) fn emit_glm_mla_prefill(
         .then(|| emit_glm_mla_query_w8a8(b, &all, n, w, t, c_rnq, mla_mha, pf_norm_q));
     let c_qa = match fp8_q.map(|(done, _)| (done, done)).or(rowband_q) {
         Some((c_qa, _)) => c_qa,
+        None if w.qkva_cat != TENSOR_NONE && emit_config::active().pf_gemm_route_all => {
+            crate::kda::emit_pf_gemm_route(
+            b,
+            n.qa,
+            n.qlat,
+            w.wqa,
+            t,
+            nh_l * dk,
+            ql,
+            &[c_rnq],
+            )
+        }
         None => gemm(b, n.qa, n.qlat, w.wqa, w.wqa_s, nh_l * dk, ql, &[c_rnq]),
     };
     // PLOW_GLM_FUSE_POST: the q RoPE rides the q_rope `GemmMed` store (t3..t5, i3 = first roped
@@ -9185,7 +9326,11 @@ pub(crate) fn emit_glm_mla_prefill(
         } else if lt_ext.o_proj && enc != MoeEnc::Mxfp4 {
             emit_glm_lt_ext(b, c, out, n.oat, w.wo, t, t, [h, nh_l * vd], deps)
         } else {
-            gemm(b, out, n.oat, w.wo, w.wo_s, h, nh_l * vd, deps)
+            if w.qkva_cat != TENSOR_NONE && emit_config::active().pf_gemm_route_all {
+                crate::kda::emit_pf_gemm_route(b, out, n.oat, w.wo, t, h, nh_l * vd, deps)
+            } else {
+                gemm(b, out, n.oat, w.wo, w.wo_s, h, nh_l * vd, deps)
+            }
         }
     };
     let no_xr = tp > 1 && emit_config::active().no_xreduce;
@@ -9891,14 +10036,16 @@ fn emit_glm_moe_ffn_prefill(
         // Same predicate as the scratch declaration (`rows > 1`), or the tensors are absent.
         let pf_w8a8 = t > 1 && glm_moe_pf_w8a8(c, enc, native_moe, tk, imoe_e, h);
         let pf_split = pf_w8a8 && glm_moe_pf_w8a8_split();
-        let c_x = if pf_w8a8 && !pf_split {
+        let pf_fq = pf_w8a8 && !pf_split && emit_config::active().moe_pf_w8a8_fq;
+        let c_x = if pf_w8a8 && !pf_split && !pf_fq {
             b.emit(
                 DevOp::QuantFp8Block128,
                 glm_quant128_cus(&all, t, h),
                 &[c_rn2],
                 |d| {
                     d.t[..3].copy_from_slice(&[n.routed_xq, n.xn2, n.routed_xs]);
-                    d.i[..2].copy_from_slice(&[t, h]);
+                    // i2 = the scale pitch the W8A8 GLU reads xs at (its i4 = t).
+                    d.i[..3].copy_from_slice(&[t, h, t]);
                 },
             )
         } else {
@@ -9929,10 +10076,10 @@ fn emit_glm_moe_ffn_prefill(
             // W8A8: A = the 1x128 fp8 rows + their [H/128][T] scales; the GLU writes fp8 `fu_g`
             // and its own 1x128 scales into `fu_scale`.
             // SPLIT: A stays the bf16 `xn2`; `fu_g` (bf16-sized) takes the [hi | lo] fp8 rows.
-            if pf_split {
+            if pf_split || pf_fq {
                 d.t[7] = n.fu_scale;
                 d.i[4] = t;
-                d.i[7] = 4;
+                d.i[7] = if pf_split { 4 } else { 6 };
             } else if pf_w8a8 {
                 d.t[1] = n.routed_xq;
                 d.t[6] = n.routed_xs;
@@ -10963,9 +11110,24 @@ fn emit_glm_moe_ffn_rows(
                 },
             )
         };
-        let [c_g, c_u] = match pre_gu {
-            Some(pre) => pre,
-            None => [
+        // PLOW_GLM_KDA_PROJ_GROUP: the shared gate/up GemmSmall pair as one grouped packet pair.
+        let group = (pre_gu.is_none()
+            && emit_config::active().glm_kda_proj_group
+            && enc != MoeEnc::Mxfp4
+            && !glm_decode_lt_routes(rows, [imoe_l, h])
+            && glm_decode_gemm_tile(rows, imoe_l, h, b.n_cu()) == Some(DevOp::GemmSmall))
+        .then(|| {
+            b.emit_gemm_small_group(
+                rows,
+                &[(n.shfu, n.xn2, w.shg, imoe_l, h), (n.shfu_up, n.xn2, w.shu, imoe_l, h)],
+                &[c_rn2],
+            )
+        })
+        .flatten();
+        let [c_g, c_u] = match (pre_gu, group) {
+            (Some(pre), _) => pre,
+            (None, Some(g)) => [g, g],
+            (None, None) => [
                 gemv_half(b, n.shfu, w.shg, w.shg_s),
                 gemv_half(b, n.shfu_up, w.shu, w.shu_s),
             ],
@@ -11081,7 +11243,26 @@ fn emit_glm_moe_ffn_rows(
         b.isolate(counter);
         counter
     } else {
-        let c_g = b.emit(DevOp::MoeGroupGluPf, all.clone(), &[c_routes, c_rn2], |d| {
+        let pf_w8a8 = !dfold
+            && !det
+            && glm_moe_dec_w8a8()
+            && glm_moe_pf_w8a8(c, enc, false, tk, imoe_e, h);
+        let pf_split = pf_w8a8 && glm_moe_pf_w8a8_split();
+        let pf_fq = pf_w8a8 && !pf_split && emit_config::active().moe_pf_w8a8_fq;
+        let c_x = if pf_w8a8 && !pf_split && !pf_fq {
+            b.emit(
+                DevOp::QuantFp8Block128,
+                glm_quant128_cus(&all, rows, h),
+                &[c_rn2],
+                |d| {
+                    d.t[..3].copy_from_slice(&[n.routed_xq, n.xn2, n.routed_xs]);
+                    d.i[..3].copy_from_slice(&[rows, h, rows]);
+                },
+            )
+        } else {
+            c_rn2
+        };
+        let c_g = b.emit(DevOp::MoeGroupGluPf, all.clone(), &[c_routes, c_x], |d| {
             d.t[0] = n.fu_g;
             d.t[1] = n.xn2;
             d.t[2] = w.ewt;
@@ -11099,6 +11280,17 @@ fn emit_glm_moe_ffn_rows(
             let (act, limit) = glm_glu_act(c);
             d.i[5] = act;
             d.f[1] = limit;
+            if pf_split || pf_fq {
+                d.t[7] = n.fu_scale;
+                d.i[4] = rows;
+                d.i[7] = if pf_split { 4 } else { 6 };
+            } else if pf_w8a8 {
+                d.t[1] = n.routed_xq;
+                d.t[6] = n.routed_xs;
+                d.t[7] = n.fu_scale;
+                d.i[4] = rows;
+                d.i[7] = 2;
+            }
         });
         b.emit(DevOp::MoeGroupDownPf, all.clone(), &[c_g], |d| {
             d.t[0] = n.part;
@@ -11117,6 +11309,10 @@ fn emit_glm_moe_ffn_rows(
             d.i[MoeEnc::PREFILL_SLOT] = enc.code();
             if det {
                 d.i[5] = tk.trailing_zeros() + 1;
+            }
+            if pf_w8a8 {
+                d.t[5] = n.fu_scale;
+                d.i[7] = if pf_split { 4 } else { 2 };
             }
         })
     };
@@ -11756,7 +11952,7 @@ pub(crate) fn emit_glm_dense_ffn(
         // does (`emit_glm_dense_block_prefill`: n_exp = 1, top_k = 1, align synthesises the
         // routing), with the decode-shaped one-shot TP seam.
         return emit_glm_dense_ffn_rows(
-            b, c, n, slot, rows, enc, x_out, c_rn2, xgate, xr_cus, raw_output,
+            b, c, n, slot, rows, enc, x_out, c_rn2, xgate, xr_cus, raw_output, false,
         );
     }
     let all = b.all();
@@ -11934,6 +12130,7 @@ fn emit_glm_dense_ffn_rows(
     xgate: &mut u32,
     xr_cus: &[u32],
     raw_output: bool,
+    prefill: bool,
 ) -> u32 {
     if enc == MoeEnc::Mxfp4 && !c.quark_mixed {
         return emit_glm_dense_mxfp4_rows(
@@ -11963,7 +12160,28 @@ fn emit_glm_dense_ffn_rows(
         d.i[1] = DENSE_N_EXP;
         d.i[2] = DENSE_TOP_K;
     });
-    let c_g = b.emit(DevOp::MoeGroupGluPf, all.clone(), &[c_align, c_rn2], |d| {
+    // PLOW_MOE_PF_W8A8 covers the dense FFN of a PREFILL program too (vLLM runs layers 0-2 W8A8
+    // like the experts): the same op pair over one expert on the routed scratch. Never decode:
+    // decode objects carry no W8A8 arm.
+    let pf_w8a8 = (prefill || glm_moe_dec_w8a8())
+        && rows > 1
+        && glm_moe_pf_w8a8(c, enc, false, DENSE_TOP_K, di_l, h);
+    let pf_split = pf_w8a8 && glm_moe_pf_w8a8_split();
+    let pf_fq = pf_w8a8 && !pf_split && emit_config::active().moe_pf_w8a8_fq;
+    let c_x = if pf_w8a8 && !pf_split && !pf_fq {
+        b.emit(
+            DevOp::QuantFp8Block128,
+            glm_quant128_cus(&all, rows, h),
+            &[c_rn2],
+            |d| {
+                d.t[..3].copy_from_slice(&[n.routed_xq, n.xn2, n.routed_xs]);
+                d.i[..3].copy_from_slice(&[rows, h, rows]);
+            },
+        )
+    } else {
+        c_rn2
+    };
+    let c_g = b.emit(DevOp::MoeGroupGluPf, all.clone(), &[c_align, c_x], |d| {
         d.t[0] = n.fu_g;
         d.t[1] = n.xn2;
         d.t[2] = w.dwt;
@@ -11981,6 +12199,17 @@ fn emit_glm_dense_ffn_rows(
         let (act, limit) = glm_glu_act(c);
         d.i[5] = act;
         d.f[1] = limit;
+        if pf_split || pf_fq {
+            d.t[7] = n.fu_scale;
+            d.i[4] = rows;
+            d.i[7] = if pf_split { 4 } else { 6 };
+        } else if pf_w8a8 {
+            d.t[1] = n.routed_xq;
+            d.t[6] = n.routed_xs;
+            d.t[7] = n.fu_scale;
+            d.i[4] = rows;
+            d.i[7] = 2;
+        }
     });
     let c_d = b.emit(DevOp::MoeGroupDownPf, all.clone(), &[c_g], |d| {
         d.t[0] = n.part;
@@ -11997,6 +12226,10 @@ fn emit_glm_dense_ffn_rows(
         d.i[1] = di_l;
         d.i[2] = DENSE_N_EXP;
         d.i[MoeEnc::PREFILL_SLOT] = enc.code();
+        if pf_w8a8 {
+            d.t[5] = n.fu_scale;
+            d.i[7] = if pf_split { 4 } else { 2 };
+        }
     });
     let no_xr = tp > 1 && emit_config::active().no_xreduce;
     if tp > 1 && !no_xr {
