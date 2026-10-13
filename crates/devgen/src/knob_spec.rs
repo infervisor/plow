@@ -1362,7 +1362,7 @@ pub const RAW_ENV: &[KnobSpec] = &[
     KnobSpec::new("env.PLOW_BENCH_SHAPE", Some("PLOW_BENCH_SHAPE"), Layer::RawEnv, Domain::Str, UNSET, DIAG),
     KnobSpec::new("env.PLOW_GEMV_MFMA4", Some("PLOW_GEMV_MFMA4"), Layer::RawEnv, Domain::Bool, OFF, OPT_IN),
     KnobSpec::new("env.PLOW_GATE_HIER_PF", Some("PLOW_GATE_HIER_PF"), Layer::RawEnv, Domain::Bool, OFF, OPT_IN),
-    KnobSpec::new("env.PLOW_MLA_PF_TR16", Some("PLOW_MLA_PF_TR16"), Layer::RawEnv, Domain::Bool, OFF, OPT_IN),
+    KnobSpec::new("env.PLOW_MLA_PF_TR16", Some("PLOW_MLA_PF_TR16"), Layer::RawEnv, Domain::Bool, UNSET, OPT_IN),
     KnobSpec::new("env.PLOW_MLA_PF_SCALE_HOIST", Some("PLOW_MLA_PF_SCALE_HOIST"), Layer::RawEnv, Domain::Bool, OFF, OPT_IN),
     KnobSpec::new("env.PLOW_QKVA_WAVE1", Some("PLOW_QKVA_WAVE1"), Layer::RawEnv, Domain::Bool, OFF, OPT_IN),
     KnobSpec::new("env.PLOW_MOE_PF_A4W4_BK", Some("PLOW_MOE_PF_A4W4_BK"), Layer::RawEnv, U32, UNSET, OPT_IN),
