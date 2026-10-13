@@ -1085,9 +1085,12 @@ enum PrefillSegmentRoute {
         tens: [u16; 8],
     },
     /// [`DevOp::GemmGroupPf`]: grouped prefill projection, one workgroup per output tile.
+    /// `tens`: the instruction's operand handles; their addresses are re-read from the live
+    /// tensor table at each launch (band views rebind per chunk).
     GemmGroup {
         args: GemmGroupArgs,
         grid: u32,
+        tens: [u16; 8],
     },
     /// The register-state carry fed with the preceding lean Wu's scaled-key pair.
     KdaChunkCarryKeyfeed {
@@ -1640,7 +1643,6 @@ fn rebase_kda_key_factor_routes(routes: &mut [PrefillSegmentRoute], t: u32) {
             PrefillSegmentRoute::KdaChunkKeyFactorCarry { args, .. } => args.t = t,
             PrefillSegmentRoute::KdaChunkCarryRegstate { args, .. } => args.t = t,
             PrefillSegmentRoute::KdaChunkWuLean { args, .. } => args.t = t,
-            PrefillSegmentRoute::GemmGroup { args, .. } => args.t = t,
             PrefillSegmentRoute::KdaChunkCarryKeyfeed { args, .. } => args.t = t,
             // The intra objects anchor each diagonal block's gate at a row inside the chunk's
             // valid rows; at the bucket width a ragged last chunk anchors on stale rows.
@@ -1894,6 +1896,7 @@ fn promote_gemm_group_routes(
                 n,
             },
             grid: gemm_group_grid(d.i[0], &n),
+            tens: d.t,
         };
     }
     Ok(())
@@ -12690,6 +12693,39 @@ impl AmdEngine {
             self.seg_launches += 3;
             return Ok(());
         }
+        // Class A (row-pure over the dense live rows): runs whether or not a packed binding is
+        // staged, like the hipBLASLt route below.
+        if let Some(PrefillSegmentRoute::GemmGroup { args, grid, tens }) =
+            self.progs[p].prefill_routes.get(seg).copied()
+        {
+            let kernel = self.k_gemm_group.ok_or_else(|| {
+                RuntimeError::Device("grouped GEMM segment has no validated object".into())
+            })?;
+            let grid = self.seg_route_grid(p, seg, grid);
+            let addr = |h: u16| {
+                let at = usize::from(h) * 8;
+                u64::from_le_bytes(self.tens_table[at..at + 8].try_into().unwrap())
+            };
+            let mut args = args;
+            args.x = addr(tens[0]);
+            args.w = addr(tens[1]);
+            for g in 0..6 {
+                if args.n[g] != 0 {
+                    args.c[g] = addr(tens[2 + g]);
+                }
+            }
+            EngineDevice::launch_kernel(
+                &*self.be,
+                kernel,
+                grid,
+                512,
+                0,
+                as_bytes(std::slice::from_ref(&args)),
+                None,
+            )?;
+            self.seg_launches += 1;
+            return Ok(());
+        }
         if let Some(PrefillSegmentRoute::GemmLt(route)) =
             self.progs[p].prefill_routes.get(seg).copied()
         {
@@ -12970,25 +13006,6 @@ impl AmdEngine {
                     kernel,
                     grid,
                     256,
-                    0,
-                    as_bytes(std::slice::from_ref(&args)),
-                    None,
-                )?;
-                self.seg_launches += 1;
-                return Ok(());
-            }
-            if let Some(PrefillSegmentRoute::GemmGroup { args, grid }) =
-                self.progs[p].prefill_routes.get(seg).copied()
-            {
-                let kernel = self.k_gemm_group.ok_or_else(|| {
-                    RuntimeError::Device("grouped GEMM segment has no validated object".into())
-                })?;
-                let grid = self.seg_route_grid(p, seg, grid);
-                EngineDevice::launch_kernel(
-                    &*self.be,
-                    kernel,
-                    grid,
-                    512,
                     0,
                     as_bytes(std::slice::from_ref(&args)),
                     None,
@@ -14279,6 +14296,9 @@ impl AmdEngine {
             }
             if let PrefillSegmentRoute::IndexTp(route) = route {
                 route.rebase(rows)?;
+            }
+            if let PrefillSegmentRoute::GemmGroup { args, .. } = route {
+                args.t = rows;
             }
             if let PrefillSegmentRoute::GemmLt(route) = route {
                 route.rebase(rows)?;
