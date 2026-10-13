@@ -132,6 +132,53 @@
             platforms = [ "x86_64-linux" ];
           };
         };
+        # ROCm 10.0 (clang-23, newer LLVM than 7.14.1) for gfx950 codegen A/Bs, via
+        # `nix develop .#rocm10`. AMD ships 10.0 only as apt packages (no TheRock
+        # tarball), and this pin is the PRERELEASE 10.0.0~pre4 from the 26.14 repo.
+        # Compile-only: the shell keeps the 7.14.1 runtime libraries.
+        rocm10Version = "10.0.0-pre4";
+        rocm10 = pkgs.stdenv.mkDerivation {
+          pname = "rocm-gfx950-apt";
+          version = rocm10Version;
+          srcs = map
+            ({ name, sha256 }: pkgs.fetchurl {
+              url = "https://repo.radeon.com/rocmradeon/apt/26.14/pool/main/a/${name}/${name}_10.0.0%7epre4-32424980240_amd64.deb";
+              inherit sha256;
+            })
+            [
+              { name = "amdrocm-base10.0"; sha256 = "23ce8b26903db45ef47b12e69c37314ad24fe3eb1f9b3f58765232467f7257a5"; }
+              { name = "amdrocm-llvm10.0"; sha256 = "e8ca0035f271518d606977e1d3cb3397b455b0729746bf43671053c14345195f"; }
+              { name = "amdrocm-runtime10.0"; sha256 = "19f01bf23f0b89d97c296c02753b4666fec466118153997a31e00130ddb1c0f3"; }
+              { name = "amdrocm-runtime-dev10.0"; sha256 = "7a382a0b5da927341758603e4700cecb4f3dc0edf069a0078516ab005a18677e"; }
+              { name = "amdrocm-sysdeps10.0"; sha256 = "ad9623365b125cbc69978e482edfa4c95215dff928e6e319c852a53d61348c79"; }
+            ];
+          dontUnpack = true;
+          nativeBuildInputs = [ pkgs.autoPatchelfHook pkgs.dpkg ];
+          buildInputs = rocm.buildInputs;
+          autoPatchelfIgnoreMissingDeps = true;
+          dontStrip = true;
+          installPhase = ''
+            runHook preInstall
+            mkdir -p root $out
+            for d in $srcs; do dpkg-deb -x "$d" root; done
+            cp -a root/opt/rocm/core-10.0/. $out/
+            gccdir=$(echo ${pkgs.gcc-unwrapped}/lib/gcc/*/*)
+            for dir in $out/bin $out/lib/llvm/bin; do
+              for c in clang clang++ clang-23 clang-cpp amdclang amdclang++ amdclang-cpp; do
+                [ -e "$dir/$c" ] || continue
+                printf -- '--gcc-install-dir=%s\n-idirafter %s\n' \
+                  "$gccdir" "${pkgs.glibc.dev}/include" > "$dir/$c.cfg"
+              done
+            done
+            runHook postInstall
+          '';
+          meta = {
+            description = "ROCm ${rocm10Version} gfx950 compiler (apt prerelease, clang-23)";
+            platforms = [ "x86_64-linux" ];
+          };
+        };
+        rocm10LlvmBin = "${rocm10}/lib/llvm/bin";
+        hip10DeviceLibPath = "${rocm10}/lib/llvm/amdgcn/bitcode";
         # Classic /opt/rocm layout: bundler and llvm-readelf share lib/llvm/bin
         # (hipcc_hsaco.sh finds readelf next to the bundler via dirname).
         rocmLlvmBin = "${rocm}/lib/llvm/bin";
@@ -611,6 +658,24 @@
             '';
           };
 
+        }
+        # `nix develop .#rocm10`: the default shell with the ROCm 10.0 compiler for
+        # object builds (hipcc, bundler, readelf, device bitcode); runtime stays 7.14.1.
+        // pkgs.lib.optionalAttrs isGpuHost {
+          rocm10 = self.devShells.${system}.default.overrideAttrs (old: {
+            name = "plow-dev-rocm10";
+            shellHook = old.shellHook + ''
+              export ROCM_PATH=${gpu.rocm10}
+              export HIP_PATH=${gpu.rocm10}
+              export HIP_DEVICE_LIB_PATH=${gpu.hip10DeviceLibPath}
+              export PLOW_HIPCC=${gpu.rocm10}/bin/hipcc
+              export PLOW_BUNDLER=${gpu.rocm10LlvmBin}/clang-offload-bundler
+              export PLOW_READELF=${gpu.rocm10LlvmBin}/llvm-readelf
+              export PLOW_TOOLCHAIN_LABEL=rocm-${gpu.rocm10Version}-nix
+              export PATH=${gpu.rocm10}/bin:$PATH
+              echo "compiler: ROCm ${gpu.rocm10Version} (nix, apt prerelease); runtime libs: ROCm ${rocmVersion}"
+            '';
+          });
         }
         # Weight quantization: everywhere except legacy x86_64-darwin, where
         # nixpkgs' torch/arrow stack is marked broken and even *evaluating* the
