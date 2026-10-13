@@ -7341,7 +7341,7 @@ impl AmdEngine {
                 if !crate::config::RuntimeConfig::get().amd.tp_audit_compact {
                     return Err(RuntimeError::Device(format!(
                         "{} ({XR_TAGGED_SYM}): tagged one-shot XReduce requires the compact TP \
-                         audit; unset PLOW_TP_AUDIT_COMPACT=0 or build with PLOW_XR_TAGGED=OFF",
+                         audit; unset PLOW_TP_AUDIT_COMPACT=0 or build with PLOW_XR_TAGGED=0",
                         path.display()
                     )));
                 }
