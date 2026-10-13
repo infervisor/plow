@@ -44,6 +44,17 @@ case "${PLOW_MLA_PF_TR16:-0}" in
   1) FLASH_TR16="-DPLOW_MLA_PF_SV=1 -DPLOW_MLA_PF_TR16=1" ;;
   *) echo "PLOW_MLA_PF_TR16 must be 0 or 1" >&2; exit 2 ;;
 esac
+# FA_MLA_PF2_DEFER=1 (default unset = the running-max V2 softmax): the deferred-frame online
+# softmax in the FLASH objects, as gfx942 ships it (op_attention_common.h; not bit-identical —
+# gated there on the decode-oracle error class and long-context needles). FA_MLA_PF2_FRAME /
+# FA_MLA_PF2_FASTBF pass through likewise.
+case "${FA_MLA_PF2_DEFER:-}" in
+  '') ;;
+  0|1) FLASH_TR16="$FLASH_TR16 -DFA_MLA_PF2_DEFER=$FA_MLA_PF2_DEFER" ;;
+  *) echo "FA_MLA_PF2_DEFER must be 0 or 1" >&2; exit 2 ;;
+esac
+[ -z "${FA_MLA_PF2_FRAME:-}" ] || FLASH_TR16="$FLASH_TR16 -DFA_MLA_PF2_FRAME=$FA_MLA_PF2_FRAME"
+[ -z "${FA_MLA_PF2_FASTBF:-}" ] || FLASH_TR16="$FLASH_TR16 -DFA_MLA_PF2_FASTBF=$FA_MLA_PF2_FASTBF"
 case "${PLOW_MLA_SPARSE:-0}" in
   0) ;;
   1) [ "${PLOW_MLA_PF_TR16:-0}" = 1 ] || { echo "PLOW_MLA_SPARSE=1 requires PLOW_MLA_PF_TR16=1" >&2; exit 2; }
