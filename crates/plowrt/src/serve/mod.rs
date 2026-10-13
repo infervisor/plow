@@ -898,15 +898,19 @@ impl AppState {
 
     /// Install one co-tenant turn per device group (once, at startup).
     ///
-    /// Called by every backend path, not just CUDA: two AMD models on one agent
-    /// is a thing that already happens — the AMD startup loop installs an
-    /// engine per bundle and each opens the same ROCr agent — and HSA has no
-    /// cooperative-launch refusal to catch the resulting CU oversubscription.
-    /// The CPU engine gives every model its own worker pool, so turns bound
-    /// thread contention there.
+    /// Called by every backend path, not just CUDA: AMD models placed on one
+    /// group share its agents, and HSA has no cooperative-launch refusal to
+    /// catch the resulting CU oversubscription. The CPU engine gives every
+    /// model its own worker pool, so turns bound thread contention there.
     pub fn install_device_turns(&self, groups: usize, cuda: bool) {
+        self.install_group_turns(groups, self.registry.slugs().len(), cuda);
+    }
+
+    /// [`Self::install_device_turns`] where `tenants` is the most instances any one group
+    /// holds: one per group shares nothing, so the turns stay free (`--co-sched` overrides).
+    pub fn install_group_turns(&self, groups: usize, tenants: usize, cuda: bool) {
         self.turns.get_or_init(|| {
-            let mode = policy::co_sched(self.registry.slugs().len(), !cuda);
+            let mode = policy::co_sched(tenants, !cuda);
             policy::set_co_sched(mode);
             let turns = (0..groups.max(1))
                 .map(|_| Arc::new(cosched::DeviceTurn::serving(mode)))

@@ -1142,9 +1142,9 @@ Removed (a set value is ignored with a startup warning; recipes and scripts may 
 | `PLOW_HTTP_MAX_CONNECTIONS=N` (`--http-max-connections`) | 4096 | Concurrent connections, counted per listener (TCP and UDS each). At the cap the listener stops accepting and new connections wait in the kernel backlog. `0` = unbounded. |
 | `PLOW_PRELOAD` | on | speculative next-model preload after an S1 switch; `=0` disables. |
 | `PLOW_DEVICES=0,1` | all visible | CUDA device ordinals to serve on. Indices into the **visible** set, not the physical one. |
-| `PLOW_PLACE=spread\|pack\|explicit` | `spread` | CUDA: how models are laid out over the visible devices. |
-| `PLOW_PIN=slug@2,...` | unset | CUDA: pin a model to a device; required for every model under `--place explicit`. A DP model's pins go to its ranks in order. |
-| `PLOW_DP=N\|all\|slug=N,...` (`--dp`) | 1 | CUDA: data-parallel ranks per model (TP1 bundles), one per device group, routed by session, prefix cache and load (`docs/runtime/data-parallel.md`). |
+| `PLOW_PLACE=spread\|pack\|explicit` | `spread` | CUDA and AMD: how models are laid out over the visible devices (AMD: groups of the widest packet TP, every model resident). |
+| `PLOW_PIN=slug@2,...` | unset | CUDA and AMD: pin a model (or `slug#r` DP rank) to the first device of its group; required for every model under `--place explicit`. A DP model's pins go to its ranks in order. |
+| `PLOW_DP=N\|all\|slug=N,...` (`--dp`) | 1 | data-parallel ranks per model (CUDA TP1 bundles; AMD any TP), one per device group, routed by session, prefix cache and load (`docs/runtime/data-parallel.md`). |
 | `PLOW_ROUTE_PREFIX=0/1` (`--route-prefix`) | on | DP routing: probe each rank's prefix cache and prefer the rank holding the longest prefix. |
 | `PLOW_ROUTE_SPILL=N` (`--route-spill`) | max(4, slots/4) | DP routing: queued requests past which a session or prefix match stops pinning a rank. |
 | `PLOW_ROUTE_PREFIX_SLACK=F` (`--route-prefix-slack`) | 0.5 | DP routing: extra load a prefix match may carry over the least-loaded rank, per fraction of the prompt it saves. |

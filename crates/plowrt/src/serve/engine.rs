@@ -10,9 +10,12 @@
 //! per-backend tick body: how many sequences it serves, and what its stop set
 //! is. Everything richer stays inside the variant.
 //!
-//! What is deliberately NOT here: VMM/prefix sharing, the S1 `ModelManager`,
-//! and multi-model residency. Those are CUDA-only today and stay CUDA-only —
-//! an AMD serve is one model, B fixed sequence slots, no paging.
+//! The AMD engine is slotted too (B fixed sequence slots with per-slot prefix
+//! snapshots, packed prefill), and an AMD serve holds several engines: models
+//! and `--dp` ranks, each placed on its own TP group (`AmdServe::load_on`) by
+//! `serve::placement`, all resident. What stays CUDA-only: VMM paging and the
+//! cross-request VMM prefix probe, and the S1 `ModelManager` (VRAM-budgeted
+//! residency switching and eviction).
 
 use std::sync::Arc;
 
