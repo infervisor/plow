@@ -508,6 +508,22 @@ The packet from config + index alone (no weights) is 70 MB: 4 prefill buckets + 
   FP32-reference gate v7 (prefix on): PASS, kl_mean 0.01396 (vLLM 0.03677), kl_p99 0.233
   (0.549), top1_decisive 0.9967 (0.9868), cont_frac 0.756 (0.730), needles 18/18. Long-context
   needles v7: 36/36 at 4k-61k. The v7 grids replace the v6 grids (stopped).
+- 23:00 UTC, v7 grids and strict reports: every cell MATCHED/EQUIVALENT; plow total throughput
+  0.07-0.26x vLLM in all 19 cells (results summary docs/bringup/results/glm53flash-mi350x-
+  2026-10-12). Recipe promoted to `validated` on v7 (8ed1b8f5).
+- 00:00 UTC (10-13), prefill kernel subagents: (a) prefill mHC mix GEMV + HyperConnPre lane-
+  parallel arms (62e06055; GemvF32 9.6 -> 4.9 ms, HyperConnPre 7.7 -> 3.3 ms at 4k; the §6a
+  72/37 ms figures were pre-seq-par and stale), and the HyperConnPre arm in decode objects too
+  (bc44e45c; r1 27.8 -> 26.2, B=8 47.3 -> 44.4, B=32 57.8 -> 55.0 ms), activation dumps
+  bit-identical; (b) GLM prefill routed to the existing lean KDA chunk objects + MoE prefill
+  axes (tile binsearch, down-epilogue hoist, raw-fp8 B prefetch, vector combine) (819034ad):
+  prefill 1k/4k/8k/16k 146/332/595/1254 -> 114/227/376/793 ms, amd-bench streams identical.
+- 00:10 UTC, v8 (= v7 + both) FAILED serving: FP32 gate capture had 15/18 needle cases return
+  null logprobs and the needle probe found 4/36. Diagnostic: v8 with PLOW_PREFIX_CACHE=0 18/18,
+  with the cache on 4/18 (6624 cached tokens); v7 with the cache on 36/36. A prefill resumed
+  from a prefix snapshot (chunk starting at row > 0 with restored KDA state) breaks on the lean
+  KDA path; amd-bench never resumes, so its stream checks could not see it. v8 grids cancelled;
+  the recipe stays on v7. Fix delegated (route or repair resumed chunks), then re-gate.
 - 17:35 UTC, E10 TP4 bench (packet pkt-glm53flash-tp4-ladder-v4, 4 GPUs, real prompt, streams
   exact at every rung): scalar (rung 8) 55.5 ms, B=8 51.4, B=32 63.3, B=64 74.6 ms (858 tok/s
   per group); prefill 1k 204 ms (TP8 173). Two such groups (DP2xTP4) would serve 128 streams at
