@@ -93,7 +93,6 @@ pub fn op_classes(op: DevOp) -> &'static [&'static str] {
         | MoeGroupGluGemmaPfW8a8
         | MoeGroupDownGemmaPfW8a8
         | MoeRouterTopkPf
-        | MoeRouterDec
         | MoeAlignPf
         | MoeGroupGluPf
         | MoeGroupDownPf

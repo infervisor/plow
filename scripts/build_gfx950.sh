@@ -257,13 +257,6 @@ case "${PLOW_MOE_ROUTER_PF_WAVE:-0}" in
   1) A4W4_BK="$A4W4_BK -DPLOW_MOE_ROUTER_PF_WAVE=1" ;;
   *) echo "PLOW_MOE_ROUTER_PF_WAVE must be 0 or 1" >&2; exit 2 ;;
 esac
-# PLOW_DEC_ROUTER_WAVE=1: the decode objects' op-83 router tail wave-per-token too (byte-identical
-# table; the batched rungs and a PLOW_GLM_ROUTER_WAVE one-row packet run it).
-case "${PLOW_DEC_ROUTER_WAVE:-0}" in
-  0) ;;
-  1) DEC_KNOBS="$DEC_KNOBS -DPLOW_MOE_ROUTER_PF_WAVE=1" ;;
-  *) echo "PLOW_DEC_ROUTER_WAVE must be 0 or 1" >&2; exit 2 ;;
-esac
 # PLOW_DSA_SELECT_V2=1: DSA prefill top-k (op 118) through d_index_select_pf_v2 (same set).
 case "${PLOW_DSA_SELECT_V2:-0}" in
   0) ;;
@@ -1460,20 +1453,7 @@ if [ "$BUILD_GEMMA_MOE" = 1 ]; then
   fi
 fi
 
-# PLOW_GLM_ROUTER_DEC: the standalone decode router (op 211) runs the decode object's GemmF32 /
-# top-k / align bodies, so it compiles with the decode object's defines ($DEC).
-ROUTER_DEC_ELFS=""
-rm -f "$OUT/moe_router_dec_gfx950.elf" "$OUT/moe_router_dec_gfx950.co"
-if [ "$ARCH" = gfx950 ] && [ -n "${PLOW_HSACO_CONFIG:-}" ] &&
-   grep -qx '#define PLOW_PACKET_HAS_MOE_ROUTER_DEC 1' "$PLOW_HSACO_CONFIG"; then
-  bash "$R/cmake/hipcc_hsaco.sh" hipcc "$BUN" "$ARCH" \
-    "$OUT/moe_router_dec_gfx950.elf" plow_moe_router_dec_v1 256 1 \
-    $INC $DEC -DPLOW_LEAN_OBJECT=1 -DPLOW_NO_SPILL=1 -DPLOW_MOE_ROUTER_PF_WAVE=1 \
-    -DPLOW_REQUIRED_MARKER=plow_moe_router_dec_1 "$R/amd/moe_router_dec.hip"
-  ROUTER_DEC_ELFS="moe_router_dec_gfx950.elf"
-fi
-
-ALL_ELFS="interp_prefill.elf interp_decode.elf interp_flash.elf test_kernels.elf $ROUTER_DEC_ELFS $K3_ELFS $DECODE_MLA_ELFS $KDA_FUSED_ELFS $KDA_INTRA_CACHED_ELFS $KDA_INTRA_WAVE_ITEMS_ELFS $ATTN_RES_F32MIX_ELFS $KDA_CARRY_REGSTATE_ELFS $KDA_WU_LEAN_ELFS $KDA_CARRY_KEYFEED_ELFS $KDA_KEY_FACTOR_ELFS $XR_ATTNRES_ELFS $MOE_STAGE1_ELFS $MOE_STAGE2_ELFS $MOE_COMBINE_ELFS $MOE_EP_ELFS $MOE_DECODE_GROUPED_ELFS $MLA_MATERIALIZED_ELFS $GQ_ELFS $FP8_ELFS $FP8KV_ELFS $MXFP4_ELFS $MLA_ELFS $MOE_ELFS $GMOE_ELFS"
+ALL_ELFS="interp_prefill.elf interp_decode.elf interp_flash.elf test_kernels.elf $K3_ELFS $DECODE_MLA_ELFS $KDA_FUSED_ELFS $KDA_INTRA_CACHED_ELFS $KDA_INTRA_WAVE_ITEMS_ELFS $ATTN_RES_F32MIX_ELFS $KDA_CARRY_REGSTATE_ELFS $KDA_WU_LEAN_ELFS $KDA_CARRY_KEYFEED_ELFS $KDA_KEY_FACTOR_ELFS $XR_ATTNRES_ELFS $MOE_STAGE1_ELFS $MOE_STAGE2_ELFS $MOE_COMBINE_ELFS $MOE_EP_ELFS $MOE_DECODE_GROUPED_ELFS $MLA_MATERIALIZED_ELFS $GQ_ELFS $FP8_ELFS $FP8KV_ELFS $MXFP4_ELFS $MLA_ELFS $MOE_ELFS $GMOE_ELFS"
 
 # Every interpreter is compiled against the packed-prefill PlowProgram tail. This is an ABI
 # marker, not a claim that descriptor-consuming math arms are enabled.

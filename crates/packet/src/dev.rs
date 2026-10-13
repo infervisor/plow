@@ -2258,15 +2258,6 @@ pub enum DevOp {
     /// [`DevOp::FlashPrefillFp8`] sites read it (their `i7` high half).
     /// `t0=out(u32[rows]) t1=ids(u32[rows])` · `i0=rows`.
     MmSpanExtent = 210,
-    /// GLM decode router as one standalone boundary (`moe_router_dec.hip`, never interpreted):
-    /// the f32 router GEMV `logit = x . W^T` on `[GemmF32]`'s per-output order, then per
-    /// 4-row group the [`DevOp::MoeRouterTopkPf`] tail, then [`DevOp::MoeAlignPf`] on the last
-    /// group to finish — so `table`, `meta` and the row arrays equal the three packets'.
-    /// `t0=logit(f32[M,E]) t1=x(bf16[M,H]) t2=W(bf16[E,H]) t3=bias(f32[E]) t4=table t5=meta
-    /// t6=counters(u32[M/4+1], zero) t7=rows(row_token|row_partidx|row_gate handles, u32[3])` ·
-    /// `i0=M i1=E i2=H i3=k i4=flags i5=shared_tail i6=n_group i7=topk_group` ·
-    /// `f0=route_scale` · `j1=e_route_k_route` (`e_route | k_route << 16`).
-    MoeRouterDec = 211,
 }
 
 /// [`DevOp::FlashPrefillFp8`]'s split count (`i7` low half).
@@ -2540,7 +2531,6 @@ impl DevOp {
         DevOp::ChunkAttentionF32,
         DevOp::MmRowsBf16,
         DevOp::MmSpanExtent,
-        DevOp::MoeRouterDec,
     ];
 
     /// Recover the opcode from its wire discriminant, or `None` for a value no
@@ -2772,7 +2762,6 @@ impl DevOp {
             DevOp::ChunkAttentionF32 => "PLOW_DOP_CHUNK_ATTENTION_F32",
             DevOp::MmRowsBf16 => "PLOW_DOP_MM_ROWS_BF16",
             DevOp::MmSpanExtent => "PLOW_DOP_MM_SPAN_EXTENT",
-            DevOp::MoeRouterDec => "PLOW_DOP_MOE_ROUTER_DEC",
         }
     }
 
@@ -2831,8 +2820,7 @@ impl DevOp {
     /// 206 -> 210 for `RmsNormF32 = 206` .. `MmRowsBf16 = 209` (multimodal towers and LM
     /// soft-token rows).
     /// 210 -> 211 for `MmSpanExtent = 210` (bidirectional media spans).
-    /// 211 -> 212 for `MoeRouterDec = 211`.
-    pub const COUNT: u16 = 212;
+    pub const COUNT: u16 = 211;
 
     /// The `(M, N, K, quant)` a decode-GEMV opcode carries, or `None` if this is not one.
     ///

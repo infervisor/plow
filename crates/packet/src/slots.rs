@@ -327,7 +327,6 @@ const DOC: &[S] = &[
     S { op: DevOp::RopeAxialF32, t: &["x", "pos"], i: &["rows", "heads", "head_width", "stride", "axes", "head_stride", "flags"], f: &["theta"], j: &[] },
     S { op: DevOp::ChunkAttentionF32, t: &["out", "q", "k", "v", "rel_k", "qscale?", "valid?"], i: &["rows", "heads", "head_width", "chunk", "past", "future", "positions", "left"], f: &["kscale", "cap"], j: &[] },
     S { op: DevOp::MmRowsBf16, t: &["x", "ids", "table", "slab"], i: &["rows", "width", "cap", "slab_rows"], f: &[], j: &[] },
-    S { op: DevOp::MoeRouterDec, t: &["logit", "x", "W", "bias", "table", "meta", "counters", "rows"], i: &["M", "E", "H", "k", "flags", "shared_tail", "n_group", "topk_group"], f: &["route_scale"], j: &["", "e_route_k_route"] },
     S { op: DevOp::MmSpanExtent, t: &["out", "ids"], i: &["rows"], f: &[], j: &[] },
 ];
 

@@ -1458,8 +1458,6 @@ enum {
     PLOW_DOP_CHUNK_ATTENTION_F32 = 208,
     PLOW_DOP_MM_ROWS_BF16 = 209,
     PLOW_DOP_MM_SPAN_EXTENT = 210,
-    /* Standalone GLM decode router (moe_router_dec.hip); never dispatched by the interpreter. */
-    PLOW_DOP_MOE_ROUTER_DEC = 211,
 
     PLOW_DOP__COUNT
 };

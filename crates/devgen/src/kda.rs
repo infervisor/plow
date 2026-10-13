@@ -2000,6 +2000,9 @@ mod tests {
 
     #[test]
     fn chunk_kda_override_is_shape_gated() {
+        // The legacy chain these probes compare against, not the batched-rung v3 boundary.
+        let _guard = crate::test_env::env_guard();
+        let _wide = crate::test_env::EnvScope::set(&[("PLOW_KDA_DECODE_WIDE", "0")]);
         let build = |t: u32, seq_rows: bool, enabled: bool| {
             let c = KdaCfg {
                 heads: 12,
@@ -2570,6 +2573,9 @@ mod tests {
 
     #[test]
     fn standalone_decode_fusion_is_shape_gated_and_falls_back_byte_identically() {
+        // The legacy chain these probes compare against, not the batched-rung v3 boundary.
+        let _guard = crate::test_env::env_guard();
+        let _wide = crate::test_env::EnvScope::set(&[("PLOW_KDA_DECODE_WIDE", "0")]);
         let supported = KdaCfg {
             heads: 12,
             head_dim: 128,
@@ -2614,6 +2620,35 @@ mod tests {
         let legacy_b8 = build_decode_fused_probe(&supported, 8, false, false);
         let invalid_b8 = build_decode_fused_probe(&supported, 8, false, true);
         assert_eq!(invalid_b8.to_blob(), legacy_b8.to_blob());
+    }
+
+    /// PLOW_KDA_DECODE_WIDE (default on): a batched rung's chain is ONE op-125 v3 boundary whose
+    /// descriptor names the chain's own intermediates; one-row and unbatched programs keep theirs.
+    #[test]
+    fn batched_rung_chain_is_one_v3_boundary() {
+        let _guard = crate::test_env::env_guard();
+        let c = KdaCfg {
+            heads: 12,
+            bv: 8,
+            ..k3()
+        };
+        let n = |p: &packet::devbuild::Program, op: DevOp| {
+            p.insts.iter().filter(|i| i.op == op as u16).count()
+        };
+        let wide = build_decode_fused_probe(&c, 8, true, false);
+        assert_eq!(n(&wide, DevOp::KdaDecodeFused), 1);
+        for old in [DevOp::KdaConv3, DevOp::KdaStateStepG, DevOp::KdaGatedNorm] {
+            assert_eq!(n(&wide, old), 0, "{old:?}");
+        }
+        let v3 = wide.insts.iter().find(|i| i.op == DevOp::KdaDecodeFused as u16).unwrap();
+        assert_eq!(v3.i, [8, 12, 128, 8, 4, 3, 1, 3]);
+        assert_eq!(wide.tensors[v3.t[7] as usize].bytes, 60);
+        let one = build_decode_fused_probe(&c, 1, false, false);
+        assert_eq!(n(&one, DevOp::KdaDecodeFused), 0);
+        let _off = crate::test_env::EnvScope::set(&[("PLOW_KDA_DECODE_WIDE", "0")]);
+        let legacy = build_decode_fused_probe(&c, 8, true, false);
+        assert_eq!(n(&legacy, DevOp::KdaDecodeFused), 0);
+        assert_eq!(n(&legacy, DevOp::KdaStateStepG), 1);
     }
 
     #[test]

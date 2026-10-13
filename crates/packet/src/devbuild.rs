@@ -2499,10 +2499,6 @@ impl Builder {
                 // A standalone raw-argument object owns this boundary. Keep its segment pure
                 // even if PLOW_UNISEG was requested; runtime routing may then select by opcode.
                 3
-            } else if op == DevOp::MoeRouterDec as u16 {
-                // Standalone router object (moe_router_dec.hip); its own class so it never
-                // shares a segment with an adjacent KDA boundary.
-                28
             } else if decode_grouped_moe
                 && ((op == DevOp::MoeGroupGluFp8Blk as u16
                     && self
@@ -2703,7 +2699,6 @@ impl Builder {
         // same-segment edges unchanged; this applies only to programs carrying the raw boundary.
         let raw_segmented = self.ops.iter().any(|op| {
             op.inst.op == DevOp::KdaDecodeFused as u16
-                || op.inst.op == DevOp::MoeRouterDec as u16
                 || op.inst.op == DevOp::MoeAiterFp8Pf as u16
                 || op.inst.op == DevOp::IndexTpPf as u16
                 || op.inst.op == DevOp::IndexFp8Decode as u16

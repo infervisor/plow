@@ -213,7 +213,6 @@ enum DecodeSegmentKind {
     Interpreter,
     MlaAttention,
     KdaDecodeFused(usize),
-    RouterDec(usize),
     MoeAiter,
     GemmLt,
     GroupedMoeMxfp4 { glu: usize, down: usize },
@@ -264,7 +263,6 @@ fn decode_segment_kinds(prog: &DevProg) -> Result<Vec<DecodeSegmentKind>> {
                     Some(_) => multiple_mla_merge = true,
                 }
             } else if inst.op == DevOp::KdaDecodeFused as u16
-                || inst.op == DevOp::MoeRouterDec as u16
                 || inst.op == DevOp::MoeAiterFp8Pf as u16
                 || inst.op == DevOp::GemmLtPf as u16
                 || inst.op == DevOp::IndexFp8Decode as u16
@@ -275,8 +273,6 @@ fn decode_segment_kinds(prog: &DevProg) -> Result<Vec<DecodeSegmentKind>> {
                     "GemmLtPf"
                 } else if inst.op == DevOp::IndexFp8Decode as u16 {
                     "IndexFp8Decode"
-                } else if inst.op == DevOp::MoeRouterDec as u16 {
-                    "MoeRouterDec"
                 } else {
                     "KdaDecodeFused"
                 };
@@ -339,8 +335,6 @@ fn decode_segment_kinds(prog: &DevProg) -> Result<Vec<DecodeSegmentKind>> {
                 "GemmLtPf"
             } else if prog.insts[inst].op == DevOp::IndexFp8Decode as u16 {
                 "IndexFp8Decode"
-            } else if prog.insts[inst].op == DevOp::MoeRouterDec as u16 {
-                "MoeRouterDec"
             } else {
                 "KdaDecodeFused"
             };
@@ -361,8 +355,6 @@ fn decode_segment_kinds(prog: &DevProg) -> Result<Vec<DecodeSegmentKind>> {
                 DecodeSegmentKind::GemmLt
             } else if prog.insts[inst].op == DevOp::IndexFp8Decode as u16 {
                 DecodeSegmentKind::IndexFp8
-            } else if prog.insts[inst].op == DevOp::MoeRouterDec as u16 {
-                DecodeSegmentKind::RouterDec(inst)
             } else {
                 DecodeSegmentKind::KdaDecodeFused(inst)
             };
@@ -429,12 +421,7 @@ fn decode_segment_kinds(prog: &DevProg) -> Result<Vec<DecodeSegmentKind>> {
     for (i, inst) in prog.insts.iter().enumerate() {
         if matches!(
             DevOp::from_u16(inst.op),
-            Some(
-                DevOp::KdaDecodeFused
-                    | DevOp::MoeRouterDec
-                    | DevOp::MoeAiterFp8Pf
-                    | DevOp::IndexFp8Decode
-            )
+            Some(DevOp::KdaDecodeFused | DevOp::MoeAiterFp8Pf | DevOp::IndexFp8Decode)
         ) && raw_segment_owner[i].is_none()
         {
             return Err(RuntimeError::Device(format!(
@@ -587,36 +574,6 @@ struct KdaDecodeWideArgs {
 }
 
 // The kernel's parameter list places `mq` right after `norm_eps`, at 184.
-
-/// Op 211 MoeRouterDec (`moe_router_dec.hip`), grid (rows/4) * (n_exp/32).
-#[derive(Clone, Copy, Debug)]
-#[repr(C)]
-struct RouterDecArgs {
-    logit: u64,
-    x: u64,
-    w: u64,
-    bias: u64,
-    table: u64,
-    meta: u64,
-    counters: u64,
-    row_token: u64,
-    row_partidx: u64,
-    row_gate: u64,
-    rows: u32,
-    n_exp: u32,
-    hidden: u32,
-    k: u32,
-    flags: u32,
-    shared_tail: u32,
-    n_group: u32,
-    topk_group: u32,
-    e_route: u32,
-    k_route: u32,
-    route_scale: f32,
-    _pad: u32,
-}
-
-const _: () = assert!(std::mem::size_of::<RouterDecArgs>() == 128);
 const _: () = assert!(std::mem::offset_of!(KdaDecodeWideArgs, mix_q) == 184);
 const _: () = assert!(std::mem::size_of::<KdaDecodeWideArgs>() == 216);
 
@@ -2811,7 +2768,6 @@ enum DecodeSegmentRoute {
     MlaAttention,
     KdaDecodeFused(KdaDecodeFusedArgs),
     KdaDecodeWide(KdaDecodeWideArgs),
-    RouterDec(RouterDecArgs),
     MoeAiter(amd_moe_aiter::Route),
     GemmLt(amd_gemm_lt::Route),
     SparseMlaDecode(amd_sparse_mla::DecodeRoute),
@@ -2903,16 +2859,6 @@ fn decode_segment_routes(
                         )
                     })?,
                 ));
-                continue;
-            }
-            DecodeSegmentKind::RouterDec(inst_ix) => {
-                routes.push(DecodeSegmentRoute::RouterDec(router_dec_args(
-                    inst_ix,
-                    &prog.insts[inst_ix],
-                    tensors,
-                    init,
-                    devp,
-                )?));
                 continue;
             }
             DecodeSegmentKind::KdaDecodeFused(inst_ix) => inst_ix,
@@ -3102,94 +3048,6 @@ fn decode_segment_routes(
         routes.push(DecodeSegmentRoute::KdaDecodeFused(a));
     }
     Ok(routes)
-}
-
-/// Op 211: the standalone decode router.
-fn router_dec_args(
-    inst_ix: usize,
-    d: &DevInst64,
-    tensors: &[crate::asset::devblob::DevTensor],
-    init: &[u8],
-    devp: &[DeviceMem],
-) -> Result<RouterDecArgs> {
-    let (rows, n_exp, hidden, k) = (d.i[0], d.i[1], d.i[2], d.i[3]);
-    let route_scale = f32::from_bits(d.fj[0]);
-    let (e_route, k_route) = (d.fj[2] & 0xFFFF, d.fj[2] >> 16);
-    if rows < 4
-        || rows % 4 != 0
-        || n_exp == 0
-        || n_exp % 32 != 0
-        || hidden % 512 != 0
-        || k == 0
-        || k > 8
-        || d.i[4] & 8 == 0
-        || e_route < n_exp
-        || k_route < k
-        || !route_scale.is_finite()
-    {
-        return Err(RuntimeError::Device(format!(
-            "MoeRouterDec instruction {inst_ix} has unsupported geometry: rows={rows} E={n_exp} \
-             H={hidden} k={k} flags={:#x} e_route={e_route} k_route={k_route}",
-            d.i[4]
-        )));
-    }
-    let addr = |h: u32, what: &str| -> Result<u64> {
-        devp.get(h as usize).map(|m| m.base).ok_or_else(|| {
-            RuntimeError::Device(format!(
-                "MoeRouterDec operand `{what}` handle {h} is outside {} tensors",
-                devp.len()
-            ))
-        })
-    };
-    let maps_h = d.t[7] as usize;
-    let maps = tensors.get(maps_h).ok_or_else(|| {
-        RuntimeError::Device(format!("MoeRouterDec row-map handle {maps_h} out of range"))
-    })?;
-    let bytes = maps
-        .init
-        .clone()
-        .and_then(|range| init.get(range))
-        .filter(|b| maps.bytes == 12 && b.len() == 12)
-        .ok_or_else(|| {
-            RuntimeError::Device(format!(
-                "MoeRouterDec row-map table `{}` is not an initialized 12-byte table",
-                maps.name
-            ))
-        })?;
-    let h = |i: usize| u32::from_le_bytes(bytes[i * 4..i * 4 + 4].try_into().expect("4"));
-    let counters_h = d.t[6] as usize;
-    let counters_ok = tensors
-        .get(counters_h)
-        .is_some_and(|t| t.bytes as u64 >= 4 * (rows as u64 / 4 + 1) && t.init.is_some());
-    if !counters_ok {
-        return Err(RuntimeError::Device(format!(
-            "MoeRouterDec instruction {inst_ix}: counter tensor {counters_h} is not a zeroed [M/4+1] u32"
-        )));
-    }
-    Ok(RouterDecArgs {
-        logit: addr(d.t[0] as u32, "logit")?,
-        x: addr(d.t[1] as u32, "x")?,
-        w: addr(d.t[2] as u32, "W")?,
-        bias: addr(d.t[3] as u32, "bias")?,
-        table: addr(d.t[4] as u32, "table")?,
-        meta: addr(d.t[5] as u32, "meta")?,
-        counters: addr(d.t[6] as u32, "counters")?,
-        row_token: addr(h(0), "row_token")?,
-        row_partidx: addr(h(1), "row_partidx")?,
-        row_gate: addr(h(2), "row_gate")?,
-        rows,
-        n_exp,
-        hidden,
-        k,
-        flags: d.i[4],
-        shared_tail: d.i[5],
-        n_group: d.i[6],
-        topk_group: d.i[7],
-        e_route,
-        k_route,
-        route_scale,
-        _pad: 0,
-    })
 }
 
 /// Op 125 descriptor version 3: the batched-rung chain (`kda_decode_wide.hip`, grid rows*heads).
@@ -6453,7 +6311,6 @@ pub struct AmdEngine {
     k_decode_mla: Option<HsaKernel>,
     k_kda_decode_fused: Option<HsaKernel>,
     k_kda_decode_wide: Option<HsaKernel>,
-    k_router_dec: Option<HsaKernel>,
     k_grouped_moe_glu: Option<HsaKernel>,
     k_grouped_moe_down: Option<HsaKernel>,
     k_kda_chunk_intra_cached: Option<HsaKernel>,
@@ -7159,7 +7016,6 @@ impl AmdEngine {
         };
         let need_kda_decode_fused = kda_decode_fused(false).then_some(());
         let need_kda_decode_wide = kda_decode_fused(true);
-        let need_router_dec = first_op_in(blob.decode_phase(), &[DevOp::MoeRouterDec]).is_some();
         let need_decode_mla_segments = blob.decode_phase().try_fold(false, |need, p| {
             Ok::<_, RuntimeError>(
                 need || decode_segment_kinds(p)?
@@ -8527,41 +8383,6 @@ impl AmdEngine {
                 return Err(RuntimeError::Device(format!(
                     "{NAME}: kernarg segment is {got} B; the v3 ABI needs {want} (or {})",
                     want + IMPLICIT
-                )));
-            }
-            modules.push(module);
-            Some(kernel)
-        } else {
-            None
-        };
-
-        let k_router_dec = if need_router_dec {
-            const NAME: &str = "moe_router_dec_gfx950.elf";
-            const MARKER: &str = "plow_moe_router_dec_1";
-            const SYMBOL: &str = "plow_moe_router_dec_v1";
-            let path = hsaco_dir.join(NAME);
-            let image = std::fs::read(&path).map_err(|e| {
-                RuntimeError::Device(format!(
-                    "op 211 requires standalone object {}: {e}",
-                    path.display()
-                ))
-            })?;
-            if !elf_symbol_names(&image).contains(&MARKER) {
-                return Err(RuntimeError::Device(format!(
-                    "router object {} does not advertise `{MARKER}`; refusing a stale object",
-                    path.display()
-                )));
-            }
-            let module = EngineDevice::module_load(&*be, &image)
-                .map_err(|e| RuntimeError::Device(format!("{}: {e}", path.display())))?;
-            let kernel = EngineDevice::get_function(&*be, &module, SYMBOL)
-                .map_err(|e| RuntimeError::Device(format!("{NAME}: no symbol {SYMBOL}: {e}")))?;
-            const IMPLICIT: u32 = 256;
-            let want = std::mem::size_of::<RouterDecArgs>() as u32;
-            let got = kernel.kernarg_size();
-            if got != want && got != want + IMPLICIT {
-                return Err(RuntimeError::Device(format!(
-                    "{NAME}: kernarg segment is {got} B; the router ABI needs {want}"
                 )));
             }
             modules.push(module);
@@ -11647,7 +11468,6 @@ impl AmdEngine {
             k_decode_mla,
             k_kda_decode_fused,
             k_kda_decode_wide,
-            k_router_dec,
             k_grouped_moe_glu,
             k_grouped_moe_down,
             k_kda_chunk_intra_cached,
@@ -13785,20 +13605,6 @@ impl AmdEngine {
                     &*self.be,
                     kernel,
                     args.base.rows * args.base.heads,
-                    WG_THREADS_8,
-                    0,
-                    as_bytes(std::slice::from_ref(&args)),
-                    None,
-                )?;
-            }
-            DecodeSegmentRoute::RouterDec(args) => {
-                let kernel = self.k_router_dec.ok_or_else(|| {
-                    RuntimeError::Device("MoeRouterDec segment has no standalone object".into())
-                })?;
-                EngineDevice::launch_kernel(
-                    &*self.be,
-                    kernel,
-                    args.rows / 4 * (args.n_exp / 32),
                     WG_THREADS_8,
                     0,
                     as_bytes(std::slice::from_ref(&args)),
