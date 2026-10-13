@@ -394,6 +394,10 @@ extern "C" __device__ unsigned plow_packed_prefill_kda_chunk_segments_1 = 1;
 #endif
 #if defined(PLOW_BUCKET_FLASH) && PLOW_PACKED_PREFILL_MLA_FLASH_CONSUMERS && PLOW_MLA_PF_V2_ARM
 extern "C" __device__ unsigned plow_packed_prefill_mla_flash_segments_1 = 1;
+/* This packed flash object runs NoPE (DR = 0) spans too. */
+#if PLOW_MLA_PF2_NOPE_ARM
+extern "C" __device__ unsigned plow_packed_prefill_mla_nope_1 = 1;
+#endif
 #endif
 
 /* The K3/KDA arms, made observable in the ELF the same way `PLOW_GEMV_WALK` is
@@ -2965,27 +2969,37 @@ extern "C" __device__ unsigned plow_mla_pf2_nope_arm = 1;
 #endif
 
 #if PLOW_PACKED_PREFILL_MLA_FLASH_CONSUMERS
-template <bool FP8>
+/* One V2 walk per span. `DR = 0` is the NoPE twin (t3/t5 unread, window = i[3] without the
+ * NoPE bit). The partials are [row][head][ns], so a span starts `row0 * n_head * ns` partial
+ * rows in, not `row0 * n_head`. */
+template <bool FP8, int DR = 64>
 __device__ __forceinline__ void exec_flash_mla_prefill_v2_packed(
     CInst in, CTens T, unsigned slice, unsigned nblk, bf16* lds, const PlowProgram* prog) {
 #define TEN(k) (in->t[k] == PLOW_TENSOR_NONE ? nullptr : T[in->t[k]])
+    static_assert(!(FP8 && DR == 0), "no FP8-KV NoPE V2 arm");
     if (!plow_packed_prefill_enabled(prog)) __builtin_trap();
     if ((!FP8 && in->t[7] != PLOW_TENSOR_NONE) || (FP8 && TEN(7) == nullptr)) __builtin_trap();
+    const unsigned ns = FP8 ? 1u : ((in->i[6] & 0xffu) ? (in->i[6] & 0xffu) : 1u);
+    const bool ofold = FP8 ? false : ((in->i[6] >> 8) & 1u) != 0u;
+    if (ofold && ns != 1u) __builtin_trap();
+    const unsigned window = DR == 0 ? (in->i[3] & 0x7fffffffu) : in->i[3];
     for (unsigned si = 0; si < prog->n_prefill_spans; ++si) {
         const PlowPrefillSpan* s = plow_packed_prefill_span(prog, si);
-        float* op = (float*)TEN(0) + (size_t)s->row0 * in->i[1] * 512u;
-        float* ml = (float*)TEN(1) + (size_t)s->row0 * in->i[1] * 2u;
+        const size_t prow = (size_t)s->row0 * in->i[1] * ns;
+        /* The W_ofold epilogue writes bf16 rows into the same allocation. */
+        float* op = ofold ? (float*)((bf16*)TEN(0) + prow * 512u) : (float*)TEN(0) + prow * 512u;
+        float* ml = (float*)TEN(1) + prow * 2u;
         const bf16* qa = (const bf16*)TEN(2) + (size_t)s->row0 * in->i[1] * 512u;
-        const bf16* qr = (const bf16*)TEN(3) + (size_t)s->row0 * in->i[1] * 64u;
+        const bf16* qr =
+            DR == 0 ? nullptr : (const bf16*)TEN(3) + (size_t)s->row0 * in->i[1] * DR;
         const char* ck = (const char*)TEN(4) +
                          (size_t)s->slot * in->i[2] * 512u * (FP8 ? 1u : 2u);
-        const bf16* kr = (const bf16*)TEN(5) + (size_t)s->slot * in->i[2] * 64u;
+        const bf16* kr = DR == 0 ? nullptr : (const bf16*)TEN(5) + (size_t)s->slot * in->i[2] * DR;
         const float* ks = FP8 ? (const float*)TEN(7) + (size_t)s->slot * in->i[2] : nullptr;
-        d_flash_mla_prefill_v2<512, 64, /*GATHER=*/false, FP8>(
+        d_flash_mla_prefill_v2<512, DR, /*GATHER=*/false, FP8>(
             op, ml, qa, qr, (const bf16*)ck, kr, plow_packed_span_kv_len(prog, s, (const int*)TEN(6)), 1u,
-            s->n_rows, in->i[1], in->i[2], in->i[3], in->fj[0].f, in->i[5], slice, nblk,
-            lds, nullptr, 0u, FP8 ? 1u : ((in->i[6] & 0xffu) ? (in->i[6] & 0xffu) : 1u),
-            FP8 ? false : ((in->i[6] >> 8) & 1u) != 0u, ks, FP8 ? in->i[6] : 0u);
+            s->n_rows, in->i[1], in->i[2], window, in->fj[0].f, in->i[5], slice, nblk,
+            lds, nullptr, 0u, ns, ofold, ks, FP8 ? in->i[6] : 0u);
     }
 #undef TEN
 }
@@ -3222,6 +3236,12 @@ __device__ static void plow_exec(CInst in_v, unsigned slice, CTens T_v, plow_sme
         /* t3/t5 (Qrope/Krope) are unread at DR=0; the window is i[3] with the NoPE bit
          * masked off. i6 keeps its dense meaning (low 8 bits = causal KV-split ns) except
          * on the GATHER arm, where it is `cap`, disambiguated by t7 as in the DR=64 chain. */
+#if PLOW_PACKED_PREFILL_MLA_FLASH_CONSUMERS
+        if (plow_packed_prefill_enabled(prog_meta))
+            exec_flash_mla_prefill_v2_packed</*FP8=*/false, /*DR=*/0>(in, T, slice, nblk,
+                                                                      sm->fa, prog_meta);
+        else
+#endif
         if (in->t[7] != PLOW_TENSOR_NONE)
             d_flash_mla_prefill_v2<512, 0, /*GATHER=*/true>(
                 (float*)TEN(0), (float*)TEN(1), (const bf16*)TEN(2), nullptr,

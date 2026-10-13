@@ -4582,6 +4582,62 @@ fn glm53_program_assembly_keeps_every_tensor_handle_in_the_final_table() {
     }
 }
 
+/// A GLM-5.3 packed-prefill sibling samples every span's last row: `RowGather` over the host's
+/// `in.pf_term` table, the head as a tiled GEMM over those rows (row 0 onward, so the host's
+/// last-row `a_row0` patch must not apply), and an argmax over the same rows. The ordinary
+/// prefill program keeps its one-row `Gemv` tail.
+#[test]
+fn glm53_packed_sibling_tail_samples_every_span() {
+    let _guard = crate::test_env::env_guard();
+    let c = glm53_ref_cfg();
+    let layers: Vec<u32> = (0..c.layers).collect();
+    let enc = MoeEnc::from_flags(false, false);
+    let rows = 128;
+    let mut tb = Builder::new(256);
+    let n = declare_glm_rows_batched_for_prefill(&mut tb, &c, 1024, &layers, rows, 128, enc, &[rows]);
+    let s = declare_glm53(&mut tb, &c, rows, 128, n.pos);
+    let tensors = tb.tensors();
+    let build = |packed: bool| {
+        let mut b = Builder::new(256);
+        b.set_tensor_dedup(true);
+        b.adopt_tensors(tensors.clone());
+        b.set_packed_prefill_segments(packed);
+        emit_glm53_program(&mut b, &c, &n, &s, 1024, rows, 128, enc, true);
+        b.finish()
+    };
+    let plain = build(false);
+    assert!(!plain.insts.iter().any(|d| d.op == DevOp::RowGather as u16));
+    let packed = build(true);
+    let gather: Vec<_> = packed
+        .insts
+        .iter()
+        .filter(|d| d.op == DevOp::RowGather as u16)
+        .collect();
+    assert_eq!(gather.len(), 1);
+    assert_eq!(gather[0].i[0], GLM53_PACKED_TERMS);
+    assert_eq!(gather[0].i[2], rows);
+    let name = |h: u32| packed.tensors[h as usize].name.as_str();
+    assert_eq!(name(gather[0].t[2]), "in.pf_term");
+    let head = packed
+        .insts
+        .iter()
+        .find(|d| d.t[0] == n.logits)
+        .expect("packed tail writes the logits");
+    assert_ne!(head.op, DevOp::Gemv as u16);
+    assert_eq!((head.t[1], head.i[0]), (gather[0].t[0], GLM53_PACKED_TERMS));
+    let argmax = packed
+        .insts
+        .iter()
+        .find(|d| d.op == DevOp::Argmax as u16)
+        .expect("argmax");
+    assert_eq!(argmax.i[1], GLM53_PACKED_TERMS);
+    for inst in &packed.insts {
+        for &h in &inst.t {
+            assert!(h == TENSOR_NONE || (h as usize) < packed.tensors.len());
+        }
+    }
+}
+
 #[test]
 fn glm_placed_prefill_preserves_native_segment_boundaries() {
     let _guard = crate::test_env::env_guard();

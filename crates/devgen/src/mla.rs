@@ -1089,7 +1089,92 @@ fn emit_glm53_program(
             d.i[3] = 2;
         },
     );
-    emit_glm_tail(b, c, n, n.x, &[contract], rows, !prefill, &mut xgate, None);
+    if prefill && b.packed_prefill_segments() {
+        emit_glm53_packed_tail(b, c, n, &[contract], rows, &mut xgate);
+    } else {
+        emit_glm_tail(b, c, n, n.x, &[contract], rows, !prefill, &mut xgate, None);
+    }
+}
+
+/// Spans a GLM-5.3 packed-prefill sibling samples: its terminal-row table `in.pf_term` and the
+/// head GEMM carry this many rows, so a packed launch holds at most this many spans.
+pub(crate) const GLM53_PACKED_TERMS: u32 = 32;
+
+/// Packed-prefill tail: every span's last row samples. The host writes span `s`'s last packed
+/// row to `in.pf_term[s]` (unused entries repeat a live row); `RowGather` compacts those normed
+/// rows, the head runs as a tiled GEMM over them (prefill objects compile a one-row GEMV), and
+/// the argmax writes `in.ids[s]` and logits row `s`.
+fn emit_glm53_packed_tail(
+    b: &mut Builder,
+    c: &GlmCfg,
+    n: &GlmTn,
+    dep: &[u32],
+    rows: u32,
+    xgate: &mut u32,
+) {
+    let all = b.all();
+    let s = GLM53_PACKED_TERMS.min(rows);
+    let vocab_l = glm_vocab_l(c);
+    let term = b.tensor("in.pf_term", u64::from(GLM53_PACKED_TERMS) * 4);
+    let xs = b.tensor(
+        "act.pf_term_x",
+        u64::from(GLM53_PACKED_TERMS) * u64::from(c.hidden) * 2,
+    );
+    let c_f = b.emit(DevOp::RmsNorm, pf_wide_cus(b.n_cu(), rows), dep, |d| {
+        d.t[0] = n.xn;
+        d.t[1] = n.x;
+        d.t[2] = n.fin;
+        d.i[0] = rows;
+        d.i[1] = c.hidden;
+        d.f[0] = c.eps;
+    });
+    let c_g = b.emit(DevOp::RowGather, all.clone(), &[c_f], |d| {
+        d.t[0] = xs;
+        d.t[1] = n.xn;
+        d.t[2] = term;
+        d.i[0] = s;
+        d.i[1] = c.hidden;
+        d.i[2] = rows;
+    });
+    let op = pick_tile(s, vocab_l, c.hidden, b.n_cu(), kernelcaps::QuantScheme::None);
+    let c_lm = b.emit(op, all, &[c_g], |d| {
+        d.t[0] = n.logits;
+        d.t[1] = xs;
+        d.t[2] = n.head;
+        d.i[0] = s;
+        d.i[1] = vocab_l;
+        d.i[2] = c.hidden;
+    });
+    let c_am = b.emit(DevOp::Argmax, (0..AMAX_BLOCKS).collect(), &[c_lm], |d| {
+        d.t[0] = n.amax;
+        d.t[1] = n.logits;
+        d.i[0] = vocab_l;
+        d.i[1] = s;
+    });
+    if glm_shard_head(c) {
+        let value_lines = packet::devbuild::xargmax_value_lines(s)
+            .expect("packed tail sample count fits XARGMAX_FIN");
+        let gate = *xgate;
+        *xgate = xgate
+            .checked_add(1 + value_lines)
+            .expect("XArgmaxFin counter id overflow");
+        b.emit(DevOp::XArgmaxFin, vec![0u32], &[c_am], |d| {
+            d.t[0] = n.ids;
+            d.t[1] = n.amax;
+            d.i[0] = AMAX_BLOCKS;
+            d.i[1] = s;
+            d.i[2] = vocab_l;
+            d.i[3] = gate;
+            d.i[4] = gate + 1;
+        });
+    } else {
+        b.emit(DevOp::ArgmaxFin, vec![0u32], &[c_am], |d| {
+            d.t[0] = n.ids;
+            d.t[1] = n.amax;
+            d.i[0] = AMAX_BLOCKS;
+            d.i[1] = s;
+        });
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1159,6 +1244,24 @@ pub(crate) fn glm53_emit_full(
         tensors = prog.tensors.clone();
         progs.push(prog);
         prog_t.push(rows);
+    }
+    // PACKED-PREFILL SIBLINGS (`PLOW_EMIT_PACKED_PREFILL=1`, as GLM-5.2 and K3 emit them): the
+    // same buckets with the family segment split, so several prompts' chunks share one launch
+    // (per-span KDA/MLA arms on the packed family objects) and every span's last row samples.
+    // The lean KDA chunk objects are single-sequence and the mHC seq-par seam is off under
+    // packing (`glm_sp`), so neither is asked for. Unset ⇒ byte-identical blob.
+    if crate::emit_is_amd() && ec.packed_prefill_on() {
+        for &rows in &pf {
+            let mut b = Builder::new(n_cu);
+            b.set_tensor_dedup(true);
+            b.adopt_tensors(tensors.clone());
+            b.set_packed_prefill_segments(true);
+            emit_glm53_program(&mut b, &c, &n, &s, ctx, rows, dbatch, enc, true);
+            let prog = b.finish();
+            tensors = prog.tensors.clone();
+            progs.push(prog);
+            prog_t.push(packet::devbuild::packed_prefill_program_t(rows));
+        }
     }
     for rows in emit_config::active().decode_rungs() {
         let mut b = Builder::new(n_cu);

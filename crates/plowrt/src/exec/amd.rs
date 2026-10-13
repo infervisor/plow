@@ -63,7 +63,7 @@ use object::{
     KDA_WU_LEAN_MARKERS, L2_DISPATCH_SYM, MLA_PF_V2_FP8_SYM, MLA_PF_V2_SYM, MOE_ENC_MXFP4,
     MOE_GEMMA_OPS, MOE_GEMMA_PF_OPS, PACKED_PREFILL_ABI_SYM, PACKED_PREFILL_BAND_SYM,
     PACKED_PREFILL_KDA_CHUNK_SEG_SYM, PACKED_PREFILL_KDA_SEG_SYM, PACKED_PREFILL_MLA_FLASH_SEG_SYM,
-    PACKED_PREFILL_MLA_NORM_SEG_SYM, XR_ATTNRES_RESOURCE_SYM, XR_ATTNRES_SEG_SYM, XR_TAGGED_SYM,
+    PACKED_PREFILL_MLA_NOPE_SYM, PACKED_PREFILL_MLA_NORM_SEG_SYM, XR_ATTNRES_RESOURCE_SYM, XR_ATTNRES_SEG_SYM, XR_TAGGED_SYM,
 };
 pub use object::{mla_pf_v2_enabled, object_name, symbol_name, Phase, PrefillArm, Sched, Variant};
 
@@ -3476,7 +3476,9 @@ fn sparse_prefill_chain(prog: &DevProg) -> bool {
 /// A packed-prefill program runs its class-A native segments (AITER MoE, hipBLASLt
 /// projections, the native fold) over the dense live rows exactly as an ordinary program does —
 /// the span table changes only how the MLA family segments address KV. What the packed flash
-/// arm cannot serve is gathered/sparse or NoPE flash, and the interpreter's class-C selectors.
+/// arm cannot serve is gathered/sparse or FP8-KV NoPE flash, and the interpreter's class-C
+/// selectors. A bf16 NoPE `FlashMlaPrefill` runs on the packed V2 flash object's NoPE arm,
+/// which the loader requires by marker whenever a packed program carries one.
 /// `sparse_spans`: the sparse chain (`IndexTpPf` + sparse FP8 flash) resolves rows through the
 /// staged spans — the ABI-2 TP indexer adapter and the AITER sparse route are loaded and route
 /// every such instruction of this program; otherwise those instructions refuse the program.
@@ -3486,18 +3488,24 @@ fn packed_mla_compatible(prog: &DevProg, sparse_spans: bool) -> bool {
             || (!sparse_spans
                 && (d.op == DevOp::IndexTpPf as u16
                     || (d.op == DevOp::FlashMlaPrefillFp8 as u16 && sparse_fp8(d))))
-            || ((d.op == DevOp::FlashMlaPrefill as u16 || d.op == DevOp::FlashMlaPrefillFp8 as u16)
-                && (d.i[3] & 0x8000_0000 != 0
-                    || (d.t[7] != packet::dev::TENSOR_NONE16
-                        && d.op != DevOp::FlashMlaPrefillFp8 as u16)))
+            || (d.op == DevOp::FlashMlaPrefillFp8 as u16 && d.i[3] & 0x8000_0000 != 0)
+            || (d.op == DevOp::FlashMlaPrefill as u16 && d.t[7] != packet::dev::TENSOR_NONE16)
     })
+}
+
+/// A packed program whose flash family must run NoPE spans.
+fn packed_mla_nope(prog: &DevProg) -> bool {
+    prog.insts
+        .iter()
+        .any(|d| d.op == DevOp::FlashMlaPrefill as u16 && d.i[3] & 0x8000_0000 != 0)
 }
 
 /// A token-batch body has the same admissible operator set as a packed program: the slot-band
 /// descriptor changes only how the MLA family segments address KV. The band's SPARSE DECODE
 /// flash is the decode program's own packet and runs on the decode object (family 27).
+/// The `_tb` flash objects carry no NoPE arm.
 fn token_batch_body_compatible(prog: &DevProg, sparse_spans: bool) -> bool {
-    packed_mla_compatible(prog, sparse_spans)
+    packed_mla_compatible(prog, sparse_spans) && !packed_mla_nope(prog)
 }
 
 /// Why a packed sibling / body carrying the sparse chain cannot take the packed route, by name;
@@ -5962,6 +5970,9 @@ struct AmdProg {
     packed_needs_mla: bool,
     packed_mla_compatible: bool,
     packed_mla_segmented: bool,
+    /// A packed sibling whose tail samples every span's last row (`RowGather` over the host's
+    /// `in.pf_term` table): the most spans one launch may carry. 0 = the tail samples one row.
+    packed_terms: u32,
     /// A packed sibling / body with the sparse chain that the loaded objects cannot run per
     /// span, by name (`packed_sparse_refusal`). `check_packed_prefill_program` refuses it.
     packed_sparse_error: Option<String>,
@@ -6277,6 +6288,8 @@ pub struct AmdEngine {
     t_ids: Option<usize>,
     t_pos: Option<usize>,
     t_kvlen: Option<usize>,
+    /// `in.pf_term`: the packed tail's per-span terminal rows (`packed_terms`).
+    t_pf_term: Option<usize>,
     /// `in.parked`, the per-row SKIP mask (non-zero = park). Present only on a sequence-rows
     /// (batched-decode) blob; `None` means every row always participates.
     t_active: Option<usize>,
@@ -7946,12 +7959,19 @@ impl AmdEngine {
         } else {
             None
         };
+        let packed_nope = blob
+            .prefill_phase()
+            .any(|g| g.role.is_packed_sibling() && packed_mla_nope(g));
         let k_packed_mla_flash = if packed_route {
             load_packed_family(
                 &format!("interp_packed_mla_flash{packed_kv_infix}"),
                 "plow_interp_packed_mla_flash",
                 Phase::Flash,
-                &[PACKED_PREFILL_MLA_FLASH_SEG_SYM],
+                if packed_nope {
+                    &[PACKED_PREFILL_MLA_FLASH_SEG_SYM, PACKED_PREFILL_MLA_NOPE_SYM]
+                } else {
+                    &[PACKED_PREFILL_MLA_FLASH_SEG_SYM]
+                },
                 Some(variant == Variant::Fp8Kv),
                 &[],
             )?
@@ -10014,6 +10034,7 @@ impl AmdEngine {
         let t_ids = find("in.ids");
         let t_pos = find("in.pos");
         let t_kvlen = find("in.kvlen");
+        let t_pf_term = find("in.pf_term");
         let t_active = find("in.parked");
         let t_logits = find("act.logits");
         // The context bound is carried by in.pos, not by any prefill bucket.
@@ -10450,6 +10471,14 @@ impl AmdEngine {
                         )
                 }),
                 packed_kda_compatible: packed_kda_compatible(p),
+                packed_terms: if p.role.is_packed_sibling() {
+                    p.insts
+                        .iter()
+                        .find(|d| d.op == DevOp::RowGather as u16)
+                        .map_or(0, |d| d.i[0])
+                } else {
+                    0
+                },
                 packed_kda_segmented,
                 packed_recurrent_spans: crate::exec::amd::packed::recurrent_span_limit(
                     p.insts.iter().map(|d| d.op),
@@ -11295,6 +11324,7 @@ impl AmdEngine {
             t_ids,
             t_pos,
             t_kvlen,
+            t_pf_term,
             t_active,
             t_logits,
             max_ctx,
@@ -11622,12 +11652,27 @@ impl AmdEngine {
     /// or `None` when the program cannot take the packed route at all. The scheduler asks BEFORE
     /// it touches cursors, so a legal plan is chosen rather than an illegal one refused.
     pub fn packed_prefill_span_limit(&self, prog: usize) -> Option<u32> {
-        self.progs
+        let recurrent = self
+            .progs
             .get(prog)?
             .packed_recurrent_spans
             .as_ref()
             .ok()
-            .copied()
+            .copied()?;
+        Some(match self.packed_prefill_terms(prog) {
+            0 => recurrent,
+            terms => recurrent.min(terms),
+        })
+    }
+
+    /// Spans whose last row the packed sibling of rung `prog` samples (0 = none: a pack then
+    /// carries only intermediate chunks).
+    pub fn packed_prefill_terms(&self, prog: usize) -> u32 {
+        packed_prefill_topology_index(prog, self.progs.len(), |candidate| {
+            self.progs.get(candidate).map(|p| p.role)
+        })
+        .and_then(|sibling| self.progs.get(sibling))
+        .map_or(0, |p| p.packed_terms)
     }
 
     /// Resolve an ordinary prefill rung to its packed-only sibling. Legacy
@@ -14068,6 +14113,8 @@ impl AmdEngine {
             // A token-batch body samples its whole slot band `[0, band)` through a tiled
             // GEMM; there is no last-row a_row0 to place and `i[4]` is not that field there.
             (Some(_), _) if self.progs[prog].role.is_token_batch_body() => {}
+            // A span-sampling packed tail: its head GEMM reads the gathered rows from row 0.
+            (Some(_), _) if self.progs[prog].packed_terms > 0 => {}
             (Some(lm), _) => insts[lm].i[4] = clen - 1,
             (None, Some(_)) => {
                 // A BLOCK can DECLARE act.logits and never write it — the
@@ -14315,6 +14362,25 @@ impl AmdEngine {
             )?;
         }
 
+        let terms = self.progs[prog].packed_terms as usize;
+        if terms > 0 {
+            if spans.len() > terms {
+                return Err(RuntimeError::Rejected(format!(
+                    "packed prefill carries {} spans; program {prog} samples at most {terms}",
+                    spans.len()
+                )));
+            }
+            let t = self.need(self.t_pf_term, "in.pf_term")?;
+            // Unused entries repeat span 0's last row: in range, and never read back.
+            let last = |s: &PrefillSpan| s.row0 + s.n_rows - 1;
+            let stage = self.h_scalar.as_mut_slice();
+            for i in 0..terms {
+                let row = spans.get(i).map_or_else(|| last(&spans[0]), last);
+                stage[i * 4..i * 4 + 4].copy_from_slice(&row.to_le_bytes());
+            }
+            self.be
+                .memcpy_htod_pinned(self.devp[t].base, &self.h_scalar.as_slice()[..terms * 4])?;
+        }
         stage_packed_prompt_rows(self.h_scalar.as_mut_slice(), rung, spans, prompt_slices)?;
         let bytes = rung as usize * 4;
         let d_ids = self.devp[self.need(self.t_ids, "in.ids")?].base;
