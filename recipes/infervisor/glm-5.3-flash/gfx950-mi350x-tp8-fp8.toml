@@ -13,7 +13,7 @@ name = "glm-5.3-flash"
 label = "gfx950-mi350x-tp8-fp8"
 network = "glm-5.3-flash"
 status = "validated"
-plow_git = "ca89f76dbdb0ed173e343c255f6e3af380266e3b"
+plow_git = "84c775e9e2e97cd4d525500ca589aa36e389892e"
 doc = "docs/amd/glm53-flash-mi350x.md"
 
 # max_ctx 65536: the model's recurrent (KDA) state carries at every length, so long prompts are
@@ -61,6 +61,10 @@ produces = ["zz-plow-glm53-derived.safetensors"]
 # 2026-10-12 (doc §4): the rung-1 program on the wide object stepped 51 ms, on its tier 27 ms;
 # the decode object body depends on PLOW_GEMV_MM / PLOW_GEMV_WALK, not on PLOW_DECODE_BATCH, so
 # a tier without its own MM is the wide object again.
+# Since 819034ad/bc44e45c the same env builds the lean KDA chunk objects (intra/carry/wu), the
+# value-identical MoE prefill axes and the lane-parallel mHC mix/HyperConnPre arms in the
+# prefill and decode objects: prefill 1k/4k/8k/16k 147/335/599/1254 -> 112/198/361/761 ms,
+# decode step r1/B8/B32/B128 27.8/47.3/57.8/84.3 -> 26.1/44.5/56.0/84.1 ms, streams unchanged.
 [objects]
 script = "scripts/build_gfx950.sh"
 env = { PLOW_DECODE_BATCH = "128", PLOW_GEMV_WALK = "1", PLOW_GEMV_MM = "4", PLOW_DECODE_TIERS = "1,8", JOBS = "32" }
@@ -86,7 +90,6 @@ env = { PLOW_DECODE_BATCH = "128", PLOW_GEMV_WALK = "1", PLOW_GEMV_MM = "4", PLO
 # Measured 2026-10-12 (amd-bench TP8): FlashMlaPrefill at 4k 11 x 5.55 -> 11 x 1.13 ms; prefill
 # 1k/4k/8k/16k/32k 167/382/803/2081/6431 -> 147/333/598/1269/2767 ms. The nat-pride-1024 and
 # 4096-token synthetic streams equal v6's (ns=1 flipped the synthetic one at its second token).
-# The FP32-reference gate has not been rerun on this packet.
 [emit]
 env = { PLOW_MLA_PREFILL = "full:128,512,2048,8192", PLOW_MLA_PF_V2 = "1", PLOW_GLM_PF_NS = "2", PLOW_DECODE_BATCH_LADDER = "1,8,32,128", PLOW_GLM_DECODE_GEMM_ROWS = "32", PLOW_GLM_DSA = "0", PLOW_GLM_SEQ_PAR = "1", PLOW_GLM_SEQ_PAR_PROJ = "0" }
 args = [
@@ -119,8 +122,9 @@ name = "smoke"
 cmd = "scripts/serve_test/smoke.sh"
 
 # FP32-reference gate (scripts/llm/fp32_ref_gate.py, 46 cases incl. 18 needles to 15872 tokens,
-# served c16, prefix cache on) on packet 451b1b07: PASS, kl_mean 0.01396 (vLLM 0.03677 on the same
-# reference), kl_p99 0.233 (0.549), top1_decisive 0.9967 (0.9868), needles 18/18.
+# served c16, prefix cache on) on packet 980625b3: PASS, kl_mean 0.01424 (vLLM 0.03677 on the same
+# reference), kl_p99 0.233 (0.549), top1_decisive 0.9956 (0.9868), needles 18/18.
+# Cross-slot prefix reuse at c8 (4064/8160 tokens resumed): cached streams equal their cold runs.
 [[gates]]
 name = "llm_fp32_ref"
 cmd = "scripts/llm/fp32_ref_gate.py"
@@ -135,11 +139,11 @@ expect = "36/36"
 
 # One serving cell for orientation; the full grid (isl 1024/4096/16384 at c1..c128, 32768/61440 at
 # c1/c8) and the strict comparison against vLLM are docs/bringup/results/glm53flash-mi350x-2026-10-12.
-# No cell beats vLLM on throughput (0.07-0.26x); see docs/amd/glm53-flash-mi350x.md.
+# No cell beats vLLM on throughput (0.08-0.31x); see docs/amd/glm53-flash-mi350x.md.
 [measured]
-tok_s = 32.29
-p50_tpot_ms = 27.26
-p50_ttft_ms = 412.23
+tok_s = 35.56
+p50_tpot_ms = 25.50
+p50_ttft_ms = 283.65
 concurrency = 1
 input_len = 4096
 output_len = 128
@@ -147,10 +151,10 @@ client = "vllm 0.31.1rc1 bench serve (scripts/bench/llm_grid.sh)"
 
 # Reproduction gates at THIS commit, checkpoint and nix lock.
 [artifacts]
-"plowrt" = "f24205a4a8f15fd3aa4b926237fad63d747763086486f24d41aa415dbafa56e8"
-"model.pkt" = "451b1b079b143d72fb0252a558b2a46e7a45b13de263b532cf946d2f4013769e"
-"interp_decode_k3_gq.elf" = "28a26207b736e582f6d950ba54d06602d004e3475ddbf249d416cbef8729b3a7"
-"lowrung1/interp_decode_k3_gq.elf" = "2ef19046326a7c3987e9374df4486588cd74bf3c6afb1998431f537137362797"
-"lowrung8/interp_decode_k3_gq.elf" = "6cd8a74a39399ff90f8417a085c64518f2d75cf06b7a5c8df9adeaf17d680c1c"
-"interp_prefill_k3_moe_gq.elf" = "daad489336760971d75ab0b17bec9492e61427f6fe098b1d6c71ce54745175e5"
-"interp_flash_gq.elf" = "25bb2d8ead882a26fe53f1714ff2161b757e3d81fb656d98cb211a4f58d6041a"
+"plowrt" = "c56db3d414ccc4a0a65f14eddd77d60e428c1492efcc923daae964262bb0f2aa"
+"model.pkt" = "980625b39c5dab354185bf26cea81c3056e846e33a3c5df320bbe734c4dc3b55"
+"interp_decode_k3_gq.elf" = "e58ac62be984604ec2f7ca6df4cd59d4b562a2ef57ae659cbc8866b439a8f054"
+"lowrung1/interp_decode_k3_gq.elf" = "7894aef7fe85acf9dfc47388fd8dbc0bae740947b165fd10966e76e444561b78"
+"lowrung8/interp_decode_k3_gq.elf" = "23ac3c815fb83ea51c43e9d5d62a6d275e4d11abe0de2a4d2eb7eaab8e8285f1"
+"interp_prefill_k3_moe_gq.elf" = "fe4db8b169f270bfaee3275bdb98757cd088c21c156cc403613d5e7203b991f4"
+"interp_flash_gq.elf" = "59e338ddc308a415f6bd39320afcd883ebea0aff673820535a41d0a7104cf200"

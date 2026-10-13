@@ -524,6 +524,17 @@ The packet from config + index alone (no weights) is 70 MB: 4 prefill buckets + 
   from a prefix snapshot (chunk starting at row > 0 with restored KDA state) breaks on the lean
   KDA path; amd-bench never resumes, so its stream checks could not see it. v8 grids cancelled;
   the recipe stays on v7. Fix delegated (route or repair resumed chunks), then re-gate.
+- 00:30 UTC, cause and fix (84c775e9): the two KDA intra routes kept the bucket's row count, so
+  a chunk whose length is not a multiple of 64 (a resumed prefix or a split prefill) read stale
+  g_prefix rows past its end; intra routes now take the chunk's real row count, interpreter below
+  512 rows. Needles cache-on 18/18, PF_CHUNK=512 split 9/9, streams equal v7.
+- 02:40 UTC, v8b (v8 packet 980625b3 + bc44e45c objects + 84c775e9 plowrt) passes every gate:
+  validate rungs r1/B8/B32/B128 26.1/44.5/56.0/84.1 ms, all ranks token-identical; FP32 gate
+  PASS kl_mean 0.01424 (vLLM 0.03677), kl_p99 0.233, top1_decisive 0.9956, needles 18/18;
+  long needles 36/36; cross-slot prefix reuse at c8: cached streams equal their cold runs
+  4/4 (off-vs-on differences also occur at 0 cached tokens: batch numerics). Strict reports,
+  all 19 cells MATCHED/EQUIVALENT: plow total throughput 0.08-0.31x vLLM (v7 0.07-0.26x).
+  Recipe moved to v8 (plow_git 84c775e9).
 - 17:35 UTC, E10 TP4 bench (packet pkt-glm53flash-tp4-ladder-v4, 4 GPUs, real prompt, streams
   exact at every rung): scalar (rung 8) 55.5 ms, B=8 51.4, B=32 63.3, B=64 74.6 ms (858 tok/s
   per group); prefill 1k 204 ms (TP8 173). Two such groups (DP2xTP4) would serve 128 streams at
@@ -532,7 +543,9 @@ The packet from config + index alone (no weights) is 70 MB: 4 prefill buckets + 
 
 ## 5. Results
 
-(pending: the strict 12-row `campaign.py report` tables go here with the comparison.csv link.)
+Strict `campaign.py report` output per input length and the combined comparison.csv:
+[docs/bringup/results/glm53flash-mi350x-2026-10-12](../bringup/results/glm53flash-mi350x-2026-10-12/summary.md).
+No qualified win: plow total throughput 0.08-0.31x vLLM (v8).
 
 ## 6. Roofline (CPU, before any plow GPU time)
 
