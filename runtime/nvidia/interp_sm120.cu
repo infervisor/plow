@@ -4038,12 +4038,22 @@ extern "C" __global__ void PLOW_LIGHT_PF_BOUNDS PLOW_SYM(plow_sm120_light_pf)(Pl
             (const __nv_bfloat16*)LIGHT_TEN(3), (const __nv_bfloat16*)LIGHT_TEN(4),
             (const __nv_bfloat16*)LIGHT_TEN(5), in->i[0], in->i[1], slice, nblk);
         break;
+    /* The decode conv step (a cuBLASLt-routed decode rung's window; exec/gpu.rs
+     * qwen_decode_light_segments, gated on plow_light_pf_qwen_conv). */
+    case PLOW_DOP_QWEN_GDN_CONV:
+        d_qwen_gdn_conv((__nv_bfloat16*)LIGHT_TEN(0), (const __nv_bfloat16*)LIGHT_TEN(1),
+            (const __nv_bfloat16*)LIGHT_TEN(2), (__nv_bfloat16*)LIGHT_TEN(3), (const int*)LIGHT_TEN(4),
+            in->i[0], in->i[1], in->i[2], slice, nblk);
+        break;
 #endif
     default:
         __trap();
     }
 #undef LIGHT_TEN
 }
+#if PLOW_NV_QWEN_GDN
+extern "C" __device__ unsigned PLOW_SYM(plow_light_pf_qwen_conv) = 1;
+#endif
 #if PLOW_NV_GEMMA
 extern "C" __device__ unsigned PLOW_SYM(plow_light_gemma) = 1;
 /* The logits tail (SoftCap, Argmax, ArgmaxFin): its own kernel, so the light kernel's code for

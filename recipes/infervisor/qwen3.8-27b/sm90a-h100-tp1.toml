@@ -175,6 +175,18 @@ PLOW_NV_FA_RG_WIDE = "1"
 PLOW_NV_FA_RG_U = "8"
 # Decode GDN step as a standalone occupancy launch on rungs >= 16 (build88).
 PLOW_QWEN_GDN_ISOLATE = "16"
+# Decode projections on rungs >= 16 as cuBLASLt segments (496 per rung; fuse_ab / fuse_mlp / fold
+# off there, the generated attention and GDN step routes beside them; plowrt merges the route
+# tables, runs the rung's pointwise windows as light launches (PLOW_QWEN_LIGHT_DECODE) and
+# graph-captures the rung with the generated attention's split count pinned to the SM cover
+# (PLOW_GEN_DECODE_PIN_NSPLIT)). Rung 8 keeps the native walks (its roles differ under
+# GDN_ISOLATE=16). build105: B1-8 bit-identical, B16/32/48 29.77/36.13/41.00 -> 29.51/33.09/34.78
+# ms; gate105 c1/c8/c32 PASS on the robust metrics (the one decisive flip is nat-docs-1024 pos 30,
+# the known swing position); grid105 4K c16/c32/c64 tok/s 229.0/280.2/292.6 -> 232.2/288.1/298.7,
+# 15K 79.8/81.7/82.8 -> 81.0/82.8/83.9. build106 (light windows + conv arm + pinned capture, ab107):
+# B16/32/48 26.37/29.90/31.22 ms, digests unchanged.
+PLOW_EMIT_DECODE_CUBLASLT = "1"
+PLOW_EMIT_DECODE_CUBLASLT_MIN_ROWS = "16"
 # Remainder split-K in the mma row-block walks; rungs 1..4 take the K8 tensor-core walk too
 # (ab94: B1/2/4/8/16 23.90/25.02/26.60/27.48/30.92 -> 22.32/23.47/25.14/26.88/29.68 ms, digests
 # identical through B32; grid94 4K c16 tok/s 226.3 -> 229.1).

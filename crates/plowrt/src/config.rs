@@ -1482,6 +1482,13 @@ pub struct NvidiaRuntimeConfig {
     )]
     pub gen_decode_step: u32,
 
+    /// The generated flash decode's split count is the SM cover alone (it no longer drops with
+    /// the step's widest KV length below two tiles per split), so a routed rung's launch
+    /// arguments are static and the rung is graph-captured. Off: the split count follows the KV
+    /// length and the rung enqueues its chain every step.
+    #[arg(long = "gen-decode-pin-nsplit", env = "PLOW_GEN_DECODE_PIN_NSPLIT", default_value_t = true, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
+    pub gen_decode_pin_nsplit: bool,
+
     /// Gemma hd256 light attention levels run `plow_<arch>_light_attn_s` (hd256 bodies only,
     /// two blocks per SM, twice the blocks): E4B B=64/128 ctx 1024 7.63/9.70 -> 7.56/9.54 ms,
     /// digests equal. Off: they run `light_attn`, one block per SM.
@@ -1508,6 +1515,12 @@ pub struct NvidiaRuntimeConfig {
         global = true
     )]
     pub qwen_light_occ: u32,
+
+    /// A cuBLASLt-routed decode rung's Qwen3.5 pointwise windows (norms, gates, rope) run as
+    /// `plow_<arch>_light_pf` launches on the `--qwen-light-occ` grid instead of interpreter
+    /// windows (the same block-per-row bodies: the outputs are the window's).
+    #[arg(long = "qwen-light-decode", env = "PLOW_QWEN_LIGHT_DECODE", default_value_t = true, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
+    pub qwen_light_decode: bool,
 
     /// A routed decode rung's q, k and v projections run as one cuBLASLt matmul when their
     /// weights are contiguous and a light attention launch reads the three outputs.

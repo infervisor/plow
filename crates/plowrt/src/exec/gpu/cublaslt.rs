@@ -374,6 +374,8 @@ pub(super) struct LightFunctions {
     flash: Option<(KernelFn, u32)>,
     /// `plow_<arch>_light_pf`: a prefill bucket's lone RmsNorm / Residual / SiLU Glu.
     pub(super) prefill: Option<KernelFn>,
+    /// `plow_light_pf_qwen_conv`: `light_pf` also runs the Qwen decode conv step.
+    pub(super) prefill_conv: bool,
 }
 
 /// `FA_ST_THREADS`: eight row-group warps and the producer warp.
@@ -437,6 +439,10 @@ pub(super) fn light_functions(
         .get_function(module, &format!("plow_{arch}_light_pf"))
         .ok()
         .filter(|_| crate::config::RuntimeConfig::get().nv.prefill_light);
+    let prefill_conv = prefill.is_some()
+        && be
+            .module_global_u32(module, "plow_light_pf_qwen_conv")?
+            .is_some();
     let tail = if abi == Some(2) {
         be.get_function(module, &format!("plow_{arch}_light_tail"))
             .ok()
@@ -470,6 +476,7 @@ pub(super) fn light_functions(
         head,
         flash,
         prefill,
+        prefill_conv,
     }))
 }
 
@@ -679,8 +686,10 @@ pub(super) fn prefill_light_segments(
 pub(super) fn qwen_light_segments(
     g: &DevProg,
     library: &[Option<usize>],
+    conv: bool,
 ) -> Vec<(usize, Vec<usize>)> {
     light_segments_matching(g, library, 4, |d| match DevOp::from_u16(d.op) {
+        Some(DevOp::QwenGdnConv) => conv,
         Some(
             DevOp::QwenRmsNorm
             | DevOp::QwenGatedNorm
@@ -827,6 +836,48 @@ pub(super) fn qwen_light_route(
         launch.blocks = grid;
     }
     route
+}
+
+/// A cuBLASLt-routed decode rung's Qwen pointwise windows (`qwen_light_segments`) outside the
+/// library, fold and `taken` segments. The light grid must reach the rung's rows: every body
+/// then takes the block-per-row branch the interpreter window runs, so the outputs are the
+/// window's (the warp-per-row prefill paths differ in summation order).
+pub(super) fn qwen_decode_light_segments(
+    g: &DevProg,
+    folds: &[ArgmaxFold],
+    conv: bool,
+    taken: impl Fn(usize) -> bool,
+) -> Vec<(usize, Vec<usize>)> {
+    let library: Vec<Option<usize>> = (0..g.gq_seg_ofs.len().saturating_sub(1))
+        .map(|seg| (taken(seg) || folds.iter().any(|f| f.segment == seg)).then_some(0))
+        .collect();
+    qwen_light_segments(g, &library, conv)
+}
+
+pub(super) fn qwen_light_instructions(light: &[(usize, Vec<usize>)]) -> Vec<(usize, usize)> {
+    light
+        .iter()
+        .flat_map(|(seg, insts)| insts.iter().map(move |&inst| (*seg, inst)))
+        .collect()
+}
+
+pub(super) fn add_qwen_light_routes(
+    routes: &mut Vec<Option<LibraryRoute>>,
+    be: &Arc<CudaBackend>,
+    function: KernelFn,
+    kernarg: DevProgram,
+    g: &DevProg,
+    light: &[(usize, Vec<usize>)],
+    grid: u32,
+) {
+    for (seg, insts) in light {
+        if routes.len() <= *seg {
+            routes.resize_with(seg + 1, || None);
+        }
+        routes[*seg] = Some(LibraryRoute::Light(qwen_light_route(
+            be, function, kernarg, g, insts, grid,
+        )));
+    }
 }
 
 /// The cached GLU quant kernel strides rows by `gridDim`: one CTA per row instead of the
@@ -1461,7 +1512,8 @@ fn glue_kernels<'a>(routes: impl Iterator<Item = &'a LibraryRoute>) -> Vec<Kerne
         .collect()
 }
 
-/// One decode program's projection routes and MoE routes, which own disjoint segments.
+/// One decode program's projection routes and its MoE or generated routes, which own disjoint
+/// segments.
 pub(super) fn merge_routes(
     projections: Vec<Option<LibraryRoute>>,
     moe: Vec<Option<LibraryRoute>>,
@@ -1482,7 +1534,7 @@ pub(super) fn merge_routes(
         .zip(moe)
         .map(|pair| match pair {
             (Some(_), Some(_)) => Err(RuntimeError::Rejected(
-                "a decode segment is both a projection and a MoE route".into(),
+                "a decode segment has two library routes".into(),
             )),
             (a, b) => Ok(a.or(b)),
         })

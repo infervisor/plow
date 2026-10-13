@@ -233,6 +233,8 @@ pub(super) struct GenDecodeLaunch {
     slots: DeviceMem,
     /// The step's widest fed kv length, stored before the launch (`patch_nv_nsplit`).
     pub(super) max_kv: AtomicU32,
+    /// `PLOW_GEN_DECODE_PIN_NSPLIT`: the split count ignores `max_kv` (static launch arguments).
+    pin_nsplit: bool,
 }
 
 impl GenDecodeLaunch {
@@ -265,12 +267,26 @@ impl GenDecodeLaunch {
             ctr,
             slots,
             max_kv: AtomicU32::new(1),
+            pin_nsplit: crate::config::RuntimeConfig::get().nv.gen_decode_pin_nsplit,
         })
+    }
+
+    /// The split count is static (`PLOW_GEN_DECODE_PIN_NSPLIT`): a routed rung can be captured.
+    pub(super) fn pinned(&self) -> bool {
+        self.pin_nsplit
     }
 
     /// Splits per (row, kv head): cover the SMs, at most two KV tiles per split (the policy the
     /// catalog classes were tuned with, build_catalog.py `pick_nsplit`; riders use the same).
+    /// Pinned: the SM cover alone (a split past the tiles writes an empty partial, weight 0).
     fn nsplit(&self, rows: u32, n_kv_head: u32, window: u32) -> u32 {
+        let cover = self
+            .sms
+            .div_ceil((rows * n_kv_head).max(1))
+            .clamp(1, self.nsplit_max);
+        if self.pin_nsplit {
+            return cover;
+        }
         let max_kv = self.max_kv.load(Ordering::Relaxed).max(1);
         let span = if window > 0 {
             max_kv.min(window)
@@ -278,10 +294,7 @@ impl GenDecodeLaunch {
             max_kv
         };
         let tiles = span.div_ceil(self.kv_tile.max(1)).max(1);
-        self.sms
-            .div_ceil((rows * n_kv_head).max(1))
-            .clamp(1, self.nsplit_max)
-            .min((tiles / 2).max(1))
+        cover.min((tiles / 2).max(1))
     }
 }
 

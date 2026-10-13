@@ -150,12 +150,29 @@ const GEN_DECODE_STEP_DEFAULT: Status = Status::Candidate {
         "`=0` is the rollback to the interpreter pair",
     ],
 };
+/// The generated flash decode's split count pinned to the SM cover: the routed rung's launch
+/// arguments are static, so the rung is graph-captured instead of enqueued per step. The split
+/// count differs from the KV-following policy only below two KV tiles per split (< ~400 tokens).
+const GEN_DECODE_PIN_NSPLIT: Status = Status::Candidate {
+    evidence: &[
+        "plans/qwen38-27b-h100.md (decprof105/106, build105): the uncaptured mixed rung enqueues ~900 launches per step, 1.4 ms of inter-kernel gaps at B16; ab107 (build106) captured B16/32/48 27.56/31.00/32.88 -> 26.37/29.90/31.22 ms, digests unchanged",
+        "`=0` is the rollback to the per-step split count and the uncaptured rung",
+    ],
+};
 /// The Qwen3.5 chain's pointwise prefill segments as light launches of the prefill object, four
 /// blocks per SM. The interpreter window runs one 256-thread block per SM (its entry is at the
 /// register cap), which left the issue-bound pointwise arms at 10-30% of their byte floors.
 const QWEN_LIGHT_DEFAULT: Status = Status::Candidate {
     evidence: &[
         "plans/qwen38-27b-h100.md (segtime62, build59): the chain's pointwise class 24.4 / 74.2 ms per 1024 / 4096 rows as interpreter windows, 16.7 / 52.0 as light launches at occ 2 or 4 (two blocks per SM, the chunk's own tensor table); digests B1 / B8 = build50",
+        "`=0` is the rollback to interpreter windows",
+    ],
+};
+/// A cuBLASLt-routed decode rung's Qwen3.5 pointwise windows as light launches of the same
+/// `light_pf` kernel (block-per-row bodies: the window's outputs).
+const QWEN_LIGHT_DECODE: Status = Status::Candidate {
+    evidence: &[
+        "plans/qwen38-27b-h100.md (decprof105, build105): 289 interpreter windows per B16 step at 19.4 us each (5.6 ms of 29.4) beside the cuBLASLt projections; the light launch of the same body costs ~4 us; ab106/ab107 (build106) B16/32/48 29.51/33.09/34.78 -> 27.56/31.00/32.88 ms with 287 windows routed, digests unchanged",
         "`=0` is the rollback to interpreter windows",
     ],
 };
@@ -605,10 +622,12 @@ pub const RUNTIME: &[KnobSpec] = &[
     KnobSpec::new("rt.tb_split_attn", Some("PLOW_TB_SPLIT_ATTN"), Layer::Runtime, Domain::Bool, ON, PROMOTED),
     KnobSpec::new("rt.tb_gen_decode", Some("PLOW_TB_GEN_DECODE"), Layer::Runtime, Domain::Bool, ON, PROMOTED),
     KnobSpec::new("rt.gen_decode_step", Some("PLOW_GEN_DECODE_STEP"), Layer::Runtime, U32, Default::Static(Val::Nat(4)), GEN_DECODE_STEP_DEFAULT),
+    KnobSpec::new("rt.gen_decode_pin_nsplit", Some("PLOW_GEN_DECODE_PIN_NSPLIT"), Layer::Runtime, Domain::Bool, ON, GEN_DECODE_PIN_NSPLIT),
     KnobSpec::new("rt.decode_light_attn_s", Some("PLOW_DECODE_LIGHT_ATTN_S"), Layer::Runtime, Domain::Bool, ON, PROMOTED),
     KnobSpec::new("rt.decode_head_argmax", Some("PLOW_DECODE_HEAD_ARGMAX"), Layer::Runtime, Domain::Bool, ON, PROMOTED),
     KnobSpec::new("rt.prefill_light", Some("PLOW_PREFILL_LIGHT"), Layer::Runtime, Domain::Bool, ON, PROMOTED),
     KnobSpec::new("rt.qwen_light_occ", Some("PLOW_QWEN_LIGHT_OCC"), Layer::Runtime, U32, Default::Static(Val::Nat(4)), QWEN_LIGHT_DEFAULT),
+    KnobSpec::new("rt.qwen_light_decode", Some("PLOW_QWEN_LIGHT_DECODE"), Layer::Runtime, Domain::Bool, ON, QWEN_LIGHT_DECODE),
     KnobSpec::new("rt.decode_lt_qkv", Some("PLOW_DECODE_LT_QKV"), Layer::Runtime, Domain::Bool, ON, PROMOTED),
     KnobSpec::new("rt.moe_pf_lt", Some("PLOW_MOE_PF_LT"), Layer::Runtime, U32, UNSET, MOE_LT_QUALIFIED),
     KnobSpec::new("rt.moe_dec_lt", Some("PLOW_MOE_DEC_LT"), Layer::Runtime, U32, UNSET, MOE_LT_QUALIFIED),

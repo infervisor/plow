@@ -82,6 +82,20 @@ pub(super) fn validate_cublaslt_ladder(blob: &DevBlob, metadata: &SegmentRoles) 
             moe_lt::decode_segments(program, &blob.tensors, roles)?;
             continue;
         }
+        // A rung below the projection rungs that only declares the generated attention: served
+        // on its own, like the generated ladder.
+        if native
+            && !roles
+                .iter()
+                .copied()
+                .any(plow_asset::segment_roles::is_projection)
+            && roles
+                .iter()
+                .any(|&role| super::gen_decode::is_generated_decode(role, &metadata.objects))
+        {
+            super::gen_decode::decode_segments(program, roles, &metadata.objects)?;
+            continue;
+        }
         native = false;
         routed.push(index);
         if !roles
