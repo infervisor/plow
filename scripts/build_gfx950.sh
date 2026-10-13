@@ -130,6 +130,15 @@ case "${PLOW_MLA_FOLD_MFMA:-0}" in
   1) A4W4_BK="$A4W4_BK -DPLOW_MLA_FOLD_MFMA=1" ;;
   *) echo "PLOW_MLA_FOLD_MFMA must be 0 or 1" >&2; exit 2 ;;
 esac
+# PLOW_K3_PF_FOLD_MFMA=1 (default off): the K3 prefill object's MlaMergeFold takes the MFMA fold
+# for up to 4 KV splits (GLM-5.3-Flash prefill runs ns=2): the scalar fold's split merge, then a
+# bf16-rounded latent into the batched MFMA GEMM. Not bit-identical to the scalar fold.
+K3_PF_ATTN=""
+case "${PLOW_K3_PF_FOLD_MFMA:-0}" in
+  0) ;;
+  1) K3_PF_ATTN="-DPLOW_MLA_FOLD_MFMA=1 -DPLOW_MLA_FOLD_MFMA_NS=4" ;;
+  *) echo "PLOW_K3_PF_FOLD_MFMA must be 0 or 1" >&2; exit 2 ;;
+esac
 case "${PLOW_MOE_ROUTER_PF_WAVE:-0}" in
   0) ;;
   1) A4W4_BK="$A4W4_BK -DPLOW_MOE_ROUTER_PF_WAVE=1" ;;
@@ -1011,13 +1020,13 @@ esac
 K3_ELFS=""
 if [ -n "${PLOW_HSACO_CONFIG:-}" ] &&
    grep -Eq '^#define PLOW_PACKET_OBJECT_REQUIRES "([^"]* )?PLOW_K3=1( |")' "$PLOW_HSACO_CONFIG"; then
-  genco "-DPLOW_BUCKET_DECODE=0 -DPLOW_MLA_PREFILL=1 -DPLOW_MOE_PREFILL=1 -DPLOW_K3=1 $K3_PF_MOE" i_prefill_k3_moe.co
+  genco "-DPLOW_BUCKET_DECODE=0 -DPLOW_MLA_PREFILL=1 -DPLOW_MOE_PREFILL=1 -DPLOW_K3=1 $K3_PF_MOE $K3_PF_ATTN" i_prefill_k3_moe.co
   unbundle i_prefill_k3_moe.co interp_prefill_k3_moe.elf
   genco "$DEC -DPLOW_K3=1" i_decode_k3.co
   unbundle i_decode_k3.co interp_decode_k3.elf
   K3_ELFS="interp_prefill_k3_moe.elf interp_decode_k3.elf"
   if [ "$BUILD_GQ" = 1 ]; then
-    genco "-DPLOW_BUCKET_DECODE=0 -DPLOW_MLA_PREFILL=1 -DPLOW_MOE_PREFILL=1 -DPLOW_K3=1 -DPLOW_GLOBAL_QUEUE=1 -DPLOW_GQ_BATCH=$GQB $L2D $HIERPF $K3_PF_MOE" i_prefill_k3_moe_gq.co
+    genco "-DPLOW_BUCKET_DECODE=0 -DPLOW_MLA_PREFILL=1 -DPLOW_MOE_PREFILL=1 -DPLOW_K3=1 -DPLOW_GLOBAL_QUEUE=1 -DPLOW_GQ_BATCH=$GQB $L2D $HIERPF $K3_PF_MOE $K3_PF_ATTN" i_prefill_k3_moe_gq.co
     unbundle i_prefill_k3_moe_gq.co interp_prefill_k3_moe_gq.elf
     genco "$DEC $L2D $HIERD -DPLOW_K3=1 -DPLOW_GLOBAL_QUEUE=1 -DPLOW_GQ_BATCH=$GQB" i_decode_k3_gq.co
     unbundle i_decode_k3_gq.co interp_decode_k3_gq.elf

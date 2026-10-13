@@ -1812,13 +1812,13 @@ __device__ __forceinline__ void exec_mla_merge_fold(CInst in, CTens T, unsigned 
 #if PLOW_MLA_FOLD_MFMA && PLOW_CDNA4 && PLOW_WAVES == 8
     /* One split and V=256 (GLM prefill): batched MFMA GEMM, 2.7-5.2x the scalar fold at T 1k-16k
      * on MI350X; bf16 rounding of the normalized latent, rel-L2 2.5e-3 vs the scalar fold. */
-    if (in->i[4] == 1u && V == 256u) {
+    if (in->i[4] >= 1u && in->i[4] <= (unsigned)PLOW_MLA_FOLD_MFMA_NS && V == 256u) {
         if (in->i[0] >= 1024u)
             d_mla_fold_pf_mfma<2, 256>(FOLD_O, FOLD_OPART, FOLD_MLPART, FOLD_WUV, in->i[0],
-                                       in->i[1], slice, nblk, (bf16*)raw);
+                                       in->i[1], slice, nblk, (bf16*)raw, in->i[4]);
         else
             d_mla_fold_pf_mfma<1, 256>(FOLD_O, FOLD_OPART, FOLD_MLPART, FOLD_WUV, in->i[0],
-                                       in->i[1], slice, nblk, (bf16*)raw);
+                                       in->i[1], slice, nblk, (bf16*)raw, in->i[4]);
         return;
     }
 #endif

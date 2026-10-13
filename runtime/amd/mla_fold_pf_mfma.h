@@ -12,11 +12,17 @@
 // reassociation; see the rel-L2 gate in runtime/tests/mla_fold_pf_mfma_gfx950.hip.
 #pragma once
 
+// Most splits the arm merges (PLOW_MLA_FOLD_MFMA_NS; 1 = the one-split arm only, the default).
+// GLM-5.3-Flash prefill packets run the NoPE flash at ns=2 (PLOW_GLM_PF_NS).
+#ifndef PLOW_MLA_FOLD_MFMA_NS
+#define PLOW_MLA_FOLD_MFMA_NS 1
+#endif
+
 template <int WM, int V>
 __device__ void d_mla_fold_pf_mfma(bf16* __restrict__ O, const float* __restrict__ Opart,
                                    const float* __restrict__ mlpart, const bf16* __restrict__ Wuv,
                                    unsigned n_batch, unsigned n_head, unsigned slice, unsigned nblk,
-                                   bf16* lds /* V * (32 + 8) bf16 */) {
+                                   bf16* lds /* V * (32 + 8) bf16 */, unsigned nsplit = 1) {
     constexpr int DK = 512, KC = 32, LROW = KC + 8;  // LDS row: 32 l + 8 pad (bank spread)
     constexpr int WN = PLOW_WAVES / WM, RB = 32 * WM;
     constexpr int NBLK = V / (32 * WN);
@@ -32,12 +38,27 @@ __device__ void d_mla_fold_pf_mfma(bf16* __restrict__ O, const float* __restrict
         const unsigned b = rb * RB + wm * 32u + mfma_frag_row(lane);
         const bool live = b < n_batch;
         float inv = 0.0f;
+        /* nsplit > 1 (PLOW_MLA_FOLD_MFMA_NS): the scalar fold's merge per element, in split order
+         * (acc += Opart_s * w_s, a dead split weighing 0), times inv, then the same bf16 rounding
+         * point as the one-split arm. */
+        float wsp[PLOW_MLA_FOLD_MFMA_NS];
+#pragma unroll
+        for (int s = 0; s < PLOW_MLA_FOLD_MFMA_NS; s++) wsp[s] = 0.0f;
         if (live) {
             float gm;
-            const float gl = fa_merge_ml(mlpart + ((size_t)b * n_head + h) * 2, 1u, gm);
+            const float* ml = mlpart + ((size_t)b * n_head + h) * nsplit * 2;
+            const float gl = fa_merge_ml(ml, nsplit, gm);
             inv = gl > 0.0f ? FA_RECIP(gl) : 0.0f;
+            if (nsplit > 1u) {
+#pragma unroll
+                for (int s = 0; s < PLOW_MLA_FOLD_MFMA_NS; s++)
+                    if ((unsigned)s < nsplit) {
+                        const float m = ml[s * 2];
+                        wsp[s] = (m == FA_NEG_INF) ? 0.0f : FA_EXP(m - gm);
+                    }
+            }
         }
-        const float* arow = Opart + ((size_t)b * n_head + h) * DK;
+        const float* arow = Opart + ((size_t)b * n_head + h) * nsplit * DK;
         const bf16* w = Wuv + (size_t)h * DK * V;
         f32x16 acc[NBLK];
 #pragma unroll
@@ -60,9 +81,25 @@ __device__ void d_mla_fold_pf_mfma(bf16* __restrict__ O, const float* __restrict
                 {
                     const unsigned k = kc + mfma_frag_k(lane, kk);
                     float4 p0 = make_float4(0, 0, 0, 0), p1 = p0;
-                    if (live) {
+                    if (live && nsplit == 1u) {
                         p0 = *(const float4*)(arow + k);
                         p1 = *(const float4*)(arow + k + 4);
+                    } else if (live) {
+                        float4 q0[PLOW_MLA_FOLD_MFMA_NS], q1[PLOW_MLA_FOLD_MFMA_NS];
+#pragma unroll
+                        for (int s = 0; s < PLOW_MLA_FOLD_MFMA_NS; s++)
+                            if ((unsigned)s < nsplit) {
+                                q0[s] = *(const float4*)(arow + (size_t)s * DK + k);
+                                q1[s] = *(const float4*)(arow + (size_t)s * DK + k + 4);
+                            }
+#pragma unroll
+                        for (int s = 0; s < PLOW_MLA_FOLD_MFMA_NS; s++)
+                            if ((unsigned)s < nsplit) {
+                                p0.x += q0[s].x * wsp[s]; p0.y += q0[s].y * wsp[s];
+                                p0.z += q0[s].z * wsp[s]; p0.w += q0[s].w * wsp[s];
+                                p1.x += q1[s].x * wsp[s]; p1.y += q1[s].y * wsp[s];
+                                p1.z += q1[s].z * wsp[s]; p1.w += q1[s].w * wsp[s];
+                            }
                     }
                     ab[0] = f2bf(p0.x * inv); ab[1] = f2bf(p0.y * inv);
                     ab[2] = f2bf(p0.z * inv); ab[3] = f2bf(p0.w * inv);
