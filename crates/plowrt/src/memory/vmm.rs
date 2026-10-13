@@ -3554,42 +3554,30 @@ fn evict_one(s: &Shared, inner: &mut Inner, preserve_hot: bool) -> bool {
         .max_by_key(|snap| snap.last_used)
         .map(|snap| snap.va);
     // One unit: the LRU boundary (a session's newest, after `retire_superseded`) and the
-    // blocks that become dead with it. A boundary inside a block serves only its exact
-    // tail, the whole-block checkpoint under the same node every continuation: that tailed
-    // one goes first, then a session's boundary its next turn already attached (spent: that
-    // turn runs now; `retire_superseded` frees it at the turn's prompt end) and a session's
-    // whole-block checkpoint under its tailed boundary. A boundary attached twice or more is
-    // a shared prefix (a system prompt) and goes last; a session-pinned one (`pin_prefix`) or
-    // a shared-prefix end (a system prompt below one block sits on no pinnable node) just
-    // before it.
+    // blocks that become dead with it. A session's boundary its next turn already attached
+    // goes first (spent: that turn runs now; `retire_superseded` frees it at the turn's prompt
+    // end), then a session's whole-block checkpoint under its tailed boundary. Any other prompt
+    // end inside a block is a conversation's next attach point, with or without `X-Session-Id`,
+    // and ranks with the whole-block checkpoint under it by LRU: ranking every such tail first
+    // evicted each conversation's newest prompt end once it passed one block (Gemma-4 26B,
+    // open-loop chat without session ids: 43% cached tokens vs 78% with them). A boundary
+    // attached twice or more is a shared prefix (a system prompt) and goes last; a
+    // session-pinned one (`pin_prefix`) or a shared-prefix end (a system prompt below one block
+    // sits on no pinnable node) just before it.
     let pinned = inner.cache.pinned();
     if let Some((node, index)) = inner
         .published
         .iter()
         .flat_map(|(&node, snaps)| {
-            let checkpoint = node.is_some() && snaps.iter().any(|snap| snap.tail.is_empty());
             let tailed = snaps
                 .iter()
                 .any(|snap| snap.session && !snap.tail.is_empty());
             let pin = node.is_some_and(|key| pinned.contains(&key));
             snaps.iter().enumerate().map(move |(i, snap)| {
-                let covered = checkpoint && !snap.tail.is_empty() && !snap.session;
                 let spent = snap.session
                     && (!snap.tail.is_empty() && snap.attaches == 1
                         || snap.tail.is_empty() && tailed && snap.attaches == 0);
-                (
-                    node,
-                    i,
-                    snap,
-                    pin,
-                    if covered {
-                        0u8
-                    } else if spent {
-                        1
-                    } else {
-                        2
-                    },
-                )
+                (node, i, snap, pin, !spent)
             })
         })
         .filter(|(_, _, snap, ..)| snap.users == 0 && Some(snap.va) != protected)
@@ -6521,11 +6509,10 @@ mod tests {
         assert_eq!(p.try_attach(1, &b).unwrap().unwrap().rows, 32);
     }
 
-    /// A boundary inside a block serves only its exact tail; the whole-block checkpoint under
-    /// the same node serves every continuation. Eviction takes the former first instead of
-    /// the LRU leaf, which would drop the checkpoint and its blocks with it.
+    /// A conversation's prompt end inside a block is its next turn's attach point, without
+    /// `X-Session-Id` too: eviction takes the older whole-block checkpoint under it first.
     #[test]
-    fn tailed_boundaries_are_reclaimed_before_the_whole_block_checkpoint() {
+    fn prompt_end_outlives_the_older_checkpoint_under_it() {
         let ops = Arc::new(MockVmm::default());
         let p = pool(ops);
         let a = prompt(21);
@@ -6542,10 +6529,10 @@ mod tests {
             assert_eq!(inner.stats.cache_blocks, 4);
             assert_eq!(inner.stats.nodes_evicted, 0);
         }
-        let mut b = prompt(16);
-        b.push(901);
+        let mut b = a[..20].to_vec();
+        b.extend([900, 901, 902]);
         p.ensure_rows(1, 1).unwrap();
-        assert_eq!(p.try_attach(1, &b).unwrap().unwrap().rows, 16);
+        assert_eq!(p.try_attach(1, &b).unwrap().unwrap().rows, 20);
     }
 
     /// The mock never changes `free_bytes`, like a real backend whose evicted blocks sit on

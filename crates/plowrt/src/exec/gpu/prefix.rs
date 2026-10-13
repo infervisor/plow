@@ -873,7 +873,9 @@ impl GpuEngine {
         let session = self.session_pin[b].is_some();
         let prompt = kv.prompt_rows(b);
         let prompt_end = is_prompt_end(rows, max_rows, prompt);
-        let max_rows = if session && prompt_end {
+        // Every prompt end, not only a session's: a chat client's next turn re-renders the same
+        // last rows whether or not it names a session.
+        let max_rows = if prompt_end {
             session_prompt_end(prompt)
         } else {
             max_rows
@@ -943,9 +945,10 @@ impl GpuEngine {
         }
         // Turn end: pressure may have evicted the prompt end (the next turn's attach point)
         // while this turn decoded. The rings still hold its window, so restore it now, newest in
-        // LRU just before the session's next request; a surviving one is only touched.
+        // LRU just before the next request; a surviving one is only touched. A client without
+        // `X-Session-Id` continues its conversation the same way.
         let end = session_prompt_end(prompt) / 32 * 32;
-        if session && rows > prompt && end > 0 && end < p_a {
+        if rows > prompt && end > 0 && end < p_a {
             self.publish_boundary(b, end);
         }
     }
@@ -998,7 +1001,7 @@ impl GpuEngine {
     }
 }
 
-/// Rows a session's prompt-end boundary may cover: its next turn re-renders the last few prompt
+/// Rows a prompt-end boundary may cover: the next turn re-renders the last few prompt
 /// rows (Gemma 4 drops the generation prompt's empty thought channel, 4 tokens), so a boundary
 /// within them never attaches — about one turn in eight missed that way.
 const SESSION_PROMPT_REWRITE: u32 = 8;
