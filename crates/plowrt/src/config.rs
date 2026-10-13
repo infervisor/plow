@@ -1844,6 +1844,11 @@ pub struct AmdRuntimeConfig {
     #[arg(long = "amd-tp-audit-compact", env = "PLOW_TP_AUDIT_COMPACT", default_value_t = true, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
     pub tp_audit_compact: bool,
 
+    /// Bytes per tagged one-shot XReduce slot; must equal the decode object's
+    /// `PLOW_XR_TAG_SLOT_BYTES` (a non-default object exports `plow_xr_tag_slot_<N>`).
+    #[arg(long = "amd-xr-tag-slot", env = "PLOW_XR_TAG_SLOT", default_value_t = 20480, global = true)]
+    pub xr_tag_slot: u32,
+
     /// Read each TP prefill chunk's exact counter audit through host-mapped large BAR instead
     /// of one D2H copy per rank. Same gates, same expectations.
     #[arg(long = "amd-tp-prefill-audit-direct", env = "PLOW_TP_PREFILL_AUDIT_DIRECT", default_value_t = true, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]

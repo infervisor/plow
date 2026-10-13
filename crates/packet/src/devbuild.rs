@@ -1255,6 +1255,16 @@ impl Builder {
         self.ops[counter as usize].deps.clone()
     }
 
+    /// The instruction op `counter` was emitted with.
+    pub fn inst(&self, counter: u32) -> &DevInst {
+        &self.ops[counter as usize].inst
+    }
+
+    /// Adjust op `counter`'s instruction after emission (its slices, deps and work stay).
+    pub fn patch(&mut self, counter: u32, f: impl FnOnce(&mut DevInst)) {
+        f(&mut self.ops[counter as usize].inst);
+    }
+
     /// As [`Builder::emit_dep`], but supplying the per-slice cost the cost model predicts.
     ///
     /// This is what lets [`Builder::select_granularity`] decide coarse-vs-fine on its own.
