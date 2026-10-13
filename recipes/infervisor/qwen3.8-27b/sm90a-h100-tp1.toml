@@ -131,7 +131,7 @@ args = ["{out}/assets"]
 name = "gen-kernels"
 script = "scripts/gen_kernels/build_catalog.py"
 python = "python3"
-args = ["build", "{out}/assets", "--entries", "attn_pf_hd256_causal"]
+args = ["build", "{out}/assets", "--entries", "attn_pf_hd256_causal_ilv"]
 
 # The hd256 GQA-6 generated flash-decode role (one launch per FlashDecode + FlashMerge pair from
 # four rows, PLOW_GEN_DECODE_STEP). A TileLang entry: needs a Python with the pinned TileLang
@@ -141,7 +141,7 @@ args = ["build", "{out}/assets", "--entries", "attn_pf_hd256_causal"]
 name = "gen-decode"
 script = "scripts/gen_kernels/build_catalog.py"
 python = "{env:PYREF}"
-args = ["build", "{out}/assets", "--entries", "attn_dec_hd256_gqa6"]
+args = ["build", "{out}/assets", "--entries", "attn_dec_hd256_gqa6_ilv"]
 [prep.env]
 TILELANG_DISABLE_CACHE = "1"
 TVM_FFI_DISABLE_TORCH_C_DLPACK = "1"
@@ -154,7 +154,13 @@ PLOW_QWEN_PREFILL = "128,512,1024,4096"
 PLOW_DECODE_BATCH = "4"
 PLOW_DECODE_BATCH_LADDER = "1,2,4,8,16,32,48"
 PLOW_EMIT_PREFILL_CUBLASLT = "1"
-PLOW_EMIT_GEN_KERNELS = "attn_pf_hd256_causal,attn_dec_hd256_gqa6"
+PLOW_EMIT_GEN_KERNELS = "attn_pf_hd256_causal_ilv,attn_dec_hd256_gqa6_ilv"
+# Row-interleaved full-attention KV ([slot][ctx][kvh][hd]): the live-KV allocator charges
+# 1024-row blocks instead of a 4096-row block per head (4.2K-row slot 512 -> 320 MiB). build97:
+# step_bench digests identical to build96 at 20 (B, ctx) cells incl. the VMM boundaries; grid97
+# peak 65.8-72.0 GiB vs vLLM 72.0-73.0 (build94 69.0-77.0), 4K c64 48 live slots (was 32),
+# 15K tok/s -0.6..-0.9%; ride98: rider and step logits byte-equal to build96 (16x4K, 32x1K, 8x15K).
+PLOW_QWEN_KV_INTERLEAVE = "1"
 # Packed prefill for the hybrid chain: the packet declares the packed section (masked padding, pad
 # rows carry slot -1, requests chunk at the widest bucket), the per-row slot / request tables and
 # the LIVE KV contract; the head is emitted as a tiled GEMM so the compact terminal can run it at
