@@ -79,6 +79,8 @@ nix develop --command env \
 #   vllm_capture = {env:G26_FP8_FP32_VLLM}
 #   concurrency = 16
 #   timeout_s = 2400
+#   kl_over_slack = 0.02
+#   cont_decisive_drop_max = 0.045
 
 # llm_fp32_ref_long
 #   reference = {env:G26_FP8_FP32_REF_LONG}
