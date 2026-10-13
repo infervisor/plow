@@ -658,6 +658,37 @@ The packet from config + index alone (no weights) is 70 MB: 4 prefill buckets + 
   Dropped (measured together, streams equal): a standalone router at batched rungs (GemmF32 tile +
   top-k + align, agent-scope last-arriver counters) plus wave-per-token op-83 top-k in the decode
   objects and at rung 1: r1/B8/B32/B128 +0.66/+1.1/+2.4/+4.6 ms.
+- 21:50 UTC (10-13), collectives vs vLLM/AITER (branch v13-allreduce, v12 int packet 3707ed52).
+  All-rank traces (`PLOW_TRACE_ALLRANKS=1`); "min-rank" = per instance the smallest body over the
+  8 ranks (the last arriver: transfer + protocol, no peer wait).
+  - Microbench, 8x MI350X (`tp_allreduce_prefill_bench` TP_PHASES, 8192x4096, 16-byte schedule):
+    reduce-scatter + all-gather 322 us at 24-32 workgroups (RS 164 + AG 158), 328 us at the shipped
+    caps (RS 16 = 169, AG 48 = 159). vLLM's `cross_device_reduce_2stage` is 307-345 us for the same
+    64 MB, so the data movement is already at parity; caps 24/32 would save ~0.5 ms per 8k chunk.
+  - Warm 8k prefill (244 ms): RS 90 x 213 us rank 0 / 175 us min-rank; the 91 hidden-wide AGs
+    170-260 us min-rank (median ~195), plus 42 router-table AGs of ~24 us. Rank-0 total 43.6 ms,
+    min-rank 34.8 ms; the ~9 ms difference is arrival skew from the band ops, not the collective.
+    The brief's "RS 31 + AG 20 = 51 ms" was cold/rank-0 envelopes.
+  - Decode B=1: XReduce 90 x 9.6 us rank 0 (0.87 ms/step), 7.0 us min-rank; the earlier 16.8 us
+    figure included the gate wait. Tagged one-shot microbench: 4.7 us with a producer (8 WGs).
+    The chain's large hop is the mHC GemvF32 packet after it (37.7 us/hop, 3.39 ms/step).
+  - Tried and dropped (bit-identical, streams equal at every rung, not shipped):
+    aiter `ar_ll`-style PUSH tagged one-shot (sender stores into every receiver's sub-slot, receiver
+    polls local memory): microbench 6.0 vs 4.7 us (pull) at B=1, in situ r1 11.83 vs 11.69 ms.
+    Decode two-shot on the 16-byte schedule for B >= 32 (`PLOW_XR_DEC_TWOSHOT_MIN=131072` + the
+    decode objects built with `PLOW_XR_SCHED_AITER`, caps 32/16): microbench [128,4096] 24.5 vs
+    31.9 us one-shot, in situ b128 36.75 vs 36.85 ms, b32 28.29 (x3) vs base 27.07-28.28
+    (bimodal) — not better. B=1 tagged one-shot at 1/2/4/8 workgroups: 13.8/9.3/5.5/4.7 us, so
+    the emitted 8 stays.
+  - Kept: `PLOW_XR_TAG_SLOT=90112` (decode objects AND serve env; existing knob, bit-identical)
+    lets B=8's [8,4096] message take the tagged one-shot: b8 22.80 -> 22.46 ms/step (three
+    alternating passes each, streams equal at r1/b8/b32/b128 and 4k/16k prompts); other rungs
+    unchanged. Serve FP32 gate with the slot (c16, PF_INTERLEAVE 8192): PASS kl_mean 0.01297,
+    top1_decisive 0.9978, 0 errors, no cross-GPU gate faults.
+  - Fusion: RS + HyperConnPost on the band does not pay (the RS runs on 16 fabric-bound
+    workgroups; HC post moves 8x its bytes locally). The remaining decode lever is folding the
+    tagged poll+reduce into the consumer mHC packet (removes the XReduce hop, ceiling ~0.6 ms/step
+    at B=1); it overlaps the v13 mHC post+mix+pre packet and is left for after that lands.
 
 ## 5. Results
 
