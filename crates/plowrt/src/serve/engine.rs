@@ -1194,6 +1194,26 @@ mod amd_serve {
         Ok(())
     }
 
+    /// `(program, decode rows ride)` for a mixed pack: `combined` covers the prefill spans plus
+    /// the decode rows, `prefill_only` the prefill spans alone. The decode rows ride only on the
+    /// prefill spans' own rung and within its span table; a pack whose decode rows would outgrow
+    /// every rung still runs its prefill spans alone.
+    fn mixed_pack_route(
+        combined: Option<usize>,
+        prefill_only: Option<usize>,
+        spans: usize,
+        width: impl Fn(usize) -> Option<u32>,
+        span_limit: impl Fn(usize) -> u32,
+    ) -> Option<(usize, bool)> {
+        match (combined, prefill_only) {
+            (Some(c), Some(p)) if width(p) != width(c) || spans > span_limit(c) as usize => {
+                Some((p, false))
+            }
+            (Some(c), _) => Some((c, true)),
+            (None, p) => p.map(|p| (p, false)),
+        }
+    }
+
     fn commit_packed_prefill(
         cursors: &mut [Option<PfCursor>],
         completed: &[(usize, crate::exec::amd::ChunkStep)],
@@ -3538,23 +3558,22 @@ mod amd_serve {
             }
 
             let lowest = spans.iter().map(|s| s.kv_row0).min();
-            let mut prog = self
-                .packed_prefill_program(row0, u32::MAX, false, lowest)
-                .ok_or_else(|| {
-                    RuntimeError::Rejected(format!("no packed prefill rung covers {row0} rows"))
-                })?;
+            let combined = self.packed_prefill_program(row0, u32::MAX, false, lowest);
             // The decode rows ride only when they fit the prefill spans' own rung and span
             // table; otherwise the pack runs without them and the caller steps them separately.
             let d0 = feeds.len();
-            if d0 > 0 {
+            let prog = if d0 > 0 {
                 let pf_rows = row0 - d0 as u32;
                 let pf_lowest = spans[d0..].iter().map(|s| s.kv_row0).min();
                 let pf_prog = self.packed_prefill_program(pf_rows, u32::MAX, false, pf_lowest);
-                let pf_width = pf_prog.and_then(|p| self.prefill_prog_t(p));
-                if pf_prog.is_some()
-                    && (pf_width != self.prefill_prog_t(prog)
-                        || spans.len() > self.packed_prefill_span_limit(prog) as usize)
-                {
+                let route = mixed_pack_route(
+                    combined,
+                    pf_prog,
+                    spans.len(),
+                    |p| self.prefill_prog_t(p),
+                    |p| self.packed_prefill_span_limit(p),
+                );
+                if let Some((_, false)) = route {
                     spans.drain(..d0);
                     slices.drain(..d0);
                     for span in &mut spans {
@@ -3562,9 +3581,14 @@ mod amd_serve {
                     }
                     row0 = pf_rows;
                     feeds = &[];
-                    prog = pf_prog.expect("checked above");
                 }
-            }
+                route.map(|(prog, _)| prog)
+            } else {
+                combined
+            };
+            let prog = prog.ok_or_else(|| {
+                RuntimeError::Rejected(format!("no packed prefill rung covers {row0} rows"))
+            })?;
             if spans.len() > self.packed_prefill_span_limit(prog) as usize {
                 return Err(RuntimeError::Rejected(format!(
                     "packed prefill program {prog} takes fewer than {} spans",
@@ -4262,7 +4286,8 @@ mod amd_serve {
     mod tests {
         use super::{
             body_respects_plan, cap_chunks_to_bodies, commit_mixed_prefill, commit_packed_prefill,
-            invalidate_prefix_metadata, mixed_cursor_rows, mixed_prefill_continuation_fits,
+            invalidate_prefix_metadata, mixed_cursor_rows, mixed_pack_route,
+            mixed_prefill_continuation_fits,
             mixed_prefill_padding_fits, multistep_feeds_armable, packable_prefill_step,
             parse_snapshot_tensors, slot_decode_position, snapshot_file_component,
             split_pending_prefill, split_terminal_prefill, stage_parked, terminal_prefill_cursor,
@@ -5110,6 +5135,20 @@ mod amd_serve {
             assert_eq!(cursors[2].as_ref().unwrap().next, 1);
             assert_eq!(cursors[2].as_ref().unwrap().frontier, 6);
             assert!(cursors[1].is_none());
+        }
+
+        #[test]
+        fn a_full_width_pack_runs_its_prefill_alone_when_decode_rows_overflow_every_rung() {
+            // Programs 0..=3 are the 128, 512, 2048 and 8192 rungs, 64 spans each.
+            let width = |p: usize| [128u32, 512, 2048, 8192].get(p).copied();
+            let limit = |_| 64;
+            // 8192 prefill rows fill the widest rung: no rung covers them plus a decode row.
+            assert_eq!(mixed_pack_route(None, Some(3), 9, width, limit), Some((3, false)));
+            assert_eq!(mixed_pack_route(Some(3), Some(3), 9, width, limit), Some((3, true)));
+            assert_eq!(mixed_pack_route(Some(3), Some(2), 9, width, limit), Some((2, false)));
+            assert_eq!(mixed_pack_route(Some(3), Some(3), 65, width, limit), Some((3, false)));
+            assert_eq!(mixed_pack_route(Some(3), None, 9, width, limit), Some((3, true)));
+            assert_eq!(mixed_pack_route(None, None, 9, width, limit), None);
         }
 
         #[test]
