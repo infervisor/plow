@@ -1748,6 +1748,14 @@ pub struct AmdRuntimeConfig {
     )]
     pub attnres_f32mix_grid: Option<u32>,
 
+    /// Per-segment prefill launch geometry (`exec/amd/seg_geom.rs`): `[T<rows>:]<family|s<i>>=g<grid>[+alt]`.
+    #[arg(long = "amd-seg-geom", env = "PLOW_SEG_GEOM", hide = true, global = true)]
+    pub seg_geom: Option<String>,
+
+    /// Directory of alternate prefill/flash interpreter objects for `PLOW_SEG_GEOM` `alt` segments.
+    #[arg(long = "amd-seg-alt-dir", env = "PLOW_SEG_ALT_DIR", hide = true, global = true)]
+    pub seg_alt_dir: Option<std::path::PathBuf>,
+
     /// Audited extra resident bytes per rank a replicated-input MoE EP packet may claim.
     #[arg(
         long = "amd-moe-prefill-ep-max-extra-bytes",
