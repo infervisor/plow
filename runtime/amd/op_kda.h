@@ -165,6 +165,17 @@ __device__ __forceinline__ float kda_softplus(float x) {
  * dependency is a wave shuffle scan rather than a cross-workgroup handoff. The result is stored
  * in log2 units for direct exp2 use by a chunk recurrence. Each chunk deliberately starts from
  * zero; inter-chunk carry is a separate stage. */
+/* Prefill-only memory-level parallelism for the BT64 gate prefix and the q/k L2 normalization:
+ * several independent items per wave pass, same per-item arithmetic. Decode objects keep the
+ * single-item loops (their code is unchanged); PLOW_KDA_PREP_ILP=0 restores them in prefill. */
+#ifndef PLOW_KDA_PREP_ILP
+#if PLOW_BUCKET_DECODE
+#define PLOW_KDA_PREP_ILP 0
+#else
+#define PLOW_KDA_PREP_ILP 1
+#endif
+#endif
+#define KDA_PREP_U 4u
 __device__ void d_kda_chunk_gate_prefix_bt64(
     float* __restrict__ g_cumsum_log2, float* __restrict__ beta,
     const bf16* __restrict__ g_raw, const bf16* __restrict__ beta_raw,
@@ -177,6 +188,71 @@ __device__ void d_kda_chunk_gate_prefix_bt64(
     const size_t hd_count = (size_t)H * D;
     const size_t n_items = (size_t)n_chunks * hd_count;
 
+#if PLOW_KDA_PREP_ILP
+    /* PLOW_KDA_PREP_ILP: KDA_PREP_U items per wave pass, loads of all of them issued before any
+     * is computed; each item's arithmetic and scan are the loop below verbatim. */
+    {
+        const size_t stride = (size_t)nblk * PLOW_WAVES;
+        for (size_t item0 = (size_t)slice * PLOW_WAVES + wave; item0 < n_items;
+             item0 += KDA_PREP_U * stride) {
+            float gate[KDA_PREP_U], graw[KDA_PREP_U], dtb[KDA_PREP_U], alog[KDA_PREP_U];
+            bool valid[KDA_PREP_U];
+            size_t row[KDA_PREP_U];
+            unsigned hdu[KDA_PREP_U], hu[KDA_PREP_U];
+#pragma unroll
+            for (unsigned u = 0; u < KDA_PREP_U; ++u) {
+                const size_t item = item0 + u * stride;
+                const bool live = item < n_items;
+                const size_t it = live ? item : item0;
+                const unsigned chunk = (unsigned)(it / hd_count);
+                const unsigned hd = (unsigned)(it - (size_t)chunk * hd_count);
+                const unsigned h = hd / D;
+                const uint2 desc = kda_chunk_desc(chunks, chunk, T);
+                valid[u] = live && lane < desc.y;
+                row[u] = (size_t)desc.x + lane;
+                hdu[u] = hd;
+                hu[u] = h;
+                graw[u] = 0.0f;
+                dtb[u] = 0.0f;
+                alog[u] = 0.0f;
+                if (valid[u]) {
+                    graw[u] = bf2f(g_raw[row[u] * hd_count + hd]);
+                    dtb[u] = dt_bias[hd];
+                    alog[u] = A_log[h];
+                }
+            }
+#pragma unroll
+            for (unsigned u = 0; u < KDA_PREP_U; ++u) {
+                gate[u] = 0.0f;
+                if (valid[u]) {
+                    const float a = __expf(alog[u]);
+                    const float sv = graw[u] + dtb[u];
+                    gate[u] = (mode == PLOW_KDA_GATE_LOWER_BOUND) ? lb * kda_sigmoid(a * sv)
+                                                                  : -a * kda_softplus(sv);
+                }
+                gate[u] *= RCP_LN2;
+            }
+#pragma unroll
+            for (unsigned delta = 1; delta < PLOW_WAVE; delta <<= 1) {
+#pragma unroll
+                for (unsigned u = 0; u < KDA_PREP_U; ++u) {
+                    const float prior = __shfl_up(gate[u], delta, PLOW_WAVE);
+                    if (lane >= delta) gate[u] += prior;
+                }
+            }
+#pragma unroll
+            for (unsigned u = 0; u < KDA_PREP_U; ++u) {
+                if (valid[u]) {
+                    g_cumsum_log2[row[u] * hd_count + hdu[u]] = gate[u];
+                    if (hdu[u] % D == 0)
+                        beta[row[u] * H + hu[u]] =
+                            kda_sigmoid(bf2f(beta_raw[row[u] * H + hu[u]]));
+                }
+            }
+        }
+        return;
+    }
+#endif
     for (size_t item = (size_t)slice * PLOW_WAVES + wave; item < n_items;
          item += (size_t)nblk * PLOW_WAVES) {
         const unsigned chunk = (unsigned)(item / hd_count);
@@ -220,6 +296,55 @@ __device__ void d_kda_chunk_prepare_bt64(
                                  n_chunks, T, H, D, mode, lb, slice, nblk);
     const unsigned lane = threadIdx.x & 63u, wave = threadIdx.x >> 6;
     const size_t n_rows = (size_t)T * H;
+#if PLOW_KDA_PREP_ILP
+    if (D <= 128u) {
+        const size_t stride = (size_t)nblk * PLOW_WAVES;
+        for (size_t rowh0 = (size_t)slice * PLOW_WAVES + wave; rowh0 < n_rows;
+             rowh0 += KDA_PREP_U * stride) {
+            float qv[KDA_PREP_U][2], kv[KDA_PREP_U][2], qinv[KDA_PREP_U], kinv[KDA_PREP_U];
+            bool live[KDA_PREP_U];
+#pragma unroll
+            for (unsigned u = 0; u < KDA_PREP_U; ++u) {
+                const size_t rowh = rowh0 + u * stride;
+                live[u] = rowh < n_rows;
+                const size_t base = (live[u] ? rowh : rowh0) * D;
+#pragma unroll
+                for (unsigned r = 0; r < 2u; ++r) {
+                    const unsigned d = lane + 64u * r;
+                    qv[u][r] = d < D ? bf2f(q[base + d]) : 0.0f;
+                    kv[u][r] = d < D ? bf2f(k[base + d]) : 0.0f;
+                }
+            }
+#pragma unroll
+            for (unsigned u = 0; u < KDA_PREP_U; ++u) {
+                float qss = 0.0f, kss = 0.0f;
+#pragma unroll
+                for (unsigned r = 0; r < 2u; ++r) {
+                    if (lane + 64u * r < D) {
+                        qss += qv[u][r] * qv[u][r];
+                        kss += kv[u][r] * kv[u][r];
+                    }
+                }
+                qinv[u] = rsqrtf(wave_sum(qss) + 1.0e-6f);
+                kinv[u] = rsqrtf(wave_sum(kss) + 1.0e-6f);
+            }
+#pragma unroll
+            for (unsigned u = 0; u < KDA_PREP_U; ++u) {
+                if (!live[u]) continue;
+                const size_t base = (rowh0 + u * stride) * D;
+#pragma unroll
+                for (unsigned r = 0; r < 2u; ++r) {
+                    const unsigned d = lane + 64u * r;
+                    if (d < D) {
+                        q[base + d] = f2bf(qv[u][r] * qinv[u]);
+                        k[base + d] = f2bf(kv[u][r] * kinv[u]);
+                    }
+                }
+            }
+        }
+        return;
+    }
+#endif
     for (size_t rowh = (size_t)slice * PLOW_WAVES + wave; rowh < n_rows;
          rowh += (size_t)nblk * PLOW_WAVES) {
         const size_t base = rowh * D;
@@ -523,13 +648,27 @@ __device__ void d_kda_chunk_intra_bt64_wave_items(
         }
         __builtin_amdgcn_wave_barrier();
 
+        /* The interpreter's forward substitution, same per-lane FMA chain in the same j order:
+         * steps j >= i contribute nothing, and lane j's `row_value` is the not-yet-rewritten
+         * mat[i][j], read here as a broadcast LDS load instead of a shuffle so the unrolled
+         * steps' loads overlap instead of one LDS round trip per step. */
         for (unsigned i = 0; i < valid; ++i) {
             const float row_value = mat[i * 64u + lane];
             float value = lane < i ? -row_value : (lane == i ? 1.0f : 0.0f);
-#pragma unroll 1
-            for (unsigned j = 1; j < 64u; ++j) {
-                const float lij = __shfl(row_value, j, PLOW_WAVE);
-                if (j < i && lane < j) value -= lij * mat[j * 64u + lane];
+            for (unsigned j0 = 1; j0 < i; j0 += 8u) {
+                float lij[8], mj[8];
+#pragma unroll
+                for (unsigned u = 0; u < 8u; ++u) {
+                    const unsigned j = min(j0 + u, 63u);
+                    lij[u] = mat[i * 64u + j];
+                    mj[u] = mat[j * 64u + lane];
+                }
+#pragma unroll
+                for (unsigned u = 0; u < 8u; ++u) {
+                    const unsigned j = j0 + u;
+                    const float stepped = value - lij[u] * mj[u];
+                    value = (j < i && lane < j) ? stepped : value;
+                }
             }
             __builtin_amdgcn_wave_barrier();
             if (lane <= i) mat[i * 64u + lane] = value;
@@ -1139,6 +1278,15 @@ __device__ void d_kda_conv(bf16* __restrict__ out, const bf16* __restrict__ x,
  * SEPARATE buffers — nothing here assumes q|k|v are contiguous in memory, which they are not:
  * `GemvQkvg` writes three distinct handles.
  */
+/* Bit-identical prefill row map for d_kda_conv3's T > 1 body (see the note there); decode objects
+ * keep the original map so their code is unchanged. PLOW_KDA_CONV3_ROWS=0 restores it. */
+#ifndef PLOW_KDA_CONV3_ROWS
+#if PLOW_BUCKET_DECODE
+#define PLOW_KDA_CONV3_ROWS 0
+#else
+#define PLOW_KDA_CONV3_ROWS 1
+#endif
+#endif
 __device__ void d_kda_conv3(bf16* __restrict__ oq, bf16* __restrict__ ok, bf16* __restrict__ ov,
                             const bf16* __restrict__ xq, const bf16* __restrict__ xk,
                             const bf16* __restrict__ xv, const float* __restrict__ wq,
@@ -1152,7 +1300,11 @@ __device__ void d_kda_conv3(bf16* __restrict__ oq, bf16* __restrict__ ok, bf16* 
     const unsigned g0 = slice * chunk;
     unsigned g1 = g0 + chunk;
     if (g1 > total) g1 = total;
+#if PLOW_KDA_CONV3_ROWS
+    if (g0 >= g1 && !(T > 1u && bstride == 0)) return;
+#else
     if (g0 >= g1) return;
+#endif
     if (T > 1u && bstride == 0) {
         enum { PLOW_KDA_WMAX = 8 };
         const unsigned Wc = W < PLOW_KDA_WMAX ? W : PLOW_KDA_WMAX;
@@ -1200,6 +1352,63 @@ __device__ void d_kda_conv3(bf16* __restrict__ oq, bf16* __restrict__ ok, bf16* 
         const unsigned row0 = Wc - 1u;
         if (row0 >= T) return;
         const unsigned rows = T - row0;
+#if PLOW_KDA_CONV3_ROWS
+        /* PLOW_KDA_CONV3_ROWS: the same per-row window, taps and sum, mapped one channel per lane
+         * (a wave reads and writes 64 consecutive channels of a row: one 128-byte line) over every
+         * workgroup's waves, each wave a contiguous row span whose next KDA_CONV3_PF rows are
+         * loaded before they are consumed. The (stream, channel)-per-workgroup map above made each
+         * row a dependent global round trip on 12 scattered channels per workgroup. */
+        {
+            enum { KDA_CONV3_PF = 16 };
+            const unsigned lane = threadIdx.x & (PLOW_WAVE - 1u);
+            const unsigned cblocks = (total + PLOW_WAVE - 1u) / PLOW_WAVE;
+            const unsigned waves = nblk * PLOW_WAVES;
+            unsigned spans = waves / cblocks;
+            if (spans == 0u) spans = 1u;
+            const unsigned span = (rows + spans - 1u) / spans;
+            for (unsigned unit = slice * PLOW_WAVES + (threadIdx.x >> 6); unit < cblocks * spans;
+                 unit += waves) {
+                const unsigned g = (unit % cblocks) * PLOW_WAVE + lane;
+                const unsigned t0 = row0 + (unit / cblocks) * span;
+                const unsigned t1 = t0 + span < T ? t0 + span : T;
+                if (g >= total || t0 >= t1) continue;
+                const unsigned s = g / C;
+                const unsigned c = g - s * C;
+                bf16* out = s == 0 ? oq : (s == 1 ? ok : ov);
+                const bf16* x = s == 0 ? xq : (s == 1 ? xk : xv);
+                const float* w = s == 0 ? wq : (s == 1 ? wk : wv);
+                float win[PLOW_KDA_WMAX], tap[PLOW_KDA_WMAX];
+#pragma unroll
+                for (unsigned j = 0; j < PLOW_KDA_WMAX; ++j) {
+                    win[j] = j < Wc
+                                 ? bf2f(x[((size_t)t0 - (Wc - 1u - j)) * C + c])
+                                 : 0.0f;
+                    tap[j] = j < Wc ? w[(size_t)c * W + j] : 0.0f;
+                }
+                for (unsigned tb = t0; tb < t1; tb += KDA_CONV3_PF) {
+                    float nx[KDA_CONV3_PF];
+#pragma unroll
+                    for (unsigned b = 0; b < KDA_CONV3_PF; ++b) {
+                        const unsigned tn = tb + 1u + b < t1 ? tb + 1u + b : t1 - 1u;
+                        nx[b] = bf2f(x[(size_t)tn * C + c]);
+                    }
+#pragma unroll
+                    for (unsigned b = 0; b < KDA_CONV3_PF; ++b) {
+                        const unsigned t = tb + b;
+                        if (t >= t1) break;
+                        float y = 0.0f;
+#pragma unroll
+                        for (unsigned j = 0; j < PLOW_KDA_WMAX; ++j) y += win[j] * tap[j];
+                        st_act1(&out[(size_t)t * C + c], f2bf(act == 1u ? act_silu(y) : y));
+#pragma unroll
+                        for (unsigned j = 0; j + 1u < PLOW_KDA_WMAX; ++j) win[j] = win[j + 1u];
+                        win[Wc - 1u] = nx[b];
+                    }
+                }
+            }
+            return;
+        }
+#endif
         const unsigned nch = g1 - g0;
         const unsigned ncpar = nch < PLOW_THREADS ? nch : PLOW_THREADS;
         const unsigned cworker = threadIdx.x % ncpar;
