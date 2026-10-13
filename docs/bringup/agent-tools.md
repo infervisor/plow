@@ -360,7 +360,7 @@ distance to FP32:
 | `kl_p99`, `kl_max` | reported, not gated: on 1414 positions p99 is the 14th-worst position and one co-batching flip moves it 60% while the trimmed mean and p95 hold | — |
 | `top1_decisive` | top-1 agreement where the FP32 top-1/top-2 margin > `tie_margin` (1.0 nat) | ≥ vLLM − `top1_drop_max` (0.01) |
 | `cont_frac` | stack's own greedy continuation: tokens matching FP32 before the first divergence / reference length | ≥ vLLM − `cont_drop_max` (0.05) |
-| `cont_decisive_frac` | cases whose continuation never diverges where FP32 was decisive (margin > `tie_margin`); a near-tie divergence is rounding luck, after which greedy histories are incomparable | ≥ vLLM − `cont_decisive_drop_max` (0) |
+| `cont_decisive_frac` | cases whose continuation never diverges where FP32 was decisive (margin > `tie_margin`); a near-tie divergence is rounding luck, after which greedy histories are incomparable | ≥ vLLM − `cont_decisive_drop_max` (0; a recipe sets a measured margin, with the swing case named, where a documented position flips on every qualified packet) |
 | `needle_acc` | needle answer contained in the greedy continuation | ≥ vLLM − `needle_drop_max` (0) and ≥ `needle_min` (0.9) |
 
 Any missing scored position fails; the position set is the reference's, identical for every arm

@@ -12,7 +12,11 @@
 # (docs/runtime/kernel-generators.md "FP8-KV entries"); step_bench packed prefill of one 15360-row
 # request 753 -> 702 ms against the same checkout's previous object, token digests identical;
 # FP32-reference gate PASS (c1 KL 0.105 / top1 0.988 / needle 1; c16 KL 0.094). The served
-# comparison above predates it and has not been re-run.
+# comparison above predates it and has not been re-run. The campaign branch was squashed onto main
+# (2026-10-13): the rebuild at b44ca43f reproduces packet 06da7686 (same hash, same hd512 FP8-KV
+# object 806febb0); only the three decode interpreter objects differ in SASS (runtime hunks shared
+# with the Gemma 26B FP8 recipe, qualified there), step_bench B 1/16/64/128 x ctx 1K/4K/16K
+# digests and times unchanged against the 597c56d6 packet on one plowrt.
 # vLLM with BF16 KV (FLASH_ATTN) is still faster than this packet: same doc, Caveats.
 #
 # Routes (per-rung evidence: docs/runtime/kernel-generators.md "Gemma-4 12B FP8 per-rung routes"):
@@ -33,7 +37,7 @@ namespace = "infervisor"
 name = "gemma-4-12b"
 label = "sm90a-h100-tp1"
 status = "validated"
-plow_git = "597c56d6a13d1e40823224fac02138ad12391405"
+plow_git = "b44ca43f9e39982ce739ff14229f59ef4c99b58f"
 network = "gemma4"
 
 [target]
@@ -164,6 +168,11 @@ python = "{env:PYREF}"
 [gates.llm_fp32_ref]
 reference = "{env:GEMMA12B_FP32_REF}"
 vllm_capture = "{env:GEMMA12B_FP32_VLLM}"
+# Measured margin (2026-10-13, four runs of packet 06da7686 on the 6af0b02c plowrt): decisive
+# free-run flips 41-43 cases of 46 against the peer's 42, a different case set each run (one case
+# = 0.0217), while kl_mean 0.08 vs 0.13, over-0.1 116 vs 123 and top1_decisive 0.984 vs 0.982 beat
+# the vLLM capture every run.
+cont_decisive_drop_max = 0.022
 
 [reference]
 csv = "perf-data/campaign/gemma4-12b.h100.reference-vllm028-fp8.csv"

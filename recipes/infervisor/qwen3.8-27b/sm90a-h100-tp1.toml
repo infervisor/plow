@@ -25,6 +25,11 @@
 # criterion and miss only cont_decisive_frac on one case, nat-docs-1024 pos 30, where the bf16
 # stacks, vLLM's included, swing ~1 nat with any accumulation-order change; treated as
 # informational like the p99 tail, user decision 2026-10-13).
+# Merge pin (2026-10-13): the campaign branch was squashed onto main, so plow_git names the merge
+# candidate b44ca43f. Its emit (build113) reproduces the qualified build106 packet 3fb7cefaf150a710
+# (same hash; two decode interpreter objects differ in SASS from the shared runtime hunks), and
+# step_bench B1/8/16/32/48 at ctx 4K, B16 at 1K/15K and the 32 x 4K ride give identical token
+# digests and ride-vs-step lines against build106 on one plowrt (ab113).
 #
 # Routes (per-rung evidence: plans/qwen38-27b-h100.md, step_bench ctx 1K):
 #   prefill projections   cuBLASLt segments on every bucket, the 48-wide GDN a/b included (the
@@ -89,7 +94,7 @@ namespace = "infervisor"
 name = "qwen3.8-27b"
 label = "sm90a-h100-tp1"
 status = "validated"
-plow_git = "742dec4b"
+plow_git = "b44ca43f9e39982ce739ff14229f59ef4c99b58f"
 network = "qwen3.5"
 
 [target]
@@ -264,3 +269,6 @@ reference = "{env:QWEN38_FP32_REF}"
 eos = [248046, 248044]
 concurrency = [1, 8, 32]
 vllm_capture = { c1 = "{env:QWEN38_FP32_VLLM}", c8 = "{env:QWEN38_FP32_VLLM_C8}", c32 = "{env:QWEN38_FP32_VLLM_C32}" }
+# One case of the 46 (0.0217): nat-docs-1024 pos 30, the known swing position (header), flips at
+# c8/c32 on every qualified packet since build96 while every KL and top-1 criterion passes.
+cont_decisive_drop_max = 0.022
