@@ -1277,6 +1277,7 @@ pub const EMIT: &[KnobSpec] = &[
     KnobSpec::new("emit.k3_fuse_ngemv", Some("PLOW_K3_FUSE_NGEMV"), Layer::Emit, Domain::Str, UNSET, OPT_IN),
     KnobSpec::new("emit.k3_kda_conv_step_db", Some("PLOW_K3_KDA_CONV_STEP_DB"), Layer::Emit, Domain::Bool, OFF, OPT_IN),
     KnobSpec::new("emit.kda_decode_fused", Some("PLOW_KDA_DECODE_FUSED"), Layer::Emit, Domain::Bool, OFF, OPT_IN),
+    KnobSpec::new("emit.kda_decode_wide", Some("PLOW_KDA_DECODE_WIDE"), Layer::Emit, Domain::Bool, ON, PROMOTED),
     KnobSpec::new("emit.mla_materialized_prefill", Some("PLOW_MLA_MATERIALIZED_PREFILL"), Layer::Emit, Domain::Bool, OFF, OPT_IN),
     KnobSpec::new("emit.kda_chunk", Some("PLOW_KDA_CHUNK"), Layer::Emit, Domain::Bool, UNSET, OPT_IN),
     KnobSpec::new("emit.kda_chunk_qpre", Some("PLOW_KDA_CHUNK_QPRE"), Layer::Emit, Domain::Bool, ON, PROMOTED),

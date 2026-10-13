@@ -417,6 +417,7 @@ rm -f i_prefill.co i_decode.co i_flash.co tk.co \
       i_prefill_mla_moe.co i_prefill_mla_moe_gq.co \
       interp_prefill_mla_moe.elf interp_prefill_mla_moe_gq.elf \
       kda_decode_fused_gfx950.co kda_decode_fused_gfx950.elf \
+      kda_decode_wide_gfx950.co kda_decode_wide_gfx950.elf \
       kda_chunk_intra_cached_gfx950.co kda_chunk_intra_cached_gfx950.elf \
       kda_chunk_intra_wave_items_gfx950.co kda_chunk_intra_wave_items_gfx950.elf \
       attn_res_f32mix_gfx950.co attn_res_f32mix_gfx950.elf \
@@ -639,7 +640,14 @@ if [ "$ARCH" = gfx950 ] && [ "$need_kda_fused" = 1 ]; then
     $INC -DPLOW_LEAN_OBJECT=1 -DPLOW_NO_SPILL=1 \
     -DPLOW_REQUIRED_MARKER=plow_kda_decode_fused_256x16_2 \
     "$R/amd/kda_decode_fused.hip"
-  KDA_FUSED_ELFS="kda_decode_fused_gfx950.elf"
+  # Descriptor version 3 (PLOW_KDA_DECODE_WIDE): the batched-rung chain through the decode
+  # object's own bodies, so it carries the decode object's bit-identical body defines.
+  bash "$R/cmake/hipcc_hsaco.sh" hipcc "$BUN" "$ARCH" \
+    "$OUT/kda_decode_wide_gfx950.elf" plow_kda_decode_wide_v3 128 2 \
+    $INC -DPLOW_LEAN_OBJECT=1 -DPLOW_NO_SPILL=1 -DPLOW_BUCKET_DECODE=1 -DPLOW_KDA_WIDE_PF=1 \
+    -DPLOW_WAVE_RED_DPP=1 -DPLOW_REQUIRED_MARKER=plow_kda_decode_wide_3 \
+    "$R/amd/kda_decode_wide.hip"
+  KDA_FUSED_ELFS="kda_decode_fused_gfx950.elf kda_decode_wide_gfx950.elf"
 fi
 
 # Opt-in lean MoE body variants requested at emit (PLOW_MOE_STAGE1_BODY / PLOW_MOE_STAGE2_BODY).

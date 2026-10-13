@@ -720,6 +720,12 @@ pub struct EmitConfig {
     #[arg(long = "emit-kda-decode-fused", env = "PLOW_KDA_DECODE_FUSED", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
     pub kda_decode_fused: bool,
 
+    /// Emit each batched decode rung's KDA Conv3 -> StateStepG -> GatedNorm chain as one
+    /// standalone op-125 boundary (descriptor version 3): the interpreter's bodies, one workgroup
+    /// per (row, head). Bit-identical. Default on; `=0` rollback.
+    #[arg(long = "emit-kda-decode-wide", env = "PLOW_KDA_DECODE_WIDE", default_value_t = true, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
+    pub kda_decode_wide: bool,
+
     /// Materialize MLA Q/K/V and emit the standalone asymmetric gfx950 prefill boundary.
     /// Opt-in candidate: exact for the first chunk, continuation chunks still diverge.
     #[arg(long, env = "PLOW_MLA_MATERIALIZED_PREFILL", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
@@ -1775,6 +1781,7 @@ impl EmitConfig {
             k3_fuse_ngemv: env_str("PLOW_K3_FUSE_NGEMV"),
             k3_kda_conv_step_db: env_bool("PLOW_K3_KDA_CONV_STEP_DB"),
             kda_decode_fused: env_bool("PLOW_KDA_DECODE_FUSED"),
+            kda_decode_wide: env_opt_out("PLOW_KDA_DECODE_WIDE"),
             mla_materialized_prefill: env_bool("PLOW_MLA_MATERIALIZED_PREFILL"),
             kda_chunk: env_bool_opt("PLOW_KDA_CHUNK"),
             kda_chunk_qpre: env_opt_out("PLOW_KDA_CHUNK_QPRE"),
