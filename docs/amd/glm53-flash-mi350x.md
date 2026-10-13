@@ -540,6 +540,20 @@ The packet from config + index alone (no weights) is 70 MB: 4 prefill buckets + 
   per group); prefill 1k 204 ms (TP8 173). Two such groups (DP2xTP4) would serve 128 streams at
   ~1715 tok/s / 75 ms vs TP8's 1408 tok/s / 91 ms at B=128 — a +22% throughput lever at c128,
   but plowrt has no data-parallel serving on AMD (two engines behind one router); hand-off.
+- 05:00 UTC (10-13), decode floor at rungs 1/8 (branch kern-c1-decode-floor). Rung-1 trace on
+  v8b: 1846 packets, ~953-hop chain, inter-hop gap ~0.5 us, op body ~22 us/hop; workgroups with
+  NO work in a wide packet still spent ~18-20 us from ready to end. Not L2 invalidation
+  (PLOW_GATE_NOINV diagnostic: -3%) and not I-cache: `plow_exec` was a real call whose prologue
+  saved ~110 VGPR dwords/lane to scratch before selecting the op, every packet, every WG (the
+  gfx942 direct-GEMV path that skips it is off for FP8/K3). Landed, all streams byte-equal to
+  v8b at every rung and on 4k/16k prompts (32-step validate):
+  (a) f2160842 + 7545d2fa: workgroup-per-output decode GemvF32 and two emit folds
+  (PLOW_GLM_HC_NORM_FOLD, PLOW_GLM_HC_POST_FOLD; rung 1 1846 -> 1678 packets, critical path
+  909 -> 741): r1/B8/B32/B128 26.1/44.5/55.4/84.9 -> 24.1/42.1/54.4/82.9 ms;
+  (b) 76d03d94 + d70122b6: gfx950 K3 decode objects inline `plow_exec` (spills tiers 0 -> 83,
+  wide 6 -> 198): r1 24.1 -> 12.3-12.9, B8 42.1 -> 31.2, B32 54.4 -> 53.0 ms, B128 82.0-86.1 vs
+  82.3-91.3 (bimodal, within noise), 4k/16k r1 23.5/23.7 -> 13.0/13.1 ms. A GEMV-only direct
+  arm instead gave r1 19.4 ms. Serving cells not re-run.
 
 ## 5. Results
 
