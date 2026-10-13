@@ -3963,8 +3963,10 @@ extern "C" __global__ void __launch_bounds__(PLOW_NV_THREADS) PLOW_SYM(plow_sm12
  * prefill window) fits 128 registers without spilling; at one block per SM (188 registers) the
  * conv ran 116 vs 83 us at 4096 rows. */
 #define PLOW_LIGHT_PF_BOUNDS __launch_bounds__(PLOW_NV_THREADS, 2)
+#define PLOW_LIGHT_PF_MINBLOCKS 2
 #else
 #define PLOW_LIGHT_PF_BOUNDS __launch_bounds__(PLOW_NV_THREADS)
+#define PLOW_LIGHT_PF_MINBLOCKS 1
 #endif
 extern "C" __global__ void PLOW_LIGHT_PF_BOUNDS PLOW_SYM(plow_sm120_light_pf)(PlowProgram prog,
                                                                               unsigned inst) {
@@ -4022,7 +4024,7 @@ extern "C" __global__ void PLOW_LIGHT_PF_BOUNDS PLOW_SYM(plow_sm120_light_pf)(Pl
             (const int*)LIGHT_TEN(7));
         break;
     case PLOW_DOP_QWEN_GDN_CONV_PREFILL:
-        d_qwen_gdn_conv_prefill<true, 2>((__nv_bfloat16*)LIGHT_TEN(0), (const __nv_bfloat16*)LIGHT_TEN(1),
+        d_qwen_gdn_conv_prefill<true, 2, PLOW_LIGHT_PF_MINBLOCKS>((__nv_bfloat16*)LIGHT_TEN(0), (const __nv_bfloat16*)LIGHT_TEN(1),
             (const __nv_bfloat16*)LIGHT_TEN(2), (__nv_bfloat16*)LIGHT_TEN(3), in->i[0], in->i[1],
             in->i[2], in->i[3], slice, nblk, (const int*)LIGHT_TEN(5));
         break;

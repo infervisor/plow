@@ -761,12 +761,110 @@ static __device__ __forceinline__ void d_qwen_gdn_conv_serial_channel(__nv_bfloa
     }
 }
 
+// Rows per (8-channel group, tile) item of the width-4 walk: the smallest tile that fills the
+// entry's resident threads (RESB blocks per SM, %nsmid SMs) a whole number of rounds. An item
+// costs its rows, so a part-filled last round costs a full one: 16-row tiles at 1024 rows x
+// 1280 groups were 81920 items on the light entry's 67584 threads, a second round 21% full.
+// Standalone (convbench2, H100): 1024 rows 29.1 -> 25.4 us with 20-row tiles, 512 rows 20.8 ->
+// 17.6 with 10, 4096 rows 87.7 -> 78.6 with 40 (two rounds; one round of 78 would exceed the
+// register window). Multiples of DEPTH, at most 64 rows.
+template <unsigned DEPTH, unsigned RESB>
+static __device__ __forceinline__ unsigned qwen_conv4_tile_rows(unsigned rows, unsigned cg) {
+    unsigned nsm;
+    asm("mov.u32 %0, %%nsmid;" : "=r"(nsm));
+    const unsigned long long resident = (unsigned long long)nsm * RESB * blockDim.x;
+    const unsigned long long row_items = (unsigned long long)rows * cg;
+    for (unsigned k = 1;; k++) {
+        unsigned vt = (unsigned)((row_items + k * resident - 1) / (k * resident));
+        vt = (vt + DEPTH - 1) / DEPTH * DEPTH;
+        if (vt < DEPTH) vt = DEPTH;
+        if (vt <= 64) return vt;
+    }
+}
+
+// One (8-channel group, `vt`-row tile) item of the width-4 (Qwen3.5) fast path: eight channels
+// (16 B) per thread. The 2-byte per-channel tile walk was latency-bound: 12.8 / 50.6 ms at
+// 1024 / 4096 rows against a 0.6 / 2.4 ms byte floor. Only the tile-0 thread reads the history
+// (sources before the chunk) and, once its tile is done, rewrites it from the chunk's last
+// width-1 rows; every other tile's taps lie inside the chunk. The window streams: three live
+// rows plus the next DEPTH loaded together, unpacked by bit shifts so no vector takes an
+// address. Rolled groups of DEPTH rows with the next group's loads in flight: unrolled, the
+// 128 sigmoids of a 16-row tile were ~4000 straight-line instructions (64 KB) that every warp
+// streamed once, and ncu put 46% of the light conv's warp stalls on instruction fetch; rolled,
+// the row loads showed (long_scoreboard 23%). 1024-row site, light entry: 61 -> 43 (rolled, 4
+// rows) -> 39 us (2 rows). Same fmaf chain and sigmoid per output as the serial walk below.
+template <unsigned DEPTH>
+static __device__ __forceinline__ void d_qwen_gdn_conv4_tile(__nv_bfloat16* out,
+    const __nv_bfloat16* in, const __nv_bfloat16* weight, __nv_bfloat16* history,
+    unsigned channels, unsigned tokens, unsigned c0, unsigned tile, unsigned vt) {
+    constexpr unsigned PD = DEPTH;
+    const unsigned t0 = tile * vt, t1 = min(t0 + vt, tokens), nt = t1 - t0;
+    float wf[4][8];
+#pragma unroll
+    for (int ch = 0; ch < 8; ch++) {
+        const __nv_bfloat16* w = weight + (size_t)(c0 + ch) * 4u;
+#pragma unroll
+        for (int j = 0; j < 4; j++) wf[j][ch] = __bfloat162float(w[j]);
+    }
+    float r0[8], r1[8], r2[8];
+    if (tile == 0) {
+#pragma unroll
+        for (int ch = 0; ch < 8; ch++) {
+            const __nv_bfloat16* h = history + (size_t)(c0 + ch) * 3u;
+            r0[ch] = __bfloat162float(h[0]);
+            r1[ch] = __bfloat162float(h[1]);
+            r2[ch] = __bfloat162float(h[2]);
+        }
+    } else {
+        qwen_bf_unpack8(*(const uint4*)(in + (size_t)(t0 - 3) * channels + c0), r0);
+        qwen_bf_unpack8(*(const uint4*)(in + (size_t)(t0 - 2) * channels + c0), r1);
+        qwen_bf_unpack8(*(const uint4*)(in + (size_t)(t0 - 1) * channels + c0), r2);
+    }
+    uint4 nx[PD];
+#pragma unroll
+    for (unsigned u = 0; u < PD; u++)
+        nx[u] = u < nt ? *(const uint4*)(in + (size_t)(t0 + u) * channels + c0)
+                       : make_uint4(0u, 0u, 0u, 0u);
+#pragma unroll 1
+    for (unsigned t = 0; t < nt; t += PD) {
+        uint4 nn[PD];
+#pragma unroll
+        for (unsigned u = 0; u < PD; u++)
+            nn[u] = t + PD + u < nt ? *(const uint4*)(in + (size_t)(t0 + t + PD + u) * channels + c0)
+                                    : make_uint4(0u, 0u, 0u, 0u);
+#pragma unroll
+        for (unsigned u = 0; u < PD; u++) {
+            float x[8], o[8];
+            qwen_bf_unpack8(nx[u], x);
+#pragma unroll
+            for (int ch = 0; ch < 8; ch++) {
+                float sum = fmaf(r0[ch], wf[0][ch], 0.f);
+                sum = fmaf(r1[ch], wf[1][ch], sum);
+                sum = fmaf(r2[ch], wf[2][ch], sum);
+                sum = fmaf(x[ch], wf[3][ch], sum);
+                o[ch] = qwen_silu(sum);
+                r0[ch] = r1[ch]; r1[ch] = r2[ch]; r2[ch] = x[ch];
+            }
+            if (t + u < nt) *(uint4*)(out + (size_t)(t0 + t + u) * channels + c0) = qwen_bf_pack8(o);
+        }
+#pragma unroll
+        for (unsigned u = 0; u < PD; u++) nx[u] = nn[u];
+    }
+    if (tile == 0) {
+#pragma unroll
+        for (int j = 0; j < 3; j++)
+            for (int ch = 0; ch < 8; ch++)
+                history[(size_t)(c0 + ch) * 3u + j] = in[(size_t)(tokens + j - 3) * channels + c0 + ch];
+    }
+}
+
 // One sequence of `tokens` rows: taps before row 0 come from `history` (this slot's last
 // width-1 rows), which is rewritten from the sequence's last rows.
 // `DEPTH`: rows of the width-4 fast path per loop group, with the next group's rows loaded
 // during this one (2 x DEPTH in flight). 4 on the prefill interpreter; 2 on the 128-register
 // light entry (per 1024-row site: 4 -> 43 us, 2 -> 39, 1 -> 43 before the double buffering).
-template <bool PF, unsigned DEPTH = 4>
+// `RESB`: the entry's resident blocks per SM (its launch bounds), which size the tiles.
+template <bool PF, unsigned DEPTH = 4, unsigned RESB = 1>
 static __device__ void d_qwen_gdn_conv_prefill_seq(__nv_bfloat16* out, const __nv_bfloat16* in,
     const __nv_bfloat16* weight, __nv_bfloat16* history, unsigned channels,
     unsigned width, unsigned tokens, unsigned slice, unsigned nblk) {
@@ -779,86 +877,10 @@ static __device__ void d_qwen_gdn_conv_prefill_seq(__nv_bfloat16* out, const __n
     // Prefill instantiations only: the staged rows cost the decode entry (already at the
     // 255-register cap) stack for an op its programs never run.
     if (width == 4 && (channels & 7u) == 0 && tokens >= 3) {
-        // Width-4 (Qwen3.5) fast path: eight channels (16 B) per thread over 16-token tiles. The
-        // 2-byte per-channel tile walk was latency-bound: 12.8 / 50.6 ms at 1024 / 4096 rows
-        // against a 0.6 / 2.4 ms byte floor. The window streams: three live rows plus the next
-        // eight loaded together (four in flight ran 16.1 ms at 4096 rows against 13.6 for a
-        // 19-vector tile: loads in flight are what pays), unpacked by bit shifts so no vector
-        // takes an address. 16-token tiles (twice the threads of 32, three extra row loads per
-        // tile) ran 83 vs 234 us at 4096 x 8192 and 24 vs 38 us at 1024 rows (one op, H100);
-        // 8-token tiles were slower again. Same fmaf chain and sigmoid per output as the serial
-        // walk below.
-        constexpr unsigned VT = 16, PD = DEPTH;
-        const unsigned cg = channels >> 3, ntiles = (tokens + VT - 1) / VT;
-        for (unsigned i = slice * blockDim.x + threadIdx.x; i < cg * ntiles; i += nblk * blockDim.x) {
-            const unsigned c0 = (i % cg) * 8u, tile = i / cg;
-            const unsigned t0 = tile * VT, t1 = min(t0 + VT, tokens), nt = t1 - t0;
-            float wf[4][8];
-#pragma unroll
-            for (int ch = 0; ch < 8; ch++) {
-                const __nv_bfloat16* w = weight + (size_t)(c0 + ch) * 4u;
-#pragma unroll
-                for (int j = 0; j < 4; j++) wf[j][ch] = __bfloat162float(w[j]);
-            }
-            float r0[8], r1[8], r2[8];
-            if (tile == 0) {
-#pragma unroll
-                for (int ch = 0; ch < 8; ch++) {
-                    const __nv_bfloat16* h = history + (size_t)(c0 + ch) * 3u;
-                    r0[ch] = __bfloat162float(h[0]);
-                    r1[ch] = __bfloat162float(h[1]);
-                    r2[ch] = __bfloat162float(h[2]);
-                }
-            } else {
-                qwen_bf_unpack8(*(const uint4*)(in + (size_t)(t0 - 3) * channels + c0), r0);
-                qwen_bf_unpack8(*(const uint4*)(in + (size_t)(t0 - 2) * channels + c0), r1);
-                qwen_bf_unpack8(*(const uint4*)(in + (size_t)(t0 - 1) * channels + c0), r2);
-            }
-            // Rolled groups of PD rows with the next group's loads in flight: unrolled, the
-            // 128 sigmoids of a tile were ~4000 straight-line instructions (64 KB) that every
-            // warp streamed once, and ncu put 46% of the light conv's warp stalls on
-            // instruction fetch (no_instruction; 61 us per 1024-row site against a ~14 us byte
-            // floor, flat in the grid size); rolled, the row loads showed (long_scoreboard 23%:
-            // the two blocks' warps load in lockstep). 1024-row site, light entry: 61 -> 43
-            // (rolled, 4 rows) -> 39 us (2 rows).
-            uint4 nx[PD];
-#pragma unroll
-            for (unsigned u = 0; u < PD; u++)
-                nx[u] = u < nt ? *(const uint4*)(in + (size_t)(t0 + u) * channels + c0)
-                               : make_uint4(0u, 0u, 0u, 0u);
-#pragma unroll 1
-            for (unsigned t = 0; t < VT; t += PD) {
-                if (t >= nt) break;
-                uint4 nn[PD];
-#pragma unroll
-                for (unsigned u = 0; u < PD; u++)
-                    nn[u] = t + PD + u < nt ? *(const uint4*)(in + (size_t)(t0 + t + PD + u) * channels + c0)
-                                            : make_uint4(0u, 0u, 0u, 0u);
-#pragma unroll
-                for (unsigned u = 0; u < PD; u++) {
-                    float x[8], o[8];
-                    qwen_bf_unpack8(nx[u], x);
-#pragma unroll
-                    for (int ch = 0; ch < 8; ch++) {
-                        float sum = fmaf(r0[ch], wf[0][ch], 0.f);
-                        sum = fmaf(r1[ch], wf[1][ch], sum);
-                        sum = fmaf(r2[ch], wf[2][ch], sum);
-                        sum = fmaf(x[ch], wf[3][ch], sum);
-                        o[ch] = qwen_silu(sum);
-                        r0[ch] = r1[ch]; r1[ch] = r2[ch]; r2[ch] = x[ch];
-                    }
-                    if (t + u < nt) *(uint4*)(out + (size_t)(t0 + t + u) * channels + c0) = qwen_bf_pack8(o);
-                }
-#pragma unroll
-                for (unsigned u = 0; u < PD; u++) nx[u] = nn[u];
-            }
-            if (tile == 0) {
-#pragma unroll
-                for (int j = 0; j < 3; j++)
-                    for (int ch = 0; ch < 8; ch++)
-                        history[(size_t)(c0 + ch) * 3u + j] = in[(size_t)(tokens + j - 3) * channels + c0 + ch];
-            }
-        }
+        const unsigned cg = channels >> 3, vt = qwen_conv4_tile_rows<DEPTH, RESB>(tokens, cg);
+        const unsigned ntiles = (tokens + vt - 1) / vt;
+        for (unsigned i = slice * blockDim.x + threadIdx.x; i < cg * ntiles; i += nblk * blockDim.x)
+            d_qwen_gdn_conv4_tile<DEPTH>(out, in, weight, history, channels, tokens, (i % cg) * 8u, i / cg, vt);
         return;
     }
     }
@@ -897,11 +919,94 @@ static __device__ void d_qwen_gdn_conv_prefill_seq(__nv_bfloat16* out, const __n
         d_qwen_gdn_conv_serial_channel(out, in, weight, history, channels, width, tokens, c);
 }
 
+// A request shorter than width-1 rows (a rider's one-row decode request) for one 8-channel
+// group: every tap of every row comes from the history or the request's own rows, which the
+// register window holds, and the history is rewritten from the window. The 8 channels' 3-row
+// history is 48 contiguous bytes (three 16-B vectors). Same fmaf chain and sigmoid per output
+// as the serial walk; the window's floats are the bf16 values, so the rewrite is exact.
+static __device__ __forceinline__ void d_qwen_gdn_conv4_short(__nv_bfloat16* out,
+    const __nv_bfloat16* in, const __nv_bfloat16* weight, __nv_bfloat16* history,
+    unsigned channels, unsigned tokens, unsigned c0) {
+    float wf[4][8];
+#pragma unroll
+    for (int ch = 0; ch < 8; ch++) {
+        const __nv_bfloat16* w = weight + (size_t)(c0 + ch) * 4u;
+#pragma unroll
+        for (int j = 0; j < 4; j++) wf[j][ch] = __bfloat162float(w[j]);
+    }
+    uint4* hv = (uint4*)(history + (size_t)c0 * 3u);
+    const uint4 h0 = hv[0], h1 = hv[1], h2 = hv[2];
+    // [ch0: r0 r1 r2][ch1: r0 r1 r2]... across the three vectors.
+    const unsigned hw[12] = {h0.x, h0.y, h0.z, h0.w, h1.x, h1.y, h1.z, h1.w, h2.x, h2.y, h2.z, h2.w};
+    float r0[8], r1[8], r2[8];
+#pragma unroll
+    for (int ch = 0; ch < 8; ch++) {
+        const unsigned e = 3u * ch;
+        r0[ch] = (e & 1u) ? qwen_bf_hi(hw[e >> 1]) : qwen_bf_lo(hw[e >> 1]);
+        r1[ch] = ((e + 1u) & 1u) ? qwen_bf_hi(hw[(e + 1u) >> 1]) : qwen_bf_lo(hw[(e + 1u) >> 1]);
+        r2[ch] = ((e + 2u) & 1u) ? qwen_bf_hi(hw[(e + 2u) >> 1]) : qwen_bf_lo(hw[(e + 2u) >> 1]);
+    }
+    for (unsigned t = 0; t < tokens; t++) {
+        float x[8], o[8];
+        qwen_bf_unpack8(*(const uint4*)(in + (size_t)t * channels + c0), x);
+#pragma unroll
+        for (int ch = 0; ch < 8; ch++) {
+            float sum = fmaf(r0[ch], wf[0][ch], 0.f);
+            sum = fmaf(r1[ch], wf[1][ch], sum);
+            sum = fmaf(r2[ch], wf[2][ch], sum);
+            sum = fmaf(x[ch], wf[3][ch], sum);
+            o[ch] = qwen_silu(sum);
+            r0[ch] = r1[ch]; r1[ch] = r2[ch]; r2[ch] = x[ch];
+        }
+        *(uint4*)(out + (size_t)t * channels + c0) = qwen_bf_pack8(o);
+    }
+    float hf[24];
+#pragma unroll
+    for (int ch = 0; ch < 8; ch++) { hf[3 * ch] = r0[ch]; hf[3 * ch + 1] = r1[ch]; hf[3 * ch + 2] = r2[ch]; }
+    hv[0] = make_uint4(qwen_bf_pack(hf[0], hf[1]), qwen_bf_pack(hf[2], hf[3]), qwen_bf_pack(hf[4], hf[5]), qwen_bf_pack(hf[6], hf[7]));
+    hv[1] = make_uint4(qwen_bf_pack(hf[8], hf[9]), qwen_bf_pack(hf[10], hf[11]), qwen_bf_pack(hf[12], hf[13]), qwen_bf_pack(hf[14], hf[15]));
+    hv[2] = make_uint4(qwen_bf_pack(hf[16], hf[17]), qwen_bf_pack(hf[18], hf[19]), qwen_bf_pack(hf[20], hf[21]), qwen_bf_pack(hf[22], hf[23]));
+}
+
+// Exclusive prefix sums of two per-entry arrays in shared memory (n <= 32 x blockDim; a[n] and
+// b[n] receive the totals), by warp 0: lane-strided segments, a shuffle scan across the lanes.
+static __device__ __forceinline__ void qwen_pack_scan2(unsigned* a, unsigned* b, unsigned n) {
+    if (threadIdx.x < 32) {
+        const unsigned lane = threadIdx.x, per = (n + 31u) >> 5, r0 = lane * per, r1 = min(r0 + per, n);
+        unsigned ta = 0, tb = 0;
+        for (unsigned r = r0; r < r1; r++) { ta += a[r]; tb += b[r]; }
+        unsigned ia = ta, ib = tb;
+#pragma unroll
+        for (unsigned o = 1; o < 32; o <<= 1) {
+            const unsigned ua = __shfl_up_sync(0xffffffffu, ia, o), ub = __shfl_up_sync(0xffffffffu, ib, o);
+            if (lane >= o) { ia += ua; ib += ub; }
+        }
+        unsigned ea = ia - ta, eb = ib - tb;
+        for (unsigned r = r0; r < r1; r++) {
+            const unsigned va = a[r], vb = b[r];
+            a[r] = ea; b[r] = eb;
+            ea += va; eb += vb;
+        }
+        if (lane == 31) { a[n] = ia; b[n] = ib; }
+    }
+}
+
+// First entry r in [0, n) whose exclusive prefix end `p[r + 1]` exceeds `x` (p non-decreasing).
+static __device__ __forceinline__ unsigned qwen_pack_find(const unsigned* p, unsigned n, unsigned x) {
+    unsigned lo = 0, hi = n;
+    while (lo < hi) {
+        const unsigned mid = (lo + hi) >> 1;
+        if (p[mid + 1] > x) hi = mid; else lo = mid + 1;
+    }
+    return lo;
+}
+
 // `rows` > `tokens`: a padded chunk (plowrt patches tokens = real rows, rows = bucket); the pad
 // rows' outputs are zeroed so the layers after the conv see finite activations. `req` (packed
 // prefill): the request table [n, (row0, len, slot, end) x n]; each request is its own sequence
 // with its slot's history (history is the unshifted per-slot tensor), tokens = the real rows.
-template <bool PF, unsigned DEPTH = 4>
+// The whole block calls this (its barriers).
+template <bool PF, unsigned DEPTH = 4, unsigned RESB = 1>
 static __device__ void d_qwen_gdn_conv_prefill(__nv_bfloat16* out, const __nv_bfloat16* in,
     const __nv_bfloat16* weight, __nv_bfloat16* history, unsigned channels,
     unsigned width, unsigned tokens, unsigned rows, unsigned slice, unsigned nblk,
@@ -913,16 +1018,78 @@ static __device__ void d_qwen_gdn_conv_prefill(__nv_bfloat16* out, const __nv_bf
             out[i] = __float2bfloat16(0.f);
     }
     if (!req) {
-        d_qwen_gdn_conv_prefill_seq<PF, DEPTH>(out, in, weight, history, channels, width, tokens, slice, nblk);
+        d_qwen_gdn_conv_prefill_seq<PF, DEPTH, RESB>(out, in, weight, history, channels, width, tokens, slice, nblk);
         return;
     }
     const unsigned n = (unsigned)req[0];
+    if constexpr (PF) {
+    if (width == 4 && (channels & 7u) == 0) {
+        // All requests' items in one pass: the long requests' (tile, channel group) items, tiles
+        // sized by the rows of all of them with a rider counted as two rows (its item loads the
+        // history and the weights for one row), then the short requests' (request, channel
+        // group) items, which run alongside the tiles rather than after them. A pass per request
+        // left the grid ~30% busy on the 512 + 501-row ticks of 4K c32 serving (66 us per conv
+        // vs 39 for one 1013-row request), and a per-channel rider pass after the tiles kept the
+        // serving conv at 58 us when the same rows without riders took 33. The table is reduced
+        // once per block into shared prefix sums (tiles and short requests per entry) and each
+        // item finds its request by a binary search over them: a per-thread walk of the table
+        // per item (a dependent load and a division per entry, every thread of the grid, ~3.5
+        // walks each) was pure issue time, 32 riders alone 12-19 us. Same per-tile walk.
+        constexpr unsigned PMAX = 256;
+        __shared__ unsigned s_tile[PMAX + 1], s_short[PMAX + 1];
+        if (n > PMAX) { if (threadIdx.x == 0) __trap(); return; }
+        const unsigned cg = channels >> 3;
+        for (unsigned r = threadIdx.x; r < n; r += blockDim.x) {
+            const unsigned row0 = (unsigned)req[1 + 4 * r], len = (unsigned)req[2 + 4 * r];
+            if (!len || row0 + len > tokens) __trap();
+            const bool lng = len + 1 >= width;
+            s_tile[r] = lng ? len : 0u;
+            s_short[r] = lng ? 0u : 1u;
+        }
+        __syncthreads();
+        qwen_pack_scan2(s_tile, s_short, n);
+        __syncthreads();
+        const unsigned long_rows = s_tile[n], n_short = s_short[n];
+        const unsigned vt = qwen_conv4_tile_rows<DEPTH, RESB>(long_rows + 2u * n_short, cg);
+        __syncthreads();
+        for (unsigned r = threadIdx.x; r < n; r += blockDim.x) {
+            const unsigned len = (unsigned)req[2 + 4 * r];
+            const bool lng = len + 1 >= width;
+            s_tile[r] = lng ? (len + vt - 1) / vt : 0u;
+            s_short[r] = lng ? 0u : 1u;
+        }
+        __syncthreads();
+        qwen_pack_scan2(s_tile, s_short, n);
+        __syncthreads();
+        const unsigned long_items = cg * s_tile[n], items = long_items + cg * n_short;
+        for (unsigned i = slice * blockDim.x + threadIdx.x; i < items; i += nblk * blockDim.x) {
+            const unsigned c0 = (i % cg) * 8u;
+            if (i < long_items) {
+                const unsigned tile = i / cg, r = qwen_pack_find(s_tile, n, tile);
+                const unsigned row0 = (unsigned)req[1 + 4 * r], len = (unsigned)req[2 + 4 * r];
+                const unsigned slot = (unsigned)req[3 + 4 * r];
+                d_qwen_gdn_conv4_tile<DEPTH>(out + (size_t)row0 * channels, in + (size_t)row0 * channels,
+                    weight, history + (size_t)slot * channels * 3u, channels, len, c0, tile - s_tile[r], vt);
+            } else {
+                const unsigned r = qwen_pack_find(s_short, n, (i - long_items) / cg);
+                const unsigned row0 = (unsigned)req[1 + 4 * r], len = (unsigned)req[2 + 4 * r];
+                const unsigned slot = (unsigned)req[3 + 4 * r];
+                d_qwen_gdn_conv4_short(out + (size_t)row0 * channels, in + (size_t)row0 * channels,
+                    weight, history + (size_t)slot * channels * 3u, channels, len, c0);
+            }
+        }
+        return;
+    }
+    }
+    for (unsigned r = 0; r < n; r++) {
+        const unsigned row0 = (unsigned)req[1 + 4 * r], len = (unsigned)req[2 + 4 * r];
+        if (!len || row0 + len > tokens) { if (threadIdx.x == 0) __trap(); return; }
+    }
     for (unsigned r = 0; r < n; r++) {
         const unsigned row0 = (unsigned)req[1 + 4 * r], len = (unsigned)req[2 + 4 * r];
         const unsigned slot = (unsigned)req[3 + 4 * r];
-        if (!len || row0 + len > tokens) { if (threadIdx.x == 0) __trap(); return; }
         if (len + 1 < width) continue;
-        d_qwen_gdn_conv_prefill_seq<PF, DEPTH>(out + (size_t)row0 * channels, in + (size_t)row0 * channels, weight,
+        d_qwen_gdn_conv_prefill_seq<PF, DEPTH, RESB>(out + (size_t)row0 * channels, in + (size_t)row0 * channels, weight,
             history + (size_t)slot * channels * (width - 1), channels, width, len, slice, nblk);
     }
     // Requests shorter than width-1 rows (the riders' one-row decode requests) in one flat pass:
