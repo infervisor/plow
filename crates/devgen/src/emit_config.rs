@@ -1012,6 +1012,23 @@ pub struct EmitConfig {
     #[arg(long, env = "PLOW_GLM_HC_PRE_TAIL", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
     pub glm_hc_pre_tail: bool,
 
+    /// GLM-5.3-Flash sequence-parallel prefill (`PLOW_GLM_SEQ_PAR`): score and top-k the router on
+    /// this rank's row band and gather the route table out of peer slot 5, as
+    /// `PLOW_GLM_SEQ_PAR_PROJ` does, without the projection half. Same kernels per row.
+    #[arg(long, env = "PLOW_GLM53_SP_ROUTER", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
+    pub glm53_sp_router: bool,
+
+    /// GLM-5.3-Flash sequence-parallel prefill: a KDA layer's input RMSNorm runs on this rank's
+    /// row band and the normed rows are gathered (as the MLA and FFN seams do), instead of
+    /// gathering the raw layer input and norming all rows on every rank. Same kernel per row.
+    #[arg(long, env = "PLOW_GLM53_SP_KDA_NORM", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
+    pub glm53_sp_kda_norm: bool,
+
+    /// With `PLOW_GLM53_SP_KDA_NORM`: the replicated low-rank g_a / f_a projections run on the band
+    /// and are gathered with the normed rows in one all-gather. Same kernels per row.
+    #[arg(long, env = "PLOW_GLM53_SP_KDA_LOWRANK", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
+    pub glm53_sp_kda_lowrank: bool,
+
     /// GLM-5.3-Flash batched decode (rows > 1): largest split-K factor for the bf16 GemmSmall
     /// projections whose 64x128 tiles leave most workgroups idle (0 = off). NOT bit-identical.
     #[arg(long, env = "PLOW_GLM_DEC_SPLITK")]
@@ -1743,6 +1760,9 @@ impl EmitConfig {
             glm_hc_norm_fold: env_bool("PLOW_GLM_HC_NORM_FOLD"),
             glm_hc_post_fold: env_bool("PLOW_GLM_HC_POST_FOLD"),
             glm_hc_pre_tail: env_bool("PLOW_GLM_HC_PRE_TAIL"),
+            glm53_sp_router: env_bool("PLOW_GLM53_SP_ROUTER"),
+            glm53_sp_kda_norm: env_bool("PLOW_GLM53_SP_KDA_NORM"),
+            glm53_sp_kda_lowrank: env_bool("PLOW_GLM53_SP_KDA_LOWRANK"),
             glm_dec_splitk: env_u32("PLOW_GLM_DEC_SPLITK"),
             glm_xr_hcpost: env_bool("PLOW_GLM_XR_HCPOST"),
             glm_decode_glu_rows: env_bool("PLOW_GLM_DECODE_GLU_ROWS"),
