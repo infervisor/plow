@@ -4313,14 +4313,32 @@ __device__ static void plow_exec(CInst in_v, unsigned slice, CTens T_v, plow_sme
                                 (const int*)TEN(5), in->i[3]);
             break;
         case PLOW_DOP_DSA_POOL_EXPAND:
-            /* Batched decode (i3 = 1): every row is its own sequence, length kv_len[row]. */
+            /* Decode (i3 = 1): every row is its own sequence, length kv_len[row]. COMPACT: the
+             * min(pools, n_groups) selected pools (op 118's -1 pads trail) expand first, the tail
+             * follows them, -1 after — so the gather's first min(width, kv_len) slots hold every
+             * selected token and any -1 is masked there. */
             if (in->i[3] == 1u) {
-                const unsigned cols = in->i[1] * in->i[2] + in->i[2] - 1u;
-                for (unsigned r = 0; r < in->i[0]; r++)
-                    d_dsa_pool_expand((int32_t*)TEN(0) + (size_t)r * cols,
-                                      (const int32_t*)TEN(1) + (size_t)r * in->i[1],
-                                      (const int32_t*)TEN(2) + r, 1u, in->i[1], in->i[2], slice,
-                                      nblk);
+                const unsigned ng = in->i[1], ps = in->i[2], cols = ng * ps + ps - 1u;
+                for (unsigned r = 0; r < in->i[0]; r++) {
+                    const int len = ((const int*)TEN(2))[r];
+                    const int npool = len / (int)ps;
+                    const int nv = npool < (int)ng ? npool : (int)ng;
+                    const int tail0 = npool * (int)ps, ntail = len - tail0;
+                    const int32_t* pid = (const int32_t*)TEN(1) + (size_t)r * ng;
+                    int32_t* out = (int32_t*)TEN(0) + (size_t)r * cols;
+                    for (unsigned c = slice * PLOW_THREADS + threadIdx.x; c < cols;
+                         c += nblk * PLOW_THREADS) {
+                        const int ci = (int)c;
+                        int v = -1;
+                        if (ci < nv * (int)ps) {
+                            const int p = pid[ci / (int)ps];
+                            v = p >= 0 ? p * (int)ps + ci % (int)ps : -1;
+                        } else if (ci - nv * (int)ps < ntail) {
+                            v = tail0 + (ci - nv * (int)ps);
+                        }
+                        out[c] = v;
+                    }
+                }
                 break;
             }
             d_dsa_pool_expand((int32_t*)TEN(0), (const int32_t*)TEN(1), (const int32_t*)TEN(2),

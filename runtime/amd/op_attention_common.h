@@ -2536,9 +2536,11 @@ __device__ void d_flash_mla_decode(float* __restrict__ Opart, float* __restrict_
                                                : (wave * KRW + p * KR + krl);
                 const unsigned kv = kv0 + rl;
                 /* dense: cache row (kv & kv_mask); gather: the selected index ibase[kv]. */
-                const unsigned row = GATHER ? (kv < hi ? (unsigned)ibase[kv] : 0u) : (kv & kv_mask);
+                /* A negative selected index (an unfilled pooled-selection slot) is masked. */
+                const int gi = (GATHER && kv < hi) ? ibase[kv] : 0;
+                const unsigned row = GATHER ? (gi > 0 ? (unsigned)gi : 0u) : (kv & kv_mask);
                 const bool keep =
-                    GATHER ? (kv < hi)
+                    GATHER ? (kv < hi && gi >= 0)
                            : (kv < hi && kv <= qpos && (!window || (qpos - kv) < window));
                 float s0[GF];
 #pragma unroll
@@ -2688,7 +2690,7 @@ __device__ void d_flash_mla_decode(float* __restrict__ Opart, float* __restrict_
 #pragma unroll
                 for (int c = 0; c < VU; c++) {
                     const unsigned t = kv0 + r + (unsigned)c * NG;
-                    const size_t vrow = GATHER ? (size_t)(unsigned)ibase[t] : (t & kv_mask);
+                    const size_t vrow = GATHER ? (size_t)(unsigned)max(ibase[t], 0) : (t & kv_mask);
                     if constexpr (FP8) {
                         vv[c] = fp8v8_to_bf16v8(ld_glob_fp8v8(cb8 + vrow * DK + dbase));
                         vsf[c] = csc[vrow];
@@ -2711,7 +2713,7 @@ __device__ void d_flash_mla_decode(float* __restrict__ Opart, float* __restrict_
                 }
             }
             for (; r < rmax; r += NG) {
-                const size_t vrow = GATHER ? (size_t)(unsigned)ibase[kv0 + r] : ((kv0 + r) & kv_mask);
+                const size_t vrow = GATHER ? (size_t)(unsigned)max(ibase[kv0 + r], 0) : ((kv0 + r) & kv_mask);
                 bf16v8 v;
                 float vsf = 1.0f;
                 if constexpr (FP8) {

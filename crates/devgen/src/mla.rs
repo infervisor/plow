@@ -6195,11 +6195,8 @@ fn emit_glm_dsa_decode_select(
             // `select_k = topk_tokens // index_kpool` (sparse_attn_indexer_kpool.py).
             let itk_pool = itk / c.index_kpool;
             // Batched: one workgroup per row (op 59 `i[4] = 4`, the per-row exact radix).
-            let sel_wgs: Vec<u32> = if rows > 1 {
-                (0..rows.min(b.n_cu())).collect()
-            } else {
-                (0..32.min(b.n_cu())).collect()
-            };
+            // Every decode rung: the coop radix leaves slots past a short row's pool count stale.
+            let sel_wgs: Vec<u32> = (0..rows.min(b.n_cu())).collect();
             let c_sel = b.emit(DevOp::IndexSelect, sel_wgs, &[c_sc], |d| {
                 d.t[0] = n.iidx_pool;
                 d.t[1] = n.iscore;
@@ -6209,10 +6206,8 @@ fn emit_glm_dsa_decode_select(
                 d.i[0] = n_pools;
                 d.i[1] = itk_pool;
                 d.i[2] = c.index_kpool;
-                if rows > 1 {
-                    d.i[4] = 4;
-                    d.i[5] = rows;
-                }
+                d.i[4] = 4;
+                d.i[5] = rows;
             });
             // Pool ids -> token ids (+ trailing incomplete-pool tail-append), into `n.iidx`
             // ITSELF — its allocation already carries the `+ (index_kpool-1)` headroom this
@@ -6225,9 +6220,7 @@ fn emit_glm_dsa_decode_select(
                 d.i[0] = rows;
                 d.i[1] = itk_pool;
                 d.i[2] = c.index_kpool;
-                if rows > 1 {
-                    d.i[3] = 1;
-                }
+                d.i[3] = 1;
             })
         } else {
             let c_ki = b.emit(DevOp::HeadNormRope, rik.clone(), &[c_kn], |d| {
