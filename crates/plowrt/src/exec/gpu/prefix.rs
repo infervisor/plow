@@ -850,7 +850,7 @@ impl GpuEngine {
         if let Err(e) = kv.publish_at(b, toks, p_a, snap_bytes, |dst| {
             self.vmm_snap_copy(b, p_a, dst, true)
         }) {
-            tracing::info!(error = %e, slot = b, p_a, "vmm: publish_boundary skipped");
+            tracing::debug!(error = %e, slot = b, p_a, "vmm: publish_boundary skipped");
             false
         } else {
             tracing::debug!(slot = b, p_a, snap_bytes, "vmm: published successfully");
