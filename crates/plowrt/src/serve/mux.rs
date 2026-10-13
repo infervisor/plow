@@ -4659,6 +4659,7 @@ fn run_one_tick(
                     .map(|s| {
                         (
                             s.prompt_ids.len().saturating_sub(s.pf_pos),
+                            s.pf_pos > 0,
                             s.arrived.elapsed().as_secs_f64() * 1e3,
                         )
                     }),
@@ -5703,15 +5704,16 @@ enum PfHold {
     Release(u32),
 }
 
-/// `PLOW_PF_HOLD` for one tick. `pending` is `(rows not yet prefilled, ms since arrival)` per
-/// waiting prompt. With at least `min_decode` decode rows, prompts wait until three quarters of
-/// `rows` are pending (a pack that fills most of a `rows`-wide rung, with room left for the
-/// decode riders) or the oldest has waited `ms`; the release tick may then pack `rows`.
+/// `PLOW_PF_HOLD` for one tick. `pending` is `(rows not yet prefilled, started, ms since arrival)`
+/// per waiting prompt. With at least `min_decode` decode rows, fresh prompts wait until three
+/// quarters of `rows` are pending (a pack that fills most of a `rows`-wide rung, with room left
+/// for the decode riders) or the oldest has waited `ms`; the release tick may then pack `rows`.
+/// A prompt already started (chunks run or prefix rows resumed) is never held.
 #[cfg(any(feature = "hsa", feature = "cpu"))]
 fn amd_pf_hold(
     spec: Option<(u32, f64, usize)>,
     decode_rows: usize,
-    pending: impl Iterator<Item = (usize, f64)>,
+    pending: impl Iterator<Item = (usize, bool, f64)>,
 ) -> PfHold {
     let Some((rows, ms, min_decode)) = spec else {
         return PfHold::Off;
@@ -5719,8 +5721,10 @@ fn amd_pf_hold(
     if decode_rows == 0 || decode_rows < min_decode {
         return PfHold::Off;
     }
-    let (sum, oldest) = pending.fold((0usize, 0.0f64), |(n, o), (r, w)| (n + r, o.max(w)));
-    if sum > 0 && sum < rows as usize * 3 / 4 && oldest < ms {
+    let (sum, started, oldest) = pending.fold((0usize, false, 0.0f64), |(n, s, o), (r, st, w)| {
+        (n + r, s || st, o.max(w))
+    });
+    if sum > 0 && !started && sum < rows as usize * 3 / 4 && oldest < ms {
         PfHold::Held
     } else {
         PfHold::Release(rows)
@@ -9727,17 +9731,24 @@ mod tests {
     fn pf_hold_waits_for_rows_or_age_and_only_under_decode() {
         use super::{amd_pf_hold, PfHold};
         let spec = Some((8192u32, 400.0, 16usize));
-        let ones = |n: usize| std::iter::repeat((1024usize, 1.0f64)).take(n);
+        let ones = |n: usize| std::iter::repeat((1024usize, false, 1.0f64)).take(n);
         assert_eq!(amd_pf_hold(None, 128, ones(1)), PfHold::Off);
         assert_eq!(amd_pf_hold(spec, 8, ones(1)), PfHold::Off);
         assert_eq!(amd_pf_hold(spec, 128, ones(5)), PfHold::Held);
         assert_eq!(amd_pf_hold(spec, 128, ones(6)), PfHold::Release(8192));
         assert_eq!(
-            amd_pf_hold(spec, 128, [(1024, 10.0), (1024, 401.0)].into_iter()),
+            amd_pf_hold(spec, 128, [(1024, false, 10.0), (1024, false, 401.0)].into_iter()),
             PfHold::Release(8192)
         );
-        assert_eq!(amd_pf_hold(spec, 128, [(4096, 1.0)].into_iter()), PfHold::Held);
-        assert_eq!(amd_pf_hold(spec, 128, [(4096, 1.0), (4096, 1.0)].into_iter()), PfHold::Release(8192));
+        assert_eq!(amd_pf_hold(spec, 128, [(4096, false, 1.0)].into_iter()), PfHold::Held);
+        assert_eq!(
+            amd_pf_hold(spec, 128, [(4096, false, 1.0), (4096, false, 1.0)].into_iter()),
+            PfHold::Release(8192)
+        );
+        assert_eq!(
+            amd_pf_hold(spec, 128, [(1024, true, 1.0)].into_iter()),
+            PfHold::Release(8192)
+        );
         assert_eq!(amd_pf_hold(spec, 128, std::iter::empty()), PfHold::Release(8192));
     }
 

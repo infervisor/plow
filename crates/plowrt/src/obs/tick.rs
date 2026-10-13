@@ -224,7 +224,8 @@ impl Drop for TickGuard {
 
 use std::cell::RefCell;
 use std::io::Write as _;
-use std::sync::{Mutex, OnceLock};
+use std::sync::mpsc::{sync_channel, RecvTimeoutError, SyncSender};
+use std::sync::OnceLock;
 
 struct TraceLaunch {
     kind: &'static str,
@@ -266,23 +267,42 @@ fn trace_epoch() -> Instant {
     *EPOCH.get_or_init(Instant::now)
 }
 
-type Sink = Mutex<std::io::BufWriter<std::fs::File>>;
-
-fn trace_sink() -> Option<&'static Sink> {
-    static SINK: OnceLock<Option<Sink>> = OnceLock::new();
+/// Lines go through a bounded queue to one writer thread, so a slow trace file never stalls the
+/// tick; a full queue drops the line. The writer flushes whenever the queue goes idle (200 ms).
+fn trace_sink() -> Option<&'static SyncSender<String>> {
+    static SINK: OnceLock<Option<SyncSender<String>>> = OnceLock::new();
     SINK.get_or_init(|| {
-        let path = crate::config::RuntimeConfig::get().tick_trace.as_ref()?;
-        match std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(path)
-        {
-            Ok(f) => Some(Mutex::new(std::io::BufWriter::new(f))),
-            Err(err) => {
-                tracing::warn!(path = %path.display(), error = %err, "PLOW_TICK_TRACE: cannot open");
-                None
-            }
-        }
+        let path = crate::config::RuntimeConfig::get().tick_trace.clone()?;
+        let (tx, rx) = sync_channel::<String>(4096);
+        let spawned = std::thread::Builder::new()
+            .name("plowrt-ticktrace".into())
+            .spawn(move || {
+                let file = match std::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(&path)
+                {
+                    Ok(f) => f,
+                    Err(err) => {
+                        tracing::warn!(path = %path.display(), error = %err, "PLOW_TICK_TRACE: cannot open");
+                        return;
+                    }
+                };
+                let mut w = std::io::BufWriter::new(file);
+                loop {
+                    match rx.recv_timeout(std::time::Duration::from_millis(200)) {
+                        Ok(line) => {
+                            let _ = w.write_all(line.as_bytes());
+                        }
+                        Err(RecvTimeoutError::Timeout) => {
+                            let _ = w.flush();
+                        }
+                        Err(RecvTimeoutError::Disconnected) => break,
+                    }
+                }
+                let _ = w.flush();
+            });
+        spawned.ok().map(|_| tx)
     })
     .as_ref()
 }
@@ -339,7 +359,9 @@ pub fn trace_begin(ready_dec: u32, waiting: u32, waiting_rows: u32) -> Option<Tr
 
 /// The tick held its fresh prompts back (`PLOW_PF_HOLD`).
 pub fn trace_held() {
-    with_open(|r| r.held = true);
+    if trace_on() {
+        with_open(|r| r.held = true);
+    }
 }
 
 /// `rows` prompt rows came from the prefix cache instead of a launch.
@@ -525,12 +547,7 @@ impl Drop for TraceGuard {
             out
         });
         if let Some(sink) = trace_sink() {
-            if let Ok(mut w) = sink.lock() {
-                let _ = w.write_all(line.as_bytes());
-                if seq % 16 == 0 {
-                    let _ = w.flush();
-                }
-            }
+            let _ = sink.try_send(line);
         }
     }
 }
