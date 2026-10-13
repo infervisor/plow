@@ -13,7 +13,7 @@ name = "glm-5.3-flash"
 label = "gfx950-mi350x-tp8-fp8"
 network = "glm-5.3-flash"
 status = "validated"
-plow_git = "f2160842c53f0f59690b971643f9cb22d304ffb3"
+plow_git = "76d03d941eb41e07af806998e8cdfd07eb5b471c"
 doc = "docs/amd/glm53-flash-mi350x.md"
 
 # max_ctx 65536: the model's recurrent (KDA) state carries at every length, so long prompts are
@@ -98,6 +98,8 @@ env = { PLOW_DECODE_BATCH = "128", PLOW_GEMV_WALK = "1", PLOW_GEMV_MM = "4", PLO
 # output decode GemvF32) validate (2026-10-13, 32 steps): r1/B8/B32/B128 26.1/44.5/55.4/84.9 ->
 # 24.1/42.1/54.4/82.9 ms, 4k/16k-prompt rung 1 25.6/26.4 -> 23.5/23.7 ms, every slot's stream
 # byte-equal to v8b's at every rung, so the v8b FP32 gate and needles carry over.
+# Objects from 76d03d94 (gfx950 K3 decode objects inline plow_exec; same [objects] env): r1/B8/B32
+# 24.1/42.1/54.4 -> 12.9/31.2/53.0 ms, B128 within noise, 4k/16k r1 13.0/13.1 ms, streams equal.
 [emit]
 env = { PLOW_MLA_PREFILL = "full:128,512,2048,8192", PLOW_MLA_PF_V2 = "1", PLOW_GLM_PF_NS = "2", PLOW_DECODE_BATCH_LADDER = "1,8,32,128", PLOW_GLM_DECODE_GEMM_ROWS = "32", PLOW_GLM_DSA = "0", PLOW_GLM_SEQ_PAR = "1", PLOW_GLM_SEQ_PAR_PROJ = "0", PLOW_GLM_HC_NORM_FOLD = "1", PLOW_GLM_HC_POST_FOLD = "1" }
 args = [
@@ -172,8 +174,8 @@ client = "vllm 0.31.1rc1 bench serve (scripts/bench/llm_grid.sh)"
 [artifacts]
 "plowrt" = "4cf847f81a59fefd19ec9d0eaa1e9ae65e75e389f9cbef2b240c05fc5fbda048"
 "model.pkt" = "1533860b946b49cc4fc9264d0370539739f265e7e7f562db7aa8fe15d0e67805"
-"interp_decode_k3_gq.elf" = "e4216be136c038e197b98db592ec147c1d6f1662e4ff6fbb5749792f01154c88"
-"lowrung1/interp_decode_k3_gq.elf" = "6bea77dbf072eda96b4c1e50e1ce7c669cc5e3aca13c16d7f56b905f26a1f16c"
-"lowrung8/interp_decode_k3_gq.elf" = "26c4530d0854c61568c6534d83b4e1bdbd9c0aac1493e438eb661f03df468f9b"
+"interp_decode_k3_gq.elf" = "d2c617e8720d40d80d12d5aa827d87fb72fcbb71d948dc51e7811e14064a8c82"
+"lowrung1/interp_decode_k3_gq.elf" = "a4f5c606f1c51f79019074741ff92746684a6c836f7d0033ea86669df8ca4db8"
+"lowrung8/interp_decode_k3_gq.elf" = "d1630c82fa4aa602701a849014212f67a30b6c11fb606a184d865f267918a521"
 "interp_prefill_k3_moe_gq.elf" = "10d60aec2d4ca279a58220b8abec7254a97b423caed625e1f6eb1ee42cb3b5e7"
 "interp_flash_gq.elf" = "692b6bbadfbdfd30f668d40994b9c7f5178efc99d01e3c84c23047f2fb4ebfae"
