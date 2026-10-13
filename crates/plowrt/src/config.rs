@@ -1500,6 +1500,11 @@ pub struct NvidiaRuntimeConfig {
     #[arg(long = "decode-head-argmax", env = "PLOW_DECODE_HEAD_ARGMAX", default_value_t = true, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
     pub decode_head_argmax: bool,
 
+    /// The packed compact terminal's lm_head (the pack's gathered last rows) runs as one cuBLASLt
+    /// matmul at the terminal's capacity between its gather/norm and argmax windows.
+    #[arg(long = "terminal-lt", env = "PLOW_TERMINAL_LT", default_value_t = true, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
+    pub terminal_lt: bool,
+
     /// A prefill bucket's lone RmsNorm / Residual / SiLU Glu segments run as ordinary launches
     /// of the decode object's `plow_<arch>_light_pf` kernel instead of interpreter windows.
     #[arg(long = "prefill-light", env = "PLOW_PREFILL_LIGHT", default_value_t = true, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]

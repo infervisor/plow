@@ -179,6 +179,15 @@ const QWEN_PF_GRAPH: Status = Status::Candidate {
         "`=0` is the rollback to the per-segment enqueue loop",
     ],
 };
+/// The packed compact terminal ran its lm_head on the prefill object's tiled MMA arm: one
+/// 1.8-2.0 ms window per tick (seg960 at 4K) for 2.5 GB of weights, ~40% of the byte floor;
+/// the routed decode rungs read the same weights through cuBLASLt at ~2.6 TB/s.
+const TERMINAL_LT: Status = Status::Candidate {
+    evidence: &[
+        "plans/qwen38-27b-h100.md (srvprof_clk15k, segtime108): one interp_pf window of 1.8-2.0 ms per mixed tick = the compact terminal (gather, norm, head, argmax, fin) at 4K and 15K",
+        "`=0` keeps the single interpreter window",
+    ],
+};
 /// A cuBLASLt-routed decode rung's Qwen3.5 pointwise windows as light launches of the same
 /// `light_pf` kernel (block-per-row bodies: the window's outputs).
 const QWEN_LIGHT_DECODE: Status = Status::Candidate {
@@ -636,6 +645,7 @@ pub const RUNTIME: &[KnobSpec] = &[
     KnobSpec::new("rt.gen_decode_pin_nsplit", Some("PLOW_GEN_DECODE_PIN_NSPLIT"), Layer::Runtime, Domain::Bool, ON, GEN_DECODE_PIN_NSPLIT),
     KnobSpec::new("rt.decode_light_attn_s", Some("PLOW_DECODE_LIGHT_ATTN_S"), Layer::Runtime, Domain::Bool, ON, PROMOTED),
     KnobSpec::new("rt.decode_head_argmax", Some("PLOW_DECODE_HEAD_ARGMAX"), Layer::Runtime, Domain::Bool, ON, PROMOTED),
+    KnobSpec::new("rt.terminal_lt", Some("PLOW_TERMINAL_LT"), Layer::Runtime, Domain::Bool, ON, TERMINAL_LT),
     KnobSpec::new("rt.prefill_light", Some("PLOW_PREFILL_LIGHT"), Layer::Runtime, Domain::Bool, ON, PROMOTED),
     KnobSpec::new("rt.qwen_light_occ", Some("PLOW_QWEN_LIGHT_OCC"), Layer::Runtime, U32, Default::Static(Val::Nat(4)), QWEN_LIGHT_DEFAULT),
     KnobSpec::new("rt.qwen_light_decode", Some("PLOW_QWEN_LIGHT_DECODE"), Layer::Runtime, Domain::Bool, ON, QWEN_LIGHT_DECODE),

@@ -208,7 +208,13 @@ PLOW_PREFIX_CACHE = "0"
 # (PLOW_QWEN_PF_GRAPH default on; grid110 on the build106 packet: 4K tok/s 241.0/293.7/305.1,
 # TTFT p99 5865/11929/24524, TPOT p99 59.7/96.8/98.0; 15K 82.1/83.9/84.8, 22946/46136/92517,
 # 101.1/101.3/101.5; digests unchanged; gate110/110b/110c c1/c8/c32 PASS, c32 on the third serve
-# with a graphs-off control serve at 0.8572 cont_frac beside the 0.8402 pass).
+# with a graphs-off control serve at 0.8572 cont_frac beside the 0.8402 pass). The packed compact
+# terminal's lm_head over the tick's gathered last rows runs as one cuBLASLt matmul between its
+# gather/norm and argmax windows (PLOW_TERMINAL_LT default on; grid111 on the same packet, every
+# cell up: 4K tok/s 243.6/295.4/307.4, TTFT p99 5815/11830/24333, TPOT p99 59.0/96.3/97.3; 15K
+# 82.7/84.5/85.4, 22743/45829/91856, 100.5/100.5/100.6; step digests unchanged; gate111/111b/111c
+# c1/c8/c32 PASS, c32 on the third serve at 0.8572 cont_frac, the earlier serves flipping only the
+# known swing position).
 PLOW_PF_INTERLEAVE = "1024"
 
 [bench]

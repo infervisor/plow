@@ -2729,6 +2729,8 @@ pub struct GpuEngine {
     prefill_turn: usize,
     packed_prefill: Option<plow_asset::packed_prefill::Manifest>,
     packed_terminal: Option<packed_terminal::PackedTerminal>,
+    /// The cuBLASLt handle the compact terminal's lm_head runs on (`PLOW_TERMINAL_LT`).
+    terminal_lt: Option<Arc<crate::device::cuda::lt::Lt>>,
     /// KV-shared tail runner (`plow_asset::kv_shared_tail`) for the token-batch route.
     shared_tail: Option<shared_tail::SharedTail>,
     /// Restricts the next `launch_prefill_chain` to these segments.
@@ -5332,6 +5334,12 @@ impl GpuEngine {
         } else {
             None
         };
+        // The compact terminal's lm_head borrows whichever Lt handle is up; it never loads one.
+        let terminal_lt = match (&cublaslt, &cublaslt_prefill) {
+            (Some(cublaslt::ProjectionBackend::Lt(lt)), _)
+            | (_, Some(cublaslt::ProjectionBackend::Lt(lt))) => Some(Arc::clone(lt)),
+            _ => None,
+        };
         let moe_lt_dirs: Vec<&Path> = objects_dir
             .as_deref()
             .into_iter()
@@ -7288,6 +7296,7 @@ impl GpuEngine {
             prefill_turn: 0,
             packed_prefill,
             packed_terminal: None,
+            terminal_lt,
             shared_tail: None,
             pf_seg_window: None,
             pf_seg_prefix: false,

@@ -21,6 +21,19 @@ pub(super) struct PackedTerminal {
     host_ids: PinnedHost,
     /// The next launch's ids and logits are already in place (the KV-shared tail ran the head).
     skip: bool,
+    /// The lm_head as one cuBLASLt matmul at `capacity` rows (`PLOW_TERMINAL_LT`): window A
+    /// (gather, norm), the matmul, window B (softcap, argmax, fin). The head's rows past the
+    /// launch's count read stale gathered rows; nothing consumes their logits.
+    head_lt: Option<HeadLt>,
+    /// Window A and B instruction sets per staging set, derived from `insts` at launch.
+    insts_split: [[Vec<DevInst64>; 2]; 2],
+}
+
+struct HeadLt {
+    plan: Arc<crate::device::cuda::lt::Plan>,
+    input: u64,
+    weight: u64,
+    output: u64,
 }
 
 pub(super) fn chain(
@@ -242,6 +255,12 @@ impl PackedTerminal {
         let (arg, _, counter_bytes, tables) =
             super::mixed_step::upload_program(&e.be, &program, tensors.base, 0, 0)?;
         tracing::info!(capacity, hidden, post_norm, "compact terminal on");
+        let head_input = if post_norm {
+            selected.base
+        } else {
+            normalized.base
+        };
+        let head_lt = Self::head_lt(e, &head, head_input, capacity)?;
         Ok(Some(Self {
             template: first,
             capacity,
@@ -258,7 +277,60 @@ impl PackedTerminal {
             host_rows: [Vec::with_capacity(capacity), Vec::with_capacity(capacity)],
             host_ids: e.be.host_alloc_pinned(capacity * 4)?,
             skip: false,
+            head_lt,
+            insts_split: [[Vec::new(), Vec::new()], [Vec::new(), Vec::new()]],
         }))
+    }
+
+    /// The terminal's lm_head plan on the engine's Lt handle: M = capacity (the weight read
+    /// dominates, so the padding is free), N = vocab, K = hidden; shapes and tensors 16-aligned.
+    fn head_lt(
+        e: &GpuEngine,
+        head: &DevInst64,
+        input: u64,
+        capacity: usize,
+    ) -> Result<Option<HeadLt>> {
+        let Some(lt) = &e.terminal_lt else {
+            return Ok(None);
+        };
+        if !crate::config::RuntimeConfig::get().nv.terminal_lt {
+            return Ok(None);
+        }
+        let (n, k) = (head.i[1], head.i[2]);
+        let weight = e.devp[head.t[2] as usize].base;
+        let output = e.devp[head.t[0] as usize].base;
+        if n % 16 != 0 || k % 16 != 0 || [input, weight, output].iter().any(|p| p % 16 != 0) {
+            tracing::info!(
+                n,
+                k,
+                "compact terminal head stays on the interpreter: cuBLASLt needs 16-aligned shapes and tensors"
+            );
+            return Ok(None);
+        }
+        let m = capacity as u32;
+        let plan = lt.plan(m, n, k, weight, None, &[m], &[n])?;
+        tracing::info!(m, n, k, "compact terminal head on cuBLASLt");
+        Ok(Some(HeadLt {
+            plan,
+            input,
+            weight,
+            output,
+        }))
+    }
+
+    /// One cooperative window of the terminal program whose instructions are already uploaded.
+    fn window(&self, e: &GpuEngine) -> Result<()> {
+        e.be.memset_d8_async(self.arg.counters, 0, self.counter_bytes, &e.stream)?;
+        let mut arg = self.arg;
+        let mut params = [&mut arg as *mut DevProgram as *mut std::ffi::c_void];
+        e.be.launch_cooperative(
+            e.f_pf.unwrap(),
+            e.grid_pf,
+            BLOCK,
+            e.smem_pf,
+            &mut params,
+            Some(&e.stream),
+        )
     }
 
     fn ids(&self, count: usize) -> &[u32] {
@@ -301,23 +373,52 @@ impl PackedTerminal {
         self.insts[i][3].i[0] = count * self.template[1].i[1];
         self.insts[i][4].i[1] = count;
         self.insts[i][5].i[1] = count;
+        let lt = self
+            .head_lt
+            .as_ref()
+            .map(|h| (Arc::clone(&h.plan), h.input, h.weight, h.output));
+        if lt.is_some() {
+            // Window A keeps [gather, norm], window B [softcap, argmax, fin]; the head is Nop
+            // in both and runs as the matmul between them (the uploads and the windows are
+            // stream-ordered, so one instruction buffer serves both).
+            let [a, b] = &mut self.insts_split[i];
+            a.clone_from(&self.insts[i]);
+            b.clone_from(&self.insts[i]);
+            for inst in &mut a[2..] {
+                inst.op = DevOp::Nop as u16;
+            }
+            for inst in &mut b[..3] {
+                inst.op = DevOp::Nop as u16;
+            }
+        }
         let launched = (|| {
             // Both upload sources are owned here until the stream is drained.
             unsafe {
                 e.be.memcpy_htod_async(self.rows.base, pod_bytes(&self.host_rows[i]), &e.stream)?;
-                e.be.memcpy_htod_async(self.arg.insts, pod_bytes(&self.insts[i]), &e.stream)?;
             }
-            e.be.memset_d8_async(self.arg.counters, 0, self.counter_bytes, &e.stream)?;
-            let mut arg = self.arg;
-            let mut params = [&mut arg as *mut DevProgram as *mut std::ffi::c_void];
-            e.be.launch_cooperative(
-                e.f_pf.unwrap(),
-                e.grid_pf,
-                BLOCK,
-                e.smem_pf,
-                &mut params,
-                Some(&e.stream),
-            )
+            let Some((plan, input, weight, output)) = &lt else {
+                unsafe {
+                    e.be.memcpy_htod_async(self.arg.insts, pod_bytes(&self.insts[i]), &e.stream)?;
+                }
+                return self.window(e);
+            };
+            unsafe {
+                e.be.memcpy_htod_async(
+                    self.arg.insts,
+                    pod_bytes(&self.insts_split[i][0]),
+                    &e.stream,
+                )?;
+            }
+            self.window(e)?;
+            plan.run(*input, *weight, *output, &e.stream)?;
+            unsafe {
+                e.be.memcpy_htod_async(
+                    self.arg.insts,
+                    pod_bytes(&self.insts_split[i][1]),
+                    &e.stream,
+                )?;
+            }
+            self.window(e)
         })();
         if let Err(error) = launched {
             let _ = e.be.stream_synchronize(&e.stream);
