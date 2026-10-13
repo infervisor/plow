@@ -723,11 +723,17 @@ mod amd_serve {
             }
         }
 
-        fn rank_at(&self, r: usize) -> &AmdEngine {
-            match self {
-                Ranks::One(e) => e,
-                Ranks::Tp(g) => g.rank(r),
+        /// Row `at` of `act.logits`, `shard` bytes per rank, concatenated over the first
+        /// `dst.len() / shard` ranks (one under a replicated head, all under a sharded one).
+        fn read_logits_row(&self, at: usize, shard: usize, dst: &mut [u8]) -> Result<()> {
+            for (r, d) in dst.chunks_exact_mut(shard).enumerate() {
+                let e = match self {
+                    Ranks::One(e) => e,
+                    Ranks::Tp(g) => g.rank(r),
+                };
+                e.read_tensor_range("act.logits", (at * shard) as u64, d)?;
             }
+            Ok(())
         }
 
         fn ctr_snapshot(&mut self, program: usize) -> Result<Vec<u32>> {
@@ -2134,12 +2140,9 @@ mod amd_serve {
                     return false;
                 }
                 bytes = vec![0u8; row];
-                for (r, dst) in bytes.chunks_exact_mut(shard).enumerate() {
-                    let e = self.ranks.rank_at(r);
-                    if let Err(err) = e.read_tensor_range("act.logits", (at * shard) as u64, dst) {
-                        tracing::warn!(error = %err, slot, rank = r, "amd: logits row readback failed");
-                        return false;
-                    }
+                if let Err(err) = self.ranks.read_logits_row(at, shard, &mut bytes) {
+                    tracing::warn!(error = %err, slot, "amd: logits row readback failed");
+                    return false;
                 }
             }
             if bytes.len() != row || row % elem != 0 {
@@ -2520,10 +2523,7 @@ mod amd_serve {
             let shard = total as usize / self.batch;
             row.resize(shard * self.logits_shards, 0);
             // The prefill tail wrote its one logits row at row 0 (`lp_row`).
-            for (r, dst) in row.chunks_exact_mut(shard).enumerate() {
-                self.ranks.rank_at(r).read_tensor_range("act.logits", 0, dst)?;
-            }
-            Ok(())
+            self.ranks.read_logits_row(0, shard, row)
         }
 
         /// Complete an end resume: the KV rows and the restored recurrence already hold the
