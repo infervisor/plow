@@ -3532,8 +3532,11 @@ async fn bringup_runtime(
     let execset = Arc::new(ExecutorSet::bringup(backend)?);
 
     let registry = Registry::new();
+    // CLI registration order (registry iteration is sorted by slug).
+    let mut registered: Vec<String> = Vec::with_capacity(assets.len());
     for (i, dir) in assets.iter().enumerate() {
         let slug = registry.load(dir, asset_slugs.get(i).cloned().flatten())?;
+        registered.push(slug.clone());
         let target = registry.get(&slug)?.manifest.gpu.clone();
         let target_vendor = hwspec::registry::lookup(&target).map(|s| s.vendor);
         if target_vendor.is_some() && target_vendor == vendor {
@@ -4028,17 +4031,9 @@ async fn bringup_runtime(
     if vendor == Some(hwspec::Vendor::Amd) {
         use plowrt::serve::dp::{rank_key, DpRouter, DpSet, RouteCfg};
         use plowrt::serve::placement::{self, ModelSpec};
-        let mut slugs: Vec<String> = state.registry.slugs();
-        // CLI registration order, as on CUDA (registry iteration is sorted by slug).
-        slugs.sort_by_key(|s| {
-            state
-                .registry
-                .get(s)
-                .ok()
-                .and_then(|b| assets.iter().position(|a| *a == b.dir))
-        });
+        let slugs = registered.as_slice();
         let mut plan: Vec<(String, PathBuf, u32, usize)> = Vec::new();
-        for slug in &slugs {
+        for slug in slugs {
             let bundle = state.registry.get(slug)?;
             let Some(blob) = plowrt::asset::devblob::DevBlob::find_in_dir(&bundle.dir)? else {
                 continue;
@@ -4101,11 +4096,10 @@ async fn bringup_runtime(
             let groups =
                 placement::plan_groups(&ordinals, width, u64::MAX).map_err(|e| e.to_string())?;
             let layout = placement::assign(&specs, &groups, cfg.place).map_err(|e| e.to_string())?;
-            let tenants = (0..layout.groups.len())
+            let tenants: Vec<usize> = (0..layout.groups.len())
                 .map(|g| layout.assignment.iter().filter(|&&a| a == g).count())
-                .max()
-                .unwrap_or(1);
-            if tenants > 1
+                .collect();
+            if tenants.iter().any(|&t| t > 1)
                 && cfg
                     .co_sched
                     .is_some_and(|mode| mode != plowrt::serve::cosched::CoSched::Rr)
@@ -4141,7 +4135,7 @@ async fn bringup_runtime(
                 state.install_dp(router);
             }
             // One co-tenant turn per group, before any dispatcher resolves its turn at spawn.
-            state.install_group_turns(layout.groups.len(), tenants, false);
+            state.install_group_turns(&tenants, false);
             for (slug, blob, tp, n) in &plan {
                 let bundle = state.registry.get(slug)?;
                 // Same refusal the CUDA path makes (`serve::manager::load_model`):
