@@ -1105,6 +1105,9 @@ extern "C" __device__ unsigned plow_glm_hc_norm_fold_arm = 1;
 /* GEMV_F32 i3 = 1: the preceding HyperConnPost folded in (PLOW_GLM_HC_POST_FOLD). An object
  * without the arm never writes the new residual stream: stale data, no trap. */
 extern "C" __device__ unsigned plow_glm_hc_post_fold_arm = 1;
+/* GEMV_F32 i4 = 1: the following one-row HyperConnPre runs on the packet's last-arriving
+ * workgroup (PLOW_GLM_HC_PRE_TAIL). An object without the arm never runs the pre: no trap. */
+extern "C" __device__ unsigned plow_glm_hc_pre_tail_arm = 1;
 
 typedef union __align__(16) {
     float part[PLOW_MIXED_STEP ? 8 : PLOW_WAVES]; /* mixed norms retain the 8-wave reduction */
@@ -3098,6 +3101,66 @@ __device__ __forceinline__ unsigned gemm_pf_repick(CInst in, unsigned nblk) {
 }
 #endif
 
+#if PLOW_BUCKET_DECODE
+/* PLOW_GLM_HC_PRE_TAIL: GemvF32 (the mHC mix, t0 = mixes, t1 = residual) with i4 = 1 carries the
+ * following ONE-ROW HyperConnPre in t7 = a u32 descriptor `[post_mix, comb_mix, layer_input,
+ * scale, base, counter, norm_fold, norm_out, gamma, hidden, sinkhorn, eps_bits, hc_eps_bits]`.
+ * Every workgroup bumps the loader-zeroed counter after its gemv slice (acq_rel, agent scope);
+ * the one whose bump closes the packet's nblk bumps runs the HyperConnPre case body verbatim on
+ * slice 0 of 1, which is what the separate b=1 packet ran: bit-identical, one hop fewer. */
+enum {
+    PLOW_HCT_POST = 0, PLOW_HCT_COMB = 1, PLOW_HCT_LIN = 2, PLOW_HCT_SCALE = 3, PLOW_HCT_BASE = 4,
+    PLOW_HCT_CTR = 5, PLOW_HCT_NORM = 6, PLOW_HCT_NOUT = 7, PLOW_HCT_GAMMA = 8,
+    PLOW_HCT_HIDDEN = 9, PLOW_HCT_SINK = 10, PLOW_HCT_EPS = 11, PLOW_HCT_HCEPS = 12,
+};
+__device__ __forceinline__ void exec_hc_pre_tail(CInst in, CTens T, unsigned nblk,
+                                                 plow_smem* sm, const PlowProgram* prog_meta) {
+    const unsigned* desc = (const unsigned*)T[in->t[7]];
+    __shared__ unsigned hct_last;
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        const unsigned old = __hip_atomic_fetch_add((unsigned*)T[desc[PLOW_HCT_CTR]], 1u,
+                                                    __ATOMIC_ACQ_REL, __HIP_MEMORY_SCOPE_AGENT);
+        hct_last = (old % nblk) == nblk - 1u;
+    }
+    __syncthreads();
+    if (!hct_last) return;
+    asm volatile("buffer_inv" ::: "memory");
+    __syncthreads();
+    float* post = (float*)T[desc[PLOW_HCT_POST]];
+    float* comb = (float*)T[desc[PLOW_HCT_COMB]];
+    bf16* lin = (bf16*)T[desc[PLOW_HCT_LIN]];
+    const float* mixes = (const float*)T[in->t[0]];
+    const bf16* res = (const bf16*)T[in->t[1]];
+    const float* hsc = (const float*)T[desc[PLOW_HCT_SCALE]];
+    const float* hbs = (const float*)T[desc[PLOW_HCT_BASE]];
+    const unsigned hidden = desc[PLOW_HCT_HIDDEN], sink = desc[PLOW_HCT_SINK];
+    const float eps = __uint_as_float(desc[PLOW_HCT_EPS]);
+    const float hceps = __uint_as_float(desc[PLOW_HCT_HCEPS]);
+#if !PLOW_HC_SINKHORN_RCP
+    if (hidden % 8u == 0u) {
+        d_hyperconn_pre_rows(post, comb, lin, mixes, res, hsc, hbs, 1u, hidden, sink, eps, hceps,
+                             0u, 1u);
+        if (desc[PLOW_HCT_NORM] == 1u) {
+            __syncthreads();
+            asm volatile("buffer_inv" ::: "memory");
+            __syncthreads();
+            d_rmsnorm((bf16*)T[desc[PLOW_HCT_NOUT]], lin, (const bf16*)T[desc[PLOW_HCT_GAMMA]],
+                      1u, hidden, eps, 0u, 0u, 1u, sm->part, nullptr, nullptr
+#if PLOW_PACKED_PREFILL_MLA_NORM_CONSUMERS || PLOW_PACKED_PREFILL_DENSE_CONSUMERS
+                      , prog_meta, 0u
+#endif
+                      );
+        }
+        return;
+    }
+    if (desc[PLOW_HCT_NORM] != 0u) __builtin_trap();
+#endif
+    d_hyperconn_pre(post, comb, lin, mixes, res, hsc, hbs, 1u, 4u, hidden, sink, eps, hceps, 0u,
+                    1u, sm->part);
+}
+#endif
+
 /* gfx950 K3 decode objects inline `plow_exec` into the dispatch loop. As a call, its prologue
  * saves ~110 VGPR dwords per lane to scratch (and restores them) before it selects an op, on
  * every packet in every workgroup -- including the workgroups a narrow packet leaves idle.
@@ -4155,6 +4218,7 @@ __device__ static void plow_exec(CInst in_v, unsigned slice, CTens T_v, plow_sme
                                      (const bf16*)TEN(3), (const bf16*)TEN(4),
                                      (const float*)TEN(5), (const float*)TEN(6), in->i[0],
                                      in->i[1], in->i[2], slice, nblk, (float*)sm->raw);
+                if (in->i[4] == 1u) exec_hc_pre_tail(in, T, nblk, sm, prog_meta);
                 break;
             }
             if (in->i[2] % (8u * PLOW_WAVE) == 0u &&
@@ -4163,10 +4227,11 @@ __device__ static void plow_exec(CInst in_v, unsigned slice, CTens T_v, plow_sme
                 d_gemv_f32_wg((float*)TEN(0), (const bf16*)TEN(1), (const float*)TEN(2),
                               in->i[0], in->i[1], in->i[2], slice, nblk,
                               (float*)sm->raw);
+                if (in->i[4] == 1u) exec_hc_pre_tail(in, T, nblk, sm, prog_meta);
                 break;
             }
 #endif
-            if (in->i[3] != 0u) __builtin_trap();
+            if (in->i[3] != 0u || in->i[4] != 0u) __builtin_trap();
             d_gemv_f32((float*)TEN(0), (const bf16*)TEN(1), (const float*)TEN(2), in->i[0], in->i[1],
                        in->i[2], slice, nblk);
             break;
@@ -4236,7 +4301,7 @@ __device__ static void plow_exec(CInst in_v, unsigned slice, CTens T_v, plow_sme
              * object reads the bit; the loader refuses the packet on any other. */
             if (in->i[4] & PLOW_KDA_F_FUSED_ARM) {
                 const unsigned* desc = (const unsigned*)TEN(7);
-                if (in->i[0] != 1u || (in->i[4] & PLOW_KDA_F_SEQ_ROWS)) __builtin_trap();
+                if (in->i[0] != 1u) __builtin_trap();
 #pragma unroll
                 for (unsigned i = 0; i <= PLOW_KDA_FUSED_DESC_SCRATCH; ++i)
                     if (desc[i] == PLOW_TENSOR_NONE) __builtin_trap();
@@ -4256,7 +4321,8 @@ __device__ static void plow_exec(CInst in_v, unsigned slice, CTens T_v, plow_sme
                     in->i[3], desc[PLOW_KDA_FUSED_DESC_W], in->i[4], in->i[6], in->fj[0].f,
                     in->fj[1].f, __uint_as_float(desc[PLOW_KDA_FUSED_DESC_EPS]), slice, nblk,
                     (float*)sm->raw,
-                    (in->i[4] & PLOW_KDA_F_FB_FOLD) ? (const bf16*)T[in->fj[2].u] : nullptr);
+                    (in->i[4] & PLOW_KDA_F_FB_FOLD) ? (const bf16*)T[in->fj[2].u] : nullptr,
+                    (in->i[4] & PLOW_KDA_F_SEQ_ROWS) ? (const unsigned*)T[in->i[7]] : nullptr);
                 break;
             }
 #endif
