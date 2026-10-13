@@ -1037,6 +1037,12 @@ extern "C" __device__ unsigned plow_dsa_idx_fp8_arm = 1;
 #ifndef PLOW_GEMV_F32_COL
 #define PLOW_GEMV_F32_COL 0
 #endif
+#ifndef PLOW_GEMV_F32_PF_R
+#define PLOW_GEMV_F32_PF_R 0
+#endif
+#ifndef PLOW_GEMV_F32_PF_CN
+#define PLOW_GEMV_F32_PF_CN 3
+#endif
 #ifndef PLOW_GEMV_F32_TILE_DEC
 #define PLOW_GEMV_F32_TILE_DEC 0
 #endif
@@ -4304,6 +4310,17 @@ __device__ static void plow_exec(CInst in_v, unsigned slice, CTens T_v, plow_sme
              * the per-output walk fills more waves and is faster. */
             if (in->i[0] >= 256u && in->i[0] % 2u == 0u && in->i[1] % 3u == 0u &&
                 in->i[2] % (8u * PLOW_WAVE) == 0u) {
+#if PLOW_GEMV_F32_PF_R
+                /* PLOW_GEMV_F32_PF_TILE: R x CN outputs per wave cut the L2 re-reads of W (once
+                 * per R rows) and x (once per CN columns); same per-output order, bit-identical. */
+                if (in->i[0] % (unsigned)PLOW_GEMV_F32_PF_R == 0u &&
+                    in->i[1] % (unsigned)PLOW_GEMV_F32_PF_CN == 0u) {
+                    d_gemv_f32_tile<PLOW_GEMV_F32_PF_R, PLOW_GEMV_F32_PF_CN>(
+                        (float*)TEN(0), (const bf16*)TEN(1), (const float*)TEN(2), in->i[0],
+                        in->i[1], in->i[2], slice, nblk);
+                    break;
+                }
+#endif
                 d_gemv_f32_tile<2, 3>((float*)TEN(0), (const bf16*)TEN(1), (const float*)TEN(2),
                                       in->i[0], in->i[1], in->i[2], slice, nblk);
                 break;

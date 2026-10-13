@@ -448,6 +448,9 @@ __device__ __forceinline__ bf16v8 hc_post4_8(const float* c, const float* p, uns
     return o;
 }
 
+#ifndef PLOW_HC_POST_ROWS
+#define PLOW_HC_POST_ROWS 1
+#endif
 /* op 122 — hyper-connections post-block, paired with op 121.
  * `new_residual[j][d] = sum_i comb_mix[i][j] * residual[i][d]  +  post_mix[j] * x_out[d]`
  * — an n x n combine (n=4) plus a broadcast multiply-add. Fully parallel over `d` with no
@@ -458,6 +461,41 @@ __device__ void d_hyperconn_post(bf16* __restrict__ new_residual, const bf16* __
                                  const bf16* __restrict__ residual, const float* __restrict__ post_mix,
                                  const float* __restrict__ comb_mix, unsigned T, unsigned n,
                                  unsigned hidden, unsigned mode, unsigned slice, unsigned nblk) {
+#if PLOW_HC_POST_ROWS > 1
+    /* PLOW_HC_POST_ROWS=R (prefill band rows): a workgroup's rows t, t+nblk, ... are one HBM
+     * round trip each in the loop below; issue R rows' loads before storing any. Mode 0, n = 4,
+     * one 8-channel step per thread per row (hidden = 8 * PLOW_THREADS). Same per-element
+     * arithmetic (hc_post4_8), so bit-identical. */
+    if (mode == 0u && n == 4u && hidden == 8u * PLOW_THREADS) {
+        constexpr unsigned R = PLOW_HC_POST_ROWS;
+        const unsigned d = threadIdx.x * 8u;
+        unsigned t = slice;
+        for (; t + (R - 1) * nblk < T; t += R * nblk) {
+            float c[R][16], p[R][4];
+            bf16v8 xv[R], r[R][4];
+#pragma unroll
+            for (unsigned q = 0; q < R; q++) {
+                const size_t tq = t + q * nblk;
+#pragma unroll
+                for (unsigned k = 0; k < 16; k++) c[q][k] = comb_mix[tq * 16u + k];
+#pragma unroll
+                for (unsigned k = 0; k < 4; k++) p[q][k] = post_mix[tq * 4u + k];
+                xv[q] = ld_glob8(x_out + tq * hidden + d);
+#pragma unroll
+                for (unsigned i = 0; i < 4; i++)
+                    r[q][i] = ld_glob8(residual + tq * 4u * hidden + (size_t)i * hidden + d);
+            }
+#pragma unroll
+            for (unsigned q = 0; q < R; q++) {
+                bf16* orow = new_residual + (size_t)(t + q * nblk) * 4u * hidden;
+#pragma unroll
+                for (unsigned j = 0; j < 4; j++)
+                    st_glob8(orow + (size_t)j * hidden + d, hc_post4_8(c[q], p[q], j, r[q], xv[q]));
+            }
+        }
+        slice = t;
+    }
+#endif
     for (unsigned t = slice; t < T; t += nblk) {
         if (mode == 1u) {
             const bf16* xrow = x_out + (size_t)t * hidden;

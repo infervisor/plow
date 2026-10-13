@@ -608,39 +608,7 @@ pub fn emit_kda_mixer(
     // independent sequences (batched decode), each carrying its own state.
     seq_rows: bool,
 ) -> (u32, u32) {
-    emit_kda_mixer_pre(
-        b, c, w, st, act_prefix, t, hidden, attn_dst, n_cu, prenormed, deps, seq_rows, None,
-    )
-}
-
-/// The low-rank `g_a` / `f_a` rows a caller already produced (GLM-5.3-Flash's sequence-parallel
-/// seam computes them on its row band and gathers them with `x`): the mixer skips those two
-/// projections and reads `ga` / `fa`, both complete once `dep` has run.
-#[derive(Clone, Copy, Debug)]
-pub struct KdaLowRankPre {
-    pub ga: u32,
-    pub fa: u32,
-    pub dep: u32,
-}
-
-/// [`emit_kda_mixer`] with optional caller-computed low-rank gate rows ([`KdaLowRankPre`]).
-#[allow(clippy::too_many_arguments)]
-pub fn emit_kda_mixer_pre(
-    b: &mut Builder,
-    c: &KdaCfg,
-    w: &KdaWeights,
-    st: &KdaState,
-    act_prefix: &str,
-    t: u32,
-    hidden: u32,
-    attn_dst: Option<u32>,
-    n_cu: u32,
-    prenormed: bool,
-    deps: &[u32],
-    seq_rows: bool,
-    pre: Option<KdaLowRankPre>,
-) -> (u32, u32) {
-    emit_kda_mixer_ex2(
+    emit_kda_mixer_ex(
         b,
         c,
         w,
@@ -659,7 +627,6 @@ pub fn emit_kda_mixer_pre(
         crate::emit_config::active().kda_decode_fused
             && crate::amd_target::active().1 == hwspec::IsaLevel::Gfx950,
         seq_rows,
-        pre,
     )
 }
 
@@ -689,49 +656,6 @@ fn emit_kda_mixer_ex(
     // batched decode program (independent sequences); everything today is `false`.
     seq_rows: bool,
 ) -> (u32, u32) {
-    emit_kda_mixer_ex2(
-        b,
-        c,
-        w,
-        st,
-        act_prefix,
-        t,
-        hidden,
-        attn_dst,
-        n_cu,
-        prenormed,
-        deps,
-        fuse,
-        chunk_enable,
-        fused_decode_enable,
-        seq_rows,
-        None,
-    )
-}
-
-#[allow(clippy::too_many_arguments)]
-fn emit_kda_mixer_ex2(
-    b: &mut Builder,
-    c: &KdaCfg,
-    w: &KdaWeights,
-    st: &KdaState,
-    act_prefix: &str,
-    t: u32,
-    hidden: u32,
-    attn_dst: Option<u32>,
-    n_cu: u32,
-    prenormed: bool,
-    deps: &[u32],
-    fuse: bool,
-    chunk_enable: bool,
-    fused_decode_enable: bool,
-    seq_rows: bool,
-    pre: Option<KdaLowRankPre>,
-) -> (u32, u32) {
-    assert!(
-        pre.is_none() || (t > 1 && !seq_rows && prenormed),
-        "KDA low-rank pre rows are a prefill seam's, on a prenormed input"
-    );
     assert_eq!(
         c.head_dim % 64,
         0,
@@ -807,10 +731,7 @@ fn emit_kda_mixer_ex2(
         bft(b, format!("{a}v"), tt * pu),
     ];
     let g_raw = bft(b, format!("{a}g_raw"), tt * pu);
-    let fa = match pre {
-        Some(p) => p.fa,
-        None => bft(b, format!("{a}f_a"), tt * hd as u64),
-    };
+    let fa = bft(b, format!("{a}f_a"), tt * hd as u64);
     let f_raw = if fb_fold {
         fa
     } else {
@@ -934,40 +855,28 @@ fn emit_kda_mixer_ex2(
                 )
             };
             // g_a: down-projection to head_dim, mirrors `fa`/`c_fa` below exactly.
-            let (ga, c_ga) = match pre {
-                Some(p) => (p.ga, p.dep),
-                None => {
-                    let ga = bft(b, format!("{a}g_a"), tt * hd as u64);
-                    (ga, gemv(b, ga, x, g_a_proj, hd, hi, c_ln))
-                }
-            };
+            let ga = bft(b, format!("{a}g_a"), tt * hd as u64);
+            let c_ga = gemv(b, ga, x, g_a_proj, hd, hi, c_ln);
             let c_gb = gemv(b, g_raw, ga, g_b_proj, p, hd, c_ga);
             (cq, ck, cv, c_gb)
         }
     };
-    let (c_fa, c_bb) = if let Some(p) = pre {
-        (
-            p.dep,
-            crate::k3::emit_k3_linear(b, b_raw, x, w.b_proj, t, nh, hi, n_cu, seq_rows, &[c_ln]),
-        )
-    } else {
-        emit_control_linears(
-            b,
-            fa,
-            b_raw,
-            x,
-            w.f_a_proj,
-            w.b_proj,
-            t,
-            hd,
-            nh,
-            hi,
-            n_cu,
-            seq_rows,
-            c_ln,
-            t == 1 && crate::whole_graph_parallel_linear2(hd, nh, hi),
-        )
-    };
+    let (c_fa, c_bb) = emit_control_linears(
+        b,
+        fa,
+        b_raw,
+        x,
+        w.f_a_proj,
+        w.b_proj,
+        t,
+        hd,
+        nh,
+        hi,
+        n_cu,
+        seq_rows,
+        c_ln,
+        t == 1 && crate::whole_graph_parallel_linear2(hd, nh, hi),
+    );
     // P7 — forget-gate up-projection. The forget gate stays LOW RANK 128 even though the output
     // gate is full rank; that asymmetry is `use_full_rank_gate`'s and it is easy to get backwards.
     let c_fb = if fb_fold {
