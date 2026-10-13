@@ -219,6 +219,13 @@ if [ -n "${PLOW_HSACO_CONFIG:-}" ] &&
    grep -Eq '^#define PLOW_PACKET_OBJECT_REQUIRES "([^"]* )?PLOW_MLA_PF2_NOPE_ARM=1( |")' "$PLOW_HSACO_CONFIG"; then
   NOPE_FLASH="-DPLOW_MLA_PF2_NOPE_ARM=1"
 fi
+# GLM-5.3-Flash (NoPE + K3 packet): the gfx950 transpose-read PV arm is the default in its flash
+# objects (same operands, same MFMA order: every validate stream byte-equal; 16k prefill flash
+# 107 -> 79 ms per 8192 chunk). PLOW_MLA_PF_TR16=0 rolls back.
+if [ -n "$NOPE_FLASH" ] && [ -z "${PLOW_MLA_PF_TR16:-}" ] &&
+   grep -Eq '^#define PLOW_PACKET_OBJECT_REQUIRES "([^"]* )?PLOW_K3=1( |")' "$PLOW_HSACO_CONFIG"; then
+  FLASH_TR16="-DPLOW_MLA_PF_SV=1 -DPLOW_MLA_PF_TR16=1 $FLASH_TR16"
+fi
 if [ -n "${PLOW_HSACO_CONFIG:-}" ] && [ "${PLOW_DSA_PREP:-0}" = 0 ] &&
    grep -Eq '^#define PLOW_PACKET_OBJECT_REQUIRES "([^"]* )?PLOW_DSA_PREP=1( |")' "$PLOW_HSACO_CONFIG"; then
   A4W4_BK="$A4W4_BK -DPLOW_DSA_PREP=1"
