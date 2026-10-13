@@ -1184,7 +1184,11 @@ fn emit_glm53_program(
                 },
             )
         };
-        let c_ffn = if c.is_dense(l as u32) {
+        let c_ffn = if c.is_dense(l as u32) && prefill && rows > 1 {
+            emit_glm_dense_ffn_rows(
+                b, c, n, l, rows, enc, n.xnext, c_norm, &mut xgate, &xr, true, true,
+            )
+        } else if c.is_dense(l as u32) {
             emit_glm_dense_ffn(
                 b, c, n, l, rows, enc, n.xnext, c_norm, &mut xgate, &xr, true,
             )
@@ -9822,7 +9826,8 @@ fn emit_glm_moe_ffn_prefill(
                 &[c_rn2],
                 |d| {
                     d.t[..3].copy_from_slice(&[n.routed_xq, n.xn2, n.routed_xs]);
-                    d.i[..2].copy_from_slice(&[t, h]);
+                    // i2 = the scale pitch the W8A8 GLU reads xs at (its i4 = t).
+                    d.i[..3].copy_from_slice(&[t, h, t]);
                 },
             )
         } else {
@@ -11680,7 +11685,7 @@ pub(crate) fn emit_glm_dense_ffn(
         // does (`emit_glm_dense_block_prefill`: n_exp = 1, top_k = 1, align synthesises the
         // routing), with the decode-shaped one-shot TP seam.
         return emit_glm_dense_ffn_rows(
-            b, c, n, slot, rows, enc, x_out, c_rn2, xgate, xr_cus, raw_output,
+            b, c, n, slot, rows, enc, x_out, c_rn2, xgate, xr_cus, raw_output, false,
         );
     }
     let all = b.all();
@@ -11858,6 +11863,7 @@ fn emit_glm_dense_ffn_rows(
     xgate: &mut u32,
     xr_cus: &[u32],
     raw_output: bool,
+    prefill: bool,
 ) -> u32 {
     if enc == MoeEnc::Mxfp4 && !c.quark_mixed {
         return emit_glm_dense_mxfp4_rows(
@@ -11887,7 +11893,25 @@ fn emit_glm_dense_ffn_rows(
         d.i[1] = DENSE_N_EXP;
         d.i[2] = DENSE_TOP_K;
     });
-    let c_g = b.emit(DevOp::MoeGroupGluPf, all.clone(), &[c_align, c_rn2], |d| {
+    // PLOW_MOE_PF_W8A8 covers the dense FFN of a PREFILL program too (vLLM runs layers 0-2 W8A8
+    // like the experts): the same op pair over one expert on the routed scratch. Never decode:
+    // decode objects carry no W8A8 arm.
+    let pf_w8a8 = prefill && rows > 1 && glm_moe_pf_w8a8(c, enc, false, DENSE_TOP_K, di_l, h);
+    let pf_split = pf_w8a8 && glm_moe_pf_w8a8_split();
+    let c_x = if pf_w8a8 && !pf_split {
+        b.emit(
+            DevOp::QuantFp8Block128,
+            glm_quant128_cus(&all, rows, h),
+            &[c_rn2],
+            |d| {
+                d.t[..3].copy_from_slice(&[n.routed_xq, n.xn2, n.routed_xs]);
+                d.i[..3].copy_from_slice(&[rows, h, rows]);
+            },
+        )
+    } else {
+        c_rn2
+    };
+    let c_g = b.emit(DevOp::MoeGroupGluPf, all.clone(), &[c_align, c_x], |d| {
         d.t[0] = n.fu_g;
         d.t[1] = n.xn2;
         d.t[2] = w.dwt;
@@ -11905,6 +11929,17 @@ fn emit_glm_dense_ffn_rows(
         let (act, limit) = glm_glu_act(c);
         d.i[5] = act;
         d.f[1] = limit;
+        if pf_split {
+            d.t[7] = n.fu_scale;
+            d.i[4] = rows;
+            d.i[7] = 4;
+        } else if pf_w8a8 {
+            d.t[1] = n.routed_xq;
+            d.t[6] = n.routed_xs;
+            d.t[7] = n.fu_scale;
+            d.i[4] = rows;
+            d.i[7] = 2;
+        }
     });
     let c_d = b.emit(DevOp::MoeGroupDownPf, all.clone(), &[c_g], |d| {
         d.t[0] = n.part;
@@ -11921,6 +11956,10 @@ fn emit_glm_dense_ffn_rows(
         d.i[1] = di_l;
         d.i[2] = DENSE_N_EXP;
         d.i[MoeEnc::PREFILL_SLOT] = enc.code();
+        if pf_w8a8 {
+            d.t[5] = n.fu_scale;
+            d.i[7] = if pf_split { 4 } else { 2 };
+        }
     });
     let no_xr = tp > 1 && emit_config::active().no_xreduce;
     if tp > 1 && !no_xr {
