@@ -41,8 +41,10 @@ if [ -n "${VLLM_CONTAINER:-}" ]; then
     done
 else
     # A host script (agentic_turns.py, needle/quality probes) runs from its checkout: mount the
-    # repo root read-only at its own path so sibling imports resolve.
+    # repo root read-only at its own path so sibling imports resolve. The container runs in the
+    # image's working directory, so the script goes in by absolute path.
     if [[ "${args[0]:-}" == *.py && -f "${args[0]}" ]]; then
+        args[0]="$(realpath -- "${args[0]}")"
         repo="$(cd -- "$(dirname -- "${args[0]}")" && git rev-parse --show-toplevel 2>/dev/null || true)"
         [ -n "$repo" ] && docker_args+=(-v "$repo:$repo:ro")
     fi
@@ -54,9 +56,12 @@ else
             docker_args+=(-v "$result_dir:$result_dir")
             args[i+1]="$result_dir" ;;
         --out|--output)
+            # Mount the parent: the path is a file the probe writes or, without an extension, its
+            # output directory (created here).
             out="$(realpath -m -- "${args[i+1]:?missing output path}")"
-            out_dir=$out; [[ "$out" == *.json || "$out" == *.jsonl ]] && out_dir=$(dirname -- "$out")
+            out_dir=$(dirname -- "$out")
             mkdir -p -- "$out_dir"
+            if [[ "$(basename -- "$out")" != *.* ]]; then mkdir -p -- "$out"; fi
             docker_args+=(-v "$out_dir:$out_dir")
             args[i+1]="$out" ;;
         esac
