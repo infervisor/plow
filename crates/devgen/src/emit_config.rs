@@ -1269,6 +1269,11 @@ pub struct EmitConfig {
     #[arg(long, env = "PLOW_MOE_FP8_PF_LEAN", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
     pub moe_fp8_pf_lean: bool,
 
+    /// Smallest prefill bucket (rows) that isolates those segments; smaller buckets keep the
+    /// interpreter arms, which are faster there (bench T=2048: GLU 0.261 vs 0.274 ms).
+    #[arg(long, env = "PLOW_MOE_FP8_PF_MIN_ROWS", default_value_t = 8192)]
+    pub moe_fp8_pf_min_rows: u32,
+
     /// Emit prefill AttnRes packets with the f32-mix contract (separate output-norm epsilon in
     /// `f[1]`) and isolate them for the gfx950 `attn_res_f32mix` object. Default on; tokens
     /// differ from the BF16-seam contract by design. `=0` is the rollback to the interpreter
@@ -1827,6 +1832,7 @@ impl EmitConfig {
             moe_stage1_lean: env_opt_out("PLOW_MOE_STAGE1_LEAN"),
             moe_combine_lean: env_bool_default_true("PLOW_MOE_COMBINE_LEAN"),
             moe_fp8_pf_lean: env_bool("PLOW_MOE_FP8_PF_LEAN"),
+            moe_fp8_pf_min_rows: env_u32("PLOW_MOE_FP8_PF_MIN_ROWS").unwrap_or(8192),
             attnres_f32mix: env_opt_out("PLOW_ATTNRES_F32MIX"),
             moe_pf_det: env_bool("PLOW_MOE_PF_DET"),
             moe_pf_w8a8: env_bool("PLOW_MOE_PF_W8A8"),
