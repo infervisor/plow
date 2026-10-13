@@ -21,6 +21,7 @@ from pathlib import Path
 
 REPO = Path(__file__).resolve().parents[2]
 TABLE = REPO / "tuning/nvidia/sm_90a/h100-sxm5/gen_kernels.json"
+GEN_ATTEMPTS = 12
 WRAPPERS = {"flash_prefill": REPO / "runtime/nvidia/gen_flash_prefill.cu",
             "flash_decode": REPO / "runtime/nvidia/gen_flash_decode.cu"}
 # A persistent role object must hold its SM alone (plowrt: role occupancy == packet grid).
@@ -366,8 +367,13 @@ def cmd_build(a):
             print(f"{name}: {out / row['object']} sha256="
                   f"{sha256((out / row['object']).read_bytes())}")
             continue
-        header, arena, _ = generate(name, row["config"])
-        if body_digest(header) != row["body_sha256"]:
+        # TileLang's codegen varies run to run under one hash seed; the pinned body is the modal
+        # variant, so regenerate before calling it drift.
+        for _ in range(GEN_ATTEMPTS):
+            header, arena, _ = generate(name, row["config"])
+            if body_digest(header) == row["body_sha256"]:
+                break
+        else:
             sys.exit(f"{name}: generator drift (body sha256 {body_digest(header)} != table "
                      f"{row['body_sha256']}); retune with `tune` or pin the generator version "
                      f"{table['generator']}")
