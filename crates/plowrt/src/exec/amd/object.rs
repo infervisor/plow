@@ -745,6 +745,10 @@ pub(super) const DECODE_ARM_MARKERS: &[(&str, &[&str])] = &[
     ("PLOW_GLM_HC_PRE_TAIL", &["plow_glm_hc_pre_tail_arm"]),
     // The mix split over S workgroups per output (op 135 i4 = 2). Same silent class.
     ("PLOW_GLM_HC_MIX_SPLIT", &["plow_glm_hc_mix_split_arm"]),
+    // Batched post + mix + pre in one packet (op 135 i4 = 3). Same silent class.
+    ("PLOW_GLM_HC_FUSE_DEC", &["plow_glm_hc_fuse_dec_arm"]),
+    // Grouped GemmSmall projections (i7 = 3/4). An object without the arm runs segment 0 only.
+    ("PLOW_GLM_KDA_PROJ_GROUP", &["plow_gemm_small_group_arm"]),
     // The K3 latent MoeCombine folded into the tagged one-shot publish (XReduce t1 = part,
     // i7 = k). An object without the arm publishes the plain partial slot, which no packet
     // wrote — stale data, no trap. A BUILD axis (`#if PLOW_XR_COMBINE_FOLD`).
