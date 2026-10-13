@@ -9759,7 +9759,8 @@ fn emit_glm_moe_ffn_prefill(
                 &[c_rn2],
                 |d| {
                     d.t[..3].copy_from_slice(&[n.routed_xq, n.xn2, n.routed_xs]);
-                    d.i[..2].copy_from_slice(&[t, h]);
+                    // i2 = the scale pitch the W8A8 GLU reads xs at (its i4 = t).
+                    d.i[..3].copy_from_slice(&[t, h, t]);
                 },
             )
         } else {

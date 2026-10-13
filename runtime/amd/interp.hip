@@ -4658,8 +4658,11 @@ __device__ static void plow_exec(CInst in_v, unsigned slice, CTens T_v, plow_sme
 #endif
 #if PLOW_HAS_QUANT_FP8_BLOCK128
         case PLOW_DOP_QUANT_FP8_BLOCK128:
+            /* i2 != 0: the scale grid's row pitch is fixed at i2 (the W8A8 grouped MoE reads it
+             * at its capacity pitch, which segments on different objects resolve alike). */
             d_quant_fp8_block128((unsigned char*)TEN(0), (const bf16*)TEN(1), (float*)TEN(2),
-                                PLOW_RUNTIME_ROWS(in->i[0]), in->i[1], slice, nblk);
+                                PLOW_RUNTIME_ROWS(in->i[0]), in->i[1], slice, nblk, nullptr, 0u,
+                                in->i[2]);
             break;
 #endif
         case PLOW_DOP_ZERO_F32: {
@@ -5802,9 +5805,12 @@ __device__ static void plow_exec(CInst in_v, unsigned slice, CTens T_v, plow_sme
                                           nblk, (unsigned char*)sm->raw);
                 break;
             }
+            /* i7 = 2: W8A8. xs is f32[H/128][i4], i4 = the capacity pitch QuantFp8Block128
+             * wrote it at (its i2), NOT PLOW_RUNTIME_ROWS: the quant and this GLU can resolve
+             * runtime rows differently (a 1024-row prompt in the 2048 bucket: 1024 vs 2048). */
             if (in->i[7] == 2u) {
                 d_moe_pf_w8a8<true>(TEN(0), (float*)TEN(7), (const unsigned char*)TEN(1),
-                                    (const float*)TEN(6), PLOW_RUNTIME_ROWS(in->i[4]),
+                                    (const float*)TEN(6), in->i[4],
                                     (const unsigned long long*)TEN(2),
                                     (const unsigned long long*)TEN(3), (const int*)TEN(4),
                                     (const unsigned*)TEN(5), nullptr, in->i[0], in->i[1],
