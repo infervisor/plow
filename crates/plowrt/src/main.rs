@@ -3478,6 +3478,8 @@ async fn bringup_runtime(
     #[cfg(not(feature = "cuda"))]
     let backend: Arc<dyn Backend> = device::select(executors);
     let vendor = backend.vendor();
+    #[cfg(feature = "hsa")]
+    let visible = backend.peer().map_or(1, |p| p.peer_agent_count()) as usize;
     let cfg = RuntimeConfig::get();
     if vendor != Some(hwspec::Vendor::Nvidia)
         && (!cfg.devices.is_empty()
@@ -3970,9 +3972,16 @@ async fn bringup_runtime(
     #[cfg(not(feature = "cuda"))]
     let managed_slugs: std::collections::HashSet<String> = std::collections::HashSet::new();
     let dp_spec = plowrt::serve::placement::parse_dp(&RuntimeConfig::get().dp)?;
-    if managed_slugs.is_empty() && (dp_spec.ranks("", 2) > 1 || dp_spec.named().next().is_some()) {
-        return Err("--dp needs the CUDA serve with model bundles under the GPU manager".into());
+    let amd_serve = cfg!(feature = "hsa") && vendor == Some(hwspec::Vendor::Amd);
+    if managed_slugs.is_empty()
+        && !amd_serve
+        && (dp_spec.ranks("", 2) > 1 || dp_spec.named().next().is_some())
+    {
+        return Err("--dp needs the CUDA serve with model bundles under the GPU manager, or an AMD serve".into());
     }
+    // AMD models served data-parallel, `(slug, ranks)`: their dispatchers are per rank.
+    #[allow(unused_mut)]
+    let mut amd_dp: Vec<(String, usize)> = Vec::new();
 
     // AMD/gfx950 engines. Deliberately NOT under the S1 `ModelManager`: that is
     // the multi-model residency planner (VRAM planning, co-residency, evict-LRU)
@@ -4009,11 +4018,55 @@ async fn bringup_runtime(
         {
             return Err("AMD co-resident models require --co-sched rr; separate HSA queues do not guarantee whole-grid residency".into());
         }
-        for slug in slugs {
-            let bundle = state.registry.get(&slug)?;
+        // `--dp`: rank r of a TP-t packet runs on the visible ordinals r*t..(r+1)*t, as its own
+        // engine `slug#r` with its own dispatcher, prefix cache and engine thread (pinned to
+        // its rank 0's socket); the DP router picks a rank per request. Planned before any
+        // load so the router is installed when the engines register.
+        let mut plan: Vec<(String, PathBuf, u32, usize)> = Vec::new();
+        for slug in &slugs {
+            let bundle = state.registry.get(slug)?;
             let Some(blob) = plowrt::asset::devblob::DevBlob::find_in_dir(&bundle.dir)? else {
                 continue;
             };
+            let tp = plowrt::serve::engine::AmdServe::packet_tp(&blob)?;
+            let n = dp_spec.ranks(slug, visible / tp as usize);
+            if n > 1 && n * tp as usize > visible {
+                return Err(format!(
+                    "{slug}: --dp {n} of a TP{tp} packet needs {} GPUs, {visible} visible",
+                    n * tp as usize
+                )
+                .into());
+            }
+            if n > plowrt::serve::dp::MAX_DP {
+                return Err(format!("{slug}: --dp {n} exceeds {} ranks", plowrt::serve::dp::MAX_DP).into());
+            }
+            plan.push((slug.clone(), blob, tp, n));
+        }
+        if let Some(m) = dp_spec.named().find(|m| !plan.iter().any(|p| p.0 == *m)) {
+            return Err(format!("--dp {m}=… names a model this server does not serve on the GPU").into());
+        }
+        {
+            use plowrt::serve::dp::{rank_key, DpRouter, DpSet, RouteCfg};
+            let mut router = DpRouter::new(RouteCfg::from_config());
+            for (slug, _, tp, n) in plan.iter().filter(|p| p.3 > 1) {
+                let ranks = (0..*n)
+                    .map(|r| {
+                        let key = rank_key(slug, r);
+                        state.set_slug_group(&key, r);
+                        ((r as u32) * tp, r, state.model_metrics(&key))
+                    })
+                    .collect();
+                tracing::info!(%slug, dp = n, tp, cfg = ?router.cfg, "dp: AMD ranks planned");
+                router.add(DpSet::new(slug, ranks));
+                amd_dp.push((slug.clone(), *n));
+            }
+            if !router.is_empty() {
+                state.install_dp(router);
+                state.install_device_turns(amd_dp.iter().map(|d| d.1).max().unwrap_or(1), false);
+            }
+        }
+        for (slug, blob, tp, n) in plan {
+            let bundle = state.registry.get(&slug)?;
             // Same refusal the CUDA path makes (`serve::manager::load_model`):
             // a real model driven through the byte-fallback tokenizer produces
             // fluent-looking GARBAGE, not an error, because the ids bear no
@@ -4036,13 +4089,28 @@ async fn bringup_runtime(
                 %slug, blob = %blob.display(), hsaco = %hsaco.display(),
                 checkpoint = %ckpt.display(), "loading AMD engine"
             );
-            let t0 = std::time::Instant::now();
-            let eng = plowrt::serve::engine::AmdServe::load(&blob, &hsaco, Some(&ckpt))?;
-            tracing::info!(
-                %slug, secs = t0.elapsed().as_secs_f64(), max_ctx = eng.max_ctx(),
-                "AMD engine loaded"
-            );
-            state.install_gpu_engine(slug, plowrt::serve::engine::ServeEngine::Amd(eng));
+            if n == 1 {
+                let t0 = std::time::Instant::now();
+                let eng = plowrt::serve::engine::AmdServe::load(&blob, &hsaco, Some(&ckpt))?;
+                tracing::info!(
+                    %slug, secs = t0.elapsed().as_secs_f64(), max_ctx = eng.max_ctx(),
+                    "AMD engine loaded"
+                );
+                state.install_gpu_engine(slug, plowrt::serve::engine::ServeEngine::Amd(eng));
+                continue;
+            }
+            for r in 0..n {
+                let key = plowrt::serve::dp::rank_key(&slug, r);
+                let first = (r as u32 * tp) as u8;
+                let t0 = std::time::Instant::now();
+                let eng =
+                    plowrt::serve::engine::AmdServe::load_on(&blob, &hsaco, Some(&ckpt), first)?;
+                tracing::info!(
+                    %key, first_device = first, tp, secs = t0.elapsed().as_secs_f64(),
+                    max_ctx = eng.max_ctx(), "AMD DP rank loaded"
+                );
+                state.install_gpu_engine(key, plowrt::serve::engine::ServeEngine::Amd(eng));
+            }
         }
     }
 
@@ -4092,6 +4160,14 @@ async fn bringup_runtime(
             continue;
         }
         let bundle = state.registry.get(&slug)?;
+        if let Some((_, n)) = amd_dp.iter().find(|d| d.0 == slug) {
+            for r in 0..*n {
+                let key = plowrt::serve::dp::rank_key(&slug, r);
+                let m = mux::spawn(key.clone(), bundle.clone(), Arc::clone(&state), mux_cfg);
+                state.install_mux(key, m);
+            }
+            continue;
+        }
         let m = mux::spawn(slug.clone(), bundle, Arc::clone(&state), mux_cfg);
         state.install_mux(slug, m);
     }

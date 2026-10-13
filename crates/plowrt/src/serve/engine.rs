@@ -1548,6 +1548,25 @@ mod amd_serve {
         /// so under a `gpulease` the visible ordinals `0..n` are the leased
         /// cards.
         pub fn load(blob_path: &Path, hsaco_dir: &Path, checkpoint: Option<&Path>) -> Result<Self> {
+            Self::load_on(blob_path, hsaco_dir, checkpoint, 0)
+        }
+
+        /// The packet's TP degree (1 for a single-GPU packet).
+        pub fn packet_tp(blob_path: &Path) -> Result<u32> {
+            let raw = std::fs::read(blob_path)
+                .map_err(|e| RuntimeError::Device(format!("read {}: {e}", blob_path.display())))?;
+            let meta = crate::asset::devblob::DevBlob::parse_l2(&raw, true)?;
+            Ok(meta.tp.map(|t| t.n_gpu).unwrap_or(1).max(1))
+        }
+
+        /// [`AmdServe::load`] on the visible ordinals `first..first + tp`: one data-parallel
+        /// replica of a node that holds several (`--dp`).
+        pub fn load_on(
+            blob_path: &Path,
+            hsaco_dir: &Path,
+            checkpoint: Option<&Path>,
+            first: u8,
+        ) -> Result<Self> {
             let raw = std::fs::read(blob_path)
                 .map_err(|e| RuntimeError::Device(format!("read {}: {e}", blob_path.display())))?;
             // METADATA ONLY -- this reads the TP fan-out to decide single-GPU vs TP group and
@@ -1570,12 +1589,12 @@ mod amd_serve {
             });
 
             let ranks = if n_gpu == 1 {
-                let be = Arc::new(crate::device::hsa::HsaBackend::new(0)?);
+                let be = Arc::new(crate::device::hsa::HsaBackend::new(first)?);
                 Ranks::One(AmdEngine::load(be, blob_path, hsaco_dir, checkpoint)?)
             } else {
                 let mut backends = Vec::with_capacity(n_gpu as usize);
                 for d in 0..n_gpu {
-                    backends.push(Arc::new(crate::device::hsa::HsaBackend::new(d as u8)?));
+                    backends.push(Arc::new(crate::device::hsa::HsaBackend::new(first + d as u8)?));
                 }
                 Ranks::Tp(AmdTpGroup::load(
                     backends, blob_path, hsaco_dir, checkpoint,
