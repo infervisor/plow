@@ -6297,6 +6297,10 @@ fn emit_glm_dsa_decode_select(
             if fuse {
                 return c_sel;
             }
+            // INDEX TABLE (decode): `n.iidx` i32 [rows][2051], COMPACT per row: the selected
+            // pools' tokens first (slot g*4+o = pool*4+o, pools in arbitrary order), then the
+            // incomplete-pool tail tokens, then -1. The gather walks min(2051, kv_len) slots and
+            // masks -1.
             // Pool ids -> token ids (+ trailing incomplete-pool tail-append), into `n.iidx`
             // ITSELF — its allocation already carries the `+ (index_kpool-1)` headroom this
             // needs (see its own declare-time comment), so the downstream flash-gather that
@@ -7745,6 +7749,12 @@ fn emit_glm_dsa_prefill_select(
                 d.i[3] = c.index_kpool;
             },
         );
+        // INDEX TABLE (prefill, consumed by IndexUnionPf and sparse prefill flash): `n.iidx_pf`
+        // is i32 [t][W], W = glm_dsa_select_width = (index_topk/kpool)*kpool + kpool-1 = 2051.
+        // Row r (query position kv_len-t+r) holds slots [0, 2048) = the selected pools p in
+        // arbitrary order, each as tokens p*4..p*4+3 (slot g*4+o); -1 where the row has fewer
+        // complete pools than 512; slots [2048, 2051) = the incomplete-pool tail tokens
+        // (pool_len*4 + j for j < row_len % 4), else -1. Every non-negative entry is < row_len.
         let c_ex = b.emit(DevOp::DsaPoolExpand, all.to_vec(), &[c_se], |d| {
             d.t[0] = n.iidx_pf;
             d.t[1] = n.iidx_pool_pf;
