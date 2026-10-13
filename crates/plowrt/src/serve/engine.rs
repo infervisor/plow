@@ -723,6 +723,13 @@ mod amd_serve {
             }
         }
 
+        fn rank_at(&self, r: usize) -> &AmdEngine {
+            match self {
+                Ranks::One(e) => e,
+                Ranks::Tp(g) => g.rank(r),
+            }
+        }
+
         fn ctr_snapshot(&mut self, program: usize) -> Result<Vec<u32>> {
             match self {
                 Ranks::One(e) => e.ctr_word0_snapshot(program),
@@ -952,6 +959,9 @@ mod amd_serve {
         /// leave a full-vocab row per slot behind the device argmax; `None` keeps host logprobs
         /// refused (sharded lm_head fold, fused argmax, or no row writer found).
         logits_elem: Option<usize>,
+        /// Ranks whose `act.logits` rows concatenate to the full vocab: the TP width under a
+        /// vocab-column-parallel lm_head (`GLM_SHARD_HEAD`, folded by `XArgmaxFin`), else 1.
+        logits_shards: usize,
         diagnostics: Option<EngineDiagnostics>,
         counter_snapshot_dir: Option<PathBuf>,
         tensor_snapshot: Option<TensorSnapshotConfig>,
@@ -1505,14 +1515,24 @@ mod amd_serve {
 
     /// Element width of the `act.logits` row the decode programs write, when host logprobs can
     /// read it: a `Gemv` (bf16) or `GemvF32` / `GemmF32` (f32) lm_head writing `act.logits`, and
-    /// no sharded-head fold (`XArgmaxFin`) or fused `GemvArgmax` in any decode program.
-    fn logits_row_elem(blob: &crate::asset::devblob::DevBlob) -> Option<usize> {
+    /// no fused `GemvArgmax` in any decode program. The flag is a sharded-head fold
+    /// (`XArgmaxFin`): each rank's row is its vocab slice, gathered in rank order.
+    fn logits_row_elem(blob: &crate::asset::devblob::DevBlob) -> (Option<usize>, bool) {
+        let sharded = blob.decode_progs().iter().any(|p| {
+            p.insts
+                .iter()
+                .any(|d| d.op == packet::dev::DevOp::XArgmaxFin as u16)
+        });
+        (logits_row_elem_width(blob), sharded)
+    }
+
+    fn logits_row_elem_width(blob: &crate::asset::devblob::DevBlob) -> Option<usize> {
         use packet::dev::DevOp;
         let logits = blob.tensors.iter().position(|t| t.name == "act.logits")? as u16;
         let mut elem = None;
         for prog in blob.decode_progs() {
             for d in &prog.insts {
-                if d.op == DevOp::XArgmaxFin as u16 || d.op == DevOp::GemvArgmax as u16 {
+                if d.op == DevOp::GemvArgmax as u16 {
                     return None;
                 }
                 if d.t[0] != logits {
@@ -1556,7 +1576,8 @@ mod amd_serve {
             // here just blocked `serve` on every placed blob before the engine saw it.
             let meta = crate::asset::devblob::DevBlob::parse_l2(&raw, true)?;
             let n_gpu = meta.tp.map(|t| t.n_gpu).unwrap_or(1).max(1);
-            let logits_elem = logits_row_elem(&meta);
+            let (logits_elem, logits_sharded) = logits_row_elem(&meta);
+            let logits_shards = if logits_sharded { n_gpu as usize } else { 1 };
             drop(meta);
             drop(raw);
 
@@ -1736,6 +1757,7 @@ mod amd_serve {
                 cursor_split_ns: (0, 0),
                 token_batch_tp,
                 logits_elem,
+                logits_shards,
                 diagnostics: None,
                 counter_snapshot_dir,
                 tensor_snapshot,
@@ -2090,16 +2112,17 @@ mod amd_serve {
 
         /// `slot`'s most recent full-vocab logits row, read back from rank 0 (every rank holds
         /// the same replicated row behind its device argmax; `in.ids` and `act.logits` are both
-        /// slot-indexed). `false` when the packet keeps no such row (see `logits_elem`).
+        /// slot-indexed), or concatenated over the ranks' vocab slices under a sharded head.
+        /// `false` when the packet keeps no such row (see `logits_elem`).
         pub fn logits_row(&self, slot: usize, out: &mut Vec<f32>) -> bool {
             let Some(elem) = self.logits_elem else {
                 return false;
             };
-            let e = self.ranks.rank0();
-            let Some(total) = e.tensor_bytes("act.logits") else {
+            let Some(total) = self.ranks.rank0().tensor_bytes("act.logits") else {
                 return false;
             };
-            let row = total as usize / self.batch;
+            let shard = total as usize / self.batch;
+            let row = shard * self.logits_shards;
             let Some(&at) = self.lp_row.get(slot) else {
                 return false;
             };
@@ -2107,13 +2130,16 @@ mod amd_serve {
             if at == END_LOGITS_ROW {
                 bytes = self.end_logits[slot].clone();
             } else {
-                if at >= self.batch || row == 0 || row % elem != 0 {
+                if at >= self.batch || shard == 0 || shard % elem != 0 {
                     return false;
                 }
                 bytes = vec![0u8; row];
-                if let Err(err) = e.read_tensor_range("act.logits", (at * row) as u64, &mut bytes) {
-                    tracing::warn!(error = %err, slot, "amd: logits row readback failed");
-                    return false;
+                for (r, dst) in bytes.chunks_exact_mut(shard).enumerate() {
+                    let e = self.ranks.rank_at(r);
+                    if let Err(err) = e.read_tensor_range("act.logits", (at * shard) as u64, dst) {
+                        tracing::warn!(error = %err, slot, rank = r, "amd: logits row readback failed");
+                        return false;
+                    }
                 }
             }
             if bytes.len() != row || row % elem != 0 {
@@ -2488,13 +2514,16 @@ mod amd_serve {
             if self.logits_elem.is_none() {
                 return Ok(());
             }
-            let e = self.ranks.rank0();
-            let Some(total) = e.tensor_bytes("act.logits") else {
+            let Some(total) = self.ranks.rank0().tensor_bytes("act.logits") else {
                 return Ok(());
             };
-            row.resize(total as usize / self.batch, 0);
+            let shard = total as usize / self.batch;
+            row.resize(shard * self.logits_shards, 0);
             // The prefill tail wrote its one logits row at row 0 (`lp_row`).
-            e.read_tensor_range("act.logits", 0, row)
+            for (r, dst) in row.chunks_exact_mut(shard).enumerate() {
+                self.ranks.rank_at(r).read_tensor_range("act.logits", 0, dst)?;
+            }
+            Ok(())
         }
 
         /// Complete an end resume: the KV rows and the restored recurrence already hold the
