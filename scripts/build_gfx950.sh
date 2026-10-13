@@ -1014,6 +1014,33 @@ BUILD_GEMMA_MOE=0; [ "${PLOW_GEMMA_MOE:-0}" = 1 ] && BUILD_GEMMA_MOE=1
 # 288 experts, down-epilogue row-metadata hoist, raw fp8 B held across the MFMAs), CombinePf
 # 23.2 -> 6.3 ms (vector arm).
 K3_PF_MOE="-DPLOW_MOE_TILE_BINSEARCH=1 -DPLOW_MOE_PF_EPI=1 -DPLOW_MOE_PF_BRAW=1 -DPLOW_COMBINE_VEC=1"
+# Value-identical K3 prefill arms, default on (=0 rolls back): the wave-per-token router tail
+# (op 83, now up to 320 experts; GLM-5.3-Flash has 288) and the all-wave align scatter (op 84).
+case "${PLOW_K3_PF_ROUTER_WAVE:-1}" in
+  0) ;;
+  1) K3_PF_MOE="$K3_PF_MOE -DPLOW_MOE_ROUTER_PF_WAVE=1" ;;
+  *) echo "PLOW_K3_PF_ROUTER_WAVE must be 0 or 1" >&2; exit 2 ;;
+esac
+case "${PLOW_K3_PF_ALIGN_WAVES:-1}" in
+  0) ;;
+  1) K3_PF_MOE="$K3_PF_MOE -DPLOW_MOE_ALIGN_WAVES=1" ;;
+  *) echo "PLOW_K3_PF_ALIGN_WAVES must be 0 or 1" >&2; exit 2 ;;
+esac
+# Opt-in K3 prefill arms (default off): PLOW_K3_PF_XR_SCHED=aiter, the 16-byte collective schedule
+# (bit-identical data movement, op_collective.h) on capped workgroups — two-shot NWG/NWG_RS, seam
+# reduce-scatter NWG_SRS, seam all-gather NWG_SAG; PLOW_K3_PF_FOLD_TB=<2|4|8>, the token-blocked
+# MlaMergeFold (op_attention_common.h; the gfx950 V=128 oracle saw packed-FMA rounding moves, so
+# it stays behind the knob until a stream check passes).
+case "${PLOW_K3_PF_XR_SCHED:-0}" in
+  0) ;;
+  aiter) K3_PF_MOE="$K3_PF_MOE -DPLOW_XR_SCHED_AITER=1 -DPLOW_XR_SCHED_NWG=${PLOW_XR_SCHED_NWG:-48} -DPLOW_XR_SCHED_NWG_RS=${PLOW_XR_SCHED_NWG_RS:-16} -DPLOW_XR_SCHED_NWG_SRS=${PLOW_XR_SCHED_NWG_SRS:-16} -DPLOW_XR_SCHED_NWG_SAG=${PLOW_XR_SCHED_NWG_SAG:-48}" ;;
+  *) echo "PLOW_K3_PF_XR_SCHED must be 0 or aiter" >&2; exit 2 ;;
+esac
+case "${PLOW_K3_PF_FOLD_TB:-0}" in
+  0|1) ;;
+  2|4|8) K3_PF_MOE="$K3_PF_MOE -DPLOW_MLA_FOLD_TB=$PLOW_K3_PF_FOLD_TB" ;;
+  *) echo "PLOW_K3_PF_FOLD_TB must be 0, 2, 4 or 8" >&2; exit 2 ;;
+esac
 K3_ELFS=""
 if [ -n "${PLOW_HSACO_CONFIG:-}" ] &&
    grep -Eq '^#define PLOW_PACKET_OBJECT_REQUIRES "([^"]* )?PLOW_K3=1( |")' "$PLOW_HSACO_CONFIG"; then

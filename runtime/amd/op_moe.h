@@ -2262,25 +2262,30 @@ __device__ void d_moe_router_topk_pf(unsigned char* table, const bf16* logit, co
     }
 #endif
 #if PLOW_MOE_ROUTER_PF_WAVE
-    /* WAVE PER TOKEN (sigmoid, no groups/hash, n_exp a multiple of 64 up to 256, k <= 8): each
-     * lane holds 4 experts, ranks its unique packed keys against all n_exp through lane
-     * shuffles, and lane 0 runs the workgroup router's gate tail in the same order, so the
-     * table is byte-identical to d_moe_router_topk's. No workgroup barrier per token: the
-     * block-per-token loop spent 0.45 ms/layer at T8192 TP8 on MI350X for 0.1 ms of traffic. */
-    if ((flags & 1u) && !(flags & 48u) && n_group <= 1u && (n_exp & 63u) == 0u && n_exp <= 256u &&
-        k <= 8u) {
+    /* WAVE PER TOKEN (sigmoid, no groups/hash, n_exp up to 320, k <= 8): each lane holds up to
+     * 5 experts, ranks its unique packed keys against all n_exp through lane shuffles, and lane 0
+     * runs the workgroup router's gate tail in the same order, so the table is byte-identical to
+     * d_moe_router_topk's. No workgroup barrier per token: the block-per-token loop spent
+     * 0.45 ms/layer at T8192 TP8 on MI350X for 0.1 ms of traffic. A lane past n_exp (GLM-5.3-
+     * Flash's 288 = 4.5 x 64) carries key 0, which no live key can equal (it would need the
+     * biased score's ordered bits to be 0, a negative NaN), so it never outranks a live expert
+     * and is never written. */
+    if ((flags & 1u) && !(flags & 48u) && n_group <= 1u && n_exp <= 320u && k <= 8u) {
         const unsigned lane = threadIdx.x & 63u, wave = threadIdx.x >> 6;
         const bool norm_topk = (flags & 2u) != 0, f32log = (flags & 8u) != 0;
-        const unsigned per = n_exp / 64u;
+        const unsigned per = (n_exp + 63u) / 64u;
         unsigned* wl = (unsigned*)lds + wave * 16u;
         float* ws = (float*)(wl + 8);
         for (unsigned tok = slice * PLOW_WAVES + wave; tok < T; tok += nblk * PLOW_WAVES) {
-            float s[4];
-            unsigned long long key[4];
+            float s[5];
+            unsigned long long key[5];
 #pragma unroll
-            for (unsigned q = 0; q < 4; q++) {
+            for (unsigned q = 0; q < 5; q++) {
                 if (q >= per) break;
                 const unsigned e = lane + q * 64u;
+                s[q] = 0.0f;
+                key[q] = 0ull;
+                if (e >= n_exp) continue;
                 const float l = f32log ? ((const float*)logit)[(size_t)tok * n_exp + e]
                                        : bf2f(logit[(size_t)tok * n_exp + e]);
                 s[q] = 1.0f / (1.0f + expf(-l));
@@ -2290,20 +2295,20 @@ __device__ void d_moe_router_topk_pf(unsigned char* table, const bf16* logit, co
                 sb = (sb & 0x80000000u) ? ~sb : (sb | 0x80000000u);
                 key[q] = ((unsigned long long)sb << 20) | (unsigned long long)((n_exp - 1u - e) & 0xFFFFFu);
             }
-            unsigned rank[4] = {0u, 0u, 0u, 0u};
+            unsigned rank[5] = {0u, 0u, 0u, 0u, 0u};
             for (unsigned src = 0; src < 64u; src++)
 #pragma unroll
-                for (unsigned q2 = 0; q2 < 4; q2++) {
+                for (unsigned q2 = 0; q2 < 5; q2++) {
                     if (q2 >= per) break;
                     const unsigned lo = __shfl((unsigned)key[q2], src), hi = __shfl((unsigned)(key[q2] >> 32), src);
                     const unsigned long long kf = ((unsigned long long)hi << 32) | lo;
 #pragma unroll
-                    for (unsigned q = 0; q < 4; q++)
+                    for (unsigned q = 0; q < 5; q++)
                         if (q < per) rank[q] += kf > key[q];
                 }
 #pragma unroll
-            for (unsigned q = 0; q < 4; q++)
-                if (q < per && rank[q] < k) {
+            for (unsigned q = 0; q < 5; q++)
+                if (q < per && lane + q * 64u < n_exp && rank[q] < k) {
                     wl[rank[q]] = lane + q * 64u;
                     ws[rank[q]] = s[q];
                 }
