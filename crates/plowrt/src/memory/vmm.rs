@@ -1679,9 +1679,13 @@ impl VmmKv {
                     let awaited = snap.tail.is_empty()
                         && blocks > 0
                         && waits.contains(&Some(hashes[blocks - 1]));
+                    // Without a session the chain's own attach is the proof: a prompt end
+                    // attached exactly once by the sequence now publishing past it is spent
+                    // (a shared-prefix end, `share`, serves other conversations and stays).
+                    let spent = snap.session || (snap.attaches == 1 && !snap.share);
                     let superseded = snap.users == 0
                         && !awaited
-                        && snap.session
+                        && spent
                         && snap.attaches <= 1
                         && snap.rows < rows
                         && (common == snap.tail.len() || stale_turn_end);
@@ -5749,7 +5753,8 @@ mod tests {
     }
 
     /// A session keeps only its newest boundary: publishing it frees the session's earlier
-    /// idle snapshots on the chain; a non-session snapshot on the chain stays.
+    /// idle snapshots on the chain; a non-session snapshot on the chain stays unless this chain
+    /// attached it (spent).
     #[test]
     fn session_retires_superseded_snapshots() {
         let ops = Arc::new(MockVmm::default());
@@ -5769,8 +5774,47 @@ mod tests {
         assert_eq!(p.stats().snapshot_bytes, 12);
         assert_eq!(
             p.retire_superseded(&pr, 28),
+            8,
+            "the session's 20-row boundary and the 12-row one this chain attached"
+        );
+        assert_eq!(p.stats().snapshot_bytes, 4);
+        p.begin_seq(1);
+        p.ensure_rows(0, 1).unwrap();
+        assert!(
+            p.try_attach(0, &pr[..26]).unwrap().is_none(),
+            "the attached-once lead is spent"
+        );
+        p.begin_seq(0);
+        p.ensure_rows(0, 1).unwrap();
+        assert_eq!(
+            p.try_attach(0, &pr).unwrap().expect("newest boundary").rows,
+            28
+        );
+    }
+
+    /// Without `X-Session-Id` a conversation's next turn attaches its prompt end and publishes a
+    /// longer one: the attached boundary is spent and freed; a never-attached boundary on the
+    /// chain stays.
+    #[test]
+    fn conversation_without_session_retires_its_attached_prompt_end() {
+        let ops = Arc::new(MockVmm::default());
+        let p = uniform_pool(ops.clone());
+        let pr = prompt(30);
+        assert!(p.try_attach(0, &pr).unwrap().is_none());
+        p.ensure_rows(0, 30).unwrap();
+        p.publish_at(0, &pr, 12, 4, |_| Ok(())).unwrap();
+        p.begin_seq(0);
+        p.ensure_rows(1, 1).unwrap();
+        assert_eq!(p.try_attach(1, &pr).unwrap().expect("prompt end").rows, 12);
+        p.finish_attach(1);
+        p.ensure_rows(1, 30).unwrap();
+        p.publish_at(1, &pr, 20, 4, |_| Ok(())).unwrap();
+        p.publish_at(1, &pr, 28, 4, |_| Ok(())).unwrap();
+        assert_eq!(p.stats().snapshot_bytes, 12);
+        assert_eq!(
+            p.retire_superseded(&pr, 28),
             4,
-            "only the session's 20-row boundary"
+            "only the 12-row boundary this chain attached"
         );
         assert_eq!(p.stats().snapshot_bytes, 8);
         p.begin_seq(1);
@@ -5778,9 +5822,9 @@ mod tests {
         assert_eq!(
             p.try_attach(0, &pr[..26])
                 .unwrap()
-                .expect("shared lead stays")
+                .expect("never-attached boundary stays")
                 .rows,
-            12
+            20
         );
         p.begin_seq(0);
         p.ensure_rows(0, 1).unwrap();

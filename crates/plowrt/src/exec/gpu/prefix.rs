@@ -941,17 +941,23 @@ impl GpuEngine {
         } else {
             self.publish_boundary(b, p_a)
         };
-        if let Some(ttl) = self.session_pin[b].filter(|_| published && prompt_end) {
-            // Pinned now, not at retire: while this turn decodes, other sessions' publishes
-            // must not evict it ahead of idle sessions' boundaries.
-            kv.pin_prefix(&toks[..p_a as usize], std::time::Instant::now() + ttl);
+        if published && prompt_end {
+            if let Some(ttl) = self.session_pin[b] {
+                // Pinned now, not at retire: while this turn decodes, other sessions' publishes
+                // must not evict it ahead of idle sessions' boundaries.
+                kv.pin_prefix(&toks[..p_a as usize], std::time::Instant::now() + ttl);
+            }
+            // With or without a session: the boundary this turn attached to is spent once its
+            // prompt end publishes (the next turn attaches to the longest boundary). Left in
+            // place it held a second ~100 MiB window copy per conversation until LRU reached it.
             let freed = kv.retire_superseded(toks, p_a);
             if freed > 0 {
                 tracing::debug!(
                     slot = b,
                     p_a,
                     freed,
-                    "vmm: session retired superseded snapshots"
+                    session,
+                    "vmm: retired superseded snapshots"
                 );
             }
         }
