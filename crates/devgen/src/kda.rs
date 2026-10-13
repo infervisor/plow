@@ -1036,6 +1036,9 @@ fn emit_kda_mixer_ex(
         && !chunk
         && st.conv_state_alt.is_none()
         && crate::emit_config::active().kda_decode_wide
+        // The v3 object is built for gfx950 only (MI350X, 256 CUs).
+        && crate::emit_is_amd()
+        && n_cu == 256
         && c.supports_decode_wide()
     {
         let handles = [

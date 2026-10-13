@@ -3070,6 +3070,8 @@ fn kda_decode_wide_args(
         || !(1..=8).contains(&conv_w)
         || flags != 3
         || rows.checked_mul(heads).is_none()
+        || heads.checked_mul(dim).and_then(|p| p.checked_mul(dim)).is_none()
+        || gate_mode > 1
         || !lower_bound.is_finite()
         || !scale.is_finite()
         || !norm_eps.is_finite()
