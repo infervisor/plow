@@ -587,6 +587,9 @@ The packet from config + index alone (no weights) is 70 MB: 4 prefill buckets + 
   FP32 error, relL2 4% vs 0.16%). Gates: validate r1/B8/B32/B128 12.7/22.7/30.4/40.1 ms, FP32 PASS
   kl_mean 0.01475, needles 36/36, split 18/18, prefix re-sends cached == cold. Strict TP8 reports 19
   cells MATCHED/EQUIVALENT: 0.28-0.61x vLLM (v10 0.25-0.62x; isl16384 c32 0.31 -> 0.49). Recipe -> v11.
+- 14:20 UTC, v11 DP2xTP4 (TP4 packet 92ae9bd5, collective knobs off, PF_INTERLEAVE 8192): FP32 PASS
+  kl_mean 0.01251, no collective errors; strict reports vs vLLM DP2xTP4 15 cells MATCHED/EQUIVALENT,
+  0.44-0.76x (isl16384 c64/c128 0.73/0.72). No qualified win.
 - 17:35 UTC, E10 TP4 bench (packet pkt-glm53flash-tp4-ladder-v4, 4 GPUs, real prompt, streams
   exact at every rung): scalar (rung 8) 55.5 ms, B=8 51.4, B=32 63.3, B=64 74.6 ms (858 tok/s
   per group); prefill 1k 204 ms (TP8 173). Two such groups (DP2xTP4) would serve 128 streams at

@@ -20,12 +20,13 @@ not wins under the strict format: TTFT p99 at isl 1024 c8 (542 vs 1765 ms), isl 
 
 ## DP2xTP4 (two TP4 groups behind one endpoint) vs vLLM DP2xTP4
 
-`PLOW_DP=2` on the TP4 packet (2beec26e) against vLLM `--tensor-parallel-size 4
---data-parallel-size 2`, same client and cells (isl 1024/4096/16384 x c1..c128, two repeats),
-strict reports in [dp2tp4/](dp2tp4/), rows `dp2tp4-*` in [comparison.csv](comparison.csv). All 15
-cells MATCHED/EQUIVALENT; no qualified win: plowrt 0.72-0.75x at c1, 0.55-0.62x at c8, 0.42-0.53x
-at c32-c128. plowrt DP2xTP4 beats plowrt TP8 at c32+ (isl4096 c128 19827 vs 13926 tok/s); vLLM's
-own DP2xTP4 is 0.66-0.88x its TP8. TTFT p99 favours plowrt at c1/c8 (isl1024 c8 484 vs 1655 ms).
+`PLOW_DP=2` on the v11 TP4 packet (92ae9bd5, same knobs as the TP8 recipe, PF_INTERLEAVE 8192)
+against vLLM `--tensor-parallel-size 4 --data-parallel-size 2`, same client and cells (isl
+1024/4096/16384 x c1..c128, two repeats), strict reports in [dp2tp4/](dp2tp4/), rows `dp2tp4-*` in
+[comparison.csv](comparison.csv). All 15 cells MATCHED/EQUIVALENT; no qualified win: plowrt
+0.72-0.76x at c1, 0.64-0.73x at c8, 0.44-0.73x at c32-c128 (v10: 0.42-0.75x). FP32 gate on DP2xTP4:
+PASS, kl_mean 0.0125. plowrt DP2xTP4 beats plowrt TP8 at c32+ (isl16384 c128 30416 vs 22196 tok/s);
+vLLM's own DP2xTP4 is 0.66-0.88x its TP8.
 
 ## Accuracy
 
