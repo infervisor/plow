@@ -480,6 +480,8 @@ pub struct Builder {
     gemm_small_splitk: u32,
     /// Split-K as two packets (partials, then a gated reduce). See [`Builder::set_gemm_small_splitk_2p`].
     gemm_small_splitk_2p: bool,
+    /// See [`Builder::set_gemm_small_group_s`].
+    gemm_small_group_s: u32,
     /// Re-declaring a tensor name returns the existing handle instead of appending.
     /// `false` (default) ⇒ byte-identical. See [`Builder::set_tensor_dedup`].
     tensor_dedup: bool,
@@ -775,6 +777,7 @@ impl Builder {
             gemv_split: 1,
             gemm_small_splitk: 0,
             gemm_small_splitk_2p: false,
+            gemm_small_group_s: 0,
             tensor_dedup: false,
             cu_cap: None,
             tr_dropped: 0,
@@ -1057,6 +1060,106 @@ impl Builder {
         if self.gemm_small_splitk_2p {
             inst.i[7] = 1;
         }
+    }
+
+    /// PLOW_GLM_KDA_PROJ_GROUP: emit the bf16 `GemmSmall` projections `segs` = `(C, A, B, N, K)`
+    /// over `m` rows as ONE partials packet (`i7 = 3`) plus, when any is split, ONE reduce packet
+    /// (`i7 = 4`), instead of a packet pair each. Each segment keeps the split factor
+    /// [`Builder::set_gemm_small_splitk`] would give its own packet (interp.hip
+    /// `exec_gemm_small_group`), so the outputs are bit-identical. `t7` is a u32 descriptor
+    /// `[nseg, {C, A, B, N, K, S, part} x nseg]`; `t0..t2` / `i0..i2` repeat segment 0. `None`
+    /// when a segment would split but the two-packet form is off.
+    /// Split factor override for [`Builder::emit_gemm_small_group`] (0 = each segment's own
+    /// split-K factor, bit-identical).
+    pub fn set_gemm_small_group_s(&mut self, s: u32) {
+        self.gemm_small_group_s = s;
+    }
+
+    /// Whether [`Builder::emit_gemm_small_group`] can emit: split-K off, or its two-packet form.
+    pub fn gemm_small_group_ok(&self) -> bool {
+        self.gemm_small_splitk < 2 || self.gemm_small_splitk_2p
+    }
+
+    pub fn emit_gemm_small_group(
+        &mut self,
+        m: u32,
+        segs: &[(u32, u32, u32, u32, u32)],
+        deps: &[u32],
+    ) -> Option<u32> {
+        assert!(!segs.is_empty() && segs.len() <= 8);
+        let slices = self.n_cu;
+        let split = |max_s: u32, n: u32, k: u32| {
+            let tiles = m.div_ceil(64) * n.div_ceil(128);
+            let mut s = 1u32;
+            while max_s >= 2 && s * 2 <= max_s && tiles * s * 2 <= slices && k % (s * 2 * 128) == 0
+            {
+                s *= 2;
+            }
+            s
+        };
+        // `group_s` (PLOW_GLM_KDA_PROJ_GROUP_S): every segment splits by the largest power of two
+        // <= it that divides K into 128-wide slices, whatever its tile count. The group already
+        // fills the grid, so fewer, longer slices cut the fp32 partial traffic. NOT
+        // bit-identical to the per-projection split.
+        let gs = self.gemm_small_group_s;
+        let ss: Vec<u32> = segs
+            .iter()
+            .map(|&(_, _, _, n, k)| {
+                if gs >= 1 {
+                    let mut s = 1u32;
+                    while s * 2 <= gs.min(16) && k % (s * 2 * 128) == 0 {
+                        s *= 2;
+                    }
+                    s
+                } else {
+                    split(self.gemm_small_splitk, n, k)
+                }
+            })
+            .collect();
+        let any_split = ss.iter().any(|&s| s > 1);
+        if any_split && !self.gemm_small_splitk_2p {
+            return None;
+        }
+        let id = self.ops.len();
+        let mut words = vec![segs.len() as u32];
+        for (g, (&(c, a, w, n, k), &s)) in segs.iter().zip(&ss).enumerate() {
+            let part = if s > 1 {
+                self.tensor(
+                    &format!("act.splitk.{id}.g{g}.m{m}n{n}k{k}s{s}.part"),
+                    u64::from(s) * u64::from(m) * u64::from(n) * 4,
+                )
+            } else {
+                TENSOR_NONE
+            };
+            words.extend([c, a, w, n, k, s, part]);
+        }
+        let bytes: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+        let desc = self.tensor_init(&format!("act.gemm_group.m{m}.{id}.desc"), bytes);
+        let (c0, a0, w0, n0, k0) = segs[0];
+        let cus: Vec<u32> = (0..self.n_cu).collect();
+        let part = self.emit(DevOp::GemmSmall, cus.clone(), deps, |d| {
+            d.t[0] = c0;
+            d.t[1] = a0;
+            d.t[2] = w0;
+            d.t[7] = desc;
+            d.i[0] = m;
+            d.i[1] = n0;
+            d.i[2] = k0;
+            d.i[7] = 3;
+        });
+        if !any_split {
+            return Some(part);
+        }
+        Some(self.emit(DevOp::GemmSmall, cus, &[part], |d| {
+            d.t[0] = c0;
+            d.t[1] = a0;
+            d.t[2] = w0;
+            d.t[7] = desc;
+            d.i[0] = m;
+            d.i[1] = n0;
+            d.i[2] = k0;
+            d.i[7] = 4;
+        }))
     }
 
     /// Re-declaring a name returns the EXISTING handle and grows it to the larger byte count,
@@ -2767,6 +2870,7 @@ impl Builder {
                 || op.inst.op == DevOp::IndexFp8Prefill as u16
                 || op.inst.op == DevOp::GemmLtPf as u16
                 || op.inst.op == DevOp::GemmBlkPf as u16
+                || op.inst.op == DevOp::GemmGroupPf as u16
                 || (op.inst.op == DevOp::MlaMergeFold as u16 && op.inst.i[5] == 1)
                 || (op.inst.op == DevOp::FlashMlaDecodeFp8 as u16 && op.isolated)
         }) || native_gemma4_glu

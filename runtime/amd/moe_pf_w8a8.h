@@ -95,7 +95,11 @@ __device__ __forceinline__ fp8v32 mw8_ld_frag(const unsigned char* p) {
 /* SPLIT (i[7] = 4/5): two-term FP8 activations. GLU reads the bf16 rows (Aq = bf16 x, As unused)
  * and splits each 1x128 group in its A staging; it writes fq rows as [hi I | lo I] (2*I bytes, the
  * bf16 fu footprint). DOWN reads those rows; both run hi and lo through the MFMA chain. */
-template <bool GLU, bool SPLIT = false>
+/* LO = false (GLU only, i[7] = 6): the bf16 rows are quantized single-term in the staging, the
+ * same arithmetic as QuantFp8Block128 (amax floored at 1e-10, /448, RNE e4m3), so the pair is
+ * bit-identical to quant + i[7] = 2 without the op, its hop and the xq/xs round trip. The output is
+ * the plain single-term fq rows DOWN i[7] = 2 reads. */
+template <bool GLU, bool SPLIT = false, bool LO = true>
 __device__ void d_moe_pf_w8a8(void* __restrict__ Cout, float* __restrict__ fs_out,
                               const unsigned char* __restrict__ Aq, const float* __restrict__ As,
                               unsigned as_stride, const unsigned long long* __restrict__ wtab,
@@ -198,14 +202,21 @@ __device__ void d_moe_pf_w8a8(void* __restrict__ Cout, float* __restrict__ fs_ou
                 fp8v16 h, l;
 #pragma unroll
                 for (int q = 0; q < 4; q++) {
-                    unsigned hq, lq;
-                    mw8_split4(v[4 * q] * inv, v[4 * q + 1] * inv, v[4 * q + 2] * inv,
-                               v[4 * q + 3] * inv, hq, lq);
-                    h[q] = hq;
-                    l[q] = lq;
+                    if constexpr (LO) {
+                        unsigned hq, lq;
+                        mw8_split4(v[4 * q] * inv, v[4 * q + 1] * inv, v[4 * q + 2] * inv,
+                                   v[4 * q + 3] * inv, hq, lq);
+                        h[q] = hq;
+                        l[q] = lq;
+                    } else {
+                        unsigned hq = __builtin_amdgcn_cvt_pk_fp8_f32(v[4 * q] * inv,
+                                                                      v[4 * q + 1] * inv, 0, false);
+                        h[q] = __builtin_amdgcn_cvt_pk_fp8_f32(v[4 * q + 2] * inv,
+                                                               v[4 * q + 3] * inv, hq, true);
+                    }
                 }
                 *(fp8v16*)(tb + mw8_swz(sr, sc)) = h;
-                *(fp8v16*)(tb + MW8_A_BYTES + mw8_swz(sr, sc)) = l;
+                if constexpr (LO) *(fp8v16*)(tb + MW8_A_BYTES + mw8_swz(sr, sc)) = l;
                 if (sc == 0u) sb[sr] = alive ? s : 0.0f;
             } else {
                 *(fp8v16*)(tb + mw8_swz(sr, sc)) = areg;
@@ -265,7 +276,7 @@ __device__ void d_moe_pf_w8a8(void* __restrict__ Cout, float* __restrict__ fs_ou
                         af[s][q] = (int)lo[q];
                         af[s][4 + q] = (int)up[q];
                     }
-                    if constexpr (SPLIT) {
+                    if constexpr (SPLIT && LO) {
                         const fp8v16 lo2 = *(const fp8v16*)(abuf + MW8_A_BYTES + mw8_swz(r, c));
                         const fp8v16 up2 =
                             *(const fp8v16*)(abuf + MW8_A_BYTES + mw8_swz(r, c + 1u));
@@ -290,7 +301,7 @@ __device__ void d_moe_pf_w8a8(void* __restrict__ Cout, float* __restrict__ fs_ou
                 for (int j = 0; j < 2; j++) {
                     f32x16 t = plow_mfma_fp8_32x32(af[0], bcur[j][0], (f32x16)(0.0f));
                     t = plow_mfma_fp8_32x32(af[1], bcur[j][1], t);
-                    if constexpr (SPLIT) {
+                    if constexpr (SPLIT && LO) {
                         t = mw8_mfma_lo(al[0], bcur[j][0], t);
                         t = mw8_mfma_lo(al[1], bcur[j][1], t);
                     }
@@ -350,7 +361,7 @@ __device__ void d_moe_pf_w8a8(void* __restrict__ Cout, float* __restrict__ fs_ou
             __syncthreads();
             unsigned char* const fq = (unsigned char*)Cout;
             const unsigned g = wave >> 2, col = n0 + 32u * wave + l32;
-            const size_t frow = SPLIT ? 2u * (size_t)N : (size_t)N;
+            const size_t frow = (SPLIT && LO) ? 2u * (size_t)N : (size_t)N;
 #pragma unroll
             for (int i = 0; i < 2; i++)
 #pragma unroll
@@ -361,7 +372,7 @@ __device__ void d_moe_pf_w8a8(void* __restrict__ Cout, float* __restrict__ fs_ou
                     const unsigned q = __builtin_amdgcn_cvt_pk_fp8_f32(xv, 0.0f, 0u, false);
                     const size_t at = (size_t)(rowbase + r) * frow + col;
                     st_act1_u8(as_glob(fq) + at, (unsigned char)q);
-                    if constexpr (SPLIT) {
+                    if constexpr (SPLIT && LO) {
                         const float d = __builtin_amdgcn_cvt_pk_f32_fp8(q, false)[0];
                         const unsigned ql =
                             __builtin_amdgcn_cvt_pk_fp8_f32((xv - d) * 16.0f, 0.0f, 0u, false);
@@ -400,4 +411,5 @@ __device__ void d_moe_pf_w8a8(void* __restrict__ Cout, float* __restrict__ fs_ou
 #undef MW8_LOAD_B
 extern "C" __device__ unsigned plow_moe_pf_w8a8_arm = 1;
 extern "C" __device__ unsigned plow_moe_pf_w8a8_split_arm = 1;
+extern "C" __device__ unsigned plow_moe_pf_w8a8_fq_arm = 1;
 #endif

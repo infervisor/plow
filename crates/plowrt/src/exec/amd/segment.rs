@@ -137,6 +137,8 @@ impl AmdEngine {
             PrefillSegmentRoute::GemmLt(_) => return "gemm_lt",
             PrefillSegmentRoute::GemmBlk(_) => return "gemm_blk",
             PrefillSegmentRoute::MlaFold(_) => return "mla_fold",
+            PrefillSegmentRoute::MlaPfDense(_) if active => return "mla_pf_dense_spans",
+            PrefillSegmentRoute::MlaPfDense(_) => return "mla_pf_dense",
             _ => {}
         }
         if !active {
@@ -167,6 +169,7 @@ impl AmdEngine {
                 PrefillSegmentRoute::KdaChunkCarryKeyfeed { .. } => {
                     return "kda_carry_keyfeed";
                 }
+                PrefillSegmentRoute::GemmGroup { .. } => return "gemm_group",
                 PrefillSegmentRoute::KdaChunkKeyFactorWu { .. }
                     if self.k_kda_key_factor_wu.is_some() =>
                 {

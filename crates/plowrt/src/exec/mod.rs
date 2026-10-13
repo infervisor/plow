@@ -32,6 +32,8 @@ mod amd_mla_bf16;
 #[cfg(feature = "hsa")]
 mod amd_mla_fold;
 #[cfg(feature = "hsa")]
+mod amd_mla_pf_dense;
+#[cfg(feature = "hsa")]
 mod amd_moe_aiter;
 #[cfg(feature = "hsa")]
 mod amd_rope;

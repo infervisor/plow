@@ -328,6 +328,7 @@ const DOC: &[S] = &[
     S { op: DevOp::ChunkAttentionF32, t: &["out", "q", "k", "v", "rel_k", "qscale?", "valid?"], i: &["rows", "heads", "head_width", "chunk", "past", "future", "positions", "left"], f: &["kscale", "cap"], j: &[] },
     S { op: DevOp::MmRowsBf16, t: &["x", "ids", "table", "slab"], i: &["rows", "width", "cap", "slab_rows"], f: &[], j: &[] },
     S { op: DevOp::MmSpanExtent, t: &["out", "ids"], i: &["rows"], f: &[], j: &[] },
+    S { op: DevOp::GemmGroupPf, t: &["x", "weight", "out0", "out1?", "out2?", "out3?", "out4?", "out5?"], i: &["T", "K", "N0", "N1", "N2", "N3", "N4", "N5"], f: &[], j: &[] },
 ];
 
 /// Ops that say "As [`DevOp::X`]" / "twin of [`DevOp::X`]" / "Same operands as

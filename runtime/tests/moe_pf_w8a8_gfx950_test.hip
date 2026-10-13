@@ -101,6 +101,18 @@ void t_down_sp(void* part, const unsigned char* fq, const float* fs, const unsig
 #endif
 }
 
+extern "C" __global__ __launch_bounds__(PLOW_THREADS, PLOW_WAVES/4)
+void t_glu_fq(unsigned char* fq, float* fs, const bf16* x, unsigned T,
+              const unsigned long long* wtab, const unsigned long long* stab, const int* meta,
+              const unsigned* rt, unsigned I, unsigned H, unsigned n_exp, float lim) {
+    __shared__ __attribute__((aligned(16))) unsigned char lds[MW8_LDS_BYTES];
+#if PLOW_CDNA4
+    d_moe_pf_w8a8<true, true, false>(fq, fs, (const unsigned char*)x, nullptr, T, wtab, stab, meta,
+                                     rt, nullptr, I, H, n_exp, PLOW_MOE_ACT_SWIGLU_CLAMP, 0.0f, lim,
+                                     0, blockIdx.x, gridDim.x, lds);
+#endif
+}
+
 static float fp8d(unsigned char b) {
     const unsigned s = b >> 7, e = (b >> 3) & 15u, m = b & 7u;
     float v = e == 0 ? ldexpf((float)m, -9) : ldexpf(1.0f + m / 8.0f, (int)e - 7);
@@ -345,6 +357,28 @@ int main(int argc, char** argv) {
     std::vector<float> fs2_h((size_t)rows * KBI); HC(hipMemcpy(fs2_h.data(), dfs2, fs2_h.size() * 4, hipMemcpyDeviceToHost));
     std::vector<float> part_s((size_t)T * K * H); HC(hipMemcpy(part_s.data(), dpart, part_s.size() * 4, hipMemcpyDeviceToHost));
     run_sp_down(1); HC(hipDeviceSynchronize());
+    {   /* FQ: staging-quant GLU must equal quant + W8A8 GLU byte for byte (fq) and bit for bit (fs) */
+        unsigned char* dfq3; float* dfs3;
+        HC(hipMalloc(&dfq3, (size_t)rows * I)); HC(hipMalloc(&dfs3, (size_t)rows * KBI * 4));
+        HC(hipMemcpy(dfq3, dfq, (size_t)rows * I, hipMemcpyDeviceToDevice));
+        HC(hipMemcpy(dfs3, dfs, (size_t)rows * KBI * 4, hipMemcpyDeviceToDevice));
+        hipLaunchKernelGGL(t_glu_fq, dim3(G), dim3(PLOW_THREADS), 0, 0, dfq3, dfs3, dx, T, dwt, dst, dmeta, drt, I, H, E, lim);
+        HC(hipDeviceSynchronize());
+        std::vector<unsigned char> a3((size_t)rows * I); std::vector<float> s3((size_t)rows * KBI);
+        HC(hipMemcpy(a3.data(), dfq3, a3.size(), hipMemcpyDeviceToHost));
+        HC(hipMemcpy(s3.data(), dfs3, s3.size() * 4, hipMemcpyDeviceToHost));
+        size_t dq = 0, ds = 0;
+        for (size_t i = 0; i < a3.size(); i++) dq += a3[i] != fq_h[i];
+        for (size_t i = 0; i < s3.size(); i++) ds += memcmp(&s3[i], &fs_h[i], 4) != 0;
+        printf("FQ vs quant+W8A8 GLU: fq bytes differing %zu of %zu, fs differing %zu of %zu\n", dq, a3.size(), ds, s3.size());
+        const double tq = 0; (void)tq;
+        auto t0 = [&] { hipLaunchKernelGGL(t_glu_fq, dim3(G), dim3(PLOW_THREADS), 0, 0, dfq3, dfs3, dx, T, dwt, dst, dmeta, drt, I, H, E, lim); };
+        hipEvent_t e0, e1; HC(hipEventCreate(&e0)); HC(hipEventCreate(&e1));
+        std::vector<float> v;
+        for (int r = 0; r < 12; r++) { HC(hipEventRecord(e0)); t0(); HC(hipEventRecord(e1)); HC(hipEventSynchronize(e1)); float ms; HC(hipEventElapsedTime(&ms, e0, e1)); if (r >= 2) v.push_back(ms); }
+        std::sort(v.begin(), v.end());
+        printf("  FQ GLU (bf16 in)          %9.1f us\n", v[v.size() / 2] * 1000.0);
+    }
     std::vector<unsigned short> part_s16((size_t)T * K * H); HC(hipMemcpy(part_s16.data(), dpart16, part_s16.size() * 2, hipMemcpyDeviceToHost));
 
     /* quantized-input check: xq*xs vs x */

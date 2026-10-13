@@ -105,6 +105,7 @@ pub fn class_of(op: DevOp) -> RowClass {
         | GemmMed
         | GemmF32
         | GemmLtPf
+        | GemmGroupPf
         | GemmBlkPf
         | GemmWide
         | GemmC5
