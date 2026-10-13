@@ -1467,7 +1467,9 @@ mod amd_serve {
         } else if cap >= MIN_PREFIX {
             (
                 0,
-                if lcp >= MIN_PREFIX {
+                // Under an end arm, a prompt the cached one covers up to its last token is a
+                // re-send: it runs cold and unsplit again, so a repeat streams what the first did.
+                if lcp >= MIN_PREFIX && !(arm_end && lcp == cap) {
                     lcp
                 } else if arm_end {
                     prompt.len() as u32
@@ -4443,7 +4445,9 @@ mod amd_serve {
             assert_eq!(super::prefix_plan(&[], 0, false, &prompt, true), (0, 1024));
             let next: Vec<u32> = (0..1030).collect();
             assert_eq!(super::prefix_plan(&prompt, 1024, true, &next, true), (1024, 0));
-            assert_eq!(super::prefix_plan(&prompt, 1024, true, &prompt, true), (0, 1023));
+            assert_eq!(super::prefix_plan(&prompt, 1024, true, &prompt, true), (0, 1024));
+            assert_eq!(super::prefix_plan(&next, 1030, true, &prompt, true), (0, 1024));
+            assert_eq!(super::prefix_plan(&next, 1030, true, &next[..600], true), (0, 600));
         }
 
         #[test]
