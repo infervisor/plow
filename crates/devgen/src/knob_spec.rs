@@ -1307,6 +1307,7 @@ pub const EMIT: &[KnobSpec] = &[
     KnobSpec::new("emit.glm_ofold", Some("PLOW_GLM_OFOLD"), Layer::Emit, Domain::Bool, OFF, OPT_IN).with(C_OFOLD),
     KnobSpec::new("emit.glm_hc_norm_fold", Some("PLOW_GLM_HC_NORM_FOLD"), Layer::Emit, Domain::Bool, OFF, OPT_IN),
     KnobSpec::new("emit.glm_hc_post_fold", Some("PLOW_GLM_HC_POST_FOLD"), Layer::Emit, Domain::Bool, OFF, OPT_IN),
+    KnobSpec::new("emit.glm_hc_pre_tail", Some("PLOW_GLM_HC_PRE_TAIL"), Layer::Emit, Domain::Bool, OFF, OPT_IN),
     KnobSpec::new("emit.glm_decode_glu_rows", Some("PLOW_GLM_DECODE_GLU_ROWS"), Layer::Emit, Domain::Bool, GLM_GLU_ROWS_DEFAULT, GLM_GFX950_ROWS),
     KnobSpec::new("emit.glm_pf_ns", Some("PLOW_GLM_PF_NS"), Layer::Emit, U32, UNSET, OPT_IN),
     KnobSpec::new("emit.glm_router_overlap", Some("PLOW_GLM_ROUTER_OVERLAP"), Layer::Emit, U32, UNSET, OPT_IN).scoped(ROUTER_OVERLAP_SCOPE),

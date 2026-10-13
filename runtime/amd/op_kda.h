@@ -2311,7 +2311,7 @@ __device__ void d_kda_decode_fused_arm_t(
     const bf16* __restrict__ og_raw, uint64_t* __restrict__ scratch, unsigned H, unsigned D,
     unsigned BV, unsigned W, unsigned flags, unsigned gate_mode, float scale, float lb,
     float eps, unsigned slice, unsigned nblk, float* __restrict__ lds,
-    const bf16* __restrict__ w_fb) {
+    const bf16* __restrict__ w_fb, const unsigned* __restrict__ parked) {
     const unsigned tid = threadIdx.x;
     const unsigned lane = tid & (PLOW_WAVE - 1);
     const unsigned wave = tid >> 6;
@@ -2324,11 +2324,15 @@ __device__ void d_kda_decode_fused_arm_t(
     const bool fb_fold = (flags & PLOW_KDA_F_FB_FOLD) != 0u;
     /* Geometry outside the contract poisons the head rather than computing something finite. */
     if (D != PL * PLOW_WAVE || BV != PLOW_WAVES || W == 0 || W > 8 ||
-        !(flags & PLOW_KDA_F_QK_L2NORM) || (flags & PLOW_KDA_F_SEQ_ROWS) || nblk < items ||
-        (fb_fold && w_fb == nullptr) || scratch == nullptr) {
+        !(flags & PLOW_KDA_F_QK_L2NORM) || ((flags & PLOW_KDA_F_SEQ_ROWS) && !parked) ||
+        nblk < items || (fb_fold && w_fb == nullptr) || scratch == nullptr) {
         for (unsigned d = tid; d < D; d += PLOW_THREADS) st_act1(&y[hd + d], (bf16)0x7fc1u);
         return;
     }
+    /* A ladder's one-row program (SEQ_ROWS, T = 1): row 0 lives at offset 0 like the
+     * single-sequence program. A parked row is skipped by every tile of every head alike, so no
+     * head counter is bumped and the round tags stay aligned; y is left as the chain leaves o. */
+    if ((flags & PLOW_KDA_F_SEQ_ROWS) && parked[0]) return;
 #if !PLOW_KDA_FB_FOLD
     if (fb_fold) __builtin_trap();
 #endif
@@ -2472,14 +2476,15 @@ __device__ void d_kda_decode_fused_arm(
     float* csq, float* csk, float* csv, const float* a_log, const float* dt_bias,
     const float* norm_w, const bf16* og_raw, uint64_t* scratch, unsigned H, unsigned D,
     unsigned BV, unsigned W, unsigned flags, unsigned gate_mode, float scale, float lb,
-    float eps, unsigned slice, unsigned nblk, float* lds, const bf16* w_fb) {
+    float eps, unsigned slice, unsigned nblk, float* lds, const bf16* w_fb,
+    const unsigned* parked) {
     /* D = 128 is the one rung the arm carries (the K3 shape); the emitter keeps the chain for
      * anything else. */
     if (D == 128)
         d_kda_decode_fused_arm_t<2>(y, q_raw, k_raw, v_raw, g_raw, beta_raw, state, wq, wk, wv,
                                     csq, csk, csv, a_log, dt_bias, norm_w, og_raw, scratch, H, D,
                                     BV, W, flags, gate_mode, scale, lb, eps, slice, nblk, lds,
-                                    w_fb);
+                                    w_fb, parked);
     else
         __builtin_trap();
 }

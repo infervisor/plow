@@ -443,6 +443,9 @@ struct Shapes {
     /// Any `GemvF32` (op 135) with `i[3] == 1` — the decode HyperConnPost fold
     /// (PLOW_GLM_HC_POST_FOLD). A pre-arm object never writes the new residual stream. Refuse.
     glm_hc_post_fold: bool,
+    /// Any `GemvF32` (op 135) with `i[4] == 1` — the one-row HyperConnPre tail
+    /// (PLOW_GLM_HC_PRE_TAIL). A pre-arm object never runs the pre. Refuse.
+    glm_hc_pre_tail: bool,
     /// Any `GemmMed` (op 15) carrying a `t[5]` — the prefill q-rope fold (PLOW_GLM_FUSE_POST):
     /// t3/t4 = cos/sin, t5 = pos, i3 = the first roped column. An object without the arm stores
     /// the unroped projection and attention runs on it. Refuse at load.
@@ -653,7 +656,10 @@ fn shapes(m: &Model) -> Shapes {
                 }
                 DevOp::AddNorm if inst.i[2] == 1 => s.glm_fuse_seam_rn = true,
                 DevOp::HyperConnPre if inst.i[4] == 1 => s.glm_hc_norm_fold = true,
-                DevOp::GemvF32 if inst.i[3] == 1 => s.glm_hc_post_fold = true,
+                DevOp::GemvF32 if inst.i[3] == 1 || inst.i[4] == 1 => {
+                    s.glm_hc_post_fold |= inst.i[3] == 1;
+                    s.glm_hc_pre_tail |= inst.i[4] == 1;
+                }
                 DevOp::Gemm | DevOp::GemmMed | DevOp::GemmSmall | DevOp::Gemv => {
                     if op == DevOp::GemmMed && inst.t[5] != packet::TENSOR_NONE {
                         s.glm_fuse_post = true;
@@ -1028,6 +1034,9 @@ fn encoding_features(f: &mut Map<String, Value>, s: &Shapes) {
     f.insert("glm_fuse_qnorm".into(), json!(s.glm_fuse_qnorm));
     f.insert("glm_hc_norm_fold".into(), json!(s.glm_hc_norm_fold));
     f.insert("glm_hc_post_fold".into(), json!(s.glm_hc_post_fold));
+    if s.glm_hc_pre_tail {
+        f.insert("glm_hc_pre_tail".into(), json!(true));
+    }
     if s.glm_fuse_post {
         f.insert("glm_fuse_post".into(), json!(true));
     }
@@ -1752,6 +1761,9 @@ fn backend_amd(
     }
     if on("glm_hc_post_fold") {
         req.push("PLOW_GLM_HC_POST_FOLD=1".into());
+    }
+    if on("glm_hc_pre_tail") {
+        req.push("PLOW_GLM_HC_PRE_TAIL=1".into());
     }
     if on("glm_fuse_seam_rn") {
         req.push("PLOW_GLM_FUSE_SEAM_RN=1".into());

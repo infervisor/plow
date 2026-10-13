@@ -741,6 +741,36 @@ fn emit_glm53_hc_pre(
         ),
         None => (residual, s.mixes, s.post_mix, s.comb_mix, s.layer_input, rows),
     };
+    let (scale, base) = if ffn {
+        (w.ffn_scale, w.ffn_base)
+    } else {
+        (w.attn_scale, w.attn_base)
+    };
+    // PLOW_GLM_HC_PRE_TAIL (one-row decode): the HyperConnPre below runs on this GemvF32's
+    // last-arriving workgroup, with its operands in a u32 descriptor (interp.hip
+    // `exec_hc_pre_tail`). The separate pre packet was one workgroup, so this is the same call.
+    let tail = (band.is_none() && rows == 1 && emit_config::active().glm_hc_pre_tail).then(|| {
+        let side = if ffn { "ffn" } else { "attn" };
+        let ctr = b.tensor(&format!("act.hc_pre_tail.{layer}.{side}.ctr"), 4);
+        let (fold, nout, gamma) = norm_fold.map_or((0, 0, 0), |(o, g)| (1, o, g));
+        let words = [
+            post_mix,
+            comb_mix,
+            layer_input,
+            scale,
+            base,
+            ctr,
+            fold,
+            nout,
+            gamma,
+            c.hidden,
+            20,
+            c.eps.to_bits(),
+            1e-6f32.to_bits(),
+        ];
+        let bytes: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+        b.tensor_init(&format!("act.hc_pre_tail.{layer}.{side}.desc"), bytes)
+    });
     let cm = b.emit(DevOp::GemvF32, b.all(), &[dep], |d| {
         d.t[0] = mixes;
         d.t[1] = residual;
@@ -757,7 +787,14 @@ fn emit_glm53_hc_pre(
             d.t[5] = post_mix;
             d.t[6] = comb_mix;
         }
+        if let Some(desc) = tail {
+            d.i[4] = 1;
+            d.t[7] = desc;
+        }
     });
+    if tail.is_some() {
+        return cm;
+    }
     b.emit(
         DevOp::HyperConnPre,
         (0..rows.min(b.n_cu())).collect(),
@@ -768,8 +805,8 @@ fn emit_glm53_hc_pre(
             d.t[2] = layer_input;
             d.t[3] = mixes;
             d.t[4] = residual;
-            d.t[5] = if ffn { w.ffn_scale } else { w.attn_scale };
-            d.t[6] = if ffn { w.ffn_base } else { w.attn_base };
+            d.t[5] = scale;
+            d.t[6] = base;
             d.i[0] = rows;
             d.i[1] = 4;
             d.i[2] = c.hidden;
