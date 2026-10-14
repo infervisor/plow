@@ -729,6 +729,13 @@ if [ "$ARCH" = gfx950 ] && [ "${PLOW_XR_ATTNRES:-0}" = 1 ]; then
     "$R/amd/xreduce_attnres_fused.hip"
   XR_ATTNRES_ELFS="xreduce_attnres_gfx950.elf"
 fi
+# PLOW_KDA_DECODE_LANES=1: the wide decode chain's state step with one value row per lane quad
+# (kda_decode_wide.hip; f32 reduction order differs from the interpreter's wide arm).
+case "${PLOW_KDA_DECODE_LANES:-0}" in
+  0) KDA_DECODE_LANES_DEF="" ;;
+  1) KDA_DECODE_LANES_DEF="-DPLOW_KDA_DECODE_LANES=1" ;;
+  *) echo "PLOW_KDA_DECODE_LANES must be 0 or 1" >&2; exit 2 ;;
+esac
 if [ "$ARCH" = gfx950 ] && [ "$need_kda_fused" = 1 ]; then
   bash "$R/cmake/hipcc_hsaco.sh" hipcc "$BUN" "$ARCH" \
     "$OUT/kda_decode_fused_gfx950.elf" plow_kda_decode_fused_256x16_v2 128 4 \
@@ -740,7 +747,7 @@ if [ "$ARCH" = gfx950 ] && [ "$need_kda_fused" = 1 ]; then
   bash "$R/cmake/hipcc_hsaco.sh" hipcc "$BUN" "$ARCH" \
     "$OUT/kda_decode_wide_gfx950.elf" plow_kda_decode_wide_v3 128 2 \
     $INC -DPLOW_LEAN_OBJECT=1 -DPLOW_NO_SPILL=1 -DPLOW_BUCKET_DECODE=1 -DPLOW_KDA_WIDE_PF=1 \
-    -DPLOW_WAVE_RED_DPP=1 -DPLOW_REQUIRED_MARKER=plow_kda_decode_wide_3 \
+    -DPLOW_WAVE_RED_DPP=1 -DPLOW_REQUIRED_MARKER=plow_kda_decode_wide_3 $KDA_DECODE_LANES_DEF \
     "$R/amd/kda_decode_wide.hip"
   KDA_FUSED_ELFS="kda_decode_fused_gfx950.elf kda_decode_wide_gfx950.elf"
 fi
