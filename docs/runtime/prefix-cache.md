@@ -79,8 +79,14 @@ Policy (`crates/plowrt/src/memory/vmm_policy.rs`, `Policy::Tree`, the default):
   ring-overflow check, so a long reply never stops the refresh) and restores it if pressure
   evicted it during the decode. A republish of an identical boundary refreshes nothing.
 * Structural retire: when `C` is published (or re-published) with parent `B`, `B` is freed iff
-  `B.children == {C}`, `B.users == 0`, `B.pending == 0`, `B` is not awaited, `B` is not a
-  `SHARED_END`, and `C` survived its own trim. The same rule runs when a sibling's eviction or a
+  `B.children == {C}`, `B.users == 0`, `B.pending == 0`, `B.ends == 0`, `B` is not awaited, `B`
+  is not a `SHARED_END`, and `C` survived its own trim. `ends` counts the requests whose prompt
+  ended at `B` (published it or found it published) that no later prompt end on the same chain
+  has superseded: each new prompt end decrements the nearest ancestor with `ends > 0`. A
+  parallel pair or a retry ends twice at one boundary and so expects two continuations, which
+  may diverge (lab dup-pair replay: 22% of twin replies differed at temperature 0); the first
+  continuation does not retire the boundary the second still needs. Without a second
+  continuation it goes by LRU. The same rule runs when a sibling's eviction or a
   hold's release leaves one continuation. `pending` counts requests that attached `B` and have
   not continued it (a publish below it, a touch of it, or a strict-publish refusal of a boundary
   another request already published from the same chain): a parallel pair's second request

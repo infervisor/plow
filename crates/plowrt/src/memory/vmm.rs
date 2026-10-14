@@ -1171,6 +1171,9 @@ struct SlotSeq {
     /// Boundary tree: the boundary this request attached and has not yet continued (a
     /// publish below it, or a touch of it). It holds `Snap::pending` on that boundary.
     lineage: Option<u64>,
+    /// Boundary tree: the boundary this request's prompt ended at (published or touched),
+    /// counted once in its `Snap::ends`.
+    ended: Option<u64>,
     /// The fine-cache counterpart of `hashes`/`held` ([`try_attach_fine`]): held exactly the
     /// same way, in the SEPARATE `fine_cache` radix tree, so `evict_one_fine` cannot evict a
     /// node a live attach is reading between `try_attach_fine`'s lock and the copy that
@@ -1286,6 +1289,11 @@ struct Snap {
     /// boundary of its own: the single-continuation retire waits for them (only LRU takes
     /// such a boundary); the count never drops for a request that ended without publishing.
     pending: u32,
+    /// Boundary tree: requests whose prompt ended at this boundary (it published it, or found
+    /// it already published) and that no continuation has superseded yet. Two of them (a
+    /// parallel pair, a retry) expect two continuations, which may diverge: the first one's
+    /// child does not retire the boundary the second still needs (only LRU takes it).
+    ends: u32,
     /// A spill whose fence failed: the device buffer is valid but never freed, never spilled.
     quarantined: bool,
     /// Boundary tree ([`Policy::Tree`]): the longest retained boundary strictly below `rows`
@@ -2878,10 +2886,14 @@ impl VmmKv {
         // rule applies to it now.
         let lineage = inner.seqs[seq].lineage;
         continue_lineage(&mut inner, seq, id, parent);
+        let superseded = note_end(&mut inner, seq, id, kind);
         if let Some(l) = lineage.filter(|&l| {
             l != id && inner.policy == Policy::Tree && inner.seqs[seq].lineage.is_none()
         }) {
             policy::try_retire(s, &mut inner, l);
+        }
+        if let Some(a) = superseded {
+            policy::try_retire(s, &mut inner, a);
         }
         true
     }
@@ -3188,6 +3200,7 @@ impl VmmKv {
                     chain: 0,
                     kind: Kind::CHECKPOINT,
                     pending: 0,
+                    ends: 0,
                     quarantined: false,
                     parent: None,
                     children: Vec::new(),
@@ -3594,8 +3607,12 @@ fn publish_locked(
             if let Some((id, parent)) = twin {
                 let lineage = inner.seqs[seq].lineage;
                 continue_lineage(inner, seq, id, parent);
+                let superseded = note_end(inner, seq, id, kind);
                 if let Some(l) = lineage.filter(|_| inner.seqs[seq].lineage.is_none()) {
                     policy::try_retire(s, inner, l);
+                }
+                if let Some(a) = superseded {
+                    policy::try_retire(s, inner, a);
                 }
             }
         }
@@ -3711,6 +3728,7 @@ fn publish_locked(
             last_used: tick,
             kind,
             pending: 0,
+            ends: 0,
             quarantined: false,
             parent: None,
             children: Vec::new(),
@@ -3729,15 +3747,20 @@ fn publish_locked(
         inner.stats.cache_bytes += snap_bytes;
         (id, None)
     };
+    let mut superseded = None;
     if inner.policy == Policy::Tree {
         policy::link(inner, id, parent);
         continue_lineage(inner, seq, id, parent);
+        superseded = note_end(inner, seq, id, kind);
     }
     trim_cache(s, inner);
     // Retire the superseded parent only behind a boundary that survived its own trim: the
     // superseded one is otherwise the chain's only attach point.
     if inner.policy == Policy::Tree && inner.by_id.contains_key(&id) {
         policy::retire_parent_of(s, inner, id);
+        if let Some(a) = superseded {
+            policy::try_retire(s, inner, a);
+        }
     }
     if let Some(held) = unheld.filter(|_| inner.policy == Policy::Tree) {
         if inner.by_id.contains_key(&held) {
@@ -3765,6 +3788,7 @@ fn try_attach_fine(inner: &mut Inner, seq: usize, prompt: &[u32]) -> Result<Opti
             held: 0,
             snapshot: None,
             lineage: None,
+            ended: None,
             fine_hashes: Vec::new(),
             fine_held: 0,
         };
@@ -3823,6 +3847,7 @@ fn try_attach_fine(inner: &mut Inner, seq: usize, prompt: &[u32]) -> Result<Opti
         held: 0,
         snapshot: None,
         lineage: None,
+        ended: None,
         fine_hashes: hashes[..pick].to_vec(),
         fine_held: pick,
     };
@@ -4207,6 +4232,33 @@ fn continue_lineage(inner: &mut Inner, seq: usize, id: u64, parent: Option<u64>)
     if let Some(snap) = snap_mut(inner, l) {
         snap.pending = snap.pending.saturating_sub(1);
     }
+}
+
+/// `seq`'s prompt ended at boundary `id` (published or found published), counted once per
+/// request: one more expected continuation of `id`, and one fewer of the nearest ancestor an
+/// earlier prompt ended at (this request continues that history, whichever boundary it
+/// attached). Returns that ancestor when no prompt end is left on it, for the
+/// single-continuation rule (the caller applies it when `id` is safe).
+fn note_end(inner: &mut Inner, seq: usize, id: u64, kind: Kind) -> Option<u64> {
+    if inner.policy != Policy::Tree
+        || !kind.has(Kind::PROMPT_END)
+        || inner.seqs[seq].ended == Some(id)
+    {
+        return None;
+    }
+    let snap = snap_mut(inner, id)?;
+    snap.ends += 1;
+    let mut up = snap.parent;
+    inner.seqs[seq].ended = Some(id);
+    while let Some(a) = up {
+        let anc = snap_mut(inner, a)?;
+        if anc.ends > 0 {
+            anc.ends -= 1;
+            return (anc.ends == 0).then_some(a);
+        }
+        up = anc.parent;
+    }
+    None
 }
 
 /// Drop `seq`'s attach hold on its snapshot; the id whose `users` reached 0, for the
