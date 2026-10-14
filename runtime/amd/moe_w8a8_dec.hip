@@ -31,6 +31,13 @@ static_assert(DEC_PD >= 1 && DEC_PD <= 8 && (DEC_PD & (DEC_PD - 1)) == 0,
 #ifndef DEC_OCC
 #define DEC_OCC 2 /* min workgroups per CU (launch bounds) */
 #endif
+/* DEC_BLDS: B k-tiles load as whole 128-byte row segments (8 lanes per row, 32 rows per
+ * instruction) into registers and are staged through an LDS double buffer, from which the MFMA
+ * fragments are read; 0 = fragments straight from global memory (32 bytes of 32 rows per
+ * instruction). Same fragment values either way. */
+#ifndef DEC_BLDS
+#define DEC_BLDS 0
+#endif
 
 namespace mdec {
 constexpr unsigned BM = 32, A_BYTES = BM * 128u; /* a work item's rows: one 32-row block */
@@ -182,8 +189,42 @@ __device__ __forceinline__ void mdec_body(void* __restrict__ Cout, float* __rest
         }
     };
 
-    fp8v32 bq[PD][2][2];
+    constexpr bool BL = DEC_BLDS != 0;
     float wq[PD][2];
+#if DEC_BLDS
+    /* B tile rows: GLU 0-127 gate / 128-255 up columns n0.., DOWN 0-255 columns n0..; thread ->
+     * (rows sr + 32 i, chunk sc). B k-tile kb lives in register slot kb % PD from PD k-tiles
+     * ahead until its LDS stage (like A). */
+    __shared__ __align__(16) unsigned char ldsb[2u * 256u * 128u];
+    const unsigned char* bpl[8];
+#pragma unroll
+    for (unsigned i = 0; i < 8; i++) {
+        const unsigned r = sr + 32u * i;
+        const unsigned col = GLU ? n0 + (r & 127u) : n0 + r;
+        const unsigned char* const Wb = (GLU && r >= 128u) ? W1 : W0;
+        bpl[i] = Wb + (size_t)min(col, N - 1u) * K + sc * 16u;
+    }
+    fp8v16 breg[PD][8];
+    float wnx[2];
+#define MDEC_LOAD_B(kb_, s)                                    \
+    do {                                                       \
+        const unsigned k_ = min((unsigned)(kb_), KB - 1u);     \
+        _Pragma("unroll") for (unsigned i_ = 0; i_ < 8; i_++)  \
+            breg[s][i_] = ld_glob_fp8v16(bpl[i_] + k_ * 128u); \
+        wq[s][0] = mdec_ldf(sp0 + k_);                         \
+        wq[s][1] = mdec_ldf(sp1 + k_);                         \
+    } while (0)
+    auto stage_b = [&](unsigned b, unsigned s) {
+#pragma unroll
+        for (unsigned i = 0; i < 8; i++)
+            *(fp8v16*)(ldsb + b * 32768u + mdec_swz(sr + 32u * i, sc)) = breg[s][i];
+        wnx[0] = wq[s][0];
+        wnx[1] = wq[s][1];
+    };
+    const unsigned brl0 = GLU ? 32u * wave + l32 : 64u * wave + l32;
+    const unsigned brl1 = GLU ? 128u + 32u * wave + l32 : 64u * wave + 32u + l32;
+#else
+    fp8v32 bq[PD][2][2];
 #define MDEC_LOAD_B(kb_, s)                                  \
     do {                                                     \
         const unsigned k_ = min((unsigned)(kb_), KB - 1u);   \
@@ -191,14 +232,16 @@ __device__ __forceinline__ void mdec_body(void* __restrict__ Cout, float* __rest
         bq[s][0][1] = mdec_frag(bp0 + k_ * 128u + 64u);      \
         bq[s][1][0] = mdec_frag(bp1 + k_ * 128u);            \
         bq[s][1][1] = mdec_frag(bp1 + k_ * 128u + 64u);      \
-        wq[s][0] = mdec_ldf(sp0 + k_);                                \
-        wq[s][1] = mdec_ldf(sp1 + k_);                                \
+        wq[s][0] = mdec_ldf(sp0 + k_);                       \
+        wq[s][1] = mdec_ldf(sp1 + k_);                       \
     } while (0)
+#endif
+    constexpr unsigned BPRE = BL ? PD : PD - 1u; /* B k-tiles loaded before the loop */
 
     const unsigned key = 2u * mt + rb;
     if constexpr (FUSED && !GLU) {
 #pragma unroll
-        for (unsigned s = 0; s + 1u < PD; s++) MDEC_LOAD_B(s, s);
+        for (unsigned s = 0; s < BPRE; s++) MDEC_LOAD_B(s, s);
         if (tid == 0u)
             while (__hip_atomic_load(ctr + 2u * key, __ATOMIC_ACQUIRE, __HIP_MEMORY_SCOPE_AGENT) <
                    KB)
@@ -210,10 +253,14 @@ __device__ __forceinline__ void mdec_body(void* __restrict__ Cout, float* __rest
 #pragma unroll
         for (unsigned s = 0; s < PD; s++) MDEC_LOAD_A(s, s);
 #pragma unroll
-        for (unsigned s = 0; s + 1u < PD; s++) MDEC_LOAD_B(s, s);
+        for (unsigned s = 0; s < BPRE; s++) MDEC_LOAD_B(s, s);
     }
     stage(0u, 0u);
     MDEC_LOAD_A(PD, 0);
+#if DEC_BLDS
+    stage_b(0u, 0u);
+    MDEC_LOAD_B(PD, 0);
+#endif
     if (!GLU && tid < BM) {
         lds_pidx[tid] = rowmap[rowbase + tid];
         lds_gate[tid] = row_gate[rowbase + tid];
@@ -229,7 +276,7 @@ __device__ __forceinline__ void mdec_body(void* __restrict__ Cout, float* __rest
         for (unsigned s = 0; s < PD; s++) {
             const unsigned kb = kb0 + s;
             const unsigned buf = (PD % 2u == 0u) ? (s & 1u) : (kb & 1u);
-            MDEC_LOAD_B(kb + PD - 1u, (s + PD - 1u) % PD);
+            if constexpr (!BL) MDEC_LOAD_B(kb + PD - 1u, (s + PD - 1u) % PD);
             const unsigned char* abuf = lds + buf * A_BYTES;
             const float* sbuf = lds_s + buf * BM;
             fp8v32 af[2];
@@ -253,6 +300,30 @@ __device__ __forceinline__ void mdec_body(void* __restrict__ Cout, float* __rest
                 as[4 * q + 2] = v.z;
                 as[4 * q + 3] = v.w;
             }
+#if DEC_BLDS
+            const unsigned char* bbuf = ldsb + buf * 32768u;
+#pragma unroll
+            for (int j = 0; j < 2; j++) {
+                const unsigned br = j ? brl1 : brl0;
+                fp8v32 bf[2];
+#pragma unroll
+                for (int t = 0; t < 2; t++) {
+                    const unsigned c = (unsigned)t * 4u + hi * 2u;
+                    const fp8v16 lo = *(const fp8v16*)(bbuf + mdec_swz(br, c));
+                    const fp8v16 up = *(const fp8v16*)(bbuf + mdec_swz(br, c + 1u));
+#pragma unroll
+                    for (int q = 0; q < 4; q++) {
+                        bf[t][q] = (int)lo[q];
+                        bf[t][4 + q] = (int)up[q];
+                    }
+                }
+                f32x16 t = plow_mfma_fp8_32x32(af[0], bf[0], (f32x16)(0.0f));
+                t = plow_mfma_fp8_32x32(af[1], bf[1], t);
+#pragma unroll
+                for (int el = 0; el < 16; el++)
+                    accf[j][el] = fmaf(t[el], as[el] * wnx[j], accf[j][el]);
+            }
+#else
 #pragma unroll
             for (int j = 0; j < 2; j++) {
                 f32x16 t = plow_mfma_fp8_32x32(af[0], bq[s][j][0], (f32x16)(0.0f));
@@ -261,9 +332,14 @@ __device__ __forceinline__ void mdec_body(void* __restrict__ Cout, float* __rest
                 for (int el = 0; el < 16; el++)
                     accf[j][el] = fmaf(t[el], as[el] * wq[s][j], accf[j][el]);
             }
+#endif
             /* The last k-tile stages a clamped re-read into the idle buffer: never consumed. */
             stage(buf ^ 1u, (s + 1u) % PD);
             MDEC_LOAD_A(kb + 1u + PD, (s + 1u) % PD);
+#if DEC_BLDS
+            stage_b(buf ^ 1u, (s + 1u) % PD);
+            MDEC_LOAD_B(kb + 1u + PD, (s + 1u) % PD);
+#endif
             __syncthreads();
         }
     }
