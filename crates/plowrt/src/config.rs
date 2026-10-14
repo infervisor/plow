@@ -2231,6 +2231,10 @@ pub struct AmdRuntimeConfig {
     /// barrier bit orders every earlier packet before it), not on every dispatch.
     #[arg(long = "amd-tail-signal", env = "PLOW_AMD_TAIL_SIGNAL", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
     pub tail_signal: bool,
+    /// Deferred AQL chains read the VRAM kernarg BAR back once at commit (the chain's last slot)
+    /// instead of once per packet.
+    #[arg(long = "amd-karg-chain-flush", env = "PLOW_AMD_KARG_CHAIN_FLUSH", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
+    pub karg_chain_flush: bool,
     /// Diagnostic: `<acquire>,<release>` HSA fence scopes (0 none, 1 agent, 2 system) on every
     /// dispatch packet. Unset = agent,agent. Not ordering-safe below agent.
     #[arg(long = "amd-pkt-fence", env = "PLOW_AMD_PKT_FENCE", global = true)]

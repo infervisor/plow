@@ -1102,6 +1102,10 @@ pub struct EmitConfig {
     #[arg(long, env = "PLOW_GLM_HC_AITER_MIN_ROWS")]
     pub glm_hc_aiter_min_rows: Option<u32>,
 
+    /// PLOW_KDA_DECODE_WIDE applies only to rungs with at least this many rows (unset = 2).
+    #[arg(long, env = "PLOW_KDA_DECODE_WIDE_MIN_ROWS")]
+    pub kda_decode_wide_min_rows: Option<u32>,
+
     /// PLOW_GLM_KDA_PROJ_GROUP split override: every grouped projection splits K by the largest
     /// power of two <= this (fewer fp32 partials than the per-projection split-K). NOT bit-identical.
     #[arg(long, env = "PLOW_GLM_KDA_PROJ_GROUP_S")]
@@ -1936,6 +1940,7 @@ impl EmitConfig {
             glm_hc_aiter: env_bool("PLOW_GLM_HC_AITER"),
             glm_hc_fold_mla: env_bool("PLOW_GLM_HC_FOLD_MLA"),
             glm_hc_aiter_min_rows: env_u32("PLOW_GLM_HC_AITER_MIN_ROWS"),
+            kda_decode_wide_min_rows: env_u32("PLOW_KDA_DECODE_WIDE_MIN_ROWS"),
             glm_kda_proj_group_s: env_u32("PLOW_GLM_KDA_PROJ_GROUP_S"),
             glm_kda_qkvg_r1: env_bool("PLOW_GLM_KDA_QKVG_R1"),
             glm_hc_fuse_variant: env_u32("PLOW_GLM_HC_FUSE_VARIANT"),
