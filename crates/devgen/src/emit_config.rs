@@ -1323,9 +1323,10 @@ pub struct EmitConfig {
     #[arg(long, env = "PLOW_MOE_FP8_PF_LEAN", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
     pub moe_fp8_pf_lean: bool,
 
-    /// Smallest prefill bucket (rows) that isolates those segments; smaller buckets keep the
-    /// interpreter arms, which are faster there (bench T=2048: GLU 0.261 vs 0.274 ms).
-    #[arg(long, env = "PLOW_MOE_FP8_PF_MIN_ROWS", default_value_t = 8192)]
+    /// Smallest prefill bucket (rows) that isolates those segments. Default 0 = every bucket:
+    /// end to end the route wins at all of them (TP8 W8A8 pack ms, every bucket vs >= 8192 only:
+    /// 128 65.1/69.4, 512 79.6/83.2, 1024 86.6/91.7, 2048 102.4/106.1, 8192 228.0/227.7).
+    #[arg(long, env = "PLOW_MOE_FP8_PF_MIN_ROWS", default_value_t = 0)]
     pub moe_fp8_pf_min_rows: u32,
 
     /// Emit prefill AttnRes packets with the f32-mix contract (separate output-norm epsilon in
@@ -1909,7 +1910,7 @@ impl EmitConfig {
             moe_stage1_lean: env_opt_out("PLOW_MOE_STAGE1_LEAN"),
             moe_combine_lean: env_bool_default_true("PLOW_MOE_COMBINE_LEAN"),
             moe_fp8_pf_lean: env_bool("PLOW_MOE_FP8_PF_LEAN"),
-            moe_fp8_pf_min_rows: env_u32("PLOW_MOE_FP8_PF_MIN_ROWS").unwrap_or(8192),
+            moe_fp8_pf_min_rows: env_u32("PLOW_MOE_FP8_PF_MIN_ROWS").unwrap_or(0),
             attnres_f32mix: env_opt_out("PLOW_ATTNRES_F32MIX"),
             moe_pf_det: env_bool("PLOW_MOE_PF_DET"),
             moe_pf_w8a8: env_bool("PLOW_MOE_PF_W8A8"),
