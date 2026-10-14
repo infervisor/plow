@@ -2185,13 +2185,14 @@ impl AmdTpGroup {
             let drain_ns = drain_begin.elapsed().as_nanos() as u64;
             if let Some(family) = family {
                 eprintln!(
-                    "PLOW_PREFILL_SEG_TIMING program={} bucket={} c0={} clen={} segment={} family={} enqueue_us={:.3} critical_us={:.3}",
+                    "PLOW_PREFILL_SEG_TIMING program={} bucket={} c0={} clen={} segment={} family={} ops={} enqueue_us={:.3} critical_us={:.3}",
                     step.prog,
                     self.ranks[0].prog_t(step.prog),
                     step.c0,
                     step.clen,
                     seg,
                     family,
+                    self.ranks[0].segment_ops(step.prog, seg),
                     (enqueued - submit_begin).as_secs_f64() * 1e6,
                     submit_begin.elapsed().as_secs_f64() * 1e6,
                 );

@@ -1146,6 +1146,26 @@ struct KdaCarryMultiArgs {
 const KDA_CARRY_MULTI_SPANS: usize = 16;
 const _: () = assert!(std::mem::size_of::<KdaCarryMultiArgs>() == 280);
 
+/// Per segment, `Op*count` of the instructions its stream entries run (diagnostic).
+fn segment_op_summary(p: &DevProg) -> Vec<String> {
+    let n = p.stream.iter().map(|e| e.seg as usize + 1).max().unwrap_or(0);
+    let mut sets = vec![std::collections::BTreeSet::new(); n];
+    for e in &p.stream {
+        sets[e.seg as usize].insert(e.inst as usize);
+    }
+    sets.into_iter()
+        .map(|set| {
+            let mut c = std::collections::BTreeMap::<String, usize>::new();
+            for i in set {
+                let op = p.insts[i].op;
+                let name = DevOp::from_u16(op).map_or(format!("op{op}"), |o| format!("{o:?}"));
+                *c.entry(name).or_default() += 1;
+            }
+            c.into_iter().map(|(k, v)| format!("{k}*{v}")).collect::<Vec<_>>().join("+")
+        })
+        .collect()
+}
+
 /// Shortest segment of the split carry.
 const KDA_CARRY_SPLIT_MIN_SEG: u32 = 1024;
 
@@ -7119,6 +7139,8 @@ struct AmdProg {
     decode_routes: Vec<DecodeSegmentRoute>,
     /// Optional raw gfx950 route for a pure MXFP4 grouped-MoE Down+Combine segment.
     prefill_routes: Vec<PrefillSegmentRoute>,
+    /// `PLOW_PREFILL_SEG_TIMING` only: each segment's instruction ops, `Op*count` (diagnostic).
+    seg_ops: Vec<String>,
     /// `PLOW_SEG_GEOM` per segment: the interpreter launch's override, and the raw route's grid
     /// (0 = shipped). Empty when unset.
     seg_geom_interp: Vec<seg_geom::SegGeom>,
@@ -12188,6 +12210,11 @@ impl AmdEngine {
                 },
                 decode_routes,
                 prefill_routes,
+                seg_ops: if crate::config::RuntimeConfig::get().amd.prefill_seg_timing {
+                    segment_op_summary(p)
+                } else {
+                    Vec::new()
+                },
                 seg_geom_interp: Vec::new(),
                 seg_geom_route: Vec::new(),
                 union_skip,
@@ -18316,6 +18343,10 @@ impl AmdEngine {
     }
 
     /// Ordered host launches and their device-side XCD queue layout.
+    pub(crate) fn segment_ops(&self, p: usize, seg: usize) -> &str {
+        self.progs[p].seg_ops.get(seg).map_or("", String::as_str)
+    }
+
     pub(crate) fn prog_dispatch(&self, p: usize) -> ProgramDispatch {
         let g = &self.progs[p];
         ProgramDispatch::classify(
