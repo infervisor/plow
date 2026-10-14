@@ -1703,10 +1703,19 @@ pub struct AmdRuntimeConfig {
     /// packed interpreter arms. Bit-identical: the objects match the interpreter arms.
     #[arg(long = "amd-packed-lean-kda", env = "PLOW_AMD_PACKED_LEAN_KDA", default_value_t = true, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
     pub packed_lean_kda: bool,
+    /// Packed lean KDA segments run every span in ONE dispatch (the `*_spans_gfx950.elf`
+    /// objects) instead of one barrier-separated launch per span, so the spans' chunk carries
+    /// run side by side. Missing objects fall back to per-span launches.
+    #[arg(long = "amd-packed-lean-kda-batch", env = "PLOW_AMD_PACKED_LEAN_KDA_BATCH", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
+    pub packed_lean_kda_batch: bool,
     /// The prompts a packed prefill launch finishes take their prefix-cache state snapshots
     /// behind one completion wait per rank instead of one per prompt; `=0` restores per-prompt.
     #[arg(long = "amd-packed-snap-batch", env = "PLOW_AMD_PACKED_SNAP_BATCH", default_value_t = true, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
     pub packed_snap_batch: bool,
+    /// Prefix-cache state snapshots run as one queue-ordered copy dispatch
+    /// (`copy_pairs_gfx950.elf`) instead of ~300 DMA copies per prompt behind a host wait.
+    #[arg(long = "amd-snap-kernel", env = "PLOW_AMD_SNAP_KERNEL", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
+    pub snap_kernel: bool,
 
     /// A planned prefill pack filling less than 3/4 of its rung runs as packs that each fit the
     /// next narrower rung (four 1024-row chunks: two 2048 packs, not one half-empty 8192 pack).
@@ -1717,6 +1726,18 @@ pub struct AmdRuntimeConfig {
     /// many rows decode; more step as a separate decode launch. Unset = no cap.
     #[arg(long = "amd-mixed-ride-max", env = "PLOW_AMD_MIXED_RIDE_MAX", global = true)]
     pub mixed_ride_max: Option<u32>,
+
+    /// Decode rows ride EVERY packed prefill launch: when they would widen the pack's rung, the
+    /// last member's chunk gives up that many rows (they run in a later launch), and the riders'
+    /// one-row spans keep the lean KDA route through the all-spans objects. Off: riders ride
+    /// only a pack whose rung has room for them.
+    #[arg(long = "amd-mixed-ride-trim", env = "PLOW_AMD_MIXED_RIDE_TRIM", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
+    pub mixed_ride_trim: bool,
+
+    /// A lone prefill chunk whose cursor is already packable (a long prompt's later chunks) runs
+    /// as a pack of one carrying the live decode rows (`PLOW_AMD_MIXED_PACK` riders).
+    #[arg(long = "amd-mixed-ride-lone", env = "PLOW_AMD_MIXED_RIDE_LONE", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
+    pub mixed_ride_lone: bool,
 
     /// Per-segment all-rank barrier timing for prefill (diagnostic; disables segment-major).
     #[arg(long = "amd-prefill-seg-timing", env = "PLOW_PREFILL_SEG_TIMING", hide = true, default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]

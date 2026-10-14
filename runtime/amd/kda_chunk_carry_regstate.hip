@@ -1,3 +1,7 @@
+/* PLOW_KDA_SPANS=1 builds only the all-spans entry point (its own object). */
+#ifndef PLOW_KDA_SPANS
+#define PLOW_KDA_SPANS 0
+#endif
 #ifdef PLOW_CONFIG
 #include PLOW_CONFIG
 #endif
@@ -27,6 +31,7 @@ extern "C" __device__ unsigned plow_packet_hash_hi =
 #endif
 
 /* One workgroup of four waves per (head, V16) state tile; `scale` is already folded into q. */
+#if !PLOW_KDA_SPANS
 extern "C" __global__ __launch_bounds__(256, 1)
 __attribute__((amdgpu_waves_per_eu(1, 1)))
 void plow_kda_chunk_carry_regstate_gfx950(
@@ -40,3 +45,33 @@ void plow_kda_chunk_carry_regstate_gfx950(
     d_kda_chunk_carry_bt64_regstate(out, state, q, k, W, U, Aqk, g, (t + 63u) / 64u, t, heads,
                                     blockIdx.x, gridDim.x, lds);
 }
+#endif
+
+#if PLOW_KDA_SPANS
+/* PLOW_AMD_PACKED_LEAN_KDA_BATCH: every span of a packed launch in one dispatch; workgroup `b`
+ * carries span `b / per_span` (item slice `b % per_span`, state at its `state_slot`). */
+extern "C" __global__ __launch_bounds__(256, 1)
+__attribute__((amdgpu_waves_per_eu(1, 1)))
+void plow_kda_chunk_carry_regstate_spans_gfx950(
+    bf16* __restrict__ out, float* __restrict__ state,
+    const bf16* __restrict__ q, const bf16* __restrict__ k,
+    const bf16* __restrict__ W, const bf16* __restrict__ U,
+    const float* __restrict__ Aqk, const float* __restrict__ g,
+    unsigned t_unused, unsigned heads, unsigned dim, unsigned value_dim, float scale,
+    const PlowPrefillSpan* __restrict__ spans, unsigned n_spans, unsigned per_span,
+    unsigned min_rows) {
+    __shared__ __align__(16) bf16 lds[plow_kda_regstate::LDS_BYTES / 2u];
+    (void)t_unused;
+    const unsigned si = blockIdx.x / per_span;
+    if (si >= n_spans || heads == 0u || dim != 128u || value_dim != 128u || !(scale > 0.0f))
+        return;
+    const unsigned t = spans[si].n_rows;
+    if (t == 0u || t < min_rows) return;
+    const size_t r = spans[si].row0;
+    const size_t rd = r * heads * dim, rv = r * heads * value_dim, ra = r * heads * 64u;
+    float* ss = state + (size_t)spans[si].state_slot * heads * value_dim * dim;
+    d_kda_chunk_carry_bt64_regstate(out + rv, ss, q + rd, k + rd, W + rd, U + rv, Aqk + ra,
+                                    g + rd, (t + 63u) / 64u, t, heads,
+                                    blockIdx.x - si * per_span, per_span, lds);
+}
+#endif

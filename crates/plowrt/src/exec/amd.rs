@@ -1052,6 +1052,31 @@ struct GemmGroupArgs {
 
 const _: () = assert!(std::mem::size_of::<GemmGroupArgs>() == 96);
 
+/// Kernarg of the `*_spans_gfx950` lean KDA entry points (`PLOW_AMD_PACKED_LEAN_KDA_BATCH`):
+/// the single-span ABI followed by the device span table. Workgroup `b` serves span
+/// `b / per_span`; spans under `min_rows` rows are skipped.
+#[derive(Clone, Copy, Debug)]
+#[repr(C)]
+struct KdaSpansArgs<A: Copy> {
+    base: A,
+    spans: u64,
+    n_spans: u32,
+    per_span: u32,
+    min_rows: u32,
+    _pad: u32,
+}
+
+/// The all-spans lean KDA objects; each is optional and its segment falls back to per-span
+/// launches when absent.
+#[derive(Clone, Copy, Default)]
+struct KdaSpansKernels {
+    intra_wave_items: Option<HsaKernel>,
+    wu_lean: Option<HsaKernel>,
+    wu_lean_keys: Option<HsaKernel>,
+    carry_keyfeed: Option<HsaKernel>,
+    carry_regstate: Option<HsaKernel>,
+}
+
 #[derive(Clone, Copy, Debug)]
 #[repr(C)]
 struct KdaChunkCarryKeyfeedArgs {
@@ -7274,6 +7299,11 @@ pub struct AmdEngine {
     k_mla_pf_gather: Option<HsaKernel>,
     k_kda_chunk_wu_lean_keys: Option<HsaKernel>,
     k_kda_chunk_carry_keyfeed: Option<HsaKernel>,
+    k_kda_spans: KdaSpansKernels,
+    /// `PLOW_AMD_SNAP_KERNEL`: the batched copy object and its piece tables (two halves).
+    k_copy_pairs: Option<HsaKernel>,
+    copy_pieces: Option<(DeviceMem, HsaPinned, usize)>,
+    copy_flip: bool,
     /// The lean Wu's `[hi | lo]` scaled-key pair for the key-fed carry.
     _kda_keyfeed_scratch: Option<DeviceMem>,
     /// `PLOW_KDA_CARRY_SPLIT`: the segment, combine and fix kernels, their scratch and the
@@ -9850,6 +9880,92 @@ impl AmdEngine {
         } else {
             None
         };
+        let mut k_copy_pairs = None;
+        if crate::config::RuntimeConfig::get().amd.snap_kernel && arch == "gfx950" {
+            let path = hsaco_dir.join("copy_pairs_gfx950.elf");
+            let loaded = (|| -> Result<(Module, HsaKernel)> {
+                let image = std::fs::read(&path)
+                    .map_err(|e| RuntimeError::Device(format!("{}: {e}", path.display())))?;
+                let module = EngineDevice::module_load(&*be, &image)?;
+                let kernel = EngineDevice::get_function(&*be, &module, "plow_copy_pairs_gfx950")?;
+                Ok((module, kernel))
+            })();
+            match loaded {
+                Ok((module, kernel)) => {
+                    tracing::info!(object = %path.display(), "snapshot copy object accepted");
+                    modules.push(module);
+                    k_copy_pairs = Some(kernel);
+                }
+                Err(e) => tracing::warn!(%e, "snapshot copy object unavailable; DMA copies"),
+            }
+        }
+        let mut k_kda_spans = KdaSpansKernels::default();
+        let amd_cfg = &crate::config::RuntimeConfig::get().amd;
+        if (amd_cfg.packed_lean_kda_batch || amd_cfg.mixed_ride_trim) && arch == "gfx950" {
+            let mut load_spans = |name: &str, symbol: &str, base: u32| -> Option<HsaKernel> {
+                let path = hsaco_dir.join(name);
+                let loaded = (|| -> Result<(Module, HsaKernel)> {
+                    let image = std::fs::read(&path)
+                        .map_err(|e| RuntimeError::Device(format!("{}: {e}", path.display())))?;
+                    check_packet_pairing_stamp(&image, blob_path, &path)?;
+                    let module = EngineDevice::module_load(&*be, &image)?;
+                    let kernel = EngineDevice::get_function(&*be, &module, symbol)?;
+                    let got = kernel.kernarg_size();
+                    let want = [base + 20, base + 24, base + 20 + 256, base + 24 + 256];
+                    if !want.contains(&got) || kernel.private_segment_size() != 0 {
+                        return Err(RuntimeError::Device(format!(
+                            "{name}: kernarg {got} B (want {} B) or private segment",
+                            base + 24
+                        )));
+                    }
+                    Ok((module, kernel))
+                })();
+                match loaded {
+                    Ok((module, kernel)) => {
+                        tracing::info!(object = %path.display(), symbol, "all-spans lean KDA object accepted");
+                        modules.push(module);
+                        Some(kernel)
+                    }
+                    Err(e) => {
+                        tracing::warn!(%e, "all-spans lean KDA object unavailable; per-span launches");
+                        None
+                    }
+                }
+            };
+            if k_kda_chunk_intra_wave_items.is_some() {
+                k_kda_spans.intra_wave_items = load_spans(
+                    "kda_chunk_intra_wave_items_spans_gfx950.elf",
+                    "plow_kda_chunk_intra_wave_items_spans_gfx950",
+                    std::mem::size_of::<KdaChunkIntraCachedArgs>() as u32,
+                );
+            }
+            if k_kda_chunk_wu_lean.is_some() {
+                k_kda_spans.wu_lean = load_spans(
+                    "kda_chunk_wu_lean_spans_gfx950.elf",
+                    "plow_kda_chunk_wu_lean_spans_gfx950",
+                    std::mem::size_of::<KdaChunkWuLeanArgs>() as u32,
+                );
+            }
+            if k_kda_chunk_wu_lean_keys.is_some() {
+                k_kda_spans.wu_lean_keys = load_spans(
+                    "kda_chunk_wu_lean_keys_spans_gfx950.elf",
+                    "plow_kda_chunk_wu_lean_keys_spans_gfx950",
+                    std::mem::size_of::<KdaChunkWuLeanArgs>() as u32,
+                );
+                k_kda_spans.carry_keyfeed = load_spans(
+                    "kda_chunk_carry_regstate_keyfeed_spans_gfx950.elf",
+                    "plow_kda_chunk_carry_regstate_keyfeed_spans_gfx950",
+                    std::mem::size_of::<KdaChunkCarryKeyfeedArgs>() as u32,
+                );
+            }
+            if k_kda_chunk_carry_regstate.is_some() {
+                k_kda_spans.carry_regstate = load_spans(
+                    "kda_chunk_carry_regstate_spans_gfx950.elf",
+                    "plow_kda_chunk_carry_regstate_spans_gfx950",
+                    std::mem::size_of::<KdaChunkCarryRegstateArgs>() as u32,
+                );
+            }
+        }
 
         let need_mla_pf_dense = crate::config::RuntimeConfig::get().amd.mla_pf_dense
             && blob
@@ -12845,6 +12961,10 @@ impl AmdEngine {
             k_mla_pf_gather,
             k_kda_chunk_wu_lean_keys,
             k_kda_chunk_carry_keyfeed,
+            k_kda_spans,
+            k_copy_pairs,
+            copy_pieces: None,
+            copy_flip: false,
             _kda_keyfeed_scratch: d_kda_keyfeed_scratch,
             k_kda_carry_split,
             k_kda_carry_multi,
@@ -14918,7 +15038,7 @@ impl AmdEngine {
                 .packed_prefill
                 .is_some_and(|b| b.prog == p && !b.token_batch)
             || self.packed_spans.is_empty()
-            || self.packed_spans.iter().any(|s| s.n_rows < 512)
+            || (self.packed_spans.iter().any(|s| s.n_rows < 512) && !self.lean_kda_spans_short())
         {
             return false;
         }
@@ -15057,11 +15177,112 @@ impl AmdEngine {
         flush(&mut m)
     }
 
+    /// `PLOW_AMD_MIXED_RIDE_TRIM`: short spans (decode riders, trimmed tails) stay on the lean KDA
+    /// route only if EVERY loaded lean object has its all-spans twin, which runs spans of any
+    /// length; the single-span objects return early below 512 rows.
+    fn lean_kda_spans_short(&self) -> bool {
+        let k = &self.k_kda_spans;
+        crate::config::RuntimeConfig::get().amd.mixed_ride_trim
+            && (self.k_kda_chunk_intra_wave_items.is_none() || k.intra_wave_items.is_some())
+            && (self.k_kda_chunk_wu_lean.is_none() || k.wu_lean.is_some())
+            && (self.k_kda_chunk_wu_lean_keys.is_none() || k.wu_lean_keys.is_some())
+            && (self.k_kda_chunk_carry_keyfeed.is_none() || k.carry_keyfeed.is_some())
+            && (self.k_kda_chunk_carry_regstate.is_none() || k.carry_regstate.is_some())
+    }
+
+    /// `PLOW_AMD_PACKED_LEAN_KDA_BATCH`: the all-spans object for this lean KDA segment.
+    fn packed_lean_kda_spans_kernel(&self, p: usize, seg: usize) -> Option<HsaKernel> {
+        let cfg = &crate::config::RuntimeConfig::get().amd;
+        if !(cfg.packed_lean_kda_batch || cfg.mixed_ride_trim) {
+            return None;
+        }
+        let k = &self.k_kda_spans;
+        let route = self.progs[p].prefill_routes.get(seg)?;
+        // PLOW_KDA_CARRY_SPLIT: a pack with a splittable span runs its carry per span (split
+        // spans) or batched (PLOW_KDA_CARRY_MULTI), never through the all-spans carry.
+        if matches!(route, PrefillSegmentRoute::KdaChunkCarryKeyfeed { .. })
+            && self.packed_spans.iter().any(|s| self.kda_carry_split_launches(s.n_rows) > 1)
+        {
+            return None;
+        }
+        match route {
+            PrefillSegmentRoute::KdaChunkIntraWaveItems { .. } => k.intra_wave_items,
+            PrefillSegmentRoute::KdaChunkWuLean { args, .. } if args.key_hi != 0 => k.wu_lean_keys,
+            PrefillSegmentRoute::KdaChunkWuLean { .. } => k.wu_lean,
+            PrefillSegmentRoute::KdaChunkCarryKeyfeed { .. } => k.carry_keyfeed,
+            PrefillSegmentRoute::KdaChunkCarryRegstate { .. } => k.carry_regstate,
+            _ => None,
+        }
+    }
+
+    /// One dispatch for every packed span: workgroup `b` serves span `b / per_span` with the
+    /// per-span launch's geometry and operand rebasing (done on the device from the staged span
+    /// table, `d_prefill_spans`).
+    fn enqueue_packed_lean_kda_spans(
+        &self,
+        p: usize,
+        seg: usize,
+        route: PrefillSegmentRoute,
+        kernel: HsaKernel,
+    ) -> Result<()> {
+        let n = self.packed_spans.len() as u32;
+        let spans = self.d_prefill_spans.base;
+        let launch = |args: &[u8], per_span: u32, block: u32| -> Result<()> {
+            // The kernel's explicit segment ends at `min_rows`; the struct's tail pad is not sent.
+            let args = &args[..args.len() - 4];
+            EngineDevice::launch_kernel(
+                &*self.be,
+                kernel,
+                per_span.checked_mul(n).ok_or_else(|| {
+                    RuntimeError::Device("all-spans lean KDA grid overflows".into())
+                })?,
+                block,
+                0,
+                args,
+                None,
+            )
+        };
+        macro_rules! spans_args {
+            ($base:expr, $per:expr) => {
+                KdaSpansArgs { base: $base, spans, n_spans: n, per_span: $per, min_rows: 1, _pad: 0 }
+            };
+        }
+        match route {
+            PrefillSegmentRoute::KdaChunkIntraWaveItems { args, grid } => {
+                let per = self.seg_route_grid(p, seg, grid);
+                let a = spans_args!(args, per);
+                launch(as_bytes(std::slice::from_ref(&a)), per, WG_THREADS_8)
+            }
+            PrefillSegmentRoute::KdaChunkWuLean { args, .. } => {
+                let per = self
+                    .packed_spans
+                    .iter()
+                    .map(|s| kda_wu_lean_grid(s.n_rows, args.heads))
+                    .max()
+                    .unwrap_or(1);
+                let a = spans_args!(args, per);
+                launch(as_bytes(std::slice::from_ref(&a)), per, 256)
+            }
+            PrefillSegmentRoute::KdaChunkCarryKeyfeed { args, grid, .. } => {
+                let a = spans_args!(args, grid);
+                launch(as_bytes(std::slice::from_ref(&a)), grid, 256)
+            }
+            PrefillSegmentRoute::KdaChunkCarryRegstate { args, grid, .. } => {
+                let a = spans_args!(args, grid);
+                launch(as_bytes(std::slice::from_ref(&a)), grid, 256)
+            }
+            _ => unreachable!("packed_lean_kda_spans_kernel admitted only lean KDA routes"),
+        }
+    }
+
     /// One lean-object launch per packed span, operands rebased to the span's rows (`row0`)
     /// and its recurrent state slot exactly as the packed interpreter arms address them
     /// (`d_kda_chunk_*_packed_bt64`). A fresh span's state was cleared at admission.
     fn enqueue_packed_lean_kda(&self, p: usize, seg: usize) -> Result<()> {
         let route = self.progs[p].prefill_routes[seg];
+        if let Some(kernel) = self.packed_lean_kda_spans_kernel(p, seg) {
+            return self.enqueue_packed_lean_kda_spans(p, seg, route, kernel);
+        }
         if let (PrefillSegmentRoute::KdaChunkCarryKeyfeed { args, .. }, Some(multi)) =
             (route, self.k_kda_carry_multi)
         {
@@ -15208,6 +15429,9 @@ impl AmdEngine {
             return 0;
         }
         if active && self.packed_lean_kda_segment(p, seg) {
+            if self.packed_lean_kda_spans_kernel(p, seg).is_some() {
+                return 1;
+            }
             return match self.progs[p].prefill_routes.get(seg) {
                 Some(PrefillSegmentRoute::KdaChunkCarryKeyfeed { .. }) => {
                     let split: usize = self
@@ -17313,7 +17537,7 @@ impl AmdEngine {
         // ONE completion wait for all 276 tensors. Per-copy `memcpy_dtod` blocks the host on its
         // own signal, and at this count that synchronisation — not the 56 MiB — is the cost.
         let t = std::time::Instant::now();
-        self.be.memcpy_dtod_batch(&pairs)?;
+        self.copy_dtod_batch(&pairs)?;
         self.prefix_rows[slot] = rows;
         crate::obs::pfx::SNAP.add(t.elapsed().as_nanos() as u64);
         Ok(())
@@ -17352,13 +17576,66 @@ impl AmdEngine {
         }
         let t = std::time::Instant::now();
         if !pairs.is_empty() {
-            self.be.memcpy_dtod_batch(&pairs)?;
+            self.copy_dtod_batch(&pairs)?;
         }
         for &(slot, rows) in &armed {
             self.prefix_rows[slot] = rows;
         }
         crate::obs::pfx::SNAP.add(t.elapsed().as_nanos() as u64);
         Ok(())
+    }
+
+    /// Device-to-device copies for prefix snapshots. With `PLOW_AMD_SNAP_KERNEL` they are one
+    /// dispatch on this engine's queue, ordered after the prefill that produced the state and
+    /// before any later launch that mutates it, so the host does not wait. The piece table
+    /// alternates halves: a tick drains its own launches before the next snapshot, so the half
+    /// being rewritten is never one a pending dispatch still reads.
+    fn copy_dtod_batch(&mut self, pairs: &[(u64, u64, u64)]) -> Result<()> {
+        let Some(kernel) = self.k_copy_pairs else {
+            return self.be.memcpy_dtod_batch(pairs);
+        };
+        const PIECE: u64 = 1 << 20;
+        let mut pieces: Vec<[u64; 3]> = Vec::with_capacity(pairs.len() * 2);
+        for &(dst, src, bytes) in pairs {
+            let mut off = 0;
+            while off < bytes {
+                let n = PIECE.min(bytes - off);
+                pieces.push([dst + off, src + off, n]);
+                off += n;
+            }
+        }
+        if pieces.is_empty() {
+            return Ok(());
+        }
+        let need = pieces.len() * 24;
+        if self.copy_pieces.as_ref().is_none_or(|&(_, _, cap)| cap < need) {
+            let cap = need.next_power_of_two().max(1 << 16);
+            let d = EngineDevice::alloc(&*self.be, 2 * cap as u64)?;
+            let h = EngineDevice::host_alloc_pinned(&*self.be, cap)?;
+            self.copy_pieces = Some((d, h, cap));
+        }
+        self.copy_flip = !self.copy_flip;
+        let (d, h, cap) = self.copy_pieces.as_mut().expect("allocated above");
+        let dst = d.base + if self.copy_flip { *cap as u64 } else { 0 };
+        h.as_mut_slice()[..need].copy_from_slice(as_bytes(&pieces));
+        self.be.memcpy_htod_pinned(dst, &h.as_slice()[..need])?;
+        #[repr(C)]
+        #[derive(Clone, Copy)]
+        struct Args {
+            pieces: u64,
+            n: u32,
+            _pad: u32,
+        }
+        let args = Args { pieces: dst, n: pieces.len() as u32, _pad: 0 };
+        EngineDevice::launch_kernel(
+            &*self.be,
+            kernel,
+            pieces.len() as u32,
+            256,
+            0,
+            as_bytes(std::slice::from_ref(&args)),
+            None,
+        )
     }
 
     /// Give `slot` a snapshot buffer of `total` bytes, evicting least recently used snapshots

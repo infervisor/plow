@@ -45,4 +45,30 @@ __device__ __forceinline__ void plow_kda_chunk_wu_lean_body(
                                    lds);
 }
 
+/* PLOW_AMD_PACKED_LEAN_KDA_BATCH: every span of a packed launch in one dispatch; workgroup `b`
+ * serves span `b / per_span` as item slice `b % per_span`, operands rebased to the span's rows
+ * as the per-span launches rebase them. Spans under `min_rows` are skipped. */
+template <bool KEYS>
+__device__ __forceinline__ void plow_kda_chunk_wu_lean_spans_body(
+    bf16* __restrict__ W, bf16* __restrict__ U, bf16* __restrict__ q,
+    bf16* __restrict__ key_hi, bf16* __restrict__ key_lo, const float* __restrict__ Ainv,
+    const bf16* __restrict__ k, const bf16* __restrict__ v, const float* __restrict__ g,
+    const float* __restrict__ beta, unsigned heads, unsigned dim, unsigned value_dim,
+    float scale, const PlowPrefillSpan* __restrict__ spans, unsigned n_spans,
+    unsigned per_span, unsigned min_rows) {
+    __shared__ __align__(16) bf16 lds[plow_kda_wu_lean::LDS_BYTES / 2u];
+    const unsigned si = blockIdx.x / per_span;
+    if (si >= n_spans || heads == 0u || dim != 128u || value_dim != 128u || !(scale > 0.0f))
+        return;
+    const unsigned t = spans[si].n_rows;
+    if (t == 0u || t < min_rows) return;
+    const size_t r = spans[si].row0;
+    const size_t rd = r * heads * dim, rv = r * heads * value_dim, rh = r * heads;
+    const size_t ra = r * heads * 64u;
+    d_kda_chunk_wu_bt64_lean<KEYS>(W + rd, U + rv, q + rd, key_hi ? key_hi + rd : nullptr,
+                                   key_lo ? key_lo + rd : nullptr, Ainv + ra, k + rd, v + rv,
+                                   g + rd, beta + rh, (t + 63u) / 64u, t, heads, scale,
+                                   blockIdx.x - si * per_span, per_span, lds);
+}
+
 #endif
