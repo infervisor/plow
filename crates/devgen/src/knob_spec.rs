@@ -1330,6 +1330,8 @@ pub const EMIT: &[KnobSpec] = &[
     KnobSpec::new("emit.glm_gemm_lt_pf_ext", Some("PLOW_GLM_GEMM_LT_PF_EXT"), Layer::Emit, Domain::Str, GLM_GEMM_LT_PF_EXT_DEFAULT, GLM_RECIPE_PF_EXT),
     KnobSpec::new("emit.glm53_gemm_lt", Some("PLOW_GLM53_GEMM_LT"), Layer::Emit, Domain::Str, UNSET, OPT_IN),
     KnobSpec::new("emit.glm53_gemm_lt_min_rows", Some("PLOW_GLM53_GEMM_LT_MIN_ROWS"), Layer::Emit, U32, Default::Static(Val::Nat(2048)), OPT_IN),
+    KnobSpec::new("emit.glm53_gemm_lt_dec", Some("PLOW_GLM53_GEMM_LT_DEC"), Layer::Emit, Domain::Str, UNSET, OPT_IN),
+    KnobSpec::new("emit.glm53_gemm_lt_dec_rungs", Some("PLOW_GLM53_GEMM_LT_DEC_RUNGS"), Layer::Emit, Domain::Str, Default::Static(Val::Str("32,128")), OPT_IN),
     KnobSpec::new("emit.glm53_gemm_lt_max_rows", Some("PLOW_GLM53_GEMM_LT_MAX_ROWS"), Layer::Emit, U32, Default::Static(Val::Nat(8192)), OPT_IN),
     KnobSpec::new("emit.glm_gemv_wg", Some("PLOW_GLM_GEMV_WG"), Layer::Emit, U32, UNSET, OPT_IN),
     KnobSpec::new("emit.glm_ofold", Some("PLOW_GLM_OFOLD"), Layer::Emit, Domain::Bool, OFF, OPT_IN).with(C_OFOLD),

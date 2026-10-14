@@ -572,8 +572,13 @@ fn emit_control_linears(
             emit_parallel_linear2(b, fa, b_raw, x, w_fa, w_b, t, hd, nh, hi, n_cu, &[dep]);
         (counter, counter)
     } else {
+        let fa_lt = seq_rows
+            .then(|| crate::mla::emit_glm53_lt_dec(b, fa, x, w_fa, t, hd, hi, &[dep]))
+            .flatten();
         (
-            crate::k3::emit_k3_linear(b, fa, x, w_fa, t, hd, hi, n_cu, seq_rows, &[dep]),
+            fa_lt.unwrap_or_else(|| {
+                crate::k3::emit_k3_linear(b, fa, x, w_fa, t, hd, hi, n_cu, seq_rows, &[dep])
+            }),
             crate::k3::emit_k3_linear(b, b_raw, x, w_b, t, nh, hi, n_cu, seq_rows, &[dep]),
         )
     }
@@ -853,6 +858,7 @@ fn emit_kda_mixer_ex(
             crate::mla::glm_decode_gemm_tile(t, n, k, n_cu) == Some(DevOp::GemmSmall)
         };
         if crate::emit_config::active().glm_kda_proj_group
+            && !crate::mla::glm53_lt_dec_rung(t)
             && seq_rows
             && t > 1
             && !fb_fold
@@ -867,6 +873,11 @@ fn emit_kda_mixer_ex(
         }
     }
     let gemv = |b: &mut Builder, out: u32, row: u32, wt: u32, n: u32, k: u32, dep: u32| {
+        if seq_rows {
+            if let Some(c) = crate::mla::emit_glm53_lt_dec(b, out, row, wt, t, n, k, &[dep]) {
+                return c;
+            }
+        }
         crate::k3::emit_k3_linear(b, out, row, wt, t, n, k, n_cu, seq_rows, &[dep])
     };
     // P1-P4 collapse into ONE packet along the OUTPUT axis. See [`fuse_qkvg`] for why that is the

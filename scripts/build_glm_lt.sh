@@ -32,4 +32,25 @@ if [[ ${actual%% *} != "$expected_elf" ]]; then
     echo "unbundled hipBLASLt object does not match qualified image" >&2
     exit 1
 fi
+if [[ $arch == gfx950 ]]; then
+    # Only the kernels runtime/amd/glm_lt_gfx950.json names (6.8 MB, not the 503 MB library).
+    here=$(cd "$(dirname "$0")" && pwd)
+    sub=$(mktemp -d "$1/.glm-lt-sub.XXXXXX")
+    trap 'rm -rf "$stem" "$stem.elf" "$sub"' EXIT
+    python3 -c 'import json, sys
+seen = []
+for s in json.load(open(sys.argv[1])):
+    if s["name"] not in seen:
+        seen.append(s["name"])
+print("\n".join(seen))' "$here/../runtime/amd/glm_lt_gfx950.json" > "$sub/names.txt"
+    "$ROCM_PATH/llvm/bin/llvm-readelf" --notes "$stem.elf" > "$sub/notes.txt"
+    python3 "$here/glm_lt_subset.py" "$stem.elf" "$sub/notes.txt" "$sub/names.txt" "$sub" > /dev/null
+    "$ROCM_PATH/llvm/bin/llvm-mc" -triple=amdgcn-amd-amdhsa -mcpu=gfx950 -filetype=obj "$sub/subset.s" -o "$sub/subset.o"
+    "$ROCM_PATH/llvm/bin/ld.lld" -shared "$sub/subset.o" -o "$stem.elf"
+    actual=$(sha256sum "$stem.elf")
+    if [[ ${actual%% *} != 1fc299617e1d7be4d2c33e99a633c4d22656e43a00fa6000acce588b0d491f3e ]]; then
+        echo "gfx950 hipBLASLt subset does not match the qualified image" >&2
+        exit 1
+    fi
+fi
 mv "$stem.elf" "$1/glm_lt_$arch.elf"

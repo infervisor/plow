@@ -11,9 +11,10 @@ use crate::{Result, RuntimeError};
 
 const OBJECT_HASH: &str = "efa5b0365bedc2effa52265c85eded14fb63febd9c067bab37138d99db607db5";
 const NOBIAS_OBJECT_HASH: &str = "0ab860e928c070fa3ee22f5f91725539caaa0a12223296060b8a2bda818ace0d";
-/// ROCm 10 `TensileLibrary_BB_BB_HA_Bias_SAV_UA_Type_BB_HPA_Contraction_l_Alik_Bljk_Cijk_Dijk`
-/// gfx950 image (`scripts/build_glm_lt.sh --gfx950`).
-const GFX950_OBJECT_HASH: &str = "379704897bfc6227f36260ac81cde6cfe9d608bd373623dd974bd4c852b1f5fe";
+/// The `glm_lt_gfx950.json` kernels cut out of the ROCm 10
+/// `TensileLibrary_BB_BB_HA_Bias_SAV_UA_Type_BB_HPA_Contraction_l_Alik_Bljk_Cijk_Dijk` gfx950 image
+/// (`scripts/build_glm_lt.sh --gfx950`, `scripts/glm_lt_subset.py`).
+const GFX950_OBJECT_HASH: &str = "1fc299617e1d7be4d2c33e99a633c4d22656e43a00fa6000acce588b0d491f3e";
 /// Stream-K partial-tile workspace and flags. Every launch runs one whole tile per workgroup;
 /// the kernels still require both pointers, and the workspace covers a full FP32 partial of
 /// every tile at 8192 rows should one write it.
@@ -190,23 +191,31 @@ fn band_choice(rows: u32, n: u32, k: u32) -> Option<(usize, u32)> {
     })
 }
 
-/// Pinned gfx950 kernel (index into `glm_lt_gfx950.json`) per GLM-5.3-Flash prefill projection and
-/// row tier (<= 2048, <= 4096, above), the fastest of hipBLASLt's eight heuristic candidates per
-/// shape through this launcher (MI350X, 30-launch means).
+/// Pinned gfx950 kernel (index into `glm_lt_gfx950.json`) per GLM-5.3-Flash projection and row
+/// tier (decode rungs <= 64 and <= 256 rows, then prefill <= 2048, <= 4096, above): the fastest of
+/// hipBLASLt's eight heuristic candidates per shape through this launcher (MI350X, 30-launch
+/// means; decode tiers at 32 and 128 rows).
 fn gfx950_choice(rows: u32, n: u32, k: u32) -> Option<usize> {
-    let tiers: [usize; 3] = match (n, k) {
-        (1536, 4096) => [0, 1, 2],
-        (512, 4096) => [3, 4, 5],
-        (4096, 1536) => [6, 7, 7],
-        (4096, 2048) => [6, 8, 8],
-        (4096, 1024) => [9, 7, 7],
-        (1024, 128) => [10, 11, 12],
-        (1024, 4096) => [13, 11, 14],
+    let tiers: [usize; 5] = match (n, k) {
+        (1536, 4096) => [18, 19, 0, 1, 2],
+        (512, 4096) => [20, 21, 3, 4, 5],
+        (4096, 1536) => [22, 23, 6, 7, 7],
+        (4096, 2048) => [24, 23, 6, 8, 8],
+        (4096, 1024) => [22, 23, 9, 7, 7],
+        (1024, 128) => [25, 26, 10, 11, 12],
+        (1024, 4096) => [27, 28, 13, 11, 14],
         // KDA f_a/g_a. Not b (N=8): the narrow kernels fault on an 8-column edge.
-        (128, 4096) => [15, 16, 17],
+        (128, 4096) => [29, 30, 15, 16, 17],
         _ => return None,
     };
-    Some(tiers[usize::from(rows > 2048) + usize::from(rows > 4096)])
+    let tier = match rows {
+        0..=64 => 0,
+        65..=256 => 1,
+        257..=2048 => 2,
+        2049..=4096 => 3,
+        _ => 4,
+    };
+    Some(tiers[tier])
 }
 
 /// The `GemmLtPf` mode each program role may carry: decode rungs `1`; prefill-side programs `0`
@@ -219,7 +228,8 @@ pub(super) fn modes_match(prog: &DevProg) -> bool {
         .filter(|d| d.op == DevOp::GemmLtPf as u16)
         .all(|d| match d.i[3] {
             1 => decode,
-            0 | 2 | 3 | 4 => !decode,
+            4 => true,
+            0 | 2 | 3 => !decode,
             _ => false,
         })
 }
@@ -379,6 +389,10 @@ pub(super) struct KernelSpec {
     pub depth_u: u32,
     #[serde(default)]
     pub internal: [u32; 2],
+    /// gfx950 decode tiers: `[rows, skGrid, skTiles, SKItersPerWG]`, hipBLASLt's own stream-K
+    /// split at exactly `rows` (a rung's fixed width); other row counts run whole tiles.
+    #[serde(default)]
+    pub sk: Option<[u32; 4]>,
 }
 
 /// gfx950 Tensile stream-K kernarg (184 bytes, `.kernarg_segment_size` of every SK5 kernel).
@@ -432,8 +446,8 @@ fn magic_number(d: u32) -> (u32, u32) {
     (q2.wrapping_add(1), (p - 32) | if add { 0x8000_0000 } else { 0 })
 }
 
-/// One whole output tile per workgroup: `skGrid = skTiles = tiles` and `SKItersPerWG =
-/// ItersPerTile`, so no tile is split and the result does not depend on the CU count.
+/// Prefill: one whole output tile per workgroup (`skGrid = skTiles = tiles`, `SKItersPerWG =
+/// ItersPerTile`), so no tile is split. Decode tiers replay hipBLASLt's split at the rung width.
 fn arguments950(
     route: Route,
     tensors: [u64; 3],
@@ -445,16 +459,20 @@ fn arguments950(
     let tiles = n.div_ceil(spec.mt_i) * m.div_ceil(spec.mt_j);
     let iters = k.div_ceil(spec.depth_u).max(1);
     let (magic, shift) = magic_number(iters);
+    let (grid, sk_tiles, sk_iters) = match spec.sk {
+        Some([rows, grid, sk_tiles, sk_iters]) if rows == m => (grid, sk_tiles, sk_iters),
+        _ => (tiles, tiles, iters),
+    };
     let args = Args950 {
-        dims: [1, spec.internal[0], spec.internal[1], tiles, n, m, 1, k],
+        dims: [1, spec.internal[0], spec.internal[1], grid, n, m, 1, k],
         pointers: [out, out, weight, x, scratch[0], scratch[1]],
         strides: [n, 0, n, 0, k, 0, k, 0],
         alpha: 1.0,
         beta: 0.0,
-        stream_k: [iters, magic, shift, iters, tiles, tiles],
+        stream_k: [iters, magic, shift, sk_iters, grid, sk_tiles],
         epilogue: [0; 10],
     };
-    (args, tiles)
+    (args, grid)
 }
 
 #[repr(C)]

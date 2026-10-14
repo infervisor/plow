@@ -1017,6 +1017,16 @@ pub struct EmitConfig {
     /// Largest prefill bucket (rows) `PLOW_GLM53_GEMM_LT` routes.
     #[arg(long, env = "PLOW_GLM53_GEMM_LT_MAX_ROWS", default_value_t = 8192)]
     pub glm53_gemm_lt_max_rows: u32,
+    /// GLM-5.3-Flash gfx950 decode: comma list of dense BF16 projections that run the pinned
+    /// gfx950 hipBLASLt object as their own segment at the `PLOW_GLM53_GEMM_LT_DEC_RUNGS` rungs:
+    /// `q_a`, `kv_a`, `q_absorb`, `mla_o`, `kda_o`, `kda_qkv`, `kda_gfa` (g_a, f_a), `kda_gb`
+    /// (g_b, f_b). A routed KDA layer drops the PLOW_GLM_KDA_PROJ_GROUP packets. Unset =>
+    /// byte-identical.
+    #[arg(long, env = "PLOW_GLM53_GEMM_LT_DEC")]
+    pub glm53_gemm_lt_dec: Option<String>,
+    /// Decode rungs `PLOW_GLM53_GEMM_LT_DEC` routes (comma list).
+    #[arg(long, env = "PLOW_GLM53_GEMM_LT_DEC_RUNGS", default_value = "32,128")]
+    pub glm53_gemm_lt_dec_rungs: String,
 
     /// Cap the dispatch width of every blocked GEMV. Unset ⇒ byte-identical.
     #[arg(long, env = "PLOW_GLM_GEMV_WG")]
@@ -1911,6 +1921,9 @@ impl EmitConfig {
             glm53_gemm_lt: env_str("PLOW_GLM53_GEMM_LT"),
             glm53_gemm_lt_min_rows: env_u32("PLOW_GLM53_GEMM_LT_MIN_ROWS").unwrap_or(2048),
             glm53_gemm_lt_max_rows: env_u32("PLOW_GLM53_GEMM_LT_MAX_ROWS").unwrap_or(8192),
+            glm53_gemm_lt_dec: env_str("PLOW_GLM53_GEMM_LT_DEC"),
+            glm53_gemm_lt_dec_rungs: env_str("PLOW_GLM53_GEMM_LT_DEC_RUNGS")
+                .unwrap_or_else(|| "32,128".into()),
             glm_gemv_wg: env_u32("PLOW_GLM_GEMV_WG"),
             glm_ofold: env_bool("PLOW_GLM_OFOLD"),
             glm_hc_norm_fold: env_bool("PLOW_GLM_HC_NORM_FOLD"),

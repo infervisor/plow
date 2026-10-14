@@ -5327,6 +5327,11 @@ pub(crate) fn emit_glm_mla(
         } else {
             DevOp::Gemv
         };
+        if enc != MoeEnc::Mxfp4 {
+            if let Some(counter) = emit_glm53_lt_dec(b, out, x, wt, rows, nn, k, deps) {
+                return counter;
+            }
+        }
         if let Some(counter) = emit_glm_decode_gemm_lt(b, c, enc, rows, [out, x, wt], [nn, k], deps)
         {
             return counter;
@@ -5474,6 +5479,8 @@ pub(crate) fn emit_glm_mla(
         && emit_config::active().glm_kda_proj_group
         && !glm_decode_lt_routes(rows, [ql, h])
         && !glm_decode_lt_routes(rows, [dk, h])
+        && !glm53_lt_dec_routes(rows, ql, h)
+        && !glm53_lt_dec_routes(rows, dk, h)
         && glm_decode_gemm_tile(rows, ql, h, b.n_cu()) == Some(DevOp::GemmSmall)
         && glm_decode_gemm_tile(rows, dk, h, b.n_cu()) == Some(DevOp::GemmSmall))
     .then(|| {
@@ -7509,6 +7516,66 @@ pub(crate) fn emit_glm53_lt_gemm(
         d.t[1] = x;
         d.t[2] = weight;
         d.i[0] = t;
+        d.i[1] = nn;
+        d.i[2] = k;
+        d.i[3] = 4;
+    });
+    b.isolate(counter);
+    Some(counter)
+}
+
+/// `PLOW_GLM53_GEMM_LT_DEC`: whether a `rows`-row decode rung routes any projection.
+pub(crate) fn glm53_lt_dec_rung(rows: u32) -> bool {
+    let ec = emit_config::active();
+    ec.glm53_gemm_lt_dec.is_some()
+        && crate::emit_is_amd()
+        && crate::amd_target::active().1 == hwspec::IsaLevel::Gfx950
+        && ec
+            .glm53_gemm_lt_dec_rungs
+            .split(',')
+            .any(|r| r.trim().parse() == Ok(rows))
+}
+
+pub(crate) fn glm53_lt_dec_routes(rows: u32, nn: u32, k: u32) -> bool {
+    let name = match (nn, k) {
+        (1536, 4096) => "q_a",
+        (512, 4096) => "kv_a",
+        (4096, 1536) => "q_absorb",
+        (4096, 2048) => "mla_o",
+        (4096, 1024) => "kda_o",
+        (1024, 4096) => "kda_qkv",
+        (128, 4096) => "kda_gfa",
+        (1024, 128) => "kda_gb",
+        _ => return false,
+    };
+    glm53_lt_dec_rung(rows)
+        && emit_config::active()
+            .glm53_gemm_lt_dec
+            .as_deref()
+            .is_some_and(|s| s.split(',').any(|s| s.trim() == name))
+}
+
+/// One `PLOW_GLM53_GEMM_LT_DEC` decode projection (`GemmLtPf` mode 4 at the rung's rows), alone
+/// in its segment.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn emit_glm53_lt_dec(
+    b: &mut Builder,
+    out: u32,
+    x: u32,
+    weight: u32,
+    rows: u32,
+    nn: u32,
+    k: u32,
+    deps: &[u32],
+) -> Option<u32> {
+    if !glm53_lt_dec_routes(rows, nn, k) {
+        return None;
+    }
+    let counter = b.emit(DevOp::GemmLtPf, vec![0], deps, |d| {
+        d.t[0] = out;
+        d.t[1] = x;
+        d.t[2] = weight;
+        d.i[0] = rows;
         d.i[1] = nn;
         d.i[2] = k;
         d.i[3] = 4;
