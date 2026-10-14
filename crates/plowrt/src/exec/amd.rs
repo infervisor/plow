@@ -6656,6 +6656,7 @@ pub struct AmdEngine {
     k_kda_chunk_wu_lean: Option<HsaKernel>,
     k_gemm_group: Option<HsaKernel>,
     k_mla_pf_dense: Option<HsaKernel>,
+    k_mla_pf_gather: Option<HsaKernel>,
     k_kda_chunk_wu_lean_keys: Option<HsaKernel>,
     k_kda_chunk_carry_keyfeed: Option<HsaKernel>,
     /// The lean Wu's `[hi | lo]` scaled-key pair for the key-fed carry.
@@ -9044,7 +9045,16 @@ impl AmdEngine {
         let need_mla_pf_dense = crate::config::RuntimeConfig::get().amd.mla_pf_dense
             && blob
                 .prefill_phase()
-                .any(|p| p.insts.iter().any(amd_mla_pf_dense::eligible));
+                .any(|p| {
+                    p.insts.iter().any(|d| {
+                        amd_mla_pf_dense::eligible(d) || amd_mla_pf_dense::eligible_gather(d)
+                    })
+                });
+        let need_mla_pf_gather = need_mla_pf_dense
+            && blob
+                .prefill_phase()
+                .any(|p| p.insts.iter().any(amd_mla_pf_dense::eligible_gather));
+        let mut k_mla_pf_gather = None;
         let k_mla_pf_dense = if need_mla_pf_dense {
             use amd_mla_pf_dense::{MARKER, OBJECT, SYMBOL};
             if arch != "gfx950" {
@@ -9085,7 +9095,34 @@ impl AmdEngine {
                     amd_mla_pf_dense::LDS_MAX
                 )));
             }
-            tracing::info!(object = %path.display(), lds, "dense MLA prefill object accepted");
+            if need_mla_pf_gather {
+                use amd_mla_pf_dense::{GATHER_MARKER, GATHER_SYMBOL};
+                if !elf_symbol_names(&image).contains(&GATHER_MARKER) {
+                    return Err(RuntimeError::Device(format!(
+                        "{} lacks the sparse gather entry (`{GATHER_MARKER}`) this DSA packet needs",
+                        path.display()
+                    )));
+                }
+                let g = EngineDevice::get_function(&*be, &module, GATHER_SYMBOL).map_err(|e| {
+                    RuntimeError::Device(format!("{OBJECT}: no symbol {GATHER_SYMBOL}: {e}"))
+                })?;
+                let want = std::mem::size_of::<amd_mla_pf_dense::GatherArgs>() as u32;
+                let got = g.kernarg_size();
+                if got != want && got != want + 256 {
+                    return Err(RuntimeError::Device(format!(
+                        "{OBJECT}: gather kernarg segment is {got} B; ABI needs {want}"
+                    )));
+                }
+                if HsaBackend::kernel_lds_bytes(&g) > amd_mla_pf_dense::LDS_MAX
+                    || g.private_segment_size() != 0
+                {
+                    return Err(RuntimeError::Device(format!(
+                        "{OBJECT}: gather entry resource gate failed"
+                    )));
+                }
+                k_mla_pf_gather = Some(g);
+            }
+            tracing::info!(object = %path.display(), lds, gather = need_mla_pf_gather, "dense MLA prefill object accepted");
             modules.push(module);
             Some(kernel)
         } else {
@@ -11952,6 +11989,7 @@ impl AmdEngine {
             k_kda_chunk_wu_lean,
             k_gemm_group,
             k_mla_pf_dense,
+            k_mla_pf_gather,
             k_kda_chunk_wu_lean_keys,
             k_kda_chunk_carry_keyfeed,
             _kda_keyfeed_scratch: d_kda_keyfeed_scratch,
@@ -13201,6 +13239,44 @@ impl AmdEngine {
             let kernel = self.k_mla_pf_dense.ok_or_else(|| {
                 RuntimeError::Device("dense MLA prefill segment has no loaded object".into())
             })?;
+            if let Some(mut g) = route.gather_args() {
+                if active {
+                    return Err(RuntimeError::Device(
+                        "sparse MLA prefill gather has no packed-span form".into(),
+                    ));
+                }
+                let gk = self.k_mla_pf_gather.ok_or_else(|| {
+                    RuntimeError::Device("sparse MLA prefill gather entry not loaded".into())
+                })?;
+                if self.kv_slot != 0 {
+                    let uni_ten = route.gather.map_or(packet::dev::TENSOR_NONE16, |(_, t, _)| t);
+                    let fields: [(&mut u64, u16); 5] = [
+                        (&mut g.opart, route.tens[0]),
+                        (&mut g.mlpart, route.tens[1]),
+                        (&mut g.q, route.tens[2]),
+                        (&mut g.ckv, route.tens[3]),
+                        (&mut g.uni, uni_ten),
+                    ];
+                    for (field, id) in fields {
+                        if let Some(&(_, stride)) =
+                            self.kv_slot_stride.iter().find(|(i, _)| *i == id as usize)
+                        {
+                            *field += stride * self.kv_slot as u64;
+                        }
+                    }
+                }
+                EngineDevice::launch_kernel(
+                    &*self.be,
+                    gk,
+                    g.n_tok.div_ceil(8).max(1),
+                    amd_mla_pf_dense::THREADS,
+                    0,
+                    as_bytes(std::slice::from_ref(&g)),
+                    None,
+                )?;
+                self.seg_launches += 1;
+                return Ok(());
+            }
             let mut args = route.args;
             let grid = if active {
                 // Span rows address the slot-0-based cache through `kv_base = slot * max_ctx`.
