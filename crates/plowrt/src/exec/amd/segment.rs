@@ -128,6 +128,9 @@ impl AmdEngine {
             return "interpreter";
         }
         let active = self.packed_prefill.is_some_and(|b| b.prog == p);
+        if active && self.packed_lean_kda_segment(p, seg) {
+            return "kda_lean_spans";
+        }
         match route {
             PrefillSegmentRoute::SparseMla(_) if active => return "mla_sparse_aiter_spans",
             PrefillSegmentRoute::SparseMla(route) if route.active => return "mla_sparse_aiter",
@@ -193,12 +196,6 @@ impl AmdEngine {
                 }
                 PrefillSegmentRoute::MoeCombine(_) if self.k_moe_combine.is_some() => {
                     return "moe_combine";
-                }
-                PrefillSegmentRoute::MoeFp8Glu { .. } if self.k_moe_fp8_pf.is_some() => {
-                    return "moe_fp8_glu";
-                }
-                PrefillSegmentRoute::MoeFp8Down { .. } if self.k_moe_fp8_pf.is_some() => {
-                    return "moe_fp8_down";
                 }
                 PrefillSegmentRoute::MoeEpAlign(_) if self.k_moe_ep_align.is_some() => {
                     return "moe_ep_align";

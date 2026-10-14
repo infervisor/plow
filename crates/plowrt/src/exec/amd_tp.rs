@@ -1487,6 +1487,10 @@ impl AmdTpGroup {
         self.each_rank_parallel(|e| e.snapshot_carried(slot, rows))
     }
 
+    pub fn snapshot_carried_many(&mut self, items: &[(usize, u32)]) -> Result<()> {
+        self.each_rank_parallel(|e| e.snapshot_carried_many(items))
+    }
+
     pub fn restore_carried(&mut self, slot: usize) -> Result<()> {
         for e in &mut self.ranks {
             e.restore_carried(slot)?;
@@ -2358,19 +2362,28 @@ impl AmdTpGroup {
             self.finish_ranks()?;
             ttft::PF_DRAIN.add(t.elapsed().as_nanos() as u64);
         } else {
+            let segment_timing = crate::config::RuntimeConfig::get().amd.prefill_seg_timing;
             for seg in 0..launches {
                 let t = std::time::Instant::now();
                 self.enqueue_segment_all(prog, seg)?;
                 ttft::PF_ENQUEUE.add(t.elapsed().as_nanos() as u64);
                 crate::obs::tick::trace_enqueued();
-                let t = std::time::Instant::now();
+                let t_drain = std::time::Instant::now();
                 self.finish_ranks()?;
-                ttft::PF_DRAIN.add(t.elapsed().as_nanos() as u64);
+                ttft::PF_DRAIN.add(t_drain.elapsed().as_nanos() as u64);
+                if segment_timing {
+                    eprintln!(
+                        "PLOW_PREFILL_SEG_TIMING packed program={prog} bucket={rung} spans={} rows={} segment={seg} family={} enqueue_us={:.3} critical_us={:.3}",
+                        spans.len(),
+                        spans.iter().map(|s| s.n_rows).sum::<u32>(),
+                        self.ranks[0].prefill_segment_family(prog, seg),
+                        (t_drain - t).as_secs_f64() * 1e6,
+                        t.elapsed().as_secs_f64() * 1e6,
+                    );
+                }
             }
         }
-        if self.audit {
-            self.group.audit_xctr(&self.gate_expect[prog])?;
-        }
+        self.audit_prefill_counters(prog)?;
         Ok(())
     }
 

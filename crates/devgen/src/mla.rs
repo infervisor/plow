@@ -1448,9 +1448,6 @@ pub(crate) fn glm53_emit_full(
             gfx950 && ec.kda_chunk_qpre && (ec.kda_wu_lean || ec.kda_carry_keyfeed),
         );
         b.set_kda_carry_keyfeed_segments(ec.kda_carry_keyfeed);
-        b.set_lean_moe_fp8_segments(
-            gfx950 && ec.moe_fp8_pf_lean && rows as u64 >= u64::from(ec.moe_fp8_pf_min_rows),
-        );
         emit_glm53_program(&mut b, &c, &n, &s, ctx, rows, dbatch, enc, true);
         let prog = b.finish();
         tensors = prog.tensors.clone();
@@ -1460,7 +1457,8 @@ pub(crate) fn glm53_emit_full(
     // PACKED-PREFILL SIBLINGS (`PLOW_EMIT_PACKED_PREFILL=1`, as GLM-5.2 and K3 emit them): the
     // same buckets with the family segment split, so several prompts' chunks share one launch
     // (per-span KDA/MLA arms on the packed family objects) and every span's last row samples.
-    // The lean KDA chunk objects are single-sequence, so they are not asked for; the mHC seq-par
+    // The lean KDA chunk objects are single-sequence, so they are asked for only under
+    // PLOW_GLM53_PACKED_LEAN_KDA, which the runtime runs once per span; the mHC seq-par
     // seams stay on (`glm_sp`). Unset ⇒ byte-identical blob.
     if crate::emit_is_amd() && ec.packed_prefill_on() {
         for &rows in &pf {
@@ -1468,6 +1466,17 @@ pub(crate) fn glm53_emit_full(
             b.set_tensor_dedup(true);
             b.adopt_tensors(tensors.clone());
             b.set_packed_prefill_segments(true);
+            if ec.glm53_packed_lean_kda {
+                b.set_kda_intra_wave_items_segments(gfx950 && ec.kda_intra_wave_items);
+                b.set_lean_kda_key_factor_segments(gfx950 && ec.kda_key_factor);
+                b.set_kda_carry_regstate_segments(
+                    gfx950 && ec.kda_chunk_qpre && ec.kda_carry_regstate,
+                );
+                b.set_kda_wu_lean_segments(
+                    gfx950 && ec.kda_chunk_qpre && (ec.kda_wu_lean || ec.kda_carry_keyfeed),
+                );
+                b.set_kda_carry_keyfeed_segments(ec.kda_carry_keyfeed);
+            }
             emit_glm53_program(&mut b, &c, &n, &s, ctx, rows, dbatch, enc, true);
             let prog = b.finish();
             tensors = prog.tensors.clone();

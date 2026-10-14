@@ -1697,6 +1697,16 @@ pub struct AmdRuntimeConfig {
     /// drain after every segment.
     #[arg(long = "amd-packed-seg-major", env = "PLOW_AMD_PACKED_SEG_MAJOR", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
     pub packed_seg_major: bool,
+    /// A packed prefill launch runs a packet's marked lean KDA chunk segments (intra wave-item,
+    /// lean Wu, register-state/key-fed carry; `PLOW_GLM53_PACKED_LEAN_KDA` emits them) as the
+    /// single-sequence objects once per span when every span has >= 512 rows; `=0` keeps the
+    /// packed interpreter arms. Bit-identical: the objects match the interpreter arms.
+    #[arg(long = "amd-packed-lean-kda", env = "PLOW_AMD_PACKED_LEAN_KDA", default_value_t = true, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
+    pub packed_lean_kda: bool,
+    /// The prompts a packed prefill launch finishes take their prefix-cache state snapshots
+    /// behind one completion wait per rank instead of one per prompt; `=0` restores per-prompt.
+    #[arg(long = "amd-packed-snap-batch", env = "PLOW_AMD_PACKED_SNAP_BATCH", default_value_t = true, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
+    pub packed_snap_batch: bool,
 
     /// A planned prefill pack filling less than 3/4 of its rung runs as packs that each fit the
     /// next narrower rung (four 1024-row chunks: two 2048 packs, not one half-empty 8192 pack).
@@ -2182,11 +2192,6 @@ pub struct AmdRuntimeConfig {
     /// Prequantize sorted MXFP4 MoE stage-1 activations once and reuse them across N tiles.
     #[arg(long = "amd-moe-stage1-a4-reuse", env = "PLOW_MOE_STAGE1_A4_REUSE", default_value_t = true, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
     pub moe_stage1_a4_reuse: bool,
-
-    /// Run isolated block-fp8 grouped-MoE prefill GLU / down segments on the
-    /// dedicated `moe_fp8_pf_gfx950.elf` object (bit-identical). `=0` runs them on the interpreter.
-    #[arg(long = "amd-moe-fp8-pf", env = "PLOW_MOE_FP8_PF", default_value_t = true, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
-    pub moe_fp8_pf: bool,
 
     /// Download rank 0's copy of act tensors after the prefill/step:
     /// `name:path[,name:path...]`. A measurement instrument, not a serving path.

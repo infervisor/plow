@@ -921,53 +921,6 @@ struct MoeCombineArgs {
 
 const _: () = assert!(std::mem::size_of::<MoeCombineArgs>() == 48);
 
-/// `plow_moe_fp8_glu_pf_gfx950` (runtime/amd/moe_fp8_pf.hip).
-#[derive(Clone, Copy, Debug)]
-#[repr(C)]
-struct MoeFp8GluArgs {
-    out: u64,
-    x: u64,
-    weight_table: u64,
-    scale_table: u64,
-    meta: u64,
-    row_token: u64,
-    /// W8A8: `[H/128][x_pitch]` input scales and the `[rows][I/128]` output scales; 0 for W8A16.
-    x_scale: u64,
-    out_scale: u64,
-    inter: u32,
-    hidden: u32,
-    experts: u32,
-    act: u32,
-    beta: f32,
-    linear_beta: f32,
-    x_pitch: u32,
-    reserved: u32,
-}
-
-const _: () = assert!(std::mem::size_of::<MoeFp8GluArgs>() == 96);
-
-/// `plow_moe_fp8_down_pf_gfx950`.
-#[derive(Clone, Copy, Debug)]
-#[repr(C)]
-struct MoeFp8DownArgs {
-    part: u64,
-    fu: u64,
-    weight_table: u64,
-    scale_table: u64,
-    meta: u64,
-    row_partidx: u64,
-    row_gate: u64,
-    /// W8A8: the GLU's `[rows][I/128]` scales; 0 for W8A16.
-    fu_scale: u64,
-    hidden: u32,
-    inter: u32,
-    experts: u32,
-    reserved: u32,
-}
-
-const _: () = assert!(std::mem::size_of::<MoeFp8DownArgs>() == 80);
-
-
 #[derive(Clone, Copy, Debug)]
 #[repr(C)]
 struct MoeEpAlignArgs {
@@ -1167,16 +1120,6 @@ enum PrefillSegmentRoute {
     MoeStage1A4Reuse(MoeStage1A4ReuseRoute),
     MoeStage2Mxfp4(MoeStage2Mxfp4Route),
     MoeCombine(MoeCombineRoute),
-    MoeFp8Glu {
-        args: MoeFp8GluArgs,
-        grid: u32,
-        w8a8: bool,
-    },
-    MoeFp8Down {
-        args: MoeFp8DownArgs,
-        grid: u32,
-        w8a8: bool,
-    },
     MoeEpAlign(MoeEpAlignRoute),
     MoeEpStage2(MoeStage2Mxfp4Route),
     MoeEpCombine(MoeEpCombineRoute),
@@ -2236,140 +2179,6 @@ fn has_moe_combine_segment(prog: &DevProg) -> bool {
     members
         .values()
         .any(|set| set.len() == 1 && moe_combine_inst(&prog.insts[*set.first().unwrap()]))
-}
-
-/// Host twins of `packet::devbuild::lean_moe_fp8_{glu,down}_inst`: the packets the dedicated
-/// block-fp8 grouped-MoE prefill object owns.
-fn moe_fp8_glu_inst(d: &DevInst64) -> bool {
-    use packet::dev::TENSOR_NONE16 as NONE;
-    d.op == DevOp::MoeGroupGluPf as u16
-        && d.i[0] != 0
-        && d.i[0].is_multiple_of(128)
-        && d.i[1] != 0
-        && d.i[1].is_multiple_of(128)
-        && d.i[2] != 0
-        && d.i[2] <= 512
-        && d.i[3] == 1
-        && d.i[6] == 0
-        && d.t[..6].iter().all(|&t| t != NONE)
-        && match d.i[7] {
-            0 => d.i[4] == 0 && d.t[6] == NONE && d.t[7] == NONE,
-            2 => d.i[4] != 0 && d.t[6] != NONE && d.t[7] != NONE,
-            _ => false,
-        }
-}
-
-fn moe_fp8_down_inst(d: &DevInst64) -> bool {
-    use packet::dev::TENSOR_NONE16 as NONE;
-    d.op == DevOp::MoeGroupDownPf as u16
-        && d.i[0] != 0
-        && d.i[0].is_multiple_of(256)
-        && d.i[1] >= 256
-        && d.i[1].is_multiple_of(128)
-        && d.i[2] != 0
-        && d.i[2] <= 512
-        && d.i[3] == 1
-        && d.i[4..7].iter().all(|&v| v == 0)
-        && d.t[..5].iter().all(|&t| t != NONE)
-        && match d.i[7] {
-            0 => d.t[5] == NONE,
-            2 => d.t[5] != NONE,
-            _ => false,
-        }
-        && d.t[6] != NONE
-        && d.t[7] != NONE
-}
-
-fn has_moe_fp8_segment(prog: &DevProg) -> bool {
-    let mut members = std::collections::BTreeMap::<u16, std::collections::BTreeSet<usize>>::new();
-    for entry in &prog.stream {
-        members
-            .entry(entry.seg)
-            .or_default()
-            .insert(entry.inst as usize);
-    }
-    members
-        .values()
-        .any(|set| set.len() == 1 && moe_fp8_glu_inst(&prog.insts[*set.first().unwrap()]))
-}
-
-/// Route single-packet block-fp8 grouped-MoE segments to the dedicated object. Anything else
-/// (mixed segments, other arms) stays on the interpreter, which carries the same arms.
-fn add_moe_fp8_pf_routes(
-    prog: &DevProg,
-    devp: &[DeviceMem],
-    routes: &mut [PrefillSegmentRoute],
-) -> Result<()> {
-    let mut members = vec![std::collections::BTreeSet::new(); routes.len()];
-    for entry in &prog.stream {
-        if let Some(set) = members.get_mut(entry.seg as usize) {
-            set.insert(entry.inst as usize);
-        }
-    }
-    let addr = |h: u16, what: &str| -> Result<u64> {
-        devp.get(h as usize).map(|m| m.base).ok_or_else(|| {
-            RuntimeError::Device(format!("fp8 MoE prefill operand `{what}` handle {h} is invalid"))
-        })
-    };
-    let opt = |h: u16, what: &str| -> Result<u64> {
-        if h == packet::dev::TENSOR_NONE16 {
-            Ok(0)
-        } else {
-            addr(h, what)
-        }
-    };
-    for (seg, set) in members.iter().enumerate() {
-        if set.len() != 1 || !matches!(routes[seg], PrefillSegmentRoute::Interpreter) {
-            continue;
-        }
-        let d = &prog.insts[*set.first().unwrap()];
-        let grid = u32::from(d.blocks).max(1);
-        let w8a8 = d.i[7] == 2;
-        if moe_fp8_glu_inst(d) {
-            routes[seg] = PrefillSegmentRoute::MoeFp8Glu {
-                args: MoeFp8GluArgs {
-                    out: addr(d.t[0], "fu")?,
-                    x: addr(d.t[1], "x")?,
-                    weight_table: addr(d.t[2], "weight_table")?,
-                    scale_table: addr(d.t[3], "scale_table")?,
-                    meta: addr(d.t[4], "meta")?,
-                    row_token: addr(d.t[5], "row_token")?,
-                    x_scale: opt(d.t[6], "x_scale")?,
-                    out_scale: opt(d.t[7], "out_scale")?,
-                    inter: d.i[0],
-                    hidden: d.i[1],
-                    experts: d.i[2],
-                    act: d.i[5],
-                    beta: f32::from_bits(d.fj[0]),
-                    linear_beta: f32::from_bits(d.fj[1]),
-                    x_pitch: d.i[4],
-                    reserved: 0,
-                },
-                grid,
-                w8a8,
-            };
-        } else if moe_fp8_down_inst(d) {
-            routes[seg] = PrefillSegmentRoute::MoeFp8Down {
-                args: MoeFp8DownArgs {
-                    part: addr(d.t[0], "part")?,
-                    fu: addr(d.t[1], "fu")?,
-                    weight_table: addr(d.t[2], "weight_table")?,
-                    scale_table: addr(d.t[3], "scale_table")?,
-                    meta: addr(d.t[4], "meta")?,
-                    row_partidx: addr(d.t[6], "row_partidx")?,
-                    row_gate: addr(d.t[7], "row_gate")?,
-                    fu_scale: opt(d.t[5], "fu_scale")?,
-                    hidden: d.i[0],
-                    inter: d.i[1],
-                    experts: d.i[2],
-                    reserved: 0,
-                },
-                grid,
-                w8a8,
-            };
-        }
-    }
-    Ok(())
 }
 
 fn has_moe_prefill_ep(prog: &DevProg) -> bool {
@@ -6661,8 +6470,6 @@ pub struct AmdEngine {
     _moe_stage1_a4_scratch: Option<DeviceMem>,
     k_moe_stage2_mxfp4: Option<HsaKernel>,
     k_moe_combine: Option<HsaKernel>,
-    /// GLU, down (W8A16), GLU, down (W8A8) of `moe_fp8_pf_gfx950.elf`.
-    k_moe_fp8_pf: Option<[HsaKernel; 4]>,
     /// The f32-mix AttnRes object and the workgroup size it advertises.
     k_attn_res_f32mix: Option<(HsaKernel, u32)>,
     k_moe_ep_align: Option<HsaKernel>,
@@ -7470,8 +7277,6 @@ impl AmdEngine {
         let need_moe_stage1_lean =
             need_moe_ep || blob.prefill_phase().any(has_moe_stage1_mxfp4_segment);
         let need_moe_combine_lean = blob.prefill_phase().any(has_moe_combine_segment);
-        let need_moe_fp8_pf = crate::config::RuntimeConfig::get().amd.moe_fp8_pf
-            && blob.prefill_phase().any(has_moe_fp8_segment);
         let need_attn_res_f32mix = blob
             .prefill_phase()
             .any(|p| p.insts.iter().any(lean_attn_res_f32mix_inst64));
@@ -9395,50 +9200,6 @@ impl AmdEngine {
             None
         };
 
-        let k_moe_fp8_pf = if arch == "gfx950" && need_moe_fp8_pf {
-            const NAME: &str = "moe_fp8_pf_gfx950.elf";
-            const SYMBOLS: [(&str, usize); 4] = [
-                ("plow_moe_fp8_glu_pf_gfx950", std::mem::size_of::<MoeFp8GluArgs>()),
-                ("plow_moe_fp8_down_pf_gfx950", std::mem::size_of::<MoeFp8DownArgs>()),
-                ("plow_moe_w8a8_glu_pf_gfx950", std::mem::size_of::<MoeFp8GluArgs>()),
-                ("plow_moe_w8a8_down_pf_gfx950", std::mem::size_of::<MoeFp8DownArgs>()),
-            ];
-            let path = hsaco_dir.join(NAME);
-            if !path.exists() {
-                tracing::info!("fp8 MoE prefill segments stay on the interpreter: no {NAME}");
-                None
-            } else {
-                let image = std::fs::read(&path).map_err(|e| {
-                    RuntimeError::Device(format!("code object {}: {e}", path.display()))
-                })?;
-                if !elf_symbol_names(&image).contains(&"plow_moe_fp8_pf_abi_2") {
-                    return Err(RuntimeError::Device(format!(
-                        "{} lacks the plow_moe_fp8_pf_abi_2 marker",
-                        path.display()
-                    )));
-                }
-                let module = EngineDevice::module_load(&*be, &image)?;
-                let mut ks = Vec::with_capacity(4);
-                for (sym, want) in SYMBOLS {
-                    let kernel = EngineDevice::get_function(&*be, &module, sym).map_err(|e| {
-                        RuntimeError::Device(format!("{NAME}: no symbol {sym}: {e}"))
-                    })?;
-                    let got = kernel.kernarg_size();
-                    let want = want as u32;
-                    if got != want && got != want + 256 {
-                        return Err(RuntimeError::Device(format!(
-                            "{NAME}: {sym} kernarg segment is {got} B; ABI needs {want}"
-                        )));
-                    }
-                    ks.push(kernel);
-                }
-                modules.push(module);
-                Some([ks[0], ks[1], ks[2], ks[3]])
-            }
-        } else {
-            None
-        };
-
         let k_attn_res_f32mix = if need_attn_res_f32mix {
             if arch != "gfx950" {
                 return Err(RuntimeError::Device(format!(
@@ -10740,9 +10501,6 @@ impl AmdEngine {
             let mut union_skip = Vec::new();
             if p.role.is_prefill_side() {
                 add_kda_key_factor_routes(p, &devp, &mut prefill_routes, kda_key_factor_scratch)?;
-                if k_moe_fp8_pf.is_some() {
-                    add_moe_fp8_pf_routes(p, &devp, &mut prefill_routes)?;
-                }
                 mla_materialized_routes(p, &devp, &mut prefill_routes)?;
                 if use_sparse_mla {
                     let sparse = amd_sparse_mla::routes(p, &blob.tensors, seg_class.len())?;
@@ -11955,7 +11713,6 @@ impl AmdEngine {
             _moe_stage1_a4_scratch: d_moe_stage1_a4_scratch,
             k_moe_stage2_mxfp4,
             k_moe_combine,
-            k_moe_fp8_pf,
             k_attn_res_f32mix,
             k_moe_ep_align,
             k_moe_ep_stage2,
@@ -13380,6 +13137,11 @@ impl AmdEngine {
                     sparse.enqueue_split(&self.be, route, &self.tens_table)? as u64;
             }
         }
+        if active && self.packed_lean_kda_segment(p, seg) {
+            self.enqueue_packed_lean_kda(p, seg)?;
+            self.seg_launches += self.packed_spans.len() as u64;
+            return Ok(());
+        }
         if !active {
             if let Some(PrefillSegmentRoute::MlaMaterializePack {
                 args,
@@ -13751,40 +13513,6 @@ impl AmdEngine {
                 self.seg_launches += 1;
                 return Ok(());
             }
-            if let Some(ks) = self.k_moe_fp8_pf {
-                let route = self.progs[p].prefill_routes.get(seg).copied();
-                let launched = match route {
-                    Some(PrefillSegmentRoute::MoeFp8Glu { args, grid, w8a8 }) => {
-                        EngineDevice::launch_kernel(
-                            &*self.be,
-                            ks[if w8a8 { 2 } else { 0 }],
-                            grid,
-                            512,
-                            0,
-                            as_bytes(std::slice::from_ref(&args)),
-                            None,
-                        )?;
-                        true
-                    }
-                    Some(PrefillSegmentRoute::MoeFp8Down { args, grid, w8a8 }) => {
-                        EngineDevice::launch_kernel(
-                            &*self.be,
-                            ks[if w8a8 { 3 } else { 1 }],
-                            grid,
-                            512,
-                            0,
-                            as_bytes(std::slice::from_ref(&args)),
-                            None,
-                        )?;
-                        true
-                    }
-                    _ => false,
-                };
-                if launched {
-                    self.seg_launches += 1;
-                    return Ok(());
-                }
-            }
             if let (Some(kernel), Some(PrefillSegmentRoute::MoeCombine(route))) = (
                 self.k_moe_combine,
                 self.progs[p].prefill_routes.get(seg).copied(),
@@ -13949,6 +13677,160 @@ impl AmdEngine {
         self.be.begin_dispatch_chain_admitted(ticket)
     }
 
+    /// `PLOW_AMD_PACKED_LEAN_KDA`: the staged packed binding runs this marked lean KDA chunk
+    /// segment as its single-sequence object once per span. The objects return early below 512
+    /// rows, so a pack with any shorter span (decode riders, short tails) keeps the packed
+    /// interpreter arms for every KDA segment, which keeps the lean Wu and its key-fed carry
+    /// paired.
+    fn packed_lean_kda_segment(&self, p: usize, seg: usize) -> bool {
+        if !crate::config::RuntimeConfig::get().amd.packed_lean_kda
+            || !self
+                .packed_prefill
+                .is_some_and(|b| b.prog == p && !b.token_batch)
+            || self.packed_spans.is_empty()
+            || self.packed_spans.iter().any(|s| s.n_rows < 512)
+        {
+            return false;
+        }
+        match self.progs[p].prefill_routes.get(seg) {
+            Some(PrefillSegmentRoute::KdaChunkIntraWaveItems { .. }) => {
+                self.k_kda_chunk_intra_wave_items.is_some()
+            }
+            // The keyed Wu and the key-fed carry run lean together or not at all.
+            Some(PrefillSegmentRoute::KdaChunkWuLean { args, .. }) if args.key_hi != 0 => {
+                self.k_kda_chunk_wu_lean_keys.is_some() && self.k_kda_chunk_carry_keyfeed.is_some()
+            }
+            Some(PrefillSegmentRoute::KdaChunkWuLean { .. }) => self.k_kda_chunk_wu_lean.is_some(),
+            Some(PrefillSegmentRoute::KdaChunkCarryKeyfeed { .. }) => {
+                self.k_kda_chunk_wu_lean_keys.is_some() && self.k_kda_chunk_carry_keyfeed.is_some()
+            }
+            Some(PrefillSegmentRoute::KdaChunkCarryRegstate { .. }) => {
+                self.k_kda_chunk_carry_regstate.is_some()
+            }
+            _ => false,
+        }
+    }
+
+    /// One lean-object launch per packed span, operands rebased to the span's rows (`row0`)
+    /// and its recurrent state slot exactly as the packed interpreter arms address them
+    /// (`d_kda_chunk_*_packed_bt64`). A fresh span's state was cleared at admission.
+    fn enqueue_packed_lean_kda(&self, p: usize, seg: usize) -> Result<()> {
+        let route = self.progs[p].prefill_routes[seg];
+        for span in &self.packed_spans {
+            let r = u64::from(span.row0);
+            let t = span.n_rows;
+            match route {
+                PrefillSegmentRoute::KdaChunkIntraWaveItems { args, grid } => {
+                    let h = u64::from(args.heads);
+                    let d = u64::from(args.dim);
+                    let mut a = args;
+                    a.aqk += r * h * 64 * 4;
+                    a.ainv += r * h * 64 * 4;
+                    a.q += r * h * d * 2;
+                    a.k += r * h * d * 2;
+                    a.g_prefix += r * h * d * 4;
+                    a.beta += r * h * 4;
+                    a.t = t;
+                    EngineDevice::launch_kernel(
+                        &*self.be,
+                        self.k_kda_chunk_intra_wave_items.expect("checked by caller"),
+                        self.seg_route_grid(p, seg, grid),
+                        WG_THREADS_8,
+                        0,
+                        as_bytes(std::slice::from_ref(&a)),
+                        None,
+                    )?;
+                }
+                PrefillSegmentRoute::KdaChunkWuLean { args, .. } => {
+                    let h = u64::from(args.heads);
+                    let d = u64::from(args.dim);
+                    let v = u64::from(args.value_dim);
+                    let mut a = args;
+                    a.w += r * h * d * 2;
+                    a.u += r * h * v * 2;
+                    a.q += r * h * d * 2;
+                    if a.key_hi != 0 {
+                        a.key_hi += r * h * d * 2;
+                        a.key_lo += r * h * d * 2;
+                    }
+                    a.ainv += r * h * 64 * 4;
+                    a.k += r * h * d * 2;
+                    a.v += r * h * v * 2;
+                    a.g += r * h * d * 4;
+                    a.beta += r * h * 4;
+                    a.t = t;
+                    let kernel = if args.key_hi != 0 {
+                        self.k_kda_chunk_wu_lean_keys
+                    } else {
+                        self.k_kda_chunk_wu_lean
+                    }
+                    .expect("checked by caller");
+                    EngineDevice::launch_kernel(
+                        &*self.be,
+                        kernel,
+                        kda_wu_lean_grid(t, args.heads),
+                        256,
+                        0,
+                        as_bytes(std::slice::from_ref(&a)),
+                        None,
+                    )?;
+                }
+                PrefillSegmentRoute::KdaChunkCarryKeyfeed { args, grid, .. } => {
+                    let h = u64::from(args.heads);
+                    let d = u64::from(args.dim);
+                    let v = u64::from(args.value_dim);
+                    let mut a = args;
+                    a.out += r * h * v * 2;
+                    a.state += u64::from(span.state_slot) * h * v * d * 4;
+                    a.q += r * h * d * 2;
+                    a.k += r * h * d * 2;
+                    a.w += r * h * d * 2;
+                    a.u += r * h * v * 2;
+                    a.aqk += r * h * 64 * 4;
+                    a.g += r * h * d * 4;
+                    a.key_hi += r * h * d * 2;
+                    a.key_lo += r * h * d * 2;
+                    a.t = t;
+                    EngineDevice::launch_kernel(
+                        &*self.be,
+                        self.k_kda_chunk_carry_keyfeed.expect("checked by caller"),
+                        grid,
+                        256,
+                        0,
+                        as_bytes(std::slice::from_ref(&a)),
+                        None,
+                    )?;
+                }
+                PrefillSegmentRoute::KdaChunkCarryRegstate { args, grid, .. } => {
+                    let h = u64::from(args.heads);
+                    let d = u64::from(args.dim);
+                    let v = u64::from(args.value_dim);
+                    let mut a = args;
+                    a.out += r * h * v * 2;
+                    a.state += u64::from(span.state_slot) * h * v * d * 4;
+                    a.q += r * h * d * 2;
+                    a.k += r * h * d * 2;
+                    a.w += r * h * d * 2;
+                    a.u += r * h * v * 2;
+                    a.aqk += r * h * 64 * 4;
+                    a.g += r * h * d * 4;
+                    a.t = t;
+                    EngineDevice::launch_kernel(
+                        &*self.be,
+                        self.k_kda_chunk_carry_regstate.expect("checked by caller"),
+                        grid,
+                        256,
+                        0,
+                        as_bytes(std::slice::from_ref(&a)),
+                        None,
+                    )?;
+                }
+                _ => unreachable!("packed_lean_kda_segment admitted only lean KDA routes"),
+            }
+        }
+        Ok(())
+    }
+
     /// An `IndexUnionPf` segment whose only reader is a sparse flash on its active native route.
     fn union_unread(&self, p: usize, seg: usize) -> bool {
         let g = &self.progs[p];
@@ -13971,6 +13853,9 @@ impl AmdEngine {
         }
         if self.union_unread(p, seg) {
             return 0;
+        }
+        if active && self.packed_lean_kda_segment(p, seg) {
+            return self.packed_spans.len();
         }
         if active {
             return match self.progs[p].prefill_routes.get(seg) {
@@ -15975,6 +15860,48 @@ impl AmdEngine {
         let t = std::time::Instant::now();
         self.be.memcpy_dtod_batch(&pairs)?;
         self.prefix_rows[slot] = rows;
+        crate::obs::pfx::SNAP.add(t.elapsed().as_nanos() as u64);
+        Ok(())
+    }
+
+    /// [`Self::snapshot_carried`] for several slots behind ONE completion wait (a packed
+    /// launch finishes up to eight prompts). Buffers are allocated first, so an eviction that
+    /// lands on an earlier slot of the batch drops that slot before any copy targets it.
+    pub fn snapshot_carried_many(&mut self, items: &[(usize, u32)]) -> Result<()> {
+        if let Some(&(slot, _)) = items.iter().find(|&&(slot, _)| slot >= self.batch) {
+            return Err(RuntimeError::Device(format!(
+                "snapshot_carried {slot} past batch {}",
+                self.batch
+            )));
+        }
+        let total = self.prefix_regions.as_ref().map_or_else(
+            || self.carried_bytes(),
+            |regions| regions.iter().map(prefix::Region::bytes).sum(),
+        );
+        let mut armed = Vec::with_capacity(items.len());
+        for &(slot, rows) in items {
+            self.sync_kda_conv_alt(slot)?;
+            if total == 0 {
+                self.prefix_rows[slot] = rows;
+            } else if self.alloc_prefix_snap(slot, slot, total)? {
+                self.prefix_tick += 1;
+                self.prefix_used[slot] = self.prefix_tick;
+                armed.push((slot, rows));
+            }
+        }
+        let mut pairs = Vec::new();
+        armed.retain(|&(slot, _)| self.prefix_snap[slot].is_some());
+        for &(slot, rows) in &armed {
+            let dst_base = self.prefix_snap[slot].as_ref().expect("retained above").base;
+            pairs.extend(self.prefix_copy_pairs(slot, rows, dst_base, false, None));
+        }
+        let t = std::time::Instant::now();
+        if !pairs.is_empty() {
+            self.be.memcpy_dtod_batch(&pairs)?;
+        }
+        for &(slot, rows) in &armed {
+            self.prefix_rows[slot] = rows;
+        }
         crate::obs::pfx::SNAP.add(t.elapsed().as_nanos() as u64);
         Ok(())
     }
