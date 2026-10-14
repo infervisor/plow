@@ -1756,6 +1756,11 @@ async fn metrics_handler(
             "Boundary snapshots in the recently used twice-attached tier.",
         ),
         (
+            "snapshots_share",
+            "gauge",
+            "Boundary snapshots flagged as a shared-prefix end.",
+        ),
+        (
             "snapshots_evicted_total",
             "counter",
             "Prefix snapshots evicted.",
@@ -1797,7 +1802,8 @@ async fn metrics_handler(
              plowrt_prefix_eviction_units_total{{model=\"{slug}\"}} {}\n\
              plowrt_prefix_eviction_unit_bytes_total{{model=\"{slug}\"}} {}\n\
              plowrt_prefix_snapshots_live{{model=\"{slug}\"}} {}\n\
-             plowrt_prefix_snapshots_shared{{model=\"{slug}\"}} {}\n",
+             plowrt_prefix_snapshots_shared{{model=\"{slug}\"}} {}\n\
+             plowrt_prefix_snapshots_share{{model=\"{slug}\"}} {}\n",
             s.attach_hits,
             s.attach_misses,
             s.tokens_queried,
@@ -1816,6 +1822,7 @@ async fn metrics_handler(
             s.eviction_unit_bytes,
             s.snapshots_live,
             s.snapshots_shared,
+            s.snapshots_share,
         );
     }
     (

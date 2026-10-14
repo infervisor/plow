@@ -855,6 +855,8 @@ pub struct VmmStats {
     /// twice-attached (shared-prefix) eviction tier.
     pub snapshots_live: u64,
     pub snapshots_shared: u64,
+    /// Boundaries flagged as a shared-prefix end (`note_share`).
+    pub snapshots_share: u64,
     /// Suffix eviction units (a boundary plus the blocks only it kept attachable) and the
     /// bytes they freed.
     pub eviction_units: u64,
@@ -1672,6 +1674,7 @@ impl VmmKv {
             return 0;
         }
         let waits = inner.awaited.clone();
+        let tick = inner.snapshot_tick;
         let mut dead = Vec::new();
         for blocks in 0..=m.blocks {
             let node = blocks.checked_sub(1).map(|i| m.placed[i]);
@@ -1704,11 +1707,15 @@ impl VmmKv {
                     // requests of that conversation attached it (parallel branches, a retry,
                     // a regenerate): the next turn attaches the longer boundary. Only a
                     // shared-prefix end (`share`) serves other conversations and stays.
-                    let spent = snap.session || (snap.attaches >= 1 && !snap.share);
+                    // A shared-prefix end stays only while it is in use: a parallel pair on
+                    // one history also marks its prompt end `share` (note_share), and that
+                    // end is never used again once the pair's turns move on.
+                    let hot_share = snap.share && hot(tick, snap);
+                    let spent = snap.session || (snap.attaches >= 1 && !hot_share);
                     let superseded = snap.users == 0
                         && !awaited
                         && spent
-                        && (snap.attaches <= 1 || !snap.share)
+                        && (snap.attaches <= 1 || !hot_share)
                         && snap.rows < rows
                         && (common == snap.tail.len() || stale_turn_end);
                     if superseded {
@@ -2861,6 +2868,11 @@ const SHARE_MIN_ROWS: usize = 256;
 /// shared-prefix eviction tier after its last use.
 const SHARED_RECENT_TICKS: u64 = 2048;
 
+/// Used within the last `SHARED_RECENT_TICKS` snapshot ticks.
+fn hot(tick: u64, snap: &Snap) -> bool {
+    tick.saturating_sub(snap.last_used) <= SHARED_RECENT_TICKS
+}
+
 /// Record where `prompt` stops matching the longest common prefix with a recent prompt
 /// (32-row aligned): a system prompt seen by two sequences ends there. The engine
 /// publishes that boundary while prefill passes it, so later sequences attach to it.
@@ -3152,8 +3164,11 @@ fn stats_of(s: &Shared) -> VmmStats {
     let tick = inner.snapshot_tick;
     for snap in inner.published.values().flatten() {
         out.snapshots_live += 1;
-        if snap.attaches >= 2 && tick.saturating_sub(snap.last_used) <= SHARED_RECENT_TICKS {
+        if snap.attaches >= 2 && hot(tick, snap) {
             out.snapshots_shared += 1;
+        }
+        if snap.share {
+            out.snapshots_share += 1;
         }
     }
     out
@@ -3625,8 +3640,9 @@ fn evict_one(s: &Shared, inner: &mut Inner, preserve_hot: bool) -> bool {
                 // prompt end attached by two of its own requests is not, and ranked last
                 // for good such ends filled the cache (production, 2026-10-14: 335 of
                 // 335 slots, every fresh prompt end evicted within its own decode).
-                snap.attaches >= 2 && tick.saturating_sub(snap.last_used) <= SHARED_RECENT_TICKS,
-                *pin || snap.share,
+                snap.attaches >= 2 && hot(tick, snap),
+                // A shared-prefix end is exempt only while it is in use (see retire_superseded).
+                *pin || (snap.share && hot(tick, snap)),
                 *rank,
                 snap.last_used,
             )
