@@ -681,24 +681,23 @@ __device__ void hc_mix_split_reduce(float* __restrict__ C, const float* __restri
  * block d = 8 * tid of the four streams, which is exactly the element map both bodies walk at
  * hidden == 8 * PLOW_THREADS (pre: i = 8 * tid + j * hidden; norm: rn_index(0) = 8 * tid, the
  * RN_VEC tail masked to zero). Same expressions, same add order, same reductions: bit-identical,
- * with one load pass instead of four. Pointers are the row's. */
-__device__ void hc_pre_norm_row_lean(float* __restrict__ post_mix, float* __restrict__ comb_mix,
-                                     bf16* __restrict__ lin, bf16* __restrict__ nout,
-                                     const bf16* __restrict__ gamma,
-                                     const float* __restrict__ mrow,
-                                     const bf16* __restrict__ rrow,
-                                     const float* __restrict__ hc_scale,
-                                     const float* __restrict__ hc_base, unsigned hidden,
-                                     unsigned sinkhorn_repeat, float rms_eps, float hc_eps,
-                                     float* part) {
+ * with one load pass instead of four. Pointers are the row's; `rv` is the row already loaded
+ * (stream i at channels 8 * tid). */
+__device__ __forceinline__ void hc_pre_norm_row_rv(const bf16v8 (&rv)[4],
+                                                   float* __restrict__ post_mix,
+                                                   float* __restrict__ comb_mix,
+                                                   bf16* __restrict__ lin, bf16* __restrict__ nout,
+                                                   const bf16* __restrict__ gamma,
+                                                   const float* __restrict__ mrow,
+                                                   const float* __restrict__ hc_scale,
+                                                   const float* __restrict__ hc_base,
+                                                   unsigned hidden, unsigned sinkhorn_repeat,
+                                                   float rms_eps, float hc_eps, float* part) {
     const unsigned nh = 4u * hidden;
     const unsigned wave = threadIdx.x / PLOW_WAVE, lane = threadIdx.x % PLOW_WAVE;
     const unsigned d = threadIdx.x * 8u;
     __shared__ float lw[PLOW_WAVES];
     __shared__ float lg[4];
-    bf16v8 rv[4];
-#pragma unroll
-    for (unsigned i = 0; i < 4; i++) rv[i] = ld_glob8(rrow + (size_t)i * hidden + d);
     const bf16v8 gw = nout ? ld_glob8(gamma + d) : bf16v8_zero();
     float ss = 0.0f;
 #pragma unroll
@@ -777,14 +776,89 @@ __device__ void hc_pre_norm_row_lean(float* __restrict__ post_mix, float* __rest
     }
     __syncthreads(); /* lw / lg reused by the next row */
 }
+__device__ void hc_pre_norm_row_lean(float* __restrict__ post_mix, float* __restrict__ comb_mix,
+                                     bf16* __restrict__ lin, bf16* __restrict__ nout,
+                                     const bf16* __restrict__ gamma,
+                                     const float* __restrict__ mrow,
+                                     const bf16* __restrict__ rrow,
+                                     const float* __restrict__ hc_scale,
+                                     const float* __restrict__ hc_base, unsigned hidden,
+                                     unsigned sinkhorn_repeat, float rms_eps, float hc_eps,
+                                     float* part) {
+    const unsigned d = threadIdx.x * 8u;
+    bf16v8 rv[4];
+#pragma unroll
+    for (unsigned i = 0; i < 4; i++) rv[i] = ld_glob8(rrow + (size_t)i * hidden + d);
+    hc_pre_norm_row_rv(rv, post_mix, comb_mix, lin, nout, gamma, mrow, hc_scale, hc_base, hidden,
+                       sinkhorn_repeat, rms_eps, hc_eps, part);
+}
+
+/* PLOW_GLM_HC_FUSE_TAG, one output per workgroup (hidden == 8 * PLOW_THREADS):
+ * d_gemv_f32_wg_hcpost for output n of one row with each wave's four steps unrolled. Step q of
+ * thread t is stream q at channels 8t..8t+7, so the residual and x_out are loaded once and every
+ * load is in flight before the first add (the rolled loop indexes c[] by a runtime stream and
+ * keeps it in scratch). Same terms, step-order adds and wave_sum: bit-identical. Leaves the row's
+ * new residual in `xs` (the lean tail's map) and the output on thread 0. */
+__device__ __forceinline__ float d_gemv_f32_hcpost_r0(bf16v8 (&xs)[4], const float* __restrict__ W,
+                                                      const bf16* __restrict__ xrow,
+                                                      const bf16* __restrict__ rrow,
+                                                      const float* __restrict__ prow,
+                                                      const float* __restrict__ crow,
+                                                      unsigned n, float* __restrict__ part) {
+    constexpr unsigned HID = 8u * PLOW_THREADS, KK = 4u * HID, STEPS = KK / (PLOW_WAVE * 8u);
+    static_assert(STEPS / PLOW_WAVES == 4u, "step q of thread t is stream q at channels 8t");
+    const unsigned wave = threadIdx.x / PLOW_WAVE, lane = threadIdx.x % PLOW_WAVE;
+    const unsigned d = threadIdx.x * 8u;
+    const float* const wn = W + (size_t)n * KK;
+    float4 w0[4], w1[4];
+#pragma unroll
+    for (unsigned q = 0; q < 4; q++) {
+        const unsigned k = (wave + q * PLOW_WAVES) * (PLOW_WAVE * 8u) + lane * 8u;
+        w0[q] = *(const float4*)(wn + k);
+        w1[q] = *(const float4*)(wn + k + 4);
+    }
+    bf16v8 r[4];
+#pragma unroll
+    for (unsigned i = 0; i < 4; i++) r[i] = ld_glob8(rrow + (size_t)i * HID + d);
+    const bf16v8 xo = ld_glob8(xrow + d);
+    float c[16], p[4];
+#pragma unroll
+    for (unsigned k = 0; k < 16; k++) c[k] = crow[k];
+#pragma unroll
+    for (unsigned k = 0; k < 4; k++) p[k] = prow[k];
+#pragma unroll
+    for (unsigned q = 0; q < 4; q++) {
+        const unsigned s = wave + q * PLOW_WAVES;
+        const bf16v8 xv = hc_post4_8(c, p, q, r, xo);
+        xs[q] = xv;
+        {
+#pragma clang fp contract(off)
+            part[s * PLOW_WAVE + lane] =
+                bf2f(xv[0]) * w0[q].x + bf2f(xv[1]) * w0[q].y + bf2f(xv[2]) * w0[q].z +
+                bf2f(xv[3]) * w0[q].w + bf2f(xv[4]) * w1[q].x + bf2f(xv[5]) * w1[q].y +
+                bf2f(xv[6]) * w1[q].z + bf2f(xv[7]) * w1[q].w;
+        }
+    }
+    __syncthreads();
+    float acc = 0.0f;
+    if (wave == 0) {
+#pragma clang fp contract(off)
+        for (unsigned s = 0; s < STEPS; s++) acc += part[s * PLOW_WAVE + lane];
+        acc = wave_sum(acc);
+    }
+    return acc;
+}
 #endif
 
 /* PLOW_GLM_HC_FUSE_DEC, batched decode rows (GemvF32 i3 = 1, i4 = 3, i5 = R): the post-folded
  * mix with one workgroup per unit = (R rows, 8 outputs). The R rows' new residual (hc_post4_8) is
  * formed once into LDS `xs` (R * K halves) and each wave walks one output's K steps for the R rows
  * with W loaded once. Each output keeps d_gemv_f32_wg's lane-to-k map, term expression and
- * step-order adds before the same wave_sum: mixes and new_residual are bit-identical. */
-template <unsigned R, unsigned U = 1>
+ * step-order adds before the same wave_sum: mixes and new_residual are bit-identical.
+ * TAG (PLOW_GLM_HC_FUSE_TAG): `C` is the tagged word array; outputs are published there and
+ * the new residual is left to the tail, which holds it in `xs`. */
+#define PLOW_HCF_TAG_KEY 0x7fbadbadu
+template <unsigned R, unsigned U = 1, bool TAG = false>
 __device__ void d_gemv_f32_hcpost_rows(float* __restrict__ C, bf16* __restrict__ new_residual,
                                        const float* __restrict__ W,
                                        const bf16* __restrict__ x_out,
@@ -830,7 +904,8 @@ __device__ void d_gemv_f32_hcpost_rows(float* __restrict__ C, bf16* __restrict__
             for (unsigned j = 0; j < 4; j++) {
                 const bf16v8 xv = hc_post4_8(c, p, j, rv, xo);
                 *(bf16v8*)(xs + (size_t)r * K + (size_t)j * hidden + d) = xv;
-                if (og == 0u) st_glob8(new_residual + (size_t)m * K + (size_t)j * hidden + d, xv);
+                if (!TAG && og == 0u)
+                    st_glob8(new_residual + (size_t)m * K + (size_t)j * hidden + d, xv);
             }
         }
     }
@@ -878,7 +953,14 @@ __device__ void d_gemv_f32_hcpost_rows(float* __restrict__ C, bf16* __restrict__
 #pragma unroll
     for (unsigned r = 0; r < R; r++) {
         const float t = wave_sum(acc[r]);
-        if (lane == 0 && m0 + r < M) C[(size_t)(m0 + r) * 24u + n] = t;
+        if (lane == 0 && m0 + r < M) {
+            if constexpr (TAG)
+                __hip_atomic_exchange((unsigned*)C + (size_t)(m0 + r) * 24u + n,
+                                      __float_as_uint(t) ^ PLOW_HCF_TAG_KEY, __ATOMIC_RELAXED,
+                                      __HIP_MEMORY_SCOPE_AGENT);
+            else
+                C[(size_t)(m0 + r) * 24u + n] = t;
+        }
     }
     __syncthreads(); /* xs is rewritten by the workgroup's next unit */
 }

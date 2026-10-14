@@ -458,6 +458,9 @@ struct Shapes {
     /// Any `GemvF32` with `i[4] == 3` — the batched decode post + mix + pre fold
     /// (PLOW_GLM_HC_FUSE_DEC). A pre-arm object never runs the pre. Refuse.
     glm_hc_fuse_dec: bool,
+    /// Any `GemvF32` with `i[4] == 3` and `i[6]` bit 32 — the tagged fused mHC
+    /// (PLOW_GLM_HC_FUSE_TAG). A pre-arm object traps. Refuse.
+    glm_hc_fuse_tag: bool,
     /// Any `GemmSmall` with `i[7] >= 3` — grouped projections (PLOW_GLM_KDA_PROJ_GROUP). An
     /// object without the arm runs segment 0 only. Refuse.
     gemm_small_group: bool,
@@ -687,6 +690,7 @@ fn shapes(m: &Model) -> Shapes {
                     s.glm_hc_pre_tail |= inst.i[4] != 0;
                     s.glm_hc_mix_split |= inst.i[4] == 2;
                     s.glm_hc_fuse_dec |= inst.i[4] == 3 || inst.i[4] == 4;
+                    s.glm_hc_fuse_tag |= inst.i[4] == 3 && inst.i[6] & 32 != 0;
                 }
                 DevOp::Gemm | DevOp::GemmMed | DevOp::GemmSmall | DevOp::Gemv => {
                     if op == DevOp::GemmMed && inst.t[5] != packet::TENSOR_NONE {
@@ -1074,6 +1078,9 @@ fn encoding_features(f: &mut Map<String, Value>, s: &Shapes) {
     }
     if s.glm_hc_fuse_dec {
         f.insert("glm_hc_fuse_dec".into(), json!(true));
+    }
+    if s.glm_hc_fuse_tag {
+        f.insert("glm_hc_fuse_tag".into(), json!(true));
     }
     if s.gemm_small_group {
         f.insert("gemm_small_group".into(), json!(true));
@@ -1821,6 +1828,9 @@ fn backend_amd(
     }
     if on("glm_hc_fuse_dec") {
         req.push("PLOW_GLM_HC_FUSE_DEC=1".into());
+    }
+    if on("glm_hc_fuse_tag") {
+        req.push("PLOW_GLM_HC_FUSE_TAG=1".into());
     }
     if on("gemm_small_group") {
         req.push("PLOW_GLM_KDA_PROJ_GROUP=1".into());

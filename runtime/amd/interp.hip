@@ -3451,8 +3451,177 @@ __device__ __forceinline__ void hc_fuse_tail(CInst in, CTens T, unsigned group, 
     }
 }
 #define HCF_TEN(k) (in->t[k] == PLOW_TENSOR_NONE ? nullptr : T[in->t[k]])
+#ifndef PLOW_HC_FUSE_TAG
+#define PLOW_HC_FUSE_TAG 1
+#endif
+#if PLOW_HC_FUSE_TAG && !PLOW_HC_SINKHORN_RCP
+/* PLOW_GLM_HC_FUSE_TAG (GemvF32 i4 = 3, i6 bits 1 and 32): the fused packet without a release
+ * or acquire per workgroup. Each output is published as one tagged word, value bits ^
+ * PLOW_HCF_TAG_KEY (0 = empty: loader-zeroed, cleared by the consuming tail, next written by a
+ * later launch), after the row-group counters in the counter tensor. The bump only elects the
+ * last arrival, relaxed; it polls its group's words, so nothing waits on an L2 writeback or
+ * invalidate. The tail runs from the rows it already holds (registers at R = 0, LDS `xs` at
+ * R > 0) and stores the mixes and the new residual itself, so the other workgroups write no
+ * plain data and signal relaxed (hcf_quiet). Same values in the same order: bit-identical. */
+extern "C" __device__ unsigned plow_glm_hc_fuse_tag_arm = 1;
+__device__ __forceinline__ unsigned& hcf_quiet() {
+    __shared__ unsigned q;
+    return q;
+}
+__device__ __forceinline__ bool hcf_elect(unsigned* ctr, unsigned arrivals) {
+    __shared__ unsigned last;
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        const unsigned old =
+            __hip_atomic_fetch_add(ctr, 1u, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
+        last = old == arrivals - 1u;
+        if (last) __hip_atomic_store(ctr, 0u, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
+    }
+    __syncthreads();
+    return last;
+}
+/* Threads < n wait for word t, decode it into dst[t] (and the plain mixes) and clear it. */
+__device__ __forceinline__ void hcf_collect(unsigned* w, unsigned n, float* dst, float* C) {
+    if (threadIdx.x < n) {
+        unsigned v;
+        while ((v = __hip_atomic_load(w + threadIdx.x, __ATOMIC_RELAXED,
+                                      __HIP_MEMORY_SCOPE_AGENT)) == 0u)
+            __builtin_amdgcn_s_sleep(1);
+        __hip_atomic_store(w + threadIdx.x, 0u, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
+        const float f = __uint_as_float(v ^ PLOW_HCF_TAG_KEY);
+        dst[threadIdx.x] = f;
+        C[threadIdx.x] = f;
+    }
+    __syncthreads();
+}
+template <unsigned R>
+__device__ __forceinline__ void hcf_rows_unit(CInst in, CTens T, unsigned M, unsigned K,
+                                              unsigned unit, unsigned* words, plow_smem* sm) {
+    if (in->i[6] & 2u)
+        d_gemv_f32_hcpost_rows<R, 8, true>((float*)words, nullptr, (const float*)HCF_TEN(2),
+                                           (const bf16*)HCF_TEN(3), (const bf16*)HCF_TEN(4),
+                                           (const float*)HCF_TEN(5), (const float*)HCF_TEN(6), M,
+                                           K, unit, sm->raw);
+    else
+        d_gemv_f32_hcpost_rows<R, 1, true>((float*)words, nullptr, (const float*)HCF_TEN(2),
+                                           (const bf16*)HCF_TEN(3), (const bf16*)HCF_TEN(4),
+                                           (const float*)HCF_TEN(5), (const float*)HCF_TEN(6), M,
+                                           K, unit, sm->raw);
+}
+/* The rows arm's tail for row group g: rows leave LDS (aliased by `part`) before any tail. */
+template <unsigned R>
+__device__ __forceinline__ void hcf_rows_tail(CInst in, CTens T, unsigned M, unsigned K,
+                                              unsigned g, unsigned* words, float* hm,
+                                              plow_smem* sm) {
+    const unsigned* desc = (const unsigned*)T[in->t[7]];
+    const unsigned hidden = K / 4u, m0 = g * R, nr = M - m0 < R ? M - m0 : R;
+    const unsigned d = threadIdx.x * 8u;
+    hcf_collect(words + (size_t)m0 * 24u, nr * 24u, hm, (float*)HCF_TEN(0) + (size_t)m0 * 24u);
+    bf16v8 rv[R][4];
+    const bf16* const xs = sm->raw;
+#pragma unroll
+    for (unsigned r = 0; r < R; r++)
+#pragma unroll
+        for (unsigned i = 0; i < 4; i++)
+            rv[r][i] = r < nr ? ld_lds8(xs + (size_t)r * K + (size_t)i * hidden + d) : bf16v8_zero();
+    __syncthreads();
+    bf16* const nres = (bf16*)HCF_TEN(1);
+    const bool norm = desc[PLOW_HCT_NORM] == 1u;
+#pragma unroll
+    for (unsigned r = 0; r < R; r++) {
+        if (r >= nr) break;
+        const size_t m = m0 + r;
+#pragma unroll
+        for (unsigned i = 0; i < 4; i++) st_glob8(nres + m * K + (size_t)i * hidden + d, rv[r][i]);
+        hc_pre_norm_row_rv(rv[r], (float*)T[desc[PLOW_HCT_POST]] + m * 4u,
+                           (float*)T[desc[PLOW_HCT_COMB]] + m * 16u,
+                           (bf16*)T[desc[PLOW_HCT_LIN]] + m * hidden,
+                           norm ? (bf16*)T[desc[PLOW_HCT_NOUT]] + m * hidden : nullptr,
+                           norm ? (const bf16*)T[desc[PLOW_HCT_GAMMA]] : nullptr, hm + r * 24u,
+                           (const float*)T[desc[PLOW_HCT_SCALE]],
+                           (const float*)T[desc[PLOW_HCT_BASE]], hidden, desc[PLOW_HCT_SINK],
+                           __uint_as_float(desc[PLOW_HCT_EPS]),
+                           __uint_as_float(desc[PLOW_HCT_HCEPS]), sm->part);
+    }
+}
+__device__ __attribute__((noinline)) void exec_hc_fuse_tag(CInst in, CTens T, unsigned slice,
+                                                          unsigned nblk, plow_smem* sm) {
+    const unsigned M = in->i[0], K = in->i[2], R = in->i[5];
+    const unsigned* desc = (const unsigned*)T[in->t[7]];
+    const unsigned hidden = desc[PLOW_HCT_HIDDEN];
+    if (in->i[1] != 24u || in->i[4] != 3u || !(in->i[6] & 1u) || hidden != 8u * PLOW_THREADS ||
+        K != 4u * hidden || PLOW_WAVES * 3u != 24u || !HCF_TEN(3) || !HCF_TEN(4) ||
+        !HCF_TEN(5) || !HCF_TEN(6) || (size_t)R * K * sizeof(bf16) > sizeof(sm->raw))
+        __builtin_trap();
+    unsigned* const ctr = (unsigned*)T[desc[PLOW_HCT_CTR]];
+    const unsigned groups = R ? (M + R - 1u) / R : M;
+    unsigned* const words = ctr + ((groups + 31u) & ~31u);
+    __shared__ float hm[4u * 24u];
+    unsigned quiet = 1u;
+    if (R == 0u) {
+        if (M * 24u > nblk) __builtin_trap();
+        if (slice < M * 24u) {
+            const unsigned m = slice / 24u, n = slice % 24u;
+            bf16v8 xs[4];
+            const float v = d_gemv_f32_hcpost_r0(
+                xs, (const float*)HCF_TEN(2), (const bf16*)HCF_TEN(3) + (size_t)m * hidden,
+                (const bf16*)HCF_TEN(4) + (size_t)m * K, (const float*)HCF_TEN(5) + m * 4u,
+                (const float*)HCF_TEN(6) + m * 16u, n, (float*)sm->raw);
+            if (threadIdx.x == 0)
+                __hip_atomic_exchange(words + m * 24u + n, __float_as_uint(v) ^ PLOW_HCF_TAG_KEY,
+                                      __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
+            if (hcf_elect(ctr + m, 24u)) {
+                quiet = 0u;
+                hcf_collect(words + m * 24u, 24u, hm, (float*)HCF_TEN(0) + m * 24u);
+                const unsigned d = threadIdx.x * 8u;
+                bf16* const nres = (bf16*)HCF_TEN(1) + (size_t)m * K;
+#pragma unroll
+                for (unsigned q = 0; q < 4; q++) st_glob8(nres + (size_t)q * hidden + d, xs[q]);
+                const bool norm = desc[PLOW_HCT_NORM] == 1u;
+                hc_pre_norm_row_rv(
+                    xs, (float*)T[desc[PLOW_HCT_POST]] + m * 4u,
+                    (float*)T[desc[PLOW_HCT_COMB]] + m * 16u,
+                    (bf16*)T[desc[PLOW_HCT_LIN]] + (size_t)m * hidden,
+                    norm ? (bf16*)T[desc[PLOW_HCT_NOUT]] + (size_t)m * hidden : nullptr,
+                    norm ? (const bf16*)T[desc[PLOW_HCT_GAMMA]] : nullptr, hm,
+                    (const float*)T[desc[PLOW_HCT_SCALE]], (const float*)T[desc[PLOW_HCT_BASE]],
+                    hidden, desc[PLOW_HCT_SINK], __uint_as_float(desc[PLOW_HCT_EPS]),
+                    __uint_as_float(desc[PLOW_HCT_HCEPS]), sm->part);
+            }
+        }
+    } else {
+        const unsigned units = (M + R - 1u) / R * 3u;
+        for (unsigned unit = slice; unit < units; unit += nblk) {
+            switch (R) {
+                case 1u: hcf_rows_unit<1>(in, T, M, K, unit, words, sm); break;
+                case 2u: hcf_rows_unit<2>(in, T, M, K, unit, words, sm); break;
+                case 4u: hcf_rows_unit<4>(in, T, M, K, unit, words, sm); break;
+                default: __builtin_trap();
+            }
+            if (!hcf_elect(ctr + unit / 3u, 3u)) continue;
+            quiet = 0u;
+            switch (R) {
+                case 1u: hcf_rows_tail<1>(in, T, M, K, unit / 3u, words, hm, sm); break;
+                case 2u: hcf_rows_tail<2>(in, T, M, K, unit / 3u, words, hm, sm); break;
+                case 4u: hcf_rows_tail<4>(in, T, M, K, unit / 3u, words, hm, sm); break;
+                default: __builtin_trap();
+            }
+        }
+    }
+    if (threadIdx.x == 0) hcf_quiet() = quiet;
+}
+#define HCF_QUIET_ON 1
+#endif
 __device__ __attribute__((noinline)) void exec_hc_fuse_dec(CInst in, CTens T, unsigned slice,
                                                           unsigned nblk, plow_smem* sm, const PlowProgram* prog_meta) {
+#if PLOW_HC_FUSE_TAG && !PLOW_HC_SINKHORN_RCP
+    if (in->i[6] & 32u) {
+        exec_hc_fuse_tag(in, T, slice, nblk, sm);
+        return;
+    }
+#else
+    if (in->i[6] & 32u) __builtin_trap();
+#endif
     const unsigned M = in->i[0], N = in->i[1], K = in->i[2], R = in->i[5];
     const bool tail = in->i[4] == 3u;
     const unsigned* desc = tail ? (const unsigned*)T[in->t[7]] : nullptr;
@@ -7602,7 +7771,13 @@ __attribute__((amdgpu_waves_per_eu(PLOW_WPE, PLOW_WPE))) void PLOW_INTERP_NAME(P
                     uint32_t* base = (uint32_t*)((char*)prog.peer_scratch[r] + xctr_off);
                     xctr_signal(PLOW_CTR(base, sid));
                 }
-            } else if (maint_leader) {
+            } else if (maint_leader
+#if HCF_QUIET_ON
+                       /* A PLOW_GLM_HC_FUSE_TAG workgroup that ran no tail wrote no plain data. */
+                       && !(in->op == PLOW_DOP_GEMV_F32 && (in->i[6] & 32u) && in->i[3] == 1u &&
+                            in->i[4] == 3u && hcf_quiet())
+#endif
+                       ) {
                 ctr_signal(PLOW_CTR(prog.counters, sid));
             } else {
                 /* PLOW_GATE_HIER_CEIL follower: the count still has to reach the threshold or

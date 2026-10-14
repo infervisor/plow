@@ -1076,6 +1076,12 @@ pub struct EmitConfig {
     #[arg(long, env = "PLOW_GLM_HC_MIX_RAW", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
     pub glm_hc_mix_raw: bool,
 
+    /// With PLOW_GLM_HC_FUSE_DEC + variant bit 1 (hidden 4096): the fused mHC mix publishes each
+    /// output as a tagged word and elects the tail with a relaxed bump (no per-workgroup L2
+    /// writeback/invalidate); the tail runs from the rows it holds. Bit-identical.
+    #[arg(long, env = "PLOW_GLM_HC_FUSE_TAG", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
+    pub glm_hc_fuse_tag: bool,
+
     /// PLOW_GLM_KDA_PROJ_GROUP split override: every grouped projection splits K by the largest
     /// power of two <= this (fewer fp32 partials than the per-projection split-K). NOT bit-identical.
     #[arg(long, env = "PLOW_GLM_KDA_PROJ_GROUP_S")]
@@ -1882,6 +1888,7 @@ impl EmitConfig {
             glm_kda_proj_group: env_bool("PLOW_GLM_KDA_PROJ_GROUP"),
             glm_hc_fuse_r1: env_bool("PLOW_GLM_HC_FUSE_R1"),
             glm_hc_mix_raw: env_bool("PLOW_GLM_HC_MIX_RAW"),
+            glm_hc_fuse_tag: env_bool("PLOW_GLM_HC_FUSE_TAG"),
             glm_kda_proj_group_s: env_u32("PLOW_GLM_KDA_PROJ_GROUP_S"),
             glm_kda_qkvg_r1: env_bool("PLOW_GLM_KDA_QKVG_R1"),
             glm_hc_fuse_variant: env_u32("PLOW_GLM_HC_FUSE_VARIANT"),
