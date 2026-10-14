@@ -497,6 +497,14 @@ impl PrefixCache {
         Some((owner, blk))
     }
 
+    /// Live references on the node `key` (`None`: not in the tree).
+    pub fn node_refs(&self, key: (u32, u32)) -> Option<u32> {
+        self.nodes
+            .iter()
+            .find(|n| !n.evicted && (n.owner_seq, n.block_idx) == key)
+            .map(|n| n.refs)
+    }
+
     /// Unlink the node `key` and then each parent, deepest first, while it is a zero-ref leaf
     /// and `keep` does not hold it. Returns the evicted `(owner_seq, block_idx)` identities.
     pub fn evict_chain_from(

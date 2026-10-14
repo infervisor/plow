@@ -4410,6 +4410,11 @@ fn demote_expired(s: &Shared, inner: &mut Inner) {
         .map(|(node, snap)| (snap.id, node))
         .collect();
     for (id, node) in expired {
+        // A live sequence still maps its blocks: demote once it lets go (a later sweep), so
+        // the private suffix goes with the snapshot.
+        if node.is_some_and(|key| inner.cache.node_refs(key).is_some_and(|r| r > 0)) {
+            continue;
+        }
         let before = inner.stats.cache_bytes + inner.stats.host_snapshot_bytes;
         if !remove_snapshot_id(s, inner, id) {
             continue;
@@ -4847,8 +4852,18 @@ fn spill_unit(s: &Shared, inner: &mut Inner, id: u64) -> bool {
         return finish_oldest_spill(s, inner);
     }
     if tier.free.is_empty() {
-        if let Some(victim) = host_lru(inner) {
-            policy::evict_unit(s, inner, victim);
+        let now = std::time::Instant::now();
+        let protected =
+            |id: u64| snap_ref(inner, id).is_some_and(|x| x.protect_until.is_some_and(|t| t > now));
+        match host_lru(inner) {
+            // An unprotected victim never displaces a session boundary inside its TTL: it is
+            // freed instead (the caller's fallback).
+            Some(victim) if protected(victim) && !protected(id) => {
+                inner.stats.spill_fallbacks += 1;
+                return false;
+            }
+            Some(victim) => policy::evict_unit(s, inner, victim),
+            None => {}
         }
     }
     if spill_snapshot(s, inner, id) {

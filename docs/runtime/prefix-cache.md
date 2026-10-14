@@ -113,7 +113,9 @@ Policy (`crates/plowrt/src/memory/vmm_policy.rs`, `Policy::Tree`, the default):
   tier's entries included), so the cache cannot deadlock. An expired one is demoted lazily (a
   sweep at most once a second from `trim_cache`, no timer thread): its snapshot, then each
   radix block only it kept attachable, newest first (`PrefixCache::evict_chain_from`); shared
-  ancestors stay under LRU. A boundary in use, awaited or mid-transfer waits for the next sweep.
+  ancestors stay under LRU. A boundary in use, awaited, mid-transfer, or whose blocks a live
+  request still maps waits for the next sweep. A full host tier never drops a protected entry to
+  take an unprotected spill (that victim is freed instead).
   `/metrics`: `plowrt_prefix_sessions_protected`, `plowrt_prefix_session_demotions_total`,
   `plowrt_prefix_session_demoted_bytes_total`. Turn-end output boundaries are not published.
 

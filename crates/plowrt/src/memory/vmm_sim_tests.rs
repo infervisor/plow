@@ -1084,6 +1084,31 @@ fn cell_session_demoted_after_ttl() {
     );
 }
 
+/// An expired session boundary whose blocks a live request still maps is demoted only once
+/// that request lets go, and then with its private suffix.
+#[test]
+fn cell_session_demotion_waits_for_a_live_mapping() {
+    let mut r = Rig::new(Policy::Tree, false, 1 << 20, 64, 2);
+    let p = conv_prompt(70, 40, 200);
+    r.turn_session(0, &p, 30, 20);
+    let blocks = r.kv().stats().cache_blocks;
+    // Another request on the same prompt maps the boundary's blocks and stays live.
+    assert!(r.admit(1, &p) > 0);
+    std::thread::sleep(std::time::Duration::from_millis(30));
+    r.kv().begin_seq(0);
+    assert_eq!(r.kv().stats().session_demotions, 0, "still mapped");
+    r.kv().begin_seq(1);
+    r.kv().begin_seq(0);
+    let s = r.kv().stats();
+    assert_eq!(s.session_demotions, 1, "{}", r.dump());
+    assert!(
+        s.cache_blocks < blocks,
+        "the private suffix went too: {}",
+        r.dump()
+    );
+    r.check();
+}
+
 /// An attach by the session's next turn refreshes the boundary's TTL.
 #[test]
 fn cell_session_attach_refreshes_ttl() {
@@ -1103,6 +1128,9 @@ fn cell_session_attach_refreshes_ttl() {
         "refreshed at the attach"
     );
     std::thread::sleep(std::time::Duration::from_millis(100));
+    // The request that attached it ends without publishing (cancelled): expired, and demoted
+    // once nothing maps it.
+    r.kv().begin_seq(0);
     r.kv().begin_seq(1);
     assert_eq!(
         r.kv().stats().session_demotions,
