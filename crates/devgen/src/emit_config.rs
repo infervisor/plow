@@ -522,6 +522,11 @@ pub struct EmitConfig {
     #[arg(long, env = "PLOW_MLA_NS")]
     pub mla_ns: Option<u32>,
 
+    /// Ceiling of the GLM dense MLA decode split count (default 64). Raising it to the chip-fill
+    /// cap (128 at TP8) lets `PLOW_MLA_NS_ADAPT` fill 256 CUs from one long-context row.
+    #[arg(long, env = "PLOW_GLM_MLA_NS_CEIL")]
+    pub glm_mla_ns_ceil: Option<u32>,
+
     #[arg(long = "k3-ns", env = "PLOW_K3_NS", hide = true)]
     legacy_k3_ns: Option<u32>,
 
@@ -1749,6 +1754,7 @@ impl EmitConfig {
             k3_full: env_bool_default_true("K3_FULL"),
             k3_fuse_a: env_bool("PLOW_K3_FUSE_A"),
             mla_ns: env_u32("PLOW_MLA_NS"),
+            glm_mla_ns_ceil: env_u32("PLOW_GLM_MLA_NS_CEIL"),
             legacy_k3_ns: env_u32("PLOW_K3_NS"),
             legacy_glm_ns: env_u32("PLOW_GLM_NS"),
             k3_prefill: env_str("K3_PREFILL"),

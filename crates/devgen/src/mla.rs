@@ -1807,7 +1807,12 @@ pub(crate) fn glm_nsplit(ctx: u32, heads: u32) -> u32 {
                                                 // ctx-scaled cost optimum, floored, then capped by the chip and the KV-tile count.
     let ns = (ctx / NS_PER)
         .max(NS_FLOOR)
-        .min(NS_CEIL_MEASURED)
+        .min(
+            emit_config::active()
+                .glm_mla_ns_ceil
+                .filter(|&v| v >= 1)
+                .unwrap_or(NS_CEIL_MEASURED),
+        )
         .min(fill)
         .min(kv_tiles)
         .max(1);

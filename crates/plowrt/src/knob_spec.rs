@@ -681,6 +681,8 @@ pub const RUNTIME: &[KnobSpec] = &[
     KnobSpec::new("rt.ragged_chunk", Some("PLOW_RAGGED_CHUNK"), Layer::Runtime, Domain::Bool, ON, DIAG),
     KnobSpec::new("rt.ragged_seams", Some("PLOW_AMD_RAGGED_SEAMS"), Layer::Runtime, Domain::Bool, UNSET, DIAG),
     KnobSpec::new("rt.mla_ns_live", Some("PLOW_MLA_NS_LIVE"), Layer::Runtime, Domain::Bool, OFF, OPT_IN),
+    KnobSpec::new("rt.mla_ns_adapt", Some("PLOW_MLA_NS_ADAPT"), Layer::Runtime, U32, UNSET, OPT_IN),
+    KnobSpec::new("rt.mla_ns_items", Some("PLOW_MLA_NS_ITEMS"), Layer::Runtime, U32, UNSET, OPT_IN),
     KnobSpec::new("rt.mla_bf16_metadata_hoist", Some("PLOW_MLA_BF16_METADATA_HOIST"), Layer::Runtime, Domain::Bool, OFF, OPT_IN),
     KnobSpec::new("rt.nv_ns_live", Some("PLOW_NV_NS_LIVE"), Layer::Runtime, Domain::Bool, OFF, OPT_IN),
     KnobSpec::new("rt.amd_decode_dense_exact", Some("PLOW_AMD_DECODE_DENSE_EXACT"), Layer::Runtime, Domain::Bool, OFF, OPT_IN).scoped(DECODE_DENSE_EXACT_SCOPE),

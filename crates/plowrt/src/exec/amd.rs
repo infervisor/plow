@@ -21,7 +21,8 @@ use crate::device::{DeviceMem, Module};
 use crate::exec::amd::packed::validate_rows as validate_amd_packed_rows;
 use crate::exec::device_api::EngineDevice;
 use crate::exec::kvrow::{
-    derive_kvrow, derive_mla_nsplit, is_lm_head_matmul, kvrow_span, mla_live_nsplit,
+    derive_kvrow, derive_mla_nsplit, is_lm_head_matmul, kvrow_span, mla_adapt_nsplit,
+    mla_live_nsplit,
     prefill_row_field, ragged_band_rows, ragged_band_views, rebase_band_rows, rebase_chunk_rows,
     RowField,
 };
@@ -6142,6 +6143,12 @@ struct MlaNsplitProg {
     lo: usize,
     /// `insts[lo ..= hi]`, patched in place and uploaded whole.
     image: Vec<DevInst64>,
+    /// This rung's emitted split count (`PLOW_MLA_NS_ADAPT`; the shared `baked` otherwise).
+    baked: u32,
+    /// This rung's resident split count (`PLOW_MLA_NS_ADAPT`).
+    cur: u32,
+    /// Flash work items per split: `rows * nh_l / GF`.
+    unit: u32,
 }
 
 /// MLA KV-split state under `PLOW_MLA_NS_LIVE`.
@@ -6160,6 +6167,8 @@ struct MlaNsplit {
     baked: u32,
     /// What is resident on the device right now.
     cur: u32,
+    /// `PLOW_MLA_NS_ADAPT`: `(min KV rows per split, target work items)`; per-rung policy.
+    adapt: Option<(u32, u32)>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -9928,9 +9937,11 @@ impl AmdEngine {
             .max();
         let mla_bf16 = mla_bf16_rows
             .map(|rows| {
-                if crate::config::RuntimeConfig::get().amd.mla_ns_live {
+                if crate::config::RuntimeConfig::get().amd.mla_ns_live
+                    || crate::config::RuntimeConfig::get().amd.mla_ns_adapt.is_some()
+                {
                     return Err(RuntimeError::Device(
-                        "BF16 MLA excludes PLOW_MLA_NS_LIVE".into(),
+                        "BF16 MLA excludes PLOW_MLA_NS_LIVE / PLOW_MLA_NS_ADAPT".into(),
                     ));
                 }
                 amd_mla_bf16::PersistentMla::load(&be, hsaco_dir, rows, &mut modules)
@@ -9950,9 +9961,11 @@ impl AmdEngine {
         {
             Some(rows) => {
                 // The relayout reads the baked split count; live re-pointing would desync it.
-                if crate::config::RuntimeConfig::get().amd.mla_ns_live {
+                if crate::config::RuntimeConfig::get().amd.mla_ns_live
+                    || crate::config::RuntimeConfig::get().amd.mla_ns_adapt.is_some()
+                {
                     return Err(RuntimeError::Device(
-                        "native sparse MLA decode is incompatible with PLOW_MLA_NS_LIVE".into(),
+                        "native sparse MLA decode is incompatible with PLOW_MLA_NS_LIVE / PLOW_MLA_NS_ADAPT".into(),
                     ));
                 }
                 Some(amd_sparse_mla::SparseMlaDecode::load(
@@ -11879,23 +11892,39 @@ impl AmdEngine {
         // EVERY decode rung, not just `decode`: with a batch ladder the mux
         // dispatches a narrower rung at low load, and patching only the widest
         // would leave the running program on its baked count.
-        let mla_nsplit = crate::config::RuntimeConfig::get()
-            .amd
-            .mla_ns_live
+        let rcfg = &crate::config::RuntimeConfig::get().amd;
+        let adapt = rcfg
+            .mla_ns_adapt
+            .filter(|&m| m > 0)
+            .map(|m| (m, rcfg.mla_ns_items.filter(|&v| v > 0).unwrap_or(blob.n_cu)));
+        let mla_nsplit = (rcfg.mla_ns_live || adapt.is_some())
             .then(|| {
                 let mut baked = None;
                 let mut rungs = Vec::new();
                 for &p in &decode_ladder {
-                    let (sites, b) = derive_mla_nsplit(&blob.progs[p].insts)?;
-                    if *baked.get_or_insert(b) != b {
+                    let insts = &blob.progs[p].insts;
+                    let (sites, b) = derive_mla_nsplit(insts)?;
+                    // Under ADAPT each rung carries its own baked count (the ladder bakes
+                    // 64/16/4/1); the shared-count rule only binds the legacy policy.
+                    if adapt.is_none() && *baked.get_or_insert(b) != b {
                         return None; // rungs disagree; leave every one of them alone
                     }
+                    baked.get_or_insert(b);
+                    let fl = sites
+                        .iter()
+                        .map(|&i| &insts[i as usize])
+                        .find(|d| d.op != DevOp::MlaMergeFold as u16)?;
+                    let gf = if fl.i[7] == 0 { 4 } else { fl.i[7] };
+                    let unit = (fl.i[0].max(1) * (fl.i[1] / gf).max(1)).max(1);
                     let (lo, hi) = crate::exec::kvrow::kvrow_span(&sites)?;
                     rungs.push(MlaNsplitProg {
                         prog: p,
                         sites: sites.iter().map(|&i| i as usize - lo).collect(),
                         lo,
-                        image: blob.progs[p].insts[lo..=hi].to_vec(),
+                        image: insts[lo..=hi].to_vec(),
+                        baked: b,
+                        cur: b,
+                        unit,
                     });
                 }
                 let baked = baked?;
@@ -11905,10 +11934,19 @@ impl AmdEngine {
                     sites = rungs.iter().map(|r| r.sites.len()).sum::<usize>(),
                     "PLOW_MLA_NS_LIVE: MLA decode split count tracks the live kv_len"
                 );
+                if let Some((minper, items)) = adapt {
+                    tracing::info!(
+                        minper,
+                        items,
+                        rungs = ?rungs.iter().map(|r| (r.unit, r.baked)).collect::<Vec<_>>(),
+                        "PLOW_MLA_NS_ADAPT: per-rung MLA decode split count"
+                    );
+                }
                 Some(MlaNsplit {
                     progs: rungs,
                     baked,
                     cur: baked,
+                    adapt,
                 })
             })
             .flatten();
@@ -15038,6 +15076,9 @@ impl AmdEngine {
         let Some(ns) = &mut self.mla_nsplit else {
             return Ok(());
         };
+        if let Some((minper, items)) = ns.adapt {
+            return self.patch_mla_nsplit_adapt(kvlen, minper, items);
+        }
         let (baked, from) = (ns.baked, ns.cur);
         let want = mla_live_nsplit(baked, kvlen);
         if want == from {
@@ -15103,6 +15144,47 @@ impl AmdEngine {
         // AFTER the uploads: `cur` is what the DEVICE holds, so a failed push must
         // leave it stale rather than claim a value that never landed.
         self.mla_nsplit.as_mut().expect("checked").cur = want;
+        Ok(())
+    }
+
+    /// `PLOW_MLA_NS_ADAPT`: [`Self::patch_mla_nsplit`] with a per-rung count. Same upload and
+    /// `h_inst` mirroring rules; only rungs whose count moved are pushed.
+    fn patch_mla_nsplit_adapt(&mut self, kvlen: u32, minper: u32, items: u32) -> Result<()> {
+        let dp = self.decode;
+        let sz = std::mem::size_of::<DevInst64>();
+        let n_rungs = self.mla_nsplit.as_ref().map_or(0, |ns| ns.progs.len());
+        for k in 0..n_rungs {
+            let r = &mut self.mla_nsplit.as_mut().expect("checked").progs[k];
+            let want = mla_adapt_nsplit(r.baked, kvlen, r.unit, items, minper);
+            if want == r.cur {
+                continue;
+            }
+            for &i in &r.sites {
+                r.image[i].i[4] = want;
+            }
+            tracing::debug!(prog = r.prog, from = r.cur, to = want, kvlen, "MLA adapt split");
+            let r = &self.mla_nsplit.as_ref().expect("checked").progs[k];
+            if r.prog == dp {
+                let slab = self.h_inst.as_mut_slice();
+                let n = slab.len() / sz;
+                // SAFETY: as in `patch_mla_nsplit`.
+                let insts: &mut [DevInst64] = unsafe {
+                    std::slice::from_raw_parts_mut(slab.as_mut_ptr() as *mut DevInst64, n)
+                };
+                for &site in &r.sites {
+                    let i = r.lo + site;
+                    if i < n {
+                        insts[i].i[4] = want;
+                    }
+                }
+            }
+            self.be.upload(
+                &self.progs[r.prog].d_inst,
+                (r.lo * sz) as u64,
+                as_bytes(&r.image),
+            )?;
+            self.mla_nsplit.as_mut().expect("checked").progs[k].cur = want;
+        }
         Ok(())
     }
 

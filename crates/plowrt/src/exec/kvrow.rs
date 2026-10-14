@@ -637,6 +637,20 @@ pub(crate) fn mla_live_nsplit(baked: u32, kv_len: u32) -> u32 {
         .min(baked.max(1))
 }
 
+/// `PLOW_MLA_NS_ADAPT`: the split count of ONE decode rung for its live `kv_len`.
+///
+/// `unit` is the rung's work items per split (`rows * nh_l / GF`). Splits are added until the
+/// rung reaches `items` work items (the CU count by default), but no split covers fewer than
+/// `minper` KV rows or less than one flash tile, and the baked count (the buffer sizing) is the
+/// ceiling. Wide rungs (B=128: unit 256) therefore stay at one split, narrow rungs at long
+/// context fill the machine, and short contexts stop paying the O(nsplit) merge for slivers.
+pub(crate) fn mla_adapt_nsplit(baked: u32, kv_len: u32, unit: u32, items: u32, minper: u32) -> u32 {
+    let tiles = kv_len.div_ceil(MLA_FA_BKV).max(1);
+    let fill = (items / unit.max(1)).max(1);
+    let by_len = (kv_len / minper.max(1)).max(1);
+    fill.min(by_len).min(tiles).min(baked.max(1)).max(1)
+}
+
 /// `PLOW_AMD_DECODE_DENSE_EXACT`: may this step run the dense-exact rung instead of the DSA one?
 ///
 /// The DSA selector keeps `min(select_width, kv_len[row])` keys, `kv_len` counting the current
@@ -1023,5 +1037,24 @@ mod row_field_tests {
         assert_eq!(sites.len(), 1);
         assert_eq!(sites[0].inst_idx, 1);
         assert!(!sites[0].is_merge);
+    }
+}
+
+#[cfg(test)]
+mod mla_adapt_tests {
+    use super::mla_adapt_nsplit;
+
+    #[test]
+    fn mla_adapt_nsplit_tp8_ladder() {
+        // TP8 GLM: nh_l 8, GF 4 -> unit = rows * 2; 256 CUs; minper 128.
+        let ns = |baked: u32, kv: u32, rows: u32| mla_adapt_nsplit(baked, kv, rows * 2, 256, 128);
+        assert_eq!(ns(1, 1024, 128), 1);
+        assert_eq!(ns(4, 1024, 32), 4);
+        assert_eq!(ns(16, 1024, 8), 8);
+        assert_eq!(ns(16, 61440, 8), 16);
+        assert_eq!(ns(128, 1024, 1), 8);
+        assert_eq!(ns(128, 61440, 1), 128);
+        assert_eq!(ns(64, 61440, 1), 64);
+        assert_eq!(ns(128, 5, 1), 1);
     }
 }

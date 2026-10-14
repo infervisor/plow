@@ -2038,6 +2038,18 @@ pub struct AmdRuntimeConfig {
     #[arg(long = "mla-ns-live", env = "PLOW_MLA_NS_LIVE", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
     pub mla_ns_live: bool,
 
+    /// Per-rung adaptive MLA decode split count (`PLOW_MLA_NS_ADAPT=<min KV rows per split>`).
+    /// Each decode rung re-points its flash/merge `i[4]` from (rows, head groups, live kv_len):
+    /// enough splits to give `PLOW_MLA_NS_ITEMS` work items, never fewer than this many KV rows
+    /// per split, never above the baked count. Implies the live patch path of `PLOW_MLA_NS_LIVE`.
+    /// Not bit-identical (a different partition reassociates the merge).
+    #[arg(long = "mla-ns-adapt", env = "PLOW_MLA_NS_ADAPT", global = true)]
+    pub mla_ns_adapt: Option<u32>,
+
+    /// Target flash work items for `PLOW_MLA_NS_ADAPT` (default: the device CU count).
+    #[arg(long = "mla-ns-items", env = "PLOW_MLA_NS_ITEMS", global = true)]
+    pub mla_ns_items: Option<u32>,
+
     /// Experimental BF16 persistent MLA work-map reuse within one ordered decode replay.
     #[arg(long = "mla-bf16-metadata-hoist", env = "PLOW_MLA_BF16_METADATA_HOIST", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
     pub mla_bf16_metadata_hoist: bool,
