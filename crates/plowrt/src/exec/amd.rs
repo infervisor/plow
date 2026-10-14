@@ -5313,12 +5313,14 @@ fn bind_packed_experts(
 
         // The fold's own preconditions, checked where the checkpoint is: TP (under EP the routed
         // experts are whole per rank while the shared expert is sliced on every rank, so there is
-        // no rank that owns it), the routed geometry AITER's 257/9 table is for, and — the one
+        // no rank that owns it), and — the one
         // that actually bites on a lite-prepped dir — a block-FP8 shared expert the slab can hold.
         if *shared_fold {
-            if whole || n_exp != 257 {
+            // Any routed count: the native call's table is 257 entries, the grouped W8A8 chain's
+            // GLM-5.3 table 289.
+            if whole {
                 return Err(RuntimeError::Device(format!(
-                    "{pfx}: the shared-expert fold is a TP construction over 257 entries, not                      EP over {n_exp}"
+                    "{pfx}: the shared-expert fold is a TP construction, not EP over {n_exp}"
                 )));
             }
             for j in 0..3 {
