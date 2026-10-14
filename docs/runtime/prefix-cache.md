@@ -72,7 +72,9 @@ Policy (`crates/plowrt/src/memory/vmm_policy.rs`, `Policy::Tree`, the default):
 * Eviction: one LRU key, `last_used`, over snapshots with `users == 0` that no in-flight waiter
   awaits (`Await { chain, rows }`, set by `inflight_prefix`, cleared at the waiter's attach,
   cancellation or next sequence). The unit is the snapshot plus the radix leaves only it kept
-  attachable. No MRU exemption, no pin tier, no shared tier, no recency window.
+  attachable. No pin tier, no shared tier, no recency window; the only MRU exemption is the
+  soft-cap trim's (`preserve_hot`): it keeps the most recently used boundary while a live request
+  maps its blocks, and allocation OOM may still take it.
 * Recency moves on consumer demand only: an attach refreshes the attached boundary and every
   ancestor on its chain (a hot system prompt end stays warm while conversations continue through
   it); the turn-end pass touches the conversation's prompt end (metadata only, before the
@@ -182,4 +184,6 @@ stay active under it (the previous binary is the exact rollback):
 * `retire_slot` releases the live ring before `begin_seq`'s trim;
 * every node-level removal frees its snapshots one at a time, and strict publish's tail
   eviction stops below a held, awaited or in-transfer snapshot;
+* whole-block checkpoints and chunk ends inside a prompt publish only for an in-flight waiter,
+  and the turn-end output boundary only for an `X-Session-Id` request;
 * snapshots are identified by id; the host tier and `PLOW_PREFIX_SESSION_TTL_S` are tree-only.
