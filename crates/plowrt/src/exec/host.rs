@@ -63,6 +63,10 @@ pub struct HostExecutor {
     /// Measured ride-or-step costs of this engine's prefill launches (`sched::ride`).
     #[cfg(feature = "cuda")]
     pub ride: crate::sched::ride::RideCost,
+    /// Prompt rows of the requests queued behind the slots, set per tick only under
+    /// `PLOW_PF_ITL_BUDGET_MS` (its backlog guard).
+    #[cfg(feature = "cuda")]
+    pub queued_prefill_rows: usize,
     /// Input text a TOKENIZE packet encodes into `token_ids` (when the host owns
     /// tokenization). Empty for the `--net` path (input is already `tokens`).
     pub input_text: Option<String>,

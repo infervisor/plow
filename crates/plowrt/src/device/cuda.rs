@@ -2282,7 +2282,8 @@ impl crate::memory::vmm::VmmOps for CudaBackend {
         let mut provenance = self.vmm_provenance.lock();
         provenance.freed(va);
         let keep = crate::config::RuntimeConfig::get().vmm_snap_pool as usize;
-        {
+        // Off, `alloc` records nothing in the pool, so there is nothing to look up.
+        if keep > 0 {
             // cuMemFree synchronizes the device; a kept buffer is reused by the next snapshot.
             let mut pool = self.snap_pool.lock();
             if let Some(bytes) = pool.1.remove(&va) {
