@@ -3,6 +3,21 @@
 #include "amd_common.h"
 #endif
 
+/* Model width the adapter is built for (scripts/build_moe_aiter.sh): GLM-5.2's 6144 on gfx942,
+ * GLM-5.3-Flash's 4096 on gfx950. gfx942 AITER objects read FNUZ e4m3 (max 240, half the OCP
+ * value of the same bits, so the OCP-scaled weight scales double); gfx950 objects read OCP. */
+#ifndef MOE_AITER_H
+#define MOE_AITER_H 6144
+#endif
+#define MOE_AITER_KB (MOE_AITER_H / 128)
+#if defined(__gfx950__)
+#define MOE_AITER_FP8_MAX 448.0f
+#define MOE_AITER_W_SCALE 1.0f
+#else
+#define MOE_AITER_FP8_MAX 240.0f
+#define MOE_AITER_W_SCALE 2.0f
+#endif
+
 template <unsigned N, unsigned K, bool GU>
 __device__ void pack_weight(uint4* out, const unsigned long long* wt) {
     constexpr unsigned vectors = N * K / 16;
@@ -24,13 +39,14 @@ __device__ void pack_weight(uint4* out, const unsigned long long* wt) {
 extern "C" __global__ void pack_moe(uint4* gu, uint4* down, float* gs, float* ds,
                          const unsigned long long* wt, const unsigned long long* st) {
     // Runtime weights already scrub OCP -0. Keep their bytes and double FNUZ scales.
-    pack_weight<512, 6144, true>(gu, wt);
-    pack_weight<6144, 256, false>(down, wt);
-    if (blockIdx.x % 8u == 0 && threadIdx.x < 96u) {
+    pack_weight<512, MOE_AITER_H, true>(gu, wt);
+    pack_weight<MOE_AITER_H, 256, false>(down, wt);
+    if (blockIdx.x % 8u == 0 && threadIdx.x < 2u * MOE_AITER_KB) {
         const unsigned e = blockIdx.x / 8u, j = threadIdx.x;
-        gs[e * 192u + j] = 2.0f * ((const float*)st[e * 3u])[j];
-        gs[e * 192u + 96u + j] = 2.0f * ((const float*)st[e * 3u + 1u])[j];
-        ds[e * 96u + j] = 2.0f * ((const float*)st[e * 3u + 2u])[j];
+        gs[e * 4u * MOE_AITER_KB + j] = MOE_AITER_W_SCALE * ((const float*)st[e * 3u])[j];
+        gs[e * 4u * MOE_AITER_KB + 2u * MOE_AITER_KB + j] =
+            MOE_AITER_W_SCALE * ((const float*)st[e * 3u + 1u])[j];
+        ds[e * 2u * MOE_AITER_KB + j] = MOE_AITER_W_SCALE * ((const float*)st[e * 3u + 2u])[j];
     }
 }
 
@@ -79,20 +95,51 @@ extern "C" __global__ void plow_moe_aiter_prepare(MoePrepareArgs a) {
     const unsigned first = blockIdx.x * blockDim.x + threadIdx.x;
     const unsigned stride = gridDim.x * blockDim.x;
     const unsigned lane = threadIdx.x % 64u;
-    for (unsigned group = first / 64u; group < a.rows * 48u; group += stride / 64u) {
-        const unsigned row = group / 48u, col = group % 48u;
+    for (unsigned group = first / 64u; group < a.rows * MOE_AITER_KB; group += stride / 64u) {
+        const unsigned row = group / MOE_AITER_KB, col = group % MOE_AITER_KB;
         const unsigned pos = group * 128u + lane * 2u;
         const float x0 = bf2f(a.x[pos]), x1 = bf2f(a.x[pos + 1u]);
         const float amax = wave_max(fmaxf(1e-10f, fmaxf(fabsf(x0), fabsf(x1))));
-        const float scale = amax * (1.0f / 240.0f);
+        const float scale = amax * (1.0f / MOE_AITER_FP8_MAX);
         const float inverse = 1.0f / scale;
         a.q[pos / 2u] = (unsigned short)__builtin_amdgcn_cvt_pk_fp8_f32(
             x0 * inverse, x1 * inverse, 0, false);
         if (lane == 0) a.qs[col * a.rows + row] = scale;
     }
     if (!a.keep_out)
-        for (unsigned i = first; i < a.rows * 768u; i += stride)
+        for (unsigned i = first; i < a.rows * (MOE_AITER_H / 8u); i += stride)
             a.out[i] = make_uint4(0, 0, 0, 0);
+#if defined(__gfx950__)
+    /* gfx950 decode tiles are 16/32 rows and the AITER kernel pays full weight traffic for an
+     * all-pad block, so the 64-row align groups are compacted: expert e keeps
+     * ceil(count/block_m) blocks, back to back. Every workgroup rebuilds the block prefix. */
+    __shared__ unsigned start[513];
+    for (unsigned e = threadIdx.x; e < a.n_exp; e += blockDim.x)
+        start[e + 1u] = ((unsigned)a.meta[a.n_exp + e] + a.block_m - 1u) / a.block_m;
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        start[0] = 0;
+        for (unsigned e = 0; e < a.n_exp; e++) start[e + 1u] += start[e];
+    }
+    __syncthreads();
+    const unsigned blocks = start[a.n_exp], padded = blocks * a.block_m;
+    for (unsigned i = first; i < padded; i += stride) {
+        const unsigned b = i / a.block_m;
+        unsigned lo = 0, hi = a.n_exp;
+        while (lo < hi) {
+            const unsigned mid = (lo + hi) / 2u;
+            if (start[mid + 1u] <= b) lo = mid + 1u;
+            else hi = mid;
+        }
+        const unsigned r = (b - start[lo]) * a.block_m + i % a.block_m;
+        const bool live = r < (unsigned)a.meta[a.n_exp + lo];
+        const unsigned li = (unsigned)a.meta[lo] + r;
+        const unsigned token = live ? a.row_token[li] : a.rows, part = live ? a.row_part[li] : 0u;
+        a.ids[i] = live ? token | ((part % a.topk) << 24) : a.rows;
+        a.weights[i] = live ? a.row_weight[li] : 0.0f;
+        if (i % a.block_m == 0u) a.experts[b] = lo;
+    }
+#else
     const unsigned padded = a.meta[3u * a.n_exp] * 64u;
     const unsigned blocks = padded / a.block_m;
     for (unsigned i = first; i < padded; i += stride) {
@@ -115,6 +162,7 @@ extern "C" __global__ void plow_moe_aiter_prepare(MoePrepareArgs a) {
         }
         a.experts[i] = lo;
     }
+#endif
     if (first == 0) {
         a.valid[0] = padded;
         a.valid[1] = a.rows;
@@ -125,7 +173,7 @@ extern "C" __global__ void plow_moe_aiter_prepare(MoePrepareArgs a) {
 extern "C" __global__ void plow_moe_aiter_store(float* out, const unsigned short* src,
                                                  unsigned rows) {
 #if defined(__HIP_DEVICE_COMPILE__)
-    for (unsigned i = blockIdx.x * blockDim.x + threadIdx.x; i < rows * 768u;
+    for (unsigned i = blockIdx.x * blockDim.x + threadIdx.x; i < rows * (MOE_AITER_H / 8u);
          i += blockDim.x * gridDim.x) {
         const bf16v8 v = ((const bf16v8*)src)[i];
         ((float4*)out)[i * 2u] = make_float4(bf2f(v[0]), bf2f(v[1]), bf2f(v[2]), bf2f(v[3]));
@@ -175,13 +223,14 @@ extern "C" __global__ void plow_moe_aiter_flat_pack(MoeFlatPackArgs a) {
     }
     __syncthreads();
     if (!active) return;
-    pack_weight<512, 6144, true>(a.gu, a.wt);
-    pack_weight<6144, 256, false>(a.down, a.wt);
-    if (blockIdx.x % 8u == 0 && threadIdx.x < 96u) {
+    pack_weight<512, MOE_AITER_H, true>(a.gu, a.wt);
+    pack_weight<MOE_AITER_H, 256, false>(a.down, a.wt);
+    if (blockIdx.x % 8u == 0 && threadIdx.x < 2u * MOE_AITER_KB) {
         const unsigned j = threadIdx.x;
-        a.gs[e * 192u + j] = 2.0f * ((const float*)a.st[e * 3u])[j];
-        a.gs[e * 192u + 96u + j] = 2.0f * ((const float*)a.st[e * 3u + 1u])[j];
-        a.ds[e * 96u + j] = 2.0f * ((const float*)a.st[e * 3u + 2u])[j];
+        a.gs[e * 4u * MOE_AITER_KB + j] = MOE_AITER_W_SCALE * ((const float*)a.st[e * 3u])[j];
+        a.gs[e * 4u * MOE_AITER_KB + 2u * MOE_AITER_KB + j] =
+            MOE_AITER_W_SCALE * ((const float*)a.st[e * 3u + 1u])[j];
+        a.ds[e * 2u * MOE_AITER_KB + j] = MOE_AITER_W_SCALE * ((const float*)a.st[e * 3u + 2u])[j];
     }
 }
 

@@ -1039,44 +1039,17 @@ impl MoeAiter {
                 &bytemuck::bytes_of(&prepare)[..self.prepare_args as usize],
             )?;
         }
-        let mut args = [0u64; 56];
-        for (i, value) in [
-            out,
-            q,
-            gu,
-            valid,
-            down,
-            qs,
-            gs,
-            ds,
-            0,
-            ids,
-            weights,
-            experts,
-            6144,
-            256,
-            u64::from(route.rows),
-            // eprt_cnt / topk: ordinary scalars in AITER's 448-byte block, so 257/9 needs no
-            // other object — and is the shape its own gfx942 GLM-5 tuning table is indexed by.
-            u64::from(self.n_exp),
-            6144,
-            6144,
-            256,
-            12288,
-            512 * 6144,
-            256 * 6144,
-            192 * 4,
-            96 * 4,
-            256 * 4,
-            u64::from(route.topk()),
+        // eprt_cnt / topk: ordinary scalars in AITER's 448-byte block, so 257/9 needs no
+        // other object — and is the shape its own gfx942 GLM-5 tuning table is indexed by.
+        let args = sorted_moe_args(
+            [out, q, gu, valid, down, qs, gs, ds, ids, weights, experts],
+            GFX942_SHAPE,
+            route.rows,
+            self.n_exp,
+            route.topk(),
             304,
             1,
-        ]
-        .into_iter()
-        .enumerate()
-        {
-            args[i * 2] = value;
-        }
+        );
         if stages & STAGE_MOE != 0 {
             be.launch(
                 tile64.unwrap_or(self.moe),
@@ -1100,6 +1073,169 @@ impl MoeAiter {
 }
 
 #[allow(clippy::too_many_arguments)]
+/// Per-rank MoE shape the AITER 448-byte argument block is filled from.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct AiterShape {
+    /// Model width (`dim`): 6144 GLM-5.2, 4096 GLM-5.3-Flash.
+    h: u64,
+    /// Per-rank expert intermediate (`inter_dim`).
+    inter: u64,
+}
+
+const GFX942_SHAPE: AiterShape = AiterShape {
+    h: 6144,
+    inter: 256,
+};
+#[cfg_attr(not(test), allow(dead_code))]
+const GFX950_FLASH_SHAPE: AiterShape = AiterShape {
+    h: 4096,
+    inter: 256,
+};
+
+/// `buffers` = out, x (fp8), gate/up, num_valid, down, x scales, gate/up scales, down scales,
+/// sorted ids, sorted weights, sorted expert ids. `total_tgs` / `ps_deno` as AITER's
+/// `FMoeKernel::launch_kernel` fills them.
+fn sorted_moe_args(
+    buffers: [u64; 11],
+    shape: AiterShape,
+    rows: u32,
+    n_exp: u32,
+    topk: u32,
+    total_tgs: u32,
+    ps_deno: u32,
+) -> [u64; 56] {
+    let [out, q, gu, valid, down, qs, gs, ds, ids, weights, experts] = buffers;
+    let AiterShape { h, inter } = shape;
+    let mut args = [0u64; 56];
+    for (i, value) in [
+        out,
+        q,
+        gu,
+        valid,
+        down,
+        qs,
+        gs,
+        ds,
+        0,
+        ids,
+        weights,
+        experts,
+        h,
+        inter,
+        u64::from(rows),
+        u64::from(n_exp),
+        h,
+        h,
+        inter,
+        2 * h,
+        2 * inter * h,
+        inter * h,
+        (2 * inter / 128) * (h / 128) * 4,
+        (h / 128) * (inter / 128) * 4,
+        inter * 4,
+        u64::from(topk),
+        u64::from(total_tgs),
+        u64::from(ps_deno),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        args[i * 2] = value;
+    }
+    args
+}
+
+/// One gfx950 AITER `fmoe_bf16_blockscaleFp8_g1u1` tile (vLLM ROCm nightly-rocm100 image,
+/// `aiter_meta/hsa/gfx950/fmoe/silu`, copied by `scripts/build_moe_aiter.sh --gfx950`). Fields
+/// are that directory's `fmoe_bf16_blockscaleFp8_g1u1_silu.csv` row.
+#[cfg_attr(not(test), allow(dead_code))]
+#[derive(Clone, Copy, Debug)]
+pub(super) struct Gfx950Tile {
+    pub object: &'static str,
+    pub symbol: &'static str,
+    pub hash: &'static str,
+    pub block_m: u32,
+    /// `tg_num_perCU` of a persistent (`ps`) object; 0 for a (subGU, blocks) grid.
+    pub tg_per_cu: u32,
+    pub sub_gu: u32,
+    /// Largest token count this tile is selected for (inclusive).
+    pub max_rows: u32,
+}
+
+/// Per-row-bucket choice at GLM-5.3-Flash TP8 (H4096 I256, E289 top9 shared fold, 256 CUs),
+/// kernel-only on MI350X with block_m-compacted sorting:
+/// T8 49 us, T32 102, T128 181, T512 203, T1024 232, T2048 280, T8192 728.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(super) const GFX950_TILES: [Gfx950Tile; 5] = [
+    Gfx950Tile {
+        object: "fmoe_bf16_blockscaleFp8_g1u1_vs_silu_1tg_pf2_16x128.co",
+        symbol: "_ZN5aiter47fmoe_bf16_blockscaleFp8_g1u1_vs_pf2_silu_16x128E",
+        hash: "07df0af964cf26dde7635b6f524fd84701a15100f5b88fc9366599e20edeea31",
+        block_m: 16,
+        tg_per_cu: 0,
+        sub_gu: 128,
+        max_rows: 16,
+    },
+    Gfx950Tile {
+        object: "fmoe_bf16_blockscaleFp8_g1u1_vs_silu_1tg_ps_32x256.co",
+        symbol: "_ZN5aiter50fmoe_bf16_blockscaleFp8_g1u1_vs_silu_1tg_ps_32x256E",
+        hash: "6a583441c6bb139c6af20c5198614b7b02b74fdba370580a5a5bbe164bd7bb34",
+        block_m: 32,
+        tg_per_cu: 1,
+        sub_gu: 256,
+        max_rows: 64,
+    },
+    Gfx950Tile {
+        object: "fmoe_bf16_blockscaleFp8_g1u1_vs_silu_1tg_ps_32x128.co",
+        symbol: "_ZN5aiter47fmoe_bf16_blockscaleFp8_g1u1_vs_ps_silu_32x128E",
+        hash: "2b2c1852d84d47f4a03ad5814087be4b4b21e0acd9ee0efdd3f7792a6afe509a",
+        block_m: 32,
+        tg_per_cu: 2,
+        sub_gu: 128,
+        max_rows: 512,
+    },
+    Gfx950Tile {
+        object: "fmoe_bf16_blockscaleFp8_g1u1_vs_silu_1tg_ps_32x256.co",
+        symbol: "_ZN5aiter50fmoe_bf16_blockscaleFp8_g1u1_vs_silu_1tg_ps_32x256E",
+        hash: "6a583441c6bb139c6af20c5198614b7b02b74fdba370580a5a5bbe164bd7bb34",
+        block_m: 32,
+        tg_per_cu: 1,
+        sub_gu: 256,
+        max_rows: 1024,
+    },
+    Gfx950Tile {
+        object: "fmoe_bf16_blockscaleFp8_g1u1_vs_silu_1tg_ps_64x256.co",
+        symbol: "_ZN5aiter46fmoe_bf16_blockscaleFp8_g1u1_vs_ps_silu_64x256E",
+        hash: "e442ee49fd88b5d165b8f8313d790c3ec7a7978140fa2306876612191429e413",
+        block_m: 64,
+        tg_per_cu: 1,
+        sub_gu: 256,
+        max_rows: 8192,
+    },
+];
+
+#[cfg_attr(not(test), allow(dead_code))]
+pub(super) fn gfx950_tile(rows: u32) -> Option<&'static Gfx950Tile> {
+    GFX950_TILES.iter().find(|t| rows <= t.max_rows)
+}
+
+impl Gfx950Tile {
+    /// `[grid_x, grid_y, total_tgs, ps_deno]` for `rows` tokens at `n_exp`/`topk` on `cus`.
+    /// A non-persistent grid is sized by the compacted-block upper bound; the kernel stops at
+    /// num_valid.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub fn launch(&self, inter: u32, rows: u32, n_exp: u32, topk: u32, cus: u32) -> [u32; 4] {
+        let ps_deno = inter.div_ceil(self.sub_gu);
+        if self.tg_per_cu == 0 {
+            let slots = rows * topk;
+            let blocks = slots.min((slots + n_exp * (self.block_m - 1)) / self.block_m);
+            return [ps_deno, blocks, 0, ps_deno];
+        }
+        let tgs = self.tg_per_cu * cus;
+        [tgs, 1, tgs / ps_deno * ps_deno, ps_deno]
+    }
+}
+
 fn flat_moe_args(
     out: u64,
     x: u64,
@@ -1286,6 +1422,71 @@ mod tests {
         std::fs::write(dir.join(TILE64_OBJECT), b"not the pinned object").unwrap();
         assert!(!tile64_available(&dir));
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn sorted_moe_args_keep_the_gfx942_block_and_fill_the_flash_shape() {
+        let b = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11];
+        let scalars = |a: [u64; 56]| (0..28).map(|i| a[i * 2]).collect::<Vec<_>>();
+        let gfx942 = scalars(sorted_moe_args(b, GFX942_SHAPE, 100, 257, 9, 304, 1));
+        assert_eq!(
+            gfx942[12..],
+            [
+                6144,
+                256,
+                100,
+                257,
+                6144,
+                6144,
+                256,
+                12288,
+                512 * 6144,
+                256 * 6144,
+                192 * 4,
+                96 * 4,
+                256 * 4,
+                9,
+                304,
+                1
+            ]
+        );
+        assert_eq!(gfx942[..12], [1, 2, 3, 4, 5, 6, 7, 8, 0, 9, 10, 11]);
+        // The values the gfx950 microbench validated against a CPU reference (relL2 0.024).
+        let flash = scalars(sorted_moe_args(b, GFX950_FLASH_SHAPE, 8, 289, 9, 512, 2));
+        assert_eq!(
+            flash[12..],
+            [
+                4096,
+                256,
+                8,
+                289,
+                4096,
+                4096,
+                256,
+                8192,
+                512 * 4096,
+                256 * 4096,
+                128 * 4,
+                64 * 4,
+                256 * 4,
+                9,
+                512,
+                2
+            ]
+        );
+    }
+
+    #[test]
+    fn gfx950_tiles_cover_the_ladder_with_aiter_grids() {
+        let pick = |rows| gfx950_tile(rows).unwrap();
+        assert_eq!(pick(8).block_m, 16);
+        assert_eq!(pick(32).object, pick(1024).object);
+        assert_eq!(pick(128).tg_per_cu, 2);
+        assert_eq!(pick(8192).block_m, 64);
+        assert!(gfx950_tile(8193).is_none());
+        assert_eq!(pick(8).launch(256, 8, 289, 9, 256), [2, 72, 0, 2]);
+        assert_eq!(pick(128).launch(256, 128, 289, 9, 256), [512, 1, 512, 2]);
+        assert_eq!(pick(8192).launch(256, 8192, 289, 9, 256), [256, 1, 256, 1]);
     }
 
     #[test]
