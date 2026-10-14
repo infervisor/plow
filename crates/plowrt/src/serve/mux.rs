@@ -763,6 +763,18 @@ impl ModelMux {
         self.submit_arrived(job, arrived, None)
     }
 
+    /// `PLOW_SHED_QUEUE_DEPTH`: requests waiting for their first token (queued plus seated in
+    /// prefill) are at the cap, so a new one would only queue into a long TTFT; a load balancer
+    /// can spill it instead. A soft bound: the seated count refreshes once per dispatcher tick.
+    fn shed_queue_depth(&self) -> bool {
+        let cap = crate::config::RuntimeConfig::get().shed_queue_depth;
+        cap > 0 && {
+            let waiting = self.metrics.queued_requests.load(Ordering::Relaxed)
+                + self.metrics.prefill_waiting.load(Ordering::Relaxed);
+            waiting >= u64::from(cap)
+        }
+    }
+
     /// Counts one request against [`Self::queue_cap`]; `false` (nothing counted) when it is full.
     fn reserve_queue(&self) -> bool {
         let queued = &self.metrics.queued_requests;
@@ -784,6 +796,11 @@ impl ModelMux {
     ) -> std::result::Result<(), SubmitError> {
         Metrics::inc(&self.metrics.requests);
         self.metrics.serving.max_tokens.tokens(job.gen.max_tokens);
+        if self.shed_queue_depth() {
+            Metrics::inc(&self.metrics.rejected);
+            Metrics::inc(&self.metrics.shed_queue);
+            return Err(SubmitError::Full(job));
+        }
         if !self.reserve_queue() {
             Metrics::inc(&self.metrics.rejected);
             return Err(if self.tx.is_closed() {
@@ -1287,6 +1304,10 @@ pub fn spawn(
             }
             let live = slots.iter().filter(|s| s.is_some()).count();
             metrics.slots_active.store(live as u64, Ordering::Relaxed);
+            let prefilling = slots.iter().flatten().filter(|s| s.step == 0).count();
+            metrics
+                .prefill_waiting
+                .store(prefilling as u64, Ordering::Relaxed);
             // The budget follows device memory (other models load, grow and leave); memory
             // pressure asks the planner to evict an idle co-tenant so this model can grow.
             #[cfg(feature = "cuda")]
@@ -5794,6 +5815,111 @@ fn pf_itl_budget_ms() -> u32 {
     crate::config::RuntimeConfig::get().pf_itl_budget_ms
 }
 
+#[cfg(feature = "cuda")]
+fn pf_admit_overlap() -> bool {
+    crate::config::RuntimeConfig::get().pf_admit_overlap
+}
+
+/// `PLOW_PF_ADMIT_OVERLAP`: a request whose admission waits for the next launch's host window.
+#[cfg(feature = "cuda")]
+struct WindowAdmit {
+    slot: usize,
+    prompt: Vec<u32>,
+    total: usize,
+    prefix: Option<crate::memory::vmm::PrefixKey>,
+    pin: Option<std::time::Duration>,
+    /// `None` until attempted.
+    outcome: Option<Result<Option<usize>>>,
+}
+
+/// Prefill rows the launch being formed can still take before a fresh request's admission
+/// is worth GPU time: with admitted rows already filling it, admission moves into the launch's
+/// host window instead.
+#[cfg(feature = "cuda")]
+struct AdmitRoom {
+    ready: usize,
+    left: usize,
+}
+
+#[cfg(feature = "cuda")]
+impl AdmitRoom {
+    /// Nothing admitted to launch yet: admitting now is the only way the GPU gets work.
+    fn fits(&self, rows: usize) -> bool {
+        self.ready == 0 || rows <= self.left
+    }
+
+    fn add(&mut self, rows: usize) {
+        self.ready += rows;
+        self.left = self.left.saturating_sub(rows);
+    }
+}
+
+/// Admit `jobs` in order. Inside a launch window (`bounded`) the first always runs and the rest
+/// only while the launch still runs: admission past the device's end delays this tick's tokens.
+#[cfg(feature = "cuda")]
+fn admit_window(e: &mut crate::exec::gpu::GpuEngine, jobs: &mut [WindowAdmit], bounded: bool) {
+    for (n, job) in jobs.iter_mut().enumerate() {
+        if bounded && n > 0 && !e.launch_in_flight() {
+            break;
+        }
+        if let Some(key) = job.prefix.take() {
+            e.stage_prefix_key(job.slot, Some(key));
+        }
+        let admitted = e.admit_packed_slot(job.slot, &job.prompt, job.total);
+        if let (Ok(Some(_)), Some(ttl)) = (&admitted, job.pin) {
+            e.hold_session_prefix(job.slot, ttl);
+        }
+        job.outcome = Some(admitted);
+    }
+}
+
+/// Apply [`admit_window`]'s outcomes to the slot table, as the pre-launch admission would have.
+#[cfg(feature = "cuda")]
+fn apply_window(
+    e: &crate::exec::gpu::GpuEngine,
+    slots: &mut [Option<Slot>],
+    jobs: &mut Vec<WindowAdmit>,
+    arena: &Option<SharedKvState>,
+    tick_fault: &mut Option<crate::DeviceErrorInfo>,
+) {
+    let (mut admitted, mut waiting, mut skipped) = (0usize, 0usize, 0usize);
+    for job in jobs.drain(..) {
+        let i = job.slot;
+        let Some(request) = slots[i].as_mut() else {
+            continue;
+        };
+        match job.outcome {
+            None => {
+                skipped += 1;
+                if request.prefix.is_none() {
+                    request.prefix = job.prefix;
+                }
+            }
+            Some(Ok(Some(frontier))) => {
+                admitted += 1;
+                request.pf_pos = frontier;
+                request.cached_tokens =
+                    (e.attached_rows(i) as usize).max(request.resume.min(frontier));
+            }
+            Some(Ok(None)) => waiting += 1,
+            Some(Err(err)) => {
+                tracing::warn!(
+                    slot = i,
+                    error = %err,
+                    error_code = ?err.device_code(),
+                    fatal = err.is_fatal(),
+                    "gpu: packed KV admission failed"
+                );
+                note_fault(tick_fault, &err);
+                fail_slot(&mut slots[i], arena, err);
+            }
+        }
+    }
+    if packlog::on() {
+        eprintln!("PACKLOG WINDOW admitted={admitted} waiting={waiting} skipped={skipped}");
+    }
+}
+
 /// RTX-12 chunked packing: per-REQUEST cap on the prefill rows one request may
 /// contribute to a single batched launch. `PLOW_PF_CHUNK=C` clamps each waiting
 /// request's slice to `C` rows so the `per_launch` budget (`PLOW_PF_INTERLEAVE`)
@@ -5863,8 +5989,25 @@ fn gpu_prefill_batched_pass(
     let chunk_cap = pf_chunk_rows().min(e.pf_request_max_rows());
     let stage = e.pf_stage_rows();
     let adaptive = crate::serve::policy::adaptive_packing();
+    let overlap = unified && compact && pf_admit_overlap();
+    let probe = if overlap { e.vmm_prefix_probe() } else { None };
+    let mut window: Vec<WindowAdmit> = Vec::new();
     loop {
         let host_t = packlog::on().then(Instant::now);
+        let mut room = overlap.then(|| {
+            let ready: usize = (0..cap.min(slots.len()))
+                .filter_map(|i| {
+                    let (s, pf_pos) = pack_row(slots, i)?;
+                    let n = s.prompt_ids.len();
+                    (e.packed_slot_ready(i) && s.step == 0 && pf_pos + withheld < n)
+                        .then(|| (n - withheld - pf_pos).min(chunk_cap))
+                })
+                .sum();
+            AdmitRoom {
+                ready,
+                left: launch_cap.saturating_sub(decode_rows + ready),
+            }
+        });
         for (i, slot) in slots.iter_mut().enumerate().take(cap) {
             let Some(request) = slot.as_mut().filter(|s| s.step == 0) else {
                 continue;
@@ -5882,6 +6025,33 @@ fn gpu_prefill_batched_pass(
             fit_speech_budget(request, e.max_ctx());
             let total = request.prompt_ids.len() + request.gen.max_tokens.max(1);
             let pair = request.cfg.is_some();
+            let fresh_rows = room
+                .as_ref()
+                .filter(|_| {
+                    !pair
+                        && request.speech.is_none()
+                        && request.resume == 0
+                        && !e.packed_slot_ready(i)
+                })
+                .map(|_| {
+                    let cached = probe.as_ref().map_or(0, |p| {
+                        p.cached_rows_keyed(&request.prompt_ids, request.prefix.as_ref())
+                    });
+                    request.prompt_ids.len().saturating_sub(cached as usize)
+                });
+            if let (Some(room), Some(rows)) = (room.as_ref(), fresh_rows) {
+                if !room.fits(rows) {
+                    window.push(WindowAdmit {
+                        slot: i,
+                        prompt: request.prompt_ids.clone(),
+                        total,
+                        prefix: request.prefix.take(),
+                        pin: request.session.as_ref().and_then(|s| s.pin_ttl()),
+                        outcome: None,
+                    });
+                    continue;
+                }
+            }
             let admitted = (|| -> Result<()> {
                 for row in [i, i + 1].into_iter().take(1 + pair as usize) {
                     let fresh = !e.packed_slot_ready(row);
@@ -5929,7 +6099,13 @@ fn gpu_prefill_batched_pass(
                 Ok(())
             })();
             match admitted {
-                Ok(_) => {}
+                Ok(_) => {
+                    if let (Some(room), Some(rows)) = (room.as_mut(), fresh_rows) {
+                        if e.packed_slot_ready(i) {
+                            room.add(rows.min(chunk_cap));
+                        }
+                    }
+                }
                 Err(err) => {
                     tracing::warn!(
                         slot = i,
@@ -5991,6 +6167,10 @@ fn gpu_prefill_batched_pass(
             })
             .collect();
         if candidates.is_empty() {
+            if !window.is_empty() {
+                admit_window(e, &mut window, false);
+                apply_window(e, slots, &mut window, arena, &mut tick_fault);
+            }
             return tick_fault;
         }
         let avail: usize = candidates.iter().map(|c| c.span.n_rows as usize).sum();
@@ -6104,6 +6284,10 @@ fn gpu_prefill_batched_pass(
             })
             .collect();
         if pack.is_empty() {
+            if !window.is_empty() {
+                admit_window(e, &mut window, false);
+                apply_window(e, slots, &mut window, arena, &mut tick_fault);
+            }
             return tick_fault;
         }
         if let Some(t) = host_t {
@@ -6151,7 +6335,17 @@ fn gpu_prefill_batched_pass(
                 })
             });
             let requests: smallvec::SmallVec<[_; 16]> = decode.chain(prefill).collect();
-            let result = if e.dev_sample_enabled() {
+            let result = if !window.is_empty() {
+                let sampled = e.dev_sample_enabled();
+                *dev_sampled = sampled;
+                let spec = |slot: u32| slots.get(slot as usize)?.as_ref().and_then(dev_row_spec);
+                let spec: Option<&dyn Fn(u32) -> Option<crate::exec::gpu::DevSample>> =
+                    sampled.then_some(&spec);
+                let jobs = &mut window;
+                e.token_batch_step_window(&requests, unified_output, spec, &mut |e| {
+                    admit_window(e, jobs, true)
+                })
+            } else if e.dev_sample_enabled() {
                 // Stochastic rows draw on the device: a host draw downloads the row's 512 KiB of
                 // logits and walks the vocabulary once per row, serially, inside the tick.
                 *dev_sampled = true;
@@ -6218,6 +6412,13 @@ fn gpu_prefill_batched_pass(
                     Ok(())
                 })
         };
+        if !window.is_empty() {
+            // A launch without a host window (the decode rows left it) admits them now.
+            if window.iter().all(|job| job.outcome.is_none()) && !unified {
+                admit_window(e, &mut window, false);
+            }
+            apply_window(e, slots, &mut window, arena, &mut tick_fault);
+        }
         if res.is_ok() {
             let ms = t_launch.elapsed().as_secs_f64() * 1e3;
             ride.observe_launch(ride_key, riders, ms);

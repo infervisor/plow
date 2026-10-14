@@ -353,19 +353,29 @@ impl PackedTerminal {
 
     /// Read the launched terminal's ids back (after anything else enqueued behind it) and wait.
     fn read(&mut self, e: &GpuEngine, i: usize) -> Result<()> {
+        self.enqueue_read(e, i)?;
+        self.wait_read(e, i)
+    }
+
+    fn enqueue_read(&mut self, e: &GpuEngine, i: usize) -> Result<()> {
         let output_bytes = self.host_rows[i].len() * 4;
-        let read = (|| {
-            // SAFETY: the pinned slab lives on self past the synchronize below.
-            unsafe {
-                e.be.memcpy_dtoh_async(
-                    &mut self.host_ids.as_mut_slice()[..output_bytes],
-                    e.devp[e.t_ids].base,
-                    &e.stream,
-                )?;
-            }
-            e.be.stream_synchronize(&e.stream)
-        })();
+        // SAFETY: the pinned slab lives on self past the synchronize in `wait_read`.
+        let read = unsafe {
+            e.be.memcpy_dtoh_async(
+                &mut self.host_ids.as_mut_slice()[..output_bytes],
+                e.devp[e.t_ids].base,
+                &e.stream,
+            )
+        };
         if let Err(error) = read {
+            let _ = e.be.stream_synchronize(&e.stream);
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    fn wait_read(&mut self, e: &GpuEngine, i: usize) -> Result<()> {
+        if let Err(error) = e.be.stream_synchronize(&e.stream) {
             let _ = e.be.stream_synchronize(&e.stream);
             return Err(error);
         }
@@ -381,38 +391,39 @@ impl PackedTerminal {
         Ok(())
     }
 
-    pub(super) fn run_rows(&mut self, e: &GpuEngine, rows: &[u32], live: usize) -> Result<&[u32]> {
-        let i = self.stage_rows(rows);
-        if rows.is_empty() {
-            // An enqueue-only body still needs retirement when S=0.
-            e.be.stream_synchronize(&e.stream)?;
-            return Ok(self.ids(0));
-        }
-        self.run(e, live, i)?;
-        Ok(self.ids(rows.len()))
-    }
-
-    /// [`Self::run_rows`] with `plow_sample` drawing each row's token from its logits row on
-    /// the device (`specs[r]` for sample row r) before the ids are read.
-    pub(super) fn run_rows_sampled(
+    /// Enqueue the terminal for `rows` (and the device sampler with `specs`) and the ids'
+    /// read-back, leaving the stream unsynchronized; [`Self::finish_rows`] waits and returns the
+    /// ids. Split so a launch window can run host work in between.
+    pub(super) fn begin_rows(
         &mut self,
         e: &mut GpuEngine,
         rows: &[u32],
         live: usize,
-        specs: &[DevSample],
-    ) -> Result<&[u32]> {
+        specs: Option<&[DevSample]>,
+    ) -> Result<usize> {
         let i = self.stage_rows(rows);
         if rows.is_empty() {
+            return Ok(i);
+        }
+        self.launch(e, live, i)?;
+        if let Some(specs) = specs {
+            if let Err(error) = e.launch_sampler_rows(specs) {
+                let _ = e.be.stream_synchronize(&e.stream);
+                return Err(error);
+            }
+        }
+        self.enqueue_read(e, i)?;
+        Ok(i)
+    }
+
+    pub(super) fn finish_rows(&mut self, e: &GpuEngine, i: usize) -> Result<&[u32]> {
+        if self.host_rows[i].is_empty() {
+            // An enqueue-only body still needs retirement when S=0.
             e.be.stream_synchronize(&e.stream)?;
             return Ok(self.ids(0));
         }
-        self.launch(e, live, i)?;
-        if let Err(error) = e.launch_sampler_rows(specs) {
-            let _ = e.be.stream_synchronize(&e.stream);
-            return Err(error);
-        }
-        self.read(e, i)?;
-        Ok(self.ids(rows.len()))
+        self.wait_read(e, i)?;
+        Ok(self.ids(self.host_rows[i].len()))
     }
 }
 

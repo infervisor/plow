@@ -2584,6 +2584,14 @@ pub struct GpuEngine {
     seq_tokens: Vec<Vec<u32>>,
     /// A prompt's prefix-cache key staged for the next attach of that slot (DP router hashes).
     staged_prefix: Vec<Option<crate::memory::vmm::PrefixKey>>,
+    /// A launch's host window is open ([`Self::token_batch_step_window`]): snapshot restores skip
+    /// their stream drain and their holds wait in `deferred_attach` for the step's own drain.
+    window_open: bool,
+    deferred_attach: Vec<usize>,
+    /// Recorded after a windowed launch's id read-back: [`Self::launch_in_flight`].
+    window_event: Option<CudaEvent>,
+    /// `PLOW_PF_PACKLOG` device span of a token-batch launch.
+    step_events: Option<(CudaEvent, CudaEvent)>,
     /// Stop-token set (the checkpoint's `eos_token_id`). `Arc` so the mux can
     /// take a per-tick handle without cloning the Vec while the engine stays
     /// mutably borrowed.
@@ -6727,6 +6735,10 @@ impl GpuEngine {
             kv_pressure_events: 0,
             seq_tokens: vec![Vec::new(); batch],
             staged_prefix: vec![None; batch],
+            window_open: false,
+            deferred_attach: Vec::new(),
+            window_event: None,
+            step_events: None,
             stop_ids: std::sync::Arc::new(stop_ids),
             logits_raw: Vec::new(),
             stage,
@@ -7455,8 +7467,21 @@ impl GpuEngine {
                 Ok(Some(frontier))
             }
             Err(error) => {
+                // A restore deferred inside a launch window may still be copying into this slot:
+                // drain it (and release its hold) before the slot's mappings go.
+                if self.deferred_attach.contains(&b) {
+                    if let Err(drain) = self.flush_deferred_attach() {
+                        return Err(drain);
+                    }
+                }
                 self.retire_slot(b, false);
                 let oom = matches!(error, RuntimeError::Oom(_)) || error.device_code() == Some(2);
+                if oom {
+                    // Parked live rings (`PLOW_VMM_RING_PARK`) hold device memory no request owns.
+                    if let Some(rings) = self.vmm.as_mut().and_then(|v| v.rings.as_mut()) {
+                        rings.release_parked();
+                    }
+                }
                 // Slot-granular KV waits even with no other request live: memory comes back
                 // from other models (retired slots, evictions), not only from this one.
                 let slot_kv = self.vmm.as_ref().is_some_and(|v| v.kv.is_none());

@@ -319,6 +319,9 @@ pub struct VmmRings {
     spare: Vec<(u64, u64)>,
     spare_cap: u64,
     recycle: bool,
+    /// [`Self::enable_bounded_park`]: `spare_cap` holds on every release, not only once no slot
+    /// is mapped.
+    bounded: bool,
     /// Released slots whose units stay mapped in place (recycling): readmitting the slot costs no
     /// driver call, and another slot takes them over only when no spare unit is left.
     parked: Vec<bool>,
@@ -371,6 +374,7 @@ impl VmmRings {
             spare: Vec::new(),
             spare_cap: 0,
             recycle: false,
+            bounded: false,
             parked: vec![false; batch],
         };
         for t in tensors {
@@ -457,6 +461,14 @@ impl VmmRings {
     pub fn enable_handle_recycling(&mut self, idle_cap_bytes: u64) {
         self.recycle = true;
         self.spare_cap = idle_cap_bytes;
+    }
+
+    /// Handle recycling whose kept units (parked slots and spare units) never exceed `cap_bytes`,
+    /// trimmed on every release: readmitting a parked slot costs no driver call, and the memory
+    /// held outside any request stays bounded while slots are live.
+    pub fn enable_bounded_park(&mut self, cap_bytes: u64) {
+        self.enable_handle_recycling(cap_bytes);
+        self.bounded = true;
     }
 
     /// Released units kept for reuse ([`Self::enable_handle_recycling`]), parked ones included.
@@ -600,6 +612,9 @@ impl VmmRings {
                         for &(window, unit) in touched.iter().rev() {
                             self.release_unit(window, unit);
                         }
+                        if self.bounded {
+                            self.trim_spare();
+                        }
                         return Err(e);
                     }
                 }
@@ -633,17 +648,42 @@ impl VmmRings {
         self.prefix = self.prefix.min(slot);
         self.stats.mapped_slots -= 1;
         self.stats.mapped_prefix = self.prefix;
-        if self.stats.mapped_slots == 0 {
+        if self.bounded {
+            self.trim_spare();
+        } else if self.stats.mapped_slots == 0 {
             for parked in 0..self.parked.len() {
                 if self.parked[parked] {
                     self.unpark(parked);
                 }
             }
-            let mut spare = self.spare_bytes();
-            while spare > self.spare_cap {
-                let (bytes, handle) = self.spare.pop().expect("spare over cap");
+            self.trim_spare();
+        }
+    }
+
+    /// [`Self::enable_bounded_park`]: return every parked slot and spare unit to the driver;
+    /// device memory pressure outranks the next admission's saved driver calls.
+    pub fn release_parked(&mut self) {
+        if !self.bounded {
+            return;
+        }
+        let cap = std::mem::replace(&mut self.spare_cap, 0);
+        self.trim_spare();
+        self.spare_cap = cap;
+    }
+
+    /// Return kept units to the driver until they fit `spare_cap`: spare units first, then the
+    /// highest-indexed parked slots (the mux seats the lowest free slot first).
+    fn trim_spare(&mut self) {
+        let mut spare = self.spare_bytes();
+        while spare > self.spare_cap {
+            if let Some((bytes, handle)) = self.spare.pop() {
                 spare -= bytes;
                 self.ops.release(handle);
+            } else if let Some(parked) = self.parked.iter().rposition(|&p| p) {
+                self.unpark(parked);
+                spare = self.spare_bytes();
+            } else {
+                break;
             }
         }
     }

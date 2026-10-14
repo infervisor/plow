@@ -633,13 +633,22 @@ async fn chat_completions_with(
         ingress,
     ) {
         return match err {
-            crate::serve::mux::SubmitError::Full(_) => crate::serve::api_error(
-                axum::http::StatusCode::TOO_MANY_REQUESTS,
-                "model request queue full",
-                "rate_limit_error",
-                Some("server_overloaded"),
-                None,
-            ),
+            crate::serve::mux::SubmitError::Full(_) => {
+                let mut r = crate::serve::api_error(
+                    axum::http::StatusCode::TOO_MANY_REQUESTS,
+                    "model request queue full",
+                    "rate_limit_error",
+                    Some("server_overloaded"),
+                    None,
+                );
+                if crate::config::RuntimeConfig::get().shed_queue_depth > 0 {
+                    r.headers_mut().insert(
+                        axum::http::header::RETRY_AFTER,
+                        axum::http::HeaderValue::from_static("1"),
+                    );
+                }
+                r
+            }
             crate::serve::mux::SubmitError::Closed(_) => crate::serve::api_error(
                 axum::http::StatusCode::SERVICE_UNAVAILABLE,
                 "model dispatcher unavailable",
