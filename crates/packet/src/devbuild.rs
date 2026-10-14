@@ -2868,6 +2868,8 @@ impl Builder {
                 || op.inst.op == DevOp::IndexTpPf as u16
                 || op.inst.op == DevOp::IndexFp8Decode as u16
                 || op.inst.op == DevOp::IndexFp8Prefill as u16
+                || (op.inst.op == DevOp::GemvF32 as u16
+                    && op.inst.i[7] == crate::dev::HC_MIX_RAW_MARK)
                 || op.inst.op == DevOp::GemmLtPf as u16
                 || op.inst.op == DevOp::GemmBlkPf as u16
                 || op.inst.op == DevOp::GemmGroupPf as u16

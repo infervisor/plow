@@ -400,6 +400,12 @@ if [ "$ARCH" = gfx950 ]; then
     -DPLOW_REQUIRED_MARKER=plow_indexer_prefill_append_abi_1 \
     -cuid=plow_indexer_prefill_append_abi_1 \
     -I"$R/amd" -I"$R/common" "$R/amd/indexer_prefill_append.hip"
+  # PLOW_GLM_HC_MIX_RAW: one-row decode mHC mix + pre/norm tail (GemvF32 marked raw).
+  bash "$R/cmake/hipcc_hsaco.sh" hipcc "$BUN" "$ARCH" \
+    "$OUT/hc_mix_decode_gfx950.elf" plow_hc_mix_decode_r1 128 2 \
+    -DPLOW_LEAN_OBJECT=1 -DPLOW_NO_SPILL=1 \
+    -DPLOW_REQUIRED_MARKER=plow_hc_mix_decode_1 \
+    -I"$R/amd" -I"$R/common" "$R/amd/hc_mix_decode.hip"
 fi
 
 # Delete FIRST. A build that fails must leave nothing behind to run.

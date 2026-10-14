@@ -840,7 +840,17 @@ fn emit_glm53_hc_pre(
         (Some(_), None, Some(_)) => (0..rows * 24).collect(),
         _ => b.all(),
     };
+    let hc_raw = rows == 1
+        && fuse_r == Some(0)
+        && tail.is_some()
+        && emit_config::active().glm_hc_mix_raw
+        && emit_config::active().glm_hc_fuse_variant.unwrap_or(0) & 1 != 0
+        && c.hidden == 4096
+        && norm_fold.is_some();
     let cm = b.emit(DevOp::GemvF32, cus, &[dep], |d| {
+        if hc_raw {
+            d.i[7] = packet::dev::HC_MIX_RAW_MARK;
+        }
         d.t[0] = mixes;
         d.t[1] = residual;
         d.t[2] = if ffn { w.ffn_fn } else { w.attn_fn };
@@ -874,6 +884,10 @@ fn emit_glm53_hc_pre(
         }
     });
     if tail.is_some() {
+        // PLOW_GLM_HC_MIX_RAW: the one-row arm (24 workgroups, lean tail) as a raw segment.
+        if hc_raw {
+            b.isolate(cm);
+        }
         return cm;
     }
     b.emit(
