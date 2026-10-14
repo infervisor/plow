@@ -3520,6 +3520,47 @@ mod amd_serve {
             self.advance_packed(members, feeds, output)
         }
 
+        /// `PLOW_AMD_MIXED_RIDE_TRIM`: shorten the last member's pending chunk so `riders` one-row
+        /// decode spans fit the rung the prefill spans already fill; the cut rows become its next
+        /// chunk. A member left under 64 rows is not cut (the riders then step separately).
+        fn trim_pack_for_riders(&mut self, members: &[(usize, &[u32])], riders: u32) -> Result<()> {
+            let pending = |slot: usize| {
+                self.pf
+                    .get(slot)
+                    .and_then(Option::as_ref)
+                    .and_then(|cur| cur.steps.get(cur.next).copied())
+            };
+            let Some(pf_rows) = members
+                .iter()
+                .map(|&(slot, _)| pending(slot).map(|s| s.clen))
+                .sum::<Option<u32>>()
+            else {
+                return Ok(());
+            };
+            let Some(width) = self
+                .packed_prefill_program(pf_rows, u32::MAX, false, None)
+                .and_then(|prog| self.prefill_prog_t(prog))
+            else {
+                return Ok(());
+            };
+            let excess = (pf_rows + riders).saturating_sub(width);
+            let Some(&(slot, _)) = members.last() else {
+                return Ok(());
+            };
+            let Some(step) = pending(slot) else {
+                return Ok(());
+            };
+            if excess == 0 || step.clen < excess + 64 {
+                return Ok(());
+            }
+            let max_bucket = self.prefill_chunk_rows.max(step.clen);
+            let g = &self.ranks;
+            let cur = self.pf[slot].as_mut().expect("pending step checked above");
+            shrink_pending_prefill(cur, step.clen - excess, |a, b| {
+                g.plan_span_at_most(a, b, max_bucket)
+            })
+        }
+
         /// `Ok(true)` iff the decode `feeds` rode the launch.
         fn advance_packed(
             &mut self,
@@ -3527,6 +3568,9 @@ mod amd_serve {
             mut feeds: &[(usize, u32)],
             output: &mut [u32],
         ) -> Result<bool> {
+            if !feeds.is_empty() && crate::config::RuntimeConfig::get().amd.mixed_ride_trim {
+                self.trim_pack_for_riders(members, feeds.len() as u32)?;
+            }
             let terminal = self.packed_terminal();
             let n = feeds.len() + members.len();
             let mut spans = Vec::with_capacity(n);

@@ -458,18 +458,25 @@ rm -f i_prefill.co i_decode.co i_flash.co tk.co \
       kda_decode_wide_gfx950.co kda_decode_wide_gfx950.elf \
       kda_chunk_intra_cached_gfx950.co kda_chunk_intra_cached_gfx950.elf \
       kda_chunk_intra_wave_items_gfx950.co kda_chunk_intra_wave_items_gfx950.elf \
+      kda_chunk_intra_wave_items_spans_gfx950.co kda_chunk_intra_wave_items_spans_gfx950.elf \
       attn_res_f32mix_gfx950.co attn_res_f32mix_gfx950.elf \
       kda_chunk_carry_regstate_gfx950.co kda_chunk_carry_regstate_gfx950.elf \
+      kda_chunk_carry_regstate_spans_gfx950.co kda_chunk_carry_regstate_spans_gfx950.elf \
       kda_chunk_wu_lean_gfx950.co kda_chunk_wu_lean_gfx950.elf \
+      kda_chunk_wu_lean_spans_gfx950.co kda_chunk_wu_lean_spans_gfx950.elf \
       kda_chunk_wu_lean_keys_gfx950.co kda_chunk_wu_lean_keys_gfx950.elf \
+      kda_chunk_wu_lean_keys_spans_gfx950.co kda_chunk_wu_lean_keys_spans_gfx950.elf \
       kda_chunk_carry_regstate_keyfeed_gfx950.co \
       kda_chunk_carry_regstate_keyfeed_gfx950.elf \
+      kda_chunk_carry_regstate_keyfeed_spans_gfx950.co \
+      kda_chunk_carry_regstate_keyfeed_spans_gfx950.elf \
       kda_chunk_key_factor_wu_gfx950.co kda_chunk_key_factor_wu_gfx950.elf \
       kda_chunk_key_factor_carry_gfx950.co kda_chunk_key_factor_carry_gfx950.elf \
       xreduce_attnres_gfx950.co xreduce_attnres_gfx950.elf \
       moe_stage1_mxfp4_gfx950.co moe_stage1_mxfp4_gfx950.elf \
       moe_stage2_mxfp4_gfx950.co moe_stage2_mxfp4_gfx950.elf \
       moe_combine_gfx950.co moe_combine_gfx950.elf \
+      copy_pairs_gfx950.co copy_pairs_gfx950.elf \
       moe_ep_align_gfx950.co moe_ep_align_gfx950.elf \
       moe_ep_stage2_gfx950.co moe_ep_stage2_gfx950.elf \
       moe_ep_combine_gfx950.co moe_ep_combine_gfx950.elf \
@@ -539,7 +546,15 @@ if [ "$ARCH" = gfx950 ] && [ "$need_kda_intra_wave_items" = 1 ]; then
     -DPLOW_KDA_INTRA_HOIST="${PLOW_KDA_INTRA_HOIST:-1}" \
     -DPLOW_KDA_INTRA_SOLVE_ILP="${PLOW_KDA_INTRA_SOLVE_ILP:-1}" \
     "$R/amd/kda_chunk_intra_wave_items.hip"
-  KDA_INTRA_WAVE_ITEMS_ELFS="kda_chunk_intra_wave_items_gfx950.elf"
+  bash "$R/cmake/hipcc_hsaco.sh" hipcc "$BUN" "$ARCH" \
+    "$OUT/kda_chunk_intra_wave_items_spans_gfx950.elf" \
+    plow_kda_chunk_intra_wave_items_spans_gfx950 256 2 \
+    $INC -DPLOW_LEAN_OBJECT=1 -DPLOW_NO_SPILL=1 -DPLOW_NO_SGPR_SPILL=1 \
+    -DPLOW_REQUIRED_MARKER=plow_kda_intra_wave_items_abi_1 \
+    -DPLOW_KDA_INTRA_HOIST="${PLOW_KDA_INTRA_HOIST:-1}" \
+    -DPLOW_KDA_INTRA_SOLVE_ILP="${PLOW_KDA_INTRA_SOLVE_ILP:-1}" \
+    -DPLOW_KDA_SPANS=1 "$R/amd/kda_chunk_intra_wave_items.hip"
+  KDA_INTRA_WAVE_ITEMS_ELFS="kda_chunk_intra_wave_items_gfx950.elf kda_chunk_intra_wave_items_spans_gfx950.elf"
 fi
 
 ATTN_RES_F32MIX_ELFS=""
@@ -592,7 +607,13 @@ if [ "$ARCH" = gfx950 ] && [ "$need_kda_carry_regstate" = 1 ]; then
     $INC -DPLOW_LEAN_OBJECT=1 -DPLOW_NO_SPILL=1 -DPLOW_NO_SGPR_SPILL=1 \
     -DPLOW_REQUIRED_MARKER=plow_kda_carry_regstate_abi_1 $KDA_CARRY_DEFS \
     "$R/amd/kda_chunk_carry_regstate.hip"
-  KDA_CARRY_REGSTATE_ELFS="kda_chunk_carry_regstate_gfx950.elf"
+  bash "$R/cmake/hipcc_hsaco.sh" hipcc "$BUN" "$ARCH" \
+    "$OUT/kda_chunk_carry_regstate_spans_gfx950.elf" \
+    plow_kda_chunk_carry_regstate_spans_gfx950 256 1 \
+    $INC -DPLOW_LEAN_OBJECT=1 -DPLOW_NO_SPILL=1 -DPLOW_NO_SGPR_SPILL=1 \
+    -DPLOW_REQUIRED_MARKER=plow_kda_carry_regstate_abi_1 $KDA_CARRY_DEFS \
+    -DPLOW_KDA_SPANS=1 "$R/amd/kda_chunk_carry_regstate.hip"
+  KDA_CARRY_REGSTATE_ELFS="kda_chunk_carry_regstate_gfx950.elf kda_chunk_carry_regstate_spans_gfx950.elf"
 fi
 
 KDA_WU_LEAN_ELFS=""
@@ -620,7 +641,13 @@ if [ "$ARCH" = gfx950 ] && [ "$need_kda_wu_lean" = 1 ]; then
     $INC -DPLOW_LEAN_OBJECT=1 -DPLOW_NO_SPILL=1 -DPLOW_NO_SGPR_SPILL=1 \
     -DPLOW_REQUIRED_MARKER=plow_kda_wu_lean_abi_1 \
     "$R/amd/kda_chunk_wu_lean.hip"
-  KDA_WU_LEAN_ELFS="kda_chunk_wu_lean_gfx950.elf"
+  bash "$R/cmake/hipcc_hsaco.sh" hipcc "$BUN" "$ARCH" \
+    "$OUT/kda_chunk_wu_lean_spans_gfx950.elf" \
+    plow_kda_chunk_wu_lean_spans_gfx950 256 2 \
+    $INC -DPLOW_LEAN_OBJECT=1 -DPLOW_NO_SPILL=1 -DPLOW_NO_SGPR_SPILL=1 \
+    -DPLOW_REQUIRED_MARKER=plow_kda_wu_lean_abi_1 \
+    -DPLOW_KDA_SPANS=1 "$R/amd/kda_chunk_wu_lean.hip"
+  KDA_WU_LEAN_ELFS="kda_chunk_wu_lean_gfx950.elf kda_chunk_wu_lean_spans_gfx950.elf"
 fi
 
 # DevOp::GemmGroupPf: the grouped prefill projection segment (packet-required only).
@@ -661,12 +688,24 @@ if [ "$ARCH" = gfx950 ] && [ "$need_kda_carry_keyfeed" = 1 ]; then
     -DPLOW_REQUIRED_MARKER=plow_kda_wu_lean_abi_1 \
     "$R/amd/kda_chunk_wu_lean_keys.hip"
   bash "$R/cmake/hipcc_hsaco.sh" hipcc "$BUN" "$ARCH" \
+    "$OUT/kda_chunk_wu_lean_keys_spans_gfx950.elf" \
+    plow_kda_chunk_wu_lean_keys_spans_gfx950 256 2 \
+    $INC -DPLOW_LEAN_OBJECT=1 -DPLOW_NO_SPILL=1 -DPLOW_NO_SGPR_SPILL=1 \
+    -DPLOW_REQUIRED_MARKER=plow_kda_wu_lean_abi_1 \
+    -DPLOW_KDA_SPANS=1 "$R/amd/kda_chunk_wu_lean_keys.hip"
+  bash "$R/cmake/hipcc_hsaco.sh" hipcc "$BUN" "$ARCH" \
     "$OUT/kda_chunk_carry_regstate_keyfeed_gfx950.elf" \
     plow_kda_chunk_carry_regstate_keyfeed_gfx950 256 1 \
     $INC -DPLOW_LEAN_OBJECT=1 -DPLOW_NO_SPILL=1 -DPLOW_NO_SGPR_SPILL=1 \
     -DPLOW_REQUIRED_MARKER=plow_kda_carry_keyfeed_abi_1 $KDA_CARRY_DEFS \
     "$R/amd/kda_chunk_carry_regstate_keyfeed.hip"
-  KDA_CARRY_KEYFEED_ELFS="kda_chunk_wu_lean_keys_gfx950.elf kda_chunk_carry_regstate_keyfeed_gfx950.elf"
+  bash "$R/cmake/hipcc_hsaco.sh" hipcc "$BUN" "$ARCH" \
+    "$OUT/kda_chunk_carry_regstate_keyfeed_spans_gfx950.elf" \
+    plow_kda_chunk_carry_regstate_keyfeed_spans_gfx950 256 1 \
+    $INC -DPLOW_LEAN_OBJECT=1 -DPLOW_NO_SPILL=1 -DPLOW_NO_SGPR_SPILL=1 \
+    -DPLOW_REQUIRED_MARKER=plow_kda_carry_keyfeed_abi_1 $KDA_CARRY_DEFS \
+    -DPLOW_KDA_SPANS=1 "$R/amd/kda_chunk_carry_regstate_keyfeed.hip"
+  KDA_CARRY_KEYFEED_ELFS="kda_chunk_wu_lean_keys_gfx950.elf kda_chunk_carry_regstate_keyfeed_gfx950.elf kda_chunk_wu_lean_keys_spans_gfx950.elf kda_chunk_carry_regstate_keyfeed_spans_gfx950.elf"
 fi
 
 # PLOW_MLA_PF_DENSE=1: the dedicated NoPE MLA flash-prefill object plowrt routes eligible flash
@@ -774,12 +813,18 @@ fi
 
 MOE_COMBINE_ELFS=""
 if [ "$ARCH" = gfx950 ]; then
+  # PLOW_AMD_SNAP_KERNEL: prefix snapshots as one queue-ordered copy dispatch.
+  bash "$R/cmake/hipcc_hsaco.sh" hipcc "$BUN" "$ARCH" \
+    "$OUT/copy_pairs_gfx950.elf" plow_copy_pairs_gfx950 64 4 \
+    $INC -DPLOW_LEAN_OBJECT=1 -DPLOW_NO_SPILL=1 -DPLOW_NO_SGPR_SPILL=1 \
+    -DPLOW_REQUIRED_MARKER=plow_copy_pairs_abi_1 \
+    "$R/amd/copy_pairs.hip"
   bash "$R/cmake/hipcc_hsaco.sh" hipcc "$BUN" "$ARCH" \
     "$OUT/moe_combine_gfx950.elf" plow_moe_combine_fixed_order_gfx950 64 4 \
     $INC -DPLOW_LEAN_OBJECT=1 -DPLOW_NO_SPILL=1 -DPLOW_NO_SGPR_SPILL=1 \
     -DPLOW_REQUIRED_MARKER=plow_moe_combine_fixed_order_abi_1 \
     "$R/bench/amd/lean_moe_combine_ref/kernel.hip"
-  MOE_COMBINE_ELFS="moe_combine_gfx950.elf"
+  MOE_COMBINE_ELFS="moe_combine_gfx950.elf copy_pairs_gfx950.elf"
 fi
 
 # Dedicated block-fp8 grouped-MoE prefill object (GLU / down, W8A16 and W8A8), routed for the
