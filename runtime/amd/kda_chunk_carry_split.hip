@@ -136,57 +136,61 @@ void plow_kda_chunk_carry_split_combine_gfx950(KdaCarrySplitArgs a) {
     a.state[off + c] = s;
 }
 
-/* grid = H * ceil((t - seg_len) / 256): o[t][h][v] += sum_d Qhat[t][h][d] Sst[p][h][v][d], with
- * Sst as its bf16 hi/lo pair (two MFMAs). Wave w owns rows [64w, 64w + 64) of the 256-row tile. */
+/* grid = H * ceil((t - seg_len) / 64): o[t][h][v] += sum_d Qhat[t][h][d] Sst[p][h][v][d], with
+ * Sst as its bf16 hi/lo pair (two MFMAs). One 64-row tile (one segment: boundaries are multiples of
+ * 64) per workgroup; wave w owns columns [32w, 32w + 32). Every load issues before the first MFMA. */
 extern "C" __global__ __launch_bounds__(256)
 void plow_kda_chunk_carry_split_fix_gfx950(KdaCarrySplitArgs a) {
     const unsigned h = blockIdx.x % a.heads, tile = blockIdx.x / a.heads;
     const unsigned lane = threadIdx.x & 63u, wave = threadIdx.x >> 6;
     const unsigned token = lane & 15u, kg = lane >> 4;
-    const unsigned rw = a.seg_len + tile * 256u + wave * 64u;
-    if (rw >= a.t) return;
+    const unsigned row0 = a.seg_len + tile * SBT;
+    if (row0 >= a.t) return;
+    const unsigned p = row0 / a.seg_len;
     const bf16* qh = split_qhat(a);
     const size_t half = split_state_elems(a.heads);
-    bf16x8 af[4][4];
-    unsigned p[4];
+    const bf16* sh = reinterpret_cast<const bf16*>(split_sst(a, p)) +
+                     ((size_t)h * SV + 32u * wave + token) * SD + 8u * kg;
+    bf16x8 bh[2][4], bl[2][4], af[4][4];
+    bf16 old[4][2][4];
 #pragma unroll
-    for (unsigned m = 0; m < 4u; ++m) {
-        const unsigned row = rw + 16u * m + token;
-        const unsigned rc = min(row, a.t - 1u);
-        p[m] = min(rw + 16u * m, a.t - 1u) / a.seg_len;
+    for (unsigned n = 0; n < 2u; ++n)
 #pragma unroll
         for (unsigned kb = 0; kb < 4u; ++kb) {
-            const bf16x8 v = *reinterpret_cast<const bf16x8*>(
-                qh + ((size_t)rc * a.heads + h) * SD + 32u * kb + 8u * kg);
-            af[m][kb] = row < a.t ? v : (bf16x8)((bf16_t)0);
+            bh[n][kb] = *reinterpret_cast<const bf16x8*>(sh + 16u * n * SD + 32u * kb);
+            bl[n][kb] = *reinterpret_cast<const bf16x8*>(sh + half + 16u * n * SD + 32u * kb);
+        }
+#pragma unroll
+    for (unsigned m = 0; m < 4u; ++m) {
+        const unsigned row = min(row0 + 16u * m + token, a.t - 1u);
+#pragma unroll
+        for (unsigned kb = 0; kb < 4u; ++kb)
+            af[m][kb] = *reinterpret_cast<const bf16x8*>(
+                qh + ((size_t)row * a.heads + h) * SD + 32u * kb + 8u * kg);
+#pragma unroll
+        for (unsigned e = 0; e < 4u; ++e) {
+            const unsigned r = min(row0 + 16u * m + 4u * kg + e, a.t - 1u);
+#pragma unroll
+            for (unsigned n = 0; n < 2u; ++n)
+                old[m][n][e] = a.out[((size_t)r * a.heads + h) * SV + 32u * wave + 16u * n + token];
         }
     }
-    for (unsigned n = 0; n < SV / 16u; ++n) {
-        f32x4 acc[4];
 #pragma unroll
-        for (unsigned m = 0; m < 4u; ++m) acc[m] = (f32x4)(0.0f);
-        /* Segment boundaries are multiples of 64 rows, so each 16-row m-tile has one segment. */
+    for (unsigned m = 0; m < 4u; ++m)
 #pragma unroll
-        for (unsigned m = 0; m < 4u; ++m) {
-            const bf16* sh = reinterpret_cast<const bf16*>(split_sst(a, p[m])) +
-                             ((size_t)h * SV + 16u * n + token) * SD + 8u * kg;
+        for (unsigned n = 0; n < 2u; ++n) {
+            f32x4 acc = (f32x4)(0.0f);
 #pragma unroll
             for (unsigned kb = 0; kb < 4u; ++kb) {
-                const bf16x8 bh = *reinterpret_cast<const bf16x8*>(sh + 32u * kb);
-                const bf16x8 bl = *reinterpret_cast<const bf16x8*>(sh + half + 32u * kb);
-                acc[m] = plow_mfma_bf16_16x16(af[m][kb], bh, acc[m]);
-                acc[m] = plow_mfma_bf16_16x16(af[m][kb], bl, acc[m]);
+                acc = plow_mfma_bf16_16x16(af[m][kb], bh[n][kb], acc);
+                acc = plow_mfma_bf16_16x16(af[m][kb], bl[n][kb], acc);
             }
-        }
-#pragma unroll
-        for (unsigned m = 0; m < 4u; ++m)
 #pragma unroll
             for (unsigned e = 0; e < 4u; ++e) {
-                const unsigned row = rw + 16u * m + 4u * kg + e;
-                if (row < a.t) {
-                    bf16* o = a.out + ((size_t)row * a.heads + h) * SV + 16u * n + token;
-                    *o = f2bf(bf2f(*o) + acc[m][e]);
-                }
+                const unsigned row = row0 + 16u * m + 4u * kg + e;
+                if (row < a.t)
+                    a.out[((size_t)row * a.heads + h) * SV + 32u * wave + 16u * n + token] =
+                        f2bf(bf2f(old[m][n][e]) + acc[e]);
             }
-    }
+        }
 }

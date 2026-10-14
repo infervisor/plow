@@ -6535,3 +6535,22 @@ fn rowband_twins_are_the_full_width_declarations_only() {
         .sum();
     assert_eq!(skipped, 800 + 400 + 240);
 }
+
+#[test]
+fn kda_carry_split_plan_keeps_segments_chunk_aligned_and_nonempty() {
+    assert_eq!(kda_carry_split_plan(8192, 0), None);
+    assert_eq!(kda_carry_split_plan(8192, 1), None);
+    assert_eq!(kda_carry_split_plan(2047, 4), None);
+    assert_eq!(kda_carry_split_plan(2048, 8), Some((2, 1024)));
+    assert_eq!(kda_carry_split_plan(8192, 2), Some((2, 4096)));
+    assert_eq!(kda_carry_split_plan(8192, 3), Some((3, 2752)));
+    for t in (2048..20000).step_by(37) {
+        for max in 2..10 {
+            let Some((nseg, seg)) = kda_carry_split_plan(t, max) else {
+                continue;
+            };
+            assert!(seg % 64 == 0 && nseg >= 2 && nseg <= max);
+            assert!((nseg - 1) * seg < t && nseg * seg >= t, "t={t} max={max}");
+        }
+    }
+}

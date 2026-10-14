@@ -14902,6 +14902,14 @@ impl AmdEngine {
         }
     }
 
+    /// AQL packets of one key-fed carry launch over `t` rows (see `launch_kda_carry_split`).
+    fn kda_carry_split_launches(&self, t: u32) -> usize {
+        match (self.k_kda_carry_split, kda_carry_split_plan(t, self.kda_carry_split_max)) {
+            (Some(_), Some(_)) => 3,
+            _ => 1,
+        }
+    }
+
     /// `PLOW_KDA_CARRY_SPLIT`: run a key-fed carry as the split segment/combine/fix launches.
     /// `false` (nothing enqueued) when the split is off or `a.t` is too short to split.
     fn launch_kda_carry_split(&self, a: &KdaChunkCarryKeyfeedArgs) -> Result<bool> {
@@ -14929,7 +14937,7 @@ impl AmdEngine {
             seg_len,
         };
         let bytes = as_bytes(std::slice::from_ref(&s));
-        let tiles = (a.t - seg_len).div_ceil(256);
+        let tiles = (a.t - seg_len).div_ceil(64);
         for (kernel, grid) in [
             (seg_k, kda_carry_regstate_grid(a.heads) * (2 * nseg - 1)),
             (combine_k, a.heads * 64),
@@ -15086,7 +15094,14 @@ impl AmdEngine {
             return 0;
         }
         if active && self.packed_lean_kda_segment(p, seg) {
-            return self.packed_spans.len();
+            return match self.progs[p].prefill_routes.get(seg) {
+                Some(PrefillSegmentRoute::KdaChunkCarryKeyfeed { .. }) => self
+                    .packed_spans
+                    .iter()
+                    .map(|s| self.kda_carry_split_launches(s.n_rows))
+                    .sum(),
+                _ => self.packed_spans.len(),
+            };
         }
         if active {
             return match self.progs[p].prefill_routes.get(seg) {
@@ -15124,6 +15139,9 @@ impl AmdEngine {
             Some(PrefillSegmentRoute::MoeAiter(route)) => route.launches() as usize,
             Some(PrefillSegmentRoute::IndexTp(route)) => route.launches(),
             Some(PrefillSegmentRoute::IndexFp8(route)) => route.launches(),
+            Some(PrefillSegmentRoute::KdaChunkCarryKeyfeed { args, .. }) if args.t >= 512 => {
+                self.kda_carry_split_launches(args.t)
+            }
             Some(PrefillSegmentRoute::MoeEpAlign(_)) if self.k_moe_ep_align.is_some() => 4,
             Some(PrefillSegmentRoute::MoeStage1A4Reuse(_))
                 if self.k_moe_stage1_a4_quant.is_some() && self.k_moe_stage1_a4_reuse.is_some() =>

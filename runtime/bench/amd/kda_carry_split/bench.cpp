@@ -219,7 +219,7 @@ int main(int argc, char** argv) {
         const unsigned nseg = (T + seg - 1) / seg;
         if (nseg < 2) continue;
         SplitArgs a{dout, dstate, dq, dk, dw, du, da, dg, dkh, dkl, scratch, T, H, nseg, seg};
-        const unsigned tiles = (T - seg + 255) / 256;
+        const unsigned tiles = (T - seg + BT - 1) / BT;
         float t1 = 0;
         auto run = [&] {
             void* args[] = {&a};
@@ -232,12 +232,20 @@ int main(int argc, char** argv) {
             void* args[] = {&a};
             launch(k_seg, H * 8 * (2 * nseg - 1), args);
         });
+        const float tc = timeit([&] {
+            void* args[] = {&a};
+            launch(k_combine, H * V / 2, args);
+        });
+        const float tf = timeit([&] {
+            void* args[] = {&a};
+            launch(k_fix, H * tiles, args);
+        });
         char name[64];
         std::snprintf(name, sizeof name, "split_p%u", nseg);
         CHECK(hipMemcpy(dstate, state0.data(), sn * 4, hipMemcpyHostToDevice));
         run();
         CHECK(hipDeviceSynchronize());
-        std::printf("median_us arm=%s seg=%u time=%.1f seg_pass=%.1f speedup=%.3fx\n", name, seg, ms * 1000, t1 * 1000, base / ms);
+        std::printf("median_us arm=%s seg=%u time=%.1f seg_pass=%.1f combine=%.1f fix=%.1f speedup=%.3fx\n", name, seg, ms * 1000, t1 * 1000, tc * 1000, tf * 1000, base / ms);
         report(name, dout, dstate);
     }
     return 0;
