@@ -33,6 +33,8 @@ struct Bucket {
     /// per-row cost, weighted by rows so a one-row launch's jitter does not set it).
     extra: Ewma,
     riders: Ewma,
+    /// Launch ms with or without decode rows: what a riding row waits for.
+    total: Ewma,
     since_explore: u32,
 }
 
@@ -80,6 +82,7 @@ impl RideCost {
     /// One prefill launch of `bucket` rows that carried `decode_rows` riding rows, `ms` long.
     pub fn observe_launch(&mut self, bucket: usize, decode_rows: usize, ms: f64) {
         let b = self.bucket(bucket);
+        b.total.add(ms);
         match (decode_rows, b.pure.0) {
             (0, _) => b.pure.add(ms),
             (d, Some(pure)) => {
@@ -95,6 +98,37 @@ impl RideCost {
         if let Some(i) = self.widths.iter().position(|&w| w >= rows) {
             self.steps[i].1.add(ms);
         }
+    }
+
+    /// The widest rung of `ladder` (ascending) a riding row can wait for under `budget_ms`: the
+    /// widest measured rung within the budget, or the next unmeasured rung above it so the ladder
+    /// is explored upward one rung at a time. `None` until a rung has been measured.
+    pub fn rows_within(&self, budget_ms: f64, ladder: &[usize]) -> Option<usize> {
+        let ms = |rows: usize| {
+            self.buckets
+                .iter()
+                .find(|b| b.rows == rows)
+                .and_then(|b| b.total.0)
+        };
+        // Widest measured rung within the budget, narrowest measured rung over it.
+        let (mut cap, mut over, mut any) = (None, None, false);
+        for (i, &rows) in ladder.iter().enumerate() {
+            if let Some(m) = ms(rows) {
+                any = true;
+                if m <= budget_ms {
+                    cap = Some(i);
+                } else if over.is_none() {
+                    over = Some(i);
+                }
+            }
+        }
+        if !any {
+            return None;
+        }
+        let next = cap.map_or(0, |i| i + 1);
+        let explore =
+            next < ladder.len() && ms(ladder[next]).is_none() && over.is_none_or(|o| o > next);
+        Some(ladder[if explore { next } else { cap.unwrap_or(0) }])
     }
 
     /// Whether `decode_rows` rows should ride the next launch of `bucket` rows.
@@ -152,6 +186,40 @@ mod tests {
             arms.iter().filter(|&&r| !r).count(),
             1,
             "one explored non-ride per window"
+        );
+    }
+
+    #[test]
+    fn the_itl_budget_takes_the_widest_measured_rung_and_explores_one_above() {
+        let ladder = [128, 512, 1024, 2048, 4096, 8192];
+        let mut c = RideCost::default();
+        assert_eq!(c.rows_within(60.0, &ladder), None, "nothing measured yet");
+        c.observe_launch(512, 2, 35.0);
+        assert_eq!(
+            c.rows_within(60.0, &ladder),
+            Some(1024),
+            "1024 unmeasured: try it"
+        );
+        c.observe_launch(1024, 3, 50.0);
+        assert_eq!(
+            c.rows_within(60.0, &ladder),
+            Some(2048),
+            "2048 unmeasured: try it"
+        );
+        c.observe_launch(2048, 1, 64.0);
+        assert_eq!(c.rows_within(60.0, &ladder), Some(1024), "2048 over budget");
+        assert_eq!(
+            c.rows_within(70.0, &ladder),
+            Some(4096),
+            "2048 fits a 70 ms budget"
+        );
+        c.observe_launch(4096, 0, 115.0);
+        c.observe_launch(8192, 0, 220.0);
+        assert_eq!(c.rows_within(70.0, &ladder), Some(2048));
+        assert_eq!(
+            c.rows_within(10.0, &ladder),
+            Some(128),
+            "nothing fits: the narrowest rung"
         );
     }
 

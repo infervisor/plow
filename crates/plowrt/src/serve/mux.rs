@@ -5977,8 +5977,22 @@ fn gpu_prefill_batched_pass(
         // `RideCost` keys both the decision and the launch it observes by the prefill bucket:
         // keyed by the launch's own bucket, a riding launch that spills (4096 + 63 into 4160)
         // records under a bucket the decision never asks about, and the rider cost is never learned.
+        // ITL budget (`PLOW_PF_ITL_BUDGET_MS`): with decode rows riding, the launch takes the
+        // widest rung whose measured launch time fits the budget, so a rider's wait is bounded
+        // and a long prompt runs as several launches. Riders always ride under a budget: a
+        // separate decode step after the launch would add a step to their wait.
+        let itl_cap = if decode_rows > 0 && !feeds.is_empty() {
+            let budget = crate::config::RuntimeConfig::get().pf_itl_budget_ms;
+            (budget > 0)
+                .then(|| ride.rows_within(f64::from(budget), &e.pf_bucket_ladder()))
+                .flatten()
+        } else {
+            None
+        };
+        let launch_cap = itl_cap.map_or(launch_cap, |cap| cap.min(launch_cap));
         let ride_key = e.pf_pack_budget(avail.min(launch_cap));
-        if std::mem::take(&mut ride_open) && !ride.ride(ride_key, feeds.len()) {
+        if std::mem::take(&mut ride_open) && itl_cap.is_none() && !ride.ride(ride_key, feeds.len())
+        {
             unified = false;
             decode_rows = 0;
         }
@@ -6059,11 +6073,12 @@ fn gpu_prefill_batched_pass(
         }
         if let Some(t) = host_t {
             eprintln!(
-                "PACKLOG PACK reqs={} rows={} decode_feeds={} unified={} admit_plan_us={:.0}",
+                "PACKLOG PACK reqs={} rows={} decode_feeds={} unified={} itl_cap={} admit_plan_us={:.0}",
                 pack.len(),
                 pack.iter().map(|p| p.2).sum::<usize>(),
                 feeds.len(),
                 unified,
+                itl_cap.unwrap_or(0),
                 t.elapsed().as_secs_f64() * 1e6
             );
         }

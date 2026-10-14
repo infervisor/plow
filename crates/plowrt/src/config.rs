@@ -582,6 +582,19 @@ pub struct RuntimeConfig {
     )]
     pub pf_chunk: u32,
 
+    /// ITL budget for a prefill launch that carries live decode rows (ms; 0 = off). With decode
+    /// rows riding, the launch takes the widest prefill rung whose measured launch time fits the
+    /// budget; without decode rows the launch width is unchanged. Learned per engine
+    /// (`sched::ride::RideCost`), so it is model- and GPU-agnostic.
+    #[arg(
+        long = "pf-itl-budget-ms",
+        env = "PLOW_PF_ITL_BUDGET_MS",
+        default_value_t = 0,
+        hide = true,
+        global = true
+    )]
+    pub pf_itl_budget_ms: u32,
+
     /// Expert: run prefill chains to completion, skip decode until all prompts are resident.
     /// Trades streaming latency for aggregate tok/s (CUDA 8x127k +7.1%, Veena c128 -3%).
     #[arg(long = "pf-defer-decode", env = "PLOW_PF_DEFER_DECODE", hide = true, default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]

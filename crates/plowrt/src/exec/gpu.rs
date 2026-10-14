@@ -8991,6 +8991,11 @@ impl GpuEngine {
     ///
     /// Still keeps a cold 4.5k-row pack out of the ~45%-padded 8192 bucket:
     /// `[4096, tail]` stays cheaper than a single `[8192]` under the cost model.
+    /// The prefill bucket ladder, ascending rows.
+    pub fn pf_bucket_ladder(&self) -> Vec<usize> {
+        self.prefill.iter().map(|b| b.t as usize).collect()
+    }
+
     pub fn pf_pack_budget(&self, avail: usize) -> usize {
         if self.prefill.is_empty() {
             return 0;
