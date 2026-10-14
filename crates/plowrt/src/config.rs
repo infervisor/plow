@@ -595,9 +595,9 @@ pub struct RuntimeConfig {
     )]
     pub pf_itl_budget_ms: u32,
 
-    /// CUDA VMM prefix snapshots: copy the fp8 ring scales, full-layer scale prefixes and the
-    /// partial full-KV block as one pitched copy per tensor (all KV heads) instead of one copy
-    /// per head. Same bytes; a Gemma-4 26B snapshot drops from ~10^3 copies to ~10^2.
+    /// CUDA VMM prefix snapshots: copy the fp8 ring scales and full-layer scale prefixes as one
+    /// pitched copy per tensor (all KV heads) instead of one copy per head. Same bytes; a
+    /// Gemma-4 26B snapshot drops from ~10^3 copies to ~10^2.
     #[arg(long = "vmm-snap-pitched", env = "PLOW_VMM_SNAP_PITCHED", hide = true, default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
     pub vmm_snap_pitched: bool,
 
@@ -612,6 +612,13 @@ pub struct RuntimeConfig {
         global = true
     )]
     pub vmm_snap_pool: u32,
+
+    /// CUDA VMM prefix cache with live sliding rings: a finished request's ring units stay
+    /// mapped in its slot (or as spares, trimmed to `PLOW_KV_POOL_MIB` once no slot is live)
+    /// instead of `cuMemRelease`, so the next admission skips `cuMemCreate`/map (~6 ms per
+    /// admission on Gemma-4 26B, 200 MiB a slot).
+    #[arg(long = "vmm-ring-recycle", env = "PLOW_VMM_RING_RECYCLE", hide = true, default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
+    pub vmm_ring_recycle: bool,
 
     /// Expert: run prefill chains to completion, skip decode until all prompts are resident.
     /// Trades streaming latency for aggregate tok/s (CUDA 8x127k +7.1%, Veena c128 -3%).
