@@ -595,6 +595,17 @@ The packet from config + index alone (no weights) is 70 MB: 4 prefill buckets + 
   (removes a random ~18 ms stall), decode router tile + split-K 2P + XR_DEC_CUS, deferred-frame flash softmax.
   Gates PASS kl 0.01305; prefill 8k 272 -> 245 ms; serving +3-9% at c32/c128. Per-segment geometry sweep: no
   gain (the interpreter object's 148 KB LDS union + 256 VGPR cap every op at 1 WG x 8 waves/CU).
+- 11:05 UTC (10-14), v16c (dc4a3ed4; packet 99e135e3; plowrt 1204dbf5): the routed MoE runs vLLM's own AITER
+  gfx950 asm kernels (fmoe_bf16_blockscaleFp8_g1u1_vs_silu_1tg_{pf2_16x128,ps_32x128,ps_32x256,ps_64x256}, imported
+  from the vLLM ROCm image with the user's approval, sha256-pinned; tile per token count from AITER's tuned
+  GLM-5.3-Flash gfx950 table) behind a plow adapter: router table sorted into compact 16/32-row blocks (all-padding
+  blocks cost full weight traffic: T8 112 -> 49 us/layer) while other workgroups quantize the input; shared expert as
+  expert 288; decode output written straight into the TP reduce buffer. Rung 1 keeps plow's single-row MoE on a
+  row-major weight copy (AITER at T=1 is 26.8 us/layer); experts 35.6 -> 71.1 GiB/rank. Per layer T8/T32/T128
+  49/102/181 us (native 75/151/247). Distinct-prompt r1/B8/B32/B128 11.83/25.49/27.94/39.60 -> 11.84/19.99/22.96/
+  32.79 ms; prefill 8k 196.9 -> 174.2 ms. Gates PASS kl 0.02167 (AITER atomics: 0.018/0.022/0.026 over three
+  runs), needles 36/36, split 18/18, prefix 49152 hit tokens. Strict TP8 reports 19 cells MATCHED/EQUIVALENT:
+  0.44-0.75x vLLM (isl4096 c8 0.55 -> 0.67, isl16384 c32 0.66 -> 0.75). No qualified win. Recipe -> v16c.
 - 07:10 UTC (10-14), v15b = v15a + serve `PLOW_AMD_PACKED_SEG_MAJOR=1` (packed prefill chunks enqueue every segment
   and drain once instead of a host drain per segment). Screen vs v15a: c128 +4.2% (1k) / +6.5% (4k), c32 +0.8 / +4.6%.
   Gates PASS kl 0.01995, needles 36/36, split 18/18, prefix 49152 hit tokens (6/8 cached == cold, cache-off 5/8).
@@ -765,7 +776,7 @@ The packet from config + index alone (no weights) is 70 MB: 4 prefill buckets + 
 
 Strict `campaign.py report` output per input length and the combined comparison.csv:
 [docs/bringup/results/glm53flash-mi350x-2026-10-12](../bringup/results/glm53flash-mi350x-2026-10-12/summary.md).
-No qualified win: plow total throughput 0.37-0.66x vLLM (v15b; v15a 0.36-0.66x, v13 0.34-0.61x, v11 0.28-0.61x).
+No qualified win: plow total throughput 0.44-0.75x vLLM (v16c; v15b 0.37-0.66x, v15a 0.36-0.66x, v13 0.34-0.61x, v11 0.28-0.61x).
 
 ## 6. Roofline (CPU, before any plow GPU time)
 

@@ -1,8 +1,9 @@
 # GLM-5.3-Flash on 8x MI350X (gfx950), TP8: plowrt vs vLLM
 
 Final recipe: [`recipes/infervisor/glm-5.3-flash/gfx950-mi350x-tp8-fp8.toml`](../../../../recipes/infervisor/glm-5.3-flash/gfx950-mi350x-tp8-fp8.toml)
-(status `validated`; v15b = v15a objects + `PLOW_AMD_PACKED_SEG_MAJOR=1` serve env: plow_git 42c4efc2, plowrt afd1509d…, packet sha256 0abfd016…, max-ctx 65536, prefix
-cache on, packed multi-prompt prefill with decode rows riding it). v15a adds dedicated decode W8A8 MoE kernels, the
+(status `validated`; v16c: plow_git dc4a3ed4, plowrt 1204dbf5…, packet sha256 99e135e3…, max-ctx 65536, prefix
+cache on, packed multi-prompt prefill with decode rows riding it). v16c routes the MoE (decode rungs 8-128 and
+prefill) through vLLM's own AITER gfx950 asm kernels behind a plow adapter, at the same W8A8 precision. v15 added dedicated decode W8A8 MoE kernels, the
 KDA prefill rework, the dedicated MoE prefill kernels actually running (v13/v14 fell back to the interpreter) and
 the fused MoE combine with the shared expert folded in as an expert, on top of v13, which added dedicated kernels outside the
 interpreter (MLA flash prefill, block-FP8 grouped MoE prefill, batched KDA decode, grouped KDA prefill GEMM),
@@ -12,8 +13,8 @@ the MoE (W8A8 block FP8 with 1x128 activation groups, prefill and decode). Campa
 
 Baseline: vLLM 0.31.1rc1 ROCm (Docker `vllm/vllm-openai-rocm:nightly-rocm100`), TP8, AITER on,
 prefix caching off, same box, same client (`scripts/bench/llm_grid.sh`, greedy, OSL 128, two
-repeats). Strict reports: `campaign.py report`, every cell MATCHED and EQUIVALENT, run on the v15b serve config
-(v15a build 42c4efc2 + `PLOW_AMD_PACKED_SEG_MAJOR=1`; v15a reports were 0.36-0.66x).
+repeats). Strict reports: `campaign.py report`, every cell MATCHED and EQUIVALENT, run on the v16c build
+(dc4a3ed4; v15b reports were 0.37-0.66x).
 
 Known algorithm difference: vLLM runs sparse MLA attention (DSA indexer, top-2048 tokens,
 `ROCM_AITER_MLA_SPARSE`); plowrt runs dense MLA (`PLOW_GLM_DSA=0`). plowrt's DSA path matches vLLM's
@@ -21,16 +22,16 @@ selection and passes the FP32 gate (kl 0.0129) but has no prefix-cache hits or p
 
 ## Qualified wins
 
-None. plowrt's total throughput is 0.37-0.66x vLLM's ([comparison.csv](comparison.csv), 19 cells
-over isl 1024/4096/16384 at c1..c128 and 32768/61440 at c1/c8; v13 0.34-0.61x, v11 0.28-0.61x):
+None. plowrt's total throughput is 0.44-0.75x vLLM's ([comparison.csv](comparison.csv), 19 cells
+over isl 1024/4096/16384 at c1..c128 and 32768/61440 at c1/c8; v15b 0.37-0.66x, v13 0.34-0.61x, v11 0.28-0.61x):
 
 | isl | c1 | c8 | c32 | c64 | c128 |
 |---|---|---|---|---|---|
-| 1024 | 0.61 | 0.47 | 0.43 | 0.37 | 0.43 |
-| 4096 | 0.62 | 0.55 | 0.53 | 0.50 | 0.57 |
-| 16384 | 0.64 | 0.58 | 0.66 | 0.59 | 0.58 |
-| 32768 | 0.64 | 0.61 | | | |
-| 61440 | 0.63 | 0.56 | | | |
+| 1024 | 0.60 | 0.58 | 0.51 | 0.44 | 0.50 |
+| 4096 | 0.62 | 0.67 | 0.62 | 0.57 | 0.65 |
+| 16384 | 0.66 | 0.69 | 0.75 | 0.66 | 0.65 |
+| 32768 | 0.66 | 0.70 | | | |
+| 61440 | 0.65 | 0.62 | | | |
 
 Decode MoE in W8A16 instead of W8A8 (screen, isl 1024/4096): equal at c1/c128, +4-6% at c32.
 
@@ -44,23 +45,22 @@ MATCHED/EQUIVALENT; no qualified win: 0.44-0.76x. FP32 gate on DP2xTP4: PASS, kl
 ## Accuracy
 
 FP32-reference gate (46 cases incl. 18 needles to 15872 tokens, prefix cache on): PASS, plowrt
-kl_mean 0.0200 vs vLLM 0.0368, top1_decisive 0.9934 vs 0.9868 (v13 0.0164; the fused MoE combine adds
-bf16-atomic reordering).
+kl_mean 0.0217 vs vLLM 0.0368, top1_decisive 0.9945 vs 0.9868 (v13 0.0164; the AITER MoE kernel accumulates with
+atomics: three runs measured 0.018 / 0.022 / 0.026, all PASS).
 Long-context needles to 61440 tokens: plowrt 36/36, vLLM 36/36; with 512-row prefill splits 18/18.
-Prefix reuse at c8: 49152 hit tokens; 6/8 cached streams equal cold (cache-off re-sends 5/8: batch shapes
-and MoE combine atomics, not the cache).
+Prefix reuse at c8: 49152 hit tokens.
 
-## Where the time goes (v15a, measured against a vLLM per-kernel profile)
+## Where the time goes (v16c, measured against a vLLM per-kernel profile)
 
-- Prefill 1k/4k/8k/16k/32k: 73/121/196/408/883 ms (v13 87/143/229/475/1019); vLLM 8k ~170 ms.
-  Remaining gap: MoE (AITER's asm kernel 31 ms per 8k vs ~47), KDA carry, dense vs sparse attention.
-- Decode (amd-bench, same prompt in every slot) r1/B8/B32/B128 11.9/24.4/24.8/33.7 ms; vLLM ~6.9 / — / — / ~14-17 ms.
+- Prefill 1k/4k/8k/16k/32k: 66/109/174/365/798 ms (v13 87/143/229/475/1019); vLLM 8k ~170 ms.
+  Remaining gap: dense GEMMs (hipBLASLt 18.5 ms per 8k vs ~38), KDA chunk (22 vs ~34), dense vs sparse attention.
+- Decode (amd-bench, same prompt in every slot) r1/B8/B32/B128 11.9/19.7/22.0/29.9 ms; vLLM ~6.9 / — / — / ~14-17 ms.
   Same-prompt batches understate serve decode (all rows route to the same experts): served c128 steps 42-46 ms.
 - Serving c128: prefill and decode never overlap (prefill 47% / 68% of wall at isl 1k / 4k); each extra span in
   a packed prefill costs ~6.5 ms.
 - c1: op bodies (10 ms) dominate interpreter hops (~1 ms); vLLM runs ~1600 graph-captured kernels at ~4.5 us.
 - Collectives are at the XGMI floor (rank-arrival skew, not transfer, explains the rest).
 
-Raw evidence (outside the repo): `/home/lava/bench/glm53flash/` (grid `plow-v15b`, screen `plow-v15sm`, `fp32ref/gate-v15b`, `needle-v15b`, `prefix-v15b`; v15a grid `plow-v15a`, screens `plow-v15as`, `plow-v14fs`; v13 grid `plow-v13`, screens `plow-v13fs`,
+Raw evidence (outside the repo): `/home/lava/bench/glm53flash/` (grid `plow-v16c`, `fp32ref/gate-v16c`, `needle-v16c`, `prefix-v16c`; v15b grid `plow-v15b`, screen `plow-v15sm`; v15a grid `plow-v15a`, screens `plow-v15as`, `plow-v14fs`; v13 grid `plow-v13`, screens `plow-v13fs`,
 `plow-v13w16s`, `vllm-tp8`, `fp32ref/gate-v13f`, `needle-v13f`, `needle-split-v13f`, `prefix-v13f`,
 `validate-v13f`; earlier versions `plow-v7`..`plow-v12s`).

@@ -13,7 +13,7 @@ name = "glm-5.3-flash"
 label = "gfx950-mi350x-tp8-fp8"
 network = "glm-5.3-flash"
 status = "validated"
-plow_git = "42c4efc2d63be6697bd9dcaecf0b1661ab955b5a"
+plow_git = "dc4a3ed4c91ec4497db6f24f11ef2426d2f0fc3c"
 doc = "docs/amd/glm53-flash-mi350x.md"
 
 # max_ctx 65536: the model's recurrent (KDA) state carries at every length, so long prompts are
@@ -133,9 +133,18 @@ env = { PLOW_DECODE_BATCH = "128", PLOW_GEMV_WALK = "1", PLOW_GEMV_MM = "4", PLO
 # - `PLOW_MOE_FP8_PF_ACC` + `PLOW_GLM_MOE_SHARED_FOLD` + `PLOW_MOE_FP8_PF_PACKED`: fused weighted combine into the
 #   bf16 SP band (pk_add_bf16 atomics, like AITER; run-to-run nondeterministic), shared expert as expert 288 of
 #   289, and the packed serving prefill on the same dedicated segments; 8k -10 ms more. FP32-gated (below).
+# v16 (docs/amd/glm53-flash-mi350x.md §4):
+# - `PLOW_GLM_MOE_AITER` + `PLOW_GLM_MOE_RESIDENT`: the routed MoE (decode rungs 8/32/128 and prefill) runs vLLM's
+#   own AITER gfx950 asm kernels (fmoe_bf16_blockscaleFp8_g1u1_vs_silu_1tg_{pf2_16x128,ps_32x128,ps_32x256,ps_64x256},
+#   tiles from AITER's tuned GLM-5.3-Flash gfx950 table; same W8A8 1x128 precision), shared expert folded in as
+#   expert 288 (289, top-9), behind a plow adapter (table sort + input quant + compact 16/32-row blocks) and a
+#   direct write into the TP reduce buffer. Rung 1 keeps plow's single-row MoE on a row-major copy of the expert
+#   weights (experts 35.6 -> 71.1 GiB/rank). Supersedes `PLOW_MOE_W8A8_DEC` / `PLOW_MOE_FP8_PF_ACC` (not emitted).
+#   AITER accumulates with atomics: B8+ and prefill are run-to-run nondeterministic (FP32-gated below).
+#   Distinct-prompt B8/B32/B128 25.5/28.0/39.6 -> 20.0/23.0/32.8 ms; prefill 8k 196.9 -> 174.2 ms.
 # - `PLOW_GLM_DSA = "0"`: dense attention (vLLM runs sparse
 #   top-2048; plow's DSA serves but has no prefix hits / packed prefill yet).
-env = { PLOW_MLA_PREFILL = "full:128,512,2048,8192", PLOW_MLA_PF_V2 = "1", PLOW_GLM_PF_NS = "2", PLOW_DECODE_BATCH_LADDER = "1,8,32,128", PLOW_GLM_DECODE_GEMM_ROWS = "32", PLOW_GLM_DSA = "0", PLOW_GLM_SEQ_PAR = "1", PLOW_GLM_SEQ_PAR_PROJ = "0", PLOW_GLM_HC_NORM_FOLD = "1", PLOW_GLM_HC_POST_FOLD = "1", PLOW_KDA_DECODE_FUSED_ARM = "1", PLOW_KDA_FB_FOLD = "1", PLOW_GLM_HC_PRE_TAIL = "1", GLM_SHARD_HEAD = "1", PLOW_GLM53_SP_ROUTER = "1", PLOW_GLM_ROUTER_OVERLAP = "2", PLOW_GLM53_SP_KDA_NORM = "1", PLOW_XR_DEC_CUS = "64", PLOW_GLM_DEC_SPLITK = "16", PLOW_GLM_DEC_SPLITK_2P = "1", PLOW_MOE_PF_W8A8 = "1", PLOW_MOE_DEC_W8A8 = "1", PLOW_GLM_HC_FUSE_DEC = "1", PLOW_GLM_KDA_PROJ_GROUP = "1", PLOW_GLM_HC_FUSE_R1 = "1", PLOW_GLM_KDA_QKVG_R1 = "1", PLOW_GLM_HC_FUSE_VARIANT = "3", PLOW_KDA_PF_GROUP_GEMM = "1", PLOW_MOE_FP8_PF_LEAN = "1", PLOW_GLM53_PACKED_LEAN_KDA = "1", PLOW_GLM_HC_MIX_RAW = "1", PLOW_MOE_W8A8_DEC = "1", PLOW_MOE_FP8_PF_ACC = "1", PLOW_GLM_MOE_SHARED_FOLD = "1", PLOW_MOE_FP8_PF_PACKED = "1" }
+env = { PLOW_MLA_PREFILL = "full:128,512,2048,8192", PLOW_MLA_PF_V2 = "1", PLOW_GLM_PF_NS = "2", PLOW_DECODE_BATCH_LADDER = "1,8,32,128", PLOW_GLM_DECODE_GEMM_ROWS = "32", PLOW_GLM_DSA = "0", PLOW_GLM_SEQ_PAR = "1", PLOW_GLM_SEQ_PAR_PROJ = "0", PLOW_GLM_HC_NORM_FOLD = "1", PLOW_GLM_HC_POST_FOLD = "1", PLOW_KDA_DECODE_FUSED_ARM = "1", PLOW_KDA_FB_FOLD = "1", PLOW_GLM_HC_PRE_TAIL = "1", GLM_SHARD_HEAD = "1", PLOW_GLM53_SP_ROUTER = "1", PLOW_GLM_ROUTER_OVERLAP = "2", PLOW_GLM53_SP_KDA_NORM = "1", PLOW_XR_DEC_CUS = "64", PLOW_GLM_DEC_SPLITK = "16", PLOW_GLM_DEC_SPLITK_2P = "1", PLOW_MOE_PF_W8A8 = "1", PLOW_MOE_DEC_W8A8 = "1", PLOW_GLM_HC_FUSE_DEC = "1", PLOW_GLM_KDA_PROJ_GROUP = "1", PLOW_GLM_HC_FUSE_R1 = "1", PLOW_GLM_KDA_QKVG_R1 = "1", PLOW_GLM_HC_FUSE_VARIANT = "3", PLOW_KDA_PF_GROUP_GEMM = "1", PLOW_MOE_FP8_PF_LEAN = "1", PLOW_GLM53_PACKED_LEAN_KDA = "1", PLOW_GLM_HC_MIX_RAW = "1", PLOW_GLM_MOE_SHARED_FOLD = "1", PLOW_MOE_FP8_PF_PACKED = "1", PLOW_GLM_MOE_AITER = "1", PLOW_GLM_MOE_RESIDENT = "1" }
 args = [
   "--emit", "devblob",
   "--arch", "gfx950",
@@ -181,10 +190,10 @@ name = "smoke"
 cmd = "scripts/serve_test/smoke.sh"
 
 # FP32-reference gate (scripts/llm/fp32_ref_gate.py, 46 cases incl. 18 needles to 15872 tokens,
-# served c16, prefix cache on, PF_INTERLEAVE 8192) on packet 0abfd016 with this [serve] env (v15b): PASS,
-# kl_mean 0.01995 (vLLM 0.03677 on the same reference), kl_p99 0.268 (0.549), top1_decisive 0.9934 (0.9868), needles
-# 18/18; needles with PLOW_PF_CHUNK=512 18/18. Prefix reuse at c8 (49152 hit tokens): 6/8 cached streams equal their
-# cold runs (cache-off re-sends 5/8: concurrent batch shapes and the MoE combine atomics, not the cache). 0 cross-GPU collective errors.
+# served c16, prefix cache on, PF_INTERLEAVE 8192) on packet 99e135e3 with this [serve] env (v16c): PASS,
+# kl_mean 0.02167 (vLLM 0.03677 on the same reference), kl_p99 0.276 (0.549), top1_decisive 0.9945 (0.9868), needles
+# 18/18; needles with PLOW_PF_CHUNK=512 18/18. Prefix reuse at c8: 49152 hit tokens. Nondeterministic route: three
+# FP32 runs of the AITER MoE build measured kl_mean 0.018 / 0.022 / 0.026 (all PASS). 0 cross-GPU collective errors.
 [[gates]]
 name = "llm_fp32_ref"
 cmd = "scripts/llm/fp32_ref_gate.py"
@@ -199,11 +208,11 @@ expect = "36/36"
 
 # One serving cell for orientation; the full grid (isl 1024/4096/16384 at c1..c128, 32768/61440 at
 # c1/c8) and the strict comparison against vLLM are docs/bringup/results/glm53flash-mi350x-2026-10-12.
-# No cell beats vLLM on throughput (v15b: 0.37-0.66x; v15a 0.36-0.66x, v13 0.34-0.61x, v11 0.28-0.61x); see docs/amd/glm53-flash-mi350x.md.
+# No cell beats vLLM on throughput (v16c: 0.44-0.75x; v15b 0.37-0.66x, v13 0.34-0.61x, v11 0.28-0.61x); see docs/amd/glm53-flash-mi350x.md.
 [measured]
-tok_s = 77.58
-p50_tpot_ms = 11.96
-p50_ttft_ms = 128.66
+tok_s = 77.83
+p50_tpot_ms = 11.97
+p50_ttft_ms = 119.85
 concurrency = 1
 input_len = 4096
 output_len = 128
@@ -211,10 +220,15 @@ client = "vllm 0.31.1rc1 bench serve (scripts/bench/llm_grid.sh)"
 
 # Reproduction gates at THIS commit, checkpoint and nix lock.
 [artifacts]
-"plowrt" = "afd1509d1aac2467607c02665a76c6580e19b189e2a73fbebbfe3f6574c4b29c"
-"model.pkt" = "0abfd01688ccc52ffea0e4be3fbe3555020788b81e88c28523caac77c3aa4ee5"
-"interp_decode_k3_gq.elf" = "578569b802460eab8be47907caf58002bec4c96c73b7ce9495e5df70fd4ed8a5"
-"lowrung1/interp_decode_k3_gq.elf" = "e6d6c1e6ff583c5a79a7095ae683a6101c46f0910fd71a545388410782d7864c"
-"lowrung8/interp_decode_k3_gq.elf" = "36eccbdd8b0f7b69fb36756977ce8daaf925b7a32de12d26aa48aafda9401b15"
-"interp_prefill_k3_moe_gq.elf" = "7af47472cdb424a6a763193121c6337a3bf895bc62a25ae91f6bf4172649b015"
-"interp_flash_gq.elf" = "b649f1c5559d2303a2cc6964440d23679202d018f3abe996f7bbccffd034c646"
+"plowrt" = "1204dbf5cae06701e41264511637c990ac0715cd466be382b78416ae22e46eb1"
+"model.pkt" = "99e135e36d6dde564a6c4028f0af4e0c2ac36700741b1dac2ba97518ae63139d"
+"interp_decode_k3_gq.elf" = "f9dd942affc1b56a881c6ebc5384ab1c390a980f3083fd9f1895c2de8800d3b3"
+"lowrung1/interp_decode_k3_gq.elf" = "870411f471fa3efbc70b40d4a9fabb64a18d19c5d6059387cab32aca380a020f"
+"lowrung8/interp_decode_k3_gq.elf" = "f71155f18534e5e383d56b32a31dc25a562ace8ba9f70e09c16c7ef8ef2e515b"
+"interp_prefill_k3_moe_gq.elf" = "18e75bea4dbc4ec6d9ce9b0bc358883500359ba6df3b9abffa726fb80358a4ac"
+"interp_flash_gq.elf" = "6702fafa9f2de955fdd6952271ceda0658b3b7803f39c872e15c7f7df92e3da3"
+"fmoe_bf16_blockscaleFp8_g1u1_vs_silu_1tg_pf2_16x128.co" = "07df0af964cf26dde7635b6f524fd84701a15100f5b88fc9366599e20edeea31"
+"fmoe_bf16_blockscaleFp8_g1u1_vs_silu_1tg_ps_32x128.co" = "2b2c1852d84d47f4a03ad5814087be4b4b21e0acd9ee0efdd3f7792a6afe509a"
+"fmoe_bf16_blockscaleFp8_g1u1_vs_silu_1tg_ps_32x256.co" = "6a583441c6bb139c6af20c5198614b7b02b74fdba370580a5a5bbe164bd7bb34"
+"fmoe_bf16_blockscaleFp8_g1u1_vs_silu_1tg_ps_64x256.co" = "e442ee49fd88b5d165b8f8313d790c3ec7a7978140fa2306876612191429e413"
+"moe_aiter_adapter_gfx950.elf" = "14d2a3c8ce0fd2a22881138825805f7ca68f8b13971b4ef90a66efb0c9f2cb07"
