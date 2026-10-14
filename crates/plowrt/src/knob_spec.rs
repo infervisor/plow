@@ -638,6 +638,7 @@ pub const RUNTIME: &[KnobSpec] = &[
     KnobSpec::new("rt.tp_prefill_segment_major", Some("PLOW_TP_PREFILL_SEGMENT_MAJOR"), Layer::Runtime, Domain::Bool, ON, PROMOTED),
     KnobSpec::new("rt.packed_seg_major", Some("PLOW_AMD_PACKED_SEG_MAJOR"), Layer::Runtime, Domain::Bool, OFF, DIAG),
     KnobSpec::new("rt.packed_lean_kda", Some("PLOW_AMD_PACKED_LEAN_KDA"), Layer::Runtime, Domain::Bool, ON, PROMOTED),
+    KnobSpec::new("rt.packed_kda_par", Some("PLOW_AMD_PACKED_KDA_PAR"), Layer::Runtime, Domain::Bool, OFF, OPT_IN),
     KnobSpec::new("rt.packed_lean_kda_batch", Some("PLOW_AMD_PACKED_LEAN_KDA_BATCH"), Layer::Runtime, Domain::Bool, OFF, OPT_IN),
     KnobSpec::new("rt.snap_kernel", Some("PLOW_AMD_SNAP_KERNEL"), Layer::Runtime, Domain::Bool, OFF, OPT_IN),
     KnobSpec::new("rt.packed_snap_batch", Some("PLOW_AMD_PACKED_SNAP_BATCH"), Layer::Runtime, Domain::Bool, ON, PROMOTED),

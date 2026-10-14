@@ -4688,7 +4688,27 @@ fn run_one_tick(
             let mut b2b_failed = false;
             while hold != PfHold::Held {
                 let now = Instant::now();
-                if b2b_pass > 0 {
+                // PLOW_AMD_MIXED_RIDE_TRIM: the first pass also initializes fresh cursors until the
+                // pending rows fill the tick budget, so a trimmed member's tail packs with fresh
+                // prompts instead of running as its own lone launch.
+                let prep_rounds = if b2b_pass > 0 {
+                    1
+                } else if rt.amd.mixed_ride_trim && mixed_pack && b2b {
+                    cap
+                } else {
+                    0
+                };
+                let mut prep_failed = false;
+                for _ in 0..prep_rounds {
+                    if b2b_pass == 0 {
+                        let pending: u32 = (0..cap)
+                            .filter(|&i| slots[i].as_ref().is_some_and(|s| s.step == 0))
+                            .filter_map(|i| e.next_prefill_rows(i))
+                            .sum();
+                        if pending >= full_budget {
+                            break;
+                        }
+                    }
                     let fresh = (0..cap)
                         .filter(|&i| {
                             slots[i].as_ref().is_some_and(|s| {
@@ -4701,18 +4721,21 @@ fn run_one_tick(
                         .min_by_key(|&i| {
                             arrival_key(slots[i].as_ref().expect("filtered above").arrived, now)
                         });
-                    if let Some(i) = fresh {
-                        let prompt = &slots[i].as_ref().expect("filtered above").prompt_ids;
-                        if let Err(err) = e.prepare_prefill_slot(i, prompt, tick_max) {
-                            note_fault(&mut tick_fault, &err);
-                            if let Some(taken) = slots[i].take() {
-                                release_kv(&arena, taken.kv);
-                                let _ = taken.respond.try_send(StreamChunk::Err(err));
-                            }
-                            e.release(i);
-                            break;
+                    let Some(i) = fresh else { break };
+                    let prompt = &slots[i].as_ref().expect("filtered above").prompt_ids;
+                    if let Err(err) = e.prepare_prefill_slot(i, prompt, tick_max) {
+                        note_fault(&mut tick_fault, &err);
+                        if let Some(taken) = slots[i].take() {
+                            release_kv(&arena, taken.kv);
+                            let _ = taken.respond.try_send(StreamChunk::Err(err));
                         }
+                        e.release(i);
+                        prep_failed = true;
+                        break;
                     }
+                }
+                if prep_failed {
+                    break;
                 }
                 let mut candidates: Vec<crate::sched::step::Candidate> = (0..cap)
                     .filter_map(|i| {

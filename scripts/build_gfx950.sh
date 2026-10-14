@@ -1431,11 +1431,12 @@ if [ "${PLOW_PACKED_PREFILL_CONSUMERS:-$PK_DEFAULT}" = 1 ]; then
   PK_NORM="-DPLOW_BUCKET_DECODE=0 -DPLOW_MLA_PREFILL=1 -DPLOW_BUCKET_PACKED_MLA_NORM=1 -DPLOW_PACKED_PREFILL_MLA_NORM_CONSUMERS=1"
   PK_FLASH="-DPLOW_BUCKET_DECODE=0 -DPLOW_BUCKET_FLASH -DPLOW_WG_WAVES=4 -DFA_DC=256 -DFA_DBUF=1 -DPLOW_MLA_PF_V2_ARM=1 $NOPE_FLASH $FLASH_TR16 -DPLOW_PACKED_PREFILL_MLA_FLASH_CONSUMERS=1"
   PK_KDA="-DPLOW_BUCKET_DECODE=0 -DPLOW_K3=1 -DPLOW_BUCKET_PACKED_KDA=1 -DPLOW_PACKED_PREFILL_KDA_CONSUMERS=1"
-  for fam in norm flash kda; do
+  for fam in norm flash kda kdapar; do
     case $fam in
       norm) AX="$PK_NORM"; S=interp_packed_mla_norm ;;
       flash) AX="$PK_FLASH"; S=interp_packed_mla_flash ;;
       kda) AX="$PK_KDA"; S=interp_packed_kda ;;
+      kdapar) AX="$PK_KDA -DPLOW_PACKED_KDA_PAR=1"; S=interp_packed_kda_par ;;
     esac
     genco "$AX" "i_pk_$fam.co"
     unbundle "i_pk_$fam.co" "$S.elf"
