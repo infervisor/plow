@@ -19,6 +19,9 @@
 #ifndef PLOW_KDA_CARRY_KTR16
 #define PLOW_KDA_CARRY_KTR16 0
 #endif
+#ifndef PLOW_KDA_CARRY_XCD
+#define PLOW_KDA_CARRY_XCD 0
+#endif
 
 /* Register-resident BT64 chunk carry, gfx950, dense chunks, D = V = 128, q pre-scaled.
  *
@@ -239,7 +242,15 @@ __device__ void d_kda_chunk_carry_bt64_regstate(
     bf16* const khi = vsm + 16u * VST + wave * 2u * KTILE;
     bf16* const klo = khi + KTILE;
     const size_t n_items = (size_t)H * (V / 16u);
-    for (size_t item = slice; item < n_items; item += nblk) {
+    /* PLOW_KDA_CARRY_XCD: with one workgroup per item and workgroups dealt round-robin over the
+     * eight XCDs, put a head's eight V16 tiles on one XCD so they share its L2 copy of the
+     * head's per-chunk W, q, Aqk and key factors. Item -> workgroup map only. */
+    size_t item0 = slice;
+#if PLOW_KDA_CARRY_XCD
+    if (nblk == n_items && n_items % 64u == 0u)
+        item0 = (size_t)(slice % 8u) * (n_items / 8u) + slice / 8u;
+#endif
+    for (size_t item = item0; item < n_items; item += nblk) {
         const unsigned h = (unsigned)(item / (V / 16u));
         const unsigned v0 = (unsigned)(item % (V / 16u)) * 16u;
         float* srow = state + ((size_t)h * V + v0 + token) * D + 32u * wave + 4u * kg;

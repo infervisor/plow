@@ -91,6 +91,14 @@ for k in PLOW_KDA_CARRY_PIPE PLOW_KDA_CARRY_KTR16; do
     *) echo "$k must be 0 or 1" >&2; exit 2 ;;
   esac
 done
+# PLOW_KDA_CARRY_XCD (default 1 in the keyfeed carry; =0 rolls back): a head's eight V16 state
+# tiles go to workgroups on one XCD so they share its L2 copy of the head's chunk factors (item ->
+# workgroup map only; bit-identical). Keyfeed carry at H=8: 413 -> 376 us per 8k chunk.
+case "${PLOW_KDA_CARRY_XCD:-1}" in
+  0) KDA_CARRY_DEFS="$KDA_CARRY_DEFS -DPLOW_KDA_CARRY_XCD=0" ;;
+  1) ;;
+  *) echo "PLOW_KDA_CARRY_XCD must be 0 or 1" >&2; exit 2 ;;
+esac
 case "${PLOW_MLA_SPARSE:-0}" in
   0) ;;
   1) [ "${PLOW_MLA_PF_TR16:-0}" = 1 ] || { echo "PLOW_MLA_SPARSE=1 requires PLOW_MLA_PF_TR16=1" >&2; exit 2; }
