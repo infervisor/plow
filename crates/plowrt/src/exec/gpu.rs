@@ -1908,8 +1908,10 @@ struct SegPf {
     f_flash: KernelFn,
     glu_quant_cached: Option<KernelFn>,
     glu_quant_cached_q: Option<KernelFn>,
+    glu_quant_any_width: bool,
     quant_cached: Option<KernelFn>,
     norm_rms_pf: Option<KernelFn>,
+    rope_pf: Option<KernelFn>,
     smem_flash: u32,
     grid_flash: u32,
     f_gemm: KernelFn,
@@ -9415,11 +9417,11 @@ impl GpuEngine {
                 let masked = plow_asset::packed_prefill::MASKED_PADDING_CAPABILITY;
                 let masked_padding = be.module_global_u32(&m1, masked)? == Some(1)
                     && be.module_global_u32(&m2, masked)? == Some(1);
-                let glu_quant_cached = if be.module_global_u32(
+                let glu_quant_abi = be.module_global_u32(
                     &m1,
                     &format!("plow_glu_quant_cache_abi{seg_global_suffix}"),
-                )? == Some(1)
-                {
+                )?;
+                let glu_quant_cached = if matches!(glu_quant_abi, Some(1 | 2)) {
                     Some(
                         be.get_function(&m1, &format!("plow_glu_quant_cached{seg_global_suffix}"))?,
                     )
@@ -9430,7 +9432,7 @@ impl GpuEngine {
                     && be.module_global_u32(
                         &m1,
                         &format!("plow_glu_quant_cache_q_abi{seg_global_suffix}"),
-                    )? == Some(1)
+                    )? == glu_quant_abi
                 {
                     Some(be.get_function(
                         &m1,
@@ -9455,11 +9457,21 @@ impl GpuEngine {
                 } else {
                     None
                 };
+                let rope_pf = if be
+                    .module_global_u32(&m1, &format!("plow_rope_pf_abi{seg_global_suffix}"))?
+                    == Some(1)
+                {
+                    Some(be.get_function(&m1, &format!("plow_rope_pf{seg_global_suffix}"))?)
+                } else {
+                    None
+                };
                 let mut sp = SegPf {
                     glu_quant_cached,
                     glu_quant_cached_q,
+                    glu_quant_any_width: glu_quant_abi == Some(2),
                     quant_cached,
                     norm_rms_pf,
+                    rope_pf,
                     masked_padding,
                     f_flash: f1,
                     smem_flash: s1,
@@ -9812,7 +9824,10 @@ impl GpuEngine {
             let cached_quant_function = seg_pf.as_ref().and_then(|sp| sp.glu_quant_cached);
             let cached_quant_segments =
                 if cached_quant_function.is_some() && seg_mode && qwen_segments.is_empty() {
-                    cublaslt::prefill_glu_quant_segments(g)
+                    cublaslt::prefill_glu_quant_segments(
+                        g,
+                        seg_pf.as_ref().is_some_and(|sp| sp.glu_quant_any_width),
+                    )
                         .into_iter()
                         .filter(|(seg, _)| packet_role_index(&packet_segment_roles, *seg).is_none())
                         .collect::<Vec<_>>()
@@ -9839,6 +9854,15 @@ impl GpuEngine {
                 } else {
                     Vec::new()
                 };
+            let rope_function = seg_pf.as_ref().and_then(|sp| sp.rope_pf);
+            let rope_segments = if rope_function.is_some() && seg_mode && qwen_segments.is_empty() {
+                cublaslt::prefill_rope_segments(g)
+                    .into_iter()
+                    .filter(|(seg, _)| packet_role_index(&packet_segment_roles, *seg).is_none())
+                    .collect::<Vec<_>>()
+            } else {
+                Vec::new()
+            };
             let light_instructions: Vec<(usize, usize)> = light_segments
                 .iter()
                 .flat_map(|(seg, insts)| insts.iter().map(move |&i| (*seg, i)))
@@ -9847,6 +9871,7 @@ impl GpuEngine {
                         .iter()
                         .chain(&plain_quant_segments)
                         .chain(&norm_rms_segments)
+                        .chain(&rope_segments)
                         .flat_map(|(seg, insts)| insts.iter().map(move |&i| (*seg, i))),
                 )
                 .chain(moe_instructions.iter().copied())
@@ -9855,6 +9880,7 @@ impl GpuEngine {
                 && cached_quant_segments.is_empty()
                 && plain_quant_segments.is_empty()
                 && norm_rms_segments.is_empty()
+                && rope_segments.is_empty()
                 && moe_instructions.is_empty()
                 && attention_gemm_segments.iter().all(Option::is_none)
             {
@@ -10127,6 +10153,23 @@ impl GpuEngine {
                         bucket = g.t,
                         segments = norm_rms_segments.len(),
                         "prefill NormResidual+RmsNorm routes"
+                    );
+                }
+            }
+            if let Some(function) = rope_function {
+                for (seg, insts) in &rope_segments {
+                    if light_routes.len() <= *seg {
+                        light_routes.resize_with(seg + 1, || None);
+                    }
+                    light_routes[*seg] = Some(cublaslt::prefill_rope_route(
+                        be, function, kernarg, g, insts,
+                    ));
+                }
+                if !rope_segments.is_empty() {
+                    tracing::info!(
+                        bucket = g.t,
+                        segments = rope_segments.len(),
+                        "prefill HeadNormRope routes"
                     );
                 }
             }

@@ -4553,26 +4553,39 @@ extern "C" int PLOW_SYM(plow_sm120_launch)(PlowProgram* prog, int grid, cudaStre
 }
 
 #if defined(PLOW_NV_GLU_QUANT_CACHE) && PLOW_NV_GLU_QUANT_CACHE && PLOW_NV_PREFILL && PLOW_NV_SEGMENTS && PLOW_NV_THREADS == 256
-extern "C" __device__ unsigned PLOW_SYM(plow_glu_quant_cache_abi) = 1;
+/* ABI 2: any 8-aligned width <= 16384 (i[1]); ABI 1 objects hardcode width 15360. */
+extern "C" __device__ unsigned PLOW_SYM(plow_glu_quant_cache_abi) = 2;
 extern "C" __global__ void __launch_bounds__(256, 2) PLOW_SYM(plow_glu_quant_cached)(PlowProgram prog,
                                                                                  unsigned inst) {
     __shared__ float part[8];
     const PlowDevInst* in = prog.insts + inst;
     void* const* t = prog.tensors;
-    d_glu_quant_fp8_cached((__nv_bfloat16*)t[in->t[1]], (uint8_t*)t[in->t[0]],
-                            (float*)t[in->t[2]], (const __nv_bfloat16*)t[in->t[3]],
-                            (const __nv_bfloat16*)t[in->t[4]], in->i[0], blockIdx.x, gridDim.x, part);
+    if (in->i[1] == 15360u)
+        d_glu_quant_fp8_cached((__nv_bfloat16*)t[in->t[1]], (uint8_t*)t[in->t[0]],
+                                (float*)t[in->t[2]], (const __nv_bfloat16*)t[in->t[3]],
+                                (const __nv_bfloat16*)t[in->t[4]], in->i[0], blockIdx.x, gridDim.x, part);
+    else
+        d_glu_quant_fp8_cached<true, 0>((__nv_bfloat16*)t[in->t[1]], (uint8_t*)t[in->t[0]],
+                                         (float*)t[in->t[2]], (const __nv_bfloat16*)t[in->t[3]],
+                                         (const __nv_bfloat16*)t[in->t[4]], in->i[0], blockIdx.x,
+                                         gridDim.x, part, in->i[1]);
 }
 /* The same rows without the bf16 GLU store, for an instruction whose output tensor nothing reads. */
-extern "C" __device__ unsigned PLOW_SYM(plow_glu_quant_cache_q_abi) = 1;
+extern "C" __device__ unsigned PLOW_SYM(plow_glu_quant_cache_q_abi) = 2;
 extern "C" __global__ void __launch_bounds__(256, 2) PLOW_SYM(plow_glu_quant_cached_q)(PlowProgram prog,
                                                                                    unsigned inst) {
     __shared__ float part[8];
     const PlowDevInst* in = prog.insts + inst;
     void* const* t = prog.tensors;
-    d_glu_quant_fp8_cached<false>(nullptr, (uint8_t*)t[in->t[0]], (float*)t[in->t[2]],
-                                  (const __nv_bfloat16*)t[in->t[3]], (const __nv_bfloat16*)t[in->t[4]],
-                                  in->i[0], blockIdx.x, gridDim.x, part);
+    if (in->i[1] == 15360u)
+        d_glu_quant_fp8_cached<false>(nullptr, (uint8_t*)t[in->t[0]], (float*)t[in->t[2]],
+                                      (const __nv_bfloat16*)t[in->t[3]], (const __nv_bfloat16*)t[in->t[4]],
+                                      in->i[0], blockIdx.x, gridDim.x, part);
+    else
+        d_glu_quant_fp8_cached<false, 0>(nullptr, (uint8_t*)t[in->t[0]], (float*)t[in->t[2]],
+                                         (const __nv_bfloat16*)t[in->t[3]],
+                                         (const __nv_bfloat16*)t[in->t[4]], in->i[0], blockIdx.x,
+                                         gridDim.x, part, in->i[1]);
 }
 #endif
 #if PLOW_NV_PREFILL && PLOW_NV_SEGMENTS && PLOW_NV_GEMMA && PLOW_NV_THREADS == 256 && !PLOW_NV_GEMM_ONLY && \
@@ -4593,6 +4606,53 @@ extern "C" __global__ void __launch_bounds__(256, 2) PLOW_SYM(plow_quant_cached)
                                  (const __nv_bfloat16*)t[in->t[1]], in->i[0], blockIdx.x, gridDim.x, part);
     else
         __trap();
+}
+#endif
+/* A prefill HeadNormRope / HeadNormRopeFp8 (hd 256/512, half-split rope) as one launch at any
+ * grid: the bodies walk (token, head) items one warp each, {(slice * WARPS + warp) + k * nblk *
+ * WARPS}, and skip masked padding rows the same way, so each item's arithmetic and KV store is
+ * the interpreter's. The fat object runs them on one CTA per SM. */
+#if defined(PLOW_NV_ROPE_PF) && PLOW_NV_ROPE_PF && !PLOW_MIXED_STEP
+extern "C" __device__ unsigned PLOW_SYM(plow_rope_pf_abi) = 1;
+extern "C" __global__ void __launch_bounds__(256) PLOW_SYM(plow_rope_pf)(PlowProgram prog,
+                                                                         unsigned inst) {
+    void* const* t = prog.tensors;
+    const PlowDevInst* in = prog.insts + inst;
+    const unsigned slice = blockIdx.x, nblk = gridDim.x;
+#define RP_TEN(k) (in->t[k] == PLOW_TENSOR_NONE ? nullptr : t[in->t[k]])
+    if (in->i[5] != 0 || in->i[7] != 0) __trap();
+    if (in->op == PLOW_DOP_HEADNORM_ROPE) {
+#define RP_ARGS                                                                                    \
+    (__nv_bfloat16*)RP_TEN(0), (const __nv_bfloat16*)RP_TEN(1), (const __nv_bfloat16*)RP_TEN(2),   \
+        (const float*)RP_TEN(3), (const float*)RP_TEN(4), (const int*)RP_TEN(5), in->i[0],         \
+        in->i[1], in->fj[0].f, in->i[3], in->fj[1].u, in->fj[2].u, in->i[4], slice, nblk,          \
+        in->i[6], (const int*)RP_TEN(6)
+        if (in->i[2] == 256) d_headnorm_rope<256>(RP_ARGS);
+        else if (in->i[2] == 512) d_headnorm_rope<512>(RP_ARGS);
+        else __trap();
+#undef RP_ARGS
+#if PLOW_FP8_KV
+    } else if (in->op == PLOW_DOP_HEADNORM_ROPE_FP8) {
+#if PLOW_NV_PACKED_REQUEST
+#define RP_SLOT , (const int*)RP_TEN(7)
+#else
+#define RP_SLOT
+#endif
+#define RP_ARGS                                                                                    \
+    (uint8_t*)RP_TEN(0), (float*)RP_TEN(6), (const __nv_bfloat16*)RP_TEN(1),                       \
+        (const __nv_bfloat16*)RP_TEN(2), (const float*)RP_TEN(3), (const float*)RP_TEN(4),         \
+        (const int*)RP_TEN(5), in->i[0], in->i[1], in->fj[0].f, in->i[3], in->fj[1].u,             \
+        in->fj[2].u, in->i[4], slice, nblk, in->i[6] RP_SLOT
+        if (in->i[2] == 256) d_headnorm_rope_fp8<256>(RP_ARGS);
+        else if (in->i[2] == 512) d_headnorm_rope_fp8<512>(RP_ARGS);
+        else __trap();
+#undef RP_ARGS
+#undef RP_SLOT
+#endif
+    } else {
+        __trap();
+    }
+#undef RP_TEN
 }
 #endif
 /* A prefill NormResidual and the RmsNorm reading its output (instruction inst + 1) as one launch

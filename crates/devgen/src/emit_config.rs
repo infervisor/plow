@@ -1339,6 +1339,13 @@ pub struct EmitConfig {
     #[arg(long = "emit-moe-pf-lt", env = "PLOW_EMIT_MOE_PF_LT", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
     pub moe_pf_lt: bool,
 
+    /// With `PLOW_EMIT_MOE_PF_LT` on a W8A8 packet: the layer's expert-input norm, router, align
+    /// and activation quant join the `MOE_PREFILL_CUBLASLT` segment (they are ordered after the
+    /// dense MLP's post-norm), so the CUDA route runs them as light launches instead of the
+    /// cooperative interpreter. A runtime without the route runs the segment in the interpreter.
+    #[arg(long = "emit-moe-pf-lt-route", env = "PLOW_EMIT_MOE_PF_LT_ROUTE", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
+    pub moe_pf_lt_route: bool,
+
     /// Isolate each layer's fused expert GLU + DOWN pair on every decode rung that runs the
     /// grouped-MoE arm (`PLOW_GEMMA_MOE_DEC_GROUP`) as a packet-declared library segment, which
     /// the CUDA runtime serves with cuBLASLt grouped matmuls under `PLOW_MOE_DEC_LT`. A runtime
@@ -1743,6 +1750,7 @@ impl EmitConfig {
             prefill_cublaslt: env_bool("PLOW_EMIT_PREFILL_CUBLASLT"),
             fp8_decode_tc64: env_bool("PLOW_FP8_DECODE_TC64"),
             moe_pf_lt: env_bool("PLOW_EMIT_MOE_PF_LT"),
+            moe_pf_lt_route: env_bool("PLOW_EMIT_MOE_PF_LT_ROUTE"),
             moe_dec_lt: env_bool("PLOW_EMIT_MOE_DEC_LT"),
             gemma_gemm_lt: env_bool("PLOW_GEMMA_GEMM_LT"),
             decode_native_tc: env_bool("PLOW_EMIT_DECODE_NATIVE_TC"),
