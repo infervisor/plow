@@ -3,19 +3,19 @@
  "matched": true,
  "equivalent": true,
  "gate": {
-  "path": "/home/lava/bench/glm53flash/fp32ref/gate-v15a/gates.json",
-  "sha256": "03e60307d3ae716080a0d47ee1c02348880bfd7ba242a5f6adaf8e85a16fa561",
+  "path": "/home/lava/bench/glm53flash/fp32ref/gate-v15b/gates.json",
+  "sha256": "a72e1c18daec07c67d5f865a4252721d55da8b58eb090f6a145d1d560bfd680a",
   "packet_sha256": "0abfd01688ccc52ffea0e4be3fbe3555020788b81e88c28523caac77c3aa4ee5",
   "passed": true,
   "why": [],
   "metrics": {
-   "kl_mean": 0.02133457160568108,
+   "kl_mean": 0.01995204148523167,
    "vllm_kl_mean": 0.03677076234614275,
-   "kl_p99": 0.40564021989025995,
+   "kl_p99": 0.2684470554641605,
    "vllm_kl_p99": 0.5493329922983649,
    "top1_decisive": 0.9933920704845814,
    "vllm_top1_decisive": 0.986784140969163,
-   "cont_frac": 0.7634930041628122,
+   "cont_frac": 0.7459400879917185,
    "vllm_cont_frac": 0.7298814617197481,
    "needle_acc": 1.0,
    "vllm_needle_acc": 1.0
@@ -59,7 +59,7 @@
     [
      "Serving stack",
      "vLLM ok    nix dev shell (ROCM_PATH=/nix/store/xbd1f4xn2j6cry6np5wij7caz0ycrykz-rocm-therock-gfx94X-dcgpu-7.14.1 CUDA_PATH=/nix/store/p49i1vrhcaw5nf2r3bwgmwfz5x8zgb14-cuda-merged-12.9)\n0.31.1rc1.dev296+gfe4df3df0.rocm100 (--gpu-memory-utilization 0.90 --max-num-seqs 256 --tensor-parallel-size 8 --trust-remote-code --max-model-len 6272 --max-num-seqs 256 --no-enable-prefix-caching --tool-call-parser glm47 --reasoning-parser glm47)",
-     "Infervisor (plowrt 42c4efc2d63b+dirty, packet 0abfd01688cc)"
+     "Infervisor (plowrt 442940c6f553, packet 0abfd01688cc)"
     ],
     [
      "Output quality / correctness",
@@ -74,31 +74,31 @@
     [
      "Total throughput",
      "4,153 tok/s",
-     "2,545 tok/s (0.61x)"
+     "2,560 tok/s (0.62x)"
     ],
     [
      "Throughput / GPU",
      "519 tok/s/GPU",
-     "318 tok/s/GPU (0.61x)"
+     "320 tok/s/GPU (0.62x)"
     ],
     [
      "TTFT P99",
      "511.6 ms *",
-     "137.4 ms (0.27x)"
+     "136.6 ms (0.27x)"
     ],
     [
      "TPOT P99",
      "6.97 ms",
-     "12.34 ms (1.77x)"
+     "12.04 ms (1.73x)"
     ]
    ],
    "repeats": 2,
    "ratios": {
     "peak_gib": 0.5682598227549818,
-    "total_tok_s": 0.6128307257773163,
-    "total_tok_s_gpu": 0.6128307257773163,
-    "ttft_p99_ms": 0.26852463067063165,
-    "tpot_p99_ms": 1.7713884578485897
+    "total_tok_s": 0.6163925272967964,
+    "total_tok_s_gpu": 0.6163925272967964,
+    "ttft_p99_ms": 0.2669523154303976,
+    "tpot_p99_ms": 1.7292212035027092
    },
    "baseline": {
     "mean": {
@@ -145,10 +145,10 @@
    "infervisor": {
     "mean": {
      "peak_gib": 1213.296875,
-     "total_tok_s": 2545.2260249878527,
-     "total_tok_s_gpu": 318.1532531234816,
-     "ttft_p99_ms": 137.364967110625,
-     "tpot_p99_ms": 12.338390085029445
+     "total_tok_s": 2560.019000506048,
+     "total_tok_s_gpu": 320.002375063256,
+     "ttft_p99_ms": 136.56064226815943,
+     "tpot_p99_ms": 12.044679221876358
     },
     "per_repeat": {
      "peak_gib": [
@@ -156,32 +156,32 @@
       1229.71875
      ],
      "total_tok_s": [
-      2550.1739049322846,
-      2540.2781450434204
+      2555.9917884567562,
+      2564.04621255534
      ],
      "total_tok_s_gpu": [
-      318.7717381165356,
-      317.53476813042755
+      319.49897355709453,
+      320.5057765694175
      ],
      "ttft_p99_ms": [
-      143.05853546247818,
-      131.67139875877183
+      138.26229725091252,
+      134.85898728540633
      ],
      "tpot_p99_ms": [
-      12.139517554071894,
-      12.537262615986998
+      12.120642270122868,
+      11.968716173629849
      ]
     },
     "spread_pct": {
      "peak_gib": 2.7069838121852907,
-     "total_tok_s": 0.38879690022466296,
-     "total_tok_s_gpu": 0.38879690022466296,
-     "ttft_p99_ms": 8.289694922385756,
-     "tpot_p99_ms": 3.2236382475676564
+     "total_tok_s": 0.31462360619165514,
+     "total_tok_s_gpu": 0.31462360619165514,
+     "ttft_p99_ms": 2.492160192702692,
+     "tpot_p99_ms": 1.2613544428570662
     },
     "sources": [
-     "/home/lava/bench/glm53flash/plow-v15a/isl4096/g1.r1",
-     "/home/lava/bench/glm53flash/plow-v15a/isl4096/g1.r2"
+     "/home/lava/bench/glm53flash/plow-v15b/isl4096/g1.r1",
+     "/home/lava/bench/glm53flash/plow-v15b/isl4096/g1.r2"
     ]
    }
   },
@@ -194,9 +194,7 @@
     "Baseline Total throughput 50.3%",
     "Baseline Throughput / GPU 50.3%",
     "Baseline TTFT P99 145.1%",
-    "Infervisor TTFT P99 20.5%",
-    "Baseline TPOT P99 92.4%",
-    "Infervisor TPOT P99 11.7%"
+    "Baseline TPOT P99 92.4%"
    ],
    "rows": [
     [
@@ -227,7 +225,7 @@
     [
      "Serving stack",
      "vLLM ok    nix dev shell (ROCM_PATH=/nix/store/xbd1f4xn2j6cry6np5wij7caz0ycrykz-rocm-therock-gfx94X-dcgpu-7.14.1 CUDA_PATH=/nix/store/p49i1vrhcaw5nf2r3bwgmwfz5x8zgb14-cuda-merged-12.9)\n0.31.1rc1.dev296+gfe4df3df0.rocm100 (--gpu-memory-utilization 0.90 --max-num-seqs 256 --tensor-parallel-size 8 --trust-remote-code --max-model-len 6272 --max-num-seqs 256 --no-enable-prefix-caching --tool-call-parser glm47 --reasoning-parser glm47)",
-     "Infervisor (plowrt 42c4efc2d63b+dirty, packet 0abfd01688cc)"
+     "Infervisor (plowrt 442940c6f553, packet 0abfd01688cc)"
     ],
     [
      "Output quality / correctness",
@@ -242,31 +240,31 @@
     [
      "Total throughput",
      "14,650 tok/s *",
-     "7,676 tok/s (0.52x)"
+     "8,033 tok/s (0.55x)"
     ],
     [
      "Throughput / GPU",
      "1,831 tok/s/GPU *",
-     "959 tok/s/GPU (0.52x)"
+     "1,004 tok/s/GPU (0.55x)"
     ],
     [
      "TTFT P99",
      "2,290.6 ms *",
-     "1,180.7 ms (0.52x) *"
+     "934.2 ms (0.41x)"
     ],
     [
      "TPOT P99",
      "25.48 ms *",
-     "33.55 ms (1.32x) *"
+     "31.81 ms (1.25x)"
     ]
    ],
    "repeats": 2,
    "ratios": {
     "peak_gib": 0.5688129519980774,
-    "total_tok_s": 0.5239428003298306,
-    "total_tok_s_gpu": 0.5239428003298306,
-    "ttft_p99_ms": 0.5154445989634109,
-    "tpot_p99_ms": 1.3167348491977173
+    "total_tok_s": 0.5483086714659784,
+    "total_tok_s_gpu": 0.5483086714659784,
+    "ttft_p99_ms": 0.407836083349695,
+    "tpot_p99_ms": 1.2484031589987092
    },
    "baseline": {
     "mean": {
@@ -313,10 +311,10 @@
    "infervisor": {
     "mean": {
      "peak_gib": 1220.34375,
-     "total_tok_s": 7675.989042416373,
-     "total_tok_s_gpu": 959.4986303020466,
-     "ttft_p99_ms": 1180.654042615788,
-     "tpot_p99_ms": 33.54651619383
+     "total_tok_s": 8032.959611975226,
+     "total_tok_s_gpu": 1004.1199514969032,
+     "ttft_p99_ms": 934.1708526964065,
+     "tpot_p99_ms": 31.80562648227609
     },
     "per_repeat": {
      "peak_gib": [
@@ -324,32 +322,32 @@
       1229.71875
      ],
      "total_tok_s": [
-      7939.126228991786,
-      7412.85185584096
+      8010.5481440180465,
+      8055.371079932405
      ],
      "total_tok_s_gpu": [
-      992.3907786239732,
-      926.60648198012
+      1001.3185180022558,
+      1006.9213849915507
      ],
      "ttft_p99_ms": [
-      1059.7593423287617,
-      1301.5487429028144
+      960.4930518928448,
+      907.8486534999682
      ],
      "tpot_p99_ms": [
-      31.58271959107864,
-      35.51031279658136
+      31.93261380070421,
+      31.678639163847972
      ]
     },
     "spread_pct": {
      "peak_gib": 1.5364523315664131,
-     "total_tok_s": 6.856111573931546,
-     "total_tok_s_gpu": 6.856111573931546,
-     "ttft_p99_ms": 20.479276049261497,
-     "tpot_p99_ms": 11.707901896009988
+     "total_tok_s": 0.5579878161909158,
+     "total_tok_s_gpu": 0.5579878161909158,
+     "ttft_p99_ms": 5.635414361401121,
+     "tpot_p99_ms": 0.7985210949948353
     },
     "sources": [
-     "/home/lava/bench/glm53flash/plow-v15a/isl4096/g8.r1",
-     "/home/lava/bench/glm53flash/plow-v15a/isl4096/g8.r2"
+     "/home/lava/bench/glm53flash/plow-v15b/isl4096/g8.r1",
+     "/home/lava/bench/glm53flash/plow-v15b/isl4096/g8.r2"
     ]
    }
   },
@@ -390,7 +388,7 @@
     [
      "Serving stack",
      "vLLM ok    nix dev shell (ROCM_PATH=/nix/store/xbd1f4xn2j6cry6np5wij7caz0ycrykz-rocm-therock-gfx94X-dcgpu-7.14.1 CUDA_PATH=/nix/store/p49i1vrhcaw5nf2r3bwgmwfz5x8zgb14-cuda-merged-12.9)\n0.31.1rc1.dev296+gfe4df3df0.rocm100 (--gpu-memory-utilization 0.90 --max-num-seqs 256 --tensor-parallel-size 8 --trust-remote-code --max-model-len 6272 --max-num-seqs 256 --no-enable-prefix-caching --tool-call-parser glm47 --reasoning-parser glm47)",
-     "Infervisor (plowrt 42c4efc2d63b+dirty, packet 0abfd01688cc)"
+     "Infervisor (plowrt 442940c6f553, packet 0abfd01688cc)"
     ],
     [
      "Output quality / correctness",
@@ -405,31 +403,31 @@
     [
      "Total throughput",
      "35,287 tok/s",
-     "17,779 tok/s (0.50x)"
+     "18,816 tok/s (0.53x)"
     ],
     [
      "Throughput / GPU",
      "4,411 tok/s/GPU",
-     "2,222 tok/s/GPU (0.50x)"
+     "2,352 tok/s/GPU (0.53x)"
     ],
     [
      "TTFT P99",
      "2,616.3 ms *",
-     "4,067.4 ms (1.55x)"
+     "3,555.7 ms (1.36x)"
     ],
     [
      "TPOT P99",
      "29.09 ms",
-     "57.36 ms (1.97x)"
+     "54.14 ms (1.86x)"
     ]
    ],
    "repeats": 2,
    "ratios": {
     "peak_gib": 0.5696848314913606,
-    "total_tok_s": 0.5038317053395402,
-    "total_tok_s_gpu": 0.5038317053395402,
-    "ttft_p99_ms": 1.5546333535348593,
-    "tpot_p99_ms": 1.9714532327105951
+    "total_tok_s": 0.533229771640544,
+    "total_tok_s_gpu": 0.533229771640544,
+    "ttft_p99_ms": 1.3590433620078501,
+    "tpot_p99_ms": 1.8608866042272656
    },
    "baseline": {
     "mean": {
@@ -476,10 +474,10 @@
    "infervisor": {
     "mean": {
      "peak_gib": 1222.21875,
-     "total_tok_s": 17778.888582050422,
-     "total_tok_s_gpu": 2222.3610727563027,
-     "ttft_p99_ms": 4067.4018667210476,
-     "tpot_p99_ms": 57.355981398654336
+     "total_tok_s": 18816.268603502314,
+     "total_tok_s_gpu": 2352.0335754377893,
+     "ttft_p99_ms": 3555.677932045364,
+     "tpot_p99_ms": 54.139238854940785
     },
     "per_repeat": {
      "peak_gib": [
@@ -487,32 +485,32 @@
       1229.71875
      ],
      "total_tok_s": [
-      17731.529369519674,
-      17826.247794581173
+      18701.73284698936,
+      18930.80436001527
      ],
      "total_tok_s_gpu": [
-      2216.4411711899593,
-      2228.2809743226467
+      2337.71660587367,
+      2366.350545001909
      ],
      "ttft_p99_ms": [
-      4020.2372991887387,
-      4114.566434253356
+      3622.149288089712,
+      3489.2065760010155
      ],
      "tpot_p99_ms": [
-      57.428248954880026,
-      57.28371384242865
+      54.275306977613965,
+      54.0031707322676
      ]
     },
     "spread_pct": {
      "peak_gib": 1.2272762138528803,
-     "total_tok_s": 0.532757852800354,
-     "total_tok_s_gpu": 0.532757852800354,
-     "ttft_p99_ms": 2.31914962316378,
-     "tpot_p99_ms": 0.2519965815714736
+     "total_tok_s": 1.2174120058175333,
+     "total_tok_s_gpu": 1.2174120058175333,
+     "ttft_p99_ms": 3.7388850910977443,
+     "tpot_p99_ms": 0.5026599026918747
     },
     "sources": [
-     "/home/lava/bench/glm53flash/plow-v15a/isl4096/g32.r1",
-     "/home/lava/bench/glm53flash/plow-v15a/isl4096/g32.r2"
+     "/home/lava/bench/glm53flash/plow-v15b/isl4096/g32.r1",
+     "/home/lava/bench/glm53flash/plow-v15b/isl4096/g32.r2"
     ]
    }
   },
@@ -551,7 +549,7 @@
     [
      "Serving stack",
      "vLLM ok    nix dev shell (ROCM_PATH=/nix/store/xbd1f4xn2j6cry6np5wij7caz0ycrykz-rocm-therock-gfx94X-dcgpu-7.14.1 CUDA_PATH=/nix/store/p49i1vrhcaw5nf2r3bwgmwfz5x8zgb14-cuda-merged-12.9)\n0.31.1rc1.dev296+gfe4df3df0.rocm100 (--gpu-memory-utilization 0.90 --max-num-seqs 256 --tensor-parallel-size 8 --trust-remote-code --max-model-len 6272 --max-num-seqs 256 --no-enable-prefix-caching --tool-call-parser glm47 --reasoning-parser glm47)",
-     "Infervisor (plowrt 42c4efc2d63b+dirty, packet 0abfd01688cc)"
+     "Infervisor (plowrt 442940c6f553, packet 0abfd01688cc)"
     ],
     [
      "Output quality / correctness",
@@ -566,31 +564,31 @@
     [
      "Total throughput",
      "43,108 tok/s",
-     "20,415 tok/s (0.47x)"
+     "21,678 tok/s (0.50x)"
     ],
     [
      "Throughput / GPU",
      "5,389 tok/s/GPU",
-     "2,552 tok/s/GPU (0.47x)"
+     "2,710 tok/s/GPU (0.50x)"
     ],
     [
      "TTFT P99",
      "4,662.2 ms",
-     "8,428.6 ms (1.81x)"
+     "7,655.1 ms (1.64x)"
     ],
     [
      "TPOT P99",
      "47.99 ms",
-     "98.78 ms (2.06x)"
+     "93.06 ms (1.94x)"
     ]
    ],
    "repeats": 2,
    "ratios": {
     "peak_gib": 0.5708500992298309,
-    "total_tok_s": 0.4735782950524837,
-    "total_tok_s_gpu": 0.4735782950524837,
-    "ttft_p99_ms": 1.807843850546731,
-    "tpot_p99_ms": 2.058530311713482
+    "total_tok_s": 0.502876453452913,
+    "total_tok_s_gpu": 0.502876453452913,
+    "ttft_p99_ms": 1.641942593831973,
+    "tpot_p99_ms": 1.9393459034403515
    },
    "baseline": {
     "mean": {
@@ -637,10 +635,10 @@
    "infervisor": {
     "mean": {
      "peak_gib": 1224.71875,
-     "total_tok_s": 20415.155561669744,
-     "total_tok_s_gpu": 2551.894445208718,
-     "ttft_p99_ms": 8428.613265075546,
-     "tpot_p99_ms": 98.77862651932776
+     "total_tok_s": 21678.149384790202,
+     "total_tok_s_gpu": 2709.7686730987753,
+     "ttft_p99_ms": 7655.140748289414,
+     "tpot_p99_ms": 93.05955982171906
     },
     "per_repeat": {
      "peak_gib": [
@@ -648,32 +646,32 @@
       1229.71875
      ],
      "total_tok_s": [
-      20299.594193379486,
-      20530.71692996
+      21586.33284485843,
+      21769.96592472198
      ],
      "total_tok_s_gpu": [
-      2537.4492741724357,
-      2566.339616245
+      2698.2916056073036,
+      2721.2457405902474
      ],
      "ttft_p99_ms": [
-      8574.52778872801,
-      8282.698741423083
+      7793.748503164388,
+      7516.532993414439
      ],
      "tpot_p99_ms": [
-      99.42014876976297,
-      98.13710426889256
+      93.3477941772343,
+      92.77132546620382
      ]
     },
     "spread_pct": {
      "peak_gib": 0.8165139955602051,
-     "total_tok_s": 1.1321135216547429,
-     "total_tok_s_gpu": 1.1321135216547429,
-     "ttft_p99_ms": 3.4623613413862295,
-     "tpot_p99_ms": 1.2989090313169798
+     "total_tok_s": 0.8470883589001853,
+     "total_tok_s_gpu": 0.8470883589001853,
+     "ttft_p99_ms": 3.6212986653693395,
+     "tpot_p99_ms": 0.6194621080680686
     },
     "sources": [
-     "/home/lava/bench/glm53flash/plow-v15a/isl4096/g64.r1",
-     "/home/lava/bench/glm53flash/plow-v15a/isl4096/g64.r2"
+     "/home/lava/bench/glm53flash/plow-v15b/isl4096/g64.r1",
+     "/home/lava/bench/glm53flash/plow-v15b/isl4096/g64.r2"
     ]
    }
   },
@@ -712,7 +710,7 @@
     [
      "Serving stack",
      "vLLM ok    nix dev shell (ROCM_PATH=/nix/store/xbd1f4xn2j6cry6np5wij7caz0ycrykz-rocm-therock-gfx94X-dcgpu-7.14.1 CUDA_PATH=/nix/store/p49i1vrhcaw5nf2r3bwgmwfz5x8zgb14-cuda-merged-12.9)\n0.31.1rc1.dev296+gfe4df3df0.rocm100 (--gpu-memory-utilization 0.90 --max-num-seqs 256 --tensor-parallel-size 8 --trust-remote-code --max-model-len 6272 --max-num-seqs 256 --no-enable-prefix-caching --tool-call-parser glm47 --reasoning-parser glm47)",
-     "Infervisor (plowrt 42c4efc2d63b+dirty, packet 0abfd01688cc)"
+     "Infervisor (plowrt 442940c6f553, packet 0abfd01688cc)"
     ],
     [
      "Output quality / correctness",
@@ -727,31 +725,31 @@
     [
      "Total throughput",
      "48,305 tok/s",
-     "25,711 tok/s (0.53x)"
+     "27,462 tok/s (0.57x)"
     ],
     [
      "Throughput / GPU",
      "6,038 tok/s/GPU",
-     "3,214 tok/s/GPU (0.53x)"
+     "3,433 tok/s/GPU (0.57x)"
     ],
     [
      "TTFT P99",
      "9,295.6 ms",
-     "16,777.7 ms (1.80x)"
+     "15,280.2 ms (1.64x)"
     ],
     [
      "TPOT P99",
      "84.73 ms",
-     "156.47 ms (1.85x)"
+     "146.58 ms (1.73x)"
     ]
    ],
    "repeats": 2,
    "ratios": {
     "peak_gib": 0.573176460306536,
-    "total_tok_s": 0.5322676522048808,
-    "total_tok_s_gpu": 0.5322676522048808,
-    "ttft_p99_ms": 1.804899078765019,
-    "tpot_p99_ms": 1.8465866881072095
+    "total_tok_s": 0.5685134655890424,
+    "total_tok_s_gpu": 0.5685134655890424,
+    "ttft_p99_ms": 1.6438089667524851,
+    "tpot_p99_ms": 1.7299387977345186
    },
    "baseline": {
     "mean": {
@@ -798,10 +796,10 @@
    "infervisor": {
     "mean": {
      "peak_gib": 1229.71875,
-     "total_tok_s": 25711.097164682342,
-     "total_tok_s_gpu": 3213.8871455852927,
-     "ttft_p99_ms": 16777.65458329057,
-     "tpot_p99_ms": 156.46711423114954
+     "total_tok_s": 27461.94493059994,
+     "total_tok_s_gpu": 3432.7431163249926,
+     "ttft_p99_ms": 15280.222240436706,
+     "tpot_p99_ms": 146.58317057157802
     },
     "per_repeat": {
      "peak_gib": [
@@ -809,32 +807,32 @@
       1229.71875
      ],
      "total_tok_s": [
-      25480.9011348037,
-      25941.293194560985
+      27456.443084421015,
+      27467.446776778866
      ],
      "total_tok_s_gpu": [
-      3185.1126418504623,
-      3242.661649320123
+      3432.055385552627,
+      3433.4308470973583
      ],
      "ttft_p99_ms": [
-      17184.639470058028,
-      16370.66969652311
+      15588.332941729459,
+      14972.111539143953
      ],
      "tpot_p99_ms": [
-      158.7926104222791,
-      154.14161804001998
+      146.84869347196107,
+      146.317647671195
      ]
     },
     "spread_pct": {
      "peak_gib": 0.0,
-     "total_tok_s": 1.7906356030177408,
-     "total_tok_s_gpu": 1.7906356030177408,
-     "ttft_p99_ms": 4.851511094676953,
-     "tpot_p99_ms": 2.9725047369303357
+     "total_tok_s": 0.04006887489454828,
+     "total_tok_s_gpu": 0.04006887489454828,
+     "ttft_p99_ms": 4.0328039271233465,
+     "tpot_p99_ms": 0.3622829269522116
     },
     "sources": [
-     "/home/lava/bench/glm53flash/plow-v15a/isl4096/g128.r1",
-     "/home/lava/bench/glm53flash/plow-v15a/isl4096/g128.r2"
+     "/home/lava/bench/glm53flash/plow-v15b/isl4096/g128.r1",
+     "/home/lava/bench/glm53flash/plow-v15b/isl4096/g128.r2"
     ]
    }
   }
@@ -858,10 +856,10 @@
   }
  },
  "infervisor": {
-  "dir": "/home/lava/bench/glm53flash/plow-v15a/isl4096",
+  "dir": "/home/lava/bench/glm53flash/plow-v15b/isl4096",
   "provenance": {
    "side": "plow",
-   "utc": "2026-10-14T05:36:07Z",
+   "utc": "2026-10-14T06:30:18Z",
    "hf": "/home/lava/models/GLM-5.3-Flash",
    "model_version": "GLM-5.3-Flash (config+weights ea5874f56d39)",
    "precision": "weights fp8 (fmt=e4m3, activation_scheme=dynamic, weight_block_size=[128, 128]); KV cache bfloat16",
@@ -870,12 +868,13 @@
    "repeats": 2,
    "sampled": "",
    "server_args": "",
-   "recorder_commit": "42c4efc2d63b+dirty",
-   "plowrt_git_sha": "42c4efc2d63b+dirty",
+   "recorder_commit": "442940c6f553",
+   "plowrt_git_sha": "442940c6f553",
    "packet_sha256": "0abfd01688ccc52ffea0e4be3fbe3555020788b81e88c28523caac77c3aa4ee5",
    "plowrt_sha256": "afd1509d1aac2467607c02665a76c6580e19b189e2a73fbebbfe3f6574c4b29c",
    "assets": "/home/lava/.claude/jobs/ca91585b/tmp/v15/a/tp8/assets",
    "plow_env": {
+    "PLOW_AMD_PACKED_SEG_MAJOR": "1",
     "PLOW_DECODE_MIN_RUNG": "1",
     "PLOW_MLA_PF_DENSE": "1",
     "PLOW_PF_BACK_TO_BACK": "1",

@@ -595,6 +595,10 @@ The packet from config + index alone (no weights) is 70 MB: 4 prefill buckets + 
   (removes a random ~18 ms stall), decode router tile + split-K 2P + XR_DEC_CUS, deferred-frame flash softmax.
   Gates PASS kl 0.01305; prefill 8k 272 -> 245 ms; serving +3-9% at c32/c128. Per-segment geometry sweep: no
   gain (the interpreter object's 148 KB LDS union + 256 VGPR cap every op at 1 WG x 8 waves/CU).
+- 07:10 UTC (10-14), v15b = v15a + serve `PLOW_AMD_PACKED_SEG_MAJOR=1` (packed prefill chunks enqueue every segment
+  and drain once instead of a host drain per segment). Screen vs v15a: c128 +4.2% (1k) / +6.5% (4k), c32 +0.8 / +4.6%.
+  Gates PASS kl 0.01995, needles 36/36, split 18/18, prefix 49152 hit tokens (6/8 cached == cold, cache-off 5/8).
+  Strict TP8 reports 19 cells MATCHED/EQUIVALENT: 0.37-0.66x vLLM (isl4096 c128 0.53 -> 0.57). Recipe -> v15b.
 - 06:20 UTC (10-14), v15a (42c4efc2; packet 0abfd016; plowrt afd1509d): v14 (decode W8A8 split-N GLU tiles,
   standalone r1 mHC mix) + dedicated decode W8A8 MoE kernels (`PLOW_MOE_W8A8_DEC`, bit-identical; distinct-prompt
   B8/B32/B128 27.6/30.1/40.4 -> 25.5/28.0/39.4 ms) + KDA prefill intra/prepare/gated-norm/carry rework (object
@@ -761,7 +765,7 @@ The packet from config + index alone (no weights) is 70 MB: 4 prefill buckets + 
 
 Strict `campaign.py report` output per input length and the combined comparison.csv:
 [docs/bringup/results/glm53flash-mi350x-2026-10-12](../bringup/results/glm53flash-mi350x-2026-10-12/summary.md).
-No qualified win: plow total throughput 0.36-0.66x vLLM (v15a; v13 0.34-0.61x, v11 0.28-0.61x).
+No qualified win: plow total throughput 0.37-0.66x vLLM (v15b; v15a 0.36-0.66x, v13 0.34-0.61x, v11 0.28-0.61x).
 
 ## 6. Roofline (CPU, before any plow GPU time)
 

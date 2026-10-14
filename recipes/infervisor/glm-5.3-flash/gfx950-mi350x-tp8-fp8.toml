@@ -169,18 +169,22 @@ args = [
 # Served 2026-10-13 (doc §4), total tok/s v8 -> this: isl1024 c32/c128 2427/2861 -> 3106/5199,
 # isl4096 6303/6330 -> 7661/10218; TTFT p99 c128 45.4 -> 17.1 s (1k), 78.7 -> 46.7 s (4k);
 # TPOT p99 c128 191 -> 213 ms (1k), 217 -> 384 ms (4k).
+# `PLOW_AMD_PACKED_SEG_MAJOR = "1"` (v15b): a packed prefill chunk enqueues every segment on every rank and drains
+# once, as isolated chunks already do, instead of a host drain after each segment (the dedicated MoE/KDA kernels made
+# packed chunks many-segment). Same kernels, same per-rank order. Strict grid vs v15a: isl1024 c128 0.41 -> 0.43,
+# isl4096 c64/c128 0.47/0.53 -> 0.50/0.57; long-context cells unchanged.
 [serve]
-env = { PLOW_STATE_CLEAR_DEVICE = "1", PLOW_TP_AGREE_EVERY = "1", PLOW_DECODE_MIN_RUNG = "1", PLOW_PF_INTERLEAVE = "8192", PLOW_PF_BACK_TO_BACK = "1", PLOW_PREFIX_ARM_END = "1", PLOW_MLA_PF_DENSE = "1", PLOW_XR_TAG_SLOT = "90112" }
+env = { PLOW_STATE_CLEAR_DEVICE = "1", PLOW_TP_AGREE_EVERY = "1", PLOW_DECODE_MIN_RUNG = "1", PLOW_PF_INTERLEAVE = "8192", PLOW_PF_BACK_TO_BACK = "1", PLOW_PREFIX_ARM_END = "1", PLOW_MLA_PF_DENSE = "1", PLOW_XR_TAG_SLOT = "90112", PLOW_AMD_PACKED_SEG_MAJOR = "1" }
 
 [[gates]]
 name = "smoke"
 cmd = "scripts/serve_test/smoke.sh"
 
 # FP32-reference gate (scripts/llm/fp32_ref_gate.py, 46 cases incl. 18 needles to 15872 tokens,
-# served c16, prefix cache on, PF_INTERLEAVE 8192) on packet 0abfd016 (v15a): PASS, kl_mean 0.02133
-# (vLLM 0.03677 on the same reference), kl_p99 0.406 (0.549), top1_decisive 0.9934 (0.9868), needles 18/18;
-# needles with PLOW_PF_CHUNK=512 18/18. Prefix reuse at c8 (53248 hit tokens): 7/8 cached streams equal their
-# cold runs, as v14 (cache-off re-sends 6/8: batch-shape nondeterminism). 0 cross-GPU collective errors.
+# served c16, prefix cache on, PF_INTERLEAVE 8192) on packet 0abfd016 with this [serve] env (v15b): PASS,
+# kl_mean 0.01995 (vLLM 0.03677 on the same reference), kl_p99 0.268 (0.549), top1_decisive 0.9934 (0.9868), needles
+# 18/18; needles with PLOW_PF_CHUNK=512 18/18. Prefix reuse at c8 (49152 hit tokens): 6/8 cached streams equal their
+# cold runs (cache-off re-sends 5/8: concurrent batch shapes and the MoE combine atomics, not the cache). 0 cross-GPU collective errors.
 [[gates]]
 name = "llm_fp32_ref"
 cmd = "scripts/llm/fp32_ref_gate.py"
@@ -195,11 +199,11 @@ expect = "36/36"
 
 # One serving cell for orientation; the full grid (isl 1024/4096/16384 at c1..c128, 32768/61440 at
 # c1/c8) and the strict comparison against vLLM are docs/bringup/results/glm53flash-mi350x-2026-10-12.
-# No cell beats vLLM on throughput (v15a: 0.36-0.66x; v13 0.34-0.61x, v11 0.28-0.61x); see docs/amd/glm53-flash-mi350x.md.
+# No cell beats vLLM on throughput (v15b: 0.37-0.66x; v15a 0.36-0.66x, v13 0.34-0.61x, v11 0.28-0.61x); see docs/amd/glm53-flash-mi350x.md.
 [measured]
-tok_s = 77.13
-p50_tpot_ms = 11.98
-p50_ttft_ms = 129.16
+tok_s = 77.58
+p50_tpot_ms = 11.96
+p50_ttft_ms = 128.66
 concurrency = 1
 input_len = 4096
 output_len = 128
