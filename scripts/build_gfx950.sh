@@ -142,6 +142,15 @@ case "${PLOW_MOE_DEC_W8_SPLITN:-1}" in
   1) DEC_KNOBS="$DEC_KNOBS -DPLOW_MOE_DEC_W8_SPLITN=1" ;;
   *) echo "PLOW_MOE_DEC_W8_SPLITN must be 0 or 1" >&2; exit 2 ;;
 esac
+# PLOW_HC_FUSE_TAG_INLINE: the tagged one-output mHC arm inlined into the dispatch. 1 = every
+# decode object, 2 = low-rung tier objects only (inlined into the wide object it costs B=128
+# 41.2 -> 43.2 ms; the wide rung never runs the arm). Default off.
+case "${PLOW_HC_FUSE_TAG_INLINE:-0}" in
+  0) ;;
+  1) DEC_KNOBS="$DEC_KNOBS -DPLOW_HC_FUSE_TAG_INLINE=1" ;;
+  2) [ -n "${PLOW_DECODE_TIER:-}" ] && DEC_KNOBS="$DEC_KNOBS -DPLOW_HC_FUSE_TAG_INLINE=1" ;;
+  *) echo "PLOW_HC_FUSE_TAG_INLINE must be 0, 1 or 2" >&2; exit 2 ;;
+esac
 case "${PLOW_MERGE_UNROLL4:-0}" in
   0) ;;
   1) DEC_KNOBS="$DEC_KNOBS -DFA_MERGE_UNROLL4=1" ;;

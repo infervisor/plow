@@ -790,9 +790,9 @@ fn emit_glm53_hc_pre(
     let no_tail = fuse_r.is_some_and(|r| r > 0)
         && emit_config::active().glm_hc_fuse_variant.unwrap_or(0) & 8 != 0;
     // PLOW_GLM_HC_FUSE_TAG (needs variant bit 1 and hidden == 8 * 512): outputs published as
-    // tagged words, relaxed election, tail from the rows in registers / LDS.
-    let hc_tag = fuse_r.is_some()
-        && !no_tail
+    // tagged words, relaxed election, tail from the row in registers. One-output arm only
+    // (rows * 24 <= CUs: r1, B8); the device rows arm (R > 0) measured slower (B32/B128).
+    let hc_tag = fuse_r == Some(0)
         && emit_config::active().glm_hc_fuse_tag
         && emit_config::active().glm_hc_fuse_variant.unwrap_or(0) & 1 != 0
         && c.hidden == 4096;

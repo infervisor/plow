@@ -3544,9 +3544,10 @@ __device__ __forceinline__ void hcf_rows_tail(CInst in, CTens T, unsigned M, uns
                            __uint_as_float(desc[PLOW_HCT_HCEPS]), sm->part);
     }
 }
-__device__ __attribute__((noinline)) void exec_hc_fuse_tag(CInst in, CTens T, unsigned slice,
-                                                          unsigned nblk, plow_smem* sm) {
-    const unsigned M = in->i[0], K = in->i[2], R = in->i[5];
+template <bool R0>
+__device__ __forceinline__ void exec_hc_fuse_tag_body(CInst in, CTens T, unsigned slice,
+                                                      unsigned nblk, plow_smem* sm) {
+    const unsigned M = in->i[0], K = in->i[2], R = R0 ? 0u : in->i[5];
     const unsigned* desc = (const unsigned*)T[in->t[7]];
     const unsigned hidden = desc[PLOW_HCT_HIDDEN];
     if (in->i[1] != 24u || in->i[4] != 3u || !(in->i[6] & 1u) || hidden != 8u * PLOW_THREADS ||
@@ -3558,7 +3559,7 @@ __device__ __attribute__((noinline)) void exec_hc_fuse_tag(CInst in, CTens T, un
     unsigned* const words = ctr + ((groups + 31u) & ~31u);
     __shared__ float hm[4u * 24u];
     unsigned quiet = 1u;
-    if (R == 0u) {
+    if (R0 || R == 0u) {
         if (M * 24u > nblk) __builtin_trap();
         if (slice < M * 24u) {
             const unsigned m = slice / 24u, n = slice % 24u;
@@ -3589,7 +3590,7 @@ __device__ __attribute__((noinline)) void exec_hc_fuse_tag(CInst in, CTens T, un
                     __uint_as_float(desc[PLOW_HCT_HCEPS]), sm->part);
             }
         }
-    } else {
+    } else if constexpr (!R0) {
         const unsigned units = (M + R - 1u) / R * 3u;
         for (unsigned unit = slice; unit < units; unit += nblk) {
             switch (R) {
@@ -3610,6 +3611,15 @@ __device__ __attribute__((noinline)) void exec_hc_fuse_tag(CInst in, CTens T, un
     }
     if (threadIdx.x == 0) hcf_quiet() = quiet;
 }
+__device__ __attribute__((noinline)) void exec_hc_fuse_tag(CInst in, CTens T, unsigned slice,
+                                                          unsigned nblk, plow_smem* sm) {
+    exec_hc_fuse_tag_body<false>(in, T, slice, nblk, sm);
+}
+/* PLOW_HC_FUSE_TAG_INLINE: the one-output-per-workgroup arm inlined into the dispatch (no call
+ * prologue saving ~110 VGPRs per lane to scratch). */
+#ifndef PLOW_HC_FUSE_TAG_INLINE
+#define PLOW_HC_FUSE_TAG_INLINE 0
+#endif
 #define HCF_QUIET_ON 1
 #endif
 __device__ __attribute__((noinline)) void exec_hc_fuse_dec(CInst in, CTens T, unsigned slice,
@@ -4873,6 +4883,12 @@ __device__ static void plow_exec(CInst in_v, unsigned slice, CTens T_v, plow_sme
             /* PLOW_GLM_HC_POST_FOLD (i3 = 1): the preceding HyperConnPost folded in. t1 is its
              * new_residual (written here), t3 = x_out, t4 = residual, t5 = post_mix,
              * t6 = comb_mix. See d_gemv_f32_wg_hcpost. */
+#if HCF_QUIET_ON && PLOW_HC_FUSE_TAG_INLINE
+            if (in->i[3] == 1u && in->i[4] == 3u && (in->i[6] & 32u) && in->i[5] == 0u) {
+                exec_hc_fuse_tag_body<true>(in, T, slice, nblk, sm);
+                break;
+            }
+#endif
             if (in->i[3] == 1u && (in->i[4] == 3u || in->i[4] == 4u)) {
                 exec_hc_fuse_dec(in, T, slice, nblk, sm, prog_meta);
                 break;
