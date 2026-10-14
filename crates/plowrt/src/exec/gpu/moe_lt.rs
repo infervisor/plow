@@ -133,6 +133,15 @@ pub(super) fn instructions(segments: &[Option<MoeLtSegment>]) -> Vec<(usize, usi
         .collect()
 }
 
+#[cfg(test)]
+pub(super) fn prologue_count(segments: &[Option<MoeLtSegment>]) -> usize {
+    segments
+        .iter()
+        .flatten()
+        .filter(|s| s.prologue.is_some())
+        .count()
+}
+
 pub(super) fn segments(
     program: &DevProg,
     tensors: &[DevTensor],
@@ -1885,6 +1894,134 @@ mod tests {
             assert!(segments(&program, &tensors, &roles).is_err());
             (program.insts, program.stream) = saved;
         }
+    }
+
+    #[test]
+    fn accepts_the_w8a8_chain_with_the_router_prologue() {
+        // 0 RmsNorm, 1 router, 2 align, 3 activation quant, 4 GLU, 5 fu quant, 6 DOWN, 7 combine,
+        // one segment (PLOW_EMIT_MOE_PF_LT_ROUTE).
+        let mut insts = vec![
+            DevInst64 {
+                op: DevOp::Nop as u16,
+                blocks: 1,
+                ..Default::default()
+            };
+            8
+        ];
+        for inst in &mut insts {
+            inst.t.fill(packet::dev::TENSOR_NONE16);
+        }
+        // Handles as accepts_the_w8a8_chain, plus 17 x, 18 norm gamma, 19 router proj,
+        // 20 router scale, 21 per-expert scale.
+        insts[0].op = DevOp::RmsNorm as u16;
+        insts[0].t[..3].copy_from_slice(&[16, 17, 18]);
+        insts[0].i[..3].copy_from_slice(&[1024, 2816, 0]);
+        insts[1].op = DevOp::MoeRouterGemmaPf as u16;
+        insts[1].t[..5].copy_from_slice(&[8, 17, 19, 20, 21]);
+        insts[1].i[..4].copy_from_slice(&[2816, 128, 8, 1024]);
+        insts[2].op = DevOp::MoeAlignGemmaPf as u16;
+        insts[2].t[..5].copy_from_slice(&[3, 8, 4, 6, 7]);
+        insts[2].i[..3].copy_from_slice(&[1024, 128, 8]);
+        insts[3].op = DevOp::QuantFp8 as u16;
+        insts[3].t[..3].copy_from_slice(&[1, 16, 9]);
+        insts[3].i[..2].copy_from_slice(&[1024, 2816]);
+        insts[4].op = DevOp::MoeGroupGluGemmaPfW8a8 as u16;
+        insts[4].t[..7].copy_from_slice(&[0, 1, 2, 3, 4, 9, 10]);
+        insts[4].i[..3].copy_from_slice(&[704, 2816, 128]);
+        insts[5].op = DevOp::QuantFp8 as u16;
+        insts[5].t[..3].copy_from_slice(&[11, 0, 12]);
+        insts[5].i[..2].copy_from_slice(&[CAPACITY as u32, 704]);
+        insts[6].op = DevOp::MoeGroupDownGemmaPfW8a8 as u16;
+        insts[6].t[..8].copy_from_slice(&[5, 11, 2, 3, 6, 7, 10, 12]);
+        insts[6].i[..3].copy_from_slice(&[2816, 704, 128]);
+        insts[7].op = DevOp::MoeCombineNormGemmaPf as u16;
+        insts[7].t[..4].copy_from_slice(&[13, 5, 14, 15]);
+        insts[7].i[..3].copy_from_slice(&[2816, 8, 1024]);
+        let stream: Vec<_> = (0..8u32)
+            .map(|inst| StreamEnt {
+                inst,
+                seg: 0,
+                ..Default::default()
+            })
+            .collect();
+        let tensors = [
+            CAPACITY * 704 * 2,
+            1024 * 2816,
+            128 * 16,
+            (3 * 128 + 2) * 4,
+            CAPACITY * 4,
+            1024 * 8 * 2816 * 4,
+            CAPACITY * 4,
+            CAPACITY * 4,
+            1024 * 8 * 8,
+            1024 * 4,
+            128 * 16,
+            CAPACITY * 704,
+            CAPACITY * 4,
+            1024 * 2816 * 2,
+            1024 * 2816 * 2,
+            2816 * 2,
+            1024 * 2816 * 2,
+            1024 * 2816 * 2,
+            2816 * 2,
+            128 * 2816 * 2,
+            2816 * 2,
+            128 * 2,
+        ]
+        .into_iter()
+        .map(|bytes| DevTensor {
+            name: "act".into(),
+            bytes,
+            init: None,
+        })
+        .collect::<Vec<_>>();
+        let mut program = DevProg {
+            t: 1024,
+            role: packet::devbuild::ProgramRole::PrefillBucket { rows: 1024 },
+            n_counter: 0,
+            insts,
+            stream: stream.clone(),
+            stream_ofs: vec![0],
+            stream_len: vec![8],
+            waits: vec![],
+            succs: vec![],
+            gq_stream: stream,
+            gq_seg_ofs: vec![0, 8],
+            l2_domains: 0,
+        };
+        let roles = [ROLE];
+        assert_eq!(
+            packet_role_segments(&program, &roles, &tensors).unwrap(),
+            roles
+        );
+        let route = segments(&program, &tensors, &roles).unwrap()[0].expect("routed prologue");
+        assert_eq!((route.glu, route.down), (4, 6));
+        assert_eq!(
+            route.prologue.map(|p| (p.norm, p.top_k, p.rows)),
+            Some((0, 8, 1024))
+        );
+        let mut covered: Vec<_> = instructions(&[Some(route)])
+            .into_iter()
+            .map(|(_, i)| i)
+            .collect();
+        covered.sort_unstable();
+        assert_eq!(covered, (0..8).collect::<Vec<_>>());
+        // The router must read the norm's input, the align the router's table, the quant the
+        // norm's output; a seven-instruction segment is no role.
+        let edits: [fn(&mut DevProg); 3] = [
+            |p| p.insts[1].t[1] = 16,
+            |p| p.insts[2].t[1] = 4,
+            |p| p.insts[3].t[1] = 17,
+        ];
+        for edit in edits {
+            let saved = program.insts.clone();
+            edit(&mut program);
+            assert!(segments(&program, &tensors, &roles).is_err());
+            program.insts = saved;
+        }
+        program.gq_stream.remove(0);
+        program.gq_seg_ofs = vec![0, 7];
+        assert!(packet_role_segments(&program, &roles, &tensors).is_err());
     }
 
     #[test]
