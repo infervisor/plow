@@ -713,6 +713,7 @@ pub const RUNTIME: &[KnobSpec] = &[
     KnobSpec::new("rt.pkt_fence", Some("PLOW_AMD_PKT_FENCE"), Layer::Runtime, Domain::Str, UNSET, DIAG),
     KnobSpec::new("rt.dispatch_times", Some("PLOW_AMD_DISPATCH_TIMES"), Layer::Runtime, Domain::Str, UNSET, DIAG),
     KnobSpec::new("rt.tp_par_host", Some("PLOW_TP_PAR_HOST"), Layer::Runtime, Domain::Bool, OFF, OPT_IN),
+    KnobSpec::new("rt.tp_audit_tail", Some("PLOW_TP_AUDIT_TAIL"), Layer::Runtime, Domain::Bool, OFF, OPT_IN),
     KnobSpec::new("rt.threads", Some("PLOW_CPU_THREADS"), Layer::Runtime, U32, Default::Static(Val::Nat(0)), OPT_IN),
     KnobSpec::new("rt.numa", Some("PLOW_CPU_NUMA"), Layer::Runtime, Domain::Str, Default::Static(Val::Str("auto")), OPT_IN),
     KnobSpec::new("rt.huge_pages", Some("PLOW_CPU_HUGE_PAGES"), Layer::Runtime, Domain::Bool, UNSET, OPT_IN),

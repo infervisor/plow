@@ -14693,6 +14693,7 @@ impl AmdEngine {
     pub(crate) fn preflight_decode_replay(
         &self,
         p: usize,
+        extra: usize,
     ) -> Result<crate::device::kernarg_retirement::Admission> {
         if self.index_fp8.is_some() {
             // Refuse an unqualified domain before reserving otherwise unfillable AQL slots.
@@ -14704,7 +14705,8 @@ impl AmdEngine {
         }
         let packets = (0..self.decode_launches(p))
             .map(|seg| self.decode_segment_launches(p, seg))
-            .sum();
+            .sum::<usize>()
+            + extra;
         self.be.preflight_dispatch_chain(packets)
     }
 

@@ -2242,6 +2242,10 @@ pub struct AmdRuntimeConfig {
     /// on one thread per rank so their SDMA round trips overlap.
     #[arg(long = "amd-tp-par-host", env = "PLOW_TP_PAR_HOST", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
     pub tp_par_host: bool,
+    /// TP decode: append the compact counter audit to each rank's decode chain instead of a
+    /// second submit and drain after it.
+    #[arg(long = "amd-tp-audit-tail", env = "PLOW_TP_AUDIT_TAIL", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
+    pub tp_audit_tail: bool,
 }
 
 /// Global runtime config, initialized once at startup from CLI parse.
