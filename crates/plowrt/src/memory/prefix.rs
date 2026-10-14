@@ -497,6 +497,45 @@ impl PrefixCache {
         Some((owner, blk))
     }
 
+    /// Live references on the node `key` (`None`: not in the tree).
+    pub fn node_refs(&self, key: (u32, u32)) -> Option<u32> {
+        self.nodes
+            .iter()
+            .find(|n| !n.evicted && (n.owner_seq, n.block_idx) == key)
+            .map(|n| n.refs)
+    }
+
+    /// Unlink the node `key` and then each parent, deepest first, while it is a zero-ref leaf
+    /// and `keep` does not hold it. Returns the evicted `(owner_seq, block_idx)` identities.
+    pub fn evict_chain_from(
+        &mut self,
+        key: (u32, u32),
+        keep: impl Fn((u32, u32)) -> bool,
+    ) -> Vec<(u32, u32)> {
+        let mut cur = self
+            .nodes
+            .iter()
+            .position(|n| !n.evicted && (n.owner_seq, n.block_idx) == key)
+            .map(|i| i as NodeId);
+        let mut evicted = Vec::new();
+        while let Some(id) = cur {
+            let n = &self.nodes[id as usize];
+            let k = (n.owner_seq, n.block_idx);
+            if n.evicted || n.refs != 0 || !n.children.is_empty() || keep(k) {
+                break;
+            }
+            let parent = n.parent;
+            match parent {
+                Some(p) => self.nodes[p as usize].children.retain(|_, v| *v != id),
+                None => self.roots.retain(|_, v| *v != id),
+            }
+            self.tombstone(id);
+            evicted.push(k);
+            cur = parent;
+        }
+        evicted
+    }
+
     /// Unlink the tail of the path named by `hashes[..from_depth]`, working backward from
     /// `from_depth - 1`, evicting each node that is currently a zero-ref **leaf** (never an
     /// interior node — same "would orphan a child" rule [`Self::evict_lru`] enforces), and

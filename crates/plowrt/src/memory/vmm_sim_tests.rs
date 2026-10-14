@@ -788,6 +788,23 @@ impl Rig {
         out
     }
 
+    /// [`Self::turn`] for a request with `X-Session-Id` held for `ttl_ms` (0 = no retention).
+    fn turn_session(
+        &mut self,
+        b: usize,
+        prompt: &[u32],
+        reply: usize,
+        ttl_ms: u64,
+    ) -> (u32, Vec<u32>) {
+        let rows = self.admit(b, prompt);
+        self.k
+            .kv
+            .hold_session(b, std::time::Duration::from_millis(ttl_ms));
+        let mut toks = self.prefill(b, prompt, self.chunk);
+        let out = self.finish(b, &mut toks, reply);
+        (rows, out)
+    }
+
     /// One whole turn in slot `b`: admit, prefill, decode `reply` rows, retire. Returns
     /// `(attached rows, reply)`.
     fn turn(&mut self, b: usize, prompt: &[u32], reply: usize) -> (u32, Vec<u32>) {
@@ -963,23 +980,183 @@ fn cell_host_tier_keeps_prompt_ends_the_device_cannot() {
     );
 }
 
-/// `X-Session-Id` changes nothing under the tree: the same cell with sessions on gives the
-/// same boundaries, hit rows and retirements (no pin, no output publish).
+/// `PLOW_PREFIX_SESSION_TTL_S=0`: a session header buys nothing; the cell runs exactly as
+/// without one (no protection, no output publish, one boundary per conversation).
 #[test]
-fn cell_session_header_is_routing_only() {
+fn cell_session_ttl_zero_is_no_session() {
     let mut r = Rig::new(Policy::Tree, false, 1 << 20, 64, 2);
     r.k.session = true;
     let mut p = conv_prompt(2, 40, 200);
-    let (_, mut reply) = r.turn(0, &p, 30);
+    let (_, mut reply) = r.turn_session(0, &p, 30, 0);
     for t in 1..4 {
         p = next_prompt(&p, &reply, 4, 100, 60_000 * t);
-        let (rows, out) = r.turn(0, &p, 30);
+        let (rows, out) = r.turn_session(0, &p, 30, 0);
         reply = out;
         assert!(rows > 0);
         assert_eq!(r.live(), 1);
     }
-    assert_eq!(r.kv().stats().publishes_turn_end, 0);
+    let s = r.kv().stats();
+    assert_eq!(s.publishes_turn_end, 0);
+    assert_eq!(s.sessions_protected, 0);
     assert!(r.kv().shared.inner.lock().cache.pinned().is_empty());
+}
+
+/// A session's newest boundary inside its TTL survives pressure that evicts every other
+/// conversation's end; without the header the same end is evicted.
+#[test]
+fn cell_session_boundary_is_protected_within_ttl() {
+    // About eight prompt ends fit (16 KiB snapshots, 128 B columns): fourteen evict.
+    const CONVS: u32 = 14;
+    let run = |ttl_ms: u64| {
+        let mut r = Rig::new(Policy::Tree, false, 176 << 10, 64, 2);
+        r.k.snap_row = 256;
+        let p0 = conv_prompt(0, 0, 240);
+        let (_, reply0) = r.turn_session(0, &p0, 30, ttl_ms);
+        for c in 1..CONVS {
+            r.turn(c as usize % 2, &conv_prompt(c, 0, 240), 30);
+        }
+        let protected = r.kv().stats().sessions_protected;
+        let dump = r.dump();
+        let p1 = next_prompt(&p0, &reply0, 4, 100, 70_000);
+        let (rows, _) = r.turn_session(0, &p1, 30, ttl_ms);
+        r.check();
+        (
+            rows,
+            (p0.len() as u32 - 9) / 32 * 32,
+            protected,
+            r.kv().stats(),
+            dump,
+        )
+    };
+    let (rows, end, protected, s, _) = run(60_000);
+    assert_eq!(protected, 1);
+    assert_eq!(rows, end, "the protected end survived: {s:?}");
+    assert!(s.snapshots_evicted > 0, "the others were evicted: {s:?}");
+    let (rows, end, protected, _, dump) = run(0);
+    assert_eq!(protected, 0);
+    assert!(
+        rows < end,
+        "unprotected, the same end is evicted: {rows} {end} {dump}"
+    );
+}
+
+/// After its TTL a session boundary is demoted: its snapshot and the blocks only it kept
+/// attachable go (newest first), the shared system prompt stays, the byte accounting closes,
+/// and the session's next turn attaches the surviving ancestor.
+#[test]
+fn cell_session_demoted_after_ttl() {
+    let mut r = Rig::new(Policy::Tree, false, 1 << 20, 64, 2);
+    let first = r.shared_pair(&conv_prompt(40, 288, 120), &conv_prompt(41, 288, 120), 20);
+    assert!(first >= 256);
+    let ps = conv_prompt(42, 288, 120);
+    let (rows, reply) = r.turn_session(0, &ps, 20, 30);
+    assert!(rows >= 256, "the session attaches the shared end");
+    let before = r.kv().stats();
+    assert_eq!(before.sessions_protected, 1);
+    std::thread::sleep(std::time::Duration::from_millis(40));
+    r.kv().begin_seq(1);
+    let s = r.kv().stats();
+    assert_eq!(s.session_demotions, 1, "{}", r.dump());
+    assert!(s.session_demoted_bytes > 0);
+    assert_eq!(s.snapshots_live, before.snapshots_live - 1);
+    assert!(
+        s.cache_blocks < before.cache_blocks,
+        "its private blocks went"
+    );
+    assert_eq!(s.sessions_protected, 0);
+    let bb = r.kv().shared.block_bytes;
+    assert_eq!(
+        s.cache_bytes,
+        s.cache_blocks * bb + s.snapshot_bytes,
+        "no byte leak"
+    );
+    assert!(
+        r.snaps().iter().any(|x| x.1.has(Kind::SHARED_END)),
+        "the system prompt end stays: {}",
+        r.dump()
+    );
+    r.check();
+    let p2 = next_prompt(&ps, &reply, 4, 50, 90_000);
+    let (rows2, _) = r.turn_session(0, &p2, 20, 30);
+    assert!(
+        rows2 >= 256 && rows2 < (ps.len() as u32 - 9) / 32 * 32,
+        "{rows2}"
+    );
+}
+
+/// An expired session boundary whose blocks a live request still maps is demoted only once
+/// that request lets go, and then with its private suffix.
+#[test]
+fn cell_session_demotion_waits_for_a_live_mapping() {
+    let mut r = Rig::new(Policy::Tree, false, 1 << 20, 64, 2);
+    let p = conv_prompt(70, 40, 200);
+    r.turn_session(0, &p, 30, 20);
+    let blocks = r.kv().stats().cache_blocks;
+    // Another request on the same prompt maps the boundary's blocks and stays live.
+    assert!(r.admit(1, &p) > 0);
+    std::thread::sleep(std::time::Duration::from_millis(30));
+    r.kv().begin_seq(0);
+    assert_eq!(r.kv().stats().session_demotions, 0, "still mapped");
+    r.kv().begin_seq(1);
+    r.kv().begin_seq(0);
+    let s = r.kv().stats();
+    assert_eq!(s.session_demotions, 1, "{}", r.dump());
+    assert!(
+        s.cache_blocks < blocks,
+        "the private suffix went too: {}",
+        r.dump()
+    );
+    r.check();
+}
+
+/// An attach by the session's next turn refreshes the boundary's TTL.
+#[test]
+fn cell_session_attach_refreshes_ttl() {
+    let mut r = Rig::new(Policy::Tree, false, 1 << 20, 64, 2);
+    let p1 = conv_prompt(50, 40, 200);
+    let (_, reply) = r.turn_session(0, &p1, 30, 80);
+    std::thread::sleep(std::time::Duration::from_millis(50));
+    let p2 = next_prompt(&p1, &reply, 4, 100, 91_000);
+    let rows = r.admit(0, &p2);
+    assert!(rows > 0);
+    r.kv().hold_session(0, std::time::Duration::from_millis(80));
+    std::thread::sleep(std::time::Duration::from_millis(50));
+    r.kv().begin_seq(1);
+    assert_eq!(
+        r.kv().stats().session_demotions,
+        0,
+        "refreshed at the attach"
+    );
+    std::thread::sleep(std::time::Duration::from_millis(100));
+    // The request that attached it ends without publishing (cancelled): expired, and demoted
+    // once nothing maps it.
+    r.kv().begin_seq(0);
+    r.kv().begin_seq(1);
+    assert_eq!(
+        r.kv().stats().session_demotions,
+        1,
+        "expired without a new publish"
+    );
+    r.check();
+}
+
+/// A session conversation keeps exactly one protected boundary across turns (each prompt end
+/// supersedes the last) and every turn attaches it.
+#[test]
+fn cell_session_conversation_keeps_one_protected_boundary() {
+    let mut r = Rig::new(Policy::Tree, false, 1 << 20, 64, 2);
+    r.k.session = true;
+    let mut p = conv_prompt(60, 40, 200);
+    let (_, mut reply) = r.turn_session(0, &p, 30, 60_000);
+    for t in 1..5u32 {
+        let end = (p.len() as u32 - 9) / 32 * 32;
+        p = next_prompt(&p, &reply, 4, 100, 50_000 * t);
+        let (rows, out) = r.turn_session(t as usize % 2, &p, 30, 60_000);
+        reply = out;
+        assert_eq!(rows, end);
+        let s = r.kv().stats();
+        assert_eq!((s.snapshots_live, s.sessions_protected), (1, 1));
+    }
 }
 
 /// Two requests of one conversation on the same history at once (parallel tool calls), the
