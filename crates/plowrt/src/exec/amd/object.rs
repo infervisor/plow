@@ -2277,6 +2277,29 @@ pub(super) fn check_dsa_select_local(
                 }
                 continue;
             }
+            if d.i[4] == 4 {
+                // Pooled batched decode (GLM-5.3-Flash kpool): op 118's per-row radix, one
+                // workgroup per row, row r over Score[r * i0] into idx[r * i1].
+                let rows = p.t;
+                let cap = |slot: u16, need: u64| {
+                    tensors
+                        .get(usize::from(slot))
+                        .is_some_and(|t| t.bytes >= need)
+                };
+                if !p.role.is_decode_rung()
+                    || d.i[5] != rows
+                    || u32::from(d.blocks) != rows
+                    || d.i[2] < 2
+                    || !cap(d.t[0], u64::from(rows) * u64::from(d.i[1]) * 4)
+                    || !cap(d.t[1], u64::from(rows) * u64::from(d.i[0]) * 4)
+                    || !cap(d.t[4], u64::from(rows) * 4)
+                {
+                    return Err(RuntimeError::Device(
+                        "pooled batched DSA selection requires a decode rung, one workgroup per row, pool_size > 1 and row-sized operands".into(),
+                    ));
+                }
+                continue;
+            }
             let err = || {
                 RuntimeError::Device(
                 "local DSA selection requires unpacked gfx942 TP8 decode rows 2/4/8/16/32, unpooled top2048 and row-sized operands".into())

@@ -646,6 +646,41 @@ The packet from config + index alone (no weights) is 70 MB: 4 prefill buckets + 
   TP4 serve 8/8, one model at a time and both at once; needles 4k/16k 18/18 per model (cache on,
   both models at once); c64 per model, isl 1024 / osl 128: 6151 + 6163 = 12303 total tok/s,
   128/128 each; metrics carry `model_name` per model.
+- 20:00 UTC (10-13), sparse attention like vLLM (branch v12-dsa). vLLM's TP8 log runs
+  `ROCM_AITER_MLA_SPARSE` with the `DEEPSEEK_V32_INDEXER/KPOOL_TAIL` indexer
+  (`vllm/models/glm5next/amd/sparse_indexer.py`): kpool-4 softmax(gate+ape)-pooled, Hadamard,
+  power-of-2-scaled FP8 index keys; FP8 Hadamard queries; fp32 weights; top `2048/4 = 512` pools
+  per query row, expanded to tokens plus the incomplete-pool tail (<= 2051 indices); at prefill
+  AND decode; rows whose length is <= 2048 take every causal token (the identity). plow's pooled
+  ops were ported from the same kernels, so the selected SET is the same (tie order aside).
+  `PLOW_GLM_DSA=topk` arms it at every decode rung (batched arm added: per-slot ring/pool cache,
+  per-row radix, compact expand) and makes every prefill bucket write the pool cache (dense
+  buckets used to skip it; packed programs write it per span). Differences left: prefill
+  attention stays dense (`PLOW_GLM_DSA_PF=1` faults on a ragged 4096-row chunk in the 8192
+  bucket; a dense row is a superset of its selection), and a pool straddling an unaligned packed
+  span start is not compressed. Production (`PLOW_GLM_DSA=0`) packets are byte-identical.
+  Validate (packet caf12efe, `PLOW_GLM_DSA=topk`): nat-pride-1024 equals the FP32 continuation
+  in 1/8/32/128 of 1/8/32/128 slots; real 4k/16k prompts give the dense packet's stream at r1 and
+  in all 8 b8 slots; 32k/61k run. Not qualified: decode cost. ms/step sparse vs dense:
+  r1 26.2 vs 12.4, B8 39.8 vs 22.9, B32 85.6 vs 30.2, B128 263.7 vs 39.9 (1k ctx);
+  r1 at 4k/16k/61k 27.4/29.2/37.1 vs 11.5/11.6/12.6. Prefill (dense attention + pool writes)
+  4k/16k/32k/61k 164/601/1345/3053 ms. Needles and the FP32 gate not run.
+  Later (v12 env + `PLOW_GLM_DSA=topk PLOW_GLM_DSA_PF=1 PLOW_GLM_DSA_FUSE=1
+  PLOW_GLM_DECODE_GLUE_CUS=1`, objects default `PLOW_DSA_KPOOL_MFMA=1 PLOW_DSA_QQUANT_WAVE=1`):
+  IndexScoreKpool on bf16 MFMA (fp8 operands are exact in bf16), items slab-major (row-major
+  pinned each workgroup to one slab: 4.8 ms -> 0.5 ms per 8k chunk layer), 8 prefill rows per
+  key slab; ragged prefill chunks shrink the pooled chain (the 4096-in-8192 fault); stash/expand
+  fused into compress/select; q quant one wave per row. Sparse vs dense (v12 int), ms/step:
+  r1 11.9 vs 11.5, B8 23.7 vs 22.8, B32 27.7 vs 26.9-29.3, B128 41.0 vs 36.5-38.7, r1 at
+  4k/16k/61k 12.4/12.5/12.7 vs 11.7/11.9/12.8; prefill 4k/16k/32k/61k 173-191/598/1254/2560 vs
+  159/561/1271/- ms. Streams = FP32 continuation at all rungs; 4k/16k = dense stream; needles
+  36/36 (serve, cache on). Serve with the packed route crashed (per-span pool writes trap in the
+  interpreter object): the packed route is refused for DSA packets until those writes move into
+  a packed family. On the v13 integration env + DSA (packet 21ffb3d1, serve PF_IL 8192, XR tag
+  90112, dense flash object): FP32 gate PASS kl_mean 0.01289 (vLLM 0.03677), kl_p99 0.199,
+  top1_decisive 0.9978, c16 serve, no exception; PF_CHUNK=512 split needles 18/18. Prefix check:
+  the cache never hits on the DSA packet (cached=0 in every case) and 7 of 24 streams differ
+  off-vs-on (run-to-run concurrency; the dense v12 packet also FAILs this check with 2) — open.
 - 23:00 UTC (10-13), dedicated decode kernels for KDA and the router (branch v13-kda-router).
   `PLOW_KDA_DECODE_WIDE` (default on): at batched rungs each KDA layer's Conv3 -> StateStepG ->
   GatedNorm runs as one standalone op-125 v3 launch (`kda_decode_wide.hip`, one 512-thread

@@ -3526,14 +3526,14 @@ fn declare_glm_rows_batched_for_prefill(
     let pool_dec_on = dsa && c.index_kpool > 1;
     let (gate_score, q_fp8, q_scale, widx_f32, iidx_pool) = if pool_dec_on {
         (
-            ac(b, "gate_score", di as u64 * BF16),
-            ac(b, "q_fp8", (hi * di) as u64),
-            ac(b, "q_scale", hi as u64 * F32),
-            ac(b, "widx_f32", hi as u64 * F32),
+            ac(b, "gate_score", dbatch as u64 * di as u64 * BF16),
+            ac(b, "q_fp8", dbatch as u64 * (hi * di) as u64),
+            ac(b, "q_scale", dbatch as u64 * hi as u64 * F32),
+            ac(b, "widx_f32", dbatch as u64 * hi as u64 * F32),
             ac(
                 b,
                 "iidx_pool",
-                itk.div_ceil(c.index_kpool.max(1)) as u64 * I32,
+                dbatch as u64 * itk.div_ceil(c.index_kpool.max(1)) as u64 * I32,
             ),
         )
     } else {
@@ -3601,12 +3601,18 @@ fn declare_glm_rows_batched_for_prefill(
             TENSOR_NONE,
         )
     };
-    let kidx_pf = if kidx_pf == TENSOR_NONE && idx_on && c.index_kpool == 1 {
+    let kidx_pf = if kidx_pf == TENSOR_NONE && idx_on {
         ac(b, "kidx_pf", rows64 * di as u64 * BF16)
     } else {
         kidx_pf
     };
     let pool_pf_on = dsa_pf && c.index_kpool > 1;
+    // Pooled sparse decode reads the pool cache every prefill bucket writes (write-only chain).
+    let gate_score_pf = if !pool_pf_on && idx_on && c.index_kpool > 1 {
+        ac(b, "gate_score_pf", rows64 * di as u64 * BF16)
+    } else {
+        TENSOR_NONE
+    };
     let (gate_score_pf, q_fp8_pf, q_scale_pf, widx_f32_pf, iidx_pool_pf) = if pool_pf_on {
         (
             ac(b, "gate_score_pf", rows64 * di as u64 * BF16),
@@ -3621,7 +3627,7 @@ fn declare_glm_rows_batched_for_prefill(
         )
     } else {
         (
-            TENSOR_NONE,
+            gate_score_pf,
             TENSOR_NONE,
             TENSOR_NONE,
             TENSOR_NONE,
@@ -6168,10 +6174,6 @@ fn emit_glm_dsa_decode_select(
     // the gfx942 arm likewise), and the manifest requires that arm on BOTH backends
     // (`manifest.rs` `backend_amd`/`backend_nvcc`), so an object without it is refused at load
     // rather than reading row 0's scores for every row.
-    assert!(
-        !(dsa && rows > 1 && c.index_kpool > 1),
-        "batched pooled DSA decode is not qualified; emit a single-row ladder or disable DSA"
-    );
     // Quark's mixed checkpoint keeps weights_proj BF16 and upcasts FP8 wq_b/wk at bind. Its
     // indexer must use BF16 projections even though its experts are MXFP4. Other MXFP4 layouts
     // have no such checkpoint contract and still refuse DSA.
@@ -6288,7 +6290,7 @@ fn emit_glm_dsa_decode_select(
                 d.t[3] = n.icos;
                 d.t[4] = n.isin;
                 d.t[5] = n.pos;
-                d.i[0] = 1;
+                d.i[0] = rows;
                 d.i[1] = 1;
                 d.i[2] = di;
                 d.i[3] = 0;
@@ -6302,7 +6304,7 @@ fn emit_glm_dsa_decode_select(
                 d.t[0] = n.gate_score;
                 d.t[1] = n.xn;
                 d.t[2] = w.ikpg;
-                d.i[0] = 1;
+                d.i[0] = rows;
                 d.i[1] = di;
                 d.i[2] = h;
                 d.f[0] = 1.0;
@@ -6315,11 +6317,16 @@ fn emit_glm_dsa_decode_select(
                 d.t[0] = n.widx_f32;
                 d.t[1] = n.xn;
                 d.t[2] = w.iwp_f32;
-                d.i[0] = 1;
+                d.i[0] = rows;
                 d.i[1] = hi;
                 d.i[2] = h;
             });
-            let c_stash = b.emit(DevOp::DsaPoolStash, all.to_vec(), &[c_ki, c_gs], |d| {
+            let fuse = emit_config::active().glm_dsa_fuse;
+            let n_pools = ctx.div_ceil(c.index_kpool.max(1));
+            let c_stash = if fuse {
+                None
+            } else {
+                Some(b.emit(DevOp::DsaPoolStash, all.to_vec(), &[c_ki, c_gs], |d| {
                 d.t[0] = n.kidx_ring[slot];
                 d.t[1] = n.kidx_ring_score[slot];
                 d.t[2] = n.kidx_normed;
@@ -6327,13 +6334,21 @@ fn emit_glm_dsa_decode_select(
                 d.t[4] = n.pos;
                 d.i[0] = c.index_kpool;
                 d.i[1] = di;
-            });
+                if rows > 1 {
+                    d.i[3] = rows;
+                }
+            }))
+            };
+            let stash_deps = match c_stash {
+                Some(c_stash) => vec![c_stash],
+                None => vec![c_ki, c_gs],
+            };
             // Decode-mode DsaPoolCompress: n_pools=1 (per its own contract), gated on
             // `pos` — a no-op except at a pool boundary. Reads the ring the stash above
             // just wrote (dep), writes into this layer's GROWING pool cache at `pos`'s
             // pool slot (internal `pool_idx = pos/pool_size` addressing — see the kernel's
             // own doc comment for the historical bug this fixed).
-            let c_compress = b.emit(DevOp::DsaPoolCompress, all.to_vec(), &[c_stash], |d| {
+            let c_compress = b.emit(DevOp::DsaPoolCompress, all.to_vec(), &stash_deps, |d| {
                 d.t[0] = n.kidx_pool[slot];
                 d.t[1] = n.kidx_pool_scale[slot];
                 d.t[2] = n.kidx_ring[slot];
@@ -6343,18 +6358,28 @@ fn emit_glm_dsa_decode_select(
                 d.i[0] = 1;
                 d.i[1] = c.index_kpool;
                 d.i[2] = di;
+                if rows > 1 {
+                    d.i[4] = rows;
+                    d.i[5] = n_pools;
+                }
+                if fuse {
+                    d.t[6] = n.kidx_normed;
+                    d.t[7] = n.gate_score;
+                    d.i[4] = rows;
+                    d.i[5] = n_pools;
+                    d.i[7] = 1;
+                }
             });
             let c_qquant = b.emit(DevOp::DsaQQuant, all.to_vec(), &[c_qi], |d| {
                 d.t[0] = n.q_fp8;
                 d.t[1] = n.q_scale;
                 d.t[2] = n.qidx;
-                d.i[0] = hi;
+                d.i[0] = rows * hi;
                 d.i[1] = di;
             });
             // The cache's ALLOCATED pool width (`kidx_pool`'s own sizing, `declare_glm`) —
             // IndexScoreKpool/IndexSelect's `pool_stride`/`len_max` walk THIS, not the live
             // count; `kv_len`/`pool_size` are what narrow it to the live occupancy internally.
-            let n_pools = ctx.div_ceil(c.index_kpool.max(1));
             let c_sc = b.emit(
                 DevOp::IndexScoreKpool,
                 all.to_vec(),
@@ -6367,7 +6392,7 @@ fn emit_glm_dsa_decode_select(
                     d.t[4] = n.kidx_pool_scale[slot];
                     d.t[5] = n.widx_f32;
                     d.t[6] = n.kvlen;
-                    d.i[0] = 1;
+                    d.i[0] = rows;
                     d.i[1] = hi;
                     d.i[2] = n_pools;
                     d.i[3] = di;
@@ -6378,7 +6403,9 @@ fn emit_glm_dsa_decode_select(
             // top_k in POOLS, floor-divided — matches the reference's own
             // `select_k = topk_tokens // index_kpool` (sparse_attn_indexer_kpool.py).
             let itk_pool = itk / c.index_kpool;
-            let sel_wgs: Vec<u32> = (0..32.min(b.n_cu())).collect();
+            // Batched: one workgroup per row (op 59 `i[4] = 4`, the per-row exact radix).
+            // Every decode rung: the coop radix leaves slots past a short row's pool count stale.
+            let sel_wgs: Vec<u32> = (0..rows.min(b.n_cu())).collect();
             let c_sel = b.emit(DevOp::IndexSelect, sel_wgs, &[c_sc], |d| {
                 d.t[0] = n.iidx_pool;
                 d.t[1] = n.iscore;
@@ -6388,7 +6415,20 @@ fn emit_glm_dsa_decode_select(
                 d.i[0] = n_pools;
                 d.i[1] = itk_pool;
                 d.i[2] = c.index_kpool;
+                d.i[4] = 4;
+                d.i[5] = rows;
+                if fuse {
+                    d.t[5] = n.iidx;
+                    d.i[6] = 1;
+                }
             });
+            if fuse {
+                return c_sel;
+            }
+            // INDEX TABLE (decode): `n.iidx` i32 [rows][2051], COMPACT per row: the selected
+            // pools' tokens first (slot g*4+o = pool*4+o, pools in arbitrary order), then the
+            // incomplete-pool tail tokens, then -1. The gather walks min(2051, kv_len) slots and
+            // masks -1.
             // Pool ids -> token ids (+ trailing incomplete-pool tail-append), into `n.iidx`
             // ITSELF — its allocation already carries the `+ (index_kpool-1)` headroom this
             // needs (see its own declare-time comment), so the downstream flash-gather that
@@ -6397,9 +6437,10 @@ fn emit_glm_dsa_decode_select(
                 d.t[0] = n.iidx;
                 d.t[1] = n.iidx_pool;
                 d.t[2] = n.kvlen;
-                d.i[0] = 1;
+                d.i[0] = rows;
                 d.i[1] = itk_pool;
                 d.i[2] = c.index_kpool;
+                d.i[3] = 1;
             })
         } else {
             let c_ki = b.emit(DevOp::HeadNormRope, rik.clone(), &[c_kn], |d| {
@@ -7555,7 +7596,6 @@ fn emit_glm_dsa_prefill_select(
                 && matches!(t, 128 | 512 | 1024 | 2048 | 4096 | 8192)),
         "native FP8 indexer prefill topology/rung"
     );
-    assert!(select || c.index_kpool == 1);
     assert!(gathered.is_none() || c.index_kpool == 1);
     let (hi, di, h, ql) = (c.index_heads, c.index_dim, c.hidden, c.q_lora);
     let itk = c.index_topk.min(ctx);
@@ -7710,15 +7750,17 @@ fn emit_glm_dsa_prefill_select(
                 d.i[2] = h;
             },
         );
-        let c_w = b.emit(DevOp::GemvF32, all.to_vec(), &[pre[0]], |d| {
+        let c_w = select.then(|| b.emit(DevOp::GemvF32, all.to_vec(), &[pre[0]], |d| {
             d.t[0] = n.widx_f32_pf;
             d.t[1] = n.xn;
             d.t[2] = w.iwp_f32;
             d.i[0] = t;
             d.i[1] = hi;
             d.i[2] = h;
-        });
+        }));
         let chunk_pools = t / c.index_kpool;
+        let packed = b.packed_prefill_segments();
+        assert!(!(packed && select), "pooled sparse prefill has no per-span selection");
         let c_comp = b.emit(DevOp::DsaPoolCompress, all.to_vec(), &[c_ki, c_gs], |d| {
             d.t[0] = n.kidx_pool[slot];
             d.t[1] = n.kidx_pool_scale[slot];
@@ -7729,7 +7771,27 @@ fn emit_glm_dsa_prefill_select(
             d.i[1] = c.index_kpool;
             d.i[2] = di;
             d.i[3] = 0; // token-granular chunk base, patched by plowrt
+            if packed {
+                // Per-span form: each span's complete pools into its slot's cache (i5 = pools
+                // per slot); the span table supplies slot, row0 and the absolute position.
+                d.i[5] = ctx.div_ceil(c.index_kpool);
+                d.i[6] = 1;
+            }
         });
+        if packed {
+            // Per-span tail seed: every span's trailing incomplete-pool rows into its slot's ring.
+            b.emit(DevOp::DsaPoolStash, all.to_vec(), &[c_comp], |d| {
+                d.t[0] = n.kidx_ring[slot];
+                d.t[1] = n.kidx_ring_score[slot];
+                d.t[2] = n.kidx_pf;
+                d.t[3] = n.gate_score_pf;
+                d.t[4] = n.pos;
+                d.i[0] = c.index_kpool;
+                d.i[1] = di;
+                d.i[4] = 1;
+            });
+            return c_comp;
+        }
         // Prefill tail-seed: a real chunk whose length isn't pool-aligned (the common
         // case — chat-templated prompts essentially never land on a multiple of
         // `index_kpool`) leaves its trailing `clen % index_kpool` real tokens
@@ -7763,6 +7825,10 @@ fn emit_glm_dsa_prefill_select(
                 d.i[2] = row;
             });
         }
+        // Dense bucket under sparse decode: the pool cache and tail ring are all decode needs.
+        let Some(c_w) = c_w else {
+            return c_comp;
+        };
         let c_qq = b.emit(DevOp::DsaQQuant, all.to_vec(), &[c_qi.unwrap()], |d| {
             d.t[0] = n.q_fp8_pf;
             d.t[1] = n.q_scale_pf;
@@ -7811,6 +7877,12 @@ fn emit_glm_dsa_prefill_select(
                 d.i[3] = c.index_kpool;
             },
         );
+        // INDEX TABLE (prefill, consumed by IndexUnionPf and sparse prefill flash): `n.iidx_pf`
+        // is i32 [t][W], W = glm_dsa_select_width = (index_topk/kpool)*kpool + kpool-1 = 2051.
+        // Row r (query position kv_len-t+r) holds slots [0, 2048) = the selected pools p in
+        // arbitrary order, each as tokens p*4..p*4+3 (slot g*4+o); -1 where the row has fewer
+        // complete pools than 512; slots [2048, 2051) = the incomplete-pool tail tokens
+        // (pool_len*4 + j for j < row_len % 4), else -1. Every non-negative entry is < row_len.
         let c_ex = b.emit(DevOp::DsaPoolExpand, all.to_vec(), &[c_se], |d| {
             d.t[0] = n.iidx_pf;
             d.t[1] = n.iidx_pool_pf;
@@ -8446,7 +8518,12 @@ pub(crate) fn emit_glm_mla_prefill(
         Some(d) => slot >= d && c.indexer_is_full((slot - d) as u32),
         None => (1..=span).any(|d| slot >= d && c.indexer_is_full((slot - d) as u32)),
     };
-    let sparse = glm_dsa_pf_bucket(c, t) && (w.iwk != TENSOR_NONE || reuses) && nh_l == 8;
+    // Pooled packed programs stay dense (the pooled selection has no per-span form) and only
+    // write the pool cache per span.
+    let sparse = glm_dsa_pf_bucket(c, t)
+        && (w.iwk != TENSOR_NONE || reuses)
+        && nh_l == 8
+        && !(b.packed_prefill_segments() && c.index_kpool > 1);
     // Row-split sparse attention (`PLOW_GLM_ROWSPLIT_ATTN`, the 8192 rung only): only the
     // bucket's row-split sibling program carries it (`Builder::rowsplit_attn`); `w.wuv_full` is
     // TENSOR_NONE unless `glm_rowsplit_attn_eligible` agreed this layer reaches the sparse arm.
@@ -8465,7 +8542,7 @@ pub(crate) fn emit_glm_mla_prefill(
         use_rowsplit && b.rowsplit_arm() == Some(packet::devbuild::RowSplitArm::Replicated);
     let rb = rowband.then(|| RowBandTn::declare(b, c, slot, t));
     // Dense prefill still feeds sparse decode's key cache, including short tail buckets.
-    let idx_chain = w.iwk != TENSOR_NONE && (sparse || (c.dsa(ctx) && c.index_kpool == 1));
+    let idx_chain = w.iwk != TENSOR_NONE && (sparse || c.dsa(ctx));
 
     // 1 input_layernorm, T rows (on the band + all-gather under the sequence-parallel seams).
     // Under `raw_output` (GLM-5.3's hyper-connection program) the seam is the mHC band seam:
