@@ -34,6 +34,21 @@
 #define MW8_BPF 0
 #endif
 
+/* MW8_NOBR: operand loads from always-valid (clamped) addresses with value selects instead of
+ * `p ? load(p) : 0`, so a k-tile's loads issue as one batch without branches around them.
+ * Clamped columns (>= N) are never stored and dead GLU rows still stage zeros: bit-identical. */
+#ifndef MW8_NOBR
+#define MW8_NOBR 1
+#endif
+
+/* PLOW_MOE_DEC_W8_SPLITN (decode objects): a GLU whose 256-column tiles would leave half the
+ * workgroups idle runs 128-column tiles (waves 0-3 own B; 4-7 only stage A). Few rows per expert
+ * make each tile a 32-k-tile latency chain on one CU; half the weight bytes per tile on twice the
+ * CUs shortens it. Same MFMAs, k order and 128-column quant groups: bit-identical. */
+#ifndef PLOW_MOE_DEC_W8_SPLITN
+#define PLOW_MOE_DEC_W8_SPLITN 0
+#endif
+
 /* MW8_XCD: hand each XCD a contiguous tile range (tile = (lin % 8) * per + lin / 8), so the
  * m-tiles of one expert, which share its weights, run under one L2. 0 = linear order. */
 #ifndef MW8_XCD
@@ -81,6 +96,11 @@ __device__ __forceinline__ f32x16 mw8_mfma_lo(fp8v32 a, fp8v32 b, f32x16 acc) {
     return __builtin_amdgcn_mfma_scale_f32_32x32x64_f8f6f4(a, b, acc, 0, 0, 0, MW8_LO_E8M0, 0, 127);
 }
 
+/* v if live else +0.0f, as a bit mask (no branch around the load). */
+__device__ __forceinline__ float mw8_sel(bool live, float v) {
+    return __uint_as_float(__float_as_uint(v) & (live ? ~0u : 0u));
+}
+
 __device__ __forceinline__ fp8v32 mw8_ld_frag(const unsigned char* p) {
     const fp8v16 lo = ld_glob_fp8v16(p), hi = ld_glob_fp8v16(p + 16);
     fp8v32 v;
@@ -99,7 +119,7 @@ __device__ __forceinline__ fp8v32 mw8_ld_frag(const unsigned char* p) {
  * same arithmetic as QuantFp8Block128 (amax floored at 1e-10, /448, RNE e4m3), so the pair is
  * bit-identical to quant + i[7] = 2 without the op, its hop and the xq/xs round trip. The output is
  * the plain single-term fq rows DOWN i[7] = 2 reads. */
-template <bool GLU, bool SPLIT = false, bool LO = true>
+template <bool GLU, bool SPLIT = false, bool LO = true, unsigned GNB = 256u>
 __device__ void d_moe_pf_w8a8(void* __restrict__ Cout, float* __restrict__ fs_out,
                               const unsigned char* __restrict__ Aq, const float* __restrict__ As,
                               unsigned as_stride, const unsigned long long* __restrict__ wtab,
@@ -109,11 +129,23 @@ __device__ void d_moe_pf_w8a8(void* __restrict__ Cout, float* __restrict__ fs_ou
                               unsigned n_exp, unsigned act, float beta, float lbeta,
                               unsigned part16, unsigned slice, unsigned nblk,
                               unsigned char* lds) {
-    constexpr unsigned NB = GLU ? 256u : 512u; /* output columns per tile */
+    static_assert(GNB == 256u || GNB == 128u, "GLU tile is 256 or 128 columns");
+    constexpr unsigned NB = GLU ? GNB : 512u; /* output columns per tile */
     const unsigned tid = threadIdx.x, lane = tid & 63u, wave = tid >> 6;
+    const bool wact = !GLU || wave < NB / 32u; /* wave-uniform: this wave owns B columns */
     const unsigned l32 = lane & 31u, hi = lane >> 5;
     const int* rowoff = meta;
     const int* tilep = meta + 2 * (int)n_exp;
+#if PLOW_MOE_DEC_W8_SPLITN
+    if constexpr (GLU && GNB == 256u) {
+        if (N % 256u == 0u && 2u * (unsigned)tilep[n_exp] * (N / 256u) <= nblk) {
+            d_moe_pf_w8a8<GLU, SPLIT, LO, 128u>(Cout, fs_out, Aq, As, as_stride, wtab, stab, meta,
+                                               rowmap, row_gate, N, K, n_exp, act, beta, lbeta,
+                                               part16, slice, nblk, lds);
+            return;
+        }
+    }
+#endif
     const unsigned tn = (N + NB - 1u) / NB;
     const unsigned n_tiles = (unsigned)tilep[n_exp] * tn;
     const unsigned KB = K >> 7;
@@ -143,10 +175,17 @@ __device__ void d_moe_pf_w8a8(void* __restrict__ Cout, float* __restrict__ fs_ou
         const unsigned cb0 = GLU ? n0 + 32u * wave : n0 + 64u * wave;
         const unsigned cb1 = GLU ? cb0 : cb0 + 32u;
         const unsigned brow0 = cb0 + l32, brow1 = cb1 + l32;
+#if MW8_NOBR
+        const unsigned char* const bp0 = W0 + (size_t)min(brow0, N - 1u) * K + hi * 32u;
+        const unsigned char* const bp1 = W1 + (size_t)min(brow1, N - 1u) * K + hi * 32u;
+        const float* const sp0 = S0 + (size_t)(min(cb0, N - 1u) >> 7) * KB;
+        const float* const sp1 = S1 + (size_t)(min(cb1, N - 1u) >> 7) * KB;
+#else
         const unsigned char* const bp0 = brow0 < N ? W0 + (size_t)brow0 * K + hi * 32u : nullptr;
         const unsigned char* const bp1 = brow1 < N ? W1 + (size_t)brow1 * K + hi * 32u : nullptr;
         const float* const sp0 = S0 + (size_t)(cb0 >> 7) * KB;
         const float* const sp1 = S1 + (size_t)(cb1 >> 7) * KB;
+#endif
 
         const unsigned asrc = GLU ? rowmap[rowbase + sr] : rowbase + sr;
         const bool alive = !GLU || asrc != PLOW_EXPERT_UNUSED;
@@ -154,15 +193,37 @@ __device__ void d_moe_pf_w8a8(void* __restrict__ Cout, float* __restrict__ fs_ou
          * [hi K | lo K] 2K / 128 with lo at +K. */
         const size_t arow = SPLIT ? 2u * (size_t)K : (size_t)K;
         const unsigned akb = (SPLIT && GLU) ? 256u : 128u;
+        const unsigned as_step = GLU ? as_stride : 1u;
+        const unsigned a2off = GLU ? 16u : K;
+#if MW8_NOBR
+        const unsigned asrc_c = alive ? asrc : 0u;
+        const unsigned char* const ap = Aq + (size_t)asrc_c * arow + sc * ((SPLIT && GLU) ? 32u : 16u);
+        const bool s_live = !(SPLIT && GLU) && sc == 0u && alive;
+        const float* const asp = (SPLIT && GLU) ? nullptr : GLU ? As + asrc_c : As + (size_t)asrc_c * KB;
+        const fp8v16 a_keep = (fp8v16)(alive ? ~0u : 0u);
+#define MW8_LOAD_A(kb) ld_glob_fp8v16(ap + (kb) * akb)
+#define MW8_LOAD_A2(kb) ld_glob_fp8v16(ap + (kb) * akb + a2off)
+#define MW8_LOAD_S(kb) ((SPLIT && GLU) ? 0.0f : asp[(size_t)(kb) * as_step])
+#else
         const unsigned char* const ap =
             alive ? Aq + (size_t)asrc * arow + sc * ((SPLIT && GLU) ? 32u : 16u) : nullptr;
         const float* const asp = ((SPLIT && GLU) || sc != 0u || !alive) ? nullptr
                                  : GLU ? As + asrc : As + (size_t)asrc * KB;
-        const unsigned as_step = GLU ? as_stride : 1u;
-        const unsigned a2off = GLU ? 16u : K;
 #define MW8_LOAD_A(kb) (ap ? ld_glob_fp8v16(ap + (kb) * akb) : (fp8v16)(0u))
 #define MW8_LOAD_A2(kb) (ap ? ld_glob_fp8v16(ap + (kb) * akb + a2off) : (fp8v16)(0u))
 #define MW8_LOAD_S(kb) (asp ? asp[(size_t)(kb) * as_step] : 0.0f)
+#endif
+#if MW8_NOBR
+#define MW8_LOAD_B(kb, b, ws)                                                                  \
+    do {                                                                                       \
+        b[0][0] = mw8_ld_frag(bp0 + (kb) * 128u);                                              \
+        b[0][1] = mw8_ld_frag(bp0 + (kb) * 128u + 64u);                                        \
+        b[1][0] = mw8_ld_frag(bp1 + (kb) * 128u);                                              \
+        b[1][1] = mw8_ld_frag(bp1 + (kb) * 128u + 64u);                                        \
+        ws[0] = sp0[kb];                                                                       \
+        ws[1] = sp1[kb];                                                                       \
+    } while (0)
+#else
 #define MW8_LOAD_B(kb, b, ws)                                                                  \
     do {                                                                                       \
         b[0][0] = bp0 ? mw8_ld_frag(bp0 + (kb) * 128u) : (fp8v32)(0);                          \
@@ -172,6 +233,7 @@ __device__ void d_moe_pf_w8a8(void* __restrict__ Cout, float* __restrict__ fs_ou
         ws[0] = bp0 ? sp0[kb] : 0.0f;                                                          \
         ws[1] = bp1 ? sp1[kb] : 0.0f;                                                          \
     } while (0)
+#endif
 
         fp8v16 areg = MW8_LOAD_A(0);
         fp8v16 areg2 = (fp8v16)(0u);
@@ -181,6 +243,11 @@ __device__ void d_moe_pf_w8a8(void* __restrict__ Cout, float* __restrict__ fs_ou
         auto stage = [&](unsigned b) {
             unsigned char* const tb = lds + b * 2u * MW8_A_BYTES;
             float* const sb = lds_s + b * MPF_BM;
+#if MW8_NOBR
+            areg &= a_keep;
+            if constexpr (SPLIT) areg2 &= a_keep;
+            sreg = mw8_sel(s_live, sreg);
+#endif
             if constexpr (SPLIT && GLU) {
                 /* areg|areg2 = 16 bf16 of this row's 128-group; the group is 8 adjacent lanes. */
                 float v[16];
@@ -257,63 +324,65 @@ __device__ void d_moe_pf_w8a8(void* __restrict__ Cout, float* __restrict__ fs_ou
                 MW8_LOAD_B(kb + 1u, bnxt, wnxt);
 #endif
             }
+            if (wact) {
 #if !MW8_BPF
-            MW8_LOAD_B(kb, bcur, wcur);
+                MW8_LOAD_B(kb, bcur, wcur);
 #endif
-            const unsigned char* abuf = lds + buf * 2u * MW8_A_BYTES;
-            const float* sbuf = lds_s + buf * MPF_BM;
+                const unsigned char* abuf = lds + buf * 2u * MW8_A_BYTES;
+                const float* sbuf = lds_s + buf * MPF_BM;
 #pragma unroll
-            for (int i = 0; i < 2; i++) {
-                const unsigned r = 32u * (unsigned)i + l32;
-                fp8v32 af[2], al[2];
+                for (int i = 0; i < 2; i++) {
+                    const unsigned r = 32u * (unsigned)i + l32;
+                    fp8v32 af[2], al[2];
 #pragma unroll
-                for (int s = 0; s < 2; s++) {
-                    const unsigned c = (unsigned)s * 4u + hi * 2u;
-                    const fp8v16 lo = *(const fp8v16*)(abuf + mw8_swz(r, c));
-                    const fp8v16 up = *(const fp8v16*)(abuf + mw8_swz(r, c + 1u));
-#pragma unroll
-                    for (int q = 0; q < 4; q++) {
-                        af[s][q] = (int)lo[q];
-                        af[s][4 + q] = (int)up[q];
-                    }
-                    if constexpr (SPLIT && LO) {
-                        const fp8v16 lo2 = *(const fp8v16*)(abuf + MW8_A_BYTES + mw8_swz(r, c));
-                        const fp8v16 up2 =
-                            *(const fp8v16*)(abuf + MW8_A_BYTES + mw8_swz(r, c + 1u));
+                    for (int s = 0; s < 2; s++) {
+                        const unsigned c = (unsigned)s * 4u + hi * 2u;
+                        const fp8v16 lo = *(const fp8v16*)(abuf + mw8_swz(r, c));
+                        const fp8v16 up = *(const fp8v16*)(abuf + mw8_swz(r, c + 1u));
 #pragma unroll
                         for (int q = 0; q < 4; q++) {
-                            al[s][q] = (int)lo2[q];
-                            al[s][4 + q] = (int)up2[q];
+                            af[s][q] = (int)lo[q];
+                            af[s][4 + q] = (int)up[q];
+                        }
+                        if constexpr (SPLIT && LO) {
+                            const fp8v16 lo2 = *(const fp8v16*)(abuf + MW8_A_BYTES + mw8_swz(r, c));
+                            const fp8v16 up2 =
+                                *(const fp8v16*)(abuf + MW8_A_BYTES + mw8_swz(r, c + 1u));
+#pragma unroll
+                            for (int q = 0; q < 4; q++) {
+                                al[s][q] = (int)lo2[q];
+                                al[s][4 + q] = (int)up2[q];
+                            }
                         }
                     }
-                }
-                float as[16];
+                    float as[16];
 #pragma unroll
-                for (int q = 0; q < 4; q++) {
-                    const float4 v =
-                        *(const float4*)(sbuf + 32u * (unsigned)i + 8u * (unsigned)q + 4u * hi);
-                    as[4 * q + 0] = v.x;
-                    as[4 * q + 1] = v.y;
-                    as[4 * q + 2] = v.z;
-                    as[4 * q + 3] = v.w;
-                }
-#pragma unroll
-                for (int j = 0; j < 2; j++) {
-                    f32x16 t = plow_mfma_fp8_32x32(af[0], bcur[j][0], (f32x16)(0.0f));
-                    t = plow_mfma_fp8_32x32(af[1], bcur[j][1], t);
-                    if constexpr (SPLIT && LO) {
-                        t = mw8_mfma_lo(al[0], bcur[j][0], t);
-                        t = mw8_mfma_lo(al[1], bcur[j][1], t);
+                    for (int q = 0; q < 4; q++) {
+                        const float4 v =
+                            *(const float4*)(sbuf + 32u * (unsigned)i + 8u * (unsigned)q + 4u * hi);
+                        as[4 * q + 0] = v.x;
+                        as[4 * q + 1] = v.y;
+                        as[4 * q + 2] = v.z;
+                        as[4 * q + 3] = v.w;
                     }
 #pragma unroll
-                    for (int el = 0; el < 16; el++)
-                        accf[i][j][el] = fmaf(t[el], as[el] * wcur[j], accf[i][j][el]);
-                }
+                    for (int j = 0; j < 2; j++) {
+                        f32x16 t = plow_mfma_fp8_32x32(af[0], bcur[j][0], (f32x16)(0.0f));
+                        t = plow_mfma_fp8_32x32(af[1], bcur[j][1], t);
+                        if constexpr (SPLIT && LO) {
+                            t = mw8_mfma_lo(al[0], bcur[j][0], t);
+                            t = mw8_mfma_lo(al[1], bcur[j][1], t);
+                        }
+#pragma unroll
+                        for (int el = 0; el < 16; el++)
+                            accf[i][j][el] = fmaf(t[el], as[el] * wcur[j], accf[i][j][el]);
+                    }
 #if MW8_SCHED
-                /* One row block's fragments, MFMAs and promotions at a time: interleaving both
-                 * keeps four 16-wide MFMA results live and spills. */
-                __builtin_amdgcn_sched_barrier(0);
+                    /* One row block's fragments, MFMAs and promotions at a time: interleaving both
+                     * keeps four 16-wide MFMA results live and spills. */
+                    __builtin_amdgcn_sched_barrier(0);
 #endif
+                }
             }
             if (more) {
                 stage(buf ^ 1u);
@@ -348,7 +417,7 @@ __device__ void d_moe_pf_w8a8(void* __restrict__ Cout, float* __restrict__ fs_ou
                 }
             __syncthreads();
             const unsigned groups = N >> 7;
-            if (tid < 2u * MPF_BM) {
+            if (tid < (NB / 128u) * MPF_BM) {
                 const unsigned r = tid & (MPF_BM - 1u), g = tid >> 6;
                 float amax = 1e-10f; /* AITER floors amax, not the scale */
 #pragma unroll
@@ -362,6 +431,7 @@ __device__ void d_moe_pf_w8a8(void* __restrict__ Cout, float* __restrict__ fs_ou
             unsigned char* const fq = (unsigned char*)Cout;
             const unsigned g = wave >> 2, col = n0 + 32u * wave + l32;
             const size_t frow = (SPLIT && LO) ? 2u * (size_t)N : (size_t)N;
+            if (wact)
 #pragma unroll
             for (int i = 0; i < 2; i++)
 #pragma unroll
