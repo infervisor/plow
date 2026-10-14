@@ -1124,7 +1124,13 @@ fn emit_glm53_program(
                 rows as u64 * c.hidden as u64 * 2,
             )
         });
-        let kda_fold = kda_x.map(|x| (x, s.kda_w[l].as_ref().unwrap().ln_w));
+        let mla_fold = hc_fold
+            && c.is_softmax(l as u32)
+            && emit_config::active().glm_hc_fold_mla
+            && !(emit_config::active().glm_norm_q128 && emit_config::active().glm_qkva_w8a8);
+        let kda_fold = kda_x
+            .map(|x| (x, s.kda_w[l].as_ref().unwrap().ln_w))
+            .or(mla_fold.then(|| (n.xn, n.lw[l].gin)));
         let c_pre = emit_glm53_hc_pre(
             b,
             c,
@@ -1157,7 +1163,7 @@ fn emit_glm53_program(
                     None,
                 )
             } else {
-                emit_glm_mla(
+                emit_glm_mla_ex(
                     b,
                     c,
                     n,
@@ -1171,6 +1177,7 @@ fn emit_glm53_program(
                     true,
                     &mut xgate,
                     &xr,
+                    mla_fold,
                 )
             }
         } else {
@@ -1453,6 +1460,7 @@ pub(crate) fn glm53_emit_full(
     rope_gen: bool,
     target: &str,
     verify: Option<&crate::VerifyHook>,
+    l2_layout: Option<packet::devbuild::L2Layout>,
 ) {
     let mut c = cfg_glm(dir);
     c.tp = tp;
@@ -1493,10 +1501,17 @@ pub(crate) fn glm53_emit_full(
     // handles point past the end of the serialized tensor table -> a null device address at load.
     let gfx950 = crate::emit_is_amd() && crate::amd_target::active().1 == hwspec::IsaLevel::Gfx950;
     let ec = emit_config::active();
+    let l2_pf =
+        l2_layout.filter(|_| std::env::var("PLOW_L2_PLACE_PREFILL").as_deref() == Ok("1"));
     for &rows in &pf {
         let mut b = Builder::new(n_cu);
         b.set_tensor_dedup(true);
         b.adopt_tensors(tensors.clone());
+        // Placement keeps the ordered (raw/lean) segments only under deny_uniseg.
+        b.set_l2_placement(l2_pf);
+        if l2_pf.is_some() {
+            b.deny_uniseg();
+        }
         // The exact BT64/D128 KDA chunk objects K3 ships (bit-identical to the interpreter arms).
         b.set_kda_intra_wave_items_segments(gfx950 && ec.kda_intra_wave_items);
         b.set_lean_kda_key_factor_segments(gfx950 && ec.kda_key_factor);
@@ -1526,6 +1541,10 @@ pub(crate) fn glm53_emit_full(
             b.set_tensor_dedup(true);
             b.adopt_tensors(tensors.clone());
             b.set_packed_prefill_segments(true);
+            b.set_l2_placement(l2_pf);
+            if l2_pf.is_some() {
+                b.deny_uniseg();
+            }
             b.set_lean_moe_fp8_segments(
                 gfx950
                     && ec.moe_fp8_pf_packed
@@ -1559,6 +1578,10 @@ pub(crate) fn glm53_emit_full(
             b.set_gemm_small_splitk_2p(ec.glm_dec_splitk_2p);
         }
         b.set_gemm_small_group_s(ec.glm_kda_proj_group_s.unwrap_or(0));
+        b.set_l2_placement(l2_layout);
+        if l2_layout.is_some() {
+            b.deny_uniseg();
+        }
         emit_glm53_program(&mut b, &c, &n, &s, ctx, rows, dbatch, enc, false);
         let prog = b.finish();
         tensors = prog.tensors.clone();
@@ -5285,6 +5308,7 @@ fn emit_glm_decode_gemm_lt(
 ///     `i[2]`/`i[3]` per step (`patch_kvrow` runs only at batch 1);
 ///   * the flash reads per-row `kv_len` (ragged, proven by `probes/raggedkv_*`).
 #[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn emit_glm_mla(
     b: &mut Builder,
     c: &GlmCfg,
@@ -5299,6 +5323,29 @@ pub(crate) fn emit_glm_mla(
     raw_output: bool,
     xgate: &mut u32,
     xr_cus: &[u32],
+) -> u32 {
+    emit_glm_mla_ex(
+        b, c, n, slot, ctx, rows, dbatch, enc, x_in, pre, raw_output, xgate, xr_cus, false,
+    )
+}
+
+/// `prenormed`: the single `pre` dep already wrote `n.xn = rmsnorm(x_in) * gin`.
+#[allow(clippy::too_many_arguments)]
+fn emit_glm_mla_ex(
+    b: &mut Builder,
+    c: &GlmCfg,
+    n: &GlmTn,
+    slot: usize,
+    ctx: u32,
+    rows: u32,
+    dbatch: u32,
+    enc: MoeEnc,
+    x_in: u32,
+    pre: &[u32],
+    raw_output: bool,
+    xgate: &mut u32,
+    xr_cus: &[u32],
+    prenormed: bool,
 ) -> u32 {
     let enc = if c.quark_mixed { MoeEnc::Bf16 } else { enc };
     let all = b.all();
@@ -5398,7 +5445,7 @@ pub(crate) fn emit_glm_mla(
     // blocks are emitted in slot order, layer 0's input comes from the embedding (nothing upstream
     // to fold into), and `seam_next_gin` is what guarantees the producer actually did it (it
     // returns None for the last slot, so the two ends of the seam agree by construction).
-    let seam_fold = slot > 0 && glm_fuse_seam(b, tp, w.gin);
+    let seam_fold = prenormed || (slot > 0 && glm_fuse_seam(b, tp, w.gin));
     let dec_norm_q = emit_config::active().glm_norm_q128
         && emit_config::active().glm_qkva_w8a8
         && !seam_fold
