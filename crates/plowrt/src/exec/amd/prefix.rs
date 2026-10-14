@@ -80,6 +80,15 @@ impl Region {
         }
     }
 }
+/// A kv tensor no instruction addresses (the pooled DSA indexer leaves the dense `kidx` cache
+/// allocated but unused) holds no request state, so it needs no snapshot or clone.
+fn mark_referenced(referenced: &mut [bool], d: &DevInst64) {
+    for &h in &d.t {
+        if let Some(r) = referenced.get_mut(h as usize) {
+            *r = true;
+        }
+    }
+}
 pub(super) fn snapshot_regions<'a>(
     tensors: &[DevTensor],
     instructions: impl Iterator<Item = &'a DevInst64> + Clone,
@@ -91,6 +100,7 @@ pub(super) fn snapshot_regions<'a>(
     }
     let mut known = vec![false; tensors.len()];
     let mut needed = vec![false; tensors.len()];
+    let mut referenced = vec![false; tensors.len()];
     let mut regions = Vec::new();
     for (i, t) in tensors.iter().enumerate() {
         if super::is_carried_state(&t.name) && !t.name.contains("blkres") {
@@ -109,6 +119,7 @@ pub(super) fn snapshot_regions<'a>(
         }
     }
     for d in instructions.clone() {
+        mark_referenced(&mut referenced, d);
         if d.op == DevOp::IndexFp8Decode as u16 || d.op == DevOp::IndexFp8Prefill as u16 {
             let index = d.t[4] as usize;
             let tensor = tensors.get(index)?;
@@ -252,7 +263,7 @@ pub(super) fn snapshot_regions<'a>(
         }
     }
     for (i, t) in tensors.iter().enumerate() {
-        if t.name.starts_with("kv.") && !t.name.contains("blkres") && !known[i] {
+        if t.name.starts_with("kv.") && !t.name.contains("blkres") && !known[i] && referenced[i] {
             return None;
         }
         if needed[i] && !regions.iter().any(|r| r.tensor == i) {
@@ -298,7 +309,9 @@ pub(super) fn clone_spans<'a>(
         return None;
     }
     let mut spans: Vec<CloneSpan> = Vec::new();
+    let mut referenced = vec![false; tensors.len()];
     for d in instructions {
+        mark_referenced(&mut referenced, d);
         if d.op == DevOp::DsaPoolCompress as u16 {
             let pool = d.i[1];
             for (h, row_bytes) in [(d.t[0], u64::from(d.i[2])), (d.t[1], 4u64)] {
@@ -369,6 +382,7 @@ pub(super) fn clone_spans<'a>(
     }
     for (i, t) in tensors.iter().enumerate() {
         if t.name.starts_with("kv.")
+            && referenced[i]
             && !super::is_carried_state(&t.name)
             && !regions.iter().any(|r| r.tensor == i)
             && !spans.iter().any(|s| s.tensor == i)
@@ -398,7 +412,9 @@ mod tests {
         assert!(snapshot_regions(&tensors, [d, prefill].iter(), 4, 64)
             .unwrap()
             .is_empty());
-        assert!(snapshot_regions(&tensors, [].iter(), 4, 64).is_none());
+        assert!(snapshot_regions(&tensors, [].iter(), 4, 64)
+            .unwrap()
+            .is_empty());
         let mut unknown = d;
         unknown.op = DevOp::RmsNorm as u16;
         assert!(snapshot_regions(&tensors, [d, unknown].iter(), 4, 64).is_none());
@@ -566,7 +582,11 @@ mod tests {
             tensor("kv.0.state", 4 * 256),
             tensor("kv.5.kidx", 4 * 64),
         ];
-        assert!(clone_spans(&extra, [d].iter(), &regions, 4).is_none());
+        assert!(clone_spans(&extra, [d].iter(), &regions, 4).is_some());
+        let mut other = d;
+        other.op = DevOp::RmsNorm as u16;
+        other.t[0] = 2;
+        assert!(clone_spans(&extra, [d, other].iter(), &regions, 4).is_none());
         let mut ring = d;
         ring.fj[2] = 63;
         assert!(clone_spans(&tensors, [ring].iter(), &[], 4).is_none());
