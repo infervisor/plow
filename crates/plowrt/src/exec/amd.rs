@@ -14090,12 +14090,36 @@ impl AmdEngine {
                     args.c[g] = addr(tens[2 + g]);
                 }
             }
-            if let Some(lt) = self
+            let lt = self
                 .gemm_lt
                 .as_ref()
-                .filter(|lt| lt.covers_group(&args.n, args.k))
-            {
-                lt.enqueue_group(&self.be, args.x, args.w, &args.c, &args.n, args.t, args.k)?;
+                .filter(|_| crate::config::RuntimeConfig::get().amd.gemm_group_lt);
+            let groups = lt.map_or(0, |lt| lt.group_prefix(&args.n, args.k));
+            if let Some(lt) = lt.filter(|_| groups > 0) {
+                lt.enqueue_group(
+                    &self.be, args.x, args.w, &args.c, &args.n, groups, args.t, args.k,
+                )?;
+                if groups == 6 || args.n[groups] == 0 {
+                    self.seg_launches += 1;
+                    return Ok(());
+                }
+                // The unpinned tail groups stay on the grouped kernel.
+                let skipped: u32 = args.n[..groups].iter().sum();
+                args.w += u64::from(skipped) * u64::from(args.k) * 2;
+                args.c.copy_within(groups.., 0);
+                args.n.copy_within(groups.., 0);
+                args.c[6 - groups..].fill(0);
+                args.n[6 - groups..].fill(0);
+                let grid = gemm_group_grid(args.t, &args.n);
+                EngineDevice::launch_kernel(
+                    &*self.be,
+                    kernel,
+                    grid,
+                    512,
+                    0,
+                    as_bytes(std::slice::from_ref(&args)),
+                    None,
+                )?;
                 self.seg_launches += 1;
                 return Ok(());
             }

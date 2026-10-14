@@ -200,7 +200,8 @@ fn gfx950_choice(rows: u32, n: u32, k: u32) -> Option<usize> {
         (4096, 1024) => [9, 7, 7],
         (1024, 128) => [10, 11, 12],
         (1024, 4096) => [13, 11, 14],
-        (128, 4096) | (8, 4096) => [15, 16, 17],
+        // KDA f_a/g_a. Not b (N=8): the narrow kernels fault on an 8-column edge.
+        (128, 4096) => [15, 16, 17],
         _ => return None,
     };
     Some(tiers[usize::from(rows > 2048) + usize::from(rows > 4096)])
@@ -641,16 +642,18 @@ impl GemmLt {
         })
     }
 
-    /// Whether every group of a `GemmGroupPf` instruction has a pinned gfx950 kernel.
-    pub fn covers_group(&self, n: &[u32; 6], k: u32) -> bool {
-        self.scratch.is_some()
-            && n.iter()
-                .filter(|&&n| n != 0)
-                .all(|&n| gfx950_choice(8192, n, k).is_some())
+    /// How many leading groups of a `GemmGroupPf` instruction have a pinned gfx950 kernel.
+    pub fn group_prefix(&self, n: &[u32; 6], k: u32) -> usize {
+        if self.scratch.is_none() {
+            return 0;
+        }
+        n.iter()
+            .take_while(|&&n| n != 0 && gfx950_choice(8192, n, k).is_some())
+            .count()
     }
 
-    /// `PLOW_AMD_GEMM_GROUP_LT`: one launch per group; group `g` reads weight rows
-    /// `sum(n[..g])..` of the row-concatenated `w`.
+    /// `PLOW_AMD_GEMM_GROUP_LT`: one launch per group of the leading `groups`; group `g` reads
+    /// weight rows `sum(n[..g])..` of the row-concatenated `w`.
     #[allow(clippy::too_many_arguments)]
     pub fn enqueue_group(
         &self,
@@ -659,6 +662,7 @@ impl GemmLt {
         w: u64,
         c: &[u64; 6],
         n: &[u32; 6],
+        groups: usize,
         rows: u32,
         k: u32,
     ) -> Result<()> {
@@ -668,7 +672,7 @@ impl GemmLt {
             .ok_or_else(|| RuntimeError::Device("grouped hipBLASLt route on gfx942".into()))?
             .base;
         let mut weight = w;
-        for (&out, &nn) in c.iter().zip(n).take_while(|(_, &nn)| nn != 0) {
+        for (&out, &nn) in c.iter().zip(n).take(groups) {
             let index = gfx950_choice(rows, nn, k)
                 .ok_or_else(|| RuntimeError::Device("grouped hipBLASLt shape unpinned".into()))?;
             let route = Route {
