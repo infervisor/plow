@@ -5777,6 +5777,11 @@ fn arrival_key(arrived: Instant, now: Instant) -> u64 {
     u64::MAX - u64::try_from(now.saturating_duration_since(arrived).as_nanos()).unwrap_or(u64::MAX)
 }
 
+#[cfg(feature = "cuda")]
+fn pf_itl_budget_ms() -> u32 {
+    crate::config::RuntimeConfig::get().pf_itl_budget_ms
+}
+
 /// RTX-12 chunked packing: per-REQUEST cap on the prefill rows one request may
 /// contribute to a single batched launch. `PLOW_PF_CHUNK=C` clamps each waiting
 /// request's slice to `C` rows so the `per_launch` budget (`PLOW_PF_INTERLEAVE`)
@@ -5787,10 +5792,6 @@ fn arrival_key(arrived: Instant, now: Instant) -> u64 {
 /// Unset and `0` both mean uncapped, so the default IS the zero sentinel.
 /// Reads `RuntimeConfig::get().pf_chunk_rows()`.
 #[cfg(feature = "cuda")]
-fn pf_itl_budget_ms() -> u32 {
-    crate::config::RuntimeConfig::get().pf_itl_budget_ms
-}
-
 fn pf_chunk_rows() -> usize {
     crate::config::RuntimeConfig::get().pf_chunk_rows()
 }
@@ -6000,7 +6001,9 @@ fn gpu_prefill_batched_pass(
         } else {
             None
         };
-        // The rung holds the riders too: their rows are reserved inside it.
+        // The rung holds the riders too: their rows are reserved inside it. A rung the riders
+        // would half fill leaves the prompt crawling; such a budget is ignored.
+        let itl_cap = itl_cap.filter(|&cap| decode_rows * 2 <= cap);
         let (launch_cap, launch_max) = match itl_cap {
             Some(cap) => (
                 launch_cap.min(cap.saturating_sub(decode_rows).max(1)),
