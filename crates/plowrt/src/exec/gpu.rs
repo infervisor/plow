@@ -9853,9 +9853,9 @@ impl GpuEngine {
                         g,
                         seg_pf.as_ref().is_some_and(|sp| sp.glu_quant_any_width),
                     )
-                        .into_iter()
-                        .filter(|(seg, _)| packet_role_index(&packet_segment_roles, *seg).is_none())
-                        .collect::<Vec<_>>()
+                    .into_iter()
+                    .filter(|(seg, _)| packet_role_index(&packet_segment_roles, *seg).is_none())
+                    .collect::<Vec<_>>()
                 } else {
                     Vec::new()
                 };
