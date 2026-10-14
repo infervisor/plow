@@ -11291,7 +11291,17 @@ fn emit_glm_moe_ffn_rows(
         } else {
             c_rn2
         };
+        // PLOW_MOE_W8A8_DEC: j1 = mark | bound on the align's 64-row tiles.
+        let dec_mark = (pf_fq && emit_config::active().moe_w8a8_dec).then(|| {
+            let slots = rows * tk_route;
+            let tiles = e_route.min(slots) + slots / 64;
+            assert!(tiles < 0x1_0000, "PLOW_MOE_W8A8_DEC tile bound {tiles} overflows j1");
+            packet::dev::MOE_W8A8_DEC_MARK | tiles
+        });
         let c_g = b.emit(DevOp::MoeGroupGluPf, all.clone(), &[c_routes, c_x], |d| {
+            if let Some(m) = dec_mark {
+                d.j[1] = m;
+            }
             d.t[0] = n.fu_g;
             d.t[1] = n.xn2;
             d.t[2] = w.ewt;
@@ -11342,6 +11352,9 @@ fn emit_glm_moe_ffn_rows(
             if pf_w8a8 {
                 d.t[5] = n.fu_scale;
                 d.i[7] = if pf_split { 4 } else { 2 };
+            }
+            if let Some(m) = dec_mark {
+                d.j[1] = m;
             }
         })
     };

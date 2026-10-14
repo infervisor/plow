@@ -264,7 +264,7 @@ fn grouped_moe_decode_pair_routes_with_exact_mxfp4_abi() {
         .map(|i| DeviceMem::view(0x1000 + i * 0x1000, 0x1000))
         .collect();
     let DecodeSegmentRoute::GroupedMoeMxfp4 { glu, down, grid } =
-        decode_segment_routes(&prog, &[], &[], &devp).unwrap()[0]
+        decode_segment_routes(&prog, &[], &[], &devp, 0).unwrap()[0]
     else {
         panic!("grouped MoE pair did not take standalone route")
     };
@@ -1025,7 +1025,7 @@ fn decode_mla_pair_routes_as_one_specialist_segment() {
         ]
     );
     assert!(matches!(
-        decode_segment_routes(&p, &[], &[], &[]).unwrap()[1],
+        decode_segment_routes(&p, &[], &[], &[], 0).unwrap()[1],
         DecodeSegmentRoute::MlaAttention
     ));
 }
@@ -1059,7 +1059,7 @@ fn mixed_decode_mla_ops_remain_on_the_ordinary_interpreter() {
         [DecodeSegmentKind::Interpreter]
     );
     assert!(!requires_segmented_decode(
-        &decode_segment_routes(&p, &[], &[], &[]).unwrap()
+        &decode_segment_routes(&p, &[], &[], &[], 0).unwrap()
     ));
 }
 
@@ -1082,7 +1082,7 @@ fn fused_decode_rejects_one_raw_instruction_in_multiple_segments() {
 fn fused_decode_v1_descriptor_fails_closed() {
     let mut p = segmented_decode_probe();
     p.insts[1].i[7] = 1;
-    let err = decode_segment_routes(&p, &[], &[], &[])
+    let err = decode_segment_routes(&p, &[], &[], &[], 0)
         .expect_err("KDA fused ABI v1 must not route to the v2 object")
         .to_string();
     assert!(err.contains("version=1"), "{err}");
@@ -1116,7 +1116,7 @@ fn fused_decode_descriptor_builds_the_exact_raw_kernarg() {
     let devp: Vec<DeviceMem> = (0..18)
         .map(|i| DeviceMem::view(0x1000 + i * 0x1000, 1 << 20))
         .collect();
-    let routes = decode_segment_routes(&p, &tensors, &init, &devp).unwrap();
+    let routes = decode_segment_routes(&p, &tensors, &init, &devp, 0).unwrap();
     let DecodeSegmentRoute::KdaDecodeFused(a) = routes[1] else {
         panic!("segment 1 must route to the raw object")
     };

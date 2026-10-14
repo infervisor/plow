@@ -214,6 +214,7 @@ enum DecodeSegmentKind {
     MlaAttention,
     KdaDecodeFused(usize),
     HcMix(usize),
+    MoeW8a8Dec { glu: usize, down: usize },
     MoeAiter,
     GemmLt,
     GroupedMoeMxfp4 { glu: usize, down: usize },
@@ -247,6 +248,7 @@ fn decode_segment_kinds(prog: &DevProg) -> Result<Vec<DecodeSegmentKind>> {
         let mut sparse_mla_inst = None;
         let mut sparse_mla_pure = true;
         let mut has_other = false;
+        let mut w8_pair: Vec<(usize, bool)> = Vec::new();
         for e in prog.stream.iter().filter(|e| e.seg as usize == seg) {
             let inst = prog.insts.get(e.inst as usize).ok_or_else(|| {
                 RuntimeError::Device(format!(
@@ -323,6 +325,16 @@ fn decode_segment_kinds(prog: &DevProg) -> Result<Vec<DecodeSegmentKind>> {
                     Some(i) if i == e.inst as usize => {}
                     Some(_) => *multiple = true,
                 }
+            } else if packet::dev::moe_w8a8_dec_marked(inst) {
+                if e.wait_len != 0 || e.succ_len != 0 || e.flags & SE_XCTR != 0 {
+                    return Err(RuntimeError::Device(format!(
+                        "W8A8 decode MoE instruction {} has counter obligations in segment {seg}",
+                        e.inst
+                    )));
+                }
+                if !w8_pair.iter().any(|&(i, _)| i == e.inst as usize) {
+                    w8_pair.push((e.inst as usize, inst.op == DevOp::MoeGroupGluPf as u16));
+                }
             } else if amd_sparse_mla::sparse_decode_inst(inst) {
                 // A native boundary only when isolated and counter-free; the ordinary emit
                 // leaves this op inside an interpreter segment.
@@ -335,6 +347,37 @@ fn decode_segment_kinds(prog: &DevProg) -> Result<Vec<DecodeSegmentKind>> {
             } else {
                 has_other = true;
             }
+        }
+        if !w8_pair.is_empty() {
+            let pair = match w8_pair[..] {
+                [(g, true), (d, false)] if d == g + 1 => Some((g, d)),
+                _ => None,
+            };
+            let Some((glu, down)) = pair.filter(|_| {
+                !has_other
+                    && fused_inst.is_none()
+                    && mla_flash_inst.is_none()
+                    && mla_merge_inst.is_none()
+                    && moe_glu_inst.is_none()
+                    && moe_down_inst.is_none()
+                    && sparse_mla_inst.is_none()
+            }) else {
+                return Err(RuntimeError::Device(format!(
+                    "decode segment {seg} is not a pure adjacent W8A8 decode MoE GLU+DOWN pair"
+                )));
+            };
+            for ix in [glu, down] {
+                match raw_segment_owner[ix] {
+                    Some(owner) if owner != seg => {
+                        return Err(RuntimeError::Device(format!(
+                            "raw instruction {ix} is referenced by segments {owner} and {seg}"
+                        )))
+                    }
+                    _ => raw_segment_owner[ix] = Some(seg),
+                }
+            }
+            kinds[seg] = DecodeSegmentKind::MoeW8a8Dec { glu, down };
+            continue;
         }
         if let Some(inst) = fused_inst {
             let name = if hc_mix_raw(&prog.insts[inst]) {
@@ -2470,6 +2513,135 @@ fn add_moe_fp8_pf_routes(
     Ok(())
 }
 
+/// PLOW_MOE_W8A8_DEC: the marked decode GLU (i7 = 6) + DOWN (i7 = 2) pair on
+/// `moe_w8a8_dec_gfx950.elf`. Grids cover every 32-row half of the j1 tile bound.
+/// `plow_moe_w8a8_dec_pair`: both grids in one launch; `ctr` is the engine's zeroed u32
+/// [2 * 2 * tiles] counter scratch, which the kernel leaves zeroed.
+#[derive(Clone, Copy, Debug)]
+#[repr(C)]
+struct MoeW8a8DecPairArgs {
+    glu: MoeFp8GluArgs,
+    down: MoeFp8DownArgs,
+    ctr: u64,
+    grid_glu: u32,
+    reserved: u32,
+}
+
+const _: () = assert!(std::mem::size_of::<MoeW8a8DecPairArgs>() == 192);
+
+/// Largest j1 tile bound over the marked decode pairs (sizes the pair counter scratch).
+fn moe_w8a8_dec_max_tiles<'a>(progs: impl IntoIterator<Item = &'a DevProg>) -> u32 {
+    progs
+        .into_iter()
+        .flat_map(|p| p.insts.iter())
+        .filter(|d| packet::dev::moe_w8a8_dec_marked(d))
+        .map(|d| d.fj[2] & 0xffff)
+        .max()
+        .unwrap_or(0)
+}
+
+fn moe_w8a8_dec_route(
+    g: &packet::dev::DevInst64,
+    d: &packet::dev::DevInst64,
+    devp: &[DeviceMem],
+    pair_ctr: u64,
+) -> Result<DecodeSegmentRoute> {
+    let tiles = g.fj[2] & 0xffff;
+    if !packet::dev::moe_w8a8_dec_marked(g)
+        || !packet::dev::moe_w8a8_dec_marked(d)
+        || g.op != DevOp::MoeGroupGluPf as u16
+        || d.op != DevOp::MoeGroupDownPf as u16
+        || d.fj[2] != g.fj[2]
+        || g.i[6] > 1
+        || d.i[6] > 1
+        || tiles == 0
+        || g.i[0] == 0
+        || g.i[0] % 256 != 0
+        // The object's GLU k-pipeline depth (<= 8) must divide hidden / 128.
+        || g.i[1] == 0
+        || g.i[1] % 1024 != 0
+        || g.i[2] == 0
+        || d.i[0] != g.i[1]
+        || d.i[1] != g.i[0]
+        || d.i[2] != g.i[2]
+        || d.t[1] != g.t[0]
+        || d.t[5] != g.t[7]
+        || d.t[4] != g.t[4]
+        // One weight / scale table: an expert skipped by GLU is skipped by DOWN (the fused
+        // pair's DOWN items would otherwise wait on it forever).
+        || d.t[2] != g.t[2]
+        || d.t[3] != g.t[3]
+        || d.i[4] != 0
+        || d.i[5] != 0
+    {
+        return Err(RuntimeError::Device(
+            "W8A8 decode MoE pair has unsupported or inconsistent geometry".into(),
+        ));
+    }
+    let addr = |h: u16, what: &str| -> Result<u64> {
+        devp.get(h as usize)
+            .map(|m| m.base)
+            .filter(|&b| b != 0)
+            .ok_or_else(|| {
+                RuntimeError::Device(format!("W8A8 decode MoE operand `{what}` handle {h} is invalid"))
+            })
+    };
+    let route = DecodeSegmentRoute::MoeW8a8Dec {
+        glu: MoeFp8GluArgs {
+            out: addr(g.t[0], "fq")?,
+            x: addr(g.t[1], "x")?,
+            weight_table: addr(g.t[2], "weight_table")?,
+            scale_table: addr(g.t[3], "scale_table")?,
+            meta: addr(g.t[4], "meta")?,
+            row_token: addr(g.t[5], "row_token")?,
+            x_scale: 0,
+            out_scale: addr(g.t[7], "fs")?,
+            inter: g.i[0],
+            hidden: g.i[1],
+            experts: g.i[2],
+            act: g.i[5],
+            beta: f32::from_bits(g.fj[0]),
+            linear_beta: f32::from_bits(g.fj[1]),
+            x_pitch: 0,
+            reserved: 0,
+        },
+        down: MoeFp8DownArgs {
+            part: addr(d.t[0], "part")?,
+            fu: addr(d.t[1], "fq")?,
+            weight_table: addr(d.t[2], "weight_table")?,
+            scale_table: addr(d.t[3], "scale_table")?,
+            meta: addr(d.t[4], "meta")?,
+            row_partidx: addr(d.t[6], "row_partidx")?,
+            row_gate: addr(d.t[7], "row_gate")?,
+            fu_scale: addr(d.t[5], "fs")?,
+            hidden: d.i[0],
+            inter: d.i[1],
+            experts: d.i[2],
+            reserved: 0,
+        },
+        grid_glu: 2 * tiles * (g.i[0] / 128),
+        grid_down: 2 * tiles * d.i[0].div_ceil(256),
+    };
+    Ok(match route {
+        DecodeSegmentRoute::MoeW8a8Dec {
+            glu,
+            down,
+            grid_glu,
+            grid_down,
+        } if pair_ctr != 0 => DecodeSegmentRoute::MoeW8a8DecPair {
+            args: MoeW8a8DecPairArgs {
+                glu,
+                down,
+                ctr: pair_ctr,
+                grid_glu,
+                reserved: 0,
+            },
+            grid: grid_glu + grid_down,
+        },
+        r => r,
+    })
+}
+
 fn has_moe_prefill_ep(prog: &DevProg) -> bool {
     prog.insts.iter().any(|d| moe_ep_degree(d).is_some())
 }
@@ -3148,6 +3320,16 @@ enum DecodeSegmentRoute {
     KdaDecodeFused(KdaDecodeFusedArgs),
     KdaDecodeWide(KdaDecodeWideArgs),
     HcMix(HcMixArgs),
+    MoeW8a8Dec {
+        glu: MoeFp8GluArgs,
+        down: MoeFp8DownArgs,
+        grid_glu: u32,
+        grid_down: u32,
+    },
+    MoeW8a8DecPair {
+        args: MoeW8a8DecPairArgs,
+        grid: u32,
+    },
     MoeAiter(amd_moe_aiter::Route),
     GemmLt(amd_gemm_lt::Route),
     SparseMlaDecode(amd_sparse_mla::DecodeRoute),
@@ -3184,6 +3366,7 @@ fn decode_segment_routes(
     tensors: &[crate::asset::devblob::DevTensor],
     init: &[u8],
     devp: &[DeviceMem],
+    moe_dec_pair_ctr: u64,
 ) -> Result<Vec<DecodeSegmentRoute>> {
     let kinds = decode_segment_kinds(prog)?;
     let aiter = amd_moe_aiter::routes(prog, tensors, kinds.len())?;
@@ -3249,6 +3432,15 @@ fn decode_segment_routes(
                     init,
                     devp,
                 )?));
+                continue;
+            }
+            DecodeSegmentKind::MoeW8a8Dec { glu, down } => {
+                routes.push(moe_w8a8_dec_route(
+                    &prog.insts[glu],
+                    &prog.insts[down],
+                    devp,
+                    moe_dec_pair_ctr,
+                )?);
                 continue;
             }
             DecodeSegmentKind::GroupedMoeMxfp4 { glu, down } => {
@@ -6753,6 +6945,7 @@ pub struct AmdEngine {
     k_kda_decode_fused: Option<HsaKernel>,
     k_kda_decode_wide: Option<HsaKernel>,
     k_hc_mix: Option<HsaKernel>,
+    k_moe_w8a8_dec: Option<[HsaKernel; 3]>,
     k_grouped_moe_glu: Option<HsaKernel>,
     k_grouped_moe_down: Option<HsaKernel>,
     k_kda_chunk_intra_cached: Option<HsaKernel>,
@@ -6762,6 +6955,7 @@ pub struct AmdEngine {
     k_kda_key_factor_carry: Option<HsaKernel>,
     /// One reusable `[hi | lo]` BF16 key-factor pair, sized for the widest eligible program.
     _kda_key_factor_scratch: Option<DeviceMem>,
+    _moe_dec_pair_ctr: Option<DeviceMem>,
     k_kda_chunk_wu_lean: Option<HsaKernel>,
     k_gemm_group: Option<HsaKernel>,
     k_mla_pf_dense: Option<HsaKernel>,
@@ -8887,6 +9081,55 @@ impl AmdEngine {
             None
         };
 
+        let need_moe_w8a8_dec = blob
+            .decode_phase()
+            .flat_map(|p| p.insts.iter())
+            .any(packet::dev::moe_w8a8_dec_marked);
+        let k_moe_w8a8_dec = if need_moe_w8a8_dec {
+            if arch != "gfx950" {
+                return Err(RuntimeError::Device(format!(
+                    "PLOW_MOE_W8A8_DEC requires gfx950, but this device is {arch}"
+                )));
+            }
+            const NAME: &str = "moe_w8a8_dec_gfx950.elf";
+            const MARKER: &str = "plow_moe_w8a8_dec_abi_1";
+            let path = hsaco_dir.join(NAME);
+            let image = std::fs::read(&path).map_err(|e| {
+                RuntimeError::Device(format!(
+                    "PLOW_MOE_W8A8_DEC requires standalone object {}: {e}",
+                    path.display()
+                ))
+            })?;
+            if !elf_symbol_names(&image).contains(&MARKER) {
+                return Err(RuntimeError::Device(format!(
+                    "{} does not advertise `{MARKER}`; refusing a stale object",
+                    path.display()
+                )));
+            }
+            let module = EngineDevice::module_load(&*be, &image)
+                .map_err(|e| RuntimeError::Device(format!("{}: {e}", path.display())))?;
+            let mut ks = Vec::with_capacity(3);
+            for (sym, want) in [
+                ("plow_moe_w8a8_dec_glu", std::mem::size_of::<MoeFp8GluArgs>() as u32),
+                ("plow_moe_w8a8_dec_down", std::mem::size_of::<MoeFp8DownArgs>() as u32),
+                ("plow_moe_w8a8_dec_pair", std::mem::size_of::<MoeW8a8DecPairArgs>() as u32),
+            ] {
+                let k = EngineDevice::get_function(&*be, &module, sym)
+                    .map_err(|e| RuntimeError::Device(format!("{NAME}: no symbol {sym}: {e}")))?;
+                let got = k.kernarg_size();
+                if (got != want && got != want + 256) || k.private_segment_size() != 0 {
+                    return Err(RuntimeError::Device(format!(
+                        "{NAME}/{sym}: kernarg segment is {got} B (ABI needs {want}) or private memory is used"
+                    )));
+                }
+                ks.push(k);
+            }
+            modules.push(module);
+            Some([ks[0], ks[1], ks[2]])
+        } else {
+            None
+        };
+
         let (k_grouped_moe_glu, k_grouped_moe_down) = if need_grouped_moe {
             if arch != "gfx950" {
                 return Err(RuntimeError::Device(format!(
@@ -10815,6 +11058,18 @@ impl AmdEngine {
             } else {
                 0
             };
+        // PLOW_MOE_W8A8_DEC_FUSED: per-half GLU counters for the one-launch decode MoE pair.
+        let d_moe_dec_pair_ctr = if k_moe_w8a8_dec.is_some()
+            && crate::config::RuntimeConfig::get().amd.moe_w8a8_dec_fused
+        {
+            let tiles = moe_w8a8_dec_max_tiles(blob.decode_phase()) as u64;
+            let bytes = 16 * tiles.max(1);
+            let m = EngineDevice::alloc(&*be, bytes)?;
+            EngineDevice::memset_d8(&*be, m.base, 0, bytes as usize)?;
+            Some(m)
+        } else {
+            None
+        };
         let d_kda_key_factor_scratch = if kda_key_factor_half != 0 {
             let bytes = kda_key_factor_half.checked_mul(2).ok_or_else(|| {
                 RuntimeError::Device("KDA key-factor scratch pair size overflows".into())
@@ -10917,7 +11172,13 @@ impl AmdEngine {
             let (small_mla_split_sites, small_mla_split_segments) =
                 mla_prefill::split_sites(p, &blob.tensors)?;
             let decode_routes = if p.role.is_decode_rung() {
-                decode_segment_routes(p, &blob.tensors, &blob.init, &devp)?
+                decode_segment_routes(
+                    p,
+                    &blob.tensors,
+                    &blob.init,
+                    &devp,
+                    d_moe_dec_pair_ctr.as_ref().map_or(0, |m| m.base),
+                )?
             } else {
                 vec![DecodeSegmentRoute::Interpreter; seg_class.len()]
             };
@@ -12132,6 +12393,7 @@ impl AmdEngine {
             k_kda_decode_fused,
             k_kda_decode_wide,
             k_hc_mix,
+            k_moe_w8a8_dec,
             k_grouped_moe_glu,
             k_grouped_moe_down,
             k_kda_chunk_intra_cached,
@@ -12140,6 +12402,7 @@ impl AmdEngine {
             k_kda_key_factor_wu,
             k_kda_key_factor_carry,
             _kda_key_factor_scratch: d_kda_key_factor_scratch,
+            _moe_dec_pair_ctr: d_moe_dec_pair_ctr,
             k_kda_chunk_wu_lean,
             k_gemm_group,
             k_mla_pf_dense,
@@ -14106,6 +14369,8 @@ impl AmdEngine {
             Some(DecodeSegmentRoute::SparseMlaDecode(route)) if route.active => 3,
             Some(DecodeSegmentRoute::MoeAiter(route)) => route.launches() as usize,
             Some(DecodeSegmentRoute::GroupedMoeMxfp4 { .. }) => 2,
+            Some(DecodeSegmentRoute::MoeW8a8Dec { .. }) => 2,
+            Some(DecodeSegmentRoute::MoeW8a8DecPair { .. }) => 1,
             Some(_) => 1,
             None => 0,
         }
@@ -14588,6 +14853,49 @@ impl AmdEngine {
                     as_bytes(std::slice::from_ref(&args)),
                     None,
                 )?;
+            }
+            DecodeSegmentRoute::MoeW8a8DecPair { args, grid } => {
+                let [_, _, kp] = self.k_moe_w8a8_dec.ok_or_else(|| {
+                    RuntimeError::Device("W8A8 decode MoE segment has no validated object".into())
+                })?;
+                EngineDevice::launch_kernel(
+                    &*self.be,
+                    kp,
+                    grid,
+                    256,
+                    0,
+                    as_bytes(std::slice::from_ref(&args)),
+                    None,
+                )?;
+            }
+            DecodeSegmentRoute::MoeW8a8Dec {
+                glu,
+                down,
+                grid_glu,
+                grid_down,
+            } => {
+                let [kg, kd, _] = self.k_moe_w8a8_dec.ok_or_else(|| {
+                    RuntimeError::Device("W8A8 decode MoE segment has no validated object".into())
+                })?;
+                EngineDevice::launch_kernel(
+                    &*self.be,
+                    kg,
+                    grid_glu,
+                    256,
+                    0,
+                    as_bytes(std::slice::from_ref(&glu)),
+                    None,
+                )?;
+                EngineDevice::launch_kernel(
+                    &*self.be,
+                    kd,
+                    grid_down,
+                    256,
+                    0,
+                    as_bytes(std::slice::from_ref(&down)),
+                    None,
+                )?;
+                self.seg_launches += 1;
             }
             DecodeSegmentRoute::HcMix(args) => {
                 let kernel = self.k_hc_mix.ok_or_else(|| {

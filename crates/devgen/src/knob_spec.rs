@@ -1390,6 +1390,7 @@ pub const EMIT: &[KnobSpec] = &[
     KnobSpec::new("emit.moe_pf_w8a8", Some("PLOW_MOE_PF_W8A8"), Layer::Emit, Domain::Bool, OFF, OPT_IN),
     KnobSpec::new("emit.moe_pf_w8a8_split", Some("PLOW_MOE_PF_W8A8_SPLIT"), Layer::Emit, Domain::Bool, OFF, OPT_IN).with(C_MOE_PF_W8A8_SPLIT),
     KnobSpec::new("emit.moe_dec_w8a8", Some("PLOW_MOE_DEC_W8A8"), Layer::Emit, Domain::Bool, OFF, OPT_IN).with(C_MOE_DEC_W8A8),
+    KnobSpec::new("emit.moe_w8a8_dec", Some("PLOW_MOE_W8A8_DEC"), Layer::Emit, Domain::Bool, OFF, OPT_IN),
     KnobSpec::new("emit.moe_pf_w8a8_fq", Some("PLOW_MOE_PF_W8A8_FQ"), Layer::Emit, Domain::Bool, ON, PROMOTED),
     KnobSpec::new("emit.moe_stage1_body", Some("PLOW_MOE_STAGE1_BODY"), Layer::Emit, Domain::Bool, OFF, OPT_IN),
     KnobSpec::new("emit.moe_stage2_body", Some("PLOW_MOE_STAGE2_BODY"), Layer::Emit, Domain::Bool, OFF, OPT_IN),

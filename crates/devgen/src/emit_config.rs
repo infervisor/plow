@@ -1403,6 +1403,11 @@ pub struct EmitConfig {
     #[arg(long, env = "PLOW_MOE_DEC_W8A8", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
     pub moe_dec_w8a8: bool,
 
+    /// With PLOW_MOE_DEC_W8A8 (+ FQ): each decode-rung routed GLU+DOWN pair is marked (i6) and
+    /// runs as one segment on the standalone moe_w8a8_dec object (same bodies). Bit-identical.
+    #[arg(long, env = "PLOW_MOE_W8A8_DEC", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
+    pub moe_w8a8_dec: bool,
+
     /// `PLOW_MOE_PF_W8A8` single-term GLU quantizes its bf16 input rows in the A staging (GLU
     /// i[7] = 6) instead of a separate QuantFp8Block128: bit-identical, one op and the xq/xs
     /// round trip fewer per MoE/dense layer. Default on; `=0` restores the quant op.
@@ -1933,6 +1938,7 @@ impl EmitConfig {
             moe_pf_w8a8: env_bool("PLOW_MOE_PF_W8A8"),
             moe_pf_w8a8_split: env_bool("PLOW_MOE_PF_W8A8_SPLIT"),
             moe_dec_w8a8: env_bool("PLOW_MOE_DEC_W8A8"),
+            moe_w8a8_dec: env_bool("PLOW_MOE_W8A8_DEC"),
             moe_pf_w8a8_fq: env_bool_default_true("PLOW_MOE_PF_W8A8_FQ"),
             moe_stage1_body: env_bool("PLOW_MOE_STAGE1_BODY"),
             moe_stage2_body: env_bool("PLOW_MOE_STAGE2_BODY"),

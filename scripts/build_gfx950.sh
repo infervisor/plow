@@ -413,6 +413,12 @@ if [ "$ARCH" = gfx950 ]; then
     -DPLOW_LEAN_OBJECT=1 -DPLOW_NO_SPILL=1 \
     -DPLOW_REQUIRED_MARKER=plow_hc_mix_decode_1 \
     -I"$R/amd" -I"$R/common" "$R/amd/hc_mix_decode.hip"
+  # PLOW_MOE_W8A8_DEC: decode-rung W8A8 grouped MoE GLU + DOWN (marked op 85/86 pair).
+  bash "$R/cmake/hipcc_hsaco.sh" hipcc "$BUN" "$ARCH" \
+    "$OUT/moe_w8a8_dec_gfx950.elf" plow_moe_w8a8_dec_glu 512 1 \
+    -DPLOW_LEAN_OBJECT=1 -DPLOW_NO_SPILL=1 \
+    -DPLOW_REQUIRED_MARKER=plow_moe_w8a8_dec_abi_1 \
+    -I"$R/amd" -I"$R/common" "$R/amd/moe_w8a8_dec.hip"
 fi
 
 # Delete FIRST. A build that fails must leave nothing behind to run.

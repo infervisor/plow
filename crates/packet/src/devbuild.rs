@@ -2648,6 +2648,15 @@ impl Builder {
         let v2_env = knobs.seg_v2.clone();
         let seg_v2 = v2_env.as_deref() == Some("1");
         let seg_q8 = seg_v2 || v2_env.as_deref() == Some("q8");
+        let moe_w8a8_dec_pair = |i: usize| {
+            self.ops.get(i..i + 2).is_some_and(|pair| {
+                pair[0].inst.op == DevOp::MoeGroupGluPf as u16
+                    && pair[1].inst.op == DevOp::MoeGroupDownPf as u16
+                    && crate::dev::moe_w8a8_dec_marked_parts(pair[0].inst.op, &pair[0].inst.i, pair[0].inst.j[1])
+                    && crate::dev::moe_w8a8_dec_marked_parts(pair[1].inst.op, &pair[1].inst.i, pair[1].inst.j[1])
+            })
+        };
+        let decode_w8a8_moe = !uniseg && (0..self.ops.len()).any(moe_w8a8_dec_pair);
         let wave_class = |i: usize| -> u8 {
             let op = self.ops[i].inst.op;
             if decode_mla_bf16 && (bf16_pair(i) || (i > 0 && bf16_pair(i - 1))) {
@@ -2669,6 +2678,11 @@ impl Builder {
                         && self.ops[i - 1].inst.op == DevOp::MoeGroupGluFp8Blk as u16))
             {
                 20
+            } else if decode_w8a8_moe
+                && (moe_w8a8_dec_pair(i) || (i > 0 && moe_w8a8_dec_pair(i - 1)))
+            {
+                // PLOW_MOE_W8A8_DEC: the marked GLU+DOWN pair is one raw two-launch segment.
+                30
             } else if op == DevOp::MlaMaterializePack as u16 {
                 14
             } else if op == DevOp::FlashMlaMaterializedPrefill as u16 {
@@ -2890,11 +2904,14 @@ impl Builder {
             || decode_mla_segments
             || decode_mla_bf16
             || decode_grouped_moe
+            || decode_w8a8_moe
             || isolate_xreduce;
         let same_segment_dep = |consumer: usize, dep: &Dep| {
             let producer = dep.producer() as usize;
-            let raw_moe_pair_edge =
-                decode_grouped_moe && wave_class(consumer) == 20 && wave_class(producer) == 20;
+            let raw_moe_pair_edge = (decode_grouped_moe
+                && wave_class(consumer) == 20
+                && wave_class(producer) == 20)
+                || (decode_w8a8_moe && wave_class(consumer) == 30 && wave_class(producer) == 30);
             let raw_mla_pair_edge =
                 decode_mla_bf16 && wave_class(consumer) == 27 && wave_class(producer) == 27;
             !raw_moe_pair_edge

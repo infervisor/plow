@@ -2198,6 +2198,11 @@ pub struct AmdRuntimeConfig {
     #[arg(long = "amd-moe-fp8-pf", env = "PLOW_MOE_FP8_PF", default_value_t = true, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
     pub moe_fp8_pf: bool,
 
+    /// PLOW_MOE_W8A8_DEC segments run GLU + DOWN as ONE launch (`plow_moe_w8a8_dec_pair`, DOWN
+    /// items wait on per-half GLU counters) instead of two. Same bodies: bit-identical.
+    #[arg(long = "amd-moe-w8a8-dec-fused", env = "PLOW_MOE_W8A8_DEC_FUSED", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
+    pub moe_w8a8_dec_fused: bool,
+
     /// Download rank 0's copy of act tensors after the prefill/step:
     /// `name:path[,name:path...]`. A measurement instrument, not a serving path.
     #[arg(long = "amd-dump-act", env = "PLOW_DUMP_ACT", global = true)]
