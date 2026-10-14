@@ -687,9 +687,11 @@ pub(super) fn prefill_glu_quant_segments(g: &DevProg) -> Vec<(usize, Vec<usize>)
             let entries = g.gq_stream.get(w[0] as usize..w[1] as usize)?;
             let inst = entries.first()?.inst as usize;
             let d = g.insts.get(inst)?;
+            // The cached kernel's row walk holds 8 x 2048 elements; its GLU is GeGLU (act 0).
             let matches = d.op == DevOp::QuantFp8 as u16
                 && d.i[0] >= 32
-                && d.i[1] == 15360
+                && d.i[1] % 8 == 0
+                && d.i[1] <= 8 * 2048
                 && d.i[2] == 0
                 && d.t[..5].iter().all(|&t| t != packet::dev::TENSOR_NONE16)
                 && d.blocks != 0
@@ -823,6 +825,58 @@ pub(super) fn prefill_norm_rms_segments(g: &DevProg) -> Vec<(usize, Vec<usize>)>
             matches.then_some((seg, vec![n, n + 1]))
         })
         .collect()
+}
+
+/// Segments of one to four prefill HeadNormRope / HeadNormRopeFp8 instructions at hd 256/512
+/// (half-split rope, no fused KV pair), each over all of its slices: `plow_rope_pf` runs each
+/// as one launch at any grid.
+pub(super) fn prefill_rope_segments(g: &DevProg) -> Vec<(usize, Vec<usize>)> {
+    g.gq_seg_ofs
+        .windows(2)
+        .enumerate()
+        .filter_map(|(seg, w)| {
+            let entries = g.gq_stream.get(w[0] as usize..w[1] as usize)?;
+            let mut insts: Vec<usize> = Vec::new();
+            for e in entries {
+                if insts.last() != Some(&(e.inst as usize)) {
+                    insts.push(e.inst as usize);
+                }
+            }
+            let ok = (1..=4).contains(&insts.len())
+                && insts.windows(2).all(|w| w[0] < w[1])
+                && insts.iter().all(|&inst| {
+                    let Some(d) = g.insts.get(inst) else {
+                        return false;
+                    };
+                    let own: Vec<_> = entries.iter().filter(|e| e.inst as usize == inst).collect();
+                    d.blocks != 0
+                        && own.len() == usize::from(d.blocks)
+                        && own.iter().enumerate().all(|(i, e)| e.slice as usize == i)
+                        && (d.op == DevOp::HeadNormRope as u16
+                            || d.op == DevOp::HeadNormRopeFp8 as u16)
+                        && matches!(d.i[2], 256 | 512)
+                        && d.i[5] == 0
+                        && d.i[7] == 0
+                });
+            ok.then_some((seg, insts))
+        })
+        .collect()
+}
+
+/// One launch per HeadNormRope instruction, one warp per (token, head) item.
+pub(super) fn prefill_rope_route(
+    be: &Arc<CudaBackend>,
+    function: KernelFn,
+    kernarg: DevProgram,
+    g: &DevProg,
+    insts: &[usize],
+) -> LightRoute {
+    let mut route = prefill_light_route(be, function, kernarg, g, insts);
+    for launch in &mut route.launches {
+        let d = &g.insts[launch.instruction as usize];
+        launch.blocks = (d.i[0] * d.i[1]).div_ceil(8).clamp(1, 8 * be.sm_count());
+    }
+    route
 }
 
 /// The NormResidual+RmsNorm pair at one warp per row (`PLOW_NV_WARPS` = 8 rows per block).
@@ -2451,7 +2505,7 @@ mod tests {
     }
 
     #[test]
-    fn prefill_glu_quant_requires_exact_shape_and_complete_segment() {
+    fn prefill_glu_quant_requires_supported_shape_and_complete_segment() {
         let make = || {
             let (mut g, _) = fixture(128);
             g.insts[1].op = DevOp::QuantFp8 as u16;
@@ -2461,9 +2515,12 @@ mod tests {
         };
         let mut g = make();
         assert_eq!(prefill_glu_quant_segments(&g), vec![(1, vec![1])]);
-        for field in [0, 1, 2] {
+        let mut narrow = make();
+        narrow.insts[1].i[1] = 2112;
+        assert_eq!(prefill_glu_quant_segments(&narrow), vec![(1, vec![1])]);
+        for (field, value) in [(0, 1), (1, 4100), (1, 8 * 2048 + 8), (2, 1)] {
             let mut bad = make();
-            bad.insts[1].i[field] = [1, 4096, 1][field];
+            bad.insts[1].i[field] = value;
             assert!(prefill_glu_quant_segments(&bad).is_empty());
         }
         for tensor in 0..5 {

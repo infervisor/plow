@@ -6807,7 +6807,15 @@ fn emit_phase(
                     d.i[1] = c.hidden;
                     d.f[0] = c.eps;
                 });
-                let c_xn2 = b.emit(DevOp::RmsNorm, rows.clone(), &[c_pf], |d| {
+                // PLOW_EMIT_MOE_PF_LT_ROUTE: order the expert-input norm and the router after
+                // the dense branch's post-norm, so they sit next to the grouped GEMMs in the queue
+                // and `dense_cublaslt::apply_moe_prefill` can put them in the library segment.
+                let route_deps = if w8a8 && emit_config::active().moe_pf_lt_route {
+                    vec![c_pf, c_h1]
+                } else {
+                    vec![c_pf]
+                };
+                let c_xn2 = b.emit(DevOp::RmsNorm, rows.clone(), &route_deps, |d| {
                     d.t[0] = n.moe_xn2;
                     d.t[1] = n.x;
                     d.t[2] = w.g_pre2;
@@ -6816,7 +6824,7 @@ fn emit_phase(
                     d.f[0] = c.eps;
                 });
                 // T-token router -> routing_table[T*k] (block-per-token, bit-identical to decode).
-                let c_rt = b.emit(DevOp::MoeRouterGemmaPf, all.clone(), &[c_pf], |d| {
+                let c_rt = b.emit(DevOp::MoeRouterGemmaPf, all.clone(), &route_deps, |d| {
                     d.t[0] = n.moe_tab;
                     d.t[1] = n.x;
                     d.t[2] = w.rproj;

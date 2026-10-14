@@ -16,7 +16,7 @@
 
 use super::*;
 use crate::asset::devblob::DevTensor;
-use crate::device::cuda::lt::{GroupedDims, GroupedPlan, Lt};
+use crate::device::cuda::lt::{AttentionGemm, GroupedDims, GroupedPlan, Lt, Plan};
 
 pub(super) const OBJECT_FILE: &str = "interp_sm90a_moe_lt.cubin";
 const GLUE_THREADS: u32 = 256;
@@ -44,6 +44,23 @@ pub(super) struct MoeLtSegment {
     pf_tail: Option<PfTail>,
     /// W8A8 prefill: the GEMMs run e4m3 in cuBLASLt, the glue applies the scales.
     fp8: Option<Fp8Ops>,
+    /// W8A8 prefill (`PLOW_EMIT_MOE_PF_LT_ROUTE`): the router prologue the segment carries.
+    prologue: Option<Prologue>,
+}
+
+/// The expert-input `RmsNorm`, `MoeRouterGemmaPf`, `MoeAlignGemmaPf` and the activation
+/// `QuantFp8` (instructions `norm .. norm + 4`) of a segment emitted with
+/// `PLOW_EMIT_MOE_PF_LT_ROUTE`; devgen's `is_w8a8_route_prologue` emits this shape.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Prologue {
+    norm: usize,
+    /// x, gamma, xn2, xq, ascale, table, proj, rscale, pes.
+    handles: [u16; 9],
+    rows: u32,
+    top_k: u32,
+    norm_eps_bits: u32,
+    root_bits: u32,
+    router_eps_bits: u32,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -101,11 +118,15 @@ pub(super) fn instructions(segments: &[Option<MoeLtSegment>]) -> Vec<(usize, usi
                 let tail = route.tail.map(|t| [(seg, t.combine), (seg, t.nrn)]);
                 let pf_tail = route.pf_tail.map(|t| (seg, t.combine));
                 let quant = route.fp8.map(|f| (seg, f.quant));
+                let prologue = route
+                    .prologue
+                    .map(|p| (p.norm..p.norm + 4).map(move |i| (seg, i)));
                 [(seg, route.glu), (seg, route.down)]
                     .into_iter()
                     .chain(tail.into_iter().flatten())
                     .chain(pf_tail)
                     .chain(quant)
+                    .chain(prologue.into_iter().flatten())
             })
         })
         .flatten()
@@ -131,12 +152,17 @@ pub(super) fn segments(
             .gq_stream
             .get(bounds[0] as usize..bounds[1] as usize)
             .ok_or_else(fail)?;
-        let glu = entries.first().ok_or_else(fail)?.inst as usize;
-        if program
-            .insts
-            .get(glu)
-            .is_some_and(|g| g.op == DevOp::MoeGroupGluGemmaPfW8a8 as u16)
+        let first = entries.first().ok_or_else(fail)?.inst as usize;
+        let is_op =
+            |inst: usize, op: DevOp| program.insts.get(inst).is_some_and(|d| d.op == op as u16);
+        // A router prologue leads the segment four instructions before the W8A8 GLU.
+        let glu = if is_op(first, DevOp::RmsNorm) && is_op(first + 4, DevOp::MoeGroupGluGemmaPfW8a8)
         {
+            first + 4
+        } else {
+            first
+        };
+        if is_op(glu, DevOp::MoeGroupGluGemmaPfW8a8) {
             routes[segment] =
                 Some(w8a8_segment(program, tensors, segment, entries, glu).ok_or_else(fail)?);
             continue;
@@ -218,6 +244,7 @@ pub(super) fn segments(
             tail: None,
             pf_tail,
             fp8: None,
+            prologue: None,
         });
     }
     Ok(routes)
@@ -242,7 +269,13 @@ fn w8a8_segment(
     );
     let (q, d) = (insts.get(glu + 1)?, insts.get(glu + 2)?);
     let pf_tail = prefill_tail(program, tensors, glu + 2)?;
-    let members = glu..=glu + 3;
+    let first = entries.first()?.inst as usize;
+    let prologue = if first + 4 == glu {
+        Some(route_prologue(program, tensors, glu)?)
+    } else {
+        None
+    };
+    let members = first..=glu + 3;
     let [inter, hidden, experts] = [g.i[0], g.i[1], g.i[2]];
     let bytes = |handle: u16| tensors.get(handle as usize).map_or(0, |t| t.bytes);
     let capacity = bytes(g.t[0]) / (u64::from(inter.max(1)) * 2);
@@ -262,8 +295,8 @@ fn w8a8_segment(
         && aq.t[3..].iter().all(|&t| t == none)
         && [aq.i[0], aq.i[1]] == [program.t, hidden]
         && bytes(aq.t[1]) >= tokens * u64::from(hidden) * 2
-        && aq_segments().next().is_some()
-        && aq_segments().all(|s| s < segment)
+        && (prologue.is_some()
+            || (aq_segments().next().is_some() && aq_segments().all(|s| s < segment)))
         && q.op == DevOp::QuantFp8 as u16
         && d.op == DevOp::MoeGroupDownGemmaPfW8a8 as u16
         && entries.iter().all(|e| members.contains(&(e.inst as usize)))
@@ -317,6 +350,60 @@ fn w8a8_segment(
                 quant: glu + 1,
                 handles: [g.t[5], g.t[6], d.t[7]],
             }),
+            prologue,
+        })
+}
+
+/// The router prologue ending at the W8A8 GLU `glu`: `[RmsNorm, MoeRouterGemmaPf,
+/// MoeAlignGemmaPf, QuantFp8]` over the program's rows, feeding the GLU's activation, align
+/// tables and scales. The route's kernels cover at most 256 experts and top-k <= 32.
+fn route_prologue(program: &DevProg, tensors: &[DevTensor], glu: usize) -> Option<Prologue> {
+    let insts = &program.insts;
+    let norm = glu.checked_sub(4)?;
+    let [n, r, a, q, g] = [norm, norm + 1, norm + 2, norm + 3, glu].map(|i| insts.get(i));
+    let (n, r, a, q, g) = (n?, r?, a?, q?, g?);
+    let bytes = |handle: u16| tensors.get(handle as usize).map_or(0, |t| t.bytes);
+    let none = packet::dev::TENSOR_NONE16;
+    let rows = program.t;
+    let [hidden, experts] = [g.i[1], g.i[2]];
+    let top_k = a.i[2];
+    let row_bytes = u64::from(rows) * u64::from(hidden) * 2;
+    (n.op == DevOp::RmsNorm as u16
+        && r.op == DevOp::MoeRouterGemmaPf as u16
+        && a.op == DevOp::MoeAlignGemmaPf as u16
+        && q.op == DevOp::QuantFp8 as u16
+        && [n.i[0], n.i[1], n.i[2]] == [rows, hidden, 0]
+        && n.t[3] == none
+        && n.t[4] == none
+        && n.t[1] == r.t[1]
+        && [r.i[0], r.i[1], r.i[2], r.i[3]] == [hidden, experts, top_k, rows]
+        && [a.i[0], a.i[1]] == [rows, experts]
+        && a.t[1] == r.t[0]
+        && [a.t[0], a.t[2]] == [g.t[3], g.t[4]]
+        && q.t[1] == n.t[0]
+        && [q.t[0], q.t[2]] == [g.t[1], g.t[5]]
+        && [q.i[0], q.i[1]] == [rows, hidden]
+        && q.t[3] == none
+        && q.t[4] == none
+        && (1..=256).contains(&experts)
+        && (1..=32).contains(&top_k)
+        && hidden % 8 == 0
+        && [n.t[1], n.t[0]].iter().all(|&t| bytes(t) >= row_bytes)
+        && bytes(n.t[2]) >= u64::from(hidden) * 2
+        && bytes(r.t[0]) >= u64::from(rows) * u64::from(top_k) * 8
+        && bytes(r.t[2]) >= u64::from(experts) * u64::from(hidden) * 2
+        && bytes(r.t[3]) >= u64::from(hidden) * 2
+        && bytes(r.t[4]) >= u64::from(experts) * 2)
+        .then(|| Prologue {
+            norm,
+            handles: [
+                n.t[1], n.t[2], n.t[0], q.t[0], q.t[2], r.t[0], r.t[2], r.t[3], r.t[4],
+            ],
+            rows,
+            top_k,
+            norm_eps_bits: n.fj[0],
+            root_bits: r.fj[0],
+            router_eps_bits: r.fj[1],
         })
 }
 
@@ -438,6 +525,7 @@ pub(super) fn decode_segments(
             tail,
             pf_tail: None,
             fp8: None,
+            prologue: None,
         });
     }
     Ok(routes)
@@ -526,6 +614,11 @@ pub(super) struct MoeLt {
     combine_pf: Option<KernelFn>,
     /// ABI 6, the W8A8 prefill chain: setup, gather, scaled GLU + re-quantization, combine.
     fp8_glue: Option<[KernelFn; 4]>,
+    /// ABI 7, a router prologue: norm + quant + router operand, top-k, align.
+    route_glue: Option<[KernelFn; 3]>,
+    /// A router prologue's bf16 operand rows then its f32 logits, for `route_rows` rows.
+    route_scratch: Option<DeviceMem>,
+    route_rows: u32,
     /// e4m3 grouped matmuls (a W8A8 packet); fixed per engine.
     fp8: bool,
     blocks: u32,
@@ -554,6 +647,7 @@ pub(super) struct MoeLtRoute {
     pf_tail: Option<([u64; 3], u32, u32, f32)>,
     /// W8A8: `[ascale, est, fs]`.
     fp8: Option<[u64; 3]>,
+    prologue: Option<RoutePrologue>,
     meta: u64,
     row_token: u64,
     row_partidx: u64,
@@ -562,6 +656,18 @@ pub(super) struct MoeLtRoute {
     fu: u64,
     part: u64,
     act: u32,
+}
+
+/// A router prologue's operands, its logits matmul and its scalars.
+struct RoutePrologue {
+    plan: Plan,
+    /// x, gamma, xn2, xq, ascale, table, proj, rscale, pes, h2, logits.
+    pointers: [u64; 11],
+    rows: u32,
+    top_k: u32,
+    norm_eps: f32,
+    root: f32,
+    router_eps: f32,
 }
 
 impl MoeLt {
@@ -584,12 +690,13 @@ impl MoeLt {
         let abi = plow_asset::cubin::global_u32(&image, "plow_moe_lt_abi");
         if profile != "sm90a"
             || plow_asset::cubin::inspect(&image).is_none_or(|i| i.sm != 90)
-            || !matches!(abi, Some(1..=6))
+            || !matches!(abi, Some(1..=7))
             || (shape.fp8.is_some() && abi < Some(6))
+            || (shape.prologue.is_some() && abi < Some(7))
         {
             return Err(RuntimeError::Rejected(format!(
-                "{OBJECT_FILE}: not an sm90a MoE cuBLASLt glue object of ABI 1 to 6 \
-                 (a W8A8 segment needs 6)"
+                "{OBJECT_FILE}: not an sm90a MoE cuBLASLt glue object of ABI 1 to 7 \
+                 (a W8A8 segment needs 6, a router prologue 7)"
             )));
         }
         let module = DecodeModule::load(be, &image)?;
@@ -606,6 +713,19 @@ impl MoeLt {
         be.upload(&tables, 0, bytemuck::cast_slice(&constants))?;
         let gather = function("plow_moe_lt_gather")?;
         let blocks = be.occupancy_blocks_per_sm(gather, GLUE_THREADS, 0)?.max(1) * be.sm_count();
+        // The align pads each expert to a tile, so a bucket of T rows needs T * k <= capacity.
+        let route_rows = shape
+            .prologue
+            .map_or(0, |p| (capacity / u64::from(p.top_k)) as u32);
+        let route_scratch = shape
+            .prologue
+            .map(|_| {
+                be.alloc(
+                    0,
+                    u64::from(route_rows) * (u64::from(hidden) * 2 + u64::from(experts) * 4),
+                )
+            })
+            .transpose()?;
         tracing::info!(
             scratch_mib = (xs.len + gu.len) >> 20,
             capacity,
@@ -645,6 +765,17 @@ impl MoeLt {
                     ])
                 })
                 .transpose()?,
+            route_glue: (abi >= Some(7))
+                .then(|| -> Result<[KernelFn; 3]> {
+                    Ok([
+                        function("plow_moe_lt_route_pre")?,
+                        function("plow_moe_lt_route_topk")?,
+                        function("plow_moe_lt_route_align")?,
+                    ])
+                })
+                .transpose()?,
+            route_scratch,
+            route_rows,
             fp8: shape.fp8.is_some(),
             _module: module,
             blocks,
@@ -826,6 +957,11 @@ impl MoeLt {
         [segment.hidden, segment.inter, segment.experts] == [self.hidden, self.inter, self.experts]
             && segment.fp8.is_some() == self.fp8
             && u64::from(segment.capacity) * u64::from(self.hidden) * 2 <= self.xs.len
+            && segment.prologue.is_none_or(|p| {
+                self.route_glue.is_some()
+                    && self.route_scratch.is_some()
+                    && p.rows <= self.route_rows
+            })
     }
 
     pub(super) fn route(
@@ -864,6 +1000,37 @@ impl MoeLt {
         };
         let [ewt, meta, row_token, row_partidx, row_gate, xn2, fu, part] = segment.handles;
         let weights = self.weights(&devp[ewt as usize])?;
+        let prologue = segment
+            .prologue
+            .map(|p| -> Result<RoutePrologue> {
+                let scratch = self.route_scratch.as_ref().expect("checked by fits()");
+                let h2 = scratch.base;
+                let logits = h2 + u64::from(self.route_rows) * u64::from(self.hidden) * 2;
+                let [x, gamma, xn2, xq, ascale, table, proj, rscale, pes] = p.handles.map(base);
+                // logits[T][E] = h2[T][H] . proj[E][H]^T, bf16 x bf16 -> f32.
+                let plan = self.lt.attention_plan(
+                    AttentionGemm::Scores,
+                    true,
+                    p.rows,
+                    self.experts,
+                    self.experts,
+                    self.hidden,
+                    1,
+                    1,
+                )?;
+                Ok(RoutePrologue {
+                    plan,
+                    pointers: [
+                        x, gamma, xn2, xq, ascale, table, proj, rscale, pes, h2, logits,
+                    ],
+                    rows: p.rows,
+                    top_k: p.top_k,
+                    norm_eps: f32::from_bits(p.norm_eps_bits),
+                    root: f32::from_bits(p.root_bits),
+                    router_eps: f32::from_bits(p.router_eps_bits),
+                })
+            })
+            .transpose()?;
         let route = MoeLtRoute {
             owner: Arc::clone(self),
             plans: self.plans(segment.average_rows, weights.base, base(fu))?,
@@ -895,6 +1062,7 @@ impl MoeLt {
                 )
             }),
             fp8: segment.fp8.map(|f| f.handles.map(base)),
+            prologue,
             meta: base(meta),
             row_token: base(row_token),
             row_partidx: base(row_partidx),
@@ -916,6 +1084,11 @@ impl MoeLt {
         if let Some(fp8) = segment.fp8 {
             insts[fp8.quant].op = DevOp::Nop as u16;
         }
+        if let Some(p) = segment.prologue {
+            for inst in &mut insts[p.norm..p.norm + 4] {
+                inst.op = DevOp::Nop as u16;
+            }
+        }
         Ok(route)
     }
 }
@@ -932,6 +1105,7 @@ impl MoeLtRoute {
             .chain(o.gather_inv)
             .chain(o.combine_pf)
             .chain(o.fp8_glue.into_iter().flatten())
+            .chain(o.route_glue.into_iter().flatten())
     }
 
     pub(super) fn run(&self, stream: &CudaStream) -> Result<()> {
@@ -1147,6 +1321,81 @@ fn skewed_rows(experts: u32, average: u64, capacity: u64) -> Vec<i32> {
 }
 
 impl MoeLtRoute {
+    /// The router prologue: expert-input norm + quant and the router operand, the logits
+    /// matmul, top-k into the routing table, align into the tables the chain reads.
+    fn run_prologue(
+        &self,
+        p: &RoutePrologue,
+        [pre, topk, align]: [KernelFn; 3],
+        stream: &CudaStream,
+    ) -> Result<()> {
+        let o = &*self.owner;
+        let arg = |value: &mut u64| (value as *mut u64).cast::<std::ffi::c_void>();
+        let arg32 = |value: &mut u32| (value as *mut u32).cast::<std::ffi::c_void>();
+        let argf = |value: &mut f32| (value as *mut f32).cast::<std::ffi::c_void>();
+        let [mut x, mut gamma, mut xn2, mut xq, mut ascale, mut table, proj, mut rscale, mut pes, mut h2, mut logits] =
+            p.pointers;
+        let (mut rows, mut hidden, mut experts, mut top_k) = (p.rows, o.hidden, o.experts, p.top_k);
+        let (mut norm_eps, mut root, mut router_eps) = (p.norm_eps, p.root, p.router_eps);
+        let mut params = [
+            arg(&mut xn2),
+            arg(&mut xq),
+            arg(&mut ascale),
+            arg(&mut x),
+            arg(&mut gamma),
+            argf(&mut norm_eps),
+            arg(&mut h2),
+            arg(&mut rscale),
+            argf(&mut root),
+            argf(&mut router_eps),
+            arg32(&mut rows),
+            arg32(&mut hidden),
+        ];
+        let warps = GLUE_THREADS / 32;
+        o.be.launch_kernel(
+            pre,
+            rows.div_ceil(warps).clamp(1, o.blocks),
+            GLUE_THREADS,
+            0,
+            &mut params,
+            Some(stream),
+        )?;
+        p.plan.matmul(1.0, proj, h2, logits, stream)?;
+        let mut params = [
+            arg(&mut table),
+            arg(&mut logits),
+            arg(&mut pes),
+            arg32(&mut rows),
+            arg32(&mut experts),
+            arg32(&mut top_k),
+        ];
+        o.be.launch_kernel(
+            topk,
+            rows.div_ceil(warps),
+            GLUE_THREADS,
+            0,
+            &mut params,
+            Some(stream),
+        )?;
+        let (mut meta, mut row_token, mut row_partidx, mut row_gate) =
+            (self.meta, self.row_token, self.row_partidx, self.row_gate);
+        let mut bm = ALIGN_PAD as u32;
+        let mut params = [
+            arg(&mut meta),
+            arg(&mut table),
+            arg(&mut row_token),
+            arg(&mut row_partidx),
+            arg(&mut row_gate),
+            arg32(&mut rows),
+            arg32(&mut experts),
+            arg32(&mut top_k),
+            arg32(&mut bm),
+        ];
+        // Every block histograms all T * k slots and scatters its own range of them.
+        let blocks = (rows * top_k).div_ceil(2048).clamp(1, 32);
+        o.be.launch_kernel(align, blocks, GLUE_THREADS, 0, &mut params, Some(stream))
+    }
+
     /// The W8A8 chain: setup + e4m3 gather (+ inverse row map), e4m3 gate|up matmul, scaled
     /// GLU + row re-quantization into `fu`, e4m3 down matmul, scaled combine.
     /// The matmuls round unscaled fast-accumulated sums to BF16 before the glue scales them
@@ -1161,6 +1410,9 @@ impl MoeLtRoute {
         stream: &CudaStream,
     ) -> Result<()> {
         let o = &*self.owner;
+        if let (Some(p), Some(glue)) = (&self.prologue, o.route_glue) {
+            self.run_prologue(p, glue, stream)?;
+        }
         let arg = |value: &mut u64| (value as *mut u64).cast::<std::ffi::c_void>();
         let arg32 = |value: &mut u32| (value as *mut u32).cast::<std::ffi::c_void>();
         let ([mut out, mut h1, mut gamma], tokens, capacity, eps) =
