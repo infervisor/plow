@@ -1839,19 +1839,30 @@ impl VmmKv {
         let bytes = tier.wants_chunk().expect("an empty tier wants a chunk");
         let ptr = s.ops.host_tier_alloc(bytes)?;
         tier.add_chunk(ptr, bytes);
+        // The worker first: nothing may spill or prefetch into a tier without it (a prefetch
+        // would wait on it forever).
+        let shared = Arc::clone(s);
+        let join = match std::thread::Builder::new()
+            .name("vmm-host-tier".into())
+            .spawn(move || host_tier_thread(&shared))
+        {
+            Ok(join) => join,
+            Err(e) => {
+                s.ops.host_tier_free(ptr, bytes);
+                return Err(RuntimeError::Device(format!(
+                    "vmm: spawn vmm-host-tier: {e}"
+                )));
+            }
+        };
         {
             let mut inner = s.inner.lock();
             inner.stats.host_capacity_bytes = tier.slots.len() as u64 * slot_bytes;
             inner.host = Some(tier);
+            // Under the lock the worker waits on: it parks until there is work.
+            s.host_cv.notify_all();
         }
         s.host_armed.store(true, Ordering::Release);
-        let shared = Arc::clone(s);
-        self.host_join = Some(
-            std::thread::Builder::new()
-                .name("vmm-host-tier".into())
-                .spawn(move || host_tier_thread(&shared))
-                .map_err(|e| RuntimeError::Device(format!("vmm: spawn vmm-host-tier: {e}")))?,
-        );
+        self.host_join = Some(join);
         Ok(())
     }
 
@@ -2594,6 +2605,30 @@ impl VmmKv {
                     inner.stats.attach_hits -= 1;
                     inner.stats.attach_misses += 1;
                     inner.stats.tokens_attached -= rows as u64;
+                    let st = &mut inner.stats;
+                    let (hits, got, miss) = if kind.has(Kind::PROMPT_END) {
+                        (
+                            &mut st.attach_prompt_end,
+                            &mut st.tokens_attached_prompt_end,
+                            &mut st.tokens_lost_prompt_end,
+                        )
+                    } else if kind.has(Kind::SHARED_END) {
+                        (
+                            &mut st.attach_shared,
+                            &mut st.tokens_attached_shared,
+                            &mut st.tokens_lost_shared,
+                        )
+                    } else {
+                        (
+                            &mut st.attach_block,
+                            &mut st.tokens_attached_block,
+                            &mut st.tokens_lost_block,
+                        )
+                    };
+                    *hits -= 1;
+                    *got -= u64::from(rows);
+                    *miss -= prompt.len() as u64 - u64::from(rows);
+                    st.tokens_lost_miss += prompt.len() as u64;
                     inner.seqs[seq] = SlotSeq {
                         hashes,
                         prompt_rows: tokens.len(),
@@ -3748,9 +3783,12 @@ fn publish_locked(
         (id, None)
     };
     let mut superseded = None;
+    let mut continued = None;
     if inner.policy == Policy::Tree {
         policy::link(inner, id, parent);
+        let lineage = inner.seqs[seq].lineage;
         continue_lineage(inner, seq, id, parent);
+        continued = lineage.filter(|&l| l != id && inner.seqs[seq].lineage.is_none());
         superseded = note_end(inner, seq, id, kind);
     }
     trim_cache(s, inner);
@@ -3758,7 +3796,7 @@ fn publish_locked(
     // superseded one is otherwise the chain's only attach point.
     if inner.policy == Policy::Tree && inner.by_id.contains_key(&id) {
         policy::retire_parent_of(s, inner, id);
-        if let Some(a) = superseded {
+        for a in [superseded, continued].into_iter().flatten() {
             policy::try_retire(s, inner, a);
         }
     }
@@ -4225,7 +4263,14 @@ fn continue_lineage(inner: &mut Inner, seq: usize, id: u64, parent: Option<u64>)
     let Some(l) = inner.seqs[seq].lineage else {
         return;
     };
-    if l != id && Some(l) != parent {
+    // `id` continues `l` if `l` is `id` or any ancestor of it (a shared end can sit between).
+    let mut up = parent;
+    let mut continues = l == id;
+    while let (false, Some(a)) = (continues, up) {
+        continues = a == l;
+        up = snap_ref(inner, a).and_then(|snap| snap.parent);
+    }
+    if !continues {
         return;
     }
     inner.seqs[seq].lineage = None;
@@ -4427,8 +4472,10 @@ fn host_tier_thread(s: &Shared) {
         if s.host_stop.load(Ordering::Acquire) {
             return;
         }
+        // Spawned before the tier is installed (`enable_host_tier`).
         let Some(tier) = inner.host.as_mut() else {
-            return;
+            s.host_cv.wait(&mut inner);
+            continue;
         };
         if let Some(id) = tier.prefetch.pop_front() {
             let Some((slot, bytes)) = snap_ref(&inner, id).and_then(|snap| match snap.store {
@@ -9100,6 +9147,13 @@ mod tests {
         assert_eq!(s.snapshots_restored, 0);
         assert_eq!(s.attach_misses, 3, "a's and b's first sightings, then this");
         assert_eq!(s.attach_hits, 0);
+        assert_eq!(
+            s.attach_prompt_end + s.attach_shared + s.attach_block,
+            0,
+            "no attach kind counts the miss"
+        );
+        assert_eq!(s.tokens_attached_prompt_end + s.tokens_attached_block, 0);
+        assert_eq!(s.tokens_lost_miss, 3 * a.len() as u64);
         assert_eq!(s.blocks_shared_mapped, 0, "the window was unwound");
         p.ensure_rows(1, 17).unwrap();
         p.begin_seq(1);
