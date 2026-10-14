@@ -14966,6 +14966,8 @@ impl AmdEngine {
         let n = self.packed_spans.len() as u32;
         let spans = self.d_prefill_spans.base;
         let launch = |args: &[u8], per_span: u32, block: u32| -> Result<()> {
+            // The kernel's explicit segment ends at `min_rows`; the struct's tail pad is not sent.
+            let args = &args[..args.len() - 4];
             EngineDevice::launch_kernel(
                 &*self.be,
                 kernel,
