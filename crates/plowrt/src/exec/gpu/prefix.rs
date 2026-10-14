@@ -577,37 +577,54 @@ impl GpuEngine {
         let g = kv.geometry();
         let ring = v.ring;
         let mut off = buf;
-        let mut blit = |dev: u64, snap: u64, bytes: u64| -> Result<()> {
-            if to_snap {
-                self.be.memcpy_dtod_async(snap, dev, bytes, &self.stream)
-            } else {
-                self.be.memcpy_dtod_async(dev, snap, bytes, &self.stream)
-            }
-        };
         for &(sk, sv) in &v.slide_scale {
             let span = RingWindow::new(p_a.into(), g.window.into(), ring);
             let w = span.rows;
             for idx in [sk, sv] {
                 let base = self.devp[idx].base + b as u64 * g.kvh_slide as u64 * ring * 4;
-                for h in 0..g.kvh_slide as u64 {
-                    let hb = base + h * ring * 4;
-                    blit(hb + span.start * 4, off, span.first * 4)?;
-                    if span.first < w {
-                        blit(hb, off + span.first * 4, (w - span.first) * 4)?;
-                    }
-                    off += w * 4;
-                }
+                let heads = g.kvh_slide;
+                let (dev, snap) = ((base + span.start * 4, ring * 4), (off, w * 4));
+                self.vmm_copy_heads(dev, snap, span.first * 4, heads, to_snap)?;
+                let (dev, snap) = ((base, ring * 4), (off + span.first * 4, w * 4));
+                self.vmm_copy_heads(dev, snap, (w - span.first) * 4, heads, to_snap)?;
+                off += u64::from(heads) * w * 4;
             }
         }
         let ctx = g.max_ctx as u64;
         for &(sk, sv) in &v.full_scale {
             for idx in [sk, sv] {
                 let base = self.devp[idx].base + b as u64 * g.kvh_full as u64 * ctx * 4;
-                for h in 0..g.kvh_full as u64 {
-                    blit(base + h * ctx * 4, off, p_a as u64 * 4)?;
-                    off += p_a as u64 * 4;
-                }
+                let bytes = p_a as u64 * 4;
+                self.vmm_copy_heads((base, ctx * 4), (off, bytes), bytes, g.kvh_full, to_snap)?;
+                off += u64::from(g.kvh_full) * bytes;
             }
+        }
+        Ok(())
+    }
+
+    /// Copy `bytes` per KV head between a slot's cache tensor (`dev` = first head, head pitch)
+    /// and a snapshot region (`snap`, same), in the `to_snap` direction: one pitched copy for all
+    /// heads under `PLOW_VMM_SNAP_PITCHED`, else one copy per head.
+    fn vmm_copy_heads(
+        &self,
+        dev: (u64, u64),
+        snap: (u64, u64),
+        bytes: u64,
+        heads: u32,
+        to_snap: bool,
+    ) -> Result<()> {
+        if bytes == 0 {
+            return Ok(());
+        }
+        let (dst, src) = if to_snap { (snap, dev) } else { (dev, snap) };
+        if RuntimeConfig::get().vmm_snap_pitched {
+            return self
+                .be
+                .memcpy_dtod_pitched_async(dst, src, bytes, heads, &self.stream);
+        }
+        for h in 0..u64::from(heads) {
+            self.be
+                .memcpy_dtod_async(dst.0 + h * dst.1, src.0 + h * src.1, bytes, &self.stream)?;
         }
         Ok(())
     }
@@ -651,18 +668,12 @@ impl GpuEngine {
         let row_bytes = u64::from(g.hd_full * g.elem);
         let bytes = u64::from(partial) * row_bytes;
         let row0 = u64::from(rows - partial);
+        let pitch = u64::from(g.max_ctx) * row_bytes;
         for &(index, _, _) in &v.tensor_tracks {
-            for h in 0..u64::from(g.kvh_full) {
-                let dev = self.devp[index].base
-                    + ((b as u64 * u64::from(g.kvh_full) + h) * u64::from(g.max_ctx) + row0)
-                        * row_bytes;
-                if to_snap {
-                    self.be.memcpy_dtod_async(buf, dev, bytes, &self.stream)?;
-                } else {
-                    self.be.memcpy_dtod_async(dev, buf, bytes, &self.stream)?;
-                }
-                buf += bytes;
-            }
+            let dev = self.devp[index].base
+                + (b as u64 * u64::from(g.kvh_full) * u64::from(g.max_ctx) + row0) * row_bytes;
+            self.vmm_copy_heads((dev, pitch), (buf, bytes), bytes, g.kvh_full, to_snap)?;
+            buf += u64::from(g.kvh_full) * bytes;
         }
         Ok(())
     }
@@ -671,6 +682,9 @@ impl GpuEngine {
     /// rings, fp8 ring scales, fp8 full-layer scale prefixes, partial full-KV.
     /// `to_snap` picks the direction (publish writes, attach restores).
     pub(super) fn vmm_snap_copy(&self, b: usize, p_a: u32, buf: u64, to_snap: bool) -> Result<()> {
+        let t0 = RuntimeConfig::get()
+            .pf_packlog
+            .then(std::time::Instant::now);
         let copied = (|| {
             self.vmm_slide_copy(b, p_a, buf, to_snap)?;
             let (v, kv) = self.vmm_prefix().expect("vmm_snap_copy without prefix vmm");
@@ -688,8 +702,17 @@ impl GpuEngine {
                 + self.vmm_full_scale_bytes(p_a);
             self.vmm_partial_copy(b, p_a, partial, to_snap)
         })();
+        let t1 = t0.map(|t| t.elapsed());
         // Drain even a partially submitted copy before VMM remapping or snapshot release.
         let completed = self.be.stream_synchronize(&self.stream);
+        if let (Some(t0), Some(t1)) = (t0, t1) {
+            eprintln!(
+                "PACKLOG SNAP slot={b} to_snap={} rows={p_a} submit_us={} sync_us={}",
+                to_snap as u8,
+                t1.as_micros(),
+                (t0.elapsed() - t1).as_micros()
+            );
+        }
         copied.and(completed)
     }
 

@@ -595,6 +595,12 @@ pub struct RuntimeConfig {
     )]
     pub pf_itl_budget_ms: u32,
 
+    /// CUDA VMM prefix snapshots: copy the fp8 ring scales, full-layer scale prefixes and the
+    /// partial full-KV block as one pitched copy per tensor (all KV heads) instead of one copy
+    /// per head. Same bytes; a Gemma-4 26B snapshot drops from ~10^3 copies to ~10^2.
+    #[arg(long = "vmm-snap-pitched", env = "PLOW_VMM_SNAP_PITCHED", hide = true, default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
+    pub vmm_snap_pitched: bool,
+
     /// Expert: run prefill chains to completion, skip decode until all prompts are resident.
     /// Trades streaming latency for aggregate tok/s (CUDA 8x127k +7.1%, Veena c128 -3%).
     #[arg(long = "pf-defer-decode", env = "PLOW_PF_DEFER_DECODE", hide = true, default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]

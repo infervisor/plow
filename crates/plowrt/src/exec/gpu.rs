@@ -7197,9 +7197,11 @@ impl GpuEngine {
                 )?;
             }
         }
+        let t0 = pf_packlog_on().then(std::time::Instant::now);
         if let Some(rings) = self.vmm.as_mut().and_then(|v| v.rings.as_mut()) {
             rings.ensure_slot(b)?;
         }
+        let t_ring = t0.map(|t| t.elapsed());
         // VMM: publish the finished sequence's generated whole blocks first —
         // a follow-up turn embedding this turn's output then attaches instead
         // of re-prefilling it — then drop the previous sequence's mappings/
@@ -7208,6 +7210,7 @@ impl GpuEngine {
         if crate::config::RuntimeConfig::get().prefix_cache_output() {
             self.vmm_publish(b, self.pos[b]);
         }
+        let t_publish = t0.map(|t| t.elapsed());
         self.pos[b] = keep;
         self.session_pin[b] = None;
         self.vmm_attached[b] = 0;
@@ -7219,6 +7222,14 @@ impl GpuEngine {
             if v.prefix_kv().is_none() {
                 v.ensure_rows(b, 1)?;
             }
+        }
+        if let (Some(t0), Some(ring), Some(publish)) = (t0, t_ring, t_publish) {
+            eprintln!(
+                "PACKLOG BEGIN slot={b} ring_us={} publish_us={} seq_us={}",
+                ring.as_micros(),
+                (publish - ring).as_micros(),
+                (t0.elapsed() - publish).as_micros()
+            );
         }
         Ok(())
     }
