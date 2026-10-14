@@ -8198,18 +8198,25 @@ impl AmdEngine {
             ));
         }
         let has_gemm_lt = |p: &DevProg| p.insts.iter().any(|d| d.op == DevOp::GemmLtPf as u16);
-        let use_gemm_lt = blob.progs.iter().any(has_gemm_lt);
+        let use_gemm_lt = blob.progs.iter().any(has_gemm_lt)
+            || (arch == "gfx950"
+                && crate::config::RuntimeConfig::get().amd.gemm_group_lt
+                && blob
+                    .progs
+                    .iter()
+                    .flat_map(|p| &p.insts)
+                    .any(|d| d.op == DevOp::GemmGroupPf as u16));
         let gemma_gemm_lt = blob
             .progs
             .iter()
             .flat_map(|p| &p.insts)
             .any(|d| d.op == DevOp::GemmLtPf as u16 && d.i[3] == 3);
         if use_gemm_lt
-            && (arch != "gfx942"
+            && (!amd_gemm_lt::arch_matches(&blob.progs, &arch)
                 || !amd_gemm_lt::topology_matches(&blob.progs, tp.as_ref().map(|b| b.n_gpu)))
         {
             return Err(RuntimeError::Device(
-                "hipBLASLt projection requires a qualified gfx942 topology and mode".into(),
+                "hipBLASLt projection requires a qualified gfx942/gfx950 topology and mode".into(),
             ));
         }
         let has_gemm_blk = |p: &DevProg| p.insts.iter().any(|d| d.op == DevOp::GemmBlkPf as u16);
@@ -10741,7 +10748,13 @@ impl AmdEngine {
             }
             None => None,
         };
-        let gemm_lt = if use_gemm_lt {
+        let gemm_lt = if use_gemm_lt && arch == "gfx950" {
+            Some(amd_gemm_lt::GemmLt::load_gfx950(
+                &be,
+                &hsaco_dir,
+                &mut modules,
+            )?)
+        } else if use_gemm_lt {
             Some(amd_gemm_lt::GemmLt::load(
                 &be,
                 &hsaco_dir,
@@ -14337,6 +14350,35 @@ impl AmdEngine {
                     args.c[g] = addr(tens[2 + g]);
                 }
             }
+            let groups = self.gemm_group_groups(&args);
+            if let Some(lt) = self.gemm_lt.as_ref().filter(|_| groups > 0) {
+                lt.enqueue_group(
+                    &self.be, args.x, args.w, &args.c, &args.n, groups, args.t, args.k,
+                )?;
+                self.seg_launches += groups as u64;
+                if groups == 6 || args.n[groups] == 0 {
+                    return Ok(());
+                }
+                // The unpinned tail groups stay on the grouped kernel.
+                let skipped: u32 = args.n[..groups].iter().sum();
+                args.w += u64::from(skipped) * u64::from(args.k) * 2;
+                args.c.copy_within(groups.., 0);
+                args.n.copy_within(groups.., 0);
+                args.c[6 - groups..].fill(0);
+                args.n[6 - groups..].fill(0);
+                let grid = gemm_group_grid(args.t, &args.n);
+                EngineDevice::launch_kernel(
+                    &*self.be,
+                    kernel,
+                    grid,
+                    512,
+                    0,
+                    as_bytes(std::slice::from_ref(&args)),
+                    None,
+                )?;
+                self.seg_launches += 1;
+                return Ok(());
+            }
             EngineDevice::launch_kernel(
                 &*self.be,
                 kernel,
@@ -15451,6 +15493,21 @@ impl AmdEngine {
     /// multi-launch route branches in `enqueue_segment`; the commit check refuses
     /// a chain whose emission disagrees, so a drift fails closed rather than
     /// overrunning the queue.
+    /// `PLOW_AMD_GEMM_GROUP_LT`: the hipBLASLt groups that have a pinned kernel, then one grouped
+    /// launch for any unpinned tail. Only above 4096 live rows: at 1024/2048-token prompts the
+    /// separate launches lost 1.9/2.3 ms to the grouped kernel, at 8192/16384 they won 1.3/2.7 ms.
+    fn gemm_group_groups(&self, args: &GemmGroupArgs) -> usize {
+        self.gemm_lt
+            .as_ref()
+            .filter(|_| crate::config::RuntimeConfig::get().amd.gemm_group_lt && args.t > 4096)
+            .map_or(0, |lt| lt.group_prefix(&args.n, args.k))
+    }
+
+    fn gemm_group_launches(&self, args: &GemmGroupArgs) -> usize {
+        let groups = self.gemm_group_groups(args);
+        groups + usize::from(groups == 0 || (groups < 6 && args.n[groups] != 0))
+    }
+
     pub(crate) fn prefill_segment_launches(&self, p: usize, seg: usize) -> usize {
         let active = self.packed_prefill.is_some_and(|b| b.prog == p);
         if !prefill_segment_specialization_allowed(self.prog_dispatch(p)) {
@@ -15493,6 +15550,7 @@ impl AmdEngine {
                     .as_ref()
                     .map_or(1, |s| s.span_launches(*route, &self.packed_spans)),
                 Some(PrefillSegmentRoute::GemmLt(_)) => 1,
+                Some(PrefillSegmentRoute::GemmGroup { args, .. }) => self.gemm_group_launches(args),
                 Some(PrefillSegmentRoute::Gemma4Glu(_)) => 1,
                 Some(PrefillSegmentRoute::GemmBlk(route)) => route.launches(),
                 Some(PrefillSegmentRoute::MlaFold(_)) => 3,
@@ -15516,6 +15574,7 @@ impl AmdEngine {
                 .as_ref()
                 .map_or(1, |s| s.split_launches(*route)),
             Some(PrefillSegmentRoute::GemmLt(_)) => 1,
+            Some(PrefillSegmentRoute::GemmGroup { args, .. }) => self.gemm_group_launches(args),
             Some(PrefillSegmentRoute::Gemma4Glu(_)) => 1,
             Some(PrefillSegmentRoute::GemmBlk(route)) => route.launches(),
             Some(PrefillSegmentRoute::MlaFold(_)) => 3,
