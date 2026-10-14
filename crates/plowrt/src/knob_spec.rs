@@ -76,6 +76,21 @@ const RETIRE_ATTACHED_QUALIFIED: Status = Status::Qualified {
         "`=0` is the rollback",
     ],
 };
+const PREFIX_TREE_QUALIFIED: Status = Status::Qualified {
+    evidence: &[
+        "Gemma-4 26B FP8 H100, production replay without session ids (1.1 sess/s, think median 45 s, 900 s), tree vs production legacy binary: cached 61.3% vs 61.3%, continuation hits 74.1% vs 74.2%, TTFT p50/p99 123/912 vs 120/946 ms, 0 errors; production-shaped replay (10 turns, 0.6 sess/s): cached 78.3% vs 78.4%, TTFT p99 408 vs 403 ms (/opt/dlami/nvme/lava-tts/g26-revamp/REPORT.md 5.2, 5.6)",
+        "parallel duplicate traffic: dup2 continuation hits 99.3% vs 85.0%; cold replay of every turn 2 token-identical to the cached run (8/8 + pair) (REPORT.md 5.1, 5.3)",
+        "`PLOW_PREFIX_POLICY=legacy` is the in-binary rollback (not byte-exact, docs/runtime/prefix-cache.md)",
+    ],
+};
+/// Default-on with `X-Session-Id` only; production sends no header. Not qualified: the one
+/// session-header A/B lost to the legacy session pin.
+const SESSION_TTL_CANDIDATE: Status = Status::Candidate {
+    evidence: &[
+        "Gemma-4 26B FP8 H100, session header on (1.1 sess/s, think 45 s): tree + TTL 150 s vs production legacy pin 60 s: cached 56.1% vs 61.1%, TTFT p50/p99 144/1435 vs 128/961 ms, continuation hits 73.7% vs 70.2% (/opt/dlami/nvme/lava-tts/g26-revamp/lab/sess/summary.tsv)",
+        "no effect without `X-Session-Id`; `=0` gives sessions no special retention",
+    ],
+};
 const INFLIGHT_WAIT_QUALIFIED: Status = Status::Qualified {
     evidence: &[
         "agent/prefix-cache v2, 12B H100 prefix-repetition C16, default vs =0: hits 57/67 vs 53/67, TTFT 259.4 vs 295.7 ms, tok/s 915 vs 889; C4 hits 26 vs 25, TTFT 144.7 vs 123.3 (v1 default 122.3, same hits)",
@@ -561,8 +576,8 @@ pub const RUNTIME: &[KnobSpec] = &[
     KnobSpec::new("rt.prefix_cache_output", Some("PLOW_PREFIX_CACHE_OUTPUT"), Layer::Runtime, Domain::Bool, ON, CACHE_OUTPUT_QUALIFIED),
     KnobSpec::new("rt.prefix_retire_attached", Some("PLOW_PREFIX_RETIRE_ATTACHED"), Layer::Runtime, Domain::Bool, ON, RETIRE_ATTACHED_QUALIFIED),
     KnobSpec::new("rt.prefix_inflight_wait", Some("PLOW_PREFIX_INFLIGHT_WAIT"), Layer::Runtime, Domain::Bool, ON, INFLIGHT_WAIT_QUALIFIED),
-    KnobSpec::new("rt.prefix_policy", Some("PLOW_PREFIX_POLICY"), Layer::Runtime, Domain::Str, Default::Static(Val::Str("tree")), OPT_IN),
-    KnobSpec::new("rt.prefix_session_ttl_s", Some("PLOW_PREFIX_SESSION_TTL_S"), Layer::Runtime, U32, Default::Static(Val::Nat(150)), OPT_IN),
+    KnobSpec::new("rt.prefix_policy", Some("PLOW_PREFIX_POLICY"), Layer::Runtime, Domain::Str, Default::Static(Val::Str("tree")), PREFIX_TREE_QUALIFIED),
+    KnobSpec::new("rt.prefix_session_ttl_s", Some("PLOW_PREFIX_SESSION_TTL_S"), Layer::Runtime, U32, Default::Static(Val::Nat(150)), SESSION_TTL_CANDIDATE),
     KnobSpec::new("rt.prefix_chunk_publish", Some("PLOW_PREFIX_CHUNK_PUBLISH"), Layer::Runtime, Domain::Bool, ON, CHUNK_PUBLISH_QUALIFIED),
     KnobSpec::new("rt.vmm_release_retire", Some("PLOW_VMM_RELEASE_RETIRE"), Layer::Runtime, Domain::Bool, ON, RELEASE_RETIRE_QUALIFIED),
     KnobSpec::new("rt.ttft_log", Some("PLOW_TTFT_LOG"), Layer::Runtime, Domain::Bool, OFF, OPT_IN),
