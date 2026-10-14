@@ -601,6 +601,18 @@ pub struct RuntimeConfig {
     #[arg(long = "vmm-snap-pitched", env = "PLOW_VMM_SNAP_PITCHED", hide = true, default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
     pub vmm_snap_pitched: bool,
 
+    /// CUDA VMM prefix snapshots: keep up to N freed snapshot buffers for reuse instead of
+    /// `cuMemFree` (which synchronizes the device) and a fresh `cuMemAlloc` per publish
+    /// (~100 MiB each on Gemma-4 26B). 0 = off.
+    #[arg(
+        long = "vmm-snap-pool",
+        env = "PLOW_VMM_SNAP_POOL",
+        default_value_t = 0,
+        hide = true,
+        global = true
+    )]
+    pub vmm_snap_pool: u32,
+
     /// Expert: run prefill chains to completion, skip decode until all prompts are resident.
     /// Trades streaming latency for aggregate tok/s (CUDA 8x127k +7.1%, Veena c128 -3%).
     #[arg(long = "pf-defer-decode", env = "PLOW_PF_DEFER_DECODE", hide = true, default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]

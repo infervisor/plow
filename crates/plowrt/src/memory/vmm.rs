@@ -1893,6 +1893,14 @@ impl VmmKv {
         trim_cache(s, &mut inner);
         let after = inner.stats;
         let pooled = after.blocks_pooled - before.blocks_pooled;
+        if crate::config::RuntimeConfig::get().pf_packlog {
+            eprintln!(
+                "PACKLOG SEQ seq={seq} unmapped={unmapped} window_us={} trim_us={} wait_us={}",
+                (t1 - t0).as_micros(),
+                t1.elapsed().as_micros(),
+                (copy_wait + chunk_wait).as_micros()
+            );
+        }
         tracing::debug!(
             seq,
             unmapped,
