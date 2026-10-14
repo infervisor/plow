@@ -4793,7 +4793,7 @@ __device__ void d_flash_mla_decode_mfma(float* __restrict__ Opart, float* __rest
  * HBM once instead of once per head-group. Differences from d_flash_mla_decode_mfma above,
  * which this replaces for that shape: Q is staged in LDS once per item (the generic kernel
  * re-read a global Q fragment on every k-step of every tile), the KV tile is staged with 16-byte
- * loads, and the QK contraction is split over the
+ * loads and prefetched into registers one tile ahead, and the QK contraction is split over the
  * eight waves (4 of the 32 k-steps each, reduced through LDS) instead of recomputed by all.
  * Only accumulator elements 0..3 (m < 8) are live. Emits the same (o, m, l) partials. */
 template <int DK>
@@ -4844,6 +4844,17 @@ __device__ void d_flash_mla_decode_hp8(float* __restrict__ Opart, float* __restr
             const unsigned h = tid / CH, c = tid % CH;
             *(bf16v8*)&Qsm[h * STRIDE + c * 8] = ld_glob8(as_glob(Qabs) + ((size_t)b * NH + h) * DK + c * 8);
         }
+        bf16v8 nxt[TPT];
+        auto fetch = [&](unsigned kv0) {
+#pragma unroll
+            for (int j = 0; j < TPT; j++) {
+                const unsigned e = tid + (unsigned)j * PLOW_THREADS;
+                const unsigned kv = kv0 + e / CH;
+                nxt[j] = kv < hi ? ld_glob8(cbase + (size_t)kv * DK + (e % CH) * 8) : (bf16v8)(bf16)0.0f;
+            }
+        };
+        if (lo < hi) fetch(lo);
+
         f32x16 oacc[NDT];
 #pragma unroll
         for (int t = 0; t < NDT; t++) oacc[t] = (f32x16)(0.0f);
@@ -4856,11 +4867,10 @@ __device__ void d_flash_mla_decode_hp8(float* __restrict__ Opart, float* __restr
 #pragma unroll
             for (int j = 0; j < TPT; j++) {
                 const unsigned e = tid + (unsigned)j * PLOW_THREADS;
-                const unsigned kv = kv0 + e / CH;
-                *(bf16v8*)&Ksm[(e / CH) * STRIDE + (e % CH) * 8] =
-                    kv < hi ? ld_glob8(cbase + (size_t)kv * DK + (e % CH) * 8) : (bf16v8)(bf16)0.0f;
+                *(bf16v8*)&Ksm[(e / CH) * STRIDE + (e % CH) * 8] = nxt[j];
             }
             __syncthreads();
+            if (kv0 + BKV < hi) fetch(kv0 + BKV);
 
             /* QK partial over this wave's KPW k-steps: S[m = head][n = kv]. */
             f32x16 s = (f32x16)(0.0f);
