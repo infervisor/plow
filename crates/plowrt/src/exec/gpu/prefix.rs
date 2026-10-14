@@ -441,11 +441,14 @@ impl GpuEngine {
                     slot_bytes,
                 })
                 .collect();
-            let rings = crate::memory::vmm::VmmRings::new_idle_backed(
+            let mut rings = crate::memory::vmm::VmmRings::new_idle_backed(
                 Arc::clone(be) as Arc<dyn crate::memory::vmm::VmmOps>,
                 &tensors,
                 geo.batch as usize,
             )?;
+            if crate::config::RuntimeConfig::get().vmm_ring_recycle {
+                rings.enable_handle_recycling(crate::memory::vmm::kv_pool_cap());
+            }
             tracing::info!(
                 slot_mib = rings.slot_charge() >> 20,
                 resident_mib = rings.stats().resident_bytes >> 20,
