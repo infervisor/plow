@@ -70,6 +70,12 @@ const CACHE_OUTPUT_QUALIFIED: Status = Status::Qualified {
         "docs/flags-reference.md: `=0` is the rollback",
     ],
 };
+const RETIRE_ATTACHED_QUALIFIED: Status = Status::Qualified {
+    evidence: &[
+        "Gemma-4 26B FP8 H100, human-paced chat replay without session ids (1.1 sess/s, think median 45 s), default vs =0: cached 58.0% vs 49.2%, continuation hits 70.0% vs 50.7%, TTFT p50 178 vs 185 ms, TPOT p50 46.1 vs 52.8 ms (/opt/dlami/nvme/lava-tts/g26-cache-study/REPORT.md)",
+        "`=0` is the rollback",
+    ],
+};
 const INFLIGHT_WAIT_QUALIFIED: Status = Status::Qualified {
     evidence: &[
         "agent/prefix-cache v2, 12B H100 prefix-repetition C16, default vs =0: hits 57/67 vs 53/67, TTFT 259.4 vs 295.7 ms, tok/s 915 vs 889; C4 hits 26 vs 25, TTFT 144.7 vs 123.3 (v1 default 122.3, same hits)",
@@ -545,6 +551,7 @@ pub const RUNTIME: &[KnobSpec] = &[
     KnobSpec::new("rt.vmm_stale_reserve", Some("PLOW_VMM_STALE_RESERVE"), Layer::Runtime, Domain::Bool, ON, STALE_RESERVE_QUALIFIED),
     KnobSpec::new("rt.vmm_publish_shared", Some("PLOW_VMM_PUBLISH_SHARED"), Layer::Runtime, Domain::Bool, ON, PUBLISH_SHARED_QUALIFIED),
     KnobSpec::new("rt.prefix_cache_output", Some("PLOW_PREFIX_CACHE_OUTPUT"), Layer::Runtime, Domain::Bool, ON, CACHE_OUTPUT_QUALIFIED),
+    KnobSpec::new("rt.prefix_retire_attached", Some("PLOW_PREFIX_RETIRE_ATTACHED"), Layer::Runtime, Domain::Bool, ON, RETIRE_ATTACHED_QUALIFIED),
     KnobSpec::new("rt.prefix_inflight_wait", Some("PLOW_PREFIX_INFLIGHT_WAIT"), Layer::Runtime, Domain::Bool, ON, INFLIGHT_WAIT_QUALIFIED),
     KnobSpec::new("rt.prefix_chunk_publish", Some("PLOW_PREFIX_CHUNK_PUBLISH"), Layer::Runtime, Domain::Bool, ON, CHUNK_PUBLISH_QUALIFIED),
     KnobSpec::new("rt.vmm_release_retire", Some("PLOW_VMM_RELEASE_RETIRE"), Layer::Runtime, Domain::Bool, ON, RELEASE_RETIRE_QUALIFIED),

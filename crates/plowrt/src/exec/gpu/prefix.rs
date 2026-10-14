@@ -950,7 +950,12 @@ impl GpuEngine {
             // With or without a session: the boundary this turn attached to is spent once its
             // prompt end publishes (the next turn attaches to the longest boundary). Left in
             // place it held a second ~100 MiB window copy per conversation until LRU reached it.
-            let freed = kv.retire_superseded(toks, p_a);
+            let retire = session || crate::config::RuntimeConfig::get().prefix_retire_attached();
+            let freed = if retire {
+                kv.retire_superseded(toks, p_a)
+            } else {
+                0
+            };
             if freed > 0 {
                 tracing::debug!(
                     slot = b,

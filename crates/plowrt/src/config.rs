@@ -796,6 +796,13 @@ pub struct RuntimeConfig {
     /// CUDA packed prefill: a request whose prompt shares whole KV blocks with a prompt another
     /// slot is still prefilling waits (bounded) for that slot's checkpoint and attaches to it
     /// instead of recomputing the shared rows beside it. `0` admits it at once.
+    /// CUDA VMM prefix cache: a conversation without `X-Session-Id` frees the prompt-end
+    /// boundary it attached once its own longer prompt end publishes (what a session's
+    /// `retire_superseded` already does), so a live conversation holds one sliding-window
+    /// snapshot instead of two. `0` keeps the attached boundary until LRU reaches it.
+    #[arg(long = "prefix-retire-attached", env = "PLOW_PREFIX_RETIRE_ATTACHED", default_value_t = true, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
+    pub prefix_retire_attached: bool,
+
     #[arg(long = "prefix-inflight-wait", env = "PLOW_PREFIX_INFLIGHT_WAIT", default_value_t = true, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
     pub prefix_inflight_wait: bool,
 
@@ -2503,6 +2510,14 @@ impl RuntimeConfig {
         select_compat(
             self.prefix_cache_output,
             Self::env_bool("PLOW_PREFIX_CACHE_OUTPUT"),
+            !Self::is_initialized(),
+        )
+    }
+
+    pub(crate) fn prefix_retire_attached(&self) -> bool {
+        select_compat(
+            self.prefix_retire_attached,
+            Self::env_bool("PLOW_PREFIX_RETIRE_ATTACHED"),
             !Self::is_initialized(),
         )
     }
