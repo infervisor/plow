@@ -2261,6 +2261,33 @@ pub struct AmdRuntimeConfig {
     /// Read through `RuntimeConfig::amd_kernarg_vram`, which supplies the default (on).
     #[arg(long = "amd-kernarg-vram", env = "PLOW_AMD_KERNARG_VRAM", value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
     pub kernarg_vram: Option<bool>,
+    /// Deferred AQL chains carry the queue completion signal on their last packet only (the
+    /// barrier bit orders every earlier packet before it), not on every dispatch.
+    #[arg(long = "amd-tail-signal", env = "PLOW_AMD_TAIL_SIGNAL", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
+    pub tail_signal: bool,
+    /// Deferred AQL chains read the VRAM kernarg BAR back once at commit (the chain's last slot)
+    /// instead of once per packet.
+    #[arg(long = "amd-karg-chain-flush", env = "PLOW_AMD_KARG_CHAIN_FLUSH", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
+    pub karg_chain_flush: bool,
+    /// Diagnostic: `<acquire>,<release>` HSA fence scopes (0 none, 1 agent, 2 system) on every
+    /// dispatch packet. Unset = agent,agent. Not ordering-safe below agent.
+    #[arg(long = "amd-pkt-fence", env = "PLOW_AMD_PKT_FENCE", global = true)]
+    pub pkt_fence: Option<String>,
+    /// Diagnostic: `<prefix>` — per-dispatch GPU start/end to `<prefix>.dev<N>.csv`.
+    #[arg(long = "amd-dispatch-times", env = "PLOW_AMD_DISPATCH_TIMES", global = true)]
+    pub dispatch_times: Option<String>,
+    /// TP decode: per-rank synchronous host copies (staging, token readback, id seeding) run
+    /// on one thread per rank so their SDMA round trips overlap.
+    #[arg(long = "amd-tp-par-host", env = "PLOW_TP_PAR_HOST", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
+    pub tp_par_host: bool,
+    /// TP decode: append the compact counter audit to each rank's decode chain instead of a
+    /// second submit and drain after it.
+    #[arg(long = "amd-tp-audit-tail", env = "PLOW_TP_AUDIT_TAIL", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
+    pub tp_audit_tail: bool,
+    /// TP decode: per-rank host work (the decode chain fill and, with PLOW_TP_PAR_HOST, the
+    /// per-rank copies) runs on persistent workers instead of threads spawned per token.
+    #[arg(long = "amd-tp-rank-pool", env = "PLOW_TP_RANK_POOL", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
+    pub tp_rank_pool: bool,
 }
 
 /// Global runtime config, initialized once at startup from CLI parse.
