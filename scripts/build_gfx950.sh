@@ -135,6 +135,13 @@ case "${PLOW_MOE_GLU_KW:-0}" in
   1) DEC_KNOBS="$DEC_KNOBS -DPLOW_MOE_GLU_KW=1" ;;
   *) echo "PLOW_MOE_GLU_KW must be 0 or 1" >&2; exit 2 ;;
 esac
+# PLOW_MOE_DEC_W8_SPLITN: the W8A8 decode GLU on 128-column tiles when 256-column tiles would
+# leave half the workgroups idle (moe_pf_w8a8.h). Bit-identical. Default on.
+case "${PLOW_MOE_DEC_W8_SPLITN:-1}" in
+  0) ;;
+  1) DEC_KNOBS="$DEC_KNOBS -DPLOW_MOE_DEC_W8_SPLITN=1" ;;
+  *) echo "PLOW_MOE_DEC_W8_SPLITN must be 0 or 1" >&2; exit 2 ;;
+esac
 case "${PLOW_MERGE_UNROLL4:-0}" in
   0) ;;
   1) DEC_KNOBS="$DEC_KNOBS -DFA_MERGE_UNROLL4=1" ;;
