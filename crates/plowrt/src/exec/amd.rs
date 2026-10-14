@@ -14683,6 +14683,7 @@ impl AmdEngine {
             Some(DecodeSegmentRoute::MoeAiter(route)) => route.launches() as usize,
             Some(DecodeSegmentRoute::GroupedMoeMxfp4 { .. }) => 2,
             Some(DecodeSegmentRoute::MoeW8a8Dec { .. }) => 2,
+            Some(DecodeSegmentRoute::HcAiter(_)) => 2,
             Some(DecodeSegmentRoute::MoeW8a8DecPair { .. }) => 1,
             Some(_) => 1,
             None => 0,
