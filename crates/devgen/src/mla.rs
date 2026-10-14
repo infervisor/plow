@@ -1448,6 +1448,9 @@ pub(crate) fn glm53_emit_full(
             gfx950 && ec.kda_chunk_qpre && (ec.kda_wu_lean || ec.kda_carry_keyfeed),
         );
         b.set_kda_carry_keyfeed_segments(ec.kda_carry_keyfeed);
+        b.set_lean_moe_fp8_segments(
+            gfx950 && ec.moe_fp8_pf_lean && rows as u64 >= u64::from(ec.moe_fp8_pf_min_rows),
+        );
         emit_glm53_program(&mut b, &c, &n, &s, ctx, rows, dbatch, enc, true);
         let prog = b.finish();
         tensors = prog.tensors.clone();

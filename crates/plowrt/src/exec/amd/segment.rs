@@ -194,6 +194,12 @@ impl AmdEngine {
                 PrefillSegmentRoute::MoeCombine(_) if self.k_moe_combine.is_some() => {
                     return "moe_combine";
                 }
+                PrefillSegmentRoute::MoeFp8Glu { .. } if self.k_moe_fp8_pf.is_some() => {
+                    return "moe_fp8_glu";
+                }
+                PrefillSegmentRoute::MoeFp8Down { .. } if self.k_moe_fp8_pf.is_some() => {
+                    return "moe_fp8_down";
+                }
                 PrefillSegmentRoute::MoeEpAlign(_) if self.k_moe_ep_align.is_some() => {
                     return "moe_ep_align";
                 }
