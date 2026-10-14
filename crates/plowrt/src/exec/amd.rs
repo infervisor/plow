@@ -13380,6 +13380,11 @@ impl AmdEngine {
                     sparse.enqueue_split(&self.be, route, &self.tens_table)? as u64;
             }
         }
+        if active && self.packed_lean_kda_segment(p, seg) {
+            self.enqueue_packed_lean_kda(p, seg)?;
+            self.seg_launches += self.packed_spans.len() as u64;
+            return Ok(());
+        }
         if !active {
             if let Some(PrefillSegmentRoute::MlaMaterializePack {
                 args,
@@ -13949,6 +13954,160 @@ impl AmdEngine {
         self.be.begin_dispatch_chain_admitted(ticket)
     }
 
+    /// `PLOW_AMD_PACKED_LEAN_KDA`: the staged packed binding runs this marked lean KDA chunk
+    /// segment as its single-sequence object once per span. The objects return early below 512
+    /// rows, so a pack with any shorter span (decode riders, short tails) keeps the packed
+    /// interpreter arms for every KDA segment, which keeps the lean Wu and its key-fed carry
+    /// paired.
+    fn packed_lean_kda_segment(&self, p: usize, seg: usize) -> bool {
+        if !crate::config::RuntimeConfig::get().amd.packed_lean_kda
+            || !self
+                .packed_prefill
+                .is_some_and(|b| b.prog == p && !b.token_batch)
+            || self.packed_spans.is_empty()
+            || self.packed_spans.iter().any(|s| s.n_rows < 512)
+        {
+            return false;
+        }
+        match self.progs[p].prefill_routes.get(seg) {
+            Some(PrefillSegmentRoute::KdaChunkIntraWaveItems { .. }) => {
+                self.k_kda_chunk_intra_wave_items.is_some()
+            }
+            // The keyed Wu and the key-fed carry run lean together or not at all.
+            Some(PrefillSegmentRoute::KdaChunkWuLean { args, .. }) if args.key_hi != 0 => {
+                self.k_kda_chunk_wu_lean_keys.is_some() && self.k_kda_chunk_carry_keyfeed.is_some()
+            }
+            Some(PrefillSegmentRoute::KdaChunkWuLean { .. }) => self.k_kda_chunk_wu_lean.is_some(),
+            Some(PrefillSegmentRoute::KdaChunkCarryKeyfeed { .. }) => {
+                self.k_kda_chunk_wu_lean_keys.is_some() && self.k_kda_chunk_carry_keyfeed.is_some()
+            }
+            Some(PrefillSegmentRoute::KdaChunkCarryRegstate { .. }) => {
+                self.k_kda_chunk_carry_regstate.is_some()
+            }
+            _ => false,
+        }
+    }
+
+    /// One lean-object launch per packed span, operands rebased to the span's rows (`row0`)
+    /// and its recurrent state slot exactly as the packed interpreter arms address them
+    /// (`d_kda_chunk_*_packed_bt64`). A fresh span's state was cleared at admission.
+    fn enqueue_packed_lean_kda(&self, p: usize, seg: usize) -> Result<()> {
+        let route = self.progs[p].prefill_routes[seg];
+        for span in &self.packed_spans {
+            let r = u64::from(span.row0);
+            let t = span.n_rows;
+            match route {
+                PrefillSegmentRoute::KdaChunkIntraWaveItems { args, grid } => {
+                    let h = u64::from(args.heads);
+                    let d = u64::from(args.dim);
+                    let mut a = args;
+                    a.aqk += r * h * 64 * 4;
+                    a.ainv += r * h * 64 * 4;
+                    a.q += r * h * d * 2;
+                    a.k += r * h * d * 2;
+                    a.g_prefix += r * h * d * 4;
+                    a.beta += r * h * 4;
+                    a.t = t;
+                    EngineDevice::launch_kernel(
+                        &*self.be,
+                        self.k_kda_chunk_intra_wave_items.expect("checked by caller"),
+                        self.seg_route_grid(p, seg, grid),
+                        WG_THREADS_8,
+                        0,
+                        as_bytes(std::slice::from_ref(&a)),
+                        None,
+                    )?;
+                }
+                PrefillSegmentRoute::KdaChunkWuLean { args, .. } => {
+                    let h = u64::from(args.heads);
+                    let d = u64::from(args.dim);
+                    let v = u64::from(args.value_dim);
+                    let mut a = args;
+                    a.w += r * h * d * 2;
+                    a.u += r * h * v * 2;
+                    a.q += r * h * d * 2;
+                    if a.key_hi != 0 {
+                        a.key_hi += r * h * d * 2;
+                        a.key_lo += r * h * d * 2;
+                    }
+                    a.ainv += r * h * 64 * 4;
+                    a.k += r * h * d * 2;
+                    a.v += r * h * v * 2;
+                    a.g += r * h * d * 4;
+                    a.beta += r * h * 4;
+                    a.t = t;
+                    let kernel = if args.key_hi != 0 {
+                        self.k_kda_chunk_wu_lean_keys
+                    } else {
+                        self.k_kda_chunk_wu_lean
+                    }
+                    .expect("checked by caller");
+                    EngineDevice::launch_kernel(
+                        &*self.be,
+                        kernel,
+                        kda_wu_lean_grid(t, args.heads),
+                        256,
+                        0,
+                        as_bytes(std::slice::from_ref(&a)),
+                        None,
+                    )?;
+                }
+                PrefillSegmentRoute::KdaChunkCarryKeyfeed { args, grid, .. } => {
+                    let h = u64::from(args.heads);
+                    let d = u64::from(args.dim);
+                    let v = u64::from(args.value_dim);
+                    let mut a = args;
+                    a.out += r * h * v * 2;
+                    a.state += u64::from(span.state_slot) * h * v * d * 4;
+                    a.q += r * h * d * 2;
+                    a.k += r * h * d * 2;
+                    a.w += r * h * d * 2;
+                    a.u += r * h * v * 2;
+                    a.aqk += r * h * 64 * 4;
+                    a.g += r * h * d * 4;
+                    a.key_hi += r * h * d * 2;
+                    a.key_lo += r * h * d * 2;
+                    a.t = t;
+                    EngineDevice::launch_kernel(
+                        &*self.be,
+                        self.k_kda_chunk_carry_keyfeed.expect("checked by caller"),
+                        grid,
+                        256,
+                        0,
+                        as_bytes(std::slice::from_ref(&a)),
+                        None,
+                    )?;
+                }
+                PrefillSegmentRoute::KdaChunkCarryRegstate { args, grid, .. } => {
+                    let h = u64::from(args.heads);
+                    let d = u64::from(args.dim);
+                    let v = u64::from(args.value_dim);
+                    let mut a = args;
+                    a.out += r * h * v * 2;
+                    a.state += u64::from(span.state_slot) * h * v * d * 4;
+                    a.q += r * h * d * 2;
+                    a.k += r * h * d * 2;
+                    a.w += r * h * d * 2;
+                    a.u += r * h * v * 2;
+                    a.aqk += r * h * 64 * 4;
+                    a.g += r * h * d * 4;
+                    a.t = t;
+                    EngineDevice::launch_kernel(
+                        &*self.be,
+                        self.k_kda_chunk_carry_regstate.expect("checked by caller"),
+                        grid,
+                        256,
+                        0,
+                        as_bytes(std::slice::from_ref(&a)),
+                        None,
+                    )?;
+                }
+                _ => unreachable!("packed_lean_kda_segment admitted only lean KDA routes"),
+            }
+        }
+        Ok(())
+    }
+
     /// An `IndexUnionPf` segment whose only reader is a sparse flash on its active native route.
     fn union_unread(&self, p: usize, seg: usize) -> bool {
         let g = &self.progs[p];
@@ -13971,6 +14130,9 @@ impl AmdEngine {
         }
         if self.union_unread(p, seg) {
             return 0;
+        }
+        if active && self.packed_lean_kda_segment(p, seg) {
+            return self.packed_spans.len();
         }
         if active {
             return match self.progs[p].prefill_routes.get(seg) {
@@ -15975,6 +16137,48 @@ impl AmdEngine {
         let t = std::time::Instant::now();
         self.be.memcpy_dtod_batch(&pairs)?;
         self.prefix_rows[slot] = rows;
+        crate::obs::pfx::SNAP.add(t.elapsed().as_nanos() as u64);
+        Ok(())
+    }
+
+    /// [`Self::snapshot_carried`] for several slots behind ONE completion wait (a packed
+    /// launch finishes up to eight prompts). Buffers are allocated first, so an eviction that
+    /// lands on an earlier slot of the batch drops that slot before any copy targets it.
+    pub fn snapshot_carried_many(&mut self, items: &[(usize, u32)]) -> Result<()> {
+        if let Some(&(slot, _)) = items.iter().find(|&&(slot, _)| slot >= self.batch) {
+            return Err(RuntimeError::Device(format!(
+                "snapshot_carried {slot} past batch {}",
+                self.batch
+            )));
+        }
+        let total = self.prefix_regions.as_ref().map_or_else(
+            || self.carried_bytes(),
+            |regions| regions.iter().map(prefix::Region::bytes).sum(),
+        );
+        let mut armed = Vec::with_capacity(items.len());
+        for &(slot, rows) in items {
+            self.sync_kda_conv_alt(slot)?;
+            if total == 0 {
+                self.prefix_rows[slot] = rows;
+            } else if self.alloc_prefix_snap(slot, slot, total)? {
+                self.prefix_tick += 1;
+                self.prefix_used[slot] = self.prefix_tick;
+                armed.push((slot, rows));
+            }
+        }
+        let mut pairs = Vec::new();
+        armed.retain(|&(slot, _)| self.prefix_snap[slot].is_some());
+        for &(slot, rows) in &armed {
+            let dst_base = self.prefix_snap[slot].as_ref().expect("retained above").base;
+            pairs.extend(self.prefix_copy_pairs(slot, rows, dst_base, false, None));
+        }
+        let t = std::time::Instant::now();
+        if !pairs.is_empty() {
+            self.be.memcpy_dtod_batch(&pairs)?;
+        }
+        for &(slot, rows) in &armed {
+            self.prefix_rows[slot] = rows;
+        }
         crate::obs::pfx::SNAP.add(t.elapsed().as_nanos() as u64);
         Ok(())
     }

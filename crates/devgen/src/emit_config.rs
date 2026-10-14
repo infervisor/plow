@@ -1039,6 +1039,12 @@ pub struct EmitConfig {
     #[arg(long, env = "PLOW_GLM53_SP_KDA_NORM", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
     pub glm53_sp_kda_norm: bool,
 
+    /// GLM-5.3-Flash packed-prefill siblings keep the lean KDA chunk segment marks (intra
+    /// wave-item, lean Wu, register-state/key-fed carry) as singleton segments, so the runtime
+    /// can run the single-sequence lean objects once per span (`PLOW_AMD_PACKED_LEAN_KDA`).
+    #[arg(long, env = "PLOW_GLM53_PACKED_LEAN_KDA", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
+    pub glm53_packed_lean_kda: bool,
+
     /// GLM-5.3-Flash decode: the HyperConnPost-folded mHC mix GemvF32 runs only on the
     /// workgroups that own an output, and under the one-row pre tail each output's K is split
     /// over this many workgroups (partials reduced in step order by the last). Bit-identical.
@@ -1861,6 +1867,7 @@ impl EmitConfig {
             glm_hc_pre_tail: env_bool("PLOW_GLM_HC_PRE_TAIL"),
             glm53_sp_router: env_bool("PLOW_GLM53_SP_ROUTER"),
             glm53_sp_kda_norm: env_bool("PLOW_GLM53_SP_KDA_NORM"),
+            glm53_packed_lean_kda: env_bool("PLOW_GLM53_PACKED_LEAN_KDA"),
             glm_hc_mix_split: env_u32("PLOW_GLM_HC_MIX_SPLIT"),
             glm_hc_fuse_dec: env_bool("PLOW_GLM_HC_FUSE_DEC"),
             glm_kda_proj_group: env_bool("PLOW_GLM_KDA_PROJ_GROUP"),

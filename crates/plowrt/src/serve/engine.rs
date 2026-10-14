@@ -701,6 +701,13 @@ mod amd_serve {
             }
         }
 
+        fn snapshot_carried_many(&mut self, items: &[(usize, u32)]) -> Result<()> {
+            match self {
+                Self::One(e) => e.snapshot_carried_many(items),
+                Self::Tp(g) => g.snapshot_carried_many(items),
+            }
+        }
+
         fn kv_rebase_all(&mut self, slot: usize) -> Result<()> {
             match self {
                 Self::One(e) => e.kv_rebase(slot),
@@ -3667,6 +3674,7 @@ mod amd_serve {
                 Ranks::One(e) => e.prefill_packed_chunk(&spans, &slices, &parked)?,
                 Ranks::Tp(g) => g.prefill_packed_chunk(&spans, &slices, &parked)?,
             }
+            let post_t = crate::config::RuntimeConfig::get().pf_packlog.then(std::time::Instant::now);
             // Span `s` sampled into `in.ids[s]` and logits row `s`. Read them before the cursors
             // move, so a failed read leaves every member re-runnable.
             let finishing: Vec<usize> = completed
@@ -3690,6 +3698,7 @@ mod amd_serve {
                     Ranks::Tp(g) => g.read_sampled_rows_agreed(sampled)?,
                 }
             };
+            let read_t = post_t.map(|t| t.elapsed());
             if d > 0 {
                 output.copy_from_slice(&tokens[..d]);
             }
@@ -3697,19 +3706,41 @@ mod amd_serve {
                 self.pos[slot] += 1;
                 self.lp_row[slot] = i;
             }
-            for &s in &finishing {
-                let (slot, step) = completed[s];
-                let cur = self.pf[slot].as_ref().expect("validated above");
-                if cur.snap_after == Some(cur.next) {
-                    self.ranks.snapshot_carried(slot, step.c0 + step.clen)?;
+            let snaps: Vec<(usize, u32)> = finishing
+                .iter()
+                .map(|&s| completed[s])
+                .filter(|&(slot, _)| {
+                    let cur = self.pf[slot].as_ref().expect("validated above");
+                    cur.snap_after == Some(cur.next)
+                })
+                .map(|(slot, step)| (slot, step.c0 + step.clen))
+                .collect();
+            if crate::config::RuntimeConfig::get().amd.packed_snap_batch {
+                if !snaps.is_empty() {
+                    self.ranks.snapshot_carried_many(&snaps)?;
+                }
+            } else {
+                for &(slot, rows) in &snaps {
+                    self.ranks.snapshot_carried(slot, rows)?;
                 }
             }
+            let snap_t = post_t.map(|t| t.elapsed());
             commit_packed_prefill(&mut self.pf, &completed);
             for &s in &finishing {
                 let (slot, _) = completed[s];
                 let tok = tokens[d + s];
                 self.finish_packed_prompt(slot, members[s].1, tok, d + s)?;
                 self.packed_tokens.push((slot, tok));
+            }
+            if let (Some(t), Some(read), Some(snap)) = (post_t, read_t, snap_t) {
+                eprintln!(
+                    "PACKLOG POST spans={} finishing={} read_us={:.0} snap_us={:.0} finish_us={:.0}",
+                    spans.len(),
+                    finishing.len(),
+                    read.as_secs_f64() * 1e6,
+                    (snap - read).as_secs_f64() * 1e6,
+                    (t.elapsed() - snap).as_secs_f64() * 1e6,
+                );
             }
             if let Some(diagnostics) = self.diagnostics.as_mut() {
                 for &(slot, step) in &completed {
