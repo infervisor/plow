@@ -4551,6 +4551,9 @@ __device__ static void plow_exec(CInst in_v, unsigned slice, CTens T_v, plow_sme
                 const size_t ring = (size_t)in->i[1] * in->i[2];
                 const unsigned rows = in->i[4] > 1u ? in->i[4] : 1u;
                 for (unsigned r = slice; r < rows; r += nblk) {
+                    /* An idle row's position may lie outside its slot's cache: write nothing. */
+                    const int pr = ((const int*)TEN(5))[r];
+                    if (pr < 0 || (unsigned)pr / in->i[1] >= in->i[5]) continue;
                     __syncthreads();
                     if (in->i[7] == 1u) {
                         d_dsa_pool_stash((bf16*)TEN(2) + r * ring, (bf16*)TEN(3) + r * ring,
