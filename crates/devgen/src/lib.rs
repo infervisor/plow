@@ -9072,7 +9072,17 @@ pub fn run_verified(args: EmitArgs, verify: Option<VerifyHook>) {
             block_spec.is_none(),
             "glm5_next currently emits the complete serving model"
         );
-        mla::glm53_emit_full(&dir, ctx, &out, n_cu, tp, rope_gen, &arch, verify.as_ref());
+        mla::glm53_emit_full(
+            &dir,
+            ctx,
+            &out,
+            n_cu,
+            tp,
+            rope_gen,
+            &arch,
+            verify.as_ref(),
+            l2_layout.filter(|_| emit_config::active().glm53_l2_place),
+        );
         return;
     }
     if model_type == "glm_moe_dsa" {

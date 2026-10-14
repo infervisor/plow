@@ -1048,6 +1048,17 @@ pub struct EmitConfig {
     #[arg(long, env = "PLOW_GLM53_PACKED_LEAN_KDA", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
     pub glm53_packed_lean_kda: bool,
 
+    /// GLM-5.3-Flash: pass plowc's L2 layout to the decode rungs (and, with
+    /// `PLOW_L2_PLACE_PREFILL=1`, the prefill buckets) so the object's two-level gate fires.
+    #[arg(long, env = "PLOW_GLM53_L2_PLACE", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
+    pub glm53_l2_place: bool,
+
+    /// GLM-5.3-Flash decode rungs with at least this many rows isolate each MLA
+    /// FlashMlaDecode+MlaMergeFold pair as a decode-MLA segment at GF=8 (all heads of the rank in
+    /// one work item), for the lean object built with PLOW_MLA_DEC_HPACK=1. NOT bit-identical.
+    #[arg(long, env = "PLOW_GLM53_MLA_HPACK_ROWS")]
+    pub glm53_mla_hpack_rows: Option<u32>,
+
     /// GLM-5.3-Flash decode: the HyperConnPost-folded mHC mix GemvF32 runs only on the
     /// workgroups that own an output, and under the one-row pre tail each output's K is split
     /// over this many workgroups (partials reduced in step order by the last). Bit-identical.
@@ -1080,6 +1091,12 @@ pub struct EmitConfig {
     /// kernels (mhc_aiter_gfx950.elf) as one raw segment. NOT bit-identical.
     #[arg(long, env = "PLOW_GLM_HC_AITER", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
     pub glm_hc_aiter: bool,
+
+    /// GLM-5.3-Flash decode: the sparse-MLA layers' input RmsNorm folds into the attention-side
+    /// HyperConnPre (the AITER pre+Sinkhorn+RmsNorm kernel under PLOW_GLM_HC_AITER), as on the
+    /// KDA and FFN sides; the MLA block then reads the normed rows and emits no norm packet.
+    #[arg(long, env = "PLOW_GLM_HC_FOLD_MLA", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
+    pub glm_hc_fold_mla: bool,
 
     /// PLOW_GLM_KDA_PROJ_GROUP split override: every grouped projection splits K by the largest
     /// power of two <= this (fewer fp32 partials than the per-projection split-K). NOT bit-identical.
@@ -1905,12 +1922,15 @@ impl EmitConfig {
             glm53_sp_router: env_bool("PLOW_GLM53_SP_ROUTER"),
             glm53_sp_kda_norm: env_bool("PLOW_GLM53_SP_KDA_NORM"),
             glm53_packed_lean_kda: env_bool("PLOW_GLM53_PACKED_LEAN_KDA"),
+            glm53_l2_place: env_bool("PLOW_GLM53_L2_PLACE"),
+            glm53_mla_hpack_rows: env_u32("PLOW_GLM53_MLA_HPACK_ROWS"),
             glm_hc_mix_split: env_u32("PLOW_GLM_HC_MIX_SPLIT"),
             glm_hc_fuse_dec: env_bool("PLOW_GLM_HC_FUSE_DEC"),
             glm_kda_proj_group: env_bool("PLOW_GLM_KDA_PROJ_GROUP"),
             glm_hc_fuse_r1: env_bool("PLOW_GLM_HC_FUSE_R1"),
             glm_hc_mix_raw: env_bool("PLOW_GLM_HC_MIX_RAW"),
             glm_hc_aiter: env_bool("PLOW_GLM_HC_AITER"),
+            glm_hc_fold_mla: env_bool("PLOW_GLM_HC_FOLD_MLA"),
             glm_kda_proj_group_s: env_u32("PLOW_GLM_KDA_PROJ_GROUP_S"),
             glm_kda_qkvg_r1: env_bool("PLOW_GLM_KDA_QKVG_R1"),
             glm_hc_fuse_variant: env_u32("PLOW_GLM_HC_FUSE_VARIANT"),
