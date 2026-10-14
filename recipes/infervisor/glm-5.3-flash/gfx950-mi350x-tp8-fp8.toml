@@ -13,7 +13,7 @@ name = "glm-5.3-flash"
 label = "gfx950-mi350x-tp8-fp8"
 network = "glm-5.3-flash"
 status = "validated"
-plow_git = "dc4a3ed4c91ec4497db6f24f11ef2426d2f0fc3c"
+plow_git = "8485e951f711ec1f0e743dfbb07182a016e18c02"
 doc = "docs/amd/glm53-flash-mi350x.md"
 
 # max_ctx 65536: the model's recurrent (KDA) state carries at every length, so long prompts are
@@ -142,9 +142,14 @@ env = { PLOW_DECODE_BATCH = "128", PLOW_GEMV_WALK = "1", PLOW_GEMV_MM = "4", PLO
 #   weights (experts 35.6 -> 71.1 GiB/rank). Supersedes `PLOW_MOE_W8A8_DEC` / `PLOW_MOE_FP8_PF_ACC` (not emitted).
 #   AITER accumulates with atomics: B8+ and prefill are run-to-run nondeterministic (FP32-gated below).
 #   Distinct-prompt B8/B32/B128 25.5/28.0/39.6 -> 20.0/23.0/32.8 ms; prefill 8k 196.9 -> 174.2 ms.
+# v17:
+# - `PLOW_GLM_HC_AITER`: decode mHC on every FFN and KDA side (post and norm folded) runs AITER's fused
+#   `mhc_fused_post_pre_gemm_sqrsum` + `mhc_pre_big_fuse_rmsnorm` (compiled from AITER source by
+#   scripts/build_mhc_aiter.sh into mhc_aiter_gfx950.elf; 20 Sinkhorn iterations, eps 1e-6) as one raw segment;
+#   MLA sides stay native. Distinct-prompt B8/B32/B128 20.0/23.0/32.8 -> 18.8/21.9/29.5 ms, r1 unchanged.
 # - `PLOW_GLM_DSA = "0"`: dense attention (vLLM runs sparse
 #   top-2048; plow's DSA serves but has no prefix hits / packed prefill yet).
-env = { PLOW_MLA_PREFILL = "full:128,512,2048,8192", PLOW_MLA_PF_V2 = "1", PLOW_GLM_PF_NS = "2", PLOW_DECODE_BATCH_LADDER = "1,8,32,128", PLOW_GLM_DECODE_GEMM_ROWS = "32", PLOW_GLM_DSA = "0", PLOW_GLM_SEQ_PAR = "1", PLOW_GLM_SEQ_PAR_PROJ = "0", PLOW_GLM_HC_NORM_FOLD = "1", PLOW_GLM_HC_POST_FOLD = "1", PLOW_KDA_DECODE_FUSED_ARM = "1", PLOW_KDA_FB_FOLD = "1", PLOW_GLM_HC_PRE_TAIL = "1", GLM_SHARD_HEAD = "1", PLOW_GLM53_SP_ROUTER = "1", PLOW_GLM_ROUTER_OVERLAP = "2", PLOW_GLM53_SP_KDA_NORM = "1", PLOW_XR_DEC_CUS = "64", PLOW_GLM_DEC_SPLITK = "16", PLOW_GLM_DEC_SPLITK_2P = "1", PLOW_MOE_PF_W8A8 = "1", PLOW_MOE_DEC_W8A8 = "1", PLOW_GLM_HC_FUSE_DEC = "1", PLOW_GLM_KDA_PROJ_GROUP = "1", PLOW_GLM_HC_FUSE_R1 = "1", PLOW_GLM_KDA_QKVG_R1 = "1", PLOW_GLM_HC_FUSE_VARIANT = "3", PLOW_KDA_PF_GROUP_GEMM = "1", PLOW_MOE_FP8_PF_LEAN = "1", PLOW_GLM53_PACKED_LEAN_KDA = "1", PLOW_GLM_HC_MIX_RAW = "1", PLOW_GLM_MOE_SHARED_FOLD = "1", PLOW_MOE_FP8_PF_PACKED = "1", PLOW_GLM_MOE_AITER = "1", PLOW_GLM_MOE_RESIDENT = "1" }
+env = { PLOW_MLA_PREFILL = "full:128,512,2048,8192", PLOW_MLA_PF_V2 = "1", PLOW_GLM_PF_NS = "2", PLOW_DECODE_BATCH_LADDER = "1,8,32,128", PLOW_GLM_DECODE_GEMM_ROWS = "32", PLOW_GLM_DSA = "0", PLOW_GLM_SEQ_PAR = "1", PLOW_GLM_SEQ_PAR_PROJ = "0", PLOW_GLM_HC_NORM_FOLD = "1", PLOW_GLM_HC_POST_FOLD = "1", PLOW_KDA_DECODE_FUSED_ARM = "1", PLOW_KDA_FB_FOLD = "1", PLOW_GLM_HC_PRE_TAIL = "1", GLM_SHARD_HEAD = "1", PLOW_GLM53_SP_ROUTER = "1", PLOW_GLM_ROUTER_OVERLAP = "2", PLOW_GLM53_SP_KDA_NORM = "1", PLOW_XR_DEC_CUS = "64", PLOW_GLM_DEC_SPLITK = "16", PLOW_GLM_DEC_SPLITK_2P = "1", PLOW_MOE_PF_W8A8 = "1", PLOW_MOE_DEC_W8A8 = "1", PLOW_GLM_HC_FUSE_DEC = "1", PLOW_GLM_KDA_PROJ_GROUP = "1", PLOW_GLM_HC_FUSE_R1 = "1", PLOW_GLM_KDA_QKVG_R1 = "1", PLOW_GLM_HC_FUSE_VARIANT = "3", PLOW_KDA_PF_GROUP_GEMM = "1", PLOW_MOE_FP8_PF_LEAN = "1", PLOW_GLM53_PACKED_LEAN_KDA = "1", PLOW_GLM_HC_MIX_RAW = "1", PLOW_GLM_MOE_SHARED_FOLD = "1", PLOW_MOE_FP8_PF_PACKED = "1", PLOW_GLM_MOE_AITER = "1", PLOW_GLM_MOE_RESIDENT = "1", PLOW_GLM_HC_AITER = "1" }
 args = [
   "--emit", "devblob",
   "--arch", "gfx950",
@@ -190,10 +195,10 @@ name = "smoke"
 cmd = "scripts/serve_test/smoke.sh"
 
 # FP32-reference gate (scripts/llm/fp32_ref_gate.py, 46 cases incl. 18 needles to 15872 tokens,
-# served c16, prefix cache on, PF_INTERLEAVE 8192) on packet 99e135e3 with this [serve] env (v16c): PASS,
-# kl_mean 0.02167 (vLLM 0.03677 on the same reference), kl_p99 0.276 (0.549), top1_decisive 0.9945 (0.9868), needles
-# 18/18; needles with PLOW_PF_CHUNK=512 18/18. Prefix reuse at c8: 49152 hit tokens. Nondeterministic route: three
-# FP32 runs of the AITER MoE build measured kl_mean 0.018 / 0.022 / 0.026 (all PASS). 0 cross-GPU collective errors.
+# served c16, prefix cache on, PF_INTERLEAVE 8192) on packet 6629af02 with this [serve] env (v17): PASS,
+# kl_mean 0.02239 (vLLM 0.03677 on the same reference), kl_p99 0.332 (0.549), top1_decisive 0.9923 (0.9868), needles
+# 18/18; needles with PLOW_PF_CHUNK=512 18/18. Prefix reuse at c8: 57344 hit tokens. Nondeterministic route (AITER
+# MoE atomics): FP32 runs of the AITER builds measured kl_mean 0.018-0.026 (all PASS). 0 cross-GPU collective errors.
 [[gates]]
 name = "llm_fp32_ref"
 cmd = "scripts/llm/fp32_ref_gate.py"
@@ -208,11 +213,11 @@ expect = "36/36"
 
 # One serving cell for orientation; the full grid (isl 1024/4096/16384 at c1..c128, 32768/61440 at
 # c1/c8) and the strict comparison against vLLM are docs/bringup/results/glm53flash-mi350x-2026-10-12.
-# No cell beats vLLM on throughput (v16c: 0.44-0.75x; v15b 0.37-0.66x, v13 0.34-0.61x, v11 0.28-0.61x); see docs/amd/glm53-flash-mi350x.md.
+# No cell beats vLLM on throughput (v17: 0.47-0.76x; v16c 0.44-0.75x, v15b 0.37-0.66x, v13 0.34-0.61x, v11 0.28-0.61x); see docs/amd/glm53-flash-mi350x.md.
 [measured]
-tok_s = 77.83
-p50_tpot_ms = 11.97
-p50_ttft_ms = 119.85
+tok_s = 78.23
+p50_tpot_ms = 11.92
+p50_ttft_ms = 118.57
 concurrency = 1
 input_len = 4096
 output_len = 128
@@ -220,15 +225,16 @@ client = "vllm 0.31.1rc1 bench serve (scripts/bench/llm_grid.sh)"
 
 # Reproduction gates at THIS commit, checkpoint and nix lock.
 [artifacts]
-"plowrt" = "1204dbf5cae06701e41264511637c990ac0715cd466be382b78416ae22e46eb1"
-"model.pkt" = "99e135e36d6dde564a6c4028f0af4e0c2ac36700741b1dac2ba97518ae63139d"
-"interp_decode_k3_gq.elf" = "f9dd942affc1b56a881c6ebc5384ab1c390a980f3083fd9f1895c2de8800d3b3"
-"lowrung1/interp_decode_k3_gq.elf" = "870411f471fa3efbc70b40d4a9fabb64a18d19c5d6059387cab32aca380a020f"
-"lowrung8/interp_decode_k3_gq.elf" = "f71155f18534e5e383d56b32a31dc25a562ace8ba9f70e09c16c7ef8ef2e515b"
-"interp_prefill_k3_moe_gq.elf" = "18e75bea4dbc4ec6d9ce9b0bc358883500359ba6df3b9abffa726fb80358a4ac"
-"interp_flash_gq.elf" = "6702fafa9f2de955fdd6952271ceda0658b3b7803f39c872e15c7f7df92e3da3"
+"plowrt" = "001c991d5a22652f10575587a4b7e410e7f4b1331291336ff90fa84cd40068e2"
+"model.pkt" = "6629af02610df5da4b4c2f72f92ce84c8c8ed61d41ae264069953e16dbb89325"
+"interp_decode_k3_gq.elf" = "0b9f4c2563bbdd14c8ef752968d87fa25cde1da6b2675d8f2a622a9103d84437"
+"lowrung1/interp_decode_k3_gq.elf" = "b9f4a6adee320d5bd3f1498b1fc58d65c260cb91d503db1dd357fc36e6b41626"
+"lowrung8/interp_decode_k3_gq.elf" = "8f6c1f1b458af48b673770de12691139e0b6f53d631655a8a62325ba30c93d8c"
+"interp_prefill_k3_moe_gq.elf" = "40d7ce5e01a3e5886f6ec80935ddf0ae46fd7dcea41a5626bdcb78f7f9bf1dff"
+"interp_flash_gq.elf" = "dd8e97608550a48cf5f86091abe17c4a45c23f0a8a5b4d63419e9c27f579a5ce"
 "fmoe_bf16_blockscaleFp8_g1u1_vs_silu_1tg_pf2_16x128.co" = "07df0af964cf26dde7635b6f524fd84701a15100f5b88fc9366599e20edeea31"
 "fmoe_bf16_blockscaleFp8_g1u1_vs_silu_1tg_ps_32x128.co" = "2b2c1852d84d47f4a03ad5814087be4b4b21e0acd9ee0efdd3f7792a6afe509a"
 "fmoe_bf16_blockscaleFp8_g1u1_vs_silu_1tg_ps_32x256.co" = "6a583441c6bb139c6af20c5198614b7b02b74fdba370580a5a5bbe164bd7bb34"
 "fmoe_bf16_blockscaleFp8_g1u1_vs_silu_1tg_ps_64x256.co" = "e442ee49fd88b5d165b8f8313d790c3ec7a7978140fa2306876612191429e413"
-"moe_aiter_adapter_gfx950.elf" = "14d2a3c8ce0fd2a22881138825805f7ca68f8b13971b4ef90a66efb0c9f2cb07"
+"moe_aiter_adapter_gfx950.elf" = "f13a64144904968b7351e21fdc0e68b73b43d1067458d1a48f88bd3ffd724c4f"
+"mhc_aiter_gfx950.elf" = "7ffed68e37b15c6580d07c3c758e5ce6a38a893b27c1c2452d24ffbd60c4c728"

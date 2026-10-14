@@ -595,6 +595,15 @@ The packet from config + index alone (no weights) is 70 MB: 4 prefill buckets + 
   (removes a random ~18 ms stall), decode router tile + split-K 2P + XR_DEC_CUS, deferred-frame flash softmax.
   Gates PASS kl 0.01305; prefill 8k 272 -> 245 ms; serving +3-9% at c32/c128. Per-segment geometry sweep: no
   gain (the interpreter object's 148 KB LDS union + 256 VGPR cap every op at 1 WG x 8 waves/CU).
+- 13:40 UTC (10-14), v17 (8485e951; packet 6629af02; plowrt 001c991d): v16c + AITER's fused mHC decode kernels
+  (`PLOW_GLM_HC_AITER`: mhc_fused_post_pre_gemm_sqrsum + mhc_pre_big_fuse_rmsnorm compiled from AITER source into
+  mhc_aiter_gfx950.elf, one raw segment per FFN/KDA side; MLA sides native). AITER pair per side 9.6/10.2/10.8/14.4 us
+  at m=1/8/32/128. Distinct-prompt r1/B8/B32/B128 11.84/19.99/22.96/32.79 -> 11.80/18.80/21.88/29.52 ms. Gates PASS
+  kl 0.02239, needles 36/36, split 18/18, prefix 57344 hit tokens. Strict TP8 reports 19 cells MATCHED/EQUIVALENT:
+  0.47-0.76x vLLM. No qualified win. Not taken: vendor hipBLASLt GEMM (gfx950 kernels are stream-K with a 184-byte
+  kernarg; plow's gfx942 GemmLt builder does not carry over; prefill gain ~7-8 ms per 8k). The L2 hierarchical gate
+  (PLOW_GATE_HIER) is compiled into the decode objects but ARMED BUT INERT: the packet is not L2-placed
+  (PLOW_L2_PLACE emit), never tried on this model. Recipe -> v17.
 - 11:05 UTC (10-14), v16c (dc4a3ed4; packet 99e135e3; plowrt 1204dbf5): the routed MoE runs vLLM's own AITER
   gfx950 asm kernels (fmoe_bf16_blockscaleFp8_g1u1_vs_silu_1tg_{pf2_16x128,ps_32x128,ps_32x256,ps_64x256}, imported
   from the vLLM ROCm image with the user's approval, sha256-pinned; tile per token count from AITER's tuned
@@ -776,7 +785,7 @@ The packet from config + index alone (no weights) is 70 MB: 4 prefill buckets + 
 
 Strict `campaign.py report` output per input length and the combined comparison.csv:
 [docs/bringup/results/glm53flash-mi350x-2026-10-12](../bringup/results/glm53flash-mi350x-2026-10-12/summary.md).
-No qualified win: plow total throughput 0.44-0.75x vLLM (v16c; v15b 0.37-0.66x, v15a 0.36-0.66x, v13 0.34-0.61x, v11 0.28-0.61x).
+No qualified win: plow total throughput 0.47-0.76x vLLM (v17; v16c 0.44-0.75x, v15b 0.37-0.66x, v15a 0.36-0.66x, v13 0.34-0.61x, v11 0.28-0.61x).
 
 ## 6. Roofline (CPU, before any plow GPU time)
 
