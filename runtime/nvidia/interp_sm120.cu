@@ -4553,7 +4553,8 @@ extern "C" int PLOW_SYM(plow_sm120_launch)(PlowProgram* prog, int grid, cudaStre
 }
 
 #if defined(PLOW_NV_GLU_QUANT_CACHE) && PLOW_NV_GLU_QUANT_CACHE && PLOW_NV_PREFILL && PLOW_NV_SEGMENTS && PLOW_NV_THREADS == 256
-extern "C" __device__ unsigned PLOW_SYM(plow_glu_quant_cache_abi) = 1;
+/* ABI 2: any 8-aligned width <= 16384 (i[1]); ABI 1 objects hardcode width 15360. */
+extern "C" __device__ unsigned PLOW_SYM(plow_glu_quant_cache_abi) = 2;
 extern "C" __global__ void __launch_bounds__(256, 2) PLOW_SYM(plow_glu_quant_cached)(PlowProgram prog,
                                                                                  unsigned inst) {
     __shared__ float part[8];
@@ -4570,7 +4571,7 @@ extern "C" __global__ void __launch_bounds__(256, 2) PLOW_SYM(plow_glu_quant_cac
                                          gridDim.x, part, in->i[1]);
 }
 /* The same rows without the bf16 GLU store, for an instruction whose output tensor nothing reads. */
-extern "C" __device__ unsigned PLOW_SYM(plow_glu_quant_cache_q_abi) = 1;
+extern "C" __device__ unsigned PLOW_SYM(plow_glu_quant_cache_q_abi) = 2;
 extern "C" __global__ void __launch_bounds__(256, 2) PLOW_SYM(plow_glu_quant_cached_q)(PlowProgram prog,
                                                                                    unsigned inst) {
     __shared__ float part[8];

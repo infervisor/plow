@@ -1908,6 +1908,7 @@ struct SegPf {
     f_flash: KernelFn,
     glu_quant_cached: Option<KernelFn>,
     glu_quant_cached_q: Option<KernelFn>,
+    glu_quant_any_width: bool,
     quant_cached: Option<KernelFn>,
     norm_rms_pf: Option<KernelFn>,
     rope_pf: Option<KernelFn>,
@@ -9411,11 +9412,11 @@ impl GpuEngine {
                 let masked = plow_asset::packed_prefill::MASKED_PADDING_CAPABILITY;
                 let masked_padding = be.module_global_u32(&m1, masked)? == Some(1)
                     && be.module_global_u32(&m2, masked)? == Some(1);
-                let glu_quant_cached = if be.module_global_u32(
+                let glu_quant_abi = be.module_global_u32(
                     &m1,
                     &format!("plow_glu_quant_cache_abi{seg_global_suffix}"),
-                )? == Some(1)
-                {
+                )?;
+                let glu_quant_cached = if matches!(glu_quant_abi, Some(1 | 2)) {
                     Some(
                         be.get_function(&m1, &format!("plow_glu_quant_cached{seg_global_suffix}"))?,
                     )
@@ -9426,7 +9427,7 @@ impl GpuEngine {
                     && be.module_global_u32(
                         &m1,
                         &format!("plow_glu_quant_cache_q_abi{seg_global_suffix}"),
-                    )? == Some(1)
+                    )? == glu_quant_abi
                 {
                     Some(be.get_function(
                         &m1,
@@ -9462,6 +9463,7 @@ impl GpuEngine {
                 let mut sp = SegPf {
                     glu_quant_cached,
                     glu_quant_cached_q,
+                    glu_quant_any_width: glu_quant_abi == Some(2),
                     quant_cached,
                     norm_rms_pf,
                     rope_pf,
@@ -9817,7 +9819,10 @@ impl GpuEngine {
             let cached_quant_function = seg_pf.as_ref().and_then(|sp| sp.glu_quant_cached);
             let cached_quant_segments =
                 if cached_quant_function.is_some() && seg_mode && qwen_segments.is_empty() {
-                    cublaslt::prefill_glu_quant_segments(g)
+                    cublaslt::prefill_glu_quant_segments(
+                        g,
+                        seg_pf.as_ref().is_some_and(|sp| sp.glu_quant_any_width),
+                    )
                         .into_iter()
                         .filter(|(seg, _)| packet_role_index(&packet_segment_roles, *seg).is_none())
                         .collect::<Vec<_>>()

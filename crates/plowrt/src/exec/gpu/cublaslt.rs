@@ -679,7 +679,8 @@ pub(super) fn prefill_light_segments(
         .collect()
 }
 
-pub(super) fn prefill_glu_quant_segments(g: &DevProg) -> Vec<(usize, Vec<usize>)> {
+/// `any_width`: the object's cached kernel is ABI 2 (any 8-aligned width); ABI 1 hardcodes 15360.
+pub(super) fn prefill_glu_quant_segments(g: &DevProg, any_width: bool) -> Vec<(usize, Vec<usize>)> {
     g.gq_seg_ofs
         .windows(2)
         .enumerate()
@@ -690,8 +691,7 @@ pub(super) fn prefill_glu_quant_segments(g: &DevProg) -> Vec<(usize, Vec<usize>)
             // The cached kernel's row walk holds 8 x 2048 elements; its GLU is GeGLU (act 0).
             let matches = d.op == DevOp::QuantFp8 as u16
                 && d.i[0] >= 32
-                && d.i[1] % 8 == 0
-                && d.i[1] <= 8 * 2048
+                && (d.i[1] == 15360 || any_width && d.i[1] % 8 == 0 && d.i[1] <= 8 * 2048)
                 && d.i[2] == 0
                 && d.t[..5].iter().all(|&t| t != packet::dev::TENSOR_NONE16)
                 && d.blocks != 0
@@ -2514,28 +2514,36 @@ mod tests {
             g
         };
         let mut g = make();
-        assert_eq!(prefill_glu_quant_segments(&g), vec![(1, vec![1])]);
+        assert_eq!(prefill_glu_quant_segments(&g, true), vec![(1, vec![1])]);
         let mut narrow = make();
         narrow.insts[1].i[1] = 2112;
-        assert_eq!(prefill_glu_quant_segments(&narrow), vec![(1, vec![1])]);
+        assert_eq!(
+            prefill_glu_quant_segments(&narrow, true),
+            vec![(1, vec![1])]
+        );
+        assert!(prefill_glu_quant_segments(&narrow, false).is_empty());
+        assert_eq!(
+            prefill_glu_quant_segments(&make(), false),
+            vec![(1, vec![1])]
+        );
         for (field, value) in [(0, 1), (1, 4100), (1, 8 * 2048 + 8), (2, 1)] {
             let mut bad = make();
             bad.insts[1].i[field] = value;
-            assert!(prefill_glu_quant_segments(&bad).is_empty());
+            assert!(prefill_glu_quant_segments(&bad, true).is_empty());
         }
         for tensor in 0..5 {
             let mut bad = make();
             bad.insts[1].t[tensor] = packet::dev::TENSOR_NONE16;
-            assert!(prefill_glu_quant_segments(&bad).is_empty());
+            assert!(prefill_glu_quant_segments(&bad, true).is_empty());
         }
         g.insts[1].blocks = 2;
-        assert!(prefill_glu_quant_segments(&g).is_empty());
+        assert!(prefill_glu_quant_segments(&g, true).is_empty());
         g.insts[1].blocks = 1;
         g.gq_stream[1].slice = 1;
-        assert!(prefill_glu_quant_segments(&g).is_empty());
+        assert!(prefill_glu_quant_segments(&g, true).is_empty());
         g.gq_stream[1].slice = 0;
         g.gq_seg_ofs = vec![0, 1, 3];
-        assert!(prefill_glu_quant_segments(&g).is_empty());
+        assert!(prefill_glu_quant_segments(&g, true).is_empty());
     }
 
     #[test]
