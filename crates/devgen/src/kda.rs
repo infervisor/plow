@@ -575,11 +575,16 @@ fn emit_control_linears(
         let fa_lt = seq_rows
             .then(|| crate::mla::emit_glm53_lt_dec(b, fa, x, w_fa, t, hd, hi, &[dep]))
             .flatten();
+        let b_lt = seq_rows
+            .then(|| crate::mla::emit_glm53_lt_dec(b, b_raw, x, w_b, t, nh, hi, &[dep]))
+            .flatten();
         (
             fa_lt.unwrap_or_else(|| {
                 crate::k3::emit_k3_linear(b, fa, x, w_fa, t, hd, hi, n_cu, seq_rows, &[dep])
             }),
-            crate::k3::emit_k3_linear(b, b_raw, x, w_b, t, nh, hi, n_cu, seq_rows, &[dep]),
+            b_lt.unwrap_or_else(|| {
+                crate::k3::emit_k3_linear(b, b_raw, x, w_b, t, nh, hi, n_cu, seq_rows, &[dep])
+            }),
         )
     }
 }

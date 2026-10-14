@@ -7546,6 +7546,7 @@ pub(crate) fn glm53_lt_dec_routes(rows: u32, nn: u32, k: u32) -> bool {
         (1024, 4096) => "kda_qkv",
         (128, 4096) => "kda_gfa",
         (1024, 128) => "kda_gb",
+        (8, 4096) => "kda_b",
         _ => return false,
     };
     glm53_lt_dec_rung(rows)

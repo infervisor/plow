@@ -1020,7 +1020,7 @@ pub struct EmitConfig {
     /// GLM-5.3-Flash gfx950 decode: comma list of dense BF16 projections that run the pinned
     /// gfx950 hipBLASLt object as their own segment at the `PLOW_GLM53_GEMM_LT_DEC_RUNGS` rungs:
     /// `q_a`, `kv_a`, `q_absorb`, `mla_o`, `kda_o`, `kda_qkv`, `kda_gfa` (g_a, f_a), `kda_gb`
-    /// (g_b, f_b). A routed KDA layer drops the PLOW_GLM_KDA_PROJ_GROUP packets. Unset =>
+    /// (g_b, f_b), `kda_b`. A routed KDA layer drops the PLOW_GLM_KDA_PROJ_GROUP packets. Unset =>
     /// byte-identical.
     #[arg(long, env = "PLOW_GLM53_GEMM_LT_DEC")]
     pub glm53_gemm_lt_dec: Option<String>,
