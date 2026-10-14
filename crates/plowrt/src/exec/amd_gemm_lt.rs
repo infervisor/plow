@@ -393,6 +393,13 @@ pub(super) struct KernelSpec {
     /// split at exactly `rows` (a rung's fixed width); other row counts run whole tiles.
     #[serde(default)]
     pub sk: Option<[u32; 4]>,
+    /// Workgroup size (the kernel's `WG` tile); 256 when absent.
+    #[serde(default = "wg256")]
+    pub wg: u32,
+}
+
+fn wg256() -> u32 {
+    256
 }
 
 /// gfx950 Tensile stream-K kernarg (184 bytes, `.kernarg_segment_size` of every SK5 kernel).
@@ -708,7 +715,7 @@ impl GemmLt {
                 &self.specs[index],
                 [base, base + GFX950_WS],
             );
-            be.launch(self.kernels[index], grid, 256, 0, bytemuck::bytes_of(&args))?;
+            be.launch(self.kernels[index], grid, self.specs[index].wg, 0, bytemuck::bytes_of(&args))?;
             weight += u64::from(nn) * u64::from(k) * 2;
         }
         Ok(())
@@ -732,7 +739,7 @@ impl GemmLt {
                 &self.specs[index],
                 [base, base + GFX950_WS],
             );
-            return be.launch(self.kernels[index], grid, 256, 0, bytemuck::bytes_of(&args));
+            return be.launch(self.kernels[index], grid, self.specs[index].wg, 0, bytemuck::bytes_of(&args));
         }
         let args = arguments(route, tensors, &self.specs[index], info1);
         be.launch(
