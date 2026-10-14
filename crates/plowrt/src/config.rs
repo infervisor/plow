@@ -803,6 +803,17 @@ pub struct RuntimeConfig {
     #[arg(long = "prefix-retire-attached", env = "PLOW_PREFIX_RETIRE_ATTACHED", default_value_t = true, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
     pub prefix_retire_attached: bool,
 
+    /// CUDA VMM prefix cache: pinned host memory (MiB) that evicted boundary snapshots spill
+    /// to instead of being freed, restored over PCIe when a prompt attaches to one. `0` (the
+    /// default) keeps snapshots device-only.
+    #[arg(
+        long = "vmm-host-cache-mib",
+        env = "PLOW_VMM_HOST_CACHE_MIB",
+        default_value_t = 0,
+        global = true
+    )]
+    pub vmm_host_cache_mib: u64,
+
     #[arg(long = "prefix-inflight-wait", env = "PLOW_PREFIX_INFLIGHT_WAIT", default_value_t = true, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
     pub prefix_inflight_wait: bool,
 
@@ -2520,6 +2531,15 @@ impl RuntimeConfig {
             Self::env_bool("PLOW_PREFIX_RETIRE_ATTACHED"),
             !Self::is_initialized(),
         )
+    }
+
+    pub(crate) fn vmm_host_cache_bytes(&self) -> u64 {
+        let mib = if Self::is_initialized() {
+            self.vmm_host_cache_mib
+        } else {
+            Self::env_parse("PLOW_VMM_HOST_CACHE_MIB").unwrap_or(self.vmm_host_cache_mib)
+        };
+        mib << 20
     }
 
     pub(crate) fn prefix_inflight_wait(&self) -> bool {

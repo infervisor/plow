@@ -1764,6 +1764,41 @@ async fn metrics_handler(
             "counter",
             "Bytes freed by suffix evictions.",
         ),
+        (
+            "host_snapshots",
+            "gauge",
+            "Prefix snapshots resident in the pinned host tier.",
+        ),
+        (
+            "host_snapshot_bytes",
+            "gauge",
+            "Bytes of prefix snapshots in the host tier.",
+        ),
+        (
+            "host_capacity_bytes",
+            "gauge",
+            "Pinned host tier bytes allocated.",
+        ),
+        (
+            "host_snapshots_spilled_total",
+            "counter",
+            "Prefix snapshots spilled to the host tier.",
+        ),
+        (
+            "host_snapshots_restored_total",
+            "counter",
+            "Host tier snapshots restored to the device by an attach.",
+        ),
+        (
+            "host_evictions_total",
+            "counter",
+            "Prefix snapshots evicted from the host tier.",
+        ),
+        (
+            "host_spill_fallbacks_total",
+            "counter",
+            "Evictions that freed a snapshot the host tier could not take.",
+        ),
     ] {
         crate::obs::serving::family(&mut out, &format!("plowrt_prefix_{name}"), kind, help);
     }
@@ -1789,7 +1824,14 @@ async fn metrics_handler(
              plowrt_prefix_snapshot_bytes{{model=\"{slug}\"}} {}\n\
              plowrt_prefix_snapshots_evicted_total{{model=\"{slug}\"}} {}\n\
              plowrt_prefix_eviction_units_total{{model=\"{slug}\"}} {}\n\
-             plowrt_prefix_eviction_unit_bytes_total{{model=\"{slug}\"}} {}\n",
+             plowrt_prefix_eviction_unit_bytes_total{{model=\"{slug}\"}} {}\n\
+             plowrt_prefix_host_snapshots{{model=\"{slug}\"}} {}\n\
+             plowrt_prefix_host_snapshot_bytes{{model=\"{slug}\"}} {}\n\
+             plowrt_prefix_host_capacity_bytes{{model=\"{slug}\"}} {}\n\
+             plowrt_prefix_host_snapshots_spilled_total{{model=\"{slug}\"}} {}\n\
+             plowrt_prefix_host_snapshots_restored_total{{model=\"{slug}\"}} {}\n\
+             plowrt_prefix_host_evictions_total{{model=\"{slug}\"}} {}\n\
+             plowrt_prefix_host_spill_fallbacks_total{{model=\"{slug}\"}} {}\n",
             s.attach_hits,
             s.attach_misses,
             s.tokens_queried,
@@ -1806,6 +1848,13 @@ async fn metrics_handler(
             s.snapshots_evicted,
             s.eviction_units,
             s.eviction_unit_bytes,
+            s.host_snapshots,
+            s.host_snapshot_bytes,
+            s.host_capacity_bytes,
+            s.snapshots_spilled,
+            s.snapshots_restored,
+            s.host_evictions,
+            s.spill_fallbacks,
         );
     }
     (

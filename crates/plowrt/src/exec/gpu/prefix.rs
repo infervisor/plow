@@ -474,9 +474,8 @@ impl GpuEngine {
             block_hint,
             cache_cap,
         ) {
-            Ok(mut kv) => Ok(Some(VmmServe {
-                rings,
-                tensor_tracks: blob
+            Ok(mut kv) => {
+                let tensor_tracks: Vec<_> = blob
                     .tensors
                     .iter()
                     .enumerate()
@@ -484,31 +483,64 @@ impl GpuEngine {
                         let (layer, which) = kv_tensor_name(&tensor.name)?;
                         kv.tensor_va(layer, which).map(|_| (id, layer, which))
                     })
-                    .collect(),
-                cache_tensors: Vec::new(),
-                kv: Some({
-                    kv.enable_block_pool(crate::memory::vmm::kv_pool_cap());
-                    if rt.vmm_deferred_reclaim() {
-                        kv.enable_deferred_reclaim();
-                        if rt.vmm_stale_reserve() {
-                            kv.enable_stale_reserve();
+                    .collect();
+                let host_cache = rt.vmm_host_cache_bytes();
+                if host_cache > 0 {
+                    // One slot holds the largest snapshot `vmm_snap_bytes` can produce: a whole
+                    // window, the full-layer scales to `max_ctx` and `block_rows - 1` partial rows.
+                    let slot_bytes = {
+                        let g = kv.geometry();
+                        snap_row_bytes * u64::from(g.window)
+                            + full_scale.len() as u64
+                                * 2
+                                * u64::from(g.kvh_full)
+                                * u64::from(g.max_ctx)
+                                * 4
+                            + tensor_tracks.len() as u64
+                                * u64::from(g.kvh_full)
+                                * u64::from(kv.block_rows() - 1)
+                                * u64::from(g.hd_full * g.elem)
+                    };
+                    match kv.enable_host_tier(host_cache, slot_bytes) {
+                        Ok(()) => tracing::info!(
+                            cap_mib = host_cache >> 20,
+                            slot_mib = slot_bytes >> 20,
+                            slots = host_cache / slot_bytes,
+                            "vmm prefix: host tier (pinned snapshot spill) armed"
+                        ),
+                        Err(error) => {
+                            tracing::warn!(error = %error, "vmm prefix: host tier off")
                         }
                     }
-                    if rt.vmm_publish_shared() {
-                        kv.enable_shared_publish();
-                    }
-                    // FP8 full-layer scales snapshot over `[0, p_a)`, not just the tail.
-                    if !full_scale.is_empty() {
-                        kv.enable_strict_publish();
-                    }
-                    kv
-                }),
-                slide,
-                slide_scale,
-                full_scale,
-                ring,
-                snap_row_bytes,
-            })),
+                }
+                Ok(Some(VmmServe {
+                    rings,
+                    tensor_tracks,
+                    cache_tensors: Vec::new(),
+                    kv: Some({
+                        kv.enable_block_pool(crate::memory::vmm::kv_pool_cap());
+                        if rt.vmm_deferred_reclaim() {
+                            kv.enable_deferred_reclaim();
+                            if rt.vmm_stale_reserve() {
+                                kv.enable_stale_reserve();
+                            }
+                        }
+                        if rt.vmm_publish_shared() {
+                            kv.enable_shared_publish();
+                        }
+                        // FP8 full-layer scales snapshot over `[0, p_a)`, not just the tail.
+                        if !full_scale.is_empty() {
+                            kv.enable_strict_publish();
+                        }
+                        kv
+                    }),
+                    slide,
+                    slide_scale,
+                    full_scale,
+                    ring,
+                    snap_row_bytes,
+                }))
+            }
             Err(e) => {
                 tracing::warn!(error = %e, "vmm off: pool bringup failed");
                 Ok(None)
