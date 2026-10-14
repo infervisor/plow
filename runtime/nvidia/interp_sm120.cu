@@ -4612,7 +4612,7 @@ extern "C" __global__ void __launch_bounds__(256, 2) PLOW_SYM(plow_quant_cached)
  * grid: the bodies walk (token, head) items one warp each, {(slice * WARPS + warp) + k * nblk *
  * WARPS}, and skip masked padding rows the same way, so each item's arithmetic and KV store is
  * the interpreter's. The fat object runs them on one CTA per SM. */
-#if !PLOW_MIXED_STEP
+#if defined(PLOW_NV_ROPE_PF) && PLOW_NV_ROPE_PF && !PLOW_MIXED_STEP
 extern "C" __device__ unsigned PLOW_SYM(plow_rope_pf_abi) = 1;
 extern "C" __global__ void __launch_bounds__(256) PLOW_SYM(plow_rope_pf)(PlowProgram prog,
                                                                          unsigned inst) {
