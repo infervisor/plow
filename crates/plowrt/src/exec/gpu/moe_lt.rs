@@ -382,6 +382,8 @@ fn route_prologue(program: &DevProg, tensors: &[DevTensor], glu: usize) -> Optio
         && a.op == DevOp::MoeAlignGemmaPf as u16
         && q.op == DevOp::QuantFp8 as u16
         && [n.i[0], n.i[1], n.i[2]] == [rows, hidden, 0]
+        // i[7] = 1 is the (1 + w) norm-weight offset, which plow_moe_lt_route_pre does not apply.
+        && n.i[7] == 0
         && n.t[3] == none
         && n.t[4] == none
         && n.t[1] == r.t[1]
@@ -2007,11 +2009,13 @@ mod tests {
         covered.sort_unstable();
         assert_eq!(covered, (0..8).collect::<Vec<_>>());
         // The router must read the norm's input, the align the router's table, the quant the
-        // norm's output; a seven-instruction segment is no role.
-        let edits: [fn(&mut DevProg); 3] = [
+        // norm's output, and the norm must not carry the weight offset; a seven-instruction
+        // segment is no role.
+        let edits: [fn(&mut DevProg); 4] = [
             |p| p.insts[1].t[1] = 16,
             |p| p.insts[2].t[1] = 4,
             |p| p.insts[3].t[1] = 17,
+            |p| p.insts[0].i[7] = 1,
         ];
         for edit in edits {
             let saved = program.insts.clone();
