@@ -667,6 +667,17 @@ if [ "$ARCH" = gfx950 ] && [ "$need_kda_carry_keyfeed" = 1 ]; then
     -DPLOW_REQUIRED_MARKER=plow_kda_carry_keyfeed_abi_1 $KDA_CARRY_DEFS \
     "$R/amd/kda_chunk_carry_regstate_keyfeed.hip"
   KDA_CARRY_KEYFEED_ELFS="kda_chunk_wu_lean_keys_gfx950.elf kda_chunk_carry_regstate_keyfeed_gfx950.elf"
+  # PLOW_KDA_CARRY_SPLIT (runtime segment cap; any nonzero value builds the object): the
+  # sequence-split key-fed carry plowrt runs when served with PLOW_KDA_CARRY_SPLIT >= 2.
+  if [ "${PLOW_KDA_CARRY_SPLIT:-0}" != 0 ]; then
+    bash "$R/cmake/hipcc_hsaco.sh" hipcc "$BUN" "$ARCH" \
+      "$OUT/kda_chunk_carry_split_gfx950.elf" \
+      plow_kda_chunk_carry_split_seg_gfx950 256 1 \
+      $INC -DPLOW_LEAN_OBJECT=1 -DPLOW_NO_SPILL=1 -DPLOW_NO_SGPR_SPILL=1 \
+      -DPLOW_REQUIRED_MARKER=plow_kda_carry_split_abi_1 $KDA_CARRY_DEFS \
+      "$R/amd/kda_chunk_carry_split.hip"
+    KDA_CARRY_KEYFEED_ELFS="$KDA_CARRY_KEYFEED_ELFS kda_chunk_carry_split_gfx950.elf"
+  fi
 fi
 
 # PLOW_MLA_PF_DENSE=1: the dedicated NoPE MLA flash-prefill object plowrt routes eligible flash

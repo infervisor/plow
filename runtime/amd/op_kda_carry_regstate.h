@@ -90,7 +90,7 @@ struct Factors {
 __device__ __forceinline__ void load_rows(
     Factors& f, const bf16* __restrict__ q, const bf16* __restrict__ W,
     const bf16* __restrict__ U, unsigned T, unsigned H, unsigned h, unsigned v0,
-    unsigned row0, unsigned wave, unsigned token, unsigned kg) {
+    unsigned row0, unsigned wave, unsigned token, unsigned kg, bool zero_u = false) {
     const unsigned m0 = 16u * wave;
     const size_t rowm = min(row0 + m0 + token, T - 1u);
     const bf16* wp = W + (rowm * H + h) * D + 8u * kg;
@@ -103,7 +103,7 @@ __device__ __forceinline__ void load_rows(
 #pragma unroll
     for (unsigned e = 0; e < 4u; ++e) {
         const size_t rowe = min(row0 + m0 + 4u * kg + e, T - 1u);
-        f.u[e] = U[(rowe * H + h) * V + v0 + token];
+        f.u[e] = zero_u ? (bf16)0 : U[(rowe * H + h) * V + v0 + token];
     }
 }
 
@@ -222,7 +222,9 @@ __device__ __forceinline__ u16x4 pack_bf16x4(f32x4 v) {
  * Must be launched with exactly four waves per workgroup. TIMED accumulates wave-0 s_memtime
  * phase cycles into timers[slice * 8 + 0..6] (bench instrumentation only). KEYFEED reads the
  * scaled-key pair from key_hi/key_lo ([T][H][D] bf16 each) instead of k and g. */
-template <bool TIMED = false, bool HW_CVT = false, bool KEYFEED = false>
+/* INIT 0 loads the state; 1 starts from zero and 2 from the identity (state row v = e_v, with
+ * U read as zero), the two partial runs of the split carry. */
+template <bool TIMED = false, bool HW_CVT = false, bool KEYFEED = false, unsigned INIT = 0>
 __device__ void d_kda_chunk_carry_bt64_regstate(
     bf16* __restrict__ out, float* __restrict__ state, const bf16* __restrict__ q,
     const bf16* __restrict__ k, const bf16* __restrict__ W, const bf16* __restrict__ U,
@@ -257,12 +259,19 @@ __device__ void d_kda_chunk_carry_bt64_regstate(
         f32x4 S[2];
 #pragma unroll
         for (unsigned b = 0; b < 2u; ++b) {
-            S[b] = *reinterpret_cast<const f32x4*>(srow + 16u * b);
+            if constexpr (INIT == 0) {
+                S[b] = *reinterpret_cast<const f32x4*>(srow + 16u * b);
+            } else {
+#pragma unroll
+                for (unsigned e = 0; e < 4u; ++e)
+                    S[b][e] = INIT == 2 && v0 + token == 32u * wave + 16u * b + 4u * kg + e
+                                  ? 1.0f : 0.0f;
+            }
             *reinterpret_cast<u16x4*>(ssm + token * SST + 32u * wave + 16u * b + 4u * kg) =
                 pack_bf16x4<HW_CVT>(S[b]);
         }
         Factors F;
-        load_rows(F, q, W, U, T, H, h, v0, 0u, wave, token, kg);
+        load_rows(F, q, W, U, T, H, h, v0, 0u, wave, token, kg, INIT == 2);
         load_aqk(F, Aqk, T, H, h, 0u, wave, token, kg);
         load_decay(F, g, H, h, 0u, min(BT, T), wave, kg);
         if constexpr (KEYFEED) {
@@ -318,10 +327,10 @@ __device__ void d_kda_chunk_carry_bt64_regstate(
                     const bf16 a = f2bf_rs<HW_CVT>(F.aqk[s0][jj >> 2][jj & 3u]);
                     af[s0][jj] = __builtin_bit_cast(bf16_t, token < mv && s < valid ? a : (bf16)0);
                 }
-            load_rows(F, q, W, U, T, H, h, v0, row0n, wave, token, kg);
+            load_rows(F, q, W, U, T, H, h, v0, row0n, wave, token, kg, INIT == 2);
             load_aqk(F, Aqk, T, H, h, row0n, wave, token, kg);
 #else
-            load_rows(F, q, W, U, T, H, h, v0, row0n, wave, token, kg);
+            load_rows(F, q, W, U, T, H, h, v0, row0n, wave, token, kg, INIT == 2);
 #endif
             __syncthreads();
             PLOW_RS_STAMP(t2);

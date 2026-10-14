@@ -1075,6 +1075,63 @@ struct KdaChunkCarryKeyfeedArgs {
 
 const _: () = assert!(std::mem::size_of::<KdaChunkCarryKeyfeedArgs>() == 104);
 
+/// Kernarg of the three `kda_chunk_carry_split.hip` kernels (`PLOW_KDA_CARRY_SPLIT`).
+#[derive(Clone, Copy, Debug)]
+#[repr(C)]
+struct KdaCarrySplitArgs {
+    out: u64,
+    state: u64,
+    q: u64,
+    k: u64,
+    w: u64,
+    u: u64,
+    aqk: u64,
+    g: u64,
+    key_hi: u64,
+    key_lo: u64,
+    scratch: u64,
+    t: u32,
+    heads: u32,
+    nseg: u32,
+    seg_len: u32,
+}
+
+const _: () = assert!(std::mem::size_of::<KdaCarrySplitArgs>() == 104);
+
+/// Shortest segment of the split carry.
+const KDA_CARRY_SPLIT_MIN_SEG: u32 = 1024;
+
+/// `(nseg, seg_len)` of a split key-fed carry over `t` rows with at most `max_seg` segments,
+/// or `None` when the carry stays serial. `seg_len` is a multiple of the 64-row chunk.
+fn kda_carry_split_plan(t: u32, max_seg: u32) -> Option<(u32, u32)> {
+    let nseg = max_seg.min(t / KDA_CARRY_SPLIT_MIN_SEG);
+    if nseg < 2 {
+        return None;
+    }
+    let seg_len = t.div_ceil(nseg).div_ceil(64) * 64;
+    Some((t.div_ceil(seg_len), seg_len))
+}
+
+/// Bytes of the split carry's scratch: Sloc, M and Sst (`[nseg-1][H][128][128]` f32 each) then
+/// Qhat (`[T][H][128]` bf16), for the widest key-fed carry of `progs`.
+fn kda_carry_split_scratch_bytes<'a>(
+    progs: impl IntoIterator<Item = &'a DevProg>,
+    max_seg: u32,
+) -> u64 {
+    let mut bytes = 0u64;
+    for prog in progs {
+        for d in &prog.insts {
+            if !(kda_carry_regstate_inst(d)) {
+                continue;
+            }
+            let (t, h) = (u64::from(d.i[0]), u64::from(d.i[1]));
+            let states = 3 * u64::from(max_seg.saturating_sub(1)) * h * 128 * 128 * 4;
+            bytes = bytes.max(states + t * h * 128 * 2);
+        }
+    }
+    bytes
+}
+
 #[derive(Clone, Copy, Debug, Default)]
 #[repr(C)]
 struct XReduceAttnResArgs {
@@ -7196,6 +7253,12 @@ pub struct AmdEngine {
     k_kda_chunk_carry_keyfeed: Option<HsaKernel>,
     /// The lean Wu's `[hi | lo]` scaled-key pair for the key-fed carry.
     _kda_keyfeed_scratch: Option<DeviceMem>,
+    /// `PLOW_KDA_CARRY_SPLIT`: the segment, combine and fix kernels, their scratch and the
+    /// segment cap.
+    k_kda_carry_split: Option<[HsaKernel; 3]>,
+    _kda_carry_split_scratch: Option<DeviceMem>,
+    kda_carry_split_scratch: u64,
+    kda_carry_split_max: u32,
     k_moe_stage1_mxfp4: Option<HsaKernel>,
     k_moe_stage1_a4_quant: Option<HsaKernel>,
     /// The GEMM and its kernarg bytes (sorted-A4 or token-gather ABI).
@@ -9727,6 +9790,28 @@ impl AmdEngine {
         } else {
             (None, None)
         };
+        let kda_carry_split_max = crate::config::RuntimeConfig::get().amd.kda_carry_split;
+        let k_kda_carry_split = if k_kda_chunk_carry_keyfeed.is_some() && kda_carry_split_max >= 2
+        {
+            let kernarg = std::mem::size_of::<KdaCarrySplitArgs>() as u32;
+            let mut load = |symbol: &str, lds: u32| {
+                load_kda_lean(
+                    "kda_chunk_carry_split_gfx950.elf",
+                    symbol,
+                    "KDA carry split",
+                    &["plow_kda_carry_split_abi_1"],
+                    kernarg,
+                    lds,
+                )
+            };
+            Some([
+                load("plow_kda_chunk_carry_split_seg_gfx950", KDA_CARRY_REGSTATE_LDS)?,
+                load("plow_kda_chunk_carry_split_combine_gfx950", 1024)?,
+                load("plow_kda_chunk_carry_split_fix_gfx950", 0)?,
+            ])
+        } else {
+            None
+        };
 
         let need_mla_pf_dense = crate::config::RuntimeConfig::get().amd.mla_pf_dense
             && blob
@@ -11397,6 +11482,14 @@ impl AmdEngine {
         let kda_keyfeed_scratch = d_kda_keyfeed_scratch
             .as_ref()
             .map(|m| (m.base, kda_keyfeed_half));
+        let d_kda_carry_split_scratch = if k_kda_carry_split.is_some() {
+            let bytes = kda_carry_split_scratch_bytes(blob.prefill_phase(), kda_carry_split_max);
+            tracing::info!(bytes, max_seg = kda_carry_split_max, "allocating KDA carry split scratch");
+            Some(EngineDevice::alloc(&*be, bytes)?)
+        } else {
+            None
+        };
+        let kda_carry_split_scratch = d_kda_carry_split_scratch.as_ref().map_or(0, |m| m.base);
         let stage1_a4_gather = matches!(k_moe_stage1_a4_reuse,
             Some((_, n)) if n == std::mem::size_of::<MoeStage1A4ReuseArgs>());
         let (stage1_a4_payload, stage1_a4_scales) =
@@ -12715,6 +12808,10 @@ impl AmdEngine {
             k_kda_chunk_wu_lean_keys,
             k_kda_chunk_carry_keyfeed,
             _kda_keyfeed_scratch: d_kda_keyfeed_scratch,
+            k_kda_carry_split,
+            _kda_carry_split_scratch: d_kda_carry_split_scratch,
+            kda_carry_split_scratch,
+            kda_carry_split_max,
             k_moe_stage1_mxfp4,
             k_moe_stage1_a4_quant,
             k_moe_stage1_a4_reuse,
@@ -14411,15 +14508,17 @@ impl AmdEngine {
                         }
                     }
                 }
-                EngineDevice::launch_kernel(
-                    &*self.be,
-                    kernel,
-                    grid,
-                    256,
-                    0,
-                    as_bytes(std::slice::from_ref(&args)),
-                    None,
-                )?;
+                if !self.launch_kda_carry_split(&args)? {
+                    EngineDevice::launch_kernel(
+                        &*self.be,
+                        kernel,
+                        grid,
+                        256,
+                        0,
+                        as_bytes(std::slice::from_ref(&args)),
+                        None,
+                    )?;
+                }
                 self.seg_launches += 1;
                 return Ok(());
             }
@@ -14803,6 +14902,44 @@ impl AmdEngine {
         }
     }
 
+    /// `PLOW_KDA_CARRY_SPLIT`: run a key-fed carry as the split segment/combine/fix launches.
+    /// `false` (nothing enqueued) when the split is off or `a.t` is too short to split.
+    fn launch_kda_carry_split(&self, a: &KdaChunkCarryKeyfeedArgs) -> Result<bool> {
+        let Some([seg_k, combine_k, fix_k]) = self.k_kda_carry_split else {
+            return Ok(false);
+        };
+        let Some((nseg, seg_len)) = kda_carry_split_plan(a.t, self.kda_carry_split_max) else {
+            return Ok(false);
+        };
+        let s = KdaCarrySplitArgs {
+            out: a.out,
+            state: a.state,
+            q: a.q,
+            k: a.k,
+            w: a.w,
+            u: a.u,
+            aqk: a.aqk,
+            g: a.g,
+            key_hi: a.key_hi,
+            key_lo: a.key_lo,
+            scratch: self.kda_carry_split_scratch,
+            t: a.t,
+            heads: a.heads,
+            nseg,
+            seg_len,
+        };
+        let bytes = as_bytes(std::slice::from_ref(&s));
+        let tiles = (a.t - seg_len).div_ceil(256);
+        for (kernel, grid) in [
+            (seg_k, kda_carry_regstate_grid(a.heads) * (2 * nseg - 1)),
+            (combine_k, a.heads * 64),
+            (fix_k, a.heads * tiles),
+        ] {
+            EngineDevice::launch_kernel(&*self.be, kernel, grid, 256, 0, bytes, None)?;
+        }
+        Ok(true)
+    }
+
     /// One lean-object launch per packed span, operands rebased to the span's rows (`row0`)
     /// and its recurrent state slot exactly as the packed interpreter arms address them
     /// (`d_kda_chunk_*_packed_bt64`). A fresh span's state was cleared at admission.
@@ -14883,15 +15020,17 @@ impl AmdEngine {
                     a.key_hi += r * h * d * 2;
                     a.key_lo += r * h * d * 2;
                     a.t = t;
-                    EngineDevice::launch_kernel(
-                        &*self.be,
-                        self.k_kda_chunk_carry_keyfeed.expect("checked by caller"),
-                        grid,
-                        256,
-                        0,
-                        as_bytes(std::slice::from_ref(&a)),
-                        None,
-                    )?;
+                    if !self.launch_kda_carry_split(&a)? {
+                        EngineDevice::launch_kernel(
+                            &*self.be,
+                            self.k_kda_chunk_carry_keyfeed.expect("checked by caller"),
+                            grid,
+                            256,
+                            0,
+                            as_bytes(std::slice::from_ref(&a)),
+                            None,
+                        )?;
+                    }
                 }
                 PrefillSegmentRoute::KdaChunkCarryRegstate { args, grid, .. } => {
                     let h = u64::from(args.heads);

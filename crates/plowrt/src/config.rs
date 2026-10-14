@@ -2154,6 +2154,13 @@ pub struct AmdRuntimeConfig {
     #[arg(long = "amd-mla-pf-dense", env = "PLOW_MLA_PF_DENSE", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
     pub mla_pf_dense: bool,
 
+    /// Sequence-split the key-fed KDA carry into at most this many segments (0 = off): the
+    /// segments run in parallel from zero / identity states and a combine + output-fix pass
+    /// restores the serial recurrence (`kda_chunk_carry_split_gfx950.elf`). Segments are at least
+    /// 1024 tokens. Not bit-identical to the serial carry.
+    #[arg(long = "amd-kda-carry-split", env = "PLOW_KDA_CARRY_SPLIT", default_value_t = 0, global = true)]
+    pub kda_carry_split: u32,
+
     /// Split a sparse-rung prefill chunk that starts below 2047 prior keys: rows holding all 2048
     /// causal keys take the AITER sparse route, the earlier rows the interpreter gather arm.
     /// Default on (checkpoint P, perf-certs/rt.mla_pf_row_split.json); `=0` is the rollback.
