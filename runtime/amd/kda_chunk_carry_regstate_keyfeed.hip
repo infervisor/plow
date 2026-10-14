@@ -5,6 +5,12 @@
 #define PLOW_PACKET_HASH 0ull
 #endif
 
+/* PLOW_KDA_CARRY_XCD (default 1 here): a head's eight V16 tiles on one XCD (op_kda_carry_regstate.h;
+ * item -> workgroup map only, bit-identical). =0 is the round-robin rollback. */
+#ifndef PLOW_KDA_CARRY_XCD
+#define PLOW_KDA_CARRY_XCD 1
+#endif
+
 #define PLOW_WG_WAVES 4
 #include "amd_common.h"
 #include "op_elementwise.h"

@@ -288,6 +288,90 @@ __device__ void d_kda_chunk_gate_prefix_bt64(
     }
 }
 
+/* PLOW_KDA_PREP_COLSCAN: the dense BT64 gate prefix with lanes on the (head, dimension) axis, so
+ * every g_raw load and g_cumsum store is a coalesced row segment instead of 64 rows' scattered
+ * elements. One wave owns one (full chunk, 64-column group) and holds the chunk's 64 gates of its
+ * column in registers; the six shuffle-scan rounds are replayed per column (row i adds row
+ * i - delta's previous-round value), so every sum has the operands of d_kda_chunk_gate_prefix_bt64.
+ * A ragged tail chunk takes the row-lane path. Requires D to be a multiple of 64 (a column group
+ * never straddles heads). */
+#ifndef PLOW_KDA_PREP_COLSCAN
+#if PLOW_BUCKET_DECODE
+#define PLOW_KDA_PREP_COLSCAN 0
+#else
+#define PLOW_KDA_PREP_COLSCAN 1
+#endif
+#endif
+/* One column of a full 64-row chunk of the PLOW_KDA_PREP_COLSCAN gate prefix; LBM = lower-bound
+ * gate mode. */
+template <bool LBM>
+__device__ __forceinline__ void kda_gate_col_scan(float* __restrict__ gout,
+                                                  const bf16* __restrict__ gin, size_t stride,
+                                                  float a, float dtb, float lb) {
+    constexpr float RCP_LN2 = 1.4426950408889634f;
+    /* A vector copy of the uniform row stride keeps the 64 row offsets out of SGPRs. */
+    asm volatile("" : "+v"(stride));
+    float x[64];
+#pragma unroll
+    for (unsigned r = 0; r < 64u; ++r)
+        x[r] = bf2f(gin[r * stride]);
+#pragma unroll
+    for (unsigned r = 0; r < 64u; ++r) {
+        const float s = x[r] + dtb;
+        const float gate = LBM ? lb * kda_sigmoid(a * s) : -a * kda_softplus(s);
+        x[r] = gate * RCP_LN2;
+    }
+    {
+        /* The row-lane scan adds shuffled values, so they never fuse with the RCP_LN2 product;
+         * in registers they would. */
+#pragma clang fp contract(off)
+#pragma unroll
+        for (unsigned delta = 1; delta < 64u; delta <<= 1) {
+#pragma unroll
+            for (unsigned r = 63u; r >= delta; --r) x[r] += x[r - delta];
+        }
+    }
+#pragma unroll
+    for (unsigned r = 0; r < 64u; ++r)
+        gout[r * stride] = x[r];
+}
+
+__device__ __forceinline__ void d_kda_chunk_gate_prefix_bt64_col(
+    float* __restrict__ g_cumsum_log2, float* __restrict__ beta,
+    const bf16* __restrict__ g_raw, const bf16* __restrict__ beta_raw,
+    const float* __restrict__ A_log, const float* __restrict__ dt_bias, unsigned T, unsigned H,
+    unsigned D, unsigned mode, float lb, unsigned slice, unsigned nblk) {
+    const unsigned lane = threadIdx.x & (PLOW_WAVE - 1u);
+    const unsigned wave = threadIdx.x >> 6;
+    const size_t hd_count = (size_t)H * D;
+    const size_t groups = hd_count / PLOW_WAVE;
+    const size_t n_items = (size_t)(T / 64u) * groups;
+    for (size_t item = (size_t)slice * PLOW_WAVES + wave; item < n_items;
+         item += (size_t)nblk * PLOW_WAVES) {
+        const unsigned chunk = (unsigned)(item / groups);
+        const unsigned hd = (unsigned)(item - (size_t)chunk * groups) * PLOW_WAVE + lane;
+        const unsigned h = hd / D;
+        const size_t row0 = (size_t)chunk * 64u;
+        const float a = __expf(A_log[h]);
+        const float dtb = dt_bias[hd];
+        float* const gout = g_cumsum_log2 + row0 * hd_count + hd;
+        const bf16* const gin = g_raw + row0 * hd_count + hd;
+        if (mode == PLOW_KDA_GATE_LOWER_BOUND)
+            kda_gate_col_scan<true>(gout, gin, hd_count, a, dtb, lb);
+        else
+            kda_gate_col_scan<false>(gout, gin, hd_count, a, dtb, lb);
+        if ((hd - lane) % D == 0u)
+            beta[(row0 + lane) * H + h] = kda_sigmoid(bf2f(beta_raw[(row0 + lane) * H + h]));
+    }
+    if (T % 64u != 0u) {
+        const size_t row0 = (size_t)(T / 64u) * 64u;
+        d_kda_chunk_gate_prefix_bt64(g_cumsum_log2 + row0 * hd_count, beta + row0 * H,
+                                     g_raw + row0 * hd_count, beta_raw + row0 * H, A_log,
+                                     dt_bias, nullptr, 1u, T - (unsigned)row0, H, D, mode, lb,
+                                     slice, nblk);
+    }
+}
+
 /* Dense production preparation: chunk-local gate prefix plus in-place q/k L2 normalization.
  * Null chunk descriptors derive contiguous BT64 chunks and a final tail bounded by T. */
 __device__ void d_kda_chunk_prepare_bt64(
@@ -296,6 +380,12 @@ __device__ void d_kda_chunk_prepare_bt64(
     const bf16* __restrict__ beta_raw, const float* __restrict__ A_log,
     const float* __restrict__ dt_bias, const uint2* __restrict__ chunks, unsigned n_chunks,
     unsigned T, unsigned H, unsigned D, unsigned mode, float lb, unsigned slice, unsigned nblk) {
+#if PLOW_KDA_PREP_COLSCAN
+    if (chunks == nullptr && D % PLOW_WAVE == 0u)
+        d_kda_chunk_gate_prefix_bt64_col(g_cumsum_log2, beta, g_raw, beta_raw, A_log, dt_bias, T,
+                                         H, D, mode, lb, slice, nblk);
+    else
+#endif
     d_kda_chunk_gate_prefix_bt64(g_cumsum_log2, beta, g_raw, beta_raw, A_log, dt_bias, chunks,
                                  n_chunks, T, H, D, mode, lb, slice, nblk);
     const unsigned lane = threadIdx.x & 63u, wave = threadIdx.x >> 6;
@@ -566,9 +656,116 @@ __device__ void d_kda_chunk_intra_bt64(
     }
 }
 
+/* Lower-triangular block products (bm, bn) for row blocks bm in [LO, HI] of one wave-owned
+ * (chunk, head) item, with every operand of a d0 step (row blocks 0..HI of k/g, LO..HI of q, the
+ * anchor rows' g) loaded up front: one dependent memory round trip per d0 step instead of one per
+ * pair. Element formulas, anchors, zeroing and each pair's MFMA order over d0 are those of the
+ * per-pair loop in d_kda_chunk_intra_bt64_wave_items. Masked rows read a clamped in-chunk row and
+ * are discarded. */
+template <unsigned LO, unsigned HI>
+__device__ __forceinline__ void kda_intra_products_hoist(
+    float* __restrict__ Aqk, float* __restrict__ mat, const bf16* __restrict__ q,
+    const bf16* __restrict__ k, const float* __restrict__ g, const float* __restrict__ beta,
+    size_t row0, unsigned valid, unsigned H, unsigned h, float scale, unsigned token,
+    unsigned kgroup) {
+    constexpr unsigned D = 128u;
+    constexpr unsigned P0 = LO * (LO + 1u) / 2u;
+    constexpr unsigned NP = (HI + 1u) * (HI + 2u) / 2u - P0;
+    const size_t hd_count = (size_t)H * D;
+    unsigned mv[HI + 1u];
+#pragma unroll
+    for (unsigned b = 0; b <= HI; ++b) mv[b] = valid > 16u * b ? min(16u, valid - 16u * b) : 0u;
+    if (mv[LO] == 0u) return;
+    f32x4 qk[NP], kk[NP];
+#pragma unroll
+    for (unsigned p = 0; p < NP; ++p) {
+        qk[p] = (f32x4)(0.0f);
+        kk[p] = (f32x4)(0.0f);
+    }
+#pragma unroll 1
+    for (unsigned d0 = 0; d0 < D; d0 += 32u) {
+        const size_t col = (size_t)h * D + d0 + 8u * kgroup;
+        uint4 qv[HI + 1u], kv[HI + 1u];
+        f32x4 gv[HI + 1u][2], gad[HI + 1u][2], gao[HI + 1u][2];
+#pragma unroll
+        for (unsigned b = 0; b <= HI; ++b) {
+            if (mv[b] == 0u) continue;
+            const size_t row = row0 + 16u * b + min(token, mv[b] - 1u);
+            const size_t i = row * hd_count + col;
+            kv[b] = *reinterpret_cast<const uint4*>(k + i);
+            gv[b][0] = *reinterpret_cast<const f32x4*>(g + i);
+            gv[b][1] = *reinterpret_cast<const f32x4*>(g + i + 4u);
+            if (b < LO) continue;
+            qv[b] = *reinterpret_cast<const uint4*>(q + i);
+            const size_t ia = (row0 + 16u * b + min(8u, mv[b] - 1u)) * hd_count + col;
+            gad[b][0] = *reinterpret_cast<const f32x4*>(g + ia);
+            gad[b][1] = *reinterpret_cast<const f32x4*>(g + ia + 4u);
+            if (b != 0u) {
+                const size_t io = (row0 + 16u * b) * hd_count + col;
+                gao[b][0] = *reinterpret_cast<const f32x4*>(g + io);
+                gao[b][1] = *reinterpret_cast<const f32x4*>(g + io + 4u);
+            }
+        }
+#pragma unroll
+        for (unsigned bm = LO; bm <= HI; ++bm) {
+            if (mv[bm] == 0u) continue;
+#pragma unroll
+            for (unsigned bn = 0; bn <= bm; ++bn) {
+                const f32x4* an = bn == bm ? gad[bm] : gao[bm];
+                bf16x8 qf = (bf16x8)((bf16_t)0);
+                bf16x8 kf = (bf16x8)((bf16_t)0);
+                bf16x8 kt = (bf16x8)((bf16_t)0);
+                if (token < mv[bm]) {
+#pragma unroll
+                    for (unsigned j = 0; j < 8; ++j) {
+                        const float dg = gv[bm][j >> 2][j & 3u] - an[j >> 2][j & 3u];
+                        const unsigned qw = qv[bm][j >> 1], kw = kv[bm][j >> 1];
+                        const bf16 qb = (bf16)((j & 1u) ? qw >> 16 : qw & 0xffffu);
+                        const bf16 kb = (bf16)((j & 1u) ? kw >> 16 : kw & 0xffffu);
+                        qf[j] = __builtin_bit_cast(bf16_t, f2bf(bf2f(qb) * exp2f(dg)));
+                        kf[j] = __builtin_bit_cast(bf16_t, f2bf(bf2f(kb) * exp2f(dg)));
+                    }
+                }
+                if (token < mv[bn]) {
+#pragma unroll
+                    for (unsigned j = 0; j < 8; ++j) {
+                        const float dg = gv[bn][j >> 2][j & 3u] - an[j >> 2][j & 3u];
+                        const unsigned kw = kv[bn][j >> 1];
+                        const bf16 kb = (bf16)((j & 1u) ? kw >> 16 : kw & 0xffffu);
+                        kt[j] = __builtin_bit_cast(bf16_t, f2bf(bf2f(kb) * exp2f(-dg)));
+                    }
+                }
+                const unsigned p = bm * (bm + 1u) / 2u + bn - P0;
+                qk[p] = plow_mfma_bf16_16x16(qf, kt, qk[p]);
+                kk[p] = plow_mfma_bf16_16x16(kf, kt, kk[p]);
+            }
+        }
+    }
+#pragma unroll
+    for (unsigned bm = LO; bm <= HI; ++bm) {
+        if (mv[bm] == 0u) continue;
+#pragma unroll
+        for (unsigned bn = 0; bn <= bm; ++bn) {
+            const unsigned p = bm * (bm + 1u) / 2u + bn - P0;
+            const unsigned m0 = bm * 16u, n0 = bn * 16u;
+#pragma unroll
+            for (unsigned e = 0; e < 4; ++e) {
+                const unsigned ml = 4u * kgroup + e;
+                const unsigned nl = token;
+                if (ml < mv[bm] && nl < mv[bn] && (bm != bn || nl <= ml)) {
+                    const unsigned m = m0 + ml, n = n0 + nl;
+                    Aqk[((row0 + m) * H + h) * 64u + n] = qk[p][e] * scale;
+                    if (n < m) mat[m * 64u + n] = kk[p][e] * beta[(row0 + m) * H + h];
+                }
+            }
+        }
+    }
+}
+
 /* Keep the strict per-item arithmetic order while using otherwise-idle waves for independent
  * (chunk, head) items.  Each wave owns a disjoint 64x64 matrix in LDS; no workgroup barrier is
  * legal inside the item loop because some waves can exhaust their item stream earlier. */
+template <bool HOIST = false, bool SOLVE_ILP = false>
 __device__ void d_kda_chunk_intra_bt64_wave_items(
     float* __restrict__ Aqk, float* __restrict__ Ainv, const bf16* __restrict__ q,
     const bf16* __restrict__ k, const float* __restrict__ g_cumsum_log2,
@@ -596,6 +793,13 @@ __device__ void d_kda_chunk_intra_bt64_wave_items(
             Aqk[((row0 + x / 64u) * H + h) * 64u + x % 64u] = 0.0f;
         __builtin_amdgcn_wave_barrier();
 
+        if constexpr (HOIST)
+        {
+            kda_intra_products_hoist<3, 3>(Aqk, mat, q, k, g_cumsum_log2, beta, row0, valid, H,
+                                           h, scale, token, kgroup);
+            kda_intra_products_hoist<0, 2>(Aqk, mat, q, k, g_cumsum_log2, beta, row0, valid, H,
+                                           h, scale, token, kgroup);
+        } else
         for (unsigned pair = 0; pair < 10u; ++pair) {
             const unsigned bm = pair >= 6u ? 3u : (pair >= 3u ? 2u : (pair >= 1u ? 1u : 0u));
             const unsigned bn = pair - bm * (bm + 1u) / 2u;
@@ -656,6 +860,58 @@ __device__ void d_kda_chunk_intra_bt64_wave_items(
          * steps j >= i contribute nothing, and lane j's `row_value` is the not-yet-rewritten
          * mat[i][j], read here as a broadcast LDS load instead of a shuffle so the unrolled
          * steps' loads overlap instead of one LDS round trip per step. */
+        if constexpr (SOLVE_ILP) {
+            /* Four rows at a time: their chains over the already-solved rows j < i0 share each
+             * mat[j][lane] load and run interleaved, then the in-block steps j = i0 .. i-1 take
+             * row j's value from its register (the value the store below would have written for
+             * the unmasked lanes). Per element the steps, operands, select and ascending j order
+             * are those of the row loop below. */
+            for (unsigned i0 = 0; i0 < valid; i0 += 4u) {
+                float val[4];
+#pragma unroll
+                for (unsigned r = 0; r < 4u; ++r) {
+                    const unsigned i = i0 + r;
+                    const float row_value = mat[i * 64u + lane];
+                    val[r] = lane < i ? -row_value : (lane == i ? 1.0f : 0.0f);
+                }
+                for (unsigned j0 = 1; j0 < i0; j0 += 8u) {
+                    float lij[4][8], mj[8];
+#pragma unroll
+                    for (unsigned u = 0; u < 8u; ++u) {
+                        const unsigned j = min(j0 + u, 63u);
+                        mj[u] = mat[j * 64u + lane];
+#pragma unroll
+                        for (unsigned r = 0; r < 4u; ++r) lij[r][u] = mat[(i0 + r) * 64u + j];
+                    }
+#pragma unroll
+                    for (unsigned u = 0; u < 8u; ++u) {
+                        const unsigned j = j0 + u;
+#pragma unroll
+                        for (unsigned r = 0; r < 4u; ++r) {
+                            const float stepped = val[r] - lij[r][u] * mj[u];
+                            val[r] = (j < i0 && lane < j) ? stepped : val[r];
+                        }
+                    }
+                }
+#pragma unroll
+                for (unsigned r = 1; r < 4u; ++r) {
+#pragma unroll
+                    for (unsigned jr = 0; jr < r; ++jr) {
+                        const unsigned j = i0 + jr;
+                        const float lij = mat[(i0 + r) * 64u + j];
+                        const float stepped = val[r] - lij * val[jr];
+                        val[r] = (j >= 1u && lane < j) ? stepped : val[r];
+                    }
+                }
+                __builtin_amdgcn_wave_barrier();
+#pragma unroll
+                for (unsigned r = 0; r < 4u; ++r) {
+                    const unsigned i = i0 + r;
+                    if (i < valid && lane <= i) mat[i * 64u + lane] = val[r];
+                }
+                __builtin_amdgcn_wave_barrier();
+            }
+        } else
         for (unsigned i = 0; i < valid; ++i) {
             const float row_value = mat[i * 64u + lane];
             float value = lane < i ? -row_value : (lane == i ? 1.0f : 0.0f);
@@ -2184,6 +2440,17 @@ __device__ void d_kda_conv_state_step_g(
  * 12 at TP1 B1 and 2 at TP8 B1. Folding this into op 102's epilogue instead needs a grid-wide
  * barrier because a head's D outputs are spread over D/BV workgroups there.
  */
+/* PLOW_KDA_GNORM_ILP (prefill objects; =0 restores the row loop): at D = 128 a wave issues the
+ * o/g loads of KDA_GNORM_U of its rows before reducing any, and keeps o in registers for the
+ * output; each row's sum, scale and output expression are the row loop's. */
+#ifndef PLOW_KDA_GNORM_ILP
+#if PLOW_BUCKET_DECODE
+#define PLOW_KDA_GNORM_ILP 0
+#else
+#define PLOW_KDA_GNORM_ILP 1
+#endif
+#endif
+#define KDA_GNORM_U 4u
 __device__ void d_kda_gated_norm(bf16* __restrict__ y, const bf16* __restrict__ o,
                                  const float* __restrict__ norm_w, const bf16* __restrict__ g_raw,
                                  unsigned T, unsigned H, unsigned D, float eps, unsigned slice,
@@ -2191,6 +2458,40 @@ __device__ void d_kda_gated_norm(bf16* __restrict__ y, const bf16* __restrict__ 
     const unsigned lane = threadIdx.x & (PLOW_WAVE - 1);
     const unsigned wave = threadIdx.x >> 6;
     const unsigned rows = T * H;
+#if PLOW_KDA_GNORM_ILP
+    if (D == 2u * PLOW_WAVE) {
+        const size_t stride = (size_t)nblk * PLOW_WAVES;
+        for (size_t r0 = (size_t)slice * PLOW_WAVES + wave; r0 < rows;
+             r0 += KDA_GNORM_U * stride) {
+            float x[KDA_GNORM_U][2], gr[KDA_GNORM_U][2];
+#pragma unroll
+            for (unsigned u = 0; u < KDA_GNORM_U; ++u) {
+                const size_t r = r0 + u * stride;
+                const size_t base = (r < rows ? r : r0) * D;
+#pragma unroll
+                for (unsigned e = 0; e < 2u; ++e) {
+                    x[u][e] = bf2f(o[base + lane + PLOW_WAVE * e]);
+                    gr[u][e] = bf2f(g_raw[base + lane + PLOW_WAVE * e]);
+                }
+            }
+#pragma unroll
+            for (unsigned u = 0; u < KDA_GNORM_U; ++u) {
+                const size_t r = r0 + u * stride;
+                float ss = 0.0f;
+#pragma unroll
+                for (unsigned e = 0; e < 2u; ++e) ss += x[u][e] * x[u][e];
+                const float inv = rsqrtf(wave_sum(ss) / (float)D + eps);
+                if (r >= rows) continue;
+#pragma unroll
+                for (unsigned e = 0; e < 2u; ++e) {
+                    const unsigned d = lane + PLOW_WAVE * e;
+                    y[r * D + d] = f2bf(x[u][e] * inv * norm_w[d] * kda_sigmoid(gr[u][e]));
+                }
+            }
+        }
+        return;
+    }
+#endif
     for (unsigned r = slice * PLOW_WAVES + wave; r < rows; r += nblk * PLOW_WAVES) {
         const size_t base = (size_t)r * D;
         float ss = 0.0f;

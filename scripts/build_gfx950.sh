@@ -70,6 +70,17 @@ case "${PLOW_MLA_PF_SNAKE:-1}" in
   1) FLASH_TR16="$FLASH_TR16 -DPLOW_MLA_PF_SNAKE=1" ;;
   *) echo "PLOW_MLA_PF_SNAKE must be 0 or 1" >&2; exit 2 ;;
 esac
+# PLOW_KDA_PREP_COLSCAN (default 1 in prefill objects; =0 rolls back): the KDA chunk-prepare gate
+# prefix with lanes on the (head, dim) axis and the shuffle scan replayed per column (op_kda.h;
+# coalesced loads/stores, bit-identical). PLOW_KDA_GNORM_ILP (default 1 in prefill objects; =0
+# rolls back): the KDA output gated RMSNorm issues four rows' loads per wave pass (bit-identical).
+for k in PLOW_KDA_PREP_COLSCAN PLOW_KDA_GNORM_ILP; do
+  case "${!k:-1}" in
+    0) INC="$INC -D$k=0" ;;
+    1) ;;
+    *) echo "$k must be 0 or 1" >&2; exit 2 ;;
+  esac
+done
 # PLOW_KDA_CARRY_PIPE=1 / PLOW_KDA_CARRY_KTR16=1: regstate KDA carry load schedule and
 # transposed key-tile reads (op_kda_carry_regstate.h; both bit-identical).
 KDA_CARRY_DEFS=""
@@ -80,6 +91,14 @@ for k in PLOW_KDA_CARRY_PIPE PLOW_KDA_CARRY_KTR16; do
     *) echo "$k must be 0 or 1" >&2; exit 2 ;;
   esac
 done
+# PLOW_KDA_CARRY_XCD (default 1 in the keyfeed carry; =0 rolls back): a head's eight V16 state
+# tiles go to workgroups on one XCD so they share its L2 copy of the head's chunk factors (item ->
+# workgroup map only; bit-identical). Keyfeed carry at H=8: 413 -> 376 us per 8k chunk.
+case "${PLOW_KDA_CARRY_XCD:-1}" in
+  0) KDA_CARRY_DEFS="$KDA_CARRY_DEFS -DPLOW_KDA_CARRY_XCD=0" ;;
+  1) ;;
+  *) echo "PLOW_KDA_CARRY_XCD must be 0 or 1" >&2; exit 2 ;;
+esac
 case "${PLOW_MLA_SPARSE:-0}" in
   0) ;;
   1) [ "${PLOW_MLA_PF_TR16:-0}" = 1 ] || { echo "PLOW_MLA_SPARSE=1 requires PLOW_MLA_PF_TR16=1" >&2; exit 2; }
@@ -483,6 +502,17 @@ if [ "$ARCH" = gfx950 ] && [ "${PLOW_KDA_INTRA_CACHED:-0}" = 1 ]; then
 fi
 
 KDA_INTRA_WAVE_ITEMS_ELFS=""
+# PLOW_KDA_INTRA_HOIST (default 1; =0 rolls back): the wave-item intra loads every operand of a
+# d0 step for all block products at once (op_kda.h kda_intra_products_hoist; bit-identical).
+# Kernel at H=8: 313 -> 153 us at 8k (+SOLVE_ILP 121), 235 -> 140 (110) at 4k, 518 -> 183 (144) at 16k.
+# PLOW_KDA_INTRA_SOLVE_ILP (default 1; =0 rolls back): its forward substitution runs four rows at a
+# time over shared loads (bit-identical).
+for k in PLOW_KDA_INTRA_HOIST PLOW_KDA_INTRA_SOLVE_ILP; do
+  case "${!k:-1}" in
+    0|1) ;;
+    *) echo "$k must be 0 or 1" >&2; exit 2 ;;
+  esac
+done
 case "${PLOW_KDA_INTRA_WAVE_ITEMS:-0}" in
   0|1) ;;
   *) echo "PLOW_KDA_INTRA_WAVE_ITEMS must be 0 or 1" >&2; exit 2 ;;
@@ -503,9 +533,11 @@ if [ "$ARCH" = gfx950 ] && [ "$need_kda_intra_wave_items" = 1 ]; then
   }
   bash "$R/cmake/hipcc_hsaco.sh" hipcc "$BUN" "$ARCH" \
     "$OUT/kda_chunk_intra_wave_items_gfx950.elf" \
-    plow_kda_chunk_intra_wave_items_gfx950 96 2 \
+    plow_kda_chunk_intra_wave_items_gfx950 256 2 \
     $INC -DPLOW_LEAN_OBJECT=1 -DPLOW_NO_SPILL=1 -DPLOW_NO_SGPR_SPILL=1 \
     -DPLOW_REQUIRED_MARKER=plow_kda_intra_wave_items_abi_1 \
+    -DPLOW_KDA_INTRA_HOIST="${PLOW_KDA_INTRA_HOIST:-1}" \
+    -DPLOW_KDA_INTRA_SOLVE_ILP="${PLOW_KDA_INTRA_SOLVE_ILP:-1}" \
     "$R/amd/kda_chunk_intra_wave_items.hip"
   KDA_INTRA_WAVE_ITEMS_ELFS="kda_chunk_intra_wave_items_gfx950.elf"
 fi
