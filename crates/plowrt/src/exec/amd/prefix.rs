@@ -270,11 +270,14 @@ pub(super) struct CloneSpan {
     heads: u32,
     stride_rows: u32,
     row_bytes: u64,
+    /// Tokens per stored row: 1, or the pooled DSA indexer's `index_kpool` (a prefix of `rows`
+    /// tokens owns its `rows / pool` complete pools; the straddled one is rebuilt on resume).
+    pool: u32,
 }
 impl CloneSpan {
     pub fn copy_spans(&self, rows: u32, mut copy: impl FnMut(u64, u64)) {
         let head_bytes = u64::from(self.stride_rows) * self.row_bytes;
-        let bytes = u64::from(rows.min(self.stride_rows)) * self.row_bytes;
+        let bytes = u64::from((rows / self.pool.max(1)).min(self.stride_rows)) * self.row_bytes;
         for head in 0..u64::from(self.heads) {
             copy(head * head_bytes, bytes);
         }
@@ -296,6 +299,32 @@ pub(super) fn clone_spans<'a>(
     }
     let mut spans: Vec<CloneSpan> = Vec::new();
     for d in instructions {
+        if d.op == DevOp::DsaPoolCompress as u16 {
+            let pool = d.i[1];
+            for (h, row_bytes) in [(d.t[0], u64::from(d.i[2])), (d.t[1], 4u64)] {
+                let tensor = tensors.get(h as usize)?;
+                let slot_bytes = tensor.bytes / batch as u64;
+                if pool < 2 || row_bytes == 0 || tensor.bytes % batch as u64 != 0
+                    || slot_bytes % row_bytes != 0
+                {
+                    return None;
+                }
+                let span = CloneSpan {
+                    tensor: h as usize,
+                    slot_bytes,
+                    heads: 1,
+                    stride_rows: u32::try_from(slot_bytes / row_bytes).ok()?,
+                    row_bytes,
+                    pool,
+                };
+                match spans.iter().find(|s| s.tensor == span.tensor) {
+                    Some(prior) if prior != &span => return None,
+                    Some(_) => {}
+                    None => spans.push(span),
+                }
+            }
+            continue;
+        }
         let fp8 = d.op == DevOp::HeadNormRopeFp8 as u16;
         if !fp8 && d.op != DevOp::HeadNormRope as u16 {
             continue;
@@ -322,6 +351,7 @@ pub(super) fn clone_spans<'a>(
                 heads,
                 stride_rows,
                 row_bytes,
+                pool: 1,
             };
             match spans.iter().find(|s| s.tensor == index) {
                 Some(prior) if prior != &span => None,
