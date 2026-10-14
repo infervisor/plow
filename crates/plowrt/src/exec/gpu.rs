@@ -7476,10 +7476,13 @@ impl GpuEngine {
                 }
                 self.retire_slot(b, false);
                 let oom = matches!(error, RuntimeError::Oom(_)) || error.device_code() == Some(2);
+                // Parked live rings (`PLOW_VMM_RING_PARK`) hold device memory no request owns; when
+                // releasing them freed memory, the request waits and retries even with no other
+                // request live.
+                let mut reclaimed = false;
                 if oom {
-                    // Parked live rings (`PLOW_VMM_RING_PARK`) hold device memory no request owns.
                     if let Some(rings) = self.vmm.as_mut().and_then(|v| v.rings.as_mut()) {
-                        rings.release_parked();
+                        reclaimed = rings.release_parked();
                     }
                 }
                 // Slot-granular KV waits even with no other request live: memory comes back
@@ -7488,7 +7491,9 @@ impl GpuEngine {
                 if (self.vmm_prefix_enabled() || slot_kv)
                     && oom
                     && !error.is_fatal()
-                    && (slot_kv || self.packed_admission.contains(&PackedAdmission::Ready))
+                    && (slot_kv
+                        || reclaimed
+                        || self.packed_admission.contains(&PackedAdmission::Ready))
                 {
                     self.vmm.as_ref().unwrap().ensure_rows(b, 1)?;
                     self.kv_pressure_events += 1;

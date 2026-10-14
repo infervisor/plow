@@ -662,13 +662,16 @@ impl VmmRings {
 
     /// [`Self::enable_bounded_park`]: return every parked slot and spare unit to the driver;
     /// device memory pressure outranks the next admission's saved driver calls.
-    pub fn release_parked(&mut self) {
+    /// Returns whether any kept memory went back to the driver.
+    pub fn release_parked(&mut self) -> bool {
         if !self.bounded {
-            return;
+            return false;
         }
+        let before = self.spare_bytes();
         let cap = std::mem::replace(&mut self.spare_cap, 0);
         self.trim_spare();
         self.spare_cap = cap;
+        self.spare_bytes() < before
     }
 
     /// Return kept units to the driver until they fit `spare_cap`: spare units first, then the
@@ -1930,7 +1933,9 @@ impl VmmKv {
         {
             Ok(join) => join,
             Err(e) => {
-                s.ops.host_tier_free(ptr, bytes);
+                for &(chunk, chunk_bytes) in &tier.chunks {
+                    s.ops.host_tier_free(chunk, chunk_bytes);
+                }
                 return Err(RuntimeError::Device(format!(
                     "vmm: spawn vmm-host-tier: {e}"
                 )));

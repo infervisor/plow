@@ -719,6 +719,43 @@ fn bounded_park_readmits_without_driver_calls_and_holds_its_cap_while_busy() {
     ops.empty();
 }
 
+#[test]
+fn release_parked_reports_whether_it_freed_memory() {
+    let ops = Arc::new(Mock::with_granularity(64));
+    ops.0.lock().unwrap().multi_map = true;
+    let committed = |ops: &Mock| ops.0.lock().unwrap().handles.values().sum::<u64>();
+    let tensors: Vec<_> = (0..4)
+        .map(|tensor| LiveRingTensor {
+            tensor,
+            slot_bytes: 128,
+        })
+        .collect();
+    let mut rings = VmmRings::new_idle_backed(ops.clone(), &tensors, 8).unwrap();
+    let startup = committed(&ops);
+    assert!(!rings.release_parked(), "parking off: nothing to release");
+    rings.enable_bounded_park(2 * rings.slot_charge());
+    assert!(!rings.release_parked(), "nothing parked yet");
+    for slot in 0..3 {
+        rings.ensure_slot(slot).unwrap();
+    }
+    rings.release_slot(1);
+    rings.release_slot(2);
+    assert!(
+        rings.release_parked(),
+        "two parked slots go back to the driver"
+    );
+    assert_eq!(rings.spare_bytes(), 0);
+    assert_eq!(
+        committed(&ops),
+        startup + rings.slot_charge(),
+        "only live slot 0 stays"
+    );
+    assert!(!rings.release_parked(), "a second release frees nothing");
+    rings.release_slot(0);
+    drop(rings);
+    ops.empty();
+}
+
 /// The driver traces of real `VmmRings` slot/prefix lifecycles, including an injected failure at
 /// every stage, are accepted by `vmm_trace.v1` (`Plow.KvRing.traceOk_sound`: mappings stay on live
 /// handles inside reservations, never overlap, and everything is returned once); mutated traces
