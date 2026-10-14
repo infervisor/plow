@@ -47,6 +47,11 @@
 #ifndef PLOW_KDA_PF_STATE_RESIDENT
 #define PLOW_KDA_PF_STATE_RESIDENT 0
 #endif
+/* PLOW_PACKED_KDA_PAR: packed KDA arms take one-row spans as a flat (span, item) space
+ * (interp_packed_kda_par*.elf; runtime PLOW_AMD_PACKED_KDA_PAR). */
+#ifndef PLOW_PACKED_KDA_PAR
+#define PLOW_PACKED_KDA_PAR 0
+#endif
 #ifndef PLOW_KDA_CONV_STEP_DB
 #define PLOW_KDA_CONV_STEP_DB 0
 #endif
@@ -1758,8 +1763,52 @@ __device__ void d_kda_conv3_packed(
     const unsigned chunk = (total + nblk - 1u) / nblk;
     const unsigned g0 = slice * chunk;
     const unsigned g1 = g0 + chunk < total ? g0 + chunk : total;
+#if PLOW_PACKED_KDA_PAR
+    /* PLOW_PACKED_KDA_PAR: one-row spans (decode riders) as one flat (span, channel) item space
+     * over every thread of the grid, instead of every workgroup walking every span for its own
+     * channel slice (~120 dependent global round trips per layer). Same per-element arithmetic
+     * as the one-row shared path: shift the window, convolve, store the window. */
+    {
+        enum { WMAX = 8 };
+        const unsigned Wc = W < WMAX ? W : WMAX;
+        const size_t n_items = (size_t)prog->n_prefill_spans * total;
+        for (size_t i = (size_t)slice * PLOW_THREADS + threadIdx.x; i < n_items;
+             i += (size_t)nblk * PLOW_THREADS) {
+            const unsigned si = (unsigned)(i / total);
+            const unsigned g = (unsigned)(i - (size_t)si * total);
+            const PlowPrefillSpan* span = plow_packed_prefill_span(prog, si);
+            if (span->n_rows != 1u) continue;
+            const unsigned s = g / C, c = g - s * C;
+            bf16* out = (s == 0 ? oq : (s == 1 ? ok : ov)) + (size_t)span->row0 * C;
+            const bf16* x = (s == 0 ? xq : (s == 1 ? xk : xv)) + (size_t)span->row0 * C;
+            const float* w = s == 0 ? wq : (s == 1 ? wk : wv);
+            float* st = (s == 0 ? sq : (s == 1 ? sk : sv)) + (size_t)span->state_slot * C * W +
+                        (size_t)c * W;
+            const bool reset = span->flags & PLOW_PREFILL_SPAN_RESET_STATE;
+            float win[WMAX], tap[WMAX];
+#pragma unroll
+            for (unsigned j = 0; j < WMAX; ++j) {
+                win[j] = j < Wc && !reset ? st[j] : 0.0f;
+                tap[j] = j < Wc ? w[(size_t)c * W + j] : 0.0f;
+            }
+#pragma unroll
+            for (unsigned j = 0; j + 1 < WMAX; ++j) win[j] = win[j + 1];
+            win[Wc - 1] = bf2f(x[c]);
+            float y = 0.0f;
+#pragma unroll
+            for (unsigned j = 0; j < WMAX; ++j) y += win[j] * tap[j];
+            st_act1(&out[c], f2bf(act == 1u ? act_silu(y) : y));
+#pragma unroll
+            for (unsigned j = 0; j < WMAX; ++j)
+                if (j < Wc) st[j] = win[j];
+        }
+    }
+#endif
     for (unsigned si = 0; si < prog->n_prefill_spans; ++si) {
         const PlowPrefillSpan* span = plow_packed_prefill_span(prog, si);
+#if PLOW_PACKED_KDA_PAR
+        if (span->n_rows == 1u) continue;
+#endif
         float* states[3] = {sq + (size_t)span->state_slot * C * W,
                             sk + (size_t)span->state_slot * C * W,
                             sv + (size_t)span->state_slot * C * W};

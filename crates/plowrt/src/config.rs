@@ -1708,6 +1708,10 @@ pub struct AmdRuntimeConfig {
     /// run side by side. Missing objects fall back to per-span launches.
     #[arg(long = "amd-packed-lean-kda-batch", env = "PLOW_AMD_PACKED_LEAN_KDA_BATCH", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
     pub packed_lean_kda_batch: bool,
+    /// The packed KDA family object built with PLOW_PACKED_KDA_PAR (`interp_packed_kda_par.elf`):
+    /// one-row spans (decode riders) run as a flat (span, channel) item space.
+    #[arg(long = "amd-packed-kda-par", env = "PLOW_AMD_PACKED_KDA_PAR", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
+    pub packed_kda_par: bool,
     /// The prompts a packed prefill launch finishes take their prefix-cache state snapshots
     /// behind one completion wait per rank instead of one per prompt; `=0` restores per-prompt.
     #[arg(long = "amd-packed-snap-batch", env = "PLOW_AMD_PACKED_SNAP_BATCH", default_value_t = true, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]

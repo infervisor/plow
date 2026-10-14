@@ -9254,7 +9254,11 @@ impl AmdEngine {
                 markers.push(KDA_CHUNK_QPRE_SYM);
             }
             load_packed_family(
-                "interp_packed_kda",
+                if crate::config::RuntimeConfig::get().amd.packed_kda_par {
+                    "interp_packed_kda_par"
+                } else {
+                    "interp_packed_kda"
+                },
                 "plow_interp_packed_kda",
                 Phase::Prefill,
                 &markers,
