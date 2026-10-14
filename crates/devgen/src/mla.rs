@@ -1483,6 +1483,12 @@ pub(crate) fn glm53_emit_full(
             b.set_tensor_dedup(true);
             b.adopt_tensors(tensors.clone());
             b.set_packed_prefill_segments(true);
+            b.set_lean_moe_fp8_segments(
+                gfx950
+                    && ec.moe_fp8_pf_packed
+                    && ec.moe_fp8_pf_lean
+                    && rows as u64 >= u64::from(ec.moe_fp8_pf_min_rows),
+            );
             if ec.glm53_packed_lean_kda {
                 b.set_kda_intra_wave_items_segments(gfx950 && ec.kda_intra_wave_items);
                 b.set_lean_kda_key_factor_segments(gfx950 && ec.kda_key_factor);
@@ -2461,7 +2467,13 @@ fn glm_shared_fold(c: &GlmCfg, enc: MoeEnc) -> bool {
     let cfg = emit_config::active();
     cfg.glm_moe_shared_fold
         && match enc {
-            MoeEnc::Fp8Blk => cfg.glm_moe_aiter() || cfg.glm_moe_resident(),
+            // The grouped W8A8 chain (dedicated moe_fp8_pf object or the interpreter arms) reads
+            // the `_sf` table as one more expert, like the native call.
+            MoeEnc::Fp8Blk => {
+                cfg.glm_moe_aiter()
+                    || cfg.glm_moe_resident()
+                    || (cfg.moe_pf_w8a8 && cfg.moe_fp8_pf_lean && !cfg.glm_routed_w8a8)
+            }
             MoeEnc::Mxfp4 => !cfg.moe_prefill_ep,
             _ => false,
         }
@@ -9727,9 +9739,9 @@ fn emit_glm_moe_ffn_prefill(
     // SCORES, because the [T, n_exp] logit matrix has no column for the shared expert.
     let fold = glm_shared_fold(c, enc);
     assert!(
-        !fold || native_moe || enc == MoeEnc::Mxfp4,
-        "PLOW_GLM_MOE_SHARED_FOLD needs the native MoE route or the grouped A4W4 chain: nothing \
-         else reads a {}-entry expert table or a top-{} routing slot",
+        !fold || native_moe || enc == MoeEnc::Mxfp4 || emit_config::active().moe_pf_w8a8,
+        "PLOW_GLM_MOE_SHARED_FOLD needs the native MoE route, the grouped A4W4 chain or the \
+         grouped W8A8 chain: nothing else reads a {}-entry expert table or a top-{} routing slot",
         e + 1,
         tk + 1
     );
@@ -9999,16 +10011,43 @@ fn emit_glm_moe_ffn_prefill(
         && tp > 1
         && !raw_output
         && glm_sp(c, n, b, t);
+    // PLOW_MOE_FP8_PF_ACC: the dedicated W8A8 down adds its gated rows straight into the FFN
+    // reduce-scatter source `dg_tp`, so the shared down writes there (or, under the fold, a
+    // zero fill does) and no MoeCombinePf runs. `dg_tp`'s last readers are the peers of the
+    // previous FFN reduce-scatter, all of which finished before this layer's input gather landed.
+    let routed_w8a8 = emit_config::active().glm_routed_w8a8;
+    let lean_fp8 = b.lean_moe_fp8_segments();
+    let pf_w8a8_xq = !routed_w8a8
+        && !native_moe
+        && t > 1
+        && glm_moe_pf_w8a8(c, enc, native_moe, tk, imoe_e, h)
+        && !glm_moe_pf_w8a8_split();
+    let pf_acc = emit_config::active().moe_fp8_pf_acc
+        && lean_fp8
+        && emit_config::active().moe_fp8_pf_xq
+        && pf_w8a8_xq
+        && !det
+        && !seed
+        && tp > 1
+        && !emit_config::active().no_xreduce
+        && glm_sp(c, n, b, t)
+        && xr_band_k(t, "moe") == 1;
+    let sh_out = if pf_acc { n.dg_tp } else { n.shared };
     // 17 shared expert down — row-parallel (imoe_l input): a PARTIAL [T,H] under TP.
-    let c_shd = if fold {
+    let c_shd = if fold && pf_acc {
+        b.emit(DevOp::ZeroF32, all.clone(), &[c_rn2], |d| {
+            d.t[0] = n.dg_tp;
+            d.i[..2].copy_from_slice(&[t, h / 2]);
+        })
+    } else if fold {
         c_shglu
     } else if emit_config::active().glm_shared_w8a8 {
-        emit_glm_shared_w8a8_down(b, &all, n, w, t, h, imoe_l, n.shared, c_shglu)
+        emit_glm_shared_w8a8_down(b, &all, n, w, t, h, imoe_l, sh_out, c_shglu)
     } else if lin_fp8 {
         emit_pf_gemm_fp8_blk(
             b,
             &all,
-            n.shared,
+            sh_out,
             n.shfu,
             w.shd,
             w.shd_s,
@@ -10018,15 +10057,14 @@ fn emit_glm_moe_ffn_prefill(
             &[c_shglu],
         )
     } else if shared_lt.is_some() {
-        let out = if seed { n.dg_tp } else { n.shared };
+        let out = if seed { n.dg_tp } else { sh_out };
         emit_glm_lt_ext(b, c, out, n.shfu, w.shd, t, t, [h, imoe_l], &[c_shglu])
     } else {
-        gemm(b, n.shared, n.shfu, w.shd, w.shd_s, h, imoe_l, &[c_shglu])
+        gemm(b, sh_out, n.shfu, w.shd, w.shd_s, h, imoe_l, &[c_shglu])
     };
     // 18 grouped gate/up + GLU over the sorted rows. A is gathered from xn2 by row_token, so an
     //    expert's gate|up crosses HBM ONCE for every token that chose it — the reuse decode cannot
     //    have. i[3] picks the block-fp8 or bf16 weight arm from the same tables decode uses.
-    let routed_w8a8 = emit_config::active().glm_routed_w8a8;
     let c_d = if routed_w8a8 {
         emit_glm_routed_w8a8(b, c, n, w, t, h, imoe_e, e, tk, c_rn2, c_align)
     } else if native_moe {
@@ -10065,7 +10103,11 @@ fn emit_glm_moe_ffn_prefill(
         // Same predicate as the scratch declaration (`rows > 1`), or the tensors are absent.
         let pf_w8a8 = t > 1 && glm_moe_pf_w8a8(c, enc, native_moe, tk, imoe_e, h);
         let pf_split = pf_w8a8 && glm_moe_pf_w8a8_split();
-        let pf_fq = pf_w8a8 && !pf_split && emit_config::active().moe_pf_w8a8_fq;
+        // The dedicated object has no staging-quant arm (PLOW_MOE_FP8_PF_XQ).
+        let pf_fq = pf_w8a8
+            && !pf_split
+            && emit_config::active().moe_pf_w8a8_fq
+            && !(lean_fp8 && emit_config::active().moe_fp8_pf_xq);
         let c_x = if pf_w8a8 && !pf_split && !pf_fq {
             b.emit(
                 DevOp::QuantFp8Block128,
@@ -10120,8 +10162,9 @@ fn emit_glm_moe_ffn_prefill(
         // 19 grouped down + gate-scale + SCATTER into part[T*k, H]. row_partidx carries each gathered
         //    row's fixed destination, so the align op's nondeterministic within-expert row ORDER does
         //    not reach the output — the combine below still sums part in FIXED slot order.
-        let c_d = b.emit(DevOp::MoeGroupDownPf, all.clone(), &[c_g], |d| {
-            d.t[0] = n.part;
+        let down_deps = if pf_acc { vec![c_g, c_shd] } else { vec![c_g] };
+        let c_d = b.emit(DevOp::MoeGroupDownPf, all.clone(), &down_deps, |d| {
+            d.t[0] = if pf_acc { n.dg_tp } else { n.part };
             d.t[1] = n.fu_g;
             d.t[2] = w.ewt;
             d.t[3] = w.est;
@@ -10148,7 +10191,15 @@ fn emit_glm_moe_ffn_prefill(
                 d.t[5] = n.fu_scale;
                 d.i[7] = if pf_split { 4 } else { 2 };
             }
+            if pf_acc {
+                d.i[4] = tk_all;
+                d.i[7] = 3;
+            }
         });
+        assert!(
+            !pf_acc || packet::devbuild::lean_moe_fp8_down_inst(b.inst(c_d)),
+            "PLOW_MOE_FP8_PF_ACC's down must be the dedicated object's"
+        );
         c_d
     };
     // 20 T-token combine. Under TP `shared`/`part` are PARTIALS, so the combine residual must NOT be
@@ -10181,7 +10232,7 @@ fn emit_glm_moe_ffn_prefill(
         };
         let xr_deps: Vec<u32> = (0..kb)
             .map(|i| {
-                let c_cmb = if seed {
+                let c_cmb = if seed || pf_acc {
                     c_d
                 } else {
                     b.emit(DevOp::MoeCombinePf, all.clone(), &[c_shd, c_d], |d| {
