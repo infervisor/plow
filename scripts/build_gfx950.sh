@@ -477,6 +477,17 @@ if [ "$ARCH" = gfx950 ] && [ "${PLOW_KDA_INTRA_CACHED:-0}" = 1 ]; then
 fi
 
 KDA_INTRA_WAVE_ITEMS_ELFS=""
+# PLOW_KDA_INTRA_HOIST (default 1; =0 rolls back): the wave-item intra loads every operand of a
+# d0 step for all block products at once (op_kda.h kda_intra_products_hoist; bit-identical).
+# Kernel at H=8: 313 -> 153 us at 8k (+SOLVE_ILP 121), 235 -> 140 (110) at 4k, 518 -> 183 (144) at 16k.
+# PLOW_KDA_INTRA_SOLVE_ILP (default 1; =0 rolls back): its forward substitution runs four rows at a
+# time over shared loads (bit-identical).
+for k in PLOW_KDA_INTRA_HOIST PLOW_KDA_INTRA_SOLVE_ILP; do
+  case "${!k:-1}" in
+    0|1) ;;
+    *) echo "$k must be 0 or 1" >&2; exit 2 ;;
+  esac
+done
 case "${PLOW_KDA_INTRA_WAVE_ITEMS:-0}" in
   0|1) ;;
   *) echo "PLOW_KDA_INTRA_WAVE_ITEMS must be 0 or 1" >&2; exit 2 ;;
@@ -497,9 +508,11 @@ if [ "$ARCH" = gfx950 ] && [ "$need_kda_intra_wave_items" = 1 ]; then
   }
   bash "$R/cmake/hipcc_hsaco.sh" hipcc "$BUN" "$ARCH" \
     "$OUT/kda_chunk_intra_wave_items_gfx950.elf" \
-    plow_kda_chunk_intra_wave_items_gfx950 96 2 \
+    plow_kda_chunk_intra_wave_items_gfx950 256 2 \
     $INC -DPLOW_LEAN_OBJECT=1 -DPLOW_NO_SPILL=1 -DPLOW_NO_SGPR_SPILL=1 \
     -DPLOW_REQUIRED_MARKER=plow_kda_intra_wave_items_abi_1 \
+    -DPLOW_KDA_INTRA_HOIST="${PLOW_KDA_INTRA_HOIST:-1}" \
+    -DPLOW_KDA_INTRA_SOLVE_ILP="${PLOW_KDA_INTRA_SOLVE_ILP:-1}" \
     "$R/amd/kda_chunk_intra_wave_items.hip"
   KDA_INTRA_WAVE_ITEMS_ELFS="kda_chunk_intra_wave_items_gfx950.elf"
 fi

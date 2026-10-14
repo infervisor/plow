@@ -941,7 +941,7 @@ pub(super) const KDA_INTRA_WAVE_ITEMS_MARKERS: [&str; 6] = [
     "plow_kda_intra_wave_items_wave64_1",
     "plow_kda_intra_wave_items_no_spill_1",
     "plow_kda_intra_wave_items_static_lds_131072",
-    "plow_kda_intra_wave_items_vgpr_le_96",
+    "plow_kda_intra_wave_items_vgpr_le_256",
 ];
 
 pub(super) const KDA_CARRY_REGSTATE_MARKERS: [&str; 6] = [
