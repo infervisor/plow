@@ -14090,17 +14090,13 @@ impl AmdEngine {
                     args.c[g] = addr(tens[2 + g]);
                 }
             }
-            let lt = self
-                .gemm_lt
-                .as_ref()
-                .filter(|_| crate::config::RuntimeConfig::get().amd.gemm_group_lt);
-            let groups = lt.map_or(0, |lt| lt.group_prefix(&args.n, args.k));
-            if let Some(lt) = lt.filter(|_| groups > 0) {
+            let groups = self.gemm_group_groups(&args);
+            if let Some(lt) = self.gemm_lt.as_ref().filter(|_| groups > 0) {
                 lt.enqueue_group(
                     &self.be, args.x, args.w, &args.c, &args.n, groups, args.t, args.k,
                 )?;
+                self.seg_launches += groups as u64;
                 if groups == 6 || args.n[groups] == 0 {
-                    self.seg_launches += 1;
                     return Ok(());
                 }
                 // The unpinned tail groups stay on the grouped kernel.
@@ -14984,6 +14980,20 @@ impl AmdEngine {
     /// multi-launch route branches in `enqueue_segment`; the commit check refuses
     /// a chain whose emission disagrees, so a drift fails closed rather than
     /// overrunning the queue.
+    /// `PLOW_AMD_GEMM_GROUP_LT`: the hipBLASLt groups that have a pinned kernel, then one grouped
+    /// launch for any unpinned tail.
+    fn gemm_group_groups(&self, args: &GemmGroupArgs) -> usize {
+        self.gemm_lt
+            .as_ref()
+            .filter(|_| crate::config::RuntimeConfig::get().amd.gemm_group_lt)
+            .map_or(0, |lt| lt.group_prefix(&args.n, args.k))
+    }
+
+    fn gemm_group_launches(&self, args: &GemmGroupArgs) -> usize {
+        let groups = self.gemm_group_groups(args);
+        groups + usize::from(groups == 0 || (groups < 6 && args.n[groups] != 0))
+    }
+
     pub(crate) fn prefill_segment_launches(&self, p: usize, seg: usize) -> usize {
         let active = self.packed_prefill.is_some_and(|b| b.prog == p);
         if !prefill_segment_specialization_allowed(self.prog_dispatch(p)) {
@@ -15002,6 +15012,7 @@ impl AmdEngine {
                     .as_ref()
                     .map_or(1, |s| s.span_launches(*route, &self.packed_spans)),
                 Some(PrefillSegmentRoute::GemmLt(_)) => 1,
+                Some(PrefillSegmentRoute::GemmGroup { args, .. }) => self.gemm_group_launches(args),
                 Some(PrefillSegmentRoute::Gemma4Glu(_)) => 1,
                 Some(PrefillSegmentRoute::GemmBlk(route)) => route.launches(),
                 Some(PrefillSegmentRoute::MlaFold(_)) => 3,
@@ -15025,6 +15036,7 @@ impl AmdEngine {
                 .as_ref()
                 .map_or(1, |s| s.split_launches(*route)),
             Some(PrefillSegmentRoute::GemmLt(_)) => 1,
+            Some(PrefillSegmentRoute::GemmGroup { args, .. }) => self.gemm_group_launches(args),
             Some(PrefillSegmentRoute::Gemma4Glu(_)) => 1,
             Some(PrefillSegmentRoute::GemmBlk(route)) => route.launches(),
             Some(PrefillSegmentRoute::MlaFold(_)) => 3,
