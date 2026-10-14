@@ -13,7 +13,7 @@ name = "glm-5.3-flash"
 label = "gfx950-mi350x-tp8-fp8"
 network = "glm-5.3-flash"
 status = "validated"
-plow_git = "16ca2decfab8d32a298f2db9ec2b1b7f004fb773"
+plow_git = "42c4efc2d63be6697bd9dcaecf0b1661ab955b5a"
 doc = "docs/amd/glm53-flash-mi350x.md"
 
 # max_ctx 65536: the model's recurrent (KDA) state carries at every length, so long prompts are
@@ -122,9 +122,20 @@ env = { PLOW_DECODE_BATCH = "128", PLOW_GEMV_WALK = "1", PLOW_GEMV_MM = "4", PLO
 # - `PLOW_KDA_PF_GROUP_GEMM`: the six KDA input projections as one routed prefill GEMM (bit-identical).
 # - `PLOW_MOE_FP8_PF_LEAN`: dedicated block-FP8 grouped MoE prefill kernels (bit-identical).
 # - `PLOW_GLM53_PACKED_LEAN_KDA`: packed serving prefill runs the lean KDA objects per span (bit-identical).
+# v14/v15 additions (docs/amd/glm53-flash-mi350x.md §4):
+# - `PLOW_GLM_HC_MIX_RAW`: standalone r1 mHC mix kernel (r1 12.15 -> 11.88 ms, bit-identical).
+# - `PLOW_MOE_W8A8_DEC`: dedicated decode W8A8 grouped MoE kernels (GLU+DOWN pair), bit-identical; distinct-prompt
+#   B8/B32/B128 27.6/30.1/40.4 -> 25.5/28.0/39.4 ms. `PLOW_MOE_DEC_W8_SPLITN` (default on) splits W8A8 GLU tiles.
+# - KDA prefill object defines (default on, bit-identical): `PLOW_KDA_INTRA_HOIST`, `_INTRA_SOLVE_ILP`,
+#   `_PREP_COLSCAN`, `_GNORM_ILP`, `_CARRY_XCD`; 8k prefill -4%.
+# - `PLOW_MOE_FP8_PF_XQ` (default on): the dedicated MoE prefill kernels actually run (v13/v14 fell back to the
+#   interpreter: the FQ GLU arm missed the dedicated predicate); bit-identical, 8k -12 ms.
+# - `PLOW_MOE_FP8_PF_ACC` + `PLOW_GLM_MOE_SHARED_FOLD` + `PLOW_MOE_FP8_PF_PACKED`: fused weighted combine into the
+#   bf16 SP band (pk_add_bf16 atomics, like AITER; run-to-run nondeterministic), shared expert as expert 288 of
+#   289, and the packed serving prefill on the same dedicated segments; 8k -10 ms more. FP32-gated (below).
 # - `PLOW_GLM_DSA = "0"`: dense attention (vLLM runs sparse
 #   top-2048; plow's DSA serves but has no prefix hits / packed prefill yet).
-env = { PLOW_MLA_PREFILL = "full:128,512,2048,8192", PLOW_MLA_PF_V2 = "1", PLOW_GLM_PF_NS = "2", PLOW_DECODE_BATCH_LADDER = "1,8,32,128", PLOW_GLM_DECODE_GEMM_ROWS = "32", PLOW_GLM_DSA = "0", PLOW_GLM_SEQ_PAR = "1", PLOW_GLM_SEQ_PAR_PROJ = "0", PLOW_GLM_HC_NORM_FOLD = "1", PLOW_GLM_HC_POST_FOLD = "1", PLOW_KDA_DECODE_FUSED_ARM = "1", PLOW_KDA_FB_FOLD = "1", PLOW_GLM_HC_PRE_TAIL = "1", GLM_SHARD_HEAD = "1", PLOW_GLM53_SP_ROUTER = "1", PLOW_GLM_ROUTER_OVERLAP = "2", PLOW_GLM53_SP_KDA_NORM = "1", PLOW_XR_DEC_CUS = "64", PLOW_GLM_DEC_SPLITK = "16", PLOW_GLM_DEC_SPLITK_2P = "1", PLOW_MOE_PF_W8A8 = "1", PLOW_MOE_DEC_W8A8 = "1", PLOW_GLM_HC_FUSE_DEC = "1", PLOW_GLM_KDA_PROJ_GROUP = "1", PLOW_GLM_HC_FUSE_R1 = "1", PLOW_GLM_KDA_QKVG_R1 = "1", PLOW_GLM_HC_FUSE_VARIANT = "3", PLOW_KDA_PF_GROUP_GEMM = "1", PLOW_MOE_FP8_PF_LEAN = "1", PLOW_GLM53_PACKED_LEAN_KDA = "1" }
+env = { PLOW_MLA_PREFILL = "full:128,512,2048,8192", PLOW_MLA_PF_V2 = "1", PLOW_GLM_PF_NS = "2", PLOW_DECODE_BATCH_LADDER = "1,8,32,128", PLOW_GLM_DECODE_GEMM_ROWS = "32", PLOW_GLM_DSA = "0", PLOW_GLM_SEQ_PAR = "1", PLOW_GLM_SEQ_PAR_PROJ = "0", PLOW_GLM_HC_NORM_FOLD = "1", PLOW_GLM_HC_POST_FOLD = "1", PLOW_KDA_DECODE_FUSED_ARM = "1", PLOW_KDA_FB_FOLD = "1", PLOW_GLM_HC_PRE_TAIL = "1", GLM_SHARD_HEAD = "1", PLOW_GLM53_SP_ROUTER = "1", PLOW_GLM_ROUTER_OVERLAP = "2", PLOW_GLM53_SP_KDA_NORM = "1", PLOW_XR_DEC_CUS = "64", PLOW_GLM_DEC_SPLITK = "16", PLOW_GLM_DEC_SPLITK_2P = "1", PLOW_MOE_PF_W8A8 = "1", PLOW_MOE_DEC_W8A8 = "1", PLOW_GLM_HC_FUSE_DEC = "1", PLOW_GLM_KDA_PROJ_GROUP = "1", PLOW_GLM_HC_FUSE_R1 = "1", PLOW_GLM_KDA_QKVG_R1 = "1", PLOW_GLM_HC_FUSE_VARIANT = "3", PLOW_KDA_PF_GROUP_GEMM = "1", PLOW_MOE_FP8_PF_LEAN = "1", PLOW_GLM53_PACKED_LEAN_KDA = "1", PLOW_GLM_HC_MIX_RAW = "1", PLOW_MOE_W8A8_DEC = "1", PLOW_MOE_FP8_PF_ACC = "1", PLOW_GLM_MOE_SHARED_FOLD = "1", PLOW_MOE_FP8_PF_PACKED = "1" }
 args = [
   "--emit", "devblob",
   "--arch", "gfx950",
@@ -166,10 +177,10 @@ name = "smoke"
 cmd = "scripts/serve_test/smoke.sh"
 
 # FP32-reference gate (scripts/llm/fp32_ref_gate.py, 46 cases incl. 18 needles to 15872 tokens,
-# served c16, prefix cache on, PF_INTERLEAVE 8192) on packet ab03f74f (v13): PASS, kl_mean 0.01636
-# (vLLM 0.03677 on the same reference), kl_p99 0.258 (0.549), top1_decisive 0.9945 (0.9868), needles 18/18;
-# needles with PLOW_PF_CHUNK=512 18/18. Prefix reuse at c8 (57344 hit tokens): cached streams equal their
-# cold runs. 0 cross-GPU collective errors.
+# served c16, prefix cache on, PF_INTERLEAVE 8192) on packet 0abfd016 (v15a): PASS, kl_mean 0.02133
+# (vLLM 0.03677 on the same reference), kl_p99 0.406 (0.549), top1_decisive 0.9934 (0.9868), needles 18/18;
+# needles with PLOW_PF_CHUNK=512 18/18. Prefix reuse at c8 (53248 hit tokens): 7/8 cached streams equal their
+# cold runs, as v14 (cache-off re-sends 6/8: batch-shape nondeterminism). 0 cross-GPU collective errors.
 [[gates]]
 name = "llm_fp32_ref"
 cmd = "scripts/llm/fp32_ref_gate.py"
@@ -184,11 +195,11 @@ expect = "36/36"
 
 # One serving cell for orientation; the full grid (isl 1024/4096/16384 at c1..c128, 32768/61440 at
 # c1/c8) and the strict comparison against vLLM are docs/bringup/results/glm53flash-mi350x-2026-10-12.
-# No cell beats vLLM on throughput (v13: 0.34-0.61x, v11 0.28-0.61x); see docs/amd/glm53-flash-mi350x.md.
+# No cell beats vLLM on throughput (v15a: 0.36-0.66x; v13 0.34-0.61x, v11 0.28-0.61x); see docs/amd/glm53-flash-mi350x.md.
 [measured]
-tok_s = 74.81
-p50_tpot_ms = 12.27
-p50_ttft_ms = 150.80
+tok_s = 77.13
+p50_tpot_ms = 11.98
+p50_ttft_ms = 129.16
 concurrency = 1
 input_len = 4096
 output_len = 128
@@ -196,10 +207,10 @@ client = "vllm 0.31.1rc1 bench serve (scripts/bench/llm_grid.sh)"
 
 # Reproduction gates at THIS commit, checkpoint and nix lock.
 [artifacts]
-"plowrt" = "7b73692d4edbd7fd9511b57dd85dfa0f39cdb13857feba18481858debdbe7fa8"
-"model.pkt" = "ab03f74fc6e847c56bae6f35e2e7b2fa357093f89467037c9b5060593e0fa73a"
-"interp_decode_k3_gq.elf" = "7c0417f78cc80b46cf03c516b50337547a8264a83909709739ff2f57b9755eb1"
-"lowrung1/interp_decode_k3_gq.elf" = "ccdb3e5f7d5e1bd986009e31005b9fe39d8a04caedac47cc1bdcfc045a35bb3a"
-"lowrung8/interp_decode_k3_gq.elf" = "8f1fa69aac0d177b84101d643f52c1c1c40f53df7752f600b79a11385e77f815"
-"interp_prefill_k3_moe_gq.elf" = "3c30215253882715341e7435449a4de679f8340315e3e0f9c124a3d49ea13038"
-"interp_flash_gq.elf" = "314a26fedaf6591cfed8f295122fb2b7bf314c57546b90754beef2ef5e3c12b4"
+"plowrt" = "afd1509d1aac2467607c02665a76c6580e19b189e2a73fbebbfe3f6574c4b29c"
+"model.pkt" = "0abfd01688ccc52ffea0e4be3fbe3555020788b81e88c28523caac77c3aa4ee5"
+"interp_decode_k3_gq.elf" = "578569b802460eab8be47907caf58002bec4c96c73b7ce9495e5df70fd4ed8a5"
+"lowrung1/interp_decode_k3_gq.elf" = "e6d6c1e6ff583c5a79a7095ae683a6101c46f0910fd71a545388410782d7864c"
+"lowrung8/interp_decode_k3_gq.elf" = "36eccbdd8b0f7b69fb36756977ce8daaf925b7a32de12d26aa48aafda9401b15"
+"interp_prefill_k3_moe_gq.elf" = "7af47472cdb424a6a763193121c6337a3bf895bc62a25ae91f6bf4172649b015"
+"interp_flash_gq.elf" = "b649f1c5559d2303a2cc6964440d23679202d018f3abe996f7bbccffd034c646"

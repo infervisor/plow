@@ -595,6 +595,21 @@ The packet from config + index alone (no weights) is 70 MB: 4 prefill buckets + 
   (removes a random ~18 ms stall), decode router tile + split-K 2P + XR_DEC_CUS, deferred-frame flash softmax.
   Gates PASS kl 0.01305; prefill 8k 272 -> 245 ms; serving +3-9% at c32/c128. Per-segment geometry sweep: no
   gain (the interpreter object's 148 KB LDS union + 256 VGPR cap every op at 1 WG x 8 waves/CU).
+- 06:20 UTC (10-14), v15a (42c4efc2; packet 0abfd016; plowrt afd1509d): v14 (decode W8A8 split-N GLU tiles,
+  standalone r1 mHC mix) + dedicated decode W8A8 MoE kernels (`PLOW_MOE_W8A8_DEC`, bit-identical; distinct-prompt
+  B8/B32/B128 27.6/30.1/40.4 -> 25.5/28.0/39.4 ms) + KDA prefill intra/prepare/gated-norm/carry rework (object
+  defaults, bit-identical, 8k -4%) + the dedicated MoE prefill kernels actually running (`PLOW_MOE_FP8_PF_XQ`,
+  default on: v13/v14 built them but the FQ GLU arm missed the dedicated predicate, so `PLOW_MOE_FP8_PF_LEAN` ran
+  the interpreter; bit-identical, 8k -12 ms) + fused weighted combine with the shared expert as expert 288 in
+  prefill and packed serving (`PLOW_MOE_FP8_PF_ACC`, `PLOW_GLM_MOE_SHARED_FOLD`, `PLOW_MOE_FP8_PF_PACKED`;
+  bf16 atomics, nondeterministic, FP32-gated). Gates PASS kl 0.02133 (vLLM 0.03677), needles 36/36, split 18/18,
+  prefix 53248 hit tokens (7/8 cached == cold, as v14). Prefill 1k/4k/8k/16k/32k 73/121/196/408/883 ms; amd-bench
+  r1/B8/B32/B128 11.89/24.43/24.81/33.69 ms. Strict TP8 reports 19 cells MATCHED/EQUIVALENT: 0.36-0.66x vLLM
+  (isl16384 c32 0.58 -> 0.66, isl4096 c32 0.45 -> 0.50). No qualified win. Not taken: decode GEMM fold (no gain,
+  spills), in-interpreter mHC tag (≈ the r1 mix kernel), adaptive MLA splits (-0.25 ms r1), DSA prefix fix
+  (unvalidated). c128 serving: prefill and decode never overlap (prefill 47%/68% of wall at 1k/4k), ~6.5 ms per
+  extra packed span, served B128 42-46 ms vs 33.7 bench. Vendor kernels (AITER asm fmoe, Tensile) not imported:
+  the existing routes are gfx942/GLM-5.2-only. Recipe -> v15a.
 - 01:16 UTC (10-14), v13 (16ca2dec; packet ab03f74f; plowrt 7b73692d): dedicated kernels outside the
   interpreter — NoPE MLA flash prefill (mla_pf_dense, flash 18.1 -> 9.9 ms per 8k chunk), block-FP8 grouped MoE
   prefill (moe_fp8_pf, pair 59 -> 47 ms), batched KDA decode chain (kda_decode_wide), grouped KDA prefill GEMM;
@@ -746,7 +761,7 @@ The packet from config + index alone (no weights) is 70 MB: 4 prefill buckets + 
 
 Strict `campaign.py report` output per input length and the combined comparison.csv:
 [docs/bringup/results/glm53flash-mi350x-2026-10-12](../bringup/results/glm53flash-mi350x-2026-10-12/summary.md).
-No qualified win: plow total throughput 0.34-0.61x vLLM (v13; v11 0.28-0.61x).
+No qualified win: plow total throughput 0.36-0.66x vLLM (v15a; v13 0.34-0.61x, v11 0.28-0.61x).
 
 ## 6. Roofline (CPU, before any plow GPU time)
 
