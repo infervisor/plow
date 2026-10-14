@@ -388,11 +388,15 @@ pub(crate) fn rebase_chunk_rows(
         } else if op == DevOp::DsaPoolCompress as u16 {
             let pool_size = d.i[1].max(1);
             d.i[0] = clen / pool_size;
+            if d.i[7] == 2 {
+                d.i[4] = clen;
+            }
         } else if op == DevOp::DsaPoolStash as u16 && d.i[4] != 1 {
             // `i[4] = 1` is the per-span packed form; it addresses rows through the span table.
             let pool_size = d.i[0].max(1);
             let pad = t.saturating_sub(clen);
-            let complete = (clen / pool_size) * pool_size;
+            // Rows before the last pool boundary at or below the chunk end are compressed.
+            let complete = ((c0 + clen) / pool_size * pool_size).saturating_sub(c0);
             match d.i[2].checked_sub(pad) {
                 Some(row) if row >= complete && row < clen => d.i[2] = row,
                 _ => d.op = DevOp::Nop as u16,

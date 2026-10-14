@@ -7785,6 +7785,15 @@ fn emit_glm_dsa_prefill_select(
             d.i[1] = c.index_kpool;
             d.i[2] = di;
             d.i[3] = 0; // token-granular chunk base, patched by plowrt
+            if !packed {
+                // Chunk form: i4 = live rows (patched by plowrt), so a chunk starting inside a
+                // pool (a prefix-cache resume or arm split) completes that pool from the tail
+                // ring (t6/t7) and pools the rest from the next pool boundary.
+                d.t[6] = n.kidx_ring[slot];
+                d.t[7] = n.kidx_ring_score[slot];
+                d.i[4] = t;
+                d.i[7] = 2;
+            }
             if packed {
                 // Per-span form: each span's complete pools into its slot's cache (i5 = pools
                 // per slot); the span table supplies slot, row0 and the absolute position.
@@ -7826,9 +7835,10 @@ fn emit_glm_dsa_prefill_select(
         // offset-from-`t` to an offset-from-`clen` and `Nop`s whichever of these
         // are surplus for THIS chunk's real length (fewer trailing rows than
         // `index_kpool - 1`, or none at all on a pool-aligned/full chunk).
+        // After the compress: a straddling pool reads the ring slots these may overwrite.
         for k in 0..c.index_kpool.saturating_sub(1) {
             let row = t - 1 - k;
-            b.emit(DevOp::DsaPoolStash, all.to_vec(), &[c_ki, c_gs], |d| {
+            b.emit(DevOp::DsaPoolStash, all.to_vec(), &[c_comp], |d| {
                 d.t[0] = n.kidx_ring[slot];
                 d.t[1] = n.kidx_ring_score[slot];
                 d.t[2] = n.kidx_pf;

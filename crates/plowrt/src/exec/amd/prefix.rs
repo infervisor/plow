@@ -138,6 +138,40 @@ pub(super) fn snapshot_regions<'a>(
         if !tensors.get(dst).is_some_and(|t| t.name.starts_with("kv.")) {
             continue;
         }
+        // Pooled DSA indexer: the pool cache is append-only like the KV cache (a pool is
+        // written once it completes; a resume rewrites the pool it starts inside), while the
+        // tail ring holds the in-progress pool's raw rows — mutable per-slot state, snapshotted
+        // whole like carried recurrent state.
+        if d.op == DevOp::DsaPoolCompress as u16 {
+            for h in [d.t[0], d.t[1]] {
+                if !tensors.get(h as usize).is_some_and(|t| t.name.starts_with("kv.")) {
+                    return None;
+                }
+                known[h as usize] = true;
+            }
+            continue;
+        }
+        if d.op == DevOp::DsaPoolStash as u16 {
+            for h in [d.t[0], d.t[1]] {
+                let i = h as usize;
+                let t = tensors.get(i)?;
+                if !t.name.starts_with("kv.") || t.bytes == 0 || t.bytes % batch as u64 != 0 {
+                    return None;
+                }
+                known[i] = true;
+                if !regions.iter().any(|r| r.tensor == i) {
+                    regions.push(Region {
+                        tensor: i,
+                        slot_bytes: t.bytes / batch as u64,
+                        heads: 1,
+                        ring: 0,
+                        window: 0,
+                        row_bytes: 0,
+                    });
+                }
+            }
+            continue;
+        }
         if d.op == DevOp::HeadNormRope as u16 || d.op == DevOp::HeadNormRopeFp8 as u16 {
             known[dst] = true;
             needed[dst] |= d.fj[2] != u32::MAX && (d.fj[1] as usize) < max_ctx;

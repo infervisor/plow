@@ -4521,6 +4521,42 @@ __device__ static void plow_exec(CInst in_v, unsigned slice, CTens T_v, plow_sme
                              in->i[2], in->i[3], slice, nblk);
             break;
         case PLOW_DOP_DSA_POOL_COMPRESS:
+            /* Prefill chunk form (i7 = 2): i3 = chunk base c0, i4 = live rows. A chunk starting
+             * inside a pool (c0 % pool != 0) first completes that pool from the ring's earlier
+             * tokens (t6/t7, slot pos % pool) and its own first rows, staged in LDS by slice 0;
+             * the remaining complete pools start at the next boundary. */
+            if (in->i[7] == 2u) {
+                const unsigned ps = in->i[1], hd = in->i[2], c0 = in->i[3], clen = in->i[4];
+                const unsigned m = c0 % ps, first = m ? ps - m : 0u;
+                if (m && clen >= first && slice == 0u) {
+                    bf16* wk = (bf16*)((char*)sm->raw + 4096);
+                    bf16* ws = wk + ps * hd;
+                    for (unsigned e = threadIdx.x; e < ps * hd; e += PLOW_THREADS) {
+                        const unsigned s = e / hd, d = e % hd;
+                        if (s < m) {
+                            const size_t src = (size_t)((c0 - m + s) % ps) * hd + d;
+                            wk[e] = ((const bf16*)TEN(6))[src];
+                            ws[e] = ((const bf16*)TEN(7))[src];
+                        } else {
+                            wk[e] = ((const bf16*)TEN(2))[(size_t)(s - m) * hd + d];
+                            ws[e] = ((const bf16*)TEN(3))[(size_t)(s - m) * hd + d];
+                        }
+                    }
+                    __syncthreads();
+                    d_dsa_pool_compress((uint8_t*)TEN(0), (float*)TEN(1), wk, ws,
+                                        (const float*)TEN(4), 1u, ps, hd, 0u, 1u, (float*)sm->raw,
+                                        sm->part, nullptr, c0 - m);
+                    __syncthreads();
+                }
+                if (clen > first) {
+                    d_dsa_pool_compress((uint8_t*)TEN(0), (float*)TEN(1),
+                                        (const bf16*)TEN(2) + (size_t)first * hd,
+                                        (const bf16*)TEN(3) + (size_t)first * hd,
+                                        (const float*)TEN(4), (clen - first) / ps, ps, hd, slice,
+                                        nblk, (float*)sm->raw, sm->part, nullptr, c0 + first);
+                }
+                break;
+            }
             /* Packed prefill (i6 = 1): per span, the complete pools whose first token lies in
              * the span (kv_row0 pool-aligned; a pool straddling an unaligned span start is not
              * written) into the span slot's cache, i5 = pools per slot. */
