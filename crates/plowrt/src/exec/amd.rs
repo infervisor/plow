@@ -14981,11 +14981,12 @@ impl AmdEngine {
     /// a chain whose emission disagrees, so a drift fails closed rather than
     /// overrunning the queue.
     /// `PLOW_AMD_GEMM_GROUP_LT`: the hipBLASLt groups that have a pinned kernel, then one grouped
-    /// launch for any unpinned tail.
+    /// launch for any unpinned tail. Only above 4096 live rows: at 1024/2048-token prompts the
+    /// separate launches lost 1.9/2.3 ms to the grouped kernel, at 8192/16384 they won 1.3/2.7 ms.
     fn gemm_group_groups(&self, args: &GemmGroupArgs) -> usize {
         self.gemm_lt
             .as_ref()
-            .filter(|_| crate::config::RuntimeConfig::get().amd.gemm_group_lt)
+            .filter(|_| crate::config::RuntimeConfig::get().amd.gemm_group_lt && args.t > 4096)
             .map_or(0, |lt| lt.group_prefix(&args.n, args.k))
     }
 
