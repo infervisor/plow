@@ -48,7 +48,7 @@ print("\n".join(seen))' "$here/../runtime/amd/glm_lt_gfx950.json" > "$sub/names.
     "$ROCM_PATH/llvm/bin/llvm-mc" -triple=amdgcn-amd-amdhsa -mcpu=gfx950 -filetype=obj "$sub/subset.s" -o "$sub/subset.o"
     "$ROCM_PATH/llvm/bin/ld.lld" -shared "$sub/subset.o" -o "$stem.elf"
     actual=$(sha256sum "$stem.elf")
-    if [[ ${actual%% *} != 1fc299617e1d7be4d2c33e99a633c4d22656e43a00fa6000acce588b0d491f3e ]]; then
+    if [[ ${actual%% *} != 88995bce9413c67da6df1a2d7e41aa95b0ba73f4ee3626de4a26e025580f1b0f ]]; then
         echo "gfx950 hipBLASLt subset does not match the qualified image" >&2
         exit 1
     fi

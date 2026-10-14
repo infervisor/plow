@@ -14,7 +14,7 @@ const NOBIAS_OBJECT_HASH: &str = "0ab860e928c070fa3ee22f5f91725539caaa0a12223296
 /// The `glm_lt_gfx950.json` kernels cut out of the ROCm 10
 /// `TensileLibrary_BB_BB_HA_Bias_SAV_UA_Type_BB_HPA_Contraction_l_Alik_Bljk_Cijk_Dijk` gfx950 image
 /// (`scripts/build_glm_lt.sh --gfx950`, `scripts/glm_lt_subset.py`).
-const GFX950_OBJECT_HASH: &str = "1fc299617e1d7be4d2c33e99a633c4d22656e43a00fa6000acce588b0d491f3e";
+const GFX950_OBJECT_HASH: &str = "88995bce9413c67da6df1a2d7e41aa95b0ba73f4ee3626de4a26e025580f1b0f";
 /// Stream-K partial-tile workspace and flags. Every launch runs one whole tile per workgroup;
 /// the kernels still require both pointers, and the workspace covers a full FP32 partial of
 /// every tile at 8192 rows should one write it.
@@ -197,6 +197,8 @@ fn band_choice(rows: u32, n: u32, k: u32) -> Option<(usize, u32)> {
 /// means; decode tiers at 32 and 128 rows).
 fn gfx950_choice(rows: u32, n: u32, k: u32) -> Option<usize> {
     let tiers: [usize; 5] = match (n, k) {
+        // KDA b at the decode rungs only; prefill keeps it on the grouped kernel.
+        (8, 4096) if rows <= 256 => [31, 32, 0, 0, 0],
         (1536, 4096) => [18, 19, 0, 1, 2],
         (512, 4096) => [20, 21, 3, 4, 5],
         (4096, 1536) => [22, 23, 6, 7, 7],
