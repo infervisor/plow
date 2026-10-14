@@ -676,7 +676,11 @@ The packet from config + index alone (no weights) is 70 MB: 4 prefill buckets + 
   159/561/1271/- ms. Streams = FP32 continuation at all rungs; 4k/16k = dense stream; needles
   36/36 (serve, cache on). Serve with the packed route crashed (per-span pool writes trap in the
   interpreter object): the packed route is refused for DSA packets until those writes move into
-  a packed family; FP32 gate pending.
+  a packed family. On the v13 integration env + DSA (packet 21ffb3d1, serve PF_IL 8192, XR tag
+  90112, dense flash object): FP32 gate PASS kl_mean 0.01289 (vLLM 0.03677), kl_p99 0.199,
+  top1_decisive 0.9978, c16 serve, no exception; PF_CHUNK=512 split needles 18/18. Prefix check:
+  the cache never hits on the DSA packet (cached=0 in every case) and 7 of 24 streams differ
+  off-vs-on (run-to-run concurrency; the dense v12 packet also FAILs this check with 2) — open.
 - 23:00 UTC (10-13), dedicated decode kernels for KDA and the router (branch v13-kda-router).
   `PLOW_KDA_DECODE_WIDE` (default on): at batched rungs each KDA layer's Conv3 -> StateStepG ->
   GatedNorm runs as one standalone op-125 v3 launch (`kda_decode_wide.hip`, one 512-thread
