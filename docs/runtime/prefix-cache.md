@@ -165,7 +165,21 @@ owner per buffer (device or host) outside `Spilling`; a `Spilling`/`Restoring` s
 freed, never a victim, never spilled twice; a held snapshot is never spilled; `users` releases
 exactly once per attach, prefetch or restore; a snapshot's blocks go only with the snapshot.
 
-`PLOW_PREFIX_POLICY=legacy` keeps the 0.1.2 flag/tier policy (with the phase-0 fixes: the MRU
-exemption is bounded by `SHARED_RECENT_TICKS`, a reuse distance in publishes + attaches; eviction
-honours waiters; the turn-end restore runs regardless of `PLOW_PREFIX_CACHE_OUTPUT`; the live ring
-is released before the retire trim) for one release.
+`PLOW_PREFIX_POLICY=legacy` (one release) restores the 0.1.2 retention policy: the
+`attaches`/`share`/`session`/`referenced`/`reusable_prompt` flags and `evict_one`'s tiers,
+`retire_superseded` (with `PLOW_PREFIX_RETIRE_ATTACHED`), `note_session` and the session pin
+(`PLOW_SESSION_TTL_MS`), the turn-end output boundary (`PLOW_PREFIX_CACHE_OUTPUT`), shared ends
+for same-history pairs. It is not a byte-exact rollback of production `c53036db`; these changes
+stay active under it (the previous binary is the exact rollback):
+
+* the MRU exemption ages out after `SHARED_RECENT_TICKS` (2048 publishes + attaches) of reuse
+  distance instead of lasting until another snapshot is referenced;
+* eviction honours waiters' reservations (`Await { chain, rows }`, tailed targets included), and
+  a packed admission reset clears a cancelled waiter's reservation;
+* the turn-end pass restores or touches the prompt end regardless of `PLOW_PREFIX_CACHE_OUTPUT`,
+  and `publish_boundary` tries that metadata touch (merging kind and `share`/`reusable_prompt`
+  like a dedup) before the ring-overflow check;
+* `retire_slot` releases the live ring before `begin_seq`'s trim;
+* every node-level removal frees its snapshots one at a time, and strict publish's tail
+  eviction stops below a held, awaited or in-transfer snapshot;
+* snapshots are identified by id; the host tier and `PLOW_PREFIX_SESSION_TTL_S` are tree-only.
