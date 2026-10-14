@@ -188,6 +188,42 @@ use crate::exec::tp::{
     gate_error, is_deadline_status, PeerLayout, TpGroup, XctrReset, PARTIAL_SLOTS, XCTR_STRIDE,
 };
 use crate::{Result, RuntimeError};
+
+/// `PLOW_TP_PAR_HOST`: run the per-rank synchronous host copies of a decode step (staging,
+/// token readback, id seeding) on one thread per rank, so their SDMA round trips overlap.
+fn par_host() -> bool {
+    crate::config::RuntimeConfig::get().amd.tp_par_host
+}
+
+fn each_rank<T: Send>(
+    ranks: &mut [AmdEngine],
+    f: impl Fn(&mut AmdEngine) -> Result<T> + Sync,
+) -> Result<Vec<T>> {
+    if !par_host() {
+        return ranks.iter_mut().map(&f).collect();
+    }
+    let f = &f;
+    std::thread::scope(|scope| {
+        let handles: Vec<_> = ranks.iter_mut().map(|e| scope.spawn(move || f(e))).collect();
+        let mut out = Vec::with_capacity(handles.len());
+        let mut first = None;
+        for h in handles {
+            match h.join() {
+                Ok(Ok(v)) => out.push(v),
+                Ok(Err(e)) => {
+                    first.get_or_insert(e);
+                }
+                Err(_) => {
+                    first.get_or_insert(RuntimeError::Device("rank host thread panicked".into()));
+                }
+            }
+        }
+        match first {
+            Some(e) => Err(e),
+            None => Ok(out),
+        }
+    })
+}
 use packet::dev::PrefillSpan;
 
 /// Tokens between full all-rank readbacks — see [`AmdTpGroup::complete_decode`]
@@ -958,6 +994,19 @@ impl AmdTpGroup {
         let all = agreement_due(&mut self.agree_tick, self.agree_every);
         let rows = (self.ranks[0].prog_t(self.cur_dp) as usize).min(batch);
         dstep::timed(&dstep::READ, || {
+            if all && par_host() {
+                let mut all_ids = each_rank(&mut self.ranks, |e| e.read_sampled_batched(rows))?;
+                if let Some(r) = all_ids.iter().position(|p| *p != all_ids[0]) {
+                    return Err(RuntimeError::Device(format!(
+                        "TP ranks disagree on a batched decode step: rank 0 sampled \
+                         {:?}, rank {r} sampled {:?} — the all-reduce is wrong",
+                        all_ids[0], all_ids[r]
+                    )));
+                }
+                let mut ids = all_ids.swap_remove(0);
+                ids.resize(batch, 0);
+                return Ok(ids);
+            }
             let mut ids = self.ranks[0].read_sampled_batched(rows)?;
             if all {
                 for (r, rank) in self.ranks.iter_mut().enumerate().skip(1) {
@@ -1119,9 +1168,9 @@ impl AmdTpGroup {
         let counter_dbuf = self.ranks[0].tp_counter_double_buffered();
         // Preparation can fail without changing bank state. Only after EVERY
         // rank is prepared may TP select the banks this dispatch will capture.
-        for e in &mut self.ranks {
-            dstep::timed(&dstep::PREPARE, || e.decode_prepare_batched(pos, kvlen))?;
-        }
+        dstep::timed(&dstep::PREPARE, || {
+            each_rank(&mut self.ranks, |e| e.decode_prepare_batched(pos, kvlen))
+        })?;
         if let Some(rank) = self.ranks.iter().position(|e| !e.tp_counter_bank_ready(dp)) {
             return Err(RuntimeError::Device(format!(
                 "rank {rank} program {dp} has no clean inactive counter bank; refusing to \
@@ -1299,7 +1348,7 @@ impl AmdTpGroup {
         let all = agreement_due(&mut self.agree_tick, self.agree_every);
         dstep::timed(&dstep::READ, || {
             if all {
-                self.ranks.iter_mut().map(|e| e.read_sampled()).collect()
+                each_rank(&mut self.ranks, |e| e.read_sampled())
             } else {
                 Ok(vec![self.ranks[0].read_sampled()?])
             }
@@ -2389,10 +2438,7 @@ impl AmdTpGroup {
 
     /// Seed `in.ids` on every rank — needed once, before the first decode step.
     pub fn seed_ids(&mut self, ids: &[u32]) -> Result<()> {
-        for e in &mut self.ranks {
-            e.seed_ids(ids)?;
-        }
-        Ok(())
+        each_rank(&mut self.ranks, |e| e.seed_ids(ids)).map(drop)
     }
 
     /// Every rank sampled the same token, or a report of who disagreed.

@@ -2238,6 +2238,10 @@ pub struct AmdRuntimeConfig {
     /// Diagnostic: `<prefix>` — per-dispatch GPU start/end to `<prefix>.dev<N>.csv`.
     #[arg(long = "amd-dispatch-times", env = "PLOW_AMD_DISPATCH_TIMES", global = true)]
     pub dispatch_times: Option<String>,
+    /// TP decode: per-rank synchronous host copies (staging, token readback, id seeding) run
+    /// on one thread per rank so their SDMA round trips overlap.
+    #[arg(long = "amd-tp-par-host", env = "PLOW_TP_PAR_HOST", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
+    pub tp_par_host: bool,
 }
 
 /// Global runtime config, initialized once at startup from CLI parse.

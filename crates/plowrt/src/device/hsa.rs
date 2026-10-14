@@ -320,8 +320,10 @@ impl DispatchTimes {
                 let _ = writeln!(g.1, "{idx},{},{},{k}", t[0], t[1]);
             }
         }
+        if upto >> 14 != g.0 >> 14 {
+            let _ = g.1.flush();
+        }
         g.0 = g.0.max(upto);
-        let _ = g.1.flush();
     }
 
     fn load(&self, drv: &HsaDriver, agent: HsaAgent) -> i64 {
