@@ -6002,7 +6002,10 @@ fn gpu_prefill_batched_pass(
         // and a long prompt runs as several launches. Riders always ride under a budget: a
         // separate decode step after the launch would add a step to their wait. A launch with
         // an indivisible media span runs unbudgeted (a span cannot be cut to a rung).
-        let budget_on = decode_rows > 0 && pf_itl_budget_ms() > 0;
+        // A backlog wider than one full launch means prefill is the bottleneck: every extra launch
+        // costs its fixed overhead in capacity (H100 26B: ~24 ms; at 2.2 sess/s the cap cost 18% of
+        // prefill rows/s), so the budget yields to throughput until the backlog drains.
+        let budget_on = decode_rows > 0 && pf_itl_budget_ms() > 0 && avail <= budget_max;
         let itl_cap = if budget_on
             && !candidates.iter().any(|c| {
                 slots[c.span.slot as usize]
