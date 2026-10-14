@@ -5142,15 +5142,22 @@ pub(super) fn shuffle_moe_weight_16x32(src: &[u8], rows: usize, kbytes: usize) -
     Ok(dst)
 }
 
+/// The resident layout is pinned per object family: GLM-5.2 H6144 (96 scales per projection) on
+/// gfx942, whose AITER objects read FNUZ e4m3 and so take doubled scales, and GLM-5.3-Flash
+/// H4096 (64 scales) on gfx950, whose objects read the checkpoint's OCP bytes as-is.
 pub(super) fn resident_moe_scales(src: &[u8]) -> Result<Vec<u8>> {
-    if src.len() != 96 * 4 {
-        return Err(RuntimeError::Device(
-            "resident MoE requires 96 f32 scales per projection".into(),
-        ));
-    }
+    let factor = match src.len() {
+        384 => 2.0f32,
+        256 => 1.0,
+        _ => {
+            return Err(RuntimeError::Device(
+                "resident MoE requires 96 (H6144) or 64 (H4096) f32 scales per projection".into(),
+            ))
+        }
+    };
     let mut out = Vec::with_capacity(src.len());
     for chunk in src.chunks_exact(4) {
-        let scaled = 2.0 * f32::from_le_bytes(chunk.try_into().unwrap());
+        let scaled = factor * f32::from_le_bytes(chunk.try_into().unwrap());
         if !scaled.is_finite() {
             return Err(RuntimeError::Device(
                 "resident MoE scale overflows or is not finite".into(),
@@ -5555,20 +5562,28 @@ fn bind_packed_experts(
                 }
             }
         }
+        // GLM-5.2 (H6144, 256 routed) or GLM-5.3-Flash (H4096, 288 routed); the fold adds one.
+        let resident_h = shape0.get(1).copied().unwrap_or(0) as u64;
+        let routed = match resident_h {
+            6144 => 256,
+            4096 => 288,
+            _ => 0,
+        };
         if resident
             && (*ep_table
                 || whole
                 || n_gpu != 8
-                || !(256..=257).contains(&n_exp)
+                || !(routed..=routed + 1).contains(&n_exp)
                 || i_moe != 256
                 || en.microscaled()
-                || shape0 != [2048, 6144]
-                || w_stride != 256 * 6144
-                || s_stride != 96 * 4
+                || shape0.len() != 2
+                || shape0[0] != 2048
+                || w_stride != 256 * resident_h
+                || s_stride != resident_h / 64 * 4
                 || resident_tables[*i_ewt] != Some(i_est as u16))
         {
             return Err(RuntimeError::Device(format!(
-                "{pfx}: resident MoE requires TP8 block-FP8 H6144/I256/E256 weights"
+                "{pfx}: resident MoE requires TP8 block-FP8 I256 H6144/E256 or H4096/E288 weights"
             )));
         }
         let t_alloc = Instant::now();
@@ -5578,7 +5593,7 @@ fn bind_packed_experts(
         let (wtab, stab) = if resident {
             resident_weights.push((
                 *i_ewt as u16,
-                amd_moe_aiter::ResidentWeights::new(d_w.base, d_s.base, n_local),
+                amd_moe_aiter::ResidentWeights::new(d_w.base, d_s.base, n_local, resident_h),
             ));
             (
                 amd_moe_aiter::resident_expert_table(d_w.base, w_stride, n_local),
@@ -7930,8 +7945,12 @@ impl AmdEngine {
         let use_moe_aiter = blob.progs.iter().any(has_moe_aiter);
         let resident_tables = amd_moe_aiter::resident_tables(&blob.progs, &blob.tensors)?;
         let use_resident_moe = resident_tables.iter().any(Option::is_some);
-        if use_moe_aiter && (arch != "gfx942" || tp.is_none_or(|b| b.n_gpu != 8)) {
-            return Err(RuntimeError::Device("AITER MoE requires gfx942 TP8".into()));
+        if use_moe_aiter
+            && (!matches!(arch.as_str(), "gfx942" | "gfx950") || tp.is_none_or(|b| b.n_gpu != 8))
+        {
+            return Err(RuntimeError::Device(
+                "AITER MoE requires gfx942 or gfx950 TP8".into(),
+            ));
         }
         let use_sparse_mla = crate::config::RuntimeConfig::get().amd.mla_pf_aiter;
         check_sparse_fp8_packet(
@@ -10283,10 +10302,16 @@ impl AmdEngine {
                 .unwrap();
             Some(amd_moe_aiter::MoeAiter::load(
                 &be,
+                &arch,
                 hsaco_dir,
                 rows.max(128),
                 n_exp,
-                blob.decode_phase().any(has_moe_aiter),
+                // Flat decode (i[6] = 1); the gfx950 route runs its decode rungs sorted.
+                blob.decode_phase().any(|p| {
+                    p.insts
+                        .iter()
+                        .any(|d| d.op == DevOp::MoeAiterFp8Pf as u16 && d.i[6] == 1)
+                }),
                 use_resident_moe,
                 crate::config::RuntimeConfig::get()
                     .amd

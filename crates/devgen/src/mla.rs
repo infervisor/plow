@@ -2300,6 +2300,10 @@ fn glm_moe_pf_w8a8(c: &GlmCfg, enc: MoeEnc, native_moe: bool, tk: u32, imoe_e: u
             && crate::amd_target::active().1 == hwspec::IsaLevel::Gfx950,
         "PLOW_MOE_PF_W8A8 requires gfx950 and block-FP8 experts"
     );
+    // The gfx950 AITER route owns the routed experts; PLOW_MOE_PF_W8A8 keeps the dense layers.
+    if native_moe && emit_config::active().glm_moe_resident() {
+        return false;
+    }
     assert!(
         !c.ep
             && !native_moe
@@ -2463,6 +2467,18 @@ fn emit_glm_shared_w8a8_down(
 /// EP (neither `c.ep` nor `PLOW_MOE_PREFILL_EP`): under EP the routed experts are distributed
 /// whole across ranks while the shared expert is TP-sliced on every rank, so it has no single
 /// owner to be expert 256 of.
+/// GLM-5.3-Flash's native AITER route on gfx950 (`PLOW_GLM_MOE_RESIDENT`, H4096 / E288 top-8 /
+/// I256 per rank at TP8 on 256 CUs): the SORTED call at every rung — decode included, where the
+/// gfx942 route runs the flat object — over `GFX950_TILES` (plowrt `amd_moe_aiter.rs`).
+fn glm_aiter_gfx950(c: &GlmCfg, n_cu: u32, enc: MoeEnc) -> bool {
+    emit_config::active().glm_moe_resident()
+        && enc == MoeEnc::Fp8Blk
+        && c.tp == 8
+        && !c.ep
+        && n_cu == 256
+        && (c.hidden, c.n_exp, c.top_k, c.moe_inter / c.tp) == (4096, 288, 8, 256)
+}
+
 fn glm_shared_fold(c: &GlmCfg, enc: MoeEnc) -> bool {
     let cfg = emit_config::active();
     cfg.glm_moe_shared_fold
@@ -3326,7 +3342,10 @@ fn declare_glm_rows_batched_for_prefill(
     let native_moe = enc == MoeEnc::Fp8Blk
         && (emit_config::active().glm_moe_aiter() || emit_config::active().glm_moe_resident());
     let has_dense = layer_ids.iter().copied().any(|l| c.is_dense(l));
-    let pf_w8a8 = rows > 1 && glm_moe_pf_w8a8(c, enc, native_moe, tk, imoe_e, h);
+    // Under the gfx950 AITER route the dense layers still run PLOW_MOE_PF_W8A8 on this scratch.
+    let pf_w8a8 = rows > 1
+        && (glm_moe_pf_w8a8(c, enc, native_moe, tk, imoe_e, h)
+            || (has_dense && glm_moe_pf_w8a8(c, enc, false, tk, imoe_e, h)));
     let compact_native_scratch = native_moe
         && has_dense
         && !prefill_rows.is_empty()
@@ -9728,10 +9747,11 @@ fn emit_glm_moe_ffn_prefill(
         assert!(
             enc == MoeEnc::Fp8Blk
                 && tp == 8
-                && n_cu == 304
                 && (1..=8192).contains(&t)
-                && (h, imoe_e, e, tk) == (6144, 256, 256, 8),
-            "PLOW_GLM_MOE_AITER requires gfx942 TP8 GLM block-FP8 prefill, rows 1..8192"
+                && ((n_cu == 304 && (h, imoe_e, e, tk) == (6144, 256, 256, 8))
+                    || glm_aiter_gfx950(c, n_cu, enc)),
+            "PLOW_GLM_MOE_AITER requires gfx942 TP8 GLM-5.2 or gfx950 TP8 GLM-5.3-Flash (resident) \
+             block-FP8 prefill, rows 1..8192"
         );
     }
     // PLOW_GLM_MOE_SHARED_FOLD — see `glm_shared_fold`. `e_all`/`tk_all` are what the ROUTING
@@ -11042,11 +11062,13 @@ fn emit_glm_moe_ffn_rows(
                 .expect("routed to the native GEMM")
         })
     });
-    let resident = emit_config::active().glm_moe_resident();
+    let aiter950 = glm_aiter_gfx950(c, b.n_cu(), enc);
+    let resident = emit_config::active().glm_moe_resident() && !aiter950;
     assert!(
         !resident || matches!(rows, 1 | 2 | 4 | 8 | 16 | 32),
         "resident GLM MoE decode requires rows 1/2/4/8/16/32"
     );
+    assert!(!aiter950 || rows <= 8192, "gfx950 AITER MoE decode rows exceed 8192");
     let flat = resident || (emit_config::active().glm_moe_flat_decode && matches!(rows, 2 | 4 | 8));
     if flat {
         assert!(
@@ -11064,12 +11086,15 @@ fn emit_glm_moe_ffn_rows(
     // the packed slab from, and a decode instruction claiming 256 against a 257-entry table would
     // make the two disagree about which allocation the pointers describe.
     let e_all = e + u32::from(glm_shared_fold(c, enc));
-    let det = !flat && moe_pf_fuse(tk) == MoePfFuse::Det;
+    let det = !flat && !aiter950 && moe_pf_fuse(tk) == MoePfFuse::Det;
     // PLOW_GLM_DECODE_SHARED_FOLD: route the shared expert as the constant tail slot here too
     // (the prefill fold's router i[5]), so it runs A4W4 in the grouped ops like vLLM's routed
     // path instead of the W4A16 GEMV pair, and its two decode packets disappear.
-    let dfold = emit_config::active().glm_decode_shared_fold;
-    assert!(!dfold || (glm_shared_fold(c, enc) && enc == MoeEnc::Mxfp4 && !flat && !det
+    // The gfx950 AITER call folds the shared expert at decode too, as vLLM's does: one more
+    // top-9 slot in the same kernel instead of the shared GEMV pair.
+    let dfold = emit_config::active().glm_decode_shared_fold
+        || (aiter950 && glm_shared_fold(c, enc));
+    assert!(!dfold || aiter950 || (glm_shared_fold(c, enc) && enc == MoeEnc::Mxfp4 && !flat && !det
         && !emit_config::active().glm_routed_w8a8 && !emit_config::active().glm_shared_w8a8),
         "PLOW_GLM_DECODE_SHARED_FOLD requires PLOW_GLM_MOE_SHARED_FOLD on the grouped MXFP4 decode path");
     let (e_route, tk_route) = if dfold { (e_all, tk + 1) } else { (e, tk) };
@@ -11304,7 +11329,24 @@ fn emit_glm_moe_ffn_rows(
     };
 
     let routed_w8a8 = emit_config::active().glm_routed_w8a8;
-    let c_d = if routed_w8a8 {
+    let c_d = if aiter950 {
+        // Sorted, BF16 rows into `part` (mode 2), summed by the one-partial combine below.
+        let counter = b.emit(DevOp::MoeAiterFp8Pf, one.clone(), &[c_routes, c_rn2], |d| {
+            d.t = [
+                n.part,
+                n.xn2,
+                w.ewt,
+                w.est,
+                n.meta,
+                n.row_token,
+                n.row_partidx,
+                n.row_gate,
+            ];
+            d.i = [rows, h, imoe_e, e_route, tk_route, 64, 2, 1];
+        });
+        b.isolate(counter);
+        counter
+    } else if routed_w8a8 {
         emit_glm_routed_w8a8(b, c, n, w, rows, h, imoe_e, e, tk, c_rn2, c_routes)
     } else if flat {
         let counter = b.emit(DevOp::MoeAiterFp8Pf, one.clone(), &[c_routes, c_rn2], |d| {
@@ -11426,7 +11468,7 @@ fn emit_glm_moe_ffn_rows(
             };
             d.t[3] = n.part;
             d.i[0] = h;
-            d.i[1] = if det || flat || routed_w8a8 {
+            d.i[1] = if det || flat || routed_w8a8 || aiter950 {
                 1
             } else {
                 tk_route
@@ -11434,7 +11476,7 @@ fn emit_glm_moe_ffn_rows(
             d.i[2] = rows;
             d.i[3] = 0;
             d.i[4] = u32::from(det);
-            d.i[7] = u32::from(flat || routed_w8a8);
+            d.i[7] = u32::from(flat || routed_w8a8 || aiter950);
         });
         let c_xr = emit_xreduce(
             b,
@@ -11481,7 +11523,7 @@ fn emit_glm_moe_ffn_rows(
             d.t[2] = if dfold { TENSOR_NONE } else { n.shared };
             d.t[3] = n.part;
             d.i[0] = h;
-            d.i[1] = if det || flat || routed_w8a8 {
+            d.i[1] = if det || flat || routed_w8a8 || aiter950 {
                 1
             } else {
                 tk_route
@@ -11489,7 +11531,7 @@ fn emit_glm_moe_ffn_rows(
             d.i[2] = rows;
             d.i[3] = 0;
             d.i[4] = u32::from(det);
-            d.i[7] = u32::from(flat || routed_w8a8);
+            d.i[7] = u32::from(flat || routed_w8a8 || aiter950);
         })
     }
 }
@@ -12456,12 +12498,12 @@ fn glm_emit_full(
     if emit_config::active().glm_moe_resident() {
         assert!(
             crate::emit_is_amd()
-                && target == "gfx942"
+                && matches!(target, "gfx942" | "gfx950")
                 && tp == 8
                 && enc == MoeEnc::Fp8Blk
                 && !c.ep
                 && !emit_config::active().moe_prefill_ep,
-            "resident GLM MoE requires gfx942 TP8 block-FP8 without EP"
+            "resident GLM MoE requires gfx942/gfx950 TP8 block-FP8 without EP"
         );
     }
 
@@ -12622,8 +12664,10 @@ fn glm_emit_full(
             || emit_config::active().glm_moe_resident()
         {
             assert!(
-                crate::emit_is_amd() && target == "gfx942",
-                "native GLM prefill requires gfx942"
+                crate::emit_is_amd()
+                    && (target == "gfx942"
+                        || (target == "gfx950" && emit_config::active().glm_moe_resident())),
+                "native GLM prefill requires gfx942 (or the gfx950 resident AITER MoE)"
             );
             pb.deny_uniseg();
         }
