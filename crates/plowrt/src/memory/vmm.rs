@@ -134,6 +134,30 @@ pub trait VmmOps: Send + Sync {
         let _ = keep_bytes;
         0
     }
+
+    /// Pinned host memory for the snapshot spill tier ([`VmmKv::enable_host_tier`]). The
+    /// defaults have none: the tier refuses to enable and eviction frees snapshots as before.
+    fn host_tier_alloc(&self, _bytes: u64) -> Result<u64> {
+        Err(RuntimeError::Rejected("no host tier".into()))
+    }
+    fn host_tier_free(&self, _ptr: u64, _bytes: u64) {}
+    /// Queue a D2H copy of `bytes` at `va` into host tier memory; returns a fence that
+    /// [`Self::fence_done`] (`Ok(true)`) or [`Self::fence_wait`] consumes once the copy
+    /// retired. `va` must stay allocated until then.
+    fn copy_dtoh_async(&self, _host_ptr: u64, _va: u64, _bytes: u64) -> Result<u64> {
+        Err(RuntimeError::Rejected("no host tier".into()))
+    }
+    fn fence_done(&self, _fence: u64) -> Result<bool> {
+        Ok(false)
+    }
+    fn fence_wait(&self, _fence: u64) -> Result<()> {
+        Err(RuntimeError::Rejected("no host tier".into()))
+    }
+    /// Restore `bytes` from host tier memory into `va`, complete when it returns: the
+    /// caller's next device operation on `va` (on any stream) reads the restored bytes.
+    fn copy_htod(&self, _va: u64, _host_ptr: u64, _bytes: u64) -> Result<()> {
+        Err(RuntimeError::Rejected("no host tier".into()))
+    }
 }
 
 /// Uniform full-KV allocation geometry. Prefix mode resolves checkpoint
@@ -892,6 +916,18 @@ pub struct VmmStats {
     /// Publishes [`VmmKv::enable_shared_publish`] skipped because the sequence's lead was
     /// seen on no other sequence (no snapshot copy, allocation or radix insert happened).
     pub publishes_skipped: u64,
+    /// Host tier ([`VmmKv::enable_host_tier`]): snapshots resident in pinned host memory and
+    /// their bytes (not in `cache_bytes`/`snapshot_bytes`, which stay device-only), the pinned
+    /// bytes allocated so far, snapshots moved device → host, host → device (an attach),
+    /// evicted from the host tier, and evictions that freed a snapshot the tier could not
+    /// take (no slot, or larger than one).
+    pub host_snapshots: u64,
+    pub host_snapshot_bytes: u64,
+    pub host_capacity_bytes: u64,
+    pub snapshots_spilled: u64,
+    pub snapshots_restored: u64,
+    pub host_evictions: u64,
+    pub spill_fallbacks: u64,
 }
 
 /// One physical sharing block: driver handle + mapping/cache refcount.
@@ -1025,7 +1061,7 @@ enum Job {
 #[derive(Clone, Copy)]
 struct BoundaryKey {
     node: Option<(u32, u32)>,
-    va: u64,
+    id: u64,
 }
 
 #[derive(Default)]
@@ -1043,9 +1079,81 @@ struct SlotSeq {
     fine_held: usize,
 }
 
+/// Where a boundary snapshot's bytes live ([`VmmKv::enable_host_tier`]).
+#[derive(Clone, Copy)]
+enum SnapStore {
+    Device(u64),
+    /// D2H in flight: the copy reads `va`, so the device buffer outlives `fence` and is
+    /// freed only once the fence retired ([`reap_spills`]).
+    Spilling {
+        va: u64,
+        slot: u32,
+        fence: u64,
+    },
+    Host(u32),
+}
+
+/// Pinned host slots for spilled snapshots ([`VmmKv::enable_host_tier`]).
+struct HostTier {
+    slot_bytes: u64,
+    cap_slots: u32,
+    chunk_slots: u32,
+    chunks: Vec<(u64, u64)>,
+    /// Slot index → host pointer.
+    slots: Vec<u64>,
+    free: Vec<u32>,
+    /// `(node, snap id, bytes)` of every `Spilling` snapshot, oldest first: one copy stream
+    /// retires them in order.
+    in_flight: std::collections::VecDeque<(Option<(u32, u32)>, u64, u64)>,
+}
+
+/// One pinned allocation per chunk of host tier slots.
+const HOST_CHUNK_BYTES: u64 = 1 << 30;
+/// Spills whose device buffer is still held; at the cap the oldest is waited for.
+const SPILL_INFLIGHT: usize = 4;
+
+impl HostTier {
+    /// Bytes of the next chunk, while fewer than a chunk of slots are free under the cap.
+    fn wants_chunk(&self) -> Option<u64> {
+        let have = self.slots.len() as u32;
+        if self.free.len() >= self.chunk_slots as usize || have >= self.cap_slots {
+            return None;
+        }
+        Some(u64::from(self.chunk_slots.min(self.cap_slots - have)) * self.slot_bytes)
+    }
+
+    fn add_chunk(&mut self, ptr: u64, bytes: u64) {
+        for i in 0..bytes / self.slot_bytes {
+            self.free.push(self.slots.len() as u32);
+            self.slots.push(ptr + i * self.slot_bytes);
+        }
+        self.chunks.push((ptr, bytes));
+    }
+
+    fn release_slot(&mut self, slot: u32) {
+        self.free.push(slot);
+    }
+
+    fn forget_spill(&mut self, id: u64) {
+        self.in_flight.retain(|&(_, i, _)| i != id);
+    }
+
+    /// Device bytes of the spills in flight: `trim_cache` counts them as freed, so a trim
+    /// queues the copies and returns without waiting; they come free at the next reap.
+    fn pending_bytes(&self) -> u64 {
+        self.in_flight.iter().map(|&(_, _, b)| b).sum()
+    }
+}
+
+fn pending_spill_bytes(inner: &Inner) -> u64 {
+    inner.host.as_ref().map_or(0, HostTier::pending_bytes)
+}
+
 /// A published boundary's sliding-window snapshot buffer.
 struct Snap {
-    va: u64,
+    /// Monotonic identity: a spilled snapshot has no device VA to be keyed by.
+    id: u64,
+    store: SnapStore,
     bytes: u64,
     rows: u32,
     tail: Vec<u32>,
@@ -1061,6 +1169,26 @@ struct Snap {
     prompt_rows: u32,
     /// Published at a prompt's shared-prefix end ([`VmmKv::share_rows`]): seen on two prompts.
     share: bool,
+}
+
+impl SnapStore {
+    /// The device buffer while one exists (a spilling snapshot's is still complete).
+    fn device_va(self) -> Option<u64> {
+        match self {
+            SnapStore::Device(va) | SnapStore::Spilling { va, .. } => Some(va),
+            SnapStore::Host(_) => None,
+        }
+    }
+}
+
+impl Snap {
+    fn device_va(&self) -> Option<u64> {
+        self.store.device_va()
+    }
+
+    fn spilling(&self) -> bool {
+        matches!(self.store, SnapStore::Spilling { .. })
+    }
 }
 
 struct Inner {
@@ -1148,6 +1276,9 @@ struct Inner {
     /// Bytes of zero-ref blocks handed to the reclaimer thread ([`Job::Release`]) so far:
     /// released, but not yet visible to [`VmmOps::free_bytes`] (`trim_cache`).
     release_queued: u64,
+    /// [`VmmKv::enable_host_tier`]: `None` = evicted snapshots are freed.
+    host: Option<HostTier>,
+    next_snap_id: u64,
 }
 
 enum PublishLocked {
@@ -1176,6 +1307,9 @@ struct Shared {
     admission_wait_us: AtomicU64,
     /// Signalled by [`copy_out`] whenever `copying[seq]` or `copy_reading[seq]` clears.
     copy_cv: parking_lot::Condvar,
+    /// Wakes `vmm-host-tier` ([`host_tier_grow`]) when a slot is taken or at shutdown.
+    host_cv: parking_lot::Condvar,
+    host_stop: std::sync::atomic::AtomicBool,
     /// Max handles the reuse pool may hold (0 = pooling off, the default).
     /// Set once by [`VmmKv::enable_block_pool`]; atomic only so `deref_block`
     /// can read it without threading a config borrow through `Inner`.
@@ -1210,6 +1344,8 @@ pub struct VmmKv {
         Arc<std::sync::atomic::AtomicBool>,
         std::thread::JoinHandle<()>,
     )>,
+    /// [`Self::enable_host_tier`]'s chunk allocator thread.
+    host_join: Option<std::thread::JoinHandle<()>>,
 }
 
 impl VmmKv {
@@ -1317,6 +1453,8 @@ impl VmmKv {
             cache_min_free: AtomicU64::new(0),
             admission_wait_us: AtomicU64::new(5_000),
             copy_cv: parking_lot::Condvar::new(),
+            host_cv: parking_lot::Condvar::new(),
+            host_stop: std::sync::atomic::AtomicBool::new(false),
             pool_cap: AtomicU32::new(0),
             inner: Mutex::new(Inner {
                 tracks,
@@ -1350,6 +1488,8 @@ impl VmmKv {
                 recent: std::collections::VecDeque::new(),
                 share: vec![0; batch],
                 release_queued: 0,
+                host: None,
+                next_snap_id: 0,
             }),
             frontier: (0..batch).map(|_| AtomicU32::new(0)).collect(),
             generation: (0..batch).map(|_| AtomicU64::new(0)).collect(),
@@ -1363,6 +1503,7 @@ impl VmmKv {
             premap_tx: None,
             premap_join: None,
             precreate: None,
+            host_join: None,
         };
         {
             let mut inner = shared.inner.lock();
@@ -1529,6 +1670,49 @@ impl VmmKv {
         self.shared
             .cache_min_free
             .store(min_free_bytes, Ordering::Relaxed);
+    }
+
+    /// Spill evicted boundary snapshots to pinned host memory instead of freeing them, up
+    /// to `cap_bytes` in `slot_bytes` slots (the largest snapshot the engine publishes), and
+    /// restore them over PCIe when a prompt attaches to one. Pinned chunks grow on a
+    /// background thread a chunk ahead of demand; the first is allocated here, which also
+    /// proves the backend has a host tier. Off by default: every existing caller is unaffected.
+    pub fn enable_host_tier(&mut self, cap_bytes: u64, slot_bytes: u64) -> Result<()> {
+        let s = &self.shared;
+        let cap_slots = u32::try_from(cap_bytes / slot_bytes.max(1)).unwrap_or(u32::MAX);
+        if slot_bytes == 0 || cap_slots == 0 {
+            return Err(RuntimeError::Rejected(
+                "vmm: host tier smaller than one snapshot".into(),
+            ));
+        }
+        let chunk_slots = u32::try_from((HOST_CHUNK_BYTES / slot_bytes).max(1))
+            .unwrap_or(u32::MAX)
+            .min(cap_slots);
+        let mut tier = HostTier {
+            slot_bytes,
+            cap_slots,
+            chunk_slots,
+            chunks: Vec::new(),
+            slots: Vec::new(),
+            free: Vec::new(),
+            in_flight: std::collections::VecDeque::new(),
+        };
+        let bytes = tier.wants_chunk().expect("an empty tier wants a chunk");
+        let ptr = s.ops.host_tier_alloc(bytes)?;
+        tier.add_chunk(ptr, bytes);
+        {
+            let mut inner = s.inner.lock();
+            inner.stats.host_capacity_bytes = tier.slots.len() as u64 * slot_bytes;
+            inner.host = Some(tier);
+        }
+        let shared = Arc::clone(s);
+        self.host_join = Some(
+            std::thread::Builder::new()
+                .name("vmm-host-tier".into())
+                .spawn(move || host_tier_grow(&shared))
+                .map_err(|e| RuntimeError::Device(format!("vmm: spawn vmm-host-tier: {e}")))?,
+        );
+        Ok(())
     }
 
     /// Give memory back for an allocation outside this pool that failed for lack of it (a
@@ -1960,7 +2144,7 @@ impl VmmKv {
                         && prompt.get(start..snap.rows as usize) == Some(snap.tail.as_slice())
                         && chosen.is_none_or(|(_, _, rows)| snap.rows > rows)
                     {
-                        chosen = Some((blocks, BoundaryKey { node, va: snap.va }, snap.rows));
+                        chosen = Some((blocks, BoundaryKey { node, id: snap.id }, snap.rows));
                     }
                 }
             }
@@ -2008,17 +2192,42 @@ impl VmmKv {
             .get_mut(&snap_key.node)
             .unwrap()
             .iter_mut()
-            .find(|s| s.va == snap_key.va)
+            .find(|s| s.id == snap_key.id)
             .unwrap();
         snap.users += 1;
         snap.last_used = tick;
         snap.referenced = true;
         snap.reusable_prompt = true;
         snap.attaches += 1;
-        let attach = Attach {
+        let snap_bytes = snap.bytes;
+        let store = snap.store;
+        let mut restore = None;
+        match store {
+            SnapStore::Device(_) => {}
+            // The attach beats the spill: keep the device copy, give the slot back.
+            SnapStore::Spilling { va, slot, fence } => {
+                if let Err(error) = s.ops.fence_wait(fence) {
+                    tracing::warn!(error = %error, "vmm host tier: fence wait");
+                }
+                snap.store = SnapStore::Device(va);
+                let tier = inner.host.as_mut().expect("a spilling snapshot has a tier");
+                tier.forget_spill(snap_key.id);
+                tier.release_slot(slot);
+            }
+            SnapStore::Host(slot) => {
+                restore = Some(
+                    inner
+                        .host
+                        .as_ref()
+                        .expect("a host snapshot has a tier")
+                        .slots[slot as usize],
+                );
+            }
+        }
+        let mut attach = Attach {
             rows,
-            snap_va: snap.va,
-            snap_bytes: snap.bytes,
+            snap_va: store.device_va().unwrap_or(0),
+            snap_bytes,
             segments: Vec::new(),
         };
 
@@ -2115,6 +2324,59 @@ impl VmmKv {
         for &h in &frees {
             s.ops.release(h);
         }
+        // A host-resident snapshot comes back to a fresh device buffer here, with the lock
+        // released like the maps below (`alloc_snapshot` evicts on OOM under the lock; this
+        // snapshot's `users` keeps it out of the eviction). Failure is a miss: the window is
+        // unwound before any of `maps` landed and the snapshot is dropped.
+        if let Some(host_ptr) = restore {
+            match restore_snapshot(s, host_ptr, snap_bytes) {
+                Ok(va) => {
+                    let mut inner = s.inner.lock();
+                    let index = find_snap(&inner, snap_key.node, snap_key.id)
+                        .expect("a held snapshot cannot be evicted");
+                    let snap = &mut inner.published.get_mut(&snap_key.node).unwrap()[index];
+                    let SnapStore::Host(slot) = snap.store else {
+                        unreachable!("a held host snapshot cannot move");
+                    };
+                    snap.store = SnapStore::Device(va);
+                    inner.host.as_mut().unwrap().release_slot(slot);
+                    inner.stats.host_snapshots -= 1;
+                    inner.stats.host_snapshot_bytes -= snap_bytes;
+                    inner.stats.snapshot_bytes += snap_bytes;
+                    inner.stats.cache_bytes += snap_bytes;
+                    inner.stats.snapshots_restored += 1;
+                    attach.snap_va = va;
+                }
+                Err(error) => {
+                    tracing::warn!(error = %error, "vmm host tier: restore failed, attach is a miss");
+                    let unlanded: rustc_hash::FxHashSet<u64> =
+                        maps.iter().map(|&(va, _)| va).collect();
+                    let mut inner = s.inner.lock();
+                    let hashes = inner.seqs[seq].hashes.clone();
+                    let tokens = std::mem::take(&mut inner.seqs[seq].tokens);
+                    let orphans = unwind_attach(s, &mut inner, seq, pick, kvh, &unlanded);
+                    if let Some(index) = find_snap(&inner, snap_key.node, snap_key.id) {
+                        remove_snapshot(s, &mut inner, snap_key.node, index);
+                    }
+                    inner.stats.attach_hits -= 1;
+                    inner.stats.attach_misses += 1;
+                    inner.stats.tokens_attached -= rows as u64;
+                    inner.seqs[seq] = SlotSeq {
+                        hashes,
+                        prompt_rows: tokens.len(),
+                        tokens,
+                        held: 0,
+                        snapshot: None,
+                        ..Default::default()
+                    };
+                    drop(inner);
+                    for hnd in orphans {
+                        s.ops.release(hnd);
+                    }
+                    return Ok(None);
+                }
+            }
+        }
         // Map every granule, then grant access with ONE set_access per
         // contiguous VA run — set_access is the ~69 µs call, and consecutive
         // blocks of one (track, head) window are VA-adjacent, so an N-block
@@ -2148,36 +2410,10 @@ impl VmmKv {
             }
         }
         if let Some(e) = err {
-            // Unwind to an empty window. Unmap exactly what is mapped — the backend's unmap
-            // contract is exact mapped ranges (`device/cuda.rs`), never a blanket sweep: every
-            // slot of the window is mapped except the maps that never landed (`maps[mapped..]`),
-            // the kept blocks and the stale columns past the prefix included. Unmapped UNDER the
-            // lock, as `reclaim_stale` does, so the reclaimer and `ensure_rows` only ever see a
-            // slot mapped or empty; handles are released once the lock drops.
             let unlanded: rustc_hash::FxHashSet<u64> =
                 maps[mapped..].iter().map(|&(va, _)| va).collect();
             let mut inner = s.inner.lock();
-            inner.stats.blocks_shared_mapped -= (pick * inner.tracks.len() * kvh) as u64;
-            let mut orphans: Vec<u64> = Vec::new();
-            for t in 0..inner.tracks.len() {
-                for h in 0..s.geo.kvh_full {
-                    for k in 0..s.bph {
-                        let slot = slot_index(s, seq, h, k);
-                        if let Some(id) = take_slot(&mut inner, t, slot) {
-                            let va = slot_va(s, &inner.tracks[t], seq, h, k);
-                            if !unlanded.contains(&va) {
-                                s.ops.unmap(va, s.block_bytes);
-                            }
-                            if let Some(hnd) = unref_block(s, &mut inner, id) {
-                                orphans.push(hnd);
-                            }
-                        }
-                    }
-                }
-            }
-            inner.seq_blocks[seq] = 0;
-            s.frontier[seq].store(0, Ordering::Release);
-            release_prefix_hold(&mut inner, seq);
+            let orphans = unwind_attach(s, &mut inner, seq, pick, kvh, &unlanded);
             drop(inner);
             for hnd in orphans {
                 s.ops.release(hnd);
@@ -2618,7 +2854,8 @@ impl VmmKv {
                 .entry(Some((pid, idx as u32)))
                 .or_default()
                 .push(Snap {
-                    va,
+                    id: 0,
+                    store: SnapStore::Device(va),
                     bytes: chunk_bytes,
                     rows: fine_rows,
                     tail: Vec::new(),
@@ -3011,8 +3248,11 @@ fn publish_locked(
         snapshot
     } else {
         let va = snapshot.expect("preflight cannot commit a missing snapshot");
+        let id = inner.next_snap_id;
+        inner.next_snap_id += 1;
         inner.published.entry(bkey).or_default().push(Snap {
-            va,
+            id,
+            store: SnapStore::Device(va),
             bytes: snap_bytes,
             rows,
             tail: tail.to_vec(),
@@ -3074,7 +3314,10 @@ fn try_attach_fine(inner: &mut Inner, seq: usize, prompt: &[u32]) -> Result<Opti
             .get(&Some(m.placed[i]))
             .and_then(|v| v.first())
         {
-            Some(snap) => segments.push((snap.va, snap.bytes)),
+            Some(snap) => segments.push((
+                snap.device_va().expect("fine snapshots stay on device"),
+                snap.bytes,
+            )),
             None => break, // an evicted node: everything past it is untrusted, stop here
         }
     }
@@ -3120,6 +3363,267 @@ fn try_attach_fine(inner: &mut Inner, seq: usize, prompt: &[u32]) -> Result<Opti
     }))
 }
 
+/// Unwind a failed attach to an empty window. Unmap exactly what is mapped — the backend's
+/// unmap contract is exact mapped ranges (`device/cuda.rs`), never a blanket sweep: every
+/// slot of the window is mapped except the maps that never landed (`unlanded`), the kept
+/// blocks and the stale columns past the prefix included. Unmapped UNDER the lock, as
+/// `reclaim_stale` does, so the reclaimer and `ensure_rows` only ever see a slot mapped or
+/// empty; the returned handles are the caller's to release once the lock drops.
+fn unwind_attach(
+    s: &Shared,
+    inner: &mut Inner,
+    seq: usize,
+    pick: usize,
+    kvh: usize,
+    unlanded: &rustc_hash::FxHashSet<u64>,
+) -> Vec<u64> {
+    inner.stats.blocks_shared_mapped -= (pick * inner.tracks.len() * kvh) as u64;
+    let mut orphans: Vec<u64> = Vec::new();
+    for t in 0..inner.tracks.len() {
+        for h in 0..s.geo.kvh_full {
+            for k in 0..s.bph {
+                let slot = slot_index(s, seq, h, k);
+                if let Some(id) = take_slot(inner, t, slot) {
+                    let va = slot_va(s, &inner.tracks[t], seq, h, k);
+                    if !unlanded.contains(&va) {
+                        s.ops.unmap(va, s.block_bytes);
+                    }
+                    if let Some(hnd) = unref_block(s, inner, id) {
+                        orphans.push(hnd);
+                    }
+                }
+            }
+        }
+    }
+    inner.seq_blocks[seq] = 0;
+    s.frontier[seq].store(0, Ordering::Release);
+    release_prefix_hold(inner, seq);
+    orphans
+}
+
+/// A device buffer holding the snapshot at `host_ptr` (no lock held: `alloc_snapshot` takes it
+/// to evict on OOM). The copy is complete on return ([`VmmOps::copy_htod`]).
+fn restore_snapshot(s: &Shared, host_ptr: u64, bytes: u64) -> Result<u64> {
+    let va = alloc_snapshot(s, bytes)?;
+    if let Err(error) = s.ops.copy_htod(va, host_ptr, bytes) {
+        s.ops.free(va);
+        return Err(error);
+    }
+    Ok(va)
+}
+
+fn find_snap(inner: &Inner, node: Option<(u32, u32)>, id: u64) -> Option<usize> {
+    inner.published.get(&node)?.iter().position(|s| s.id == id)
+}
+
+/// Background growth of the host tier: one pinned chunk ahead of demand, never on the
+/// engine thread (a 1 GiB `cuMemHostAlloc` is 100 ms-class).
+fn host_tier_grow(s: &Shared) {
+    let mut inner = s.inner.lock();
+    loop {
+        if s.host_stop.load(Ordering::Acquire) {
+            return;
+        }
+        let Some(bytes) = inner.host.as_ref().and_then(HostTier::wants_chunk) else {
+            s.host_cv.wait(&mut inner);
+            continue;
+        };
+        drop(inner);
+        let chunk = s.ops.host_tier_alloc(bytes);
+        inner = s.inner.lock();
+        let Some(tier) = inner.host.as_mut() else {
+            return;
+        };
+        match chunk {
+            Ok(ptr) => {
+                tier.add_chunk(ptr, bytes);
+                let capacity = tier.slots.len() as u64 * tier.slot_bytes;
+                inner.stats.host_capacity_bytes = capacity;
+            }
+            Err(error) => {
+                tier.cap_slots = tier.slots.len() as u32;
+                tracing::warn!(
+                    error = %error,
+                    capacity_mib = inner.stats.host_capacity_bytes >> 20,
+                    "vmm host tier: pinned allocation failed, growth stopped"
+                );
+            }
+        }
+    }
+}
+
+/// Free the device buffers of spills whose copy retired, oldest first (one copy stream, in
+/// order: the first unfinished fence ends the scan).
+fn reap_spills(s: &Shared, inner: &mut Inner) {
+    while let Some(&(node, id, _)) = inner.host.as_ref().and_then(|t| t.in_flight.front()) {
+        let done = match find_snap(inner, node, id).map(|i| inner.published[&node][i].store) {
+            Some(SnapStore::Spilling { fence, .. }) => s.ops.fence_done(fence).unwrap_or(true),
+            // Removed, restored or un-spilled meanwhile: nothing to reap.
+            _ => true,
+        };
+        if !done {
+            return;
+        }
+        inner.host.as_mut().unwrap().in_flight.pop_front();
+        complete_spill(s, inner, node, id);
+    }
+}
+
+/// The spill's copy retired: free the device buffer, the snapshot is host-resident.
+fn complete_spill(s: &Shared, inner: &mut Inner, node: Option<(u32, u32)>, id: u64) {
+    let Some(index) = find_snap(inner, node, id) else {
+        return;
+    };
+    let snap = &mut inner.published.get_mut(&node).unwrap()[index];
+    let SnapStore::Spilling { va, slot, .. } = snap.store else {
+        return;
+    };
+    snap.store = SnapStore::Host(slot);
+    let bytes = snap.bytes;
+    s.ops.free(va);
+    inner.stats.snapshot_bytes -= bytes;
+    inner.stats.cache_bytes -= bytes;
+    inner.stats.host_snapshots += 1;
+    inner.stats.host_snapshot_bytes += bytes;
+}
+
+/// Block on the oldest spill and free its device buffer: the trim loop needs bytes now.
+fn finish_oldest_spill(s: &Shared, inner: &mut Inner) -> bool {
+    while let Some((node, id, _)) = inner.host.as_mut().and_then(|t| t.in_flight.pop_front()) {
+        let Some(index) = find_snap(inner, node, id) else {
+            continue;
+        };
+        let SnapStore::Spilling { fence, .. } = inner.published[&node][index].store else {
+            continue;
+        };
+        if let Err(error) = s.ops.fence_wait(fence) {
+            tracing::warn!(error = %error, "vmm host tier: fence wait");
+        }
+        complete_spill(s, inner, node, id);
+        return true;
+    }
+    false
+}
+
+/// Queue the D2H copy of a device snapshot into a free host slot. `false` = not spilled
+/// (no tier, no free slot, too large, or the copy was refused): the caller frees it instead.
+fn spill_snapshot(s: &Shared, inner: &mut Inner, node: Option<(u32, u32)>, index: usize) -> bool {
+    let Inner {
+        host, published, ..
+    } = inner;
+    let Some(tier) = host.as_mut() else {
+        return false;
+    };
+    let snap = &mut published.get_mut(&node).unwrap()[index];
+    let SnapStore::Device(va) = snap.store else {
+        return false;
+    };
+    if snap.bytes > tier.slot_bytes {
+        return false;
+    }
+    let Some(slot) = tier.free.pop() else {
+        return false;
+    };
+    match s
+        .ops
+        .copy_dtoh_async(tier.slots[slot as usize], va, snap.bytes)
+    {
+        Ok(fence) => {
+            snap.store = SnapStore::Spilling { va, slot, fence };
+            tier.in_flight.push_back((node, snap.id, snap.bytes));
+            if tier.wants_chunk().is_some() {
+                s.host_cv.notify_one();
+            }
+            inner.stats.snapshots_spilled += 1;
+            true
+        }
+        Err(error) => {
+            tier.release_slot(slot);
+            tracing::warn!(error = %error, "vmm host tier: spill refused, freeing the snapshot");
+            false
+        }
+    }
+}
+
+/// The host-resident snapshot to evict when the tier is full: the least recently used one.
+fn host_lru(inner: &Inner, protected: Option<u64>) -> Option<(Option<(u32, u32)>, usize)> {
+    inner
+        .published
+        .iter()
+        .flat_map(|(&node, snaps)| {
+            snaps
+                .iter()
+                .enumerate()
+                .map(move |(i, snap)| (node, i, snap))
+        })
+        .filter(|(_, _, snap)| {
+            snap.users == 0
+                && matches!(snap.store, SnapStore::Host(_))
+                && Some(snap.id) != protected
+        })
+        .min_by_key(|(_, _, snap)| snap.last_used)
+        .map(|(node, i, _)| (node, i))
+}
+
+/// Evict the unit at `(node, index)` as `evict_one` does: the snapshot and the blocks only
+/// it kept attachable.
+fn evict_unit(s: &Shared, inner: &mut Inner, node: Option<(u32, u32)>, index: usize) {
+    let before = inner.stats.cache_bytes;
+    remove_snapshot(s, inner, node, index);
+    let mut blocks = 0;
+    while evict_dead_leaf(s, inner) {
+        blocks += 1;
+    }
+    inner.stats.eviction_units += 1;
+    inner.stats.eviction_unit_bytes += before - inner.stats.cache_bytes;
+    tracing::debug!(
+        freed = before - inner.stats.cache_bytes,
+        blocks,
+        "vmm prefix eviction unit"
+    );
+}
+
+/// Spill the chosen device snapshot instead of freeing it. At the in-flight cap the oldest
+/// spill is finished instead (its device bytes come free now); a full tier first evicts its
+/// LRU snapshot entirely. `false` = not handled: evict as before.
+fn spill_unit(
+    s: &Shared,
+    inner: &mut Inner,
+    node: Option<(u32, u32)>,
+    index: usize,
+    protected: Option<u64>,
+) -> bool {
+    let Some(tier) = inner.host.as_ref() else {
+        return false;
+    };
+    let snap = &inner.published[&node][index];
+    if !matches!(snap.store, SnapStore::Device(_)) {
+        return false;
+    }
+    if snap.bytes > tier.slot_bytes {
+        inner.stats.spill_fallbacks += 1;
+        return false;
+    }
+    if tier.in_flight.len() >= SPILL_INFLIGHT {
+        return finish_oldest_spill(s, inner);
+    }
+    let id = snap.id;
+    if tier.free.is_empty() {
+        if let Some((hn, hi)) = host_lru(inner, protected) {
+            evict_unit(s, inner, hn, hi);
+        }
+    }
+    // The host eviction may have reordered this node's list.
+    let Some(index) = find_snap(inner, node, id) else {
+        return true;
+    };
+    if spill_snapshot(s, inner, node, index) {
+        return true;
+    }
+    inner.stats.spill_fallbacks += 1;
+    false
+}
+
 fn stats_of(s: &Shared) -> VmmStats {
     let inner = s.inner.lock();
     let mut out = inner.stats;
@@ -3143,6 +3647,11 @@ impl Drop for VmmKv {
             stop.store(true, Ordering::Release);
             let _ = j.join();
         }
+        if let Some(j) = self.host_join.take() {
+            self.shared.host_stop.store(true, Ordering::Release);
+            self.shared.host_cv.notify_all();
+            let _ = j.join();
+        }
         let s = &self.shared;
         let mut inner = s.inner.lock();
         for seq in 0..s.geo.batch as usize {
@@ -3155,12 +3664,27 @@ impl Drop for VmmKv {
         }
         for (_, snapshots) in std::mem::take(&mut inner.published) {
             for snap in snapshots {
-                s.ops.free(snap.va);
+                match snap.store {
+                    SnapStore::Device(va) => s.ops.free(va),
+                    SnapStore::Spilling { va, fence, .. } => {
+                        let _ = s.ops.fence_wait(fence);
+                        s.ops.free(va);
+                    }
+                    SnapStore::Host(_) => {}
+                }
+            }
+        }
+        if let Some(tier) = inner.host.take() {
+            for (ptr, bytes) in tier.chunks {
+                s.ops.host_tier_free(ptr, bytes);
             }
         }
         inner.stats.cache_blocks = 0;
         inner.stats.cache_bytes = 0;
         inner.stats.snapshot_bytes = 0;
+        inner.stats.host_snapshots = 0;
+        inner.stats.host_snapshot_bytes = 0;
+        inner.stats.host_capacity_bytes = 0;
         for handle in std::mem::take(&mut inner.pooled) {
             s.ops.release(handle);
         }
@@ -3394,6 +3918,7 @@ fn install_block(inner: &mut Inner, block: Block) -> u32 {
 }
 
 fn trim_cache(s: &Shared, inner: &mut Inner) {
+    reap_spills(s, inner);
     let min_free = s.cache_min_free.load(Ordering::Relaxed);
     if min_free > 0 {
         if let Some(mut free) = s.ops.free_bytes() {
@@ -3404,7 +3929,7 @@ fn trim_cache(s: &Shared, inner: &mut Inner) {
             // them, or one floor flushes every prefix the thread has not caught up with.
             // (Pooled blocks are not free and not credited; the pool cap bounds them.)
             let queued = inner.release_queued;
-            while free + (inner.release_queued - queued) < min_free {
+            while free + (inner.release_queued - queued) + pending_spill_bytes(inner) < min_free {
                 if !evict_one(s, inner, true) {
                     break;
                 }
@@ -3413,7 +3938,13 @@ fn trim_cache(s: &Shared, inner: &mut Inner) {
             return;
         }
     }
-    while s.cache_cap > 0 && inner.stats.cache_bytes > s.cache_cap {
+    while s.cache_cap > 0
+        && inner
+            .stats
+            .cache_bytes
+            .saturating_sub(pending_spill_bytes(inner))
+            > s.cache_cap
+    {
         if !evict_one(s, inner, true) {
             break;
         }
@@ -3427,7 +3958,7 @@ fn release_snapshot_hold(inner: &mut Inner, seq: usize) {
             .get_mut(&key.node)
             .unwrap()
             .iter_mut()
-            .find(|snap| snap.va == key.va)
+            .find(|snap| snap.id == key.id)
             .unwrap();
         snap.users -= 1;
     }
@@ -3457,10 +3988,35 @@ fn release_prefix_hold(inner: &mut Inner, seq: usize) {
 
 fn free_snapshot(s: &Shared, inner: &mut Inner, snap: Snap) {
     assert_eq!(snap.users, 0, "evicting an in-flight snapshot");
-    inner.stats.snapshot_bytes -= snap.bytes;
-    inner.stats.cache_bytes -= snap.bytes;
     inner.stats.snapshots_evicted += 1;
-    s.ops.free(snap.va);
+    match snap.store {
+        SnapStore::Device(va) => {
+            inner.stats.snapshot_bytes -= snap.bytes;
+            inner.stats.cache_bytes -= snap.bytes;
+            s.ops.free(va);
+        }
+        // The copy still reads `va`: retire it before freeing either side.
+        SnapStore::Spilling { va, slot, fence } => {
+            if let Err(error) = s.ops.fence_wait(fence) {
+                tracing::warn!(error = %error, "vmm host tier: fence wait");
+            }
+            inner.stats.snapshot_bytes -= snap.bytes;
+            inner.stats.cache_bytes -= snap.bytes;
+            s.ops.free(va);
+            if let Some(tier) = inner.host.as_mut() {
+                tier.forget_spill(snap.id);
+                tier.release_slot(slot);
+            }
+        }
+        SnapStore::Host(slot) => {
+            inner.stats.host_snapshots -= 1;
+            inner.stats.host_snapshot_bytes -= snap.bytes;
+            inner.stats.host_evictions += 1;
+            if let Some(tier) = inner.host.as_mut() {
+                tier.release_slot(slot);
+            }
+        }
+    }
 }
 
 /// Fine-cache eviction ([`VmmKv::enable_fine_matching`]): the cheapest tier, no physical
@@ -3518,6 +4074,11 @@ fn evict_dead_leaf(s: &Shared, inner: &mut Inner) -> bool {
 /// pinned.
 fn evict_one(s: &Shared, inner: &mut Inner, preserve_hot: bool) -> bool {
     cache_changed(s);
+    reap_spills(s, inner);
+    // An allocation that failed (not a trim) needs bytes now: a queued spill is the cheapest.
+    if !preserve_hot && finish_oldest_spill(s, inner) {
+        return true;
+    }
     if evict_one_fine(s, inner) {
         return true;
     }
@@ -3556,7 +4117,7 @@ fn evict_one(s: &Shared, inner: &mut Inner, preserve_hot: bool) -> bool {
                 && (!snap.session || snap.tail.is_empty() || snap.attaches >= 2)
         })
         .max_by_key(|snap| snap.last_used)
-        .map(|snap| snap.va);
+        .map(|snap| snap.id);
     // One unit: the LRU boundary (a session's newest, after `retire_superseded`) and the
     // blocks that become dead with it. A session's boundary its next turn already attached
     // goes first (spent: that turn runs now; `retire_superseded` frees it at the turn's prompt
@@ -3584,7 +4145,9 @@ fn evict_one(s: &Shared, inner: &mut Inner, preserve_hot: bool) -> bool {
                 (node, i, snap, pin, !spent)
             })
         })
-        .filter(|(_, _, snap, ..)| snap.users == 0 && Some(snap.va) != protected)
+        .filter(|(_, _, snap, ..)| {
+            snap.users == 0 && !snap.spilling() && Some(snap.id) != protected
+        })
         .min_by_key(|(_, _, snap, pin, rank)| {
             (
                 snap.attaches >= 2,
@@ -3595,19 +4158,14 @@ fn evict_one(s: &Shared, inner: &mut Inner, preserve_hot: bool) -> bool {
         })
         .map(|(node, index, ..)| (node, index))
     {
-        let before = inner.stats.cache_bytes;
-        remove_snapshot(s, inner, node, index);
-        let mut blocks = 0;
-        while evict_dead_leaf(s, inner) {
-            blocks += 1;
+        if spill_unit(s, inner, node, index, protected) {
+            return true;
         }
-        inner.stats.eviction_units += 1;
-        inner.stats.eviction_unit_bytes += before - inner.stats.cache_bytes;
-        tracing::debug!(
-            freed = before - inner.stats.cache_bytes,
-            blocks,
-            "vmm prefix eviction unit"
-        );
+        evict_unit(s, inner, node, index);
+        return true;
+    }
+    // Everything left is held or spilling: a finished spill is the bytes to give back.
+    if finish_oldest_spill(s, inner) {
         return true;
     }
     let Some(key) = inner.cache.evict_lru() else {
@@ -3620,8 +4178,8 @@ fn evict_one(s: &Shared, inner: &mut Inner, preserve_hot: bool) -> bool {
                     .enumerate()
                     .map(move |(i, snap)| (node, i, snap))
             })
-            .filter(|(_, _, snap)| snap.users == 0)
-            .min_by_key(|(_, _, snap)| (Some(snap.va) == protected, snap.last_used))
+            .filter(|(_, _, snap)| snap.users == 0 && !snap.spilling())
+            .min_by_key(|(_, _, snap)| (Some(snap.id) == protected, snap.last_used))
             .map(|(node, index, _)| (node, index))
         else {
             return false;
@@ -3630,9 +4188,12 @@ fn evict_one(s: &Shared, inner: &mut Inner, preserve_hot: bool) -> bool {
         // snapshot until retirement, but allow OOM reclamation to remove it.
         if preserve_hot
             && inner.stats.cache_blocks > 0
-            && Some(inner.published[&node][index].va) == protected
+            && Some(inner.published[&node][index].id) == protected
         {
             return false;
+        }
+        if spill_unit(s, inner, node, index, None) {
+            return true;
         }
         remove_snapshot(s, inner, node, index);
         return true;
@@ -5078,11 +5639,45 @@ mod tests {
         /// default) reproduces every real backend today: pressure mode reports
         /// "unsupported" and `trim_cache` falls back to `cache_cap`.
         free_bytes: std::sync::Mutex<Option<u64>>,
+        /// Host tier: pinned chunks as byte vectors behind fake pointers, the device byte
+        /// store spills copy through (`alloc` zero-fills, `copy_htod`/`copy_dtoh_async` copy
+        /// for real), outstanding fences, and `hold_fences` keeps `fence_done` false so a
+        /// test can see the spill in flight.
+        host: std::sync::Mutex<Vec<(u64, Vec<u8>)>>,
+        dev: std::sync::Mutex<std::collections::HashMap<u64, Vec<u8>>>,
+        fences: std::sync::Mutex<std::collections::HashSet<u64>>,
+        hold_fences: std::sync::atomic::AtomicBool,
+        fail_host_allocs: AtomicI64,
+        host_allocs: AtomicU64,
+        host_frees: AtomicU64,
+        fence_waits: AtomicU64,
+        fences_max: AtomicU64,
     }
 
     static MODEL_DRIVER: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     impl MockVmm {
+        fn dev_write(&self, va: u64, bytes: &[u8]) {
+            let mut dev = self.dev.lock().unwrap();
+            let buf = dev.get_mut(&va).expect("write to a live device buffer");
+            buf[..bytes.len()].copy_from_slice(bytes);
+        }
+
+        fn dev_read(&self, va: u64) -> Vec<u8> {
+            self.dev.lock().unwrap()[&va].clone()
+        }
+
+        fn host_slice(&self, ptr: u64, bytes: u64) -> std::ops::Range<usize> {
+            let host = self.host.lock().unwrap();
+            let (base, chunk) = host
+                .iter()
+                .find(|(base, chunk)| *base <= ptr && ptr + bytes <= *base + chunk.len() as u64)
+                .expect("host pointer inside a pinned chunk");
+            let off = (ptr - base) as usize;
+            let _ = chunk;
+            off..off + bytes as usize
+        }
+
         /// ROCr's shape: vmem calls serialize process-wide, D2D copies do not.
         fn lag(&self, which: usize) {
             let us = self.lat_us[which].load(Ordering::Relaxed);
@@ -5173,12 +5768,81 @@ mod tests {
             self.accesses.fetch_add(1, Ordering::SeqCst);
             Ok(())
         }
-        fn alloc(&self, _bytes: u64) -> Result<u64> {
+        fn alloc(&self, bytes: u64) -> Result<u64> {
             self.allocs.fetch_add(1, Ordering::SeqCst);
-            Ok(self.next.fetch_add(1, Ordering::SeqCst))
+            let va = self.next.fetch_add(1, Ordering::SeqCst);
+            self.dev.lock().unwrap().insert(va, vec![0; bytes as usize]);
+            Ok(va)
         }
-        fn free(&self, _va: u64) {
+        fn free(&self, va: u64) {
             self.frees.fetch_add(1, Ordering::SeqCst);
+            self.dev.lock().unwrap().remove(&va);
+        }
+        fn host_tier_alloc(&self, bytes: u64) -> Result<u64> {
+            if self.fail_host_allocs.fetch_sub(1, Ordering::SeqCst) > 0 {
+                return Err(RuntimeError::Rejected("mock: no host tier".into()));
+            }
+            self.fail_host_allocs.fetch_add(1, Ordering::SeqCst);
+            let n = self.host_allocs.fetch_add(1, Ordering::SeqCst) + 1;
+            let ptr = n << 40;
+            self.host
+                .lock()
+                .unwrap()
+                .push((ptr, vec![0; bytes as usize]));
+            Ok(ptr)
+        }
+        fn host_tier_free(&self, ptr: u64, _bytes: u64) {
+            self.host_frees.fetch_add(1, Ordering::SeqCst);
+            self.host.lock().unwrap().retain(|(base, _)| *base != ptr);
+        }
+        fn copy_dtoh_async(&self, host_ptr: u64, va: u64, bytes: u64) -> Result<u64> {
+            let range = self.host_slice(host_ptr, bytes);
+            let src = self.dev_read(va);
+            let mut host = self.host.lock().unwrap();
+            let (_, chunk) = host
+                .iter_mut()
+                .find(|(base, chunk)| *base <= host_ptr && host_ptr < *base + chunk.len() as u64)
+                .unwrap();
+            chunk[range].copy_from_slice(&src[..bytes as usize]);
+            let fence = self.next.fetch_add(1, Ordering::SeqCst);
+            let mut fences = self.fences.lock().unwrap();
+            fences.insert(fence);
+            self.fences_max
+                .fetch_max(fences.len() as u64, Ordering::SeqCst);
+            Ok(fence)
+        }
+        fn fence_done(&self, fence: u64) -> Result<bool> {
+            if self.hold_fences.load(Ordering::SeqCst) {
+                return Ok(false);
+            }
+            if self.fences.lock().unwrap().remove(&fence) {
+                Ok(true)
+            } else {
+                Err(RuntimeError::Device("mock: unknown fence".into()))
+            }
+        }
+        fn fence_wait(&self, fence: u64) -> Result<()> {
+            self.fence_waits.fetch_add(1, Ordering::SeqCst);
+            if self.fences.lock().unwrap().remove(&fence) {
+                Ok(())
+            } else {
+                Err(RuntimeError::Device("mock: unknown fence".into()))
+            }
+        }
+        fn copy_htod(&self, va: u64, host_ptr: u64, bytes: u64) -> Result<()> {
+            let range = self.host_slice(host_ptr, bytes);
+            let src = {
+                let host = self.host.lock().unwrap();
+                let (_, chunk) = host
+                    .iter()
+                    .find(|(base, chunk)| {
+                        *base <= host_ptr && host_ptr < *base + chunk.len() as u64
+                    })
+                    .unwrap();
+                chunk[range].to_vec()
+            };
+            self.dev_write(va, &src);
+            Ok(())
         }
         fn copy_dtod(&self, _dst: u64, src: u64, _bytes: u64) -> Result<()> {
             let hook = self.copy_hook.lock().unwrap().take();
@@ -7174,6 +7838,248 @@ mod tests {
         assert_eq!(ops.frees.load(Ordering::SeqCst), 1);
     }
 
+    /// `pool_with_cap` plus a host tier of `slots` slots of `slot_bytes`.
+    fn host_pool(ops: Arc<MockVmm>, cache_cap: u64, slots: u64, slot_bytes: u64) -> VmmKv {
+        let mut p = pool_with_cap(ops, cache_cap);
+        p.enable_host_tier(slots * slot_bytes, slot_bytes).unwrap();
+        p
+    }
+
+    /// Publish a 17-token prompt (`tokens[0] = first`) at row 12: one shared block (128 B)
+    /// plus a 192-byte tailed snapshot filled with `byte`. `session` marks it a session's.
+    fn publish_tailed(
+        p: &VmmKv,
+        ops: &MockVmm,
+        seq: usize,
+        first: u32,
+        byte: u8,
+        session: bool,
+    ) -> Vec<u32> {
+        let mut tokens = prompt(17);
+        tokens[0] = first;
+        p.try_attach(seq, &tokens).unwrap();
+        p.ensure_rows(seq, 17).unwrap();
+        if session {
+            p.note_session(seq, &tokens);
+        }
+        p.publish_at(seq, &tokens, 12, 192, |va| {
+            ops.dev_write(va, &[byte; 192]);
+            Ok(())
+        })
+        .unwrap();
+        p.begin_seq(seq);
+        tokens
+    }
+
+    /// Cap pressure spills the LRU snapshot to the host tier instead of freeing it: device
+    /// snapshot bytes drop, host bytes rise, the node and its blocks stay, and the boundary
+    /// still counts as cached.
+    #[test]
+    fn host_tier_spills_the_evicted_snapshot_instead_of_freeing_it() {
+        let ops = Arc::new(MockVmm::default());
+        let p = host_pool(ops.clone(), 448, 2, 192);
+        let a = publish_tailed(&p, &ops, 0, 10, 0xA1, false);
+        assert_eq!(p.stats().cache_bytes, 320);
+        let b = publish_tailed(&p, &ops, 0, 20, 0xB2, false);
+        // The trim queued a's spill and credited it; the next trim reaps the fence.
+        assert_eq!(p.stats().snapshots_spilled, 1);
+        p.begin_seq(1);
+        let s = p.stats();
+        assert_eq!(s.snapshots_evicted, 0);
+        assert_eq!(s.host_snapshots, 1);
+        assert_eq!(s.host_snapshot_bytes, 192);
+        assert_eq!(s.snapshot_bytes, 192, "only b's snapshot is on the device");
+        assert_eq!(
+            s.cache_bytes, 448,
+            "a's block stays: the node is still attachable"
+        );
+        assert_eq!(s.cache_blocks, 4);
+        assert_eq!(s.host_capacity_bytes, 384);
+        assert_eq!(
+            ops.frees.load(Ordering::SeqCst),
+            1,
+            "a's device buffer freed after the fence"
+        );
+        assert_eq!(p.cached_rows(&a), 12);
+        assert_eq!(p.cached_rows(&b), 12);
+    }
+
+    /// An attach to a host-resident boundary restores it to a fresh device buffer with the
+    /// published bytes, and the slot goes back to the tier.
+    #[test]
+    fn attach_restores_a_host_snapshot_byte_for_byte() {
+        let ops = Arc::new(MockVmm::default());
+        let p = host_pool(ops.clone(), 448, 2, 192);
+        let a = publish_tailed(&p, &ops, 0, 10, 0xA1, false);
+        let _b = publish_tailed(&p, &ops, 0, 20, 0xB2, false);
+        p.begin_seq(1);
+        assert_eq!(p.stats().host_snapshots, 1);
+        let hit = p.try_attach(1, &a).unwrap().unwrap();
+        assert_eq!(hit.rows, 12);
+        assert_eq!(hit.snap_bytes, 192);
+        assert_eq!(ops.dev_read(hit.snap_va), vec![0xA1; 192]);
+        let s = p.stats();
+        assert_eq!(s.snapshots_restored, 1);
+        assert_eq!(s.host_snapshots, 0);
+        assert_eq!(s.host_snapshot_bytes, 0);
+        assert_eq!(s.snapshot_bytes, 384);
+        assert_eq!(s.attach_hits, 1);
+        p.finish_attach(1);
+        p.begin_seq(1);
+        // Over the cap again: b (not the just-reused a) spills into the freed slot.
+        let s = p.stats();
+        assert_eq!(s.snapshots_spilled, 2);
+        assert_eq!(s.host_snapshots, 1);
+        assert_eq!(s.spill_fallbacks, 0);
+        assert_eq!(ops.dev_read(hit.snap_va), vec![0xA1; 192]);
+    }
+
+    /// A full host tier evicts its least recently used snapshot entirely (slot, node, dead
+    /// blocks) before the next spill takes the slot; it never piles up beyond the cap.
+    #[test]
+    fn full_host_tier_evicts_its_lru_snapshot_before_spilling_more() {
+        let ops = Arc::new(MockVmm::default());
+        let p = host_pool(ops.clone(), 448, 1, 192);
+        let a = publish_tailed(&p, &ops, 0, 10, 0xA1, false);
+        let b = publish_tailed(&p, &ops, 0, 20, 0xB2, true);
+        p.begin_seq(1);
+        assert_eq!(p.stats().host_snapshots, 1, "a holds the single slot");
+        // b attached once by its session is spent: it ranks before a for eviction.
+        assert_eq!(p.try_attach(1, &b).unwrap().unwrap().rows, 12);
+        p.finish_attach(1);
+        p.begin_seq(1);
+        let c = publish_tailed(&p, &ops, 0, 30, 0xC3, false);
+        p.begin_seq(1);
+        let s = p.stats();
+        assert_eq!(s.host_evictions, 1, "a left the tier");
+        assert_eq!(s.snapshots_spilled, 2, "b took its slot");
+        assert_eq!(s.host_snapshots, 1);
+        assert_eq!(s.snapshot_bytes, 192, "c is the only device snapshot");
+        assert_eq!(s.cache_bytes, 448, "a's block went with it");
+        assert_eq!(p.cached_rows(&a), 0);
+        assert_eq!(p.cached_rows(&b), 12);
+        assert_eq!(p.cached_rows(&c), 12);
+    }
+
+    /// A snapshot a request is restoring from (`users > 0`) is never spilled: its device
+    /// buffer is being read.
+    #[test]
+    fn an_attached_snapshot_is_never_spilled() {
+        let ops = Arc::new(MockVmm::default());
+        let p = host_pool(ops.clone(), 448, 4, 192);
+        let a = publish_tailed(&p, &ops, 0, 10, 0xA1, false);
+        let hit = p.try_attach(1, &a).unwrap().unwrap();
+        let _b = publish_tailed(&p, &ops, 0, 20, 0xB2, false);
+        p.release_prefix(0);
+        let s = p.stats();
+        assert_eq!(s.snapshots_spilled, 1);
+        assert_eq!(s.host_snapshots, 1, "b spilled, not a");
+        assert_eq!(s.snapshot_bytes, 192);
+        assert_eq!(ops.dev_read(hit.snap_va), vec![0xA1; 192]);
+        p.finish_attach(1);
+        assert_eq!(p.try_attach(0, &a).unwrap().unwrap().snap_va, hit.snap_va);
+        assert_eq!(p.stats().snapshots_restored, 0);
+    }
+
+    /// `retire_superseded` frees a host-resident snapshot's slot like a device one's buffer.
+    #[test]
+    fn retire_superseded_frees_a_host_slot() {
+        let ops = Arc::new(MockVmm::default());
+        let p = host_pool(ops.clone(), 448, 1, 192);
+        let a = publish_tailed(&p, &ops, 0, 10, 0xA1, true);
+        let _b = publish_tailed(&p, &ops, 0, 20, 0xB2, false);
+        p.begin_seq(1);
+        assert_eq!(p.stats().host_snapshots, 1);
+        let mut next = prompt(24);
+        next[0] = 10;
+        assert_eq!(p.retire_superseded(&next, 20), 192);
+        let s = p.stats();
+        assert_eq!(s.host_snapshots, 0);
+        assert_eq!(s.host_snapshot_bytes, 0);
+        assert_eq!(s.host_evictions, 1);
+        assert_eq!(s.snapshots_evicted, 1);
+        assert_eq!(p.cached_rows(&a), 0);
+        // The slot is reusable.
+        let _c = publish_tailed(&p, &ops, 0, 30, 0xC3, false);
+        p.begin_seq(1);
+        assert_eq!(p.stats().host_snapshots, 1);
+        assert_eq!(p.stats().spill_fallbacks, 0);
+    }
+
+    /// A snapshot larger than a slot is freed as before and counted as a fallback; a
+    /// backend without pinned memory cannot enable the tier at all.
+    #[test]
+    fn host_tier_falls_back_to_freeing_when_it_cannot_take_a_snapshot() {
+        let ops = Arc::new(MockVmm::default());
+        let p = host_pool(ops.clone(), 448, 4, 64);
+        let a = publish_tailed(&p, &ops, 0, 10, 0xA1, false);
+        let _b = publish_tailed(&p, &ops, 0, 20, 0xB2, false);
+        let s = p.stats();
+        assert_eq!(s.spill_fallbacks, 1);
+        assert_eq!(s.snapshots_spilled, 0);
+        assert_eq!(s.snapshots_evicted, 1);
+        assert_eq!(s.host_snapshots, 0);
+        assert_eq!(p.cached_rows(&a), 0);
+        assert_eq!(ops.frees.load(Ordering::SeqCst), 1);
+
+        let ops = Arc::new(MockVmm::default());
+        ops.fail_host_allocs.store(1, Ordering::SeqCst);
+        let mut p = pool_with_cap(ops.clone(), 448);
+        assert!(p.enable_host_tier(4 * 192, 192).is_err());
+        let _a = publish_tailed(&p, &ops, 0, 10, 0xA1, false);
+        let _b = publish_tailed(&p, &ops, 0, 20, 0xB2, false);
+        assert_eq!(p.stats().snapshots_evicted, 1);
+        assert_eq!(p.stats().snapshots_spilled, 0);
+    }
+
+    /// With copies still in flight: the trim credits them and returns without waiting, the
+    /// in-flight cap forces a wait on the oldest, and an attach to a spilling boundary keeps
+    /// the device copy (no restore) and hands the slot back.
+    #[test]
+    fn spills_in_flight_are_credited_capped_and_unspilled_by_an_attach() {
+        let ops = Arc::new(MockVmm::default());
+        ops.hold_fences.store(true, Ordering::SeqCst);
+        let p = host_pool(ops.clone(), 448, 8, 192);
+        let a = publish_tailed(&p, &ops, 0, 10, 0xA1, false);
+        let _b = publish_tailed(&p, &ops, 0, 20, 0xB2, false);
+        p.begin_seq(1);
+        let s = p.stats();
+        assert_eq!(s.snapshots_spilled, 1);
+        assert_eq!(s.host_snapshots, 0, "the fence is still pending");
+        assert_eq!(
+            s.snapshot_bytes, 384,
+            "the device buffer outlives the fence"
+        );
+        assert_eq!(
+            ops.fence_waits.load(Ordering::SeqCst),
+            0,
+            "a trim never waits"
+        );
+        assert_eq!(p.cached_rows(&a), 12);
+
+        let hit = p.try_attach(1, &a).unwrap().unwrap();
+        assert_eq!(ops.fence_waits.load(Ordering::SeqCst), 1);
+        assert_eq!(ops.dev_read(hit.snap_va), vec![0xA1; 192]);
+        let s = p.stats();
+        assert_eq!(s.snapshots_restored, 0);
+        assert_eq!(s.host_snapshots, 0);
+        p.finish_attach(1);
+        p.begin_seq(1);
+
+        for (i, first) in (30..).step_by(10).take(6).enumerate() {
+            let _ = publish_tailed(&p, &ops, 0, first, 0xC0 + i as u8, false);
+        }
+        assert!(ops.fences_max.load(Ordering::SeqCst) <= SPILL_INFLIGHT as u64);
+        assert!(
+            ops.fence_waits.load(Ordering::SeqCst) > 1,
+            "the cap waited on the oldest"
+        );
+        ops.hold_fences.store(false, Ordering::SeqCst);
+        p.begin_seq(1);
+        assert!(p.stats().host_snapshots > 0);
+        assert_eq!(ops.fences.lock().unwrap().len(), 0, "every fence retired");
+    }
+
     /// Sub-`block_rows` matching ([`VmmKv::enable_fine_matching`]) — the direct test for
     /// design-review-vllm-throughput.md §7's cross-conversation system-prompt case. Two
     /// sequences share the first `fine_rows`-multiple depth of their content and diverge
@@ -7671,7 +8577,7 @@ mod tests {
         let inner = p.shared.inner.lock();
         assert!(inner.published[&None]
             .iter()
-            .any(|snap| snap.va == hit.snap_va && snap.users == 1));
+            .any(|snap| snap.device_va() == Some(hit.snap_va) && snap.users == 1));
         drop(inner);
         p.finish_attach(1);
         p.release_prefix(1);
