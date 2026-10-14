@@ -1734,6 +1734,11 @@ pub struct AmdRuntimeConfig {
     #[arg(long = "amd-mixed-ride-trim", env = "PLOW_AMD_MIXED_RIDE_TRIM", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
     pub mixed_ride_trim: bool,
 
+    /// A lone prefill chunk whose cursor is already packable (a long prompt's later chunks) runs
+    /// as a pack of one carrying the live decode rows (`PLOW_AMD_MIXED_PACK` riders).
+    #[arg(long = "amd-mixed-ride-lone", env = "PLOW_AMD_MIXED_RIDE_LONE", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
+    pub mixed_ride_lone: bool,
+
     /// Per-segment all-rank barrier timing for prefill (diagnostic; disables segment-major).
     #[arg(long = "amd-prefill-seg-timing", env = "PLOW_PREFILL_SEG_TIMING", hide = true, default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
     pub prefill_seg_timing: bool,

@@ -4820,14 +4820,21 @@ fn run_one_tick(
                     // launch as one-row spans. A lone chunk stays on its isolated program, whose
                     // lean KDA objects the packed siblings lack: as a pack of one carrying the
                     // decode rows it measured 5-7% slower at isl4096 c32/c128.
+                    // PLOW_AMD_MIXED_RIDE_LONE: a lone chunk whose cursor is already packable (a
+                    // long prompt's later chunks) runs as a pack of one so the riders come along.
+                    let lone_ride = rt.amd.mixed_ride_lone
+                        && !launch.is_pack()
+                        && !slo_on
+                        && e.packable_prefill_span(launch.spans[0].slot as usize, full_budget)
+                            .is_some_and(|span| span.n_rows == launch.spans[0].n_rows);
                     let ride = mixed_pack
                         && !decoded_in_pack
-                        && launch.is_pack()
+                        && (launch.is_pack() || lone_ride)
                         && slots[..cap].iter().any(|s| {
                             s.as_ref()
                                 .is_some_and(|s| s.parked_at.is_none() && !s.out_ids.is_empty())
                         });
-                    if launch.is_pack() {
+                    if launch.is_pack() || (lone_ride && ride) {
                         let packed = launch.spans.clone();
                         let feeds: Vec<(usize, u32)> = if ride {
                             slots[..cap]
