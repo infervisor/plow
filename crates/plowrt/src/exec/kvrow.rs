@@ -924,13 +924,13 @@ mod row_field_tests {
     fn every_gemm_opcode_is_either_row_shrunk_or_exempt() {
         /// `Gemm*` opcodes deliberately NOT in `PREFILL_ROW_FIELDS`, with the reason.
         ///
-        /// Both of these are NATIVE-ROUTED and already shrink themselves: the route owns a
-        /// `rebase(rows)` that re-picks the kernel for the live row count
-        /// (`amd_gemm_lt.rs:21`, `amd_gemm_blk.rs:157`, both driven from `patch_prefill`).
+        /// All of these are NATIVE-ROUTED and already shrink themselves from `patch_prefill`:
+        /// `GemmLtPf`/`GemmBlkPf` own a `rebase(rows)` that re-picks the kernel for the live row
+        /// count (`amd_gemm_lt.rs:21`, `amd_gemm_blk.rs:157`); `GemmGroupPf` sets `args.t = rows`.
         /// Adding them to the table would shrink `i[0]` a SECOND time, and `rebase` derives its
         /// band cap and its `rows != i[0]` guard from that same field -- so the table would feed
         /// the route an already-shrunk bucket and break the sequence-parallel band case.
-        const EXEMPT: &[DevOp] = &[DevOp::GemmLtPf, DevOp::GemmBlkPf];
+        const EXEMPT: &[DevOp] = &[DevOp::GemmLtPf, DevOp::GemmBlkPf, DevOp::GemmGroupPf];
         let mut missing = Vec::new();
         for op in DevOp::ALL {
             let name = format!("{op:?}");
