@@ -7471,6 +7471,52 @@ fn emit_glm_lt_gemm(
     Some(counter)
 }
 
+/// `PLOW_GLM53_GEMM_LT`: one GLM-5.3-Flash gfx950 prefill projection on the pinned hipBLASLt
+/// object (`GemmLtPf` mode 4), alone in its segment. The six shapes are distinct per rank, so the
+/// shape names the projection.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn emit_glm53_lt_gemm(
+    b: &mut Builder,
+    out: u32,
+    x: u32,
+    weight: u32,
+    t: u32,
+    nn: u32,
+    k: u32,
+    deps: &[u32],
+) -> Option<u32> {
+    let ec = emit_config::active();
+    let spec = ec.glm53_gemm_lt.as_deref()?;
+    let name = match (nn, k) {
+        (1536, 4096) => "q_a",
+        (512, 4096) => "kv_a",
+        (4096, 1536) => "q_absorb",
+        (4096, 2048) => "mla_o",
+        (4096, 1024) => "kda_o",
+        (1024, 128) => "kda_gb",
+        _ => return None,
+    };
+    if t < ec.glm53_gemm_lt_min_rows
+        || t > ec.glm53_gemm_lt_max_rows.min(8192)
+        || !crate::emit_is_amd()
+        || crate::amd_target::active().1 != hwspec::IsaLevel::Gfx950
+        || !spec.split(',').any(|s| s.trim() == name)
+    {
+        return None;
+    }
+    let counter = b.emit(DevOp::GemmLtPf, vec![0], deps, |d| {
+        d.t[0] = out;
+        d.t[1] = x;
+        d.t[2] = weight;
+        d.i[0] = t;
+        d.i[1] = nn;
+        d.i[2] = k;
+        d.i[3] = 4;
+    });
+    b.isolate(counter);
+    Some(counter)
+}
+
 /// `PLOW_GLM_GEMM_LT_PF_EXT`: prefill GEMMs `PLOW_GLM_GEMM_LT` leaves on interpreter tiles that
 /// take the same pinned hipBLASLt route. Each becomes its own native segment, so every group
 /// trades its tile for up to two segment boundaries.
@@ -8585,6 +8631,9 @@ pub(crate) fn emit_glm_mla_prefill(
         // measured at ≈0.4% of peak — the worst number in the campaign. `op_gemm.h` now
         // instantiates the fp4 body at all five rungs, so the selection applies.
         if enc != MoeEnc::Mxfp4 {
+            if let Some(counter) = emit_glm53_lt_gemm(b, out, x, wt, t, nn, k, deps) {
+                return counter;
+            }
             if let Some(counter) = emit_glm_lt_gemm(b, c, out, x, wt, t, nn, k, deps) {
                 return counter;
             }

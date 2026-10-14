@@ -8080,18 +8080,25 @@ impl AmdEngine {
             ));
         }
         let has_gemm_lt = |p: &DevProg| p.insts.iter().any(|d| d.op == DevOp::GemmLtPf as u16);
-        let use_gemm_lt = blob.progs.iter().any(has_gemm_lt);
+        let use_gemm_lt = blob.progs.iter().any(has_gemm_lt)
+            || (arch == "gfx950"
+                && crate::config::RuntimeConfig::get().amd.gemm_group_lt
+                && blob
+                    .progs
+                    .iter()
+                    .flat_map(|p| &p.insts)
+                    .any(|d| d.op == DevOp::GemmGroupPf as u16));
         let gemma_gemm_lt = blob
             .progs
             .iter()
             .flat_map(|p| &p.insts)
             .any(|d| d.op == DevOp::GemmLtPf as u16 && d.i[3] == 3);
         if use_gemm_lt
-            && (arch != "gfx942"
+            && (!amd_gemm_lt::arch_matches(&blob.progs, &arch)
                 || !amd_gemm_lt::topology_matches(&blob.progs, tp.as_ref().map(|b| b.n_gpu)))
         {
             return Err(RuntimeError::Device(
-                "hipBLASLt projection requires a qualified gfx942 topology and mode".into(),
+                "hipBLASLt projection requires a qualified gfx942/gfx950 topology and mode".into(),
             ));
         }
         let has_gemm_blk = |p: &DevProg| p.insts.iter().any(|d| d.op == DevOp::GemmBlkPf as u16);
@@ -10498,7 +10505,13 @@ impl AmdEngine {
             }
             None => None,
         };
-        let gemm_lt = if use_gemm_lt {
+        let gemm_lt = if use_gemm_lt && arch == "gfx950" {
+            Some(amd_gemm_lt::GemmLt::load_gfx950(
+                &be,
+                &hsaco_dir,
+                &mut modules,
+            )?)
+        } else if use_gemm_lt {
             Some(amd_gemm_lt::GemmLt::load(
                 &be,
                 &hsaco_dir,
@@ -14076,6 +14089,15 @@ impl AmdEngine {
                 if args.n[g] != 0 {
                     args.c[g] = addr(tens[2 + g]);
                 }
+            }
+            if let Some(lt) = self
+                .gemm_lt
+                .as_ref()
+                .filter(|lt| lt.covers_group(&args.n, args.k))
+            {
+                lt.enqueue_group(&self.be, args.x, args.w, &args.c, &args.n, args.t, args.k)?;
+                self.seg_launches += 1;
+                return Ok(());
             }
             EngineDevice::launch_kernel(
                 &*self.be,

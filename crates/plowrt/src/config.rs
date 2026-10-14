@@ -2166,6 +2166,11 @@ pub struct AmdRuntimeConfig {
     #[arg(long = "amd-mla-pf-row-split-native-lo", env = "PLOW_MLA_PF_ROW_SPLIT_NATIVE_LO", default_value_t = true, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
     pub mla_pf_row_split_native_lo: bool,
 
+    /// gfx950: run each group of a `GemmGroupPf` segment (the KDA fused in-projection) as its own
+    /// pinned hipBLASLt launch (`glm_lt_gfx950.elf`) instead of `plow_gemm_group_pf_gfx950`.
+    #[arg(long = "amd-gemm-group-lt", env = "PLOW_AMD_GEMM_GROUP_LT", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
+    pub gemm_group_lt: bool,
+
     /// DIAGNOSTIC. Zero the whole sparse-MLA workspace before every row-band dispatch, so the
     /// dispatch sees the device state a freshly loaded server would give it. Bisects the
     /// row-band wrong-answer defect: that defect is armed by any ordinary program-3 execution in

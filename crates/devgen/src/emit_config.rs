@@ -1006,6 +1006,17 @@ pub struct EmitConfig {
     /// `--glm-gemm-lt`.
     #[arg(long, env = "PLOW_GLM_GEMM_LT_PF_EXT")]
     pub glm_gemm_lt_pf_ext: Option<String>,
+    /// GLM-5.3-Flash gfx950 prefill: comma list of dense BF16 projections that run the pinned
+    /// gfx950 hipBLASLt object (`glm_lt_gfx950.elf`) as their own segment: `q_a`, `kv_a`,
+    /// `q_absorb`, `mla_o`, `kda_o`, `kda_gb`. Unset => byte-identical.
+    #[arg(long, env = "PLOW_GLM53_GEMM_LT")]
+    pub glm53_gemm_lt: Option<String>,
+    /// Smallest prefill bucket (rows) `PLOW_GLM53_GEMM_LT` routes.
+    #[arg(long, env = "PLOW_GLM53_GEMM_LT_MIN_ROWS", default_value_t = 2048)]
+    pub glm53_gemm_lt_min_rows: u32,
+    /// Largest prefill bucket (rows) `PLOW_GLM53_GEMM_LT` routes.
+    #[arg(long, env = "PLOW_GLM53_GEMM_LT_MAX_ROWS", default_value_t = 8192)]
+    pub glm53_gemm_lt_max_rows: u32,
 
     /// Cap the dispatch width of every blocked GEMV. Unset ⇒ byte-identical.
     #[arg(long, env = "PLOW_GLM_GEMV_WG")]
@@ -1897,6 +1908,9 @@ impl EmitConfig {
             glm_fold_lt: env_bool_opt("PLOW_GLM_FOLD_LT"),
             glm_gemm_blk: env_str("PLOW_GLM_GEMM_BLK"),
             glm_gemm_lt_pf_ext: env_str("PLOW_GLM_GEMM_LT_PF_EXT"),
+            glm53_gemm_lt: env_str("PLOW_GLM53_GEMM_LT"),
+            glm53_gemm_lt_min_rows: env_u32("PLOW_GLM53_GEMM_LT_MIN_ROWS").unwrap_or(2048),
+            glm53_gemm_lt_max_rows: env_u32("PLOW_GLM53_GEMM_LT_MAX_ROWS").unwrap_or(8192),
             glm_gemv_wg: env_u32("PLOW_GLM_GEMV_WG"),
             glm_ofold: env_bool("PLOW_GLM_OFOLD"),
             glm_hc_norm_fold: env_bool("PLOW_GLM_HC_NORM_FOLD"),

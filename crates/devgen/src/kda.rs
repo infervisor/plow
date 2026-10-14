@@ -883,7 +883,11 @@ fn emit_kda_mixer_ex(
             d.i[..8].copy_from_slice(&[t, hi, p, p, p, hd, hd, nh]);
         });
         b.isolate(c);
-        let c_gb = if crate::emit_config::active().pf_gemm_route_all {
+        let c_gb = if let Some(c) =
+            crate::mla::emit_glm53_lt_gemm(b, g_raw, ga, g_b_proj, t, p, hd, &[c])
+        {
+            c
+        } else if crate::emit_config::active().pf_gemm_route_all {
             emit_pf_gemm_route(b, g_raw, ga, g_b_proj, t, p, hd, &[c])
         } else {
             gemv(b, g_raw, ga, g_b_proj, p, hd, c)
@@ -1535,7 +1539,13 @@ fn emit_kda_mixer_ex(
     });
 
     // P12 — out projection. The residual is NOT here: see `emit_kda_layer`.
-    let c_o = if group.is_some() && crate::emit_config::active().pf_gemm_route_all {
+    let lt_o = group
+        .is_some()
+        .then(|| crate::mla::emit_glm53_lt_gemm(b, attn, y, w.o_proj, t, hi, p, &[c_norm]))
+        .flatten();
+    let c_o = if let Some(c) = lt_o {
+        c
+    } else if group.is_some() && crate::emit_config::active().pf_gemm_route_all {
         emit_pf_gemm_route(b, attn, y, w.o_proj, t, hi, p, &[c_norm])
     } else {
         gemv(b, attn, y, w.o_proj, hi, p, c_norm)
