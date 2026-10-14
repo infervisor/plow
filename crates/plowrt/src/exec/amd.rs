@@ -1121,7 +1121,7 @@ fn kda_carry_split_scratch_bytes<'a>(
     let mut bytes = 0u64;
     for prog in progs {
         for d in &prog.insts {
-            if !(kda_carry_regstate_inst(d)) {
+            if !kda_carry_regstate_inst(d) {
                 continue;
             }
             let (t, h) = (u64::from(d.i[0]), u64::from(d.i[1]));
@@ -11484,7 +11484,7 @@ impl AmdEngine {
             .map(|m| (m.base, kda_keyfeed_half));
         let d_kda_carry_split_scratch = if k_kda_carry_split.is_some() {
             let bytes = kda_carry_split_scratch_bytes(blob.prefill_phase(), kda_carry_split_max);
-            tracing::info!(bytes, max_seg = kda_carry_split_max, "allocating KDA carry split scratch");
+            tracing::info!(bytes, max_seg = kda_carry_split_max, "KDA carry split scratch");
             Some(EngineDevice::alloc(&*be, bytes)?)
         } else {
             None
