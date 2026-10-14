@@ -701,6 +701,7 @@ pub const RUNTIME: &[KnobSpec] = &[
     KnobSpec::new("rt.mla_pf_aiter", Some("PLOW_MLA_PF_AITER"), Layer::Runtime, Domain::Bool, OFF, OPT_IN),
     KnobSpec::new("rt.mla_pf_dense", Some("PLOW_MLA_PF_DENSE"), Layer::Runtime, Domain::Bool, OFF, OPT_IN),
     KnobSpec::new("rt.kda_carry_split", Some("PLOW_KDA_CARRY_SPLIT"), Layer::Runtime, U32, Default::Static(Val::Nat(0)), OPT_IN),
+    KnobSpec::new("rt.kda_carry_multi", Some("PLOW_KDA_CARRY_MULTI"), Layer::Runtime, Domain::Bool, OFF, OPT_IN),
     KnobSpec::new("rt.moe_aiter_tile64", Some("PLOW_MOE_AITER_TILE64"), Layer::Runtime, Domain::Bool, UNSET, OPT_IN),
     KnobSpec::new("rt.moe_aiter_xcd", Some("PLOW_MOE_AITER_XCD"), Layer::Runtime, Domain::Bool, UNSET, OPT_IN),
     KnobSpec::new("rt.moe_stage1_a4_reuse", Some("PLOW_MOE_STAGE1_A4_REUSE"), Layer::Runtime, Domain::Bool, ON, PROMOTED),

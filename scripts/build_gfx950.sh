@@ -678,6 +678,16 @@ if [ "$ARCH" = gfx950 ] && [ "$need_kda_carry_keyfeed" = 1 ]; then
       "$R/amd/kda_chunk_carry_split.hip"
     KDA_CARRY_KEYFEED_ELFS="$KDA_CARRY_KEYFEED_ELFS kda_chunk_carry_split_gfx950.elf"
   fi
+  # PLOW_KDA_CARRY_MULTI=1: packed spans' key-fed carries batched 16 per launch.
+  if [ "${PLOW_KDA_CARRY_MULTI:-0}" = 1 ]; then
+    bash "$R/cmake/hipcc_hsaco.sh" hipcc "$BUN" "$ARCH" \
+      "$OUT/kda_chunk_carry_multi_gfx950.elf" \
+      plow_kda_chunk_carry_multi_gfx950 256 1 \
+      $INC -DPLOW_LEAN_OBJECT=1 -DPLOW_NO_SPILL=1 -DPLOW_NO_SGPR_SPILL=1 \
+      -DPLOW_REQUIRED_MARKER=plow_kda_carry_multi_abi_1 $KDA_CARRY_DEFS \
+      "$R/amd/kda_chunk_carry_multi.hip"
+    KDA_CARRY_KEYFEED_ELFS="$KDA_CARRY_KEYFEED_ELFS kda_chunk_carry_multi_gfx950.elf"
+  fi
 fi
 
 # PLOW_MLA_PF_DENSE=1: the dedicated NoPE MLA flash-prefill object plowrt routes eligible flash

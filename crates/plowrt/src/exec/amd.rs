@@ -1098,6 +1098,29 @@ struct KdaCarrySplitArgs {
 
 const _: () = assert!(std::mem::size_of::<KdaCarrySplitArgs>() == 104);
 
+/// Kernarg of `plow_kda_chunk_carry_multi_gfx950` (`PLOW_KDA_CARRY_MULTI`).
+#[derive(Clone, Copy, Debug)]
+#[repr(C)]
+struct KdaCarryMultiArgs {
+    out: u64,
+    state: u64,
+    q: u64,
+    k: u64,
+    w: u64,
+    u: u64,
+    aqk: u64,
+    g: u64,
+    key_hi: u64,
+    key_lo: u64,
+    heads: u32,
+    n: u32,
+    /// `[row0, rows, state slot]` per span.
+    span: [[u32; 3]; KDA_CARRY_MULTI_SPANS],
+}
+
+const KDA_CARRY_MULTI_SPANS: usize = 16;
+const _: () = assert!(std::mem::size_of::<KdaCarryMultiArgs>() == 280);
+
 /// Shortest segment of the split carry.
 const KDA_CARRY_SPLIT_MIN_SEG: u32 = 1024;
 
@@ -7256,6 +7279,8 @@ pub struct AmdEngine {
     /// `PLOW_KDA_CARRY_SPLIT`: the segment, combine and fix kernels, their scratch and the
     /// segment cap.
     k_kda_carry_split: Option<[HsaKernel; 3]>,
+    /// `PLOW_KDA_CARRY_MULTI`: the multi-span carry kernel.
+    k_kda_carry_multi: Option<HsaKernel>,
     _kda_carry_split_scratch: Option<DeviceMem>,
     kda_carry_split_scratch: u64,
     kda_carry_split_max: u32,
@@ -9791,6 +9816,19 @@ impl AmdEngine {
             (None, None)
         };
         let kda_carry_split_max = crate::config::RuntimeConfig::get().amd.kda_carry_split;
+        let kda_carry_multi = crate::config::RuntimeConfig::get().amd.kda_carry_multi;
+        let k_kda_carry_multi = if k_kda_chunk_carry_keyfeed.is_some() && kda_carry_multi {
+            Some(load_kda_lean(
+                "kda_chunk_carry_multi_gfx950.elf",
+                "plow_kda_chunk_carry_multi_gfx950",
+                "KDA carry multi",
+                &["plow_kda_carry_multi_abi_1"],
+                std::mem::size_of::<KdaCarryMultiArgs>() as u32,
+                KDA_CARRY_REGSTATE_LDS,
+            )?)
+        } else {
+            None
+        };
         let k_kda_carry_split = if k_kda_chunk_carry_keyfeed.is_some() && kda_carry_split_max >= 2
         {
             let kernarg = std::mem::size_of::<KdaCarrySplitArgs>() as u32;
@@ -12809,6 +12847,7 @@ impl AmdEngine {
             k_kda_chunk_carry_keyfeed,
             _kda_keyfeed_scratch: d_kda_keyfeed_scratch,
             k_kda_carry_split,
+            k_kda_carry_multi,
             _kda_carry_split_scratch: d_kda_carry_split_scratch,
             kda_carry_split_scratch,
             kda_carry_split_max,
@@ -14948,11 +14987,86 @@ impl AmdEngine {
         Ok(true)
     }
 
+    /// `PLOW_KDA_CARRY_MULTI`: the packed spans' key-fed carries, split spans as their own
+    /// split launches and the rest batched 16 per multi-span launch (same per-span operands as
+    /// the per-span arm below).
+    fn enqueue_packed_kda_carry_multi(
+        &self,
+        multi: HsaKernel,
+        args: KdaChunkCarryKeyfeedArgs,
+    ) -> Result<()> {
+        let (h, d, v) = (
+            u64::from(args.heads),
+            u64::from(args.dim),
+            u64::from(args.value_dim),
+        );
+        let mut m = KdaCarryMultiArgs {
+            out: args.out,
+            state: args.state,
+            q: args.q,
+            k: args.k,
+            w: args.w,
+            u: args.u,
+            aqk: args.aqk,
+            g: args.g,
+            key_hi: args.key_hi,
+            key_lo: args.key_lo,
+            heads: args.heads,
+            n: 0,
+            span: [[0; 3]; KDA_CARRY_MULTI_SPANS],
+        };
+        let flush = |m: &mut KdaCarryMultiArgs| -> Result<()> {
+            if m.n != 0 {
+                EngineDevice::launch_kernel(
+                    &*self.be,
+                    multi,
+                    kda_carry_regstate_grid(m.heads) * m.n,
+                    256,
+                    0,
+                    as_bytes(std::slice::from_ref(m)),
+                    None,
+                )?;
+                m.n = 0;
+            }
+            Ok(())
+        };
+        for span in &self.packed_spans {
+            if self.kda_carry_split_launches(span.n_rows) > 1 {
+                let r = u64::from(span.row0);
+                let mut a = args;
+                a.out += r * h * v * 2;
+                a.state += u64::from(span.state_slot) * h * v * d * 4;
+                a.q += r * h * d * 2;
+                a.k += r * h * d * 2;
+                a.w += r * h * d * 2;
+                a.u += r * h * v * 2;
+                a.aqk += r * h * 64 * 4;
+                a.g += r * h * d * 4;
+                a.key_hi += r * h * d * 2;
+                a.key_lo += r * h * d * 2;
+                a.t = span.n_rows;
+                self.launch_kda_carry_split(&a)?;
+                continue;
+            }
+            m.span[m.n as usize] = [span.row0, span.n_rows, span.state_slot];
+            m.n += 1;
+            if m.n as usize == KDA_CARRY_MULTI_SPANS {
+                flush(&mut m)?;
+            }
+        }
+        flush(&mut m)
+    }
+
     /// One lean-object launch per packed span, operands rebased to the span's rows (`row0`)
     /// and its recurrent state slot exactly as the packed interpreter arms address them
     /// (`d_kda_chunk_*_packed_bt64`). A fresh span's state was cleared at admission.
     fn enqueue_packed_lean_kda(&self, p: usize, seg: usize) -> Result<()> {
         let route = self.progs[p].prefill_routes[seg];
+        if let (PrefillSegmentRoute::KdaChunkCarryKeyfeed { args, .. }, Some(multi)) =
+            (route, self.k_kda_carry_multi)
+        {
+            return self.enqueue_packed_kda_carry_multi(multi, args);
+        }
         for span in &self.packed_spans {
             let r = u64::from(span.row0);
             let t = span.n_rows;
@@ -15095,11 +15209,25 @@ impl AmdEngine {
         }
         if active && self.packed_lean_kda_segment(p, seg) {
             return match self.progs[p].prefill_routes.get(seg) {
-                Some(PrefillSegmentRoute::KdaChunkCarryKeyfeed { .. }) => self
-                    .packed_spans
-                    .iter()
-                    .map(|s| self.kda_carry_split_launches(s.n_rows))
-                    .sum(),
+                Some(PrefillSegmentRoute::KdaChunkCarryKeyfeed { .. }) => {
+                    let split: usize = self
+                        .packed_spans
+                        .iter()
+                        .map(|s| self.kda_carry_split_launches(s.n_rows))
+                        .filter(|&n| n > 1)
+                        .sum();
+                    let serial = self
+                        .packed_spans
+                        .iter()
+                        .filter(|s| self.kda_carry_split_launches(s.n_rows) == 1)
+                        .count();
+                    split
+                        + if self.k_kda_carry_multi.is_some() {
+                            serial.div_ceil(KDA_CARRY_MULTI_SPANS)
+                        } else {
+                            serial
+                        }
+                }
                 _ => self.packed_spans.len(),
             };
         }

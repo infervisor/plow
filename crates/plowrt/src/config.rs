@@ -2161,6 +2161,12 @@ pub struct AmdRuntimeConfig {
     #[arg(long = "amd-kda-carry-split", env = "PLOW_KDA_CARRY_SPLIT", default_value_t = 0, global = true)]
     pub kda_carry_split: u32,
 
+    /// Run a packed binding's per-span key-fed KDA carries that are not split as one launch per
+    /// 16 spans (`kda_chunk_carry_multi_gfx950.elf`)
+    /// instead of one 64-workgroup launch per span. Bit-identical per span.
+    #[arg(long = "amd-kda-carry-multi", env = "PLOW_KDA_CARRY_MULTI", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
+    pub kda_carry_multi: bool,
+
     /// Split a sparse-rung prefill chunk that starts below 2047 prior keys: rows holding all 2048
     /// causal keys take the AITER sparse route, the earlier rows the interpreter gather arm.
     /// Default on (checkpoint P, perf-certs/rt.mla_pf_row_split.json); `=0` is the rollback.

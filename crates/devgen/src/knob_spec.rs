@@ -1461,6 +1461,7 @@ pub const RAW_ENV: &[KnobSpec] = &[
     KnobSpec::new("env.PLOW_KDA_CARRY_KTR16", Some("PLOW_KDA_CARRY_KTR16"), Layer::RawEnv, Domain::Bool, OFF, OPT_IN),
     KnobSpec::new("env.PLOW_KDA_DECODE_LANES", Some("PLOW_KDA_DECODE_LANES"), Layer::RawEnv, Domain::Bool, OFF, OPT_IN),
     KnobSpec::new("env.PLOW_KDA_CARRY_SPLIT", Some("PLOW_KDA_CARRY_SPLIT"), Layer::RawEnv, U32, Default::Static(Val::Nat(0)), OPT_IN),
+    KnobSpec::new("env.PLOW_KDA_CARRY_MULTI", Some("PLOW_KDA_CARRY_MULTI"), Layer::RawEnv, Domain::Bool, OFF, OPT_IN),
     KnobSpec::new("env.PLOW_KDA_INTRA_HOIST", Some("PLOW_KDA_INTRA_HOIST"), Layer::RawEnv, Domain::Bool, ON, OPT_IN),
     KnobSpec::new("env.PLOW_KDA_INTRA_SOLVE_ILP", Some("PLOW_KDA_INTRA_SOLVE_ILP"), Layer::RawEnv, Domain::Bool, ON, OPT_IN),
     KnobSpec::new("env.PLOW_KDA_PREP_COLSCAN", Some("PLOW_KDA_PREP_COLSCAN"), Layer::RawEnv, Domain::Bool, ON, OPT_IN),
