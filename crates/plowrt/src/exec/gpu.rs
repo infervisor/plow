@@ -1650,7 +1650,8 @@ fn packet_role_segments_with(
                     | plow_asset::segment_roles::MOE_DECODE_CUBLASLT
             ) {
                 // A library segment of two complete instructions (grouped GLU + DOWN), on
-                // prefill three (+ the combine) or four (W8A8: + the fu quant), on decode four
+                // prefill three (+ the combine), four (W8A8: + the fu quant) or eight (W8A8 with
+                // the router prologue: + RmsNorm, router, align, activation quant), on decode four
                 // (+ the combine/NRN layer tail);
                 // the route itself (`moe_lt::segments`, `moe_lt::decode_segments`) checks them
                 // when switched on.
@@ -1672,12 +1673,12 @@ fn packet_role_segments_with(
                 let tails: &[usize] = if role == plow_asset::segment_roles::MOE_DECODE_CUBLASLT {
                     &[4]
                 } else {
-                    &[3, 4]
+                    &[3, 4, 8]
                 };
                 if !(pcs.len() == 2 || tails.contains(&pcs.len())) || !complete {
                     return Err(RuntimeError::Rejected(
-                        "MoE cuBLASLt segment requires two (prefill: or three or four, decode: or \
-                         four) complete instructions"
+                        "MoE cuBLASLt segment requires two (prefill: or three, four or eight, \
+                         decode: or four) complete instructions"
                             .into(),
                     ));
                 }
