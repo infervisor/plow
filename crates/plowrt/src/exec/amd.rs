@@ -5414,7 +5414,13 @@ fn bind_packed_experts(
         if ep_full.is_some() {
             return ep_full;
         }
-        dec.insts.iter().find_map(|d| {
+        // The widest decode program first; under the gfx950 AITER companion only the single-row
+        // program streams the row-major slab, so fall back to every program.
+        let mut insts = dec
+            .insts
+            .iter()
+            .chain(blob.progs.iter().flat_map(|p| &p.insts));
+        insts.find_map(|d| {
             if d.t[3] as usize == i_ewt && GLU_ARMS.iter().any(|&o| o as u16 == d.op) {
                 Some(d.i[1] as u64)
             } else if d.t[2] as usize == i_ewt && d.op == DevOp::MoeGroupGluPf as u16 {
@@ -5630,6 +5636,43 @@ fn bind_packed_experts(
         } else {
             (None, None)
         };
+        // gfx950 AITER COMPANION SLAB (`expert_weight_table[_sf]_ai`): every projection again,
+        // in AITER's 16x16 shuffle (`shuffle_moe_weight_16x32`), at the row-major slab's packed
+        // offsets; the scales are the row-major slab's own (OCP, unscaled). The fused call reads
+        // it through `ResidentWeights::companion`, the single-row decode keeps the row-major one.
+        let ai_name = if *shared_fold {
+            format!("{pfx}expert_weight_table_sf_ai")
+        } else {
+            format!("{pfx}expert_weight_table_ai")
+        };
+        let i_ewt_ai = names.iter().position(|x| *x == ai_name);
+        let (d_ai, aitab) = if let Some(i_ai) = i_ewt_ai {
+            if *ep_table
+                || whole
+                || resident
+                || en.microscaled()
+                || i_moe != 256
+                || shape0.len() != 2
+                || shape0[1] != 4096
+                || w_stride != 256 * 4096
+                || s_stride != 64 * 4
+            {
+                return Err(RuntimeError::Device(format!(
+                    "{pfx}: the AITER companion slab requires TP block-FP8 H4096/I256 weights"
+                )));
+            }
+            let t_a = Instant::now();
+            let d = EngineDevice::alloc(be, (n_local * 3 * w_stride).max(1))?;
+            LoadProf::add(&prof.alloc_ns, t_a);
+            let t = crate::orch::moe::packed_expert_table(d.base, w_stride, n_exp, owned.clone());
+            resident_weights.push((
+                i_ai as u16,
+                amd_moe_aiter::ResidentWeights::companion(d.base, w_stride, d_s.base, s_stride),
+            ));
+            (Some(d), Some(t))
+        } else {
+            (None, None)
+        };
         let moe2_weight_suffix = if *ep_table {
             "expert_weight_table_moe2_ep"
         } else {
@@ -5717,7 +5760,10 @@ fn bind_packed_experts(
                     (w_stride / i_moe, i_moe)
                 };
                 let pf_dst = wptab.as_ref().map_or(0, |t| t[idx]);
-                let w2_dst = w2tab.as_ref().map_or(0, |t| t[idx]);
+                let w2_dst = w2tab
+                    .as_ref()
+                    .or(aitab.as_ref())
+                    .map_or(0, |t| t[idx]);
                 let s2_dst = s2tab.as_ref().map_or(0, |t| t[idx]);
                 let down_kbytes = i_moe / 2;
                 let down_rows = if down_kbytes == 0 {
@@ -5735,8 +5781,8 @@ fn bind_packed_experts(
                     pf_rows,
                     pf_k,
                     w2_dst,
-                    down_rows,
-                    down_kbytes,
+                    if aitab.is_some() { pf_rows } else { down_rows },
+                    if aitab.is_some() { pf_k } else { down_kbytes },
                     false,
                     shared && !en.microscaled(),
                 ));
@@ -5868,6 +5914,9 @@ fn bind_packed_experts(
         if let (Some(ip), Some(tab)) = (i_ewt_pf, &wptab) {
             EngineDevice::upload(be, &devp[ip], 0, as_bytes(tab))?;
         }
+        if let (Some(ia), Some(tab)) = (i_ewt_ai, &aitab) {
+            EngineDevice::upload(be, &devp[ia], 0, as_bytes(tab))?;
+        }
         if let (Some(iw), Some(is), Some(wt), Some(st)) = (i_ewt_moe2, i_est_moe2, &w2tab, &s2tab) {
             EngineDevice::upload(be, &devp[iw], 0, as_bytes(wt))?;
             EngineDevice::upload(be, &devp[is], 0, as_bytes(st))?;
@@ -5881,6 +5930,9 @@ fn bind_packed_experts(
             bufs.push(d);
         }
         if let Some(d) = d_s2 {
+            bufs.push(d);
+        }
+        if let Some(d) = d_ai {
             bufs.push(d);
         }
     }
@@ -7944,7 +7996,11 @@ impl AmdEngine {
             |p: &DevProg| p.insts.iter().any(|d| d.op == DevOp::MoeAiterFp8Pf as u16);
         let use_moe_aiter = blob.progs.iter().any(has_moe_aiter);
         let resident_tables = amd_moe_aiter::resident_tables(&blob.progs, &blob.tensors)?;
-        let use_resident_moe = resident_tables.iter().any(Option::is_some);
+        // i[7] = 2 is the gfx950 companion slab: bound per layer like the resident layout.
+        let use_resident_moe = resident_tables.iter().any(Option::is_some)
+            || blob.progs.iter().flat_map(|p| &p.insts).any(|d| {
+                d.op == DevOp::MoeAiterFp8Pf as u16 && d.i[7] == 2
+            });
         if use_moe_aiter
             && (!matches!(arch.as_str(), "gfx942" | "gfx950") || tp.is_none_or(|b| b.n_gpu != 8))
         {

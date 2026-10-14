@@ -182,6 +182,100 @@ extern "C" __global__ void plow_moe_aiter_store(float* out, const unsigned short
 #endif
 }
 
+/* `plow_moe_aiter_prepare` straight from the router's [rows][topk] (expert u32, weight f32)
+ * table: workgroup 0 sorts it into block_m-compacted AITER blocks, the others quantize x and
+ * zero `out`. Replaces the interpreter align + its segment boundary (decode rungs). */
+struct MoeTableArgs {
+    unsigned short* q;
+    float* qs;
+    uint4* out;
+    unsigned* ids;
+    float* weights;
+    unsigned* experts;
+    unsigned* valid;
+    const unsigned short* x;
+    const uint2* table;
+    unsigned rows;
+    unsigned block_m;
+    unsigned n_exp;
+    unsigned topk;
+    unsigned keep_out;
+    unsigned pad;
+};
+static_assert(sizeof(MoeTableArgs) == 96);
+
+extern "C" __global__ void plow_moe_aiter_prepare_table(MoeTableArgs a) {
+#if defined(__HIP_DEVICE_COMPILE__)
+    if (blockIdx.x == 0) {
+        __shared__ unsigned cnt[512], start[513], cur[512];
+        const unsigned slots = a.rows * a.topk, tid = threadIdx.x;
+        for (unsigned e = tid; e < a.n_exp; e += blockDim.x) cnt[e] = cur[e] = 0;
+        __syncthreads();
+        for (unsigned s = tid; s < slots; s += blockDim.x) {
+            const unsigned e = a.table[s].x;
+            if (e < a.n_exp) atomicAdd(&cnt[e], 1u);
+        }
+        __syncthreads();
+        if (tid == 0) {
+            unsigned b = 0;
+            for (unsigned e = 0; e < a.n_exp; e++) {
+                start[e] = b;
+                b += (cnt[e] + a.block_m - 1u) / a.block_m;
+            }
+            start[a.n_exp] = b;
+        }
+        __syncthreads();
+        const unsigned blocks = start[a.n_exp], padded = blocks * a.block_m;
+        for (unsigned i = tid; i < padded; i += blockDim.x) {
+            const unsigned b = i / a.block_m;
+            unsigned lo = 0, hi = a.n_exp;
+            while (lo < hi) {
+                const unsigned mid = (lo + hi) / 2u;
+                if (start[mid + 1u] <= b) lo = mid + 1u;
+                else hi = mid;
+            }
+            if (i % a.block_m == 0u) a.experts[b] = lo;
+            if ((b - start[lo]) * a.block_m + i % a.block_m >= cnt[lo]) {
+                a.ids[i] = a.rows;
+                a.weights[i] = 0.0f;
+            }
+        }
+        for (unsigned s = tid; s < slots; s += blockDim.x) {
+            const uint2 r = a.table[s];
+            if (r.x >= a.n_exp) continue;
+            const unsigned at = start[r.x] * a.block_m + atomicAdd(&cur[r.x], 1u);
+            a.ids[at] = (s / a.topk) | ((s % a.topk) << 24);
+            a.weights[at] = __uint_as_float(r.y);
+        }
+        if (tid == 0) {
+            a.valid[0] = padded;
+            a.valid[1] = a.rows;
+        }
+        if (gridDim.x > 1) return;
+    }
+    const unsigned workers = gridDim.x > 1 ? gridDim.x - 1u : 1u;
+    const unsigned wg = gridDim.x > 1 ? blockIdx.x - 1u : 0u;
+    const unsigned first = wg * blockDim.x + threadIdx.x;
+    const unsigned stride = workers * blockDim.x;
+    const unsigned lane = threadIdx.x % 64u;
+    for (unsigned group = first / 64u; group < a.rows * MOE_AITER_KB; group += stride / 64u) {
+        const unsigned row = group / MOE_AITER_KB, col = group % MOE_AITER_KB;
+        const unsigned pos = group * 128u + lane * 2u;
+        const float x0 = bf2f(a.x[pos]), x1 = bf2f(a.x[pos + 1u]);
+        const float amax = wave_max(fmaxf(1e-10f, fmaxf(fabsf(x0), fabsf(x1))));
+        const float scale = amax * (1.0f / MOE_AITER_FP8_MAX);
+        const float inverse = 1.0f / scale;
+        a.q[pos / 2u] = (unsigned short)__builtin_amdgcn_cvt_pk_fp8_f32(
+            x0 * inverse, x1 * inverse, 0, false);
+        if (lane == 0) a.qs[col * a.rows + row] = scale;
+    }
+    if (!a.keep_out)
+        for (unsigned i = first; i < a.rows * (MOE_AITER_H / 8u); i += stride)
+            a.out[i] = make_uint4(0, 0, 0, 0);
+#endif
+}
+
+extern "C" __device__ unsigned plow_moe_aiter_table_abi_1 = 1;
 extern "C" __device__ unsigned plow_moe_aiter_fp8_abi_1 = 1;
 extern "C" __device__ unsigned plow_moe_aiter_tile64_abi_1 = 1;
 extern "C" __device__ unsigned plow_moe_aiter_swizzle_abi_1 = 1;

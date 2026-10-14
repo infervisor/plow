@@ -88,6 +88,10 @@ pub fn is_host_filled_table(name: &str) -> bool {
         // packed slab whose per-projection layout is [K/64][R][64] so the grouped prefill GEMM's
         // B stream is contiguous per k-tile. Host-computed addresses, no checkpoint bytes.
         || name.ends_with("mlp.expert_weight_table_pf")
+        // The gfx950 AITER companion (`bind_packed_experts`): a second slab in AITER's 16x16
+        // shuffle, plain or under the shared-expert fold.
+        || name.ends_with("mlp.expert_weight_table_ai")
+        || name.ends_with("mlp.expert_weight_table_sf_ai")
 }
 
 /// True when this declared tensor's bytes must come from the checkpoint.

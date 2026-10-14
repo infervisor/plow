@@ -2813,6 +2813,10 @@ struct GlmLW {
     // remain intact for decode and the interpreter fallback.
     _ewt_moe2: u32,
     _est_moe2: u32,
+    // gfx950 AITER companion (`glm_aiter_gfx950`): the same [E][3] table over a SECOND slab
+    // holding every projection in AITER's 16x16 shuffle; scales stay on `est`. The row-major
+    // slab keeps serving the single-row decode MoE.
+    ewt_ai: u32,
     // Dense FFN (layers < first_k_dense): block-fp8 gate/up/down + their weight_scale_inv grids.
     // TENSOR_NONE on MoE layers.
     dgate: u32,
@@ -4363,6 +4367,13 @@ fn declare_glm_rows_batched_for_prefill(
                 TENSOR_NONE
             } else {
                 t(b, "mlp.expert_scale_table_moe2", (e * 3) as u64 * 8)
+            },
+            ewt_ai: if dense || !glm_aiter_gfx950(c, b.n_cu(), enc) {
+                TENSOR_NONE
+            } else if fold {
+                t(b, "mlp.expert_weight_table_sf_ai", (e_all * 3) as u64 * 8)
+            } else {
+                t(b, "mlp.expert_weight_table_ai", (e * 3) as u64 * 8)
             },
             // Dense-FFN weights. Block-fp8 keeps the checkpoint's own byte layout and its
             // [N/128][K/128] f32 `weight_scale_inv` grid; MXFP4 halves the weight and swaps the
@@ -10094,7 +10105,7 @@ fn emit_glm_moe_ffn_prefill(
             d.t = [
                 if seed { n.dg_tp } else { n.part },
                 n.xn2,
-                w.ewt,
+                if w.ewt_ai != TENSOR_NONE { w.ewt_ai } else { w.ewt },
                 w.est,
                 n.meta,
                 n.row_token,
@@ -10110,7 +10121,7 @@ fn emit_glm_moe_ffn_prefill(
                 tk_all,
                 64,
                 2 + u32::from(seed),
-                u32::from(resident),
+                if w.ewt_ai != TENSOR_NONE { 2 } else { u32::from(resident) },
             ];
             if native_align {
                 d.j[0] = n.tab + 1;
@@ -11129,7 +11140,8 @@ fn emit_glm_moe_ffn_rows(
         d.i[7] = c.topk_group;
         d.f[0] = c.route_scale;
     });
-    let c_routes = if flat {
+    // The gfx950 AITER call sorts the router's table itself (`plow_moe_aiter_prepare_table`).
+    let c_routes = if flat || aiter950 {
         c_router
     } else {
         b.emit(DevOp::MoeAlignPf, one.clone(), &[c_router], |d| {
@@ -11329,20 +11341,25 @@ fn emit_glm_moe_ffn_rows(
     };
 
     let routed_w8a8 = emit_config::active().glm_routed_w8a8;
+    // gfx950 AITER at TP: BF16 rows straight into the reduce source (mode 4, no combine);
+    // otherwise into `part` (mode 2) for the one-partial combine below.
+    let aiter_direct = aiter950 && tp > 1 && !emit_config::active().no_xreduce;
     let c_d = if aiter950 {
-        // Sorted, BF16 rows into `part` (mode 2), summed by the one-partial combine below.
         let counter = b.emit(DevOp::MoeAiterFp8Pf, one.clone(), &[c_routes, c_rn2], |d| {
             d.t = [
-                n.part,
+                if aiter_direct { n.dg_tp } else { n.part },
                 n.xn2,
-                w.ewt,
+                w.ewt_ai,
                 w.est,
                 n.meta,
                 n.row_token,
                 n.row_partidx,
                 n.row_gate,
             ];
-            d.i = [rows, h, imoe_e, e_route, tk_route, 64, 2, 1];
+            let mode = if aiter_direct { 4 } else { 2 };
+            d.i = [rows, h, imoe_e, e_route, tk_route, 64, mode, 2];
+            d.j[0] = n.tab + 1;
+            d.j[1] = GLM_MOE_NATIVE_ALIGN_NPART;
         });
         b.isolate(counter);
         counter
@@ -11456,28 +11473,32 @@ fn emit_glm_moe_ffn_rows(
     // AddNorm (or Residual), exactly as the single-row decode block ends.
     let no_xr = tp > 1 && emit_config::active().no_xreduce;
     if tp > 1 && !no_xr {
-        let c_cmb = b.emit(DevOp::MoeCombinePf, combine_cus, &[c_shd, c_d], |d| {
-            d.t[0] = n.dg_tp;
-            d.t[1] = TENSOR_NONE; // residual rides AFTER the all-reduce (else summed tp times)
-            d.t[2] = if dfold {
-                TENSOR_NONE
-            } else if raw_output {
-                n.attn
-            } else {
-                n.shared
-            };
-            d.t[3] = n.part;
-            d.i[0] = h;
-            d.i[1] = if det || flat || routed_w8a8 || aiter950 {
-                1
-            } else {
-                tk_route
-            };
-            d.i[2] = rows;
-            d.i[3] = 0;
-            d.i[4] = u32::from(det);
-            d.i[7] = u32::from(flat || routed_w8a8 || aiter950);
-        });
+        let c_cmb = if aiter_direct {
+            c_d
+        } else {
+            b.emit(DevOp::MoeCombinePf, combine_cus, &[c_shd, c_d], |d| {
+                d.t[0] = n.dg_tp;
+                d.t[1] = TENSOR_NONE; // residual rides AFTER the all-reduce (else summed tp times)
+                d.t[2] = if dfold {
+                    TENSOR_NONE
+                } else if raw_output {
+                    n.attn
+                } else {
+                    n.shared
+                };
+                d.t[3] = n.part;
+                d.i[0] = h;
+                d.i[1] = if det || flat || routed_w8a8 || aiter950 {
+                    1
+                } else {
+                    tk_route
+                };
+                d.i[2] = rows;
+                d.i[3] = 0;
+                d.i[4] = u32::from(det);
+                d.i[7] = u32::from(flat || routed_w8a8 || aiter950);
+            })
+        };
         let c_xr = emit_xreduce(
             b,
             xgate,
@@ -11579,7 +11600,10 @@ pub(crate) fn emit_glm_moe_ffn(
     let use_fp8 = enc != MoeEnc::Bf16;
     let lin_fp8 = glm_linear_fp8(enc);
     let glu_split = glm_shared_glu_split(enc);
-    if rows > 1 || emit_config::active().glm_moe_resident() || emit_config::active().glm_routed_w8a8
+    // gfx950's AITER route keeps the row-major slab, so one row stays on the single-row MoE.
+    if rows > 1
+        || (emit_config::active().glm_moe_resident() && !glm_aiter_gfx950(c, b.n_cu(), enc))
+        || emit_config::active().glm_routed_w8a8
     {
         // BATCHED DECODE FFN: the decode MoE op family carries no token dimension
         // (`MoeRouterTopk`/`MoeGroupGluFp8Blk`/`MoeGroupDownFp8Blk`/`MoeCombine` are all
