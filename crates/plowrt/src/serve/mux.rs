@@ -1420,6 +1420,7 @@ pub fn spawn(
                     &mut draining,
                     &mut drain_done,
                     &mut late_drains,
+                    prefix_probe.as_ref(),
                 );
             }
 
@@ -1641,6 +1642,7 @@ pub fn spawn(
                     &mut draining,
                     &mut drain_done,
                     &mut late_drains,
+                    prefix_probe.as_ref(),
                 ) > 0
             {
                 queued_behind = true;
@@ -2107,12 +2109,22 @@ fn drain_channel(
     draining: &mut bool,
     drain_done: &mut Option<tokio::sync::oneshot::Sender<()>>,
     late_drains: &mut Vec<tokio::sync::oneshot::Sender<()>>,
+    prefix: Option<&crate::memory::vmm::PrefixProbe>,
 ) -> usize {
     let mut jobs = 0;
     while let Ok(msg) = rx.try_recv() {
         match msg {
-            MuxMsg::Job(job, arrived) => {
+            MuxMsg::Job(mut job, arrived) => {
                 note_arrival(job.arrived, load, metrics);
+                // A host-tier boundary this prompt would attach starts its restore now, so
+                // the copy overlaps the queueing (`VmmKv::enable_host_tier`). One pool lock
+                // per arrival, nothing when the tier is off.
+                if let Some(p) = prefix.filter(|p| p.host_tier()) {
+                    if job.opts.prefix.is_none() {
+                        job.opts.prefix = Some(p.key(&job.prompt_ids));
+                    }
+                    p.prefetch(&job.prompt_ids, job.opts.prefix.as_ref());
+                }
                 waiting.push_back((job, arrived));
                 jobs += 1;
             }
@@ -7959,7 +7971,8 @@ mod tests {
                 &metrics,
                 &mut draining,
                 &mut drain_done,
-                &mut late
+                &mut late,
+                None,
             ),
             3
         );
@@ -8006,6 +8019,7 @@ mod tests {
             &mut draining,
             &mut drain_done,
             &mut late,
+            None,
         );
         let mut slots: Vec<Option<Slot>> = (0..1).map(|_| None).collect();
         let due = tick_due(&slots, &waiting, 0, now);

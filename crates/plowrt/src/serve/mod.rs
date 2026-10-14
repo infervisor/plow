@@ -1775,6 +1775,136 @@ async fn metrics_handler(
             "counter",
             "Bytes freed by suffix evictions.",
         ),
+        (
+            "snapshots_branch",
+            "gauge",
+            "Boundary snapshots with two or more retained continuations.",
+        ),
+        (
+            "snapshots_retired_total",
+            "counter",
+            "Boundary snapshots retired as superseded by their single continuation.",
+        ),
+        (
+            "snapshots_touched_total",
+            "counter",
+            "Metadata-only refreshes of an already published boundary.",
+        ),
+        (
+            "publishes_prompt_end_total",
+            "counter",
+            "Boundary snapshots published at a prompt end.",
+        ),
+        (
+            "publishes_shared_end_total",
+            "counter",
+            "Boundary snapshots published at a shared-prefix end.",
+        ),
+        (
+            "publishes_checkpoint_total",
+            "counter",
+            "Boundary snapshots published at an awaited checkpoint.",
+        ),
+        (
+            "publishes_turn_end_total",
+            "counter",
+            "Boundary snapshots published at a turn end (legacy session output).",
+        ),
+        (
+            "attach_prompt_end_total",
+            "counter",
+            "Attaches whose attach point was a prompt-end boundary.",
+        ),
+        (
+            "attach_block_total",
+            "counter",
+            "Attaches that fell back to a block-aligned checkpoint (prompt end evicted).",
+        ),
+        (
+            "attach_shared_total",
+            "counter",
+            "Attaches that hit only a shared-prefix end.",
+        ),
+        (
+            "tokens_attached_prompt_end_total",
+            "counter",
+            "Prompt rows attached at prompt-end boundaries.",
+        ),
+        (
+            "tokens_attached_block_total",
+            "counter",
+            "Prompt rows attached at block-aligned checkpoints.",
+        ),
+        (
+            "tokens_attached_shared_total",
+            "counter",
+            "Prompt rows attached at shared-prefix ends.",
+        ),
+        (
+            "tokens_lost_prompt_end_total",
+            "counter",
+            "Prompt rows recomputed after a prompt-end attach.",
+        ),
+        (
+            "tokens_lost_block_total",
+            "counter",
+            "Prompt rows recomputed after a block-aligned attach.",
+        ),
+        (
+            "tokens_lost_shared_total",
+            "counter",
+            "Prompt rows recomputed after a shared-prefix attach.",
+        ),
+        (
+            "tokens_lost_miss_total",
+            "counter",
+            "Prompt rows recomputed after a miss.",
+        ),
+        (
+            "host_snapshots",
+            "gauge",
+            "Boundary snapshots resident in the pinned host tier.",
+        ),
+        (
+            "host_snapshot_bytes",
+            "gauge",
+            "Bytes of boundary snapshots resident in the pinned host tier.",
+        ),
+        (
+            "host_capacity_bytes",
+            "gauge",
+            "Pinned host tier bytes allocated so far.",
+        ),
+        (
+            "host_snapshots_spilled_total",
+            "counter",
+            "Boundary snapshots copied device to host on eviction.",
+        ),
+        (
+            "host_snapshots_restored_total",
+            "counter",
+            "Boundary snapshots copied host to device for an attach or a prefetch.",
+        ),
+        (
+            "host_evictions_total",
+            "counter",
+            "Boundary snapshots dropped from the host tier.",
+        ),
+        (
+            "host_spill_fallbacks_total",
+            "counter",
+            "Evictions that freed a snapshot the host tier could not take.",
+        ),
+        (
+            "host_prefetches_total",
+            "counter",
+            "Host to device restores queued by the admission probe ahead of the attach.",
+        ),
+        (
+            "host_fence_failures_total",
+            "counter",
+            "Spill copies whose fence failed; both buffers quarantined.",
+        ),
     ] {
         crate::obs::serving::family(&mut out, &format!("plowrt_prefix_{name}"), kind, help);
     }
@@ -1803,7 +1933,33 @@ async fn metrics_handler(
              plowrt_prefix_eviction_unit_bytes_total{{model=\"{slug}\"}} {}\n\
              plowrt_prefix_snapshots_live{{model=\"{slug}\"}} {}\n\
              plowrt_prefix_snapshots_shared{{model=\"{slug}\"}} {}\n\
-             plowrt_prefix_snapshots_share{{model=\"{slug}\"}} {}\n",
+             plowrt_prefix_snapshots_share{{model=\"{slug}\"}} {}\n\
+             plowrt_prefix_snapshots_branch{{model=\"{slug}\"}} {}\n\
+             plowrt_prefix_snapshots_retired_total{{model=\"{slug}\"}} {}\n\
+             plowrt_prefix_snapshots_touched_total{{model=\"{slug}\"}} {}\n\
+             plowrt_prefix_publishes_prompt_end_total{{model=\"{slug}\"}} {}\n\
+             plowrt_prefix_publishes_shared_end_total{{model=\"{slug}\"}} {}\n\
+             plowrt_prefix_publishes_checkpoint_total{{model=\"{slug}\"}} {}\n\
+             plowrt_prefix_publishes_turn_end_total{{model=\"{slug}\"}} {}\n\
+             plowrt_prefix_attach_prompt_end_total{{model=\"{slug}\"}} {}\n\
+             plowrt_prefix_attach_block_total{{model=\"{slug}\"}} {}\n\
+             plowrt_prefix_attach_shared_total{{model=\"{slug}\"}} {}\n\
+             plowrt_prefix_tokens_attached_prompt_end_total{{model=\"{slug}\"}} {}\n\
+             plowrt_prefix_tokens_attached_block_total{{model=\"{slug}\"}} {}\n\
+             plowrt_prefix_tokens_attached_shared_total{{model=\"{slug}\"}} {}\n\
+             plowrt_prefix_tokens_lost_prompt_end_total{{model=\"{slug}\"}} {}\n\
+             plowrt_prefix_tokens_lost_block_total{{model=\"{slug}\"}} {}\n\
+             plowrt_prefix_tokens_lost_shared_total{{model=\"{slug}\"}} {}\n\
+             plowrt_prefix_tokens_lost_miss_total{{model=\"{slug}\"}} {}\n\
+             plowrt_prefix_host_snapshots{{model=\"{slug}\"}} {}\n\
+             plowrt_prefix_host_snapshot_bytes{{model=\"{slug}\"}} {}\n\
+             plowrt_prefix_host_capacity_bytes{{model=\"{slug}\"}} {}\n\
+             plowrt_prefix_host_snapshots_spilled_total{{model=\"{slug}\"}} {}\n\
+             plowrt_prefix_host_snapshots_restored_total{{model=\"{slug}\"}} {}\n\
+             plowrt_prefix_host_evictions_total{{model=\"{slug}\"}} {}\n\
+             plowrt_prefix_host_spill_fallbacks_total{{model=\"{slug}\"}} {}\n\
+             plowrt_prefix_host_prefetches_total{{model=\"{slug}\"}} {}\n\
+             plowrt_prefix_host_fence_failures_total{{model=\"{slug}\"}} {}\n",
             s.attach_hits,
             s.attach_misses,
             s.tokens_queried,
@@ -1823,6 +1979,32 @@ async fn metrics_handler(
             s.snapshots_live,
             s.snapshots_shared,
             s.snapshots_share,
+            s.snapshots_branch,
+            s.snapshots_retired,
+            s.snapshots_touched,
+            s.publishes_prompt_end,
+            s.publishes_shared_end,
+            s.publishes_checkpoint,
+            s.publishes_turn_end,
+            s.attach_prompt_end,
+            s.attach_block,
+            s.attach_shared,
+            s.tokens_attached_prompt_end,
+            s.tokens_attached_block,
+            s.tokens_attached_shared,
+            s.tokens_lost_prompt_end,
+            s.tokens_lost_block,
+            s.tokens_lost_shared,
+            s.tokens_lost_miss,
+            s.host_snapshots,
+            s.host_snapshot_bytes,
+            s.host_capacity_bytes,
+            s.snapshots_spilled,
+            s.snapshots_restored,
+            s.host_evictions,
+            s.spill_fallbacks,
+            s.host_prefetches,
+            s.spill_fence_failures,
         );
     }
     (

@@ -587,6 +587,15 @@ impl Drop for PinnedHost {
     }
 }
 
+/// The VMM host tier's copy stream and fences ([`crate::memory::vmm::VmmOps::copy_dtoh_async`]),
+/// created at the first spill. A fence is the raw handle of a recorded event; retired events
+/// are reused.
+struct CopyTier {
+    stream: CudaStream,
+    events: FxHashMap<u64, CudaEvent>,
+    spare: Vec<CudaEvent>,
+}
+
 /// `cuTensorMapEncodeTiled` (CUDA 12.0+): out map (128 B, 128-aligned), dtype, rank,
 /// globalAddress, globalDim[rank], globalStrides[rank-1] (bytes), boxDim[rank],
 /// elementStrides[rank], interleave, swizzle, l2Promotion, oobFill.
@@ -639,6 +648,8 @@ pub struct CudaBackend {
     /// `VmmOps::pool_put`/`pool_take`). Device-local by construction (one
     /// pool per backend, one backend per device); leftovers released in Drop.
     slab_pool: Mutex<Vec<(u64, u64)>>,
+    /// Snapshot spill copies ([`CopyTier`]); `None` until the first spill.
+    copy_tier: Mutex<Option<CopyTier>>,
     // Serialize driver mutations with metadata so rebinding cannot revive stale evidence.
     vmm_provenance: Mutex<super::provenance::VmmProvenance>,
     /// Set once, on the first fatal driver status ([`is_cuda_fatal`]): the
@@ -851,6 +862,7 @@ impl CudaBackend {
                 module_images: Mutex::new(FxHashMap::default()),
                 next_module: AtomicU64::new(1),
                 slab_pool: Mutex::new(Vec::new()),
+                copy_tier: Mutex::new(None),
                 vmm_provenance: Mutex::new(super::provenance::VmmProvenance::default()),
                 poisoned,
             })
@@ -2249,6 +2261,105 @@ impl crate::memory::vmm::VmmOps for CudaBackend {
             released += b;
         }
         released
+    }
+
+    fn host_tier_alloc(&self, bytes: u64) -> Result<u64> {
+        self.host_alloc(bytes as usize).map(|p| p as u64)
+    }
+
+    fn host_tier_free(&self, ptr: u64, bytes: u64) {
+        // SAFETY: ptr from `host_tier_alloc`, freed exactly once (pool contract).
+        let rc = unsafe {
+            let _ = bind_context(&self.api, self.ctx, self.freer.context_id);
+            (self.api.cuMemFreeHost)(ptr as *mut c_void)
+        };
+        if rc != 0 {
+            if self.is_poisoned() {
+                tracing::debug!(
+                    rc,
+                    bytes,
+                    "cuMemFreeHost(vmm host tier) failed (context poisoned)"
+                );
+            } else {
+                tracing::warn!(rc, bytes, "cuMemFreeHost(vmm host tier) failed");
+            }
+        }
+    }
+
+    fn copy_dtoh_async(&self, host_ptr: u64, va: u64, bytes: u64) -> Result<u64> {
+        self.bind()?;
+        let mut tier = self.copy_tier.lock();
+        let tier = match tier.as_mut() {
+            Some(t) => t,
+            None => tier.insert(CopyTier {
+                stream: self.stream_create()?,
+                events: FxHashMap::default(),
+                spare: Vec::new(),
+            }),
+        };
+        // SAFETY: `va` stays allocated until the fence retires (`memory/vmm.rs`,
+        // `SnapStore::Spilling`); `host_ptr` is inside a pinned tier chunk of at least `bytes`.
+        self.check(
+            unsafe {
+                (self.api.cuMemcpyDtoHAsync_v2)(
+                    host_ptr as *mut c_void,
+                    va,
+                    bytes as usize,
+                    tier.stream.raw as CUstream,
+                )
+            },
+            "cuMemcpyDtoHAsync(vmm spill)",
+        )?;
+        let event = match tier.spare.pop() {
+            Some(e) => e,
+            None => self.event_create(false)?,
+        };
+        self.event_record(&event, &tier.stream)?;
+        let fence = event.raw as u64;
+        tier.events.insert(fence, event);
+        Ok(fence)
+    }
+
+    fn fence_done(&self, fence: u64) -> Result<bool> {
+        let mut tier = self.copy_tier.lock();
+        let Some(tier) = tier.as_mut() else {
+            return Err(RuntimeError::Rejected("vmm spill: no copy stream".into()));
+        };
+        let Some(event) = tier.events.get(&fence) else {
+            return Err(RuntimeError::Device("vmm spill: unknown fence".into()));
+        };
+        if !self.event_query(event)? {
+            return Ok(false);
+        }
+        let event = tier.events.remove(&fence).expect("checked above");
+        tier.spare.push(event);
+        Ok(true)
+    }
+
+    fn fence_wait(&self, fence: u64) -> Result<()> {
+        let mut tier = self.copy_tier.lock();
+        let Some(tier) = tier.as_mut() else {
+            return Err(RuntimeError::Rejected("vmm spill: no copy stream".into()));
+        };
+        let Some(event) = tier.events.remove(&fence) else {
+            return Err(RuntimeError::Device("vmm spill: unknown fence".into()));
+        };
+        let done = self.event_synchronize(&event);
+        tier.spare.push(event);
+        done
+    }
+
+    /// Synchronous by design: from pinned memory `cuMemcpyHtoD` returns once the DMA
+    /// completed, so the engine's next operation on `va` (its own non-blocking stream) reads
+    /// the restored bytes without a cross-stream event.
+    fn copy_htod(&self, va: u64, host_ptr: u64, bytes: u64) -> Result<()> {
+        self.bind()?;
+        // SAFETY: `va` is a live `bytes`-long device allocation from `alloc`; `host_ptr` is
+        // inside a pinned tier chunk of at least `bytes`.
+        self.check(
+            unsafe { (self.api.cuMemcpyHtoD_v2)(va, host_ptr as *const c_void, bytes as usize) },
+            "cuMemcpyHtoD(vmm restore)",
+        )
     }
 }
 

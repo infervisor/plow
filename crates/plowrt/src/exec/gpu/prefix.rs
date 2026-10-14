@@ -501,6 +501,36 @@ impl GpuEngine {
                     if !full_scale.is_empty() {
                         kv.enable_strict_publish();
                     }
+                    if rt.prefix_policy_legacy() {
+                        kv.set_policy(crate::memory::vmm::Policy::Legacy);
+                    }
+                    tracing::info!(policy = ?kv.policy(), "vmm prefix: retention policy");
+                    let host_cap = rt.vmm_host_cache_bytes();
+                    if host_cap > 0 {
+                        // The largest snapshot a publish can produce (`vmm_snap_bytes` at
+                        // `max_ctx`): a full window, the fp8 full-layer scales over the whole
+                        // context and the partial block's rows.
+                        let g = kv.geometry();
+                        let full_scale_bytes =
+                            full_scale.len() as u64 * 2 * u64::from(g.kvh_full) * u64::from(g.max_ctx) * 4;
+                        let partial_bytes = g.full_layers.len() as u64
+                            * 2
+                            * u64::from(g.kvh_full)
+                            * u64::from(kv.block_rows() - 1)
+                            * u64::from(g.hd_full * g.elem);
+                        let slot_bytes = snap_row_bytes * u64::from(g.window)
+                            + full_scale_bytes
+                            + partial_bytes;
+                        match kv.enable_host_tier(host_cap, slot_bytes) {
+                            Ok(()) => tracing::info!(
+                                cap_mib = host_cap >> 20,
+                                slot_mib = slot_bytes >> 20,
+                                slots = host_cap / slot_bytes,
+                                "vmm prefix: host tier armed"
+                            ),
+                            Err(e) => tracing::warn!(error = %e, "vmm prefix: host tier off"),
+                        }
+                    }
                     kv
                 }),
                 slide,
@@ -815,7 +845,7 @@ impl GpuEngine {
         Ok(self.pos[b] as usize)
     }
 
-    fn publish_boundary(&self, b: usize, p_a: u32) -> bool {
+    fn publish_boundary(&self, b: usize, p_a: u32, kind: crate::memory::vmm::Kind) -> bool {
         let Some((v, kv)) = self.vmm_prefix() else {
             return false;
         };
@@ -824,6 +854,12 @@ impl GpuEngine {
         let g = kv.geometry();
         if rows == 0 || toks.len() != rows as usize || p_a == 0 {
             return false;
+        }
+        // An already published boundary needs no copy: refresh it before the ring-overflow
+        // check, so a surviving prompt end is touched however far decode ran past it.
+        if kv.touch(b, toks, p_a) {
+            tracing::debug!(slot = b, p_a, "vmm: boundary touched");
+            return true;
         }
         if !v.slide.is_empty() && rows - p_a > v.ring as u32 - g.window {
             tracing::debug!(
@@ -847,7 +883,7 @@ impl GpuEngine {
             return false;
         }
         let snap_bytes = self.vmm_snap_bytes(p_a);
-        if let Err(e) = kv.publish_at(b, toks, p_a, snap_bytes, |dst| {
+        if let Err(e) = kv.publish_kind(b, toks, p_a, kind, snap_bytes, |dst| {
             self.vmm_snap_copy(b, p_a, dst, true)
         }) {
             tracing::debug!(error = %e, slot = b, p_a, "vmm: publish_boundary skipped");
@@ -864,13 +900,16 @@ impl GpuEngine {
     /// block-aligned boundary has no tail, so any prompt sharing those blocks attaches to
     /// it), or every `PLOW_AMD_PREFIX_FINE_ROWS` rows when that is set.
     pub(super) fn vmm_publish(&self, b: usize, max_rows: u32) {
+        use crate::memory::vmm::{Kind, Policy};
         let Some((v, kv)) = self.vmm_prefix() else {
             return;
         };
         let rows = self.pos[b];
         let toks = &self.seq_tokens[b];
         let g = kv.geometry();
-        let session = self.session_pin[b].is_some();
+        let legacy = kv.policy() == Policy::Legacy;
+        // The boundary tree gives `X-Session-Id` no cache meaning.
+        let session = legacy && self.session_pin[b].is_some();
         let prompt = kv.prompt_rows(b);
         let prompt_end = is_prompt_end(rows, max_rows, prompt);
         // Every prompt end, not only a session's: a chat client's next turn re-renders the same
@@ -920,7 +959,7 @@ impl GpuEngine {
         let mut p = step;
         while p < p_a {
             if kv.checkpoint_awaited(toks, p) {
-                self.publish_boundary(b, p);
+                self.publish_boundary(b, p, Kind::CHECKPOINT);
             }
             p += step;
         }
@@ -935,13 +974,26 @@ impl GpuEngine {
         // usually diverges before it (`Snap::reusable_prompt`), so without a session it is
         // another private window copy published for nothing; the prompt end below is restored
         // or touched instead.
+        // The turn-end output boundary (prompt + reply) is a legacy session feature
+        // (`PLOW_PREFIX_CACHE_OUTPUT`): the next prompt re-renders the reply, so it attaches
+        // 0 of 1223 times on Gemma 4 and the boundary tree never publishes it.
         let turn_end = rows > prompt;
-        let published = if turn_end && !session {
+        let output = turn_end
+            && session
+            && crate::config::RuntimeConfig::get().prefix_cache_output();
+        let published = if turn_end && !output {
             false
         } else {
-            self.publish_boundary(b, p_a)
+            let kind = if turn_end {
+                Kind::TURN_END
+            } else if prompt_end {
+                Kind::PROMPT_END
+            } else {
+                Kind::CHECKPOINT
+            };
+            self.publish_boundary(b, p_a, kind)
         };
-        if published && prompt_end {
+        if published && prompt_end && legacy {
             if let Some(ttl) = self.session_pin[b] {
                 // Pinned now, not at retire: while this turn decodes, other sessions' publishes
                 // must not evict it ahead of idle sessions' boundaries.
@@ -950,6 +1002,7 @@ impl GpuEngine {
             // With or without a session: the boundary this turn attached to is spent once its
             // prompt end publishes (the next turn attaches to the longest boundary). Left in
             // place it held a second ~100 MiB window copy per conversation until LRU reached it.
+            // (The boundary tree retires structurally inside the publish.)
             let retire = session || crate::config::RuntimeConfig::get().prefix_retire_attached();
             let freed = if retire {
                 kv.retire_superseded(toks, p_a)
@@ -972,7 +1025,7 @@ impl GpuEngine {
         // `X-Session-Id` continues its conversation the same way.
         let end = session_prompt_end(prompt) / 32 * 32;
         if rows > prompt && end > 0 && end < p_a {
-            self.publish_boundary(b, end);
+            self.publish_boundary(b, end, Kind::PROMPT_END);
         }
     }
 
@@ -985,7 +1038,7 @@ impl GpuEngine {
         };
         let rows = kv.share_rows(b);
         if rows > c0 && rows <= self.pos[b] {
-            self.publish_boundary(b, rows);
+            self.publish_boundary(b, rows, crate::memory::vmm::Kind::SHARED_END);
         }
     }
 

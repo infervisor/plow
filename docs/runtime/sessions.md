@@ -128,12 +128,13 @@ Two mechanisms, one per KV layout, never both:
   slot itself is retained, as above (`GpuEngine::slot_resume_supported`, `resume_slot`). Zero
   copies; `begin_slot` starts the next sequence at the kept row.
 * VMM prefix cache (`docs/runtime/prefix-cache.md`; Hopper hybrid-BF16 Gemma 4 by default): the
-  cache already publishes each finished sequence's prompt and output blocks
-  (`PLOW_PREFIX_CACHE_OUTPUT`, on), and a next turn attaches them, so slots are not retained. A
-  session's retire instead pins its published path for the TTL (`PrefixCache::pin`): eviction
-  takes every unpinned leaf first and a pinned one only when nothing else is left, so a pin orders
-  eviction and never refuses an allocation. The reuse shows in
-  `usage.prompt_tokens_details.cached_tokens`; the header says `prefix-cache`. The prefix cache
+  cache publishes each sequence's prompt end, and a next turn attaches it, so slots are not
+  retained and `X-Session-Id` has no cache meaning (routing, fairness, dedupe and the turn table
+  only): the conversation's own chain of boundaries is the retention unit
+  (`PLOW_PREFIX_POLICY=tree`). Under `PLOW_PREFIX_POLICY=legacy` a session's retire additionally
+  pins its published path for the TTL (`PrefixCache::pin`: eviction takes every unpinned leaf
+  first) and publishes the turn-end output boundary (`PLOW_PREFIX_CACHE_OUTPUT`). The reuse shows
+  in `usage.prompt_tokens_details.cached_tokens`; the header says `prefix-cache`. The prefix cache
   stays off for overlay packets (their rows are not keyed by ids).
 
 The CPU engine retains slots the same way (`CpuServe::resume_slot`): a released slot keeps its

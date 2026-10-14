@@ -7290,7 +7290,9 @@ impl GpuEngine {
             }
             return;
         }
-        if cache_output && crate::config::RuntimeConfig::get().prefix_cache_output() {
+        // The turn-end pass: restores or touches the prompt end (the next turn's attach point)
+        // regardless of `PLOW_PREFIX_CACHE_OUTPUT`, which only gates the legacy output boundary.
+        if cache_output {
             self.vmm_publish(b, self.pos[b]);
         }
         if let (Some(ttl), Some(kv)) = (
@@ -7313,11 +7315,13 @@ impl GpuEngine {
                 tracing::warn!(slot = b, error = %e, "retire: pos_base reset failed");
             }
         }
-        // Decode's backstop maps row zero before any inactive-row write.
-        self.vmm.as_ref().unwrap().begin_seq(b);
+        // The live ring goes back first: `begin_seq`'s pressure trim then sees that memory free
+        // instead of evicting cached boundaries for it.
         if let Some(rings) = self.vmm.as_mut().and_then(|v| v.rings.as_mut()) {
             rings.release_slot(b);
         }
+        // Decode's backstop maps row zero before any inactive-row write.
+        self.vmm.as_ref().unwrap().begin_seq(b);
         self.seq_tokens[b].clear();
         self.vmm_active[b] = false;
     }
@@ -7326,6 +7330,13 @@ impl GpuEngine {
         self.staged_prefix[b] = None;
         if self.packed_admission[b] == PackedAdmission::Ready {
             self.kv_admission_epoch = self.kv_admission_epoch.wrapping_add(1);
+        }
+        // A wait on an in-flight prefix that ends here (cancelled before admission) drops its
+        // reservation; an admitted one is replaced by its attach.
+        if self.packed_admission[b] != PackedAdmission::Pending {
+            if let Some(kv) = self.vmm.as_ref().and_then(|v| v.kv.as_ref()) {
+                kv.clear_await(b);
+            }
         }
         self.packed_admission[b] = PackedAdmission::Pending;
     }
