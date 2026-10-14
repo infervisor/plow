@@ -65,6 +65,8 @@ pub const TENSOR_NONE_I: u32 = TENSOR_NONE16 as u32;
 /// GemvF32 i7 marker (PLOW_GLM_HC_MIX_RAW): the one-row fused mHC mix packet is an isolated
 /// segment the runtime routes to `hc_mix_decode_gfx950.elf`; the interpreter ignores i7.
 pub const HC_MIX_RAW_MARK: u32 = 0x4843_4d58;
+/// PLOW_GLM_HC_AITER: a GemvF32 run as the AITER fused mHC raw segment.
+pub const HC_AITER_MARK: u32 = 0x4843_4149;
 /// MoeGroupGluPf (i7 = 6) / MoeGroupDownPf (i7 = 2) j1 (= fj[2]) high half (PLOW_MOE_W8A8_DEC):
 /// the decode pair is one segment the runtime routes to `moe_w8a8_dec_gfx950.elf`; the low half
 /// is the align's tile-count bound. The interpreter's W8A8 arms ignore j1 (i6 is the EP degree).

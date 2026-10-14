@@ -224,7 +224,12 @@ enum DecodeSegmentKind {
 }
 
 fn hc_mix_raw(inst: &packet::dev::DevInst64) -> bool {
-    inst.op == DevOp::GemvF32 as u16 && inst.i[7] == packet::dev::HC_MIX_RAW_MARK
+    inst.op == DevOp::GemvF32 as u16
+        && (inst.i[7] == packet::dev::HC_MIX_RAW_MARK || hc_aiter_raw(inst))
+}
+
+fn hc_aiter_raw(inst: &packet::dev::DevInst64) -> bool {
+    inst.op == DevOp::GemvF32 as u16 && inst.i[7] == packet::dev::HC_AITER_MARK
 }
 
 fn decode_segment_kinds(prog: &DevProg) -> Result<Vec<DecodeSegmentKind>> {
@@ -641,6 +646,140 @@ struct HcMixArgs {
 }
 
 const _: () = assert!(std::mem::size_of::<HcMixArgs>() == 128);
+
+/// PLOW_GLM_HC_AITER: `mhc_fused_post_pre_gemm_sqrsum_kernel` (bf16, 4 warps, tile_m 16|32,
+/// tile_n 32, tile_k 32, split_k 64) kernargs.
+#[derive(Clone, Copy, Debug)]
+#[repr(C, packed(4))]
+struct HcAiterPostArgs {
+    mul: u64,
+    sq: u64,
+    next_residual: u64,
+    x: u64,
+    residual: u64,
+    w: u64,
+    post_mix: u64,
+    comb_mix: u64,
+    m: i32,
+    hidden: i32,
+    x_stride: i32,
+    out_stride: i32,
+    split_k: i32,
+}
+
+/// `mhc_pre_big_fuse_rmsnorm_kernel` (bf16, 5 warps, 1 row, hidden 4096) kernargs.
+#[derive(Clone, Copy, Debug)]
+#[repr(C, packed(4))]
+struct HcAiterPreArgs {
+    post_mix: u64,
+    comb_mix: u64,
+    out: u64,
+    mul: u64,
+    sq: u64,
+    hc_scale: u64,
+    hc_base: u64,
+    residual: u64,
+    gamma: u64,
+    m: i32,
+    n_splits: i32,
+    mul_stride: i32,
+    residual_stride: i32,
+    rms_eps: f32,
+    hc_pre_eps: f32,
+    sinkhorn_eps: f32,
+    norm_eps: f32,
+    post_mult: f32,
+    sinkhorn_repeat: i32,
+    res_preshuffle: i32,
+}
+
+const _: () = assert!(std::mem::size_of::<HcAiterPostArgs>() == 84);
+const _: () = assert!(std::mem::size_of::<HcAiterPreArgs>() == 116);
+const HC_AITER_SPLIT_K: u32 = 64;
+
+#[derive(Clone, Copy, Debug)]
+struct HcAiterRoute {
+    post: HcAiterPostArgs,
+    pre: HcAiterPreArgs,
+    tile32: bool,
+}
+
+fn hc_aiter_args(
+    d: &packet::dev::DevInst64,
+    tensors: &[crate::asset::devblob::DevTensor],
+    init: &[u8],
+    devp: &[DeviceMem],
+) -> Result<HcAiterRoute> {
+    let bad = |m: &str| RuntimeError::Device(format!("HcAiterDecode: {m}"));
+    let desc = tensors
+        .get(d.t[7] as usize)
+        .ok_or_else(|| bad("descriptor handle"))?;
+    let bytes = desc
+        .init
+        .clone()
+        .and_then(|r| init.get(r))
+        .filter(|b| b.len() == 40 && desc.bytes == 40)
+        .ok_or_else(|| bad("descriptor is not an initialized 10-word table"))?;
+    let w: Vec<u32> = bytes
+        .chunks_exact(4)
+        .map(|c| u32::from_le_bytes(c.try_into().expect("4")))
+        .collect();
+    let addr = |h: u32| -> Result<u64> {
+        devp.get(h as usize)
+            .map(|m| m.base)
+            .filter(|&b| b != 0)
+            .ok_or_else(|| bad("operand handle"))
+    };
+    let t = |slot: usize| addr(d.t[slot] as u32);
+    let m = d.i[0];
+    if m == 0 || m > 512 || d.i[1] != 24 || d.i[2] != 4 * 4096 || d.i[3] != 1 || w[6] != 4096 {
+        return Err(bad("unsupported geometry or descriptor"));
+    }
+    let (mul, sq) = (addr(w[4])?, addr(w[5])?);
+    let (post_mix, comb_mix, next_residual) = (t(5)?, t(6)?, t(1)?);
+    // AITER's gfx950 picker: tile_m 32 once ceil(m / 32) * split_k fills the 256 CUs.
+    let tile32 = m.div_ceil(32) * HC_AITER_SPLIT_K >= 256;
+    Ok(HcAiterRoute {
+        post: HcAiterPostArgs {
+            mul,
+            sq,
+            next_residual,
+            x: t(3)?,
+            residual: t(4)?,
+            w: t(2)?,
+            post_mix,
+            comb_mix,
+            m: m as i32,
+            hidden: 4096,
+            x_stride: 4096,
+            out_stride: 32,
+            split_k: HC_AITER_SPLIT_K as i32,
+        },
+        pre: HcAiterPreArgs {
+            post_mix,
+            comb_mix,
+            out: addr(w[0])?,
+            mul,
+            sq,
+            hc_scale: addr(w[2])?,
+            hc_base: addr(w[3])?,
+            residual: next_residual,
+            gamma: addr(w[1])?,
+            m: m as i32,
+            n_splits: HC_AITER_SPLIT_K as i32,
+            mul_stride: 32,
+            residual_stride: 4 * 4096,
+            rms_eps: f32::from_bits(w[8]),
+            hc_pre_eps: f32::from_bits(w[9]),
+            sinkhorn_eps: f32::from_bits(w[9]),
+            norm_eps: f32::from_bits(w[8]),
+            post_mult: 2.0,
+            sinkhorn_repeat: w[7] as i32,
+            res_preshuffle: 0,
+        },
+        tile32,
+    })
+}
 
 fn hc_mix_args(
     d: &packet::dev::DevInst64,
@@ -3333,6 +3472,7 @@ enum DecodeSegmentRoute {
     KdaDecodeFused(KdaDecodeFusedArgs),
     KdaDecodeWide(KdaDecodeWideArgs),
     HcMix(HcMixArgs),
+    HcAiter(HcAiterRoute),
     MoeW8a8Dec {
         glu: MoeFp8GluArgs,
         down: MoeFp8DownArgs,
@@ -3438,6 +3578,15 @@ fn decode_segment_routes(
                 continue;
             }
             DecodeSegmentKind::KdaDecodeFused(inst_ix) => inst_ix,
+            DecodeSegmentKind::HcMix(ix) if hc_aiter_raw(&prog.insts[ix]) => {
+                routes.push(DecodeSegmentRoute::HcAiter(hc_aiter_args(
+                    &prog.insts[ix],
+                    tensors,
+                    init,
+                    devp,
+                )?));
+                continue;
+            }
             DecodeSegmentKind::HcMix(ix) => {
                 routes.push(DecodeSegmentRoute::HcMix(hc_mix_args(
                     &prog.insts[ix],
@@ -7027,6 +7176,7 @@ pub struct AmdEngine {
     k_kda_decode_fused: Option<HsaKernel>,
     k_kda_decode_wide: Option<HsaKernel>,
     k_hc_mix: Option<HsaKernel>,
+    k_hc_aiter: Option<[HsaKernel; 3]>,
     k_moe_w8a8_dec: Option<[HsaKernel; 3]>,
     k_grouped_moe_glu: Option<HsaKernel>,
     k_grouped_moe_down: Option<HsaKernel>,
@@ -9127,10 +9277,60 @@ impl AmdEngine {
             None
         };
 
+        let need_hc_aiter = blob
+            .decode_phase()
+            .flat_map(|p| p.insts.iter())
+            .any(hc_aiter_raw);
+        let k_hc_aiter = if need_hc_aiter {
+            if arch != "gfx950" {
+                return Err(RuntimeError::Device(format!(
+                    "PLOW_GLM_HC_AITER requires gfx950, but this device is {arch}"
+                )));
+            }
+            const NAME: &str = "mhc_aiter_gfx950.elf";
+            const MARKER: &str = "plow_mhc_aiter_1";
+            const SYMS: [(&str, u32); 3] = [
+                ("_ZN5aiter37mhc_fused_post_pre_gemm_sqrsum_kernelIDF16bLi4ELi4ELi16ELi32ELi32ELb0ELb0ELb0ELb0EEEvPfS1_PT_S3_S3_S1_S1_S1_iiiii", 84),
+                ("_ZN5aiter37mhc_fused_post_pre_gemm_sqrsum_kernelIDF16bLi4ELi4ELi32ELi32ELi32ELb0ELb0ELb0ELb0EEEvPfS1_PT_S3_S3_S1_S1_S1_iiiii", 84),
+                ("_ZN5aiter31mhc_pre_big_fuse_rmsnorm_kernelIDF16bLi5ELi4ELi1ELi4096ELi1024ELi1024ELb0EEEvPfS1_PT_S1_S1_S1_S1_S3_S3_iiiifffffii", 116),
+            ];
+            let path = hsaco_dir.join(NAME);
+            let image = std::fs::read(&path).map_err(|e| {
+                RuntimeError::Device(format!(
+                    "PLOW_GLM_HC_AITER requires standalone object {}: {e}",
+                    path.display()
+                ))
+            })?;
+            if !elf_symbol_names(&image).contains(&MARKER) {
+                return Err(RuntimeError::Device(format!(
+                    "{} does not advertise `{MARKER}`; refusing a stale object",
+                    path.display()
+                )));
+            }
+            let module = EngineDevice::module_load(&*be, &image)
+                .map_err(|e| RuntimeError::Device(format!("{}: {e}", path.display())))?;
+            let mut ks = Vec::with_capacity(3);
+            for (sym, want) in SYMS {
+                let k = EngineDevice::get_function(&*be, &module, sym)
+                    .map_err(|e| RuntimeError::Device(format!("{NAME}: no symbol {sym}: {e}")))?;
+                let got = k.kernarg_size();
+                if got < want || k.private_segment_size() != 0 {
+                    return Err(RuntimeError::Device(format!(
+                        "{NAME}: {sym} kernarg segment is {got} B (ABI needs {want}) or private memory is used"
+                    )));
+                }
+                ks.push(k);
+            }
+            modules.push(module);
+            Some([ks[0], ks[1], ks[2]])
+        } else {
+            None
+        };
+
         let need_hc_mix = blob
             .decode_phase()
             .flat_map(|p| p.insts.iter())
-            .any(hc_mix_raw);
+            .any(|i| hc_mix_raw(i) && !hc_aiter_raw(i));
         let k_hc_mix = if need_hc_mix {
             if arch != "gfx950" {
                 return Err(RuntimeError::Device(format!(
@@ -12497,6 +12697,7 @@ impl AmdEngine {
             k_kda_decode_fused,
             k_kda_decode_wide,
             k_hc_mix,
+            k_hc_aiter,
             k_moe_w8a8_dec,
             k_grouped_moe_glu,
             k_grouped_moe_down,
@@ -15006,6 +15207,27 @@ impl AmdEngine {
                     0,
                     as_bytes(std::slice::from_ref(&down)),
                     None,
+                )?;
+                self.seg_launches += 1;
+            }
+            DecodeSegmentRoute::HcAiter(r) => {
+                let [k16, k32, kpre] = self.k_hc_aiter.ok_or_else(|| {
+                    RuntimeError::Device("HcAiterDecode segment has no validated object".into())
+                })?;
+                let tm = if r.tile32 { 32 } else { 16 };
+                self.be.launch_3d(
+                    if r.tile32 { k32 } else { k16 },
+                    [(r.post.m as u32).div_ceil(tm), 1, HC_AITER_SPLIT_K],
+                    256,
+                    as_bytes(std::slice::from_ref(&r.post)),
+                )?;
+                // Dynamic LDS: max(one bf16 row, reduce partials) = 8192 B at hidden 4096.
+                self.be.launch_3d_lds(
+                    kpre,
+                    [r.pre.m as u32, 1, 1],
+                    320,
+                    8192,
+                    as_bytes(std::slice::from_ref(&r.pre)),
                 )?;
                 self.seg_launches += 1;
             }

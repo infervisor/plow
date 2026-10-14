@@ -746,6 +746,49 @@ fn emit_glm53_hc_pre(
     } else {
         (w.attn_scale, w.attn_base)
     };
+    // PLOW_GLM_HC_AITER: post + mix (split-K partials) then pre + Sinkhorn + RmsNorm, AITER's two
+    // kernels in one raw segment. `layer_input` is dead under the norm fold and is not written.
+    if let (true, None, Some((raw, prev)), Some((nout, gamma))) = (
+        emit_config::active().glm_hc_aiter && c.hidden == 4096 && rows <= 512,
+        band,
+        post_fold,
+        norm_fold,
+    ) {
+        let side = if ffn { "ffn" } else { "attn" };
+        let mul = b.tensor(&format!("act.hc_aiter.{rows}.mul"), u64::from(rows) * 64 * 32 * 4);
+        let sq = b.tensor(&format!("act.hc_aiter.{rows}.sq"), u64::from(rows) * 64 * 4);
+        let words = [
+            nout,
+            gamma,
+            scale,
+            base,
+            mul,
+            sq,
+            c.hidden,
+            20,
+            c.eps.to_bits(),
+            1e-6f32.to_bits(),
+        ];
+        let bytes: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+        let desc = b.tensor_init(&format!("act.hc_aiter.{rows}.{layer}.{side}.desc"), bytes);
+        let cm = b.emit(DevOp::GemvF32, vec![0], &[dep], |d| {
+            d.i[7] = packet::dev::HC_AITER_MARK;
+            d.t[0] = mixes;
+            d.t[1] = residual;
+            d.t[2] = if ffn { w.ffn_fn } else { w.attn_fn };
+            d.t[3] = raw;
+            d.t[4] = prev;
+            d.t[5] = post_mix;
+            d.t[6] = comb_mix;
+            d.t[7] = desc;
+            d.i[0] = rows;
+            d.i[1] = 24;
+            d.i[2] = 4 * c.hidden;
+            d.i[3] = 1;
+        });
+        b.isolate(cm);
+        return cm;
+    }
     // PLOW_GLM_HC_PRE_TAIL (one-row decode): the HyperConnPre below runs on this GemvF32's
     // last-arriving workgroup, with its operands in a u32 descriptor (interp.hip
     // `exec_hc_pre_tail`). The separate pre packet was one workgroup, so this is the same call.
