@@ -1185,7 +1185,11 @@ enum SnapStore {
     Device(u64),
     /// D2H in flight: the copy reads `va`, so the device buffer outlives `fence` and is
     /// freed only once the fence retired ([`reap_spills`]).
-    Spilling { va: u64, slot: u32, fence: u64 },
+    Spilling {
+        va: u64,
+        slot: u32,
+        fence: u64,
+    },
     Host(u32),
     /// H2D in flight on the `vmm-host-tier` thread (a prefetch): `users` holds it, an attach
     /// waits on `host_cv` for the device buffer.
@@ -2757,10 +2761,14 @@ impl VmmKv {
         // The reservation names the boundary the owner will publish: a block checkpoint or a
         // shared end. A same-history wait names none: the owner's prompt end lands newest in
         // LRU and the wait ends when it does.
-        inner.awaited[seq] = best.filter(|&(owner, rows, at_share)| at_share || rows as usize % br == 0 || inner.share[owner] == rows).map(|(_, rows, _)| Await {
-            chain: chain_hash(&prompt[..rows as usize]),
-            rows,
-        });
+        inner.awaited[seq] = best
+            .filter(|&(owner, rows, at_share)| {
+                at_share || rows as usize % br == 0 || inner.share[owner] == rows
+            })
+            .map(|(_, rows, _)| Await {
+                chain: chain_hash(&prompt[..rows as usize]),
+                rows,
+            });
         if best.is_some() {
             note_lead(&mut inner, seq, prompt);
         }
@@ -2827,12 +2835,21 @@ impl VmmKv {
         };
         inner.snapshot_tick += 1;
         let tick = inner.snapshot_tick;
-        continue_lineage(&mut inner, seq, id, None);
         let snap = snap_mut(&mut inner, id).expect("found above");
         snap.last_used = tick;
         let parent = snap.parent;
         policy::refresh_ancestors(&mut inner, parent, tick);
         inner.stats.snapshots_touched += 1;
+        // A touch of the boundary this request's twin published (a same-history pair) is its
+        // continuation: the attached parent's `pending` hold ends and the single-continuation
+        // rule applies to it now.
+        let lineage = inner.seqs[seq].lineage;
+        continue_lineage(&mut inner, seq, id, parent);
+        if let Some(l) = lineage.filter(|&l| {
+            l != id && inner.policy == Policy::Tree && inner.seqs[seq].lineage.is_none()
+        }) {
+            policy::try_retire(s, &mut inner, l);
+        }
         true
     }
 
@@ -3420,7 +3437,12 @@ fn note_share(inner: &mut Inner, seq: usize, prompt: &[u32], attached: u32) {
     let common = inner
         .recent
         .iter()
-        .map(|r| (r.iter().zip(prompt).take_while(|(a, b)| a == b).count(), r.len()))
+        .map(|r| {
+            (
+                r.iter().zip(prompt).take_while(|(a, b)| a == b).count(),
+                r.len(),
+            )
+        })
         // Boundary tree: a recent prompt matched to its end (the same history, or a truncated
         // copy of it) or one this prompt is a prefix of showed no divergence: its prompt end
         // serves this prompt, a shared end there would be a window copy no later turn matches.
@@ -3850,7 +3872,10 @@ impl Drop for VmmKv {
                     s.ops.host_tier_free(ptr, bytes);
                 }
             } else {
-                tracing::warn!(leaked, "vmm host tier: unproven copies, pinned chunks leaked");
+                tracing::warn!(
+                    leaked,
+                    "vmm host tier: unproven copies, pinned chunks leaked"
+                );
             }
         }
         inner.stats.cache_blocks = 0;
@@ -8707,7 +8732,10 @@ mod tests {
         assert_eq!(s.snapshots_branch, 1);
         {
             let mut inner = p.shared.inner.lock();
-            assert!(evict_one(&p.shared, &mut inner, false), "a (the LRU) spills");
+            assert!(
+                evict_one(&p.shared, &mut inner, false),
+                "a (the LRU) spills"
+            );
         }
         p.begin_seq(0);
         p.begin_seq(1);
@@ -8727,7 +8755,10 @@ mod tests {
             policy::evict_unit(&p.shared, &mut inner, c_id);
         }
         let s = p.stats();
-        assert_eq!(s.snapshots_retired, 1, "one continuation left: a retires from the host");
+        assert_eq!(
+            s.snapshots_retired, 1,
+            "one continuation left: a retires from the host"
+        );
         assert_eq!(s.host_snapshots, 0);
         assert_eq!(s.host_snapshot_bytes, 0);
         assert_eq!(s.host_evictions, 1);
@@ -8924,7 +8955,10 @@ mod tests {
         let probe = p.prefix_probe().unwrap();
         let key = probe.key(&a);
         assert!(probe.prefetch(&a, Some(&key)));
-        assert!(!probe.prefetch(&a, Some(&key)), "queued or restored already");
+        assert!(
+            !probe.prefetch(&a, Some(&key)),
+            "queued or restored already"
+        );
         let hit = p.try_attach(1, &a).unwrap().unwrap();
         assert_eq!(ops.dev_read(hit.snap_va), vec![0xA1; 192]);
         let s = p.stats();
@@ -8935,9 +8969,16 @@ mod tests {
         p.finish_attach(1);
         p.release_prefix(1);
         let inner = p.shared.inner.lock();
-        assert!(inner.published.values().flatten().all(|snap| snap.users == 0));
+        assert!(inner
+            .published
+            .values()
+            .flatten()
+            .all(|snap| snap.users == 0));
         drop(inner);
-        assert!(!probe.prefetch(&prompt(5), None), "a miss prefetches nothing");
+        assert!(
+            !probe.prefetch(&prompt(5), None),
+            "a miss prefetches nothing"
+        );
     }
 
     /// Teardown with a tier: spills in flight are waited for, chunks freed, nothing leaked.
@@ -8952,7 +8993,11 @@ mod tests {
         drop(p);
         assert_eq!(ops.fences.lock().unwrap().len(), 0);
         assert_eq!(ops.host_frees.load(Ordering::SeqCst), 1);
-        assert_eq!(ops.dev.lock().unwrap().len(), 0, "every device buffer freed");
+        assert_eq!(
+            ops.dev.lock().unwrap().len(),
+            0,
+            "every device buffer freed"
+        );
     }
 
     /// Sub-`block_rows` matching ([`VmmKv::enable_fine_matching`]) — the direct test for

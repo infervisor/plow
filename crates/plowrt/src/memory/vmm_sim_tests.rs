@@ -180,7 +180,8 @@ impl Kv {
         let legacy = self.kv.policy() == Policy::Legacy;
         let session = self.session && legacy;
         let slack = env_u64("SIM_PE_SLACK", 8) as u32;
-        let prompt_end = (rows == prompt && max_rows < rows) || (rows + 1 == prompt && max_rows == rows);
+        let prompt_end =
+            (rows == prompt && max_rows < rows) || (rows + 1 == prompt && max_rows == rows);
         let max_rows = if prompt_end {
             prompt.saturating_sub(1 + slack)
         } else {
@@ -655,7 +656,14 @@ impl Rig {
 
     /// `strict`: FP8 KV's strict publish (`resolve_prefix_hazard`), the production pool's
     /// mode; `false` models a BF16-KV geometry.
-    fn new_with(policy: Policy, uniform: bool, cap: u64, gran: u64, batch: u32, strict: bool) -> Rig {
+    fn new_with(
+        policy: Policy,
+        uniform: bool,
+        cap: u64,
+        gran: u64,
+        batch: u32,
+        strict: bool,
+    ) -> Rig {
         let geo = VmmGeometry {
             full_layers: vec![3],
             kvh_full: 1,
@@ -734,7 +742,9 @@ impl Rig {
 
     /// The packed-admission wait: `(owner, rows)` while another slot's prefill will cover more.
     fn inflight(&self, b: usize, prompt: &[u32]) -> Option<(usize, u32)> {
-        self.k.kv.inflight_prefix(b, prompt, self.lookback, &self.pos)
+        self.k
+            .kv
+            .inflight_prefix(b, prompt, self.lookback, &self.pos)
     }
 
     /// Prefill `prompt` in `b` from the attached rows in chunks of `chunk` rows, publishing as
@@ -799,7 +809,10 @@ impl Rig {
         let wait = self.inflight(1, pb);
         assert!(wait.is_some_and(|(o, _)| o == 0), "B waits on A: {wait:?}");
         let mut a_toks = self.prefill(0, pa, 32);
-        assert!(self.inflight(1, pb).is_none(), "the wait ends with A's prefill");
+        assert!(
+            self.inflight(1, pb).is_none(),
+            "the wait ends with A's prefill"
+        );
         let b_rows = self.admit(1, pb);
         let mut b_toks = self.prefill(1, pb, self.chunk);
         self.finish(0, &mut a_toks, reply);
@@ -944,7 +957,10 @@ fn cell_host_tier_keeps_prompt_ends_the_device_cannot() {
     assert!(warm.snapshots_spilled > 0 && warm.snapshots_restored > 0);
     assert_eq!(warm.spill_fallbacks, 0);
     assert_eq!(warm.spill_fence_failures, 0);
-    assert!(warm.host_snapshots > 0, "the tier holds the idle prompt ends");
+    assert!(
+        warm.host_snapshots > 0,
+        "the tier holds the idle prompt ends"
+    );
 }
 
 /// `X-Session-Id` changes nothing under the tree: the same cell with sessions on gives the
@@ -966,11 +982,13 @@ fn cell_session_header_is_routing_only() {
     assert!(r.kv().shared.inner.lock().cache.pinned().is_empty());
 }
 
-/// Two requests of one conversation on the same history at once (parallel tool calls).
-/// Path 1: B waits on A's in-flight prefill (`inflight_prefix`); path 2: B is admitted while A's
-/// prompt is the most recent (`note_share`). The tree publishes no shared end for the pair and
-/// the conversation keeps one boundary; legacy runs the same script without the claim (its
-/// residue needs the production shapes).
+/// Two requests of one conversation on the same history at once (parallel tool calls), the
+/// 2026-10-14 production shape: a turn delta past `SHARE_MIN_ROWS` and a prompt whose 32-row
+/// shared end lands inside the rows the next turn's template re-renders. Path 1: B waits on A's
+/// in-flight prefill (`inflight_prefix` names the shared end); path 2: B is admitted while A's
+/// prompt is the most recent (`note_share`). Legacy publishes the shared end, no later turn can
+/// attach it and it is never retired (the sticky slot); the tree names no shared end for a
+/// same-history pair and the conversation keeps one boundary.
 #[test]
 fn cell_parallel_pair_on_one_history() {
     for (policy, via_inflight) in [
@@ -979,10 +997,16 @@ fn cell_parallel_pair_on_one_history() {
         (Policy::Tree, true),
         (Policy::Tree, false),
     ] {
-        let mut r = Rig::new(policy, false, 1 << 20, 64, 3);
-        let p1 = conv_prompt(3, 40, 150);
+        let at = format!("{policy:?} via_inflight={via_inflight}");
+        // 512-row blocks: as in production (4096-row blocks, 5.7K prompts) both prompt ends and
+        // the shared end sit in one block, so strict publish lets either request publish it.
+        let mut r = Rig::new(policy, false, 1 << 20, 4096, 3);
+        let p1 = conv_prompt(3, 40, 520);
         let (_, reply) = r.turn(0, &p1, 30);
-        let p2 = next_prompt(&p1, &reply, 4, 400, 70_000);
+        // 834 rows: the shared end (833 / 32 * 32 = 832) lies past the 830 rows the next
+        // turn keeps; the prompt end is 800, 256 rows past the attached 544.
+        let p2 = next_prompt(&p1, &reply, 4, 248, 70_000);
+        assert_eq!(p2.len(), 834);
         // A: admitted and prefilling the first 64 rows past its attach point.
         let a_rows = r.admit(0, &p2);
         assert!(a_rows > 0);
@@ -992,7 +1016,7 @@ fn cell_parallel_pair_on_one_history() {
         let b_rows;
         if via_inflight {
             let wait = r.inflight(1, &p2);
-            assert!(wait.is_some_and(|(o, _)| o == 0), "B waits on A ({policy:?})");
+            assert!(wait.is_some_and(|(o, _)| o == 0), "B waits on A ({at})");
             // A finishes its prefill (publishing its shared end if one was named), B attaches.
             let c0 = a_toks.len();
             a_toks.extend_from_slice(&p2[c0..]);
@@ -1011,22 +1035,55 @@ fn cell_parallel_pair_on_one_history() {
             r.k.publish(0, &a_toks, a_toks.len() as u32 - 1, RIG_TTL);
             r.k.kv.prefill_done(0);
         }
-        let mut b_toks = r.prefill(1, &p2, 4096);
         assert!(b_rows > 0);
+        let mut b_toks = r.prefill(1, &p2, 4096);
         let mut a_toks = a_toks;
-        let reply_a = r.finish(0, &mut a_toks, 30);
+        let mut reply = r.finish(0, &mut a_toks, 30);
         r.finish(1, &mut b_toks, 30);
-        let share_snaps = r.kv().stats().snapshots_share;
-        // Turn 3 continues from A's reply.
-        let p3 = next_prompt(&p2, &reply_a, 4, 100, 80_000);
-        let (rows, _) = r.turn(2, &p3, 30);
-        assert!(rows > 0, "turn 3 attaches a prompt end ({policy:?})");
-        let snaps = r.snaps();
-        if policy == Policy::Tree {
-            assert_eq!(r.kv().stats().publishes_shared_end, 0, "no shared end: {snaps:?}");
-            assert_eq!(r.live(), 1, "one boundary: {snaps:?}");
+        // Three more turns continue from A's reply.
+        let mut p = p2;
+        for t in 0..3u32 {
+            p = next_prompt(&p, &reply, 4, 100, 80_000 + 1_000 * t);
+            let (rows, out) = r.turn(2, &p, 30);
+            reply = out;
+            assert_eq!(
+                rows,
+                (p.len() as u32 - 100 - 30 + 4 - 9) / 32 * 32,
+                "turn {} attaches the previous prompt end ({at}): {}",
+                t + 3,
+                r.dump()
+            );
         }
-        let _ = share_snaps;
+        let s = r.kv().stats();
+        let sticky = r.snaps().iter().any(|&(rows, _, _)| rows == 832);
+        if policy == Policy::Tree {
+            assert_eq!(
+                s.publishes_shared_end,
+                0,
+                "no shared end ({at}): {}",
+                r.dump()
+            );
+            assert_eq!(r.live(), 1, "one boundary ({at}): {}", r.dump());
+        } else {
+            assert_eq!(
+                s.publishes_shared_end,
+                1,
+                "legacy publishes the shared end ({at}): {}",
+                r.dump()
+            );
+            assert!(
+                sticky,
+                "legacy keeps the unattachable shared end ({at}): {}",
+                r.dump()
+            );
+            assert_eq!(s.snapshots_share, 1, "({at}): {}", r.dump());
+            assert_eq!(
+                r.live(),
+                2,
+                "the conversation's end plus the sticky slot ({at}): {}",
+                r.dump()
+            );
+        }
     }
 }
 
@@ -1068,7 +1125,11 @@ fn cell_retry_and_regenerate() {
     assert!(rows2 > 0);
     let live = r.live();
     let (rows_retry, _) = r.turn(1, &p2, 30);
-    assert_eq!(rows_retry, p2.len() as u32 - 1 - 8 - (p2.len() as u32 - 9) % 32, "the retry attaches its own prompt end");
+    assert_eq!(
+        rows_retry,
+        p2.len() as u32 - 1 - 8 - (p2.len() as u32 - 9) % 32,
+        "the retry attaches its own prompt end"
+    );
     assert_eq!(r.live(), live, "a retry adds no boundary");
     assert_eq!(
         r.kv().stats().snapshots_touched,
@@ -1078,8 +1139,16 @@ fn cell_retry_and_regenerate() {
     // Regenerate turn 2 with a different message: P1's end is retired, so this is a miss below P2.
     let p2b = next_prompt(&p1, &r1, 4, 100, 91_000);
     let (rows_b, _) = r.turn(0, &p2b, 30);
-    assert_eq!(rows_b, 0, "no boundary on the regenerate's chain survives P1's retire");
-    assert_eq!(r.live(), 2, "two live branches of the conversation: {}", r.dump());
+    assert_eq!(
+        rows_b, 0,
+        "no boundary on the regenerate's chain survives P1's retire"
+    );
+    assert_eq!(
+        r.live(),
+        2,
+        "two live branches of the conversation: {}",
+        r.dump()
+    );
     let _ = r2;
 }
 
@@ -1118,13 +1187,20 @@ fn cell_shared_system_prompt_under_pressure() {
         for c in 2..20u32 {
             let p = conv_prompt(10 + c, 288, 120);
             let (rows, _) = r.turn((c % 2) as usize, &p, 20);
-            assert!(rows >= 256, "conversation {c} ({policy:?}): attached {rows} rows");
+            assert!(
+                rows >= 256,
+                "conversation {c} ({policy:?}): attached {rows} rows"
+            );
             hits += 1;
         }
         assert_eq!(hits, 19);
         let s = r.kv().stats();
         assert_eq!(s.attach_shared, 19, "{policy:?}");
-        assert!(s.snapshots_live <= 9, "{policy:?}: {} live", s.snapshots_live);
+        assert!(
+            s.snapshots_live <= 9,
+            "{policy:?}: {} live",
+            s.snapshots_live
+        );
     }
 }
 
@@ -1226,7 +1302,11 @@ fn cell_branch_point_retires_when_one_child_is_left() {
     let (rows_c2, _) = r.turn(0, &pc, 10);
     assert_eq!(rows_c2, 0, "C's chain recomputes from nothing");
     let (rows_d2, _) = r.turn(1, &pd, 10);
-    assert_eq!(rows_d2, (pd.len() as u32 - 9) / 32 * 32, "D is the attach point");
+    assert_eq!(
+        rows_d2,
+        (pd.len() as u32 - 9) / 32 * 32,
+        "D is the attach point"
+    );
     r.check();
 }
 
@@ -1246,7 +1326,11 @@ fn cell_shared_end_is_structurally_exempt_prompt_end_is_not() {
     assert!(snaps.iter().any(|s| s.1.has(Kind::SHARED_END)), "{snaps:?}");
     let d = conv_prompt(23, 288, 100);
     r.turn(1, &d, 10);
-    assert!(r.snaps().iter().any(|s| s.1.has(Kind::SHARED_END)), "still there: {:?}", r.snaps());
+    assert!(
+        r.snaps().iter().any(|s| s.1.has(Kind::SHARED_END)),
+        "still there: {:?}",
+        r.snaps()
+    );
     // A prompt end attached twice and then continued is retired all the same.
     let (rows1, r1) = r.turn(0, &d, 10);
     assert!(rows1 > 0);
@@ -1254,7 +1338,12 @@ fn cell_shared_end_is_structurally_exempt_prompt_end_is_not() {
     let d2 = next_prompt(&d, &r1, 4, 50, 130_000);
     let (rows2, _) = r.turn(0, &d2, 10);
     assert_eq!(rows2, rows1, "d2 attaches d's end too: {}", r.dump());
-    assert_eq!(r.live(), live, "d's end retired as d2 published: {}", r.dump());
+    assert_eq!(
+        r.live(),
+        live,
+        "d's end retired as d2 published: {}",
+        r.dump()
+    );
     assert_eq!(r.kv().stats().snapshots_retired, 1);
 }
 
@@ -1281,11 +1370,19 @@ fn cell_recency_moves_on_attach_and_touch_only() {
             .map(|s| s.last_used)
             .unwrap()
     };
-    let shared_rows = r.snaps().iter().find(|s| s.1.has(Kind::SHARED_END)).unwrap().0;
+    let shared_rows = r
+        .snaps()
+        .iter()
+        .find(|s| s.1.has(Kind::SHARED_END))
+        .unwrap()
+        .0;
     let t0 = used(&r, shared_rows);
     let (rows, _) = r.turn(1, &c, 10); // a retry of c: attaches c's end, republishes it
     assert!(rows > shared_rows, "{rows} vs {shared_rows}: {}", r.dump());
-    assert!(used(&r, shared_rows) > t0, "the ancestor was refreshed by the attach");
+    assert!(
+        used(&r, shared_rows) > t0,
+        "the ancestor was refreshed by the attach"
+    );
 }
 
 /// Strict publish (FP8 KV, the production pool): a conversation that arrives after its
@@ -1332,7 +1429,10 @@ fn cell_sliding_only_geometry_is_refused_explicitly() {
         lag_us: [0, 0],
         gran: 64,
     });
-    let err = VmmKv::new(ops, geo, 64, 0).err().expect("refused").to_string();
+    let err = VmmKv::new(ops, geo, 64, 0)
+        .err()
+        .expect("refused")
+        .to_string();
     assert!(err.contains("cache tensor tracks"), "{err}");
 }
 
@@ -1356,5 +1456,9 @@ fn cell_turn_end_restores_an_evicted_prompt_end() {
     assert_eq!(r.k.republish.get(), (1, 1));
     let (rows2, _) = r.turn(1, &next_prompt(&p, &toks[p.len()..], 4, 50, 140_000), 10);
     assert!(rows2 > 0);
-    assert_eq!(r.k.republish.get(), (1, 2), "the surviving end was touched, not copied");
+    assert_eq!(
+        r.k.republish.get(),
+        (1, 2),
+        "the surviving end was touched, not copied"
+    );
 }

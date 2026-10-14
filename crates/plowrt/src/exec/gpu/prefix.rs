@@ -511,16 +511,18 @@ impl GpuEngine {
                         // `max_ctx`): a full window, the fp8 full-layer scales over the whole
                         // context and the partial block's rows.
                         let g = kv.geometry();
-                        let full_scale_bytes =
-                            full_scale.len() as u64 * 2 * u64::from(g.kvh_full) * u64::from(g.max_ctx) * 4;
+                        let full_scale_bytes = full_scale.len() as u64
+                            * 2
+                            * u64::from(g.kvh_full)
+                            * u64::from(g.max_ctx)
+                            * 4;
                         let partial_bytes = g.full_layers.len() as u64
                             * 2
                             * u64::from(g.kvh_full)
                             * u64::from(kv.block_rows() - 1)
                             * u64::from(g.hd_full * g.elem);
-                        let slot_bytes = snap_row_bytes * u64::from(g.window)
-                            + full_scale_bytes
-                            + partial_bytes;
+                        let slot_bytes =
+                            snap_row_bytes * u64::from(g.window) + full_scale_bytes + partial_bytes;
                         match kv.enable_host_tier(host_cap, slot_bytes) {
                             Ok(()) => tracing::info!(
                                 cap_mib = host_cap >> 20,
@@ -978,9 +980,8 @@ impl GpuEngine {
         // (`PLOW_PREFIX_CACHE_OUTPUT`): the next prompt re-renders the reply, so it attaches
         // 0 of 1223 times on Gemma 4 and the boundary tree never publishes it.
         let turn_end = rows > prompt;
-        let output = turn_end
-            && session
-            && crate::config::RuntimeConfig::get().prefix_cache_output();
+        let output =
+            turn_end && session && crate::config::RuntimeConfig::get().prefix_cache_output();
         let published = if turn_end && !output {
             false
         } else {

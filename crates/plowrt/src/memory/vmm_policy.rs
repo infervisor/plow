@@ -4,7 +4,7 @@
 //! the attached boundary and its ancestors, and a boundary is retired structurally once exactly
 //! one retained continuation extends it. No per-boundary flags, tiers or recency windows.
 //!
-//! Invariants (checked by `vmm_sim_tests::tree_invariants`):
+//! Invariants (checked by `check_tree` after every step of the scripted sim cells):
 //! * `users > 0` or an [`Await`] on a snapshot ⇒ it is never freed, on any path;
 //! * `parent(C).rows < C.rows` and the parent lies on `C`'s chain; `None` iff no retained
 //!   boundary lies below `C` on it;
@@ -238,16 +238,27 @@ pub(super) fn check_tree(inner: &Inner) {
         .flatten()
         .map(|s| (s.id, s))
         .collect();
-    assert_eq!(snaps.len(), inner.by_id.len(), "by_id out of step with published");
+    assert_eq!(
+        snaps.len(),
+        inner.by_id.len(),
+        "by_id out of step with published"
+    );
     for (&id, snap) in &snaps {
         assert_eq!(inner.by_id.get(&id), Some(&inner.by_id[&id]));
         if let Some(p) = snap.parent {
-            let parent = snaps.get(&p).unwrap_or_else(|| panic!("snap {id}: parent {p} freed"));
+            let parent = snaps
+                .get(&p)
+                .unwrap_or_else(|| panic!("snap {id}: parent {p} freed"));
             assert!(parent.rows < snap.rows, "snap {id}: parent not below it");
-            assert!(parent.children.contains(&id), "snap {id}: not in its parent's children");
+            assert!(
+                parent.children.contains(&id),
+                "snap {id}: not in its parent's children"
+            );
         }
         for &c in &snap.children {
-            let child = snaps.get(&c).unwrap_or_else(|| panic!("snap {id}: child {c} freed"));
+            let child = snaps
+                .get(&c)
+                .unwrap_or_else(|| panic!("snap {id}: child {c} freed"));
             assert_eq!(child.parent, Some(id), "child {c}: parent link mismatch");
         }
         assert!(
