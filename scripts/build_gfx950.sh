@@ -70,6 +70,17 @@ case "${PLOW_MLA_PF_SNAKE:-1}" in
   1) FLASH_TR16="$FLASH_TR16 -DPLOW_MLA_PF_SNAKE=1" ;;
   *) echo "PLOW_MLA_PF_SNAKE must be 0 or 1" >&2; exit 2 ;;
 esac
+# PLOW_KDA_PREP_COLSCAN (default 1 in prefill objects; =0 rolls back): the KDA chunk-prepare gate
+# prefix with lanes on the (head, dim) axis and the shuffle scan replayed per column (op_kda.h;
+# coalesced loads/stores, bit-identical). PLOW_KDA_GNORM_ILP (default 1 in prefill objects; =0
+# rolls back): the KDA output gated RMSNorm issues four rows' loads per wave pass (bit-identical).
+for k in PLOW_KDA_PREP_COLSCAN PLOW_KDA_GNORM_ILP; do
+  case "${!k:-1}" in
+    0) INC="$INC -D$k=0" ;;
+    1) ;;
+    *) echo "$k must be 0 or 1" >&2; exit 2 ;;
+  esac
+done
 # PLOW_KDA_CARRY_PIPE=1 / PLOW_KDA_CARRY_KTR16=1: regstate KDA carry load schedule and
 # transposed key-tile reads (op_kda_carry_regstate.h; both bit-identical).
 KDA_CARRY_DEFS=""
