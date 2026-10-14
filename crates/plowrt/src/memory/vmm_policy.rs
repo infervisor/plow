@@ -158,7 +158,22 @@ pub(super) fn evict_one_tree(s: &Shared, inner: &mut Inner, preserve_hot: bool) 
     // One LRU key; the newest boundary goes when it is the last candidate (the request that
     // published it is held by its lease, not by its snapshot). A session boundary inside its
     // TTL goes only once nothing unprotected is left, the host tier's entries included.
-    let _ = preserve_hot;
+    // The soft-cap trim (`preserve_hot`) keeps the most recently used boundary while a live
+    // request maps its blocks (production's MRU exemption, without its tier); allocation OOM
+    // may take it.
+    let hot = if preserve_hot && inner.stats.cache_blocks > 0 {
+        inner
+            .published
+            .iter()
+            .flat_map(|(node, list)| list.iter().map(move |snap| (*node, snap)))
+            .max_by_key(|(_, snap)| snap.last_used)
+            .filter(|(node, _)| {
+                node.is_some_and(|k| inner.cache.node_refs(k).is_some_and(|r| r > 0))
+            })
+            .map(|(_, snap)| snap.id)
+    } else {
+        None
+    };
     let now = std::time::Instant::now();
     let lru = |protected: bool| {
         inner
@@ -166,6 +181,7 @@ pub(super) fn evict_one_tree(s: &Shared, inner: &mut Inner, preserve_hot: bool) 
             .values()
             .flatten()
             .filter(|snap| snap.users == 0 && snap.on_device() && !snap_awaited(&awaited, snap))
+            .filter(|snap| Some(snap.id) != hot)
             .filter(|snap| snap.protect_until.is_some_and(|t| t > now) == protected)
             .min_by_key(|snap| snap.last_used)
             .map(|snap| snap.id)
