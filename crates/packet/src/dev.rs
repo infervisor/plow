@@ -62,6 +62,9 @@ pub const GEMM_WIDE_C8_TAG: u32 = (128 << 16) | 384;
 /// nothing, and the arm's absence check would pass on a packet that is missing
 /// an operand.
 pub const TENSOR_NONE_I: u32 = TENSOR_NONE16 as u32;
+/// GemvF32 i7 marker (PLOW_GLM_HC_MIX_RAW): the one-row fused mHC mix packet is an isolated
+/// segment the runtime routes to `hc_mix_decode_gfx950.elf`; the interpreter ignores i7.
+pub const HC_MIX_RAW_MARK: u32 = 0x4843_4d58;
 
 /// uint32 slots between adjacent counters — one 128-byte cache line.
 ///

@@ -213,12 +213,17 @@ enum DecodeSegmentKind {
     Interpreter,
     MlaAttention,
     KdaDecodeFused(usize),
+    HcMix(usize),
     MoeAiter,
     GemmLt,
     GroupedMoeMxfp4 { glu: usize, down: usize },
     SparseMlaDecode(usize),
     MlaBf16,
     IndexFp8,
+}
+
+fn hc_mix_raw(inst: &packet::dev::DevInst64) -> bool {
+    inst.op == DevOp::GemvF32 as u16 && inst.i[7] == packet::dev::HC_MIX_RAW_MARK
 }
 
 fn decode_segment_kinds(prog: &DevProg) -> Result<Vec<DecodeSegmentKind>> {
@@ -266,8 +271,11 @@ fn decode_segment_kinds(prog: &DevProg) -> Result<Vec<DecodeSegmentKind>> {
                 || inst.op == DevOp::MoeAiterFp8Pf as u16
                 || inst.op == DevOp::GemmLtPf as u16
                 || inst.op == DevOp::IndexFp8Decode as u16
+                || hc_mix_raw(inst)
             {
-                let name = if inst.op == DevOp::MoeAiterFp8Pf as u16 {
+                let name = if hc_mix_raw(inst) {
+                    "HcMixDecode"
+                } else if inst.op == DevOp::MoeAiterFp8Pf as u16 {
                     "MoeAiterFp8Pf"
                 } else if inst.op == DevOp::GemmLtPf as u16 {
                     "GemmLtPf"
@@ -329,7 +337,9 @@ fn decode_segment_kinds(prog: &DevProg) -> Result<Vec<DecodeSegmentKind>> {
             }
         }
         if let Some(inst) = fused_inst {
-            let name = if prog.insts[inst].op == DevOp::MoeAiterFp8Pf as u16 {
+            let name = if hc_mix_raw(&prog.insts[inst]) {
+                "HcMixDecode"
+            } else if prog.insts[inst].op == DevOp::MoeAiterFp8Pf as u16 {
                 "MoeAiterFp8Pf"
             } else if prog.insts[inst].op == DevOp::GemmLtPf as u16 {
                 "GemmLtPf"
@@ -349,7 +359,9 @@ fn decode_segment_kinds(prog: &DevProg) -> Result<Vec<DecodeSegmentKind>> {
                     "decode segment {seg} mixes {name} with interpreter opcodes; standalone dispatch requires a pure segment"
                 )));
             }
-            kinds[seg] = if prog.insts[inst].op == DevOp::MoeAiterFp8Pf as u16 {
+            kinds[seg] = if hc_mix_raw(&prog.insts[inst]) {
+                DecodeSegmentKind::HcMix(inst)
+            } else if prog.insts[inst].op == DevOp::MoeAiterFp8Pf as u16 {
                 DecodeSegmentKind::MoeAiter
             } else if prog.insts[inst].op == DevOp::GemmLtPf as u16 {
                 DecodeSegmentKind::GemmLt
@@ -559,6 +571,92 @@ struct KdaDecodeFusedArgs {
 }
 
 const _: () = assert!(std::mem::size_of::<KdaDecodeFusedArgs>() == 184);
+
+/// PLOW_GLM_HC_MIX_RAW (`hc_mix_decode.hip`, grid 24): the one-row fused mHC mix packet.
+#[derive(Clone, Copy, Debug)]
+#[repr(C)]
+struct HcMixArgs {
+    mixes: u64,
+    new_residual: u64,
+    w: u64,
+    x_out: u64,
+    residual: u64,
+    post_mix: u64,
+    comb_mix: u64,
+    lin: u64,
+    nout: u64,
+    gamma: u64,
+    hc_scale: u64,
+    hc_base: u64,
+    ctr: u64,
+    k: u32,
+    hidden: u32,
+    sink: u32,
+    eps: u32,
+    hceps: u32,
+    norm: u32,
+}
+
+const _: () = assert!(std::mem::size_of::<HcMixArgs>() == 128);
+
+fn hc_mix_args(
+    d: &packet::dev::DevInst64,
+    tensors: &[crate::asset::devblob::DevTensor],
+    init: &[u8],
+    devp: &[DeviceMem],
+) -> Result<HcMixArgs> {
+    let bad = |m: &str| RuntimeError::Device(format!("HcMixDecode: {m}"));
+    let desc = tensors
+        .get(d.t[7] as usize)
+        .ok_or_else(|| bad("descriptor handle"))?;
+    let bytes = desc
+        .init
+        .clone()
+        .and_then(|r| init.get(r))
+        .filter(|b| b.len() == 52 && desc.bytes == 52)
+        .ok_or_else(|| bad("descriptor is not an initialized 13-word table"))?;
+    let w: Vec<u32> = bytes
+        .chunks_exact(4)
+        .map(|c| u32::from_le_bytes(c.try_into().expect("4")))
+        .collect();
+    let addr = |h: u32| -> Result<u64> {
+        devp.get(h as usize)
+            .map(|m| m.base)
+            .filter(|&b| b != 0)
+            .ok_or_else(|| bad("operand handle"))
+    };
+    let t = |slot: usize| addr(d.t[slot] as u32);
+    if d.i[..7] != [1, 24, 4 * w[9], 1, 3, 0, d.i[6]]
+        || d.i[6] & 1 == 0
+        || w[9] != 4096
+        || w[6] != 1
+        || w[0] != d.t[5] as u32
+        || w[1] != d.t[6] as u32
+    {
+        return Err(bad("unsupported geometry or descriptor"));
+    }
+    Ok(HcMixArgs {
+        mixes: t(0)?,
+        new_residual: t(1)?,
+        w: t(2)?,
+        x_out: t(3)?,
+        residual: t(4)?,
+        post_mix: t(5)?,
+        comb_mix: t(6)?,
+        lin: addr(w[2])?,
+        nout: addr(w[7])?,
+        gamma: addr(w[8])?,
+        hc_scale: addr(w[3])?,
+        hc_base: addr(w[4])?,
+        ctr: addr(w[5])?,
+        k: d.i[2],
+        hidden: w[9],
+        sink: w[10],
+        eps: w[11],
+        hceps: w[12],
+        norm: 1,
+    })
+}
 
 /// Op 125 descriptor version 3 (`kda_decode_wide.hip`): version 2's operands plus the chain's
 /// bf16 intermediates, which the standalone object still round-trips so it can run the
@@ -3049,6 +3147,7 @@ enum DecodeSegmentRoute {
     MlaAttention,
     KdaDecodeFused(KdaDecodeFusedArgs),
     KdaDecodeWide(KdaDecodeWideArgs),
+    HcMix(HcMixArgs),
     MoeAiter(amd_moe_aiter::Route),
     GemmLt(amd_gemm_lt::Route),
     SparseMlaDecode(amd_sparse_mla::DecodeRoute),
@@ -3143,6 +3242,15 @@ fn decode_segment_routes(
                 continue;
             }
             DecodeSegmentKind::KdaDecodeFused(inst_ix) => inst_ix,
+            DecodeSegmentKind::HcMix(ix) => {
+                routes.push(DecodeSegmentRoute::HcMix(hc_mix_args(
+                    &prog.insts[ix],
+                    tensors,
+                    init,
+                    devp,
+                )?));
+                continue;
+            }
             DecodeSegmentKind::GroupedMoeMxfp4 { glu, down } => {
                 let g = &prog.insts[glu];
                 let d = &prog.insts[down];
@@ -6644,6 +6752,7 @@ pub struct AmdEngine {
     k_decode_mla: Option<HsaKernel>,
     k_kda_decode_fused: Option<HsaKernel>,
     k_kda_decode_wide: Option<HsaKernel>,
+    k_hc_mix: Option<HsaKernel>,
     k_grouped_moe_glu: Option<HsaKernel>,
     k_grouped_moe_down: Option<HsaKernel>,
     k_kda_chunk_intra_cached: Option<HsaKernel>,
@@ -8726,6 +8835,50 @@ impl AmdEngine {
                 return Err(RuntimeError::Device(format!(
                     "{NAME}: kernarg segment is {got} B; the v3 ABI needs {want} (or {})",
                     want + IMPLICIT
+                )));
+            }
+            modules.push(module);
+            Some(kernel)
+        } else {
+            None
+        };
+
+        let need_hc_mix = blob
+            .decode_phase()
+            .flat_map(|p| p.insts.iter())
+            .any(hc_mix_raw);
+        let k_hc_mix = if need_hc_mix {
+            if arch != "gfx950" {
+                return Err(RuntimeError::Device(format!(
+                    "HcMixDecode requires gfx950, but this device is {arch}"
+                )));
+            }
+            const NAME: &str = "hc_mix_decode_gfx950.elf";
+            const MARKER: &str = "plow_hc_mix_decode_1";
+            const SYMBOL: &str = "plow_hc_mix_decode_r1";
+            let path = hsaco_dir.join(NAME);
+            let image = std::fs::read(&path).map_err(|e| {
+                RuntimeError::Device(format!(
+                    "PLOW_GLM_HC_MIX_RAW requires standalone object {}: {e}",
+                    path.display()
+                ))
+            })?;
+            if !elf_symbol_names(&image).contains(&MARKER) {
+                return Err(RuntimeError::Device(format!(
+                    "standalone HC mix object {} does not advertise `{MARKER}`; refusing a stale object",
+                    path.display()
+                )));
+            }
+            let module = EngineDevice::module_load(&*be, &image)
+                .map_err(|e| RuntimeError::Device(format!("{}: {e}", path.display())))?;
+            let kernel = EngineDevice::get_function(&*be, &module, SYMBOL)
+                .map_err(|e| RuntimeError::Device(format!("{NAME}: no symbol {SYMBOL}: {e}")))?;
+            const IMPLICIT: u32 = 256;
+            let want = std::mem::size_of::<HcMixArgs>() as u32;
+            let got = kernel.kernarg_size();
+            if (got != want && got != want + IMPLICIT) || kernel.private_segment_size() != 0 {
+                return Err(RuntimeError::Device(format!(
+                    "{NAME}: kernarg segment is {got} B (ABI needs {want}) or private memory is used"
                 )));
             }
             modules.push(module);
@@ -11978,6 +12131,7 @@ impl AmdEngine {
             k_decode_mla,
             k_kda_decode_fused,
             k_kda_decode_wide,
+            k_hc_mix,
             k_grouped_moe_glu,
             k_grouped_moe_down,
             k_kda_chunk_intra_cached,
@@ -14430,6 +14584,20 @@ impl AmdEngine {
                     kernel,
                     args.rows * args.heads,
                     256,
+                    0,
+                    as_bytes(std::slice::from_ref(&args)),
+                    None,
+                )?;
+            }
+            DecodeSegmentRoute::HcMix(args) => {
+                let kernel = self.k_hc_mix.ok_or_else(|| {
+                    RuntimeError::Device("HcMixDecode segment has no validated object".into())
+                })?;
+                EngineDevice::launch_kernel(
+                    &*self.be,
+                    kernel,
+                    24,
+                    WG_THREADS_8,
                     0,
                     as_bytes(std::slice::from_ref(&args)),
                     None,
