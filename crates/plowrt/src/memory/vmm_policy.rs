@@ -155,16 +155,23 @@ pub(super) fn evict_one_tree(s: &Shared, inner: &mut Inner, preserve_hot: bool) 
         return true;
     }
     let awaited = inner.awaited.clone();
-    // One LRU key and no exemption: the newest boundary goes when it is the last candidate
-    // (the request that published it is held by its lease, not by its snapshot).
+    // One LRU key; the newest boundary goes when it is the last candidate (the request that
+    // published it is held by its lease, not by its snapshot). A session boundary inside its
+    // TTL goes only once nothing unprotected is left, the host tier's entries included.
     let _ = preserve_hot;
-    let victim = inner
-        .published
-        .values()
-        .flatten()
-        .filter(|snap| snap.users == 0 && snap.on_device() && !snap_awaited(&awaited, snap))
-        .min_by_key(|snap| snap.last_used)
-        .map(|snap| snap.id);
+    let now = std::time::Instant::now();
+    let lru = |protected: bool| {
+        inner
+            .published
+            .values()
+            .flatten()
+            .filter(|snap| snap.users == 0 && snap.on_device() && !snap_awaited(&awaited, snap))
+            .filter(|snap| snap.protect_until.is_some_and(|t| t > now) == protected)
+            .min_by_key(|snap| snap.last_used)
+            .map(|snap| snap.id)
+    };
+    let victim = lru(false);
+    let protected = lru(true);
     // Blocks no boundary makes attachable are the cheapest bytes.
     if evict_dead_leaf(s, inner) {
         return true;
@@ -178,9 +185,16 @@ pub(super) fn evict_one_tree(s: &Shared, inner: &mut Inner, preserve_hot: bool) 
         evict_unit(s, inner, id);
         return true;
     }
-    // Every device boundary is held, awaited or the kept MRU: the device bytes a host-resident
+    // Every unprotected device boundary is held or awaited: the device bytes a host-resident
     // boundary still occupies (its blocks) are the next level of the same LRU.
     if let Some(id) = host_lru(inner) {
+        evict_unit(s, inner, id);
+        return true;
+    }
+    if let Some(id) = protected {
+        if spill_unit(s, inner, id) {
+            return true;
+        }
         evict_unit(s, inner, id);
         return true;
     }

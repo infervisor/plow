@@ -922,6 +922,11 @@ pub struct VmmStats {
     pub spill_fallbacks: u64,
     pub host_prefetches: u64,
     pub spill_fence_failures: u64,
+    /// `X-Session-Id` retention (`PLOW_PREFIX_SESSION_TTL_S`, tree): boundaries inside their
+    /// session TTL (gauge), and the expired ones demoted (suffix freed) with their bytes.
+    pub sessions_protected: u64,
+    pub session_demotions: u64,
+    pub session_demoted_bytes: u64,
     /// Suffix eviction units (a boundary plus the blocks only it kept attachable) and the
     /// bytes they freed.
     pub eviction_units: u64,
@@ -1174,6 +1179,10 @@ struct SlotSeq {
     /// Boundary tree: the boundary this request's prompt ended at (published or touched),
     /// counted once in its `Snap::ends`.
     ended: Option<u64>,
+    /// The boundary this request attached (for the session hold's refresh-on-attach).
+    attached: Option<u64>,
+    /// This request's session TTL ([`VmmKv::hold_session`]): its prompt end is protected.
+    session_ttl: Option<std::time::Duration>,
     /// The fine-cache counterpart of `hashes`/`held` ([`try_attach_fine`]): held exactly the
     /// same way, in the SEPARATE `fine_cache` radix tree, so `evict_one_fine` cannot evict a
     /// node a live attach is reading between `try_attach_fine`'s lock and the copy that
@@ -1294,6 +1303,10 @@ struct Snap {
     /// parallel pair, a retry) expect two continuations, which may diverge: the first one's
     /// child does not retire the boundary the second still needs (only LRU takes it).
     ends: u32,
+    /// A session's newest boundary (`X-Session-Id`, [`VmmKv::hold_session`]): protected from
+    /// LRU until this instant (eviction takes it only once nothing unprotected is left), then
+    /// demoted: the snapshot and the blocks only it kept attachable are freed.
+    protect_until: Option<std::time::Instant>,
     /// A spill whose fence failed: the device buffer is valid but never freed, never spilled.
     quarantined: bool,
     /// Boundary tree ([`Policy::Tree`]): the longest retained boundary strictly below `rows`
@@ -1392,6 +1405,8 @@ struct Inner {
     /// Snapshot id → the `published` key holding it.
     by_id: FxHashMap<u64, Option<(u32, u32)>>,
     next_snap_id: u64,
+    /// Last [`demote_expired`] sweep: at most one per [`SESSION_SWEEP`].
+    session_sweep: Option<std::time::Instant>,
     policy: Policy,
     /// [`VmmKv::enable_host_tier`]: `None` = evicted snapshots are freed.
     host: Option<HostTier>,
@@ -1614,6 +1629,7 @@ impl VmmKv {
                 awaited: vec![None; batch],
                 by_id: FxHashMap::default(),
                 next_snap_id: 0,
+                session_sweep: None,
                 policy: Policy::Tree,
                 host: None,
                 session: vec![false; batch],
@@ -2409,6 +2425,7 @@ impl VmmKv {
             held: pick,
             snapshot: Some(snap_key),
             lineage: Some(snap_key.id),
+            attached: Some(snap_key.id),
             ..Default::default()
         };
         inner.snapshot_tick += 1;
@@ -2734,6 +2751,26 @@ impl VmmKv {
 
     /// `seq` stopped waiting in [`Self::inflight_prefix`] without attaching (a cancelled or
     /// abandoned admission): drop its reservation.
+    /// `seq`'s request carries `X-Session-Id` (boundary tree): its prompt end, and the
+    /// boundary it attached (refreshed now), are protected from LRU for `ttl` after their last
+    /// use, then demoted ([`demote_expired`]). Called once the request is admitted; lasts
+    /// until its next `begin_seq`.
+    pub fn hold_session(&self, seq: usize, ttl: std::time::Duration) {
+        if !self.prefix_reuse || ttl.is_zero() {
+            return;
+        }
+        let mut inner = self.shared.inner.lock();
+        if inner.policy != Policy::Tree {
+            return;
+        }
+        inner.seqs[seq].session_ttl = Some(ttl);
+        if let Some(id) = inner.seqs[seq].attached {
+            if let Some(snap) = snap_mut(&mut inner, id).filter(|s| s.kind.has(Kind::PROMPT_END)) {
+                snap.protect_until = Some(std::time::Instant::now() + ttl);
+            }
+        }
+    }
+
     pub fn clear_await(&self, seq: usize) {
         if !self.prefix_reuse {
             return;
@@ -2948,6 +2985,7 @@ impl VmmKv {
         let lineage = inner.seqs[seq].lineage;
         continue_lineage(&mut inner, seq, id, parent);
         let superseded = note_end(&mut inner, seq, id, kind);
+        protect(&mut inner, seq, id, kind);
         if let Some(l) = lineage.filter(|&l| {
             l != id && inner.policy == Policy::Tree && inner.seqs[seq].lineage.is_none()
         }) {
@@ -3262,6 +3300,7 @@ impl VmmKv {
                     kind: Kind::CHECKPOINT,
                     pending: 0,
                     ends: 0,
+                    protect_until: None,
                     quarantined: false,
                     parent: None,
                     children: Vec::new(),
@@ -3669,6 +3708,7 @@ fn publish_locked(
                 let lineage = inner.seqs[seq].lineage;
                 continue_lineage(inner, seq, id, parent);
                 let superseded = note_end(inner, seq, id, kind);
+                protect(inner, seq, id, kind);
                 if let Some(l) = lineage.filter(|_| inner.seqs[seq].lineage.is_none()) {
                     policy::try_retire(s, inner, l);
                 }
@@ -3731,7 +3771,13 @@ fn publish_locked(
     // The publisher's own attach hold ends here, but the boundary it attached is retired (if
     // this publish leaves it one continuation) only once the new boundary is linked below.
     let unheld = drop_snapshot_hold(inner, seq);
-    let lineage = inner.seqs[seq].lineage;
+    let SlotSeq {
+        lineage,
+        ended,
+        attached,
+        session_ttl,
+        ..
+    } = inner.seqs[seq];
     release_prefix_hold(s, inner, seq);
     inner.seqs[seq] = SlotSeq {
         tokens: tokens.to_vec(),
@@ -3740,6 +3786,9 @@ fn publish_locked(
         held: n_pub,
         snapshot: None,
         lineage,
+        ended,
+        attached,
+        session_ttl,
         ..Default::default()
     };
 
@@ -3790,6 +3839,7 @@ fn publish_locked(
             kind,
             pending: 0,
             ends: 0,
+            protect_until: None,
             quarantined: false,
             parent: None,
             children: Vec::new(),
@@ -3816,6 +3866,7 @@ fn publish_locked(
         continue_lineage(inner, seq, id, parent);
         continued = lineage.filter(|&l| l != id && inner.seqs[seq].lineage.is_none());
         superseded = note_end(inner, seq, id, kind);
+        protect(inner, seq, id, kind);
     }
     trim_cache(s, inner);
     // Retire the superseded parent only behind a boundary that survived its own trim: the
@@ -3853,6 +3904,8 @@ fn try_attach_fine(inner: &mut Inner, seq: usize, prompt: &[u32]) -> Result<Opti
             snapshot: None,
             lineage: None,
             ended: None,
+            attached: None,
+            session_ttl: None,
             fine_hashes: Vec::new(),
             fine_held: 0,
         };
@@ -3912,6 +3965,8 @@ fn try_attach_fine(inner: &mut Inner, seq: usize, prompt: &[u32]) -> Result<Opti
         snapshot: None,
         lineage: None,
         ended: None,
+        attached: None,
+        session_ttl: None,
         fine_hashes: hashes[..pick].to_vec(),
         fine_held: pick,
     };
@@ -3928,6 +3983,7 @@ fn stats_of(s: &Shared) -> VmmStats {
     let mut out = inner.stats;
     out.hash_collisions = inner.cache.collisions();
     let tick = inner.snapshot_tick;
+    let now = std::time::Instant::now();
     for snap in inner.published.values().flatten() {
         out.snapshots_live += 1;
         if snap.attaches >= 2 && hot(tick, snap) {
@@ -3938,6 +3994,9 @@ fn stats_of(s: &Shared) -> VmmStats {
         }
         if snap.children.len() >= 2 {
             out.snapshots_branch += 1;
+        }
+        if snap.protect_until.is_some_and(|t| t > now) {
+            out.sessions_protected += 1;
         }
     }
     out
@@ -4249,6 +4308,7 @@ fn install_block(inner: &mut Inner, block: Block) -> u32 {
 
 fn trim_cache(s: &Shared, inner: &mut Inner) {
     reap_spills(s, inner);
+    demote_expired(s, inner);
     let min_free = s.cache_min_free.load(Ordering::Relaxed);
     if min_free > 0 {
         if let Some(mut free) = s.ops.free_bytes() {
@@ -4302,6 +4362,80 @@ fn continue_lineage(inner: &mut Inner, seq: usize, id: u64, parent: Option<u64>)
     inner.seqs[seq].lineage = None;
     if let Some(snap) = snap_mut(inner, l) {
         snap.pending = snap.pending.saturating_sub(1);
+    }
+}
+
+/// A session request's prompt end (or the boundary it attached): protected for its TTL.
+fn protect(inner: &mut Inner, seq: usize, id: u64, kind: Kind) {
+    let Some(ttl) = inner.seqs[seq].session_ttl else {
+        return;
+    };
+    if !kind.has(Kind::PROMPT_END) {
+        return;
+    }
+    if let Some(snap) = snap_mut(inner, id) {
+        snap.protect_until = Some(std::time::Instant::now() + ttl);
+    }
+}
+
+/// How often [`demote_expired`] scans (lazily, from `trim_cache`).
+const SESSION_SWEEP: std::time::Duration = if cfg!(test) {
+    std::time::Duration::ZERO
+} else {
+    std::time::Duration::from_secs(1)
+};
+
+/// Demote every session boundary whose TTL ran out: free its snapshot, then the radix blocks
+/// only it kept attachable, newest block first. Shared ancestors (a system prompt, another
+/// chain's blocks) stay under LRU. A boundary in use, awaited or mid-transfer waits for the
+/// next sweep.
+fn demote_expired(s: &Shared, inner: &mut Inner) {
+    let now = std::time::Instant::now();
+    if inner
+        .session_sweep
+        .is_some_and(|t| now.duration_since(t) < SESSION_SWEEP)
+    {
+        return;
+    }
+    inner.session_sweep = Some(now);
+    let awaited = &inner.awaited;
+    let expired: Vec<(u64, Option<(u32, u32)>)> = inner
+        .published
+        .iter()
+        .flat_map(|(node, list)| list.iter().map(move |snap| (*node, snap)))
+        .filter(|(_, snap)| {
+            snap.protect_until.is_some_and(|t| t <= now)
+                && snapshots_free(std::slice::from_ref(snap), awaited)
+        })
+        .map(|(node, snap)| (snap.id, node))
+        .collect();
+    for (id, node) in expired {
+        let before = inner.stats.cache_bytes + inner.stats.host_snapshot_bytes;
+        if !remove_snapshot_id(s, inner, id) {
+            continue;
+        }
+        if let Some(key) = node.filter(|k| !inner.published.contains_key(&Some(*k))) {
+            let published = &inner.published;
+            let keys = inner
+                .cache
+                .evict_chain_from(key, |k| published.contains_key(&Some(k)));
+            if !keys.is_empty() {
+                cache_changed(s);
+            }
+            for key in keys {
+                if let Some(ids) = inner.node_blocks.remove(&key) {
+                    inner.stats.cache_blocks -= ids.len() as u64;
+                    inner.stats.cache_bytes -= ids.len() as u64 * s.block_bytes;
+                    for b in ids {
+                        deref_block(s, inner, b);
+                    }
+                }
+                inner.stats.nodes_evicted += 1;
+            }
+        }
+        inner.stats.session_demotions += 1;
+        inner.stats.session_demoted_bytes +=
+            before - (inner.stats.cache_bytes + inner.stats.host_snapshot_bytes);
     }
 }
 
@@ -4677,6 +4811,7 @@ fn spill_snapshot(s: &Shared, inner: &mut Inner, id: u64) -> bool {
 /// The host-resident snapshot to evict when the tier is full: the least recently used one
 /// nobody holds or awaits.
 fn host_lru(inner: &Inner) -> Option<u64> {
+    let now = std::time::Instant::now();
     inner
         .published
         .values()
@@ -4686,7 +4821,8 @@ fn host_lru(inner: &Inner) -> Option<u64> {
                 && matches!(snap.store, SnapStore::Host(_))
                 && !snap_awaited(&inner.awaited, snap)
         })
-        .min_by_key(|snap| snap.last_used)
+        // A session boundary inside its TTL goes last here too.
+        .min_by_key(|snap| (snap.protect_until.is_some_and(|t| t > now), snap.last_used))
         .map(|snap| snap.id)
 }
 

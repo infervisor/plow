@@ -1905,6 +1905,21 @@ async fn metrics_handler(
             "counter",
             "Spill copies whose fence failed; both buffers quarantined.",
         ),
+        (
+            "sessions_protected",
+            "gauge",
+            "Session boundaries inside PLOW_PREFIX_SESSION_TTL_S, protected from LRU.",
+        ),
+        (
+            "session_demotions_total",
+            "counter",
+            "Session boundaries demoted after their TTL (snapshot and private blocks freed).",
+        ),
+        (
+            "session_demoted_bytes_total",
+            "counter",
+            "Bytes freed by session demotions.",
+        ),
     ] {
         crate::obs::serving::family(&mut out, &format!("plowrt_prefix_{name}"), kind, help);
     }
@@ -1959,7 +1974,10 @@ async fn metrics_handler(
              plowrt_prefix_host_evictions_total{{model=\"{slug}\"}} {}\n\
              plowrt_prefix_host_spill_fallbacks_total{{model=\"{slug}\"}} {}\n\
              plowrt_prefix_host_prefetches_total{{model=\"{slug}\"}} {}\n\
-             plowrt_prefix_host_fence_failures_total{{model=\"{slug}\"}} {}\n",
+             plowrt_prefix_host_fence_failures_total{{model=\"{slug}\"}} {}\n\
+             plowrt_prefix_sessions_protected{{model=\"{slug}\"}} {}\n\
+             plowrt_prefix_session_demotions_total{{model=\"{slug}\"}} {}\n\
+             plowrt_prefix_session_demoted_bytes_total{{model=\"{slug}\"}} {}\n",
             s.attach_hits,
             s.attach_misses,
             s.tokens_queried,
@@ -2005,6 +2023,9 @@ async fn metrics_handler(
             s.spill_fallbacks,
             s.host_prefetches,
             s.spill_fence_failures,
+            s.sessions_protected,
+            s.session_demotions,
+            s.session_demoted_bytes,
         );
     }
     (

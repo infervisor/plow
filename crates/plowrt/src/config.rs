@@ -814,6 +814,18 @@ pub struct RuntimeConfig {
     )]
     pub vmm_host_cache_mib: u64,
 
+    /// CUDA VMM prefix cache, `PLOW_PREFIX_POLICY=tree`: seconds a request with
+    /// `X-Session-Id` keeps its newest boundary protected from LRU after its last use; then the
+    /// boundary and the blocks only it kept attachable are demoted (freed). `0` = sessions get
+    /// no special retention.
+    #[arg(
+        long = "prefix-session-ttl-s",
+        env = "PLOW_PREFIX_SESSION_TTL_S",
+        default_value_t = 150,
+        global = true
+    )]
+    pub prefix_session_ttl_s: u32,
+
     #[arg(long = "prefix-inflight-wait", env = "PLOW_PREFIX_INFLIGHT_WAIT", default_value_t = true, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
     pub prefix_inflight_wait: bool,
 
@@ -2552,6 +2564,15 @@ impl RuntimeConfig {
             Self::env_parse("PLOW_VMM_HOST_CACHE_MIB").unwrap_or(self.vmm_host_cache_mib)
         };
         mib << 20
+    }
+
+    pub(crate) fn prefix_session_ttl(&self) -> std::time::Duration {
+        let s = if Self::is_initialized() {
+            self.prefix_session_ttl_s
+        } else {
+            Self::env_parse("PLOW_PREFIX_SESSION_TTL_S").unwrap_or(self.prefix_session_ttl_s)
+        };
+        std::time::Duration::from_secs(u64::from(s))
     }
 
     /// `PLOW_PREFIX_POLICY`: `legacy` selects the 0.1.2 flag/tier policy; anything else is

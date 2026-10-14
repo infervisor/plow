@@ -106,7 +106,16 @@ Policy (`crates/plowrt/src/memory/vmm_policy.rs`, `Policy::Tree`, the default):
   prefix) are never structurally retired: their second continuation is expected. They survive by
   LRU refresh alone. A shared end within 64 rows of the owner's prompt end is the same history (a
   parallel pair, a retry) and is not published at all: the waiter attaches the prompt end.
-* `X-Session-Id` has no cache meaning. Turn-end output boundaries are not published.
+* `X-Session-Id` buys bounded retention (`PLOW_PREFIX_SESSION_TTL_S`, default 150 s, `0` = none):
+  a session request's prompt end (and the boundary it attached, at admission) gets
+  `protect_until = now + TTL`, refreshed by every use (publish, turn-end touch, the next turn's
+  attach). Eviction takes a protected boundary only once nothing unprotected is left (the host
+  tier's entries included), so the cache cannot deadlock. An expired one is demoted lazily (a
+  sweep at most once a second from `trim_cache`, no timer thread): its snapshot, then each
+  radix block only it kept attachable, newest first (`PrefixCache::evict_chain_from`); shared
+  ancestors stay under LRU. A boundary in use, awaited or mid-transfer waits for the next sweep.
+  `/metrics`: `plowrt_prefix_sessions_protected`, `plowrt_prefix_session_demotions_total`,
+  `plowrt_prefix_session_demoted_bytes_total`. Turn-end output boundaries are not published.
 
 Invariants (`vmm_sim_tests::cell_*`, `policy::check_tree`): a held, awaited or in-transfer
 snapshot is never freed on any path (LRU, retire, radix leaf eviction, strict publish's tail

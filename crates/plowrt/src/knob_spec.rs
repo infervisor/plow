@@ -555,6 +555,7 @@ pub const RUNTIME: &[KnobSpec] = &[
     KnobSpec::new("rt.prefix_retire_attached", Some("PLOW_PREFIX_RETIRE_ATTACHED"), Layer::Runtime, Domain::Bool, ON, RETIRE_ATTACHED_QUALIFIED),
     KnobSpec::new("rt.prefix_inflight_wait", Some("PLOW_PREFIX_INFLIGHT_WAIT"), Layer::Runtime, Domain::Bool, ON, INFLIGHT_WAIT_QUALIFIED),
     KnobSpec::new("rt.prefix_policy", Some("PLOW_PREFIX_POLICY"), Layer::Runtime, Domain::Str, Default::Static(Val::Str("tree")), OPT_IN),
+    KnobSpec::new("rt.prefix_session_ttl_s", Some("PLOW_PREFIX_SESSION_TTL_S"), Layer::Runtime, U32, Default::Static(Val::Nat(150)), OPT_IN),
     KnobSpec::new("rt.prefix_chunk_publish", Some("PLOW_PREFIX_CHUNK_PUBLISH"), Layer::Runtime, Domain::Bool, ON, CHUNK_PUBLISH_QUALIFIED),
     KnobSpec::new("rt.vmm_release_retire", Some("PLOW_VMM_RELEASE_RETIRE"), Layer::Runtime, Domain::Bool, ON, RELEASE_RETIRE_QUALIFIED),
     KnobSpec::new("rt.ttft_log", Some("PLOW_TTFT_LOG"), Layer::Runtime, Domain::Bool, OFF, OPT_IN),

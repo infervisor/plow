@@ -7271,6 +7271,11 @@ impl GpuEngine {
     pub fn hold_session_prefix(&mut self, b: usize, ttl: std::time::Duration) {
         if self.vmm_prefix_enabled() && b < self.batch {
             self.session_pin[b] = Some(ttl);
+            // The boundary tree's session retention: `PLOW_PREFIX_SESSION_TTL_S` (0 = none).
+            if let Some(kv) = self.vmm.as_ref().and_then(|v| v.kv.as_ref()) {
+                let ttl = crate::config::RuntimeConfig::get().prefix_session_ttl();
+                kv.hold_session(b, ttl);
+            }
         }
     }
 
