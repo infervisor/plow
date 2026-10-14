@@ -1806,9 +1806,10 @@ impl VmmKv {
     /// `cap_bytes` in `slot_bytes` slots (the largest snapshot the engine publishes), and
     /// restore them over PCIe when a prompt attaches to one (or ahead of it: `PrefixProbe::
     /// prefetch`). The tier is the second level of the boundary tree's LRU: a device eviction
-    /// spills, a full tier drops its least recently used host snapshot. Pinned chunks grow on a
-    /// background thread a chunk ahead of demand; the first is allocated here, which also
-    /// proves the backend has a host tier. Off by default; `Policy::Tree` only.
+    /// spills, a full tier drops its least recently used host snapshot. Every pinned chunk is
+    /// allocated here, at bring-up (the first proves the backend has a host tier; a failed
+    /// one caps the tier); the background thread only restores prefetches. Off by default;
+    /// `Policy::Tree` only.
     pub fn enable_host_tier(&mut self, cap_bytes: u64, slot_bytes: u64) -> Result<()> {
         let s = &self.shared;
         let cap_slots = u32::try_from(cap_bytes / slot_bytes.max(1)).unwrap_or(u32::MAX);
@@ -1839,6 +1840,31 @@ impl VmmKv {
         let bytes = tier.wants_chunk().expect("an empty tier wants a chunk");
         let ptr = s.ops.host_tier_alloc(bytes)?;
         tier.add_chunk(ptr, bytes);
+        // The rest up front, here at bring-up: pinning takes the driver's context lock (1 GiB
+        // is 100 ms-class), and growth while serving stalled every engine launch behind it
+        // (lab: 2-18 s TTFT stalls while the tier grew).
+        let started = std::time::Instant::now();
+        while (tier.slots.len() as u32) < tier.cap_slots {
+            let n = chunk_slots.min(tier.cap_slots - tier.slots.len() as u32);
+            let bytes = u64::from(n) * slot_bytes;
+            match s.ops.host_tier_alloc(bytes) {
+                Ok(ptr) => tier.add_chunk(ptr, bytes),
+                Err(error) => {
+                    tier.cap_slots = tier.slots.len() as u32;
+                    tracing::warn!(
+                        error = %error,
+                        capacity_mib = (tier.slots.len() as u64 * slot_bytes) >> 20,
+                        "vmm host tier: pinned allocation failed, tier capped"
+                    );
+                    break;
+                }
+            }
+        }
+        tracing::info!(
+            capacity_mib = (tier.slots.len() as u64 * slot_bytes) >> 20,
+            ms = started.elapsed().as_millis() as u64,
+            "vmm host tier: pinned at bring-up"
+        );
         // The worker first: nothing may spill or prefetch into a tier without it (a prefetch
         // would wait on it forever).
         let shared = Arc::clone(s);

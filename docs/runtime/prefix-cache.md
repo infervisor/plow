@@ -122,7 +122,8 @@ host memory can. With the tier armed the device LRU's victim is *spilled*, not f
 
 * `SnapStore::{Device(va), Spilling{va,slot,fence}, Host(slot), Restoring(slot)}`. A spill is one
   async D2H copy into a fixed host slot (the largest snapshot the engine can publish; chunks of
-  1 GiB grow on the `vmm-host-tier` thread a chunk ahead of demand, never on the engine thread).
+  1 GiB are all pinned at bring-up: pinning takes the driver context lock, and growing them
+  while serving stalled every engine launch for seconds in the lab).
   The device buffer outlives the fence: `reap_spills` (every trim) frees it once the copy
   retired; the cap trim credits in-flight spills and never waits, OOM reclamation finishes the
   oldest in-flight spill before queueing another; at most 4 are in flight.
