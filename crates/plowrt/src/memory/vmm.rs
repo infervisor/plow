@@ -2468,13 +2468,18 @@ impl VmmKv {
         let pick = placed.len();
         let mut prefix_ids: Vec<Vec<u32>> = Vec::with_capacity(pick);
         for key in &placed {
-            let ids = inner
-                .node_blocks
-                .get(key)
-                .ok_or_else(|| {
-                    RuntimeError::Device(format!("vmm: node {key:?} has no block payload"))
-                })?
-                .clone();
+            let Some(ids) = inner.node_blocks.get(key).cloned() else {
+                // Give back the restore this attach claimed, or its waiters never wake.
+                if let Some((slot, _)) = restore {
+                    if let Some(snap) = snap_mut(&mut inner, snap_key.id) {
+                        snap.store = SnapStore::Host(slot);
+                    }
+                    s.host_cv.notify_all();
+                }
+                return Err(RuntimeError::Device(format!(
+                    "vmm: node {key:?} has no block payload"
+                )));
+            };
             debug_assert_eq!(ids.len(), inner.tracks.len() * kvh);
             prefix_ids.push(ids);
         }
