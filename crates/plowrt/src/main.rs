@@ -2495,13 +2495,15 @@ fn amd_bench_tp(
             // so rows 1.. still hold whatever the last prefill left there; and after a step the
             // device has written all B rows itself, but re-seeding from the host chain keeps the
             // fed id and the recorded chain provably the same value.
-            g.seed_ids(&feed)?;
+            let tok = plowrt::obs::dstep::begin_token();
+            plowrt::obs::dstep::timed(&plowrt::obs::dstep::SEED, || g.seed_ids(&feed))?;
             let kv: Vec<u32> = pos_v.iter().map(|x| x + 1).collect();
             let t = std::time::Instant::now();
             let out = g.decode_step_batched_at(&pos_v, &kv, dp)?;
             if step > 0 {
                 timed += t.elapsed();
             }
+            plowrt::obs::dstep::finish_token(tok);
             dump(&g, &format!("b{:03}", chains[0].len()))?;
             for s in 0..active {
                 chains[s].push(out[s]);
