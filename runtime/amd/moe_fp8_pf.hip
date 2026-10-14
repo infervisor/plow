@@ -83,6 +83,15 @@ __device__ __forceinline__ fp8v32 mfp_frag32(const unsigned char* t, unsigned ro
     return v;
 }
 
+/* Two bf16 added into dst[0..1] with one device-scope packed atomic (aiter fmoe's
+ * global_atomic_pk_add_bf16). */
+__device__ __forceinline__ void mfp_atomic_bf16x2(bf16* dst, float lo, float hi) {
+    typedef short pair_t __attribute__((ext_vector_type(2)));
+    const unsigned packed = (unsigned)__builtin_bit_cast(unsigned short, f2bf(lo)) |
+                            ((unsigned)__builtin_bit_cast(unsigned short, f2bf(hi)) << 16);
+    __builtin_amdgcn_global_atomic_fadd_v2bf16((pair_t*)dst, __builtin_bit_cast(pair_t, packed));
+}
+
 /* Per-item metadata the producer resolves and hands to the consumer. */
 struct MfpItem {
     unsigned row0, valid, n0;
@@ -138,8 +147,10 @@ __device__ __forceinline__ MfpItem mfp_decode(unsigned it, unsigned tn, const in
  *   GLU : A = x rows gathered by row_token (bf16, or fp8 + as[kb*pitch + token]),
  *         Cout = fu_g (bf16 [rows][N], or fp8 + fs_out[row][N/128]).
  *   DOWN: A = fu_g rows (bf16, or fp8 + as[row*KB + kb]),
- *         Cout = part f32 [T*k][N] scattered by row_partidx, times row_gate. */
-template <bool GLU, bool W8>
+ *         Cout = part f32 [T*k][N] scattered by row_partidx, times row_gate.
+ *   DOWN, ACC: Cout = out bf16 [T][N]; row_gate * value is ADDED (bf16 pair atomics) at token
+ *         row_partidx / kacc -- the weighted combine fused in, run-to-run nondeterministic. */
+template <bool GLU, bool W8, bool ACC = false>
 __device__ __forceinline__ void mfp_body(void* __restrict__ Cout, const void* __restrict__ Av,
                                          const unsigned long long* __restrict__ wtab,
                                          const unsigned long long* __restrict__ stab,
@@ -150,8 +161,9 @@ __device__ __forceinline__ void mfp_body(void* __restrict__ Cout, const void* __
                                          const float* __restrict__ a_scale,
                                          float* __restrict__ fs_out, unsigned a_pitch, unsigned N,
                                          unsigned K, unsigned n_exp, unsigned act, float beta,
-                                         float lbeta) {
+                                         float lbeta, unsigned kacc = 0u) {
     using namespace mfp;
+    static_assert(!ACC || !GLU, "ACC is a DOWN epilogue");
     const unsigned char* const A = (const unsigned char*)Av;
     /* Bytes per A row. */
     const size_t arow = W8 ? (size_t)K : (size_t)K * 2u;
@@ -296,6 +308,8 @@ __device__ __forceinline__ void mfp_body(void* __restrict__ Cout, const void* __
         }
         if constexpr (!GLU) {
             m_pidx = tid < m.valid ? snap_pidx : PLOW_EXPERT_UNUSED;
+            if constexpr (ACC)
+                if (m_pidx != PLOW_EXPERT_UNUSED) m_pidx /= kacc; /* the token row */
             m_gate = snap_gate;
         }
         if (p_it + gridDim.x < total) pre = decode(p_it + gridDim.x);
@@ -557,6 +571,33 @@ __device__ __forceinline__ void mfp_body(void* __restrict__ Cout, const void* __
                             st_act1(&fu[(size_t)(ci.row0 + rr) * N + nn],
                                     f2bf(moe_glu(accf[i][0][el], accf[i][1][el], act, beta,
                                                  lbeta)));
+                    }
+            } else if constexpr (ACC) {
+                /* Lanes l32 and l32^1 hold adjacent columns of the same rows; element pairs
+                 * (el, el+1) are adjacent rows. Even lanes add row el, odd lanes row el+1, each
+                 * as one (n, n+1) bf16 pair. */
+                bf16* const out = (bf16*)Cout;
+                const unsigned par = c_seq & 1u;
+                const bool odd = (l32 & 1u) != 0u;
+#pragma unroll
+                for (int i = 0; i < 2; i++)
+#pragma unroll
+                    for (int j = 0; j < 2; j++) {
+                        const unsigned nn = ci.n0 + wn * 64u + (unsigned)j * 32u + (l32 & ~1u);
+#pragma unroll
+                        for (int el = 0; el < 16; el += 2) {
+                            const unsigned r0 =
+                                wm * 64u + (unsigned)i * 32u + mfma_acc_m(lane, (unsigned)el);
+                            const float a = s_gate[par][r0] * accf[i][j][el];
+                            const float b = s_gate[par][r0 + 1u] * accf[i][j][el + 1];
+                            const float recv = __shfl_xor(odd ? a : b, 1);
+                            const unsigned rr = odd ? r0 + 1u : r0;
+                            if (rr >= ci.valid) continue;
+                            const unsigned tok = s_pidx[par][rr];
+                            if (tok == PLOW_EXPERT_UNUSED) continue;
+                            mfp_atomic_bf16x2(&out[(size_t)tok * N + nn], odd ? recv : a,
+                                              odd ? b : recv);
+                        }
                     }
             } else {
                 float* const part = (float*)Cout;
@@ -1171,4 +1212,16 @@ extern "C" __global__ __launch_bounds__(512, 1) void plow_moe_w8a8_down_pf_gfx95
     if (experts > mfp::MAXE || hidden % 256u != 0u || inter % 128u != 0u || inter < 256u) return;
     MFP_BODY(false, true)(part, fu, wtab, stab, meta, nullptr, row_partidx, row_gate, fu_scale,
                           nullptr, 0u, hidden, inter, experts, 0u, 0.0f, 0.0f);
+}
+
+/* W8A8 down with the weighted combine fused (PLOW_MOE_FP8_PF_ACC): `part` is the bf16 [T][H]
+ * output the caller pre-seeded (shared-expert partial or zeros); reserved = routing slots per
+ * token (row_partidx / reserved = token). */
+extern "C" __global__ __launch_bounds__(512, 1) void plow_moe_w8a8_down_acc_pf_gfx950(MFP_DOWN_ARGS) {
+    if (experts > mfp::MAXE || hidden % 256u != 0u || inter % 128u != 0u || inter < 256u ||
+        reserved == 0u)
+        return;
+    mfp_body<false, true, true>(part, fu, wtab, stab, meta, nullptr, row_partidx, row_gate,
+                                fu_scale, nullptr, 0u, hidden, inter, experts, 0u, 0.0f, 0.0f,
+                                reserved);
 }

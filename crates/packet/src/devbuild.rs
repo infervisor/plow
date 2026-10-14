@@ -617,7 +617,9 @@ pub fn lean_moe_fp8_glu_inst(d: &DevInst) -> bool {
 }
 
 /// The f32-scatter down twin: H % 256 == 0, I % 128 == 0 and I >= 256; i7 = 0 (bf16 A) or 2
-/// (fp8 A with its 1x128 scales in t5).
+/// (fp8 A with its 1x128 scales in t5). i7 = 3 is the W8A8 arm with the weighted combine fused
+/// (PLOW_MOE_FP8_PF_ACC): t0 is the bf16 [T][H] output, i4 = routing slots per token. Only the
+/// dedicated object has that arm.
 pub fn lean_moe_fp8_down_inst(d: &DevInst) -> bool {
     d.op == DevOp::MoeGroupDownPf as u16
         && d.i[0] != 0
@@ -627,13 +629,14 @@ pub fn lean_moe_fp8_down_inst(d: &DevInst) -> bool {
         && d.i[2] != 0
         && d.i[2] <= 512
         && d.i[3] == 1
-        && d.i[4] == 0
+        && (d.i[4] == 0 || d.i[7] == 3)
         && d.i[5] == 0
         && d.i[6] == 0
         && d.t[..5].iter().all(|&t| t != TENSOR_NONE)
         && match d.i[7] {
             0 => d.t[5] == TENSOR_NONE,
             2 => d.t[5] != TENSOR_NONE,
+            3 => d.t[5] != TENSOR_NONE && d.i[4] != 0,
             _ => false,
         }
         && d.t[6] != TENSOR_NONE
@@ -939,6 +942,10 @@ impl Builder {
 
     pub fn set_lean_moe_fp8_segments(&mut self, enabled: bool) {
         self.lean_moe_fp8_segments = enabled;
+    }
+
+    pub fn lean_moe_fp8_segments(&self) -> bool {
+        self.lean_moe_fp8_segments
     }
 
     /// Enable the model-independent replicated-input expert-parallel rewrite.

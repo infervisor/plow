@@ -1343,6 +1343,24 @@ pub struct EmitConfig {
     #[arg(long, env = "PLOW_MOE_FP8_PF_MIN_ROWS", default_value_t = 0)]
     pub moe_fp8_pf_min_rows: u32,
 
+    /// Programs that isolate the dedicated MoE segments quantize the GLU input with a separate
+    /// QuantFp8Block128 (GLU i7 = 2) instead of the staging quant (i7 = 6), which the dedicated
+    /// object has no arm for. Bit-identical. `=0` keeps the staging quant (interpreter MoE).
+    #[arg(long, env = "PLOW_MOE_FP8_PF_XQ", default_value_t = true, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
+    pub moe_fp8_pf_xq: bool,
+
+    /// Fuse the weighted combine into the dedicated W8A8 down (i7 = 3): bf16 pair atomics into
+    /// the FFN reduce-scatter source, seeded by the shared-expert down (or zeroed under the
+    /// shared fold); no `part` scatter, no MoeCombinePf. NOT bit-identical (bf16 accumulation in
+    /// arrival order, run-to-run nondeterministic). Sequence-parallel TP seam only.
+    #[arg(long, env = "PLOW_MOE_FP8_PF_ACC", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
+    pub moe_fp8_pf_acc: bool,
+
+    /// Also isolate the dedicated MoE segments in the packed-prefill siblings (one launch over
+    /// every span's rows: MoE has no cross-row state). Default off.
+    #[arg(long, env = "PLOW_MOE_FP8_PF_PACKED", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
+    pub moe_fp8_pf_packed: bool,
+
     /// Emit prefill AttnRes packets with the f32-mix contract (separate output-norm epsilon in
     /// `f[1]`) and isolate them for the gfx950 `attn_res_f32mix` object. Default on; tokens
     /// differ from the BF16-seam contract by design. `=0` is the rollback to the interpreter
@@ -1933,6 +1951,9 @@ impl EmitConfig {
             moe_combine_lean: env_bool_default_true("PLOW_MOE_COMBINE_LEAN"),
             moe_fp8_pf_lean: env_bool("PLOW_MOE_FP8_PF_LEAN"),
             moe_fp8_pf_min_rows: env_u32("PLOW_MOE_FP8_PF_MIN_ROWS").unwrap_or(0),
+            moe_fp8_pf_xq: env_bool_default_true("PLOW_MOE_FP8_PF_XQ"),
+            moe_fp8_pf_acc: env_bool("PLOW_MOE_FP8_PF_ACC"),
+            moe_fp8_pf_packed: env_bool("PLOW_MOE_FP8_PF_PACKED"),
             attnres_f32mix: env_opt_out("PLOW_ATTNRES_F32MIX"),
             moe_pf_det: env_bool("PLOW_MOE_PF_DET"),
             moe_pf_w8a8: env_bool("PLOW_MOE_PF_W8A8"),

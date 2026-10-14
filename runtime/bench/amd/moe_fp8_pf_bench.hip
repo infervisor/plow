@@ -95,21 +95,28 @@ int main(int argc, char** argv) {
     const double skew = argc > 3 ? atof(argv[3]) : 1.0;
     const unsigned grid_n = argc > 4 ? (unsigned)atoi(argv[4]) : 256u;
     const bool w8 = argc > 5 && std::strcmp(argv[5], "w8") == 0;
-    const unsigned E = 288, K8 = 8, H = 4096, I = 256, BMP = 64;
+    /* fold: the shared expert as expert 288, a constant 9th slot of every token (gate 1). */
+    const bool fold = argc > 6 && std::strcmp(argv[6], "fold") == 0;
+    const unsigned E = fold ? 289 : 288, K8 = fold ? 9 : 8, H = 4096, I = 256, BMP = 64;
+    const unsigned ER = 288, KR = 8;
     const unsigned act = PLOW_MOE_ACT_SWIGLU_CLAMP;
     const float beta = 0.0f, lbeta = 10.0f;
     std::mt19937 rng(1234);
 
     /* routing: skewed expert popularity, k distinct experts per token */
-    std::vector<double> pop(E);
-    for (unsigned e = 0; e < E; e++) pop[e] = 1.0 / std::pow(1.0 + (double)((e * 37u) % E), skew * 0.5);
+    std::vector<double> pop(ER);
+    for (unsigned e = 0; e < ER; e++) pop[e] = 1.0 / std::pow(1.0 + (double)((e * 37u) % ER), skew * 0.5);
     std::discrete_distribution<unsigned> pick(pop.begin(), pop.end());
     std::uniform_real_distribution<float> uf(0.05f, 1.0f);
     std::vector<unsigned> slot_e(T * K8);
     std::vector<float> slot_g(T * K8);
     for (unsigned t = 0; t < T; t++) {
         unsigned n = 0;
-        while (n < K8) {
+        if (fold) {
+            slot_e[t * K8 + KR] = ER;
+            slot_g[t * K8 + KR] = 1.0f;
+        }
+        while (n < KR) {
             const unsigned e = pick(rng);
             bool dup = false;
             for (unsigned j = 0; j < n; j++) dup |= slot_e[t * K8 + j] == e;
@@ -283,6 +290,31 @@ int main(int argc, char** argv) {
         bad += cmp("fq", fq_r, fq_n, live_rows * I, 1);
         bad += cmp("fs", fs_r, fs_n, live_rows * (I / 128) * 4, 4);
         bad += cmp("part", part_r, part_n, part_b, 4);
+        /* Fused combine: seed out with the shared partial (zeros under fold), the acc down adds
+         * the k gated slots; compare against the fixed-order combine of the same part. */
+        if (fold) HC(hipMemset(dsh, 0, out_b));
+        ref_combine<<<NCU, 512>>>(out_r, dsh, part_r, H, K8, T);
+        HC(hipMemcpy(out_n, dsh, out_b, hipMemcpyDeviceToDevice));
+        plow_moe_w8a8_down_acc_pf_gfx950<<<grid_n, 512>>>((float*)out_n, fq_r, dwt, dst, dmeta, drp, drg, fs_r, H, I, E, K8);
+        HC(hipDeviceSynchronize());
+        {
+            std::vector<unsigned short> a(out_b / 2), b(out_b / 2);
+            HC(hipMemcpy(a.data(), out_r, out_b, hipMemcpyDeviceToHost));
+            HC(hipMemcpy(b.data(), out_n, out_b, hipMemcpyDeviceToHost));
+            auto bf = [](unsigned short v) { unsigned u = (unsigned)v << 16; float f; std::memcpy(&f, &u, 4); return (double)f; };
+            double num = 0, den = 0;
+            for (size_t i = 0; i < a.size(); i++) {
+                const double x = bf(a[i]), y = bf(b[i]);
+                num += (x - y) * (x - y);
+                den += x * x;
+            }
+            const double rel = std::sqrt(num / (den > 0 ? den : 1));
+            std::printf("acc vs combine relL2 %.3e%s\n", rel, rel < 1e-2 ? "" : "  ACC_FAIL");
+            if (!(rel < 1e-2)) bad++;
+        }
+        timeit("ref_combine", [&] { ref_combine<<<NCU, 512>>>(out_r, dsh, part_r, H, K8, T); });
+        timeit("acc_down8", [&] { plow_moe_w8a8_down_acc_pf_gfx950<<<grid_n, 512>>>((float*)out_n, fq_r, dwt, dst, dmeta, drp, drg, fs_r, H, I, E, K8); });
+        timeit("memset_out", [&] { HC(hipMemsetAsync(out_n, 0, out_b)); });
     }
     const bool ok = bad == 0;
     std::printf(ok ? "BITEXACT_OK\n" : "BITEXACT_FAIL\n");

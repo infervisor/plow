@@ -2410,15 +2410,22 @@ fn moe_fp8_down_inst(d: &DevInst64) -> bool {
         && d.i[2] != 0
         && d.i[2] <= 512
         && d.i[3] == 1
-        && d.i[4..7].iter().all(|&v| v == 0)
+        && (d.i[4] == 0 || d.i[7] == 3)
+        && d.i[5..7].iter().all(|&v| v == 0)
         && d.t[..5].iter().all(|&t| t != NONE)
         && match d.i[7] {
             0 => d.t[5] == NONE,
             2 => d.t[5] != NONE,
+            3 => d.t[5] != NONE && d.i[4] != 0,
             _ => false,
         }
         && d.t[6] != NONE
         && d.t[7] != NONE
+}
+
+/// PLOW_MOE_FP8_PF_ACC's down (i7 = 3): only the dedicated object carries that arm.
+fn moe_fp8_acc_inst(d: &DevInst64) -> bool {
+    d.op == DevOp::MoeGroupDownPf as u16 && d.i[7] == 3
 }
 
 fn has_moe_fp8_segment(prog: &DevProg) -> bool {
@@ -2461,11 +2468,16 @@ fn add_moe_fp8_pf_routes(
     };
     for (seg, set) in members.iter().enumerate() {
         if set.len() != 1 || !matches!(routes[seg], PrefillSegmentRoute::Interpreter) {
+            if set.iter().any(|&i| moe_fp8_acc_inst(&prog.insts[i])) {
+                return Err(RuntimeError::Device(format!(
+                    "segment {seg} holds a fused-combine fp8 MoE down outside its own segment"
+                )));
+            }
             continue;
         }
         let d = &prog.insts[*set.first().unwrap()];
         let grid = u32::from(d.blocks).max(1);
-        let w8a8 = d.i[7] == 2;
+        let w8a8 = d.i[7] == 2 || d.i[7] == 3;
         if moe_fp8_glu_inst(d) {
             routes[seg] = PrefillSegmentRoute::MoeFp8Glu {
                 args: MoeFp8GluArgs {
@@ -2503,7 +2515,8 @@ fn add_moe_fp8_pf_routes(
                     hidden: d.i[0],
                     inter: d.i[1],
                     experts: d.i[2],
-                    reserved: 0,
+                    // Routing slots per token: selects the fused-combine kernel.
+                    reserved: if d.i[7] == 3 { d.i[4] } else { 0 },
                 },
                 grid,
                 w8a8,
@@ -5492,12 +5505,14 @@ fn bind_packed_experts(
 
         // The fold's own preconditions, checked where the checkpoint is: TP (under EP the routed
         // experts are whole per rank while the shared expert is sliced on every rank, so there is
-        // no rank that owns it), the routed geometry AITER's 257/9 table is for, and — the one
+        // no rank that owns it), and — the one
         // that actually bites on a lite-prepped dir — a block-FP8 shared expert the slab can hold.
         if *shared_fold {
-            if whole || n_exp != 257 {
+            // Any routed count: the native call's table is 257 entries, the grouped W8A8 chain's
+            // GLM-5.3 table 289.
+            if whole {
                 return Err(RuntimeError::Device(format!(
-                    "{pfx}: the shared-expert fold is a TP construction over 257 entries, not                      EP over {n_exp}"
+                    "{pfx}: the shared-expert fold is a TP construction, not EP over {n_exp}"
                 )));
             }
             for j in 0..3 {
@@ -6971,8 +6986,8 @@ pub struct AmdEngine {
     _moe_stage1_a4_scratch: Option<DeviceMem>,
     k_moe_stage2_mxfp4: Option<HsaKernel>,
     k_moe_combine: Option<HsaKernel>,
-    /// GLU, down (W8A16), GLU, down (W8A8) of `moe_fp8_pf_gfx950.elf`.
-    k_moe_fp8_pf: Option<[HsaKernel; 4]>,
+    /// GLU, down (W8A16), GLU, down (W8A8), fused-combine down (W8A8) of `moe_fp8_pf_gfx950.elf`.
+    k_moe_fp8_pf: Option<[HsaKernel; 5]>,
     /// The f32-mix AttnRes object and the workgroup size it advertises.
     k_attn_res_f32mix: Option<(HsaKernel, u32)>,
     k_moe_ep_align: Option<HsaKernel>,
@@ -9836,11 +9851,12 @@ impl AmdEngine {
 
         let k_moe_fp8_pf = if arch == "gfx950" && need_moe_fp8_pf {
             const NAME: &str = "moe_fp8_pf_gfx950.elf";
-            const SYMBOLS: [(&str, usize); 4] = [
+            const SYMBOLS: [(&str, usize); 5] = [
                 ("plow_moe_fp8_glu_pf_gfx950", std::mem::size_of::<MoeFp8GluArgs>()),
                 ("plow_moe_fp8_down_pf_gfx950", std::mem::size_of::<MoeFp8DownArgs>()),
                 ("plow_moe_w8a8_glu_pf_gfx950", std::mem::size_of::<MoeFp8GluArgs>()),
                 ("plow_moe_w8a8_down_pf_gfx950", std::mem::size_of::<MoeFp8DownArgs>()),
+                ("plow_moe_w8a8_down_acc_pf_gfx950", std::mem::size_of::<MoeFp8DownArgs>()),
             ];
             let path = hsaco_dir.join(NAME);
             if !path.exists() {
@@ -9872,7 +9888,7 @@ impl AmdEngine {
                     ks.push(kernel);
                 }
                 modules.push(module);
-                Some([ks[0], ks[1], ks[2], ks[3]])
+                Some([ks[0], ks[1], ks[2], ks[3], ks[4]])
             }
         } else {
             None
@@ -11199,6 +11215,13 @@ impl AmdEngine {
                 add_kda_key_factor_routes(p, &devp, &mut prefill_routes, kda_key_factor_scratch)?;
                 if k_moe_fp8_pf.is_some() {
                     add_moe_fp8_pf_routes(p, &devp, &mut prefill_routes)?;
+                } else if p.insts.iter().any(moe_fp8_acc_inst) {
+                    return Err(RuntimeError::Device(
+                        "packet fuses the MoE combine into the dedicated fp8 down \
+                         (PLOW_MOE_FP8_PF_ACC), which needs moe_fp8_pf_gfx950.elf and \
+                         PLOW_MOE_FP8_PF on; the interpreter has no such arm"
+                            .into(),
+                    ));
                 }
                 mla_materialized_routes(p, &devp, &mut prefill_routes)?;
                 if use_sparse_mla {
@@ -13884,6 +13907,48 @@ impl AmdEngine {
             self.seg_launches += self.packed_spans.len() as u64;
             return Ok(());
         }
+        // Packed (active) programs too: MoE has no cross-row state, so one launch covers
+        // every span (PLOW_MOE_FP8_PF_PACKED).
+        if let Some(ks) = self.k_moe_fp8_pf {
+            let route = self.progs[p].prefill_routes.get(seg).copied();
+            let launched = match route {
+                Some(PrefillSegmentRoute::MoeFp8Glu { args, grid, w8a8 }) => {
+                    EngineDevice::launch_kernel(
+                        &*self.be,
+                        ks[if w8a8 { 2 } else { 0 }],
+                        grid,
+                        512,
+                        0,
+                        as_bytes(std::slice::from_ref(&args)),
+                        None,
+                    )?;
+                    true
+                }
+                Some(PrefillSegmentRoute::MoeFp8Down { args, grid, w8a8 }) => {
+                    EngineDevice::launch_kernel(
+                        &*self.be,
+                        ks[if args.reserved != 0 {
+                            4
+                        } else if w8a8 {
+                            3
+                        } else {
+                            1
+                        }],
+                        grid,
+                        512,
+                        0,
+                        as_bytes(std::slice::from_ref(&args)),
+                        None,
+                    )?;
+                    true
+                }
+                _ => false,
+            };
+            if launched {
+                self.seg_launches += 1;
+                return Ok(());
+            }
+        }
         if !active {
             if let Some(PrefillSegmentRoute::MlaMaterializePack {
                 args,
@@ -14254,40 +14319,6 @@ impl AmdEngine {
                 )?;
                 self.seg_launches += 1;
                 return Ok(());
-            }
-            if let Some(ks) = self.k_moe_fp8_pf {
-                let route = self.progs[p].prefill_routes.get(seg).copied();
-                let launched = match route {
-                    Some(PrefillSegmentRoute::MoeFp8Glu { args, grid, w8a8 }) => {
-                        EngineDevice::launch_kernel(
-                            &*self.be,
-                            ks[if w8a8 { 2 } else { 0 }],
-                            grid,
-                            512,
-                            0,
-                            as_bytes(std::slice::from_ref(&args)),
-                            None,
-                        )?;
-                        true
-                    }
-                    Some(PrefillSegmentRoute::MoeFp8Down { args, grid, w8a8 }) => {
-                        EngineDevice::launch_kernel(
-                            &*self.be,
-                            ks[if w8a8 { 3 } else { 1 }],
-                            grid,
-                            512,
-                            0,
-                            as_bytes(std::slice::from_ref(&args)),
-                            None,
-                        )?;
-                        true
-                    }
-                    _ => false,
-                };
-                if launched {
-                    self.seg_launches += 1;
-                    return Ok(());
-                }
             }
             if let (Some(kernel), Some(PrefillSegmentRoute::MoeCombine(route))) = (
                 self.k_moe_combine,
