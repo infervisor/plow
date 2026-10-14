@@ -782,7 +782,13 @@ pub(super) fn required_moe_pf_accum<'a>(
     progs
         .into_iter()
         .flat_map(|p| &p.insts)
-        .any(|inst| inst.op == DevOp::MoeGroupDownPf as u16 && inst.i[field] != 0)
+        // i7 = 3 (PLOW_MOE_FP8_PF_ACC) spells its slot count in i4; that down runs only on the
+        // dedicated object, never the interpreter's atomic arm.
+        .any(|inst| {
+            inst.op == DevOp::MoeGroupDownPf as u16
+                && inst.i[field] != 0
+                && !(field == 4 && inst.i[7] == 3)
+        })
 }
 
 /// Refuse a DECODE code object that does not carry the arms the packet needs.

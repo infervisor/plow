@@ -611,7 +611,9 @@ fn shapes(m: &Model) -> Shapes {
                         }
                     }
                     // i[4] on DOWN is the fused decomposition's log2(k)+1 (PLOW_MOE_PF_ATOMIC).
-                    if op == DevOp::MoeGroupDownPf && inst.i[4] != 0 {
+                    // i7 = 3 (PLOW_MOE_FP8_PF_ACC) reuses i[4] as its slot count on the
+                    // dedicated object; it never reaches the interpreter's atomic arm.
+                    if op == DevOp::MoeGroupDownPf && inst.i[4] != 0 && inst.i[7] != 3 {
                         s.moe_pf_atomic = true;
                     }
                     // i[5] on DOWN is the deterministic arm's log2(k)+1 (PLOW_MOE_PF_DET).
