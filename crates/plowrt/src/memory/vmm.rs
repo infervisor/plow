@@ -1171,6 +1171,9 @@ struct SlotSeq {
     /// Boundary tree: the boundary this request attached and has not yet continued (a
     /// publish below it, or a touch of it). It holds `Snap::pending` on that boundary.
     lineage: Option<u64>,
+    /// Boundary tree: the boundary this request's prompt ended at (published or touched),
+    /// counted once in its `Snap::ends`.
+    ended: Option<u64>,
     /// The fine-cache counterpart of `hashes`/`held` ([`try_attach_fine`]): held exactly the
     /// same way, in the SEPARATE `fine_cache` radix tree, so `evict_one_fine` cannot evict a
     /// node a live attach is reading between `try_attach_fine`'s lock and the copy that
@@ -1286,6 +1289,11 @@ struct Snap {
     /// boundary of its own: the single-continuation retire waits for them (only LRU takes
     /// such a boundary); the count never drops for a request that ended without publishing.
     pending: u32,
+    /// Boundary tree: requests whose prompt ended at this boundary (it published it, or found
+    /// it already published) and that no continuation has superseded yet. Two of them (a
+    /// parallel pair, a retry) expect two continuations, which may diverge: the first one's
+    /// child does not retire the boundary the second still needs (only LRU takes it).
+    ends: u32,
     /// A spill whose fence failed: the device buffer is valid but never freed, never spilled.
     quarantined: bool,
     /// Boundary tree ([`Policy::Tree`]): the longest retained boundary strictly below `rows`
@@ -1798,9 +1806,10 @@ impl VmmKv {
     /// `cap_bytes` in `slot_bytes` slots (the largest snapshot the engine publishes), and
     /// restore them over PCIe when a prompt attaches to one (or ahead of it: `PrefixProbe::
     /// prefetch`). The tier is the second level of the boundary tree's LRU: a device eviction
-    /// spills, a full tier drops its least recently used host snapshot. Pinned chunks grow on a
-    /// background thread a chunk ahead of demand; the first is allocated here, which also
-    /// proves the backend has a host tier. Off by default; `Policy::Tree` only.
+    /// spills, a full tier drops its least recently used host snapshot. Every pinned chunk is
+    /// allocated here, at bring-up (the first proves the backend has a host tier; a failed
+    /// one caps the tier); the background thread only restores prefetches. Off by default;
+    /// `Policy::Tree` only.
     pub fn enable_host_tier(&mut self, cap_bytes: u64, slot_bytes: u64) -> Result<()> {
         let s = &self.shared;
         let cap_slots = u32::try_from(cap_bytes / slot_bytes.max(1)).unwrap_or(u32::MAX);
@@ -1831,19 +1840,55 @@ impl VmmKv {
         let bytes = tier.wants_chunk().expect("an empty tier wants a chunk");
         let ptr = s.ops.host_tier_alloc(bytes)?;
         tier.add_chunk(ptr, bytes);
+        // The rest up front, here at bring-up: pinning takes the driver's context lock (1 GiB
+        // is 100 ms-class), and growth while serving stalled every engine launch behind it
+        // (lab: 2-18 s TTFT stalls while the tier grew).
+        let started = std::time::Instant::now();
+        while (tier.slots.len() as u32) < tier.cap_slots {
+            let n = chunk_slots.min(tier.cap_slots - tier.slots.len() as u32);
+            let bytes = u64::from(n) * slot_bytes;
+            match s.ops.host_tier_alloc(bytes) {
+                Ok(ptr) => tier.add_chunk(ptr, bytes),
+                Err(error) => {
+                    tier.cap_slots = tier.slots.len() as u32;
+                    tracing::warn!(
+                        error = %error,
+                        capacity_mib = (tier.slots.len() as u64 * slot_bytes) >> 20,
+                        "vmm host tier: pinned allocation failed, tier capped"
+                    );
+                    break;
+                }
+            }
+        }
+        tracing::info!(
+            capacity_mib = (tier.slots.len() as u64 * slot_bytes) >> 20,
+            ms = started.elapsed().as_millis() as u64,
+            "vmm host tier: pinned at bring-up"
+        );
+        // The worker first: nothing may spill or prefetch into a tier without it (a prefetch
+        // would wait on it forever).
+        let shared = Arc::clone(s);
+        let join = match std::thread::Builder::new()
+            .name("vmm-host-tier".into())
+            .spawn(move || host_tier_thread(&shared))
+        {
+            Ok(join) => join,
+            Err(e) => {
+                s.ops.host_tier_free(ptr, bytes);
+                return Err(RuntimeError::Device(format!(
+                    "vmm: spawn vmm-host-tier: {e}"
+                )));
+            }
+        };
         {
             let mut inner = s.inner.lock();
             inner.stats.host_capacity_bytes = tier.slots.len() as u64 * slot_bytes;
             inner.host = Some(tier);
+            // Under the lock the worker waits on: it parks until there is work.
+            s.host_cv.notify_all();
         }
         s.host_armed.store(true, Ordering::Release);
-        let shared = Arc::clone(s);
-        self.host_join = Some(
-            std::thread::Builder::new()
-                .name("vmm-host-tier".into())
-                .spawn(move || host_tier_thread(&shared))
-                .map_err(|e| RuntimeError::Device(format!("vmm: spawn vmm-host-tier: {e}")))?,
-        );
+        self.host_join = Some(join);
         Ok(())
     }
 
@@ -2586,6 +2631,30 @@ impl VmmKv {
                     inner.stats.attach_hits -= 1;
                     inner.stats.attach_misses += 1;
                     inner.stats.tokens_attached -= rows as u64;
+                    let st = &mut inner.stats;
+                    let (hits, got, miss) = if kind.has(Kind::PROMPT_END) {
+                        (
+                            &mut st.attach_prompt_end,
+                            &mut st.tokens_attached_prompt_end,
+                            &mut st.tokens_lost_prompt_end,
+                        )
+                    } else if kind.has(Kind::SHARED_END) {
+                        (
+                            &mut st.attach_shared,
+                            &mut st.tokens_attached_shared,
+                            &mut st.tokens_lost_shared,
+                        )
+                    } else {
+                        (
+                            &mut st.attach_block,
+                            &mut st.tokens_attached_block,
+                            &mut st.tokens_lost_block,
+                        )
+                    };
+                    *hits -= 1;
+                    *got -= u64::from(rows);
+                    *miss -= prompt.len() as u64 - u64::from(rows);
+                    st.tokens_lost_miss += prompt.len() as u64;
                     inner.seqs[seq] = SlotSeq {
                         hashes,
                         prompt_rows: tokens.len(),
@@ -2878,10 +2947,14 @@ impl VmmKv {
         // rule applies to it now.
         let lineage = inner.seqs[seq].lineage;
         continue_lineage(&mut inner, seq, id, parent);
+        let superseded = note_end(&mut inner, seq, id, kind);
         if let Some(l) = lineage.filter(|&l| {
             l != id && inner.policy == Policy::Tree && inner.seqs[seq].lineage.is_none()
         }) {
             policy::try_retire(s, &mut inner, l);
+        }
+        if let Some(a) = superseded {
+            policy::try_retire(s, &mut inner, a);
         }
         true
     }
@@ -3188,6 +3261,7 @@ impl VmmKv {
                     chain: 0,
                     kind: Kind::CHECKPOINT,
                     pending: 0,
+                    ends: 0,
                     quarantined: false,
                     parent: None,
                     children: Vec::new(),
@@ -3594,8 +3668,12 @@ fn publish_locked(
             if let Some((id, parent)) = twin {
                 let lineage = inner.seqs[seq].lineage;
                 continue_lineage(inner, seq, id, parent);
+                let superseded = note_end(inner, seq, id, kind);
                 if let Some(l) = lineage.filter(|_| inner.seqs[seq].lineage.is_none()) {
                     policy::try_retire(s, inner, l);
+                }
+                if let Some(a) = superseded {
+                    policy::try_retire(s, inner, a);
                 }
             }
         }
@@ -3711,6 +3789,7 @@ fn publish_locked(
             last_used: tick,
             kind,
             pending: 0,
+            ends: 0,
             quarantined: false,
             parent: None,
             children: Vec::new(),
@@ -3729,15 +3808,23 @@ fn publish_locked(
         inner.stats.cache_bytes += snap_bytes;
         (id, None)
     };
+    let mut superseded = None;
+    let mut continued = None;
     if inner.policy == Policy::Tree {
         policy::link(inner, id, parent);
+        let lineage = inner.seqs[seq].lineage;
         continue_lineage(inner, seq, id, parent);
+        continued = lineage.filter(|&l| l != id && inner.seqs[seq].lineage.is_none());
+        superseded = note_end(inner, seq, id, kind);
     }
     trim_cache(s, inner);
     // Retire the superseded parent only behind a boundary that survived its own trim: the
     // superseded one is otherwise the chain's only attach point.
     if inner.policy == Policy::Tree && inner.by_id.contains_key(&id) {
         policy::retire_parent_of(s, inner, id);
+        for a in [superseded, continued].into_iter().flatten() {
+            policy::try_retire(s, inner, a);
+        }
     }
     if let Some(held) = unheld.filter(|_| inner.policy == Policy::Tree) {
         if inner.by_id.contains_key(&held) {
@@ -3765,6 +3852,7 @@ fn try_attach_fine(inner: &mut Inner, seq: usize, prompt: &[u32]) -> Result<Opti
             held: 0,
             snapshot: None,
             lineage: None,
+            ended: None,
             fine_hashes: Vec::new(),
             fine_held: 0,
         };
@@ -3823,6 +3911,7 @@ fn try_attach_fine(inner: &mut Inner, seq: usize, prompt: &[u32]) -> Result<Opti
         held: 0,
         snapshot: None,
         lineage: None,
+        ended: None,
         fine_hashes: hashes[..pick].to_vec(),
         fine_held: pick,
     };
@@ -4200,13 +4289,47 @@ fn continue_lineage(inner: &mut Inner, seq: usize, id: u64, parent: Option<u64>)
     let Some(l) = inner.seqs[seq].lineage else {
         return;
     };
-    if l != id && Some(l) != parent {
+    // `id` continues `l` if `l` is `id` or any ancestor of it (a shared end can sit between).
+    let mut up = parent;
+    let mut continues = l == id;
+    while let (false, Some(a)) = (continues, up) {
+        continues = a == l;
+        up = snap_ref(inner, a).and_then(|snap| snap.parent);
+    }
+    if !continues {
         return;
     }
     inner.seqs[seq].lineage = None;
     if let Some(snap) = snap_mut(inner, l) {
         snap.pending = snap.pending.saturating_sub(1);
     }
+}
+
+/// `seq`'s prompt ended at boundary `id` (published or found published), counted once per
+/// request: one more expected continuation of `id`, and one fewer of the nearest ancestor an
+/// earlier prompt ended at (this request continues that history, whichever boundary it
+/// attached). Returns that ancestor when no prompt end is left on it, for the
+/// single-continuation rule (the caller applies it when `id` is safe).
+fn note_end(inner: &mut Inner, seq: usize, id: u64, kind: Kind) -> Option<u64> {
+    if inner.policy != Policy::Tree
+        || !kind.has(Kind::PROMPT_END)
+        || inner.seqs[seq].ended == Some(id)
+    {
+        return None;
+    }
+    let snap = snap_mut(inner, id)?;
+    snap.ends += 1;
+    let mut up = snap.parent;
+    inner.seqs[seq].ended = Some(id);
+    while let Some(a) = up {
+        let anc = snap_mut(inner, a)?;
+        if anc.ends > 0 {
+            anc.ends -= 1;
+            return (anc.ends == 0).then_some(a);
+        }
+        up = anc.parent;
+    }
+    None
 }
 
 /// Drop `seq`'s attach hold on its snapshot; the id whose `users` reached 0, for the
@@ -4375,8 +4498,10 @@ fn host_tier_thread(s: &Shared) {
         if s.host_stop.load(Ordering::Acquire) {
             return;
         }
+        // Spawned before the tier is installed (`enable_host_tier`).
         let Some(tier) = inner.host.as_mut() else {
-            return;
+            s.host_cv.wait(&mut inner);
+            continue;
         };
         if let Some(id) = tier.prefetch.pop_front() {
             let Some((slot, bytes)) = snap_ref(&inner, id).and_then(|snap| match snap.store {
@@ -9048,6 +9173,13 @@ mod tests {
         assert_eq!(s.snapshots_restored, 0);
         assert_eq!(s.attach_misses, 3, "a's and b's first sightings, then this");
         assert_eq!(s.attach_hits, 0);
+        assert_eq!(
+            s.attach_prompt_end + s.attach_shared + s.attach_block,
+            0,
+            "no attach kind counts the miss"
+        );
+        assert_eq!(s.tokens_attached_prompt_end + s.tokens_attached_block, 0);
+        assert_eq!(s.tokens_lost_miss, 3 * a.len() as u64);
         assert_eq!(s.blocks_shared_mapped, 0, "the window was unwound");
         p.ensure_rows(1, 17).unwrap();
         p.begin_seq(1);

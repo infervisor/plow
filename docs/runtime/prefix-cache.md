@@ -79,8 +79,14 @@ Policy (`crates/plowrt/src/memory/vmm_policy.rs`, `Policy::Tree`, the default):
   ring-overflow check, so a long reply never stops the refresh) and restores it if pressure
   evicted it during the decode. A republish of an identical boundary refreshes nothing.
 * Structural retire: when `C` is published (or re-published) with parent `B`, `B` is freed iff
-  `B.children == {C}`, `B.users == 0`, `B.pending == 0`, `B` is not awaited, `B` is not a
-  `SHARED_END`, and `C` survived its own trim. The same rule runs when a sibling's eviction or a
+  `B.children == {C}`, `B.users == 0`, `B.pending == 0`, `B.ends == 0`, `B` is not awaited, `B`
+  is not a `SHARED_END`, and `C` survived its own trim. `ends` counts the requests whose prompt
+  ended at `B` (published it or found it published) that no later prompt end on the same chain
+  has superseded: each new prompt end decrements the nearest ancestor with `ends > 0`. A
+  parallel pair or a retry ends twice at one boundary and so expects two continuations, which
+  may diverge (lab dup-pair replay: 22% of twin replies differed at temperature 0); the first
+  continuation does not retire the boundary the second still needs. Without a second
+  continuation it goes by LRU. The same rule runs when a sibling's eviction or a
   hold's release leaves one continuation. `pending` counts requests that attached `B` and have
   not continued it (a publish below it, a touch of it, or a strict-publish refusal of a boundary
   another request already published from the same chain): a parallel pair's second request
@@ -116,7 +122,8 @@ host memory can. With the tier armed the device LRU's victim is *spilled*, not f
 
 * `SnapStore::{Device(va), Spilling{va,slot,fence}, Host(slot), Restoring(slot)}`. A spill is one
   async D2H copy into a fixed host slot (the largest snapshot the engine can publish; chunks of
-  1 GiB grow on the `vmm-host-tier` thread a chunk ahead of demand, never on the engine thread).
+  1 GiB are all pinned at bring-up: pinning takes the driver context lock, and growing them
+  while serving stalled every engine launch for seconds in the lab).
   The device buffer outlives the fence: `reap_spills` (every trim) frees it once the copy
   retired; the cap trim credits in-flight spills and never waits, OOM reclamation finishes the
   oldest in-flight spill before queueing another; at most 4 are in flight.

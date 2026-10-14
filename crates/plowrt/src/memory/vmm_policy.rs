@@ -10,8 +10,9 @@
 //!   published: a shorter boundary published later does not adopt `C`); `None` iff none did;
 //! * `children` hold retained ids only: every free unlinks synchronously
 //!   ([`unlink_snapshot`]) and re-parents the freed boundary's children to its parent;
-//! * a boundary is retired only when exactly one retained continuation extends it, it is not
-//!   in use, not awaited, and not a shared-prefix end ([`Kind::SHARED_END`]: published because
+//! * a boundary is retired only when exactly one retained continuation extends it, every
+//!   request whose prompt ended there has been continued (`ends`), it is not in use, not
+//!   awaited, and not a shared-prefix end ([`Kind::SHARED_END`]: published because
 //!   another prompt shares it, so its second continuation is expected, and it survives by
 //!   LRU refresh alone).
 use super::*;
@@ -102,6 +103,7 @@ pub(super) fn try_retire(s: &Shared, inner: &mut Inner, id: u64) -> bool {
     if p.children.len() != 1
         || p.users != 0
         || p.pending != 0
+        || p.ends != 0
         || p.kind.has(Kind::SHARED_END)
         || snap_awaited(&inner.awaited, p)
     {
@@ -265,6 +267,7 @@ pub(super) fn check_tree(inner: &Inner) {
             snap.children.len() != 1
                 || snap.users > 0
                 || snap.pending > 0
+                || snap.ends > 0
                 || snap.kind.has(Kind::SHARED_END)
                 || snap_awaited(&inner.awaited, snap),
             "snap {id}: single retained continuation left unretired"

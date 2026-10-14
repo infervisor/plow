@@ -991,13 +991,15 @@ fn cell_session_header_is_routing_only() {
 /// same-history pair and the conversation keeps one boundary.
 #[test]
 fn cell_parallel_pair_on_one_history() {
-    for (policy, via_inflight) in [
-        (Policy::Legacy, true),
-        (Policy::Legacy, false),
-        (Policy::Tree, true),
-        (Policy::Tree, false),
+    for (policy, via_inflight, diverge) in [
+        (Policy::Legacy, true, false),
+        (Policy::Legacy, false, false),
+        (Policy::Tree, true, false),
+        (Policy::Tree, false, false),
+        (Policy::Tree, true, true),
+        (Policy::Tree, false, true),
     ] {
-        let at = format!("{policy:?} via_inflight={via_inflight}");
+        let at = format!("{policy:?} via_inflight={via_inflight} diverge={diverge}");
         // 512-row blocks: as in production (4096-row blocks, 5.7K prompts) both prompt ends and
         // the shared end sit in one block, so strict publish lets either request publish it.
         let mut r = Rig::new(policy, false, 1 << 20, 4096, 3);
@@ -1039,12 +1041,21 @@ fn cell_parallel_pair_on_one_history() {
         let mut b_toks = r.prefill(1, &p2, 4096);
         let mut a_toks = a_toks;
         let mut reply = r.finish(0, &mut a_toks, 30);
-        r.finish(1, &mut b_toks, 30);
-        // Three more turns continue from A's reply.
+        let mut reply_b = r.finish(1, &mut b_toks, 30);
+        if diverge {
+            reply_b.iter_mut().for_each(|t| *t ^= 0x0020_0000);
+        } else {
+            reply_b = reply.clone();
+        }
+        // Three more turns continue from A's reply; B's conversation sends the same turn 3
+        // (its reply was A's) or diverges (its own reply), right after A's.
+        let p3b = next_prompt(&p2, &reply_b, 4, 100, 80_000);
+        let b_end = (p2.len() as u32 - 9) / 32 * 32;
         let mut p = p2;
         for t in 0..3u32 {
             p = next_prompt(&p, &reply, 4, 100, 80_000 + 1_000 * t);
             let (rows, out) = r.turn(2, &p, 30);
+            let rows_a3 = (p.len() as u32 - 9) / 32 * 32;
             reply = out;
             assert_eq!(
                 rows,
@@ -1053,6 +1064,13 @@ fn cell_parallel_pair_on_one_history() {
                 t + 3,
                 r.dump()
             );
+            if t == 0 {
+                // B's turn 3: a diverged one attaches the pair's prompt end (still there), a
+                // converged one A's turn-3 end.
+                let (rows_b, _) = r.turn(1, &p3b, 30);
+                let want = if diverge { b_end } else { rows_a3 };
+                assert_eq!(rows_b, want, "B's turn 3 ({at}): {}", r.dump());
+            }
         }
         let s = r.kv().stats();
         let sticky = r.snaps().iter().any(|&(rows, _, _)| rows == 832);
@@ -1063,7 +1081,11 @@ fn cell_parallel_pair_on_one_history() {
                 "no shared end ({at}): {}",
                 r.dump()
             );
-            assert_eq!(r.live(), 1, "one boundary ({at}): {}", r.dump());
+            // A's conversation keeps one boundary, plus the last one B's conversation ended
+            // at (B never sends a turn 4): A's turn-3 end when B converged; B's own end and
+            // the pair's end (their branch point) when it diverged. LRU takes them.
+            let want = if diverge { 3 } else { 2 };
+            assert_eq!(r.live(), want, "boundaries ({at}): {}", r.dump());
         } else {
             assert_eq!(
                 s.publishes_shared_end,
@@ -1311,7 +1333,8 @@ fn cell_branch_point_retires_when_one_child_is_left() {
 }
 
 /// A system prompt end (`SHARED_END`) attached by several conversations is never retired by a
-/// single continuation; a prompt end attached twice (a retry and the real next turn) is.
+/// single continuation. A prompt end two requests ended at (a retry) expects two
+/// continuations: the first keeps it, the second retires it.
 #[test]
 fn cell_shared_end_is_structurally_exempt_prompt_end_is_not() {
     let mut r = Rig::new(Policy::Tree, true, 1 << 20, 64, 2);
@@ -1331,7 +1354,7 @@ fn cell_shared_end_is_structurally_exempt_prompt_end_is_not() {
         "still there: {:?}",
         r.snaps()
     );
-    // A prompt end attached twice and then continued is retired all the same.
+    // The retry ends at d's end again: two continuations expected.
     let (rows1, r1) = r.turn(0, &d, 10);
     assert!(rows1 > 0);
     let live = r.live();
@@ -1340,10 +1363,14 @@ fn cell_shared_end_is_structurally_exempt_prompt_end_is_not() {
     assert_eq!(rows2, rows1, "d2 attaches d's end too: {}", r.dump());
     assert_eq!(
         r.live(),
-        live,
-        "d's end retired as d2 published: {}",
+        live + 1,
+        "d's end waits for its second continuation: {}",
         r.dump()
     );
+    assert_eq!(r.kv().stats().snapshots_retired, 0);
+    // The second one (here the same next turn again) retires it.
+    r.turn(1, &d2, 10);
+    assert_eq!(r.live(), live, "d's end retired: {}", r.dump());
     assert_eq!(r.kv().stats().snapshots_retired, 1);
 }
 
