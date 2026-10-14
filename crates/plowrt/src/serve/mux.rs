@@ -3395,6 +3395,9 @@ fn run_one_tick(
                     let mut completed = std::mem::take(&mut obs.host.prefill_tokens);
                     completed.clear();
                     let mut dev_sampled = false;
+                    if obs.host.ride.needs_ladder() {
+                        obs.host.ride.set_ladder(&e.pf_bucket_ladder());
+                    }
                     if obs.host.ride.needs_widths() {
                         let widths: Vec<usize> = e
                             .effective_decode_rungs()
@@ -5784,6 +5787,10 @@ fn arrival_key(arrived: Instant, now: Instant) -> u64 {
 /// Unset and `0` both mean uncapped, so the default IS the zero sentinel.
 /// Reads `RuntimeConfig::get().pf_chunk_rows()`.
 #[cfg(feature = "cuda")]
+fn pf_itl_budget_ms() -> u32 {
+    crate::config::RuntimeConfig::get().pf_itl_budget_ms
+}
+
 fn pf_chunk_rows() -> usize {
     crate::config::RuntimeConfig::get().pf_chunk_rows()
 }
@@ -5980,19 +5987,29 @@ fn gpu_prefill_batched_pass(
         // ITL budget (`PLOW_PF_ITL_BUDGET_MS`): with decode rows riding, the launch takes the
         // widest rung whose measured launch time fits the budget, so a rider's wait is bounded
         // and a long prompt runs as several launches. Riders always ride under a budget: a
-        // separate decode step after the launch would add a step to their wait.
-        let itl_cap = if decode_rows > 0 && !feeds.is_empty() {
-            let budget = crate::config::RuntimeConfig::get().pf_itl_budget_ms;
-            (budget > 0)
-                .then(|| ride.rows_within(f64::from(budget), &e.pf_bucket_ladder()))
-                .flatten()
+        // separate decode step after the launch would add a step to their wait. A launch with
+        // an indivisible media span runs unbudgeted (a span cannot be cut to a rung).
+        let budget_on = decode_rows > 0 && pf_itl_budget_ms() > 0;
+        let itl_cap = if budget_on
+            && !candidates.iter().any(|c| {
+                slots[c.span.slot as usize]
+                    .as_ref()
+                    .is_some_and(|s| s.mm.as_deref().is_some_and(|j| j.spans()))
+            }) {
+            ride.rows_within(f64::from(pf_itl_budget_ms()))
         } else {
             None
         };
-        let launch_cap = itl_cap.map_or(launch_cap, |cap| cap.min(launch_cap));
+        // The rung holds the riders too: their rows are reserved inside it.
+        let (launch_cap, launch_max) = match itl_cap {
+            Some(cap) => (
+                launch_cap.min(cap.saturating_sub(decode_rows).max(1)),
+                launch_max.min(cap),
+            ),
+            None => (launch_cap, launch_max),
+        };
         let ride_key = e.pf_pack_budget(avail.min(launch_cap));
-        if std::mem::take(&mut ride_open) && itl_cap.is_none() && !ride.ride(ride_key, feeds.len())
-        {
+        if std::mem::take(&mut ride_open) && !budget_on && !ride.ride(ride_key, feeds.len()) {
             unified = false;
             decode_rows = 0;
         }
@@ -6184,7 +6201,13 @@ fn gpu_prefill_batched_pass(
                 })
         };
         if res.is_ok() {
-            ride.observe_launch(ride_key, riders, t_launch.elapsed().as_secs_f64() * 1e3);
+            let ms = t_launch.elapsed().as_secs_f64() * 1e3;
+            ride.observe_launch(ride_key, riders, ms);
+            // The rung actually launched: the smallest bucket holding the packed rows and riders.
+            ride.observe_rung(
+                e.pf_pack_budget(pack.iter().map(|p| p.2).sum::<usize>() + riders),
+                ms,
+            );
         }
         match res {
             Ok(()) => {
