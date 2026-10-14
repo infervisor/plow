@@ -11090,7 +11090,7 @@ impl GpuEngine {
                             continue;
                         }
                         if let Some(Some(route)) = self.prefill[bi].light_segments.get(seg) {
-                            route.run(&capture_stream)?;
+                            route.run_tensors(&capture_stream, arg.tensors)?;
                             continue;
                         }
                         if let Some(Some(route)) = self.prefill[bi].moe_lt_segments.get(seg) {
@@ -11469,11 +11469,11 @@ impl GpuEngine {
                         let e0 = self.be.event_create(true)?;
                         let e1 = self.be.event_create(true)?;
                         self.be.event_record(&e0, &self.stream)?;
-                        route.run(&self.stream)?;
+                        route.run_tensors(&self.stream, arg.tensors)?;
                         self.be.event_record(&e1, &self.stream)?;
                         evs.push((seg, cls, e0, e1));
                     } else {
-                        route.run(&self.stream)?;
+                        route.run_tensors(&self.stream, arg.tensors)?;
                     }
                     continue;
                 }
