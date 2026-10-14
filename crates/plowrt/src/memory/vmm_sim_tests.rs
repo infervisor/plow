@@ -142,7 +142,7 @@ impl Kv {
         if rows == 0 || p_a == 0 {
             return (false, false);
         }
-        if self.kv.touch(b, toks, p_a) {
+        if self.kv.touch(b, toks, p_a, kind) {
             return (true, false);
         }
         let ring = if rows > self.kv.prompt_rows(b) {

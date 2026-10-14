@@ -859,7 +859,7 @@ impl GpuEngine {
         }
         // An already published boundary needs no copy: refresh it before the ring-overflow
         // check, so a surviving prompt end is touched however far decode ran past it.
-        if kv.touch(b, toks, p_a) {
+        if kv.touch(b, toks, p_a, kind) {
             tracing::debug!(slot = b, p_a, "vmm: boundary touched");
             return true;
         }

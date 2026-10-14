@@ -62,8 +62,10 @@ device memory above `PLOW_VMM_CACHE_MIN_FREE_MIB`.
 Policy (`crates/plowrt/src/memory/vmm_policy.rs`, `Policy::Tree`, the default):
 
 * `Snap { id, kind, chain, parent, children, users, last_used, store }`. `kind` is what the
-  publisher said (`PROMPT_END`, `SHARED_END`, `CHECKPOINT`; a dedup ORs). `parent` is canonical:
-  the longest retained boundary strictly below this one on its chain at publish time, found by
+  publisher said (`PROMPT_END`, `SHARED_END`, `CHECKPOINT`; a dedup or a touch ORs). `parent` is
+  canonical at publish time (historical: a shorter boundary published later does not adopt the
+  existing longer ones, so a parent can be an ancestor further up than the nearest retained
+  boundary): the longest retained boundary strictly below this one on its chain, found by
   the same walk an attach does, so an identical boundary published from two attach points has
   one parent. `children` are the retained boundaries whose parent this is; every free unlinks
   synchronously and re-parents the freed boundary's children to its parent.
@@ -100,8 +102,9 @@ Policy (`crates/plowrt/src/memory/vmm_policy.rs`, `Policy::Tree`, the default):
   parallel pair, a retry) and is not published at all: the waiter attaches the prompt end.
 * `X-Session-Id` has no cache meaning. Turn-end output boundaries are not published.
 
-Invariants (`vmm_sim_tests::cell_*`, `policy::check_tree`): a held or awaited snapshot is never
-freed on any path; `parent.rows < rows` and the parent lies on the chain; children sets hold
+Invariants (`vmm_sim_tests::cell_*`, `policy::check_tree`): a held, awaited or in-transfer
+snapshot is never freed on any path (LRU, retire, radix leaf eviction, strict publish's tail
+eviction; a node's snapshots are freed one by one so each unlinks while the rest are indexed); `parent.rows < rows` and the parent lies on the chain; children sets hold
 retained ids only; a retire needs exactly one retained continuation.
 
 ### Host tier: level 2 of the LRU (`PLOW_VMM_HOST_CACHE_MIB`, tree policy only)
@@ -121,17 +124,19 @@ host memory can. With the tier armed the device LRU's victim is *spilled*, not f
   least recently used host snapshot entirely (slot, node, dead blocks, `host_evictions`). The
   radix blocks of a host-resident boundary stay on the device: the boundary is still found by
   the same walk, `cached_rows` still counts it, admission still sees it.
-* An attach to a `Host` snapshot restores it (`alloc_snapshot` + synchronous H2D) with the pool
+* An attach to a `Host` snapshot claims it (`Restoring`, so a prefetch or a second attach waits
+  instead of copying again) and restores it (`alloc_snapshot` + synchronous H2D) with the pool
   lock released, under `users` so no eviction touches it; a failed restore unwinds the window to
   a miss and leaves the snapshot on the host for the next try. An attach to a `Spilling`
   snapshot waits for the fence and keeps the device copy (the slot goes back). A restored
   snapshot is the MRU (no device/host ping-pong). The mux queues a restore at arrival
   (`PrefixProbe::prefetch`, `Restoring`, held) so the copy overlaps the queueing; the attach
   waits on it when it is still in flight.
-* A fence that cannot be queried is "not done"; a fence that fails on wait quarantines the
-  snapshot: the device buffer is valid (a D2H copy only reads it) but never freed or spilled
-  again, the host slot is never reused (`host_fence_failures`). Teardown waits for every fence
-  and leaks the pinned chunks if one fails.
+* A fence that cannot be queried or fails on wait, or a copy submitted without a fence,
+  quarantines the snapshot: the device buffer is valid (a D2H copy only reads it) but never
+  freed or spilled again, the host slot is never reused (`host_fence_failures`). The tier
+  counts quarantines independently of the snapshot, so teardown leaks the pinned chunks while
+  any exists, even after the snapshot itself was evicted.
 * Accounting: `cache_bytes`/`snapshot_bytes` stay device-only; `host_snapshots`,
   `host_snapshot_bytes`, `host_capacity_bytes` are the tier's; `snapshots_spilled`,
   `snapshots_restored`, `host_evictions`, `spill_fallbacks` (too large for a slot, no slot, copy

@@ -594,6 +594,9 @@ struct CopyTier {
     stream: CudaStream,
     events: FxHashMap<u64, CudaEvent>,
     spare: Vec<CudaEvent>,
+    /// Fences of submitted copies whose completion could not be fenced or proven: every
+    /// query and wait on them fails, so the pool quarantines both buffers.
+    failed: rustc_hash::FxHashSet<u64>,
 }
 
 /// `cuTensorMapEncodeTiled` (CUDA 12.0+): out map (128 B, 128-aligned), dtype, rank,
@@ -2295,11 +2298,17 @@ impl crate::memory::vmm::VmmOps for CudaBackend {
                 stream: self.stream_create()?,
                 events: FxHashMap::default(),
                 spare: Vec::new(),
+                failed: Default::default(),
             }),
+        };
+        // The event first: once the copy is submitted every failure must still name it.
+        let event = match tier.spare.pop() {
+            Some(e) => e,
+            None => self.event_create(false)?,
         };
         // SAFETY: `va` stays allocated until the fence retires (`memory/vmm.rs`,
         // `SnapStore::Spilling`); `host_ptr` is inside a pinned tier chunk of at least `bytes`.
-        self.check(
+        if let Err(error) = self.check(
             unsafe {
                 (self.api.cuMemcpyDtoHAsync_v2)(
                     host_ptr as *mut c_void,
@@ -2309,13 +2318,23 @@ impl crate::memory::vmm::VmmOps for CudaBackend {
                 )
             },
             "cuMemcpyDtoHAsync(vmm spill)",
-        )?;
-        let event = match tier.spare.pop() {
-            Some(e) => e,
-            None => self.event_create(false)?,
-        };
-        self.event_record(&event, &tier.stream)?;
+        ) {
+            tier.spare.push(event);
+            return Err(error);
+        }
         let fence = event.raw as u64;
+        if let Err(error) = self.event_record(&event, &tier.stream) {
+            // Submitted but unfenced: a drained stream proves the copy done (the caller may
+            // free both sides); otherwise the fence reports failure and the pool quarantines.
+            if self.stream_synchronize(&tier.stream).is_ok() {
+                tier.spare.push(event);
+                return Err(error);
+            }
+            tracing::error!(error = %error, "vmm spill: copy submitted without a fence");
+            tier.events.insert(fence, event);
+            tier.failed.insert(fence);
+            return Ok(fence);
+        }
         tier.events.insert(fence, event);
         Ok(fence)
     }
@@ -2325,6 +2344,9 @@ impl crate::memory::vmm::VmmOps for CudaBackend {
         let Some(tier) = tier.as_mut() else {
             return Err(RuntimeError::Rejected("vmm spill: no copy stream".into()));
         };
+        if tier.failed.contains(&fence) {
+            return Err(RuntimeError::Device("vmm spill: unfenced copy".into()));
+        }
         let Some(event) = tier.events.get(&fence) else {
             return Err(RuntimeError::Device("vmm spill: unknown fence".into()));
         };
@@ -2344,6 +2366,11 @@ impl crate::memory::vmm::VmmOps for CudaBackend {
         let Some(event) = tier.events.remove(&fence) else {
             return Err(RuntimeError::Device("vmm spill: unknown fence".into()));
         };
+        if tier.failed.remove(&fence) {
+            // Never recorded: not reused.
+            drop(event);
+            return Err(RuntimeError::Device("vmm spill: unfenced copy".into()));
+        }
         let done = self.event_synchronize(&event);
         tier.spare.push(event);
         done

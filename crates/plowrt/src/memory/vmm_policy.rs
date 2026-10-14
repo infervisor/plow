@@ -6,8 +6,8 @@
 //!
 //! Invariants (checked by `check_tree` after every step of the scripted sim cells):
 //! * `users > 0` or an [`Await`] on a snapshot ⇒ it is never freed, on any path;
-//! * `parent(C).rows < C.rows` and the parent lies on `C`'s chain; `None` iff no retained
-//!   boundary lies below `C` on it;
+//! * `parent(C).rows < C.rows` and the parent lies on `C`'s chain (canonical when `C` was
+//!   published: a shorter boundary published later does not adopt `C`); `None` iff none did;
 //! * `children` hold retained ids only: every free unlinks synchronously
 //!   ([`unlink_snapshot`]) and re-parents the freed boundary's children to its parent;
 //! * a boundary is retired only when exactly one retained continuation extends it, it is not
@@ -183,12 +183,16 @@ pub(super) fn evict_one_tree(s: &Shared, inner: &mut Inner, preserve_hot: bool) 
         return true;
     }
     // Whole LRU radix leaves, never through a held, awaited or in-flight boundary.
-    let published = &inner.published;
-    let Some(key) = inner.cache.evict_lru_where(|key| {
-        published.get(&Some(key)).is_none_or(|list| {
-            list.iter()
-                .all(|snap| snap.users == 0 && !snap_awaited(&awaited, snap) && snap.on_device())
-        })
+    let Inner {
+        cache,
+        published,
+        awaited,
+        ..
+    } = &mut *inner;
+    let Some(key) = cache.evict_lru_where(|key| {
+        published
+            .get(&Some(key))
+            .is_none_or(|list| snapshots_free(list, awaited))
     }) else {
         return false;
     };
@@ -200,11 +204,7 @@ pub(super) fn evict_one_tree(s: &Shared, inner: &mut Inner, preserve_hot: bool) 
             deref_block(s, inner, id);
         }
     }
-    if let Some(snapshots) = inner.published.remove(&Some(key)) {
-        for snap in snapshots {
-            free_snapshot(s, inner, snap);
-        }
-    }
+    drop_node_snapshots(s, inner, key);
     inner.stats.nodes_evicted += 1;
     true
 }

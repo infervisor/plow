@@ -1220,6 +1220,9 @@ struct HostTier {
     in_flight: std::collections::VecDeque<(u64, u64)>,
     /// Snapshot ids queued for a host → device restore ahead of their attach.
     prefetch: std::collections::VecDeque<u64>,
+    /// Copies whose fence failed, whether or not their snapshot is still published: teardown
+    /// leaks the pinned chunks while any exists (a DMA may still read or write them).
+    quarantined: u32,
 }
 
 /// One pinned allocation per chunk of host tier slots.
@@ -1823,6 +1826,7 @@ impl VmmKv {
             free: Vec::new(),
             in_flight: std::collections::VecDeque::new(),
             prefetch: std::collections::VecDeque::new(),
+            quarantined: 0,
         };
         let bytes = tier.wants_chunk().expect("an empty tier wants a chunk");
         let ptr = s.ops.host_tier_alloc(bytes)?;
@@ -2371,7 +2375,7 @@ impl VmmKv {
         snap.referenced = true;
         snap.reusable_prompt = true;
         snap.attaches += 1;
-        let (parent, kind, snap_bytes) = (snap.parent, snap.kind, snap.bytes);
+        let (kind, snap_bytes) = (snap.kind, snap.bytes);
         // A prefetch's restore in flight: wait for its device buffer (`users` holds it).
         while matches!(
             snap_ref(&inner, snap_key.id).expect("held").store,
@@ -2397,12 +2401,20 @@ impl VmmKv {
                     quarantine(s, &mut inner, snap_key.id, &error);
                 }
             },
+            // Owned by this attach until the copy lands: a prefetch or another attach of the
+            // same snapshot waits on `host_cv` instead of starting a second restore.
             SnapStore::Host(slot) => {
-                let tier = inner.host.as_ref().expect("a host snapshot has a tier");
-                restore = Some(tier.slots[slot as usize]);
+                snap.store = SnapStore::Restoring(slot);
+                restore = Some(slot);
             }
             SnapStore::Restoring(_) => unreachable!("waited above"),
         }
+        let restore = restore.map(|slot| {
+            let tier = inner.host.as_ref().expect("a host snapshot has a tier");
+            (slot, tier.slots[slot as usize])
+        });
+        // The ancestors as they are now: the restore wait above released the lock.
+        let parent = snap_ref(&inner, snap_key.id).expect("held").parent;
         let snap = snap_ref(&inner, snap_key.id).expect("held");
         let snap_va = snap.device_va().unwrap_or(0);
         let lost = prompt.len() as u64 - u64::from(rows);
@@ -2535,15 +2547,13 @@ impl VmmKv {
         // released like the maps below (`alloc_snapshot` evicts on OOM under the lock; this
         // snapshot's `users` keeps it out of the eviction). Failure is a miss: the window is
         // unwound before any of `maps` landed and the snapshot stays on the host.
-        if let Some(host_ptr) = restore {
+        if let Some((slot, host_ptr)) = restore {
             match restore_snapshot(s, host_ptr, snap_bytes) {
                 Ok(va) => {
                     let mut inner = s.inner.lock();
                     let tick = inner.snapshot_tick;
                     let snap = snap_mut(&mut inner, snap_key.id).expect("held");
-                    let SnapStore::Host(slot) = snap.store else {
-                        unreachable!("a held host snapshot cannot move");
-                    };
+                    debug_assert!(matches!(snap.store, SnapStore::Restoring(r) if r == slot));
                     snap.store = SnapStore::Device(va);
                     snap.last_used = tick;
                     inner.host.as_mut().unwrap().release_slot(slot);
@@ -2552,6 +2562,7 @@ impl VmmKv {
                     inner.stats.snapshot_bytes += snap_bytes;
                     inner.stats.cache_bytes += snap_bytes;
                     inner.stats.snapshots_restored += 1;
+                    s.host_cv.notify_all();
                     attach.snap_va = va;
                 }
                 Err(error) => {
@@ -2563,7 +2574,9 @@ impl VmmKv {
                     let tokens = std::mem::take(&mut inner.seqs[seq].tokens);
                     if let Some(snap) = snap_mut(&mut inner, snap_key.id) {
                         snap.pending -= 1;
+                        snap.store = SnapStore::Host(slot);
                     }
+                    s.host_cv.notify_all();
                     let orphans = unwind_attach(s, &mut inner, seq, pick, kvh, &unlanded);
                     inner.stats.attach_hits -= 1;
                     inner.stats.attach_misses += 1;
@@ -2620,6 +2633,12 @@ impl VmmKv {
             let unlanded: rustc_hash::FxHashSet<u64> =
                 maps[mapped..].iter().map(|&(va, _)| va).collect();
             let mut inner = s.inner.lock();
+            // The attach never happened: its expected continuation is gone too.
+            if inner.seqs[seq].lineage.take().is_some() {
+                if let Some(snap) = snap_mut(&mut inner, snap_key.id) {
+                    snap.pending = snap.pending.saturating_sub(1);
+                }
+            }
             let orphans = unwind_attach(s, &mut inner, seq, pick, kvh, &unlanded);
             drop(inner);
             for hnd in orphans {
@@ -2811,7 +2830,7 @@ impl VmmKv {
 
     /// Refresh the boundary at `tokens[..rows]` if it is published: newest in LRU, its
     /// ancestors with it. No copy, no allocation, no slot state. `false` = not published.
-    pub fn touch(&self, seq: usize, tokens: &[u32], rows: u32) -> bool {
+    pub fn touch(&self, seq: usize, tokens: &[u32], rows: u32, kind: Kind) -> bool {
         if !self.prefix_reuse || rows == 0 || rows as usize > tokens.len() {
             return false;
         }
@@ -2835,8 +2854,17 @@ impl VmmKv {
         };
         inner.snapshot_tick += 1;
         let tick = inner.snapshot_tick;
+        let prompt_rows = match inner.seqs[seq].prompt_rows {
+            0 => tokens.len(),
+            rows => rows,
+        };
+        let share = rows == inner.share[seq];
         let snap = snap_mut(&mut inner, id).expect("found above");
         snap.last_used = tick;
+        // What a dedup in `publish_locked` would merge: the publisher's kind and flags.
+        snap.kind |= kind;
+        snap.reusable_prompt |= (rows as usize) < prompt_rows;
+        snap.share |= share;
         let parent = snap.parent;
         policy::refresh_ancestors(&mut inner, parent, tick);
         inner.stats.snapshots_touched += 1;
@@ -3016,7 +3044,13 @@ impl VmmKv {
             return true;
         }
         let orphaned = m.blocks - held;
-        let evicted = inner.cache.evict_tail(&hashes, m.blocks, held);
+        // Never through a held, awaited or in-transfer snapshot: the tail above the deepest
+        // such node only (the publish is then skipped, as for a referenced node).
+        let keep = (held..m.blocks)
+            .rev()
+            .find(|&i| !node_snapshots_free(&inner, m.placed[i]))
+            .map_or(held, |i| i + 1);
+        let evicted = inner.cache.evict_tail(&hashes, m.blocks, keep);
         let evicted_count = evicted.len();
         for key in evicted {
             if let Some(ids) = inner.node_blocks.remove(&key) {
@@ -3026,11 +3060,7 @@ impl VmmKv {
                     deref_block(s, &mut inner, id);
                 }
             }
-            if let Some(snapshots) = inner.published.remove(&Some(key)) {
-                for snap in snapshots {
-                    free_snapshot(s, &mut inner, snap);
-                }
-            }
+            drop_node_snapshots(s, &mut inner, key);
             inner.stats.nodes_evicted += 1;
         }
         // Re-check: eviction may have stopped early (a referenced node in the way, e.g. a
@@ -3836,8 +3866,13 @@ impl Drop for VmmKv {
             let _ = j.join();
         }
         if let Some(j) = self.host_join.take() {
-            self.shared.host_stop.store(true, Ordering::Release);
-            self.shared.host_cv.notify_all();
+            {
+                // Under the worker's mutex: it checks the flag and parks on `host_cv` without
+                // releasing it in between, so the wakeup cannot fall into that gap.
+                let _inner = self.shared.inner.lock();
+                self.shared.host_stop.store(true, Ordering::Release);
+                self.shared.host_cv.notify_all();
+            }
             let _ = j.join();
         }
         let s = &self.shared;
@@ -3855,6 +3890,7 @@ impl Drop for VmmKv {
         for (_, snapshots) in std::mem::take(&mut inner.published) {
             for snap in snapshots {
                 match snap.store {
+                    SnapStore::Device(_) if snap.quarantined => {}
                     SnapStore::Device(va) => s.ops.free(va),
                     // A copy whose completion cannot be proven keeps its buffers: a free under
                     // a running DMA is worse than the leak at teardown.
@@ -3867,6 +3903,7 @@ impl Drop for VmmKv {
             }
         }
         if let Some(tier) = inner.host.take() {
+            let leaked = leaked + u64::from(tier.quarantined);
             if leaked == 0 {
                 for (ptr, bytes) in tier.chunks {
                     s.ops.host_tier_free(ptr, bytes);
@@ -4238,6 +4275,9 @@ fn free_snapshot(s: &Shared, inner: &mut Inner, snap: Snap) {
                 }
                 Err(error) => {
                     inner.stats.spill_fence_failures += 1;
+                    if let Some(tier) = inner.host.as_mut() {
+                        tier.quarantined += 1;
+                    }
                     tracing::error!(error = %error, "vmm host tier: fence failed, buffers quarantined");
                 }
             }
@@ -4262,6 +4302,7 @@ fn quarantine(s: &Shared, inner: &mut Inner, id: u64, error: &RuntimeError) {
     tracing::error!(error = %error, id, "vmm host tier: fence failed, buffers quarantined");
     if let Some(tier) = inner.host.as_mut() {
         tier.forget_spill(id);
+        tier.quarantined += 1;
     }
     if let Some(snap) = snap_mut(inner, id) {
         if let SnapStore::Spilling { va, .. } = snap.store {
@@ -4395,12 +4436,19 @@ fn host_tier_thread(s: &Shared) {
 }
 
 /// Free the device buffers of spills whose copy retired, oldest first (one copy stream, in
-/// order: the first unfinished fence ends the scan). A fence that cannot be queried is not
-/// done: the entry stays in flight and is quarantined when it has to be waited for.
+/// order: the first unfinished fence ends the scan). A fence that cannot be queried is a
+/// terminal failure: the entry is quarantined (neither buffer freed or reused), not left in
+/// flight where it would block every later reap.
 fn reap_spills(s: &Shared, inner: &mut Inner) {
     while let Some(&(id, _)) = inner.host.as_ref().and_then(|t| t.in_flight.front()) {
         let done = match snap_ref(inner, id).map(|snap| snap.store) {
-            Some(SnapStore::Spilling { fence, .. }) => s.ops.fence_done(fence).unwrap_or(false),
+            Some(SnapStore::Spilling { fence, .. }) => match s.ops.fence_done(fence) {
+                Ok(done) => done,
+                Err(error) => {
+                    quarantine(s, inner, id, &error);
+                    continue;
+                }
+            },
             // Removed, restored or un-spilled meanwhile: nothing to reap.
             _ => true,
         };
@@ -4565,6 +4613,36 @@ fn snap_awaited(awaited: &[Option<Await>], snap: &Snap) -> bool {
         .iter()
         .flatten()
         .any(|a| a.rows == snap.rows && a.chain == snap.chain)
+}
+
+/// None of `list` is held (an attach, a prefetch), awaited, or mid-transfer.
+fn snapshots_free(list: &[Snap], awaited: &[Option<Await>]) -> bool {
+    list.iter().all(|snap| {
+        snap.users == 0
+            && !snap_awaited(awaited, snap)
+            && matches!(snap.store, SnapStore::Device(_) | SnapStore::Host(_))
+    })
+}
+
+/// Every snapshot on radix node `key` may be freed with it ([`snapshots_free`]).
+fn node_snapshots_free(inner: &Inner, key: (u32, u32)) -> bool {
+    inner
+        .published
+        .get(&Some(key))
+        .is_none_or(|list| snapshots_free(list, &inner.awaited))
+}
+
+/// Free every snapshot on radix node `key`, one at a time through [`remove_snapshot_id`], so
+/// each unlinks from the boundary tree while the others are still indexed.
+fn drop_node_snapshots(s: &Shared, inner: &mut Inner, key: (u32, u32)) {
+    let ids: Vec<u64> = inner
+        .published
+        .get(&Some(key))
+        .map(|list| list.iter().map(|snap| snap.id).collect())
+        .unwrap_or_default();
+    for id in ids {
+        remove_snapshot_id(s, inner, id);
+    }
 }
 
 /// Remove the snapshot with this id from `published` and free it.
@@ -4787,11 +4865,7 @@ fn evict_one(s: &Shared, inner: &mut Inner, preserve_hot: bool) -> bool {
             deref_block(s, inner, id);
         }
     }
-    if let Some(snapshots) = inner.published.remove(&Some(key)) {
-        for snap in snapshots {
-            free_snapshot(s, inner, snap);
-        }
-    }
+    drop_node_snapshots(s, inner, key);
     inner.stats.nodes_evicted += 1;
     true
 }
@@ -8914,6 +8988,42 @@ mod tests {
         );
         assert_eq!(p.cached_rows(&a), 0);
         policy::check_tree(&p.shared.inner.lock());
+        // The quarantined snapshot is gone from the cache, its copy is not proven: teardown
+        // keeps the pinned chunks.
+        drop(p);
+        assert_eq!(
+            ops.host_frees.load(Ordering::SeqCst),
+            0,
+            "pinned chunks leaked"
+        );
+    }
+
+    /// A fence that cannot be queried is terminal: the reap quarantines the spill (nothing
+    /// freed, slot never reused) instead of leaving it in flight ahead of every later copy.
+    #[test]
+    fn fence_query_failure_quarantines_instead_of_blocking_the_reap() {
+        let ops = Arc::new(MockVmm::default());
+        let p = host_pool(ops.clone(), 448, 2, 192);
+        let frees = ops.frees.load(Ordering::SeqCst);
+        ops.fail_fences.store(1, Ordering::SeqCst);
+        let _a = publish_tailed(&p, &ops, 0, 10, 0xA1);
+        let _b = publish_tailed(&p, &ops, 0, 20, 0xB2);
+        let _c = publish_tailed(&p, &ops, 0, 30, 0xC3);
+        let s = p.stats();
+        assert_eq!(s.spill_fence_failures, 1);
+        assert_eq!(s.snapshots_spilled, 2);
+        assert_eq!(
+            s.host_snapshots, 1,
+            "the later spill retired behind the failed one"
+        );
+        assert_eq!(
+            ops.frees.load(Ordering::SeqCst) - frees,
+            1,
+            "only the good spill's buffer"
+        );
+        policy::check_tree(&p.shared.inner.lock());
+        drop(p);
+        assert_eq!(ops.host_frees.load(Ordering::SeqCst), 0);
     }
 
     /// A restore that fails (H2D refused, or no device memory) leaves the snapshot on the
