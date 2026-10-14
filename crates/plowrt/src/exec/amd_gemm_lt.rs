@@ -14,9 +14,11 @@ const NOBIAS_OBJECT_HASH: &str = "0ab860e928c070fa3ee22f5f91725539caaa0a12223296
 /// ROCm 10 `TensileLibrary_BB_BB_HA_Bias_SAV_UA_Type_BB_HPA_Contraction_l_Alik_Bljk_Cijk_Dijk`
 /// gfx950 image (`scripts/build_glm_lt.sh --gfx950`).
 const GFX950_OBJECT_HASH: &str = "379704897bfc6227f36260ac81cde6cfe9d608bd373623dd974bd4c852b1f5fe";
-/// Stream-K flag and partial-tile workspace. Every launch runs one whole tile per workgroup, so
-/// neither is written; the kernels only require both pointers to be valid.
-const GFX950_SCRATCH: u64 = 4 << 20;
+/// Stream-K partial-tile workspace and flags. Every launch runs one whole tile per workgroup;
+/// the kernels still require both pointers, and the workspace covers a full FP32 partial of
+/// every tile at 8192 rows should one write it.
+const GFX950_WS: u64 = 256 << 20;
+const GFX950_FLAGS: u64 = 4 << 20;
 
 #[derive(Clone, Copy, Debug)]
 pub(super) struct Route {
@@ -633,8 +635,8 @@ impl GemmLt {
             184,
             modules,
         )?;
-        let scratch = EngineDevice::alloc(be, 2 * GFX950_SCRATCH)?;
-        be.memset_d8(scratch.base, 0, (2 * GFX950_SCRATCH) as usize)?;
+        let scratch = EngineDevice::alloc(be, GFX950_WS + GFX950_FLAGS)?;
+        be.memset_d8(scratch.base, 0, (GFX950_WS + GFX950_FLAGS) as usize)?;
         Ok(Self {
             kernels,
             specs,
@@ -686,7 +688,7 @@ impl GemmLt {
                 route,
                 [out, x, weight],
                 &self.specs[index],
-                [base, base + GFX950_SCRATCH],
+                [base, base + GFX950_WS],
             );
             be.launch(self.kernels[index], grid, 256, 0, bytemuck::bytes_of(&args))?;
             weight += u64::from(nn) * u64::from(k) * 2;
@@ -710,7 +712,7 @@ impl GemmLt {
                 route,
                 tensors,
                 &self.specs[index],
-                [base, base + GFX950_SCRATCH],
+                [base, base + GFX950_WS],
             );
             return be.launch(self.kernels[index], grid, 256, 0, bytemuck::bytes_of(&args));
         }
