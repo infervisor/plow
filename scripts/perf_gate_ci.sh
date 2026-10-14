@@ -98,7 +98,7 @@ for path in paths:
             hit[id_] = "flip\t" + row
         elif d in changed_prod:
             hit[id_] = "flip\t" + row
-        elif (not prev or prev[0] != d) and not off(d, nc):
+        elif (not prev or resolved(prev[0], oc) != resolved(d, nc)) and not off(d, nc):
             # A non-off default outside Production/Qualified skips checkpoint P: Candidate says
             # so on purpose (reported), OptIn/Diagnostic misdescribes the default (refused).
             cls = "candidate" if kind(s, nc) == "Status::Candidate" else "unqualified"
@@ -134,6 +134,10 @@ while IFS=$'\t' read -r knob class env change; do
     certs+=("$cert")
 done <<< "$flipped"
 [ "$fail" = 0 ] || exit 1
+if [ ${#certs[@]} -eq 0 ]; then
+    echo "perf-gate: no certificate to verify since $base"
+    exit 0
+fi
 flipped=$(printf '%s\n' "${knobs[@]}")
 if [ -z "${PLOW_VERIFY_BIN:-}" ] && [ ! -x lean-plow/.lake/build/bin/plow_verify ]; then
     echo "::warning title=perf certificates not verified::checkpoint P did not re-run for $(paste -sd, <<< "$flipped"): PLOW_VERIFY_BIN not set on this runner"

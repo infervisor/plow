@@ -1864,7 +1864,14 @@ pub fn spawn(
             #[cfg(feature = "cuda")]
             {
                 taken_obs.host.queued_prefill_rows = if pf_itl_budget_ms() > 0 {
-                    waiting.iter().map(|(job, _)| job.prompt_ids.len()).sum()
+                    // A CFG pair prefills two sequences, as its KV reservation counts it.
+                    waiting
+                        .iter()
+                        .map(|(job, _)| {
+                            let pair = job.opts.speech.as_ref().is_some_and(|s| s.cfg.is_some());
+                            job.prompt_ids.len() * (1 + usize::from(pair))
+                        })
+                        .sum()
                 } else {
                     0
                 };
