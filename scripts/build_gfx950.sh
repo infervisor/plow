@@ -149,6 +149,15 @@ case "${PLOW_MLA_DEC_MINPER:-0}" in
   *[!0-9]*) echo "PLOW_MLA_DEC_MINPER must be a row count" >&2; exit 2 ;;
   *) DEC_KNOBS="$DEC_KNOBS -DPLOW_MLA_DEC_MINPER=$PLOW_MLA_DEC_MINPER" ;;
 esac
+# PLOW_MLA_DEC_HPACK (decode-MLA segment objects only): GF=8 NoPE dense flash packets run on
+# the head-packed MFMA kernel (=1, d_flash_mla_decode_mfma) or the scalar GF=8 arm (=2).
+DMLA_X=""
+case "${PLOW_MLA_DEC_HPACK:-0}" in
+  0) ;;
+  1) DMLA_X="-DPLOW_MLA_DEC_HPACK=1" ;;
+  2) DMLA_X="-DPLOW_GLM_GF8_ARM=1" ;;
+  *) echo "PLOW_MLA_DEC_HPACK must be 0, 1 or 2" >&2; exit 2 ;;
+esac
 case "${PLOW_MOE_GLU_KW:-0}" in
   0) ;;
   1) DEC_KNOBS="$DEC_KNOBS -DPLOW_MOE_GLU_KW=1" ;;
@@ -946,7 +955,7 @@ done
 
 DECODE_MLA_ELFS=""
 if [ "$need_decode_mla" = 1 ]; then
-  genco "$DEC -DPLOW_BUCKET_DECODE_MLA=1" i_decode_mla.co
+  genco "$DEC -DPLOW_BUCKET_DECODE_MLA=1 $DMLA_X" i_decode_mla.co
   unbundle i_decode_mla.co interp_decode_mla.elf
   DECODE_MLA_ELFS="interp_decode_mla.elf"
 fi
@@ -1056,7 +1065,7 @@ if [ "$BUILD_GQ" = 1 ]; then
   genco "-DPLOW_BUCKET_DECODE=0 -DPLOW_BUCKET_FLASH -DPLOW_WG_WAVES=4 -DFA_DC=256 -DFA_DBUF=1 -DPLOW_MLA_PF_V2_ARM=1 $DSA_FLASH $NOPE_FLASH $FLASH_TR16 -DPLOW_GLOBAL_QUEUE=1 -DPLOW_GQ_BATCH=$GQB $L2D $HIERPF" i_flash_gq.co
   unbundle i_flash_gq.co interp_flash_gq.elf
   if [ "$need_decode_mla" = 1 ]; then
-    genco "$DEC $L2D $HIERD -DPLOW_BUCKET_DECODE_MLA=1 -DPLOW_GLOBAL_QUEUE=1 -DPLOW_GQ_BATCH=$GQB" i_decode_mla_gq.co
+    genco "$DEC $L2D $HIERD -DPLOW_BUCKET_DECODE_MLA=1 $DMLA_X -DPLOW_GLOBAL_QUEUE=1 -DPLOW_GQ_BATCH=$GQB" i_decode_mla_gq.co
     unbundle i_decode_mla_gq.co interp_decode_mla_gq.elf
     DECODE_MLA_ELFS="$DECODE_MLA_ELFS interp_decode_mla_gq.elf"
   fi
@@ -1444,7 +1453,7 @@ check prefill "-DPLOW_BUCKET_DECODE=0" 256 2
 check decode  "$DEC" 256 2
 check flash   "-DPLOW_BUCKET_DECODE=0 -DPLOW_BUCKET_FLASH -DPLOW_WG_WAVES=4 -DFA_DC=256 -DFA_DBUF=1 -DPLOW_MLA_PF_V2_ARM=1 $DSA_FLASH $NOPE_FLASH $FLASH_TR16" 512 1
 if [ "$need_decode_mla" = 1 ]; then
-  check decode_mla "$DEC -DPLOW_BUCKET_DECODE_MLA=1" 256 2
+  check decode_mla "$DEC -DPLOW_BUCKET_DECODE_MLA=1 $DMLA_X" 256 2
 fi
 # The GQ loop adds a shared cursor + claim broadcast; it must NOT push prefill past 256/occ-2. If it
 # does and no minimal-live-set fix recovers it, that is itself a recordable E1 finding (GQ incompatible
@@ -1455,7 +1464,7 @@ if [ "$BUILD_GQ" = 1 ]; then
   check decode_gq  "$DEC $L2D -DPLOW_GLOBAL_QUEUE=1 -DPLOW_GQ_BATCH=$GQB" 256 2
   check flash_gq   "-DPLOW_BUCKET_DECODE=0 -DPLOW_BUCKET_FLASH -DPLOW_WG_WAVES=4 -DFA_DC=256 -DFA_DBUF=1 -DPLOW_MLA_PF_V2_ARM=1 $DSA_FLASH $NOPE_FLASH $FLASH_TR16 -DPLOW_GLOBAL_QUEUE=1 -DPLOW_GQ_BATCH=$GQB $L2D $HIERPF" 512 1
   if [ "$need_decode_mla" = 1 ]; then
-    check decode_mla_gq "$DEC $L2D $HIERD -DPLOW_BUCKET_DECODE_MLA=1 -DPLOW_GLOBAL_QUEUE=1 -DPLOW_GQ_BATCH=$GQB" 256 2
+    check decode_mla_gq "$DEC $L2D $HIERD -DPLOW_BUCKET_DECODE_MLA=1 $DMLA_X -DPLOW_GLOBAL_QUEUE=1 -DPLOW_GQ_BATCH=$GQB" 256 2
   fi
   GQ_ELFS="interp_prefill_gq.elf interp_decode_gq.elf interp_flash_gq.elf"
 fi

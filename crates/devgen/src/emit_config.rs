@@ -1053,6 +1053,12 @@ pub struct EmitConfig {
     #[arg(long, env = "PLOW_GLM53_L2_PLACE", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
     pub glm53_l2_place: bool,
 
+    /// GLM-5.3-Flash decode rungs with at least this many rows isolate each MLA
+    /// FlashMlaDecode+MlaMergeFold pair as a decode-MLA segment at GF=8 (all heads of the rank in
+    /// one work item), for the lean object built with PLOW_MLA_DEC_HPACK=1. NOT bit-identical.
+    #[arg(long, env = "PLOW_GLM53_MLA_HPACK_ROWS")]
+    pub glm53_mla_hpack_rows: Option<u32>,
+
     /// GLM-5.3-Flash decode: the HyperConnPost-folded mHC mix GemvF32 runs only on the
     /// workgroups that own an output, and under the one-row pre tail each output's K is split
     /// over this many workgroups (partials reduced in step order by the last). Bit-identical.
@@ -1917,6 +1923,7 @@ impl EmitConfig {
             glm53_sp_kda_norm: env_bool("PLOW_GLM53_SP_KDA_NORM"),
             glm53_packed_lean_kda: env_bool("PLOW_GLM53_PACKED_LEAN_KDA"),
             glm53_l2_place: env_bool("PLOW_GLM53_L2_PLACE"),
+            glm53_mla_hpack_rows: env_u32("PLOW_GLM53_MLA_HPACK_ROWS"),
             glm_hc_mix_split: env_u32("PLOW_GLM_HC_MIX_SPLIT"),
             glm_hc_fuse_dec: env_bool("PLOW_GLM_HC_FUSE_DEC"),
             glm_kda_proj_group: env_bool("PLOW_GLM_KDA_PROJ_GROUP"),

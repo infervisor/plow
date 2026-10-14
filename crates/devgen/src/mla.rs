@@ -1125,6 +1125,7 @@ fn emit_glm53_program(
             )
         });
         let mla_fold = hc_fold
+            && rows > 1
             && c.is_softmax(l as u32)
             && emit_config::active().glm_hc_fold_mla
             && !(emit_config::active().glm_norm_q128 && emit_config::active().glm_qkva_w8a8);
@@ -1578,6 +1579,7 @@ pub(crate) fn glm53_emit_full(
             b.set_gemm_small_splitk_2p(ec.glm_dec_splitk_2p);
         }
         b.set_gemm_small_group_s(ec.glm_kda_proj_group_s.unwrap_or(0));
+        b.set_decode_mla_segments(ec.glm53_mla_hpack_rows.is_some_and(|min| rows >= min.max(2)));
         b.set_l2_placement(l2_layout);
         if l2_layout.is_some() {
             b.deny_uniseg();
@@ -5974,7 +5976,24 @@ fn emit_glm_mla_ex(
     //   Runs this rank's nh_l head-shard; the latent ckv/krot caches are REPLICATED (all heads read
     //   the same shared latent), so the cache stays full-width on every rank. Under DSA the flash reads
     //   ONLY the top_k rows via n.iidx (constant work ~ top_k regardless of ctx).
-    let ns_attn = if dsa {
+    // PLOW_GLM53_MLA_HPACK_ROWS: GF = nh_l (8), one work item per (row, split), run by the
+    // decode-MLA segment object's head-packed MFMA arm.
+    let hpack = dr == 0
+        && nh_l == 8
+        && !dsa
+        && !fp8kv
+        && !fuse_rope
+        && !dcp
+        && !emit_config::active().glm_mla_w8a8
+        && emit_config::active()
+            .glm53_mla_hpack_rows
+            .is_some_and(|min| rows >= min.max(2));
+    let gf = if hpack { nh_l } else { glm_gf(ctx, nh_l) };
+    let ns_attn = if hpack {
+        (1u32 << (b.n_cu() / rows).max(1).ilog2())
+            .min(glm_nsplit(ctx, nh_l))
+            .max(1)
+    } else if dsa {
         glm_dsa_decode_nsplit(rows, nh_l, glm_gf(ctx, nh_l), b.n_cu())
     } else if rows > 1
         && emit_config::active().glm_mla_ns_rows
@@ -6046,7 +6065,7 @@ fn emit_glm_mla_ex(
             (true, false) => DevOp::FlashGatherDecode,
             (false, false) => DevOp::FlashMlaDecode,
         },
-        flash_mla_cus(&all, rows, 1, nh_l, glm_gf(ctx, nh_l), ns_attn),
+        flash_mla_cus(&all, rows, 1, nh_l, gf, ns_attn),
         &fl_deps,
         |d| {
             d.t[0] = n.opart;
@@ -6062,7 +6081,7 @@ fn emit_glm_mla_ex(
             d.i[3] = if dr == 0 { 1u32 << 31 } else { 0 };
             d.i[4] = ns_attn;
             d.i[5] = KV_MASK_NONE;
-            d.i[7] = glm_gf(ctx, nh_l); // per-pkt head-fusion factor (interp dispatches 2/4/8 on this)
+            d.i[7] = gf; // per-pkt head-fusion factor (interp dispatches 2/4/8 on this)
             d.f[0] = c.attn_scale;
             if fuse_rope {
                 // Q-ROPE FOLD. `t[3]` carries the RAW q_rope projection instead of the roped
