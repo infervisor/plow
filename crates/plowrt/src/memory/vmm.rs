@@ -851,6 +851,10 @@ pub struct VmmStats {
     pub cache_bytes: u64,
     pub snapshot_bytes: u64,
     pub snapshots_evicted: u64,
+    /// Boundary snapshots currently published, and how many of them sit in the recently used
+    /// twice-attached (shared-prefix) eviction tier.
+    pub snapshots_live: u64,
+    pub snapshots_shared: u64,
     /// Suffix eviction units (a boundary plus the blocks only it kept attachable) and the
     /// bytes they freed.
     pub eviction_units: u64,
@@ -1651,6 +1655,22 @@ impl VmmKv {
         cache_changed(s);
         let m = inner.cache.lookup(&hashes, &chain[..hashes.len() * br]);
         inner.cache.release(&hashes, m.blocks);
+        // Retire only behind a boundary that is actually retained at `rows`: the publish that
+        // precedes this call can lose its snapshot to pressure, and the superseded boundary is
+        // then the chain's only attach point until the turn end restores it (which it cannot
+        // once decode has run past the ring's lookback).
+        let n_pub = hashes.len();
+        let replacement = m.blocks >= n_pub && {
+            let node = n_pub.checked_sub(1).map(|i| m.placed[i]);
+            let tail = &chain[n_pub * br..];
+            inner.published.get(&node).is_some_and(|list| {
+                list.iter()
+                    .any(|snap| snap.rows == rows && snap.tail == tail)
+            })
+        };
+        if !replacement {
+            return 0;
+        }
         let waits = inner.awaited.clone();
         let mut dead = Vec::new();
         for blocks in 0..=m.blocks {
@@ -1680,13 +1700,15 @@ impl VmmKv {
                         && blocks > 0
                         && waits.contains(&Some(hashes[blocks - 1]));
                     // Without a session the chain's own attach is the proof: a prompt end
-                    // attached exactly once by the sequence now publishing past it is spent
-                    // (a shared-prefix end, `share`, serves other conversations and stays).
-                    let spent = snap.session || (snap.attaches == 1 && !snap.share);
+                    // the sequence now publishing past it attached is spent, however many
+                    // requests of that conversation attached it (parallel branches, a retry,
+                    // a regenerate): the next turn attaches the longer boundary. Only a
+                    // shared-prefix end (`share`) serves other conversations and stays.
+                    let spent = snap.session || (snap.attaches >= 1 && !snap.share);
                     let superseded = snap.users == 0
                         && !awaited
                         && spent
-                        && snap.attaches <= 1
+                        && (snap.attaches <= 1 || !snap.share)
                         && snap.rows < rows
                         && (common == snap.tail.len() || stale_turn_end);
                     if superseded {
@@ -2835,6 +2857,9 @@ const RECENT_PROMPTS: usize = 32;
 const RECENT_ROWS: usize = 16384;
 /// Rows a shared prefix must reach past the attached boundary to be worth a snapshot.
 const SHARE_MIN_ROWS: usize = 256;
+/// Snapshot ticks (one per publish or attach) a twice-attached boundary stays in the
+/// shared-prefix eviction tier after its last use.
+const SHARED_RECENT_TICKS: u64 = 2048;
 
 /// Record where `prompt` stops matching the longest common prefix with a recent prompt
 /// (32-row aligned): a system prompt seen by two sequences ends there. The engine
@@ -3124,6 +3149,13 @@ fn stats_of(s: &Shared) -> VmmStats {
     let inner = s.inner.lock();
     let mut out = inner.stats;
     out.hash_collisions = inner.cache.collisions();
+    let tick = inner.snapshot_tick;
+    for snap in inner.published.values().flatten() {
+        out.snapshots_live += 1;
+        if snap.attaches >= 2 && tick.saturating_sub(snap.last_used) <= SHARED_RECENT_TICKS {
+            out.snapshots_shared += 1;
+        }
+    }
     out
 }
 
@@ -3569,6 +3601,7 @@ fn evict_one(s: &Shared, inner: &mut Inner, preserve_hot: bool) -> bool {
     // session-pinned one (`pin_prefix`) or a shared-prefix end (a system prompt below one block
     // sits on no pinnable node) just before it.
     let pinned = inner.cache.pinned();
+    let tick = inner.snapshot_tick;
     if let Some((node, index)) = inner
         .published
         .iter()
@@ -3587,7 +3620,12 @@ fn evict_one(s: &Shared, inner: &mut Inner, preserve_hot: bool) -> bool {
         .filter(|(_, _, snap, ..)| snap.users == 0 && Some(snap.va) != protected)
         .min_by_key(|(_, _, snap, pin, rank)| {
             (
-                snap.attaches >= 2,
+                // A boundary attached twice is a shared prefix only while it keeps being
+                // used: a system prompt is touched every few requests, a conversation's
+                // prompt end attached by two of its own requests is not, and ranked last
+                // for good such ends filled the cache (production, 2026-10-14: 335 of
+                // 335 slots, every fresh prompt end evicted within its own decode).
+                snap.attaches >= 2 && tick.saturating_sub(snap.last_used) <= SHARED_RECENT_TICKS,
                 *pin || snap.share,
                 *rank,
                 snap.last_used,
@@ -5789,6 +5827,123 @@ mod tests {
         assert_eq!(
             p.try_attach(0, &pr).unwrap().expect("newest boundary").rows,
             28
+        );
+    }
+
+    /// A prompt end two requests of the same conversation attached (a parallel branch or a
+    /// retry) is still spent once the chain publishes past it.
+    #[test]
+    fn twice_attached_prompt_end_is_retired_by_its_chain() {
+        let ops = Arc::new(MockVmm::default());
+        let p = uniform_pool(ops.clone());
+        let pr = prompt(30);
+        assert!(p.try_attach(0, &pr).unwrap().is_none());
+        p.ensure_rows(0, 30).unwrap();
+        p.publish_at(0, &pr, 12, 4, |_| Ok(())).unwrap();
+        // The pool has two slots: the second attach reuses slot 1 after its first request ends.
+        for _ in 0..2 {
+            p.begin_seq(1);
+            p.ensure_rows(1, 1).unwrap();
+            assert_eq!(
+                p.try_attach(1, &pr).unwrap().expect("prompt end").rows,
+                12
+            );
+            p.finish_attach(1);
+            p.ensure_rows(1, 30).unwrap();
+        }
+        p.publish_at(1, &pr, 28, 4, |_| Ok(())).unwrap();
+        assert_eq!(
+            p.retire_superseded(&pr, 28),
+            4,
+            "the twice-attached 12-row boundary"
+        );
+        assert_eq!(p.stats().snapshot_bytes, 4);
+    }
+
+    /// A twice-attached boundary leaves the shared-prefix eviction tier once it has not been
+    /// used for `SHARED_RECENT_TICKS`: a stale one is evicted before a fresh single-attach one.
+    #[test]
+    fn stale_twice_attached_boundary_is_evicted_before_a_fresh_one() {
+        let ops = Arc::new(MockVmm::default());
+        let p = uniform_pool(ops.clone());
+        let a = prompt(30);
+        let mut b = prompt(30);
+        b[0] = 99;
+        assert!(p.try_attach(0, &a).unwrap().is_none());
+        p.ensure_rows(0, 30).unwrap();
+        p.publish_at(0, &a, 12, 4, |_| Ok(())).unwrap();
+        for _ in 0..2 {
+            p.begin_seq(1);
+            p.ensure_rows(1, 1).unwrap();
+            assert_eq!(p.try_attach(1, &a).unwrap().expect("a").rows, 12);
+            p.finish_attach(1);
+        }
+        p.begin_seq(0);
+        assert!(p.try_attach(0, &b).unwrap().is_none());
+        p.ensure_rows(0, 30).unwrap();
+        p.publish_at(0, &b, 12, 4, |_| Ok(())).unwrap();
+        assert_eq!(p.stats().snapshots_live, 2);
+        assert_eq!(
+            p.stats().snapshots_shared,
+            1,
+            "a's boundary is in the shared tier"
+        );
+        {
+            let mut inner = p.shared.inner.lock();
+            assert!(evict_one(&p.shared, &mut inner, false));
+        }
+        assert_eq!(
+            p.cached_rows(&a),
+            12,
+            "recently shared a stays, fresh b went first"
+        );
+        p.begin_seq(0);
+        assert!(p.try_attach(0, &b).unwrap().is_none());
+        p.ensure_rows(0, 30).unwrap();
+        p.publish_at(0, &b, 12, 4, |_| Ok(())).unwrap();
+        p.shared.inner.lock().snapshot_tick += SHARED_RECENT_TICKS + 1;
+        assert_eq!(
+            p.stats().snapshots_shared,
+            0,
+            "a aged out of the shared tier"
+        );
+        {
+            let mut inner = p.shared.inner.lock();
+            assert!(evict_one(&p.shared, &mut inner, false));
+        }
+        assert_eq!(p.cached_rows(&a), 0, "stale a evicted");
+        assert_eq!(p.cached_rows(&b), 12);
+    }
+
+    /// `retire_superseded` at rows with no retained boundary (the publish lost its snapshot)
+    /// frees nothing: the attached boundary stays the chain's attach point.
+    #[test]
+    fn retire_without_a_retained_replacement_is_a_no_op() {
+        let ops = Arc::new(MockVmm::default());
+        let p = uniform_pool(ops.clone());
+        let pr = prompt(30);
+        assert!(p.try_attach(0, &pr).unwrap().is_none());
+        p.ensure_rows(0, 30).unwrap();
+        p.publish_at(0, &pr, 12, 4, |_| Ok(())).unwrap();
+        p.begin_seq(0);
+        p.ensure_rows(1, 1).unwrap();
+        assert_eq!(p.try_attach(1, &pr).unwrap().expect("prompt end").rows, 12);
+        p.finish_attach(1);
+        p.ensure_rows(1, 30).unwrap();
+        assert_eq!(
+            p.retire_superseded(&pr, 28),
+            0,
+            "no boundary at 28 was published"
+        );
+        assert_eq!(p.stats().snapshot_bytes, 4);
+        p.begin_seq(1);
+        p.ensure_rows(0, 1).unwrap();
+        assert_eq!(
+            p.try_attach(0, &pr)
+                .unwrap()
+                .expect("still attachable")
+                .rows,
+            12
         );
     }
 

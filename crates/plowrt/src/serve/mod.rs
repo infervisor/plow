@@ -1749,6 +1749,12 @@ async fn metrics_handler(
         ("cache_blocks", "gauge", "Prefix cache blocks."),
         ("cache_bytes", "gauge", "Prefix cache bytes."),
         ("snapshot_bytes", "gauge", "Prefix snapshot bytes."),
+        ("snapshots_live", "gauge", "Boundary snapshots published."),
+        (
+            "snapshots_shared",
+            "gauge",
+            "Boundary snapshots in the recently used twice-attached tier.",
+        ),
         (
             "snapshots_evicted_total",
             "counter",
@@ -1789,7 +1795,9 @@ async fn metrics_handler(
              plowrt_prefix_snapshot_bytes{{model=\"{slug}\"}} {}\n\
              plowrt_prefix_snapshots_evicted_total{{model=\"{slug}\"}} {}\n\
              plowrt_prefix_eviction_units_total{{model=\"{slug}\"}} {}\n\
-             plowrt_prefix_eviction_unit_bytes_total{{model=\"{slug}\"}} {}\n",
+             plowrt_prefix_eviction_unit_bytes_total{{model=\"{slug}\"}} {}\n\
+             plowrt_prefix_snapshots_live{{model=\"{slug}\"}} {}\n\
+             plowrt_prefix_snapshots_shared{{model=\"{slug}\"}} {}\n",
             s.attach_hits,
             s.attach_misses,
             s.tokens_queried,
@@ -1806,6 +1814,8 @@ async fn metrics_handler(
             s.snapshots_evicted,
             s.eviction_units,
             s.eviction_unit_bytes,
+            s.snapshots_live,
+            s.snapshots_shared,
         );
     }
     (
