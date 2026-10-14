@@ -2250,6 +2250,10 @@ pub struct AmdRuntimeConfig {
     /// second submit and drain after it.
     #[arg(long = "amd-tp-audit-tail", env = "PLOW_TP_AUDIT_TAIL", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
     pub tp_audit_tail: bool,
+    /// TP decode: per-rank host work (the decode chain fill and, with PLOW_TP_PAR_HOST, the
+    /// per-rank copies) runs on persistent workers instead of threads spawned per token.
+    #[arg(long = "amd-tp-rank-pool", env = "PLOW_TP_RANK_POOL", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
+    pub tp_rank_pool: bool,
 }
 
 /// Global runtime config, initialized once at startup from CLI parse.

@@ -203,6 +203,18 @@ fn each_rank<T: Send>(
         return ranks.iter_mut().map(&f).collect();
     }
     let f = &f;
+    if super::rank_pool::enabled() {
+        let mut out: Vec<Option<Result<T>>> = (0..ranks.len()).map(|_| None).collect();
+        let jobs: Vec<Box<dyn FnOnce() + Send + '_>> = ranks
+            .iter_mut()
+            .zip(out.iter_mut())
+            .map(|(e, slot)| Box::new(move || *slot = Some(f(e))) as Box<dyn FnOnce() + Send + '_>)
+            .collect();
+        if !super::rank_pool::run(jobs) {
+            return Err(RuntimeError::Device("rank host worker panicked".into()));
+        }
+        return out.into_iter().map(|r| r.expect("rank pool job ran")).collect();
+    }
     std::thread::scope(|scope| {
         let handles: Vec<_> = ranks.iter_mut().map(|e| scope.spawn(move || f(e))).collect();
         let mut out = Vec::with_capacity(handles.len());
@@ -1258,7 +1270,33 @@ impl AmdTpGroup {
             // Their only ordering requirement is local segment order, so fill the eight independent
             // rank queues in parallel. This removes the serialized host submission term without
             // allowing an early rank to enter a collective before its peers are ready.
-            if n_segments > 1 {
+            if n_segments > 1 && super::rank_pool::enabled() {
+                let mut res: Vec<Result<()>> = (0..ranks.len()).map(|_| Ok(())).collect();
+                let jobs: Vec<Box<dyn FnOnce() + Send + '_>> = ranks
+                    .iter_mut()
+                    .zip(res.iter_mut())
+                    .enumerate()
+                    .map(|(rank, (e, slot))| {
+                        Box::new(move || {
+                            let k = e.decode_kernel_for(dp);
+                            for seg in 1..n_segments {
+                                if let Err(err) = e.enqueue_decode_segment(dp, seg, k) {
+                                    *slot = Err(RuntimeError::Device(format!(
+                                        "rank {rank} decode replay segment {seg}: {err}"
+                                    )));
+                                    return;
+                                }
+                            }
+                        }) as Box<dyn FnOnce() + Send + '_>
+                    })
+                    .collect();
+                if !super::rank_pool::run(jobs) {
+                    return Err(RuntimeError::Device("decode replay fill worker panicked".into()));
+                }
+                if let Some(error) = res.into_iter().find_map(|r| r.err()) {
+                    return Err(error);
+                }
+            } else if n_segments > 1 {
                 std::thread::scope(|scope| -> Result<()> {
                     let handles: Vec<_> = ranks
                         .iter_mut()
