@@ -282,26 +282,26 @@ __device__ void d_dsa_pool_expand(int32_t* __restrict__ out, const int32_t* __re
                                   unsigned n_groups, unsigned pool_size, unsigned slice, unsigned nblk) {
     const unsigned topk = n_groups * pool_size;
     const unsigned out_cols = topk + pool_size - 1;
-    const unsigned total = rows * out_cols;
     const int q_pos0 = (int)kv_len[0] - (int)rows;
-    for (unsigned idx = slice * PLOW_THREADS + threadIdx.x; idx < total; idx += nblk * PLOW_THREADS) {
-        const unsigned row = idx / out_cols;
-        const unsigned col = idx % out_cols;
+    /* Row-major walk: the per-row geometry is computed once per row, not per element. */
+    for (unsigned row = slice; row < rows; row += nblk) {
         const int seq_len = q_pos0 + (int)row + 1;
         const int pool_len = seq_len / (int)pool_size;
         const int tail_start = pool_len * (int)pool_size;
         const int tail_count = seq_len - tail_start;
-        int result;
-        if (col < topk) {
-            const unsigned g = col / pool_size;
-            const unsigned o = col % pool_size;
-            const int pid = pool_ids[(size_t)row * n_groups + g];
-            result = (pid >= 0) ? (pid * (int)pool_size + (int)o) : -1;
-        } else {
-            const int tail_off = (int)col - (int)topk;
-            result = (tail_off < tail_count) ? (tail_start + tail_off) : -1;
+        const int32_t* const pr = pool_ids + (size_t)row * n_groups;
+        int32_t* const orow = out + (size_t)row * out_cols;
+        for (unsigned col = threadIdx.x; col < out_cols; col += PLOW_THREADS) {
+            int result;
+            if (col < topk) {
+                const int pid = pr[col / pool_size];
+                result = (pid >= 0) ? (pid * (int)pool_size + (int)(col % pool_size)) : -1;
+            } else {
+                const int tail_off = (int)col - (int)topk;
+                result = (tail_off < tail_count) ? (tail_start + tail_off) : -1;
+            }
+            orow[col] = result;
         }
-        out[idx] = result;
     }
 }
 
