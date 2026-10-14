@@ -2037,6 +2037,18 @@ impl CudaBackend {
 /// `PLOW_VMM_SNAP_POOL` allocation class for prefix-snapshot buffers.
 const SNAP_POOL_CLASS: u64 = 4 << 20;
 
+impl CudaBackend {
+    /// Return every kept snapshot buffer (`PLOW_VMM_SNAP_POOL`) to the driver; whether any was.
+    fn snap_pool_drain(&self) -> bool {
+        let kept: Vec<(u64, u64)> = self.snap_pool.lock().0.drain(..).collect();
+        for &(va, _) in &kept {
+            // SAFETY: a kept buffer from cuMemAlloc, owned by the free list only.
+            unsafe { (self.api.cuMemFree_v2)(va) };
+        }
+        !kept.is_empty()
+    }
+}
+
 impl crate::memory::vmm::VmmOps for CudaBackend {
     fn allocation_provenance(
         &self,
@@ -2097,10 +2109,12 @@ impl crate::memory::vmm::VmmOps for CudaBackend {
         let mut provenance = self.vmm_provenance.lock();
         let mut h = 0u64;
         // SAFETY: out-pointer; bytes is a granularity multiple (pool contract).
-        self.check(
-            unsafe { (self.api.cuMemCreate)(&mut h, bytes as usize, &prop, 0) },
-            "cuMemCreate",
-        )?;
+        let mut rc = unsafe { (self.api.cuMemCreate)(&mut h, bytes as usize, &prop, 0) };
+        if rc == 2 && self.snap_pool_drain() {
+            // SAFETY: as above.
+            rc = unsafe { (self.api.cuMemCreate)(&mut h, bytes as usize, &prop, 0) };
+        }
+        self.check(rc, "cuMemCreate")?;
         provenance.created(h, bytes);
         Ok(h)
     }
@@ -2217,23 +2231,18 @@ impl crate::memory::vmm::VmmOps for CudaBackend {
         }
         let mut dptr: CUdeviceptr = 0;
         // SAFETY: out-pointer to a device allocation (snapshot buffers).
-        self.check(
-            unsafe { (self.api.cuMemAlloc_v2)(&mut dptr, bytes as usize) },
-            "cuMemAlloc(vmm snapshot)",
-        )
-        // CUDA_ERROR_OUT_OF_MEMORY is memory pressure, not a fault: the pool evicts
-        // and retries on `Oom` only.
-        .map_err(|e| match e.device_code() {
-            Some(2) => {
-                // Kept buffers go back to the driver before the caller evicts and retries.
-                for (va, _) in self.snap_pool.lock().0.drain(..) {
-                    // SAFETY: a kept buffer from cuMemAlloc, owned by the free list only.
-                    unsafe { (self.api.cuMemFree_v2)(va) };
-                }
-                RuntimeError::Oom(e.to_string())
-            }
-            _ => e,
-        })?;
+        let mut rc = unsafe { (self.api.cuMemAlloc_v2)(&mut dptr, bytes as usize) };
+        if rc == 2 && self.snap_pool_drain() {
+            // SAFETY: as above.
+            rc = unsafe { (self.api.cuMemAlloc_v2)(&mut dptr, bytes as usize) };
+        }
+        self.check(rc, "cuMemAlloc(vmm snapshot)")
+            // CUDA_ERROR_OUT_OF_MEMORY is memory pressure, not a fault: the pool evicts
+            // and retries on `Oom` only.
+            .map_err(|e| match e.device_code() {
+                Some(2) => RuntimeError::Oom(e.to_string()),
+                _ => e,
+            })?;
         self.vmm_provenance.lock().allocated(dptr, bytes);
         if keep > 0 {
             self.snap_pool.lock().1.insert(dptr, bytes);
@@ -2264,6 +2273,9 @@ impl crate::memory::vmm::VmmOps for CudaBackend {
             if let Some(bytes) = pool.1.remove(&va) {
                 if pool.0.len() < keep {
                     pool.0.push((va, bytes));
+                    if let Some(t0) = t0 {
+                        eprintln!("PACKLOG SNAPFREE pooled=1 us={}", t0.elapsed().as_micros());
+                    }
                     return;
                 }
             }
