@@ -441,12 +441,17 @@ impl GpuEngine {
                     slot_bytes,
                 })
                 .collect();
-            let rings = crate::memory::vmm::VmmRings::new_idle_backed(
+            let mut rings = crate::memory::vmm::VmmRings::new_idle_backed(
                 Arc::clone(be) as Arc<dyn crate::memory::vmm::VmmOps>,
                 &tensors,
                 geo.batch as usize,
             )?;
+            let park = crate::config::RuntimeConfig::get().vmm_ring_park;
+            if park > 0 {
+                rings.enable_bounded_park(u64::from(park) * rings.slot_charge());
+            }
             tracing::info!(
+                park,
                 slot_mib = rings.slot_charge() >> 20,
                 resident_mib = rings.stats().resident_bytes >> 20,
                 reserved_gib = rings.stats().reserved_bytes as f64 / (1u64 << 30) as f64,
@@ -735,8 +740,13 @@ impl GpuEngine {
             self.vmm_partial_copy(b, p_a, partial, to_snap)
         })();
         let t1 = t0.map(|t| t.elapsed());
-        // Drain even a partially submitted copy before VMM remapping or snapshot release.
-        let completed = self.be.stream_synchronize(&self.stream);
+        // Drain even a partially submitted copy before VMM remapping or snapshot release. Inside a
+        // launch window a whole restore is drained by the step instead (`deferred_attach`).
+        let completed = if self.window_open && !to_snap && copied.is_ok() {
+            Ok(())
+        } else {
+            self.be.stream_synchronize(&self.stream)
+        };
         if let (Some(t0), Some(t1)) = (t0, t1) {
             eprintln!(
                 "PACKLOG SNAP slot={b} to_snap={} rows={p_a} submit_us={} sync_us={}",
@@ -791,7 +801,11 @@ impl GpuEngine {
             kv.begin_seq(b);
             return Err(error);
         }
-        kv.finish_attach(b);
+        if self.window_open {
+            self.deferred_attach.push(b);
+        } else {
+            kv.finish_attach(b);
+        }
         self.pos[b] = a.rows;
         self.vmm_attached[b] = a.rows;
         // Seed the row-token record with the attached prefix — the tail is
