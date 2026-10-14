@@ -7799,6 +7799,8 @@ fn emit_glm_dsa_prefill_select(
                 // per slot); the span table supplies slot, row0 and the absolute position.
                 d.i[5] = ctx.div_ceil(c.index_kpool);
                 d.i[6] = 1;
+                d.t[6] = n.kidx_ring[slot];
+                d.t[7] = n.kidx_ring_score[slot];
             }
         });
         if packed {

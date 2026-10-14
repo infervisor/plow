@@ -521,9 +521,13 @@ fn token_batch_band_segment_class(inst: &DevInst, band: u32) -> Option<u8> {
 // family, not a model. The serving runtime independently re-derives and purity-checks
 // them before it can select a family object.
 fn packed_prefill_segment_class(op: u16) -> Option<u8> {
+    // The pooled DSA per-span writes (the only DsaPool forms a packed program carries) read the
+    // span table, which the packed MLA norm family object owns.
     if op == DevOp::RmsNorm as u16
         || op == DevOp::HeadNormRope as u16
         || op == DevOp::HeadNormRopeFp8 as u16
+        || op == DevOp::DsaPoolCompress as u16
+        || op == DevOp::DsaPoolStash as u16
     {
         Some(5)
     } else if op == DevOp::FlashMlaPrefill as u16 || op == DevOp::FlashMlaPrefillFp8 as u16 {

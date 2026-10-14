@@ -3747,7 +3747,11 @@ fn derive_packed_segment_families(prog: &DevProg) -> Result<Vec<u8>> {
             narrow_norm[e.seg as usize] = Some(inst.i[0]);
             continue;
         }
-        let next = if norm {
+        let next = if norm
+            || (packed
+                && ((op == DevOp::DsaPoolCompress as u16 && inst.i[6] == 1)
+                    || (op == DevOp::DsaPoolStash as u16 && inst.i[4] == 1)))
+        {
             Some(5)
         } else if op == DevOp::FlashMlaPrefill as u16 || op == DevOp::FlashMlaPrefillFp8 as u16 {
             Some(6)
@@ -3975,11 +3979,9 @@ fn check_packed_dense_program(insts: &[DevInst64]) -> Result<()> {
 /// The class-C prefill selectors with no per-span form: they run on the primary interpreter,
 /// which reads every row's position from `kv_len[0]`, so a packed program may not carry them.
 fn packed_class_c_selector(d: &DevInst64) -> bool {
-    // The per-span pool writes (DsaPoolCompress `i[6] = 1`, DsaPoolStash `i[4] = 1`) read the
-    // span table, which only the packed family objects carry; they run in interpreter segments,
-    // whose object traps there. Until they move into a packed family, refuse the packed route.
-    if d.op == DevOp::DsaPoolStash as u16 && d.i[4] == 1 {
-        return true;
+    // The per-span pool writes (DsaPoolCompress `i[6] = 1`) run on the packed MLA norm family.
+    if d.op == DevOp::DsaPoolCompress as u16 && d.i[6] == 1 {
+        return false;
     }
     matches!(
         DevOp::from_u16(d.op),

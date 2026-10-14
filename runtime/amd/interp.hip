@@ -3528,6 +3528,71 @@ __device__ __attribute__((noinline)) void exec_hc_fuse_dec(CInst in, CTens T, un
 #undef HCF_TEN
 #endif
 
+/* Pooled DSA per-span writes of a packed prefill program (DsaPoolCompress i6 = 1, DsaPoolStash
+ * i4 = 1). They need the span table, so they run on the packed MLA norm family object (class 5)
+ * as well as here. Compress: per span, a pool straddling an unaligned span start completes from
+ * the slot's tail ring (t6/t7) plus the span's first rows (staged in LDS on one workgroup), then
+ * the span's complete pools from the next boundary, into the slot's cache (i5 = pools per slot).
+ * Stash: each span's trailing incomplete-pool rows into its slot's ring at pos % pool. */
+__device__ static void exec_dsa_pool_packed(CInst in, CTens T, unsigned slice, unsigned nblk,
+                                            plow_smem* sm, const PlowProgram* prog_meta) {
+#define DTEN(k) (in->t[k] == PLOW_TENSOR_NONE ? nullptr : T[in->t[k]])
+    if (!plow_packed_prefill_enabled(prog_meta)) __builtin_trap();
+    if (in->op == PLOW_DOP_DSA_POOL_COMPRESS) {
+        const unsigned ps = in->i[1], hd = in->i[2], stride = in->i[5];
+        for (unsigned si = 0; si < prog_meta->n_prefill_spans; si++) {
+            const PlowPrefillSpan* sp = prog_meta->prefill_spans + si;
+            const unsigned kv0 = sp->kv_row0, n = sp->n_rows;
+            const unsigned m = kv0 % ps, first = m ? ps - m : 0u;
+            uint8_t* kc = (uint8_t*)DTEN(0) + (size_t)sp->slot * stride * hd;
+            float* kcs = (float*)DTEN(1) + (size_t)sp->slot * stride;
+            const bf16* rk = (const bf16*)DTEN(2) + (size_t)sp->row0 * hd;
+            const bf16* rs = (const bf16*)DTEN(3) + (size_t)sp->row0 * hd;
+            __syncthreads();
+            if (m && n >= first && slice == si % nblk) {
+                const bf16* ringk = (const bf16*)DTEN(6) + (size_t)sp->slot * ps * hd;
+                const bf16* rings = (const bf16*)DTEN(7) + (size_t)sp->slot * ps * hd;
+                bf16* wk = (bf16*)((char*)sm->raw + 4096);
+                bf16* ws = wk + ps * hd;
+                for (unsigned e = threadIdx.x; e < ps * hd; e += PLOW_THREADS) {
+                    const unsigned s = e / hd, d = e % hd;
+                    if (s < m) {
+                        const size_t src = (size_t)((kv0 - m + s) % ps) * hd + d;
+                        wk[e] = ringk[src];
+                        ws[e] = rings[src];
+                    } else {
+                        wk[e] = rk[(size_t)(s - m) * hd + d];
+                        ws[e] = rs[(size_t)(s - m) * hd + d];
+                    }
+                }
+                __syncthreads();
+                d_dsa_pool_compress(kc, kcs, wk, ws, (const float*)DTEN(4), 1u, ps, hd, 0u, 1u,
+                                    (float*)sm->raw, sm->part, nullptr, kv0 - m);
+                __syncthreads();
+            }
+            if (n > first)
+                d_dsa_pool_compress(kc, kcs, rk + (size_t)first * hd, rs + (size_t)first * hd,
+                                    (const float*)DTEN(4), (n - first) / ps, ps, hd, slice, nblk,
+                                    (float*)sm->raw, sm->part, nullptr, kv0 + first);
+        }
+        return;
+    }
+    const unsigned ps = in->i[0], hd = in->i[1], d = threadIdx.x;
+    for (unsigned si = slice; si < prog_meta->n_prefill_spans; si += nblk) {
+        const PlowPrefillSpan* sp = prog_meta->prefill_spans + si;
+        const unsigned kv0 = sp->kv_row0, end = kv0 + sp->n_rows;
+        const unsigned t0 = end / ps * ps > kv0 ? end / ps * ps : kv0;
+        if (d >= hd) continue;
+        for (unsigned p = t0; p < end; p++) {
+            const size_t src = (size_t)(sp->row0 + p - kv0) * hd + d;
+            const size_t dst = ((size_t)sp->slot * ps + p % ps) * hd + d;
+            ((bf16*)DTEN(0))[dst] = ((const bf16*)DTEN(2))[src];
+            ((bf16*)DTEN(1))[dst] = ((const bf16*)DTEN(3))[src];
+        }
+    }
+#undef DTEN
+}
+
 /* gfx950 K3 decode objects inline `plow_exec` into the dispatch loop. As a call, its prologue
  * saves ~110 VGPR dwords per lane to scratch (and restores them) before it selects an op, on
  * every packet in every workgroup -- including the workgroups a narrow packet leaves idle.
@@ -3871,6 +3936,14 @@ __device__ static void plow_exec(CInst in_v, unsigned slice, CTens T_v, plow_sme
 #undef PLOW_PACKED_HEADNORM_FP8
             break;
 #endif
+        case PLOW_DOP_DSA_POOL_COMPRESS:
+            if (in->i[6] != 1u) __builtin_trap();
+            exec_dsa_pool_packed(in, T, slice, nblk, sm, prog_meta);
+            break;
+        case PLOW_DOP_DSA_POOL_STASH:
+            if (in->i[4] != 1u) __builtin_trap();
+            exec_dsa_pool_packed(in, T, slice, nblk, sm, prog_meta);
+            break;
         default:
             __builtin_trap();
     }
@@ -4557,26 +4630,8 @@ __device__ static void plow_exec(CInst in_v, unsigned slice, CTens T_v, plow_sme
                 }
                 break;
             }
-            /* Packed prefill (i6 = 1): per span, the complete pools whose first token lies in
-             * the span (kv_row0 pool-aligned; a pool straddling an unaligned span start is not
-             * written) into the span slot's cache, i5 = pools per slot. */
             if (in->i[6] == 1u) {
-                if (!plow_packed_prefill_enabled(prog_meta)) __builtin_trap();
-                const unsigned ps = in->i[1], hd = in->i[2];
-                for (unsigned si = 0; si < prog_meta->n_prefill_spans; si++) {
-                    const PlowPrefillSpan* sp = prog_meta->prefill_spans + si;
-                    const unsigned kv0 = sp->kv_row0, end = kv0 + sp->n_rows;
-                    const unsigned p0 = (kv0 + ps - 1u) / ps, p1 = end / ps;
-                    if (p1 <= p0) continue;
-                    const size_t r0 = sp->row0 + (p0 * ps - kv0);
-                    __syncthreads();
-                    d_dsa_pool_compress((uint8_t*)TEN(0) + (size_t)sp->slot * in->i[5] * hd,
-                                        (float*)TEN(1) + (size_t)sp->slot * in->i[5],
-                                        (const bf16*)TEN(2) + r0 * hd,
-                                        (const bf16*)TEN(3) + r0 * hd, (const float*)TEN(4),
-                                        p1 - p0, ps, hd, slice, nblk, (float*)sm->raw, sm->part,
-                                        nullptr, p0 * ps);
-                }
+                exec_dsa_pool_packed(in, T, slice, nblk, sm, prog_meta);
                 break;
             }
             /* Batched decode (i4 = rows > 1): row r is decode slot r — its ring, pos[r] and its
@@ -4631,23 +4686,8 @@ __device__ static void plow_exec(CInst in_v, unsigned slice, CTens T_v, plow_sme
                               in->i[0], in->i[1], in->i[2], slice, nblk);
             break;
         case PLOW_DOP_DSA_POOL_STASH:
-            /* Packed prefill (i4 = 1): each span's trailing incomplete-pool rows into its slot's
-             * ring at pos % pool_size (the per-span twin of the baked tail-seed stashes). */
             if (in->i[4] == 1u) {
-                if (!plow_packed_prefill_enabled(prog_meta)) __builtin_trap();
-                const unsigned ps = in->i[0], hd = in->i[1], d = threadIdx.x;
-                for (unsigned si = slice; si < prog_meta->n_prefill_spans; si += nblk) {
-                    const PlowPrefillSpan* sp = prog_meta->prefill_spans + si;
-                    const unsigned kv0 = sp->kv_row0, end = kv0 + sp->n_rows;
-                    const unsigned t0 = end / ps * ps > kv0 ? end / ps * ps : kv0;
-                    if (d >= hd) continue;
-                    for (unsigned p = t0; p < end; p++) {
-                        const size_t src = (size_t)(sp->row0 + p - kv0) * hd + d;
-                        const size_t dst = ((size_t)sp->slot * ps + p % ps) * hd + d;
-                        ((bf16*)TEN(0))[dst] = ((const bf16*)TEN(2))[src];
-                        ((bf16*)TEN(1))[dst] = ((const bf16*)TEN(3))[src];
-                    }
-                }
+                exec_dsa_pool_packed(in, T, slice, nblk, sm, prog_meta);
                 break;
             }
             /* Batched decode (i3 = rows > 1): row r stashes into slot r's ring. */
