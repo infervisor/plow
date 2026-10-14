@@ -130,6 +130,7 @@ fn is_w8a8_route_prologue(insts: &[DevInst]) -> bool {
         && quant.op == DevOp::QuantFp8 as u16
         && glu.op == DevOp::MoeGroupGluGemmaPfW8a8 as u16
         && [norm.i[0], norm.i[1]] == [rows, glu.i[1]]
+        && norm.i[7] == 0
         && norm.t[3] == packet::dev::TENSOR_NONE
         && norm.t[4] == packet::dev::TENSOR_NONE
         && [router.i[0], router.i[1], router.i[2], router.i[3]]
@@ -915,6 +916,28 @@ mod tests {
             tensor.bytes = extent;
         }
         model
+    }
+
+    #[test]
+    fn route_prologue_rejects_the_norm_weight_offset() {
+        let none = packet::dev::TENSOR_NONE;
+        let mut insts = [DevOp::RmsNorm, DevOp::MoeRouterGemmaPf, DevOp::MoeAlignGemmaPf,
+            DevOp::QuantFp8, DevOp::MoeGroupGluGemmaPfW8a8]
+            .map(|op| DevInst { op: op as u16, t: [none; 8], ..Default::default() });
+        let [norm, router, align, quant, glu] = &mut insts;
+        glu.t[..6].copy_from_slice(&[0, 1, 2, 3, 4, 9]);
+        glu.i[..3].copy_from_slice(&[704, 2816, 128]);
+        norm.t[..3].copy_from_slice(&[16, 17, 18]);
+        norm.i[..2].copy_from_slice(&[1024, 2816]);
+        router.t[0] = 8;
+        router.i[..4].copy_from_slice(&[2816, 128, 8, 1024]);
+        align.t[..3].copy_from_slice(&[3, 8, 4]);
+        align.i[..3].copy_from_slice(&[1024, 128, 8]);
+        quant.t[..3].copy_from_slice(&[1, 16, 9]);
+        quant.i[..2].copy_from_slice(&[1024, 2816]);
+        assert!(is_w8a8_route_prologue(&insts));
+        insts[0].i[7] = 1;
+        assert!(!is_w8a8_route_prologue(&insts));
     }
 
     #[test]

@@ -440,8 +440,29 @@ extern "C" __global__ void plow_moe_lt_gather8_inv(uint8_t* xs8, unsigned* inv, 
     }
 }
 
+/* QuantFp8's row scale and e4m3 pair, bit-identical to the interpreter's d_quant_fp8 /
+ * d_quant_fp8_wpr in either build (PLOW_NV_QUANT_FP8_VLLM: correctly rounded divides, the vLLM
+ * scale floor and an explicit clamp; otherwise the reciprocal multiply and the 1e-12 floor). */
+__device__ __forceinline__ float moe_lt_quant_scale(float amax) {
+#if defined(PLOW_NV_QUANT_FP8_VLLM) && PLOW_NV_QUANT_FP8_VLLM
+    return fmaxf(__fdiv_rn(amax, 448.0f), 1.0f / (448.0f * 512.0f));
+#else
+    return fmaxf(amax * (1.0f / 448.0f), 1e-12f);
+#endif
+}
+/* `inv` = 1 / s, hoisted by the caller (unused in the vLLM form). */
+__device__ __forceinline__ unsigned short moe_lt_quant_pair(float lo, float hi, float s, float inv) {
+#if defined(PLOW_NV_QUANT_FP8_VLLM) && PLOW_NV_QUANT_FP8_VLLM
+    (void)inv;
+    const float a = __fdiv_rn(lo, s), b = __fdiv_rn(hi, s);
+    return pack_fp8_e4m3(fmaxf(-448.0f, fminf(a, 448.0f)), fmaxf(-448.0f, fminf(b, 448.0f)));
+#else
+    return pack_fp8_e4m3(lo * inv, hi * inv);
+#endif
+}
+
 /* Warp per live row: f = bf16(act(g * as * sg) * (u * as * su)) from the unscaled gate|up row,
- * then QuantFp8 of the row: fs = max(amax / 448, 1e-12), fu8 = e4m3(f / fs). I % 8 == 0,
+ * then QuantFp8 of the row (moe_lt_quant_scale / moe_lt_quant_pair). I % 8 == 0,
  * I <= 96 * 8. */
 extern "C" __global__ void plow_moe_lt_glu8(uint8_t* fu8, float* fs, const __nv_bfloat16* gu,
                                             const float* ascale, const unsigned long long* est,
@@ -487,7 +508,7 @@ extern "C" __global__ void plow_moe_lt_glu8(uint8_t* fu8, float* fs, const __nv_
         }
 #pragma unroll
         for (int o = 16; o > 0; o >>= 1) amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, o));
-        const float s = fmaxf(amax * (1.0f / 448.0f), 1e-12f);
+        const float s = moe_lt_quant_scale(amax);
         const float inv = 1.0f / s;
         if (lane == 0) fs[r] = s;
 #pragma unroll
@@ -497,7 +518,7 @@ extern "C" __global__ void plow_moe_lt_glu8(uint8_t* fu8, float* fs, const __nv_
             uint2 q8;
             unsigned short* q2 = (unsigned short*)&q8;
 #pragma unroll
-            for (int j = 0; j < 4; j++) q2[j] = pack_fp8_e4m3(f[c][2 * j] * inv, f[c][2 * j + 1] * inv);
+            for (int j = 0; j < 4; j++) q2[j] = moe_lt_quant_pair(f[c][2 * j], f[c][2 * j + 1], s, inv);
             *(uint2*)(fu8 + r * I + ch * 8u) = q8;
         }
     }
@@ -591,7 +612,25 @@ extern "C" __global__ void __launch_bounds__(256) plow_moe_lt_route_pre(
     const __nv_bfloat16* gamma, float norm_eps, __nv_bfloat16* h2, const __nv_bfloat16* rscale,
     float root, float rt_eps, unsigned rows, unsigned H) {
     __shared__ float part[32];
+#if defined(PLOW_NV_QUANT_FP8_VLLM) && PLOW_NV_QUANT_FP8_VLLM
+    /* d_rmsnorm's fused quant is the reciprocal form; the separate QuantFp8 the interpreter runs
+     * divides. Each block quantizes the rows it normalized. */
+    d_rmsnorm(xn2, x, gamma, rows, H, norm_eps, 0u, blockIdx.x, gridDim.x, part);
+    __syncthreads();
+    for (unsigned row = blockIdx.x; row < rows; row += gridDim.x) {
+        const __nv_bfloat16* v = xn2 + (size_t)row * H;
+        float am = 0.0f;
+        for (unsigned h = threadIdx.x; h < H; h += PLOW_NV_THREADS) am = fmaxf(am, fabsf(__bfloat162float(v[h])));
+        const float as = moe_lt_quant_scale(block_max(am, part));
+        if (threadIdx.x == 0) ascale[row] = as;
+        for (unsigned h = threadIdx.x * 2u; h < H; h += PLOW_NV_THREADS * 2u)
+            *(unsigned short*)(xq + (size_t)row * H + h) =
+                moe_lt_quant_pair(__bfloat162float(v[h]), __bfloat162float(v[h + 1]), as, 0.0f);
+        __syncthreads();
+    }
+#else
     d_rmsnorm(xn2, x, gamma, rows, H, norm_eps, 0u, blockIdx.x, gridDim.x, part, xq, ascale);
+#endif
     const unsigned lane = threadIdx.x & 31u, warp = threadIdx.x >> 5;
     for (unsigned row = blockIdx.x * (PLOW_NV_THREADS / 32u) + warp; row < rows;
          row += gridDim.x * (PLOW_NV_THREADS / 32u)) {
