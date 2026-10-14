@@ -1402,6 +1402,136 @@ __device__ void d_gemm_small_splitk_reduce(bf16* C, const float* part, unsigned 
         st_act1(&C[o], f2bf(v));
     }
 }
+/* PLOW_GLM_DEC_GEMM_FOLD (GemmSmall i7 = 5 group / 6 single): the split-K pair as ONE packet,
+ * bit-identical to it. A wave owns one 32x32 output tile and one K slice; its MFMA operands come
+ * straight from global (no LDS stage, no barrier in the K loop) in d_gemm_t's 32x32x16 lane map
+ * and k order, so each slice accumulator equals the partial the two-packet form writes. The
+ * WPT = min(S, 8) waves of a tile park their slice accumulators in LDS and the workgroup folds
+ * them in slice order (d_gemm_small_splitk_reduce's p0 + p1 + ... + pS-1): no fp32 workspace, no
+ * reduce packet. S = 1 stores the accumulator directly (d_gemm_t's unsplit value).
+ * `seg(g, C, A, B, N, K, S)` yields segment g; A's row stride is K. */
+#define PLOW_FOLD_LDS_FLOATS (8u * 1024u)
+static_assert(GM_LDS_HALVES_T(GM_SM_BM, GM_SM_BN, GM_SM_BK) >= 2u * PLOW_FOLD_LDS_FLOATS,
+              "the fold parks 8 waves x 32x32 fp32 inside the GemmSmall arena");
+__device__ __forceinline__ f32x16 d_gemm_fold_slice(const bf16* A, const bf16* B, unsigned M,
+                                                    unsigned N, unsigned K, unsigned m0,
+                                                    unsigned n0, unsigned k0, unsigned ks) {
+    const unsigned lane = threadIdx.x & 63u;
+    const unsigned ar = m0 + mfma_frag_row(lane), br = n0 + mfma_frag_row(lane);
+    const bool aok = ar < M, bok = br < N;
+    const auto* ap = as_glob(A) + (size_t)(aok ? ar : 0u) * K + k0 + mfma_frag_k(lane, 0);
+    const auto* bp = as_glob(B) + (size_t)(bok ? br : 0u) * K + k0 + mfma_frag_k(lane, 0);
+    const bf16v8 z = (bf16v8)((bf16)0);
+    f32x16 acc = (f32x16)(0.0f);
+    /* ks % 128 == 0 (the emitter's K % (S * 128) == 0): 8-step chunks. Kept at 64 operand VGPRs:
+     * the decode interpreter is already at its 256-VGPR cap and a 16-step chunk spills. */
+    for (unsigned c = 0; c < ks; c += 128u) {
+        bf16v8 a[8], b[8];
+#pragma unroll
+        for (int q = 0; q < 8; q++) {
+            a[q] = aok ? ld_glob8(ap + c + q * MFMA_K) : z;
+            b[q] = bok ? ld_glob8(bp + c + q * MFMA_K) : z;
+        }
+#pragma unroll
+        for (int q = 0; q < 8; q++)
+            acc = plow_mfma_bf16_32x32(__builtin_bit_cast(bf16x8, a[q]),
+                                       __builtin_bit_cast(bf16x8, b[q]), acc);
+    }
+    return acc;
+}
+template <typename Seg>
+__device__ __forceinline__ void d_gemm_small_fold(const Seg& seg, unsigned nseg, unsigned M,
+                                                  unsigned slice, unsigned nblk, bf16* lds) {
+    constexpr unsigned W = PLOW_THREADS / PLOW_WAVE;
+    static_assert(W == 8u, "the fold maps 8 waves onto tiles x slices");
+    float* part = reinterpret_cast<float*>(lds);
+    const unsigned lane = threadIdx.x & 63u, wave = threadIdx.x >> 6;
+    const unsigned tm = (M + 31u) / 32u;
+    /* Tiles per item: the largest power of two (<= 8 / WPT per segment) that still leaves one item
+     * per workgroup, so a small group spreads over the grid instead of packing onto a few CUs. */
+    unsigned pack = 8u, total = 0;
+    for (;; pack >>= 1) {
+        total = 0;
+        for (unsigned g = 0; g < nseg; g++) {
+            bf16* C;
+            const bf16 *A, *B;
+            unsigned N, K, S;
+            seg(g, C, A, B, N, K, S);
+            if (S == 0u || S > 16u) __builtin_trap();
+            const unsigned wpt = S < W ? S : W, t = (W / wpt) < pack ? (W / wpt) : pack;
+            total +=(tm * ((N + 31u) / 32u) + t - 1u) / t;
+        }
+        if (pack == 1u || total >= nblk) break;
+    }
+    for (unsigned it = slice; it < total; it += nblk) {
+        unsigned g = 0, b0 = 0, tpi = 1, nt = 0;
+        bf16* C = nullptr;
+        const bf16 *A = nullptr, *B = nullptr;
+        unsigned N = 0, K = 0, S = 1;
+        for (; g < nseg; g++) {
+            seg(g, C, A, B, N, K, S);
+            const unsigned wpt = S < W ? S : W;
+            tpi = (W / wpt) < pack ? (W / wpt) : pack;
+            nt = tm * ((N + 31u) / 32u);
+            const unsigned ni = (nt + tpi - 1u) / tpi;
+            if (it < b0 + ni) break;
+            b0 += ni;
+        }
+        const unsigned wpt = S < W ? S : W, rounds = S / wpt, ks = S ? K / S : 0u;
+        if (S == 0u || S > 16u || rounds * wpt != S || ks * S != K || ks % 128u != 0u)
+            __builtin_trap();
+        const unsigned lt = wave / wpt, wsub = wave % wpt;
+        const unsigned tile = (it - b0) * tpi + lt; /* row block fastest: weight reuse in L2 */
+        const bool live = lt < tpi && tile < nt;
+        const unsigned m0 = (tile % tm) * 32u, n0 = (tile / tm) * 32u;
+        if (S == 1u) {
+            const unsigned nn = n0 + mfma_acc_n(lane);
+            if (live) {
+                const f32x16 acc = d_gemm_fold_slice(A, B, M, N, K, m0, n0, 0u, K);
+                if (nn < N)
+#pragma unroll
+                    for (int e = 0; e < 16; e++) {
+                        const unsigned mm = m0 + mfma_acc_m(lane, e);
+                        if (mm < M) st_act1(&as_glob(C)[(size_t)mm * N + nn], f2bf(acc[e]));
+                    }
+            }
+            continue;
+        }
+        float v[8];
+        for (unsigned r = 0; r < rounds; r++) {
+            if (live) {
+                const f32x16 acc =
+                    d_gemm_fold_slice(A, B, M, N, K, m0, n0, (r * wpt + wsub) * ks, ks);
+                float* p = part + (size_t)(lt * wpt + wsub) * 1024u + lane;
+#pragma unroll
+                for (int e = 0; e < 16; e++) p[e * 64] = acc[e];
+            }
+            __syncthreads();
+#pragma unroll
+            for (int j = 0; j < 8; j++) {
+                const unsigned o = threadIdx.x + PLOW_THREADS * j;
+                if (o < tpi * 1024u) {
+                    const float* p = part + (size_t)(o / 1024u) * wpt * 1024u + (o % 1024u);
+                    float x = r == 0u ? p[0] : v[j] + p[0];
+                    for (unsigned q = 1; q < wpt; q++) x += p[q * 1024u];
+                    v[j] = x;
+                }
+            }
+            __syncthreads();
+        }
+#pragma unroll
+        for (int j = 0; j < 8; j++) {
+            const unsigned o = threadIdx.x + PLOW_THREADS * j;
+            const unsigned tl = (it - b0) * tpi + o / 1024u, idx = o % 1024u;
+            if (o < tpi * 1024u && tl < nt) {
+                const unsigned l = idx % 64u, e = idx / 64u;
+                const unsigned mm = (tl % tm) * 32u + mfma_acc_m(l, e);
+                const unsigned nc = (tl / tm) * 32u + mfma_acc_n(l);
+                if (mm < M && nc < N) st_act1(&as_glob(C)[(size_t)mm * N + nc], f2bf(v[j]));
+            }
+        }
+    }
+}
 #endif
 __device__ void d_gemm_med(bf16* C, const bf16* A, const bf16* B, unsigned M, unsigned N,
                            unsigned K, unsigned slice, unsigned nblk, bf16* lds) {

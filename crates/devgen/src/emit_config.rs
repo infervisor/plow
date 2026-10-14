@@ -1114,6 +1114,12 @@ pub struct EmitConfig {
     #[arg(long, env = "PLOW_GLM_DEC_SPLITK_2P", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
     pub glm_dec_splitk_2p: bool,
 
+    /// PLOW_GLM_DEC_SPLITK as ONE packet per projection (or group) that folds the S slice
+    /// partials in LDS in slice order: no fp32 workspace, no reduce packet. Bit-identical to the
+    /// two-packet form. Needs objects with the arm (plow_gemm_small_fold_arm).
+    #[arg(long, env = "PLOW_GLM_DEC_GEMM_FOLD", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
+    pub glm_dec_gemm_fold: bool,
+
     /// GLM-5.3-Flash batched decode (rungs the HyperConnPost fold does not cover): fold each
     /// HyperConnPost into the one-shot XReduce that produces its block output. Bit-identical.
     #[arg(long, env = "PLOW_GLM_XR_HCPOST", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
@@ -1889,6 +1895,7 @@ impl EmitConfig {
             glm_dec_splitk: env_u32("PLOW_GLM_DEC_SPLITK"),
             glm_dec_splitk_max_rows: env_u32("PLOW_GLM_DEC_SPLITK_MAX_ROWS"),
             glm_dec_splitk_2p: env_bool("PLOW_GLM_DEC_SPLITK_2P"),
+            glm_dec_gemm_fold: env_bool("PLOW_GLM_DEC_GEMM_FOLD"),
             glm_xr_hcpost: env_bool("PLOW_GLM_XR_HCPOST"),
             glm_decode_glu_rows: env_bool("PLOW_GLM_DECODE_GLU_ROWS"),
             glm_pf_ns: env_u32("PLOW_GLM_PF_NS"),

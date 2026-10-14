@@ -1348,6 +1348,7 @@ pub const EMIT: &[KnobSpec] = &[
     KnobSpec::new("emit.glm_dec_splitk", Some("PLOW_GLM_DEC_SPLITK"), Layer::Emit, U32, UNSET, OPT_IN),
     KnobSpec::new("emit.glm_dec_splitk_max_rows", Some("PLOW_GLM_DEC_SPLITK_MAX_ROWS"), Layer::Emit, U32, UNSET, OPT_IN),
     KnobSpec::new("emit.glm_dec_splitk_2p", Some("PLOW_GLM_DEC_SPLITK_2P"), Layer::Emit, Domain::Bool, OFF, OPT_IN),
+    KnobSpec::new("emit.glm_dec_gemm_fold", Some("PLOW_GLM_DEC_GEMM_FOLD"), Layer::Emit, Domain::Bool, OFF, OPT_IN),
     KnobSpec::new("emit.glm_xr_hcpost", Some("PLOW_GLM_XR_HCPOST"), Layer::Emit, Domain::Bool, OFF, OPT_IN),
     KnobSpec::new("emit.glm_decode_glu_rows", Some("PLOW_GLM_DECODE_GLU_ROWS"), Layer::Emit, Domain::Bool, GLM_GLU_ROWS_DEFAULT, GLM_GFX950_ROWS),
     KnobSpec::new("emit.glm_pf_ns", Some("PLOW_GLM_PF_NS"), Layer::Emit, U32, UNSET, OPT_IN),

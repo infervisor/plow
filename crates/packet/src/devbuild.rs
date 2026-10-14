@@ -482,6 +482,8 @@ pub struct Builder {
     gemm_small_splitk_2p: bool,
     /// See [`Builder::set_gemm_small_group_s`].
     gemm_small_group_s: u32,
+    /// See [`Builder::set_gemm_small_fold`].
+    gemm_small_fold: bool,
     /// Re-declaring a tensor name returns the existing handle instead of appending.
     /// `false` (default) ⇒ byte-identical. See [`Builder::set_tensor_dedup`].
     tensor_dedup: bool,
@@ -778,6 +780,7 @@ impl Builder {
             gemm_small_splitk: 0,
             gemm_small_splitk_2p: false,
             gemm_small_group_s: 0,
+            gemm_small_fold: false,
             tensor_dedup: false,
             cu_cap: None,
             tr_dropped: 0,
@@ -1048,6 +1051,11 @@ impl Builder {
         if s < 2 {
             return;
         }
+        if self.gemm_small_fold {
+            inst.i[6] = s;
+            inst.i[7] = 6;
+            return;
+        }
         let id = self.ops.len();
         let part = self.tensor(
             &format!("act.splitk.{id}.m{m}n{n}s{s}.part"),
@@ -1075,9 +1083,16 @@ impl Builder {
         self.gemm_small_group_s = s;
     }
 
+    /// PLOW_GLM_DEC_GEMM_FOLD: every split-K `GemmSmall` (single, `i7 = 6`, and grouped, `i7 = 5`)
+    /// as ONE packet that folds its S slice partials in LDS in slice order (interp.hip
+    /// `exec_gemm_small_fold`): no fp32 workspace, no reduce packet, bit-identical outputs.
+    pub fn set_gemm_small_fold(&mut self, on: bool) {
+        self.gemm_small_fold = on;
+    }
+
     /// Whether [`Builder::emit_gemm_small_group`] can emit: split-K off, or its two-packet form.
     pub fn gemm_small_group_ok(&self) -> bool {
-        self.gemm_small_splitk < 2 || self.gemm_small_splitk_2p
+        self.gemm_small_splitk < 2 || self.gemm_small_splitk_2p || self.gemm_small_fold
     }
 
     pub fn emit_gemm_small_group(
@@ -1117,13 +1132,14 @@ impl Builder {
             })
             .collect();
         let any_split = ss.iter().any(|&s| s > 1);
-        if any_split && !self.gemm_small_splitk_2p {
+        let fold = self.gemm_small_fold && self.gemm_small_splitk >= 2;
+        if any_split && !self.gemm_small_splitk_2p && !fold {
             return None;
         }
         let id = self.ops.len();
         let mut words = vec![segs.len() as u32];
         for (g, (&(c, a, w, n, k), &s)) in segs.iter().zip(&ss).enumerate() {
-            let part = if s > 1 {
+            let part = if s > 1 && !fold {
                 self.tensor(
                     &format!("act.splitk.{id}.g{g}.m{m}n{n}k{k}s{s}.part"),
                     u64::from(s) * u64::from(m) * u64::from(n) * 4,
@@ -1145,9 +1161,9 @@ impl Builder {
             d.i[0] = m;
             d.i[1] = n0;
             d.i[2] = k0;
-            d.i[7] = 3;
+            d.i[7] = if fold { 5 } else { 3 };
         });
-        if !any_split {
+        if !any_split || fold {
             return Some(part);
         }
         Some(self.emit(DevOp::GemmSmall, cus, &[part], |d| {

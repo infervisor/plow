@@ -1508,6 +1508,7 @@ pub(crate) fn glm53_emit_full(
         if rows > 1 && rows <= ec.glm_dec_splitk_max_rows.unwrap_or(u32::MAX) {
             b.set_gemm_small_splitk(ec.glm_dec_splitk.unwrap_or(0));
             b.set_gemm_small_splitk_2p(ec.glm_dec_splitk_2p);
+            b.set_gemm_small_fold(ec.glm_dec_gemm_fold);
         }
         b.set_gemm_small_group_s(ec.glm_kda_proj_group_s.unwrap_or(0));
         emit_glm53_program(&mut b, &c, &n, &s, ctx, rows, dbatch, enc, false);

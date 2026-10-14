@@ -2602,9 +2602,49 @@ __device__ __forceinline__ void exec_gemm_small_group(CInst in, CTens T, unsigne
     }
 }
 #endif
+#if PLOW_GEMM_SMALL_SPLITK
+/* PLOW_GLM_DEC_GEMM_FOLD: i7 = 5 is the group (t7 descriptor, `part` unused), i7 = 6 one split
+ * projection (i6 = S). d_gemm_small_fold. */
+extern "C" __device__ unsigned plow_gemm_small_fold_arm = 1;
+__device__ __forceinline__ void exec_gemm_small_fold(CInst in, CTens T, unsigned slice,
+                                                     unsigned nblk, bf16* lds) {
+    if (in->i[7] == 6u) {
+        auto seg = [&](unsigned, bf16*& C, const bf16*& A, const bf16*& B, unsigned& N,
+                       unsigned& K, unsigned& S) {
+            C = (bf16*)T[in->t[0]];
+            A = (const bf16*)T[in->t[1]];
+            B = (const bf16*)T[in->t[2]];
+            N = in->i[1];
+            K = in->i[2];
+            S = in->i[6];
+        };
+        if (in->i[4] != 0u || in->i[5] != 0u) __builtin_trap();
+        d_gemm_small_fold(seg, 1u, in->i[0], slice, nblk, lds);
+        return;
+    }
+    const unsigned* d = (const unsigned*)T[in->t[7]];
+    const unsigned nseg = d[0];
+    if (nseg == 0u || nseg > 8u) __builtin_trap();
+    auto seg = [&](unsigned g, bf16*& C, const bf16*& A, const bf16*& B, unsigned& N,
+                   unsigned& K, unsigned& S) {
+        const unsigned* e = d + 1u + PLOW_GSG_W * g;
+        C = (bf16*)T[e[0]];
+        A = (const bf16*)T[e[1]];
+        B = (const bf16*)T[e[2]];
+        N = e[3];
+        K = e[4];
+        S = e[5];
+    };
+    d_gemm_small_fold(seg, nseg, in->i[0], slice, nblk, lds);
+}
+#endif
 __device__ __forceinline__ void exec_gemm_small(CInst in, CTens T,
                                                unsigned slice, unsigned nblk, bf16* lds) {
 #if PLOW_GEMM_SMALL_SPLITK
+    if (in->i[7] >= 5u) {
+        exec_gemm_small_fold(in, T, slice, nblk, lds);
+        return;
+    }
     if (in->i[7] >= 3u) {
         exec_gemm_small_group(in, T, slice, nblk, lds);
         return;

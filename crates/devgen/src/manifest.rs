@@ -461,6 +461,9 @@ struct Shapes {
     /// Any `GemmSmall` with `i[7] >= 3` — grouped projections (PLOW_GLM_KDA_PROJ_GROUP). An
     /// object without the arm runs segment 0 only. Refuse.
     gemm_small_group: bool,
+    /// Any `GemmSmall` with `i[7] >= 5` — split-K folded in one packet (PLOW_GLM_DEC_GEMM_FOLD).
+    /// An object without the arm runs it as a group / plain tile. Refuse.
+    gemm_small_fold: bool,
     /// Any `GemmSmall` with `i[6] > 1` — decode split-K (PLOW_GLM_DEC_SPLITK). A BUILD axis
     /// (`#if PLOW_GEMM_SMALL_SPLITK`); an object without it runs the unsplit tile (correct).
     gemm_small_splitk: bool,
@@ -677,6 +680,10 @@ fn shapes(m: &Model) -> Shapes {
                 }
                 DevOp::AddNorm if inst.i[2] == 1 => s.glm_fuse_seam_rn = true,
                 DevOp::HyperConnPre if inst.i[4] == 1 => s.glm_hc_norm_fold = true,
+                DevOp::GemmSmall if inst.i[7] >= 5 => {
+                    s.gemm_small_splitk = true;
+                    s.gemm_small_fold = true;
+                }
                 DevOp::GemmSmall if inst.i[7] >= 3 => {
                     s.gemm_small_splitk = true;
                     s.gemm_small_group = true;
@@ -1074,6 +1081,9 @@ fn encoding_features(f: &mut Map<String, Value>, s: &Shapes) {
     }
     if s.glm_hc_fuse_dec {
         f.insert("glm_hc_fuse_dec".into(), json!(true));
+    }
+    if s.gemm_small_fold {
+        f.insert("gemm_small_fold".into(), json!(true));
     }
     if s.gemm_small_group {
         f.insert("gemm_small_group".into(), json!(true));
@@ -1824,6 +1834,9 @@ fn backend_amd(
     }
     if on("gemm_small_group") {
         req.push("PLOW_GLM_KDA_PROJ_GROUP=1".into());
+    }
+    if on("gemm_small_fold") {
+        req.push("PLOW_GLM_DEC_GEMM_FOLD=1".into());
     }
     if on("glm_fuse_seam_rn") {
         req.push("PLOW_GLM_FUSE_SEAM_RN=1".into());
