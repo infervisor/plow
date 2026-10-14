@@ -665,6 +665,18 @@ The packet from config + index alone (no weights) is 70 MB: 4 prefill buckets + 
   r1 26.2 vs 12.4, B8 39.8 vs 22.9, B32 85.6 vs 30.2, B128 263.7 vs 39.9 (1k ctx);
   r1 at 4k/16k/61k 27.4/29.2/37.1 vs 11.5/11.6/12.6. Prefill (dense attention + pool writes)
   4k/16k/32k/61k 164/601/1345/3053 ms. Needles and the FP32 gate not run.
+  Later (v12 env + `PLOW_GLM_DSA=topk PLOW_GLM_DSA_PF=1 PLOW_GLM_DSA_FUSE=1
+  PLOW_GLM_DECODE_GLUE_CUS=1`, objects default `PLOW_DSA_KPOOL_MFMA=1 PLOW_DSA_QQUANT_WAVE=1`):
+  IndexScoreKpool on bf16 MFMA (fp8 operands are exact in bf16), items slab-major (row-major
+  pinned each workgroup to one slab: 4.8 ms -> 0.5 ms per 8k chunk layer), 8 prefill rows per
+  key slab; ragged prefill chunks shrink the pooled chain (the 4096-in-8192 fault); stash/expand
+  fused into compress/select; q quant one wave per row. Sparse vs dense (v12 int), ms/step:
+  r1 11.9 vs 11.5, B8 23.7 vs 22.8, B32 27.7 vs 26.9-29.3, B128 41.0 vs 36.5-38.7, r1 at
+  4k/16k/61k 12.4/12.5/12.7 vs 11.7/11.9/12.8; prefill 4k/16k/32k/61k 173-191/598/1254/2560 vs
+  159/561/1271/- ms. Streams = FP32 continuation at all rungs; 4k/16k = dense stream; needles
+  36/36 (serve, cache on). Serve with the packed route crashed (per-span pool writes trap in the
+  interpreter object): the packed route is refused for DSA packets until those writes move into
+  a packed family; FP32 gate pending.
 - 23:00 UTC (10-13), dedicated decode kernels for KDA and the router (branch v13-kda-router).
   `PLOW_KDA_DECODE_WIDE` (default on): at batched rungs each KDA layer's Conv3 -> StateStepG ->
   GatedNorm runs as one standalone op-125 v3 launch (`kda_decode_wide.hip`, one 512-thread
