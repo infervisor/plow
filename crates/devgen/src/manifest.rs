@@ -1144,6 +1144,11 @@ fn tuning(s: &Shapes, arch: &str) -> Map<String, Value> {
             if crate::emit_config::active().nv_gemv_rem_split {
                 t.insert("gemv_rem_split".into(), json!(1));
             }
+            // * `gemv_bal` (PLOW_NV_GEMV_BAL, recipe opt-in): the walks' row blocks and k64 steps are
+            //   cut into 8 equal warp ranges with whole-line loads (op_gemv_mma.cuh). Reorders sums.
+            if crate::emit_config::active().nv_gemv_bal {
+                t.insert("gemv_bal".into(), json!(1));
+            }
         }
         // * `gemv_k8`: rungs 2..32 run the tensor-core K-split walk (op_gemv_k8_sm90.cuh), weight
         //   rows as the mma M. Veena (Llama-3.2-3B) ctx 1024 B=1/2/4/8/16/32 3.44/3.86/3.96/4.09/
@@ -3152,6 +3157,9 @@ pub fn config_header(manifest: &Value) -> String {
                 out.push_str(
                     "#ifndef PLOW_NV_GEMV_REM_SPLIT\n#define PLOW_NV_GEMV_REM_SPLIT 1\n#endif\n",
                 );
+            }
+            if t.get("gemv_bal").is_some() {
+                out.push_str("#ifndef PLOW_NV_GEMV_BAL\n#define PLOW_NV_GEMV_BAL 1\n#endif\n");
             }
             if t.get("gemv_wide").is_some() {
                 out.push_str("#ifndef PLOW_NV_GEMV_WIDE\n#define PLOW_NV_GEMV_WIDE 1\n#endif\n");

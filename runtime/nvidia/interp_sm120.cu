@@ -273,6 +273,12 @@ extern "C" __device__ __constant__ unsigned plow_pf_fp8_request_abi = 1;
 #ifndef PLOW_NV_GEMV_K8_MIN
 #define PLOW_NV_GEMV_K8_MIN 2
 #endif
+/* The balanced k64 walk (op_gemv_mma.cuh, PLOW_NV_GEMV_BAL) takes the 1..8-row ops the K-split
+ * route would otherwise own; the K8 sites skip them so the d_gemv* ladders reach its hook. */
+#ifndef PLOW_NV_GEMV_BAL
+#define PLOW_NV_GEMV_BAL 0
+#endif
+#define PLOW_NV_GEMV_BAL_TAKES(rows, K) (PLOW_NV_GEMV_BAL && (rows) <= 8u && (((K) & 63u) == 0u))
 #if PLOW_NV_GEMV_K8_MAX > 32
 #define PLOW_NV_K8_CALL(NW, MATS, X, ACT)                                                        \
     do {                                                                                       \
@@ -2192,7 +2198,8 @@ __device__ __forceinline__ void plow_exec(const PlowDevInst* in, void* const* T,
             break;
         }
 #if defined(PLOW_NV_HOPPER) && !PLOW_NV_PREFILL && PLOW_NV_GEMV_K8
-        if (in->i[0] >= PLOW_NV_GEMV_K8_MIN && in->i[0] <= PLOW_NV_GEMV_K8_MAX && !TEN(7) && k8_split(in->i[1], in->i[2], nblk)) {
+        if (in->i[0] >= PLOW_NV_GEMV_K8_MIN && in->i[0] <= PLOW_NV_GEMV_K8_MAX && !TEN(7) &&
+            !PLOW_NV_GEMV_BAL_TAKES(in->i[0], in->i[2]) && k8_split(in->i[1], in->i[2], nblk)) {
             const K8Mats mats{{(const __nv_bfloat16*)TEN(2), nullptr, nullptr},
                               {(__nv_bfloat16*)TEN(0), nullptr, nullptr}, {in->i[1], 0u, 0u}};
             PLOW_NV_K8_CALL(1, mats, (const __nv_bfloat16*)TEN(1) + (size_t)in->i[4] * in->i[2], 0u);
@@ -2305,6 +2312,7 @@ __device__ __forceinline__ void plow_exec(const PlowDevInst* in, void* const* T,
     case PLOW_DOP_GEMV_QKV:
 #if defined(PLOW_NV_HOPPER) && !PLOW_NV_PREFILL && PLOW_NV_GEMV_K8
         if (in->i[0] >= PLOW_NV_GEMV_K8_MIN && in->i[0] <= PLOW_NV_GEMV_K8_MAX && !(in->i[5] && in->i[6] && in->i[7]) &&
+            !PLOW_NV_GEMV_BAL_TAKES(in->i[0], in->i[2]) &&
             k8_split(in->i[1] + in->i[3] + in->i[4], in->i[2], nblk)) {
             const K8Mats mats{{(const __nv_bfloat16*)TEN(2), (const __nv_bfloat16*)TEN(4),
                                (const __nv_bfloat16*)TEN(6)},
@@ -2452,7 +2460,8 @@ __device__ __forceinline__ void plow_exec(const PlowDevInst* in, void* const* T,
         }
 #endif
 #if defined(PLOW_NV_HOPPER) && !PLOW_NV_PREFILL && PLOW_NV_GEMV_K8
-        if (in->i[0] >= PLOW_NV_GEMV_K8_MIN && in->i[0] <= PLOW_NV_GEMV_K8_MAX && k8_split(in->i[1], in->i[2], nblk)) {
+        if (in->i[0] >= PLOW_NV_GEMV_K8_MIN && in->i[0] <= PLOW_NV_GEMV_K8_MAX &&
+            !PLOW_NV_GEMV_BAL_TAKES(in->i[0], in->i[2]) && k8_split(in->i[1], in->i[2], nblk)) {
             const K8Mats mats{{(const __nv_bfloat16*)TEN(2), (const __nv_bfloat16*)TEN(5), nullptr},
                               {(__nv_bfloat16*)TEN(0), nullptr, nullptr}, {in->i[1], 0u, 0u}};
             PLOW_NV_K8_CALL(2, mats, (const __nv_bfloat16*)TEN(1), in->i[5]);

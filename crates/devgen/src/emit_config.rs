@@ -336,6 +336,11 @@ pub struct EmitConfig {
     #[arg(long, env = "PLOW_NV_GEMV_REM_SPLIT", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
     pub nv_gemv_rem_split: bool,
 
+    /// The mma row-block GEMV walks (rows 1..16, K % 64 == 0) run the balanced k64 walk
+    /// (op_gemv_mma.cuh PLOW_NV_GEMV_BAL). Reorders those sums; a recipe opts in after its gate.
+    #[arg(long, env = "PLOW_NV_GEMV_BAL", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
+    pub nv_gemv_bal: bool,
+
     /// S3Gen voice caches pre-formatted for the 3xFP16 cached attention (sm_90 speech object).
     #[arg(long, env = "PLOW_EMIT_S3GEN_ATTN_H16", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
     pub s3gen_attn_h16: bool,
@@ -1560,6 +1565,7 @@ impl EmitConfig {
             nv_fa_fold: env_bool("PLOW_NV_FA_FOLD"),
             nv_dense_tune: env_bool("PLOW_NV_DENSE_TUNE"),
             nv_gemv_rem_split: env_bool("PLOW_NV_GEMV_REM_SPLIT"),
+            nv_gemv_bal: env_bool("PLOW_NV_GEMV_BAL"),
             packed_prefill_small_hd: env_bool("PLOW_EMIT_PACKED_PREFILL_SMALL_HD"),
             s3gen_attn_h16: env_bool("PLOW_EMIT_S3GEN_ATTN_H16"),
             nv_fa_mma_hd128: env_bool("PLOW_NV_FA_MMA_HD128"),

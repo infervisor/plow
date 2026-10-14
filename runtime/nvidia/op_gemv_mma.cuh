@@ -43,6 +43,27 @@
 #ifndef PLOW_NV_GEMV_REM_SPLIT
 #define PLOW_NV_GEMV_REM_SPLIT 0
 #endif
+/* BALANCED K64 WALK (manifest `gemv_bal`, recipe opt-in: it reorders sums). Two measured defects of
+ * the wave walk above, standalone against cuBLASLt on the same cold weight stream (h100-sxm5,
+ * plans/gemm-vs-cublaslt.md): (1) a block with `per` row blocks runs ceil(per/8) waves and the
+ * last wave idles 8 - per % 8 warps, which ncu shows as 1.6 of 2.0 active warps per scheduler
+ * (27B inqkv/gu/qg at rows 2..16: 0.69/0.75/0.76 of the Lt time); (2) a k32 step reads half a
+ * 128 B line per weight row per lane group. The balanced walk cuts the block's (row block,
+ * k-step) units into 8 equal contiguous ranges, one per warp, and steps K by 64 so each lane
+ * loads 32 contiguous bytes and a row's 4 lanes cover one whole line per step. A row block cut by
+ * a warp boundary is owned by the warp holding its first k-step; every later warp touching it
+ * parks its partial fragment in its own reduction slot and the owner adds them in warp order
+ * after one block barrier (bit-stable). Same shapes: 0.84/0.87/0.85 of Lt, 27B down 0.87 -> 0.89,
+ * narrow kv/k/ab/ple rows 1.01-1.26x. Requires K % 64 == 0 (callers keep the wave walk otherwise)
+ * and MT == 1 (rows <= 16). */
+#ifndef PLOW_NV_GEMV_BAL
+#define PLOW_NV_GEMV_BAL 0
+#endif
+/* k64 steps of weight loads in flight per lane before the group's mmas (UNB/2 = the k32 walk's
+ * bytes in flight); an object define for tuning. */
+#ifndef PLOW_NV_GEMV_BAL_UNB
+#define PLOW_NV_GEMV_BAL_UNB (PLOW_NV_GEMV_MMA_UNB / 2u)
+#endif
 /* k32 steps in flight per lane: UNB x (NW x 16 B) of weight loads before the first mma.
  * 12, measured on h100-sxm5 (step_bench ms at B=1/4/16): Gemma-4-12B 11.93/13.16/16.03 at 8,
  * 11.18/12.58/15.25 at 12, 11.52/12.93/15.77 at 16; 26B 5.79/10.06/15.89, 5.80/9.93/15.62,
@@ -316,6 +337,141 @@ __device__ __forceinline__ void gvmma_store_tile(__nv_bfloat16* __restrict__ C, 
     }
 }
 
+#if PLOW_NV_GEMV_BAL
+/* gvmma_tile on 64-wide k-steps over [kb0, kb1) (k64 units): lane t loads W[n][64kb + 16t .. +16)
+ * as two 16 B vectors, the same virtual-k order per vector as the k32 tile. Weights of a group
+ * land before the group's mmas (UNB/2 steps = the k32 tile's bytes in flight). */
+template <int NW, bool ONE>
+__device__ __forceinline__ void gvbal_tile64(float (&acc)[NW][1][4], const __nv_bfloat16* __restrict__ x,
+                                             const __nv_bfloat16* const (&W)[NW], unsigned nb,
+                                             unsigned rows, unsigned N, unsigned K, unsigned kb0,
+                                             unsigned kb1) {
+    constexpr unsigned UNB = PLOW_NV_GEMV_BAL_UNB < 2u ? 2u : PLOW_NV_GEMV_BAL_UNB;
+    const unsigned lane = threadIdx.x & PLOW_NV_LANE_MASK;
+    const unsigned g = lane >> 2, t = lane & 3;
+    const __nv_bfloat16* xa = x + (size_t)(g < rows ? g : 0u) * K + t * 16u;
+    const __nv_bfloat16* xb = x + (size_t)((g + 8u) < rows ? (g + 8u) : 0u) * K + t * 16u;
+    const unsigned n = nb + g;
+    const __nv_bfloat16* w[NW];
+#pragma unroll
+    for (int i = 0; i < NW; i++) w[i] = W[i] + (size_t)(n < N ? n : 0u) * K + t * 16u;
+#pragma unroll
+    for (int i = 0; i < NW; i++)
+#pragma unroll
+        for (int j = 0; j < 4; j++) acc[i][0][j] = 0.0f;
+    auto step = [&](const uint4 (&w0)[NW], const uint4 (&w1)[NW], unsigned kb) {
+        const uint4 a0 = *(const uint4*)(xa + kb * 64u);
+        const uint4 a2 = *(const uint4*)(xa + kb * 64u + 8u);
+        const uint4 a1 = ONE ? a0 : *(const uint4*)(xb + kb * 64u);
+        const uint4 a3 = ONE ? a2 : *(const uint4*)(xb + kb * 64u + 8u);
+#pragma unroll
+        for (int i = 0; i < NW; i++) {
+            gvmma_mma16816(acc[i][0], a0.x, a1.x, a0.y, a1.y, w0[i].x, w0[i].y);
+            gvmma_mma16816(acc[i][0], a0.z, a1.z, a0.w, a1.w, w0[i].z, w0[i].w);
+            gvmma_mma16816(acc[i][0], a2.x, a3.x, a2.y, a3.y, w1[i].x, w1[i].y);
+            gvmma_mma16816(acc[i][0], a2.z, a3.z, a2.w, a3.w, w1[i].z, w1[i].w);
+        }
+    };
+    unsigned kb = kb0;
+    for (; kb + UNB <= kb1; kb += UNB) {
+        uint4 wv[UNB][2][NW];
+#pragma unroll
+        for (unsigned u = 0; u < UNB; u++)
+#pragma unroll
+            for (int i = 0; i < NW; i++) {
+                wv[u][0][i] = *(const uint4*)(w[i] + (kb + u) * 64u);
+                wv[u][1][i] = *(const uint4*)(w[i] + (kb + u) * 64u + 8u);
+            }
+        /* At the decode entry's register cap ptxas schedules for pressure and interleaves a
+         * group's loads with its mmas, leaving two or three loads in flight per warp. Making the
+         * first mma's operand depend on every load keeps the whole group in flight. */
+        unsigned gate = 0u;
+#pragma unroll
+        for (unsigned u = 0; u < UNB; u++)
+#pragma unroll
+            for (int i = 0; i < NW; i++) gate ^= wv[u][0][i].x ^ wv[u][1][i].w;
+        if (gate == 0x9e3779b9u) wv[0][0][0].x ^= 1u;
+#pragma unroll
+        for (unsigned u = 0; u < UNB; u++) step(wv[u][0], wv[u][1], kb + u);
+    }
+    for (; kb < kb1; kb++) {
+        uint4 w0[NW], w1[NW];
+#pragma unroll
+        for (int i = 0; i < NW; i++) {
+            w0[i] = *(const uint4*)(w[i] + kb * 64u);
+            w1[i] = *(const uint4*)(w[i] + kb * 64u + 8u);
+        }
+        step(w0, w1, kb);
+    }
+}
+
+/* The balanced partition shared by the three walks: units u = rb * nkb + kb over the block's `per`
+ * row blocks; warp w owns [w*U/8, (w+1)*U/8). `tile(acc, rb, kb0, kb1)` computes a row block's
+ * k64 range into acc, `store(acc, rb)` writes it. A warp parks at most once (its first row block,
+ * when it does not start at k-step 0) and owns at most once (its last, when it does not end at
+ * nkb), so one reduction slot per warp suffices; warp 0 never parks, so slot warp - 1 indexes
+ * gvmma_red<NW>. Both barriers are block-uniform. */
+/* Block `slice` takes row blocks [slice*nrb/nblk, (slice+1)*nrb/nblk): gvmma_partition's
+ * ceil(nrb/nblk) per block leaves trailing blocks empty (480 row blocks on 132 blocks: 12 idle).
+ * 32-bit products throughout this walk (nblk * nrb < 2^32 for any N plowrt launches): a 64-bit
+ * divide is a subroutine call on sm_90 that spilled ~1 KB around each site at the entry's
+ * 255-register cap. */
+__device__ __forceinline__ gvmma_range gvbal_partition(unsigned N, unsigned slice, unsigned nblk) {
+    const unsigned nrb = (N + 7u) >> 3;
+    return {(slice * nrb) / nblk, ((slice + 1u) * nrb) / nblk};
+}
+
+template <int NW, class Tile, class Store>
+__device__ __forceinline__ void gvbal_walk(unsigned per, unsigned nkb, Tile&& tile, Store&& store) {
+    const unsigned lane = threadIdx.x & PLOW_NV_LANE_MASK;
+    const unsigned warp = threadIdx.x >> PLOW_NV_WARP_SHIFT;
+    gvmma_red_t<NW>& red = gvmma_red<NW>();
+    const unsigned U = per * nkb;
+    auto ustart = [&](unsigned w) -> unsigned { return (w * U) / PLOW_NV_WARPS; };
+    const unsigned u0 = ustart(warp), u1 = ustart(warp + 1u);
+    float own[NW][1][4];
+    unsigned own_rb = 0xffffffffu;
+    if (u0 < u1) {
+        for (unsigned rb = u0 / nkb; rb * nkb < u1; rb++) {
+            const unsigned base = rb * nkb;
+            const unsigned kb0 = (u0 > base ? u0 : base) - base;
+            const unsigned kb1 = (u1 < base + nkb ? u1 : base + nkb) - base;
+            float acc[NW][1][4];
+            tile(acc, rb, kb0, kb1);
+            if (kb0 == 0u && kb1 == nkb) {
+                store(acc, rb);
+            } else if (kb0 == 0u) {
+#pragma unroll
+                for (int i = 0; i < NW; i++)
+#pragma unroll
+                    for (int j = 0; j < 4; j++) own[i][0][j] = acc[i][0][j];
+                own_rb = rb;
+            } else {
+#pragma unroll
+                for (int i = 0; i < NW; i++)
+#pragma unroll
+                    for (int j = 0; j < 4; j++) red.v[warp - 1u][lane][i * 4 + j] = acc[i][0][j];
+            }
+        }
+    }
+    __syncthreads();
+    if (own_rb != 0xffffffffu) {
+        const unsigned end = (own_rb + 1u) * nkb;
+        for (unsigned w = warp + 1u; w < PLOW_NV_WARPS; w++) {
+            const unsigned ws = ustart(w);
+            if (ws >= end) break;
+            if (ws >= ustart(w + 1u)) continue; /* empty range: parked nothing */
+#pragma unroll
+            for (int i = 0; i < NW; i++)
+#pragma unroll
+                for (int j = 0; j < 4; j++) own[i][0][j] += red.v[w - 1u][lane][i * 4 + j];
+        }
+        store(own, own_rb);
+    }
+    __syncthreads(); /* red is reused by the next call on this block */
+}
+#endif
+
 template <bool BIAS, int MT = 1, bool ONE = false>
 __device__ __forceinline__ void gemv_rows_mma(__nv_bfloat16* __restrict__ C,
                                               const __nv_bfloat16* __restrict__ x,
@@ -329,6 +485,22 @@ __device__ __forceinline__ void gemv_rows_mma(__nv_bfloat16* __restrict__ C,
     const __nv_bfloat16* const W1[1] = {W};
     const unsigned per = r.rb1 - r.rb0;
     const unsigned nkb = K >> 5;
+#if PLOW_NV_GEMV_BAL
+    if constexpr (MT == 1) {
+        if ((K & 63u) == 0u) {
+            const gvmma_range b = gvbal_partition(N, slice, nblk);
+            gvbal_walk<1>(
+                b.rb1 - b.rb0, K >> 6,
+                [&](float (&acc)[1][1][4], unsigned rb, unsigned kb0, unsigned kb1) {
+                    gvbal_tile64<1, ONE>(acc, x, W1, (b.rb0 + rb) << 3, rows, N, K, kb0, kb1);
+                },
+                [&](const float (&acc)[1][1][4], unsigned rb) {
+                    gvmma_store_tile<BIAS, 1>(C, acc[0], (b.rb0 + rb) << 3, rows, N, bias);
+                });
+            return;
+        }
+    }
+#endif
 #if PLOW_NV_GEMV_MMA_PAIR
     /* TWO ROW BLOCKS PER K-STEP. A k-step's cost is mostly its round trip, not its bytes: the
      * two-stream GLU step measured 1.56x a one-stream step while moving 2x the weights (GLU walks
@@ -504,6 +676,20 @@ __device__ __forceinline__ void gemv_glu_rows_mma(__nv_bfloat16* __restrict__ C,
             }
         }
     };
+#if PLOW_NV_GEMV_BAL
+    if constexpr (MT == 1) {
+        if ((K & 63u) == 0u) {
+            const gvmma_range b = gvbal_partition(N, slice, nblk);
+            gvbal_walk<2>(
+                b.rb1 - b.rb0, K >> 6,
+                [&](float (&acc)[2][1][4], unsigned rb, unsigned kb0, unsigned kb1) {
+                    gvbal_tile64<2, ONE>(acc, x, W2, (b.rb0 + rb) << 3, rows, N, K, kb0, kb1);
+                },
+                [&](const float (&acc)[2][1][4], unsigned rb) { store(acc, b.rb0 + rb); });
+            return;
+        }
+    }
+#endif
 #if !PLOW_NV_GEMV_MMA_PAIR
     /* SPLIT-K, as gemv_rows_mma's: the 26B's N=2112 is 2 row blocks per block, so 6 of 8 warps sat
      * idle. gate and up reduce one after the other through the one-stream slots. 26B step_bench
@@ -609,6 +795,35 @@ __device__ __forceinline__ void gemv_qkv_rows_mma(
     const unsigned warp = threadIdx.x >> PLOW_NV_WARP_SHIFT;
     const unsigned g = lane >> 2, t = lane & 3;
     const gvmma_range r = gvmma_partition(Nq + Nk + Nv, slice, nblk);
+#if PLOW_NV_GEMV_BAL
+    if constexpr (MT == 1) {
+        if ((K & 63u) == 0u) {
+            const gvmma_range b = gvbal_partition(Nq + Nk + Nv, slice, nblk);
+            auto seg = [&](unsigned rb, const __nv_bfloat16*& W, __nv_bfloat16*& C,
+                           const __nv_bfloat16*& bias, unsigned& Nx, unsigned& n0) {
+                const unsigned gn = (b.rb0 + rb) << 3;
+                if (gn < Nq) { W = Wq; C = Cq; Nx = Nq; n0 = 0u; bias = bq; }
+                else if (gn < Nq + Nk) { W = Wk; C = Ck; Nx = Nk; n0 = Nq; bias = bk; }
+                else { W = Wv; C = Cv; Nx = Nv; n0 = Nq + Nk; bias = bv; }
+                return gn - n0;
+            };
+            gvbal_walk<1>(
+                b.rb1 - b.rb0, K >> 6,
+                [&](float (&acc)[1][1][4], unsigned rb, unsigned kb0, unsigned kb1) {
+                    const __nv_bfloat16* W; __nv_bfloat16* C; const __nv_bfloat16* bias; unsigned Nx, n0;
+                    const unsigned nb = seg(rb, W, C, bias, Nx, n0);
+                    const __nv_bfloat16* const W1[1] = {W};
+                    gvbal_tile64<1, ONE>(acc, x, W1, nb, rows, Nx, K, kb0, kb1);
+                },
+                [&](const float (&acc)[1][1][4], unsigned rb) {
+                    const __nv_bfloat16* W; __nv_bfloat16* C; const __nv_bfloat16* bias; unsigned Nx, n0;
+                    const unsigned nb = seg(rb, W, C, bias, Nx, n0);
+                    gvmma_store_tile<BIAS, 1>(C, acc[0], nb, rows, Nx, bias);
+                });
+            return;
+        }
+    }
+#endif
     /* Waves of one row block per warp; a short last wave splits its row blocks over K. MT 1 only
      * (see gemv_rows_mma). */
 #if PLOW_NV_GEMV_REM_SPLIT
