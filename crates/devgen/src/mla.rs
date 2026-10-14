@@ -749,7 +749,10 @@ fn emit_glm53_hc_pre(
     // PLOW_GLM_HC_AITER: post + mix (split-K partials) then pre + Sinkhorn + RmsNorm, AITER's two
     // kernels in one raw segment. `layer_input` is dead under the norm fold and is not written.
     if let (true, None, Some((raw, prev)), Some((nout, gamma))) = (
-        emit_config::active().glm_hc_aiter && c.hidden == 4096 && rows <= 512,
+        emit_config::active().glm_hc_aiter
+            && c.hidden == 4096
+            && rows <= 512
+            && rows >= emit_config::active().glm_hc_aiter_min_rows.unwrap_or(1),
         band,
         post_fold,
         norm_fold,
