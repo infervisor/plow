@@ -13,7 +13,7 @@ name = "glm-5.3-flash"
 label = "gfx950-mi350x-tp8-fp8"
 network = "glm-5.3-flash"
 status = "validated"
-plow_git = "ac22964825b9bc8cbaa5f50665436aa181a1c39f"
+plow_git = "16ca2decfab8d32a298f2db9ec2b1b7f004fb773"
 doc = "docs/amd/glm53-flash-mi350x.md"
 
 # max_ctx 65536: the model's recurrent (KDA) state carries at every length, so long prompts are
@@ -69,7 +69,11 @@ produces = ["zz-plow-glm53-derived.safetensors"]
 script = "scripts/build_gfx950.sh"
 # v11: bit-identical V2 flash softmax (DPP reductions, P convert, no spills) and KDA carry schedule
 # (pipelined loads, transpose key reads); streams identical, validate-v11c8.
-env = { PLOW_DECODE_BATCH = "128", PLOW_GEMV_WALK = "1", PLOW_GEMV_MM = "4", PLOW_DECODE_TIERS = "1,8", JOBS = "32", PLOW_MLA_PF2_DPP = "1", PLOW_MLA_PF2_PCVT = "1", PLOW_KDA_CARRY_PIPE = "1", PLOW_KDA_CARRY_KTR16 = "1" }
+# v13: `PLOW_K3_PF_XR_SCHED = "aiter"` (16-byte prefill collective schedule), `FA_MLA_PF2_DEFER = "1"`
+# (deferred-frame flash softmax), `PLOW_MLA_PF_DENSE = "1"` (builds the dedicated NoPE MLA flash prefill
+# object mla_pf_dense_gfx950.elf; the serve env routes to it), `PLOW_XR_TAG_SLOT = "90112"` (decode tag slot;
+# the serve env must carry the same value or the loader refuses the objects).
+env = { PLOW_DECODE_BATCH = "128", PLOW_GEMV_WALK = "1", PLOW_GEMV_MM = "4", PLOW_DECODE_TIERS = "1,8", JOBS = "32", PLOW_MLA_PF2_DPP = "1", PLOW_MLA_PF2_PCVT = "1", PLOW_KDA_CARRY_PIPE = "1", PLOW_KDA_CARRY_KTR16 = "1", PLOW_K3_PF_XR_SCHED = "aiter", FA_MLA_PF2_DEFER = "1", PLOW_MLA_PF_DENSE = "1", PLOW_XR_TAG_SLOT = "90112" }
 
 # Dense attention at every rung (`PLOW_GLM_DSA = "0"`; the pooled-DSA batched-decode arm does not
 # exist, and below the 64k DSA crossover the dense MLA path serves). The ladder rungs 32/128
@@ -103,7 +107,24 @@ env = { PLOW_DECODE_BATCH = "128", PLOW_GEMV_WALK = "1", PLOW_GEMV_MM = "4", PLO
 # Objects from 76d03d94 (gfx950 K3 decode objects inline plow_exec; same [objects] env): r1/B8/B32
 # 24.1/42.1/54.4 -> 12.9/31.2/53.0 ms, B128 within noise, 4k/16k r1 13.0/13.1 ms, streams equal.
 [emit]
-env = { PLOW_MLA_PREFILL = "full:128,512,2048,8192", PLOW_MLA_PF_V2 = "1", PLOW_GLM_PF_NS = "2", PLOW_DECODE_BATCH_LADDER = "1,8,32,128", PLOW_GLM_DECODE_GEMM_ROWS = "32", PLOW_GLM_DSA = "0", PLOW_GLM_SEQ_PAR = "1", PLOW_GLM_SEQ_PAR_PROJ = "0", PLOW_GLM_HC_NORM_FOLD = "1", PLOW_GLM_HC_POST_FOLD = "1", PLOW_KDA_DECODE_FUSED_ARM = "1", PLOW_KDA_FB_FOLD = "1", PLOW_GLM_HC_PRE_TAIL = "1", GLM_SHARD_HEAD = "1" }
+# v13 additions (each validated per rung; docs/amd/glm53-flash-mi350x.md §4):
+# - `PLOW_GLM_PF_NS = "2"` kept (two causal KV splits, as built and gated); NS=1 measured slightly faster (flash 9.5
+#   vs 9.9 ms per 8k chunk) with FP32 kl 0.0125 on its own build, not yet in this recipe.
+# - `PLOW_GLM53_SP_ROUTER` / `PLOW_GLM_ROUTER_OVERLAP = "2"` / `PLOW_GLM53_SP_KDA_NORM`: router and KDA input norm on
+#   the rank's sequence-parallel band (bit-identical).
+# - `PLOW_XR_DEC_CUS = "64"`, `PLOW_GLM_DEC_SPLITK = "16"` + `PLOW_GLM_DEC_SPLITK_2P`: decode XReduce CU cap and the
+#   two-packet split-K q/k/v.
+# - `PLOW_MOE_PF_W8A8` + `PLOW_MOE_DEC_W8A8`: vLLM's precision — W8A8 block FP8 (per-token 1x128 activation
+#   groups) for the routed MoE and the dense layers 0-2, prefill and batched decode; all attention/KDA projections
+#   stay bf16 as in vLLM. Decode W8A8 costs ~4-6% at c32 vs W8A16 (screen), equal at c1/c128.
+# - `PLOW_GLM_HC_FUSE_DEC`/`_R1`/`_VARIANT = "3"`, `PLOW_GLM_KDA_PROJ_GROUP`, `PLOW_GLM_KDA_QKVG_R1`: fused decode mHC
+#   (post + mix + pre + norm) and grouped split-K projections (bit-identical).
+# - `PLOW_KDA_PF_GROUP_GEMM`: the six KDA input projections as one routed prefill GEMM (bit-identical).
+# - `PLOW_MOE_FP8_PF_LEAN`: dedicated block-FP8 grouped MoE prefill kernels (bit-identical).
+# - `PLOW_GLM53_PACKED_LEAN_KDA`: packed serving prefill runs the lean KDA objects per span (bit-identical).
+# - `PLOW_GLM_DSA = "0"`: dense attention (vLLM runs sparse
+#   top-2048; plow's DSA serves but has no prefix hits / packed prefill yet).
+env = { PLOW_MLA_PREFILL = "full:128,512,2048,8192", PLOW_MLA_PF_V2 = "1", PLOW_GLM_PF_NS = "2", PLOW_DECODE_BATCH_LADDER = "1,8,32,128", PLOW_GLM_DECODE_GEMM_ROWS = "32", PLOW_GLM_DSA = "0", PLOW_GLM_SEQ_PAR = "1", PLOW_GLM_SEQ_PAR_PROJ = "0", PLOW_GLM_HC_NORM_FOLD = "1", PLOW_GLM_HC_POST_FOLD = "1", PLOW_KDA_DECODE_FUSED_ARM = "1", PLOW_KDA_FB_FOLD = "1", PLOW_GLM_HC_PRE_TAIL = "1", GLM_SHARD_HEAD = "1", PLOW_GLM53_SP_ROUTER = "1", PLOW_GLM_ROUTER_OVERLAP = "2", PLOW_GLM53_SP_KDA_NORM = "1", PLOW_XR_DEC_CUS = "64", PLOW_GLM_DEC_SPLITK = "16", PLOW_GLM_DEC_SPLITK_2P = "1", PLOW_MOE_PF_W8A8 = "1", PLOW_MOE_DEC_W8A8 = "1", PLOW_GLM_HC_FUSE_DEC = "1", PLOW_GLM_KDA_PROJ_GROUP = "1", PLOW_GLM_HC_FUSE_R1 = "1", PLOW_GLM_KDA_QKVG_R1 = "1", PLOW_GLM_HC_FUSE_VARIANT = "3", PLOW_KDA_PF_GROUP_GEMM = "1", PLOW_MOE_FP8_PF_LEAN = "1", PLOW_GLM53_PACKED_LEAN_KDA = "1" }
 args = [
   "--emit", "devblob",
   "--arch", "gfx950",
@@ -138,18 +159,17 @@ args = [
 # isl4096 6303/6330 -> 7661/10218; TTFT p99 c128 45.4 -> 17.1 s (1k), 78.7 -> 46.7 s (4k);
 # TPOT p99 c128 191 -> 213 ms (1k), 217 -> 384 ms (4k).
 [serve]
-env = { PLOW_STATE_CLEAR_DEVICE = "1", PLOW_TP_AGREE_EVERY = "1", PLOW_DECODE_MIN_RUNG = "1", PLOW_PF_INTERLEAVE = "8192", PLOW_PF_BACK_TO_BACK = "1", PLOW_PREFIX_ARM_END = "1" }
+env = { PLOW_STATE_CLEAR_DEVICE = "1", PLOW_TP_AGREE_EVERY = "1", PLOW_DECODE_MIN_RUNG = "1", PLOW_PF_INTERLEAVE = "8192", PLOW_PF_BACK_TO_BACK = "1", PLOW_PREFIX_ARM_END = "1", PLOW_MLA_PF_DENSE = "1", PLOW_XR_TAG_SLOT = "90112" }
 
 [[gates]]
 name = "smoke"
 cmd = "scripts/serve_test/smoke.sh"
 
 # FP32-reference gate (scripts/llm/fp32_ref_gate.py, 46 cases incl. 18 needles to 15872 tokens,
-# served c16, prefix cache on, PF_INTERLEAVE 8192) on packet 9328c621 (v11, mixed prefill+decode on): PASS,
-# kl_mean 0.01475 (vLLM 0.03677 on the same reference), kl_p99 0.229 (0.549), top1_decisive 0.9978 (0.9868), needles
-# 18/18 (DP2xTP4 on the TP4 packet 2beec26e: kl_mean 0.01295, PASS); needles with
-# PLOW_PF_CHUNK=512 18/18. Prefix reuse at c8 (identical re-sends 4096 cached, 53248 hit tokens):
-# cached streams equal their cold runs 4/4.
+# served c16, prefix cache on, PF_INTERLEAVE 8192) on packet ab03f74f (v13): PASS, kl_mean 0.01636
+# (vLLM 0.03677 on the same reference), kl_p99 0.258 (0.549), top1_decisive 0.9945 (0.9868), needles 18/18;
+# needles with PLOW_PF_CHUNK=512 18/18. Prefix reuse at c8 (57344 hit tokens): cached streams equal their
+# cold runs. 0 cross-GPU collective errors.
 [[gates]]
 name = "llm_fp32_ref"
 cmd = "scripts/llm/fp32_ref_gate.py"
@@ -164,11 +184,11 @@ expect = "36/36"
 
 # One serving cell for orientation; the full grid (isl 1024/4096/16384 at c1..c128, 32768/61440 at
 # c1/c8) and the strict comparison against vLLM are docs/bringup/results/glm53flash-mi350x-2026-10-12.
-# No cell beats vLLM on throughput (v11: 0.28-0.61x; PLOW_GLM_XR_HCPOST / PLOW_XR_DEC_CUS break serving, keep off); see docs/amd/glm53-flash-mi350x.md.
+# No cell beats vLLM on throughput (v13: 0.34-0.61x, v11 0.28-0.61x); see docs/amd/glm53-flash-mi350x.md.
 [measured]
-tok_s = 76.81
-p50_tpot_ms = 11.75
-p50_ttft_ms = 171.04
+tok_s = 74.81
+p50_tpot_ms = 12.27
+p50_ttft_ms = 150.80
 concurrency = 1
 input_len = 4096
 output_len = 128
@@ -176,10 +196,10 @@ client = "vllm 0.31.1rc1 bench serve (scripts/bench/llm_grid.sh)"
 
 # Reproduction gates at THIS commit, checkpoint and nix lock.
 [artifacts]
-"plowrt" = "6dcb21868180f2cd80085e7781f4b56fc0208c2dacb74096465e9ac9a434fa75"
-"model.pkt" = "9328c621ad084d60edb25b0e2fbfebefa8aa7f70d09ad7b292369035e1fbd85e"
-"interp_decode_k3_gq.elf" = "3e1b007a389124f3775f216faa54b3d681ea784a5266c15b69a7978c71faba52"
-"lowrung1/interp_decode_k3_gq.elf" = "8b1907208c83164a1a4dee68ef7f8293bdd572b5d95926419311b0360a9939a0"
-"lowrung8/interp_decode_k3_gq.elf" = "09cc30342ce017d533b9588f24f0d8caf94e13f69979dcc27c6a41fbb678ceed"
-"interp_prefill_k3_moe_gq.elf" = "c8e488d03f3a8ca1640973e744e71b721e6f122787881fbebc97d4b993f04f1b"
-"interp_flash_gq.elf" = "4f7e93a10004fd4a1ac43af4117c5874d1e7fd333f510644072a2e71d8b0cd20"
+"plowrt" = "7b73692d4edbd7fd9511b57dd85dfa0f39cdb13857feba18481858debdbe7fa8"
+"model.pkt" = "ab03f74fc6e847c56bae6f35e2e7b2fa357093f89467037c9b5060593e0fa73a"
+"interp_decode_k3_gq.elf" = "7c0417f78cc80b46cf03c516b50337547a8264a83909709739ff2f57b9755eb1"
+"lowrung1/interp_decode_k3_gq.elf" = "ccdb3e5f7d5e1bd986009e31005b9fe39d8a04caedac47cc1bdcfc045a35bb3a"
+"lowrung8/interp_decode_k3_gq.elf" = "8f1fa69aac0d177b84101d643f52c1c1c40f53df7752f600b79a11385e77f815"
+"interp_prefill_k3_moe_gq.elf" = "3c30215253882715341e7435449a4de679f8340315e3e0f9c124a3d49ea13038"
+"interp_flash_gq.elf" = "314a26fedaf6591cfed8f295122fb2b7bf314c57546b90754beef2ef5e3c12b4"

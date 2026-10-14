@@ -590,6 +590,23 @@ The packet from config + index alone (no weights) is 70 MB: 4 prefill buckets + 
 - 14:20 UTC, v11 DP2xTP4 (TP4 packet 92ae9bd5, collective knobs off, PF_INTERLEAVE 8192): FP32 PASS
   kl_mean 0.01251, no collective errors; strict reports vs vLLM DP2xTP4 15 cells MATCHED/EQUIVALENT,
   0.44-0.76x (isl16384 c64/c128 0.73/0.72). No qualified win.
+- 21:00 UTC, v12 (bedd7980; packet 3707ed52): sequence-parallel band router + KDA norm, 16-byte prefill
+  collective schedule, flash prefill heaviest-first work order (PLOW_MLA_PF_SNAKE), blocked HSA drain wait
+  (removes a random ~18 ms stall), decode router tile + split-K 2P + XR_DEC_CUS, deferred-frame flash softmax.
+  Gates PASS kl 0.01305; prefill 8k 272 -> 245 ms; serving +3-9% at c32/c128. Per-segment geometry sweep: no
+  gain (the interpreter object's 148 KB LDS union + 256 VGPR cap every op at 1 WG x 8 waves/CU).
+- 01:16 UTC (10-14), v13 (16ca2dec; packet ab03f74f; plowrt 7b73692d): dedicated kernels outside the
+  interpreter — NoPE MLA flash prefill (mla_pf_dense, flash 18.1 -> 9.9 ms per 8k chunk), block-FP8 grouped MoE
+  prefill (moe_fp8_pf, pair 59 -> 47 ms), batched KDA decode chain (kda_decode_wide), grouped KDA prefill GEMM;
+  fused decode mHC + grouped split-K projections (B128 packets 1714 -> 1056); lean KDA in packed serve prefill
+  (packed launch 355 -> 312 ms); W8A8 MoE prefill+decode with vLLM's 1x128 activation groups (bug fixed: the
+  quant op wrote scales at the chunk's runtime-row pitch, the GLU read them at the bucket's; fixed pitch on both
+  sides). Gates PASS kl 0.01636, needles 36/36, split 18/18, prefix hits == cold. Prefill 1k/4k/8k/16k/32k
+  87/143/229/475/1019 ms. Strict TP8 reports 19 cells MATCHED/EQUIVALENT: 0.34-0.61x vLLM (isl4096 c128 0.35 ->
+  0.48, isl16384 c32 0.49 -> 0.58). No qualified win. vLLM per-kernel profile (same image/args): 8k prefill 170 ms,
+  B=1 6.87 ms, B=128 ~14-17 ms; vLLM runs sparse MLA (plow DSA serves, gate PASS kl 0.0129, but no prefix hits or
+  packed prefill yet) and W8A8 only for MoE + dense layers. Collectives at the XGMI floor. amd-bench --batched
+  feeds one prompt to every slot, so it understates decode MoE (distinct prompts B128 41.4 vs 34.0 ms). Recipe -> v13.
 - 17:35 UTC, E10 TP4 bench (packet pkt-glm53flash-tp4-ladder-v4, 4 GPUs, real prompt, streams
   exact at every rung): scalar (rung 8) 55.5 ms, B=8 51.4, B=32 63.3, B=64 74.6 ms (858 tok/s
   per group); prefill 1k 204 ms (TP8 173). Two such groups (DP2xTP4) would serve 128 streams at
@@ -729,7 +746,7 @@ The packet from config + index alone (no weights) is 70 MB: 4 prefill buckets + 
 
 Strict `campaign.py report` output per input length and the combined comparison.csv:
 [docs/bringup/results/glm53flash-mi350x-2026-10-12](../bringup/results/glm53flash-mi350x-2026-10-12/summary.md).
-No qualified win: plow total throughput 0.28-0.61x vLLM (v11).
+No qualified win: plow total throughput 0.34-0.61x vLLM (v13; v11 0.28-0.61x).
 
 ## 6. Roofline (CPU, before any plow GPU time)
 
