@@ -595,6 +595,18 @@ The packet from config + index alone (no weights) is 70 MB: 4 prefill buckets + 
   (removes a random ~18 ms stall), decode router tile + split-K 2P + XR_DEC_CUS, deferred-frame flash softmax.
   Gates PASS kl 0.01305; prefill 8k 272 -> 245 ms; serving +3-9% at c32/c128. Per-segment geometry sweep: no
   gain (the interpreter object's 148 KB LDS union + 256 VGPR cap every op at 1 WG x 8 waves/CU).
+- 20:50 UTC (10-14), v18 (ca11e3f0; packet 360814fc; plowrt 98bc6ba7): five-lever round (agents SA/G/D/B/K).
+  Taken: D — `PLOW_GLM53_L2_PLACE` (glm53_emit_full never got plowc's L2 layout, so the compiled-in PLOW_GATE_HIER was
+  ARMED BUT INERT; now FIRING), head-packed GF8 NoPE MLA decode kernel d_flash_mla_decode_hp8 (`PLOW_GLM53_MLA_HPACK_ROWS
+  = 32`, obj `PLOW_MLA_DEC_HPACK`), `PLOW_GLM_HC_FOLD_MLA`; SA — `PLOW_AMD_SNAP_KERNEL` (prefix snapshot as one copy
+  kernel), `PLOW_AMD_PACKED_LEAN_KDA_BATCH` (one dispatch per lean KDA segment over all packed spans); K —
+  `PLOW_KDA_CARRY_SPLIT=4` (affine split of the key-fed carry), `PLOW_KDA_DECODE_LANES`. Rejected: decode rows riding
+  the packed prefill (-4..-23%), AQL packet/fence/signal knobs and per-rank host threads (no gain; in-step packet
+  boundaries cost ~0, a 1.3-1.7 ms GPU idle between decode steps remains), prefill hipBLASLt stream-K route (works,
+  ~1%, 503 MB image; not taken), K's CARRY_MULTI (no gain over SA batching). Distinct-prompt r1/B8/B32/B128
+  11.79/18.79/21.25/29.69 -> 10.22/17.60/19.05/26.49 ms; prefill 8k 174.9 -> 169.0. Gates PASS kl 0.02264, needles
+  36/36, split 18/18. Strict TP8 reports 19 cells MATCHED/EQUIVALENT: 0.54-0.82x vLLM (isl1024 c128 0.52 -> 0.62,
+  isl16384 c32 0.76 -> 0.82). No qualified win. Recipe -> v18.
 - 13:40 UTC (10-14), v17 (8485e951; packet 6629af02; plowrt 001c991d): v16c + AITER's fused mHC decode kernels
   (`PLOW_GLM_HC_AITER`: mhc_fused_post_pre_gemm_sqrsum + mhc_pre_big_fuse_rmsnorm compiled from AITER source into
   mhc_aiter_gfx950.elf, one raw segment per FFN/KDA side; MLA sides native). AITER pair per side 9.6/10.2/10.8/14.4 us
@@ -785,7 +797,7 @@ The packet from config + index alone (no weights) is 70 MB: 4 prefill buckets + 
 
 Strict `campaign.py report` output per input length and the combined comparison.csv:
 [docs/bringup/results/glm53flash-mi350x-2026-10-12](../bringup/results/glm53flash-mi350x-2026-10-12/summary.md).
-No qualified win: plow total throughput 0.47-0.76x vLLM (v17; v16c 0.44-0.75x, v15b 0.37-0.66x, v15a 0.36-0.66x, v13 0.34-0.61x, v11 0.28-0.61x).
+No qualified win: plow total throughput 0.54-0.82x vLLM (v18; v17 0.47-0.76x, v16c 0.44-0.75x, v15b 0.37-0.66x, v15a 0.36-0.66x, v13 0.34-0.61x, v11 0.28-0.61x).
 
 ## 6. Roofline (CPU, before any plow GPU time)
 
