@@ -671,12 +671,20 @@ impl GpuEngine {
         let row_bytes = u64::from(g.hd_full * g.elem);
         let bytes = u64::from(partial) * row_bytes;
         let row0 = u64::from(rows - partial);
-        let pitch = u64::from(g.max_ctx) * row_bytes;
+        // One copy per head: the heads' rows live in separately mapped VMM blocks, and a pitched
+        // copy spanning the unmapped VA between them is rejected (CUDA_ERROR_INVALID_VALUE).
         for &(index, _, _) in &v.tensor_tracks {
-            let dev = self.devp[index].base
-                + (b as u64 * u64::from(g.kvh_full) * u64::from(g.max_ctx) + row0) * row_bytes;
-            self.vmm_copy_heads((dev, pitch), (buf, bytes), bytes, g.kvh_full, to_snap)?;
-            buf += u64::from(g.kvh_full) * bytes;
+            for h in 0..u64::from(g.kvh_full) {
+                let dev = self.devp[index].base
+                    + ((b as u64 * u64::from(g.kvh_full) + h) * u64::from(g.max_ctx) + row0)
+                        * row_bytes;
+                if to_snap {
+                    self.be.memcpy_dtod_async(buf, dev, bytes, &self.stream)?;
+                } else {
+                    self.be.memcpy_dtod_async(dev, buf, bytes, &self.stream)?;
+                }
+                buf += bytes;
+            }
         }
         Ok(())
     }
