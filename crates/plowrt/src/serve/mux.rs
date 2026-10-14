@@ -3407,6 +3407,9 @@ fn run_one_tick(
                     let mut completed = std::mem::take(&mut obs.host.prefill_tokens);
                     completed.clear();
                     let mut dev_sampled = false;
+                    if obs.host.ride.needs_ladder() {
+                        obs.host.ride.set_ladder(&e.pf_bucket_ladder());
+                    }
                     if obs.host.ride.needs_widths() {
                         let widths: Vec<usize> = e
                             .effective_decode_rungs()
@@ -5786,6 +5789,11 @@ fn arrival_key(arrived: Instant, now: Instant) -> u64 {
     u64::MAX - u64::try_from(now.saturating_duration_since(arrived).as_nanos()).unwrap_or(u64::MAX)
 }
 
+#[cfg(feature = "cuda")]
+fn pf_itl_budget_ms() -> u32 {
+    crate::config::RuntimeConfig::get().pf_itl_budget_ms
+}
+
 /// RTX-12 chunked packing: per-REQUEST cap on the prefill rows one request may
 /// contribute to a single batched launch. `PLOW_PF_CHUNK=C` clamps each waiting
 /// request's slice to `C` rows so the `per_launch` budget (`PLOW_PF_INTERLEAVE`)
@@ -5989,8 +5997,34 @@ fn gpu_prefill_batched_pass(
         // `RideCost` keys both the decision and the launch it observes by the prefill bucket:
         // keyed by the launch's own bucket, a riding launch that spills (4096 + 63 into 4160)
         // records under a bucket the decision never asks about, and the rider cost is never learned.
+        // ITL budget (`PLOW_PF_ITL_BUDGET_MS`): with decode rows riding, the launch takes the
+        // widest rung whose measured launch time fits the budget, so a rider's wait is bounded
+        // and a long prompt runs as several launches. Riders always ride under a budget: a
+        // separate decode step after the launch would add a step to their wait. A launch with
+        // an indivisible media span runs unbudgeted (a span cannot be cut to a rung).
+        let budget_on = decode_rows > 0 && pf_itl_budget_ms() > 0;
+        let itl_cap = if budget_on
+            && !candidates.iter().any(|c| {
+                slots[c.span.slot as usize]
+                    .as_ref()
+                    .is_some_and(|s| s.mm.as_deref().is_some_and(|j| j.spans()))
+            }) {
+            ride.rows_within(f64::from(pf_itl_budget_ms()))
+        } else {
+            None
+        };
+        // The rung holds the riders too: their rows are reserved inside it. The prompt keeps at
+        // least half the rung, so many riders widen the rung instead of starving the prompt.
+        let itl_cap = itl_cap.map(|cap| cap.max(e.pf_pack_budget(decode_rows * 2)));
+        let (launch_cap, launch_max) = match itl_cap {
+            Some(cap) => (
+                launch_cap.min(cap.saturating_sub(decode_rows).max(1)),
+                launch_max.min(cap),
+            ),
+            None => (launch_cap, launch_max),
+        };
         let ride_key = e.pf_pack_budget(avail.min(launch_cap));
-        if std::mem::take(&mut ride_open) && !ride.ride(ride_key, feeds.len()) {
+        if std::mem::take(&mut ride_open) && !budget_on && !ride.ride(ride_key, feeds.len()) {
             unified = false;
             decode_rows = 0;
         }
@@ -6071,11 +6105,12 @@ fn gpu_prefill_batched_pass(
         }
         if let Some(t) = host_t {
             eprintln!(
-                "PACKLOG PACK reqs={} rows={} decode_feeds={} unified={} admit_plan_us={:.0}",
+                "PACKLOG PACK reqs={} rows={} decode_feeds={} unified={} itl_cap={} admit_plan_us={:.0}",
                 pack.len(),
                 pack.iter().map(|p| p.2).sum::<usize>(),
                 feeds.len(),
                 unified,
+                itl_cap.unwrap_or(0),
                 t.elapsed().as_secs_f64() * 1e6
             );
         }
@@ -6181,7 +6216,13 @@ fn gpu_prefill_batched_pass(
                 })
         };
         if res.is_ok() {
-            ride.observe_launch(ride_key, riders, t_launch.elapsed().as_secs_f64() * 1e3);
+            let ms = t_launch.elapsed().as_secs_f64() * 1e3;
+            ride.observe_launch(ride_key, riders, ms);
+            // The rung actually launched: the smallest bucket holding the packed rows and riders.
+            ride.observe_rung(
+                e.pf_pack_budget(pack.iter().map(|p| p.2).sum::<usize>() + riders),
+                ms,
+            );
         }
         match res {
             Ok(()) => {

@@ -9009,6 +9009,11 @@ impl GpuEngine {
         self.prefill[self.pick_prefill_bucket(avail, usize::MAX)].t as usize
     }
 
+    /// The prefill bucket ladder, ascending rows.
+    pub fn pf_bucket_ladder(&self) -> Vec<usize> {
+        self.prefill.iter().map(|b| b.t as usize).collect()
+    }
+
     /// Rows to slice off a request with `rem` prefill rows still unsent, under per-launch
     /// `cap`. Plans the WHOLE remainder, so the slice lands on a rung that fills exactly
     /// instead of leaving a stranded tail: 8192 rows under a 4224 cap runs [4096, 4096]

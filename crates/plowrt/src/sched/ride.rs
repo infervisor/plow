@@ -33,6 +33,8 @@ struct Bucket {
     /// per-row cost, weighted by rows so a one-row launch's jitter does not set it).
     extra: Ewma,
     riders: Ewma,
+    /// Launch ms with or without decode rows: what a riding row waits for.
+    total: Ewma,
     since_explore: u32,
 }
 
@@ -43,6 +45,8 @@ pub struct RideCost {
     /// Standalone decode step ms, keyed by the covering width in `widths`.
     steps: Vec<(usize, Ewma)>,
     widths: Vec<usize>,
+    /// The engine's prefill rungs, ascending (for [`RideCost::rows_within`]).
+    ladder: Vec<usize>,
 }
 
 impl RideCost {
@@ -56,6 +60,16 @@ impl RideCost {
 
     pub fn needs_widths(&self) -> bool {
         self.widths.is_empty()
+    }
+
+    pub fn set_ladder(&mut self, ladder: &[usize]) {
+        if self.ladder != ladder {
+            self.ladder = ladder.to_vec();
+        }
+    }
+
+    pub fn needs_ladder(&self) -> bool {
+        self.ladder.is_empty()
     }
 
     fn bucket(&mut self, rows: usize) -> &mut Bucket {
@@ -90,11 +104,47 @@ impl RideCost {
         }
     }
 
+    /// One launch of the rung actually launched (`bucket` rows, riders included), `ms` long.
+    pub fn observe_rung(&mut self, bucket: usize, ms: f64) {
+        self.bucket(bucket).total.add(ms);
+    }
+
     /// One standalone decode step over `rows` rows, `ms` per step.
     pub fn observe_step(&mut self, rows: usize, ms: f64) {
         if let Some(i) = self.widths.iter().position(|&w| w >= rows) {
             self.steps[i].1.add(ms);
         }
+    }
+
+    /// The widest rung of the ladder a riding row can wait for under `budget_ms`: the widest
+    /// measured rung within the budget, or the rung right above it while that one is unmeasured
+    /// (its first launch measures it). `None` until a rung has been measured.
+    pub fn rows_within(&self, budget_ms: f64) -> Option<usize> {
+        let ms = |rows: usize| {
+            self.buckets
+                .iter()
+                .find(|b| b.rows == rows)
+                .and_then(|b| b.total.0)
+        };
+        let mut cap = None;
+        let mut any = false;
+        for (i, &rows) in self.ladder.iter().enumerate() {
+            if let Some(m) = ms(rows) {
+                any = true;
+                if m <= budget_ms {
+                    cap = Some(i);
+                }
+            }
+        }
+        if !any {
+            return None;
+        }
+        let next = cap.map_or(0, |i| i + 1);
+        let explore = self
+            .ladder
+            .get(next)
+            .is_some_and(|&rows| ms(rows).is_none());
+        Some(self.ladder[if explore { next } else { cap.unwrap_or(0) }])
     }
 
     /// Whether `decode_rows` rows should ride the next launch of `bucket` rows.
@@ -152,6 +202,39 @@ mod tests {
             arms.iter().filter(|&&r| !r).count(),
             1,
             "one explored non-ride per window"
+        );
+    }
+
+    #[test]
+    fn the_itl_budget_takes_the_widest_measured_rung_and_explores_one_above() {
+        let mut c = RideCost::default();
+        c.set_ladder(&[128, 512, 1024, 1088, 2048, 4096, 8192]);
+        assert_eq!(c.rows_within(60.0), None, "nothing measured yet");
+        c.observe_rung(512, 35.0);
+        assert_eq!(c.rows_within(60.0), Some(1024), "1024 unmeasured: try it");
+        c.observe_rung(1024, 50.0);
+        assert_eq!(c.rows_within(60.0), Some(1088), "1088 unmeasured: try it");
+        c.observe_rung(1088, 80.0);
+        assert_eq!(c.rows_within(60.0), Some(1024), "1088 over budget");
+        assert_eq!(
+            c.rows_within(90.0),
+            Some(2048),
+            "2048 unmeasured above 1088"
+        );
+        c.observe_rung(2048, 64.0);
+        assert_eq!(c.rows_within(60.0), Some(1024));
+        assert_eq!(
+            c.rows_within(70.0),
+            Some(4096),
+            "2048 fits 70 ms; the over-budget 1088 below it does not block exploring upward"
+        );
+        c.observe_rung(4096, 115.0);
+        c.observe_rung(8192, 220.0);
+        assert_eq!(c.rows_within(70.0), Some(2048));
+        assert_eq!(
+            c.rows_within(10.0),
+            Some(128),
+            "nothing fits: the narrowest rung"
         );
     }
 
