@@ -6001,9 +6001,9 @@ fn gpu_prefill_batched_pass(
         } else {
             None
         };
-        // The rung holds the riders too: their rows are reserved inside it. A rung the riders
-        // would half fill leaves the prompt crawling; such a budget is ignored.
-        let itl_cap = itl_cap.filter(|&cap| decode_rows * 2 <= cap);
+        // The rung holds the riders too: their rows are reserved inside it. The prompt keeps at
+        // least half the rung, so many riders widen the rung instead of starving the prompt.
+        let itl_cap = itl_cap.map(|cap| cap.max(e.pf_pack_budget(decode_rows * 2)));
         let (launch_cap, launch_max) = match itl_cap {
             Some(cap) => (
                 launch_cap.min(cap.saturating_sub(decode_rows).max(1)),
