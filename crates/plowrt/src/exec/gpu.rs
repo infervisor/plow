@@ -7179,6 +7179,9 @@ impl GpuEngine {
                 }
             }
         }
+        if let Some(v) = vmm.as_ref() {
+            prefix::trace_init(v);
+        }
         let kv_admission = be.mem_info().ok().and_then(|(free, total)| {
             let (per_token, block_rows, request_bytes) =
                 kv_row_charge(vmm.as_ref(), &blob, max_ctx, batch)?;
@@ -7873,6 +7876,7 @@ impl GpuEngine {
         // cache references. Prefix admission maps after lookup; every execution
         // path maps the rows it writes, including inactive decode rows.
         self.vmm_publish(b, self.pos[b]);
+        self.trace_finish(b);
         let t_publish = t0.map(|t| t.elapsed());
         self.pos[b] = keep;
         self.vmm_attached[b] = 0;
@@ -8015,6 +8019,7 @@ impl GpuEngine {
         if cache_output {
             self.vmm_publish(b, self.pos[b]);
         }
+        self.trace_finish(b);
         self.pos[b] = 0;
         self.vmm_attached[b] = 0;
         // A retired row decodes as an idle lane from position 0: a stale learned-position base
