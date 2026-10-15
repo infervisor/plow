@@ -21,3 +21,30 @@ fn recipe_moe_routes_are_the_packet_defaults() {
     assert_eq!(decode_min.is_some(), prefill);
     assert!(decode_min.is_none_or(|rows| rows == 4));
 }
+
+/// `PLOW_TEST_BLOB=<model.pkt>`: every prefill program's declared segment roles pass the load-time
+/// validator, and each `MOE_PREFILL_CUBLASLT` segment is one the route takes (CPU only; the check
+/// `load_prefill` runs before any launch). Prints the router-prologue segment count.
+#[test]
+#[ignore = "set PLOW_TEST_BLOB"]
+fn packet_moe_prefill_segments_load() {
+    let path = std::env::var("PLOW_TEST_BLOB").unwrap();
+    let raw = std::fs::read(&path).unwrap();
+    let blob = DevBlob::parse(&raw).unwrap();
+    let roles = segment_role_metadata(&blob, &raw)
+        .unwrap()
+        .expect("segment roles");
+    let (mut routed, mut prologues) = (0, 0);
+    for (index, g) in blob.prefill_progs().iter().enumerate() {
+        let Some(program) = roles.program(index) else {
+            continue;
+        };
+        let selected =
+            packet_role_segments_with(g, &program.roles, &blob.tensors, &roles.objects).unwrap();
+        let segments = moe_lt::segments(g, &blob.tensors, &selected).unwrap();
+        routed += segments.iter().flatten().count();
+        prologues += moe_lt::prologue_count(&segments);
+    }
+    eprintln!("{path}: {routed} MoE prefill segments routed, {prologues} with the router prologue");
+    assert!(routed > 0);
+}

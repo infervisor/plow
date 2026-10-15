@@ -19,6 +19,19 @@ fn pf_packlog_on() -> bool {
 /// Fixed cost of ONE prefill launch, in padded-row equivalents (measured on sm_120 / gemma-4-12B).
 pub(crate) const PF_CHUNK_COST_ROWS: usize = 512;
 
+/// The smallest rung of an ascending `ladder` holding `rows`; the widest when none does (0 when
+/// the ladder is empty).
+pub(crate) fn cover_rung(ladder: impl Iterator<Item = usize>, rows: usize) -> usize {
+    let mut widest = 0;
+    for t in ladder {
+        if t >= rows {
+            return t;
+        }
+        widest = t;
+    }
+    widest
+}
+
 use crate::asset::devblob::{DevBlob, DevProg};
 use crate::device::cuda::{CudaBackend, CudaEvent, CudaStream, KernelFn, PinnedHost};
 use crate::device::{Backend, DeviceMem, Module};
@@ -1680,7 +1693,8 @@ fn packet_role_segments_with(
                     | plow_asset::segment_roles::MOE_DECODE_CUBLASLT
             ) {
                 // A library segment of two complete instructions (grouped GLU + DOWN), on
-                // prefill three (+ the combine) or four (W8A8: + the fu quant), on decode four
+                // prefill three (+ the combine), four (W8A8: + the fu quant) or eight (W8A8 with
+                // the router prologue: + RmsNorm, router, align, activation quant), on decode four
                 // (+ the combine/NRN layer tail);
                 // the route itself (`moe_lt::segments`, `moe_lt::decode_segments`) checks them
                 // when switched on.
@@ -1702,12 +1716,12 @@ fn packet_role_segments_with(
                 let tails: &[usize] = if role == plow_asset::segment_roles::MOE_DECODE_CUBLASLT {
                     &[4]
                 } else {
-                    &[3, 4]
+                    &[3, 4, 8]
                 };
                 if !(pcs.len() == 2 || tails.contains(&pcs.len())) || !complete {
                     return Err(RuntimeError::Rejected(
-                        "MoE cuBLASLt segment requires two (prefill: or three or four, decode: or \
-                         four) complete instructions"
+                        "MoE cuBLASLt segment requires two (prefill: or three, four or eight, \
+                         decode: or four) complete instructions"
                             .into(),
                     ));
                 }
@@ -1948,8 +1962,10 @@ struct SegPf {
     f_flash: KernelFn,
     glu_quant_cached: Option<KernelFn>,
     glu_quant_cached_q: Option<KernelFn>,
+    glu_quant_any_width: bool,
     quant_cached: Option<KernelFn>,
     norm_rms_pf: Option<KernelFn>,
+    rope_pf: Option<KernelFn>,
     smem_flash: u32,
     grid_flash: u32,
     f_gemm: KernelFn,
@@ -2684,8 +2700,6 @@ pub struct GpuEngine {
     /// retained prefix of `rows` is intact only while the sequence stopped within this many rows
     /// past it (the VMM prefix cache's `publish_boundary` rule). None: no sliding cache.
     resume_ring_slack: Option<u32>,
-    /// A session sequence's retire pins its published prefix in the VMM cache for this long.
-    session_pin: Vec<Option<std::time::Duration>>,
     vmm_active: Vec<bool>,
     packed_admission: Vec<PackedAdmission>,
     kv_admission_epoch: u64,
@@ -2699,6 +2713,14 @@ pub struct GpuEngine {
     seq_tokens: Vec<Vec<u32>>,
     /// A prompt's prefix-cache key staged for the next attach of that slot (DP router hashes).
     staged_prefix: Vec<Option<crate::memory::vmm::PrefixKey>>,
+    /// A launch's host window is open ([`Self::token_batch_step_window`]): snapshot restores skip
+    /// their stream drain and their holds wait in `deferred_attach` for the step's own drain.
+    window_open: bool,
+    deferred_attach: Vec<usize>,
+    /// Recorded after a windowed launch's id read-back: [`Self::launch_in_flight`].
+    window_event: Option<CudaEvent>,
+    /// `PLOW_PF_PACKLOG` device span of a token-batch launch.
+    step_events: Option<(CudaEvent, CudaEvent)>,
     /// Stop-token set (the checkpoint's `eos_token_id`). `Arc` so the mux can
     /// take a per-tick handle without cloning the Vec while the engine stays
     /// mutably borrowed.
@@ -7276,13 +7298,16 @@ impl GpuEngine {
             resume_rows: vec![0; batch],
             rewind_snapshots: (0..batch).map(|_| None).collect(),
             resume_ring_slack,
-            session_pin: vec![None; batch],
             vmm_active: vec![false; batch],
             packed_admission: vec![PackedAdmission::Pending; batch],
             kv_admission_epoch: 0,
             kv_pressure_events: 0,
             seq_tokens: vec![Vec::new(); batch],
             staged_prefix: vec![None; batch],
+            window_open: false,
+            deferred_attach: Vec::new(),
+            window_event: None,
+            step_events: None,
             stop_ids: std::sync::Arc::new(stop_ids),
             logits_raw: Vec::new(),
             stage,
@@ -7837,19 +7862,19 @@ impl GpuEngine {
                 )?;
             }
         }
+        let t0 = pf_packlog_on().then(std::time::Instant::now);
         if let Some(rings) = self.vmm.as_mut().and_then(|v| v.rings.as_mut()) {
             rings.ensure_slot(b)?;
         }
+        let t_ring = t0.map(|t| t.elapsed());
         // VMM: publish the finished sequence's generated whole blocks first —
         // a follow-up turn embedding this turn's output then attaches instead
         // of re-prefilling it — then drop the previous sequence's mappings/
         // cache references. Prefix admission maps after lookup; every execution
         // path maps the rows it writes, including inactive decode rows.
-        if crate::config::RuntimeConfig::get().prefix_cache_output() {
-            self.vmm_publish(b, self.pos[b]);
-        }
+        self.vmm_publish(b, self.pos[b]);
+        let t_publish = t0.map(|t| t.elapsed());
         self.pos[b] = keep;
-        self.session_pin[b] = None;
         self.vmm_attached[b] = 0;
         if let Some(v) = &self.vmm {
             self.vmm_active[b] = true;
@@ -7859,6 +7884,14 @@ impl GpuEngine {
             if v.prefix_kv().is_none() {
                 v.ensure_rows(b, 1)?;
             }
+        }
+        if let (Some(t0), Some(ring), Some(publish)) = (t0, t_ring, t_publish) {
+            eprintln!(
+                "PACKLOG BEGIN slot={b} ring_us={} publish_us={} seq_us={}",
+                ring.as_micros(),
+                (publish - ring).as_micros(),
+                (t0.elapsed() - publish).as_micros()
+            );
         }
         Ok(())
     }
@@ -7950,12 +7983,15 @@ impl GpuEngine {
         }
     }
 
-    /// Slot `b`'s current sequence belongs to a session: when it retires, its published prefix
-    /// (prompt and, with `PLOW_PREFIX_CACHE_OUTPUT`, output blocks) is pinned for `ttl` in the VMM
-    /// prefix cache, evicted only after every unpinned block.
-    pub fn hold_session_prefix(&mut self, b: usize, ttl: std::time::Duration) {
+    /// Slot `b`'s current sequence belongs to a session (`X-Session-Id`): the VMM prefix cache
+    /// protects its newest boundary for `PLOW_PREFIX_SESSION_TTL_S` (0 = none). `_ttl` is the
+    /// static-slot retention TTL, which the VMM path does not use.
+    pub fn hold_session_prefix(&mut self, b: usize, _ttl: std::time::Duration) {
         if self.vmm_prefix_enabled() && b < self.batch {
-            self.session_pin[b] = Some(ttl);
+            if let Some(kv) = self.vmm.as_ref().and_then(|v| v.kv.as_ref()) {
+                let ttl = crate::config::RuntimeConfig::get().prefix_session_ttl();
+                kv.hold_session(b, ttl);
+            }
         }
     }
 
@@ -7975,14 +8011,9 @@ impl GpuEngine {
             }
             return;
         }
-        if cache_output && crate::config::RuntimeConfig::get().prefix_cache_output() {
+        // The turn-end pass: restores or touches the prompt end (the next turn's attach point).
+        if cache_output {
             self.vmm_publish(b, self.pos[b]);
-        }
-        if let (Some(ttl), Some(kv)) = (
-            self.session_pin[b].take(),
-            self.vmm.as_ref().and_then(|v| v.kv.as_ref()),
-        ) {
-            kv.pin_prefix(&self.seq_tokens[b], std::time::Instant::now() + ttl);
         }
         self.pos[b] = 0;
         self.vmm_attached[b] = 0;
@@ -7998,11 +8029,13 @@ impl GpuEngine {
                 tracing::warn!(slot = b, error = %e, "retire: pos_base reset failed");
             }
         }
-        // Decode's backstop maps row zero before any inactive-row write.
-        self.vmm.as_ref().unwrap().begin_seq(b);
+        // The live ring goes back first: `begin_seq`'s pressure trim then sees that memory free
+        // instead of evicting cached boundaries for it.
         if let Some(rings) = self.vmm.as_mut().and_then(|v| v.rings.as_mut()) {
             rings.release_slot(b);
         }
+        // Decode's backstop maps row zero before any inactive-row write.
+        self.vmm.as_ref().unwrap().begin_seq(b);
         self.seq_tokens[b].clear();
         self.vmm_active[b] = false;
     }
@@ -8011,6 +8044,13 @@ impl GpuEngine {
         self.staged_prefix[b] = None;
         if self.packed_admission[b] == PackedAdmission::Ready {
             self.kv_admission_epoch = self.kv_admission_epoch.wrapping_add(1);
+        }
+        // A wait on an in-flight prefix that ends here (cancelled before admission) drops its
+        // reservation; an admitted one is replaced by its attach.
+        if self.packed_admission[b] != PackedAdmission::Pending {
+            if let Some(kv) = self.vmm.as_ref().and_then(|v| v.kv.as_ref()) {
+                kv.clear_await(b);
+            }
         }
         self.packed_admission[b] = PackedAdmission::Pending;
     }
@@ -8111,15 +8151,33 @@ impl GpuEngine {
                 Ok(Some(frontier))
             }
             Err(error) => {
+                // A restore deferred inside a launch window may still be copying into this slot:
+                // drain it (and release its hold) before the slot's mappings go.
+                if self.deferred_attach.contains(&b) {
+                    if let Err(drain) = self.flush_deferred_attach() {
+                        return Err(drain);
+                    }
+                }
                 self.retire_slot(b, false);
                 let oom = matches!(error, RuntimeError::Oom(_)) || error.device_code() == Some(2);
+                // Parked live rings (`PLOW_VMM_RING_PARK`) hold device memory no request owns; when
+                // releasing them freed memory, the request waits and retries even with no other
+                // request live.
+                let mut reclaimed = false;
+                if oom {
+                    if let Some(rings) = self.vmm.as_mut().and_then(|v| v.rings.as_mut()) {
+                        reclaimed = rings.release_parked();
+                    }
+                }
                 // Slot-granular KV waits even with no other request live: memory comes back
                 // from other models (retired slots, evictions), not only from this one.
                 let slot_kv = self.vmm.as_ref().is_some_and(|v| v.kv.is_none());
                 if (self.vmm_prefix_enabled() || slot_kv)
                     && oom
                     && !error.is_fatal()
-                    && (slot_kv || self.packed_admission.contains(&PackedAdmission::Ready))
+                    && (slot_kv
+                        || reclaimed
+                        || self.packed_admission.contains(&PackedAdmission::Ready))
                 {
                     self.vmm.as_ref().unwrap().ensure_rows(b, 1)?;
                     self.kv_pressure_events += 1;
@@ -9713,15 +9771,16 @@ impl GpuEngine {
         self.prefill[self.pick_prefill_bucket(avail, usize::MAX)].t as usize
     }
 
-    /// Rows of the smallest bucket holding `rows` in ONE launch: what the unified token batch
-    /// takes (`CudaTokenBatch::load`). Not the pack budget, whose cost-aware plan splits instead
-    /// (1040 rows: `[1024, 128]`, so it reports no spill where the batch runs 4096). `None`
-    /// when no bucket holds the rows.
-    pub fn pf_launch_bucket(&self, rows: usize) -> Option<usize> {
-        self.prefill
-            .iter()
-            .map(|b| b.t as usize)
-            .find(|&t| t >= rows)
+    /// The rung a launch of `rows` rows runs: the smallest bucket holding them (the token batch's
+    /// pick), the widest when none does. Not [`Self::pf_pack_budget`], which is the first launch of
+    /// the cheapest cover and can be narrower than `rows` (4260 rows: 4160, then a tail).
+    pub fn pf_cover_rows(&self, rows: usize) -> usize {
+        cover_rung(self.prefill.iter().map(|b| b.t as usize), rows)
+    }
+
+    /// The prefill bucket ladder, ascending rows.
+    pub fn pf_bucket_ladder(&self) -> Vec<usize> {
+        self.prefill.iter().map(|b| b.t as usize).collect()
     }
 
     /// Rows to slice off a request with `rem` prefill rows still unsent, under per-launch
@@ -10109,11 +10168,11 @@ impl GpuEngine {
                 let masked = plow_asset::packed_prefill::MASKED_PADDING_CAPABILITY;
                 let masked_padding = be.module_global_u32(&m1, masked)? == Some(1)
                     && be.module_global_u32(&m2, masked)? == Some(1);
-                let glu_quant_cached = if be.module_global_u32(
+                let glu_quant_abi = be.module_global_u32(
                     &m1,
                     &format!("plow_glu_quant_cache_abi{seg_global_suffix}"),
-                )? == Some(1)
-                {
+                )?;
+                let glu_quant_cached = if matches!(glu_quant_abi, Some(1 | 2)) {
                     Some(
                         be.get_function(&m1, &format!("plow_glu_quant_cached{seg_global_suffix}"))?,
                     )
@@ -10124,7 +10183,7 @@ impl GpuEngine {
                     && be.module_global_u32(
                         &m1,
                         &format!("plow_glu_quant_cache_q_abi{seg_global_suffix}"),
-                    )? == Some(1)
+                    )? == glu_quant_abi
                 {
                     Some(be.get_function(
                         &m1,
@@ -10149,11 +10208,21 @@ impl GpuEngine {
                 } else {
                     None
                 };
+                let rope_pf = if be
+                    .module_global_u32(&m1, &format!("plow_rope_pf_abi{seg_global_suffix}"))?
+                    == Some(1)
+                {
+                    Some(be.get_function(&m1, &format!("plow_rope_pf{seg_global_suffix}"))?)
+                } else {
+                    None
+                };
                 let mut sp = SegPf {
                     glu_quant_cached,
                     glu_quant_cached_q,
+                    glu_quant_any_width: glu_quant_abi == Some(2),
                     quant_cached,
                     norm_rms_pf,
+                    rope_pf,
                     masked_padding,
                     f_flash: f1,
                     smem_flash: s1,
@@ -10508,10 +10577,13 @@ impl GpuEngine {
             let cached_quant_function = seg_pf.as_ref().and_then(|sp| sp.glu_quant_cached);
             let cached_quant_segments =
                 if cached_quant_function.is_some() && seg_mode && qwen_segments.is_empty() {
-                    cublaslt::prefill_glu_quant_segments(g)
-                        .into_iter()
-                        .filter(|(seg, _)| packet_role_index(&packet_segment_roles, *seg).is_none())
-                        .collect::<Vec<_>>()
+                    cublaslt::prefill_glu_quant_segments(
+                        g,
+                        seg_pf.as_ref().is_some_and(|sp| sp.glu_quant_any_width),
+                    )
+                    .into_iter()
+                    .filter(|(seg, _)| packet_role_index(&packet_segment_roles, *seg).is_none())
+                    .collect::<Vec<_>>()
                 } else {
                     Vec::new()
                 };
@@ -10566,6 +10638,15 @@ impl GpuEngine {
                 }
                 None => Vec::new(),
             };
+            let rope_function = seg_pf.as_ref().and_then(|sp| sp.rope_pf);
+            let rope_segments = if rope_function.is_some() && seg_mode && qwen_segments.is_empty() {
+                cublaslt::prefill_rope_segments(g)
+                    .into_iter()
+                    .filter(|(seg, _)| packet_role_index(&packet_segment_roles, *seg).is_none())
+                    .collect::<Vec<_>>()
+            } else {
+                Vec::new()
+            };
             let light_instructions: Vec<(usize, usize)> = light_segments
                 .iter()
                 .chain(&qwen_light)
@@ -10575,6 +10656,7 @@ impl GpuEngine {
                         .iter()
                         .chain(&plain_quant_segments)
                         .chain(&norm_rms_segments)
+                        .chain(&rope_segments)
                         .flat_map(|(seg, insts)| insts.iter().map(move |&i| (*seg, i))),
                 )
                 .chain(moe_instructions.iter().copied())
@@ -10583,6 +10665,7 @@ impl GpuEngine {
                 && cached_quant_segments.is_empty()
                 && plain_quant_segments.is_empty()
                 && norm_rms_segments.is_empty()
+                && rope_segments.is_empty()
                 && moe_instructions.is_empty()
                 && qwen_light.is_empty()
                 && attention_gemm_segments.iter().all(Option::is_none)
@@ -10895,6 +10978,23 @@ impl GpuEngine {
                         bucket = g.t,
                         segments = norm_rms_segments.len(),
                         "prefill NormResidual+RmsNorm routes"
+                    );
+                }
+            }
+            if let Some(function) = rope_function {
+                for (seg, insts) in &rope_segments {
+                    if light_routes.len() <= *seg {
+                        light_routes.resize_with(seg + 1, || None);
+                    }
+                    light_routes[*seg] = Some(cublaslt::prefill_rope_route(
+                        be, function, kernarg, g, insts,
+                    ));
+                }
+                if !rope_segments.is_empty() {
+                    tracing::info!(
+                        bucket = g.t,
+                        segments = rope_segments.len(),
+                        "prefill HeadNormRope routes"
                     );
                 }
             }

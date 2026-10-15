@@ -6807,7 +6807,15 @@ fn emit_phase(
                     d.i[1] = c.hidden;
                     d.f[0] = c.eps;
                 });
-                let c_xn2 = b.emit(DevOp::RmsNorm, rows.clone(), &[c_pf], |d| {
+                // PLOW_EMIT_MOE_PF_LT_ROUTE: order the expert-input norm and the router after
+                // the dense branch's post-norm, so they sit next to the grouped GEMMs in the queue
+                // and `dense_cublaslt::apply_moe_prefill` can put them in the library segment.
+                let route_deps = if w8a8 && emit_config::active().moe_pf_lt_route {
+                    vec![c_pf, c_h1]
+                } else {
+                    vec![c_pf]
+                };
+                let c_xn2 = b.emit(DevOp::RmsNorm, rows.clone(), &route_deps, |d| {
                     d.t[0] = n.moe_xn2;
                     d.t[1] = n.x;
                     d.t[2] = w.g_pre2;
@@ -6816,7 +6824,7 @@ fn emit_phase(
                     d.f[0] = c.eps;
                 });
                 // T-token router -> routing_table[T*k] (block-per-token, bit-identical to decode).
-                let c_rt = b.emit(DevOp::MoeRouterGemmaPf, all.clone(), &[c_pf], |d| {
+                let c_rt = b.emit(DevOp::MoeRouterGemmaPf, all.clone(), &route_deps, |d| {
                     d.t[0] = n.moe_tab;
                     d.t[1] = n.x;
                     d.t[2] = w.rproj;
@@ -7897,6 +7905,16 @@ pub(crate) fn apply_verify_gate(
     m: &packet::devbuild::Model,
     verify: Option<&VerifyHook>,
 ) -> LeanReport {
+    let stray = emit_config::rung::unconsumed();
+    assert!(
+        stray.is_empty(),
+        "PLOW_EMIT_RUNG_ENV overrides {stray:?} match no rung this emit lowered (buckets {:?}); \
+         a typo'd width, or a model family that does not lower per rung",
+        m.prog_t
+            .iter()
+            .map(|&t| packet::devbuild::program_rows(t))
+            .collect::<Vec<_>>()
+    );
     knob_spec::gate();
     match verify {
         Some(v) => match v(m) {
@@ -10279,7 +10297,9 @@ fn emit_dense_gqa(
         }
         let split = hetero::RowSplit::from_env();
         emitter.hetero_on.set(split.is_some());
-        emitter.emit_prefill(&mut b, t);
+        emit_config::rung::with_rung(emit_config::rung::Rung::prefill(t), || {
+            emitter.emit_prefill(&mut b, t)
+        });
         emitter.hetero_on.set(false);
         let spans = std::mem::take(&mut *emitter.channel.borrow_mut());
         if !spans.is_empty() {
@@ -10363,7 +10383,9 @@ fn emit_dense_gqa(
         } else {
             &mut scratch
         };
-        emitter.emit_decode(&mut bd, rb, dmode, sink);
+        emit_config::rung::with_rung(emit_config::rung::Rung::decode(rb), || {
+            emitter.emit_decode(&mut bd, rb, dmode, sink)
+        });
         shared_tail_marks.push(bd.shared_tail_mark());
         progs.push(bd.finish());
         tlist.push(rb);

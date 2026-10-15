@@ -63,11 +63,12 @@ const PUBLISH_SHARED_QUALIFIED: Status = Status::Qualified {
         "docs/flags-reference.md: `=0` is the rollback",
     ],
 };
-const CACHE_OUTPUT_QUALIFIED: Status = Status::Qualified {
+/// Default-on with `X-Session-Id` only; production sends no header. Not qualified: the one
+/// session-header A/B lost to the legacy session pin.
+const SESSION_TTL_CANDIDATE: Status = Status::Candidate {
     evidence: &[
-        "agent/prefix-cache v1: a 7230-token follow-up turn 404 -> 32 ms TTFT",
-        "agent/prefix-cache v2, 12B H100 prefix-repetition, =0 vs default: C4 144.4/144.7, C16 258.4/259.4 ms TTFT, hits equal (neutral on single-turn)",
-        "docs/flags-reference.md: `=0` is the rollback",
+        "Gemma-4 26B FP8 H100, session header on (1.1 sess/s, think 45 s): tree + TTL 150 s vs production legacy pin 60 s: cached 56.1% vs 61.1%, TTFT p50/p99 144/1435 vs 128/961 ms, continuation hits 73.7% vs 70.2% (/opt/dlami/nvme/lava-tts/g26-revamp/lab/sess/summary.tsv)",
+        "no effect without `X-Session-Id`; `=0` gives sessions no special retention",
     ],
 };
 const INFLIGHT_WAIT_QUALIFIED: Status = Status::Qualified {
@@ -561,6 +562,7 @@ pub const RUNTIME: &[KnobSpec] = &[
     KnobSpec::new("rt.encode_split_min", Some("PLOW_ENCODE_SPLIT_MIN"), Layer::Runtime, U32, UNSET, ONE_WORD_ENCODE_QUALIFIED),
     KnobSpec::new("rt.vmm_cache_memory_utilization", Some("PLOW_VMM_CACHE_MEMORY_UTILIZATION"), Layer::Runtime, Domain::Str, Default::Static(Val::Str("0")), OPT_IN),
     KnobSpec::new("rt.vmm_cache_min_free_mib", Some("PLOW_VMM_CACHE_MIN_FREE_MIB"), Layer::Runtime, U32, UNSET, PRESSURE_EVICTION_DEFAULT),
+    KnobSpec::new("rt.vmm_host_cache_mib", Some("PLOW_VMM_HOST_CACHE_MIB"), Layer::Runtime, USIZE, Default::Static(Val::Nat(0)), OPT_IN),
     KnobSpec::new("rt.kv_admit_headroom", Some("PLOW_KV_ADMIT_HEADROOM"), Layer::Runtime, Domain::Str, Default::Static(Val::Str("0.9")), KV_ADMIT_DEFAULT),
     KnobSpec::new("rt.kv_mem_util", Some("PLOW_KV_MEM_UTIL"), Layer::Runtime, Domain::Str, Default::Static(Val::Str("0")), OPT_IN),
     KnobSpec::new("rt.amd_prefix_fine_rows", Some("PLOW_AMD_PREFIX_FINE_ROWS"), Layer::Runtime, U32, UNSET, PREFIX_CACHE_CANDIDATE),
@@ -573,7 +575,14 @@ pub const RUNTIME: &[KnobSpec] = &[
     KnobSpec::new("rt.objective", Some("PLOW_OBJECTIVE"), Layer::Runtime, Domain::Str, Default::Static(Val::Str("auto")), OPT_IN),
     KnobSpec::new("rt.pf_interleave", Some("PLOW_PF_INTERLEAVE"), Layer::Runtime, U32, UNSET, DIAG),
     KnobSpec::new("rt.pf_chunk", Some("PLOW_PF_CHUNK"), Layer::Runtime, U32, Default::Static(Val::Nat(0)), DIAG),
+    KnobSpec::new("rt.pf_itl_budget_ms", Some("PLOW_PF_ITL_BUDGET_MS"), Layer::Runtime, U32, Default::Static(Val::Nat(0)), DIAG),
     KnobSpec::new("rt.pf_defer_decode", Some("PLOW_PF_DEFER_DECODE"), Layer::Runtime, Domain::Bool, OFF, DIAG),
+    KnobSpec::new("rt.vmm_snap_pitched", Some("PLOW_VMM_SNAP_PITCHED"), Layer::Runtime, Domain::Bool, OFF, DIAG),
+    KnobSpec::new("rt.vmm_snap_pool", Some("PLOW_VMM_SNAP_POOL"), Layer::Runtime, U32, Default::Static(Val::Nat(0)), DIAG),
+    KnobSpec::new("rt.vmm_ring_recycle", Some("PLOW_VMM_RING_RECYCLE"), Layer::Runtime, Domain::Bool, OFF, DIAG),
+    KnobSpec::new("rt.vmm_ring_park", Some("PLOW_VMM_RING_PARK"), Layer::Runtime, U32, Default::Static(Val::Nat(0)), DIAG),
+    KnobSpec::new("rt.pf_admit_overlap", Some("PLOW_PF_ADMIT_OVERLAP"), Layer::Runtime, Domain::Bool, OFF, DIAG),
+    KnobSpec::new("rt.shed_queue_depth", Some("PLOW_SHED_QUEUE_DEPTH"), Layer::Runtime, U32, Default::Static(Val::Nat(0)), DIAG),
     KnobSpec::new("rt.rt_max_ctx", Some("PLOW_RT_MAX_CTX"), Layer::Runtime, USIZE, UNSET, OPT_IN),
     KnobSpec::new("rt.tbt_slo_ms", Some("PLOW_TBT_SLO_MS"), Layer::Runtime, Domain::Str, UNSET, OPT_IN),
     KnobSpec::new("rt.ttft_slo_ms", Some("PLOW_TTFT_SLO_MS"), Layer::Runtime, Domain::Str, UNSET, OPT_IN),
@@ -601,8 +610,8 @@ pub const RUNTIME: &[KnobSpec] = &[
     KnobSpec::new("rt.vmm_deferred_reclaim", Some("PLOW_VMM_DEFERRED_RECLAIM"), Layer::Runtime, Domain::Bool, ON, PROMOTED),
     KnobSpec::new("rt.vmm_stale_reserve", Some("PLOW_VMM_STALE_RESERVE"), Layer::Runtime, Domain::Bool, ON, STALE_RESERVE_QUALIFIED),
     KnobSpec::new("rt.vmm_publish_shared", Some("PLOW_VMM_PUBLISH_SHARED"), Layer::Runtime, Domain::Bool, ON, PUBLISH_SHARED_QUALIFIED),
-    KnobSpec::new("rt.prefix_cache_output", Some("PLOW_PREFIX_CACHE_OUTPUT"), Layer::Runtime, Domain::Bool, ON, CACHE_OUTPUT_QUALIFIED),
     KnobSpec::new("rt.prefix_inflight_wait", Some("PLOW_PREFIX_INFLIGHT_WAIT"), Layer::Runtime, Domain::Bool, ON, INFLIGHT_WAIT_QUALIFIED),
+    KnobSpec::new("rt.prefix_session_ttl_s", Some("PLOW_PREFIX_SESSION_TTL_S"), Layer::Runtime, U32, Default::Static(Val::Nat(150)), SESSION_TTL_CANDIDATE),
     KnobSpec::new("rt.prefix_chunk_publish", Some("PLOW_PREFIX_CHUNK_PUBLISH"), Layer::Runtime, Domain::Bool, ON, CHUNK_PUBLISH_QUALIFIED),
     KnobSpec::new("rt.vmm_release_retire", Some("PLOW_VMM_RELEASE_RETIRE"), Layer::Runtime, Domain::Bool, ON, RELEASE_RETIRE_QUALIFIED),
     KnobSpec::new("rt.ttft_log", Some("PLOW_TTFT_LOG"), Layer::Runtime, Domain::Bool, OFF, OPT_IN),
@@ -799,6 +808,9 @@ pub const RAW_ENV: &[KnobSpec] = &[
     KnobSpec::new("env.PLOW_PF_NO_INTERLEAVE", Some("PLOW_PF_NO_INTERLEAVE"), Layer::RawEnv, Domain::Str, UNSET, REMOVED),
     KnobSpec::new("env.PLOW_PF_SPAN_POLICY", Some("PLOW_PF_SPAN_POLICY"), Layer::RawEnv, Domain::Str, UNSET, REMOVED),
     KnobSpec::new("env.PLOW_PIPE_PREFILL", Some("PLOW_PIPE_PREFILL"), Layer::RawEnv, Domain::Str, UNSET, REMOVED),
+    KnobSpec::new("env.PLOW_PREFIX_CACHE_OUTPUT", Some("PLOW_PREFIX_CACHE_OUTPUT"), Layer::RawEnv, Domain::Str, UNSET, REMOVED),
+    KnobSpec::new("env.PLOW_PREFIX_POLICY", Some("PLOW_PREFIX_POLICY"), Layer::RawEnv, Domain::Str, UNSET, REMOVED),
+    KnobSpec::new("env.PLOW_PREFIX_RETIRE_ATTACHED", Some("PLOW_PREFIX_RETIRE_ATTACHED"), Layer::RawEnv, Domain::Str, UNSET, REMOVED),
     KnobSpec::new("env.PLOW_QUEUE_TTL_MS", Some("PLOW_QUEUE_TTL_MS"), Layer::RawEnv, Domain::Str, UNSET, REMOVED),
     KnobSpec::new("env.PLOW_RIDE_FIXED", Some("PLOW_RIDE_FIXED"), Layer::RawEnv, Domain::Str, UNSET, REMOVED),
     KnobSpec::new("env.PLOW_RUNG_FAST_PROBE", Some("PLOW_RUNG_FAST_PROBE"), Layer::RawEnv, Domain::Str, UNSET, REMOVED),
@@ -1258,8 +1270,13 @@ mod tests {
                 k.scope.iter().map(allow_src).collect::<Vec<_>>().join(", ")
             )
         };
+        let per_rung = if k.rungs.is_empty() {
+            String::new()
+        } else {
+            format!(".per_rung({})", strs_src(k.rungs))
+        };
         format!(
-            "    KnobSpec::new({:?}, {:?}, Layer::{:?}, {domain}, {default}, {status}){scoped},",
+            "    KnobSpec::new({:?}, {:?}, Layer::{:?}, {domain}, {default}, {status}){scoped}{per_rung},",
             k.id, k.env, k.layer
         )
     }
@@ -1324,7 +1341,10 @@ mod tests {
             for c in k.constraints {
                 c.formula.vars(&mut wanted);
             }
-            if matches!(k.default, Default::Production { .. }) || !k.scope.is_empty() {
+            if matches!(k.default, Default::Production { .. })
+                || !k.scope.is_empty()
+                || !k.rungs.is_empty()
+            {
                 wanted.push(k.id);
                 wanted.extend(k.default.vars());
             }

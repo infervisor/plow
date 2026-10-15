@@ -405,6 +405,10 @@ impl SharedPrefix {
                 (cache_cap / total_row_bytes * row_bytes * tensors.len() as u64).max(1)
             };
             let mut pool = VmmKv::new_tensors(ops.clone(), geometry, granularity, cap, &keys)?;
+            // AMD publishes every completed chunk as an attach point for other suffixes; the
+            // boundary tree's structural retire is the CUDA conversation policy (a migration of
+            // this path is explicit, not implied).
+            pool.set_policy(crate::memory::vmm::Policy::Legacy);
             pool.enable_block_recycling(
                 pool_cap / total_row_bytes * row_bytes * tensors.len() as u64,
             );

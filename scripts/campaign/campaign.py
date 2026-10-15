@@ -11,6 +11,7 @@
     campaign.py sweep   <recipe.toml> --param KNOB --values V1,V2 [--out DIR]
     campaign.py ledger  <results.csv> --cell NAME --note TEXT [--provisional]
     campaign.py gate    <recipe.toml> --assets DIR --out DIR [--only K] [--dry-run|--score-only]
+    campaign.py rung-sweep <recipe.toml> --knob K --values 0,1 --out DIR --stage build|run|score|verify
 
 The recipe pins everything that decides a number: checkpoint revision, precision, emit
 knobs and flags, object-build gates, serve-side mirrors, and the client protocol. Every
@@ -44,6 +45,8 @@ try:
     from roofline import generate_roofline_report
 except Exception:
     generate_roofline_report = None
+import rung_env
+import rung_sweep
 
 REPO = Path(__file__).resolve().parents[2]
 GPULEASE = REPO / "perf-data" / "tools" / "gpulease"
@@ -524,6 +527,24 @@ def packet_serve_defaults(r: dict, out: Path) -> tuple[dict[str, str], list[str]
     return keep, skipped
 
 
+def build_rung_env(r: dict, environ, overrides: dict, cli: list[str] | None) -> str:
+    """The one `PLOW_EMIT_RUNG_ENV` both emits get: the recipe's [emit.rung_env] with `--rung-env`
+    entries replacing the same (phase, rows, knob). Any other way in would win silently over it."""
+    for where, env in (("the environment", environ), ("--env", overrides)):
+        if rung_env.ENV in env:
+            die(f"{rung_env.ENV} set in {where}: state rung overrides as [emit.rung_env] or --rung-env")
+    if errs := rung_env.recipe_source_errors(r):
+        die("; ".join(errs))
+    try:
+        over = rung_env.merge(rung_env.from_recipe(r), rung_env.parse(";".join(cli or [])))
+    except rung_env.RungEnvError as e:
+        die(str(e))
+    errs = rung_env.check(over)
+    if errs:
+        die("rung overrides refused:\n  " + "\n  ".join(errs))
+    return rung_env.render(over)
+
+
 def cmd_build(a: argparse.Namespace) -> None:
     recipe_bytes = Path(a.recipe).read_bytes()
     r = tomllib.loads(recipe_bytes.decode("utf-8"))
@@ -585,6 +606,9 @@ def cmd_build(a: argparse.Namespace) -> None:
     common.update(overrides)
 
     roles = r.get("emit_roles")
+    rungs = build_rung_env(r, os.environ, overrides, getattr(a, "rung_env", None))
+    if rungs:
+        common[rung_env.ENV] = rungs
     objects = r.get("objects")
     object_env = merge_object_env((objects or {}).get("env", {}), object_overrides)
     if roles:
@@ -671,9 +695,11 @@ def cmd_build(a: argparse.Namespace) -> None:
             "serve_defaults": common.get("PLOW_EMIT_SERVE_DEFAULTS"),
             "role_env": {**(roles or {}).get("env", {}), **overrides},
             "object_env": object_env,
+            "rung_env": rungs or None,
         },
         "cell": cell,
         "overrides": overrides,
+        "rung_overrides": list(getattr(a, "rung_env", None) or []),
         "object_overrides": object_overrides,
         "commit": source_start["commit"],
         "dirty": bool(source_start["status"]),
@@ -1406,6 +1432,170 @@ def cmd_sweep(a: argparse.Namespace) -> None:
             print(f"  in={k[0]:<5} C={k[1]:<2} | TTFT: {ttft_s:>9} | TPOT: {tpot_s:>8} | {vs_ref}")
 
 
+# ---------------------------------------------------------------- rung-sweep
+# Per-rung choice of one rung-eligible emit knob (scripts/campaign/rung_sweep.py):
+#   build  (CPU)  reference build (the recipe as is, or --reference-build) + one build per value,
+#                 the value on every prefill rung via PLOW_EMIT_RUNG_ENV
+#   run    (CPU)  writes run.sh: step_bench packed prefill per rung x arm x ABBA block, with the
+#                 compact-terminal logits of the same launches; queue it with gpuq.py
+#   score  (CPU)  choice.json / choice.md / resources.md / recipe-snippet.toml
+#   verify (CPU)  mixed build from the choice; each rung's program must equal the winning arm's;
+#                 writes verify-run.sh to re-time the switched rungs on the mixed packet
+def build_args(a: argparse.Namespace, out: Path, rungs: list[str]) -> argparse.Namespace:
+    return argparse.Namespace(recipe=a.recipe, out=str(out), env=a.env, object_env=None, rung_env=rungs,
+                              no_probe=True, leased=False, plowrt=None, store_cell=None, hf_dir=a.hf_dir)
+
+
+def sweep_build_stale(rec: dict, out: Path) -> str:
+    """Why a finished build no longer matches this tree, compiler, toolchain and its own artifacts ('' = reusable)."""
+    plowc = Path(os.environ.get("CARGO_TARGET_DIR", REPO / "target")) / "release" / "plowc"
+    prov = rec.get("build_provenance") or {}
+    if rec.get("dirty") or prov.get("source_state_changed") or prov.get("compiler_changed"):
+        return "built from a dirty or changing tree/compiler"
+    if git("status", "--porcelain"):
+        return "the source tree is dirty"
+    if rec.get("commit") != git("rev-parse", "HEAD"):
+        return f"built at {rec.get('commit')}, tree is at {git('rev-parse', 'HEAD')}"
+    if not plowc.is_file() or rec.get("compiler_sha256") != sha(plowc):
+        return "plowc changed"
+    tool = {k: os.environ[k] for k in ("PLOW_NVCC", "PLOW_NVCC_PATH", "NVCC_PREPEND_FLAGS", "NVCC_APPEND_FLAGS")
+            if k in os.environ}
+    if (rec.get("compilation") or {}).get("toolchain_env") != tool:
+        return "toolchain env changed"
+    for sub, files in (("assets", rec.get("hashes") or {}), ("objects", rec.get("objects") or {})):
+        for name, digest in files.items():
+            f = out / sub / name
+            if not f.is_file() or sha(f) != digest:
+                return f"{sub}/{name} changed since the build"
+    # The bundled copies serve loads: each must still be the recorded object.
+    objects = rec.get("objects") or {}
+    for f in sorted((out / "assets" / "objects").glob("*")):
+        if f.is_file() and sha(f) != objects.get(f.name):
+            return f"assets/objects/{f.name} is not the recorded object"
+    return ""
+
+
+def sweep_build(a: argparse.Namespace, out: Path, rungs: list[str]) -> Path:
+    """Build, or reuse a finished build of exactly this recipe, emit env and rung overrides."""
+    record = out / "build-record.json"
+    if (out / "assets" / "model.pkt").is_file() and record.is_file():
+        rec = json.loads(record.read_text())
+        want = {"recipe_sha256": sha(Path(a.recipe)), "overrides": dict(kv.split("=", 1) for kv in (a.env or [])),
+                "rung_overrides": rungs}
+        got = {k: rec.get(k) for k in want}
+        if got != want:
+            die(f"{out} was built from a different recipe/env/rung overrides ({got} vs {want}); use a fresh --out")
+        stale = sweep_build_stale(rec, out)
+        if stale:
+            die(f"{out} is stale ({stale}); use a fresh --out")
+        return out
+    cmd_build(build_args(a, out, rungs))
+    return out
+
+
+def cmd_rung_sweep(a: argparse.Namespace) -> None:
+    out = Path(a.out).resolve()
+    out.mkdir(parents=True, exist_ok=True)
+    plan_path = out / "plan.json"
+    r = load(a.recipe)
+    try:
+        rung_sweep.knob_id(a.knob)
+    except ValueError as e:
+        die(str(e))
+    values = [v.strip() for v in a.values.split(",") if v.strip()]
+    if len(values) < 2 or len({rung_env.boolish(v) or v for v in values}) != len(values):
+        die("--values needs at least two distinct values")
+    if a.blocks < 2 or a.blocks % 2:
+        die("--blocks must be even (ABBA)")
+    if a.stage == "build":
+        ref = Path(a.reference_build).resolve() if a.reference_build else sweep_build(a, out / "ref", [])
+        bj = rung_sweep.build_json(ref)
+        buckets = bj["shapes"]["prefill_buckets"]
+        try:
+            rungs = rung_sweep.plan_rungs(bj, [int(x) for x in a.rungs.split(",")] if a.rungs else buckets)
+        except ValueError as e:
+            die(str(e))
+        builds = {}
+        for v in values:
+            arm = rung_sweep.arm_name(v)
+            builds[arm] = str(sweep_build(a, out / "arms" / arm, [f"prefill:{b}:{a.knob}={v}" for b in buckets]))
+        plan = {"recipe": str(Path(a.recipe).resolve()), "knob": a.knob, "values": values, "buckets": buckets,
+                "rungs": rungs, "reference_build": str(ref), "builds": builds,
+                "arms": [rung_sweep.arm_name(v) for v in values], "out": str(out),
+                "reps": a.reps, "blocks": a.blocks, "timeout_s": a.timeout}
+        plan_path.write_text(json.dumps(plan, indent=1) + "\n")
+        print(f"rung-sweep: plan {plan_path}; next: --stage run", file=sys.stderr)
+        return
+    if not plan_path.is_file():
+        die(f"{plan_path} missing: run --stage build first")
+    plan = json.loads(plan_path.read_text())
+    if plan["knob"] != a.knob or plan["values"] != values:
+        die(f"{plan_path} is a sweep of {plan['knob']}={plan['values']}")
+    if a.stage == "run":
+        sb = Path(a.step_bench or Path(os.environ.get("CARGO_TARGET_DIR", REPO / "target")) / "release/examples/step_bench")
+        if not sb.is_file():
+            die(f"{sb} missing: cargo build --release -p plowrt --features cuda --bin plowrt --example step_bench")
+        if plan["reps"] < 2:
+            die("--reps must be >= 2 (rep 0 is the graph capture)")
+        (out / "bin").mkdir(exist_ok=True)
+        shutil.copy2(sb, out / "bin" / sb.name)
+        env = {} if a.no_serve_env else packet_serve_defaults(r, out)[0]
+        env.update(dict(kv.split("=", 1) for kv in (a.run_env or [])))
+        plan.update(step_bench=str(out / "bin" / sb.name), run_env=env)
+        plan_path.write_text(json.dumps(plan, indent=1) + "\n")
+        script = out / "run.sh"
+        script.write_text(rung_sweep.run_script(plan, sb, env))
+        script.chmod(0o755)
+        n = len(plan["rungs"]) * len(plan["arms"]) * plan["blocks"]
+        print(f"rung-sweep: {script} ({n} step_bench runs); queue it:\n"
+              f"  PLOW_CAMPAIGN_NO_NIX=${{PLOW_CAMPAIGN_NO_NIX:-0}} python3 scripts/bench/gpuq.py submit rung-sweep 1 "
+              f"timeout {n * (plan['timeout_s'] + 30)} bash {script}", file=sys.stderr)
+        return
+    builds = {arm: rung_sweep.build_json(Path(d)) for arm, d in plan["builds"].items()}
+    ref_bj = rung_sweep.build_json(Path(plan["reference_build"]))
+    if a.stage == "score":
+        try:
+            choice = rung_sweep.score(plan, out / "runs", ref_bj, builds, a.kl_max, a.top1_min,
+                                      rung_sweep.vocab_size(Path(plan["reference_build"])))
+        except ValueError as e:
+            die(str(e))
+        cuobjdump = a.cuobjdump or shutil.which("cuobjdump") or "/usr/local/cuda/bin/cuobjdump"
+        res = {arm: rung_sweep.resources(Path(d) / "assets", cuobjdump) for arm, d in plan["builds"].items()}
+        choice["resources"] = res
+        choice["qualification"] = rung_sweep.qualify(choice, res, a.roofline, a.library_resources)
+        (out / "choice.json").write_text(json.dumps(choice, indent=1) + "\n")
+        (out / "choice.md").write_text(rung_sweep.table(choice))
+        (out / "resources.md").write_text(rung_sweep.resource_table(res))
+        (out / "recipe-snippet.toml").write_text(rung_sweep.snippet(choice, r))
+        print((out / "choice.md").read_text())
+        print(f"rung-sweep: {out / 'choice.json'}, {out / 'resources.md'}, {out / 'recipe-snippet.toml'}")
+        return
+    # verify
+    choice_path = out / "choice.json"
+    if not choice_path.is_file():
+        die(f"{choice_path} missing: run --stage score first")
+    choice = json.loads(choice_path.read_text())
+    # Every scored winner explicitly, so a recipe override the sweep reverted cannot survive.
+    winners = {x["rows"]: x["winner"] for x in choice["rungs"] if x.get("winner") is not None}
+    mixed = sweep_build(a, out / "mixed", [f"prefill:{rows}:{a.knob}={v}" for rows, v in sorted(winners.items())])
+    mbj = rung_sweep.build_json(mixed)
+    report, bad = [], 0
+    for rows in plan["buckets"]:
+        want_bj = builds[rung_sweep.arm_name(winners[rows])] if rows in winners else ref_bj
+        same = rung_sweep.program_digest(mbj, rows) == rung_sweep.program_digest(want_bj, rows)
+        bad += not same
+        report.append({"rows": rows, "expected_from": rung_sweep.arm_name(winners[rows]) if rows in winners else "ref",
+                       "program_matches": same})
+    (out / "verify.json").write_text(json.dumps({"mixed_build": str(mixed), "rungs": report}, indent=1) + "\n")
+    vplan = dict(plan, builds={"mixed": str(mixed)}, arms=["mixed"], blocks=2)
+    (out / "verify-run.sh").write_text(rung_sweep.run_script(vplan, Path(plan["step_bench"]), plan["run_env"])
+                                       .replace("$O/runs", "$O/verify-runs"))
+    print(json.dumps(report, indent=1))
+    if bad:
+        die(f"{bad} rung program(s) of the mixed packet differ from the arm they were chosen from")
+    print(f"rung-sweep: mixed packet {mixed} matches the chosen arms per rung; time it with {out / 'verify-run.sh'}")
+
+
 # ---------------------------------------------------------------- gate
 # Accuracy gates declared in the recipe's [gates] table, run in one lease and scored uniformly, so
 # every patch is validated the same way. Presets (a [gates.<kind>] table each):
@@ -1885,6 +2075,8 @@ def main() -> None:
     b = sp.add_parser("build"); b.add_argument("recipe"); b.add_argument("--out", required=True)
     b.add_argument("--env", action="append", metavar="K=V", help="one-variable override for the emit env; recorded")
     b.add_argument("--object-env", action="append", metavar="K=V", help="object-build-only env over [objects.env]: *_FLAGS append, other keys replace; recorded")
+    b.add_argument("--rung-env", action="append", metavar="PHASE:ROWS:K=V",
+                   help="per-rung override of a rung-eligible emit knob over [emit.rung_env], e.g. prefill:128:PLOW_NO_GLU_FUSE=0; recorded")
     b.add_argument("--no-probe", action="store_true", help="skip the leased cuBLASLt algorithm probe even with the GPU present")
     b.add_argument("--leased", action="store_true", help="the probe runs inside the caller's GPU lease (a gpuq job)")
     b.add_argument("--plowrt", help="plowrt the probe serves with (default [serve].plowrt, else target/release/plowrt)")
@@ -1943,6 +2135,24 @@ def main() -> None:
     sw.add_argument("--out"); sw.add_argument("--profile"); sw.add_argument("--concs"); sw.add_argument("--in-lens")
     sw.add_argument("--reference"); sw.add_argument("--env", action="append", metavar="K=V")
     sw.set_defaults(f=cmd_sweep)
+    rs = sp.add_parser("rung-sweep", help="per-rung choice of one rung-eligible emit knob (build|run|score|verify)")
+    rs.add_argument("recipe"); rs.add_argument("--knob", required=True, help="env name, e.g. PLOW_NO_GLU_FUSE")
+    rs.add_argument("--values", required=True, help="comma-separated values, e.g. 0,1")
+    rs.add_argument("--out", required=True); rs.add_argument("--stage", required=True, choices=("build", "run", "score", "verify"))
+    rs.add_argument("--rungs", help="comma-separated prefill rows to time (default: every bucket)")
+    rs.add_argument("--reference-build", help="existing campaign build of the unchanged recipe (default: build it)")
+    rs.add_argument("--hf-dir"); rs.add_argument("--env", action="append", metavar="K=V", help="emit env for every build")
+    rs.add_argument("--reps", type=int, default=6, help="packed prefill reps per run (rep 0 = capture, dropped)")
+    rs.add_argument("--blocks", type=int, default=2, help="ABBA blocks per rung (even)")
+    rs.add_argument("--timeout", type=int, default=600, help="per step_bench run, s")
+    rs.add_argument("--step-bench", help="step_bench binary (default $CARGO_TARGET_DIR/release/examples/step_bench)")
+    rs.add_argument("--run-env", action="append", metavar="K=V", help="env for every run (runtime libs, PLOW_LIVE_CTX, ...)")
+    rs.add_argument("--no-serve-env", action="store_true", help="do not export the recipe's packet serve defaults to the runs")
+    rs.add_argument("--kl-max", type=float, help="fail a non-bitwise arm whose KL(ref||arm) max exceeds this")
+    rs.add_argument("--top1-min", type=float, help="fail a non-bitwise arm whose top-1 agreement is below this")
+    rs.add_argument("--roofline", help="calibrated roofline record for the swept rungs (required for a qualified label)")
+    rs.add_argument("--library-resources", help="library-kernel (cuBLASLt) resource record (required for a qualified label)")
+    rs.add_argument("--cuobjdump"); rs.set_defaults(f=cmd_rung_sweep)
     ga = sp.add_parser("gate", help="run the recipe's [gates] (accuracy) in one lease and score them")
     ga.add_argument("recipe"); ga.add_argument("--assets", required=True); ga.add_argument("--out", required=True)
     ga.add_argument("--only", help="comma-separated gate kinds")

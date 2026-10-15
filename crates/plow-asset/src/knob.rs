@@ -141,6 +141,9 @@ pub struct KnobSpec {
     pub constraints: &'static [Constraint],
     /// What the knob may change in a packet or a route (checkpoint S). Empty: nothing.
     pub scope: &'static [Allow],
+    /// Program phases (`prefill`, `decode`) whose rungs may override this knob
+    /// (`PLOW_EMIT_RUNG_ENV`). Empty: packet-wide only.
+    pub rungs: &'static [&'static str],
 }
 
 /// A packet or route property checkpoint S compares.
@@ -251,7 +254,12 @@ impl KnobSpec {
             status,
             constraints: &[],
             scope: &[],
+            rungs: &[],
         }
+    }
+
+    pub const fn per_rung(self, rungs: &'static [&'static str]) -> KnobSpec {
+        KnobSpec { rungs, ..self }
     }
 
     pub const fn scoped(self, scope: &'static [Allow]) -> KnobSpec {

@@ -12,7 +12,7 @@ use plow_asset::token_batch::{Phase, Request, Selection};
 /// 3.1 ms and all decode kernels at ~5.5 ms, so ~88 % was unattributed.)
 ///
 /// Split reported: `enqueue` is `packed_token_body_enqueue` (host-side submission of the
-/// interpreter launch, async) and `terminal` is `run_rows`, which must wait on the device
+/// interpreter launch, async) and `terminal` is the packed terminal, which must wait on the device
 /// for the sampled ids — so `terminal` carries the device time the enqueue deferred.
 mod steptime {
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -85,6 +85,60 @@ impl CudaTokenBatch {
     }
 }
 
+/// `PLOW_PF_PACKLOG=1`: one `PACKLOG STEP` line per unified token-batch launch. `enq` is the host
+/// time from the first enqueue to the id read-back's enqueue, `window` the host work run while
+/// the launch executes, `wait` the remaining block on the device, `post` commit + publication;
+/// `gpu` is the device span (events around the launch), so `enq + window + wait + post - gpu`
+/// is the time the device sat idle inside this step.
+struct StepClock {
+    t0: std::time::Instant,
+    enq_us: u64,
+    window_us: u64,
+    wait_us: u64,
+}
+
+impl StepClock {
+    fn start(e: &mut GpuEngine) -> Option<Self> {
+        if !RuntimeConfig::get().pf_packlog {
+            return None;
+        }
+        if e.step_events.is_none() {
+            e.step_events = Some((e.be.event_create(true).ok()?, e.be.event_create(true).ok()?));
+        }
+        let (start, _) = e.step_events.as_ref()?;
+        e.be.event_record(start, &e.stream).ok()?;
+        Some(Self {
+            t0: std::time::Instant::now(),
+            enq_us: 0,
+            window_us: 0,
+            wait_us: 0,
+        })
+    }
+
+    fn end(&mut self, e: &GpuEngine) {
+        if let Some((_, end)) = e.step_events.as_ref() {
+            let _ = e.be.event_record(end, &e.stream);
+        }
+        self.enq_us = self.t0.elapsed().as_micros() as u64;
+    }
+
+    fn log(self, e: &GpuEngine, rows: usize, bucket: u32) {
+        let total = self.t0.elapsed().as_micros() as u64;
+        let gpu_us = e
+            .step_events
+            .as_ref()
+            .and_then(|(start, end)| e.be.event_elapsed_ms(start, end).ok())
+            .map_or(0, |ms| (ms * 1e3) as u64);
+        eprintln!(
+            "PACKLOG STEP rows={rows} bucket={bucket} enq_us={} window_us={} wait_us={} post_us={} gpu_us={gpu_us}",
+            self.enq_us,
+            self.window_us,
+            self.wait_us,
+            total.saturating_sub(self.enq_us + self.window_us + self.wait_us),
+        );
+    }
+}
+
 impl GpuEngine {
     pub fn token_batch_enabled(&self) -> bool {
         self.token_batch.is_some()
@@ -99,7 +153,7 @@ impl GpuEngine {
         requests: &[Request<'_>],
         output: &mut Vec<(u32, u32)>,
     ) -> Result<()> {
-        self.token_batch_step_inner(requests, output, None)
+        self.token_batch_step_inner(requests, output, None, None)
     }
 
     /// As [`Self::token_batch_step`], with `spec(slot)` rows drawn on the device by `plow_sample`
@@ -111,7 +165,21 @@ impl GpuEngine {
         output: &mut Vec<(u32, u32)>,
         spec: &dyn Fn(u32) -> Option<DevSample>,
     ) -> Result<()> {
-        self.token_batch_step_inner(requests, output, Some(spec))
+        self.token_batch_step_inner(requests, output, Some(spec), None)
+    }
+
+    /// [`Self::token_batch_step`] (or `_sampled` with `spec`) that runs `window` on the host
+    /// while the launch executes: after the body, terminal and id read-back are enqueued and
+    /// before the wait. `window` may admit slots this launch does not touch
+    /// ([`Self::admit_packed_slot`] defers their snapshot waits to the step's own drain).
+    pub fn token_batch_step_window(
+        &mut self,
+        requests: &[Request<'_>],
+        output: &mut Vec<(u32, u32)>,
+        spec: Option<&dyn Fn(u32) -> Option<DevSample>>,
+        window: &mut dyn FnMut(&mut GpuEngine),
+    ) -> Result<()> {
+        self.token_batch_step_inner(requests, output, spec, Some(window))
     }
 
     fn token_batch_step_inner(
@@ -119,6 +187,7 @@ impl GpuEngine {
         requests: &[Request<'_>],
         output: &mut Vec<(u32, u32)>,
         spec: Option<&dyn Fn(u32) -> Option<DevSample>>,
+        mut window: Option<&mut dyn FnMut(&mut GpuEngine)>,
     ) -> Result<()> {
         output.clear();
         let mut state = self.token_batch.take().ok_or_else(|| {
@@ -251,6 +320,7 @@ impl GpuEngine {
             // behind the flag rather than running on every decode step.
             let timed = RuntimeConfig::get().nv.step_time;
             let t_enq = timed.then(std::time::Instant::now);
+            let mut gpu = StepClock::start(self);
             // KV-shared tail: the body stops at the tail boundary and the tail runs the sampled
             // rows alone, which the terminal then finds at rows 0..n.
             let tail_rows = self.shared_tail_rows(&chunks, &sample_rows);
@@ -281,16 +351,40 @@ impl GpuEngine {
                 .take()
                 .expect("capability checked at load");
             let t_term = timed.then(std::time::Instant::now);
-            let sampled = match &specs {
-                Some(specs) => terminal.run_rows_sampled(self, &sample_rows, real_rows, specs),
-                None => terminal.run_rows(self, &sample_rows, real_rows),
-            }
-            .and_then(|ids| {
-                state
-                    .staging
-                    .deliver(ids, output)
-                    .map_err(|error| RuntimeError::Rejected(error.to_string()))
-            });
+            let sampled = terminal
+                .begin_rows(self, &sample_rows, real_rows, specs.as_deref())
+                .and_then(|i| {
+                    if let Some(gpu) = gpu.as_mut() {
+                        gpu.end(self);
+                    }
+                    if let Some(window) = window.as_mut() {
+                        if self.window_event.is_none() {
+                            self.window_event = self.be.event_create(false).ok();
+                        }
+                        if let Some(done) = &self.window_event {
+                            let _ = self.be.event_record(done, &self.stream);
+                        }
+                        let t = gpu.as_ref().map(|_| std::time::Instant::now());
+                        self.window_open = true;
+                        window(self);
+                        self.window_open = false;
+                        if let (Some(gpu), Some(t)) = (gpu.as_mut(), t) {
+                            gpu.window_us = t.elapsed().as_micros() as u64;
+                        }
+                    }
+                    let t = gpu.as_ref().map(|_| std::time::Instant::now());
+                    let ids = terminal.finish_rows(self, i);
+                    if let (Some(gpu), Some(t)) = (gpu.as_mut(), t) {
+                        gpu.wait_us = t.elapsed().as_micros() as u64;
+                    }
+                    ids
+                })
+                .and_then(|ids| {
+                    state
+                        .staging
+                        .deliver(ids, output)
+                        .map_err(|error| RuntimeError::Rejected(error.to_string()))
+                });
             let terminal_ns = t_term.map_or(0, |t| t.elapsed().as_nanos() as u64);
             self.packed_terminal = Some(terminal);
             sampled?;
@@ -316,6 +410,9 @@ impl GpuEngine {
                 for (slot, rows) in chunk_ends {
                     self.vmm_publish(slot, rows);
                 }
+            }
+            if let Some(gpu) = gpu {
+                gpu.log(self, rows, capacity);
             }
             if !state.fired {
                 tracing::info!(
@@ -349,7 +446,33 @@ impl GpuEngine {
             output.clear();
         }
         self.token_batch = Some(state);
-        result
+        let flushed = self.flush_deferred_attach();
+        result.and(flushed)
+    }
+
+    /// Inside a launch window: whether the launch is still running on the device.
+    pub(crate) fn launch_in_flight(&self) -> bool {
+        self.window_open
+            && self
+                .window_event
+                .as_ref()
+                .is_some_and(|done| !self.be.event_query(done).unwrap_or(true))
+    }
+
+    /// Complete the restores a launch window deferred: drain the stream, then release their
+    /// snapshot holds. A failed drain keeps the holds: the copies' completion is unproven.
+    pub(crate) fn flush_deferred_attach(&mut self) -> Result<()> {
+        if self.deferred_attach.is_empty() {
+            return Ok(());
+        }
+        self.be.stream_synchronize(&self.stream)?;
+        let kv = self.vmm.as_ref().and_then(|v| v.kv.as_ref());
+        for b in self.deferred_attach.drain(..) {
+            if let Some(kv) = kv {
+                kv.finish_attach(b);
+            }
+        }
+        Ok(())
     }
 }
 
@@ -477,7 +600,10 @@ mod tests {
                 // Match the compact tail's RMSNorm reduction. Ordinary prefill uses
                 // the >=32-row reduction, which can differ by a BF16 rounding bit.
                 let mut terminal = e.packed_terminal.take().unwrap();
-                terminal.run_rows(&e, &[(real - 1) as u32], real).unwrap();
+                let i = terminal
+                    .begin_rows(&mut e, &[(real - 1) as u32], real, None)
+                    .unwrap();
+                terminal.finish_rows(&e, i).unwrap();
                 e.packed_terminal = Some(terminal);
                 e.logits_row(0, &mut logits).unwrap();
                 let delta = logits

@@ -119,7 +119,13 @@ PLOW_PF_SEG_FA512 = "1"
 # at 4K c16/c32, TTFT p99 +9..16% and FP8 agentic c128 -11% tok/s (p99 3.6x): narrow 4096 launches
 # cost ~8% more per row (2026-10-08 auto-vs-pin A/B, docs/bringup/results/gemma26b-h100-20261009).
 PLOW_PF_INTERLEAVE = "0"
-PLOW_VMM_LIVE_RINGS = "0"
+# Sliding rings mapped per admitted slot instead of 128 x 200 MiB preallocated: free device memory
+# after load 26 -> 52 GiB for the KV admission budget and the prefix cache. Production chat (no
+# session ids, 2.2 req/s, ~5.7K-token prompts, human think times; replay --think-median-s 45) with
+# the prompt-end-only publish: cached tokens 32.7% -> 47.4%, TTFT p50 246 -> 192 ms (2026-10-13,
+# /opt/dlami/nvme/lava-tts/g26-churn/ab-*). Costs per-admission ring mapping: -6% tok/s under
+# prefill overload (4.5 req/s), nothing at production concurrency (0-4 running).
+PLOW_VMM_LIVE_RINGS = "1"
 PLOW_MULTISTEP = "0"
 PLOW_DECODE_MAX_RUNG = "128"
 PLOW_TOKEN_BATCH = "1"

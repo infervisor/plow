@@ -314,6 +314,10 @@ const LT_GLU_TARGET: F = F::And(&[
     F::Atom("emit.w8a16", Cmp::Eq, FALSE),
     F::Atom("emit.mxfp4", Cmp::Eq, FALSE),
 ]);
+/// Per-rung eligibility (`KnobSpec::per_rung`, `PLOW_EMIT_RUNG_ENV`): the knob only picks the op or
+/// library route of the program being lowered, never a tensor, object or the program set. A fused
+/// GLU rung still needs an object carrying the GemmGlu arm, as a packet-wide `=0` does.
+const PREFILL_RUNGS: &[&str] = &["prefill"];
 const LT_GLU_DEFAULT: Default = Default::Production {
     cases: &[DefaultCase {
         when: LT_GLU_TARGET,
@@ -1307,7 +1311,7 @@ pub const EMIT: &[KnobSpec] = &[
     KnobSpec::new("emit.moe_pf_det", Some("PLOW_MOE_PF_DET"), Layer::Emit, Domain::Bool, OFF, OPT_IN),
     KnobSpec::new("emit.moe_stage1_body", Some("PLOW_MOE_STAGE1_BODY"), Layer::Emit, Domain::Bool, OFF, OPT_IN),
     KnobSpec::new("emit.moe_stage2_body", Some("PLOW_MOE_STAGE2_BODY"), Layer::Emit, Domain::Bool, OFF, OPT_IN),
-    KnobSpec::new("emit.no_glu_fuse", Some("PLOW_NO_GLU_FUSE"), Layer::Emit, Domain::Bool, LT_GLU_DEFAULT, LT_GLU_QUALIFIED),
+    KnobSpec::new("emit.no_glu_fuse", Some("PLOW_NO_GLU_FUSE"), Layer::Emit, Domain::Bool, LT_GLU_DEFAULT, LT_GLU_QUALIFIED).per_rung(PREFILL_RUNGS),
     KnobSpec::new("emit.tma_gemm", Some("PLOW_TMA_GEMM"), Layer::Emit, Domain::Bool, OFF, OPT_IN),
     KnobSpec::new("emit.gemma4_sm90_gemm_glu_role", Some("PLOW_GEMMA4_SM90_GEMM_GLU_ROLE"), Layer::Emit, Domain::Bool, OFF, OPT_IN),
     KnobSpec::new("emit.gemma4_sm90_w8a8_gemm_glu_role", Some("PLOW_GEMMA4_SM90_W8A8_GEMM_GLU_ROLE"), Layer::Emit, Domain::Bool, OFF, OPT_IN),
@@ -1316,6 +1320,7 @@ pub const EMIT: &[KnobSpec] = &[
     KnobSpec::new("emit.gemma4_sm90_hd512_px4_bq64_role", Some("PLOW_GEMMA4_SM90_HD512_PX4_BQ64_ROLE"), Layer::Emit, Domain::Bool, OFF, OPT_IN),
     KnobSpec::new("emit.gen_kernels", Some("PLOW_EMIT_GEN_KERNELS"), Layer::Emit, Domain::Str, UNSET, OPT_IN),
     KnobSpec::new("emit.serve_defaults", Some("PLOW_EMIT_SERVE_DEFAULTS"), Layer::Emit, Domain::Str, UNSET, OPT_IN),
+    KnobSpec::new("emit.rung_env", Some("PLOW_EMIT_RUNG_ENV"), Layer::Emit, Domain::Str, UNSET, OPT_IN),
     KnobSpec::new("emit.fp8_pf_gemm_role", Some("PLOW_FP8_PF_GEMM_ROLE"), Layer::Emit, Domain::Bool, OFF, OPT_IN),
     KnobSpec::new("emit.fp8_pf_isolate", Some("PLOW_QWEN_FP8_PF_ISOLATE"), Layer::Emit, Domain::Bool, OFF, OPT_IN),
     KnobSpec::new("emit.attention_pf_role", Some("PLOW_ATTENTION_PF_ROLE"), Layer::Emit, Domain::Bool, OFF, OPT_IN),
@@ -1329,6 +1334,7 @@ pub const EMIT: &[KnobSpec] = &[
     KnobSpec::new("emit.prefill_cublaslt", Some("PLOW_EMIT_PREFILL_CUBLASLT"), Layer::Emit, Domain::Bool, LT_GLU_DEFAULT, LT_GLU_QUALIFIED),
     KnobSpec::new("emit.fp8_decode_tc64", Some("PLOW_FP8_DECODE_TC64"), Layer::Emit, Domain::Bool, OFF, OPT_IN),
     KnobSpec::new("emit.moe_pf_lt", Some("PLOW_EMIT_MOE_PF_LT"), Layer::Emit, Domain::Bool, GEMMA4_HOPPER_MOE_ON, MOE_LT_EMIT_QUALIFIED),
+    KnobSpec::new("emit.moe_pf_lt_route", Some("PLOW_EMIT_MOE_PF_LT_ROUTE"), Layer::Emit, Domain::Bool, OFF, OPT_IN),
     KnobSpec::new("emit.moe_dec_lt", Some("PLOW_EMIT_MOE_DEC_LT"), Layer::Emit, Domain::Bool, GEMMA4_MOE_DEC_LT_DEFAULT, MOE_LT_EMIT_QUALIFIED),
     KnobSpec::new("emit.gemma_gemm_lt", Some("PLOW_GEMMA_GEMM_LT"), Layer::Emit, Domain::Bool, OFF, OPT_IN),
     KnobSpec::new("emit.decode_native_tc", Some("PLOW_EMIT_DECODE_NATIVE_TC"), Layer::Emit, Domain::Bool, OFF, OPT_IN),
@@ -2105,6 +2111,7 @@ pub const OBJECT_DEFINES: &[KnobSpec] = &[
     KnobSpec::new("def.PLOW_NV_QUANT_FP8_VLLM", None, Layer::ObjectDefine, Domain::Str, UNSET, OPT_IN),
     KnobSpec::new("def.PLOW_NV_GLU_QUANT_CACHE", None, Layer::ObjectDefine, Domain::Bool, OFF, OPT_IN),
     KnobSpec::new("def.PLOW_NV_GLU_QUANT_WPR", None, Layer::ObjectDefine, Domain::Bool, OFF, OPT_IN),
+    KnobSpec::new("def.PLOW_NV_ROPE_PF", None, Layer::ObjectDefine, Domain::Bool, OFF, OPT_IN),
     KnobSpec::new("def.PLOW_GEN_FP8_KV", None, Layer::ObjectDefine, Domain::Bool, OFF, OPT_IN),
     KnobSpec::new("def.PLOW_GEN_KV_ILV", None, Layer::ObjectDefine, Domain::Bool, OFF, OPT_IN),
     KnobSpec::new("def.PLOW_CUTLASS_HOST", None, Layer::ObjectDefine, Domain::Bool, OFF, OPT_IN),

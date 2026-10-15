@@ -93,6 +93,19 @@ protocol; select only the fastest correct route for each rung. Validate the chos
 isolated block, including ragged rungs, before full-model accuracy and matched serving. An
 unmeasured rung or a correctness/resource failure keeps the candidate experimental.
 
+**Per-rung knob values.** An emit knob that only picks a rung program's op or library route is
+declared rung-eligible in `crates/devgen/src/knob_spec.rs` (`.per_rung(&["prefill"])`; today only
+`PLOW_NO_GLU_FUSE`). Choose it per rung, not packet-wide:
+`campaign.py rung-sweep <recipe> --knob K --values 0,1 --stage build|run|score|verify`
+(`scripts/campaign/README.md`, "Per-rung knob choices") times every rung in every value arm in one
+queue job, compares the same launches' logits, lists object resources and writes the
+`[emit.rung_env.prefill.<rows>]` recipe snippet. devgen refuses an override of a packet-wide knob
+(tensors, objects, program set, checked constraints); making a knob eligible needs that audit plus a
+mixed-rung emit test (`crates/devgen/tests/rung_env.rs`). The score labels a choice `experimental`
+unless accuracy is accepted (bitwise, or `--kl-max` + `--top1-min`), the arms' objects show no
+spills, and `--roofline` / `--library-resources` records are given; only `qualified` choices go
+into a production recipe, and the mixed packet then needs its own full gates (FP32 included).
+
 Store tuning evidence with source and object SHA256s, exact compiler/cubin flags, launch geometry,
 device/compiler versions, shape/precision and correctness results. A Git commit is useful
 traceability, but evidence remains valid across commits if these effective inputs match; changed

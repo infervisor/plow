@@ -48,6 +48,7 @@ pub(crate) fn apply_moe_prefill(
             if !matches!(profile, "sm90a" | "sm_90a") {
                 return groups;
             }
+            let route = crate::emit_config::active().moe_pf_lt_route;
             for (head, pair) in insts.windows(2).enumerate() {
                 let (glu, down) = (&pair[0], &pair[1]);
                 if glu.op == DevOp::MoeGroupGluGemmaPf as u16
@@ -70,6 +71,18 @@ pub(crate) fn apply_moe_prefill(
                 if let [quant, down, comb] = insts.get(head + 1..head + 4).unwrap_or_default() {
                     if is_w8a8_prefill_chain(model, glu, quant, down, comb) {
                         groups[head..head + 4].fill(Some(head));
+                        if route && head >= 4 && is_w8a8_route_prologue(&insts[head - 4..=head]) {
+                            let program = &model.progs[index];
+                            if queue_contiguous(program, head - 4..head + 4) {
+                                groups[head - 4..head].fill(Some(head));
+                            } else {
+                                eprintln!(
+                                    "  cuBLASLt MoE prefill: T={} layer at inst {head}: router \
+                                     prologue not contiguous in the queue, left in the interpreter",
+                                    model.prog_t[index]
+                                );
+                            }
+                        }
                     }
                 }
             }
@@ -101,6 +114,49 @@ fn is_w8a8_prefill_chain(
         && glu.i[0] % 16 == 0
         && glu.i[1] % 16 == 0
         && is_prefill_tail(glu, down, comb)
+}
+
+/// `[RmsNorm (expert input), MoeRouterGemmaPf, MoeAlignGemmaPf, QuantFp8 (of the norm), glu]`:
+/// the W8A8 chain's inputs, which `PLOW_EMIT_MOE_PF_LT_ROUTE` moves into the library segment.
+/// plowrt's `moe_lt::route_prologue` checks the same operands.
+fn is_w8a8_route_prologue(insts: &[DevInst]) -> bool {
+    let [norm, router, align, quant, glu] = insts else {
+        return false;
+    };
+    let rows = align.i[0];
+    norm.op == DevOp::RmsNorm as u16
+        && router.op == DevOp::MoeRouterGemmaPf as u16
+        && align.op == DevOp::MoeAlignGemmaPf as u16
+        && quant.op == DevOp::QuantFp8 as u16
+        && glu.op == DevOp::MoeGroupGluGemmaPfW8a8 as u16
+        && [norm.i[0], norm.i[1]] == [rows, glu.i[1]]
+        && norm.i[7] == 0
+        && norm.t[3] == packet::dev::TENSOR_NONE
+        && norm.t[4] == packet::dev::TENSOR_NONE
+        && [router.i[0], router.i[1], router.i[2], router.i[3]]
+            == [glu.i[1], glu.i[2], align.i[2], rows]
+        && align.i[1] == glu.i[2]
+        && align.t[1] == router.t[0]
+        && [align.t[0], align.t[2]] == [glu.t[3], glu.t[4]]
+        && quant.t[1] == norm.t[0]
+        && [quant.t[0], quant.t[2]] == [glu.t[1], glu.t[5]]
+        && [quant.i[0], quant.i[1]] == [rows, glu.i[1]]
+        && quant.t[3] == packet::dev::TENSOR_NONE
+        && quant.t[4] == packet::dev::TENSOR_NONE
+}
+
+/// Every queue entry of `insts` forms one contiguous run of the program's global queue.
+fn queue_contiguous(program: &packet::devbuild::Program, insts: std::ops::Range<usize>) -> bool {
+    let at: Vec<usize> = program
+        .gq_stream
+        .iter()
+        .enumerate()
+        .filter(|(_, e)| insts.contains(&(e.inst as usize)))
+        .map(|(i, _)| i)
+        .collect();
+    at.first()
+        .zip(at.last())
+        .is_some_and(|(&lo, &hi)| hi + 1 - lo == at.len())
 }
 
 /// The `MoeCombineNormGemmaPf` right after a routed prefill pair, which the route's glue runs
@@ -860,6 +916,37 @@ mod tests {
             tensor.bytes = extent;
         }
         model
+    }
+
+    #[test]
+    fn route_prologue_rejects_the_norm_weight_offset() {
+        let none = packet::dev::TENSOR_NONE;
+        let mut insts = [
+            DevOp::RmsNorm,
+            DevOp::MoeRouterGemmaPf,
+            DevOp::MoeAlignGemmaPf,
+            DevOp::QuantFp8,
+            DevOp::MoeGroupGluGemmaPfW8a8,
+        ]
+        .map(|op| DevInst {
+            op: op as u16,
+            t: [none; 8],
+            ..Default::default()
+        });
+        let [norm, router, align, quant, glu] = &mut insts;
+        glu.t[..6].copy_from_slice(&[0, 1, 2, 3, 4, 9]);
+        glu.i[..3].copy_from_slice(&[704, 2816, 128]);
+        norm.t[..3].copy_from_slice(&[16, 17, 18]);
+        norm.i[..2].copy_from_slice(&[1024, 2816]);
+        router.t[0] = 8;
+        router.i[..4].copy_from_slice(&[2816, 128, 8, 1024]);
+        align.t[..3].copy_from_slice(&[3, 8, 4]);
+        align.i[..3].copy_from_slice(&[1024, 128, 8]);
+        quant.t[..3].copy_from_slice(&[1, 16, 9]);
+        quant.i[..2].copy_from_slice(&[1024, 2816]);
+        assert!(is_w8a8_route_prologue(&insts));
+        insts[0].i[7] = 1;
+        assert!(!is_w8a8_route_prologue(&insts));
     }
 
     #[test]

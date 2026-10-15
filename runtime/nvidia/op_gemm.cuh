@@ -2586,12 +2586,14 @@ static __device__ __noinline__ void d_quant_fp8_wpr(uint8_t* __restrict__ xq,
 
 #if PLOW_NV_THREADS == 256
 /* STORE = false: the bf16 GLU output has no reader (plowrt checks the program), so only the FP8
- * bytes and row scales are written; both are bit-identical to the storing form. */
-template <bool STORE = true>
+ * bytes and row scales are written; both are bit-identical to the storing form.
+ * WIDTH = 0 takes the row width from `runtime_width` (8-aligned, at most 8 * 2048). */
+template <bool STORE = true, unsigned WIDTH = 15360>
 static __device__ __forceinline__ void d_glu_quant_fp8_cached(__nv_bfloat16* output, uint8_t* quantized, float* scales,
                                   const __nv_bfloat16* gate, const __nv_bfloat16* up, unsigned rows,
-                                  unsigned slice, unsigned nblk, float* part) {
-    constexpr unsigned width = 15360;
+                                  unsigned slice, unsigned nblk, float* part,
+                                  unsigned runtime_width = 0) {
+    const unsigned width = WIDTH ? WIDTH : runtime_width;
     for (unsigned row = slice; row < rows; row += nblk) {
         bf16v8 values[8];
         const size_t base = size_t(row) * width;

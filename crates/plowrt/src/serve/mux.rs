@@ -763,6 +763,18 @@ impl ModelMux {
         self.submit_arrived(job, arrived, None)
     }
 
+    /// `PLOW_SHED_QUEUE_DEPTH`: requests waiting for their first token (queued plus seated in
+    /// prefill) are at the cap, so a new one would only queue into a long TTFT; a load balancer
+    /// can spill it instead. A soft bound: the seated count refreshes once per dispatcher tick.
+    fn shed_queue_depth(&self) -> bool {
+        let cap = crate::config::RuntimeConfig::get().shed_queue_depth;
+        cap > 0 && {
+            let waiting = self.metrics.queued_requests.load(Ordering::Relaxed)
+                + self.metrics.prefill_waiting.load(Ordering::Relaxed);
+            waiting >= u64::from(cap)
+        }
+    }
+
     /// Counts one request against [`Self::queue_cap`]; `false` (nothing counted) when it is full.
     fn reserve_queue(&self) -> bool {
         let queued = &self.metrics.queued_requests;
@@ -784,6 +796,11 @@ impl ModelMux {
     ) -> std::result::Result<(), SubmitError> {
         Metrics::inc(&self.metrics.requests);
         self.metrics.serving.max_tokens.tokens(job.gen.max_tokens);
+        if self.shed_queue_depth() {
+            Metrics::inc(&self.metrics.rejected);
+            Metrics::inc(&self.metrics.shed_queue);
+            return Err(SubmitError::Full(job));
+        }
         if !self.reserve_queue() {
             Metrics::inc(&self.metrics.rejected);
             return Err(if self.tx.is_closed() {
@@ -1287,6 +1304,10 @@ pub fn spawn(
             }
             let live = slots.iter().filter(|s| s.is_some()).count();
             metrics.slots_active.store(live as u64, Ordering::Relaxed);
+            let prefilling = slots.iter().flatten().filter(|s| s.step == 0).count();
+            metrics
+                .prefill_waiting
+                .store(prefilling as u64, Ordering::Relaxed);
             // The budget follows device memory (other models load, grow and leave); memory
             // pressure asks the planner to evict an idle co-tenant so this model can grow.
             #[cfg(feature = "cuda")]
@@ -1420,6 +1441,7 @@ pub fn spawn(
                     &mut draining,
                     &mut drain_done,
                     &mut late_drains,
+                    prefix_probe.as_ref(),
                 );
             }
 
@@ -1641,6 +1663,7 @@ pub fn spawn(
                     &mut draining,
                     &mut drain_done,
                     &mut late_drains,
+                    prefix_probe.as_ref(),
                 ) > 0
             {
                 queued_behind = true;
@@ -1832,11 +1855,27 @@ pub fn spawn(
                 .map(|s| s.prompt_ids.len().saturating_sub(s.pf_pos))
                 .sum();
             let taken_slots = std::mem::take(&mut slots);
-            let taken_obs = obs.take().unwrap_or_else(|| {
+            #[cfg_attr(not(feature = "cuda"), allow(unused_mut))]
+            let mut taken_obs = obs.take().unwrap_or_else(|| {
                 let mut obs = RunObserver::new(state.record_trace, indirection_size);
                 obs.set_kv_pages_range(kv_pages_range.clone());
                 obs
             });
+            #[cfg(feature = "cuda")]
+            {
+                taken_obs.host.queued_prefill_rows = if pf_itl_budget_ms() > 0 {
+                    // A CFG pair prefills two sequences, as its KV reservation counts it.
+                    waiting
+                        .iter()
+                        .map(|(job, _)| {
+                            let pair = job.opts.speech.as_ref().is_some_and(|s| s.cfg.is_some());
+                            job.prompt_ids.len() * (1 + usize::from(pair))
+                        })
+                        .sum()
+                } else {
+                    0
+                };
+            }
             let arena_ref = arena.clone();
             let kv_pages_for_tick = kv_pages_range.clone();
 
@@ -2107,12 +2146,22 @@ fn drain_channel(
     draining: &mut bool,
     drain_done: &mut Option<tokio::sync::oneshot::Sender<()>>,
     late_drains: &mut Vec<tokio::sync::oneshot::Sender<()>>,
+    prefix: Option<&crate::memory::vmm::PrefixProbe>,
 ) -> usize {
     let mut jobs = 0;
     while let Ok(msg) = rx.try_recv() {
         match msg {
-            MuxMsg::Job(job, arrived) => {
+            MuxMsg::Job(mut job, arrived) => {
                 note_arrival(job.arrived, load, metrics);
+                // A host-tier boundary this prompt would attach starts its restore now, so
+                // the copy overlaps the queueing (`VmmKv::enable_host_tier`). One pool lock
+                // per arrival, nothing when the tier is off.
+                if let Some(p) = prefix.filter(|p| p.host_tier()) {
+                    if job.opts.prefix.is_none() {
+                        job.opts.prefix = Some(p.key(&job.prompt_ids));
+                    }
+                    p.prefetch(&job.prompt_ids, job.opts.prefix.as_ref());
+                }
                 waiting.push_back((job, arrived));
                 jobs += 1;
             }
@@ -3395,6 +3444,9 @@ fn run_one_tick(
                     let mut completed = std::mem::take(&mut obs.host.prefill_tokens);
                     completed.clear();
                     let mut dev_sampled = false;
+                    if obs.host.ride.needs_ladder() {
+                        obs.host.ride.set_ladder(&e.pf_bucket_ladder());
+                    }
                     if obs.host.ride.needs_widths() {
                         let widths: Vec<usize> = e
                             .effective_decode_rungs()
@@ -3416,6 +3468,7 @@ fn run_one_tick(
                         &mut dev_sampled,
                         &mut obs.host.ride,
                         aging,
+                        obs.host.queued_prefill_rows,
                     ) {
                         if tick_fault.is_none() {
                             tick_fault = Some(f);
@@ -5446,7 +5499,7 @@ fn trim_for_riders(
 ) -> bool {
     let cost = pf_chunk_cost_rows();
     let tail = (rows + decode_rows).saturating_sub(bucket);
-    let lone_tail = tail + beyond < cost && spilled - bucket < cost;
+    let lone_tail = tail + beyond < cost && spilled.saturating_sub(bucket) < cost;
     decode_rows > 0 && spilled > bucket && bucket >= cost && !lone_tail
 }
 
@@ -5774,6 +5827,158 @@ fn arrival_key(arrived: Instant, now: Instant) -> u64 {
     u64::MAX - u64::try_from(now.saturating_duration_since(arrived).as_nanos()).unwrap_or(u64::MAX)
 }
 
+/// Prefill rows still owed: every seated prompt's unsent rows plus the queued prompts'. The ITL
+/// budget yields when this exceeds one full launch; the launch candidates alone are capped
+/// slices (`pf_plan_slice` under the chunk cap) and miss both the remainders and the queue.
+#[cfg(feature = "cuda")]
+fn itl_backlog_rows(seated_unsent: impl IntoIterator<Item = usize>, queued_rows: usize) -> usize {
+    seated_unsent
+        .into_iter()
+        .fold(queued_rows, usize::saturating_add)
+}
+
+/// [`itl_backlog_rows`] over the seated prompts of `slots[..cap]`.
+#[cfg(feature = "cuda")]
+fn itl_owed_rows(slots: &[Option<Slot>], cap: usize, withheld: usize, queued_rows: usize) -> usize {
+    itl_backlog_rows(
+        (0..cap.min(slots.len())).filter_map(|i| {
+            let (s, pf_pos) = pack_row(slots, i)?;
+            (s.step == 0).then(|| s.prompt_ids.len().saturating_sub(withheld + pf_pos))
+        }),
+        queued_rows,
+    )
+}
+
+/// Rows a launch under the ITL budget takes (riders included), given the budget's measured rung:
+/// the launch holds the riders, and the prompt keeps at least half the rung.
+#[cfg(feature = "cuda")]
+fn itl_rung_rows(e: &crate::exec::gpu::GpuEngine, rung: usize, decode_rows: usize) -> usize {
+    rung.max(e.pf_cover_rows(decode_rows * 2))
+}
+
+#[cfg(feature = "cuda")]
+fn pf_itl_budget_ms() -> u32 {
+    crate::config::RuntimeConfig::get().pf_itl_budget_ms
+}
+
+#[cfg(feature = "cuda")]
+fn pf_admit_overlap() -> bool {
+    crate::config::RuntimeConfig::get().pf_admit_overlap
+}
+
+/// `PLOW_PF_ADMIT_OVERLAP`: a request whose admission waits for the next launch's host window.
+#[cfg(feature = "cuda")]
+struct WindowAdmit {
+    slot: usize,
+    prompt: Vec<u32>,
+    total: usize,
+    prefix: Option<crate::memory::vmm::PrefixKey>,
+    pin: Option<std::time::Duration>,
+    /// `None` until attempted.
+    outcome: Option<Result<Option<usize>>>,
+}
+
+/// Prefill rows the launch being formed can still take before a fresh request's admission
+/// is worth GPU time: with admitted rows already filling it, admission moves into the launch's
+/// host window instead.
+#[cfg(feature = "cuda")]
+struct AdmitRoom {
+    ready: usize,
+    left: usize,
+}
+
+/// Rows the launch being formed takes: `launch_cap`, or the ITL budget's rung when it applies.
+#[cfg(feature = "cuda")]
+fn admit_launch_rows(launch_cap: usize, itl_rung: Option<usize>) -> usize {
+    itl_rung.map_or(launch_cap, |rung| launch_cap.min(rung))
+}
+
+#[cfg(feature = "cuda")]
+impl AdmitRoom {
+    fn new(ready: usize, launch_rows: usize, decode_rows: usize) -> Self {
+        Self {
+            ready,
+            left: launch_rows.saturating_sub(decode_rows + ready),
+        }
+    }
+
+    /// Nothing admitted to launch yet: admitting now is the only way the GPU gets work.
+    fn fits(&self, rows: usize) -> bool {
+        self.ready == 0 || rows <= self.left
+    }
+
+    fn add(&mut self, rows: usize) {
+        self.ready += rows;
+        self.left = self.left.saturating_sub(rows);
+    }
+}
+
+/// Admit `jobs` in order. Inside a launch window (`bounded`) the first always runs and the rest
+/// only while the launch still runs: admission past the device's end delays this tick's tokens.
+#[cfg(feature = "cuda")]
+fn admit_window(e: &mut crate::exec::gpu::GpuEngine, jobs: &mut [WindowAdmit], bounded: bool) {
+    for (n, job) in jobs.iter_mut().enumerate() {
+        if bounded && n > 0 && !e.launch_in_flight() {
+            break;
+        }
+        if let Some(key) = job.prefix.take() {
+            e.stage_prefix_key(job.slot, Some(key));
+        }
+        let admitted = e.admit_packed_slot(job.slot, &job.prompt, job.total);
+        if let (Ok(Some(_)), Some(ttl)) = (&admitted, job.pin) {
+            e.hold_session_prefix(job.slot, ttl);
+        }
+        job.outcome = Some(admitted);
+    }
+}
+
+/// Apply [`admit_window`]'s outcomes to the slot table, as the pre-launch admission would have.
+#[cfg(feature = "cuda")]
+fn apply_window(
+    e: &crate::exec::gpu::GpuEngine,
+    slots: &mut [Option<Slot>],
+    jobs: &mut Vec<WindowAdmit>,
+    arena: &Option<SharedKvState>,
+    tick_fault: &mut Option<crate::DeviceErrorInfo>,
+) {
+    let (mut admitted, mut waiting, mut skipped) = (0usize, 0usize, 0usize);
+    for job in jobs.drain(..) {
+        let i = job.slot;
+        let Some(request) = slots[i].as_mut() else {
+            continue;
+        };
+        match job.outcome {
+            None => {
+                skipped += 1;
+                if request.prefix.is_none() {
+                    request.prefix = job.prefix;
+                }
+            }
+            Some(Ok(Some(frontier))) => {
+                admitted += 1;
+                request.pf_pos = frontier;
+                request.cached_tokens =
+                    (e.attached_rows(i) as usize).max(request.resume.min(frontier));
+            }
+            Some(Ok(None)) => waiting += 1,
+            Some(Err(err)) => {
+                tracing::warn!(
+                    slot = i,
+                    error = %err,
+                    error_code = ?err.device_code(),
+                    fatal = err.is_fatal(),
+                    "gpu: packed KV admission failed"
+                );
+                note_fault(tick_fault, &err);
+                fail_slot(&mut slots[i], arena, err);
+            }
+        }
+    }
+    if packlog::on() {
+        eprintln!("PACKLOG WINDOW admitted={admitted} waiting={waiting} skipped={skipped}");
+    }
+}
+
 /// RTX-12 chunked packing: per-REQUEST cap on the prefill rows one request may
 /// contribute to a single batched launch. `PLOW_PF_CHUNK=C` clamps each waiting
 /// request's slice to `C` rows so the `per_launch` budget (`PLOW_PF_INTERLEAVE`)
@@ -5806,6 +6011,7 @@ fn gpu_prefill_batched_pass(
     dev_sampled: &mut bool,
     ride: &mut crate::sched::ride::RideCost,
     aging: std::time::Duration,
+    queued_rows: usize,
 ) -> Option<crate::DeviceErrorInfo> {
     use crate::exec::gpu::PfBatchReq;
 
@@ -5843,8 +6049,34 @@ fn gpu_prefill_batched_pass(
     let chunk_cap = pf_chunk_rows().min(e.pf_request_max_rows());
     let stage = e.pf_stage_rows();
     let adaptive = crate::serve::policy::adaptive_packing();
+    let overlap = unified && compact && pf_admit_overlap();
+    let probe = if overlap { e.vmm_prefix_probe() } else { None };
+    let mut window: Vec<WindowAdmit> = Vec::new();
     loop {
         let host_t = packlog::on().then(Instant::now);
+        let mut room = overlap.then(|| {
+            let ready: usize = (0..cap.min(slots.len()))
+                .filter_map(|i| {
+                    let (s, pf_pos) = pack_row(slots, i)?;
+                    let n = s.prompt_ids.len();
+                    (e.packed_slot_ready(i) && s.step == 0 && pf_pos + withheld < n)
+                        .then(|| (n - withheld - pf_pos).min(chunk_cap))
+                })
+                .sum();
+            // Under the ITL budget the launch takes only the budget's rung: rows ready past it do
+            // not fill this launch, so a fresh request's admission belongs in the host window, not
+            // in front of the launch its riders wait for. Pre-admission rows over-count the
+            // backlog, so a budget this sees on is on at the launch too.
+            let rung = ride
+                .rows_fit(f64::from(pf_itl_budget_ms()))
+                .filter(|_| {
+                    decode_rows > 0
+                        && pf_itl_budget_ms() > 0
+                        && itl_owed_rows(slots, cap, withheld, queued_rows) <= budget_max
+                })
+                .map(|rung| itl_rung_rows(e, rung, decode_rows));
+            AdmitRoom::new(ready, admit_launch_rows(launch_cap, rung), decode_rows)
+        });
         for (i, slot) in slots.iter_mut().enumerate().take(cap) {
             let Some(request) = slot.as_mut().filter(|s| s.step == 0) else {
                 continue;
@@ -5862,6 +6094,33 @@ fn gpu_prefill_batched_pass(
             fit_speech_budget(request, e.max_ctx());
             let total = request.prompt_ids.len() + request.gen.max_tokens.max(1);
             let pair = request.cfg.is_some();
+            let fresh_rows = room
+                .as_ref()
+                .filter(|_| {
+                    !pair
+                        && request.speech.is_none()
+                        && request.resume == 0
+                        && !e.packed_slot_ready(i)
+                })
+                .map(|_| {
+                    let cached = probe.as_ref().map_or(0, |p| {
+                        p.cached_rows_keyed(&request.prompt_ids, request.prefix.as_ref())
+                    });
+                    request.prompt_ids.len().saturating_sub(cached as usize)
+                });
+            if let (Some(room), Some(rows)) = (room.as_ref(), fresh_rows) {
+                if !room.fits(rows) {
+                    window.push(WindowAdmit {
+                        slot: i,
+                        prompt: request.prompt_ids.clone(),
+                        total,
+                        prefix: request.prefix.take(),
+                        pin: request.session.as_ref().and_then(|s| s.pin_ttl()),
+                        outcome: None,
+                    });
+                    continue;
+                }
+            }
             let admitted = (|| -> Result<()> {
                 for row in [i, i + 1].into_iter().take(1 + pair as usize) {
                     let fresh = !e.packed_slot_ready(row);
@@ -5909,7 +6168,13 @@ fn gpu_prefill_batched_pass(
                 Ok(())
             })();
             match admitted {
-                Ok(_) => {}
+                Ok(_) => {
+                    if let (Some(room), Some(rows)) = (room.as_mut(), fresh_rows) {
+                        if e.packed_slot_ready(i) {
+                            room.add(rows.min(chunk_cap));
+                        }
+                    }
+                }
                 Err(err) => {
                     tracing::warn!(
                         slot = i,
@@ -5971,14 +6236,49 @@ fn gpu_prefill_batched_pass(
             })
             .collect();
         if candidates.is_empty() {
+            if !window.is_empty() {
+                admit_window(e, &mut window, false);
+                apply_window(e, slots, &mut window, arena, &mut tick_fault);
+            }
             return tick_fault;
         }
         let avail: usize = candidates.iter().map(|c| c.span.n_rows as usize).sum();
         // `RideCost` keys both the decision and the launch it observes by the prefill bucket:
         // keyed by the launch's own bucket, a riding launch that spills (4096 + 63 into 4160)
         // records under a bucket the decision never asks about, and the rider cost is never learned.
+        // ITL budget (`PLOW_PF_ITL_BUDGET_MS`): with decode rows riding, the launch takes the
+        // widest rung whose measured launch time fits the budget, so a rider's wait is bounded
+        // and a long prompt runs as several launches. Riders always ride under a budget: a
+        // separate decode step after the launch would add a step to their wait. A launch with
+        // an indivisible media span runs unbudgeted (a span cannot be cut to a rung).
+        // A backlog wider than one full launch means prefill is the bottleneck: every extra launch
+        // costs its fixed overhead in capacity (H100 26B: ~24 ms; at 2.2 sess/s the cap cost 18% of
+        // prefill rows/s), so the budget yields to throughput until the backlog drains.
+        let budget_on = decode_rows > 0
+            && pf_itl_budget_ms() > 0
+            && itl_owed_rows(slots, cap, withheld, queued_rows) <= budget_max;
+        let media_spans = candidates.iter().any(|c| {
+            slots[c.span.slot as usize]
+                .as_ref()
+                .is_some_and(|s| s.mm.as_deref().is_some_and(|j| j.spans()))
+        });
+        let itl_cap = if budget_on && !media_spans {
+            ride.rows_within(f64::from(pf_itl_budget_ms()))
+        } else {
+            None
+        };
+        // The rung holds the riders too: their rows are reserved inside it. The prompt keeps at
+        // least half the rung, so many riders widen the rung instead of starving the prompt.
+        let itl_cap = itl_cap.map(|cap| itl_rung_rows(e, cap, decode_rows));
+        let (launch_cap, launch_max) = match itl_cap {
+            Some(cap) => (
+                launch_cap.min(cap.saturating_sub(decode_rows).max(1)),
+                launch_max.min(cap),
+            ),
+            None => (launch_cap, launch_max),
+        };
         let ride_key = e.pf_pack_budget(avail.min(launch_cap));
-        if std::mem::take(&mut ride_open) && !ride.ride(ride_key, feeds.len()) {
+        if std::mem::take(&mut ride_open) && !budget_on && !ride.ride(ride_key, feeds.len()) {
             unified = false;
             decode_rows = 0;
         }
@@ -6000,14 +6300,15 @@ fn gpu_prefill_batched_pass(
         let bucket = e.pf_pack_budget(rows);
         // Under the unified token batch the decode rows ride in this launch, and the batch takes the
         // smallest bucket holding every row.
-        let trim = trim_for_riders(
-            bucket,
-            e.pf_launch_bucket(rows.min(bucket) + decode_rows)
-                .unwrap_or(usize::MAX),
-            decode_rows,
-            rows,
-            avail - rows,
-        );
+        // An indivisible media span cut by a trim would leave the launch empty: it spills instead.
+        let trim = !media_spans
+            && trim_for_riders(
+                bucket,
+                e.pf_cover_rows(rows.min(bucket) + decode_rows),
+                decode_rows,
+                rows,
+                avail - rows,
+            );
         let per_launch = if trim {
             bucket.saturating_sub(decode_rows).max(1)
         } else {
@@ -6056,15 +6357,20 @@ fn gpu_prefill_batched_pass(
             })
             .collect();
         if pack.is_empty() {
+            if !window.is_empty() {
+                admit_window(e, &mut window, false);
+                apply_window(e, slots, &mut window, arena, &mut tick_fault);
+            }
             return tick_fault;
         }
         if let Some(t) = host_t {
             eprintln!(
-                "PACKLOG PACK reqs={} rows={} decode_feeds={} unified={} admit_plan_us={:.0}",
+                "PACKLOG PACK reqs={} rows={} decode_feeds={} unified={} itl_cap={} admit_plan_us={:.0}",
                 pack.len(),
                 pack.iter().map(|p| p.2).sum::<usize>(),
                 feeds.len(),
                 unified,
+                itl_cap.unwrap_or(0),
                 t.elapsed().as_secs_f64() * 1e6
             );
         }
@@ -6102,7 +6408,17 @@ fn gpu_prefill_batched_pass(
                 })
             });
             let requests: smallvec::SmallVec<[_; 16]> = decode.chain(prefill).collect();
-            let result = if e.dev_sample_enabled() {
+            let result = if !window.is_empty() {
+                let sampled = e.dev_sample_enabled();
+                *dev_sampled = sampled;
+                let spec = |slot: u32| slots.get(slot as usize)?.as_ref().and_then(dev_row_spec);
+                let spec: Option<&dyn Fn(u32) -> Option<crate::exec::gpu::DevSample>> =
+                    sampled.then_some(&spec);
+                let jobs = &mut window;
+                e.token_batch_step_window(&requests, unified_output, spec, &mut |e| {
+                    admit_window(e, jobs, true)
+                })
+            } else if e.dev_sample_enabled() {
                 // Stochastic rows draw on the device: a host draw downloads the row's 512 KiB of
                 // logits and walks the vocabulary once per row, serially, inside the tick.
                 *dev_sampled = true;
@@ -6169,8 +6485,30 @@ fn gpu_prefill_batched_pass(
                     Ok(())
                 })
         };
-        if res.is_ok() {
-            ride.observe_launch(ride_key, riders, t_launch.elapsed().as_secs_f64() * 1e3);
+        let mut admitted_in_launch = false;
+        if !window.is_empty() {
+            // A launch without a host window (the decode rows left it) admits them now.
+            if window.iter().all(|job| job.outcome.is_none()) && !unified {
+                admit_window(e, &mut window, false);
+            }
+            // Any attempt counts: `Ok(None)` also follows an allocation that failed under pressure.
+            admitted_in_launch = window.iter().any(|job| job.outcome.is_some());
+            apply_window(e, slots, &mut window, arena, &mut tick_fault);
+        }
+        // A launch that ran admissions measured them (and the restores they queued behind it),
+        // not the launch: they cost the same at any rung, so they would price the rung, and every
+        // rung below it in turn, out of the ITL budget.
+        if res.is_ok() && !admitted_in_launch {
+            let ms = t_launch.elapsed().as_secs_f64() * 1e3;
+            ride.observe_launch(ride_key, riders, ms);
+            // The rung actually launched: the smallest bucket holding the packed rows and riders.
+            // Only `rows_within` (the ITL budget) reads it.
+            if pf_itl_budget_ms() > 0 {
+                ride.observe_rung(
+                    e.pf_cover_rows(pack.iter().map(|p| p.2).sum::<usize>() + riders),
+                    ms,
+                );
+            }
         }
         match res {
             Ok(()) => {
@@ -7662,6 +8000,67 @@ mod tests {
 
     #[cfg(feature = "cuda")]
     #[test]
+    fn a_rider_spill_is_judged_on_the_rung_the_launch_runs() {
+        let ladder = [
+            128, 256, 512, 1024, 1088, 1152, 2048, 2112, 4096, 4160, 4224, 8192,
+        ];
+        let cover = |rows| crate::exec::gpu::cover_rung(ladder.iter().copied(), rows);
+        // 4224 prompt rows + 60 riders run the 8192 rung (the cheapest cover's first launch,
+        // 4160, is narrower than the rows): the riders are trimmed into the next launch.
+        assert_eq!(cover(4224 + 60), 8192);
+        assert!(super::trim_for_riders(4224, cover(4224 + 60), 60, 4224, 0));
+        // 2112 + 20 riders spill to 4096, 1152 + 10 to 2048.
+        assert!(super::trim_for_riders(2112, cover(2112 + 20), 20, 2112, 0));
+        assert!(super::trim_for_riders(
+            1152,
+            cover(1152 + 10),
+            10,
+            1152,
+            600
+        ));
+        // Riders that fit the bucket keep it.
+        assert_eq!(cover(1100 + 10), 1152);
+        assert!(!super::trim_for_riders(1152, cover(1100 + 10), 10, 1100, 0));
+        assert_eq!(cover(9000), 8192);
+        assert_eq!(crate::exec::gpu::cover_rung(std::iter::empty(), 10), 0);
+        // A spilled rung below the bucket is not an underflow.
+        assert!(!super::trim_for_riders(1152, 128, 10, 1152, 0));
+    }
+
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn admission_room_under_the_itl_budget_is_the_budget_rung() {
+        // 1000 rows admitted and 4 riders: an unbudgeted 8192-row launch still has room for a
+        // 3000-row prompt; the budget's 1152-row launch does not, so its admission waits for the
+        // launch's host window instead of running in front of it.
+        let unbudgeted = super::AdmitRoom::new(1000, super::admit_launch_rows(8192, None), 4);
+        assert!(unbudgeted.fits(3000));
+        let budgeted = super::AdmitRoom::new(1000, super::admit_launch_rows(8192, Some(1152)), 4);
+        assert!(!budgeted.fits(3000));
+        assert!(budgeted.fits(148));
+        assert_eq!(super::admit_launch_rows(1024, Some(2048)), 1024);
+        // Nothing admitted yet: the first admission always runs before the launch.
+        assert!(super::AdmitRoom::new(0, 1152, 4).fits(6000));
+    }
+
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn itl_backlog_counts_remainders_and_queue_not_capped_slices() {
+        // Two seated 6K prompts sliced to 2048 each (4096 of candidates) under an 8192-row
+        // launch: the slices fit one launch, the backlog does not.
+        let full_launch = 8192;
+        let slices = 2048 + 2048;
+        assert!(slices <= full_launch);
+        assert!(super::itl_backlog_rows([6000, 6000], 0) > full_launch);
+        // Seated rows fit, the queue behind them does not.
+        assert!(super::itl_backlog_rows([1000], 0) <= full_launch);
+        assert!(super::itl_backlog_rows([1000], 7500) > full_launch);
+        assert_eq!(super::itl_backlog_rows(std::iter::empty(), 0), 0);
+        assert_eq!(super::itl_backlog_rows([usize::MAX], 1), usize::MAX);
+    }
+
+    #[cfg(feature = "cuda")]
+    #[test]
     fn queue_pack_rows_pack_short_prompts_and_run_long_ones_alone() {
         // An empty queue leaves the static bound; a lone prompt takes its rows.
         assert_eq!(super::queue_pack_rows(&[], 256, 4224), 4224);
@@ -7971,7 +8370,8 @@ mod tests {
                 &metrics,
                 &mut draining,
                 &mut drain_done,
-                &mut late
+                &mut late,
+                None,
             ),
             3
         );
@@ -8018,6 +8418,7 @@ mod tests {
             &mut draining,
             &mut drain_done,
             &mut late,
+            None,
         );
         let mut slots: Vec<Option<Slot>> = (0..1).map(|_| None).collect();
         let due = tick_due(&slots, &waiting, 0, now);

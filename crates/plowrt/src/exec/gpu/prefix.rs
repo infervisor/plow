@@ -446,12 +446,19 @@ impl GpuEngine {
                     slot_bytes,
                 })
                 .collect();
-            let rings = crate::memory::vmm::VmmRings::new_idle_backed(
+            let mut rings = crate::memory::vmm::VmmRings::new_idle_backed(
                 Arc::clone(be) as Arc<dyn crate::memory::vmm::VmmOps>,
                 &tensors,
                 geo.batch as usize,
             )?;
+            let park = crate::config::RuntimeConfig::get().vmm_ring_park;
+            if crate::config::RuntimeConfig::get().vmm_ring_recycle {
+                rings.enable_handle_recycling(crate::memory::vmm::kv_pool_cap());
+            } else if park > 0 {
+                rings.enable_bounded_park(u64::from(park) * rings.slot_charge());
+            }
             tracing::info!(
+                park,
                 slot_mib = rings.slot_charge() >> 20,
                 resident_mib = rings.stats().resident_bytes >> 20,
                 reserved_gib = rings.stats().reserved_bytes as f64 / (1u64 << 30) as f64,
@@ -505,6 +512,35 @@ impl GpuEngine {
                     // FP8 full-layer scales snapshot over `[0, p_a)`, not just the tail.
                     if !full_scale.is_empty() {
                         kv.enable_strict_publish();
+                    }
+                    tracing::info!(policy = ?kv.policy(), "vmm prefix: retention policy");
+                    let host_cap = rt.vmm_host_cache_bytes();
+                    if host_cap > 0 {
+                        // The largest snapshot a publish can produce (`vmm_snap_bytes` at
+                        // `max_ctx`): a full window, the fp8 full-layer scales over the whole
+                        // context and the partial block's rows.
+                        let g = kv.geometry();
+                        let full_scale_bytes = full_scale.len() as u64
+                            * 2
+                            * u64::from(g.kvh_full)
+                            * u64::from(g.max_ctx)
+                            * 4;
+                        let partial_bytes = g.full_layers.len() as u64
+                            * 2
+                            * u64::from(g.kvh_full)
+                            * u64::from(kv.block_rows() - 1)
+                            * u64::from(g.hd_full * g.elem);
+                        let slot_bytes =
+                            snap_row_bytes * u64::from(g.window) + full_scale_bytes + partial_bytes;
+                        match kv.enable_host_tier(host_cap, slot_bytes) {
+                            Ok(()) => tracing::info!(
+                                cap_mib = host_cap >> 20,
+                                slot_mib = slot_bytes >> 20,
+                                slots = host_cap / slot_bytes,
+                                "vmm prefix: host tier armed"
+                            ),
+                            Err(e) => tracing::warn!(error = %e, "vmm prefix: host tier off"),
+                        }
                     }
                     kv
                 }),
@@ -582,37 +618,54 @@ impl GpuEngine {
         let g = kv.geometry();
         let ring = v.ring;
         let mut off = buf;
-        let mut blit = |dev: u64, snap: u64, bytes: u64| -> Result<()> {
-            if to_snap {
-                self.be.memcpy_dtod_async(snap, dev, bytes, &self.stream)
-            } else {
-                self.be.memcpy_dtod_async(dev, snap, bytes, &self.stream)
-            }
-        };
         for &(sk, sv) in &v.slide_scale {
             let span = RingWindow::new(p_a.into(), g.window.into(), ring);
             let w = span.rows;
             for idx in [sk, sv] {
                 let base = self.devp[idx].base + b as u64 * g.kvh_slide as u64 * ring * 4;
-                for h in 0..g.kvh_slide as u64 {
-                    let hb = base + h * ring * 4;
-                    blit(hb + span.start * 4, off, span.first * 4)?;
-                    if span.first < w {
-                        blit(hb, off + span.first * 4, (w - span.first) * 4)?;
-                    }
-                    off += w * 4;
-                }
+                let heads = g.kvh_slide;
+                let (dev, snap) = ((base + span.start * 4, ring * 4), (off, w * 4));
+                self.vmm_copy_heads(dev, snap, span.first * 4, heads, to_snap)?;
+                let (dev, snap) = ((base, ring * 4), (off + span.first * 4, w * 4));
+                self.vmm_copy_heads(dev, snap, (w - span.first) * 4, heads, to_snap)?;
+                off += u64::from(heads) * w * 4;
             }
         }
         let ctx = g.max_ctx as u64;
         for &(sk, sv) in &v.full_scale {
             for idx in [sk, sv] {
                 let base = self.devp[idx].base + b as u64 * g.kvh_full as u64 * ctx * 4;
-                for h in 0..g.kvh_full as u64 {
-                    blit(base + h * ctx * 4, off, p_a as u64 * 4)?;
-                    off += p_a as u64 * 4;
-                }
+                let bytes = p_a as u64 * 4;
+                self.vmm_copy_heads((base, ctx * 4), (off, bytes), bytes, g.kvh_full, to_snap)?;
+                off += u64::from(g.kvh_full) * bytes;
             }
+        }
+        Ok(())
+    }
+
+    /// Copy `bytes` per KV head between a slot's cache tensor (`dev` = first head, head pitch)
+    /// and a snapshot region (`snap`, same), in the `to_snap` direction: one pitched copy for all
+    /// heads under `PLOW_VMM_SNAP_PITCHED`, else one copy per head.
+    fn vmm_copy_heads(
+        &self,
+        dev: (u64, u64),
+        snap: (u64, u64),
+        bytes: u64,
+        heads: u32,
+        to_snap: bool,
+    ) -> Result<()> {
+        if bytes == 0 {
+            return Ok(());
+        }
+        let (dst, src) = if to_snap { (snap, dev) } else { (dev, snap) };
+        if RuntimeConfig::get().vmm_snap_pitched {
+            return self
+                .be
+                .memcpy_dtod_pitched_async(dst, src, bytes, heads, &self.stream);
+        }
+        for h in 0..u64::from(heads) {
+            self.be
+                .memcpy_dtod_async(dst.0 + h * dst.1, src.0 + h * src.1, bytes, &self.stream)?;
         }
         Ok(())
     }
@@ -656,6 +709,8 @@ impl GpuEngine {
         let row_bytes = u64::from(g.hd_full * g.elem);
         let bytes = u64::from(partial) * row_bytes;
         let row0 = u64::from(rows - partial);
+        // One copy per head: the heads' rows live in separately mapped VMM blocks, and a pitched
+        // copy spanning the unmapped VA between them is rejected (CUDA_ERROR_INVALID_VALUE).
         for &(index, _, _) in &v.tensor_tracks {
             for h in 0..u64::from(g.kvh_full) {
                 let dev = self.devp[index].base
@@ -676,6 +731,9 @@ impl GpuEngine {
     /// rings, fp8 ring scales, fp8 full-layer scale prefixes, partial full-KV.
     /// `to_snap` picks the direction (publish writes, attach restores).
     pub(super) fn vmm_snap_copy(&self, b: usize, p_a: u32, buf: u64, to_snap: bool) -> Result<()> {
+        let t0 = RuntimeConfig::get()
+            .pf_packlog
+            .then(std::time::Instant::now);
         let copied = (|| {
             self.vmm_slide_copy(b, p_a, buf, to_snap)?;
             let (v, kv) = self.vmm_prefix().expect("vmm_snap_copy without prefix vmm");
@@ -693,8 +751,22 @@ impl GpuEngine {
                 + self.vmm_full_scale_bytes(p_a);
             self.vmm_partial_copy(b, p_a, partial, to_snap)
         })();
-        // Drain even a partially submitted copy before VMM remapping or snapshot release.
-        let completed = self.be.stream_synchronize(&self.stream);
+        let t1 = t0.map(|t| t.elapsed());
+        // Drain even a partially submitted copy before VMM remapping or snapshot release. Inside a
+        // launch window a whole restore is drained by the step instead (`deferred_attach`).
+        let completed = if self.window_open && !to_snap && copied.is_ok() {
+            Ok(())
+        } else {
+            self.be.stream_synchronize(&self.stream)
+        };
+        if let (Some(t0), Some(t1)) = (t0, t1) {
+            eprintln!(
+                "PACKLOG SNAP slot={b} to_snap={} rows={p_a} submit_us={} sync_us={}",
+                to_snap as u8,
+                t1.as_micros(),
+                (t0.elapsed() - t1).as_micros()
+            );
+        }
         copied.and(completed)
     }
 
@@ -741,7 +813,11 @@ impl GpuEngine {
             kv.begin_seq(b);
             return Err(error);
         }
-        kv.finish_attach(b);
+        if self.window_open {
+            self.deferred_attach.push(b);
+        } else {
+            kv.finish_attach(b);
+        }
         self.pos[b] = a.rows;
         self.vmm_attached[b] = a.rows;
         // Seed the row-token record with the attached prefix — the tail is
@@ -820,7 +896,7 @@ impl GpuEngine {
         Ok(self.pos[b] as usize)
     }
 
-    fn publish_boundary(&self, b: usize, p_a: u32) -> bool {
+    fn publish_boundary(&self, b: usize, p_a: u32, kind: crate::memory::vmm::Kind) -> bool {
         let Some((v, kv)) = self.vmm_prefix() else {
             return false;
         };
@@ -829,6 +905,12 @@ impl GpuEngine {
         let g = kv.geometry();
         if rows == 0 || toks.len() != rows as usize || p_a == 0 {
             return false;
+        }
+        // An already published boundary needs no copy: refresh it before the ring-overflow
+        // check, so a surviving prompt end is touched however far decode ran past it.
+        if kv.touch(b, toks, p_a, kind) {
+            tracing::debug!(slot = b, p_a, "vmm: boundary touched");
+            return true;
         }
         if !v.slide.is_empty() && rows - p_a > v.ring as u32 - g.window {
             tracing::debug!(
@@ -852,7 +934,7 @@ impl GpuEngine {
             return false;
         }
         let snap_bytes = self.vmm_snap_bytes(p_a);
-        if let Err(e) = kv.publish_at(b, toks, p_a, snap_bytes, |dst| {
+        if let Err(e) = kv.publish_kind(b, toks, p_a, kind, snap_bytes, |dst| {
             self.vmm_snap_copy(b, p_a, dst, true)
         }) {
             tracing::debug!(error = %e, slot = b, p_a, "vmm: publish_boundary skipped");
@@ -869,13 +951,13 @@ impl GpuEngine {
     /// block-aligned boundary has no tail, so any prompt sharing those blocks attaches to
     /// it), or every `PLOW_AMD_PREFIX_FINE_ROWS` rows when that is set.
     pub(super) fn vmm_publish(&self, b: usize, max_rows: u32) {
+        use crate::memory::vmm::Kind;
         let Some((v, kv)) = self.vmm_prefix() else {
             return;
         };
         let rows = self.pos[b];
         let toks = &self.seq_tokens[b];
         let g = kv.geometry();
-        let session = self.session_pin[b].is_some();
         let prompt = kv.prompt_rows(b);
         let prompt_end = is_prompt_end(rows, max_rows, prompt);
         // Every prompt end, not only a session's: a chat client's next turn re-renders the same
@@ -909,44 +991,37 @@ impl GpuEngine {
             tracing::debug!(slot = b, p_a, "vmm_publish skipped: p_a == 0");
             return;
         }
-        if session {
-            kv.note_session(b, toks);
-        }
         let step = crate::config::RuntimeConfig::get()
             .amd_prefix_fine_rows()
             .map_or(kv.block_rows(), |step| step.max(32));
-        // A session's next turn attaches to its prompt end, which retires every checkpoint and
-        // chunk end inside the prompt (`retire_superseded`), and its reply rows are re-rendered:
-        // those snapshots are transient, and each one's trim evicts another session's boundary.
-        // Publish them only for a request waiting on this prefill (`inflight_prefix`).
+        // A conversation's next turn attaches to its prompt end, with or without `X-Session-Id`;
+        // a whole-block checkpoint or chunk end inside the prompt only serves a request waiting
+        // on this prefill (`inflight_prefix`), and a shared prefix end publishes through
+        // `vmm_publish_shared`. Every other checkpoint is a private window copy
+        // (`vmm_snap_bytes`, ~100 MiB at Gemma-4 26B) whose trim evicts another conversation's
+        // prompt end: published unconditionally, a 6K-token chat turn wrote three such copies
+        // and the cache retained a prompt end for ~20 s against think times of minutes.
         let mut p = step;
         while p < p_a {
-            if !session || kv.checkpoint_awaited(toks, p) {
-                self.publish_boundary(b, p);
+            if kv.checkpoint_awaited(toks, p) {
+                self.publish_boundary(b, p, Kind::CHECKPOINT);
             }
             p += step;
         }
-        if session && !prompt_end && rows < prompt && !kv.checkpoint_awaited(toks, p_a) {
+        if !prompt_end && rows < prompt && !kv.checkpoint_awaited(toks, p_a) {
             return;
         }
-        // Only the prompt-end publish retires (a chunk-end publish also caps `max_rows` below
-        // `rows`): the next turn's prompt re-renders this turn's reply, which need not
-        // re-tokenize to the generated ids, so the turn-end boundary may not match it and the
-        // prompt-end boundary must survive until then.
-        let published = self.publish_boundary(b, p_a);
-        if let Some(ttl) = self.session_pin[b].filter(|_| published && prompt_end) {
-            // Pinned now, not at retire: while this turn decodes, other sessions' publishes
-            // must not evict it ahead of idle sessions' boundaries.
-            kv.pin_prefix(&toks[..p_a as usize], std::time::Instant::now() + ttl);
-            let freed = kv.retire_superseded(toks, p_a);
-            if freed > 0 {
-                tracing::debug!(
-                    slot = b,
-                    p_a,
-                    freed,
-                    "vmm: session retired superseded snapshots"
-                );
-            }
+        // A turn end (prompt + reply) is never published: the next prompt re-renders the reply
+        // and diverges before it (0 of 1223 attaches on Gemma 4); the prompt end below is
+        // restored or touched instead. The boundary tree retires structurally inside the publish.
+        let turn_end = rows > prompt;
+        if !turn_end {
+            let kind = if prompt_end {
+                Kind::PROMPT_END
+            } else {
+                Kind::CHECKPOINT
+            };
+            self.publish_boundary(b, p_a, kind);
         }
         // Turn end: pressure may have evicted the prompt end (the next turn's attach point)
         // while this turn decoded. The rings still hold its window, so restore it now, newest in
@@ -954,7 +1029,7 @@ impl GpuEngine {
         // `X-Session-Id` continues its conversation the same way.
         let end = session_prompt_end(prompt) / 32 * 32;
         if rows > prompt && end > 0 && end < p_a {
-            self.publish_boundary(b, end);
+            self.publish_boundary(b, end, Kind::PROMPT_END);
         }
     }
 
@@ -967,7 +1042,7 @@ impl GpuEngine {
         };
         let rows = kv.share_rows(b);
         if rows > c0 && rows <= self.pos[b] {
-            self.publish_boundary(b, rows);
+            self.publish_boundary(b, rows, crate::memory::vmm::Kind::SHARED_END);
         }
     }
 

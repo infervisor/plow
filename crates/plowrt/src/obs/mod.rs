@@ -27,6 +27,11 @@ pub struct Metrics {
     pub rejected: AtomicU64,
     /// Requests accepted by the HTTP path but not yet moved into engine slots.
     pub queued_requests: AtomicU64,
+    /// Seated requests still waiting for their first token (prefill backlog), at the
+    /// dispatcher's last loop top.
+    pub prefill_waiting: AtomicU64,
+    /// Requests refused with 429 because the waiting queue was over `PLOW_SHED_QUEUE_DEPTH`.
+    pub shed_queue: AtomicU64,
     /// λ and ρ scaled ×1000 (atomics are integer; f64 read back on export).
     /// ρ here is the QUEUEING utilization λ/μ from `sched::admission`, not a
     /// memory or SM occupancy figure — see `LoadEstimator::utilization`.
@@ -102,6 +107,8 @@ impl Metrics {
             other.kv_budget_denials.load(Ordering::Relaxed),
             Ordering::Relaxed,
         );
+        self.shed_queue
+            .fetch_add(other.shed_queue.load(Ordering::Relaxed), Ordering::Relaxed);
     }
 
     pub fn accumulate(&self, other: &Self) {
@@ -120,6 +127,10 @@ impl Metrics {
         );
         self.queued_requests.fetch_add(
             other.queued_requests.load(Ordering::Relaxed),
+            Ordering::Relaxed,
+        );
+        self.prefill_waiting.fetch_add(
+            other.prefill_waiting.load(Ordering::Relaxed),
             Ordering::Relaxed,
         );
         self.lambda_milli.fetch_add(
@@ -199,6 +210,12 @@ impl Metrics {
              # HELP plowrt_queued_requests Requests waiting outside engine slots.\n\
              # TYPE plowrt_queued_requests gauge\n\
              plowrt_queued_requests {}\n\
+             # HELP plowrt_prefill_waiting Seated requests still waiting for their first token.\n\
+             # TYPE plowrt_prefill_waiting gauge\n\
+             plowrt_prefill_waiting {}\n\
+             # HELP plowrt_shed_queue_total Requests refused with 429 over PLOW_SHED_QUEUE_DEPTH.\n\
+             # TYPE plowrt_shed_queue_total counter\n\
+             plowrt_shed_queue_total {}\n\
              # HELP plowrt_admit_shed_total Live slots dropped by admission (predicted wait over SLO).\n\
              # TYPE plowrt_admit_shed_total counter\n\
              plowrt_admit_shed_total {}\n\
@@ -266,6 +283,8 @@ impl Metrics {
             g(&self.tokens),
             g(&self.rejected),
             g(&self.queued_requests),
+            g(&self.prefill_waiting),
+            g(&self.shed_queue),
             g(&self.admit_shed),
             g(&self.lambda_milli) as f64 / 1000.0,
             g(&self.util_milli) as f64 / 1000.0,
