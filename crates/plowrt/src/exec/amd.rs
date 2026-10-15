@@ -16454,12 +16454,12 @@ impl AmdEngine {
             self.progs[prog].t,
             bucket.or_else(|| self.ragged_bucket(prog)),
         );
-        self.dsa_pf_dense_chunk = self.progs[prog].sparse_prefill
-            && crate::config::RuntimeConfig::get()
-                .amd
-                .dsa_pf_min_ctx
-                .is_some_and(|min| c0 + clen <= min);
-        if self.dsa_pf_dense_chunk {
+        self.dsa_pf_dense_chunk = false;
+        if crate::config::RuntimeConfig::get()
+            .amd
+            .dsa_pf_min_ctx
+            .is_some_and(|min| c0 + clen <= min)
+        {
             for d in insts.iter_mut() {
                 let op = d.op;
                 let skip = op == DevOp::DsaQQuant as u16
@@ -16469,6 +16469,7 @@ impl AmdEngine {
                     || op == DevOp::IndexUnionPf as u16;
                 if skip {
                     d.op = DevOp::Nop as u16;
+                    self.dsa_pf_dense_chunk = true;
                 }
             }
         }
