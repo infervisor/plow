@@ -180,12 +180,22 @@ reference = "{env:G26_FP8_FP32_REF_LONG}"
 vllm_capture = "{env:G26_FP8_FP32_VLLM_LONG}"
 concurrency = 4
 timeout_s = 7200
-# Measured c4 margins (2026-10-15, 20 cases / 743 positions, one vLLM peer capture): the control packet
-# (squash 03162215 recipe without PLOW_NO_GLU_FUSE, 156de996) five runs on the squash plowrt, plus the
-# production packet 5ce87bd28db1 (two captures) and p0b-base on 2dff2171: decisive free-run flips
-# cont_decisive_frac 0.75-0.80 against the peer's 0.80 (one case of 20; 0.75 in 5 of 9 runs, the production
-# packet included), positions over 0.1 nat 102-118 against the peer's 113 (+0.0067 of positions).
-# Every run holds kl_mean 0.135-0.178 vs 0.165, kl_p99 1.63-3.72 vs 3.56, top1_decisive 0.9605-0.9769 vs
-# 0.9605, needles 16/16.
-cont_decisive_drop_max = 0.05
+# Measured c4 margins (2026-10-15, 20 cases / 743 positions, one vLLM peer capture: kl_mean 0.165, top1_decisive
+# 0.9605, cont_decisive_frac 0.80, 113 positions over 0.1 nat). Fourteen control runs: control 156de996 x5, P1
+# 86cd362a x2, WPR8 (p1-wpr8, p1w-rec x2) x3 on the squash plowrt 03162215; p0b-base 9b7d62c51048 (gl-ctrl) and P1
+# bd9c0722 (gl-p1) on 2dff2171; the production packet 5ce87bd28db1 x2 (allbuild, mmharden):
+#   run          kl_mean kl_p99 over top1   cont_dec      run          kl_mean kl_p99 over top1   cont_dec
+#   ctrl         0.1776  3.718  110  0.9605 0.75          ctrl-r2/r3   0.1346  1.630  108  0.9769 0.75 x2
+#   ctrl-r4/r5   0.1675  3.287  102  0.9654 0.80 x2       p1           0.1430  2.714  108  0.9687 0.75
+#   p1-r2        0.1367  2.030  110  0.9671 0.80          gl-ctrl      0.1515  3.204  118  0.9621 0.75
+#   gl-p1        0.1627  3.180  114  0.9638 0.75          wpr8         0.1292  2.564  112  0.9654 0.80
+#   wpr8-r1      0.1484  2.735  110  0.9605 0.70          wpr8-r2      0.1278  2.110  111  0.9638 0.75
+#   allbuild     0.1476  3.108  112  0.9687 0.80          mmharden     0.1580  3.113  113  0.9638 0.75
+# cont_decisive_frac moves in steps of one case (0.05): 0.80 x5, 0.75 x8, 0.70 x1. The previous 0.05 margin failed
+# the promoted WPR8 packet once in three runs (wpr8-r1) and 1 of 14 controls; 0.125 (between two and three cases,
+# clear of float rounding at a step boundary) passes all 14 and fails a 3-case drop. Trade-off: a real 1- or 2-case free-run regression is now indistinguishable from re-roll
+# noise at this case count; resolving it needs more cases (a pooled second capture halves the step to 0.025).
+# top1_decisive (default margin 0.01, threshold 0.9505) and kl_over (+0.01 of positions; controls +0.0067 at most)
+# pass every control run unchanged.
+cont_decisive_drop_max = 0.125
 kl_over_slack = 0.01
