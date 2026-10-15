@@ -262,7 +262,7 @@ fn decode_segment_kinds(prog: &DevProg) -> Result<Vec<DecodeSegmentKind>> {
                     prog.insts.len()
                 ))
             })?;
-            if inst.op == DevOp::FlashMlaDecode as u16 {
+            if inst.op == DevOp::FlashMlaDecode as u16 || inst.op == DevOp::FlashGatherDecode as u16 {
                 match mla_flash_inst {
                     None => mla_flash_inst = Some(e.inst as usize),
                     Some(i) if i == e.inst as usize => {}
@@ -12383,11 +12383,15 @@ impl AmdEngine {
                 "in.kvlen has {metadata_rows} rows incompatible with decode capacity {batch}"
             )));
         }
+        let dense_max_ctx = crate::config::RuntimeConfig::get().amd.amd_decode_dense_max_ctx;
         let dense_exact_select = blob.progs[decode]
             .insts
             .iter()
-            .find(|d| d.op == DevOp::FlashMlaDecodeFp8 as u16 && d.fj[1] != 0)
-            .map_or(0, |d| d.i[6]);
+            .find(|d| {
+                (d.op == DevOp::FlashMlaDecodeFp8 as u16 && d.fj[1] != 0)
+                    || d.op == DevOp::FlashGatherDecode as u16
+            })
+            .map_or(0, |d| d.i[6].max(dense_max_ctx.unwrap_or(0)));
         let dense_exact_ladder = if crate::config::RuntimeConfig::get()
             .amd
             .amd_decode_dense_exact
@@ -18337,7 +18341,16 @@ impl AmdEngine {
     /// The armed dense-exact rung of ladder program `dp`'s width.
     pub fn dense_exact_for(&self, dp: usize) -> Option<usize> {
         let t = self.progs[dp].t;
-        if t < Self::DENSE_EXACT_MIN_RUNG || !self.decode_ladder.contains(&dp) {
+        let min_rung = if crate::config::RuntimeConfig::get()
+            .amd
+            .amd_decode_dense_max_ctx
+            .is_some()
+        {
+            1
+        } else {
+            Self::DENSE_EXACT_MIN_RUNG
+        };
+        if t < min_rung || !self.decode_ladder.contains(&dp) {
             return None;
         }
         self.dense_exact_ladder

@@ -2080,6 +2080,11 @@ pub struct AmdRuntimeConfig {
     #[arg(long = "amd-decode-dense-exact", env = "PLOW_AMD_DECODE_DENSE_EXACT", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
     pub amd_decode_dense_exact: bool,
 
+    /// With `PLOW_AMD_DECODE_DENSE_EXACT`: run the dense twin while every advanced row holds at
+    /// most this many keys (raised to the selection width), on every rung that has a twin.
+    #[arg(long = "amd-decode-dense-max-ctx", env = "PLOW_AMD_DECODE_DENSE_MAX_CTX", global = true)]
+    pub amd_decode_dense_max_ctx: Option<u32>,
+
     /// hsaco directory override. Default: <assets>/hsaco.
     ///
     /// The clap **id** and **long** are both `rt-hsaco`, not `hsaco`. A

@@ -2183,6 +2183,17 @@ __device__ __forceinline__ void exec_flash_mla_decode(CInst in, CTens T, unsigne
     const bool nope = (in->i[3] & 0x80000000u) != 0;
     const unsigned window = in->i[3] & 0x7fffffffu;
     if (in->op == PLOW_DOP_FLASH_GATHER_DECODE) {
+#if PLOW_MLA_DEC_HPACK
+        /* PLOW_GLM53_MLA_HPACK_GATHER: the head-packed kernel over the DSA index table. */
+        if (nope && gf == 8 && window == 0) {
+            if (in->i[1] != 8) __builtin_trap();
+            d_flash_mla_decode_hp8<512>((float*)TEN(0), (float*)TEN(1), (const bf16*)TEN(2),
+                                        (const bf16*)TEN(4), (const int*)TEN(6), in->i[0],
+                                        in->i[2], in->fj[0].f, in->i[4], slice, nblk, lds,
+                                        (const int*)TEN(7), in->i[6]);
+            return;
+        }
+#endif
         if (nope && gf == 2)
             d_flash_mla_decode<512, 0, 2, /*GATHER=*/true>(
                 (float*)TEN(0), (float*)TEN(1), (const bf16*)TEN(2), (const bf16*)TEN(3),

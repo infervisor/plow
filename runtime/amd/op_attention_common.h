@@ -4795,14 +4795,18 @@ __device__ void d_flash_mla_decode_mfma(float* __restrict__ Opart, float* __rest
  * re-read a global Q fragment on every k-step of every tile), the KV tile is staged with 16-byte
  * loads and prefetched into registers one tile ahead, and the QK contraction is split over the
  * eight waves (4 of the 32 k-steps each, reduced through LDS) instead of recomputed by all.
- * Only accumulator elements 0..3 (m < 8) are live. Emits the same (o, m, l) partials. */
+ * Only accumulator elements 0..3 (m < 8) are live. Emits the same (o, m, l) partials.
+ * GATHER (idx != nullptr, DSA decode): KV slot j of row b reads latent row idx[b*idx_w + j]
+ * over min(kv_len, idx_w) slots; a negative entry is masked. */
 template <int DK>
 __device__ void d_flash_mla_decode_hp8(float* __restrict__ Opart, float* __restrict__ mlpart,
                                        const bf16* __restrict__ Qabs,
                                        const bf16* __restrict__ Ckv,
                                        const int* __restrict__ kv_len, unsigned n_batch,
                                        unsigned kv_stride, float scale, unsigned nsplit,
-                                       unsigned slice, unsigned nblk, float* lds_) {
+                                       unsigned slice, unsigned nblk, float* lds_,
+                                       const int* __restrict__ idx = nullptr,
+                                       unsigned idx_w = 0) {
     constexpr int NH = 8;
     constexpr int BKV = 32;
     constexpr int STRIDE = DK + FA_PAD;
@@ -4833,11 +4837,13 @@ __device__ void d_flash_mla_decode_hp8(float* __restrict__ Opart, float* __restr
     for (unsigned w = slice; w < n_work; w += nblk) {
         const unsigned sp = w % nsplit;
         const unsigned b = w / nsplit;
-        const unsigned len = (unsigned)kv_len[b];
+        const unsigned klen = (unsigned)kv_len[b];
+        const unsigned len = idx && idx_w < klen ? idx_w : klen;
         const unsigned per = (len + nsplit - 1) / nsplit;
         const unsigned lo = sp * per < len ? sp * per : len;
         const unsigned hi = lo + per < len ? lo + per : len;
         const auto* cbase = as_glob(Ckv) + (size_t)b * kv_stride * DK;
+        const int* ib = idx ? idx + (size_t)b * idx_w : nullptr;
 
         __syncthreads();
         if (tid < NH * CH) {
@@ -4850,7 +4856,8 @@ __device__ void d_flash_mla_decode_hp8(float* __restrict__ Opart, float* __restr
             for (int j = 0; j < TPT; j++) {
                 const unsigned e = tid + (unsigned)j * PLOW_THREADS;
                 const unsigned kv = kv0 + e / CH;
-                nxt[j] = kv < hi ? ld_glob8(cbase + (size_t)kv * DK + (e % CH) * 8) : (bf16v8)(bf16)0.0f;
+                const int row = kv < hi ? (ib ? ib[kv] : (int)kv) : -1;
+                nxt[j] = row >= 0 ? ld_glob8(cbase + (size_t)row * DK + (e % CH) * 8) : (bf16v8)(bf16)0.0f;
             }
         };
         if (lo < hi) fetch(lo);
@@ -4898,7 +4905,8 @@ __device__ void d_flash_mla_decode_hp8(float* __restrict__ Opart, float* __restr
                 float acc = 0.0f;
 #pragma unroll
                 for (int ww = 0; ww < PLOW_WAVES; ww++) acc += Sred[(ww * NH + m) * BKV + accn];
-                p[i] = (kv0 + accn < hi) ? acc * FA_SCALE(scale) : FA_NEG_INF;
+                const bool live = kv0 + accn < hi && (!ib || ib[kv0 + accn] >= 0);
+                p[i] = live ? acc * FA_SCALE(scale) : FA_NEG_INF;
             }
 #pragma unroll
             for (int i = 0; i < 4; i++) {

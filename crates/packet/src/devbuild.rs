@@ -2559,11 +2559,13 @@ impl Builder {
         let lean_kda_key_factor = !uniseg
             && (self.lean_kda_key_factor_segments || kda_carry_regstate || kda_wu_lean)
             && (0..self.ops.len()).any(|i| lean_kda_key_factor_pair(&self.ops, i));
+        let mla_flash = |op: u16| {
+            op == DevOp::FlashMlaDecode as u16 || op == DevOp::FlashGatherDecode as u16
+        };
         let decode_mla_segments = !uniseg
             && self.decode_mla_segments
             && self.ops.windows(2).any(|pair| {
-                pair[0].inst.op == DevOp::FlashMlaDecode as u16
-                    && pair[1].inst.op == DevOp::MlaMergeFold as u16
+                mla_flash(pair[0].inst.op) && pair[1].inst.op == DevOp::MlaMergeFold as u16
             });
         let bf16_pair = |i: usize| {
             self.ops.get(i..i + 2).is_some_and(|pair| {
@@ -2749,14 +2751,14 @@ impl Builder {
                 // The f32-mix AttnRes object owns exactly one packet per segment.
                 25
             } else if decode_mla_segments
-                && ((op == DevOp::FlashMlaDecode as u16
+                && ((mla_flash(op)
                     && self
                         .ops
                         .get(i + 1)
                         .is_some_and(|next| next.inst.op == DevOp::MlaMergeFold as u16))
                     || (op == DevOp::MlaMergeFold as u16
                         && i > 0
-                        && self.ops[i - 1].inst.op == DevOp::FlashMlaDecode as u16))
+                        && mla_flash(self.ops[i - 1].inst.op)))
             {
                 18
             } else if isolate_xreduce && op == DevOp::XReduceTwoShot as u16 {

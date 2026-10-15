@@ -1080,6 +1080,11 @@ pub struct EmitConfig {
     #[arg(long, env = "PLOW_GLM53_MLA_HPACK_ROWS")]
     pub glm53_mla_hpack_rows: Option<u32>,
 
+    /// GLM-5.3-Flash DSA decode rungs with at least this many rows run the sparse
+    /// FlashGatherDecode on the head-packed decode-MLA segment kernel (GF=8) over the index table.
+    #[arg(long, env = "PLOW_GLM53_MLA_HPACK_GATHER")]
+    pub glm53_mla_hpack_gather: Option<u32>,
+
     /// GLM-5.3-Flash decode: the HyperConnPost-folded mHC mix GemvF32 runs only on the
     /// workgroups that own an output, and under the one-row pre tail each output's K is split
     /// over this many workgroups (partials reduced in step order by the last). Bit-identical.
@@ -1959,6 +1964,7 @@ impl EmitConfig {
             glm53_packed_lean_kda: env_bool("PLOW_GLM53_PACKED_LEAN_KDA"),
             glm53_l2_place: env_bool("PLOW_GLM53_L2_PLACE"),
             glm53_mla_hpack_rows: env_u32("PLOW_GLM53_MLA_HPACK_ROWS"),
+            glm53_mla_hpack_gather: env_u32("PLOW_GLM53_MLA_HPACK_GATHER"),
             glm_hc_mix_split: env_u32("PLOW_GLM_HC_MIX_SPLIT"),
             glm_hc_fuse_dec: env_bool("PLOW_GLM_HC_FUSE_DEC"),
             glm_kda_proj_group: env_bool("PLOW_GLM_KDA_PROJ_GROUP"),

@@ -2109,11 +2109,13 @@ fn object_inventory(progs: &[ProgramArms], arch: &str, packed_metadata: bool) ->
             && p.seg.is_some()
             && p.insts == 2
             && p.arms.len() == 2
-            && p.arms.iter().any(|a| a.op == "FlashMlaDecode")
-            && p.arms.iter().any(|a| a.op == "MlaMergeFold")
             && p.arms
                 .iter()
-                .all(|a| a.op == "FlashMlaDecode" || a.op == "MlaMergeFold")
+                .any(|a| a.op == "FlashMlaDecode" || a.op == "FlashGatherDecode")
+            && p.arms.iter().any(|a| a.op == "MlaMergeFold")
+            && p.arms.iter().all(|a| {
+                a.op == "FlashMlaDecode" || a.op == "FlashGatherDecode" || a.op == "MlaMergeFold"
+            })
     };
     let decode_mla: BTreeSet<Arm> = progs
         .iter()

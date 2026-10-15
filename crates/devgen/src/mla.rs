@@ -1573,7 +1573,17 @@ pub(crate) fn glm53_emit_full(
             prog_t.push(packet::devbuild::packed_prefill_program_t(rows));
         }
     }
-    for rows in emit_config::active().decode_rungs() {
+    // PLOW_GLM_DECODE_DENSE_EXACT: a dense twin per rung (head-packed dense flash, the indexer
+    // only maintains the pool cache), served by PLOW_AMD_DECODE_DENSE_EXACT on short-context steps.
+    let rungs = emit_config::active().decode_rungs();
+    let twins = ec.glm_decode_dense_exact && c.dsa(ctx);
+    for (rows, dense) in rungs
+        .iter()
+        .filter(|_| twins)
+        .map(|&r| (r, true))
+        .chain(rungs.iter().map(|&r| (r, false)))
+    {
+        let _dense_exact = dense.then(DenseExactEmit::set);
         let mut b = Builder::new(n_cu);
         b.set_tensor_dedup(true);
         b.adopt_tensors(tensors.clone());
@@ -1582,7 +1592,11 @@ pub(crate) fn glm53_emit_full(
             b.set_gemm_small_splitk_2p(ec.glm_dec_splitk_2p);
         }
         b.set_gemm_small_group_s(ec.glm_kda_proj_group_s.unwrap_or(0));
-        b.set_decode_mla_segments(ec.glm53_mla_hpack_rows.is_some_and(|min| rows >= min.max(2)));
+        b.set_decode_mla_segments(if dense || !c.dsa(ctx) {
+            ec.glm53_mla_hpack_rows.is_some_and(|min| rows >= min.max(2))
+        } else {
+            ec.glm53_mla_hpack_gather.is_some_and(|min| rows >= min)
+        });
         b.set_l2_placement(l2_layout);
         if l2_layout.is_some() {
             b.deny_uniseg();
@@ -1591,7 +1605,11 @@ pub(crate) fn glm53_emit_full(
         let prog = b.finish();
         tensors = prog.tensors.clone();
         progs.push(prog);
-        prog_t.push(rows);
+        prog_t.push(if dense {
+            packet::devbuild::dense_exact_program_t(rows)
+        } else {
+            rows
+        });
     }
     let mut m = Model {
         n_cu,
@@ -5988,22 +6006,33 @@ fn emit_glm_mla_ex(
     //   ONLY the top_k rows via n.iidx (constant work ~ top_k regardless of ctx).
     // PLOW_GLM53_MLA_HPACK_ROWS: GF = nh_l (8), one work item per (row, split), run by the
     // decode-MLA segment object's head-packed MFMA arm.
+    // PLOW_GLM53_MLA_HPACK_GATHER: the same head-packed kernel walks the DSA index table.
     let hpack = dr == 0
         && nh_l == 8
-        && !dsa
         && !fp8kv
         && !fuse_rope
         && !dcp
         && !emit_config::active().glm_mla_w8a8
-        && emit_config::active()
-            .glm53_mla_hpack_rows
-            .is_some_and(|min| rows >= min.max(2));
+        && if sparse {
+            emit_config::active()
+                .glm53_mla_hpack_gather
+                .is_some_and(|min| rows >= min)
+        } else {
+            emit_config::active()
+                .glm53_mla_hpack_rows
+                .is_some_and(|min| rows >= min.max(2))
+        };
     let gf = if hpack { nh_l } else { glm_gf(ctx, nh_l) };
     let ns_attn = if hpack {
+        let walk = if sparse {
+            glm_dsa_select_width(c, ctx)
+        } else {
+            ctx
+        };
         (1u32 << (b.n_cu() / rows).max(1).ilog2())
-            .min(glm_nsplit(ctx, nh_l))
+            .min(glm_nsplit(walk, nh_l))
             .max(1)
-    } else if dsa {
+    } else if sparse {
         glm_dsa_decode_nsplit(rows, nh_l, glm_gf(ctx, nh_l), b.n_cu())
     } else if rows > 1
         && emit_config::active().glm_mla_ns_rows
@@ -6070,7 +6099,7 @@ fn emit_glm_mla_ex(
         ));
     }
     let c_fl = b.emit(
-        match (dsa, fp8kv) {
+        match (sparse, fp8kv) {
             (_, true) => DevOp::FlashMlaDecodeFp8,
             (true, false) => DevOp::FlashGatherDecode,
             (false, false) => DevOp::FlashMlaDecode,
@@ -6484,18 +6513,6 @@ fn emit_glm_dsa_decode_select(
                 d.i[2] = h;
                 d.f[0] = 1.0;
             });
-            // weights_proj @ xn, fp32 (IndexScoreKpool's W — see GemvF32's doc comment for
-            // why this must NOT be the bf16 `iwp`/`c_w` GEMV plain IndexScore uses: the
-            // reference computes this exact weight in fp32 throughout, a documented
-            // accuracy requirement, not an optimization to skip).
-            let c_wf32 = b.emit(DevOp::GemvF32, all.to_vec(), &[c_rn1], |d| {
-                d.t[0] = n.widx_f32;
-                d.t[1] = n.xn;
-                d.t[2] = w.iwp_f32;
-                d.i[0] = rows;
-                d.i[1] = hi;
-                d.i[2] = h;
-            });
             let fuse = emit_config::active().glm_dsa_fuse;
             let n_pools = ctx.div_ceil(c.index_kpool.max(1));
             let c_stash = if fuse {
@@ -6544,6 +6561,22 @@ fn emit_glm_dsa_decode_select(
                     d.i[5] = n_pools;
                     d.i[7] = 1;
                 }
+            });
+            // A dense-exact twin only keeps the pool cache current for later sparse steps.
+            if dense_exact {
+                return c_compress;
+            }
+            // weights_proj @ xn, fp32 (IndexScoreKpool's W — see GemvF32's doc comment for
+            // why this must NOT be the bf16 `iwp`/`c_w` GEMV plain IndexScore uses: the
+            // reference computes this exact weight in fp32 throughout, a documented
+            // accuracy requirement, not an optimization to skip).
+            let c_wf32 = b.emit(DevOp::GemvF32, all.to_vec(), &[c_rn1], |d| {
+                d.t[0] = n.widx_f32;
+                d.t[1] = n.xn;
+                d.t[2] = w.iwp_f32;
+                d.i[0] = rows;
+                d.i[1] = hi;
+                d.i[2] = h;
             });
             let c_qquant = b.emit(DevOp::DsaQQuant, all.to_vec(), &[c_qi], |d| {
                 d.t[0] = n.q_fp8;

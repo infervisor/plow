@@ -317,6 +317,15 @@ enum Cmd {
         /// actual context is the prompt length and this option is rejected.
         #[arg(long, default_value_t = 1024, conflicts_with = "prompt")]
         ctx: u32,
+        /// Batched TP timing only: start each slot's decode this many positions past its prompt
+        /// (the skipped KV rows are never written). Measures decode cost at long context without
+        /// prefilling it; the token streams are not meaningful. Comma list with `--batch-sweep`.
+        #[arg(long, default_value = "0", requires = "batched")]
+        ctx_pad: String,
+        /// Batched TP timing grid: time every listed active batch at every `--ctx-pad` on one
+        /// loaded engine (all slots prefilled once).
+        #[arg(long, requires = "batched")]
+        batch_sweep: Option<String>,
         /// Drive all `batch` sequences per dispatch (needs a blob compiled with
         /// PLOW_DECODE_BATCH > 1). Reports tpot AND aggregate throughput, which
         /// are the two axes a concurrency sweep compares.
@@ -1222,6 +1231,8 @@ async fn async_main(
             prompt,
             steps,
             ctx,
+            ctx_pad,
+            batch_sweep,
             batched,
             active_batch,
             tp,
@@ -1242,6 +1253,8 @@ async fn async_main(
                     prompt,
                     steps,
                     ctx,
+                    ctx_pad,
+                    batch_sweep,
                     tp,
                     batched,
                     active_batch,
@@ -1291,6 +1304,8 @@ async fn async_main(
                     None,
                     steps,
                     ctx,
+                    "0".into(),
+                    None,
                     tp,
                     batched,
                     None,
@@ -2292,6 +2307,8 @@ fn amd_bench_tp(
     prompt: Option<String>,
     steps: u32,
     ctx: u32,
+    ctx_pad: String,
+    batch_sweep: Option<String>,
     tp: u32,
     batched: bool,
     active_batch: Option<u32>,
@@ -2446,7 +2463,15 @@ fn amd_bench_tp(
     // identically or the comparison is between a chain and a formatting difference.
     if batched {
         let b = g.rank(0).batch();
-        let active = active_batch.map(|n| n as usize).unwrap_or(b);
+        let list = |v: &str| -> Result<Vec<u32>, Box<dyn std::error::Error>> {
+            v.split(',').map(|x| Ok(x.trim().parse::<u32>()?)).collect()
+        };
+        let pads = list(&ctx_pad)?;
+        let sweep = batch_sweep.as_deref().map(list).transpose()?;
+        let active = match &sweep {
+            Some(bs) => bs.iter().copied().max().unwrap_or(1) as usize,
+            None => active_batch.map(|n| n as usize).unwrap_or(b),
+        };
         if active > b {
             return Err(format!("--active-batch {active} exceeds packet batch {b}").into());
         }
@@ -2481,13 +2506,47 @@ fn amd_bench_tp(
                 // slot's cache is genuinely populated by this run.
                 let tok = AmdTpGroup::agree(&g.prefill_slot(s, ids)?)?;
                 println!("  slot {s}: prefill {} tokens -> sampled {tok}", ids.len());
-                pos_v[s] = ids.len() as u32;
+                pos_v[s] = ids.len() as u32 + if sweep.is_some() { 0 } else { pads[0] };
                 feed[s] = tok;
             }
         }
 
         // Native indexer admission requires an explicit mask even when every row participates.
         g.upload_parked(&vec![0; b])?;
+        if let Some(bs) = &sweep {
+            for &pad in &pads {
+                for &nb in bs {
+                    let nb = nb as usize;
+                    let dp = g.rank(0).decode_prog_for(nb);
+                    let mut pv: Vec<u32> = pos_v.iter().map(|p| p + pad).collect();
+                    let mut fd = feed.clone();
+                    let mut timed = std::time::Duration::ZERO;
+                    let mut last = Vec::new();
+                    for step in 0..steps {
+                        g.seed_ids(&fd)?;
+                        let kv: Vec<u32> = pv.iter().map(|x| x + 1).collect();
+                        let t = std::time::Instant::now();
+                        let out = g.decode_step_batched_at(&pv, &kv, dp)?;
+                        if step > 0 {
+                            timed += t.elapsed();
+                        }
+                        for s in 0..nb {
+                            fd[s] = out[s];
+                            pv[s] += 1;
+                        }
+                        last = out[..nb.min(4)].to_vec();
+                    }
+                    let ms = timed.as_secs_f64() * 1e3 / (steps.max(2) - 1) as f64;
+                    println!(
+                        "SWEEP B={nb} rung={} ctx0={} pad={pad} {ms:.3} ms/step last={last:?}",
+                        g.rank(0).prog_t(dp),
+                        pos_v[0] + pad
+                    );
+                }
+            }
+            trace_dump(&g)?;
+            return Ok(());
+        }
         let mut chains: Vec<Vec<u32>> = vec![Vec::new(); active];
         let mut timed = std::time::Duration::ZERO;
         for step in 0..steps {
