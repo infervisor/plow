@@ -53,6 +53,7 @@ nix develop --command env \
   PLOW_GEMMA_MOE_ROUTER_EXACT=0 \
   PLOW_MAX_CHUNK=4096 \
   PLOW_MAX_REQUEST_CHUNK=4096 \
+  PLOW_NO_GLU_FUSE=1 \
   PLOW_PF_LADDER_APPEND=256,1088,1152,2112,4160,4224 \
   PLOW_SEG_FA256_GQA2=1 \
   PLOW_SEG_FA512=1 \
@@ -106,7 +107,7 @@ nix develop --command env \
   PLOW_PF_SEG_PURE=fp8 \
   PLOW_PREFIX_CACHE=1 \
   PLOW_TOKEN_BATCH=1 \
-  PLOW_VMM_LIVE_RINGS=0 \
+  PLOW_VMM_LIVE_RINGS=1 \
   PLOW_VMM_PREFIX=1 \
   ./target/release/plowrt serve --assets $ASSETS --port 8080
 ```
