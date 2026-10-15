@@ -138,6 +138,39 @@ pub(super) fn snapshot_regions<'a>(
         if !tensors.get(dst).is_some_and(|t| t.name.starts_with("kv.")) {
             continue;
         }
+        // Pooled DSA indexer (GLM-5.3): the compressed pool cache is append-only like the
+        // latent cache; the incomplete-pool tail ring is per-slot state, snapshotted whole.
+        if d.op == DevOp::DsaPoolCompress as u16 {
+            for k in [0usize, 1] {
+                let i = d.t[k] as usize;
+                if !tensors.get(i).is_some_and(|t| t.name.starts_with("kv.")) {
+                    return None;
+                }
+                known[i] = true;
+            }
+            continue;
+        }
+        if d.op == DevOp::DsaPoolStash as u16 {
+            for k in [0usize, 1] {
+                let i = d.t[k] as usize;
+                let t = tensors.get(i)?;
+                if !t.name.starts_with("kv.") || t.bytes == 0 || t.bytes % batch as u64 != 0 {
+                    return None;
+                }
+                known[i] = true;
+                if !regions.iter().any(|r: &Region| r.tensor == i) {
+                    regions.push(Region {
+                        tensor: i,
+                        slot_bytes: t.bytes / batch as u64,
+                        heads: 1,
+                        ring: 0,
+                        window: 0,
+                        row_bytes: 0,
+                    });
+                }
+            }
+            continue;
+        }
         if d.op == DevOp::HeadNormRope as u16 || d.op == DevOp::HeadNormRopeFp8 as u16 {
             known[dst] = true;
             needed[dst] |= d.fj[2] != u32::MAX && (d.fj[1] as usize) < max_ctx;
@@ -236,11 +269,14 @@ pub(super) struct CloneSpan {
     heads: u32,
     stride_rows: u32,
     row_bytes: u64,
+    /// Tokens per row: 1, or the DSA pool size for the compressed indexer cache (a prefix of
+    /// `rows` tokens owns its `rows / pool` complete pools; the tail rides the snapshot ring).
+    pool: u32,
 }
 impl CloneSpan {
     pub fn copy_spans(&self, rows: u32, mut copy: impl FnMut(u64, u64)) {
         let head_bytes = u64::from(self.stride_rows) * self.row_bytes;
-        let bytes = u64::from(rows.min(self.stride_rows)) * self.row_bytes;
+        let bytes = u64::from((rows / self.pool.max(1)).min(self.stride_rows)) * self.row_bytes;
         for head in 0..u64::from(self.heads) {
             copy(head * head_bytes, bytes);
         }
@@ -262,6 +298,32 @@ pub(super) fn clone_spans<'a>(
     }
     let mut spans: Vec<CloneSpan> = Vec::new();
     for d in instructions {
+        if d.op == DevOp::DsaPoolCompress as u16 {
+            let (pool, hd) = (d.i[1].max(1), d.i[2]);
+            for (k, row_bytes) in [(0usize, u64::from(hd)), (1, 4)] {
+                let index = d.t[k] as usize;
+                let tensor = tensors.get(index)?;
+                let slot_bytes = tensor.bytes / batch as u64;
+                if row_bytes == 0 || tensor.bytes % batch as u64 != 0 || slot_bytes % row_bytes != 0
+                {
+                    return None;
+                }
+                let span = CloneSpan {
+                    tensor: index,
+                    slot_bytes,
+                    heads: 1,
+                    stride_rows: u32::try_from(slot_bytes / row_bytes).ok()?,
+                    row_bytes,
+                    pool,
+                };
+                match spans.iter().find(|s| s.tensor == index) {
+                    Some(prior) if prior != &span => return None,
+                    Some(_) => {}
+                    None => spans.push(span),
+                }
+            }
+            continue;
+        }
         let fp8 = d.op == DevOp::HeadNormRopeFp8 as u16;
         if !fp8 && d.op != DevOp::HeadNormRope as u16 {
             continue;
@@ -288,6 +350,7 @@ pub(super) fn clone_spans<'a>(
                 heads,
                 stride_rows,
                 row_bytes,
+                pool: 1,
             };
             match spans.iter().find(|s| s.tensor == index) {
                 Some(prior) if prior != &span => None,
