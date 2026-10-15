@@ -16,11 +16,12 @@
 #include <hip/hip_runtime.h>
 #if defined(__HIP_DEVICE_COMPILE__)
 #include "amd_common.h"
-extern "C" __device__ unsigned plow_glm_inproj_abi_3 = 1;
+extern "C" __device__ unsigned plow_glm_inproj_abi_4 = 1;
 #endif
 
 #define INPROJ_KS 512u
 #define INPROJ_WAVES 8u
+#define INPROJ_PARTS 6u
 #define INPROJ_MAXM 128u
 #define INPROJ_LDS_STRIDE (INPROJ_KS + 8u)
 
@@ -35,7 +36,8 @@ struct InprojPart {
 struct InprojArgs {
     const unsigned short* x;
     float* partial;
-    InprojPart parts[8];
+    /* Explicit kernargs + the 256 hidden bytes must fit the 512-byte kernarg ring slot. */
+    InprojPart parts[INPROJ_PARTS];
     unsigned m;
     unsigned k;
     unsigned nparts;
@@ -44,13 +46,13 @@ struct InprojArgs {
     unsigned act;
     float limit;
 };
-static_assert(sizeof(InprojArgs) == 296);
+static_assert(sizeof(InprojArgs) == 232);
 
 #if defined(__HIP_DEVICE_COMPILE__)
 __device__ __forceinline__ unsigned inproj_part(const InprojArgs& a, unsigned b) {
     unsigned p = 0;
 #pragma unroll
-    for (unsigned i = 1; i < 8u; i++)
+    for (unsigned i = 1; i < INPROJ_PARTS; i++)
         if (i < a.nparts && a.parts[i].blk0 <= b) p = i;
     return p;
 }
