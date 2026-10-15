@@ -25,9 +25,14 @@ from __future__ import annotations
 
 import argparse
 import re
+import shlex
+import sys
 from pathlib import Path
 
 import plow_dist as pd
+
+sys.path.insert(0, str(Path(__file__).resolve().parent / "campaign"))
+import rung_env  # noqa: E402
 
 SECTIONS = ("prepare", "objects", "emit", "serve", "gates")
 
@@ -75,6 +80,12 @@ def block_emit(r: dict) -> str:
         return "# This recipe does not emit: see `refusal`."
     out = ["nix develop --command env \\"]
     out += env_prefix(e.get("env") or {})
+    src = rung_env.recipe_source_errors(r)
+    if src:
+        raise SystemExit("render_recipe: " + "; ".join(src))
+    rungs = rung_env.render(rung_env.from_recipe(r))
+    if rungs:
+        out.append(f"  {rung_env.ENV}={shlex.quote(rungs)} \\")
     out.append("  ./target/release/plowc \\")
     out.append("  --hf-dir $CKPT \\")
     args = e.get("args") or []
@@ -298,6 +309,14 @@ def self_test() -> None:
     # A changed recipe changes the rendering — that is the staleness signal.
     changed = dict(recipe, emit={"env": {"PLOW_FP8_KV": "0"}, "args": []})
     assert render(out, changed) != out
+
+    # Per-rung overrides render as the one PLOW_EMIT_RUNG_ENV plowc reads, quoted for the shell.
+    rung = dict(recipe, emit={"env": {"PLOW_FP8_KV": "1"}, "args": [],
+                              "rung_env": {"prefill": {"4096": {"PLOW_NO_GLU_FUSE": "0"},
+                                                       "128": {"PLOW_NO_GLU_FUSE": "1"}}}})
+    out = render(scaffold(rung), rung)
+    assert "PLOW_EMIT_RUNG_ENV='prefill:128:PLOW_NO_GLU_FUSE=1;prefill:4096:PLOW_NO_GLU_FUSE=0'" in out, out
+    assert render(out, rung) == out
 
     # A refused recipe renders without inventing an emit command.
     refused = {

@@ -2042,6 +2042,13 @@ fn run_devblob(cli: &Cli) -> Result<PathBuf, Box<dyn std::error::Error>> {
         },
         verify,
     );
+    let stray = devgen::emit_config::rung::unconsumed();
+    if !stray.is_empty() {
+        return Err(format!(
+            "PLOW_EMIT_RUNG_ENV overrides {stray:?} were never lowered by this model's emitter"
+        )
+        .into());
+    }
 
     // `--emit devblob+cubin`: build the object the packet we just wrote needs.
     // Runs AFTER emission, from the manifest that emission produced — never from

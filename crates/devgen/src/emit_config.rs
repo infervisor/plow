@@ -1283,6 +1283,11 @@ pub struct EmitConfig {
     #[arg(long = "emit-serve-defaults", env = "PLOW_EMIT_SERVE_DEFAULTS")]
     pub serve_defaults: Option<String>,
 
+    /// Per-rung overrides of rung-eligible knobs (`KnobSpec::per_rung`): `phase:rows:ENV=value`
+    /// entries joined by `;`, e.g. `prefill:128:PLOW_NO_GLU_FUSE=0`. See [`rung`].
+    #[arg(long = "emit-rung-env", env = "PLOW_EMIT_RUNG_ENV")]
+    pub rung_env: Option<String>,
+
     /// Select the packet-declared native FP8 prefill GEMM role.
     #[arg(long, env = "PLOW_FP8_PF_GEMM_ROLE", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
     pub fp8_pf_gemm_role: bool,
@@ -1735,6 +1740,7 @@ impl EmitConfig {
             gemma4_sm90_hd512_px4_bq64_role: env_bool("PLOW_GEMMA4_SM90_HD512_PX4_BQ64_ROLE"),
             gen_kernels: env_str("PLOW_EMIT_GEN_KERNELS"),
             serve_defaults: env_str("PLOW_EMIT_SERVE_DEFAULTS"),
+            rung_env: env_str("PLOW_EMIT_RUNG_ENV"),
             fp8_pf_gemm_role: env_bool("PLOW_FP8_PF_GEMM_ROLE"),
             fp8_pf_isolate: env_bool("PLOW_QWEN_FP8_PF_ISOLATE"),
             attention_pf_role: env_bool("PLOW_ATTENTION_PF_ROLE"),
@@ -2179,6 +2185,8 @@ impl EmitConfig {
 
 use std::sync::OnceLock;
 
+pub mod rung;
+
 /// Installed config. In production there is exactly one `install()` call at the top of
 /// `run_verified`. In test binaries, multiple tests may call `run_verified` with different
 /// env-var setups in the same process — they each get a fresh `from_env()` snapshot.
@@ -2197,6 +2205,7 @@ static FALLBACK: OnceLock<EmitConfig> = OnceLock::new();
 pub fn install(mut cfg: EmitConfig) {
     cfg.resolve_deprecated_aliases();
     cfg.validate();
+    rung::install(&cfg);
     let mut seg_knobs = packet::devbuild::SegKnobs::from_env();
     // Carry the resolved field into the packet builder. This is what makes a
     // production default and a replay behave like the equivalent explicit env
@@ -2401,13 +2410,18 @@ pub fn explicitly_set(id: &str) -> bool {
         .any(|k| k.id == id && matches!(k.source, "cli" | "env"))
 }
 
-/// Access the active emit config.
+/// Access the active emit config: inside [`rung::with_rung`] that rung's resolved config.
 ///
-/// Returns the explicitly [`install`]ed config if one exists. Otherwise, lazily
+/// Otherwise returns the explicitly [`install`]ed config if one exists. Otherwise, lazily
 /// constructs from the process environment — matching the pre-migration semantics
 /// where every call site read `std::env::var` directly (needed for unit tests that
 /// call emitter helpers without going through `run_verified`).
 pub fn active() -> &'static EmitConfig {
+    rung::current().unwrap_or_else(packet_wide)
+}
+
+/// The packet-wide config, ignoring any rung being lowered.
+pub fn packet_wide() -> &'static EmitConfig {
     let ptr = INSTALLED.load(std::sync::atomic::Ordering::Acquire);
     if !ptr.is_null() {
         // SAFETY: `install()` wrote a valid Box::into_raw pointer and we never dealloc.

@@ -14,7 +14,8 @@
 //! traffic does (the default prompts share one 1000-id cycle). `--packed-prefill`
 //! initializes prompts through packed request chunks and the compact terminal, printing each
 //! launch's wall ms; `--pf-chunk N` caps the per-request slice below the packet's request chunk and
-//! `--pf-reps N` repeats the whole packed prefill (the first pass pays graph capture).
+//! `--pf-reps N` repeats the whole packed prefill (the first pass pays graph capture);
+//! with `--dump-prefill-logits` the last rep's compact-terminal logits are written per slot.
 //! `--dump-tensors`
 //! writes the named tensors raw after the last step (block_run's format), which
 //! with `--max-inst N`, one step and zero warmup gives partial decode activations;
@@ -146,8 +147,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let be = Arc::new(plowrt::device::cuda::CudaBackend::new(0)?);
     let mut e = plowrt::exec::gpu::GpuEngine::load(be, &assets, &ckpt)?;
     let slots = want_slots.min(e.batch());
-    if prefill_logits_dir.is_some() && (packed_prefill || !e.has_prefill()) {
-        return Err("prefill logit capture requires ordinary GPU prefill".into());
+    if prefill_logits_dir.is_some() && !e.has_prefill() {
+        return Err("prefill logit capture requires GPU prefill".into());
     }
     if (max_segments.is_some() || seg_sweep.is_some()) && slots != e.batch() {
         return Err("--max-segments requires the widest decode rung".into());
@@ -174,6 +175,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             Ok::<_, Box<dyn std::error::Error>>(vec![0u8; e.vocab() * 2])
         })
         .transpose()?;
+    let prefill_case = |prompt: &[u32], b: usize, file: String, token: u32| {
+        let prompt_bytes: Vec<u8> = prompt.iter().flat_map(|id| id.to_le_bytes()).collect();
+        serde_json::json!({
+            "id": format!("prefill-s{b:03}"), "file": file, "dtype": "bf16",
+            "prompt_token_ids": prompt, "prompt_len": prompt.len(),
+            "prompt_sha256_u32le": plow_asset::knob::sha256_hex(&prompt_bytes),
+            "sampled_token_id": token, "generation_step": 0,
+            "execution_phase": "prefill_output",
+        })
+    };
     let prompt_for = |b: usize| -> Vec<u32> {
         let bb = if same { 0 } else { b as u32 };
         if spread {
@@ -206,6 +217,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         let width = e.pf_max_rows() / chunk;
         let mut completed = Vec::new();
+        let mut logits_row = Vec::new();
         for rep in 0..pf_reps.max(1) {
             for b in 0..slots {
                 if rep > 0 {
@@ -236,8 +248,21 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     if c0 + len == ctx && completed.len() != requests.len() {
                         return Err("packed prefill did not complete every request".into());
                     }
-                    for &(slot, token) in &completed {
+                    for (row, &(slot, token)) in completed.iter().enumerate() {
                         last[slot] = token;
+                        // The compact terminal leaves row k's logits for completed[k]; the last
+                        // rep's are the ones its timed launches produced.
+                        if let (Some(dir), true) = (&prefill_logits_dir, rep + 1 == pf_reps.max(1))
+                        {
+                            e.logits_row(row, &mut logits_row)?;
+                            let raw: Vec<u8> = logits_row
+                                .iter()
+                                .flat_map(|v| ((v.to_bits() >> 16) as u16).to_le_bytes())
+                                .collect();
+                            let file = format!("prefill-s{slot:03}.bin");
+                            std::fs::write(dir.join(&file), raw)?;
+                            prefill_cases.push(prefill_case(&prompts[slot], slot, file, token));
+                        }
                     }
                 }
             }
@@ -265,14 +290,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 e.read_tensor_range("act.logits", 0, raw)?;
                 let file = format!("prefill-s{b:03}.bin");
                 std::fs::write(dir.join(&file), raw)?;
-                let prompt_bytes: Vec<u8> = prompt.iter().flat_map(|id| id.to_le_bytes()).collect();
-                prefill_cases.push(serde_json::json!({
-                    "id": format!("prefill-s{b:03}"), "file": file, "dtype": "bf16",
-                    "prompt_token_ids": prompt, "prompt_len": ctx,
-                    "prompt_sha256_u32le": plow_asset::knob::sha256_hex(&prompt_bytes),
-                    "sampled_token_id": last[b], "generation_step": 0,
-                    "execution_phase": "prefill_output",
-                }));
+                prefill_cases.push(prefill_case(&prompt, b, file, last[b]));
             }
             println!(
                 "slot {b}: prompt consumed in {:.4} s",

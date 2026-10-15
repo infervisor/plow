@@ -198,11 +198,63 @@ row against a different precision.
 [cell]        name, model, revision, hf_dir, checkpoint_dir?, gpu, arch, n_cu, n_gpu?, max_ctx, precision
 [emit]        emit?, args = [...], env = { PLOW_... }
 [objects]     script, env = { PLOW_BUILD_... }, role_files = [...]      # optional
+[emit.rung_env.<phase>.<rows>]  PLOW_KNOB = "value"                   # optional, per-rung override (below)
 [emit_roles]  env = { PLOW_..._ROLE = 1 }                               # optional, merged over [emit].env
 [serve]       env = { PLOW_PF_SEG_DIR = "...", ... }, extra_args?, plowrt?
 [bench]       backend, in_lens, concs, nprompt, outlen, warmups, seed, gate_prompt, tokenizer, vllm_venv?, port?, model_id?
 [reference]   csv                                                        # same CSV schema as results.csv
 ```
+
+## Per-rung knob choices
+
+A rung-eligible emit knob (knob_spec `.per_rung(&["prefill"])`; today only `PLOW_NO_GLU_FUSE`;
+explicit GLU roles still win at their rung via `select_fused`) can take a different value per prefill bucket:
+
+```toml
+[emit.env]
+PLOW_NO_GLU_FUSE = "1"                  # packet-wide
+[emit.rung_env.prefill.128]
+PLOW_NO_GLU_FUSE = "0"                  # rung 128 only
+```
+
+`build` renders the table into the one `PLOW_EMIT_RUNG_ENV` both emits get
+(`prefill:128:PLOW_NO_GLU_FUSE=0;...`, plus `--rung-env phase:rows:K=V` A/B overrides) and refuses
+it from any other source. devgen lowers each rung under its resolved config, refuses packet-wide
+knobs and overrides that match no emitted rung, and writes the per-program resolution to build.json
+`rung_knobs`; `check_recipe.py` holds the recipe to it.
+
+`rung-sweep` chooses the value per rung. Four CPU/GPU stages, one queue job:
+
+```
+campaign.py rung-sweep <recipe> --knob PLOW_NO_GLU_FUSE --values 0,1 --rungs 128,1024,8192 --out DIR --stage build \
+    [--reference-build <build of the unchanged recipe>]
+campaign.py rung-sweep ... --stage run --run-env LD_LIBRARY_PATH=... --run-env PLOW_LIVE_CTX=16384
+scripts/bench/gpuq.py submit rung-sweep 1 timeout <s> bash DIR/run.sh
+campaign.py rung-sweep ... --stage score       # choice.md / choice.json / resources.md / recipe-snippet.toml
+campaign.py rung-sweep ... --stage verify      # mixed packet; per-rung program == chosen arm; verify-run.sh
+```
+
+* build: one packet per value with the value on every prefill rung (`--rung-env`), so arm v's
+  rung program is the program a mixed recipe gets at that rung (verify proves it on the mixed
+  packet by per-rung program digest: kernel_cases + dispatch chain).
+* run: step_bench packed prefill at exactly the rung's rows (`slots x ctx` within the request
+  chunk; the score refuses a launch of any other width), graph on, `--reps` per run with rep 0
+  (capture) dropped, ABBA blocks, the packet's serve defaults exported (`--no-serve-env` drops
+  them). The same launches dump the compact-terminal logits.
+* score: per rung, the reference value is the reference build's resolution, and the reference
+  arm's program must equal the reference build's. Another arm wins only if every run has exactly
+  `--reps` reps at the rung width, every block's logits (reference too) are complete, equally sized
+  and finite, its program differs, and it is faster beyond max(control drift, treatment spread)
+  over all block medians with spread <= 3x drift (agent-tools §7, no floor). resources.md lists
+  REG/STACK/SHARED/LOCAL for every object that differs between arms.
+* Label: `experimental` unless accuracy is accepted (bitwise, or `--kl-max` and `--top1-min` both
+  given and passed), no switched arm's object spills, and `--roofline <file>` (calibrated
+  bandwidth/compute bound per rung) and `--library-resources <file>` (library kernels, e.g.
+  cuBLASLt, which cuobjdump of our objects does not cover) are given. The snippet header carries the
+  label; only a `qualified` snippet may enter a canonical recipe.
+* Promotion: nothing here edits a recipe. A qualified switch needs verify, the re-timed switched
+  rungs and the mixed packet's own full gates (`campaign.py gate`, llm_fp32_ref included); then the
+  snippet goes into the canonical recipe.
 
 ## Known protocol traps (each cost a run once)
 
