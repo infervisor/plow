@@ -135,6 +135,7 @@ impl AmdEngine {
             PrefillSegmentRoute::SparseMla(_) if active => return "mla_sparse_aiter_spans",
             PrefillSegmentRoute::SparseMla(route) if route.active => return "mla_sparse_aiter",
             PrefillSegmentRoute::MoeAiter(_) => return "moe_aiter_fp8",
+            PrefillSegmentRoute::HcAiter { .. } => return "hc_aiter",
             PrefillSegmentRoute::IndexTp(_) if active => return "index_tp_spans",
             PrefillSegmentRoute::IndexTp(_) => return "index_tp",
             PrefillSegmentRoute::GemmLt(_) => return "gemm_lt",

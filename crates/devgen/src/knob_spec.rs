@@ -1343,6 +1343,7 @@ pub const EMIT: &[KnobSpec] = &[
     KnobSpec::new("emit.glm53_packed_lean_kda", Some("PLOW_GLM53_PACKED_LEAN_KDA"), Layer::Emit, Domain::Bool, OFF, OPT_IN),
     KnobSpec::new("emit.glm53_l2_place", Some("PLOW_GLM53_L2_PLACE"), Layer::Emit, Domain::Bool, OFF, OPT_IN),
     KnobSpec::new("emit.glm53_mla_hpack_rows", Some("PLOW_GLM53_MLA_HPACK_ROWS"), Layer::Emit, U32, UNSET, OPT_IN),
+    KnobSpec::new("emit.glm53_pf_hc_aiter", Some("PLOW_GLM53_PF_HC_AITER"), Layer::Emit, Domain::Bool, OFF, OPT_IN),
     KnobSpec::new("emit.glm_hc_mix_split", Some("PLOW_GLM_HC_MIX_SPLIT"), Layer::Emit, U32, UNSET, OPT_IN),
     KnobSpec::new("emit.glm_hc_fuse_dec", Some("PLOW_GLM_HC_FUSE_DEC"), Layer::Emit, Domain::Bool, OFF, OPT_IN),
     KnobSpec::new("emit.glm_kda_proj_group", Some("PLOW_GLM_KDA_PROJ_GROUP"), Layer::Emit, Domain::Bool, OFF, OPT_IN),

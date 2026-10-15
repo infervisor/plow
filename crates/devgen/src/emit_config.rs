@@ -1080,6 +1080,11 @@ pub struct EmitConfig {
     #[arg(long, env = "PLOW_GLM53_MLA_HPACK_ROWS")]
     pub glm53_mla_hpack_rows: Option<u32>,
 
+    /// GLM-5.3-Flash prefill band seams: HyperConnPost + mix and HyperConnPre + input RmsNorm as
+    /// AITER's fused mHC pair (FFN and SP-normed KDA inputs). NOT bit-identical.
+    #[arg(long, env = "PLOW_GLM53_PF_HC_AITER", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
+    pub glm53_pf_hc_aiter: bool,
+
     /// GLM-5.3-Flash decode: the HyperConnPost-folded mHC mix GemvF32 runs only on the
     /// workgroups that own an output, and under the one-row pre tail each output's K is split
     /// over this many workgroups (partials reduced in step order by the last). Bit-identical.
@@ -1959,6 +1964,7 @@ impl EmitConfig {
             glm53_packed_lean_kda: env_bool("PLOW_GLM53_PACKED_LEAN_KDA"),
             glm53_l2_place: env_bool("PLOW_GLM53_L2_PLACE"),
             glm53_mla_hpack_rows: env_u32("PLOW_GLM53_MLA_HPACK_ROWS"),
+            glm53_pf_hc_aiter: env_bool("PLOW_GLM53_PF_HC_AITER"),
             glm_hc_mix_split: env_u32("PLOW_GLM_HC_MIX_SPLIT"),
             glm_hc_fuse_dec: env_bool("PLOW_GLM_HC_FUSE_DEC"),
             glm_kda_proj_group: env_bool("PLOW_GLM_KDA_PROJ_GROUP"),

@@ -710,7 +710,17 @@ fn hc_aiter_args(
     init: &[u8],
     devp: &[DeviceMem],
 ) -> Result<HcAiterRoute> {
-    let bad = |m: &str| RuntimeError::Device(format!("HcAiterDecode: {m}"));
+    let w = hc_aiter_words(d, tensors, init)?;
+    hc_aiter_build(d, &w, &|h| devp.get(h as usize).map(|m| m.base))
+}
+
+/// The 10-word descriptor of an HC_AITER `GemvF32` (operand handles and constants).
+fn hc_aiter_words(
+    d: &packet::dev::DevInst64,
+    tensors: &[crate::asset::devblob::DevTensor],
+    init: &[u8],
+) -> Result<[u32; 10]> {
+    let bad = |m: &str| RuntimeError::Device(format!("HcAiter: {m}"));
     let desc = tensors
         .get(d.t[7] as usize)
         .ok_or_else(|| bad("descriptor handle"))?;
@@ -720,19 +730,27 @@ fn hc_aiter_args(
         .and_then(|r| init.get(r))
         .filter(|b| b.len() == 40 && desc.bytes == 40)
         .ok_or_else(|| bad("descriptor is not an initialized 10-word table"))?;
-    let w: Vec<u32> = bytes
-        .chunks_exact(4)
-        .map(|c| u32::from_le_bytes(c.try_into().expect("4")))
-        .collect();
+    let mut w = [0u32; 10];
+    for (o, c) in w.iter_mut().zip(bytes.chunks_exact(4)) {
+        *o = u32::from_le_bytes(c.try_into().expect("4"));
+    }
+    Ok(w)
+}
+
+fn hc_aiter_build(
+    d: &packet::dev::DevInst64,
+    w: &[u32; 10],
+    resolve: &dyn Fn(u32) -> Option<u64>,
+) -> Result<HcAiterRoute> {
+    let bad = |m: &str| RuntimeError::Device(format!("HcAiter: {m}"));
     let addr = |h: u32| -> Result<u64> {
-        devp.get(h as usize)
-            .map(|m| m.base)
+        resolve(h)
             .filter(|&b| b != 0)
             .ok_or_else(|| bad("operand handle"))
     };
     let t = |slot: usize| addr(d.t[slot] as u32);
     let m = d.i[0];
-    if m == 0 || m > 512 || d.i[1] != 24 || d.i[2] != 4 * 4096 || d.i[3] != 1 || w[6] != 4096 {
+    if m == 0 || m > 1024 || d.i[1] != 24 || d.i[2] != 4 * 4096 || d.i[3] != 1 || w[6] != 4096 {
         return Err(bad("unsupported geometry or descriptor"));
     }
     let (mul, sq) = (addr(w[4])?, addr(w[5])?);
@@ -1485,6 +1503,13 @@ struct MoeEpCombineRoute {
 #[derive(Clone, Copy, Debug)]
 enum PrefillSegmentRoute {
     Interpreter,
+    /// PLOW_GLM53_PF_HC_AITER: instruction `ix` (band rows patched per chunk) and its descriptor;
+    /// operand addresses are re-read from the live tensor table at each launch.
+    HcAiter {
+        ix: u32,
+        inst: DevInst64,
+        words: [u32; 10],
+    },
     SparseMla(amd_sparse_mla::Route),
     MoeAiter(amd_moe_aiter::Route),
     IndexTp(amd_index_tp::Route),
@@ -2357,6 +2382,40 @@ fn promote_gemm_group_routes(
             },
             grid: gemm_group_grid(d.i[0], &n),
             tens: d.t,
+        };
+    }
+    Ok(())
+}
+
+fn promote_hc_aiter_routes(
+    prog: &DevProg,
+    segments: usize,
+    tensors: &[crate::asset::devblob::DevTensor],
+    init: &[u8],
+    devp: &[DeviceMem],
+    routes: &mut [PrefillSegmentRoute],
+) -> Result<()> {
+    if !prog.insts.iter().any(hc_aiter_raw) {
+        return Ok(());
+    }
+    let owners = amd_gemm_lt::segment_owners(prog, segments, hc_aiter_raw)?;
+    for (ix, d) in prog.insts.iter().enumerate() {
+        if !hc_aiter_raw(d) {
+            continue;
+        }
+        let seg = owners[ix].ok_or_else(|| {
+            RuntimeError::Device(format!("HcAiter instruction {ix} has no segment"))
+        })?;
+        if !matches!(routes[seg], PrefillSegmentRoute::Interpreter) {
+            return Err(RuntimeError::Device("HcAiter overlaps another native route".into()));
+        }
+        let words = hc_aiter_words(d, tensors, init)?;
+        // Validate once against the load-time bindings.
+        hc_aiter_build(d, &words, &|h| devp.get(h as usize).map(|m| m.base))?;
+        routes[seg] = PrefillSegmentRoute::HcAiter {
+            ix: ix as u32,
+            inst: *d,
+            words,
         };
     }
     Ok(())
@@ -9407,7 +9466,8 @@ impl AmdEngine {
         };
 
         let need_hc_aiter = blob
-            .decode_phase()
+            .progs
+            .iter()
             .flat_map(|p| p.insts.iter())
             .any(hc_aiter_raw);
         let k_hc_aiter = if need_hc_aiter {
@@ -11929,6 +11989,14 @@ impl AmdEngine {
                     kda_keyfeed_scratch,
                 )?;
                 promote_gemm_group_routes(p, seg_class.len(), &devp, &mut prefill_routes)?;
+                promote_hc_aiter_routes(
+                    p,
+                    seg_class.len(),
+                    &blob.tensors,
+                    &blob.init,
+                    &devp,
+                    &mut prefill_routes,
+                )?;
                 if k_mla_pf_dense.is_some() {
                     let mut promoted = 0usize;
                     for (seg, route) in amd_mla_pf_dense::routes(p, &devp, seg_class.len())?
@@ -14331,6 +14399,35 @@ impl AmdEngine {
         }
         // Class A (row-pure over the dense live rows): runs whether or not a packed binding is
         // staged, like the hipBLASLt route below.
+        if let Some(PrefillSegmentRoute::HcAiter { inst, words, .. }) =
+            self.progs[p].prefill_routes.get(seg).copied()
+        {
+            let [k16, k32, kpre] = self.k_hc_aiter.ok_or_else(|| {
+                RuntimeError::Device("HcAiter prefill segment has no validated object".into())
+            })?;
+            let tens = &self.tens_table;
+            let r = hc_aiter_build(&inst, &words, &|h| {
+                let at = h as usize * 8;
+                tens.get(at..at + 8)
+                    .map(|b| u64::from_le_bytes(b.try_into().unwrap()))
+            })?;
+            let tm = if r.tile32 { 32 } else { 16 };
+            self.be.launch_3d(
+                if r.tile32 { k32 } else { k16 },
+                [(r.post.m as u32).div_ceil(tm), 1, HC_AITER_SPLIT_K],
+                256,
+                as_bytes(std::slice::from_ref(&r.post)),
+            )?;
+            self.be.launch_3d_lds(
+                kpre,
+                [r.pre.m as u32, 1, 1],
+                320,
+                8192,
+                as_bytes(std::slice::from_ref(&r.pre)),
+            )?;
+            self.seg_launches += 2;
+            return Ok(());
+        }
         if let Some(PrefillSegmentRoute::GemmGroup { args, grid, tens }) =
             self.progs[p].prefill_routes.get(seg).copied()
         {
@@ -15557,6 +15654,7 @@ impl AmdEngine {
                 Some(PrefillSegmentRoute::MoeAiter(route)) => route.launches() as usize,
                 Some(PrefillSegmentRoute::IndexTp(route)) => route.launches(),
                 Some(PrefillSegmentRoute::IndexFp8(route)) => route.launches(),
+                Some(PrefillSegmentRoute::HcAiter { .. }) => 2,
                 _ => 1,
             };
         }
@@ -15574,6 +15672,7 @@ impl AmdEngine {
                 .as_ref()
                 .map_or(1, |s| s.split_launches(*route)),
             Some(PrefillSegmentRoute::GemmLt(_)) => 1,
+            Some(PrefillSegmentRoute::HcAiter { .. }) => 2,
             Some(PrefillSegmentRoute::GemmGroup { args, .. }) => self.gemm_group_launches(args),
             Some(PrefillSegmentRoute::Gemma4Glu(_)) => 1,
             Some(PrefillSegmentRoute::GemmBlk(route)) => route.launches(),
@@ -16556,6 +16655,10 @@ impl AmdEngine {
             }
             if let PrefillSegmentRoute::MoeAiter(route) = route {
                 route.rebase(rows)?;
+            }
+            if let PrefillSegmentRoute::HcAiter { ix, inst, .. } = route {
+                // Band rows follow the chunk (rebase_band_rows patched the live record).
+                *inst = insts[*ix as usize];
             }
             if let PrefillSegmentRoute::IndexTp(route) = route {
                 route.rebase(rows)?;
