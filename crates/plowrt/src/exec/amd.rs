@@ -821,6 +821,18 @@ struct RouterTopkArgs {
     route_scale: f32,
 }
 
+/// `plow_moe_router_fused` kernargs (`MoeRouterFusedArgs`).
+#[derive(Clone, Copy, Debug)]
+#[repr(C)]
+struct RouterFusedArgs {
+    g: RouterGemmArgs,
+    t: RouterTopkArgs,
+    ctr: u64,
+}
+
+/// `PLOW_AMD_ROUTER_FUSED` per-16-row-tile counters (rows <= 16 * this).
+const ROUTER_FUSED_TILES: usize = 1024;
+
 /// `plow_xr_native` kernargs (runtime/amd/xr_native.hip `XrNativeArgs`).
 #[derive(Clone, Copy, Debug)]
 #[repr(C)]
@@ -7724,6 +7736,8 @@ pub struct AmdEngine {
     k_xr_native: Option<HsaKernel>,
     /// `PLOW_AMD_ROUTER_NATIVE`: `plow_moe_router_gemm` / `_topk` from the gfx950 MoE adapter.
     k_router_native: Option<[HsaKernel; 2]>,
+    /// `PLOW_AMD_ROUTER_FUSED`: `plow_moe_router_fused` and its zeroed per-tile counters.
+    k_router_fused: Option<(HsaKernel, DeviceMem)>,
     /// `PLOW_AMD_LT_FUSE`: `plow_glm_inproj_partial` / `_reduce` and their f32 split-K scratch.
     k_inproj: Option<[HsaKernel; 4]>,
     d_inproj: Option<DeviceMem>,
@@ -9932,7 +9946,7 @@ impl AmdEngine {
         } else {
             (None, None)
         };
-        let k_router_native = if crate::config::RuntimeConfig::get().amd.router_native {
+        let (k_router_native, k_router_fused) = if crate::config::RuntimeConfig::get().amd.router_native {
             const NAME: &str = "moe_aiter_adapter_gfx950.elf";
             const MARKER: &str = "plow_moe_router_abi_2";
             let path = hsaco_dir.join(NAME);
@@ -9965,10 +9979,32 @@ impl AmdEngine {
                 }
                 ks.push(k);
             }
+            let fused = if crate::config::RuntimeConfig::get().amd.router_fused {
+                const FUSED: &str = "plow_moe_router_fused_abi_1";
+                if !elf_symbol_names(&image).contains(&FUSED) {
+                    return Err(RuntimeError::Device(format!(
+                        "PLOW_AMD_ROUTER_FUSED: {NAME} does not advertise `{FUSED}`"
+                    )));
+                }
+                let k = EngineDevice::get_function(&*be, &module, "plow_moe_router_fused")
+                    .map_err(|e| RuntimeError::Device(format!("{NAME}: plow_moe_router_fused: {e}")))?;
+                let want = std::mem::size_of::<RouterFusedArgs>();
+                if (k.kernarg_size() as usize) < want || k.private_segment_size() != 0 {
+                    return Err(RuntimeError::Device(format!(
+                        "{NAME}: plow_moe_router_fused kernarg segment is {} B (ABI needs {want}) or private memory is used",
+                        k.kernarg_size()
+                    )));
+                }
+                let ctr = EngineDevice::alloc(&*be, (ROUTER_FUSED_TILES * 4) as u64)?;
+                EngineDevice::upload(&*be, &ctr, 0, &[0u8; ROUTER_FUSED_TILES * 4])?;
+                Some((k, ctr))
+            } else {
+                None
+            };
             modules.push(module);
-            Some([ks[0], ks[1]])
+            (Some([ks[0], ks[1]]), fused)
         } else {
-            None
+            (None, None)
         };
 
         let need_hc_aiter = blob
@@ -13529,6 +13565,7 @@ impl AmdEngine {
             k_hc_aiter,
             k_xr_native,
             k_router_native,
+            k_router_fused,
             k_inproj,
             d_inproj,
             k_moe_w8a8_dec,
@@ -15608,7 +15645,13 @@ impl AmdEngine {
             Some(DecodeSegmentRoute::GroupedMoeMxfp4 { .. }) => 2,
             Some(DecodeSegmentRoute::MoeW8a8Dec { .. }) => 2,
             Some(DecodeSegmentRoute::HcAiter(_)) => 2,
-            Some(DecodeSegmentRoute::RouterNative { .. }) => 2,
+            Some(DecodeSegmentRoute::RouterNative { .. }) => {
+                if self.k_router_fused.is_some() {
+                    1
+                } else {
+                    2
+                }
+            }
             Some(DecodeSegmentRoute::LtFused(_)) => 2,
             Some(DecodeSegmentRoute::DenseNative(_)) => 5,
             Some(DecodeSegmentRoute::Skip) => 0,
@@ -16445,16 +16488,6 @@ impl AmdEngine {
                     k: gemm.i[2],
                     pad: 0,
                 };
-                EngineDevice::launch_kernel(
-                    &*self.be,
-                    kg,
-                    gemm.i[0].div_ceil(16) * gemm.i[1].div_ceil(16),
-                    // Eight waves split K (`plow_moe_router_gemm`'s launch bound).
-                    512,
-                    0,
-                    as_bytes(std::slice::from_ref(&ga)),
-                    None,
-                )?;
                 let ta = RouterTopkArgs {
                     table: addr(topk.t[0]),
                     logit: addr(topk.t[1]),
@@ -16466,6 +16499,33 @@ impl AmdEngine {
                     shared_tail: topk.i[5],
                     route_scale: f32::from_bits(topk.fj[0]),
                 };
+                if let Some((kf, ctr)) = self.k_router_fused.as_ref() {
+                    if gemm.i[0].div_ceil(16) as usize > ROUTER_FUSED_TILES {
+                        return Err(RuntimeError::Device("PLOW_AMD_ROUTER_FUSED: too many rows".into()));
+                    }
+                    let fa = RouterFusedArgs { g: ga, t: ta, ctr: ctr.base };
+                    EngineDevice::launch_kernel(
+                        &*self.be,
+                        *kf,
+                        gemm.i[0].div_ceil(16) * gemm.i[1].div_ceil(16),
+                        512,
+                        0,
+                        as_bytes(std::slice::from_ref(&fa)),
+                        None,
+                    )?;
+                    self.seg_launches += 1;
+                    return Ok(());
+                }
+                EngineDevice::launch_kernel(
+                    &*self.be,
+                    kg,
+                    gemm.i[0].div_ceil(16) * gemm.i[1].div_ceil(16),
+                    // Eight waves split K (`plow_moe_router_gemm`'s launch bound).
+                    512,
+                    0,
+                    as_bytes(std::slice::from_ref(&ga)),
+                    None,
+                )?;
                 EngineDevice::launch_kernel(
                     &*self.be,
                     kt,

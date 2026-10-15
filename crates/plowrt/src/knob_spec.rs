@@ -732,6 +732,7 @@ pub const RUNTIME: &[KnobSpec] = &[
     KnobSpec::new("rt.lt_overlap", Some("PLOW_AMD_LT_OVERLAP"), Layer::Runtime, Domain::Bool, OFF, OPT_IN),
     KnobSpec::new("rt.lt_fuse", Some("PLOW_AMD_LT_FUSE"), Layer::Runtime, Domain::Bool, OFF, OPT_IN),
     KnobSpec::new("rt.dense_native", Some("PLOW_AMD_DENSE_NATIVE"), Layer::Runtime, Domain::Bool, OFF, OPT_IN),
+    KnobSpec::new("rt.router_fused", Some("PLOW_AMD_ROUTER_FUSED"), Layer::Runtime, Domain::Bool, OFF, OPT_IN),
     KnobSpec::new("rt.threads", Some("PLOW_CPU_THREADS"), Layer::Runtime, U32, Default::Static(Val::Nat(0)), OPT_IN),
     KnobSpec::new("rt.numa", Some("PLOW_CPU_NUMA"), Layer::Runtime, Domain::Str, Default::Static(Val::Str("auto")), OPT_IN),
     KnobSpec::new("rt.huge_pages", Some("PLOW_CPU_HUGE_PAGES"), Layer::Runtime, Domain::Bool, UNSET, OPT_IN),

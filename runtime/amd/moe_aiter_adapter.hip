@@ -373,8 +373,8 @@ static_assert(sizeof(MoeRouterGemmArgs) == 40);
 
 /* Eight waves split K (512 each, 16 fully unrolled 16-byte loads per operand in flight per lane):
  * the score GEMM is load-latency bound at these shapes, not MFMA bound. */
-extern "C" __global__ __launch_bounds__(512) void plow_moe_router_gemm(MoeRouterGemmArgs a) {
 #if defined(__HIP_DEVICE_COMPILE__) && defined(__gfx950__)
+__device__ __forceinline__ void router_gemm_tile(const MoeRouterGemmArgs& a) {
     __shared__ f32x4 part[8][64];
     const unsigned tiles_n = (a.n_exp + 15u) / 16u;
     const unsigned t0 = blockIdx.x / tiles_n * 16u, e0 = blockIdx.x % tiles_n * 16u;
@@ -412,6 +412,12 @@ extern "C" __global__ __launch_bounds__(512) void plow_moe_router_gemm(MoeRouter
             if (t < a.rows && e < a.n_exp) a.logit[(size_t)t * a.n_exp + e] = s[i];
         }
     }
+}
+#endif
+
+extern "C" __global__ __launch_bounds__(512) void plow_moe_router_gemm(MoeRouterGemmArgs a) {
+#if defined(__HIP_DEVICE_COMPILE__) && defined(__gfx950__)
+    router_gemm_tile(a);
 #endif
 }
 
@@ -428,15 +434,11 @@ struct MoeRouterTopkArgs {
 };
 static_assert(sizeof(MoeRouterTopkArgs) == 48);
 
-extern "C" __global__ __launch_bounds__(256) void plow_moe_router_topk(MoeRouterTopkArgs a) {
 #if defined(__HIP_DEVICE_COMPILE__)
-    __shared__ unsigned wl_all[4][8];
-    __shared__ float ws_all[4][8];
-    const unsigned lane = threadIdx.x & 63u, wave = threadIdx.x >> 6;
-    const unsigned tok = blockIdx.x * 4u + wave;
-    if (tok >= a.rows) return;
-    unsigned* wl = wl_all[wave];
-    float* ws = ws_all[wave];
+/* One wave selects one token's top-k; `wl`/`ws` are that wave's 8-slot LDS scratch. */
+__device__ __forceinline__ void router_topk_row(const MoeRouterTopkArgs& a, unsigned tok,
+                                                unsigned* wl, float* ws) {
+    const unsigned lane = threadIdx.x & 63u;
     const unsigned per = (a.n_exp + 63u) / 64u;
     float s[5];
     unsigned long long key[5];
@@ -516,7 +518,49 @@ extern "C" __global__ __launch_bounds__(256) void plow_moe_router_topk(MoeRouter
         }
         if (a.shared_tail) trow[a.k] = make_uint2(a.n_exp, __float_as_uint(1.0f));
     }
+}
+#endif
+
+extern "C" __global__ __launch_bounds__(256) void plow_moe_router_topk(MoeRouterTopkArgs a) {
+#if defined(__HIP_DEVICE_COMPILE__)
+    __shared__ unsigned wl_all[4][8];
+    __shared__ float ws_all[4][8];
+    const unsigned wave = threadIdx.x >> 6;
+    const unsigned tok = blockIdx.x * 4u + wave;
+    if (tok >= a.rows) return;
+    router_topk_row(a, tok, wl_all[wave], ws_all[wave]);
+#endif
+}
+
+/* PLOW_AMD_ROUTER_FUSED: the score GEMM and the top-k in one launch. Each 16-token row of tiles
+ * counts its finished expert tiles; the last tile's workgroup selects those 16 tokens' top-k
+ * from the f32 logits the others published, then re-arms the counter. */
+struct MoeRouterFusedArgs {
+    MoeRouterGemmArgs g;
+    MoeRouterTopkArgs t;
+    unsigned* ctr;
+};
+static_assert(sizeof(MoeRouterFusedArgs) == 96);
+
+extern "C" __global__ __launch_bounds__(512) void plow_moe_router_fused(MoeRouterFusedArgs a) {
+#if defined(__HIP_DEVICE_COMPILE__) && defined(__gfx950__)
+    router_gemm_tile(a.g);
+    __shared__ unsigned last;
+    __shared__ unsigned wl_all[8][8];
+    __shared__ float ws_all[8][8];
+    const unsigned tiles_n = (a.g.n_exp + 15u) / 16u, rt = blockIdx.x / tiles_n;
+    __threadfence();
+    __syncthreads();
+    if (threadIdx.x == 0) last = atomicAdd(&a.ctr[rt], 1u) == tiles_n - 1u;
+    __syncthreads();
+    if (!last) return;
+    __threadfence();
+    const unsigned wave = threadIdx.x >> 6;
+    for (unsigned tok = rt * 16u + wave; tok < min(rt * 16u + 16u, a.t.rows); tok += 8u)
+        router_topk_row(a.t, tok, wl_all[wave], ws_all[wave]);
+    if (threadIdx.x == 0) a.ctr[rt] = 0u;
 #endif
 }
 
 extern "C" __device__ unsigned plow_moe_router_abi_2 = 1;
+extern "C" __device__ unsigned plow_moe_router_fused_abi_1 = 1;

@@ -2328,6 +2328,9 @@ pub struct AmdRuntimeConfig {
     /// Needs `PLOW_AMD_XR_NATIVE` to cover the layer's collective.
     #[arg(long = "amd-dense-native", env = "PLOW_AMD_DENSE_NATIVE", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
     pub dense_native: bool,
+    /// With `PLOW_AMD_ROUTER_NATIVE`: the router score GEMM and top-k as one launch.
+    #[arg(long = "amd-router-fused", env = "PLOW_AMD_ROUTER_FUSED", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
+    pub router_fused: bool,
 }
 
 /// Global runtime config, initialized once at startup from CLI parse.
