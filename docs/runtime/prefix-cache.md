@@ -50,7 +50,7 @@ production qualification remain pending; build compatibility alone is not that
 evidence. The H100 readiness report lives with the campaign's raw `perf-data`, which is
 kept out of source control.
 
-## Retention policy on the CUDA VMM pool: the boundary tree (`PLOW_PREFIX_POLICY`, 2026-10)
+## Retention policy on the CUDA VMM pool: the boundary tree (2026-10)
 
 Mechanism (unchanged since 2026-09): the full-attention layers' KV is shared zero-copy as 2 MiB
 granules through a token-verified radix tree of whole blocks; everything else a prompt needs to
@@ -59,7 +59,7 @@ the last whole block, FP8 scales) is a private *boundary snapshot* (`vmm_snap_by
 prompt end on Gemma-4 26B FP8, a stub on uniform full attention). Pressure eviction keeps free
 device memory above `PLOW_VMM_CACHE_MIN_FREE_MIB`.
 
-Policy (`crates/plowrt/src/memory/vmm_policy.rs`, `Policy::Tree`, the default):
+Policy (`crates/plowrt/src/memory/vmm_policy.rs`, `Policy::Tree`, the only CUDA policy):
 
 * `Snap { id, kind, chain, parent, children, users, last_used, store }`. `kind` is what the
   publisher said (`PROMPT_END`, `SHARED_END`, `CHECKPOINT`; a dedup or a touch ORs). `parent` is
@@ -167,23 +167,15 @@ owner per buffer (device or host) outside `Spilling`; a `Spilling`/`Restoring` s
 freed, never a victim, never spilled twice; a held snapshot is never spilled; `users` releases
 exactly once per attach, prefetch or restore; a snapshot's blocks go only with the snapshot.
 
-`PLOW_PREFIX_POLICY=legacy` (one release) restores the 0.1.2 retention policy: the
-`attaches`/`share`/`session`/`referenced`/`reusable_prompt` flags and `evict_one`'s tiers,
-`retire_superseded` (with `PLOW_PREFIX_RETIRE_ATTACHED`), `note_session` and the session pin
-(`PLOW_SESSION_TTL_MS`), the turn-end output boundary (`PLOW_PREFIX_CACHE_OUTPUT`), shared ends
-for same-history pairs. It is not a byte-exact rollback of production `c53036db`; these changes
-stay active under it (the previous binary is the exact rollback):
+The 0.1.2 flag/tier policy (`Policy::Legacy`: `attaches`/`share`/`referenced` flags,
+`evict_one`'s tiers, `SHARED_RECENT_TICKS`) remains only for AMD's shared-prefix path
+(`exec/amd/shared_prefix.rs`). The CUDA engine always runs the tree; `PLOW_PREFIX_POLICY`,
+`PLOW_PREFIX_CACHE_OUTPUT` and `PLOW_PREFIX_RETIRE_ATTACHED` were removed with the CUDA legacy
+paths (session pin, turn-end output boundary, `retire_superseded`). The previous binary is the
+rollback.
 
-* the MRU exemption ages out after `SHARED_RECENT_TICKS` (2048 publishes + attaches) of reuse
-  distance instead of lasting until another snapshot is referenced;
-* eviction honours waiters' reservations (`Await { chain, rows }`, tailed targets included), and
-  a packed admission reset clears a cancelled waiter's reservation;
-* the turn-end pass restores or touches the prompt end regardless of `PLOW_PREFIX_CACHE_OUTPUT`,
-  and `publish_boundary` tries that metadata touch (merging kind and `share`/`reusable_prompt`
-  like a dedup) before the ring-overflow check;
-* `retire_slot` releases the live ring before `begin_seq`'s trim;
-* every node-level removal frees its snapshots one at a time, and strict publish's tail
-  eviction stops below a held, awaited or in-transfer snapshot;
-* whole-block checkpoints and chunk ends inside a prompt publish only for an in-flight waiter,
-  and the turn-end output boundary only for an `X-Session-Id` request;
-* snapshots are identified by id; the host tier and `PLOW_PREFIX_SESSION_TTL_S` are tree-only.
+`/metrics`: `plowrt_prefix_snapshots_{live,branch,share}`, `snapshots_{retired,touched}_total`,
+`publishes_{prompt_end,shared_end,checkpoint,turn_end}_total`, attach kinds
+`attach_{prompt_end,block,shared}_total` + `attach_misses_total` and the rows each kind attached
+/ left to recompute `tokens_{attached,lost}_{prompt_end,block,shared}_total`,
+`tokens_lost_miss_total`.

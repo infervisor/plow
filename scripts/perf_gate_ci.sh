@@ -8,7 +8,8 @@
 # default or Qualified, or when the body of a `Default::Production` const it uses changes. Each
 # flipped knob needs perf-certs/<knob id>.json, written by `scripts/perf_cert.py make`, and
 # `scripts/perf_cert.py verify` must accept it: a rejected or insufficient_evidence certificate
-# fails the run. A missing certificate fails the run on any runner.
+# fails the run. A missing certificate fails the run on any runner. A gated knob whose registry
+# line is gone is reported as a notice.
 #
 # Environment:
 #   PLOW_VERIFY_BIN   a plow_verify that implements checkpoint P. Unset (and no lean-plow build),
@@ -103,6 +104,9 @@ for path in paths:
             # so on purpose (reported), OptIn/Diagnostic misdescribes the default (refused).
             cls = "candidate" if kind(s, nc) == "Status::Candidate" else "unqualified"
             hit[id_] = cls + "\t" + row
+    for id_, prev in ok.items():
+        if id_ not in nk and gated(*prev, oc):
+            hit[id_] = f"removed\t{envs.get(id_, '')}\t{prev[0]} / {kind(prev[1], oc)} -> removed"
 print("\n".join(f"{k}\t{v}" for k, v in sorted(hit.items())))
 PY
 )
@@ -116,6 +120,10 @@ fail=0
 knobs=()
 while IFS=$'\t' read -r knob class env change; do
     knobs+=("$knob")
+    if [ "$class" = removed ]; then
+        echo "::notice title=knob removed::$knob ($env): $change. No certificate needed; its runtime path is gone"
+        continue
+    fi
     if [ "$class" = candidate ]; then
         echo "::warning title=default-on candidate::$knob ($env): $change. Default-on without a certificate; promoting it to Status::Qualified needs perf-certs/$knob.json (scripts/perf_cert.py make)"
         continue

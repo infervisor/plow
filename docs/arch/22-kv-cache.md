@@ -456,7 +456,7 @@ reuse it, paying the copies and an allocation on workloads with a zero hit rate.
 `PLOW_VMM_PUBLISH_SHARED` (default on) records each sequence's leading 32 tokens
 and publishes only once that lead has been seen on another sequence
 (`vmm.rs:1994`). Unique-prompt benchmarks now pay nothing; a shared prefix costs
-one extra miss on its first sighting. The boundary tree (`PLOW_PREFIX_POLICY=tree`) still
+one extra miss on its first sighting. The boundary tree still
 publishes an unseen lead's prompt end, at the cold end of the LRU: otherwise the first
 conversation with a new system prompt missed its whole turn 2. Eviction takes cold boundaries
 before any other, and an attach makes one ordinary. The cost: a unique-prompt workload pays one

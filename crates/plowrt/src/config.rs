@@ -856,23 +856,6 @@ pub struct RuntimeConfig {
     #[arg(long = "vmm-publish-shared", env = "PLOW_VMM_PUBLISH_SHARED", default_value_t = true, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
     pub vmm_publish_shared: bool,
 
-    /// CUDA VMM prefix cache: publish a finished sequence's end-of-generation boundary (prompt
-    /// + generated rows), so a follow-up turn that embeds this turn's output attaches to it.
-    /// `0` skips it for single-turn traffic (one sliding-window snapshot buffer and copy less
-    /// per request); the prompt-end boundary and whole-block checkpoints still publish.
-    #[arg(long = "prefix-cache-output", env = "PLOW_PREFIX_CACHE_OUTPUT", default_value_t = true, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
-    pub prefix_cache_output: bool,
-
-    /// CUDA packed prefill: a request whose prompt shares whole KV blocks with a prompt another
-    /// slot is still prefilling waits (bounded) for that slot's checkpoint and attaches to it
-    /// instead of recomputing the shared rows beside it. `0` admits it at once.
-    /// CUDA VMM prefix cache: a conversation without `X-Session-Id` frees the prompt-end
-    /// boundary it attached once its own longer prompt end publishes (what a session's
-    /// `retire_superseded` already does), so a live conversation holds one sliding-window
-    /// snapshot instead of two. `0` keeps the attached boundary until LRU reaches it.
-    #[arg(long = "prefix-retire-attached", env = "PLOW_PREFIX_RETIRE_ATTACHED", default_value_t = true, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
-    pub prefix_retire_attached: bool,
-
     /// CUDA VMM prefix cache: pinned host memory (MiB) that evicted boundary snapshots spill
     /// to instead of being freed (the second level of the cache's LRU), restored over PCIe when
     /// a prompt attaches to one. `0` (the default) keeps snapshots device-only.
@@ -884,7 +867,7 @@ pub struct RuntimeConfig {
     )]
     pub vmm_host_cache_mib: u64,
 
-    /// CUDA VMM prefix cache, `PLOW_PREFIX_POLICY=tree`: seconds a request with
+    /// CUDA VMM prefix cache: seconds a request with
     /// `X-Session-Id` keeps its newest boundary protected from LRU after its last use; then the
     /// boundary and the blocks only it kept attachable are demoted (freed). `0` = sessions get
     /// no special retention.
@@ -896,20 +879,11 @@ pub struct RuntimeConfig {
     )]
     pub prefix_session_ttl_s: u32,
 
+    /// CUDA packed prefill: a request whose prompt shares whole KV blocks with a prompt another
+    /// slot is still prefilling waits (bounded) for that slot's checkpoint and attaches to it
+    /// instead of recomputing the shared rows beside it. `0` admits it at once.
     #[arg(long = "prefix-inflight-wait", env = "PLOW_PREFIX_INFLIGHT_WAIT", default_value_t = true, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
     pub prefix_inflight_wait: bool,
-
-    /// CUDA VMM prefix cache retention policy: `tree` (boundary tree, one LRU; the default) or
-    /// `legacy` (the flag/tier policy of release 0.1.2, kept for one release as an in-binary
-    /// rollback; the only policy under which `PLOW_PREFIX_CACHE_OUTPUT`,
-    /// `PLOW_PREFIX_RETIRE_ATTACHED` and a session's cache pin have an effect).
-    #[arg(
-        long = "prefix-policy",
-        env = "PLOW_PREFIX_POLICY",
-        default_value = "tree",
-        global = true
-    )]
-    pub prefix_policy: String,
 
     /// CUDA token-batch prefill: publish the whole-block checkpoints a prompt chunk completed
     /// when the chunk lands, not only at the prompt's end, so a request waiting on a long
@@ -2611,22 +2585,6 @@ impl RuntimeConfig {
         )
     }
 
-    pub(crate) fn prefix_cache_output(&self) -> bool {
-        select_compat(
-            self.prefix_cache_output,
-            Self::env_bool("PLOW_PREFIX_CACHE_OUTPUT"),
-            !Self::is_initialized(),
-        )
-    }
-
-    pub(crate) fn prefix_retire_attached(&self) -> bool {
-        select_compat(
-            self.prefix_retire_attached,
-            Self::env_bool("PLOW_PREFIX_RETIRE_ATTACHED"),
-            !Self::is_initialized(),
-        )
-    }
-
     pub(crate) fn vmm_host_cache_bytes(&self) -> u64 {
         let mib = if Self::is_initialized() {
             self.vmm_host_cache_mib
@@ -2643,17 +2601,6 @@ impl RuntimeConfig {
             Self::env_parse("PLOW_PREFIX_SESSION_TTL_S").unwrap_or(self.prefix_session_ttl_s)
         };
         std::time::Duration::from_secs(u64::from(s))
-    }
-
-    /// `PLOW_PREFIX_POLICY`: `legacy` selects the 0.1.2 flag/tier policy; anything else is
-    /// the boundary tree.
-    pub(crate) fn prefix_policy_legacy(&self) -> bool {
-        let value = if Self::is_initialized() {
-            self.prefix_policy.clone()
-        } else {
-            Self::env_nonempty("PLOW_PREFIX_POLICY").unwrap_or_else(|| self.prefix_policy.clone())
-        };
-        value.eq_ignore_ascii_case("legacy")
     }
 
     pub(crate) fn prefix_inflight_wait(&self) -> bool {
