@@ -474,6 +474,13 @@ pub(crate) fn rebase_band_rows(
         if d.op == DevOp::XAllToAllHeads as u16 && d.i[0] == tb {
             d.i[0] = b;
         }
+        if names.get(d.t[0] as usize).is_some_and(|n| n == "act.qa_rs") {
+            if let Some(RowField::Rows(f)) = prefill_row_field(d.op) {
+                if d.i[f] == tb {
+                    d.i[f] = b;
+                }
+            }
+        }
         if d.op == DevOp::MlaMergeFold as u16
             && d.i[0] == tb
             && names.get(d.t[0] as usize).is_some_and(|n| n == "act.oat_rs_tp")

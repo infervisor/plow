@@ -2895,6 +2895,9 @@ struct GlmLW {
     // `nh_l` shard — see `glm_rowsplit_attn_eligible`. TENSOR_NONE unless the knob is on and
     // this layer reaches the sparse prefill arm at the 8192 rung.
     wuv_full: u32,
+    /// `PLOW_GLM_DSA_PF_A2A`: the full derived q_absorb, so the sibling projects its band's q at
+    /// every head instead of all-to-alling it.
+    wqa_full: u32,
     wo: u32,     // o_proj (NH*VD -> H)
     wofold: u32, // DERIVED fused W_uv·W_o (NH*DK -> H), prefill ofold arm only; else NONE
     gpost: u32,  // post_attention_layernorm
@@ -4363,6 +4366,19 @@ fn declare_glm_rows_batched_for_prefill(
                     b,
                     "self_attn.derived.v_absorb.weight",
                     (nh * dk * vd) as u64 * BF16,
+                )
+            } else {
+                TENSOR_NONE
+            },
+            wqa_full: if mla
+                && emit_config::active().glm_dsa_pf_a2a
+                && tp > 1
+                && glm_rowsplit_attn_eligible(c, l, full)
+            {
+                t(
+                    b,
+                    "self_attn.derived.q_absorb.weight",
+                    (nh * dk * ql) as u64 * BF16,
                 )
             } else {
                 TENSOR_NONE
@@ -8687,26 +8703,13 @@ fn emit_glm53_a2a_attn(
             && n.qa_tp != TENSOR_NONE
             && n.qa_rs != TENSOR_NONE
             && n.oat_rs != TENSOR_NONE
-            && w.wuv_full != TENSOR_NONE,
+            && w.wuv_full != TENSOR_NONE
+            && w.wqa_full != TENSOR_NONE,
         "PLOW_GLM_DSA_PF_A2A needs the bf16 NoPE latent-512 MLA at 8 heads per rank"
     );
     let all = b.all();
-    let c_q = crate::emit_xalltoall_heads(
-        b,
-        xgate,
-        xr_cus,
-        fl_deps,
-        n.qa_rs,
-        rows,
-        nh_l,
-        dk,
-        nh,
-        tp,
-        6 * n.slot_b,
-        0,
-        nh,
-    );
-    let c_fl = b.emit(DevOp::FlashMlaPrefill, all.clone(), &[c_q], |d| {
+    // q is already this band's at every head (the q_absorb band GEMM above).
+    let c_fl = b.emit(DevOp::FlashMlaPrefill, all.clone(), fl_deps, |d| {
         d.t[0] = n.opart;
         d.t[1] = n.mlpart;
         d.t[2] = n.qa_rs;
@@ -9377,6 +9380,19 @@ pub(crate) fn emit_glm_mla_prefill(
             ql,
             &[c_rnq],
             )
+        }
+        // A2A sibling: this rank's band q at every head, straight into the flash's operand.
+        None if use_rowsplit && a2a => {
+            let ql_b = glm_band_as(b, n.qlat, t, tp, u64::from(ql) * BF16, ".ql");
+            let op = pick_tile(t / tp, nh * dk, ql, n_cu, kernelcaps::QuantScheme::None);
+            b.emit(op, all.clone(), &[c_rnq], |d| {
+                d.t[0] = n.qa_rs;
+                d.t[1] = ql_b;
+                d.t[2] = w.wqa_full;
+                d.i[0] = t / tp;
+                d.i[1] = nh * dk;
+                d.i[2] = ql;
+            })
         }
         None => gemm(
             b,
