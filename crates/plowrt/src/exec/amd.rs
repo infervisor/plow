@@ -214,6 +214,7 @@ enum DecodeSegmentKind {
     MlaAttention,
     KdaDecodeFused(usize),
     HcMix(usize),
+    Router(usize),
     MoeW8a8Dec { glu: usize, down: usize },
     MoeAiter,
     GemmLt,
@@ -226,6 +227,10 @@ enum DecodeSegmentKind {
 fn hc_mix_raw(inst: &packet::dev::DevInst64) -> bool {
     inst.op == DevOp::GemvF32 as u16
         && (inst.i[7] == packet::dev::HC_MIX_RAW_MARK || hc_aiter_raw(inst))
+}
+
+fn router_raw(inst: &packet::dev::DevInst64) -> bool {
+    inst.op == DevOp::GemmF32 as u16 && inst.i[7] == packet::dev::ROUTER_RAW_MARK
 }
 
 fn hc_aiter_raw(inst: &packet::dev::DevInst64) -> bool {
@@ -279,9 +284,12 @@ fn decode_segment_kinds(prog: &DevProg) -> Result<Vec<DecodeSegmentKind>> {
                 || inst.op == DevOp::GemmLtPf as u16
                 || inst.op == DevOp::IndexFp8Decode as u16
                 || hc_mix_raw(inst)
+                || router_raw(inst)
             {
                 let name = if hc_mix_raw(inst) {
                     "HcMixDecode"
+                } else if router_raw(inst) {
+                    "RouterDecode"
                 } else if inst.op == DevOp::MoeAiterFp8Pf as u16 {
                     "MoeAiterFp8Pf"
                 } else if inst.op == DevOp::GemmLtPf as u16 {
@@ -387,6 +395,8 @@ fn decode_segment_kinds(prog: &DevProg) -> Result<Vec<DecodeSegmentKind>> {
         if let Some(inst) = fused_inst {
             let name = if hc_mix_raw(&prog.insts[inst]) {
                 "HcMixDecode"
+            } else if router_raw(&prog.insts[inst]) {
+                "RouterDecode"
             } else if prog.insts[inst].op == DevOp::MoeAiterFp8Pf as u16 {
                 "MoeAiterFp8Pf"
             } else if prog.insts[inst].op == DevOp::GemmLtPf as u16 {
@@ -409,6 +419,8 @@ fn decode_segment_kinds(prog: &DevProg) -> Result<Vec<DecodeSegmentKind>> {
             }
             kinds[seg] = if hc_mix_raw(&prog.insts[inst]) {
                 DecodeSegmentKind::HcMix(inst)
+            } else if router_raw(&prog.insts[inst]) {
+                DecodeSegmentKind::Router(inst)
             } else if prog.insts[inst].op == DevOp::MoeAiterFp8Pf as u16 {
                 DecodeSegmentKind::MoeAiter
             } else if prog.insts[inst].op == DevOp::GemmLtPf as u16 {
@@ -646,6 +658,66 @@ struct HcMixArgs {
 }
 
 const _: () = assert!(std::mem::size_of::<HcMixArgs>() == 128);
+
+/// PLOW_GLM_ROUTER_RAW (`router_decode.hip`): score GEMV + top-k, `rows * per_row` workgroups
+/// (`per_row` at eight rows, all co-resident).
+#[derive(Clone, Copy, Debug)]
+#[repr(C)]
+struct RouterDecodeArgs {
+    logit: u64,
+    x: u64,
+    w: u64,
+    table: u64,
+    bias: u64,
+    ctr: u64,
+    rows: u32,
+    n_exp: u32,
+    k_dim: u32,
+    topk: u32,
+    flags: u32,
+    shared_tail: u32,
+    n_group: u32,
+    topk_group: u32,
+    route_scale: f32,
+    per_row: u32,
+}
+
+const _: () = assert!(std::mem::size_of::<RouterDecodeArgs>() == 88);
+
+fn router_args(d: &packet::dev::DevInst64, devp: &[DeviceMem]) -> Result<RouterDecodeArgs> {
+    let bad = |m: &str| RuntimeError::Device(format!("RouterDecode: {m}"));
+    let t = |slot: usize| -> Result<u64> {
+        devp.get(d.t[slot] as usize)
+            .map(|m| m.base)
+            .filter(|&b| b != 0)
+            .ok_or_else(|| bad("operand handle"))
+    };
+    let (rows, n_exp, k_dim, topk, flags) = (d.i[0], d.i[1], d.i[2], d.i[3], d.i[4]);
+    // f32 logits (flag 8), sigmoid (1), no hash/sqrt-softplus arms; k within the LDS carve.
+    if rows == 0 || rows > 256 || n_exp == 0 || n_exp > 512 || k_dim % 8 != 0 || topk == 0
+        || topk > 8 || flags & 9 != 9 || flags & 48 != 0 || d.i[5] > 1
+    {
+        return Err(bad("unsupported geometry or flags"));
+    }
+    Ok(RouterDecodeArgs {
+        logit: t(0)?,
+        x: t(1)?,
+        w: t(2)?,
+        table: t(3)?,
+        bias: t(4)?,
+        ctr: t(5)?,
+        rows,
+        n_exp,
+        k_dim,
+        topk,
+        flags,
+        shared_tail: d.i[5],
+        n_group: d.i[6] & 0xffff,
+        topk_group: d.i[6] >> 16,
+        route_scale: f32::from_bits(d.fj[0]),
+        per_row: n_exp.div_ceil(WG_THREADS_8 / 64),
+    })
+}
 
 /// PLOW_GLM_HC_AITER: `mhc_fused_post_pre_gemm_sqrsum_kernel` (bf16, 4 warps, tile_m 16|32,
 /// tile_n 32, tile_k 32, split_k 64) kernargs.
@@ -3578,6 +3650,7 @@ enum DecodeSegmentRoute {
     KdaDecodeWide(KdaDecodeWideArgs),
     HcMix(HcMixArgs),
     HcAiter(HcAiterRoute),
+    Router(RouterDecodeArgs),
     MoeW8a8Dec {
         glu: MoeFp8GluArgs,
         down: MoeFp8DownArgs,
@@ -3690,6 +3763,10 @@ fn decode_segment_routes(
                     init,
                     devp,
                 )?));
+                continue;
+            }
+            DecodeSegmentKind::Router(ix) => {
+                routes.push(DecodeSegmentRoute::Router(router_args(&prog.insts[ix], devp)?));
                 continue;
             }
             DecodeSegmentKind::HcMix(ix) => {
@@ -7281,6 +7358,7 @@ pub struct AmdEngine {
     k_kda_decode_fused: Option<HsaKernel>,
     k_kda_decode_wide: Option<HsaKernel>,
     k_hc_mix: Option<HsaKernel>,
+    k_router: Option<HsaKernel>,
     k_hc_aiter: Option<[HsaKernel; 3]>,
     k_moe_w8a8_dec: Option<[HsaKernel; 3]>,
     k_grouped_moe_glu: Option<HsaKernel>,
@@ -7509,6 +7587,9 @@ pub struct AmdEngine {
     pub seg_enq_us: f64,
     pub seg_drain_us: f64,
     pub seg_launches: u64,
+    /// PLOW_AMD_LT_CONCURRENT: (program, segment) of the last decode segment enqueued and the
+    /// (output, input) addresses of the hipBLASLt segments queued since the last barrier packet.
+    lt_group: (Option<(usize, usize)>, Vec<(u64, u64)>),
 
     /// A/B CONTROL, not a tuning knob (`PLOW_SEG_WINDOW=0`). Clears
     /// `PlowProgram::seg_ofs`, so the interpreter falls back to scanning each
@@ -9488,6 +9569,50 @@ impl AmdEngine {
                 .map_err(|e| RuntimeError::Device(format!("{NAME}: no symbol {SYMBOL}: {e}")))?;
             const IMPLICIT: u32 = 256;
             let want = std::mem::size_of::<HcMixArgs>() as u32;
+            let got = kernel.kernarg_size();
+            if (got != want && got != want + IMPLICIT) || kernel.private_segment_size() != 0 {
+                return Err(RuntimeError::Device(format!(
+                    "{NAME}: kernarg segment is {got} B (ABI needs {want}) or private memory is used"
+                )));
+            }
+            modules.push(module);
+            Some(kernel)
+        } else {
+            None
+        };
+
+        let need_router = blob
+            .decode_phase()
+            .flat_map(|p| p.insts.iter())
+            .any(router_raw);
+        let k_router = if need_router {
+            if arch != "gfx950" {
+                return Err(RuntimeError::Device(format!(
+                    "RouterDecode requires gfx950, but this device is {arch}"
+                )));
+            }
+            const NAME: &str = "router_decode_gfx950.elf";
+            const MARKER: &str = "plow_router_decode_abi_2";
+            const SYMBOL: &str = "plow_router_decode";
+            let path = hsaco_dir.join(NAME);
+            let image = std::fs::read(&path).map_err(|e| {
+                RuntimeError::Device(format!(
+                    "PLOW_GLM_ROUTER_RAW requires standalone object {}: {e}",
+                    path.display()
+                ))
+            })?;
+            if !elf_symbol_names(&image).contains(&MARKER) {
+                return Err(RuntimeError::Device(format!(
+                    "standalone router object {} does not advertise `{MARKER}`",
+                    path.display()
+                )));
+            }
+            let module = EngineDevice::module_load(&*be, &image)
+                .map_err(|e| RuntimeError::Device(format!("{}: {e}", path.display())))?;
+            let kernel = EngineDevice::get_function(&*be, &module, SYMBOL)
+                .map_err(|e| RuntimeError::Device(format!("{NAME}: no symbol {SYMBOL}: {e}")))?;
+            const IMPLICIT: u32 = 256;
+            let want = std::mem::size_of::<RouterDecodeArgs>() as u32;
             let got = kernel.kernarg_size();
             if (got != want && got != want + IMPLICIT) || kernel.private_segment_size() != 0 {
                 return Err(RuntimeError::Device(format!(
@@ -12961,6 +13086,7 @@ impl AmdEngine {
             k_kda_decode_fused,
             k_kda_decode_wide,
             k_hc_mix,
+            k_router,
             k_hc_aiter,
             k_moe_w8a8_dec,
             k_grouped_moe_glu,
@@ -13090,6 +13216,7 @@ impl AmdEngine {
             seg_enq_us: 0.0,
             seg_drain_us: 0.0,
             seg_launches: 0,
+            lt_group: (None, Vec::new()),
             seg_window: crate::config::RuntimeConfig::get().amd.seg_window,
         };
         engine.selected_routes = engine.capture_selected_routes();
@@ -15685,6 +15812,11 @@ impl AmdEngine {
                 self.progs[p].decode_routes.len()
             ))
         })?;
+        let lt_follows = self.lt_group.0 == Some((p, seg.wrapping_sub(1)));
+        if !matches!(route, DecodeSegmentRoute::GemmLt(_)) {
+            self.lt_group.1.clear();
+        }
+        self.lt_group.0 = Some((p, seg));
         match route {
             DecodeSegmentRoute::IndexFp8(route) => {
                 self.index_fp8
@@ -15749,6 +15881,26 @@ impl AmdEngine {
                 let kernel = self.gemm_lt.as_ref().ok_or_else(|| {
                     RuntimeError::Device("native decode GEMM has no loaded kernels".into())
                 })?;
+                if crate::config::RuntimeConfig::get().amd.lt_concurrent {
+                    let at = |h: u16| {
+                        let o = usize::from(h) * 8;
+                        u64::from_le_bytes(self.tens_table[o..o + 8].try_into().unwrap())
+                    };
+                    let [out, x] = route.io().map(at);
+                    if lt_follows
+                        && !self.lt_group.1.is_empty()
+                        && self
+                            .lt_group
+                            .1
+                            .iter()
+                            .all(|&(o, i)| o != x && o != out && i != out)
+                    {
+                        self.be.no_barrier_next();
+                    } else {
+                        self.lt_group.1.clear();
+                    }
+                    self.lt_group.1.push((out, x));
+                }
                 kernel.enqueue(&self.be, route, &self.tens_table)?;
             }
             DecodeSegmentRoute::KdaDecodeFused(args) => {
@@ -15830,6 +15982,20 @@ impl AmdEngine {
                     as_bytes(std::slice::from_ref(&r.pre)),
                 )?;
                 self.seg_launches += 1;
+            }
+            DecodeSegmentRoute::Router(args) => {
+                let kernel = self.k_router.ok_or_else(|| {
+                    RuntimeError::Device("RouterDecode segment has no validated object".into())
+                })?;
+                EngineDevice::launch_kernel(
+                    &*self.be,
+                    kernel,
+                    if args.rows == 8 { args.per_row } else { args.rows * args.per_row },
+                    WG_THREADS_8,
+                    0,
+                    as_bytes(std::slice::from_ref(&args)),
+                    None,
+                )?;
             }
             DecodeSegmentRoute::HcMix(args) => {
                 let kernel = self.k_hc_mix.ok_or_else(|| {

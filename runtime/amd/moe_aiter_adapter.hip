@@ -204,6 +204,10 @@ struct MoeTableArgs {
 };
 static_assert(sizeof(MoeTableArgs) == 96);
 
+#ifndef PLOW_MOE_TABLE_SCAN
+#define PLOW_MOE_TABLE_SCAN 0
+#endif
+
 extern "C" __global__ void plow_moe_aiter_prepare_table(MoeTableArgs a) {
 #if defined(__HIP_DEVICE_COMPILE__)
     if (blockIdx.x == 0) {
@@ -216,6 +220,29 @@ extern "C" __global__ void plow_moe_aiter_prepare_table(MoeTableArgs a) {
             if (e < a.n_exp) atomicAdd(&cnt[e], 1u);
         }
         __syncthreads();
+#if PLOW_MOE_TABLE_SCAN
+        /* Wave 0 scans: lane l owns experts [l*per, l*per+per), an exclusive prefix over the
+         * lane sums, then each lane writes its run. Same starts as the serial loop below, whose
+         * 288 dependent LDS round trips dominated this kernel at decode. */
+        if (tid < 64u) {
+            const unsigned per = (a.n_exp + 63u) / 64u, e0 = tid * per;
+            unsigned own = 0;
+            for (unsigned j = 0; j < per; j++)
+                if (e0 + j < a.n_exp) own += (cnt[e0 + j] + a.block_m - 1u) / a.block_m;
+            unsigned inc = own;
+            for (unsigned d = 1; d < 64u; d <<= 1) {
+                const unsigned v = __shfl_up(inc, d, 64);
+                if (tid >= d) inc += v;
+            }
+            unsigned b = inc - own;
+            for (unsigned j = 0; j < per; j++)
+                if (e0 + j < a.n_exp) {
+                    start[e0 + j] = b;
+                    b += (cnt[e0 + j] + a.block_m - 1u) / a.block_m;
+                }
+            if (tid == 63u) start[a.n_exp] = inc;
+        }
+#else
         if (tid == 0) {
             unsigned b = 0;
             for (unsigned e = 0; e < a.n_exp; e++) {
@@ -224,8 +251,21 @@ extern "C" __global__ void plow_moe_aiter_prepare_table(MoeTableArgs a) {
             }
             start[a.n_exp] = b;
         }
+#endif
         __syncthreads();
         const unsigned blocks = start[a.n_exp], padded = blocks * a.block_m;
+#if PLOW_MOE_TABLE_SCAN
+        /* Per expert instead of a binary search per padded entry: same experts[] and the same
+         * padding entries (positions >= cnt[e] of e's blocks). */
+        for (unsigned e = tid; e < a.n_exp; e += blockDim.x) {
+            const unsigned b0 = start[e], b1 = start[e + 1u];
+            for (unsigned b = b0; b < b1; b++) a.experts[b] = e;
+            for (unsigned i = b0 * a.block_m + cnt[e]; i < b1 * a.block_m; i++) {
+                a.ids[i] = a.rows;
+                a.weights[i] = 0.0f;
+            }
+        }
+#else
         for (unsigned i = tid; i < padded; i += blockDim.x) {
             const unsigned b = i / a.block_m;
             unsigned lo = 0, hi = a.n_exp;
@@ -240,6 +280,7 @@ extern "C" __global__ void plow_moe_aiter_prepare_table(MoeTableArgs a) {
                 a.weights[i] = 0.0f;
             }
         }
+#endif
         for (unsigned s = tid; s < slots; s += blockDim.x) {
             const uint2 r = a.table[s];
             if (r.x >= a.n_exp) continue;

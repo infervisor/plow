@@ -1042,6 +1042,8 @@ pub struct HsaBackend {
     chain_next: AtomicU64,
     chain_end: AtomicU64,
     chain_immediate: std::sync::atomic::AtomicBool,
+    /// PLOW_AMD_LT_CONCURRENT: the next dispatch packet omits the barrier bit (one-shot).
+    no_barrier_next: std::sync::atomic::AtomicBool,
     /// PLOW_AMD_KARG_CHAIN_FLUSH: the last VRAM kernarg slot written into the open deferred
     /// chain (address, size, last byte), read back once at commit instead of per packet.
     chain_karg: std::sync::Mutex<Option<(usize, usize, u8, [u8; KARG_SLOT])>>,
@@ -1449,6 +1451,7 @@ impl HsaBackend {
             chain_next: AtomicU64::new(0),
             chain_end: AtomicU64::new(CHAIN_IDLE),
             chain_immediate: std::sync::atomic::AtomicBool::new(false),
+            no_barrier_next: std::sync::atomic::AtomicBool::new(false),
             chain_karg: std::sync::Mutex::new(None),
             kernarg_retirement: super::kernarg_retirement::KernargRetirement::new(),
             zero_stage: parking_lot::Mutex::new(None),
@@ -2662,8 +2665,9 @@ impl HsaBackend {
         } else {
             1
         };
+        let barrier = !self.no_barrier_next.swap(false, Ordering::Relaxed);
         let header: u16 = (HSA_PACKET_TYPE_KERNEL_DISPATCH << HSA_PACKET_HEADER_TYPE) as u16
-            | (1 << HSA_PACKET_HEADER_BARRIER) as u16
+            | (u16::from(barrier) << HSA_PACKET_HEADER_BARRIER)
             | ((pkt_knobs().acquire << HSA_PACKET_HEADER_SCACQUIRE_FENCE_SCOPE) as u16)
             | ((pkt_knobs().release << HSA_PACKET_HEADER_SCRELEASE_FENCE_SCOPE) as u16);
         let setup: u16 = (dims << HSA_KERNEL_DISPATCH_PACKET_SETUP_DIMENSIONS as u16) as u16;
@@ -4085,6 +4089,13 @@ impl HsaBackend {
         self.kernarg_retirement
             .reserve(packets, capacity)
             .map_err(kernarg_retirement_error)
+    }
+
+    /// The next dispatch packet omits the AQL barrier bit, so it may start before earlier
+    /// packets complete. The caller guarantees it is independent of every packet queued since
+    /// the last barrier packet.
+    pub fn no_barrier_next(&self) {
+        self.no_barrier_next.store(true, Ordering::Relaxed);
     }
 
     /// Launch `f` over `grid` workgroups of `block` threads.

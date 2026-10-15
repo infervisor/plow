@@ -26,11 +26,18 @@ if [[ ${1:-} == --gfx950 ]]; then
 6a583441c6bb139c6af20c5198614b7b02b74fdba370580a5a5bbe164bd7bb34 fmoe_bf16_blockscaleFp8_g1u1_vs_silu_1tg_ps_32x256.co
 e442ee49fd88b5d165b8f8313d790c3ec7a7978140fa2306876612191429e413 fmoe_bf16_blockscaleFp8_g1u1_vs_silu_1tg_ps_64x256.co
 PINS
+    # PLOW_MOE_TABLE_SCAN=1: the decode table prepare's expert prefix as a wave scan (same table).
+    scan=""
+    case "${PLOW_MOE_TABLE_SCAN:-0}" in
+        0) ;;
+        1) scan="-DPLOW_MOE_TABLE_SCAN=1" ;;
+        *) echo "PLOW_MOE_TABLE_SCAN must be 0 or 1" >&2; exit 2 ;;
+    esac
     stem=$(mktemp "$out/.moe-aiter.XXXXXX")
     trap 'rm -f "$stem" "$stem.co" "$stem.elf"' EXIT
     for kind in aiter align; do
         "${PLOW_HIPCC:?run inside nix develop}" --genco --offload-arch=gfx950 -O3 -w \
-            -std=c++17 -DMOE_AITER_H=4096 -I"$root/runtime/amd" -I"$root/runtime/common" \
+            -std=c++17 -DMOE_AITER_H=4096 $scan -I"$root/runtime/amd" -I"$root/runtime/common" \
             "$root/runtime/amd/moe_${kind}_adapter.hip" -o "$stem.co"
         "${PLOW_BUNDLER:?run inside nix develop}" --unbundle --type=o \
             --targets=hipv4-amdgcn-amd-amdhsa--gfx950 --input="$stem.co" --output="$stem.elf"

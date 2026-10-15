@@ -2278,6 +2278,11 @@ pub struct AmdRuntimeConfig {
     /// instead of once per packet.
     #[arg(long = "amd-karg-chain-flush", env = "PLOW_AMD_KARG_CHAIN_FLUSH", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
     pub karg_chain_flush: bool,
+    /// Decode hipBLASLt segments that neither read nor write an output of the GEMM segments
+    /// queued since the last barrier packet drop the AQL barrier bit, so independent projections
+    /// of one layer run concurrently.
+    #[arg(long = "amd-lt-concurrent", env = "PLOW_AMD_LT_CONCURRENT", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
+    pub lt_concurrent: bool,
     /// Diagnostic: `<acquire>,<release>` HSA fence scopes (0 none, 1 agent, 2 system) on every
     /// dispatch packet. Unset = agent,agent. Not ordering-safe below agent.
     #[arg(long = "amd-pkt-fence", env = "PLOW_AMD_PKT_FENCE", global = true)]

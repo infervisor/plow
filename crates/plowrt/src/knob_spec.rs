@@ -719,6 +719,7 @@ pub const RUNTIME: &[KnobSpec] = &[
     KnobSpec::new("rt.kernarg_vram", Some("PLOW_AMD_KERNARG_VRAM"), Layer::Runtime, Domain::Bool, UNSET, OPT_IN),
     KnobSpec::new("rt.tail_signal", Some("PLOW_AMD_TAIL_SIGNAL"), Layer::Runtime, Domain::Bool, OFF, OPT_IN),
     KnobSpec::new("rt.karg_chain_flush", Some("PLOW_AMD_KARG_CHAIN_FLUSH"), Layer::Runtime, Domain::Bool, OFF, OPT_IN),
+    KnobSpec::new("rt.lt_concurrent", Some("PLOW_AMD_LT_CONCURRENT"), Layer::Runtime, Domain::Bool, OFF, OPT_IN),
     KnobSpec::new("rt.pkt_fence", Some("PLOW_AMD_PKT_FENCE"), Layer::Runtime, Domain::Str, UNSET, DIAG),
     KnobSpec::new("rt.dispatch_times", Some("PLOW_AMD_DISPATCH_TIMES"), Layer::Runtime, Domain::Str, UNSET, DIAG),
     KnobSpec::new("rt.tp_par_host", Some("PLOW_TP_PAR_HOST"), Layer::Runtime, Domain::Bool, OFF, OPT_IN),

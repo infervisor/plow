@@ -1,0 +1,88 @@
+/* router_decode.hip — PLOW_GLM_ROUTER_RAW: the decode MoE router as ONE raw segment.
+ *
+ * A GemmF32 marked ROUTER_RAW_MARK carries the score GEMV and its top-k tail (op MOE_ROUTER_TOPK
+ * at one row, op 83 at `rows`). Workgroups [r*per_row, (r+1)*per_row) compute row r's logits with
+ * d_gemv_bf16_f32 at M = 1 (one wave per output, so every logit is the interpreter's bits), and the
+ * last of them to finish runs d_moe_router_topk over the row (op 83's per-token body, with its
+ * shared-expert tail slot). Table bytes are identical to the GemmF32 -> top-k packet pair.
+ * At rows == 8 the grid is `per_row` workgroups: each wave owns one column for all eight rows
+ * (d_gemv_bf16_f32_tile, same bits as the vector walk), so W crosses L2 once; workgroups
+ * 0..7 then wait for every arrival and run row b's top-k. The grid (<= 64 WGs) is co-resident. */
+#include "amd_common.h"
+#include "op_gemm.h"
+#include "op_moe.h"
+
+extern "C" __device__ unsigned plow_router_decode_abi_2 = 1;
+
+struct RouterDecodeArgs {
+    float* logit;
+    const bf16* x;
+    const bf16* w;
+    unsigned char* table;
+    const float* bias;
+    unsigned* ctr; /* [rows] counters, 32 words apart, zero between launches */
+    unsigned rows, n_exp, k_dim, topk, flags, shared_tail, n_group, topk_group;
+    float route_scale;
+    unsigned per_row;
+};
+
+extern "C" __global__ __launch_bounds__(PLOW_THREADS) void plow_router_decode(RouterDecodeArgs a) {
+    __shared__ float lds[4096];
+    __shared__ unsigned last;
+    if (a.rows == 8u) {
+        d_gemv_bf16_f32_tile<8, 1>(a.logit, a.x, a.w, 8u, a.n_exp, a.k_dim, blockIdx.x,
+                                   a.per_row);
+        __syncthreads();
+        if (threadIdx.x == 0) {
+            __hip_atomic_fetch_add(a.ctr, 1u, __ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_AGENT);
+            if (blockIdx.x < 8u) {
+                while (__hip_atomic_load(a.ctr, __ATOMIC_ACQUIRE, __HIP_MEMORY_SCOPE_AGENT) <
+                       a.per_row)
+                    __builtin_amdgcn_s_sleep(1);
+                const unsigned gone = __hip_atomic_fetch_add(a.ctr + 32, 1u, __ATOMIC_ACQ_REL,
+                                                             __HIP_MEMORY_SCOPE_AGENT);
+                if (gone == 7u) {
+                    __hip_atomic_store(a.ctr, 0u, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
+                    __hip_atomic_store(a.ctr + 32, 0u, __ATOMIC_RELAXED,
+                                       __HIP_MEMORY_SCOPE_AGENT);
+                }
+            }
+        }
+        if (blockIdx.x >= 8u) return;
+        asm volatile("buffer_inv" ::: "memory");
+        __syncthreads();
+        const unsigned row = blockIdx.x;
+        unsigned char* const trow = a.table + (size_t)row * (a.topk + a.shared_tail) * 8u;
+        d_moe_router_topk(trow, (const bf16*)(a.logit + (size_t)row * a.n_exp), a.bias, a.n_exp,
+                          a.topk, a.flags, a.route_scale, 0u, 1u, lds, a.n_group, a.topk_group);
+        if (a.shared_tail && threadIdx.x == 0) {
+            *(unsigned*)(trow + (size_t)a.topk * 8u) = a.n_exp;
+            *(float*)(trow + (size_t)a.topk * 8u + 4u) = 1.0f;
+        }
+        return;
+    }
+    const unsigned row = blockIdx.x / a.per_row, part = blockIdx.x % a.per_row;
+    if (row >= a.rows || blockDim.x != PLOW_THREADS) __builtin_trap();
+    float* const lrow = a.logit + (size_t)row * a.n_exp;
+    d_gemv_bf16_f32(lrow, a.x + (size_t)row * a.k_dim, a.w, 1u, a.n_exp, a.k_dim, part,
+                    a.per_row);
+    __syncthreads();
+    unsigned* const ctr = a.ctr + (size_t)row * 32u;
+    if (threadIdx.x == 0) {
+        const unsigned old =
+            __hip_atomic_fetch_add(ctr, 1u, __ATOMIC_ACQ_REL, __HIP_MEMORY_SCOPE_AGENT);
+        last = old == a.per_row - 1u;
+        if (last) __hip_atomic_store(ctr, 0u, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
+    }
+    __syncthreads();
+    if (!last) return;
+    asm volatile("buffer_inv" ::: "memory");
+    __syncthreads();
+    unsigned char* const trow = a.table + (size_t)row * (a.topk + a.shared_tail) * 8u;
+    d_moe_router_topk(trow, (const bf16*)lrow, a.bias, a.n_exp, a.topk, a.flags, a.route_scale,
+                      0u, 1u, lds, a.n_group, a.topk_group);
+    if (a.shared_tail && threadIdx.x == 0) {
+        *(unsigned*)(trow + (size_t)a.topk * 8u) = a.n_exp;
+        *(float*)(trow + (size_t)a.topk * 8u + 4u) = 1.0f;
+    }
+}

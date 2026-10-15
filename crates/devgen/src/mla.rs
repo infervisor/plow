@@ -2797,6 +2797,33 @@ pub(crate) mod router_flag {
 }
 
 /// GLM/DeepSeek-V3/Kimi: sigmoid scoring, normalised gates, and a selection bias.
+/// PLOW_GLM_ROUTER_RAW: the per-row arrival counters of a raw router at `rows`, when the knob is
+/// on and the score op is the f32 GemmF32 the raw kernel reproduces.
+fn glm_router_raw_ctr(b: &mut Builder, score_op: DevOp, rows: u32) -> Option<u32> {
+    (emit_config::active().glm_router_raw && score_op == DevOp::GemmF32)
+        .then(|| b.tensor(&format!("act.router_raw.{rows}.ctr"), u64::from(rows) * 128))
+}
+
+/// The top-k operands of a router GemmF32 marked `ROUTER_RAW_MARK` (packet/dev.rs).
+fn glm_router_raw_fields(
+    d: &mut DevInst,
+    c: &GlmCfg,
+    tab: u32,
+    bias: u32,
+    ctr: u32,
+    shared_tail: bool,
+) {
+    d.t[3] = tab;
+    d.t[4] = bias;
+    d.t[5] = ctr;
+    d.i[3] = c.top_k;
+    d.i[4] = GLM_ROUTER_FLAGS;
+    d.i[5] = u32::from(shared_tail);
+    d.i[6] = c.n_group | (c.topk_group << 16);
+    d.i[7] = packet::dev::ROUTER_RAW_MARK;
+    d.f[0] = c.route_scale;
+}
+
 const GLM_ROUTER_FLAGS: u32 =
     router_flag::SIGMOID | router_flag::NORM_TOPK | router_flag::BIAS | router_flag::F32_LOGIT;
 /// Expert/shared GLU activation = SiLU (SwiGLU). Mirrors ACT in the B4 harness.
@@ -11273,6 +11300,12 @@ fn emit_glm_moe_ffn_rows(
     } else {
         glm_decode_gemm_tile(rows, e, h, b.n_cu()).unwrap_or(DevOp::Gemv)
     };
+    // PLOW_GLM_ROUTER_RAW on the gfx950 AITER route only: its table needs no align, and the
+    // fold's tail slot is the AITER call's (`dfold` below).
+    let router_raw = glm_aiter_gfx950(c, b.n_cu(), enc)
+        .then(|| glm_router_raw_ctr(b, score_op, rows))
+        .flatten();
+    let raw_fold = glm_shared_fold(c, enc);
     let c_score = b.emit(
         score_op,
         glm_decode_gemv_cus(&all, score_op, e, h),
@@ -11287,6 +11320,9 @@ fn emit_glm_moe_ffn_rows(
             d.i[0] = rows;
             d.i[1] = e;
             d.i[2] = h;
+            if let Some(ctr) = router_raw {
+                glm_router_raw_fields(d, c, n.tab, w.bias, ctr, raw_fold);
+            }
         },
     );
     // PLOW_GLM_DECODE_GEMM_GROUP: the shared gate/up read only `xn2`, so emit them straight after
@@ -11352,7 +11388,12 @@ fn emit_glm_moe_ffn_rows(
     } else {
         all.clone()
     };
-    let c_router = b.emit(DevOp::MoeRouterTopkPf, router_cus, &[c_score], |d| {
+    let c_router = if router_raw.is_some() {
+        assert!(dfold == raw_fold && !det && !flat, "PLOW_GLM_ROUTER_RAW: AITER route only");
+        b.isolate(c_score);
+        c_score
+    } else {
+    b.emit(DevOp::MoeRouterTopkPf, router_cus, &[c_score], |d| {
         d.t[0] = n.tab;
         d.t[1] = n.rlogit;
         d.t[3] = w.bias;
@@ -11368,7 +11409,8 @@ fn emit_glm_moe_ffn_rows(
         d.i[6] = c.n_group;
         d.i[7] = c.topk_group;
         d.f[0] = c.route_scale;
-    });
+    })
+    };
     // The gfx950 AITER call sorts the router's table itself (`plow_moe_aiter_prepare_table`).
     let c_routes = if flat || aiter950 {
         c_router
@@ -11933,6 +11975,7 @@ pub(crate) fn emit_glm_moe_ffn(
         } else {
             DevOp::Gemv
         };
+        let raw = glm_router_raw_ctr(b, score_op, 1);
         let c_score = b.emit(score_op, router_cus.clone(), &[c_rn2], |d| {
             d.t[0] = n.rlogit;
             d.t[1] = n.xn2;
@@ -11943,7 +11986,14 @@ pub(crate) fn emit_glm_moe_ffn(
             d.i[0] = 1;
             d.i[1] = e;
             d.i[2] = h;
+            if let Some(ctr) = raw {
+                glm_router_raw_fields(d, c, n.tab, w.bias, ctr, false);
+            }
         });
+        if raw.is_some() {
+            b.isolate(c_score);
+            c_score
+        } else {
         b.emit(DevOp::MoeRouterTopk, one.clone(), &[c_score], |d| {
             d.t[0] = n.tab;
             d.t[1] = n.rlogit;
@@ -11957,6 +12007,7 @@ pub(crate) fn emit_glm_moe_ffn(
             d.i[7] = c.topk_group;
             d.f[0] = c.route_scale;
         })
+        }
     };
     // 16 shared expert gate|up (fused GLU) — column-parallel: this rank's imoe_l lanes. Under cores>=2
     //   it runs on its OWN slice (shared_cus), CO-RESIDENT with the routed experts (it is routing-
