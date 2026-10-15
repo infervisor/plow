@@ -3,8 +3,8 @@
 **Status: MATCHED, EQUIVALENT**
 
 - Baseline results: `/home/lava/bench/glm53flash/vllm-tp8/isl61440`
-- Infervisor results: `/home/lava/bench/glm53flash/plow-v18/isl61440`
-- FP32-reference gate: `/home/lava/bench/glm53flash/fp32ref/gate-v18-int/gates.json` (sha256 360cd843bdbd, packet 360814fc607b, PASS)
+- Infervisor results: `/home/lava/bench/glm53flash/plow-v19/isl61440`
+- FP32-reference gate: `/home/lava/bench/glm53flash/fp32ref/gate-v19-int-g/gates.json` (sha256 8b94438e8baa, packet 540ba4fa4012, PASS)
 - Values are means over repeats; ratios are Infervisor / Baseline. Total throughput = (input + output) tok/s. `*` = repeat spread > 10%.
 
 ## g1
@@ -19,15 +19,15 @@ Comparison: **MATCHED**; quality: **EQUIVALENT**
 | Traffic / concurrency | greedy (T=0), 16 prompts, request rate inf / concurrency 1 | Same as baseline |
 | GPU type & count | 8 x AMD Instinct MI350X | Same as baseline |
 | Serving stack | vLLM ok    nix dev shell (ROCM_PATH=/nix/store/xbd1f4xn2j6cry6np5wij7caz0ycrykz-rocm-therock-gfx94X-dcgpu-7.14.1 CUDA_PATH=/nix/store/p49i1vrhcaw5nf2r3bwgmwfz5x8zgb14-cuda-merged-12.9)
-0.31.1rc1.dev296+gfe4df3df0.rocm100 (--gpu-memory-utilization 0.90 --max-num-seqs 256 --tensor-parallel-size 8 --trust-remote-code --max-model-len 63616 --max-num-seqs 256 --no-enable-prefix-caching --tool-call-parser glm47 --reasoning-parser glm47) | Infervisor (plowrt ca11e3f0822b, packet 360814fc607b) |
+0.31.1rc1.dev296+gfe4df3df0.rocm100 (--gpu-memory-utilization 0.90 --max-num-seqs 256 --tensor-parallel-size 8 --trust-remote-code --max-model-len 63616 --max-num-seqs 256 --no-enable-prefix-caching --tool-call-parser glm47 --reasoning-parser glm47) | Infervisor (plowrt 29af24ff94c4, packet 540ba4fa4012) |
 | Output quality / correctness | FP32-reference gate peer (kl_mean 0.03677, top1_decisive 0.9868, needle_acc 1) | Equivalent |
-| Peak GPU memory | 2,145.6 GiB | 1,485.4 GiB (0.69x) |
-| Total throughput | 26,947 tok/s | 19,199 tok/s (0.71x) |
-| Throughput / GPU | 3,368 tok/s/GPU | 2,400 tok/s/GPU (0.71x) |
-| TTFT P99 | 2,039.3 ms * | 1,800.4 ms (0.88x) |
-| TPOT P99 | 8.83 ms * | 11.41 ms (1.29x) |
+| Peak GPU memory | 2,145.6 GiB | 1,472.5 GiB (0.69x) |
+| Total throughput | 26,947 tok/s | 20,776 tok/s (0.77x) |
+| Throughput / GPU | 3,368 tok/s/GPU | 2,597 tok/s/GPU (0.77x) |
+| TTFT P99 | 2,039.3 ms * | 1,808.9 ms (0.89x) |
+| TPOT P99 | 8.83 ms * | 9.43 ms (1.07x) |
 
-Spread over 2 repeats, (max - min) / mean, Baseline / Infervisor: Peak GPU memory 0.2% / 0.9%; Total throughput 6.0% / 0.6%; Throughput / GPU 6.0% / 0.6%; TTFT P99 65.5% / 0.7%; TPOT P99 45.6% / 0.2%.
+Spread over 2 repeats, (max - min) / mean, Baseline / Infervisor: Peak GPU memory 0.2% / 1.0%; Total throughput 6.0% / 0.2%; Throughput / GPU 6.0% / 0.2%; TTFT P99 65.5% / 1.2%; TPOT P99 45.6% / 0.3%.
 
 **FLAGGED: spread > 10%: Baseline TTFT P99 65.5%; Baseline TPOT P99 45.6%.**
 
@@ -43,14 +43,14 @@ Comparison: **MATCHED**; quality: **EQUIVALENT**
 | Traffic / concurrency | greedy (T=0), 24 prompts, request rate inf / concurrency 8 | Same as baseline |
 | GPU type & count | 8 x AMD Instinct MI350X | Same as baseline |
 | Serving stack | vLLM ok    nix dev shell (ROCM_PATH=/nix/store/xbd1f4xn2j6cry6np5wij7caz0ycrykz-rocm-therock-gfx94X-dcgpu-7.14.1 CUDA_PATH=/nix/store/p49i1vrhcaw5nf2r3bwgmwfz5x8zgb14-cuda-merged-12.9)
-0.31.1rc1.dev296+gfe4df3df0.rocm100 (--gpu-memory-utilization 0.90 --max-num-seqs 256 --tensor-parallel-size 8 --trust-remote-code --max-model-len 63616 --max-num-seqs 256 --no-enable-prefix-caching --tool-call-parser glm47 --reasoning-parser glm47) | Infervisor (plowrt ca11e3f0822b, packet 360814fc607b) |
+0.31.1rc1.dev296+gfe4df3df0.rocm100 (--gpu-memory-utilization 0.90 --max-num-seqs 256 --tensor-parallel-size 8 --trust-remote-code --max-model-len 63616 --max-num-seqs 256 --no-enable-prefix-caching --tool-call-parser glm47 --reasoning-parser glm47) | Infervisor (plowrt 29af24ff94c4, packet 540ba4fa4012) |
 | Output quality / correctness | FP32-reference gate peer (kl_mean 0.03677, top1_decisive 0.9868, needle_acc 1) | Equivalent |
-| Peak GPU memory | 2,147.7 GiB | 1,492.5 GiB (0.69x) |
-| Total throughput | 43,576 tok/s | 28,556 tok/s (0.66x) |
-| Throughput / GPU | 5,447 tok/s/GPU | 3,570 tok/s/GPU (0.66x) |
-| TTFT P99 | 10,716.7 ms * | 14,742.7 ms (1.38x) |
-| TPOT P99 | 80.48 ms * | 118.27 ms (1.47x) |
+| Peak GPU memory | 2,147.7 GiB | 1,479.5 GiB (0.69x) |
+| Total throughput | 43,576 tok/s | 29,569 tok/s (0.68x) |
+| Throughput / GPU | 5,447 tok/s/GPU | 3,696 tok/s/GPU (0.68x) |
+| TTFT P99 | 10,716.7 ms * | 14,599.5 ms (1.36x) |
+| TPOT P99 | 80.48 ms * | 114.40 ms (1.42x) |
 
-Spread over 2 repeats, (max - min) / mean, Baseline / Infervisor: Peak GPU memory 0.0% / 0.0%; Total throughput 5.7% / 1.0%; Throughput / GPU 5.7% / 1.0%; TTFT P99 18.0% / 2.8%; TPOT P99 14.5% / 1.9%.
+Spread over 2 repeats, (max - min) / mean, Baseline / Infervisor: Peak GPU memory 0.0% / 0.0%; Total throughput 5.7% / 0.9%; Throughput / GPU 5.7% / 0.9%; TTFT P99 18.0% / 2.7%; TPOT P99 14.5% / 2.1%.
 
 **FLAGGED: spread > 10%: Baseline TTFT P99 18.0%; Baseline TPOT P99 14.5%.**

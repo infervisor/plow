@@ -595,6 +595,19 @@ The packet from config + index alone (no weights) is 70 MB: 4 prefill buckets + 
   (removes a random ~18 ms stall), decode router tile + split-K 2P + XR_DEC_CUS, deferred-frame flash softmax.
   Gates PASS kl 0.01305; prefill 8k 272 -> 245 ms; serving +3-9% at c32/c128. Per-segment geometry sweep: no
   gain (the interpreter object's 148 KB LDS union + 256 VGPR cap every op at 1 WG x 8 waves/CU).
+- 00:35 UTC (10-15), v19 (29af24ff; packet 540ba4fa; plowrt 84e6ac15): second lever round. Taken: G —
+  `PLOW_GLM53_GEMM_LT_DEC` (all nine decode projections of rungs 8/32/128 as hipBLASLt gfx950 kernels from a 6.8 MB
+  sha-pinned 26-kernel subset image, each at its own workgroup size; partial routing loses ~30 us per interpreter
+  segment left between native ones); D — `PLOW_AMD_KARG_CHAIN_FLUSH` (one uncached kernarg readback per chain,
+  enqueue 631 -> 295 us/token), `PLOW_TP_RANK_POOL` (persistent per-rank host workers), `PLOW_TP_PAR_HOST`; SA —
+  `PLOW_PF_HOLD=8192` (isl1024 c64/c128 +3.5%). Rejected: `PLOW_PF_DEFER_DECODE` (TTFT p50 4-15x), decode rows
+  riding packs (the packed interpreter KDA arms walk every span per workgroup, ~0.4 ms per span per pack; a one-row
+  conv3 fix `PLOW_AMD_PACKED_KDA_PAR` is on the branch, default off), fewer decode segments via interpreter mHC
+  (GPU +0.67 ms > enqueue -0.6 ms), DSA prefill (K: slower than dense through 61k, the interpreter indexer chain
+  costs +4.2 ms per MLA layer per 8k chunk; crossover ~80-90k). Runtime knobs alone on v18 assets (v19a): 0.56-0.83x.
+  Distinct-prompt B8/B32/B128 18.11/18.95/26.40 -> 13.03/16.64/22.98 ms; r1 validate 8.99 ms. Gates PASS kl 0.02314,
+  needles 36/36, split 18/18. Strict TP8 reports 19 cells MATCHED/EQUIVALENT: 0.62-0.93x vLLM (isl4096 c8 0.75 ->
+  0.93, isl1024 c1 0.69 -> 0.85). No qualified win. Recipe -> v19.
 - 20:50 UTC (10-14), v18 (ca11e3f0; packet 360814fc; plowrt 98bc6ba7): five-lever round (agents SA/G/D/B/K).
   Taken: D — `PLOW_GLM53_L2_PLACE` (glm53_emit_full never got plowc's L2 layout, so the compiled-in PLOW_GATE_HIER was
   ARMED BUT INERT; now FIRING), head-packed GF8 NoPE MLA decode kernel d_flash_mla_decode_hp8 (`PLOW_GLM53_MLA_HPACK_ROWS
@@ -797,7 +810,7 @@ The packet from config + index alone (no weights) is 70 MB: 4 prefill buckets + 
 
 Strict `campaign.py report` output per input length and the combined comparison.csv:
 [docs/bringup/results/glm53flash-mi350x-2026-10-12](../bringup/results/glm53flash-mi350x-2026-10-12/summary.md).
-No qualified win: plow total throughput 0.54-0.82x vLLM (v18; v17 0.47-0.76x, v16c 0.44-0.75x, v15b 0.37-0.66x, v15a 0.36-0.66x, v13 0.34-0.61x, v11 0.28-0.61x).
+No qualified win: plow total throughput 0.62-0.93x vLLM (v19; v18 0.54-0.82x, v17 0.47-0.76x, v16c 0.44-0.75x, v15b 0.37-0.66x, v15a 0.36-0.66x, v13 0.34-0.61x, v11 0.28-0.61x).
 
 ## 6. Roofline (CPU, before any plow GPU time)
 
