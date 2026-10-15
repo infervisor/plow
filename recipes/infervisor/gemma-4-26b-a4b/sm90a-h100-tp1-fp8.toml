@@ -191,12 +191,16 @@ reference = "{env:G26_FP8_FP32_REF_LONG}"
 vllm_capture = "{env:G26_FP8_FP32_VLLM_LONG}"
 concurrency = 4
 timeout_s = 7200
-# Measured c4 margins (2026-10-15, 20 cases / 743 positions, one vLLM peer capture): the control packet
-# (squash 03162215 recipe without PLOW_NO_GLU_FUSE, 156de996) five runs on the squash plowrt, plus the
-# production packet 5ce87bd28db1 (two captures) and p0b-base on 2dff2171: decisive free-run flips
-# cont_decisive_frac 0.75-0.80 against the peer's 0.80 (one case of 20; 0.75 in 5 of 9 runs, the production
-# packet included), positions over 0.1 nat 102-118 against the peer's 113 (+0.0067 of positions).
-# Every run holds kl_mean 0.135-0.178 vs 0.165, kl_p99 1.63-3.72 vs 3.56, top1_decisive 0.9605-0.9769 vs
-# 0.9605, needles 16/16.
-cont_decisive_drop_max = 0.05
+# Two pooled c4 captures per run (captures = 2: 40 case-samples, one free-run flip = 0.025 of cont_decisive_frac;
+# 1486 positions; the peer's one vLLM capture is replicated to the same size). Peer: kl_mean 0.165, top1_decisive
+# 0.9605, cont_decisive_frac 0.80, kl_over 0.152. Measured 2026-10-15 by pooling every same-packet pair of the single
+# c4 captures on the squash plowrt 03162215 (control 156de996 x5, P1 86cd362a x2, WPR8 bd9c0722 x5, production
+# 5ce87bd28db1 x2), 22 pairs:
+#   pair cont_decisive_frac: ctrl 0.750 x3, 0.775 x6, 0.800 | p1 0.775 | wpr8 0.700 x3, 0.725 x3, 0.750 x3, 0.775
+#   | prod 0.775; pair top1_decisive 0.9621-0.9769, kl_over_frac 0.137-0.151, kl_mean 0.129-0.173
+# 0.1125 passes all 22 control pairs and fails a pooled 0.675 (five cases of 40 below the peer, one below the worst
+# control pair). The control pairs span four cases: the limit is run-to-run variance, not the 0.025 step, so a 1-2
+# case regression still sits inside control noise. top1_decisive (default 0.01) and kl_over (+0.01) pass every pair.
+captures = 2
+cont_decisive_drop_max = 0.1125
 kl_over_slack = 0.01

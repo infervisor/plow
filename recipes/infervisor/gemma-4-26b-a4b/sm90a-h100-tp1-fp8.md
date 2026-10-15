@@ -89,7 +89,8 @@ nix develop --command env \
 #   vllm_capture = {env:G26_FP8_FP32_VLLM_LONG}
 #   concurrency = 4
 #   timeout_s = 7200
-#   cont_decisive_drop_max = 0.05
+#   captures = 2
+#   cont_decisive_drop_max = 0.1125
 #   kl_over_slack = 0.01
 ```
 <!-- /plow:recipe:gates -->

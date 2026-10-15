@@ -56,6 +56,16 @@ class GatePacketTests(unittest.TestCase):
             with self.assertRaises(SystemExit):
                 campaign.cmd_gate(a)
 
+    def test_fp32_captures_pool_names(self):
+        g = {"reference": "/r.json", "vllm_capture": "/v.json", "concurrency": 4, "captures": 2}
+        up, _ = campaign.gate_steps("llm_fp32_ref_long", g, "python3", Path("/o"), Path("/a"))
+        outs = [c.split("--out ")[1].split()[0] for c in up]
+        self.assertEqual(outs, ["/o/llm_fp32_ref_long/plow.json", "/o/llm_fp32_ref_long/plow-r2.json"])
+        for bad in (0, -1, 1.5, True, "2"):
+            with self.assertRaises(SystemExit):
+                campaign.fp32_captures({"captures": bad})
+        self.assertEqual(campaign.fp32_captures({}), 1)
+
     def test_suffixed_table_is_a_second_gate_of_its_kind(self):
         self.assertEqual(campaign.gate_kind("llm_fp32_ref_long"), "llm_fp32_ref")
         self.assertEqual(campaign.gate_kind("llm_fp32_ref"), "llm_fp32_ref")
