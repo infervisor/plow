@@ -333,6 +333,11 @@ pub fn cublaslt_prefill_bf16(profile: &str, m: u32, n: u32, k: u32) -> bool {
                 || CUBLASLT_PREFILL_LLAMA_TTS_SHAPES.contains(&(n, k))
                 || CUBLASLT_PREFILL_GEMMA4_E4B_SHAPES.contains(&(n, k)))
         }
+        // GB202 has Ada's prefill object (no TMA/wgmma); only the ASR decoders are routed so far.
+        "sm120" | "sm_120a" => {
+            rows && (CUBLASLT_PREFILL_QWEN3_1_7B_SHAPES.contains(&(n, k))
+                || CUBLASLT_PREFILL_QWEN3_0_6B_SHAPES.contains(&(n, k)))
+        }
         _ => false,
     }
 }
@@ -887,6 +892,19 @@ mod tests {
                     .into_iter()
                     .chain(CUBLASLT_PREFILL_QWEN3_0_6B_SHAPES)
                     .chain(CUBLASLT_PREFILL_LLAMA_TTS_SHAPES)
+                {
+                    assert!(cublaslt_prefill_bf16(profile, *m, n, k));
+                }
+            }
+        }
+        for profile in ["sm120", "sm_120a"] {
+            for m in CUBLASLT_PREFILL_ROWS
+                .iter()
+                .chain(&CUBLASLT_PREFILL_SPEECH_ROWS)
+            {
+                for (n, k) in CUBLASLT_PREFILL_QWEN3_1_7B_SHAPES
+                    .into_iter()
+                    .chain(CUBLASLT_PREFILL_QWEN3_0_6B_SHAPES)
                 {
                     assert!(cublaslt_prefill_bf16(profile, *m, n, k));
                 }

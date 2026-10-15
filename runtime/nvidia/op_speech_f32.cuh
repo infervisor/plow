@@ -40,9 +40,9 @@ __device__ __forceinline__ constexpr bool sp_op_on(unsigned op) {
 /* Covers the GEMM ring, AttentionF32's Q/K/V stages (SpfShape), and
  * GroupedAttention's K stage for group_rows*(head_width+1) <= SP_ARENA_FLOATS - 2048 (larger
  * groups read K from global instead). */
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ == 890
-/* sm_89 caps one block at 99 KiB of shared memory, static included. The hd128 AttentionF32
- * stage (25856 floats) does not fit; that arm traps there. */
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ == 890 || __CUDA_ARCH__ == 1200)
+/* sm_89 and sm_120 cap one block at 99 KiB of shared memory, static included. The hd128
+ * AttentionF32 stage (25856 floats) does not fit; that arm traps there. */
 #define SP_ARENA_FLOATS 24576
 #define SPF_HD128 0
 #else

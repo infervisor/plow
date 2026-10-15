@@ -1,0 +1,64 @@
+# Qwen3-ASR-0.6B on RTX 5090 (GB202 sm_120a, 170 SMs, 32 GB GDDR7): trial recipe, not qualified.
+# The L40S recipe (recipes/infervisor/qwen3-asr-0.6b/sm89-l40s-tp1.toml) on the sm_120a objects;
+# see qwen3-asr.rtx5090.bf16.toml. Every per-rung choice must be re-measured on the 5090.
+
+schema = "plow.recipe.v1"
+namespace = "infervisor"
+name = "qwen3-asr-0.6b"
+label = "sm120a-rtx5090-tp1"
+network = "qwen3"
+doc = "docs/runtime/asr.md"
+
+[target]
+vendor = "nvidia"
+isa = "sm_120a"
+sku = "RTX 5090"
+units = 170
+num_gpus = 1
+parallel = "tp"
+
+[checkpoint]
+source = "hf:Qwen/Qwen3-ASR-0.6B"
+
+[cell]
+name = "qwen3-asr-0.6b-rtx5090"
+hf_dir = "{hf:Qwen/Qwen3-ASR-0.6B}"
+gpu = "5090"
+arch = "sm_120a"
+n_cu = 170
+n_gpu = 1
+max_ctx = 2048
+
+[emit]
+emit = "devblob+cubin"
+args = ["--served-name", "qwen3-asr-0.6b"]
+[emit.env]
+PLOW_VERIFY_BIN = "{repo}/lean-plow/.lake/build/bin/plow_verify"
+PLOW_UNISEG = "0"
+PLOW_MAX_CHUNK = "512"
+PLOW_PF_LADDER_APPEND = "256,384"
+PLOW_DECODE_BATCH_LADDER = "1,2,4,8,16,32,64,128"
+PLOW_EMIT_DECODE_CUBLASLT = "1"
+PLOW_EMIT_DECODE_CUBLASLT_MIN_ROWS = "64"
+PLOW_EMIT_DECODE_CUBLASLT_HEAD = "1"
+PLOW_EMIT_PREFILL_CUBLASLT = "1"
+PLOW_NO_GLU_FUSE = "1"
+PLOW_NV_FA_FOLD = "1"
+PLOW_EMIT_PACKED_PREFILL = "1"
+PLOW_EMIT_PACKED_PREFILL_SMALL_HD = "1"
+
+[bench]
+kind = "asr"
+client = "crates/plowrt/examples/asr/packet_dataset.rs"
+manifest = "scripts/asr/nvidia/get_audio.py"
+reference = "scripts/asr/nvidia/ref_bench.py"
+
+[gates]
+python = "{env:PYREF}"
+[gates.asr_wer]
+manifest = "{env:ASR_MANIFEST}"
+conc = "1,16,64"
+wer_max = 0.045
+
+[serve.env]
+PLOW_VMM_PREFIX = "1"
