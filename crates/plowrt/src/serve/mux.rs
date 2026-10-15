@@ -5499,7 +5499,7 @@ fn trim_for_riders(
 ) -> bool {
     let cost = pf_chunk_cost_rows();
     let tail = (rows + decode_rows).saturating_sub(bucket);
-    let lone_tail = tail + beyond < cost && spilled - bucket < cost;
+    let lone_tail = tail + beyond < cost && spilled.saturating_sub(bucket) < cost;
     decode_rows > 0 && spilled > bucket && bucket >= cost && !lone_tail
 }
 
@@ -5837,6 +5837,25 @@ fn itl_backlog_rows(seated_unsent: impl IntoIterator<Item = usize>, queued_rows:
         .fold(queued_rows, usize::saturating_add)
 }
 
+/// [`itl_backlog_rows`] over the seated prompts of `slots[..cap]`.
+#[cfg(feature = "cuda")]
+fn itl_owed_rows(slots: &[Option<Slot>], cap: usize, withheld: usize, queued_rows: usize) -> usize {
+    itl_backlog_rows(
+        (0..cap.min(slots.len())).filter_map(|i| {
+            let (s, pf_pos) = pack_row(slots, i)?;
+            (s.step == 0).then(|| s.prompt_ids.len().saturating_sub(withheld + pf_pos))
+        }),
+        queued_rows,
+    )
+}
+
+/// Rows a launch under the ITL budget takes (riders included), given the budget's measured rung:
+/// the launch holds the riders, and the prompt keeps at least half the rung.
+#[cfg(feature = "cuda")]
+fn itl_rung_rows(e: &crate::exec::gpu::GpuEngine, rung: usize, decode_rows: usize) -> usize {
+    rung.max(e.pf_cover_rows(decode_rows * 2))
+}
+
 #[cfg(feature = "cuda")]
 fn pf_itl_budget_ms() -> u32 {
     crate::config::RuntimeConfig::get().pf_itl_budget_ms
@@ -5868,8 +5887,21 @@ struct AdmitRoom {
     left: usize,
 }
 
+/// Rows the launch being formed takes: `launch_cap`, or the ITL budget's rung when it applies.
+#[cfg(feature = "cuda")]
+fn admit_launch_rows(launch_cap: usize, itl_rung: Option<usize>) -> usize {
+    itl_rung.map_or(launch_cap, |rung| launch_cap.min(rung))
+}
+
 #[cfg(feature = "cuda")]
 impl AdmitRoom {
+    fn new(ready: usize, launch_rows: usize, decode_rows: usize) -> Self {
+        Self {
+            ready,
+            left: launch_rows.saturating_sub(decode_rows + ready),
+        }
+    }
+
     /// Nothing admitted to launch yet: admitting now is the only way the GPU gets work.
     fn fits(&self, rows: usize) -> bool {
         self.ready == 0 || rows <= self.left
@@ -6031,10 +6063,19 @@ fn gpu_prefill_batched_pass(
                         .then(|| (n - withheld - pf_pos).min(chunk_cap))
                 })
                 .sum();
-            AdmitRoom {
-                ready,
-                left: launch_cap.saturating_sub(decode_rows + ready),
-            }
+            // Under the ITL budget the launch takes only the budget's rung: rows ready past it do
+            // not fill this launch, so a fresh request's admission belongs in the host window, not
+            // in front of the launch its riders wait for. Pre-admission rows over-count the
+            // backlog, so a budget this sees on is on at the launch too.
+            let rung = ride
+                .rows_fit(f64::from(pf_itl_budget_ms()))
+                .filter(|_| {
+                    decode_rows > 0
+                        && pf_itl_budget_ms() > 0
+                        && itl_owed_rows(slots, cap, withheld, queued_rows) <= budget_max
+                })
+                .map(|rung| itl_rung_rows(e, rung, decode_rows));
+            AdmitRoom::new(ready, admit_launch_rows(launch_cap, rung), decode_rows)
         });
         for (i, slot) in slots.iter_mut().enumerate().take(cap) {
             let Some(request) = slot.as_mut().filter(|s| s.step == 0) else {
@@ -6215,13 +6256,7 @@ fn gpu_prefill_batched_pass(
         // prefill rows/s), so the budget yields to throughput until the backlog drains.
         let budget_on = decode_rows > 0
             && pf_itl_budget_ms() > 0
-            && itl_backlog_rows(
-                (0..cap.min(slots.len())).filter_map(|i| {
-                    let (s, pf_pos) = pack_row(slots, i)?;
-                    (s.step == 0).then(|| s.prompt_ids.len().saturating_sub(withheld + pf_pos))
-                }),
-                queued_rows,
-            ) <= budget_max;
+            && itl_owed_rows(slots, cap, withheld, queued_rows) <= budget_max;
         let itl_cap = if budget_on
             && !candidates.iter().any(|c| {
                 slots[c.span.slot as usize]
@@ -6234,7 +6269,7 @@ fn gpu_prefill_batched_pass(
         };
         // The rung holds the riders too: their rows are reserved inside it. The prompt keeps at
         // least half the rung, so many riders widen the rung instead of starving the prompt.
-        let itl_cap = itl_cap.map(|cap| cap.max(e.pf_pack_budget(decode_rows * 2)));
+        let itl_cap = itl_cap.map(|cap| itl_rung_rows(e, cap, decode_rows));
         let (launch_cap, launch_max) = match itl_cap {
             Some(cap) => (
                 launch_cap.min(cap.saturating_sub(decode_rows).max(1)),
@@ -6267,7 +6302,7 @@ fn gpu_prefill_batched_pass(
         // smallest bucket holding every row.
         let trim = trim_for_riders(
             bucket,
-            e.pf_pack_budget(rows.min(bucket) + decode_rows),
+            e.pf_cover_rows(rows.min(bucket) + decode_rows),
             decode_rows,
             rows,
             avail - rows,
@@ -6448,21 +6483,29 @@ fn gpu_prefill_batched_pass(
                     Ok(())
                 })
         };
+        let mut admitted_in_launch = false;
         if !window.is_empty() {
             // A launch without a host window (the decode rows left it) admits them now.
             if window.iter().all(|job| job.outcome.is_none()) && !unified {
                 admit_window(e, &mut window, false);
             }
+            // A KV-waiting outcome (`Ok(None)`) returns without admission work.
+            admitted_in_launch = window
+                .iter()
+                .any(|job| !matches!(job.outcome, None | Some(Ok(None))));
             apply_window(e, slots, &mut window, arena, &mut tick_fault);
         }
-        if res.is_ok() {
+        // A launch that ran admissions measured them (and the restores they queued behind it),
+        // not the launch: they cost the same at any rung, so they would price the rung, and every
+        // rung below it in turn, out of the ITL budget.
+        if res.is_ok() && !admitted_in_launch {
             let ms = t_launch.elapsed().as_secs_f64() * 1e3;
             ride.observe_launch(ride_key, riders, ms);
             // The rung actually launched: the smallest bucket holding the packed rows and riders.
             // Only `rows_within` (the ITL budget) reads it.
             if pf_itl_budget_ms() > 0 {
                 ride.observe_rung(
-                    e.pf_pack_budget(pack.iter().map(|p| p.2).sum::<usize>() + riders),
+                    e.pf_cover_rows(pack.iter().map(|p| p.2).sum::<usize>() + riders),
                     ms,
                 );
             }
@@ -7942,6 +7985,51 @@ mod tests {
             super::trim_for_riders(1024, 1088, 3, 1024, 600),
             "the tail joins waiting rows"
         );
+    }
+
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn a_rider_spill_is_judged_on_the_rung_the_launch_runs() {
+        let ladder = [
+            128, 256, 512, 1024, 1088, 1152, 2048, 2112, 4096, 4160, 4224, 8192,
+        ];
+        let cover = |rows| crate::exec::gpu::cover_rung(ladder.iter().copied(), rows);
+        // 4224 prompt rows + 60 riders run the 8192 rung (the cheapest cover's first launch,
+        // 4160, is narrower than the rows): the riders are trimmed into the next launch.
+        assert_eq!(cover(4224 + 60), 8192);
+        assert!(super::trim_for_riders(4224, cover(4224 + 60), 60, 4224, 0));
+        // 2112 + 20 riders spill to 4096, 1152 + 10 to 2048.
+        assert!(super::trim_for_riders(2112, cover(2112 + 20), 20, 2112, 0));
+        assert!(super::trim_for_riders(
+            1152,
+            cover(1152 + 10),
+            10,
+            1152,
+            600
+        ));
+        // Riders that fit the bucket keep it.
+        assert_eq!(cover(1100 + 10), 1152);
+        assert!(!super::trim_for_riders(1152, cover(1100 + 10), 10, 1100, 0));
+        assert_eq!(cover(9000), 8192);
+        assert_eq!(crate::exec::gpu::cover_rung(std::iter::empty(), 10), 0);
+        // A spilled rung below the bucket is not an underflow.
+        assert!(!super::trim_for_riders(1152, 128, 10, 1152, 0));
+    }
+
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn admission_room_under_the_itl_budget_is_the_budget_rung() {
+        // 1000 rows admitted and 4 riders: an unbudgeted 8192-row launch still has room for a
+        // 3000-row prompt; the budget's 1152-row launch does not, so its admission waits for the
+        // launch's host window instead of running in front of it.
+        let unbudgeted = super::AdmitRoom::new(1000, super::admit_launch_rows(8192, None), 4);
+        assert!(unbudgeted.fits(3000));
+        let budgeted = super::AdmitRoom::new(1000, super::admit_launch_rows(8192, Some(1152)), 4);
+        assert!(!budgeted.fits(3000));
+        assert!(budgeted.fits(148));
+        assert_eq!(super::admit_launch_rows(1024, Some(2048)), 1024);
+        // Nothing admitted yet: the first admission always runs before the launch.
+        assert!(super::AdmitRoom::new(0, 1152, 4).fits(6000));
     }
 
     #[cfg(feature = "cuda")]
