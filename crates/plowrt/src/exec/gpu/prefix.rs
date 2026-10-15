@@ -882,6 +882,11 @@ impl GpuEngine {
         self.attach_prompt_keyed(b, prompt, None)
     }
 
+    /// Whether slot `b` holds a staged key its next attach will consume.
+    pub fn has_staged_prefix(&self, b: usize) -> bool {
+        self.staged_prefix[b].is_some()
+    }
+
     /// Stage `key` for slot `b`'s next attach inside [`Self::prefill_chunk`]; `None` clears it.
     pub fn stage_prefix_key(&mut self, b: usize, key: Option<crate::memory::vmm::PrefixKey>) {
         self.staged_prefix[b] = key;

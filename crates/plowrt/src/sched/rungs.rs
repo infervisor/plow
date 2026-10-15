@@ -193,6 +193,11 @@ impl RungController {
         self.rungs.width(self.target)
     }
 
+    /// The widest admission limit the controller can reach: its top rung.
+    pub fn ceiling(&self) -> usize {
+        self.rungs.width(self.rungs.len() - 1)
+    }
+
     pub fn observe_decode(&mut self, rung: usize, service_ms: f64, steps: NonZeroUsize) {
         if !service_ms.is_finite() || service_ms <= 0.0 || rung >= self.stats.len() {
             return;
@@ -377,6 +382,13 @@ mod tests {
 
     fn controller(widths: &[u32]) -> RungController {
         RungController::new(DecodeRungs::new(widths, *widths.last().unwrap() as usize).unwrap())
+    }
+
+    #[test]
+    fn ceiling_is_the_top_rung_while_admission_starts_at_the_bottom() {
+        let c = controller(&[8, 16, 32, 64]);
+        assert_eq!(c.admission_limit(), 8);
+        assert_eq!(c.ceiling(), 64);
     }
 
     fn load(occupied_extent: usize, queued: usize) -> RungLoad {

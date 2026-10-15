@@ -1554,13 +1554,17 @@ pub fn spawn(
             };
             #[cfg(feature = "cuda")]
             if let Some((request_rows, top_rows)) = pf_rungs {
-                // Only demand past every slot: a rung admission hold (E4B c128's cold start
-                // queued 32K rows behind a 96-slot rung) is not overload.
-                let overflow_rows = if slots.iter().all(Option::is_some) {
-                    waiting.iter().map(|(job, _)| job.prompt_ids.len()).sum()
-                } else {
-                    0
-                };
+                // Only demand past every slot admission can reach (the controller's top rung):
+                // a rung admission hold below it (E4B c128's cold start queued 32K rows behind a
+                // 96-slot rung) is not overload.
+                let ceiling = rung_controller
+                    .as_ref()
+                    .map_or(slots.len(), |c| c.ceiling().min(slots.len()));
+                let overflow_rows = overflow_rows(
+                    slots.iter().map(Option::is_some),
+                    ceiling,
+                    waiting.iter().map(|(job, _)| job.prompt_ids.len()),
+                );
                 crate::serve::policy::observe_prefill(crate::serve::policy::PrefillLoad {
                     overflow_rows,
                     queued: waiting.len() + rx.len(),
@@ -5889,6 +5893,27 @@ fn pf_admit_overlap() -> bool {
     crate::config::RuntimeConfig::get().pf_admit_overlap
 }
 
+/// Waiting prompt rows once every slot below `ceiling` (the widest admission limit) is occupied;
+/// 0 while one is free.
+#[cfg(feature = "cuda")]
+fn overflow_rows(
+    occupied: impl Iterator<Item = bool>,
+    ceiling: usize,
+    waiting_rows: impl Iterator<Item = usize>,
+) -> usize {
+    let mut n = 0;
+    for o in occupied.take(ceiling) {
+        if !o {
+            return 0;
+        }
+        n += 1;
+    }
+    if n < ceiling {
+        return 0;
+    }
+    waiting_rows.sum()
+}
+
 /// `PLOW_PF_ADMIT_OVERLAP`: a request whose admission waits for the next launch's host window.
 #[cfg(feature = "cuda")]
 struct WindowAdmit {
@@ -5930,6 +5955,12 @@ impl AdmitRoom {
         self.ready == 0 || rows <= self.left
     }
 
+    /// A fresh prompt of `rows` uncached rows: this launch takes at most one `chunk_cap` slice of
+    /// it, as `ready` and [`Self::add`] count.
+    fn fits_prompt(&self, rows: usize, chunk_cap: usize) -> bool {
+        self.fits(rows.min(chunk_cap))
+    }
+
     fn add(&mut self, rows: usize) {
         self.ready += rows;
         self.left = self.left.saturating_sub(rows);
@@ -5939,19 +5970,84 @@ impl AdmitRoom {
 /// Admit `jobs` in order. Inside a launch window (`bounded`) the first always runs and the rest
 /// only while the launch still runs: admission past the device's end delays this tick's tokens.
 #[cfg(feature = "cuda")]
-fn admit_window(e: &mut crate::exec::gpu::GpuEngine, jobs: &mut [WindowAdmit], bounded: bool) {
+fn admit_window(
+    e: &mut crate::exec::gpu::GpuEngine,
+    jobs: &mut [WindowAdmit],
+    bounded: bool,
+) -> WindowTime {
+    let t = Instant::now();
     for (n, job) in jobs.iter_mut().enumerate() {
         if bounded && n > 0 && !e.launch_in_flight() {
             break;
         }
-        if let Some(key) = job.prefix.take() {
-            e.stage_prefix_key(job.slot, Some(key));
+        // The job keeps its key until an attach consumes it: a wait (`Ok(None)`) hands it back
+        // to the request, so the retry does not re-hash the prompt.
+        if !e.has_staged_prefix(job.slot) {
+            e.stage_prefix_key(job.slot, job.prefix.clone());
         }
         let admitted = e.admit_packed_slot(job.slot, &job.prompt, job.total);
         if let (Ok(Some(_)), Some(ttl)) = (&admitted, job.pin) {
             e.hold_session_prefix(job.slot, ttl);
         }
         job.outcome = Some(admitted);
+    }
+    WindowTime {
+        admit_ms: t.elapsed().as_secs_f64() * 1e3,
+        mode: if !bounded {
+            WindowMode::Serial
+        } else if e.launch_in_flight() {
+            WindowMode::Hidden
+        } else {
+            WindowMode::Overran
+        },
+    }
+}
+
+/// How [`admit_window`]'s host time sat relative to the launch it rode.
+#[cfg(feature = "cuda")]
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum WindowMode {
+    /// After the launch completed: the tick's wall time is the launch plus the admissions.
+    Serial,
+    /// Inside the launch window, ended while the device still ran: the launch hid it.
+    Hidden,
+    /// Inside the launch window, ran past the device's end: where the launch ended is unknown.
+    Overran,
+}
+
+#[cfg(feature = "cuda")]
+#[derive(Clone, Copy, Debug)]
+struct WindowTime {
+    admit_ms: f64,
+    mode: WindowMode,
+}
+
+/// The launch time `RideCost` observes for a launch measured as `ms` (enqueue to completion,
+/// tick wall time) that carried window admissions. Serial admissions add their host time to the
+/// wall time, so it comes off exactly. Admissions hidden in the window cost nothing on the
+/// device path; the restores they queued behind the launch stay in (one D2D snapshot copy each,
+/// ~0.1 ms against a 25+ ms launch). An admission that ran past the device's end hides where the
+/// launch ended, so that launch is not observed.
+#[cfg(feature = "cuda")]
+fn ride_launch_ms(ms: f64, window: Option<WindowTime>) -> Option<f64> {
+    match window {
+        None => Some(ms),
+        Some(w) => match w.mode {
+            WindowMode::Serial => Some((ms - w.admit_ms).max(0.0)),
+            WindowMode::Hidden => Some(ms),
+            WindowMode::Overran => None,
+        },
+    }
+}
+
+/// A request whose admission waited (or never ran) takes its prefix key back.
+#[cfg(feature = "cuda")]
+fn restore_prefix(
+    request: &mut Option<crate::memory::vmm::PrefixKey>,
+    job: Option<crate::memory::vmm::PrefixKey>,
+) {
+    if request.is_none() {
+        *request = job;
     }
 }
 
@@ -5973,9 +6069,7 @@ fn apply_window(
         match job.outcome {
             None => {
                 skipped += 1;
-                if request.prefix.is_none() {
-                    request.prefix = job.prefix;
-                }
+                restore_prefix(&mut request.prefix, job.prefix);
             }
             Some(Ok(Some(frontier))) => {
                 admitted += 1;
@@ -5983,7 +6077,10 @@ fn apply_window(
                 request.cached_tokens =
                     (e.attached_rows(i) as usize).max(request.resume.min(frontier));
             }
-            Some(Ok(None)) => waiting += 1,
+            Some(Ok(None)) => {
+                waiting += 1;
+                restore_prefix(&mut request.prefix, job.prefix);
+            }
             Some(Err(err)) => {
                 tracing::warn!(
                     slot = i,
@@ -6132,7 +6229,7 @@ fn gpu_prefill_batched_pass(
                     request.prompt_ids.len().saturating_sub(cached as usize)
                 });
             if let (Some(room), Some(rows)) = (room.as_ref(), fresh_rows) {
-                if !room.fits(rows) {
+                if !room.fits_prompt(rows, chunk_cap) {
                     window.push(WindowAdmit {
                         slot: i,
                         prompt: request.prompt_ids.clone(),
@@ -6150,8 +6247,8 @@ fn gpu_prefill_batched_pass(
                     if fresh && request.resume > 0 {
                         request.resume = e.resume_slot(row, request.resume);
                     }
-                    if fresh && row == i && request.prefix.is_some() {
-                        e.stage_prefix_key(row, request.prefix.take());
+                    if fresh && row == i && request.prefix.is_some() && !e.has_staged_prefix(row) {
+                        e.stage_prefix_key(row, request.prefix.clone());
                     }
                     let Some(frontier) = e.admit_packed_slot(row, &request.prompt_ids, total)?
                     else {
@@ -6192,6 +6289,10 @@ fn gpu_prefill_batched_pass(
             })();
             match admitted {
                 Ok(_) => {
+                    if e.packed_slot_ready(i) {
+                        // Attached (or missed): the key is spent; a wait keeps it for the retry.
+                        request.prefix = None;
+                    }
                     if let (Some(room), Some(rows)) = (room.as_mut(), fresh_rows) {
                         if e.packed_slot_ready(i) {
                             room.add(rows.min(chunk_cap));
@@ -6398,6 +6499,7 @@ fn gpu_prefill_batched_pass(
             );
         }
         let riders = if unified { feeds.len() } else { 0 };
+        let mut window_time: Option<WindowTime> = None;
         let t_launch = Instant::now();
         let res = if unified {
             use plow_asset::token_batch::{Phase, Request, Selection};
@@ -6438,8 +6540,9 @@ fn gpu_prefill_batched_pass(
                 let spec: Option<&dyn Fn(u32) -> Option<crate::exec::gpu::DevSample>> =
                     sampled.then_some(&spec);
                 let jobs = &mut window;
+                let timed = &mut window_time;
                 e.token_batch_step_window(&requests, unified_output, spec, &mut |e| {
-                    admit_window(e, jobs, true)
+                    *timed = Some(admit_window(e, jobs, true));
                 })
             } else if e.dev_sample_enabled() {
                 // Stochastic rows draw on the device: a host draw downloads the row's 512 KiB of
@@ -6508,30 +6611,37 @@ fn gpu_prefill_batched_pass(
                     Ok(())
                 })
         };
-        let mut admitted_in_launch = false;
         if !window.is_empty() {
             // A launch without a host window (the decode rows left it) admits them now.
             if window.iter().all(|job| job.outcome.is_none()) && !unified {
-                admit_window(e, &mut window, false);
+                window_time = Some(admit_window(e, &mut window, false));
             }
-            // Any attempt counts: `Ok(None)` also follows an allocation that failed under pressure.
-            admitted_in_launch = window.iter().any(|job| job.outcome.is_some());
             apply_window(e, slots, &mut window, arena, &mut tick_fault);
         }
-        // A launch that ran admissions measured them (and the restores they queued behind it),
-        // not the launch: they cost the same at any rung, so they would price the rung, and every
-        // rung below it in turn, out of the ITL budget.
-        if res.is_ok() && !admitted_in_launch {
-            let ms = t_launch.elapsed().as_secs_f64() * 1e3;
+        // Admissions cost the same at any rung: left in, they would price the rung, and every rung
+        // below it in turn, out of the ITL budget; skipped, steady arrivals froze the estimates.
+        // `ride_launch_ms` takes out what the host measured.
+        let observed = ride_launch_ms(t_launch.elapsed().as_secs_f64() * 1e3, window_time);
+        if let (true, Some(ms)) = (res.is_ok(), observed) {
             ride.observe_launch(ride_key, riders, ms);
             // The rung actually launched: the smallest bucket holding the packed rows and riders.
             // Only `rows_within` (the ITL budget) reads it.
+            let rung = e.pf_cover_rows(pack.iter().map(|p| p.2).sum::<usize>() + riders);
             if pf_itl_budget_ms() > 0 {
-                ride.observe_rung(
-                    e.pf_cover_rows(pack.iter().map(|p| p.2).sum::<usize>() + riders),
-                    ms,
+                ride.observe_rung(rung, ms);
+            }
+            if packlog::on() {
+                eprintln!(
+                    "PACKLOG RIDE rung={rung} riders={riders} ms={ms:.2} window={}",
+                    window_time.map_or("none", |w| match w.mode {
+                        WindowMode::Serial => "serial",
+                        WindowMode::Hidden => "hidden",
+                        WindowMode::Overran => "overran",
+                    })
                 );
             }
+        } else if packlog::on() && res.is_ok() {
+            eprintln!("PACKLOG RIDE skipped window=overran");
         }
         match res {
             Ok(()) => {
@@ -8064,6 +8174,72 @@ mod tests {
         assert_eq!(super::admit_launch_rows(1024, Some(2048)), 1024);
         // Nothing admitted yet: the first admission always runs before the launch.
         assert!(super::AdmitRoom::new(0, 1152, 4).fits(6000));
+    }
+
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn a_prompt_longer_than_its_chunk_is_admitted_when_its_slice_fits() {
+        // 900 rows ready in a 1152-row launch with 4 riders leave 248: a 6000-row prompt sends
+        // only its 128-row chunk into this launch, so it is admitted in front of it.
+        let room = super::AdmitRoom::new(900, 1152, 4);
+        assert!(room.fits_prompt(6000, 128));
+        assert!(!room.fits(6000));
+        assert!(
+            !room.fits_prompt(6000, 512),
+            "a 512-row slice does not fit 248 rows"
+        );
+    }
+
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn ride_cost_takes_the_measured_admissions_out_of_the_launch() {
+        use super::{ride_launch_ms, WindowMode, WindowTime};
+        let w = |admit_ms, mode| Some(WindowTime { admit_ms, mode });
+        assert_eq!(ride_launch_ms(30.0, None), Some(30.0));
+        assert_eq!(
+            ride_launch_ms(42.0, w(12.0, WindowMode::Serial)),
+            Some(30.0)
+        );
+        assert_eq!(ride_launch_ms(5.0, w(12.0, WindowMode::Serial)), Some(0.0));
+        assert_eq!(
+            ride_launch_ms(30.0, w(12.0, WindowMode::Hidden)),
+            Some(30.0)
+        );
+        assert_eq!(ride_launch_ms(40.0, w(35.0, WindowMode::Overran)), None);
+    }
+
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn overflow_counts_waiting_rows_once_every_reachable_slot_is_full() {
+        use super::overflow_rows;
+        let occ = |full: usize, cap: usize| (0..cap).map(move |i| i < full);
+        // (a) The ladder tops out at 64 of 128 slots: slots 0..64 full and a queue is overload.
+        assert_eq!(
+            overflow_rows(occ(64, 128), 64, [3000, 2000].into_iter()),
+            5000
+        );
+        // (b) A rung hold at 32 below the 64 ceiling: slots 32..64 are still reachable.
+        assert_eq!(overflow_rows(occ(32, 128), 64, [3000].into_iter()), 0);
+        // (c) No controller: the ceiling is every slot, as before.
+        assert_eq!(overflow_rows(occ(127, 128), 128, [3000].into_iter()), 0);
+        assert_eq!(overflow_rows(occ(128, 128), 128, [3000].into_iter()), 3000);
+        assert_eq!(overflow_rows(occ(4, 4), 4, std::iter::empty()), 0);
+    }
+
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn a_waiting_admission_hands_its_prefix_key_back() {
+        let key = crate::memory::vmm::PrefixKey::new(&[1, 2, 3, 4], 2);
+        let mut request = None;
+        super::restore_prefix(&mut request, Some(key.clone()));
+        assert_eq!(
+            request.as_ref().map(|k| k.hashes.len()),
+            Some(key.hashes.len())
+        );
+        // A key the request already holds is kept.
+        let other = crate::memory::vmm::PrefixKey::new(&[9, 9], 2);
+        super::restore_prefix(&mut request, Some(other));
+        assert_eq!(request.map(|k| k.hashes), Some(key.hashes));
     }
 
     #[cfg(feature = "cuda")]

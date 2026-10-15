@@ -8115,12 +8115,15 @@ impl GpuEngine {
         }
         let host_t = pf_packlog_on().then(std::time::Instant::now);
         let mut marks = [0u64; 3];
+        // `begin_slot` resets the slot's admission state, staged key included: carry the key
+        // across it to the attach (a failed attempt drops it; the mux keeps its own copy).
+        let staged = self.staged_prefix[b].take();
         let started = (|| {
             self.begin_slot(b, total)?;
             if let Some(t) = host_t {
                 marks[0] = t.elapsed().as_nanos() as u64;
             }
-            let frontier = self.attach_prompt(b, prompt)?;
+            let frontier = self.attach_prompt_keyed(b, prompt, staged)?;
             if let Some(t) = host_t {
                 marks[1] = t.elapsed().as_nanos() as u64;
             }
