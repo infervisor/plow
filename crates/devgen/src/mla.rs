@@ -748,18 +748,23 @@ fn emit_glm53_hc_pre(
     };
     // PLOW_GLM_HC_AITER: post + mix (split-K partials) then pre + Sinkhorn + RmsNorm, AITER's two
     // kernels in one raw segment. `layer_input` is dead under the norm fold and is not written.
-    if let (true, None, Some((raw, prev)), Some((nout, gamma))) = (
-        emit_config::active().glm_hc_aiter
-            && c.hidden == 4096
-            && rows <= 512
-            && rows >= emit_config::active().glm_hc_aiter_min_rows.unwrap_or(1),
-        band,
-        post_fold,
-        norm_fold,
-    ) {
+    // PLOW_GLM53_PF_HC_AITER: the same pair on a prefill band (sequence-parallel seam).
+    let aiter_ok = match band {
+        None => {
+            emit_config::active().glm_hc_aiter
+                && rows <= 512
+                && rows >= emit_config::active().glm_hc_aiter_min_rows.unwrap_or(1)
+        }
+        Some(_) => emit_config::active().glm53_pf_hc_aiter,
+    };
+    if let (true, Some((raw, prev)), Some((nout, gamma))) =
+        (aiter_ok && c.hidden == 4096, post_fold, norm_fold)
+    {
+        let prev = band.map_or(prev, |v| v.res(s, prev));
         let side = if ffn { "ffn" } else { "attn" };
-        let mul = b.tensor(&format!("act.hc_aiter.{rows}.mul"), u64::from(rows) * 64 * 32 * 4);
-        let sq = b.tensor(&format!("act.hc_aiter.{rows}.sq"), u64::from(rows) * 64 * 4);
+        let pfx = if band.is_some() { "act.hc_aiter_pf" } else { "act.hc_aiter" };
+        let mul = b.tensor(&format!("{pfx}.{rows}.mul"), u64::from(rows) * 64 * 32 * 4);
+        let sq = b.tensor(&format!("{pfx}.{rows}.sq"), u64::from(rows) * 64 * 4);
         let words = [
             nout,
             gamma,
@@ -773,7 +778,7 @@ fn emit_glm53_hc_pre(
             1e-6f32.to_bits(),
         ];
         let bytes: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
-        let desc = b.tensor_init(&format!("act.hc_aiter.{rows}.{layer}.{side}.desc"), bytes);
+        let desc = b.tensor_init(&format!("{pfx}.{rows}.{layer}.{side}.desc"), bytes);
         let cm = b.emit(DevOp::GemvF32, vec![0], &[dep], |d| {
             d.i[7] = packet::dev::HC_AITER_MARK;
             d.t[0] = mixes;
@@ -1109,6 +1114,17 @@ fn emit_glm53_program(
                 && emit_config::active().glm_hc_fuse_dec
                 && c.hidden % 1024 == 0
                 && rows.div_ceil(4) * 3 <= b.n_cu()));
+    // PLOW_GLM53_PF_HC_AITER (prefill band seams): a block's HyperConnPost folds into the next
+    // sublayer's mix and that sublayer's input norm into its pre (AITER's pair), then the
+    // gather. Taken where the next input norm is a band norm + gather: FFN, and KDA under
+    // PLOW_GLM53_SP_KDA_NORM. MLA inputs keep the interpreter chain.
+    let pf_hc = prefill && bv.is_some() && emit_config::active().glm53_pf_hc_aiter;
+    if pf_hc {
+        assert!(c.hidden == 4096, "PLOW_GLM53_PF_HC_AITER needs hidden 4096");
+    }
+    let pf_kda_in = |l: usize| {
+        pf_hc && !c.is_softmax(l as u32) && emit_config::active().glm53_sp_kda_norm
+    };
     let mut pending_post: Option<(u32, u32)> = None;
     let xr_hcpost = !prefill && bv.is_none() && c.tp > 1 && emit_config::active().glm_xr_hcpost;
     for l in 0..c.layers as usize {
@@ -1132,9 +1148,13 @@ fn emit_glm53_program(
             && c.is_softmax(l as u32)
             && emit_config::active().glm_hc_fold_mla
             && !(emit_config::active().glm_norm_q128 && emit_config::active().glm_qkva_w8a8);
+        let pf_kda_fold = pf_kda_in(l) && pending_post.is_some();
         let kda_fold = kda_x
             .map(|x| (x, s.kda_w[l].as_ref().unwrap().ln_w))
-            .or(mla_fold.then(|| (n.xn, n.lw[l].gin)));
+            .or(mla_fold.then(|| (n.xn, n.lw[l].gin)))
+            .or(bv
+                .filter(|_| pf_kda_fold)
+                .map(|v| (v.h2, s.kda_w[l].as_ref().unwrap().ln_w)));
         let c_pre = emit_glm53_hc_pre(
             b,
             c,
@@ -1192,7 +1212,16 @@ fn emit_glm53_program(
                     rows as u64 * c.hidden as u64 * 2,
                 )
             });
-            let c_in = if let Some(x) = sp_x {
+            let c_in = if let Some(x) = sp_x.filter(|_| pf_kda_fold) {
+                crate::emit_xall_gather(
+                    b,
+                    &mut xgate,
+                    &xr,
+                    &[c_pre],
+                    &[(x, rows * c.hidden, 3 * n.slot_b)],
+                    c.tp,
+                )
+            } else if let Some(x) = sp_x {
                 glm_sp_norm_gather(
                     b,
                     n,
@@ -1263,7 +1292,7 @@ fn emit_glm53_program(
             }
         };
         let raw = bv.map_or(n.attn, |v| v.og);
-        let (c_post, attn_post) = if post_fold_on {
+        let (c_post, attn_post) = if post_fold_on || pf_hc {
             (c_attn, Some((raw, residual)))
         } else if let Some(x) = xr_hcpost
             .then(|| glm53_xr_hcpost(b, c, s, next, raw, residual, rows, c_attn))
@@ -1276,12 +1305,23 @@ fn emit_glm53_program(
         ri ^= 1;
         let residual = s.residual[ri];
         let next = s.residual[ri ^ 1];
-        let ffn_fold = hc_fold.then_some((n.xn2, n.lw[l].gpost));
+        let ffn_fold = hc_fold
+            .then_some((n.xn2, n.lw[l].gpost))
+            .or(bv.filter(|_| pf_hc).map(|v| (v.h2, n.lw[l].gpost)));
         let c_pre_ffn = emit_glm53_hc_pre(
             b, c, s, residual, true, l, rows, c_post, bv, false, ffn_fold, attn_post,
         );
         let c_norm = if hc_fold {
             c_pre_ffn
+        } else if pf_hc {
+            crate::emit_xall_gather(
+                b,
+                &mut xgate,
+                &xr,
+                &[c_pre_ffn],
+                &[(n.xn2, rows * c.hidden, 3 * n.slot_b)],
+                c.tp,
+            )
         } else if bv.is_some() {
             glm_sp_norm_gather(
                 b,
@@ -1334,7 +1374,9 @@ fn emit_glm53_program(
             )
         };
         let raw = bv.map_or(n.attn, |v| v.dg);
-        if post_fold_on && l + 1 < c.layers as usize {
+        if (post_fold_on && l + 1 < c.layers as usize)
+            || (l + 1 < c.layers as usize && pf_kda_in(l + 1))
+        {
             pending_post = Some((raw, residual));
             dep = c_ffn;
         } else if let Some(x) = xr_hcpost
