@@ -295,13 +295,13 @@ esac
 # PLOW_DSA_SELECT_V2=1: DSA prefill top-k (op 118) through d_index_select_pf_v2 (same set).
 case "${PLOW_DSA_SELECT_V2:-0}" in
   0) ;;
-  1) A4W4_BK="$A4W4_BK -DPLOW_DSA_SELECT_V2=1" ;;
+  1) INC="$INC -DPLOW_DSA_SELECT_V2=1" ;;
   *) echo "PLOW_DSA_SELECT_V2 must be 0 or 1" >&2; exit 2 ;;
 esac
 # PLOW_DSA_KPOOL_ROWWAVE=1: pooled DSA prefill score (op 134) with one query row per wave.
 case "${PLOW_DSA_KPOOL_ROWWAVE:-0}" in
   0) ;;
-  1) A4W4_BK="$A4W4_BK -DPLOW_DSA_KPOOL_ROWWAVE=1" ;;
+  1) INC="$INC -DPLOW_DSA_KPOOL_ROWWAVE=1" ;;
   *) echo "PLOW_DSA_KPOOL_ROWWAVE must be 0 or 1" >&2; exit 2 ;;
 esac
 # PLOW_DSA_SELECT_V3=1: op 118 through dsa_select_v3.h (same set); fused select+union when the

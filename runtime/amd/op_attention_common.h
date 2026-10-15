@@ -5502,6 +5502,9 @@ __device__ void d_index_score_kpool_mfma(float* __restrict__ Score, const uint8_
     }
 }
 
+#ifndef DSA_KPOOL_RPW
+#define DSA_KPOOL_RPW 4u /* rows per wave per staged key slab */
+#endif
 /* PLOW_DSA_KPOOL_ROWWAVE: prefill form of d_index_score_kpool_mfma with one query ROW per WAVE.
  * The old prefill walk swapped each row's query tile through LDS behind two workgroup barriers per
  * row and ran one 32-pool MFMA tile per wave per row; here a work item stages the TILE_N-pool key
@@ -5521,7 +5524,7 @@ __device__ void d_index_score_kpool_rowwave(float* __restrict__ Score,
     static_assert(HIc == 32 && DI % 16 == 0, "32 heads, whole MFMA k-steps");
     constexpr int NK = DI / MFMA_K;
     constexpr int KSTRIDE = DI + FA_PAD;
-    constexpr unsigned RG = PLOW_WAVES;
+    constexpr unsigned RG = PLOW_WAVES * DSA_KPOOL_RPW;
     auto* const Sc = as_glob(Score);
     const auto* const Qg = as_glob(Qfp8);
     const auto* const Qs = as_glob(Qscale);
@@ -5557,8 +5560,8 @@ __device__ void d_index_score_kpool_rowwave(float* __restrict__ Score,
         for (unsigned r = tid; r < (unsigned)TILE_N; r += PLOW_THREADS)
             kslds[r] = (base + r < lmax) ? Ks[base + r] : 0.0f;
         __syncthreads();
-        const unsigned b = b0 + wave;
-        if (b >= b1) continue;
+#pragma unroll 1
+        for (unsigned b = b0 + wave; b < b1; b += PLOW_WAVES) {
         const unsigned len = row_len(b);
         if (base >= len) continue;
         if (b != staged) {
@@ -5597,6 +5600,7 @@ __device__ void d_index_score_kpool_rowwave(float* __restrict__ Score,
                 const unsigned p = base + st + lane;
                 if (p < len) st_act<float>(&Sc[(size_t)b * pool_stride + p], part * scale);
             }
+        }
         }
     }
 }
