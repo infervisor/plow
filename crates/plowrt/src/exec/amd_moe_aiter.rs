@@ -1191,13 +1191,19 @@ impl MoeAiter {
         // gfx950: the per-row-bucket AITER tile and its grid; gfx942 keeps the 32/64-row pair.
         let gfx950 = match &self.gfx950 {
             Some(kernels) => {
-                let (i, tile) = GFX950_TILES
+                let (mut i, mut tile) = GFX950_TILES
                     .iter()
                     .enumerate()
                     .find(|(_, t)| route.rows <= t.max_rows)
                     .ok_or_else(|| {
                         RuntimeError::Device("gfx950 AITER MoE rows exceed 8192".into())
                     })?;
+                // PLOW_AMD_MOE_TILE_DEC (diagnostic): force a tile at the decode rungs.
+                if let Some(f) = crate::config::RuntimeConfig::get().amd.moe_tile_dec {
+                    if route.rows <= 256 && (f as usize) < GFX950_TILES.len() {
+                        (i, tile) = (f as usize, &GFX950_TILES[f as usize]);
+                    }
+                }
                 Some((kernels[i], tile))
             }
             None => None,

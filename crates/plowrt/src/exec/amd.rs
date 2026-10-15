@@ -221,6 +221,45 @@ enum DecodeSegmentKind {
     SparseMlaDecode(usize),
     MlaBf16,
     IndexFp8,
+    XrNative(usize),
+    RouterNative { gemm: usize, topk: usize },
+}
+
+/// `PLOW_AMD_ROUTER_NATIVE`: the decode router pair the native kernels implement — a bf16
+/// GemmF32 score feeding a sigmoid/bias/normalized top-k (<= 8 of <= 320, no groups) tail.
+fn router_native_pair(g: &packet::dev::DevInst64, r: &packet::dev::DevInst64) -> bool {
+    use packet::dev::TENSOR_NONE16 as NONE;
+    crate::config::RuntimeConfig::get().amd.router_native
+        && g.op == DevOp::GemmF32 as u16
+        && r.op == DevOp::MoeRouterTopkPf as u16
+        && g.t[3] == NONE
+        && r.t[1] == g.t[0]
+        && r.t[2] == NONE
+        && r.t[3] != NONE
+        && g.i[0] == r.i[4]
+        && g.i[1] == r.i[1]
+        && g.i[1] <= 320
+        && g.i[2] % 128 == 0
+        && r.i[2] <= 8
+        && r.i[3] == 15
+        && r.i[6] <= 1
+        && r.i[5] <= 1
+}
+
+/// `PLOW_AMD_XR_NATIVE`: a decode collective the native wrapper can stand in for — no folded
+/// gather, combine, residual or HyperConn operands, and at least the configured message size.
+fn xr_native_inst(inst: &packet::dev::DevInst64) -> bool {
+    let Some(min) = crate::config::RuntimeConfig::get().amd.xr_native else {
+        return false;
+    };
+    let plain = inst.t[1..].iter().all(|&t| t == packet::dev::TENSOR_NONE16);
+    plain
+        && inst.i[0] >= min.max(1)
+        && if inst.op == DevOp::XReduce as u16 {
+            inst.i[4..].iter().all(|&v| v == 0)
+        } else {
+            inst.op == DevOp::XReduceTwoShot as u16 && inst.i[5..].iter().all(|&v| v == 0)
+        }
 }
 
 fn hc_mix_raw(inst: &packet::dev::DevInst64) -> bool {
@@ -254,6 +293,8 @@ fn decode_segment_kinds(prog: &DevProg) -> Result<Vec<DecodeSegmentKind>> {
         let mut sparse_mla_pure = true;
         let mut has_other = false;
         let mut w8_pair: Vec<(usize, bool)> = Vec::new();
+        let mut xr_inst = None;
+        let mut xr_pure = true;
         for e in prog.stream.iter().filter(|e| e.seg as usize == seg) {
             let inst = prog.insts.get(e.inst as usize).ok_or_else(|| {
                 RuntimeError::Device(format!(
@@ -349,9 +390,63 @@ fn decode_segment_kinds(prog: &DevProg) -> Result<Vec<DecodeSegmentKind>> {
                     Some(_) => sparse_mla_pure = false,
                 }
                 sparse_mla_pure &= e.wait_len == 0 && e.succ_len == 0 && e.flags & SE_XCTR == 0;
+            } else if xr_native_inst(inst) {
+                match xr_inst {
+                    None => xr_inst = Some(e.inst as usize),
+                    Some(i) if i == e.inst as usize => {}
+                    Some(_) => xr_pure = false,
+                }
+                xr_pure &= e.wait_len == 0 && e.succ_len == 0 && e.flags & SE_XCTR == 0;
             } else {
                 has_other = true;
             }
+        }
+        if has_other
+            && w8_pair.is_empty()
+            && fused_inst.is_none()
+            && xr_inst.is_none()
+            && mla_flash_inst.is_none()
+            && mla_merge_inst.is_none()
+            && moe_glu_inst.is_none()
+            && moe_down_inst.is_none()
+            && sparse_mla_inst.is_none()
+        {
+            let mut insts: Vec<usize> = prog
+                .stream
+                .iter()
+                .filter(|e| e.seg as usize == seg)
+                .map(|e| e.inst as usize)
+                .collect();
+            insts.sort_unstable();
+            insts.dedup();
+            if let [g, r] = insts[..] {
+                if router_native_pair(&prog.insts[g], &prog.insts[r])
+                    && prog
+                        .stream
+                        .iter()
+                        .filter(|e| e.seg as usize == seg)
+                        .all(|e| e.flags & SE_XCTR == 0)
+                {
+                    kinds[seg] = DecodeSegmentKind::RouterNative { gemm: g, topk: r };
+                    continue;
+                }
+            }
+        }
+        if let Some(ix) = xr_inst {
+            if xr_pure
+                && !has_other
+                && w8_pair.is_empty()
+                && fused_inst.is_none()
+                && mla_flash_inst.is_none()
+                && mla_merge_inst.is_none()
+                && moe_glu_inst.is_none()
+                && moe_down_inst.is_none()
+                && sparse_mla_inst.is_none()
+            {
+                kinds[seg] = DecodeSegmentKind::XrNative(ix);
+                continue;
+            }
+            has_other = true;
         }
         if !w8_pair.is_empty() {
             let pair = match w8_pair[..] {
@@ -583,6 +678,71 @@ fn validate_decode_dispatch<'a>(
         }
     }
     Ok(())
+}
+
+/// `PLOW_AMD_LT_OVERLAP`: a native decode GEMM may start without waiting for the run of
+/// native GEMMs directly before it when it shares no tensor with any of them as a written
+/// operand (it reads none of their outputs and writes none of their operands).
+fn lt_overlaps_run(before: &[DecodeSegmentRoute], inst: &packet::dev::DevInst64) -> bool {
+    let (out, x) = (inst.t[0], inst.t[1]);
+    let mut any = false;
+    for r in before.iter().rev() {
+        let DecodeSegmentRoute::GemmLt(prev) = r else {
+            break;
+        };
+        let pi = prev.inst();
+        if pi.t[0] == x || pi.t[0] == out || pi.t[1] == out || pi.t[2] == out {
+            return false;
+        }
+        any = true;
+    }
+    any
+}
+
+/// `plow_moe_router_gemm` kernargs (runtime/amd/moe_aiter_adapter.hip `MoeRouterGemmArgs`).
+#[derive(Clone, Copy, Debug)]
+#[repr(C)]
+struct RouterGemmArgs {
+    logit: u64,
+    x: u64,
+    w: u64,
+    rows: u32,
+    n_exp: u32,
+    k: u32,
+    pad: u32,
+}
+
+/// `plow_moe_router_topk` kernargs (`MoeRouterTopkArgs`).
+#[derive(Clone, Copy, Debug)]
+#[repr(C)]
+struct RouterTopkArgs {
+    table: u64,
+    logit: u64,
+    bias: u64,
+    rows: u32,
+    n_exp: u32,
+    k: u32,
+    norm: u32,
+    shared_tail: u32,
+    route_scale: f32,
+}
+
+/// `plow_xr_native` kernargs (runtime/amd/xr_native.hip `XrNativeArgs`).
+#[derive(Clone, Copy, Debug)]
+#[repr(C)]
+struct XrNativeArgs {
+    out: u64,
+    peers: u64,
+    status: u64,
+    xoff: u64,
+    n: u32,
+    slot_bytes: u32,
+    gate_rs: u32,
+    gate_ag: u32,
+    rank: u32,
+    nranks: u32,
+    two_shot: u32,
+    pad: u32,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -3590,6 +3750,11 @@ enum DecodeSegmentRoute {
     },
     MoeAiter(amd_moe_aiter::Route),
     GemmLt(amd_gemm_lt::Route),
+    XrNative(packet::dev::DevInst64),
+    RouterNative {
+        gemm: packet::dev::DevInst64,
+        topk: packet::dev::DevInst64,
+    },
     SparseMlaDecode(amd_sparse_mla::DecodeRoute),
     MlaBf16(amd_mla_bf16::Route),
     IndexFp8(amd_index_fp8::Route),
@@ -3654,6 +3819,17 @@ fn decode_segment_routes(
             }
             DecodeSegmentKind::Interpreter => {
                 routes.push(DecodeSegmentRoute::Interpreter);
+                continue;
+            }
+            DecodeSegmentKind::XrNative(ix) => {
+                routes.push(DecodeSegmentRoute::XrNative(prog.insts[ix]));
+                continue;
+            }
+            DecodeSegmentKind::RouterNative { gemm, topk } => {
+                routes.push(DecodeSegmentRoute::RouterNative {
+                    gemm: prog.insts[gemm],
+                    topk: prog.insts[topk],
+                });
                 continue;
             }
             DecodeSegmentKind::MlaAttention => {
@@ -7282,6 +7458,10 @@ pub struct AmdEngine {
     k_kda_decode_wide: Option<HsaKernel>,
     k_hc_mix: Option<HsaKernel>,
     k_hc_aiter: Option<[HsaKernel; 3]>,
+    /// `PLOW_AMD_XR_NATIVE`: `plow_xr_native` from `xr_native_gfx950.elf`.
+    k_xr_native: Option<HsaKernel>,
+    /// `PLOW_AMD_ROUTER_NATIVE`: `plow_moe_router_gemm` / `_topk` from the gfx950 MoE adapter.
+    k_router_native: Option<[HsaKernel; 2]>,
     k_moe_w8a8_dec: Option<[HsaKernel; 3]>,
     k_grouped_moe_glu: Option<HsaKernel>,
     k_grouped_moe_down: Option<HsaKernel>,
@@ -9402,6 +9582,83 @@ impl AmdEngine {
             }
             modules.push(module);
             Some(kernel)
+        } else {
+            None
+        };
+
+        let need_xr_native = blob
+            .decode_phase()
+            .flat_map(|p| p.insts.iter())
+            .any(xr_native_inst);
+        let k_xr_native = if need_xr_native {
+            const NAME: &str = "xr_native_gfx950.elf";
+            const MARKER: &str = "plow_xr_native_abi_1";
+            const SYMBOL: &str = "plow_xr_native";
+            let path = hsaco_dir.join(NAME);
+            let image = std::fs::read(&path).map_err(|e| {
+                RuntimeError::Device(format!(
+                    "PLOW_AMD_XR_NATIVE requires standalone object {}: {e}",
+                    path.display()
+                ))
+            })?;
+            if !elf_symbol_names(&image).contains(&MARKER) {
+                return Err(RuntimeError::Device(format!(
+                    "{} does not advertise `{MARKER}`; refusing a stale object",
+                    path.display()
+                )));
+            }
+            let module = EngineDevice::module_load(&*be, &image)
+                .map_err(|e| RuntimeError::Device(format!("{}: {e}", path.display())))?;
+            let kernel = EngineDevice::get_function(&*be, &module, SYMBOL)
+                .map_err(|e| RuntimeError::Device(format!("{NAME}: no symbol {SYMBOL}: {e}")))?;
+            let want = std::mem::size_of::<XrNativeArgs>() as u32;
+            let got = kernel.kernarg_size();
+            if got < want || kernel.private_segment_size() != 0 {
+                return Err(RuntimeError::Device(format!(
+                    "{NAME}: kernarg segment is {got} B (ABI needs {want}) or private memory is used"
+                )));
+            }
+            modules.push(module);
+            Some(kernel)
+        } else {
+            None
+        };
+
+        let k_router_native = if crate::config::RuntimeConfig::get().amd.router_native {
+            const NAME: &str = "moe_aiter_adapter_gfx950.elf";
+            const MARKER: &str = "plow_moe_router_abi_1";
+            let path = hsaco_dir.join(NAME);
+            let image = std::fs::read(&path).map_err(|e| {
+                RuntimeError::Device(format!(
+                    "PLOW_AMD_ROUTER_NATIVE requires {}: {e}",
+                    path.display()
+                ))
+            })?;
+            if !elf_symbol_names(&image).contains(&MARKER) {
+                return Err(RuntimeError::Device(format!(
+                    "{} does not advertise `{MARKER}`; refusing a stale adapter",
+                    path.display()
+                )));
+            }
+            let module = EngineDevice::module_load(&*be, &image)
+                .map_err(|e| RuntimeError::Device(format!("{}: {e}", path.display())))?;
+            let mut ks = Vec::with_capacity(2);
+            for (sym, want) in [
+                ("plow_moe_router_gemm", std::mem::size_of::<RouterGemmArgs>()),
+                ("plow_moe_router_topk", std::mem::size_of::<RouterTopkArgs>()),
+            ] {
+                let k = EngineDevice::get_function(&*be, &module, sym)
+                    .map_err(|e| RuntimeError::Device(format!("{NAME}: no symbol {sym}: {e}")))?;
+                if (k.kernarg_size() as usize) < want || k.private_segment_size() != 0 {
+                    return Err(RuntimeError::Device(format!(
+                        "{NAME}: {sym} kernarg segment is {} B (ABI needs {want}) or private memory is used",
+                        k.kernarg_size()
+                    )));
+                }
+                ks.push(k);
+            }
+            modules.push(module);
+            Some([ks[0], ks[1]])
         } else {
             None
         };
@@ -12962,6 +13219,8 @@ impl AmdEngine {
             k_kda_decode_wide,
             k_hc_mix,
             k_hc_aiter,
+            k_xr_native,
+            k_router_native,
             k_moe_w8a8_dec,
             k_grouped_moe_glu,
             k_grouped_moe_down,
@@ -14988,6 +15247,7 @@ impl AmdEngine {
             Some(DecodeSegmentRoute::GroupedMoeMxfp4 { .. }) => 2,
             Some(DecodeSegmentRoute::MoeW8a8Dec { .. }) => 2,
             Some(DecodeSegmentRoute::HcAiter(_)) => 2,
+            Some(DecodeSegmentRoute::RouterNative { .. }) => 2,
             Some(DecodeSegmentRoute::MoeW8a8DecPair { .. }) => 1,
             Some(_) => 1,
             None => 0,
@@ -15749,7 +16009,98 @@ impl AmdEngine {
                 let kernel = self.gemm_lt.as_ref().ok_or_else(|| {
                     RuntimeError::Device("native decode GEMM has no loaded kernels".into())
                 })?;
+                if crate::config::RuntimeConfig::get().amd.lt_overlap
+                    && lt_overlaps_run(&self.progs[p].decode_routes[..seg], route.inst())
+                {
+                    self.be.skip_next_barrier();
+                }
                 kernel.enqueue(&self.be, route, &self.tens_table)?;
+            }
+            DecodeSegmentRoute::RouterNative { gemm, topk } => {
+                let [kg, kt] = self.k_router_native.ok_or_else(|| {
+                    RuntimeError::Device("PLOW_AMD_ROUTER_NATIVE segment has no loaded kernels".into())
+                })?;
+                let addr = |h: u16| {
+                    let at = usize::from(h) * 8;
+                    u64::from_le_bytes(self.tens_table[at..at + 8].try_into().unwrap())
+                };
+                let ga = RouterGemmArgs {
+                    logit: addr(gemm.t[0]),
+                    x: addr(gemm.t[1]),
+                    w: addr(gemm.t[2]),
+                    rows: gemm.i[0],
+                    n_exp: gemm.i[1],
+                    k: gemm.i[2],
+                    pad: 0,
+                };
+                EngineDevice::launch_kernel(
+                    &*self.be,
+                    kg,
+                    gemm.i[0].div_ceil(16) * gemm.i[1].div_ceil(16),
+                    256,
+                    0,
+                    as_bytes(std::slice::from_ref(&ga)),
+                    None,
+                )?;
+                let ta = RouterTopkArgs {
+                    table: addr(topk.t[0]),
+                    logit: addr(topk.t[1]),
+                    bias: addr(topk.t[3]),
+                    rows: topk.i[4],
+                    n_exp: topk.i[1],
+                    k: topk.i[2],
+                    norm: 1,
+                    shared_tail: topk.i[5],
+                    route_scale: f32::from_bits(topk.fj[0]),
+                };
+                EngineDevice::launch_kernel(
+                    &*self.be,
+                    kt,
+                    topk.i[4].div_ceil(4),
+                    256,
+                    0,
+                    as_bytes(std::slice::from_ref(&ta)),
+                    None,
+                )?;
+                self.seg_launches += 1;
+            }
+            DecodeSegmentRoute::XrNative(inst) => {
+                let kernel = self.k_xr_native.ok_or_else(|| {
+                    RuntimeError::Device("PLOW_AMD_XR_NATIVE segment has no loaded object".into())
+                })?;
+                let tp = self.tp.ok_or_else(|| {
+                    RuntimeError::Device("PLOW_AMD_XR_NATIVE needs a TP group".into())
+                })?;
+                let at = usize::from(inst.t[0]) * 8;
+                let out = u64::from_le_bytes(self.tens_table[at..at + 8].try_into().unwrap());
+                let two_shot = inst.op == DevOp::XReduceTwoShot as u16;
+                // The compact audit's status line, as `patch_tp_xaudit` points the interpreter's
+                // collectives at it (xctr lines are 128 B apart).
+                let status = tp.xctr + u64::from(tp.xstatus_id) * 128;
+                let args = XrNativeArgs {
+                    out,
+                    peers: tp.peer_table,
+                    status,
+                    xoff: tp.xctr - tp.scratch_base,
+                    n: inst.i[0],
+                    slot_bytes: inst.i[2],
+                    gate_rs: inst.i[3],
+                    gate_ag: if two_shot { inst.i[4] } else { 0 },
+                    rank: tp.rank,
+                    nranks: inst.i[1],
+                    // 2 = the peer-parallel two-shot in xr_native.hip (op_collective.h's is 1).
+                    two_shot: u32::from(two_shot) * 2,
+                    pad: 0,
+                };
+                EngineDevice::launch_kernel(
+                    &*self.be,
+                    kernel,
+                    u32::from(inst.blocks).max(1),
+                    512,
+                    0,
+                    as_bytes(std::slice::from_ref(&args)),
+                    None,
+                )?;
             }
             DecodeSegmentRoute::KdaDecodeFused(args) => {
                 let kernel = self.k_kda_decode_fused.ok_or_else(|| {

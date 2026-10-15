@@ -1024,6 +1024,8 @@ pub struct HsaBackend {
     done_signal: HsaSignal,
     /// `PLOW_AMD_DISPATCH_TIMES`: per-slot completion signals on a profiling queue.
     dtimes: Option<Box<DispatchTimes>>,
+    /// Clear the barrier bit of the next dispatch only (`skip_next_barrier`).
+    no_barrier_once: std::sync::atomic::AtomicBool,
     karg_ring: *mut u8,
     /// `karg_ring` is VRAM mapped through the large BAR (`PLOW_AMD_KERNARG_VRAM`): every slot is
     /// staged on the stack, copied through the BAR and made visible before its header is published.
@@ -1437,6 +1439,7 @@ impl HsaBackend {
             queue,
             done_signal,
             dtimes,
+            no_barrier_once: std::sync::atomic::AtomicBool::new(false),
             karg_ring: karg_ring as *mut u8,
             karg_vram,
             device_name,
@@ -2662,8 +2665,9 @@ impl HsaBackend {
         } else {
             1
         };
+        let barrier = u16::from(!self.no_barrier_once.swap(false, Ordering::Relaxed));
         let header: u16 = (HSA_PACKET_TYPE_KERNEL_DISPATCH << HSA_PACKET_HEADER_TYPE) as u16
-            | (1 << HSA_PACKET_HEADER_BARRIER) as u16
+            | (barrier << HSA_PACKET_HEADER_BARRIER) as u16
             | ((pkt_knobs().acquire << HSA_PACKET_HEADER_SCACQUIRE_FENCE_SCOPE) as u16)
             | ((pkt_knobs().release << HSA_PACKET_HEADER_SCRELEASE_FENCE_SCOPE) as u16);
         let setup: u16 = (dims << HSA_KERNEL_DISPATCH_PACKET_SETUP_DIMENSIONS as u16) as u16;
@@ -4093,6 +4097,12 @@ impl HsaBackend {
     /// dispatch counts threads, so it is multiplied here. Getting that
     /// backwards launches 256 workgroups' worth of threads as one workgroup, or
     /// 65536 workgroups — both of which the packet processor accepts.
+    /// The next dispatch may start before earlier packets finish (AQL barrier bit clear). The
+    /// caller guarantees it neither reads what those packets write nor writes what they touch.
+    pub fn skip_next_barrier(&self) {
+        self.no_barrier_once.store(true, Ordering::Relaxed);
+    }
+
     pub fn launch(
         &self,
         f: HsaKernel,

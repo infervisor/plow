@@ -2297,6 +2297,21 @@ pub struct AmdRuntimeConfig {
     /// per-rank copies) runs on persistent workers instead of threads spawned per token.
     #[arg(long = "amd-tp-rank-pool", env = "PLOW_TP_RANK_POOL", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
     pub tp_rank_pool: bool,
+    /// Decode rungs: a segment holding only an XReduce / XReduceTwoShot of at least this many
+    /// elements runs as its own kernel (`xr_native_gfx950.elf`) instead of an interpreter launch.
+    #[arg(long = "amd-xr-native", env = "PLOW_AMD_XR_NATIVE", global = true)]
+    pub xr_native: Option<u32>,
+    /// Decode rungs: the router segment (GemmF32 score + MoeRouterTopkPf) runs as two native
+    /// kernels from the gfx950 MoE adapter instead of an interpreter launch.
+    #[arg(long = "amd-router-native", env = "PLOW_AMD_ROUTER_NATIVE", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
+    pub router_native: bool,
+    /// Diagnostic: force `GFX950_TILES[i]` for AITER MoE calls of at most 256 rows.
+    #[arg(long = "amd-moe-tile-dec", env = "PLOW_AMD_MOE_TILE_DEC", global = true)]
+    pub moe_tile_dec: Option<u32>,
+    /// Decode rungs: adjacent native (hipBLASLt) GEMMs with no data dependence on each other
+    /// launch without the AQL barrier bit, so they run concurrently.
+    #[arg(long = "amd-lt-overlap", env = "PLOW_AMD_LT_OVERLAP", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
+    pub lt_overlap: bool,
 }
 
 /// Global runtime config, initialized once at startup from CLI parse.
