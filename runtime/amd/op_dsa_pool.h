@@ -305,6 +305,48 @@ __device__ void d_dsa_pool_expand(int32_t* __restrict__ out, const int32_t* __re
     }
 }
 
+/* op 124, i3 = 2 (PLOW_GLM_ROWSPLIT_ATTN on the pooled chain): this rank's band rows
+ * [band0, band0 + band) as one-query gather tables for plow_mla_pf_gather, whose 8-query pack is
+ * then one query's 64 heads as eight 8-head groups. Per local row l: count = out_cols, then
+ * [cap] positions (-1 -> row 0) and [cap] membership words (0xFF selected, 0 not), the
+ * IndexUnionPf layout. Same expansion as d_dsa_pool_expand. */
+__device__ void d_dsa_pool_expand_table(unsigned char* __restrict__ uni,
+                                        const int32_t* __restrict__ pool_ids,
+                                        const int32_t* __restrict__ kv_len, unsigned rows,
+                                        unsigned n_groups, unsigned pool_size, unsigned band0,
+                                        unsigned band, unsigned cap, unsigned slice,
+                                        unsigned nblk) {
+    const unsigned topk = n_groups * pool_size;
+    const unsigned out_cols = topk + pool_size - 1;
+    const unsigned walk = (out_cols + 63u) / 64u * 64u;
+    const unsigned hdr = (band * 4u + 255u) / 256u * 256u;
+    const int q_pos0 = (int)kv_len[0] - (int)rows;
+    for (unsigned l = slice; l < band; l += nblk) {
+        const unsigned row = band0 + l;
+        unsigned* const pos = (unsigned*)(uni + hdr + (size_t)l * cap * 12u);
+        unsigned* const msk = pos + cap;
+        if (threadIdx.x == 0) ((unsigned*)uni)[l] = row < rows ? out_cols : 0u;
+        if (row >= rows) continue;
+        const int seq_len = q_pos0 + (int)row + 1;
+        const int pool_len = seq_len / (int)pool_size;
+        const int tail_start = pool_len * (int)pool_size;
+        const int tail_count = seq_len - tail_start;
+        const int32_t* const pr = pool_ids + (size_t)row * n_groups;
+        for (unsigned col = threadIdx.x; col < walk; col += PLOW_THREADS) {
+            int v = -1;
+            if (col < topk) {
+                const int pid = pr[col / pool_size];
+                v = (pid >= 0) ? (pid * (int)pool_size + (int)(col % pool_size)) : -1;
+            } else if (col < out_cols) {
+                const int tail_off = (int)col - (int)topk;
+                v = (tail_off < tail_count) ? (tail_start + tail_off) : -1;
+            }
+            pos[col] = v >= 0 ? (unsigned)v : 0u;
+            msk[col] = v >= 0 ? 0xFFu : 0u;
+        }
+    }
+}
+
 /* op 125 — decode-side ring stash. Unconditional, every decode step: write this step's
  * roped indexer key + projected gate score into a small per-layer ring of `pool_size`
  * slots at `pos % pool_size`, so [`d_dsa_pool_compress`]'s decode-mode gate has a

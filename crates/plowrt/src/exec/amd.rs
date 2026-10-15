@@ -7234,6 +7234,9 @@ pub struct AmdEngine {
     rowsplit_sibling: Vec<Option<usize>>,
     /// Per program: a row-split sibling on the row-band arm (no head all-to-all).
     rowband_sibling: Vec<bool>,
+    /// Per program: a `PLOW_GLM_DSA_PF_A2A` sibling (pooled interpreter selection feeding the
+    /// gather flash object; no native sparse route needed).
+    a2a_sibling: Vec<bool>,
     /// `--glm-rowband` as read at engine build. Serve-start only: with it off the packet's
     /// full-width twins were never bound, so the siblings must never be dispatched either.
     rowband_on: bool,
@@ -12307,6 +12310,17 @@ impl AmdEngine {
                     && !p.insts.iter().any(|d| d.op == DevOp::XAllToAllHeads as u16)
             })
             .collect();
+        let a2a_sibling: Vec<bool> = blob
+            .progs
+            .iter()
+            .map(|p| {
+                p.role.is_rowsplit_sibling()
+                    && p
+                        .insts
+                        .iter()
+                        .any(|d| d.op == DevOp::DsaPoolExpand as u16 && d.i[3] == 2)
+            })
+            .collect();
         let decode = *decode_ladder.last().ok_or_else(|| {
             RuntimeError::Device("devblob: no decode rung in the program table".into())
         })?;
@@ -12975,6 +12989,7 @@ impl AmdEngine {
             dense_exact_select,
             rowsplit_sibling,
             rowband_sibling,
+            a2a_sibling,
             rowband_on,
             devp,
             _weight_slab: weight_slab,
@@ -16552,11 +16567,17 @@ impl AmdEngine {
         {
             for d in insts.iter_mut() {
                 let op = d.op;
+                // The indexer query side (projection, rope, head weights) feeds only the
+                // selection; the key side still writes the pool cache later chunks score.
+                let q_side = self.tensor_names.get(d.t[0] as usize).is_some_and(|n| {
+                    n.starts_with("act.qidx_pf") || n.starts_with("act.widx_f32_pf")
+                });
                 let skip = op == DevOp::DsaQQuant as u16
                     || (op == DevOp::IndexScoreKpool as u16 && d.i[5] != 0)
                     || op == DevOp::IndexSelectPf as u16
                     || (op == DevOp::DsaPoolExpand as u16 && d.i[3] != 1)
-                    || op == DevOp::IndexUnionPf as u16;
+                    || op == DevOp::IndexUnionPf as u16
+                    || q_side;
                 if skip {
                     d.op = DevOp::Nop as u16;
                     self.dsa_pf_dense_chunk = true;
@@ -16741,10 +16762,19 @@ impl AmdEngine {
             .get(step.prog)
             .copied()
             .flatten()
-            .filter(|_| self.sparse_mla.is_some())
+            .filter(|&s| self.sparse_mla.is_some() || self.a2a_sibling[s])
             .filter(|_| self.rowband_on);
         let rowband = sibling.is_some_and(|s| self.rowband_sibling[s]);
-        let prog = rowsplit_chunk_prog(step, self.progs[step.prog].t, sibling, rowband);
+        let mut prog = rowsplit_chunk_prog(step, self.progs[step.prog].t, sibling, rowband);
+        // PLOW_GLM_DSA_PF_A2A: chunks ending at or below PLOW_GLM_DSA_PF_MIN_CTX stay dense.
+        if self.a2a_sibling.get(prog).copied().unwrap_or(false)
+            && crate::config::RuntimeConfig::get()
+                .amd
+                .dsa_pf_min_ctx
+                .is_some_and(|min| step.c0 + step.clen <= min)
+        {
+            prog = step.prog;
+        }
         if prog != step.prog {
             static SAID: std::sync::Once = std::sync::Once::new();
             SAID.call_once(|| {

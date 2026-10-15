@@ -5520,7 +5520,8 @@ __device__ void d_index_score_kpool_rowwave(float* __restrict__ Score,
                                             const int* __restrict__ kv_len, unsigned n_tok,
                                             unsigned pool_stride, unsigned pool_size, float scale,
                                             unsigned slice, unsigned nblk, bf16* ktile,
-                                            float* kslds) {
+                                            float* kslds, unsigned row_begin = 0u,
+                                            unsigned row_end = ~0u) {
     static_assert(HIc == 32 && DI % 16 == 0, "32 heads, whole MFMA k-steps");
     constexpr int NK = DI / MFMA_K;
     constexpr int KSTRIDE = DI + FA_PAD;
@@ -5536,7 +5537,10 @@ __device__ void d_index_score_kpool_rowwave(float* __restrict__ Score,
     const unsigned frow = mfma_frag_row(lane);
     const unsigned mbase = 4 * (lane / 32);
     const unsigned nslab = (pool_stride + TILE_N - 1) / TILE_N;
-    const unsigned ngrp = (n_tok + RG - 1) / RG;
+    /* Band mode (PLOW_GLM_DSA_PF_SHARD): rows [row_begin, row_end) of the n_tok-row chunk. */
+    const unsigned r_end = row_end < n_tok ? row_end : n_tok;
+    const unsigned r_beg = row_begin < r_end ? row_begin : r_end;
+    const unsigned ngrp = (r_end - r_beg + RG - 1) / RG;
     const int len_tok = as_glob(kv_len)[0];
     auto row_len = [&](unsigned b) -> unsigned {
         return (unsigned)(len_tok - (int)n_tok + (int)b + 1) / pool_size;
@@ -5546,8 +5550,8 @@ __device__ void d_index_score_kpool_rowwave(float* __restrict__ Score,
     float wr[16];
     for (unsigned it = slice; it < ngrp * nslab; it += nblk) {
         const unsigned g = it % ngrp, base = (it / ngrp) * TILE_N;
-        const unsigned b0 = g * RG;
-        const unsigned b1 = (b0 + RG < n_tok ? b0 + RG : n_tok);
+        const unsigned b0 = r_beg + g * RG;
+        const unsigned b1 = (b0 + RG < r_end ? b0 + RG : r_end);
         const unsigned lmax = row_len(b1 - 1);
         if (base >= lmax) continue;
         __syncthreads();
@@ -6444,7 +6448,8 @@ __device__ void d_index_select_pf_v2(int* __restrict__ idx, const float* __restr
                                      const int* __restrict__ kv_len, unsigned n_tok,
                                      unsigned top_k, unsigned kv_stride, unsigned slice,
                                      unsigned nblk, unsigned* hist, unsigned* red,
-                                     unsigned pool_size = 1u) {
+                                     unsigned pool_size = 1u, unsigned row_begin = 0u,
+                                     unsigned row_end = ~0u) {
     constexpr unsigned PER = IDXSEL_V2_PER;
     const auto* const Sc = as_glob(Score);
     int* const ib = as_glob(idx);
@@ -6452,9 +6457,10 @@ __device__ void d_index_select_pf_v2(int* __restrict__ idx, const float* __restr
     const unsigned len = (unsigned)as_glob(kv_len)[0];
     const unsigned q_pos0 = len - n_tok;
     unsigned nxt[PER];
+    const unsigned r_end = row_end < n_tok ? row_end : n_tok;
     auto fetch = [&](unsigned t) {
         const unsigned rl = (q_pos0 + t + 1u) / pool_size;
-        const bool want = t < n_tok && rl > top_k && rl <= PER * PLOW_THREADS;
+        const bool want = t < r_end && rl > top_k && rl <= PER * PLOW_THREADS;
         const float* const sr = Sc + (size_t)t * kv_stride;
 #pragma unroll
         for (unsigned u = 0; u < PER; u++) {
@@ -6464,8 +6470,8 @@ __device__ void d_index_select_pf_v2(int* __restrict__ idx, const float* __restr
             nxt[u] = b;
         }
     };
-    fetch(slice);
-    for (unsigned t = slice; t < n_tok; t += nblk) {
+    fetch(row_begin + slice);
+    for (unsigned t = row_begin + slice; t < r_end; t += nblk) {
         const unsigned row_len = (q_pos0 + t + 1u) / pool_size;
         int* const row = ib + (size_t)t * top_k;
         if (row_len <= top_k) {

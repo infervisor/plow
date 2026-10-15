@@ -449,6 +449,13 @@ pub(crate) fn rebase_band_rows(
         }
     };
     for d in insts.iter_mut() {
+        // PLOW_GLM_DSA_PF_SHARD: the band score/select (i6 = band rows) follow the band, so
+        // their rows match the rescaled pool-id all-gather slices.
+        if (d.op == DevOp::IndexScoreKpool as u16 || d.op == DevOp::IndexSelectPf as u16)
+            && d.i[6] == tb
+        {
+            d.i[6] = b;
+        }
         if d.op == DevOp::XReduceScatter as u16 {
             d.i[0] = rescale(d.i[0], t, tp * b);
         } else if d.op == DevOp::XAllGather as u16 {

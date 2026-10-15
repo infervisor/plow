@@ -877,6 +877,15 @@ pub struct EmitConfig {
     /// op 119 is marked skipped; objects without the arm run both ops as before.
     #[arg(long, env = "PLOW_GLM_DSA_SEL_UNION", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
     pub glm_dsa_sel_union: bool,
+    /// Pooled DSA prefill: each TP rank scores and selects its own `T/tp` query band (q index
+    /// projection, quant, score, top-k), then one all-gather of the pool ids through peer slot 4.
+    #[arg(long, env = "PLOW_GLM_DSA_PF_SHARD", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
+    pub glm_dsa_pf_shard: bool,
+    /// Pooled DSA prefill on a row-split sibling of the 8192 rung: each TP rank selects for its
+    /// own `T/tp` query band and attends it at all heads after a q all-to-all; the ordinary rung
+    /// stays dense and only writes the indexer pool cache.
+    #[arg(long, env = "PLOW_GLM_DSA_PF_A2A", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
+    pub glm_dsa_pf_a2a: bool,
 
     /// Set by [`super::apply_production_defaults`] when this emit is the QUALIFIED GLM target —
     /// gfx942, TP8, 304 CU. The nine knobs whose accessors read it are `Option<bool>` precisely
@@ -1922,6 +1931,8 @@ impl EmitConfig {
             glm_dsa_kw_dual: env_bool("PLOW_GLM_DSA_KW_DUAL"),
             glm_dsa_fuse: env_bool("PLOW_GLM_DSA_FUSE"),
             glm_dsa_sel_union: env_bool("PLOW_GLM_DSA_SEL_UNION"),
+            glm_dsa_pf_shard: env_bool("PLOW_GLM_DSA_PF_SHARD"),
+            glm_dsa_pf_a2a: env_bool("PLOW_GLM_DSA_PF_A2A"),
             glm_production_defaults: false,
             glm_fp8_kv: env_bool_opt("PLOW_GLM_FP8_KV"),
             glm_moe_aiter: env_bool_opt("PLOW_GLM_MOE_AITER"),
