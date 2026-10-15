@@ -602,7 +602,10 @@ The packet from config + index alone (no weights) is 70 MB: 4 prefill buckets + 
   MATCHED/EQUIVALENT: 0.68-0.94x vLLM (c64 isl1024/4096/16384 0.62/0.70/0.76 -> 0.70/0.77/0.80). DSA prefill (K,
   v19-pf, default off): native select v2 + row-wave kpool score cut the indexer chain 5.5 -> 2.1 ms per MLA layer;
   all-sparse gates PASS kl 0.0195; prefill 61k 1711 -> 1679 ms, still slower at 8k-32k (chunks with <= 8k context
-  gain nothing from sparse). No qualified win. Recipe -> v20.
+  gain nothing from sparse); `PLOW_GLM_DSA_PF_MIN_CTX=16384` (dense below the threshold): 8k/16k/32k/61k
+  179.6/376.2/807.3/1675 ms vs dense 169.9/354.1/779.6/1711, TTFT p50 c1/c8 61k 1758/2801 vs 1801/2897 ms (vLLM c1
+  1350), 32k ~4% worse. Branch v19-pf 1b249e77. Next: row-shard score/select across TP ranks (the chain runs
+  replicated on all 8), FP8 MFMA score, skip the q-index chain under MIN_CTX. No qualified win. Recipe -> v20.
 - 00:35 UTC (10-15), v19 (29af24ff; packet 540ba4fa; plowrt 84e6ac15): second lever round. Taken: G —
   `PLOW_GLM53_GEMM_LT_DEC` (all nine decode projections of rungs 8/32/128 as hipBLASLt gfx950 kernels from a 6.8 MB
   sha-pinned 26-kernel subset image, each at its own workgroup size; partial routing loses ~30 us per interpreter
