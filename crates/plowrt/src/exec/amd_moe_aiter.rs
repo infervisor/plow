@@ -1198,8 +1198,19 @@ impl MoeAiter {
                     .ok_or_else(|| {
                         RuntimeError::Device("gfx950 AITER MoE rows exceed 8192".into())
                     })?;
+                let cfg = &crate::config::RuntimeConfig::get().amd;
+                // PLOW_AMD_MOE_DEC_TILES: measured at the GLM-5.3 TP8 decode rungs (1k context,
+                // kernel-only in situ): 16x128 at 32 rows 90.3 -> 84.6 us, 32x256 at 128 rows
+                // 141.8 -> 134.2 us.
+                if cfg.moe_dec_tiles {
+                    if route.rows <= 32 {
+                        (i, tile) = (0, &GFX950_TILES[0]);
+                    } else if route.rows <= 256 {
+                        (i, tile) = (1, &GFX950_TILES[1]);
+                    }
+                }
                 // PLOW_AMD_MOE_TILE_DEC (diagnostic): force a tile at the decode rungs.
-                if let Some(f) = crate::config::RuntimeConfig::get().amd.moe_tile_dec {
+                if let Some(f) = cfg.moe_tile_dec {
                     if route.rows <= 256 && (f as usize) < GFX950_TILES.len() {
                         (i, tile) = (f as usize, &GFX950_TILES[f as usize]);
                     }

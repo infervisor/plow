@@ -456,7 +456,9 @@ extern "C" __global__ __launch_bounds__(256) void plow_moe_router_topk(MoeRouter
         key[q] = ((unsigned long long)sb << 20) | (unsigned long long)((a.n_exp - 1u - e) & 0xFFFFFu);
     }
     /* k rounds of a wave-wide max over the packed keys (unique per expert, so the winner is
-     * one lane and one slot): the same order the rank-by-comparison form produces. */
+     * one lane and one slot): the same order the rank-by-comparison form produces. The round
+     * reduces the 32 high key bits (the ordered biased score) through DPP and settles equal
+     * scores, which are rare, with a 64-bit shuffle reduction. */
     for (unsigned j = 0; j < a.k; j++) {
         unsigned long long best = 0ull;
         unsigned bq = 0u;
@@ -468,14 +470,29 @@ extern "C" __global__ __launch_bounds__(256) void plow_moe_router_topk(MoeRouter
                 bq = q;
                 bs = s[q];
             }
-        unsigned long long m = best;
+        const unsigned hi = (unsigned)(best >> 32);
+        unsigned m = hi;
+        m = max(m, (unsigned)__builtin_amdgcn_update_dpp(0, (int)m, 0xb1, 0xf, 0xf, true));
+        m = max(m, (unsigned)__builtin_amdgcn_update_dpp(0, (int)m, 0x4e, 0xf, 0xf, true));
+        m = max(m, (unsigned)__builtin_amdgcn_update_dpp(0, (int)m, 0x141, 0xf, 0xf, true));
+        m = max(m, (unsigned)__builtin_amdgcn_update_dpp(0, (int)m, 0x140, 0xf, 0xf, true));
+        m = max(m, (unsigned)__builtin_amdgcn_ds_swizzle((int)m, (16 << 10) | 31));
+        m = max(m, (unsigned)__shfl_xor((int)m, 32, 64));
+        const unsigned long long cand = __ballot(hi == m && best != 0ull);
+        bool take;
+        if (__popcll(cand) == 1) {
+            take = lane == (unsigned)(__ffsll((long long)cand) - 1);
+        } else {
+            unsigned long long win = hi == m ? best : 0ull;
 #pragma unroll
-        for (unsigned o = 32; o >= 1; o >>= 1) {
-            const unsigned lo = __shfl_xor((unsigned)m, o), hi = __shfl_xor((unsigned)(m >> 32), o);
-            const unsigned long long v = ((unsigned long long)hi << 32) | lo;
-            m = v > m ? v : m;
+            for (unsigned o = 32; o >= 1; o >>= 1) {
+                const unsigned lo = __shfl_xor((unsigned)win, o), h2 = __shfl_xor((unsigned)(win >> 32), o);
+                const unsigned long long v = ((unsigned long long)h2 << 32) | lo;
+                win = v > win ? v : win;
+            }
+            take = win != 0ull && best == win;
         }
-        if (m != 0ull && best == m) {
+        if (take) {
             wl[j] = lane + bq * 64u;
             ws[j] = bs;
 #pragma unroll

@@ -2308,10 +2308,17 @@ pub struct AmdRuntimeConfig {
     /// Diagnostic: force `GFX950_TILES[i]` for AITER MoE calls of at most 256 rows.
     #[arg(long = "amd-moe-tile-dec", env = "PLOW_AMD_MOE_TILE_DEC", global = true)]
     pub moe_tile_dec: Option<u32>,
+    /// GLM-5.3 gfx950 AITER MoE: 16x128 up to 32 rows and 32x256 up to 256 rows (decode rungs).
+    #[arg(long = "amd-moe-dec-tiles", env = "PLOW_AMD_MOE_DEC_TILES", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
+    pub moe_dec_tiles: bool,
     /// Decode rungs: adjacent native (hipBLASLt) GEMMs with no data dependence on each other
     /// launch without the AQL barrier bit, so they run concurrently.
     #[arg(long = "amd-lt-overlap", env = "PLOW_AMD_LT_OVERLAP", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
     pub lt_overlap: bool,
+    /// Decode rungs: adjacent native GEMMs of one input (GLM-5.3's KDA in-projection) run as
+    /// one split-K MFMA pass from `glm_inproj_gfx950.elf`.
+    #[arg(long = "amd-lt-fuse", env = "PLOW_AMD_LT_FUSE", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
+    pub lt_fuse: bool,
 }
 
 /// Global runtime config, initialized once at startup from CLI parse.

@@ -699,6 +699,28 @@ fn lt_overlaps_run(before: &[DecodeSegmentRoute], inst: &packet::dev::DevInst64)
     any
 }
 
+/// `plow_glm_inproj_*` kernargs (runtime/amd/glm_inproj.hip `InprojArgs`).
+#[derive(Clone, Copy, Debug, Default)]
+#[repr(C)]
+struct InprojPartArgs {
+    w: u64,
+    out: u64,
+    n: u32,
+    blk0: u32,
+}
+
+#[derive(Clone, Copy, Debug)]
+#[repr(C)]
+struct InprojArgs {
+    x: u64,
+    partial: u64,
+    parts: [InprojPartArgs; 8],
+    m: u32,
+    k: u32,
+    nparts: u32,
+    blocks: u32,
+}
+
 /// `plow_moe_router_gemm` kernargs (runtime/amd/moe_aiter_adapter.hip `MoeRouterGemmArgs`).
 #[derive(Clone, Copy, Debug)]
 #[repr(C)]
@@ -742,7 +764,7 @@ struct XrNativeArgs {
     rank: u32,
     nranks: u32,
     two_shot: u32,
-    pad: u32,
+    ag_count: u32,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -3751,6 +3773,10 @@ enum DecodeSegmentRoute {
     MoeAiter(amd_moe_aiter::Route),
     GemmLt(amd_gemm_lt::Route),
     XrNative(packet::dev::DevInst64),
+    /// `PLOW_AMD_LT_FUSE`: native decode GEMMs of one input, as `glm_inproj_gfx950.elf`'s pair.
+    LtFused(LtFusedRoute),
+    /// A segment whose work an earlier `LtFused` already did.
+    Skip,
     RouterNative {
         gemm: packet::dev::DevInst64,
         topk: packet::dev::DevInst64,
@@ -4071,7 +4097,86 @@ fn decode_segment_routes(
         };
         routes.push(DecodeSegmentRoute::KdaDecodeFused(a));
     }
+    if crate::config::RuntimeConfig::get().amd.lt_fuse {
+        fuse_lt_runs(&mut routes);
+    }
     Ok(routes)
+}
+
+/// `PLOW_AMD_LT_FUSE` operands: `parts` share the input `x` ([m, k] bf16).
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct LtFusedRoute {
+    x: u16,
+    m: u32,
+    k: u32,
+    n_parts: u32,
+    /// (weight, output, columns) per part.
+    parts: [(u16, u16, u32); 8],
+}
+
+const LT_FUSE_KS: u32 = 512;
+const LT_FUSE_SCRATCH: u64 = 32 << 20;
+
+fn lt_fuse_blocks(r: &LtFusedRoute) -> u32 {
+    r.parts[..r.n_parts as usize].iter().map(|p| p.2.div_ceil(16)).sum()
+}
+
+/// Group each run of adjacent native decode GEMMs that read the same `[m, k]` input into one
+/// fused launch at the run's first segment. A GEMM between members may stay where it is when
+/// moving the members ahead of it changes nothing it reads or writes.
+fn fuse_lt_runs(routes: &mut [DecodeSegmentRoute]) {
+    let lt = |r: &DecodeSegmentRoute| match r {
+        DecodeSegmentRoute::GemmLt(g) => Some(*g.inst()),
+        _ => None,
+    };
+    let mut i = 0;
+    while i < routes.len() {
+        let Some(head) = lt(&routes[i]) else {
+            i += 1;
+            continue;
+        };
+        let (x, m, k) = (head.t[1], head.i[0], head.i[2]);
+        let ok_shape = |d: &packet::dev::DevInst64| {
+            d.t[1] == x && d.i[0] == m && d.i[2] == k && m <= 128 && k % LT_FUSE_KS == 0
+        };
+        if !ok_shape(&head) {
+            i += 1;
+            continue;
+        }
+        let mut members = vec![i];
+        let mut others: Vec<usize> = Vec::new();
+        let mut j = i + 1;
+        while j < routes.len() && members.len() < 8 {
+            let Some(d) = lt(&routes[j]) else { break };
+            let clash_with_others = others.iter().any(|&o| {
+                let od = lt(&routes[o]).unwrap();
+                // Hoisting `d` ahead of `od`: `d` must not write what `od` reads or writes.
+                od.t[1] == d.t[0] || od.t[2] == d.t[0] || od.t[0] == d.t[0] || od.t[0] == x
+            });
+            let clash_with_members = members.iter().any(|&o| lt(&routes[o]).unwrap().t[0] == d.t[0]);
+            if ok_shape(&d) && !clash_with_others && !clash_with_members && d.t[0] != x {
+                members.push(j);
+            } else {
+                others.push(j);
+            }
+            j += 1;
+        }
+        let blocks: u32 = members.iter().map(|&o| lt(&routes[o]).unwrap().i[1].div_ceil(16)).sum();
+        let scratch = u64::from(k / LT_FUSE_KS) * u64::from(m) * u64::from(blocks) * 16 * 4;
+        if members.len() >= 2 && scratch <= LT_FUSE_SCRATCH {
+            let mut parts = [(0u16, 0u16, 0u32); 8];
+            for (slot, &o) in parts.iter_mut().zip(&members) {
+                let d = lt(&routes[o]).unwrap();
+                *slot = (d.t[2], d.t[0], d.i[1]);
+            }
+            let fused = LtFusedRoute { x, m, k, n_parts: members.len() as u32, parts };
+            for &o in &members[1..] {
+                routes[o] = DecodeSegmentRoute::Skip;
+            }
+            routes[i] = DecodeSegmentRoute::LtFused(fused);
+        }
+        i = j.max(i + 1);
+    }
 }
 
 /// Op 125 descriptor version 3: the batched-rung chain (`kda_decode_wide.hip`, grid rows*heads).
@@ -7462,6 +7567,9 @@ pub struct AmdEngine {
     k_xr_native: Option<HsaKernel>,
     /// `PLOW_AMD_ROUTER_NATIVE`: `plow_moe_router_gemm` / `_topk` from the gfx950 MoE adapter.
     k_router_native: Option<[HsaKernel; 2]>,
+    /// `PLOW_AMD_LT_FUSE`: `plow_glm_inproj_partial` / `_reduce` and their f32 split-K scratch.
+    k_inproj: Option<[HsaKernel; 2]>,
+    d_inproj: Option<DeviceMem>,
     k_moe_w8a8_dec: Option<[HsaKernel; 3]>,
     k_grouped_moe_glu: Option<HsaKernel>,
     k_grouped_moe_down: Option<HsaKernel>,
@@ -9624,6 +9732,42 @@ impl AmdEngine {
             None
         };
 
+        let (k_inproj, d_inproj) = if crate::config::RuntimeConfig::get().amd.lt_fuse {
+            const NAME: &str = "glm_inproj_gfx950.elf";
+            const MARKER: &str = "plow_glm_inproj_abi_1";
+            let path = hsaco_dir.join(NAME);
+            let image = std::fs::read(&path).map_err(|e| {
+                RuntimeError::Device(format!(
+                    "PLOW_AMD_LT_FUSE requires standalone object {}: {e}",
+                    path.display()
+                ))
+            })?;
+            if !elf_symbol_names(&image).contains(&MARKER) {
+                return Err(RuntimeError::Device(format!(
+                    "{} does not advertise `{MARKER}`; refusing a stale object",
+                    path.display()
+                )));
+            }
+            let module = EngineDevice::module_load(&*be, &image)
+                .map_err(|e| RuntimeError::Device(format!("{}: {e}", path.display())))?;
+            let mut ks = Vec::with_capacity(2);
+            for sym in ["plow_glm_inproj_partial", "plow_glm_inproj_reduce"] {
+                let k = EngineDevice::get_function(&*be, &module, sym)
+                    .map_err(|e| RuntimeError::Device(format!("{NAME}: no symbol {sym}: {e}")))?;
+                let want = std::mem::size_of::<InprojArgs>();
+                if (k.kernarg_size() as usize) < want || k.private_segment_size() != 0 {
+                    return Err(RuntimeError::Device(format!(
+                        "{NAME}: {sym} kernarg segment is {} B (ABI needs {want}) or private memory is used",
+                        k.kernarg_size()
+                    )));
+                }
+                ks.push(k);
+            }
+            modules.push(module);
+            (Some([ks[0], ks[1]]), Some(EngineDevice::alloc(&*be, LT_FUSE_SCRATCH)?))
+        } else {
+            (None, None)
+        };
         let k_router_native = if crate::config::RuntimeConfig::get().amd.router_native {
             const NAME: &str = "moe_aiter_adapter_gfx950.elf";
             const MARKER: &str = "plow_moe_router_abi_1";
@@ -13221,6 +13365,8 @@ impl AmdEngine {
             k_hc_aiter,
             k_xr_native,
             k_router_native,
+            k_inproj,
+            d_inproj,
             k_moe_w8a8_dec,
             k_grouped_moe_glu,
             k_grouped_moe_down,
@@ -15248,6 +15394,8 @@ impl AmdEngine {
             Some(DecodeSegmentRoute::MoeW8a8Dec { .. }) => 2,
             Some(DecodeSegmentRoute::HcAiter(_)) => 2,
             Some(DecodeSegmentRoute::RouterNative { .. }) => 2,
+            Some(DecodeSegmentRoute::LtFused(_)) => 2,
+            Some(DecodeSegmentRoute::Skip) => 0,
             Some(DecodeSegmentRoute::MoeW8a8DecPair { .. }) => 1,
             Some(_) => 1,
             None => 0,
@@ -16016,6 +16164,52 @@ impl AmdEngine {
                 }
                 kernel.enqueue(&self.be, route, &self.tens_table)?;
             }
+            DecodeSegmentRoute::Skip => {}
+            DecodeSegmentRoute::LtFused(r) => {
+                let [kp, kr] = self.k_inproj.ok_or_else(|| {
+                    RuntimeError::Device("PLOW_AMD_LT_FUSE segment has no loaded kernels".into())
+                })?;
+                let scratch = self.d_inproj.as_ref().map(|m| m.base).ok_or_else(|| {
+                    RuntimeError::Device("PLOW_AMD_LT_FUSE has no scratch".into())
+                })?;
+                let addr = |h: u16| {
+                    let at = usize::from(h) * 8;
+                    u64::from_le_bytes(self.tens_table[at..at + 8].try_into().unwrap())
+                };
+                let mut parts = [InprojPartArgs::default(); 8];
+                let mut blk0 = 0;
+                for (dst, &(w, out, n)) in parts.iter_mut().zip(&r.parts[..r.n_parts as usize]) {
+                    *dst = InprojPartArgs { w: addr(w), out: addr(out), n, blk0 };
+                    blk0 += n.div_ceil(16);
+                }
+                let args = InprojArgs {
+                    x: addr(r.x),
+                    partial: scratch,
+                    parts,
+                    m: r.m,
+                    k: r.k,
+                    nparts: r.n_parts,
+                    blocks: lt_fuse_blocks(&r),
+                };
+                // runtime/amd/glm_inproj.hip: m rows of (KS + 8) bf16.
+                self.be.launch_3d_lds(
+                    kp,
+                    [args.blocks.div_ceil(4), r.k / LT_FUSE_KS, 1],
+                    256,
+                    r.m * (LT_FUSE_KS + 8) * 2,
+                    as_bytes(std::slice::from_ref(&args)),
+                )?;
+                EngineDevice::launch_kernel(
+                    &*self.be,
+                    kr,
+                    (r.m * args.blocks * 16).div_ceil(256),
+                    256,
+                    0,
+                    as_bytes(std::slice::from_ref(&args)),
+                    None,
+                )?;
+                self.seg_launches += 1;
+            }
             DecodeSegmentRoute::RouterNative { gemm, topk } => {
                 let [kg, kt] = self.k_router_native.ok_or_else(|| {
                     RuntimeError::Device("PLOW_AMD_ROUTER_NATIVE segment has no loaded kernels".into())
@@ -16090,12 +16284,19 @@ impl AmdEngine {
                     nranks: inst.i[1],
                     // 2 = the peer-parallel two-shot in xr_native.hip (op_collective.h's is 1).
                     two_shot: u32::from(two_shot) * 2,
-                    pad: 0,
+                    ag_count: u32::from(inst.blocks),
+                };
+                // The peer-parallel two-shot moves one 16-byte pack per lane per peer: one
+                // 64-lane group per 64 packs of this rank's slice.
+                let grid = if two_shot {
+                    (inst.i[0] / 64).div_ceil(64).max(1)
+                } else {
+                    u32::from(inst.blocks).max(1)
                 };
                 EngineDevice::launch_kernel(
                     &*self.be,
                     kernel,
-                    u32::from(inst.blocks).max(1),
+                    grid,
                     512,
                     0,
                     as_bytes(std::slice::from_ref(&args)),

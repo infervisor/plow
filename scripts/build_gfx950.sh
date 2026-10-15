@@ -453,6 +453,12 @@ if [ "$ARCH" = gfx950 ]; then
     -DPLOW_LEAN_OBJECT=1 -DPLOW_NO_SPILL=1 -DPLOW_XR_MLP=1 -DPLOW_XR_AGG=1 \
     -DPLOW_REQUIRED_MARKER=plow_xr_native_abi_1 \
     -I"$R/amd" -I"$R/common" "$R/amd/xr_native.hip"
+  # PLOW_AMD_LT_FUSE: decode GEMMs of one input (GLM-5.3 KDA in-projection) as one split-K pass.
+  bash "$R/cmake/hipcc_hsaco.sh" hipcc "$BUN" "$ARCH" \
+    "$OUT/glm_inproj_gfx950.elf" plow_glm_inproj_partial 256 1 \
+    -DPLOW_LEAN_OBJECT=1 -DPLOW_NO_SPILL=1 \
+    -DPLOW_REQUIRED_MARKER=plow_glm_inproj_abi_1 \
+    -I"$R/amd" -I"$R/common" "$R/amd/glm_inproj.hip"
 fi
 
 # Delete FIRST. A build that fails must leave nothing behind to run.
