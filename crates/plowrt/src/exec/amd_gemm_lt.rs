@@ -33,6 +33,10 @@ impl Route {
         [self.inst.t[0], self.inst.t[1]]
     }
 
+    pub fn inst(&self) -> &DevInst64 {
+        &self.inst
+    }
+
     pub fn rebase(&mut self, rows: u32) -> Result<()> {
         // A band GEMM covers this rank's fixed `T/8` rows whatever the chunk carries.
         let cap = if self.inst.i[3] == 2 {

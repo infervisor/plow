@@ -1024,6 +1024,8 @@ pub struct HsaBackend {
     done_signal: HsaSignal,
     /// `PLOW_AMD_DISPATCH_TIMES`: per-slot completion signals on a profiling queue.
     dtimes: Option<Box<DispatchTimes>>,
+    /// Clear the barrier bit of the next dispatch only (`skip_next_barrier`).
+    no_barrier_once: std::sync::atomic::AtomicBool,
     karg_ring: *mut u8,
     /// `karg_ring` is VRAM mapped through the large BAR (`PLOW_AMD_KERNARG_VRAM`): every slot is
     /// staged on the stack, copied through the BAR and made visible before its header is published.
@@ -1042,8 +1044,6 @@ pub struct HsaBackend {
     chain_next: AtomicU64,
     chain_end: AtomicU64,
     chain_immediate: std::sync::atomic::AtomicBool,
-    /// PLOW_AMD_LT_CONCURRENT: the next dispatch packet omits the barrier bit (one-shot).
-    no_barrier_next: std::sync::atomic::AtomicBool,
     /// PLOW_AMD_KARG_CHAIN_FLUSH: the last VRAM kernarg slot written into the open deferred
     /// chain (address, size, last byte), read back once at commit instead of per packet.
     chain_karg: std::sync::Mutex<Option<(usize, usize, u8, [u8; KARG_SLOT])>>,
@@ -1439,6 +1439,7 @@ impl HsaBackend {
             queue,
             done_signal,
             dtimes,
+            no_barrier_once: std::sync::atomic::AtomicBool::new(false),
             karg_ring: karg_ring as *mut u8,
             karg_vram,
             device_name,
@@ -1451,7 +1452,6 @@ impl HsaBackend {
             chain_next: AtomicU64::new(0),
             chain_end: AtomicU64::new(CHAIN_IDLE),
             chain_immediate: std::sync::atomic::AtomicBool::new(false),
-            no_barrier_next: std::sync::atomic::AtomicBool::new(false),
             chain_karg: std::sync::Mutex::new(None),
             kernarg_retirement: super::kernarg_retirement::KernargRetirement::new(),
             zero_stage: parking_lot::Mutex::new(None),
@@ -2665,9 +2665,9 @@ impl HsaBackend {
         } else {
             1
         };
-        let barrier = !self.no_barrier_next.swap(false, Ordering::Relaxed);
+        let barrier = u16::from(!self.no_barrier_once.swap(false, Ordering::Relaxed));
         let header: u16 = (HSA_PACKET_TYPE_KERNEL_DISPATCH << HSA_PACKET_HEADER_TYPE) as u16
-            | (u16::from(barrier) << HSA_PACKET_HEADER_BARRIER)
+            | (barrier << HSA_PACKET_HEADER_BARRIER) as u16
             | ((pkt_knobs().acquire << HSA_PACKET_HEADER_SCACQUIRE_FENCE_SCOPE) as u16)
             | ((pkt_knobs().release << HSA_PACKET_HEADER_SCRELEASE_FENCE_SCOPE) as u16);
         let setup: u16 = (dims << HSA_KERNEL_DISPATCH_PACKET_SETUP_DIMENSIONS as u16) as u16;
@@ -4091,19 +4091,18 @@ impl HsaBackend {
             .map_err(kernarg_retirement_error)
     }
 
-    /// The next dispatch packet omits the AQL barrier bit, so it may start before earlier
-    /// packets complete. The caller guarantees it is independent of every packet queued since
-    /// the last barrier packet.
-    pub fn no_barrier_next(&self) {
-        self.no_barrier_next.store(true, Ordering::Relaxed);
-    }
-
     /// Launch `f` over `grid` workgroups of `block` threads.
     ///
     /// `grid` is in WORKGROUPS, matching the CUDA engine's call sites; an AQL
     /// dispatch counts threads, so it is multiplied here. Getting that
     /// backwards launches 256 workgroups' worth of threads as one workgroup, or
     /// 65536 workgroups — both of which the packet processor accepts.
+    /// The next dispatch may start before earlier packets finish (AQL barrier bit clear). The
+    /// caller guarantees it neither reads what those packets write nor writes what they touch.
+    pub fn skip_next_barrier(&self) {
+        self.no_barrier_once.store(true, Ordering::Relaxed);
+    }
+
     pub fn launch(
         &self,
         f: HsaKernel,
