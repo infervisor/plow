@@ -688,6 +688,13 @@ fn decode_segment_kinds(prog: &DevProg) -> Result<Vec<DecodeSegmentKind>> {
         if e.flags & SE_XCTR != 0 {
             continue;
         }
+        // A signalling raw router (ROUTER_RAW_SIGNAL) is serviced by its kernel, which bumps the
+        // counter its next segment waits on.
+        if prog.insts.get(e.inst as usize).is_some_and(|i| {
+            router_raw(i) && i.i[5] & packet::dev::ROUTER_RAW_SIGNAL != 0
+        }) {
+            continue;
+        }
         let end = e.succ_ofs as usize + e.succ_len as usize;
         let succs = prog.succs.get(e.succ_ofs as usize..end).ok_or_else(|| {
             RuntimeError::Device(format!(
