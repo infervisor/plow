@@ -5,11 +5,8 @@
  * d_gemv_bf16_f32 at M = 1 (one wave per output, so every logit is the interpreter's bits), and the
  * last of them to finish runs d_moe_router_topk over the row (op 83's per-token body, with its
  * shared-expert tail slot). Table bytes are identical to the GemmF32 -> top-k packet pair.
- * plow_router_decode8 (eight rows) runs `per_row` workgroups: each wave owns one column for all
- * eight rows (d_gemv_bf16_f32_tile, same bits as the vector walk), so W crosses L2 once;
- * workgroups 0..7 then wait for every arrival and run row b's top-k. The grid (<= 64 WGs) is
- * co-resident. With `signal_add` set (ROUTER_RAW_SIGNAL) the top-k workgroup adds it to the
- * interpreter counter at `signal` once the table is written. */
+ * With `signal_add` set (ROUTER_RAW_SIGNAL) the top-k workgroup adds it to the interpreter
+ * counter at `signal` once the table is written. */
 #include "amd_common.h"
 #include "op_gemm.h"
 #include "op_moe.h"
@@ -64,29 +61,4 @@ extern "C" __global__ __launch_bounds__(PLOW_THREADS) void plow_router_decode(Ro
     if (a.signal_add && threadIdx.x == 0)
         __hip_atomic_fetch_add(a.signal, a.signal_add, __ATOMIC_RELEASE,
                                __HIP_MEMORY_SCOPE_AGENT);
-}
-
-extern "C" __global__ __launch_bounds__(PLOW_THREADS) void plow_router_decode8(RouterDecodeArgs a) {
-    __shared__ float lds[4096];
-    if (a.rows != 8u || blockDim.x != PLOW_THREADS) __builtin_trap();
-    d_gemv_bf16_f32_tile<8, 1>(a.logit, a.x, a.w, 8u, a.n_exp, a.k_dim, blockIdx.x, a.per_row);
-    __syncthreads();
-    if (threadIdx.x == 0) {
-        __hip_atomic_fetch_add(a.ctr, 1u, __ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_AGENT);
-        if (blockIdx.x < 8u) {
-            while (__hip_atomic_load(a.ctr, __ATOMIC_ACQUIRE, __HIP_MEMORY_SCOPE_AGENT) <
-                   a.per_row)
-                __builtin_amdgcn_s_sleep(1);
-            const unsigned gone = __hip_atomic_fetch_add(a.ctr + 32, 1u, __ATOMIC_ACQ_REL,
-                                                         __HIP_MEMORY_SCOPE_AGENT);
-            if (gone == 7u) {
-                __hip_atomic_store(a.ctr, 0u, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
-                __hip_atomic_store(a.ctr + 32, 0u, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
-            }
-        }
-    }
-    if (blockIdx.x >= 8u) return;
-    asm volatile("buffer_inv" ::: "memory");
-    __syncthreads();
-    router_topk_row(a, blockIdx.x, lds);
 }
