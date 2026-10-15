@@ -82,8 +82,8 @@ class ShadowTest(unittest.TestCase):
         # the hybrid allocator also the previous reply's whole 16-row blocks.
         self.assertGreater(out["i"]["cached"], 0.6)
         self.assertGreater(out["iv"]["cached"], out["i"]["cached"])
-        self.assertLess(out["iv"]["structural"], out["i"]["structural"])
-        self.assertAlmostEqual(out["i"]["capacity"], 0.0)
+        self.assertLess(out["iv"]["struct"], out["i"]["struct"])
+        self.assertAlmostEqual(out["i"]["budget_delta"], 0.0)
         # The second conversation's first turn finds the system prompt's shared end.
         self.assertGreater(out["i"]["att"], 0)
 
@@ -91,9 +91,18 @@ class ShadowTest(unittest.TestCase):
         recs = trace([conv(c) for c in range(12)])
         path = write(recs)
         tight = pfx_shadow.main([path, "--skip-s", "0", "--budget-mib", "600", "--scale", "", "--only", "i,iv"])
-        self.assertGreater(tight["i"]["capacity"], 0.05)
+        self.assertGreater(tight["i"]["budget_delta"], 0.05)
         a = tight["traced"]
         self.assertEqual(sum(a["cats"].values()), a["prompt"] - a["att"])
+
+    def test_kv_is_reusable_only_once_computed(self):
+        recs = trace([conv(0, 1)])
+        twin = dict(recs[0], rid=2, t_att=recs[0]["t_att"] + 0.01, t_fin=recs[0]["t_fin"] + 0.01,
+                    ideal=recs[0]["prompt"], ideal_rid=1)
+        path = write(recs + [twin])
+        out = pfx_shadow.main([path, "--skip-s", "0", "--budget-mib", "1e9", "--scale", "", "--only", "i,iv"])
+        self.assertEqual(out["i"]["att"], 0, "the twin attached before its sibling's prefill finished")
+        self.assertEqual(out["iv"]["att"], 0)
 
     def test_finer_full_blocks_shrink_the_snapshot_tail(self):
         c = pfx_shadow.Costs(HEADER)

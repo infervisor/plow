@@ -1115,10 +1115,7 @@ pub(super) fn trace_init(v: &VmmServe) {
         return;
     };
     let g = kv.geometry();
-    let (block_bytes, cache_cap, min_free) = kv.budget();
-    crate::obs::pfx_trace::init(crate::obs::pfx_trace::Header {
-        block_rows: kv.block_rows(),
-        block_bytes,
+    let mut h = crate::obs::pfx_trace::Header {
         full_layers: g.full_layers.len() as u32,
         kvh_full: g.kvh_full,
         hd_full: g.hd_full,
@@ -1133,10 +1130,13 @@ pub(super) fn trace_init(v: &VmmServe) {
         max_ctx: g.max_ctx,
         batch: g.batch,
         snap_row_bytes: v.snap_row_bytes,
-        cache_cap,
-        min_free,
         host_cap: crate::config::RuntimeConfig::get().vmm_host_cache_bytes(),
-    });
+        boundary_quantum: 32,
+        prompt_end_backoff: 1 + SESSION_PROMPT_REWRITE,
+        ..Default::default()
+    };
+    kv.trace_header(&mut h);
+    crate::obs::pfx_trace::init(h);
 }
 
 /// Rows a prompt-end boundary may cover: the next turn re-renders the last few prompt

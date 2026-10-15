@@ -27,6 +27,9 @@ const TRIE_CAP_TOKENS: usize = 256 << 20;
 /// Registry entries kept before the oldest half is forgotten.
 const REGISTRY_CAP: usize = 1 << 22;
 const FLUSH_EVERY: Duration = Duration::from_secs(1);
+const SCHEMA: u32 = 1;
+/// `h16` and boundary identities: [`prefix_hashes`] (64-bit, per token).
+const HASH_NAME: &str = "splitmix64-chain/token";
 const STATS_EVERY: Duration = Duration::from_secs(10);
 /// An arrival not attached within this many seconds is not this attach's.
 const ARRIVAL_STALE_S: f64 = 120.0;
@@ -105,7 +108,7 @@ pub fn flush(timeout: Duration) -> bool {
     }
     ack_rx
         .recv_timeout(deadline.saturating_duration_since(Instant::now()))
-        .is_ok()
+        .unwrap_or(false)
 }
 
 /// Queue `ev` for the writer; a full queue drops it (counted in the `stats` record).
@@ -175,8 +178,8 @@ fn writer(rx: Receiver<Event>, mut out: impl Write, epoch: Instant, wall: f64) {
         match rx.recv_timeout(FLUSH_EVERY) {
             Ok(Event::Flush(ack)) => {
                 a.finish_all(&mut out);
-                let _ = out.flush();
-                let _ = ack.send(());
+                a.stats(&mut out, DROPPED.load(Ordering::Relaxed));
+                let _ = ack.send(out.flush().is_ok());
             }
             Ok(ev) => a.handle(ev, &mut out),
             Err(RecvTimeoutError::Timeout) => {}
@@ -300,6 +303,16 @@ pub struct Header {
     pub cache_cap: u64,
     pub min_free: u64,
     pub host_cap: u64,
+    /// Publication rules the shadow replay models: boundaries are multiples of
+    /// `boundary_quantum` rows, a prompt end backs off `prompt_end_backoff` rows, FP8 strict
+    /// publish, and the shared-prefix end test (`recent_prompts` heads of `recent_rows` rows,
+    /// `share_min_rows` past the attach).
+    pub boundary_quantum: u32,
+    pub prompt_end_backoff: u32,
+    pub strict_publish: bool,
+    pub share_min_rows: u32,
+    pub recent_prompts: u32,
+    pub recent_rows: u32,
 }
 
 #[derive(Debug)]
@@ -357,7 +370,7 @@ pub enum Event {
         tokens: Vec<u32>,
     },
     /// Write in-flight requests, flush, ack ([`flush`]).
-    Flush(SyncSender<()>),
+    Flush(SyncSender<bool>),
 }
 
 /// `vmm::Kind` bits, as `VmmStats` attributes attach kinds.
@@ -607,8 +620,9 @@ struct Record {
     ideal_src: Option<&'static str>,
     /// The request whose prompt or output last covered the ideal match end (conversation hint).
     ideal_rid: Option<u64>,
-    /// That request had not finished at this attach (its KV may not have been computed yet).
-    ideal_inflight: bool,
+    /// Token LCP with the finished sequences only: rows past it were seen only in requests still
+    /// in flight at this attach (their KV may not exist yet).
+    ideal_ready: u32,
     /// Rows of whole radix blocks matched.
     radix: u32,
     att: u32,
@@ -625,6 +639,9 @@ struct Record {
     session: Option<u64>,
     tenant: Option<u64>,
     unwound: bool,
+    /// Events the bounded queue had dropped when this record was written: nonzero means the
+    /// reconstructed boundary registry may be incomplete from here on.
+    dropped_events: u64,
     /// Prefix hash of the computed sequence at every 16th row (`h16[k]` = rows `16(k+1)`).
     h16: Vec<String>,
 }
@@ -633,7 +650,10 @@ struct Record {
 pub struct Analyzer {
     epoch: Instant,
     wall: f64,
+    /// Every sequence seen: prompts at their attach, prompt + output at their finish.
     trie: Trie,
+    /// Finished sequences only (their KV was computed before this attach).
+    ready: Trie,
     next_rid: u64,
     slots: FxHashMap<u32, Pending>,
     boundaries: FxHashMap<u64, Boundary>,
@@ -651,6 +671,7 @@ impl Analyzer {
             epoch,
             wall,
             trie: Trie::new(),
+            ready: Trie::new(),
             next_rid: 1,
             slots: FxHashMap::default(),
             boundaries: FxHashMap::default(),
@@ -680,6 +701,8 @@ impl Analyzer {
                 let mut v = serde_json::to_value(&*h).unwrap_or_default();
                 if let Some(m) = v.as_object_mut() {
                     m.insert("ev".into(), "header".into());
+                    m.insert("schema".into(), SCHEMA.into());
+                    m.insert("hash".into(), HASH_NAME.into());
                     m.insert("unix_epoch_s".into(), self.wall.into());
                 }
                 Self::line(out, &v);
@@ -768,6 +791,9 @@ impl Analyzer {
                 );
                 match slot.and_then(|p| p.hashes.get(rows as usize)) {
                     Some(&h) => {
+                        if self.refusals.len() >= REGISTRY_CAP {
+                            self.refusals.clear();
+                        }
                         self.refusals.insert(h, (cause, t, rows));
                     }
                     None => self.unresolved += 1,
@@ -805,7 +831,7 @@ impl Analyzer {
             }
             Event::Flush(ack) => {
                 self.finish_all(out);
-                let _ = ack.send(());
+                let _ = ack.send(out.flush().is_ok());
             }
             Event::Finish { t, slot, tokens } => {
                 let t = self.secs(t);
@@ -816,6 +842,7 @@ impl Analyzer {
                 p.rec.t_fin = Some(t);
                 p.rec.out = Some((tokens.len() as u32).saturating_sub(p.rec.prompt));
                 self.trie.insert(&tokens, Src::Output, rid);
+                self.ready.insert(&tokens, Src::Output, rid);
                 p.rec.h16 = h16(&tokens);
                 self.emit_record(p.rec, out);
             }
@@ -850,7 +877,8 @@ impl Analyzer {
         self.next_rid += 1;
         let prompt = &a.prompt;
         let mut arrival = None;
-        if let Some(q) = self.arrivals.get_mut(&fingerprint(prompt)) {
+        let fp = fingerprint(prompt);
+        if let Some(q) = self.arrivals.get_mut(&fp) {
             // An identical prompt rejected or cancelled before its attach leaves its arrival
             // behind: skip arrivals older than any queueing delay.
             while let Some(x) = q.pop_front() {
@@ -860,8 +888,12 @@ impl Analyzer {
                     break;
                 }
             }
+            if q.is_empty() {
+                self.arrivals.remove(&fp);
+            }
         }
         let (ideal, src) = self.trie.lcp(prompt);
+        let ideal_ready = self.ready.lcp(prompt).0 as u32;
         self.trie.insert(prompt, Src::Prompt, rid);
         let hashes = prefix_hashes(prompt);
         let plen = prompt.len() as u32;
@@ -887,7 +919,7 @@ impl Analyzer {
                 Src::Output => "output",
             }),
             ideal_rid: src.map(|(_, r)| r),
-            ideal_inflight: src.is_some_and(|(_, r)| self.slots.values().any(|p| p.rec.rid == r)),
+            ideal_ready,
             radix: a.radix_blocks * a.block_rows,
             att,
             kind: if a.snap.is_some() {
@@ -905,6 +937,7 @@ impl Analyzer {
             session: arrival.as_ref().and_then(|x| x.session),
             tenant: arrival.as_ref().and_then(|x| x.tenant),
             unwound: false,
+            dropped_events: 0,
             h16: Vec::new(),
         };
         self.slots.insert(a.slot, Pending { rec, hashes });
@@ -977,7 +1010,8 @@ impl Analyzer {
         None
     }
 
-    fn emit_record(&mut self, rec: Record, out: &mut impl Write) {
+    fn emit_record(&mut self, mut rec: Record, out: &mut impl Write) {
+        rec.dropped_events = DROPPED.load(Ordering::Relaxed);
         Self::line(out, &rec);
         self.records += 1;
         if self.records % 256 == 0 {
@@ -1202,9 +1236,53 @@ mod tests {
         assert_eq!(d["state"], "dropped");
         assert_eq!(d["cause"], "lru");
         assert_eq!(d["trigger"], "min_free");
-        assert_eq!(r2["ideal_inflight"], false);
+        assert_eq!(r2["ideal_ready"], full1.len());
         assert_eq!(d["ago_s"], 4.0);
         assert_eq!(d["life_s"], 3.0);
+    }
+
+    #[test]
+    fn in_flight_history_is_seen_but_not_ready_and_arrivals_are_consumed() {
+        let t0 = Instant::now();
+        let mut a = Analyzer::new(t0, 0.0);
+        let p: Vec<u32> = (0..300).collect();
+        let arrive = |s: u64| Event::Arrive {
+            t: t0 + Duration::from_secs(s),
+            fp: fingerprint(&p),
+            prompt_len: 300,
+            session: None,
+            tenant: Some(s),
+        };
+        let recs = run(
+            &mut a,
+            vec![
+                arrive(0),
+                arrive(1),
+                attach(t0 + Duration::from_secs(2), 0, p.clone(), 0, None),
+                attach(t0 + Duration::from_secs(3), 1, p.clone(), 0, None),
+                Event::Finish {
+                    t: t0 + Duration::from_secs(4),
+                    slot: 1,
+                    tokens: p.clone(),
+                },
+                Event::Finish {
+                    t: t0 + Duration::from_secs(5),
+                    slot: 0,
+                    tokens: p.clone(),
+                },
+            ],
+        );
+        assert_eq!(recs.len(), 2);
+        let (first, second) = (&recs[1], &recs[0]);
+        assert_eq!(
+            (first["tenant"].clone(), second["tenant"].clone()),
+            (0.into(), 1.into())
+        );
+        assert_eq!(first["ideal"], 0);
+        assert_eq!(second["ideal"], 300);
+        assert_eq!(second["ideal_ready"], 0, "the twin was still in flight");
+        assert!(a.arrivals.is_empty());
+        assert_eq!(second["dropped_events"], 0);
     }
 
     #[test]

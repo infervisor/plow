@@ -2212,14 +2212,17 @@ impl VmmKv {
         self.shared.block_rows
     }
 
-    /// Pool sizes for the prefix trace header: (block bytes, soft cap, free-memory floor).
-    pub fn budget(&self) -> (u64, u64, u64) {
+    /// The pool's sizes and publication rules, for the prefix trace header.
+    pub fn trace_header(&self, h: &mut pfx_trace::Header) {
         let s = &self.shared;
-        (
-            s.block_bytes,
-            s.cache_cap,
-            s.cache_min_free.load(Ordering::Relaxed),
-        )
+        h.block_rows = s.block_rows;
+        h.block_bytes = s.block_bytes;
+        h.cache_cap = s.cache_cap;
+        h.min_free = s.cache_min_free.load(Ordering::Relaxed);
+        h.strict_publish = s.inner.lock().strict_publish;
+        h.share_min_rows = SHARE_MIN_ROWS as u32;
+        h.recent_prompts = RECENT_PROMPTS as u32;
+        h.recent_rows = RECENT_ROWS as u32;
     }
 
     pub fn geometry(&self) -> &VmmGeometry {
@@ -4464,7 +4467,9 @@ fn trim_cache_by(
     let min_free = s.cache_min_free.load(Ordering::Relaxed);
     if min_free > 0 {
         if let Some(mut free) = s.ops.free_bytes() {
-            inner.free_sample = Some((free, std::time::Instant::now()));
+            if pfx_trace::on() {
+                inner.free_sample = Some((free, std::time::Instant::now()));
+            }
             // Real pressure only: a backend that can answer this is authoritative, so
             // `cache_cap` is not consulted at all while this branch runs — that is the
             // point (evict on demand, not on a fixed count of cached bytes). Blocks an

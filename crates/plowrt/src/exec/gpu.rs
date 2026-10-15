@@ -7230,13 +7230,13 @@ impl GpuEngine {
             rings.ensure_slot(b)?;
         }
         let t_ring = t0.map(|t| t.elapsed());
-        self.trace_finish(b);
         // VMM: publish the finished sequence's generated whole blocks first —
         // a follow-up turn embedding this turn's output then attaches instead
         // of re-prefilling it — then drop the previous sequence's mappings/
         // cache references. Prefix admission maps after lookup; every execution
         // path maps the rows it writes, including inactive decode rows.
         self.vmm_publish(b, self.pos[b]);
+        self.trace_finish(b);
         let t_publish = t0.map(|t| t.elapsed());
         self.pos[b] = keep;
         self.vmm_attached[b] = 0;
@@ -7330,11 +7330,11 @@ impl GpuEngine {
             }
             return;
         }
-        self.trace_finish(b);
         // The turn-end pass: restores or touches the prompt end (the next turn's attach point).
         if cache_output {
             self.vmm_publish(b, self.pos[b]);
         }
+        self.trace_finish(b);
         self.pos[b] = 0;
         self.vmm_attached[b] = 0;
         // A retired row decodes as an idle lane from position 0: a stale learned-position base
