@@ -282,19 +282,14 @@ struct LightLaunch {
 
 impl LightRoute {
     pub(super) fn run(&self, stream: &CudaStream) -> Result<()> {
-        self.run_tensors(stream, self.kernarg.tensors)
+        self.run_with(stream, self.kernarg.tensors)
     }
 
-    /// `tensors` is the launch's tensor table: a per-slot prefill table shifts `kv.*` to the
-    /// slot's ring, so a route writing the cache (HeadNormRope) must not use the load-time one.
-    pub(super) fn run_tensors(&self, stream: &CudaStream, tensors: u64) -> Result<()> {
+    /// `tensors`: the launch's tensor table. A per-slot prefill chunk selects slot b's shifted
+    /// table (kv.*, recurrent state) through its kernarg; the route's own copy is slot 0's.
+    pub(super) fn run_with(&self, stream: &CudaStream, tensors: u64) -> Result<()> {
         for launch in &self.launches {
             if let Some(span) = &launch.direct {
-                if tensors != self.kernarg.tensors {
-                    return Err(RuntimeError::Rejected(
-                        "a load-resolved light launch cannot take another tensor table".into(),
-                    ));
-                }
                 let mut span = **span;
                 let mut op = span.op[0];
                 let mut params = [match launch.kind {
@@ -757,21 +752,27 @@ pub(super) fn prefill_light_route(
     LightRoute {
         be: Arc::clone(be),
         kernarg,
-        launches: insts
-            .iter()
-            .map(|&inst| LightLaunch {
-                function,
-                xs: LightX::default(),
-                kind: LightKind::Single,
-                direct: None,
-                instruction: inst as u32,
-                blocks: u32::from(g.insts[inst].blocks),
-                block: BLOCK,
-                smem: 0,
-            })
-            .collect(),
+        launches: prefill_light_launches(function, g, insts),
         _scratch: None,
     }
+}
+
+/// Never load-resolved (`direct`): the per-slot routes (`plow_rope_pf` writes `kv.*`) read
+/// their tensor pointers through the launch's table, which `run_with` shifts per slot.
+fn prefill_light_launches(function: KernelFn, g: &DevProg, insts: &[usize]) -> Vec<LightLaunch> {
+    insts
+        .iter()
+        .map(|&inst| LightLaunch {
+            function,
+            xs: LightX::default(),
+            kind: LightKind::Single,
+            direct: None,
+            instruction: inst as u32,
+            blocks: u32::from(g.insts[inst].blocks),
+            block: BLOCK,
+            smem: 0,
+        })
+        .collect()
 }
 
 /// The cached GLU quant kernel strides rows by `gridDim`: one CTA per row instead of the
@@ -2349,6 +2350,15 @@ fn projection_segments(
 mod tests {
     use super::*;
     use packet::dev::{DevInst64, StreamEnt};
+
+    #[test]
+    fn prefill_light_launches_take_the_launch_tensor_table() {
+        let (mut g, _) = fixture(4);
+        g.insts[1].op = DevOp::HeadNormRope as u16;
+        let launches = prefill_light_launches(KernelFn::null(), &g, &[1, 2]);
+        assert_eq!(launches.len(), 2);
+        assert!(launches.iter().all(|l| l.direct.is_none()));
+    }
 
     #[test]
     fn merge_routes_keeps_either_side_when_the_other_is_absent() {
