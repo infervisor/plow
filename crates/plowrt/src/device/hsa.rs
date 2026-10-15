@@ -255,6 +255,10 @@ const CHAIN_IDLE: u64 = u64::MAX;
 struct DispatchTimes {
     sigs: Vec<HsaSignal>,
     kobj: Vec<AtomicU64>,
+    /// Host system-domain timestamps (ns, `HSA_SYSTEM_INFO_TIMESTAMP`, the domain the dispatch
+    /// times are reported in): header publish, and the doorbell write that covered the packet.
+    host_pub: Vec<AtomicU64>,
+    host_door: Vec<AtomicU64>,
     written: AtomicU64,
     out: parking_lot::Mutex<(u64, std::io::BufWriter<std::fs::File>)>,
 }
@@ -284,6 +288,8 @@ impl DispatchTimes {
         Some(Box::new(Self {
             sigs,
             kobj: (0..QUEUE_SIZE).map(|_| AtomicU64::new(0)).collect(),
+            host_pub: (0..QUEUE_SIZE).map(|_| AtomicU64::new(0)).collect(),
+            host_door: (0..QUEUE_SIZE).map(|_| AtomicU64::new(0)).collect(),
             written: AtomicU64::new(0),
             out: parking_lot::Mutex::new((0, std::io::BufWriter::new(f))),
         }))
@@ -299,6 +305,22 @@ impl DispatchTimes {
         unsafe { (drv.hsa_signal_store_screlease)(s, 1) };
         self.written.fetch_max(idx + 1, Ordering::AcqRel);
         s
+    }
+
+    fn host_now(drv: &HsaDriver) -> u64 {
+        let mut t = 0u64;
+        // HSA_SYSTEM_INFO_TIMESTAMP
+        unsafe { (drv.hsa_system_get_info)(2, &mut t as *mut u64 as *mut c_void) };
+        t
+    }
+
+    fn published(&self, drv: &HsaDriver, idx: u64) {
+        self.host_pub[self.slot(idx)].store(Self::host_now(drv), Ordering::Relaxed);
+    }
+
+    /// A doorbell write covering every packet up to `last`.
+    fn rang(&self, drv: &HsaDriver, last: u64) {
+        self.host_door[self.slot(last)].store(Self::host_now(drv), Ordering::Relaxed);
     }
 
     fn name(&self, kobj: u64, name: &str) {
@@ -318,6 +340,12 @@ impl DispatchTimes {
             if rc == HSA_STATUS_SUCCESS {
                 let k = self.kobj[self.slot(idx)].load(Ordering::Relaxed);
                 let _ = writeln!(g.1, "{idx},{},{},{k}", t[0], t[1]);
+                let _ = writeln!(
+                    g.1,
+                    "#h,{idx},{},{}",
+                    self.host_pub[self.slot(idx)].swap(0, Ordering::Relaxed),
+                    self.host_door[self.slot(idx)].swap(0, Ordering::Relaxed)
+                );
             }
         }
         if upto >> 14 != g.0 >> 14 {
@@ -1024,6 +1052,8 @@ pub struct HsaBackend {
     done_signal: HsaSignal,
     /// `PLOW_AMD_DISPATCH_TIMES`: per-slot completion signals on a profiling queue.
     dtimes: Option<Box<DispatchTimes>>,
+    /// Clear the barrier bit of the next dispatch only (`skip_next_barrier`).
+    no_barrier_once: std::sync::atomic::AtomicBool,
     karg_ring: *mut u8,
     /// `karg_ring` is VRAM mapped through the large BAR (`PLOW_AMD_KERNARG_VRAM`): every slot is
     /// staged on the stack, copied through the BAR and made visible before its header is published.
@@ -1437,6 +1467,7 @@ impl HsaBackend {
             queue,
             done_signal,
             dtimes,
+            no_barrier_once: std::sync::atomic::AtomicBool::new(false),
             karg_ring: karg_ring as *mut u8,
             karg_vram,
             device_name,
@@ -2662,8 +2693,9 @@ impl HsaBackend {
         } else {
             1
         };
+        let barrier = u16::from(!self.no_barrier_once.swap(false, Ordering::Relaxed));
         let header: u16 = (HSA_PACKET_TYPE_KERNEL_DISPATCH << HSA_PACKET_HEADER_TYPE) as u16
-            | (1 << HSA_PACKET_HEADER_BARRIER) as u16
+            | (barrier << HSA_PACKET_HEADER_BARRIER) as u16
             | ((pkt_knobs().acquire << HSA_PACKET_HEADER_SCACQUIRE_FENCE_SCOPE) as u16)
             | ((pkt_knobs().release << HSA_PACKET_HEADER_SCRELEASE_FENCE_SCOPE) as u16);
         let setup: u16 = (dims << HSA_KERNEL_DISPATCH_PACKET_SETUP_DIMENSIONS as u16) as u16;
@@ -2673,6 +2705,9 @@ impl HsaBackend {
             std::sync::atomic::AtomicU32::from_ptr(pkt as *mut u32)
                 .store(header_setup, Ordering::Release);
         }
+        if let Some(t) = &self.dtimes {
+            t.published(&self.shared.drv, idx);
+        }
 
         // Immediate batches retain ordinary per-dispatch doorbells. Deferred
         // chains ring once after every TP rank has been prepared.
@@ -2681,6 +2716,9 @@ impl HsaBackend {
         }) {
             unsafe {
                 (self.shared.drv.hsa_signal_store_screlease)((*q).doorbell_signal, idx as i64);
+            }
+            if let Some(t) = &self.dtimes {
+                t.rang(&self.shared.drv, idx);
             }
         }
         if chain_end == CHAIN_IDLE {
@@ -4018,6 +4056,9 @@ impl HsaBackend {
                     (end - 1) as i64,
                 );
             }
+            if let Some(t) = &self.dtimes {
+                t.rang(&self.shared.drv, end - 1);
+            }
         }
         self.kernarg_retirement
             .publish(end)
@@ -4093,6 +4134,12 @@ impl HsaBackend {
     /// dispatch counts threads, so it is multiplied here. Getting that
     /// backwards launches 256 workgroups' worth of threads as one workgroup, or
     /// 65536 workgroups — both of which the packet processor accepts.
+    /// The next dispatch may start before earlier packets finish (AQL barrier bit clear). The
+    /// caller guarantees it neither reads what those packets write nor writes what they touch.
+    pub fn skip_next_barrier(&self) {
+        self.no_barrier_once.store(true, Ordering::Relaxed);
+    }
+
     pub fn launch(
         &self,
         f: HsaKernel,

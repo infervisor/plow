@@ -2914,8 +2914,25 @@ impl Builder {
             || decode_grouped_moe
             || decode_w8a8_moe
             || isolate_xreduce;
+        let router_sig: Vec<bool> = self
+            .ops
+            .iter()
+            .map(|op| {
+                op.inst.op == DevOp::GemmF32 as u16
+                    && op.inst.i[7] == crate::dev::ROUTER_RAW_MARK
+                    && op.inst.i[5] & crate::dev::ROUTER_RAW_SIGNAL != 0
+            })
+            .collect();
+        let router_signal = |i: usize| router_sig[i];
         let same_segment_dep = |consumer: usize, dep: &Dep| {
             let producer = dep.producer() as usize;
+            // A signalling raw router bumps its counter itself; its next segment keeps the wait.
+            if raw_segmented
+                && router_signal(producer)
+                && seg_of[consumer] == seg_of[producer] + 1
+            {
+                return true;
+            }
             let raw_moe_pair_edge = (decode_grouped_moe
                 && wave_class(consumer) == 20
                 && wave_class(producer) == 20)
@@ -3106,6 +3123,11 @@ impl Builder {
 
         for (idx, op) in self.ops.iter().enumerate() {
             let mut inst = op.inst;
+            if router_signal(idx) {
+                let threshold = op.cus.len() as u32;
+                assert!(threshold < 1024 && op.counter < 1 << 20, "router signal fields");
+                inst.i[5] |= threshold << 2 | op.counter << 12;
+            }
             if kda_carry_keyfeed
                 && inst.op == DevOp::KdaChunkWu as u16
                 && lean_kda_key_factor_pair(&self.ops, idx)

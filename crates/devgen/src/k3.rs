@@ -1472,6 +1472,7 @@ pub fn emit_k3_latent_moe(
             tp.slot_b,
             part,
             c.top_k,
+            crate::TENSOR_NONE,
         );
     } else if tp.on() {
         c_cmb = crate::emit_xreduce(

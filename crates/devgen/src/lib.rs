@@ -3700,6 +3700,7 @@ fn emit_xreduce_combine_fold(
     slot: u32,
     part: u32,
     k: u32,
+    shared: u32,
 ) -> u32 {
     assert!(k > 0, "combine fold needs at least one routed slot");
     let need = (xr_elems.div_ceil(512).max(1) as usize).min(xr_cus.len());
@@ -3709,6 +3710,7 @@ fn emit_xreduce_combine_fold(
     b.emit(DevOp::XReduce, xr_cus.to_vec(), deps, |d| {
         d.t[0] = out;
         d.t[1] = part;
+        d.t[6] = shared;
         d.i[0] = xr_elems;
         d.i[1] = tp;
         d.i[2] = slot;

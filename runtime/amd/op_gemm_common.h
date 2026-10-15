@@ -5267,6 +5267,13 @@ __device__ void d_gemv_t(bf16* __restrict__ C, const bf16* __restrict__ x,
     if ((size_t)M * K <= GM_LDS_HALVES) {
         stage_x_lds(lds, x, (size_t)M * K);
         __syncthreads();
+#ifdef GEMV_GLU_STAGE_AVAILABLE
+        /* norm >= 3: x is the GLU gate, `gamma` its up half (GLM shared-expert down). */
+        if (norm >= 3) {
+            gemv_glu_lds(lds, gamma, (size_t)M * K, (unsigned)norm - 3u, eps);
+            norm = 0;
+        }
+#endif
         /* Fold the RMSNORM into the staged copy, then fall through to the ORDINARY un-normed
          * hot loop — the k-loop never learns this happened, so it keeps its register
          * allocation and its unroll. `gemv_norm_lds` barriers on exit. */
@@ -5369,6 +5376,7 @@ __device__ void d_gemv_t(bf16* __restrict__ C, const bf16* __restrict__ x,
 #endif
         }
     } else {
+        if (norm >= 3) __builtin_trap(); /* the GLU stage needs the staged arm */
         /* Unstaged: `fold` is false here by construction, so norm == 2 was already demoted to
          * 0 above and this is mode 1 or nothing. */
         if (norm == 1)

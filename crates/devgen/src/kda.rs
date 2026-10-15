@@ -858,6 +858,7 @@ fn emit_kda_mixer_ex(
     // and the split-K two-packet form (or no split), so the eight can run as two groups.
     let mut kda_group: Option<(u32, u32)> = None;
     let mut return_qkvg: Option<(u32, u32)> = None;
+    let mut defer_gb: Option<(u32, u32, u32)> = None;
     if let OutputGate::LowRank { .. } = w.gate {
         let small = |n: u32, k: u32| {
             crate::mla::glm_decode_gemm_tile(t, n, k, n_cu) == Some(DevOp::GemmSmall)
@@ -1030,7 +1031,12 @@ fn emit_kda_mixer_ex(
                 c_gb
             } else {
                 let c_ga = gemv(b, ga, x, g_a_proj, hd, hi, c_ln);
-                gemv(b, g_raw, ga, g_b_proj, p, hd, c_ga)
+                if seq_rows && t > 1 && crate::emit_config::active().glm_kda_lt_order {
+                    defer_gb = Some((c_ga, ga, g_b_proj));
+                    c_ga
+                } else {
+                    gemv(b, g_raw, ga, g_b_proj, p, hd, c_ga)
+                }
             };
             (cq, ck, cv, c_gb)
         }
@@ -1057,6 +1063,10 @@ fn emit_kda_mixer_ex(
         c_ln,
         t == 1 && crate::whole_graph_parallel_linear2(hd, nh, hi),
     )
+    };
+    let c_g = match defer_gb {
+        Some((c_ga, ga, g_b_proj)) => gemv(b, g_raw, ga, g_b_proj, p, hd, c_ga),
+        None => c_g,
     };
     // P7 — forget-gate up-projection. The forget gate stays LOW RANK 128 even though the output
     // gate is full rank; that asymmetry is `use_full_rank_gate`'s and it is easy to get backwards.

@@ -207,40 +207,46 @@ static_assert(sizeof(MoeTableArgs) == 96);
 extern "C" __global__ void plow_moe_aiter_prepare_table(MoeTableArgs a) {
 #if defined(__HIP_DEVICE_COMPILE__)
     if (blockIdx.x == 0) {
-        __shared__ unsigned cnt[512], start[513], cur[512];
-        const unsigned slots = a.rows * a.topk, tid = threadIdx.x;
-        for (unsigned e = tid; e < a.n_exp; e += blockDim.x) cnt[e] = cur[e] = 0;
+        /* Parallel over experts: per-expert block counts, a workgroup scan, then each expert's
+         * own block ids and pad rows. A thread-0 serial prefix over 289 experts plus a binary
+         * search per padded row cost ~25 us at 128 rows; this is the decode critical path. */
+        __shared__ unsigned cnt[512], start[513], cur[512], wsum[8];
+        const unsigned slots = a.rows * a.topk, tid = threadIdx.x, nt = blockDim.x;
+        for (unsigned e = tid; e < 512u; e += nt) cnt[e] = cur[e] = 0;
         __syncthreads();
-        for (unsigned s = tid; s < slots; s += blockDim.x) {
+        for (unsigned s = tid; s < slots; s += nt) {
             const unsigned e = a.table[s].x;
             if (e < a.n_exp) atomicAdd(&cnt[e], 1u);
         }
         __syncthreads();
-        if (tid == 0) {
-            unsigned b = 0;
-            for (unsigned e = 0; e < a.n_exp; e++) {
-                start[e] = b;
-                b += (cnt[e] + a.block_m - 1u) / a.block_m;
-            }
-            start[a.n_exp] = b;
+        /* Two experts per thread (n_exp <= 512, blockDim 256): exclusive scan of block counts. */
+        const unsigned e0 = 2u * tid, e1 = e0 + 1u;
+        const unsigned b0 = e0 < a.n_exp ? (cnt[e0] + a.block_m - 1u) / a.block_m : 0u;
+        const unsigned b1 = e1 < a.n_exp ? (cnt[e1] + a.block_m - 1u) / a.block_m : 0u;
+        const unsigned lane = tid % 64u, wave = tid / 64u;
+        unsigned incl = b0 + b1;
+        for (unsigned o = 1; o < 64u; o <<= 1) {
+            const unsigned v = __shfl_up(incl, o);
+            if (lane >= o) incl += v;
         }
+        if (lane == 63u) wsum[wave] = incl;
+        __syncthreads();
+        unsigned base = 0;
+        for (unsigned w = 0; w < wave; w++) base += wsum[w];
+        const unsigned excl = base + incl - b0 - b1;
+        if (e0 <= a.n_exp) start[e0] = excl;
+        if (e1 <= a.n_exp) start[e1] = excl + b0;
         __syncthreads();
         const unsigned blocks = start[a.n_exp], padded = blocks * a.block_m;
-        for (unsigned i = tid; i < padded; i += blockDim.x) {
-            const unsigned b = i / a.block_m;
-            unsigned lo = 0, hi = a.n_exp;
-            while (lo < hi) {
-                const unsigned mid = (lo + hi) / 2u;
-                if (start[mid + 1u] <= b) lo = mid + 1u;
-                else hi = mid;
-            }
-            if (i % a.block_m == 0u) a.experts[b] = lo;
-            if ((b - start[lo]) * a.block_m + i % a.block_m >= cnt[lo]) {
+        for (unsigned e = tid; e < a.n_exp; e += nt) {
+            const unsigned lo = start[e], hi = start[e + 1u];
+            for (unsigned b = lo; b < hi; b++) a.experts[b] = e;
+            for (unsigned i = lo * a.block_m + cnt[e]; i < hi * a.block_m; i++) {
                 a.ids[i] = a.rows;
                 a.weights[i] = 0.0f;
             }
         }
-        for (unsigned s = tid; s < slots; s += blockDim.x) {
+        for (unsigned s = tid; s < slots; s += nt) {
             const uint2 r = a.table[s];
             if (r.x >= a.n_exp) continue;
             const unsigned at = start[r.x] * a.block_m + atomicAdd(&cur[r.x], 1u);
@@ -348,3 +354,169 @@ extern "C" __global__ void plow_moe_aiter_flat_route(MoeFlatRouteArgs a) {
 }
 
 extern "C" __device__ unsigned plow_moe_resident_fp8_abi_1 = 1;
+
+/* PLOW_AMD_ROUTER_NATIVE: the decode router segment (GemmF32 score + MoeRouterTopkPf) as two
+ * kernels. `plow_moe_router_gemm`: f32 logits[rows][n_exp] = x[rows][K] . w[n_exp][K]^T, one
+ * 16x16 output tile per workgroup, the four waves splitting K and summing through LDS.
+ * `plow_moe_router_topk`: wave per token, the interpreter's PLOW_MOE_ROUTER_PF_WAVE selection
+ * and gate tail (sigmoid, bias, top-k, normalize, scale, shared-expert tail slot). */
+struct MoeRouterGemmArgs {
+    float* logit;
+    const unsigned short* x;
+    const unsigned short* w;
+    unsigned rows;
+    unsigned n_exp;
+    unsigned k;
+    unsigned pad;
+};
+static_assert(sizeof(MoeRouterGemmArgs) == 40);
+
+/* Eight waves split K (512 each, 16 fully unrolled 16-byte loads per operand in flight per lane):
+ * the score GEMM is load-latency bound at these shapes, not MFMA bound. */
+extern "C" __global__ __launch_bounds__(512) void plow_moe_router_gemm(MoeRouterGemmArgs a) {
+#if defined(__HIP_DEVICE_COMPILE__) && defined(__gfx950__)
+    __shared__ f32x4 part[8][64];
+    const unsigned tiles_n = (a.n_exp + 15u) / 16u;
+    const unsigned t0 = blockIdx.x / tiles_n * 16u, e0 = blockIdx.x % tiles_n * 16u;
+    const unsigned lane = threadIdx.x & 63u, wave = threadIdx.x >> 6;
+    const unsigned r = lane & 15u, kg = lane >> 4;
+    const unsigned tok = t0 + r, exp = e0 + r;
+    const bool tok_ok = tok < a.rows, exp_ok = exp < a.n_exp;
+    const unsigned kw = a.k / 8u;
+    const bf16x8* xp = (const bf16x8*)(a.x + (size_t)(tok_ok ? tok : 0u) * a.k + wave * kw + kg * 8u);
+    const bf16x8* wp = (const bf16x8*)(a.w + (size_t)(exp_ok ? exp : 0u) * a.k + wave * kw + kg * 8u);
+    f32x4 acc = {0.0f, 0.0f, 0.0f, 0.0f};
+    const bf16x8 zero = {};
+    constexpr unsigned U = 16u;
+    for (unsigned s0 = 0; s0 < kw / 32u; s0 += U) {
+        bf16x8 av[U], bv[U];
+#pragma unroll
+        for (unsigned u = 0; u < U; u++) {
+            av[u] = tok_ok ? xp[(s0 + u) * 4u] : zero;
+            bv[u] = exp_ok ? wp[(s0 + u) * 4u] : zero;
+        }
+#pragma unroll
+        for (unsigned u = 0; u < U; u++)
+            acc = __builtin_amdgcn_mfma_f32_16x16x32_bf16(av[u], bv[u], acc, 0, 0, 0);
+    }
+    part[wave][lane] = acc;
+    __syncthreads();
+    if (wave == 0) {
+        f32x4 s = part[0][lane];
+#pragma unroll
+        for (unsigned w = 1; w < 8u; w++) s += part[w][lane];
+        const unsigned e = e0 + (lane & 15u);
+#pragma unroll
+        for (unsigned i = 0; i < 4u; i++) {
+            const unsigned t = t0 + (lane >> 4) * 4u + i;
+            if (t < a.rows && e < a.n_exp) a.logit[(size_t)t * a.n_exp + e] = s[i];
+        }
+    }
+#endif
+}
+
+struct MoeRouterTopkArgs {
+    uint2* table;
+    const float* logit;
+    const float* bias;
+    unsigned rows;
+    unsigned n_exp;
+    unsigned k;
+    unsigned norm;
+    unsigned shared_tail;
+    float route_scale;
+};
+static_assert(sizeof(MoeRouterTopkArgs) == 48);
+
+extern "C" __global__ __launch_bounds__(256) void plow_moe_router_topk(MoeRouterTopkArgs a) {
+#if defined(__HIP_DEVICE_COMPILE__)
+    __shared__ unsigned wl_all[4][8];
+    __shared__ float ws_all[4][8];
+    const unsigned lane = threadIdx.x & 63u, wave = threadIdx.x >> 6;
+    const unsigned tok = blockIdx.x * 4u + wave;
+    if (tok >= a.rows) return;
+    unsigned* wl = wl_all[wave];
+    float* ws = ws_all[wave];
+    const unsigned per = (a.n_exp + 63u) / 64u;
+    float s[5];
+    unsigned long long key[5];
+#pragma unroll
+    for (unsigned q = 0; q < 5; q++) {
+        s[q] = 0.0f;
+        key[q] = 0ull;
+        if (q >= per) continue;
+        const unsigned e = lane + q * 64u;
+        if (e >= a.n_exp) continue;
+        const float l = a.logit[(size_t)tok * a.n_exp + e];
+        s[q] = 1.0f / (1.0f + expf(-l));
+        float sc = s[q] + (a.bias ? a.bias[e] : 0.0f);
+        unsigned sb;
+        __builtin_memcpy(&sb, &sc, 4);
+        sb = (sb & 0x80000000u) ? ~sb : (sb | 0x80000000u);
+        key[q] = ((unsigned long long)sb << 32) | (unsigned long long)(a.n_exp - 1u - e);
+    }
+    /* k rounds of a wave-wide max over the packed keys (unique per expert, so the winner is
+     * one lane and one slot): the same order the rank-by-comparison form produces. The round
+     * reduces the 32 high key bits (the ordered biased score) through DPP and settles equal
+     * scores, which are rare, with a 64-bit shuffle reduction. */
+    for (unsigned j = 0; j < a.k; j++) {
+        unsigned long long best = 0ull;
+        unsigned bq = 0u;
+        float bs = 0.0f;
+#pragma unroll
+        for (unsigned q = 0; q < 5; q++)
+            if (q < per && key[q] > best) {
+                best = key[q];
+                bq = q;
+                bs = s[q];
+            }
+        const unsigned hi = (unsigned)(best >> 32);
+        unsigned m = hi;
+        m = max(m, (unsigned)__builtin_amdgcn_update_dpp(0, (int)m, 0xb1, 0xf, 0xf, true));
+        m = max(m, (unsigned)__builtin_amdgcn_update_dpp(0, (int)m, 0x4e, 0xf, 0xf, true));
+        m = max(m, (unsigned)__builtin_amdgcn_update_dpp(0, (int)m, 0x141, 0xf, 0xf, true));
+        m = max(m, (unsigned)__builtin_amdgcn_update_dpp(0, (int)m, 0x140, 0xf, 0xf, true));
+        m = max(m, (unsigned)__builtin_amdgcn_ds_swizzle((int)m, (16 << 10) | 31));
+        m = max(m, (unsigned)__shfl_xor((int)m, 32, 64));
+        const unsigned long long cand = __ballot(hi == m && best != 0ull);
+        bool take;
+        if (__popcll(cand) == 1) {
+            take = lane == (unsigned)(__ffsll((long long)cand) - 1);
+        } else {
+            unsigned long long win = hi == m ? best : 0ull;
+#pragma unroll
+            for (unsigned o = 32; o >= 1; o >>= 1) {
+                const unsigned lo = __shfl_xor((unsigned)win, o), h2 = __shfl_xor((unsigned)(win >> 32), o);
+                const unsigned long long v = ((unsigned long long)h2 << 32) | lo;
+                win = v > win ? v : win;
+            }
+            take = win != 0ull && best == win;
+        }
+        if (take) {
+            wl[j] = lane + bq * 64u;
+            ws[j] = bs;
+#pragma unroll
+            for (unsigned q = 0; q < 5; q++)
+                if (q == bq) key[q] = 0ull;
+        }
+    }
+    __builtin_amdgcn_fence(__ATOMIC_RELEASE, "wavefront");
+    __builtin_amdgcn_wave_barrier();
+    __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "wavefront");
+    if (lane == 0) {
+        uint2* trow = a.table + (size_t)tok * (a.k + a.shared_tail);
+        float gate[8];
+        for (unsigned j = 0; j < a.k; j++) gate[j] = ws[j];
+        float sum = 0.0f;
+        for (unsigned j = 0; j < a.k; j++) sum += gate[j];
+        for (unsigned j = 0; j < a.k; j++) {
+            if (a.norm && sum != 0.0f) gate[j] /= sum;
+            gate[j] *= a.route_scale;
+            trow[j] = make_uint2(wl[j], __float_as_uint(gate[j]));
+        }
+        if (a.shared_tail) trow[a.k] = make_uint2(a.n_exp, __float_as_uint(1.0f));
+    }
+#endif
+}
+
+extern "C" __device__ unsigned plow_moe_router_abi_2 = 1;

@@ -447,12 +447,31 @@ if [ "$ARCH" = gfx950 ]; then
     -DPLOW_LEAN_OBJECT=1 -DPLOW_NO_SPILL=1 \
     -DPLOW_REQUIRED_MARKER=plow_hc_mix_decode_1 \
     -I"$R/amd" -I"$R/common" "$R/amd/hc_mix_decode.hip"
+  # PLOW_GLM_ROUTER_RAW: decode router GEMV + top-k (GemmF32 marked raw), the decode objects'
+  # GEMV walk and exact select.
+  bash "$R/cmake/hipcc_hsaco.sh" hipcc "$BUN" "$ARCH" \
+    "$OUT/router_decode_gfx950.elf" plow_router_decode 256 1 \
+    -DPLOW_LEAN_OBJECT=1 -DPLOW_NO_SPILL=1 -DPLOW_MOE_ROUTER_SELECT=1 \
+    -DPLOW_REQUIRED_MARKER=plow_router_decode_abi_3 \
+    $INC "$R/amd/router_decode.hip"
   # PLOW_MOE_W8A8_DEC: decode-rung W8A8 grouped MoE GLU + DOWN (marked op 85/86 pair).
   bash "$R/cmake/hipcc_hsaco.sh" hipcc "$BUN" "$ARCH" \
     "$OUT/moe_w8a8_dec_gfx950.elf" plow_moe_w8a8_dec_glu 256 2 \
     -DPLOW_LEAN_OBJECT=1 -DPLOW_NO_SPILL=1 \
     -DPLOW_REQUIRED_MARKER=plow_moe_w8a8_dec_abi_1 \
     -I"$R/amd" -I"$R/common" "$R/amd/moe_w8a8_dec.hip"
+  # PLOW_AMD_XR_NATIVE: a lone decode XReduce / XReduceTwoShot segment as its own kernel.
+  bash "$R/cmake/hipcc_hsaco.sh" hipcc "$BUN" "$ARCH" \
+    "$OUT/xr_native_gfx950.elf" plow_xr_native 256 1 \
+    -DPLOW_LEAN_OBJECT=1 -DPLOW_NO_SPILL=1 -DPLOW_XR_MLP=1 -DPLOW_XR_AGG=1 \
+    -DPLOW_REQUIRED_MARKER=plow_xr_native_abi_1 \
+    -I"$R/amd" -I"$R/common" "$R/amd/xr_native.hip"
+  # PLOW_AMD_LT_FUSE: decode GEMMs of one input (GLM-5.3 KDA in-projection) as one split-K pass.
+  bash "$R/cmake/hipcc_hsaco.sh" hipcc "$BUN" "$ARCH" \
+    "$OUT/glm_inproj_gfx950.elf" plow_glm_inproj_partial 512 1 \
+    -DPLOW_LEAN_OBJECT=1 -DPLOW_NO_SPILL=1 \
+    -DPLOW_REQUIRED_MARKER=plow_glm_inproj_abi_4 \
+    -I"$R/amd" -I"$R/common" "$R/amd/glm_inproj.hip"
 fi
 
 # Delete FIRST. A build that fails must leave nothing behind to run.

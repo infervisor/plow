@@ -230,6 +230,16 @@ __device__ void d_glu(bf16* __restrict__ out, const bf16* __restrict__ gate,
     }
 }
 
+/* GemvGluDown staging (Gemv norm >= 3, act = norm - 3): the staged gate row becomes d_glu's
+ * output in place. Barriers on exit. */
+#define GEMV_GLU_STAGE_AVAILABLE 1
+__device__ __forceinline__ void gemv_glu_lds(bf16* lds, const bf16* __restrict__ up, size_t n,
+                                             unsigned act, float limit) {
+    for (size_t i = threadIdx.x; i < n; i += PLOW_THREADS)
+        lds[i] = f2bf(act_glu_pair(bf2f(lds[i]), bf2f(up[i]), act, limit));
+    __syncthreads();
+}
+
 /* Final logit softcapping: cap * tanh(x / cap). Gemma 4 uses cap = 30 on the
  * lm_head output. There is NO attention-logit softcapping in the text tower. */
 __device__ void d_softcap(bf16* __restrict__ out, const bf16* __restrict__ x, unsigned n,

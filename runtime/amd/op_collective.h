@@ -792,7 +792,9 @@ __device__ __forceinline__ void d_xreduce_tag_publish(const bf16* part, void* ts
  * directly, so the combine packet and its gate are not emitted at all. Bit-exact against
  * d_moe_combine -> d_xreduce_tag_publish by construction; the plain partial slot is not
  * written. Carried on the XReduce packet as `t1 = part ([k, n] f32)`, `i7 = k` (0 = off);
- * the loader refuses a folded packet on an object without `plow_xr_combine_fold_1`. */
+ * the loader refuses a folded packet on an object without `plow_xr_combine_fold_1`.
+ * GLM's combine also adds a bf16 `shared` row first (d_moe_combine's order: 0 + shared, then the
+ * slots); the packet carries it in `t6` (TENSOR_NONE = none). */
 #ifndef PLOW_XR_COMBINE_FOLD
 #define PLOW_XR_COMBINE_FOLD 0
 #endif
@@ -811,6 +813,7 @@ extern "C" __device__ unsigned plow_xr_combine_fold_1 = 1;
  * adds (adding +0.0f would turn a -0.0f sum into +0.0f). */
 #define PLOW_XRT_FOLD_MAXK 16u
 __device__ __forceinline__ void d_xreduce_tag_publish_combine(const float* part, uint32_t k,
+                                                              const bf16* shared,
                                                               void* tslot, uint32_t n,
                                                               uint32_t tag, unsigned slice,
                                                               unsigned nblk) {
@@ -832,6 +835,7 @@ __device__ __forceinline__ void d_xreduce_tag_publish_combine(const float* part,
 #pragma unroll
         for (uint32_t j = 0; j < PLOW_XRT_PER_WORD; j++) {
             float acc = 0.0f;
+            if (shared) acc += bf2f(shared[(e + j < n) ? e + j : e]);
 #pragma unroll
             for (uint32_t s = 0; s < PLOW_XRT_FOLD_MAXK; s++)
                 if (s < k) acc += v[j][s];
@@ -849,7 +853,7 @@ __device__ __forceinline__ void d_xreduce_tagged_mega(
     uint32_t* status, unsigned slice, unsigned nblk, uint32_t gslot_bytes, uint32_t gcols,
     uint32_t row_w, uint32_t tag_off, uint32_t tag_slot
 #if PLOW_XR_COMBINE_FOLD
-    , const float* cpart, uint32_t ck
+    , const float* cpart, uint32_t ck, const bf16* cshared
 #endif
 #if PLOW_XR_TRACE_PHASES
     , PlowTraceRec* xr_trace = nullptr
@@ -875,8 +879,8 @@ __device__ __forceinline__ void d_xreduce_tagged_mega(
     const uint32_t tg_off = tag_off + (2u + parity) * tag_slot;
 #if PLOW_XR_COMBINE_FOLD
     if (ck)
-        d_xreduce_tag_publish_combine(cpart, ck, (char*)peer_scratch[rank] + tp_off, n, want,
-                                      slice, nblk);
+        d_xreduce_tag_publish_combine(cpart, ck, cshared, (char*)peer_scratch[rank] + tp_off, n,
+                                      want, slice, nblk);
     else
 #endif
     d_xreduce_tag_publish((const bf16*)((const char*)peer_scratch[rank] + slot_bytes),
