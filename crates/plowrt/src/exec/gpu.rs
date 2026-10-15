@@ -19,6 +19,19 @@ fn pf_packlog_on() -> bool {
 /// Fixed cost of ONE prefill launch, in padded-row equivalents (measured on sm_120 / gemma-4-12B).
 pub(crate) const PF_CHUNK_COST_ROWS: usize = 512;
 
+/// The smallest rung of an ascending `ladder` holding `rows`; the widest when none does (0 when
+/// the ladder is empty).
+pub(crate) fn cover_rung(ladder: impl Iterator<Item = usize>, rows: usize) -> usize {
+    let mut widest = 0;
+    for t in ladder {
+        if t >= rows {
+            return t;
+        }
+        widest = t;
+    }
+    widest
+}
+
 use crate::asset::devblob::{DevBlob, DevProg};
 use crate::device::cuda::{CudaBackend, CudaEvent, CudaStream, KernelFn, PinnedHost};
 use crate::device::{Backend, DeviceMem, Module};
@@ -9041,6 +9054,13 @@ impl GpuEngine {
             return 0;
         }
         self.prefill[self.pick_prefill_bucket(avail, usize::MAX)].t as usize
+    }
+
+    /// The rung a launch of `rows` rows runs: the smallest bucket holding them (the token batch's
+    /// pick), the widest when none does. Not [`Self::pf_pack_budget`], which is the first launch of
+    /// the cheapest cover and can be narrower than `rows` (4260 rows: 4160, then a tail).
+    pub fn pf_cover_rows(&self, rows: usize) -> usize {
+        cover_rung(self.prefill.iter().map(|b| b.t as usize), rows)
     }
 
     /// The prefill bucket ladder, ascending rows.
