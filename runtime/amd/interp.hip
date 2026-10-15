@@ -2836,9 +2836,10 @@ __device__ __forceinline__ void exec_gemv(CInst in, CTens T,
     /* No `part` here on purpose: `plow_smem` is a UNION, so `sm->part` and `sm->gm` are one
      * buffer. The fused-norm arm (norm == 2) takes its reduction scratch from the TOP of the
      * arena itself — handing it `sm->part` would write through the row it is reducing. */
+    /* i3 >= 3 (GemvGluDown): t1 = gate, t4 = up, act = i3 - 3, f1 = limit. */
     d_gemv((bf16*)TEN(0), (const bf16*)TEN(1) + (size_t)in->i[4] * in->i[2], (const bf16*)TEN(2),
            (const float*)TEN(3), (const bf16*)TEN(4), in->i[0], in->i[1], in->i[2],
-           (int)in->i[3], in->fj[0].f, slice, nblk, lds);
+           (int)in->i[3], in->i[3] >= 3u ? in->fj[1].f : in->fj[0].f, slice, nblk, lds);
 #undef TEN
 }
 #if PLOW_FP8
@@ -7312,7 +7313,10 @@ __attribute__((amdgpu_waves_per_eu(PLOW_WPE, PLOW_WPE))) void PLOW_INTERP_NAME(P
                                   , in->t[1] == PLOW_TENSOR_NONE
                                         ? nullptr
                                         : (const float*)tens[in->t[1]],
-                                  in->i[7]
+                                  in->i[7],
+                                  in->t[6] == PLOW_TENSOR_NONE
+                                        ? nullptr
+                                        : (const bf16*)tens[in->t[6]]
 #endif
 #if PLOW_XR_TRACE_PHASES
                                   , prog.trace ? &prog.trace[base + ix] : nullptr

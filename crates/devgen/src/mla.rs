@@ -12022,6 +12022,9 @@ pub(crate) fn emit_glm_moe_ffn(
     // GEMV_FP8_BLK (44) — the exact pair `emit_glm_dense_block` already uses for the dense FFN,
     // same operand slots (t2/t5 weights, t3/t4 grids on 47; t5 grid on 44) and same i[] meanings.
     // Op 47 is i0=N i1=K where GemvGlu is i0=M i1=N i2=K, which is why this is a separate emit.
+    // PLOW_GLM_SHARED_GLU_DOWN: the up half's counter, when the down GEMV applies the GLU.
+    let glu_down = emit_config::active().glm_shared_glu_down && enc != MoeEnc::Mxfp4;
+    let mut glu_down_up: Option<u32> = None;
     let c_shglu = if emit_config::active().glm_shared_w8a8 {
         emit_glm_shared_w8a8_glu(b, c, &shared_cus, n, w, 1, h, imoe_l, c_rn2)
     } else if glu_split {
@@ -12097,6 +12100,10 @@ pub(crate) fn emit_glm_moe_ffn(
         };
         let c_g = gemv_half(b, sh_g, n.shfu, w.shg, w.shg_s);
         let c_u = gemv_half(b, sh_u, n.shfu_up, w.shu, w.shu_s);
+        if glu_down {
+            glu_down_up = Some(c_u);
+            c_g
+        } else {
         b.emit(DevOp::Glu, shared_cus[..1].to_vec(), &[c_g, c_u], |d| {
             d.t[0] = n.shfu;
             d.t[1] = n.shfu;
@@ -12106,6 +12113,7 @@ pub(crate) fn emit_glm_moe_ffn(
             d.i[1] = act;
             d.f[1] = limit;
         })
+        }
     } else {
         let shglu_op = if enc == MoeEnc::Mxfp4 {
             DevOp::GemvGluMxfp4
@@ -12158,7 +12166,8 @@ pub(crate) fn emit_glm_moe_ffn(
         } else {
             DevOp::Gemv
         };
-        b.emit(shd_op, shared_cus.clone(), &[c_shglu], |d| {
+        let deps: Vec<u32> = std::iter::once(c_shglu).chain(glu_down_up).collect();
+        b.emit(shd_op, shared_cus.clone(), &deps, |d| {
             // Same destination rule as the fp8/W8A8 arms above: the combine below reads the
             // shared partial from `n.attn` under `raw_output`. A bf16 shared expert
             // (GLM-5.3-Flash) wrote `n.shared` here and the combine summed the attention
@@ -12173,6 +12182,12 @@ pub(crate) fn emit_glm_moe_ffn(
             d.i[1] = h;
             d.i[2] = imoe_l;
             d.f[0] = 1.0;
+            if glu_down_up.is_some() {
+                let (act, limit) = glm_glu_act(c);
+                d.t[4] = n.shfu_up;
+                d.i[3] = 3 + act;
+                d.f[1] = limit;
+            }
         })
     };
     // 18..33 the top-8 routed experts (gate/up GLU then down). imoe_e = full moe_inter under EP (whole
@@ -12273,17 +12288,25 @@ pub(crate) fn emit_glm_moe_ffn(
     deps.extend_from_slice(&downs);
     let no_xr = tp > 1 && emit_config::active().no_xreduce;
     if tp > 1 && !no_xr {
+        let shared_src = if raw_output { n.attn } else { n.shared };
+        // PLOW_GLM_XR_COMBINE: the tagged publish sums shared + slots itself (no dg_tp write).
+        let c_xr = if emit_config::active().glm_xr_combine && tk <= 16 {
+            crate::emit_xreduce_combine_fold(
+                b, xgate, xr_cus, &deps, n.attn, h, tp, n.slot_b, n.part, tk, shared_src,
+            )
+        } else {
         let c_cmb = b.emit(DevOp::MoeCombine, elem_cus(&all, h), &deps, |d| {
             d.t[0] = n.dg_tp;
             d.t[1] = TENSOR_NONE;
-            d.t[2] = if raw_output { n.attn } else { n.shared };
+            d.t[2] = shared_src;
             d.t[3] = n.part;
             d.i[0] = h;
             d.i[1] = tk;
         });
         // partial_A = og_tp @ 0, partial_B = dg_tp @ n.slot_b. Blob-wide, so a decode program
         // sharing a tensor table with prefill buckets names the SAME offset they do.
-        let c_xr = emit_xreduce(b, xgate, true, xr_cus, c_cmb, n.attn, h, tp, n.slot_b);
+        emit_xreduce(b, xgate, true, xr_cus, c_cmb, n.attn, h, tp, n.slot_b)
+        };
         // LAYER-SEAM FOLD: one AddNorm writes the residual stream AND the next layer's normed
         // input, deleting the next block's `RmsNorm` packet. See `glm_fuse_seam`.
         if raw_output {

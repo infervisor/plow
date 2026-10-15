@@ -1118,6 +1118,16 @@ pub struct EmitConfig {
     #[arg(long, env = "PLOW_GLM_ROUTER_SIGNAL", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
     pub glm_router_signal: bool,
 
+    /// One-row clamped shared expert: the pair Glu folds into the down GEMV's staged activation
+    /// (Gemv norm = 3 + act, t4 = up, f1 = limit). Same bytes into the down; one hop fewer.
+    #[arg(long, env = "PLOW_GLM_SHARED_GLU_DOWN", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
+    pub glm_shared_glu_down: bool,
+
+    /// One-row GLM MoE under TP: the combine (shared + routed slots) folds into the tagged
+    /// XReduce publish (`PLOW_XR_COMBINE_FOLD` with the shared row in t6). One hop fewer.
+    #[arg(long, env = "PLOW_GLM_XR_COMBINE", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
+    pub glm_xr_combine: bool,
+
     /// Batched decode KDA: emit g_b after f_a/b so the six x-fed hipBLASLt projections are
     /// adjacent (runtime PLOW_AMD_LT_CONCURRENT then drops their barriers). Same math.
     #[arg(long, env = "PLOW_GLM_KDA_LT_ORDER", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
@@ -1981,6 +1991,8 @@ impl EmitConfig {
             glm_hc_mix_raw: env_bool("PLOW_GLM_HC_MIX_RAW"),
             glm_router_raw: env_bool("PLOW_GLM_ROUTER_RAW"),
             glm_router_signal: env_bool("PLOW_GLM_ROUTER_SIGNAL"),
+            glm_shared_glu_down: env_bool("PLOW_GLM_SHARED_GLU_DOWN"),
+            glm_xr_combine: env_bool("PLOW_GLM_XR_COMBINE"),
             glm_kda_lt_order: env_bool("PLOW_GLM_KDA_LT_ORDER"),
             glm_hc_aiter: env_bool("PLOW_GLM_HC_AITER"),
             glm_hc_fold_mla: env_bool("PLOW_GLM_HC_FOLD_MLA"),

@@ -255,6 +255,10 @@ const CHAIN_IDLE: u64 = u64::MAX;
 struct DispatchTimes {
     sigs: Vec<HsaSignal>,
     kobj: Vec<AtomicU64>,
+    /// Host system-domain timestamps (ns, `HSA_SYSTEM_INFO_TIMESTAMP`, the domain the dispatch
+    /// times are reported in): header publish, and the doorbell write that covered the packet.
+    host_pub: Vec<AtomicU64>,
+    host_door: Vec<AtomicU64>,
     written: AtomicU64,
     out: parking_lot::Mutex<(u64, std::io::BufWriter<std::fs::File>)>,
 }
@@ -284,6 +288,8 @@ impl DispatchTimes {
         Some(Box::new(Self {
             sigs,
             kobj: (0..QUEUE_SIZE).map(|_| AtomicU64::new(0)).collect(),
+            host_pub: (0..QUEUE_SIZE).map(|_| AtomicU64::new(0)).collect(),
+            host_door: (0..QUEUE_SIZE).map(|_| AtomicU64::new(0)).collect(),
             written: AtomicU64::new(0),
             out: parking_lot::Mutex::new((0, std::io::BufWriter::new(f))),
         }))
@@ -299,6 +305,22 @@ impl DispatchTimes {
         unsafe { (drv.hsa_signal_store_screlease)(s, 1) };
         self.written.fetch_max(idx + 1, Ordering::AcqRel);
         s
+    }
+
+    fn host_now(drv: &HsaDriver) -> u64 {
+        let mut t = 0u64;
+        // HSA_SYSTEM_INFO_TIMESTAMP
+        unsafe { (drv.hsa_system_get_info)(2, &mut t as *mut u64 as *mut c_void) };
+        t
+    }
+
+    fn published(&self, drv: &HsaDriver, idx: u64) {
+        self.host_pub[self.slot(idx)].store(Self::host_now(drv), Ordering::Relaxed);
+    }
+
+    /// A doorbell write covering every packet up to `last`.
+    fn rang(&self, drv: &HsaDriver, last: u64) {
+        self.host_door[self.slot(last)].store(Self::host_now(drv), Ordering::Relaxed);
     }
 
     fn name(&self, kobj: u64, name: &str) {
@@ -318,6 +340,12 @@ impl DispatchTimes {
             if rc == HSA_STATUS_SUCCESS {
                 let k = self.kobj[self.slot(idx)].load(Ordering::Relaxed);
                 let _ = writeln!(g.1, "{idx},{},{},{k}", t[0], t[1]);
+                let _ = writeln!(
+                    g.1,
+                    "#h,{idx},{},{}",
+                    self.host_pub[self.slot(idx)].swap(0, Ordering::Relaxed),
+                    self.host_door[self.slot(idx)].swap(0, Ordering::Relaxed)
+                );
             }
         }
         if upto >> 14 != g.0 >> 14 {
@@ -2677,6 +2705,9 @@ impl HsaBackend {
             std::sync::atomic::AtomicU32::from_ptr(pkt as *mut u32)
                 .store(header_setup, Ordering::Release);
         }
+        if let Some(t) = &self.dtimes {
+            t.published(&self.shared.drv, idx);
+        }
 
         // Immediate batches retain ordinary per-dispatch doorbells. Deferred
         // chains ring once after every TP rank has been prepared.
@@ -2685,6 +2716,9 @@ impl HsaBackend {
         }) {
             unsafe {
                 (self.shared.drv.hsa_signal_store_screlease)((*q).doorbell_signal, idx as i64);
+            }
+            if let Some(t) = &self.dtimes {
+                t.rang(&self.shared.drv, idx);
             }
         }
         if chain_end == CHAIN_IDLE {
@@ -4021,6 +4055,9 @@ impl HsaBackend {
                     (*self.queue).doorbell_signal,
                     (end - 1) as i64,
                 );
+            }
+            if let Some(t) = &self.dtimes {
+                t.rang(&self.shared.drv, end - 1);
             }
         }
         self.kernarg_retirement
