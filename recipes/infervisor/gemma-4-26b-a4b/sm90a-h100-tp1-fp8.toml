@@ -31,7 +31,7 @@ namespace = "infervisor"
 name = "gemma-4-26b-a4b"
 label = "sm90a-h100-tp1-fp8"
 status = "validated"
-plow_git = "edbe43e9b0663c8faff61b87e25e9a640bc42e0f"
+plow_git = "642771946c2a6a0972d91b4f0ac4a1a2887c55ab"
 network = "gemma4"
 
 [target]
@@ -92,7 +92,13 @@ PLOW_GEMMA_MOE_ROUTER_EXACT = "0"
 # B32 ctx16000 28.81 -> 26.02), VMM kv_len 4094/4095/8191 clean; FP32 gate PASS (kl_mean 0.1858 vs vLLM 0.202,
 # top1 0.9662) and long gate PASS (kl_mean 0.1292 vs 0.165, top1 0.9654). hd256 WPR loses at B16/32 (not set).
 # Evidence: g26-pfrung REPORT.md section 19 (dec/ab-wpr8, ab/gw-wpr8).
-NVCC_APPEND_FLAGS = "-DPLOW_MOE_FP8_DEDUP=1 -DPLOW_NV_FA_WPR=1 -DPLOW_NV_FA_WPR_FP8=1"
+# -DPLOW_NV_FA_RG8=2: FP8-KV row-group decode item at hd256 (8 rows/warp) and hd512 (4 rows/warp) replaces those
+# bodies (qualified 2026-10-15): decode step vs the WPR packet at ctx 1024/5600/16000 B1 -8..-11%, B16 -12/-16/-25%,
+# B32 -12/-20/-31% (B32 ctx16000 25.95 -> 17.99 ms), VMM kv_len 4094/4095/8191 clean; probe relL2 vs FP64 identical to
+# WPR at every (b, h) incl. peaky Q and ragged lengths, memcheck clean; mixed-context full-step logits: no outlier slot.
+# c4 long gate 7 runs: top1_decisive mean 0.9621 vs WPR 0.9651 (5 runs), cont_decisive 0.721 vs 0.730 (Mann-Whitney
+# p 0.31 / 0.64); 6 of 7 pass the 0.125 margin. Evidence: g26-pfrung REPORT.md sections 20-22 (dec/ab-rg8, ab/gl30-*).
+NVCC_APPEND_FLAGS = "-DPLOW_MOE_FP8_DEDUP=1 -DPLOW_NV_FA_WPR=1 -DPLOW_NV_FA_WPR_FP8=1 -DPLOW_NV_FA_RG8=2"
 PLOW_EMIT_MOE_PF_LT = "1"
 # Dense gate|up as two FP8 cuBLASLt GEMMs + Glu/Quant (qualified 2026-10-15, packet bd9c0722e368, plowrt 2dff2171):
 # prefill rungs at prefix 0 128/256/1024/4096 rows 15.69/17.53/26.46/81.33 vs 17.24/18.33/30.81/96.23 ms
