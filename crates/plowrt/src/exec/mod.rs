@@ -51,6 +51,8 @@ pub mod affinity;
 /// all-ranks, with a host barrier — see the module note for why the two differ.
 #[cfg(feature = "hsa")]
 pub mod amd_tp;
+#[cfg(feature = "hsa")]
+mod rank_pool;
 /// Apple Neural Engine executor: CoreML programs built from plow weights, run at segment
 /// boundaries of the Metal walk. See `plans/apple-silicon-backend.md` §4.5.
 #[cfg(all(feature = "ane", target_os = "macos"))]

@@ -1006,6 +1006,27 @@ pub struct EmitConfig {
     /// `--glm-gemm-lt`.
     #[arg(long, env = "PLOW_GLM_GEMM_LT_PF_EXT")]
     pub glm_gemm_lt_pf_ext: Option<String>,
+    /// GLM-5.3-Flash gfx950 prefill: comma list of dense BF16 projections that run the pinned
+    /// gfx950 hipBLASLt object (`glm_lt_gfx950.elf`) as their own segment: `q_a`, `kv_a`,
+    /// `q_absorb`, `mla_o`, `kda_o`, `kda_gb`. Unset => byte-identical.
+    #[arg(long, env = "PLOW_GLM53_GEMM_LT")]
+    pub glm53_gemm_lt: Option<String>,
+    /// Smallest prefill bucket (rows) `PLOW_GLM53_GEMM_LT` routes.
+    #[arg(long, env = "PLOW_GLM53_GEMM_LT_MIN_ROWS", default_value_t = 2048)]
+    pub glm53_gemm_lt_min_rows: u32,
+    /// Largest prefill bucket (rows) `PLOW_GLM53_GEMM_LT` routes.
+    #[arg(long, env = "PLOW_GLM53_GEMM_LT_MAX_ROWS", default_value_t = 8192)]
+    pub glm53_gemm_lt_max_rows: u32,
+    /// GLM-5.3-Flash gfx950 decode: comma list of dense BF16 projections that run the pinned
+    /// gfx950 hipBLASLt object as their own segment at the `PLOW_GLM53_GEMM_LT_DEC_RUNGS` rungs:
+    /// `q_a`, `kv_a`, `q_absorb`, `mla_o`, `kda_o`, `kda_qkv`, `kda_gfa` (g_a, f_a), `kda_gb`
+    /// (g_b, f_b), `kda_b`. A routed KDA layer drops the PLOW_GLM_KDA_PROJ_GROUP packets. Unset =>
+    /// byte-identical.
+    #[arg(long, env = "PLOW_GLM53_GEMM_LT_DEC")]
+    pub glm53_gemm_lt_dec: Option<String>,
+    /// Decode rungs `PLOW_GLM53_GEMM_LT_DEC` routes (comma list).
+    #[arg(long, env = "PLOW_GLM53_GEMM_LT_DEC_RUNGS", default_value = "32,128")]
+    pub glm53_gemm_lt_dec_rungs: String,
 
     /// Cap the dispatch width of every blocked GEMV. Unset ⇒ byte-identical.
     #[arg(long, env = "PLOW_GLM_GEMV_WG")]
@@ -1097,6 +1118,14 @@ pub struct EmitConfig {
     /// KDA and FFN sides; the MLA block then reads the normed rows and emits no norm packet.
     #[arg(long, env = "PLOW_GLM_HC_FOLD_MLA", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
     pub glm_hc_fold_mla: bool,
+
+    /// PLOW_GLM_HC_AITER applies only to rungs with at least this many rows (unset = every rung).
+    #[arg(long, env = "PLOW_GLM_HC_AITER_MIN_ROWS")]
+    pub glm_hc_aiter_min_rows: Option<u32>,
+
+    /// PLOW_KDA_DECODE_WIDE applies only to rungs with at least this many rows (unset = 2).
+    #[arg(long, env = "PLOW_KDA_DECODE_WIDE_MIN_ROWS")]
+    pub kda_decode_wide_min_rows: Option<u32>,
 
     /// PLOW_GLM_KDA_PROJ_GROUP split override: every grouped projection splits K by the largest
     /// power of two <= this (fewer fp32 partials than the per-projection split-K). NOT bit-identical.
@@ -1914,6 +1943,12 @@ impl EmitConfig {
             glm_fold_lt: env_bool_opt("PLOW_GLM_FOLD_LT"),
             glm_gemm_blk: env_str("PLOW_GLM_GEMM_BLK"),
             glm_gemm_lt_pf_ext: env_str("PLOW_GLM_GEMM_LT_PF_EXT"),
+            glm53_gemm_lt: env_str("PLOW_GLM53_GEMM_LT"),
+            glm53_gemm_lt_min_rows: env_u32("PLOW_GLM53_GEMM_LT_MIN_ROWS").unwrap_or(2048),
+            glm53_gemm_lt_max_rows: env_u32("PLOW_GLM53_GEMM_LT_MAX_ROWS").unwrap_or(8192),
+            glm53_gemm_lt_dec: env_str("PLOW_GLM53_GEMM_LT_DEC"),
+            glm53_gemm_lt_dec_rungs: env_str("PLOW_GLM53_GEMM_LT_DEC_RUNGS")
+                .unwrap_or_else(|| "32,128".into()),
             glm_gemv_wg: env_u32("PLOW_GLM_GEMV_WG"),
             glm_ofold: env_bool("PLOW_GLM_OFOLD"),
             glm_hc_norm_fold: env_bool("PLOW_GLM_HC_NORM_FOLD"),
@@ -1931,6 +1966,8 @@ impl EmitConfig {
             glm_hc_mix_raw: env_bool("PLOW_GLM_HC_MIX_RAW"),
             glm_hc_aiter: env_bool("PLOW_GLM_HC_AITER"),
             glm_hc_fold_mla: env_bool("PLOW_GLM_HC_FOLD_MLA"),
+            glm_hc_aiter_min_rows: env_u32("PLOW_GLM_HC_AITER_MIN_ROWS"),
+            kda_decode_wide_min_rows: env_u32("PLOW_KDA_DECODE_WIDE_MIN_ROWS"),
             glm_kda_proj_group_s: env_u32("PLOW_GLM_KDA_PROJ_GROUP_S"),
             glm_kda_qkvg_r1: env_bool("PLOW_GLM_KDA_QKVG_R1"),
             glm_hc_fuse_variant: env_u32("PLOW_GLM_HC_FUSE_VARIANT"),

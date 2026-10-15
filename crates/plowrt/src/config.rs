@@ -1708,6 +1708,10 @@ pub struct AmdRuntimeConfig {
     /// run side by side. Missing objects fall back to per-span launches.
     #[arg(long = "amd-packed-lean-kda-batch", env = "PLOW_AMD_PACKED_LEAN_KDA_BATCH", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
     pub packed_lean_kda_batch: bool,
+    /// The packed KDA family object built with PLOW_PACKED_KDA_PAR (`interp_packed_kda_par.elf`):
+    /// one-row spans (decode riders) run as a flat (span, channel) item space.
+    #[arg(long = "amd-packed-kda-par", env = "PLOW_AMD_PACKED_KDA_PAR", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
+    pub packed_kda_par: bool,
     /// The prompts a packed prefill launch finishes take their prefix-cache state snapshots
     /// behind one completion wait per rank instead of one per prompt; `=0` restores per-prompt.
     #[arg(long = "amd-packed-snap-batch", env = "PLOW_AMD_PACKED_SNAP_BATCH", default_value_t = true, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
@@ -2206,6 +2210,11 @@ pub struct AmdRuntimeConfig {
     #[arg(long = "amd-mla-pf-row-split-native-lo", env = "PLOW_MLA_PF_ROW_SPLIT_NATIVE_LO", default_value_t = true, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
     pub mla_pf_row_split_native_lo: bool,
 
+    /// gfx950: run each group of a `GemmGroupPf` segment (the KDA fused in-projection) as its own
+    /// pinned hipBLASLt launch (`glm_lt_gfx950.elf`) instead of `plow_gemm_group_pf_gfx950`.
+    #[arg(long = "amd-gemm-group-lt", env = "PLOW_AMD_GEMM_GROUP_LT", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
+    pub gemm_group_lt: bool,
+
     /// DIAGNOSTIC. Zero the whole sparse-MLA workspace before every row-band dispatch, so the
     /// dispatch sees the device state a freshly loaded server would give it. Bisects the
     /// row-band wrong-answer defect: that defect is armed by any ordinary program-3 execution in
@@ -2271,6 +2280,10 @@ pub struct AmdRuntimeConfig {
     /// barrier bit orders every earlier packet before it), not on every dispatch.
     #[arg(long = "amd-tail-signal", env = "PLOW_AMD_TAIL_SIGNAL", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
     pub tail_signal: bool,
+    /// Deferred AQL chains read the VRAM kernarg BAR back once at commit (the chain's last slot)
+    /// instead of once per packet.
+    #[arg(long = "amd-karg-chain-flush", env = "PLOW_AMD_KARG_CHAIN_FLUSH", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
+    pub karg_chain_flush: bool,
     /// Diagnostic: `<acquire>,<release>` HSA fence scopes (0 none, 1 agent, 2 system) on every
     /// dispatch packet. Unset = agent,agent. Not ordering-safe below agent.
     #[arg(long = "amd-pkt-fence", env = "PLOW_AMD_PKT_FENCE", global = true)]
@@ -2278,6 +2291,18 @@ pub struct AmdRuntimeConfig {
     /// Diagnostic: `<prefix>` — per-dispatch GPU start/end to `<prefix>.dev<N>.csv`.
     #[arg(long = "amd-dispatch-times", env = "PLOW_AMD_DISPATCH_TIMES", global = true)]
     pub dispatch_times: Option<String>,
+    /// TP decode: per-rank synchronous host copies (staging, token readback, id seeding) run
+    /// on one thread per rank so their SDMA round trips overlap.
+    #[arg(long = "amd-tp-par-host", env = "PLOW_TP_PAR_HOST", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
+    pub tp_par_host: bool,
+    /// TP decode: append the compact counter audit to each rank's decode chain instead of a
+    /// second submit and drain after it.
+    #[arg(long = "amd-tp-audit-tail", env = "PLOW_TP_AUDIT_TAIL", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
+    pub tp_audit_tail: bool,
+    /// TP decode: per-rank host work (the decode chain fill and, with PLOW_TP_PAR_HOST, the
+    /// per-rank copies) runs on persistent workers instead of threads spawned per token.
+    #[arg(long = "amd-tp-rank-pool", env = "PLOW_TP_RANK_POOL", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
+    pub tp_rank_pool: bool,
 }
 
 /// Global runtime config, initialized once at startup from CLI parse.

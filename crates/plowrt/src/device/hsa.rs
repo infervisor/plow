@@ -320,8 +320,10 @@ impl DispatchTimes {
                 let _ = writeln!(g.1, "{idx},{},{},{k}", t[0], t[1]);
             }
         }
+        if upto >> 14 != g.0 >> 14 {
+            let _ = g.1.flush();
+        }
         g.0 = g.0.max(upto);
-        let _ = g.1.flush();
     }
 
     fn load(&self, drv: &HsaDriver, agent: HsaAgent) -> i64 {
@@ -359,6 +361,7 @@ impl DispatchTimes {
 
 struct PktKnobs {
     tail_signal: bool,
+    karg_chain_flush: bool,
     acquire: u32,
     release: u32,
 }
@@ -378,6 +381,7 @@ fn pkt_knobs() -> &'static PktKnobs {
             .unwrap_or((HSA_FENCE_SCOPE_AGENT, HSA_FENCE_SCOPE_AGENT));
         PktKnobs {
             tail_signal: amd.tail_signal,
+            karg_chain_flush: amd.karg_chain_flush,
             acquire,
             release,
         }
@@ -1038,6 +1042,9 @@ pub struct HsaBackend {
     chain_next: AtomicU64,
     chain_end: AtomicU64,
     chain_immediate: std::sync::atomic::AtomicBool,
+    /// PLOW_AMD_KARG_CHAIN_FLUSH: the last VRAM kernarg slot written into the open deferred
+    /// chain (address, size, last byte), read back once at commit instead of per packet.
+    chain_karg: std::sync::Mutex<Option<(usize, usize, u8, [u8; KARG_SLOT])>>,
     kernarg_retirement: super::kernarg_retirement::KernargRetirement,
     /// Reusable zero source + completion signal for [`PeerMemory::zero_peer`].
     /// See `zero_peer` for why the per-token path cannot afford to build these
@@ -1442,6 +1449,7 @@ impl HsaBackend {
             chain_next: AtomicU64::new(0),
             chain_end: AtomicU64::new(CHAIN_IDLE),
             chain_immediate: std::sync::atomic::AtomicBool::new(false),
+            chain_karg: std::sync::Mutex::new(None),
             kernarg_retirement: super::kernarg_retirement::KernargRetirement::new(),
             zero_stage: parking_lot::Mutex::new(None),
             peer_host_writable: std::sync::atomic::AtomicBool::new(false),
@@ -2570,7 +2578,17 @@ impl HsaBackend {
                     [wg_x, wg_y, wg_z],
                 );
                 std::ptr::copy_nonoverlapping(stage.as_ptr(), karg, n);
-                if n > 0 && !publish_device_kernarg(karg, n, stage[n - 1]) {
+                // A deferred chain rings once: the BAR is read back once, at commit, for the
+                // chain's last slot. A read completes only after every earlier posted write.
+                let defer = n > 0
+                    && pkt_knobs().karg_chain_flush
+                    && chain_end != CHAIN_IDLE
+                    && !self.chain_immediate.load(Ordering::Relaxed);
+                if defer {
+                    #[cfg(target_arch = "x86_64")]
+                    std::arch::x86_64::_mm_sfence();
+                    *self.chain_karg.lock().unwrap() = Some((karg as usize, n, stage[n - 1], stage));
+                } else if n > 0 && !publish_device_kernarg(karg, n, stage[n - 1]) {
                     // A BAR write that did not land: copy once more, and poison the device rather
                     // than publish a packet over a stale slot.
                     std::ptr::copy_nonoverlapping(stage.as_ptr(), karg, n);
@@ -3972,6 +3990,27 @@ impl HsaBackend {
             return Err(error);
         }
         let end = self.chain_end.load(Ordering::Acquire);
+        if let Some((karg, n, last, stage)) = self.chain_karg.lock().unwrap().take() {
+            let karg = karg as *mut u8;
+            // SAFETY: `karg` is this chain's last kernarg slot (`n <= KARG_SLOT` bytes), still
+            // reserved: the chain has not been published.
+            let ok = unsafe {
+                publish_device_kernarg(karg, n, last) || {
+                    std::ptr::copy_nonoverlapping(stage.as_ptr(), karg, n);
+                    publish_device_kernarg(karg, n, last)
+                }
+            };
+            if !ok {
+                let info = DeviceErrorInfo {
+                    operation: "kernarg readback (PLOW_AMD_KARG_CHAIN_FLUSH)".into(),
+                    code: -1,
+                    name: "KERNARG_READBACK_MISMATCH".into(),
+                    fatal: true,
+                };
+                self.mark_poisoned(&info);
+                return Err(RuntimeError::DeviceFault { info });
+            }
+        }
         if super::kernarg_retirement::ring_on_commit(self.chain_immediate.load(Ordering::Relaxed)) {
             unsafe {
                 (self.shared.drv.hsa_signal_store_screlease)(

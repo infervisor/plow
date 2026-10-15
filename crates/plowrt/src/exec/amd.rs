@@ -8222,18 +8222,25 @@ impl AmdEngine {
             ));
         }
         let has_gemm_lt = |p: &DevProg| p.insts.iter().any(|d| d.op == DevOp::GemmLtPf as u16);
-        let use_gemm_lt = blob.progs.iter().any(has_gemm_lt);
+        let use_gemm_lt = blob.progs.iter().any(has_gemm_lt)
+            || (arch == "gfx950"
+                && crate::config::RuntimeConfig::get().amd.gemm_group_lt
+                && blob
+                    .progs
+                    .iter()
+                    .flat_map(|p| &p.insts)
+                    .any(|d| d.op == DevOp::GemmGroupPf as u16));
         let gemma_gemm_lt = blob
             .progs
             .iter()
             .flat_map(|p| &p.insts)
             .any(|d| d.op == DevOp::GemmLtPf as u16 && d.i[3] == 3);
         if use_gemm_lt
-            && (arch != "gfx942"
+            && (!amd_gemm_lt::arch_matches(&blob.progs, &arch)
                 || !amd_gemm_lt::topology_matches(&blob.progs, tp.as_ref().map(|b| b.n_gpu)))
         {
             return Err(RuntimeError::Device(
-                "hipBLASLt projection requires a qualified gfx942 topology and mode".into(),
+                "hipBLASLt projection requires a qualified gfx942/gfx950 topology and mode".into(),
             ));
         }
         let has_gemm_blk = |p: &DevProg| p.insts.iter().any(|d| d.op == DevOp::GemmBlkPf as u16);
@@ -9278,7 +9285,11 @@ impl AmdEngine {
                 markers.push(KDA_CHUNK_QPRE_SYM);
             }
             load_packed_family(
-                "interp_packed_kda",
+                if crate::config::RuntimeConfig::get().amd.packed_kda_par {
+                    "interp_packed_kda_par"
+                } else {
+                    "interp_packed_kda"
+                },
                 "plow_interp_packed_kda",
                 Phase::Prefill,
                 &markers,
@@ -10761,7 +10772,13 @@ impl AmdEngine {
             }
             None => None,
         };
-        let gemm_lt = if use_gemm_lt {
+        let gemm_lt = if use_gemm_lt && arch == "gfx950" {
+            Some(amd_gemm_lt::GemmLt::load_gfx950(
+                &be,
+                &hsaco_dir,
+                &mut modules,
+            )?)
+        } else if use_gemm_lt {
             Some(amd_gemm_lt::GemmLt::load(
                 &be,
                 &hsaco_dir,
@@ -14363,6 +14380,35 @@ impl AmdEngine {
                     args.c[g] = addr(tens[2 + g]);
                 }
             }
+            let groups = self.gemm_group_groups(&args);
+            if let Some(lt) = self.gemm_lt.as_ref().filter(|_| groups > 0) {
+                lt.enqueue_group(
+                    &self.be, args.x, args.w, &args.c, &args.n, groups, args.t, args.k,
+                )?;
+                self.seg_launches += groups as u64;
+                if groups == 6 || args.n[groups] == 0 {
+                    return Ok(());
+                }
+                // The unpinned tail groups stay on the grouped kernel.
+                let skipped: u32 = args.n[..groups].iter().sum();
+                args.w += u64::from(skipped) * u64::from(args.k) * 2;
+                args.c.copy_within(groups.., 0);
+                args.n.copy_within(groups.., 0);
+                args.c[6 - groups..].fill(0);
+                args.n[6 - groups..].fill(0);
+                let grid = gemm_group_grid(args.t, &args.n);
+                EngineDevice::launch_kernel(
+                    &*self.be,
+                    kernel,
+                    grid,
+                    512,
+                    0,
+                    as_bytes(std::slice::from_ref(&args)),
+                    None,
+                )?;
+                self.seg_launches += 1;
+                return Ok(());
+            }
             EngineDevice::launch_kernel(
                 &*self.be,
                 kernel,
@@ -14981,6 +15027,7 @@ impl AmdEngine {
     pub(crate) fn preflight_decode_replay(
         &self,
         p: usize,
+        extra: usize,
     ) -> Result<crate::device::kernarg_retirement::Admission> {
         if self.index_fp8.is_some() {
             // Refuse an unqualified domain before reserving otherwise unfillable AQL slots.
@@ -14992,7 +15039,8 @@ impl AmdEngine {
         }
         let packets = (0..self.decode_launches(p))
             .map(|seg| self.decode_segment_launches(p, seg))
-            .sum();
+            .sum::<usize>()
+            + extra;
         self.be.preflight_dispatch_chain(packets)
     }
 
@@ -15230,7 +15278,9 @@ impl AmdEngine {
         let route = self.progs[p].prefill_routes.get(seg)?;
         // PLOW_KDA_CARRY_SPLIT: a pack with a splittable span runs its carry per span (split
         // spans) or batched (PLOW_KDA_CARRY_MULTI), never through the all-spans carry.
+        // Spans under 512 rows (riders) have no per-span or split carry: they stay all-spans.
         if matches!(route, PrefillSegmentRoute::KdaChunkCarryKeyfeed { .. })
+            && self.packed_spans.iter().all(|s| s.n_rows >= 512)
             && self.packed_spans.iter().any(|s| self.kda_carry_split_launches(s.n_rows) > 1)
         {
             return None;
@@ -15248,6 +15298,23 @@ impl AmdEngine {
     /// One dispatch for every packed span: workgroup `b` serves span `b / per_span` with the
     /// per-span launch's geometry and operand rebasing (done on the device from the staged span
     /// table, `d_prefill_spans`).
+    /// Consecutive span groups of one all-spans dispatch each: the leading decode riders (one-row
+    /// spans, `advance_packed` puts them first) and the rest. Each group is sized for its own
+    /// widest span; one grid sized for a prompt span over 100+ riders launched ~100k empty
+    /// workgroups per lean segment (isl4096 c128: +38 ms per pack).
+    fn lean_span_groups(&self) -> ([(usize, usize); 2], usize) {
+        let n = self.packed_spans.len();
+        let short = self.packed_spans.iter().take_while(|s| s.n_rows <= 64).count();
+        if short == 0 || short == n {
+            ([(0, n), (0, 0)], 1)
+        } else {
+            ([(0, short), (short, n - short)], 2)
+        }
+    }
+
+    /// One dispatch per span group: workgroup `b` serves the group's span `b / per_span` with the
+    /// per-span launch's geometry and operand rebasing (done on the device from the staged span
+    /// table, `d_prefill_spans`).
     fn enqueue_packed_lean_kda_spans(
         &self,
         p: usize,
@@ -15255,54 +15322,60 @@ impl AmdEngine {
         route: PrefillSegmentRoute,
         kernel: HsaKernel,
     ) -> Result<()> {
-        let n = self.packed_spans.len() as u32;
-        let spans = self.d_prefill_spans.base;
-        let launch = |args: &[u8], per_span: u32, block: u32| -> Result<()> {
-            // The kernel's explicit segment ends at `min_rows`; the struct's tail pad is not sent.
-            let args = &args[..args.len() - 4];
-            EngineDevice::launch_kernel(
-                &*self.be,
-                kernel,
-                per_span.checked_mul(n).ok_or_else(|| {
-                    RuntimeError::Device("all-spans lean KDA grid overflows".into())
-                })?,
-                block,
-                0,
-                args,
-                None,
-            )
-        };
-        macro_rules! spans_args {
-            ($base:expr, $per:expr) => {
-                KdaSpansArgs { base: $base, spans, n_spans: n, per_span: $per, min_rows: 1, _pad: 0 }
+        let (groups, n_groups) = self.lean_span_groups();
+        for &(first, count) in &groups[..n_groups] {
+            let group = &self.packed_spans[first..first + count];
+            let n = count as u32;
+            let spans = self.d_prefill_spans.base
+                + (first * std::mem::size_of::<PrefillSpan>()) as u64;
+            let widest = group.iter().map(|s| s.n_rows).max().unwrap_or(1);
+            let launch = |args: &[u8], per_span: u32, block: u32| -> Result<()> {
+                // The kernel's explicit segment ends at `min_rows`; the struct's tail pad is not sent.
+                let args = &args[..args.len() - 4];
+                EngineDevice::launch_kernel(
+                    &*self.be,
+                    kernel,
+                    per_span.checked_mul(n).ok_or_else(|| {
+                        RuntimeError::Device("all-spans lean KDA grid overflows".into())
+                    })?,
+                    block,
+                    0,
+                    args,
+                    None,
+                )
             };
+            macro_rules! spans_args {
+                ($base:expr, $per:expr) => {
+                    KdaSpansArgs { base: $base, spans, n_spans: n, per_span: $per, min_rows: 1, _pad: 0 }
+                };
+            }
+            match route {
+                PrefillSegmentRoute::KdaChunkIntraWaveItems { args, grid } => {
+                    let full = self.seg_route_grid(p, seg, grid);
+                    let chunks = args.t.div_ceil(64).max(1);
+                    let per = (u64::from(full) * u64::from(widest.div_ceil(64)))
+                        .div_ceil(u64::from(chunks))
+                        .clamp(1, u64::from(full)) as u32;
+                    let a = spans_args!(args, per);
+                    launch(as_bytes(std::slice::from_ref(&a)), per, WG_THREADS_8)?;
+                }
+                PrefillSegmentRoute::KdaChunkWuLean { args, .. } => {
+                    let per = kda_wu_lean_grid(widest, args.heads);
+                    let a = spans_args!(args, per);
+                    launch(as_bytes(std::slice::from_ref(&a)), per, 256)?;
+                }
+                PrefillSegmentRoute::KdaChunkCarryKeyfeed { args, grid, .. } => {
+                    let a = spans_args!(args, grid);
+                    launch(as_bytes(std::slice::from_ref(&a)), grid, 256)?;
+                }
+                PrefillSegmentRoute::KdaChunkCarryRegstate { args, grid, .. } => {
+                    let a = spans_args!(args, grid);
+                    launch(as_bytes(std::slice::from_ref(&a)), grid, 256)?;
+                }
+                _ => unreachable!("packed_lean_kda_spans_kernel admitted only lean KDA routes"),
+            }
         }
-        match route {
-            PrefillSegmentRoute::KdaChunkIntraWaveItems { args, grid } => {
-                let per = self.seg_route_grid(p, seg, grid);
-                let a = spans_args!(args, per);
-                launch(as_bytes(std::slice::from_ref(&a)), per, WG_THREADS_8)
-            }
-            PrefillSegmentRoute::KdaChunkWuLean { args, .. } => {
-                let per = self
-                    .packed_spans
-                    .iter()
-                    .map(|s| kda_wu_lean_grid(s.n_rows, args.heads))
-                    .max()
-                    .unwrap_or(1);
-                let a = spans_args!(args, per);
-                launch(as_bytes(std::slice::from_ref(&a)), per, 256)
-            }
-            PrefillSegmentRoute::KdaChunkCarryKeyfeed { args, grid, .. } => {
-                let a = spans_args!(args, grid);
-                launch(as_bytes(std::slice::from_ref(&a)), grid, 256)
-            }
-            PrefillSegmentRoute::KdaChunkCarryRegstate { args, grid, .. } => {
-                let a = spans_args!(args, grid);
-                launch(as_bytes(std::slice::from_ref(&a)), grid, 256)
-            }
-            _ => unreachable!("packed_lean_kda_spans_kernel admitted only lean KDA routes"),
-        }
+        Ok(())
     }
 
     /// One lean-object launch per packed span, operands rebased to the span's rows (`row0`)
@@ -15450,6 +15523,21 @@ impl AmdEngine {
     /// multi-launch route branches in `enqueue_segment`; the commit check refuses
     /// a chain whose emission disagrees, so a drift fails closed rather than
     /// overrunning the queue.
+    /// `PLOW_AMD_GEMM_GROUP_LT`: the hipBLASLt groups that have a pinned kernel, then one grouped
+    /// launch for any unpinned tail. Only above 4096 live rows: at 1024/2048-token prompts the
+    /// separate launches lost 1.9/2.3 ms to the grouped kernel, at 8192/16384 they won 1.3/2.7 ms.
+    fn gemm_group_groups(&self, args: &GemmGroupArgs) -> usize {
+        self.gemm_lt
+            .as_ref()
+            .filter(|_| crate::config::RuntimeConfig::get().amd.gemm_group_lt && args.t > 4096)
+            .map_or(0, |lt| lt.group_prefix(&args.n, args.k))
+    }
+
+    fn gemm_group_launches(&self, args: &GemmGroupArgs) -> usize {
+        let groups = self.gemm_group_groups(args);
+        groups + usize::from(groups == 0 || (groups < 6 && args.n[groups] != 0))
+    }
+
     pub(crate) fn prefill_segment_launches(&self, p: usize, seg: usize) -> usize {
         let active = self.packed_prefill.is_some_and(|b| b.prog == p);
         if !prefill_segment_specialization_allowed(self.prog_dispatch(p)) {
@@ -15460,7 +15548,7 @@ impl AmdEngine {
         }
         if active && self.packed_lean_kda_segment(p, seg) {
             if self.packed_lean_kda_spans_kernel(p, seg).is_some() {
-                return 1;
+                return self.lean_span_groups().1;
             }
             return match self.progs[p].prefill_routes.get(seg) {
                 Some(PrefillSegmentRoute::KdaChunkCarryKeyfeed { .. }) => {
@@ -15492,6 +15580,7 @@ impl AmdEngine {
                     .as_ref()
                     .map_or(1, |s| s.span_launches(*route, &self.packed_spans)),
                 Some(PrefillSegmentRoute::GemmLt(_)) => 1,
+                Some(PrefillSegmentRoute::GemmGroup { args, .. }) => self.gemm_group_launches(args),
                 Some(PrefillSegmentRoute::Gemma4Glu(_)) => 1,
                 Some(PrefillSegmentRoute::GemmBlk(route)) => route.launches(),
                 Some(PrefillSegmentRoute::MlaFold(_)) => 3,
@@ -15515,6 +15604,7 @@ impl AmdEngine {
                 .as_ref()
                 .map_or(1, |s| s.split_launches(*route)),
             Some(PrefillSegmentRoute::GemmLt(_)) => 1,
+            Some(PrefillSegmentRoute::GemmGroup { args, .. }) => self.gemm_group_launches(args),
             Some(PrefillSegmentRoute::Gemma4Glu(_)) => 1,
             Some(PrefillSegmentRoute::GemmBlk(route)) => route.launches(),
             Some(PrefillSegmentRoute::MlaFold(_)) => 3,

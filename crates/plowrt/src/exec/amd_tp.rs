@@ -188,6 +188,54 @@ use crate::exec::tp::{
     gate_error, is_deadline_status, PeerLayout, TpGroup, XctrReset, PARTIAL_SLOTS, XCTR_STRIDE,
 };
 use crate::{Result, RuntimeError};
+
+/// `PLOW_TP_PAR_HOST`: run the per-rank synchronous host copies of a decode step (staging,
+/// token readback, id seeding) on one thread per rank, so their SDMA round trips overlap.
+fn par_host() -> bool {
+    crate::config::RuntimeConfig::get().amd.tp_par_host
+}
+
+fn each_rank<T: Send>(
+    ranks: &mut [AmdEngine],
+    f: impl Fn(&mut AmdEngine) -> Result<T> + Sync,
+) -> Result<Vec<T>> {
+    if !par_host() {
+        return ranks.iter_mut().map(&f).collect();
+    }
+    let f = &f;
+    if super::rank_pool::enabled() {
+        let mut out: Vec<Option<Result<T>>> = (0..ranks.len()).map(|_| None).collect();
+        let jobs: Vec<Box<dyn FnOnce() + Send + '_>> = ranks
+            .iter_mut()
+            .zip(out.iter_mut())
+            .map(|(e, slot)| Box::new(move || *slot = Some(f(e))) as Box<dyn FnOnce() + Send + '_>)
+            .collect();
+        if !super::rank_pool::run(jobs) {
+            return Err(RuntimeError::Device("rank host worker panicked".into()));
+        }
+        return out.into_iter().map(|r| r.expect("rank pool job ran")).collect();
+    }
+    std::thread::scope(|scope| {
+        let handles: Vec<_> = ranks.iter_mut().map(|e| scope.spawn(move || f(e))).collect();
+        let mut out = Vec::with_capacity(handles.len());
+        let mut first = None;
+        for h in handles {
+            match h.join() {
+                Ok(Ok(v)) => out.push(v),
+                Ok(Err(e)) => {
+                    first.get_or_insert(e);
+                }
+                Err(_) => {
+                    first.get_or_insert(RuntimeError::Device("rank host thread panicked".into()));
+                }
+            }
+        }
+        match first {
+            Some(e) => Err(e),
+            None => Ok(out),
+        }
+    })
+}
 use packet::dev::PrefillSpan;
 
 /// Tokens between full all-rank readbacks — see [`AmdTpGroup::complete_decode`]
@@ -399,6 +447,8 @@ pub struct AmdTpGroup {
     audit: bool,
     audit_direct: bool,
     audit_compact: bool,
+    /// The last decode submit appended the compact audit to every rank's chain.
+    tail_audited: bool,
     prefill_audit_direct: bool,
     prefill_audit_pinned: bool,
     index_tp_status: bool,
@@ -832,6 +882,7 @@ impl AmdTpGroup {
             gate_expect,
             audit: !crate::config::RuntimeConfig::get().amd.tp_no_audit,
             audit_direct: crate::config::RuntimeConfig::get().amd.tp_audit_direct,
+            tail_audited: false,
             prefill_audit_direct: crate::config::RuntimeConfig::get()
                 .amd
                 .tp_prefill_audit_direct,
@@ -958,6 +1009,19 @@ impl AmdTpGroup {
         let all = agreement_due(&mut self.agree_tick, self.agree_every);
         let rows = (self.ranks[0].prog_t(self.cur_dp) as usize).min(batch);
         dstep::timed(&dstep::READ, || {
+            if all && par_host() {
+                let mut all_ids = each_rank(&mut self.ranks, |e| e.read_sampled_batched(rows))?;
+                if let Some(r) = all_ids.iter().position(|p| *p != all_ids[0]) {
+                    return Err(RuntimeError::Device(format!(
+                        "TP ranks disagree on a batched decode step: rank 0 sampled \
+                         {:?}, rank {r} sampled {:?} — the all-reduce is wrong",
+                        all_ids[0], all_ids[r]
+                    )));
+                }
+                let mut ids = all_ids.swap_remove(0);
+                ids.resize(batch, 0);
+                return Ok(ids);
+            }
             let mut ids = self.ranks[0].read_sampled_batched(rows)?;
             if all {
                 for (r, rank) in self.ranks.iter_mut().enumerate().skip(1) {
@@ -1007,6 +1071,17 @@ impl AmdTpGroup {
         self.drain_and_audit()?;
         if agreement_due(&mut self.agree_tick, self.agree_every) {
             dstep::timed(&dstep::READ, || {
+                if par_host() {
+                    let all = each_rank(&mut self.ranks, |e| e.read_sampled_batched(rows))?;
+                    return match all.iter().position(|p| *p != all[0]) {
+                        Some(r) => Err(RuntimeError::Device(format!(
+                            "TP ranks disagree on deferred batched decode step: rank 0 sampled \
+                             {:?}, rank {r} sampled {:?}",
+                            all[0], all[r]
+                        ))),
+                        None => Ok(()),
+                    };
+                }
                 let ids = self.ranks[0].read_sampled_batched(rows)?;
                 for (r, rank) in self.ranks.iter_mut().enumerate().skip(1) {
                     let peer = rank.read_sampled_batched(rows)?;
@@ -1119,9 +1194,9 @@ impl AmdTpGroup {
         let counter_dbuf = self.ranks[0].tp_counter_double_buffered();
         // Preparation can fail without changing bank state. Only after EVERY
         // rank is prepared may TP select the banks this dispatch will capture.
-        for e in &mut self.ranks {
-            dstep::timed(&dstep::PREPARE, || e.decode_prepare_batched(pos, kvlen))?;
-        }
+        dstep::timed(&dstep::PREPARE, || {
+            each_rank(&mut self.ranks, |e| e.decode_prepare_batched(pos, kvlen))
+        })?;
         if let Some(rank) = self.ranks.iter().position(|e| !e.tp_counter_bank_ready(dp)) {
             return Err(RuntimeError::Device(format!(
                 "rank {rank} program {dp} has no clean inactive counter bank; refusing to \
@@ -1157,12 +1232,25 @@ impl AmdTpGroup {
         let mut i = 0usize;
         let t0 = dstep::on().then(std::time::Instant::now);
         let mut launched_at: Option<std::time::Instant> = None;
+        // Each rank's audit reads only its own xctr, whose gates that rank waited on before its
+        // chain could end, so it can ride the chain tail instead of a second submit and drain.
+        let tail_audit = self.audit
+            && self.audit_compact
+            && crate::config::RuntimeConfig::get().amd.tp_audit_tail;
+        self.tail_audited = false;
+        let audit_args: Vec<(u64, u64)> = self
+            .group
+            .ranks()
+            .iter()
+            .map(|r| (r.xctr(), r.xstatus()))
+            .collect();
+        let (n_xctr, n_gpu) = (self.group.layout().n_xctr, self.group.n_gpu());
         // Prepare every rank's complete packet chain before publishing any doorbell. Ringing each
         // segment as it is written lets an early GPU run ahead of the host's segment-major loop;
         // at wide rungs that can put peers in different collective segments.
         super::chain_admission::reserve_all(
             &mut self.chain_tickets,
-            |rank| ranks[rank].preflight_decode_replay(dp),
+            |rank| ranks[rank].preflight_decode_replay(dp, tail_audit as usize),
             |rank, ticket| ranks[rank].begin_decode_replay_admitted(ticket),
             |rank| ranks[rank].abort_replay(),
         )?;
@@ -1182,7 +1270,33 @@ impl AmdTpGroup {
             // Their only ordering requirement is local segment order, so fill the eight independent
             // rank queues in parallel. This removes the serialized host submission term without
             // allowing an early rank to enter a collective before its peers are ready.
-            if n_segments > 1 {
+            if n_segments > 1 && super::rank_pool::enabled() {
+                let mut res: Vec<Result<()>> = (0..ranks.len()).map(|_| Ok(())).collect();
+                let jobs: Vec<Box<dyn FnOnce() + Send + '_>> = ranks
+                    .iter_mut()
+                    .zip(res.iter_mut())
+                    .enumerate()
+                    .map(|(rank, (e, slot))| {
+                        Box::new(move || {
+                            let k = e.decode_kernel_for(dp);
+                            for seg in 1..n_segments {
+                                if let Err(err) = e.enqueue_decode_segment(dp, seg, k) {
+                                    *slot = Err(RuntimeError::Device(format!(
+                                        "rank {rank} decode replay segment {seg}: {err}"
+                                    )));
+                                    return;
+                                }
+                            }
+                        }) as Box<dyn FnOnce() + Send + '_>
+                    })
+                    .collect();
+                if !super::rank_pool::run(jobs) {
+                    return Err(RuntimeError::Device("decode replay fill worker panicked".into()));
+                }
+                if let Some(error) = res.into_iter().find_map(|r| r.err()) {
+                    return Err(error);
+                }
+            } else if n_segments > 1 {
                 std::thread::scope(|scope| -> Result<()> {
                     let handles: Vec<_> = ranks
                         .iter_mut()
@@ -1219,6 +1333,11 @@ impl AmdTpGroup {
                     }
                 })?;
             }
+            if tail_audit {
+                for (e, &(xctr, status)) in ranks.iter().zip(&audit_args) {
+                    e.enqueue_xaudit(dp, xctr, n_xctr, n_gpu, status)?;
+                }
+            }
             for e in &*ranks {
                 e.preflight_replay_commit()?;
             }
@@ -1233,6 +1352,7 @@ impl AmdTpGroup {
             }
             return Err(error);
         }
+        self.tail_audited = tail_audit;
         if let Some(z) = launched_at {
             dstep::ENQUEUE.add(z.elapsed().as_nanos() as u64);
         }
@@ -1299,7 +1419,7 @@ impl AmdTpGroup {
         let all = agreement_due(&mut self.agree_tick, self.agree_every);
         dstep::timed(&dstep::READ, || {
             if all {
-                self.ranks.iter_mut().map(|e| e.read_sampled()).collect()
+                each_rank(&mut self.ranks, |e| e.read_sampled())
             } else {
                 Ok(vec![self.ranks[0].read_sampled()?])
             }
@@ -1316,13 +1436,22 @@ impl AmdTpGroup {
         // The decode is on the GPU: a prefix publish deferred from this tick's chunk runs here.
         let published = self.flush_deferred_publish();
         dstep::timed(&dstep::DRAIN, || -> Result<()> { self.finish_ranks() })?;
+        let tail_audited = std::mem::take(&mut self.tail_audited);
         if self.audit {
             // The rung that actually launched, not the widest — a narrow rung emits fewer
             // collectives and auditing it against the widest program's expectations would
             // report a timeout on gates it never armed.
             let dp = self.cur_dp;
             dstep::timed(&dstep::AUDIT, || {
-                if self.audit_compact {
+                if self.audit_compact && tail_audited {
+                    match self.group.audit_xstatus_direct() {
+                        Ok(()) => Ok(()),
+                        Err(status) => self
+                            .group
+                            .audit_xctr_direct(&self.gate_expect[dp])
+                            .and(Err(status)),
+                    }
+                } else if self.audit_compact {
                     let submitted =
                         self.ranks
                             .iter()
@@ -1603,10 +1732,7 @@ impl AmdTpGroup {
 
     /// Publish the per-row parked mask on every rank. See `AmdEngine::upload_parked`.
     pub fn upload_parked(&mut self, parked: &[u32]) -> Result<()> {
-        for e in &mut self.ranks {
-            e.upload_parked(parked)?;
-        }
-        Ok(())
+        each_rank(&mut self.ranks, |e| e.upload_parked(parked)).map(drop)
     }
 
     /// Stage the same packed-prefill metadata on every rank. Any partial failure clears all
@@ -2390,10 +2516,7 @@ impl AmdTpGroup {
 
     /// Seed `in.ids` on every rank — needed once, before the first decode step.
     pub fn seed_ids(&mut self, ids: &[u32]) -> Result<()> {
-        for e in &mut self.ranks {
-            e.seed_ids(ids)?;
-        }
-        Ok(())
+        each_rank(&mut self.ranks, |e| e.seed_ids(ids)).map(drop)
     }
 
     /// Every rank sampled the same token, or a report of who disagreed.

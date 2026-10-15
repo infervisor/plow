@@ -572,9 +572,19 @@ fn emit_control_linears(
             emit_parallel_linear2(b, fa, b_raw, x, w_fa, w_b, t, hd, nh, hi, n_cu, &[dep]);
         (counter, counter)
     } else {
+        let fa_lt = seq_rows
+            .then(|| crate::mla::emit_glm53_lt_dec(b, fa, x, w_fa, t, hd, hi, &[dep]))
+            .flatten();
+        let b_lt = seq_rows
+            .then(|| crate::mla::emit_glm53_lt_dec(b, b_raw, x, w_b, t, nh, hi, &[dep]))
+            .flatten();
         (
-            crate::k3::emit_k3_linear(b, fa, x, w_fa, t, hd, hi, n_cu, seq_rows, &[dep]),
-            crate::k3::emit_k3_linear(b, b_raw, x, w_b, t, nh, hi, n_cu, seq_rows, &[dep]),
+            fa_lt.unwrap_or_else(|| {
+                crate::k3::emit_k3_linear(b, fa, x, w_fa, t, hd, hi, n_cu, seq_rows, &[dep])
+            }),
+            b_lt.unwrap_or_else(|| {
+                crate::k3::emit_k3_linear(b, b_raw, x, w_b, t, nh, hi, n_cu, seq_rows, &[dep])
+            }),
         )
     }
 }
@@ -853,6 +863,7 @@ fn emit_kda_mixer_ex(
             crate::mla::glm_decode_gemm_tile(t, n, k, n_cu) == Some(DevOp::GemmSmall)
         };
         if crate::emit_config::active().glm_kda_proj_group
+            && !crate::mla::glm53_lt_dec_rung(t)
             && seq_rows
             && t > 1
             && !fb_fold
@@ -867,6 +878,11 @@ fn emit_kda_mixer_ex(
         }
     }
     let gemv = |b: &mut Builder, out: u32, row: u32, wt: u32, n: u32, k: u32, dep: u32| {
+        if seq_rows {
+            if let Some(c) = crate::mla::emit_glm53_lt_dec(b, out, row, wt, t, n, k, &[dep]) {
+                return c;
+            }
+        }
         crate::k3::emit_k3_linear(b, out, row, wt, t, n, k, n_cu, seq_rows, &[dep])
     };
     // P1-P4 collapse into ONE packet along the OUTPUT axis. See [`fuse_qkvg`] for why that is the
@@ -883,7 +899,11 @@ fn emit_kda_mixer_ex(
             d.i[..8].copy_from_slice(&[t, hi, p, p, p, hd, hd, nh]);
         });
         b.isolate(c);
-        let c_gb = if crate::emit_config::active().pf_gemm_route_all {
+        let c_gb = if let Some(c) =
+            crate::mla::emit_glm53_lt_gemm(b, g_raw, ga, g_b_proj, t, p, hd, &[c])
+        {
+            c
+        } else if crate::emit_config::active().pf_gemm_route_all {
             emit_pf_gemm_route(b, g_raw, ga, g_b_proj, t, p, hd, &[c])
         } else {
             gemv(b, g_raw, ga, g_b_proj, p, hd, c)
@@ -1190,6 +1210,7 @@ fn emit_kda_mixer_ex(
         && !chunk
         && st.conv_state_alt.is_none()
         && crate::emit_config::active().kda_decode_wide
+        && t >= crate::emit_config::active().kda_decode_wide_min_rows.unwrap_or(2)
         // The v3 object is built for gfx950 only (MI350X, 256 CUs).
         && crate::emit_is_amd()
         && n_cu == 256
@@ -1535,7 +1556,13 @@ fn emit_kda_mixer_ex(
     });
 
     // P12 — out projection. The residual is NOT here: see `emit_kda_layer`.
-    let c_o = if group.is_some() && crate::emit_config::active().pf_gemm_route_all {
+    let lt_o = group
+        .is_some()
+        .then(|| crate::mla::emit_glm53_lt_gemm(b, attn, y, w.o_proj, t, hi, p, &[c_norm]))
+        .flatten();
+    let c_o = if let Some(c) = lt_o {
+        c
+    } else if group.is_some() && crate::emit_config::active().pf_gemm_route_all {
         emit_pf_gemm_route(b, attn, y, w.o_proj, t, hi, p, &[c_norm])
     } else {
         gemv(b, attn, y, w.o_proj, hi, p, c_norm)
