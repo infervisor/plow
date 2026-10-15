@@ -1206,8 +1206,13 @@ mod tests {
                 k.scope.iter().map(allow_src).collect::<Vec<_>>().join(", ")
             )
         };
+        let per_rung = if k.rungs.is_empty() {
+            String::new()
+        } else {
+            format!(".per_rung({})", strs_src(k.rungs))
+        };
         format!(
-            "    KnobSpec::new({:?}, {:?}, Layer::{:?}, {domain}, {default}, {status}){scoped},",
+            "    KnobSpec::new({:?}, {:?}, Layer::{:?}, {domain}, {default}, {status}){scoped}{per_rung},",
             k.id, k.env, k.layer
         )
     }
@@ -1272,7 +1277,10 @@ mod tests {
             for c in k.constraints {
                 c.formula.vars(&mut wanted);
             }
-            if matches!(k.default, Default::Production { .. }) || !k.scope.is_empty() {
+            if matches!(k.default, Default::Production { .. })
+                || !k.scope.is_empty()
+                || !k.rungs.is_empty()
+            {
                 wanted.push(k.id);
                 wanted.extend(k.default.vars());
             }
