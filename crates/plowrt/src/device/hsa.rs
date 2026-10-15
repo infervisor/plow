@@ -539,6 +539,7 @@ hsa_fns! {
     hsa_amd_memory_async_copy: unsafe extern "C" fn(*mut c_void, HsaAgent, *const c_void, HsaAgent, usize, u32, *const HsaSignal, HsaSignal) -> HsaStatus,
     hsa_queue_create: unsafe extern "C" fn(HsaAgent, u32, u32, *const c_void, *const c_void, u32, u32, *mut *mut HsaQueue) -> HsaStatus,
     hsa_queue_destroy: unsafe extern "C" fn(*mut HsaQueue) -> HsaStatus,
+    hsa_amd_queue_cu_set_mask: unsafe extern "C" fn(*const HsaQueue, u32, *const u32) -> HsaStatus,
     hsa_queue_add_write_index_screlease: unsafe extern "C" fn(*mut HsaQueue, u64) -> u64,
     hsa_queue_load_read_index_scacquire: unsafe extern "C" fn(*const HsaQueue) -> u64,
     hsa_signal_create: unsafe extern "C" fn(i64, u32, *const HsaAgent, *mut HsaSignal) -> HsaStatus,
@@ -602,6 +603,7 @@ impl HsaDriver {
             hsa_amd_memory_async_copy: resolve!(lib, b"hsa_amd_memory_async_copy\0"),
             hsa_queue_create: resolve!(lib, b"hsa_queue_create\0"),
             hsa_queue_destroy: resolve!(lib, b"hsa_queue_destroy\0"),
+            hsa_amd_queue_cu_set_mask: resolve!(lib, b"hsa_amd_queue_cu_set_mask\0"),
             hsa_queue_add_write_index_screlease: resolve!(
                 lib,
                 b"hsa_queue_add_write_index_screlease\0"
@@ -1333,6 +1335,18 @@ impl HsaBackend {
         };
         if rc != HSA_STATUS_SUCCESS {
             return Err(hsa_fault(rc, "hsa_queue_create"));
+        }
+        if let Some(spec) = crate::config::RuntimeConfig::get().amd.cu_mask.as_deref() {
+            let mask = cu_mask_bits(spec, cu_count)
+                .ok_or_else(|| RuntimeError::Device(format!("PLOW_AMD_CU_MASK={spec:?}: want N or ^N")))?;
+            let rc = unsafe {
+                (drv.hsa_amd_queue_cu_set_mask)(queue, (mask.len() * 32) as u32, mask.as_ptr())
+            };
+            if rc != HSA_STATUS_SUCCESS {
+                return Err(hsa_fault(rc, "hsa_amd_queue_cu_set_mask"));
+            }
+            tracing::warn!(spec, cu_count, "PLOW_AMD_CU_MASK: queue restricted (diagnostic)");
+            cu_count = mask.iter().map(|w| w.count_ones()).sum();
         }
 
         // Create completion signal.
@@ -4654,4 +4668,25 @@ mod tests {
         assert_eq!(hsa_status_name(0x1008), "HSA_STATUS_ERROR_OUT_OF_RESOURCES");
         assert_eq!(hsa_status_name(-1), "HSA_STATUS_UNKNOWN");
     }
+}
+
+/// `PLOW_AMD_CU_MASK` (diagnostic): `N` keeps N CUs strided evenly over the agent's `cu_count`,
+/// `^N` keeps the complement of that set.
+fn cu_mask_bits(spec: &str, cu_count: u32) -> Option<Vec<u32>> {
+    let (inv, n) = match spec.strip_prefix('^') {
+        Some(r) => (true, r),
+        None => (false, spec),
+    };
+    let n: u32 = n.parse().ok()?;
+    if cu_count == 0 || n == 0 || n > cu_count {
+        return None;
+    }
+    let mut mask = vec![0u32; cu_count.div_ceil(32) as usize];
+    for i in 0..cu_count {
+        let pick = (0..n).any(|k| k * cu_count / n == i);
+        if pick != inv {
+            mask[(i / 32) as usize] |= 1 << (i % 32);
+        }
+    }
+    Some(mask)
 }

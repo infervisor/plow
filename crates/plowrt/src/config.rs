@@ -2085,6 +2085,11 @@ pub struct AmdRuntimeConfig {
     #[arg(long = "amd-decode-dense-max-ctx", env = "PLOW_AMD_DECODE_DENSE_MAX_CTX", global = true)]
     pub amd_decode_dense_max_ctx: Option<u32>,
 
+    /// Diagnostic: restrict every rank's AQL queue to a CU subset (`N` = N CUs strided evenly,
+    /// `^N` = the complement). Grids sized to the full chip deadlock persistent objects.
+    #[arg(long = "amd-cu-mask", env = "PLOW_AMD_CU_MASK", global = true)]
+    pub cu_mask: Option<String>,
+
     /// hsaco directory override. Default: <assets>/hsaco.
     ///
     /// The clap **id** and **long** are both `rt-hsaco`, not `hsaco`. A

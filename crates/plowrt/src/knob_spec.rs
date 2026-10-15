@@ -692,6 +692,7 @@ pub const RUNTIME: &[KnobSpec] = &[
     KnobSpec::new("rt.nv_ns_live", Some("PLOW_NV_NS_LIVE"), Layer::Runtime, Domain::Bool, OFF, OPT_IN),
     KnobSpec::new("rt.amd_decode_dense_exact", Some("PLOW_AMD_DECODE_DENSE_EXACT"), Layer::Runtime, Domain::Bool, OFF, OPT_IN).scoped(DECODE_DENSE_EXACT_SCOPE),
     KnobSpec::new("rt.amd_decode_dense_max_ctx", Some("PLOW_AMD_DECODE_DENSE_MAX_CTX"), Layer::Runtime, U32, UNSET, OPT_IN),
+    KnobSpec::new("rt.cu_mask", Some("PLOW_AMD_CU_MASK"), Layer::Runtime, Domain::Str, UNSET, DIAG),
     KnobSpec::new("rt.glm_rowband", Some("PLOW_GLM_ROWBAND"), Layer::Runtime, Domain::Bool, OFF, OPT_IN),
     KnobSpec::new("rt.decode_max_rung", Some("PLOW_DECODE_MAX_RUNG"), Layer::Runtime, U32, UNSET, DIAG),
     KnobSpec::new("rt.rt_hsaco", Some("PLOW_HSACO"), Layer::Runtime, Domain::Str, UNSET, OPT_IN),
