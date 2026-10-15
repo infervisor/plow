@@ -2312,6 +2312,9 @@ pub struct AmdRuntimeConfig {
     /// instruction's workgroup count).
     #[arg(long = "amd-xr-native-grid", env = "PLOW_AMD_XR_NATIVE_GRID", global = true)]
     pub xr_native_grid: Option<u32>,
+    /// Diagnostic: launch the native router top-k this many extra times.
+    #[arg(long = "amd-router-repeat", env = "PLOW_AMD_ROUTER_REPEAT", global = true)]
+    pub router_repeat: Option<u32>,
     /// GLM-5.3 gfx950 AITER MoE: 16x128 up to 32 rows and 32x256 up to 256 rows (decode rungs).
     #[arg(long = "amd-moe-dec-tiles", env = "PLOW_AMD_MOE_DEC_TILES", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
     pub moe_dec_tiles: bool,

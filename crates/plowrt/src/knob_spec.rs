@@ -728,6 +728,7 @@ pub const RUNTIME: &[KnobSpec] = &[
     KnobSpec::new("rt.router_native", Some("PLOW_AMD_ROUTER_NATIVE"), Layer::Runtime, Domain::Bool, OFF, OPT_IN),
     KnobSpec::new("rt.moe_tile_dec", Some("PLOW_AMD_MOE_TILE_DEC"), Layer::Runtime, U32, UNSET, DIAG),
     KnobSpec::new("rt.xr_native_grid", Some("PLOW_AMD_XR_NATIVE_GRID"), Layer::Runtime, U32, UNSET, DIAG),
+    KnobSpec::new("rt.router_repeat", Some("PLOW_AMD_ROUTER_REPEAT"), Layer::Runtime, U32, UNSET, DIAG),
     KnobSpec::new("rt.moe_dec_tiles", Some("PLOW_AMD_MOE_DEC_TILES"), Layer::Runtime, Domain::Bool, OFF, OPT_IN),
     KnobSpec::new("rt.lt_overlap", Some("PLOW_AMD_LT_OVERLAP"), Layer::Runtime, Domain::Bool, OFF, OPT_IN),
     KnobSpec::new("rt.lt_fuse", Some("PLOW_AMD_LT_FUSE"), Layer::Runtime, Domain::Bool, OFF, OPT_IN),

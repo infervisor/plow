@@ -15649,7 +15649,7 @@ impl AmdEngine {
                 if self.k_router_fused.is_some() {
                     1
                 } else {
-                    2
+                    2 + crate::config::RuntimeConfig::get().amd.router_repeat.unwrap_or(0) as usize
                 }
             }
             Some(DecodeSegmentRoute::LtFused(_)) => 2,
@@ -16526,16 +16526,21 @@ impl AmdEngine {
                     as_bytes(std::slice::from_ref(&ga)),
                     None,
                 )?;
-                EngineDevice::launch_kernel(
-                    &*self.be,
-                    kt,
-                    topk.i[4].div_ceil(4),
-                    256,
-                    0,
-                    as_bytes(std::slice::from_ref(&ta)),
-                    None,
-                )?;
-                self.seg_launches += 1;
+                // PLOW_AMD_ROUTER_REPEAT (diagnostic): the idempotent top-k launched again, to
+                // price one more launch of it.
+                let reps = 1 + crate::config::RuntimeConfig::get().amd.router_repeat.unwrap_or(0);
+                for _ in 0..reps {
+                    EngineDevice::launch_kernel(
+                        &*self.be,
+                        kt,
+                        topk.i[4].div_ceil(4),
+                        256,
+                        0,
+                        as_bytes(std::slice::from_ref(&ta)),
+                        None,
+                    )?;
+                }
+                self.seg_launches += u64::from(reps);
             }
             DecodeSegmentRoute::XrNative(inst) => self.launch_xr_native(&inst)?,
             DecodeSegmentRoute::DenseNative(r) => {
