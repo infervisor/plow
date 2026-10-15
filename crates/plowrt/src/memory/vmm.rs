@@ -7506,6 +7506,68 @@ mod tests {
         policy::check_tree(&p.shared.inner.lock());
     }
 
+    /// A twice-attached boundary leaves the shared-prefix eviction tier once it has not been
+    /// used for `SHARED_RECENT_TICKS`: a stale one is evicted before an older single-attach one.
+    /// (The most recently attached boundary, `b`, is the one `evict_one` always protects.)
+    #[test]
+    fn stale_twice_attached_boundary_is_evicted_before_a_fresh_one() {
+        let ops = Arc::new(MockVmm::default());
+        let p = legacy_uniform_pool(ops.clone());
+        let a = prompt(30);
+        let mut b = prompt(30);
+        b[0] = 99;
+        let mut c = prompt(30);
+        c[0] = 98;
+        let publish = |pr: &[u32]| {
+            p.begin_seq(0);
+            assert!(p.try_attach(0, pr).unwrap().is_none());
+            p.ensure_rows(0, 30).unwrap();
+            p.publish_at(0, pr, 12, 4, |_| Ok(())).unwrap();
+        };
+        let attach = |pr: &[u32]| {
+            p.begin_seq(1);
+            p.ensure_rows(1, 1).unwrap();
+            assert_eq!(p.try_attach(1, pr).unwrap().expect("boundary").rows, 12);
+            p.finish_attach(1);
+        };
+        publish(&a);
+        attach(&a);
+        attach(&a);
+        publish(&c);
+        attach(&c);
+        publish(&b);
+        attach(&b);
+        p.begin_seq(1);
+        assert_eq!(p.stats().snapshots_live, 3);
+        assert_eq!(
+            p.stats().snapshots_shared,
+            1,
+            "a's boundary is in the shared tier"
+        );
+        {
+            let mut inner = p.shared.inner.lock();
+            assert!(evict_one(&p.shared, &mut inner, false));
+        }
+        assert_eq!(p.cached_rows(&c), 0, "single-attach c went first");
+        assert_eq!(
+            p.cached_rows(&a),
+            12,
+            "recently shared a stays although it is the LRU"
+        );
+        p.shared.inner.lock().snapshot_tick += SHARED_RECENT_TICKS + 1;
+        assert_eq!(
+            p.stats().snapshots_shared,
+            0,
+            "a aged out of the shared tier"
+        );
+        {
+            let mut inner = p.shared.inner.lock();
+            assert!(evict_one(&p.shared, &mut inner, false));
+        }
+        assert_eq!(p.cached_rows(&a), 0, "stale a evicted");
+        assert_eq!(p.cached_rows(&b), 12);
+    }
+
     /// The second prompt sharing a 300-row head with a recent one names the shared end
     /// (32-row aligned); a short common head names nothing.
     #[test]
