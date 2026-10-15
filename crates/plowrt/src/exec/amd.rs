@@ -1084,6 +1084,42 @@ struct KdaSpansArgs<A: Copy> {
     _pad: u32,
 }
 
+/// Kernarg of `plow_kda_rider_v1` (`kda_decode_wide.hip`, `PLOW_AMD_RIDER_KDA`): one KDA
+/// layer's conv + gated state step for the leading one-row spans of a packed launch.
+#[derive(Clone, Copy, Debug)]
+#[repr(C)]
+struct KdaRiderArgs {
+    spans: u64,
+    o: u64,
+    q_raw: u64,
+    k_raw: u64,
+    v_raw: u64,
+    wq: u64,
+    wk: u64,
+    wv: u64,
+    csq: u64,
+    csk: u64,
+    csv: u64,
+    forget_raw: u64,
+    beta_raw: u64,
+    a_log: u64,
+    dt_bias: u64,
+    state: u64,
+    mq: u64,
+    mk: u64,
+    mv: u64,
+    n_spans: u32,
+    heads: u32,
+    dim: u32,
+    conv_w: u32,
+    act: u32,
+    gate_mode: u32,
+    lower_bound: f32,
+    scale: f32,
+}
+
+const _: () = assert!(std::mem::size_of::<KdaRiderArgs>() == 184);
+
 /// The all-spans lean KDA objects; each is optional and its segment falls back to per-span
 /// launches when absent.
 #[derive(Clone, Copy, Default)]
@@ -2479,6 +2515,122 @@ fn kda_keyfeed_scratch_half_bytes<'a>(progs: impl IntoIterator<Item = &'a DevPro
         }
     }
     Ok(max_half)
+}
+
+/// `PLOW_AMD_RIDER_KDA`: per segment, the rider-chain arguments of the KDA layer whose
+/// `KdaConv3` that segment runs (its `KdaChunkPrepare` / `KdaChunkCarry` supply the gate and
+/// state operands). `None` when some conv3 cannot be paired: riders then keep the chunk arms.
+fn kda_rider_routes(
+    prog: &DevProg,
+    families: &[u8],
+    devp: &[DeviceMem],
+) -> Option<Vec<Option<KdaRiderArgs>>> {
+    let addr = |h: u32| devp.get(h as usize).map(|m| m.base).filter(|_| h != packet::dev::TENSOR_NONE16 as u32);
+    let mut out = vec![None; families.len()];
+    let mut any = false;
+    for (ci, c) in prog.insts.iter().enumerate() {
+        if c.op != DevOp::KdaConv3 as u16 {
+            continue;
+        }
+        let seg = prog.stream.iter().find(|e| e.inst as usize == ci)?.seg as usize;
+        if families.get(seg) != Some(&7) || out[seg].is_some() {
+            return None;
+        }
+        let rest = || prog.insts.iter().skip(ci + 1);
+        // The chunk route names the gate operands on its prepare and the state on its carry;
+        // the serial route (short rungs) names them all on its gated step.
+        struct Ops {
+            o: u32,
+            state: u32,
+            g_raw: u32,
+            beta_raw: u32,
+            a_log: u32,
+            dt_bias: u32,
+            heads: u32,
+            dim: u32,
+            gate_mode: u32,
+            lb: u32,
+            scale: u32,
+        }
+        let ops = match rest().find(|d| {
+            (d.op == DevOp::KdaChunkPrepare as u16 || d.op == DevOp::KdaStateStepG as u16)
+                && d.t[if d.op == DevOp::KdaStateStepG as u16 { 1 } else { 0 }] == c.t[0]
+        })? {
+            st if st.op == DevOp::KdaStateStepG as u16 => {
+                if st.i[4] != 1 {
+                    return None;
+                }
+                Ops {
+                    o: st.t[0] as u32,
+                    state: st.t[6] as u32,
+                    g_raw: st.t[4] as u32,
+                    beta_raw: st.t[5] as u32,
+                    a_log: st.t[7] as u32,
+                    dt_bias: st.i[5],
+                    heads: st.i[1],
+                    dim: st.i[2],
+                    gate_mode: st.i[6],
+                    lb: st.fj[1],
+                    scale: st.fj[0],
+                }
+            }
+            prep => {
+                let carry =
+                    rest().find(|d| d.op == DevOp::KdaChunkCarry as u16 && d.t[2] == c.t[0])?;
+                if carry.i[3] != prep.i[2] {
+                    return None;
+                }
+                Ops {
+                    o: carry.t[0] as u32,
+                    state: carry.t[1] as u32,
+                    g_raw: prep.t[4] as u32,
+                    beta_raw: prep.t[5] as u32,
+                    a_log: prep.t[6] as u32,
+                    dt_bias: prep.t[7] as u32,
+                    heads: prep.i[1],
+                    dim: prep.i[2],
+                    gate_mode: prep.i[3],
+                    lb: prep.fj[0],
+                    scale: carry.fj[0],
+                }
+            }
+        };
+        let (heads, dim) = (ops.heads, ops.dim);
+        if dim != 128 || heads * dim != c.i[1] || c.i[2] == 0 || c.i[2] > 8 {
+            return None;
+        }
+        out[seg] = Some(KdaRiderArgs {
+            spans: 0,
+            o: addr(ops.o)?,
+            q_raw: addr(c.t[3] as u32)?,
+            k_raw: addr(c.t[4] as u32)?,
+            v_raw: addr(c.t[5] as u32)?,
+            wq: addr(c.t[6] as u32)?,
+            wk: addr(c.t[7] as u32)?,
+            wv: addr(c.i[4])?,
+            csq: addr(c.i[5])?,
+            csk: addr(c.i[6])?,
+            csv: addr(c.i[7])?,
+            forget_raw: addr(ops.g_raw)?,
+            beta_raw: addr(ops.beta_raw)?,
+            a_log: addr(ops.a_log)?,
+            dt_bias: addr(ops.dt_bias)?,
+            state: addr(ops.state)?,
+            mq: addr(c.t[0] as u32)?,
+            mk: addr(c.t[1] as u32)?,
+            mv: addr(c.t[2] as u32)?,
+            n_spans: 0,
+            heads,
+            dim,
+            conv_w: c.i[2],
+            act: c.i[3],
+            gate_mode: ops.gate_mode,
+            lower_bound: f32::from_bits(ops.lb),
+            scale: f32::from_bits(ops.scale),
+        });
+        any = true;
+    }
+    any.then_some(out)
 }
 
 /// Marked lean Wu segments; a key-emitting Wu (`i[5] == 1`) also converts the regstate carry
@@ -7161,6 +7313,8 @@ struct AmdProg {
     packed_needs_kda: bool,
     packed_kda_compatible: bool,
     packed_kda_segmented: bool,
+    /// `PLOW_AMD_RIDER_KDA`: per segment, the rider chain of the KDA layer whose conv3 it runs.
+    kda_rider: Option<Vec<Option<KdaRiderArgs>>>,
     /// §3/§5.4 of `plans/unified-token-batch.md`, from
     /// [`crate::exec::amd::packed::recurrent_span_limit`]: `Ok(n)` = at most `n` request spans in
     /// one packed launch, `Err(msg)` = this program's recurrent operators have no packed form at
@@ -7386,6 +7540,8 @@ pub struct AmdEngine {
     k_kda_chunk_wu_lean_keys: Option<HsaKernel>,
     k_kda_chunk_carry_keyfeed: Option<HsaKernel>,
     k_kda_spans: KdaSpansKernels,
+    /// `PLOW_AMD_RIDER_KDA`: the rider chain object (`plow_kda_rider_v1`).
+    k_kda_rider: Option<HsaKernel>,
     /// `PLOW_AMD_SNAP_KERNEL`: the batched copy object and its piece tables (two halves).
     k_copy_pairs: Option<HsaKernel>,
     copy_pieces: Option<(DeviceMem, HsaPinned, usize)>,
@@ -9347,7 +9503,9 @@ impl AmdEngine {
                 markers.push(KDA_CHUNK_QPRE_SYM);
             }
             load_packed_family(
-                if crate::config::RuntimeConfig::get().amd.packed_kda_par {
+                if crate::config::RuntimeConfig::get().amd.rider_kda {
+                    "interp_packed_kda_rider"
+                } else if crate::config::RuntimeConfig::get().amd.packed_kda_par {
                     "interp_packed_kda_par"
                 } else {
                     "interp_packed_kda"
@@ -9997,6 +10155,40 @@ impl AmdEngine {
                 Err(e) => tracing::warn!(%e, "snapshot copy object unavailable; DMA copies"),
             }
         }
+        let k_kda_rider = if crate::config::RuntimeConfig::get().amd.rider_kda && arch == "gfx950" {
+            const NAME: &str = "kda_rider_gfx950.elf";
+            const MARKER: &str = "plow_kda_rider_1";
+            const SYMBOL: &str = "plow_kda_rider_v1";
+            let path = hsaco_dir.join(NAME);
+            let loaded = (|| -> Result<(Module, HsaKernel)> {
+                let image = std::fs::read(&path)
+                    .map_err(|e| RuntimeError::Device(format!("{}: {e}", path.display())))?;
+                if !elf_symbol_names(&image).contains(&MARKER) {
+                    return Err(RuntimeError::Device(format!("{NAME}: no `{MARKER}` marker")));
+                }
+                let module = EngineDevice::module_load(&*be, &image)?;
+                let kernel = EngineDevice::get_function(&*be, &module, SYMBOL)?;
+                let want = std::mem::size_of::<KdaRiderArgs>() as u32;
+                let got = kernel.kernarg_size();
+                if (got != want && got != want + 256) || kernel.private_segment_size() != 0 {
+                    return Err(RuntimeError::Device(format!(
+                        "{NAME}: kernarg {got} B (want {want} B) or private segment"
+                    )));
+                }
+                Ok((module, kernel))
+            })();
+            match loaded {
+                Ok((module, kernel)) => {
+                    tracing::info!(object = %path.display(), "rider KDA object accepted");
+                    modules.push(module);
+                    Some(kernel)
+                }
+                // The rider family object skips one-row spans: without this chain nothing runs them.
+                Err(e) => return Err(e),
+            }
+        } else {
+            None
+        };
         let mut k_kda_spans = KdaSpansKernels::default();
         let amd_cfg = &crate::config::RuntimeConfig::get().amd;
         if (amd_cfg.packed_lean_kda_batch || amd_cfg.mixed_ride_trim) && arch == "gfx950" {
@@ -12140,6 +12332,19 @@ impl AmdEngine {
             };
             let packed_mla_segmented = packed_family_segments_cover(p, &packed_seg_family, &[5, 6]);
             let packed_kda_segmented = packed_family_segments_cover(p, &packed_seg_family, &[7]);
+            let kda_rider = (crate::config::RuntimeConfig::get().amd.rider_kda
+                && packed_kda_segmented
+                && p.role.is_packed_sibling())
+            .then(|| {
+                kda_rider_routes(p, &packed_seg_family, &devp).ok_or_else(|| {
+                    RuntimeError::Device(format!(
+                        "PLOW_AMD_RIDER_KDA: packed program T={} has a KDA layer the rider chain \
+                         cannot pair (conv3/prepare/carry)",
+                        p.t
+                    ))
+                })
+            })
+            .transpose()?;
             let up = |bytes: &[u8]| -> Result<DeviceMem> {
                 let m = EngineDevice::alloc(&*be, bytes.len().max(1) as u64)?;
                 if !bytes.is_empty() {
@@ -12290,6 +12495,7 @@ impl AmdEngine {
                     0
                 },
                 packed_kda_segmented,
+                kda_rider,
                 packed_recurrent_spans: crate::exec::amd::packed::recurrent_span_limit(
                     p.insts.iter().map(|d| d.op),
                 ),
@@ -13092,6 +13298,7 @@ impl AmdEngine {
             k_kda_chunk_wu_lean_keys,
             k_kda_chunk_carry_keyfeed,
             k_kda_spans,
+            k_kda_rider,
             k_copy_pairs,
             copy_pieces: None,
             copy_flip: false,
@@ -14078,6 +14285,15 @@ impl AmdEngine {
                 self.d_prefill_spans.base,
                 self.d_prefill_parked.base,
             );
+        // PLOW_AMD_RIDER_KDA: the KDA family object sees the spans past the leading riders.
+        let riders = if g.packed_seg_family.get(seg as usize) == Some(&7) {
+            self.kda_rider_skip(p) as u32
+        } else {
+            0
+        };
+        let prefill_spans =
+            prefill_spans + u64::from(riders) * std::mem::size_of::<PrefillSpan>() as u64;
+        let n_prefill_spans = n_prefill_spans - riders;
         DevProgram {
             insts: g.d_inst.base,
             stream: g.d_stream.base,
@@ -14630,7 +14846,7 @@ impl AmdEngine {
         }
         if active && self.packed_lean_kda_segment(p, seg) {
             self.enqueue_packed_lean_kda(p, seg)?;
-            self.seg_launches += self.packed_spans.len() as u64;
+            self.seg_launches += self.kda_spans(p).len() as u64;
             return Ok(());
         }
         // Packed (active) programs too: MoE has no cross-row state, so one launch covers
@@ -15100,19 +15316,75 @@ impl AmdEngine {
             }
         }
         let (k, threads, family) = self.prefill_interpreter_kernel(p, seg)?;
-        let (k, grid) = self.seg_interp_geom(p, seg, k, family);
-        let arg = self.kernarg(p, seg as u32);
-        EngineDevice::launch_cooperative(
-            &*self.be,
-            k,
-            grid,
-            threads,
-            0,
-            kernarg_bytes(&arg),
-            None,
-        )?;
-        self.seg_launches += 1;
+        if !self.kda_family_idle(p, seg) {
+            let (k, grid) = self.seg_interp_geom(p, seg, k, family);
+            let arg = self.kernarg(p, seg as u32);
+            EngineDevice::launch_cooperative(
+                &*self.be,
+                k,
+                grid,
+                threads,
+                0,
+                kernarg_bytes(&arg),
+                None,
+            )?;
+            self.seg_launches += 1;
+        }
+        if active && self.kda_rider_launch(p, seg) {
+            if let Some(mut args) = self.kda_rider_args(p, seg) {
+                args.spans = self.d_prefill_spans.base;
+                args.n_spans = self.packed_spans.len() as u32;
+                EngineDevice::launch_kernel(
+                    &*self.be,
+                    self.k_kda_rider.expect("kda_rider_skip checked the object"),
+                    args.n_spans * args.heads,
+                    WG_THREADS_8,
+                    0,
+                    as_bytes(std::slice::from_ref(&args)),
+                    None,
+                )?;
+                self.seg_launches += 1;
+            }
+        }
         Ok(())
+    }
+
+    /// `PLOW_AMD_RIDER_KDA`: the active pack's leading one-row spans, which the rider chain runs
+    /// instead of the packed KDA arms (0 when the route is off or the program has no rider chain).
+    fn kda_rider_skip(&self, p: usize) -> usize {
+        if !self.kda_rider_mode(p) {
+            return 0;
+        }
+        self.packed_spans.iter().take_while(|s| s.n_rows == 1).count()
+    }
+
+    /// A KDA family segment of a pack that is all riders has nothing left for the family object.
+    fn kda_family_idle(&self, p: usize, seg: usize) -> bool {
+        self.progs[p].packed_seg_family.get(seg) == Some(&7)
+            && self.kda_rider_mode(p)
+            && self.kda_rider_skip(p) == self.packed_spans.len()
+    }
+
+    fn kda_rider_mode(&self, p: usize) -> bool {
+        self.k_kda_rider.is_some()
+            && self.progs[p].kda_rider.is_some()
+            && self.packed_prefill.is_some_and(|b| b.prog == p && !b.token_batch)
+    }
+
+    /// Whether segment `seg` of the active pack launches the rider chain after its family object.
+    fn kda_rider_launch(&self, p: usize, seg: usize) -> bool {
+        self.kda_rider_mode(p)
+            && self.kda_rider_args(p, seg).is_some()
+            && self.packed_spans.iter().any(|s| s.n_rows == 1)
+    }
+
+    /// The spans the packed KDA arms and lean KDA objects run.
+    fn kda_spans(&self, p: usize) -> &[PrefillSpan] {
+        &self.packed_spans[self.kda_rider_skip(p)..]
+    }
+
+    fn kda_rider_args(&self, p: usize, seg: usize) -> Option<KdaRiderArgs> {
+        self.progs[p].kda_rider.as_ref()?.get(seg).copied().flatten()
     }
 
     /// Number of ordered segment steps in a decode program. A grouped-MoE step owns two
@@ -15227,8 +15499,8 @@ impl AmdEngine {
             || !self
                 .packed_prefill
                 .is_some_and(|b| b.prog == p && !b.token_batch)
-            || self.packed_spans.is_empty()
-            || (self.packed_spans.iter().any(|s| s.n_rows < 512) && !self.lean_kda_spans_short())
+            || self.kda_spans(p).is_empty()
+            || (self.kda_spans(p).iter().any(|s| s.n_rows < 512) && !self.lean_kda_spans_short())
         {
             return false;
         }
@@ -15302,6 +15574,7 @@ impl AmdEngine {
     /// the per-span arm below).
     fn enqueue_packed_kda_carry_multi(
         &self,
+        p: usize,
         multi: HsaKernel,
         args: KdaChunkCarryKeyfeedArgs,
     ) -> Result<()> {
@@ -15340,7 +15613,10 @@ impl AmdEngine {
             }
             Ok(())
         };
-        for span in &self.packed_spans {
+        for span in self.kda_spans(p) {
+            if span.n_rows == 1 && self.kda_rider_mode(p) {
+                continue;
+            }
             if self.kda_carry_split_launches(span.n_rows) > 1 {
                 let r = u64::from(span.row0);
                 let mut a = args;
@@ -15392,8 +15668,8 @@ impl AmdEngine {
         // spans) or batched (PLOW_KDA_CARRY_MULTI), never through the all-spans carry.
         // Spans under 512 rows (riders) have no per-span or split carry: they stay all-spans.
         if matches!(route, PrefillSegmentRoute::KdaChunkCarryKeyfeed { .. })
-            && self.packed_spans.iter().all(|s| s.n_rows >= 512)
-            && self.packed_spans.iter().any(|s| self.kda_carry_split_launches(s.n_rows) > 1)
+            && self.kda_spans(p).iter().all(|s| s.n_rows >= 512)
+            && self.kda_spans(p).iter().any(|s| self.kda_carry_split_launches(s.n_rows) > 1)
         {
             return None;
         }
@@ -15414,9 +15690,10 @@ impl AmdEngine {
     /// spans, `advance_packed` puts them first) and the rest. Each group is sized for its own
     /// widest span; one grid sized for a prompt span over 100+ riders launched ~100k empty
     /// workgroups per lean segment (isl4096 c128: +38 ms per pack).
-    fn lean_span_groups(&self) -> ([(usize, usize); 2], usize) {
-        let n = self.packed_spans.len();
-        let short = self.packed_spans.iter().take_while(|s| s.n_rows <= 64).count();
+    fn lean_span_groups(&self, p: usize) -> ([(usize, usize); 2], usize) {
+        let spans = self.kda_spans(p);
+        let n = spans.len();
+        let short = spans.iter().take_while(|s| s.n_rows <= 64).count();
         if short == 0 || short == n {
             ([(0, n), (0, 0)], 1)
         } else {
@@ -15434,12 +15711,15 @@ impl AmdEngine {
         route: PrefillSegmentRoute,
         kernel: HsaKernel,
     ) -> Result<()> {
-        let (groups, n_groups) = self.lean_span_groups();
+        let (groups, n_groups) = self.lean_span_groups(p);
+        let skip = self.kda_rider_skip(p);
+        // PLOW_AMD_RIDER_KDA: one-row spans belong to the rider chain wherever they sit.
+        let min_rows = 1 + u32::from(self.kda_rider_mode(p));
         for &(first, count) in &groups[..n_groups] {
-            let group = &self.packed_spans[first..first + count];
+            let group = &self.kda_spans(p)[first..first + count];
             let n = count as u32;
             let spans = self.d_prefill_spans.base
-                + (first * std::mem::size_of::<PrefillSpan>()) as u64;
+                + ((skip + first) * std::mem::size_of::<PrefillSpan>()) as u64;
             let widest = group.iter().map(|s| s.n_rows).max().unwrap_or(1);
             let launch = |args: &[u8], per_span: u32, block: u32| -> Result<()> {
                 // The kernel's explicit segment ends at `min_rows`; the struct's tail pad is not sent.
@@ -15458,7 +15738,7 @@ impl AmdEngine {
             };
             macro_rules! spans_args {
                 ($base:expr, $per:expr) => {
-                    KdaSpansArgs { base: $base, spans, n_spans: n, per_span: $per, min_rows: 1, _pad: 0 }
+                    KdaSpansArgs { base: $base, spans, n_spans: n, per_span: $per, min_rows, _pad: 0 }
                 };
             }
             match route {
@@ -15501,9 +15781,12 @@ impl AmdEngine {
         if let (PrefillSegmentRoute::KdaChunkCarryKeyfeed { args, .. }, Some(multi)) =
             (route, self.k_kda_carry_multi)
         {
-            return self.enqueue_packed_kda_carry_multi(multi, args);
+            return self.enqueue_packed_kda_carry_multi(p, multi, args);
         }
-        for span in &self.packed_spans {
+        for span in self.kda_spans(p) {
+            if span.n_rows == 1 && self.kda_rider_mode(p) {
+                continue;
+            }
             let r = u64::from(span.row0);
             let t = span.n_rows;
             match route {
@@ -15660,18 +15943,18 @@ impl AmdEngine {
         }
         if active && self.packed_lean_kda_segment(p, seg) {
             if self.packed_lean_kda_spans_kernel(p, seg).is_some() {
-                return self.lean_span_groups().1;
+                return self.lean_span_groups(p).1;
             }
             return match self.progs[p].prefill_routes.get(seg) {
                 Some(PrefillSegmentRoute::KdaChunkCarryKeyfeed { .. }) => {
                     let split: usize = self
-                        .packed_spans
+                        .kda_spans(p)
                         .iter()
                         .map(|s| self.kda_carry_split_launches(s.n_rows))
                         .filter(|&n| n > 1)
                         .sum();
                     let serial = self
-                        .packed_spans
+                        .kda_spans(p)
                         .iter()
                         .filter(|s| self.kda_carry_split_launches(s.n_rows) == 1)
                         .count();
@@ -15682,8 +15965,13 @@ impl AmdEngine {
                             serial
                         }
                 }
-                _ => self.packed_spans.len(),
+                _ => self.kda_spans(p).len(),
             };
+        }
+        if active && self.progs[p].packed_seg_family.get(seg) == Some(&7) && self.kda_rider_mode(p)
+        {
+            return usize::from(!self.kda_family_idle(p, seg))
+                + usize::from(self.kda_rider_launch(p, seg));
         }
         if active {
             return match self.progs[p].prefill_routes.get(seg) {

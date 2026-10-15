@@ -4686,6 +4686,7 @@ fn run_one_tick(
             let mut b2b_used = 0u32;
             let mut b2b_pass = 0u32;
             let mut b2b_failed = false;
+            let mut ride_filled = false;
             while hold != PfHold::Held {
                 let now = Instant::now();
                 // PLOW_AMD_MIXED_RIDE_TRIM: the first pass also initializes fresh cursors until the
@@ -4809,6 +4810,35 @@ fn run_one_tick(
                         |program| e.packed_prefill_span_limit(program as usize),
                     )
                 };
+                // PLOW_AMD_RIDE_FILL: the tick's first launch (the one decode rows ride) fills the
+                // budget less its riders: the oldest planned chunk that does not fit is cut to the
+                // gap (its rest is its next chunk) and the tick re-plans, instead of the launch
+                // running short (a trimmed tail alone, or a pack a whole chunk short).
+                if rt.amd.ride_fill && mixed_pack && b2b_pass == 0 && !decoded_in_pack && !ride_filled
+                {
+                    ride_filled = true;
+                    let riders = slots[..cap]
+                        .iter()
+                        .flatten()
+                        .filter(|s| s.parked_at.is_none() && !s.out_ids.is_empty())
+                        .count() as u32;
+                    if let Some(pack) = step.launches.first() {
+                        let gap = full_budget.saturating_sub(riders + pack.rows());
+                        let fill = candidates
+                            .iter()
+                            .filter(|c| {
+                                c.planned
+                                    && c.span.n_rows > gap
+                                    && pack.spans.iter().all(|s| s.slot != c.span.slot)
+                            })
+                            .min_by_key(|c| (c.arrival, c.span.slot));
+                        if let Some(c) = fill.filter(|_| gap >= 256) {
+                            if e.shrink_prefill_chunk(c.span.slot as usize, gap).is_ok() {
+                                continue;
+                            }
+                        }
+                    }
+                }
                 // A pack wider than its members' isolated rungs together runs as lone launches;
                 // PLOW_AMD_PACK_FILL first splits a mostly empty pack into narrower full ones.
                 let launches: Vec<crate::sched::step::Launch> = step
