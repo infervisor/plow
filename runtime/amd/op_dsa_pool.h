@@ -325,8 +325,15 @@ __device__ void d_dsa_pool_expand_table(unsigned char* __restrict__ uni,
         const unsigned row = band0 + l;
         unsigned* const pos = (unsigned*)(uni + hdr + (size_t)l * cap * 12u);
         unsigned* const msk = pos + cap;
-        if (threadIdx.x == 0) ((unsigned*)uni)[l] = row < rows ? out_cols : 0u;
-        if (row >= rows) continue;
+        /* A band row past the chunk attends token 0 alone: finite padding, never read. */
+        if (threadIdx.x == 0) ((unsigned*)uni)[l] = row < rows ? out_cols : 1u;
+        if (row >= rows) {
+            if (threadIdx.x < 64u) {
+                pos[threadIdx.x] = 0u;
+                msk[threadIdx.x] = threadIdx.x == 0u ? 0xFFu : 0u;
+            }
+            continue;
+        }
         const int seq_len = q_pos0 + (int)row + 1;
         const int pool_len = seq_len / (int)pool_size;
         const int tail_start = pool_len * (int)pool_size;

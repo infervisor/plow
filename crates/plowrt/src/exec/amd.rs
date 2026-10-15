@@ -16766,6 +16766,15 @@ impl AmdEngine {
             .filter(|_| self.rowband_on);
         let rowband = sibling.is_some_and(|s| self.rowband_sibling[s]);
         let mut prog = rowsplit_chunk_prog(step, self.progs[step.prog].t, sibling, rowband);
+        // The A2A sibling also takes a ragged chunk: its bands follow PLOW_AMD_RAGGED_SEAMS.
+        if let Some(s) = sibling.filter(|&s| {
+            self.a2a_sibling[s]
+                && step.c0 >= amd_sparse_mla::SPAN_MIN_PRIOR
+                && step.clen < self.progs[step.prog].t
+                && crate::config::RuntimeConfig::get().amd_ragged_seams()
+        }) {
+            prog = s;
+        }
         // PLOW_GLM_DSA_PF_A2A: chunks ending at or below PLOW_GLM_DSA_PF_MIN_CTX stay dense.
         if self.a2a_sibling.get(prog).copied().unwrap_or(false)
             && crate::config::RuntimeConfig::get()
