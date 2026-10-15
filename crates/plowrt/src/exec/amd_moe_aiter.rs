@@ -84,6 +84,8 @@ pub(super) struct Route {
     inst: DevInst64,
     rows: u32,
     mode: Mode,
+    /// A decode rung's call (`PLOW_AMD_MOE_DEC_TILES` re-tiles only these).
+    decode: bool,
 }
 
 impl Route {
@@ -403,6 +405,7 @@ pub(super) fn routes(
             inst: *inst,
             rows: prog.t,
             mode,
+            decode: prog.role.is_decode_rung(),
         });
     }
     Ok(routes)
@@ -1202,7 +1205,7 @@ impl MoeAiter {
                 // PLOW_AMD_MOE_DEC_TILES: measured at the GLM-5.3 TP8 decode rungs (1k context,
                 // kernel-only in situ): 16x128 at 32 rows 90.3 -> 84.6 us, 32x256 at 128 rows
                 // 141.8 -> 134.2 us.
-                if cfg.moe_dec_tiles {
+                if cfg.moe_dec_tiles && route.decode {
                     if route.rows <= 32 {
                         (i, tile) = (0, &GFX950_TILES[0]);
                     } else if route.rows <= 256 {
