@@ -4961,6 +4961,187 @@ __device__ void d_flash_mla_decode_hp8(float* __restrict__ Opart, float* __restr
     }
 }
 
+#ifndef PLOW_MLA_DEC_HP8_ASYNC
+#define PLOW_MLA_DEC_HP8_ASYNC 0 /* NS: hp8 KV ring stages (PLOW_MLA_DEC_HP8_ASYNC object knob) */
+#endif
+#if PLOW_MLA_DEC_HP8_ASYNC && PLOW_CDNA4
+#define FA_MLA_HP8A_LDS_FLOATS(DK, NS) \
+    (((NS) * 32 * ((DK) + FA_PAD) + 8 * ((DK) + FA_PAD) + PLOW_WAVES * 8 * 32) / 2 + PLOW_WAVES * 8 * 32)
+/* d_flash_mla_decode_hp8 with the KV tiles moved HBM -> LDS by cp_async16 (no VGPR staging)
+ * through an NS-stage ring, NS-1 tiles in flight. Same QK / softmax / PV arithmetic as hp8, so
+ * the partials are bit-identical. Each wave moves 4 of a tile's 32 latent rows (one 1 KiB row
+ * per wave issue); rows past `hi` re-read row hi-1 (finite, masked to p = 0). */
+template <int NS>
+__device__ __forceinline__ void fa_hp8a_wait_tiles(unsigned after) {
+    /* vmcnt counts this wave's loads; 4 per tile. */
+    if (NS >= 4 && after >= 2) asm volatile("s_waitcnt vmcnt(8)" ::: "memory");
+    else if (NS >= 3 && after >= 1) asm volatile("s_waitcnt vmcnt(4)" ::: "memory");
+    else asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
+}
+
+template <int DK, int NS>
+__device__ void d_flash_mla_decode_hp8_async(float* __restrict__ Opart, float* __restrict__ mlpart,
+                          const bf16* __restrict__ Qabs, const bf16* __restrict__ Ckv,
+                          const int* __restrict__ kv_len, unsigned n_batch, unsigned kv_stride,
+                          float scale, unsigned nsplit, unsigned slice, unsigned nblk,
+                          float* lds_) {
+    constexpr int NH = 8;
+    constexpr int BKV = 32;
+    constexpr int STRIDE = DK + FA_PAD;
+    constexpr int NK = DK / MFMA_K;
+    constexpr int KPW = NK / PLOW_WAVES;
+    constexpr int CPW = DK / PLOW_WAVES;
+    constexpr int NDT = CPW / MFMA_N;
+    constexpr int CH = DK / 8;
+    constexpr int RPW = BKV / PLOW_WAVES; /* latent rows per wave per tile */
+    static_assert(DK == 8 * PLOW_WAVE && RPW == 4 && NS >= 2 && NS <= 4, "hp8 async tiling");
+
+    bf16* Kring = (bf16*)lds_;                    /* [NS][BKV][STRIDE] */
+    bf16* Qsm = Kring + NS * BKV * STRIDE;        /* [NH][STRIDE] */
+    bf16* Psm = Qsm + NH * STRIDE;                /* [WAVES][NH][BKV] */
+    float* Sred = (float*)(Psm + PLOW_WAVES * NH * BKV);
+
+    const unsigned tid = threadIdx.x;
+    const unsigned lane = tid & 63;
+    const unsigned wave = tid >> 6;
+    const unsigned frow = mfma_frag_row(lane);
+    const unsigned accn = mfma_acc_n(lane);
+    const unsigned ncol0 = wave * CPW;
+    const bf16x8 zero8 = (bf16x8)(bf16_t)0.0f;
+
+    const unsigned n_work = n_batch * nsplit;
+    for (unsigned w = slice; w < n_work; w += nblk) {
+        const unsigned sp = w % nsplit;
+        const unsigned b = w / nsplit;
+        const unsigned len = (unsigned)kv_len[b];
+        const unsigned per = (len + nsplit - 1) / nsplit;
+        const unsigned lo = sp * per < len ? sp * per : len;
+        const unsigned hi = lo + per < len ? lo + per : len;
+        const auto* cbase = as_glob(Ckv) + (size_t)b * kv_stride * DK;
+        const unsigned ntile = (hi - lo + BKV - 1) / BKV;
+
+        __syncthreads();
+        if (tid < NH * CH) {
+            const unsigned h = tid / CH, c = tid % CH;
+            *(bf16v8*)&Qsm[h * STRIDE + c * 8] = ld_glob8(as_glob(Qabs) + ((size_t)b * NH + h) * DK + c * 8);
+        }
+        auto issue = [&](unsigned t) {
+            bf16* st = Kring + (t % NS) * BKV * STRIDE;
+#pragma unroll
+            for (int r = 0; r < RPW; r++) {
+                const unsigned row = wave * RPW + r;
+                unsigned kv = lo + t * BKV + row;
+                kv = kv < hi ? kv : hi - 1;
+                cp_async16(cbase + (size_t)kv * DK + lane * 8, st + row * STRIDE);
+            }
+        };
+#pragma unroll
+        for (int t = 0; t < NS - 1; t++)
+            if ((unsigned)t < ntile) issue(t);
+
+        f32x16 oacc[NDT];
+#pragma unroll
+        for (int t = 0; t < NDT; t++) oacc[t] = (f32x16)(0.0f);
+        float m_st[4], l_st[4];
+#pragma unroll
+        for (int i = 0; i < 4; i++) { m_st[i] = FA_NEG_INF; l_st[i] = 0.0f; }
+
+        for (unsigned t = 0; t < ntile; t++) {
+            const unsigned kv0 = lo + t * BKV;
+            const unsigned left = ntile - 1 - t;
+            fa_hp8a_wait_tiles<NS>(left < (unsigned)(NS - 2) ? left : (unsigned)(NS - 2));
+            __syncthreads();
+            if (t + NS - 1 < ntile) issue(t + NS - 1);
+            const bf16* Ksm = Kring + (t % NS) * BKV * STRIDE;
+
+            f32x16 s = (f32x16)(0.0f);
+#pragma unroll
+            for (int q = 0; q < KPW; q++) {
+                const unsigned d0 = mfma_frag_k(lane, (wave * KPW + q) * MFMA_K);
+                bf16x8 qf = zero8, kf;
+                if (frow < NH) {
+                    const bf16v8 qv = ld_lds8(&Qsm[frow * STRIDE + d0]);
+                    __builtin_memcpy(&qf, &qv, 16);
+                }
+                const bf16v8 kv8 = ld_lds8(&Ksm[frow * STRIDE + d0]);
+                __builtin_memcpy(&kf, &kv8, 16);
+                s = plow_mfma_bf16_32x32(qf, kf, s);
+            }
+#pragma unroll
+            for (int i = 0; i < 4; i++)
+                Sred[(wave * NH + mfma_acc_m(lane, i)) * BKV + accn] = s[i];
+            __syncthreads();
+
+            float p[4];
+#pragma unroll
+            for (int i = 0; i < 4; i++) {
+                const unsigned m = mfma_acc_m(lane, i);
+                float acc = 0.0f;
+#pragma unroll
+                for (int ww = 0; ww < PLOW_WAVES; ww++) acc += Sred[(ww * NH + m) * BKV + accn];
+                p[i] = (kv0 + accn < hi) ? acc * FA_SCALE(scale) : FA_NEG_INF;
+            }
+#pragma unroll
+            for (int i = 0; i < 4; i++) {
+                const float rmax = half_wave_max(p[i]);
+                const float mnew = fmaxf(m_st[i], rmax);
+                const float corr = (m_st[i] == FA_NEG_INF) ? 0.0f : FA_EXP(m_st[i] - mnew);
+                const float pe = (mnew == FA_NEG_INF) ? 0.0f : FA_EXP(p[i] - mnew);
+                l_st[i] = l_st[i] * corr + half_wave_sum(pe);
+                m_st[i] = mnew;
+                p[i] = pe;
+#pragma unroll
+                for (int t2 = 0; t2 < NDT; t2++) oacc[t2][i] *= corr;
+            }
+            bf16* myP = Psm + wave * NH * BKV;
+#pragma unroll
+            for (int i = 0; i < 4; i++) myP[mfma_acc_m(lane, i) * BKV + accn] = f2bf(p[i]);
+            __syncthreads();
+
+#pragma unroll
+            for (int t2 = 0; t2 < NDT; t2++) {
+#pragma unroll
+                for (int ks = 0; ks < BKV; ks += MFMA_K) {
+                    const unsigned kk = mfma_frag_k(lane, ks);
+                    bf16x8 pf = zero8, vf;
+                    if (frow < NH) {
+                        const bf16v8 pv = ld_lds8(&myP[frow * BKV + kk]);
+                        __builtin_memcpy(&pf, &pv, 16);
+                    }
+                    const unsigned col = ncol0 + t2 * MFMA_N + frow;
+#pragma unroll
+                    for (int j = 0; j < 8; j++) {
+                        const bf16 vv = Ksm[(kk + j) * STRIDE + col];
+                        bf16_t vb;
+                        __builtin_memcpy(&vb, &vv, 2);
+                        vf[j] = vb;
+                    }
+                    oacc[t2] = plow_mfma_bf16_32x32(pf, vf, oacc[t2]);
+                }
+            }
+        }
+
+#pragma unroll
+        for (int t = 0; t < NDT; t++) {
+#pragma unroll
+            for (int i = 0; i < 4; i++) {
+                const unsigned m = mfma_acc_m(lane, i);
+                const unsigned d = ncol0 + t * MFMA_N + accn;
+                st_act<float>(&Opart[((size_t)(b * NH + m) * nsplit + sp) * DK + d], oacc[t][i]);
+            }
+        }
+        if (wave == 0 && accn == 0) {
+#pragma unroll
+            for (int i = 0; i < 4; i++) {
+                float* ml = mlpart + ((size_t)(b * NH + mfma_acc_m(lane, i)) * nsplit + sp) * 2;
+                st_act<float>(&ml[0], m_st[i]);
+                st_act<float>(&ml[1], l_st[i]);
+            }
+        }
+    }
+}
+#endif
+
 /* ATTN_SELECT — on-device top-k KV selection (DeepSeek DSA).            [DEEPSEEK-MLA]
  * sparse-attn-design.md §3.2. The attention twin of the MoE router: scores the indexer
  * query against every KV position's index key, keeps the top_k positions per batch, and

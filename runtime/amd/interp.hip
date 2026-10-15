@@ -1264,6 +1264,9 @@ typedef union __align__(16) {
 #endif
 #if PLOW_MLA_DEC_HPACK
     float fmla_hpack[FA_MLA_HP8_LDS_FLOATS(512)]; /* 8-head packed NoPE MLA decode */
+#if PLOW_MLA_DEC_HP8_ASYNC && PLOW_CDNA4
+    float fmla_hp8a[FA_MLA_HP8A_LDS_FLOATS(512, PLOW_MLA_DEC_HP8_ASYNC)]; /* its async KV ring */
+#endif
 #endif
 #if PLOW_MLA_MHA_ARM && defined(PLOW_BUCKET_FLASH) && PLOW_CDNA4
     bf16 mha[mla_mha::LDS_BYTES / 2]; /* MHA-form MLA prefill: 2 stages x (K + V) */
@@ -2252,6 +2255,12 @@ __device__ __forceinline__ void exec_flash_mla_decode(CInst in, CTens T, unsigne
          * `lds` is the start of the smem union, which `fmla_hpack` sizes for it. */
         if (nope && gf == 8 && !qrc && window == 0) {
             if (in->i[1] != 8) __builtin_trap();
+#if PLOW_MLA_DEC_HP8_ASYNC && PLOW_CDNA4
+            d_flash_mla_decode_hp8_async<512, PLOW_MLA_DEC_HP8_ASYNC>(
+                (float*)TEN(0), (float*)TEN(1), (const bf16*)TEN(2), (const bf16*)TEN(4),
+                (const int*)TEN(6), in->i[0], in->i[2], in->fj[0].f, in->i[4], slice, nblk, lds);
+            return;
+#endif
             d_flash_mla_decode_hp8<512>((float*)TEN(0), (float*)TEN(1), (const bf16*)TEN(2),
                                         (const bf16*)TEN(4), (const int*)TEN(6), in->i[0],
                                         in->i[2], in->fj[0].f, in->i[4], slice, nblk, lds);

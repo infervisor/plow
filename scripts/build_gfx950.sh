@@ -161,6 +161,21 @@ esac
 # PLOW_MLA_DEC_FOLD_MFMA=1 (decode-MLA segment objects only): rungs of >= 32 rows fold through
 # the batched MFMA GEMM (bf16-rounded latent, as PLOW_K3_PF_FOLD_MFMA) instead of one W_uv panel
 # stream per (row, head). Not bit-identical to the scalar fold.
+# PLOW_MLA_DEC_HP8_ASYNC=<2|3|4> (decode-MLA objects, with HPACK=1): the hp8 flash moves its KV
+# tiles HBM -> LDS by global_load_lds through an NS-stage ring (NS-1 tiles in flight). Same
+# arithmetic as hp8.
+case "${PLOW_MLA_DEC_HP8_ASYNC:-0}" in
+  0) ;;
+  2|3|4) DMLA_X="$DMLA_X -DPLOW_MLA_DEC_HP8_ASYNC=$PLOW_MLA_DEC_HP8_ASYNC" ;;
+  *) echo "PLOW_MLA_DEC_HP8_ASYNC must be 0, 2, 3 or 4" >&2; exit 2 ;;
+esac
+# PLOW_MLA_DEC_FOLD_TB=<2|4|8> (decode-MLA objects): the token-blocked fold (TB tokens of one
+# head per workgroup, one W_uv panel stream per TB tokens) where it fills the grid (B128: TB=4).
+case "${PLOW_MLA_DEC_FOLD_TB:-0}" in
+  0) ;;
+  2|4|8) DMLA_X="$DMLA_X -DPLOW_MLA_FOLD_TB=$PLOW_MLA_DEC_FOLD_TB" ;;
+  *) echo "PLOW_MLA_DEC_FOLD_TB must be 0, 2, 4 or 8" >&2; exit 2 ;;
+esac
 case "${PLOW_MLA_DEC_FOLD_MFMA:-0}" in
   0) ;;
   1) DMLA_X="$DMLA_X -DPLOW_MLA_FOLD_MFMA=1 -DPLOW_MLA_FOLD_MFMA_NS=4 -DPLOW_MLA_FOLD_MFMA_MIN_ROWS=32" ;;
