@@ -802,7 +802,7 @@ struct InprojPartArgs {
 struct InprojArgs {
     x: u64,
     partial: u64,
-    parts: [InprojPartArgs; 8],
+    parts: [InprojPartArgs; LT_FUSE_PARTS],
     m: u32,
     k: u32,
     nparts: u32,
@@ -4362,11 +4362,13 @@ pub(crate) struct LtFusedRoute {
     k: u32,
     n_parts: u32,
     /// (weight, output, columns) per part.
-    parts: [(u16, u16, u32); 8],
+    parts: [(u16, u16, u32); LT_FUSE_PARTS],
 }
 
 const LT_FUSE_KS: u32 = 512;
 const LT_FUSE_WAVES: u32 = 8;
+/// `glm_inproj.hip` INPROJ_PARTS: its kernargs must fit the 512-byte kernarg ring slot.
+const LT_FUSE_PARTS: usize = 6;
 const LT_FUSE_SCRATCH: u64 = 32 << 20;
 
 fn lt_fuse_blocks(r: &LtFusedRoute) -> u32 {
@@ -4398,7 +4400,7 @@ fn fuse_lt_runs(routes: &mut [DecodeSegmentRoute]) {
         let mut members = vec![i];
         let mut others: Vec<usize> = Vec::new();
         let mut j = i + 1;
-        while j < routes.len() && members.len() < 8 {
+        while j < routes.len() && members.len() < LT_FUSE_PARTS {
             let Some(d) = lt(&routes[j]) else { break };
             let clash_with_others = others.iter().any(|&o| {
                 let od = lt(&routes[o]).unwrap();
@@ -4416,7 +4418,7 @@ fn fuse_lt_runs(routes: &mut [DecodeSegmentRoute]) {
         let blocks: u32 = members.iter().map(|&o| lt(&routes[o]).unwrap().i[1].div_ceil(16)).sum();
         let scratch = u64::from(k / LT_FUSE_KS) * u64::from(m) * u64::from(blocks) * 16 * 4;
         if members.len() >= 2 && scratch <= LT_FUSE_SCRATCH {
-            let mut parts = [(0u16, 0u16, 0u32); 8];
+            let mut parts = [(0u16, 0u16, 0u32); LT_FUSE_PARTS];
             for (slot, &o) in parts.iter_mut().zip(&members) {
                 let d = lt(&routes[o]).unwrap();
                 *slot = (d.t[2], d.t[0], d.i[1]);
@@ -9995,7 +9997,7 @@ impl AmdEngine {
             || crate::config::RuntimeConfig::get().amd.dense_native
         {
             const NAME: &str = "glm_inproj_gfx950.elf";
-            const MARKER: &str = "plow_glm_inproj_abi_3";
+            const MARKER: &str = "plow_glm_inproj_abi_4";
             let path = hsaco_dir.join(NAME);
             let image = std::fs::read(&path).map_err(|e| {
                 RuntimeError::Device(format!(
@@ -16570,7 +16572,7 @@ impl AmdEngine {
                     let at = usize::from(h) * 8;
                     u64::from_le_bytes(self.tens_table[at..at + 8].try_into().unwrap())
                 };
-                let mut parts = [InprojPartArgs::default(); 8];
+                let mut parts = [InprojPartArgs::default(); LT_FUSE_PARTS];
                 let mut blk0 = 0;
                 for (dst, &(w, out, n)) in parts.iter_mut().zip(&r.parts[..r.n_parts as usize]) {
                     *dst = InprojPartArgs { w: addr(w), out: addr(out), s: 0, n, blk0 };
@@ -16668,7 +16670,7 @@ impl AmdEngine {
                     u64::from_le_bytes(self.tens_table[at..at + 8].try_into().unwrap())
                 };
                 let hrows = scratch + DENSE_H_OFFSET;
-                let mut parts = [InprojPartArgs::default(); 8];
+                let mut parts = [InprojPartArgs::default(); LT_FUSE_PARTS];
                 parts[0] = InprojPartArgs { w: r.w[0], out: hrows, s: r.s[0], n: r.inter, blk0: 0 };
                 parts[1] = InprojPartArgs { w: r.w[1], out: 0, s: r.s[1], n: r.inter, blk0: r.inter / 16 };
                 let glu = InprojArgs {
@@ -16700,7 +16702,7 @@ impl AmdEngine {
                     as_bytes(std::slice::from_ref(&glu)),
                     None,
                 )?;
-                let mut parts = [InprojPartArgs::default(); 8];
+                let mut parts = [InprojPartArgs::default(); LT_FUSE_PARTS];
                 parts[0] = InprojPartArgs { w: r.w[2], out: addr(r.out), s: r.s[2], n: r.h, blk0: 0 };
                 let dn = InprojArgs {
                     x: hrows,

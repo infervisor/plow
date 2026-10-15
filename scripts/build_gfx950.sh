@@ -464,7 +464,7 @@ if [ "$ARCH" = gfx950 ]; then
   bash "$R/cmake/hipcc_hsaco.sh" hipcc "$BUN" "$ARCH" \
     "$OUT/glm_inproj_gfx950.elf" plow_glm_inproj_partial 512 1 \
     -DPLOW_LEAN_OBJECT=1 -DPLOW_NO_SPILL=1 \
-    -DPLOW_REQUIRED_MARKER=plow_glm_inproj_abi_3 \
+    -DPLOW_REQUIRED_MARKER=plow_glm_inproj_abi_4 \
     -I"$R/amd" -I"$R/common" "$R/amd/glm_inproj.hip"
 fi
 
