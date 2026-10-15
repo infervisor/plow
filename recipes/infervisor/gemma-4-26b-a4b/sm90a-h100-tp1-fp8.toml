@@ -31,7 +31,7 @@ namespace = "infervisor"
 name = "gemma-4-26b-a4b"
 label = "sm90a-h100-tp1-fp8"
 status = "validated"
-plow_git = "800970648b1a3ac7e8acb6535924dd0af2dfa734"
+plow_git = "cdcd21618d9dc8dcddae7dbb50779905e72a099d"
 network = "gemma4"
 
 [target]
@@ -89,6 +89,12 @@ PLOW_GEMMA_MOE_ROUTER_EXACT = "0"
 # step_bench decode with vs without: B4/B8/B16 6.74/8.21/12.25 vs 7.15/9.36/16.24 ms, B1/B2 +1.5%.
 NVCC_APPEND_FLAGS = "-DPLOW_MOE_FP8_DEDUP=1"
 PLOW_EMIT_MOE_PF_LT = "1"
+# Dense gate|up as two FP8 cuBLASLt GEMMs + Glu/Quant (qualified 2026-10-15, packet bd9c0722e368, plowrt 2dff2171):
+# prefill rungs at prefix 0 128/256/1024/4096 rows 15.69/17.53/26.46/81.33 vs 17.24/18.33/30.81/96.23 ms
+# (-9.0/-4.4/-14.1/-15.5%). FP32 gate PASS: kl_mean 0.1865 vs ctrl 0.1881, kl_p99 4.016 (limit 4.668), top1_decisive
+# 0.9602 vs ctrl 0.9642; long gate PASS: kl_mean 0.1627 vs ctrl 0.1515 / vLLM 0.165, kl_p99 3.18, top1 0.9638.
+# Evidence: g26-pfrung REPORT.md sections 6 and 13-14 (res2, ab/g-p1, ab/gl-p1).
+PLOW_NO_GLU_FUSE = "1"
 
 [objects]
 script = "scripts/build_sm90a_gemma4_segments.sh"
