@@ -921,9 +921,18 @@ mod tests {
     #[test]
     fn route_prologue_rejects_the_norm_weight_offset() {
         let none = packet::dev::TENSOR_NONE;
-        let mut insts = [DevOp::RmsNorm, DevOp::MoeRouterGemmaPf, DevOp::MoeAlignGemmaPf,
-            DevOp::QuantFp8, DevOp::MoeGroupGluGemmaPfW8a8]
-            .map(|op| DevInst { op: op as u16, t: [none; 8], ..Default::default() });
+        let mut insts = [
+            DevOp::RmsNorm,
+            DevOp::MoeRouterGemmaPf,
+            DevOp::MoeAlignGemmaPf,
+            DevOp::QuantFp8,
+            DevOp::MoeGroupGluGemmaPfW8a8,
+        ]
+        .map(|op| DevInst {
+            op: op as u16,
+            t: [none; 8],
+            ..Default::default()
+        });
         let [norm, router, align, quant, glu] = &mut insts;
         glu.t[..6].copy_from_slice(&[0, 1, 2, 3, 4, 9]);
         glu.i[..3].copy_from_slice(&[704, 2816, 128]);
