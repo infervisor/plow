@@ -6257,12 +6257,12 @@ fn gpu_prefill_batched_pass(
         let budget_on = decode_rows > 0
             && pf_itl_budget_ms() > 0
             && itl_owed_rows(slots, cap, withheld, queued_rows) <= budget_max;
-        let itl_cap = if budget_on
-            && !candidates.iter().any(|c| {
-                slots[c.span.slot as usize]
-                    .as_ref()
-                    .is_some_and(|s| s.mm.as_deref().is_some_and(|j| j.spans()))
-            }) {
+        let media_spans = candidates.iter().any(|c| {
+            slots[c.span.slot as usize]
+                .as_ref()
+                .is_some_and(|s| s.mm.as_deref().is_some_and(|j| j.spans()))
+        });
+        let itl_cap = if budget_on && !media_spans {
             ride.rows_within(f64::from(pf_itl_budget_ms()))
         } else {
             None
@@ -6300,13 +6300,15 @@ fn gpu_prefill_batched_pass(
         let bucket = e.pf_pack_budget(rows);
         // Under the unified token batch the decode rows ride in this launch, and the batch takes the
         // smallest bucket holding every row.
-        let trim = trim_for_riders(
-            bucket,
-            e.pf_cover_rows(rows.min(bucket) + decode_rows),
-            decode_rows,
-            rows,
-            avail - rows,
-        );
+        // An indivisible media span cut by a trim would leave the launch empty: it spills instead.
+        let trim = !media_spans
+            && trim_for_riders(
+                bucket,
+                e.pf_cover_rows(rows.min(bucket) + decode_rows),
+                decode_rows,
+                rows,
+                avail - rows,
+            );
         let per_launch = if trim {
             bucket.saturating_sub(decode_rows).max(1)
         } else {
@@ -6489,10 +6491,8 @@ fn gpu_prefill_batched_pass(
             if window.iter().all(|job| job.outcome.is_none()) && !unified {
                 admit_window(e, &mut window, false);
             }
-            // A KV-waiting outcome (`Ok(None)`) returns without admission work.
-            admitted_in_launch = window
-                .iter()
-                .any(|job| !matches!(job.outcome, None | Some(Ok(None))));
+            // Any attempt counts: `Ok(None)` also follows an allocation that failed under pressure.
+            admitted_in_launch = window.iter().any(|job| job.outcome.is_some());
             apply_window(e, slots, &mut window, arena, &mut tick_fault);
         }
         // A launch that ran admissions measured them (and the restores they queued behind it),
