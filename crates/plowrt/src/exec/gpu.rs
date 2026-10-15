@@ -2713,6 +2713,8 @@ pub struct GpuEngine {
     seq_tokens: Vec<Vec<u32>>,
     /// A prompt's prefix-cache key staged for the next attach of that slot (DP router hashes).
     staged_prefix: Vec<Option<crate::memory::vmm::PrefixKey>>,
+    /// Serve-manifest KV geometry, kept only under `PLOW_NV_DUMP_KV` ([`Self::dump_slot_kv`]).
+    dump_kv_geo: Option<plow_asset::serve_manifest::KvGeometry>,
     /// A launch's host window is open ([`Self::token_batch_step_window`]): snapshot restores skip
     /// their stream drain and their holds wait in `deferred_attach` for the step's own drain.
     window_open: bool,
@@ -7304,6 +7306,11 @@ impl GpuEngine {
             kv_pressure_events: 0,
             seq_tokens: vec![Vec::new(); batch],
             staged_prefix: vec![None; batch],
+            dump_kv_geo: RuntimeConfig::get()
+                .nv
+                .nv_dump_kv
+                .as_ref()
+                .and(serve.manifest.kv.clone()),
             window_open: false,
             deferred_attach: Vec::new(),
             window_event: None,
@@ -8002,6 +8009,9 @@ impl GpuEngine {
                 return;
             }
             p.queue.forget(b);
+        }
+        if self.pos[b] > 0 {
+            self.dump_slot_kv(b, "retire", self.pos[b]);
         }
         self.slot_generations[b] = self.slot_generations[b].wrapping_add(1);
         self.reset_packed_admission(b);
@@ -13822,6 +13832,78 @@ impl GpuEngine {
     /// or `None`. Block-harness accessor; not a hot path.
     pub fn handle_of(&self, name: &str) -> Option<usize> {
         self.tensor_names.iter().position(|n| n == name)
+    }
+
+    /// DIAGNOSTIC (`PLOW_NV_DUMP_KV=<dir>`): write slot `b`'s KV to `<dir>/<n>-<tag>-s<b>.kv`
+    /// with a JSON index: full-layer K/V and scales over rows `[0, rows)` per head (rows past it
+    /// may be unmapped under VMM), the slot's whole sliding rings and ring scales.
+    pub(crate) fn dump_slot_kv(&self, b: usize, tag: &str, rows: u32) {
+        static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let (Some(dir), Some(g)) = (
+            RuntimeConfig::get().nv.nv_dump_kv.as_ref(),
+            self.dump_kv_geo.as_ref(),
+        ) else {
+            return;
+        };
+        let n = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let stem = dir.join(format!("{n:05}-{tag}-s{b}"));
+        let dumped = (|| -> Result<serde_json::Value> {
+            self.be.stream_synchronize(&self.stream)?;
+            let mut data = Vec::new();
+            let mut index = Vec::new();
+            let groups = [
+                (&g.full_layers, g.kv_heads_full, true),
+                (&g.slide_layers, g.kv_heads_slide, false),
+            ];
+            for (layers, kvh, full) in groups {
+                for &l in layers {
+                    for t in ["k", "v", "k_scale", "v_scale"] {
+                        let name = format!("kv.{l}.{t}");
+                        let Some(i) = self.handle_of(&name) else {
+                            continue;
+                        };
+                        let slot = self.devp[i].len / self.batch as u64;
+                        let head = slot / u64::from(kvh);
+                        let fp8 = self.handle_of(&format!("kv.{l}.k_scale")).is_some();
+                        let row = match (t.ends_with("scale"), fp8) {
+                            (true, _) => 4,
+                            (false, true) => u64::from(g.head_dim_full),
+                            (false, false) => 2 * u64::from(g.head_dim_full),
+                        };
+                        let take = if full {
+                            (u64::from(rows) * row).min(head)
+                        } else {
+                            head
+                        };
+                        for h in 0..u64::from(kvh) {
+                            let mut buf = vec![0u8; take as usize];
+                            self.be
+                                .download(&self.devp[i], b as u64 * slot + h * head, &mut buf)?;
+                            index.push(serde_json::json!({
+                                "name": name, "head": h, "offset": data.len(), "bytes": take,
+                                "head_bytes": head, "full": full,
+                            }));
+                            data.extend_from_slice(&buf);
+                        }
+                    }
+                }
+            }
+            std::fs::write(stem.with_extension("kv"), &data)
+                .map_err(|e| RuntimeError::Rejected(e.to_string()))?;
+            Ok(serde_json::json!({
+                "tag": tag, "seq": n, "slot": b, "rows": rows, "pos": self.pos[b],
+                "attached": self.vmm_attached[b], "max_ctx": self.max_ctx,
+                "tokens": self.seq_tokens[b], "window": g.window, "segments": index,
+            }))
+        })();
+        match dumped {
+            Ok(meta) => {
+                if let Err(e) = std::fs::write(stem.with_extension("json"), meta.to_string()) {
+                    tracing::warn!(error = %e, "PLOW_NV_DUMP_KV index write failed");
+                }
+            }
+            Err(e) => tracing::warn!(error = %e, slot = b, tag, "PLOW_NV_DUMP_KV dump failed"),
+        }
     }
 
     /// Read a named tensor as raw bytes for diagnostics.

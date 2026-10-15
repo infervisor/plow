@@ -1478,6 +1478,11 @@ pub struct NvidiaRuntimeConfig {
     #[arg(long = "pf-trace-log", env = "PLOW_PF_TRACE_LOG", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
     pub pf_trace_log: bool,
 
+    /// Diagnostic: directory to write a slot's KV into after a prefix attach and at retire
+    /// (`GpuEngine::dump_slot_kv`). Unset = none.
+    #[arg(long = "nv-dump-kv", env = "PLOW_NV_DUMP_KV", hide = true, global = true)]
+    pub nv_dump_kv: Option<std::path::PathBuf>,
+
     /// Diagnostic: name why a decode rung failed ladder normalization (widest-rung fallback).
     #[arg(long = "ladder-debug", env = "PLOW_LADDER_DEBUG", hide = true, default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
     pub ladder_debug: bool,
