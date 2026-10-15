@@ -22,6 +22,14 @@ extern "C" __device__ unsigned plow_kda_decode_wide_3 = 3;
 #ifndef PLOW_KDA_DECODE_LANES
 #define PLOW_KDA_DECODE_LANES 0
 #endif
+/* PLOW_KDA_DECODE_PREFETCH (object define, LANES only): issue the state loads before the conv,
+ * so their latency hides under it. Same arithmetic. */
+#ifndef PLOW_KDA_DECODE_PREFETCH
+#define PLOW_KDA_DECODE_PREFETCH 0
+#endif
+#if PLOW_KDA_DECODE_PREFETCH && !PLOW_KDA_DECODE_LANES
+#error "PLOW_KDA_DECODE_PREFETCH requires PLOW_KDA_DECODE_LANES"
+#endif
 #if PLOW_KDA_DECODE_LANES
 __device__ __forceinline__ float kda_quad_sum(float x) {
     x += __builtin_bit_cast(float, __builtin_amdgcn_update_dpp(
@@ -31,22 +39,35 @@ __device__ __forceinline__ float kda_quad_sum(float x) {
     return x;
 }
 
+/* Lane (w, l)'s slice of the (row, h) state: value row 16w + l/4, key positions 16i + 4(l%4). */
+__device__ __forceinline__ float* kda_lanes_srow(float* state, unsigned row, unsigned h, unsigned H) {
+    constexpr unsigned D = 128u;
+    const unsigned lane = threadIdx.x & 63u, wave = threadIdx.x >> 6;
+    return state + ((size_t)row * H + h) * D * D + (size_t)(16u * wave + (lane >> 2)) * D +
+           4u * (lane & 3u);
+}
+
+__device__ __forceinline__ void kda_lanes_load(f32x4 (&s)[8], const float* srow) {
+#pragma unroll
+    for (unsigned i = 0; i < 8u; ++i) s[i] = *reinterpret_cast<const f32x4*>(srow + 16u * i);
+}
+
+/* PRE: `s` already holds the state (PLOW_KDA_DECODE_PREFETCH loads it before the conv). */
+template <bool PRE>
 __device__ void kda_state_step_lanes(
     bf16* __restrict__ o, const bf16* __restrict__ q, const bf16* __restrict__ k,
     const bf16* __restrict__ v, const bf16* __restrict__ g_raw,
     const bf16* __restrict__ beta_raw, const float* __restrict__ a_log,
     const float* __restrict__ dt_bias, unsigned gate_mode, float lb, float* __restrict__ state,
     unsigned row, unsigned h, unsigned H, unsigned flags, float scale, float* __restrict__ lds,
-    const unsigned* __restrict__ parked) {
+    const unsigned* __restrict__ parked, f32x4 (&s)[8]) {
     constexpr unsigned D = 128u;
     if (parked && parked[row]) return;
     const unsigned lane = threadIdx.x & 63u, wave = threadIdx.x >> 6;
     const unsigned vr = 16u * wave + (lane >> 2), part = lane & 3u;
     const size_t hd = (size_t)row * H * D + (size_t)h * D;
-    float* srow = state + ((size_t)row * H + h) * D * D + (size_t)vr * D + 4u * part;
-    f32x4 s[8];
-#pragma unroll
-    for (unsigned i = 0; i < 8u; ++i) s[i] = *reinterpret_cast<const f32x4*>(srow + 16u * i);
+    float* srow = kda_lanes_srow(state, row, h, H);
+    if (!PRE) kda_lanes_load(s, srow);
     float* l_q = lds;
     float* l_k = lds + D;
     float* l_g = lds + 2 * D;
@@ -128,6 +149,12 @@ void plow_kda_decode_wide_v3(
     const size_t rcs = rp * conv_w;
     const unsigned* pk = parked ? parked + row : nullptr;
     const unsigned c0 = h * dim, c1 = c0 + dim;
+#if PLOW_KDA_DECODE_LANES
+    f32x4 st[8];
+#if PLOW_KDA_DECODE_PREFETCH
+    if (!(pk && *pk)) kda_lanes_load(st, kda_lanes_srow(state, row, h, heads));
+#endif
+#endif
     /* op 109, independent-sequence arm: this row's window, this head's channels. */
     kda_conv_range(mq + rp, q_raw + rp, wq, csq + rcs, 1u, proj, conv_w, 1u, c0, c1,
                    (size_t)proj * conv_w, pk);
@@ -138,8 +165,9 @@ void plow_kda_decode_wide_v3(
     __syncthreads();
     /* op 110, wide arm: grid == T*H items, so this workgroup's only item is `item`. */
 #if PLOW_KDA_DECODE_LANES
-    kda_state_step_lanes(o, mq, mk, mv, forget_raw, beta_raw, a_log, dt_bias, gate_mode,
-                         lower_bound, state, row, h, heads, flags, scale, lds, parked);
+    kda_state_step_lanes<PLOW_KDA_DECODE_PREFETCH != 0>(
+        o, mq, mk, mv, forget_raw, beta_raw, a_log, dt_bias, gate_mode, lower_bound, state, row, h,
+        heads, flags, scale, lds, parked, st);
 #else
     d_kda_state_step_g(o, mq, mk, mv, forget_raw, beta_raw, a_log, dt_bias, gate_mode,
                        lower_bound, state, rows, heads, dim, bv, flags, scale, item,

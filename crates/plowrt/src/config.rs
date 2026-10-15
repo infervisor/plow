@@ -2283,6 +2283,16 @@ pub struct AmdRuntimeConfig {
     /// of one layer run concurrently.
     #[arg(long = "amd-lt-concurrent", env = "PLOW_AMD_LT_CONCURRENT", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
     pub lt_concurrent: bool,
+    /// Diagnostic: gfx950 hipBLASLt kernel (index into `glm_lt_gfx950.json`) of the GLM-5.3 TP8
+    /// lm_head decode route (`PLOW_GLM53_GEMM_LT_DEC=lm_head`). Unset = 23 (MT64x32x128).
+    #[arg(long = "amd-lt-lm-head-kernel", env = "PLOW_AMD_LT_LM_HEAD_KERNEL", value_parser = clap::value_parser!(u32).range(0..=32), global = true)]
+    pub lt_lm_head_kernel: Option<u32>,
+    /// Diagnostic: split-K (8, 16, 32 or 64; unset = 64) of the PLOW_GLM_HC_AITER decode pair.
+    #[arg(long = "amd-hc-split-k", env = "PLOW_AMD_HC_SPLIT_K", global = true)]
+    pub hc_split_k: Option<u32>,
+    /// Diagnostic: tile_m (16 or 32; unset = AITER's picker) of the PLOW_GLM_HC_AITER post kernel.
+    #[arg(long = "amd-hc-tile-m", env = "PLOW_AMD_HC_TILE_M", global = true)]
+    pub hc_tile_m: Option<u32>,
     /// Diagnostic: `<acquire>,<release>` HSA fence scopes (0 none, 1 agent, 2 system) on every
     /// dispatch packet. Unset = agent,agent. Not ordering-safe below agent.
     #[arg(long = "amd-pkt-fence", env = "PLOW_AMD_PKT_FENCE", global = true)]

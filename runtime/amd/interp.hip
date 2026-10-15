@@ -258,6 +258,11 @@ extern "C" __device__ unsigned plow_phase_xreduce_wave64_occ2_nospill_1 = 1;
 #ifndef PLOW_MLA_FOLD_MFMA
 #define PLOW_MLA_FOLD_MFMA 0
 #endif
+/* Fewest rows the MFMA fold takes (PLOW_MLA_DEC_FOLD_MFMA decode objects: 32, where the
+ * row-block GEMM has work for its waves; smaller decode rungs keep the VT=32 scalar map). */
+#ifndef PLOW_MLA_FOLD_MFMA_MIN_ROWS
+#define PLOW_MLA_FOLD_MFMA_MIN_ROWS 1
+#endif
 #if PLOW_MLA_FOLD_MFMA && PLOW_CDNA4 && PLOW_WAVES == 8
 #include "mla_fold_pf_mfma.h"
 #endif
@@ -1959,7 +1964,8 @@ __device__ __forceinline__ void exec_mla_merge_fold(CInst in, CTens T, unsigned 
 #if PLOW_MLA_FOLD_MFMA && PLOW_CDNA4 && PLOW_WAVES == 8
     /* One split and V=256 (GLM prefill): batched MFMA GEMM, 2.7-5.2x the scalar fold at T 1k-16k
      * on MI350X; bf16 rounding of the normalized latent, rel-L2 2.5e-3 vs the scalar fold. */
-    if (in->i[4] >= 1u && in->i[4] <= (unsigned)PLOW_MLA_FOLD_MFMA_NS && V == 256u) {
+    if (in->i[4] >= 1u && in->i[4] <= (unsigned)PLOW_MLA_FOLD_MFMA_NS && V == 256u &&
+        in->i[0] >= (unsigned)PLOW_MLA_FOLD_MFMA_MIN_ROWS) {
         if (in->i[0] >= 1024u)
             d_mla_fold_pf_mfma<2, 256>(FOLD_O, FOLD_OPART, FOLD_MLPART, FOLD_WUV, in->i[0],
                                        in->i[1], slice, nblk, (bf16*)raw, in->i[4]);

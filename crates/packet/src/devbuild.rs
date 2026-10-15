@@ -462,6 +462,7 @@ pub struct Builder {
     lean_kda_key_factor_segments: bool,
     /// Isolate adjacent FlashMlaDecode+MlaMergeFold pairs for a gfx950 object.
     decode_mla_segments: bool,
+    decode_mla_kvw_segments: bool,
     decode_mla_bf16_segments: bool,
     /// Isolate adjacent grouped decode GLU+DOWN pairs for ordered raw launches.
     decode_grouped_moe_segments: bool,
@@ -771,6 +772,7 @@ impl Builder {
             kda_carry_keyfeed_segments: false,
             lean_kda_key_factor_segments: false,
             decode_mla_segments: false,
+            decode_mla_kvw_segments: false,
             decode_mla_bf16_segments: false,
             decode_grouped_moe_segments: false,
             xreduce_wave_rs_segments: false,
@@ -986,6 +988,12 @@ impl Builder {
 
     pub fn set_decode_mla_segments(&mut self, enabled: bool) {
         self.decode_mla_segments = enabled;
+    }
+
+    /// With decode-MLA segments: a HeadNormRope directly before a FlashMlaDecode+MlaMergeFold
+    /// pair (the latent KV writer) joins that pair's segment.
+    pub fn set_decode_mla_kvw_segments(&mut self, enabled: bool) {
+        self.decode_mla_kvw_segments = enabled;
     }
 
     pub fn set_decode_grouped_moe_segments(&mut self, enabled: bool) {
@@ -2756,7 +2764,13 @@ impl Builder {
                         .is_some_and(|next| next.inst.op == DevOp::MlaMergeFold as u16))
                     || (op == DevOp::MlaMergeFold as u16
                         && i > 0
-                        && self.ops[i - 1].inst.op == DevOp::FlashMlaDecode as u16))
+                        && self.ops[i - 1].inst.op == DevOp::FlashMlaDecode as u16)
+                    || (self.decode_mla_kvw_segments
+                        && op == DevOp::HeadNormRope as u16
+                        && self.ops.get(i + 1..i + 3).is_some_and(|pair| {
+                            pair[0].inst.op == DevOp::FlashMlaDecode as u16
+                                && pair[1].inst.op == DevOp::MlaMergeFold as u16
+                        })))
             {
                 18
             } else if isolate_xreduce && op == DevOp::XReduceTwoShot as u16 {

@@ -2104,16 +2104,18 @@ fn object_inventory(progs: &[ProgramArms], arch: &str, packed_metadata: bool) ->
     if packed_metadata && packed_prefill.is_empty() {
         packed_prefill = prefill.clone();
     }
+    // The pair, optionally led by its latent KV writer (`PLOW_GLM53_MLA_SEG_KVW`).
     let decode_mla_segment = |p: &&ProgramArms| {
+        let kvw = p.arms.iter().any(|a| a.op == "HeadNormRope");
         p.kind == "decode"
             && p.seg.is_some()
-            && p.insts == 2
-            && p.arms.len() == 2
+            && p.insts == 2 + usize::from(kvw)
+            && p.arms.len() == 2 + usize::from(kvw)
             && p.arms.iter().any(|a| a.op == "FlashMlaDecode")
             && p.arms.iter().any(|a| a.op == "MlaMergeFold")
-            && p.arms
-                .iter()
-                .all(|a| a.op == "FlashMlaDecode" || a.op == "MlaMergeFold")
+            && p.arms.iter().all(|a| {
+                a.op == "FlashMlaDecode" || a.op == "MlaMergeFold" || a.op == "HeadNormRope"
+            })
     };
     let decode_mla: BTreeSet<Arm> = progs
         .iter()

@@ -340,6 +340,7 @@ fn decode_segment_kinds(prog: &DevProg) -> Result<Vec<DecodeSegmentKind>> {
         let mut w8_pair: Vec<(usize, bool)> = Vec::new();
         let mut xr_inst = None;
         let mut xr_pure = true;
+        let mut mla_kvw = None;
         for e in prog.stream.iter().filter(|e| e.seg as usize == seg) {
             let inst = prog.insts.get(e.inst as usize).ok_or_else(|| {
                 RuntimeError::Device(format!(
@@ -451,9 +452,19 @@ fn decode_segment_kinds(prog: &DevProg) -> Result<Vec<DecodeSegmentKind>> {
                     Some(_) => xr_pure = false,
                 }
                 xr_pure &= e.wait_len == 0 && e.succ_len == 0 && e.flags & SE_XCTR == 0;
+            } else if inst.op == DevOp::HeadNormRope as u16 {
+                match mla_kvw {
+                    None => mla_kvw = Some(e.inst as usize),
+                    Some(i) if i == e.inst as usize => {}
+                    Some(_) => has_other = true,
+                }
             } else {
                 has_other = true;
             }
+        }
+        // `PLOW_GLM53_MLA_SEG_KVW`: one latent KV writer may lead a decode-MLA pair.
+        if mla_kvw.is_some() && mla_flash_inst.is_none() {
+            has_other = true;
         }
         if has_other
             && w8_pair.is_empty()
@@ -1087,8 +1098,18 @@ fn hc_aiter_args(
     }
     let (mul, sq) = (addr(w[4])?, addr(w[5])?);
     let (post_mix, comb_mix, next_residual) = (t(5)?, t(6)?, t(1)?);
+    let amd = &crate::config::RuntimeConfig::get().amd;
+    // Diagnostic overrides; the reduce scratch holds HC_AITER_SPLIT_K partials, so never more.
+    let split = amd
+        .hc_split_k
+        .filter(|s| matches!(s, 8 | 16 | 32 | 64))
+        .unwrap_or(HC_AITER_SPLIT_K);
     // AITER's gfx950 picker: tile_m 32 once ceil(m / 32) * split_k fills the 256 CUs.
-    let tile32 = m.div_ceil(32) * HC_AITER_SPLIT_K >= 256;
+    let tile32 = match amd.hc_tile_m {
+        Some(16) => false,
+        Some(32) => true,
+        _ => m.div_ceil(32) * split >= 256,
+    };
     Ok(HcAiterRoute {
         post: HcAiterPostArgs {
             mul,
@@ -1103,7 +1124,7 @@ fn hc_aiter_args(
             hidden: 4096,
             x_stride: 4096,
             out_stride: 32,
-            split_k: HC_AITER_SPLIT_K as i32,
+            split_k: split as i32,
         },
         pre: HcAiterPreArgs {
             post_mix,
@@ -1116,7 +1137,7 @@ fn hc_aiter_args(
             residual: next_residual,
             gamma: addr(w[1])?,
             m: m as i32,
-            n_splits: HC_AITER_SPLIT_K as i32,
+            n_splits: split as i32,
             mul_stride: 32,
             residual_stride: 4 * 4096,
             rms_eps: f32::from_bits(w[8]),
@@ -16807,7 +16828,7 @@ impl AmdEngine {
                 let tm = if r.tile32 { 32 } else { 16 };
                 self.be.launch_3d(
                     if r.tile32 { k32 } else { k16 },
-                    [(r.post.m as u32).div_ceil(tm), 1, HC_AITER_SPLIT_K],
+                    [(r.post.m as u32).div_ceil(tm), 1, r.post.split_k as u32],
                     256,
                     as_bytes(std::slice::from_ref(&r.post)),
                 )?;

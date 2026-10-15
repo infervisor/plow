@@ -1020,7 +1020,7 @@ pub struct EmitConfig {
     /// GLM-5.3-Flash gfx950 decode: comma list of dense BF16 projections that run the pinned
     /// gfx950 hipBLASLt object as their own segment at the `PLOW_GLM53_GEMM_LT_DEC_RUNGS` rungs:
     /// `q_a`, `kv_a`, `q_absorb`, `mla_o`, `kda_o`, `kda_qkv`, `kda_gfa` (g_a, f_a), `kda_gb`
-    /// (g_b, f_b), `kda_b`. A routed KDA layer drops the PLOW_GLM_KDA_PROJ_GROUP packets. Unset =>
+    /// (g_b, f_b), `kda_b`, `lm_head` (TP8 vocab shard). A routed KDA layer drops the PLOW_GLM_KDA_PROJ_GROUP packets. Unset =>
     /// byte-identical.
     #[arg(long, env = "PLOW_GLM53_GEMM_LT_DEC")]
     pub glm53_gemm_lt_dec: Option<String>,
@@ -1079,6 +1079,11 @@ pub struct EmitConfig {
     /// one work item), for the lean object built with PLOW_MLA_DEC_HPACK=1. NOT bit-identical.
     #[arg(long, env = "PLOW_GLM53_MLA_HPACK_ROWS")]
     pub glm53_mla_hpack_rows: Option<u32>,
+
+    /// With `PLOW_GLM53_MLA_HPACK_ROWS`: the latent KV writer (HeadNormRope) that precedes each
+    /// pair joins its decode-MLA segment, one interpreter segment less per MLA layer.
+    #[arg(long, env = "PLOW_GLM53_MLA_SEG_KVW", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
+    pub glm53_mla_seg_kvw: bool,
 
     /// GLM-5.3-Flash decode: the HyperConnPost-folded mHC mix GemvF32 runs only on the
     /// workgroups that own an output, and under the one-row pre tail each output's K is split
@@ -1974,6 +1979,7 @@ impl EmitConfig {
             glm53_packed_lean_kda: env_bool("PLOW_GLM53_PACKED_LEAN_KDA"),
             glm53_l2_place: env_bool("PLOW_GLM53_L2_PLACE"),
             glm53_mla_hpack_rows: env_u32("PLOW_GLM53_MLA_HPACK_ROWS"),
+            glm53_mla_seg_kvw: env_bool("PLOW_GLM53_MLA_SEG_KVW"),
             glm_hc_mix_split: env_u32("PLOW_GLM_HC_MIX_SPLIT"),
             glm_hc_fuse_dec: env_bool("PLOW_GLM_HC_FUSE_DEC"),
             glm_kda_proj_group: env_bool("PLOW_GLM_KDA_PROJ_GROUP"),

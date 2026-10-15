@@ -158,6 +158,14 @@ case "${PLOW_MLA_DEC_HPACK:-0}" in
   2) DMLA_X="-DPLOW_GLM_GF8_ARM=1" ;;
   *) echo "PLOW_MLA_DEC_HPACK must be 0, 1 or 2" >&2; exit 2 ;;
 esac
+# PLOW_MLA_DEC_FOLD_MFMA=1 (decode-MLA segment objects only): rungs of >= 32 rows fold through
+# the batched MFMA GEMM (bf16-rounded latent, as PLOW_K3_PF_FOLD_MFMA) instead of one W_uv panel
+# stream per (row, head). Not bit-identical to the scalar fold.
+case "${PLOW_MLA_DEC_FOLD_MFMA:-0}" in
+  0) ;;
+  1) DMLA_X="$DMLA_X -DPLOW_MLA_FOLD_MFMA=1 -DPLOW_MLA_FOLD_MFMA_NS=4 -DPLOW_MLA_FOLD_MFMA_MIN_ROWS=32" ;;
+  *) echo "PLOW_MLA_DEC_FOLD_MFMA must be 0 or 1" >&2; exit 2 ;;
+esac
 case "${PLOW_MOE_GLU_KW:-0}" in
   0) ;;
   1) DEC_KNOBS="$DEC_KNOBS -DPLOW_MOE_GLU_KW=1" ;;
@@ -812,6 +820,12 @@ case "${PLOW_KDA_DECODE_LANES:-0}" in
   0) KDA_DECODE_LANES_DEF="" ;;
   1) KDA_DECODE_LANES_DEF="-DPLOW_KDA_DECODE_LANES=1" ;;
   *) echo "PLOW_KDA_DECODE_LANES must be 0 or 1" >&2; exit 2 ;;
+esac
+# PLOW_KDA_DECODE_PREFETCH=1 (with LANES): state loads issued before the conv (same arithmetic).
+case "${PLOW_KDA_DECODE_PREFETCH:-0}" in
+  0) ;;
+  1) KDA_DECODE_LANES_DEF="$KDA_DECODE_LANES_DEF -DPLOW_KDA_DECODE_PREFETCH=1" ;;
+  *) echo "PLOW_KDA_DECODE_PREFETCH must be 0 or 1" >&2; exit 2 ;;
 esac
 if [ "$ARCH" = gfx950 ] && [ "$need_kda_fused" = 1 ]; then
   bash "$R/cmake/hipcc_hsaco.sh" hipcc "$BUN" "$ARCH" \

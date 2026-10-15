@@ -217,6 +217,14 @@ fn gfx950_choice(rows: u32, n: u32, k: u32) -> Option<usize> {
         (1024, 4096) => [27, 28, 13, 11, 14],
         // KDA f_a/g_a. Not b (N=8): the narrow kernels fault on an 8-column edge.
         (128, 4096) => [29, 30, 15, 16, 17],
+        // TP8 lm_head shard at the decode rungs only.
+        (19360, 4096) if rows <= 256 => {
+            let k = crate::config::RuntimeConfig::get()
+                .amd
+                .lt_lm_head_kernel
+                .unwrap_or(23) as usize;
+            [k, k, 0, 0, 0]
+        }
         _ => return None,
     };
     let tier = match rows {

@@ -1583,6 +1583,7 @@ pub(crate) fn glm53_emit_full(
         }
         b.set_gemm_small_group_s(ec.glm_kda_proj_group_s.unwrap_or(0));
         b.set_decode_mla_segments(ec.glm53_mla_hpack_rows.is_some_and(|min| rows >= min.max(2)));
+        b.set_decode_mla_kvw_segments(ec.glm53_mla_seg_kvw);
         b.set_l2_placement(l2_layout);
         if l2_layout.is_some() {
             b.deny_uniseg();
@@ -7643,6 +7644,7 @@ pub(crate) fn glm53_lt_dec_routes(rows: u32, nn: u32, k: u32) -> bool {
         (128, 4096) => "kda_gfa",
         (1024, 128) => "kda_gb",
         (8, 4096) => "kda_b",
+        (19360, 4096) => "lm_head",
         _ => return false,
     };
     glm53_lt_dec_rung(rows)
@@ -13310,14 +13312,18 @@ fn emit_glm_tail(
     // A token-batch body samples its band through a tiled GEMM (see above), never through the
     // native decode route: the body runs on prefill objects.
     let lt = if nb > 0 && band.is_none() {
-        emit_glm_decode_gemm_lt(
-            b,
-            c,
-            MoeEnc::Bf16,
-            rows,
-            [n.logits, n.xn, n.head],
-            [vocab_l, c.hidden],
-            &[c_f],
+        emit_glm53_lt_dec(b, n.logits, n.xn, n.head, rows, vocab_l, c.hidden, &[c_f]).or_else(
+            || {
+                emit_glm_decode_gemm_lt(
+                    b,
+                    c,
+                    MoeEnc::Bf16,
+                    rows,
+                    [n.logits, n.xn, n.head],
+                    [vocab_l, c.hidden],
+                    &[c_f],
+                )
+            },
         )
     } else {
         None
