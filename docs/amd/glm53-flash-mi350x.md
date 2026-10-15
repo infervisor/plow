@@ -595,6 +595,14 @@ The packet from config + index alone (no weights) is 70 MB: 4 prefill buckets + 
   (removes a random ~18 ms stall), decode router tile + split-K 2P + XR_DEC_CUS, deferred-frame flash softmax.
   Gates PASS kl 0.01305; prefill 8k 272 -> 245 ms; serving +3-9% at c32/c128. Per-segment geometry sweep: no
   gain (the interpreter object's 148 KB LDS union + 256 VGPR cap every op at 1 WG x 8 waves/CU).
+- 01:50 UTC (10-15), v20 (29af24ff; packet 49b696e4): v19 + a 64-row decode rung (`PLOW_DECODE_BATCH_LADDER =
+  1,8,32,64,128`, `PLOW_GLM53_GEMM_LT_DEC_RUNGS = 8,32,64,128`; emit only, same binary). Batches of 33-64 ran padded
+  on the 128 rung: distinct-prompt B64 18.3 ms vs B128 23.0. Routing rung 1 through hipBLASLt too: B1 8.4 -> 9.5 ms,
+  dropped. Gates PASS kl 0.02125, needles 36/36, split 18/18, prefix 53248 hits. Strict TP8 19 cells
+  MATCHED/EQUIVALENT: 0.68-0.94x vLLM (c64 isl1024/4096/16384 0.62/0.70/0.76 -> 0.70/0.77/0.80). DSA prefill (K,
+  v19-pf, default off): native select v2 + row-wave kpool score cut the indexer chain 5.5 -> 2.1 ms per MLA layer;
+  all-sparse gates PASS kl 0.0195; prefill 61k 1711 -> 1679 ms, still slower at 8k-32k (chunks with <= 8k context
+  gain nothing from sparse). No qualified win. Recipe -> v20.
 - 00:35 UTC (10-15), v19 (29af24ff; packet 540ba4fa; plowrt 84e6ac15): second lever round. Taken: G —
   `PLOW_GLM53_GEMM_LT_DEC` (all nine decode projections of rungs 8/32/128 as hipBLASLt gfx950 kernels from a 6.8 MB
   sha-pinned 26-kernel subset image, each at its own workgroup size; partial routing loses ~30 us per interpreter
@@ -810,7 +818,7 @@ The packet from config + index alone (no weights) is 70 MB: 4 prefill buckets + 
 
 Strict `campaign.py report` output per input length and the combined comparison.csv:
 [docs/bringup/results/glm53flash-mi350x-2026-10-12](../bringup/results/glm53flash-mi350x-2026-10-12/summary.md).
-No qualified win: plow total throughput 0.62-0.93x vLLM (v19; v18 0.54-0.82x, v17 0.47-0.76x, v16c 0.44-0.75x, v15b 0.37-0.66x, v15a 0.36-0.66x, v13 0.34-0.61x, v11 0.28-0.61x).
+No qualified win: plow total throughput 0.68-0.94x vLLM (v20; v19 0.62-0.93x, v18 0.54-0.82x, v17 0.47-0.76x, v16c 0.44-0.75x, v15b 0.37-0.66x, v15a 0.36-0.66x, v13 0.34-0.61x, v11 0.28-0.61x).
 
 ## 6. Roofline (CPU, before any plow GPU time)
 
