@@ -89,6 +89,7 @@ pub(super) fn snapshot_regions<'a>(
     if batch == 0 || max_ctx == 0 {
         return None;
     }
+    let instructions_all = instructions.clone();
     let mut known = vec![false; tensors.len()];
     let mut needed = vec![false; tensors.len()];
     let mut regions = Vec::new();
@@ -250,8 +251,9 @@ pub(super) fn snapshot_regions<'a>(
             }
         }
     }
+    let used = referenced(tensors.len(), instructions_all);
     for (i, t) in tensors.iter().enumerate() {
-        if t.name.starts_with("kv.") && !t.name.contains("blkres") && !known[i] {
+        if t.name.starts_with("kv.") && !t.name.contains("blkres") && !known[i] && used[i] {
             return None;
         }
         if needed[i] && !regions.iter().any(|r| r.tensor == i) {
@@ -289,13 +291,14 @@ impl CloneSpan {
 /// cross-slot reuse) for anything else: rings, pooled indexers, unknown writers.
 pub(super) fn clone_spans<'a>(
     tensors: &[DevTensor],
-    instructions: impl Iterator<Item = &'a DevInst64>,
+    instructions: impl Iterator<Item = &'a DevInst64> + Clone,
     regions: &[Region],
     batch: usize,
 ) -> Option<Vec<CloneSpan>> {
     if batch == 0 {
         return None;
     }
+    let used = referenced(tensors.len(), instructions.clone());
     let mut spans: Vec<CloneSpan> = Vec::new();
     for d in instructions {
         if d.op == DevOp::DsaPoolCompress as u16 {
@@ -371,11 +374,26 @@ pub(super) fn clone_spans<'a>(
             && !super::is_carried_state(&t.name)
             && !regions.iter().any(|r| r.tensor == i)
             && !spans.iter().any(|s| s.tensor == i)
+            && used[i]
         {
             return None;
         }
     }
     Some(spans)
+}
+
+/// Tensors some instruction names: a declared `kv.*` no program touches (the pooled DSA packet's
+/// unused per-token indexer cache) holds nothing a prefix could own.
+fn referenced<'a>(n: usize, instructions: impl Iterator<Item = &'a DevInst64>) -> Vec<bool> {
+    let mut used = vec![false; n];
+    for d in instructions {
+        for &h in &d.t {
+            if let Some(u) = used.get_mut(h as usize) {
+                *u = true;
+            }
+        }
+    }
+    used
 }
 #[cfg(test)]
 mod tests {
