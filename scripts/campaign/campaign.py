@@ -1467,6 +1467,11 @@ def sweep_build_stale(rec: dict, out: Path) -> str:
             f = out / sub / name
             if not f.is_file() or sha(f) != digest:
                 return f"{sub}/{name} changed since the build"
+    # The bundled copies serve loads: each must still be the recorded object.
+    objects = rec.get("objects") or {}
+    for f in sorted((out / "assets" / "objects").glob("*")):
+        if f.is_file() and sha(f) != objects.get(f.name):
+            return f"assets/objects/{f.name} is not the recorded object"
     return ""
 
 

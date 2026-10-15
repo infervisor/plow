@@ -330,6 +330,14 @@ class SweepReuseTests(unittest.TestCase):
                 plowc.write_bytes(b"plowc")
                 git["status"] = " M x"
                 self.assertEqual(campaign.sweep_build_stale(rec, out), "the source tree is dirty")
+                git["status"] = ""
+                (out / "assets" / "objects").mkdir()
+                (out / "assets" / "objects" / "k.cubin").write_bytes(b"k")
+                self.assertIn("assets/objects/k.cubin", campaign.sweep_build_stale(rec, out))
+                (out / "objects").mkdir()
+                (out / "objects" / "k.cubin").write_bytes(b"k")
+                rec["objects"] = {"k.cubin": campaign.sha(out / "objects" / "k.cubin")}
+                self.assertEqual(campaign.sweep_build_stale(rec, out), "")
 
 if __name__ == "__main__":
     unittest.main()
