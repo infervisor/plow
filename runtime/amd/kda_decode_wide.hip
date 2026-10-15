@@ -161,3 +161,63 @@ void plow_kda_decode_wide_v3(
                                kda_sigmoid(bf2f(output_gate_raw[base + d])));
     }
 }
+
+#if PLOW_KDA_RIDER
+/* PLOW_AMD_RIDER_KDA: the one-row spans of a packed prefill launch (decode riders) run this
+ * chain's conv and state step instead of the packed BT64 chunk arms (built with
+ * PLOW_PACKED_KDA_RIDER, which skip them), one workgroup per (span, head); longer spans' items
+ * exit. A span addresses its rows by `row0` and its conv/recurrent state by `state_slot`;
+ * KdaGatedNorm stays in the packed program. */
+extern "C" __device__ unsigned plow_kda_rider_1 = 1;
+
+extern "C" __global__ __launch_bounds__(PLOW_THREADS)
+void plow_kda_rider_v1(
+    const PlowPrefillSpan* spans, bf16* o, const bf16* q_raw, const bf16* k_raw,
+    const bf16* v_raw, const float* wq, const float* wk, const float* wv, float* csq,
+    float* csk, float* csv, const bf16* forget_raw, const bf16* beta_raw, const float* a_log,
+    const float* dt_bias, float* state, bf16* mq, bf16* mk, bf16* mv, unsigned n_spans,
+    unsigned heads, unsigned dim, unsigned conv_w, unsigned act, unsigned gate_mode,
+    float lower_bound, float scale) {
+    if (blockDim.x != PLOW_THREADS || heads == 0u || dim != 128u || conv_w == 0u ||
+        conv_w > 8u || gridDim.x != n_spans * heads)
+        __builtin_trap();
+    __shared__ float lds[5u * 128u + 2u * PLOW_WAVES];
+    const unsigned r = blockIdx.x / heads;
+    const unsigned h = blockIdx.x - r * heads;
+    const PlowPrefillSpan* span = spans + r;
+    if (span->n_rows != 1u) return;
+    const unsigned proj = heads * dim;
+    const size_t rp = (size_t)span->row0 * proj;
+    const size_t cs = (size_t)span->state_slot * proj * conv_w;
+    const unsigned c0 = h * dim, c1 = c0 + dim;
+    float* st = state + (size_t)span->state_slot * heads * dim * dim;
+    if (span->flags & PLOW_PREFILL_SPAN_RESET_STATE) {
+        for (unsigned x = threadIdx.x; x < dim * conv_w; x += PLOW_THREADS) {
+            const size_t at = (size_t)c0 * conv_w + x;
+            csq[cs + at] = 0.0f;
+            csk[cs + at] = 0.0f;
+            csv[cs + at] = 0.0f;
+        }
+        for (unsigned x = threadIdx.x; x < dim * dim; x += PLOW_THREADS)
+            st[(size_t)h * dim * dim + x] = 0.0f;
+        __syncthreads();
+    }
+    const size_t one = (size_t)proj * conv_w;
+    kda_conv_range(mq + rp, q_raw + rp, wq, csq + cs, 1u, proj, conv_w, act, c0, c1, one, nullptr);
+    kda_conv_range(mk + rp, k_raw + rp, wk, csk + cs, 1u, proj, conv_w, act, c0, c1, one, nullptr);
+    kda_conv_range(mv + rp, v_raw + rp, wv, csv + cs, 1u, proj, conv_w, act, c0, c1, one, nullptr);
+    __syncthreads();
+    const size_t rh = (size_t)span->row0 * heads;
+#if PLOW_KDA_DECODE_LANES
+    kda_state_step_lanes(o + rp, mq + rp, mk + rp, mv + rp, forget_raw + rp, beta_raw + rh, a_log,
+                         dt_bias, gate_mode, lower_bound, st, 0u, h, heads,
+                         PLOW_KDA_F_QK_L2NORM | PLOW_KDA_F_SEQ_ROWS, scale, lds, nullptr);
+#else
+    /* Two nominal rows select the wide arm; item h is row 0 only. */
+    d_kda_state_step_g(o + rp, mq + rp, mk + rp, mv + rp, forget_raw + rp, beta_raw + rh, a_log,
+                       dt_bias, gate_mode, lower_bound, st, 2u, heads, dim, 8u,
+                       PLOW_KDA_F_QK_L2NORM | PLOW_KDA_F_SEQ_ROWS, scale, h, 2u * heads, lds,
+                       (size_t)heads * dim * dim, nullptr);
+#endif
+}
+#endif

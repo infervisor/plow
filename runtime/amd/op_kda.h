@@ -52,6 +52,17 @@
 #ifndef PLOW_PACKED_KDA_PAR
 #define PLOW_PACKED_KDA_PAR 0
 #endif
+/* PLOW_PACKED_KDA_RIDER: packed KDA arms skip one-row spans (decode riders); the rider chain
+ * (kda_decode_wide.hip plow_kda_rider_v1; runtime PLOW_AMD_RIDER_KDA) runs them. */
+#ifndef PLOW_PACKED_KDA_RIDER
+#define PLOW_PACKED_KDA_RIDER 0
+#endif
+#if PLOW_PACKED_KDA_RIDER
+#define PLOW_KDA_RIDER_SKIP(span) \
+    if ((span)->n_rows == 1u) continue
+#else
+#define PLOW_KDA_RIDER_SKIP(span) (void)0
+#endif
 #ifndef PLOW_KDA_CONV_STEP_DB
 #define PLOW_KDA_CONV_STEP_DB 0
 #endif
@@ -1333,6 +1344,7 @@ __device__ void d_kda_chunk_prepare_packed_bt64(
     size_t off = 0;
     for (unsigned si = 0; si < prog->n_prefill_spans; ++si) {
         const PlowPrefillSpan* span = plow_packed_prefill_span(prog, si);
+        PLOW_KDA_RIDER_SKIP(span);
         const size_t rd = (size_t)span->row0 * H * D;
         const size_t rh = (size_t)span->row0 * H;
         d_kda_chunk_prepare_bt64(q + rd, k + rd, g_prefix + rd, beta + rh, g_raw + rd,
@@ -1350,6 +1362,7 @@ __device__ void d_kda_chunk_intra_packed_bt64(
     size_t off = 0;
     for (unsigned si = 0; si < prog->n_prefill_spans; ++si) {
         const PlowPrefillSpan* span = plow_packed_prefill_span(prog, si);
+        PLOW_KDA_RIDER_SKIP(span);
         const size_t rd = (size_t)span->row0 * H * D;
         const size_t rh = (size_t)span->row0 * H;
         const size_t ra = (size_t)span->row0 * H * 64u;
@@ -1369,6 +1382,7 @@ __device__ void d_kda_chunk_wu_packed_bt64(
     size_t off = 0;
     for (unsigned si = 0; si < prog->n_prefill_spans; ++si) {
         const PlowPrefillSpan* span = plow_packed_prefill_span(prog, si);
+        PLOW_KDA_RIDER_SKIP(span);
         const size_t rd = (size_t)span->row0 * H * D;
         const size_t rv = (size_t)span->row0 * H * V;
         const size_t rh = (size_t)span->row0 * H;
@@ -1391,6 +1405,7 @@ __device__ void d_kda_chunk_carry_packed_bt64(
     const unsigned vtiles = (V + 15u) / 16u;
     for (unsigned si = 0; si < prog->n_prefill_spans; ++si) {
         const PlowPrefillSpan* span = plow_packed_prefill_span(prog, si);
+        PLOW_KDA_RIDER_SKIP(span);
         float* ss = state + (size_t)span->state_slot * H * V * D;
         /* The reset and the carry share one item map, so a tile is zeroed by its carrier. */
         const unsigned rs = plow_packed_span_slice(slice, nblk, (size_t)si * H * vtiles);
@@ -1806,6 +1821,7 @@ __device__ void d_kda_conv3_packed(
 #endif
     for (unsigned si = 0; si < prog->n_prefill_spans; ++si) {
         const PlowPrefillSpan* span = plow_packed_prefill_span(prog, si);
+        PLOW_KDA_RIDER_SKIP(span);
 #if PLOW_PACKED_KDA_PAR
         if (span->n_rows == 1u) continue;
 #endif
@@ -2301,6 +2317,7 @@ __device__ void d_kda_state_step_packed(
     const PlowProgram* prog) {
     for (unsigned si = 0; si < prog->n_prefill_spans; ++si) {
         const PlowPrefillSpan* span = plow_packed_prefill_span(prog, si);
+        PLOW_KDA_RIDER_SKIP(span);
         float* ss = state + (size_t)span->state_slot * H * D * D;
         const unsigned rs = plow_packed_span_slice(slice, nblk, (size_t)si * H * (D / BV));
         if (span->flags & PLOW_PREFILL_SPAN_RESET_STATE) {

@@ -645,6 +645,8 @@ pub const RUNTIME: &[KnobSpec] = &[
     KnobSpec::new("rt.packed_snap_batch", Some("PLOW_AMD_PACKED_SNAP_BATCH"), Layer::Runtime, Domain::Bool, ON, PROMOTED),
     KnobSpec::new("rt.pack_fill", Some("PLOW_AMD_PACK_FILL"), Layer::Runtime, Domain::Bool, OFF, DIAG),
     KnobSpec::new("rt.mixed_ride_trim", Some("PLOW_AMD_MIXED_RIDE_TRIM"), Layer::Runtime, Domain::Bool, OFF, OPT_IN),
+    KnobSpec::new("rt.rider_kda", Some("PLOW_AMD_RIDER_KDA"), Layer::Runtime, Domain::Bool, OFF, OPT_IN),
+    KnobSpec::new("rt.ride_fill", Some("PLOW_AMD_RIDE_FILL"), Layer::Runtime, Domain::Bool, OFF, OPT_IN),
     KnobSpec::new("rt.mixed_ride_lone", Some("PLOW_AMD_MIXED_RIDE_LONE"), Layer::Runtime, Domain::Bool, OFF, OPT_IN),
     KnobSpec::new("rt.mixed_ride_max", Some("PLOW_AMD_MIXED_RIDE_MAX"), Layer::Runtime, U32, UNSET, DIAG),
     KnobSpec::new("rt.prefill_seg_timing", Some("PLOW_PREFILL_SEG_TIMING"), Layer::Runtime, Domain::Bool, OFF, DIAG),

@@ -465,6 +465,7 @@ rm -f i_prefill.co i_decode.co i_flash.co tk.co \
       interp_prefill_mla_moe.elf interp_prefill_mla_moe_gq.elf \
       kda_decode_fused_gfx950.co kda_decode_fused_gfx950.elf \
       kda_decode_wide_gfx950.co kda_decode_wide_gfx950.elf \
+      kda_rider_gfx950.co kda_rider_gfx950.elf \
       kda_chunk_intra_cached_gfx950.co kda_chunk_intra_cached_gfx950.elf \
       kda_chunk_intra_wave_items_gfx950.co kda_chunk_intra_wave_items_gfx950.elf \
       kda_chunk_intra_wave_items_spans_gfx950.co kda_chunk_intra_wave_items_spans_gfx950.elf \
@@ -807,7 +808,13 @@ if [ "$ARCH" = gfx950 ] && [ "$need_kda_fused" = 1 ]; then
     $INC -DPLOW_LEAN_OBJECT=1 -DPLOW_NO_SPILL=1 -DPLOW_BUCKET_DECODE=1 -DPLOW_KDA_WIDE_PF=1 \
     -DPLOW_WAVE_RED_DPP=1 -DPLOW_REQUIRED_MARKER=plow_kda_decode_wide_3 $KDA_DECODE_LANES_DEF \
     "$R/amd/kda_decode_wide.hip"
-  KDA_FUSED_ELFS="kda_decode_fused_gfx950.elf kda_decode_wide_gfx950.elf"
+  # PLOW_AMD_RIDER_KDA: packed decode riders through the wide chain's conv + state step.
+  bash "$R/cmake/hipcc_hsaco.sh" hipcc "$BUN" "$ARCH" \
+    "$OUT/kda_rider_gfx950.elf" plow_kda_rider_v1 128 2 \
+    $INC -DPLOW_LEAN_OBJECT=1 -DPLOW_NO_SPILL=1 -DPLOW_BUCKET_DECODE=1 -DPLOW_KDA_WIDE_PF=1 \
+    -DPLOW_WAVE_RED_DPP=1 -DPLOW_REQUIRED_MARKER=plow_kda_rider_1 $KDA_DECODE_LANES_DEF \
+    -DPLOW_KDA_RIDER=1 "$R/amd/kda_decode_wide.hip"
+  KDA_FUSED_ELFS="kda_decode_fused_gfx950.elf kda_decode_wide_gfx950.elf kda_rider_gfx950.elf"
 fi
 
 # Opt-in lean MoE body variants requested at emit (PLOW_MOE_STAGE1_BODY / PLOW_MOE_STAGE2_BODY).
@@ -1431,12 +1438,13 @@ if [ "${PLOW_PACKED_PREFILL_CONSUMERS:-$PK_DEFAULT}" = 1 ]; then
   PK_NORM="-DPLOW_BUCKET_DECODE=0 -DPLOW_MLA_PREFILL=1 -DPLOW_BUCKET_PACKED_MLA_NORM=1 -DPLOW_PACKED_PREFILL_MLA_NORM_CONSUMERS=1"
   PK_FLASH="-DPLOW_BUCKET_DECODE=0 -DPLOW_BUCKET_FLASH -DPLOW_WG_WAVES=4 -DFA_DC=256 -DFA_DBUF=1 -DPLOW_MLA_PF_V2_ARM=1 $NOPE_FLASH $FLASH_TR16 -DPLOW_PACKED_PREFILL_MLA_FLASH_CONSUMERS=1"
   PK_KDA="-DPLOW_BUCKET_DECODE=0 -DPLOW_K3=1 -DPLOW_BUCKET_PACKED_KDA=1 -DPLOW_PACKED_PREFILL_KDA_CONSUMERS=1"
-  for fam in norm flash kda kdapar; do
+  for fam in norm flash kda kdapar kdarider; do
     case $fam in
       norm) AX="$PK_NORM"; S=interp_packed_mla_norm ;;
       flash) AX="$PK_FLASH"; S=interp_packed_mla_flash ;;
       kda) AX="$PK_KDA"; S=interp_packed_kda ;;
       kdapar) AX="$PK_KDA -DPLOW_PACKED_KDA_PAR=1"; S=interp_packed_kda_par ;;
+      kdarider) AX="$PK_KDA -DPLOW_PACKED_KDA_RIDER=1"; S=interp_packed_kda_rider ;;
     esac
     genco "$AX" "i_pk_$fam.co"
     unbundle "i_pk_$fam.co" "$S.elf"

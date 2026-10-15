@@ -204,9 +204,14 @@ __device__ __forceinline__ const PlowPrefillSpan* plow_packed_prefill_span(
     if (!span->n_rows) __builtin_trap();
     const uint32_t end = span->row0 + span->n_rows;
     if (end < span->row0 || end > prog->n_prefill_rows) __builtin_trap();
+#if PLOW_PACKED_KDA_RIDER
+    /* The host's KDA view (PLOW_AMD_RIDER_KDA) starts past the leading one-row spans. */
+    if (index && (span - 1)->row0 + (span - 1)->n_rows != span->row0) __builtin_trap();
+#else
     if ((index == 0u && span->row0 != plow_packed_prefill_band(prog)) ||
         (index && (span - 1)->row0 + (span - 1)->n_rows != span->row0))
         __builtin_trap();
+#endif
     if (prog->prefill_parked[span->row0] || prog->prefill_parked[end - 1u]) __builtin_trap();
     return span;
 }

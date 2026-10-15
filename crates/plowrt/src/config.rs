@@ -1737,6 +1737,15 @@ pub struct AmdRuntimeConfig {
     /// only a pack whose rung has room for them.
     #[arg(long = "amd-mixed-ride-trim", env = "PLOW_AMD_MIXED_RIDE_TRIM", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
     pub mixed_ride_trim: bool,
+    /// Packed launches run their leading one-row spans (decode riders) through the decode KDA
+    /// chain (`kda_rider_gfx950.elf`, one workgroup per rider and head) instead of the packed
+    /// BT64 chunk arms, which walk every span on every workgroup.
+    #[arg(long = "amd-rider-kda", env = "PLOW_AMD_RIDER_KDA", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
+    pub rider_kda: bool,
+    /// The pack decode rows ride fills its row budget less the riders: the oldest planned chunk
+    /// that does not fit is cut to the gap instead of the pack running short.
+    #[arg(long = "amd-ride-fill", env = "PLOW_AMD_RIDE_FILL", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
+    pub ride_fill: bool,
 
     /// A lone prefill chunk whose cursor is already packable (a long prompt's later chunks) runs
     /// as a pack of one carrying the live decode rows (`PLOW_AMD_MIXED_PACK` riders).

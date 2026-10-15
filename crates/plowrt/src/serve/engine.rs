@@ -140,6 +140,11 @@ pub trait SeqEngine {
     fn mixed_pack_ready(&self) -> bool {
         false
     }
+    /// Cut `slot`'s pending prefill chunk to its first `rows` rows (the rest becomes its next
+    /// chunk). No-op where the backend plans no chunks.
+    fn shrink_prefill_chunk(&mut self, _slot: usize, _rows: u32) -> crate::Result<()> {
+        Ok(())
+    }
     /// Whether one launch of chunks `rows` costs no more rung rows than running each alone.
     fn pack_pays(&self, _rows: &[u32]) -> bool {
         true
@@ -3520,6 +3525,22 @@ mod amd_serve {
             self.advance_packed(members, feeds, output)
         }
 
+        /// `PLOW_AMD_RIDE_FILL`: cut `slot`'s pending chunk to `rows` so it fills a pack's gap.
+        pub fn shrink_prefill_chunk(&mut self, slot: usize, rows: u32) -> Result<()> {
+            let Some(step) = self
+                .pf
+                .get(slot)
+                .and_then(Option::as_ref)
+                .and_then(|cur| cur.steps.get(cur.next).copied())
+            else {
+                return Ok(());
+            };
+            let max_bucket = self.prefill_chunk_rows.max(step.clen);
+            let g = &self.ranks;
+            let cur = self.pf[slot].as_mut().expect("pending step checked above");
+            shrink_pending_prefill(cur, rows, |a, b| g.plan_span_at_most(a, b, max_bucket))
+        }
+
         /// `PLOW_AMD_MIXED_RIDE_TRIM`: shorten the last member's pending chunk so `riders` one-row
         /// decode spans fit the rung the prefill spans already fill; the cut rows become its next
         /// chunk. A member left under 64 rows is not cut (the riders then step separately).
@@ -5489,6 +5510,9 @@ impl SeqEngine for AmdServe {
     }
     fn mixed_pack_ready(&self) -> bool {
         AmdServe::mixed_pack_ready(self)
+    }
+    fn shrink_prefill_chunk(&mut self, slot: usize, rows: u32) -> crate::Result<()> {
+        AmdServe::shrink_prefill_chunk(self, slot, rows)
     }
     fn pack_pays(&self, rows: &[u32]) -> bool {
         AmdServe::pack_pays(self, rows)
