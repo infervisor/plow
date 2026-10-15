@@ -282,8 +282,19 @@ struct LightLaunch {
 
 impl LightRoute {
     pub(super) fn run(&self, stream: &CudaStream) -> Result<()> {
+        self.run_tensors(stream, self.kernarg.tensors)
+    }
+
+    /// `tensors` is the launch's tensor table: a per-slot prefill table shifts `kv.*` to the
+    /// slot's ring, so a route writing the cache (HeadNormRope) must not use the load-time one.
+    pub(super) fn run_tensors(&self, stream: &CudaStream, tensors: u64) -> Result<()> {
         for launch in &self.launches {
             if let Some(span) = &launch.direct {
+                if tensors != self.kernarg.tensors {
+                    return Err(RuntimeError::Rejected(
+                        "a load-resolved light launch cannot take another tensor table".into(),
+                    ));
+                }
                 let mut span = **span;
                 let mut op = span.op[0];
                 let mut params = [match launch.kind {
@@ -301,6 +312,7 @@ impl LightRoute {
                 continue;
             }
             let mut arg = self.kernarg;
+            arg.tensors = tensors;
             let mut instruction = launch.instruction;
             let (mut count, mut hnr) = match launch.kind {
                 LightKind::Attn(n) => (n, [0; 4]),
