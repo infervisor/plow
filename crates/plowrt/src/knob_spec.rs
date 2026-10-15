@@ -757,6 +757,7 @@ pub const RUNTIME: &[KnobSpec] = &[
     KnobSpec::new("rt.dump_act", Some("PLOW_DUMP_ACT"), Layer::Runtime, Domain::Str, UNSET, OPT_IN),
     KnobSpec::new("rt.dump_kv", Some("PLOW_DUMP_KV"), Layer::Runtime, Domain::Str, UNSET, DIAG),
     KnobSpec::new("rt.nv_dump_kv", Some("PLOW_NV_DUMP_KV"), Layer::Runtime, Domain::Str, UNSET, DIAG),
+    KnobSpec::new("rt.nv_dump_act", Some("PLOW_NV_DUMP_ACT"), Layer::Runtime, Domain::Str, UNSET, DIAG),
     KnobSpec::new("rt.numa_host_pools", Some("PLOW_AMD_NUMA_HOST_POOLS"), Layer::Runtime, Domain::Bool, UNSET, OPT_IN),
     KnobSpec::new("rt.kernarg_vram", Some("PLOW_AMD_KERNARG_VRAM"), Layer::Runtime, Domain::Bool, UNSET, OPT_IN),
     KnobSpec::new("rt.threads", Some("PLOW_CPU_THREADS"), Layer::Runtime, U32, Default::Static(Val::Nat(0)), OPT_IN),

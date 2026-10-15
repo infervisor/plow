@@ -13599,6 +13599,7 @@ impl GpuEngine {
             self.be
                 .memset_d8_async(ctr_base, 0, ctr_bytes, &self.stream)?;
             if self.packed_prefill.is_some() {
+                self.dump_prefill_acts(bi, arg, f_pf, reqs, total, tc, ctr_base, ctr_bytes)?;
                 self.pf_seg_window = self
                     .shared_tail
                     .as_ref()
@@ -13904,6 +13905,89 @@ impl GpuEngine {
             }
             Err(e) => tracing::warn!(error = %e, slot = b, tag, "PLOW_NV_DUMP_KV dump failed"),
         }
+    }
+
+    /// DIAGNOSTIC (`PLOW_NV_DUMP_ACT`, see the knob): partial chains `0..=seg(pc)` of a packed
+    /// launch, each followed by a dump of the matching request's activation rows. Every partial
+    /// chain restarts at the embedding, so the full chain that follows recomputes the same state.
+    #[allow(clippy::too_many_arguments)]
+    fn dump_prefill_acts(
+        &mut self,
+        bi: usize,
+        arg: DevProgram,
+        f_pf: KernelFn,
+        reqs: &[PackedTokenReq<'_>],
+        total: usize,
+        tc: usize,
+        ctr_base: u64,
+        ctr_bytes: usize,
+    ) -> Result<()> {
+        let rt = RuntimeConfig::get();
+        let (Some(dir), Some(spec)) = (rt.nv.nv_dump_kv.as_ref(), rt.nv.nv_dump_act.as_ref())
+        else {
+            return Ok(());
+        };
+        let Some((len, pcs)) = spec.split_once(':') else {
+            return Ok(());
+        };
+        let Ok(len) = len.parse::<usize>() else {
+            return Ok(());
+        };
+        let mut q0 = 0usize;
+        let Some(r) = reqs.iter().find(|r| {
+            q0 += r.tokens.len();
+            r.prompt_len == len
+        }) else {
+            return Ok(());
+        };
+        let (row0, rows) = (q0 - r.tokens.len(), r.tokens.len());
+        let max_t = self.prefill.iter().map(|b| b.t as u64).max().unwrap_or(1);
+        for pc in pcs.split(',').filter_map(|p| p.parse::<usize>().ok()) {
+            let Some(seg) = self.prefill[bi]
+                .segment_sites
+                .iter()
+                .position(|sites| sites.iter().any(|&(i, _)| i == pc))
+            else {
+                tracing::warn!(pc, bucket = bi, "PLOW_NV_DUMP_ACT: no segment holds this pc");
+                continue;
+            };
+            self.be
+                .memset_d8_async(ctr_base, 0, ctr_bytes, &self.stream)?;
+            self.pf_seg_window = Some(0..seg + 1);
+            let chain = self.launch_prefill_chain(bi, arg, f_pf, r.slot, r.c0, total, tc, true);
+            self.pf_seg_window = None;
+            chain?;
+            let mut data = Vec::new();
+            let mut index = Vec::new();
+            for name in [
+                "act.x", "act.hn", "act.q", "act.at", "act.og", "act.dg", "act.moe.h1",
+                "act.moe.xn2", "act.moe.comb",
+            ] {
+                let Some(i) = self.handle_of(name) else {
+                    continue;
+                };
+                // Rows `[0, row0 + rows)` at the tensor's widest stride: a layer narrower than
+                // the tensor's row width packs its rows densely.
+                let row_bytes = self.devp[i].len / max_t;
+                let mut buf = vec![0u8; (row_bytes * (row0 + rows) as u64) as usize];
+                self.be.download(&self.devp[i], 0, &mut buf)?;
+                index.push(serde_json::json!({
+                    "name": name, "offset": data.len(), "row_bytes": row_bytes, "rows": rows,
+                }));
+                data.extend_from_slice(&buf);
+            }
+            let stem = dir.join(format!("act-p{len}-pc{pc}-c{}", r.c0));
+            std::fs::write(stem.with_extension("bin"), &data)
+                .map_err(|e| RuntimeError::Rejected(e.to_string()))?;
+            let meta = serde_json::json!({
+                "prompt_len": len, "pc": pc, "segment": seg, "segment_sites": self.prefill[bi].segment_sites[seg],
+                "bucket_t": self.prefill[bi].t, "c0": r.c0, "rows": rows, "row0": row0, "tensors": index,
+            });
+            std::fs::write(stem.with_extension("json"), meta.to_string())
+                .map_err(|e| RuntimeError::Rejected(e.to_string()))?;
+        }
+        self.be
+            .memset_d8_async(ctr_base, 0, ctr_bytes, &self.stream)
     }
 
     /// Read a named tensor as raw bytes for diagnostics.

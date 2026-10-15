@@ -1483,6 +1483,13 @@ pub struct NvidiaRuntimeConfig {
     #[arg(long = "nv-dump-kv", env = "PLOW_NV_DUMP_KV", hide = true, global = true)]
     pub nv_dump_kv: Option<std::path::PathBuf>,
 
+    /// Diagnostic, with `PLOW_NV_DUMP_KV`: `<prompt_len>:<pc>[,<pc>...]`. A packed prefill launch
+    /// carrying a request of that prompt length first runs the segment chain up to the segment
+    /// holding each prefill instruction `pc` and dumps that request's activation rows, then runs
+    /// the whole chain as usual (`GpuEngine::dump_prefill_acts`).
+    #[arg(long = "nv-dump-act", env = "PLOW_NV_DUMP_ACT", hide = true, global = true)]
+    pub nv_dump_act: Option<String>,
+
     /// Diagnostic: name why a decode rung failed ladder normalization (widest-rung fallback).
     #[arg(long = "ladder-debug", env = "PLOW_LADDER_DEBUG", hide = true, default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
     pub ladder_debug: bool,
