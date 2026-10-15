@@ -5502,6 +5502,109 @@ __device__ void d_index_score_kpool_mfma(float* __restrict__ Score, const uint8_
     }
 }
 
+#ifndef DSA_KPOOL_RPW
+#define DSA_KPOOL_RPW 4u /* rows per wave per staged key slab */
+#endif
+/* PLOW_DSA_KPOOL_ROWWAVE: prefill form of d_index_score_kpool_mfma with one query ROW per WAVE.
+ * The old prefill walk swapped each row's query tile through LDS behind two workgroup barriers per
+ * row and ran one 32-pool MFMA tile per wave per row; here a work item stages the TILE_N-pool key
+ * slab once, every wave holds its own row's query fragment and head weights in registers and walks
+ * the whole slab. Per-element arithmetic and summation order are unchanged (bit-identical). */
+template <int DI, int HIc, int TILE_N>
+__device__ void d_index_score_kpool_rowwave(float* __restrict__ Score,
+                                            const uint8_t* __restrict__ Qfp8,
+                                            const float* __restrict__ Qscale,
+                                            const uint8_t* __restrict__ Kfp8,
+                                            const float* __restrict__ Kscale,
+                                            const float* __restrict__ W,
+                                            const int* __restrict__ kv_len, unsigned n_tok,
+                                            unsigned pool_stride, unsigned pool_size, float scale,
+                                            unsigned slice, unsigned nblk, bf16* ktile,
+                                            float* kslds) {
+    static_assert(HIc == 32 && DI % 16 == 0, "32 heads, whole MFMA k-steps");
+    constexpr int NK = DI / MFMA_K;
+    constexpr int KSTRIDE = DI + FA_PAD;
+    constexpr unsigned RG = PLOW_WAVES * DSA_KPOOL_RPW;
+    auto* const Sc = as_glob(Score);
+    const auto* const Qg = as_glob(Qfp8);
+    const auto* const Qs = as_glob(Qscale);
+    const auto* const Kg = as_glob(Kfp8);
+    const auto* const Ks = as_glob(Kscale);
+    const auto* const Wg = as_glob(W);
+    const unsigned tid = threadIdx.x;
+    const unsigned lane = tid & 63, wave = tid >> 6;
+    const unsigned frow = mfma_frag_row(lane);
+    const unsigned mbase = 4 * (lane / 32);
+    const unsigned nslab = (pool_stride + TILE_N - 1) / TILE_N;
+    const unsigned ngrp = (n_tok + RG - 1) / RG;
+    const int len_tok = as_glob(kv_len)[0];
+    auto row_len = [&](unsigned b) -> unsigned {
+        return (unsigned)(len_tok - (int)n_tok + (int)b + 1) / pool_size;
+    };
+    unsigned staged = ~0u;
+    bf16x8 qf[NK];
+    float wr[16];
+    for (unsigned it = slice; it < ngrp * nslab; it += nblk) {
+        const unsigned g = it % ngrp, base = (it / ngrp) * TILE_N;
+        const unsigned b0 = g * RG;
+        const unsigned b1 = (b0 + RG < n_tok ? b0 + RG : n_tok);
+        const unsigned lmax = row_len(b1 - 1);
+        if (base >= lmax) continue;
+        __syncthreads();
+        for (unsigned c = tid; c < (unsigned)TILE_N * (DI / 8); c += PLOW_THREADS) {
+            const unsigned row = c / (DI / 8), c8 = (c % (DI / 8)) * 8;
+            const unsigned p = base + row;
+            *(bf16v8*)&ktile[row * KSTRIDE + c8] =
+                (p < lmax) ? fp8v8_to_bf16v8(ld_glob_fp8v8(&Kg[(size_t)p * DI + c8])) : bf16v8_zero();
+        }
+        for (unsigned r = tid; r < (unsigned)TILE_N; r += PLOW_THREADS)
+            kslds[r] = (base + r < lmax) ? Ks[base + r] : 0.0f;
+        __syncthreads();
+#pragma unroll 1
+        for (unsigned b = b0 + wave; b < b1; b += PLOW_WAVES) {
+        const unsigned len = row_len(b);
+        if (base >= len) continue;
+        if (b != staged) {
+            const uint8_t* const qrow = Qg + (size_t)b * HIc * DI + (size_t)frow * DI;
+#pragma unroll
+            for (int s2 = 0; s2 < NK; s2++)
+                qf[s2] = __builtin_bit_cast(
+                    bf16x8, fp8v8_to_bf16v8(ld_glob_fp8v8(&qrow[mfma_frag_k(lane, s2 * MFMA_K)])));
+#pragma unroll
+            for (int i = 0; i < 16; i++) {
+                const unsigned h = mbase + (i % 4) + 8 * (i / 4);
+                wr[i] = Wg[(size_t)b * HIc + h] * Qs[(size_t)b * HIc + h];
+            }
+            staged = b;
+        }
+#pragma unroll 1
+        for (unsigned st = 0; st < (unsigned)TILE_N; st += 32u) {
+            if (base + st >= len) break;
+            f32x16 acc = (f32x16)(0.0f);
+#pragma unroll
+            for (int s2 = 0; s2 < NK; s2++) {
+                const unsigned d0 = mfma_frag_k(lane, s2 * MFMA_K);
+                const bf16x8 kf =
+                    __builtin_bit_cast(bf16x8, ld_lds8(&ktile[(st + frow) * KSTRIDE + d0]));
+                acc = plow_mfma_bf16_32x32(qf[s2], kf, acc);
+            }
+            const float ks = kslds[st + (lane & 31)];
+            float part = 0.0f;
+#pragma unroll
+            for (int i = 0; i < 16; i++) {
+                const float d = bf2f(f2bf(acc[i])) * ks;
+                part += wr[i] * (d > 0.0f ? d : 0.0f);
+            }
+            part += __shfl_xor(part, 32, PLOW_WAVE);
+            if (lane < 32) {
+                const unsigned p = base + st + lane;
+                if (p < len) st_act<float>(&Sc[(size_t)b * pool_stride + p], part * scale);
+            }
+        }
+        }
+    }
+}
+
 /* DSA top-k SELECT via radix threshold (G4 — the hard selector).               [DSA]
  * Consumes the f32 indexer scores in HBM (d_index_score output) and writes the top_k position
  * indices (idx[b*top_k + slot]) the gather flash reads. Uses the SAME monotone packed key as
@@ -6340,7 +6443,8 @@ __device__ __forceinline__ void idxsel_v2_find(unsigned* hist, unsigned* red, un
 __device__ void d_index_select_pf_v2(int* __restrict__ idx, const float* __restrict__ Score,
                                      const int* __restrict__ kv_len, unsigned n_tok,
                                      unsigned top_k, unsigned kv_stride, unsigned slice,
-                                     unsigned nblk, unsigned* hist, unsigned* red) {
+                                     unsigned nblk, unsigned* hist, unsigned* red,
+                                     unsigned pool_size = 1u) {
     constexpr unsigned PER = IDXSEL_V2_PER;
     const auto* const Sc = as_glob(Score);
     int* const ib = as_glob(idx);
@@ -6349,7 +6453,7 @@ __device__ void d_index_select_pf_v2(int* __restrict__ idx, const float* __restr
     const unsigned q_pos0 = len - n_tok;
     unsigned nxt[PER];
     auto fetch = [&](unsigned t) {
-        const unsigned rl = q_pos0 + t + 1u;
+        const unsigned rl = (q_pos0 + t + 1u) / pool_size;
         const bool want = t < n_tok && rl > top_k && rl <= PER * PLOW_THREADS;
         const float* const sr = Sc + (size_t)t * kv_stride;
 #pragma unroll
@@ -6362,7 +6466,7 @@ __device__ void d_index_select_pf_v2(int* __restrict__ idx, const float* __restr
     };
     fetch(slice);
     for (unsigned t = slice; t < n_tok; t += nblk) {
-        const unsigned row_len = q_pos0 + t + 1u;
+        const unsigned row_len = (q_pos0 + t + 1u) / pool_size;
         int* const row = ib + (size_t)t * top_k;
         if (row_len <= top_k) {
             for (unsigned s = tid; s < top_k; s += PLOW_THREADS)
@@ -6373,7 +6477,7 @@ __device__ void d_index_select_pf_v2(int* __restrict__ idx, const float* __restr
         }
         if (row_len > PER * PLOW_THREADS) {
             d_index_select_pf<true>(idx, Score, kv_len, n_tok, top_k, kv_stride, 0u, 1u, hist,
-                                    red + 8, 1u, t, t + 1u);
+                                    red + 8, pool_size, t, t + 1u);
             fetch(t + nblk);
             continue;
         }
@@ -6945,7 +7049,10 @@ __device__ void d_index_union_pf(unsigned char* __restrict__ uni,
         int* const upos = (int*)(uni + hdr + (size_t)qt * cap * 12u);
         unsigned* const ulo = (unsigned*)(uni + hdr + (size_t)qt * cap * 12u + (size_t)cap * 4u);
         unsigned* const uhi = (unsigned*)(uni + hdr + (size_t)qt * cap * 12u + (size_t)cap * 8u);
-        for (unsigned s = tid; s < tile_end; s += PLOW_THREADS) atomicExch(&mrow[s], 0ull);
+        /* Plain L2-coherent load/store (agent-scope relaxed atomics), not RMW: the zeroing and
+         * the compaction read only need to see this workgroup's atomicOr results at L2. */
+        for (unsigned s = tid; s < tile_end; s += PLOW_THREADS)
+            __hip_atomic_store(&mrow[s], 0ull, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
         __syncthreads();
         for (unsigned e = tid; e < P * top_k; e += PLOW_THREADS) {
             const unsigned ql = e / top_k;
@@ -6965,7 +7072,7 @@ __device__ void d_index_union_pf(unsigned char* __restrict__ uni,
         for (unsigned c0 = 0; c0 < tile_end; c0 += PLOW_THREADS) {
             const unsigned s = c0 + tid;
             const unsigned long long m =
-                (s < tile_end) ? atomicOr(&mrow[s], 0ull) : 0ull;
+                (s < tile_end) ? __hip_atomic_load(&mrow[s], __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT) : 0ull;
             const unsigned flag = m != 0ull;
             const unsigned lane = tid % PLOW_WAVE, wave = tid / PLOW_WAVE;
             const unsigned long long bits = __ballot(flag);

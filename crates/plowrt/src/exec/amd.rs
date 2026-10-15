@@ -1146,6 +1146,26 @@ struct KdaCarryMultiArgs {
 const KDA_CARRY_MULTI_SPANS: usize = 16;
 const _: () = assert!(std::mem::size_of::<KdaCarryMultiArgs>() == 280);
 
+/// Per segment, `Op*count` of the instructions its stream entries run (diagnostic).
+fn segment_op_summary(p: &DevProg) -> Vec<String> {
+    let n = p.stream.iter().map(|e| e.seg as usize + 1).max().unwrap_or(0);
+    let mut sets = vec![std::collections::BTreeSet::new(); n];
+    for e in &p.stream {
+        sets[e.seg as usize].insert(e.inst as usize);
+    }
+    sets.into_iter()
+        .map(|set| {
+            let mut c = std::collections::BTreeMap::<String, usize>::new();
+            for i in set {
+                let op = p.insts[i].op;
+                let name = DevOp::from_u16(op).map_or(format!("op{op}"), |o| format!("{o:?}"));
+                *c.entry(name).or_default() += 1;
+            }
+            c.into_iter().map(|(k, v)| format!("{k}*{v}")).collect::<Vec<_>>().join("+")
+        })
+        .collect()
+}
+
 /// Shortest segment of the split carry.
 const KDA_CARRY_SPLIT_MIN_SEG: u32 = 1024;
 
@@ -7119,6 +7139,8 @@ struct AmdProg {
     decode_routes: Vec<DecodeSegmentRoute>,
     /// Optional raw gfx950 route for a pure MXFP4 grouped-MoE Down+Combine segment.
     prefill_routes: Vec<PrefillSegmentRoute>,
+    /// `PLOW_PREFILL_SEG_TIMING` only: each segment's instruction ops, `Op*count` (diagnostic).
+    seg_ops: Vec<String>,
     /// `PLOW_SEG_GEOM` per segment: the interpreter launch's override, and the raw route's grid
     /// (0 = shipped). Empty when unset.
     seg_geom_interp: Vec<seg_geom::SegGeom>,
@@ -7297,6 +7319,8 @@ pub struct AmdEngine {
     k_gemm_group: Option<HsaKernel>,
     k_mla_pf_dense: Option<HsaKernel>,
     k_mla_pf_gather: Option<HsaKernel>,
+    /// `PLOW_GLM_DSA_PF_MIN_CTX`: this chunk's sparse rung runs dense (selection Nop'd).
+    dsa_pf_dense_chunk: bool,
     k_kda_chunk_wu_lean_keys: Option<HsaKernel>,
     k_kda_chunk_carry_keyfeed: Option<HsaKernel>,
     k_kda_spans: KdaSpansKernels,
@@ -12205,6 +12229,11 @@ impl AmdEngine {
                 },
                 decode_routes,
                 prefill_routes,
+                seg_ops: if crate::config::RuntimeConfig::get().amd.prefill_seg_timing {
+                    segment_op_summary(p)
+                } else {
+                    Vec::new()
+                },
                 seg_geom_interp: Vec::new(),
                 seg_geom_route: Vec::new(),
                 union_skip,
@@ -12976,6 +13005,7 @@ impl AmdEngine {
             k_gemm_group,
             k_mla_pf_dense,
             k_mla_pf_gather,
+            dsa_pf_dense_chunk: false,
             k_kda_chunk_wu_lean_keys,
             k_kda_chunk_carry_keyfeed,
             k_kda_spans,
@@ -14234,7 +14264,7 @@ impl AmdEngine {
             let kernel = self.k_mla_pf_dense.ok_or_else(|| {
                 RuntimeError::Device("dense MLA prefill segment has no loaded object".into())
             })?;
-            if let Some(mut g) = route.gather_args() {
+            if let Some(mut g) = route.gather_args().filter(|_| !self.dsa_pf_dense_chunk) {
                 if active {
                     return Err(RuntimeError::Device(
                         "sparse MLA prefill gather has no packed-span form".into(),
@@ -16514,6 +16544,25 @@ impl AmdEngine {
             self.progs[prog].t,
             bucket.or_else(|| self.ragged_bucket(prog)),
         );
+        self.dsa_pf_dense_chunk = false;
+        if crate::config::RuntimeConfig::get()
+            .amd
+            .dsa_pf_min_ctx
+            .is_some_and(|min| c0 + clen <= min)
+        {
+            for d in insts.iter_mut() {
+                let op = d.op;
+                let skip = op == DevOp::DsaQQuant as u16
+                    || (op == DevOp::IndexScoreKpool as u16 && d.i[5] != 0)
+                    || op == DevOp::IndexSelectPf as u16
+                    || (op == DevOp::DsaPoolExpand as u16 && d.i[3] != 1)
+                    || op == DevOp::IndexUnionPf as u16;
+                if skip {
+                    d.op = DevOp::Nop as u16;
+                    self.dsa_pf_dense_chunk = true;
+                }
+            }
+        }
         if let (true, Some(tp)) = (
             crate::config::RuntimeConfig::get().amd_ragged_seams(),
             self.tp,
@@ -18406,6 +18455,10 @@ impl AmdEngine {
     }
 
     /// Ordered host launches and their device-side XCD queue layout.
+    pub(crate) fn segment_ops(&self, p: usize, seg: usize) -> &str {
+        self.progs[p].seg_ops.get(seg).map_or("", String::as_str)
+    }
+
     pub(crate) fn prog_dispatch(&self, p: usize) -> ProgramDispatch {
         let g = &self.progs[p];
         ProgramDispatch::classify(
