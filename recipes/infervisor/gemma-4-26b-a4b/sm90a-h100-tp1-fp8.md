@@ -37,7 +37,7 @@ nix develop --command env \
 <!-- plow:recipe:emit -->
 ```bash
 nix develop --command env \
-  NVCC_APPEND_FLAGS=-DPLOW_MOE_FP8_DEDUP=1 \
+  NVCC_APPEND_FLAGS=-DPLOW_MOE_FP8_DEDUP=1 -DPLOW_NV_FA_WPR=1 -DPLOW_NV_FA_WPR_FP8=1 \
   PLOW_ATTENTION_DECODE_BALANCE_GF=4 \
   PLOW_DECODE_BATCH_LADDER=1,2,4,8,16,32,64,128 \
   PLOW_EMIT_DECODE_CUBLASLT=1 \
@@ -53,6 +53,7 @@ nix develop --command env \
   PLOW_GEMMA_MOE_ROUTER_EXACT=0 \
   PLOW_MAX_CHUNK=4096 \
   PLOW_MAX_REQUEST_CHUNK=4096 \
+  PLOW_NO_GLU_FUSE=1 \
   PLOW_PF_LADDER_APPEND=256,1088,1152,2112,4160,4224 \
   PLOW_SEG_FA256_GQA2=1 \
   PLOW_SEG_FA512=1 \
@@ -88,6 +89,8 @@ nix develop --command env \
 #   vllm_capture = {env:G26_FP8_FP32_VLLM_LONG}
 #   concurrency = 4
 #   timeout_s = 7200
+#   cont_decisive_drop_max = 0.125
+#   kl_over_slack = 0.01
 ```
 <!-- /plow:recipe:gates -->
 

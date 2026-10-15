@@ -31,7 +31,7 @@ namespace = "infervisor"
 name = "gemma-4-26b-a4b"
 label = "sm90a-h100-tp1-fp8"
 status = "validated"
-plow_git = "800970648b1a3ac7e8acb6535924dd0af2dfa734"
+plow_git = "d5a4365c855ed4b0b1636527e9883ff99f296f73"
 network = "gemma4"
 
 [target]
@@ -87,8 +87,19 @@ PLOW_GEMMA_MOE_ROUTER_EXACT = "0"
 # Emit-time on purpose: plowc compiles the decode interpreters (interp_sm90a{,_fp8kv,_gw}.cubin,
 # whose hashes change with it) and nvcc appends this; the [objects] script builds no op_moe object.
 # step_bench decode with vs without: B4/B8/B16 6.74/8.21/12.25 vs 7.15/9.36/16.24 ms, B1/B2 +1.5%.
-NVCC_APPEND_FLAGS = "-DPLOW_MOE_FP8_DEDUP=1"
+# -DPLOW_NV_FA_WPR=1 -DPLOW_NV_FA_WPR_FP8=1: hd512 FP8-KV flash decode scores warp-per-row (coalesced e4m3 rows;
+# qualified 2026-10-15): decode step -4..-10% at every rung B1..32, ctx 1024/5600/16000 (B16 ctx5600 12.76 -> 12.08 ms,
+# B32 ctx16000 28.81 -> 26.02), VMM kv_len 4094/4095/8191 clean; FP32 gate PASS (kl_mean 0.1858 vs vLLM 0.202,
+# top1 0.9662) and long gate PASS (kl_mean 0.1292 vs 0.165, top1 0.9654). hd256 WPR loses at B16/32 (not set).
+# Evidence: g26-pfrung REPORT.md section 19 (dec/ab-wpr8, ab/gw-wpr8).
+NVCC_APPEND_FLAGS = "-DPLOW_MOE_FP8_DEDUP=1 -DPLOW_NV_FA_WPR=1 -DPLOW_NV_FA_WPR_FP8=1"
 PLOW_EMIT_MOE_PF_LT = "1"
+# Dense gate|up as two FP8 cuBLASLt GEMMs + Glu/Quant (qualified 2026-10-15, packet bd9c0722e368, plowrt 2dff2171):
+# prefill rungs at prefix 0 128/256/1024/4096 rows 15.69/17.53/26.46/81.33 vs 17.24/18.33/30.81/96.23 ms
+# (-9.0/-4.4/-14.1/-15.5%). FP32 gate PASS: kl_mean 0.1865 vs ctrl 0.1881, kl_p99 4.016 (limit 4.668), top1_decisive
+# 0.9602 vs ctrl 0.9642; long gate PASS: kl_mean 0.1627 vs ctrl 0.1515 / vLLM 0.165, kl_p99 3.18, top1 0.9638.
+# Evidence: g26-pfrung REPORT.md sections 6 and 13-14 (res2, ab/g-p1, ab/gl-p1).
+PLOW_NO_GLU_FUSE = "1"
 
 [objects]
 script = "scripts/build_sm90a_gemma4_segments.sh"
@@ -180,3 +191,22 @@ reference = "{env:G26_FP8_FP32_REF_LONG}"
 vllm_capture = "{env:G26_FP8_FP32_VLLM_LONG}"
 concurrency = 4
 timeout_s = 7200
+# Measured c4 margins (2026-10-15, 20 cases / 743 positions, one vLLM peer capture: kl_mean 0.165, top1_decisive
+# 0.9605, cont_decisive_frac 0.80, 113 positions over 0.1 nat). Fourteen control runs: control 156de996 x5, P1
+# 86cd362a x2, WPR8 (p1-wpr8, p1w-rec x2) x3 on the squash plowrt 03162215; p0b-base 9b7d62c51048 (gl-ctrl) and P1
+# bd9c0722 (gl-p1) on 2dff2171; the production packet 5ce87bd28db1 x2 (allbuild, mmharden):
+#   run          kl_mean kl_p99 over top1   cont_dec      run          kl_mean kl_p99 over top1   cont_dec
+#   ctrl         0.1776  3.718  110  0.9605 0.75          ctrl-r2/r3   0.1346  1.630  108  0.9769 0.75 x2
+#   ctrl-r4/r5   0.1675  3.287  102  0.9654 0.80 x2       p1           0.1430  2.714  108  0.9687 0.75
+#   p1-r2        0.1367  2.030  110  0.9671 0.80          gl-ctrl      0.1515  3.204  118  0.9621 0.75
+#   gl-p1        0.1627  3.180  114  0.9638 0.75          wpr8         0.1292  2.564  112  0.9654 0.80
+#   wpr8-r1      0.1484  2.735  110  0.9605 0.70          wpr8-r2      0.1278  2.110  111  0.9638 0.75
+#   allbuild     0.1476  3.108  112  0.9687 0.80          mmharden     0.1580  3.113  113  0.9638 0.75
+# cont_decisive_frac moves in steps of one case (0.05): 0.80 x5, 0.75 x8, 0.70 x1. The previous 0.05 margin failed
+# the promoted WPR8 packet once in three runs (wpr8-r1) and 1 of 14 controls; 0.125 (between two and three cases,
+# clear of float rounding at a step boundary) passes all 14 and fails a 3-case drop. Trade-off: a real 1- or 2-case free-run regression is now indistinguishable from re-roll
+# noise at this case count; resolving it needs more cases (a pooled second capture halves the step to 0.025).
+# top1_decisive (default margin 0.01, threshold 0.9505) and kl_over (+0.01 of positions; controls +0.0067 at most)
+# pass every control run unchanged.
+cont_decisive_drop_max = 0.125
+kl_over_slack = 0.01
