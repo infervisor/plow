@@ -1349,6 +1349,7 @@ pub const EMIT: &[KnobSpec] = &[
     KnobSpec::new("emit.glm_hc_fuse_r1", Some("PLOW_GLM_HC_FUSE_R1"), Layer::Emit, Domain::Bool, OFF, OPT_IN),
     KnobSpec::new("emit.glm_hc_mix_raw", Some("PLOW_GLM_HC_MIX_RAW"), Layer::Emit, Domain::Bool, OFF, OPT_IN),
     KnobSpec::new("emit.glm_router_raw", Some("PLOW_GLM_ROUTER_RAW"), Layer::Emit, Domain::Bool, OFF, OPT_IN),
+    KnobSpec::new("emit.glm_router_signal", Some("PLOW_GLM_ROUTER_SIGNAL"), Layer::Emit, Domain::Bool, OFF, OPT_IN),
     KnobSpec::new("emit.glm_kda_lt_order", Some("PLOW_GLM_KDA_LT_ORDER"), Layer::Emit, Domain::Bool, OFF, OPT_IN),
     KnobSpec::new("emit.glm_hc_aiter", Some("PLOW_GLM_HC_AITER"), Layer::Emit, Domain::Bool, OFF, OPT_IN),
     KnobSpec::new("emit.glm_hc_fold_mla", Some("PLOW_GLM_HC_FOLD_MLA"), Layer::Emit, Domain::Bool, OFF, OPT_IN),

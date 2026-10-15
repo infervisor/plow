@@ -1113,6 +1113,11 @@ pub struct EmitConfig {
     #[arg(long, env = "PLOW_GLM_ROUTER_RAW", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
     pub glm_router_raw: bool,
 
+    /// With PLOW_GLM_ROUTER_RAW at one row: the raw router bumps its consumers' counter and the
+    /// following MoE segment launches without the queue barrier, so the shared expert overlaps it.
+    #[arg(long, env = "PLOW_GLM_ROUTER_SIGNAL", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
+    pub glm_router_signal: bool,
+
     /// Batched decode KDA: emit g_b after f_a/b so the six x-fed hipBLASLt projections are
     /// adjacent (runtime PLOW_AMD_LT_CONCURRENT then drops their barriers). Same math.
     #[arg(long, env = "PLOW_GLM_KDA_LT_ORDER", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
@@ -1975,6 +1980,7 @@ impl EmitConfig {
             glm_hc_fuse_r1: env_bool("PLOW_GLM_HC_FUSE_R1"),
             glm_hc_mix_raw: env_bool("PLOW_GLM_HC_MIX_RAW"),
             glm_router_raw: env_bool("PLOW_GLM_ROUTER_RAW"),
+            glm_router_signal: env_bool("PLOW_GLM_ROUTER_SIGNAL"),
             glm_kda_lt_order: env_bool("PLOW_GLM_KDA_LT_ORDER"),
             glm_hc_aiter: env_bool("PLOW_GLM_HC_AITER"),
             glm_hc_fold_mla: env_bool("PLOW_GLM_HC_FOLD_MLA"),

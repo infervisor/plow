@@ -446,7 +446,7 @@ if [ "$ARCH" = gfx950 ]; then
   bash "$R/cmake/hipcc_hsaco.sh" hipcc "$BUN" "$ARCH" \
     "$OUT/router_decode_gfx950.elf" plow_router_decode 256 1 \
     -DPLOW_LEAN_OBJECT=1 -DPLOW_NO_SPILL=1 -DPLOW_MOE_ROUTER_SELECT=1 \
-    -DPLOW_REQUIRED_MARKER=plow_router_decode_abi_2 \
+    -DPLOW_REQUIRED_MARKER=plow_router_decode_abi_3 \
     $INC "$R/amd/router_decode.hip"
   # PLOW_MOE_W8A8_DEC: decode-rung W8A8 grouped MoE GLU + DOWN (marked op 85/86 pair).
   bash "$R/cmake/hipcc_hsaco.sh" hipcc "$BUN" "$ARCH" \

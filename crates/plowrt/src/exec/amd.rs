@@ -660,7 +660,8 @@ struct HcMixArgs {
 const _: () = assert!(std::mem::size_of::<HcMixArgs>() == 128);
 
 /// PLOW_GLM_ROUTER_RAW (`router_decode.hip`): score GEMV + top-k, `rows * per_row` workgroups
-/// (`per_row` at eight rows, all co-resident).
+/// (`per_row` at eight rows, all co-resident). `signal` holds the interpreter counter id until
+/// launch, which rebases it onto the program's live counter bank.
 #[derive(Clone, Copy, Debug)]
 #[repr(C)]
 struct RouterDecodeArgs {
@@ -670,6 +671,7 @@ struct RouterDecodeArgs {
     table: u64,
     bias: u64,
     ctr: u64,
+    signal: u64,
     rows: u32,
     n_exp: u32,
     k_dim: u32,
@@ -680,9 +682,11 @@ struct RouterDecodeArgs {
     topk_group: u32,
     route_scale: f32,
     per_row: u32,
+    signal_add: u32,
+    pad: u32,
 }
 
-const _: () = assert!(std::mem::size_of::<RouterDecodeArgs>() == 88);
+const _: () = assert!(std::mem::size_of::<RouterDecodeArgs>() == 104);
 
 fn router_args(d: &packet::dev::DevInst64, devp: &[DeviceMem]) -> Result<RouterDecodeArgs> {
     let bad = |m: &str| RuntimeError::Device(format!("RouterDecode: {m}"));
@@ -694,10 +698,17 @@ fn router_args(d: &packet::dev::DevInst64, devp: &[DeviceMem]) -> Result<RouterD
     };
     let (rows, n_exp, k_dim, topk, flags) = (d.i[0], d.i[1], d.i[2], d.i[3], d.i[4]);
     // f32 logits (flag 8), sigmoid (1), no hash/sqrt-softplus arms; k within the LDS carve.
+    let signal = d.i[5] & packet::dev::ROUTER_RAW_SIGNAL != 0;
     if rows == 0 || rows > 256 || n_exp == 0 || n_exp > 512 || k_dim % 8 != 0 || topk == 0
-        || topk > 8 || flags & 9 != 9 || flags & 48 != 0 || d.i[5] > 1
+        || topk > 8 || flags & 9 != 9 || flags & 48 != 0
+        || (!signal && d.i[5] > 1)
+        || (signal && (rows != 1 || d.i[5] & 1 != 0 || (d.i[5] >> 2) & 0x3ff == 0))
     {
         return Err(bad("unsupported geometry or flags"));
+    }
+    let per_row = n_exp.div_ceil(WG_THREADS_8 / 64);
+    if rows == 8 && (k_dim % 512 != 0 || !(8..=64).contains(&per_row)) {
+        return Err(bad("eight-row tile geometry"));
     }
     Ok(RouterDecodeArgs {
         logit: t(0)?,
@@ -706,16 +717,19 @@ fn router_args(d: &packet::dev::DevInst64, devp: &[DeviceMem]) -> Result<RouterD
         table: t(3)?,
         bias: t(4)?,
         ctr: t(5)?,
+        signal: if signal { u64::from(d.i[5] >> 12) } else { 0 },
         rows,
         n_exp,
         k_dim,
         topk,
         flags,
-        shared_tail: d.i[5],
+        shared_tail: d.i[5] & 1,
         n_group: d.i[6] & 0xffff,
         topk_group: d.i[6] >> 16,
         route_scale: f32::from_bits(d.fj[0]),
-        per_row: n_exp.div_ceil(WG_THREADS_8 / 64),
+        per_row,
+        signal_add: if signal { (d.i[5] >> 2) & 0x3ff } else { 0 },
+        pad: 0,
     })
 }
 
@@ -7358,7 +7372,11 @@ pub struct AmdEngine {
     k_kda_decode_fused: Option<HsaKernel>,
     k_kda_decode_wide: Option<HsaKernel>,
     k_hc_mix: Option<HsaKernel>,
-    k_router: Option<HsaKernel>,
+    /// (one-row / per-row kernel, eight-row kernel).
+    k_router: Option<(HsaKernel, HsaKernel)>,
+    /// The (program, segment) of the last launched signalling router: its next interpreter
+    /// segment launches without the queue barrier.
+    router_signal_seg: Option<(usize, usize)>,
     k_hc_aiter: Option<[HsaKernel; 3]>,
     k_moe_w8a8_dec: Option<[HsaKernel; 3]>,
     k_grouped_moe_glu: Option<HsaKernel>,
@@ -9592,8 +9610,9 @@ impl AmdEngine {
                 )));
             }
             const NAME: &str = "router_decode_gfx950.elf";
-            const MARKER: &str = "plow_router_decode_abi_2";
+            const MARKER: &str = "plow_router_decode_abi_3";
             const SYMBOL: &str = "plow_router_decode";
+            const SYMBOL8: &str = "plow_router_decode8";
             let path = hsaco_dir.join(NAME);
             let image = std::fs::read(&path).map_err(|e| {
                 RuntimeError::Device(format!(
@@ -9609,18 +9628,22 @@ impl AmdEngine {
             }
             let module = EngineDevice::module_load(&*be, &image)
                 .map_err(|e| RuntimeError::Device(format!("{}: {e}", path.display())))?;
-            let kernel = EngineDevice::get_function(&*be, &module, SYMBOL)
-                .map_err(|e| RuntimeError::Device(format!("{NAME}: no symbol {SYMBOL}: {e}")))?;
-            const IMPLICIT: u32 = 256;
-            let want = std::mem::size_of::<RouterDecodeArgs>() as u32;
-            let got = kernel.kernarg_size();
-            if (got != want && got != want + IMPLICIT) || kernel.private_segment_size() != 0 {
-                return Err(RuntimeError::Device(format!(
-                    "{NAME}: kernarg segment is {got} B (ABI needs {want}) or private memory is used"
-                )));
+            let mut pair = Vec::with_capacity(2);
+            for sym in [SYMBOL, SYMBOL8] {
+                let kernel = EngineDevice::get_function(&*be, &module, sym)
+                    .map_err(|e| RuntimeError::Device(format!("{NAME}: no symbol {sym}: {e}")))?;
+                const IMPLICIT: u32 = 256;
+                let want = std::mem::size_of::<RouterDecodeArgs>() as u32;
+                let got = kernel.kernarg_size();
+                if (got != want && got != want + IMPLICIT) || kernel.private_segment_size() != 0 {
+                    return Err(RuntimeError::Device(format!(
+                        "{NAME}: {sym} kernarg segment is {got} B (ABI needs {want}) or private memory is used"
+                    )));
+                }
+                pair.push(kernel);
             }
             modules.push(module);
-            Some(kernel)
+            Some((pair[0], pair[1]))
         } else {
             None
         };
@@ -13087,6 +13110,7 @@ impl AmdEngine {
             k_kda_decode_wide,
             k_hc_mix,
             k_router,
+            router_signal_seg: None,
             k_hc_aiter,
             k_moe_w8a8_dec,
             k_grouped_moe_glu,
@@ -15813,6 +15837,7 @@ impl AmdEngine {
             ))
         })?;
         let lt_follows = self.lt_group.0 == Some((p, seg.wrapping_sub(1)));
+        let after_signal = self.router_signal_seg.take() == Some((p, seg.wrapping_sub(1)));
         if !matches!(route, DecodeSegmentRoute::GemmLt(_)) {
             self.lt_group.1.clear();
         }
@@ -15842,6 +15867,10 @@ impl AmdEngine {
                 self.seg_launches += 2;
             }
             DecodeSegmentRoute::Interpreter | DecodeSegmentRoute::SparseMlaDecode(_) => {
+                if after_signal {
+                    // Its MoE consumers wait on the router's counter; the shared expert need not.
+                    self.be.no_barrier_next();
+                }
                 let arg = self.kernarg(p, seg as u32);
                 EngineDevice::launch_cooperative(
                     &*self.be,
@@ -15983,13 +16012,20 @@ impl AmdEngine {
                 )?;
                 self.seg_launches += 1;
             }
-            DecodeSegmentRoute::Router(args) => {
-                let kernel = self.k_router.ok_or_else(|| {
+            DecodeSegmentRoute::Router(mut args) => {
+                let (k1, k8) = self.k_router.ok_or_else(|| {
                     RuntimeError::Device("RouterDecode segment has no validated object".into())
                 })?;
+                if args.signal_add != 0 {
+                    let g = &self.progs[p];
+                    args.signal = g.d_ctr.base
+                        + g.bank.current() as u64 * g.ctr_span
+                        + args.signal * (CTR_STRIDE_U32 * 4) as u64;
+                    self.router_signal_seg = Some((p, seg));
+                }
                 EngineDevice::launch_kernel(
                     &*self.be,
-                    kernel,
+                    if args.rows == 8 { k8 } else { k1 },
                     if args.rows == 8 { args.per_row } else { args.rows * args.per_row },
                     WG_THREADS_8,
                     0,

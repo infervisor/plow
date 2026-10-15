@@ -11300,9 +11300,9 @@ fn emit_glm_moe_ffn_rows(
     } else {
         glm_decode_gemm_tile(rows, e, h, b.n_cu()).unwrap_or(DevOp::Gemv)
     };
-    // PLOW_GLM_ROUTER_RAW on the gfx950 AITER route only: its table needs no align, and the
-    // fold's tail slot is the AITER call's (`dfold` below).
-    let router_raw = glm_aiter_gfx950(c, b.n_cu(), enc)
+    // PLOW_GLM_ROUTER_RAW at <= 8 rows on the gfx950 AITER route only: its table needs no align,
+    // and the fold's tail slot is the AITER call's (`dfold` below).
+    let router_raw = (rows <= 8 && glm_aiter_gfx950(c, b.n_cu(), enc))
         .then(|| glm_router_raw_ctr(b, score_op, rows))
         .flatten();
     let raw_fold = glm_shared_fold(c, enc);
@@ -11988,6 +11988,9 @@ pub(crate) fn emit_glm_moe_ffn(
             d.i[2] = h;
             if let Some(ctr) = raw {
                 glm_router_raw_fields(d, c, n.tab, w.bias, ctr, false);
+                if emit_config::active().glm_router_signal {
+                    d.i[5] |= packet::dev::ROUTER_RAW_SIGNAL;
+                }
             }
         });
         if raw.is_some() {
