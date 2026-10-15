@@ -4810,9 +4810,10 @@ fn run_one_tick(
                         |program| e.packed_prefill_span_limit(program as usize),
                     )
                 };
-                // PLOW_AMD_RIDE_FILL: the riding pack's prompt rows fill the budget less its
-                // riders: the oldest planned chunk that does not fit is cut to the gap (its rest
-                // is its next chunk) and the tick re-plans, instead of the pack running short.
+                // PLOW_AMD_RIDE_FILL: the tick's first launch (the one decode rows ride) fills the
+                // budget less its riders: the oldest planned chunk that does not fit is cut to the
+                // gap (its rest is its next chunk) and the tick re-plans, instead of the launch
+                // running short (a trimmed tail alone, or a pack a whole chunk short).
                 if rt.amd.ride_fill && mixed_pack && b2b_pass == 0 && !decoded_in_pack && !ride_filled
                 {
                     ride_filled = true;
@@ -4821,7 +4822,7 @@ fn run_one_tick(
                         .flatten()
                         .filter(|s| s.parked_at.is_none() && !s.out_ids.is_empty())
                         .count() as u32;
-                    if let Some(pack) = step.launches.iter().find(|l| l.is_pack()) {
+                    if let Some(pack) = step.launches.first() {
                         let gap = full_budget.saturating_sub(riders + pack.rows());
                         let fill = candidates
                             .iter()
