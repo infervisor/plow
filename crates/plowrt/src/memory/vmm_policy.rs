@@ -110,7 +110,9 @@ pub(super) fn try_retire(s: &Shared, inner: &mut Inner, id: u64) -> bool {
         return false;
     }
     let bytes = p.bytes;
-    if remove_snapshot_id(s, inner, id) {
+    if with_cause(inner, Some(Mechanism::Retire), None, |inner| {
+        remove_snapshot_id(s, inner, id)
+    }) {
         inner.stats.snapshots_retired += 1;
         tracing::debug!(id, bytes, "vmm prefix: boundary retired (superseded)");
         true
@@ -197,7 +199,9 @@ pub(super) fn evict_one_tree(s: &Shared, inner: &mut Inner, preserve_hot: bool) 
     if victim.is_some_and(|id| !snap_ref(inner, id).is_some_and(Snap::cold)) {
         if let Some(id) = host_lru(inner).filter(|&id| snap_ref(inner, id).is_some_and(Snap::cold))
         {
-            evict_unit(s, inner, id);
+            with_cause(inner, Some(Mechanism::Cold), None, |inner| {
+                evict_unit(s, inner, id)
+            });
             return true;
         }
     }
@@ -245,7 +249,9 @@ pub(super) fn evict_one_tree(s: &Shared, inner: &mut Inner, preserve_hot: bool) 
             deref_block(s, inner, id);
         }
     }
-    drop_node_snapshots(s, inner, key);
+    with_cause(inner, Some(Mechanism::NodeLru), None, |inner| {
+        drop_node_snapshots(s, inner, key)
+    });
     inner.stats.nodes_evicted += 1;
     true
 }
@@ -253,7 +259,8 @@ pub(super) fn evict_one_tree(s: &Shared, inner: &mut Inner, preserve_hot: bool) 
 /// Evict the boundary `id` and every radix leaf it alone kept attachable.
 pub(super) fn evict_unit(s: &Shared, inner: &mut Inner, id: u64) {
     let before = inner.stats.cache_bytes;
-    if !remove_snapshot_id(s, inner, id) {
+    let mech = (inner.drop_mech == Mechanism::Other).then_some(Mechanism::Lru);
+    if !with_cause(inner, mech, None, |inner| remove_snapshot_id(s, inner, id)) {
         return;
     }
     let mut blocks = 0;

@@ -6630,6 +6630,9 @@ impl GpuEngine {
                 }
             }
         }
+        if let Some(v) = vmm.as_ref() {
+            prefix::trace_init(v);
+        }
         let kv_admission = be.mem_info().ok().and_then(|(free, total)| {
             let (per_token, block_rows, request_bytes) =
                 kv_row_charge(vmm.as_ref(), &blob, max_ctx, batch)?;
@@ -7227,6 +7230,7 @@ impl GpuEngine {
             rings.ensure_slot(b)?;
         }
         let t_ring = t0.map(|t| t.elapsed());
+        self.trace_finish(b);
         // VMM: publish the finished sequence's generated whole blocks first —
         // a follow-up turn embedding this turn's output then attaches instead
         // of re-prefilling it — then drop the previous sequence's mappings/
@@ -7326,6 +7330,7 @@ impl GpuEngine {
             }
             return;
         }
+        self.trace_finish(b);
         // The turn-end pass: restores or touches the prompt end (the next turn's attach point).
         if cache_output {
             self.vmm_publish(b, self.pos[b]);

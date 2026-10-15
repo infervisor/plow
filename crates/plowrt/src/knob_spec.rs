@@ -560,6 +560,7 @@ pub const RUNTIME: &[KnobSpec] = &[
     KnobSpec::new("rt.ttft_log", Some("PLOW_TTFT_LOG"), Layer::Runtime, Domain::Bool, OFF, OPT_IN),
     KnobSpec::new("rt.host_timing", Some("PLOW_HOST_TIMING"), Layer::Runtime, Domain::Bool, OFF, OPT_IN),
     KnobSpec::new("rt.pfx_log", Some("PLOW_PFX_LOG"), Layer::Runtime, Domain::Bool, OFF, OPT_IN),
+    KnobSpec::new("rt.pfx_trace", Some("PLOW_PFX_TRACE"), Layer::Runtime, Domain::Str, UNSET, DIAG),
     KnobSpec::new("rt.tick_log", Some("PLOW_TICK_LOG"), Layer::Runtime, Domain::Bool, OFF, OPT_IN),
     KnobSpec::new("rt.dstep_log", Some("PLOW_DSTEP_LOG"), Layer::Runtime, Domain::Bool, OFF, OPT_IN),
     KnobSpec::new("rt.pf_packlog", Some("PLOW_PF_PACKLOG"), Layer::Runtime, Domain::Bool, OFF, OPT_IN),

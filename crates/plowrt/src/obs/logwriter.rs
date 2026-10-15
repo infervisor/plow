@@ -106,6 +106,7 @@ impl NonBlockingStdout {
 /// Drains the installed sink; a direct stdout flush when `serve` logging is not installed.
 /// Call before every `process::exit` so the last lines of a shutdown or fault are on disk.
 pub fn flush(timeout: Duration) -> bool {
+    crate::obs::pfx_trace::flush(timeout);
     match INSTALLED.get() {
         Some(w) => w.flush(timeout),
         None => std::io::stdout().flush().is_ok(),

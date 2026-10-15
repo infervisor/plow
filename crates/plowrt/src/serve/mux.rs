@@ -205,6 +205,27 @@ impl Default for MuxConfig {
     }
 }
 
+/// `PLOW_PFX_TRACE`: the request's arrival, matched to its prefix attach by prompt.
+fn trace_arrival(job: &Job, arrived: Instant) {
+    use crate::obs::pfx_trace;
+    if !pfx_trace::on() {
+        return;
+    }
+    let session = job.opts.session.as_ref().map(|t| {
+        use std::hash::{Hash, Hasher};
+        let mut h = rustc_hash::FxHasher::default();
+        t.session.hash(&mut h);
+        h.finish()
+    });
+    pfx_trace::emit(pfx_trace::Event::Arrive {
+        t: arrived,
+        fp: pfx_trace::fingerprint(&job.prompt_ids),
+        prompt_len: job.prompt_ids.len() as u32,
+        session,
+        tenant: job.opts.tenant,
+    });
+}
+
 /// One request through the mux. Tokens stream out on `respond` as they are
 /// produced; `Done`/`Err` terminates the stream. The receiver drives the
 /// HTTP handler (SSE frames or a buffered non-streaming response).
@@ -810,6 +831,7 @@ impl ModelMux {
             });
         }
         let urgent = job.opts.class != JobClass::Bulk;
+        trace_arrival(&job, arrived);
         match self.tx.try_send(MuxMsg::Job(job, arrived)) {
             Ok(()) => {
                 // Released only once the job is on the channel: a graceful drain held by this
@@ -850,6 +872,7 @@ impl ModelMux {
         }
         let arrived = job.arrived;
         let urgent = job.opts.class != JobClass::Bulk;
+        trace_arrival(&job, arrived);
         self.tx
             .send(MuxMsg::Job(job, arrived))
             .await

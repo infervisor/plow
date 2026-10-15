@@ -806,6 +806,10 @@ impl GpuEngine {
         })();
         if let Err(error) = restored {
             kv.begin_seq(b);
+            if crate::obs::pfx_trace::on() {
+                let slot = b as u32;
+                crate::obs::pfx_trace::emit(crate::obs::pfx_trace::Event::AttachUnwound { slot });
+            }
             return Err(error);
         }
         if self.window_open {
@@ -908,6 +912,7 @@ impl GpuEngine {
             return true;
         }
         if !v.slide.is_empty() && rows - p_a > v.ring as u32 - g.window {
+            trace_refusal(b, p_a, Refusal::RingWrapped);
             tracing::debug!(
                 slot = b,
                 rows,
@@ -921,6 +926,7 @@ impl GpuEngine {
             return false;
         }
         if !kv.resolve_prefix_hazard(b, toks, p_a) {
+            trace_refusal(b, p_a, Refusal::Hazard);
             tracing::debug!(
                 slot = b,
                 p_a,
@@ -933,6 +939,7 @@ impl GpuEngine {
             self.vmm_snap_copy(b, p_a, dst, true)
         }) {
             tracing::debug!(error = %e, slot = b, p_a, "vmm: publish_boundary skipped");
+            trace_refusal(b, p_a, Refusal::Error);
             false
         } else {
             tracing::debug!(slot = b, p_a, snap_bytes, "vmm: published successfully");
@@ -980,10 +987,12 @@ impl GpuEngine {
                 toks_len = toks.len(),
                 "vmm_publish skipped: rows/toks mismatch"
             );
+            trace_refusal(b, p_a, Refusal::NotPublishable);
             return;
         }
         if p_a == 0 {
             tracing::debug!(slot = b, p_a, "vmm_publish skipped: p_a == 0");
+            trace_refusal(b, p_a, Refusal::NotPublishable);
             return;
         }
         let step = crate::config::RuntimeConfig::get()
@@ -1055,6 +1064,17 @@ impl GpuEngine {
         share + (v.ring as usize).saturating_sub(kv.geometry().window as usize) - c0
     }
 
+    /// `PLOW_PFX_TRACE`: slot `b`'s sequence ended with these computed rows.
+    pub(super) fn trace_finish(&self, b: usize) {
+        if crate::obs::pfx_trace::on() && self.vmm_prefix().is_some() && self.pos[b] > 0 {
+            crate::obs::pfx_trace::emit(crate::obs::pfx_trace::Event::Finish {
+                t: std::time::Instant::now(),
+                slot: b as u32,
+                tokens: self.seq_tokens[b].clone(),
+            });
+        }
+    }
+
     /// Slot `b`'s prompt is prefilled and its prompt-end publish has run.
     pub(super) fn vmm_prefill_done(&self, b: usize) {
         if let Some((_, kv)) = self.vmm_prefix() {
@@ -1074,6 +1094,49 @@ impl GpuEngine {
         };
         kv.inflight_prefix(b, prompt, lookback, &self.pos)
     }
+}
+
+use crate::obs::pfx_trace::Refusal;
+
+fn trace_refusal(b: usize, rows: u32, cause: Refusal) {
+    if crate::obs::pfx_trace::on() {
+        crate::obs::pfx_trace::emit(crate::obs::pfx_trace::Event::Refuse {
+            t: std::time::Instant::now(),
+            slot: b as u32,
+            rows,
+            cause,
+        });
+    }
+}
+
+/// Arm `PLOW_PFX_TRACE` with the prefix pool's geometry and byte costs (a no-op unset).
+pub(super) fn trace_init(v: &VmmServe) {
+    let Some(kv) = v.kv.as_ref().filter(|kv| kv.prefix_reuse()) else {
+        return;
+    };
+    let g = kv.geometry();
+    let (block_bytes, cache_cap, min_free) = kv.budget();
+    crate::obs::pfx_trace::init(crate::obs::pfx_trace::Header {
+        block_rows: kv.block_rows(),
+        block_bytes,
+        full_layers: g.full_layers.len() as u32,
+        kvh_full: g.kvh_full,
+        hd_full: g.hd_full,
+        elem_full: g.elem,
+        full_scale: !v.full_scale.is_empty(),
+        slide_layers: v.slide.len() as u32,
+        kvh_slide: g.kvh_slide,
+        hd_slide: g.hd_slide,
+        elem_slide: g.elem_slide,
+        window: g.window,
+        ring: v.ring,
+        max_ctx: g.max_ctx,
+        batch: g.batch,
+        snap_row_bytes: v.snap_row_bytes,
+        cache_cap,
+        min_free,
+        host_cap: crate::config::RuntimeConfig::get().vmm_host_cache_bytes(),
+    });
 }
 
 /// Rows a prompt-end boundary may cover: the next turn re-renders the last few prompt

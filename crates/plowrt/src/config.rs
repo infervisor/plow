@@ -932,6 +932,11 @@ pub struct RuntimeConfig {
     #[arg(long = "pfx-log", env = "PLOW_PFX_LOG", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
     pub pfx_log: bool,
 
+    /// Per-request prefix-cache trace as JSONL at this path (`PLOW_PFX_TRACE=<path>`): attach
+    /// point and kind, ideal match, boundary fates (`obs::pfx_trace`, `scripts/bench/pfx_shadow.py`).
+    #[arg(long = "pfx-trace", env = "PLOW_PFX_TRACE", global = true)]
+    pub pfx_trace: Option<std::path::PathBuf>,
+
     /// Per-tick AMD serve breakdown: prefill launches, decode dispatch, host remainder
     /// (`PLOW_TICK_LOG=1`).
     #[arg(long = "tick-log", env = "PLOW_TICK_LOG", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]

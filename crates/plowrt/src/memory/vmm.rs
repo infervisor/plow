@@ -40,6 +40,7 @@
 //! refcount 0 and boundary snapshots freed with their node. Short-prefix
 //! snapshots use a second-chance policy and stay pinned during restoration.
 
+use crate::obs::pfx_trace::{self, Mechanism, Trigger};
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
 
@@ -1173,6 +1174,10 @@ impl Kind {
     fn has(self, k: Kind) -> bool {
         self.0 & k.0 != 0
     }
+
+    pub fn bits(self) -> u8 {
+        self.0
+    }
 }
 
 impl Snap {
@@ -1469,6 +1474,69 @@ struct Inner {
     /// Bytes of zero-ref blocks handed to the reclaimer thread ([`Job::Release`]) so far:
     /// released, but not yet visible to [`VmmOps::free_bytes`] (`trim_cache`).
     release_queued: u64,
+    /// `PLOW_PFX_TRACE` attribution of the next snapshot free ([`with_cause`]).
+    drop_mech: Mechanism,
+    drop_trigger: Trigger,
+    /// The pressure trim's last [`VmmOps::free_bytes`] sample (the trace's pool gauge).
+    free_sample: Option<(u64, std::time::Instant)>,
+}
+
+/// Run `f` with the trace's drop attribution set; the previous one is restored after, so a
+/// nested cause (a retire cascade inside an eviction) reports its own.
+fn with_cause<R>(
+    inner: &mut Inner,
+    mech: Option<Mechanism>,
+    trigger: Option<Trigger>,
+    f: impl FnOnce(&mut Inner) -> R,
+) -> R {
+    let prev = (inner.drop_mech, inner.drop_trigger);
+    if let Some(m) = mech {
+        inner.drop_mech = m;
+    }
+    if let Some(t) = trigger {
+        inner.drop_trigger = t;
+    }
+    let r = f(inner);
+    (inner.drop_mech, inner.drop_trigger) = prev;
+    r
+}
+
+fn trace_gauges(inner: &Inner) -> pfx_trace::Gauges {
+    pfx_trace::Gauges {
+        snapshot_bytes: inner.stats.snapshot_bytes,
+        cache_bytes: inner.stats.cache_bytes,
+        host_bytes: inner.stats.host_snapshot_bytes,
+        snaps_live: inner.by_id.len() as u64,
+        free_bytes: inner.free_sample.map(|(b, _)| b),
+        free_age_s: inner
+            .free_sample
+            .map(|(_, t)| (t.elapsed().as_secs_f64() * 1e3).round() / 1e3),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn trace_attach(
+    seq: usize,
+    prompt: Vec<u32>,
+    radix_blocks: usize,
+    block_rows: u32,
+    rows: u32,
+    snap: Option<(u64, Kind)>,
+    host: bool,
+    inner: &Inner,
+) {
+    pfx_trace::emit(pfx_trace::Event::Attach(Box::new(pfx_trace::AttachEv {
+        t: std::time::Instant::now(),
+        slot: seq as u32,
+        prompt,
+        radix_blocks: radix_blocks as u32,
+        block_rows,
+        rows,
+        snap: snap.map(|(id, _)| id),
+        kind: snap.map_or(0, |(_, k)| k.bits()),
+        host,
+        gauges: trace_gauges(inner),
+    })));
 }
 
 enum PublishLocked {
@@ -1687,6 +1755,9 @@ impl VmmKv {
                 recent: std::collections::VecDeque::new(),
                 share: vec![0; batch],
                 release_queued: 0,
+                drop_mech: Mechanism::Other,
+                drop_trigger: Trigger::None,
+                free_sample: None,
             }),
             frontier: (0..batch).map(|_| AtomicU32::new(0)).collect(),
             generation: (0..batch).map(|_| AtomicU64::new(0)).collect(),
@@ -1983,7 +2054,9 @@ impl VmmKv {
             .free_bytes()
             .is_some_and(|free| free + (inner.release_queued - queued) < target)
         {
-            if !evict_one(s, &mut inner, false) {
+            if !with_cause(&mut inner, None, Some(Trigger::Relieve), |inner| {
+                evict_one(s, inner, false)
+            }) {
                 break;
             }
             freed = true;
@@ -2137,6 +2210,16 @@ impl VmmKv {
     /// Tokens per sharing block — the prefix-match granularity.
     pub fn block_rows(&self) -> u32 {
         self.shared.block_rows
+    }
+
+    /// Pool sizes for the prefix trace header: (block bytes, soft cap, free-memory floor).
+    pub fn budget(&self) -> (u64, u64, u64) {
+        let s = &self.shared;
+        (
+            s.block_bytes,
+            s.cache_cap,
+            s.cache_min_free.load(Ordering::Relaxed),
+        )
     }
 
     pub fn geometry(&self) -> &VmmGeometry {
@@ -2295,6 +2378,7 @@ impl VmmKv {
         }
         let _section = EngineSection::enter();
         let s = &self.shared;
+        let traced = pfx_trace::on().then(|| prompt.to_vec());
         let mut inner = s.inner.lock();
         inner.stats.tokens_queried += prompt.len() as u64;
         inner.prefilling[seq] = true;
@@ -2332,6 +2416,9 @@ impl VmmKv {
             chosen.map_or(0, |(_, _, rows)| rows),
         );
         let Some((pick, snap_key, rows)) = chosen else {
+            if let Some(p) = traced {
+                trace_attach(seq, p, m.blocks, s.block_rows, 0, None, false, &inner);
+            }
             inner.stats.attach_misses += 1;
             inner.stats.tokens_lost_miss += prompt.len() as u64;
             inner.cache.release(&hashes, m.blocks);
@@ -2411,6 +2498,11 @@ impl VmmKv {
             let tier = inner.host.as_ref().expect("a host snapshot has a tier");
             (slot, tier.slots[slot as usize])
         });
+        if let Some(p) = traced {
+            let snap = Some((snap_key.id, kind));
+            let host = restore.is_some();
+            trace_attach(seq, p, m.blocks, s.block_rows, rows, snap, host, &inner);
+        }
         // The ancestors as they are now: the restore wait above released the lock.
         let parent = snap_ref(&inner, snap_key.id).expect("held").parent;
         let snap = snap_ref(&inner, snap_key.id).expect("held");
@@ -2608,6 +2700,9 @@ impl VmmKv {
                     *got -= u64::from(rows);
                     *miss -= prompt.len() as u64 - u64::from(rows);
                     st.tokens_lost_miss += prompt.len() as u64;
+                    if pfx_trace::on() {
+                        pfx_trace::emit(pfx_trace::Event::AttachUnwound { slot: seq as u32 });
+                    }
                     inner.seqs[seq] = SlotSeq {
                         hashes,
                         prompt_rows: tokens.len(),
@@ -2670,6 +2765,9 @@ impl VmmKv {
             drop(inner);
             for hnd in orphans {
                 s.ops.release(hnd);
+            }
+            if pfx_trace::on() {
+                pfx_trace::emit(pfx_trace::Event::AttachUnwound { slot: seq as u32 });
             }
             return Err(e);
         }
@@ -2919,6 +3017,10 @@ impl VmmKv {
         let parent = snap.parent;
         policy::refresh_ancestors(&mut inner, parent, tick);
         inner.stats.snapshots_touched += 1;
+        if pfx_trace::on() {
+            let t = std::time::Instant::now();
+            pfx_trace::emit(pfx_trace::Event::Touch { t, id });
+        }
         // A touch of the boundary this request's twin published (a same-history pair) is its
         // continuation: the attached parent's `pending` hold ends and the single-continuation
         // rule applies to it now.
@@ -3121,7 +3223,9 @@ impl VmmKv {
                     deref_block(s, &mut inner, id);
                 }
             }
-            drop_node_snapshots(s, &mut inner, key);
+            with_cause(&mut inner, Some(Mechanism::StrictTail), None, |inner| {
+                drop_node_snapshots(s, inner, key)
+            });
             inner.stats.nodes_evicted += 1;
         }
         // Re-check: eviction may have stopped early (a referenced node in the way, e.g. a
@@ -3571,7 +3675,12 @@ fn alloc_cold_snapshot(s: &Shared, bytes: u64) -> Result<u64> {
                 let Some(id) = cold_victim(&inner) else {
                     return Err(error);
                 };
-                policy::evict_unit(s, &mut inner, id);
+                with_cause(
+                    &mut inner,
+                    Some(Mechanism::Cold),
+                    Some(Trigger::Oom),
+                    |inner| policy::evict_unit(s, inner, id),
+                );
             }
             Err(error) => return Err(error),
         }
@@ -3584,7 +3693,9 @@ fn alloc_snapshot(s: &Shared, bytes: u64) -> Result<u64> {
             Ok(va) => return Ok(va),
             Err(error) if matches!(&error, RuntimeError::Oom(_)) => {
                 let mut inner = s.inner.lock();
-                if !evict_one(s, &mut inner, false) {
+                if !with_cause(&mut inner, None, Some(Trigger::Oom), |inner| {
+                    evict_one(s, inner, false)
+                }) {
                     return Err(error);
                 }
             }
@@ -3661,6 +3772,14 @@ fn publish_locked(
     // consistent; same-conversation growth across turns is exactly that case.)
     if inner.strict_publish && m.blocks > inner.seqs[seq].held {
         inner.cache.release(&hashes, m.blocks);
+        if pfx_trace::on() {
+            pfx_trace::emit(pfx_trace::Event::Refuse {
+                t: std::time::Instant::now(),
+                slot: seq as u32,
+                rows,
+                cause: pfx_trace::Refusal::StrictFp8,
+            });
+        }
         // The same boundary published from the blocks this one would have aliased (the other
         // request of a same-history pair) is this request's continuation all the same.
         if inner.policy == Policy::Tree {
@@ -3829,6 +3948,17 @@ fn publish_locked(
         });
         inner.stats.snapshot_bytes += snap_bytes;
         inner.stats.cache_bytes += snap_bytes;
+        if pfx_trace::on() {
+            pfx_trace::emit(pfx_trace::Event::Publish {
+                t: std::time::Instant::now(),
+                slot: seq as u32,
+                id,
+                rows,
+                kind: kind.bits(),
+                bytes: snap_bytes,
+                cold,
+            });
+        }
         (id, None)
     };
     let mut superseded = None;
@@ -4300,7 +4430,9 @@ fn trim_cache_cold(s: &Shared, inner: &mut Inner) {
         };
         // `spill_unit` keeps a cold spill from displacing a used host boundary.
         if !spill_unit(s, inner, id) {
-            policy::evict_unit(s, inner, id);
+            with_cause(inner, Some(Mechanism::Cold), None, |inner| {
+                policy::evict_unit(s, inner, id)
+            });
         }
         true
     });
@@ -4332,6 +4464,7 @@ fn trim_cache_by(
     let min_free = s.cache_min_free.load(Ordering::Relaxed);
     if min_free > 0 {
         if let Some(mut free) = s.ops.free_bytes() {
+            inner.free_sample = Some((free, std::time::Instant::now()));
             // Real pressure only: a backend that can answer this is authoritative, so
             // `cache_cap` is not consulted at all while this branch runs — that is the
             // point (evict on demand, not on a fixed count of cached bytes). Blocks an
@@ -4340,7 +4473,9 @@ fn trim_cache_by(
             // (Pooled blocks are not free and not credited; the pool cap bounds them.)
             let queued = inner.release_queued;
             while free + (inner.release_queued - queued) + pending_spill_bytes(inner) < min_free {
-                if !evict_one(s, inner, true) {
+                if !with_cause(inner, None, Some(Trigger::MinFree), |inner| {
+                    evict_one(s, inner, true)
+                }) {
                     break;
                 }
                 free = s.ops.free_bytes().unwrap_or(u64::MAX);
@@ -4355,7 +4490,9 @@ fn trim_cache_by(
             .saturating_sub(pending_spill_bytes(inner))
             > s.cache_cap
     {
-        if !evict_one(s, inner, true) {
+        if !with_cause(inner, None, Some(Trigger::SoftCap), |inner| {
+            evict_one(s, inner, true)
+        }) {
             break;
         }
     }
@@ -4436,7 +4573,9 @@ fn demote_expired(s: &Shared, inner: &mut Inner) {
             continue;
         }
         let before = inner.stats.cache_bytes + inner.stats.host_snapshot_bytes;
-        if !remove_snapshot_id(s, inner, id) {
+        if !with_cause(inner, Some(Mechanism::SessionDemote), None, |inner| {
+            remove_snapshot_id(s, inner, id)
+        }) {
             continue;
         }
         if let Some(key) = node.filter(|k| !inner.published.contains_key(&Some(*k))) {
@@ -4534,6 +4673,18 @@ fn release_prefix_hold(s: &Shared, inner: &mut Inner, seq: usize) {
 /// Free a snapshot already removed from `published`: tree links first, then the buffer(s).
 fn free_snapshot(s: &Shared, inner: &mut Inner, snap: Snap) {
     assert_eq!(snap.users, 0, "evicting an in-flight snapshot");
+    // Before the unlink: a retire it cascades into reports after this drop.
+    if pfx_trace::on() {
+        pfx_trace::emit(pfx_trace::Event::Drop {
+            t: std::time::Instant::now(),
+            id: snap.id,
+            rows: snap.rows,
+            mechanism: inner.drop_mech,
+            trigger: inner.drop_trigger,
+            host: matches!(snap.store, SnapStore::Host(_)),
+            attaches: snap.attaches,
+        });
+    }
     inner.by_id.remove(&snap.id);
     policy::unlink_snapshot(s, inner, &snap);
     inner.stats.snapshots_evicted += 1;
@@ -4823,6 +4974,10 @@ fn spill_snapshot(s: &Shared, inner: &mut Inner, id: u64) -> bool {
                 s.host_cv.notify_all();
             }
             inner.stats.snapshots_spilled += 1;
+            if pfx_trace::on() {
+                let t = std::time::Instant::now();
+                pfx_trace::emit(pfx_trace::Event::Spill { t, id });
+            }
             true
         }
         Err(error) => {
@@ -8570,6 +8725,79 @@ mod tests {
 
     /// Publish a 17-token prompt (`tokens[0] = first`) at row 12: one shared block (128 B)
     /// plus a 192-byte tailed snapshot filled with `byte`.
+    /// `PLOW_PFX_TRACE`: the hooks report attaches, publishes and each drop's mechanism and
+    /// memory trigger at the real sites (a chain publish retires its parent; the free-memory
+    /// floor evicts an LRU unit).
+    #[test]
+    fn pfx_trace_reports_attach_publish_and_drop_causes() {
+        use crate::obs::pfx_trace::{capture, Event};
+        let ops = Arc::new(MockVmm::default());
+        let mut p = pool_with_cap(ops.clone(), 1 << 20);
+        let a = prompt(17);
+        let b = prompt(24);
+        let ((), evs) = capture(|| {
+            p.try_attach(0, &a).unwrap();
+            p.ensure_rows(0, 17).unwrap();
+            p.publish_at(0, &a, 12, 192, |_| Ok(())).unwrap();
+            p.begin_seq(0);
+            assert_eq!(p.try_attach(0, &b).unwrap().unwrap().rows, 12);
+            p.ensure_rows(0, 24).unwrap();
+            p.publish_at(0, &b, 20, 192, |_| Ok(())).unwrap();
+        });
+        let mut ids = Vec::new();
+        let mut seen = Vec::new();
+        for ev in &evs {
+            match ev {
+                Event::Attach(x) => seen.push(format!("attach {} {:?}", x.rows, x.snap.is_some())),
+                Event::Publish { id, rows, .. } => {
+                    ids.push(*id);
+                    seen.push(format!("publish {rows}"));
+                }
+                Event::Drop {
+                    id,
+                    mechanism,
+                    trigger,
+                    ..
+                } => seen.push(format!(
+                    "drop {} {mechanism:?} {trigger:?}",
+                    ids.iter().position(|i| i == id).unwrap()
+                )),
+                _ => {}
+            }
+        }
+        assert_eq!(
+            seen,
+            [
+                "attach 0 false",
+                "publish 12",
+                "attach 12 true",
+                "publish 20",
+                "drop 0 Retire None"
+            ]
+        );
+        p.enable_pressure_eviction(500);
+        *ops.free_bytes.lock().unwrap() = Some(100);
+        let ((), evs) = capture(|| p.begin_seq(0));
+        let drops: Vec<String> = evs
+            .iter()
+            .filter_map(|ev| match ev {
+                Event::Drop {
+                    rows,
+                    mechanism,
+                    trigger,
+                    ..
+                } => Some(format!("{rows} {mechanism:?} {trigger:?}")),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(drops, ["20 Lru MinFree"]);
+        let (_, evs) = capture(|| p.try_attach(1, &b).unwrap());
+        let Some(Event::Attach(x)) = evs.first() else {
+            panic!("no attach event");
+        };
+        assert_eq!((x.rows, x.gauges.free_bytes), (0, Some(100)));
+    }
+
     fn publish_tailed(p: &VmmKv, ops: &MockVmm, seq: usize, first: u32, byte: u8) -> Vec<u32> {
         let mut tokens = prompt(17);
         tokens[0] = first;
