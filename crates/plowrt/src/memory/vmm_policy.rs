@@ -192,6 +192,15 @@ pub(super) fn evict_one_tree(s: &Shared, inner: &mut Inner, preserve_hot: bool) 
     if evict_dead_leaf(s, inner) {
         return true;
     }
+    // A cold host boundary (published on a first sighting, never attached) ranks below every
+    // used device boundary: it goes before the device victim is spilled or freed.
+    if victim.is_some_and(|id| !snap_ref(inner, id).is_some_and(Snap::cold)) {
+        if let Some(id) = host_lru(inner).filter(|&id| snap_ref(inner, id).is_some_and(Snap::cold))
+        {
+            evict_unit(s, inner, id);
+            return true;
+        }
+    }
     if let Some(id) = victim {
         // Level 2 of the same LRU: the device victim moves to pinned host memory when a tier
         // is armed; its blocks stay (a host snapshot is attachable through them).
