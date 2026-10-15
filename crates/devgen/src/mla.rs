@@ -1116,14 +1116,14 @@ fn emit_glm53_program(
                 && rows.div_ceil(4) * 3 <= b.n_cu()));
     // PLOW_GLM53_PF_HC_AITER (prefill band seams): a block's HyperConnPost folds into the next
     // sublayer's mix and that sublayer's input norm into its pre (AITER's pair), then the
-    // gather. Taken where the next input norm is a band norm + gather: FFN, and KDA under
-    // PLOW_GLM53_SP_KDA_NORM. MLA inputs keep the interpreter chain.
+    // gather. Taken where the next input norm is a band norm + gather: FFN, MLA, and KDA under
+    // PLOW_GLM53_SP_KDA_NORM.
     let pf_hc = prefill && bv.is_some() && emit_config::active().glm53_pf_hc_aiter;
     if pf_hc {
         assert!(c.hidden == 4096, "PLOW_GLM53_PF_HC_AITER needs hidden 4096");
     }
-    let pf_kda_in = |l: usize| {
-        pf_hc && !c.is_softmax(l as u32) && emit_config::active().glm53_sp_kda_norm
+    let pf_in_fold = |l: usize| {
+        pf_hc && (c.is_softmax(l as u32) || emit_config::active().glm53_sp_kda_norm)
     };
     let mut pending_post: Option<(u32, u32)> = None;
     let xr_hcpost = !prefill && bv.is_none() && c.tp > 1 && emit_config::active().glm_xr_hcpost;
@@ -1148,13 +1148,18 @@ fn emit_glm53_program(
             && c.is_softmax(l as u32)
             && emit_config::active().glm_hc_fold_mla
             && !(emit_config::active().glm_norm_q128 && emit_config::active().glm_qkva_w8a8);
-        let pf_kda_fold = pf_kda_in(l) && pending_post.is_some();
+        let pf_attn_fold = pf_in_fold(l) && pending_post.is_some();
         let kda_fold = kda_x
             .map(|x| (x, s.kda_w[l].as_ref().unwrap().ln_w))
             .or(mla_fold.then(|| (n.xn, n.lw[l].gin)))
-            .or(bv
-                .filter(|_| pf_kda_fold)
-                .map(|v| (v.h2, s.kda_w[l].as_ref().unwrap().ln_w)));
+            .or(bv.filter(|_| pf_attn_fold).map(|v| {
+                let gamma = if c.is_softmax(l as u32) {
+                    n.lw[l].gin
+                } else {
+                    s.kda_w[l].as_ref().unwrap().ln_w
+                };
+                (v.h2, gamma)
+            }));
         let c_pre = emit_glm53_hc_pre(
             b,
             c,
@@ -1171,6 +1176,17 @@ fn emit_glm53_program(
         );
         let c_attn = if c.is_softmax(l as u32) {
             if prefill {
+                if pf_attn_fold {
+                    let g = crate::emit_xall_gather(
+                        b,
+                        &mut xgate,
+                        &xr,
+                        &[c_pre],
+                        &[(n.xn, rows * c.hidden, 3 * n.slot_b)],
+                        c.tp,
+                    );
+                    MLA_PF_PRENORMED.with(|f| f.set(Some(g)));
+                }
                 emit_glm_mla_prefill(
                     b,
                     c,
@@ -1212,7 +1228,7 @@ fn emit_glm53_program(
                     rows as u64 * c.hidden as u64 * 2,
                 )
             });
-            let c_in = if let Some(x) = sp_x.filter(|_| pf_kda_fold) {
+            let c_in = if let Some(x) = sp_x.filter(|_| pf_attn_fold) {
                 crate::emit_xall_gather(
                     b,
                     &mut xgate,
@@ -1375,7 +1391,7 @@ fn emit_glm53_program(
         };
         let raw = bv.map_or(n.attn, |v| v.dg);
         if (post_fold_on && l + 1 < c.layers as usize)
-            || (l + 1 < c.layers as usize && pf_kda_in(l + 1))
+            || (l + 1 < c.layers as usize && pf_in_fold(l + 1))
         {
             pending_post = Some((raw, residual));
             dep = c_ffn;
@@ -6323,6 +6339,9 @@ fn emit_glm_mla_ex(
 
 thread_local! {
     static DENSE_EXACT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// PLOW_GLM53_PF_HC_AITER: the next `emit_glm_mla_prefill` input is already normed and
+    /// gathered into `n.xn` by this counter.
+    static MLA_PF_PRENORMED: std::cell::Cell<Option<u32>> = const { std::cell::Cell::new(None) };
 }
 
 /// Marks the decode program being emitted as a dense-exact rung (`PLOW_GLM_DECODE_DENSE_EXACT`).
@@ -8901,7 +8920,14 @@ pub(crate) fn emit_glm_mla_prefill(
                 && (!sparse || (emit_config::active().glm_index_tp() && t >= 2048))));
     let mut proj_g: Option<(u32, Option<u32>)> = None;
     let mut band_q: Option<(u32, u32)> = None;
-    let c_rn1 = if sp_proj {
+    let prenormed = MLA_PF_PRENORMED.with(|f| f.take());
+    assert!(
+        prenormed.is_none() || (sp && !sp_proj),
+        "PLOW_GLM53_PF_HC_AITER: a prenormed MLA input needs the band norm + gather seam"
+    );
+    let c_rn1 = if let Some(gather) = prenormed {
+        gather
+    } else if sp_proj {
         let tb = t / tp;
         let xb = glm_band(b, x_in, t, tp, h as u64 * 2);
         let xnb = glm_band(b, n.xn, t, tp, h as u64 * 2);
