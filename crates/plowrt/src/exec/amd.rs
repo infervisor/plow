@@ -7319,6 +7319,8 @@ pub struct AmdEngine {
     k_gemm_group: Option<HsaKernel>,
     k_mla_pf_dense: Option<HsaKernel>,
     k_mla_pf_gather: Option<HsaKernel>,
+    /// `PLOW_GLM_DSA_PF_MIN_CTX`: this chunk's sparse rung runs dense (selection Nop'd).
+    dsa_pf_dense_chunk: bool,
     k_kda_chunk_wu_lean_keys: Option<HsaKernel>,
     k_kda_chunk_carry_keyfeed: Option<HsaKernel>,
     k_kda_spans: KdaSpansKernels,
@@ -12986,6 +12988,7 @@ impl AmdEngine {
             k_gemm_group,
             k_mla_pf_dense,
             k_mla_pf_gather,
+            dsa_pf_dense_chunk: false,
             k_kda_chunk_wu_lean_keys,
             k_kda_chunk_carry_keyfeed,
             k_kda_spans,
@@ -14244,7 +14247,7 @@ impl AmdEngine {
             let kernel = self.k_mla_pf_dense.ok_or_else(|| {
                 RuntimeError::Device("dense MLA prefill segment has no loaded object".into())
             })?;
-            if let Some(mut g) = route.gather_args() {
+            if let Some(mut g) = route.gather_args().filter(|_| !self.dsa_pf_dense_chunk) {
                 if active {
                     return Err(RuntimeError::Device(
                         "sparse MLA prefill gather has no packed-span form".into(),
@@ -16451,6 +16454,24 @@ impl AmdEngine {
             self.progs[prog].t,
             bucket.or_else(|| self.ragged_bucket(prog)),
         );
+        self.dsa_pf_dense_chunk = self.progs[prog].sparse_prefill
+            && crate::config::RuntimeConfig::get()
+                .amd
+                .dsa_pf_min_ctx
+                .is_some_and(|min| c0 + clen <= min);
+        if self.dsa_pf_dense_chunk {
+            for d in insts.iter_mut() {
+                let op = d.op;
+                let skip = op == DevOp::DsaQQuant as u16
+                    || (op == DevOp::IndexScoreKpool as u16 && d.i[5] != 0)
+                    || op == DevOp::IndexSelectPf as u16
+                    || (op == DevOp::DsaPoolExpand as u16 && d.i[3] != 1)
+                    || op == DevOp::IndexUnionPf as u16;
+                if skip {
+                    d.op = DevOp::Nop as u16;
+                }
+            }
+        }
         if let (true, Some(tp)) = (
             crate::config::RuntimeConfig::get().amd_ragged_seams(),
             self.tp,

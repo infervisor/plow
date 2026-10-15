@@ -1974,6 +1974,12 @@ pub struct AmdRuntimeConfig {
     )]
     pub tail_sparse_ctx: Option<u32>,
 
+    /// DSA sparse prefill chunk floor: a chunk on the sparse prefill rung whose context end
+    /// (`c0 + clen`) is at most this many tokens skips the indexer selection and runs the dense
+    /// flash. Unset = every chunk of the sparse rung is sparse.
+    #[arg(long = "glm-dsa-pf-min-ctx", env = "PLOW_GLM_DSA_PF_MIN_CTX", global = true)]
+    pub dsa_pf_min_ctx: Option<u32>,
+
     /// With the tail-sparse floor: the dense final chunk moves only when `prior x tail rows` (the
     /// query-key pairs its dense attention scores) reaches this many; unset = no pair floor.
     #[arg(
