@@ -409,6 +409,13 @@ unsafe impl Sync for GraphExec {}
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub struct KernelFn(usize);
 
+#[cfg(test)]
+impl KernelFn {
+    pub(crate) const fn null() -> Self {
+        Self(0)
+    }
+}
+
 /// The freer every owned [`DeviceMem`] carries ([`crate::device::DeviceFree`]).
 /// It holds the primary-context **retain**: the context is released only when
 /// the backend AND every owned allocation are gone, so a late `DeviceMem` drop
