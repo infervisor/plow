@@ -72,6 +72,7 @@ const CACHE_OUTPUT_QUALIFIED: Status = Status::Qualified {
 };
 const RETIRE_ATTACHED_QUALIFIED: Status = Status::Qualified {
     evidence: &[
+        "perf-certs/rt.prefix_retire_attached.json: checkpoint P accepts, same binary, PLOW_PREFIX_POLICY=legacy, production replay 1.1 sess/s without session ids, ABAB: per-request cached fraction median 0.637 -> 0.749, TTFT p50 110.7 -> 86.6 ms, TPOT p50 15.16 -> 13.03 ms, 0 errors, cached replies token-identical to cold",
         "Gemma-4 26B FP8 H100, human-paced chat replay without session ids (1.1 sess/s, think median 45 s), default vs =0: cached 58.0% vs 49.2%, continuation hits 70.0% vs 50.7%, TTFT p50 178 vs 185 ms, TPOT p50 46.1 vs 52.8 ms (/opt/dlami/nvme/lava-tts/g26-cache-study/REPORT.md)",
         "`=0` is the rollback",
     ],
