@@ -1631,6 +1631,34 @@ pub(crate) fn glm53_emit_full(
             prog_t.push(packet::devbuild::packed_prefill_program_t(rows));
         }
     }
+    // PLOW_GLM_DSA_PF_A2A: the 8192 rung's sparse row-split sibling (the runtime picks it per
+    // full chunk past the threshold; the ordinary 8192 program stays dense).
+    if crate::emit_is_amd() && ec.glm_dsa_pf_a2a && tp > 1 && pf.contains(&8192) {
+        let rows = 8192;
+        let mut b = Builder::new(n_cu);
+        b.set_tensor_dedup(true);
+        b.adopt_tensors(tensors.clone());
+        b.set_l2_placement(l2_pf);
+        if l2_pf.is_some() {
+            b.deny_uniseg();
+        }
+        b.set_rowsplit_arm(Some(packet::devbuild::RowSplitArm::AllToAll));
+        b.set_kda_intra_wave_items_segments(gfx950 && ec.kda_intra_wave_items);
+        b.set_lean_kda_key_factor_segments(gfx950 && ec.kda_key_factor);
+        b.set_kda_carry_regstate_segments(gfx950 && ec.kda_chunk_qpre && ec.kda_carry_regstate);
+        b.set_kda_wu_lean_segments(
+            gfx950 && ec.kda_chunk_qpre && (ec.kda_wu_lean || ec.kda_carry_keyfeed),
+        );
+        b.set_kda_carry_keyfeed_segments(ec.kda_carry_keyfeed);
+        b.set_lean_moe_fp8_segments(
+            gfx950 && ec.moe_fp8_pf_lean && rows as u64 >= u64::from(ec.moe_fp8_pf_min_rows),
+        );
+        emit_glm53_program(&mut b, &c, &n, &s, ctx, rows, dbatch, enc, true);
+        let prog = b.finish();
+        tensors = prog.tensors.clone();
+        progs.push(prog);
+        prog_t.push(packet::devbuild::rowsplit_prefill_program_t(rows));
+    }
     for rows in emit_config::active().decode_rungs() {
         let mut b = Builder::new(n_cu);
         b.set_tensor_dedup(true);
@@ -2925,6 +2953,9 @@ struct GlmLW {
     // `nh_l` shard — see `glm_rowsplit_attn_eligible`. TENSOR_NONE unless the knob is on and
     // this layer reaches the sparse prefill arm at the 8192 rung.
     wuv_full: u32,
+    /// `PLOW_GLM_DSA_PF_A2A`: the full derived q_absorb, so the sibling projects its band's q at
+    /// every head instead of all-to-alling it.
+    wqa_full: u32,
     wo: u32,     // o_proj (NH*VD -> H)
     wofold: u32, // DERIVED fused W_uv·W_o (NH*DK -> H), prefill ofold arm only; else NONE
     gpost: u32,  // post_attention_layernorm
@@ -3038,6 +3069,8 @@ pub(crate) struct GlmTn {
     qa_rs: u32,
     qr_rs: u32,
     oat_rs: u32,
+    /// `PLOW_GLM_DSA_PF_A2A`: peer slot 6, the sibling's q_absorb output and q all-to-all source.
+    qa_tp: u32,
     attn: u32,
     xmid: u32,
     xn2: u32,
@@ -3363,6 +3396,16 @@ fn declare_glm_rows_batched_for_prefill(
     let alltoall =
         emit_config::active().glm_rowsplit_arm() == Some(packet::devbuild::RowSplitArm::AllToAll);
     let rowsplit_attn = alltoall;
+    let a2a_pf = emit_config::active().glm_dsa_pf_a2a && tp > 1;
+    assert!(!(a2a_pf && alltoall), "PLOW_GLM_DSA_PF_A2A and PLOW_GLM_ROWSPLIT_ATTN are exclusive");
+    let qa_tp = if a2a_pf {
+        // The all-to-all peer slots 7/8 must exist with it (`check_rowsplit_attn`); NoPE has no
+        // q rope, so slot 7 is a placeholder.
+        let _ = ac(b, "qr_tp", 256);
+        ac(b, "qa_tp", rows * (nh_l * dk) as u64 * BF16)
+    } else {
+        TENSOR_NONE
+    };
     let qa = if alltoall {
         ac(b, "qa_tp", rows * (nh_l * dk) as u64 * BF16)
     } else {
@@ -3416,7 +3459,7 @@ fn declare_glm_rows_batched_for_prefill(
         !rowsplit_attn || rows % u64::from(tp) == 0,
         "PLOW_GLM_ROWSPLIT_ATTN requires the prefill row capacity to divide TP evenly (rows={rows}, tp={tp})"
     );
-    let qa_rs = if rowsplit_attn {
+    let qa_rs = if rowsplit_attn || a2a_pf {
         ac(b, "qa_rs", (rows / u64::from(tp)) * (nh * dk) as u64 * BF16)
     } else {
         TENSOR_NONE
@@ -3426,7 +3469,7 @@ fn declare_glm_rows_batched_for_prefill(
     } else {
         TENSOR_NONE
     };
-    let oat_rs = if rowsplit_attn {
+    let oat_rs = if rowsplit_attn || a2a_pf {
         ac(
             b,
             "oat_rs_tp",
@@ -4372,14 +4415,28 @@ fn declare_glm_rows_batched_for_prefill(
             // shared-expert weights already use), so no new binding-path code is needed to
             // present all `nh` heads. See `GlmLw::wuv_full`.
             wuv_full: if mla
-                && emit_config::active().glm_rowsplit_arm()
+                && (emit_config::active().glm_rowsplit_arm()
                     == Some(packet::devbuild::RowSplitArm::AllToAll)
+                    || (emit_config::active().glm_dsa_pf_a2a && tp > 1))
                 && glm_rowsplit_attn_eligible(c, l, full)
             {
                 t(
                     b,
                     "self_attn.derived.v_absorb.weight",
                     (nh * dk * vd) as u64 * BF16,
+                )
+            } else {
+                TENSOR_NONE
+            },
+            wqa_full: if mla
+                && emit_config::active().glm_dsa_pf_a2a
+                && tp > 1
+                && glm_rowsplit_attn_eligible(c, l, full)
+            {
+                t(
+                    b,
+                    "self_attn.derived.q_absorb.weight",
+                    (nh * dk * ql) as u64 * BF16,
                 )
             } else {
                 TENSOR_NONE
@@ -4810,6 +4867,7 @@ fn declare_glm_rows_batched_for_prefill(
         qa_rs,
         qr_rs,
         oat_rs,
+        qa_tp,
         attn,
         xmid,
         xn2,
@@ -7925,6 +7983,7 @@ fn emit_glm_dsa_prefill_select(
     all: &[u32],
     pre: &[u32],
     xgate: &mut u32,
+    xr_cus: &[u32],
     select: bool,
     // `PLOW_GLM_SEQ_PAR_PROJ`: `kidx_pf` (and `widx_pf` under `select`) were projected on the
     // band and all-gathered by this packet; the T-row projections from `xn` are not emitted.
@@ -7960,8 +8019,67 @@ fn emit_glm_dsa_prefill_select(
                 d.i[2] = k;
             })
         };
+    // PLOW_GLM_DSA_PF_SHARD: the query side (projection, rope, weights, quant, score, top-k) runs
+    // on this rank's `T/tp` band; the selected pool ids travel through peer slot 4 (`act.xe_tp`,
+    // unused by the pooled chain, whose band projections stay off) and one all-gather.
+    // Under the row-split sibling (PLOW_GLM_DSA_PF_A2A) the band selection stays local: the
+    // band's own rows feed its one-query gather tables, nothing is all-gathered.
+    let shard = select
+        && c.index_kpool > 1
+        && (emit_config::active().glm_dsa_pf_shard || b.rowsplit_attn());
+    let gather_ids = shard && !b.rowsplit_attn();
+    let tp = c.tp;
+    let tb = t / tp.max(1);
+    if shard {
+        let ids_bytes = u64::from(t) * u64::from(itk / c.index_kpool) * 4;
+        assert!(
+            tp > 1
+                && t % tp == 0
+                && (!gather_ids || n.xe_tp != TENSOR_NONE)
+                && !b.packed_prefill_segments()
+                && !native_fp8
+                && !emit_config::active().glm_indexer_wq_w8a8
+                && ids_bytes <= u64::from(n.slot_b),
+            "PLOW_GLM_DSA_PF_SHARD needs TP > 1, the sequence-parallel seam slots, an ordinary \
+             bucket divisible by tp, the bf16 indexer query and pool ids within one peer slot"
+        );
+    }
+    let band = |b: &mut Builder, base: u32, row_bytes: u64, tag: &str| {
+        glm_band_as(b, base, t, tp, row_bytes, tag)
+    };
     // q_idx: [T][HI*DI] from the q-latent; k_idx: [T][DI] from the input norm.
-    let c_qi = select.then(|| {
+    let c_qi = shard.then(|| {
+        let qi_b = band(b, n.qidx_pf, u64::from(hi * di) * BF16, ".qi");
+        let ql_b = band(b, n.qlat, u64::from(ql) * BF16, ".ql");
+        let pos_b = band(b, n.pos, 4, "");
+        let op = pick_tile(tb, hi * di, ql, n_cu, kernelcaps::QuantScheme::None);
+        let c_q0 = b.emit(op, all.to_vec(), &[pre[1]], |d| {
+            d.t[0] = qi_b;
+            d.t[1] = ql_b;
+            d.t[2] = w.iwqb;
+            d.i[0] = tb;
+            d.i[1] = hi * di;
+            d.i[2] = ql;
+        });
+        b.emit(DevOp::HeadNormRope, all.to_vec(), &[c_q0], |d| {
+            d.t[0] = qi_b;
+            d.t[1] = qi_b;
+            d.t[2] = TENSOR_NONE;
+            d.t[3] = n.icos;
+            d.t[4] = n.isin;
+            d.t[5] = pos_b;
+            d.i[0] = tb;
+            d.i[1] = hi;
+            d.i[2] = di;
+            d.i[3] = 0;
+            d.i[4] = 1;
+            d.i[5] = 1;
+            d.f[0] = c.eps;
+            d.j[0] = 0;
+            d.j[1] = KV_MASK_NONE;
+        })
+    });
+    let c_qi = c_qi.or_else(|| select.then(|| {
         let blk_q0 = if emit_config::active().glm_indexer_wq_w8a8 {
             Some(emit_glm_indexer_wq_w8a8(
                 b,
@@ -8007,7 +8125,7 @@ fn emit_glm_dsa_prefill_select(
             d.j[0] = 0;
             d.j[1] = KV_MASK_NONE;
         })
-    });
+    }));
     // PLOW_GLM_DSA_KW_DUAL: wk and weights_proj as ONE GemmSmall packet (t3/t4/i3 = the second
     // GEMM), their tiles sharing the workgroups; per-element arithmetic unchanged.
     let small =
@@ -8093,14 +8211,25 @@ fn emit_glm_dsa_prefill_select(
                 d.i[2] = h;
             },
         );
-        let c_w = select.then(|| b.emit(DevOp::GemvF32, all.to_vec(), &[pre[0]], |d| {
-            d.t[0] = n.widx_f32_pf;
-            d.t[1] = n.xn;
-            d.t[2] = w.iwp_f32;
-            d.i[0] = t;
-            d.i[1] = hi;
-            d.i[2] = h;
-        }));
+        let c_w = select.then(|| {
+            let (wo, xi, rows) = if shard {
+                (
+                    band(b, n.widx_f32_pf, u64::from(hi) * 4, ".w"),
+                    band(b, n.xn, u64::from(h) * BF16, ".xn"),
+                    tb,
+                )
+            } else {
+                (n.widx_f32_pf, n.xn, t)
+            };
+            b.emit(DevOp::GemvF32, all.to_vec(), &[pre[0]], |d| {
+                d.t[0] = wo;
+                d.t[1] = xi;
+                d.t[2] = w.iwp_f32;
+                d.i[0] = rows;
+                d.i[1] = hi;
+                d.i[2] = h;
+            })
+        });
         let chunk_pools = t / c.index_kpool;
         let packed = b.packed_prefill_segments();
         assert!(!(packed && select), "pooled sparse prefill has no per-span selection");
@@ -8172,11 +8301,21 @@ fn emit_glm_dsa_prefill_select(
         let Some(c_w) = c_w else {
             return c_comp;
         };
+        let (qf, qs, qr, qrows) = if shard {
+            (
+                band(b, n.q_fp8_pf, u64::from(hi * di), ".qf"),
+                band(b, n.q_scale_pf, u64::from(hi) * 4, ".qs"),
+                band(b, n.qidx_pf, u64::from(hi * di) * BF16, ".qi"),
+                tb,
+            )
+        } else {
+            (n.q_fp8_pf, n.q_scale_pf, n.qidx_pf, t)
+        };
         let c_qq = b.emit(DevOp::DsaQQuant, all.to_vec(), &[c_qi.unwrap()], |d| {
-            d.t[0] = n.q_fp8_pf;
-            d.t[1] = n.q_scale_pf;
-            d.t[2] = n.qidx_pf;
-            d.i[0] = t * hi;
+            d.t[0] = qf;
+            d.t[1] = qs;
+            d.t[2] = qr;
+            d.i[0] = qrows * hi;
             d.i[1] = di;
         });
         let pool_stride = ctx.div_ceil(c.index_kpool);
@@ -8198,6 +8337,7 @@ fn emit_glm_dsa_prefill_select(
                 d.i[3] = di;
                 d.i[4] = c.index_kpool;
                 d.i[5] = 1;
+                d.i[6] = if shard { tb } else { 0 };
                 d.f[0] = (di as f32).powf(-0.5) * (hi as f32).powf(-0.5);
             },
         );
@@ -8211,15 +8351,41 @@ fn emit_glm_dsa_prefill_select(
             (0..n_cu.min(t)).collect::<Vec<_>>(),
             &[c_sc],
             |d| {
-                d.t[0] = n.iidx_pool_pf;
+                d.t[0] = if gather_ids { n.xe_tp } else { n.iidx_pool_pf };
                 d.t[1] = n.iscore_pf;
                 d.t[2] = n.kvlen;
                 d.i[0] = t;
                 d.i[1] = itk_pool;
                 d.i[2] = pool_stride;
                 d.i[3] = c.index_kpool;
+                d.i[6] = if shard { tb } else { 0 };
             },
         );
+        if b.rowsplit_attn() {
+            return b.emit(DevOp::DsaPoolExpand, all.to_vec(), &[c_se], |d| {
+                d.t[0] = n.iuni;
+                d.t[1] = n.iidx_pool_pf;
+                d.t[2] = n.kvlen;
+                d.i[0] = t;
+                d.i[1] = itk_pool;
+                d.i[2] = c.index_kpool;
+                d.i[3] = 2;
+                d.i[4] = tb;
+                d.i[5] = glm_dsa_a2a_cap(c, ctx);
+            });
+        }
+        let c_se = if gather_ids {
+            crate::emit_xall_gather(
+                b,
+                xgate,
+                xr_cus,
+                &[c_se],
+                &[(n.iidx_pool_pf, t * itk_pool * 2, 4 * n.slot_b)],
+                tp,
+            )
+        } else {
+            c_se
+        };
         // INDEX TABLE (prefill, consumed by IndexUnionPf and sparse prefill flash): `n.iidx_pf`
         // is i32 [t][W], W = glm_dsa_select_width = (index_topk/kpool)*kpool + kpool-1 = 2051.
         // Row r (query position kv_len-t+r) holds slots [0, 2048) = the selected pools p in
@@ -8560,6 +8726,101 @@ fn emit_glm_rowband_q(
     (c_qa, c_qr)
 }
 
+/// `PLOW_GLM_DSA_PF_A2A` gather-table width: one query's selection, padded to the gather
+/// kernel's 64-key chunk.
+fn glm_dsa_a2a_cap(c: &GlmCfg, ctx: u32) -> u32 {
+    glm_dsa_select_width(c, ctx).div_ceil(64) * 64
+}
+
+/// `PLOW_GLM_DSA_PF_A2A` (GLM-5.3 NoPE pooled sparse prefill, row-split sibling): the q
+/// all-to-all turns this rank's `[t][nh_l][dk]` (peer slot 6) into its band `[t/tp][nh][dk]`;
+/// the gather flash walks each band query's own selection with that query's `nh` heads as
+/// `nh/nh_l` eight-head groups (virtual 8-query packs, `d_dsa_pool_expand_table`); the fold runs
+/// at `nh` heads against the full W_uv; the O all-to-all (peer slot 8) returns `[t][nh_l][vd]`
+/// to `n.oat`, so o_proj and the seam are unchanged.
+#[allow(clippy::too_many_arguments)]
+fn emit_glm53_a2a_attn(
+    b: &mut Builder,
+    c: &GlmCfg,
+    n: &GlmTn,
+    w: &GlmLW,
+    t: u32,
+    ctx: u32,
+    slot: usize,
+    fl_deps: &[u32],
+    xgate: &mut u32,
+    xr_cus: &[u32],
+) -> u32 {
+    let (tp, nh, dk, vd) = (c.tp, c.heads, c.kv_lora, c.v_head);
+    let nh_l = nh / tp;
+    let rows = t / tp;
+    assert!(
+        c.qk_rope == 0
+            && dk == 512
+            && nh_l == 8
+            && nh % nh_l == 0
+            && t % tp == 0
+            && !glm_fp8_kv()
+            && n.qa_tp != TENSOR_NONE
+            && n.qa_rs != TENSOR_NONE
+            && n.oat_rs != TENSOR_NONE
+            && w.wuv_full != TENSOR_NONE
+            && w.wqa_full != TENSOR_NONE,
+        "PLOW_GLM_DSA_PF_A2A needs the bf16 NoPE latent-512 MLA at 8 heads per rank"
+    );
+    let all = b.all();
+    // q is already this band's at every head (the q_absorb band GEMM above).
+    let c_fl = b.emit(DevOp::FlashMlaPrefill, all.clone(), fl_deps, |d| {
+        d.t[0] = n.opart;
+        d.t[1] = n.mlpart;
+        d.t[2] = n.qa_rs;
+        d.t[3] = n.qa_rs;
+        d.t[4] = n.ckv[slot];
+        d.t[5] = n.ckv[slot];
+        d.t[6] = n.kvlen;
+        d.t[7] = n.iuni;
+        d.i[0] = 1;
+        d.i[1] = nh_l;
+        d.i[2] = ctx;
+        d.i[3] = 1u32 << 31;
+        d.i[4] = rows * (nh / nh_l);
+        d.i[5] = KV_MASK_NONE;
+        d.i[6] = glm_dsa_a2a_cap(c, ctx);
+        d.i[7] = glm_gf_prefill(ctx, nh_l);
+        d.f[0] = c.attn_scale;
+    });
+    let c_fold = b.emit(
+        DevOp::MlaMergeFold,
+        mla_fold_cus(&all, rows * nh, vd),
+        &[c_fl],
+        |d| {
+            d.t[0] = n.oat_rs;
+            d.t[1] = n.opart;
+            d.t[2] = n.mlpart;
+            d.t[3] = w.wuv_full;
+            d.i[0] = rows;
+            d.i[1] = nh;
+            d.i[2] = vd;
+            d.i[4] = 1;
+        },
+    );
+    crate::emit_xalltoall_heads(
+        b,
+        xgate,
+        xr_cus,
+        &[c_fold],
+        n.oat,
+        rows,
+        nh_l,
+        vd,
+        nh,
+        tp,
+        8 * n.slot_b,
+        1,
+        nh,
+    )
+}
+
 /// Query-row-split sparse attention for the GLM 8192 rung (`PLOW_GLM_ROWSPLIT_ATTN`,
 /// `reports/rowsplit-attention-design.md`). Two all-to-alls over heads (`DevOp::XAllToAllHeads`,
 /// opcode 160) bracket one sparse attention call and its merge-fold, all run at `nh` (every
@@ -8866,10 +9127,13 @@ pub(crate) fn emit_glm_mla_prefill(
     };
     // Pooled packed programs stay dense (the pooled selection has no per-span form) and only
     // write the pool cache per span.
+    // PLOW_GLM_DSA_PF_A2A: only the row-split sibling is sparse; the ordinary rung is dense.
+    let a2a = cfg.glm_dsa_pf_a2a && tp > 1;
     let sparse = glm_dsa_pf_bucket(c, t)
         && (w.iwk != TENSOR_NONE || reuses)
         && nh_l == 8
-        && !(b.packed_prefill_segments() && c.index_kpool > 1);
+        && !(b.packed_prefill_segments() && c.index_kpool > 1)
+        && (!a2a || b.rowsplit_attn());
     // Row-split sparse attention (`PLOW_GLM_ROWSPLIT_ATTN`, the 8192 rung only): only the
     // bucket's row-split sibling program carries it (`Builder::rowsplit_attn`); `w.wuv_full` is
     // TENSOR_NONE unless `glm_rowsplit_attn_eligible` agreed this layer reaches the sparse arm.
@@ -8888,7 +9152,9 @@ pub(crate) fn emit_glm_mla_prefill(
         use_rowsplit && b.rowsplit_arm() == Some(packet::devbuild::RowSplitArm::Replicated);
     let rb = rowband.then(|| RowBandTn::declare(b, c, slot, t));
     // Dense prefill still feeds sparse decode's key cache, including short tail buckets.
-    let idx_chain = w.iwk != TENSOR_NONE && (sparse || c.dsa(ctx));
+    // ...and the dense A2A rung still writes the pool cache the sibling's later chunks score.
+    let idx_chain = w.iwk != TENSOR_NONE
+        && (sparse || c.dsa(ctx) || (a2a && glm_dsa_pf_bucket(c, t) && !b.packed_prefill_segments()));
 
     // 1 input_layernorm, T rows (on the band + all-gather under the sequence-parallel seams).
     // Under `raw_output` (GLM-5.3's hyper-connection program) the seam is the mHC band seam:
@@ -9174,7 +9440,7 @@ pub(crate) fn emit_glm_mla_prefill(
         None if w.qkva_cat != TENSOR_NONE && emit_config::active().pf_gemm_route_all => {
             crate::kda::emit_pf_gemm_route(
             b,
-            n.qa,
+            if use_rowsplit && a2a { n.qa_tp } else { n.qa },
             n.qlat,
             w.wqa,
             t,
@@ -9183,7 +9449,29 @@ pub(crate) fn emit_glm_mla_prefill(
             &[c_rnq],
             )
         }
-        None => gemm(b, n.qa, n.qlat, w.wqa, w.wqa_s, nh_l * dk, ql, &[c_rnq]),
+        // A2A sibling: this rank's band q at every head, straight into the flash's operand.
+        None if use_rowsplit && a2a => {
+            let ql_b = glm_band_as(b, n.qlat, t, tp, u64::from(ql) * BF16, ".ql");
+            let op = pick_tile(t / tp, nh * dk, ql, n_cu, kernelcaps::QuantScheme::None);
+            b.emit(op, all.clone(), &[c_rnq], |d| {
+                d.t[0] = n.qa_rs;
+                d.t[1] = ql_b;
+                d.t[2] = w.wqa_full;
+                d.i[0] = t / tp;
+                d.i[1] = nh * dk;
+                d.i[2] = ql;
+            })
+        }
+        None => gemm(
+            b,
+            if use_rowsplit && a2a { n.qa_tp } else { n.qa },
+            n.qlat,
+            w.wqa,
+            w.wqa_s,
+            nh_l * dk,
+            ql,
+            &[c_rnq],
+        ),
     };
     // PLOW_GLM_FUSE_POST: the q RoPE rides the q_rope `GemmMed` store (t3..t5, i3 = first roped
     // column), so its `HeadNormRope` is not emitted.
@@ -9359,6 +9647,7 @@ pub(crate) fn emit_glm_mla_prefill(
             &all,
             &[c_rn1, c_rnq],
             xgate,
+            xr_cus,
             sparse,
             proj_g.and_then(|(_, gi)| gi),
             fp8_q.map(|(_, quant)| quant),
@@ -9472,7 +9761,9 @@ pub(crate) fn emit_glm_mla_prefill(
         let g = emit_glm_dcp_gather(b, xgate, n, slot, false, t, ctx, &fl_deps.clone());
         fl_deps.push(g);
     }
-    let c_uv = if use_rowsplit {
+    let c_uv = if use_rowsplit && a2a {
+        emit_glm53_a2a_attn(b, c, n, w, t, ctx, slot, &fl_deps, xgate, xr_cus)
+    } else if use_rowsplit {
         emit_glm_rowsplit_attn(
             b,
             c,

@@ -155,7 +155,9 @@ pub(super) fn routes(
     segments: usize,
 ) -> Result<Vec<Option<Route>>> {
     let mut out = vec![None; segments];
-    if prog.role.is_token_batch_body() || prog.role.is_rowsplit_sibling() {
+    // A GLM-5 row-split sibling's 64-head flash is not eligible below; the GLM-5.3 A2A
+    // sibling's virtual eight-head gather is.
+    if prog.role.is_token_batch_body() {
         return Ok(out);
     }
     let mut seg_inst: Vec<Option<Option<usize>>> = vec![None; segments];

@@ -1210,6 +1210,9 @@ extern "C" __device__ unsigned plow_glm_hc_pre_tail_arm = 1;
 #ifndef PLOW_DSA_KPOOL_MFMA
 #define PLOW_DSA_KPOOL_MFMA 1
 #endif
+#ifndef PLOW_DSA_KPOOL_ROWWAVE
+#define PLOW_DSA_KPOOL_ROWWAVE 0
+#endif
 #ifndef PLOW_DSA_QQUANT_WAVE
 #define PLOW_DSA_QQUANT_WAVE 1
 #endif
@@ -4606,6 +4609,14 @@ __device__ static void plow_exec(CInst in_v, unsigned slice, CTens T_v, plow_sme
                                         slice * PLOW_THREADS + threadIdx.x, nblk * PLOW_THREADS);
                 break;
             }
+            if (in->i[3] == 2u) {
+                /* i4 = band rows, i5 = table cap: this rank's band as one-query gather tables. */
+                d_dsa_pool_expand_table((unsigned char*)TEN(0), (const int32_t*)TEN(1),
+                                        (const int32_t*)TEN(2), in->i[0], in->i[1], in->i[2],
+                                        prog_meta->rank * in->i[4], in->i[4], in->i[5], slice,
+                                        nblk);
+                break;
+            }
             d_dsa_pool_expand((int32_t*)TEN(0), (const int32_t*)TEN(1), (const int32_t*)TEN(2),
                               in->i[0], in->i[1], in->i[2], slice, nblk);
             break;
@@ -4664,6 +4675,19 @@ __device__ static void plow_exec(CInst in_v, unsigned slice, CTens T_v, plow_sme
                 bf16* qlds = (bf16*)sm->raw;
                 bf16* ktile = qlds + HI_ * QSTRIDE;
                 float* wlds = (float*)(ktile + TILE_N * KSTRIDE);
+#if PLOW_DSA_KPOOL_ROWWAVE
+                if (in->i[5] != 0u) {
+                    /* i6 = band rows (PLOW_GLM_DSA_PF_SHARD): this rank's rows only. */
+                    const unsigned rb = in->i[6] ? prog_meta->rank * in->i[6] : 0u;
+                    d_index_score_kpool_rowwave<DI_, HI_, TILE_N>(
+                        (float*)TEN(0), (const uint8_t*)TEN(1), (const float*)TEN(2),
+                        (const uint8_t*)TEN(3), (const float*)TEN(4), (const float*)TEN(5),
+                        (const int*)TEN(6), in->i[0], in->i[2], in->i[4], in->fj[0].f, slice,
+                        nblk, ktile, wlds + HI_, rb, in->i[6] ? rb + in->i[6] : ~0u);
+                    break;
+                }
+#endif
+                if (in->i[6] != 0u) __builtin_trap(); /* band score needs the rowwave arm */
                 d_index_score_kpool_mfma<DI_, HI_, TILE_N>(
                     (float*)TEN(0), (const uint8_t*)TEN(1), (const float*)TEN(2),
                     (const uint8_t*)TEN(3), (const float*)TEN(4), (const float*)TEN(5),
@@ -5587,18 +5611,19 @@ __device__ static void plow_exec(CInst in_v, unsigned slice, CTens T_v, plow_sme
                 break;
             }
 #endif
+            /* i6 = band rows (PLOW_GLM_DSA_PF_SHARD): this rank's rows only. */
+            const unsigned rb = in->i[6] ? prog_meta->rank * in->i[6] : 0u;
+            const unsigned re = in->i[6] ? rb + in->i[6] : ~0u;
 #if PLOW_DSA_SELECT_V2
-            if (pool_size == 1u) {
-                d_index_select_pf_v2((int*)TEN(0), (const float*)TEN(1), (const int*)TEN(2),
-                                     in->i[0], in->i[1], in->i[2], slice, nblk,
-                                     (unsigned*)sm->raw, (unsigned*)sm->raw + 4096);
-                break;
-            }
+            d_index_select_pf_v2((int*)TEN(0), (const float*)TEN(1), (const int*)TEN(2),
+                                 in->i[0], in->i[1], in->i[2], slice, nblk, (unsigned*)sm->raw,
+                                 (unsigned*)sm->raw + 4096, pool_size, rb, re);
+            break;
 #endif
             d_index_select_pf<PLOW_DSA_IDX_ROW != 0>(
                 (int*)TEN(0), (const float*)TEN(1), (const int*)TEN(2), in->i[0],
                               in->i[1], in->i[2], slice, nblk, (unsigned*)sm->raw,
-                              (unsigned*)sm->raw + 256, pool_size);
+                              (unsigned*)sm->raw + 256, pool_size, rb, re);
             break;
         }
 #endif

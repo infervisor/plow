@@ -682,6 +682,7 @@ pub const RUNTIME: &[KnobSpec] = &[
     KnobSpec::new("rt.token_batch_rows", Some("PLOW_TOKEN_BATCH_ROWS"), Layer::Runtime, U32, UNSET, OPT_IN),
     KnobSpec::new("rt.decode_min_rung", Some("PLOW_DECODE_MIN_RUNG"), Layer::Runtime, U32, UNSET, DIAG).scoped(DECODE_MIN_RUNG_SCOPE),
     KnobSpec::new("rt.tail_sparse_ctx", Some("PLOW_AMD_TAIL_SPARSE_CTX"), Layer::Runtime, U32, UNSET, OPT_IN).scoped(TAIL_SPARSE_SCOPE),
+    KnobSpec::new("rt.dsa_pf_min_ctx", Some("PLOW_GLM_DSA_PF_MIN_CTX"), Layer::Runtime, U32, UNSET, OPT_IN),
     KnobSpec::new("rt.tail_sparse_min_pairs", Some("PLOW_AMD_TAIL_SPARSE_MIN_PAIRS"), Layer::Runtime, U32, UNSET, OPT_IN).scoped(TAIL_SPARSE_SCOPE),
     KnobSpec::new("rt.token_batch_wide_tiles", Some("PLOW_TOKEN_BATCH_WIDE"), Layer::Runtime, Domain::Bool, OFF, OPT_IN),
     KnobSpec::new("rt.ragged_chunk", Some("PLOW_RAGGED_CHUNK"), Layer::Runtime, Domain::Bool, ON, DIAG),

@@ -409,6 +409,11 @@ pub(crate) fn rebase_chunk_rows(
         {
             continue;
         }
+        // PLOW_GLM_DSA_PF_A2A: the band gather flash counts virtual rows (band x head groups);
+        // `rebase_band_rows` sizes it with the band.
+        if is_a2a_flash(d, names) {
+            continue;
+        }
         match prefill_row_field(op) {
             Some(RowField::Rows(f)) if d.i[f] == t => d.i[f] = clen,
             Some(RowField::RowsTimes(f)) if d.i[f] > 0 && d.i[f] % t == 0 => {
@@ -417,6 +422,12 @@ pub(crate) fn rebase_chunk_rows(
             _ => {}
         }
     }
+}
+
+/// The `PLOW_GLM_DSA_PF_A2A` band gather flash: its q is the all-to-all's `act.qa_rs`.
+fn is_a2a_flash(d: &DevInst64, names: &[String]) -> bool {
+    d.op == DevOp::FlashMlaPrefill as u16
+        && names.get(d.t[2] as usize).is_some_and(|n| n == "act.qa_rs")
 }
 
 /// Rows of each rank's band when a `t`-row sequence-parallel bucket carries `clen` live rows
@@ -449,6 +460,36 @@ pub(crate) fn rebase_band_rows(
         }
     };
     for d in insts.iter_mut() {
+        // PLOW_GLM_DSA_PF_SHARD: the band score/select (i6 = band rows) follow the band, so
+        // their rows match the rescaled pool-id all-gather slices.
+        if (d.op == DevOp::IndexScoreKpool as u16 || d.op == DevOp::IndexSelectPf as u16)
+            && d.i[6] == tb
+        {
+            d.i[6] = b;
+        }
+        // PLOW_GLM_DSA_PF_A2A: the band tables, both all-to-alls, the band flash and fold.
+        if d.op == DevOp::DsaPoolExpand as u16 && d.i[3] == 2 && d.i[4] == tb {
+            d.i[4] = b;
+        }
+        if d.op == DevOp::XAllToAllHeads as u16 && d.i[0] == tb {
+            d.i[0] = b;
+        }
+        if names.get(d.t[0] as usize).is_some_and(|n| n == "act.qa_rs") {
+            if let Some(RowField::Rows(f)) = prefill_row_field(d.op) {
+                if d.i[f] == tb {
+                    d.i[f] = b;
+                }
+            }
+        }
+        if d.op == DevOp::MlaMergeFold as u16
+            && d.i[0] == tb
+            && names.get(d.t[0] as usize).is_some_and(|n| n == "act.oat_rs_tp")
+        {
+            d.i[0] = b;
+        }
+        if is_a2a_flash(d, names) && d.i[4] % tb == 0 {
+            d.i[4] = d.i[4] / tb * b;
+        }
         if d.op == DevOp::XReduceScatter as u16 {
             d.i[0] = rescale(d.i[0], t, tp * b);
         } else if d.op == DevOp::XAllGather as u16 {

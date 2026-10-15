@@ -1164,6 +1164,26 @@ struct KdaCarryMultiArgs {
 const KDA_CARRY_MULTI_SPANS: usize = 16;
 const _: () = assert!(std::mem::size_of::<KdaCarryMultiArgs>() == 280);
 
+/// Per segment, `Op*count` of the instructions its stream entries run (diagnostic).
+fn segment_op_summary(p: &DevProg) -> Vec<String> {
+    let n = p.stream.iter().map(|e| e.seg as usize + 1).max().unwrap_or(0);
+    let mut sets = vec![std::collections::BTreeSet::new(); n];
+    for e in &p.stream {
+        sets[e.seg as usize].insert(e.inst as usize);
+    }
+    sets.into_iter()
+        .map(|set| {
+            let mut c = std::collections::BTreeMap::<String, usize>::new();
+            for i in set {
+                let op = p.insts[i].op;
+                let name = DevOp::from_u16(op).map_or(format!("op{op}"), |o| format!("{o:?}"));
+                *c.entry(name).or_default() += 1;
+            }
+            c.into_iter().map(|(k, v)| format!("{k}*{v}")).collect::<Vec<_>>().join("+")
+        })
+        .collect()
+}
+
 /// Shortest segment of the split carry.
 const KDA_CARRY_SPLIT_MIN_SEG: u32 = 1024;
 
@@ -7178,6 +7198,8 @@ struct AmdProg {
     decode_routes: Vec<DecodeSegmentRoute>,
     /// Optional raw gfx950 route for a pure MXFP4 grouped-MoE Down+Combine segment.
     prefill_routes: Vec<PrefillSegmentRoute>,
+    /// `PLOW_PREFILL_SEG_TIMING` only: each segment's instruction ops, `Op*count` (diagnostic).
+    seg_ops: Vec<String>,
     /// `PLOW_SEG_GEOM` per segment: the interpreter launch's override, and the raw route's grid
     /// (0 = shipped). Empty when unset.
     seg_geom_interp: Vec<seg_geom::SegGeom>,
@@ -7271,6 +7293,9 @@ pub struct AmdEngine {
     rowsplit_sibling: Vec<Option<usize>>,
     /// Per program: a row-split sibling on the row-band arm (no head all-to-all).
     rowband_sibling: Vec<bool>,
+    /// Per program: a `PLOW_GLM_DSA_PF_A2A` sibling (pooled interpreter selection feeding the
+    /// gather flash object; no native sparse route needed).
+    a2a_sibling: Vec<bool>,
     /// `--glm-rowband` as read at engine build. Serve-start only: with it off the packet's
     /// full-width twins were never bound, so the siblings must never be dispatched either.
     rowband_on: bool,
@@ -7356,6 +7381,8 @@ pub struct AmdEngine {
     k_gemm_group: Option<HsaKernel>,
     k_mla_pf_dense: Option<HsaKernel>,
     k_mla_pf_gather: Option<HsaKernel>,
+    /// `PLOW_GLM_DSA_PF_MIN_CTX`: this chunk's sparse rung runs dense (selection Nop'd).
+    dsa_pf_dense_chunk: bool,
     k_kda_chunk_wu_lean_keys: Option<HsaKernel>,
     k_kda_chunk_carry_keyfeed: Option<HsaKernel>,
     k_kda_spans: KdaSpansKernels,
@@ -12273,6 +12300,11 @@ impl AmdEngine {
                 },
                 decode_routes,
                 prefill_routes,
+                seg_ops: if crate::config::RuntimeConfig::get().amd.prefill_seg_timing {
+                    segment_op_summary(p)
+                } else {
+                    Vec::new()
+                },
                 seg_geom_interp: Vec::new(),
                 seg_geom_route: Vec::new(),
                 union_skip,
@@ -12344,6 +12376,17 @@ impl AmdEngine {
             .map(|p| {
                 p.role.is_rowsplit_sibling()
                     && !p.insts.iter().any(|d| d.op == DevOp::XAllToAllHeads as u16)
+            })
+            .collect();
+        let a2a_sibling: Vec<bool> = blob
+            .progs
+            .iter()
+            .map(|p| {
+                p.role.is_rowsplit_sibling()
+                    && p
+                        .insts
+                        .iter()
+                        .any(|d| d.op == DevOp::DsaPoolExpand as u16 && d.i[3] == 2)
             })
             .collect();
         let decode = *decode_ladder.last().ok_or_else(|| {
@@ -13014,6 +13057,7 @@ impl AmdEngine {
             dense_exact_select,
             rowsplit_sibling,
             rowband_sibling,
+            a2a_sibling,
             rowband_on,
             devp,
             _weight_slab: weight_slab,
@@ -13044,6 +13088,7 @@ impl AmdEngine {
             k_gemm_group,
             k_mla_pf_dense,
             k_mla_pf_gather,
+            dsa_pf_dense_chunk: false,
             k_kda_chunk_wu_lean_keys,
             k_kda_chunk_carry_keyfeed,
             k_kda_spans,
@@ -14302,7 +14347,7 @@ impl AmdEngine {
             let kernel = self.k_mla_pf_dense.ok_or_else(|| {
                 RuntimeError::Device("dense MLA prefill segment has no loaded object".into())
             })?;
-            if let Some(mut g) = route.gather_args() {
+            if let Some(mut g) = route.gather_args().filter(|_| !self.dsa_pf_dense_chunk) {
                 if active {
                     return Err(RuntimeError::Device(
                         "sparse MLA prefill gather has no packed-span form".into(),
@@ -16613,6 +16658,31 @@ impl AmdEngine {
             self.progs[prog].t,
             bucket.or_else(|| self.ragged_bucket(prog)),
         );
+        self.dsa_pf_dense_chunk = false;
+        if crate::config::RuntimeConfig::get()
+            .amd
+            .dsa_pf_min_ctx
+            .is_some_and(|min| c0 + clen <= min)
+        {
+            for d in insts.iter_mut() {
+                let op = d.op;
+                // The indexer query side (projection, rope, head weights) feeds only the
+                // selection; the key side still writes the pool cache later chunks score.
+                let q_side = self.tensor_names.get(d.t[0] as usize).is_some_and(|n| {
+                    n.starts_with("act.qidx_pf") || n.starts_with("act.widx_f32_pf")
+                });
+                let skip = op == DevOp::DsaQQuant as u16
+                    || (op == DevOp::IndexScoreKpool as u16 && d.i[5] != 0)
+                    || op == DevOp::IndexSelectPf as u16
+                    || (op == DevOp::DsaPoolExpand as u16 && d.i[3] != 1)
+                    || op == DevOp::IndexUnionPf as u16
+                    || q_side;
+                if skip {
+                    d.op = DevOp::Nop as u16;
+                    self.dsa_pf_dense_chunk = true;
+                }
+            }
+        }
         if let (true, Some(tp)) = (
             crate::config::RuntimeConfig::get().amd_ragged_seams(),
             self.tp,
@@ -16795,10 +16865,28 @@ impl AmdEngine {
             .get(step.prog)
             .copied()
             .flatten()
-            .filter(|_| self.sparse_mla.is_some())
+            .filter(|&s| self.sparse_mla.is_some() || self.a2a_sibling[s])
             .filter(|_| self.rowband_on);
         let rowband = sibling.is_some_and(|s| self.rowband_sibling[s]);
-        let prog = rowsplit_chunk_prog(step, self.progs[step.prog].t, sibling, rowband);
+        let mut prog = rowsplit_chunk_prog(step, self.progs[step.prog].t, sibling, rowband);
+        // The A2A sibling also takes a ragged chunk: its bands follow PLOW_AMD_RAGGED_SEAMS.
+        if let Some(s) = sibling.filter(|&s| {
+            self.a2a_sibling[s]
+                && step.c0 >= amd_sparse_mla::SPAN_MIN_PRIOR
+                && step.clen < self.progs[step.prog].t
+                && crate::config::RuntimeConfig::get().amd_ragged_seams()
+        }) {
+            prog = s;
+        }
+        // PLOW_GLM_DSA_PF_A2A: chunks ending at or below PLOW_GLM_DSA_PF_MIN_CTX stay dense.
+        if self.a2a_sibling.get(prog).copied().unwrap_or(false)
+            && crate::config::RuntimeConfig::get()
+                .amd
+                .dsa_pf_min_ctx
+                .is_some_and(|min| step.c0 + step.clen <= min)
+        {
+            prog = step.prog;
+        }
         if prog != step.prog {
             static SAID: std::sync::Once = std::sync::Once::new();
             SAID.call_once(|| {
@@ -18509,6 +18597,10 @@ impl AmdEngine {
     }
 
     /// Ordered host launches and their device-side XCD queue layout.
+    pub(crate) fn segment_ops(&self, p: usize, seg: usize) -> &str {
+        self.progs[p].seg_ops.get(seg).map_or("", String::as_str)
+    }
+
     pub(crate) fn prog_dispatch(&self, p: usize) -> ProgramDispatch {
         let g = &self.progs[p];
         ProgramDispatch::classify(

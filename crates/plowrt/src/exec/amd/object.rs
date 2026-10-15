@@ -2397,7 +2397,7 @@ pub(super) fn check_xalltoall_heads(
 ) -> Result<()> {
     let err = || {
         RuntimeError::Device(
-            "row-split attention's head/row all-to-all requires gfx942 TP8 with \
+            "row-split attention's head/row all-to-all requires gfx942/gfx950 TP8 with \
              self-consistent row/head geometry"
                 .into(),
         )
@@ -2410,7 +2410,7 @@ pub(super) fn check_xalltoall_heads(
         {
             let (rpr, nh_l, dsz, nh_total, n_gpu, dir, hg) =
                 (d.i[0], d.i[1], d.i[2], d.i[3], d.i[5], d.i[7], d.fj[1]);
-            if arch != "gfx942"
+            if !matches!(arch, "gfx942" | "gfx950")
                 || n_gpu != 8
                 || dir > 1
                 || rpr == 0
