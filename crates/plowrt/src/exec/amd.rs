@@ -4115,6 +4115,7 @@ pub(crate) struct LtFusedRoute {
 }
 
 const LT_FUSE_KS: u32 = 512;
+const LT_FUSE_WAVES: u32 = 8;
 const LT_FUSE_SCRATCH: u64 = 32 << 20;
 
 fn lt_fuse_blocks(r: &LtFusedRoute) -> u32 {
@@ -9734,7 +9735,7 @@ impl AmdEngine {
 
         let (k_inproj, d_inproj) = if crate::config::RuntimeConfig::get().amd.lt_fuse {
             const NAME: &str = "glm_inproj_gfx950.elf";
-            const MARKER: &str = "plow_glm_inproj_abi_1";
+            const MARKER: &str = "plow_glm_inproj_abi_2";
             let path = hsaco_dir.join(NAME);
             let image = std::fs::read(&path).map_err(|e| {
                 RuntimeError::Device(format!(
@@ -16194,8 +16195,8 @@ impl AmdEngine {
                 // runtime/amd/glm_inproj.hip: m rows of (KS + 8) bf16.
                 self.be.launch_3d_lds(
                     kp,
-                    [args.blocks.div_ceil(4), r.k / LT_FUSE_KS, 1],
-                    256,
+                    [args.blocks.div_ceil(LT_FUSE_WAVES), r.k / LT_FUSE_KS, 1],
+                    (LT_FUSE_WAVES * 64) as u16,
                     r.m * (LT_FUSE_KS + 8) * 2,
                     as_bytes(std::slice::from_ref(&args)),
                 )?;

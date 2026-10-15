@@ -3,7 +3,7 @@
  * (q/k/v 1024, g_a/f_a 128, b 8 columns per rank): separate hipBLASLt launches leave most of the
  * GPU idle at M <= 128. Here every 16-column block of every part is one wave of one split-K slice.
  *
- * plow_glm_inproj_partial: grid (ceil(blocks/4), S). The workgroup stages its [M, K/S] slice of x
+ * plow_glm_inproj_partial: grid (ceil(blocks/INPROJ_WAVES), S). The workgroup stages its [M, K/S] slice of x
  * in LDS once; each wave streams one 16-column block of weights (all of its K/S slice issued up
  * front) and writes f32 partials[s][m][col].
  * plow_glm_inproj_reduce: sums the S partials in s order, rounds once to bf16, scatters to the
@@ -11,10 +11,11 @@
 #include <hip/hip_runtime.h>
 #if defined(__HIP_DEVICE_COMPILE__)
 #include "amd_common.h"
-extern "C" __device__ unsigned plow_glm_inproj_abi_1 = 1;
+extern "C" __device__ unsigned plow_glm_inproj_abi_2 = 1;
 #endif
 
 #define INPROJ_KS 512u
+#define INPROJ_WAVES 8u
 #define INPROJ_MAXM 128u
 #define INPROJ_LDS_STRIDE (INPROJ_KS + 8u)
 
@@ -46,14 +47,14 @@ __device__ __forceinline__ unsigned inproj_part(const InprojArgs& a, unsigned b)
 }
 #endif
 
-extern "C" __global__ __launch_bounds__(256, 1) void plow_glm_inproj_partial(InprojArgs a) {
+extern "C" __global__ __launch_bounds__(INPROJ_WAVES * 64u, 1) void plow_glm_inproj_partial(InprojArgs a) {
 #if defined(__HIP_DEVICE_COMPILE__) && defined(__gfx950__)
     /* Dynamic LDS sized by the host to m rows, so narrow rungs keep several workgroups per CU. */
     extern __shared__ __align__(16) bf16 xs[];
     const unsigned s = blockIdx.y, kb = s * INPROJ_KS;
     const unsigned lane = threadIdx.x & 63u, wave = threadIdx.x >> 6;
     const unsigned r = lane & 15u, kg = lane >> 4;
-    const unsigned b = blockIdx.x * 4u + wave;
+    const unsigned b = blockIdx.x * INPROJ_WAVES + wave;
     const bool live = b < a.blocks;
     const unsigned p = live ? inproj_part(a, b) : 0u;
     const unsigned col = (b - a.parts[p].blk0) * 16u + r;
@@ -67,17 +68,18 @@ extern "C" __global__ __launch_bounds__(256, 1) void plow_glm_inproj_partial(Inp
     /* x staged sixteen 16-byte loads per thread at a time, all in flight before the LDS stores. */
     const unsigned per_row = INPROJ_KS / 8u, total = a.m * per_row;
     constexpr unsigned XU = 16u;
-    for (unsigned i0 = 0; i0 < total; i0 += XU * 256u) {
+    constexpr unsigned NT = INPROJ_WAVES * 64u;
+    for (unsigned i0 = 0; i0 < total; i0 += XU * NT) {
         bf16x8 xv[XU];
 #pragma unroll
         for (unsigned u = 0; u < XU; u++) {
-            const unsigned i = i0 + u * 256u + threadIdx.x;
+            const unsigned i = i0 + u * NT + threadIdx.x;
             if (i < total)
                 xv[u] = *(const bf16x8*)(a.x + (size_t)(i / per_row) * a.k + kb + (i % per_row) * 8u);
         }
 #pragma unroll
         for (unsigned u = 0; u < XU; u++) {
-            const unsigned i = i0 + u * 256u + threadIdx.x;
+            const unsigned i = i0 + u * NT + threadIdx.x;
             if (i < total) *(bf16x8*)&xs[(i / per_row) * INPROJ_LDS_STRIDE + (i % per_row) * 8u] = xv[u];
         }
     }

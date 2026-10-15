@@ -455,9 +455,9 @@ if [ "$ARCH" = gfx950 ]; then
     -I"$R/amd" -I"$R/common" "$R/amd/xr_native.hip"
   # PLOW_AMD_LT_FUSE: decode GEMMs of one input (GLM-5.3 KDA in-projection) as one split-K pass.
   bash "$R/cmake/hipcc_hsaco.sh" hipcc "$BUN" "$ARCH" \
-    "$OUT/glm_inproj_gfx950.elf" plow_glm_inproj_partial 256 1 \
+    "$OUT/glm_inproj_gfx950.elf" plow_glm_inproj_partial 512 1 \
     -DPLOW_LEAN_OBJECT=1 -DPLOW_NO_SPILL=1 \
-    -DPLOW_REQUIRED_MARKER=plow_glm_inproj_abi_1 \
+    -DPLOW_REQUIRED_MARKER=plow_glm_inproj_abi_2 \
     -I"$R/amd" -I"$R/common" "$R/amd/glm_inproj.hip"
 fi
 
