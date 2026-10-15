@@ -595,9 +595,9 @@ pub struct RuntimeConfig {
     )]
     pub pf_itl_budget_ms: u32,
 
-    /// CUDA VMM prefix snapshots: copy the fp8 ring scales, full-layer scale prefixes and the
-    /// partial full-KV block as one pitched copy per tensor (all KV heads) instead of one copy
-    /// per head. Same bytes; a Gemma-4 26B snapshot drops from ~10^3 copies to ~10^2.
+    /// CUDA VMM prefix snapshots: copy the fp8 ring scales and full-layer scale prefixes as one
+    /// pitched copy per tensor (all KV heads) instead of one copy per head. Same bytes; a
+    /// Gemma-4 26B snapshot drops from ~10^3 copies to ~10^2.
     #[arg(long = "vmm-snap-pitched", env = "PLOW_VMM_SNAP_PITCHED", hide = true, default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
     pub vmm_snap_pitched: bool,
 
@@ -612,6 +612,45 @@ pub struct RuntimeConfig {
         global = true
     )]
     pub vmm_snap_pool: u32,
+
+    /// CUDA VMM prefix cache with live sliding rings: a finished request's ring units stay
+    /// mapped in its slot (or as spares, trimmed to `PLOW_KV_POOL_MIB` once no slot is live)
+    /// instead of `cuMemRelease`, so the next admission skips `cuMemCreate`/map (~6 ms per
+    /// admission on Gemma-4 26B, 200 MiB a slot).
+    #[arg(long = "vmm-ring-recycle", env = "PLOW_VMM_RING_RECYCLE", hide = true, default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
+    pub vmm_ring_recycle: bool,
+
+    /// CUDA VMM prefix live rings: keep up to N released slots' sliding-ring units mapped in
+    /// place (parked) instead of returning them to the driver. Readmitting a parked slot costs no
+    /// driver call (otherwise unmap + cuMemCreate + map + set_access per unit, ~8 ms a request on
+    /// Gemma-4 26B); held memory is bounded by N slots. 0 = off.
+    #[arg(
+        long = "vmm-ring-park",
+        env = "PLOW_VMM_RING_PARK",
+        default_value_t = 0,
+        hide = true,
+        global = true
+    )]
+    pub vmm_ring_park: u32,
+
+    /// CUDA unified token batch: admit (begin_slot + prefix attach) requests the next launch
+    /// takes while the current prefill launch runs on the device, instead of before it, whenever
+    /// the launch is already full of admitted rows. Admission then costs no GPU time.
+    #[arg(long = "pf-admit-overlap", env = "PLOW_PF_ADMIT_OVERLAP", hide = true, default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
+    pub pf_admit_overlap: bool,
+
+    /// Load shedding at the capacity knee: refuse a new request with 429 + `Retry-After` while
+    /// this many requests already wait for their first token (queued plus seated in prefill),
+    /// so a load balancer spills it to another backend instead of queueing it into a long
+    /// TTFT. 0 = off.
+    #[arg(
+        long = "shed-queue-depth",
+        env = "PLOW_SHED_QUEUE_DEPTH",
+        default_value_t = 0,
+        hide = true,
+        global = true
+    )]
+    pub shed_queue_depth: u32,
 
     /// Expert: run prefill chains to completion, skip decode until all prompts are resident.
     /// Trades streaming latency for aggregate tok/s (CUDA 8x127k +7.1%, Veena c128 -3%).
@@ -817,23 +856,6 @@ pub struct RuntimeConfig {
     #[arg(long = "vmm-publish-shared", env = "PLOW_VMM_PUBLISH_SHARED", default_value_t = true, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
     pub vmm_publish_shared: bool,
 
-    /// CUDA VMM prefix cache: publish a finished sequence's end-of-generation boundary (prompt
-    /// + generated rows), so a follow-up turn that embeds this turn's output attaches to it.
-    /// `0` skips it for single-turn traffic (one sliding-window snapshot buffer and copy less
-    /// per request); the prompt-end boundary and whole-block checkpoints still publish.
-    #[arg(long = "prefix-cache-output", env = "PLOW_PREFIX_CACHE_OUTPUT", default_value_t = true, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
-    pub prefix_cache_output: bool,
-
-    /// CUDA packed prefill: a request whose prompt shares whole KV blocks with a prompt another
-    /// slot is still prefilling waits (bounded) for that slot's checkpoint and attaches to it
-    /// instead of recomputing the shared rows beside it. `0` admits it at once.
-    /// CUDA VMM prefix cache: a conversation without `X-Session-Id` frees the prompt-end
-    /// boundary it attached once its own longer prompt end publishes (what a session's
-    /// `retire_superseded` already does), so a live conversation holds one sliding-window
-    /// snapshot instead of two. `0` keeps the attached boundary until LRU reaches it.
-    #[arg(long = "prefix-retire-attached", env = "PLOW_PREFIX_RETIRE_ATTACHED", default_value_t = true, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
-    pub prefix_retire_attached: bool,
-
     /// CUDA VMM prefix cache: pinned host memory (MiB) that evicted boundary snapshots spill
     /// to instead of being freed (the second level of the cache's LRU), restored over PCIe when
     /// a prompt attaches to one. `0` (the default) keeps snapshots device-only.
@@ -845,20 +867,23 @@ pub struct RuntimeConfig {
     )]
     pub vmm_host_cache_mib: u64,
 
-    #[arg(long = "prefix-inflight-wait", env = "PLOW_PREFIX_INFLIGHT_WAIT", default_value_t = true, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
-    pub prefix_inflight_wait: bool,
-
-    /// CUDA VMM prefix cache retention policy: `tree` (boundary tree, one LRU; the default) or
-    /// `legacy` (the flag/tier policy of release 0.1.2, kept for one release as an in-binary
-    /// rollback; the only policy under which `PLOW_PREFIX_CACHE_OUTPUT`,
-    /// `PLOW_PREFIX_RETIRE_ATTACHED` and a session's cache pin have an effect).
+    /// CUDA VMM prefix cache: seconds a request with
+    /// `X-Session-Id` keeps its newest boundary protected from LRU after its last use; then the
+    /// boundary and the blocks only it kept attachable are demoted (freed). `0` = sessions get
+    /// no special retention.
     #[arg(
-        long = "prefix-policy",
-        env = "PLOW_PREFIX_POLICY",
-        default_value = "tree",
+        long = "prefix-session-ttl-s",
+        env = "PLOW_PREFIX_SESSION_TTL_S",
+        default_value_t = 150,
         global = true
     )]
-    pub prefix_policy: String,
+    pub prefix_session_ttl_s: u32,
+
+    /// CUDA packed prefill: a request whose prompt shares whole KV blocks with a prompt another
+    /// slot is still prefilling waits (bounded) for that slot's checkpoint and attaches to it
+    /// instead of recomputing the shared rows beside it. `0` admits it at once.
+    #[arg(long = "prefix-inflight-wait", env = "PLOW_PREFIX_INFLIGHT_WAIT", default_value_t = true, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
+    pub prefix_inflight_wait: bool,
 
     /// CUDA token-batch prefill: publish the whole-block checkpoints a prompt chunk completed
     /// when the chunk lands, not only at the prompt's end, so a request waiting on a long
@@ -2560,22 +2585,6 @@ impl RuntimeConfig {
         )
     }
 
-    pub(crate) fn prefix_cache_output(&self) -> bool {
-        select_compat(
-            self.prefix_cache_output,
-            Self::env_bool("PLOW_PREFIX_CACHE_OUTPUT"),
-            !Self::is_initialized(),
-        )
-    }
-
-    pub(crate) fn prefix_retire_attached(&self) -> bool {
-        select_compat(
-            self.prefix_retire_attached,
-            Self::env_bool("PLOW_PREFIX_RETIRE_ATTACHED"),
-            !Self::is_initialized(),
-        )
-    }
-
     pub(crate) fn vmm_host_cache_bytes(&self) -> u64 {
         let mib = if Self::is_initialized() {
             self.vmm_host_cache_mib
@@ -2585,15 +2594,13 @@ impl RuntimeConfig {
         mib << 20
     }
 
-    /// `PLOW_PREFIX_POLICY`: `legacy` selects the 0.1.2 flag/tier policy; anything else is
-    /// the boundary tree.
-    pub(crate) fn prefix_policy_legacy(&self) -> bool {
-        let value = if Self::is_initialized() {
-            self.prefix_policy.clone()
+    pub(crate) fn prefix_session_ttl(&self) -> std::time::Duration {
+        let s = if Self::is_initialized() {
+            self.prefix_session_ttl_s
         } else {
-            Self::env_nonempty("PLOW_PREFIX_POLICY").unwrap_or_else(|| self.prefix_policy.clone())
+            Self::env_parse("PLOW_PREFIX_SESSION_TTL_S").unwrap_or(self.prefix_session_ttl_s)
         };
-        value.eq_ignore_ascii_case("legacy")
+        std::time::Duration::from_secs(u64::from(s))
     }
 
     pub(crate) fn prefix_inflight_wait(&self) -> bool {

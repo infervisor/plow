@@ -155,19 +155,51 @@ pub(super) fn evict_one_tree(s: &Shared, inner: &mut Inner, preserve_hot: bool) 
         return true;
     }
     let awaited = inner.awaited.clone();
-    // One LRU key and no exemption: the newest boundary goes when it is the last candidate
-    // (the request that published it is held by its lease, not by its snapshot).
-    let _ = preserve_hot;
-    let victim = inner
-        .published
-        .values()
-        .flatten()
-        .filter(|snap| snap.users == 0 && snap.on_device() && !snap_awaited(&awaited, snap))
-        .min_by_key(|snap| snap.last_used)
-        .map(|snap| snap.id);
+    // One LRU key; the newest boundary goes when it is the last candidate (the request that
+    // published it is held by its lease, not by its snapshot). A session boundary inside its
+    // TTL goes only once nothing unprotected is left, the host tier's entries included.
+    // The soft-cap trim (`preserve_hot`) keeps the most recently used boundary while a live
+    // request maps its blocks (production's MRU exemption, without its tier); allocation OOM
+    // may take it.
+    let hot = if preserve_hot && inner.stats.cache_blocks > 0 {
+        inner
+            .published
+            .iter()
+            .flat_map(|(node, list)| list.iter().map(move |snap| (*node, snap)))
+            .max_by_key(|(_, snap)| snap.last_used)
+            .filter(|(node, _)| {
+                node.is_some_and(|k| inner.cache.node_refs(k).is_some_and(|r| r > 0))
+            })
+            .map(|(_, snap)| snap.id)
+    } else {
+        None
+    };
+    let now = std::time::Instant::now();
+    let lru = |protected: bool| {
+        inner
+            .published
+            .values()
+            .flatten()
+            .filter(|snap| snap.users == 0 && snap.on_device() && !snap_awaited(&awaited, snap))
+            .filter(|snap| Some(snap.id) != hot)
+            .filter(|snap| snap.protect_until.is_some_and(|t| t > now) == protected)
+            .min_by_key(|snap| snap.last_used)
+            .map(|snap| snap.id)
+    };
+    let victim = lru(false);
+    let protected = lru(true);
     // Blocks no boundary makes attachable are the cheapest bytes.
     if evict_dead_leaf(s, inner) {
         return true;
+    }
+    // A cold host boundary (published on a first sighting, never attached) ranks below every
+    // used device boundary: it goes before the device victim is spilled or freed.
+    if victim.is_some_and(|id| !snap_ref(inner, id).is_some_and(Snap::cold)) {
+        if let Some(id) = host_lru(inner).filter(|&id| snap_ref(inner, id).is_some_and(Snap::cold))
+        {
+            evict_unit(s, inner, id);
+            return true;
+        }
     }
     if let Some(id) = victim {
         // Level 2 of the same LRU: the device victim moves to pinned host memory when a tier
@@ -178,9 +210,16 @@ pub(super) fn evict_one_tree(s: &Shared, inner: &mut Inner, preserve_hot: bool) 
         evict_unit(s, inner, id);
         return true;
     }
-    // Every device boundary is held, awaited or the kept MRU: the device bytes a host-resident
+    // Every unprotected device boundary is held or awaited: the device bytes a host-resident
     // boundary still occupies (its blocks) are the next level of the same LRU.
     if let Some(id) = host_lru(inner) {
+        evict_unit(s, inner, id);
+        return true;
+    }
+    if let Some(id) = protected {
+        if spill_unit(s, inner, id) {
+            return true;
+        }
         evict_unit(s, inner, id);
         return true;
     }

@@ -22,11 +22,14 @@ from __future__ import annotations
 import argparse
 import json
 import subprocess
+import sys
 from pathlib import Path
 
 import plow_dist as pd
 
 REPO = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(REPO / "scripts" / "campaign"))
+import rung_env  # noqa: E402
 
 
 class Invalid(pd.Fail):
@@ -54,9 +57,54 @@ def exact_map(requested: dict, observed: dict, surface: str) -> None:
         )
 
 
+def recipe_rung_env(recipe: dict) -> dict:
+    """`[emit.rung_env]`, refused unless every override names a rung-eligible knob."""
+    src = rung_env.recipe_source_errors(recipe)
+    need(not src, "emit: " + "; ".join(src))
+    try:
+        over = rung_env.from_recipe(recipe)
+    except rung_env.RungEnvError as e:
+        raise Invalid(f"emit: {e}")
+    errs = rung_env.check(over)
+    need(not errs, "emit: " + "; ".join(errs))
+    return over
+
+
+def check_rung_env(over: dict, build_json: dict, observed: dict) -> None:
+    """`[emit.rung_env]` against the build's replayed string and its per-program resolution."""
+    try:
+        built = rung_env.parse(observed.get(rung_env.ENV))
+    except rung_env.RungEnvError as e:
+        raise Invalid(f"emit: build replayed a malformed {rung_env.ENV}: {e}")
+    need(
+        built == over,
+        f"emit: contradictory {rung_env.ENV} — recipe says {rung_env.render(over)!r}, build "
+        f"replayed {rung_env.render(built)!r}",
+    )
+    if not over:
+        return
+    programs = (build_json.get("rung_knobs") or {}).get("programs")
+    need(programs is not None, "emit: build.json has no `rung_knobs` (a plowc that predates per-rung overrides)")
+    ids, _ = rung_env.registry()
+    for (phase, rows), knobs in sorted(over.items()):
+        hit = [p for p in programs if p.get("phase") == phase and p.get("rows") == rows]
+        need(hit, f"emit: [emit.rung_env.{phase}.{rows}] matches no program the build emitted")
+        for env, value in knobs.items():
+            want = rung_env.boolish(value)
+            for p in hit:
+                got = (p.get("knobs") or {}).get(ids[env]) or {}
+                need(
+                    got.get("source") == "rung" and (want is None or got.get("value") == want),
+                    f"emit: {phase}:{rows} {env}={value!r} but program {p.get('program')} resolved "
+                    f"{got.get('value')!r} from {got.get('source')!r}",
+                )
+
+
 def check_emit(recipe: dict, build_json: dict) -> list[str]:
     """`[emit].env` against `build.json`'s own knob record."""
+    rungs = recipe_rung_env(recipe)
     ec = build_json.get("emit_config")
+    need(ec or not rungs, "emit: the recipe states [emit.rung_env] but build.json has no `emit_config` to verify it")
     if not ec:
         return [
             "emit: build.json has no `emit_config` (written by a plowc that predates the "
@@ -68,10 +116,11 @@ def check_emit(recipe: dict, build_json: dict) -> list[str]:
     observed.update(ec.get("unrecorded_env") or {})
     requested = (recipe.get("emit") or {}).get("env") or {}
     exact_map(requested, observed, "emit")
+    check_rung_env(rungs, build_json, observed)
 
     # The other direction, as a report rather than a refusal: a knob the build
     # replayed but the recipe does not mention is a reproduction gap.
-    missing = sorted(set(observed) - set(requested))
+    missing = sorted(set(observed) - set(requested) - {rung_env.ENV})
     return [f"emit: build replayed {k}={observed[k]!r}, recipe does not state it" for k in missing]
 
 
@@ -241,6 +290,7 @@ def check(recipe_path: Path, bundle: Path | None, objects: Path | None, strict: 
         return check_provenance(recipe, strict)
 
     notes += check_lowrung_tiers(recipe)
+    recipe_rung_env(recipe)
 
     if bundle:
         bj = pd.load_json(bundle / "build.json") if (bundle / "build.json").exists() else {}
@@ -422,6 +472,54 @@ def self_test() -> None:
         except pd.Fail as e:
             assert "must carry `[measured] tok_s`" in str(e)
 
+        # Per-rung overrides: stated in [emit.rung_env], replayed as PLOW_EMIT_RUNG_ENV, resolved
+        # per program in build.json `rung_knobs`.
+        rb = d / "rung-assets"
+        rb.mkdir()
+        rung_build = {
+            "arch": "gfx942",
+            "n_cu": 304,
+            "emit_config": {
+                "replay": {"PLOW_FP8_KV": "1", "PLOW_EMIT_RUNG_ENV": "prefill:128:PLOW_NO_GLU_FUSE=0"},
+                "unrecorded_env": {"PLOW_MLA_PF_V2": "1"},
+            },
+            "rung_knobs": {"programs": [
+                {"program": 0, "phase": "prefill", "rows": 128,
+                 "knobs": {"emit.no_glu_fuse": {"value": "false", "source": "rung"}}},
+                {"program": 1, "phase": "prefill", "rows": 512,
+                 "knobs": {"emit.no_glu_fuse": {"value": "true", "source": "packet"}}},
+            ]},
+        }
+        (rb / "build.json").write_text(json.dumps(rung_build))
+        (rb / "weights.json").write_text((bundle / "weights.json").read_text())
+        rung = json.loads(json.dumps(good))
+        del rung["artifacts"]
+        rung["emit"]["rung_env"] = {"prefill": {"128": {"PLOW_NO_GLU_FUSE": "0"}}}
+        notes = check(write(rung), rb, None, strict=False)
+        assert not any("PLOW_EMIT_RUNG_ENV" in n for n in notes), notes
+        for edit, why in [
+            (lambda x: x["emit"]["rung_env"]["prefill"]["128"].update(PLOW_NO_GLU_FUSE="1"), "contradictory PLOW_EMIT_RUNG_ENV"),
+            (lambda x: x["emit"]["rung_env"]["prefill"]["128"].update(PLOW_FP8_KV="1"), "packet-wide"),
+            (lambda x: x["emit"]["rung_env"].update(prefill={"0": {"PLOW_NO_GLU_FUSE": "0"}}), "positive"),
+            (lambda x: x["emit"]["env"].update(PLOW_EMIT_RUNG_ENV="prefill:128:PLOW_NO_GLU_FUSE=0"), "[emit.rung_env]"),
+        ]:
+            bad = json.loads(json.dumps(rung))
+            edit(bad)
+            try:
+                check(write(bad), rb, None, strict=False)
+                raise AssertionError(f"accepted a bad rung override ({why})")
+            except pd.Fail as e:
+                assert why in str(e), e
+        # The build resolved the value from the packet, not the rung.
+        stale = json.loads(json.dumps(rung_build))
+        stale["rung_knobs"]["programs"][0]["knobs"]["emit.no_glu_fuse"]["source"] = "packet"
+        (rb / "build.json").write_text(json.dumps(stale))
+        try:
+            check(write(rung), rb, None, strict=False)
+            raise AssertionError("accepted a rung override the build did not apply")
+        except pd.Fail as e:
+            assert "resolved" in str(e), e
+
         # A refused recipe states what blocks it and carries no build.
         refused = {
             "schema": "plow.recipe.v1",
@@ -447,6 +545,8 @@ def to_toml(doc: dict) -> str:
     """Minimal TOML writer for the self-test (python has no stdlib writer)."""
 
     def val(v):
+        if isinstance(v, dict):
+            return "{ " + ", ".join(f"{key(a)} = {val(b)}" for a, b in v.items()) + " }"
         if isinstance(v, bool):
             return "true" if v else "false"
         if isinstance(v, (int, float)):

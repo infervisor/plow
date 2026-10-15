@@ -50,7 +50,7 @@ production qualification remain pending; build compatibility alone is not that
 evidence. The H100 readiness report lives with the campaign's raw `perf-data`, which is
 kept out of source control.
 
-## Retention policy on the CUDA VMM pool: the boundary tree (`PLOW_PREFIX_POLICY`, 2026-10)
+## Retention policy on the CUDA VMM pool: the boundary tree (2026-10)
 
 Mechanism (unchanged since 2026-09): the full-attention layers' KV is shared zero-copy as 2 MiB
 granules through a token-verified radix tree of whole blocks; everything else a prompt needs to
@@ -59,7 +59,7 @@ the last whole block, FP8 scales) is a private *boundary snapshot* (`vmm_snap_by
 prompt end on Gemma-4 26B FP8, a stub on uniform full attention). Pressure eviction keeps free
 device memory above `PLOW_VMM_CACHE_MIN_FREE_MIB`.
 
-Policy (`crates/plowrt/src/memory/vmm_policy.rs`, `Policy::Tree`, the default):
+Policy (`crates/plowrt/src/memory/vmm_policy.rs`, `Policy::Tree`, the only CUDA policy):
 
 * `Snap { id, kind, chain, parent, children, users, last_used, store }`. `kind` is what the
   publisher said (`PROMPT_END`, `SHARED_END`, `CHECKPOINT`; a dedup or a touch ORs). `parent` is
@@ -72,7 +72,9 @@ Policy (`crates/plowrt/src/memory/vmm_policy.rs`, `Policy::Tree`, the default):
 * Eviction: one LRU key, `last_used`, over snapshots with `users == 0` that no in-flight waiter
   awaits (`Await { chain, rows }`, set by `inflight_prefix`, cleared at the waiter's attach,
   cancellation or next sequence). The unit is the snapshot plus the radix leaves only it kept
-  attachable. No MRU exemption, no pin tier, no shared tier, no recency window.
+  attachable. No pin tier, no shared tier, no recency window; the only MRU exemption is the
+  soft-cap trim's (`preserve_hot`): it keeps the most recently used boundary while a live request
+  maps its blocks, and allocation OOM may still take it.
 * Recency moves on consumer demand only: an attach refreshes the attached boundary and every
   ancestor on its chain (a hot system prompt end stays warm while conversations continue through
   it); the turn-end pass touches the conversation's prompt end (metadata only, before the
@@ -106,7 +108,18 @@ Policy (`crates/plowrt/src/memory/vmm_policy.rs`, `Policy::Tree`, the default):
   prefix) are never structurally retired: their second continuation is expected. They survive by
   LRU refresh alone. A shared end within 64 rows of the owner's prompt end is the same history (a
   parallel pair, a retry) and is not published at all: the waiter attaches the prompt end.
-* `X-Session-Id` has no cache meaning. Turn-end output boundaries are not published.
+* `X-Session-Id` buys bounded retention (`PLOW_PREFIX_SESSION_TTL_S`, default 150 s, `0` = none):
+  a session request's prompt end (and the boundary it attached, at admission) gets
+  `protect_until = now + TTL`, refreshed by every use (publish, turn-end touch, the next turn's
+  attach). Eviction takes a protected boundary only once nothing unprotected is left (the host
+  tier's entries included), so the cache cannot deadlock. An expired one is demoted lazily (a
+  sweep at most once a second from `trim_cache`, no timer thread): its snapshot, then each
+  radix block only it kept attachable, newest first (`PrefixCache::evict_chain_from`); shared
+  ancestors stay under LRU. A boundary in use, awaited, mid-transfer, or whose blocks a live
+  request still maps waits for the next sweep. A full host tier never drops a protected entry to
+  take an unprotected spill (that victim is freed instead).
+  `/metrics`: `plowrt_prefix_sessions_protected`, `plowrt_prefix_session_demotions_total`,
+  `plowrt_prefix_session_demoted_bytes_total`. Turn-end output boundaries are not published.
 
 Invariants (`vmm_sim_tests::cell_*`, `policy::check_tree`): a held, awaited or in-transfer
 snapshot is never freed on any path (LRU, retire, radix leaf eviction, strict publish's tail
@@ -154,7 +167,15 @@ owner per buffer (device or host) outside `Spilling`; a `Spilling`/`Restoring` s
 freed, never a victim, never spilled twice; a held snapshot is never spilled; `users` releases
 exactly once per attach, prefetch or restore; a snapshot's blocks go only with the snapshot.
 
-`PLOW_PREFIX_POLICY=legacy` keeps the 0.1.2 flag/tier policy (with the phase-0 fixes: the MRU
-exemption is bounded by `SHARED_RECENT_TICKS`, a reuse distance in publishes + attaches; eviction
-honours waiters; the turn-end restore runs regardless of `PLOW_PREFIX_CACHE_OUTPUT`; the live ring
-is released before the retire trim) for one release.
+The 0.1.2 flag/tier policy (`Policy::Legacy`: `attaches`/`share`/`referenced` flags,
+`evict_one`'s tiers, `SHARED_RECENT_TICKS`) remains only for AMD's shared-prefix path
+(`exec/amd/shared_prefix.rs`). The CUDA engine always runs the tree; `PLOW_PREFIX_POLICY`,
+`PLOW_PREFIX_CACHE_OUTPUT` and `PLOW_PREFIX_RETIRE_ATTACHED` were removed with the CUDA legacy
+paths (session pin, turn-end output boundary, `retire_superseded`). The previous binary is the
+rollback.
+
+`/metrics`: `plowrt_prefix_snapshots_{live,branch,share}`, `snapshots_{retired,touched}_total`,
+`publishes_{prompt_end,shared_end,checkpoint,turn_end}_total`, attach kinds
+`attach_{prompt_end,block,shared}_total` + `attach_misses_total` and the rows each kind attached
+/ left to recompute `tokens_{attached,lost}_{prompt_end,block,shared}_total`,
+`tokens_lost_miss_total`.

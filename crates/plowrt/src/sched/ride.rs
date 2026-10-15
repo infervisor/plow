@@ -47,6 +47,8 @@ pub struct RideCost {
     widths: Vec<usize>,
     /// The engine's prefill rungs, ascending (for [`RideCost::rows_within`]).
     ladder: Vec<usize>,
+    /// [`RideCost::rows_within`] calls since the measured rung above the cap last re-ran.
+    since_reprobe: u32,
 }
 
 impl RideCost {
@@ -116,26 +118,41 @@ impl RideCost {
         }
     }
 
-    /// The widest rung of the ladder a riding row can wait for under `budget_ms`: the widest
-    /// measured rung within the budget, or the rung right above it while that one is unmeasured
-    /// (its first launch measures it). `None` until a rung has been measured.
-    pub fn rows_within(&self, budget_ms: f64) -> Option<usize> {
-        let ms = |rows: usize| {
-            self.buckets
-                .iter()
-                .find(|b| b.rows == rows)
-                .and_then(|b| b.total.0)
-        };
+    /// `(any rung measured, index of the widest measured rung within budget_ms)`.
+    fn fit(&self, budget_ms: f64) -> (bool, Option<usize>) {
         let mut cap = None;
         let mut any = false;
         for (i, &rows) in self.ladder.iter().enumerate() {
-            if let Some(m) = ms(rows) {
+            if let Some(m) = self.rung_ms(rows) {
                 any = true;
                 if m <= budget_ms {
                     cap = Some(i);
                 }
             }
         }
+        (any, cap)
+    }
+
+    fn rung_ms(&self, rows: usize) -> Option<f64> {
+        self.buckets
+            .iter()
+            .find(|b| b.rows == rows)
+            .and_then(|b| b.total.0)
+    }
+
+    /// The widest measured rung within `budget_ms` (the narrowest when none fits), without the
+    /// exploration [`RideCost::rows_within`] adds. `None` until a rung has been measured.
+    pub fn rows_fit(&self, budget_ms: f64) -> Option<usize> {
+        let (any, cap) = self.fit(budget_ms);
+        any.then(|| self.ladder[cap.unwrap_or(0)])
+    }
+
+    /// The widest rung of the ladder a riding row can wait for under `budget_ms`: the widest
+    /// measured rung within the budget, or the rung right above it while that one is unmeasured
+    /// (its first launch measures it) and once per [`EXPLORE`] calls when it is measured.
+    /// `None` until a rung has been measured.
+    pub fn rows_within(&mut self, budget_ms: f64) -> Option<usize> {
+        let (any, cap) = self.fit(budget_ms);
         if !any {
             return None;
         }
@@ -143,8 +160,24 @@ impl RideCost {
         let explore = self
             .ladder
             .get(next)
-            .is_some_and(|&rows| ms(rows).is_none());
-        Some(self.ladder[if explore { next } else { cap.unwrap_or(0) }])
+            .is_some_and(|&rows| self.rung_ms(rows).is_none());
+        // Only launching a rung re-measures it, and a budgeted launch never runs the rung above
+        // the cap: one slow sample (a host stall) priced it over the budget for good, so the cap
+        // could only fall, rung by rung (G26 at 2.2 sessions/s: 1152 -> 128 rows in 7 minutes).
+        let reprobe = !explore && next < self.ladder.len() && {
+            self.since_reprobe += 1;
+            self.since_reprobe >= EXPLORE
+        };
+        if reprobe {
+            self.since_reprobe = 0;
+        }
+        Some(
+            self.ladder[if explore || reprobe {
+                next
+            } else {
+                cap.unwrap_or(0)
+            }],
+        )
     }
 
     /// Whether `decode_rows` rows should ride the next launch of `bucket` rows.
@@ -235,6 +268,42 @@ mod tests {
             c.rows_within(10.0),
             Some(128),
             "nothing fits: the narrowest rung"
+        );
+    }
+
+    #[test]
+    fn an_over_budget_rung_is_re_measured_so_the_cap_can_climb_back() {
+        let mut c = RideCost::default();
+        c.set_ladder(&[512, 1024, 1152, 2048]);
+        c.observe_rung(512, 25.0);
+        c.observe_rung(1024, 36.0);
+        c.observe_rung(1152, 44.0);
+        c.observe_rung(2048, 90.0);
+        // One stalled 1152 launch prices it over the budget.
+        c.observe_rung(1152, 250.0);
+        assert_eq!(
+            c.rows_within(60.0),
+            Some(1024),
+            "1152 priced over the budget"
+        );
+        for _ in 0..20 * EXPLORE {
+            let cap = c.rows_within(60.0).unwrap();
+            // Each launch measures its rung at its real cost.
+            c.observe_rung(
+                cap,
+                [36.0, 44.0, 90.0][[1024, 1152, 2048].iter().position(|&r| r == cap).unwrap()],
+            );
+        }
+        let picks: Vec<usize> = (0..EXPLORE).map(|_| c.rows_within(60.0).unwrap()).collect();
+        assert_eq!(
+            picks.iter().filter(|&&r| r == 1152).count() as u32,
+            EXPLORE - 1,
+            "the cap climbed back to 1152 once its re-runs fit the budget"
+        );
+        assert_eq!(
+            picks.iter().filter(|&&r| r == 2048).count(),
+            1,
+            "the over-budget rung above re-runs once per window"
         );
     }
 

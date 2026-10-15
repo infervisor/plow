@@ -2579,6 +2579,7 @@ fn build_inner(m: &Model, arch: &str, lean: &crate::LeanReport, packed_prefill: 
         // the operator ASKED FOR to get those shapes. Reproducing a measured configuration
         // needs both, and only the first was ever written down.
         "emit_config": emit_config_section(),
+        "rung_knobs": crate::emit_config::rung::manifest_section(&m.prog_t),
         "attention_policy": {
             "entries": attention,
             "runtime_kv_reselection": false,

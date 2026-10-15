@@ -129,11 +129,14 @@ Two mechanisms, one per KV layout, never both:
   copies; `begin_slot` starts the next sequence at the kept row.
 * VMM prefix cache (`docs/runtime/prefix-cache.md`; Hopper hybrid-BF16 Gemma 4 by default): the
   cache publishes each sequence's prompt end, and a next turn attaches it, so slots are not
-  retained and `X-Session-Id` has no cache meaning (routing, fairness, dedupe and the turn table
-  only): the conversation's own chain of boundaries is the retention unit
-  (`PLOW_PREFIX_POLICY=tree`). Under `PLOW_PREFIX_POLICY=legacy` a session's retire additionally
-  pins its published path for the TTL (`PrefixCache::pin`: eviction takes every unpinned leaf
-  first) and publishes the turn-end output boundary (`PLOW_PREFIX_CACHE_OUTPUT`). The reuse shows
+  retained: the conversation's own chain of boundaries is the retention unit (the boundary
+  tree), with or without a header. `X-Session-Id` buys bounded retention:
+  the session's newest boundary (its prompt end, refreshed by the turn-end touch and by the next
+  turn's attach) is protected from LRU for `PLOW_PREFIX_SESSION_TTL_S` (150 s) after its last
+  use (pressure takes it only once nothing unprotected is left), then demoted: the snapshot and
+  the blocks only it kept attachable are freed, newest block first; a shared system prompt
+  stays under LRU. A later turn after demotion attaches whatever ancestor survives. `0` = no
+  special retention (same as no header). The reuse shows
   in `usage.prompt_tokens_details.cached_tokens`; the header says `prefix-cache`. The prefix cache
   stays off for overlay packets (their rows are not keyed by ids).
 

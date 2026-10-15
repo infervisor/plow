@@ -1,16 +1,15 @@
 //! Closed-loop agentic-serving simulation of the VMM prefix cache (`cargo test -p plowrt
 //! --features cuda,hsa --lib --release vmm_sim -- --ignored --nocapture`): the real [`VmmKv`]
 //! on a byte-accounting driver, driven the way the CUDA engine drives it (admission, prompt-end
-//! publish, turn-end publish and retire). Env: `SIM_CELLS` (comma-separated prompt files of
+//! publish and turn-end republish). Env: `SIM_CELLS` (comma-separated prompt files of
 //! `session turn prompt_tokens` lines, run back to back on one pool), `SIM_KV` (fp8|bf16),
 //! `SIM_SLOTS`, `SIM_FREE_MIB` (free after load), `SIM_FLOOR_MIB`, `SIM_CHUNK` / `SIM_PF_TPS`
-//! (prefill launch rows / rows per second), `SIM_TTL_S`, `SIM_GAP_MS` (client round trip between
+//! (prefill launch rows / rows per second), `SIM_GAP_MS` (client round trip between
 //! turns), `SIM_MARGIN` (admission rows past prompt + output), `SIM_GROW` (map output rows as decode
 //! reaches them, preempting on failure), `SIM_RING_DECODE` (ring rows a slot keeps after its
 //! prefill: 1024 = paged sliding rings), and `SIM_SCALE` with `SIM_UNMAP_US` / `SIM_RELEASE_US` to
-//! pace the reclaimer thread in real time instead of draining it per call. `SIM_SESSION=1` sends
-//! `X-Session-Id` on every request (production sends none); `SIM_POLICY_LEGACY=1` runs the 0.1.2
-//! flag/tier policy. The scripted cells below (`cell_*`) drive the same engine logic over a small
+//! pace the reclaimer thread in real time instead of draining it per call. `SIM_POLICY_LEGACY=1`
+//! runs the flag/tier policy AMD's shared prefix uses. The scripted cells below (`cell_*`) drive the same engine logic over a small
 //! pool and run as ordinary tests.
 use super::*;
 use std::collections::{HashMap, VecDeque};
@@ -119,8 +118,6 @@ struct Kv {
     scale_row: u64,
     /// Turn-end re-publishes that had to copy (the prompt end was evicted while decoding) / all.
     republish: std::cell::Cell<(u64, u64)>,
-    /// `SIM_SESSION=1`: every request carries `X-Session-Id` (production sends none).
-    session: bool,
 }
 
 impl Kv {
@@ -174,11 +171,9 @@ impl Kv {
     }
 
     /// `exec/gpu/prefix.rs::vmm_publish`.
-    fn publish(&self, b: usize, toks: &[u32], max_rows: u32, ttl: std::time::Duration) {
+    fn publish(&self, b: usize, toks: &[u32], max_rows: u32) {
         let rows = toks.len() as u32;
         let prompt = self.kv.prompt_rows(b);
-        let legacy = self.kv.policy() == Policy::Legacy;
-        let session = self.session && legacy;
         let slack = env_u64("SIM_PE_SLACK", 8) as u32;
         let prompt_end =
             (rows == prompt && max_rows < rows) || (rows + 1 == prompt && max_rows == rows);
@@ -190,9 +185,6 @@ impl Kv {
         let p_a = rows.min(max_rows) / 32 * 32;
         if rows == 0 || p_a == 0 {
             return;
-        }
-        if session {
-            self.kv.note_session(b, toks);
         }
         let step = self.kv.block_rows();
         let mut p = step;
@@ -206,24 +198,13 @@ impl Kv {
             return;
         }
         let turn_end = rows > prompt;
-        let published = if turn_end && !session {
-            false
-        } else {
-            let kind = if turn_end {
-                Kind::TURN_END
-            } else if prompt_end {
+        if !turn_end {
+            let kind = if prompt_end {
                 Kind::PROMPT_END
             } else {
                 Kind::CHECKPOINT
             };
-            self.boundary(b, toks, p_a, kind)
-        };
-        if published && prompt_end && legacy {
-            if session {
-                self.kv
-                    .pin_prefix(&toks[..p_a as usize], std::time::Instant::now() + ttl);
-            }
-            self.kv.retire_superseded(toks, p_a);
+            self.boundary(b, toks, p_a, kind);
         }
         let end = prompt.saturating_sub(1 + slack) / 32 * 32;
         if turn_end && end > 0 && end < p_a {
@@ -351,7 +332,6 @@ fn vmm_sim_agentic() {
     }
     let k = Kv {
         kv,
-        session: env_u64("SIM_SESSION", 0) == 1,
         ring: 2048,
         ring_decode: std::cell::Cell::new(env_u64("SIM_RING_DECODE", 2048) as u32),
         window: 1024,
@@ -360,7 +340,6 @@ fn vmm_sim_agentic() {
         scale_row: if fp8 { 64 } else { 0 },
         republish: std::cell::Cell::new((0, 0)),
     };
-    let ttl = std::time::Duration::from_secs(env_u64("SIM_TTL_S", 60));
     // `GpuEngine::admission_rows` on a masked-padding packet: one decode quantum (K = 8) + 1.
     let margin = env_u64("SIM_MARGIN", 9) as usize;
     // `SIM_GROW=1`: admission maps the prompt plus `margin` only; decode maps each next row and a
@@ -525,12 +504,12 @@ fn vmm_sim_agentic() {
                     let b = s.slot;
                     k.publish_shared(b, &s.toks, c0);
                     if s.toks.len() == s.prompt.len() {
-                        k.publish(b, &s.toks, s.toks.len() as u32 - 1, ttl);
+                        k.publish(b, &s.toks, s.toks.len() as u32 - 1);
                         k.kv.prefill_done(b);
                         s.phase = Phase::Decode;
                         s.decoded = s.resumed.unwrap_or(0);
                     } else {
-                        k.publish(b, &s.toks, s.toks.len() as u32, ttl);
+                        k.publish(b, &s.toks, s.toks.len() as u32);
                     }
                     sync(&k.kv);
                 }
@@ -567,10 +546,7 @@ fn vmm_sim_agentic() {
                     }
                     s.resumed = None;
                     let b = s.slot;
-                    k.publish(b, &s.toks, s.toks.len() as u32, ttl);
-                    if k.session {
-                        k.kv.pin_prefix(&s.toks, std::time::Instant::now() + ttl);
-                    }
+                    k.publish(b, &s.toks, s.toks.len() as u32);
                     k.kv.begin_seq(b);
                     sync(&k.kv);
                     free_slots.push(b);
@@ -694,7 +670,6 @@ impl Rig {
         Rig {
             k: Kv {
                 kv,
-                session: false,
                 ring: 128,
                 ring_decode: std::cell::Cell::new(128),
                 window: 64,
@@ -758,10 +733,10 @@ impl Rig {
             self.pos[b] = toks.len() as u32;
             self.k.publish_shared(b, &toks, c0);
             if toks.len() == prompt.len() {
-                self.k.publish(b, &toks, toks.len() as u32 - 1, RIG_TTL);
+                self.k.publish(b, &toks, toks.len() as u32 - 1);
                 self.k.kv.prefill_done(b);
             } else {
-                self.k.publish(b, &toks, toks.len() as u32, RIG_TTL);
+                self.k.publish(b, &toks, toks.len() as u32);
             }
             self.check();
         }
@@ -776,16 +751,28 @@ impl Rig {
             .collect();
         toks.extend_from_slice(&out);
         self.pos[b] = toks.len() as u32;
-        self.k.publish(b, toks, toks.len() as u32, RIG_TTL);
-        if self.k.session {
-            self.k
-                .kv
-                .pin_prefix(toks, std::time::Instant::now() + RIG_TTL);
-        }
+        self.k.publish(b, toks, toks.len() as u32);
         self.k.kv.begin_seq(b);
         self.pos[b] = 0;
         self.check();
         out
+    }
+
+    /// [`Self::turn`] for a request with `X-Session-Id` held for `ttl_ms` (0 = no retention).
+    fn turn_session(
+        &mut self,
+        b: usize,
+        prompt: &[u32],
+        reply: usize,
+        ttl_ms: u64,
+    ) -> (u32, Vec<u32>) {
+        let rows = self.admit(b, prompt);
+        self.k
+            .kv
+            .hold_session(b, std::time::Duration::from_millis(ttl_ms));
+        let mut toks = self.prefill(b, prompt, self.chunk);
+        let out = self.finish(b, &mut toks, reply);
+        (rows, out)
     }
 
     /// One whole turn in slot `b`: admit, prefill, decode `reply` rows, retire. Returns
@@ -963,46 +950,196 @@ fn cell_host_tier_keeps_prompt_ends_the_device_cannot() {
     );
 }
 
-/// `X-Session-Id` changes nothing under the tree: the same cell with sessions on gives the
-/// same boundaries, hit rows and retirements (no pin, no output publish).
+/// `PLOW_PREFIX_SESSION_TTL_S=0`: a session header buys nothing; the cell runs exactly as
+/// without one (no protection, no output publish, one boundary per conversation).
 #[test]
-fn cell_session_header_is_routing_only() {
+fn cell_session_ttl_zero_is_no_session() {
     let mut r = Rig::new(Policy::Tree, false, 1 << 20, 64, 2);
-    r.k.session = true;
     let mut p = conv_prompt(2, 40, 200);
-    let (_, mut reply) = r.turn(0, &p, 30);
+    let (_, mut reply) = r.turn_session(0, &p, 30, 0);
     for t in 1..4 {
         p = next_prompt(&p, &reply, 4, 100, 60_000 * t);
-        let (rows, out) = r.turn(0, &p, 30);
+        let (rows, out) = r.turn_session(0, &p, 30, 0);
         reply = out;
         assert!(rows > 0);
         assert_eq!(r.live(), 1);
     }
-    assert_eq!(r.kv().stats().publishes_turn_end, 0);
+    let s = r.kv().stats();
+    assert_eq!(s.publishes_turn_end, 0);
+    assert_eq!(s.sessions_protected, 0);
     assert!(r.kv().shared.inner.lock().cache.pinned().is_empty());
+}
+
+/// A session's newest boundary inside its TTL survives pressure that evicts every other
+/// conversation's end; without the header the same end is evicted.
+#[test]
+fn cell_session_boundary_is_protected_within_ttl() {
+    // About eight prompt ends fit (16 KiB snapshots, 128 B columns): fourteen evict.
+    const CONVS: u32 = 14;
+    let run = |ttl_ms: u64| {
+        let mut r = Rig::new(Policy::Tree, false, 176 << 10, 64, 2);
+        r.k.snap_row = 256;
+        let p0 = conv_prompt(0, 0, 240);
+        let (_, reply0) = r.turn_session(0, &p0, 30, ttl_ms);
+        for c in 1..CONVS {
+            r.turn(c as usize % 2, &conv_prompt(c, 0, 240), 30);
+        }
+        let protected = r.kv().stats().sessions_protected;
+        let dump = r.dump();
+        let p1 = next_prompt(&p0, &reply0, 4, 100, 70_000);
+        let (rows, _) = r.turn_session(0, &p1, 30, ttl_ms);
+        r.check();
+        (
+            rows,
+            (p0.len() as u32 - 9) / 32 * 32,
+            protected,
+            r.kv().stats(),
+            dump,
+        )
+    };
+    let (rows, end, protected, s, _) = run(60_000);
+    assert_eq!(protected, 1);
+    assert_eq!(rows, end, "the protected end survived: {s:?}");
+    assert!(s.snapshots_evicted > 0, "the others were evicted: {s:?}");
+    let (rows, end, protected, _, dump) = run(0);
+    assert_eq!(protected, 0);
+    assert!(
+        rows < end,
+        "unprotected, the same end is evicted: {rows} {end} {dump}"
+    );
+}
+
+/// After its TTL a session boundary is demoted: its snapshot and the blocks only it kept
+/// attachable go (newest first), the shared system prompt stays, the byte accounting closes,
+/// and the session's next turn attaches the surviving ancestor.
+#[test]
+fn cell_session_demoted_after_ttl() {
+    let mut r = Rig::new(Policy::Tree, false, 1 << 20, 64, 2);
+    let first = r.shared_pair(&conv_prompt(40, 288, 120), &conv_prompt(41, 288, 120), 20);
+    assert!(first >= 256);
+    let ps = conv_prompt(42, 288, 120);
+    let (rows, reply) = r.turn_session(0, &ps, 20, 30);
+    assert!(rows >= 256, "the session attaches the shared end");
+    let before = r.kv().stats();
+    assert_eq!(before.sessions_protected, 1);
+    std::thread::sleep(std::time::Duration::from_millis(40));
+    r.kv().begin_seq(1);
+    let s = r.kv().stats();
+    assert_eq!(s.session_demotions, 1, "{}", r.dump());
+    assert!(s.session_demoted_bytes > 0);
+    assert_eq!(s.snapshots_live, before.snapshots_live - 1);
+    assert!(
+        s.cache_blocks < before.cache_blocks,
+        "its private blocks went"
+    );
+    assert_eq!(s.sessions_protected, 0);
+    let bb = r.kv().shared.block_bytes;
+    assert_eq!(
+        s.cache_bytes,
+        s.cache_blocks * bb + s.snapshot_bytes,
+        "no byte leak"
+    );
+    assert!(
+        r.snaps().iter().any(|x| x.1.has(Kind::SHARED_END)),
+        "the system prompt end stays: {}",
+        r.dump()
+    );
+    r.check();
+    let p2 = next_prompt(&ps, &reply, 4, 50, 90_000);
+    let (rows2, _) = r.turn_session(0, &p2, 20, 30);
+    assert!(
+        rows2 >= 256 && rows2 < (ps.len() as u32 - 9) / 32 * 32,
+        "{rows2}"
+    );
+}
+
+/// An expired session boundary whose blocks a live request still maps is demoted only once
+/// that request lets go, and then with its private suffix.
+#[test]
+fn cell_session_demotion_waits_for_a_live_mapping() {
+    let mut r = Rig::new(Policy::Tree, false, 1 << 20, 64, 2);
+    let p = conv_prompt(70, 40, 200);
+    r.turn_session(0, &p, 30, 20);
+    let blocks = r.kv().stats().cache_blocks;
+    // Another request on the same prompt maps the boundary's blocks and stays live.
+    assert!(r.admit(1, &p) > 0);
+    std::thread::sleep(std::time::Duration::from_millis(30));
+    r.kv().begin_seq(0);
+    assert_eq!(r.kv().stats().session_demotions, 0, "still mapped");
+    r.kv().begin_seq(1);
+    r.kv().begin_seq(0);
+    let s = r.kv().stats();
+    assert_eq!(s.session_demotions, 1, "{}", r.dump());
+    assert!(
+        s.cache_blocks < blocks,
+        "the private suffix went too: {}",
+        r.dump()
+    );
+    r.check();
+}
+
+/// An attach by the session's next turn refreshes the boundary's TTL.
+#[test]
+fn cell_session_attach_refreshes_ttl() {
+    let mut r = Rig::new(Policy::Tree, false, 1 << 20, 64, 2);
+    let p1 = conv_prompt(50, 40, 200);
+    let (_, reply) = r.turn_session(0, &p1, 30, 80);
+    std::thread::sleep(std::time::Duration::from_millis(50));
+    let p2 = next_prompt(&p1, &reply, 4, 100, 91_000);
+    let rows = r.admit(0, &p2);
+    assert!(rows > 0);
+    r.kv().hold_session(0, std::time::Duration::from_millis(80));
+    std::thread::sleep(std::time::Duration::from_millis(50));
+    r.kv().begin_seq(1);
+    assert_eq!(
+        r.kv().stats().session_demotions,
+        0,
+        "refreshed at the attach"
+    );
+    std::thread::sleep(std::time::Duration::from_millis(100));
+    // The request that attached it ends without publishing (cancelled): expired, and demoted
+    // once nothing maps it.
+    r.kv().begin_seq(0);
+    r.kv().begin_seq(1);
+    assert_eq!(
+        r.kv().stats().session_demotions,
+        1,
+        "expired without a new publish"
+    );
+    r.check();
+}
+
+/// A session conversation keeps exactly one protected boundary across turns (each prompt end
+/// supersedes the last) and every turn attaches it.
+#[test]
+fn cell_session_conversation_keeps_one_protected_boundary() {
+    let mut r = Rig::new(Policy::Tree, false, 1 << 20, 64, 2);
+    let mut p = conv_prompt(60, 40, 200);
+    let (_, mut reply) = r.turn_session(0, &p, 30, 60_000);
+    for t in 1..5u32 {
+        let end = (p.len() as u32 - 9) / 32 * 32;
+        p = next_prompt(&p, &reply, 4, 100, 50_000 * t);
+        let (rows, out) = r.turn_session(t as usize % 2, &p, 30, 60_000);
+        reply = out;
+        assert_eq!(rows, end);
+        let s = r.kv().stats();
+        assert_eq!((s.snapshots_live, s.sessions_protected), (1, 1));
+    }
 }
 
 /// Two requests of one conversation on the same history at once (parallel tool calls), the
 /// 2026-10-14 production shape: a turn delta past `SHARE_MIN_ROWS` and a prompt whose 32-row
 /// shared end lands inside the rows the next turn's template re-renders. Path 1: B waits on A's
 /// in-flight prefill (`inflight_prefix` names the shared end); path 2: B is admitted while A's
-/// prompt is the most recent (`note_share`). Legacy publishes the shared end, no later turn can
-/// attach it and it is never retired (the sticky slot); the tree names no shared end for a
-/// same-history pair and the conversation keeps one boundary.
+/// prompt is the most recent (`note_share`). The tree names no shared end for a same-history pair
+/// and the conversation keeps one boundary.
 #[test]
 fn cell_parallel_pair_on_one_history() {
-    for (policy, via_inflight, diverge) in [
-        (Policy::Legacy, true, false),
-        (Policy::Legacy, false, false),
-        (Policy::Tree, true, false),
-        (Policy::Tree, false, false),
-        (Policy::Tree, true, true),
-        (Policy::Tree, false, true),
-    ] {
-        let at = format!("{policy:?} via_inflight={via_inflight} diverge={diverge}");
+    for (via_inflight, diverge) in [(true, false), (false, false), (true, true), (false, true)] {
+        let at = format!("via_inflight={via_inflight} diverge={diverge}");
         // 512-row blocks: as in production (4096-row blocks, 5.7K prompts) both prompt ends and
         // the shared end sit in one block, so strict publish lets either request publish it.
-        let mut r = Rig::new(policy, false, 1 << 20, 4096, 3);
+        let mut r = Rig::new(Policy::Tree, false, 1 << 20, 4096, 3);
         let p1 = conv_prompt(3, 40, 520);
         let (_, reply) = r.turn(0, &p1, 30);
         // 834 rows: the shared end (833 / 32 * 32 = 832) lies past the 830 rows the next
@@ -1024,7 +1161,7 @@ fn cell_parallel_pair_on_one_history() {
             a_toks.extend_from_slice(&p2[c0..]);
             r.pos[0] = a_toks.len() as u32;
             r.k.publish_shared(0, &a_toks, c0);
-            r.k.publish(0, &a_toks, a_toks.len() as u32 - 1, RIG_TTL);
+            r.k.publish(0, &a_toks, a_toks.len() as u32 - 1);
             r.k.kv.prefill_done(0);
             assert!(r.inflight(1, &p2).is_none(), "the wait ends");
             b_rows = r.admit(1, &p2);
@@ -1034,7 +1171,7 @@ fn cell_parallel_pair_on_one_history() {
             a_toks.extend_from_slice(&p2[c0..]);
             r.pos[0] = a_toks.len() as u32;
             r.k.publish_shared(0, &a_toks, c0);
-            r.k.publish(0, &a_toks, a_toks.len() as u32 - 1, RIG_TTL);
+            r.k.publish(0, &a_toks, a_toks.len() as u32 - 1);
             r.k.kv.prefill_done(0);
         }
         assert!(b_rows > 0);
@@ -1073,39 +1210,17 @@ fn cell_parallel_pair_on_one_history() {
             }
         }
         let s = r.kv().stats();
-        let sticky = r.snaps().iter().any(|&(rows, _, _)| rows == 832);
-        if policy == Policy::Tree {
-            assert_eq!(
-                s.publishes_shared_end,
-                0,
-                "no shared end ({at}): {}",
-                r.dump()
-            );
-            // A's conversation keeps one boundary, plus the last one B's conversation ended
-            // at (B never sends a turn 4): A's turn-3 end when B converged; B's own end and
-            // the pair's end (their branch point) when it diverged. LRU takes them.
-            let want = if diverge { 3 } else { 2 };
-            assert_eq!(r.live(), want, "boundaries ({at}): {}", r.dump());
-        } else {
-            assert_eq!(
-                s.publishes_shared_end,
-                1,
-                "legacy publishes the shared end ({at}): {}",
-                r.dump()
-            );
-            assert!(
-                sticky,
-                "legacy keeps the unattachable shared end ({at}): {}",
-                r.dump()
-            );
-            assert_eq!(s.snapshots_share, 1, "({at}): {}", r.dump());
-            assert_eq!(
-                r.live(),
-                2,
-                "the conversation's end plus the sticky slot ({at}): {}",
-                r.dump()
-            );
-        }
+        assert_eq!(
+            s.publishes_shared_end,
+            0,
+            "no shared end ({at}): {}",
+            r.dump()
+        );
+        // A's conversation keeps one boundary, plus the last one B's conversation ended
+        // at (B never sends a turn 4): A's turn-3 end when B converged; B's own end and
+        // the pair's end (their branch point) when it diverged. LRU takes them.
+        let want = if diverge { 3 } else { 2 };
+        assert_eq!(r.live(), want, "boundaries ({at}): {}", r.dump());
     }
 }
 

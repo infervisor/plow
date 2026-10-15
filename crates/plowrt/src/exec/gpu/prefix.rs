@@ -441,12 +441,19 @@ impl GpuEngine {
                     slot_bytes,
                 })
                 .collect();
-            let rings = crate::memory::vmm::VmmRings::new_idle_backed(
+            let mut rings = crate::memory::vmm::VmmRings::new_idle_backed(
                 Arc::clone(be) as Arc<dyn crate::memory::vmm::VmmOps>,
                 &tensors,
                 geo.batch as usize,
             )?;
+            let park = crate::config::RuntimeConfig::get().vmm_ring_park;
+            if crate::config::RuntimeConfig::get().vmm_ring_recycle {
+                rings.enable_handle_recycling(crate::memory::vmm::kv_pool_cap());
+            } else if park > 0 {
+                rings.enable_bounded_park(u64::from(park) * rings.slot_charge());
+            }
             tracing::info!(
+                park,
                 slot_mib = rings.slot_charge() >> 20,
                 resident_mib = rings.stats().resident_bytes >> 20,
                 reserved_gib = rings.stats().reserved_bytes as f64 / (1u64 << 30) as f64,
@@ -500,9 +507,6 @@ impl GpuEngine {
                     // FP8 full-layer scales snapshot over `[0, p_a)`, not just the tail.
                     if !full_scale.is_empty() {
                         kv.enable_strict_publish();
-                    }
-                    if rt.prefix_policy_legacy() {
-                        kv.set_policy(crate::memory::vmm::Policy::Legacy);
                     }
                     tracing::info!(policy = ?kv.policy(), "vmm prefix: retention policy");
                     let host_cap = rt.vmm_host_cache_bytes();
@@ -700,12 +704,20 @@ impl GpuEngine {
         let row_bytes = u64::from(g.hd_full * g.elem);
         let bytes = u64::from(partial) * row_bytes;
         let row0 = u64::from(rows - partial);
-        let pitch = u64::from(g.max_ctx) * row_bytes;
+        // One copy per head: the heads' rows live in separately mapped VMM blocks, and a pitched
+        // copy spanning the unmapped VA between them is rejected (CUDA_ERROR_INVALID_VALUE).
         for &(index, _, _) in &v.tensor_tracks {
-            let dev = self.devp[index].base
-                + (b as u64 * u64::from(g.kvh_full) * u64::from(g.max_ctx) + row0) * row_bytes;
-            self.vmm_copy_heads((dev, pitch), (buf, bytes), bytes, g.kvh_full, to_snap)?;
-            buf += u64::from(g.kvh_full) * bytes;
+            for h in 0..u64::from(g.kvh_full) {
+                let dev = self.devp[index].base
+                    + ((b as u64 * u64::from(g.kvh_full) + h) * u64::from(g.max_ctx) + row0)
+                        * row_bytes;
+                if to_snap {
+                    self.be.memcpy_dtod_async(buf, dev, bytes, &self.stream)?;
+                } else {
+                    self.be.memcpy_dtod_async(dev, buf, bytes, &self.stream)?;
+                }
+                buf += bytes;
+            }
         }
         Ok(())
     }
@@ -735,8 +747,13 @@ impl GpuEngine {
             self.vmm_partial_copy(b, p_a, partial, to_snap)
         })();
         let t1 = t0.map(|t| t.elapsed());
-        // Drain even a partially submitted copy before VMM remapping or snapshot release.
-        let completed = self.be.stream_synchronize(&self.stream);
+        // Drain even a partially submitted copy before VMM remapping or snapshot release. Inside a
+        // launch window a whole restore is drained by the step instead (`deferred_attach`).
+        let completed = if self.window_open && !to_snap && copied.is_ok() {
+            Ok(())
+        } else {
+            self.be.stream_synchronize(&self.stream)
+        };
         if let (Some(t0), Some(t1)) = (t0, t1) {
             eprintln!(
                 "PACKLOG SNAP slot={b} to_snap={} rows={p_a} submit_us={} sync_us={}",
@@ -791,7 +808,11 @@ impl GpuEngine {
             kv.begin_seq(b);
             return Err(error);
         }
-        kv.finish_attach(b);
+        if self.window_open {
+            self.deferred_attach.push(b);
+        } else {
+            kv.finish_attach(b);
+        }
         self.pos[b] = a.rows;
         self.vmm_attached[b] = a.rows;
         // Seed the row-token record with the attached prefix — the tail is
@@ -925,16 +946,13 @@ impl GpuEngine {
     /// block-aligned boundary has no tail, so any prompt sharing those blocks attaches to
     /// it), or every `PLOW_AMD_PREFIX_FINE_ROWS` rows when that is set.
     pub(super) fn vmm_publish(&self, b: usize, max_rows: u32) {
-        use crate::memory::vmm::{Kind, Policy};
+        use crate::memory::vmm::Kind;
         let Some((v, kv)) = self.vmm_prefix() else {
             return;
         };
         let rows = self.pos[b];
         let toks = &self.seq_tokens[b];
         let g = kv.geometry();
-        let legacy = kv.policy() == Policy::Legacy;
-        // The boundary tree gives `X-Session-Id` no cache meaning.
-        let session = legacy && self.session_pin[b].is_some();
         let prompt = kv.prompt_rows(b);
         let prompt_end = is_prompt_end(rows, max_rows, prompt);
         // Every prompt end, not only a session's: a chat client's next turn re-renders the same
@@ -968,9 +986,6 @@ impl GpuEngine {
             tracing::debug!(slot = b, p_a, "vmm_publish skipped: p_a == 0");
             return;
         }
-        if session {
-            kv.note_session(b, toks);
-        }
         let step = crate::config::RuntimeConfig::get()
             .amd_prefix_fine_rows()
             .map_or(kv.block_rows(), |step| step.max(32));
@@ -991,57 +1006,17 @@ impl GpuEngine {
         if !prompt_end && rows < prompt && !kv.checkpoint_awaited(toks, p_a) {
             return;
         }
-        // Only the prompt-end publish retires (a chunk-end publish also caps `max_rows` below
-        // `rows`): the next turn's prompt re-renders this turn's reply, which need not
-        // re-tokenize to the generated ids, so the turn-end boundary may not match it and the
-        // prompt-end boundary must survive until then.
-        // A turn end is an output-only boundary: the next prompt re-renders the reply and
-        // usually diverges before it (`Snap::reusable_prompt`), so without a session it is
-        // another private window copy published for nothing; the prompt end below is restored
-        // or touched instead.
-        // The turn-end output boundary (prompt + reply) is a legacy session feature
-        // (`PLOW_PREFIX_CACHE_OUTPUT`): the next prompt re-renders the reply, so it attaches
-        // 0 of 1223 times on Gemma 4 and the boundary tree never publishes it.
+        // A turn end (prompt + reply) is never published: the next prompt re-renders the reply
+        // and diverges before it (0 of 1223 attaches on Gemma 4); the prompt end below is
+        // restored or touched instead. The boundary tree retires structurally inside the publish.
         let turn_end = rows > prompt;
-        let output =
-            turn_end && session && crate::config::RuntimeConfig::get().prefix_cache_output();
-        let published = if turn_end && !output {
-            false
-        } else {
-            let kind = if turn_end {
-                Kind::TURN_END
-            } else if prompt_end {
+        if !turn_end {
+            let kind = if prompt_end {
                 Kind::PROMPT_END
             } else {
                 Kind::CHECKPOINT
             };
-            self.publish_boundary(b, p_a, kind)
-        };
-        if published && prompt_end && legacy {
-            if let Some(ttl) = self.session_pin[b] {
-                // Pinned now, not at retire: while this turn decodes, other sessions' publishes
-                // must not evict it ahead of idle sessions' boundaries.
-                kv.pin_prefix(&toks[..p_a as usize], std::time::Instant::now() + ttl);
-            }
-            // With or without a session: the boundary this turn attached to is spent once its
-            // prompt end publishes (the next turn attaches to the longest boundary). Left in
-            // place it held a second ~100 MiB window copy per conversation until LRU reached it.
-            // (The boundary tree retires structurally inside the publish.)
-            let retire = session || crate::config::RuntimeConfig::get().prefix_retire_attached();
-            let freed = if retire {
-                kv.retire_superseded(toks, p_a)
-            } else {
-                0
-            };
-            if freed > 0 {
-                tracing::debug!(
-                    slot = b,
-                    p_a,
-                    freed,
-                    session,
-                    "vmm: retired superseded snapshots"
-                );
-            }
+            self.publish_boundary(b, p_a, kind);
         }
         // Turn end: pressure may have evicted the prompt end (the next turn's attach point)
         // while this turn decoded. The rings still hold its window, so restore it now, newest in

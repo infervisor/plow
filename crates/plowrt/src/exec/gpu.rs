@@ -19,6 +19,19 @@ fn pf_packlog_on() -> bool {
 /// Fixed cost of ONE prefill launch, in padded-row equivalents (measured on sm_120 / gemma-4-12B).
 pub(crate) const PF_CHUNK_COST_ROWS: usize = 512;
 
+/// The smallest rung of an ascending `ladder` holding `rows`; the widest when none does (0 when
+/// the ladder is empty).
+pub(crate) fn cover_rung(ladder: impl Iterator<Item = usize>, rows: usize) -> usize {
+    let mut widest = 0;
+    for t in ladder {
+        if t >= rows {
+            return t;
+        }
+        widest = t;
+    }
+    widest
+}
+
 use crate::asset::devblob::{DevBlob, DevProg};
 use crate::device::cuda::{CudaBackend, CudaEvent, CudaStream, KernelFn, PinnedHost};
 use crate::device::{Backend, DeviceMem, Module};
@@ -2570,8 +2583,6 @@ pub struct GpuEngine {
     /// retained prefix of `rows` is intact only while the sequence stopped within this many rows
     /// past it (the VMM prefix cache's `publish_boundary` rule). None: no sliding cache.
     resume_ring_slack: Option<u32>,
-    /// A session sequence's retire pins its published prefix in the VMM cache for this long.
-    session_pin: Vec<Option<std::time::Duration>>,
     vmm_active: Vec<bool>,
     packed_admission: Vec<PackedAdmission>,
     kv_admission_epoch: u64,
@@ -2585,6 +2596,14 @@ pub struct GpuEngine {
     seq_tokens: Vec<Vec<u32>>,
     /// A prompt's prefix-cache key staged for the next attach of that slot (DP router hashes).
     staged_prefix: Vec<Option<crate::memory::vmm::PrefixKey>>,
+    /// A launch's host window is open ([`Self::token_batch_step_window`]): snapshot restores skip
+    /// their stream drain and their holds wait in `deferred_attach` for the step's own drain.
+    window_open: bool,
+    deferred_attach: Vec<usize>,
+    /// Recorded after a windowed launch's id read-back: [`Self::launch_in_flight`].
+    window_event: Option<CudaEvent>,
+    /// `PLOW_PF_PACKLOG` device span of a token-batch launch.
+    step_events: Option<(CudaEvent, CudaEvent)>,
     /// Stop-token set (the checkpoint's `eos_token_id`). `Arc` so the mux can
     /// take a per-tick handle without cloning the Vec while the engine stays
     /// mutably borrowed.
@@ -6721,13 +6740,16 @@ impl GpuEngine {
             vmm_attached: vec![0; batch],
             resume_rows: vec![0; batch],
             resume_ring_slack,
-            session_pin: vec![None; batch],
             vmm_active: vec![false; batch],
             packed_admission: vec![PackedAdmission::Pending; batch],
             kv_admission_epoch: 0,
             kv_pressure_events: 0,
             seq_tokens: vec![Vec::new(); batch],
             staged_prefix: vec![None; batch],
+            window_open: false,
+            deferred_attach: Vec::new(),
+            window_event: None,
+            step_events: None,
             stop_ids: std::sync::Arc::new(stop_ids),
             logits_raw: Vec::new(),
             stage,
@@ -7210,12 +7232,9 @@ impl GpuEngine {
         // of re-prefilling it — then drop the previous sequence's mappings/
         // cache references. Prefix admission maps after lookup; every execution
         // path maps the rows it writes, including inactive decode rows.
-        if crate::config::RuntimeConfig::get().prefix_cache_output() {
-            self.vmm_publish(b, self.pos[b]);
-        }
+        self.vmm_publish(b, self.pos[b]);
         let t_publish = t0.map(|t| t.elapsed());
         self.pos[b] = keep;
-        self.session_pin[b] = None;
         self.vmm_attached[b] = 0;
         if let Some(v) = &self.vmm {
             self.vmm_active[b] = true;
@@ -7279,12 +7298,15 @@ impl GpuEngine {
         }
     }
 
-    /// Slot `b`'s current sequence belongs to a session: when it retires, its published prefix
-    /// (prompt and, with `PLOW_PREFIX_CACHE_OUTPUT`, output blocks) is pinned for `ttl` in the VMM
-    /// prefix cache, evicted only after every unpinned block.
-    pub fn hold_session_prefix(&mut self, b: usize, ttl: std::time::Duration) {
+    /// Slot `b`'s current sequence belongs to a session (`X-Session-Id`): the VMM prefix cache
+    /// protects its newest boundary for `PLOW_PREFIX_SESSION_TTL_S` (0 = none). `_ttl` is the
+    /// static-slot retention TTL, which the VMM path does not use.
+    pub fn hold_session_prefix(&mut self, b: usize, _ttl: std::time::Duration) {
         if self.vmm_prefix_enabled() && b < self.batch {
-            self.session_pin[b] = Some(ttl);
+            if let Some(kv) = self.vmm.as_ref().and_then(|v| v.kv.as_ref()) {
+                let ttl = crate::config::RuntimeConfig::get().prefix_session_ttl();
+                kv.hold_session(b, ttl);
+            }
         }
     }
 
@@ -7304,16 +7326,9 @@ impl GpuEngine {
             }
             return;
         }
-        // The turn-end pass: restores or touches the prompt end (the next turn's attach point)
-        // regardless of `PLOW_PREFIX_CACHE_OUTPUT`, which only gates the legacy output boundary.
+        // The turn-end pass: restores or touches the prompt end (the next turn's attach point).
         if cache_output {
             self.vmm_publish(b, self.pos[b]);
-        }
-        if let (Some(ttl), Some(kv)) = (
-            self.session_pin[b].take(),
-            self.vmm.as_ref().and_then(|v| v.kv.as_ref()),
-        ) {
-            kv.pin_prefix(&self.seq_tokens[b], std::time::Instant::now() + ttl);
         }
         self.pos[b] = 0;
         self.vmm_attached[b] = 0;
@@ -7451,15 +7466,33 @@ impl GpuEngine {
                 Ok(Some(frontier))
             }
             Err(error) => {
+                // A restore deferred inside a launch window may still be copying into this slot:
+                // drain it (and release its hold) before the slot's mappings go.
+                if self.deferred_attach.contains(&b) {
+                    if let Err(drain) = self.flush_deferred_attach() {
+                        return Err(drain);
+                    }
+                }
                 self.retire_slot(b, false);
                 let oom = matches!(error, RuntimeError::Oom(_)) || error.device_code() == Some(2);
+                // Parked live rings (`PLOW_VMM_RING_PARK`) hold device memory no request owns; when
+                // releasing them freed memory, the request waits and retries even with no other
+                // request live.
+                let mut reclaimed = false;
+                if oom {
+                    if let Some(rings) = self.vmm.as_mut().and_then(|v| v.rings.as_mut()) {
+                        reclaimed = rings.release_parked();
+                    }
+                }
                 // Slot-granular KV waits even with no other request live: memory comes back
                 // from other models (retired slots, evictions), not only from this one.
                 let slot_kv = self.vmm.as_ref().is_some_and(|v| v.kv.is_none());
                 if (self.vmm_prefix_enabled() || slot_kv)
                     && oom
                     && !error.is_fatal()
-                    && (slot_kv || self.packed_admission.contains(&PackedAdmission::Ready))
+                    && (slot_kv
+                        || reclaimed
+                        || self.packed_admission.contains(&PackedAdmission::Ready))
                 {
                     self.vmm.as_ref().unwrap().ensure_rows(b, 1)?;
                     self.kv_pressure_events += 1;
@@ -9023,6 +9056,13 @@ impl GpuEngine {
         self.prefill[self.pick_prefill_bucket(avail, usize::MAX)].t as usize
     }
 
+    /// The rung a launch of `rows` rows runs: the smallest bucket holding them (the token batch's
+    /// pick), the widest when none does. Not [`Self::pf_pack_budget`], which is the first launch of
+    /// the cheapest cover and can be narrower than `rows` (4260 rows: 4160, then a tail).
+    pub fn pf_cover_rows(&self, rows: usize) -> usize {
+        cover_rung(self.prefill.iter().map(|b| b.t as usize), rows)
+    }
+
     /// The prefill bucket ladder, ascending rows.
     pub fn pf_bucket_ladder(&self) -> Vec<usize> {
         self.prefill.iter().map(|b| b.t as usize).collect()
@@ -9824,9 +9864,9 @@ impl GpuEngine {
                         g,
                         seg_pf.as_ref().is_some_and(|sp| sp.glu_quant_any_width),
                     )
-                        .into_iter()
-                        .filter(|(seg, _)| packet_role_index(&packet_segment_roles, *seg).is_none())
-                        .collect::<Vec<_>>()
+                    .into_iter()
+                    .filter(|(seg, _)| packet_role_index(&packet_segment_roles, *seg).is_none())
+                    .collect::<Vec<_>>()
                 } else {
                     Vec::new()
                 };
