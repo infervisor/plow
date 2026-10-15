@@ -302,5 +302,34 @@ class BuildRungEnvTests(unittest.TestCase):
             self.assertEqual(record["rung_overrides"], ["prefill:4096:PLOW_NO_GLU_FUSE=0"])
 
 
+
+class SweepReuseTests(unittest.TestCase):
+    def test_a_finished_build_is_reused_only_while_tree_compiler_and_artifacts_match(self):
+        with tempfile.TemporaryDirectory() as d:
+            out = Path(d)
+            (out / "assets").mkdir()
+            (out / "assets" / "model.pkt").write_bytes(b"pkt")
+            plowc = out / "release" / "plowc"
+            plowc.parent.mkdir()
+            plowc.write_bytes(b"plowc")
+            rec = {"commit": "abc", "dirty": False, "compiler_sha256": campaign.sha(plowc),
+                   "build_provenance": {}, "compilation": {"toolchain_env": {}},
+                   "hashes": {"model.pkt": campaign.sha(out / "assets" / "model.pkt")}, "objects": {}}
+            git = {"status": "", "rev-parse": "abc"}
+            env = {"CARGO_TARGET_DIR": d}
+            with patch.object(campaign, "git", lambda *a, **k: git[a[0]]), patch.dict("os.environ", env, clear=True):
+                self.assertEqual(campaign.sweep_build_stale(rec, out), "")
+                (out / "assets" / "model.pkt").write_bytes(b"other")
+                self.assertIn("model.pkt changed", campaign.sweep_build_stale(rec, out))
+                (out / "assets" / "model.pkt").write_bytes(b"pkt")
+                git["rev-parse"] = "def"
+                self.assertIn("built at abc", campaign.sweep_build_stale(rec, out))
+                git["rev-parse"] = "abc"
+                plowc.write_bytes(b"new")
+                self.assertEqual(campaign.sweep_build_stale(rec, out), "plowc changed")
+                plowc.write_bytes(b"plowc")
+                git["status"] = " M x"
+                self.assertEqual(campaign.sweep_build_stale(rec, out), "the source tree is dirty")
+
 if __name__ == "__main__":
     unittest.main()

@@ -2907,7 +2907,11 @@ impl VmmKv {
         };
         let share = rows == inner.share[seq];
         let snap = snap_mut(&mut inner, id).expect("found above");
-        snap.last_used = tick;
+        // Only an attach makes a cold boundary ordinary: its producer's turn-end touch leaves a
+        // unique request's prompt end first in line for eviction.
+        if !snap.cold() {
+            snap.last_used = tick;
+        }
         // What a dedup in `publish_locked` would merge: the publisher's kind and flags.
         snap.kind |= kind;
         snap.reusable_prompt |= (rows as usize) < prompt_rows;
@@ -7460,6 +7464,40 @@ mod tests {
         );
         evict_snapshot(&p);
         assert_eq!(tails(&p), vec![first[16]], "an attach made it the newest");
+    }
+
+    /// The producer's turn-end touch of its cold first-sighting prompt end keeps it cold: under
+    /// pressure it still goes before a boundary that was published normally.
+    #[test]
+    fn turn_end_touch_keeps_a_cold_prompt_end_cold() {
+        let ops = Arc::new(MockVmm::default());
+        let mut p = uniform_pool(ops.clone());
+        p.enable_shared_publish();
+        let warm = prompt(32);
+        let unique: Vec<u32> = warm.iter().map(|t| t + 1000).collect();
+        assert!(p.try_attach(0, &warm).unwrap().is_none());
+        p.ensure_rows(1, 1).unwrap();
+        assert!(p.try_attach(1, &warm).unwrap().is_none());
+        p.ensure_rows(0, 32).unwrap();
+        p.publish_at(0, &warm, 20, 4, |_| Ok(())).unwrap();
+        p.begin_seq(0);
+        p.begin_seq(1);
+        p.ensure_rows(0, 1).unwrap();
+        assert!(p.try_attach(0, &unique).unwrap().is_none());
+        p.ensure_rows(0, 32).unwrap();
+        p.publish_at(0, &unique, 20, 4, |_| Ok(())).unwrap();
+        assert!(
+            p.touch(0, &unique, 20, Kind::PROMPT_END),
+            "the turn-end touch finds it"
+        );
+        p.begin_seq(0);
+        assert!(evict_one(&p.shared, &mut p.shared.inner.lock(), false));
+        assert_eq!(
+            p.cached_rows(&unique),
+            0,
+            "the touched cold boundary goes first"
+        );
+        assert_eq!(p.cached_rows(&warm), 20);
     }
 
     /// A cold publish out of memory frees only other cold boundaries, and is skipped before

@@ -1446,6 +1446,30 @@ def build_args(a: argparse.Namespace, out: Path, rungs: list[str]) -> argparse.N
                               no_probe=True, leased=False, plowrt=None, store_cell=None, hf_dir=a.hf_dir)
 
 
+def sweep_build_stale(rec: dict, out: Path) -> str:
+    """Why a finished build no longer matches this tree, compiler, toolchain and its own artifacts ('' = reusable)."""
+    plowc = Path(os.environ.get("CARGO_TARGET_DIR", REPO / "target")) / "release" / "plowc"
+    prov = rec.get("build_provenance") or {}
+    if rec.get("dirty") or prov.get("source_state_changed") or prov.get("compiler_changed"):
+        return "built from a dirty or changing tree/compiler"
+    if git("status", "--porcelain"):
+        return "the source tree is dirty"
+    if rec.get("commit") != git("rev-parse", "HEAD"):
+        return f"built at {rec.get('commit')}, tree is at {git('rev-parse', 'HEAD')}"
+    if not plowc.is_file() or rec.get("compiler_sha256") != sha(plowc):
+        return "plowc changed"
+    tool = {k: os.environ[k] for k in ("PLOW_NVCC", "PLOW_NVCC_PATH", "NVCC_PREPEND_FLAGS", "NVCC_APPEND_FLAGS")
+            if k in os.environ}
+    if (rec.get("compilation") or {}).get("toolchain_env") != tool:
+        return "toolchain env changed"
+    for sub, files in (("assets", rec.get("hashes") or {}), ("objects", rec.get("objects") or {})):
+        for name, digest in files.items():
+            f = out / sub / name
+            if not f.is_file() or sha(f) != digest:
+                return f"{sub}/{name} changed since the build"
+    return ""
+
+
 def sweep_build(a: argparse.Namespace, out: Path, rungs: list[str]) -> Path:
     """Build, or reuse a finished build of exactly this recipe, emit env and rung overrides."""
     record = out / "build-record.json"
@@ -1456,6 +1480,9 @@ def sweep_build(a: argparse.Namespace, out: Path, rungs: list[str]) -> Path:
         got = {k: rec.get(k) for k in want}
         if got != want:
             die(f"{out} was built from a different recipe/env/rung overrides ({got} vs {want}); use a fresh --out")
+        stale = sweep_build_stale(rec, out)
+        if stale:
+            die(f"{out} is stale ({stale}); use a fresh --out")
         return out
     cmd_build(build_args(a, out, rungs))
     return out
