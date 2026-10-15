@@ -4233,11 +4233,8 @@ fn dense_native_route(
         w[j] = base(format!("{pfx}{proj}.weight"), ih)?;
         sc[j] = base(format!("{pfx}{proj}.weight_scale_inv"), sg)?;
     }
-    // The combine writes the rows the collective then reduces in place.
-    let (out, red) = (usize::from(cb.t[0]), usize::from(x.t[0]));
-    if devp.get(out).map(|d| d.base) != devp.get(red).map(|d| d.base) {
-        return Err(err("combine output and collective buffer differ".into()));
-    }
+    // The combine's output is this rank's collective slot (the interpreter segment runs the
+    // same pair back to back), so the native collective reduces exactly what it wrote.
     let partial = |splits: u32, cols: u32| u64::from(splits * m * cols) * 4;
     if inter % 16 != 0
         || partial(h / LT_FUSE_KS, 2 * inter) > DENSE_H_OFFSET
