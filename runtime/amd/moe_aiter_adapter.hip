@@ -453,7 +453,7 @@ extern "C" __global__ __launch_bounds__(256) void plow_moe_router_topk(MoeRouter
         unsigned sb;
         __builtin_memcpy(&sb, &sc, 4);
         sb = (sb & 0x80000000u) ? ~sb : (sb | 0x80000000u);
-        key[q] = ((unsigned long long)sb << 20) | (unsigned long long)((a.n_exp - 1u - e) & 0xFFFFFu);
+        key[q] = ((unsigned long long)sb << 32) | (unsigned long long)(a.n_exp - 1u - e);
     }
     /* k rounds of a wave-wide max over the packed keys (unique per expert, so the winner is
      * one lane and one slot): the same order the rank-by-comparison form produces. The round
@@ -519,4 +519,4 @@ extern "C" __global__ __launch_bounds__(256) void plow_moe_router_topk(MoeRouter
 #endif
 }
 
-extern "C" __device__ unsigned plow_moe_router_abi_1 = 1;
+extern "C" __device__ unsigned plow_moe_router_abi_2 = 1;
