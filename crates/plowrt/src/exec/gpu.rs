@@ -2570,8 +2570,6 @@ pub struct GpuEngine {
     /// retained prefix of `rows` is intact only while the sequence stopped within this many rows
     /// past it (the VMM prefix cache's `publish_boundary` rule). None: no sliding cache.
     resume_ring_slack: Option<u32>,
-    /// A session sequence's retire pins its published prefix in the VMM cache for this long.
-    session_pin: Vec<Option<std::time::Duration>>,
     vmm_active: Vec<bool>,
     packed_admission: Vec<PackedAdmission>,
     kv_admission_epoch: u64,
@@ -6729,7 +6727,6 @@ impl GpuEngine {
             vmm_attached: vec![0; batch],
             resume_rows: vec![0; batch],
             resume_ring_slack,
-            session_pin: vec![None; batch],
             vmm_active: vec![false; batch],
             packed_admission: vec![PackedAdmission::Pending; batch],
             kv_admission_epoch: 0,
@@ -7222,12 +7219,9 @@ impl GpuEngine {
         // of re-prefilling it — then drop the previous sequence's mappings/
         // cache references. Prefix admission maps after lookup; every execution
         // path maps the rows it writes, including inactive decode rows.
-        if crate::config::RuntimeConfig::get().prefix_cache_output() {
-            self.vmm_publish(b, self.pos[b]);
-        }
+        self.vmm_publish(b, self.pos[b]);
         let t_publish = t0.map(|t| t.elapsed());
         self.pos[b] = keep;
-        self.session_pin[b] = None;
         self.vmm_attached[b] = 0;
         if let Some(v) = &self.vmm {
             self.vmm_active[b] = true;
@@ -7291,13 +7285,11 @@ impl GpuEngine {
         }
     }
 
-    /// Slot `b`'s current sequence belongs to a session: when it retires, its published prefix
-    /// (prompt and, with `PLOW_PREFIX_CACHE_OUTPUT`, output blocks) is pinned for `ttl` in the VMM
-    /// prefix cache, evicted only after every unpinned block.
-    pub fn hold_session_prefix(&mut self, b: usize, ttl: std::time::Duration) {
+    /// Slot `b`'s current sequence belongs to a session (`X-Session-Id`): the VMM prefix cache
+    /// protects its newest boundary for `PLOW_PREFIX_SESSION_TTL_S` (0 = none). `_ttl` is the
+    /// static-slot retention TTL, which the VMM path does not use.
+    pub fn hold_session_prefix(&mut self, b: usize, _ttl: std::time::Duration) {
         if self.vmm_prefix_enabled() && b < self.batch {
-            self.session_pin[b] = Some(ttl);
-            // The boundary tree's session retention: `PLOW_PREFIX_SESSION_TTL_S` (0 = none).
             if let Some(kv) = self.vmm.as_ref().and_then(|v| v.kv.as_ref()) {
                 let ttl = crate::config::RuntimeConfig::get().prefix_session_ttl();
                 kv.hold_session(b, ttl);
@@ -7321,16 +7313,9 @@ impl GpuEngine {
             }
             return;
         }
-        // The turn-end pass: restores or touches the prompt end (the next turn's attach point)
-        // regardless of `PLOW_PREFIX_CACHE_OUTPUT`, which only gates the legacy output boundary.
+        // The turn-end pass: restores or touches the prompt end (the next turn's attach point).
         if cache_output {
             self.vmm_publish(b, self.pos[b]);
-        }
-        if let (Some(ttl), Some(kv)) = (
-            self.session_pin[b].take(),
-            self.vmm.as_ref().and_then(|v| v.kv.as_ref()),
-        ) {
-            kv.pin_prefix(&self.seq_tokens[b], std::time::Instant::now() + ttl);
         }
         self.pos[b] = 0;
         self.vmm_attached[b] = 0;

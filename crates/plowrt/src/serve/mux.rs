@@ -1855,11 +1855,27 @@ pub fn spawn(
                 .map(|s| s.prompt_ids.len().saturating_sub(s.pf_pos))
                 .sum();
             let taken_slots = std::mem::take(&mut slots);
-            let taken_obs = obs.take().unwrap_or_else(|| {
+            #[cfg_attr(not(feature = "cuda"), allow(unused_mut))]
+            let mut taken_obs = obs.take().unwrap_or_else(|| {
                 let mut obs = RunObserver::new(state.record_trace, indirection_size);
                 obs.set_kv_pages_range(kv_pages_range.clone());
                 obs
             });
+            #[cfg(feature = "cuda")]
+            {
+                taken_obs.host.queued_prefill_rows = if pf_itl_budget_ms() > 0 {
+                    // A CFG pair prefills two sequences, as its KV reservation counts it.
+                    waiting
+                        .iter()
+                        .map(|(job, _)| {
+                            let pair = job.opts.speech.as_ref().is_some_and(|s| s.cfg.is_some());
+                            job.prompt_ids.len() * (1 + usize::from(pair))
+                        })
+                        .sum()
+                } else {
+                    0
+                };
+            }
             let arena_ref = arena.clone();
             let kv_pages_for_tick = kv_pages_range.clone();
 
@@ -3452,6 +3468,7 @@ fn run_one_tick(
                         &mut dev_sampled,
                         &mut obs.host.ride,
                         aging,
+                        obs.host.queued_prefill_rows,
                     ) {
                         if tick_fault.is_none() {
                             tick_fault = Some(f);
@@ -5810,6 +5827,16 @@ fn arrival_key(arrived: Instant, now: Instant) -> u64 {
     u64::MAX - u64::try_from(now.saturating_duration_since(arrived).as_nanos()).unwrap_or(u64::MAX)
 }
 
+/// Prefill rows still owed: every seated prompt's unsent rows plus the queued prompts'. The ITL
+/// budget yields when this exceeds one full launch; the launch candidates alone are capped
+/// slices (`pf_plan_slice` under the chunk cap) and miss both the remainders and the queue.
+#[cfg(feature = "cuda")]
+fn itl_backlog_rows(seated_unsent: impl IntoIterator<Item = usize>, queued_rows: usize) -> usize {
+    seated_unsent
+        .into_iter()
+        .fold(queued_rows, usize::saturating_add)
+}
+
 #[cfg(feature = "cuda")]
 fn pf_itl_budget_ms() -> u32 {
     crate::config::RuntimeConfig::get().pf_itl_budget_ms
@@ -5952,6 +5979,7 @@ fn gpu_prefill_batched_pass(
     dev_sampled: &mut bool,
     ride: &mut crate::sched::ride::RideCost,
     aging: std::time::Duration,
+    queued_rows: usize,
 ) -> Option<crate::DeviceErrorInfo> {
     use crate::exec::gpu::PfBatchReq;
 
@@ -6185,7 +6213,15 @@ fn gpu_prefill_batched_pass(
         // A backlog wider than one full launch means prefill is the bottleneck: every extra launch
         // costs its fixed overhead in capacity (H100 26B: ~24 ms; at 2.2 sess/s the cap cost 18% of
         // prefill rows/s), so the budget yields to throughput until the backlog drains.
-        let budget_on = decode_rows > 0 && pf_itl_budget_ms() > 0 && avail <= budget_max;
+        let budget_on = decode_rows > 0
+            && pf_itl_budget_ms() > 0
+            && itl_backlog_rows(
+                (0..cap.min(slots.len())).filter_map(|i| {
+                    let (s, pf_pos) = pack_row(slots, i)?;
+                    (s.step == 0).then(|| s.prompt_ids.len().saturating_sub(withheld + pf_pos))
+                }),
+                queued_rows,
+            ) <= budget_max;
         let itl_cap = if budget_on
             && !candidates.iter().any(|c| {
                 slots[c.span.slot as usize]
@@ -6423,10 +6459,13 @@ fn gpu_prefill_batched_pass(
             let ms = t_launch.elapsed().as_secs_f64() * 1e3;
             ride.observe_launch(ride_key, riders, ms);
             // The rung actually launched: the smallest bucket holding the packed rows and riders.
-            ride.observe_rung(
-                e.pf_pack_budget(pack.iter().map(|p| p.2).sum::<usize>() + riders),
-                ms,
-            );
+            // Only `rows_within` (the ITL budget) reads it.
+            if pf_itl_budget_ms() > 0 {
+                ride.observe_rung(
+                    e.pf_pack_budget(pack.iter().map(|p| p.2).sum::<usize>() + riders),
+                    ms,
+                );
+            }
         }
         match res {
             Ok(()) => {
@@ -7903,6 +7942,22 @@ mod tests {
             super::trim_for_riders(1024, 1088, 3, 1024, 600),
             "the tail joins waiting rows"
         );
+    }
+
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn itl_backlog_counts_remainders_and_queue_not_capped_slices() {
+        // Two seated 6K prompts sliced to 2048 each (4096 of candidates) under an 8192-row
+        // launch: the slices fit one launch, the backlog does not.
+        let full_launch = 8192;
+        let slices = 2048 + 2048;
+        assert!(slices <= full_launch);
+        assert!(super::itl_backlog_rows([6000, 6000], 0) > full_launch);
+        // Seated rows fit, the queue behind them does not.
+        assert!(super::itl_backlog_rows([1000], 0) <= full_launch);
+        assert!(super::itl_backlog_rows([1000], 7500) > full_launch);
+        assert_eq!(super::itl_backlog_rows(std::iter::empty(), 0), 0);
+        assert_eq!(super::itl_backlog_rows([usize::MAX], 1), usize::MAX);
     }
 
     #[cfg(feature = "cuda")]

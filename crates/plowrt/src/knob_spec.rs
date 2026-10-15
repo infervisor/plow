@@ -63,17 +63,12 @@ const PUBLISH_SHARED_QUALIFIED: Status = Status::Qualified {
         "docs/flags-reference.md: `=0` is the rollback",
     ],
 };
-const CACHE_OUTPUT_QUALIFIED: Status = Status::Qualified {
+/// Default-on with `X-Session-Id` only; production sends no header. Not qualified: the one
+/// session-header A/B lost to the legacy session pin.
+const SESSION_TTL_CANDIDATE: Status = Status::Candidate {
     evidence: &[
-        "agent/prefix-cache v1: a 7230-token follow-up turn 404 -> 32 ms TTFT",
-        "agent/prefix-cache v2, 12B H100 prefix-repetition, =0 vs default: C4 144.4/144.7, C16 258.4/259.4 ms TTFT, hits equal (neutral on single-turn)",
-        "docs/flags-reference.md: `=0` is the rollback",
-    ],
-};
-const RETIRE_ATTACHED_QUALIFIED: Status = Status::Qualified {
-    evidence: &[
-        "Gemma-4 26B FP8 H100, human-paced chat replay without session ids (1.1 sess/s, think median 45 s), default vs =0: cached 58.0% vs 49.2%, continuation hits 70.0% vs 50.7%, TTFT p50 178 vs 185 ms, TPOT p50 46.1 vs 52.8 ms (/opt/dlami/nvme/lava-tts/g26-cache-study/REPORT.md)",
-        "`=0` is the rollback",
+        "Gemma-4 26B FP8 H100, session header on (1.1 sess/s, think 45 s): tree + TTL 150 s vs production legacy pin 60 s: cached 56.1% vs 61.1%, TTFT p50/p99 144/1435 vs 128/961 ms, continuation hits 73.7% vs 70.2% (/opt/dlami/nvme/lava-tts/g26-revamp/lab/sess/summary.tsv)",
+        "no effect without `X-Session-Id`; `=0` gives sessions no special retention",
     ],
 };
 const INFLIGHT_WAIT_QUALIFIED: Status = Status::Qualified {
@@ -558,11 +553,8 @@ pub const RUNTIME: &[KnobSpec] = &[
     KnobSpec::new("rt.vmm_deferred_reclaim", Some("PLOW_VMM_DEFERRED_RECLAIM"), Layer::Runtime, Domain::Bool, ON, PROMOTED),
     KnobSpec::new("rt.vmm_stale_reserve", Some("PLOW_VMM_STALE_RESERVE"), Layer::Runtime, Domain::Bool, ON, STALE_RESERVE_QUALIFIED),
     KnobSpec::new("rt.vmm_publish_shared", Some("PLOW_VMM_PUBLISH_SHARED"), Layer::Runtime, Domain::Bool, ON, PUBLISH_SHARED_QUALIFIED),
-    KnobSpec::new("rt.prefix_cache_output", Some("PLOW_PREFIX_CACHE_OUTPUT"), Layer::Runtime, Domain::Bool, ON, CACHE_OUTPUT_QUALIFIED),
-    KnobSpec::new("rt.prefix_retire_attached", Some("PLOW_PREFIX_RETIRE_ATTACHED"), Layer::Runtime, Domain::Bool, ON, RETIRE_ATTACHED_QUALIFIED),
     KnobSpec::new("rt.prefix_inflight_wait", Some("PLOW_PREFIX_INFLIGHT_WAIT"), Layer::Runtime, Domain::Bool, ON, INFLIGHT_WAIT_QUALIFIED),
-    KnobSpec::new("rt.prefix_policy", Some("PLOW_PREFIX_POLICY"), Layer::Runtime, Domain::Str, Default::Static(Val::Str("tree")), OPT_IN),
-    KnobSpec::new("rt.prefix_session_ttl_s", Some("PLOW_PREFIX_SESSION_TTL_S"), Layer::Runtime, U32, Default::Static(Val::Nat(150)), OPT_IN),
+    KnobSpec::new("rt.prefix_session_ttl_s", Some("PLOW_PREFIX_SESSION_TTL_S"), Layer::Runtime, U32, Default::Static(Val::Nat(150)), SESSION_TTL_CANDIDATE),
     KnobSpec::new("rt.prefix_chunk_publish", Some("PLOW_PREFIX_CHUNK_PUBLISH"), Layer::Runtime, Domain::Bool, ON, CHUNK_PUBLISH_QUALIFIED),
     KnobSpec::new("rt.vmm_release_retire", Some("PLOW_VMM_RELEASE_RETIRE"), Layer::Runtime, Domain::Bool, ON, RELEASE_RETIRE_QUALIFIED),
     KnobSpec::new("rt.ttft_log", Some("PLOW_TTFT_LOG"), Layer::Runtime, Domain::Bool, OFF, OPT_IN),
@@ -752,6 +744,9 @@ pub const RAW_ENV: &[KnobSpec] = &[
     KnobSpec::new("env.PLOW_PF_NO_INTERLEAVE", Some("PLOW_PF_NO_INTERLEAVE"), Layer::RawEnv, Domain::Str, UNSET, REMOVED),
     KnobSpec::new("env.PLOW_PF_SPAN_POLICY", Some("PLOW_PF_SPAN_POLICY"), Layer::RawEnv, Domain::Str, UNSET, REMOVED),
     KnobSpec::new("env.PLOW_PIPE_PREFILL", Some("PLOW_PIPE_PREFILL"), Layer::RawEnv, Domain::Str, UNSET, REMOVED),
+    KnobSpec::new("env.PLOW_PREFIX_CACHE_OUTPUT", Some("PLOW_PREFIX_CACHE_OUTPUT"), Layer::RawEnv, Domain::Str, UNSET, REMOVED),
+    KnobSpec::new("env.PLOW_PREFIX_POLICY", Some("PLOW_PREFIX_POLICY"), Layer::RawEnv, Domain::Str, UNSET, REMOVED),
+    KnobSpec::new("env.PLOW_PREFIX_RETIRE_ATTACHED", Some("PLOW_PREFIX_RETIRE_ATTACHED"), Layer::RawEnv, Domain::Str, UNSET, REMOVED),
     KnobSpec::new("env.PLOW_QUEUE_TTL_MS", Some("PLOW_QUEUE_TTL_MS"), Layer::RawEnv, Domain::Str, UNSET, REMOVED),
     KnobSpec::new("env.PLOW_RIDE_FIXED", Some("PLOW_RIDE_FIXED"), Layer::RawEnv, Domain::Str, UNSET, REMOVED),
     KnobSpec::new("env.PLOW_RUNG_FAST_PROBE", Some("PLOW_RUNG_FAST_PROBE"), Layer::RawEnv, Domain::Str, UNSET, REMOVED),

@@ -508,9 +508,6 @@ impl GpuEngine {
                     if !full_scale.is_empty() {
                         kv.enable_strict_publish();
                     }
-                    if rt.prefix_policy_legacy() {
-                        kv.set_policy(crate::memory::vmm::Policy::Legacy);
-                    }
                     tracing::info!(policy = ?kv.policy(), "vmm prefix: retention policy");
                     let host_cap = rt.vmm_host_cache_bytes();
                     if host_cap > 0 {
@@ -949,16 +946,13 @@ impl GpuEngine {
     /// block-aligned boundary has no tail, so any prompt sharing those blocks attaches to
     /// it), or every `PLOW_AMD_PREFIX_FINE_ROWS` rows when that is set.
     pub(super) fn vmm_publish(&self, b: usize, max_rows: u32) {
-        use crate::memory::vmm::{Kind, Policy};
+        use crate::memory::vmm::Kind;
         let Some((v, kv)) = self.vmm_prefix() else {
             return;
         };
         let rows = self.pos[b];
         let toks = &self.seq_tokens[b];
         let g = kv.geometry();
-        let legacy = kv.policy() == Policy::Legacy;
-        // The boundary tree gives `X-Session-Id` no cache meaning.
-        let session = legacy && self.session_pin[b].is_some();
         let prompt = kv.prompt_rows(b);
         let prompt_end = is_prompt_end(rows, max_rows, prompt);
         // Every prompt end, not only a session's: a chat client's next turn re-renders the same
@@ -992,9 +986,6 @@ impl GpuEngine {
             tracing::debug!(slot = b, p_a, "vmm_publish skipped: p_a == 0");
             return;
         }
-        if session {
-            kv.note_session(b, toks);
-        }
         let step = crate::config::RuntimeConfig::get()
             .amd_prefix_fine_rows()
             .map_or(kv.block_rows(), |step| step.max(32));
@@ -1015,57 +1006,17 @@ impl GpuEngine {
         if !prompt_end && rows < prompt && !kv.checkpoint_awaited(toks, p_a) {
             return;
         }
-        // Only the prompt-end publish retires (a chunk-end publish also caps `max_rows` below
-        // `rows`): the next turn's prompt re-renders this turn's reply, which need not
-        // re-tokenize to the generated ids, so the turn-end boundary may not match it and the
-        // prompt-end boundary must survive until then.
-        // A turn end is an output-only boundary: the next prompt re-renders the reply and
-        // usually diverges before it (`Snap::reusable_prompt`), so without a session it is
-        // another private window copy published for nothing; the prompt end below is restored
-        // or touched instead.
-        // The turn-end output boundary (prompt + reply) is a legacy session feature
-        // (`PLOW_PREFIX_CACHE_OUTPUT`): the next prompt re-renders the reply, so it attaches
-        // 0 of 1223 times on Gemma 4 and the boundary tree never publishes it.
+        // A turn end (prompt + reply) is never published: the next prompt re-renders the reply
+        // and diverges before it (0 of 1223 attaches on Gemma 4); the prompt end below is
+        // restored or touched instead. The boundary tree retires structurally inside the publish.
         let turn_end = rows > prompt;
-        let output =
-            turn_end && session && crate::config::RuntimeConfig::get().prefix_cache_output();
-        let published = if turn_end && !output {
-            false
-        } else {
-            let kind = if turn_end {
-                Kind::TURN_END
-            } else if prompt_end {
+        if !turn_end {
+            let kind = if prompt_end {
                 Kind::PROMPT_END
             } else {
                 Kind::CHECKPOINT
             };
-            self.publish_boundary(b, p_a, kind)
-        };
-        if published && prompt_end && legacy {
-            if let Some(ttl) = self.session_pin[b] {
-                // Pinned now, not at retire: while this turn decodes, other sessions' publishes
-                // must not evict it ahead of idle sessions' boundaries.
-                kv.pin_prefix(&toks[..p_a as usize], std::time::Instant::now() + ttl);
-            }
-            // With or without a session: the boundary this turn attached to is spent once its
-            // prompt end publishes (the next turn attaches to the longest boundary). Left in
-            // place it held a second ~100 MiB window copy per conversation until LRU reached it.
-            // (The boundary tree retires structurally inside the publish.)
-            let retire = session || crate::config::RuntimeConfig::get().prefix_retire_attached();
-            let freed = if retire {
-                kv.retire_superseded(toks, p_a)
-            } else {
-                0
-            };
-            if freed > 0 {
-                tracing::debug!(
-                    slot = b,
-                    p_a,
-                    freed,
-                    session,
-                    "vmm: retired superseded snapshots"
-                );
-            }
+            self.publish_boundary(b, p_a, kind);
         }
         // Turn end: pressure may have evicted the prompt end (the next turn's attach point)
         // while this turn decoded. The rings still hold its window, so restore it now, newest in
