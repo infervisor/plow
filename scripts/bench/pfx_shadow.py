@@ -76,9 +76,11 @@ def load(path):
         sys.exit("no header record: was the trace armed at pool bring-up?")
     for r in reqs:
         other["dropped_events"] = max(other["dropped_events"], r.get("dropped_events", 0))
-        t_fin = r.get("t_fin") or r["t_att"]
         est = r["t_att"] + (r["prompt"] - r["att"]) / PREFILL_ROWS_PER_S
-        r["t_ready"] = min(ready.get(r["rid"], est), t_fin)
+        t_ready = ready.get(r["rid"], est)
+        # Still in flight at shutdown: no finish, its KV reusable only once prefilled.
+        t_fin = r.get("t_fin") or t_ready
+        r["t_ready"] = min(t_ready, t_fin)
         r["t_fin"] = max(t_fin, r["t_ready"])
     reqs.sort(key=lambda r: r["t_att"])
     return header, reqs, other
@@ -414,19 +416,20 @@ class BoundaryCache:
         if b is not None:
             b.users -= 1
             # The prompt end continues the attached boundary: its pending continuation is done.
+            # Without one it stays pending, as `Snap::pending` does (only LRU takes it then).
             if c is not None and (c is b or b in self.ancestors(c)):
                 b.pending -= 1
-        self.trim()
-        if c is not None and c.alive:
-            self.try_retire(c.parent)
-            self.try_retire(superseded)
-            self.try_retire(b)
         # The request maps its prompt's published whole blocks until it finishes.
         have = set(st["hold"])
         for k in self.block_keys(h16, min(P, len(h16) * 16)):
             if k in self.blocks and k not in have:
                 self.ref_block(k)
                 st["hold"].append(k)
+        self.trim()
+        if c is not None and c.alive:
+            self.try_retire(c.parent)
+            self.try_retire(superseded)
+            self.try_retire(b)
 
     def finish(self, r, st, t):
         h16, end = r["h16"], st["end"]
@@ -446,6 +449,11 @@ class BoundaryCache:
     def probe(self, h16, prompt):
         b = self.lookup(h16, prompt)
         return b.rows if b else 0
+
+    def retained(self, h16, prompt):
+        """The prompt's own end boundary is attachable."""
+        end = (prompt - self.c.backoff) // self.c.quantum * self.c.quantum
+        return end > 0 and keyat(h16, end) in self.bounds
 
 
 class HybridCache:
@@ -476,7 +484,7 @@ class HybridCache:
             self.total += size
         if hold:
             e[0] += 1
-        e[1] = (t, rank)
+        e[1] = max(e[1], (t, rank)) if isinstance(e[1], tuple) else (t, rank)
         self.seq += 1
         heapq.heappush(self.lru, (e[1], self.seq, d is self.full, k))
         self.ever.add(k)
@@ -530,15 +538,16 @@ class HybridCache:
             e = d.get(k)
             if e is not None:
                 e[0] -= 1
+                # A held block's heap entry may have been dropped by a trim: requeue it.
+                self.seq += 1
+                heapq.heappush(self.lru, (e[1], self.seq, full, k))
         n = len(h16)
         # Sliding blocks behind the final window were freed while the request ran (they keep
-        # their earlier recency); the window and every full block are freed now.
+        # their earlier recency, and a live one is charged now); the window and every full
+        # block are freed at the finish.
         for i in range(n):
             self._add(self.full, h16[i], self.fb, t, False, -i)
-            if i >= n - self.wb:
-                self._add(self.slide, h16[i], self.sb, t, False, -i)
-            elif h16[i] not in self.slide:
-                self._add(self.slide, h16[i], self.sb, st["t"], False, -i)
+            self._add(self.slide, h16[i], self.sb, t if i >= n - self.wb else st["t"], False, -i)
         self.trim()
 
     def trim(self):
@@ -554,6 +563,11 @@ class HybridCache:
 
     def probe(self, h16, prompt):
         return 16 * self.hit(h16, prompt)
+
+    def retained(self, h16, prompt):
+        """Every block a hit on the whole prompt can use is cached."""
+        lim = min((prompt - 1) // 16, len(h16))
+        return lim > 0 and self.hit(h16, prompt) == lim
 
 
 def conversations(reqs):
@@ -589,8 +603,7 @@ def replay(reqs, make, t0, t1, sample_s=10.0, active_s=300.0):
             ret = 0
             for tf, q in last.values():
                 if next_sample - tf <= active_s:
-                    got = cache.probe(q["h16"], q["prompt"])
-                    ret += got > 0 and got >= q["prompt"] - 64
+                    ret += cache.retained(q["h16"], q["prompt"])
             byte_int += cache.total
             conv_int += ret
             samples += 1
