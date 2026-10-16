@@ -482,6 +482,22 @@ __device__ unsigned long long g_tr_gate[PLOW_TRACE_MAX];
 __device__ unsigned long long g_tr_body[PLOW_TRACE_MAX];
 __device__ unsigned long long g_tr_sig[PLOW_TRACE_MAX];
 #endif
+#if PLOW_NV_TRACE >= 2
+/* PLOW_NV_TRACE=2: every block's packets on one %globaltimer (ns) timeline, for critical-path
+ * attribution across blocks. Per packet: (inst << 32 | block << 16 | slice), gate start,
+ * gate end, body end, signal end, in per-block slots (no shared atomic). A full slot stops
+ * recording. */
+#define PLOW_TL_BLOCKS 160
+#define PLOW_TL_PER 1536
+#define PLOW_TL_W 8 /* + three in-body phase stamps (op_norm.cuh PLOW_TL_PH), 0 when unset */
+__device__ unsigned g_tl_cnt[PLOW_TL_BLOCKS];
+__device__ unsigned long long g_tl[PLOW_TL_BLOCKS * PLOW_TL_PER * PLOW_TL_W];
+__device__ __forceinline__ unsigned long long plow_gtime() {
+    unsigned long long t;
+    asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t));
+    return t;
+}
+#endif
 #if !PLOW_NV_PTXSYNC
 /* Release before signal / acquire after the gate — one device-scope fence, exactly where
  * interp.hip puts its agent-scope buffer_wbl2 / buffer_inv. */
@@ -1243,7 +1259,19 @@ extern "C" __device__ unsigned PLOW_SYM(plow_kv_layout) = 1;
  * offset 16 of a 64-byte record, so the access is 16-byte aligned (asserted in
  * dev_isa.h). k is always a literal, so tw_[k>>1] resolves to a register. */
 #define PLOW_T(k) ((tw_[(k) >> 1] >> (((k) & 1) * 16)) & 0xFFFFu)
+/* PLOW_NV_INST_PRELOAD (default off): the main loop copies the packet's 64-B instruction and its
+ * eight resolved tensor pointers into shared memory BEFORE the gate (both are immutable for the
+ * launch), so the body starts on smem reads instead of two dependent L2/HBM round trips after it. */
+#ifndef PLOW_NV_INST_PRELOAD
+#define PLOW_NV_INST_PRELOAD 0
+#endif
+#if PLOW_NV_INST_PRELOAD
+__shared__ __align__(16) PlowDevInst plow_s_in;
+__shared__ void* plow_s_ten[8];
+#define TEN(k) (plow_s_ten[k])
+#else
 #define TEN(k) (PLOW_T(k) == PLOW_TENSOR_NONE ? nullptr : T[PLOW_T(k)])
+#endif
 #define TEN_I(k) ((in->i[k] == PLOW_TENSOR_NONE || in->i[k] == 0) ? nullptr : T[in->i[k]])
 
 __device__ __forceinline__ void plow_exec(const PlowDevInst* in, void* const* T, unsigned slice,
@@ -3641,6 +3669,16 @@ __global__ __launch_bounds__(PLOW_NV_THREADS, PLOW_NV_MINBLK) void PLOW_SYM(inte
 #endif
         const PlowDevInst* in = prog.insts + e.inst;
 #endif
+#if PLOW_NV_INST_PRELOAD
+        /* Warp 1 (not a poller unless wait_len > 32): lanes 0-3 copy the instruction, lanes 8-15
+         * resolve its tensor handles. The gate's __syncthreads publishes both to the block. */
+        if (threadIdx.x >= 32u && threadIdx.x < 36u) {
+            ((uint4*)&plow_s_in)[threadIdx.x - 32u] = ((const uint4*)in)[threadIdx.x - 32u];
+        } else if (threadIdx.x >= 40u && threadIdx.x < 48u) {
+            const unsigned h = in->t[threadIdx.x - 40u];
+            plow_s_ten[threadIdx.x - 40u] = h == PLOW_TENSOR_NONE ? nullptr : prog.tensors[h];
+        }
+#endif
 
         /* GATES live on the STREAM ENTRY, always — the 64-byte PlowDevInst carries no
          * wait/succ metadata. Coarse entries point at the op's coarse lists (all slices
@@ -3671,6 +3709,10 @@ __global__ __launch_bounds__(PLOW_NV_THREADS, PLOW_NV_MINBLK) void PLOW_SYM(inte
         long long t_gate0 = 0, t_gate1 = 0, t_body1 = 0;
         if (tr) t_gate0 = clock64();
 #endif
+#if PLOW_NV_TRACE >= 2
+        unsigned long long tl0 = 0, tl1 = 0, tl2 = 0;
+        if (threadIdx.x == 0) tl0 = plow_gtime();
+#endif
         /* Gate: one thread per counter, polled concurrently. */
         for (unsigned w = threadIdx.x; w < wait_len; w += blockDim.x) {
             const PlowWait pw = prog.waits[wait_ofs + w];
@@ -3690,6 +3732,9 @@ __global__ __launch_bounds__(PLOW_NV_THREADS, PLOW_NV_MINBLK) void PLOW_SYM(inte
 #endif
 #if PLOW_NV_TRACE
         if (tr) t_gate1 = clock64();
+#endif
+#if PLOW_NV_TRACE >= 2
+        if (threadIdx.x == 0) tl1 = plow_gtime();
 #endif
 
 #if PLOW_NV_PTXSYNC == 1 || PLOW_NV_PTXSYNC == 3
@@ -3716,7 +3761,11 @@ __global__ __launch_bounds__(PLOW_NV_THREADS, PLOW_NV_MINBLK) void PLOW_SYM(inte
         (void)nblk_grid;
 #else
         if (e.inst < PLOW_SYM(plow_debug_max_inst)) {
+#if PLOW_NV_INST_PRELOAD
+            plow_exec(&plow_s_in, prog.tensors, e.slice, in->blocks ? in->blocks : nblk_grid, arena
+#else
             plow_exec(in, prog.tensors, e.slice, in->blocks ? in->blocks : nblk_grid, arena
+#endif
 #if PLOW_MIXED_STEP
                       , &prog
 #endif
@@ -3733,6 +3782,9 @@ __global__ __launch_bounds__(PLOW_NV_THREADS, PLOW_NV_MINBLK) void PLOW_SYM(inte
 #endif
 #if PLOW_NV_TRACE
         if (tr) t_body1 = clock64();
+#endif
+#if PLOW_NV_TRACE >= 2
+        if (threadIdx.x == 0) tl2 = plow_gtime();
 #endif
 
 #if PLOW_NV_PTXSYNC != 1 && PLOW_NV_PTXSYNC != 3
@@ -3760,6 +3812,27 @@ __global__ __launch_bounds__(PLOW_NV_THREADS, PLOW_NV_MINBLK) void PLOW_SYM(inte
             g_tr_body[k] = (unsigned long long)(t_body1 - t_gate1);
             g_tr_sig[k]  = (unsigned long long)(clock64() - t_body1);
             g_tr_n       = k + 1;
+        }
+#endif
+#if PLOW_NV_TRACE >= 2
+        __syncthreads();
+        if (threadIdx.x == 0 && blockIdx.x < PLOW_TL_BLOCKS) {
+            const unsigned long long tl3 = plow_gtime();
+            const unsigned k = g_tl_cnt[blockIdx.x];
+            if (k < PLOW_TL_PER) {
+                unsigned long long* r = g_tl + ((size_t)blockIdx.x * PLOW_TL_PER + k) * PLOW_TL_W;
+                r[0] = ((unsigned long long)e.inst << 32) | ((unsigned long long)(blockIdx.x & 0xffffu) << 16) |
+                       (e.slice & 0xffffu);
+                r[1] = tl0;
+                r[2] = tl1;
+                r[3] = tl2;
+                r[4] = tl3;
+                for (int q = 0; q < 3; q++) {
+                    r[5 + q] = g_tl_ph[blockIdx.x][q];
+                    g_tl_ph[blockIdx.x][q] = 0;
+                }
+                g_tl_cnt[blockIdx.x] = k + 1;
+            }
         }
 #endif
     }

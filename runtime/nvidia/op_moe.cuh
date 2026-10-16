@@ -434,6 +434,12 @@ static __global__ void plow_moe_slot_glu_fp8_blk(bf16* __restrict__ fu, const bf
 #ifndef PLOW_MOE_XN_BF16
 #define PLOW_MOE_XN_BF16 0
 #endif
+#ifndef PLOW_NV_ROUTER_V8
+#define PLOW_NV_ROUTER_V8 0
+#endif
+#ifndef PLOW_NV_TOPK_V4
+#define PLOW_NV_TOPK_V4 0
+#endif
 #ifndef PLOW_MOE_ROUTER_WIDE
 #define PLOW_MOE_ROUTER_WIDE 0
 #endif
@@ -844,6 +850,7 @@ static __device__ void d_moe_router_gemma_score_fast(float* __restrict__ score,
     } else
 #endif
         plow_moe_row_rms(invs, red, resid, H, nrow, eps);
+    PLOW_TL_PH(0);
 
 #if PLOW_NV_GEMV_RB
     /* Vectorized twin (H100 campaign round 3). The body below reads resid/scale/proj with
@@ -861,7 +868,25 @@ static __device__ void d_moe_router_gemma_score_fast(float* __restrict__ score,
         float* h2s = arena; /* dynamic arena, see the note in the expert-GLU arm */
 #endif
         const float invrms = invs[0];
+#if PLOW_NV_ROUTER_V8
+        /* 8-wide: both loads of a vector issue together instead of 11 dependent 2-byte rounds;
+         * each element is the same expression as the scalar loop. */
+        for (unsigned v8 = tid; v8 < (H >> 3); v8 += blockDim.x) {
+            const bf16v8 rv = ld_glob8(resid + v8 * 8u), sv = ld_glob8(scale + v8 * 8u);
+#pragma unroll
+            for (int j = 0; j < 8; j++) {
+                const float v = __bfloat162float(rv.x[j]) * invrms * __bfloat162float(sv.x[j]) * root;
+#if PLOW_MOE_XN_BF16
+                h2s[v8 * 8u + j] = __float2bfloat16(v);
+#else
+                h2s[v8 * 8u + j] = v;
+#endif
+            }
+        }
+        for (unsigned h = (H & ~7u) + tid; h < H; h += blockDim.x) {
+#else
         for (unsigned h = tid; h < H; h += blockDim.x) {
+#endif
             const float v = __bfloat162float(resid[h]) * invrms * __bfloat162float(scale[h]) * root;
 #if PLOW_MOE_XN_BF16
             h2s[h] = __float2bfloat16(v);
@@ -870,6 +895,7 @@ static __device__ void d_moe_router_gemma_score_fast(float* __restrict__ score,
 #endif
         }
         __syncthreads();
+        PLOW_TL_PH(1);
         const unsigned nchunk = (H + GV_STEP - 1u) / GV_STEP;
 #if PLOW_MOE_ROUTER_WIDE
         /* ONE EXPERT PER BLOCK, all 8 warps splitting H. The default map below is
@@ -935,6 +961,7 @@ static __device__ void d_moe_router_gemma_score_fast(float* __restrict__ score,
             acc = plow_warp_sum(acc);
             if (lane == 0) score[e] = acc;
         }
+        PLOW_TL_PH(2);
         return;
     }
     /* BATCH>1, vectorized. The body below walks each (row, expert) pair with 88 DEPENDENT
@@ -945,8 +972,18 @@ static __device__ void d_moe_router_gemma_score_fast(float* __restrict__ score,
      * so the warp-sum rounding of a logit) changes, as it already does on the B=1 arm. */
     if (H <= PLOW_MOE_XN_MAX) {
         float* sr = arena;
+#if PLOW_NV_ROUTER_V8
+        for (unsigned v8 = tid; v8 < (H >> 3); v8 += blockDim.x) {
+            const bf16v8 sv = ld_glob8(scale + v8 * 8u);
+#pragma unroll
+            for (int j = 0; j < 8; j++) sr[v8 * 8u + j] = __bfloat162float(sv.x[j]) * root;
+        }
+        for (unsigned h = (H & ~7u) + tid; h < H; h += blockDim.x) sr[h] = __bfloat162float(scale[h]) * root;
+#else
         for (unsigned h = tid; h < H; h += blockDim.x) sr[h] = __bfloat162float(scale[h]) * root;
+#endif
         __syncthreads();
+        PLOW_TL_PH(1);
         const unsigned nchunk = (H + GV_STEP - 1u) / GV_STEP;
         const unsigned npair_v = nrow * n_exp;
         for (unsigned idx = slice * 8u + warp; idx < npair_v; idx += nblk * 8u) {
@@ -979,6 +1016,7 @@ static __device__ void d_moe_router_gemma_score_fast(float* __restrict__ score,
             acc = plow_warp_sum(acc);
             if (lane == 0) score[(size_t)row * n_exp + e] = acc;
         }
+        PLOW_TL_PH(2);
         return;
     }
 #endif
@@ -1012,6 +1050,86 @@ static __device__ void d_moe_router_gemma_score_fast(float* __restrict__ score,
 static __device__ __forceinline__ void plow_moe_gemma_topk_warp(unsigned char* table, float* sc,
                                                              const bf16* pes, unsigned n_exp,
                                                              unsigned k, unsigned lane) {
+#if PLOW_NV_TOPK_V4
+    /* n_exp <= 128: the lane's (at most 4) probabilities stay in registers and its local winner is
+     * cached; only the lane that lost its winner rescans. Same keys, same strict-> lowest-id scan
+     * order, same -1e30 sentinel and slot-order gate sum as the smem rounds below. */
+    if (n_exp <= 128u) {
+        float v[4];
+        float m = -1e30f;
+#pragma unroll
+        for (int i = 0; i < 4; i++) {
+            v[i] = (lane + 32u * i < n_exp) ? sc[lane + 32u * i] : 0.0f;
+            if (lane + 32u * i < n_exp) m = fmaxf(m, v[i]);
+        }
+#pragma unroll
+        for (int o = 16; o > 0; o >>= 1) m = fmaxf(m, __shfl_xor_sync(~0u, m, o));
+#pragma unroll
+        for (int i = 0; i < 4; i++)
+            if (lane + 32u * i < n_exp) { v[i] = __expf(v[i] - m); sc[lane + 32u * i] = v[i]; }
+        __syncwarp();
+        /* denominator: lane 0, e = 0..n_exp-1 order (16 B loads when aligned) */
+        float s = 0.0f;
+        if (lane == 0) {
+            if ((n_exp & 3u) == 0u && ((size_t)sc & 15u) == 0u) {
+                const float4* sc4 = (const float4*)sc;
+#pragma unroll 8
+                for (unsigned q = 0; q < (n_exp >> 2); q++) {
+                    const float4 t = sc4[q];
+                    s += t.x; s += t.y; s += t.z; s += t.w;
+                }
+            } else {
+                for (unsigned e = 0; e < n_exp; e++) s += sc[e];
+            }
+        }
+        s = __shfl_sync(~0u, s, 0);
+#pragma unroll
+        for (int i = 0; i < 4; i++)
+            if (lane + 32u * i < n_exp) v[i] /= s;
+        PLOW_TL_PH(1);
+        unsigned best = 0u, bid = ~0u;
+        float bval = 0.0f;
+        auto scan = [&]() {
+            best = 0u; bid = ~0u; bval = 0.0f;
+#pragma unroll
+            for (int i = 0; i < 4; i++) {
+                const unsigned e = lane + 32u * i;
+                if (e >= n_exp) continue;
+                unsigned sb;
+                __builtin_memcpy(&sb, &v[i], 4);
+                sb = (sb & 0x80000000u) ? ~sb : (sb | 0x80000000u);
+                if (bid == ~0u || sb > best) { best = sb; bid = e; bval = v[i]; }
+            }
+        };
+        scan();
+        unsigned win = 0u;
+        float gate = 0.0f, pe = 0.0f;
+        for (unsigned j = 0; j < k; j++) {
+            const unsigned top = __reduce_max_sync(~0u, best);
+            const unsigned w = __reduce_min_sync(~0u, (bid != ~0u && best == top) ? bid : ~0u);
+            const float wval = __shfl_sync(~0u, bval, w & 31u);
+            if (lane == j) { win = w; gate = wval; }
+            if (lane == (w & 31u)) {
+#pragma unroll
+                for (int i = 0; i < 4; i++)
+                    if ((unsigned)i == (w >> 5)) v[i] = -1e30f;
+                scan();
+            }
+        }
+        /* one load round for all k slots, off the selection chain */
+        if (lane < k) pe = __bfloat162float(pes[win]);
+        PLOW_TL_PH(2);
+        float gs = 0.0f;
+        for (unsigned j = 0; j < k; j++) gs += __shfl_sync(~0u, gate, j);
+        if (lane < k) {
+            if (gs != 0.0f) gate /= gs;
+            gate *= pe;
+            *(unsigned*)(table + (size_t)lane * 8) = win;
+            *(float*)(table + (size_t)lane * 8 + 4) = gate;
+        }
+        return;
+    }
+#endif
     float m = -1e30f;
     for (unsigned e = lane; e < n_exp; e += 32u) m = fmaxf(m, sc[e]);
 #pragma unroll
@@ -1021,6 +1139,7 @@ static __device__ __forceinline__ void plow_moe_gemma_topk_warp(unsigned char* t
     float s = 0.0f;
     if (lane == 0)
         for (unsigned e = 0; e < n_exp; e++) s += sc[e]; /* original order, exact */
+    PLOW_TL_PH(1);
     s = __shfl_sync(~0u, s, 0);
     for (unsigned e = lane; e < n_exp; e += 32u) sc[e] /= s;
 
@@ -1047,6 +1166,7 @@ static __device__ __forceinline__ void plow_moe_gemma_topk_warp(unsigned char* t
         if (lane == j) { win = w; gate = wval; pe = __bfloat162float(pes[w]); }
         if (lane == (w & 31u)) sc[w] = -1e30f;
     }
+    PLOW_TL_PH(2);
     float gs = 0.0f;
     for (unsigned j = 0; j < k; j++) gs += __shfl_sync(~0u, gate, j);
     if (lane < k) {
@@ -1064,8 +1184,22 @@ static __device__ void d_moe_router_gemma_topk_row(unsigned char* __restrict__ t
                                          unsigned n_exp, unsigned k,
                                          float* __restrict__ arena) {
     float* sc = arena;
+#if PLOW_NV_GEMV_RB && PLOW_NV_TOPK_V4
+    /* warp 0 alone consumes the copy (n_exp <= 128 register path): no block barrier before it */
+    if (n_exp <= 128u) {
+        if (threadIdx.x < 32u) {
+            for (unsigned e = threadIdx.x; e < n_exp; e += 32u) sc[e] = score[e];
+            __syncwarp();
+            PLOW_TL_PH(0);
+            plow_moe_gemma_topk_warp(table, sc, pes, n_exp, k, threadIdx.x);
+        }
+        __syncthreads(); /* arena is reused by the next row */
+        return;
+    }
+#endif
     for (unsigned e = threadIdx.x; e < n_exp; e += blockDim.x) sc[e] = score[e];
     __syncthreads();
+    PLOW_TL_PH(0);
 #if PLOW_NV_GEMV_RB
     /* WARP-PARALLEL TOP-K (H100 campaign round 3). The default body below runs the entire
      * 128-expert softmax AND the k x n_exp masked-argmax scan on THREAD 0 alone: ~1400 serial
@@ -2233,6 +2367,55 @@ static __device__ void d_moe_combine_norm_gemma(bf16* __restrict__ out,
          * slot (the runtime-k loop measured ~10 us of the 26B's B=1 layer tail on ONE block),
          * and pass 2 moves 8 elements per load. Same slot order, same ss order, same
          * per-element arithmetic: bit-identical. */
+#if PLOW_NV_RAW_NARROW
+        /* Packed twin (sm120_common.cuh PLOW_NV_RAW_NARROW): the guard predicates the loads instead
+         * of skipping the iteration (a zero chunk adds +0.0f to ss, the arena store is still
+         * skipped), %tid.x is re-read, pass 2 keeps its 8 x bf16 chunks packed. Same slot order, ss
+         * order and per-element arithmetic. */
+        if (k == 8u && (H & 7u) == 0u && H <= 12u * nth) {
+            const unsigned rt = plow_tid();
+#pragma unroll
+            for (unsigned it = 0; it < 3u; it++) {
+                const unsigned h = rt * 4u + it * nth * 4u;
+                const bool ok = h < H;
+                float4 v[8];
+#pragma unroll
+                for (unsigned slot = 0; slot < 8u; slot++)
+                    v[slot] = ok ? *(const float4*)(pt + (size_t)slot * H + h) : make_float4(0.f, 0.f, 0.f, 0.f);
+                float4 acc4 = make_float4(0.f, 0.f, 0.f, 0.f);
+#pragma unroll
+                for (unsigned slot = 0; slot < 8u; slot++) {
+                    acc4.x += v[slot].x; acc4.y += v[slot].y; acc4.z += v[slot].z; acc4.w += v[slot].w;
+                }
+                if (ok) *(float4*)(arena + h) = acc4;
+                ss += acc4.x * acc4.x + acc4.y * acc4.y + acc4.z * acc4.z + acc4.w * acc4.w;
+            }
+            ss = plow_warp_sum(ss);
+            if ((rt & 31u) == 0) red[rt >> 5] = ss;
+            __syncthreads();
+            if (rt == 0) {
+                float t = 0.0f;
+                const unsigned nw = (nth + 31u) >> 5;
+                for (unsigned i = 0; i < nw; i++) t += red[i];
+                red[0] = rsqrtf(t / (float)H + eps);
+            }
+            __syncthreads();
+            const float inv = red[0];
+            for (unsigned c = rt; c < (H >> 3); c += nth) {
+                const uint4 g = plow_ld_u4(gamma + c * 8u, true), r = plow_ld_u4(res + c * 8u, true);
+                const float4 a0 = *(const float4*)(arena + c * 8u), a1 = *(const float4*)(arena + c * 8u + 4u);
+                const float av[8] = {a0.x, a0.y, a0.z, a0.w, a1.x, a1.y, a1.z, a1.w};
+                unsigned ow[4];
+#pragma unroll
+                for (int j = 0; j < 8; j += 2)
+                    ow[j / 2] = plow_bf_pack(__float2bfloat16(av[j] * inv * plow_bf_at(g, j) + plow_bf_at(r, j)),
+                                             __float2bfloat16(av[j + 1] * inv * plow_bf_at(g, j + 1) + plow_bf_at(r, j + 1)));
+                *(uint4*)(o + c * 8u) = make_uint4(ow[0], ow[1], ow[2], ow[3]);
+            }
+            __syncthreads(); /* arena/red reused by the next row */
+            continue;
+        }
+#endif
         if (k == 8u && (H & 7u) == 0u && H <= 12u * nth) {
 #pragma unroll
             for (unsigned it = 0; it < 3u; it++) {
