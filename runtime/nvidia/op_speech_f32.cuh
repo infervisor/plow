@@ -137,11 +137,27 @@ __device__ __forceinline__ float sp_gelu_tanh(float x) {
     return __fmul_rn(__fmul_rn(0.5f, x), __fadd_rn(1.0f, tanhf(inner)));
 }
 
+/* The erf-GELU's 1/d (d >= 1). On sm_120 rcp.approx and two Newton FMA steps equal __fdiv_rn(1, d) for
+ * every d in [1, 2^126) (__fdiv_rn's general path is ~130 instructions); past 2^126 exp(-z^2) is 0 and t
+ * does not matter, but inf would turn the Newton steps into NaN, hence the clamp. The GELU below then
+ * equals the __fdiv_rn form on all 65536 bf16 inputs. */
+__device__ __forceinline__ float sp_gelu_rcp(float d) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ == 1200
+    d = fminf(d, 0x1p126f);
+    float r;
+    asm("rcp.approx.ftz.f32 %0, %1;" : "=f"(r) : "f"(d));
+    r = fmaf(r, fmaf(-d, r, 1.0f), r);
+    return fmaf(r, fmaf(-d, r, 1.0f), r);
+#else
+    return __fdiv_rn(1.0f, d);
+#endif
+}
+
 /* bf16(x) -> erf-GELU (Abramowitz-Stegun 7.1.26) -> bf16, exactly as the golden spells it. */
 __device__ __forceinline__ float sp_gelu_erf_bf16(float value) {
     value = sp_bf16(value);
     const float z = __fmul_rn(value, 0.7071067811865475f);
-    const float t = __fdiv_rn(1.0f, __fadd_rn(1.0f, __fmul_rn(0.3275911f, fabsf(z))));
+    const float t = sp_gelu_rcp(__fadd_rn(1.0f, __fmul_rn(0.3275911f, fabsf(z))));
     float p = __fsub_rn(__fmul_rn(1.061405429f, t), 1.453152027f);
     p = __fadd_rn(__fmul_rn(p, t), 1.421413741f);
     p = __fsub_rn(__fmul_rn(p, t), 0.284496736f);
@@ -1829,6 +1845,293 @@ static __device__ __forceinline__ void sp_conv2d_wide(unsigned M, unsigned N, un
     }
 }
 
+/* sm_120 Conv2dF32 with one input channel, 3x3 / stride 2 / pad 1, erf-GELU (the Qwen3-ASR conv1): a
+ * thread per output position keeps its 3x3 patch and walks a channel group, weights in smem. The
+ * golden sums bias + x w in double; only the bf16 of its (float) reaches the GELU. The float FMA sum s
+ * is within 9 2^-24 A of the exact sum (A = |bias| + sum |x w|), so s and the golden's float round to
+ * the same bf16 unless a bf16 midpoint lies within d = 2^-24 (|s| + 9.5 A) of s (or d reaches an
+ * eighth of the bf16 spacing). Then float-float (TwoProd / TwoSum, within 2^-40.4 A of the golden's
+ * double sum) gives the golden's float itself unless it is within that of a float rounding boundary;
+ * then the golden's double sum. Bit-exact; rtx-5090, 64 chunks: 0.74 -> 0.47 ms (write floor 0.24). */
+__device__ __forceinline__ float sp_conv1_ff(const float (&xv)[9], const float* wv, float bias, float a,
+                                             unsigned valid) {
+    float sh = bias, sl = 0.f;
+#pragma unroll
+    for (unsigned t = 0; t < 9; t++)
+        if (valid >> t & 1u) {
+            const float ph = __fmul_rn(xv[t], wv[t]), pl = fmaf(xv[t], wv[t], -ph);
+            const float u = __fadd_rn(sh, ph), bb = __fsub_rn(u, sh);
+            sl = __fadd_rn(sl, __fadd_rn(__fadd_rn(__fsub_rn(sh, __fsub_rn(u, bb)), __fsub_rn(ph, bb)), pl));
+            sh = u;
+        }
+    const float f = __fadd_rn(sh, sl), fv = __fsub_rn(f, sh);
+    const float r = __fadd_rn(__fsub_rn(sh, __fsub_rn(f, fv)), __fsub_rn(sl, fv));
+    const unsigned fb = __float_as_uint(f), fe = fb & 0x7F800000u;
+    const float lim = __fmul_rn((fb & 0x7FFFFFu) == 0 ? 0.25f : 0.5f, __uint_as_float(fe - (23u << 23))) -
+                      __fmul_rn(0x1p-39f, a);
+    if (fe >= (25u << 23) && fabsf(r) < lim) return f;
+    double ds = bias;
+#pragma unroll
+    for (unsigned t = 0; t < 9; t++)
+        if (valid >> t & 1u) ds += (double)xv[t] * (double)wv[t];
+    return (float)ds;
+}
+static __device__ __forceinline__ void sp_conv1_direct(float* __restrict__ out, const float* __restrict__ x,
+                                                       const float* __restrict__ w, const float* __restrict__ bias,
+                                                       unsigned F, unsigned W, unsigned OC, unsigned OF, unsigned OW,
+                                                       unsigned batches, bool relu, unsigned slice, unsigned nblk,
+                                                       float* arena) {
+    const unsigned OFW = OF * OW, positions = batches * OFW, tid = threadIdx.x;
+    float* ws = arena; /* [c][12]: 9 taps, padded for float4; then the bias */
+    for (unsigned i = tid; i < OC * 12u; i += PLOW_NV_THREADS) ws[i] = i % 12u < 9u ? w[i / 12u * 9u + i % 12u] : 0.f;
+    for (unsigned i = tid; i < OC; i += PLOW_NV_THREADS) ws[OC * 12u + i] = bias ? bias[i] : 0.f;
+    __syncthreads();
+    /* channel groups so that small batches still give every thread work */
+    const unsigned groups = min(16u, max(1u, (2u * nblk * PLOW_NV_THREADS + positions - 1u) / positions));
+    const unsigned cg = (OC + groups - 1u) / groups, items = positions * groups;
+    for (unsigned item = slice * PLOW_NV_THREADS + tid; item < items; item += nblk * PLOW_NV_THREADS) {
+        const unsigned grp = item / positions, pos = item - grp * positions;
+        const unsigned ox = pos % OW, oy = (pos / OW) % OF, b = pos / OFW;
+        float xv[9];
+        unsigned valid = 0;
+#pragma unroll
+        for (unsigned t = 0; t < 9; t++) {
+            const int iy = 2 * (int)oy - 1 + (int)(t / 3), ix = 2 * (int)ox - 1 + (int)(t % 3);
+            const bool ok = iy >= 0 && iy < (int)F && ix >= 0 && ix < (int)W;
+            xv[t] = ok ? __ldg(x + ((size_t)b * F + iy) * W + ix) : 0.f;
+            valid |= (unsigned)ok << t;
+        }
+        float* o = out + ((size_t)b * OC * OF + oy) * OW + ox;
+        const unsigned c1 = min(OC, (grp + 1u) * cg);
+        for (unsigned c = grp * cg; c < c1; c++) {
+            const float4 w0 = *(const float4*)(ws + c * 12u), w1 = *(const float4*)(ws + c * 12u + 4u);
+            const float wv[9] = {w0.x, w0.y, w0.z, w0.w, w1.x, w1.y, w1.z, w1.w, ws[c * 12u + 8u]};
+            const float bc = ws[OC * 12u + c];
+            float s = bc, a = fabsf(bc);
+#pragma unroll
+            for (unsigned t = 0; t < 9; t++)
+                if (valid >> t & 1u) {
+                    s = fmaf(xv[t], wv[t], s);
+                    a = fmaf(fabsf(xv[t]), fabsf(wv[t]), a);
+                }
+            const float d = __fmul_rn(0x1p-24f, fmaf(9.5f, a, fabsf(s)));
+            const unsigned sb = __float_as_uint(s);
+            const float mid = __uint_as_float((sb & 0xFFFF0000u) | 0x8000u);
+            /* a == 0: every term is +-0 and s is the golden's sum, sign included */
+            if (a != 0.f && (!(fabsf(__fsub_rn(s, mid)) > d) || !(d < __uint_as_float(sb & 0x7F800000u) * 0x1p-10f)))
+                s = sp_conv1_ff(xv, wv, bc, a, valid);
+            const float v = sp_gelu_erf_bf16(s);
+            o[(size_t)c * OFW] = relu ? fmaxf(v, 0.0f) : v;
+        }
+    }
+    __syncthreads(); /* the next op may reuse the arena */
+}
+
+/* sm_120 Conv2dF32 bf16 tensor-core path for 3x3 / stride 2 / pad 1 over NCFW input (Qwen3-ASR
+ * conv2/conv3, where sp_conv2d_wide's column table does not fit 99 KiB): 128 positions x 80 channels
+ * per block, 8 warps as 4 (M) x 2 (N). K order: 16-channel block, then the 9 taps (a k16 MMA step
+ * each), folded into tot every 4 steps as sp_tc_tile does. Per channel block the tile's input rows
+ * (2 slots per output row + 1, W + 2 entries with the x padding zeroed) are staged channels-last bf16
+ * in two 8-channel planes, so ldmatrix reads the im2col rows directly (entry swizzle e ^ (e >> 3 & 1)
+ * keeps stride-2 rows conflict-free); weights are scatter-converted to [half][tap][n][8], the tap
+ * stride padded off the banks. Two stages; the next stage's loads go in 3 register parts across the
+ * taps. VEC 2 loads two x positions per 8-byte load (even W). rtx-5090, 64 chunks, us: conv2 3678 ->
+ * 1627, conv3 992 -> 502; outputs off a compensated-sum reference 0.0124% -> 0.0125%. */
+template <unsigned VEC_>
+struct SpCs {
+    static constexpr unsigned VEC = VEC_, BM = 128, BN = 80, WM = 4, TM = BM / WM, TN = BN / 2, MI = TM / 16,
+                              NJ = TN / 8, NQ = (NJ + 1) / 2;
+    static constexpr unsigned AE = 784, ZE = AE - 1, A_PLANE = AE * 16, A_BYTES = 2 * A_PLANE;
+    static constexpr unsigned B_TAP = BN * 16 + 16, B_PLANE = 9 * B_TAP, B_BYTES = 2 * B_PLANE;
+    static constexpr unsigned STAGE = A_BYTES + B_BYTES, NP = 3, AI = 3 - VEC, BI = 4;
+    static_assert(2 * STAGE <= SP_ARENA_FLOATS * 4, "two stages");
+    static_assert(NP * BI * 7 >= BN, "weight rows");
+};
+__device__ __forceinline__ unsigned sp_cs_sw(unsigned e) { return e ^ ((e >> 3) & 1u); }
+/* A tile spans at most rows output rows: 2 (rows - 1) + 3 slots must fit, and their items the loader. */
+__device__ __forceinline__ bool sp_cs_fits(unsigned W, unsigned OW, unsigned vec) {
+    const unsigned rows = (OW + SpCs<1>::BM - 2u) / OW + 1u, slots = 2u * (rows - 1u) + 3u;
+    return slots * (W + 2u) < SpCs<1>::ZE && slots * W * 2u <= 3u * (3u - vec) * PLOW_NV_THREADS * vec;
+}
+template <class C, class EP>
+static __device__ __forceinline__ void sp_cs_conv(const float* __restrict__ x, const float* __restrict__ w,
+                                                  const EP& ep, unsigned F, unsigned W, unsigned IC, unsigned N,
+                                                  unsigned OF, unsigned OW, unsigned M, unsigned slice,
+                                                  unsigned nblk, float* arena) {
+    char* smem = (char*)arena;
+    const unsigned tid = threadIdx.x, lane = tid & 31u, warp = tid >> 5;
+    const unsigned wm = (warp % C::WM) * C::TM, wn = (warp / C::WM) * C::TN, g = lane >> 2, t = lane & 3u;
+    const unsigned K = IC * 9u, NCB = IC / 16u, FW = F * W, W2 = W + 2u;
+    const unsigned tn = (N + C::BN - 1) / C::BN, tiles = ((M + C::BM - 1) / C::BM) * tn;
+    for (unsigned e = tid; e < 2u * C::STAGE / 16u; e += PLOW_NV_THREADS) ((uint4*)smem)[e] = make_uint4(0, 0, 0, 0);
+    __syncthreads();
+    /* weight loader: thread = (k quad bj, row br), fixed smem offsets for its 4 k */
+    const unsigned bj = tid % 36u, br = tid / 36u;
+    unsigned boff[4];
+#pragma unroll
+    for (unsigned q = 0; q < 4; q++) {
+        const unsigned kl = 4u * bj + q, c = kl / 9u, tap = kl - 9u * c;
+        boff[q] = (c >> 3) * C::B_PLANE + tap * C::B_TAP + (c & 7u) * 2u;
+    }
+    for (unsigned tile = slice; tile < tiles; tile += nblk) {
+        const unsigned m0 = (tile / tn) * C::BM, n0 = (tile % tn) * C::BN;
+        const unsigned g0 = m0 / OW, g1 = (min(m0 + C::BM, M) - 1u) / OW, nslots = 2u * (g1 - g0) + 3u;
+        /* input loader items (slot, half, x): slot 0 = (g0, ky 0), odd = (g, ky 1), even = (g - 1, ky 2) */
+        unsigned agoff[C::NP * C::AI], asoff[C::NP * C::AI];
+#pragma unroll
+        for (unsigned it = 0; it < C::NP * C::AI; it++) {
+            const unsigned i = tid + it * PLOW_NV_THREADS, per = 2u * W / C::VEC, s = i / per, rem = i - s * per,
+                           h = rem / (W / C::VEC), ix = (rem - h * (W / C::VEC)) * C::VEC;
+            asoff[it] = 0xFFFFFFFFu;
+            agoff[it] = 0;
+            if (s < nslots) {
+                const unsigned gq = s == 0 ? g0 : (s & 1u) ? g0 + (s - 1u) / 2u : g0 + s / 2u - 1u;
+                const unsigned ky = s == 0 ? 0u : (s & 1u) ? 1u : 2u, b = gq / OF, oy = gq - b * OF;
+                const int iy = 2 * (int)oy - 1 + (int)ky;
+                if (iy >= 0 && iy < (int)F) {
+                    agoff[it] = ((b * IC + h * 8u) * F + (unsigned)iy) * W + ix;
+                    asoff[it] = h * C::A_PLANE + sp_cs_sw(s * W2 + ix + 1u) * 16u;
+                }
+            }
+        }
+        /* ldmatrix rows: the entry of (position, ky) before + kx, -1 for the zero entry */
+        int re[C::MI][3];
+#pragma unroll
+        for (unsigned i = 0; i < C::MI; i++) {
+            const unsigned p = m0 + wm + i * 16u + (lane & 15u);
+            const unsigned gq = p / OW, ox = p - gq * OW, oy = gq % OF, jj = gq - g0;
+#pragma unroll
+            for (unsigned ky = 0; ky < 3; ky++) {
+                const int iy = 2 * (int)oy - 1 + (int)ky;
+                re[i][ky] = p < M && iy >= 0 && iy < (int)F ? (int)((2u * jj + ky) * W2 + 2u * ox) : -1;
+            }
+        }
+        float av[C::AI][8 * C::VEC];
+        float4 bv[C::BI];
+        auto issue = [&](unsigned cb, unsigned part) {
+#pragma unroll
+            for (unsigned r = 0; r < C::AI; r++) {
+                const unsigned it = part * C::AI + r;
+                const float* src = x + agoff[it] + cb * 16u * FW;
+                const bool ok = asoff[it] != 0xFFFFFFFFu;
+#pragma unroll
+                for (unsigned q = 0; q < 8; q++) {
+                    if constexpr (C::VEC == 2) {
+                        const float2 v = ok ? __ldcg((const float2*)(src + q * FW)) : make_float2(0.f, 0.f);
+                        av[r][q] = v.x;
+                        av[r][8 + q] = v.y;
+                    } else {
+                        av[r][q] = ok ? __ldcg(src + q * FW) : 0.f;
+                    }
+                }
+            }
+#pragma unroll
+            for (unsigned r = 0; r < C::BI; r++) {
+                const unsigned n = br + 7u * (part * C::BI + r);
+                bv[r] = tid < 252u && n < C::BN && n0 + n < N
+                            ? __ldcg((const float4*)(w + (size_t)(n0 + n) * K + cb * 144u + 4u * bj))
+                            : make_float4(0.f, 0.f, 0.f, 0.f);
+            }
+        };
+        auto store = [&](unsigned buf, unsigned part) {
+            char* as = smem + buf * C::STAGE;
+#pragma unroll
+            for (unsigned r = 0; r < C::AI; r++) {
+                const unsigned it = part * C::AI + r;
+                if (asoff[it] == 0xFFFFFFFFu) continue;
+#pragma unroll
+                for (unsigned v = 0; v < C::VEC; v++) {
+                    uint4 u;
+                    u.x = sp_pack_bf16(make_float2(av[r][8 * v], av[r][8 * v + 1]));
+                    u.y = sp_pack_bf16(make_float2(av[r][8 * v + 2], av[r][8 * v + 3]));
+                    u.z = sp_pack_bf16(make_float2(av[r][8 * v + 4], av[r][8 * v + 5]));
+                    u.w = sp_pack_bf16(make_float2(av[r][8 * v + 6], av[r][8 * v + 7]));
+                    const unsigned plane = asoff[it] / C::A_PLANE * C::A_PLANE;
+                    *(uint4*)(as + (v ? plane + sp_cs_sw(sp_cs_sw((asoff[it] - plane) / 16u) + 1u) * 16u : asoff[it])) = u;
+                }
+            }
+            char* bs = as + C::A_BYTES;
+#pragma unroll
+            for (unsigned r = 0; r < C::BI; r++) {
+                const unsigned n = br + 7u * (part * C::BI + r);
+                if (tid < 252u && n < C::BN) {
+                    *(__nv_bfloat16*)(bs + boff[0] + n * 16u) = __float2bfloat16_rn(bv[r].x);
+                    *(__nv_bfloat16*)(bs + boff[1] + n * 16u) = __float2bfloat16_rn(bv[r].y);
+                    *(__nv_bfloat16*)(bs + boff[2] + n * 16u) = __float2bfloat16_rn(bv[r].z);
+                    *(__nv_bfloat16*)(bs + boff[3] + n * 16u) = __float2bfloat16_rn(bv[r].w);
+                }
+            }
+        };
+        float acc[C::MI][C::NJ][4], tot[C::MI][C::NJ][4];
+#pragma unroll
+        for (unsigned i = 0; i < C::MI; i++)
+#pragma unroll
+            for (unsigned j = 0; j < C::NJ; j++)
+#pragma unroll
+                for (unsigned r = 0; r < 4; r++) acc[i][j][r] = tot[i][j][r] = 0.f;
+        auto fold = [&]() {
+#pragma unroll
+            for (unsigned i = 0; i < C::MI; i++)
+#pragma unroll
+                for (unsigned j = 0; j < C::NJ; j++)
+#pragma unroll
+                    for (unsigned r = 0; r < 4; r++) {
+                        tot[i][j][r] = __fadd_rn(tot[i][j][r], acc[i][j][r]);
+                        acc[i][j][r] = 0.f;
+                    }
+        };
+#pragma unroll
+        for (unsigned part = 0; part < C::NP; part++) {
+            issue(0, part);
+            store(0, part);
+        }
+        __syncthreads();
+        for (unsigned cb = 0; cb < NCB; cb++) {
+            const unsigned buf = cb & 1u;
+            const bool more = cb + 1u < NCB;
+            const char* as = smem + buf * C::STAGE + (lane >> 4) * C::A_PLANE;
+            const char* bs = smem + buf * C::STAGE + C::A_BYTES + ((lane >> 3) & 1u) * C::B_PLANE;
+#pragma unroll
+            for (unsigned tap = 0; tap < 9; tap++) {
+                const unsigned ky = tap / 3u, kx = tap % 3u;
+                if (more && tap % 3u == 0) issue(cb + 1u, tap / 3u);
+                unsigned a[C::MI][4];
+#pragma unroll
+                for (unsigned i = 0; i < C::MI; i++) {
+                    const int e = re[i][ky];
+                    sp_ldsm4(a[i], as + sp_cs_sw(e < 0 ? C::ZE : (unsigned)e + kx) * 16u);
+                }
+#pragma unroll
+                for (unsigned q = 0; q < C::NQ; q++) {
+                    unsigned b[4];
+                    const char* bp = bs + tap * C::B_TAP + (wn + q * 16u + (lane & 7u) + ((lane >> 4) << 3)) * 16u;
+                    if (2 * q + 1 < C::NJ) sp_ldsm4(b, bp);
+                    else sp_ldsm2(b, bp);
+#pragma unroll
+                    for (unsigned hh = 0; hh < 2; hh++)
+                        if (2 * q + hh < C::NJ)
+#pragma unroll
+                            for (unsigned i = 0; i < C::MI; i++)
+                                sp_mma_bf16x(acc[i][2 * q + hh], a[i], b[2 * hh], b[2 * hh + 1]);
+                }
+                if (((cb + tap) & 3u) == 3u) fold(); /* step 9 cb + tap */
+                if (more && tap % 3u == 2u) store(buf ^ 1u, tap / 3u);
+            }
+            __syncthreads();
+        }
+        if ((NCB * 9u) & 3u) fold();
+#pragma unroll
+        for (unsigned i = 0; i < C::MI; i++)
+#pragma unroll
+            for (unsigned j = 0; j < C::NJ; j++)
+#pragma unroll
+                for (unsigned r = 0; r < 4; r++) {
+                    const unsigned row = m0 + wm + i * 16u + g + (r >> 1) * 8u, col = n0 + wn + j * 8u + 2u * t + (r & 1u);
+                    if (row < M && col < N) ep(row, col, tot[i][j][r]);
+                }
+    }
+}
+
 /* NCFW output: consecutive positions are adjacent. */
 __device__ __forceinline__ bool sp_ep_mfast(const SpConvEpi& ep) { return ep.layout == 2u; }
 static __device__ __noinline__ void d_conv2d_f32(float* __restrict__ out, const float* __restrict__ x,
@@ -1861,6 +2164,25 @@ static __device__ __noinline__ void d_conv2d_f32(float* __restrict__ out, const 
             static_assert(TAB0 >= 4u * SpTc<false>::STAGE_BYTES / 4u, "conv table placement");
             SpConvTab* tab = (SpConvTab*)(arena + TAB0);
             const bool tabled = TAB0 + 2u * k <= SP_ARENA_FLOATS && (uint64_t)ic * frames * width < (1ull << 31);
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ == 1200
+            if (ic == 1u && kernel == 3u && stride == 2u && pad_before == 1u && pad_after == 1u && out_layout == 2u &&
+                (flags & 128u) && oc * 13u <= SP_ARENA_FLOATS && positions64 * oc < (1ull << 31)) {
+                sp_conv1_direct(out, x, (const float*)w, bias, frames, width, oc, of, ow, batches, flags & 2u, slice,
+                                nblk, arena);
+                return;
+            }
+            if ((flags & 256u) && kernel == 3u && stride == 2u && pad_before == 1u && pad_after == 1u && in_layout == 2u &&
+                (ic & 15u) == 0 && sp_aligned(w, 16) && (uint64_t)batches * ic * frames * width < (1ull << 31)) {
+                if ((width & 1u) == 0 && sp_aligned(x, 8) && sp_cs_fits(width, ow, 2u)) {
+                    sp_cs_conv<SpCs<2>>(x, (const float*)w, ep, frames, width, ic, oc, of, ow, positions, slice, nblk, arena);
+                    return;
+                }
+                if (sp_cs_fits(width, ow, 1u)) {
+                    sp_cs_conv<SpCs<1>>(x, (const float*)w, ep, frames, width, ic, oc, of, ow, positions, slice, nblk, arena);
+                    return;
+                }
+            }
+#endif
             if ((flags & 256u) && SPW_TAB0 + 2u * k <= SP_ARENA_FLOATS && (k & 3u) == 0 && sp_aligned(w, 16) &&
                 (uint64_t)ic * frames * width < (1ull << 31)) {
                 SpConvTab* wtab = (SpConvTab*)(arena + SPW_TAB0);
