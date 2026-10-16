@@ -415,7 +415,9 @@ mod tests {
         assert!(snapshot_regions(&tensors, [d, prefill].iter(), 4, 64)
             .unwrap()
             .is_empty());
-        assert!(snapshot_regions(&tensors, [].iter(), 4, 64).is_none());
+        assert!(snapshot_regions(&tensors, [].iter(), 4, 64)
+            .unwrap()
+            .is_empty());
         let mut unknown = d;
         unknown.op = DevOp::RmsNorm as u16;
         assert!(snapshot_regions(&tensors, [d, unknown].iter(), 4, 64).is_none());

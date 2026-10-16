@@ -3945,6 +3945,44 @@ __device__ static void plow_exec(CInst in_v, unsigned slice, CTens T_v, plow_sme
 #undef PLOW_PACKED_HEADNORM_FP8
             break;
 #endif
+        case PLOW_DOP_DSA_POOL_COMPRESS:
+            if (in->i[6] == 1u) {
+                const unsigned ps = in->i[1], hd = in->i[2];
+                for (unsigned si = 0; si < prog_meta->n_prefill_spans; si++) {
+                    const PlowPrefillSpan* sp = prog_meta->prefill_spans + si;
+                    const unsigned kv0 = sp->kv_row0, end = kv0 + sp->n_rows;
+                    const unsigned p0 = (kv0 + ps - 1u) / ps, p1 = end / ps;
+                    if (p1 <= p0) continue;
+                    const size_t r0 = sp->row0 + (p0 * ps - kv0);
+                    __syncthreads();
+                    d_dsa_pool_compress((uint8_t*)TEN(0) + (size_t)sp->slot * in->i[5] * hd,
+                                        (float*)TEN(1) + (size_t)sp->slot * in->i[5],
+                                        (const bf16*)TEN(2) + r0 * hd,
+                                        (const bf16*)TEN(3) + r0 * hd, (const float*)TEN(4),
+                                        p1 - p0, ps, hd, slice, nblk, (float*)sm->raw, sm->part,
+                                        nullptr, p0 * ps);
+                }
+                break;
+            }
+            __builtin_trap();
+        case PLOW_DOP_DSA_POOL_STASH:
+            if (in->i[4] == 1u) {
+                const unsigned ps = in->i[0], hd = in->i[1], d = threadIdx.x;
+                for (unsigned si = slice; si < prog_meta->n_prefill_spans; si += nblk) {
+                    const PlowPrefillSpan* sp = prog_meta->prefill_spans + si;
+                    const unsigned kv0 = sp->kv_row0, end = kv0 + sp->n_rows;
+                    const unsigned t0 = end / ps * ps > kv0 ? end / ps * ps : kv0;
+                    if (d >= hd) continue;
+                    for (unsigned p = t0; p < end; p++) {
+                        const size_t src = (size_t)(sp->row0 + p - kv0) * hd + d;
+                        const size_t dst = ((size_t)sp->slot * ps + p % ps) * hd + d;
+                        ((bf16*)TEN(0))[dst] = ((const bf16*)TEN(2))[src];
+                        ((bf16*)TEN(1))[dst] = ((const bf16*)TEN(3))[src];
+                    }
+                }
+                break;
+            }
+            __builtin_trap();
         default:
             __builtin_trap();
     }

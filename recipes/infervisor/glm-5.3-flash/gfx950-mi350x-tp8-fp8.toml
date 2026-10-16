@@ -167,7 +167,7 @@ env = { PLOW_DECODE_BATCH = "128", PLOW_GEMV_WALK = "1", PLOW_GEMV_MM = "4", PLO
 # - `PLOW_GLM_HC_FOLD_MLA`: MLA input RmsNorm folded into the AITER mHC pre (rows > 1).
 #   Same-prompt r1/B8/B32/B128 11.84/19.66/20.22/26.72 -> 10.24/17.58/18.13/23.34 ms; 4k-context B128 33.8 -> 29.5.
 # - `PLOW_GLM_DSA = "1"`: DeepSeek sparse attention (DSA / sparse-MLA top-2048) enabled by default.
-env = { GLM_MOE_CORESIDENT = "2", GLM_SHARD_HEAD = "1", GLM_SHARED_CUS = "64", PLOW_DECODE_BATCH_LADDER = "1,8,32,64,128", PLOW_GLM53_GEMM_LT_DEC = "q_a,kv_a,q_absorb,mla_o,kda_o,kda_qkv,kda_gfa,kda_gb,kda_b,lm_head", PLOW_GLM53_GEMM_LT_DEC_RUNGS = "8,32,64,128", PLOW_GLM53_L2_PLACE = "1", PLOW_GLM53_MLA_HPACK_ROWS = "32", PLOW_GLM53_MLA_SEG_KVW = "1", PLOW_GLM53_PACKED_LEAN_KDA = "1", PLOW_GLM53_SP_KDA_NORM = "1", PLOW_GLM53_SP_ROUTER = "1", PLOW_GLM_DECODE_GEMM_ROWS = "32", PLOW_GLM_DEC_SPLITK = "16", PLOW_GLM_DEC_SPLITK_2P = "1", PLOW_GLM_DSA = "0", PLOW_GLM_HC_AITER = "1", PLOW_GLM_HC_FOLD_MLA = "1", PLOW_GLM_HC_FUSE_DEC = "1", PLOW_GLM_HC_FUSE_R1 = "1", PLOW_GLM_HC_FUSE_VARIANT = "3", PLOW_GLM_HC_MIX_RAW = "1", PLOW_GLM_HC_NORM_FOLD = "1", PLOW_GLM_HC_POST_FOLD = "1", PLOW_GLM_HC_PRE_TAIL = "1", PLOW_GLM_KDA_LT_ORDER = "1", PLOW_GLM_KDA_PROJ_GROUP = "1", PLOW_GLM_KDA_QKVG_R1 = "1", PLOW_GLM_MOE_AITER = "1", PLOW_GLM_MOE_RESIDENT = "1", PLOW_GLM_MOE_SHARED_FOLD = "1", PLOW_GLM_PF_NS = "2", PLOW_GLM_ROUTER_OVERLAP = "2", PLOW_GLM_ROUTER_RAW = "1", PLOW_GLM_SEQ_PAR = "1", PLOW_GLM_SEQ_PAR_PROJ = "0", PLOW_KDA_DECODE_FUSED_ARM = "1", PLOW_KDA_FB_FOLD = "1", PLOW_KDA_PF_GROUP_GEMM = "1", PLOW_MLA_PF_V2 = "1", PLOW_MLA_PREFILL = "full:128,512,2048,8192", PLOW_MOE_DEC_W8A8 = "1", PLOW_MOE_FP8_PF_LEAN = "1", PLOW_MOE_FP8_PF_PACKED = "1", PLOW_MOE_PF_W8A8 = "1", PLOW_UNISEG = "0", PLOW_XR_DEC_CUS = "64" }
+env = { GLM_MOE_CORESIDENT = "2", GLM_SHARD_HEAD = "1", GLM_SHARED_CUS = "64", PLOW_DECODE_BATCH_LADDER = "1,8,32,64,128", PLOW_GLM53_GEMM_LT_DEC = "q_a,kv_a,q_absorb,mla_o,kda_o,kda_qkv,kda_gfa,kda_gb,kda_b,lm_head", PLOW_GLM53_GEMM_LT_DEC_RUNGS = "8,32,64,128", PLOW_GLM53_L2_PLACE = "1", PLOW_GLM53_MLA_HPACK_ROWS = "32", PLOW_GLM53_MLA_SEG_KVW = "1", PLOW_GLM53_PACKED_LEAN_KDA = "1", PLOW_GLM53_SP_KDA_NORM = "1", PLOW_GLM53_SP_ROUTER = "1", PLOW_GLM_DECODE_GEMM_ROWS = "32", PLOW_GLM_DEC_SPLITK = "16", PLOW_GLM_DEC_SPLITK_2P = "1", PLOW_GLM_DSA = "1", PLOW_GLM_DSA_FUSE = "1", PLOW_GLM_HC_AITER = "1", PLOW_GLM_HC_FOLD_MLA = "1", PLOW_GLM_HC_FUSE_DEC = "1", PLOW_GLM_HC_FUSE_R1 = "1", PLOW_GLM_HC_FUSE_VARIANT = "3", PLOW_GLM_HC_MIX_RAW = "1", PLOW_GLM_HC_NORM_FOLD = "1", PLOW_GLM_HC_POST_FOLD = "1", PLOW_GLM_HC_PRE_TAIL = "1", PLOW_GLM_KDA_LT_ORDER = "1", PLOW_GLM_KDA_PROJ_GROUP = "1", PLOW_GLM_KDA_QKVG_R1 = "1", PLOW_GLM_MOE_AITER = "1", PLOW_GLM_MOE_RESIDENT = "1", PLOW_GLM_MOE_SHARED_FOLD = "1", PLOW_GLM_PF_NS = "2", PLOW_GLM_ROUTER_OVERLAP = "2", PLOW_GLM_ROUTER_RAW = "1", PLOW_GLM_SEQ_PAR = "1", PLOW_GLM_SEQ_PAR_PROJ = "0", PLOW_KDA_DECODE_FUSED_ARM = "1", PLOW_KDA_FB_FOLD = "1", PLOW_KDA_PF_GROUP_GEMM = "1", PLOW_MLA_PF_V2 = "1", PLOW_MLA_PREFILL = "full:128,512,2048,8192", PLOW_MOE_DEC_W8A8 = "1", PLOW_MOE_FP8_PF_LEAN = "1", PLOW_MOE_FP8_PF_PACKED = "1", PLOW_MOE_PF_W8A8 = "1", PLOW_UNISEG = "0", PLOW_XR_DEC_CUS = "64" }
 args = [
   "--emit", "devblob",
   "--arch", "gfx950",
@@ -268,24 +268,24 @@ client = "vllm 0.31.1rc1 bench serve (scripts/bench/llm_grid.sh)"
 
 # Reproduction gates at THIS commit, checkpoint and nix lock.
 [artifacts]
-"plowrt" = "b7bae515d7997ac316e304398c8bdb78b2c8d7ff5bd86999a7fa99d8b48c4cf2"
-"model.pkt" = "943e4fcffbb0d621b97514b63406325e7e0a0fd6865ecf967c87b1db52deb97c"
-"interp_decode_k3_gq.elf" = "04b6622306a41949f4d6e6350164b347dd32b6ba566a65032b4990fdfad8b583"
-"lowrung1/interp_decode_k3_gq.elf" = "65cac281c00c88603a0f8afa191e78dd3801c7dcbda8c656074348ec6be1cdc8"
-"lowrung8/interp_decode_k3_gq.elf" = "e187081742f50eb9e43b0f2058c8fbc69ecc3adccd397ed5d4228fee1df1a680"
-"interp_prefill_k3_moe_gq.elf" = "88022e2e2353799990b19c7cda9687aaf64754e6075afbbf610f5c089fed5818"
-"interp_flash_gq.elf" = "3c949f5ffb887029382cd688b533ebc906b8c6c5b99d1dfdb02dedd7c8307710"
+"plowrt" = "8be3671dc2dbf23a729b89f7713b86b2d900c90e869fd6d56cfe8249d5c24563"
+"model.pkt" = "d3d7db7307d470866e360a75ea8f68e271a52a275fda7067a6eb651ffa5596d7"
+"interp_decode_k3_gq.elf" = "24d09cea4b7dc0a6a433b48e41d9ce207e400a4226b4fd5e4ac14d7f49cf844a"
+"lowrung1/interp_decode_k3_gq.elf" = "fda698bc3bd99336d33b0cb20c7bf606fd0f99a6645b7c7c0547f174e44037f7"
+"lowrung8/interp_decode_k3_gq.elf" = "4bc2b4a5ec2e56b81d5cff05ec1d7cd9ce0d77898d8a49d28b7a0d47bbd443ac"
+"interp_prefill_k3_moe_gq.elf" = "df3125f83b6b1ebbe25c25987fb56f754b016d0d040a36aca7576fdd085ba173"
+"interp_flash_gq.elf" = "b5db3627a3e9f80823a9fc31574127f05daf1dcc9f0ed007d842d966a7bedcfb"
 "fmoe_bf16_blockscaleFp8_g1u1_vs_silu_1tg_pf2_16x128.co" = "07df0af964cf26dde7635b6f524fd84701a15100f5b88fc9366599e20edeea31"
 "fmoe_bf16_blockscaleFp8_g1u1_vs_silu_1tg_ps_32x128.co" = "2b2c1852d84d47f4a03ad5814087be4b4b21e0acd9ee0efdd3f7792a6afe509a"
 "fmoe_bf16_blockscaleFp8_g1u1_vs_silu_1tg_ps_32x256.co" = "6a583441c6bb139c6af20c5198614b7b02b74fdba370580a5a5bbe164bd7bb34"
 "fmoe_bf16_blockscaleFp8_g1u1_vs_silu_1tg_ps_64x256.co" = "e442ee49fd88b5d165b8f8313d790c3ec7a7978140fa2306876612191429e413"
 "moe_aiter_adapter_gfx950.elf" = "27084645d735c7975d11a025b10d6a0ec60db9718595016d61a2f7fb54f29dce"
 "mhc_aiter_gfx950.elf" = "b6ddf9dfbf417e98246b5e4a9326657488817649a0a1a9286482cc8f850f76e0"
-"copy_pairs_gfx950.elf" = "15040338284770424e9e733d01ae973bbf9428ab8138b261e467d1336336d31b"
-"kda_chunk_carry_regstate_keyfeed_spans_gfx950.elf" = "1c7d56d8e3ef1e17988ebd209ec129957fd1e33a56988aa37e5f8571546cadcb"
-"kda_chunk_carry_regstate_spans_gfx950.elf" = "757b8266aa7de0d80cf0fa7afd70dcffce3cdfacae834b112a2a1dcf39df636d"
-"kda_chunk_intra_wave_items_spans_gfx950.elf" = "c3075a2d148305d2607be13016c7c77707a18d6402aaac38a3d2cddfbbf8d93c"
-"kda_chunk_wu_lean_keys_spans_gfx950.elf" = "fffca7cd41ea0b20580de25eccd6745600f14abc96dee540345263db5f49e954"
-"kda_chunk_carry_split_gfx950.elf" = "a35a829156066353ff56841cc8391fd8c075c1781198dc8fa33972c44fbc75ef"
-"kda_decode_wide_gfx950.elf" = "43bdcaeee85a16211a2f371630a4e876e10a724e777b7bd743c5189155891ebe"
+"copy_pairs_gfx950.elf" = "5fc34a3fa1b45a4bc59d3160a1da4f5ebd3e249bde18192f4bf35dc1a0719d3a"
+"kda_chunk_carry_regstate_keyfeed_spans_gfx950.elf" = "5cd98ac537a85f89250f301f87cd6658d599724d9b45dba4d9b9ed91c74be012"
+"kda_chunk_carry_regstate_spans_gfx950.elf" = "e30e97077ac67d49f1e67d5b5379e081f907f26a2388f304386d82f418f1c3a0"
+"kda_chunk_intra_wave_items_spans_gfx950.elf" = "fe825fe08ab5ec81bdb82a5e969decbe024c19ab9ac21a4b67ce5e0ac7eda529"
+"kda_chunk_wu_lean_keys_spans_gfx950.elf" = "e3998375099b66f7f16fef815fc18500eda8abbef90bebaa5613a6c748014de6"
+"kda_chunk_carry_split_gfx950.elf" = "dab3effc46d054b32da7638f05aff5e84ee534bfe995e0fe1862caff16eb5b83"
+"kda_decode_wide_gfx950.elf" = "5c406748b9d005d01a4911adb095a31cf52ca747268d70361e11dc500a15f4fb"
 "glm_lt_gfx950.elf" = "88995bce9413c67da6df1a2d7e41aa95b0ba73f4ee3626de4a26e025580f1b0f"
