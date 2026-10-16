@@ -220,6 +220,13 @@ pub fn synthesize_full(json: &str, name: String) -> Result<HfSynthesis, String> 
     if v["model_type"].as_str() == Some("qwen3_5") {
         return synth_qwen35(&v, name);
     }
+    if matches!(v["model_type"].as_str(), Some("muse_spark" | "muse_spark_text")) {
+        return Err(format!(
+            "unsupported model_type {:?}: Muse Spark (latent MoE, NoPE GQA, residual gates) has \
+             no --hf-dir synthesis; it is not a Gemma-4 nested checkpoint",
+            v["model_type"].as_str().unwrap_or_default()
+        ));
+    }
     if v.get("text_config").is_some() {
         return synth_gemma(&v["text_config"], name, "model.language_model.");
     }
@@ -1797,6 +1804,13 @@ mod tests {
             }}
         }}"#
         )
+    }
+
+    #[test]
+    fn muse_spark_is_refused_not_read_as_gemma4() {
+        let json = gemma_json("").replace("gemma4_unified", "muse_spark");
+        let err = synthesize_full(&json, "muse".into()).unwrap_err();
+        assert!(err.contains("Muse Spark"), "{err}");
     }
 
     #[test]

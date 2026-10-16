@@ -69,6 +69,7 @@ use config::*;
 mod gptoss;
 mod ladder;
 mod mla;
+mod muse;
 mod qwen35;
 #[cfg(test)]
 mod test_env;
@@ -9071,6 +9072,23 @@ pub fn run_verified(args: EmitArgs, verify: Option<VerifyHook>) {
     // theta as an `Option` and `require_mla_rope` refuses a NoPE checkpoint, so the `kimi` arm
     // is loud about this one too even without the claim above. `kimi_k3_emit` never returns: it
     // validates everything the front end can and then reports what is not implemented.
+    // Muse Spark nests under `text_config` too; unclaimed, `cfg_from` reads it as Gemma-4 and dies
+    // on the absent `global_head_dim`.
+    if matches!(model_type.as_str(), "muse_spark" | "muse_spark_text") {
+        muse::run(
+            &dir,
+            ctx,
+            &out,
+            n_cu,
+            tp,
+            block_spec.as_deref(),
+            rope_gen,
+            &arch,
+            &gpu,
+            verify.as_ref(),
+        );
+        return;
+    }
     if model_type == "kimi_k3" {
         // The hybrid emitter is the production default. Keep the old itemised
         // capability report behind `K3_FULL=0` as a diagnostic; experiments
@@ -9702,6 +9720,10 @@ const GFX950_DISPATCHED: &[&str] = &[
     "PLOW_DOP_MOE_ROUTER_GEMMA_TOPK",
     "PLOW_DOP_MOE_ROUTER_TOPK",
     "PLOW_DOP_MOE_ROUTER_TOPK_PF",
+    "PLOW_DOP_MUSE_MOE_COMBINE_NORM",
+    "PLOW_DOP_MUSE_NORM_GATE_NORM",
+    "PLOW_DOP_MUSE_RESIDUAL_GATE",
+    "PLOW_DOP_MUSE_RMSNORM",
     "PLOW_DOP_NORM_RESIDUAL",
     "PLOW_DOP_NORM_RESIDUAL_NORM",
     "PLOW_DOP_O_UV_FOLD",

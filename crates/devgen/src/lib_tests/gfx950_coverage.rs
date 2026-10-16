@@ -303,6 +303,7 @@ const EMITTER_SRC: &[&str] = &[
     "k3.rs",
     "mla/kimi_k3.rs",
     "qwen35.rs",
+    "muse.rs",
 ];
 
 /// Arms gfx950 dispatches that NOTHING emits, each with why that is deliberate.

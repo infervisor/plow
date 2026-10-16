@@ -286,6 +286,9 @@ pub fn classify(op: DevOp) -> OpClass {
 
         // ---- norms, elementwise, embedding ------------------------------
         DevOp::RmsNorm => a_rows("i0=rows"),
+        DevOp::MuseRmsNorm => a_rows("i0=rows"),
+        DevOp::MuseResidualGate => a_rows("i1=rows"),
+        DevOp::MuseNormGateNorm => a_rows("i0=rows"),
         DevOp::RowRms => a_rows("i0=rows"),
         DevOp::Residual | DevOp::Sum4Bf16 => a_elem("i0=n"),
         DevOp::Glu => a_elem("i0=n"),
@@ -528,6 +531,7 @@ pub fn classify(op: DevOp) -> OpClass {
         DevOp::MoeRouterTopk => a_one("i1=n_exp i2=k, no token axis"),
         DevOp::MoeExpertGlu | DevOp::MoeExpertDown => a_one("i0=slot, one token"),
         DevOp::MoeCombine => a_one("i0=H i1=k, no token axis"),
+        DevOp::MuseMoeCombineNorm => a_one("i0=H i1=k, no token axis"),
         DevOp::MoeExpertGluFp8Blk | DevOp::MoeExpertDownFp8Blk => a_one("i0=slot, one token"),
         DevOp::MoeGroupGluFp8Blk | DevOp::MoeGroupDownFp8Blk => {
             a_one("i0=k loops the top-k slots of ONE token")

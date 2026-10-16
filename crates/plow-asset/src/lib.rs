@@ -721,6 +721,7 @@ pub mod hetero;
 pub mod hetero_channel;
 pub mod modular;
 pub mod token_batch;
+pub mod weight_shards;
 pub use modular::{
     ModularBlockKind, ModularBlockProg, ModularLeanCorrectness, ModularLeanPerformance,
     ModularLeanSummary, ModularPhase, ModularPipelineManifest, MODULAR_MANIFEST_SECTION,

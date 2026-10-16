@@ -49,7 +49,7 @@ build_harness() {
   echo "toolchain   : $TOOLCHAIN_LABEL"
   "$hipcc" --offload-arch=gfx950 -O3 -w -DPLOW_GEMV_MM="$OBJ_MM" -DPLOW_GEMV_WALK=1 --genco "$ROOT/runtime/amd/test_kernels.hip" -o "$obj/test_kernels.co" -I"$ROOT/runtime/amd" -I"$ROOT/runtime/common"
   "$bundler" --unbundle --type=o --targets=hipv4-amdgcn-amd-amdhsa--gfx950 --input="$obj/test_kernels.co" --output="$obj/test_kernels.elf"
-  "$cc" -O2 -std=gnu11 -o "$obj/gemv_row_sweep" "$ROOT/runtime/bench/gemm/gemv_row_sweep.c" "$ROOT/runtime/amd/hsa_backend.c" -I"$rocm/include" -L"$rocm/lib" -Wl,-rpath,"$rocm/lib" -lhsa-runtime64 -lm
+  "$cc" -O2 -std=gnu11 -o "$obj/gemv_row_sweep" "$ROOT/runtime/bench/gemm/gemv_row_sweep.c" "$ROOT/runtime/amd/hsa_backend.c" -I"$ROOT/runtime/common" -I"$rocm/include" -L"$rocm/lib" -Wl,-rpath,"$rocm/lib" -lhsa-runtime64 -lm
 }
 
 if [[ "${1:-}" == --build-only ]]; then

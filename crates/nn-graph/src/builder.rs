@@ -165,6 +165,17 @@ impl Nn {
         self.emit(Op::RmsNormZeroCentered { eps }, vec![x, w])
     }
 
+    pub fn rmsnorm_input_scaled(
+        &mut self,
+        name: &str,
+        x: TensorId,
+        hidden: i64,
+        eps: f32,
+    ) -> TensorId {
+        let w = self.param(&format!("{name}.weight"), [Dim::stat(hidden)]);
+        self.emit(Op::RmsNormInputScaled { eps }, vec![x, w])
+    }
+
     pub fn rmsnorm_dtype(
         &mut self,
         name: &str,
@@ -437,6 +448,7 @@ impl Nn {
                 norm_topk: false,
                 route_scale: 1.0,
                 correction_bias: false,
+                logit_scale: 1.0,
             },
             vec![x, w],
         )
@@ -471,6 +483,7 @@ impl Nn {
                 norm_topk: false,
                 route_scale: 1.0,
                 correction_bias: false,
+                logit_scale: 1.0,
             },
             vec![x, w],
         )
@@ -509,6 +522,46 @@ impl Nn {
                 norm_topk,
                 route_scale,
                 correction_bias: true,
+                logit_scale: 1.0,
+            },
+            vec![x, w, correction],
+        )
+    }
+
+    /// Flat top-k sigmoid router computed in fp32 (`{name}.weight` and
+    /// `{name}.e_score_correction_bias` are F32): `sigmoid(logits * logit_scale)`,
+    /// the bias steering selection only, selected weights renormalized.
+    #[allow(clippy::too_many_arguments)]
+    pub fn moe_router_sigmoid_f32(
+        &mut self,
+        name: &str,
+        x: TensorId,
+        hidden: i64,
+        num_experts: u32,
+        top_k: u32,
+        route_scale: f32,
+        logit_scale: f32,
+    ) -> TensorId {
+        let w = self.param_dtype(
+            &format!("{name}.weight"),
+            [Dim::stat(num_experts as i64), Dim::stat(hidden)],
+            DType::F32,
+        );
+        let correction = self.param_dtype(
+            &format!("{name}.e_score_correction_bias"),
+            [Dim::stat(num_experts as i64)],
+            DType::F32,
+        );
+        self.emit(
+            Op::MoeRouter {
+                num_experts,
+                top_k,
+                group: None,
+                scoring: MoeScoring::Sigmoid,
+                norm_topk: true,
+                route_scale,
+                correction_bias: true,
+                logit_scale,
             },
             vec![x, w, correction],
         )
@@ -529,8 +582,36 @@ impl Nn {
                 top_k,
                 intermediate_size,
                 block_fp8,
+                post_expert_norm: None,
             },
             vec![x, routes],
+        )
+    }
+
+    /// Routed experts with Muse Spark's per-(token, expert) input-scaled
+    /// RMSNorm, weight `{name}.weight` of shape `[hidden]`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn moe_experts_post_norm(
+        &mut self,
+        name: &str,
+        x: TensorId,
+        routes: TensorId,
+        hidden: i64,
+        num_experts: u32,
+        top_k: u32,
+        intermediate_size: u32,
+        eps: f32,
+    ) -> TensorId {
+        let w = self.param(&format!("{name}.weight"), [Dim::stat(hidden)]);
+        self.emit(
+            Op::MoeExperts {
+                num_experts,
+                top_k,
+                intermediate_size,
+                block_fp8: false,
+                post_expert_norm: Some(eps),
+            },
+            vec![x, routes, w],
         )
     }
 
@@ -774,6 +855,23 @@ impl Nn {
         ins.push(norm);
         ins.push(proj);
         self.emit(Op::BlockResidual { max_snapshots }, ins)
+    }
+
+    /// Muse Spark's gated residual over `[residual, h]`, gate `{name}.gate`.
+    pub fn residual_gate(
+        &mut self,
+        name: &str,
+        residual: TensorId,
+        h: TensorId,
+        hidden: i64,
+        temperature: f32,
+        eps: f32,
+    ) -> TensorId {
+        let gate = self.param(&format!("{name}.gate"), [Dim::stat(hidden)]);
+        self.emit(
+            Op::ResidualGate { temperature, eps },
+            vec![residual, h, gate],
+        )
     }
 
     // ---- finish ------------------------------------------------------------

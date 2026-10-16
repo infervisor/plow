@@ -7876,6 +7876,39 @@ mod tests {
     }
 
     #[test]
+    fn from_config_muse_spark_text_config() {
+        // Muse Spark: full (NoPE) attention every 4th layer from the last, 2048-window
+        // sliding elsewhere, one GQA shape for both families.
+        let dir = std::env::temp_dir().join(format!("plow-vmm-muse-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let layer_types: Vec<_> = (0..62u32)
+            .map(|l| {
+                if (61 - l).is_multiple_of(4) {
+                    "full_attention"
+                } else {
+                    "sliding_attention"
+                }
+            })
+            .collect();
+        let cfg = serde_json::json!({
+            "model_type": "muse_spark",
+            "text_config": {
+                "model_type": "muse_spark_text", "num_hidden_layers": 62,
+                "num_key_value_heads": 16, "head_dim": 64, "sliding_window": 2048,
+                "layer_types": layer_types
+            }
+        });
+        std::fs::write(dir.join("config.json"), cfg.to_string()).unwrap();
+        let g = VmmGeometry::from_config(&dir, 4096, 2).expect("muse_spark geometry");
+        assert_eq!(g.full_layers, (1..62).step_by(4).collect::<Vec<u32>>());
+        assert_eq!(g.slide_layers.len(), 46);
+        assert_eq!(g.window, 2048);
+        assert_eq!((g.kvh_full, g.hd_full), (16, 64));
+        assert_eq!((g.kvh_slide, g.hd_slide), (16, 64));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
     fn frontier_growth_maps_whole_blocks() {
         let ops = Arc::new(MockVmm::default());
         let p = pool(ops.clone());

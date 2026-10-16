@@ -241,6 +241,60 @@ fn term_for(
                 f64lit(*eps)
             )
         }
+        Op::RmsNormInputScaled { eps } => {
+            format!("(InputScaledRmsNorm {} {} {})", e(0)?, e(1)?, f64lit(*eps))
+        }
+        Op::ResidualGate { temperature, eps } => format!(
+            "(ResidualGate {} {} {} {} {})",
+            e(0)?,
+            e(1)?,
+            e(2)?,
+            f64lit(*temperature),
+            f64lit(*eps)
+        ),
+        Op::MoeRouter {
+            num_experts,
+            top_k,
+            group: None,
+            scoring: nn_graph::op::MoeScoring::Sigmoid,
+            norm_topk,
+            route_scale,
+            correction_bias: true,
+            logit_scale,
+        } => format!(
+            "(MoeRouterSigmoidBias {} {} {} {} {} {} {} {})",
+            e(0)?,
+            e(1)?,
+            e(2)?,
+            num_experts,
+            top_k,
+            i64::from(*norm_topk),
+            f64lit(*route_scale),
+            f64lit(*logit_scale),
+        ),
+        // No other router term carries a logit scale.
+        Op::MoeRouter { logit_scale, .. } if *logit_scale != 1.0 => {
+            return Err(LowerError::Unsupported {
+                op: "moe_router(logit_scale)",
+            })
+        }
+        Op::MoeExperts {
+            num_experts,
+            top_k,
+            intermediate_size,
+            block_fp8,
+            post_expert_norm: Some(eps),
+        } => format!(
+            "(MoeExpertsPostNorm {} {} {} {} {} {} {} {})",
+            e(0)?,
+            e(1)?,
+            e(2)?,
+            num_experts,
+            top_k,
+            intermediate_size,
+            i64::from(*block_fp8),
+            f64lit(*eps),
+        ),
         Op::MoeRouter {
             num_experts,
             top_k,
@@ -257,6 +311,7 @@ fn term_for(
             norm_topk,
             route_scale,
             correction_bias: true,
+            ..
         } => format!(
             "(MoeRouterNoAux {} {} {} {} {} {} {} {} {})",
             e(0)?,
@@ -288,6 +343,7 @@ fn term_for(
             top_k,
             intermediate_size,
             block_fp8,
+            post_expert_norm: None,
         } => format!(
             "(MoeExperts {} {} {} {} {} {})",
             e(0)?,
