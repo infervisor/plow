@@ -5350,6 +5350,8 @@ fn sparse_prefill_chain(prog: &DevProg) -> bool {
     prog.insts.iter().any(|d| {
         d.op == DevOp::IndexTpPf as u16
             || (d.op == DevOp::FlashMlaPrefillFp8 as u16 && sparse_fp8(d))
+            || (d.op == DevOp::DsaPoolCompress as u16 && d.i[6] != 1)
+            || (d.op == DevOp::DsaPoolStash as u16 && d.i[4] != 1)
     })
 }
 
@@ -5405,6 +5407,16 @@ fn packed_sparse_refusal(
             .map(|e| e.seg as usize)
     };
     for (ix, d) in prog.insts.iter().enumerate() {
+        if d.op == DevOp::DsaPoolCompress as u16 && d.i[6] != 1 {
+            return Some(format!(
+                "packed sparse prefill: DsaPoolCompress instruction {ix} carries non-span indexing"
+            ));
+        }
+        if d.op == DevOp::DsaPoolStash as u16 && d.i[4] != 1 {
+            return Some(format!(
+                "packed sparse prefill: DsaPoolStash instruction {ix} carries non-span indexing"
+            ));
+        }
         if d.op == DevOp::IndexTpPf as u16 {
             match index_tp_span_aware {
                 Some(true) => {}
