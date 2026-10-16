@@ -988,7 +988,11 @@ __device__ __forceinline__ void fa_decode_rg_item(
  * Needs nsplit 1, no window, no ring wrap, and a merge-folded output. Block = FA_ST_THREADS. */
 #if !defined(__CUDA_ARCH__) || __CUDA_ARCH__ >= 900
 #ifndef PLOW_NV_FA_ST_STAGES
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ == 1200
+#define PLOW_NV_FA_ST_STAGES 2 /* 4 stages at hd 128 = 140 KiB > GB202's 99 KiB opt-in */
+#else
 #define PLOW_NV_FA_ST_STAGES 4
+#endif
 #endif
 #define FA_ST_TR (16u * (unsigned)PLOW_NV_FA_RG_U)
 #define FA_ST_THREADS (PLOW_NV_THREADS + 32u)
