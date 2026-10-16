@@ -646,8 +646,14 @@ impl HsaDriver {
             hsa_signal_wait_scacquire: resolve!(lib, b"hsa_signal_wait_scacquire\0"),
             hsa_signal_add_screlease: resolve!(lib, b"hsa_signal_add_screlease\0"),
             hsa_signal_load_scacquire: resolve!(lib, b"hsa_signal_load_scacquire\0"),
-            hsa_amd_profiling_set_profiler_enabled: resolve!(lib, b"hsa_amd_profiling_set_profiler_enabled\0"),
-            hsa_amd_profiling_get_dispatch_time: resolve!(lib, b"hsa_amd_profiling_get_dispatch_time\0"),
+            hsa_amd_profiling_set_profiler_enabled: resolve!(
+                lib,
+                b"hsa_amd_profiling_set_profiler_enabled\0"
+            ),
+            hsa_amd_profiling_get_dispatch_time: resolve!(
+                lib,
+                b"hsa_amd_profiling_get_dispatch_time\0"
+            ),
             hsa_code_object_reader_create_from_memory: resolve!(
                 lib,
                 b"hsa_code_object_reader_create_from_memory\0"
@@ -1374,15 +1380,20 @@ impl HsaBackend {
             return Err(hsa_fault(rc, "hsa_queue_create"));
         }
         if let Some(spec) = crate::config::RuntimeConfig::get().amd.cu_mask.as_deref() {
-            let mask = cu_mask_bits(spec, cu_count)
-                .ok_or_else(|| RuntimeError::Device(format!("PLOW_AMD_CU_MASK={spec:?}: want N or ^N")))?;
+            let mask = cu_mask_bits(spec, cu_count).ok_or_else(|| {
+                RuntimeError::Device(format!("PLOW_AMD_CU_MASK={spec:?}: want N or ^N"))
+            })?;
             let rc = unsafe {
                 (drv.hsa_amd_queue_cu_set_mask)(queue, (mask.len() * 32) as u32, mask.as_ptr())
             };
             if rc != HSA_STATUS_SUCCESS {
                 return Err(hsa_fault(rc, "hsa_amd_queue_cu_set_mask"));
             }
-            tracing::warn!(spec, cu_count, "PLOW_AMD_CU_MASK: queue restricted (diagnostic)");
+            tracing::warn!(
+                spec,
+                cu_count,
+                "PLOW_AMD_CU_MASK: queue restricted (diagnostic)"
+            );
             cu_count = mask.iter().map(|w| w.count_ones()).sum();
         }
 
@@ -1395,7 +1406,11 @@ impl HsaBackend {
             }
             return Err(hsa_fault(rc, "hsa_signal_create"));
         }
-        let dtimes = match crate::config::RuntimeConfig::get().amd.dispatch_times.as_deref() {
+        let dtimes = match crate::config::RuntimeConfig::get()
+            .amd
+            .dispatch_times
+            .as_deref()
+        {
             Some(prefix) if !prefix.is_empty() => unsafe {
                 DispatchTimes::new(&drv, queue, agent, prefix, device_ordinal)
             },
@@ -1596,8 +1611,7 @@ impl Drop for HsaBackend {
             .kernarg_retirement
             .completion_ticket()
             .and_then(|ticket| {
-                let value =
-                    self.done_load();
+                let value = self.done_load();
                 self.kernarg_retirement.complete(ticket, value)
             })
             .is_ok();
@@ -2649,7 +2663,8 @@ impl HsaBackend {
                 if defer {
                     #[cfg(target_arch = "x86_64")]
                     std::arch::x86_64::_mm_sfence();
-                    *self.chain_karg.lock().unwrap() = Some((karg as usize, n, stage[n - 1], stage));
+                    *self.chain_karg.lock().unwrap() =
+                        Some((karg as usize, n, stage[n - 1], stage));
                 } else if n > 0 && !publish_device_kernarg(karg, n, stage[n - 1]) {
                     // A BAR write that did not land: copy once more, and poison the device rather
                     // than publish a packet over a stale slot.
@@ -3998,9 +4013,7 @@ impl HsaBackend {
             ));
         }
         self.kernarg_retirement
-            .preflight(packets as u64, size as u64, || unsafe {
-                self.done_load()
-            })
+            .preflight(packets as u64, size as u64, || unsafe { self.done_load() })
             .map_err(kernarg_retirement_error)
     }
 
@@ -4539,12 +4552,7 @@ impl crate::memory::vmm::VmmOps for HsaBackend {
         let alloc_bytes = (bytes as usize).max(64);
         let mut ptr: *mut c_void = std::ptr::null_mut();
         let rc = unsafe {
-            (self.shared.drv.hsa_amd_memory_pool_allocate)(
-                self.fine_pool,
-                alloc_bytes,
-                0,
-                &mut ptr,
-            )
+            (self.shared.drv.hsa_amd_memory_pool_allocate)(self.fine_pool, alloc_bytes, 0, &mut ptr)
         };
         self.check(
             rc,
@@ -4590,9 +4598,8 @@ impl crate::memory::vmm::VmmOps for HsaBackend {
             }
             None => {
                 let mut s = HsaSignal { handle: 0 };
-                let rc = unsafe {
-                    (self.shared.drv.hsa_signal_create)(1, 0, std::ptr::null(), &mut s)
-                };
+                let rc =
+                    unsafe { (self.shared.drv.hsa_signal_create)(1, 0, std::ptr::null(), &mut s) };
                 self.check(rc, "hsa_signal_create (vmm spill)")?;
                 s
             }
@@ -4681,9 +4688,8 @@ impl crate::memory::vmm::VmmOps for HsaBackend {
             }
             None => {
                 let mut s = HsaSignal { handle: 0 };
-                let rc = unsafe {
-                    (self.shared.drv.hsa_signal_create)(1, 0, std::ptr::null(), &mut s)
-                };
+                let rc =
+                    unsafe { (self.shared.drv.hsa_signal_create)(1, 0, std::ptr::null(), &mut s) };
                 self.check(rc, "hsa_signal_create (vmm restore)")?;
                 s
             }

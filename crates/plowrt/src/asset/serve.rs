@@ -516,9 +516,16 @@ mod tests {
         );
         assert_eq!(split_asset_arg(&dir).unwrap(), (dir.clone(), None, None));
         assert_eq!(
-            split_asset_arg(Path::new(&format!("{},slug=glm-b,checkpoint=/c", dir.display())))
-                .unwrap(),
-            (dir.clone(), Some(PathBuf::from("/c")), Some("glm-b".to_string()))
+            split_asset_arg(Path::new(&format!(
+                "{},slug=glm-b,checkpoint=/c",
+                dir.display()
+            )))
+            .unwrap(),
+            (
+                dir.clone(),
+                Some(PathBuf::from("/c")),
+                Some("glm-b".to_string())
+            )
         );
         for bad in [
             ",checkpoint=",
@@ -537,7 +544,10 @@ mod tests {
         // An existing path is literal even with a comma in its name.
         let comma = dir.join("a,checkpoint=b");
         std::fs::create_dir_all(&comma).unwrap();
-        assert_eq!(split_asset_arg(&comma).unwrap(), (comma.clone(), None, None));
+        assert_eq!(
+            split_asset_arg(&comma).unwrap(),
+            (comma.clone(), None, None)
+        );
 
         assert_eq!(take_asset_arg(Path::new(&arg)).unwrap(), dir);
         assert_eq!(

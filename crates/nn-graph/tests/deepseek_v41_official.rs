@@ -13,8 +13,8 @@
 //! those lists exactly. The index itself is 7 MB and not committed; these
 //! lists are its load-bearing content.
 
-use nn_graph::models::config::{ModelConfig, V41Attn};
 use nn_graph::models::config::DeepSeekV41Config;
+use nn_graph::models::config::{ModelConfig, V41Attn};
 
 // ---- observed in model.safetensors.index.json ----
 
@@ -132,7 +132,10 @@ fn layers_where(cfg: &DeepSeekV41Config, f: impl Fn(&DeepSeekV41Config, u32) -> 
 fn compressor_layers_match_the_checkpoint() {
     let cfg = official();
     assert_eq!(layers_where(&cfg, |c, l| c.is_kv_source(l)), COMPRESSOR);
-    assert_eq!(COMPRESSOR_NORM, COMPRESSOR, "every compressor carries a norm");
+    assert_eq!(
+        COMPRESSOR_NORM, COMPRESSOR,
+        "every compressor carries a norm"
+    );
 
     // The V4 reading, stated so the difference is visible rather than implied.
     let v4_reading = layers_where(&cfg, |c, l| c.attn_kind(l) != V41Attn::Window);
@@ -145,7 +148,10 @@ fn compressor_layers_match_the_checkpoint() {
 #[test]
 fn only_pooling_compressors_carry_a_gate() {
     let cfg = official();
-    assert_eq!(layers_where(&cfg, |c, l| c.compressor_has_gate(l)), COMPRESSOR_GATE);
+    assert_eq!(
+        layers_where(&cfg, |c, l| c.compressor_has_gate(l)),
+        COMPRESSOR_GATE
+    );
     assert_eq!(COMPRESSOR_GATE.len(), COMPRESSOR.len() - 1);
     assert_eq!(cfg.attn_kind(20), V41Attn::Compressed { ratio: 1 });
 }
@@ -167,7 +173,10 @@ fn indexer_layers_match_the_checkpoint() {
 #[test]
 fn engram_layers_match_the_checkpoint() {
     let cfg = official();
-    assert_eq!(layers_where(&cfg, |c, l| c.engram_rows(l).is_some()), ENGRAM);
+    assert_eq!(
+        layers_where(&cfg, |c, l| c.engram_rows(l).is_some()),
+        ENGRAM
+    );
     assert_eq!(cfg.engram_rows(1), Some(384_006_168));
     assert_eq!(cfg.engram_rows(14), Some(384_016_682));
 }
@@ -211,16 +220,28 @@ fn graph_build_refuses_with_a_checklist() {
 #[test]
 fn engram_hash_tables_match_the_reference() {
     let cfg = official();
-    let t = cfg.engram_hash_tables().expect("released checkpoint's engram shape");
+    let t = cfg
+        .engram_hash_tables()
+        .expect("released checkpoint's engram shape");
 
     assert_eq!(t.multipliers.len(), 2);
     assert_eq!(
         t.multipliers[0],
-        vec![76_632_096_046_245, 4_839_876_093_313, 35_959_672_319_349, 73_987_337_458_391]
+        vec![
+            76_632_096_046_245,
+            4_839_876_093_313,
+            35_959_672_319_349,
+            73_987_337_458_391
+        ]
     );
     assert_eq!(
         t.multipliers[1],
-        vec![67_716_810_739_261, 51_510_806_800_915, 30_921_347_202_721, 82_619_226_485_591]
+        vec![
+            67_716_810_739_261,
+            51_510_806_800_915,
+            30_921_347_202_721,
+            82_619_226_485_591
+        ]
     );
     // Odd by construction: the reference draws `v` and stores `2v + 1`.
     for row in &t.multipliers {
@@ -244,8 +265,10 @@ fn engram_hash_tables_match_the_reference() {
     assert_eq!(all.len(), n, "every bucket range must own a DISTINCT prime");
 
     // Offsets are the exclusive prefix sum, and the last range ends exactly at the table's end.
-    for (primes, (offsets, rows)) in
-        t.primes.iter().zip(t.offsets.iter().zip(cfg.engram_num_embeddings.iter()))
+    for (primes, (offsets, rows)) in t
+        .primes
+        .iter()
+        .zip(t.offsets.iter().zip(cfg.engram_num_embeddings.iter()))
     {
         assert_eq!(offsets[0], 0);
         for i in 1..offsets.len() {

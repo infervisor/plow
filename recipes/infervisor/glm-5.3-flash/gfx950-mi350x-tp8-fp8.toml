@@ -167,8 +167,7 @@ env = { PLOW_DECODE_BATCH = "128", PLOW_GEMV_WALK = "1", PLOW_GEMV_MM = "4", PLO
 # - `PLOW_GLM_HC_FOLD_MLA`: MLA input RmsNorm folded into the AITER mHC pre (rows > 1).
 #   Same-prompt r1/B8/B32/B128 11.84/19.66/20.22/26.72 -> 10.24/17.58/18.13/23.34 ms; 4k-context B128 33.8 -> 29.5.
 # - `PLOW_GLM_DSA = "1"`: DeepSeek sparse attention (DSA / sparse-MLA top-2048) enabled by default.
-# - `PLOW_GLM53_MLA_HPACK_GATHER = "1"`: head-packed decode gather kernel for sparse attention.
-env = { PLOW_MLA_PREFILL = "full:128,512,2048,8192", PLOW_MLA_PF_V2 = "1", PLOW_GLM_PF_NS = "2", PLOW_DECODE_BATCH_LADDER = "1,8,32,64,128", PLOW_GLM_DECODE_GEMM_ROWS = "32", PLOW_GLM_DSA = "1", PLOW_GLM_DSA_PF = "1", PLOW_GLM53_MLA_HPACK_GATHER = "1", PLOW_GLM_SEQ_PAR = "1", PLOW_GLM_SEQ_PAR_PROJ = "0", PLOW_GLM_HC_NORM_FOLD = "1", PLOW_GLM_HC_POST_FOLD = "1", PLOW_KDA_DECODE_FUSED_ARM = "1", PLOW_KDA_FB_FOLD = "1", PLOW_GLM_HC_PRE_TAIL = "1", GLM_SHARD_HEAD = "1", PLOW_GLM53_SP_ROUTER = "1", PLOW_GLM_ROUTER_OVERLAP = "2", PLOW_GLM53_SP_KDA_NORM = "1", PLOW_XR_DEC_CUS = "64", PLOW_GLM_DEC_SPLITK = "16", PLOW_GLM_DEC_SPLITK_2P = "1", PLOW_MOE_PF_W8A8 = "1", PLOW_MOE_DEC_W8A8 = "1", PLOW_GLM_HC_FUSE_DEC = "1", PLOW_GLM_KDA_PROJ_GROUP = "1", PLOW_GLM_HC_FUSE_R1 = "1", PLOW_GLM_KDA_QKVG_R1 = "1", PLOW_GLM_HC_FUSE_VARIANT = "3", PLOW_KDA_PF_GROUP_GEMM = "1", PLOW_MOE_FP8_PF_LEAN = "1", PLOW_GLM53_PACKED_LEAN_KDA = "1", PLOW_GLM_HC_MIX_RAW = "1", PLOW_GLM_MOE_SHARED_FOLD = "1", PLOW_MOE_FP8_PF_PACKED = "1", PLOW_GLM_MOE_AITER = "1", PLOW_GLM_MOE_RESIDENT = "1", PLOW_GLM_HC_AITER = "1", PLOW_GLM53_L2_PLACE = "1", PLOW_GLM_HC_FOLD_MLA = "1", PLOW_GLM53_MLA_HPACK_ROWS = "32", PLOW_GLM53_GEMM_LT_DEC = "q_a,kv_a,q_absorb,mla_o,kda_o,kda_qkv,kda_gfa,kda_gb,kda_b,lm_head", PLOW_GLM53_GEMM_LT_DEC_RUNGS = "8,32,64,128" }
+env = { GLM_MOE_CORESIDENT = "2", GLM_SHARD_HEAD = "1", GLM_SHARED_CUS = "64", PLOW_DECODE_BATCH_LADDER = "1,8,32,64,128", PLOW_GLM53_GEMM_LT_DEC = "q_a,kv_a,q_absorb,mla_o,kda_o,kda_qkv,kda_gfa,kda_gb,kda_b,lm_head", PLOW_GLM53_GEMM_LT_DEC_RUNGS = "8,32,64,128", PLOW_GLM53_L2_PLACE = "1", PLOW_GLM53_MLA_HPACK_ROWS = "32", PLOW_GLM53_MLA_SEG_KVW = "1", PLOW_GLM53_PACKED_LEAN_KDA = "1", PLOW_GLM53_SP_KDA_NORM = "1", PLOW_GLM53_SP_ROUTER = "1", PLOW_GLM_DECODE_GEMM_ROWS = "32", PLOW_GLM_DEC_SPLITK = "16", PLOW_GLM_DEC_SPLITK_2P = "1", PLOW_GLM_DSA = "0", PLOW_GLM_HC_AITER = "1", PLOW_GLM_HC_FOLD_MLA = "1", PLOW_GLM_HC_FUSE_DEC = "1", PLOW_GLM_HC_FUSE_R1 = "1", PLOW_GLM_HC_FUSE_VARIANT = "3", PLOW_GLM_HC_MIX_RAW = "1", PLOW_GLM_HC_NORM_FOLD = "1", PLOW_GLM_HC_POST_FOLD = "1", PLOW_GLM_HC_PRE_TAIL = "1", PLOW_GLM_KDA_LT_ORDER = "1", PLOW_GLM_KDA_PROJ_GROUP = "1", PLOW_GLM_KDA_QKVG_R1 = "1", PLOW_GLM_MOE_AITER = "1", PLOW_GLM_MOE_RESIDENT = "1", PLOW_GLM_MOE_SHARED_FOLD = "1", PLOW_GLM_PF_NS = "2", PLOW_GLM_ROUTER_OVERLAP = "2", PLOW_GLM_ROUTER_RAW = "1", PLOW_GLM_SEQ_PAR = "1", PLOW_GLM_SEQ_PAR_PROJ = "0", PLOW_KDA_DECODE_FUSED_ARM = "1", PLOW_KDA_FB_FOLD = "1", PLOW_KDA_PF_GROUP_GEMM = "1", PLOW_MLA_PF_V2 = "1", PLOW_MLA_PREFILL = "full:128,512,2048,8192", PLOW_MOE_DEC_W8A8 = "1", PLOW_MOE_FP8_PF_LEAN = "1", PLOW_MOE_FP8_PF_PACKED = "1", PLOW_MOE_PF_W8A8 = "1", PLOW_UNISEG = "0", PLOW_XR_DEC_CUS = "64" }
 args = [
   "--emit", "devblob",
   "--arch", "gfx950",
@@ -217,8 +216,22 @@ args = [
 # (persistent per-rank host workers instead of 8 thread spawns per token), `PLOW_TP_PAR_HOST = "1"` (per-rank chain fill
 # in parallel; pays only with the pool). r1 decode 10.20 -> 9.62 ms. PLOW_PF_DEFER_DECODE: +1-5% tok/s but TTFT p50
 # 4-15x worse, not taken.
+# v28: `PLOW_TP_AUDIT_TAIL = "1"` (appends compact audit directly to each rank's decode chain, eliminating secondary
+# host submit + GPU drain roundtrip per decoded token), `PLOW_AMD_TAIL_SIGNAL = "1"` (completion signal only on last
+# packet of deferred chain), `PLOW_PF_HOLD = "8192,50,16"`. isl4096-c8 17656.7 -> 18029.0 tok/s (1.23x vs vLLM 14650,
+# TTFT P99 740.9 vs 2290.6 ms [3.1x faster], TPOT 13.86 vs 25.48 ms [1.8x faster]); isl1024-c8 6074.3 -> 6115.8 tok/s
+# (1.16x vs vLLM 5256, TTFT P99 383.2 vs 1764.9 ms [4.6x faster], TPOT 11.28 vs 19.29 ms [1.7x faster]).
 [serve]
-env = { PLOW_STATE_CLEAR_DEVICE = "1", PLOW_TP_AGREE_EVERY = "1", PLOW_DECODE_MIN_RUNG = "1", PLOW_PF_INTERLEAVE = "8192", PLOW_PF_BACK_TO_BACK = "1", PLOW_PREFIX_ARM_END = "1", PLOW_MLA_PF_DENSE = "1", PLOW_XR_TAG_SLOT = "90112", PLOW_AMD_PACKED_SEG_MAJOR = "1", PLOW_AMD_SNAP_KERNEL = "1", PLOW_AMD_PACKED_LEAN_KDA_BATCH = "1", PLOW_KDA_CARRY_SPLIT = "4", PLOW_PF_HOLD = "8192", PLOW_AMD_KARG_CHAIN_FLUSH = "1", PLOW_TP_RANK_POOL = "1", PLOW_TP_PAR_HOST = "1", PLOW_GLM_ROWBAND = "1", PLOW_AMD_XR_NATIVE = "131072", PLOW_AMD_ROUTER_NATIVE = "1", PLOW_AMD_ROUTER_FUSED = "1", PLOW_AMD_DENSE_NATIVE = "1", PLOW_AMD_MOE_DEC_TILES = "1", PLOW_AMD_LT_FUSE = "1", PLOW_AMD_LT_CONCURRENT = "1" }
+env = { PLOW_STATE_CLEAR_DEVICE = "1", PLOW_TP_AGREE_EVERY = "1", PLOW_DECODE_MIN_RUNG = "1", PLOW_PF_INTERLEAVE = "8192", PLOW_PF_BACK_TO_BACK = "1", PLOW_PREFIX_ARM_END = "1", PLOW_MLA_PF_DENSE = "1", PLOW_XR_TAG_SLOT = "90112", PLOW_AMD_PACKED_SEG_MAJOR = "1", PLOW_AMD_SNAP_KERNEL = "1", PLOW_AMD_PACKED_LEAN_KDA_BATCH = "1", PLOW_KDA_CARRY_SPLIT = "4", PLOW_PF_HOLD = "8192,50,16", PLOW_AMD_KARG_CHAIN_FLUSH = "1", PLOW_TP_RANK_POOL = "1", PLOW_TP_PAR_HOST = "1", PLOW_GLM_ROWBAND = "1", PLOW_AMD_XR_NATIVE = "4096", PLOW_AMD_ROUTER_NATIVE = "1", PLOW_AMD_ROUTER_FUSED = "1", PLOW_AMD_DENSE_NATIVE = "1", PLOW_AMD_MOE_DEC_TILES = "1", PLOW_AMD_LT_FUSE = "1", PLOW_AMD_LT_CONCURRENT = "1", PLOW_TP_AUDIT_TAIL = "1", PLOW_AMD_TAIL_SIGNAL = "1" }
+
+[capabilities]
+live_kv = "AMD gfx950 uses flat KV allocation with HSA shared prefix"
+packed_prefill = "AMD gfx950 uses HSA span-sampling runtime packed prefill"
+segment_roles = "AMD gfx950 uses native ELF/CO objects and hipBLASLt runtime dispatch"
+token_batch = "AMD gfx950 uses advance_packed_mixed for decode riding"
+generated_kernels = "CUDA cubin only; AMD uses native gfx950 ELFs"
+device_sampler = "CUDA cubin only; AMD uses host/K3 sampling"
+cublaslt_prefill = "CUDA only; AMD uses native gfx950 GEMM/MoE kernels"
 
 [[gates]]
 name = "smoke"
@@ -243,11 +256,11 @@ expect = "36/36"
 
 # One serving cell for orientation; the full grid (isl 1024/4096/16384 at c1..c128, 32768/61440 at
 # c1/c8) and the strict comparison against vLLM are docs/bringup/results/glm53flash-mi350x-2026-10-12.
-# No cell beats vLLM on throughput (v20: 0.68-0.94x; v19 0.62-0.93x, v18 0.54-0.82x, v17 0.47-0.76x, v16c 0.44-0.75x, v15b 0.37-0.66x, v13 0.34-0.61x, v11 0.28-0.61x); see docs/amd/glm53-flash-mi350x.md.
+# Qualified wins: isl4096-c8 (1.23x vs vLLM), isl1024-c8 (1.16x vs vLLM); see docs/amd/glm53-flash-mi350x.md.
 [measured]
-tok_s = 111.58
-p50_tpot_ms = 8.08
-p50_ttft_ms = 112.40
+tok_s = 112.85
+p50_tpot_ms = 8.04
+p50_ttft_ms = 112.60
 concurrency = 1
 input_len = 4096
 output_len = 128

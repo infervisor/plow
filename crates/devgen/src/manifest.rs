@@ -2569,8 +2569,7 @@ fn build_inner(m: &Model, arch: &str, lean: &crate::LeanReport, packed_prefill: 
     objects["lean"]["kda_carry_keyfeed"] = json!({ "required": marked_wu(true) });
     // PLOW_MOE_PF_W8A8: ops 85/86 with i[7] >= 2 need the W8A8 arm in the prefill object.
     let moe_pf_w8a8 = m.progs.iter().flat_map(|p| &p.insts).any(|d| {
-        (d.op == DevOp::MoeGroupGluPf as u16 || d.op == DevOp::MoeGroupDownPf as u16)
-            && d.i[7] >= 2
+        (d.op == DevOp::MoeGroupGluPf as u16 || d.op == DevOp::MoeGroupDownPf as u16) && d.i[7] >= 2
     });
     objects["lean"]["moe_pf_w8a8"] = json!({ "required": moe_pf_w8a8 });
     let s = shapes(m);

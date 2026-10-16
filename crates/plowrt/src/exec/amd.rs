@@ -59,12 +59,13 @@ use object::{
     read_kda_intra_wave_items_object, required_gemv_m, required_k3_op, required_kda_chunk,
     required_kda_conv_step_db, required_kv_op, required_moe_pf_a4w4, required_moe_pf_accum,
     required_qwen_gdn_op, resolve_flash_object_load, sparse_fp8, BF16_KV_OPS, FP8_KV_OPS,
-    FP8_KV_SYM, FP8_WEIGHT_OPS, GATE_HIER_SYM, KDA_CARRY_KEYFEED_MARKERS, KDA_CARRY_REGSTATE_LDS,
-    KDA_CHUNK_QPRE_SYM, KDA_CONV_STEP_DB_REPLACED_OPS, KDA_FAMILY_SEG_SYM, KDA_WU_LEAN_LDS,
-    KDA_WU_LEAN_MARKERS, GEMM_GROUP_LDS, L2_DISPATCH_SYM, MLA_PF_V2_FP8_SYM, MLA_PF_V2_SYM, MOE_ENC_MXFP4,
-    MOE_GEMMA_OPS, MOE_GEMMA_PF_OPS, PACKED_PREFILL_ABI_SYM, PACKED_PREFILL_BAND_SYM,
-    PACKED_PREFILL_KDA_CHUNK_SEG_SYM, PACKED_PREFILL_KDA_SEG_SYM, PACKED_PREFILL_MLA_FLASH_SEG_SYM,
-    PACKED_PREFILL_MLA_NOPE_SYM, PACKED_PREFILL_MLA_NORM_SEG_SYM, XR_ATTNRES_RESOURCE_SYM, XR_ATTNRES_SEG_SYM, XR_TAGGED_SYM,
+    FP8_KV_SYM, FP8_WEIGHT_OPS, GATE_HIER_SYM, GEMM_GROUP_LDS, KDA_CARRY_KEYFEED_MARKERS,
+    KDA_CARRY_REGSTATE_LDS, KDA_CHUNK_QPRE_SYM, KDA_CONV_STEP_DB_REPLACED_OPS, KDA_FAMILY_SEG_SYM,
+    KDA_WU_LEAN_LDS, KDA_WU_LEAN_MARKERS, L2_DISPATCH_SYM, MLA_PF_V2_FP8_SYM, MLA_PF_V2_SYM,
+    MOE_ENC_MXFP4, MOE_GEMMA_OPS, MOE_GEMMA_PF_OPS, PACKED_PREFILL_ABI_SYM,
+    PACKED_PREFILL_BAND_SYM, PACKED_PREFILL_KDA_CHUNK_SEG_SYM, PACKED_PREFILL_KDA_SEG_SYM,
+    PACKED_PREFILL_MLA_FLASH_SEG_SYM, PACKED_PREFILL_MLA_NOPE_SYM, PACKED_PREFILL_MLA_NORM_SEG_SYM,
+    XR_ATTNRES_RESOURCE_SYM, XR_ATTNRES_SEG_SYM, XR_TAGGED_SYM,
 };
 pub use object::{mla_pf_v2_enabled, object_name, symbol_name, Phase, PrefillArm, Sched, Variant};
 
@@ -215,16 +216,29 @@ enum DecodeSegmentKind {
     KdaDecodeFused(usize),
     HcMix(usize),
     Router(usize),
-    MoeW8a8Dec { glu: usize, down: usize },
+    MoeW8a8Dec {
+        glu: usize,
+        down: usize,
+    },
     MoeAiter,
     GemmLt,
-    GroupedMoeMxfp4 { glu: usize, down: usize },
+    GroupedMoeMxfp4 {
+        glu: usize,
+        down: usize,
+    },
     SparseMlaDecode(usize),
     MlaBf16,
     IndexFp8,
     XrNative(usize),
-    RouterNative { gemm: usize, topk: usize },
-    DenseNative { glu: usize, combine: usize, xr: usize },
+    RouterNative {
+        gemm: usize,
+        topk: usize,
+    },
+    DenseNative {
+        glu: usize,
+        combine: usize,
+        xr: usize,
+    },
 }
 
 /// `PLOW_AMD_ROUTER_NATIVE`: the decode router pair the native kernels implement — a bf16
@@ -273,8 +287,13 @@ fn dense_native_insts(prog: &DevProg, insts: &[usize]) -> Option<(usize, usize, 
         return None;
     }
     let &[a, g, d, c, x] = insts else { return None };
-    let (al, gl, dn, cb, xr) =
-        (&prog.insts[a], &prog.insts[g], &prog.insts[d], &prog.insts[c], &prog.insts[x]);
+    let (al, gl, dn, cb, xr) = (
+        &prog.insts[a],
+        &prog.insts[g],
+        &prog.insts[d],
+        &prog.insts[c],
+        &prog.insts[x],
+    );
     let (i_l, h) = (gl.i[0], gl.i[1]);
     let ok = al.op == DevOp::MoeAlignPf as u16
         && al.i[..3] == [prog.t, 1, 1]
@@ -349,7 +368,8 @@ fn decode_segment_kinds(prog: &DevProg) -> Result<Vec<DecodeSegmentKind>> {
                     prog.insts.len()
                 ))
             })?;
-            if inst.op == DevOp::FlashMlaDecode as u16 || inst.op == DevOp::FlashGatherDecode as u16 {
+            if inst.op == DevOp::FlashMlaDecode as u16 || inst.op == DevOp::FlashGatherDecode as u16
+            {
                 match mla_flash_inst {
                     None => mla_flash_inst = Some(e.inst as usize),
                     Some(i) if i == e.inst as usize => {}
@@ -402,8 +422,7 @@ fn decode_segment_kinds(prog: &DevProg) -> Result<Vec<DecodeSegmentKind>> {
                     _ => {}
                 }
                 // A signalling router bumps its one counter itself (`router_decode.hip`).
-                let signals =
-                    router_raw(inst) && inst.i[5] & packet::dev::ROUTER_RAW_SIGNAL != 0;
+                let signals = router_raw(inst) && inst.i[5] & packet::dev::ROUTER_RAW_SIGNAL != 0;
                 if e.wait_len != 0
                     || (e.succ_len != 0 && !(signals && e.succ_len == 1))
                     || e.flags & SE_XCTR != 0
@@ -701,9 +720,11 @@ fn decode_segment_kinds(prog: &DevProg) -> Result<Vec<DecodeSegmentKind>> {
         }
         // A signalling raw router (ROUTER_RAW_SIGNAL) is serviced by its kernel, which bumps the
         // counter its next segment waits on.
-        if prog.insts.get(e.inst as usize).is_some_and(|i| {
-            router_raw(i) && i.i[5] & packet::dev::ROUTER_RAW_SIGNAL != 0
-        }) {
+        if prog
+            .insts
+            .get(e.inst as usize)
+            .is_some_and(|i| router_raw(i) && i.i[5] & packet::dev::ROUTER_RAW_SIGNAL != 0)
+        {
             continue;
         }
         let end = e.succ_ofs as usize + e.succ_len as usize;
@@ -989,8 +1010,15 @@ fn router_args(d: &packet::dev::DevInst64, devp: &[DeviceMem]) -> Result<RouterD
     let (rows, n_exp, k_dim, topk, flags) = (d.i[0], d.i[1], d.i[2], d.i[3], d.i[4]);
     // f32 logits (flag 8), sigmoid (1), no hash/sqrt-softplus arms; k within the LDS carve.
     let signal = d.i[5] & packet::dev::ROUTER_RAW_SIGNAL != 0;
-    if rows == 0 || rows > 256 || n_exp == 0 || n_exp > 512 || k_dim % 8 != 0 || topk == 0
-        || topk > 8 || flags & 9 != 9 || flags & 48 != 0
+    if rows == 0
+        || rows > 256
+        || n_exp == 0
+        || n_exp > 512
+        || k_dim % 8 != 0
+        || topk == 0
+        || topk > 8
+        || flags & 9 != 9
+        || flags & 48 != 0
         || (!signal && d.i[5] > 1)
         || (signal && (rows != 1 || d.i[5] & 1 != 0 || (d.i[5] >> 2) & 0x3ff == 0))
     {
@@ -1585,7 +1613,12 @@ const _: () = assert!(std::mem::size_of::<KdaCarryMultiArgs>() == 280);
 
 /// Per segment, `Op*count` of the instructions its stream entries run (diagnostic).
 fn segment_op_summary(p: &DevProg) -> Vec<String> {
-    let n = p.stream.iter().map(|e| e.seg as usize + 1).max().unwrap_or(0);
+    let n = p
+        .stream
+        .iter()
+        .map(|e| e.seg as usize + 1)
+        .max()
+        .unwrap_or(0);
     let mut sets = vec![std::collections::BTreeSet::new(); n];
     for e in &p.stream {
         sets[e.seg as usize].insert(e.inst as usize);
@@ -1598,7 +1631,10 @@ fn segment_op_summary(p: &DevProg) -> Vec<String> {
                 let name = DevOp::from_u16(op).map_or(format!("op{op}"), |o| format!("{o:?}"));
                 *c.entry(name).or_default() += 1;
             }
-            c.into_iter().map(|(k, v)| format!("{k}*{v}")).collect::<Vec<_>>().join("+")
+            c.into_iter()
+                .map(|(k, v)| format!("{k}*{v}"))
+                .collect::<Vec<_>>()
+                .join("+")
         })
         .collect()
 }
@@ -1808,7 +1844,6 @@ struct MoeFp8DownArgs {
 }
 
 const _: () = assert!(std::mem::size_of::<MoeFp8DownArgs>() == 80);
-
 
 #[derive(Clone, Copy, Debug)]
 #[repr(C)]
@@ -2846,7 +2881,9 @@ fn promote_hc_aiter_routes(
             RuntimeError::Device(format!("HcAiter instruction {ix} has no segment"))
         })?;
         if !matches!(routes[seg], PrefillSegmentRoute::Interpreter) {
-            return Err(RuntimeError::Device("HcAiter overlaps another native route".into()));
+            return Err(RuntimeError::Device(
+                "HcAiter overlaps another native route".into(),
+            ));
         }
         let words = hc_aiter_words(d, tensors, init)?;
         // Validate once against the load-time bindings.
@@ -2908,7 +2945,11 @@ fn kda_rider_routes(
     families: &[u8],
     devp: &[DeviceMem],
 ) -> Option<Vec<Option<KdaRiderArgs>>> {
-    let addr = |h: u32| devp.get(h as usize).map(|m| m.base).filter(|_| h != packet::dev::TENSOR_NONE16 as u32);
+    let addr = |h: u32| {
+        devp.get(h as usize)
+            .map(|m| m.base)
+            .filter(|_| h != packet::dev::TENSOR_NONE16 as u32)
+    };
     let mut out = vec![None; families.len()];
     let mut any = false;
     for (ci, c) in prog.insts.iter().enumerate() {
@@ -2937,7 +2978,11 @@ fn kda_rider_routes(
         }
         let ops = match rest().find(|d| {
             (d.op == DevOp::KdaChunkPrepare as u16 || d.op == DevOp::KdaStateStepG as u16)
-                && d.t[if d.op == DevOp::KdaStateStepG as u16 { 1 } else { 0 }] == c.t[0]
+                && d.t[if d.op == DevOp::KdaStateStepG as u16 {
+                    1
+                } else {
+                    0
+                }] == c.t[0]
         })? {
             st if st.op == DevOp::KdaStateStepG as u16 => {
                 if st.i[4] != 1 {
@@ -3314,7 +3359,9 @@ fn add_moe_fp8_pf_routes(
     }
     let addr = |h: u16, what: &str| -> Result<u64> {
         devp.get(h as usize).map(|m| m.base).ok_or_else(|| {
-            RuntimeError::Device(format!("fp8 MoE prefill operand `{what}` handle {h} is invalid"))
+            RuntimeError::Device(format!(
+                "fp8 MoE prefill operand `{what}` handle {h} is invalid"
+            ))
         })
     };
     let opt = |h: u16, what: &str| -> Result<u64> {
@@ -3454,7 +3501,9 @@ fn moe_w8a8_dec_route(
             .map(|m| m.base)
             .filter(|&b| b != 0)
             .ok_or_else(|| {
-                RuntimeError::Device(format!("W8A8 decode MoE operand `{what}` handle {h} is invalid"))
+                RuntimeError::Device(format!(
+                    "W8A8 decode MoE operand `{what}` handle {h} is invalid"
+                ))
             })
     };
     let route = DecodeSegmentRoute::MoeW8a8Dec {
@@ -4333,7 +4382,10 @@ fn decode_segment_routes(
                 continue;
             }
             DecodeSegmentKind::Router(ix) => {
-                routes.push(DecodeSegmentRoute::Router(router_args(&prog.insts[ix], devp)?));
+                routes.push(DecodeSegmentRoute::Router(router_args(
+                    &prog.insts[ix],
+                    devp,
+                )?));
                 continue;
             }
             DecodeSegmentKind::HcMix(ix) => {
@@ -4573,7 +4625,8 @@ fn dense_native_route(
     xr: usize,
 ) -> Result<DecodeSegmentRoute> {
     let (g, cb, x) = (&prog.insts[glu], &prog.insts[combine], &prog.insts[xr]);
-    let err = |m: String| RuntimeError::Device(format!("PLOW_AMD_DENSE_NATIVE instruction {glu}: {m}"));
+    let err =
+        |m: String| RuntimeError::Device(format!("PLOW_AMD_DENSE_NATIVE instruction {glu}: {m}"));
     let (m, inter, h) = (prog.t, g.i[0], g.i[1]);
     let pfx = tensors
         .get(usize::from(g.t[2]))
@@ -4585,11 +4638,17 @@ fn dense_native_route(
             .position(|t| t.name == name)
             .ok_or_else(|| err(format!("no tensor {name}")))?;
         if tensors[k].bytes != bytes || devp.get(k).is_none_or(|d| d.base == 0) {
-            return Err(err(format!("{name} is {} B (want {bytes}) or unbound", tensors[k].bytes)));
+            return Err(err(format!(
+                "{name} is {} B (want {bytes}) or unbound",
+                tensors[k].bytes
+            )));
         }
         Ok(devp[k].base)
     };
-    let (ih, sg) = (u64::from(inter) * u64::from(h), u64::from(inter / 128) * u64::from(h / 128) * 4);
+    let (ih, sg) = (
+        u64::from(inter) * u64::from(h),
+        u64::from(inter / 128) * u64::from(h / 128) * 4,
+    );
     let mut w = [0u64; 3];
     let mut sc = [0u64; 3];
     for (j, proj) in ["gate_proj", "up_proj", "down_proj"].iter().enumerate() {
@@ -4604,7 +4663,9 @@ fn dense_native_route(
         || partial(inter / LT_FUSE_KS, h) > DENSE_H_OFFSET
         || DENSE_H_OFFSET + u64::from(m * inter) * 2 > LT_FUSE_SCRATCH
     {
-        return Err(err(format!("shape m={m} I={inter} H={h} exceeds the scratch")));
+        return Err(err(format!(
+            "shape m={m} I={inter} H={h} exceeds the scratch"
+        )));
     }
     Ok(DecodeSegmentRoute::DenseNative(DenseRoute {
         x: g.t[1],
@@ -4638,7 +4699,10 @@ const LT_FUSE_PARTS: usize = 6;
 const LT_FUSE_SCRATCH: u64 = 32 << 20;
 
 fn lt_fuse_blocks(r: &LtFusedRoute) -> u32 {
-    r.parts[..r.n_parts as usize].iter().map(|p| p.2.div_ceil(16)).sum()
+    r.parts[..r.n_parts as usize]
+        .iter()
+        .map(|p| p.2.div_ceil(16))
+        .sum()
 }
 
 /// Group each run of adjacent native decode GEMMs that read the same `[m, k]` input into one
@@ -4673,7 +4737,9 @@ fn fuse_lt_runs(routes: &mut [DecodeSegmentRoute]) {
                 // Hoisting `d` ahead of `od`: `d` must not write what `od` reads or writes.
                 od.t[1] == d.t[0] || od.t[2] == d.t[0] || od.t[0] == d.t[0] || od.t[0] == x
             });
-            let clash_with_members = members.iter().any(|&o| lt(&routes[o]).unwrap().t[0] == d.t[0]);
+            let clash_with_members = members
+                .iter()
+                .any(|&o| lt(&routes[o]).unwrap().t[0] == d.t[0]);
             if ok_shape(&d) && !clash_with_others && !clash_with_members && d.t[0] != x {
                 members.push(j);
             } else {
@@ -4681,7 +4747,10 @@ fn fuse_lt_runs(routes: &mut [DecodeSegmentRoute]) {
             }
             j += 1;
         }
-        let blocks: u32 = members.iter().map(|&o| lt(&routes[o]).unwrap().i[1].div_ceil(16)).sum();
+        let blocks: u32 = members
+            .iter()
+            .map(|&o| lt(&routes[o]).unwrap().i[1].div_ceil(16))
+            .sum();
         let scratch = u64::from(k / LT_FUSE_KS) * u64::from(m) * u64::from(blocks) * 16 * 4;
         if members.len() >= 2 && scratch <= LT_FUSE_SCRATCH {
             let mut parts = [(0u16, 0u16, 0u32); LT_FUSE_PARTS];
@@ -4689,7 +4758,13 @@ fn fuse_lt_runs(routes: &mut [DecodeSegmentRoute]) {
                 let d = lt(&routes[o]).unwrap();
                 *slot = (d.t[2], d.t[0], d.i[1]);
             }
-            let fused = LtFusedRoute { x, m, k, n_parts: members.len() as u32, parts };
+            let fused = LtFusedRoute {
+                x,
+                m,
+                k,
+                n_parts: members.len() as u32,
+                parts,
+            };
             for &o in &members[1..] {
                 routes[o] = DecodeSegmentRoute::Skip;
             }
@@ -4719,7 +4794,10 @@ fn kda_decode_wide_args(
         || !(1..=8).contains(&conv_w)
         || flags != 3
         || rows.checked_mul(heads).is_none()
-        || heads.checked_mul(dim).and_then(|p| p.checked_mul(dim)).is_none()
+        || heads
+            .checked_mul(dim)
+            .and_then(|p| p.checked_mul(dim))
+            .is_none()
         || gate_mode > 1
         || !lower_bound.is_finite()
         || !scale.is_finite()
@@ -4900,8 +4978,10 @@ fn derive_segments_for(prog: &DevProg, v2: bool) -> Result<Vec<u8>> {
             // The expanded (MHA) form (i6 bit 9) exists only in the flash object: every rung.
             let mha = op == DevOp::FlashMlaPrefill as u16 && (d.i[6] >> 9) & 1 == 1;
             let dsa = op == DevOp::FlashMlaPrefill as u16 && d.t[7] != packet::dev::TENSOR_NONE16;
-            let split = (op == DevOp::FlashMlaPrefill as u16 || op == DevOp::FlashMlaPrefillFp8 as u16)
-                && ((d.i[7] >> 8) & 0xff > 1 || (d.t[7] == packet::dev::TENSOR_NONE16 && d.i[6] > 1));
+            let split = (op == DevOp::FlashMlaPrefill as u16
+                || op == DevOp::FlashMlaPrefillFp8 as u16)
+                && ((d.i[7] >> 8) & 0xff > 1
+                    || (d.t[7] == packet::dev::TENSOR_NONE16 && d.i[6] > 1));
             mla_pure[seg] &= prog.t >= 2048 || small_split || mha || dsa || split;
             mla_nope[seg] |= d.i[3] & 0x8000_0000 != 0;
             // DEFERRED to after the class pass, and that is the whole point. This used to
@@ -6820,10 +6900,7 @@ fn bind_packed_experts(
                     (w_stride / i_moe, i_moe)
                 };
                 let pf_dst = wptab.as_ref().map_or(0, |t| t[idx]);
-                let w2_dst = w2tab
-                    .as_ref()
-                    .or(aitab.as_ref())
-                    .map_or(0, |t| t[idx]);
+                let w2_dst = w2tab.as_ref().or(aitab.as_ref()).map_or(0, |t| t[idx]);
                 let s2_dst = s2tab.as_ref().map_or(0, |t| t[idx]);
                 let down_kbytes = i_moe / 2;
                 let down_rows = if down_kbytes == 0 {
@@ -7084,7 +7161,9 @@ fn kda_in_proj_cat(
     n_gpu: u32,
 ) -> Option<Result<Vec<u8>>> {
     use crate::asset::shard::{shard_of, slice_for, Shard};
-    const KDA: &[&str] = &["q_proj", "k_proj", "v_proj", "g_a_proj", "f_a_proj", "b_proj"];
+    const KDA: &[&str] = &[
+        "q_proj", "k_proj", "v_proj", "g_a_proj", "f_a_proj", "b_proj",
+    ];
     const QKVA: &[&str] = &["q_a_proj", "derived.kv_a_latent"];
     let (stem, parts) = match name.strip_suffix("derived.in_proj_cat.weight") {
         Some(stem) => (stem, KDA),
@@ -9116,9 +9195,11 @@ impl AmdEngine {
         let resident_tables = amd_moe_aiter::resident_tables(&blob.progs, &blob.tensors)?;
         // i[7] = 2 is the gfx950 companion slab: bound per layer like the resident layout.
         let use_resident_moe = resident_tables.iter().any(Option::is_some)
-            || blob.progs.iter().flat_map(|p| &p.insts).any(|d| {
-                d.op == DevOp::MoeAiterFp8Pf as u16 && d.i[7] == 2
-            });
+            || blob
+                .progs
+                .iter()
+                .flat_map(|p| &p.insts)
+                .any(|d| d.op == DevOp::MoeAiterFp8Pf as u16 && d.i[7] == 2);
         if use_moe_aiter
             && (!matches!(arch.as_str(), "gfx942" | "gfx950") || tp.is_none_or(|b| b.n_gpu != 8))
         {
@@ -9370,7 +9451,10 @@ impl AmdEngine {
                 }
                 let want = (slot != super::tp::PeerLayout::XR_TAG_SLOT)
                     .then(|| format!("plow_xr_tag_slot_{slot}"));
-                let have = syms.iter().copied().find(|s| s.starts_with("plow_xr_tag_slot_"));
+                let have = syms
+                    .iter()
+                    .copied()
+                    .find(|s| s.starts_with("plow_xr_tag_slot_"));
                 if have != want.as_deref() {
                     return Err(RuntimeError::Device(format!(
                         "{} ({XR_TAGGED_SYM}): object tag slot marker {have:?} does not match \
@@ -9653,18 +9737,21 @@ impl AmdEngine {
             Some(spec) => seg_geom::parse(spec)?,
             None => Vec::new(),
         };
-        let (k_prefill_alt, k_flash_alt) =
-            match crate::config::RuntimeConfig::get().amd.seg_alt_dir.as_deref() {
-                Some(dir) => {
-                    let (kp, _) = load_one_in(Phase::Prefill, sched_prefill, dir, None)?;
-                    let kf = match &k_flash {
-                        Some(_) => Some(load_one_in(Phase::Flash, sched_prefill, dir, None)?.0),
-                        None => None,
-                    };
-                    (Some(kp), kf)
-                }
-                None => (None, None),
-            };
+        let (k_prefill_alt, k_flash_alt) = match crate::config::RuntimeConfig::get()
+            .amd
+            .seg_alt_dir
+            .as_deref()
+        {
+            Some(dir) => {
+                let (kp, _) = load_one_in(Phase::Prefill, sched_prefill, dir, None)?;
+                let kf = match &k_flash {
+                    Some(_) => Some(load_one_in(Phase::Flash, sched_prefill, dir, None)?.0),
+                    None => None,
+                };
+                (Some(kp), kf)
+            }
+            None => (None, None),
+        };
         drop(load_one_in);
 
         let mut need_mla_small = false;
@@ -10004,7 +10091,10 @@ impl AmdEngine {
                 "plow_interp_packed_mla_flash",
                 Phase::Flash,
                 if packed_nope {
-                    &[PACKED_PREFILL_MLA_FLASH_SEG_SYM, PACKED_PREFILL_MLA_NOPE_SYM]
+                    &[
+                        PACKED_PREFILL_MLA_FLASH_SEG_SYM,
+                        PACKED_PREFILL_MLA_NOPE_SYM,
+                    ]
                 } else {
                     &[PACKED_PREFILL_MLA_FLASH_SEG_SYM]
                 },
@@ -10328,11 +10418,17 @@ impl AmdEngine {
                 ks.push(k);
             }
             modules.push(module);
-            (Some([ks[0], ks[1], ks[2], ks[3]]), Some(EngineDevice::alloc(&*be, LT_FUSE_SCRATCH)?))
+            (
+                Some([ks[0], ks[1], ks[2], ks[3]]),
+                Some(EngineDevice::alloc(&*be, LT_FUSE_SCRATCH)?),
+            )
         } else {
             (None, None)
         };
-        let (k_router_native, k_router_fused) = if crate::config::RuntimeConfig::get().amd.router_native {
+        let (k_router_native, k_router_fused) = if crate::config::RuntimeConfig::get()
+            .amd
+            .router_native
+        {
             const NAME: &str = "moe_aiter_adapter_gfx950.elf";
             const MARKER: &str = "plow_moe_router_abi_2";
             let path = hsaco_dir.join(NAME);
@@ -10352,8 +10448,14 @@ impl AmdEngine {
                 .map_err(|e| RuntimeError::Device(format!("{}: {e}", path.display())))?;
             let mut ks = Vec::with_capacity(2);
             for (sym, want) in [
-                ("plow_moe_router_gemm", std::mem::size_of::<RouterGemmArgs>()),
-                ("plow_moe_router_topk", std::mem::size_of::<RouterTopkArgs>()),
+                (
+                    "plow_moe_router_gemm",
+                    std::mem::size_of::<RouterGemmArgs>(),
+                ),
+                (
+                    "plow_moe_router_topk",
+                    std::mem::size_of::<RouterTopkArgs>(),
+                ),
             ] {
                 let k = EngineDevice::get_function(&*be, &module, sym)
                     .map_err(|e| RuntimeError::Device(format!("{NAME}: no symbol {sym}: {e}")))?;
@@ -10373,7 +10475,9 @@ impl AmdEngine {
                     )));
                 }
                 let k = EngineDevice::get_function(&*be, &module, "plow_moe_router_fused")
-                    .map_err(|e| RuntimeError::Device(format!("{NAME}: plow_moe_router_fused: {e}")))?;
+                    .map_err(|e| {
+                        RuntimeError::Device(format!("{NAME}: plow_moe_router_fused: {e}"))
+                    })?;
                 let want = std::mem::size_of::<RouterFusedArgs>();
                 if (k.kernarg_size() as usize) < want || k.private_segment_size() != 0 {
                     return Err(RuntimeError::Device(format!(
@@ -10561,9 +10665,18 @@ impl AmdEngine {
                 .map_err(|e| RuntimeError::Device(format!("{}: {e}", path.display())))?;
             let mut ks = Vec::with_capacity(3);
             for (sym, want) in [
-                ("plow_moe_w8a8_dec_glu", std::mem::size_of::<MoeFp8GluArgs>() as u32),
-                ("plow_moe_w8a8_dec_down", std::mem::size_of::<MoeFp8DownArgs>() as u32),
-                ("plow_moe_w8a8_dec_pair", std::mem::size_of::<MoeW8a8DecPairArgs>() as u32),
+                (
+                    "plow_moe_w8a8_dec_glu",
+                    std::mem::size_of::<MoeFp8GluArgs>() as u32,
+                ),
+                (
+                    "plow_moe_w8a8_dec_down",
+                    std::mem::size_of::<MoeFp8DownArgs>() as u32,
+                ),
+                (
+                    "plow_moe_w8a8_dec_pair",
+                    std::mem::size_of::<MoeW8a8DecPairArgs>() as u32,
+                ),
             ] {
                 let k = EngineDevice::get_function(&*be, &module, sym)
                     .map_err(|e| RuntimeError::Device(format!("{NAME}: no symbol {sym}: {e}")))?;
@@ -10902,8 +11015,7 @@ impl AmdEngine {
         } else {
             None
         };
-        let k_kda_carry_split = if k_kda_chunk_carry_keyfeed.is_some() && kda_carry_split_max >= 2
-        {
+        let k_kda_carry_split = if k_kda_chunk_carry_keyfeed.is_some() && kda_carry_split_max >= 2 {
             let kernarg = std::mem::size_of::<KdaCarrySplitArgs>() as u32;
             let mut load = |symbol: &str, lds: u32| {
                 load_kda_lean(
@@ -10916,7 +11028,10 @@ impl AmdEngine {
                 )
             };
             Some([
-                load("plow_kda_chunk_carry_split_seg_gfx950", KDA_CARRY_REGSTATE_LDS)?,
+                load(
+                    "plow_kda_chunk_carry_split_seg_gfx950",
+                    KDA_CARRY_REGSTATE_LDS,
+                )?,
                 load("plow_kda_chunk_carry_split_combine_gfx950", 1024)?,
                 load("plow_kda_chunk_carry_split_fix_gfx950", 0)?,
             ])
@@ -10951,7 +11066,9 @@ impl AmdEngine {
                 let image = std::fs::read(&path)
                     .map_err(|e| RuntimeError::Device(format!("{}: {e}", path.display())))?;
                 if !elf_symbol_names(&image).contains(&MARKER) {
-                    return Err(RuntimeError::Device(format!("{NAME}: no `{MARKER}` marker")));
+                    return Err(RuntimeError::Device(format!(
+                        "{NAME}: no `{MARKER}` marker"
+                    )));
                 }
                 let module = EngineDevice::module_load(&*be, &image)?;
                 let kernel = EngineDevice::get_function(&*be, &module, SYMBOL)?;
@@ -11045,13 +11162,11 @@ impl AmdEngine {
         }
 
         let need_mla_pf_dense = crate::config::RuntimeConfig::get().amd.mla_pf_dense
-            && blob
-                .prefill_phase()
-                .any(|p| {
-                    p.insts.iter().any(|d| {
-                        amd_mla_pf_dense::eligible(d) || amd_mla_pf_dense::eligible_gather(d)
-                    })
-                });
+            && blob.prefill_phase().any(|p| {
+                p.insts
+                    .iter()
+                    .any(|d| amd_mla_pf_dense::eligible(d) || amd_mla_pf_dense::eligible_gather(d))
+            });
         let need_mla_pf_gather = need_mla_pf_dense
             && blob
                 .prefill_phase()
@@ -11443,11 +11558,26 @@ impl AmdEngine {
         let k_moe_fp8_pf = if arch == "gfx950" && need_moe_fp8_pf {
             const NAME: &str = "moe_fp8_pf_gfx950.elf";
             const SYMBOLS: [(&str, usize); 5] = [
-                ("plow_moe_fp8_glu_pf_gfx950", std::mem::size_of::<MoeFp8GluArgs>()),
-                ("plow_moe_fp8_down_pf_gfx950", std::mem::size_of::<MoeFp8DownArgs>()),
-                ("plow_moe_w8a8_glu_pf_gfx950", std::mem::size_of::<MoeFp8GluArgs>()),
-                ("plow_moe_w8a8_down_pf_gfx950", std::mem::size_of::<MoeFp8DownArgs>()),
-                ("plow_moe_w8a8_down_acc_pf_gfx950", std::mem::size_of::<MoeFp8DownArgs>()),
+                (
+                    "plow_moe_fp8_glu_pf_gfx950",
+                    std::mem::size_of::<MoeFp8GluArgs>(),
+                ),
+                (
+                    "plow_moe_fp8_down_pf_gfx950",
+                    std::mem::size_of::<MoeFp8DownArgs>(),
+                ),
+                (
+                    "plow_moe_w8a8_glu_pf_gfx950",
+                    std::mem::size_of::<MoeFp8GluArgs>(),
+                ),
+                (
+                    "plow_moe_w8a8_down_pf_gfx950",
+                    std::mem::size_of::<MoeFp8DownArgs>(),
+                ),
+                (
+                    "plow_moe_w8a8_down_acc_pf_gfx950",
+                    std::mem::size_of::<MoeFp8DownArgs>(),
+                ),
             ];
             let path = hsaco_dir.join(NAME);
             if !path.exists() {
@@ -12721,7 +12851,11 @@ impl AmdEngine {
             .map(|m| (m.base, kda_keyfeed_half));
         let d_kda_carry_split_scratch = if k_kda_carry_split.is_some() {
             let bytes = kda_carry_split_scratch_bytes(blob.prefill_phase(), kda_carry_split_max);
-            tracing::info!(bytes, max_seg = kda_carry_split_max, "KDA carry split scratch");
+            tracing::info!(
+                bytes,
+                max_seg = kda_carry_split_max,
+                "KDA carry split scratch"
+            );
             Some(EngineDevice::alloc(&*be, bytes)?)
         } else {
             None
@@ -13019,7 +13153,11 @@ impl AmdEngine {
                             promoted += 1;
                         }
                     }
-                    tracing::info!(prog = prog_ix, promoted, "dense MLA prefill segments routed");
+                    tracing::info!(
+                        prog = prog_ix,
+                        promoted,
+                        "dense MLA prefill segments routed"
+                    );
                 }
                 for (seg, &class) in seg_class.iter().enumerate() {
                     let graph_phase = graph_phase_segments[prog_ix].contains(&seg);
@@ -13376,8 +13514,7 @@ impl AmdEngine {
             .iter()
             .map(|p| {
                 p.role.is_rowsplit_sibling()
-                    && p
-                        .insts
+                    && p.insts
                         .iter()
                         .any(|d| d.op == DevOp::DsaPoolExpand as u16 && d.i[3] == 2)
             })
@@ -13458,7 +13595,9 @@ impl AmdEngine {
                 "in.kvlen has {metadata_rows} rows incompatible with decode capacity {batch}"
             )));
         }
-        let dense_max_ctx = crate::config::RuntimeConfig::get().amd.amd_decode_dense_max_ctx;
+        let dense_max_ctx = crate::config::RuntimeConfig::get()
+            .amd
+            .amd_decode_dense_max_ctx;
         let dense_exact_select = blob.progs[decode]
             .insts
             .iter()
@@ -13736,8 +13875,7 @@ impl AmdEngine {
             (n_dec_inst * std::mem::size_of::<DevInst64>()).max(64),
         )?;
         if n_dec_inst > 0 {
-            h_inst
-                .as_mut_slice()[..n_dec_inst * std::mem::size_of::<DevInst64>()]
+            h_inst.as_mut_slice()[..n_dec_inst * std::mem::size_of::<DevInst64>()]
                 .copy_from_slice(as_bytes(&blob.progs[decode].insts));
         }
         // Prefill stages ids AND pos for a whole chunk, so this must hold
@@ -15376,7 +15514,9 @@ impl AmdEngine {
                     RuntimeError::Device("sparse MLA prefill gather entry not loaded".into())
                 })?;
                 if self.kv_slot != 0 {
-                    let uni_ten = route.gather.map_or(packet::dev::TENSOR_NONE16, |(_, t, _)| t);
+                    let uni_ten = route
+                        .gather
+                        .map_or(packet::dev::TENSOR_NONE16, |(_, t, _)| t);
                     let fields: [(&mut u64, u16); 5] = [
                         (&mut g.opart, route.tens[0]),
                         (&mut g.mlpart, route.tens[1]),
@@ -16158,7 +16298,10 @@ impl AmdEngine {
         if !self.kda_rider_mode(p) {
             return 0;
         }
-        self.packed_spans.iter().take_while(|s| s.n_rows == 1).count()
+        self.packed_spans
+            .iter()
+            .take_while(|s| s.n_rows == 1)
+            .count()
     }
 
     /// A KDA family segment of a pack that is all riders has nothing left for the family object.
@@ -16171,7 +16314,9 @@ impl AmdEngine {
     fn kda_rider_mode(&self, p: usize) -> bool {
         self.k_kda_rider.is_some()
             && self.progs[p].kda_rider.is_some()
-            && self.packed_prefill.is_some_and(|b| b.prog == p && !b.token_batch)
+            && self
+                .packed_prefill
+                .is_some_and(|b| b.prog == p && !b.token_batch)
     }
 
     /// Whether segment `seg` of the active pack launches the rider chain after its family object.
@@ -16187,7 +16332,12 @@ impl AmdEngine {
     }
 
     fn kda_rider_args(&self, p: usize, seg: usize) -> Option<KdaRiderArgs> {
-        self.progs[p].kda_rider.as_ref()?.get(seg).copied().flatten()
+        self.progs[p]
+            .kda_rider
+            .as_ref()?
+            .get(seg)
+            .copied()
+            .flatten()
     }
 
     /// Number of ordered segment steps in a decode program. A grouped-MoE step owns two
@@ -16200,9 +16350,9 @@ impl AmdEngine {
         let kernel = self.k_xr_native.ok_or_else(|| {
             RuntimeError::Device("PLOW_AMD_XR_NATIVE segment has no loaded object".into())
         })?;
-        let tp = self.tp.ok_or_else(|| {
-            RuntimeError::Device("PLOW_AMD_XR_NATIVE needs a TP group".into())
-        })?;
+        let tp = self
+            .tp
+            .ok_or_else(|| RuntimeError::Device("PLOW_AMD_XR_NATIVE needs a TP group".into()))?;
         let at = usize::from(inst.t[0]) * 8;
         let out = u64::from_le_bytes(self.tens_table[at..at + 8].try_into().unwrap());
         let two_shot = inst.op == DevOp::XReduceTwoShot as u16;
@@ -16260,7 +16410,10 @@ impl AmdEngine {
                 if self.k_router_fused.is_some() {
                     1
                 } else {
-                    2 + crate::config::RuntimeConfig::get().amd.router_repeat.unwrap_or(0) as usize
+                    2 + crate::config::RuntimeConfig::get()
+                        .amd
+                        .router_repeat
+                        .unwrap_or(0) as usize
                 }
             }
             Some(DecodeSegmentRoute::LtFused(_)) => 2,
@@ -16389,7 +16542,10 @@ impl AmdEngine {
 
     /// AQL packets of one key-fed carry launch over `t` rows (see `launch_kda_carry_split`).
     fn kda_carry_split_launches(&self, t: u32) -> usize {
-        match (self.k_kda_carry_split, kda_carry_split_plan(t, self.kda_carry_split_max)) {
+        match (
+            self.k_kda_carry_split,
+            kda_carry_split_plan(t, self.kda_carry_split_max),
+        ) {
             (Some(_), Some(_)) => 3,
             _ => 1,
         }
@@ -16533,7 +16689,10 @@ impl AmdEngine {
         // Spans under 512 rows (riders) have no per-span or split carry: they stay all-spans.
         if matches!(route, PrefillSegmentRoute::KdaChunkCarryKeyfeed { .. })
             && self.kda_spans(p).iter().all(|s| s.n_rows >= 512)
-            && self.kda_spans(p).iter().any(|s| self.kda_carry_split_launches(s.n_rows) > 1)
+            && self
+                .kda_spans(p)
+                .iter()
+                .any(|s| self.kda_carry_split_launches(s.n_rows) > 1)
         {
             return None;
         }
@@ -16602,7 +16761,14 @@ impl AmdEngine {
             };
             macro_rules! spans_args {
                 ($base:expr, $per:expr) => {
-                    KdaSpansArgs { base: $base, spans, n_spans: n, per_span: $per, min_rows, _pad: 0 }
+                    KdaSpansArgs {
+                        base: $base,
+                        spans,
+                        n_spans: n,
+                        per_span: $per,
+                        min_rows,
+                        _pad: 0,
+                    }
                 };
             }
             match route {
@@ -16667,7 +16833,8 @@ impl AmdEngine {
                     a.t = t;
                     EngineDevice::launch_kernel(
                         &*self.be,
-                        self.k_kda_chunk_intra_wave_items.expect("checked by caller"),
+                        self.k_kda_chunk_intra_wave_items
+                            .expect("checked by caller"),
                         self.seg_route_grid(p, seg, grid),
                         WG_THREADS_8,
                         0,
@@ -17106,7 +17273,13 @@ impl AmdEngine {
                 let mut parts = [InprojPartArgs::default(); LT_FUSE_PARTS];
                 let mut blk0 = 0;
                 for (dst, &(w, out, n)) in parts.iter_mut().zip(&r.parts[..r.n_parts as usize]) {
-                    *dst = InprojPartArgs { w: addr(w), out: addr(out), s: 0, n, blk0 };
+                    *dst = InprojPartArgs {
+                        w: addr(w),
+                        out: addr(out),
+                        s: 0,
+                        n,
+                        blk0,
+                    };
                     blk0 += n.div_ceil(16);
                 }
                 let args = InprojArgs {
@@ -17141,7 +17314,9 @@ impl AmdEngine {
             }
             DecodeSegmentRoute::RouterNative { gemm, topk } => {
                 let [kg, kt] = self.k_router_native.ok_or_else(|| {
-                    RuntimeError::Device("PLOW_AMD_ROUTER_NATIVE segment has no loaded kernels".into())
+                    RuntimeError::Device(
+                        "PLOW_AMD_ROUTER_NATIVE segment has no loaded kernels".into(),
+                    )
                 })?;
                 let addr = |h: u16| {
                     let at = usize::from(h) * 8;
@@ -17169,9 +17344,15 @@ impl AmdEngine {
                 };
                 if let Some((kf, ctr)) = self.k_router_fused.as_ref() {
                     if gemm.i[0].div_ceil(16) as usize > ROUTER_FUSED_TILES {
-                        return Err(RuntimeError::Device("PLOW_AMD_ROUTER_FUSED: too many rows".into()));
+                        return Err(RuntimeError::Device(
+                            "PLOW_AMD_ROUTER_FUSED: too many rows".into(),
+                        ));
                     }
-                    let fa = RouterFusedArgs { g: ga, t: ta, ctr: ctr.base };
+                    let fa = RouterFusedArgs {
+                        g: ga,
+                        t: ta,
+                        ctr: ctr.base,
+                    };
                     EngineDevice::launch_kernel(
                         &*self.be,
                         *kf,
@@ -17196,7 +17377,10 @@ impl AmdEngine {
                 )?;
                 // PLOW_AMD_ROUTER_REPEAT (diagnostic): the idempotent top-k launched again, to
                 // price one more launch of it.
-                let reps = 1 + crate::config::RuntimeConfig::get().amd.router_repeat.unwrap_or(0);
+                let reps = 1 + crate::config::RuntimeConfig::get()
+                    .amd
+                    .router_repeat
+                    .unwrap_or(0);
                 for _ in 0..reps {
                     EngineDevice::launch_kernel(
                         &*self.be,
@@ -17224,8 +17408,20 @@ impl AmdEngine {
                 };
                 let hrows = scratch + DENSE_H_OFFSET;
                 let mut parts = [InprojPartArgs::default(); LT_FUSE_PARTS];
-                parts[0] = InprojPartArgs { w: r.w[0], out: hrows, s: r.s[0], n: r.inter, blk0: 0 };
-                parts[1] = InprojPartArgs { w: r.w[1], out: 0, s: r.s[1], n: r.inter, blk0: r.inter / 16 };
+                parts[0] = InprojPartArgs {
+                    w: r.w[0],
+                    out: hrows,
+                    s: r.s[0],
+                    n: r.inter,
+                    blk0: 0,
+                };
+                parts[1] = InprojPartArgs {
+                    w: r.w[1],
+                    out: 0,
+                    s: r.s[1],
+                    n: r.inter,
+                    blk0: r.inter / 16,
+                };
                 let glu = InprojArgs {
                     x: addr(r.x),
                     partial: scratch,
@@ -17256,7 +17452,13 @@ impl AmdEngine {
                     None,
                 )?;
                 let mut parts = [InprojPartArgs::default(); LT_FUSE_PARTS];
-                parts[0] = InprojPartArgs { w: r.w[2], out: addr(r.out), s: r.s[2], n: r.h, blk0: 0 };
+                parts[0] = InprojPartArgs {
+                    w: r.w[2],
+                    out: addr(r.out),
+                    s: r.s[2],
+                    n: r.h,
+                    blk0: 0,
+                };
                 let dn = InprojArgs {
                     x: hrows,
                     partial: scratch,
@@ -19283,7 +19485,10 @@ impl AmdEngine {
         let mut pairs = Vec::new();
         armed.retain(|&(slot, _)| self.prefix_snap[slot].is_some());
         for &(slot, rows) in &armed {
-            let dst_base = self.prefix_snap[slot].as_ref().expect("retained above").base;
+            let dst_base = self.prefix_snap[slot]
+                .as_ref()
+                .expect("retained above")
+                .base;
             pairs.extend(self.prefix_copy_pairs(slot, rows, dst_base, false, None));
         }
         let t = std::time::Instant::now();
@@ -19320,7 +19525,11 @@ impl AmdEngine {
             return Ok(());
         }
         let need = pieces.len() * 24;
-        if self.copy_pieces.as_ref().is_none_or(|&(_, _, cap)| cap < need) {
+        if self
+            .copy_pieces
+            .as_ref()
+            .is_none_or(|&(_, _, cap)| cap < need)
+        {
             let cap = need.next_power_of_two().max(1 << 16);
             let d = EngineDevice::alloc(&*self.be, 2 * cap as u64)?;
             let h = EngineDevice::host_alloc_pinned(&*self.be, cap)?;
@@ -19338,7 +19547,11 @@ impl AmdEngine {
             n: u32,
             _pad: u32,
         }
-        let args = Args { pieces: dst, n: pieces.len() as u32, _pad: 0 };
+        let args = Args {
+            pieces: dst,
+            n: pieces.len() as u32,
+            _pad: 0,
+        };
         EngineDevice::launch_kernel(
             &*self.be,
             kernel,
@@ -19428,7 +19641,9 @@ impl AmdEngine {
                 base + span.slot_bytes * src as u64,
                 base + span.slot_bytes * dst as u64,
             );
-            span.copy_spans(rows, |offset, bytes| pairs.push((to + offset, from + offset, bytes)));
+            span.copy_spans(rows, |offset, bytes| {
+                pairs.push((to + offset, from + offset, bytes))
+            });
         }
         let t = std::time::Instant::now();
         self.be.memcpy_dtod_batch(&pairs)?;

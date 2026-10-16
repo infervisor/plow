@@ -965,7 +965,12 @@ pub struct RuntimeConfig {
     /// AMD serve tick timeline: one JSON line per tick (launch kinds, rows, rungs, enqueue and
     /// drain timestamps, per-rank drain skew, emitted slots) appended to this path
     /// (`PLOW_TICK_TRACE=<path>`). `scripts/bench/tick_trace_report.py` turns it into a table.
-    #[arg(long = "tick-trace", env = "PLOW_TICK_TRACE", hide = true, global = true)]
+    #[arg(
+        long = "tick-trace",
+        env = "PLOW_TICK_TRACE",
+        hide = true,
+        global = true
+    )]
     pub tick_trace: Option<std::path::PathBuf>,
 
     /// AMD prefill hold (`PLOW_PF_HOLD=rows[,ms[,min_decode]]`): while at least `min_decode`
@@ -1874,7 +1879,11 @@ pub struct AmdRuntimeConfig {
 
     /// Decode rows ride a packed prefill launch (`PLOW_AMD_MIXED_PACK`) only while at most this
     /// many rows decode; more step as a separate decode launch. Unset = no cap.
-    #[arg(long = "amd-mixed-ride-max", env = "PLOW_AMD_MIXED_RIDE_MAX", global = true)]
+    #[arg(
+        long = "amd-mixed-ride-max",
+        env = "PLOW_AMD_MIXED_RIDE_MAX",
+        global = true
+    )]
     pub mixed_ride_max: Option<u32>,
 
     /// Decode rows ride EVERY packed prefill launch: when they would widen the pack's rung, the
@@ -1939,11 +1948,21 @@ pub struct AmdRuntimeConfig {
     pub attnres_f32mix_grid: Option<u32>,
 
     /// Per-segment prefill launch geometry (`exec/amd/seg_geom.rs`): `[T<rows>:]<family|s<i>>=g<grid>[+alt]`.
-    #[arg(long = "amd-seg-geom", env = "PLOW_SEG_GEOM", hide = true, global = true)]
+    #[arg(
+        long = "amd-seg-geom",
+        env = "PLOW_SEG_GEOM",
+        hide = true,
+        global = true
+    )]
     pub seg_geom: Option<String>,
 
     /// Directory of alternate prefill/flash interpreter objects for `PLOW_SEG_GEOM` `alt` segments.
-    #[arg(long = "amd-seg-alt-dir", env = "PLOW_SEG_ALT_DIR", hide = true, global = true)]
+    #[arg(
+        long = "amd-seg-alt-dir",
+        env = "PLOW_SEG_ALT_DIR",
+        hide = true,
+        global = true
+    )]
     pub seg_alt_dir: Option<std::path::PathBuf>,
 
     /// Audited extra resident bytes per rank a replicated-input MoE EP packet may claim.
@@ -2080,7 +2099,12 @@ pub struct AmdRuntimeConfig {
 
     /// Bytes per tagged one-shot XReduce slot; must equal the decode object's
     /// `PLOW_XR_TAG_SLOT_BYTES` (a non-default object exports `plow_xr_tag_slot_<N>`).
-    #[arg(long = "amd-xr-tag-slot", env = "PLOW_XR_TAG_SLOT", default_value_t = 20480, global = true)]
+    #[arg(
+        long = "amd-xr-tag-slot",
+        env = "PLOW_XR_TAG_SLOT",
+        default_value_t = 20480,
+        global = true
+    )]
     pub xr_tag_slot: u32,
 
     /// Read each TP prefill chunk's exact counter audit through host-mapped large BAR instead
@@ -2136,7 +2160,11 @@ pub struct AmdRuntimeConfig {
     /// DSA sparse prefill chunk floor: a chunk on the sparse prefill rung whose context end
     /// (`c0 + clen`) is at most this many tokens skips the indexer selection and runs the dense
     /// flash. Unset = every chunk of the sparse rung is sparse.
-    #[arg(long = "glm-dsa-pf-min-ctx", env = "PLOW_GLM_DSA_PF_MIN_CTX", global = true)]
+    #[arg(
+        long = "glm-dsa-pf-min-ctx",
+        env = "PLOW_GLM_DSA_PF_MIN_CTX",
+        global = true
+    )]
     pub dsa_pf_min_ctx: Option<u32>,
 
     /// With the tail-sparse floor: the dense final chunk moves only when `prior x tail rows` (the
@@ -2237,7 +2265,11 @@ pub struct AmdRuntimeConfig {
 
     /// With `PLOW_AMD_DECODE_DENSE_EXACT`: run the dense twin while every advanced row holds at
     /// most this many keys (raised to the selection width), on every rung that has a twin.
-    #[arg(long = "amd-decode-dense-max-ctx", env = "PLOW_AMD_DECODE_DENSE_MAX_CTX", global = true)]
+    #[arg(
+        long = "amd-decode-dense-max-ctx",
+        env = "PLOW_AMD_DECODE_DENSE_MAX_CTX",
+        global = true
+    )]
     pub amd_decode_dense_max_ctx: Option<u32>,
 
     /// Diagnostic: restrict every rank's AQL queue to a CU subset (`N` = N CUs strided evenly,
@@ -2354,7 +2386,12 @@ pub struct AmdRuntimeConfig {
     /// segments run in parallel from zero / identity states and a combine + output-fix pass
     /// restores the serial recurrence (`kda_chunk_carry_split_gfx950.elf`). Segments are at least
     /// 1024 tokens. Not bit-identical to the serial carry.
-    #[arg(long = "amd-kda-carry-split", env = "PLOW_KDA_CARRY_SPLIT", default_value_t = 0, global = true)]
+    #[arg(
+        long = "amd-kda-carry-split",
+        env = "PLOW_KDA_CARRY_SPLIT",
+        default_value_t = 0,
+        global = true
+    )]
     pub kda_carry_split: u32,
 
     /// Run a packed binding's per-span key-fed KDA carries that are not split as one launch per
@@ -2469,7 +2506,11 @@ pub struct AmdRuntimeConfig {
     #[arg(long = "amd-pkt-fence", env = "PLOW_AMD_PKT_FENCE", global = true)]
     pub pkt_fence: Option<String>,
     /// Diagnostic: `<prefix>` — per-dispatch GPU start/end to `<prefix>.dev<N>.csv`.
-    #[arg(long = "amd-dispatch-times", env = "PLOW_AMD_DISPATCH_TIMES", global = true)]
+    #[arg(
+        long = "amd-dispatch-times",
+        env = "PLOW_AMD_DISPATCH_TIMES",
+        global = true
+    )]
     pub dispatch_times: Option<String>,
     /// TP decode: per-rank synchronous host copies (staging, token readback, id seeding) run
     /// on one thread per rank so their SDMA round trips overlap.
@@ -2492,14 +2533,26 @@ pub struct AmdRuntimeConfig {
     #[arg(long = "amd-router-native", env = "PLOW_AMD_ROUTER_NATIVE", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
     pub router_native: bool,
     /// Diagnostic: force `GFX950_TILES[i]` for AITER MoE calls of at most 256 rows.
-    #[arg(long = "amd-moe-tile-dec", env = "PLOW_AMD_MOE_TILE_DEC", global = true)]
+    #[arg(
+        long = "amd-moe-tile-dec",
+        env = "PLOW_AMD_MOE_TILE_DEC",
+        global = true
+    )]
     pub moe_tile_dec: Option<u32>,
     /// Diagnostic: launch width of a native one-shot decode collective (default: the
     /// instruction's workgroup count).
-    #[arg(long = "amd-xr-native-grid", env = "PLOW_AMD_XR_NATIVE_GRID", global = true)]
+    #[arg(
+        long = "amd-xr-native-grid",
+        env = "PLOW_AMD_XR_NATIVE_GRID",
+        global = true
+    )]
     pub xr_native_grid: Option<u32>,
     /// Diagnostic: launch the native router top-k this many extra times.
-    #[arg(long = "amd-router-repeat", env = "PLOW_AMD_ROUTER_REPEAT", global = true)]
+    #[arg(
+        long = "amd-router-repeat",
+        env = "PLOW_AMD_ROUTER_REPEAT",
+        global = true
+    )]
     pub router_repeat: Option<u32>,
     /// GLM-5.3 gfx950 AITER MoE: 16x128 up to 32 rows and 32x256 up to 256 rows (decode rungs).
     #[arg(long = "amd-moe-dec-tiles", env = "PLOW_AMD_MOE_DEC_TILES", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
@@ -3052,7 +3105,10 @@ fn parse_pf_hold(spec: &str) -> Option<(u32, f64, usize)> {
     let mut it = spec.split(',').map(str::trim);
     let rows: u32 = it.next()?.parse().ok().filter(|&r| r > 0)?;
     let ms: f64 = match it.next() {
-        Some(v) => v.parse().ok().filter(|m: &f64| m.is_finite() && *m >= 0.0)?,
+        Some(v) => v
+            .parse()
+            .ok()
+            .filter(|m: &f64| m.is_finite() && *m >= 0.0)?,
         None => 400.0,
     };
     let min_decode: usize = match it.next() {

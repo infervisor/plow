@@ -1751,7 +1751,9 @@ mod amd_serve {
             } else {
                 let mut backends = Vec::with_capacity(n_gpu as usize);
                 for d in 0..n_gpu {
-                    backends.push(Arc::new(crate::device::hsa::HsaBackend::new(first + d as u8)?));
+                    backends.push(Arc::new(crate::device::hsa::HsaBackend::new(
+                        first + d as u8,
+                    )?));
                 }
                 Ranks::Tp(AmdTpGroup::load(
                     backends, blob_path, hsaco_dir, checkpoint,
@@ -3525,8 +3527,12 @@ mod amd_serve {
             if !crate::config::RuntimeConfig::get().amd.pack_fill {
                 return vec![rows.len()];
             }
-            let mut rungs: Vec<u32> =
-                self.ranks.rank0().prefill_rungs().map(|(_, width)| width).collect();
+            let mut rungs: Vec<u32> = self
+                .ranks
+                .rank0()
+                .prefill_rungs()
+                .map(|(_, width)| width)
+                .collect();
             rungs.sort_unstable();
             split_pack(rows, &rungs)
         }
@@ -3775,7 +3781,9 @@ mod amd_serve {
                 Ranks::One(e) => e.prefill_packed_chunk(&spans, &slices, &parked)?,
                 Ranks::Tp(g) => g.prefill_packed_chunk(&spans, &slices, &parked)?,
             }
-            let post_t = crate::config::RuntimeConfig::get().pf_packlog.then(std::time::Instant::now);
+            let post_t = crate::config::RuntimeConfig::get()
+                .pf_packlog
+                .then(std::time::Instant::now);
             // Span `s` sampled into `in.ids[s]` and logits row `s`. Read them before the cursors
             // move, so a failed read leaves every member re-runnable.
             let finishing: Vec<usize> = completed
@@ -4473,13 +4481,13 @@ mod amd_serve {
     mod tests {
         use super::{
             body_respects_plan, cap_chunks_to_bodies, commit_mixed_prefill, commit_packed_prefill,
-            invalidate_prefix_metadata, mixed_cursor_rows, mixed_pack_route, split_pack,
-            mixed_prefill_continuation_fits,
-            mixed_prefill_padding_fits, multistep_feeds_armable, packable_prefill_step,
-            parse_snapshot_tensors, slot_decode_position, snapshot_file_component,
-            split_pending_prefill, split_terminal_prefill, stage_parked, terminal_prefill_cursor,
-            token_batch_host_step, token_batch_prefill_continuation_fits, AmdServe, PfCursor,
-            DEFAULT_SNAPSHOT_TENSORS, MAX_SNAPSHOT_TENSORS,
+            invalidate_prefix_metadata, mixed_cursor_rows, mixed_pack_route,
+            mixed_prefill_continuation_fits, mixed_prefill_padding_fits, multistep_feeds_armable,
+            packable_prefill_step, parse_snapshot_tensors, slot_decode_position,
+            snapshot_file_component, split_pack, split_pending_prefill, split_terminal_prefill,
+            stage_parked, terminal_prefill_cursor, token_batch_host_step,
+            token_batch_prefill_continuation_fits, AmdServe, PfCursor, DEFAULT_SNAPSHOT_TENSORS,
+            MAX_SNAPSHOT_TENSORS,
         };
         use crate::exec::amd::ChunkStep;
 
@@ -5342,11 +5350,26 @@ mod amd_serve {
             let width = |p: usize| [128u32, 512, 2048, 8192].get(p).copied();
             let limit = |_| 64;
             // 8192 prefill rows fill the widest rung: no rung covers them plus a decode row.
-            assert_eq!(mixed_pack_route(None, Some(3), 9, width, limit), Some((3, false)));
-            assert_eq!(mixed_pack_route(Some(3), Some(3), 9, width, limit), Some((3, true)));
-            assert_eq!(mixed_pack_route(Some(3), Some(2), 9, width, limit), Some((2, false)));
-            assert_eq!(mixed_pack_route(Some(3), Some(3), 65, width, limit), Some((3, false)));
-            assert_eq!(mixed_pack_route(Some(3), None, 9, width, limit), Some((3, true)));
+            assert_eq!(
+                mixed_pack_route(None, Some(3), 9, width, limit),
+                Some((3, false))
+            );
+            assert_eq!(
+                mixed_pack_route(Some(3), Some(3), 9, width, limit),
+                Some((3, true))
+            );
+            assert_eq!(
+                mixed_pack_route(Some(3), Some(2), 9, width, limit),
+                Some((2, false))
+            );
+            assert_eq!(
+                mixed_pack_route(Some(3), Some(3), 65, width, limit),
+                Some((3, false))
+            );
+            assert_eq!(
+                mixed_pack_route(Some(3), None, 9, width, limit),
+                Some((3, true))
+            );
             assert_eq!(mixed_pack_route(None, None, 9, width, limit), None);
         }
 

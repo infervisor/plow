@@ -4478,7 +4478,10 @@ fn moe_pf_w8a8_marks_grouped_pair_and_quantizes_input() {
         let n = declare_glm_rows_batched(&mut decl, &c, 512, &[3], rows, rows, MoeEnc::Fp8Blk);
         let tensors = decl.tensors();
         assert_eq!(tensors[n.routed_xq as usize].bytes, (rows * h) as u64);
-        assert_eq!(tensors[n.routed_xs as usize].bytes, (rows * (h / 128) * 4) as u64);
+        assert_eq!(
+            tensors[n.routed_xs as usize].bytes,
+            (rows * (h / 128) * 4) as u64
+        );
         let mut b = Builder::new(256);
         b.adopt_tensors(tensors);
         let all = b.all();
@@ -4503,13 +4506,24 @@ fn moe_pf_w8a8_marks_grouped_pair_and_quantizes_input() {
             .iter()
             .find(|d| d.op == DevOp::QuantFp8Block128 as u16 && d.t[0] == n.routed_xq)
             .expect("routed input quant");
-        assert_eq!((q.t[1], q.t[2], q.i[0], q.i[1]), (n.xn2, n.routed_xs, rows, h));
-        let glu = p.insts.iter().find(|d| d.op == DevOp::MoeGroupGluPf as u16).unwrap();
+        assert_eq!(
+            (q.t[1], q.t[2], q.i[0], q.i[1]),
+            (n.xn2, n.routed_xs, rows, h)
+        );
+        let glu = p
+            .insts
+            .iter()
+            .find(|d| d.op == DevOp::MoeGroupGluPf as u16)
+            .unwrap();
         assert_eq!(
             (glu.t[1], glu.t[6], glu.t[7], glu.i[0], glu.i[4], glu.i[7]),
             (n.routed_xq, n.routed_xs, n.fu_scale, inter, rows, 2)
         );
-        let down = p.insts.iter().find(|d| d.op == DevOp::MoeGroupDownPf as u16).unwrap();
+        let down = p
+            .insts
+            .iter()
+            .find(|d| d.op == DevOp::MoeGroupDownPf as u16)
+            .unwrap();
         assert_eq!((down.t[1], down.t[5], down.i[7]), (n.fu_g, n.fu_scale, 2));
         assert_ne!(n.fu_scale, TENSOR_NONE);
     }
@@ -4550,13 +4564,24 @@ fn moe_pf_w8a8_split_reads_bf16_input_without_quant() {
         None,
     );
     let p = b.finish();
-    assert!(!p.insts.iter().any(|d| d.op == DevOp::QuantFp8Block128 as u16 && d.t[1] == n.xn2));
-    let glu = p.insts.iter().find(|d| d.op == DevOp::MoeGroupGluPf as u16).unwrap();
+    assert!(!p
+        .insts
+        .iter()
+        .any(|d| d.op == DevOp::QuantFp8Block128 as u16 && d.t[1] == n.xn2));
+    let glu = p
+        .insts
+        .iter()
+        .find(|d| d.op == DevOp::MoeGroupGluPf as u16)
+        .unwrap();
     assert_eq!(
         (glu.t[1], glu.t[7], glu.i[0], glu.i[4], glu.i[7]),
         (n.xn2, n.fu_scale, inter, rows, 4)
     );
-    let down = p.insts.iter().find(|d| d.op == DevOp::MoeGroupDownPf as u16).unwrap();
+    let down = p
+        .insts
+        .iter()
+        .find(|d| d.op == DevOp::MoeGroupDownPf as u16)
+        .unwrap();
     assert_eq!((down.t[1], down.t[5], down.i[7]), (n.fu_g, n.fu_scale, 4));
 }
 
@@ -4594,13 +4619,24 @@ fn moe_pf_w8a8_fq_quantizes_in_the_glu() {
         None,
     );
     let p = b.finish();
-    assert!(!p.insts.iter().any(|d| d.op == DevOp::QuantFp8Block128 as u16 && d.t[1] == n.xn2));
-    let glu = p.insts.iter().find(|d| d.op == DevOp::MoeGroupGluPf as u16).unwrap();
+    assert!(!p
+        .insts
+        .iter()
+        .any(|d| d.op == DevOp::QuantFp8Block128 as u16 && d.t[1] == n.xn2));
+    let glu = p
+        .insts
+        .iter()
+        .find(|d| d.op == DevOp::MoeGroupGluPf as u16)
+        .unwrap();
     assert_eq!(
         (glu.t[1], glu.t[7], glu.i[0], glu.i[4], glu.i[7]),
         (n.xn2, n.fu_scale, inter, rows, 6)
     );
-    let down = p.insts.iter().find(|d| d.op == DevOp::MoeGroupDownPf as u16).unwrap();
+    let down = p
+        .insts
+        .iter()
+        .find(|d| d.op == DevOp::MoeGroupDownPf as u16)
+        .unwrap();
     assert_eq!((down.t[1], down.t[5], down.i[7]), (n.fu_g, n.fu_scale, 2));
 }
 
@@ -4738,7 +4774,8 @@ fn glm53_packed_sibling_tail_samples_every_span() {
     let enc = MoeEnc::from_flags(false, false);
     let rows = 128;
     let mut tb = Builder::new(256);
-    let n = declare_glm_rows_batched_for_prefill(&mut tb, &c, 1024, &layers, rows, 128, enc, &[rows]);
+    let n =
+        declare_glm_rows_batched_for_prefill(&mut tb, &c, 1024, &layers, rows, 128, enc, &[rows]);
     let s = declare_glm53(&mut tb, &c, rows, 128, n.pos);
     let tensors = tb.tensors();
     let build = |packed: bool| {
@@ -8427,7 +8464,19 @@ fn glm5_next_cfg_reads_root_quantization_and_clamped_swiglu() {
         d.i[1] = c.hidden;
         d.f[0] = c.eps;
     });
-    emit_glm_dense_ffn(&mut b, &c, &n, 0, 1, MoeEnc::Fp8Blk, n.xnext, norm, &mut 0, &all, false);
+    emit_glm_dense_ffn(
+        &mut b,
+        &c,
+        &n,
+        0,
+        1,
+        MoeEnc::Fp8Blk,
+        n.xnext,
+        norm,
+        &mut 0,
+        &all,
+        false,
+    );
     let p = b.finish();
     let glu = p
         .insts

@@ -4106,7 +4106,10 @@ async fn bringup_runtime(
         && !amd_serve
         && (dp_spec.ranks("", 2) > 1 || dp_spec.named().next().is_some())
     {
-        return Err("--dp needs the CUDA serve with model bundles under the GPU manager, or an AMD serve".into());
+        return Err(
+            "--dp needs the CUDA serve with model bundles under the GPU manager, or an AMD serve"
+                .into(),
+        );
     }
     // AMD models served data-parallel, `(slug, ranks)`: their dispatchers are per rank.
     #[allow(unused_mut)]
@@ -4147,12 +4150,18 @@ async fn bringup_runtime(
                 .into());
             }
             if n > plowrt::serve::dp::MAX_DP {
-                return Err(format!("{slug}: --dp {n} exceeds {} ranks", plowrt::serve::dp::MAX_DP).into());
+                return Err(format!(
+                    "{slug}: --dp {n} exceeds {} ranks",
+                    plowrt::serve::dp::MAX_DP
+                )
+                .into());
             }
             plan.push((slug.clone(), blob, tp, n));
         }
         if let Some(m) = dp_spec.named().find(|m| !plan.iter().any(|p| p.0 == *m)) {
-            return Err(format!("--dp {m}=… names a model this server does not serve on the GPU").into());
+            return Err(
+                format!("--dp {m}=… names a model this server does not serve on the GPU").into(),
+            );
         }
         let instance = |slug: &str, n: usize, r: usize| {
             if n > 1 {
@@ -4183,9 +4192,10 @@ async fn bringup_runtime(
             match unpinned.or_else(|| specs.iter().position(|s| s.slug == slug)) {
                 Some(i) => specs[i].device = Some(ordinal),
                 None => {
-                    return Err(
-                        format!("--pin {slug}@{ordinal} names a model this server does not serve").into()
+                    return Err(format!(
+                        "--pin {slug}@{ordinal} names a model this server does not serve"
                     )
+                    .into())
                 }
             }
         }
@@ -4194,7 +4204,8 @@ async fn bringup_runtime(
             let width = placement::grouping_width(&specs, visible).map_err(|e| e.to_string())?;
             let groups =
                 placement::plan_groups(&ordinals, width, u64::MAX).map_err(|e| e.to_string())?;
-            let layout = placement::assign(&specs, &groups, cfg.place).map_err(|e| e.to_string())?;
+            let layout =
+                placement::assign(&specs, &groups, cfg.place).map_err(|e| e.to_string())?;
             let tenants: Vec<usize> = (0..layout.groups.len())
                 .map(|g| layout.assignment.iter().filter(|&&a| a == g).count())
                 .collect();
@@ -4206,7 +4217,10 @@ async fn bringup_runtime(
                 return Err("AMD models sharing a device group require --co-sched rr; separate HSA queues do not guarantee whole-grid residency".into());
             }
             let first_of = |key: &str| {
-                let i = specs.iter().position(|s| s.slug == key).expect("planned instance");
+                let i = specs
+                    .iter()
+                    .position(|s| s.slug == key)
+                    .expect("planned instance");
                 layout.groups[layout.assignment[i]].first()
             };
             for (i, s) in specs.iter().enumerate() {
@@ -4271,12 +4285,8 @@ async fn bringup_runtime(
                     let first = u8::try_from(first_of(&key))
                         .map_err(|_| format!("{key}: device ordinal out of range"))?;
                     let t0 = std::time::Instant::now();
-                    let eng = plowrt::serve::engine::AmdServe::load_on(
-                        blob,
-                        &hsaco,
-                        Some(&ckpt),
-                        first,
-                    )?;
+                    let eng =
+                        plowrt::serve::engine::AmdServe::load_on(blob, &hsaco, Some(&ckpt), first)?;
                     tracing::info!(
                         %key, first_device = first, tp, secs = t0.elapsed().as_secs_f64(),
                         max_ctx = eng.max_ctx(), "AMD engine loaded"
@@ -4387,8 +4397,15 @@ async fn bench(
     )?;
     plowrt::serve::bench::validate_request_layout(&input, warmup_requests, requests)?;
     validate_token_audit_options(token_audit, &input, warmup_requests, requests, output_len)?;
-    let state =
-        bringup_runtime(vec![assets], Vec::new(), executors, false, mux_cfg, Vec::new()).await?;
+    let state = bringup_runtime(
+        vec![assets],
+        Vec::new(),
+        executors,
+        false,
+        mux_cfg,
+        Vec::new(),
+    )
+    .await?;
     let models = state.registry.slugs();
     let [model] = models.as_slice() else {
         return Err(format!("bench requires exactly one model, loaded {}", models.len()).into());
@@ -4579,8 +4596,15 @@ async fn serve(
     trace: bool,
     mux_cfg: MuxConfig,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let state =
-        bringup_runtime(assets, asset_slugs, executors, trace, mux_cfg, served_model_name).await?;
+    let state = bringup_runtime(
+        assets,
+        asset_slugs,
+        executors,
+        trace,
+        mux_cfg,
+        served_model_name,
+    )
+    .await?;
     #[cfg(feature = "cuda")]
     {
         let state = Arc::clone(&state);

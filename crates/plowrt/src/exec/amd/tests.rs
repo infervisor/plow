@@ -2685,7 +2685,10 @@ fn nope_mla_prefill_routes_to_four_waves_and_is_gated_at_load() {
         prog.insts[0].i[3] = 0x8000_0040;
         prog.insts[0].t[7] = packet::dev::TENSOR_NONE16;
         // bf16 NoPE packs on the packed V2 flash object's NoPE arm (marker-gated at load).
-        assert_eq!(packed_mla_compatible(&prog, false), op == DevOp::FlashMlaPrefill);
+        assert_eq!(
+            packed_mla_compatible(&prog, false),
+            op == DevOp::FlashMlaPrefill
+        );
         assert_eq!(packed_mla_nope(&prog), op == DevOp::FlashMlaPrefill);
         assert!(!token_batch_body_compatible(&prog, false));
         assert_eq!(

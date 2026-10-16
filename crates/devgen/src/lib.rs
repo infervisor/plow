@@ -9122,9 +9122,12 @@ pub fn run_verified(args: EmitArgs, verify: Option<VerifyHook>) {
             let l = layers[0];
             // A config that does not parse is a DIFFERENT failure from an unemitted part, and
             // saying so keeps a checkpoint problem from reading as missing emit work.
-            let c = mla::cfg_dsv41(&dir)
-                .unwrap_or_else(|e| panic!("deepseek_v41 --block {l}: the config does not parse, \
-                     so there is nothing to plan a rung against: {e}"));
+            let c = mla::cfg_dsv41(&dir).unwrap_or_else(|e| {
+                panic!(
+                    "deepseek_v41 --block {l}: the config does not parse, \
+                     so there is nothing to plan a rung against: {e}"
+                )
+            });
             // Every layer, not just the first: a range whose tail is unemittable must say so
             // before it writes a blob that is short some layers.
             let plan = layers
@@ -9140,7 +9143,16 @@ pub fn run_verified(args: EmitArgs, verify: Option<VerifyHook>) {
                         .copied()
                         .unwrap_or_else(|| ctx.min(1024));
                     mla::dsv41_emit_block(
-                        &dir, &layers, ctx, t, &out, n_cu, tp, rope_gen, &arch, verify.as_ref(),
+                        &dir,
+                        &layers,
+                        ctx,
+                        t,
+                        &out,
+                        n_cu,
+                        tp,
+                        rope_gen,
+                        &arch,
+                        verify.as_ref(),
                     );
                     return;
                 }

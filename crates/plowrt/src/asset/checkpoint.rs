@@ -223,10 +223,7 @@ impl Checkpoint {
                         )));
                     }
                     let header_str = std::str::from_utf8(&map[8..8 + hlen]).map_err(|_| {
-                        RuntimeError::Device(format!(
-                            "safetensors {}: {err}",
-                            path.display()
-                        ))
+                        RuntimeError::Device(format!("safetensors {}: {err}", path.display()))
                     })?;
                     if !header_str.contains("F8_E8M0") {
                         return Err(RuntimeError::Device(format!(
@@ -251,10 +248,8 @@ impl Checkpoint {
                         if name == "__metadata__" {
                             continue;
                         }
-                        let dtype_str = val
-                            .get("dtype")
-                            .and_then(|d| d.as_str())
-                            .ok_or_else(|| {
+                        let dtype_str =
+                            val.get("dtype").and_then(|d| d.as_str()).ok_or_else(|| {
                                 RuntimeError::Device(format!(
                                     "safetensors {}: tensor {name} missing dtype",
                                     path.display()
@@ -283,10 +278,8 @@ impl Checkpoint {
                                 )));
                             }
                         };
-                        let shape_arr = val
-                            .get("shape")
-                            .and_then(|s| s.as_array())
-                            .ok_or_else(|| {
+                        let shape_arr =
+                            val.get("shape").and_then(|s| s.as_array()).ok_or_else(|| {
                                 RuntimeError::Device(format!(
                                     "safetensors {}: tensor {name} missing shape",
                                     path.display()

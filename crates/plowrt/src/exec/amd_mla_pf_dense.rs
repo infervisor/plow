@@ -180,7 +180,9 @@ pub(super) fn routes(
     }
     let addr = |h: u16, what: &str| -> Result<u64> {
         devp.get(h as usize).map(|m| m.base).ok_or_else(|| {
-            RuntimeError::Device(format!("dense MLA prefill operand `{what}` handle {h} is invalid"))
+            RuntimeError::Device(format!(
+                "dense MLA prefill operand `{what}` handle {h} is invalid"
+            ))
         })
     };
     for (seg, inst) in seg_inst.into_iter().enumerate() {
@@ -193,7 +195,11 @@ pub(super) fn routes(
         out[seg] = Some(Route {
             args: Args {
                 opart: addr(d.t[0], "Opart")?,
-                mlpart: if d.t[1] == TENSOR_NONE16 { 0 } else { addr(d.t[1], "mlpart")? },
+                mlpart: if d.t[1] == TENSOR_NONE16 {
+                    0
+                } else {
+                    addr(d.t[1], "mlpart")?
+                },
                 q: addr(d.t[2], "Qabs")?,
                 ckv: addr(d.t[4], "Ckv")?,
                 kv_len: addr(d.t[6], "kv_len")?,

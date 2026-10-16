@@ -1148,7 +1148,6 @@ enum Job {
     Sync(std::sync::mpsc::Sender<()>),
 }
 
-
 /// What a boundary was published as (a bit set: a dedup ORs the publisher's kind in).
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 pub struct Kind(u8);

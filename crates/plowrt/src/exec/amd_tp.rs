@@ -213,10 +213,16 @@ fn each_rank<T: Send>(
         if !super::rank_pool::run(jobs) {
             return Err(RuntimeError::Device("rank host worker panicked".into()));
         }
-        return out.into_iter().map(|r| r.expect("rank pool job ran")).collect();
+        return out
+            .into_iter()
+            .map(|r| r.expect("rank pool job ran"))
+            .collect();
     }
     std::thread::scope(|scope| {
-        let handles: Vec<_> = ranks.iter_mut().map(|e| scope.spawn(move || f(e))).collect();
+        let handles: Vec<_> = ranks
+            .iter_mut()
+            .map(|e| scope.spawn(move || f(e)))
+            .collect();
         let mut out = Vec::with_capacity(handles.len());
         let mut first = None;
         for h in handles {
@@ -1291,7 +1297,9 @@ impl AmdTpGroup {
                     })
                     .collect();
                 if !super::rank_pool::run(jobs) {
-                    return Err(RuntimeError::Device("decode replay fill worker panicked".into()));
+                    return Err(RuntimeError::Device(
+                        "decode replay fill worker panicked".into(),
+                    ));
                 }
                 if let Some(error) = res.into_iter().find_map(|r| r.err()) {
                     return Err(error);

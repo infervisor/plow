@@ -4169,7 +4169,10 @@ fn run_one_tick(
                     .flatten()
                     .filter(|s| s.step == 0)
                     .fold((0u32, 0u32), |(n, r), s| {
-                        (n + 1, r + s.prompt_ids.len().saturating_sub(s.pf_pos) as u32)
+                        (
+                            n + 1,
+                            r + s.prompt_ids.len().saturating_sub(s.pf_pos) as u32,
+                        )
                     });
                 crate::obs::tick::trace_begin(decode_rows as u32, waiting, rows)
             } else {
@@ -4733,7 +4736,10 @@ fn run_one_tick(
             let mixed_pack = has_decode
                 && !slo_on
                 && e.mixed_pack_ready()
-                && rt.amd.mixed_ride_max.is_none_or(|max| decode_rows <= max as usize);
+                && rt
+                    .amd
+                    .mixed_ride_max
+                    .is_none_or(|max| decode_rows <= max as usize);
             // PLOW_PF_HOLD: while enough rows decode, fresh prompts wait for a wide pack.
             let hold = amd_pf_hold(
                 rt.pf_hold().filter(|_| !slo_on),
@@ -4894,7 +4900,11 @@ fn run_one_tick(
                 // budget less its riders: the oldest planned chunk that does not fit is cut to the
                 // gap (its rest is its next chunk) and the tick re-plans, instead of the launch
                 // running short (a trimmed tail alone, or a pack a whole chunk short).
-                if rt.amd.ride_fill && mixed_pack && b2b_pass == 0 && !decoded_in_pack && !ride_filled
+                if rt.amd.ride_fill
+                    && mixed_pack
+                    && b2b_pass == 0
+                    && !decoded_in_pack
+                    && !ride_filled
                 {
                     ride_filled = true;
                     let riders = slots[..cap]
@@ -4921,33 +4931,33 @@ fn run_one_tick(
                 }
                 // A pack wider than its members' isolated rungs together runs as lone launches;
                 // PLOW_AMD_PACK_FILL first splits a mostly empty pack into narrower full ones.
-                let launches: Vec<crate::sched::step::Launch> = step
-                    .launches
-                    .iter()
-                    .flat_map(|launch| {
-                        if !launch.is_pack() {
-                            return vec![launch.clone()];
-                        }
-                        let rows: Vec<u32> = launch.spans.iter().map(|s| s.n_rows).collect();
-                        let mut out = Vec::new();
-                        let mut at = 0usize;
-                        for n in e.pack_groups(&rows) {
-                            let spans = &launch.spans[at..at + n];
-                            let group_rows = &rows[at..at + n];
-                            at += n;
-                            if spans.len() == 1 || e.pack_pays(group_rows) {
-                                out.push(crate::sched::step::Launch {
-                                    spans: spans.to_vec(),
-                                });
-                            } else {
-                                out.extend(spans.iter().map(|&span| crate::sched::step::Launch {
-                                    spans: vec![span],
-                                }));
+                let launches: Vec<crate::sched::step::Launch> =
+                    step.launches
+                        .iter()
+                        .flat_map(|launch| {
+                            if !launch.is_pack() {
+                                return vec![launch.clone()];
                             }
-                        }
-                        out
-                    })
-                    .collect();
+                            let rows: Vec<u32> = launch.spans.iter().map(|s| s.n_rows).collect();
+                            let mut out = Vec::new();
+                            let mut at = 0usize;
+                            for n in e.pack_groups(&rows) {
+                                let spans = &launch.spans[at..at + n];
+                                let group_rows = &rows[at..at + n];
+                                at += n;
+                                if spans.len() == 1 || e.pack_pays(group_rows) {
+                                    out.push(crate::sched::step::Launch {
+                                        spans: spans.to_vec(),
+                                    });
+                                } else {
+                                    out.extend(spans.iter().map(|&span| {
+                                        crate::sched::step::Launch { spans: vec![span] }
+                                    }));
+                                }
+                            }
+                            out
+                        })
+                        .collect();
                 for launch in &launches {
                     // PLOW_AMD_MIXED_PACK: the live decode rows ride the tick's first packed
                     // launch as one-row spans. A lone chunk stays on its isolated program, whose
@@ -5127,14 +5137,15 @@ fn run_one_tick(
                                     "AMD packed prefill rejected"
                                 );
                                 b2b_failed = true;
-                                let failed_slots: Vec<usize> = if let Some(i) = rejected_pack_slot(&reason) {
-                                    vec![i]
-                                } else {
-                                    amd_failed_pack_slots(
-                                        packed.iter().map(|span| span.slot as usize),
-                                        &feeds,
-                                    )
-                                };
+                                let failed_slots: Vec<usize> =
+                                    if let Some(i) = rejected_pack_slot(&reason) {
+                                        vec![i]
+                                    } else {
+                                        amd_failed_pack_slots(
+                                            packed.iter().map(|span| span.slot as usize),
+                                            &feeds,
+                                        )
+                                    };
                                 let err = crate::RuntimeError::Rejected(reason);
                                 let msg = err.to_string();
                                 for i in failed_slots {
@@ -10477,19 +10488,33 @@ mod tests {
         assert_eq!(amd_pf_hold(spec, 128, ones(5)), PfHold::Held);
         assert_eq!(amd_pf_hold(spec, 128, ones(6)), PfHold::Release(8192));
         assert_eq!(
-            amd_pf_hold(spec, 128, [(1024, false, 10.0), (1024, false, 401.0)].into_iter()),
+            amd_pf_hold(
+                spec,
+                128,
+                [(1024, false, 10.0), (1024, false, 401.0)].into_iter()
+            ),
             PfHold::Release(8192)
         );
-        assert_eq!(amd_pf_hold(spec, 128, [(4096, false, 1.0)].into_iter()), PfHold::Held);
         assert_eq!(
-            amd_pf_hold(spec, 128, [(4096, false, 1.0), (4096, false, 1.0)].into_iter()),
+            amd_pf_hold(spec, 128, [(4096, false, 1.0)].into_iter()),
+            PfHold::Held
+        );
+        assert_eq!(
+            amd_pf_hold(
+                spec,
+                128,
+                [(4096, false, 1.0), (4096, false, 1.0)].into_iter()
+            ),
             PfHold::Release(8192)
         );
         assert_eq!(
             amd_pf_hold(spec, 128, [(1024, true, 1.0)].into_iter()),
             PfHold::Release(8192)
         );
-        assert_eq!(amd_pf_hold(spec, 128, std::iter::empty()), PfHold::Release(8192));
+        assert_eq!(
+            amd_pf_hold(spec, 128, std::iter::empty()),
+            PfHold::Release(8192)
+        );
     }
 
     #[cfg(any(feature = "hsa", feature = "cpu"))]
@@ -10652,7 +10677,10 @@ mod tests {
     #[cfg(feature = "hsa")]
     #[test]
     fn a_failed_mixed_pack_terminates_its_decode_riders_too() {
-        assert_eq!(amd_failed_pack_slots([4, 5], &[(0, 7), (2, 9)]), [4, 5, 0, 2]);
+        assert_eq!(
+            amd_failed_pack_slots([4, 5], &[(0, 7), (2, 9)]),
+            [4, 5, 0, 2]
+        );
         assert_eq!(amd_failed_pack_slots([4, 5], &[]), [4, 5]);
     }
 
@@ -10660,8 +10688,14 @@ mod tests {
     #[test]
     fn rejected_pack_slot_extracts_slot() {
         assert_eq!(rejected_pack_slot("invalid mixed decode slot 3"), Some(3));
-        assert_eq!(rejected_pack_slot("packed prefill slot 12 has no initialized cursor"), Some(12));
-        assert_eq!(rejected_pack_slot("no packed prefill rung covers 128 rows"), None);
+        assert_eq!(
+            rejected_pack_slot("packed prefill slot 12 has no initialized cursor"),
+            Some(12)
+        );
+        assert_eq!(
+            rejected_pack_slot("no packed prefill rung covers 128 rows"),
+            None
+        );
     }
 
     #[cfg(any(feature = "cuda", feature = "hsa", feature = "cpu"))]

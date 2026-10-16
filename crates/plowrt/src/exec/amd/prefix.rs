@@ -564,7 +564,10 @@ mod tests {
     }
     #[test]
     fn full_context_kv_clones_by_head_prefix_and_unknown_kv_refuses() {
-        let tensors = [tensor("kv.3.ckv", 4 * 2 * 64 * 1024), tensor("kv.0.state", 4 * 256)];
+        let tensors = [
+            tensor("kv.3.ckv", 4 * 2 * 64 * 1024),
+            tensor("kv.0.state", 4 * 256),
+        ];
         let mut d = DevInst64::default();
         d.op = DevOp::HeadNormRope as u16;
         d.t[0] = 0;

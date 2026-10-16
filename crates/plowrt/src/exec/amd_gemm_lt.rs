@@ -361,7 +361,10 @@ pub(super) fn routes(
                     && prog.t % 8 == 0
                     && band_choice(rows, inst.i[1], inst.i[2]).is_some()
             }
-            4 => (1..=8192).contains(&prog.t) && gfx950_choice(prog.t, inst.i[1], inst.i[2]).is_some(),
+            4 => {
+                (1..=8192).contains(&prog.t)
+                    && gfx950_choice(prog.t, inst.i[1], inst.i[2]).is_some()
+            }
             3 => {
                 matches!(prog.t, 2048 | 4096 | 8192)
                     && inst.i[0] == prog.t
@@ -469,7 +472,10 @@ fn magic_number(d: u32) -> (u32, u32) {
             break;
         }
     }
-    (q2.wrapping_add(1), (p - 32) | if add { 0x8000_0000 } else { 0 })
+    (
+        q2.wrapping_add(1),
+        (p - 32) | if add { 0x8000_0000 } else { 0 },
+    )
 }
 
 /// Prefill: one whole output tile per workgroup (`skGrid = skTiles = tiles`, `SKItersPerWG =
@@ -734,7 +740,13 @@ impl GemmLt {
                 &self.specs[index],
                 [base, base + GFX950_WS],
             );
-            be.launch(self.kernels[index], grid, self.specs[index].wg, 0, bytemuck::bytes_of(&args))?;
+            be.launch(
+                self.kernels[index],
+                grid,
+                self.specs[index].wg,
+                0,
+                bytemuck::bytes_of(&args),
+            )?;
             weight += u64::from(nn) * u64::from(k) * 2;
         }
         Ok(())
@@ -752,13 +764,15 @@ impl GemmLt {
                 .as_ref()
                 .ok_or_else(|| RuntimeError::Device("gfx950 hipBLASLt route on gfx942".into()))?
                 .base;
-            let (args, grid) = arguments950(
-                route,
-                tensors,
-                &self.specs[index],
-                [base, base + GFX950_WS],
+            let (args, grid) =
+                arguments950(route, tensors, &self.specs[index], [base, base + GFX950_WS]);
+            return be.launch(
+                self.kernels[index],
+                grid,
+                self.specs[index].wg,
+                0,
+                bytemuck::bytes_of(&args),
             );
-            return be.launch(self.kernels[index], grid, self.specs[index].wg, 0, bytemuck::bytes_of(&args));
         }
         let args = arguments(route, tensors, &self.specs[index], info1);
         be.launch(
@@ -842,7 +856,14 @@ mod tests {
         let specs: Vec<KernelSpec> =
             serde_json::from_str(include_str!("../../../../runtime/amd/glm_lt_gfx950.json"))
                 .unwrap();
-        for (n, k) in [(1536, 4096), (512, 4096), (4096, 1536), (4096, 2048), (4096, 1024), (1024, 128)] {
+        for (n, k) in [
+            (1536, 4096),
+            (512, 4096),
+            (4096, 1536),
+            (4096, 2048),
+            (4096, 1024),
+            (1024, 128),
+        ] {
             for rows in [1, 2048, 2049, 4096, 4097, 8192] {
                 let spec = &specs[gfx950_choice(rows, n, k).unwrap()];
                 assert!(spec.depth_u > 0 && spec.mt_i > 0 && spec.mt_j > 0);
