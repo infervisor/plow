@@ -1270,6 +1270,21 @@ fn tuning(s: &Shapes, arch: &str) -> Map<String, Value> {
             }
         }
     }
+    // GB202 (sm_120a): a dense hd <= 128 packet walks its B=1 GEMVs on the tensor cores too.
+    // Qwen3-ASR rtx-5090 step_bench ctx 512 B=1/8/16/32, PLOW_GEMV_PREFETCH on, token digests
+    // unchanged: 1.7B 2.722/3.091/3.469/4.270 -> 2.630/3.091/3.470/4.268 ms; 0.6B
+    // 1.433/1.662/2.038/2.917 -> 1.301/1.660/2.033/2.907.
+    if arch == "sm_120a"
+        && s.moe_down_inter == 0
+        && s.decode_batch >= 2
+        && !s.decode_gemv_k.is_empty()
+        && s.decode_gemv_k.iter().all(|k| k % 32 == 0)
+        && s.hd.iter().all(|&h| h <= 128)
+        && !s.ops_present.iter().any(|op| op.starts_with("Moe"))
+        && !s.ops_present.contains(&op_name(DevOp::GluStrided))
+    {
+        t.insert("gemv_mma_b1".into(), json!(1));
+    }
     if sm90a && crate::emit_config::active().w8a8 && crate::emit_config::active().decode_cublaslt {
         t.insert("fp8_lt_decode".into(), json!(true));
     }
@@ -3125,6 +3140,14 @@ pub fn config_header(manifest: &Value) -> String {
         }
         if t.get("kv_ilv").is_some() {
             out.push_str("#ifndef PLOW_NV_KV_ILV\n#define PLOW_NV_KV_ILV 1\n#endif\n");
+        }
+        // Measured in the decode object only; the speech and prefill objects keep their walks.
+        if manifest.get("arch").and_then(Value::as_str) == Some("sm_120a")
+            && t.get("gemv_mma_b1").is_some()
+        {
+            out.push_str(
+                "#if !PLOW_NV_SPEECH && !PLOW_NV_PREFILL\n#ifndef PLOW_NV_GEMV_MMA_B1\n#define PLOW_NV_GEMV_MMA_B1 1\n#endif\n#endif\n",
+            );
         }
         if manifest.get("arch").and_then(Value::as_str) == Some("sm_90a") {
             if let Some(ks) = t.get("xreg_k").and_then(Value::as_array) {
