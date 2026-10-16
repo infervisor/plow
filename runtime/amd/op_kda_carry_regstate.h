@@ -7,6 +7,22 @@
  * fma and keep every other product/sum separately rounded. */
 #pragma clang fp contract(off)
 
+/* Drain every load before the chunk loop. The loop header merges the preheader's waitcnt state
+ * with the back edge's, and the preheader loaded registers the loop later reuses in a different
+ * issue order, so the merged state made phase 1 wait for loads issued just before the previous
+ * barrier (vmcnt(4)) instead of one iteration earlier. Timing only: same loads, same math. */
+#ifndef PLOW_KDA_CARRY_PIPE
+#define PLOW_KDA_CARRY_PIPE 0
+#endif
+/* Key-factor tiles read for the update MFMA with gfx950 transpose loads: 16 ds_read_b64_tr_b16
+ * per lane per chunk instead of 64 ds_read_u16. Same bf16 values in the same fragment slots. */
+#ifndef PLOW_KDA_CARRY_KTR16
+#define PLOW_KDA_CARRY_KTR16 0
+#endif
+#ifndef PLOW_KDA_CARRY_XCD
+#define PLOW_KDA_CARRY_XCD 0
+#endif
+
 /* Register-resident BT64 chunk carry, gfx950, dense chunks, D = V = 128, q pre-scaled.
  *
  * Four waves own one (head, V16) state tile. Wave w owns token rows [16w, 16w+16) of every chunk
@@ -36,6 +52,13 @@ constexpr unsigned LDS_BYTES = (16u * SST + 16u * VST + 4u * 2u * KTILE) * 2u;
 typedef unsigned short u16x4 __attribute__((ext_vector_type(4)));
 typedef unsigned u32x4 __attribute__((ext_vector_type(4)));
 typedef unsigned u32x2 __attribute__((ext_vector_type(2)));
+#if PLOW_KDA_CARRY_KTR16
+typedef bf16_t kda_bf16x4 __attribute__((ext_vector_type(4)));
+__device__ __forceinline__ kda_bf16x4 kda_ds_read_tr16(const bf16* p) {
+    auto* lp = (kda_bf16x4 __attribute__((address_space(3)))*)(void*)p;
+    return __builtin_amdgcn_ds_read_tr16_b64_v4bf16(lp);
+}
+#endif
 
 /* Branch-free RNE with the same result as f2bf for every input (qNaN for NaN). */
 __device__ __forceinline__ bf16 f2bf_sel(float f) {
@@ -67,7 +90,7 @@ struct Factors {
 __device__ __forceinline__ void load_rows(
     Factors& f, const bf16* __restrict__ q, const bf16* __restrict__ W,
     const bf16* __restrict__ U, unsigned T, unsigned H, unsigned h, unsigned v0,
-    unsigned row0, unsigned wave, unsigned token, unsigned kg) {
+    unsigned row0, unsigned wave, unsigned token, unsigned kg, bool zero_u = false) {
     const unsigned m0 = 16u * wave;
     const size_t rowm = min(row0 + m0 + token, T - 1u);
     const bf16* wp = W + (rowm * H + h) * D + 8u * kg;
@@ -80,7 +103,7 @@ __device__ __forceinline__ void load_rows(
 #pragma unroll
     for (unsigned e = 0; e < 4u; ++e) {
         const size_t rowe = min(row0 + m0 + 4u * kg + e, T - 1u);
-        f.u[e] = U[(rowe * H + h) * V + v0 + token];
+        f.u[e] = zero_u ? (bf16)0 : U[(rowe * H + h) * V + v0 + token];
     }
 }
 
@@ -199,7 +222,9 @@ __device__ __forceinline__ u16x4 pack_bf16x4(f32x4 v) {
  * Must be launched with exactly four waves per workgroup. TIMED accumulates wave-0 s_memtime
  * phase cycles into timers[slice * 8 + 0..6] (bench instrumentation only). KEYFEED reads the
  * scaled-key pair from key_hi/key_lo ([T][H][D] bf16 each) instead of k and g. */
-template <bool TIMED = false, bool HW_CVT = false, bool KEYFEED = false>
+/* INIT 0 loads the state; 1 starts from zero and 2 from the identity (state row v = e_v, with
+ * U read as zero), the two partial runs of the split carry. */
+template <bool TIMED = false, bool HW_CVT = false, bool KEYFEED = false, unsigned INIT = 0>
 __device__ void d_kda_chunk_carry_bt64_regstate(
     bf16* __restrict__ out, float* __restrict__ state, const bf16* __restrict__ q,
     const bf16* __restrict__ k, const bf16* __restrict__ W, const bf16* __restrict__ U,
@@ -219,19 +244,34 @@ __device__ void d_kda_chunk_carry_bt64_regstate(
     bf16* const khi = vsm + 16u * VST + wave * 2u * KTILE;
     bf16* const klo = khi + KTILE;
     const size_t n_items = (size_t)H * (V / 16u);
-    for (size_t item = slice; item < n_items; item += nblk) {
+    /* PLOW_KDA_CARRY_XCD: with one workgroup per item and workgroups dealt round-robin over the
+     * eight XCDs, put a head's eight V16 tiles on one XCD so they share its L2 copy of the
+     * head's per-chunk W, q, Aqk and key factors. Item -> workgroup map only. */
+    size_t item0 = slice;
+#if PLOW_KDA_CARRY_XCD
+    if (nblk == n_items && n_items % 64u == 0u)
+        item0 = (size_t)(slice % 8u) * (n_items / 8u) + slice / 8u;
+#endif
+    for (size_t item = item0; item < n_items; item += nblk) {
         const unsigned h = (unsigned)(item / (V / 16u));
         const unsigned v0 = (unsigned)(item % (V / 16u)) * 16u;
         float* srow = state + ((size_t)h * V + v0 + token) * D + 32u * wave + 4u * kg;
         f32x4 S[2];
 #pragma unroll
         for (unsigned b = 0; b < 2u; ++b) {
-            S[b] = *reinterpret_cast<const f32x4*>(srow + 16u * b);
+            if constexpr (INIT == 0) {
+                S[b] = *reinterpret_cast<const f32x4*>(srow + 16u * b);
+            } else {
+#pragma unroll
+                for (unsigned e = 0; e < 4u; ++e)
+                    S[b][e] = INIT == 2 && v0 + token == 32u * wave + 16u * b + 4u * kg + e
+                                  ? 1.0f : 0.0f;
+            }
             *reinterpret_cast<u16x4*>(ssm + token * SST + 32u * wave + 16u * b + 4u * kg) =
                 pack_bf16x4<HW_CVT>(S[b]);
         }
         Factors F;
-        load_rows(F, q, W, U, T, H, h, v0, 0u, wave, token, kg);
+        load_rows(F, q, W, U, T, H, h, v0, 0u, wave, token, kg, INIT == 2);
         load_aqk(F, Aqk, T, H, h, 0u, wave, token, kg);
         load_decay(F, g, H, h, 0u, min(BT, T), wave, kg);
         if constexpr (KEYFEED) {
@@ -247,6 +287,9 @@ __device__ void d_kda_chunk_carry_bt64_regstate(
                 load_keys(F, k, g, T, H, h, c1 * BT, min(BT, T - c1 * BT), wave, lane);
             }
         }
+#if PLOW_KDA_CARRY_PIPE
+        __builtin_amdgcn_s_waitcnt(0);
+#endif
         __syncthreads();
 
         for (unsigned c = 0; c < n_chunks; ++c) {
@@ -273,11 +316,30 @@ __device__ void d_kda_chunk_carry_bt64_regstate(
                 vp[e] = 4u * kg + e < mv ? f2bf_rs<HW_CVT>(bf2f(F.u[e]) - pred[e]) : (bf16)0;
             *reinterpret_cast<u16x4*>(vsm + token * VST + m0 + 4u * kg) = vp;
             PLOW_RS_STAMP(t1);
-            load_rows(F, q, W, U, T, H, h, v0, row0n, wave, token, kg);
+            bf16x8 vB[2], af[2];
+#if PLOW_KDA_CARRY_PIPE
+            /* aqk(c) is consumed here, so aqk(c+1) issues a whole chunk ahead of its use. */
+#pragma unroll
+            for (unsigned s0 = 0; s0 < 2u; ++s0)
+#pragma unroll
+                for (unsigned jj = 0; jj < 8u; ++jj) {
+                    const unsigned s = 32u * s0 + 8u * kg + jj;
+                    const bf16 a = f2bf_rs<HW_CVT>(F.aqk[s0][jj >> 2][jj & 3u]);
+                    af[s0][jj] = __builtin_bit_cast(bf16_t, token < mv && s < valid ? a : (bf16)0);
+                }
+            load_rows(F, q, W, U, T, H, h, v0, row0n, wave, token, kg, INIT == 2);
+            load_aqk(F, Aqk, T, H, h, row0n, wave, token, kg);
+#else
+            load_rows(F, q, W, U, T, H, h, v0, row0n, wave, token, kg, INIT == 2);
+#endif
             __syncthreads();
             PLOW_RS_STAMP(t2);
 
-            bf16x8 vB[2], af[2];
+#if PLOW_KDA_CARRY_PIPE
+#pragma unroll
+            for (unsigned s0 = 0; s0 < 2u; ++s0)
+                vB[s0] = *reinterpret_cast<const bf16x8*>(vsm + token * VST + 32u * s0 + 8u * kg);
+#else
 #pragma unroll
             for (unsigned s0 = 0; s0 < 2u; ++s0) {
                 vB[s0] = *reinterpret_cast<const bf16x8*>(vsm + token * VST + 32u * s0 + 8u * kg);
@@ -288,6 +350,7 @@ __device__ void d_kda_chunk_carry_bt64_regstate(
                     af[s0][jj] = __builtin_bit_cast(bf16_t, token < mv && s < valid ? a : (bf16)0);
                 }
             }
+#endif
             f32x4 local = (f32x4)(0.0f);
 #pragma unroll
             for (unsigned s0 = 0; s0 < 2u; ++s0) local = plow_mfma_bf16_16x16(af[s0], vB[s0], local);
@@ -299,21 +362,42 @@ __device__ void d_kda_chunk_carry_bt64_regstate(
                         f2bf_rs<HW_CVT>(fs[e] + local[e]);
             }
             PLOW_RS_STAMP(t3);
+#if !PLOW_KDA_CARRY_PIPE
             load_aqk(F, Aqk, T, H, h, row0n, wave, token, kg);
+#endif
 
 #pragma unroll
             for (unsigned b = 0; b < 2u; ++b) {
                 f32x4 upd = (f32x4)(0.0f);
 #pragma unroll
                 for (unsigned s0 = 0; s0 < 2u; ++s0) {
+                    bf16x8 kh, kl;
+#if PLOW_KDA_CARRY_KTR16
+                    /* ds_read_b64_tr_b16: lane (token, kg) addresses row 32s0+8kg+token/4,
+                     * columns 16b+4(token%4)..+4; the 16-lane group returns rows +0..3 of
+                     * column 16b+token, so kh[jj] = khi[32s0+8kg+jj][16b+token] as below. */
+                    const unsigned tro = (32u * s0 + 8u * kg + (token >> 2)) * KST + 16u * b +
+                                         4u * (token & 3u);
+                    const kda_bf16x4 h0 = kda_ds_read_tr16(khi + tro);
+                    const kda_bf16x4 h1 = kda_ds_read_tr16(khi + tro + 4u * KST);
+                    const kda_bf16x4 l0 = kda_ds_read_tr16(klo + tro);
+                    const kda_bf16x4 l1 = kda_ds_read_tr16(klo + tro + 4u * KST);
+#pragma unroll
+                    for (unsigned jj = 0; jj < 4u; ++jj) {
+                        kh[jj] = h0[jj];
+                        kh[jj + 4u] = h1[jj];
+                        kl[jj] = l0[jj];
+                        kl[jj + 4u] = l1[jj];
+                    }
+#else
                     const bf16* hp = khi + (32u * s0 + 8u * kg) * KST + 16u * b + token;
                     const bf16* lp = klo + (32u * s0 + 8u * kg) * KST + 16u * b + token;
-                    bf16x8 kh, kl;
 #pragma unroll
                     for (unsigned jj = 0; jj < 8u; ++jj) {
                         kh[jj] = __builtin_bit_cast(bf16_t, hp[jj * KST]);
                         kl[jj] = __builtin_bit_cast(bf16_t, lp[jj * KST]);
                     }
+#endif
                     upd = plow_mfma_bf16_16x16(kh, vB[s0], upd);
                     upd = plow_mfma_bf16_16x16(kl, vB[s0], upd);
                 }

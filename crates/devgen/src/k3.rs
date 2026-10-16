@@ -787,8 +787,15 @@ fn emit_k3_linear_rows(
     // runs on the DECODE object, where AMD's dispatch `default:` writes NOTHING rather than
     // trapping. The packet then leaves its output holding whatever the arena held — the run
     // completes, every row is finite and plausible, and every row is wrong.
-    let gemv_arm = t == 1 || seq_rows;
-    let (op, gemm_blocks, gemm_variant) = if gemv_arm {
+    // PLOW_GLM_DECODE_GEMM_ROWS: a wide batched-decode rung takes the prefill tile family
+    // instead (row-pure, so the per-sequence rows are just rows). Never with a norm fold.
+    let tile = (seq_rows && t > 1 && fold.is_none())
+        .then(|| crate::mla::glm_decode_gemm_tile(t, n, k, n_cu))
+        .flatten();
+    let gemv_arm = tile.is_none() && (t == 1 || seq_rows);
+    let (op, gemm_blocks, gemm_variant) = if let Some(tile) = tile {
+        (tile, n_cu, 0)
+    } else if gemv_arm {
         (DevOp::Gemv, n_cu, 0)
     } else {
         crate::pick_gemm_emit_plan(t, n, k, n_cu, kernelcaps::QuantScheme::None)
@@ -1465,6 +1472,7 @@ pub fn emit_k3_latent_moe(
             tp.slot_b,
             part,
             c.top_k,
+            crate::TENSOR_NONE,
         );
     } else if tp.on() {
         c_cmb = crate::emit_xreduce(

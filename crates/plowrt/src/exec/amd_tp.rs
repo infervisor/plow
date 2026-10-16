@@ -188,6 +188,54 @@ use crate::exec::tp::{
     gate_error, is_deadline_status, PeerLayout, TpGroup, XctrReset, PARTIAL_SLOTS, XCTR_STRIDE,
 };
 use crate::{Result, RuntimeError};
+
+/// `PLOW_TP_PAR_HOST`: run the per-rank synchronous host copies of a decode step (staging,
+/// token readback, id seeding) on one thread per rank, so their SDMA round trips overlap.
+fn par_host() -> bool {
+    crate::config::RuntimeConfig::get().amd.tp_par_host
+}
+
+fn each_rank<T: Send>(
+    ranks: &mut [AmdEngine],
+    f: impl Fn(&mut AmdEngine) -> Result<T> + Sync,
+) -> Result<Vec<T>> {
+    if !par_host() {
+        return ranks.iter_mut().map(&f).collect();
+    }
+    let f = &f;
+    if super::rank_pool::enabled() {
+        let mut out: Vec<Option<Result<T>>> = (0..ranks.len()).map(|_| None).collect();
+        let jobs: Vec<Box<dyn FnOnce() + Send + '_>> = ranks
+            .iter_mut()
+            .zip(out.iter_mut())
+            .map(|(e, slot)| Box::new(move || *slot = Some(f(e))) as Box<dyn FnOnce() + Send + '_>)
+            .collect();
+        if !super::rank_pool::run(jobs) {
+            return Err(RuntimeError::Device("rank host worker panicked".into()));
+        }
+        return out.into_iter().map(|r| r.expect("rank pool job ran")).collect();
+    }
+    std::thread::scope(|scope| {
+        let handles: Vec<_> = ranks.iter_mut().map(|e| scope.spawn(move || f(e))).collect();
+        let mut out = Vec::with_capacity(handles.len());
+        let mut first = None;
+        for h in handles {
+            match h.join() {
+                Ok(Ok(v)) => out.push(v),
+                Ok(Err(e)) => {
+                    first.get_or_insert(e);
+                }
+                Err(_) => {
+                    first.get_or_insert(RuntimeError::Device("rank host thread panicked".into()));
+                }
+            }
+        }
+        match first {
+            Some(e) => Err(e),
+            None => Ok(out),
+        }
+    })
+}
 use packet::dev::PrefillSpan;
 
 /// Tokens between full all-rank readbacks — see [`AmdTpGroup::complete_decode`]
@@ -399,6 +447,8 @@ pub struct AmdTpGroup {
     audit: bool,
     audit_direct: bool,
     audit_compact: bool,
+    /// The last decode submit appended the compact audit to every rank's chain.
+    tail_audited: bool,
     prefill_audit_direct: bool,
     prefill_audit_pinned: bool,
     index_tp_status: bool,
@@ -509,8 +559,19 @@ impl AmdTpGroup {
     }
 
     fn finish_ranks(&self) -> Result<()> {
-        let result =
-            super::chain_admission::finish_all(self.ranks.len(), |rank| self.ranks[rank].drain());
+        let result = if crate::obs::tick::trace_on() {
+            let start = std::time::Instant::now();
+            let mut done = Vec::with_capacity(self.ranks.len());
+            let result = super::chain_admission::finish_all(self.ranks.len(), |rank| {
+                let r = self.ranks[rank].drain();
+                done.push(std::time::Instant::now());
+                r
+            });
+            crate::obs::tick::trace_drain(start, &done);
+            result
+        } else {
+            super::chain_admission::finish_all(self.ranks.len(), |rank| self.ranks[rank].drain())
+        };
         if result.is_err() {
             for rank in &self.ranks {
                 rank.abort_replay();
@@ -821,6 +882,7 @@ impl AmdTpGroup {
             gate_expect,
             audit: !crate::config::RuntimeConfig::get().amd.tp_no_audit,
             audit_direct: crate::config::RuntimeConfig::get().amd.tp_audit_direct,
+            tail_audited: false,
             prefill_audit_direct: crate::config::RuntimeConfig::get()
                 .amd
                 .tp_prefill_audit_direct,
@@ -947,6 +1009,19 @@ impl AmdTpGroup {
         let all = agreement_due(&mut self.agree_tick, self.agree_every);
         let rows = (self.ranks[0].prog_t(self.cur_dp) as usize).min(batch);
         dstep::timed(&dstep::READ, || {
+            if all && par_host() {
+                let mut all_ids = each_rank(&mut self.ranks, |e| e.read_sampled_batched(rows))?;
+                if let Some(r) = all_ids.iter().position(|p| *p != all_ids[0]) {
+                    return Err(RuntimeError::Device(format!(
+                        "TP ranks disagree on a batched decode step: rank 0 sampled \
+                         {:?}, rank {r} sampled {:?} — the all-reduce is wrong",
+                        all_ids[0], all_ids[r]
+                    )));
+                }
+                let mut ids = all_ids.swap_remove(0);
+                ids.resize(batch, 0);
+                return Ok(ids);
+            }
             let mut ids = self.ranks[0].read_sampled_batched(rows)?;
             if all {
                 for (r, rank) in self.ranks.iter_mut().enumerate().skip(1) {
@@ -996,6 +1071,17 @@ impl AmdTpGroup {
         self.drain_and_audit()?;
         if agreement_due(&mut self.agree_tick, self.agree_every) {
             dstep::timed(&dstep::READ, || {
+                if par_host() {
+                    let all = each_rank(&mut self.ranks, |e| e.read_sampled_batched(rows))?;
+                    return match all.iter().position(|p| *p != all[0]) {
+                        Some(r) => Err(RuntimeError::Device(format!(
+                            "TP ranks disagree on deferred batched decode step: rank 0 sampled \
+                             {:?}, rank {r} sampled {:?}",
+                            all[0], all[r]
+                        ))),
+                        None => Ok(()),
+                    };
+                }
                 let ids = self.ranks[0].read_sampled_batched(rows)?;
                 for (r, rank) in self.ranks.iter_mut().enumerate().skip(1) {
                     let peer = rank.read_sampled_batched(rows)?;
@@ -1108,9 +1194,9 @@ impl AmdTpGroup {
         let counter_dbuf = self.ranks[0].tp_counter_double_buffered();
         // Preparation can fail without changing bank state. Only after EVERY
         // rank is prepared may TP select the banks this dispatch will capture.
-        for e in &mut self.ranks {
-            dstep::timed(&dstep::PREPARE, || e.decode_prepare_batched(pos, kvlen))?;
-        }
+        dstep::timed(&dstep::PREPARE, || {
+            each_rank(&mut self.ranks, |e| e.decode_prepare_batched(pos, kvlen))
+        })?;
         if let Some(rank) = self.ranks.iter().position(|e| !e.tp_counter_bank_ready(dp)) {
             return Err(RuntimeError::Device(format!(
                 "rank {rank} program {dp} has no clean inactive counter bank; refusing to \
@@ -1146,12 +1232,25 @@ impl AmdTpGroup {
         let mut i = 0usize;
         let t0 = dstep::on().then(std::time::Instant::now);
         let mut launched_at: Option<std::time::Instant> = None;
+        // Each rank's audit reads only its own xctr, whose gates that rank waited on before its
+        // chain could end, so it can ride the chain tail instead of a second submit and drain.
+        let tail_audit = self.audit
+            && self.audit_compact
+            && crate::config::RuntimeConfig::get().amd.tp_audit_tail;
+        self.tail_audited = false;
+        let audit_args: Vec<(u64, u64)> = self
+            .group
+            .ranks()
+            .iter()
+            .map(|r| (r.xctr(), r.xstatus()))
+            .collect();
+        let (n_xctr, n_gpu) = (self.group.layout().n_xctr, self.group.n_gpu());
         // Prepare every rank's complete packet chain before publishing any doorbell. Ringing each
         // segment as it is written lets an early GPU run ahead of the host's segment-major loop;
         // at wide rungs that can put peers in different collective segments.
         super::chain_admission::reserve_all(
             &mut self.chain_tickets,
-            |rank| ranks[rank].preflight_decode_replay(dp),
+            |rank| ranks[rank].preflight_decode_replay(dp, tail_audit as usize),
             |rank, ticket| ranks[rank].begin_decode_replay_admitted(ticket),
             |rank| ranks[rank].abort_replay(),
         )?;
@@ -1171,7 +1270,33 @@ impl AmdTpGroup {
             // Their only ordering requirement is local segment order, so fill the eight independent
             // rank queues in parallel. This removes the serialized host submission term without
             // allowing an early rank to enter a collective before its peers are ready.
-            if n_segments > 1 {
+            if n_segments > 1 && super::rank_pool::enabled() {
+                let mut res: Vec<Result<()>> = (0..ranks.len()).map(|_| Ok(())).collect();
+                let jobs: Vec<Box<dyn FnOnce() + Send + '_>> = ranks
+                    .iter_mut()
+                    .zip(res.iter_mut())
+                    .enumerate()
+                    .map(|(rank, (e, slot))| {
+                        Box::new(move || {
+                            let k = e.decode_kernel_for(dp);
+                            for seg in 1..n_segments {
+                                if let Err(err) = e.enqueue_decode_segment(dp, seg, k) {
+                                    *slot = Err(RuntimeError::Device(format!(
+                                        "rank {rank} decode replay segment {seg}: {err}"
+                                    )));
+                                    return;
+                                }
+                            }
+                        }) as Box<dyn FnOnce() + Send + '_>
+                    })
+                    .collect();
+                if !super::rank_pool::run(jobs) {
+                    return Err(RuntimeError::Device("decode replay fill worker panicked".into()));
+                }
+                if let Some(error) = res.into_iter().find_map(|r| r.err()) {
+                    return Err(error);
+                }
+            } else if n_segments > 1 {
                 std::thread::scope(|scope| -> Result<()> {
                     let handles: Vec<_> = ranks
                         .iter_mut()
@@ -1208,6 +1333,11 @@ impl AmdTpGroup {
                     }
                 })?;
             }
+            if tail_audit {
+                for (e, &(xctr, status)) in ranks.iter().zip(&audit_args) {
+                    e.enqueue_xaudit(dp, xctr, n_xctr, n_gpu, status)?;
+                }
+            }
             for e in &*ranks {
                 e.preflight_replay_commit()?;
             }
@@ -1222,9 +1352,11 @@ impl AmdTpGroup {
             }
             return Err(error);
         }
+        self.tail_audited = tail_audit;
         if let Some(z) = launched_at {
             dstep::ENQUEUE.add(z.elapsed().as_nanos() as u64);
         }
+        crate::obs::tick::trace_enqueued();
         let in_flight_enqueued = crate::obs::tick::on().then(|| self.ranks[0].in_flight());
         // Do not put this work inside the launch closure: every rank must be
         // resident before ~1.5 ms of TP8 counter clears can begin. These are
@@ -1287,7 +1419,7 @@ impl AmdTpGroup {
         let all = agreement_due(&mut self.agree_tick, self.agree_every);
         dstep::timed(&dstep::READ, || {
             if all {
-                self.ranks.iter_mut().map(|e| e.read_sampled()).collect()
+                each_rank(&mut self.ranks, |e| e.read_sampled())
             } else {
                 Ok(vec![self.ranks[0].read_sampled()?])
             }
@@ -1304,13 +1436,22 @@ impl AmdTpGroup {
         // The decode is on the GPU: a prefix publish deferred from this tick's chunk runs here.
         let published = self.flush_deferred_publish();
         dstep::timed(&dstep::DRAIN, || -> Result<()> { self.finish_ranks() })?;
+        let tail_audited = std::mem::take(&mut self.tail_audited);
         if self.audit {
             // The rung that actually launched, not the widest — a narrow rung emits fewer
             // collectives and auditing it against the widest program's expectations would
             // report a timeout on gates it never armed.
             let dp = self.cur_dp;
             dstep::timed(&dstep::AUDIT, || {
-                if self.audit_compact {
+                if self.audit_compact && tail_audited {
+                    match self.group.audit_xstatus_direct() {
+                        Ok(()) => Ok(()),
+                        Err(status) => self
+                            .group
+                            .audit_xctr_direct(&self.gate_expect[dp])
+                            .and(Err(status)),
+                    }
+                } else if self.audit_compact {
                     let submitted =
                         self.ranks
                             .iter()
@@ -1472,10 +1613,11 @@ impl AmdTpGroup {
     /// one at the same point in the token stream — a rank that skipped it would resume from a
     /// state one prefix behind its peers and the group would disagree from the first token.
     pub fn snapshot_carried(&mut self, slot: usize, rows: u32) -> Result<()> {
-        for e in &mut self.ranks {
-            e.snapshot_carried(slot, rows)?;
-        }
-        Ok(())
+        self.each_rank_parallel(|e| e.snapshot_carried(slot, rows))
+    }
+
+    pub fn snapshot_carried_many(&mut self, items: &[(usize, u32)]) -> Result<()> {
+        self.each_rank_parallel(|e| e.snapshot_carried_many(items))
     }
 
     pub fn restore_carried(&mut self, slot: usize) -> Result<()> {
@@ -1486,10 +1628,35 @@ impl AmdTpGroup {
     }
 
     pub fn restore_carried_since(&mut self, slot: usize, dirty_until: u32) -> Result<()> {
-        for e in &mut self.ranks {
-            e.restore_carried_since(slot, dirty_until)?;
-        }
-        Ok(())
+        self.each_rank_parallel(|e| e.restore_carried_since(slot, dirty_until))
+    }
+
+    /// Run `f` on every rank at once. Each rank's snapshot copy is a batch of ~300 small DMA
+    /// copies behind one blocking completion wait (~1.6 ms); serial over eight ranks that wait
+    /// was ~13 ms of every prefix-armed prompt.
+    fn each_rank_parallel(
+        &mut self,
+        f: impl Fn(&mut AmdEngine) -> Result<()> + Sync,
+    ) -> Result<()> {
+        let f = &f;
+        std::thread::scope(|scope| {
+            let handles: Vec<_> = self
+                .ranks
+                .iter_mut()
+                .map(|e| scope.spawn(move || f(e)))
+                .collect();
+            let mut first = None;
+            for handle in handles {
+                let result = handle
+                    .join()
+                    .map_err(|_| RuntimeError::Device("rank thread panicked".into()))
+                    .and_then(|result| result);
+                if let Err(error) = result {
+                    first.get_or_insert(error);
+                }
+            }
+            first.map_or(Ok(()), Err)
+        })
     }
 
     /// `all`, not `any`: `attach_shared_prefixes` requires every rank to carry the cache, so a
@@ -1563,12 +1730,21 @@ impl AmdTpGroup {
         }
     }
 
+    pub fn vmm_prefix_probe(&self) -> Option<crate::memory::vmm::PrefixProbe> {
+        self.ranks.first().and_then(|r| r.vmm_prefix_probe())
+    }
+
+    pub fn vmm_stats_handle(&self) -> Option<crate::memory::vmm::VmmStatsHandle> {
+        self.ranks.first().and_then(|r| r.vmm_stats_handle())
+    }
+
+    pub fn kv_row_bytes(&self) -> u64 {
+        self.ranks.iter().map(|r| r.kv_row_bytes()).sum()
+    }
+
     /// Publish the per-row parked mask on every rank. See `AmdEngine::upload_parked`.
     pub fn upload_parked(&mut self, parked: &[u32]) -> Result<()> {
-        for e in &mut self.ranks {
-            e.upload_parked(parked)?;
-        }
-        Ok(())
+        each_rank(&mut self.ranks, |e| e.upload_parked(parked)).map(drop)
     }
 
     /// Stage the same packed-prefill metadata on every rank. Any partial failure clears all
@@ -1782,6 +1958,16 @@ impl AmdTpGroup {
                 .all(|rank| rank.packed_prefill_prog_capable(prog))
     }
 
+    /// [`AmdEngine::clone_prefix`] on every rank; `true` only if every rank took it (a rank that
+    /// did not has no snapshot, so `has_snapshot` keeps the group from resuming).
+    pub fn clone_prefix(&mut self, src: usize, dst: usize) -> Result<bool> {
+        let mut all = true;
+        for e in &mut self.ranks {
+            all &= e.clone_prefix(src, dst)?;
+        }
+        Ok(all)
+    }
+
     pub fn has_snapshot(&self, slot: usize) -> bool {
         self.ranks.iter().all(|e| e.has_snapshot(slot))
     }
@@ -1815,6 +2001,22 @@ impl AmdTpGroup {
     /// Every rank's sampled id after a prefill's final chunk.
     pub fn read_sampled_all(&mut self) -> Result<Vec<u32>> {
         self.ranks.iter_mut().map(|e| e.read_sampled()).collect()
+    }
+
+    /// The first `n` sampled ids (a span-sampling packed prefill's per-span tokens), which every
+    /// rank must agree on.
+    pub fn read_sampled_rows_agreed(&mut self, n: usize) -> Result<Vec<u32>> {
+        let first = self.ranks[0].read_sampled_batched(n)?;
+        for rank in 1..self.ranks.len() {
+            let ids = self.ranks[rank].read_sampled_batched(n)?;
+            if let Some(i) = (0..n).find(|&i| ids[i] != first[i]) {
+                return Err(RuntimeError::Device(format!(
+                    "RANKS DISAGREE on packed span {i}: rank 0 sampled {}, rank {rank} sampled {}",
+                    first[i], ids[i]
+                )));
+            }
+        }
+        Ok(first)
     }
 
     /// Run the prefill chunks covering `[from, to)` on every rank.
@@ -1885,6 +2087,65 @@ impl AmdTpGroup {
         };
         self.prefill_span(prompt, from, n)?;
         self.ranks.iter_mut().map(|e| e.read_sampled()).collect()
+    }
+
+    /// The bare collective launcher, for a packet that carries no tokens: a single-block PREFILL
+    /// RUNG, whose entry is an activation the caller uploaded with `write_tensor` and whose exit is
+    /// one it reads back. `prefill_chunk` cannot serve that -- it begins with `prefill_prepare`,
+    /// which stages a prompt and a KV mapping a rung has neither of.
+    pub fn run_rung(&mut self, p: usize) -> Result<()> {
+        self.run_rung_upto(p, usize::MAX)
+    }
+
+    /// Run program `p`, but enqueue only its first `max_segs` SEGMENTS.
+    pub fn run_rung_upto(&mut self, p: usize, max_segs: usize) -> Result<()> {
+        if p >= self.ranks[0].n_programs() {
+            return Err(RuntimeError::Device(format!(
+                "program {p} does not exist (the packet has {})",
+                self.ranks[0].n_programs()
+            )));
+        }
+        for e in &mut self.ranks {
+            e.rearm_prog(p)?;
+        }
+        self.group.zero_xctr()?;
+        let launches = self.ranks[0].prog_dispatch(p).launches();
+        if launches == 0 {
+            return Err(RuntimeError::Device(format!(
+                "program {p} has no segments to launch -- an empty program, such as the decode placeholder a prefill-only rung carries"
+            )));
+        }
+        let n_ranks = self.ranks.len();
+        let phase_replay = self.ranks[0].graph_phase_replay(p);
+        if self
+            .ranks
+            .iter()
+            .any(|rank| rank.graph_phase_replay(p) != phase_replay)
+        {
+            return Err(RuntimeError::Device(
+                "graph phase-object selection differs across TP ranks".into(),
+            ));
+        }
+        if phase_replay {
+            for rank in &self.ranks {
+                rank.begin_graph_phase_replay(p)?;
+            }
+        }
+        for (seg, rank) in segment_major_order(launches, n_ranks) {
+            if seg >= max_segs {
+                continue;
+            }
+            self.ranks[rank].enqueue_segment(p, seg)?;
+        }
+        if phase_replay {
+            for rank in &self.ranks {
+                rank.commit_graph_phase_replay()?;
+            }
+        }
+        for e in &self.ranks {
+            e.drain()?;
+        }
+        Ok(())
     }
 
     /// The chunk plan for a prompt — a server chunks prefill itself, so it needs
@@ -1998,6 +2259,8 @@ impl AmdTpGroup {
             }
             let enqueue_ns = t.elapsed().as_nanos() as u64;
             ttft::PF_ENQUEUE.add(enqueue_ns);
+            crate::obs::tick::trace_enqueued();
+            crate::obs::tick::trace_rung(self.ranks[0].prog_t(step.prog));
 
             // The GPU is ~1 s behind the host here: map the next KV block on every rank now,
             // not in the decode that follows the chunk (`AmdEngine::prefill_map_ahead`).
@@ -2012,6 +2275,8 @@ impl AmdTpGroup {
 
             let t = std::time::Instant::now();
             let mut rank_drain_ns = Vec::with_capacity(if tick_log { self.ranks.len() } else { 0 });
+            let trace = crate::obs::tick::trace_on();
+            let mut rank_done = Vec::with_capacity(if trace { self.ranks.len() } else { 0 });
             // Drain EVERY rank even after one fails: `?` on the first error returned with ranks
             // 1..n still running, the same rebase-under-in-flight-work hazard as above.
             let mut drain_err = None;
@@ -2022,6 +2287,12 @@ impl AmdTpGroup {
                 if tick_log {
                     rank_drain_ns.push(t.elapsed().as_nanos() as u64);
                 }
+                if trace {
+                    rank_done.push(std::time::Instant::now());
+                }
+            }
+            if trace {
+                crate::obs::tick::trace_drain(t, &rank_done);
             }
             if let Some(err) = drain_err {
                 for rank in &self.ranks {
@@ -2111,13 +2382,14 @@ impl AmdTpGroup {
             let drain_ns = drain_begin.elapsed().as_nanos() as u64;
             if let Some(family) = family {
                 eprintln!(
-                    "PLOW_PREFILL_SEG_TIMING program={} bucket={} c0={} clen={} segment={} family={} enqueue_us={:.3} critical_us={:.3}",
+                    "PLOW_PREFILL_SEG_TIMING program={} bucket={} c0={} clen={} segment={} family={} ops={} enqueue_us={:.3} critical_us={:.3}",
                     step.prog,
                     self.ranks[0].prog_t(step.prog),
                     step.c0,
                     step.clen,
                     seg,
                     family,
+                    self.ranks[0].segment_ops(step.prog, seg),
                     (enqueued - submit_begin).as_secs_f64() * 1e6,
                     submit_begin.elapsed().as_secs_f64() * 1e6,
                 );
@@ -2272,26 +2544,50 @@ impl AmdTpGroup {
 
         let launches = self.ranks[0].prog_dispatch(prog).launches();
         ttft::PF_SEGMENTS.tally(launches as u64);
-        for seg in 0..launches {
+        crate::obs::tick::trace_rung(rung);
+        // PLOW_AMD_PACKED_SEG_MAJOR: every segment on every rank, one drain, as the isolated
+        // chunk's segment-major path; each rank's queue keeps its local segment order.
+        if crate::config::RuntimeConfig::get().amd.packed_seg_major
+            && self.prefill_capture.is_none()
+        {
             let t = std::time::Instant::now();
-            self.enqueue_segment_all(prog, seg)?;
+            for seg in 0..launches {
+                self.enqueue_segment_all(prog, seg)?;
+            }
             ttft::PF_ENQUEUE.add(t.elapsed().as_nanos() as u64);
+            crate::obs::tick::trace_enqueued();
             let t = std::time::Instant::now();
             self.finish_ranks()?;
             ttft::PF_DRAIN.add(t.elapsed().as_nanos() as u64);
+        } else {
+            let segment_timing = crate::config::RuntimeConfig::get().amd.prefill_seg_timing;
+            for seg in 0..launches {
+                let t = std::time::Instant::now();
+                self.enqueue_segment_all(prog, seg)?;
+                ttft::PF_ENQUEUE.add(t.elapsed().as_nanos() as u64);
+                crate::obs::tick::trace_enqueued();
+                let t_drain = std::time::Instant::now();
+                self.finish_ranks()?;
+                ttft::PF_DRAIN.add(t_drain.elapsed().as_nanos() as u64);
+                if segment_timing {
+                    eprintln!(
+                        "PLOW_PREFILL_SEG_TIMING packed program={prog} bucket={rung} spans={} rows={} segment={seg} family={} enqueue_us={:.3} critical_us={:.3}",
+                        spans.len(),
+                        spans.iter().map(|s| s.n_rows).sum::<u32>(),
+                        self.ranks[0].prefill_segment_family(prog, seg),
+                        (t_drain - t).as_secs_f64() * 1e6,
+                        t.elapsed().as_secs_f64() * 1e6,
+                    );
+                }
+            }
         }
-        if self.audit {
-            self.group.audit_xctr(&self.gate_expect[prog])?;
-        }
+        self.audit_prefill_counters(prog)?;
         Ok(())
     }
 
     /// Seed `in.ids` on every rank — needed once, before the first decode step.
     pub fn seed_ids(&mut self, ids: &[u32]) -> Result<()> {
-        for e in &mut self.ranks {
-            e.seed_ids(ids)?;
-        }
-        Ok(())
+        each_rank(&mut self.ranks, |e| e.seed_ids(ids)).map(drop)
     }
 
     /// Every rank sampled the same token, or a report of who disagreed.
@@ -2398,27 +2694,51 @@ const XR_FOLD_MAX_K: u32 = 16;
 
 fn check_xr_tagged_insts(pi: usize, insts: &[packet::dev::DevInst64], hidden: u32) -> Result<()> {
     use packet::dev::DevOp;
+    let max_w = PeerLayout::xr_tag_max_width_cfg();
+    let widened = max_w > PeerLayout::XR_TAG_MAX_WIDTH;
     {
         let mut prev: Option<u32> = None;
         for d in insts {
             if d.op != DevOp::XReduce as u16 {
                 continue;
             }
+            // The HyperConnPost fold (t2) always runs the gate one-shot.
+            if d.t[2] != packet::dev::TENSOR_NONE16 {
+                continue;
+            }
             let (n, gate, gcols, row_w) = (d.i[0], d.i[3], d.i[5], d.i[6]);
-            let bad = n == 0
-                || n > hidden
-                || hidden > PeerLayout::XR_TAG_MAX_WIDTH
-                || gcols > hidden
-                || (gcols != 0 && row_w != n)
-                || (d.i[7] != 0 && d.t[1] == packet::dev::TENSOR_NONE16)
-                || d.i[7] > XR_FOLD_MAX_K
-                || gate >= 0xffff;
-            if bad {
-                return Err(RuntimeError::Device(format!(
-                    "program {pi}: XReduce n={n} gate={gate} gcols={gcols} row_w={row_w} is \
-                     outside the tagged one-shot contract (hidden={hidden}, slot holds {})",
-                    PeerLayout::XR_TAG_MAX_WIDTH
-                )));
+            let plain = gcols == 0 && d.i[7] == 0;
+            if n > max_w && plain {
+                // A plain collective wider than the slot (a batched decode rung's [rows, hidden])
+                // runs the gate one-shot on the device (`xrt_fits`). Under a widened slot a
+                // ragged batch (kvrow rescales i0 to live rows) can shrink it into the tagged
+                // range, so its gate still takes part in the parity contract there.
+                if !widened || hidden == 0 || n % hidden != 0 || hidden > max_w {
+                    continue;
+                }
+                if gate >= 0xffff {
+                    return Err(RuntimeError::Device(format!(
+                        "program {pi}: XReduce n={n} gate={gate} does not fit the 16-bit tag"
+                    )));
+                }
+            } else {
+                // A plain batched message (`rows * hidden`) may ride a widened slot.
+                let bad = n == 0
+                    || hidden == 0
+                    || (n > hidden && (!plain || n % hidden != 0))
+                    || hidden > max_w
+                    || gcols > hidden
+                    || (gcols != 0 && row_w != n)
+                    || (d.i[7] != 0 && d.t[1] == packet::dev::TENSOR_NONE16)
+                    || d.i[7] > XR_FOLD_MAX_K
+                    || gate >= 0xffff;
+                if bad {
+                    return Err(RuntimeError::Device(format!(
+                        "program {pi}: XReduce n={n} gate={gate} gcols={gcols} row_w={row_w} is \
+                         outside the tagged one-shot contract (hidden={hidden}, slot holds {})",
+                        max_w
+                    )));
+                }
             }
             if let Some(g) = prev {
                 if (g ^ gate) & 1 == 0 {
@@ -2772,6 +3092,7 @@ mod tests {
         let xr = |n: u32, gate: u32, gcols: u32, row_w: u32| DevInst64 {
             op: DevOp::XReduce as u16,
             blocks: 14,
+            t: [packet::dev::TENSOR_NONE16; 8],
             i: [n, 8, 0, gate, 0, gcols, row_w, 0],
             ..Default::default()
         };
@@ -2798,6 +3119,17 @@ mod tests {
         assert!(check_xr_tagged_insts(0, &[xr(7169, 0, 0, 0)], 7168).is_err());
         assert!(check_xr_tagged_insts(0, &[xr(7168, 0, 896, 14336)], 7168).is_err());
         assert!(check_xr_tagged_insts(0, &[xr(7168, 0xffff, 0, 0)], 7168).is_err());
+        // A batched rung's [rows, hidden] message is past the slot: the device keeps the gate
+        // one-shot for it, so it neither fails the width check nor takes part in the parity.
+        let rung8 = vec![xr(8 * 4096, 0, 0, 0), xr(8 * 4096, 2, 0, 0)];
+        assert!(check_xr_tagged_insts(0, &rung8, 4096).is_ok());
+        assert!(check_xr_tagged_insts(0, &[xr(8 * 4096, 0, 512, 8 * 4096)], 4096).is_err());
+        // The HyperConnPost fold (t2) always runs the gate one-shot: outside the contract.
+        let mut fold = xr(2 * 4096, 0, 0, 0);
+        fold.t[2] = 7;
+        assert!(
+            check_xr_tagged_insts(0, &[xr(4096, 0, 0, 0), fold, xr(4096, 1, 0, 0)], 4096).is_ok()
+        );
     }
 
     #[test]

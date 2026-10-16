@@ -248,6 +248,173 @@ const HSA_EXECUTABLE_SYMBOL_INFO_KERNEL_PRIVATE_SEGMENT_SIZE: u32 = 14;
 const QUEUE_SIZE: u32 = 4096;
 const KARG_SLOT: usize = 512;
 const CHAIN_IDLE: u64 = u64::MAX;
+
+/// `PLOW_AMD_DISPATCH_TIMES=<prefix>`: every dispatch completes its own slot signal on a
+/// profiling-enabled queue; harvested start/end (system ns) go to `<prefix>.dev<N>.csv`. The
+/// newest packet's signal stands in for the counting signal: barrier bits order completion.
+struct DispatchTimes {
+    sigs: Vec<HsaSignal>,
+    kobj: Vec<AtomicU64>,
+    /// Host system-domain timestamps (ns, `HSA_SYSTEM_INFO_TIMESTAMP`, the domain the dispatch
+    /// times are reported in): header publish, and the doorbell write that covered the packet.
+    host_pub: Vec<AtomicU64>,
+    host_door: Vec<AtomicU64>,
+    written: AtomicU64,
+    out: parking_lot::Mutex<(u64, std::io::BufWriter<std::fs::File>)>,
+}
+
+impl DispatchTimes {
+    unsafe fn new(
+        drv: &HsaDriver,
+        queue: *mut HsaQueue,
+        agent: HsaAgent,
+        prefix: &str,
+        dev: u8,
+    ) -> Option<Box<Self>> {
+        if (drv.hsa_amd_profiling_set_profiler_enabled)(queue, 1) != HSA_STATUS_SUCCESS {
+            tracing::warn!("PLOW_AMD_DISPATCH_TIMES: profiler enable failed");
+            return None;
+        }
+        let mut sigs = Vec::with_capacity(QUEUE_SIZE as usize);
+        for _ in 0..QUEUE_SIZE {
+            let mut s = HsaSignal { handle: 0 };
+            // One GPU consumer: a polled (non-interrupt) signal, so 4096 of them cost no events.
+            if (drv.hsa_signal_create)(0, 1, &agent, &mut s) != HSA_STATUS_SUCCESS {
+                return None;
+            }
+            sigs.push(s);
+        }
+        let f = std::fs::File::create(format!("{prefix}.dev{dev}.csv")).ok()?;
+        Some(Box::new(Self {
+            sigs,
+            kobj: (0..QUEUE_SIZE).map(|_| AtomicU64::new(0)).collect(),
+            host_pub: (0..QUEUE_SIZE).map(|_| AtomicU64::new(0)).collect(),
+            host_door: (0..QUEUE_SIZE).map(|_| AtomicU64::new(0)).collect(),
+            written: AtomicU64::new(0),
+            out: parking_lot::Mutex::new((0, std::io::BufWriter::new(f))),
+        }))
+    }
+
+    fn slot(&self, idx: u64) -> usize {
+        (idx & (QUEUE_SIZE as u64 - 1)) as usize
+    }
+
+    fn arm(&self, drv: &HsaDriver, idx: u64, kobj: u64) -> HsaSignal {
+        let s = self.sigs[self.slot(idx)];
+        self.kobj[self.slot(idx)].store(kobj, Ordering::Relaxed);
+        unsafe { (drv.hsa_signal_store_screlease)(s, 1) };
+        self.written.fetch_max(idx + 1, Ordering::AcqRel);
+        s
+    }
+
+    fn host_now(drv: &HsaDriver) -> u64 {
+        let mut t = 0u64;
+        // HSA_SYSTEM_INFO_TIMESTAMP
+        unsafe { (drv.hsa_system_get_info)(2, &mut t as *mut u64 as *mut c_void) };
+        t
+    }
+
+    fn published(&self, drv: &HsaDriver, idx: u64) {
+        self.host_pub[self.slot(idx)].store(Self::host_now(drv), Ordering::Relaxed);
+    }
+
+    /// A doorbell write covering every packet up to `last`.
+    fn rang(&self, drv: &HsaDriver, last: u64) {
+        self.host_door[self.slot(last)].store(Self::host_now(drv), Ordering::Relaxed);
+    }
+
+    fn name(&self, kobj: u64, name: &str) {
+        use std::io::Write;
+        let _ = writeln!(self.out.lock().1, "#k,{kobj},{name}");
+    }
+
+    fn harvest(&self, drv: &HsaDriver, agent: HsaAgent, upto: u64) {
+        use std::io::Write;
+        let mut g = self.out.lock();
+        let from = g.0.max(upto.saturating_sub(QUEUE_SIZE as u64));
+        for idx in from..upto {
+            let mut t = [0u64; 2];
+            let rc = unsafe {
+                (drv.hsa_amd_profiling_get_dispatch_time)(agent, self.sigs[self.slot(idx)], &mut t)
+            };
+            if rc == HSA_STATUS_SUCCESS {
+                let k = self.kobj[self.slot(idx)].load(Ordering::Relaxed);
+                let _ = writeln!(g.1, "{idx},{},{},{k}", t[0], t[1]);
+                let _ = writeln!(
+                    g.1,
+                    "#h,{idx},{},{}",
+                    self.host_pub[self.slot(idx)].swap(0, Ordering::Relaxed),
+                    self.host_door[self.slot(idx)].swap(0, Ordering::Relaxed)
+                );
+            }
+        }
+        if upto >> 14 != g.0 >> 14 {
+            let _ = g.1.flush();
+        }
+        g.0 = g.0.max(upto);
+    }
+
+    fn load(&self, drv: &HsaDriver, agent: HsaAgent) -> i64 {
+        let w = self.written.load(Ordering::Acquire);
+        if w == 0 {
+            return 0;
+        }
+        let v = unsafe { (drv.hsa_signal_load_scacquire)(self.sigs[self.slot(w - 1)]) };
+        if v == 0 {
+            self.harvest(drv, agent, w);
+        }
+        v
+    }
+
+    fn wait(&self, drv: &HsaDriver, agent: HsaAgent, state: u32) -> i64 {
+        let w = self.written.load(Ordering::Acquire);
+        if w == 0 {
+            return 0;
+        }
+        let v = unsafe {
+            (drv.hsa_signal_wait_scacquire)(
+                self.sigs[self.slot(w - 1)],
+                HSA_SIGNAL_CONDITION_LT,
+                1,
+                u64::MAX,
+                state,
+            )
+        };
+        if v == 0 {
+            self.harvest(drv, agent, w);
+        }
+        v
+    }
+}
+
+struct PktKnobs {
+    tail_signal: bool,
+    karg_chain_flush: bool,
+    acquire: u32,
+    release: u32,
+}
+
+fn pkt_knobs() -> &'static PktKnobs {
+    static K: std::sync::OnceLock<PktKnobs> = std::sync::OnceLock::new();
+    K.get_or_init(|| {
+        let amd = &crate::config::RuntimeConfig::get().amd;
+        let (acquire, release) = amd
+            .pkt_fence
+            .as_deref()
+            .and_then(|v| {
+                let (a, r) = v.split_once(',')?;
+                Some((a.trim().parse().ok()?, r.trim().parse().ok()?))
+            })
+            .filter(|&(a, r): &(u32, u32)| a <= 2 && r <= 2)
+            .unwrap_or((HSA_FENCE_SCOPE_AGENT, HSA_FENCE_SCOPE_AGENT));
+        PktKnobs {
+            tail_signal: amd.tail_signal,
+            karg_chain_flush: amd.karg_chain_flush,
+            acquire,
+            release,
+        }
+    })
+}
 const CHAIN_SETUP: u64 = u64::MAX - 1;
 
 fn kernarg_retirement_error(error: super::kernarg_retirement::Error) -> RuntimeError {
@@ -400,6 +567,7 @@ hsa_fns! {
     hsa_amd_memory_async_copy: unsafe extern "C" fn(*mut c_void, HsaAgent, *const c_void, HsaAgent, usize, u32, *const HsaSignal, HsaSignal) -> HsaStatus,
     hsa_queue_create: unsafe extern "C" fn(HsaAgent, u32, u32, *const c_void, *const c_void, u32, u32, *mut *mut HsaQueue) -> HsaStatus,
     hsa_queue_destroy: unsafe extern "C" fn(*mut HsaQueue) -> HsaStatus,
+    hsa_amd_queue_cu_set_mask: unsafe extern "C" fn(*const HsaQueue, u32, *const u32) -> HsaStatus,
     hsa_queue_add_write_index_screlease: unsafe extern "C" fn(*mut HsaQueue, u64) -> u64,
     hsa_queue_load_read_index_scacquire: unsafe extern "C" fn(*const HsaQueue) -> u64,
     hsa_signal_create: unsafe extern "C" fn(i64, u32, *const HsaAgent, *mut HsaSignal) -> HsaStatus,
@@ -408,6 +576,8 @@ hsa_fns! {
     hsa_signal_wait_scacquire: unsafe extern "C" fn(HsaSignal, u32, i64, u64, u32) -> i64,
     hsa_signal_add_screlease: unsafe extern "C" fn(HsaSignal, i64),
     hsa_signal_load_scacquire: unsafe extern "C" fn(HsaSignal) -> i64,
+    hsa_amd_profiling_set_profiler_enabled: unsafe extern "C" fn(*mut HsaQueue, i32) -> HsaStatus,
+    hsa_amd_profiling_get_dispatch_time: unsafe extern "C" fn(HsaAgent, HsaSignal, *mut [u64; 2]) -> HsaStatus,
     hsa_code_object_reader_create_from_memory: unsafe extern "C" fn(*const c_void, usize, *mut HsaCodeObjectReader) -> HsaStatus,
     hsa_code_object_reader_destroy: unsafe extern "C" fn(HsaCodeObjectReader) -> HsaStatus,
     hsa_executable_create_alt: unsafe extern "C" fn(u32, u32, *const c_void, *mut HsaExecutable) -> HsaStatus,
@@ -461,6 +631,7 @@ impl HsaDriver {
             hsa_amd_memory_async_copy: resolve!(lib, b"hsa_amd_memory_async_copy\0"),
             hsa_queue_create: resolve!(lib, b"hsa_queue_create\0"),
             hsa_queue_destroy: resolve!(lib, b"hsa_queue_destroy\0"),
+            hsa_amd_queue_cu_set_mask: resolve!(lib, b"hsa_amd_queue_cu_set_mask\0"),
             hsa_queue_add_write_index_screlease: resolve!(
                 lib,
                 b"hsa_queue_add_write_index_screlease\0"
@@ -475,6 +646,8 @@ impl HsaDriver {
             hsa_signal_wait_scacquire: resolve!(lib, b"hsa_signal_wait_scacquire\0"),
             hsa_signal_add_screlease: resolve!(lib, b"hsa_signal_add_screlease\0"),
             hsa_signal_load_scacquire: resolve!(lib, b"hsa_signal_load_scacquire\0"),
+            hsa_amd_profiling_set_profiler_enabled: resolve!(lib, b"hsa_amd_profiling_set_profiler_enabled\0"),
+            hsa_amd_profiling_get_dispatch_time: resolve!(lib, b"hsa_amd_profiling_get_dispatch_time\0"),
             hsa_code_object_reader_create_from_memory: resolve!(
                 lib,
                 b"hsa_code_object_reader_create_from_memory\0"
@@ -879,6 +1052,10 @@ pub struct HsaBackend {
     kernarg_pool: HsaMemoryPool,
     queue: *mut HsaQueue,
     done_signal: HsaSignal,
+    /// `PLOW_AMD_DISPATCH_TIMES`: per-slot completion signals on a profiling queue.
+    dtimes: Option<Box<DispatchTimes>>,
+    /// Clear the barrier bit of the next dispatch only (`skip_next_barrier`).
+    no_barrier_once: std::sync::atomic::AtomicBool,
     karg_ring: *mut u8,
     /// `karg_ring` is VRAM mapped through the large BAR (`PLOW_AMD_KERNARG_VRAM`): every slot is
     /// staged on the stack, copied through the BAR and made visible before its header is published.
@@ -897,6 +1074,9 @@ pub struct HsaBackend {
     chain_next: AtomicU64,
     chain_end: AtomicU64,
     chain_immediate: std::sync::atomic::AtomicBool,
+    /// PLOW_AMD_KARG_CHAIN_FLUSH: the last VRAM kernarg slot written into the open deferred
+    /// chain (address, size, last byte), read back once at commit instead of per packet.
+    chain_karg: std::sync::Mutex<Option<(usize, usize, u8, [u8; KARG_SLOT])>>,
     kernarg_retirement: super::kernarg_retirement::KernargRetirement,
     /// Reusable zero source + completion signal for [`PeerMemory::zero_peer`].
     /// See `zero_peer` for why the per-token path cannot afford to build these
@@ -923,6 +1103,13 @@ pub struct HsaBackend {
     /// a queue that will never advance. Teardown paths (Drop impls,
     /// `DeviceFree`) don't guard and still attempt their calls.
     poisoned: std::sync::OnceLock<DeviceErrorInfo>,
+    copy_tier: parking_lot::Mutex<Option<HsaCopyTier>>,
+}
+
+struct HsaCopyTier {
+    signals: rustc_hash::FxHashMap<u64, HsaSignal>,
+    spare: Vec<HsaSignal>,
+    failed: rustc_hash::FxHashSet<u64>,
 }
 
 /// Preallocated fill source: `len` bytes of fine-grained memory already set to
@@ -1186,6 +1373,18 @@ impl HsaBackend {
         if rc != HSA_STATUS_SUCCESS {
             return Err(hsa_fault(rc, "hsa_queue_create"));
         }
+        if let Some(spec) = crate::config::RuntimeConfig::get().amd.cu_mask.as_deref() {
+            let mask = cu_mask_bits(spec, cu_count)
+                .ok_or_else(|| RuntimeError::Device(format!("PLOW_AMD_CU_MASK={spec:?}: want N or ^N")))?;
+            let rc = unsafe {
+                (drv.hsa_amd_queue_cu_set_mask)(queue, (mask.len() * 32) as u32, mask.as_ptr())
+            };
+            if rc != HSA_STATUS_SUCCESS {
+                return Err(hsa_fault(rc, "hsa_amd_queue_cu_set_mask"));
+            }
+            tracing::warn!(spec, cu_count, "PLOW_AMD_CU_MASK: queue restricted (diagnostic)");
+            cu_count = mask.iter().map(|w| w.count_ones()).sum();
+        }
 
         // Create completion signal.
         let mut done_signal = HsaSignal { handle: 0 };
@@ -1196,6 +1395,12 @@ impl HsaBackend {
             }
             return Err(hsa_fault(rc, "hsa_signal_create"));
         }
+        let dtimes = match crate::config::RuntimeConfig::get().amd.dispatch_times.as_deref() {
+            Some(prefix) if !prefix.is_empty() => unsafe {
+                DispatchTimes::new(&drv, queue, agent, prefix, device_ordinal)
+            },
+            _ => None,
+        };
 
         // Allocate kernarg ring: this GPU's VRAM through the large BAR under
         // PLOW_AMD_KERNARG_VRAM (CLR's device kernarg pool, `ManagedBuffer::Create`), else the host
@@ -1282,6 +1487,8 @@ impl HsaBackend {
             kernarg_pool,
             queue,
             done_signal,
+            dtimes,
+            no_barrier_once: std::sync::atomic::AtomicBool::new(false),
             karg_ring: karg_ring as *mut u8,
             karg_vram,
             device_name,
@@ -1294,6 +1501,7 @@ impl HsaBackend {
             chain_next: AtomicU64::new(0),
             chain_end: AtomicU64::new(CHAIN_IDLE),
             chain_immediate: std::sync::atomic::AtomicBool::new(false),
+            chain_karg: std::sync::Mutex::new(None),
             kernarg_retirement: super::kernarg_retirement::KernargRetirement::new(),
             zero_stage: parking_lot::Mutex::new(None),
             peer_host_writable: std::sync::atomic::AtomicBool::new(false),
@@ -1301,6 +1509,7 @@ impl HsaBackend {
             slab_pool: parking_lot::Mutex::new(Vec::new()),
             vmm_provenance: parking_lot::Mutex::new(super::provenance::VmmProvenance::default()),
             poisoned: std::sync::OnceLock::new(),
+            copy_tier: parking_lot::Mutex::new(None),
         })
     }
 
@@ -1388,7 +1597,7 @@ impl Drop for HsaBackend {
             .completion_ticket()
             .and_then(|ticket| {
                 let value =
-                    unsafe { (self.shared.drv.hsa_signal_load_scacquire)(self.done_signal) };
+                    self.done_load();
                 self.kernarg_retirement.complete(ticket, value)
             })
             .is_ok();
@@ -1403,6 +1612,14 @@ impl Drop for HsaBackend {
         // owner (same contract as `CudaBackend::drop`).
         for (h, _) in self.slab_pool.lock().drain(..) {
             crate::memory::vmm::VmmOps::release(self, h);
+        }
+        if let Some(mut tier) = self.copy_tier.lock().take() {
+            for (_, sig) in tier.signals.drain() {
+                unsafe { (self.shared.drv.hsa_signal_destroy)(sig) };
+            }
+            for sig in tier.spare.drain(..) {
+                unsafe { (self.shared.drv.hsa_signal_destroy)(sig) };
+            }
         }
         if let Some(fs) = self.fill_stage.lock().take() {
             unsafe { (self.shared.drv.hsa_amd_memory_pool_free)(fs.ptr) };
@@ -2083,6 +2300,27 @@ impl PeerMemory for HsaBackend {
     /// a fine-grained (already agent-visible, unlockable) zero buffer and one
     /// signal removes both per-call costs.
     fn zero_peer(&self, dptr: u64, bytes: u64) -> Result<()> {
+        self.zero_peer_submit(dptr, bytes)?;
+        self.zero_peer_wait()
+    }
+
+    fn zero_peer_wait(&self) -> Result<()> {
+        let guard = self.zero_stage.lock();
+        if let Some(stage) = guard.as_ref() {
+            unsafe {
+                (self.shared.drv.hsa_signal_wait_scacquire)(
+                    stage.sig,
+                    HSA_SIGNAL_CONDITION_LT,
+                    1,
+                    u64::MAX,
+                    HSA_WAIT_STATE_BLOCKED,
+                );
+            }
+        }
+        Ok(())
+    }
+
+    fn zero_peer_submit(&self, dptr: u64, bytes: u64) -> Result<()> {
         if bytes == 0 {
             return Ok(());
         }
@@ -2154,15 +2392,6 @@ impl PeerMemory for HsaBackend {
                     self.device_ordinal
                 ),
             ));
-        }
-        unsafe {
-            (self.shared.drv.hsa_signal_wait_scacquire)(
-                stage.sig,
-                HSA_SIGNAL_CONDITION_LT,
-                1,
-                u64::MAX,
-                HSA_WAIT_STATE_BLOCKED,
-            );
         }
         Ok(())
     }
@@ -2288,6 +2517,10 @@ impl HsaBackend {
             self.check(rc, "hsa_executable_symbol_get_info (kernel resources)")?;
         }
 
+        if let Some(t) = &self.dtimes {
+            t.name(kernel_object, name);
+        }
+
         // THE INVARIANT `dispatch` ALREADY CLAIMED. Its SAFETY comment asserted that
         // "`kernarg_size <= KARG_SLOT` is checked when the kernel is resolved" — and nothing
         // checked it. `runtime/amd/hsa_backend.c:345` does; the Rust port dropped it.
@@ -2378,6 +2611,13 @@ impl HsaBackend {
             idx
         };
 
+        // A deferred chain is published by one doorbell and every packet carries the barrier
+        // bit, so its last packet completing implies every earlier one did.
+        let is_last = chain_end != CHAIN_IDLE && idx + 1 == chain_end;
+        let signal = chain_end == CHAIN_IDLE
+            || is_last
+            || self.chain_immediate.load(Ordering::Relaxed)
+            || !pkt_knobs().tail_signal;
         let slot = (idx & (size - 1)) as u32;
         // SAFETY: `size` is the queue's power-of-two capacity, so `slot` is in
         // `0..size` and the kernarg ring was allocated as `size * KARG_SLOT`
@@ -2400,7 +2640,17 @@ impl HsaBackend {
                     [wg_x, wg_y, wg_z],
                 );
                 std::ptr::copy_nonoverlapping(stage.as_ptr(), karg, n);
-                if n > 0 && !publish_device_kernarg(karg, n, stage[n - 1]) {
+                // A deferred chain rings once: the BAR is read back once, at commit, for the
+                // chain's last slot. A read completes only after every earlier posted write.
+                let defer = n > 0
+                    && pkt_knobs().karg_chain_flush
+                    && chain_end != CHAIN_IDLE
+                    && !self.chain_immediate.load(Ordering::Relaxed);
+                if defer {
+                    #[cfg(target_arch = "x86_64")]
+                    std::arch::x86_64::_mm_sfence();
+                    *self.chain_karg.lock().unwrap() = Some((karg as usize, n, stage[n - 1], stage));
+                } else if n > 0 && !publish_device_kernarg(karg, n, stage[n - 1]) {
                     // A BAR write that did not land: copy once more, and poison the device rather
                     // than publish a packet over a stale slot.
                     std::ptr::copy_nonoverlapping(stage.as_ptr(), karg, n);
@@ -2450,12 +2700,20 @@ impl HsaBackend {
             (*pkt).kernarg_address = karg as u64;
             (*pkt).group_segment_size = kernel.group_segment_size + dynamic_lds;
             (*pkt).private_segment_size = kernel.private_segment_size;
-            (*pkt).completion_signal = self.done_signal;
+            (*pkt).completion_signal = if let Some(t) = &self.dtimes {
+                t.arm(&self.shared.drv, idx, kernel.kernel_object)
+            } else if signal {
+                self.done_signal
+            } else {
+                HsaSignal { handle: 0 }
+            };
         }
 
-        // Increment the counting signal (one per dispatch).
-        unsafe {
-            (self.shared.drv.hsa_signal_add_screlease)(self.done_signal, 1);
+        // Increment the counting signal (one per signalled dispatch).
+        if signal && self.dtimes.is_none() {
+            unsafe {
+                (self.shared.drv.hsa_signal_add_screlease)(self.done_signal, 1);
+            }
         }
 
         // Publish the packet: one release store of header|setup.
@@ -2466,16 +2724,26 @@ impl HsaBackend {
         } else {
             1
         };
+        let allow_skip = !is_last;
+        let barrier = if allow_skip && self.no_barrier_once.swap(false, Ordering::Relaxed) {
+            0
+        } else {
+            self.no_barrier_once.store(false, Ordering::Relaxed);
+            1
+        };
         let header: u16 = (HSA_PACKET_TYPE_KERNEL_DISPATCH << HSA_PACKET_HEADER_TYPE) as u16
-            | (1 << HSA_PACKET_HEADER_BARRIER) as u16
-            | ((HSA_FENCE_SCOPE_AGENT << HSA_PACKET_HEADER_SCACQUIRE_FENCE_SCOPE) as u16)
-            | ((HSA_FENCE_SCOPE_AGENT << HSA_PACKET_HEADER_SCRELEASE_FENCE_SCOPE) as u16);
+            | (barrier << HSA_PACKET_HEADER_BARRIER) as u16
+            | ((pkt_knobs().acquire << HSA_PACKET_HEADER_SCACQUIRE_FENCE_SCOPE) as u16)
+            | ((pkt_knobs().release << HSA_PACKET_HEADER_SCRELEASE_FENCE_SCOPE) as u16);
         let setup: u16 = (dims << HSA_KERNEL_DISPATCH_PACKET_SETUP_DIMENSIONS as u16) as u16;
         let header_setup: u32 = (setup as u32) << 16 | header as u32;
 
         unsafe {
             std::sync::atomic::AtomicU32::from_ptr(pkt as *mut u32)
                 .store(header_setup, Ordering::Release);
+        }
+        if let Some(t) = &self.dtimes {
+            t.published(&self.shared.drv, idx);
         }
 
         // Immediate batches retain ordinary per-dispatch doorbells. Deferred
@@ -2485,6 +2753,9 @@ impl HsaBackend {
         }) {
             unsafe {
                 (self.shared.drv.hsa_signal_store_screlease)((*q).doorbell_signal, idx as i64);
+            }
+            if let Some(t) = &self.dtimes {
+                t.rang(&self.shared.drv, idx);
             }
         }
         if chain_end == CHAIN_IDLE {
@@ -2988,10 +3259,17 @@ impl HsaBackend {
         })
     }
 
+    fn done_load(&self) -> i64 {
+        match &self.dtimes {
+            Some(t) => t.load(&self.shared.drv, self.agent),
+            None => unsafe { (self.shared.drv.hsa_signal_load_scacquire)(self.done_signal) },
+        }
+    }
+
     /// Dispatches published on this queue that have not completed: the counting signal
     /// [`Self::synchronize`] waits on. A diagnostic read; it never waits.
     pub fn in_flight(&self) -> i64 {
-        unsafe { (self.shared.drv.hsa_signal_load_scacquire)(self.done_signal) }
+        self.done_load()
     }
 
     /// Drain the queue (device-wide; there is one queue).
@@ -3049,6 +3327,11 @@ impl HsaBackend {
             } else {
                 HSA_WAIT_STATE_ACTIVE
             };
+        if let Some(t) = &self.dtimes {
+            let value = t.wait(&self.shared.drv, self.agent, state);
+            self.guard()?;
+            return Ok(value);
+        }
         let value = unsafe {
             (self.shared.drv.hsa_signal_wait_scacquire)(
                 self.done_signal,
@@ -3143,13 +3426,14 @@ impl HsaBackend {
     /// Page-locked, device-visible host staging memory.
     pub fn host_alloc_pinned(&self, bytes: usize) -> Result<HsaPinned> {
         self.guard()?;
+        let alloc_bytes = bytes.max(64);
         let mut ptr: *mut c_void = std::ptr::null_mut();
         let rc = unsafe {
-            (self.shared.drv.hsa_amd_memory_pool_allocate)(self.fine_pool, bytes, 0, &mut ptr)
+            (self.shared.drv.hsa_amd_memory_pool_allocate)(self.fine_pool, alloc_bytes, 0, &mut ptr)
         };
         self.check(
             rc,
-            &format!("hsa_amd_memory_pool_allocate(fine, {bytes} bytes)"),
+            &format!("hsa_amd_memory_pool_allocate(fine, {alloc_bytes} bytes)"),
         )?;
         // The GPU agent must be allowed to read the staging slab; without this
         // the copy engine faults on first touch.
@@ -3162,7 +3446,7 @@ impl HsaBackend {
         }
         Ok(HsaPinned {
             ptr: ptr as *mut u8,
-            len: bytes,
+            len: alloc_bytes,
             shared: self.shared.clone(),
         })
     }
@@ -3715,7 +3999,7 @@ impl HsaBackend {
         }
         self.kernarg_retirement
             .preflight(packets as u64, size as u64, || unsafe {
-                (self.shared.drv.hsa_signal_load_scacquire)(self.done_signal)
+                self.done_load()
             })
             .map_err(kernarg_retirement_error)
     }
@@ -3739,6 +4023,7 @@ impl HsaBackend {
         ticket: super::kernarg_retirement::Admission,
         immediate: bool,
     ) -> Result<()> {
+        self.clear_skip_barrier();
         self.guard()?;
         let packets = ticket.count();
         let size = unsafe { (*self.queue).size } as u64;
@@ -3777,17 +4062,42 @@ impl HsaBackend {
 
     /// Finish a prepared reservation, ringing once only for deferred chains.
     pub fn commit_dispatch_chain(&self) -> Result<()> {
+        self.clear_skip_barrier();
         if let Err(error) = self.preflight_dispatch_chain_commit() {
             self.abort_dispatch_replay();
             return Err(error);
         }
         let end = self.chain_end.load(Ordering::Acquire);
+        if let Some((karg, n, last, stage)) = self.chain_karg.lock().unwrap().take() {
+            let karg = karg as *mut u8;
+            // SAFETY: `karg` is this chain's last kernarg slot (`n <= KARG_SLOT` bytes), still
+            // reserved: the chain has not been published.
+            let ok = unsafe {
+                publish_device_kernarg(karg, n, last) || {
+                    std::ptr::copy_nonoverlapping(stage.as_ptr(), karg, n);
+                    publish_device_kernarg(karg, n, last)
+                }
+            };
+            if !ok {
+                let info = DeviceErrorInfo {
+                    operation: "kernarg readback (PLOW_AMD_KARG_CHAIN_FLUSH)".into(),
+                    code: -1,
+                    name: "KERNARG_READBACK_MISMATCH".into(),
+                    fatal: true,
+                };
+                self.mark_poisoned(&info);
+                return Err(RuntimeError::DeviceFault { info });
+            }
+        }
         if super::kernarg_retirement::ring_on_commit(self.chain_immediate.load(Ordering::Relaxed)) {
             unsafe {
                 (self.shared.drv.hsa_signal_store_screlease)(
                     (*self.queue).doorbell_signal,
                     (end - 1) as i64,
                 );
+            }
+            if let Some(t) = &self.dtimes {
+                t.rang(&self.shared.drv, end - 1);
             }
         }
         self.kernarg_retirement
@@ -3827,6 +4137,7 @@ impl HsaBackend {
     }
 
     pub(crate) fn abort_dispatch_replay(&self) {
+        self.clear_skip_barrier();
         self.kernarg_retirement.cancel();
         self.mark_poisoned(&DeviceErrorInfo {
             operation: "AQL chain cancellation".into(),
@@ -3846,7 +4157,7 @@ impl HsaBackend {
             .kernarg_retirement
             .completion_ticket()
             .map_err(kernarg_retirement_error)?;
-        let value = unsafe { (self.shared.drv.hsa_signal_load_scacquire)(self.done_signal) };
+        let value = self.done_load();
         // Never block here: another TP rank may still need its chain published.
         // Rejection precedes this queue's reservation. A TP caller must coordinate
         // other ranks' reservations before attempting any retry.
@@ -3864,6 +4175,17 @@ impl HsaBackend {
     /// dispatch counts threads, so it is multiplied here. Getting that
     /// backwards launches 256 workgroups' worth of threads as one workgroup, or
     /// 65536 workgroups — both of which the packet processor accepts.
+    /// The next dispatch may start before earlier packets finish (AQL barrier bit clear). The
+    /// caller guarantees it neither reads what those packets write nor writes what they touch.
+    pub fn skip_next_barrier(&self) {
+        self.no_barrier_once.store(true, Ordering::Relaxed);
+    }
+
+    /// Clear the one-shot barrier skip flag.
+    pub fn clear_skip_barrier(&self) {
+        self.no_barrier_once.store(false, Ordering::Relaxed);
+    }
+
     pub fn launch(
         &self,
         f: HsaKernel,
@@ -4211,6 +4533,196 @@ impl crate::memory::vmm::VmmOps for HsaBackend {
         }
         released
     }
+
+    fn host_tier_alloc(&self, bytes: u64) -> Result<u64> {
+        self.guard()?;
+        let alloc_bytes = (bytes as usize).max(64);
+        let mut ptr: *mut c_void = std::ptr::null_mut();
+        let rc = unsafe {
+            (self.shared.drv.hsa_amd_memory_pool_allocate)(
+                self.fine_pool,
+                alloc_bytes,
+                0,
+                &mut ptr,
+            )
+        };
+        self.check(
+            rc,
+            &format!("hsa_amd_memory_pool_allocate (fine, {alloc_bytes} bytes)"),
+        )?;
+        let rc = unsafe {
+            (self.shared.drv.hsa_amd_agents_allow_access)(
+                self.agents.len() as u32,
+                self.agents.as_ptr(),
+                std::ptr::null(),
+                ptr,
+            )
+        };
+        if rc != HSA_STATUS_SUCCESS {
+            unsafe { (self.shared.drv.hsa_amd_memory_pool_free)(ptr) };
+            return Err(self.fault(rc, "hsa_amd_agents_allow_access (host tier)"));
+        }
+        Ok(ptr as u64)
+    }
+
+    fn host_tier_free(&self, ptr: u64, _bytes: u64) {
+        let rc = unsafe { (self.shared.drv.hsa_amd_memory_pool_free)(ptr as *mut c_void) };
+        if rc != HSA_STATUS_SUCCESS {
+            tracing::warn!(rc, ptr, "hsa_amd_memory_pool_free (vmm host tier) failed");
+        }
+    }
+
+    fn copy_dtoh_async(&self, host_ptr: u64, va: u64, bytes: u64) -> Result<u64> {
+        self.guard()?;
+        let mut tier_lock = self.copy_tier.lock();
+        let tier = match tier_lock.as_mut() {
+            Some(t) => t,
+            None => tier_lock.insert(HsaCopyTier {
+                signals: rustc_hash::FxHashMap::default(),
+                spare: Vec::new(),
+                failed: rustc_hash::FxHashSet::default(),
+            }),
+        };
+        let sig = match tier.spare.pop() {
+            Some(s) => {
+                unsafe { (self.shared.drv.hsa_signal_store_screlease)(s, 1) };
+                s
+            }
+            None => {
+                let mut s = HsaSignal { handle: 0 };
+                let rc = unsafe {
+                    (self.shared.drv.hsa_signal_create)(1, 0, std::ptr::null(), &mut s)
+                };
+                self.check(rc, "hsa_signal_create (vmm spill)")?;
+                s
+            }
+        };
+        let rc = unsafe {
+            (self.shared.drv.hsa_amd_memory_async_copy)(
+                host_ptr as *mut c_void,
+                self.cpu_agent,
+                va as *const c_void,
+                self.agent,
+                bytes as usize,
+                0,
+                std::ptr::null(),
+                sig,
+            )
+        };
+        let fence = sig.handle as u64;
+        if rc != HSA_STATUS_SUCCESS {
+            tier.spare.push(sig);
+            return Err(self.fault(rc, "hsa_amd_memory_async_copy (vmm spill D2H)"));
+        }
+        tier.signals.insert(fence, sig);
+        Ok(fence)
+    }
+
+    fn fence_done(&self, fence: u64) -> Result<bool> {
+        let mut tier_lock = self.copy_tier.lock();
+        let Some(tier) = tier_lock.as_mut() else {
+            return Err(RuntimeError::Rejected("vmm spill: no copy tier".into()));
+        };
+        if tier.failed.contains(&fence) {
+            return Err(RuntimeError::Device("vmm spill: unfenced copy".into()));
+        }
+        let Some(&sig) = tier.signals.get(&fence) else {
+            return Err(RuntimeError::Device("vmm spill: unknown fence".into()));
+        };
+        let val = unsafe { (self.shared.drv.hsa_signal_load_scacquire)(sig) };
+        if val >= 1 {
+            return Ok(false);
+        }
+        let sig = tier.signals.remove(&fence).expect("checked above");
+        tier.spare.push(sig);
+        Ok(true)
+    }
+
+    fn fence_wait(&self, fence: u64) -> Result<()> {
+        let mut tier_lock = self.copy_tier.lock();
+        let Some(tier) = tier_lock.as_mut() else {
+            return Err(RuntimeError::Rejected("vmm spill: no copy tier".into()));
+        };
+        let Some(sig) = tier.signals.remove(&fence) else {
+            return Err(RuntimeError::Device("vmm spill: unknown fence".into()));
+        };
+        if tier.failed.remove(&fence) {
+            tier.spare.push(sig);
+            return Err(RuntimeError::Device("vmm spill: unfenced copy".into()));
+        }
+        unsafe {
+            (self.shared.drv.hsa_signal_wait_scacquire)(
+                sig,
+                HSA_SIGNAL_CONDITION_LT,
+                1,
+                u64::MAX,
+                HSA_WAIT_STATE_BLOCKED,
+            );
+        }
+        tier.spare.push(sig);
+        Ok(())
+    }
+
+    fn copy_htod(&self, va: u64, host_ptr: u64, bytes: u64) -> Result<()> {
+        self.guard()?;
+        let mut tier_lock = self.copy_tier.lock();
+        let tier = match tier_lock.as_mut() {
+            Some(t) => t,
+            None => tier_lock.insert(HsaCopyTier {
+                signals: rustc_hash::FxHashMap::default(),
+                spare: Vec::new(),
+                failed: rustc_hash::FxHashSet::default(),
+            }),
+        };
+        let sig = match tier.spare.pop() {
+            Some(s) => {
+                unsafe { (self.shared.drv.hsa_signal_store_screlease)(s, 1) };
+                s
+            }
+            None => {
+                let mut s = HsaSignal { handle: 0 };
+                let rc = unsafe {
+                    (self.shared.drv.hsa_signal_create)(1, 0, std::ptr::null(), &mut s)
+                };
+                self.check(rc, "hsa_signal_create (vmm restore)")?;
+                s
+            }
+        };
+        drop(tier_lock);
+        let rc = unsafe {
+            (self.shared.drv.hsa_amd_memory_async_copy)(
+                va as *mut c_void,
+                self.agent,
+                host_ptr as *const c_void,
+                self.cpu_agent,
+                bytes as usize,
+                0,
+                std::ptr::null(),
+                sig,
+            )
+        };
+        if rc != HSA_STATUS_SUCCESS {
+            let mut tier_lock = self.copy_tier.lock();
+            if let Some(tier) = tier_lock.as_mut() {
+                tier.spare.push(sig);
+            }
+            return Err(self.fault(rc, "hsa_amd_memory_async_copy (vmm restore H2D)"));
+        }
+        unsafe {
+            (self.shared.drv.hsa_signal_wait_scacquire)(
+                sig,
+                HSA_SIGNAL_CONDITION_LT,
+                1,
+                u64::MAX,
+                HSA_WAIT_STATE_BLOCKED,
+            );
+        }
+        let mut tier_lock = self.copy_tier.lock();
+        if let Some(tier) = tier_lock.as_mut() {
+            tier.spare.push(sig);
+        }
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -4425,4 +4937,25 @@ mod tests {
         assert_eq!(hsa_status_name(0x1008), "HSA_STATUS_ERROR_OUT_OF_RESOURCES");
         assert_eq!(hsa_status_name(-1), "HSA_STATUS_UNKNOWN");
     }
+}
+
+/// `PLOW_AMD_CU_MASK` (diagnostic): `N` keeps N CUs strided evenly over the agent's `cu_count`,
+/// `^N` keeps the complement of that set.
+fn cu_mask_bits(spec: &str, cu_count: u32) -> Option<Vec<u32>> {
+    let (inv, n) = match spec.strip_prefix('^') {
+        Some(r) => (true, r),
+        None => (false, spec),
+    };
+    let n: u32 = n.parse().ok()?;
+    if cu_count == 0 || n == 0 || n > cu_count {
+        return None;
+    }
+    let mut mask = vec![0u32; cu_count.div_ceil(32) as usize];
+    for i in 0..cu_count {
+        let pick = (0..n).any(|k| k * cu_count / n == i);
+        if pick != inv {
+            mask[(i / 32) as usize] |= 1 << (i % 32);
+        }
+    }
+    Some(mask)
 }

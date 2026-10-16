@@ -167,12 +167,12 @@ owner per buffer (device or host) outside `Spilling`; a `Spilling`/`Restoring` s
 freed, never a victim, never spilled twice; a held snapshot is never spilled; `users` releases
 exactly once per attach, prefetch or restore; a snapshot's blocks go only with the snapshot.
 
-The 0.1.2 flag/tier policy (`Policy::Legacy`: `attaches`/`share`/`referenced` flags,
-`evict_one`'s tiers, `SHARED_RECENT_TICKS`) remains only for AMD's shared-prefix path
-(`exec/amd/shared_prefix.rs`). The CUDA engine always runs the tree; `PLOW_PREFIX_POLICY`,
-`PLOW_PREFIX_CACHE_OUTPUT` and `PLOW_PREFIX_RETIRE_ATTACHED` were removed with the CUDA legacy
-paths (session pin, turn-end output boundary, `retire_superseded`). The previous binary is the
-rollback.
+The legacy 0.1.2 flag/tier policy (`Policy::Legacy`) is removed completely across all backends.
+Every pool (including AMD's shared-prefix path) now runs the boundary-tree retention policy:
+canonical parents, one LRU over unheld boundaries, ancestor refresh on attach, structural retire
+when exactly one continuation extends a boundary. `PLOW_PREFIX_POLICY`, `PLOW_PREFIX_CACHE_OUTPUT`
+and `PLOW_PREFIX_RETIRE_ATTACHED` were removed with the legacy paths (session pin, turn-end output
+boundary, `retire_superseded`). The previous binary is the rollback.
 
 `/metrics`: `plowrt_prefix_snapshots_{live,branch,share}`, `snapshots_{retired,touched}_total`,
 `publishes_{prompt_end,shared_end,checkpoint,turn_end}_total`, attach kinds

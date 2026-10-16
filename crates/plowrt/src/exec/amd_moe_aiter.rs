@@ -48,6 +48,8 @@ enum Mode {
     /// BF16 output the shared expert's down projection already wrote: prepare keeps it and the
     /// fused call accumulates the routed partials onto it. No combine follows.
     SharedBf16,
+    /// BF16 rows straight into the TP reduce source (`dg_tp`): prepare zeroes it, no combine.
+    DirectBf16,
     Flat,
 }
 
@@ -61,33 +63,60 @@ enum Mode {
 /// gfx942 GLM-5 tuning table is indexed by, so the tile the dispatcher picks was tuned for it.
 const GEOMETRIES: [(u32, u32); 2] = [(256, 8), (257, 9)];
 
+/// Routed experts of the one model each pinned object family serves, keyed by model width:
+/// GLM-5.2 on gfx942 (H6144, E256) and GLM-5.3-Flash on gfx950 (H4096, E288, `GFX950_TILES`).
+/// Both are I256 per rank at TP8; the fold appends the shared expert as expert `E`, top-9.
+fn routed_experts(h: u32) -> Option<u32> {
+    match h {
+        6144 => Some(256),
+        4096 => Some(288),
+        _ => None,
+    }
+}
+
+/// `(n_exp, topk)` is the model's own routing or its shared-expert fold.
+fn shaped(h: u32, n_exp: u32, topk: u32) -> bool {
+    routed_experts(h).is_some_and(|e| (n_exp, topk) == (e, 8) || (n_exp, topk) == (e + 1, 9))
+}
+
 #[derive(Clone, Copy, Debug)]
 pub(super) struct Route {
     inst: DevInst64,
     rows: u32,
     mode: Mode,
+    /// A decode rung's call (`PLOW_AMD_MOE_DEC_TILES` re-tiles only these).
+    decode: bool,
 }
 
 impl Route {
     pub fn launches(self) -> u64 {
+        // gfx950 table form: one prepare (sort + quant) and the fused call.
+        if self.table_form() {
+            return 2;
+        }
         u64::from(self.inst.fj[1] != 0) * 4
             + match self.mode {
                 Mode::Sorted => {
-                    if self.inst.i[7] == 1 {
+                    if self.inst.i[7] != 0 {
                         3
                     } else {
                         4
                     }
                 }
                 Mode::Flat => 2,
-                Mode::SortedBf16 | Mode::SharedBf16 => {
-                    if self.inst.i[7] == 1 {
+                Mode::SortedBf16 | Mode::SharedBf16 | Mode::DirectBf16 => {
+                    if self.inst.i[7] != 0 {
                         2
                     } else {
                         3
                     }
                 }
             }
+    }
+
+    /// gfx950 (H4096) with a routing table operand: `plow_moe_aiter_prepare_table` sorts it.
+    fn table_form(self) -> bool {
+        self.inst.i[1] == 4096 && self.inst.fj[1] != 0
     }
 
     /// Expert-table length. Under the shared-expert fold the last entry is the shared expert.
@@ -118,7 +147,9 @@ fn native_align_form(inst: &DevInst64, flat: bool) -> bool {
         && inst.fj[0] == 0
         && inst.fj[1] != 0
         && matches!(inst.fj[2], 64 | 304)
-        && inst.i[3..5] == [256, 8]
+        && shaped(inst.i[1], inst.i[3], inst.i[4])
+        // gfx942's align adapter serves GLM's own routing only; gfx950 sorts the folded table too.
+        && (inst.i[1] == 4096 || inst.i[4] == 8)
 }
 
 pub(super) fn routes(
@@ -137,33 +168,32 @@ pub(super) fn routes(
             1 => Mode::Flat,
             2 => Mode::SortedBf16,
             3 => Mode::SharedBf16,
+            4 => Mode::DirectBf16,
             _ => return Err(err("unknown output mode")),
         };
         let flat = mode == Mode::Flat;
         let resident = inst.i[7] == 1;
+        // i[7] = 2: the gfx950 AITER companion slab (`expert_weight_table*_ai`), bound at load.
+        let layout = if inst.i[7] == 2 && inst.i[1] == 4096 && !flat {
+            2
+        } else {
+            u32::from(resident)
+        };
         // The DECODE (flat) route keeps top-8 even under the fold — one row has no gathered reuse
         // to win, so decode still runs the shared expert as its own GEMV pair — but it must agree
         // with prefill about the expert TABLE's length, which is what the packed slab is sized
         // from. Hence `n_exp` from the instruction and `topk` pinned to 8 on the flat arm.
-        let (n_exp, topk) = (inst.i[3], inst.i[4]);
+        let (h, n_exp, topk) = (inst.i[1], inst.i[3], inst.i[4]);
+        let routed = routed_experts(h).unwrap_or(0);
         let geometry = if flat {
             [prog.t, 6144, 256, n_exp, 8, 0, 1, u32::from(resident)]
         } else {
-            [
-                prog.t,
-                6144,
-                256,
-                n_exp,
-                topk,
-                64,
-                inst.i[6],
-                u32::from(resident),
-            ]
+            [prog.t, h, 256, n_exp, topk, 64, inst.i[6], layout]
         };
         let shaped = if flat {
             GEOMETRIES.iter().any(|&(e, _)| e == n_exp)
         } else {
-            GEOMETRIES.contains(&(n_exp, topk))
+            shaped(h, n_exp, topk)
         };
         // A packed-prefill sibling carries this instruction unchanged: the kernel is
         // row-agnostic over the dense live rows (the align maps sort real tokens; parked rows
@@ -176,7 +206,7 @@ pub(super) fn routes(
             || inst.i != geometry
             || !(inst.fj == [0; 3] || native_align_form(inst, flat))
         {
-            return Err(err("requires H6144/I256 with E256/top8 or the shared-expert fold's E257/top9; sorted prefill rows1..8192 or flat decode rows2/4/8 (resident:1/2/4/8/16/32)"));
+            return Err(err("requires I256 with H6144/E256 or H4096/E288 (top8, or the shared-expert fold's E+1/top9); sorted prefill rows1..8192 or flat decode H6144 rows2/4/8 (resident:1/2/4/8/16/32)"));
         }
         if flat {
             let router = prog.insts[..ix]
@@ -223,11 +253,18 @@ pub(super) fn routes(
             // scores `n_exp - fold` experts, selects `topk - fold` of them, and appends the
             // constant slot iff the fold is on. A folded route with no visible router is refused
             // outright — it is the router's tail that puts the shared expert in the table at all.
-            let fold = u32::from(n_exp != 256);
-            let router = prog.insts[..ix]
-                .iter()
-                .rev()
-                .find(|d| d.op == DevOp::MoeRouterTopkPf as u16 && d.t[0] == align.t[1]);
+            let fold = u32::from(n_exp != routed);
+            let routers = || {
+                prog.insts[..ix]
+                    .iter()
+                    .rev()
+                    .filter(|d| d.op == DevOp::MoeRouterTopkPf as u16)
+            };
+            // PLOW_GLM53_SP_ROUTER scores the owned row band into a band table that a peer
+            // gather then assembles into the align's input, so the nearest router stands in.
+            let router = routers()
+                .find(|d| d.t[0] == align.t[1])
+                .or_else(|| routers().next());
             match router {
                 Some(r) if r.i[1..3] != [n_exp - fold, topk - fold] || r.i[5] != fold => {
                     return Err(err(
@@ -251,7 +288,7 @@ pub(super) fn routes(
                 .take_while(|d| d.t[0] != inst.t[0])
                 .filter(|d| d.op == DevOp::MoeCombinePf as u16 && d.t[3] == inst.t[0])
             {
-                if combine.i[..2] != [6144, 1]
+                if combine.i[..2] != [h, 1]
                     || combine.i[2] == 0
                     || combine.i[2] > prog.t - covered
                     || combine.i[3] != covered
@@ -268,11 +305,22 @@ pub(super) fn routes(
                 return Err(err("sorted BF16 output has incomplete combine coverage"));
             }
         }
+        if mode == Mode::DirectBf16
+            && (inst.t[1..].contains(&inst.t[0])
+                || prog.insts[ix + 1..]
+                    .iter()
+                    .take_while(|d| d.t[0] != inst.t[0])
+                    .any(|d| d.op == DevOp::MoeCombinePf as u16 && d.t[3] == inst.t[0]))
+        {
+            return Err(err(
+                "direct BF16 output must not alias an input or feed a combine",
+            ));
+        }
         if mode == Mode::SharedBf16 {
             let writer = prog.insts[..ix].iter().rev().find(|d| d.t[0] == inst.t[0]);
             if inst.t[1..].contains(&inst.t[0])
                 || !writer.is_some_and(|d| {
-                    d.op == DevOp::GemmLtPf as u16 && d.i[..2] == [prog.t, 6144] && d.i[3] == 0
+                    d.op == DevOp::GemmLtPf as u16 && d.i[..2] == [prog.t, h] && d.i[3] == 0
                 })
                 || prog.insts[ix + 1..]
                     .iter()
@@ -285,7 +333,7 @@ pub(super) fn routes(
             }
         }
         let rows = u64::from(prog.t);
-        let (n_exp, topk) = (u64::from(n_exp), u64::from(topk));
+        let (h, n_exp, topk) = (u64::from(h), u64::from(n_exp), u64::from(topk));
         let capacity = rows * topk + n_exp * 63;
         let sizes = if flat {
             [
@@ -300,13 +348,13 @@ pub(super) fn routes(
             ]
         } else {
             [
-                rows * 6144
-                    * if matches!(mode, Mode::SortedBf16 | Mode::SharedBf16) {
+                rows * h
+                    * if matches!(mode, Mode::SortedBf16 | Mode::SharedBf16 | Mode::DirectBf16) {
                         2
                     } else {
                         4
                     },
-                rows * 6144 * 2,
+                rows * h * 2,
                 n_exp * 3 * 8,
                 n_exp * 3 * 8,
                 (3 * n_exp + 1) * 4,
@@ -357,6 +405,7 @@ pub(super) fn routes(
             inst: *inst,
             rows: prog.t,
             mode,
+            decode: prog.role.is_decode_rung(),
         });
     }
     Ok(routes)
@@ -379,6 +428,8 @@ pub(super) fn resident_tables(
                 continue;
             }
             1 => {}
+            // The companion slab: validated and bound by `bind_packed_experts`, not resident.
+            2 => continue,
             _ => {
                 return Err(RuntimeError::Device(
                     "unknown native MoE weight layout".into(),
@@ -386,7 +437,7 @@ pub(super) fn resident_tables(
             }
         }
         let invalid = || {
-            RuntimeError::Device("resident MoE requires matching H6144/I256 E256/top8 (or the shared fold's E257) expert tables without companions".into())
+            RuntimeError::Device("resident MoE requires matching I256 H6144/E256 or H4096/E288 (or the shared fold's E+1) expert tables without companions".into())
         };
         let wt = tensors.get(inst.t[2] as usize).ok_or_else(invalid)?;
         let st = tensors.get(inst.t[3] as usize).ok_or_else(invalid)?;
@@ -405,9 +456,10 @@ pub(super) fn resident_tables(
         } else {
             "expert_scale_table"
         };
-        if inst.i[1..5] != [6144, 256, inst.i[3], inst.i[4]]
-            || !GEOMETRIES.iter().any(|&(e, _)| e == inst.i[3])
-            || folded != (inst.i[3] != 256)
+        let routed = routed_experts(inst.i[1]);
+        if inst.i[2] != 256
+            || routed.is_none_or(|e| ![e, e + 1].contains(&inst.i[3]))
+            || folded != (Some(inst.i[3]) != routed)
             || wt.bytes != n_exp * 24
             || st.bytes != n_exp * 24
             || st.name != format!("{prefix}{scales}")
@@ -469,17 +521,33 @@ pub(super) struct ResidentWeights {
     pub down: u64,
     pub gs: u64,
     pub ds: u64,
+    /// Per-expert byte strides (eGUs, eDs, eGUQs, eDQs) of the AITER argument block.
+    pub strides: [u64; 4],
 }
 
 impl ResidentWeights {
     /// The slab holds `2*n_exp` gate/up slots followed by `n_exp` down slots — so `n_exp` is a
     /// parameter, not the 256 it was before the shared-expert fold made the table 257 long.
-    pub fn new(weights: u64, scales: u64, n_exp: u64) -> Self {
+    /// Each slot is one [256, h] (or [h, 256]) projection with `2 * h / 128` f32 scales.
+    pub fn new(weights: u64, scales: u64, n_exp: u64, h: u64) -> Self {
         Self {
             gu: weights,
-            down: weights + 2 * n_exp * 256 * 6144,
+            down: weights + 2 * n_exp * 256 * h,
             gs: scales,
-            ds: scales + 2 * n_exp * 96 * 4,
+            ds: scales + 2 * n_exp * (h / 64) * 4,
+            strides: [2 * 256 * h, 256 * h, 2 * (h / 64) * 4, (h / 64) * 4],
+        }
+    }
+
+    /// The gfx950 companion: the `[e][gate, up, down]`-interleaved packed slabs
+    /// (`packed_expert_table` order) — AITER-shuffled weights, the row-major slab's own scales.
+    pub fn companion(weights: u64, w_stride: u64, scales: u64, s_stride: u64) -> Self {
+        Self {
+            gu: weights,
+            down: weights + 2 * w_stride,
+            gs: scales,
+            ds: scales + 2 * s_stride,
+            strides: [3 * w_stride, 3 * w_stride, 3 * s_stride, 3 * s_stride],
         }
     }
 }
@@ -583,6 +651,19 @@ const _: () = assert!(std::mem::size_of::<AlignArgs>() == 64);
 const ALIGN_MAX_NPART: u64 = 304;
 const _: () = assert!(std::mem::size_of::<StoreArgs>() == 24);
 
+#[repr(C)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+struct TableArgs {
+    pointers: [u64; 9],
+    rows: u32,
+    block_m: u32,
+    n_exp: u32,
+    topk: u32,
+    keep_out: u32,
+    pad: u32,
+}
+const _: () = assert!(std::mem::size_of::<TableArgs>() == 96);
+
 pub(super) struct MoeAiter {
     pack: HsaKernel,
     flat: Option<(HsaKernel, HsaKernel)>,
@@ -604,11 +685,19 @@ pub(super) struct MoeAiter {
     /// `moe_align_adapter_gfx942.elf` and its meta workspace (partial counts of up to 304 parts).
     align: Option<(HsaKernel, DeviceMem)>,
     xcd_swizzle: bool,
+    /// Compute units the prepare/store grids span: 304 on MI300X, 256 on MI350X.
+    cus: u32,
+    /// gfx950: one kernel per `GFX950_TILES` entry (GLM-5.3-Flash H4096). `None` on gfx942.
+    gfx950: Option<[HsaKernel; 5]>,
+    /// gfx950 `plow_moe_aiter_prepare_table` (adapter marker `plow_moe_aiter_table_abi_1`).
+    prepare_table: Option<HsaKernel>,
 }
 
 impl MoeAiter {
+    #[allow(clippy::too_many_arguments)]
     pub fn load(
         be: &HsaBackend,
+        arch: &str,
         dir: &Path,
         rows: u32,
         n_exp: u32,
@@ -621,6 +710,9 @@ impl MoeAiter {
             return Err(RuntimeError::Device(
                 "AITER MoE workspace requires rows 128..8192".into(),
             ));
+        }
+        if arch == "gfx950" {
+            return Self::load_gfx950(be, dir, rows, n_exp, flat_decode, resident, modules);
         }
         let Some(&(_, max_topk)) = GEOMETRIES.iter().find(|&&(e, _)| e == n_exp) else {
             return Err(RuntimeError::Device(format!(
@@ -808,34 +900,7 @@ impl MoeAiter {
             }
         }
         modules.push(module);
-        let rows = u64::from(rows);
-        let experts = u64::from(n_exp);
-        let capacity = rows * u64::from(max_topk) + experts * 63;
-        let mut sizes = [
-            experts * 512 * 6144,
-            experts * 6144 * 256,
-            experts * 192 * 4,
-            experts * 96 * 4,
-            rows * 6144,
-            rows * 48 * 4,
-            rows * 6144 * 2,
-            capacity * 4,
-            capacity * 4,
-            capacity.div_ceil(32) * 4,
-            8,
-        ];
-        if resident {
-            sizes[..4].fill(0);
-        }
-        let bytes = sizes.iter().map(|s| s.div_ceil(256) * 256).sum();
-        let scratch = EngineDevice::alloc(be, bytes)?;
-        let mut ptr = scratch.base;
-        let buffers = sizes.map(|size| {
-            let p = ptr;
-            ptr += size.div_ceil(256) * 256;
-            p
-        });
-        tracing::info!(bytes, n_exp, "allocated reusable AITER MoE workspace");
+        let (scratch, buffers) = workspace(be, rows, n_exp, max_topk, 6144, resident)?;
         Ok(Self {
             pack,
             flat,
@@ -852,6 +917,138 @@ impl MoeAiter {
             keep_out,
             align,
             xcd_swizzle: false,
+            cus: 304,
+            gfx950: None,
+            prepare_table: None,
+        })
+    }
+
+    /// GLM-5.3-Flash (H4096, E288 or the fold's E289) on 256-CU MI350X: the sorted route over
+    /// the pinned `GFX950_TILES`, adapter and align from `build_moe_aiter.sh --gfx950`.
+    fn load_gfx950(
+        be: &HsaBackend,
+        dir: &Path,
+        rows: u32,
+        n_exp: u32,
+        flat_decode: bool,
+        resident: bool,
+        modules: &mut Vec<Module>,
+    ) -> Result<Self> {
+        if flat_decode || !resident || ![288, 289].contains(&n_exp) {
+            return Err(RuntimeError::Device(format!(
+                "gfx950 AITER MoE serves the sorted resident GLM-5.3-Flash route only \
+                 (E288/E289, got E{n_exp}, flat={flat_decode}, resident={resident})"
+            )));
+        }
+        let mut loaded: Vec<(&str, HsaKernel)> = Vec::new();
+        for tile in &GFX950_TILES {
+            if loaded.iter().any(|(o, _)| *o == tile.object) {
+                continue;
+            }
+            let path = dir.join(tile.object);
+            let mut image = std::fs::read(&path)
+                .map_err(|e| RuntimeError::Device(format!("{}: {e}", path.display())))?;
+            if plow_asset::decode_objects::image_sha256(&image) != tile.hash {
+                return Err(RuntimeError::Device(format!(
+                    "{}: hash does not match the pinned gfx950 AITER object",
+                    path.display()
+                )));
+            }
+            // The descriptor at 0x1e40 leaves KERNARG_SIZE zero (metadata says 448); ROCr reads
+            // the descriptor. Normalize only this field after hashing.
+            image[0x1e48..0x1e4c].copy_from_slice(&448u32.to_le_bytes());
+            let module = EngineDevice::module_load(be, &image)?;
+            let kernel = EngineDevice::get_function(be, &module, tile.symbol)?;
+            if kernel.kernarg_size() != 448
+                || kernel.private_segment_size() != 0
+                || HsaBackend::kernel_lds_bytes(&kernel) != 65536
+            {
+                return Err(RuntimeError::Device(format!(
+                    "{}: AITER MoE resource ABI mismatch",
+                    path.display()
+                )));
+            }
+            modules.push(module);
+            loaded.push((tile.object, kernel));
+        }
+        let kernels = GFX950_TILES.map(|t| loaded.iter().find(|(o, _)| *o == t.object).unwrap().1);
+        let path = dir.join("moe_aiter_adapter_gfx950.elf");
+        let image = std::fs::read(&path)
+            .map_err(|e| RuntimeError::Device(format!("{}: {e}", path.display())))?;
+        let syms = super::amd::elf_symbol_names(&image);
+        if ![
+            "plow_moe_aiter_nexp_abi_1",
+            "plow_moe_aiter_keep_out_abi_1",
+            "plow_moe_resident_fp8_abi_1",
+        ]
+        .iter()
+        .all(|m| syms.contains(m))
+        {
+            return Err(RuntimeError::Device(
+                "gfx950 AITER MoE adapter lacks its ABI markers".into(),
+            ));
+        }
+        let module = EngineDevice::module_load(be, &image)?;
+        let pack = EngineDevice::get_function(be, &module, "pack_moe")?;
+        let prepare = EngineDevice::get_function(be, &module, "plow_moe_aiter_prepare")?;
+        let store = EngineDevice::get_function(be, &module, "plow_moe_aiter_store")?;
+        let prepare_table = if syms.contains(&"plow_moe_aiter_table_abi_1") {
+            let kernel = EngineDevice::get_function(be, &module, "plow_moe_aiter_prepare_table")?;
+            if ![96, 96 + 256].contains(&kernel.kernarg_size())
+                || kernel.private_segment_size() != 0
+            {
+                return Err(RuntimeError::Device(
+                    "gfx950 AITER table prepare resource ABI mismatch".into(),
+                ));
+            }
+            Some(kernel)
+        } else {
+            None
+        };
+        for (kernel, size) in [(prepare, PREPARE_ARGS_NEXP), (store, 24)] {
+            if ![size, size + 256].contains(&kernel.kernarg_size())
+                || kernel.private_segment_size() != 0
+            {
+                return Err(RuntimeError::Device(
+                    "gfx950 AITER MoE adapter resource ABI mismatch".into(),
+                ));
+            }
+        }
+        modules.push(module);
+        let align = match std::fs::read(dir.join("moe_align_adapter_gfx950.elf")) {
+            Ok(image) if super::amd::elf_symbol_names(&image).contains(&"plow_moe_align_abi_1") => {
+                let module = EngineDevice::module_load(be, &image)?;
+                let kernel = EngineDevice::get_function(be, &module, "plow_moe_align")?;
+                modules.push(module);
+                let meta = EngineDevice::alloc(
+                    be,
+                    (u64::from(3 * n_exp + 1) + ALIGN_MAX_NPART * u64::from(n_exp)) * 4,
+                )?;
+                Some((kernel, meta))
+            }
+            _ => None,
+        };
+        let (scratch, buffers) = workspace(be, rows, n_exp, 9, 4096, resident)?;
+        tracing::info!(n_exp, "gfx950 AITER MoE tiles loaded (GLM-5.3-Flash H4096)");
+        Ok(Self {
+            pack,
+            flat: None,
+            prepare,
+            moe: kernels[0],
+            tile64: None,
+            store,
+            _scratch: scratch,
+            buffers,
+            resident,
+            n_exp,
+            resident_weights: Vec::new(),
+            prepare_args: PREPARE_ARGS_NEXP,
+            keep_out: true,
+            align,
+            xcd_swizzle: false,
+            cus: 256,
+            gfx950: Some(kernels),
+            prepare_table,
         })
     }
 
@@ -911,7 +1108,7 @@ impl MoeAiter {
             .map(|h| if h == TENSOR_NONE16 { 0 } else { addr(h) });
         let [mut gu, mut down, mut gs, mut ds, q, qs, workspace_out, ids, weights, experts, valid] =
             self.buffers;
-        if (route.inst.i[7] == 1) != self.resident {
+        if (route.inst.i[7] != 0) != self.resident {
             return Err(RuntimeError::Device(
                 "MoE route and workspace weight layouts differ".into(),
             ));
@@ -924,6 +1121,7 @@ impl MoeAiter {
             ));
         }
         let experts_grid = 8 * self.n_exp;
+        let mut strides = None;
         if self.resident {
             let w = self
                 .resident_weights
@@ -933,6 +1131,7 @@ impl MoeAiter {
                     RuntimeError::Device("resident MoE weights were not bound".into())
                 })?;
             (gu, down, gs, ds) = (w.gu, w.down, w.gs, w.ds);
+            strides = Some(w.strides);
         }
         if route.mode == Mode::Flat {
             let (pack, moe) = self.flat.ok_or_else(|| {
@@ -983,13 +1182,84 @@ impl MoeAiter {
                     .into(),
             ));
         }
-        let out = if matches!(route.mode, Mode::SortedBf16 | Mode::SharedBf16) {
+        let out = if matches!(
+            route.mode,
+            Mode::SortedBf16 | Mode::SharedBf16 | Mode::DirectBf16
+        ) {
             t[0]
         } else {
             workspace_out
         };
         let tile64 = self.tile64.filter(|_| route.rows >= TILE64_MIN_ROWS);
+        // gfx950: the per-row-bucket AITER tile and its grid; gfx942 keeps the 32/64-row pair.
+        let gfx950 = match &self.gfx950 {
+            Some(kernels) => {
+                let (mut i, mut tile) = GFX950_TILES
+                    .iter()
+                    .enumerate()
+                    .find(|(_, t)| route.rows <= t.max_rows)
+                    .ok_or_else(|| {
+                        RuntimeError::Device("gfx950 AITER MoE rows exceed 8192".into())
+                    })?;
+                let cfg = &crate::config::RuntimeConfig::get().amd;
+                // PLOW_AMD_MOE_DEC_TILES: measured at the GLM-5.3 TP8 decode rungs (1k context,
+                // kernel-only in situ): 16x128 at 32 rows 90.3 -> 84.6 us, 32x256 at 128 rows
+                // 141.8 -> 134.2 us.
+                if cfg.moe_dec_tiles && route.decode {
+                    if route.rows <= 32 {
+                        (i, tile) = (0, &GFX950_TILES[0]);
+                    } else if route.rows <= 256 {
+                        (i, tile) = (1, &GFX950_TILES[1]);
+                    }
+                }
+                // PLOW_AMD_MOE_TILE_DEC (diagnostic): force a tile at the decode rungs.
+                if let Some(f) = cfg.moe_tile_dec {
+                    if route.rows <= 256 && (f as usize) < GFX950_TILES.len() {
+                        (i, tile) = (f as usize, &GFX950_TILES[f as usize]);
+                    }
+                }
+                Some((kernels[i], tile))
+            }
+            None => None,
+        };
+        let table_prepare = match (gfx950, route.table_form()) {
+            (Some((_, tile)), true) => {
+                let kernel = self.prepare_table.ok_or_else(|| {
+                    RuntimeError::Device(
+                        "gfx950 AITER table route needs plow_moe_aiter_table_abi_1".into(),
+                    )
+                })?;
+                Some((kernel, tile.block_m))
+            }
+            _ => None,
+        };
         let meta = match route.inst.fj[1].checked_sub(1) {
+            Some(table) if table_prepare.is_some() => {
+                let (kernel, block_m) = table_prepare.unwrap();
+                if stages & STAGE_PREPARE != 0 {
+                    let args = TableArgs {
+                        pointers: [
+                            q,
+                            qs,
+                            out,
+                            ids,
+                            weights,
+                            experts,
+                            valid,
+                            t[1],
+                            addr(table as u16),
+                        ],
+                        rows: route.rows,
+                        block_m,
+                        n_exp: self.n_exp,
+                        topk: route.topk(),
+                        keep_out: u32::from(route.mode == Mode::SharedBf16),
+                        pad: 0,
+                    };
+                    be.launch(kernel, self.cus * 4, 256, 0, bytemuck::bytes_of(&args))?;
+                }
+                0
+            }
             None => t[4],
             Some(table) => {
                 let (kernel, ws) = self.align.as_ref().ok_or_else(|| {
@@ -1021,72 +1291,73 @@ impl MoeAiter {
                 q, qs, out, ids, weights, experts, valid, t[1], meta, t[5], t[6], t[7],
             ],
             rows: route.rows,
-            block_m: if tile64.is_some() { 64 } else { 32 },
+            block_m: match gfx950 {
+                Some((_, tile)) => tile.block_m,
+                None if tile64.is_some() => 64,
+                None => 32,
+            },
             // The psx object remaps workgroup w to tile (w % 8) * 38 + w / 8 itself (its prologue:
             // s_and_b32 7 / s_lshr_b32 3 on the workgroup id), so consecutive blocks already share
             // an XCD there; a second permutation on top measured +8%. The ps object has no remap.
-            swizzle: u32::from(self.xcd_swizzle && tile64.is_none()),
+            swizzle: u32::from(self.xcd_swizzle && tile64.is_none() && gfx950.is_none()),
             n_exp: self.n_exp,
             topk: route.topk(),
             keep_out: u32::from(route.mode == Mode::SharedBf16),
         };
-        if stages & STAGE_PREPARE != 0 {
+        if stages & STAGE_PREPARE != 0 && table_prepare.is_none() {
             be.launch(
                 self.prepare,
-                304 * 4,
+                self.cus * 4,
                 256,
                 0,
                 &bytemuck::bytes_of(&prepare)[..self.prepare_args as usize],
             )?;
         }
-        let mut args = [0u64; 56];
-        for (i, value) in [
-            out,
-            q,
-            gu,
-            valid,
-            down,
-            qs,
-            gs,
-            ds,
-            0,
-            ids,
-            weights,
-            experts,
-            6144,
-            256,
-            u64::from(route.rows),
-            // eprt_cnt / topk: ordinary scalars in AITER's 448-byte block, so 257/9 needs no
-            // other object — and is the shape its own gfx942 GLM-5 tuning table is indexed by.
-            u64::from(self.n_exp),
-            6144,
-            6144,
-            256,
-            12288,
-            512 * 6144,
-            256 * 6144,
-            192 * 4,
-            96 * 4,
-            256 * 4,
-            u64::from(route.topk()),
-            304,
-            1,
-        ]
-        .into_iter()
-        .enumerate()
-        {
-            args[i * 2] = value;
-        }
-        if stages & STAGE_MOE != 0 {
-            be.launch(
-                tile64.unwrap_or(self.moe),
+        // eprt_cnt / topk: ordinary scalars in AITER's 448-byte block, so 257/9 needs no
+        // other object — and is the shape its own gfx942 GLM-5 tuning table is indexed by.
+        let buffers = [out, q, gu, valid, down, qs, gs, ds, ids, weights, experts];
+        if let Some((kernel, tile)) = gfx950 {
+            let [gx, gy, total_tgs, ps_deno] =
+                tile.launch(256, route.rows, self.n_exp, route.topk(), self.cus);
+            let args = sorted_moe_args(
+                buffers,
+                GFX950_FLASH_SHAPE,
+                strides,
+                route.rows,
+                self.n_exp,
+                route.topk(),
+                total_tgs,
+                ps_deno,
+            );
+            if stages & STAGE_MOE != 0 {
+                be.launch_3d(kernel, [gx, gy, 1], 256, bytemuck::cast_slice(&args))?;
+            }
+        } else {
+            let args = sorted_moe_args(
+                buffers,
+                GFX942_SHAPE,
+                strides,
+                route.rows,
+                self.n_exp,
+                route.topk(),
                 304,
-                256,
-                0,
-                bytemuck::cast_slice(&args),
-            )?;
+                1,
+            );
+            if stages & STAGE_MOE != 0 {
+                be.launch(
+                    tile64.unwrap_or(self.moe),
+                    304,
+                    256,
+                    0,
+                    bytemuck::cast_slice(&args),
+                )?;
+            }
         }
-        if matches!(route.mode, Mode::SortedBf16 | Mode::SharedBf16) || stages & STAGE_STORE == 0 {
+        if matches!(
+            route.mode,
+            Mode::SortedBf16 | Mode::SharedBf16 | Mode::DirectBf16
+        ) || stages & STAGE_STORE == 0
+        {
             return Ok(());
         }
         let store = StoreArgs {
@@ -1095,11 +1366,222 @@ impl MoeAiter {
             rows: route.rows,
             pad: 0,
         };
-        be.launch(self.store, 304, 256, 0, bytemuck::bytes_of(&store))
+        be.launch(self.store, self.cus, 256, 0, bytemuck::bytes_of(&store))
     }
 }
 
 #[allow(clippy::too_many_arguments)]
+/// The reusable staging workspace: packed weights/scales (empty when resident), fp8 x and its
+/// scales, the output, and the sorted ids/weights/expert-ids (16-row blocks at worst) + valid.
+fn workspace(
+    be: &HsaBackend,
+    rows: u32,
+    n_exp: u32,
+    max_topk: u32,
+    h: u64,
+    resident: bool,
+) -> Result<(DeviceMem, [u64; 11])> {
+    let rows = u64::from(rows);
+    let experts = u64::from(n_exp);
+    let capacity = rows * u64::from(max_topk) + experts * 63;
+    let mut sizes = [
+        experts * 512 * h,
+        experts * h * 256,
+        experts * (h / 32) * 4,
+        experts * (h / 64) * 4,
+        rows * h,
+        rows * (h / 128) * 4,
+        rows * h * 2,
+        capacity * 4,
+        capacity * 4,
+        capacity.div_ceil(16) * 4,
+        8,
+    ];
+    if resident {
+        sizes[..4].fill(0);
+    }
+    let bytes = sizes.iter().map(|s| s.div_ceil(256) * 256).sum();
+    let scratch = EngineDevice::alloc(be, bytes)?;
+    let mut ptr = scratch.base;
+    let buffers = sizes.map(|size| {
+        let p = ptr;
+        ptr += size.div_ceil(256) * 256;
+        p
+    });
+    tracing::info!(bytes, n_exp, "allocated reusable AITER MoE workspace");
+    Ok((scratch, buffers))
+}
+
+/// Per-rank MoE shape the AITER 448-byte argument block is filled from.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct AiterShape {
+    /// Model width (`dim`): 6144 GLM-5.2, 4096 GLM-5.3-Flash.
+    h: u64,
+    /// Per-rank expert intermediate (`inter_dim`).
+    inter: u64,
+}
+
+const GFX942_SHAPE: AiterShape = AiterShape {
+    h: 6144,
+    inter: 256,
+};
+#[cfg_attr(not(test), allow(dead_code))]
+const GFX950_FLASH_SHAPE: AiterShape = AiterShape {
+    h: 4096,
+    inter: 256,
+};
+
+/// `buffers` = out, x (fp8), gate/up, num_valid, down, x scales, gate/up scales, down scales,
+/// sorted ids, sorted weights, sorted expert ids. `total_tgs` / `ps_deno` as AITER's
+/// `FMoeKernel::launch_kernel` fills them.
+fn sorted_moe_args(
+    buffers: [u64; 11],
+    shape: AiterShape,
+    strides: Option<[u64; 4]>,
+    rows: u32,
+    n_exp: u32,
+    topk: u32,
+    total_tgs: u32,
+    ps_deno: u32,
+) -> [u64; 56] {
+    let [out, q, gu, valid, down, qs, gs, ds, ids, weights, experts] = buffers;
+    let AiterShape { h, inter } = shape;
+    let [e_gu, e_d, e_gs, e_ds] = strides.unwrap_or([
+        2 * inter * h,
+        inter * h,
+        (2 * inter / 128) * (h / 128) * 4,
+        (h / 128) * (inter / 128) * 4,
+    ]);
+    let mut args = [0u64; 56];
+    for (i, value) in [
+        out,
+        q,
+        gu,
+        valid,
+        down,
+        qs,
+        gs,
+        ds,
+        0,
+        ids,
+        weights,
+        experts,
+        h,
+        inter,
+        u64::from(rows),
+        u64::from(n_exp),
+        h,
+        h,
+        inter,
+        2 * h,
+        e_gu,
+        e_d,
+        e_gs,
+        e_ds,
+        inter * 4,
+        u64::from(topk),
+        u64::from(total_tgs),
+        u64::from(ps_deno),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        args[i * 2] = value;
+    }
+    args
+}
+
+/// One gfx950 AITER `fmoe_bf16_blockscaleFp8_g1u1` tile (vLLM ROCm nightly-rocm100 image,
+/// `aiter_meta/hsa/gfx950/fmoe/silu`, copied by `scripts/build_moe_aiter.sh --gfx950`). Fields
+/// are that directory's `fmoe_bf16_blockscaleFp8_g1u1_silu.csv` row.
+#[cfg_attr(not(test), allow(dead_code))]
+#[derive(Clone, Copy, Debug)]
+pub(super) struct Gfx950Tile {
+    pub object: &'static str,
+    pub symbol: &'static str,
+    pub hash: &'static str,
+    pub block_m: u32,
+    /// `tg_num_perCU` of a persistent (`ps`) object; 0 for a (subGU, blocks) grid.
+    pub tg_per_cu: u32,
+    pub sub_gu: u32,
+    /// Largest token count this tile is selected for (inclusive).
+    pub max_rows: u32,
+}
+
+/// Per-row-bucket choice at GLM-5.3-Flash TP8 (H4096 I256, E289 top9 shared fold, 256 CUs),
+/// kernel-only on MI350X with block_m-compacted sorting:
+/// T8 49 us, T32 102, T128 181, T512 203, T1024 232, T2048 280, T8192 728.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(super) const GFX950_TILES: [Gfx950Tile; 5] = [
+    Gfx950Tile {
+        object: "fmoe_bf16_blockscaleFp8_g1u1_vs_silu_1tg_pf2_16x128.co",
+        symbol: "_ZN5aiter47fmoe_bf16_blockscaleFp8_g1u1_vs_pf2_silu_16x128E",
+        hash: "07df0af964cf26dde7635b6f524fd84701a15100f5b88fc9366599e20edeea31",
+        block_m: 16,
+        tg_per_cu: 0,
+        sub_gu: 128,
+        max_rows: 16,
+    },
+    Gfx950Tile {
+        object: "fmoe_bf16_blockscaleFp8_g1u1_vs_silu_1tg_ps_32x256.co",
+        symbol: "_ZN5aiter50fmoe_bf16_blockscaleFp8_g1u1_vs_silu_1tg_ps_32x256E",
+        hash: "6a583441c6bb139c6af20c5198614b7b02b74fdba370580a5a5bbe164bd7bb34",
+        block_m: 32,
+        tg_per_cu: 1,
+        sub_gu: 256,
+        max_rows: 64,
+    },
+    Gfx950Tile {
+        object: "fmoe_bf16_blockscaleFp8_g1u1_vs_silu_1tg_ps_32x128.co",
+        symbol: "_ZN5aiter47fmoe_bf16_blockscaleFp8_g1u1_vs_ps_silu_32x128E",
+        hash: "2b2c1852d84d47f4a03ad5814087be4b4b21e0acd9ee0efdd3f7792a6afe509a",
+        block_m: 32,
+        tg_per_cu: 2,
+        sub_gu: 128,
+        max_rows: 512,
+    },
+    Gfx950Tile {
+        object: "fmoe_bf16_blockscaleFp8_g1u1_vs_silu_1tg_ps_32x256.co",
+        symbol: "_ZN5aiter50fmoe_bf16_blockscaleFp8_g1u1_vs_silu_1tg_ps_32x256E",
+        hash: "6a583441c6bb139c6af20c5198614b7b02b74fdba370580a5a5bbe164bd7bb34",
+        block_m: 32,
+        tg_per_cu: 1,
+        sub_gu: 256,
+        max_rows: 1024,
+    },
+    Gfx950Tile {
+        object: "fmoe_bf16_blockscaleFp8_g1u1_vs_silu_1tg_ps_64x256.co",
+        symbol: "_ZN5aiter46fmoe_bf16_blockscaleFp8_g1u1_vs_ps_silu_64x256E",
+        hash: "e442ee49fd88b5d165b8f8313d790c3ec7a7978140fa2306876612191429e413",
+        block_m: 64,
+        tg_per_cu: 1,
+        sub_gu: 256,
+        max_rows: 8192,
+    },
+];
+
+#[cfg_attr(not(test), allow(dead_code))]
+pub(super) fn gfx950_tile(rows: u32) -> Option<&'static Gfx950Tile> {
+    GFX950_TILES.iter().find(|t| rows <= t.max_rows)
+}
+
+impl Gfx950Tile {
+    /// `[grid_x, grid_y, total_tgs, ps_deno]` for `rows` tokens at `n_exp`/`topk` on `cus`.
+    /// A non-persistent grid is sized by the compacted-block upper bound; the kernel stops at
+    /// num_valid.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub fn launch(&self, inter: u32, rows: u32, n_exp: u32, topk: u32, cus: u32) -> [u32; 4] {
+        let ps_deno = inter.div_ceil(self.sub_gu);
+        if self.tg_per_cu == 0 {
+            let slots = rows * topk;
+            let blocks = slots.min((slots + n_exp * (self.block_m - 1)) / self.block_m);
+            return [ps_deno, blocks, 0, ps_deno];
+        }
+        let tgs = self.tg_per_cu * cus;
+        [tgs, 1, tgs / ps_deno * ps_deno, ps_deno]
+    }
+}
+
 fn flat_moe_args(
     out: u64,
     x: u64,
@@ -1286,6 +1768,80 @@ mod tests {
         std::fs::write(dir.join(TILE64_OBJECT), b"not the pinned object").unwrap();
         assert!(!tile64_available(&dir));
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn sorted_moe_args_keep_the_gfx942_block_and_fill_the_flash_shape() {
+        let b = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11];
+        let scalars = |a: [u64; 56]| (0..28).map(|i| a[i * 2]).collect::<Vec<_>>();
+        let gfx942 = scalars(sorted_moe_args(b, GFX942_SHAPE, None, 100, 257, 9, 304, 1));
+        assert_eq!(
+            gfx942[12..],
+            [
+                6144,
+                256,
+                100,
+                257,
+                6144,
+                6144,
+                256,
+                12288,
+                512 * 6144,
+                256 * 6144,
+                192 * 4,
+                96 * 4,
+                256 * 4,
+                9,
+                304,
+                1
+            ]
+        );
+        assert_eq!(gfx942[..12], [1, 2, 3, 4, 5, 6, 7, 8, 0, 9, 10, 11]);
+        // The values the gfx950 microbench validated against a CPU reference (relL2 0.024).
+        let flash = scalars(sorted_moe_args(
+            b,
+            GFX950_FLASH_SHAPE,
+            None,
+            8,
+            289,
+            9,
+            512,
+            2,
+        ));
+        assert_eq!(
+            flash[12..],
+            [
+                4096,
+                256,
+                8,
+                289,
+                4096,
+                4096,
+                256,
+                8192,
+                512 * 4096,
+                256 * 4096,
+                128 * 4,
+                64 * 4,
+                256 * 4,
+                9,
+                512,
+                2
+            ]
+        );
+    }
+
+    #[test]
+    fn gfx950_tiles_cover_the_ladder_with_aiter_grids() {
+        let pick = |rows| gfx950_tile(rows).unwrap();
+        assert_eq!(pick(8).block_m, 16);
+        assert_eq!(pick(32).object, pick(1024).object);
+        assert_eq!(pick(128).tg_per_cu, 2);
+        assert_eq!(pick(8192).block_m, 64);
+        assert!(gfx950_tile(8193).is_none());
+        assert_eq!(pick(8).launch(256, 8, 289, 9, 256), [2, 72, 0, 2]);
+        assert_eq!(pick(128).launch(256, 128, 289, 9, 256), [512, 1, 512, 2]);
+        assert_eq!(pick(8192).launch(256, 8192, 289, 9, 256), [256, 1, 256, 1]);
     }
 
     #[test]
@@ -1636,7 +2192,7 @@ mod tests {
             .collect::<Vec<_>>();
         offsets.sort_unstable();
         assert_eq!(offsets, (0..768).collect::<Vec<_>>());
-        let w = ResidentWeights::new(base, 8192, 256);
+        let w = ResidentWeights::new(base, 8192, 256, 6144);
         assert_eq!(table[0], w.gu);
         assert_eq!(table[2], w.down);
         for e in 0..256 {
@@ -1802,7 +2358,7 @@ mod tests {
             .collect::<Vec<_>>();
         offsets.sort_unstable();
         assert_eq!(offsets, (0..771).collect::<Vec<_>>());
-        let w = ResidentWeights::new(base, 8192, 257);
+        let w = ResidentWeights::new(base, 8192, 257, 6144);
         assert_eq!((table[0], table[2]), (w.gu, w.down));
         // The shared expert is the last gate/up pair and the last down slot.
         assert_eq!(table[256 * 3], w.gu + 256 * 2 * stride);
@@ -1830,6 +2386,7 @@ mod tests {
         let dir = std::env::var("PLOW_TEST_AITER_DIR").unwrap();
         let kernel = MoeAiter::load(
             &be,
+            "gfx942",
             Path::new(&dir),
             128,
             256,
@@ -1924,7 +2481,7 @@ mod tests {
         let scales = upload(bytemuck::cast_slice(&native_scales));
         kernel.bind_resident(vec![(
             2,
-            ResidentWeights::new(weights.base, scales.base, 256),
+            ResidentWeights::new(weights.base, scales.base, 256, 6144),
         )]);
         vec![weights, scales]
     }
@@ -1935,6 +2492,7 @@ mod tests {
         let dir = std::env::var("PLOW_TEST_AITER_DIR").unwrap();
         let mut kernel = MoeAiter::load(
             &be,
+            "gfx942",
             Path::new(&dir),
             128,
             256,
@@ -2002,6 +2560,7 @@ mod tests {
                 },
                 rows,
                 mode: Mode::Flat,
+                decode: false,
             };
             kernel
                 .enqueue(&be, route, bytemuck::cast_slice(&table))
@@ -2158,10 +2717,30 @@ mod tests {
         let mut modules = Vec::new();
         let dir = std::env::var("PLOW_TEST_AITER_DIR").unwrap();
         let dir = Path::new(&dir);
-        let mut k32 =
-            MoeAiter::load(&be, dir, 8192, 256, false, false, false, &mut modules).unwrap();
-        let mut k64 =
-            MoeAiter::load(&be, dir, 8192, 256, false, false, true, &mut modules).unwrap();
+        let mut k32 = MoeAiter::load(
+            &be,
+            "gfx942",
+            dir,
+            8192,
+            256,
+            false,
+            false,
+            false,
+            &mut modules,
+        )
+        .unwrap();
+        let mut k64 = MoeAiter::load(
+            &be,
+            "gfx942",
+            dir,
+            8192,
+            256,
+            false,
+            false,
+            true,
+            &mut modules,
+        )
+        .unwrap();
         let upload = |bytes: &[u8]| {
             let m = EngineDevice::alloc(&be, bytes.len() as u64).unwrap();
             EngineDevice::upload(&be, &m, 0, bytes).unwrap();
@@ -2227,6 +2806,7 @@ mod tests {
                 },
                 rows,
                 mode: Mode::Sorted,
+                decode: false,
             };
             let padded = meta[768] as usize * 64;
             for (kernel, block_m) in [(&mut k32, 32u32), (&mut k64, 64)] {
@@ -2353,8 +2933,30 @@ mod tests {
         let mut modules = Vec::new();
         let dir = std::env::var("PLOW_TEST_AITER_DIR").unwrap();
         let dir = Path::new(&dir);
-        let k32 = MoeAiter::load(&be, dir, 8192, 256, false, false, false, &mut modules).unwrap();
-        let k64 = MoeAiter::load(&be, dir, 8192, 256, false, false, true, &mut modules).unwrap();
+        let k32 = MoeAiter::load(
+            &be,
+            "gfx942",
+            dir,
+            8192,
+            256,
+            false,
+            false,
+            false,
+            &mut modules,
+        )
+        .unwrap();
+        let k64 = MoeAiter::load(
+            &be,
+            "gfx942",
+            dir,
+            8192,
+            256,
+            false,
+            false,
+            true,
+            &mut modules,
+        )
+        .unwrap();
         let upload = |bytes: &[u8]| {
             let m = EngineDevice::alloc(&be, bytes.len() as u64).unwrap();
             EngineDevice::upload(&be, &m, 0, bytes).unwrap();
@@ -2431,6 +3033,7 @@ mod tests {
                 },
                 rows,
                 mode: Mode::Sorted,
+                decode: false,
             };
             let mut results = Vec::new();
             for (kernel, tile) in [(&k32, 32u32), (&k64, 64)] {
@@ -2581,8 +3184,30 @@ mod tests {
         let dir = std::env::var("PLOW_TEST_AITER_DIR").unwrap();
         let dir = Path::new(&dir);
         let tile64 = std::env::var("PLOW_TEST_FOLD_TILE64").is_ok_and(|v| v == "1");
-        let k256 = MoeAiter::load(&be, dir, 8192, 256, false, false, tile64, &mut modules).unwrap();
-        let k257 = MoeAiter::load(&be, dir, 8192, 257, false, false, tile64, &mut modules).unwrap();
+        let k256 = MoeAiter::load(
+            &be,
+            "gfx942",
+            dir,
+            8192,
+            256,
+            false,
+            false,
+            tile64,
+            &mut modules,
+        )
+        .unwrap();
+        let k257 = MoeAiter::load(
+            &be,
+            "gfx942",
+            dir,
+            8192,
+            257,
+            false,
+            false,
+            tile64,
+            &mut modules,
+        )
+        .unwrap();
         let upload = |bytes: &[u8]| {
             let m = EngineDevice::alloc(&be, bytes.len() as u64).unwrap();
             EngineDevice::upload(&be, &m, 0, bytes).unwrap();
@@ -2746,6 +3371,7 @@ mod tests {
                     },
                     rows,
                     mode: Mode::SortedBf16,
+                    decode: false,
                 };
                 kernel
                     .enqueue(&be, route, bytemuck::cast_slice(&table))
@@ -2973,6 +3599,7 @@ mod tests {
         let capacity = if tile64 { 2048 } else { 129 };
         let mut kernel = MoeAiter::load(
             &be,
+            "gfx942",
             Path::new(&dir),
             capacity,
             256,
@@ -3066,6 +3693,7 @@ mod tests {
                 } else {
                     Mode::Sorted
                 },
+                decode: false,
             };
             kernel
                 .enqueue(&be, route, bytemuck::cast_slice(&table))

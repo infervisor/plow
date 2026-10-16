@@ -127,6 +127,7 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--url")
     ap.add_argument("--arm")
+    ap.add_argument("--model", help="served model id (default: the first /v1/models entry)")
     ap.add_argument("--compare", nargs=2, metavar=("REFERENCE", "CANDIDATE"))
     ap.add_argument("--out", required=True)
     ap.add_argument("--lens", default="4096,16384,30000")
@@ -138,6 +139,9 @@ def main():
     ap.add_argument("--ignore-eos", action="store_true")
     ap.add_argument("--exact-lengths", action="store_true", help="use /tokenize and explicit token-ID prompts")
     ap.add_argument("--chat-template-hf", help="local checkpoint chat template; requires --exact-lengths")
+    ap.add_argument("--gen-suffix", default="",
+                    help="appended after the chat generation prompt, e.g. '</think>' for GLM-5.3-Flash, whose "
+                         "template opens a reasoning block even with thinking off (as fp32_ref_gate.py prompts)")
     a = ap.parse_args()
     if a.compare:
         captures = []
@@ -156,8 +160,11 @@ def main():
     if a.chat_template_hf and not a.exact_lengths:
         ap.error("--chat-template-hf requires --exact-lengths")
     prefix, ending = chat_frame(a.chat_template_hf) if a.chat_template_hf else ("", "")
+    if a.gen_suffix and not a.chat_template_hf:
+        ap.error("--gen-suffix requires --chat-template-hf")
+    ending += a.gen_suffix
 
-    model = json.load(urllib.request.urlopen(a.url + "/v1/models"))["data"][0]["id"]
+    model = a.model or json.load(urllib.request.urlopen(a.url + "/v1/models"))["data"][0]["id"]
     @lru_cache(maxsize=None)
     def tokenize(text):
         return post(a.url + "/tokenize", {"model": model, "prompt": text,

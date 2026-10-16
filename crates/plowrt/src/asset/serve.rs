@@ -189,36 +189,49 @@ pub fn set_checkpoint(asset_dir: &Path, checkpoint: &Path) -> Result<()> {
     }
 }
 
-/// Split one `--assets` value, `<dir>[,checkpoint=<path>]`, and record the pairing. A value that
-/// names an existing path is taken literally (a directory name may contain a comma).
+/// Split one `--assets` value, `<dir>[,checkpoint=<path>][,slug=<name>]`, and record the
+/// pairing. A value that names an existing path is taken literally (a directory name may contain
+/// a comma).
 pub fn take_asset_arg(arg: &Path) -> Result<PathBuf> {
-    let (dir, checkpoint) = split_asset_arg(arg)?;
+    take_asset_spec(arg).map(|(dir, _)| dir)
+}
+
+/// [`take_asset_arg`] plus the `slug=` the bundle is served under (default: the manifest's
+/// name), so one bundle can be served twice under two names.
+pub fn take_asset_spec(arg: &Path) -> Result<(PathBuf, Option<String>)> {
+    let (dir, checkpoint, slug) = split_asset_arg(arg)?;
     if let Some(checkpoint) = checkpoint {
         set_checkpoint(&dir, &checkpoint)?;
     }
-    Ok(dir)
+    Ok((dir, slug))
 }
 
-fn split_asset_arg(arg: &Path) -> Result<(PathBuf, Option<PathBuf>)> {
+type AssetArg = (PathBuf, Option<PathBuf>, Option<String>);
+
+fn split_asset_arg(arg: &Path) -> Result<AssetArg> {
     let Some(text) = arg.to_str().filter(|_| !arg.exists()) else {
-        return Ok((arg.to_path_buf(), None));
+        return Ok((arg.to_path_buf(), None, None));
     };
     let mut fields = text.split(',');
     let dir = PathBuf::from(fields.next().unwrap_or_default());
-    let mut checkpoint = None;
+    let (mut checkpoint, mut slug) = (None, None);
     for field in fields {
         match field.split_once('=') {
             Some(("checkpoint", path)) if !path.is_empty() && checkpoint.is_none() => {
                 checkpoint = Some(PathBuf::from(path))
             }
+            // `#` is the DP rank separator of an instance key (`serve::dp::rank_key`).
+            Some(("slug", name)) if !name.is_empty() && !name.contains('#') && slug.is_none() => {
+                slug = Some(name.to_string())
+            }
             _ => {
                 return Err(RuntimeError::Rejected(format!(
-                    "--assets {text:?}: expected DIR[,checkpoint=PATH]"
+                    "--assets {text:?}: expected DIR[,checkpoint=PATH][,slug=NAME]"
                 )))
             }
         }
     }
-    Ok((dir, checkpoint))
+    Ok((dir, checkpoint, slug))
 }
 
 /// The checkpoint a bundle serves against: the explicit per-bundle pairing
@@ -499,14 +512,22 @@ mod tests {
         let arg = format!("{},checkpoint=/hf/model@abc", dir.display());
         assert_eq!(
             split_asset_arg(Path::new(&arg)).unwrap(),
-            (dir.clone(), Some(PathBuf::from("/hf/model@abc")))
+            (dir.clone(), Some(PathBuf::from("/hf/model@abc")), None)
         );
-        assert_eq!(split_asset_arg(&dir).unwrap(), (dir.clone(), None));
+        assert_eq!(split_asset_arg(&dir).unwrap(), (dir.clone(), None, None));
+        assert_eq!(
+            split_asset_arg(Path::new(&format!("{},slug=glm-b,checkpoint=/c", dir.display())))
+                .unwrap(),
+            (dir.clone(), Some(PathBuf::from("/c")), Some("glm-b".to_string()))
+        );
         for bad in [
             ",checkpoint=",
             ",ckpt=/x",
             ",checkpoint=/a,checkpoint=/b",
             ",",
+            ",slug=",
+            ",slug=a#1",
+            ",slug=a,slug=b",
         ] {
             assert!(
                 split_asset_arg(Path::new(&format!("{}{bad}", dir.display()))).is_err(),
@@ -516,7 +537,7 @@ mod tests {
         // An existing path is literal even with a comma in its name.
         let comma = dir.join("a,checkpoint=b");
         std::fs::create_dir_all(&comma).unwrap();
-        assert_eq!(split_asset_arg(&comma).unwrap(), (comma.clone(), None));
+        assert_eq!(split_asset_arg(&comma).unwrap(), (comma.clone(), None, None));
 
         assert_eq!(take_asset_arg(Path::new(&arg)).unwrap(), dir);
         assert_eq!(

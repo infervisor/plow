@@ -48,6 +48,7 @@ fn kimi_ref_cfg() -> GlmCfg {
         softmax_layers: vec![],
         has_dsa: false,
         quark_mixed: false,
+        swiglu_limit: None,
     }
 }
 
@@ -1517,6 +1518,7 @@ fn mla_prefill_stays_dense_under_an_armed_dsa_gate() {
     // the routing assertions below are unchanged and are what the test is actually about.
     c.index_heads = 32;
     c.index_dim = 128;
+    c.index_topk = 2048;
     c.indexer_full = vec![false, true, false, false];
     let (m, _) = glm_build_block_pf(
         &c,

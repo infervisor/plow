@@ -301,6 +301,7 @@ def cmd_prompts(a):
     import glm53_needle_probe as needle
     tok = AutoTokenizer.from_pretrained(a.hf, local_files_only=True)
     enc = lambda s: tok(s, add_special_tokens=False)["input_ids"]
+    bos = [] if tok.bos_token_id is None else [tok.bos_token_id]  # GLM-5.3-Flash has no BOS
     corpora, sources = {}, {}
     for spec in a.corpus:
         name, path = spec.split("=", 1)
@@ -323,8 +324,9 @@ def cmd_prompts(a):
             cases.append(dict(id=f"nat-{name}-{n}", kind="natural", prompt_ids=ids, max_new=a.natural_new))
     for cid, (msgs, tools) in chats(text_of).items():
         text = tok.apply_chat_template(msgs, tools=tools, add_generation_prompt=True, tokenize=False, enable_thinking=False)
-        cases.append(dict(id=cid, kind="chat", prompt_ids=enc(text), max_new=a.chat_new))
+        cases.append(dict(id=cid, kind="chat", prompt_ids=enc(text + a.gen_suffix), max_new=a.chat_new))
     prefix, ending = needle.chat_frame(a.hf)
+    ending += a.gen_suffix
     for n in [int(x) for x in a.needle_lens.split(",")]:
         for d in [float(x) for x in a.needle_depths.split(",")]:
             for nid, sentence, question, expect in needle.NEEDLES:
@@ -341,7 +343,8 @@ def cmd_prompts(a):
         if len(c["prompt_ids"]) + c["max_new"] > a.max_ctx:
             raise SystemExit(f"{c['id']}: {len(c['prompt_ids'])} + {c['max_new']} exceeds --max-ctx {a.max_ctx}")
         c["prompt_sha256_u32le"] = ids_sha(c["prompt_ids"])
-    out = dict(schema="plow.fp32ref.prompts.v1", tokenizer=str(Path(a.hf).resolve()), sources=sources, cases=cases)
+    out = dict(schema="plow.fp32ref.prompts.v1", tokenizer=str(Path(a.hf).resolve()), sources=sources,
+               gen_suffix=a.gen_suffix, cases=cases)
     Path(a.out).write_text(json.dumps(out))
     for c in cases:
         print(f"{c['id']:<28} {c['kind']:<8} {len(c['prompt_ids']):>6} +{c['max_new']}")
@@ -396,6 +399,19 @@ def fp32_attention(module, query, key, value, attention_mask, dropout=0.0, scali
     return out.transpose(1, 2).contiguous(), None
 
 
+def dequant(w, scale):
+    """Exact FP32 weight from checkpoint codes: per-output-channel scale ([N, 1], Gemma-4) or a
+    [128, 128]-block scale grid (`_scale_inv`, GLM-5.3-Flash) expanded over the weight."""
+    import torch
+    w = w.to(torch.float32)
+    if scale is None:
+        return w
+    scale = scale.to(torch.float32)
+    if scale.shape[-2:] != (w.shape[-2], 1):
+        scale = scale.repeat_interleave(128, -2).repeat_interleave(128, -1)[..., :w.shape[-2], :w.shape[-1]]
+    return w * scale
+
+
 def compact_experts_class():
     """Gemma-4 MoE experts kept in checkpoint storage (BF16, or FP8 + per-channel scale) and
     dequantized per expert to FP32 inside forward: the FP32 26B-A4B (103 GB) does not fit one GPU,
@@ -435,6 +451,107 @@ def compact_experts_class():
     return CompactExperts
 
 
+# GLM-5.3-Flash checkpoint names -> transformers' glm5_next modules (its from_pretrained renames).
+GLM_RENAMES = (("self_attn.f_a_proj.", "self_attn.forget_gate.f_a_proj."),
+               ("self_attn.f_b_proj.", "self_attn.forget_gate.f_b_proj."),
+               ("self_attn.dt_bias", "self_attn.forget_gate.dt_bias"),
+               ("self_attn.A_log", "self_attn.forget_gate.A_log"),
+               ("hc_attn_", "attn_hc."), ("hc_ffn_", "ffn_hc."))
+
+
+def glm_slot(name, w, scale, parts):
+    """Checkpoint tensor -> glm5_next model slot: HF's renames, q/k/v conv1d and per-expert
+    gate/up concatenated along dim 0 (exact: 2048 is a multiple of the 128 scale block). Returns
+    None until a concatenation's other parts have arrived; `parts` holds the pending ones."""
+    import torch
+    for src, dst in GLM_RENAMES:
+        name = name.replace(src, dst)
+    parent, _, leaf = name.rpartition(".")
+    stem, _, part = parent.rpartition(".")
+    expert = leaf == "weight" and stem.rpartition(".")[0].endswith(".experts")
+    if leaf == "weight" and (part.endswith("_conv1d") or expert and part != "down_proj"):
+        order, target = ((("q_conv1d", "k_conv1d", "v_conv1d"), "conv1d.weight") if part.endswith("_conv1d")
+                         else (("gate_proj", "up_proj"), "gate_up_proj"))
+        group = parts.setdefault(stem, {})
+        group[part] = (w, scale)
+        if any(p not in group for p in order):
+            return None
+        del parts[stem]
+        w = torch.cat([group[p][0] for p in order], 0)
+        scale = None if scale is None else torch.cat([group[p][1] for p in order], 0)
+        return f"{stem}.{target}", w, scale
+    return (parent if expert else name), w, scale
+
+
+def glm5_experts_class():
+    """GLM-5.3-Flash routed experts (288 per layer, 300 GB of block-FP8 codes: no FP32 copy fits
+    anywhere) kept per layer as one checkpoint-precision tensor, pinned in host memory under
+    offload, and dequantized per hit expert on the compute device inside HF's own gate math."""
+    import torch
+    from torch import nn
+    from transformers.models.glm5_next.modeling_glm5_next import Glm5NextTextExperts
+
+    class CompactExperts(Glm5NextTextExperts):
+        def __init__(self, config):
+            nn.Module.__init__(self)
+            self.num_experts = config.num_local_experts
+            self.swiglu_limit = config.swiglu_limit
+            self.w, self.s = {}, {}
+            self.register_buffer("gate_up_proj", torch.empty(0), persistent=False)
+            self.register_buffer("down_proj", torch.empty(0), persistent=False)
+
+        def load(self, which, e, w, scale, pin):
+            if which not in self.w:
+                self.w[which] = torch.empty((self.num_experts, *w.shape), dtype=w.dtype, device=w.device, pin_memory=pin)
+                self.s[which] = None if scale is None else torch.empty(
+                    (self.num_experts, *scale.shape), dtype=torch.float32, device=w.device, pin_memory=pin)
+            self.w[which][e].copy_(w)
+            if scale is not None:
+                self.s[which][e].copy_(scale)
+
+        def weight(self, which, e, device):
+            s = self.s[which]
+            return dequant(self.w[which][e].to(device, non_blocking=True), None if s is None else s[e].to(device))
+
+        def forward(self, hidden_states, top_k_index, top_k_weights):
+            dev = hidden_states.device
+            final = torch.zeros_like(hidden_states)
+            mask = nn.functional.one_hot(top_k_index, num_classes=self.num_experts).permute(2, 1, 0)
+            for e in torch.greater(mask.sum(dim=(-1, -2)), 0).nonzero()[:, 0].tolist():
+                top_k_pos, token_idx = torch.where(mask[e])
+                current = self._apply_gate(nn.functional.linear(hidden_states[token_idx], self.weight("gate_up_proj", e, dev)))
+                current = nn.functional.linear(current, self.weight("down_proj", e, dev)) * top_k_weights[token_idx, top_k_pos, None]
+                final.index_add_(0, token_idx, current)
+            return final
+
+    return CompactExperts
+
+
+def glm5_text_lm_class():
+    """Text-only causal LM over Glm5NextTextModel: the hub Glm5NextForConditionalGeneration also
+    instantiates the vision tower, which the reference never runs."""
+    from torch import nn
+    from transformers.modeling_outputs import MoeCausalLMOutputWithPast
+    from transformers.models.glm5_next import modeling_glm5_next as m
+
+    class Glm5NextTextForCausalLM(m.Glm5NextPreTrainedModel):
+        config: m.Glm5NextTextConfig
+
+        def __init__(self, config):
+            super().__init__(config)
+            self.model = m.Glm5NextTextModel(config)
+            self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
+            self.post_init()
+
+        def forward(self, input_ids, attention_mask=None, past_key_values=None, use_cache=None, logits_to_keep=0, **kwargs):
+            out = self.model(input_ids=input_ids, attention_mask=attention_mask, past_key_values=past_key_values,
+                             use_cache=use_cache, **kwargs)
+            logits = self.lm_head(out.last_hidden_state[:, slice(-logits_to_keep, None)])
+            return MoeCausalLMOutputWithPast(logits=logits, past_key_values=out.past_key_values)
+
+    return Glm5NextTextForCausalLM
+
+
 def scaled_tensors(files, device="cuda"):
     """Yield (key, tensor, scale or None) for each language-model tensor. Scales are resolved
     checkpoint-wide (a shard boundary may split a tensor from its scale); an FP8 tensor with no
@@ -448,10 +565,13 @@ def scaled_tensors(files, device="cuda"):
         for f in shards:
             for k in sorted(f.keys()):
                 # The text tower, plus an untied output head (Qwen3.5: top-level lm_head.weight).
-                if (not k.startswith("model.language_model.") and k != "lm_head.weight") or k.endswith("weight_scale"):
+                if not (k.startswith("model.language_model.") or k == "lm_head.weight") or k.endswith(("weight_scale", "weight_scale_inv")):
                     continue
-                # Experts: <...>.experts.gate_up_proj + ".weight_scale"; dense: <...>.weight + "_scale".
+                # Experts: <...>.experts.gate_up_proj + ".weight_scale"; dense: <...>.weight + "_scale";
+                # block FP8: <...>.weight + "_scale_inv".
                 sk = k + (".weight_scale" if k.rpartition(".")[0].endswith(".experts") else "_scale")
+                if sk not in where and k + "_scale_inv" in where:
+                    sk = k + "_scale_inv"
                 w = f.get_tensor(k)
                 scale = where[sk].get_tensor(sk) if sk in where else None
                 if scale is None and w.dtype in (torch.float8_e4m3fn, torch.float8_e5m2):
@@ -495,10 +615,7 @@ def offload_layers(model, compact, headroom_gib):
     def pre(j):
         def hook(_m, _a):
             for p, shape, w, scale in store[j]:
-                d = w.to("cuda", non_blocking=True).to(torch.float32)
-                if scale is not None:
-                    d = d * scale
-                p.data = d.reshape(shape)
+                p.data = dequant(w.to("cuda", non_blocking=True), scale).reshape(shape)
         return hook
 
     def post(j):
@@ -526,7 +643,14 @@ def load_fp32(hf, device="cuda", compact=None, headroom_gib=40.0):
     AttentionInterface.register("sdpa", fp32_attention)
     cfg = AutoConfig.from_pretrained(hf).text_config
     moe = bool(getattr(cfg, "enable_moe_block", False))
-    if moe or cfg.model_type == "gemma4_text":  # hub Gemma-4 (E2B/E4B per-layer inputs, 26B MoE, 31B)
+    glm = cfg.model_type == "glm5_next_text"
+    if glm:  # GLM-5.3-Flash: 34 KDA + 11 sparse-MLA layers, 288 block-FP8 experts per MoE layer
+        # Import before the modeling module binds its kernels: HF's pure-torch KDA / conv1d paths.
+        sys.modules["fla"] = sys.modules["causal_conv1d"] = None
+        from transformers.models.glm5_next import modeling_glm5_next
+        modeling_glm5_next.Glm5NextTextExperts = glm5_experts_class()
+        model_class = glm5_text_lm_class()
+    elif moe or cfg.model_type == "gemma4_text":  # hub Gemma-4 (E2B/E4B per-layer inputs, 26B MoE, 31B)
         from transformers.models.gemma4 import modeling_gemma4
         if moe:
             modeling_gemma4.Gemma4TextExperts = compact_experts_class()
@@ -545,31 +669,39 @@ def load_fp32(hf, device="cuda", compact=None, headroom_gib=40.0):
     params.update(dict(model.named_buffers()))
     loaded, unused = set(), []
     experts = 0
+    parts = {}
     files = sorted(Path(hf).glob("*.safetensors"))
     for k, w, scale in scaled_tensors(files, device):
-        name = k if k == "lm_head.weight" else "model." + k.removeprefix("model.language_model.")
+        name = "model." + k.removeprefix("model.language_model.") if k.startswith("model.language_model.") else k
+        if glm:
+            slot = glm_slot(name, w, scale, parts)
+            if slot is None:
+                continue
+            name, w, scale = slot
         parent, _, leaf = name.rpartition(".")
         if moe and leaf in ("gate_up_proj", "down_proj") and parent.endswith(".experts"):
             model.get_submodule(parent).load(leaf, w, scale)
             experts += 1
             continue
-        if name not in params:  # e.g. k/v of KV-shared layers: the model never reads them
+        if glm and leaf in ("gate_up_proj", "down_proj") and parent.rpartition(".")[0].endswith(".experts"):
+            owner, _, e = parent.rpartition(".")
+            if owner + ".gate_up_proj" not in params:  # the MTP layer's experts
+                unused.append(k)
+                continue
+            model.get_submodule(owner).load(leaf, int(e), w, scale, pin=compact is not None)
+            experts += 1
+            continue
+        if name not in params:  # e.g. k/v of KV-shared layers, the GLM MTP layer: the model never reads them
             unused.append(k)
             continue
         if compact is not None:  # offload: keep checkpoint precision, materialize per forward
             if name.startswith("model.layers.") and name in weights_of:
                 compact[name] = (w, scale)
             else:
-                w = w.to(torch.float32)
-                if scale is not None:
-                    w = w * scale.to(torch.float32)
-                params[name].data = w.reshape(params[name].shape)
+                params[name].data = dequant(w, scale).reshape(params[name].shape)
             loaded.add(name)
             continue
-        w = w.to(torch.float32)
-        if scale is not None:  # FP8 per-output-channel: dequantize exactly in FP32
-            w = w * scale.to(torch.float32)
-        params[name].data.copy_(w.reshape(params[name].shape))
+        params[name].data.copy_(dequant(w, scale).reshape(params[name].shape))
         loaded.add(name)
     model.tie_weights()
     if getattr(cfg, "tie_word_embeddings", True):
@@ -577,10 +709,14 @@ def load_fp32(hf, device="cuda", compact=None, headroom_gib=40.0):
     unset = [n for n, _ in model.named_parameters() if n not in loaded]
     if unset:
         raise SystemExit(f"FP32 parameters not loaded from the checkpoint: {unset[:8]}")
+    if parts:
+        raise SystemExit(f"incomplete concatenated tensors: {sorted(parts)[:4]}")
     if unused:
         print(f"{len(unused)} checkpoint tensors have no FP32 model slot (unused by the model): {unused[:4]} ...")
     if moe and experts != 2 * cfg.num_hidden_layers:
         raise SystemExit(f"expert tensors loaded: {experts}, expected {2 * cfg.num_hidden_layers}")
+    if glm and experts != (want := 2 * cfg.num_local_experts * cfg.mlp_layer_types.count("sparse")):
+        raise SystemExit(f"expert tensors loaded: {experts}, expected {want}")
     return model, [dict(file=str(p), sha256=file_sha(p)) for p in files]
 
 
@@ -595,7 +731,9 @@ def cmd_reference(a):
     tok = AutoTokenizer.from_pretrained(a.hf, local_files_only=True)
     eos = model_eos(a.hf)
     prompts = json.loads(Path(a.prompts).read_text())
+    t_load = time.time()
     model, weights = load_fp32(a.hf, a.device, headroom_gib=a.offload_headroom_gib)
+    print(f"FP32 model loaded in {time.time() - t_load:.0f}s", flush=True)
     # HF's sliding cache keeps its last-window slice as a view of the whole prefill K/V, so every
     # sliding layer pins prompt-length K/V (31B at 32K: 54 GB in FP32). Copy the window out.
     from transformers import cache_utils
@@ -610,6 +748,10 @@ def cmd_reference(a):
     # Long prompts compute their masks inside fp32_attention (causal + sliding window): HF would
     # materialize a q x kv mask per layer type, 64 GiB at 262144 tokens.
     no_masks = {t: None for t in set(getattr(model.config, "layer_types", None) or ["full_attention"])}
+    eos_cfg = model.config.eos_token_id
+    eos = set(eos_cfg if isinstance(eos_cfg, list) else [eos_cfg] if eos_cfg is not None else []) | {tok.eos_token_id} - {None}
+    if model.config.model_type.startswith("gemma"):  # EOS holds Gemma-4 ids; they are ordinary tokens elsewhere ('"', 'S' in GLM)
+        eos |= set(EOS)
     cases = []
     t0 = time.time()
     with torch.no_grad():
@@ -619,15 +761,19 @@ def cmd_reference(a):
             ids = c["prompt_ids"]
             x = torch.tensor([ids], device=dev)
             masks = no_masks if len(ids) > LONG_KV else None
+            t_case = time.time()
             out = model(input_ids=x, attention_mask=masks, use_cache=True, logits_to_keep=1)
             cont = []
             while True:
                 t = int(out.logits[0, -1].argmax())
+                if not cont:
+                    t_prefill, t_decode = time.time() - t_case, time.time()
                 cont.append(t)
                 if t in eos or len(cont) == c["max_new"]:
                     break
                 out = model(input_ids=torch.tensor([[t]], device=dev), past_key_values=out.past_key_values,
                             attention_mask=masks, use_cache=True)
+            t_decode = (time.time() - t_decode) / max(len(cont) - 1, 1)
             del out
             # Teacher-forced pass over the full sequence: the scored distributions.
             logits = model(input_ids=torch.tensor([ids + cont[:-1]], device=dev), attention_mask=masks,
@@ -645,10 +791,11 @@ def cmd_reference(a):
                 row["ref_correct"] = c["expect"] in row["cont_text"]
             cases.append(row)
             print(f"{c['id']:<28} prompt {len(ids):>6} cont {len(cont):>3} min margin "
-                  f"{min(p['margin'] for p in pos):.3f} tf-mismatch {mism} {time.time() - t0:.0f}s", flush=True)
+                  f"{min(p['margin'] for p in pos):.3f} tf-mismatch {mism} prefill {t_prefill:.1f}s "
+                  f"decode {t_decode:.2f}s/tok {time.time() - t0:.0f}s", flush=True)
     meta = dict(schema="plow.fp32ref.v1", prompts=str(Path(a.prompts).resolve()), prompts_sha256=file_sha(a.prompts),
                 weights=weights, dtype="float32", tf32=False, attention="fp32 chunked math",
-                dequant="fp8_e4m3 weight x per-channel scale in fp32", torch=torch.__version__,
+                dequant="fp8_e4m3 weight x per-channel or [128,128]-block scale in fp32", torch=torch.__version__,
                 transformers=transformers.__version__, device=(torch.cuda.get_device_name() + (" + host offload" if a.device == "offload" else "")) if dev == "cuda" else f"cpu ({torch.get_num_threads()} threads)",
                 utc=time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), top=TOP, eos=eos)
     Path(a.out).write_text(json.dumps(dict(meta=meta, cases=cases)))
@@ -807,6 +954,10 @@ def main():
     pr.add_argument("--needle-lens", default="4096,15872")
     pr.add_argument("--needle-depths", default="0.1,0.5,0.9")
     pr.add_argument("--needle-new", type=int, default=16)
+    pr.add_argument("--gen-suffix", default="",
+                    help="appended after the generation prompt of chat and needle cases, e.g. '</think>' for "
+                         "GLM-5.3-Flash, whose template always opens a reasoning block (needles must answer "
+                         "within --needle-new tokens)")
     pr.add_argument("--max-ctx", type=int, default=16384)
     pr.add_argument("--drop-over-ctx", action="store_true",
                     help="drop (and list) cases longer than --max-ctx instead of failing")

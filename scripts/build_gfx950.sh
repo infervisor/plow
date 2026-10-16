@@ -44,6 +44,67 @@ case "${PLOW_MLA_PF_TR16:-0}" in
   1) FLASH_TR16="-DPLOW_MLA_PF_SV=1 -DPLOW_MLA_PF_TR16=1" ;;
   *) echo "PLOW_MLA_PF_TR16 must be 0 or 1" >&2; exit 2 ;;
 esac
+# FA_MLA_PF2_DEFER=1 (default unset = the running-max V2 softmax): the deferred-frame online
+# softmax in the FLASH objects, as gfx942 ships it (op_attention_common.h; not bit-identical —
+# gated there on the decode-oracle error class and long-context needles). FA_MLA_PF2_FRAME /
+# FA_MLA_PF2_FASTBF pass through likewise.
+case "${FA_MLA_PF2_DEFER:-}" in
+  '') ;;
+  0|1) FLASH_TR16="$FLASH_TR16 -DFA_MLA_PF2_DEFER=$FA_MLA_PF2_DEFER" ;;
+  *) echo "FA_MLA_PF2_DEFER must be 0 or 1" >&2; exit 2 ;;
+esac
+[ -z "${FA_MLA_PF2_FRAME:-}" ] || FLASH_TR16="$FLASH_TR16 -DFA_MLA_PF2_FRAME=$FA_MLA_PF2_FRAME"
+[ -z "${FA_MLA_PF2_FASTBF:-}" ] || FLASH_TR16="$FLASH_TR16 -DFA_MLA_PF2_FASTBF=$FA_MLA_PF2_FASTBF"
+# PLOW_MLA_PF2_DPP=1: the V2 softmax's 16-lane butterflies as DPP moves (bit-identical).
+case "${PLOW_MLA_PF2_DPP:-0}" in
+  0) ;;
+  1) FLASH_TR16="$FLASH_TR16 -DPLOW_MLA_PF2_DPP=1" ;;
+  *) echo "PLOW_MLA_PF2_DPP must be 0 or 1" >&2; exit 2 ;;
+esac
+# PLOW_MLA_PF2_PCVT=1: the running-max V2 P strip without f2bf's dead NaN guard (bit-identical).
+case "${PLOW_MLA_PF2_PCVT:-0}" in
+  0) ;;
+  1) FLASH_TR16="$FLASH_TR16 -DPLOW_MLA_PF2_PCVT=1" ;;
+  *) echo "PLOW_MLA_PF2_PCVT must be 0 or 1" >&2; exit 2 ;;
+esac
+# PLOW_MLA_PF_SNAKE (default 1; =0 rolls back): the V2 MLA prefill deals its (q-tile, head, split)
+# items heaviest-first, rounds boustrophedon over the workgroups (op_attention_common.h; bit-identical,
+# item->WG map only). GLM-5.3-Flash TP8 MI350X: flash 29.6 -> 20.6 ms per 8k chunk at c0=0, 66.0 ->
+# 57.9 at c0=8k; 8k prefill 272.2 -> 264.0 ms, 16k 598.6 -> 583.4; streams byte-equal.
+case "${PLOW_MLA_PF_SNAKE:-1}" in
+  0) ;;
+  1) FLASH_TR16="$FLASH_TR16 -DPLOW_MLA_PF_SNAKE=1" ;;
+  *) echo "PLOW_MLA_PF_SNAKE must be 0 or 1" >&2; exit 2 ;;
+esac
+# PLOW_KDA_PREP_COLSCAN (default 1 in prefill objects; =0 rolls back): the KDA chunk-prepare gate
+# prefix with lanes on the (head, dim) axis and the shuffle scan replayed per column (op_kda.h;
+# coalesced loads/stores, bit-identical). PLOW_KDA_GNORM_ILP (default 1 in prefill objects; =0
+# rolls back): the KDA output gated RMSNorm issues four rows' loads per wave pass (bit-identical).
+for k in PLOW_KDA_PREP_COLSCAN PLOW_KDA_GNORM_ILP; do
+  case "${!k:-1}" in
+    0) INC="$INC -D$k=0" ;;
+    1) ;;
+    *) echo "$k must be 0 or 1" >&2; exit 2 ;;
+  esac
+done
+# PLOW_KDA_CARRY_PIPE=1 / PLOW_KDA_CARRY_KTR16=1: regstate KDA carry load schedule and
+# transposed key-tile reads (op_kda_carry_regstate.h; both bit-identical).
+KDA_CARRY_DEFS=""
+for k in PLOW_KDA_CARRY_PIPE PLOW_KDA_CARRY_KTR16; do
+  case "${!k:-0}" in
+    0) ;;
+    1) KDA_CARRY_DEFS="$KDA_CARRY_DEFS -D$k=1" ;;
+    *) echo "$k must be 0 or 1" >&2; exit 2 ;;
+  esac
+done
+# PLOW_KDA_CARRY_XCD (default 1 in the keyfeed carry; =0 rolls back): a head's eight V16 state
+# tiles go to workgroups on one XCD so they share its L2 copy of the head's chunk factors (item ->
+# workgroup map only; bit-identical). Keyfeed carry at H=8: 413 -> 376 us per 8k chunk.
+case "${PLOW_KDA_CARRY_XCD:-1}" in
+  0) KDA_CARRY_DEFS="$KDA_CARRY_DEFS -DPLOW_KDA_CARRY_XCD=0" ;;
+  1) ;;
+  *) echo "PLOW_KDA_CARRY_XCD must be 0 or 1" >&2; exit 2 ;;
+esac
 case "${PLOW_MLA_SPARSE:-0}" in
   0) ;;
   1) [ "${PLOW_MLA_PF_TR16:-0}" = 1 ] || { echo "PLOW_MLA_SPARSE=1 requires PLOW_MLA_PF_TR16=1" >&2; exit 2; }
@@ -94,15 +155,131 @@ case "${PLOW_MLA_DEC_MINPER:-0}" in
   *[!0-9]*) echo "PLOW_MLA_DEC_MINPER must be a row count" >&2; exit 2 ;;
   *) DEC_KNOBS="$DEC_KNOBS -DPLOW_MLA_DEC_MINPER=$PLOW_MLA_DEC_MINPER" ;;
 esac
+# PLOW_MLA_DEC_HPACK (decode-MLA segment objects only): GF=8 NoPE dense flash packets run on
+# the head-packed MFMA kernel (=1, d_flash_mla_decode_mfma) or the scalar GF=8 arm (=2).
+DMLA_X=""
+case "${PLOW_MLA_DEC_HPACK:-0}" in
+  0) ;;
+  1) DMLA_X="-DPLOW_MLA_DEC_HPACK=1" ;;
+  2) DMLA_X="-DPLOW_GLM_GF8_ARM=1" ;;
+  *) echo "PLOW_MLA_DEC_HPACK must be 0, 1 or 2" >&2; exit 2 ;;
+esac
+# PLOW_MLA_DEC_FOLD_MFMA=1 (decode-MLA segment objects only): rungs of >= 32 rows fold through
+# the batched MFMA GEMM (bf16-rounded latent, as PLOW_K3_PF_FOLD_MFMA) instead of one W_uv panel
+# stream per (row, head). Not bit-identical to the scalar fold.
+# PLOW_MLA_DEC_HP8_ASYNC=<2|3|4> (decode-MLA objects, with HPACK=1): the hp8 flash moves its KV
+# tiles HBM -> LDS by global_load_lds through an NS-stage ring (NS-1 tiles in flight). Same
+# arithmetic as hp8.
+case "${PLOW_MLA_DEC_HP8_ASYNC:-0}" in
+  0) ;;
+  2|3|4) DMLA_X="$DMLA_X -DPLOW_MLA_DEC_HP8_ASYNC=$PLOW_MLA_DEC_HP8_ASYNC" ;;
+  *) echo "PLOW_MLA_DEC_HP8_ASYNC must be 0, 2, 3 or 4" >&2; exit 2 ;;
+esac
+# PLOW_MLA_DEC_FOLD_TB=<2|4|8> (decode-MLA objects): the token-blocked fold (TB tokens of one
+# head per workgroup, one W_uv panel stream per TB tokens) where it fills the grid (B128: TB=4).
+case "${PLOW_MLA_DEC_FOLD_TB:-0}" in
+  0) ;;
+  2|4|8) DMLA_X="$DMLA_X -DPLOW_MLA_FOLD_TB=$PLOW_MLA_DEC_FOLD_TB" ;;
+  *) echo "PLOW_MLA_DEC_FOLD_TB must be 0, 2, 4 or 8" >&2; exit 2 ;;
+esac
+case "${PLOW_MLA_DEC_FOLD_MFMA:-0}" in
+  0) ;;
+  1) DMLA_X="$DMLA_X -DPLOW_MLA_FOLD_MFMA=1 -DPLOW_MLA_FOLD_MFMA_NS=4 -DPLOW_MLA_FOLD_MFMA_MIN_ROWS=32" ;;
+  *) echo "PLOW_MLA_DEC_FOLD_MFMA must be 0 or 1" >&2; exit 2 ;;
+esac
 case "${PLOW_MOE_GLU_KW:-0}" in
   0) ;;
-  1) DEC_KNOBS="$DEC_KNOBS -DPLOW_MOE_GLU_KW=1" ;;
+  1) A4W4_BK="$A4W4_BK -DPLOW_MOE_GLU_KW=1" ;;
   *) echo "PLOW_MOE_GLU_KW must be 0 or 1" >&2; exit 2 ;;
+esac
+# PLOW_MOE_DEC_W8_SPLITN: the W8A8 decode GLU on 128-column tiles when 256-column tiles would
+# leave half the workgroups idle (moe_pf_w8a8.h). Bit-identical. Default on.
+case "${PLOW_MOE_DEC_W8_SPLITN:-1}" in
+  0) ;;
+  1) DEC_KNOBS="$DEC_KNOBS -DPLOW_MOE_DEC_W8_SPLITN=1" ;;
+  *) echo "PLOW_MOE_DEC_W8_SPLITN must be 0 or 1" >&2; exit 2 ;;
 esac
 case "${PLOW_MERGE_UNROLL4:-0}" in
   0) ;;
   1) DEC_KNOBS="$DEC_KNOBS -DFA_MERGE_UNROLL4=1" ;;
   *) echo "PLOW_MERGE_UNROLL4 must be 0 or 1" >&2; exit 2 ;;
+esac
+# PLOW_XR_TAGGED (default 1; 0 = rollback): decode one-shot XReduce publishes tagged data words and
+# spins on the tags instead of the xctr gate (op_collective.h; the CMake build's default).
+# Bit-identical. A message wider than the tag slot (batched rungs) keeps the gate one-shot.
+case "${PLOW_XR_TAGGED:-1}" in
+  0) ;;
+  1) DEC_KNOBS="$DEC_KNOBS -DPLOW_XR_TAGGED=1" ;;
+  *) echo "PLOW_XR_TAGGED must be 0 or 1" >&2; exit 2 ;;
+esac
+# PLOW_XR_DEC_AGG (default 1; 0 = rollback): device-local aggregation of the two-shot's all-gather
+# signal (PLOW_XR_AGG, build_gfx942.sh's default) in the decode objects, for packets emitted with
+# PLOW_XR_DEC_TWOSHOT_MIN. Bit-identical; inert without decode two-shots.
+# PLOW_FA_DEC_KL=8: decode flash K-phase with eight lanes per KV row (gfx942's map; one 128-byte
+# line per row per instruction instead of 64 rows per instruction) plus the interleaved row->wave
+# map. NOT bit-identical (the per-row dot is summed in a different order); 1 = shipped map.
+case "${PLOW_FA_DEC_KL:-1}" in
+  1) ;;
+  8) DEC_KNOBS="$DEC_KNOBS -DFA_DEC_KL=8 -DFA_DEC_ILV=1" ;;
+  *) echo "PLOW_FA_DEC_KL must be 1 or 8" >&2; exit 2 ;;
+esac
+# PLOW_XR_DEC_MLP (default 1; 0 = rollback): the peer-batched reduce (PLOW_XR_MLP, op_collective.h)
+# in the decode objects only. Measured null for gfx942's bandwidth-bound prefill reduce-scatter; a decode one-shot past
+# the tag slot (B=8: 64 KiB, one element per thread) is the latency-bound case it was written for.
+# Bit-identical; B=8 all-reduce 25.2 -> 18.5 us (gfx950 TP8 trace).
+case "${PLOW_XR_DEC_MLP:-1}" in
+  0) ;;
+  1) DEC_KNOBS="$DEC_KNOBS -DPLOW_XR_MLP=1" ;;
+  *) echo "PLOW_XR_DEC_MLP must be 0 or 1" >&2; exit 2 ;;
+esac
+# PLOW_XR_DEC_VEC (default 0 = off; 2/4/8): the decode one-shot reduce loads that many bf16 per
+# peer per thread (PLOW_XR_VEC, op_collective.h) for the batched rungs' gate path. Bit-identical.
+# MEASURED SLOWER, keep 0 (tp_allreduce_bench cold, 8x MI350X, [128,4096] at 256 WGs: 52.3 us
+# scalar vs 59.6 (V=4) / 59.0 (V=8)). The lever there is fewer workgroups: PLOW_XR_DEC_CUS=64
+# gives 31.3 us (B=32 shape 27.1 -> 15.6, B=8 18.5 -> 11.5).
+case "${PLOW_XR_DEC_VEC:-0}" in
+  0) ;;
+  2|4|8) DEC_KNOBS="$DEC_KNOBS -DPLOW_XR_VEC=$PLOW_XR_DEC_VEC" ;;
+  *) echo "PLOW_XR_DEC_VEC must be 0, 2, 4 or 8" >&2; exit 2 ;;
+esac
+# PLOW_XR_TAG_SLOT (default 20480; bytes, multiple of 256): the tagged one-shot slot of the decode
+# objects. 90112 lets B=8 x hidden 4096 take the tagged path. Serve with the same PLOW_XR_TAG_SLOT.
+# Bench (cold, 64 WGs): B=8 message 11.5 us gate -> 7.6 us tagged; B=32 15.9 -> 15.3 (no gain).
+case "${PLOW_XR_TAG_SLOT:-20480}" in
+  20480) ;;
+  *[!0-9]*) echo "PLOW_XR_TAG_SLOT must be a byte count" >&2; exit 2 ;;
+  *) if [ $((PLOW_XR_TAG_SLOT % 256)) -ne 0 ] || [ "$PLOW_XR_TAG_SLOT" -lt 20480 ]; then
+       echo "PLOW_XR_TAG_SLOT must be a multiple of 256, >= 20480" >&2; exit 2
+     fi
+     DEC_KNOBS="$DEC_KNOBS -DPLOW_XR_TAG_SLOT_BYTES=${PLOW_XR_TAG_SLOT}u -DPLOW_XR_TAG_SLOT_BYTES_N=$PLOW_XR_TAG_SLOT" ;;
+esac
+case "${PLOW_XR_DEC_AGG:-1}" in
+  0) ;;
+  1) DEC_KNOBS="$DEC_KNOBS -DPLOW_XR_AGG=1" ;;
+  *) echo "PLOW_XR_DEC_AGG must be 0 or 1" >&2; exit 2 ;;
+esac
+# PLOW_DECODE_BODIES (default 1; =0 rolls back): bit-identical decode-body axes. MoE down/GLU and bf16 GEMV
+# lane-group maps (op_moe.h [FP8-DECODE-DOWN-LG]/[FP8-DECODE-X2], op_gemm_common.h
+# [BF16-GEMV-NARROWK-LG]); the value-identical grouped-MoE axes the K3 prefill object ships plus
+# the A-gather hoist (the batched rungs run MoeGroup*Pf); GemmSmall at BK=128 (the batched rungs'
+# 16-64-workgroup projections are k-tile-latency bound; each output's MFMA k order is unchanged);
+# the prefill GemvF32 tile at the 128-row rung; the wide StateStepG column prefetch.
+# GLM-5.3-Flash MI350X TP8 (traced): B=8 30.4 -> 24.5 ms, B=128 82.2 -> 57.0 ms, rung 1 unchanged.
+case "${PLOW_DECODE_BODIES:-1}" in
+  0) ;;
+  1) DEC_KNOBS="$DEC_KNOBS -DPLOW_MOE_DEC_LG=1 -DPLOW_GEMV_LG=1 -DPLOW_MOE_DEC_X2=1 -DGM_SM_BK=128"
+     DEC_KNOBS="$DEC_KNOBS -DPLOW_MOE_TILE_BINSEARCH=1 -DPLOW_MOE_PF_EPI=1 -DPLOW_MOE_PF_BRAW=1 -DPLOW_COMBINE_VEC=1"
+     DEC_KNOBS="$DEC_KNOBS -DPLOW_MOE_PF_GH=2 -DPLOW_MOE_ALIGN_PAR_PREFIX=1 -DPLOW_GEMV_F32_TILE_DEC=128 -DPLOW_KDA_WIDE_PF=1"
+     # Uniform GEMV weight descriptors. The low-rung tiers also scalarize num_records, which
+     # removes the per-load readfirstlane waterfall (tier 8: 219 -> 0; B=8 GEMV 30.5 -> 23.3 us
+     # per hop). On the wide object that costs B=128 (64 -> 88 ms), and that object keeps DPP
+     # wave sums instead (GemmSmall 114 -> 67 us per hop against the bare set).
+     if [ -n "${PLOW_DECODE_TIER:-}" ]; then
+       DEC_KNOBS="$DEC_KNOBS -DGV_USCALAR=1 -DPLOW_RSRC_SCALAR_N=1"
+     else
+       DEC_KNOBS="$DEC_KNOBS -DGV_USCALAR=1 -DPLOW_WAVE_RED_DPP=1"
+     fi ;;
+  *) echo "PLOW_DECODE_BODIES must be 0 or 1" >&2; exit 2 ;;
 esac
 case "${PLOW_FP8_BLK_DMA:-0}" in
   0) ;;
@@ -130,6 +307,15 @@ case "${PLOW_MLA_FOLD_MFMA:-0}" in
   1) A4W4_BK="$A4W4_BK -DPLOW_MLA_FOLD_MFMA=1" ;;
   *) echo "PLOW_MLA_FOLD_MFMA must be 0 or 1" >&2; exit 2 ;;
 esac
+# PLOW_K3_PF_FOLD_MFMA=1 (default off): the K3 prefill object's MlaMergeFold takes the MFMA fold
+# for up to 4 KV splits (GLM-5.3-Flash prefill runs ns=2): the scalar fold's split merge, then a
+# bf16-rounded latent into the batched MFMA GEMM. Not bit-identical to the scalar fold.
+K3_PF_ATTN=""
+case "${PLOW_K3_PF_FOLD_MFMA:-0}" in
+  0) ;;
+  1) K3_PF_ATTN="-DPLOW_MLA_FOLD_MFMA=1 -DPLOW_MLA_FOLD_MFMA_NS=4" ;;
+  *) echo "PLOW_K3_PF_FOLD_MFMA must be 0 or 1" >&2; exit 2 ;;
+esac
 case "${PLOW_MOE_ROUTER_PF_WAVE:-0}" in
   0) ;;
   1) A4W4_BK="$A4W4_BK -DPLOW_MOE_ROUTER_PF_WAVE=1" ;;
@@ -138,8 +324,14 @@ esac
 # PLOW_DSA_SELECT_V2=1: DSA prefill top-k (op 118) through d_index_select_pf_v2 (same set).
 case "${PLOW_DSA_SELECT_V2:-0}" in
   0) ;;
-  1) A4W4_BK="$A4W4_BK -DPLOW_DSA_SELECT_V2=1" ;;
+  1) INC="$INC -DPLOW_DSA_SELECT_V2=1" ;;
   *) echo "PLOW_DSA_SELECT_V2 must be 0 or 1" >&2; exit 2 ;;
+esac
+# PLOW_DSA_KPOOL_ROWWAVE=1: pooled DSA prefill score (op 134) with one query row per wave.
+case "${PLOW_DSA_KPOOL_ROWWAVE:-0}" in
+  0) ;;
+  1) INC="$INC -DPLOW_DSA_KPOOL_ROWWAVE=1" ;;
+  *) echo "PLOW_DSA_KPOOL_ROWWAVE must be 0 or 1" >&2; exit 2 ;;
 esac
 # PLOW_DSA_SELECT_V3=1: op 118 through dsa_select_v3.h (same set); fused select+union when the
 # packet asks (emit PLOW_GLM_DSA_SEL_UNION=1).
@@ -191,10 +383,52 @@ if [ -n "${PLOW_HSACO_CONFIG:-}" ] &&
    grep -Eq '^#define PLOW_PACKET_OBJECT_REQUIRES "([^"]* )?PLOW_DSA_PF_ARM=1( |")' "$PLOW_HSACO_CONFIG"; then
   DSA_FLASH="-DPLOW_DSA_PF_ARM=1"
 fi
+# The zero-rope (NoPE) V2 MLA prefill arm, FLASH OBJECT ONLY (interp.hip PLOW_MLA_PF2_NOPE_ARM;
+# gfx942 spells it PLOW_MLA_PF_NOPE=1): GLM-5.3-Flash and DeepSeek-V4 packets require it and the
+# loader refuses a flash object without `plow_mla_pf2_nope_arm`.
+NOPE_FLASH=""
+if [ -n "${PLOW_HSACO_CONFIG:-}" ] &&
+   grep -Eq '^#define PLOW_PACKET_OBJECT_REQUIRES "([^"]* )?PLOW_MLA_PF2_NOPE_ARM=1( |")' "$PLOW_HSACO_CONFIG"; then
+  NOPE_FLASH="-DPLOW_MLA_PF2_NOPE_ARM=1"
+fi
+# GLM-5.3-Flash (NoPE + K3 packet): the gfx950 transpose-read PV arm is the default in its flash
+# objects (same operands, same MFMA order: every validate stream byte-equal; 16k prefill flash
+# 107 -> 79 ms per 8192 chunk). PLOW_MLA_PF_TR16=0 rolls back.
+if [ -n "$NOPE_FLASH" ] && [ -z "${PLOW_MLA_PF_TR16:-}" ] &&
+   grep -Eq '^#define PLOW_PACKET_OBJECT_REQUIRES "([^"]* )?PLOW_K3=1( |")' "$PLOW_HSACO_CONFIG"; then
+  FLASH_TR16="-DPLOW_MLA_PF_SV=1 -DPLOW_MLA_PF_TR16=1 $FLASH_TR16"
+fi
+# GLM-5.3-Flash (NoPE + K3 packet) gets the arms qualified on it alone. PLOW_GEMV_F32_VEC: the
+# 8-wide GEMV walks (op_gemm_common.h) reassociate the f32 sums of every object's mHC mix and
+# router GEMVs, so they are qualified per model.
+GLM53_FLASH=0
+if [ -n "$NOPE_FLASH" ] &&
+   grep -Eq '^#define PLOW_PACKET_OBJECT_REQUIRES "([^"]* )?PLOW_K3=1( |")' "$PLOW_HSACO_CONFIG"; then
+  GLM53_FLASH=1
+  INC="$INC -DPLOW_GEMV_F32_VEC=1"
+fi
 if [ -n "${PLOW_HSACO_CONFIG:-}" ] && [ "${PLOW_DSA_PREP:-0}" = 0 ] &&
    grep -Eq '^#define PLOW_PACKET_OBJECT_REQUIRES "([^"]* )?PLOW_DSA_PREP=1( |")' "$PLOW_HSACO_CONFIG"; then
   A4W4_BK="$A4W4_BK -DPLOW_DSA_PREP=1"
 fi
+MLA_EXTRA=""
+if [ "${PLOW_K3:-0}" = 1 ] || { [ -n "${PLOW_HSACO_CONFIG:-}" ] &&
+   grep -Eq '^#define PLOW_PACKET_OBJECT_REQUIRES "([^"]* )?PLOW_K3=1( |")' "$PLOW_HSACO_CONFIG"; }; then
+  MLA_EXTRA="$MLA_EXTRA -DPLOW_K3=1"
+fi
+if [ "${PLOW_QWEN_GDN:-0}" = 1 ] || { [ -n "${PLOW_HSACO_CONFIG:-}" ] &&
+   grep -Eq '^#define PLOW_PACKET_OBJECT_REQUIRES "([^"]* )?PLOW_QWEN_GDN=1( |")' "$PLOW_HSACO_CONFIG"; }; then
+  MLA_EXTRA="$MLA_EXTRA -DPLOW_QWEN_GDN=1"
+fi
+if [ "${PLOW_DSV41_BLKFP8:-1}" = 1 ] || { [ -n "${PLOW_HSACO_CONFIG:-}" ] &&
+   grep -Eq '^#define PLOW_PACKET_OBJECT_REQUIRES "([^"]* )?PLOW_DSV41_BLKFP8=1( |")' "$PLOW_HSACO_CONFIG"; }; then
+  MLA_EXTRA="$MLA_EXTRA -DPLOW_DSV41_BLKFP8=1"
+fi
+if [ "${PLOW_DSV41_ENGRAM:-1}" = 1 ] || { [ -n "${PLOW_HSACO_CONFIG:-}" ] &&
+   grep -Eq '^#define PLOW_PACKET_OBJECT_REQUIRES "([^"]* )?PLOW_DSV41_ENGRAM=1( |")' "$PLOW_HSACO_CONFIG"; }; then
+  MLA_EXTRA="$MLA_EXTRA -DPLOW_DSV41_ENGRAM=1"
+fi
+A4W4_BK="$A4W4_BK $MLA_EXTRA"
 case "${decode_inventory_prune,,}" in
   auto) [ -n "${PLOW_HSACO_CONFIG:-}" ] && decode_inventory_prune=1 || decode_inventory_prune=0 ;;
   1|on|true|yes) decode_inventory_prune=1 ;;
@@ -254,6 +488,37 @@ if [ "$ARCH" = gfx950 ]; then
     -DPLOW_REQUIRED_MARKER=plow_indexer_prefill_append_abi_1 \
     -cuid=plow_indexer_prefill_append_abi_1 \
     -I"$R/amd" -I"$R/common" "$R/amd/indexer_prefill_append.hip"
+  # PLOW_GLM_HC_MIX_RAW: one-row decode mHC mix + pre/norm tail (GemvF32 marked raw).
+  bash "$R/cmake/hipcc_hsaco.sh" hipcc "$BUN" "$ARCH" \
+    "$OUT/hc_mix_decode_gfx950.elf" plow_hc_mix_decode_r1 128 2 \
+    -DPLOW_LEAN_OBJECT=1 -DPLOW_NO_SPILL=1 \
+    -DPLOW_REQUIRED_MARKER=plow_hc_mix_decode_1 \
+    -I"$R/amd" -I"$R/common" "$R/amd/hc_mix_decode.hip"
+  # PLOW_GLM_ROUTER_RAW: decode router GEMV + top-k (GemmF32 marked raw), the decode objects'
+  # GEMV walk and exact select.
+  bash "$R/cmake/hipcc_hsaco.sh" hipcc "$BUN" "$ARCH" \
+    "$OUT/router_decode_gfx950.elf" plow_router_decode 256 1 \
+    -DPLOW_LEAN_OBJECT=1 -DPLOW_NO_SPILL=1 -DPLOW_MOE_ROUTER_SELECT=1 \
+    -DPLOW_REQUIRED_MARKER=plow_router_decode_abi_3 \
+    $INC "$R/amd/router_decode.hip"
+  # PLOW_MOE_W8A8_DEC: decode-rung W8A8 grouped MoE GLU + DOWN (marked op 85/86 pair).
+  bash "$R/cmake/hipcc_hsaco.sh" hipcc "$BUN" "$ARCH" \
+    "$OUT/moe_w8a8_dec_gfx950.elf" plow_moe_w8a8_dec_glu 256 2 \
+    -DPLOW_LEAN_OBJECT=1 -DPLOW_NO_SPILL=1 \
+    -DPLOW_REQUIRED_MARKER=plow_moe_w8a8_dec_abi_1 \
+    -I"$R/amd" -I"$R/common" "$R/amd/moe_w8a8_dec.hip"
+  # PLOW_AMD_XR_NATIVE: a lone decode XReduce / XReduceTwoShot segment as its own kernel.
+  bash "$R/cmake/hipcc_hsaco.sh" hipcc "$BUN" "$ARCH" \
+    "$OUT/xr_native_gfx950.elf" plow_xr_native 256 1 \
+    -DPLOW_LEAN_OBJECT=1 -DPLOW_NO_SPILL=1 -DPLOW_XR_MLP=1 -DPLOW_XR_AGG=1 \
+    -DPLOW_REQUIRED_MARKER=plow_xr_native_abi_1 \
+    -I"$R/amd" -I"$R/common" "$R/amd/xr_native.hip"
+  # PLOW_AMD_LT_FUSE: decode GEMMs of one input (GLM-5.3 KDA in-projection) as one split-K pass.
+  bash "$R/cmake/hipcc_hsaco.sh" hipcc "$BUN" "$ARCH" \
+    "$OUT/glm_inproj_gfx950.elf" plow_glm_inproj_partial 512 1 \
+    -DPLOW_LEAN_OBJECT=1 -DPLOW_NO_SPILL=1 \
+    -DPLOW_REQUIRED_MARKER=plow_glm_inproj_abi_4 \
+    -I"$R/amd" -I"$R/common" "$R/amd/glm_inproj.hip"
 fi
 
 # Delete FIRST. A build that fails must leave nothing behind to run.
@@ -271,20 +536,29 @@ rm -f i_prefill.co i_decode.co i_flash.co tk.co \
       i_prefill_mla_moe.co i_prefill_mla_moe_gq.co \
       interp_prefill_mla_moe.elf interp_prefill_mla_moe_gq.elf \
       kda_decode_fused_gfx950.co kda_decode_fused_gfx950.elf \
+      kda_decode_wide_gfx950.co kda_decode_wide_gfx950.elf \
+      kda_rider_gfx950.co kda_rider_gfx950.elf \
       kda_chunk_intra_cached_gfx950.co kda_chunk_intra_cached_gfx950.elf \
       kda_chunk_intra_wave_items_gfx950.co kda_chunk_intra_wave_items_gfx950.elf \
+      kda_chunk_intra_wave_items_spans_gfx950.co kda_chunk_intra_wave_items_spans_gfx950.elf \
       attn_res_f32mix_gfx950.co attn_res_f32mix_gfx950.elf \
       kda_chunk_carry_regstate_gfx950.co kda_chunk_carry_regstate_gfx950.elf \
+      kda_chunk_carry_regstate_spans_gfx950.co kda_chunk_carry_regstate_spans_gfx950.elf \
       kda_chunk_wu_lean_gfx950.co kda_chunk_wu_lean_gfx950.elf \
+      kda_chunk_wu_lean_spans_gfx950.co kda_chunk_wu_lean_spans_gfx950.elf \
       kda_chunk_wu_lean_keys_gfx950.co kda_chunk_wu_lean_keys_gfx950.elf \
+      kda_chunk_wu_lean_keys_spans_gfx950.co kda_chunk_wu_lean_keys_spans_gfx950.elf \
       kda_chunk_carry_regstate_keyfeed_gfx950.co \
       kda_chunk_carry_regstate_keyfeed_gfx950.elf \
+      kda_chunk_carry_regstate_keyfeed_spans_gfx950.co \
+      kda_chunk_carry_regstate_keyfeed_spans_gfx950.elf \
       kda_chunk_key_factor_wu_gfx950.co kda_chunk_key_factor_wu_gfx950.elf \
       kda_chunk_key_factor_carry_gfx950.co kda_chunk_key_factor_carry_gfx950.elf \
       xreduce_attnres_gfx950.co xreduce_attnres_gfx950.elf \
       moe_stage1_mxfp4_gfx950.co moe_stage1_mxfp4_gfx950.elf \
       moe_stage2_mxfp4_gfx950.co moe_stage2_mxfp4_gfx950.elf \
       moe_combine_gfx950.co moe_combine_gfx950.elf \
+      copy_pairs_gfx950.co copy_pairs_gfx950.elf \
       moe_ep_align_gfx950.co moe_ep_align_gfx950.elf \
       moe_ep_stage2_gfx950.co moe_ep_stage2_gfx950.elf \
       moe_ep_combine_gfx950.co moe_ep_combine_gfx950.elf \
@@ -317,6 +591,17 @@ if [ "$ARCH" = gfx950 ] && [ "${PLOW_KDA_INTRA_CACHED:-0}" = 1 ]; then
 fi
 
 KDA_INTRA_WAVE_ITEMS_ELFS=""
+# PLOW_KDA_INTRA_HOIST (default 1; =0 rolls back): the wave-item intra loads every operand of a
+# d0 step for all block products at once (op_kda.h kda_intra_products_hoist; bit-identical).
+# Kernel at H=8: 313 -> 153 us at 8k (+SOLVE_ILP 121), 235 -> 140 (110) at 4k, 518 -> 183 (144) at 16k.
+# PLOW_KDA_INTRA_SOLVE_ILP (default 1; =0 rolls back): its forward substitution runs four rows at a
+# time over shared loads (bit-identical).
+for k in PLOW_KDA_INTRA_HOIST PLOW_KDA_INTRA_SOLVE_ILP; do
+  case "${!k:-1}" in
+    0|1) ;;
+    *) echo "$k must be 0 or 1" >&2; exit 2 ;;
+  esac
+done
 case "${PLOW_KDA_INTRA_WAVE_ITEMS:-0}" in
   0|1) ;;
   *) echo "PLOW_KDA_INTRA_WAVE_ITEMS must be 0 or 1" >&2; exit 2 ;;
@@ -337,11 +622,21 @@ if [ "$ARCH" = gfx950 ] && [ "$need_kda_intra_wave_items" = 1 ]; then
   }
   bash "$R/cmake/hipcc_hsaco.sh" hipcc "$BUN" "$ARCH" \
     "$OUT/kda_chunk_intra_wave_items_gfx950.elf" \
-    plow_kda_chunk_intra_wave_items_gfx950 96 2 \
+    plow_kda_chunk_intra_wave_items_gfx950 256 2 \
     $INC -DPLOW_LEAN_OBJECT=1 -DPLOW_NO_SPILL=1 -DPLOW_NO_SGPR_SPILL=1 \
     -DPLOW_REQUIRED_MARKER=plow_kda_intra_wave_items_abi_1 \
+    -DPLOW_KDA_INTRA_HOIST="${PLOW_KDA_INTRA_HOIST:-1}" \
+    -DPLOW_KDA_INTRA_SOLVE_ILP="${PLOW_KDA_INTRA_SOLVE_ILP:-1}" \
     "$R/amd/kda_chunk_intra_wave_items.hip"
-  KDA_INTRA_WAVE_ITEMS_ELFS="kda_chunk_intra_wave_items_gfx950.elf"
+  bash "$R/cmake/hipcc_hsaco.sh" hipcc "$BUN" "$ARCH" \
+    "$OUT/kda_chunk_intra_wave_items_spans_gfx950.elf" \
+    plow_kda_chunk_intra_wave_items_spans_gfx950 256 2 \
+    $INC -DPLOW_LEAN_OBJECT=1 -DPLOW_NO_SPILL=1 -DPLOW_NO_SGPR_SPILL=1 \
+    -DPLOW_REQUIRED_MARKER=plow_kda_intra_wave_items_abi_1 \
+    -DPLOW_KDA_INTRA_HOIST="${PLOW_KDA_INTRA_HOIST:-1}" \
+    -DPLOW_KDA_INTRA_SOLVE_ILP="${PLOW_KDA_INTRA_SOLVE_ILP:-1}" \
+    -DPLOW_KDA_SPANS=1 "$R/amd/kda_chunk_intra_wave_items.hip"
+  KDA_INTRA_WAVE_ITEMS_ELFS="kda_chunk_intra_wave_items_gfx950.elf kda_chunk_intra_wave_items_spans_gfx950.elf"
 fi
 
 ATTN_RES_F32MIX_ELFS=""
@@ -392,9 +687,15 @@ if [ "$ARCH" = gfx950 ] && [ "$need_kda_carry_regstate" = 1 ]; then
     "$OUT/kda_chunk_carry_regstate_gfx950.elf" \
     plow_kda_chunk_carry_regstate_gfx950 256 1 \
     $INC -DPLOW_LEAN_OBJECT=1 -DPLOW_NO_SPILL=1 -DPLOW_NO_SGPR_SPILL=1 \
-    -DPLOW_REQUIRED_MARKER=plow_kda_carry_regstate_abi_1 \
+    -DPLOW_REQUIRED_MARKER=plow_kda_carry_regstate_abi_1 $KDA_CARRY_DEFS \
     "$R/amd/kda_chunk_carry_regstate.hip"
-  KDA_CARRY_REGSTATE_ELFS="kda_chunk_carry_regstate_gfx950.elf"
+  bash "$R/cmake/hipcc_hsaco.sh" hipcc "$BUN" "$ARCH" \
+    "$OUT/kda_chunk_carry_regstate_spans_gfx950.elf" \
+    plow_kda_chunk_carry_regstate_spans_gfx950 256 1 \
+    $INC -DPLOW_LEAN_OBJECT=1 -DPLOW_NO_SPILL=1 -DPLOW_NO_SGPR_SPILL=1 \
+    -DPLOW_REQUIRED_MARKER=plow_kda_carry_regstate_abi_1 $KDA_CARRY_DEFS \
+    -DPLOW_KDA_SPANS=1 "$R/amd/kda_chunk_carry_regstate.hip"
+  KDA_CARRY_REGSTATE_ELFS="kda_chunk_carry_regstate_gfx950.elf kda_chunk_carry_regstate_spans_gfx950.elf"
 fi
 
 KDA_WU_LEAN_ELFS=""
@@ -422,7 +723,25 @@ if [ "$ARCH" = gfx950 ] && [ "$need_kda_wu_lean" = 1 ]; then
     $INC -DPLOW_LEAN_OBJECT=1 -DPLOW_NO_SPILL=1 -DPLOW_NO_SGPR_SPILL=1 \
     -DPLOW_REQUIRED_MARKER=plow_kda_wu_lean_abi_1 \
     "$R/amd/kda_chunk_wu_lean.hip"
-  KDA_WU_LEAN_ELFS="kda_chunk_wu_lean_gfx950.elf"
+  bash "$R/cmake/hipcc_hsaco.sh" hipcc "$BUN" "$ARCH" \
+    "$OUT/kda_chunk_wu_lean_spans_gfx950.elf" \
+    plow_kda_chunk_wu_lean_spans_gfx950 256 2 \
+    $INC -DPLOW_LEAN_OBJECT=1 -DPLOW_NO_SPILL=1 -DPLOW_NO_SGPR_SPILL=1 \
+    -DPLOW_REQUIRED_MARKER=plow_kda_wu_lean_abi_1 \
+    -DPLOW_KDA_SPANS=1 "$R/amd/kda_chunk_wu_lean.hip"
+  KDA_WU_LEAN_ELFS="kda_chunk_wu_lean_gfx950.elf kda_chunk_wu_lean_spans_gfx950.elf"
+fi
+
+# DevOp::GemmGroupPf: the grouped prefill projection segment (packet-required only).
+GEMM_GROUP_ELFS=""
+if [ "$ARCH" = gfx950 ] && [ -n "${PLOW_HSACO_CONFIG:-}" ] &&
+   grep -qx '#define PLOW_PACKET_REQUIRES_GEMM_GROUP_PF 1' "$PLOW_HSACO_CONFIG"; then
+  bash "$R/cmake/hipcc_hsaco.sh" hipcc "$BUN" "$ARCH" \
+    "$OUT/gemm_group_pf_gfx950.elf" \
+    plow_gemm_group_pf_gfx950 256 2 \
+    $INC -DPLOW_LEAN_OBJECT=1 -DPLOW_REQUIRED_MARKER=plow_gemm_group_pf_abi_1 \
+    "$R/amd/gemm_group_pf.hip"
+  GEMM_GROUP_ELFS="gemm_group_pf_gfx950.elf"
 fi
 
 KDA_CARRY_KEYFEED_ELFS=""
@@ -451,12 +770,66 @@ if [ "$ARCH" = gfx950 ] && [ "$need_kda_carry_keyfeed" = 1 ]; then
     -DPLOW_REQUIRED_MARKER=plow_kda_wu_lean_abi_1 \
     "$R/amd/kda_chunk_wu_lean_keys.hip"
   bash "$R/cmake/hipcc_hsaco.sh" hipcc "$BUN" "$ARCH" \
+    "$OUT/kda_chunk_wu_lean_keys_spans_gfx950.elf" \
+    plow_kda_chunk_wu_lean_keys_spans_gfx950 256 2 \
+    $INC -DPLOW_LEAN_OBJECT=1 -DPLOW_NO_SPILL=1 -DPLOW_NO_SGPR_SPILL=1 \
+    -DPLOW_REQUIRED_MARKER=plow_kda_wu_lean_abi_1 \
+    -DPLOW_KDA_SPANS=1 "$R/amd/kda_chunk_wu_lean_keys.hip"
+  bash "$R/cmake/hipcc_hsaco.sh" hipcc "$BUN" "$ARCH" \
     "$OUT/kda_chunk_carry_regstate_keyfeed_gfx950.elf" \
     plow_kda_chunk_carry_regstate_keyfeed_gfx950 256 1 \
     $INC -DPLOW_LEAN_OBJECT=1 -DPLOW_NO_SPILL=1 -DPLOW_NO_SGPR_SPILL=1 \
-    -DPLOW_REQUIRED_MARKER=plow_kda_carry_keyfeed_abi_1 \
+    -DPLOW_REQUIRED_MARKER=plow_kda_carry_keyfeed_abi_1 $KDA_CARRY_DEFS \
     "$R/amd/kda_chunk_carry_regstate_keyfeed.hip"
-  KDA_CARRY_KEYFEED_ELFS="kda_chunk_wu_lean_keys_gfx950.elf kda_chunk_carry_regstate_keyfeed_gfx950.elf"
+  bash "$R/cmake/hipcc_hsaco.sh" hipcc "$BUN" "$ARCH" \
+    "$OUT/kda_chunk_carry_regstate_keyfeed_spans_gfx950.elf" \
+    plow_kda_chunk_carry_regstate_keyfeed_spans_gfx950 256 1 \
+    $INC -DPLOW_LEAN_OBJECT=1 -DPLOW_NO_SPILL=1 -DPLOW_NO_SGPR_SPILL=1 \
+    -DPLOW_REQUIRED_MARKER=plow_kda_carry_keyfeed_abi_1 $KDA_CARRY_DEFS \
+    -DPLOW_KDA_SPANS=1 "$R/amd/kda_chunk_carry_regstate_keyfeed.hip"
+  KDA_CARRY_KEYFEED_ELFS="kda_chunk_wu_lean_keys_gfx950.elf kda_chunk_carry_regstate_keyfeed_gfx950.elf kda_chunk_wu_lean_keys_spans_gfx950.elf kda_chunk_carry_regstate_keyfeed_spans_gfx950.elf"
+  # PLOW_KDA_CARRY_SPLIT (runtime segment cap; any nonzero value builds the object): the
+  # sequence-split key-fed carry plowrt runs when served with PLOW_KDA_CARRY_SPLIT >= 2.
+  if [ "${PLOW_KDA_CARRY_SPLIT:-0}" != 0 ]; then
+    bash "$R/cmake/hipcc_hsaco.sh" hipcc "$BUN" "$ARCH" \
+      "$OUT/kda_chunk_carry_split_gfx950.elf" \
+      plow_kda_chunk_carry_split_seg_gfx950 256 1 \
+      $INC -DPLOW_LEAN_OBJECT=1 -DPLOW_NO_SPILL=1 -DPLOW_NO_SGPR_SPILL=1 \
+      -DPLOW_REQUIRED_MARKER=plow_kda_carry_split_abi_1 $KDA_CARRY_DEFS \
+      "$R/amd/kda_chunk_carry_split.hip"
+    KDA_CARRY_KEYFEED_ELFS="$KDA_CARRY_KEYFEED_ELFS kda_chunk_carry_split_gfx950.elf"
+  fi
+  # PLOW_KDA_CARRY_MULTI=1: packed spans' key-fed carries batched 16 per launch.
+  if [ "${PLOW_KDA_CARRY_MULTI:-0}" = 1 ]; then
+    bash "$R/cmake/hipcc_hsaco.sh" hipcc "$BUN" "$ARCH" \
+      "$OUT/kda_chunk_carry_multi_gfx950.elf" \
+      plow_kda_chunk_carry_multi_gfx950 256 1 \
+      $INC -DPLOW_LEAN_OBJECT=1 -DPLOW_NO_SPILL=1 -DPLOW_NO_SGPR_SPILL=1 \
+      -DPLOW_REQUIRED_MARKER=plow_kda_carry_multi_abi_1 $KDA_CARRY_DEFS \
+      "$R/amd/kda_chunk_carry_multi.hip"
+    KDA_CARRY_KEYFEED_ELFS="$KDA_CARRY_KEYFEED_ELFS kda_chunk_carry_multi_gfx950.elf"
+  fi
+fi
+
+# PLOW_MLA_PF_DENSE=1: the dedicated NoPE MLA flash-prefill object plowrt routes eligible flash
+# segments to when served with PLOW_MLA_PF_DENSE=1 (exec/amd_mla_pf_dense.rs). iterative-ilp keeps
+# the QK fragment loads in flight (measured 8k chunk 0.826 -> 0.809 ms/layer, 16k 2.267 -> 2.223).
+MLA_PF_DENSE_ELFS=""
+case "${PLOW_MLA_PF_DENSE:-0}" in
+  0|1) ;;
+  *) echo "PLOW_MLA_PF_DENSE must be 0 or 1" >&2; exit 2 ;;
+esac
+if [ "${PLOW_MLA_PF_DENSE:-0}" = 1 ] && [ "$ARCH" != gfx950 ]; then
+  echo "PLOW_MLA_PF_DENSE=1 is supported only on gfx950" >&2
+  exit 2
+fi
+if [ "$ARCH" = gfx950 ] && [ "${PLOW_MLA_PF_DENSE:-0}" = 1 ]; then
+  bash "$R/cmake/hipcc_hsaco.sh" hipcc "$BUN" "$ARCH" \
+    "$OUT/mla_pf_dense_gfx950.elf" plow_mla_pf_dense_gfx950 512 1 \
+    $INC -DPLOW_LEAN_OBJECT=1 -DPLOW_NO_SPILL=1 -DPLOW_NO_SGPR_SPILL=1 \
+    -DPLOW_REQUIRED_MARKER=plow_mla_pf_dense_abi_1 -mllvm -amdgpu-sched-strategy=iterative-ilp \
+    "$R/amd/mla_pf_dense_gfx950.hip"
+  MLA_PF_DENSE_ELFS="mla_pf_dense_gfx950.elf"
 fi
 
 KDA_KEY_FACTOR_ELFS=""
@@ -487,13 +860,42 @@ if [ "$ARCH" = gfx950 ] && [ "${PLOW_XR_ATTNRES:-0}" = 1 ]; then
     "$R/amd/xreduce_attnres_fused.hip"
   XR_ATTNRES_ELFS="xreduce_attnres_gfx950.elf"
 fi
+# PLOW_KDA_DECODE_LANES=1: the wide decode chain's state step with one value row per lane quad
+# (kda_decode_wide.hip; f32 reduction order differs from the interpreter's wide arm).
+case "${PLOW_KDA_DECODE_LANES:-0}" in
+  0) KDA_DECODE_LANES_DEF="" ;;
+  1) KDA_DECODE_LANES_DEF="-DPLOW_KDA_DECODE_LANES=1" ;;
+  *) echo "PLOW_KDA_DECODE_LANES must be 0 or 1" >&2; exit 2 ;;
+esac
+# PLOW_KDA_DECODE_PREFETCH=1 (with LANES): state loads issued before the conv (same arithmetic).
+case "${PLOW_KDA_DECODE_PREFETCH:-0}" in
+  0) ;;
+  1) KDA_DECODE_LANES_DEF="$KDA_DECODE_LANES_DEF -DPLOW_KDA_DECODE_PREFETCH=1" ;;
+  *) echo "PLOW_KDA_DECODE_PREFETCH must be 0 or 1" >&2; exit 2 ;;
+esac
 if [ "$ARCH" = gfx950 ] && [ "$need_kda_fused" = 1 ]; then
   bash "$R/cmake/hipcc_hsaco.sh" hipcc "$BUN" "$ARCH" \
     "$OUT/kda_decode_fused_gfx950.elf" plow_kda_decode_fused_256x16_v2 128 4 \
     $INC -DPLOW_LEAN_OBJECT=1 -DPLOW_NO_SPILL=1 \
     -DPLOW_REQUIRED_MARKER=plow_kda_decode_fused_256x16_2 \
     "$R/amd/kda_decode_fused.hip"
-  KDA_FUSED_ELFS="kda_decode_fused_gfx950.elf"
+  # Descriptor version 3 (PLOW_KDA_DECODE_WIDE): the batched-rung chain through the decode
+  # object's own bodies, so it carries the decode object's bit-identical body defines.
+  bash "$R/cmake/hipcc_hsaco.sh" hipcc "$BUN" "$ARCH" \
+    "$OUT/kda_decode_wide_gfx950.elf" plow_kda_decode_wide_v3 128 2 \
+    $INC -DPLOW_LEAN_OBJECT=1 -DPLOW_NO_SPILL=1 -DPLOW_BUCKET_DECODE=1 -DPLOW_KDA_WIDE_PF=1 \
+    -DPLOW_WAVE_RED_DPP=1 -DPLOW_REQUIRED_MARKER=plow_kda_decode_wide_3 $KDA_DECODE_LANES_DEF \
+    "$R/amd/kda_decode_wide.hip"
+  # PLOW_AMD_RIDER_KDA: packed decode riders through the wide chain's conv + state step.
+  KDA_FUSED_ELFS="kda_decode_fused_gfx950.elf kda_decode_wide_gfx950.elf"
+  if [ "${PLOW_AMD_RIDER_KDA:-0}" = 1 ]; then
+    bash "$R/cmake/hipcc_hsaco.sh" hipcc "$BUN" "$ARCH" \
+      "$OUT/kda_rider_gfx950.elf" plow_kda_rider_v1 256 2 \
+      $INC -DPLOW_LEAN_OBJECT=1 -DPLOW_NO_SPILL=1 -DPLOW_BUCKET_DECODE=1 -DPLOW_KDA_WIDE_PF=1 \
+      -DPLOW_WAVE_RED_DPP=1 -DPLOW_REQUIRED_MARKER=plow_kda_rider_1 $KDA_DECODE_LANES_DEF \
+      -DPLOW_KDA_RIDER=1 "$R/amd/kda_decode_wide.hip"
+    KDA_FUSED_ELFS="$KDA_FUSED_ELFS kda_rider_gfx950.elf"
+  fi
 fi
 
 # Opt-in lean MoE body variants requested at emit (PLOW_MOE_STAGE1_BODY / PLOW_MOE_STAGE2_BODY).
@@ -536,12 +938,29 @@ fi
 
 MOE_COMBINE_ELFS=""
 if [ "$ARCH" = gfx950 ]; then
+  # PLOW_AMD_SNAP_KERNEL: prefix snapshots as one queue-ordered copy dispatch.
+  bash "$R/cmake/hipcc_hsaco.sh" hipcc "$BUN" "$ARCH" \
+    "$OUT/copy_pairs_gfx950.elf" plow_copy_pairs_gfx950 64 4 \
+    $INC -DPLOW_LEAN_OBJECT=1 -DPLOW_NO_SPILL=1 -DPLOW_NO_SGPR_SPILL=1 \
+    -DPLOW_REQUIRED_MARKER=plow_copy_pairs_abi_1 \
+    "$R/amd/copy_pairs.hip"
   bash "$R/cmake/hipcc_hsaco.sh" hipcc "$BUN" "$ARCH" \
     "$OUT/moe_combine_gfx950.elf" plow_moe_combine_fixed_order_gfx950 64 4 \
     $INC -DPLOW_LEAN_OBJECT=1 -DPLOW_NO_SPILL=1 -DPLOW_NO_SGPR_SPILL=1 \
     -DPLOW_REQUIRED_MARKER=plow_moe_combine_fixed_order_abi_1 \
     "$R/bench/amd/lean_moe_combine_ref/kernel.hip"
-  MOE_COMBINE_ELFS="moe_combine_gfx950.elf"
+  MOE_COMBINE_ELFS="moe_combine_gfx950.elf copy_pairs_gfx950.elf"
+fi
+
+# Dedicated block-fp8 grouped-MoE prefill object (GLU / down, W8A16 and W8A8), routed for the
+# segments PLOW_MOE_FP8_PF_LEAN=1 packets isolate; bit-identical to the interpreter arms.
+MOE_FP8_PF_ELFS=""
+if [ "$ARCH" = gfx950 ]; then
+  bash "$R/cmake/hipcc_hsaco.sh" hipcc "$BUN" "$ARCH" \
+    "$OUT/moe_fp8_pf_gfx950.elf" plow_moe_fp8_glu_pf_gfx950 256 1 \
+    $INC -DPLOW_LEAN_OBJECT=1 -DPLOW_REQUIRED_MARKER=plow_moe_fp8_pf_abi_2 \
+    "$R/amd/moe_fp8_pf.hip"
+  MOE_FP8_PF_ELFS="moe_fp8_pf_gfx950.elf"
 fi
 
 MOE_EP_ELFS=""
@@ -697,7 +1116,7 @@ done
 
 DECODE_MLA_ELFS=""
 if [ "$need_decode_mla" = 1 ]; then
-  genco "$DEC -DPLOW_BUCKET_DECODE_MLA=1" i_decode_mla.co
+  genco "$DEC -DPLOW_BUCKET_DECODE_MLA=1 $DMLA_X" i_decode_mla.co
   unbundle i_decode_mla.co interp_decode_mla.elf
   DECODE_MLA_ELFS="interp_decode_mla.elf"
 fi
@@ -705,7 +1124,7 @@ fi
 # SEGMENTED-DISPATCH flash object: prefill op set at 4 waves / FA_DC=256, compiling ONLY the class-4
 # flash_prefill segment (PLOW_BUCKET_FLASH). 1 wave/SIMD => 512-reg budget; the Q-hoist spills Q to
 # on-chip scratch by design (cheaper than the L2 re-read it replaces).
-genco "-DPLOW_BUCKET_DECODE=0 -DPLOW_BUCKET_FLASH -DPLOW_WG_WAVES=4 -DFA_DC=256 -DFA_DBUF=1 -DPLOW_MLA_PF_V2_ARM=1 $DSA_FLASH $FLASH_TR16" i_flash.co
+genco "-DPLOW_BUCKET_DECODE=0 -DPLOW_BUCKET_FLASH -DPLOW_WG_WAVES=4 -DFA_DC=256 -DFA_DBUF=1 -DPLOW_MLA_PF_V2_ARM=1 $DSA_FLASH $NOPE_FLASH $FLASH_TR16" i_flash.co
 unbundle i_flash.co interp_flash.elf
 
 # GLOBAL-QUEUE variant (Experiment E1). Same op set / tiles / wave count as the static prefill+decode
@@ -755,6 +1174,10 @@ BUILD_MLA=0; [ "${PLOW_MLA_PREFILL:-0}" = 1 ] && BUILD_MLA=1
 # to the bf16 prefill, 256 VGPR / 0 AGPR / occ 2 / spill 2 — the grouped GEMM costs occupancy
 # nothing, and its 81920 B double-buffered tile fits inside the interpreter's existing arena.
 BUILD_MOE=0; [ "${PLOW_MOE_PREFILL:-0}" = 1 ] && { BUILD_MOE=1; BUILD_MLA=1; }
+if [ -n "${PLOW_HSACO_CONFIG:-}" ]; then
+  grep -Eq '^#define PLOW_PACKET_OBJECT_REQUIRES "([^"]* )?PLOW_MOE_PREFILL=1( |")' "$PLOW_HSACO_CONFIG" && { BUILD_MOE=1; BUILD_MLA=1; }
+  grep -Eq '^#define PLOW_PACKET_OBJECT_REQUIRES "([^"]* )?PLOW_MOE_PF_A4W4=1( |")' "$PLOW_HSACO_CONFIG" && BUILD_MXFP4=1
+fi
 # L2-DOMAIN DISPATCH (PLOW_L2_PLACE=1). Makes a workgroup take its global-queue window from the
 # XCD it is PHYSICALLY running on (HW_REG_XCC_ID) instead of from the host's `cur_seg`, so all 8
 # domains drain concurrently in one launch and a consumer reads its producer out of the same XCD's
@@ -804,10 +1227,10 @@ if [ "$BUILD_GQ" = 1 ]; then
   # one — it is the SAME object with one extra scalar read, and if that ever costs occupancy the
   # build must fail rather than ship a decode kernel at occ 1.
   # GQ flash object (Gemma's segmented 4-wave flash segment under the global queue).
-  genco "-DPLOW_BUCKET_DECODE=0 -DPLOW_BUCKET_FLASH -DPLOW_WG_WAVES=4 -DFA_DC=256 -DFA_DBUF=1 -DPLOW_MLA_PF_V2_ARM=1 $DSA_FLASH $FLASH_TR16 -DPLOW_GLOBAL_QUEUE=1 -DPLOW_GQ_BATCH=$GQB $L2D $HIERPF" i_flash_gq.co
+  genco "-DPLOW_BUCKET_DECODE=0 -DPLOW_BUCKET_FLASH -DPLOW_WG_WAVES=4 -DFA_DC=256 -DFA_DBUF=1 -DPLOW_MLA_PF_V2_ARM=1 $DSA_FLASH $NOPE_FLASH $FLASH_TR16 -DPLOW_GLOBAL_QUEUE=1 -DPLOW_GQ_BATCH=$GQB $L2D $HIERPF" i_flash_gq.co
   unbundle i_flash_gq.co interp_flash_gq.elf
   if [ "$need_decode_mla" = 1 ]; then
-    genco "$DEC $L2D $HIERD -DPLOW_BUCKET_DECODE_MLA=1 -DPLOW_GLOBAL_QUEUE=1 -DPLOW_GQ_BATCH=$GQB" i_decode_mla_gq.co
+    genco "$DEC $L2D $HIERD -DPLOW_BUCKET_DECODE_MLA=1 $DMLA_X -DPLOW_GLOBAL_QUEUE=1 -DPLOW_GQ_BATCH=$GQB" i_decode_mla_gq.co
     unbundle i_decode_mla_gq.co interp_decode_mla_gq.elf
     DECODE_MLA_ELFS="$DECODE_MLA_ELFS interp_decode_mla_gq.elf"
   fi
@@ -844,12 +1267,12 @@ if [ "$BUILD_FP8KV" = 1 ]; then
   fi
   genco "$DEC $FP8KV_WEIGHTS -DPLOW_FP8_KV=1" i_decode_fp8kv.co
   unbundle i_decode_fp8kv.co interp_decode_fp8kv.elf
-  genco "-DPLOW_BUCKET_DECODE=0 -DPLOW_BUCKET_FLASH -DPLOW_WG_WAVES=4 -DFA_DC=256 -DFA_DBUF=1 -DPLOW_MLA_PF_V2_ARM=1 -DPLOW_FP8_KV=1 $DSA_FLASH $FLASH_TR16 $FLASH_SCALE_HOIST" i_flash_fp8kv.co
+  genco "-DPLOW_BUCKET_DECODE=0 -DPLOW_BUCKET_FLASH -DPLOW_WG_WAVES=4 -DFA_DC=256 -DFA_DBUF=1 -DPLOW_MLA_PF_V2_ARM=1 -DPLOW_FP8_KV=1 $DSA_FLASH $NOPE_FLASH $FLASH_TR16 $FLASH_SCALE_HOIST" i_flash_fp8kv.co
   unbundle i_flash_fp8kv.co interp_flash_fp8kv.elf
   if [ "$BUILD_GQ" = 1 ]; then
     genco "$DEC $FP8KV_WEIGHTS -DPLOW_FP8_KV=1 $L2D $HIERD -DPLOW_GLOBAL_QUEUE=1 -DPLOW_GQ_BATCH=$GQB" i_decode_fp8kv_gq.co
     unbundle i_decode_fp8kv_gq.co interp_decode_fp8kv_gq.elf
-    genco "-DPLOW_BUCKET_DECODE=0 -DPLOW_BUCKET_FLASH -DPLOW_WG_WAVES=4 -DFA_DC=256 -DFA_DBUF=1 -DPLOW_MLA_PF_V2_ARM=1 -DPLOW_FP8_KV=1 $DSA_FLASH $FLASH_TR16 $FLASH_SCALE_HOIST -DPLOW_GLOBAL_QUEUE=1 -DPLOW_GQ_BATCH=$GQB $L2D $HIERPF" i_flash_fp8kv_gq.co
+    genco "-DPLOW_BUCKET_DECODE=0 -DPLOW_BUCKET_FLASH -DPLOW_WG_WAVES=4 -DFA_DC=256 -DFA_DBUF=1 -DPLOW_MLA_PF_V2_ARM=1 -DPLOW_FP8_KV=1 $DSA_FLASH $NOPE_FLASH $FLASH_TR16 $FLASH_SCALE_HOIST -DPLOW_GLOBAL_QUEUE=1 -DPLOW_GQ_BATCH=$GQB $L2D $HIERPF" i_flash_fp8kv_gq.co
     unbundle i_flash_fp8kv_gq.co interp_flash_fp8kv_gq.elf
   fi
 fi
@@ -887,22 +1310,22 @@ fi
 # MLA prefill objects (static + GQ).
 MLA_ELFS=""
 if [ "$BUILD_MLA" = 1 ]; then
-  genco "-DPLOW_BUCKET_DECODE=0 -DPLOW_MLA_PREFILL=1" i_prefill_mla.co
+  genco "-DPLOW_BUCKET_DECODE=0 -DPLOW_MLA_PREFILL=1 $MLA_EXTRA" i_prefill_mla.co
   unbundle i_prefill_mla.co interp_prefill_mla.elf
   MLA_ELFS="interp_prefill_mla.elf"
   if [ "$BUILD_GQ" = 1 ]; then
-    genco "-DPLOW_BUCKET_DECODE=0 -DPLOW_MLA_PREFILL=1 -DPLOW_GLOBAL_QUEUE=1 -DPLOW_GQ_BATCH=$GQB $L2D $HIERPF" i_prefill_mla_gq.co
+    genco "-DPLOW_BUCKET_DECODE=0 -DPLOW_MLA_PREFILL=1 -DPLOW_GLOBAL_QUEUE=1 -DPLOW_GQ_BATCH=$GQB $L2D $HIERPF $MLA_EXTRA" i_prefill_mla_gq.co
     unbundle i_prefill_mla_gq.co interp_prefill_mla_gq.elf
     MLA_ELFS="interp_prefill_mla.elf interp_prefill_mla_gq.elf"
   fi
 fi
 
 if [ "$BUILD_MLA" = 1 ] && [ "$BUILD_MXFP4" = 1 ]; then
-  genco "-DPLOW_BUCKET_DECODE=0 -DPLOW_MXFP4=1 -DPLOW_MLA_PREFILL=1" i_prefill_mxfp4_mla.co
+  genco "-DPLOW_BUCKET_DECODE=0 -DPLOW_MXFP4=1 -DPLOW_MLA_PREFILL=1 $MLA_EXTRA" i_prefill_mxfp4_mla.co
   unbundle i_prefill_mxfp4_mla.co interp_prefill_mxfp4_mla.elf
   MLA_ELFS="$MLA_ELFS interp_prefill_mxfp4_mla.elf"
   if [ "$BUILD_GQ" = 1 ]; then
-    genco "-DPLOW_BUCKET_DECODE=0 -DPLOW_MXFP4=1 -DPLOW_MLA_PREFILL=1 -DPLOW_GLOBAL_QUEUE=1 -DPLOW_GQ_BATCH=$GQB $L2D $HIERPF" i_prefill_mxfp4_mla_gq.co
+    genco "-DPLOW_BUCKET_DECODE=0 -DPLOW_MXFP4=1 -DPLOW_MLA_PREFILL=1 -DPLOW_GLOBAL_QUEUE=1 -DPLOW_GQ_BATCH=$GQB $L2D $HIERPF $MLA_EXTRA" i_prefill_mxfp4_mla_gq.co
     unbundle i_prefill_mxfp4_mla_gq.co interp_prefill_mxfp4_mla_gq.elf
     MLA_ELFS="$MLA_ELFS interp_prefill_mxfp4_mla_gq.elf"
   fi
@@ -911,11 +1334,11 @@ fi
 # MLA+MoE prefill objects (static + GQ) — the whole-layer prefill object.
 MOE_ELFS=""
 if [ "$BUILD_MOE" = 1 ]; then
-  genco "-DPLOW_BUCKET_DECODE=0 -DPLOW_MLA_PREFILL=1 -DPLOW_MOE_PREFILL=1" i_prefill_mla_moe.co
+  genco "-DPLOW_BUCKET_DECODE=0 -DPLOW_MLA_PREFILL=1 -DPLOW_MOE_PREFILL=1 $MLA_EXTRA" i_prefill_mla_moe.co
   unbundle i_prefill_mla_moe.co interp_prefill_mla_moe.elf
   MOE_ELFS="interp_prefill_mla_moe.elf"
   if [ "$BUILD_GQ" = 1 ]; then
-    genco "-DPLOW_BUCKET_DECODE=0 -DPLOW_MLA_PREFILL=1 -DPLOW_MOE_PREFILL=1 -DPLOW_GLOBAL_QUEUE=1 -DPLOW_GQ_BATCH=$GQB $L2D $HIERPF" i_prefill_mla_moe_gq.co
+    genco "-DPLOW_BUCKET_DECODE=0 -DPLOW_MLA_PREFILL=1 -DPLOW_MOE_PREFILL=1 -DPLOW_GLOBAL_QUEUE=1 -DPLOW_GQ_BATCH=$GQB $L2D $HIERPF $MLA_EXTRA" i_prefill_mla_moe_gq.co
     unbundle i_prefill_mla_moe_gq.co interp_prefill_mla_moe_gq.elf
     MOE_ELFS="interp_prefill_mla_moe.elf interp_prefill_mla_moe_gq.elf"
   fi
@@ -963,6 +1386,162 @@ fi
 # the decode program groups by expert exactly as prefill does (see the note above the arms in
 # interp.hip), so the grouped GEMM has to be there too.
 BUILD_GEMMA_MOE=0; [ "${PLOW_GEMMA_MOE:-0}" = 1 ] && BUILD_GEMMA_MOE=1
+# Kimi-K3 / GLM-5.3-Flash packets (`PLOW_K3=1` in PLOW_PACKET_OBJECT_REQUIRES): the loader resolves
+# `interp_prefill_k3_moe` and `interp_decode_k3` (exec/amd/object.rs `PrefillArm`), i.e. the
+# MLA+MoE prefill object and the decode object under their K3 names. The paired config header
+# already derives PLOW_K3 / PLOW_KDA_CHUNK from the packet; -DPLOW_K3=1 restates it as the
+# gfx942 rows do.
+# K3_PF_MOE: grouped-MoE prefill axes, all value-identical (op_moe.h notes). GLM-5.3-Flash TP8
+# 4k prefill, MI350X: GroupDownPf 58.6 -> 20.2 ms, GroupGluPf 36.4 -> 24.3 ms (tile binsearch over
+# 288 experts, down-epilogue row-metadata hoist, raw fp8 B held across the MFMAs), CombinePf
+# 23.2 -> 6.3 ms (vector arm).
+K3_PF_MOE="-DPLOW_MOE_TILE_BINSEARCH=1 -DPLOW_MOE_PF_EPI=1 -DPLOW_MOE_PF_BRAW=1 -DPLOW_COMBINE_VEC=1"
+# Value-identical K3 prefill arms, default on (=0 rolls back): the wave-per-token router tail
+# (op 83, now up to 320 experts; GLM-5.3-Flash has 288) and the all-wave align scatter (op 84).
+case "${PLOW_K3_PF_ROUTER_WAVE:-1}" in
+  0) ;;
+  1) K3_PF_MOE="$K3_PF_MOE -DPLOW_MOE_ROUTER_PF_WAVE=1" ;;
+  *) echo "PLOW_K3_PF_ROUTER_WAVE must be 0 or 1" >&2; exit 2 ;;
+esac
+case "${PLOW_K3_PF_ALIGN_WAVES:-1}" in
+  0) ;;
+  1) K3_PF_MOE="$K3_PF_MOE -DPLOW_MOE_ALIGN_WAVES=1" ;;
+  *) echo "PLOW_K3_PF_ALIGN_WAVES must be 0 or 1" >&2; exit 2 ;;
+esac
+# PLOW_K3_PF_XR_SCHED=aiter (opt-in, default off): the 16-byte collective schedule (bit-identical
+# data movement, op_collective.h) on capped workgroups — two-shot NWG/NWG_RS, seam reduce-scatter
+# NWG_SRS, seam all-gather NWG_SAG. PLOW_K3_PF_FOLD_TB (default 8 on GLM-5.3-Flash packets, 0 on
+# other K3 packets; 0 rolls back): the token-blocked MlaMergeFold (op_attention_common.h). The
+# gfx950 V=128 oracle saw packed-FMA rounding moves, so it is qualified per model: GLM-5.3-Flash
+# (V=256) validate streams byte-equal at every rung and 4k-60k prompts, fold 9.8 -> 3.8 ms at 4k.
+case "${PLOW_K3_PF_XR_SCHED:-0}" in
+  0) ;;
+  aiter) K3_PF_MOE="$K3_PF_MOE -DPLOW_XR_SCHED_AITER=1 -DPLOW_XR_SCHED_NWG=${PLOW_XR_SCHED_NWG:-48} -DPLOW_XR_SCHED_NWG_RS=${PLOW_XR_SCHED_NWG_RS:-16} -DPLOW_XR_SCHED_NWG_SRS=${PLOW_XR_SCHED_NWG_SRS:-16} -DPLOW_XR_SCHED_NWG_SAG=${PLOW_XR_SCHED_NWG_SAG:-48}" ;;
+  *) echo "PLOW_K3_PF_XR_SCHED must be 0 or aiter" >&2; exit 2 ;;
+esac
+# PLOW_K3_PF_SP_VEC (default 0; 2/4/8): the seq-par seam reduce-scatter/all-gather (ops 25/26)
+# move that many bf16 per peer access (PLOW_XR_SP_VEC, op_collective.h). Bit-identical.
+# MEASURED, keep 0: rs+ag at 1024 rows 106.6 -> 94.0 us (V=8) but 4096 rows 244.6 -> 362.6 and
+# 8192 rows 416.7 -> 720.9 (tp_allreduce_prefill_bench TP_PHASES, hidden 4096, 256 WGs).
+case "${PLOW_K3_PF_SP_VEC:-0}" in
+  0) ;;
+  2|4|8) K3_PF_MOE="$K3_PF_MOE -DPLOW_XR_SP_VEC=$PLOW_K3_PF_SP_VEC" ;;
+  *) echo "PLOW_K3_PF_SP_VEC must be 0, 2, 4 or 8" >&2; exit 2 ;;
+esac
+# PLOW_RN_ROWS (default 1 here; gfx942 ships 2): d_rmsnorm issues R rows of loads per workgroup
+# before reducing any (op_norm.h multi-row arm; same element map and tree, bit-identical). Plain
+# prefill rows only: a packed program keeps the single-row loop.
+case "${PLOW_RN_ROWS:-1}" in
+  0|1) ;;
+  2|4) K3_PF_MOE="$K3_PF_MOE -DPLOW_RN_ROWS=$PLOW_RN_ROWS" ;;
+  *) echo "PLOW_RN_ROWS must be 1, 2 or 4" >&2; exit 2 ;;
+esac
+# PLOW_HC_POST_ROWS (default 1): the mHC HyperConnPost issues R band rows of loads per workgroup
+# before storing (op_hyperconn.h; same arithmetic, bit-identical).
+case "${PLOW_HC_POST_ROWS:-1}" in
+  0|1) ;;
+  2|4) K3_PF_MOE="$K3_PF_MOE -DPLOW_HC_POST_ROWS=$PLOW_HC_POST_ROWS" ;;
+  *) echo "PLOW_HC_POST_ROWS must be 1, 2 or 4" >&2; exit 2 ;;
+esac
+# PLOW_GEMV_F32_PF_TILE=RxCN (default 2x3, the plain arm): the prefill GemvF32 (mHC mix, N = 24,
+# K = 16384) output tile per wave; each output keeps its lane-to-k map and term order (bit-identical).
+case "${PLOW_GEMV_F32_PF_TILE:-2x3}" in
+  2x3) ;;
+  4x3|2x6|4x6) K3_PF_MOE="$K3_PF_MOE -DPLOW_GEMV_F32_PF_R=${PLOW_GEMV_F32_PF_TILE%x*} -DPLOW_GEMV_F32_PF_CN=${PLOW_GEMV_F32_PF_TILE#*x}" ;;
+  *) echo "PLOW_GEMV_F32_PF_TILE must be 2x3, 4x3, 2x6 or 4x6" >&2; exit 2 ;;
+esac
+FOLD_TB_DEFAULT=0
+if [ "$GLM53_FLASH" = 1 ]; then FOLD_TB_DEFAULT=8; fi
+case "${PLOW_K3_PF_FOLD_TB:-$FOLD_TB_DEFAULT}" in
+  0|1) ;;
+  2|4|8) K3_PF_MOE="$K3_PF_MOE -DPLOW_MLA_FOLD_TB=${PLOW_K3_PF_FOLD_TB:-$FOLD_TB_DEFAULT}" ;;
+  *) echo "PLOW_K3_PF_FOLD_TB must be 0, 2, 4 or 8" >&2; exit 2 ;;
+esac
+# PLOW_MOE_PF_DEEP (default 1; =0 rolls back): two raw register stages over the LDS ping-pong in
+# the grouped k-loop, with the A-gather index hoisted per tile (PLOW_MOE_PF_GH=1), so each load
+# has two MFMA phases to land instead of one. Bit-identical (same LDS bytes, same MFMA order).
+case "${PLOW_MOE_PF_DEEP:-1}" in
+  0) ;;
+  1) K3_PF_MOE="$K3_PF_MOE -DPLOW_MOE_PF_GH=1 -DPLOW_MOE_PF_DEEP=1" ;;
+  *) echo "PLOW_MOE_PF_DEEP must be 0 or 1" >&2; exit 2 ;;
+esac
+# PLOW_MOE_PF_HDR (default 1; =0 rolls back): a tile's expert from a register copy of the tile
+# prefix (ballot count) instead of the binary search's nine dependent loads per tile. Bit-identical.
+case "${PLOW_MOE_PF_HDR:-1}" in
+  0) ;;
+  1) K3_PF_MOE="$K3_PF_MOE -DPLOW_MOE_PF_HDR=1" ;;
+  *) echo "PLOW_MOE_PF_HDR must be 0 or 1" >&2; exit 2 ;;
+esac
+# PLOW_GEMM_PF_REPICK (default 1 here, =0 rolls back): a dense prefill GEMM whose emitted rung fills
+# under PLOW_GEMM_PF_FILL_PCT (75) of its workgroups at the chunk's live M takes the largest rung
+# that does (interp.hip gemm_pf_repick; bit-identical, the same MFMA and k order).
+case "${PLOW_GEMM_PF_REPICK:-1}" in
+  0) ;;
+  1) K3_PF_MOE="$K3_PF_MOE -DPLOW_GEMM_PF_REPICK=1 -DPLOW_GEMM_PF_FILL_PCT=${PLOW_GEMM_PF_FILL_PCT:-75}" ;;
+  *) echo "PLOW_GEMM_PF_REPICK must be 0 or 1" >&2; exit 2 ;;
+esac
+# PLOW_GEMM_PF_SM_BK=128: the 64x128 GemmSmall rung (and its fp32 router twin) at BK=128 in the K3
+# prefill objects only -- half the k-tiles for the N<=256, K=4096 projections that run on 64-128
+# workgroups. Arithmetic-preserving (BK only moves the k-tile barriers; op_gemm_common.h). Default
+# 128 (=64 rolls back): gemm_tile_sweep on MI350X put e2 (64x128x128) 5-25% ahead of c4 on every
+# N<=256, K=4096 GLM-5.3-Flash shape, and validate streams stayed byte-equal.
+case "${PLOW_GEMM_PF_SM_BK:-128}" in
+  64) ;;
+  128) K3_PF_MOE="$K3_PF_MOE -DGM_SM_BK=128" ;;
+  *) echo "PLOW_GEMM_PF_SM_BK must be 64 or 128" >&2; exit 2 ;;
+esac
+K3_ELFS=""
+if [ -n "${PLOW_HSACO_CONFIG:-}" ] &&
+   grep -Eq '^#define PLOW_PACKET_OBJECT_REQUIRES "([^"]* )?PLOW_K3=1( |")' "$PLOW_HSACO_CONFIG"; then
+  genco "-DPLOW_BUCKET_DECODE=0 -DPLOW_MLA_PREFILL=1 -DPLOW_MOE_PREFILL=1 -DPLOW_K3=1 $K3_PF_MOE $K3_PF_ATTN" i_prefill_k3_moe.co
+  unbundle i_prefill_k3_moe.co interp_prefill_k3_moe.elf
+  genco "$DEC -DPLOW_K3=1" i_decode_k3.co
+  unbundle i_decode_k3.co interp_decode_k3.elf
+  K3_ELFS="interp_prefill_k3_moe.elf interp_decode_k3.elf"
+  if [ "$BUILD_GQ" = 1 ]; then
+    genco "-DPLOW_BUCKET_DECODE=0 -DPLOW_MLA_PREFILL=1 -DPLOW_MOE_PREFILL=1 -DPLOW_K3=1 -DPLOW_GLOBAL_QUEUE=1 -DPLOW_GQ_BATCH=$GQB $L2D $HIERPF $K3_PF_MOE $K3_PF_ATTN" i_prefill_k3_moe_gq.co
+    unbundle i_prefill_k3_moe_gq.co interp_prefill_k3_moe_gq.elf
+    genco "$DEC $L2D $HIERD -DPLOW_K3=1 -DPLOW_GLOBAL_QUEUE=1 -DPLOW_GQ_BATCH=$GQB" i_decode_k3_gq.co
+    unbundle i_decode_k3_gq.co interp_decode_k3_gq.elf
+    K3_ELFS="$K3_ELFS interp_prefill_k3_moe_gq.elf interp_decode_k3_gq.elf"
+  fi
+fi
+# PACKED-PREFILL FAMILY OBJECTS (PLOW_PACKED_PREFILL_CONSUMERS=1; default on when the packet
+# carries packed-prefill siblings, `=0` skips them): the three lean objects such a packet opens
+# by name (exec/amd.rs `load_packed_family`), the gfx950 twins of build_gfx942.sh's rows. The
+# flash object takes the NoPE V2 arm when the packet requires it (marker
+# `plow_packed_prefill_mla_nope_1`). Not in ALL_ELFS: the default-object check there refuses
+# consumer arms by design.
+PACKED_ELFS=""
+PK_DEFAULT=0
+if [ -n "${PLOW_HSACO_CONFIG:-}" ] &&
+  grep -q '^#define PLOW_PACKET_HAS_PACKED_PREFILL_TOPOLOGY 1' "$PLOW_HSACO_CONFIG"; then
+  PK_DEFAULT=1
+fi
+if [ "${PLOW_PACKED_PREFILL_CONSUMERS:-$PK_DEFAULT}" = 1 ]; then
+  rm -f interp_packed_mla_norm*.elf interp_packed_mla_flash*.elf interp_packed_kda*.elf
+  PK_NORM="-DPLOW_BUCKET_DECODE=0 -DPLOW_MLA_PREFILL=1 -DPLOW_BUCKET_PACKED_MLA_NORM=1 -DPLOW_PACKED_PREFILL_MLA_NORM_CONSUMERS=1"
+  PK_FLASH="-DPLOW_BUCKET_DECODE=0 -DPLOW_BUCKET_FLASH -DPLOW_WG_WAVES=4 -DFA_DC=256 -DFA_DBUF=1 -DPLOW_MLA_PF_V2_ARM=1 $NOPE_FLASH $FLASH_TR16 -DPLOW_PACKED_PREFILL_MLA_FLASH_CONSUMERS=1"
+  PK_KDA="-DPLOW_BUCKET_DECODE=0 -DPLOW_K3=1 -DPLOW_BUCKET_PACKED_KDA=1 -DPLOW_PACKED_PREFILL_KDA_CONSUMERS=1"
+  for fam in norm flash kda kdapar kdarider; do
+    case $fam in
+      norm) AX="$PK_NORM"; S=interp_packed_mla_norm ;;
+      flash) AX="$PK_FLASH"; S=interp_packed_mla_flash ;;
+      kda) AX="$PK_KDA"; S=interp_packed_kda ;;
+      kdapar) AX="$PK_KDA -DPLOW_PACKED_KDA_PAR=1"; S=interp_packed_kda_par ;;
+      kdarider) AX="$PK_KDA -DPLOW_PACKED_KDA_RIDER=1"; S=interp_packed_kda_rider ;;
+    esac
+    genco "$AX" "i_pk_$fam.co"
+    unbundle "i_pk_$fam.co" "$S.elf"
+    PACKED_ELFS="$PACKED_ELFS $S.elf"
+    if [ "$BUILD_GQ" = 1 ]; then
+      genco "$AX -DPLOW_GLOBAL_QUEUE=1 -DPLOW_GQ_BATCH=$GQB $L2D $HIERPF" "i_pk_${fam}_gq.co"
+      unbundle "i_pk_${fam}_gq.co" "${S}_gq.elf"
+      PACKED_ELFS="$PACKED_ELFS ${S}_gq.elf"
+    fi
+  done
+  echo "   packed-prefill family objects:$PACKED_ELFS"
+fi
 GMOE_ELFS=""
 if [ "$BUILD_GEMMA_MOE" = 1 ]; then
   # `if`, not `[ ... ] && GMD=...`: the file already records what that pattern costs under
@@ -1039,9 +1618,9 @@ check() { # <name> <defs> <max-total> <min-occ>
 }
 check prefill "-DPLOW_BUCKET_DECODE=0" 256 2
 check decode  "$DEC" 256 2
-check flash   "-DPLOW_BUCKET_DECODE=0 -DPLOW_BUCKET_FLASH -DPLOW_WG_WAVES=4 -DFA_DC=256 -DFA_DBUF=1 -DPLOW_MLA_PF_V2_ARM=1 $DSA_FLASH $FLASH_TR16" 512 1
+check flash   "-DPLOW_BUCKET_DECODE=0 -DPLOW_BUCKET_FLASH -DPLOW_WG_WAVES=4 -DFA_DC=256 -DFA_DBUF=1 -DPLOW_MLA_PF_V2_ARM=1 $DSA_FLASH $NOPE_FLASH $FLASH_TR16" 512 1
 if [ "$need_decode_mla" = 1 ]; then
-  check decode_mla "$DEC -DPLOW_BUCKET_DECODE_MLA=1" 256 2
+  check decode_mla "$DEC -DPLOW_BUCKET_DECODE_MLA=1 $DMLA_X" 256 2
 fi
 # The GQ loop adds a shared cursor + claim broadcast; it must NOT push prefill past 256/occ-2. If it
 # does and no minimal-live-set fix recovers it, that is itself a recordable E1 finding (GQ incompatible
@@ -1050,9 +1629,9 @@ GQ_ELFS=""
 if [ "$BUILD_GQ" = 1 ]; then
   check prefill_gq "-DPLOW_BUCKET_DECODE=0 -DPLOW_GLOBAL_QUEUE=1 -DPLOW_GQ_BATCH=$GQB $L2D $HIERPF" 256 2
   check decode_gq  "$DEC $L2D -DPLOW_GLOBAL_QUEUE=1 -DPLOW_GQ_BATCH=$GQB" 256 2
-  check flash_gq   "-DPLOW_BUCKET_DECODE=0 -DPLOW_BUCKET_FLASH -DPLOW_WG_WAVES=4 -DFA_DC=256 -DFA_DBUF=1 -DPLOW_MLA_PF_V2_ARM=1 $DSA_FLASH $FLASH_TR16 -DPLOW_GLOBAL_QUEUE=1 -DPLOW_GQ_BATCH=$GQB $L2D $HIERPF" 512 1
+  check flash_gq   "-DPLOW_BUCKET_DECODE=0 -DPLOW_BUCKET_FLASH -DPLOW_WG_WAVES=4 -DFA_DC=256 -DFA_DBUF=1 -DPLOW_MLA_PF_V2_ARM=1 $DSA_FLASH $NOPE_FLASH $FLASH_TR16 -DPLOW_GLOBAL_QUEUE=1 -DPLOW_GQ_BATCH=$GQB $L2D $HIERPF" 512 1
   if [ "$need_decode_mla" = 1 ]; then
-    check decode_mla_gq "$DEC $L2D $HIERD -DPLOW_BUCKET_DECODE_MLA=1 -DPLOW_GLOBAL_QUEUE=1 -DPLOW_GQ_BATCH=$GQB" 256 2
+    check decode_mla_gq "$DEC $L2D $HIERD -DPLOW_BUCKET_DECODE_MLA=1 $DMLA_X -DPLOW_GLOBAL_QUEUE=1 -DPLOW_GQ_BATCH=$GQB" 256 2
   fi
   GQ_ELFS="interp_prefill_gq.elf interp_decode_gq.elf interp_flash_gq.elf"
 fi
@@ -1072,11 +1651,11 @@ fi
 FP8KV_ELFS=""
 if [ "$BUILD_FP8KV" = 1 ]; then
   check decode_fp8kv "$DEC $FP8KV_WEIGHTS -DPLOW_FP8_KV=1" 256 2
-  check flash_fp8kv "-DPLOW_BUCKET_DECODE=0 -DPLOW_BUCKET_FLASH -DPLOW_WG_WAVES=4 -DFA_DC=256 -DFA_DBUF=1 -DPLOW_MLA_PF_V2_ARM=1 -DPLOW_FP8_KV=1 $DSA_FLASH $FLASH_TR16 $FLASH_SCALE_HOIST" 512 1
+  check flash_fp8kv "-DPLOW_BUCKET_DECODE=0 -DPLOW_BUCKET_FLASH -DPLOW_WG_WAVES=4 -DFA_DC=256 -DFA_DBUF=1 -DPLOW_MLA_PF_V2_ARM=1 -DPLOW_FP8_KV=1 $DSA_FLASH $NOPE_FLASH $FLASH_TR16 $FLASH_SCALE_HOIST" 512 1
   FP8KV_ELFS="interp_decode_fp8kv.elf interp_flash_fp8kv.elf"
   if [ "$BUILD_GQ" = 1 ]; then
     check decode_fp8kv_gq "$DEC $FP8KV_WEIGHTS -DPLOW_FP8_KV=1 $L2D $HIERD -DPLOW_GLOBAL_QUEUE=1 -DPLOW_GQ_BATCH=$GQB" 256 2
-    check flash_fp8kv_gq "-DPLOW_BUCKET_DECODE=0 -DPLOW_BUCKET_FLASH -DPLOW_WG_WAVES=4 -DFA_DC=256 -DFA_DBUF=1 -DPLOW_MLA_PF_V2_ARM=1 -DPLOW_FP8_KV=1 $DSA_FLASH $FLASH_TR16 $FLASH_SCALE_HOIST -DPLOW_GLOBAL_QUEUE=1 -DPLOW_GQ_BATCH=$GQB $L2D $HIERPF" 512 1
+    check flash_fp8kv_gq "-DPLOW_BUCKET_DECODE=0 -DPLOW_BUCKET_FLASH -DPLOW_WG_WAVES=4 -DFA_DC=256 -DFA_DBUF=1 -DPLOW_MLA_PF_V2_ARM=1 -DPLOW_FP8_KV=1 $DSA_FLASH $NOPE_FLASH $FLASH_TR16 $FLASH_SCALE_HOIST -DPLOW_GLOBAL_QUEUE=1 -DPLOW_GQ_BATCH=$GQB $L2D $HIERPF" 512 1
     FP8KV_ELFS="interp_decode_fp8kv.elf interp_decode_fp8kv_gq.elf interp_flash_fp8kv.elf interp_flash_fp8kv_gq.elf"
   fi
 fi
@@ -1145,7 +1724,7 @@ if [ "$BUILD_GEMMA_MOE" = 1 ]; then
   fi
 fi
 
-ALL_ELFS="interp_prefill.elf interp_decode.elf interp_flash.elf test_kernels.elf $DECODE_MLA_ELFS $KDA_FUSED_ELFS $KDA_INTRA_CACHED_ELFS $KDA_INTRA_WAVE_ITEMS_ELFS $ATTN_RES_F32MIX_ELFS $KDA_CARRY_REGSTATE_ELFS $KDA_WU_LEAN_ELFS $KDA_CARRY_KEYFEED_ELFS $KDA_KEY_FACTOR_ELFS $XR_ATTNRES_ELFS $MOE_STAGE1_ELFS $MOE_STAGE2_ELFS $MOE_COMBINE_ELFS $MOE_EP_ELFS $MOE_DECODE_GROUPED_ELFS $MLA_MATERIALIZED_ELFS $GQ_ELFS $FP8_ELFS $FP8KV_ELFS $MXFP4_ELFS $MLA_ELFS $MOE_ELFS $GMOE_ELFS"
+ALL_ELFS="interp_prefill.elf interp_decode.elf interp_flash.elf test_kernels.elf $K3_ELFS $DECODE_MLA_ELFS $KDA_FUSED_ELFS $KDA_INTRA_CACHED_ELFS $KDA_INTRA_WAVE_ITEMS_ELFS $ATTN_RES_F32MIX_ELFS $KDA_CARRY_REGSTATE_ELFS $KDA_WU_LEAN_ELFS $GEMM_GROUP_ELFS $KDA_CARRY_KEYFEED_ELFS $MLA_PF_DENSE_ELFS $KDA_KEY_FACTOR_ELFS $XR_ATTNRES_ELFS $MOE_STAGE1_ELFS $MOE_STAGE2_ELFS $MOE_COMBINE_ELFS $MOE_FP8_PF_ELFS $MOE_EP_ELFS $MOE_DECODE_GROUPED_ELFS $MLA_MATERIALIZED_ELFS $GQ_ELFS $FP8_ELFS $FP8KV_ELFS $MXFP4_ELFS $MLA_ELFS $MOE_ELFS $GMOE_ELFS"
 
 # Every interpreter is compiled against the packed-prefill PlowProgram tail. This is an ABI
 # marker, not a claim that descriptor-consuming math arms are enabled.
@@ -1206,7 +1785,7 @@ if [ -f "$EXPECT" ] && command -v python3 >/dev/null; then
         --expect "$REPO/scripts/asm_expect_gfx950_mfma4.json" $MFMA4_ELFS | tail -20
     fi
   elif [ -n "${PLOW_HSACO_CONFIG:-}" ] &&
-       grep -qx '#define PLOW_PACKET_HAS_INDEX_SCORE 1' "$PLOW_HSACO_CONFIG"; then
+       grep -Eq '(#define PLOW_PACKET_HAS_INDEX_SCORE 1|PLOW_MOE_PF_A4W4=1)' "$PLOW_HSACO_CONFIG"; then
     DEFAULT_ELFS=""
     DSA_DECODE_ELFS=""
     QUARK_FP8KV_ELFS=""
@@ -1237,3 +1816,22 @@ fi
 # Freshness is the whole point of this script: print it, every time.
 ls -l --time-style=+%H:%M:%S $ALL_ELFS chat \
   | awk '{print "   ", $NF, $5"B", $6}'
+
+# Low-rung decode tiers (PLOW_DECODE_TIERS=<w,...>, as build_gfx942.sh): plowrt serves a decode
+# rung t <= w from `lowrung<w>/interp_decode*.elf` beside the object dir, so a one-row rung does
+# not run the widest object's GEMV body. Each tier is this script again at PLOW_DECODE_BATCH=w,
+# one GEMV pass of w rows (PLOW_GEMV_MM=min(w,16)), from the same packet config — a tier stamps
+# the packet hash and is refused under any other packet. Only its decode objects are kept.
+if [ -n "${PLOW_DECODE_TIERS:-}" ] && [ -z "${PLOW_DECODE_TIER:-}" ]; then
+  for w in ${PLOW_DECODE_TIERS//,/ }; do
+    case "$w" in ''|*[!0-9]*) echo "PLOW_DECODE_TIERS must be a comma list of widths" >&2; exit 1;; esac
+    if [ "$w" -ge "${PLOW_DECODE_BATCH:-1}" ]; then continue; fi  # the wide object serves it
+    mm=$w; [ "$mm" -gt 16 ] && mm=16
+    echo ""
+    echo ">>> low-rung decode tier: width $w -> $OUT/lowrung$w"
+    ( unset PLOW_DECODE_TIERS
+      PLOW_DECODE_TIER="$w" PLOW_DECODE_BATCH="$w" PLOW_GEMV_MM="$mm" PLOW_GEMV_WALK="${PLOW_GEMV_WALK:-1}" \
+        "$REPO/scripts/build_gfx950.sh" "$OUT/lowrung$w" ) || exit 1
+    find "$OUT/lowrung$w" -maxdepth 1 -type f ! -name 'interp_decode*' -delete
+  done
+fi

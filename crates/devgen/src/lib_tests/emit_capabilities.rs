@@ -303,11 +303,12 @@ fn glm_production_recipe_defaults_on_only_for_the_qualified_target() {
         let argv: Vec<&str> = ["test"].into_iter().chain(flag).collect();
         let mut cfg = EmitArgsForTest::try_parse_from(argv).unwrap().emit;
         apply_production_defaults(&mut cfg, emit_capabilities(model), arch, tp, n_cu);
-        assert_eq!(
-            resolved(&cfg),
-            [false; 9],
-            "{model} {arch} tp={tp} n_cu={n_cu} {flag:?}"
-        );
+        // gfx950 GLM keeps only the bit-identical batched-decode width defaults.
+        let gfx950_glm = arch == "gfx950" && model.starts_with("glm");
+        let mut want = [false; 9];
+        want[5] = gfx950_glm;
+        assert_eq!(resolved(&cfg), want, "{model} {arch} tp={tp} n_cu={n_cu} {flag:?}");
+        assert_eq!(cfg.glm_decode_glu_rows, gfx950_glm, "{model} {arch}");
     }
 }
 

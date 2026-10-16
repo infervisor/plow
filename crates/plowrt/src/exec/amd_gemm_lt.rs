@@ -6,11 +6,20 @@ use serde::Deserialize;
 use super::device_api::EngineDevice;
 use crate::asset::devblob::{DevProg, DevTensor};
 use crate::device::hsa::{HsaBackend, HsaKernel};
-use crate::device::Module;
+use crate::device::{DeviceMem, Module};
 use crate::{Result, RuntimeError};
 
 const OBJECT_HASH: &str = "efa5b0365bedc2effa52265c85eded14fb63febd9c067bab37138d99db607db5";
 const NOBIAS_OBJECT_HASH: &str = "0ab860e928c070fa3ee22f5f91725539caaa0a12223296060b8a2bda818ace0d";
+/// The `glm_lt_gfx950.json` kernels cut out of the ROCm 10
+/// `TensileLibrary_BB_BB_HA_Bias_SAV_UA_Type_BB_HPA_Contraction_l_Alik_Bljk_Cijk_Dijk` gfx950 image
+/// (`scripts/build_glm_lt.sh --gfx950`, `scripts/glm_lt_subset.py`).
+const GFX950_OBJECT_HASH: &str = "88995bce9413c67da6df1a2d7e41aa95b0ba73f4ee3626de4a26e025580f1b0f";
+/// Stream-K partial-tile workspace and flags. Every launch runs one whole tile per workgroup;
+/// the kernels still require both pointers, and the workspace covers a full FP32 partial of
+/// every tile at 8192 rows should one write it.
+const GFX950_WS: u64 = 256 << 20;
+const GFX950_FLAGS: u64 = 4 << 20;
 
 #[derive(Clone, Copy, Debug)]
 pub(super) struct Route {
@@ -19,6 +28,15 @@ pub(super) struct Route {
 }
 
 impl Route {
+    /// Tensor handles of the output and the activation input.
+    pub fn io(&self) -> [u16; 2] {
+        [self.inst.t[0], self.inst.t[1]]
+    }
+
+    pub fn inst(&self) -> &DevInst64 {
+        &self.inst
+    }
+
     pub fn rebase(&mut self, rows: u32) -> Result<()> {
         // A band GEMM covers this rank's fixed `T/8` rows whatever the chunk carries.
         let cap = if self.inst.i[3] == 2 {
@@ -41,6 +59,7 @@ impl Route {
         let (n, k) = (self.inst.i[1], self.inst.i[2]);
         match self.inst.i[3] {
             1 => return decode_choice(self.rows, n, k).unwrap(),
+            4 => return (gfx950_choice(self.rows, n, k).unwrap(), 0),
             2 => return band_choice(self.rows, n, k).unwrap(),
             3 => return gemma_choice(self.inst.i[0], n, k).unwrap(),
             _ => {}
@@ -181,8 +200,46 @@ fn band_choice(rows: u32, n: u32, k: u32) -> Option<(usize, u32)> {
     })
 }
 
+/// Pinned gfx950 kernel (index into `glm_lt_gfx950.json`) per GLM-5.3-Flash projection and row
+/// tier (decode rungs <= 64 and <= 256 rows, then prefill <= 2048, <= 4096, above): the fastest of
+/// hipBLASLt's eight heuristic candidates per shape through this launcher (MI350X, 30-launch
+/// means; decode tiers at 32 and 128 rows).
+fn gfx950_choice(rows: u32, n: u32, k: u32) -> Option<usize> {
+    let tiers: [usize; 5] = match (n, k) {
+        // KDA b at the decode rungs only; prefill keeps it on the grouped kernel.
+        (8, 4096) if rows <= 256 => [31, 32, 0, 0, 0],
+        (1536, 4096) => [18, 19, 0, 1, 2],
+        (512, 4096) => [20, 21, 3, 4, 5],
+        (4096, 1536) => [22, 23, 6, 7, 7],
+        (4096, 2048) => [24, 23, 6, 8, 8],
+        (4096, 1024) => [22, 23, 9, 7, 7],
+        (1024, 128) => [25, 26, 10, 11, 12],
+        (1024, 4096) => [27, 28, 13, 11, 14],
+        // KDA f_a/g_a. Not b (N=8): the narrow kernels fault on an 8-column edge.
+        (128, 4096) => [29, 30, 15, 16, 17],
+        // TP8 lm_head shard at the decode rungs only.
+        (19360, 4096) if rows <= 256 => {
+            let k = crate::config::RuntimeConfig::get()
+                .amd
+                .lt_lm_head_kernel
+                .unwrap_or(23) as usize;
+            [k, k, 0, 0, 0]
+        }
+        _ => return None,
+    };
+    let tier = match rows {
+        0..=64 => 0,
+        65..=256 => 1,
+        257..=2048 => 2,
+        2049..=4096 => 3,
+        _ => 4,
+    };
+    Some(tiers[tier])
+}
+
 /// The `GemmLtPf` mode each program role may carry: decode rungs `1`; prefill-side programs `0`
-/// (GLM bucket rows), `2` (GLM sequence-parallel bands), and `3` (Gemma bucket rows).
+/// (GLM bucket rows), `2` (GLM sequence-parallel bands), `3` (Gemma bucket rows) and `4`
+/// (GLM-5.3-Flash gfx950 bucket rows).
 pub(super) fn modes_match(prog: &DevProg) -> bool {
     let decode = prog.role.is_decode_rung();
     prog.insts
@@ -190,9 +247,24 @@ pub(super) fn modes_match(prog: &DevProg) -> bool {
         .filter(|d| d.op == DevOp::GemmLtPf as u16)
         .all(|d| match d.i[3] {
             1 => decode,
+            4 => true,
             0 | 2 | 3 => !decode,
             _ => false,
         })
+}
+
+/// Mode 4 is the gfx950 object; every other mode the gfx942 one. A blob never mixes them.
+pub(super) fn arch_matches(progs: &[DevProg], arch: &str) -> bool {
+    let mut modes = progs
+        .iter()
+        .flat_map(|p| &p.insts)
+        .filter(|d| d.op == DevOp::GemmLtPf as u16)
+        .map(|d| d.i[3] == 4);
+    match arch {
+        "gfx942" => modes.all(|gfx950| !gfx950),
+        "gfx950" => modes.all(|gfx950| gfx950),
+        _ => false,
+    }
 }
 
 pub(super) fn topology_matches(progs: &[DevProg], tp: Option<u32>) -> bool {
@@ -289,6 +361,7 @@ pub(super) fn routes(
                     && prog.t % 8 == 0
                     && band_choice(rows, inst.i[1], inst.i[2]).is_some()
             }
+            4 => (1..=8192).contains(&prog.t) && gfx950_choice(prog.t, inst.i[1], inst.i[2]).is_some(),
             3 => {
                 matches!(prog.t, 2048 | 4096 | 8192)
                     && inst.i[0] == prog.t
@@ -330,6 +403,102 @@ pub(super) struct KernelSpec {
     pub lds: u32,
     pub mt_i: u32,
     pub mt_j: u32,
+    /// gfx950 only: the K unroll and hipBLASLt's internalArgs/internalArgs1 words.
+    #[serde(default)]
+    pub depth_u: u32,
+    #[serde(default)]
+    pub internal: [u32; 2],
+    /// gfx950 decode tiers: `[rows, skGrid, skTiles, SKItersPerWG]`, hipBLASLt's own stream-K
+    /// split at exactly `rows` (a rung's fixed width); other row counts run whole tiles.
+    #[serde(default)]
+    pub sk: Option<[u32; 4]>,
+    /// Workgroup size (the kernel's `WG` tile); 256 when absent.
+    #[serde(default = "wg256")]
+    pub wg: u32,
+}
+
+fn wg256() -> u32 {
+    256
+}
+
+/// gfx950 Tensile stream-K kernarg (184 bytes, `.kernarg_segment_size` of every SK5 kernel).
+#[repr(C)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+struct Args950 {
+    dims: [u32; 8],
+    /// D, C, A, B, partial-tile workspace, stream-K flags.
+    pointers: [u64; 6],
+    strides: [u32; 8],
+    alpha: f32,
+    beta: f32,
+    /// ItersPerTile, MagicNumberItersPerTile, MagicShiftItersPerTile, SKItersPerWG, skGrid, skTiles.
+    stream_k: [u32; 6],
+    /// scaleAlphaVec, bias, biasType, strideBias, activation alpha/beta/type (all unused).
+    epilogue: [u32; 10],
+}
+const _: () = assert!(std::mem::size_of::<Args950>() == 184);
+
+/// hipBLASLt's `magicNumberAlg2` (Hacker's Delight unsigned magic division), bit 31 of the shift
+/// carrying the "add" indicator.
+fn magic_number(d: u32) -> (u32, u32) {
+    let nc = u32::MAX - d.wrapping_neg() % d;
+    let mut p = 31u32;
+    let (mut q1, mut r1) = (0x8000_0000 / nc, 0x8000_0000 - (0x8000_0000 / nc) * nc);
+    let (mut q2, mut r2) = (0x7FFF_FFFF / d, 0x7FFF_FFFF - (0x7FFF_FFFF / d) * d);
+    let mut add = false;
+    loop {
+        p += 1;
+        if r1 >= nc - r1 {
+            q1 = q1.wrapping_mul(2).wrapping_add(1);
+            r1 = r1.wrapping_mul(2).wrapping_sub(nc);
+        } else {
+            q1 = q1.wrapping_mul(2);
+            r1 = r1.wrapping_mul(2);
+        }
+        if r2 + 1 >= d - r2 {
+            add |= q2 >= 0x7FFF_FFFF;
+            q2 = q2.wrapping_mul(2).wrapping_add(1);
+            r2 = r2.wrapping_mul(2).wrapping_add(1).wrapping_sub(d);
+        } else {
+            add |= q2 >= 0x8000_0000;
+            q2 = q2.wrapping_mul(2);
+            r2 = r2.wrapping_mul(2).wrapping_add(1);
+        }
+        let delta = d - 1 - r2;
+        if !(p < 64 && (q1 < delta || (q1 == delta && r1 == 0))) {
+            break;
+        }
+    }
+    (q2.wrapping_add(1), (p - 32) | if add { 0x8000_0000 } else { 0 })
+}
+
+/// Prefill: one whole output tile per workgroup (`skGrid = skTiles = tiles`, `SKItersPerWG =
+/// ItersPerTile`), so no tile is split. Decode tiers replay hipBLASLt's split at the rung width.
+fn arguments950(
+    route: Route,
+    tensors: [u64; 3],
+    spec: &KernelSpec,
+    scratch: [u64; 2],
+) -> (Args950, u32) {
+    let [out, x, weight] = tensors;
+    let (m, n, k) = (route.rows, route.inst.i[1], route.inst.i[2]);
+    let tiles = n.div_ceil(spec.mt_i) * m.div_ceil(spec.mt_j);
+    let iters = k.div_ceil(spec.depth_u).max(1);
+    let (magic, shift) = magic_number(iters);
+    let (grid, sk_tiles, sk_iters) = match spec.sk {
+        Some([rows, grid, sk_tiles, sk_iters]) if rows == m => (grid, sk_tiles, sk_iters),
+        _ => (tiles, tiles, iters),
+    };
+    let args = Args950 {
+        dims: [1, spec.internal[0], spec.internal[1], grid, n, m, 1, k],
+        pointers: [out, out, weight, x, scratch[0], scratch[1]],
+        strides: [n, 0, n, 0, k, 0, k, 0],
+        alpha: 1.0,
+        beta: 0.0,
+        stream_k: [iters, magic, shift, sk_iters, grid, sk_tiles],
+        epilogue: [0; 10],
+    };
+    (args, grid)
 }
 
 #[repr(C)]
@@ -414,6 +583,7 @@ pub(super) fn load_kernels(
 pub(super) struct GemmLt {
     kernels: Vec<HsaKernel>,
     specs: Vec<KernelSpec>,
+    scratch: Option<DeviceMem>,
 }
 
 impl GemmLt {
@@ -487,7 +657,87 @@ impl GemmLt {
             )?);
             specs.extend(no_bias);
         }
-        Ok(Self { kernels, specs })
+        Ok(Self {
+            kernels,
+            specs,
+            scratch: None,
+        })
+    }
+
+    pub fn load_gfx950(be: &HsaBackend, dir: &Path, modules: &mut Vec<Module>) -> Result<Self> {
+        let specs: Vec<KernelSpec> =
+            serde_json::from_str(include_str!("../../../../runtime/amd/glm_lt_gfx950.json"))
+                .map_err(|e| {
+                    RuntimeError::Device(format!("gfx950 hipBLASLt kernel specification: {e}"))
+                })?;
+        let kernels = load_kernels(
+            be,
+            dir,
+            "glm_lt_gfx950.elf",
+            GFX950_OBJECT_HASH,
+            &specs,
+            184,
+            modules,
+        )?;
+        let scratch = EngineDevice::alloc(be, GFX950_WS + GFX950_FLAGS)?;
+        be.memset_d8(scratch.base, 0, (GFX950_WS + GFX950_FLAGS) as usize)?;
+        Ok(Self {
+            kernels,
+            specs,
+            scratch: Some(scratch),
+        })
+    }
+
+    /// How many leading groups of a `GemmGroupPf` instruction have a pinned gfx950 kernel.
+    pub fn group_prefix(&self, n: &[u32; 6], k: u32) -> usize {
+        if self.scratch.is_none() {
+            return 0;
+        }
+        n.iter()
+            .take_while(|&&n| n != 0 && gfx950_choice(8192, n, k).is_some())
+            .count()
+    }
+
+    /// `PLOW_AMD_GEMM_GROUP_LT`: one launch per group of the leading `groups`; group `g` reads
+    /// weight rows `sum(n[..g])..` of the row-concatenated `w`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn enqueue_group(
+        &self,
+        be: &HsaBackend,
+        x: u64,
+        w: u64,
+        c: &[u64; 6],
+        n: &[u32; 6],
+        groups: usize,
+        rows: u32,
+        k: u32,
+    ) -> Result<()> {
+        let base = self
+            .scratch
+            .as_ref()
+            .ok_or_else(|| RuntimeError::Device("grouped hipBLASLt route on gfx942".into()))?
+            .base;
+        let mut weight = w;
+        for (&out, &nn) in c.iter().zip(n).take(groups) {
+            let index = gfx950_choice(rows, nn, k)
+                .ok_or_else(|| RuntimeError::Device("grouped hipBLASLt shape unpinned".into()))?;
+            let route = Route {
+                inst: DevInst64 {
+                    i: [rows, nn, k, 4, 0, 0, 0, 0],
+                    ..Default::default()
+                },
+                rows,
+            };
+            let (args, grid) = arguments950(
+                route,
+                [out, x, weight],
+                &self.specs[index],
+                [base, base + GFX950_WS],
+            );
+            be.launch(self.kernels[index], grid, self.specs[index].wg, 0, bytemuck::bytes_of(&args))?;
+            weight += u64::from(nn) * u64::from(k) * 2;
+        }
+        Ok(())
     }
 
     pub fn enqueue(&self, be: &HsaBackend, route: Route, tensor_table: &[u8]) -> Result<()> {
@@ -496,6 +746,20 @@ impl GemmLt {
             u64::from_le_bytes(tensor_table[at..at + 8].try_into().unwrap())
         });
         let (index, info1) = route.kernel_choice();
+        if route.inst.i[3] == 4 {
+            let base = self
+                .scratch
+                .as_ref()
+                .ok_or_else(|| RuntimeError::Device("gfx950 hipBLASLt route on gfx942".into()))?
+                .base;
+            let (args, grid) = arguments950(
+                route,
+                tensors,
+                &self.specs[index],
+                [base, base + GFX950_WS],
+            );
+            return be.launch(self.kernels[index], grid, self.specs[index].wg, 0, bytemuck::bytes_of(&args));
+        }
         let args = arguments(route, tensors, &self.specs[index], info1);
         be.launch(
             self.kernels[index],
@@ -556,6 +820,35 @@ mod tests {
         (prog, tensors)
     }
 
+    /// The (magic, shift) words hipBLASLt itself packed for these ItersPerTile (TENSILE_DB dumps).
+    #[test]
+    fn gfx950_magic_matches_hipblaslt() {
+        for (d, want) in [
+            (64, (67108864, 0)),
+            (32, (134217728, 0)),
+            (24, (2863311531, 4)),
+            (16, (268435456, 0)),
+            (12, (2863311531, 3)),
+            (6, (2863311531, 2)),
+            (3, (2863311531, 1)),
+            (2, (2147483648, 0)),
+        ] {
+            assert_eq!(magic_number(d), want, "ItersPerTile {d}");
+        }
+    }
+
+    #[test]
+    fn gfx950_specs_cover_the_table() {
+        let specs: Vec<KernelSpec> =
+            serde_json::from_str(include_str!("../../../../runtime/amd/glm_lt_gfx950.json"))
+                .unwrap();
+        for (n, k) in [(1536, 4096), (512, 4096), (4096, 1536), (4096, 2048), (4096, 1024), (1024, 128)] {
+            for rows in [1, 2048, 2049, 4096, 4097, 8192] {
+                let spec = &specs[gfx950_choice(rows, n, k).unwrap()];
+                assert!(spec.depth_u > 0 && spec.mt_i > 0 && spec.mt_j > 0);
+            }
+        }
+    }
     #[test]
     fn lt_route_rejects_invalid_shapes_bindings_and_segments() {
         let (p, t) = fixture();

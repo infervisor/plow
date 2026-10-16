@@ -86,6 +86,18 @@ pub fn build_graph(cfg: &ModelConfig, bucket: &ShapeBucket) -> Result<Graph, Bui
                 c.unimplemented(),
             )))
         }
+        ModelConfig::DeepSeekV41(c) => {
+            return Err(BuildError::Config(ConfigError::Unsupported(
+                c.unimplemented(),
+            )))
+        }
+        // Served by the devblob emitter (`mla::glm53_emit_full`), which does
+        // not use nn-graph; the packet path has no lowering.
+        ModelConfig::Glm5Next(c) => {
+            return Err(BuildError::Config(ConfigError::Unsupported(
+                c.unimplemented(),
+            )))
+        }
         ModelConfig::Siglip(c) => siglip::build(c),
         ModelConfig::QwenVl(c) => qwen_vl::build(c),
         ModelConfig::QwenImageDit(c) => qwen_image_dit::build(c, bucket),
@@ -114,6 +126,8 @@ pub fn build_encoder_graph(cfg: &ModelConfig, taps: &[u32]) -> Result<Graph, Bui
                 ModelConfig::KimiK3(_) => "kimi_k3",
                 ModelConfig::DeepSeek(_) => "deepseek",
                 ModelConfig::DeepSeekV4(_) => "deepseek_v4",
+                ModelConfig::DeepSeekV41(_) => "deepseek_v41",
+                ModelConfig::Glm5Next(_) => "glm5_next",
                 ModelConfig::Siglip(_) => "siglip",
                 ModelConfig::QwenVl(_) => "qwen_vl",
                 ModelConfig::QwenImageDit(_) => "qwen_image_dit",

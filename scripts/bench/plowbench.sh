@@ -364,8 +364,8 @@ pb_check_vllm() {
     # AMD target
     v="${v:-/app/plow/build-gemma31/vllm-python}"
     [ -x "$v" ] || { pb_bad "no vLLM client at $v (set PB_VLLM)"; return 1; }
-    if [[ "$v" == */vllm029-client.sh ]]; then
-        pb_ok "vLLM client $v (pinned Docker 0.29; host ROCm lib not needed)"
+    if [[ "$v" == *-client.sh ]]; then
+        pb_ok "vLLM client $v (Docker wrapper; host ROCm lib not needed)"
         return 0
     fi
     local lib="${PB_VLLM_ROCM_LIB:-/opt/rocm/core-7.14/lib}"
@@ -436,7 +436,9 @@ pb_bench() {
     # A `vllm` console script takes the subcommand directly; a python launcher needs the module.
     local cli=(-m vllm.entrypoints.cli.main)
     [ "${v##*/}" = vllm ] && cli=()
-    local lib="${PB_VLLM_ROCM_LIB:-/opt/rocm/core-7.14/lib}"
+    # The lab ROCm lib is exported only when it exists (a Docker wrapper client has none to link).
+    local lib="${PB_VLLM_ROCM_LIB:-/opt/rocm/core-7.14/lib}" lib_env=()
+    [ -n "${PB_VLLM_ROCM_LIB:-}" ] || [ -d "$lib" ] && lib_env=(VLLM_ROCM_LIB="$lib")
     local tokz="${PB_TOKENIZER:-zai-org/GLM-5.3}"
     PB_ARM_N=$((PB_ARM_N + 1))
     # One seed per cell unless PB_SEED pins it. With range ratio 0 a shared seed makes each cell's
@@ -446,7 +448,7 @@ pb_bench() {
     local seed="${PB_SEED:-$((8193 + conc * 131 + isl * 7 + osl))}"
     mkdir -p "$res"
     echo "$PB_ARM_N" > "$res/$tag.armorder"
-    timeout --foreground --kill-after=10s -s TERM "${PB_BENCH_TIMEOUT:-3000}" env VLLM_ROCM_LIB="$lib" "$v" \
+    timeout --foreground --kill-after=10s -s TERM "${PB_BENCH_TIMEOUT:-3000}" env "${lib_env[@]}" "$v" \
         "${cli[@]}" bench serve \
         --backend vllm --host 127.0.0.1 --port "$PB_SERVER_PORT" --model "$model" \
         --tokenizer "$tokz" --trust-remote-code --dataset-name random \

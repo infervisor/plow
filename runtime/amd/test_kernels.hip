@@ -362,7 +362,7 @@ __launch_bounds__(PLOW_THREADS, PLOW_WAVES / 4) void moe_group_glu_a8w8_block128
     const int* meta, const unsigned* row_token, unsigned I, unsigned H,
     unsigned n_exp, unsigned T) {
     d_moe_group_glu_fp8_block128_m16(fu, xq, xscale, wtab, stab, meta, row_token,
-        I, H, n_exp, T, blockIdx.x, gridDim.x);
+        I, H, n_exp, T, blockIdx.x, gridDim.x, 0.0f);
 }
 extern "C" __global__ __attribute__((flatten))
 __launch_bounds__(PLOW_THREADS, PLOW_WAVES / 4) void moe_group_down_a8w8_block128_m16(
@@ -798,6 +798,15 @@ extern "C" __global__ __launch_bounds__(PLOW_THREADS, PLOW_WAVES / 4) void d_gem
     unsigned K) {
     __shared__ bf16 lds[GM_LDS_HALVES_T(GM_BLK_BM, GM_BLK_BN, GM_BLK_BK)];
     d_gemm_fp8_blk(C, A, W, wscale, M, N, K, blockIdx.x, gridDim.x, lds);
+}
+#endif
+
+#if GM_TILE_FITS(GM_MX_BM, GM_MX_BN, GM_MX_BK)
+extern "C" __global__ __launch_bounds__(PLOW_THREADS, PLOW_WAVES / 4) void d_gemm_fp8_mx_k(
+    bf16* C, const bf16* A, const unsigned char* W, const unsigned char* wscale, unsigned M,
+    unsigned N, unsigned K) {
+    __shared__ bf16 lds[GM_LDS_HALVES_T(GM_MX_BM, GM_MX_BN, GM_MX_BK)];
+    d_gemm_fp8_mx(C, A, W, wscale, M, N, K, blockIdx.x, gridDim.x, lds);
 }
 #endif
 

@@ -362,10 +362,16 @@ struct Shapes {
     moe_pf_part16: bool,
     /// Any prefill GLU with `i[7]=1` — fp8 gathered activations (PLOW_MOE_PF_A8).
     moe_pf_a8: bool,
+    /// Any prefill GLU/DOWN with `i[7]>=2` — the W8A8 block-FP8 arm (PLOW_MOE_PF_W8A8).
+    moe_pf_w8a8: bool,
     /// Any decode one-shot XReduce with `i[7]!=0` — the K3 latent MoeCombine folded into the
     /// tagged publish (PLOW_XR_COMBINE_FOLD). An object without the arm publishes the unwritten
     /// plain slot: finite, stale, wrong.
     xr_combine_fold: bool,
+    /// Any XReduce with `t[2]` set — the GLM-5.3-Flash HyperConnPost folded into the batched
+    /// decode one-shot (PLOW_GLM_XR_HCPOST). An object without the arm never writes the new
+    /// residual stream: stale data, no trap.
+    xr_hcpost: bool,
     /// Widest head dim of a merge-folded `FlashDecode` (`j2` != 0; nv_decode_merge_fold), 0 if
     /// none. The fold traps in an object without the row-group body for that width.
     flash_fold_hd: u32,
@@ -436,6 +442,28 @@ struct Shapes {
     /// A pre-arm object ignores both and stages `t[1]` verbatim, i.e. it runs the projection
     /// over an UNNORMED row and returns finite, fluent, wrong tokens. Refuse at load.
     glm_fuse_qnorm: bool,
+    /// Any `HyperConnPre` (op 128) with `i[4] == 1` — the decode RmsNorm fold
+    /// (PLOW_GLM_HC_NORM_FOLD): t7 = gamma, i5 = out handle. A pre-arm object never writes the
+    /// normed row and every consumer reads stale data. Refuse at load.
+    glm_hc_norm_fold: bool,
+    /// Any `GemvF32` (op 135) with `i[3] == 1` — the decode HyperConnPost fold
+    /// (PLOW_GLM_HC_POST_FOLD). A pre-arm object never writes the new residual stream. Refuse.
+    glm_hc_post_fold: bool,
+    /// Any `GemvF32` (op 135) with `i[4] == 1` — the one-row HyperConnPre tail
+    /// (PLOW_GLM_HC_PRE_TAIL). A pre-arm object never runs the pre. Refuse.
+    glm_hc_pre_tail: bool,
+    /// Any `GemvF32` with `i[4] == 2` — the mix split over workgroups (PLOW_GLM_HC_MIX_SPLIT).
+    /// A pre-arm object runs the unsplit mix on the narrowed grid and never the pre. Refuse.
+    glm_hc_mix_split: bool,
+    /// Any `GemvF32` with `i[4] == 3` — the batched decode post + mix + pre fold
+    /// (PLOW_GLM_HC_FUSE_DEC). A pre-arm object never runs the pre. Refuse.
+    glm_hc_fuse_dec: bool,
+    /// Any `GemmSmall` with `i[7] >= 3` — grouped projections (PLOW_GLM_KDA_PROJ_GROUP). An
+    /// object without the arm runs segment 0 only. Refuse.
+    gemm_small_group: bool,
+    /// Any `GemmSmall` with `i[6] > 1` — decode split-K (PLOW_GLM_DEC_SPLITK). A BUILD axis
+    /// (`#if PLOW_GEMM_SMALL_SPLITK`); an object without it runs the unsplit tile (correct).
+    gemm_small_splitk: bool,
     /// Any `GemmMed` (op 15) carrying a `t[5]` — the prefill q-rope fold (PLOW_GLM_FUSE_POST):
     /// t3/t4 = cos/sin, t5 = pos, i3 = the first roped column. An object without the arm stores
     /// the unroped projection and attention runs on it. Refuse at load.
@@ -498,6 +526,7 @@ fn shapes(m: &Model) -> Shapes {
             }
             match op {
                 DevOp::XReduce if inst.i[7] != 0 => s.xr_combine_fold = true,
+                DevOp::XReduce if inst.t[2] != packet::TENSOR_NONE => s.xr_hcpost = true,
                 DevOp::KdaStateStepG if inst.i[4] & 12 != 0 => {
                     s.kda_fb_fold |= inst.i[4] & 4 != 0;
                     s.kda_decode_fused_arm |= inst.i[4] & 8 != 0;
@@ -572,7 +601,9 @@ fn shapes(m: &Model) -> Shapes {
                         ));
                     }
                     // i[7] carries the activation-side arms: a8 on GLU, part16 on DOWN.
-                    if inst.i[7] != 0 {
+                    if inst.i[7] >= 2 {
+                        s.moe_pf_w8a8 = true;
+                    } else if inst.i[7] != 0 {
                         if op == DevOp::MoeGroupGluPf {
                             s.moe_pf_a8 = true;
                         } else {
@@ -580,7 +611,9 @@ fn shapes(m: &Model) -> Shapes {
                         }
                     }
                     // i[4] on DOWN is the fused decomposition's log2(k)+1 (PLOW_MOE_PF_ATOMIC).
-                    if op == DevOp::MoeGroupDownPf && inst.i[4] != 0 {
+                    // i7 = 3 (PLOW_MOE_FP8_PF_ACC) reuses i[4] as its slot count on the
+                    // dedicated object; it never reaches the interpreter's atomic arm.
+                    if op == DevOp::MoeGroupDownPf && inst.i[4] != 0 && inst.i[7] != 3 {
                         s.moe_pf_atomic = true;
                     }
                     // i[5] on DOWN is the deterministic arm's log2(k)+1 (PLOW_MOE_PF_DET).
@@ -645,6 +678,18 @@ fn shapes(m: &Model) -> Shapes {
                     }
                 }
                 DevOp::AddNorm if inst.i[2] == 1 => s.glm_fuse_seam_rn = true,
+                DevOp::HyperConnPre if inst.i[4] == 1 => s.glm_hc_norm_fold = true,
+                DevOp::GemmSmall if inst.i[7] >= 3 => {
+                    s.gemm_small_splitk = true;
+                    s.gemm_small_group = true;
+                }
+                DevOp::GemmSmall if inst.i[6] > 1 => s.gemm_small_splitk = true,
+                DevOp::GemvF32 if inst.i[3] == 1 || inst.i[4] != 0 => {
+                    s.glm_hc_post_fold |= inst.i[3] == 1;
+                    s.glm_hc_pre_tail |= inst.i[4] != 0;
+                    s.glm_hc_mix_split |= inst.i[4] == 2;
+                    s.glm_hc_fuse_dec |= inst.i[4] == 3 || inst.i[4] == 4;
+                }
                 DevOp::Gemm | DevOp::GemmMed | DevOp::GemmSmall | DevOp::Gemv => {
                     if op == DevOp::GemmMed && inst.t[5] != packet::TENSOR_NONE {
                         s.glm_fuse_post = true;
@@ -981,7 +1026,11 @@ fn encoding_features(f: &mut Map<String, Value>, s: &Shapes) {
     f.insert("moe_aiter_fp8".into(), json!(s.moe_aiter_fp8));
     f.insert("moe_aiter_flat".into(), json!(s.moe_aiter_flat));
     f.insert("moe_pf_a8".into(), json!(s.moe_pf_a8));
+    f.insert("moe_pf_w8a8".into(), json!(s.moe_pf_w8a8));
     f.insert("xr_combine_fold".into(), json!(s.xr_combine_fold));
+    if s.xr_hcpost {
+        f.insert("xr_hcpost".into(), json!(true));
+    }
     f.insert("kda_fb_fold".into(), json!(s.kda_fb_fold));
     f.insert("kda_decode_fused_arm".into(), json!(s.kda_decode_fused_arm));
     // L8 is packet-inert (loads only), so it is an EMIT setting surfaced here for the paired
@@ -1017,6 +1066,23 @@ fn encoding_features(f: &mut Map<String, Value>, s: &Shapes) {
     f.insert("mla_pf_nope".into(), json!(s.mla_pf_nope));
     f.insert("glm_fuse_rope".into(), json!(s.glm_fuse_rope));
     f.insert("glm_fuse_qnorm".into(), json!(s.glm_fuse_qnorm));
+    f.insert("glm_hc_norm_fold".into(), json!(s.glm_hc_norm_fold));
+    f.insert("glm_hc_post_fold".into(), json!(s.glm_hc_post_fold));
+    if s.glm_hc_pre_tail {
+        f.insert("glm_hc_pre_tail".into(), json!(true));
+    }
+    if s.glm_hc_mix_split {
+        f.insert("glm_hc_mix_split".into(), json!(true));
+    }
+    if s.glm_hc_fuse_dec {
+        f.insert("glm_hc_fuse_dec".into(), json!(true));
+    }
+    if s.gemm_small_group {
+        f.insert("gemm_small_group".into(), json!(true));
+    }
+    if s.gemm_small_splitk {
+        f.insert("gemm_small_splitk".into(), json!(true));
+    }
     if s.glm_fuse_post {
         f.insert("glm_fuse_post".into(), json!(true));
     }
@@ -1653,6 +1719,35 @@ fn backend_amd(
     if on("moe_prefill") {
         req.push("PLOW_MOE_PREFILL=1".into());
     }
+    // DeepSeek-V4 CSA2 (ops 212/213/217). Its own axis for the same reason PLOW_MOE_PREFILL has one:
+    // the compressor is a second pooling body with its own LDS staging, and only a V4 object can
+    // reach it. An object without the axis has no case for either op, so a CSA2 packet would fall
+    // through the interpreter's switch -- which is what `plow_dsv4_csa2_arm` lets the loader
+    // refuse instead.
+    if has("CompressPool") || has("CompressRopeQuant") || has("RopeInverseO") {
+        req.push("PLOW_DSV4_CSA2=1".into());
+    }
+    // Engram (ops 214/215). Separate from CSA2 above: V4 has the compressor without the tables, and
+    // only two V4.1 layers carry one. An object without the axis has no case for the op, so the
+    // packet would run as a no-op and the stream would simply lose its memory contribution.
+    if has("EngramGate") || has("EngramEmbed") {
+        req.push("PLOW_DSV41_ENGRAM=1".into());
+    }
+    // V4.1's [32,32] ue8m0 block-fp8 GEMM (op 216). Its own axis, not folded into the Engram one:
+    // the projections need it on EVERY layer where Engram is on two, and a V4.1 object could in
+    // principle want one without the other. Without the axis there is no case for op 216 and the
+    // packet would fall through the switch, leaving every projection's output untouched.
+    if has("GemmFp8Mx") {
+        req.push("PLOW_DSV41_BLKFP8=1".into());
+    }
+    // Op 142, the per-head norm + interior-range rotary. Qwen's name, but DeepSeek-V4.1 dispatches
+    // it for its own RoPE: `head_dim` 512 contains the 64 rope dims as a SUFFIX, which is what the
+    // op's `rot_offset` expresses. The arm is behind `PLOW_QWEN_GDN` and an object without it
+    // leaves `q`/`kv` unrotated -- every position attends as if it were position zero, which reads
+    // as a long-context regression rather than as a missing kernel.
+    if has("QwenHeadNormRope") {
+        req.push("PLOW_QWEN_GDN=1".into());
+    }
     if on("a4w4") {
         req.push("PLOW_MOE_PF_A4W4=1".into());
     }
@@ -1698,9 +1793,16 @@ fn backend_amd(
     if on("moe_pf_a8") {
         req.push("PLOW_MOE_PF_A8=1".into());
     }
+    // W8A8 grouped MoE prefill: a BUILD axis (`#if PLOW_MOE_PF_W8A8`), set by plow_config.h.
+    if on("moe_pf_w8a8") {
+        req.push("PLOW_MOE_PF_W8A8=1".into());
+    }
     // L4 combine fold: a BUILD axis of the tagged decode object (`#if PLOW_XR_COMBINE_FOLD`).
     if on("xr_combine_fold") {
         req.push("PLOW_XR_COMBINE_FOLD=1".into());
+    }
+    if on("xr_hcpost") {
+        req.push("PLOW_XR_HCPOST=1".into());
     }
     // L3 f_b fold: a BUILD axis of the decode object (`#if PLOW_KDA_FB_FOLD`).
     if on("kda_fb_fold") {
@@ -1797,6 +1899,24 @@ fn backend_amd(
     if on("glm_fuse_post") {
         req.push("PLOW_GLM_FUSE_POST=1".into());
     }
+    if on("glm_hc_norm_fold") {
+        req.push("PLOW_GLM_HC_NORM_FOLD=1".into());
+    }
+    if on("glm_hc_post_fold") {
+        req.push("PLOW_GLM_HC_POST_FOLD=1".into());
+    }
+    if on("glm_hc_pre_tail") {
+        req.push("PLOW_GLM_HC_PRE_TAIL=1".into());
+    }
+    if on("glm_hc_mix_split") {
+        req.push("PLOW_GLM_HC_MIX_SPLIT=1".into());
+    }
+    if on("glm_hc_fuse_dec") {
+        req.push("PLOW_GLM_HC_FUSE_DEC=1".into());
+    }
+    if on("gemm_small_group") {
+        req.push("PLOW_GLM_KDA_PROJ_GROUP=1".into());
+    }
     if on("glm_fuse_seam_rn") {
         req.push("PLOW_GLM_FUSE_SEAM_RN=1".into());
     }
@@ -1814,6 +1934,14 @@ fn backend_amd(
     // PLOW_K3 skips all of it through the non-trapping `default:` and returns fluent output from
     // a model that is missing most of itself.
     if has("AttnRes")
+        // DeepSeek-V4.1's mHC. Not Kimi ops and not KDA, but they live inside the same
+        // `#if PLOW_K3` block (interp.hip:3485-3887), so the axis that compiles them is the same
+        // one -- and the failure is the one this rule's header describes, on a model where the
+        // hyper-connection IS the residual stream. Without the arm, `HyperConnPost` writes
+        // nothing, every layer's residual stays whatever the seed left, and the run completes.
+        || has("HyperConnPre")
+        || has("HyperConnPost")
+        || has("GemvF32")
         || has("SituGlu")
         || has("MlaOutGate")
         || has("KdaStateStep")
@@ -2074,16 +2202,23 @@ fn object_inventory(progs: &[ProgramArms], arch: &str, packed_metadata: bool) ->
     if packed_metadata && packed_prefill.is_empty() {
         packed_prefill = prefill.clone();
     }
+    // The pair, optionally led by its latent KV writer (`PLOW_GLM53_MLA_SEG_KVW`).
     let decode_mla_segment = |p: &&ProgramArms| {
+        let kvw = p.arms.iter().any(|a| a.op == "HeadNormRope");
         p.kind == "decode"
             && p.seg.is_some()
-            && p.insts == 2
-            && p.arms.len() == 2
-            && p.arms.iter().any(|a| a.op == "FlashMlaDecode")
-            && p.arms.iter().any(|a| a.op == "MlaMergeFold")
+            && p.insts == 2 + usize::from(kvw)
+            && p.arms.len() == 2 + usize::from(kvw)
             && p.arms
                 .iter()
-                .all(|a| a.op == "FlashMlaDecode" || a.op == "MlaMergeFold")
+                .any(|a| a.op == "FlashMlaDecode" || a.op == "FlashGatherDecode")
+            && p.arms.iter().any(|a| a.op == "MlaMergeFold")
+            && p.arms.iter().all(|a| {
+                a.op == "FlashMlaDecode"
+                    || a.op == "FlashGatherDecode"
+                    || a.op == "MlaMergeFold"
+                    || a.op == "HeadNormRope"
+            })
     };
     let decode_mla: BTreeSet<Arm> = progs
         .iter()
@@ -2432,6 +2567,12 @@ fn build_inner(m: &Model, arch: &str, lean: &crate::LeanReport, packed_prefill: 
     };
     objects["lean"]["kda_wu_lean"] = json!({ "required": marked_wu(false) });
     objects["lean"]["kda_carry_keyfeed"] = json!({ "required": marked_wu(true) });
+    // PLOW_MOE_PF_W8A8: ops 85/86 with i[7] >= 2 need the W8A8 arm in the prefill object.
+    let moe_pf_w8a8 = m.progs.iter().flat_map(|p| &p.insts).any(|d| {
+        (d.op == DevOp::MoeGroupGluPf as u16 || d.op == DevOp::MoeGroupDownPf as u16)
+            && d.i[7] >= 2
+    });
+    objects["lean"]["moe_pf_w8a8"] = json!({ "required": moe_pf_w8a8 });
     let s = shapes(m);
     let mut ep_tables = BTreeSet::new();
     let ep_extra_resident_bytes_per_rank = m
@@ -2870,6 +3011,10 @@ pub fn config_header(manifest: &Value) -> String {
         .pointer("/objects/lean/moe_prefill_ep/required")
         .and_then(Value::as_bool)
         .unwrap_or(false);
+    let moe_pf_w8a8_required = manifest
+        .pointer("/objects/lean/moe_pf_w8a8/required")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
     let attn_res_f32mix_required = manifest
         .pointer("/objects/lean/attn_res_f32mix/required")
         .and_then(Value::as_bool)
@@ -2910,6 +3055,10 @@ pub fn config_header(manifest: &Value) -> String {
         if kda_wu_lean_required { 1 } else { 0 }
     ));
     out.push_str(&format!(
+        "#define PLOW_PACKET_REQUIRES_GEMM_GROUP_PF {}\n",
+        u8::from(ops.contains("GemmGroupPf"))
+    ));
+    out.push_str(&format!(
         "#define PLOW_PACKET_REQUIRES_KDA_CARRY_KEYFEED {}\n",
         if kda_carry_keyfeed_required { 1 } else { 0 }
     ));
@@ -2917,6 +3066,11 @@ pub fn config_header(manifest: &Value) -> String {
         "#define PLOW_PACKET_REQUIRES_MOE_PREFILL_EP {}\n",
         if moe_prefill_ep_required { 1 } else { 0 }
     ));
+    if moe_pf_w8a8_required {
+        out.push_str(
+            "#define PLOW_PACKET_REQUIRES_MOE_PF_W8A8 1\n#ifndef PLOW_MOE_PF_W8A8\n#define PLOW_MOE_PF_W8A8 1\n#endif\n",
+        );
+    }
     let prefill_gemv_head = prefill_ops.contains("Gemv");
     out.push_str(&format!(
         "#define PLOW_PACKET_REQUIRES_PF_GEMV_HEAD {0}\n#ifndef PLOW_NV_PF_GEMV_HEAD\n#define PLOW_NV_PF_GEMV_HEAD {0}\n#endif\n",
@@ -2985,6 +3139,13 @@ pub fn config_header(manifest: &Value) -> String {
         "#define PLOW_PACKET_REQUIRES_XR_COMBINE_FOLD {0}\n#ifndef PLOW_XR_COMBINE_FOLD\n#define PLOW_XR_COMBINE_FOLD {0}\n#endif\n",
         if xr_combine_fold { 1 } else { 0 }
     ));
+    let xr_hcpost = manifest
+        .pointer("/features/xr_hcpost")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    if xr_hcpost {
+        out.push_str("#ifndef PLOW_XR_HCPOST\n#define PLOW_XR_HCPOST 1\n#endif\n");
+    }
     let attnres_decode_mwg = manifest
         .pointer("/features/attnres_decode_mwg")
         .and_then(Value::as_bool)
@@ -2993,6 +3154,13 @@ pub fn config_header(manifest: &Value) -> String {
         "#ifndef PLOW_ATTNRES_DECODE_MWG\n#define PLOW_ATTNRES_DECODE_MWG {}\n#endif\n",
         if attnres_decode_mwg { 1 } else { 0 }
     ));
+    if manifest
+        .pointer("/features/gemm_small_splitk")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+    {
+        out.push_str("#ifndef PLOW_GEMM_SMALL_SPLITK\n#define PLOW_GEMM_SMALL_SPLITK 1\n#endif\n");
+    }
     let kda_fb_fold = manifest
         .pointer("/features/kda_fb_fold")
         .and_then(Value::as_bool)

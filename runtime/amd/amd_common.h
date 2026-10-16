@@ -479,13 +479,25 @@ __device__ __forceinline__ __amdgpu_buffer_rsrc_t buf_rsrc_fp8(const unsigned ch
 /* PROBE: force a wave-uniform base pointer into SGPRs so make_buffer_rsrc emits a SCALAR resource
  * (no per-load readfirstlane waterfall). Valid ONLY when `base` is genuinely uniform across the wave
  * (it is in the GEMV: base = W + n*K, n = wave index, uniform per wave). */
+/* PLOW_RSRC_SCALAR_N=1: num_records goes through readfirstlane too. With only the base made
+ * uniform, a VGPR-resident record count still leaves the descriptor divergent in the compiler's
+ * eyes, and gfx950's inlined decode objects kept the per-load waterfall (tier-8: 219 of them). */
+#ifndef PLOW_RSRC_SCALAR_N
+#define PLOW_RSRC_SCALAR_N 0
+#endif
+#if PLOW_RSRC_SCALAR_N
+#define PLOW_RSRC_N(n) __builtin_amdgcn_readfirstlane(n)
+#else
+#define PLOW_RSRC_N(n) (n)
+#endif
 __device__ __forceinline__ __amdgpu_buffer_rsrc_t buf_rsrc_fp8_u(const unsigned char* base,
                                                                  unsigned n_bytes) {
     unsigned long long u = (unsigned long long)(size_t)base;
     unsigned lo = __builtin_amdgcn_readfirstlane((unsigned)u);
     unsigned hi = __builtin_amdgcn_readfirstlane((unsigned)(u >> 32));
     const unsigned char* ub = (const unsigned char*)(size_t)(((unsigned long long)hi << 32) | lo);
-    return __builtin_amdgcn_make_buffer_rsrc((void*)ub, (short)0, n_bytes, PLOW_BUF_RSRC3);
+    return __builtin_amdgcn_make_buffer_rsrc((void*)ub, (short)0, PLOW_RSRC_N(n_bytes),
+                                             PLOW_BUF_RSRC3);
 }
 /* The bf16 twin of buf_rsrc_fp8_u, and the reason it is worth having is visible in the shipped
  * decode object: EVERY buffer_load_dwordx4 in d_gemv_qkv / d_gemv_glu / d_gemv_fp8_blk carries
@@ -507,7 +519,8 @@ __device__ __forceinline__ __amdgpu_buffer_rsrc_t buf_rsrc_u(const bf16* base, u
     unsigned lo = __builtin_amdgcn_readfirstlane((unsigned)u);
     unsigned hi = __builtin_amdgcn_readfirstlane((unsigned)(u >> 32));
     const bf16* ub = (const bf16*)(size_t)(((unsigned long long)hi << 32) | lo);
-    return __builtin_amdgcn_make_buffer_rsrc((void*)ub, (short)0, n_halves * 2u, PLOW_BUF_RSRC3);
+    return __builtin_amdgcn_make_buffer_rsrc((void*)ub, (short)0, PLOW_RSRC_N(n_halves * 2u),
+                                             PLOW_BUF_RSRC3);
 }
 /* `aux` = 3 (glc|slc): streaming/non-temporal, exactly as the bf16 weight stream — zero reuse. */
 __device__ __forceinline__ fp8v16 buf_ld_fp8(__amdgpu_buffer_rsrc_t r, unsigned byte_off) {
@@ -1114,7 +1127,7 @@ __device__ __forceinline__ fp8v8 ld_glob_fp8v8(const unsigned char* p) {
     return *(const PLOW_GLOB fp8v8*)(const PLOW_GLOB void*)p;
 }
 #if PLOW_HAS_MX_CVT /* CDNA4 MX block-scale convert; CDNA3 has no fp4 type and no scalef32 */
-__device__ __forceinline__ bf16v8 fp8v8_to_bf16v8(fp8v8 w) {
+__device__ __forceinline__ bf16v8 fp8v8_to_bf16v8(fp8v8 w, float scale = 1.0f) {
     typedef bf16_t bf16_2 __attribute__((ext_vector_type(2)));
     union {
         bf16v8 v;
@@ -1123,9 +1136,9 @@ __device__ __forceinline__ bf16v8 fp8v8_to_bf16v8(fp8v8 w) {
 #pragma unroll
     for (int i = 0; i < 2; i++) {
         const bf16_2 a =
-            __builtin_amdgcn_cvt_scalef32_pk_bf16_fp8(w[i], 1.0f, false); /* bytes 0,1 */
+            __builtin_amdgcn_cvt_scalef32_pk_bf16_fp8(w[i], scale, false); /* bytes 0,1 */
         const bf16_2 c =
-            __builtin_amdgcn_cvt_scalef32_pk_bf16_fp8(w[i], 1.0f, true); /* bytes 2,3 */
+            __builtin_amdgcn_cvt_scalef32_pk_bf16_fp8(w[i], scale, true); /* bytes 2,3 */
         d.u[i * 2 + 0] = __builtin_bit_cast(unsigned, a);
         d.u[i * 2 + 1] = __builtin_bit_cast(unsigned, c);
     }
@@ -1134,13 +1147,17 @@ __device__ __forceinline__ bf16v8 fp8v8_to_bf16v8(fp8v8 w) {
 #else
 /* CDNA3 arm: same two-step decode as fp8_to_bf16v8 above, and bit-identical for the same
  * reason (fp8 e4m3 is exact in bf16). */
-__device__ __forceinline__ bf16v8 fp8v8_to_bf16v8(fp8v8 w) {
+__device__ __forceinline__ bf16v8 fp8v8_to_bf16v8(fp8v8 w, float scale = 1.0f) {
     union {
         bf16v8 v;
         unsigned u[4];
     } d;
 #pragma unroll
     for (int i = 0; i < 2; i++) plow_fp8x4_ocp_to_bf16((unsigned)w[i], d.u[i * 2], d.u[i * 2 + 1]);
+    if (scale != 1.0f) {
+#pragma unroll
+        for (int i = 0; i < 8; i++) d.v[i] = (bf16)((float)d.v[i] * scale);
+    }
     return d.v;
 }
 #endif /* PLOW_HAS_MX_CVT */

@@ -185,35 +185,185 @@ impl Checkpoint {
             }
 
             let t_meta = std::time::Instant::now();
-            let (header_len, meta) =
-                safetensors::SafeTensors::read_metadata(&map).map_err(|e| {
-                    RuntimeError::Device(format!("safetensors {}: {e}", path.display()))
-                })?;
+            let parsed_meta = safetensors::SafeTensors::read_metadata(&map);
+            let (header_len, tensors_info): (
+                usize,
+                Vec<(String, Range<usize>, Vec<usize>, bool, safetensors::Dtype)>,
+            ) = match parsed_meta {
+                Ok((hlen, meta)) => {
+                    let items = meta
+                        .tensors()
+                        .into_iter()
+                        .map(|(name, info)| {
+                            let fp8 = matches!(info.dtype, safetensors::Dtype::F8_E4M3);
+                            (
+                                name,
+                                info.data_offsets.0..info.data_offsets.1,
+                                info.shape.clone(),
+                                fp8,
+                                info.dtype,
+                            )
+                        })
+                        .collect();
+                    (hlen, items)
+                }
+                Err(err) => {
+                    // Fallback only for headers with dtypes not in safetensors Dtype enum (specifically F8_E8M0).
+                    if map.len() < 8 {
+                        return Err(RuntimeError::Device(format!(
+                            "safetensors {}: {err}",
+                            path.display()
+                        )));
+                    }
+                    let hlen = u64::from_le_bytes(map[0..8].try_into().unwrap()) as usize;
+                    if map.len() < 8 + hlen {
+                        return Err(RuntimeError::Device(format!(
+                            "safetensors {}: {err}",
+                            path.display()
+                        )));
+                    }
+                    let header_str = std::str::from_utf8(&map[8..8 + hlen]).map_err(|_| {
+                        RuntimeError::Device(format!(
+                            "safetensors {}: {err}",
+                            path.display()
+                        ))
+                    })?;
+                    if !header_str.contains("F8_E8M0") {
+                        return Err(RuntimeError::Device(format!(
+                            "safetensors {}: {err}",
+                            path.display()
+                        )));
+                    }
+                    let v: serde_json::Value = serde_json::from_str(header_str).map_err(|e| {
+                        RuntimeError::Device(format!(
+                            "safetensors {}: invalid json header: {e}",
+                            path.display()
+                        ))
+                    })?;
+                    let obj = v.as_object().ok_or_else(|| {
+                        RuntimeError::Device(format!(
+                            "safetensors {}: header not a json object",
+                            path.display()
+                        ))
+                    })?;
+                    let mut items = Vec::with_capacity(obj.len());
+                    for (name, val) in obj {
+                        if name == "__metadata__" {
+                            continue;
+                        }
+                        let dtype_str = val
+                            .get("dtype")
+                            .and_then(|d| d.as_str())
+                            .ok_or_else(|| {
+                                RuntimeError::Device(format!(
+                                    "safetensors {}: tensor {name} missing dtype",
+                                    path.display()
+                                ))
+                            })?;
+                        let (dtype, fp8) = match dtype_str {
+                            "F32" => (safetensors::Dtype::F32, false),
+                            "F16" => (safetensors::Dtype::F16, false),
+                            "BF16" => (safetensors::Dtype::BF16, false),
+                            "F8_E4M3" => (safetensors::Dtype::F8_E4M3, true),
+                            "F8_E5M2" => (safetensors::Dtype::F8_E5M2, false),
+                            "I8" => (safetensors::Dtype::I8, false),
+                            "U8" => (safetensors::Dtype::U8, false),
+                            "I16" => (safetensors::Dtype::I16, false),
+                            "U16" => (safetensors::Dtype::U16, false),
+                            "I32" => (safetensors::Dtype::I32, false),
+                            "U32" => (safetensors::Dtype::U32, false),
+                            "I64" => (safetensors::Dtype::I64, false),
+                            "U64" => (safetensors::Dtype::U64, false),
+                            "BOOL" => (safetensors::Dtype::BOOL, false),
+                            "F8_E8M0" => (safetensors::Dtype::U8, false),
+                            other => {
+                                return Err(RuntimeError::Device(format!(
+                                    "safetensors {}: tensor {name} has unsupported dtype {other}",
+                                    path.display()
+                                )));
+                            }
+                        };
+                        let shape_arr = val
+                            .get("shape")
+                            .and_then(|s| s.as_array())
+                            .ok_or_else(|| {
+                                RuntimeError::Device(format!(
+                                    "safetensors {}: tensor {name} missing shape",
+                                    path.display()
+                                ))
+                            })?;
+                        let mut shape = Vec::with_capacity(shape_arr.len());
+                        for x in shape_arr {
+                            shape.push(x.as_u64().map(|n| n as usize).ok_or_else(|| {
+                                RuntimeError::Device(format!(
+                                    "safetensors {}: tensor {name} invalid shape element",
+                                    path.display()
+                                ))
+                            })?);
+                        }
+                        let offsets = val
+                            .get("data_offsets")
+                            .and_then(|o| o.as_array())
+                            .ok_or_else(|| {
+                                RuntimeError::Device(format!(
+                                    "safetensors {}: tensor {name} missing data_offsets",
+                                    path.display()
+                                ))
+                            })?;
+                        if offsets.len() != 2 {
+                            return Err(RuntimeError::Device(format!(
+                                "safetensors {}: tensor {name} invalid data_offsets length",
+                                path.display()
+                            )));
+                        }
+                        let start = offsets[0].as_u64().ok_or_else(|| {
+                            RuntimeError::Device(format!(
+                                "safetensors {}: tensor {name} invalid data_offset start",
+                                path.display()
+                            ))
+                        })? as usize;
+                        let end = offsets[1].as_u64().ok_or_else(|| {
+                            RuntimeError::Device(format!(
+                                "safetensors {}: tensor {name} invalid data_offset end",
+                                path.display()
+                            ))
+                        })? as usize;
+                        if start > end || 8 + hlen + end > map.len() {
+                            return Err(RuntimeError::Device(format!(
+                                "safetensors {}: tensor {name} data_offsets [{start}, {end}] out of bounds (map len {})",
+                                path.display(),
+                                map.len()
+                            )));
+                        }
+                        items.push((name.clone(), start..end, shape, fp8, dtype));
+                    }
+                    (hlen, items)
+                }
+            };
             if let Some(t) = timing.as_mut() {
                 t.meta_ms += t_meta.elapsed().as_secs_f64() * 1e3;
             }
 
             let data_off = 8 + header_len;
             let shard = shards.len();
-            let tensors = meta.tensors();
             tracing::debug!(
                 shard = shard,
                 file = %path.display(),
-                tensors = tensors.len(),
+                tensors = tensors_info.len(),
                 mib = map.len() / (1 << 20),
                 "mapped checkpoint shard"
             );
             let t_idx = std::time::Instant::now();
-            index.reserve(tensors.len());
-            for (name, info) in tensors {
+            index.reserve(tensors_info.len());
+            for (name, range, shape, fp8, dtype) in tensors_info {
                 let previous = index.insert(
                     name.clone(),
                     Entry {
                         shard,
-                        range: info.data_offsets.0..info.data_offsets.1,
-                        shape: info.shape.clone(),
-                        fp8: matches!(info.dtype, safetensors::Dtype::F8_E4M3),
-                        dtype: info.dtype,
+                        range,
+                        shape,
+                        fp8,
+                        dtype,
                     },
                 );
                 if let Some(old) = previous {

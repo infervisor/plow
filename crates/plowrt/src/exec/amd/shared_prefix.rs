@@ -255,6 +255,22 @@ impl SharedPrefix {
             })
             .collect()
     }
+
+    pub fn prefix_probe(&self) -> Option<crate::memory::vmm::PrefixProbe> {
+        self.groups.first().and_then(|g| g.pool.prefix_probe())
+    }
+
+    pub fn stats_handle(&self) -> Option<crate::memory::vmm::VmmStatsHandle> {
+        self.groups.first().map(|g| g.pool.stats_handle())
+    }
+
+    pub fn row_bytes(&self) -> u64 {
+        self.groups
+            .iter()
+            .flat_map(|g| g.tensors.iter())
+            .map(|t| t.row_bytes)
+            .sum()
+    }
 }
 
 struct DeferredPublish {
@@ -444,6 +460,33 @@ impl SharedPrefix {
                 }
                 _ => (0, 0),
             };
+        let host_cap = crate::config::RuntimeConfig::get().vmm_host_cache_bytes();
+        if host_cap > 0 {
+            for (idx, g) in groups.iter_mut().enumerate() {
+                let tail = u64::from(g.pool.block_rows().saturating_sub(1));
+                let cache_bytes: u64 = g.tensors.iter().map(|t| tail * t.row_bytes).sum();
+                let scale_bytes: u64 = if idx == 0 {
+                    layout.scales.iter().map(|t| u64::from(layout.context) * t.row_bytes).sum()
+                } else {
+                    0
+                };
+                let slot_bytes = (cache_bytes + scale_bytes).max(4);
+                let row_bytes = g.tensors[0].row_bytes;
+                let group_host_cap = (((host_cap as u128 * row_bytes as u128 * g.tensors.len() as u128)
+                    / total_row_bytes.max(1) as u128) as u64)
+                    .clamp(slot_bytes, host_cap);
+                match g.pool.enable_host_tier(group_host_cap, slot_bytes) {
+                    Ok(()) => tracing::info!(
+                        group = idx,
+                        cap_mib = group_host_cap >> 20,
+                        slot_mib = slot_bytes >> 20,
+                        slots = group_host_cap / slot_bytes,
+                        "vmm prefix: AMD host tier armed"
+                    ),
+                    Err(e) => tracing::warn!(group = idx, error = %e, "vmm prefix: AMD host tier off"),
+                }
+            }
+        }
         Ok(Self {
             groups,
             scales: layout.scales,

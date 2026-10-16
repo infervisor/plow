@@ -77,7 +77,7 @@ pub fn shard_of(name: &str) -> Shard {
     // exists for the per-output-channel fp8 scale `[N]`, which is a different tensor that happens
     // to share the spelling. Which one a checkpoint has is decided by its SHAPE, here and in
     // `bind_packed_experts`, never by a flag.)
-    const COL: [&str; 12] = [
+    const COL: [&str; 22] = [
         "q_proj.weight",
         "k_proj.weight",
         "v_proj.weight",
@@ -88,18 +88,33 @@ pub fn shard_of(name: &str) -> Shard {
         "derived.v_absorb",
         "self_attn.q_b_proj.weight",
         "derived.mla_fp8_tp",
-        // Mixtral-spelled routed experts -- see the note below.
+        // Mixtral & DeepSeek routed and shared experts
         ".w1.weight",
+        ".w1.scale",
         ".w3.weight",
+        ".w3.scale",
+        // DeepSeek-V4.1 MLA projections, sink, and engram
+        "attn.wq_b.weight",
+        "attn.wq_b.scale",
+        "attn.wo_a.weight",
+        "attn.wo_a.scale",
+        "attn.attn_sink",
+        "attn_sink",
+        "engram.embed.weight",
+        "engram.embed.scale",
     ];
     // `derived.o_fold.weight` = the prep-fused W_uv·W_o ([H, NH*DK], head-major columns):
     // its contraction dim slices per rank exactly as o_proj's does (rank r takes columns
     // h∈[r·nh_l, (r+1)·nh_l)·DK — a strided column range), so it rides the same Row class.
-    const ROW: [&str; 4] = [
+    const ROW: [&str; 7] = [
         "o_proj.weight",
         "down_proj.weight",
         ".w2.weight",
+        ".w2.scale",
         "derived.o_fold.weight",
+        // DeepSeek-V4.1 MLA projection
+        "attn.wo_b.weight",
+        "attn.wo_b.scale",
     ];
 
     // --- Mixtral `w1|w2|w3` routed experts (Kimi-K3), in the generic tables above ---

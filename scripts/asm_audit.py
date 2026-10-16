@@ -142,7 +142,7 @@ def check(kernels, expect):
     """Assert `expect` against the parsed kernels. Returns a list of failures."""
     fails = []
     for pat, rules in expect.items():
-        hits = [k for k in kernels if pat in k.name]
+        hits = [k for k in kernels if any(p in k.name for p in pat.split('|'))]
         if not hits:
             fails.append(f"{pat}: no kernel matched")
             continue

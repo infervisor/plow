@@ -1,6 +1,44 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# gfx950 / GLM-5.3-Flash (H4096): `--gfx950 OBJECT_DIR AITER_FMOE_SILU_DIR`, the directory holding
+# vLLM ROCm AITER's aiter_meta/hsa/gfx950/fmoe/silu objects. Copies the pinned per-row-bucket
+# tiles and builds the H4096/OCP adapter and align.
+if [[ ${1:-} == --gfx950 ]]; then
+    if [[ $# -ne 3 ]]; then
+        echo "usage: $0 --gfx950 OBJECT_DIR AITER_FMOE_SILU_DIR (inside nix develop)" >&2
+        exit 2
+    fi
+    out=$2
+    src=$3
+    root=$(cd "$(dirname "$0")/.." && pwd)
+    mkdir -p "$out"
+    while read -r hash name; do
+        actual=$(sha256sum "$src/$name")
+        if [[ ${actual%% *} != "$hash" ]]; then
+            echo "AITER gfx950 object $name does not match the pinned hash" >&2
+            exit 1
+        fi
+        cmp -s "$src/$name" "$out/$name" || cp "$src/$name" "$out/$name"
+    done <<'PINS'
+07df0af964cf26dde7635b6f524fd84701a15100f5b88fc9366599e20edeea31 fmoe_bf16_blockscaleFp8_g1u1_vs_silu_1tg_pf2_16x128.co
+2b2c1852d84d47f4a03ad5814087be4b4b21e0acd9ee0efdd3f7792a6afe509a fmoe_bf16_blockscaleFp8_g1u1_vs_silu_1tg_ps_32x128.co
+6a583441c6bb139c6af20c5198614b7b02b74fdba370580a5a5bbe164bd7bb34 fmoe_bf16_blockscaleFp8_g1u1_vs_silu_1tg_ps_32x256.co
+e442ee49fd88b5d165b8f8313d790c3ec7a7978140fa2306876612191429e413 fmoe_bf16_blockscaleFp8_g1u1_vs_silu_1tg_ps_64x256.co
+PINS
+    stem=$(mktemp "$out/.moe-aiter.XXXXXX")
+    trap 'rm -f "$stem" "$stem.co" "$stem.elf"' EXIT
+    for kind in aiter align; do
+        "${PLOW_HIPCC:?run inside nix develop}" --genco --offload-arch=gfx950 -O3 -w \
+            -std=c++17 -DMOE_AITER_H=4096 -I"$root/runtime/amd" -I"$root/runtime/common" \
+            "$root/runtime/amd/moe_${kind}_adapter.hip" -o "$stem.co"
+        "${PLOW_BUNDLER:?run inside nix develop}" --unbundle --type=o \
+            --targets=hipv4-amdgcn-amd-amdhsa--gfx950 --input="$stem.co" --output="$stem.elf"
+        mv "$stem.elf" "$out/moe_${kind}_adapter_gfx950.elf"
+    done
+    exit 0
+fi
+
 if [[ $# -lt 2 || $# -gt 4 ]]; then
     echo "usage: $0 OBJECT_DIR AITER_MOE_CODE_OBJECT [AITER_FLAT_CODE_OBJECT [AITER_TILE64_CODE_OBJECT]] (inside nix develop)" >&2
     exit 2

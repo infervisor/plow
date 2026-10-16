@@ -72,22 +72,41 @@ pub fn is_runtime_tensor(name: &str) -> bool {
 /// `bind_dense_ffn_tables` fill them once packing is done.
 ///
 /// Suffix-matched, not prefix-matched, precisely because the model prefix in front of them is
-/// whatever the checkpoint uses.
+/// whatever the checkpoint uses. Matched on the LAST COMPONENT ALONE, not on `mlp.<table>`.
+///
+/// The FFN's own component name is the checkpoint's to choose just as the model prefix is: GLM,
+/// DeepSeek-V3 and Kimi spell it `mlp.`, DeepSeek-V4.1 spells it `ffn.`. Requiring `mlp.` here sent
+/// `layers.0.ffn.expert_weight_table` down the checkpoint path, where the preflight refused it as
+/// a MISSING WEIGHT -- correctly, since no checkpoint has one; the name was simply not recognised
+/// as host-filled. No checkpoint carries a tensor whose last component is one of these, so the
+/// component is the whole signal and the prefix in front of it is free.
 pub fn is_host_filled_table(name: &str) -> bool {
-    name.ends_with("mlp.expert_weight_table")
-        || name.ends_with("mlp.expert_scale_table")
-        || name.ends_with("mlp.expert_weight_table_moe2")
-        || name.ends_with("mlp.expert_scale_table_moe2")
-        || name.ends_with("mlp.dense_weight_table")
-        || name.ends_with("mlp.dense_scale_table")
-        // PLOW_GLM_MOE_SHARED_FOLD's spelling of the same pair: one entry longer, the last one
-        // pointing at the SHARED expert packed into the routed slab. Still host addresses.
-        || name.ends_with("mlp.expert_weight_table_sf")
-        || name.ends_with("mlp.expert_scale_table_sf")
-        // The PRESHUFFLED twin of expert_weight_table (PLOW_MOE_PF_SHUF): points into a second
-        // packed slab whose per-projection layout is [K/64][R][64] so the grouped prefill GEMM's
-        // B stream is contiguous per k-tile. Host-computed addresses, no checkpoint bytes.
-        || name.ends_with("mlp.expert_weight_table_pf")
+    let table = name.rsplit('.').next().unwrap_or(name);
+    matches!(
+        table,
+        "expert_weight_table"
+            | "expert_scale_table"
+            | "expert_weight_table_moe2"
+            | "expert_scale_table_moe2"
+            | "dense_weight_table"
+            | "dense_scale_table"
+            // PLOW_GLM_MOE_SHARED_FOLD's spelling of the same pair: one entry longer, the last one
+            // pointing at the SHARED expert packed into the routed slab. Still host addresses.
+            | "expert_weight_table_sf"
+            | "expert_scale_table_sf"
+            // The PRESHUFFLED twin of expert_weight_table (PLOW_MOE_PF_SHUF): points into a second
+            // packed slab whose per-projection layout is [K/64][R][64] so the grouped prefill
+            // GEMM's B stream is contiguous per k-tile. Host addresses, no checkpoint bytes.
+            | "expert_weight_table_pf"
+            // EP's spelling, which the loader also resolves by suffix
+            // (`bind_packed_experts`: `strip_suffix("expert_weight_table_ep")`).
+            | "expert_weight_table_ep"
+            | "expert_scale_table_ep"
+            // The gfx950 AITER companion (`bind_packed_experts`): a second slab in AITER's 16x16
+            // shuffle, plain or under the shared-expert fold.
+            | "expert_weight_table_ai"
+            | "expert_weight_table_sf_ai"
+    )
 }
 
 /// True when this declared tensor's bytes must come from the checkpoint.

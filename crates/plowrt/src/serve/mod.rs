@@ -476,7 +476,7 @@ pub struct AppState {
     gpu: RwLock<FxHashMap<String, Arc<Mutex<engine::ServeEngine>>>>,
     /// Engine-lock-free VMM stats readers for `/metrics` (one per slug with
     /// prefix sharing up) — a scrape must never queue behind a tick.
-    #[cfg(feature = "cuda")]
+    #[cfg(any(feature = "cuda", feature = "hsa"))]
     vmm_stats: RwLock<FxHashMap<String, crate::memory::vmm::VmmStatsHandle>>,
     /// Per-instance multimodal runtime (encoders on the instance's device, slab mirroring its
     /// engine's table): installed and removed with the engine.
@@ -584,7 +584,7 @@ impl AppState {
             downstream: RwLock::new(FxHashMap::default()),
             #[cfg(any(feature = "cuda", feature = "hsa", feature = "cpu"))]
             gpu: RwLock::new(FxHashMap::default()),
-            #[cfg(feature = "cuda")]
+            #[cfg(any(feature = "cuda", feature = "hsa"))]
             vmm_stats: RwLock::new(FxHashMap::default()),
             mm: RwLock::new(FxHashMap::default()),
             #[cfg(feature = "cuda")]
@@ -749,7 +749,7 @@ impl AppState {
     /// Register a GPU engine for a model slug. Called once at startup.
     #[cfg(any(feature = "cuda", feature = "hsa", feature = "cpu"))]
     pub fn install_gpu_engine(&self, slug: String, engine: engine::ServeEngine) {
-        #[cfg(feature = "cuda")]
+        #[cfg(any(feature = "cuda", feature = "hsa"))]
         if let Some(h) = engine.vmm_stats_handle() {
             self.vmm_stats.write().insert(slug.clone(), h);
         }
@@ -764,9 +764,9 @@ impl AppState {
             self.sampling_honoured
                 .write()
                 .insert(set.model.clone(), engine.honours_sampling());
-            #[cfg(feature = "cuda")]
+            #[cfg(any(feature = "cuda", feature = "hsa"))]
             set.set_probe(r, engine.vmm_prefix_probe());
-            #[cfg(not(feature = "cuda"))]
+            #[cfg(not(any(feature = "cuda", feature = "hsa")))]
             let _ = r;
         }
         if let Ok(bundle) = self.registry.get(self.model_of(&slug)) {
@@ -873,7 +873,7 @@ impl AppState {
     /// CUDA-specific, and that is gated inside.
     #[cfg(any(feature = "cuda", feature = "hsa", feature = "cpu"))]
     pub fn remove_gpu_engine(&self, slug: &str) -> Option<Arc<Mutex<engine::ServeEngine>>> {
-        #[cfg(feature = "cuda")]
+        #[cfg(any(feature = "cuda", feature = "hsa"))]
         self.vmm_stats.write().remove(slug);
         if let Some((set, r)) = self.dp_rank(slug) {
             set.set_probe(r, None);
@@ -898,23 +898,30 @@ impl AppState {
 
     /// Install one co-tenant turn per device group (once, at startup).
     ///
-    /// Called by every backend path, not just CUDA: two AMD models on one agent
-    /// is a thing that already happens — the AMD startup loop installs an
-    /// engine per bundle and each opens the same ROCr agent — and HSA has no
-    /// cooperative-launch refusal to catch the resulting CU oversubscription.
-    /// The CPU engine gives every model its own worker pool, so turns bound
-    /// thread contention there.
+    /// Called by every backend path, not just CUDA: AMD models placed on one
+    /// group share its agents, and HSA has no cooperative-launch refusal to
+    /// catch the resulting CU oversubscription. The CPU engine gives every
+    /// model its own worker pool, so turns bound thread contention there.
     pub fn install_device_turns(&self, groups: usize, cuda: bool) {
+        let models = self.registry.slugs().len();
+        self.install_group_turns(&vec![models; groups.max(1)], cuda);
+    }
+
+    /// [`Self::install_device_turns`] with each group's own instance count: a group of one
+    /// shares nothing, so its turn stays free unless `--co-sched` says otherwise. The
+    /// process-wide mode ([`policy::installed_co_sched`]) is the most-shared group's.
+    pub fn install_group_turns(&self, tenants: &[usize], cuda: bool) {
         self.turns.get_or_init(|| {
-            let mode = policy::co_sched(self.registry.slugs().len(), !cuda);
-            policy::set_co_sched(mode);
-            let turns = (0..groups.max(1))
-                .map(|_| Arc::new(cosched::DeviceTurn::serving(mode)))
+            let busiest = tenants.iter().copied().max().unwrap_or(1);
+            policy::set_co_sched(policy::co_sched(busiest, !cuda));
+            let turns = tenants
+                .iter()
+                .map(|&t| Arc::new(cosched::DeviceTurn::serving(policy::co_sched(t, !cuda))))
                 .collect::<Vec<_>>();
             if let Some(first) = turns.first() {
                 tracing::info!(
                     groups = turns.len(),
-                    mode = ?first.mode(),
+                    modes = ?turns.iter().map(|t| t.mode()).collect::<Vec<_>>(),
                     quantum = first.quantum(),
                     "co-tenant scheduling installed"
                 );
@@ -1923,7 +1930,7 @@ async fn metrics_handler(
     ] {
         crate::obs::serving::family(&mut out, &format!("plowrt_prefix_{name}"), kind, help);
     }
-    #[cfg(feature = "cuda")]
+    #[cfg(any(feature = "cuda", feature = "hsa"))]
     for (slug, h) in state.vmm_stats.read().iter() {
         let s = h.stats();
         let slug = crate::obs::serving::escape_label(slug);
