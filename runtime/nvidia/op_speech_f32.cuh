@@ -58,12 +58,67 @@ extern __shared__ __align__(16) float sp_smem[];
 __device__ __forceinline__ float sp_bf16(float v) { return __bfloat162float(__float2bfloat16_rn(v)); }
 /* CUDA's expf/tanhf are 2-ulp; the double forms round like glibc's (~0.5 ulp), which keeps
  * bf16-rounded probabilities and GELUs on the golden's side of a rounding boundary. */
+/* FP64 runs at 1/64 rate on sm_120. On [-86, 0] exp in float-float (k = rint(64 x / ln2), 3-part
+ * Cody-Waite, 2^(j/64) hi/lo table, degree-5 polynomial) rounds as (float)exp((double)x) does,
+ * except within 2^-34 of a rounding boundary (0.04% of that domain), where it takes the double
+ * form. Equal on all 2^32 inputs; rtx-5090 690 vs 48 Gexp/s. The table is in every pass: nvcc's
+ * host stub registers each __device__ variable. */
+static __device__ const float2 sp_exp_tab[64] = {
+    {0x1p+0f, 0.0f}, {0x1.02c9a4p+0f, -0x1.887fap-28f}, {0x1.059b0ep+0f, -0x1.9d4f52p-25f},
+    {0x1.087452p+0f, -0x1.e2990ep-26f}, {0x1.0b5586p+0f, 0x1.9f3122p-25f}, {0x1.0e3ec4p+0f, -0x1.a585ccp-25f},
+    {0x1.11301ep+0f, -0x1.fdb496p-25f}, {0x1.1429aap+0f, 0x1.d525bcp-25f}, {0x1.172b84p+0f, -0x1.c15742p-27f},
+    {0x1.1a35bep+0f, 0x1.6df96ep-25f}, {0x1.1d4874p+0f, -0x1.d2e8cap-25f}, {0x1.2063b8p+0f, 0x1.0c519ap-25f},
+    {0x1.2387a6p+0f, 0x1.ceac48p-25f}, {0x1.26b456p+0f, 0x1.789f38p-26f}, {0x1.29e9ep+0f, -0x1.5c0424p-25f},
+    {0x1.2d285ap+0f, 0x1.b900c2p-26f}, {0x1.306fep+0f, 0x1.4636e2p-25f}, {0x1.33c08cp+0f, -0x1.b37d2p-25f},
+    {0x1.371a74p+0f, -0x1.18aac6p-25f}, {0x1.3a7db4p+0f, -0x1.634c02p-25f}, {0x1.3dea64p+0f, 0x1.824684p-25f},
+    {0x1.4160a2p+0f, 0x1.f72e2ap-28f}, {0x1.44e086p+0f, 0x1.8624b4p-30f}, {0x1.486a2cp+0f, -0x1.47d866p-25f},
+    {0x1.4bfdaep+0f, -0x1.593abcp-25f}, {0x1.4f9b28p+0f, -0x1.2c5a6cp-25f}, {0x1.5342b6p+0f, -0x1.2c561p-25f},
+    {0x1.56f474p+0f, -0x1.295b04p-25f}, {0x1.5ab07ep+0f, -0x1.5bd5ecp-27f},
+    {0x1.5e76f2p+0f, -0x1.4a5bd6p-25f}, {0x1.6247ecp+0f, -0x1.f8b55p-25f}, {0x1.662388p+0f, 0x1.2a9112p-27f},
+    {0x1.6a09e6p+0f, 0x1.9fcef4p-26f}, {0x1.6dfb24p+0f, -0x1.cd72e8p-27f}, {0x1.71f75ep+0f, 0x1.1d8beep-25f},
+    {0x1.75feb6p+0f, -0x1.37b306p-25f}, {0x1.7a1148p+0f, -0x1.829fdp-25f}, {0x1.7e2f34p+0f, -0x1.261634p-25f},
+    {0x1.82589ap+0f, -0x1.accc7cp-26f}, {0x1.868d9ap+0f, -0x1.2edb44p-26f}, {0x1.8ace54p+0f, 0x1.15506ep-27f},
+    {0x1.8f1aeap+0f, -0x1.baa232p-26f}, {0x1.93737cp+0f, -0x1.e64744p-25f},
+    {0x1.97d82ap+0f, -0x1.0d8d84p-31f}, {0x1.9c4918p+0f, 0x1.51f848p-27f}, {0x1.a0c668p+0f, -0x1.2886a6p-26f},
+    {0x1.a5503cp+0f, -0x1.b83b54p-25f}, {0x1.a9e6b6p+0f, -0x1.50c048p-25f},
+    {0x1.ae89fap+0f, -0x1.a94b14p-26f}, {0x1.b33a2cp+0f, -0x1.ec3a82p-26f}, {0x1.b7f77p+0f, -0x1.a09438p-25f},
+    {0x1.bcc1eap+0f, -0x1.f687c6p-25f}, {0x1.c199bep+0f, -0x1.3d56b2p-27f}, {0x1.c67f12p+0f, 0x1.cafa2ap-25f},
+    {0x1.cb720ep+0f, -0x1.8837ccp-27f}, {0x1.d072d4p+0f, 0x1.40f13p-25f}, {0x1.d5818ep+0f, -0x1.822dbcp-27f},
+    {0x1.da9e6p+0f, 0x1.ed9942p-27f}, {0x1.dfc974p+0f, -0x1.908c94p-25f}, {0x1.e502eep+0f, 0x1.e2cffep-26f},
+    {0x1.ea4afap+0f, 0x1.52486cp-27f}, {0x1.efa1bep+0f, 0x1.cc2b44p-25f}, {0x1.f50766p+0f, -0x1.246ebp-26f},
+    {0x1.fa7c18p+0f, 0x1.9e90d8p-28f},
+};
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ == 1200
+__device__ __forceinline__ float sp_expf(float x) {
+    if (!(x <= 0.0f && x >= -86.0f)) return (float)exp((double)x);
+    const float k = rintf(x * 0x1.715476p+6f);
+    const float r1 = fmaf(-k, 0x1.63p-7f, x);
+    const float t = __fmul_rn(k, -0x1.bd0106p-19f), tl = fmaf(k, -0x1.bd0106p-19f, -t);
+    const float s = __fsub_rn(r1, t), bb = __fsub_rn(s, r1);
+    const float rl = fmaf(-k, 0x1.cf79acp-46f, __fsub_rn(__fadd_rn(__fsub_rn(r1, __fsub_rn(s, bb)), __fsub_rn(-t, bb)), tl));
+    const int ki = (int)k;
+    const float2 T = __ldg(&sp_exp_tab[ki & 63]);
+    const float rr = __fadd_rn(s, rl);
+    const float q = __fmul_rn(__fmul_rn(rr, rr),
+                              fmaf(rr, fmaf(rr, fmaf(rr, 0x1.111112p-7f, 0x1.555556p-5f), 0x1.555556p-3f), 0.5f));
+    const float ph = __fmul_rn(T.x, s), pl = fmaf(T.x, s, -ph);
+    const float small = fmaf(T.x, q, fmaf(T.x, rl, __fadd_rn(fmaf(T.y, __fadd_rn(rr, q), T.y), pl)));
+    const float s1 = __fadd_rn(T.x, ph), e1 = __fsub_rn(ph, __fsub_rn(s1, T.x));
+    const float t2 = __fadd_rn(e1, small), y = __fadd_rn(s1, t2), r3 = __fsub_rn(t2, __fsub_rn(y, s1));
+    const unsigned yb = __float_as_uint(y);
+    const float ulp = __uint_as_float((yb & 0x7F800000u) - (23u << 23));
+    if (fabsf(r3) >= __fmul_rn(r3 < 0.0f && (yb & 0x7FFFFFu) == 0 ? 0.25f : 0.5f, ulp) - 0x1p-34f)
+        return (float)exp((double)x);
+    return __uint_as_float(yb + ((unsigned)(ki >> 6) << 23));
+}
+#else
 __device__ __forceinline__ float sp_expf(float x) { return (float)exp((double)x); }
+#endif
 __device__ __forceinline__ float sp_tanhf(float x) { return (float)tanh((double)x); }
 /* The erf-GELU's exp(-z^2) in float on sm_120, where FP64 runs at 1/64 rate: the double form was
  * most of the Qwen3-ASR conv front end. rtx-5090, 64-chunk bucket, ms: conv1 2.784 -> 0.808,
- * conv2 4.228 -> 3.739, fc1 0.146 -> 0.084. Same bf16 GELUs as the double form on every
- * speech_f32_op_test case; the attention softmax keeps sp_expf (float exp moved its outputs). */
+ * conv2 4.228 -> 3.739, fc1 0.146 -> 0.084. Same bf16 GELU as the double form for all 65536 bf16
+ * inputs; the attention softmax keeps sp_expf (expf moved its probabilities). */
 __device__ __forceinline__ float sp_gelu_expf(float x) {
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ == 1200
     return expf(x);
