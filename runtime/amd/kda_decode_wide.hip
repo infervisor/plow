@@ -237,9 +237,10 @@ void plow_kda_rider_v1(
     __syncthreads();
     const size_t rh = (size_t)span->row0 * heads;
 #if PLOW_KDA_DECODE_LANES
-    kda_state_step_lanes(o + rp, mq + rp, mk + rp, mv + rp, forget_raw + rp, beta_raw + rh, a_log,
-                         dt_bias, gate_mode, lower_bound, st, 0u, h, heads,
-                         PLOW_KDA_F_QK_L2NORM | PLOW_KDA_F_SEQ_ROWS, scale, lds, nullptr);
+    f32x4 s_lanes[8];
+    kda_state_step_lanes<false>(o + rp, mq + rp, mk + rp, mv + rp, forget_raw + rp, beta_raw + rh, a_log,
+                                dt_bias, gate_mode, lower_bound, st, 0u, h, heads,
+                                PLOW_KDA_F_QK_L2NORM | PLOW_KDA_F_SEQ_ROWS, scale, lds, nullptr, s_lanes);
 #else
     /* Two nominal rows select the wide arm; item h is row 0 only. */
     d_kda_state_step_g(o + rp, mq + rp, mk + rp, mv + rp, forget_raw + rp, beta_raw + rh, a_log,

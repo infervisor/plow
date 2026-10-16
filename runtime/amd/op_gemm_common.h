@@ -697,7 +697,7 @@ __device__ void d_gemm_t(bf16* __restrict__ C, const bf16* __restrict__ A,
              * 32-elem MX block (32 % 8 == 0), so one scale byte covers it. Hardware cvt scales   \
              * exactly with zero rounding error. */                                               \
             if (r < N) {                                                                      \
-                const unsigned char sc = as_glob(ssrc)[(size_t)r * ((K + 31u) >> 5) + (kk >> 5)]; \
+                const unsigned char sc = as_glob(ssrc)[(size_t)(r >> 5) * ((K + 31u) >> 5) + (kk >> 5)]; \
                 *(bf16v8*)&rb[it * 8] = fp8v8_to_bf16v8(ld_glob_fp8v8(                        \
                     reinterpret_cast<const unsigned char*>(bsrc) + (size_t)r * K + kk),       \
                     e8m0_to_f32(sc));                                                         \
