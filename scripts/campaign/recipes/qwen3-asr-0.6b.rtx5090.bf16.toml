@@ -27,8 +27,9 @@ gpu = "5090"
 arch = "sm_120a"
 n_cu = 170
 n_gpu = 1
-# 128 slots x 2048 ctx = 28 GiB of KV does not fit 32 GB; 1024 holds a 30 s clip (L4 WER parity).
-max_ctx = 1024
+# 128 slots x 2048 ctx = 28 GiB of KV does not fit 32 GB. The audio_lm geometry needs a 30 s clip
+# (391 rows) + output.max_tokens 1024 <= max_ctx, so 1536 (21 GiB of KV).
+max_ctx = 1536
 
 [emit]
 emit = "devblob+cubin"
