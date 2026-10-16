@@ -6557,20 +6557,12 @@ fn every_glm_recipe_entry_holds_without_being_named() {
     // Recipe entries an unflagged emit deliberately does NOT produce yet. A TOMBSTONE, not a
     // waiver: the assertion below is equality, so a knob that gets an applier must be deleted
     // from here, and a knob that silently loses one cannot be absorbed by it.
-    const NOT_YET_APPLIED: &[(&str, &str)] = &[
-        (
-            "PLOW_GLM_DSA_PF",
-            "sparse prefill measures 3.27x at 70k C1 with retrieval 36/36, but FAULTS at C16 \
-             (write to a read-only page, task #70). Applying it here would make a crashing \
-             configuration the unflagged default. Promote with the span knob once #70 clears.",
-        ),
-        (
-            "PLOW_MLA_PF_V2",
-            "env layer, not an EmitConfig field: the emitter reads the variable directly, so \
+    const NOT_YET_APPLIED: &[(&str, &str)] = &[(
+        "PLOW_MLA_PF_V2",
+        "env layer, not an EmitConfig field: the emitter reads the variable directly, so \
              apply_production_defaults cannot set it. scripts/glm53_serve_inner.sh exports it; \
              every_env_recipe_entry_is_set_by_a_driver_script is the gate for that half.",
-        ),
-    ];
+    )];
 
     let recipe = crate::knob_spec::glm53_recipe_env();
     assert!(

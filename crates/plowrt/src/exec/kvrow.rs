@@ -278,6 +278,7 @@ pub(crate) const PREFILL_ROW_FIELDS: &[(DevOp, RowField)] = &[
     // next packet that does emit them from silently paying full width.
     (DevOp::GemmC5Fp8, RowField::Rows(0)),
     (DevOp::GemmSplitK, RowField::Rows(0)),
+    (DevOp::GemmFp8Mx, RowField::Rows(0)),
     (DevOp::PerLayerInput, RowField::Rows(0)),
     (DevOp::GluStrided, RowField::Rows(0)),
     (DevOp::FlashMlaPrefill, RowField::Rows(4)),
@@ -377,7 +378,11 @@ pub(crate) fn rebase_chunk_rows(
         if let Some(f) = kv_write_row_field(op, names.get(d.t[0] as usize)) {
             d.i[f] = c0;
         }
-        if (op == DevOp::HeadNormRope as u16 || op == DevOp::HeadNormRopeFp8 as u16) && d.fj[1] != 0
+        if (op == DevOp::HeadNormRope as u16 || op == DevOp::HeadNormRopeFp8 as u16)
+            && d.fj[1] != 0
+            && !names
+                .get(d.t[0] as usize)
+                .is_some_and(|n| n.starts_with("act."))
         {
             d.i[3] = c0;
         } else if op == DevOp::FlashPrefill as u16 || op == DevOp::FlashPrefillFp8 as u16 {
@@ -533,6 +538,9 @@ pub(crate) fn ragged_band_views(
         let Some(bi) = names.iter().position(|x| *x == n[..pos]) else {
             continue;
         };
+        if bases[bi] == 0 {
+            continue;
+        }
         let row = lens[i] / (t / tp) as u64;
         out.push((i, bases[bi] + rank as u64 * b as u64 * row));
     }
