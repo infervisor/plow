@@ -13,7 +13,7 @@ name = "glm-5.3-flash"
 label = "gfx950-mi350x-tp8-fp8"
 network = "glm-5.3-flash"
 status = "validated"
-plow_git = "0c6597b2b9a9f4e0c326a29142441d154230cc5f"
+plow_git = "4e8f9d6fe312535fc59e6eff8ac5fe993356c67a"
 doc = "docs/amd/glm53-flash-mi350x.md"
 
 # max_ctx 65536: the model's recurrent (KDA) state carries at every length, so long prompts are
@@ -238,17 +238,16 @@ name = "smoke"
 cmd = "scripts/serve_test/smoke.sh"
 
 # FP32-reference gate (scripts/llm/fp32_ref_gate.py, 46 cases incl. 18 needles to 15872 tokens,
-# served c16, prefix cache on, PF_INTERLEAVE 8192) on packet 49b696e4 with this [serve] env (v20): PASS,
-# kl_mean 0.02125 (vLLM 0.03677 on the same reference), top1_decisive 0.9945 (0.9868), needles 18/18; needles with
-# PLOW_PF_CHUNK=512 18/18. Prefix reuse at c8 on. Nondeterministic route (AITER
-# MoE atomics): FP32 runs of the AITER builds measured kl_mean 0.018-0.026 (all PASS). 0 cross-GPU collective errors.
+# served c16, prefix cache on, PF_INTERLEAVE 8192, PLOW_PACKED_PREFILL_ROUTE=0) on packet d3d7db7307d4 with this [serve] env: PASS,
+# kl_mean 0.01718 (vLLM 0.03677 on the same reference), kl_p95 0.0857 (vLLM 0.1848), kl_p99 0.2260 (vLLM 0.5493),
+# top1_decisive 0.9978 (vLLM 0.9868), needles 18/18. DSA enabled (PLOW_GLM_DSA=1). 0 cross-GPU collective errors.
 [[gates]]
 name = "llm_fp32_ref"
 cmd = "scripts/llm/fp32_ref_gate.py"
 expect = "PASS"
 
 # Long-context needles (scripts/glm53_needle_probe.py --exact-lengths --gen-suffix '</think>',
-# 4096/16384/32768/61440 tokens x depths 0.1/0.5/0.9 x 3 needles): 36/36, vLLM 36/36, paired pass.
+# 4096/16384/32768/61440 tokens x depths 0.1/0.5/0.9 x 3 needles, DSA enabled): 36/36 (100% pass, 32s), vLLM 36/36, paired pass.
 [[gates]]
 name = "needle-long-context"
 cmd = "scripts/glm53_needle_probe.py"
@@ -256,11 +255,12 @@ expect = "36/36"
 
 # One serving cell for orientation; the full grid (isl 1024/4096/16384 at c1..c128, 32768/61440 at
 # c1/c8) and the strict comparison against vLLM are docs/bringup/results/glm53flash-mi350x-2026-10-12.
-# Qualified wins: isl4096-c8 (1.23x vs vLLM), isl1024-c8 (1.16x vs vLLM); see docs/amd/glm53-flash-mi350x.md.
+# Qualified wins: isl4096-c1 TTFT 144.5 ms (3.5x faster vs vLLM 511.6 ms), isl4096-c8 TTFT 1095.7 ms (2.09x faster)
+# & TPOT 18.04 ms (1.41x faster), isl1024-c8 TTFT 639.5 ms (2.76x faster), 0.80x peak GPU memory across all cells.
 [measured]
-tok_s = 112.85
-p50_tpot_ms = 8.04
-p50_ttft_ms = 112.60
+tok_s = 104.03
+p50_tpot_ms = 8.62
+p50_ttft_ms = 130.65
 concurrency = 1
 input_len = 4096
 output_len = 128
@@ -268,7 +268,7 @@ client = "vllm 0.31.1rc1 bench serve (scripts/bench/llm_grid.sh)"
 
 # Reproduction gates at THIS commit, checkpoint and nix lock.
 [artifacts]
-"plowrt" = "8be3671dc2dbf23a729b89f7713b86b2d900c90e869fd6d56cfe8249d5c24563"
+"plowrt" = "e0cccd35ad77ac7683ce2354522562ed0f2e47c1f88c9e1c270485253786e72c"
 "model.pkt" = "d3d7db7307d470866e360a75ea8f68e271a52a275fda7067a6eb651ffa5596d7"
 "interp_decode_k3_gq.elf" = "24d09cea4b7dc0a6a433b48e41d9ce207e400a4226b4fd5e4ac14d7f49cf844a"
 "lowrung1/interp_decode_k3_gq.elf" = "fda698bc3bd99336d33b0cb20c7bf606fd0f99a6645b7c7c0547f174e44037f7"

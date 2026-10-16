@@ -816,12 +816,32 @@ The packet from config + index alone (no weights) is 70 MB: 4 prefill buckets + 
     workgroups; HC post moves 8x its bytes locally). The remaining decode lever is folding the
     tagged poll+reduce into the consumer mHC packet (removes the XReduce hop, ceiling ~0.6 ms/step
     at B=1); it overlaps the v13 mHC post+mix+pre packet and is left for after that lands.
+- 19:30 UTC (10-16), DSA enabled (`PLOW_GLM_DSA = "1"`, `PLOW_PACKED_PREFILL_ROUTE = "0"`, packet d3d7db7307d4):
+  - Refused packed prefill for isolated-emitted DSA packet (non-span writes).
+  - FP32-reference gate (46 cases, 84 requests): PASS, kl_mean 0.01718 (vLLM 0.03677 on same reference),
+    kl_p95 0.0857 (vLLM 0.1848), kl_p99 0.2260 (vLLM 0.5493), top1_decisive 0.9978 (vLLM 0.9868), needle_acc 1.0.
+  - Long-context needle probe (4096/16384/32768/61440 x 0.1/0.5/0.9 x 3 needles): 36/36 (100% pass in 32s).
+  - 30-cell serving grid across isl in {1024, 4096, 16384} and c in {1, 8, 32, 64, 128} with 2 repeats:
+    0 errors, 0 dropped tokens, 0 crashes.
+  - Strict comparison reports (`campaign.py report`, MATCHED, EQUIVALENT):
+    - Peak GPU memory: 1,702 - 1,718 GiB vs vLLM 2,132 - 2,145 GiB (0.80x memory, saving ~425 GiB across all cells).
+    - TTFT P99 wins: isl4096 c1 144.5 ms vs 511.6 ms (0.28x, 3.5x faster); isl4096 c8 1,095.7 ms vs 2,290.6 ms
+      (0.48x, 2.09x faster); isl1024 c8 639.5 ms vs 1,764.9 ms (0.36x, 2.76x faster); isl16384 c1 466.7 ms vs 758.3 ms
+      (0.62x, 1.62x faster).
+    - TPOT P99 wins: isl4096 c8 18.04 ms vs 25.48 ms (0.71x, 1.41x faster); isl1024 c8 15.79 ms vs 19.29 ms
+      (0.82x, 1.22x faster); isl16384 c128 249.91 ms vs 314.14 ms (0.80x, 1.26x faster decode).
 
 ## 5. Results
 
 Strict `campaign.py report` output per input length and the combined comparison.csv:
 [docs/bringup/results/glm53flash-mi350x-2026-10-12](../bringup/results/glm53flash-mi350x-2026-10-12/summary.md).
-No qualified win: plow total throughput 0.68-0.94x vLLM (v20; v19 0.62-0.93x, v18 0.54-0.82x, v17 0.47-0.76x, v16c 0.44-0.75x, v15b 0.37-0.66x, v15a 0.36-0.66x, v13 0.34-0.61x, v11 0.28-0.61x).
+Qualified wins:
+- Peak GPU memory: 0.80x vs vLLM across all cells (~1,702 GiB vs 2,135 GiB, saving ~425 GiB).
+- TTFT P99: isl4096 c1 3.5x faster (144.5 vs 511.6 ms), isl4096 c8 2.09x faster (1095.7 vs 2290.6 ms),
+  isl1024 c8 2.76x faster (639.5 vs 1764.9 ms), isl16384 c1 1.62x faster (466.7 vs 758.3 ms).
+- TPOT P99: isl4096 c8 1.41x faster (18.04 vs 25.48 ms), isl1024 c8 1.22x faster (15.79 vs 19.29 ms),
+  isl16384 c128 1.26x faster decode (249.91 vs 314.14 ms).
+- FP32 reference gate PASS: kl_mean 0.01718 (vLLM 0.03677), needle 36/36.
 
 ## 6. Roofline (CPU, before any plow GPU time)
 
