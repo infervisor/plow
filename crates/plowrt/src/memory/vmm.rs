@@ -1148,11 +1148,6 @@ enum Job {
     Sync(std::sync::mpsc::Sender<()>),
 }
 
-#[derive(Clone, Copy)]
-struct BoundaryKey {
-    node: Option<(u32, u32)>,
-    id: u64,
-}
 
 /// What a boundary was published as (a bit set: a dedup ORs the publisher's kind in).
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
@@ -1224,7 +1219,7 @@ struct SlotSeq {
     tokens: Vec<u32>,
     prompt_rows: usize,
     held: usize,
-    snapshot: Option<BoundaryKey>,
+    snapshot: Option<u64>,
     /// Boundary tree: the boundary this request attached and has not yet continued (a
     /// publish below it, or a touch of it). It holds `Snap::pending` on that boundary.
     lineage: Option<u64>,
@@ -1367,11 +1362,8 @@ struct Snap {
     parent: Option<u64>,
     children: Vec<u64>,
     referenced: bool,
-    reusable_prompt: bool,
     /// Attaches served; a session's own boundary is attached at most once (its next turn).
     attaches: u32,
-    /// The publishing sequence's prompt rows: `rows >= prompt_rows` is a turn end.
-    prompt_rows: u32,
     /// Published at a prompt's shared-prefix end ([`VmmKv::share_rows`]): seen on two prompts.
     share: bool,
 }
@@ -2382,7 +2374,7 @@ impl VmmKv {
                         && prompt.get(start..snap.rows as usize) == Some(snap.tail.as_slice())
                         && chosen.is_none_or(|(_, _, rows)| snap.rows > rows)
                     {
-                        chosen = Some((blocks, BoundaryKey { node, id: snap.id }, snap.rows));
+                        chosen = Some((blocks, snap.id, snap.rows));
                     }
                 }
             }
@@ -2393,7 +2385,7 @@ impl VmmKv {
             prompt,
             chosen.map_or(0, |(_, _, rows)| rows),
         );
-        let Some((pick, snap_key, rows)) = chosen else {
+        let Some((pick, snap_id, rows)) = chosen else {
             if let Some(p) = traced {
                 trace_attach(seq, p, m.blocks, s.block_rows, 0, None, false, &inner);
             }
@@ -2424,29 +2416,28 @@ impl VmmKv {
             tokens: prompt.to_vec(),
             prompt_rows: prompt.len(),
             held: pick,
-            snapshot: Some(snap_key),
-            lineage: Some(snap_key.id),
-            attached: Some(snap_key.id),
+            snapshot: Some(snap_id),
+            lineage: Some(snap_id),
+            attached: Some(snap_id),
             ..Default::default()
         };
         inner.snapshot_tick += 1;
         let tick = inner.snapshot_tick;
-        let snap = snap_mut(&mut inner, snap_key.id).expect("chosen snapshot is published");
+        let snap = snap_mut(&mut inner, snap_id).expect("chosen snapshot is published");
         snap.users += 1;
         snap.pending += 1;
         snap.last_used = tick;
         snap.referenced = true;
-        snap.reusable_prompt = true;
         snap.attaches += 1;
         let (kind, snap_bytes) = (snap.kind, snap.bytes);
         // A prefetch's restore in flight: wait for its device buffer (`users` holds it).
         while matches!(
-            snap_ref(&inner, snap_key.id).expect("held").store,
+            snap_ref(&inner, snap_id).expect("held").store,
             SnapStore::Restoring(_)
         ) {
             s.host_cv.wait(&mut inner);
         }
-        let snap = snap_mut(&mut inner, snap_key.id).expect("held");
+        let snap = snap_mut(&mut inner, snap_id).expect("held");
         let mut restore = None;
         match snap.store {
             SnapStore::Device(_) => {}
@@ -2455,13 +2446,13 @@ impl VmmKv {
                 Ok(()) => {
                     snap.store = SnapStore::Device(va);
                     let tier = inner.host.as_mut().expect("a spilling snapshot has a tier");
-                    tier.forget_spill(snap_key.id);
+                    tier.forget_spill(snap_id);
                     tier.release_slot(slot);
                 }
                 Err(error) => {
                     // Completion unproven: the host slot is never reused, the device buffer
                     // (still intact: a D2H copy only reads it) never freed.
-                    quarantine(s, &mut inner, snap_key.id, &error);
+                    quarantine(s, &mut inner, snap_id, &error);
                 }
             },
             // Owned by this attach until the copy lands: a prefetch or another attach of the
@@ -2477,13 +2468,13 @@ impl VmmKv {
             (slot, tier.slots[slot as usize])
         });
         if let Some(p) = traced {
-            let snap = Some((snap_key.id, kind));
+            let snap = Some((snap_id, kind));
             let host = restore.is_some();
             trace_attach(seq, p, m.blocks, s.block_rows, rows, snap, host, &inner);
         }
         // The ancestors as they are now: the restore wait above released the lock.
-        let parent = snap_ref(&inner, snap_key.id).expect("held").parent;
-        let snap = snap_ref(&inner, snap_key.id).expect("held");
+        let parent = snap_ref(&inner, snap_id).expect("held").parent;
+        let snap = snap_ref(&inner, snap_id).expect("held");
         let snap_va = snap.device_va().unwrap_or(0);
         let lost = prompt.len() as u64 - u64::from(rows);
         let st = &mut inner.stats;
@@ -2539,7 +2530,7 @@ impl VmmKv {
             let Some(ids) = inner.node_blocks.get(key).cloned() else {
                 // Give back the restore this attach claimed, or its waiters never wake.
                 if let Some((slot, _)) = restore {
-                    if let Some(snap) = snap_mut(&mut inner, snap_key.id) {
+                    if let Some(snap) = snap_mut(&mut inner, snap_id) {
                         snap.store = SnapStore::Host(slot);
                     }
                     s.host_cv.notify_all();
@@ -2625,7 +2616,7 @@ impl VmmKv {
                 Ok(va) => {
                     let mut inner = s.inner.lock();
                     let tick = inner.snapshot_tick;
-                    let snap = snap_mut(&mut inner, snap_key.id).expect("held");
+                    let snap = snap_mut(&mut inner, snap_id).expect("held");
                     debug_assert!(matches!(snap.store, SnapStore::Restoring(r) if r == slot));
                     snap.store = SnapStore::Device(va);
                     snap.last_used = tick;
@@ -2645,7 +2636,7 @@ impl VmmKv {
                     let mut inner = s.inner.lock();
                     let hashes = inner.seqs[seq].hashes.clone();
                     let tokens = std::mem::take(&mut inner.seqs[seq].tokens);
-                    if let Some(snap) = snap_mut(&mut inner, snap_key.id) {
+                    if let Some(snap) = snap_mut(&mut inner, snap_id) {
                         snap.pending -= 1;
                         snap.store = SnapStore::Host(slot);
                     }
@@ -2735,7 +2726,7 @@ impl VmmKv {
             let mut inner = s.inner.lock();
             // The attach never happened: its expected continuation is gone too.
             if inner.seqs[seq].lineage.take().is_some() {
-                if let Some(snap) = snap_mut(&mut inner, snap_key.id) {
+                if let Some(snap) = snap_mut(&mut inner, snap_id) {
                     snap.pending = snap.pending.saturating_sub(1);
                 }
             }
@@ -2974,10 +2965,6 @@ impl VmmKv {
         };
         inner.snapshot_tick += 1;
         let tick = inner.snapshot_tick;
-        let prompt_rows = match inner.seqs[seq].prompt_rows {
-            0 => tokens.len(),
-            rows => rows,
-        };
         let share = rows == inner.share[seq];
         let snap = snap_mut(&mut inner, id).expect("found above");
         // Only an attach makes a cold boundary ordinary: its producer's turn-end touch leaves a
@@ -2987,7 +2974,6 @@ impl VmmKv {
         }
         // What a dedup in `publish_locked` would merge: the publisher's kind and flags.
         snap.kind |= kind;
-        snap.reusable_prompt |= (rows as usize) < prompt_rows;
         snap.share |= share;
         let parent = snap.parent;
         policy::refresh_ancestors(&mut inner, parent, tick);
@@ -3329,9 +3315,7 @@ impl VmmKv {
                     users: 0,
                     last_used: 0,
                     referenced: false,
-                    reusable_prompt: false,
                     attaches: 0,
-                    prompt_rows: 0,
                     share: false,
                 });
             // Counts toward the same budget whole blocks and boundary snapshots do, so
@@ -3604,24 +3588,12 @@ fn note_lead(inner: &mut Inner, seq: usize, tokens: &[u32]) -> bool {
     inner.lead_seen.get(&key).is_some_and(|&n| n > 1)
 }
 
-/// Trailing prompt rows in which a session's turn-end boundary may differ from the next
-/// prompt (re-rendered generation prompt) and still count as superseded
-/// ([`VmmKv::retire_superseded`]); its reply rows may differ entirely.
-const TURN_END_SLACK: usize = 64;
 /// Recent prompts compared for a shared prefix (a system prompt).
 const RECENT_PROMPTS: usize = 32;
 /// Rows of each recent prompt kept for the comparison.
 const RECENT_ROWS: usize = 16384;
 /// Rows a shared prefix must reach past the attached boundary to be worth a snapshot.
 const SHARE_MIN_ROWS: usize = 256;
-/// Snapshot ticks (one per publish or attach) a twice-attached boundary stays in the
-/// shared-prefix eviction tier after its last use (legacy policy).
-const SHARED_RECENT_TICKS: u64 = 2048;
-
-/// Used within the last `SHARED_RECENT_TICKS` snapshot ticks.
-fn hot(tick: u64, snap: &Snap) -> bool {
-    tick.saturating_sub(snap.last_used) <= SHARED_RECENT_TICKS
-}
 
 /// Record where `prompt` stops matching the longest common prefix with a recent prompt
 /// (32-row aligned): a system prompt seen by two sequences ends there. The engine
@@ -3728,11 +3700,6 @@ fn publish_locked(
     }
     let hashes = hash_blocks(&tokens[..rows as usize], s.block_rows);
     let n_pub = hashes.len();
-    let prompt_rows = match inner.seqs[seq].prompt_rows {
-        0 => tokens.len(),
-        rows => rows,
-    };
-    let reusable_prompt = (rows as usize) < prompt_rows;
     let share = rows == inner.share[seq];
     let tail = &tokens[n_pub * s.block_rows as usize..rows as usize];
 
@@ -3847,6 +3814,7 @@ fn publish_locked(
         ended,
         attached,
         session_ttl,
+        prompt_rows,
         ..
     } = inner.seqs[seq];
     release_prefix_hold(s, inner, seq);
@@ -3880,7 +3848,6 @@ fn publish_locked(
         // Recency refreshes on consumer demand only (an attach, the turn-end touch): a
         // republish of an identical boundary proves nothing about its next use.
         snap.kind |= kind;
-        snap.reusable_prompt |= reusable_prompt;
         snap.share |= share;
         inner.stats.snapshots_touched += 1;
         (snap.id, snapshot)
@@ -3918,13 +3885,7 @@ fn publish_locked(
             parent: None,
             children: Vec::new(),
             referenced: false,
-            // A session's turn end is reclaimed first like any output boundary until an
-            // attach proves it: a chat template re-renders the reply (Gemma 4 drops the
-            // generation prompt's empty thought channel), so the next prompt usually diverges
-            // before it and attaches to the prompt-end boundary instead.
-            reusable_prompt,
             attaches: 0,
-            prompt_rows: prompt_rows as u32,
             share,
         });
         inner.stats.snapshot_bytes += snap_bytes;
@@ -4066,11 +4027,10 @@ fn stats_of(s: &Shared) -> VmmStats {
     let inner = s.inner.lock();
     let mut out = inner.stats;
     out.hash_collisions = inner.cache.collisions();
-    let tick = inner.snapshot_tick;
     let now = std::time::Instant::now();
     for snap in inner.published.values().flatten() {
         out.snapshots_live += 1;
-        if snap.attaches >= 2 && hot(tick, snap) {
+        if snap.attaches >= 2 {
             out.snapshots_shared += 1;
         }
         if snap.share || snap.kind.has(Kind::SHARED_END) {
@@ -4610,10 +4570,10 @@ fn note_end(inner: &mut Inner, seq: usize, id: u64, kind: Kind) -> Option<u64> {
 /// single-continuation rule the hold deferred ([`release_snapshot_hold`] applies it at once;
 /// `publish_locked` only after the publisher's own boundary is linked).
 fn drop_snapshot_hold(inner: &mut Inner, seq: usize) -> Option<u64> {
-    let key = inner.seqs[seq].snapshot.take()?;
-    let snap = snap_mut(inner, key.id).expect("a held snapshot is published");
+    let id = inner.seqs[seq].snapshot.take()?;
+    let snap = snap_mut(inner, id).expect("a held snapshot is published");
     snap.users -= 1;
-    (snap.users == 0).then_some(key.id)
+    (snap.users == 0).then_some(id)
 }
 
 fn release_snapshot_hold(s: &Shared, inner: &mut Inner, seq: usize) {

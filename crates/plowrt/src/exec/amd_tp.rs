@@ -1730,6 +1730,18 @@ impl AmdTpGroup {
         }
     }
 
+    pub fn vmm_prefix_probe(&self) -> Option<crate::memory::vmm::PrefixProbe> {
+        self.ranks.first().and_then(|r| r.vmm_prefix_probe())
+    }
+
+    pub fn vmm_stats_handle(&self) -> Option<crate::memory::vmm::VmmStatsHandle> {
+        self.ranks.first().and_then(|r| r.vmm_stats_handle())
+    }
+
+    pub fn kv_row_bytes(&self) -> u64 {
+        self.ranks.iter().map(|r| r.kv_row_bytes()).sum()
+    }
+
     /// Publish the per-row parked mask on every rank. See `AmdEngine::upload_parked`.
     pub fn upload_parked(&mut self, parked: &[u32]) -> Result<()> {
         each_rank(&mut self.ranks, |e| e.upload_parked(parked)).map(drop)

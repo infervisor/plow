@@ -1130,24 +1130,24 @@ pub fn spawn(
     let pf_rungs = state
         .gpu_engine(&slug)
         .and_then(|e| e.lock().pf_launch_rungs());
-    #[cfg(feature = "cuda")]
+    #[cfg(any(feature = "cuda", feature = "hsa"))]
     let prefix_probe = state
         .gpu_engine(&slug)
         .and_then(|e| e.lock().vmm_prefix_probe());
-    #[cfg(not(feature = "cuda"))]
+    #[cfg(not(any(feature = "cuda", feature = "hsa")))]
     let prefix_probe: Option<crate::memory::vmm::PrefixProbe> = None;
     let prefix_block_rows = prefix_probe.as_ref().map_or(0, |p| p.block_rows());
-    #[cfg(feature = "cuda")]
+    #[cfg(any(feature = "cuda", feature = "hsa"))]
     let (resume_supported, prefix_cache, kv_row_bytes) =
         state.gpu_engine(&slug).map_or((false, false, 0), |e| {
             let e = e.lock();
             (
                 e.slot_resume_supported(),
-                e.is_cuda() && e.prefix_cache_enabled(),
+                e.prefix_cache_enabled(),
                 e.kv_row_bytes(),
             )
         });
-    #[cfg(all(not(feature = "cuda"), feature = "cpu"))]
+    #[cfg(all(not(any(feature = "cuda", feature = "hsa")), feature = "cpu"))]
     let (resume_supported, prefix_cache, kv_row_bytes) = (
         state
             .gpu_engine(&slug)
@@ -1155,7 +1155,7 @@ pub fn spawn(
         false,
         0,
     );
-    #[cfg(not(any(feature = "cuda", feature = "cpu")))]
+    #[cfg(not(any(feature = "cuda", feature = "hsa", feature = "cpu")))]
     let (resume_supported, prefix_cache, kv_row_bytes) = (false, false, 0);
     if let Some(b) = kv_budget {
         tracing::info!(

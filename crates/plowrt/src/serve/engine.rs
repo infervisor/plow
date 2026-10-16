@@ -460,6 +460,8 @@ impl ServeEngine {
         match self {
             #[cfg(feature = "cuda")]
             ServeEngine::Cuda(e) => e.kv_row_bytes(),
+            #[cfg(feature = "hsa")]
+            ServeEngine::Amd(e) => e.kv_row_bytes(),
             #[allow(unreachable_patterns)]
             _ => 0,
         }
@@ -521,26 +523,27 @@ impl ServeEngine {
         }
     }
 
-    /// The VMM prefix-cache stats reader, when this engine has one. Only the
-    /// CUDA engine does.
-    #[cfg(feature = "cuda")]
+    /// The VMM prefix-cache stats reader, when this engine has one.
+    #[cfg(any(feature = "cuda", feature = "hsa"))]
     pub fn vmm_stats_handle(&self) -> Option<crate::memory::vmm::VmmStatsHandle> {
         match self {
+            #[cfg(feature = "cuda")]
             ServeEngine::Cuda(e) => e.vmm_stats_handle(),
             #[cfg(feature = "hsa")]
-            ServeEngine::Amd(_) => None,
+            ServeEngine::Amd(e) => e.vmm_stats_handle(),
             #[cfg(feature = "cpu")]
             ServeEngine::Cpu(_) => None,
         }
     }
 
     /// The prefix cache's read-only attach probe, for cache-aware admission order.
-    #[cfg(feature = "cuda")]
+    #[cfg(any(feature = "cuda", feature = "hsa"))]
     pub fn vmm_prefix_probe(&self) -> Option<crate::memory::vmm::PrefixProbe> {
         match self {
+            #[cfg(feature = "cuda")]
             ServeEngine::Cuda(e) => e.vmm_prefix_probe(),
             #[cfg(feature = "hsa")]
-            ServeEngine::Amd(_) => None,
+            ServeEngine::Amd(e) => e.vmm_prefix_probe(),
             #[cfg(feature = "cpu")]
             ServeEngine::Cpu(_) => None,
         }
@@ -635,6 +638,27 @@ mod amd_serve {
             match self {
                 Self::One(e) => e.release_shared_prefix(slot),
                 Self::Tp(g) => g.release_shared_prefix(slot),
+            }
+        }
+
+        fn vmm_prefix_probe(&self) -> Option<crate::memory::vmm::PrefixProbe> {
+            match self {
+                Self::One(e) => e.vmm_prefix_probe(),
+                Self::Tp(g) => g.vmm_prefix_probe(),
+            }
+        }
+
+        fn vmm_stats_handle(&self) -> Option<crate::memory::vmm::VmmStatsHandle> {
+            match self {
+                Self::One(e) => e.vmm_stats_handle(),
+                Self::Tp(g) => g.vmm_stats_handle(),
+            }
+        }
+
+        fn kv_row_bytes(&self) -> u64 {
+            match self {
+                Self::One(e) => e.kv_row_bytes(),
+                Self::Tp(g) => g.kv_row_bytes(),
             }
         }
 
@@ -1949,6 +1973,18 @@ mod amd_serve {
 
         pub(super) fn prefix_cache_enabled(&self) -> bool {
             self.prefix_cache
+        }
+
+        pub fn vmm_prefix_probe(&self) -> Option<crate::memory::vmm::PrefixProbe> {
+            self.ranks.vmm_prefix_probe()
+        }
+
+        pub fn vmm_stats_handle(&self) -> Option<crate::memory::vmm::VmmStatsHandle> {
+            self.ranks.vmm_stats_handle()
+        }
+
+        pub fn kv_row_bytes(&self) -> u64 {
+            self.ranks.kv_row_bytes()
         }
 
         /// Sequence slots one decode dispatch advances. The mux sizes its slot

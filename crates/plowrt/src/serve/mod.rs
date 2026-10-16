@@ -476,7 +476,7 @@ pub struct AppState {
     gpu: RwLock<FxHashMap<String, Arc<Mutex<engine::ServeEngine>>>>,
     /// Engine-lock-free VMM stats readers for `/metrics` (one per slug with
     /// prefix sharing up) — a scrape must never queue behind a tick.
-    #[cfg(feature = "cuda")]
+    #[cfg(any(feature = "cuda", feature = "hsa"))]
     vmm_stats: RwLock<FxHashMap<String, crate::memory::vmm::VmmStatsHandle>>,
     /// Per-instance multimodal runtime (encoders on the instance's device, slab mirroring its
     /// engine's table): installed and removed with the engine.
@@ -584,7 +584,7 @@ impl AppState {
             downstream: RwLock::new(FxHashMap::default()),
             #[cfg(any(feature = "cuda", feature = "hsa", feature = "cpu"))]
             gpu: RwLock::new(FxHashMap::default()),
-            #[cfg(feature = "cuda")]
+            #[cfg(any(feature = "cuda", feature = "hsa"))]
             vmm_stats: RwLock::new(FxHashMap::default()),
             mm: RwLock::new(FxHashMap::default()),
             #[cfg(feature = "cuda")]
@@ -749,7 +749,7 @@ impl AppState {
     /// Register a GPU engine for a model slug. Called once at startup.
     #[cfg(any(feature = "cuda", feature = "hsa", feature = "cpu"))]
     pub fn install_gpu_engine(&self, slug: String, engine: engine::ServeEngine) {
-        #[cfg(feature = "cuda")]
+        #[cfg(any(feature = "cuda", feature = "hsa"))]
         if let Some(h) = engine.vmm_stats_handle() {
             self.vmm_stats.write().insert(slug.clone(), h);
         }
@@ -764,9 +764,9 @@ impl AppState {
             self.sampling_honoured
                 .write()
                 .insert(set.model.clone(), engine.honours_sampling());
-            #[cfg(feature = "cuda")]
+            #[cfg(any(feature = "cuda", feature = "hsa"))]
             set.set_probe(r, engine.vmm_prefix_probe());
-            #[cfg(not(feature = "cuda"))]
+            #[cfg(not(any(feature = "cuda", feature = "hsa")))]
             let _ = r;
         }
         if let Ok(bundle) = self.registry.get(self.model_of(&slug)) {
@@ -873,7 +873,7 @@ impl AppState {
     /// CUDA-specific, and that is gated inside.
     #[cfg(any(feature = "cuda", feature = "hsa", feature = "cpu"))]
     pub fn remove_gpu_engine(&self, slug: &str) -> Option<Arc<Mutex<engine::ServeEngine>>> {
-        #[cfg(feature = "cuda")]
+        #[cfg(any(feature = "cuda", feature = "hsa"))]
         self.vmm_stats.write().remove(slug);
         if let Some((set, r)) = self.dp_rank(slug) {
             set.set_probe(r, None);
@@ -1930,7 +1930,7 @@ async fn metrics_handler(
     ] {
         crate::obs::serving::family(&mut out, &format!("plowrt_prefix_{name}"), kind, help);
     }
-    #[cfg(feature = "cuda")]
+    #[cfg(any(feature = "cuda", feature = "hsa"))]
     for (slug, h) in state.vmm_stats.read().iter() {
         let s = h.stats();
         let slug = crate::obs::serving::escape_label(slug);

@@ -19168,6 +19168,24 @@ impl AmdEngine {
         }
     }
 
+    pub fn vmm_prefix_probe(&self) -> Option<crate::memory::vmm::PrefixProbe> {
+        self.shared_prefix.as_ref().and_then(|p| p.prefix_probe())
+    }
+
+    pub fn vmm_stats_handle(&self) -> Option<crate::memory::vmm::VmmStatsHandle> {
+        self.shared_prefix.as_ref().and_then(|p| p.stats_handle())
+    }
+
+    pub fn kv_row_bytes(&self) -> u64 {
+        if let Some(shared) = &self.shared_prefix {
+            shared.row_bytes()
+        } else if let Some(vmm) = &self.vmm {
+            vmm.geometry().row_bytes()
+        } else {
+            0
+        }
+    }
+
     fn evict_prefix_snapshot(&mut self, keep: usize, also_keep: usize) -> bool {
         let victim = (0..self.batch)
             .filter(|&slot| slot != keep && slot != also_keep && self.prefix_snap[slot].is_some())

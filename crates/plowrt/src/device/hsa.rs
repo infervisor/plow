@@ -1103,6 +1103,13 @@ pub struct HsaBackend {
     /// a queue that will never advance. Teardown paths (Drop impls,
     /// `DeviceFree`) don't guard and still attempt their calls.
     poisoned: std::sync::OnceLock<DeviceErrorInfo>,
+    copy_tier: parking_lot::Mutex<Option<HsaCopyTier>>,
+}
+
+struct HsaCopyTier {
+    signals: rustc_hash::FxHashMap<u64, HsaSignal>,
+    spare: Vec<HsaSignal>,
+    failed: rustc_hash::FxHashSet<u64>,
 }
 
 /// Preallocated fill source: `len` bytes of fine-grained memory already set to
@@ -1502,6 +1509,7 @@ impl HsaBackend {
             slab_pool: parking_lot::Mutex::new(Vec::new()),
             vmm_provenance: parking_lot::Mutex::new(super::provenance::VmmProvenance::default()),
             poisoned: std::sync::OnceLock::new(),
+            copy_tier: parking_lot::Mutex::new(None),
         })
     }
 
@@ -1604,6 +1612,14 @@ impl Drop for HsaBackend {
         // owner (same contract as `CudaBackend::drop`).
         for (h, _) in self.slab_pool.lock().drain(..) {
             crate::memory::vmm::VmmOps::release(self, h);
+        }
+        if let Some(mut tier) = self.copy_tier.lock().take() {
+            for (_, sig) in tier.signals.drain() {
+                unsafe { (self.shared.drv.hsa_signal_destroy)(sig) };
+            }
+            for sig in tier.spare.drain(..) {
+                unsafe { (self.shared.drv.hsa_signal_destroy)(sig) };
+            }
         }
         if let Some(fs) = self.fill_stage.lock().take() {
             unsafe { (self.shared.drv.hsa_amd_memory_pool_free)(fs.ptr) };
@@ -4501,6 +4517,196 @@ impl crate::memory::vmm::VmmOps for HsaBackend {
             released += b;
         }
         released
+    }
+
+    fn host_tier_alloc(&self, bytes: u64) -> Result<u64> {
+        self.guard()?;
+        let alloc_bytes = (bytes as usize).max(64);
+        let mut ptr: *mut c_void = std::ptr::null_mut();
+        let rc = unsafe {
+            (self.shared.drv.hsa_amd_memory_pool_allocate)(
+                self.fine_pool,
+                alloc_bytes,
+                0,
+                &mut ptr,
+            )
+        };
+        self.check(
+            rc,
+            &format!("hsa_amd_memory_pool_allocate (fine, {alloc_bytes} bytes)"),
+        )?;
+        let rc = unsafe {
+            (self.shared.drv.hsa_amd_agents_allow_access)(
+                self.agents.len() as u32,
+                self.agents.as_ptr(),
+                std::ptr::null(),
+                ptr,
+            )
+        };
+        if rc != HSA_STATUS_SUCCESS {
+            unsafe { (self.shared.drv.hsa_amd_memory_pool_free)(ptr) };
+            return Err(self.fault(rc, "hsa_amd_agents_allow_access (host tier)"));
+        }
+        Ok(ptr as u64)
+    }
+
+    fn host_tier_free(&self, ptr: u64, _bytes: u64) {
+        let rc = unsafe { (self.shared.drv.hsa_amd_memory_pool_free)(ptr as *mut c_void) };
+        if rc != HSA_STATUS_SUCCESS {
+            tracing::warn!(rc, ptr, "hsa_amd_memory_pool_free (vmm host tier) failed");
+        }
+    }
+
+    fn copy_dtoh_async(&self, host_ptr: u64, va: u64, bytes: u64) -> Result<u64> {
+        self.guard()?;
+        let mut tier_lock = self.copy_tier.lock();
+        let tier = match tier_lock.as_mut() {
+            Some(t) => t,
+            None => tier_lock.insert(HsaCopyTier {
+                signals: rustc_hash::FxHashMap::default(),
+                spare: Vec::new(),
+                failed: rustc_hash::FxHashSet::default(),
+            }),
+        };
+        let sig = match tier.spare.pop() {
+            Some(s) => {
+                unsafe { (self.shared.drv.hsa_signal_store_screlease)(s, 1) };
+                s
+            }
+            None => {
+                let mut s = HsaSignal { handle: 0 };
+                let rc = unsafe {
+                    (self.shared.drv.hsa_signal_create)(1, 0, std::ptr::null(), &mut s)
+                };
+                self.check(rc, "hsa_signal_create (vmm spill)")?;
+                s
+            }
+        };
+        let rc = unsafe {
+            (self.shared.drv.hsa_amd_memory_async_copy)(
+                host_ptr as *mut c_void,
+                self.cpu_agent,
+                va as *const c_void,
+                self.agent,
+                bytes as usize,
+                0,
+                std::ptr::null(),
+                sig,
+            )
+        };
+        let fence = sig.handle as u64;
+        if rc != HSA_STATUS_SUCCESS {
+            tier.spare.push(sig);
+            return Err(self.fault(rc, "hsa_amd_memory_async_copy (vmm spill D2H)"));
+        }
+        tier.signals.insert(fence, sig);
+        Ok(fence)
+    }
+
+    fn fence_done(&self, fence: u64) -> Result<bool> {
+        let mut tier_lock = self.copy_tier.lock();
+        let Some(tier) = tier_lock.as_mut() else {
+            return Err(RuntimeError::Rejected("vmm spill: no copy tier".into()));
+        };
+        if tier.failed.contains(&fence) {
+            return Err(RuntimeError::Device("vmm spill: unfenced copy".into()));
+        }
+        let Some(&sig) = tier.signals.get(&fence) else {
+            return Err(RuntimeError::Device("vmm spill: unknown fence".into()));
+        };
+        let val = unsafe { (self.shared.drv.hsa_signal_load_scacquire)(sig) };
+        if val >= 1 {
+            return Ok(false);
+        }
+        let sig = tier.signals.remove(&fence).expect("checked above");
+        tier.spare.push(sig);
+        Ok(true)
+    }
+
+    fn fence_wait(&self, fence: u64) -> Result<()> {
+        let mut tier_lock = self.copy_tier.lock();
+        let Some(tier) = tier_lock.as_mut() else {
+            return Err(RuntimeError::Rejected("vmm spill: no copy tier".into()));
+        };
+        let Some(sig) = tier.signals.remove(&fence) else {
+            return Err(RuntimeError::Device("vmm spill: unknown fence".into()));
+        };
+        if tier.failed.remove(&fence) {
+            tier.spare.push(sig);
+            return Err(RuntimeError::Device("vmm spill: unfenced copy".into()));
+        }
+        unsafe {
+            (self.shared.drv.hsa_signal_wait_scacquire)(
+                sig,
+                HSA_SIGNAL_CONDITION_LT,
+                1,
+                u64::MAX,
+                HSA_WAIT_STATE_BLOCKED,
+            );
+        }
+        tier.spare.push(sig);
+        Ok(())
+    }
+
+    fn copy_htod(&self, va: u64, host_ptr: u64, bytes: u64) -> Result<()> {
+        self.guard()?;
+        let mut tier_lock = self.copy_tier.lock();
+        let tier = match tier_lock.as_mut() {
+            Some(t) => t,
+            None => tier_lock.insert(HsaCopyTier {
+                signals: rustc_hash::FxHashMap::default(),
+                spare: Vec::new(),
+                failed: rustc_hash::FxHashSet::default(),
+            }),
+        };
+        let sig = match tier.spare.pop() {
+            Some(s) => {
+                unsafe { (self.shared.drv.hsa_signal_store_screlease)(s, 1) };
+                s
+            }
+            None => {
+                let mut s = HsaSignal { handle: 0 };
+                let rc = unsafe {
+                    (self.shared.drv.hsa_signal_create)(1, 0, std::ptr::null(), &mut s)
+                };
+                self.check(rc, "hsa_signal_create (vmm restore)")?;
+                s
+            }
+        };
+        drop(tier_lock);
+        let rc = unsafe {
+            (self.shared.drv.hsa_amd_memory_async_copy)(
+                va as *mut c_void,
+                self.agent,
+                host_ptr as *const c_void,
+                self.cpu_agent,
+                bytes as usize,
+                0,
+                std::ptr::null(),
+                sig,
+            )
+        };
+        if rc != HSA_STATUS_SUCCESS {
+            let mut tier_lock = self.copy_tier.lock();
+            if let Some(tier) = tier_lock.as_mut() {
+                tier.spare.push(sig);
+            }
+            return Err(self.fault(rc, "hsa_amd_memory_async_copy (vmm restore H2D)"));
+        }
+        unsafe {
+            (self.shared.drv.hsa_signal_wait_scacquire)(
+                sig,
+                HSA_SIGNAL_CONDITION_LT,
+                1,
+                u64::MAX,
+                HSA_WAIT_STATE_BLOCKED,
+            );
+        }
+        let mut tier_lock = self.copy_tier.lock();
+        if let Some(tier) = tier_lock.as_mut() {
+            tier.spare.push(sig);
+        }
+        Ok(())
     }
 }
 

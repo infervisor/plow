@@ -20,6 +20,10 @@ the markers is hand-written.
 ```bash
 nix develop --command env \
   JOBS=32 \
+  PLOW_MOE_GLU_KW=1 \
+  PLOW_MOE_PF_DOWN_SWEEP=1 \
+  PLOW_MOE_PREFILL=1 \
+  PLOW_MXFP4=1 \
   PLOW_UNISEG=0 \
   scripts/build_gfx950.sh \
   $OBJDIR
@@ -65,9 +69,18 @@ plowrt serve --model infervisor/deepseek-v4.1:gfx950-mi350x-tp8-fp8 --port 8080
 
 # Equivalently, from a locally built asset directory:
 nix develop --command env \
+  PLOW_AMD_KARG_CHAIN_FLUSH=1 \
+  PLOW_AMD_PACKED_SEG_MAJOR=1 \
+  PLOW_AMD_SNAP_KERNEL=1 \
   PLOW_DECODE_MIN_RUNG=1 \
+  PLOW_PF_BACK_TO_BACK=1 \
+  PLOW_PF_HOLD=8192 \
+  PLOW_PF_INTERLEAVE=8192 \
+  PLOW_PREFIX_ARM_END=1 \
   PLOW_STATE_CLEAR_DEVICE=1 \
   PLOW_TP_AGREE_EVERY=1 \
+  PLOW_TP_PAR_HOST=1 \
+  PLOW_TP_RANK_POOL=1 \
   ./target/release/plowrt serve --assets $ASSETS --port 8080
 ```
 <!-- /plow:recipe:serve -->
