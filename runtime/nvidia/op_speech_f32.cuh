@@ -1300,6 +1300,192 @@ __device__ __forceinline__ unsigned sp_w_width(unsigned M, unsigned N, unsigned 
     return c128 <= c64 ? 128u : 64u;
 }
 
+/* ---- sm_120 reference-split DenseGemm (flag 128): 64 x BN tiles, 8 warps as 4 (M) x 2 (N) of
+ * 16 x BN/2, so a warp keeps BN/16 accumulators in flight (two warps per SM sub-partition). B
+ * through a 3-stage cp.async ring; A (f32) one k-step ahead in registers, packed to bf16 into a
+ * double buffer read with ldmatrix. Per output the k order is sp_tc_tile_async's (a fresh partial
+ * per 64 k folded in order, reference chunks folded as there): the same bits. rtx-5090, 832 rows,
+ * 91-row references, us (64x64 sp_tc_tile_async -> this): d 896 q 39.0 -> 20.5, fc1 78.1 -> 57.4,
+ * fc2 117.3 -> 57.3, conv_out 241.6 -> 114.6; d 1024 43.1 -> 22.5, 86.7 -> 62.8, 133.1 -> 63.6. */
+#define SPN_NS 3u
+#define SPN_LD 72u
+template <unsigned BN>
+struct SpN {
+    static constexpr unsigned NJ = BN / 16, NQ = (NJ + 1) / 2, B_BYTES = BN * SPN_LD * 2,
+                              A_BYTES = SPT_BM * SPN_LD * 2, RING = SPN_NS * B_BYTES, LDO = BN + 8;
+    static_assert(BN % 16 == 0, "two warps of whole n8 columns");
+    static_assert(RING + 2 * A_BYTES <= SP_ARENA_FLOATS * 4 && SPT_BM * LDO * 4 <= SP_ARENA_FLOATS * 4,
+                  "reference tile stages");
+};
+__device__ __forceinline__ void sp_ldsm2(unsigned (&r)[4], const void* p) {
+    asm volatile("ldmatrix.sync.aligned.m8n8.x2.shared.b16 {%0,%1}, [%2];\n"
+                 : "=r"(r[0]), "=r"(r[1])
+                 : "r"((unsigned)__cvta_generic_to_shared(p)));
+}
+template <unsigned BN>
+static __device__ __forceinline__ void sp_tcn_tile(unsigned m0, unsigned n0, unsigned M, unsigned N, unsigned K,
+                                                   const SpRowF32& la, const SpRowBf16& lb, float* arena,
+                                                   float (&acc)[SpN<BN>::NJ][4], const SpRefSplit& rs) {
+    using C = SpN<BN>;
+    constexpr unsigned NJ = C::NJ;
+    char* smem = (char*)arena;
+    __nv_bfloat16* abuf = (__nv_bfloat16*)(smem + C::RING);
+    const unsigned tid = threadIdx.x, lane = tid & 31u, warp = tid >> 5;
+    const unsigned wm = (warp & 3u) * 16u, wn = (warp >> 2) * (BN / 2), g = lane >> 2;
+    const unsigned nk = (K + 63u) / 64u;
+    float4 av[4];
+    auto a_fetch = [&](unsigned kt) {
+#pragma unroll
+        for (unsigned p = 0; p < 4; p++) {
+            const unsigned e = tid + p * PLOW_NV_THREADS, r = e >> 4, k = kt * 64u + (e & 15u) * 4u;
+            av[p] = kt < nk && m0 + r < M && k < K ? __ldcg((const float4*)(la.p + (size_t)(m0 + r) * la.k + k))
+                                                   : make_float4(0.f, 0.f, 0.f, 0.f);
+        }
+    };
+    auto a_store = [&](unsigned buf) {
+#pragma unroll
+        for (unsigned p = 0; p < 4; p++) {
+            const unsigned e = tid + p * PLOW_NV_THREADS;
+            uint2 u;
+            u.x = sp_pack_bf16(make_float2(av[p].x, av[p].y));
+            u.y = sp_pack_bf16(make_float2(av[p].z, av[p].w));
+            *(uint2*)(abuf + buf * (SPT_BM * SPN_LD) + (e >> 4) * SPN_LD + (e & 15u) * 4u) = u;
+        }
+    };
+    auto issue_b = [&](unsigned kt) {
+        if (kt < nk) {
+            __nv_bfloat16* bs = (__nv_bfloat16*)(smem + (kt % SPN_NS) * C::B_BYTES);
+            const unsigned k0 = kt * 64u;
+#pragma unroll
+            for (unsigned p = 0; p < (BN * 8u + PLOW_NV_THREADS - 1) / PLOW_NV_THREADS; p++) {
+                const unsigned e = tid + p * PLOW_NV_THREADS, r = e >> 3, c = (e & 7u) * 8u;
+                const bool ok = n0 + r < N && k0 + c < K;
+                if (e < BN * 8u) sp_cp16(bs + r * SPN_LD + c, ok ? lb.p + (size_t)(n0 + r) * lb.stride + k0 + c : lb.p, ok);
+            }
+        }
+        asm volatile("cp.async.commit_group;\n" ::);
+    };
+    /* Per row half: the k-step after which its reference chunk folds (nk: never). */
+    unsigned chunk[2], fold[2];
+#pragma unroll
+    for (unsigned h = 0; h < 2; h++) {
+        const unsigned row = m0 + wm + g + h * 8u;
+        chunk[h] = row < M ? sp_ref_chunk(rs.rows[row], N, K, rs.ncu) : nk;
+        fold[h] = chunk[h] - 1u;
+    }
+    float tot[NJ][4];
+#pragma unroll
+    for (unsigned j = 0; j < NJ; j++)
+#pragma unroll
+        for (unsigned r = 0; r < 4; r++) acc[j][r] = tot[j][r] = 0.f;
+    a_fetch(0u);
+    a_store(0u);
+#pragma unroll
+    for (unsigned s = 0; s + 1 < SPN_NS; s++) issue_b(s);
+    for (unsigned kt = 0; kt < nk; kt++) {
+        asm volatile("cp.async.wait_group %0;\n" ::"n"(SPN_NS - 2));
+        __syncthreads();
+        issue_b(kt + SPN_NS - 1);
+        a_fetch(kt + 1u);
+        const __nv_bfloat16* bs = (const __nv_bfloat16*)(smem + (kt % SPN_NS) * C::B_BYTES);
+        const __nv_bfloat16* ab = abuf + (kt & 1u) * (SPT_BM * SPN_LD);
+        float part[NJ][4];
+#pragma unroll
+        for (unsigned j = 0; j < NJ; j++)
+#pragma unroll
+            for (unsigned r = 0; r < 4; r++) part[j][r] = 0.f;
+#pragma unroll
+        for (unsigned ks = 0; ks < 64u; ks += 16) {
+            unsigned a[4], b[C::NQ][4];
+            sp_ldsm4(a, ab + (wm + (lane & 15u)) * SPN_LD + ks + (lane >> 4) * 8u);
+#pragma unroll
+            for (unsigned q = 0; q < C::NQ; q++) {
+                const __nv_bfloat16* bp =
+                    bs + (wn + q * 16u + (lane & 7u) + ((lane >> 4) << 3)) * SPN_LD + ks + ((lane >> 3) & 1u) * 8u;
+                if (2 * q + 1 < NJ) sp_ldsm4(b[q], bp);
+                else sp_ldsm2(b[q], bp);
+            }
+#pragma unroll
+            for (unsigned j = 0; j < NJ; j++)
+                sp_mma_bf16x(part[j], a, b[j >> 1][(j & 1u) * 2], b[j >> 1][(j & 1u) * 2 + 1]);
+        }
+        if (kt + 1 < nk) a_store((kt + 1u) & 1u);
+#pragma unroll
+        for (unsigned j = 0; j < NJ; j++)
+#pragma unroll
+            for (unsigned r = 0; r < 4; r++) acc[j][r] = __fadd_rn(acc[j][r], part[j][r]);
+#pragma unroll
+        for (unsigned h = 0; h < 2; h++) {
+            if (chunk[h] >= nk || (kt != fold[h] && kt + 1u < nk)) continue;
+            fold[h] += chunk[h];
+#pragma unroll
+            for (unsigned j = 0; j < NJ; j++)
+#pragma unroll
+                for (unsigned r = 2 * h; r < 2 * h + 2; r++) {
+                    tot[j][r] = __fadd_rn(tot[j][r], acc[j][r]);
+                    acc[j][r] = 0.f;
+                }
+        }
+    }
+#pragma unroll
+    for (unsigned h = 0; h < 2; h++)
+        if (chunk[h] < nk)
+#pragma unroll
+            for (unsigned j = 0; j < NJ; j++)
+#pragma unroll
+                for (unsigned r = 2 * h; r < 2 * h + 2; r++) acc[j][r] = tot[j][r];
+    asm volatile("cp.async.wait_group 0;\n" ::);
+    __syncthreads();
+}
+/* sp_tc_store for the 64 x BN tile. */
+template <unsigned BN, class EP>
+static __device__ __forceinline__ void sp_tcn_store(unsigned m0, unsigned n0, unsigned M, unsigned N, const EP& ep,
+                                                    const float (&acc)[SpN<BN>::NJ][4], float* arena) {
+    constexpr unsigned LDO = SpN<BN>::LDO, GROUPS = SPT_BM * BN / 4u;
+    const unsigned lane = threadIdx.x & 31u, warp = threadIdx.x >> 5;
+    const unsigned mb = (warp & 3u) * 16u + (lane >> 2), nb = (warp >> 2) * (BN / 2) + (lane & 3u) * 2u;
+#pragma unroll
+    for (unsigned j = 0; j < SpN<BN>::NJ; j++)
+#pragma unroll
+        for (unsigned h = 0; h < 2; h++)
+            *(float2*)(arena + (mb + h * 8u) * LDO + nb + j * 8u) = make_float2(acc[j][2 * h], acc[j][2 * h + 1]);
+    __syncthreads();
+    const unsigned rows = min(SPT_BM, M - m0), cols = min(BN, N - n0);
+    constexpr unsigned G = (GROUPS + PLOW_NV_THREADS - 1) / PLOW_NV_THREADS;
+    float4 ld[G];
+#pragma unroll
+    for (unsigned i = 0; i < G; i++) {
+        const unsigned e = threadIdx.x + i * PLOW_NV_THREADS, r = e / (BN / 4u), c = (e % (BN / 4u)) * 4u;
+        if (e < GROUPS && r < rows && c < cols) ld[i] = sp_ep4_load(ep, m0 + r, n0 + c, min(4u, cols - c));
+    }
+#pragma unroll
+    for (unsigned i = 0; i < G; i++) {
+        const unsigned e = threadIdx.x + i * PLOW_NV_THREADS, r = e / (BN / 4u), c = (e % (BN / 4u)) * 4u;
+        if (e < GROUPS && r < rows && c < cols) sp_ep4(ep, m0 + r, n0 + c, arena + r * LDO + c, min(4u, cols - c), ld[i]);
+    }
+    __syncthreads();
+}
+template <unsigned BN, class EP>
+static __device__ __forceinline__ void sp_tcn_gemm(unsigned M, unsigned N, unsigned K, const SpRowF32& la,
+                                                   const SpRowBf16& lb, const EP& ep, unsigned slice, unsigned nblk,
+                                                   float* arena, const SpRefSplit& rs) {
+    const unsigned tn = (N + BN - 1) / BN, tiles = ((M + SPT_BM - 1) / SPT_BM) * tn;
+    for (unsigned tile = slice; tile < tiles; tile += nblk) {
+        const unsigned m0 = (tile / tn) * SPT_BM, n0 = (tile % tn) * BN;
+        float acc[SpN<BN>::NJ][4];
+        sp_tcn_tile<BN>(m0, n0, M, N, K, la, lb, arena, acc, rs);
+        sp_tcn_store<BN>(m0, n0, M, N, ep, acc, arena);
+    }
+}
+/* 160-wide tiles when their rounds over the blocks cost no more than 80-wide ones (fc1, N = 4 d:
+ * 2 rounds of 160 vs 4 of 80; the projections, N = d, take one round of 80). */
+__device__ __forceinline__ bool sp_tcn_wide(unsigned M, unsigned N, unsigned nblk) {
+    const unsigned mt = (M + SPT_BM - 1) / SPT_BM;
+    const unsigned r80 = (mt * ((N + 79u) / 80u) + nblk - 1u) / nblk;
+    const unsigned r160 = (mt * ((N + 159u) / 160u) + nblk - 1u) / nblk;
+    return r160 * 2u <= r80;
+}
+
 /* DenseGemmF32 (170). flags: 1 = bf16-round, 2 = bf16 erf-GELU (implies the round), 4 = bf16
  * weights, 8 = A (and f32 W) bf16-representable -> bf16 tensor cores, 16 = 3xTF32 tensor cores.
  * i5 != 0: weight row stride, and i6 < i5 names a one-hot weight column added in. t4: optional
@@ -1341,6 +1527,14 @@ static __device__ __noinline__ void d_dense_gemm_f32(float* __restrict__ out, co
     if (flags & 4u) {
         const __nv_bfloat16* wb = (const __nv_bfloat16*)w;
         if ((flags & 8u) && (k & 7u) == 0 && (stride & 7u) == 0 && sp_aligned(x, 16) && sp_aligned(wb, 16)) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ == 1200
+            if (rs && !ln) {
+                const SpRowBf16 lb{wb, k, stride, true};
+                if (sp_tcn_wide(m, n, nblk)) sp_tcn_gemm<160>(m, n, k, la, lb, ep, slice, nblk, arena, *rs);
+                else sp_tcn_gemm<80>(m, n, k, la, lb, ep, slice, nblk, arena, *rs);
+                return;
+            }
+#endif
             sp_tc_gemm<false, true>(m, n, k, la, SpRowBf16{wb, k, stride, true}, ep, slice, nblk, arena,
                                     rs ? nullptr : scratch, ln, rs);
             return;
