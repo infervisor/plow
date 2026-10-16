@@ -689,7 +689,9 @@ pub fn emit_kda_mixer(
             crate::emit_is_amd() && crate::amd_target::active().1 == hwspec::IsaLevel::Gfx950
         }),
         crate::emit_config::active().kda_decode_fused
-            && t >= crate::emit_config::active().kda_decode_fused_min_rows.unwrap_or(1)
+            && t >= crate::emit_config::active()
+                .kda_decode_fused_min_rows
+                .unwrap_or(1)
             && crate::amd_target::active().1 == hwspec::IsaLevel::Gfx950,
         seq_rows,
     )
@@ -915,72 +917,7 @@ fn emit_kda_mixer_ex(
         (c, c, c, c_gb)
     } else {
         match (w.gate, fuse_qkvg(t, hi)) {
-        (OutputGate::FullRank { g_proj }, true) => {
-            let f = b.emit(DevOp::GemvQkvg, all.clone(), &[c_ln], |d| {
-                d.t[0] = raw[0];
-                d.t[1] = x;
-                d.t[2] = w.q_proj;
-                d.t[3] = raw[1];
-                d.t[4] = w.k_proj;
-                d.t[5] = raw[2];
-                d.t[6] = w.v_proj;
-                d.t[7] = g_raw;
-                d.i[0] = t;
-                d.i[1] = p;
-                d.i[2] = hi;
-                d.i[3] = p;
-                d.i[4] = p;
-                d.i[5] = p;
-                // The ninth pointer. `t[8]` is full; `DevOp::GemvQkvg` states why the demoted
-                // operand is a weight and not an output.
-                d.i[6] = g_proj;
-            });
-            (f, f, f, f)
-        }
-        (OutputGate::FullRank { g_proj }, false) => (
-            gemv(b, raw[0], x, w.q_proj, p, hi, c_ln),
-            gemv(b, raw[1], x, w.k_proj, p, hi, c_ln),
-            gemv(b, raw[2], x, w.v_proj, p, hi, c_ln),
-            gemv(b, g_raw, x, g_proj, p, hi, c_ln),
-        ),
-        (OutputGate::LowRank { g_a_proj, g_b_proj }, false) if kda_group.is_some() => {
-            // PLOW_GLM_KDA_PROJ_GROUP: q/k/v/g_a/f_a/b (all from x) as one GemmSmall group,
-            // then g_b/f_b (K = head_dim) as a second. Bit-identical (Builder::emit_gemm_small_group).
-            let ga = bft(b, format!("{a}g_a"), tt * hd as u64);
-            let g1 = b
-                .emit_gemm_small_group(
-                    t,
-                    &[
-                        (raw[0], x, w.q_proj, p, hi),
-                        (raw[1], x, w.k_proj, p, hi),
-                        (raw[2], x, w.v_proj, p, hi),
-                        (ga, x, g_a_proj, hd, hi),
-                        (fa, x, w.f_a_proj, hd, hi),
-                        (b_raw, x, w.b_proj, nh, hi),
-                    ],
-                    &[c_ln],
-                )
-                .expect("kda_group checked the split form");
-            let g2 = b
-                .emit_gemm_small_group(
-                    t,
-                    &[(g_raw, ga, g_b_proj, p, hd), (f_raw, fa, w.f_b_proj, p, hd)],
-                    &[g1],
-                )
-                .expect("kda_group checked the split form");
-            kda_group = Some((g1, g2));
-            (g1, g1, g1, g2)
-        }
-        (OutputGate::LowRank { g_a_proj, g_b_proj }, fuse_qkv) => {
-            // No fourth (gate) stream to fuse — GLM5-Next's gate is low-rank, so it rides the
-            // same two-GEMV shape as the forget gate (P5/P7) below, not the QKV fusion. q/k/v
-            // still fuse into ONE [`DevOp::GemvQkv`] under the same decode-only/LDS-arena bound
-            // `fuse_qkvg` already checks — GemvQkv's arena is a strict subset of GemvQkvg's
-            // (three streams, not four), so the same gate is conservative, not approximate.
-            let ga = bft(b, format!("{a}g_a"), tt * hd as u64);
-            // PLOW_GLM_KDA_QKVG_R1: the low-rank gate's down-projection g_a rides the q/k/v sweep
-            // as GemvQkvg's fourth stream (Ng = head_dim), so g_b no longer waits on its own packet.
-            if fuse_qkv && crate::emit_config::active().glm_kda_qkvg_r1 {
+            (OutputGate::FullRank { g_proj }, true) => {
                 let f = b.emit(DevOp::GemvQkvg, all.clone(), &[c_ln], |d| {
                     d.t[0] = raw[0];
                     d.t[1] = x;
@@ -989,58 +926,123 @@ fn emit_kda_mixer_ex(
                     d.t[4] = w.k_proj;
                     d.t[5] = raw[2];
                     d.t[6] = w.v_proj;
-                    d.t[7] = ga;
+                    d.t[7] = g_raw;
                     d.i[0] = t;
                     d.i[1] = p;
                     d.i[2] = hi;
                     d.i[3] = p;
                     d.i[4] = p;
-                    d.i[5] = hd;
-                    d.i[6] = g_a_proj;
+                    d.i[5] = p;
+                    // The ninth pointer. `t[8]` is full; `DevOp::GemvQkvg` states why the demoted
+                    // operand is a weight and not an output.
+                    d.i[6] = g_proj;
                 });
-                let c_gb = gemv(b, g_raw, ga, g_b_proj, p, hd, f);
-                return_qkvg = Some((f, c_gb));
+                (f, f, f, f)
             }
-            let (cq, ck, cv) = if let Some((f, _)) = return_qkvg {
-                (f, f, f)
-            } else if fuse_qkv {
-                let f = b.emit(DevOp::GemvQkv, all.clone(), &[c_ln], |d| {
-                    d.t[0] = raw[0];
-                    d.t[1] = x;
-                    d.t[2] = w.q_proj;
-                    d.t[3] = raw[1];
-                    d.t[4] = w.k_proj;
-                    d.t[5] = raw[2];
-                    d.t[6] = w.v_proj;
-                    d.i[0] = t;
-                    d.i[1] = p;
-                    d.i[2] = hi;
-                    d.i[3] = p;
-                    d.i[4] = p;
-                });
-                (f, f, f)
-            } else {
-                (
-                    gemv(b, raw[0], x, w.q_proj, p, hi, c_ln),
-                    gemv(b, raw[1], x, w.k_proj, p, hi, c_ln),
-                    gemv(b, raw[2], x, w.v_proj, p, hi, c_ln),
-                )
-            };
-            // g_a: down-projection to head_dim, mirrors `fa`/`c_fa` below exactly.
-            let c_gb = if let Some((_, c_gb)) = return_qkvg {
-                c_gb
-            } else {
-                let c_ga = gemv(b, ga, x, g_a_proj, hd, hi, c_ln);
-                if seq_rows && t > 1 && crate::emit_config::active().glm_kda_lt_order {
-                    defer_gb = Some((c_ga, ga, g_b_proj));
-                    c_ga
-                } else {
-                    gemv(b, g_raw, ga, g_b_proj, p, hd, c_ga)
+            (OutputGate::FullRank { g_proj }, false) => (
+                gemv(b, raw[0], x, w.q_proj, p, hi, c_ln),
+                gemv(b, raw[1], x, w.k_proj, p, hi, c_ln),
+                gemv(b, raw[2], x, w.v_proj, p, hi, c_ln),
+                gemv(b, g_raw, x, g_proj, p, hi, c_ln),
+            ),
+            (OutputGate::LowRank { g_a_proj, g_b_proj }, false) if kda_group.is_some() => {
+                // PLOW_GLM_KDA_PROJ_GROUP: q/k/v/g_a/f_a/b (all from x) as one GemmSmall group,
+                // then g_b/f_b (K = head_dim) as a second. Bit-identical (Builder::emit_gemm_small_group).
+                let ga = bft(b, format!("{a}g_a"), tt * hd as u64);
+                let g1 = b
+                    .emit_gemm_small_group(
+                        t,
+                        &[
+                            (raw[0], x, w.q_proj, p, hi),
+                            (raw[1], x, w.k_proj, p, hi),
+                            (raw[2], x, w.v_proj, p, hi),
+                            (ga, x, g_a_proj, hd, hi),
+                            (fa, x, w.f_a_proj, hd, hi),
+                            (b_raw, x, w.b_proj, nh, hi),
+                        ],
+                        &[c_ln],
+                    )
+                    .expect("kda_group checked the split form");
+                let g2 = b
+                    .emit_gemm_small_group(
+                        t,
+                        &[(g_raw, ga, g_b_proj, p, hd), (f_raw, fa, w.f_b_proj, p, hd)],
+                        &[g1],
+                    )
+                    .expect("kda_group checked the split form");
+                kda_group = Some((g1, g2));
+                (g1, g1, g1, g2)
+            }
+            (OutputGate::LowRank { g_a_proj, g_b_proj }, fuse_qkv) => {
+                // No fourth (gate) stream to fuse — GLM5-Next's gate is low-rank, so it rides the
+                // same two-GEMV shape as the forget gate (P5/P7) below, not the QKV fusion. q/k/v
+                // still fuse into ONE [`DevOp::GemvQkv`] under the same decode-only/LDS-arena bound
+                // `fuse_qkvg` already checks — GemvQkv's arena is a strict subset of GemvQkvg's
+                // (three streams, not four), so the same gate is conservative, not approximate.
+                let ga = bft(b, format!("{a}g_a"), tt * hd as u64);
+                // PLOW_GLM_KDA_QKVG_R1: the low-rank gate's down-projection g_a rides the q/k/v sweep
+                // as GemvQkvg's fourth stream (Ng = head_dim), so g_b no longer waits on its own packet.
+                if fuse_qkv && crate::emit_config::active().glm_kda_qkvg_r1 {
+                    let f = b.emit(DevOp::GemvQkvg, all.clone(), &[c_ln], |d| {
+                        d.t[0] = raw[0];
+                        d.t[1] = x;
+                        d.t[2] = w.q_proj;
+                        d.t[3] = raw[1];
+                        d.t[4] = w.k_proj;
+                        d.t[5] = raw[2];
+                        d.t[6] = w.v_proj;
+                        d.t[7] = ga;
+                        d.i[0] = t;
+                        d.i[1] = p;
+                        d.i[2] = hi;
+                        d.i[3] = p;
+                        d.i[4] = p;
+                        d.i[5] = hd;
+                        d.i[6] = g_a_proj;
+                    });
+                    let c_gb = gemv(b, g_raw, ga, g_b_proj, p, hd, f);
+                    return_qkvg = Some((f, c_gb));
                 }
-            };
-            (cq, ck, cv, c_gb)
+                let (cq, ck, cv) = if let Some((f, _)) = return_qkvg {
+                    (f, f, f)
+                } else if fuse_qkv {
+                    let f = b.emit(DevOp::GemvQkv, all.clone(), &[c_ln], |d| {
+                        d.t[0] = raw[0];
+                        d.t[1] = x;
+                        d.t[2] = w.q_proj;
+                        d.t[3] = raw[1];
+                        d.t[4] = w.k_proj;
+                        d.t[5] = raw[2];
+                        d.t[6] = w.v_proj;
+                        d.i[0] = t;
+                        d.i[1] = p;
+                        d.i[2] = hi;
+                        d.i[3] = p;
+                        d.i[4] = p;
+                    });
+                    (f, f, f)
+                } else {
+                    (
+                        gemv(b, raw[0], x, w.q_proj, p, hi, c_ln),
+                        gemv(b, raw[1], x, w.k_proj, p, hi, c_ln),
+                        gemv(b, raw[2], x, w.v_proj, p, hi, c_ln),
+                    )
+                };
+                // g_a: down-projection to head_dim, mirrors `fa`/`c_fa` below exactly.
+                let c_gb = if let Some((_, c_gb)) = return_qkvg {
+                    c_gb
+                } else {
+                    let c_ga = gemv(b, ga, x, g_a_proj, hd, hi, c_ln);
+                    if seq_rows && t > 1 && crate::emit_config::active().glm_kda_lt_order {
+                        defer_gb = Some((c_ga, ga, g_b_proj));
+                        c_ga
+                    } else {
+                        gemv(b, g_raw, ga, g_b_proj, p, hd, c_ga)
+                    }
+                };
+                (cq, ck, cv, c_gb)
+            }
         }
-    }
     };
     let (c_fa, c_bb) = if let Some((g1, _)) = kda_group {
         (g1, g1)
@@ -1048,21 +1050,21 @@ fn emit_kda_mixer_ex(
         (c, c)
     } else {
         emit_control_linears(
-        b,
-        fa,
-        b_raw,
-        x,
-        w.f_a_proj,
-        w.b_proj,
-        t,
-        hd,
-        nh,
-        hi,
-        n_cu,
-        seq_rows,
-        c_ln,
-        t == 1 && crate::whole_graph_parallel_linear2(hd, nh, hi),
-    )
+            b,
+            fa,
+            b_raw,
+            x,
+            w.f_a_proj,
+            w.b_proj,
+            t,
+            hd,
+            nh,
+            hi,
+            n_cu,
+            seq_rows,
+            c_ln,
+            t == 1 && crate::whole_graph_parallel_linear2(hd, nh, hi),
+        )
     };
     let c_g = match defer_gb {
         Some((c_ga, ga, g_b_proj)) => gemv(b, g_raw, ga, g_b_proj, p, hd, c_ga),
@@ -2838,7 +2840,11 @@ mod tests {
         for old in [DevOp::KdaConv3, DevOp::KdaStateStepG, DevOp::KdaGatedNorm] {
             assert_eq!(n(&wide, old), 0, "{old:?}");
         }
-        let v3 = wide.insts.iter().find(|i| i.op == DevOp::KdaDecodeFused as u16).unwrap();
+        let v3 = wide
+            .insts
+            .iter()
+            .find(|i| i.op == DevOp::KdaDecodeFused as u16)
+            .unwrap();
         assert_eq!(v3.i, [8, 12, 128, 8, 4, 3, 1, 3]);
         assert_eq!(wide.tensors[v3.t[7] as usize].bytes, 60);
         let one = build_decode_fused_probe(&c, 1, false, false);

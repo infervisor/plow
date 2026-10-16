@@ -111,8 +111,14 @@ mod hsa {
 
     pub fn run() -> Result<(), Box<dyn std::error::Error>> {
         let mut args = std::env::args().skip(1);
-        let blob = PathBuf::from(args.next().ok_or("usage: rung_run <blob.pkt> <hsaco-dir> ...")?);
-        let hsaco = PathBuf::from(args.next().ok_or("usage: rung_run <blob.pkt> <hsaco-dir> ...")?);
+        let blob = PathBuf::from(
+            args.next()
+                .ok_or("usage: rung_run <blob.pkt> <hsaco-dir> ...")?,
+        );
+        let hsaco = PathBuf::from(
+            args.next()
+                .ok_or("usage: rung_run <blob.pkt> <hsaco-dir> ...")?,
+        );
         let mut checkpoint: Option<PathBuf> = None;
         let mut tp = 8u32;
         let mut iters = 10u32;
@@ -182,11 +188,9 @@ mod hsa {
         let x_bytes = g.rank(0).tensor_bytes(&entry).ok_or_else(|| {
             format!("this packet has no `{entry}`; pass --entry with the right name")
         })? as usize;
-        let out_bytes = g
-            .rank(0)
-            .tensor_bytes(&exit)
-            .ok_or_else(|| format!("this packet has no `{exit}`; pass --exit with the right name"))?
-            as usize;
+        let out_bytes = g.rank(0).tensor_bytes(&exit).ok_or_else(|| {
+            format!("this packet has no `{exit}`; pass --exit with the right name")
+        })? as usize;
         println!("entry {entry} = {x_bytes} B, exit {exit} = {out_bytes} B");
         if segs != usize::MAX {
             println!("  HALTING after {segs} segments -- this is a PREFIX of the layer, so the exit and every probe past the cut are whatever the arena held.");
@@ -206,15 +210,14 @@ mod hsa {
             // Positions 0..T for the rotary tables, and the attended length. A rung has no KV
             // history: it attends over its own rows, so kv_len is the bucket width.
             if let Some(b) = g.rank(r).tensor_bytes("in.pos") {
-                let pos: Vec<u8> = (0..b / 4)
-                    .flat_map(|i| (i as u32).to_le_bytes())
-                    .collect();
+                let pos: Vec<u8> = (0..b / 4).flat_map(|i| (i as u32).to_le_bytes()).collect();
                 g.rank_mut(r).write_tensor("in.pos", &pos)?;
             }
             if g.rank(r).tensor_bytes("in.kvlen").is_some() {
                 // Rows, not copies: the entry carries `hc_mult` of them.
                 let rows = (x_bytes / 2 / 5120 / 4) as u32;
-                g.rank_mut(r).write_tensor("in.kvlen", &rows.to_le_bytes())?;
+                g.rank_mut(r)
+                    .write_tensor("in.kvlen", &rows.to_le_bytes())?;
             }
             // V4.1 ENGRAM (layers 1 and 14): the n-gram row ids. Host-built in a real run, from
             // token ids alone -- `plowrt::text::engram::EngramHasher`. A rung has no prompt, so
@@ -285,7 +288,11 @@ mod hsa {
                     st.zero,
                     st.nan,
                     st.inf,
-                    if st.nan > 0 || st.inf > 0 { "  <-- NON-FINITE" } else { "" }
+                    if st.nan > 0 || st.inf > 0 {
+                        "  <-- NON-FINITE"
+                    } else {
+                        ""
+                    }
                 );
             }
         }
@@ -298,8 +305,11 @@ mod hsa {
             for spec in dump.split(',').map(str::trim).filter(|s| !s.is_empty()) {
                 let (name, path) = spec.split_once('=').ok_or("--dump wants name=path")?;
                 for rank in 0..if all { g.n_gpu() } else { 1 } {
-                    let out =
-                        if all { format!("{path}.rk{rank}") } else { path.to_string() };
+                    let out = if all {
+                        format!("{path}.rk{rank}")
+                    } else {
+                        path.to_string()
+                    };
                     let b = g
                         .rank(rank)
                         .tensor_bytes(name)

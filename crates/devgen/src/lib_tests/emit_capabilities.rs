@@ -307,7 +307,11 @@ fn glm_production_recipe_defaults_on_only_for_the_qualified_target() {
         let gfx950_glm = arch == "gfx950" && model.starts_with("glm");
         let mut want = [false; 9];
         want[5] = gfx950_glm;
-        assert_eq!(resolved(&cfg), want, "{model} {arch} tp={tp} n_cu={n_cu} {flag:?}");
+        assert_eq!(
+            resolved(&cfg),
+            want,
+            "{model} {arch} tp={tp} n_cu={n_cu} {flag:?}"
+        );
         assert_eq!(cfg.glm_decode_glu_rows, gfx950_glm, "{model} {arch}");
     }
 }

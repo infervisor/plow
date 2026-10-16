@@ -42,8 +42,18 @@ pub fn v41_hash_tables(
     compressed_vocab: usize,
 ) -> Option<EngramTables> {
     const MULTIPLIERS: [[i64; 4]; 2] = [
-        [76_632_096_046_245, 4_839_876_093_313, 35_959_672_319_349, 73_987_337_458_391],
-        [67_716_810_739_261, 51_510_806_800_915, 30_921_347_202_721, 82_619_226_485_591],
+        [
+            76_632_096_046_245,
+            4_839_876_093_313,
+            35_959_672_319_349,
+            73_987_337_458_391,
+        ],
+        [
+            67_716_810_739_261,
+            51_510_806_800_915,
+            30_921_347_202_721,
+            82_619_226_485_591,
+        ],
     ];
     if layer_ids != [1, 14] || max_ngram != 4 || compressed_vocab != 99_092 {
         return None;
@@ -83,14 +93,22 @@ pub fn v41_hash_tables(
             }
         }
         let mut acc = 0i64;
-        offsets.push(flat.iter().map(|p| {
-            let o = acc;
-            acc += *p;
-            o
-        }).collect());
+        offsets.push(
+            flat.iter()
+                .map(|p| {
+                    let o = acc;
+                    acc += *p;
+                    o
+                })
+                .collect(),
+        );
         primes.push(flat);
     }
-    Some(EngramTables { multipliers: MULTIPLIERS.iter().map(|r| r.to_vec()).collect(), primes, offsets })
+    Some(EngramTables {
+        multipliers: MULTIPLIERS.iter().map(|r| r.to_vec()).collect(),
+        primes,
+        offsets,
+    })
 }
 
 /// Maps every token id onto a smaller id space where tokens that normalize alike collapse
@@ -253,7 +271,13 @@ impl EngramHasher {
     /// `mask[i] == false` marks a token that takes no part in an n-gram. It is written to the
     /// cache as `DEAD`, which blocks lookback THROUGH it for later positions as well — that
     /// persistence is the whole reason the mask is applied here rather than at the gate.
-    pub fn hash(&mut self, ids: &[u32], start_pos: usize, mask: Option<&[bool]>, out: &mut Vec<i64>) {
+    pub fn hash(
+        &mut self,
+        ids: &[u32],
+        start_pos: usize,
+        mask: Option<&[bool]>,
+        out: &mut Vec<i64>,
+    ) {
         let end = start_pos + ids.len();
         if end > self.cache.len() {
             self.cache.resize(end, DEAD);
@@ -320,17 +344,37 @@ mod tests {
         let dir = std::env::var("DSV41_CKPT").unwrap_or_else(|_| {
             "/root/dsv41/hf/hub/models--deepseek-ai--DeepSeek-V4.1-Flash/snapshots/dba1be0a40aa45a94ad051997016db3960a90277".into()
         });
-        let Ok(raw) = std::fs::read_to_string(std::path::Path::new(&dir).join("config.json")) else {
-            eprintln!("v41_tables_match_nn_graph: SKIPPED, no config.json under {dir} (set DSV41_CKPT)");
+        let Ok(raw) = std::fs::read_to_string(std::path::Path::new(&dir).join("config.json"))
+        else {
+            eprintln!(
+                "v41_tables_match_nn_graph: SKIPPED, no config.json under {dir} (set DSV41_CKPT)"
+            );
             return;
         };
         let v: serde_json::Value = serde_json::from_str(&raw).unwrap();
-        let tower = if v.get("text_config").is_some() { sub_config(&v, "text_config") } else { v };
-        let ModelConfig::DeepSeekV41(c) = ModelConfig::from_json(&tower.to_string()).unwrap() else { panic!("not v41") };
+        let tower = if v.get("text_config").is_some() {
+            sub_config(&v, "text_config")
+        } else {
+            v
+        };
+        let ModelConfig::DeepSeekV41(c) = ModelConfig::from_json(&tower.to_string()).unwrap()
+        else {
+            panic!("not v41")
+        };
         let theirs = c.engram_hash_tables().unwrap();
         let layers: Vec<usize> = c.engram_layer_ids.iter().map(|&l| l as usize).collect();
-        let ours = super::v41_hash_tables(&layers, c.engram_max_ngram_size as usize, c.engram_n_heads as usize, c.engram_vocab_size, c.engram_compressed_vocab_size as usize).unwrap();
-        assert_eq!((ours.multipliers, ours.primes, ours.offsets), (theirs.multipliers, theirs.primes, theirs.offsets));
+        let ours = super::v41_hash_tables(
+            &layers,
+            c.engram_max_ngram_size as usize,
+            c.engram_n_heads as usize,
+            c.engram_vocab_size,
+            c.engram_compressed_vocab_size as usize,
+        )
+        .unwrap();
+        assert_eq!(
+            (ours.multipliers, ours.primes, ours.offsets),
+            (theirs.multipliers, theirs.primes, theirs.offsets)
+        );
     }
 
     use super::*;
@@ -338,8 +382,18 @@ mod tests {
     /// The released checkpoint's constants. The multipliers come from numpy's PCG64 and cannot be
     /// derived; the primes can, and are, by the same walk `nn-graph` uses.
     const MULTS: [[i64; 4]; 2] = [
-        [76_632_096_046_245, 4_839_876_093_313, 35_959_672_319_349, 73_987_337_458_391],
-        [67_716_810_739_261, 51_510_806_800_915, 30_921_347_202_721, 82_619_226_485_591],
+        [
+            76_632_096_046_245,
+            4_839_876_093_313,
+            35_959_672_319_349,
+            73_987_337_458_391,
+        ],
+        [
+            67_716_810_739_261,
+            51_510_806_800_915,
+            30_921_347_202_721,
+            82_619_226_485_591,
+        ],
     ];
     const ENGRAM_VOCAB: i64 = 16_000_000;
     const MAX_NGRAM: usize = 4;
@@ -415,7 +469,12 @@ mod tests {
     }
 
     /// `[position][layer][column]` from one `hash` call.
-    fn run(h: &mut EngramHasher, ids: &[u32], at: usize, mask: Option<&[bool]>) -> Vec<Vec<Vec<i64>>> {
+    fn run(
+        h: &mut EngramHasher,
+        ids: &[u32],
+        at: usize,
+        mask: Option<&[bool]>,
+    ) -> Vec<Vec<Vec<i64>>> {
         let mut out = Vec::new();
         h.hash(ids, at, mask, &mut out);
         let (nl, nc) = (h.layers(), h.cols());
@@ -441,7 +500,10 @@ mod tests {
         let col = |r: &Vec<Vec<Vec<i64>>>, l: usize, c: usize| -> Vec<i64> {
             r.iter().map(|p| p[l][c]).collect()
         };
-        assert_eq!(col(&r, 0, 0), vec![4052413, 11457621, 4299726, 15507829, 1611640, 15990408]);
+        assert_eq!(
+            col(&r, 0, 0),
+            vec![4052413, 11457621, 4299726, 15507829, 1611640, 15990408]
+        );
         assert_eq!(
             col(&r, 0, 8),
             vec![138893193, 135125969, 129401291, 136244361, 140764033, 128381820]
@@ -451,7 +513,10 @@ mod tests {
             vec![270913409, 257763495, 264341430, 262364454, 264586790, 263519714]
         );
         // The second layer hashes differently: its own multipliers, its own bucket ranges.
-        assert_eq!(col(&r, 1, 0), vec![12021899, 1475491, 6788701, 11232881, 6182201, 10797156]);
+        assert_eq!(
+            col(&r, 1, 0),
+            vec![12021899, 1475491, 6788701, 11232881, 6182201, 10797156]
+        );
 
         assert_eq!(
             r[0][0],
@@ -478,7 +543,10 @@ mod tests {
         let mut b = hasher(64);
         let plain = run(&mut b, &SEQ, 0, None);
 
-        assert_eq!(masked[4][0][0], plain[4][0][0], "the 2-gram at pos 4 never sees pos 2");
+        assert_eq!(
+            masked[4][0][0], plain[4][0][0],
+            "the 2-gram at pos 4 never sees pos 2"
+        );
         assert_ne!(masked[4][0][8], plain[4][0][8], "the 3-gram at pos 4 does");
         assert_ne!(masked[4][0][16], plain[4][0][16], "and so does the 4-gram");
 
@@ -486,8 +554,15 @@ mod tests {
         // shorter n-grams do not. This is the edge of the window, and the arithmetic is worth
         // spelling out because it is easy to be off by one: `max_ngram = 4` means shifts 0..=3,
         // so position 5 sees positions 5, 4, 3 and 2, and the dead token is the last of them.
-        assert_eq!(masked[5][0][..16], plain[5][0][..16], "2- and 3-grams are clear of pos 2");
-        assert_ne!(masked[5][0][16], plain[5][0][16], "the 4-gram at pos 5 still reaches it");
+        assert_eq!(
+            masked[5][0][..16],
+            plain[5][0][..16],
+            "2- and 3-grams are clear of pos 2"
+        );
+        assert_ne!(
+            masked[5][0][16], plain[5][0][16],
+            "the 4-gram at pos 5 still reaches it"
+        );
 
         // And the dead position itself hashes pad against pad, whatever the token was.
         assert_eq!(masked[2][0][0], 4299726);
@@ -507,7 +582,11 @@ mod tests {
         assert_eq!(pre.len(), 4);
         assert_eq!(dec.len(), 2);
         assert_eq!(whole[..4], pre[..]);
-        assert_eq!(whole[4..], dec[..], "the decode step must see the prefill's tokens");
+        assert_eq!(
+            whole[4..],
+            dec[..],
+            "the decode step must see the prefill's tokens"
+        );
     }
 
     /// Every id must land inside its own column's bucket range, and the ranges must tile the
@@ -556,7 +635,9 @@ mod tests {
             2,
             64,
         ) {
-            Ok(_) => panic!("a compressed vocab of 99091 against a config saying 99092 must refuse"),
+            Ok(_) => {
+                panic!("a compressed vocab of 99091 against a config saying 99092 must refuse")
+            }
             Err(e) => e,
         };
         assert!(err.contains("rehash the whole table"), "{err}");
@@ -579,7 +660,10 @@ mod tests {
 
         // THE load-bearing assertion. `engram_compressed_vocab_size` is 99092 in the released
         // config, and it is the bound every hash multiplier was drawn against.
-        assert_eq!(size, 99_092, "the normalizer sequence does not reproduce the reference's map");
+        assert_eq!(
+            size, 99_092,
+            "the normalizer sequence does not reproduce the reference's map"
+        );
         assert_eq!(map.len(), tok.get_vocab_size(true));
 
         // Case and leading whitespace collapse -- " The", "the" and "THE" must hash alike.

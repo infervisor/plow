@@ -466,15 +466,20 @@ impl SharedPrefix {
                 let tail = u64::from(g.pool.block_rows().saturating_sub(1));
                 let cache_bytes: u64 = g.tensors.iter().map(|t| tail * t.row_bytes).sum();
                 let scale_bytes: u64 = if idx == 0 {
-                    layout.scales.iter().map(|t| u64::from(layout.context) * t.row_bytes).sum()
+                    layout
+                        .scales
+                        .iter()
+                        .map(|t| u64::from(layout.context) * t.row_bytes)
+                        .sum()
                 } else {
                     0
                 };
                 let slot_bytes = (cache_bytes + scale_bytes).max(4);
                 let row_bytes = g.tensors[0].row_bytes;
-                let group_host_cap = (((host_cap as u128 * row_bytes as u128 * g.tensors.len() as u128)
-                    / total_row_bytes.max(1) as u128) as u64)
-                    .clamp(slot_bytes, host_cap);
+                let group_host_cap =
+                    (((host_cap as u128 * row_bytes as u128 * g.tensors.len() as u128)
+                        / total_row_bytes.max(1) as u128) as u64)
+                        .clamp(slot_bytes, host_cap);
                 match g.pool.enable_host_tier(group_host_cap, slot_bytes) {
                     Ok(()) => tracing::info!(
                         group = idx,
@@ -483,7 +488,9 @@ impl SharedPrefix {
                         slots = group_host_cap / slot_bytes,
                         "vmm prefix: AMD host tier armed"
                     ),
-                    Err(e) => tracing::warn!(group = idx, error = %e, "vmm prefix: AMD host tier off"),
+                    Err(e) => {
+                        tracing::warn!(group = idx, error = %e, "vmm prefix: AMD host tier off")
+                    }
                 }
             }
         }

@@ -532,18 +532,31 @@ fn cfg_glm(dir: &Path) -> GlmCfg {
         // (`declare_glm53`, `emit_glm53_hc_pre`), and the pooled indexer always compresses and
         // appends the tail (`DsaPoolCompress`/`DsaPoolExpand`): refuse a checkpoint that says
         // otherwise rather than emit the wrong model.
-        assert_eq!(v["mhc"].as_bool(), Some(true), "glm5_next requires mhc=true");
-        assert_eq!(v["hc_mult"].as_u64(), Some(4), "glm5_next mHC emit is n=4 streams only");
+        assert_eq!(
+            v["mhc"].as_bool(),
+            Some(true),
+            "glm5_next requires mhc=true"
+        );
+        assert_eq!(
+            v["hc_mult"].as_u64(),
+            Some(4),
+            "glm5_next mHC emit is n=4 streams only"
+        );
         assert_eq!(
             v["hc_sinkhorn_iters"].as_u64(),
             Some(20),
             "glm5_next mHC emit is 20 Sinkhorn iterations only"
         );
         let hc_eps = v["hc_eps"].as_f64().expect("glm5_next text_config.hc_eps");
-        assert!((hc_eps - 1e-6).abs() < 1e-12, "glm5_next mHC emit is hc_eps=1e-6 only");
+        assert!(
+            (hc_eps - 1e-6).abs() < 1e-12,
+            "glm5_next mHC emit is hc_eps=1e-6 only"
+        );
         assert!(
             v["index_kpool_compress"].as_bool().unwrap_or(true)
-                && v["index_kpool_always_select_tail"].as_bool().unwrap_or(true),
+                && v["index_kpool_always_select_tail"]
+                    .as_bool()
+                    .unwrap_or(true),
             "glm5_next pooled indexer emit always compresses and selects the tail"
         );
     }
@@ -943,7 +956,14 @@ fn emit_glm53_hc_pre(
             if peer_input { v.h2 } else { v.layer_input },
             v.rows,
         ),
-        None => (residual, s.mixes, s.post_mix, s.comb_mix, s.layer_input, rows),
+        None => (
+            residual,
+            s.mixes,
+            s.post_mix,
+            s.comb_mix,
+            s.layer_input,
+            rows,
+        ),
     };
     let (scale, base) = if ffn {
         (w.ffn_scale, w.ffn_base)
@@ -966,7 +986,11 @@ fn emit_glm53_hc_pre(
     {
         let prev = band.map_or(prev, |v| v.res(s, prev));
         let side = if ffn { "ffn" } else { "attn" };
-        let pfx = if band.is_some() { "act.hc_aiter_pf" } else { "act.hc_aiter" };
+        let pfx = if band.is_some() {
+            "act.hc_aiter_pf"
+        } else {
+            "act.hc_aiter"
+        };
         let mul = b.tensor(&format!("{pfx}.{rows}.mul"), u64::from(rows) * 64 * 32 * 4);
         let sq = b.tensor(&format!("{pfx}.{rows}.sq"), u64::from(rows) * 64 * 4);
         let words = [
@@ -1036,7 +1060,9 @@ fn emit_glm53_hc_pre(
                 if emit_config::active().glm_hc_fuse_variant.unwrap_or(0) & 4 != 0 {
                     return Some(1);
                 }
-                [1u32, 2, 4].into_iter().find(|&r| rows.div_ceil(r) * 3 <= b.n_cu())
+                [1u32, 2, 4]
+                    .into_iter()
+                    .find(|&r| rows.div_ceil(r) * 3 <= b.n_cu())
             }
         })
         .flatten();
@@ -1047,44 +1073,44 @@ fn emit_glm53_hc_pre(
     let tail = (band.is_none()
         && ((rows == 1 && emit_config::active().glm_hc_pre_tail) || fuse_r.is_some())
         && !no_tail)
-    .then(|| {
-        let side = if ffn { "ffn" } else { "attn" };
-        let ctr = match fuse_r {
-            None => b.tensor(&format!("act.hc_pre_tail.{layer}.{side}.ctr"), 4),
-            Some(r) => b.tensor(
-                &format!("act.hc_fuse.{rows}.{layer}.{side}.ctr"),
-                u64::from(rows.div_ceil(r.max(1))) * 4,
-            ),
-        };
-        let (fold, nout, gamma) = norm_fold.map_or((0, 0, 0), |(o, g)| (1, o, g));
-        let words = [
-            post_mix,
-            comb_mix,
-            layer_input,
-            scale,
-            base,
-            ctr,
-            fold,
-            nout,
-            gamma,
-            c.hidden,
-            20,
-            c.eps.to_bits(),
-            1e-6f32.to_bits(),
-        ];
-        let mut words = words.to_vec();
-        if let Some(sp) = split {
-            let k = 4 * c.hidden;
-            let part = b.tensor("act.hc_mix_part", 24 * (k as u64 / 8) * 4);
-            words.extend([part, sp]);
-        }
-        let bytes: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
-        let name = match fuse_r {
-            None => format!("act.hc_pre_tail.{layer}.{side}.desc"),
-            Some(_) => format!("act.hc_fuse.{rows}.{layer}.{side}.desc"),
-        };
-        b.tensor_init(&name, bytes)
-    });
+        .then(|| {
+            let side = if ffn { "ffn" } else { "attn" };
+            let ctr = match fuse_r {
+                None => b.tensor(&format!("act.hc_pre_tail.{layer}.{side}.ctr"), 4),
+                Some(r) => b.tensor(
+                    &format!("act.hc_fuse.{rows}.{layer}.{side}.ctr"),
+                    u64::from(rows.div_ceil(r.max(1))) * 4,
+                ),
+            };
+            let (fold, nout, gamma) = norm_fold.map_or((0, 0, 0), |(o, g)| (1, o, g));
+            let words = [
+                post_mix,
+                comb_mix,
+                layer_input,
+                scale,
+                base,
+                ctr,
+                fold,
+                nout,
+                gamma,
+                c.hidden,
+                20,
+                c.eps.to_bits(),
+                1e-6f32.to_bits(),
+            ];
+            let mut words = words.to_vec();
+            if let Some(sp) = split {
+                let k = 4 * c.hidden;
+                let part = b.tensor("act.hc_mix_part", 24 * (k as u64 / 8) * 4);
+                words.extend([part, sp]);
+            }
+            let bytes: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+            let name = match fuse_r {
+                None => format!("act.hc_pre_tail.{layer}.{side}.desc"),
+                Some(_) => format!("act.hc_fuse.{rows}.{layer}.{side}.desc"),
+            };
+            b.tensor_init(&name, bytes)
+        });
     // PLOW_GLM_HC_MIX_SPLIT=S: a folded mix packet runs on the workgroups that own an output
     // (rows * 24) instead of the whole grid; with the one-row pre tail each output's K steps are
     // also split over S workgroups (i4 = 2) and reduced in step order by the last one.
@@ -1127,7 +1153,11 @@ fn emit_glm53_hc_pre(
             d.i[6] = emit_config::active().glm_hc_fuse_variant.unwrap_or(0) & 2;
         }
         if let Some(desc) = tail {
-            d.i[4] = if split.is_some() && post_fold.is_some() { 2 } else { 1 };
+            d.i[4] = if split.is_some() && post_fold.is_some() {
+                2
+            } else {
+                1
+            };
             if let Some(r) = fuse_r {
                 d.i[4] = 3;
                 d.i[5] = r;
@@ -1188,7 +1218,13 @@ fn emit_glm53_hc_post(
     band: Option<&Glm53Band>,
 ) -> u32 {
     let (out, residual, post_mix, comb_mix, rows) = match band {
-        Some(v) => (v.res(s, out), v.res(s, residual), v.post_mix, v.comb_mix, v.rows),
+        Some(v) => (
+            v.res(s, out),
+            v.res(s, residual),
+            v.post_mix,
+            v.comb_mix,
+            v.rows,
+        ),
         None => (out, residual, s.post_mix, s.comb_mix, rows),
     };
     b.emit(
@@ -1326,9 +1362,8 @@ fn emit_glm53_program(
     if pf_hc {
         assert!(c.hidden == 4096, "PLOW_GLM53_PF_HC_AITER needs hidden 4096");
     }
-    let pf_in_fold = |l: usize| {
-        pf_hc && (c.is_softmax(l as u32) || emit_config::active().glm53_sp_kda_norm)
-    };
+    let pf_in_fold =
+        |l: usize| pf_hc && (c.is_softmax(l as u32) || emit_config::active().glm53_sp_kda_norm);
     let mut pending_post: Option<(u32, u32)> = None;
     let xr_hcpost = !prefill && bv.is_none() && c.tp > 1 && emit_config::active().glm_xr_hcpost;
     for l in 0..c.layers as usize {
@@ -1520,7 +1555,10 @@ fn emit_glm53_program(
         {
             (x, None)
         } else {
-            (emit_glm53_hc_post(b, c, s, next, raw, residual, rows, c_attn, bv), None)
+            (
+                emit_glm53_hc_post(b, c, s, next, raw, residual, rows, c_attn, bv),
+                None,
+            )
         };
         ri ^= 1;
         let residual = s.residual[ri];
@@ -1586,7 +1624,19 @@ fn emit_glm53_program(
             // (emit_glm_moe_ffn_rows) and cannot serve a real prefill bucket. See
             // emit_glm_moe_ffn_prefill's doc comment for why.
             emit_glm_moe_ffn_prefill(
-                b, c, n, l, rows, enc, n.xnext, c_norm, &mut xgate, &xr, true, None, GLM_ROUTER_FLAGS,
+                b,
+                c,
+                n,
+                l,
+                rows,
+                enc,
+                n.xnext,
+                c_norm,
+                &mut xgate,
+                &xr,
+                true,
+                None,
+                GLM_ROUTER_FLAGS,
             )
         } else {
             emit_glm_moe_ffn(
@@ -1675,7 +1725,13 @@ fn emit_glm53_packed_tail(
         d.i[1] = c.hidden;
         d.i[2] = rows;
     });
-    let op = pick_tile(s, vocab_l, c.hidden, b.n_cu(), kernelcaps::QuantScheme::None);
+    let op = pick_tile(
+        s,
+        vocab_l,
+        c.hidden,
+        b.n_cu(),
+        kernelcaps::QuantScheme::None,
+    );
     let c_lm = b.emit(op, all, &[c_g], |d| {
         d.t[0] = n.logits;
         d.t[1] = xs;
@@ -1767,8 +1823,7 @@ pub(crate) fn glm53_emit_full(
     // handles point past the end of the serialized tensor table -> a null device address at load.
     let gfx950 = crate::emit_is_amd() && crate::amd_target::active().1 == hwspec::IsaLevel::Gfx950;
     let ec = emit_config::active();
-    let l2_pf =
-        l2_layout.filter(|_| std::env::var("PLOW_L2_PLACE_PREFILL").as_deref() == Ok("1"));
+    let l2_pf = l2_layout.filter(|_| std::env::var("PLOW_L2_PLACE_PREFILL").as_deref() == Ok("1"));
     for &rows in &pf {
         let mut b = Builder::new(n_cu);
         b.set_tensor_dedup(true);
@@ -1883,7 +1938,8 @@ pub(crate) fn glm53_emit_full(
         }
         b.set_gemm_small_group_s(ec.glm_kda_proj_group_s.unwrap_or(0));
         b.set_decode_mla_segments(if dense || !c.dsa(ctx) {
-            ec.glm53_mla_hpack_rows.is_some_and(|min| rows >= min.max(2))
+            ec.glm53_mla_hpack_rows
+                .is_some_and(|min| rows >= min.max(2))
         } else {
             ec.glm53_mla_hpack_gather.is_some_and(|min| rows >= min)
         });
@@ -2670,7 +2726,14 @@ fn emit_glm_shared_w8a8_glu(
 /// `PLOW_MOE_PF_W8A8` for one grouped prefill MoE (ops 85/86 `i[7] = 2`): 1x128 FP8 routed
 /// input, fp8 x fp8 MFMA against the [128,128] weight grid, GLU output re-quantized 1x128 for
 /// DOWN. Refuses rather than silently falling back when the knob meets a shape it cannot run.
-fn glm_moe_pf_w8a8(c: &GlmCfg, enc: MoeEnc, native_moe: bool, tk: u32, imoe_e: u32, h: u32) -> bool {
+fn glm_moe_pf_w8a8(
+    c: &GlmCfg,
+    enc: MoeEnc,
+    native_moe: bool,
+    tk: u32,
+    imoe_e: u32,
+    h: u32,
+) -> bool {
     if !emit_config::active().moe_pf_w8a8 {
         return false;
     }
@@ -3110,7 +3173,8 @@ pub(crate) fn emit_pf_gemm_fp8_mx_band(
     let sb = b.tensor_bytes(sc);
     let want_sc = (nn as u64).div_ceil(32) * (k as u64).div_ceil(32);
     assert_eq!(
-        sb, want_sc,
+        sb,
+        want_sc,
         "GemmFp8Mx scale {:?} is declared {sb} bytes but a [{nn}, {k}] ue8m0 grid is {want_sc}",
         b.tensor_name(sc)
     );
@@ -3969,7 +4033,10 @@ fn declare_glm_rows_batched_for_prefill(
         emit_config::active().glm_rowsplit_arm() == Some(packet::devbuild::RowSplitArm::AllToAll);
     let rowsplit_attn = alltoall;
     let a2a_pf = emit_config::active().glm_dsa_pf_a2a && tp > 1;
-    assert!(!(a2a_pf && alltoall), "PLOW_GLM_DSA_PF_A2A and PLOW_GLM_ROWSPLIT_ATTN are exclusive");
+    assert!(
+        !(a2a_pf && alltoall),
+        "PLOW_GLM_DSA_PF_A2A and PLOW_GLM_ROWSPLIT_ATTN are exclusive"
+    );
     let qa_tp = if a2a_pf {
         // The all-to-all peer slots 7/8 must exist with it (`check_rowsplit_attn`); NoPE has no
         // q rope, so slot 7 is a placeholder.
@@ -7191,18 +7258,20 @@ fn emit_glm_dsa_decode_select(
             let c_stash = if fuse {
                 None
             } else {
-                Some(b.emit(DevOp::DsaPoolStash, all.to_vec(), &[c_ki, c_gs], |d| {
-                d.t[0] = n.kidx_ring[slot];
-                d.t[1] = n.kidx_ring_score[slot];
-                d.t[2] = n.kidx_normed;
-                d.t[3] = n.gate_score;
-                d.t[4] = n.pos;
-                d.i[0] = c.index_kpool;
-                d.i[1] = di;
-                if rows > 1 {
-                    d.i[3] = rows;
-                }
-            }))
+                Some(
+                    b.emit(DevOp::DsaPoolStash, all.to_vec(), &[c_ki, c_gs], |d| {
+                        d.t[0] = n.kidx_ring[slot];
+                        d.t[1] = n.kidx_ring_score[slot];
+                        d.t[2] = n.kidx_normed;
+                        d.t[3] = n.gate_score;
+                        d.t[4] = n.pos;
+                        d.i[0] = c.index_kpool;
+                        d.i[1] = di;
+                        if rows > 1 {
+                            d.i[3] = rows;
+                        }
+                    }),
+                )
             };
             let stash_deps = match c_stash {
                 Some(c_stash) => vec![c_stash],
@@ -8667,53 +8736,55 @@ fn emit_glm_dsa_prefill_select(
             d.j[1] = KV_MASK_NONE;
         })
     });
-    let c_qi = c_qi.or_else(|| select.then(|| {
-        let blk_q0 = if emit_config::active().glm_indexer_wq_w8a8 {
-            Some(emit_glm_indexer_wq_w8a8(
-                b,
-                all,
-                n,
-                w,
-                n.qidx_pf,
-                t,
-                query_quant.expect("shared MLA query quantization"),
-            ))
-        } else {
-            emit_glm_blk_gemm(
-                b,
-                c,
-                n,
-                n.qidx_pf,
-                n.qlat,
-                [w.blk_iwqb, w.blk_iwqb_s],
-                t,
-                [hi * di, ql],
-                true,
-                &[pre[1]],
-            )
-        };
-        let c_q0 = match blk_q0 {
-            Some(counter) => counter,
-            None => bf16_gemm(b, n.qidx_pf, n.qlat, w.iwqb, hi * di, ql, &[pre[1]]),
-        };
-        b.emit(DevOp::HeadNormRope, all.to_vec(), &[c_q0], |d| {
-            d.t[0] = n.qidx_pf;
-            d.t[1] = n.qidx_pf;
-            d.t[2] = TENSOR_NONE;
-            d.t[3] = n.icos;
-            d.t[4] = n.isin;
-            d.t[5] = n.pos;
-            d.i[0] = t;
-            d.i[1] = hi;
-            d.i[2] = di;
-            d.i[3] = 0;
-            d.i[4] = 1;
-            d.i[5] = 1;
-            d.f[0] = c.eps;
-            d.j[0] = 0;
-            d.j[1] = KV_MASK_NONE;
+    let c_qi = c_qi.or_else(|| {
+        select.then(|| {
+            let blk_q0 = if emit_config::active().glm_indexer_wq_w8a8 {
+                Some(emit_glm_indexer_wq_w8a8(
+                    b,
+                    all,
+                    n,
+                    w,
+                    n.qidx_pf,
+                    t,
+                    query_quant.expect("shared MLA query quantization"),
+                ))
+            } else {
+                emit_glm_blk_gemm(
+                    b,
+                    c,
+                    n,
+                    n.qidx_pf,
+                    n.qlat,
+                    [w.blk_iwqb, w.blk_iwqb_s],
+                    t,
+                    [hi * di, ql],
+                    true,
+                    &[pre[1]],
+                )
+            };
+            let c_q0 = match blk_q0 {
+                Some(counter) => counter,
+                None => bf16_gemm(b, n.qidx_pf, n.qlat, w.iwqb, hi * di, ql, &[pre[1]]),
+            };
+            b.emit(DevOp::HeadNormRope, all.to_vec(), &[c_q0], |d| {
+                d.t[0] = n.qidx_pf;
+                d.t[1] = n.qidx_pf;
+                d.t[2] = TENSOR_NONE;
+                d.t[3] = n.icos;
+                d.t[4] = n.isin;
+                d.t[5] = n.pos;
+                d.i[0] = t;
+                d.i[1] = hi;
+                d.i[2] = di;
+                d.i[3] = 0;
+                d.i[4] = 1;
+                d.i[5] = 1;
+                d.f[0] = c.eps;
+                d.j[0] = 0;
+                d.j[1] = KV_MASK_NONE;
+            })
         })
-    }));
+    });
     // PLOW_GLM_DSA_KW_DUAL: wk and weights_proj as ONE GemmSmall packet (t3/t4/i3 = the second
     // GEMM), their tiles sharing the workgroups; per-element arithmetic unchanged.
     let small =
@@ -8820,7 +8891,10 @@ fn emit_glm_dsa_prefill_select(
         });
         let chunk_pools = t / c.index_kpool;
         let packed = b.packed_prefill_segments();
-        assert!(!(packed && select), "pooled sparse prefill has no per-span selection");
+        assert!(
+            !(packed && select),
+            "pooled sparse prefill has no per-span selection"
+        );
         let c_comp = b.emit(DevOp::DsaPoolCompress, all.to_vec(), &[c_ki, c_gs], |d| {
             d.t[0] = n.kidx_pool[slot];
             d.t[1] = n.kidx_pool_scale[slot];
@@ -9742,7 +9816,9 @@ pub(crate) fn emit_glm_mla_prefill(
     // Dense prefill still feeds sparse decode's key cache, including short tail buckets.
     // ...and the dense A2A rung still writes the pool cache the sibling's later chunks score.
     let idx_chain = w.iwk != TENSOR_NONE
-        && (sparse || c.dsa(ctx) || (a2a && glm_dsa_pf_bucket(c, t) && !b.packed_prefill_segments()));
+        && (sparse
+            || c.dsa(ctx)
+            || (a2a && glm_dsa_pf_bucket(c, t) && !b.packed_prefill_segments()));
 
     // 1 input_layernorm, T rows (on the band + all-gather under the sequence-parallel seams).
     // Under `raw_output` (GLM-5.3's hyper-connection program) the seam is the mHC band seam:
@@ -10027,14 +10103,14 @@ pub(crate) fn emit_glm_mla_prefill(
         Some((c_qa, _)) => c_qa,
         None if w.qkva_cat != TENSOR_NONE && emit_config::active().pf_gemm_route_all => {
             crate::kda::emit_pf_gemm_route(
-            b,
-            if use_rowsplit && a2a { n.qa_tp } else { n.qa },
-            n.qlat,
-            w.wqa,
-            t,
-            nh_l * dk,
-            ql,
-            &[c_rnq],
+                b,
+                if use_rowsplit && a2a { n.qa_tp } else { n.qa },
+                n.qlat,
+                w.wqa,
+                t,
+                nh_l * dk,
+                ql,
+                &[c_rnq],
             )
         }
         // A2A sibling: this rank's band q at every head, straight into the flash's operand.
@@ -10606,7 +10682,10 @@ pub(crate) fn emit_glm_mla_prefill(
         if rowband {
             // Row-band arm: the fold already wrote this rank's `[T/8][nh][vd]` rows, so the
             // full-width o_proj writes the band the reduce-scatter would have left in `og_tp`.
-            assert!(!raw_output, "row-band attention has no raw_output (mHC) arm");
+            assert!(
+                !raw_output,
+                "row-band attention has no raw_output (mHC) arm"
+            );
             let rb = rb.as_ref().expect("declared with the arm");
             let og_band = glm_band(b, n.og_tp, t, tp, h as u64 * 2);
             let c_p = emit_glm_lt_ext(
@@ -10826,7 +10905,21 @@ fn emit_glm_block_prefill(
     let c_rn2 = emit_glm_mla_prefill(
         b, c, n, slot, ctx, t, enc, x_in, pre, false, xgate, xr_cus, band,
     );
-    emit_glm_moe_ffn_prefill(b, c, n, slot, t, enc, x_out, c_rn2, xgate, xr_cus, false, None, GLM_ROUTER_FLAGS)
+    emit_glm_moe_ffn_prefill(
+        b,
+        c,
+        n,
+        slot,
+        t,
+        enc,
+        x_out,
+        c_rn2,
+        xgate,
+        xr_cus,
+        false,
+        None,
+        GLM_ROUTER_FLAGS,
+    )
 }
 
 /// The grouped-MoE prefill scratch, and the row bound that sizes it.
@@ -10903,7 +10996,15 @@ pub(crate) fn declare_moe_pf_scratch(
                 TENSOR_NONE,
             )
         };
-    MoePfScratch { part, meta, row_token, row_partidx, row_gate, fu_g, fu_scale }
+    MoePfScratch {
+        part,
+        meta,
+        row_token,
+        row_partidx,
+        row_gate,
+        fu_g,
+        fu_scale,
+    }
 }
 
 /// Emit ONE MoE FFN for a PREFILL bucket of `t` rows, given the attention output's completion dep
@@ -11369,7 +11470,11 @@ pub(crate) fn emit_glm_moe_ffn_prefill(
             d.t = [
                 if seed { n.dg_tp } else { n.part },
                 n.xn2,
-                if w.ewt_ai != TENSOR_NONE { w.ewt_ai } else { w.ewt },
+                if w.ewt_ai != TENSOR_NONE {
+                    w.ewt_ai
+                } else {
+                    w.ewt
+                },
                 w.est,
                 n.meta,
                 n.row_token,
@@ -11385,7 +11490,11 @@ pub(crate) fn emit_glm_moe_ffn_prefill(
                 tk_all,
                 64,
                 2 + u32::from(seed),
-                if w.ewt_ai != TENSOR_NONE { 2 } else { u32::from(resident) },
+                if w.ewt_ai != TENSOR_NONE {
+                    2
+                } else {
+                    u32::from(resident)
+                },
             ];
             if native_align {
                 d.j[0] = n.tab + 1;
@@ -12356,7 +12465,10 @@ fn emit_glm_moe_ffn_rows(
         !resident || matches!(rows, 1 | 2 | 4 | 8 | 16 | 32),
         "resident GLM MoE decode requires rows 1/2/4/8/16/32"
     );
-    assert!(!aiter950 || rows <= 8192, "gfx950 AITER MoE decode rows exceed 8192");
+    assert!(
+        !aiter950 || rows <= 8192,
+        "gfx950 AITER MoE decode rows exceed 8192"
+    );
     let flat = resident || (emit_config::active().glm_moe_flat_decode && matches!(rows, 2 | 4 | 8));
     if flat {
         assert!(
@@ -12380,8 +12492,8 @@ fn emit_glm_moe_ffn_rows(
     // path instead of the W4A16 GEMV pair, and its two decode packets disappear.
     // The gfx950 AITER call folds the shared expert at decode too, as vLLM's does: one more
     // top-9 slot in the same kernel instead of the shared GEMV pair.
-    let dfold = emit_config::active().glm_decode_shared_fold
-        || (aiter950 && glm_shared_fold(c, enc));
+    let dfold =
+        emit_config::active().glm_decode_shared_fold || (aiter950 && glm_shared_fold(c, enc));
     assert!(!dfold || aiter950 || (glm_shared_fold(c, enc) && enc == MoeEnc::Mxfp4 && !flat && !det
         && !emit_config::active().glm_routed_w8a8 && !emit_config::active().glm_shared_w8a8),
         "PLOW_GLM_DECODE_SHARED_FOLD requires PLOW_GLM_MOE_SHARED_FOLD on the grouped MXFP4 decode path");
@@ -12401,27 +12513,30 @@ fn emit_glm_moe_ffn_rows(
         all.clone()
     };
     let c_router = if router_raw.is_some() {
-        assert!(dfold == raw_fold && !det && !flat, "PLOW_GLM_ROUTER_RAW: AITER route only");
+        assert!(
+            dfold == raw_fold && !det && !flat,
+            "PLOW_GLM_ROUTER_RAW: AITER route only"
+        );
         b.isolate(c_score);
         c_score
     } else {
-    b.emit(DevOp::MoeRouterTopkPf, router_cus, &[c_score], |d| {
-        d.t[0] = n.tab;
-        d.t[1] = n.rlogit;
-        d.t[3] = w.bias;
-        if det {
-            d.t[2] = n.part;
-            d.i[0] = h;
-        }
-        d.i[1] = e;
-        d.i[2] = tk;
-        d.i[3] = GLM_ROUTER_FLAGS;
-        d.i[4] = rows;
-        d.i[5] = u32::from(dfold);
-        d.i[6] = c.n_group;
-        d.i[7] = c.topk_group;
-        d.f[0] = c.route_scale;
-    })
+        b.emit(DevOp::MoeRouterTopkPf, router_cus, &[c_score], |d| {
+            d.t[0] = n.tab;
+            d.t[1] = n.rlogit;
+            d.t[3] = w.bias;
+            if det {
+                d.t[2] = n.part;
+                d.i[0] = h;
+            }
+            d.i[1] = e;
+            d.i[2] = tk;
+            d.i[3] = GLM_ROUTER_FLAGS;
+            d.i[4] = rows;
+            d.i[5] = u32::from(dfold);
+            d.i[6] = c.n_group;
+            d.i[7] = c.topk_group;
+            d.f[0] = c.route_scale;
+        })
     };
     // The gfx950 AITER call sorts the router's table itself (`plow_moe_aiter_prepare_table`).
     let c_routes = if flat || aiter950 {
@@ -12519,7 +12634,10 @@ fn emit_glm_moe_ffn_rows(
         .then(|| {
             b.emit_gemm_small_group(
                 rows,
-                &[(n.shfu, n.xn2, w.shg, imoe_l, h), (n.shfu_up, n.xn2, w.shu, imoe_l, h)],
+                &[
+                    (n.shfu, n.xn2, w.shg, imoe_l, h),
+                    (n.shfu_up, n.xn2, w.shu, imoe_l, h),
+                ],
                 &[c_rn2],
             )
         })
@@ -12665,10 +12783,8 @@ fn emit_glm_moe_ffn_rows(
         b.isolate(counter);
         counter
     } else {
-        let pf_w8a8 = !dfold
-            && !det
-            && glm_moe_dec_w8a8()
-            && glm_moe_pf_w8a8(c, enc, false, tk, imoe_e, h);
+        let pf_w8a8 =
+            !dfold && !det && glm_moe_dec_w8a8() && glm_moe_pf_w8a8(c, enc, false, tk, imoe_e, h);
         let pf_split = pf_w8a8 && glm_moe_pf_w8a8_split();
         let pf_fq = pf_w8a8 && !pf_split && emit_config::active().moe_pf_w8a8_fq;
         let c_x = if pf_w8a8 && !pf_split && !pf_fq {
@@ -12688,7 +12804,10 @@ fn emit_glm_moe_ffn_rows(
         let dec_mark = (pf_fq && emit_config::active().moe_w8a8_dec).then(|| {
             let slots = rows * tk_route;
             let tiles = e_route.min(slots) + slots / 64;
-            assert!(tiles < 0x1_0000, "PLOW_MOE_W8A8_DEC tile bound {tiles} overflows j1");
+            assert!(
+                tiles < 0x1_0000,
+                "PLOW_MOE_W8A8_DEC tile bound {tiles} overflows j1"
+            );
             packet::dev::MOE_W8A8_DEC_MARK | tiles
         });
         let c_g = b.emit(DevOp::MoeGroupGluPf, all.clone(), &[c_routes, c_x], |d| {
@@ -13009,19 +13128,19 @@ pub(crate) fn emit_glm_moe_ffn(
             b.isolate(c_score);
             c_score
         } else {
-        b.emit(DevOp::MoeRouterTopk, one.clone(), &[c_score], |d| {
-            d.t[0] = n.tab;
-            d.t[1] = n.rlogit;
-            d.t[3] = w.bias;
-            d.i[1] = e;
-            d.i[2] = tk;
-            d.i[3] = GLM_ROUTER_FLAGS;
-            // GROUP-LIMITED top-k (noaux_tc). Inert at n_group<=1, which is every GLM/Qwen/Mixtral
-            // packet — so this stays byte-identical there and fixes Kimi/DeepSeek, which group.
-            d.i[6] = c.n_group;
-            d.i[7] = c.topk_group;
-            d.f[0] = c.route_scale;
-        })
+            b.emit(DevOp::MoeRouterTopk, one.clone(), &[c_score], |d| {
+                d.t[0] = n.tab;
+                d.t[1] = n.rlogit;
+                d.t[3] = w.bias;
+                d.i[1] = e;
+                d.i[2] = tk;
+                d.i[3] = GLM_ROUTER_FLAGS;
+                // GROUP-LIMITED top-k (noaux_tc). Inert at n_group<=1, which is every GLM/Qwen/Mixtral
+                // packet — so this stays byte-identical there and fixes Kimi/DeepSeek, which group.
+                d.i[6] = c.n_group;
+                d.i[7] = c.topk_group;
+                d.f[0] = c.route_scale;
+            })
         }
     };
     // 16 shared expert gate|up (fused GLU) — column-parallel: this rank's imoe_l lanes. Under cores>=2
@@ -13116,15 +13235,15 @@ pub(crate) fn emit_glm_moe_ffn(
             glu_down_up = Some(c_u);
             c_g
         } else {
-        b.emit(DevOp::Glu, shared_cus[..1].to_vec(), &[c_g, c_u], |d| {
-            d.t[0] = n.shfu;
-            d.t[1] = n.shfu;
-            d.t[2] = n.shfu_up;
-            d.i[0] = imoe_l;
-            let (act, limit) = glm_glu_act(c);
-            d.i[1] = act;
-            d.f[1] = limit;
-        })
+            b.emit(DevOp::Glu, shared_cus[..1].to_vec(), &[c_g, c_u], |d| {
+                d.t[0] = n.shfu;
+                d.t[1] = n.shfu;
+                d.t[2] = n.shfu_up;
+                d.i[0] = imoe_l;
+                let (act, limit) = glm_glu_act(c);
+                d.i[1] = act;
+                d.f[1] = limit;
+            })
         }
     } else {
         let shglu_op = if enc == MoeEnc::Mxfp4 {
@@ -13307,17 +13426,17 @@ pub(crate) fn emit_glm_moe_ffn(
                 b, xgate, xr_cus, &deps, n.attn, h, tp, n.slot_b, n.part, tk, shared_src,
             )
         } else {
-        let c_cmb = b.emit(DevOp::MoeCombine, elem_cus(&all, h), &deps, |d| {
-            d.t[0] = n.dg_tp;
-            d.t[1] = TENSOR_NONE;
-            d.t[2] = shared_src;
-            d.t[3] = n.part;
-            d.i[0] = h;
-            d.i[1] = tk;
-        });
-        // partial_A = og_tp @ 0, partial_B = dg_tp @ n.slot_b. Blob-wide, so a decode program
-        // sharing a tensor table with prefill buckets names the SAME offset they do.
-        emit_xreduce(b, xgate, true, xr_cus, c_cmb, n.attn, h, tp, n.slot_b)
+            let c_cmb = b.emit(DevOp::MoeCombine, elem_cus(&all, h), &deps, |d| {
+                d.t[0] = n.dg_tp;
+                d.t[1] = TENSOR_NONE;
+                d.t[2] = shared_src;
+                d.t[3] = n.part;
+                d.i[0] = h;
+                d.i[1] = tk;
+            });
+            // partial_A = og_tp @ 0, partial_B = dg_tp @ n.slot_b. Blob-wide, so a decode program
+            // sharing a tensor table with prefill buckets names the SAME offset they do.
+            emit_xreduce(b, xgate, true, xr_cus, c_cmb, n.attn, h, tp, n.slot_b)
         };
         // LAYER-SEAM FOLD: one AddNorm writes the residual stream AND the next layer's normed
         // input, deleting the next block's `RmsNorm` packet. See `glm_fuse_seam`.
@@ -14379,8 +14498,9 @@ fn emit_glm_tail(
         })
     } else if let Some(counter) = lt {
         counter
-    } else if let Some(tile) =
-        (nb > 0).then(|| glm_decode_gemm_tile(rows, vocab_l, c.hidden, b.n_cu())).flatten()
+    } else if let Some(tile) = (nb > 0)
+        .then(|| glm_decode_gemm_tile(rows, vocab_l, c.hidden, b.n_cu()))
+        .flatten()
     {
         b.emit(tile, all, &[c_f], |d| {
             d.t[0] = n.logits;

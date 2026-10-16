@@ -136,7 +136,12 @@ fn the_refusal_carries_the_real_checkpoints_validated_geometry() {
         "the real config should parse AND validate through nn-graph; got: {msg}"
     );
     // Read off the released checkpoint: 40 layers, kv_source [2, 8, 14, 20], engram [1, 14].
-    for needle in ["40 layers", "4 kv_source layers", "[2, 8, 14, 20]", "[1, 14]"] {
+    for needle in [
+        "40 layers",
+        "4 kv_source layers",
+        "[2, 8, 14, 20]",
+        "[1, 14]",
+    ] {
         assert!(
             msg.contains(needle),
             "the refusal should report {needle:?} from the checkpoint; got: {msg}"
@@ -175,7 +180,12 @@ fn the_refusal_states_the_absorbed_mla_and_the_grouped_output_lora() {
     let Some(msg) = real_checkpoint_message() else {
         return;
     };
-    for needle in ["FULLY ABSORBED", "512-wide latent", "no kv_b tensor", "64 heads"] {
+    for needle in [
+        "FULLY ABSORBED",
+        "512-wide latent",
+        "no kv_b tensor",
+        "64 heads",
+    ] {
         assert!(
             msg.contains(needle),
             "the refusal should state {needle:?} -- it is read from the shards, not the config; \

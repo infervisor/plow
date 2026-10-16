@@ -271,8 +271,18 @@ impl DeepSeekV41Config {
         /// `engram_max_ngram_size == 4` and `engram_compressed_vocab_size == 99_092`, since the
         /// draw's bound is `(i64::MAX / compressed_vocab) / 2`.
         const MULTIPLIERS: [[i64; 4]; 2] = [
-            [76_632_096_046_245, 4_839_876_093_313, 35_959_672_319_349, 73_987_337_458_391],
-            [67_716_810_739_261, 51_510_806_800_915, 30_921_347_202_721, 82_619_226_485_591],
+            [
+                76_632_096_046_245,
+                4_839_876_093_313,
+                35_959_672_319_349,
+                73_987_337_458_391,
+            ],
+            [
+                67_716_810_739_261,
+                51_510_806_800_915,
+                30_921_347_202_721,
+                82_619_226_485_591,
+            ],
         ];
         if self.engram_layer_ids != [1, 14]
             || self.engram_max_ngram_size != 4
@@ -347,7 +357,12 @@ impl DeepSeekV41Config {
     /// and validates; the *emit* refuses, so the gap is a checklist rather
     /// than a dead end at `config.json`.
     pub fn unimplemented(&self) -> String {
-        let mut ratios: Vec<u32> = self.compress_ratios.iter().copied().filter(|r| *r > 0).collect();
+        let mut ratios: Vec<u32> = self
+            .compress_ratios
+            .iter()
+            .copied()
+            .filter(|r| *r > 0)
+            .collect();
         ratios.sort_unstable();
         ratios.dedup();
         format!(
@@ -429,8 +444,7 @@ impl DeepSeekV41Config {
                 self.qk_rope_head_dim, self.head_dim
             ));
         }
-        if self.num_key_value_heads == 0
-            || self.num_attention_heads % self.num_key_value_heads != 0
+        if self.num_key_value_heads == 0 || self.num_attention_heads % self.num_key_value_heads != 0
         {
             return bad(format!(
                 "deepseek_v41 num_attention_heads={} must be a positive multiple of \
@@ -728,8 +742,11 @@ impl DeepSeekV41Config {
         // checksum on the prime walk in `engram_hash_tables`. A walk that drifts (a missed
         // `seen`, a wrong restart point) lands here rather than in a silently wrong lookup.
         if let Some(t) = self.engram_hash_tables() {
-            for (at, (primes, rows)) in
-                t.primes.iter().zip(self.engram_num_embeddings.iter()).enumerate()
+            for (at, (primes, rows)) in t
+                .primes
+                .iter()
+                .zip(self.engram_num_embeddings.iter())
+                .enumerate()
             {
                 let span: i64 = primes.iter().sum();
                 if span != *rows {
@@ -1127,8 +1144,9 @@ mod tests {
 
     #[test]
     fn rejects_v4_scale_grid() {
-        let err =
-            mutated(|v| v["quantization_config"]["weight_block_size"] = serde_json::json!([128, 128]));
+        let err = mutated(|v| {
+            v["quantization_config"]["weight_block_size"] = serde_json::json!([128, 128])
+        });
         assert!(err.contains("block-FP8 [32,32]"), "{err}");
     }
 

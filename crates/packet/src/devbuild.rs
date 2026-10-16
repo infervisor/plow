@@ -1068,7 +1068,10 @@ impl Builder {
             &format!("act.splitk.{id}.m{m}n{n}s{s}.part"),
             u64::from(s) * u64::from(m) * u64::from(n) * 4,
         );
-        let ctr = self.tensor(&format!("act.splitk.{id}.m{m}n{n}s{s}.ctr"), u64::from(tiles) * 4);
+        let ctr = self.tensor(
+            &format!("act.splitk.{id}.m{m}n{n}s{s}.ctr"),
+            u64::from(tiles) * 4,
+        );
         inst.t[5] = part;
         inst.t[6] = ctr;
         inst.i[6] = s;
@@ -2629,9 +2632,8 @@ impl Builder {
         let lean_kda_key_factor = !uniseg
             && (self.lean_kda_key_factor_segments || kda_carry_regstate || kda_wu_lean)
             && (0..self.ops.len()).any(|i| lean_kda_key_factor_pair(&self.ops, i));
-        let mla_flash = |op: u16| {
-            op == DevOp::FlashMlaDecode as u16 || op == DevOp::FlashGatherDecode as u16
-        };
+        let mla_flash =
+            |op: u16| op == DevOp::FlashMlaDecode as u16 || op == DevOp::FlashGatherDecode as u16;
         let decode_mla_segments = !uniseg
             && self.decode_mla_segments
             && self.ops.windows(2).any(|pair| {
@@ -2731,8 +2733,16 @@ impl Builder {
             self.ops.get(i..i + 2).is_some_and(|pair| {
                 pair[0].inst.op == DevOp::MoeGroupGluPf as u16
                     && pair[1].inst.op == DevOp::MoeGroupDownPf as u16
-                    && crate::dev::moe_w8a8_dec_marked_parts(pair[0].inst.op, &pair[0].inst.i, pair[0].inst.j[1])
-                    && crate::dev::moe_w8a8_dec_marked_parts(pair[1].inst.op, &pair[1].inst.i, pair[1].inst.j[1])
+                    && crate::dev::moe_w8a8_dec_marked_parts(
+                        pair[0].inst.op,
+                        &pair[0].inst.i,
+                        pair[0].inst.j[1],
+                    )
+                    && crate::dev::moe_w8a8_dec_marked_parts(
+                        pair[1].inst.op,
+                        &pair[1].inst.i,
+                        pair[1].inst.j[1],
+                    )
             })
         };
         let decode_w8a8_moe = !uniseg && (0..self.ops.len()).any(moe_w8a8_dec_pair);
@@ -3005,9 +3015,7 @@ impl Builder {
         let same_segment_dep = |consumer: usize, dep: &Dep| {
             let producer = dep.producer() as usize;
             // A signalling raw router bumps its counter itself; its next segment keeps the wait.
-            if raw_segmented
-                && router_signal(producer)
-                && seg_of[consumer] == seg_of[producer] + 1
+            if raw_segmented && router_signal(producer) && seg_of[consumer] == seg_of[producer] + 1
             {
                 return true;
             }
@@ -3203,7 +3211,10 @@ impl Builder {
             let mut inst = op.inst;
             if router_signal(idx) {
                 let threshold = op.cus.len() as u32;
-                assert!(threshold < 1024 && op.counter < 1 << 20, "router signal fields");
+                assert!(
+                    threshold < 1024 && op.counter < 1 << 20,
+                    "router signal fields"
+                );
                 inst.i[5] |= threshold << 2 | op.counter << 12;
             }
             if kda_carry_keyfeed

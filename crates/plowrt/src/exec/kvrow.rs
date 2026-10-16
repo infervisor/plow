@@ -483,7 +483,9 @@ pub(crate) fn rebase_band_rows(
         }
         if d.op == DevOp::MlaMergeFold as u16
             && d.i[0] == tb
-            && names.get(d.t[0] as usize).is_some_and(|n| n == "act.oat_rs_tp")
+            && names
+                .get(d.t[0] as usize)
+                .is_some_and(|n| n == "act.oat_rs_tp")
         {
             d.i[0] = b;
         }

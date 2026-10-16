@@ -1239,7 +1239,6 @@ pub struct EmitConfig {
     #[arg(long, env = "PLOW_KDA_DECODE_FUSED_MIN_ROWS")]
     pub kda_decode_fused_min_rows: Option<u32>,
 
-
     /// GLM-5.3-Flash batched decode (rows > 1): largest split-K factor for the bf16 GemmSmall
     /// projections whose 64x128 tiles leave most workgroups idle (0 = off). NOT bit-identical.
     #[arg(long, env = "PLOW_GLM_DEC_SPLITK")]
@@ -2393,7 +2392,10 @@ impl EmitConfig {
     /// `PLOW_GLM_DECODE_GEMM_ROWS`: does a `rows`-row decode rung take the GEMM tile family?
     /// Never at one row, where the GEMV is the measured floor and the blob stays byte-identical.
     pub fn glm_decode_gemm_rows_on(&self, rows: u32) -> bool {
-        rows > 1 && self.glm_decode_gemm_rows.is_some_and(|thr| rows >= thr.max(2))
+        rows > 1
+            && self
+                .glm_decode_gemm_rows
+                .is_some_and(|thr| rows >= thr.max(2))
     }
 
     pub fn glm_decode_gemm_group(&self) -> bool {

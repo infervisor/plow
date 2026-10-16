@@ -15,7 +15,10 @@ use super::*;
 
 const HF: &str = "/workspace/models/DeepSeek-V4.1-Flash";
 
-fn checkpoint() -> Option<(Dsv41Cfg, std::collections::BTreeMap<String, (String, Vec<i64>)>)> {
+fn checkpoint() -> Option<(
+    Dsv41Cfg,
+    std::collections::BTreeMap<String, (String, Vec<i64>)>,
+)> {
     let dir = std::path::Path::new(HF);
     if !dir.join("config.json").exists() {
         eprintln!("skipping: DeepSeek-V4.1-Flash not present");
@@ -133,10 +136,12 @@ fn the_optional_groups_land_on_the_right_layers() {
             .iter()
             .any(|(n, _)| n == suffix)
     };
-    let layers_with = |suffix: &str| -> Vec<u32> {
-        (0..cfg.layers).filter(|l| has(*l, suffix)).collect()
-    };
-    assert_eq!(layers_with("attn.compressor.wkv.weight"), vec![2, 8, 14, 20]);
+    let layers_with =
+        |suffix: &str| -> Vec<u32> { (0..cfg.layers).filter(|l| has(*l, suffix)).collect() };
+    assert_eq!(
+        layers_with("attn.compressor.wkv.weight"),
+        vec![2, 8, 14, 20]
+    );
     assert_eq!(layers_with("attn.compressor.wgate.weight"), vec![2, 8, 14]);
     assert_eq!(
         layers_with("attn.indexer.wq_b.weight"),
@@ -244,7 +249,10 @@ fn the_block_fp8_grid_is_32_not_128_and_the_scales_are_e8m0() {
         let (wdt, wshape) = hdr.get(&w).unwrap_or_else(|| panic!("{w} missing"));
         let (sdt, sshape) = hdr.get(&sc).unwrap_or_else(|| panic!("{sc} missing"));
         assert_eq!(wdt, "F8_E4M3", "{w}");
-        assert_eq!(sdt, "F8_E8M0", "{sc} is a ue8m0 BYTE, not the f32 the kernel expects");
+        assert_eq!(
+            sdt, "F8_E8M0",
+            "{sc} is a ue8m0 BYTE, not the f32 the kernel expects"
+        );
         assert_eq!(
             *sshape,
             vec![(wshape[0] + 31) / 32, (wshape[1] + 31) / 32],
@@ -271,9 +279,16 @@ fn the_block_fp8_grid_is_32_not_128_and_the_scales_are_e8m0() {
     // The routed experts are the exception, and naming it keeps the scope honest: they are MXFP4
     // at group 32 along K only, which is a path plow ALREADY has — so the 39.8% figure excludes
     // the 49.4% of the prefill that the routed experts are.
-    let (edt, eshape) = hdr.get("layers.0.ffn.experts.0.w1.weight").expect("expert w1");
-    let (esdt, esshape) = hdr.get("layers.0.ffn.experts.0.w1.scale").expect("expert w1 scale");
-    assert_eq!(edt, "I8", "routed experts are nibble-packed fp4 in an I8 container");
+    let (edt, eshape) = hdr
+        .get("layers.0.ffn.experts.0.w1.weight")
+        .expect("expert w1");
+    let (esdt, esshape) = hdr
+        .get("layers.0.ffn.experts.0.w1.scale")
+        .expect("expert w1 scale");
+    assert_eq!(
+        edt, "I8",
+        "routed experts are nibble-packed fp4 in an I8 container"
+    );
     assert_eq!(esdt, "F8_E8M0");
     // [2304, 160]: full rows, K/32 columns — a per-32-along-K group, NOT a 2-D block.
     assert_eq!(*esshape, vec![eshape[0], (eshape[1] * 2 + 31) / 32]);
@@ -318,8 +333,14 @@ fn the_refusal_leads_with_the_emit_and_the_closed_kernel_gate_is_gone() {
          listed as missing:\n{joined}"
     );
     // The gaps that ARE still real must survive, or this test would pass on an empty list.
-    assert!(joined.contains("CSA2 emit"), "CSA2 emit is still missing:\n{joined}");
-    assert!(joined.contains("two-level indexer"), "the indexer is still missing:\n{joined}");
+    assert!(
+        joined.contains("CSA2 emit"),
+        "CSA2 emit is still missing:\n{joined}"
+    );
+    assert!(
+        joined.contains("two-level indexer"),
+        "the indexer is still missing:\n{joined}"
+    );
 }
 
 /// The op-198 emit primitive, pinned the way `glm_linear_fp8_prefill_routes_to_the_block_fp8_gemm`
@@ -367,7 +388,11 @@ fn a_ragged_n_is_emitted_because_only_k_is_unforgiving() {
     let o = b.tensor("act.kv", 512 * 576 * BF16);
     let all: Vec<u32> = (0..304u32).collect();
     emit_pf_gemm_fp8_mx(&mut b, &all, o, x, w, sc, 512, 576, 5120, &[]);
-    assert_eq!(b.finish().insts.len(), 1, "N = 576 is a real V4.1 shape, not an error");
+    assert_eq!(
+        b.finish().insts.len(),
+        1,
+        "N = 576 is a real V4.1 shape, not an error"
+    );
 }
 
 /// A K with a remainder does not mean "ragged tail" here, it means the grid bound to t[3] is not
@@ -478,7 +503,10 @@ fn the_declaration_puts_the_optional_groups_only_where_they_belong() {
             cfg.kv_source
         );
         // Present on EVERY layer, so a per-layer map must not lose it.
-        assert!(w.has(l, "attn.wq_a.weight"), "layer {l} lost its q_a projection");
+        assert!(
+            w.has(l, "attn.wq_a.weight"),
+            "layer {l} lost its q_a projection"
+        );
     }
 }
 
@@ -498,7 +526,10 @@ fn the_declared_total_is_the_documented_weight_budget() {
         .flat_map(|&l| super::dsv41::dsv41_layer_tensors(&cfg, l))
         .map(|(_, sz)| sz)
         .sum();
-    assert_eq!(w.bytes, listed, "the declaration must account for every listed byte");
+    assert_eq!(
+        w.bytes, listed,
+        "the declaration must account for every listed byte"
+    );
     // The breakdown, all of it derivable from the config rather than measured:
     //   routed experts  384 x 3 x 2304 x 5120 at 4 bits + ue8m0  = 7.22 GB/layer x 40 = 288.8
     //   engram tables   384 M rows x 256 fp8 + scales, 2 layers  = 202.8
@@ -566,8 +597,16 @@ fn the_attention_projection_chain_emits_against_the_real_weights() {
         .iter()
         .filter(|d| d.op == DevOp::GemmFp8Mx as u16)
         .collect();
-    assert_eq!(gemms.len(), 3, "q_a, q_b and kv are the three projections on this side");
-    let norms = p.insts.iter().filter(|d| d.op == DevOp::RmsNorm as u16).count();
+    assert_eq!(
+        gemms.len(),
+        3,
+        "q_a, q_b and kv are the three projections on this side"
+    );
+    let norms = p
+        .insts
+        .iter()
+        .filter(|d| d.op == DevOp::RmsNorm as u16)
+        .count();
     assert_eq!(norms, 2, "the input norm and the q-LoRA norm");
     assert!(
         p.insts.iter().all(|d| d.op != DevOp::GemmFp8Blk as u16),
@@ -585,7 +624,10 @@ fn the_attention_projection_chain_emits_against_the_real_weights() {
          head_dim ALREADY contains the {}-wide rope half, so there is nothing to add to it",
         cfg.head_dim, cfg.heads, cfg.qk_rope
     );
-    assert_eq!(kv.i[2], cfg.hidden, "the latent reads the normed input, width hidden");
+    assert_eq!(
+        kv.i[2], cfg.hidden,
+        "the latent reads the normed input, width hidden"
+    );
 
     let q = gemms
         .iter()
@@ -704,7 +746,11 @@ fn the_output_projection_is_two_ordinary_gemms_at_tp8() {
     let _guard = crate::test_env::env_guard();
     let (groups, orow, ocol) = cfg.wo_a_groups();
     assert_eq!(groups, 8);
-    assert_eq!(ocol, cfg.heads * cfg.head_dim / groups, "one rank's share of the heads");
+    assert_eq!(
+        ocol,
+        cfg.heads * cfg.head_dim / groups,
+        "one rank's share of the heads"
+    );
     let mut b = Builder::new(304);
     // Declared at tp=8, because the emit reads this rank's SHARE of wo_a. Declaring full-size
     // here and reading a per-rank shape is exactly the bug the operand check now catches.
@@ -712,10 +758,18 @@ fn the_output_projection_is_two_ordinary_gemms_at_tp8() {
     let all: Vec<u32> = (0..304u32).collect();
     let t = 512u32;
     let attn_out = b.tensor("act.attn_out", (t as u64) * (ocol as u64) * 2);
-    let (act, _) =
-        super::dsv41::emit_dsv41_attn_out(
-            &mut b, &cfg, &w, &all, 0, groups, attn_out, t, &mut 0, &[],
-        );
+    let (act, _) = super::dsv41::emit_dsv41_attn_out(
+        &mut b,
+        &cfg,
+        &w,
+        &all,
+        0,
+        groups,
+        attn_out,
+        t,
+        &mut 0,
+        &[],
+    );
     let p = b.finish();
     let g: Vec<_> = p
         .insts
@@ -724,7 +778,11 @@ fn the_output_projection_is_two_ordinary_gemms_at_tp8() {
         .collect();
     assert_eq!(g.len(), 2, "wo_a for this rank's group, then wo_b");
     let oa = g.iter().find(|d| d.t[0] == act.o_a).unwrap();
-    assert_eq!([oa.i[1], oa.i[2]], [orow, ocol], "wo_a is [o_lora_rank, one group's heads]");
+    assert_eq!(
+        [oa.i[1], oa.i[2]],
+        [orow, ocol],
+        "wo_a is [o_lora_rank, one group's heads]"
+    );
     // wo_b is INPUT-parallel: this rank multiplies its own group's [T, orow] by its own
     // [hidden, orow] slice and the ranks SUM. Reading the full wo_b_in() here would be the
     // all-gather form, which is 8x the arithmetic for the same answer.
@@ -734,16 +792,31 @@ fn the_output_projection_is_two_ordinary_gemms_at_tp8() {
         [cfg.hidden, orow],
         "wo_b reads THIS rank's group only, and the all-reduce sums the eight partials"
     );
-    assert_eq!(cfg.wo_b_in(), groups * orow, "the full wo_b input is o_groups * o_lora_rank");
+    assert_eq!(
+        cfg.wo_b_in(),
+        groups * orow,
+        "the full wo_b input is o_groups * o_lora_rank"
+    );
     // And the sum is actually emitted -- a partial nobody reduces is silently 1/8 of the answer.
     let xr: Vec<_> = p
         .insts
         .iter()
         .filter(|d| d.op == DevOp::XReduce as u16 || d.op == DevOp::XReduceTwoShot as u16)
         .collect();
-    assert_eq!(xr.len(), 1, "exactly one all-reduce closes the output projection");
-    assert_eq!(xr[0].t[0], act.o, "the reduce writes the layer's o, not the partial");
-    assert_eq!(xr[0].i[0], t * cfg.hidden, "it reduces the whole [T, hidden] partial");
+    assert_eq!(
+        xr.len(),
+        1,
+        "exactly one all-reduce closes the output projection"
+    );
+    assert_eq!(
+        xr[0].t[0], act.o,
+        "the reduce writes the layer's o, not the partial"
+    );
+    assert_eq!(
+        xr[0].i[0],
+        t * cfg.hidden,
+        "it reduces the whole [T, hidden] partial"
+    );
     assert_eq!(xr[0].i[1], groups, "over all 8 ranks");
     // The peer-slot NAME is the contract: plowrt binds `act.og_tp` into the peer region and every
     // other name into local VRAM, where the peers' slots are never written.
@@ -820,7 +893,11 @@ fn the_shared_expert_uses_the_clamped_swiglu_not_plain_silu() {
         .iter()
         .filter(|d| d.op == DevOp::GemmFp8Mx as u16)
         .collect();
-    assert_eq!(g.len(), 3, "gate, up and down are all block-fp8 dense GEMMs");
+    assert_eq!(
+        g.len(),
+        3,
+        "gate, up and down are all block-fp8 dense GEMMs"
+    );
     assert!(
         p.insts.iter().all(|d| d.op != DevOp::MoeGroupGluPf as u16),
         "the SHARED expert is not a routed expert; it must not reach the grouped MoE path"
@@ -833,7 +910,11 @@ fn the_shared_expert_uses_the_clamped_swiglu_not_plain_silu() {
     let gates = |d: &DevInst| -> Vec<packet::dev::Wait> {
         p.waits[d.wait_ofs as usize..d.wait_ofs as usize + d.wait_len as usize].to_vec()
     };
-    assert_eq!(gates(gate), gates(up), "gate and up are parallel, not serialised");
+    assert_eq!(
+        gates(gate),
+        gates(up),
+        "gate and up are parallel, not serialised"
+    );
 }
 
 /// V4.1's mHC is GLM-5.3's hyper-connection, and the emit must carry V4.1's OWN constants.
@@ -864,7 +945,10 @@ fn the_mhc_pair_is_glm53s_hyper_connection_at_v41s_own_constants() {
         .iter()
         .find(|d| d.op == DevOp::GemvF32 as u16)
         .expect("the mix GEMV");
-    assert_eq!(gv.i[1], mix, "the mix matrix is (2 + hc_mult) * hc_mult rows");
+    assert_eq!(
+        gv.i[1], mix,
+        "the mix matrix is (2 + hc_mult) * hc_mult rows"
+    );
     assert_eq!(
         gv.i[2],
         cfg.hc_mult * cfg.hidden,
@@ -883,7 +967,10 @@ fn the_mhc_pair_is_glm53s_hyper_connection_at_v41s_own_constants() {
         "Sinkhorn iterations from the config, not GLM's inlined 20"
     );
     assert_eq!(pre.f[0], cfg.eps);
-    assert_eq!(pre.f[1], cfg.raw.hc_eps, "hc_eps is its own epsilon, not rms_norm_eps");
+    assert_eq!(
+        pre.f[1], cfg.raw.hc_eps,
+        "hc_eps is its own epsilon, not rms_norm_eps"
+    );
     // rms_norm_eps is 1e-20 on this checkpoint and hc_eps is 1e-6 -- 14 orders apart, so
     // confusing them is not a rounding difference.
     assert_ne!(cfg.eps, cfg.raw.hc_eps);
@@ -930,7 +1017,10 @@ fn router_flag_bits_do_not_collide() {
     for (i, (na, a)) in named.iter().enumerate() {
         assert_eq!(a.count_ones(), 1, "{na} must be a single bit, got {a:#b}");
         for (nb, b) in &named[i + 1..] {
-            assert_ne!(a, b, "{na} and {nb} are the same bit ({a:#b}) -- one wire bit, two meanings");
+            assert_ne!(
+                a, b,
+                "{na} and {nb} are the same bit ({a:#b}) -- one wire bit, two meanings"
+            );
         }
     }
     // 2. GLM asks for SIGMOID scoring, and must not accidentally select another transform.
@@ -1006,7 +1096,19 @@ fn the_routed_experts_run_glms_prefill_body_at_v41_shapes() {
     // The shared expert is emitted separately (block-FP8, op 198); the MoE body only combines it.
     let sh = b.tensor("act.shared", (t as u64) * (cfg.hidden as u64) * 2);
     super::dsv41::emit_dsv41_moe(
-        &mut b, &cfg, &w, 0, tp, t, x_out, xn2, c_norm, (sh, c_norm), &mut xgate, &all, cfg.hidden,
+        &mut b,
+        &cfg,
+        &w,
+        0,
+        tp,
+        t,
+        x_out,
+        xn2,
+        c_norm,
+        (sh, c_norm),
+        &mut xgate,
+        &all,
+        cfg.hidden,
     );
     let p = b.finish();
 
@@ -1014,9 +1116,7 @@ fn the_routed_experts_run_glms_prefill_body_at_v41_shapes() {
     let rt = p
         .insts
         .iter()
-        .find(|d| {
-            d.op == DevOp::MoeRouterTopkPf as u16 || d.op == DevOp::MoeRouterTopk as u16
-        })
+        .find(|d| d.op == DevOp::MoeRouterTopkPf as u16 || d.op == DevOp::MoeRouterTopk as u16)
         .expect("a router top-k");
     assert_eq!(rt.i[1], cfg.n_exp, "384 routed experts");
     assert_eq!(rt.i[1], 384);
@@ -1030,8 +1130,16 @@ fn the_routed_experts_run_glms_prefill_body_at_v41_shapes() {
         "V4.1 scores with sqrt(softplus(.)); emitting sigmoid here still selects plausible \
          experts and silently reweights every one of them"
     );
-    assert_eq!(rt.i[3] & f::SIGMOID, 0, "and not sigmoid, which is a different function");
-    assert_ne!(rt.i[3] & f::BIAS, 0, "noaux_tc binds e_score_correction_bias");
+    assert_eq!(
+        rt.i[3] & f::SIGMOID,
+        0,
+        "and not sigmoid, which is a different function"
+    );
+    assert_ne!(
+        rt.i[3] & f::BIAS,
+        0,
+        "noaux_tc binds e_score_correction_bias"
+    );
 
     // The grouped expert ops are the MXFP4 pair, and they see this rank's TP slice of moe_inter.
     let glu: Vec<_> = p
@@ -1039,10 +1147,16 @@ fn the_routed_experts_run_glms_prefill_body_at_v41_shapes() {
         .iter()
         .filter(|d| d.op == DevOp::MoeGroupGluPf as u16)
         .collect();
-    assert!(!glu.is_empty(), "the routed experts must emit the grouped gate/up (op 85)");
+    assert!(
+        !glu.is_empty(),
+        "the routed experts must emit the grouped gate/up (op 85)"
+    );
     for g in &glu {
         // op 85: i0=I_moe i1=H i2=n_exp.
-        assert_eq!(g.i[2], cfg.n_exp, "the expert op carries the bound expert table");
+        assert_eq!(
+            g.i[2], cfg.n_exp,
+            "the expert op carries the bound expert table"
+        );
         assert_eq!(g.i[1], cfg.hidden);
         assert_eq!(
             g.i[0],
@@ -1072,7 +1186,10 @@ fn the_attention_core_is_512_wide_with_the_rope_inside_it() {
     let (hd, nope, rope) = super::dsv41::dsv41_attn_core_shape(&cfg);
     assert_eq!(hd, 512);
     assert_eq!(rope, 64, "qk_rope_head_dim");
-    assert_eq!(nope, 448, "and it is INSIDE head_dim, so nope is 448 and not 512");
+    assert_eq!(
+        nope, 448,
+        "and it is INSIDE head_dim, so nope is 448 and not 512"
+    );
     // The latent is one 512-wide row for all 64 heads: wkv is [512, hidden], not [576, hidden].
     let t = super::dsv41::dsv41_layer_tensors(&cfg, 0);
     let wkv = t
@@ -1109,12 +1226,18 @@ fn layer_zero_attends_over_the_window_only() {
     };
     assert!(!cfg.kv_source.contains(&0), "layer 0 owns no compressor");
     assert_eq!(cfg.kv_source, vec![2, 8, 14, 20]);
-    assert_eq!(cfg.sliding_window, 128, "the window every layer attends over");
+    assert_eq!(
+        cfg.sliding_window, 128,
+        "the window every layer attends over"
+    );
     // The window is smaller than an 8k prefill by the factor that matters.
     let t = 8192u64;
     let full = t * t / 2;
     let win = t * cfg.sliding_window as u64;
-    assert!(win * 30 < full, "the window must be the cheap form, not a detail");
+    assert!(
+        win * 30 < full,
+        "the window must be the cheap form, not a detail"
+    );
 }
 
 /// The attention core: interior rope, a WINDOWED absorbed-MLA flash, and the sink merge.
@@ -1142,7 +1265,22 @@ fn the_attention_core_is_windowed_nope_mla_over_the_shared_latent() {
     let cos = b.tensor("gen.cos", (ctx as u64) * 32 * 4);
     let sin = b.tensor("gen.sin", (ctx as u64) * 32 * 4);
     let (act, _) = super::dsv41::emit_dsv41_attn_core(
-        &mut b, &cfg, &w, &all, 0, tp, q, kv, kvlen, pos, cos, sin, None, t, ctx, &[],
+        &mut b,
+        &cfg,
+        &w,
+        &all,
+        0,
+        tp,
+        q,
+        kv,
+        kvlen,
+        pos,
+        cos,
+        sin,
+        None,
+        t,
+        ctx,
+        &[],
     );
     let p = b.finish();
 
@@ -1167,11 +1305,17 @@ fn the_attention_core_is_windowed_nope_mla_over_the_shared_latent() {
             "V4.1's rope is INTERLEAVED; the half-split arm is a different operator and does \
              NOT cancel when q and the latent take it together"
         );
-        assert_eq!(r.i[7], nope, "starting at 448 -- the SUFFIX, not the prefix");
+        assert_eq!(
+            r.i[7], nope,
+            "starting at 448 -- the SUFFIX, not the prefix"
+        );
         assert_eq!(r.i[5], 0, "normalize off; q_norm and kv_norm already ran");
     }
     assert_eq!(ropes[0].i[0], nh_l, "the query is per-head");
-    assert_eq!(ropes[1].i[0], 1, "the latent is ONE row shared by every head");
+    assert_eq!(
+        ropes[1].i[0], 1,
+        "the latent is ONE row shared by every head"
+    );
 
     let fl = p
         .insts
@@ -1264,14 +1408,23 @@ fn the_compressor_pools_with_no_ape_and_stops_before_the_rope() {
         .iter()
         .find(|d| d.op == DevOp::CompressPool as u16)
         .expect("a ratio-2 compressor pools");
-    assert_eq!(pool.t[3], TENSOR_NONE, "NO `ape` -- V4.1's Compressor has none");
-    assert_eq!(pool.t[5], TENSOR_NONE, "no cos on the pool: arm 2 stops before the rope");
+    assert_eq!(
+        pool.t[3], TENSOR_NONE,
+        "NO `ape` -- V4.1's Compressor has none"
+    );
+    assert_eq!(
+        pool.t[5], TENSOR_NONE,
+        "no cos on the pool: arm 2 stops before the rope"
+    );
     assert_eq!(pool.t[6], TENSOR_NONE);
     assert_eq!(pool.i[2], 1, "coff 1: no overlap transform");
     assert_eq!(pool.i[7], 2, "arm 2 -- pool, norm, STOP");
     assert_eq!(pool.i[1], 2, "layer 2 compresses at ratio 2");
     assert_eq!(pool.i[0], t / 2, "one pool per `ratio` tokens");
-    assert_eq!(pool.t[0], cp.latent, "the PRE-RoPE latent, which the indexer reads");
+    assert_eq!(
+        pool.t[0], cp.latent,
+        "the PRE-RoPE latent, which the indexer reads"
+    );
 
     let tail = p
         .insts
@@ -1279,7 +1432,10 @@ fn the_compressor_pools_with_no_ape_and_stops_before_the_rope() {
         .find(|d| d.op == DevOp::CompressRopeQuant as u16)
         .expect("op 199 finishes the cache row");
     assert_eq!(tail.t[0], cp.cache, "the shared cache");
-    assert_eq!(tail.t[1], cp.latent, "reading the latent it must NOT overwrite");
+    assert_eq!(
+        tail.t[1], cp.latent,
+        "reading the latent it must NOT overwrite"
+    );
     assert_ne!(
         tail.t[0], tail.t[1],
         "the reference ropes in place; here the indexer still has to read `src`, and a \
@@ -1287,8 +1443,14 @@ fn the_compressor_pools_with_no_ape_and_stops_before_the_rope() {
     );
     assert_eq!(tail.i[2], cfg.qk_rope, "only the last 64 rotate");
     assert_eq!(tail.i[3], 16, "fp4_act_quant(latent, 16, ...)");
-    assert_eq!(tail.i[6], 2, "fp4 e2m1 with an E4M3 scale, not a power of two");
-    assert_eq!(tail.i[4], 2, "a latent stands for the FIRST token of its group");
+    assert_eq!(
+        tail.i[6], 2,
+        "fp4 e2m1 with an E4M3 scale, not a power of two"
+    );
+    assert_eq!(
+        tail.i[4], 2,
+        "a latent stands for the FIRST token of its group"
+    );
 }
 
 /// Layer 20 compresses at ratio 1, and that is a plain projection with NO pool.
@@ -1415,27 +1577,35 @@ fn the_indexer_scores_pools_and_both_ops_agree_on_the_ratio() {
     let _guard = crate::test_env::env_guard();
     for (l, ratio) in [(2u32, 2u32), (20, 1)] {
         let (m, _) = super::dsv41::emit_dsv41_block(&cfg, &[l], 8, 304, 8192, 256);
-        let sc = m
-            .progs[0]
+        let sc = m.progs[0]
             .insts
             .iter()
             .find(|d| d.op == DevOp::IndexScorePf as u16)
             .unwrap_or_else(|| panic!("layer {l} is an index_source and must score"));
-        let se = m
-            .progs[0]
+        let se = m.progs[0]
             .insts
             .iter()
             .find(|d| d.op == DevOp::IndexSelectPf as u16)
             .unwrap_or_else(|| panic!("layer {l} must select"));
         assert_eq!(sc.i[4], ratio, "op 117 pool_size");
         assert_eq!(se.i[3], ratio, "op 118 pool_size");
-        assert_eq!(sc.i[4], se.i[3], "the score and the select MUST agree on the ratio");
-        assert_eq!(sc.i[1], cfg.index_heads, "all 32 heads: the indexer is replicated");
+        assert_eq!(
+            sc.i[4], se.i[3],
+            "the score and the select MUST agree on the ratio"
+        );
+        assert_eq!(
+            sc.i[1], cfg.index_heads,
+            "all 32 heads: the indexer is replicated"
+        );
         assert_eq!(sc.i[1], 32, "and 32 is what the MFMA A tile is");
         assert_eq!(sc.i[3], cfg.index_dim);
         assert_eq!(sc.i[2], se.i[2], "one score stride");
         // `min(index_topk, end_pos // ratio)` -- at t=256 and ratio 2 that is 128, not 512.
-        assert_eq!(se.i[1], cfg.index_topk.min(256 / ratio), "the reference's own min");
+        assert_eq!(
+            se.i[1],
+            cfg.index_topk.min(256 / ratio),
+            "the reference's own min"
+        );
     }
 }
 
@@ -1455,8 +1625,7 @@ fn an_index_layer_that_owns_no_keys_derives_none() {
     let (m, _) = super::dsv41::emit_dsv41_block(&cfg, &[20, 24], 8, 304, 8192, 256);
     // op 199 runs three times per KEY-OWNING index layer (cache row, index key, queries) and
     // once for a query-only one. Layer 20 owns keys, layer 24 does not: 3 + 1.
-    let tails = m
-        .progs[0]
+    let tails = m.progs[0]
         .insts
         .iter()
         .filter(|d| d.op == DevOp::CompressRopeQuant as u16)
@@ -1468,13 +1637,21 @@ fn an_index_layer_that_owns_no_keys_derives_none() {
     );
     // Both layers score and select: the SELECTION is per-layer, only the keys are shared.
     assert_eq!(
-        m.progs[0].insts.iter().filter(|d| d.op == DevOp::IndexScorePf as u16).count(),
+        m.progs[0]
+            .insts
+            .iter()
+            .filter(|d| d.op == DevOp::IndexScorePf as u16)
+            .count(),
         2
     );
     // And a single-layer chain at 24 must not invent a key derivation.
     let (m24, _) = super::dsv41::emit_dsv41_block(&cfg, &[24], 8, 304, 8192, 256);
     assert_eq!(
-        m24.progs[0].insts.iter().filter(|d| d.op == DevOp::CompressRopeQuant as u16).count(),
+        m24.progs[0]
+            .insts
+            .iter()
+            .filter(|d| d.op == DevOp::CompressRopeQuant as u16)
+            .count(),
         1,
         "layer 24 alone ropes only its queries"
     );
@@ -1498,14 +1675,12 @@ fn a_compressed_layer_merges_two_partials_with_the_sink_folded_once() {
     // BOTH passes are op 51. The gathered one is the one carrying a table on t7 -- the per-pack
     // union, which selects the V2 GATHER arm; the window pass leaves t7 unset and takes the dense
     // arm of the same body.
-    let win = m
-        .progs[0]
+    let win = m.progs[0]
         .insts
         .iter()
         .find(|d| d.op == DevOp::FlashMlaPrefill as u16 && d.t[7] == TENSOR_NONE)
         .expect("the window flash");
-    let gat = m
-        .progs[0]
+    let gat = m.progs[0]
         .insts
         .iter()
         .find(|d| d.op == DevOp::FlashMlaPrefill as u16 && d.t[7] != TENSOR_NONE)
@@ -1522,31 +1697,48 @@ fn a_compressed_layer_merges_two_partials_with_the_sink_folded_once() {
     );
     assert_eq!(win.t[0], gat.t[0], "ONE Opart, filled in disjoint halves");
     assert_eq!(win.t[1], gat.t[1], "ONE mlpart");
-    assert_ne!(win.t[4], gat.t[4], "and two DIFFERENT caches: the window K and the CSA2 cache");
+    assert_ne!(
+        win.t[4], gat.t[4],
+        "and two DIFFERENT caches: the window K and the CSA2 cache"
+    );
     assert_eq!(
         m.tensors[gat.t[7] as usize].name, "act.index_uni",
         "the gathered pass walks the per-pack UNION, not the raw per-query selection",
     );
-    assert_ne!(gat.i[3] & 0x8000_0000, 0, "NoPE: the rope is interior and already applied");
+    assert_ne!(
+        gat.i[3] & 0x8000_0000,
+        0,
+        "NoPE: the rope is interior and already applied"
+    );
 
-    let merges: Vec<_> = m
-        .progs[0]
+    let merges: Vec<_> = m.progs[0]
         .insts
         .iter()
         .filter(|d| d.op == DevOp::FlashMerge as u16)
         .collect();
-    assert_eq!(merges.len(), 1, "ONE merge: the sink joins one denominator, not two");
+    assert_eq!(
+        merges.len(),
+        1,
+        "ONE merge: the sink joins one denominator, not two"
+    );
     assert_eq!(merges[0].i[2], nsplit, "the merge folds every partial");
     assert_eq!(
         merges[0].t[3],
-        m.progs[0].insts.iter().find(|d| d.op == DevOp::FlashMerge as u16).unwrap().t[3],
+        m.progs[0]
+            .insts
+            .iter()
+            .find(|d| d.op == DevOp::FlashMerge as u16)
+            .unwrap()
+            .t[3],
     );
-    assert_ne!(merges[0].t[3], TENSOR_NONE, "the attention sink is folded here and only here");
+    assert_ne!(
+        merges[0].t[3], TENSOR_NONE,
+        "the attention sink is folded here and only here"
+    );
 
     // A window-only layer keeps the one-partial layout, byte-for-byte what it emitted before.
     let (m0, _) = super::dsv41::emit_dsv41_block(&cfg, &[0], 8, 304, 8192, 256);
-    let w0 = m0
-        .progs[0]
+    let w0 = m0.progs[0]
         .insts
         .iter()
         .find(|d| d.op == DevOp::FlashMlaPrefill as u16)
@@ -1597,20 +1789,39 @@ fn every_tp_weight_is_read_at_the_width_it_was_declared() {
         .iter()
         .find(|d| d.op == DevOp::GemmFp8Mx as u16 && byname(d.t[2]).ends_with("attn.wkv.weight"))
         .expect("the layer projects the shared latent through wkv");
-    assert_eq!(kv.i[1], cfg.head_dim, "wkv is replicated: the full 512, on every rank");
+    assert_eq!(
+        kv.i[1], cfg.head_dim,
+        "wkv is replicated: the full 512, on every rank"
+    );
 
     // The shared expert: OutSplit gate/up and InSplit down, all over `moe_inter`.
     for (suffix, n, k) in [
-        ("ffn.shared_experts.w1.weight", cfg.moe_inter / 8, cfg.hidden),
-        ("ffn.shared_experts.w3.weight", cfg.moe_inter / 8, cfg.hidden),
-        ("ffn.shared_experts.w2.weight", cfg.hidden, cfg.moe_inter / 8),
+        (
+            "ffn.shared_experts.w1.weight",
+            cfg.moe_inter / 8,
+            cfg.hidden,
+        ),
+        (
+            "ffn.shared_experts.w3.weight",
+            cfg.moe_inter / 8,
+            cfg.hidden,
+        ),
+        (
+            "ffn.shared_experts.w2.weight",
+            cfg.hidden,
+            cfg.moe_inter / 8,
+        ),
     ] {
         let d = m.progs[0]
             .insts
             .iter()
             .find(|d| d.op == DevOp::GemmFp8Mx as u16 && byname(d.t[2]).ends_with(suffix))
             .unwrap_or_else(|| panic!("{suffix} is not emitted"));
-        assert_eq!([d.i[1], d.i[2]], [n, k], "{suffix} is per-rank over moe_inter");
+        assert_eq!(
+            [d.i[1], d.i[2]],
+            [n, k],
+            "{suffix} is per-rank over moe_inter"
+        );
     }
 }
 
@@ -1691,7 +1902,10 @@ fn the_shared_experts_partial_is_consumed_by_the_combine_not_reduced_twice() {
         .iter()
         .filter(|d| d.op == DevOp::XReduce as u16 || d.op == DevOp::XReduceTwoShot as u16)
         .count();
-    assert_eq!(n_xr, 2, "TWO collectives per layer: attention, and the routed combine");
+    assert_eq!(
+        n_xr, 2,
+        "TWO collectives per layer: attention, and the routed combine"
+    );
 
     // EVERY offset this layer reduces at must be one the host actually binds, and the host binds
     // exactly two: 0 and `slot_b`. An offset outside that set is the failure this pins -- it does
@@ -1706,7 +1920,10 @@ fn the_shared_experts_partial_is_consumed_by_the_combine_not_reduced_twice() {
         slots.iter().all(|s| *s == 0 || *s == slot_b),
         "only slots 0 and slot_b={slot_b} exist, got {slots:?}"
     );
-    assert!(slots.contains(&0), "attention reduces slot 0, which the shared partial also lives in");
+    assert!(
+        slots.contains(&0),
+        "attention reduces slot 0, which the shared partial also lives in"
+    );
 }
 
 /// The routed combine's peer slot is BOUND. `GlmTn::none()` leaves `dg_tp` at `TENSOR_NONE` and
@@ -1724,7 +1941,11 @@ fn the_routed_combine_writes_a_real_peer_slot() {
         .iter()
         .find(|t| t.name == super::dsv41::PEER_SLOT_MOE)
         .expect("the routed combine declares act.dg_tp at tp>1");
-    assert_eq!(dg.bytes, 256 * cfg.hidden as u64 * 2, "one [T, hidden] slot");
+    assert_eq!(
+        dg.bytes,
+        256 * cfg.hidden as u64 * 2,
+        "one [T, hidden] slot"
+    );
     assert!(
         m.progs[0]
             .insts
@@ -1747,7 +1968,11 @@ fn the_layer_zero_rung_is_a_topological_program() {
     };
     let _guard = crate::test_env::env_guard();
     let (m, desc) = super::dsv41::emit_dsv41_block(&cfg, &[0], 8, 304, 2048, 256);
-    assert_eq!(m.progs.len(), 2, "one prefill bucket plus the empty decode placeholder");
+    assert_eq!(
+        m.progs.len(),
+        2,
+        "one prefill bucket plus the empty decode placeholder"
+    );
     let p = &m.progs[0];
     assert!(!p.insts.is_empty());
     for (i, d) in p.insts.iter().enumerate() {
@@ -1968,7 +2193,11 @@ fn the_rung_is_a_prefill_bucket_and_states_it_cannot_decode() {
     };
     let _guard = crate::test_env::env_guard();
     let (m, desc) = super::dsv41::emit_dsv41_block(&cfg, &[0], 8, 304, 2048, 512);
-    assert_eq!(m.prog_t, vec![512, 1], "one prefill bucket, then the decode slot");
+    assert_eq!(
+        m.prog_t,
+        vec![512, 1],
+        "one prefill bucket, then the decode slot"
+    );
 
     let roles =
         packet::devbuild::derive_roles(&m.prog_t, packet::devbuild::RoleSource::Positional, |_| 0);
@@ -2035,7 +2264,10 @@ fn a_block_range_emits_every_layer_in_it_chained() {
     // A single layer names its own weights; a chain cannot, because it draws on all of them.
     assert_eq!(d1.weights.prefix, "layers.3.");
     assert_eq!(d5.weights.prefix, "layers.");
-    assert_eq!(d5.layer, 3, "the descriptor names the first layer of the chain");
+    assert_eq!(
+        d5.layer, 3,
+        "the descriptor names the first layer of the chain"
+    );
 }
 
 /// Engram runs BEFORE the block, on the hc-expanded stream -- not inside the FFN sublayer.
@@ -2070,9 +2302,16 @@ fn engram_is_the_first_part_of_its_layer_not_an_ffn_one() {
             .position(|(n, _)| n.starts_with("mhc_pre"))
             .expect("every layer has an mhc_pre part");
         if eng.contains(&l) {
-            let at = at.unwrap_or_else(|| panic!("layer {l} is an engram layer and has no engram part"));
-            assert_eq!(at, 0, "layer {l}: engram is the FIRST part -- it precedes the block");
-            assert!(at < mhc, "layer {l}: engram must precede mhc_pre, not follow ffn_norm");
+            let at =
+                at.unwrap_or_else(|| panic!("layer {l} is an engram layer and has no engram part"));
+            assert_eq!(
+                at, 0,
+                "layer {l}: engram is the FIRST part -- it precedes the block"
+            );
+            assert!(
+                at < mhc,
+                "layer {l}: engram must precede mhc_pre, not follow ffn_norm"
+            );
         } else {
             assert!(at.is_none(), "layer {l} is not an engram layer");
         }
@@ -2158,9 +2397,15 @@ fn layer_one_opens_with_the_engram_gather_and_its_all_reduce() {
     let wkv = first(DevOp::GemmFp8Mx).expect("layer 1 projects the gather");
     let gate = first(DevOp::EngramGate).expect("layer 1 gates");
     let mhc = first(DevOp::HyperConnPre).expect("layer 1 has an mHC");
-    assert_eq!(gather, 0, "the gather is the layer's FIRST op -- Engram precedes the block");
+    assert_eq!(
+        gather, 0,
+        "the gather is the layer's FIRST op -- Engram precedes the block"
+    );
     assert!(gather < wkv && wkv < gate, "gather -> wkv -> gate");
-    assert!(gate < mhc, "Engram completes before mhc_pre collapses the copies");
+    assert!(
+        gate < mhc,
+        "Engram completes before mhc_pre collapses the copies"
+    );
 
     // The all-reduce sits BETWEEN the gather and wkv, and it is a real collective over the
     // gather's width, not a copy.
@@ -2202,7 +2447,10 @@ fn layer_one_opens_with_the_engram_gather_and_its_all_reduce() {
     );
     let rows = cfg.raw.engram_rows(1).expect("layer 1 has a table");
     assert_eq!(p.insts[gather].i[5], (rows as u64).div_ceil(8) as u32);
-    assert_eq!(p.insts[gather].i[3], 32, "V4.1's block size is 32, not V4's 128");
+    assert_eq!(
+        p.insts[gather].i[3], 32,
+        "V4.1's block size is 32, not V4's 128"
+    );
 
     // The gate is IN PLACE on the residual stream's hc copies -- the tensor mhc_pre then reads.
     assert_eq!(name(p.insts[gate].t[0]), "act.hc_residual_a");
@@ -2270,7 +2518,11 @@ fn the_mhc_pre_gate_comes_from_the_previous_sublayer() {
     // Sublayer k reads half k%2 and publishes into the other, so the halves alternate. Two
     // consecutive sublayers reading the same half would have the second one read its own output.
     let halves: Vec<u32> = pre.iter().map(|d| d.i[4]).collect();
-    assert_eq!(halves, vec![0, 1, 0, 1], "the pre_pair halves must alternate");
+    assert_eq!(
+        halves,
+        vec![0, 1, 0, 1],
+        "the pre_pair halves must alternate"
+    );
 
     let pair = pre[0].t[7];
     assert_ne!(pair, packet::dev::TENSOR_NONE, "pre_pair must be bound");
@@ -2310,7 +2562,10 @@ fn the_compressed_read_lands_on_the_reader_layers_not_the_writers() {
     assert!(!reads(0), "layer 0 is window-only");
     assert!(!reads(1), "layer 1 is window-only");
     for l in 2..cfg.layers {
-        assert!(reads(l), "layer {l} reads the compressed cache and must say so");
+        assert!(
+            reads(l),
+            "layer {l} reads the compressed cache and must say so"
+        );
     }
 
     // And the reader side is NOT the writer side: layer 3 reads without owning a compressor.

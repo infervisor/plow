@@ -29,14 +29,22 @@ pub(super) struct SegGeomRule {
 }
 
 pub(super) fn parse(spec: &str) -> Result<Vec<SegGeomRule>> {
-    let bad = |e: &str, why: &str| RuntimeError::Device(format!("PLOW_SEG_GEOM entry `{e}`: {why}"));
+    let bad =
+        |e: &str, why: &str| RuntimeError::Device(format!("PLOW_SEG_GEOM entry `{e}`: {why}"));
     let mut rules = Vec::new();
     for ent in spec.split(',').map(str::trim).filter(|s| !s.is_empty()) {
-        let (lhs, rhs) = ent.split_once('=').ok_or_else(|| bad(ent, "expected sel=value"))?;
+        let (lhs, rhs) = ent
+            .split_once('=')
+            .ok_or_else(|| bad(ent, "expected sel=value"))?;
         let (bucket, sel) = match lhs.split_once(':') {
             Some((b, s)) => {
-                let b = b.strip_prefix('T').ok_or_else(|| bad(ent, "bucket must be T<rows>"))?;
-                (Some(b.parse().map_err(|_| bad(ent, "bucket is not a u32"))?), s)
+                let b = b
+                    .strip_prefix('T')
+                    .ok_or_else(|| bad(ent, "bucket must be T<rows>"))?;
+                (
+                    Some(b.parse().map_err(|_| bad(ent, "bucket is not a u32"))?),
+                    s,
+                )
             }
             None => (None, lhs),
         };
@@ -94,7 +102,10 @@ pub(super) fn resolve(rules: &[SegGeomRule], bucket: u32, seg: usize, family: &s
 
 /// Families whose kernels stride over `gridDim` (safe to relaunch at any grid).
 pub(super) fn route_grid_free(family: &str) -> bool {
-    matches!(family, "kda_intra_wave_items" | "kda_wu_lean" | "kda_wu_lean_keys")
+    matches!(
+        family,
+        "kda_intra_wave_items" | "kda_wu_lean" | "kda_wu_lean_keys"
+    )
 }
 
 impl super::AmdEngine {
@@ -115,7 +126,11 @@ impl super::AmdEngine {
         k: HsaKernel,
         family: &str,
     ) -> (HsaKernel, u32) {
-        let g = self.progs[p].seg_geom_interp.get(seg).copied().unwrap_or_default();
+        let g = self.progs[p]
+            .seg_geom_interp
+            .get(seg)
+            .copied()
+            .unwrap_or_default();
         let k = match (g.alt, family) {
             (true, "interpreter") => self.k_prefill_alt.unwrap_or(k),
             (true, "flash_interpreter") => self.k_flash_alt.unwrap_or(k),
@@ -207,10 +222,31 @@ mod tests {
     #[test]
     fn parse_and_resolve() {
         let r = parse("interpreter=g192, T8192:s14=g64+alt,flash_interpreter=alt").unwrap();
-        assert_eq!(resolve(&r, 4096, 3, "interpreter"), SegGeom { grid: 192, alt: false });
-        assert_eq!(resolve(&r, 8192, 14, "interpreter"), SegGeom { grid: 64, alt: true });
-        assert_eq!(resolve(&r, 4096, 14, "interpreter"), SegGeom { grid: 192, alt: false });
-        assert_eq!(resolve(&r, 8192, 13, "flash_interpreter"), SegGeom { grid: 0, alt: true });
+        assert_eq!(
+            resolve(&r, 4096, 3, "interpreter"),
+            SegGeom {
+                grid: 192,
+                alt: false
+            }
+        );
+        assert_eq!(
+            resolve(&r, 8192, 14, "interpreter"),
+            SegGeom {
+                grid: 64,
+                alt: true
+            }
+        );
+        assert_eq!(
+            resolve(&r, 4096, 14, "interpreter"),
+            SegGeom {
+                grid: 192,
+                alt: false
+            }
+        );
+        assert_eq!(
+            resolve(&r, 8192, 13, "flash_interpreter"),
+            SegGeom { grid: 0, alt: true }
+        );
         assert_eq!(resolve(&r, 8192, 1, "kda_wu_lean_keys"), SegGeom::default());
         assert!(parse("interpreter=g0").is_err());
         assert!(parse("interpreter=x2").is_err());
