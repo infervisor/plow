@@ -217,9 +217,13 @@ impl PrefillArm {
         let mut moe = false;
         let mut a4w4 = false;
         let mut k3 = false;
+        let mut muse = false;
         for p in progs {
             for i in &p.insts {
                 let op = i.op;
+                // Muse Spark: its grouped MoE prefill rides the plain prefill object, which
+                // `scripts/build_gfx950.sh` builds with the Muse arms (MUSE_AX/MUSE_PF).
+                muse |= op == DevOp::MuseRmsNorm as u16;
                 if op == DevOp::FlashMlaPrefill as u16
                     || op == DevOp::FlashGatherPrefill as u16
                     || op == DevOp::MlaMergeFold as u16
@@ -261,6 +265,9 @@ impl PrefillArm {
                     k3 = true;
                 }
             }
+        }
+        if muse && !k3 && !mla {
+            return PrefillArm::None;
         }
         match (k3, moe, a4w4, mla) {
             (true, true, true, _) => PrefillArm::K3MoeA4w4,

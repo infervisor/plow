@@ -261,10 +261,16 @@ esac
 # Muse Spark packets (`PLOW_PACKET_HAS_MUSE_RMSNORM`) load the plain prefill/decode objects: no
 # MLA/KDA opcode selects another arm (exec/amd/object.rs `PrefillArm::detect`). Their block ops
 # (op_muse.h, QwenHeadNormRope) are PLOW_QWEN_GDN arms and the f32 router GEMV is a PLOW_K3 arm.
+# Their prefill buckets add the grouped MoE prefill chain with the A4W4 body to the plain prefill
+# object (MUSE_PF), not the MLA+MoE objects, which lack the Muse arms. Its activation quantizer
+# is the checkpoint's declared Quark rule (PLOW_MX_ACT_EVEN, amd_common.h).
 MUSE_AX=""
+MUSE_PF=""
 if [ -n "${PLOW_HSACO_CONFIG:-}" ] &&
    grep -qx '#define PLOW_PACKET_HAS_MUSE_RMSNORM 1' "$PLOW_HSACO_CONFIG"; then
   MUSE_AX="-DPLOW_K3=1 -DPLOW_QWEN_GDN=1"
+  grep -Eq '^#define PLOW_PACKET_OBJECT_REQUIRES "([^"]* )?PLOW_MOE_PREFILL=1( |")' "$PLOW_HSACO_CONFIG" &&
+    MUSE_PF="-DPLOW_MOE_PREFILL=1 -DPLOW_MOE_PF_A4W4=1 -DPLOW_MX_ACT_EVEN=1"
 fi
 # PLOW_DECODE_BODIES (default 1; =0 rolls back): bit-identical decode-body axes. MoE down/GLU and bf16 GEMV
 # lane-group maps (op_moe.h [FP8-DECODE-DOWN-LG]/[FP8-DECODE-X2], op_gemm_common.h
@@ -1119,12 +1125,19 @@ fi
 if [ -n "$MUSE_AX" ]; then
   DEC="$DEC $MUSE_AX"
   echo "   Muse Spark packet: plain objects carry $MUSE_AX"
+  # PLOW_MUSE_DEC_A4W4=1 (opt-in): decode experts with the prefill's A4W4 activation numerics
+  # (op_moe.h PLOW_MOE_DEC_A4). Default W4A16.
+  case "${PLOW_MUSE_DEC_A4W4:-0}" in
+    0) ;;
+    1) DEC="$DEC -DPLOW_MOE_DEC_A4=1" ;;
+    *) echo "PLOW_MUSE_DEC_A4W4 must be 0 or 1" >&2; exit 2 ;;
+  esac
 fi
 echo "   decode GEMV batch bucket: PLOW_GEMV_MM=$GVMM walk=$WALK inventory_prune=$decode_inventory_prune (PLOW_DECODE_BATCH=${PLOW_DECODE_BATCH:-1})"
 
 for B in 0 1; do
   N=$([ "$B" -eq 0 ] && echo prefill || echo decode)
-  D=$([ "$B" -eq 0 ] && echo "-DPLOW_BUCKET_DECODE=0 $MUSE_AX" || echo "$DEC")
+  D=$([ "$B" -eq 0 ] && echo "-DPLOW_BUCKET_DECODE=0 $MUSE_AX $MUSE_PF" || echo "$DEC")
   genco "$D" "i_$N.co"
   unbundle "i_$N.co" "interp_$N.elf"
 done
@@ -1190,7 +1203,8 @@ BUILD_MLA=0; [ "${PLOW_MLA_PREFILL:-0}" = 1 ] && BUILD_MLA=1
 # nothing, and its 81920 B double-buffered tile fits inside the interpreter's existing arena.
 BUILD_MOE=0; [ "${PLOW_MOE_PREFILL:-0}" = 1 ] && { BUILD_MOE=1; BUILD_MLA=1; }
 if [ -n "${PLOW_HSACO_CONFIG:-}" ]; then
-  grep -Eq '^#define PLOW_PACKET_OBJECT_REQUIRES "([^"]* )?PLOW_MOE_PREFILL=1( |")' "$PLOW_HSACO_CONFIG" && { BUILD_MOE=1; BUILD_MLA=1; }
+  grep -Eq '^#define PLOW_PACKET_OBJECT_REQUIRES "([^"]* )?PLOW_MOE_PREFILL=1( |")' "$PLOW_HSACO_CONFIG" &&
+    [ -z "$MUSE_AX" ] && { BUILD_MOE=1; BUILD_MLA=1; }
   # A Muse packet's MXFP4 experts run in the plain decode object; it loads no _mxfp4 object.
   grep -Eq '^#define PLOW_PACKET_OBJECT_REQUIRES "([^"]* )?PLOW_MOE_PF_A4W4=1( |")' "$PLOW_HSACO_CONFIG" &&
     [ -z "$MUSE_AX" ] && BUILD_MXFP4=1
@@ -1236,7 +1250,7 @@ esac
 if [ "$BUILD_GQ" = 1 ]; then
   for B in 0 1; do
     N=$([ "$B" -eq 0 ] && echo prefill || echo decode)
-    D=$([ "$B" -eq 0 ] && echo "-DPLOW_BUCKET_DECODE=0 $MUSE_AX $L2D $HIERPF" || echo "$DEC $L2D $HIERD")
+    D=$([ "$B" -eq 0 ] && echo "-DPLOW_BUCKET_DECODE=0 $MUSE_AX $MUSE_PF $L2D $HIERPF" || echo "$DEC $L2D $HIERD")
     genco "$D -DPLOW_GLOBAL_QUEUE=1 -DPLOW_GQ_BATCH=$GQB" "i_${N}_gq.co"
     unbundle "i_${N}_gq.co" "interp_${N}_gq.elf"
   done
@@ -1633,7 +1647,7 @@ check() { # <name> <defs> <max-total> <min-occ>
     rm -f "interp_$1.elf"; exit 1
   fi
 }
-check prefill "-DPLOW_BUCKET_DECODE=0 $MUSE_AX" 256 2
+check prefill "-DPLOW_BUCKET_DECODE=0 $MUSE_AX $MUSE_PF" 256 2
 check decode  "$DEC" 256 2
 check flash   "-DPLOW_BUCKET_DECODE=0 -DPLOW_BUCKET_FLASH -DPLOW_WG_WAVES=4 -DFA_DC=256 -DFA_DBUF=1 -DPLOW_MLA_PF_V2_ARM=1 $DSA_FLASH $NOPE_FLASH $FLASH_TR16" 512 1
 if [ "$need_decode_mla" = 1 ]; then
@@ -1644,7 +1658,7 @@ fi
 # with occ-2 prefill). These run only when the GQ objects were built.
 GQ_ELFS=""
 if [ "$BUILD_GQ" = 1 ]; then
-  check prefill_gq "-DPLOW_BUCKET_DECODE=0 $MUSE_AX -DPLOW_GLOBAL_QUEUE=1 -DPLOW_GQ_BATCH=$GQB $L2D $HIERPF" 256 2
+  check prefill_gq "-DPLOW_BUCKET_DECODE=0 $MUSE_AX $MUSE_PF -DPLOW_GLOBAL_QUEUE=1 -DPLOW_GQ_BATCH=$GQB $L2D $HIERPF" 256 2
   check decode_gq  "$DEC $L2D -DPLOW_GLOBAL_QUEUE=1 -DPLOW_GQ_BATCH=$GQB" 256 2
   check flash_gq   "-DPLOW_BUCKET_DECODE=0 -DPLOW_BUCKET_FLASH -DPLOW_WG_WAVES=4 -DFA_DC=256 -DFA_DBUF=1 -DPLOW_MLA_PF_V2_ARM=1 $DSA_FLASH $NOPE_FLASH $FLASH_TR16 -DPLOW_GLOBAL_QUEUE=1 -DPLOW_GQ_BATCH=$GQB $L2D $HIERPF" 512 1
   if [ "$need_decode_mla" = 1 ]; then

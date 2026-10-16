@@ -122,20 +122,8 @@ __device__ void d_moe_glu_a4w4_kw(unsigned char* __restrict__ fu, unsigned char*
             __builtin_amdgcn_wave_barrier();
             __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "wavefront");
             if (lane < TM && row_partidx[rowbase + lane] != PLOW_EXPERT_UNUSED) {
-                const float* bs = br + lane * 32u;
-                float amax = 0.0f;
-#pragma unroll
-                for (int z = 0; z < 32; z++) amax = fmaxf(amax, fabsf(bs[z]));
-                const unsigned char sbv = e8m0_for_amax(amax);
-                const float inv = e8m0_inv_f32(sbv);
                 mpf4_b16 q;
-#pragma unroll
-                for (int kk = 0; kk < 4; kk++) {
-                    unsigned w = 0u;
-#pragma unroll
-                    for (int j = 0; j < 8; j++) w |= quant_fp4(bs[kk * 8 + j] * inv) << (j * 4);
-                    q[kk] = w;
-                }
+                const unsigned char sbv = mpf4_quant_f32(br + lane * 32u, q);
                 mpf4_st16(fu + (size_t)(rowbase + lane) * (I >> 1) + (n0 >> 1), q);
                 fu_scale[(size_t)(rowbase + lane) * (I >> 5) + (n0 >> 5)] = sbv;
             }

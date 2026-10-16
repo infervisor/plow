@@ -6075,6 +6075,22 @@ __device__ static void plow_exec(CInst in_v, unsigned slice, CTens T_v, plow_sme
              * to before). */
             /* f1 = logit scale applied before the score transform (Muse Spark's
              * output_multiplier); 0 in every other packet, which the kernel reads as 1. */
+            /* i4 > 1: that many rows (one per workgroup), the table and logit rows advanced as
+             * op 83's token loop does (Muse Spark's batched decode rungs). */
+            if (in->i[4] > 1u) {
+                const unsigned ne = in->i[1], kk = in->i[2];
+                const bool f32l = (in->i[3] & 8u) != 0u;
+                for (unsigned r = slice; r < in->i[4]; r += nblk) {
+                    const bf16* lrow = f32l ? (const bf16*)((const float*)TEN(1) + (size_t)r * ne)
+                                            : (const bf16*)TEN(1) + (size_t)r * ne;
+                    d_moe_router_topk((unsigned char*)TEN(0) + (size_t)r * kk * 8, lrow,
+                                      (in->i[3] & 4u) ? (const float*)TEN(3) : nullptr, ne, kk,
+                                      in->i[3], in->fj[0].f, 0, 1, (float*)sm->raw, in->i[6],
+                                      in->i[7], nullptr, 0, in->fj[1].f);
+                    __syncthreads();
+                }
+                break;
+            }
             d_moe_router_topk((unsigned char*)TEN(0), (const bf16*)TEN(1),
                               (in->i[3] & 4u) ? (const float*)TEN(3) : nullptr, in->i[1], in->i[2],
                               in->i[3], in->fj[0].f, slice, nblk, (float*)sm->raw, in->i[6],
@@ -6116,12 +6132,12 @@ __device__ static void plow_exec(CInst in_v, unsigned slice, CTens T_v, plow_sme
             break;
 #endif
 #if !PLOW_DECODE_INVENTORY_PRUNE || PLOW_HAS_MOE_GROUP_GLU_FP8_BLK
-        case PLOW_DOP_MOE_GROUP_GLU_FP8_BLK: /* grouped: t3=wtab t4=stab; i0=k i1=I_moe i2=H i3=n_exp i5=act i6=ENC */
+        case PLOW_DOP_MOE_GROUP_GLU_FP8_BLK: /* grouped: t3=wtab t4=stab; i0=k i1=I_moe i2=H i3=n_exp i4=k/row i5=act i6=ENC */
             d_moe_group_glu_fp8_blk((bf16*)TEN(0), (const bf16*)TEN(1), (const unsigned char*)TEN(2),
                                     (const unsigned long long*)TEN(3),
                                     (const unsigned long long*)TEN(4), in->i[0], in->i[1], in->i[2],
                                     in->i[3], in->i[5], slice, nblk, in->i[6], in->fj[0].f,
-                                    in->fj[1].f);
+                                    in->fj[1].f, in->i[4]);
             break;
 #endif
 #if !PLOW_DECODE_INVENTORY_PRUNE || PLOW_HAS_MOE_GROUP_DOWN_FP8_BLK
@@ -6327,7 +6343,7 @@ __device__ static void plow_exec(CInst in_v, unsigned slice, CTens T_v, plow_sme
                                  /* tid2eid / token_ids are DSV4 hash routing (unread here);
                                   * i5 = the shared-expert fold's constant `k+1`th slot. */
                                  ,
-                                 nullptr, nullptr, in->i[5]
+                                 nullptr, nullptr, in->i[5], in->fj[1].f
             );
             break;
         case PLOW_DOP_MOE_ALIGN_PF:
@@ -6602,9 +6618,10 @@ __device__ static void plow_exec(CInst in_v, unsigned slice, CTens T_v, plow_sme
             break;
         /* Muse Spark (op_muse.h): built with the Qwen arms, checked by the same marker. */
         case PLOW_DOP_MUSE_RMSNORM:
+            /* t3/i3: band-major copy (i3 = band width, 0 = none). */
             d_muse_rmsnorm((bf16*)TEN(0), (const bf16*)TEN(1), (const bf16*)TEN(2), in->i[0],
                            in->i[1], in->i[2], in->fj[0].f, in->fj[1].f, slice, nblk,
-                           sm->part);
+                           sm->part, in->i[3] ? (bf16*)TEN(3) : nullptr, in->i[3]);
             break;
         case PLOW_DOP_MUSE_RESIDUAL_GATE:
             d_muse_residual_gate((bf16*)TEN(0), (const bf16*)TEN(1), (const bf16*)TEN(2),
@@ -6614,7 +6631,8 @@ __device__ static void plow_exec(CInst in_v, unsigned slice, CTens T_v, plow_sme
         case PLOW_DOP_MUSE_MOE_COMBINE_NORM:
             d_muse_moe_combine_norm((bf16*)TEN(0), (const float*)TEN(1),
                                     (const unsigned char*)TEN(2), (const bf16*)TEN(3), in->i[0],
-                                    in->i[1], in->fj[0].f, slice, nblk, (float*)sm->raw, in->i[2]);
+                                    in->i[1], in->fj[0].f, slice, nblk, (float*)sm->raw, in->i[2],
+                                    in->i[3], in->i[4] ? (bf16*)TEN(4) : nullptr, in->i[4]);
             break;
 #endif
         case PLOW_DOP_ROPE_INVERSE_O:

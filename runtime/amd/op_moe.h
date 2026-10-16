@@ -240,6 +240,30 @@ __device__ __forceinline__ float moe_glu(float g, float u, unsigned act, float b
     return moe_act(g, act) * u;
 }
 
+/* `moe_glu` with the reference's bf16 dataflow (bf16 gate/up projections, bf16 activation, bf16
+ * product): the tensor a Quark A4W4 down_proj fake-quantizes. */
+__device__ __forceinline__ float moe_glu_bf16(float g, float u, unsigned act, float beta,
+                                              float lbeta) {
+    const float gb = bf2f(f2bf(g)), ub = bf2f(f2bf(u));
+    if (act == PLOW_MOE_ACT_SITU || act == PLOW_MOE_ACT_SWIGLU_CLAMP)
+        return bf2f(f2bf(moe_glu(gb, ub, act, beta, lbeta)));
+    return bf2f(f2bf(bf2f(f2bf(moe_act(gb, act))) * ub));
+}
+
+/* PLOW_MOE_DEC_A4=1: the decode MXFP4 expert GEMVs run A4W4 numerics: each 32-element block of
+ * their bf16 activation is Quark-even quantize-dequantized on load (mx_even_fq32) and the GLU
+ * output keeps the bf16 dataflow. */
+#ifndef PLOW_MOE_DEC_A4
+#define PLOW_MOE_DEC_A4 0
+#endif
+#if PLOW_MOE_DEC_A4
+#define MOE_DEC_A4_FQ(x0, x1, x2, x3) mx_even_fq32(x0, x1, x2, x3)
+#define MOE_DEC_GLU moe_glu_bf16
+#else
+#define MOE_DEC_A4_FQ(x0, x1, x2, x3) ((void)0)
+#define MOE_DEC_GLU moe_glu
+#endif
+
 /* Sequential f32 dot of a bf16 row against a bf16 vector, bf16-rounded — the decode GEMV
  * element. `x` has K entries, `w` is one output row [K]. */
 __device__ __forceinline__ float moe_dot_bf16(const bf16* x, const bf16* w, unsigned K) {
@@ -829,8 +853,10 @@ __device__ __forceinline__ float wave_dot_mxfp4(const bf16* x, const unsigned ch
         const unsigned k = c * step + lane * 32;
         if (k + 32u <= K) {
             const fp4_frag32 wf = fp4_prep32(W[k >> 5], e8m0_to_f32(srow[k >> 5]));
-            acc = fp4_dot32(wf, ld_glob8(x + k), ld_glob8(x + k + 8), ld_glob8(x + k + 16),
-                            ld_glob8(x + k + 24), acc);
+            bf16v8 x0 = ld_glob8(x + k), x1 = ld_glob8(x + k + 8), x2 = ld_glob8(x + k + 16),
+                   x3 = ld_glob8(x + k + 24);
+            MOE_DEC_A4_FQ(x0, x1, x2, x3);
+            acc = fp4_dot32(wf, x0, x1, x2, x3, acc);
         }
     }
     return wave_sum(acc);
@@ -900,8 +926,9 @@ __device__ __forceinline__ void wave_dot_mxfp4_x2(const bf16* x, const unsigned 
             const fp4v32 w0 = A[k >> 5];
             const fp4v32 w1 = B[k >> 5]; /* independent of w0 — the point of the whole function */
             const float s0 = e8m0_to_f32(S0[k >> 5]), s1 = e8m0_to_f32(S1[k >> 5]);
-            const bf16v8 x0 = ld_glob8(x + k), x1 = ld_glob8(x + k + 8),
-                         x2 = ld_glob8(x + k + 16), x3 = ld_glob8(x + k + 24);
+            bf16v8 x0 = ld_glob8(x + k), x1 = ld_glob8(x + k + 8), x2 = ld_glob8(x + k + 16),
+                   x3 = ld_glob8(x + k + 24);
+            MOE_DEC_A4_FQ(x0, x1, x2, x3);
             a0 = fp4_dot32(fp4_prep32(w0, s0), x0, x1, x2, x3, a0);
             a1 = fp4_dot32(fp4_prep32(w1, s1), x0, x1, x2, x3, a1);
         }
@@ -954,8 +981,9 @@ __device__ __forceinline__ void wave_dot_mxfp4_lg2(const bf16* x, const unsigned
     if (k + 32u <= K) {
         const fp4v32 wa = A[k >> 5], wb = B[k >> 5];
         const float sa = e8m0_to_f32(Sa[k >> 5]), sb = e8m0_to_f32(Sb[k >> 5]);
-        const bf16v8 x0 = ld_glob8(x + k), x1 = ld_glob8(x + k + 8), x2 = ld_glob8(x + k + 16),
-                     x3 = ld_glob8(x + k + 24);
+        bf16v8 x0 = ld_glob8(x + k), x1 = ld_glob8(x + k + 8), x2 = ld_glob8(x + k + 16),
+               x3 = ld_glob8(x + k + 24);
+        MOE_DEC_A4_FQ(x0, x1, x2, x3);
         a = fp4_dot32(fp4_prep32(wa, sa), x0, x1, x2, x3, a);
         b = fp4_dot32(fp4_prep32(wb, sb), x0, x1, x2, x3, b);
     }
@@ -1254,7 +1282,7 @@ __device__ void d_moe_expert_glu_fp8_blk(bf16* fu, const bf16* x, const unsigned
         /* moe_glu, not moe_act: Kimi-K3's `situ` transforms the UP branch too, so the epilogue
          * shape is A(g)*B(u). For every other activation B is the identity and this is
          * byte-identical to what it replaces. */
-        if (lane == 0) fu_slot[n] = f2bf(moe_glu(g, u, act, beta, lbeta));
+        if (lane == 0) fu_slot[n] = f2bf(MOE_DEC_GLU(g, u, act, beta, lbeta));
     }
 }
 
@@ -1395,7 +1423,16 @@ __device__ void d_moe_group_glu_mfma(bf16*, const bf16*, const unsigned char*,
 __device__ PLOW_MOE_GROUP_INLINE void d_moe_group_glu_fp8_blk(
     bf16* fu, const bf16* x, const unsigned char* table, const unsigned long long* wtab,
     const unsigned long long* stab, unsigned k, unsigned I_moe, unsigned H, unsigned n_exp,
-    unsigned act, unsigned slice, unsigned nblk, unsigned enc, float beta, float lbeta) {
+    unsigned act, unsigned slice, unsigned nblk, unsigned enc, float beta, float lbeta,
+    unsigned kpr = 0) {
+    /* kpr (i4) > 0: `k` spans several rows of kpr slots each, and slot s reads row s / kpr of
+     * `x` (Muse Spark's batched decode). 0 = every slot reads the one row. */
+#if PLOW_MOE_MFMA || PLOW_MOE_GROUP_FLAT
+    if (kpr > 1u) { /* those bodies share one `x` row */
+        if (threadIdx.x == 0) __builtin_trap();
+        return;
+    }
+#endif
 #if PLOW_MOE_MFMA
     /* `enc` IS NOW HONOURED HERE. It used to be dropped on the floor with a comment saying so:
      * `d_moe_group_glu_mfma` was block-fp8 only, so under this non-default axis an MXFP4 packet's
@@ -1440,7 +1477,7 @@ __device__ PLOW_MOE_GROUP_INLINE void d_moe_group_glu_fp8_blk(
         const size_t brow = (size_t)n * (H >> 5); /* MXFP4 E8M0 scale row */
         const float g = wave_dot_enc(enc, x, Wg + (size_t)n * wstr, Sg + nrow, Bg + brow, H, lane);
         const float u = wave_dot_enc(enc, x, Wu + (size_t)n * wstr, Su + nrow, Bu + brow, H, lane);
-        if (lane == 0) fu[(size_t)slot * I_moe + n] = f2bf(moe_glu(g, u, act, beta, lbeta));
+        if (lane == 0) fu[(size_t)slot * I_moe + n] = f2bf(MOE_DEC_GLU(g, u, act, beta, lbeta));
     }
 #else
     /* MXFP4: FLATTEN THE (slot, channel) SPACE. The slot-outer walk below gives ONE WAVE PER
@@ -1485,15 +1522,17 @@ __device__ PLOW_MOE_GROUP_INLINE void d_moe_group_glu_fp8_blk(
             const unsigned char* Bu = (const unsigned char*)(size_t)stab[(size_t)eid * 3 + 1];
             const size_t brow = (size_t)n * (H >> 5);
             float g, u;
-            wave_dot_mxfp4_x2(x, Wg + (size_t)n * (H >> 1), Bg + brow, Wu + (size_t)n * (H >> 1),
+            const bf16* xr = kpr ? x + (size_t)(slot / kpr) * H : x;
+            wave_dot_mxfp4_x2(xr, Wg + (size_t)n * (H >> 1), Bg + brow, Wu + (size_t)n * (H >> 1),
                               Bu + brow, H, lane, g, u);
-            if (lane == 0) fu[(size_t)slot * I_moe + n] = f2bf(moe_glu(g, u, act, beta, lbeta));
+            if (lane == 0)
+                fu[(size_t)slot * I_moe + n] = f2bf(MOE_DEC_GLU(g, u, act, beta, lbeta));
         }
         return;
     }
     for (unsigned slot = 0; slot < k; slot++)
-        d_moe_expert_glu_fp8_blk(fu, x, table, wtab, stab, slot, I_moe, H, n_exp, act, slice, nblk,
-                                 enc, beta, lbeta);
+        d_moe_expert_glu_fp8_blk(fu, kpr ? x + (size_t)(slot / kpr) * H : x, table, wtab, stab,
+                                 slot, I_moe, H, n_exp, act, slice, nblk, enc, beta, lbeta);
 #endif
 }
 
@@ -2267,8 +2306,11 @@ __device__ void d_moe_router_topk_pf(unsigned char* table, const bf16* logit, co
                                       * sees `n_exp` and `k`, so a folded and an unfolded packet
                                       * route every token to the same routed experts with the same
                                       * gates, and differ only by the appended slot. */
-                                     unsigned shared_tail = 0
+                                     unsigned shared_tail = 0,
+                                     /* f1: the decode router's logit scale (Muse Spark). */
+                                     float logit_scale = 0.0f
                                      ) {
+    const float ls = logit_scale != 0.0f ? logit_scale : 1.0f;
 #if PLOW_MOE_PF_ATOMIC
     /* PLOW_MOE_PF_ATOMIC: zero the [T,H] f32 accumulator op 86 will atomically add into. This
      * packet is the earliest one in the MoE chain (router -> align -> GLU -> DOWN), so the
@@ -2321,8 +2363,8 @@ __device__ void d_moe_router_topk_pf(unsigned char* table, const bf16* logit, co
                 s[q] = 0.0f;
                 key[q] = 0ull;
                 if (e >= n_exp) continue;
-                const float l = f32log ? ((const float*)logit)[(size_t)tok * n_exp + e]
-                                       : bf2f(logit[(size_t)tok * n_exp + e]);
+                const float l = (f32log ? ((const float*)logit)[(size_t)tok * n_exp + e]
+                                        : bf2f(logit[(size_t)tok * n_exp + e])) * ls;
                 s[q] = 1.0f / (1.0f + expf(-l));
                 float sc = s[q] + (bias ? bias[e] : 0.0f);
                 unsigned sb;
@@ -2383,7 +2425,7 @@ __device__ void d_moe_router_topk_pf(unsigned char* table, const bf16* logit, co
         unsigned char* trow = table + (size_t)tok * (k + shared_tail) * 8;
         d_moe_router_topk(trow, lrow, bias, n_exp, k, flags, route_scale,
                           0, 1, lds, n_group, topk_group, tid2eid,
-                          token_ids ? token_ids[tok] : 0);
+                          token_ids ? token_ids[tok] : 0, logit_scale);
         if (shared_tail && threadIdx.x == 0) {
             *(unsigned*)(trow + (size_t)k * 8) = n_exp;
             *(float*)(trow + (size_t)k * 8 + 4) = 1.0f;
@@ -4011,6 +4053,8 @@ __device__ __forceinline__ float mpf4_glu(float g, float u, unsigned act, float 
 #if PLOW_MOE_PF_SITU_ONLY
     (void)act;
     return k3_situ_gate(g, beta) * k3_situ_up(u, lbeta);
+#elif PLOW_MX_ACT_EVEN
+    return moe_glu_bf16(g, u, act, beta, lbeta);
 #else
     return moe_glu(g, u, act, beta, lbeta);
 #endif
@@ -4098,8 +4142,8 @@ __device__ __forceinline__ void mpf4_quant_commit(mpf4_a32 a, unsigned char* dst
     for (int i = 0; i < 4; i++)
 #pragma unroll
         for (int j = 0; j < 8; j++) amax = fmaxf(amax, fabsf(bf2f(a.w[i][j])));
-    const unsigned char sb = e8m0_for_amax(amax);
-    const float inv = e8m0_inv_f32(sb);
+    const unsigned char sb = mx_act_e8m0(amax);
+    const float inv = mx_act_inv(sb);
     /* Packed a word at a time and written as ONE b128. Byte i of the block holds element 2i in
      * its low nibble and 2i+1 in its high nibble, so word k holds elements 8k..8k+7 at nibble
      * j — the same bytes the sixteen `dst16[i] = ...` stores produced, as one `ds_write_b128`
@@ -4109,11 +4153,29 @@ __device__ __forceinline__ void mpf4_quant_commit(mpf4_a32 a, unsigned char* dst
     for (int i = 0; i < 4; i++) {
         unsigned w = 0u;
 #pragma unroll
-        for (int j = 0; j < 8; j++) w |= quant_fp4(bf2f(a.w[i][j]) * inv) << (j * 4);
+        for (int j = 0; j < 8; j++) w |= mx_act_fp4(bf2f(a.w[i][j]) * inv) << (j * 4);
         q[i] = w;
     }
     mpf4_st16(dst16, q);
     *scale_out = sb;
+}
+
+/* The GLU bridge's quantizer: 32 f32 (one MX block, read twice from LDS: the amax has to be
+ * complete before anything is scaled) -> 16 fp4 bytes in `q`, E8M0 byte returned. */
+__device__ __forceinline__ unsigned char mpf4_quant_f32(const float* bs, mpf4_b16& q) {
+    float amax = 0.0f;
+#pragma unroll
+    for (int z = 0; z < 32; z++) amax = fmaxf(amax, fabsf(bs[z]));
+    const unsigned char sb = mx_act_e8m0(amax);
+    const float inv = mx_act_inv(sb);
+#pragma unroll
+    for (int k = 0; k < 4; k++) {
+        unsigned w = 0u;
+#pragma unroll
+        for (int j = 0; j < 8; j++) w |= mx_act_fp4(bs[k * 8 + j] * inv) << (j * 4);
+        q[k] = w;
+    }
+    return sb;
 }
 
 /* What a thread holds for its A block between ISSUE and COMMIT: 32 raw bf16 under GLU, 16 fp4
@@ -4145,7 +4207,7 @@ __device__ void d_moe_group_pf_a4w4(void* __restrict__ Cout, const void* __restr
 #if PLOW_MOE_PF_DET
                                     , unsigned det_ksh = 0
 #endif
-                                    ) {
+                                    , unsigned part16 = 0) {
     static_assert(!GLU || (MPF4_BM == 64 && MPF4_BN == MPF4_WNc * 64),
                   "A4W4 GLU requires paired gate/up accumulators per wave");
     constexpr int SMa = MPF4_BM / MPF4_WMc / MFMA_M; /* 1 */
@@ -4558,23 +4620,12 @@ __device__ void d_moe_group_pf_a4w4(void* __restrict__ Cout, const void* __restr
                  * read TWICE on purpose — the amax has to be complete before anything is scaled,
                  * and holding 32 floats across it costs more than re-reading LDS. */
                 const float* const bs = Br + r * (MPF4_BN / 2) + c0;
-                float amax = 0.0f;
-#pragma unroll
-                for (int z = 0; z < 32; z++) amax = fmaxf(amax, fabsf(bs[z]));
-                const unsigned char sbv = e8m0_for_amax(amax);
-                const float inv = e8m0_inv_f32(sbv);
                 unsigned char* o = fq + (size_t)(rowbase + r) * (N >> 1) + ((n0 + c0) >> 1);
                 /* Same byte layout as the sixteen `o[z] = ...` stores it replaces — byte i is
                  * element 2i low, 2i+1 high — emitted as one 16-byte store. Both N and the block
                  * origin are multiples of 32 elements, so `o` is 16-byte aligned. */
                 mpf4_b16 q;
-#pragma unroll
-                for (int k = 0; k < 4; k++) {
-                    unsigned w = 0u;
-#pragma unroll
-                    for (int j = 0; j < 8; j++) w |= quant_fp4(bs[k * 8 + j] * inv) << (j * 4);
-                    q[k] = w;
-                }
+                const unsigned char sbv = mpf4_quant_f32(bs, q);
                 mpf4_st16(o, q);
                 Cscale[(size_t)(rowbase + r) * (N >> 5) + ((n0 + c0) >> 5)] = sbv;
             }
@@ -4640,7 +4691,11 @@ __device__ void d_moe_group_pf_a4w4(void* __restrict__ Cout, const void* __restr
                         const unsigned rr =
                             wm * (MPF4_BM / MPF4_WMc) + i * MFMA_M + mfma_acc_m(lane, el);
                         MPF4_ROWMETA(rr, pidx, gv);
-                        part[(size_t)pidx * N + nn] = gv * acc[i][j][el];
+                        /* part16: the bf16 scatter (PLOW_MOE_PF_PART16), same gate multiply. */
+                        if (part16)
+                            ((bf16*)part)[(size_t)pidx * N + nn] = f2bf(gv * acc[i][j][el]);
+                        else
+                            part[(size_t)pidx * N + nn] = gv * acc[i][j][el];
                     }
                 }
         }
@@ -4743,7 +4798,7 @@ __device__ void d_moe_group_pf_a4w4(void* __restrict__ Cout, const void* __restr
 #if PLOW_MOE_PF_DET
                                     , unsigned det_ksh = 0
 #endif
-                                    ) {
+                                    , unsigned part16 = 0) {
     constexpr int SMa = MPF4_BM / MPF4_WMc / MFMA_M; /* 1 */
     constexpr int SNa = MPF4_BN / MPF4_WNc / MFMA_N; /* 2 */
     constexpr unsigned NB = GLU ? (MPF4_BN / 2) : MPF4_BN;
@@ -5012,20 +5067,9 @@ __device__ void d_moe_group_pf_a4w4(void* __restrict__ Cout, const void* __restr
                 const unsigned c0 = blk * 32u;
                 if (n0 + c0 >= N) continue;
                 const float* const bs = Br + r * (MPF4_BN / 2) + c0;
-                float amax = 0.0f;
-#pragma unroll
-                for (int z = 0; z < 32; z++) amax = fmaxf(amax, fabsf(bs[z]));
-                const unsigned char sbv = e8m0_for_amax(amax);
-                const float inv = e8m0_inv_f32(sbv);
                 unsigned char* o = fq + (size_t)(rowbase + r) * (N >> 1) + ((n0 + c0) >> 1);
                 mpf4_b16 q;
-#pragma unroll
-                for (int k = 0; k < 4; k++) {
-                    unsigned w = 0u;
-#pragma unroll
-                    for (int j = 0; j < 8; j++) w |= quant_fp4(bs[k * 8 + j] * inv) << (j * 4);
-                    q[k] = w;
-                }
+                const unsigned char sbv = mpf4_quant_f32(bs, q);
                 mpf4_st16(o, q);
                 Cscale[(size_t)(rowbase + r) * (N >> 5) + ((n0 + c0) >> 5)] = sbv;
             }
@@ -5091,7 +5135,11 @@ __device__ void d_moe_group_pf_a4w4(void* __restrict__ Cout, const void* __restr
                         const unsigned rr =
                             wm * (MPF4_BM / MPF4_WMc) + i * MFMA_M + mfma_acc_m(lane, el);
                         C3_ROWMETA(rr, pidx, gv);
-                        part[(size_t)pidx * N + nn] = gv * acc[i][j][el];
+                        /* part16: the bf16 scatter (PLOW_MOE_PF_PART16), same gate multiply. */
+                        if (part16)
+                            ((bf16*)part)[(size_t)pidx * N + nn] = f2bf(gv * acc[i][j][el]);
+                        else
+                            part[(size_t)pidx * N + nn] = gv * acc[i][j][el];
                     }
                 }
         }
@@ -5264,7 +5312,8 @@ __device__ void d_moe_group_down_pf(float* part, const bf16* fu, const unsigned 
 #endif
         d_moe_group_pf_a4w4<false>((void*)part, (const void*)fu, fu_scale, wtab, stab, meta,
                                    nullptr, row_partidx, row_gate, nullptr, H, I_moe, n_exp, 0,
-                                   slice, nblk, 0.0f, 0.0f, (void*)lds MPF_ATOM_ARG MPF_DET_ARG);
+                                   slice, nblk, 0.0f, 0.0f, (void*)lds MPF_ATOM_ARG MPF_DET_ARG,
+                                   part16);
         return;
     }
 #else

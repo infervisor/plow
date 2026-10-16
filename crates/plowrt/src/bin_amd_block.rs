@@ -3,7 +3,10 @@ use std::{path::PathBuf, sync::Arc, time::Instant};
 use plowrt::{
     asset::devblob::DevBlob,
     device::hsa::HsaBackend,
-    exec::{amd::AmdEngine, amd_tp::AmdTpGroup},
+    exec::{
+        amd::{AmdEngine, ChunkStep},
+        amd_tp::AmdTpGroup,
+    },
 };
 
 type Error = Box<dyn std::error::Error>;
@@ -144,6 +147,13 @@ pub fn run(
     if batch == 0 || batch > 64 {
         return Err("capture batch must be in 1..=64".into());
     }
+    // `tokens > 1`: one prefill chunk of that many rows at positions `prefix..` (slot 0).
+    let tokens = u32::try_from(metadata["tokens"].as_u64().unwrap_or(0))?;
+    let prefill = tokens > 1;
+    if prefill && batch != 1 {
+        return Err("a prefill capture is one sequence".into());
+    }
+    let live_rows = if prefill { tokens as usize } else { batch };
     let allocated_rows = parsed
         .progs
         .iter()
@@ -184,9 +194,9 @@ pub fn run(
             .into());
         }
         if name == "act.x"
-            && bytes.len() != activation_prefix_bytes(tensor.bytes, allocated_rows, batch)?
+            && bytes.len() != activation_prefix_bytes(tensor.bytes, allocated_rows, live_rows)?
         {
-            return Err("act.x.bin must cover exactly the live decode rows".into());
+            return Err("act.x.bin must cover exactly the live rows".into());
         }
         operands.push((name, bytes));
     }
@@ -207,10 +217,37 @@ pub fn run(
         .find(|t| t.name == output)
         .ok_or("packet has no act.xnext; use a single-layer block")?
         .bytes;
-    let output_bytes = activation_prefix_bytes(output_capacity, allocated_rows, batch)?;
+    let output_bytes = activation_prefix_bytes(output_capacity, allocated_rows, live_rows)?;
     let reference = std::fs::read(inputs.join("reference.bf16"))?;
-    let positions = vec![ctx - 1; batch];
-    let kv_lengths = vec![ctx; batch];
+    // Per-slot decode positions (mixed-length rungs), else every slot at `prefix` (ctx - 1).
+    let prefix = u32::try_from(metadata["prefix"].as_u64().unwrap_or(u64::from(ctx - 1)))?;
+    let positions = match metadata["positions"].as_array() {
+        Some(p) => p
+            .iter()
+            .map(|v| v.as_u64().and_then(|v| u32::try_from(v).ok()))
+            .collect::<Option<Vec<_>>>()
+            .ok_or("invalid positions")?,
+        None => vec![prefix; batch],
+    };
+    if positions.len() != batch || positions.iter().any(|&p| p >= ctx) {
+        return Err("positions must give one in-context row per slot".into());
+    }
+    if prefill && prefix + tokens > ctx {
+        return Err("prefill chunk exceeds the context".into());
+    }
+    let kv_lengths: Vec<u32> = positions.iter().map(|p| p + 1).collect();
+    let chunk = |engine: &AmdEngine| -> Result<ChunkStep, Error> {
+        let prog = (0..parsed.decode_rung_lo())
+            .filter(|&p| parsed.progs[p].role.rows() >= tokens)
+            .min_by_key(|&p| parsed.progs[p].role.rows())
+            .ok_or("no prefill bucket covers the chunk")?;
+        Ok(engine.chunk_program(ChunkStep {
+            prog,
+            c0: prefix,
+            clen: tokens,
+        }))
+    };
+    let prompt = vec![0u32; (prefix + tokens) as usize];
     let parked = vec![0; batch];
     if metadata["ctx"].as_u64() != Some(u64::from(ctx)) || reference.len() != output_bytes {
         return Err("reference context or residual shape differs from the requested block".into());
@@ -237,7 +274,7 @@ pub fn run(
                 .iter()
                 .find(|t| t.name == name)
                 .ok_or("reference stage absent from packet")?;
-            if bytes.len() != activation_prefix_bytes(tensor.bytes, allocated_rows, batch)? {
+            if bytes.len() != activation_prefix_bytes(tensor.bytes, allocated_rows, live_rows)? {
                 return Err(format!("{name}: stage shape mismatch").into());
             }
             Ok((name, bytes))
@@ -284,6 +321,7 @@ pub fn run(
                 "act.opart",
                 "act.mlpart",
                 "act.xn2",
+                "act.xe",
                 "act.attn",
                 "act.rlogit",
                 "act.tab",
@@ -309,6 +347,12 @@ pub fn run(
                 "act.blk_xq",
                 "act.blk_xs",
                 "act.og_tp",
+                "act.hn",
+                "act.qg",
+                "act.kg",
+                "act.vg",
+                "act.ogate",
+                "act.q",
             ] {
                 if let Some(size) = engine.tensor_bytes(name) {
                     let mut bytes = vec![0; size as usize];
@@ -339,6 +383,13 @@ pub fn run(
             for slot in 0..batch {
                 engine.dump_slot_kv(dir, &format!("rank{rank}"), slot, ctx)?;
             }
+            for tensor in parsed.tensors.iter().filter(|t| {
+                t.name.starts_with("kv.") && (t.name.ends_with(".k") || t.name.ends_with(".v"))
+            }) {
+                let mut bytes = vec![0; tensor.bytes as usize];
+                engine.read_tensor(&tensor.name, &mut bytes)?;
+                std::fs::write(dir.join(format!("rank{rank}.{}.bin", tensor.name)), bytes)?;
+            }
             for (name, reference) in &stages {
                 let mut bytes = vec![0; reference.len()];
                 engine.read_tensor(name, &mut bytes)?;
@@ -348,7 +399,8 @@ pub fn run(
         for (name, reference) in &stages {
             let mut bytes = vec![0; reference.len()];
             engine.read_tensor(name, &mut bytes)?;
-            check_rows(&bytes, reference, batch, tolerance).map_err(|e| format!("{name}: {e}"))?;
+            check_rows(&bytes, reference, live_rows, tolerance)
+                .map_err(|e| format!("{name}: {e}"))?;
         }
         Ok(())
     };
@@ -369,7 +421,8 @@ pub fn run(
             std::fs::write(
                 path,
                 serde_json::to_string_pretty(&serde_json::json!({
-                    "scope": "single-block-decode", "batch": batch, "ctx": ctx, "tp": tp,
+                    "scope": if prefill { "single-block-prefill" } else { "single-block-decode" },
+                    "batch": batch, "tokens": tokens, "ctx": ctx, "tp": tp,
                     "oracle_verified": false, "validation_errors": errors,
                     "input_dir": inputs, "blob": blob, "hsaco": hsaco, "checkpoint": checkpoint
                 }))?,
@@ -380,19 +433,29 @@ pub fn run(
     // `rank`: a head-major KV operand that covers all `tp` ranks' heads is split per rank.
     let run = |engines: &mut [&mut AmdEngine], rank: usize| -> Result<(), Error> {
         for engine in engines {
-            if engine.batch() != batch {
-                return Err("capture batch must equal the packet's allocated decode batch".into());
+            // A capture narrower than the packet runs the rung of its width; the slots past it
+            // sit at position 0.
+            let slots = engine.batch();
+            if slots < batch {
+                return Err("capture batch exceeds the packet's allocated decode batch".into());
             }
             if ctx as usize > engine.max_ctx() {
                 return Err("context exceeds packet capacity".into());
             }
-            engine.decode_prepare_batched(&positions, &kv_lengths)?;
-            engine.upload_parked(&parked)?;
+            if !prefill {
+                let pad = |v: &[u32], fill: u32| {
+                    let mut v = v.to_vec();
+                    v.resize(slots, fill);
+                    v
+                };
+                engine.decode_prepare_batched(&pad(&positions, 0), &pad(&kv_lengths, 1))?;
+                engine.upload_parked(&pad(&parked, 0))?;
+            }
             for (name, bytes) in &operands {
                 if name.starts_with("kv.") {
                     let capacity = engine.tensor_bytes(name).ok_or("missing KV tensor")? as usize;
                     let (stride, prefix) =
-                        carried_state_layout(name, capacity, batch, engine.max_ctx(), ctx)?;
+                        carried_state_layout(name, capacity, slots, engine.max_ctx(), ctx)?;
                     let ranks = if tp > 1 && bytes.len() == prefix * batch * tp as usize {
                         tp as usize
                     } else {
@@ -421,8 +484,14 @@ pub fn run(
         for i in 0..iterations {
             run(&mut [&mut single], 0)?;
             let start = Instant::now();
-            let dp = single.decode_prog_for(batch);
-            single.run(dp, single.decode_kernel_for(dp))?;
+            if prefill {
+                let step = chunk(&single)?;
+                single.prefill_prepare(&prompt, step)?;
+                single.run_segmented(step.prog)?;
+            } else {
+                let dp = single.decode_prog_for(batch);
+                single.run(dp, single.decode_kernel_for(dp))?;
+            }
             let elapsed = start.elapsed();
             plowrt::obs::dstep::token(elapsed.as_nanos() as u64);
             let us = elapsed.as_secs_f64() * 1e6;
@@ -433,7 +502,7 @@ pub fn run(
                 if let Err(e) = check_stages(&single, 0) {
                     errors.push(e.to_string());
                 }
-                if let Err(e) = check_rows(&bytes, &reference, batch, tolerance) {
+                if let Err(e) = check_rows(&bytes, &reference, live_rows, tolerance) {
                     errors.push(e.to_string());
                 }
                 validation_failure(errors)?;
@@ -460,9 +529,18 @@ pub fn run(
                 run(&mut [group.rank_mut(rank)], rank)?;
             }
             let start = Instant::now();
-            let dp = group.rank(0).decode_prog_for(batch);
-            group.submit_decode_batched_at(&positions, &kv_lengths, dp)?;
-            group.complete_block()?;
+            if prefill {
+                let step = chunk(group.rank(0))?;
+                group.prefill_chunk(&prompt, step, None)?;
+            } else {
+                let dp = group.rank(0).decode_prog_for(batch);
+                let slots = group.rank(0).batch();
+                let (mut pos, mut kvl) = (positions.clone(), kv_lengths.clone());
+                pos.resize(slots, 0);
+                kvl.resize(slots, 1);
+                group.submit_decode_batched_at(&pos, &kvl, dp)?;
+                group.complete_block()?;
+            }
             let elapsed = start.elapsed();
             plowrt::obs::dstep::token(elapsed.as_nanos() as u64);
             let us = elapsed.as_secs_f64() * 1e6;
@@ -474,7 +552,7 @@ pub fn run(
                     if let Err(e) = check_stages(group.rank(rank), rank) {
                         errors.push(format!("rank{rank}: {e}"));
                     }
-                    if let Err(e) = check_rows(&bytes, &reference, batch, tolerance) {
+                    if let Err(e) = check_rows(&bytes, &reference, live_rows, tolerance) {
                         errors.push(format!("rank{rank}: {e}"));
                     }
                 }
@@ -494,7 +572,7 @@ pub fn run(
     }
     let relative_l2 = outputs
         .iter()
-        .map(|b| check_rows(b, &reference, batch, tolerance))
+        .map(|b| check_rows(b, &reference, live_rows, tolerance))
         .collect::<Result<Vec<_>, _>>()?;
     if outputs.iter().any(|b| b != &outputs[0]) {
         return Err("block residual differs across TP ranks".into());
@@ -508,8 +586,9 @@ pub fn run(
     let mut sorted = samples.clone();
     sorted.sort_by(f64::total_cmp);
     let record = serde_json::json!({
-        "scope": "single-block-decode", "clock": if tp == 1 { "host-dispatch-drain" } else { "host-prepare-dispatch-drain-audit" },
-        "batch": batch, "ctx": ctx, "tp": tp, "warmup": warmup,
+        "scope": if prefill { "single-block-prefill" } else { "single-block-decode" },
+        "clock": if tp == 1 { "host-dispatch-drain" } else { "host-prepare-dispatch-drain-audit" },
+        "batch": batch, "tokens": tokens, "ctx": ctx, "tp": tp, "warmup": warmup,
         "latency_us_median": sorted[sorted.len()/2], "samples_us": samples,
         "input_dir": inputs, "blob": blob, "hsaco": hsaco, "checkpoint": checkpoint,
         "finiteness": true, "rank_identity": true, "oracle_verified": true, "relative_l2": relative_l2,

@@ -563,8 +563,9 @@ pub enum DevOp {
     /// `wave_dot_fp8_blk`, same slot layout); the win is per-op overhead (one counter edge + one
     /// interp dispatch instead of `k`). Sentinel/EP-non-local (null base) slots leave `fu` unwritten.
     /// `t0=fu[k,I_moe] t1=x t2=routing_table t3=expert_weight_table t4=expert_scale_table` ·
-    /// `i0=k i1=I_moe i2=H i3=n_exp i5=act i6=enc` · `f0=situ_beta f1=situ_linear_beta`, exactly
-    /// as [`DevOp::MoeExpertGluFp8Blk`].
+    /// `i0=k i1=I_moe i2=H i3=n_exp i4=k_per_row? i5=act i6=enc` · `f0=situ_beta
+    /// f1=situ_linear_beta`, exactly as [`DevOp::MoeExpertGluFp8Blk`]. `k_per_row` (0 = all slots
+    /// read the one `x` row): slot `s` reads row `s / k_per_row` (batched decode rows).
     MoeGroupGluFp8Blk = 48,
     /// GROUPED block-fp8 expert down — ONE packet loops all `k` slots that
     /// [`DevOp::MoeExpertDownFp8Blk`] did one-per-packet. Bit-identical gate-scaled `part`; sentinel /
@@ -644,8 +645,9 @@ pub enum DevOp {
     /// dot); this cheap 1-CU op does the score transform (sigmoid|softmax) + `e_score_correction_bias`
     /// on SELECTION only + group-limited top-k with lowest-id tie-break + norm_topk + route_scale over
     /// the precomputed logits. Byte-for-byte the selection logic of [`DevOp::MoeRouter`], minus the GEMV.
-    /// `t0=table t1=logit(bf16[n_exp]) t3=bias(f32[n_exp] or 0)` · `i1=n_exp i2=k i3=flags` ·
-    /// `f0=route_scale f1=logit_scale?` (scales the logit before the transform; 0 = 1).
+    /// `t0=table t1=logit(bf16[n_exp]) t3=bias(f32[n_exp] or 0)` · `i1=n_exp i2=k i3=flags
+    /// i4=rows?` · `f0=route_scale f1=logit_scale?` (scales the logit before the transform; 0 = 1).
+    /// `rows > 1`: that many logit/table rows, one workgroup each (0 = one row on one CU).
     MoeRouterTopk = 56,
 
     /// FUSED MLA merge + W_uv fold (`d_mla_merge_fold`) — replaces the [`DevOp::FlashMerge`] +
@@ -859,7 +861,8 @@ pub enum DevOp {
     /// bit-identical PER TOKEN to the decode router by construction. The `[T,n_exp]` logit matrix is
     /// an ordinary [`DevOp::Gemm`], already in the prefill bucket; only this tail was missing.
     /// `t0=table[T*k] t1=logit(bf16[T,n_exp]) t2=atom_acc? t3=bias` ·
-    /// `i0=atom_h i1=n_exp i2=k i3=flags i4=T i5=shared_tail` · `f0=route_scale`.
+    /// `i0=atom_h i1=n_exp i2=k i3=flags i4=T i5=shared_tail` · `f0=route_scale
+    /// f1=logit_scale?` (as [`DevOp::MoeRouterTopk`]).
     ///
     /// `i5` is PLOW_GLM_MOE_SHARED_FOLD: 1 makes the table `[T*(k+1)]`, each token's last slot the
     /// constant `{expert n_exp, gate 1.0}` — the shared expert routed as one more expert. The
@@ -2406,8 +2409,10 @@ pub enum DevOp {
     /// A third call site, differing from the other two only in `i3`/`i6`/`i7`.
     CompressRopeQuant = 217,
     /// Muse Spark row RMSNorm (`op_muse.h` `d_muse_rmsnorm`), one workgroup per row.
-    /// `t0=out(bf16[rows][dim]) t1=x(bf16) t2=w(bf16[dim])?` · `i0=rows i1=dim i2=mode` · `f0=eps`
-    /// `f1=oscale` (0 = 1: the final norm carries the logit `output_multiplier`).
+    /// `t0=out(bf16[rows][dim]) t1=x(bf16) t2=w(bf16[dim])? t3=band_out?` · `i0=rows i1=dim
+    /// i2=mode i3=band_cols?` · `f0=eps f1=oscale` (0 = 1: the final norm carries the logit
+    /// `output_multiplier`). `band_cols` (0 = none) also writes the band-major copy
+    /// `band_out[c / band_cols][row][c % band_cols]` (the TP latent projections' input bands).
     /// `mode` 0: `x*r*w` (`w` absent = weightless); 1 CENTERED: `x*r*(1+w)`;
     /// 2 INPUT_SCALED: `y = bf16(x*(1+w))`, `y*r(y)`. Every product is rounded to bf16 where the
     /// reference rounds it.
@@ -2420,9 +2425,10 @@ pub enum DevOp {
     /// Muse Spark expert combine with the per-(token, expert) input-scaled post-expert norm.
     /// `part` is the grouped down projection's `gate * y`; per slot this recovers
     /// `y = bf16(part/gate)`, applies the input-scaled RMSNorm, and sums `gate * norm(y)` in f32.
-    /// `t0=out(bf16[H]) t1=part(f32[k][H]) t2=table t3=w(bf16[H])` · `i0=H i1=k i2=ybf` ·
-    /// `f0=eps`. `ybf = 1` (TP): `part` is the reduced bf16 unweighted `y[k][H]`.
-    /// Decode (one token) only.
+    /// `t0=out(bf16[rows][H]) t1=part(f32[rows][k][H]) t2=table t3=w(bf16[H]) t4=band_out?` ·
+    /// `i0=H i1=k i2=ybf i3=rows? i4=band_cols?` · `f0=eps`. `ybf` (TP): `part` is the reduced
+    /// bf16 `[rows][k][H]`, 1 = unweighted `y`, 2 = `gate * y`. `rows` (0 = 1): one workgroup per
+    /// row; `band_cols` as [`DevOp::MuseRmsNorm`].
     MuseMoeCombineNorm = 220,
 }
 
