@@ -9071,6 +9071,15 @@ pub fn run_verified(args: EmitArgs, verify: Option<VerifyHook>) {
     // theta as an `Option` and `require_mla_rope` refuses a NoPE checkpoint, so the `kimi` arm
     // is loud about this one too even without the claim above. `kimi_k3_emit` never returns: it
     // validates everything the front end can and then reports what is not implemented.
+    // Muse Spark nests under `text_config` too; unclaimed, `cfg_from` reads it as Gemma-4 and dies
+    // on the absent `global_head_dim`.
+    if matches!(model_type.as_str(), "muse_spark" | "muse_spark_text") {
+        panic!(
+            "{model_type}: Muse Spark device emission is not implemented (NoPE GQA, gated \
+             attention output, residual gates and the latent MoE have no devgen route yet); \
+             nn-graph models it in crates/nn-graph/src/models/muse_spark.rs"
+        );
+    }
     if model_type == "kimi_k3" {
         // The hybrid emitter is the production default. Keep the old itemised
         // capability report behind `K3_FULL=0` as a diagnostic; experiments

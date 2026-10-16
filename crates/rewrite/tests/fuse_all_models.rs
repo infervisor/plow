@@ -55,10 +55,12 @@ fn assert_expert_bindings_in_checkpoint(g: &nn_graph::Graph) {
         }
     }
 
+    // Expert-scoped weights the compute DAG consumes (Muse's post-expert norm) are leaves.
+    let dag = graph_dag_weights(g);
     let checkpoint_experts = g
         .checkpoint_manifest()
         .into_iter()
-        .filter(|weight| weight.name.contains(".mlp.experts."))
+        .filter(|weight| weight.name.contains(".mlp.experts.") && !dag.contains(&*weight.name))
         .map(|weight| weight.name.to_string())
         .collect();
     assert_eq!(bound, checkpoint_experts, "expert manifest is incomplete");
@@ -872,4 +874,81 @@ fn fuse_qwen35() {
         graph_weights(&g),
         "Qwen3.5 fusion dropped or duplicated weight leaves"
     );
+}
+
+// --- Muse Spark: gated residuals, centered / input-scaled norms, latent MoE ---
+
+/// IlyasMoutawwakil/tiny-random-Muse-Spark-NVFP4 `text_config`, unquantized.
+const MUSE_SPARK: &str = r#"{
+    "model_type": "muse_spark",
+    "dtype": "bfloat16",
+    "text_config": {
+        "model_type": "muse_spark_text",
+        "attention_bias": false,
+        "final_logit_softcapping": 20.0,
+        "head_dim": 32,
+        "hidden_act": "silu",
+        "hidden_size": 128,
+        "intermediate_size": 256,
+        "layer_rope_theta": [10000.0, 0],
+        "layer_types": ["sliding_attention", "full_attention"],
+        "mlp_layer_types": ["sparse", "dense"],
+        "moe_hidden_size": 128,
+        "moe_intermediate_size": 128,
+        "num_attention_heads": 4,
+        "num_experts_per_tok": 2,
+        "num_hidden_layers": 2,
+        "num_key_value_heads": 2,
+        "num_local_experts": 4,
+        "output_multiplier": 0.1767766952966369,
+        "post_norm_eps": 1e-08,
+        "qk_scale_factor": 5.4730064863875,
+        "residual_gate_temperature": 0.3,
+        "rms_norm_eps": 1e-05,
+        "rope_parameters": {"rope_theta": 10000.0, "rope_type": "default"},
+        "routed_scaling_factor": 1.0,
+        "sliding_window": 2048,
+        "tie_word_embeddings": false,
+        "vocab_size": 256
+    }
+}"#;
+
+#[test]
+fn fuse_muse_spark() {
+    let g = build_from_config_json(MUSE_SPARK).expect("build muse_spark");
+    let (fused, stats) = rewrite::rewrite_graph(&g).expect("rewrite muse_spark");
+
+    for op in [
+        "FusedZeroCenteredNormLinear",
+        "FusedResidualGateZeroCenteredNorm",
+        "FusedMlaOutGate",
+        "FusedNormLinear",
+        "SwiGLU",
+    ] {
+        assert!(fused.contains(op), "{op} did not fire in Muse Spark");
+    }
+    for op in [
+        "ResidualGate",
+        "InputScaledRmsNorm",
+        "MoeRouterSigmoidBias",
+        "MoeExpertsPostNorm",
+    ] {
+        assert!(fused.contains(op), "{op} missing from the Muse Spark graph");
+    }
+    assert!(
+        !fused.contains("FusedResidualZeroCenteredNorm"),
+        "a gated residual extracted as an add"
+    );
+    assert!(
+        stats.ops_after < stats.ops_before,
+        "fusion did not reduce Muse Spark ops: {} -> {}",
+        stats.ops_before,
+        stats.ops_after
+    );
+    assert_eq!(
+        fused_weights(&fused),
+        graph_dag_weights(&g),
+        "Muse Spark fusion dropped or duplicated weight leaves"
+    );
+    assert_expert_bindings_in_checkpoint(&g);
 }

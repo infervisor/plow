@@ -152,7 +152,7 @@ impl Ctx<'_> {
                 self.expect_arity_range(inputs, 1, 2)?;
                 self.input_shape(inputs, 0)
             }
-            Op::RmsNormZeroCentered { .. } => {
+            Op::RmsNormZeroCentered { .. } | Op::RmsNormInputScaled { .. } => {
                 self.expect_arity(inputs, 2)?;
                 self.input_shape(inputs, 0)
             }
@@ -404,9 +404,24 @@ impl Ctx<'_> {
                 Ok(replace_last(&x, Dim::stat(*num_experts as i64)))
             }
 
-            Op::MoeExperts { .. } => {
-                self.expect_arity(inputs, 2)?;
-                self.input_shape(inputs, 0)
+            Op::MoeExperts {
+                post_expert_norm, ..
+            } => {
+                self.expect_arity(inputs, if post_expert_norm.is_some() { 3 } else { 2 })?;
+                let x = self.input_shape(inputs, 0)?;
+                if post_expert_norm.is_some() {
+                    let hidden = x
+                        .dims()
+                        .last()
+                        .ok_or_else(|| self.err("moe_experts input must have rank >= 1"))?;
+                    let w = self.input_shape(inputs, 2)?;
+                    if w.rank() != 1 || w.dim(0).provably_ne(hidden) {
+                        return Err(self.err(format!(
+                            "moe_experts post_expert_norm weight has shape {w}, expected [{hidden}]"
+                        )));
+                    }
+                }
+                Ok(x)
             }
 
             Op::DsaIndexer {
@@ -622,6 +637,24 @@ impl Ctx<'_> {
                 let gate = self.input_shape(inputs, 0)?;
                 let up = self.input_shape(inputs, 1)?;
                 broadcast(self, &gate, &up)
+            }
+
+            Op::ResidualGate { .. } => {
+                self.expect_arity(inputs, 3)?;
+                let residual = self.input_shape(inputs, 0)?;
+                let h = self.input_shape(inputs, 1)?;
+                let out = broadcast(self, &residual, &h)?;
+                let hidden = out
+                    .dims()
+                    .last()
+                    .ok_or_else(|| self.err("residual_gate input must have rank >= 1"))?;
+                let gate = self.input_shape(inputs, 2)?;
+                if gate.rank() != 1 || gate.dim(0).provably_ne(hidden) {
+                    return Err(self.err(format!(
+                        "residual_gate gate has shape {gate}, expected [{hidden}]"
+                    )));
+                }
+                Ok(out)
             }
 
             Op::BlockResidual { max_snapshots } => {
