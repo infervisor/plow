@@ -1,18 +1,22 @@
 #!/usr/bin/env python3
-# muse_block_oracle.py: a real-weight host oracle for ONE Muse Spark decoder layer (decode, B1).
+# muse_block_oracle.py: a real-weight host oracle for a chain of Muse Spark decoder layers
+# (`LAYERS` = l or l..r, r exclusive; decode, B1).
 #
 # It mirrors modeling_muse_spark.py (transformers) op by op in torch on the CPU. The layer weights
 # come straight from the Quark MXFP4 checkpoint: bf16 tensors are used verbatim, and the routed
 # experts are dequantized from fp4 e2m1 + e8m0/32 (W4A16, which is what the device runs). It writes
 # the operands `plowrt amd-block --input-dir` consumes:
-#   act.x.bin                 bf16 [H]                 the decode token's layer input (pos ctx-1)
-#   kv.{L}.k.bin / kv.{L}.v.bin bf16 [kvh][ctx][hd]    head-major history of a seeded sequence
-#   reference.bf16            act.xnext (layer output)
-#   <stage>.reference.bf16    act.xmid / act.xn2 / act.ylat
+#   act.x.bin                 bf16 [H]                 the decode token's first-layer input (pos ctx-1)
+#   kv.{L}.k.bin / kv.{L}.v.bin bf16 [kvh][ctx][hd]    head-major history, all kv heads (amd-block
+#                                                      splits it per rank under --tp)
+#   reference.bf16            act.xnext (last layer output)
+#   <stage>.reference.bf16    the last layer's act.xmid / act.xn2 / act.ylat (+ act.attn at TP1)
 #   reference.json            ctx, batch, tolerance, stages, router top-k, A4W4 delta
-# The INPUT is a seeded synthetic hidden sequence (N(0,1) rows, so input_layernorm sees unit RMS
-# like the embed-normed stream). The WEIGHTS are real. The K/V history is this layer's own
-# projections of that sequence, as a prefill would have written it.
+# The INPUT is a seeded synthetic hidden row (N(0,1), so input_layernorm sees unit RMS like the
+# embed-normed stream). The WEIGHTS are real. Each layer's K/V history (rows 0..ctx-2) is its own
+# projections of a per-layer seeded N(0,1) sequence; the decode row is the chained hidden. The
+# histories need not be the previous layer's outputs: they are operands, and the gate is that the
+# device computes the same chain from the same operands.
 #
 # --compare DUMP diffs an `amd-block --dump DUMP` run against the references. It prints max abs,
 # max rel, rel-L2 and cosine per stage, and the router top-k agreement.
@@ -28,13 +32,22 @@ P = "model.language_model.layers.{}."
 
 ap = argparse.ArgumentParser()
 ap.add_argument("model")
-ap.add_argument("layer", type=int)
+ap.add_argument("layers")
 ap.add_argument("out")
 ap.add_argument("--ctx", type=int, default=4096)
 ap.add_argument("--seed", type=int, default=1234)
+ap.add_argument("--attn-f32", action="store_true",
+                help="fused-attention numerics: qk_scale_factor folded into an f32 softmax scale, f32 "
+                     "scores and probabilities, instead of eager HF's bf16 q*scale, bf16 score "
+                     "matmul and bf16 probability cast")
+ap.add_argument("--force-last", help="comma-separated expert ids: the last layer routes to these "
+                "(score the continuous stages under a device near-tie routing flip)")
+ap.add_argument("--tp", type=int, default=1, help="omit rank-local stages (act.attn) at TP > 1")
 ap.add_argument("--compare", help="amd-block --dump directory to diff against OUT")
 args = ap.parse_args()
-L, CTX, OUT = args.layer, args.ctx, args.out
+lo_hi = [int(v) for v in args.layers.split("..")]
+LAYERS = list(range(lo_hi[0], lo_hi[1] if len(lo_hi) > 1 else lo_hi[0] + 1))
+CTX, OUT = args.ctx, args.out
 
 
 def to_bytes(t):
@@ -65,7 +78,10 @@ if args.compare:
     for name in ["act.xnext"] + meta["stages"]:
         ref = from_bf16(os.path.join(OUT, "reference.bf16" if name == "act.xnext"
                                      else f"{name}.reference.bf16"))
-        dev = from_bf16(os.path.join(args.compare, f"rank0.{name}.bin"))[: ref.numel()]
+        path = os.path.join(args.compare, f"rank0.{name}.bin")
+        if not os.path.exists(path):
+            continue
+        dev = from_bf16(path)[: ref.numel()]
         rows[name] = metrics(dev, ref)
     tab = np.fromfile(os.path.join(args.compare, "rank0.act.tab.bin"), dtype=np.uint32)
     k = len(meta["router_topk"]["ids"])
@@ -86,9 +102,6 @@ tc = cfg.get("text_config", cfg)
 H, NH, NKV, HD = tc["hidden_size"], tc["num_attention_heads"], tc["num_key_value_heads"], tc["head_dim"]
 EPS, PEPS = tc["rms_norm_eps"], tc["post_norm_eps"]
 E, K, M = tc["num_local_experts"], tc["num_experts_per_tok"], tc["moe_hidden_size"]
-sliding = tc["layer_types"][L] == "sliding_attention"
-rope_on = tc["layer_rope_theta"][L] != 0
-WINDOW = tc["sliding_window"] if sliding else None
 THETA = tc["rope_parameters"]["rope_theta"]
 
 # Shard index from the headers (works on a partially downloaded checkpoint).
@@ -112,8 +125,6 @@ def tensor(name):
     return _handles[f].get_tensor(name)
 
 
-p = P.format(L)
-w = lambda n: tensor(p + n)
 
 FP4 = torch.tensor([0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0,
                     -0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0])
@@ -182,91 +193,120 @@ def rope(x, pos):                   # x [n, heads, hd] bf16, pos [n]
     return x * cos + rot * sin
 
 
+def layer_fwd(L, x, hist, force=None):
+    """One decoder layer on the decode row `x` [1,H] with K/V history from `hist` [CTX-1,H]."""
+    w = lambda n: tensor(P.format(L) + n)
+    sliding = tc["layer_types"][L] == "sliding_attention"
+    rope_on = tc["layer_rope_theta"][L] != 0
+    window = tc["sliding_window"] if sliding else None
+    xs = torch.cat([hist, x])
+    pos = torch.arange(CTX)
+    qpos = CTX - 1
+    hn = norm_centered(xs, w("input_layernorm.weight"), EPS)
+    k = norm_weightless(lin(hn, w("self_attn.k_proj.weight")).view(CTX, NKV, HD), EPS)
+    v = lin(hn, w("self_attn.v_proj.weight")).view(CTX, NKV, HD)
+    hq = hn[qpos : qpos + 1]
+    q = norm_weightless(lin(hq, w("self_attn.q_proj.weight")).view(1, NH, HD), EPS)
+    qk_scale = tc["qk_scale_factor"] * HD ** -0.5
+    if not args.attn_f32:  # eager HF: q * qk_scale_factor rounds to bf16 before the score matmul
+        q, qk_scale = q * tc["qk_scale_factor"], HD ** -0.5
+    if rope_on:
+        k = rope(k, pos)
+        q = rope(q, pos[qpos : qpos + 1])
+    lo = max(qpos - window + 1 if window else 0, 0)
+    kk = k[lo : qpos + 1].transpose(0, 1).repeat_interleave(NH // NKV, 0)    # [NH, n, HD]
+    vv = v[lo : qpos + 1].transpose(0, 1).repeat_interleave(NH // NKV, 0)
+    qq = q.transpose(0, 1)                                                     # [NH, 1, HD]
+    if args.attn_f32:
+        sc = torch.matmul(qq.float(), kk.float().transpose(1, 2)) * qk_scale
+    else:
+        sc = torch.matmul(qq, kk.transpose(1, 2)) * qk_scale
+    pr = torch.softmax(sc, dim=-1, dtype=torch.float32)
+    if args.attn_f32:
+        attn = torch.matmul(pr, vv.float()).to(BF16)
+    else:
+        attn = torch.matmul(pr.to(BF16), vv)
+    attn = attn.transpose(0, 1).reshape(1, NH, HD)                            # [1, NH, HD]
+    at = norm_weightless(attn, EPS).reshape(1, NH * HD)
+    at = at * torch.sigmoid(lin(hq, w("self_attn.gate_proj.weight")))
+    o_raw = lin(at, w("self_attn.o_proj.weight"))
+    o = norm_weightless(o_raw, PEPS)
+    xmid = residual_gate(x, o, w("post_attention_residual_gate.gate"))
+
+    xn2 = norm_centered(xmid, w("pre_feedforward_layernorm.weight"), EPS)
+    logits = lin(xn2.float(), w("mlp.gate.weight").float()) * tc["output_multiplier"]
+    scores = torch.sigmoid(logits)
+    bias = w("mlp.gate.e_score_correction_bias").float()
+    top = torch.topk(scores + bias, k=K, dim=-1, sorted=False)[1][0]
+    ranked = torch.sort((scores + bias)[0], descending=True).values
+    margin = (ranked[K - 1] - ranked[K]).item()  # a device flip below ~1e-3 is a near tie
+    if force is not None:
+        top = torch.tensor(force)
+    gates = scores[0, top]
+    gates = gates / (gates.sum() + 1e-15) * tc["routed_scaling_factor"]
+    xe = norm_centered(lin(xn2, w("mlp.pre_expert_proj.weight")), w("mlp.pre_expert_norm.weight"), EPS)
+    w_pen = w("mlp.experts.post_expert_norm.weight")
+    mx = (P.format(L) + "mlp.experts.0.gate_proj.weight_scale") in index
+
+    def experts(a4w4):
+        acc = torch.zeros(1, M, dtype=BF16)
+        for j in torch.argsort(top).tolist():                 # HF loops experts in id order
+            ep = f"mlp.experts.{top[j].item()}."
+            wt = {n: dequant_mxfp4(w(ep + n + ".weight"), w(ep + n + ".weight_scale")) if mx
+                  else w(ep + n + ".weight") for n in ("gate_proj", "up_proj", "down_proj")}
+            xi = quant_mxfp4_act(xe) if a4w4 and mx else xe
+            hcur = torch.nn.functional.silu(lin(xi, wt["gate_proj"])) * lin(xi, wt["up_proj"])
+            hcur = quant_mxfp4_act(hcur) if a4w4 and mx else hcur
+            y = norm_input_scaled(lin(hcur, wt["down_proj"]), w_pen, PEPS)
+            acc = acc + (y * gates[j]).to(BF16)
+        return acc
+
+    def tail(ylat):
+        y = lin(ylat, w("mlp.post_expert_proj.weight"))
+        y = norm_input_scaled(y, w("post_feedforward_layernorm.weight"), PEPS)
+        return residual_gate(xmid, y, w("post_feedforward_residual_gate.gate"))
+
+    ylat = experts(False)
+    xnext = tail(ylat)
+    xnext_a4w4 = tail(experts(True))
+    kind = ("sliding" if sliding else "full") + ("+rope" if rope_on else "+nope") + ("" if mx else "+bf16-experts")
+    return dict(xnext=xnext, xnext_a4w4=xnext_a4w4, k=k, v=v, top=top, gates=gates, kind=kind,
+                margin=margin,
+                stages={"act.attn": attn.reshape(1, NH * HD), "act.at": at, "act.o": o_raw,
+                        "act.on": o, "act.xmid": xmid, "act.xn2": xn2, "act.ylat": ylat})
+
+
 torch.manual_seed(args.seed)
-xs = torch.randn(CTX, H).to(BF16)
-pos = torch.arange(CTX)
-qpos = CTX - 1
-
-# ---- attention: K/V history for the whole sequence, q for the decode token ----
-w_in = w("input_layernorm.weight")
-hn = norm_centered(xs, w_in, EPS)
-k = norm_weightless(lin(hn, w("self_attn.k_proj.weight")).view(CTX, NKV, HD), EPS)
-v = lin(hn, w("self_attn.v_proj.weight")).view(CTX, NKV, HD)
-hq = hn[qpos : qpos + 1]
-q = norm_weightless(lin(hq, w("self_attn.q_proj.weight")).view(1, NH, HD), EPS) * tc["qk_scale_factor"]
-if rope_on:
-    k = rope(k, pos)
-    q = rope(q, pos[qpos : qpos + 1])
-lo = qpos - WINDOW + 1 if WINDOW else 0
-lo = max(lo, 0)
-kk = k[lo : qpos + 1].transpose(0, 1).repeat_interleave(NH // NKV, 0)    # [NH, n, HD]
-vv = v[lo : qpos + 1].transpose(0, 1).repeat_interleave(NH // NKV, 0)
-qq = q.transpose(0, 1)                                                     # [NH, 1, HD]
-sc = torch.matmul(qq, kk.transpose(1, 2)) * (HD ** -0.5)
-pr = torch.softmax(sc, dim=-1, dtype=torch.float32).to(BF16)
-attn = torch.matmul(pr, vv).transpose(0, 1).reshape(1, NH, HD)            # [1, NH, HD]
-at = norm_weightless(attn, EPS).reshape(1, NH * HD)
-at = at * torch.sigmoid(lin(hq, w("self_attn.gate_proj.weight")))
-o = lin(at, w("self_attn.o_proj.weight"))
-o = norm_weightless(o, PEPS)
-x = xs[qpos : qpos + 1]
-xmid = residual_gate(x, o, w("post_attention_residual_gate.gate"))
-
-# ---- latent MoE ----
-xn2 = norm_centered(xmid, w("pre_feedforward_layernorm.weight"), EPS)
-logits = lin(xn2.float(), w("mlp.gate.weight").float()) * tc["output_multiplier"]
-scores = torch.sigmoid(logits)
-bias = w("mlp.gate.e_score_correction_bias").float()
-top = torch.topk(scores + bias, k=K, dim=-1, sorted=False)[1][0]
-gates = scores[0, top]
-gates = gates / (gates.sum() + 1e-15) * tc["routed_scaling_factor"]
-xe = norm_centered(lin(xn2, w("mlp.pre_expert_proj.weight")), w("mlp.pre_expert_norm.weight"), EPS)
-w_pen = w("mlp.experts.post_expert_norm.weight")
-
-
-def experts(a4w4):
-    acc = torch.zeros(1, M, dtype=BF16)
-    for j in torch.argsort(top).tolist():                 # HF loops experts in id order
-        e = top[j].item()
-        ep = f"mlp.experts.{e}."
-        wt = {n: dequant_mxfp4(w(ep + n + ".weight"), w(ep + n + ".weight_scale"))
-              for n in ("gate_proj", "up_proj", "down_proj")}
-        xi = quant_mxfp4_act(xe) if a4w4 else xe
-        hcur = torch.nn.functional.silu(lin(xi, wt["gate_proj"])) * lin(xi, wt["up_proj"])
-        hcur = quant_mxfp4_act(hcur) if a4w4 else hcur
-        y = norm_input_scaled(lin(hcur, wt["down_proj"]), w_pen, PEPS)
-        acc = acc + (y * gates[j]).to(BF16)
-    return acc
-
-
-def tail(ylat):
-    y = lin(ylat, w("mlp.post_expert_proj.weight"))
-    y = norm_input_scaled(y, w("post_feedforward_layernorm.weight"), PEPS)
-    return residual_gate(xmid, y, w("post_feedforward_residual_gate.gate"))
-
-
-ylat = experts(False)
-xnext = tail(ylat)
-xnext_a4w4 = tail(experts(True))
-
+x0 = torch.randn(1, H).to(BF16)
 os.makedirs(OUT, exist_ok=True)
-open(os.path.join(OUT, "act.x.bin"), "wb").write(to_bytes(x))
-# head-major [slot][kvh][ctx][hd]; row qpos is rewritten by the device itself
-open(os.path.join(OUT, f"kv.{L}.k.bin"), "wb").write(to_bytes(k.transpose(0, 1)))
-open(os.path.join(OUT, f"kv.{L}.v.bin"), "wb").write(to_bytes(v.transpose(0, 1)))
-open(os.path.join(OUT, "reference.bf16"), "wb").write(to_bytes(xnext))
-stages = {"act.attn": attn.reshape(1, NH * HD), "act.xmid": xmid, "act.xn2": xn2, "act.ylat": ylat}
+x, kinds, margins = x0, [], []
+for L in LAYERS:
+    g = torch.Generator().manual_seed(args.seed + 1 + L)
+    hist = torch.randn(CTX - 1, H, generator=g).to(BF16)
+    force = [int(v) for v in args.force_last.split(",")] if args.force_last and L == LAYERS[-1] else None
+    r = layer_fwd(L, x, hist, force)
+    # head-major [kvh][ctx][hd]; row ctx-1 is rewritten by the device itself
+    open(os.path.join(OUT, f"kv.{L}.k.bin"), "wb").write(to_bytes(r["k"].transpose(0, 1)))
+    open(os.path.join(OUT, f"kv.{L}.v.bin"), "wb").write(to_bytes(r["v"].transpose(0, 1)))
+    kinds.append(f"{L}:{r['kind']}")
+    margins.append(r["margin"])
+    print(f"layer {L} ({r['kind']}) ctx={CTX}: top{K}={r['top'].tolist()} margin={r['margin']:.2e} "
+          f"xnext rms={r['xnext'].float().pow(2).mean().sqrt():.4f}", flush=True)
+    x = r["xnext"]
+open(os.path.join(OUT, "act.x.bin"), "wb").write(to_bytes(x0))
+open(os.path.join(OUT, "reference.bf16"), "wb").write(to_bytes(x))
+stages = {n: t for n, t in r["stages"].items() if args.tp == 1 or n not in ("act.attn", "act.at")}
 for name, t in stages.items():
     open(os.path.join(OUT, f"{name}.reference.bf16"), "wb").write(to_bytes(t))
-d = (xnext_a4w4.double() - xnext.double()).flatten()
+d = (r["xnext_a4w4"].double() - x.double()).flatten()
 json.dump(dict(
-    model=args.model, layer=L, ctx=CTX, batch=1, seed=args.seed,
-    kind=("sliding" if sliding else "full") + ("+rope" if rope_on else "+nope"),
-    reference="torch CPU mirror of modeling_muse_spark.py, W4A16 experts",
+    model=args.model, layers=LAYERS, ctx=CTX, batch=1, seed=args.seed, tp=args.tp, kinds=kinds,
+    router_margins=margins, forced_last=args.force_last,
+    reference="torch CPU mirror of modeling_muse_spark.py, W4A16 experts"
+              + (", f32 attention scores/probabilities" if args.attn_f32 else ""),
     tolerance_rel_l2=0.03, stages=list(stages),
-    router_topk=dict(ids=top.tolist(), weights=gates.tolist()),
-    a4w4_vs_w4a16_xnext=dict(rel_l2=(d.norm() / xnext.double().norm()).item(),
+    router_topk=dict(ids=r["top"].tolist(), weights=r["gates"].tolist()),
+    a4w4_vs_w4a16_xnext=dict(rel_l2=(d.norm() / x.double().norm()).item(),
                              max_abs=d.abs().max().item()),
 ), open(os.path.join(OUT, "reference.json"), "w"), indent=2)
-print(f"layer {L} ({'sliding' if sliding else 'full'}, rope={rope_on}) ctx={CTX}: top{K}={top.tolist()} "
-      f"xnext rms={xnext.float().pow(2).mean().sqrt():.4f} -> {OUT}")
+print(f"layers {LAYERS} -> {OUT}")

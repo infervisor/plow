@@ -1,5 +1,5 @@
-//! Muse Spark (`muse_spark` / `muse_spark_text`) device emitter, M1: `--block l[..r]` decode at
-//! TP1 for gfx950. Hand-routed like gpt_oss / qwen35 (the rewrite path has no terms for the
+//! Muse Spark (`muse_spark` / `muse_spark_text`) device emitter: B1 decode for gfx950 at TP1 or
+//! TP (`--block l[..r]`, or the full model ending in a greedy `in.ids`). Hand-routed like gpt_oss / qwen35 (the rewrite path has no terms for the
 //! Muse IR ops); the graph it lowers is `crates/nn-graph/src/models/muse_spark.rs`.
 //!
 //! Per layer (one decode token, `act.x` -> `act.xnext`):
@@ -24,6 +24,7 @@ use super::*;
 use std::path::Path;
 
 const PREFIX: &str = "model.language_model.";
+const MOE_ENC_BF16: u32 = 0;
 const MOE_ENC_MXFP4: u32 = 2;
 const MOE_ACT_SILU: u32 = 1;
 /// `MoeRouterTopk` flags: sigmoid | renormalize | bias bound | f32 logit.
@@ -37,11 +38,8 @@ const BF16: u64 = 2;
 const F32: u64 = 4;
 
 /// What full-model emission still needs; the refusal names it.
-const REMAINING: &str = "full-model emission (embed + weightless embed norm, final norm, untied \
-    lm_head with output_multiplier and 20*tanh softcap, sampling), all 62 layers chained, prefill \
-    buckets (hd64 FlashPrefill, grouped MoE prefill with the post-expert norm), batched decode \
-    rungs, sliding-window KV rings, bf16-expert layers 0 and 61, TP8/EP layout and collectives, \
-    and serve integration";
+const REMAINING: &str = "prefill buckets (hd64 FlashPrefill, grouped MoE prefill with the \
+    post-expert norm), batched decode rungs, sliding-window KV rings, a vocab-parallel head";
 
 #[derive(Debug, Clone)]
 pub(crate) struct MuseCfg {
@@ -59,6 +57,8 @@ pub(crate) struct MuseCfg {
     pub theta: f64,
     pub qk_scale: f32,
     pub output_multiplier: f32,
+    pub softcap: f32,
+    pub vocab: u32,
     pub temperature: f32,
     pub n_exp: u32,
     pub top_k: u32,
@@ -181,6 +181,8 @@ impl MuseCfg {
             theta,
             qk_scale: f("qk_scale_factor") as f32,
             output_multiplier: f("output_multiplier") as f32,
+            softcap: f("final_logit_softcapping") as f32,
+            vocab: u("vocab_size"),
             temperature: f("residual_gate_temperature") as f32,
             n_exp: u("num_local_experts"),
             top_k: u("num_experts_per_tok"),
@@ -191,17 +193,42 @@ impl MuseCfg {
         }
     }
 
-    /// The M1 refusals for one layer, or `Ok`.
+    /// The block refusals for one layer, or `Ok`.
     fn check_m1_layer(&self, l: usize) -> Result<(), String> {
         if !self.sparse[l] {
-            return Err(format!("layer {l} has a dense MLP (no M1 route)"));
-        }
-        if !self.mxfp4_experts[l] {
-            return Err(format!(
-                "layer {l} routed experts are bf16 (Quark `exclude`); M1 routes MXFP4 experts only"
-            ));
+            return Err(format!("layer {l} has a dense MLP (no route)"));
         }
         Ok(())
+    }
+}
+
+/// Tensor parallelism. One blob serves every rank: weights are declared at the rank's shard
+/// size (`plowrt::asset::shard::slice_for`) and the row-parallel partials go to the two peer
+/// slots, which the collectives use strictly alternately — a rank rewrites a slot only after the
+/// next rendezvous, which every peer reaches only after finishing its reads of that slot.
+struct Tp {
+    n: u32,
+    /// Peer slots A (`act.og_tp`) and B (`act.dg_tp`).
+    slots: [u32; 2],
+    slot_b: u32,
+    next: usize,
+    xgate: u32,
+    xr_cus: Vec<u32>,
+    /// `pre_expert_proj` / `post_expert_proj` row-parallel (else replicated).
+    latent: bool,
+}
+
+impl Tp {
+    fn on(&self) -> bool {
+        self.n > 1
+    }
+    fn local(&self, w: u32) -> u32 {
+        assert_eq!(w % self.n, 0, "muse_spark: --num-gpus {} must divide {w}", self.n);
+        w / self.n
+    }
+    /// The peer slot the next row-parallel producer writes.
+    fn partial(&self) -> u32 {
+        self.slots[self.next]
     }
 }
 
@@ -231,6 +258,19 @@ struct Acts {
     ylat: u32,
     y: u32,
     yn: u32,
+    /// TP: the reduced bf16 unweighted expert outputs `[k][moe_hidden]`.
+    ysum: u32,
+    /// TP latent row-parallel: this rank's input slices of `xn2` / `ylat`.
+    hn2_band: u32,
+    ylat_band: u32,
+}
+
+/// The full-model ends: `in.ids` -> embed -> weightless norm -> layers -> head -> `in.ids`.
+struct Ends {
+    ids: u32,
+    emb: u32,
+    logits: u32,
+    amax: u32,
 }
 
 struct Emitter<'a> {
@@ -243,6 +283,7 @@ struct Emitter<'a> {
     cos: u32,
     sin: u32,
     a: Acts,
+    tp: Tp,
 }
 
 impl Emitter<'_> {
@@ -288,6 +329,13 @@ impl Emitter<'_> {
             d.f[1] = RESIDUAL_GATE_EPS;
         })
     }
+    /// All-reduce the partial the last producer wrote into [`Tp::partial`] into `out`.
+    fn reduce(&mut self, dep: u32, out: u32, elems: u32) -> u32 {
+        let slot = self.tp.next as u32 * self.tp.slot_b;
+        self.tp.next ^= 1;
+        let (n, cus) = (self.tp.n, self.tp.xr_cus.clone());
+        crate::emit_xreduce(&mut self.b, &mut self.tp.xgate, true, &cus, dep, out, elems, n, slot)
+    }
     /// Weightless per-head RMSNorm, optionally NeoX-rotated, optionally written into a KV cache
     /// row at `pos` (`cache`). `normalize = false` is a plain copy (the V cache write).
     #[allow(clippy::too_many_arguments)]
@@ -329,14 +377,23 @@ impl Emitter<'_> {
     fn layer(&mut self, l: usize, src: u32, dst: u32, dep: Option<u32>) -> u32 {
         let c = self.c;
         let p = format!("{PREFIX}layers.{l}.");
-        let (h, nh, nkv, hd) = (c.hidden, c.heads, c.kv_heads, c.hd);
-        let (qd, kd, m, e) = (nh * hd, nkv * hd, c.moe_hidden, c.n_exp);
+        let (h, hd, m, e) = (c.hidden, c.hd, c.moe_hidden, c.n_exp);
+        let (nh, nkv) = (self.tp.local(c.heads), self.tp.local(c.kv_heads));
+        let (qd, kd, imoe) = (nh * hd, nkv * hd, self.tp.local(c.moe_inter));
         let (h64, qd64, kd64, m64) = (h as u64, qd as u64, kd as u64, m as u64);
         let a = &self.a;
         let (hn, q_raw, k_raw, v_raw, gate, q) = (a.hn, a.q_raw, a.k_raw, a.v_raw, a.gate, a.q);
         let (opart, mlpart, attn, at, o, on) = (a.opart, a.mlpart, a.attn, a.at, a.o, a.on);
         let (xmid, hn2, rlogit, tab, xe0, xe) = (a.xmid, a.hn2, a.rlogit, a.tab, a.xe0, a.xe);
-        let (fu, part, ylat, y, yn) = (a.fu, a.part, a.ylat, a.y, a.yn);
+        let (fu, part, ylat, y, yn, ysum) = (a.fu, a.part, a.ylat, a.y, a.yn, a.ysum);
+        let (hn2_band, ylat_band) = (a.hn2_band, a.ylat_band);
+        let (tp, latent) = (self.tp.on(), self.tp.on() && self.tp.latent);
+        // Row-parallel latent projections contract over this rank's 1/tp of their input.
+        let (pre_k, post_k) = if latent {
+            (self.tp.local(h), self.tp.local(m))
+        } else {
+            (h, m)
+        };
 
         let w_in = self.w(&format!("{p}input_layernorm.weight"), h64 * BF16);
         let wq = self.w(&format!("{p}self_attn.q_proj.weight"), qd64 * h64 * BF16);
@@ -350,21 +407,15 @@ impl Emitter<'_> {
         let g_ff = self.w(&format!("{p}post_feedforward_residual_gate.gate"), h64 * BF16);
         let wr = self.w(&format!("{p}mlp.gate.weight"), e as u64 * h64 * F32);
         let wr_bias = self.w(&format!("{p}mlp.gate.e_score_correction_bias"), e as u64 * F32);
-        let w_pre = self.w(&format!("{p}mlp.pre_expert_proj.weight"), m64 * h64 * BF16);
+        let w_pre = self.w(&format!("{p}mlp.pre_expert_proj.weight"), m64 * pre_k as u64 * BF16);
         let w_pre_n = self.w(&format!("{p}mlp.pre_expert_norm.weight"), m64 * BF16);
         let w_pen = self.w(&format!("{p}mlp.experts.post_expert_norm.weight"), m64 * BF16);
-        let w_postp = self.w(&format!("{p}mlp.post_expert_proj.weight"), h64 * m64 * BF16);
+        let w_postp = self.w(&format!("{p}mlp.post_expert_proj.weight"), h64 * post_k as u64 * BF16);
         let ewt = self.w(&format!("moe.{p}mlp.expert_weight_table"), e as u64 * 3 * 8);
         let est = self.w(&format!("moe.{p}mlp.expert_scale_table"), e as u64 * 3 * 8);
         let slots = 1u64;
-        let kc = self.w(
-            &format!("kv.{l}.k"),
-            slots * kd64 * self.ctx as u64 * BF16,
-        );
-        let vc = self.w(
-            &format!("kv.{l}.v"),
-            slots * kd64 * self.ctx as u64 * BF16,
-        );
+        let kc = self.w(&format!("kv.{l}.k"), slots * kd64 * self.ctx as u64 * BF16);
+        let vc = self.w(&format!("kv.{l}.v"), slots * kd64 * self.ctx as u64 * BF16);
 
         // ---- attention ----
         let d_hn = self.norm(hn, src, w_in, h, NORM_CENTERED, c.eps, dep.as_slice());
@@ -397,7 +448,13 @@ impl Emitter<'_> {
                 d.t[..4].copy_from_slice(&[at, at, gate, TENSOR_NONE]);
                 d.i[..2].copy_from_slice(&[qd, 1]);
             });
-        let d_o = self.gemv(o, at, wo, h, qd, d_gate);
+        let d_o = if tp {
+            let og = self.tp.partial();
+            let d = self.gemv(og, at, wo, h, qd, d_gate);
+            self.reduce(d, o, h)
+        } else {
+            self.gemv(o, at, wo, h, qd, d_gate)
+        };
         let d_pn = self.norm(on, o, TENSOR_NONE, h, NORM_PLAIN, c.post_eps, &[d_o]);
         let d_xm = self.residual_gate(xmid, src, on, g_attn, &[d_pn]);
 
@@ -424,9 +481,20 @@ impl Emitter<'_> {
             d.f[0] = route_scale;
             d.f[1] = logit_scale;
         });
-        let d_xe0 = self.gemv(xe0, hn2, w_pre, m, h, d_hn2);
+        let d_xe0 = if latent {
+            let pg = self.tp.partial();
+            let d = self.gemv(pg, hn2_band, w_pre, m, pre_k, d_hn2);
+            self.reduce(d, xe0, m)
+        } else {
+            self.gemv(xe0, hn2, w_pre, m, h, d_hn2)
+        };
         let d_xe = self.norm(xe, xe0, w_pre_n, m, NORM_CENTERED, c.eps, &[d_xe0]);
-        let imoe = c.moe_inter;
+        // TP: each rank's down writes its bf16 unweighted partial y into the peer slot; the
+        // post-expert norm is nonlinear per (token, expert), so the reduce precedes it.
+        let dn_out = if tp { self.tp.partial() } else { part };
+        let ybf = u32::from(tp);
+        // Quark `exclude`d layers keep bf16 experts: same grouped ops, bf16 encoding.
+        let enc = if c.mxfp4_experts[l] { MOE_ENC_MXFP4 } else { MOE_ENC_BF16 };
         let d_glu = self
             .b
             .emit(DevOp::MoeGroupGluFp8Blk, self.b.all(), &[d_rt, d_xe], |d| {
@@ -436,28 +504,41 @@ impl Emitter<'_> {
                 d.i[2] = m;
                 d.i[3] = e;
                 d.i[5] = MOE_ACT_SILU;
-                d.i[6] = MOE_ENC_MXFP4;
+                d.i[6] = enc;
             });
         let d_dn = self
             .b
             .emit(DevOp::MoeGroupDownFp8Blk, self.b.all(), &[d_glu], |d| {
-                d.t[..5].copy_from_slice(&[part, fu, tab, ewt, est]);
+                d.t[..5].copy_from_slice(&[dn_out, fu, tab, ewt, est]);
                 d.i[0] = top_k;
                 d.i[1] = m;
                 d.i[2] = imoe;
                 d.i[3] = e;
-                d.i[6] = MOE_ENC_MXFP4;
+                d.i[6] = enc;
+                d.i[7] = ybf;
             });
+        let (d_dn, ysrc) = if tp {
+            (self.reduce(d_dn, ysum, top_k * m), ysum)
+        } else {
+            (d_dn, part)
+        };
         let post_eps = c.post_eps;
         let d_cmb = self
             .b
             .emit(DevOp::MuseMoeCombineNorm, self.cus(m.div_ceil(512)), &[d_dn], |d| {
-                d.t[..4].copy_from_slice(&[ylat, part, tab, w_pen]);
+                d.t[..4].copy_from_slice(&[ylat, ysrc, tab, w_pen]);
                 d.i[0] = m;
                 d.i[1] = top_k;
+                d.i[2] = ybf;
                 d.f[0] = post_eps;
             });
-        let d_y = self.gemv(y, ylat, w_postp, h, m, d_cmb);
+        let d_y = if latent {
+            let pg = self.tp.partial();
+            let d = self.gemv(pg, ylat_band, w_postp, h, post_k, d_cmb);
+            self.reduce(d, y, h)
+        } else {
+            self.gemv(y, ylat, w_postp, h, m, d_cmb)
+        };
         let d_yn = self.norm(yn, y, w_post, h, NORM_INPUT_SCALED, c.post_eps, &[d_y]);
         self.residual_gate(dst, xmid, yn, g_ff, &[d_yn])
     }
@@ -465,23 +546,35 @@ impl Emitter<'_> {
 
 /// One decode program over `layers`. The last layer writes `act.xnext`; earlier ones write
 /// `act.x` back in place (it is dead after the layer's attention residual).
-fn decode_program(c: &MuseCfg, ctx: u32, n_cu: u32, layers: std::ops::Range<usize>) -> Model {
+fn decode_program(
+    c: &MuseCfg,
+    ctx: u32,
+    n_cu: u32,
+    tp: u32,
+    layers: std::ops::Range<usize>,
+    full: bool,
+) -> Model {
     let mut b = Builder::new(n_cu);
     b.force_uniseg();
-    let (h, nh, nkv, hd, m) = (c.hidden, c.heads, c.kv_heads, c.hd, c.moe_hidden);
+    let local = |w: u32| {
+        assert_eq!(w % tp, 0, "muse_spark: --num-gpus {tp} must divide {w}");
+        w / tp
+    };
+    let (h, hd, m, k) = (c.hidden, c.hd, c.moe_hidden, c.top_k);
+    let (nh, nkv) = (local(c.heads), local(c.kv_heads));
     let (qd, kd) = ((nh * hd) as u64, (nkv * hd) as u64);
     // `in.ids` first: handle 0 is the "absent" value of several optional operand slots.
-    b.tensor("in.ids", ctx as u64 * F32);
+    let ids = b.tensor("in.ids", ctx as u64 * F32);
     // The engine reads its context capacity off `in.pos`.
     let pos = b.tensor("in.pos", ctx as u64 * F32);
     let kvlen = b.tensor("in.kvlen", F32);
     let [gc, gs] = GenTensor::rope_pair(ctx, hd, c.theta, 1.0, RopeScale::None);
     let cos = b.tensor_gen("in.cos_full", gc.byte_len(), gc);
     let sin = b.tensor_gen("in.sin_full", gs.byte_len(), gs);
-    let ns = decode_ns(c, n_cu);
+    let ns = decode_ns(nh, nkv, n_cu);
     let (h64, m64) = (h as u64, m as u64);
     let mut act = |n: &str, bytes: u64| b.tensor(&format!("act.{n}"), bytes);
-    let a = Acts {
+    let mut a = Acts {
         x: act("x", h64 * BF16),
         xnext: act("xnext", h64 * BF16),
         hn: act("hn", h64 * BF16),
@@ -499,14 +592,60 @@ fn decode_program(c: &MuseCfg, ctx: u32, n_cu: u32, layers: std::ops::Range<usiz
         xmid: act("xmid", h64 * BF16),
         hn2: act("xn2", h64 * BF16),
         rlogit: act("rlogit", c.n_exp as u64 * F32),
-        tab: act("tab", c.top_k as u64 * 8),
+        tab: act("tab", k as u64 * 8),
         xe0: act("xe0", m64 * BF16),
         xe: act("xe", m64 * BF16),
-        fu: act("fu", c.top_k as u64 * c.moe_inter as u64 * BF16),
-        part: act("part", c.top_k as u64 * m64 * F32),
+        fu: act("fu", k as u64 * local(c.moe_inter) as u64 * BF16),
+        part: act("part", k as u64 * m64 * F32),
         ylat: act("ylat", m64 * BF16),
         y: act("y", h64 * BF16),
         yn: act("yn", h64 * BF16),
+        ysum: TENSOR_NONE,
+        hn2_band: TENSOR_NONE,
+        ylat_band: TENSOR_NONE,
+    };
+    let ends = full.then(|| Ends {
+        ids,
+        emb: b.tensor("act.emb", h64 * BF16),
+        logits: b.tensor("act.logits", c.vocab as u64 * BF16),
+        amax: b.tensor("act.amax", AMAX_BLOCKS as u64 * 8),
+    });
+    let latent = emit_config::active().muse_latent_tp;
+    let tp = if tp > 1 {
+        // Slot bytes: the widest partial (the k expert outputs), and a whole number of the
+        // recovered `hidden` (the host sizes the peer region as max_tokens * hidden * 2).
+        let slot_b = h.max(k * m) * 2;
+        a.ysum = b.tensor("act.ysum", k as u64 * m64 * BF16);
+        if latent {
+            let band = |b: &mut Builder, base: u32, n: u32| {
+                let name = format!("{}@band1", b.tensor_name(base));
+                b.tensor(&name, n as u64 * BF16)
+            };
+            a.hn2_band = band(&mut b, a.hn2, local(h));
+            a.ylat_band = band(&mut b, a.ylat, local(m));
+        }
+        Tp {
+            n: tp,
+            slots: [
+                b.tensor("act.og_tp", slot_b as u64),
+                b.tensor("act.dg_tp", slot_b as u64),
+            ],
+            slot_b,
+            next: 0,
+            xgate: 0,
+            xr_cus: (0..emit_config::active().xr_cus.unwrap_or(n_cu).clamp(1, n_cu)).collect(),
+            latent,
+        }
+    } else {
+        Tp {
+            n: 1,
+            slots: [TENSOR_NONE; 2],
+            slot_b: 0,
+            next: 0,
+            xgate: 0,
+            xr_cus: Vec::new(),
+            latent: false,
+        }
     };
     let (x, xnext) = (a.x, a.xnext);
     let mut em = Emitter {
@@ -519,12 +658,51 @@ fn decode_program(c: &MuseCfg, ctx: u32, n_cu: u32, layers: std::ops::Range<usiz
         cos,
         sin,
         a,
+        tp,
     };
     let mut dep = None;
+    if let Some(e) = &ends {
+        let table = em.w(&format!("{PREFIX}embed_tokens.weight"), c.vocab as u64 * h64 * BF16);
+        let d_emb = em.b.emit(DevOp::Embed, em.b.all(), &[], |d| {
+            d.t[..3].copy_from_slice(&[e.emb, table, e.ids]);
+            d.i[0] = 1;
+            d.i[1] = h;
+            d.f[0] = 1.0;
+        });
+        dep = Some(em.norm(x, e.emb, TENSOR_NONE, h, NORM_PLAIN, c.eps, &[d_emb]));
+    }
     let last = layers.end - 1;
     for l in layers {
-        dep = Some(em.layer(l, x, if l == last { xnext } else { x }, dep));
+        let dst = if l == last && !full { xnext } else { x };
+        dep = Some(em.layer(l, x, dst, dep));
     }
+    if let Some(e) = &ends {
+        let w_final = em.w(&format!("{PREFIX}norm.weight"), h64 * BF16);
+        let lm = em.w("lm_head.weight", c.vocab as u64 * h64 * BF16);
+        let (hn, vocab, mult, cap) = (em.a.hn, c.vocab, c.output_multiplier, c.softcap);
+        // `cap * tanh(mult * logits / cap)`: the multiplier rides the final norm's output.
+        let d_fn = em.b.emit(DevOp::MuseRmsNorm, vec![0], dep.as_slice(), |d| {
+            d.t[..3].copy_from_slice(&[hn, x, w_final]);
+            d.i[..3].copy_from_slice(&[1, h, NORM_PLAIN]);
+            d.f[0] = c.eps;
+            d.f[1] = mult;
+        });
+        let d_lm = em.gemv(e.logits, hn, lm, vocab, h, d_fn);
+        let d_cap = em.b.emit(DevOp::SoftCap, em.b.all(), &[d_lm], |d| {
+            d.t[..2].copy_from_slice(&[e.logits, e.logits]);
+            d.i[0] = vocab;
+            d.f[0] = cap;
+        });
+        let d_am = em.b.emit(DevOp::Argmax, (0..AMAX_BLOCKS).collect(), &[d_cap], |d| {
+            d.t[..2].copy_from_slice(&[e.amax, e.logits]);
+            d.i[0] = vocab;
+        });
+        dep = Some(em.b.emit(DevOp::ArgmaxFin, vec![0], &[d_am], |d| {
+            d.t[..2].copy_from_slice(&[e.ids, e.amax]);
+            d.i[0] = AMAX_BLOCKS;
+        }));
+    }
+    let _ = dep;
     let tensors = em.b.tensors();
     let gen = em.b.gen_tensors();
     Model {
@@ -546,31 +724,27 @@ pub(crate) fn m1_layers(
     arch: &str,
     gpu: &str,
 ) -> std::ops::Range<usize> {
-    let Some(spec) = block else {
-        panic!(
-            "muse_spark: only `--block l[..r]` (single-block decode, TP1, gfx950) is emitted. \
-             Remaining: {REMAINING}"
-        );
-    };
-    assert_eq!(
-        tp, 1,
-        "muse_spark --block: TP{tp} is not implemented (M1 is TP1). Remaining: {REMAINING}"
+    let spec = block.unwrap_or("full model");
+    assert!(
+        c.kv_heads % tp == 0,
+        "muse_spark {spec}: TP{tp} must divide the {} kv heads",
+        c.kv_heads
     );
     assert!(
         target_is_amd(arch, gpu),
-        "muse_spark --block: M1 targets gfx950 only (got arch {arch:?} gpu {gpu:?})"
+        "muse_spark {spec}: only gfx950 is emitted (got arch {arch:?} gpu {gpu:?})"
     );
-    let layers = parse_block(spec, c.layers as usize);
+    let layers = block.map_or(0..c.layers as usize, |b| parse_block(b, c.layers as usize));
     for l in layers.clone() {
         if let Err(e) = c.check_m1_layer(l) {
-            panic!("muse_spark --block {spec}: {e}. Remaining: {REMAINING}");
+            panic!("muse_spark {spec}: {e}. Remaining: {REMAINING}");
         }
     }
     let rungs = emit_config::active().decode_rungs();
     assert_eq!(
         rungs,
         vec![1],
-        "muse_spark --block: M1 emits the B1 decode program only (decode rungs {rungs:?})"
+        "muse_spark {spec}: only the B1 decode program is emitted (decode rungs {rungs:?})"
     );
     layers
 }
@@ -594,7 +768,7 @@ pub(super) fn run(
     let c = MuseCfg::parse(&root);
     let layers = m1_layers(&c, block, tp, arch, gpu);
     let _guard = EmitAmdGuard::set(true);
-    let mut m = decode_program(&c, ctx, n_cu, layers.clone());
+    let mut m = decode_program(&c, ctx, n_cu, tp, layers.clone(), block.is_none());
     if !gpu.is_empty() {
         m.target = packet::devbuild::gpu_fingerprint(gpu);
     }
@@ -602,7 +776,7 @@ pub(super) fn run(
         dir,
         PREFIX,
         &m.tensors.iter().map(|t| t.name.clone()).collect::<Vec<_>>(),
-        Some(layers.clone()),
+        block.map(|_| layers.clone()),
         &[".experts."],
         &[],
         &[],
@@ -613,6 +787,44 @@ pub(super) fn run(
         m.bake_gen();
     }
     let lean = apply_verify_gate(&m, verify);
+    let section = match block {
+        Some(_) => block_section(&c, dir, out, layers.clone()),
+        None => serve_section::section(dir, emit_config::active().serve_defaults.as_deref())
+            .unwrap_or_else(|e| panic!("muse_spark serve manifest: {e}")),
+    };
+    let outp = Path::new(out);
+    std::fs::write(outp, m.to_blob_v6(&[section])).expect("write muse_spark blob");
+    if !arch.is_empty() {
+        write_lean_receipts(outp, &lean);
+        let mut man = manifest::build(&m, arch, &lean);
+        if emit_config::active().fa_gf_64.is_some() {
+            man["tuning"]["gf64"] = serde_json::json!(fa_gf(c.heads, c.kv_heads));
+            man["pairing"]["hash"] =
+                serde_json::json!(format!("0x{:016x}", manifest::pairing_hash(&man)));
+        }
+        report_dispatch_audit(&man);
+        manifest::write_config_header(&outp.with_file_name("plow_config.h"), &man)
+            .expect("muse_spark config header");
+        std::fs::write(
+            outp.with_file_name("build.json"),
+            serde_json::to_vec_pretty(&man).unwrap(),
+        )
+        .expect("muse_spark build manifest");
+    }
+    eprintln!(
+        "muse_spark {layers:?}: {} decode packets, ctx={ctx}, ns={} -> {out}\n  NOTE: B1 decode \
+         only. Remaining: {REMAINING}",
+        m.progs[0].insts.len(),
+        decode_ns(c.heads / tp, c.kv_heads / tp, n_cu),
+    );
+}
+
+fn block_section(
+    c: &MuseCfg,
+    dir: &Path,
+    out: &str,
+    layers: std::ops::Range<usize>,
+) -> packet::devbuild::SectionData {
     let l = layers.start;
     let hidden = c.hidden as i64;
     let ckpt = dir.to_string_lossy().into_owned();
@@ -670,40 +882,15 @@ pub(super) fn run(
             decode_t: 1,
         },
     };
-    let section = write_block_descriptor(out, &desc);
-    let outp = Path::new(out);
-    std::fs::write(outp, m.to_blob_v6(&[section])).expect("write muse_spark blob");
-    if !arch.is_empty() {
-        write_lean_receipts(outp, &lean);
-        let mut man = manifest::build(&m, arch, &lean);
-        if emit_config::active().fa_gf_64.is_some() {
-            man["tuning"]["gf64"] = serde_json::json!(fa_gf(&c));
-            man["pairing"]["hash"] =
-                serde_json::json!(format!("0x{:016x}", manifest::pairing_hash(&man)));
-        }
-        report_dispatch_audit(&man);
-        manifest::write_config_header(&outp.with_file_name("plow_config.h"), &man)
-            .expect("muse_spark config header");
-        std::fs::write(
-            outp.with_file_name("build.json"),
-            serde_json::to_vec_pretty(&man).unwrap(),
-        )
-        .expect("muse_spark build manifest");
-    }
-    eprintln!(
-        "muse_spark --block {layers:?}: {} decode packets, ctx={ctx}, ns={} -> {out}\n  NOTE: \
-         M1 single-block decode only. Remaining: {REMAINING}",
-        m.progs[0].insts.len(),
-        decode_ns(&c, n_cu),
-    );
+    write_block_descriptor(out, &desc)
 }
 
 /// Query heads per flash-decode work item (`PLOW_FA_GF_64`; the packet header carries a set value
 /// to the object). 2 by default: on MI350X TP1 B1 the full GQA group (8) is faster only on full
 /// layers at long context (c32768 FlashDecode 144 -> 97 us) and slower on sliding layers and at
 /// c4096 (20 -> 41 us), where flash decode is not bandwidth-bound.
-fn fa_gf(c: &MuseCfg) -> u32 {
-    let gqa = c.heads / c.kv_heads;
+fn fa_gf(heads: u32, kv_heads: u32) -> u32 {
+    let gqa = heads / kv_heads;
     let gf = emit_config::active().fa_gf_64.unwrap_or(2);
     assert!(
         matches!(gf, 1 | 2 | 4 | 8) && gqa % gf == 0,
@@ -712,10 +899,11 @@ fn fa_gf(c: &MuseCfg) -> u32 {
     gf
 }
 
-fn decode_ns(c: &MuseCfg, n_cu: u32) -> u32 {
+/// Flash-decode split count for `heads` / `kv_heads` (the rank-local counts under TP).
+fn decode_ns(heads: u32, kv_heads: u32, n_cu: u32) -> u32 {
     emit_config::active().muse_decode_ns.unwrap_or_else(|| {
-        let groups = c.heads / fa_gf(c);
-        attention_decode_ns(1, c.heads, c.kv_heads, n_cu, n_cu.div_ceil(groups).max(1))
+        let groups = heads / fa_gf(heads, kv_heads);
+        attention_decode_ns(1, heads, kv_heads, n_cu, n_cu.div_ceil(groups).max(1))
     })
 }
 
@@ -759,9 +947,8 @@ mod tests {
         assert_eq!(c.rope, vec![true, false, true, true]);
         assert_eq!(c.mxfp4_experts, vec![false, true, true, true]);
         assert_eq!((c.heads, c.kv_heads, c.hd, c.window), (8, 2, 64, 128));
-        assert_eq!((fa_gf(&c), decode_ns(&c, 256)), (2, 64));
-        assert!(c.check_m1_layer(0).unwrap_err().contains("bf16"));
-        assert!(c.check_m1_layer(1).is_ok());
+        assert_eq!((fa_gf(8, 2), decode_ns(8, 2, 256)), (2, 64));
+        assert!(c.check_m1_layer(0).is_ok() && c.check_m1_layer(1).is_ok());
     }
 
     fn ops(m: &Model, op: DevOp) -> Vec<&packet::dev::DevInst> {
@@ -771,7 +958,7 @@ mod tests {
     #[test]
     fn full_nope_and_sliding_rope_layers_route_attention() {
         let c = MuseCfg::parse(&config());
-        let full = decode_program(&c, 512, 256, 1..2);
+        let full = decode_program(&c, 512, 256, 1, 1..2, false);
         let fa = ops(&full, DevOp::FlashDecode);
         assert_eq!(fa.len(), 1);
         assert_eq!(fa[0].i[4], 0, "full layer: no window");
@@ -780,7 +967,7 @@ mod tests {
         assert_eq!(hnr.len(), 4, "q, k, v cache writes and the output norm");
         assert!(hnr.iter().all(|i| i.i[2] == 0 && i.t[2] == TENSOR_NONE), "NoPE, weightless");
 
-        let slide = decode_program(&c, 512, 256, 2..3);
+        let slide = decode_program(&c, 512, 256, 1, 2..3, false);
         assert_eq!(ops(&slide, DevOp::FlashDecode)[0].i[4], 128);
         let hnr = ops(&slide, DevOp::QwenHeadNormRope);
         assert_eq!(hnr.iter().filter(|i| i.i[2] == 64).count(), 2, "q and k rotated");
@@ -789,7 +976,7 @@ mod tests {
     #[test]
     fn latent_moe_routes_scaled_f32_logits_and_normed_combine() {
         let c = MuseCfg::parse(&config());
-        let m = decode_program(&c, 512, 256, 1..2);
+        let m = decode_program(&c, 512, 256, 1, 1..2, false);
         let rt = ops(&m, DevOp::MoeRouterTopk);
         assert_eq!(rt.len(), 1);
         assert_eq!(rt[0].i[3], ROUTER_FLAGS);
@@ -814,7 +1001,7 @@ mod tests {
     #[test]
     fn multi_layer_block_chains_in_place_and_ends_in_xnext() {
         let c = MuseCfg::parse(&config());
-        let m = decode_program(&c, 512, 256, 1..3);
+        let m = decode_program(&c, 512, 256, 1, 1..3, false);
         let x = m.tensors.iter().position(|t| t.name == "act.x").unwrap() as u32;
         let xnext = m.tensors.iter().position(|t| t.name == "act.xnext").unwrap() as u32;
         let outs: Vec<u32> = ops(&m, DevOp::MuseResidualGate).iter().map(|i| i.t[0]).collect();
@@ -827,12 +1014,57 @@ mod tests {
     #[test]
     fn m1_scope_refusals_name_what_remains() {
         let c = MuseCfg::parse(&config());
-        let full = std::panic::catch_unwind(|| m1_layers(&c, None, 1, "gfx950", ""));
-        let msg = *full.unwrap_err().downcast::<String>().unwrap();
-        assert!(msg.contains("lm_head") && msg.contains("TP8"), "{msg}");
-        let bf16 = std::panic::catch_unwind(|| m1_layers(&c, Some("0"), 1, "gfx950", ""));
-        assert!(bf16.unwrap_err().downcast::<String>().unwrap().contains("bf16"));
+        assert_eq!(m1_layers(&c, None, 1, "gfx950", ""), 0..4);
+        let gpu = std::panic::catch_unwind(|| m1_layers(&c, None, 1, "", "H100"));
+        let msg = *gpu.unwrap_err().downcast::<String>().unwrap();
+        assert!(msg.contains("gfx950"), "{msg}");
+        assert_eq!(m1_layers(&c, Some("0"), 1, "gfx950", ""), 0..1);
         assert!(std::panic::catch_unwind(|| m1_layers(&c, Some("1"), 8, "gfx950", "")).is_err());
-        assert_eq!(m1_layers(&c, Some("1..3"), 1, "gfx950", ""), 1..3);
+        assert_eq!(m1_layers(&c, Some("1..3"), 2, "gfx950", ""), 1..3);
+    }
+
+    #[test]
+    fn tp_shards_heads_and_experts_and_reduces_before_the_post_expert_norm() {
+        let c = MuseCfg::parse(&config());
+        let m = decode_program(&c, 512, 256, 2, 0..2, false);
+        let size = |n: &str| m.tensors.iter().find(|t| t.name == n).unwrap().bytes;
+        let p = "model.language_model.layers.1.";
+        assert_eq!(size(&format!("{p}self_attn.q_proj.weight")), 256 * 256 * 2);
+        assert_eq!(size(&format!("{p}self_attn.k_proj.weight")), 64 * 256 * 2);
+        assert_eq!(size(&format!("{p}self_attn.o_proj.weight")), 256 * 256 * 2);
+        assert_eq!(size(&format!("{p}mlp.pre_expert_proj.weight")), 128 * 128 * 2);
+        assert_eq!(size(&format!("{p}mlp.gate.weight")), 16 * 256 * 4, "router replicated");
+        let fa = ops(&m, DevOp::FlashDecode);
+        assert_eq!((fa[0].i[1], fa[0].i[2]), (4, 1), "4 q heads / 1 kv head per rank");
+        let xr: Vec<u32> = ops(&m, DevOp::XReduce).iter().map(|i| i.i[0]).collect();
+        assert_eq!(xr, vec![256, 128, 4 * 128, 256, 256, 128, 4 * 128, 256]);
+        let slots: Vec<u32> = ops(&m, DevOp::XReduce).iter().map(|i| i.i[2]).collect();
+        let sb = 4 * 128 * 2;
+        assert_eq!(slots, vec![0, sb, 0, sb, 0, sb, 0, sb], "slots strictly alternate");
+        assert!(ops(&m, DevOp::MuseMoeCombineNorm).iter().all(|i| i.i[2] == 1));
+        assert!(ops(&m, DevOp::MoeGroupDownFp8Blk).iter().all(|i| i.i[7] == 1));
+        let downs = ops(&m, DevOp::MoeGroupDownFp8Blk);
+        assert_eq!(downs.iter().map(|i| i.i[6]).collect::<Vec<_>>(), vec![MOE_ENC_BF16, MOE_ENC_MXFP4]);
+        assert!(downs.iter().all(|i| i.i[2] == 64));
+    }
+
+    #[test]
+    fn full_model_embeds_ids_and_ends_in_a_softcapped_greedy_id() {
+        let c = MuseCfg::parse(&config());
+        let m = decode_program(&c, 512, 256, 2, 0..4, true);
+        let size = |n: &str| m.tensors.iter().find(|t| t.name == n).unwrap().bytes;
+        let ins = &m.progs[0].insts;
+        let id = |n: &str| m.tensors.iter().position(|t| t.name == n).unwrap() as u32;
+        assert_eq!(ins[0].op, DevOp::Embed as u16);
+        assert_eq!((ins[0].t[2], ins[0].f[0]), (id("in.ids"), 1.0));
+        assert_eq!((ins[1].op, ins[1].t[2], ins[1].i[2]), (DevOp::MuseRmsNorm as u16, TENSOR_NONE, NORM_PLAIN));
+        let n = ins.len();
+        let ops: Vec<u16> = ins[n - 5..].iter().map(|i| i.op).collect();
+        let want = [DevOp::MuseRmsNorm, DevOp::Gemv, DevOp::SoftCap, DevOp::Argmax, DevOp::ArgmaxFin];
+        assert_eq!(ops, want.map(|o| o as u16));
+        assert_eq!(ins[n - 5].f[1], c.output_multiplier, "multiplier rides the final norm");
+        assert_eq!((ins[n - 3].i[0], ins[n - 3].f[0]), (1000, 20.0));
+        assert_eq!(ins[n - 1].t[0], id("in.ids"));
+        assert_eq!(size("lm_head.weight"), 1000 * 256 * 2, "head replicated at TP");
     }
 }

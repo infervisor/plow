@@ -106,7 +106,7 @@ pub fn shard_of(name: &str) -> Shard {
     // `derived.o_fold.weight` = the prep-fused W_uv·W_o ([H, NH*DK], head-major columns):
     // its contraction dim slices per rank exactly as o_proj's does (rank r takes columns
     // h∈[r·nh_l, (r+1)·nh_l)·DK — a strided column range), so it rides the same Row class.
-    const ROW: [&str; 7] = [
+    const ROW: [&str; 9] = [
         "o_proj.weight",
         "down_proj.weight",
         ".w2.weight",
@@ -115,6 +115,9 @@ pub fn shard_of(name: &str) -> Shard {
         // DeepSeek-V4.1 MLA projection
         "attn.wo_b.weight",
         "attn.wo_b.scale",
+        // Muse Spark latent MoE projections; replicated unless the packet declares a slice.
+        "mlp.pre_expert_proj.weight",
+        "mlp.post_expert_proj.weight",
     ];
 
     // --- Mixtral `w1|w2|w3` routed experts (Kimi-K3), in the generic tables above ---
@@ -868,6 +871,29 @@ mod glm_shard_tests {
     /// A Row classification would pass every size check here and return `full[2],
     /// full[3], full[6], ...` instead — same length, same dtype, wrong model. That is
     /// the reason this asserts BYTES and not just a length.
+    #[test]
+    fn muse_latent_projections_are_row_parallel_or_whole_as_declared() {
+        const P: &str = "model.language_model.layers.3.mlp.";
+        for n in ["pre_expert_proj.weight", "post_expert_proj.weight"] {
+            assert_eq!(shard_of(&format!("{P}{n}")), Shard::Row);
+        }
+        for n in [
+            "gate.weight",
+            "pre_expert_norm.weight",
+            "experts.post_expert_norm.weight",
+        ] {
+            assert_eq!(shard_of(&format!("{P}{n}")), Shard::Replicated);
+        }
+        let (k, n) = (8usize, 4usize);
+        let full: Vec<u8> = (0..(k * n * 2) as u8).collect();
+        let name = format!("{P}pre_expert_proj.weight");
+        let whole = slice_for(&name, &full, &[n, k], full.len() as u64, 3, 4).unwrap();
+        assert_eq!(&*whole, &full[..]);
+        let r1 = slice_for(&name, &full, &[n, k], (full.len() / 4) as u64, 1, 4).unwrap();
+        let want: Vec<u8> = (0..n).flat_map(|row| full[row * 16 + 4..row * 16 + 8].to_vec()).collect();
+        assert_eq!(&*r1, &want[..]);
+    }
+
     #[test]
     fn k3_up_proj_column_shard_is_a_contiguous_row_range() {
         const H: usize = 8; // "hidden": the split axis

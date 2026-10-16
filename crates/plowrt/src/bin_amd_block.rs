@@ -170,7 +170,12 @@ pub fn run(
             .find(|t| t.name == name)
             .ok_or_else(|| format!("{name}: tensor absent from packet"))?;
         let bytes = std::fs::read(path)?;
-        if bytes.is_empty() || bytes.len() as u64 > tensor.bytes || bytes.len() % 2 != 0 {
+        let capacity = if name.starts_with("kv.") {
+            tensor.bytes * u64::from(tp)
+        } else {
+            tensor.bytes
+        };
+        if bytes.is_empty() || bytes.len() as u64 > capacity || bytes.len() % 2 != 0 {
             return Err(format!(
                 "{name}: invalid operand size {} (capacity {})",
                 bytes.len(),
@@ -372,7 +377,8 @@ pub fn run(
         }
         Err(errors.join("; ").into())
     };
-    let run = |engines: &mut [&mut AmdEngine]| -> Result<(), Error> {
+    // `rank`: a head-major KV operand that covers all `tp` ranks' heads is split per rank.
+    let run = |engines: &mut [&mut AmdEngine], rank: usize| -> Result<(), Error> {
         for engine in engines {
             if engine.batch() != batch {
                 return Err("capture batch must equal the packet's allocated decode batch".into());
@@ -387,14 +393,20 @@ pub fn run(
                     let capacity = engine.tensor_bytes(name).ok_or("missing KV tensor")? as usize;
                     let (stride, prefix) =
                         carried_state_layout(name, capacity, batch, engine.max_ctx(), ctx)?;
-                    if bytes.len() != prefix * batch {
+                    let ranks = if tp > 1 && bytes.len() == prefix * batch * tp as usize {
+                        tp as usize
+                    } else {
+                        1
+                    };
+                    if bytes.len() != prefix * batch * ranks {
                         return Err(format!(
                             "{name}: capture must cover exactly {batch} rows of context {ctx}"
                         )
                         .into());
                     }
-                    for (row, data) in bytes.chunks_exact(prefix).enumerate() {
-                        engine.write_tensor_at(name, (row * stride) as u64, data)?;
+                    for (row, data) in bytes.chunks_exact(prefix * ranks).enumerate() {
+                        let part = &data[rank % ranks * prefix..][..prefix];
+                        engine.write_tensor_at(name, (row * stride) as u64, part)?;
                     }
                 } else {
                     engine.write_tensor(name, bytes)?;
@@ -407,7 +419,7 @@ pub fn run(
         single = AmdEngine::load(backends[0].clone(), &blob, &hsaco, checkpoint.as_deref())?;
         selected_routes = vec![single.selected_route_evidence().clone()];
         for i in 0..iterations {
-            run(&mut [&mut single])?;
+            run(&mut [&mut single], 0)?;
             let start = Instant::now();
             let dp = single.decode_prog_for(batch);
             single.run(dp, single.decode_kernel_for(dp))?;
@@ -445,7 +457,7 @@ pub fn run(
         }
         for i in 0..iterations {
             for rank in 0..tp as usize {
-                run(&mut [group.rank_mut(rank)])?;
+                run(&mut [group.rank_mut(rank)], rank)?;
             }
             let start = Instant::now();
             let dp = group.rank(0).decode_prog_for(batch);

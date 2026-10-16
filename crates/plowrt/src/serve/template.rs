@@ -256,7 +256,7 @@ impl ChatTemplate {
                 Ok(crate::serve::tools::pyjson::dumps(&json, &opts))
             },
         );
-        if let Err(e) = env.add_template_owned("chat", text.clone()) {
+        if let Err(e) = env.add_template_owned("chat", neutral_generation_blocks(&text)) {
             // A template that will not COMPILE is a defect in the assets, and
             // falling back silently is how a wrong prompt ships. Say which file.
             tracing::error!(%source, error = %e, "chat template failed to compile — falling back to the built-in prompt builders");
@@ -337,9 +337,66 @@ impl ChatTemplate {
     }
 }
 
+/// `transformers`' `{% generation %}...{% endgeneration %}` (the assistant-token mask for
+/// training) renders its body unchanged; minijinja has no such statement, so each tag becomes an
+/// always-true `if` with the same whitespace control.
+fn neutral_generation_blocks(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(i) = rest.find("{%") {
+        let Some(j) = rest[i..].find("%}") else { break };
+        let tag = &rest[i..i + j + 2];
+        let inner = tag[2..tag.len() - 2].trim_matches(|c: char| c == '-' || c == '+');
+        out.push_str(&rest[..i]);
+        match inner.trim() {
+            "generation" => out.push_str(&tag.replacen("generation", "if true", 1)),
+            "endgeneration" => out.push_str(&tag.replacen("endgeneration", "endif", 1)),
+            _ => out.push_str(tag),
+        }
+        rest = &rest[i + j + 2..];
+    }
+    out.push_str(rest);
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::ChatTemplate;
+
+    #[test]
+    fn generation_blocks_become_always_true_ifs() {
+        let t = "a{%- generation %}b{% endgeneration -%}c{% if x %}d{% endif %}";
+        assert_eq!(
+            super::neutral_generation_blocks(t),
+            "a{%- if true %}b{% endif -%}c{% if x %}d{% endif %}"
+        );
+    }
+
+    /// Muse Spark's template wraps the assistant turn in `{% generation %}`; the multi-turn
+    /// render is the string `transformers` produces (`reasoning_effort='high'`, fixed date).
+    #[test]
+    fn the_real_muse_spark_template_renders_what_transformers_renders() {
+        let dir = std::path::Path::new("/home/lava/models/Muse-Spark-Open-816B-A42B-Quark-MXFP4");
+        if !dir.join("chat_template.jinja").exists() {
+            eprintln!("skipped: no Muse Spark checkpoint on this host");
+            return;
+        }
+        let t = ChatTemplate::load(dir).expect("template compiles");
+        let msgs = vec![
+            serde_json::json!({"role": "user", "content": "one"}),
+            serde_json::json!({"role": "assistant", "content": "two"}),
+            serde_json::json!({"role": "user", "content": "three"}),
+        ];
+        let opts = super::RenderOpts {
+            reasoning_effort: Some("high".into()),
+            kwargs: [("current_date".to_string(), serde_json::json!("2026-10-16"))].into(),
+            ..Default::default()
+        };
+        assert_eq!(
+            t.render_with(&msgs, &opts).expect("renders"),
+            "<|begin_of_text|><|start|>system<|message|>You are a helpful AI assistant.\n\nKnowledge cutoff: 2026-01-04.\n\nCurrent date: 2026-10-16.\n\nReasoning strength: 256.\n\nUse the appropriate recipient for each message:\n\n- \"self\": private reasoning and tool planning.\n- \"commentary\": user-visible intermediate updates while the assistant will continue working, including messages sent to the user before or between tool calls.\n- \"user\": messages that end the assistant turn, such as a completed response or clarification question that waits for the user's reply; do not use for pre-tool updates or partial responses.\n\n# Valid recipients: \"self\", \"commentary\", \"user\".<|eot|><|start|>user<|message|>one<|eot|><|start|>assistant to=user<|message|>two<|eot|><|start|>user<|message|>three<|eot|><|start|>assistant"
+        );
+    }
 
     /// Render the REAL checkpoint template and compare against the string
     /// `transformers` produces for the same conversation. Skipped when the

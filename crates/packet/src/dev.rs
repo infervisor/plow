@@ -506,7 +506,8 @@ pub enum DevOp {
     /// the gate-scaled partial `part[slot]`. On the skip path it zeroes `part[slot]` so the
     /// combine sums a deterministic zero.
     /// `t0=part(out,[k,H]) t1=fu t2=routing_table t3=expert_weight_table` ·
-    /// `i0=slot i1=H(N) i2=I_moe(K) i3=n_exp`.
+    /// `i0=slot i1=H(N) i2=I_moe(K) i3=n_exp i7=ybf` (`ybf = 1`: unweighted bf16 `[k,H]` partial,
+    /// as [`DevOp::MoeGroupDownFp8Blk`]).
     MoeExpertDown = 42,
     /// MoE combine (`moe-ep-kernels.md §3b`) — the deterministic gather-combine. Waits on
     /// all `k` expert-down slots + the shared expert, then
@@ -569,7 +570,8 @@ pub enum DevOp {
     /// [`DevOp::MoeExpertDownFp8Blk`] did one-per-packet. Bit-identical gate-scaled `part`; sentinel /
     /// EP-non-local slots zero the partial so the fixed-slot combine sums a deterministic zero.
     /// `t0=part[k,H] t1=fu t2=routing_table t3=expert_weight_table t4=expert_scale_table` ·
-    /// `i0=k i1=H i2=I_moe i3=n_exp`.
+    /// `i0=k i1=H i2=I_moe i3=n_exp i6=enc i7=ybf`. `ybf = 1` (Muse Spark TP, MXFP4 only) writes
+    /// the UNWEIGHTED down output as a bf16 `[k,H]` partial for a cross-rank reduce.
     MoeGroupDownFp8Blk = 49,
 
     // ===== DeepSeek MLA (Multi-head Latent Attention) — flash READ path. =====
@@ -2404,7 +2406,8 @@ pub enum DevOp {
     /// A third call site, differing from the other two only in `i3`/`i6`/`i7`.
     CompressRopeQuant = 217,
     /// Muse Spark row RMSNorm (`op_muse.h` `d_muse_rmsnorm`), one workgroup per row.
-    /// `t0=out(bf16[rows][dim]) t1=x(bf16) t2=w(bf16[dim])?` · `i0=rows i1=dim i2=mode` · `f0=eps`.
+    /// `t0=out(bf16[rows][dim]) t1=x(bf16) t2=w(bf16[dim])?` · `i0=rows i1=dim i2=mode` · `f0=eps`
+    /// `f1=oscale` (0 = 1: the final norm carries the logit `output_multiplier`).
     /// `mode` 0: `x*r*w` (`w` absent = weightless); 1 CENTERED: `x*r*(1+w)`;
     /// 2 INPUT_SCALED: `y = bf16(x*(1+w))`, `y*r(y)`. Every product is rounded to bf16 where the
     /// reference rounds it.
@@ -2417,7 +2420,8 @@ pub enum DevOp {
     /// Muse Spark expert combine with the per-(token, expert) input-scaled post-expert norm.
     /// `part` is the grouped down projection's `gate * y`; per slot this recovers
     /// `y = bf16(part/gate)`, applies the input-scaled RMSNorm, and sums `gate * norm(y)` in f32.
-    /// `t0=out(bf16[H]) t1=part(f32[k][H]) t2=table t3=w(bf16[H])` · `i0=H i1=k` · `f0=eps`.
+    /// `t0=out(bf16[H]) t1=part(f32[k][H]) t2=table t3=w(bf16[H])` · `i0=H i1=k i2=ybf` ·
+    /// `f0=eps`. `ybf = 1` (TP): `part` is the reduced bf16 unweighted `y[k][H]`.
     /// Decode (one token) only.
     MuseMoeCombineNorm = 220,
 }

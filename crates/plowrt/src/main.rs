@@ -2639,6 +2639,10 @@ fn amd_bench_tp(
                 for (p, id) in ids.iter().enumerate() {
                     g.seed_ids(&[*id])?;
                     last = AmdTpGroup::agree(&g.decode_step(p as u32, p as u32 + 1)?)?;
+                    // Teacher-forced: every prompt position's logits row.
+                    if dump_logits.is_some() && p + 1 < ids.len() {
+                        dump(&g, &format!("pf{p:05}"))?;
+                    }
                 }
                 last
             } else {

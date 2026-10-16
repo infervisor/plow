@@ -5955,7 +5955,8 @@ struct ExpertNames {
     proj: [&'static str; 3],
     /// `.weight` or `.weight_packed`.
     payload: &'static str,
-    /// `.weight_scale_inv` (block-fp8 f32 grid) or `.weight_scale` (E8M0 row).
+    /// `.weight_scale_inv` (block-fp8 f32 grid) or `.weight_scale` (E8M0 row); empty for an
+    /// unquantized bf16 expert (Muse Spark's layers 0 and 61, Quark `exclude`d).
     scale: &'static str,
 }
 
@@ -5987,6 +5988,10 @@ impl ExpertNames {
     /// K) rather than a block-fp8 `[N/128][K/128]` f32 grid?
     fn microscaled(&self) -> bool {
         self.scale == ".weight_scale" || self.scale == ".scale"
+    }
+
+    fn bf16(&self) -> bool {
+        self.scale.is_empty()
     }
 }
 
@@ -6039,6 +6044,17 @@ fn resolve_expert_names(
                     });
                 }
             }
+            // No scale twin and two bytes per element: an unquantized bf16 expert.
+            if let Some((w, shape)) = ckpt.tensor_ex(&probe) {
+                if payload == ".weight" && w.len() == 2 * shape.iter().product::<usize>() {
+                    return Ok(ExpertNames {
+                        ns,
+                        proj,
+                        payload,
+                        scale: "",
+                    });
+                }
+            }
             return Err(RuntimeError::Device(format!(
                 "MISSING EXPERT SCALE: `{probe}` is in the checkpoint but none of \
                  `{ns}0.{}` with any of {SCALES:?} is. A quantized expert without its scale \
@@ -6078,6 +6094,15 @@ fn check_expert_geometry(
     for j in 0..3 {
         let (wn, sn) = (n.weight_of(0, j, false), n.scale_of(0, j, false));
         let (w, ws) = ckpt.tensor_ex(&wn).ok_or_else(|| miss(&wn))?;
+        if n.bf16() {
+            if ws.len() != 2 || w.len() != 2 * ws[0] * ws[1] {
+                return Err(RuntimeError::Device(format!(
+                    "EXPERT GEOMETRY: bf16 `{wn}` {ws:?} ({} B) is not a 2-D bf16 matrix",
+                    w.len()
+                )));
+            }
+            continue;
+        }
         let (s, ss) = ckpt.tensor_ex(&sn).ok_or_else(|| miss(&sn))?;
         let bad = |m: String| {
             Err(RuntimeError::Device(format!(
@@ -6569,12 +6594,15 @@ fn bind_packed_experts(
         // Slot strides: what ONE {expert, proj} occupies in the packed buffer.
         let w_stride = w0.len() as u64 / if whole { 1 } else { n_gpu as u64 };
         let s_probe = en.scale_of(0, 0, false);
-        let s_stride = ckpt
-            .tensor_ex(&s_probe)
-            .ok_or_else(|| RuntimeError::Device(format!("MISSING EXPERT SCALE: {s_probe}")))?
-            .0
-            .len() as u64
-            / if whole { 1 } else { n_gpu as u64 };
+        let s_stride = if en.bf16() {
+            0
+        } else {
+            ckpt.tensor_ex(&s_probe)
+                .ok_or_else(|| RuntimeError::Device(format!("MISSING EXPERT SCALE: {s_probe}")))?
+                .0
+                .len() as u64
+                / if whole { 1 } else { n_gpu as u64 }
+        };
 
         // The fold's own preconditions, checked where the checkpoint is: TP (under EP the routed
         // experts are whole per rank while the shared expert is sliced on every rank, so there is
@@ -6800,7 +6828,7 @@ fn bind_packed_experts(
         // slab — value-identical, and it is what lets the CDNA3 grouped-GEMM staging decode
         // drop its neg-0 mask (`mpf_fp8x4_to_bf16_h`, runtime/amd/op_moe.h). Never the scales
         // (f32) and never an MXFP4 payload (0x80 there is two live fp4 nibbles).
-        let scrub_w = !en.microscaled();
+        let scrub_w = !en.microscaled() && !en.bf16();
         // Per-entry: (name, dst, bytes, scrub, pf_dst, pf_rows, pf_kbytes). pf_dst == 0 means no
         // preshuffled copy (scale entries, or the pf table not declared). Geometry per
         // projection: gate/up are [I_moe][K] row-major shards, down is [H][I_moe] — in both
@@ -6846,6 +6874,9 @@ fn bind_packed_experts(
                     false,
                     shared && !en.microscaled(),
                 ));
+                if en.bf16() {
+                    continue;
+                }
                 plan.push((
                     en.scale_of(e, j, shared),
                     stab[idx],

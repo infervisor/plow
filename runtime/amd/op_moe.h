@@ -1157,21 +1157,34 @@ __device__ __forceinline__ float wave_dot_int4_g32(const bf16* x, const unsigned
  * trap, finite numbers, wrong model. That is the exact failure this file's `moe_act` poison
  * exists to prevent, and the encoding operand had no equivalent.
  *
- * BF16 IS REFUSED RATHER THAN IMPLEMENTED, deliberately. A bf16 MoE already has its own
- * opcodes — `d_moe_expert_glu` / `d_moe_expert_down` (41/42) — and `mla.rs:3298`
- * (`use_fp8 = enc != MoeEnc::Bf16`) routes to them, so no shipping emitter can land here with
- * enc 0. `k3.rs:418` CAN: it emits `MoeExpertGluFp8Blk` unconditionally and passes `c.enc`
- * through, so a bf16 K3 config would arrive here with 0 — and did, silently. A wave-reduced
- * bf16 arm is ~10 lines, but adding a fourth body nothing emits is speculative; a NaN says
- * "this object has no body for that field value" on the first token instead.
+ * BF16 (enc 0) has a wave-reduced arm for Muse Spark's unquantized expert layers, whose rows
+ * are 2 bytes per element (callers stride by `moe_wstr`). The thread-per-output bf16 opcodes
+ * 41/42 stay for the emitters that route to them.
  *
  * NUMERICS: enc == PLOW_MOE_ENC_FP8BLK is unchanged (one uniform scalar compare ahead of the
  * same call), so GLM-5.2 stays byte-identical. */
+__device__ __forceinline__ float wave_dot_bf16(const bf16* x, const bf16* w, unsigned K,
+                                               unsigned lane) {
+    float acc = 0.0f;
+    for (unsigned i = lane * 8u; i < K; i += PLOW_WAVE * 8u) {
+        const bf16v8 a = ld_glob8(x + i), b = ld_glob8(w + i);
+#pragma unroll
+        for (unsigned j = 0; j < 8; j++) acc += bf2f(a[j]) * bf2f(b[j]);
+    }
+    return wave_sum(acc);
+}
+
+/* Bytes per weight row of K elements under `enc`. */
+__device__ __forceinline__ unsigned moe_wstr(unsigned enc, unsigned K) {
+    return enc == PLOW_MOE_ENC_MXFP4 ? (K >> 1) : enc == PLOW_MOE_ENC_BF16 ? 2u * K : K;
+}
+
 __device__ __forceinline__ float wave_dot_enc(unsigned enc, const bf16* x,
                                               const unsigned char* Wrow, const float* srow_f,
                                               const unsigned char* srow_b, unsigned K,
                                               unsigned lane) {
     if (enc == PLOW_MOE_ENC_MXFP4) return wave_dot_mxfp4(x, Wrow, srow_b, K, lane);
+    if (enc == PLOW_MOE_ENC_BF16) return wave_dot_bf16(x, (const bf16*)(const void*)Wrow, K, lane);
     /* int4 g32 rides `srow_b` because it is the BYTE row operand and this encoding's scale is a
      * BF16 per group — 2 bytes at stride K/32 — not an E8M0 byte. No signature change, and the
      * fp8 f32 row stays untouched. */
@@ -1209,7 +1222,7 @@ __device__ void d_moe_expert_glu_fp8_blk(bf16* fu, const bf16* x, const unsigned
     /* Weight/scale row strides differ by encoding: block-fp8 is 1 byte/elt with a
      * [N/128][K/128] f32 grid; MXFP4 is 2 elts/byte with a [N][K/32] E8M0 row. */
     const bool mx = (enc == PLOW_MOE_ENC_MXFP4);
-    const unsigned wstr = mx ? (H >> 1) : H;
+    const unsigned wstr = moe_wstr(enc, H);
     const unsigned KB = (H + 127u) >> 7;
     bf16* fu_slot = fu + (size_t)slot * I_moe;
 
@@ -1245,6 +1258,16 @@ __device__ void d_moe_expert_glu_fp8_blk(bf16* fu, const bf16* x, const unsigned
     }
 }
 
+/* `ybf` != 0 (Muse Spark TP, packet i7): store the UNWEIGHTED down output as bf16 into a [k][H]
+ * bf16 partial, for the cross-rank reduce that must precede the per-expert post norm. */
+__device__ __forceinline__ void moe_down_st(float* part, size_t i, float gate, float y,
+                                            unsigned ybf) {
+    if (ybf)
+        ((bf16*)part)[i] = f2bf(y);
+    else
+        part[i] = gate * y;
+}
+
 /* --- kernel 2b-fp8: EXPERT DOWN, block-fp8 (PLOW_DOP_MOE_EXPERT_DOWN_FP8_BLK) -----------------
  * Block-fp8 twin of d_moe_expert_down, PARALLEL (wave-per-output). Wd base from wtab[eid*3+2]; scale
  * grid from stab[eid*3+2] ([H/128][I_moe/128] f32). fu (this expert's gate/up output) stays bf16.
@@ -1254,14 +1277,14 @@ __device__ void d_moe_expert_down_fp8_blk(float* part, const bf16* fu, const uns
                                           const unsigned long long* wtab,
                                           const unsigned long long* stab, unsigned slot, unsigned H,
                                           unsigned I_moe, unsigned n_exp, unsigned slice,
-                                          unsigned nblk, unsigned enc) {
+                                          unsigned nblk, unsigned enc, unsigned ybf = 0) {
     const unsigned eid = moe_slot_expert(table, slot);
     float* part_slot = part + (size_t)slot * H;
     /* skip (sentinel OR EP-non-local null base): zero this slot's partial (all threads share row) */
     if (eid >= n_exp || wtab[(size_t)eid * 3 + 2] == 0ull) {
         const unsigned gid = slice * PLOW_THREADS + threadIdx.x;
         const unsigned stride = nblk * PLOW_THREADS;
-        for (unsigned h = gid; h < H; h += stride) part_slot[h] = 0.0f;
+        for (unsigned h = gid; h < H; h += stride) moe_down_st(part, (size_t)slot * H + h, 0.0f, 0.0f, ybf);
         return;
     }
     const float gate = moe_slot_gate(table, slot);
@@ -1269,7 +1292,7 @@ __device__ void d_moe_expert_down_fp8_blk(float* part, const bf16* fu, const uns
     const float* Sd = (const float*)(size_t)stab[(size_t)eid * 3 + 2];
     const unsigned char* Bd = (const unsigned char*)(size_t)stab[(size_t)eid * 3 + 2];
     const bool mx = (enc == PLOW_MOE_ENC_MXFP4);
-    const unsigned wstr = mx ? (I_moe >> 1) : I_moe;
+    const unsigned wstr = moe_wstr(enc, I_moe);
     const unsigned KB = (I_moe + 127u) >> 7;
     const bf16* fu_slot = fu + (size_t)slot * I_moe;
     const unsigned lane = threadIdx.x & 63;
@@ -1289,10 +1312,22 @@ __device__ void d_moe_expert_down_fp8_blk(float* part, const bf16* fu, const uns
                               Wd + (size_t)h1 * wstr, Bd + (size_t)h1 * (I_moe >> 5), I_moe, lane,
                               y0, y1);
             if (lane == 0) {
-                part_slot[h] = gate * y0;
-                if (h + 1u < H) part_slot[h + 1u] = gate * y1;
+                moe_down_st(part, (size_t)slot * H + h, gate, y0, ybf);
+                if (h + 1u < H) moe_down_st(part, (size_t)slot * H + h + 1u, gate, y1, ybf);
             }
         }
+        return;
+    }
+    if (enc == PLOW_MOE_ENC_BF16) {
+        for (unsigned h = slice * PLOW_WAVES + wave; h < H; h += wstride) {
+            const float y = wave_dot_bf16(fu_slot, (const bf16*)(const void*)(Wd + (size_t)h * wstr),
+                                          I_moe, lane);
+            if (lane == 0) moe_down_st(part, (size_t)slot * H + h, gate, y, ybf);
+        }
+        return;
+    }
+    if (ybf) { /* the bf16 out-mode is an MXFP4 / bf16 route only */
+        if (threadIdx.x == 0) __builtin_trap();
         return;
     }
 #if PLOW_MOE_DEC_LG && !PLOW_MOE_DEC_ABL
@@ -1400,8 +1435,7 @@ __device__ PLOW_MOE_GROUP_INLINE void d_moe_group_glu_fp8_blk(
          * read fp4 nibbles as one byte per element with an E8M0 row reinterpreted as an f32 grid
          * (garbage activations, no fault) and only the down projection was right. The asymmetry
          * made it present as a gate/up numerics bug rather than a dropped operand. */
-        const bool mx = (enc == PLOW_MOE_ENC_MXFP4);
-        const unsigned wstr = mx ? (H >> 1) : H;
+        const unsigned wstr = moe_wstr(enc, H);
         const unsigned nrow = (n >> 7) * KB;      /* block-fp8 scale row  */
         const size_t brow = (size_t)n * (H >> 5); /* MXFP4 E8M0 scale row */
         const float g = wave_dot_enc(enc, x, Wg + (size_t)n * wstr, Sg + nrow, Bg + brow, H, lane);
@@ -1466,7 +1500,7 @@ __device__ PLOW_MOE_GROUP_INLINE void d_moe_group_glu_fp8_blk(
 __device__ PLOW_MOE_GROUP_INLINE void d_moe_group_down_fp8_blk(
     float* part, const bf16* fu, const unsigned char* table, const unsigned long long* wtab,
     const unsigned long long* stab, unsigned k, unsigned H, unsigned I_moe, unsigned n_exp,
-    unsigned slice, unsigned nblk, unsigned enc) {
+    unsigned slice, unsigned nblk, unsigned enc, unsigned ybf = 0) {
 #if PLOW_MOE_GROUP_FLAT
     const unsigned KB = (I_moe + 127u) >> 7;
     const unsigned lane = threadIdx.x & 63;
@@ -1477,21 +1511,20 @@ __device__ PLOW_MOE_GROUP_INLINE void d_moe_group_down_fp8_blk(
         const unsigned slot = f / H;
         const unsigned h = f - slot * H;
         const unsigned eid = moe_slot_expert(table, slot);
-        float* part_slot = part + (size_t)slot * H;
         if (eid >= n_exp || wtab[(size_t)eid * 3 + 2] == 0ull) { /* skip: deterministic zero partial */
-            if (lane == 0) part_slot[h] = 0.0f;
+            if (lane == 0) moe_down_st(part, (size_t)slot * H + h, 0.0f, 0.0f, ybf);
             continue;
         }
         const float gate = moe_slot_gate(table, slot);
         const unsigned char* Wd = (const unsigned char*)(size_t)wtab[(size_t)eid * 3 + 2];
         const float* Sd = (const float*)(size_t)stab[(size_t)eid * 3 + 2];
         const bf16* fu_slot = fu + (size_t)slot * I_moe;
-        const unsigned wstr = (enc == PLOW_MOE_ENC_MXFP4) ? (I_moe >> 1) : I_moe;
+        const unsigned wstr = moe_wstr(enc, I_moe);
         const float y = wave_dot_enc(enc, fu_slot, Wd + (size_t)h * wstr,
                                      Sd + (size_t)(h >> 7) * KB,
                                      (const unsigned char*)Sd + (size_t)h * (I_moe >> 5), I_moe,
                                      lane);
-        if (lane == 0) part_slot[h] = gate * y;
+        if (lane == 0) moe_down_st(part, (size_t)slot * H + h, gate, y, ybf);
     }
 #else
     /* MXFP4 with a NARROW contraction: the lane-group map plus the flattened (slot, row-octet)
@@ -1521,11 +1554,10 @@ __device__ PLOW_MOE_GROUP_INLINE void d_moe_group_down_fp8_blk(
             const unsigned h = (f - slot * ng) * 2u * RG;
             const unsigned ra = h + lane / LPG, rb = h + RG + lane / LPG;
             const unsigned eid = moe_slot_expert(table, slot);
-            float* ps = part + (size_t)slot * H;
             if (eid >= n_exp || wtab[(size_t)eid * 3 + 2] == 0ull) {
                 if ((lane % LPG) == 0) { /* deterministic zero partial, as the shipped skip */
-                    if (ra < H) ps[ra] = 0.0f;
-                    if (rb < H) ps[rb] = 0.0f;
+                    if (ra < H) moe_down_st(part, (size_t)slot * H + ra, 0.0f, 0.0f, ybf);
+                    if (rb < H) moe_down_st(part, (size_t)slot * H + rb, 0.0f, 0.0f, ybf);
                 }
                 continue;
             }
@@ -1538,15 +1570,15 @@ __device__ PLOW_MOE_GROUP_INLINE void d_moe_group_down_fp8_blk(
             wave_dot_mxfp4_lg2<RG>(fu + (size_t)slot * I_moe, Wd, Bd, wstr, sstr, ca, cb, I_moe,
                                    lane, y0, y1);
             if ((lane % LPG) == 0) {
-                if (ra < H) ps[ra] = gate * y0;
-                if (rb < H) ps[rb] = gate * y1;
+                if (ra < H) moe_down_st(part, (size_t)slot * H + ra, gate, y0, ybf);
+                if (rb < H) moe_down_st(part, (size_t)slot * H + rb, gate, y1, ybf);
             }
         }
         return;
     }
     for (unsigned slot = 0; slot < k; slot++)
         d_moe_expert_down_fp8_blk(part, fu, table, wtab, stab, slot, H, I_moe, n_exp, slice, nblk,
-                                  enc);
+                                  enc, ybf);
 #endif
 }
 
@@ -1744,13 +1776,13 @@ __device__ void d_moe_expert_glu(bf16* fu, const bf16* x, const unsigned char* t
  * combine sums a deterministic zero. */
 __device__ void d_moe_expert_down(float* part, const bf16* fu, const unsigned char* table,
                                   const unsigned long long* wtab, unsigned slot, unsigned H,
-                                  unsigned I_moe, unsigned n_exp, unsigned slice, unsigned nblk) {
+                                  unsigned I_moe, unsigned n_exp, unsigned slice, unsigned nblk,
+                                  unsigned ybf = 0) {
     const unsigned eid = moe_slot_expert(table, slot);
-    float* part_slot = part + (size_t)slot * H;
     const unsigned gid = slice * PLOW_THREADS + threadIdx.x;
     const unsigned stride = nblk * PLOW_THREADS;
     if (eid >= n_exp || wtab[(size_t)eid * 3 + 2] == 0ull) { /* skip (sentinel/EP-non-local): zero */
-        for (unsigned h = gid; h < H; h += stride) part_slot[h] = 0.0f;
+        for (unsigned h = gid; h < H; h += stride) moe_down_st(part, (size_t)slot * H + h, 0.0f, 0.0f, ybf);
         return;
     }
     const float gate = moe_slot_gate(table, slot);
@@ -1758,7 +1790,7 @@ __device__ void d_moe_expert_down(float* part, const bf16* fu, const unsigned ch
     const bf16* fu_slot = fu + (size_t)slot * I_moe;
     for (unsigned h = gid; h < H; h += stride) {
         float y = moe_dot_bf16(fu_slot, Wd + (size_t)h * I_moe, I_moe);
-        part_slot[h] = gate * y; /* f32 partial into the combine */
+        moe_down_st(part, (size_t)slot * H + h, gate, y, ybf); /* f32 partial into the combine */
     }
 }
 

@@ -551,6 +551,10 @@ pub struct EmitConfig {
     /// for the split-count screen.
     #[arg(long, env = "PLOW_MUSE_DECODE_NS")]
     pub muse_decode_ns: Option<u32>,
+    /// Muse Spark TP: `pre_expert_proj` / `post_expert_proj` row-parallel with one all-reduce
+    /// each (default) instead of replicated on every rank.
+    #[arg(long, env = "PLOW_MUSE_LATENT_TP", default_value_t = true, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
+    pub muse_latent_tp: bool,
     /// Items per gathered query pack in the V4.1 sparse prefill (1 = the un-split arm).
     #[arg(long, env = "PLOW_MLA_GATHER_SPLIT", default_value_t = 2)]
     pub mla_gather_split: u32,
@@ -1955,6 +1959,7 @@ impl EmitConfig {
             k3_fuse_a: env_bool("PLOW_K3_FUSE_A"),
             mla_ns: env_u32("PLOW_MLA_NS"),
             muse_decode_ns: env_u32("PLOW_MUSE_DECODE_NS"),
+            muse_latent_tp: env_bool_default_true("PLOW_MUSE_LATENT_TP"),
             mla_gather_split: env_u32("PLOW_MLA_GATHER_SPLIT").unwrap_or(2),
             dsv41_xr_band: env_u32("PLOW_DSV41_XR_BAND").unwrap_or(1),
             dsv41_xr_band_cus: env_u32("PLOW_DSV41_XR_BAND_CUS"),
