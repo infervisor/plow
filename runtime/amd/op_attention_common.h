@@ -1193,6 +1193,11 @@ __device__ void d_flash_prefill(float* __restrict__ Opart, float* __restrict__ m
  * The softmax is now GF-way. The per-head reductions run on DIFFERENT WAVES (wave g reduces head
  * g), so all GF of them happen concurrently and the tile still costs 3 barriers, not 3*GF.
  * ------------------------------------------------------------------------- */
+/* Defaulted here, not in dev_isa.h: interp.hip includes dev_isa.h before PLOW_CONFIG, and the
+ * packet header of a `PLOW_FA_GF_64` Muse emit carries the hd64 group. Default 2. */
+#ifndef PLOW_FA_GF_64
+#define PLOW_FA_GF_64 2
+#endif
 #define FA_DEC_LDS_FLOATS(D, GF) \
     ((GF) * FA_DEC_TILE * FA_DEC_GROUPS + 2 * PLOW_WAVES + (GF) * ((D) / 2) + \
      FA_DEC_GROUPS * FA_DEC_NG(D) * (D))
@@ -2016,6 +2021,18 @@ __device__ __noinline__ void d_flash_decode_slots(
         Opart, mlpart, Q, K, V, kv_len, n_batch, n_head, n_kv_head, kv_stride, window, scale,
         nsplit, kv_mask, slice, nblk, lds, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr,
         nullptr, nullptr, 0.0f, 0, nullptr, nullptr, decode_slot);
+}
+
+/* Out of line so a wide hd64 group's registers do not spill the rest of the decode interpreter
+ * (MI350X Muse block, GF=8: k/v GEMVs 12.7 -> 23.8 us inlined). */
+template <int D, int GF>
+__device__ __noinline__ void d_flash_decode_noinl(
+    float* Opart, float* mlpart, const bf16* Q, const bf16* K, const bf16* V,
+    const int* kv_len, unsigned n_batch, unsigned n_head, unsigned n_kv_head,
+    unsigned kv_stride, unsigned window, float scale, unsigned nsplit, unsigned kv_mask,
+    unsigned slice, unsigned nblk, float* lds) {
+    d_flash_decode<D, GF>(Opart, mlpart, Q, K, V, kv_len, n_batch, n_head, n_kv_head, kv_stride,
+                          window, scale, nsplit, kv_mask, slice, nblk, lds);
 }
 
 /* Combine the split partials: standard online-softmax merge.

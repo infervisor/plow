@@ -1955,7 +1955,8 @@ typedef struct {
 #ifndef PLOW_FA_GF_FULL
 #define PLOW_FA_GF_FULL 2
 #endif
-#define PLOW_FA_GF(HD) ((HD) == 512 ? PLOW_FA_GF_FULL : 2)
+/* hd64: PLOW_FA_GF_64 defaults in op_attention_common.h, after the packet header that carries it. */
+#define PLOW_FA_GF(HD) ((HD) == 512 ? PLOW_FA_GF_FULL : (HD) == 64 ? PLOW_FA_GF_64 : 2)
 
 /* SLIDING-WINDOW KV RING.
  *

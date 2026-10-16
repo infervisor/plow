@@ -393,6 +393,11 @@ pub struct EmitConfig {
     #[arg(long, env = "PLOW_FA_GF_FULL")]
     pub fa_gf_full: Option<u32>,
 
+    /// AMD flash-decode GQA fusion factor on Muse Spark hd64 layers (paired with the object's
+    /// `PLOW_FA_GF_64` through the packet header). Unset = 2.
+    #[arg(long, env = "PLOW_FA_GF_64")]
+    pub fa_gf_64: Option<u32>,
+
     /// Experimental full-attention decode GF with batch-aware balanced split counts.
     #[arg(long, env = "PLOW_ATTENTION_DECODE_BALANCE_GF")]
     pub attention_decode_balance_gf: Option<u32>,
@@ -1917,6 +1922,7 @@ impl EmitConfig {
             fuse_kv_hnr: env_bool("PLOW_FUSE_KV_HNR"),
             moe_combine_blocks: env_u32("PLOW_MOE_COMBINE_BLOCKS"),
             fa_gf_full: env_u32("PLOW_FA_GF_FULL"),
+            fa_gf_64: env_u32("PLOW_FA_GF_64"),
             attention_decode_balance_gf: env_u32("PLOW_ATTENTION_DECODE_BALANCE_GF"),
             fa_gf_light512: env_u32("PLOW_FA_GF_LIGHT512"),
             fa_mmaqk: env_u32("PLOW_FA_MMAQK"),

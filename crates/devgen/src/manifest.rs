@@ -3265,6 +3265,11 @@ pub fn config_header(manifest: &Value) -> String {
                 "#ifndef PLOW_NV_FA_GF_HD256\n#define PLOW_NV_FA_GF_HD256 {v}\n#endif\n"
             ));
         }
+        if let Some(v) = t.get("gf64").and_then(Value::as_u64) {
+            out.push_str(&format!(
+                "#ifndef PLOW_FA_GF_64\n#define PLOW_FA_GF_64 {v}\n#endif\n"
+            ));
+        }
         if let Some(v) = t.get("gf_full").and_then(Value::as_u64) {
             out.push_str(&format!(
                 "#ifndef PLOW_NV_FA_GF_FULL\n#define PLOW_NV_FA_GF_FULL {v}\n#endif\n\

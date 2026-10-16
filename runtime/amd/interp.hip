@@ -1263,7 +1263,9 @@ typedef union __align__(16) {
      * workgroup per CU (2 waves/SIMD) no matter what else shrank. */
     bf16  fa[FA_LDS_HALVES(512)];     /* flash K|V|P tiles          */
 #endif
-    float fd[FA_DEC_LDS_FLOATS(512, PLOW_FA_GF(512))]; /* flash decode; the op owns this size */
+    float fd[FA_DEC_LDS_FLOATS(512, PLOW_FA_GF(512)) > FA_DEC_LDS_FLOATS(64, PLOW_FA_GF(64))
+                 ? FA_DEC_LDS_FLOATS(512, PLOW_FA_GF(512))
+                 : FA_DEC_LDS_FLOATS(64, PLOW_FA_GF(64))]; /* flash decode; the op owns this size */
 /* PROBE GATE. `fmla` is the MLA latent-decode arena (GLM/DeepSeek/Kimi) and it sets the decode
  * union at 42,064 B once the flash-prefill `fa` is gated out -- above the 32,768 B that would
  * fit TWO workgroups per CU. A Gemma decode object never runs an MLA op. Gating it is NOT safe
@@ -1887,6 +1889,11 @@ __device__ __forceinline__ void exec_flash_decode(CInst in, CTens T,
                 (const bf16*)TEN(4), (const int*)TEN(5), n_batch_runtime, in->i[1], in->i[2],         \
                 in->i[3], in->i[4], in->fj[0].f, in->i[5], in->i[7], slice, nblk, lds,         \
                 (const int*)TEN(6));                                                            \
+        else if constexpr (DD == 64 && GG > 2)                                                  \
+            d_flash_decode_noinl<DD, GG>(                                                       \
+                (float*)TEN(0), (float*)TEN(1), (const bf16*)TEN(2), (const bf16*)TEN(3),       \
+                (const bf16*)TEN(4), (const int*)TEN(5), n_batch_runtime, in->i[1], in->i[2],   \
+                in->i[3], in->i[4], in->fj[0].f, in->i[5], in->i[7], slice, nblk, lds);         \
         else                                                                                    \
             d_flash_decode<DD, GG>(                                                             \
                 (float*)TEN(0), (float*)TEN(1), (const bf16*)TEN(2), (const bf16*)TEN(3),       \

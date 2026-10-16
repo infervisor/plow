@@ -675,7 +675,12 @@ pub(super) fn run(
     std::fs::write(outp, m.to_blob_v6(&[section])).expect("write muse_spark blob");
     if !arch.is_empty() {
         write_lean_receipts(outp, &lean);
-        let man = manifest::build(&m, arch, &lean);
+        let mut man = manifest::build(&m, arch, &lean);
+        if emit_config::active().fa_gf_64.is_some() {
+            man["tuning"]["gf64"] = serde_json::json!(fa_gf(&c));
+            man["pairing"]["hash"] =
+                serde_json::json!(format!("0x{:016x}", manifest::pairing_hash(&man)));
+        }
         report_dispatch_audit(&man);
         manifest::write_config_header(&outp.with_file_name("plow_config.h"), &man)
             .expect("muse_spark config header");
@@ -693,9 +698,24 @@ pub(super) fn run(
     );
 }
 
+/// Query heads per flash-decode work item (`PLOW_FA_GF_64`; the packet header carries a set value
+/// to the object). 2 by default: on MI350X TP1 B1 the full GQA group (8) is faster only on full
+/// layers at long context (c32768 FlashDecode 144 -> 97 us) and slower on sliding layers and at
+/// c4096 (20 -> 41 us), where flash decode is not bandwidth-bound.
+fn fa_gf(c: &MuseCfg) -> u32 {
+    let gqa = c.heads / c.kv_heads;
+    let gf = emit_config::active().fa_gf_64.unwrap_or(2);
+    assert!(
+        matches!(gf, 1 | 2 | 4 | 8) && gqa % gf == 0,
+        "PLOW_FA_GF_64={gf} must be 1|2|4|8 and divide GQA {gqa}"
+    );
+    gf
+}
+
 fn decode_ns(c: &MuseCfg, n_cu: u32) -> u32 {
     emit_config::active().muse_decode_ns.unwrap_or_else(|| {
-        attention_decode_ns(1, c.heads, c.kv_heads, n_cu, n_cu.div_ceil(c.heads / 2).max(1))
+        let groups = c.heads / fa_gf(c);
+        attention_decode_ns(1, c.heads, c.kv_heads, n_cu, n_cu.div_ceil(groups).max(1))
     })
 }
 
@@ -739,6 +759,7 @@ mod tests {
         assert_eq!(c.rope, vec![true, false, true, true]);
         assert_eq!(c.mxfp4_experts, vec![false, true, true, true]);
         assert_eq!((c.heads, c.kv_heads, c.hd, c.window), (8, 2, 64, 128));
+        assert_eq!((fa_gf(&c), decode_ns(&c, 256)), (2, 64));
         assert!(c.check_m1_layer(0).unwrap_err().contains("bf16"));
         assert!(c.check_m1_layer(1).is_ok());
     }
