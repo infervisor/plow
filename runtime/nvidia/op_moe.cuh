@@ -1927,7 +1927,10 @@ static __device__ void d_moe_fp8_tc(void* out, const bf16* x, const unsigned cha
     const unsigned per = (total + nblk - 1u) / nblk;
     const unsigned i0 = slice * per, i1 = min(i0 + per, total);
     const unsigned ntile = i1 > i0 ? i1 - i0 : 0u;
-    const unsigned ks = fp8tc_ksplit(ntile, nw);
+    /* Dd: ngr follows every row's routing, idle rows included. A K split sized from this CTA's
+     * share would change a live slot's reduction order with the rest of the batch; size it from
+     * the routing-independent per-slot share instead. */
+    const unsigned ks = fp8tc_ksplit(Dd ? (nslot * tpn + nblk - 1u) / nblk : ntile, nw);
     const unsigned tiles_per_round = nw / ks;
     const unsigned nchunk = K / 64u;
     const unsigned my_tile = warp / ks, my_k = warp % ks;
