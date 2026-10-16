@@ -48,6 +48,9 @@ PLOW_NO_GLU_FUSE = "1"
 PLOW_NV_FA_FOLD = "1"
 PLOW_EMIT_PACKED_PREFILL = "1"
 PLOW_EMIT_PACKED_PREFILL_SMALL_HD = "1"
+# 192-chunk packed encoder buckets (~5.7 GB of FP32 activations) + 21 GiB of KV exceed 32 GB;
+# 64 chunks (64 s of audio) as on the L4. Encoder batch width at c64+ to be measured.
+PLOW_ASR_PACKED_MAX_CHUNKS = "64"
 
 [bench]
 kind = "asr"
