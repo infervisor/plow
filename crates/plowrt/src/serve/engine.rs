@@ -13,9 +13,8 @@
 //! The AMD engine is slotted too (B fixed sequence slots with per-slot prefix
 //! snapshots, packed prefill), and an AMD serve holds several engines: models
 //! and `--dp` ranks, each placed on its own TP group (`AmdServe::load_on`) by
-//! `serve::placement`, all resident. What stays CUDA-only: VMM paging and the
-//! cross-request VMM prefix probe, and the S1 `ModelManager` (VRAM-budgeted
-//! residency switching and eviction).
+//! `serve::placement`, all resident. What stays CUDA-only: VMM paging
+//! and the S1 `ModelManager` (VRAM-budgeted residency switching and eviction).
 
 use std::sync::Arc;
 
@@ -2234,6 +2233,7 @@ mod amd_serve {
                 .filter(|&d| {
                     d != slot
                         && self.snap_at[d] > own
+                        && self.pf[d].is_none()
                         && covered(
                             &self.cached_prompt[d],
                             self.snap_at[d],

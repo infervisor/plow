@@ -16981,6 +16981,7 @@ impl AmdEngine {
                 self.progs[p].decode_routes.len()
             ))
         })?;
+        let is_last_seg = seg + 1 == self.progs[p].decode_routes.len();
         let lt_follows = self.lt_group.0 == Some((p, seg.wrapping_sub(1)));
         let after_signal = self.router_signal_seg.take() == Some((p, seg.wrapping_sub(1)));
         if !matches!(route, DecodeSegmentRoute::GemmLt(_)) {
@@ -17012,12 +17013,12 @@ impl AmdEngine {
                 self.seg_launches += 2;
             }
             DecodeSegmentRoute::Interpreter | DecodeSegmentRoute::SparseMlaDecode(_) => {
-                if after_signal {
+                if !is_last_seg && after_signal {
                     // Its MoE consumers wait on the router's counter; the shared expert need not.
                     self.be.skip_next_barrier();
                 }
                 let arg = self.kernarg(p, seg as u32);
-                EngineDevice::launch_cooperative(
+                let res = EngineDevice::launch_cooperative(
                     &*self.be,
                     interpreter,
                     self.n_cu,
@@ -17025,7 +17026,11 @@ impl AmdEngine {
                     0,
                     kernarg_bytes(&arg),
                     None,
-                )?;
+                );
+                if res.is_err() {
+                    self.be.clear_skip_barrier();
+                }
+                res?;
             }
             DecodeSegmentRoute::MlaAttention => {
                 let kernel = self.k_decode_mla.ok_or_else(|| {
@@ -17061,7 +17066,8 @@ impl AmdEngine {
                         u64::from_le_bytes(self.tens_table[o..o + 8].try_into().unwrap())
                     };
                     let [out, x] = route.io().map(at);
-                    if lt_follows
+                    if !is_last_seg
+                        && lt_follows
                         && !self.lt_group.1.is_empty()
                         && self
                             .lt_group
@@ -17074,12 +17080,16 @@ impl AmdEngine {
                         self.lt_group.1.clear();
                     }
                     self.lt_group.1.push((out, x));
-                } else if crate::config::RuntimeConfig::get().amd.lt_overlap
+                } else if !is_last_seg
+                    && crate::config::RuntimeConfig::get().amd.lt_overlap
                     && lt_overlaps_run(&self.progs[p].decode_routes[..seg], route.inst())
                 {
                     self.be.skip_next_barrier();
                 }
-                kernel.enqueue(&self.be, route, &self.tens_table)?;
+                if let Err(err) = kernel.enqueue(&self.be, route, &self.tens_table) {
+                    self.be.clear_skip_barrier();
+                    return Err(err);
+                }
             }
             DecodeSegmentRoute::Skip => {}
             DecodeSegmentRoute::LtFused(r) => {

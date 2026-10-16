@@ -2613,8 +2613,9 @@ impl HsaBackend {
 
         // A deferred chain is published by one doorbell and every packet carries the barrier
         // bit, so its last packet completing implies every earlier one did.
+        let is_last = chain_end != CHAIN_IDLE && idx + 1 == chain_end;
         let signal = chain_end == CHAIN_IDLE
-            || idx + 1 == chain_end
+            || is_last
             || self.chain_immediate.load(Ordering::Relaxed)
             || !pkt_knobs().tail_signal;
         let slot = (idx & (size - 1)) as u32;
@@ -2723,7 +2724,13 @@ impl HsaBackend {
         } else {
             1
         };
-        let barrier = u16::from(!self.no_barrier_once.swap(false, Ordering::Relaxed));
+        let allow_skip = !is_last;
+        let barrier = if allow_skip && self.no_barrier_once.swap(false, Ordering::Relaxed) {
+            0
+        } else {
+            self.no_barrier_once.store(false, Ordering::Relaxed);
+            1
+        };
         let header: u16 = (HSA_PACKET_TYPE_KERNEL_DISPATCH << HSA_PACKET_HEADER_TYPE) as u16
             | (barrier << HSA_PACKET_HEADER_BARRIER) as u16
             | ((pkt_knobs().acquire << HSA_PACKET_HEADER_SCACQUIRE_FENCE_SCOPE) as u16)
@@ -4016,6 +4023,7 @@ impl HsaBackend {
         ticket: super::kernarg_retirement::Admission,
         immediate: bool,
     ) -> Result<()> {
+        self.clear_skip_barrier();
         self.guard()?;
         let packets = ticket.count();
         let size = unsafe { (*self.queue).size } as u64;
@@ -4054,6 +4062,7 @@ impl HsaBackend {
 
     /// Finish a prepared reservation, ringing once only for deferred chains.
     pub fn commit_dispatch_chain(&self) -> Result<()> {
+        self.clear_skip_barrier();
         if let Err(error) = self.preflight_dispatch_chain_commit() {
             self.abort_dispatch_replay();
             return Err(error);
@@ -4128,6 +4137,7 @@ impl HsaBackend {
     }
 
     pub(crate) fn abort_dispatch_replay(&self) {
+        self.clear_skip_barrier();
         self.kernarg_retirement.cancel();
         self.mark_poisoned(&DeviceErrorInfo {
             operation: "AQL chain cancellation".into(),
@@ -4169,6 +4179,11 @@ impl HsaBackend {
     /// caller guarantees it neither reads what those packets write nor writes what they touch.
     pub fn skip_next_barrier(&self) {
         self.no_barrier_once.store(true, Ordering::Relaxed);
+    }
+
+    /// Clear the one-shot barrier skip flag.
+    pub fn clear_skip_barrier(&self) {
+        self.no_barrier_once.store(false, Ordering::Relaxed);
     }
 
     pub fn launch(

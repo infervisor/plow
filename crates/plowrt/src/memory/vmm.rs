@@ -1422,7 +1422,7 @@ struct Inner {
     /// One small owned snapshot per fine node, keyed the same way `published` is
     /// (`(pid, chunk index)` from whoever first published that exact content) — reusing
     /// [`Snap`] as a plain, refcount-free "one shared copy of `fine_rows` rows" record.
-    /// `users`/`last_used`/`referenced`/`reusable_prompt` are unused here: fine chunks are
+    /// `users`/`last_used`/`referenced` are unused here: fine chunks are
     /// never evicted in this version (see the module note above `enable_fine_matching`), so
     /// nothing needs pinning against a concurrent evictor.
     fine_published: FxHashMap<Option<(u32, u32)>, Vec<Snap>>,
@@ -4023,14 +4023,17 @@ fn try_attach_fine(inner: &mut Inner, seq: usize, prompt: &[u32]) -> Result<Opti
     }))
 }
 
+const SHARED_RECENT_TICKS: u64 = 2048;
+
 fn stats_of(s: &Shared) -> VmmStats {
     let inner = s.inner.lock();
     let mut out = inner.stats;
     out.hash_collisions = inner.cache.collisions();
     let now = std::time::Instant::now();
+    let tick = inner.snapshot_tick;
     for snap in inner.published.values().flatten() {
         out.snapshots_live += 1;
-        if snap.attaches >= 2 {
+        if snap.attaches >= 2 && tick.saturating_sub(snap.last_used) <= SHARED_RECENT_TICKS {
             out.snapshots_shared += 1;
         }
         if snap.share || snap.kind.has(Kind::SHARED_END) {

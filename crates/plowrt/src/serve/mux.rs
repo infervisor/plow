@@ -5119,6 +5119,34 @@ fn run_one_tick(
                                     }
                                 }
                             }
+                            Err(crate::RuntimeError::Rejected(reason)) => {
+                                tracing::warn!(
+                                    %reason,
+                                    members = packed.len(),
+                                    model = bundle.network(),
+                                    "AMD packed prefill rejected"
+                                );
+                                b2b_failed = true;
+                                let failed_slots: Vec<usize> = if let Some(i) = rejected_pack_slot(&reason) {
+                                    vec![i]
+                                } else {
+                                    amd_failed_pack_slots(
+                                        packed.iter().map(|span| span.slot as usize),
+                                        &feeds,
+                                    )
+                                };
+                                let err = crate::RuntimeError::Rejected(reason);
+                                let msg = err.to_string();
+                                for i in failed_slots {
+                                    if let Some(taken) = slots[i].take() {
+                                        release_kv(&arena, taken.kv);
+                                        let _ = taken
+                                            .respond
+                                            .try_send(StreamChunk::Err(fanout_err(&err, &msg)));
+                                    }
+                                    e.release(i);
+                                }
+                            }
                             Err(err) => {
                                 tracing::warn!(
                                     error = %err,
@@ -6158,6 +6186,13 @@ fn amd_failed_pack_slots(
         .into_iter()
         .chain(feeds.iter().map(|&(slot, _)| slot))
         .collect()
+}
+
+#[cfg(any(feature = "hsa", feature = "cpu"))]
+fn rejected_pack_slot(reason: &str) -> Option<usize> {
+    let (_, after) = reason.split_once("slot ")?;
+    let digits: String = after.chars().take_while(|c| c.is_ascii_digit()).collect();
+    digits.parse().ok()
 }
 
 /// Arrival order key for the step planner: smaller is older.
@@ -7921,18 +7956,17 @@ fn incremental_delta(
     })
 }
 
-/// Common per-slot bookkeeping for a produced token: append to `out_ids`,
-/// stream the incremental delta, and close/free the slot on stop conditions.
-/// Shared by the batched, fallback, and GPU paths so error/exit semantics
-/// stay identical. `stop_ids` overrides the reference path's newline-byte
-/// heuristic with the model's real eos set (GPU path).
-/// `cached_tokens = rows`, tracing the newly cached rows as prefix hits.
 #[cfg(any(feature = "hsa", feature = "cpu"))]
 fn set_cached(slot: &mut Slot, rows: usize) {
     crate::obs::tick::trace_hit(rows.saturating_sub(slot.cached_tokens));
     slot.cached_tokens = rows;
 }
 
+/// Common per-slot bookkeeping for a produced token: append to `out_ids`,
+/// stream the incremental delta, and close/free the slot on stop conditions.
+/// Shared by the batched, fallback, and GPU paths so error/exit semantics
+/// stay identical. `stop_ids` overrides the reference path's newline-byte
+/// heuristic with the model's real eos set (GPU path).
 fn handle_produced_token(
     slot_opt: &mut Option<Slot>,
     arena: &Option<SharedKvState>,
@@ -10620,6 +10654,14 @@ mod tests {
     fn a_failed_mixed_pack_terminates_its_decode_riders_too() {
         assert_eq!(amd_failed_pack_slots([4, 5], &[(0, 7), (2, 9)]), [4, 5, 0, 2]);
         assert_eq!(amd_failed_pack_slots([4, 5], &[]), [4, 5]);
+    }
+
+    #[cfg(feature = "hsa")]
+    #[test]
+    fn rejected_pack_slot_extracts_slot() {
+        assert_eq!(rejected_pack_slot("invalid mixed decode slot 3"), Some(3));
+        assert_eq!(rejected_pack_slot("packed prefill slot 12 has no initialized cursor"), Some(12));
+        assert_eq!(rejected_pack_slot("no packed prefill rung covers 128 rows"), None);
     }
 
     #[cfg(any(feature = "cuda", feature = "hsa", feature = "cpu"))]

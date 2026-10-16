@@ -351,7 +351,8 @@ def arm(root, prov, cell, tags, errors):
     traffic = runs[0]["traffic"]
     if "extra" in runs[0]:  # one seed per repeat; the arms must replay the same plans
         traffic += ", seeds " + "/".join(str(r["extra"]["seed"]) for r in runs)
-    out = dict(io=runs[0]["io"], io_key=runs[0]["io_key"], traffic=traffic, repeats=len(runs),
+    io_key = "/".join(r["io_key"] for r in runs)
+    out = dict(io=runs[0]["io"], io_key=io_key, traffic=traffic, repeats=len(runs),
                sources=[r["source"] for r in runs], per_repeat={}, mean={}, spread_pct={})
     gpu_count = prov.get("gpu_count") or 1
     for r in runs:
