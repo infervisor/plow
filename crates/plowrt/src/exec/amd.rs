@@ -5895,18 +5895,17 @@ fn rowband_replicated_bytes(tensors: &[crate::asset::devblob::DevTensor], n_gpu:
 fn touched<'a>(
     ckpt: &'a crate::asset::checkpoint::Checkpoint,
     name: &str,
+    axis: crate::asset::shard::Shard,
     want: u64,
     rank: u32,
     n_gpu: u32,
 ) -> Option<&'a [u8]> {
     let (src, shape) = ckpt.tensor_ex(name)?;
-    let strided = n_gpu > 1
-        && shape.len() == 2
-        && crate::asset::shard::shard_of(name) == crate::asset::shard::Shard::Row;
+    let strided = n_gpu > 1 && shape.len() == 2 && axis == crate::asset::shard::Shard::Row;
     if strided {
         return Some(src);
     }
-    match crate::asset::shard::slice_for(name, src, shape, want, rank, n_gpu) {
+    match crate::asset::shard::slice_for_as(name, axis, src, shape, want, rank, n_gpu) {
         Ok(std::borrow::Cow::Borrowed(s)) => Some(s),
         // An `Owned` here would mean the row guard above missed a case; the
         // gather has already happened, so fall back to the whole tensor rather
@@ -5919,12 +5918,13 @@ fn touched<'a>(
 fn weight_span(
     ckpt: &crate::asset::checkpoint::Checkpoint,
     name: &str,
+    axis: crate::asset::shard::Shard,
     want: u64,
     rank: u32,
     n_gpu: u32,
 ) -> Option<crate::asset::checkpoint::Span> {
     let (src, _) = ckpt.tensor_ex(name)?;
-    let span = touched(ckpt, name, want, rank, n_gpu)?;
+    let span = touched(ckpt, name, axis, want, rank, n_gpu)?;
     let off = span.as_ptr() as usize - src.as_ptr() as usize;
     ckpt.span(name, off, span.len())
 }
@@ -5956,7 +5956,7 @@ struct ExpertNames {
     /// `.weight` or `.weight_packed`.
     payload: &'static str,
     /// `.weight_scale_inv` (block-fp8 f32 grid) or `.weight_scale` (E8M0 row); empty for an
-    /// unquantized bf16 expert (Muse Spark's layers 0 and 61, Quark `exclude`d).
+    /// expert the packet declares bf16.
     scale: &'static str,
 }
 
@@ -5995,6 +5995,38 @@ impl ExpertNames {
     }
 }
 
+/// The weight encoding (`PLOW_MOE_ENC_*`) every encoding-carrying expert op streaming table
+/// `i_ewt` declares, or `None` if no such op reads it. Ops that disagree are refused.
+fn declared_expert_enc(blob: &DevBlob, i_ewt: usize) -> Result<Option<u32>> {
+    let mut enc = None;
+    for d in blob.progs.iter().flat_map(|p| &p.insts) {
+        let (table, slot) = match DevOp::from_u16(d.op) {
+            Some(DevOp::MoeGroupGluPf | DevOp::MoeGroupDownPf) => (d.t[2], object::MOE_PF_ENC_SLOT),
+            Some(
+                DevOp::MoeGroupGluFp8Blk
+                | DevOp::MoeGroupDownFp8Blk
+                | DevOp::MoeExpertGluFp8Blk
+                | DevOp::MoeExpertDownFp8Blk,
+            ) => (d.t[3], 6),
+            _ => continue,
+        };
+        if table as usize != i_ewt {
+            continue;
+        }
+        match enc {
+            None => enc = Some(d.i[slot]),
+            Some(e) if e == d.i[slot] => {}
+            Some(e) => {
+                return Err(RuntimeError::Device(format!(
+                    "{}: expert ops declare encodings {e} and {} for one table",
+                    blob.tensors[i_ewt].name, d.i[slot]
+                )))
+            }
+        }
+    }
+    Ok(enc)
+}
+
 /// Which spelling THIS checkpoint uses, decided by probing it.
 ///
 /// `pfx` is what is left of the packet's `…expert_weight_table` after the suffix
@@ -6011,6 +6043,7 @@ impl ExpertNames {
 fn resolve_expert_names(
     ckpt: &crate::asset::checkpoint::Checkpoint,
     pfx: &str,
+    bf16: bool,
 ) -> Result<ExpertNames> {
     const TEMPLATES: [([&str; 3], &str); 3] = [
         (["gate_proj", "up_proj", "down_proj"], ".weight"),
@@ -6031,29 +6064,40 @@ fn resolve_expert_names(
             // The payload is there, so this IS the layout — a missing scale is
             // now a broken checkpoint and not a wrong guess, and saying so beats
             // falling through to a spelling that cannot be right.
-            for scale in SCALES {
-                if ckpt
-                    .tensor_ex(&format!("{ns}0.{}{scale}", proj[0]))
+            let found = SCALES.into_iter().find(|scale| {
+                ckpt.tensor_ex(&format!("{ns}0.{}{scale}", proj[0]))
                     .is_some()
-                {
-                    return Ok(ExpertNames {
-                        ns,
-                        proj,
-                        payload,
-                        scale,
-                    });
+            });
+            if bf16 {
+                let (w, shape) = ckpt.tensor_ex(&probe).expect("probed above");
+                if let Some(scale) = found {
+                    return Err(RuntimeError::Device(format!(
+                        "EXPERT ENCODING MISMATCH: the packet declares `{pfx}` experts bf16, but \
+                         the checkpoint has the scale twin `{ns}0.{}{scale}`",
+                        proj[0]
+                    )));
                 }
+                if w.len() != 2 * shape.iter().product::<usize>() {
+                    return Err(RuntimeError::Device(format!(
+                        "EXPERT ENCODING MISMATCH: the packet declares `{pfx}` experts bf16, but \
+                         `{probe}` {shape:?} is {} B, not two bytes per element",
+                        w.len()
+                    )));
+                }
+                return Ok(ExpertNames {
+                    ns,
+                    proj,
+                    payload,
+                    scale: "",
+                });
             }
-            // No scale twin and two bytes per element: an unquantized bf16 expert.
-            if let Some((w, shape)) = ckpt.tensor_ex(&probe) {
-                if payload == ".weight" && w.len() == 2 * shape.iter().product::<usize>() {
-                    return Ok(ExpertNames {
-                        ns,
-                        proj,
-                        payload,
-                        scale: "",
-                    });
-                }
+            if let Some(scale) = found {
+                return Ok(ExpertNames {
+                    ns,
+                    proj,
+                    payload,
+                    scale,
+                });
             }
             return Err(RuntimeError::Device(format!(
                 "MISSING EXPERT SCALE: `{probe}` is in the checkpoint but none of \
@@ -6339,13 +6383,14 @@ fn gather_expert_entry<'a>(
             .ok_or_else(|| RuntimeError::Device(format!("MISSING EXPERT WEIGHT: {name}")))?
     };
     if populate && !fp8_spelling {
-        if let Some(s) = weight_span(ckpt, name, *want, shard_rank, shard_n) {
+        let axis = crate::asset::shard::shard_of(name);
+        if let Some(s) = weight_span(ckpt, name, axis, *want, shard_rank, shard_n) {
             ckpt.populate(s);
         }
     }
     let mut fault_ns = 0u64;
     if do_prefault && !fp8_spelling {
-        if let Some(s) = touched(ckpt, name, *want, shard_rank, shard_n) {
+        if let Some(s) = touched(ckpt, name, crate::asset::shard::shard_of(name), *want, shard_rank, shard_n) {
             fault_ns = prefault_ns(s);
         }
     }
@@ -6561,7 +6606,7 @@ fn bind_packed_experts(
         })?;
         // WHICH SPELLING, from the checkpoint, before anything is sized against
         // it — then the weight/scale size agreement, once, for expert 0.
-        let en = resolve_expert_names(ckpt, pfx)?;
+        let en = resolve_expert_names(ckpt, pfx, declared_expert_enc(blob, *i_ewt)? == Some(0))?;
         check_expert_geometry(ckpt, &en)?;
         layout = format!("{}{{gate,up,down}}{}+{}", en.ns, en.payload, en.scale);
         // Geometry from expert 0; every expert in a layer is the same shape.
@@ -7201,6 +7246,7 @@ fn fold_res_score(c: &crate::asset::checkpoint::Checkpoint, name: &str) -> Optio
 /// two-spelling lookup. Getting any of them wrong here would refuse a load that works.
 fn preflight_weights(
     blob: &DevBlob,
+    shards: &crate::asset::shard::DeclaredShards,
     ckpt: Option<&crate::asset::checkpoint::Checkpoint>,
     fp8_ckpt: Option<&crate::asset::checkpoint::Checkpoint>,
     rank: u32,
@@ -7243,11 +7289,10 @@ fn preflight_weights(
         }
         // A row-parallel gather is the one arm that allocates. Skipped for exactly the
         // shapes `touched` skips it for; everything else is measured here.
-        let row = n_gpu > 1
-            && shape.len() == 2
-            && crate::asset::shard::shard_of(stripped) == crate::asset::shard::Shard::Row;
+        let axis = shards.axis(stripped);
+        let row = n_gpu > 1 && shape.len() == 2 && axis == crate::asset::shard::Shard::Row;
         if !row {
-            crate::asset::shard::slice_for(stripped, src, shape, td.bytes, rank, n_gpu)?;
+            crate::asset::shard::slice_for_as(stripped, axis, src, shape, td.bytes, rank, n_gpu)?;
         }
     }
     Ok(())
@@ -8654,6 +8699,7 @@ impl AmdEngine {
         // of by assertion. PLOW_L2_PLACE_DISPATCH=1 still works for anyone scripting it.
         let mut blob = DevBlob::parse_l2(&raw, true)?;
         crate::certificate_checks::check_packet(blob_path, &raw, &blob)?;
+        let shards = crate::asset::shard::DeclaredShards::from_blob(&blob, &raw)?;
         // BEFORE anything reads the blob's geometry: `max_ctx`, the KV slot
         // stride, the VMM geometry and the prefill planner all derive from the
         // tensor table, so narrowing here is the whole change and none of them
@@ -12107,7 +12153,7 @@ impl AmdEngine {
                 if !packet::names::is_checkpoint_weight(&td.name) || td.name.starts_with("fp8/") {
                     continue;
                 }
-                if let Some(s) = weight_span(c, &td.name, td.bytes, rank, n_gpu) {
+                if let Some(s) = weight_span(c, &td.name, shards.axis(&td.name), td.bytes, rank, n_gpu) {
                     pool.push(s);
                 }
                 n += 1;
@@ -12188,7 +12234,7 @@ impl AmdEngine {
         // `is_checkpoint_weight` gate, same `fp8/` -> `fp8_ckpt` routing, same two-spelling
         // lookup, and the same exemption for the derived `_res_score.weight` (in no
         // checkpoint by design — `fold_res_score`).
-        preflight_weights(&blob, ckpt.as_deref(), fp8_ckpt.as_ref(), rank, n_gpu)?;
+        preflight_weights(&blob, &shards, ckpt.as_deref(), fp8_ckpt.as_ref(), rank, n_gpu)?;
 
         let t_slab = Instant::now();
         let weight_slab = if slab_bytes == 0 || !crate::asset::checkpoint::weight_slab_enabled() {
@@ -12516,13 +12562,19 @@ impl AmdEngine {
                         // (`stripped`), so an fp8 twin shards exactly like its bf16
                         // counterpart instead of falling through as replicated.
                         if do_prefault {
-                            if let Some(s) = touched(c, stripped, td.bytes, rank, n_gpu) {
+                            if let Some(s) = touched(c, stripped, shards.axis(stripped), td.bytes, rank, n_gpu) {
                                 prefault(s, &prof);
                             }
                         }
                         let t = Instant::now();
-                        let slice = crate::asset::shard::slice_for(
-                            stripped, src, shape, td.bytes, rank, n_gpu,
+                        let slice = crate::asset::shard::slice_for_as(
+                            stripped,
+                            shards.axis(stripped),
+                            src,
+                            shape,
+                            td.bytes,
+                            rank,
+                            n_gpu,
                         )?;
                         LoadProf::add(&prof.gather_ns, t);
                         match gemm_blk_bound.get(&(i as u16)) {

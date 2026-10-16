@@ -374,14 +374,14 @@ mod tests {
 
     /// Muse Spark's template wraps the assistant turn in `{% generation %}`; the multi-turn
     /// render is the string `transformers` produces (`reasoning_effort='high'`, fixed date).
+    /// Set `MUSE_SPARK_CKPT` to the checkpoint directory to run it.
     #[test]
     fn the_real_muse_spark_template_renders_what_transformers_renders() {
-        let dir = std::path::Path::new("/home/lava/models/Muse-Spark-Open-816B-A42B-Quark-MXFP4");
-        if !dir.join("chat_template.jinja").exists() {
-            eprintln!("skipped: no Muse Spark checkpoint on this host");
+        let Some(dir) = std::env::var_os("MUSE_SPARK_CKPT").map(std::path::PathBuf::from) else {
+            eprintln!("skipped: MUSE_SPARK_CKPT not set");
             return;
-        }
-        let t = ChatTemplate::load(dir).expect("template compiles");
+        };
+        let t = ChatTemplate::load(&dir).expect("template compiles");
         let msgs = vec![
             serde_json::json!({"role": "user", "content": "one"}),
             serde_json::json!({"role": "assistant", "content": "two"}),

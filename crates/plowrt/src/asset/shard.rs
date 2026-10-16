@@ -106,7 +106,7 @@ pub fn shard_of(name: &str) -> Shard {
     // `derived.o_fold.weight` = the prep-fused W_uv·W_o ([H, NH*DK], head-major columns):
     // its contraction dim slices per rank exactly as o_proj's does (rank r takes columns
     // h∈[r·nh_l, (r+1)·nh_l)·DK — a strided column range), so it rides the same Row class.
-    const ROW: [&str; 9] = [
+    const ROW: [&str; 7] = [
         "o_proj.weight",
         "down_proj.weight",
         ".w2.weight",
@@ -115,9 +115,6 @@ pub fn shard_of(name: &str) -> Shard {
         // DeepSeek-V4.1 MLA projection
         "attn.wo_b.weight",
         "attn.wo_b.scale",
-        // Muse Spark latent MoE projections; replicated unless the packet declares a slice.
-        "mlp.pre_expert_proj.weight",
-        "mlp.post_expert_proj.weight",
     ];
 
     // --- Mixtral `w1|w2|w3` routed experts (Kimi-K3), in the generic tables above ---
@@ -239,6 +236,53 @@ pub fn slice_for<'a>(
     rank: u32,
     tp: u32,
 ) -> Result<Cow<'a, [u8]>> {
+    slice_for_as(name, shard_of(name), src, shape, want, rank, tp)
+}
+
+/// The tensors whose axis the packet declares (`plow_asset::weight_shards`), over [`shard_of`].
+#[derive(Clone, Debug, Default)]
+pub struct DeclaredShards(std::collections::HashMap<String, Shard>);
+
+impl DeclaredShards {
+    /// Every declared name must be a checkpoint weight the packet's tensor table binds.
+    pub fn from_blob(blob: &crate::asset::devblob::DevBlob, raw: &[u8]) -> Result<Self> {
+        let Some(sec) = blob.reserved_metadata(raw, plow_asset::weight_shards::SECTION)? else {
+            return Ok(Self::default());
+        };
+        let decl =
+            plow_asset::weight_shards::WeightShards::parse(sec).map_err(RuntimeError::Rejected)?;
+        let mut map = std::collections::HashMap::new();
+        for (names, axis) in [(&decl.column, Shard::Column), (&decl.row, Shard::Row)] {
+            for n in names {
+                if !packet::names::is_checkpoint_weight(n)
+                    || !blob.tensors.iter().any(|t| &t.name == n)
+                {
+                    return Err(RuntimeError::Rejected(format!(
+                        "{}: `{n}` is not a checkpoint weight of this packet",
+                        plow_asset::weight_shards::SECTION
+                    )));
+                }
+                map.insert(n.clone(), axis);
+            }
+        }
+        Ok(Self(map))
+    }
+
+    pub fn axis(&self, name: &str) -> Shard {
+        self.0.get(name).copied().unwrap_or_else(|| shard_of(name))
+    }
+}
+
+/// [`slice_for`] with the split axis given rather than classified from the name.
+pub fn slice_for_as<'a>(
+    name: &str,
+    axis: Shard,
+    src: &'a [u8],
+    shape: &[usize],
+    want: u64,
+    rank: u32,
+    tp: u32,
+) -> Result<Cow<'a, [u8]>> {
     let bad = |m: String| RuntimeError::Device(format!("shard {name}: {m}"));
     let full = src.len() as u64;
     if let Some((_, suffix)) = name.split_once(".derived.mla_fp8_tp") {
@@ -252,7 +296,7 @@ pub fn slice_for<'a>(
 
     // tp==1 binds everything whole, which is byte-identical to the pre-TP path.
     let shard = if tp > 1 {
-        shard_of(name)
+        axis
     } else {
         Shard::Replicated
     };
@@ -451,6 +495,61 @@ pub fn slice_for<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// An unclassified name binds whole unless the packet declares its axis; a declared axis
+    /// still slices only when the declared size is a 1/tp share.
+    #[test]
+    fn declared_shards_come_from_the_packet_section() {
+        use packet::devbuild::{Builder, Model, SectionData, SECT_METADATA};
+        use plow_asset::weight_shards::SECTION;
+        let mut b = Builder::new(4);
+        let w = b.tensor("m.layers.0.mlp.latent_proj.weight", 64);
+        b.emit(packet::dev::DevOp::Nop, b.all(), &[], |d| d.t[0] = w);
+        let p = b.finish();
+        let model = Model {
+            n_cu: 4,
+            target: 0,
+            tensors: p.tensors.clone(),
+            progs: vec![p],
+            kv_row_insts: vec![],
+            prog_t: vec![1],
+            gen: vec![],
+        };
+        let blob_with = |json: serde_json::Value| {
+            let raw = model.to_blob_v6(&[SectionData {
+                kind: SECT_METADATA,
+                name: SECTION.into(),
+                data: serde_json::to_vec(&json).unwrap(),
+            }]);
+            let blob = crate::asset::devblob::DevBlob::parse(&raw).unwrap();
+            DeclaredShards::from_blob(&blob, &raw)
+        };
+        let name = "m.layers.0.mlp.latent_proj.weight";
+        let d = blob_with(serde_json::json!({"version": 1, "row": [name]})).unwrap();
+        assert_eq!(d.axis(name), Shard::Row);
+        assert_eq!(d.axis("x.o_proj.weight"), Shard::Row);
+        assert_eq!(d.axis("x.q_proj.weight"), Shard::Column);
+        assert!(blob_with(serde_json::json!({"version": 1, "row": ["m.absent.weight"]})).is_err());
+        assert!(blob_with(serde_json::json!({"version": 2, "row": [name]})).is_err());
+        let raw = model.to_blob_v6(&[]);
+        let blob = crate::asset::devblob::DevBlob::parse(&raw).unwrap();
+        assert_eq!(DeclaredShards::from_blob(&blob, &raw).unwrap().axis(name), Shard::Replicated);
+    }
+
+    #[test]
+    fn a_declared_axis_slices_an_unclassified_name() {
+        let name = "m.layers.3.mlp.latent_proj.weight";
+        assert_eq!(shard_of(name), Shard::Replicated);
+        let (k, n) = (8usize, 4usize);
+        let full: Vec<u8> = (0..(k * n * 2) as u8).collect();
+        let quarter = (full.len() / 4) as u64;
+        assert!(slice_for(name, &full, &[n, k], quarter, 1, 4).is_err());
+        let whole = slice_for_as(name, Shard::Row, &full, &[n, k], full.len() as u64, 3, 4).unwrap();
+        assert_eq!(&*whole, &full[..]);
+        let r1 = slice_for_as(name, Shard::Row, &full, &[n, k], quarter, 1, 4).unwrap();
+        let want: Vec<u8> = (0..n).flat_map(|row| full[row * 16 + 4..row * 16 + 8].to_vec()).collect();
+        assert_eq!(&*r1, &want[..]);
+    }
 
     /// KIMI-K3's LATENT MoE REPLICATES FOUR TENSORS PER LAYER THAT `shard_of` NAMES
     /// AS SHARDED, AND THE BLOB IS WHAT SAYS SO.
@@ -871,29 +970,6 @@ mod glm_shard_tests {
     /// A Row classification would pass every size check here and return `full[2],
     /// full[3], full[6], ...` instead — same length, same dtype, wrong model. That is
     /// the reason this asserts BYTES and not just a length.
-    #[test]
-    fn muse_latent_projections_are_row_parallel_or_whole_as_declared() {
-        const P: &str = "model.language_model.layers.3.mlp.";
-        for n in ["pre_expert_proj.weight", "post_expert_proj.weight"] {
-            assert_eq!(shard_of(&format!("{P}{n}")), Shard::Row);
-        }
-        for n in [
-            "gate.weight",
-            "pre_expert_norm.weight",
-            "experts.post_expert_norm.weight",
-        ] {
-            assert_eq!(shard_of(&format!("{P}{n}")), Shard::Replicated);
-        }
-        let (k, n) = (8usize, 4usize);
-        let full: Vec<u8> = (0..(k * n * 2) as u8).collect();
-        let name = format!("{P}pre_expert_proj.weight");
-        let whole = slice_for(&name, &full, &[n, k], full.len() as u64, 3, 4).unwrap();
-        assert_eq!(&*whole, &full[..]);
-        let r1 = slice_for(&name, &full, &[n, k], (full.len() / 4) as u64, 1, 4).unwrap();
-        let want: Vec<u8> = (0..n).flat_map(|row| full[row * 16 + 4..row * 16 + 8].to_vec()).collect();
-        assert_eq!(&*r1, &want[..]);
-    }
-
     #[test]
     fn k3_up_proj_column_shard_is_a_contiguous_row_range() {
         const H: usize = 8; // "hidden": the split axis

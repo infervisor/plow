@@ -283,6 +283,24 @@ pub fn run(
     if stages.is_empty() {
         return Err("empty per-stage reference gates".into());
     }
+    // `dump`: extra packet tensors the capture asks `--dump` to write whole.
+    let dump_names = match metadata.get("dump") {
+        None => Vec::new(),
+        Some(v) => v
+            .as_array()
+            .and_then(|a| {
+                a.iter()
+                    .map(|n| n.as_str().map(str::to_owned))
+                    .collect::<Option<Vec<_>>>()
+            })
+            .ok_or("reference dump must be a list of tensor names")?,
+    };
+    if let Some(n) = dump_names
+        .iter()
+        .find(|n| !parsed.tensors.iter().any(|t| &t.name == *n))
+    {
+        return Err(format!("{n}: dump tensor absent from packet").into());
+    }
     let check_stages = |engine: &AmdEngine, rank: usize| -> Result<(), Error> {
         if let Some(dir) = &dump {
             std::fs::create_dir_all(dir)?;
@@ -321,7 +339,6 @@ pub fn run(
                 "act.opart",
                 "act.mlpart",
                 "act.xn2",
-                "act.xe",
                 "act.attn",
                 "act.rlogit",
                 "act.tab",
@@ -347,13 +364,10 @@ pub fn run(
                 "act.blk_xq",
                 "act.blk_xs",
                 "act.og_tp",
-                "act.hn",
-                "act.qg",
-                "act.kg",
-                "act.vg",
-                "act.ogate",
-                "act.q",
-            ] {
+            ]
+            .into_iter()
+            .chain(dump_names.iter().map(String::as_str))
+            {
                 if let Some(size) = engine.tensor_bytes(name) {
                     let mut bytes = vec![0; size as usize];
                     engine.read_tensor(name, &mut bytes)?;

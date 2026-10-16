@@ -1075,8 +1075,12 @@ pub(super) fn run(
         None => serve_section::section(dir, emit_config::active().serve_defaults.as_deref())
             .unwrap_or_else(|e| panic!("muse_spark serve manifest: {e}")),
     };
+    let mut sections = vec![section];
+    if tp > 1 && emit_config::active().muse_latent_tp {
+        sections.push(latent_shards_section(&m));
+    }
     let outp = Path::new(out);
-    std::fs::write(outp, m.to_blob_v6(&[section])).expect("write muse_spark blob");
+    std::fs::write(outp, m.to_blob_v6(&sections)).expect("write muse_spark blob");
     if !arch.is_empty() {
         write_lean_receipts(outp, &lean);
         let mut man = manifest::build(&m, arch, &lean);
@@ -1099,6 +1103,23 @@ pub(super) fn run(
          -> {out}\n  Remaining: {REMAINING}",
         m.progs.iter().map(|p| p.insts.len()).sum::<usize>(),
     );
+}
+
+/// The row-parallel latent projections, by name: `shard_of` does not classify them.
+fn latent_shards_section(m: &Model) -> packet::devbuild::SectionData {
+    use plow_asset::weight_shards::{WeightShards, SECTION, VERSION};
+    let row = m
+        .tensors
+        .iter()
+        .map(|t| t.name.clone())
+        .filter(|n| n.ends_with("mlp.pre_expert_proj.weight") || n.ends_with("mlp.post_expert_proj.weight"))
+        .collect();
+    packet::devbuild::SectionData {
+        kind: packet::devbuild::SECT_METADATA,
+        name: SECTION.into(),
+        data: serde_json::to_vec(&WeightShards { version: VERSION, row, column: Vec::new() })
+            .expect("weight shards json"),
+    }
 }
 
 fn block_section(
@@ -1382,6 +1403,23 @@ mod tests {
         let size = |n: &str| m.tensors.iter().find(|t| t.name == n).unwrap().bytes;
         assert_eq!(size("act.x"), 128 * 256 * 2, "one table at the widest program");
         assert_eq!(size("kv.1.k"), 64 * 2 * 512 * 2);
+    }
+
+    #[test]
+    fn tp_declares_the_latent_projections_row_parallel() {
+        let c = MuseCfg::parse(&config());
+        let m = model(&c, 512, 256, 2, 0..2, true, &[], &[1]);
+        let sec = latent_shards_section(&m);
+        let d = plow_asset::weight_shards::WeightShards::parse(&sec.data).unwrap();
+        let mut row = d.row.clone();
+        row.sort();
+        let want: Vec<String> = (0..2)
+            .flat_map(|l| {
+                ["post", "pre"].map(|w| format!("{PREFIX}layers.{l}.mlp.{w}_expert_proj.weight"))
+            })
+            .collect();
+        assert_eq!(row, want);
+        assert!(d.column.is_empty());
     }
 
     #[test]

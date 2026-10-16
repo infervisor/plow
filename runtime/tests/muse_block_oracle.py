@@ -14,7 +14,8 @@
 #                                                      rewrites them)
 #   reference.bf16            act.xnext (last layer output); reference_a4w4.bf16 the A4W4 experts' chain
 #   <stage>.reference.bf16    the last layer's act.xmid / act.xn2 / act.ylat (+ act.attn at TP1)
-#   reference.json            ctx, batch, tolerance, stages, router top-k, A4W4 delta
+#   reference.json            ctx, batch, tolerance, stages, dump (extra tensors `--dump` writes),
+#                             router top-k, A4W4 delta
 # The INPUT is a seeded synthetic hidden row (N(0,1), so input_layernorm sees unit RMS like the
 # embed-normed stream). The WEIGHTS are real. Each layer's K/V history (rows 0..ctx-2) is its own
 # projections of a per-layer seeded N(0,1) sequence; the decode row is the chained hidden. The
@@ -396,6 +397,7 @@ json.dump(dict(
     reference="torch CPU mirror of modeling_muse_spark.py, W4A16 experts"
               + (", f32 attention scores/probabilities" if args.attn_f32 else ""),
     tolerance_rel_l2=0.03, stages=list(stages),
+    dump=["act.hn", "act.qg", "act.kg", "act.vg", "act.ogate", "act.q", "act.xe"],
     router_topk=dict(ids=r["top"].tolist(), weights=r["gates"].tolist()),
     a4w4_vs_w4a16_xnext=dict(rel_l2=(d.norm() / x.double().norm()).item(),
                              max_abs=d.abs().max().item()),
