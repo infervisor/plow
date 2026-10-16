@@ -657,6 +657,26 @@ pub struct RuntimeConfig {
     #[arg(long = "pf-defer-decode", env = "PLOW_PF_DEFER_DECODE", hide = true, default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
     pub pf_defer_decode: bool,
 
+    /// Expert (AMD): keep launching prefill chunks within one tick — a prompt's remaining chunks
+    /// and further waiting prompts — until the tick's `PLOW_PF_INTERLEAVE` row budget is spent,
+    /// then run the decode step. Off: one chunk per slot and one fresh prompt per tick.
+    #[arg(long = "pf-back-to-back", env = "PLOW_PF_BACK_TO_BACK", hide = true, default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
+    pub pf_back_to_back: bool,
+
+    /// AMD span-sampling packed prefill: the live decode rows ride the tick's packed prefill
+    /// launches as one-row spans (the H100 unified token batch's lowering), and the separate
+    /// decode step is skipped for that tick. `=0` rollback: prefill launches, then a decode step.
+    #[arg(long = "amd-mixed-pack", env = "PLOW_AMD_MIXED_PACK", default_value_t = true, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
+    pub amd_mixed_pack: bool,
+
+    /// Expert (AMD prefix cache): a prompt sharing no cached prefix snapshots its recurrent state
+    /// after its LAST chunk instead of at a split 32 rows before the end, so a cold prompt runs
+    /// no extra tail launch. A continuation (prompt + reply + ...) resumes at the full prompt; an
+    /// identical re-sent prompt resumes there too and takes the first token (and its logits row)
+    /// kept with the snapshot, running no chunk.
+    #[arg(long = "prefix-arm-end", env = "PLOW_PREFIX_ARM_END", hide = true, default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
+    pub prefix_arm_end: bool,
+
     /// Runtime max context override. If set, limits or configures the maximum sequence length at runtime.
     /// If unset, defaults to the context length declared by the packet.
     #[arg(long = "rt-max-ctx", env = "PLOW_RT_MAX_CTX", global = true)]
@@ -761,7 +781,7 @@ pub struct RuntimeConfig {
     #[arg(long = "pin", env = "PLOW_PIN", value_delimiter = ',', global = true)]
     pub pin: Vec<String>,
 
-    /// Data-parallel ranks per model on one serve (CUDA, TP1 bundles): `--dp 8`, `--dp all`
+    /// Data-parallel ranks per model on one serve (CUDA TP1 bundles; AMD any TP): `--dp 8`, `--dp all`
     /// (one per device group), or per model `--dp gemma=4,asr=2`. Each rank is a full copy on its
     /// own device group; requests route by session, prefix cache and load. Unset = 1.
     #[arg(long = "dp", env = "PLOW_DP", value_delimiter = ',', global = true)]
@@ -941,6 +961,19 @@ pub struct RuntimeConfig {
     /// (`PLOW_TICK_LOG=1`).
     #[arg(long = "tick-log", env = "PLOW_TICK_LOG", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
     pub tick_log: bool,
+
+    /// AMD serve tick timeline: one JSON line per tick (launch kinds, rows, rungs, enqueue and
+    /// drain timestamps, per-rank drain skew, emitted slots) appended to this path
+    /// (`PLOW_TICK_TRACE=<path>`). `scripts/bench/tick_trace_report.py` turns it into a table.
+    #[arg(long = "tick-trace", env = "PLOW_TICK_TRACE", hide = true, global = true)]
+    pub tick_trace: Option<std::path::PathBuf>,
+
+    /// AMD prefill hold (`PLOW_PF_HOLD=rows[,ms[,min_decode]]`): while at least `min_decode`
+    /// (default 16) rows decode, waiting prompts wait until 3/4 of `rows` prompt rows are pending
+    /// or the oldest has waited `ms` (default 400), so they run as one wide pack instead of one
+    /// lone padded launch per arrival. The tick budget is raised to `rows` on release. Unset = off.
+    #[arg(long = "pf-hold", env = "PLOW_PF_HOLD", hide = true, global = true)]
+    pub pf_hold: Option<String>,
 
     /// Decode-step host-phase breakdown (`PLOW_DSTEP_LOG=1`).
     #[arg(long = "dstep-log", env = "PLOW_DSTEP_LOG", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
@@ -1686,6 +1719,12 @@ impl RuntimeConfig {
         self.pf_interleave.unwrap_or(0)
     }
 
+    /// `PLOW_PF_HOLD=rows[,ms[,min_decode]]` as `(rows, ms, min_decode)`; unset, empty, `0` or
+    /// malformed = off.
+    pub fn pf_hold(&self) -> Option<(u32, f64, usize)> {
+        parse_pf_hold(self.pf_hold.as_deref()?)
+    }
+
     /// AMD per-rank NUMA-local kernarg ring and host staging (`PLOW_AMD_NUMA_HOST_POOLS`). Unset →
     /// on; `=0` → the single first-CPU-agent placement.
     pub fn amd_numa_host_pools(&self) -> bool {
@@ -1799,6 +1838,66 @@ pub struct AmdRuntimeConfig {
     #[arg(long = "amd-tp-prefill-segment-major", env = "PLOW_TP_PREFILL_SEGMENT_MAJOR", default_value_t = true, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
     pub tp_prefill_segment_major: bool,
 
+    /// Packed (multi-prompt / mixed) prefill chunks enqueue every segment on every rank and
+    /// drain once, as isolated chunks do under `PLOW_TP_PREFILL_SEGMENT_MAJOR`; off = a host
+    /// drain after every segment.
+    #[arg(long = "amd-packed-seg-major", env = "PLOW_AMD_PACKED_SEG_MAJOR", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
+    pub packed_seg_major: bool,
+    /// A packed prefill launch runs a packet's marked lean KDA chunk segments (intra wave-item,
+    /// lean Wu, register-state/key-fed carry; `PLOW_GLM53_PACKED_LEAN_KDA` emits them) as the
+    /// single-sequence objects once per span when every span has >= 512 rows; `=0` keeps the
+    /// packed interpreter arms. Bit-identical: the objects match the interpreter arms.
+    #[arg(long = "amd-packed-lean-kda", env = "PLOW_AMD_PACKED_LEAN_KDA", default_value_t = true, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
+    pub packed_lean_kda: bool,
+    /// Packed lean KDA segments run every span in ONE dispatch (the `*_spans_gfx950.elf`
+    /// objects) instead of one barrier-separated launch per span, so the spans' chunk carries
+    /// run side by side. Missing objects fall back to per-span launches.
+    #[arg(long = "amd-packed-lean-kda-batch", env = "PLOW_AMD_PACKED_LEAN_KDA_BATCH", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
+    pub packed_lean_kda_batch: bool,
+    /// The packed KDA family object built with PLOW_PACKED_KDA_PAR (`interp_packed_kda_par.elf`):
+    /// one-row spans (decode riders) run as a flat (span, channel) item space.
+    #[arg(long = "amd-packed-kda-par", env = "PLOW_AMD_PACKED_KDA_PAR", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
+    pub packed_kda_par: bool,
+    /// The prompts a packed prefill launch finishes take their prefix-cache state snapshots
+    /// behind one completion wait per rank instead of one per prompt; `=0` restores per-prompt.
+    #[arg(long = "amd-packed-snap-batch", env = "PLOW_AMD_PACKED_SNAP_BATCH", default_value_t = true, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
+    pub packed_snap_batch: bool,
+    /// Prefix-cache state snapshots run as one queue-ordered copy dispatch
+    /// (`copy_pairs_gfx950.elf`) instead of ~300 DMA copies per prompt behind a host wait.
+    #[arg(long = "amd-snap-kernel", env = "PLOW_AMD_SNAP_KERNEL", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
+    pub snap_kernel: bool,
+
+    /// A planned prefill pack filling less than 3/4 of its rung runs as packs that each fit the
+    /// next narrower rung (four 1024-row chunks: two 2048 packs, not one half-empty 8192 pack).
+    #[arg(long = "amd-pack-fill", env = "PLOW_AMD_PACK_FILL", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
+    pub pack_fill: bool,
+
+    /// Decode rows ride a packed prefill launch (`PLOW_AMD_MIXED_PACK`) only while at most this
+    /// many rows decode; more step as a separate decode launch. Unset = no cap.
+    #[arg(long = "amd-mixed-ride-max", env = "PLOW_AMD_MIXED_RIDE_MAX", global = true)]
+    pub mixed_ride_max: Option<u32>,
+
+    /// Decode rows ride EVERY packed prefill launch: when they would widen the pack's rung, the
+    /// last member's chunk gives up that many rows (they run in a later launch), and the riders'
+    /// one-row spans keep the lean KDA route through the all-spans objects. Off: riders ride
+    /// only a pack whose rung has room for them.
+    #[arg(long = "amd-mixed-ride-trim", env = "PLOW_AMD_MIXED_RIDE_TRIM", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
+    pub mixed_ride_trim: bool,
+    /// Packed launches run their leading one-row spans (decode riders) through the decode KDA
+    /// chain (`kda_rider_gfx950.elf`, one workgroup per rider and head) instead of the packed
+    /// BT64 chunk arms, which walk every span on every workgroup.
+    #[arg(long = "amd-rider-kda", env = "PLOW_AMD_RIDER_KDA", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
+    pub rider_kda: bool,
+    /// The pack decode rows ride fills its row budget less the riders: the oldest planned chunk
+    /// that does not fit is cut to the gap instead of the pack running short.
+    #[arg(long = "amd-ride-fill", env = "PLOW_AMD_RIDE_FILL", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
+    pub ride_fill: bool,
+
+    /// A lone prefill chunk whose cursor is already packable (a long prompt's later chunks) runs
+    /// as a pack of one carrying the live decode rows (`PLOW_AMD_MIXED_PACK` riders).
+    #[arg(long = "amd-mixed-ride-lone", env = "PLOW_AMD_MIXED_RIDE_LONE", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
+    pub mixed_ride_lone: bool,
+
     /// Per-segment all-rank barrier timing for prefill (diagnostic; disables segment-major).
     #[arg(long = "amd-prefill-seg-timing", env = "PLOW_PREFILL_SEG_TIMING", hide = true, default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
     pub prefill_seg_timing: bool,
@@ -1838,6 +1937,14 @@ pub struct AmdRuntimeConfig {
         global = true
     )]
     pub attnres_f32mix_grid: Option<u32>,
+
+    /// Per-segment prefill launch geometry (`exec/amd/seg_geom.rs`): `[T<rows>:]<family|s<i>>=g<grid>[+alt]`.
+    #[arg(long = "amd-seg-geom", env = "PLOW_SEG_GEOM", hide = true, global = true)]
+    pub seg_geom: Option<String>,
+
+    /// Directory of alternate prefill/flash interpreter objects for `PLOW_SEG_GEOM` `alt` segments.
+    #[arg(long = "amd-seg-alt-dir", env = "PLOW_SEG_ALT_DIR", hide = true, global = true)]
+    pub seg_alt_dir: Option<std::path::PathBuf>,
 
     /// Audited extra resident bytes per rank a replicated-input MoE EP packet may claim.
     #[arg(
@@ -1905,10 +2012,11 @@ pub struct AmdRuntimeConfig {
     #[arg(long = "amd-publish-defer", env = "PLOW_AMD_PUBLISH_DEFER", default_value_t = true, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
     pub publish_defer: bool,
 
-    /// DIAGNOSTIC: drain with a blocked (interrupt-backed) wait on the queue's completion
-    /// signal instead of busy-polling it, so the host core stops contending for the line the
-    /// GPU decrements once per dispatch.
-    #[arg(long = "amd-hsa-drain-blocked", env = "PLOW_HSA_DRAIN_BLOCKED", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
+    /// Drain with a blocked (interrupt-backed) wait on the queue's completion signal instead of
+    /// busy-polling it, so the host core stops contending for the line the GPU decrements once
+    /// per dispatch. GLM-5.3-Flash TP8 MI350X: prefill 8k median 293 -> 272 ms (the ~18 ms
+    /// stall in a third of busy-polled chunks is gone), decode r1/b32/b128 -3%. `=0` rolls back.
+    #[arg(long = "amd-hsa-drain-blocked", env = "PLOW_HSA_DRAIN_BLOCKED", default_value_t = true, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
     pub hsa_drain_blocked: bool,
 
     /// Where the AMD engine thread runs: `auto` pins it to the CPU socket holding rank 0's GPU
@@ -1970,6 +2078,11 @@ pub struct AmdRuntimeConfig {
     #[arg(long = "amd-tp-audit-compact", env = "PLOW_TP_AUDIT_COMPACT", default_value_t = true, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
     pub tp_audit_compact: bool,
 
+    /// Bytes per tagged one-shot XReduce slot; must equal the decode object's
+    /// `PLOW_XR_TAG_SLOT_BYTES` (a non-default object exports `plow_xr_tag_slot_<N>`).
+    #[arg(long = "amd-xr-tag-slot", env = "PLOW_XR_TAG_SLOT", default_value_t = 20480, global = true)]
+    pub xr_tag_slot: u32,
+
     /// Read each TP prefill chunk's exact counter audit through host-mapped large BAR instead
     /// of one D2H copy per rank. Same gates, same expectations.
     #[arg(long = "amd-tp-prefill-audit-direct", env = "PLOW_TP_PREFILL_AUDIT_DIRECT", default_value_t = true, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
@@ -2019,6 +2132,12 @@ pub struct AmdRuntimeConfig {
         global = true
     )]
     pub tail_sparse_ctx: Option<u32>,
+
+    /// DSA sparse prefill chunk floor: a chunk on the sparse prefill rung whose context end
+    /// (`c0 + clen`) is at most this many tokens skips the indexer selection and runs the dense
+    /// flash. Unset = every chunk of the sparse rung is sparse.
+    #[arg(long = "glm-dsa-pf-min-ctx", env = "PLOW_GLM_DSA_PF_MIN_CTX", global = true)]
+    pub dsa_pf_min_ctx: Option<u32>,
 
     /// With the tail-sparse floor: the dense final chunk moves only when `prior x tail rows` (the
     /// query-key pairs its dense attention scores) reaches this many; unset = no pair floor.
@@ -2115,6 +2234,16 @@ pub struct AmdRuntimeConfig {
     /// selection order reassociates the softmax.
     #[arg(long = "amd-decode-dense-exact", env = "PLOW_AMD_DECODE_DENSE_EXACT", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
     pub amd_decode_dense_exact: bool,
+
+    /// With `PLOW_AMD_DECODE_DENSE_EXACT`: run the dense twin while every advanced row holds at
+    /// most this many keys (raised to the selection width), on every rung that has a twin.
+    #[arg(long = "amd-decode-dense-max-ctx", env = "PLOW_AMD_DECODE_DENSE_MAX_CTX", global = true)]
+    pub amd_decode_dense_max_ctx: Option<u32>,
+
+    /// Diagnostic: restrict every rank's AQL queue to a CU subset (`N` = N CUs strided evenly,
+    /// `^N` = the complement). Grids sized to the full chip deadlock persistent objects.
+    #[arg(long = "amd-cu-mask", env = "PLOW_AMD_CU_MASK", global = true)]
+    pub cu_mask: Option<String>,
 
     /// hsaco directory override. Default: <assets>/hsaco.
     ///
@@ -2215,6 +2344,25 @@ pub struct AmdRuntimeConfig {
     #[arg(long = "amd-mla-pf-aiter", env = "PLOW_MLA_PF_AITER", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
     pub mla_pf_aiter: bool,
 
+    /// Run eligible NoPE bf16 MLA flash-prefill segments on the dedicated gfx950 object
+    /// `mla_pf_dense_gfx950.elf` (built with `PLOW_MLA_PF_DENSE=1`). Not bit-identical to the
+    /// interpreter flash; a missing object is a load error.
+    #[arg(long = "amd-mla-pf-dense", env = "PLOW_MLA_PF_DENSE", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
+    pub mla_pf_dense: bool,
+
+    /// Sequence-split the key-fed KDA carry into at most this many segments (0 = off): the
+    /// segments run in parallel from zero / identity states and a combine + output-fix pass
+    /// restores the serial recurrence (`kda_chunk_carry_split_gfx950.elf`). Segments are at least
+    /// 1024 tokens. Not bit-identical to the serial carry.
+    #[arg(long = "amd-kda-carry-split", env = "PLOW_KDA_CARRY_SPLIT", default_value_t = 0, global = true)]
+    pub kda_carry_split: u32,
+
+    /// Run a packed binding's per-span key-fed KDA carries that are not split as one launch per
+    /// 16 spans (`kda_chunk_carry_multi_gfx950.elf`)
+    /// instead of one 64-workgroup launch per span. Bit-identical per span.
+    #[arg(long = "amd-kda-carry-multi", env = "PLOW_KDA_CARRY_MULTI", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
+    pub kda_carry_multi: bool,
+
     /// Split a sparse-rung prefill chunk that starts below 2047 prior keys: rows holding all 2048
     /// causal keys take the AITER sparse route, the earlier rows the interpreter gather arm.
     /// Default on (checkpoint P, perf-certs/rt.mla_pf_row_split.json); `=0` is the rollback.
@@ -2226,6 +2374,11 @@ pub struct AmdRuntimeConfig {
     /// Default on (checkpoint P, perf-certs/rt.mla_pf_row_split_native_lo.json); `=0` is the rollback.
     #[arg(long = "amd-mla-pf-row-split-native-lo", env = "PLOW_MLA_PF_ROW_SPLIT_NATIVE_LO", default_value_t = true, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
     pub mla_pf_row_split_native_lo: bool,
+
+    /// gfx950: run each group of a `GemmGroupPf` segment (the KDA fused in-projection) as its own
+    /// pinned hipBLASLt launch (`glm_lt_gfx950.elf`) instead of `plow_gemm_group_pf_gfx950`.
+    #[arg(long = "amd-gemm-group-lt", env = "PLOW_AMD_GEMM_GROUP_LT", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
+    pub gemm_group_lt: bool,
 
     /// DIAGNOSTIC. Zero the whole sparse-MLA workspace before every row-band dispatch, so the
     /// dispatch sees the device state a freshly loaded server would give it. Bisects the
@@ -2254,6 +2407,16 @@ pub struct AmdRuntimeConfig {
     #[arg(long = "amd-moe-stage1-a4-reuse", env = "PLOW_MOE_STAGE1_A4_REUSE", default_value_t = true, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
     pub moe_stage1_a4_reuse: bool,
 
+    /// Run isolated block-fp8 grouped-MoE prefill GLU / down segments on the
+    /// dedicated `moe_fp8_pf_gfx950.elf` object (bit-identical). `=0` runs them on the interpreter.
+    #[arg(long = "amd-moe-fp8-pf", env = "PLOW_MOE_FP8_PF", default_value_t = true, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
+    pub moe_fp8_pf: bool,
+
+    /// PLOW_MOE_W8A8_DEC segments run GLU + DOWN as ONE launch (`plow_moe_w8a8_dec_pair`, DOWN
+    /// items wait on per-half GLU counters) instead of two. Same bodies: bit-identical.
+    #[arg(long = "amd-moe-w8a8-dec-fused", env = "PLOW_MOE_W8A8_DEC_FUSED", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
+    pub moe_w8a8_dec_fused: bool,
+
     /// Download rank 0's copy of act tensors after the prefill/step:
     /// `name:path[,name:path...]`. A measurement instrument, not a serving path.
     #[arg(long = "amd-dump-act", env = "PLOW_DUMP_ACT", global = true)]
@@ -2278,6 +2441,85 @@ pub struct AmdRuntimeConfig {
     /// Read through `RuntimeConfig::amd_kernarg_vram`, which supplies the default (on).
     #[arg(long = "amd-kernarg-vram", env = "PLOW_AMD_KERNARG_VRAM", value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
     pub kernarg_vram: Option<bool>,
+    /// Deferred AQL chains carry the queue completion signal on their last packet only (the
+    /// barrier bit orders every earlier packet before it), not on every dispatch.
+    #[arg(long = "amd-tail-signal", env = "PLOW_AMD_TAIL_SIGNAL", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
+    pub tail_signal: bool,
+    /// Deferred AQL chains read the VRAM kernarg BAR back once at commit (the chain's last slot)
+    /// instead of once per packet.
+    #[arg(long = "amd-karg-chain-flush", env = "PLOW_AMD_KARG_CHAIN_FLUSH", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
+    pub karg_chain_flush: bool,
+    /// Decode hipBLASLt segments that neither read nor write an output of the GEMM segments
+    /// queued since the last barrier packet drop the AQL barrier bit, so independent projections
+    /// of one layer run concurrently.
+    #[arg(long = "amd-lt-concurrent", env = "PLOW_AMD_LT_CONCURRENT", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
+    pub lt_concurrent: bool,
+    /// Diagnostic: gfx950 hipBLASLt kernel (index into `glm_lt_gfx950.json`) of the GLM-5.3 TP8
+    /// lm_head decode route (`PLOW_GLM53_GEMM_LT_DEC=lm_head`). Unset = 23 (MT64x32x128).
+    #[arg(long = "amd-lt-lm-head-kernel", env = "PLOW_AMD_LT_LM_HEAD_KERNEL", value_parser = clap::value_parser!(u32).range(0..=32), global = true)]
+    pub lt_lm_head_kernel: Option<u32>,
+    /// Diagnostic: split-K (8, 16, 32 or 64; unset = 64) of the PLOW_GLM_HC_AITER decode pair.
+    #[arg(long = "amd-hc-split-k", env = "PLOW_AMD_HC_SPLIT_K", global = true)]
+    pub hc_split_k: Option<u32>,
+    /// Diagnostic: tile_m (16 or 32; unset = AITER's picker) of the PLOW_GLM_HC_AITER post kernel.
+    #[arg(long = "amd-hc-tile-m", env = "PLOW_AMD_HC_TILE_M", global = true)]
+    pub hc_tile_m: Option<u32>,
+    /// Diagnostic: `<acquire>,<release>` HSA fence scopes (0 none, 1 agent, 2 system) on every
+    /// dispatch packet. Unset = agent,agent. Not ordering-safe below agent.
+    #[arg(long = "amd-pkt-fence", env = "PLOW_AMD_PKT_FENCE", global = true)]
+    pub pkt_fence: Option<String>,
+    /// Diagnostic: `<prefix>` — per-dispatch GPU start/end to `<prefix>.dev<N>.csv`.
+    #[arg(long = "amd-dispatch-times", env = "PLOW_AMD_DISPATCH_TIMES", global = true)]
+    pub dispatch_times: Option<String>,
+    /// TP decode: per-rank synchronous host copies (staging, token readback, id seeding) run
+    /// on one thread per rank so their SDMA round trips overlap.
+    #[arg(long = "amd-tp-par-host", env = "PLOW_TP_PAR_HOST", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
+    pub tp_par_host: bool,
+    /// TP decode: append the compact counter audit to each rank's decode chain instead of a
+    /// second submit and drain after it.
+    #[arg(long = "amd-tp-audit-tail", env = "PLOW_TP_AUDIT_TAIL", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
+    pub tp_audit_tail: bool,
+    /// TP decode: per-rank host work (the decode chain fill and, with PLOW_TP_PAR_HOST, the
+    /// per-rank copies) runs on persistent workers instead of threads spawned per token.
+    #[arg(long = "amd-tp-rank-pool", env = "PLOW_TP_RANK_POOL", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
+    pub tp_rank_pool: bool,
+    /// Decode rungs: a segment holding only an XReduce / XReduceTwoShot of at least this many
+    /// elements runs as its own kernel (`xr_native_gfx950.elf`) instead of an interpreter launch.
+    #[arg(long = "amd-xr-native", env = "PLOW_AMD_XR_NATIVE", global = true)]
+    pub xr_native: Option<u32>,
+    /// Decode rungs: the router segment (GemmF32 score + MoeRouterTopkPf) runs as two native
+    /// kernels from the gfx950 MoE adapter instead of an interpreter launch.
+    #[arg(long = "amd-router-native", env = "PLOW_AMD_ROUTER_NATIVE", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
+    pub router_native: bool,
+    /// Diagnostic: force `GFX950_TILES[i]` for AITER MoE calls of at most 256 rows.
+    #[arg(long = "amd-moe-tile-dec", env = "PLOW_AMD_MOE_TILE_DEC", global = true)]
+    pub moe_tile_dec: Option<u32>,
+    /// Diagnostic: launch width of a native one-shot decode collective (default: the
+    /// instruction's workgroup count).
+    #[arg(long = "amd-xr-native-grid", env = "PLOW_AMD_XR_NATIVE_GRID", global = true)]
+    pub xr_native_grid: Option<u32>,
+    /// Diagnostic: launch the native router top-k this many extra times.
+    #[arg(long = "amd-router-repeat", env = "PLOW_AMD_ROUTER_REPEAT", global = true)]
+    pub router_repeat: Option<u32>,
+    /// GLM-5.3 gfx950 AITER MoE: 16x128 up to 32 rows and 32x256 up to 256 rows (decode rungs).
+    #[arg(long = "amd-moe-dec-tiles", env = "PLOW_AMD_MOE_DEC_TILES", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
+    pub moe_dec_tiles: bool,
+    /// Decode rungs: adjacent native (hipBLASLt) GEMMs with no data dependence on each other
+    /// launch without the AQL barrier bit, so they run concurrently.
+    #[arg(long = "amd-lt-overlap", env = "PLOW_AMD_LT_OVERLAP", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
+    pub lt_overlap: bool,
+    /// Decode rungs: adjacent native GEMMs of one input (GLM-5.3's KDA in-projection) run as
+    /// one split-K MFMA pass from `glm_inproj_gfx950.elf`.
+    #[arg(long = "amd-lt-fuse", env = "PLOW_AMD_LT_FUSE", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
+    pub lt_fuse: bool,
+    /// Decode rungs: GLM-5.3's dense FFN layers (one-expert grouped block-FP8 pair + combine +
+    /// collective) run as `glm_inproj_gfx950.elf`'s split-K FP8 passes and the native collective.
+    /// Needs `PLOW_AMD_XR_NATIVE` to cover the layer's collective.
+    #[arg(long = "amd-dense-native", env = "PLOW_AMD_DENSE_NATIVE", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
+    pub dense_native: bool,
+    /// With `PLOW_AMD_ROUTER_NATIVE`: the router score GEMM and top-k as one launch.
+    #[arg(long = "amd-router-fused", env = "PLOW_AMD_ROUTER_FUSED", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
+    pub router_fused: bool,
 }
 
 /// Global runtime config, initialized once at startup from CLI parse.
@@ -2804,6 +3046,20 @@ pub fn is_secret_env(name: &str) -> bool {
         || ["_KEY", "_KEYS", "_TOKEN", "_TOKENS"]
             .iter()
             .any(|suffix| upper.ends_with(suffix))
+}
+
+fn parse_pf_hold(spec: &str) -> Option<(u32, f64, usize)> {
+    let mut it = spec.split(',').map(str::trim);
+    let rows: u32 = it.next()?.parse().ok().filter(|&r| r > 0)?;
+    let ms: f64 = match it.next() {
+        Some(v) => v.parse().ok().filter(|m: &f64| m.is_finite() && *m >= 0.0)?,
+        None => 400.0,
+    };
+    let min_decode: usize = match it.next() {
+        Some(v) => v.parse().ok()?,
+        None => 16,
+    };
+    it.next().is_none().then_some((rows, ms, min_decode))
 }
 
 #[cfg(test)]
@@ -3392,6 +3648,17 @@ mod tests {
             .expect("explicit state-clear rollback");
         let config = super::AmdRuntimeConfig::from_arg_matches(&matches).expect("AMD config");
         assert!(!config.state_clear_device);
+    }
+
+    #[test]
+    fn pf_hold_parses_rows_ms_and_min_decode() {
+        assert_eq!(super::parse_pf_hold("8192"), Some((8192, 400.0, 16)));
+        assert_eq!(super::parse_pf_hold("4096, 250"), Some((4096, 250.0, 16)));
+        assert_eq!(super::parse_pf_hold("2048,100,8"), Some((2048, 100.0, 8)));
+        assert_eq!(super::parse_pf_hold("0"), None);
+        assert_eq!(super::parse_pf_hold(""), None);
+        assert_eq!(super::parse_pf_hold("8192,x"), None);
+        assert_eq!(super::parse_pf_hold("8192,1,2,3"), None);
     }
 
     #[test]

@@ -40,8 +40,8 @@ __device__ __forceinline__ void moe_sw_mfma_rows(moe_sw_f32x4* acc, const moe_sw
     }
 }
 
-// TM rows per unit (16 or 64), KS = I / 128 K-steps, DEPTH column groups of loads in flight.
-template <unsigned TM, unsigned KS, unsigned DEPTH>
+// TM rows per unit (16 or 64), KS = (I + 127) / 128 K-steps, DEPTH column groups of loads in flight.
+template <unsigned TM, unsigned KS, unsigned DEPTH, unsigned I_PARAM = 0>
 __device__ void d_moe_down_a4w4_sweep(float* __restrict__ part, const unsigned char* __restrict__ fu,
                                       const unsigned char* __restrict__ fu_scale,
                                       const unsigned long long* __restrict__ wtab,
@@ -53,7 +53,8 @@ __device__ void d_moe_down_a4w4_sweep(float* __restrict__ part, const unsigned c
                                       float* stage = nullptr) {
     static_assert(TM % 16 == 0 && TM <= 64 && 64 % TM == 0, "TM divides the 64-row routing tile");
     constexpr unsigned MI = TM / 16, SUB = 64 / TM;
-    constexpr unsigned I = KS * 128, ROWB = I / 2, GROUPS = I / 32;
+    constexpr unsigned I = (I_PARAM != 0) ? I_PARAM : (KS * 128u);
+    constexpr unsigned ROWB = I / 2u, GROUPS = I / 32u;
     const unsigned lane = threadIdx.x & 63u, wave = threadIdx.x >> 6;
     const unsigned lane_k = lane >> 4, lane_n = lane & 15u;
     const int* rowoff = meta;
@@ -84,11 +85,14 @@ __device__ void d_moe_down_a4w4_sweep(float* __restrict__ part, const unsigned c
 #pragma unroll
         for (unsigned ks = 0; ks < KS; ks++) {
             sa[ks] = 0;
+            const bool k_ok = (ks * 4u + lane_k < GROUPS);
 #pragma unroll
             for (unsigned mi = 0; mi < MI; mi++) {
                 const unsigned row = rowbase + mi * 16u + lane_n;
-                a[ks][mi] = moe_sw_fp4(fu + (size_t)row * ROWB + ks * 64u + lane_k * 16u);
-                sa[ks] |= (int)fu_scale[(size_t)row * GROUPS + ks * 4u + lane_k] << (8 * mi);
+                a[ks][mi] = k_ok ? moe_sw_fp4(fu + (size_t)row * ROWB + ks * 64u + lane_k * 16u)
+                                 : moe_sw_i32x8{0, 0, 0, 0, 0, 0, 0, 0};
+                const int sc = k_ok ? (int)fu_scale[(size_t)row * GROUPS + ks * 4u + lane_k] : PLOW_E8M0_ONE;
+                sa[ks] |= sc << (8 * mi);
             }
         }
 #if PLOW_MOE_DOWN_SWEEP_LINE
@@ -128,9 +132,10 @@ __device__ void d_moe_down_a4w4_sweep(float* __restrict__ part, const unsigned c
             const bool ok = c < h1;
 #pragma unroll
             for (unsigned ks = 0; ks < KS; ks++) {
-                b[slot][ks] = ok ? moe_sw_fp4(W + (size_t)col * ROWB + ks * 64u + lane_k * 16u)
-                                 : moe_sw_i32x8{0, 0, 0, 0, 0, 0, 0, 0};
-                sb[slot][ks] = ok ? (int)S[(size_t)col * GROUPS + ks * 4u + lane_k] : 0;
+                const bool k_ok = ok && (ks * 4u + lane_k < GROUPS);
+                b[slot][ks] = k_ok ? moe_sw_fp4(W + (size_t)col * ROWB + ks * 64u + lane_k * 16u)
+                                   : moe_sw_i32x8{0, 0, 0, 0, 0, 0, 0, 0};
+                sb[slot][ks] = k_ok ? (int)S[(size_t)col * GROUPS + ks * 4u + lane_k] : PLOW_E8M0_ONE;
             }
         };
 #if PLOW_MOE_DOWN_SWEEP_LINE
@@ -192,7 +197,7 @@ __device__ void d_moe_down_a4w4_sweep(float* __restrict__ part, const unsigned c
 // Launch-shape choice from the routing metadata, the same in every workgroup: TM=16 while most
 // experts hold one 64-row tile or none (decode rows; measured faster at T<=16), else TM=64; the H
 // split sized so live units cover ~2 per workgroup. `red` is one word of LDS.
-template <unsigned KS>
+template <unsigned KS, unsigned I_PARAM = 0>
 __device__ void moe_down_a4w4_sweep_auto(float* part, const unsigned char* fu,
                                          const unsigned char* fu_scale,
                                          const unsigned long long* wtab,
@@ -218,11 +223,11 @@ __device__ void moe_down_a4w4_sweep_auto(float* part, const unsigned char* fu,
     nsplit = nsplit < 1u ? 1u : (nsplit > H / 64u ? H / 64u : nsplit);
     const unsigned waves = blockDim.x / 64u;
     if (small)
-        d_moe_down_a4w4_sweep<16, KS, 4>(part, fu, fu_scale, wtab, stab, meta, row_partidx, row_gate,
-                                         H, n_exp, nsplit, slice, nblk, waves,
-                                         reinterpret_cast<float*>(red + 4));
+        d_moe_down_a4w4_sweep<16, KS, 4, I_PARAM>(part, fu, fu_scale, wtab, stab, meta, row_partidx, row_gate,
+                                                  H, n_exp, nsplit, slice, nblk, waves,
+                                                  reinterpret_cast<float*>(red + 4));
     else
-        d_moe_down_a4w4_sweep<64, KS, 4>(part, fu, fu_scale, wtab, stab, meta, row_partidx, row_gate,
-                                         H, n_exp, nsplit, slice, nblk, waves,
-                                         reinterpret_cast<float*>(red + 4));
+        d_moe_down_a4w4_sweep<64, KS, 4, I_PARAM>(part, fu, fu_scale, wtab, stab, meta, row_partidx, row_gate,
+                                                  H, n_exp, nsplit, slice, nblk, waves,
+                                                  reinterpret_cast<float*>(red + 4));
 }

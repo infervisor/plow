@@ -4163,6 +4163,18 @@ fn run_one_tick(
                 .filter(|slot| slot.as_ref().is_some_and(|slot| slot.step > 0))
                 .count();
             let has_decode = decode_rows > 0;
+            let _trace = if crate::obs::tick::trace_on() {
+                let (waiting, rows) = slots[..b.min(slots.len())]
+                    .iter()
+                    .flatten()
+                    .filter(|s| s.step == 0)
+                    .fold((0u32, 0u32), |(n, r), s| {
+                        (n + 1, r + s.prompt_ids.len().saturating_sub(s.pf_pos) as u32)
+                    });
+                crate::obs::tick::trace_begin(decode_rows as u32, waiting, rows)
+            } else {
+                None
+            };
             let tick_max = amd_prefill_tick_cap(
                 has_decode || co_scheduled,
                 rt.pf_defer_decode && !co_scheduled,
@@ -4715,153 +4727,502 @@ fn run_one_tick(
             let pf_batch = true;
             let cap = b.min(slots.len());
             let backend = e.step_backend();
-            let now = Instant::now();
-            let full_budget = tick_max.min(backend.step_budget);
-            let candidates: Vec<crate::sched::step::Candidate> = (0..cap)
-                .filter_map(|i| {
-                    let slot = slots[i]
-                        .as_ref()
-                        .filter(|s| s.step == 0 && !s.respond.is_closed())?;
-                    let arrival = arrival_key(slot.arrived, now);
-                    if let Some(span) = pf_batch
-                        .then(|| e.packable_prefill_span(i, full_budget))
-                        .flatten()
-                    {
-                        return Some(crate::sched::step::Candidate {
-                            span,
-                            arrival,
-                            packable: true,
-                            planned: true,
+            // PLOW_AMD_MIXED_RIDE_MAX: a rider row in a packed prefill launch costs about a
+            // millisecond (isl1024 c128: 4-prompt pack 235 ms alone, 332 ms with ~100 riders,
+            // against a 49 ms B=128 decode step), so many riders step separately instead.
+            let mixed_pack = has_decode
+                && !slo_on
+                && e.mixed_pack_ready()
+                && rt.amd.mixed_ride_max.is_none_or(|max| decode_rows <= max as usize);
+            // PLOW_PF_HOLD: while enough rows decode, fresh prompts wait for a wide pack.
+            let hold = amd_pf_hold(
+                rt.pf_hold().filter(|_| !slo_on),
+                decode_rows,
+                slots[..cap]
+                    .iter()
+                    .flatten()
+                    .filter(|s| s.step == 0 && !s.respond.is_closed())
+                    .map(|s| {
+                        (
+                            s.prompt_ids.len().saturating_sub(s.pf_pos),
+                            s.pf_pos > 0,
+                            s.arrived.elapsed().as_secs_f64() * 1e3,
+                        )
+                    }),
+            );
+            if hold == PfHold::Held {
+                crate::obs::tick::trace_held();
+            }
+            let tick_budget = match hold {
+                PfHold::Release(rows) => tick_max.max(rows),
+                _ => tick_max,
+            };
+            let full_budget = tick_budget.min(backend.step_budget);
+            // PLOW_PF_BACK_TO_BACK: re-plan after each pass until the tick's row budget is spent,
+            // so a prompt's chunks and further waiting prompts run before the decode step. Later
+            // passes admit only cursors whose next chunk is known and fits what is left.
+            let b2b = rt.pf_back_to_back && !slo_on;
+            let mut decoded_in_pack = false;
+            let mut b2b_used = 0u32;
+            let mut b2b_pass = 0u32;
+            let mut b2b_failed = false;
+            let mut ride_filled = false;
+            while hold != PfHold::Held {
+                let now = Instant::now();
+                // PLOW_AMD_MIXED_RIDE_TRIM: the first pass also initializes fresh cursors until the
+                // pending rows fill the tick budget, so a trimmed member's tail packs with fresh
+                // prompts instead of running as its own lone launch.
+                let prep_rounds = if b2b_pass > 0 {
+                    1
+                } else if rt.amd.mixed_ride_trim && mixed_pack && b2b {
+                    cap
+                } else {
+                    0
+                };
+                let mut prep_failed = false;
+                for _ in 0..prep_rounds {
+                    if b2b_pass == 0 {
+                        let pending: u32 = (0..cap)
+                            .filter(|&i| slots[i].as_ref().is_some_and(|s| s.step == 0))
+                            .filter_map(|i| e.next_prefill_rows(i))
+                            .sum();
+                        if pending >= full_budget {
+                            break;
+                        }
+                    }
+                    let fresh = (0..cap)
+                        .filter(|&i| {
+                            slots[i].as_ref().is_some_and(|s| {
+                                s.step == 0
+                                    && s.pf_pos == 0
+                                    && s.resume == 0
+                                    && !s.respond.is_closed()
+                            }) && e.next_prefill_rows(i).is_none()
+                        })
+                        .min_by_key(|&i| {
+                            arrival_key(slots[i].as_ref().expect("filtered above").arrived, now)
                         });
+                    let Some(i) = fresh else { break };
+                    let prompt = &slots[i].as_ref().expect("filtered above").prompt_ids;
+                    if let Err(err) = e.prepare_prefill_slot(i, prompt, tick_max) {
+                        note_fault(&mut tick_fault, &err);
+                        if let Some(taken) = slots[i].take() {
+                            release_kv(&arena, taken.kv);
+                            let _ = taken.respond.try_send(StreamChunk::Err(err));
+                        }
+                        e.release(i);
+                        prep_failed = true;
+                        break;
                     }
-                    let planned = e.next_prefill_rows(i);
-                    let rows = planned.unwrap_or(u32::MAX);
-                    Some(crate::sched::step::Candidate {
-                        span: packet::dev::PrefillSpan {
-                            row0: 0,
-                            n_rows: rows,
-                            slot: i as u32,
-                            flags: 0,
-                            kv_row0: 0,
-                            kv_len: rows,
-                            state_slot: i as u32,
-                            program: 0,
-                        },
-                        arrival,
-                        packable: false,
-                        planned: planned.is_some(),
-                    })
-                })
-                .collect();
-            let step_tick = crate::sched::step::Tick {
-                cap_rows: tick_max,
-                packing: pf_batch,
-                rotate: rt.pf_rotate(),
-                turn: e.prefill_turn(),
-                slots: cap,
-            };
-            let step = if slo_on {
-                amd_slo_plan(
-                    &*e,
-                    &slots,
-                    backend,
-                    step_tick,
-                    slo_targets,
-                    &mut obs.slo,
-                    now,
-                )
-            } else {
-                crate::sched::step::plan(
-                    backend,
-                    step_tick,
-                    (0..cap)
-                        .filter(|&i| slots[i].as_ref().is_some_and(|s| s.step > 0))
-                        .map(|i| i as u32),
-                    &candidates,
-                    |program| e.prefill_prog_t(program as usize),
-                    |program| e.packed_prefill_span_limit(program as usize),
-                )
-            };
-            for launch in &step.launches {
-                if launch.is_pack() {
-                    let packed = launch.spans.clone();
-                    let pk_t = packlog::on().then(Instant::now);
-                    for span in &packed {
-                        let slot = slots[span.slot as usize]
+                }
+                if prep_failed {
+                    break;
+                }
+                let mut candidates: Vec<crate::sched::step::Candidate> = (0..cap)
+                    .filter_map(|i| {
+                        let slot = slots[i]
                             .as_ref()
-                            .expect("packed candidate still occupies its slot");
-                        crate::obs::ttft::QUEUE.add(slot.arrived.elapsed().as_nanos() as u64);
-                    }
-                    let t_pf = Instant::now();
-                    let mut result = {
-                        let members: Vec<_> = packed
+                            .filter(|s| s.step == 0 && !s.respond.is_closed())?;
+                        let arrival = arrival_key(slot.arrived, now);
+                        if let Some(span) = pf_batch
+                            .then(|| e.packable_prefill_span(i, full_budget))
+                            .flatten()
+                        {
+                            return Some(crate::sched::step::Candidate {
+                                span,
+                                arrival,
+                                packable: true,
+                                planned: true,
+                            });
+                        }
+                        let planned = e.next_prefill_rows(i);
+                        let rows = planned.unwrap_or(u32::MAX);
+                        Some(crate::sched::step::Candidate {
+                            span: packet::dev::PrefillSpan {
+                                row0: 0,
+                                n_rows: rows,
+                                slot: i as u32,
+                                flags: 0,
+                                kv_row0: 0,
+                                kv_len: rows,
+                                state_slot: i as u32,
+                                program: 0,
+                            },
+                            arrival,
+                            packable: false,
+                            planned: planned.is_some(),
+                        })
+                    })
+                    .collect();
+                if b2b_pass > 0 {
+                    candidates.retain(|c| c.planned);
+                }
+                let step_tick = crate::sched::step::Tick {
+                    cap_rows: if b2b_pass > 0 {
+                        full_budget.saturating_sub(b2b_used)
+                    } else {
+                        tick_budget
+                    },
+                    packing: pf_batch,
+                    rotate: rt.pf_rotate(),
+                    turn: e.prefill_turn(),
+                    slots: cap,
+                };
+                let step = if slo_on {
+                    amd_slo_plan(
+                        &*e,
+                        &slots,
+                        backend,
+                        step_tick,
+                        slo_targets,
+                        &mut obs.slo,
+                        now,
+                    )
+                } else {
+                    crate::sched::step::plan(
+                        backend,
+                        step_tick,
+                        (0..cap)
+                            .filter(|&i| slots[i].as_ref().is_some_and(|s| s.step > 0))
+                            .map(|i| i as u32),
+                        &candidates,
+                        |program| e.prefill_prog_t(program as usize),
+                        |program| e.packed_prefill_span_limit(program as usize),
+                    )
+                };
+                // PLOW_AMD_RIDE_FILL: the tick's first launch (the one decode rows ride) fills the
+                // budget less its riders: the oldest planned chunk that does not fit is cut to the
+                // gap (its rest is its next chunk) and the tick re-plans, instead of the launch
+                // running short (a trimmed tail alone, or a pack a whole chunk short).
+                if rt.amd.ride_fill && mixed_pack && b2b_pass == 0 && !decoded_in_pack && !ride_filled
+                {
+                    ride_filled = true;
+                    let riders = slots[..cap]
+                        .iter()
+                        .flatten()
+                        .filter(|s| s.parked_at.is_none() && !s.out_ids.is_empty())
+                        .count() as u32;
+                    if let Some(pack) = step.launches.first() {
+                        let gap = full_budget.saturating_sub(riders + pack.rows());
+                        let fill = candidates
                             .iter()
-                            .map(|span| {
-                                let i = span.slot as usize;
-                                (
-                                    i,
-                                    slots[i]
-                                        .as_ref()
-                                        .expect("packed candidate still occupies its slot")
-                                        .prompt_ids
-                                        .as_slice(),
-                                )
+                            .filter(|c| {
+                                c.planned
+                                    && c.span.n_rows > gap
+                                    && pack.spans.iter().all(|s| s.slot != c.span.slot)
                             })
-                            .collect();
-                        e.advance_packed_prefill(&members)
-                    };
-                    crate::obs::ttft::PREFILL.add(t_pf.elapsed().as_nanos() as u64);
-                    crate::obs::tick::prefill(
-                        t_pf.elapsed().as_nanos() as u64,
-                        packed.iter().map(|span| span.n_rows).sum(),
-                    );
-                    if result.is_ok() {
-                        match amd_packed_frontier_updates(
-                            packed.iter().map(|span| span.slot as usize),
-                            |i| e.prefill_frontier(i),
-                        ) {
-                            Ok(updates) => {
-                                for (i, frontier) in updates {
-                                    slots[i]
-                                        .as_mut()
-                                        .expect("packed member still occupies its slot")
-                                        .pf_pos = frontier;
-                                }
-                            }
-                            Err(i) => {
-                                result = Err(crate::RuntimeError::Device(format!(
-                                    "packed prefill slot {i} lost its cursor after dispatch"
-                                )));
+                            .min_by_key(|c| (c.arrival, c.span.slot));
+                        if let Some(c) = fill.filter(|_| gap >= 256) {
+                            if e.shrink_prefill_chunk(c.span.slot as usize, gap).is_ok() {
+                                continue;
                             }
                         }
                     }
-                    e.advance_prefill_turn(packed.last().expect("pack has members").slot as usize);
-                    match result {
-                        Ok(()) => {
-                            // ONE info line the first time it actually fires. "Armed" (the
-                            // load-time line in exec/amd.rs) and "firing" are different
-                            // claims, and only the second one is evidence that a measured
-                            // delta belongs to this feature. Everything after that stays at
-                            // debug so the steady state is quiet.
-                            static FIRED: std::sync::Once = std::sync::Once::new();
-                            FIRED.call_once(|| {
-                                tracing::info!(
-                                    spans = packed.len(),
-                                    program = packed[0].program,
-                                    "AMD packed prefill fired"
-                                )
-                            });
-                            tracing::debug!(spans = packed.len(), "AMD packed prefill advanced");
-                            for span in &packed {
-                                let i = span.slot as usize;
-                                if let Some(s) = slots[i].as_mut() {
-                                    s.cached_tokens = e.cached_rows(i);
+                }
+                // A pack wider than its members' isolated rungs together runs as lone launches;
+                // PLOW_AMD_PACK_FILL first splits a mostly empty pack into narrower full ones.
+                let launches: Vec<crate::sched::step::Launch> = step
+                    .launches
+                    .iter()
+                    .flat_map(|launch| {
+                        if !launch.is_pack() {
+                            return vec![launch.clone()];
+                        }
+                        let rows: Vec<u32> = launch.spans.iter().map(|s| s.n_rows).collect();
+                        let mut out = Vec::new();
+                        let mut at = 0usize;
+                        for n in e.pack_groups(&rows) {
+                            let spans = &launch.spans[at..at + n];
+                            let group_rows = &rows[at..at + n];
+                            at += n;
+                            if spans.len() == 1 || e.pack_pays(group_rows) {
+                                out.push(crate::sched::step::Launch {
+                                    spans: spans.to_vec(),
+                                });
+                            } else {
+                                out.extend(spans.iter().map(|&span| crate::sched::step::Launch {
+                                    spans: vec![span],
+                                }));
+                            }
+                        }
+                        out
+                    })
+                    .collect();
+                for launch in &launches {
+                    // PLOW_AMD_MIXED_PACK: the live decode rows ride the tick's first packed
+                    // launch as one-row spans. A lone chunk stays on its isolated program, whose
+                    // lean KDA objects the packed siblings lack: as a pack of one carrying the
+                    // decode rows it measured 5-7% slower at isl4096 c32/c128.
+                    // PLOW_AMD_MIXED_RIDE_LONE: a lone chunk whose cursor is already packable (a
+                    // long prompt's later chunks) runs as a pack of one so the riders come along.
+                    let lone_ride = rt.amd.mixed_ride_lone
+                        && !launch.is_pack()
+                        && !slo_on
+                        && e.packable_prefill_span(launch.spans[0].slot as usize, full_budget)
+                            .is_some_and(|span| span.n_rows == launch.spans[0].n_rows);
+                    let ride = mixed_pack
+                        && !decoded_in_pack
+                        && (launch.is_pack() || lone_ride)
+                        && slots[..cap].iter().any(|s| {
+                            s.as_ref()
+                                .is_some_and(|s| s.parked_at.is_none() && !s.out_ids.is_empty())
+                        });
+                    if launch.is_pack() || (lone_ride && ride) {
+                        let packed = launch.spans.clone();
+                        let feeds: Vec<(usize, u32)> = if ride {
+                            slots[..cap]
+                                .iter()
+                                .enumerate()
+                                .filter_map(|(i, slot)| {
+                                    let slot = slot.as_ref().filter(|s| s.parked_at.is_none())?;
+                                    Some((i, *slot.out_ids.last()?))
+                                })
+                                .collect()
+                        } else {
+                            Vec::new()
+                        };
+                        let mut ride_tokens = vec![0u32; feeds.len()];
+                        let mut rode_now = false;
+                        let pk_t = packlog::on().then(Instant::now);
+                        for span in &packed {
+                            let slot = slots[span.slot as usize]
+                                .as_ref()
+                                .expect("packed candidate still occupies its slot");
+                            crate::obs::ttft::QUEUE.add(slot.arrived.elapsed().as_nanos() as u64);
+                        }
+                        crate::obs::tick::trace_launch(if ride { "mixed" } else { "packed" });
+                        let t_pf = Instant::now();
+                        let mut result = {
+                            let members: Vec<_> = packed
+                                .iter()
+                                .map(|span| {
+                                    let i = span.slot as usize;
+                                    (
+                                        i,
+                                        slots[i]
+                                            .as_ref()
+                                            .expect("packed candidate still occupies its slot")
+                                            .prompt_ids
+                                            .as_slice(),
+                                    )
+                                })
+                                .collect();
+                            if ride {
+                                e.advance_packed_mixed(&members, &feeds, &mut ride_tokens)
+                                    .map(|rode| rode_now = rode)
+                            } else {
+                                e.advance_packed_prefill(&members)
+                            }
+                        };
+                        crate::obs::ttft::PREFILL.add(t_pf.elapsed().as_nanos() as u64);
+                        let pack_rows: u32 = packed.iter().map(|span| span.n_rows).sum();
+                        crate::obs::tick::trace_launch_done(
+                            Some(if rode_now { "mixed" } else { "packed" }),
+                            pack_rows,
+                            packed.len() as u32,
+                            if rode_now { feeds.len() as u32 } else { 0 },
+                        );
+                        b2b_used = b2b_used.saturating_add(pack_rows);
+                        crate::obs::tick::prefill(t_pf.elapsed().as_nanos() as u64, pack_rows);
+                        // Prompts the pack completed have no cursor left; their sampled
+                        // tokens are handled below.
+                        let finished = e.take_packed_tokens();
+                        if result.is_ok() {
+                            match amd_packed_frontier_updates(
+                                packed
+                                    .iter()
+                                    .map(|span| span.slot as usize)
+                                    .filter(|&i| finished.iter().all(|&(f, _)| f != i)),
+                                |i| e.prefill_frontier(i),
+                            ) {
+                                Ok(updates) => {
+                                    for (i, frontier) in updates {
+                                        slots[i]
+                                            .as_mut()
+                                            .expect("packed member still occupies its slot")
+                                            .pf_pos = frontier;
+                                    }
+                                }
+                                Err(i) => {
+                                    result = Err(crate::RuntimeError::Device(format!(
+                                        "packed prefill slot {i} lost its cursor after dispatch"
+                                    )));
                                 }
                             }
-                            for (i, token) in e.take_packed_tokens() {
+                        }
+                        e.advance_prefill_turn(
+                            packed.last().expect("pack has members").slot as usize,
+                        );
+                        match result {
+                            Ok(()) => {
+                                // ONE info line the first time it actually fires. "Armed" (the
+                                // load-time line in exec/amd.rs) and "firing" are different
+                                // claims, and only the second one is evidence that a measured
+                                // delta belongs to this feature. Everything after that stays at
+                                // debug so the steady state is quiet.
+                                static FIRED: std::sync::Once = std::sync::Once::new();
+                                FIRED.call_once(|| {
+                                    tracing::info!(
+                                        spans = packed.len(),
+                                        program = packed[0].program,
+                                        "AMD packed prefill fired"
+                                    )
+                                });
+                                tracing::debug!(
+                                    spans = packed.len(),
+                                    decode = if rode_now { feeds.len() } else { 0 },
+                                    "AMD packed prefill advanced"
+                                );
+                                if rode_now {
+                                    decoded_in_pack = true;
+                                    for (row, &(i, _)) in feeds.iter().enumerate() {
+                                        seq_host_logprobs(&*e, i, &mut slots[i], ride_tokens[row]);
+                                        handle_produced_token(
+                                            &mut slots[i],
+                                            &arena,
+                                            bundle,
+                                            ride_tokens[row],
+                                            1,
+                                            &mut tokens_this_tick,
+                                            Some(stop.as_slice()),
+                                        );
+                                        if slots[i].is_none() {
+                                            e.release(i);
+                                        }
+                                    }
+                                }
+                                for span in &packed {
+                                    let i = span.slot as usize;
+                                    if let Some(s) = slots[i].as_mut() {
+                                        set_cached(s, e.cached_rows(i));
+                                    }
+                                }
+                                for (i, token) in finished {
+                                    if let Some(s) = slots[i].as_mut() {
+                                        s.pf_pos = s.prompt_ids.len();
+                                    }
+                                    let t_tok = std::time::Instant::now();
+                                    seq_host_logprobs(&*e, i, &mut slots[i], token);
+                                    handle_produced_token(
+                                        &mut slots[i],
+                                        &arena,
+                                        bundle,
+                                        token,
+                                        1,
+                                        &mut tokens_this_tick,
+                                        Some(stop.as_slice()),
+                                    );
+                                    crate::obs::ttft::FIRST_TOK
+                                        .add(t_tok.elapsed().as_nanos() as u64);
+                                    if slots[i].is_none() {
+                                        e.release(i);
+                                    }
+                                }
+                            }
+                            Err(err) => {
+                                tracing::warn!(
+                                    error = %err,
+                                    error_code = ?err.device_code(),
+                                    fatal = err.is_fatal(),
+                                    members = packed.len(),
+                                    model = bundle.network(),
+                                    "AMD packed prefill failed"
+                                );
+                                b2b_failed = true;
+                                note_fault(&mut tick_fault, &err);
+                                let msg = err.to_string();
+                                for i in amd_failed_pack_slots(
+                                    packed.iter().map(|span| span.slot as usize),
+                                    &feeds,
+                                ) {
+                                    if let Some(taken) = slots[i].take() {
+                                        release_kv(&arena, taken.kv);
+                                        let _ = taken
+                                            .respond
+                                            .try_send(StreamChunk::Err(fanout_err(&err, &msg)));
+                                    }
+                                    e.release(i);
+                                }
+                            }
+                        }
+                        if let Some(t) = pk_t {
+                            packlog::record(t.elapsed().as_nanos() as u64, 0, true, false, 0);
+                        }
+                        did_prefill = true;
+                    } else {
+                        let i = launch.spans[0].slot as usize;
+                        if pf_batch {
+                            e.advance_prefill_turn(i);
+                        }
+                        // AMD prefill and decode share scratch and run sequentially.
+                        // This interval measures isolated prefill, not mixed-kernel overlap.
+                        let pk_t = packlog::on().then(Instant::now);
+                        // A retained session's rows: the engine keeps them and prefills only the
+                        // suffix, or refuses and the prompt starts cold.
+                        if let Some(s) = slots[i].as_mut().filter(|s| s.pf_pos == 0 && s.resume > 0)
+                        {
+                            s.resume = if s.cfg.is_none() {
+                                e.resume_slot(i, s.resume)
+                            } else {
+                                0
+                            };
+                            s.pf_pos = s.resume;
+                            s.cached_tokens = s.resume;
+                        }
+                        let slot_ref = slots[i].as_ref().expect("found above");
+                        // §TTFT: everything between `mux.submit` and this line — the
+                        // dispatcher wake, the formation hold, admission, and the
+                        // engine-thread handoff.
+                        crate::obs::ttft::QUEUE.add(slot_ref.arrived.elapsed().as_nanos() as u64);
+                        crate::obs::tick::trace_launch("lone");
+                        let t_pf = std::time::Instant::now();
+                        // ONE CHUNK, not the whole prompt. `Ok(None)` means this slot has more chunks to
+                        // go; it stays `step == 0` for a later tick. Planned against the FULL tick cap,
+                        // never the planner's remainder: a fresh cursor built against a partial budget
+                        // would plan the whole prompt in narrower rungs, and the planner only admits a
+                        // planned chunk that fits.
+                        let fresh = slo_on && e.next_prefill_rows(i).is_none();
+                        let (pf, ran) = if slo_on {
+                            let rows = launch.spans[0].n_rows;
+                            match e.prefill_chunk_rows(i, &slot_ref.prompt_ids, tick_max, rows) {
+                                Ok((token, ran)) => (Ok(token), ran),
+                                Err(err) => (Err(err), None),
+                            }
+                        } else {
+                            (
+                                e.prefill_chunked_at_most(i, &slot_ref.prompt_ids, tick_max),
+                                None,
+                            )
+                        };
+                        if let Some(ran) = ran {
+                            let ms = t_pf.elapsed().as_secs_f64() * 1e3;
+                            slo_pf_ms += ms;
+                            obs.slo
+                                .cost
+                                .observe_launch(ran.bucket, ran.clen, ran.c0, fresh, ms);
+                        }
+                        let frontier = e.prefill_frontier(i).unwrap_or(slot_ref.prompt_ids.len());
+                        // Prefix-cache rows were resumed, not run (an end resume runs none).
+                        let ran_rows =
+                            frontier.saturating_sub(slot_ref.pf_pos.max(e.cached_rows(i))) as u32;
+                        b2b_used = b2b_used.saturating_add(ran_rows);
+                        crate::obs::tick::prefill(t_pf.elapsed().as_nanos() as u64, ran_rows);
+                        crate::obs::tick::trace_launch_done(None, ran_rows, 1, 0);
+                        if let Some(s) = slots[i].as_mut() {
+                            set_cached(s, e.cached_rows(i));
+                        }
+                        crate::obs::ttft::PREFILL.add(t_pf.elapsed().as_nanos() as u64);
+                        match pf {
+                            Ok(None) => {
+                                if let Some(slot) = slots[i].as_mut() {
+                                    slot.pf_pos = frontier;
+                                }
+                            }
+                            Ok(Some(token)) => {
                                 if let Some(s) = slots[i].as_mut() {
                                     s.pf_pos = s.prompt_ids.len();
                                 }
+                                tracing::debug!(token, slot = i, "amd: prefill token");
                                 let t_tok = std::time::Instant::now();
                                 seq_host_logprobs(&*e, i, &mut slots[i], token);
                                 handle_produced_token(
@@ -4878,142 +5239,39 @@ fn run_one_tick(
                                     e.release(i);
                                 }
                             }
-                        }
-                        Err(err) => {
-                            tracing::warn!(
-                                error = %err,
-                                error_code = ?err.device_code(),
-                                fatal = err.is_fatal(),
-                                members = packed.len(),
-                                model = bundle.network(),
-                                "AMD packed prefill failed"
-                            );
-                            note_fault(&mut tick_fault, &err);
-                            let msg = err.to_string();
-                            for span in &packed {
-                                let i = span.slot as usize;
+                            Err(err) => {
+                                tracing::warn!(
+                                    slot = i,
+                                    error = %err,
+                                    error_code = ?err.device_code(),
+                                    fatal = err.is_fatal(),
+                                    model = bundle.network(),
+                                    "amd: prefill failed"
+                                );
+                                b2b_failed = true;
+                                note_fault(&mut tick_fault, &err);
                                 if let Some(taken) = slots[i].take() {
                                     release_kv(&arena, taken.kv);
-                                    let _ = taken
-                                        .respond
-                                        .try_send(StreamChunk::Err(fanout_err(&err, &msg)));
+                                    let _ = taken.respond.try_send(StreamChunk::Err(err));
                                 }
                                 e.release(i);
                             }
                         }
-                    }
-                    if let Some(t) = pk_t {
-                        packlog::record(t.elapsed().as_nanos() as u64, 0, true, false, 0);
-                    }
-                    did_prefill = true;
-                } else {
-                    let i = launch.spans[0].slot as usize;
-                    if pf_batch {
-                        e.advance_prefill_turn(i);
-                    }
-                    // AMD prefill and decode share scratch and run sequentially.
-                    // This interval measures isolated prefill, not mixed-kernel overlap.
-                    let pk_t = packlog::on().then(Instant::now);
-                    // A retained session's rows: the engine keeps them and prefills only the
-                    // suffix, or refuses and the prompt starts cold.
-                    if let Some(s) = slots[i].as_mut().filter(|s| s.pf_pos == 0 && s.resume > 0) {
-                        s.resume = if s.cfg.is_none() {
-                            e.resume_slot(i, s.resume)
-                        } else {
-                            0
-                        };
-                        s.pf_pos = s.resume;
-                        s.cached_tokens = s.resume;
-                    }
-                    let slot_ref = slots[i].as_ref().expect("found above");
-                    // §TTFT: everything between `mux.submit` and this line — the
-                    // dispatcher wake, the formation hold, admission, and the
-                    // engine-thread handoff.
-                    crate::obs::ttft::QUEUE.add(slot_ref.arrived.elapsed().as_nanos() as u64);
-                    let t_pf = std::time::Instant::now();
-                    // ONE CHUNK, not the whole prompt. `Ok(None)` means this slot has more chunks to
-                    // go; it stays `step == 0` for a later tick. Planned against the FULL tick cap,
-                    // never the planner's remainder: a fresh cursor built against a partial budget
-                    // would plan the whole prompt in narrower rungs, and the planner only admits a
-                    // planned chunk that fits.
-                    let fresh = slo_on && e.next_prefill_rows(i).is_none();
-                    let (pf, ran) = if slo_on {
-                        let rows = launch.spans[0].n_rows;
-                        match e.prefill_chunk_rows(i, &slot_ref.prompt_ids, tick_max, rows) {
-                            Ok((token, ran)) => (Ok(token), ran),
-                            Err(err) => (Err(err), None),
+                        if let Some(t) = pk_t {
+                            packlog::record(t.elapsed().as_nanos() as u64, 0, true, false, 0);
                         }
-                    } else {
-                        (
-                            e.prefill_chunked_at_most(i, &slot_ref.prompt_ids, tick_max),
-                            None,
-                        )
-                    };
-                    if let Some(ran) = ran {
-                        let ms = t_pf.elapsed().as_secs_f64() * 1e3;
-                        slo_pf_ms += ms;
-                        obs.slo
-                            .cost
-                            .observe_launch(ran.bucket, ran.clen, ran.c0, fresh, ms);
+                        did_prefill = true;
                     }
-                    let frontier = e.prefill_frontier(i).unwrap_or(slot_ref.prompt_ids.len());
-                    crate::obs::tick::prefill(
-                        t_pf.elapsed().as_nanos() as u64,
-                        frontier.saturating_sub(slot_ref.pf_pos) as u32,
-                    );
-                    if let Some(s) = slots[i].as_mut() {
-                        s.cached_tokens = e.cached_rows(i);
-                    }
-                    crate::obs::ttft::PREFILL.add(t_pf.elapsed().as_nanos() as u64);
-                    match pf {
-                        Ok(None) => {
-                            if let Some(slot) = slots[i].as_mut() {
-                                slot.pf_pos = frontier;
-                            }
-                        }
-                        Ok(Some(token)) => {
-                            if let Some(s) = slots[i].as_mut() {
-                                s.pf_pos = s.prompt_ids.len();
-                            }
-                            tracing::debug!(token, slot = i, "amd: prefill token");
-                            let t_tok = std::time::Instant::now();
-                            seq_host_logprobs(&*e, i, &mut slots[i], token);
-                            handle_produced_token(
-                                &mut slots[i],
-                                &arena,
-                                bundle,
-                                token,
-                                1,
-                                &mut tokens_this_tick,
-                                Some(stop.as_slice()),
-                            );
-                            crate::obs::ttft::FIRST_TOK.add(t_tok.elapsed().as_nanos() as u64);
-                            if slots[i].is_none() {
-                                e.release(i);
-                            }
-                        }
-                        Err(err) => {
-                            tracing::warn!(
-                                slot = i,
-                                error = %err,
-                                error_code = ?err.device_code(),
-                                fatal = err.is_fatal(),
-                                model = bundle.network(),
-                                "amd: prefill failed"
-                            );
-                            note_fault(&mut tick_fault, &err);
-                            if let Some(taken) = slots[i].take() {
-                                release_kv(&arena, taken.kv);
-                                let _ = taken.respond.try_send(StreamChunk::Err(err));
-                            }
-                            e.release(i);
-                        }
-                    }
-                    if let Some(t) = pk_t {
-                        packlog::record(t.elapsed().as_nanos() as u64, 0, true, false, 0);
-                    }
-                    did_prefill = true;
                 }
+                b2b_pass += 1;
+                if !b2b || b2b_failed || step.launches.is_empty() || b2b_used >= full_budget {
+                    break;
+                }
+            }
+            if decoded_in_pack {
+                // The decode rows advanced inside a packed launch this tick. Like the mixed arm,
+                // its latency includes prefill and must not train decode-rung estimates.
+                return (slots, bufs, obs, tokens_this_tick, true, tick_fault, None);
             }
             if did_prefill {
                 let prefill_remains = slots[..b.min(slots.len())]
@@ -5075,8 +5333,10 @@ fn run_one_tick(
             let mut deferred = std::mem::take(&mut obs.host.slot_tokens);
             let t_dec = (crate::obs::tick::on() || slo_on).then(Instant::now);
             let t_call = crate::obs::host::on().then(Instant::now);
+            crate::obs::tick::trace_launch("decode");
             let step_result = if let Some(quantum) = multi {
                 let call_res = e.multi_step(&feeds, quantum, &mut deferred);
+                crate::obs::tick::trace_launch_done(None, 0, 0, feeds.len() as u32);
                 let t_emit = host_engine_call(t_call, feeds.len(), tokens_this_tick);
                 let res = call_res.and_then(|quantum| {
                     for &(i, _) in &feeds {
@@ -5106,6 +5366,7 @@ fn run_one_tick(
                 res
             } else {
                 let call_res = e.step_batch(&feeds);
+                crate::obs::tick::trace_launch_done(None, 0, 0, feeds.len() as u32);
                 let t_emit = host_engine_call(t_call, feeds.len(), tokens_this_tick);
                 let res = call_res.map(|out| {
                     for (i, token) in out {
@@ -5594,6 +5855,43 @@ fn amd_prefill_tick_cap(has_decode: bool, defer_decode: bool, interleave: u32) -
 }
 
 #[cfg(any(feature = "hsa", feature = "cpu"))]
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum PfHold {
+    Off,
+    /// Fresh prompts wait this tick; only decode runs.
+    Held,
+    /// The pending prompts run now under a tick budget of this many rows.
+    Release(u32),
+}
+
+/// `PLOW_PF_HOLD` for one tick. `pending` is `(rows not yet prefilled, started, ms since arrival)`
+/// per waiting prompt. With at least `min_decode` decode rows, fresh prompts wait until three
+/// quarters of `rows` are pending (a pack that fills most of a `rows`-wide rung, with room left
+/// for the decode riders) or the oldest has waited `ms`; the release tick may then pack `rows`.
+/// A prompt already started (chunks run or prefix rows resumed) is never held.
+#[cfg(any(feature = "hsa", feature = "cpu"))]
+fn amd_pf_hold(
+    spec: Option<(u32, f64, usize)>,
+    decode_rows: usize,
+    pending: impl Iterator<Item = (usize, bool, f64)>,
+) -> PfHold {
+    let Some((rows, ms, min_decode)) = spec else {
+        return PfHold::Off;
+    };
+    if decode_rows == 0 || decode_rows < min_decode {
+        return PfHold::Off;
+    }
+    let (sum, started, oldest) = pending.fold((0usize, false, 0.0f64), |(n, s, o), (r, st, w)| {
+        (n + r, s || st, o.max(w))
+    });
+    if sum > 0 && !started && sum < rows as usize * 3 / 4 && oldest < ms {
+        PfHold::Held
+    } else {
+        PfHold::Release(rows)
+    }
+}
+
+#[cfg(any(feature = "hsa", feature = "cpu"))]
 fn amd_defer_decode(enabled: bool, prefill_remains: bool) -> bool {
     enabled && prefill_remains
 }
@@ -5845,6 +6143,20 @@ fn amd_packed_frontier_updates(
     members
         .into_iter()
         .map(|slot| frontier(slot).map(|value| (slot, value)).ok_or(slot))
+        .collect()
+}
+
+/// Slots a failed packed launch terminates: its prefill members and every decode feed offered
+/// to ride it, since the launch may have advanced a rider's KV and recurrent state before its
+/// position or sampled token reached the host.
+#[cfg(any(feature = "hsa", feature = "cpu"))]
+fn amd_failed_pack_slots(
+    members: impl IntoIterator<Item = usize>,
+    feeds: &[(usize, u32)],
+) -> Vec<usize> {
+    members
+        .into_iter()
+        .chain(feeds.iter().map(|&(slot, _)| slot))
         .collect()
 }
 
@@ -7614,6 +7926,13 @@ fn incremental_delta(
 /// Shared by the batched, fallback, and GPU paths so error/exit semantics
 /// stay identical. `stop_ids` overrides the reference path's newline-byte
 /// heuristic with the model's real eos set (GPU path).
+/// `cached_tokens = rows`, tracing the newly cached rows as prefix hits.
+#[cfg(any(feature = "hsa", feature = "cpu"))]
+fn set_cached(slot: &mut Slot, rows: usize) {
+    crate::obs::tick::trace_hit(rows.saturating_sub(slot.cached_tokens));
+    slot.cached_tokens = rows;
+}
+
 fn handle_produced_token(
     slot_opt: &mut Option<Slot>,
     arena: &Option<SharedKvState>,
@@ -7630,6 +7949,7 @@ fn handle_produced_token(
     if let Some(telemetry) = slot.telemetry.as_mut() {
         telemetry.token(slot.cached_tokens);
     }
+    crate::obs::tick::trace_token(slot.arrived, slot.step == 0);
     slot.out_ids.push(token);
     slot.executed += exec;
     slot.step += 1;
@@ -10114,6 +10434,32 @@ mod tests {
 
     #[cfg(any(feature = "hsa", feature = "cpu"))]
     #[test]
+    fn pf_hold_waits_for_rows_or_age_and_only_under_decode() {
+        use super::{amd_pf_hold, PfHold};
+        let spec = Some((8192u32, 400.0, 16usize));
+        let ones = |n: usize| std::iter::repeat((1024usize, false, 1.0f64)).take(n);
+        assert_eq!(amd_pf_hold(None, 128, ones(1)), PfHold::Off);
+        assert_eq!(amd_pf_hold(spec, 8, ones(1)), PfHold::Off);
+        assert_eq!(amd_pf_hold(spec, 128, ones(5)), PfHold::Held);
+        assert_eq!(amd_pf_hold(spec, 128, ones(6)), PfHold::Release(8192));
+        assert_eq!(
+            amd_pf_hold(spec, 128, [(1024, false, 10.0), (1024, false, 401.0)].into_iter()),
+            PfHold::Release(8192)
+        );
+        assert_eq!(amd_pf_hold(spec, 128, [(4096, false, 1.0)].into_iter()), PfHold::Held);
+        assert_eq!(
+            amd_pf_hold(spec, 128, [(4096, false, 1.0), (4096, false, 1.0)].into_iter()),
+            PfHold::Release(8192)
+        );
+        assert_eq!(
+            amd_pf_hold(spec, 128, [(1024, true, 1.0)].into_iter()),
+            PfHold::Release(8192)
+        );
+        assert_eq!(amd_pf_hold(spec, 128, std::iter::empty()), PfHold::Release(8192));
+    }
+
+    #[cfg(any(feature = "hsa", feature = "cpu"))]
+    #[test]
     fn amd_prefill_scheduler_controls_are_bounded() {
         assert_eq!(amd_prefill_tick_cap(false, false, 2048), u32::MAX);
         assert_eq!(amd_prefill_tick_cap(true, false, 0), u32::MAX);
@@ -10267,6 +10613,13 @@ mod tests {
             amd_packed_frontier_updates([2, 0, 3], |slot| (slot != 0).then_some(slot + 10)),
             Err(0)
         );
+    }
+
+    #[cfg(feature = "hsa")]
+    #[test]
+    fn a_failed_mixed_pack_terminates_its_decode_riders_too() {
+        assert_eq!(amd_failed_pack_slots([4, 5], &[(0, 7), (2, 9)]), [4, 5, 0, 2]);
+        assert_eq!(amd_failed_pack_slots([4, 5], &[]), [4, 5]);
     }
 
     #[cfg(any(feature = "cuda", feature = "hsa", feature = "cpu"))]

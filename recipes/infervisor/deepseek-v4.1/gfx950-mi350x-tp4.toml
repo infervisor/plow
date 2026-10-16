@@ -1,0 +1,42 @@
+# DeepSeek-V4.1-Flash on 4x MI350X — REFUSED.
+#
+# A refused recipe is a statement of support, not a build: "can plow serve this?" is answerable
+# from the catalog, and the answer carries the file:line that would have to change. The config
+# parses and validates (`DeepSeekV41Config`); `build_graph` refuses with the itemised gap list.
+# The packet design (layer-mode table, caches, op mapping, TP plan) is in
+# plans/glm53-flash-dsv41-mi350x.md §4 and plans/research/dsv41-arch-diff.md.
+#
+# It is publishable and appears in `plowrt show`, but is never selectable.
+
+schema = "plow.recipe.v1"
+namespace = "infervisor"
+name = "deepseek-v4.1"
+label = "gfx950-mi350x-tp4"
+network = "deepseek-v4.1"
+status = "refused"
+plow_git = "9f1ca46899b2f0297a022beb1046ba53f2976734"
+doc = "docs/amd/deepseek-v4-mi300x.md"
+
+refusal = "crates/nn-graph/src/models/config/deepseek_v41.rs:492 — deepseek_v41 graph emit is not implemented"
+
+# What would unblock it, beyond DeepSeek-V4's own gap list (docs/amd/deepseek-v4-mi300x.md §7):
+# the CED cross-layer KV / index-K / top-k sharing with the layer-20 candidate pool, ratio-1/2
+# compressors, FP4 compressed KV with e4m3 (RNE) scales per 16, block-32 fake-fp8 window KV and
+# attention output, single-pass mHC, fp8 block-32 projections, the engram tables (2 x ~384M rows
+# x 256, ~197 GB fp8) with their host-side n-gram hashing, and w4a8 experts. DSpark is optional.
+unblocked_by = "plans/glm53-flash-dsv41-mi350x.md §4 (packet design) — items 1-12"
+
+# TP4 is the vendor-recommended topology (two replicas per 8-GPU node, engram tables resident at
+# ~50 GB/rank); `o_groups = 8` caps clean head sharding at TP8.
+[target]
+vendor = "amd"
+isa = "gfx950"
+sku = "MI350X"
+units = 256
+num_gpus = 4
+parallel = "tp"
+
+[checkpoint]
+source = "hf:deepseek-ai/DeepSeek-V4.1-Flash"
+shards = 48
+layout = "native-mxfp4-fp8blk32"

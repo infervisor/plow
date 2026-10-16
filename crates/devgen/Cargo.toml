@@ -14,6 +14,7 @@ kernelcaps = { workspace = true }
 tunedb = { workspace = true }
 hwspec = { workspace = true }
 plow-asset = { workspace = true }
+nn-graph = { workspace = true }
 serde_json = "1"
 clap = { version = "4", features = ["derive", "env"] }
 tracing = "0.1"

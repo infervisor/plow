@@ -90,7 +90,7 @@ BODY({
     __shared__ __align__(16) float lds[8 * 256];
     d_kda_decode_fused_arm(y, xq, xk, xv, g_raw, beta_raw, state, wq, wk, wv, sq, sk, sv, a_log,
                            dt_bias, norm_w, og_raw, (uint64_t*)scratch, H, D, BV, W, flags,
-                           gate_mode, scale, lb, eps, blockIdx.x, nblk, lds, w_fb);
+                           gate_mode, scale, lb, eps, blockIdx.x, nblk, lds, w_fb, nullptr);
 })
 
 static uint16_t f2bf_h(float f) {

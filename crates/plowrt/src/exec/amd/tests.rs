@@ -264,7 +264,7 @@ fn grouped_moe_decode_pair_routes_with_exact_mxfp4_abi() {
         .map(|i| DeviceMem::view(0x1000 + i * 0x1000, 0x1000))
         .collect();
     let DecodeSegmentRoute::GroupedMoeMxfp4 { glu, down, grid } =
-        decode_segment_routes(&prog, &[], &[], &devp).unwrap()[0]
+        decode_segment_routes(&prog, &[], &[], &devp, 0).unwrap()[0]
     else {
         panic!("grouped MoE pair did not take standalone route")
     };
@@ -1025,7 +1025,7 @@ fn decode_mla_pair_routes_as_one_specialist_segment() {
         ]
     );
     assert!(matches!(
-        decode_segment_routes(&p, &[], &[], &[]).unwrap()[1],
+        decode_segment_routes(&p, &[], &[], &[], 0).unwrap()[1],
         DecodeSegmentRoute::MlaAttention
     ));
 }
@@ -1059,7 +1059,7 @@ fn mixed_decode_mla_ops_remain_on_the_ordinary_interpreter() {
         [DecodeSegmentKind::Interpreter]
     );
     assert!(!requires_segmented_decode(
-        &decode_segment_routes(&p, &[], &[], &[]).unwrap()
+        &decode_segment_routes(&p, &[], &[], &[], 0).unwrap()
     ));
 }
 
@@ -1082,7 +1082,7 @@ fn fused_decode_rejects_one_raw_instruction_in_multiple_segments() {
 fn fused_decode_v1_descriptor_fails_closed() {
     let mut p = segmented_decode_probe();
     p.insts[1].i[7] = 1;
-    let err = decode_segment_routes(&p, &[], &[], &[])
+    let err = decode_segment_routes(&p, &[], &[], &[], 0)
         .expect_err("KDA fused ABI v1 must not route to the v2 object")
         .to_string();
     assert!(err.contains("version=1"), "{err}");
@@ -1116,7 +1116,7 @@ fn fused_decode_descriptor_builds_the_exact_raw_kernarg() {
     let devp: Vec<DeviceMem> = (0..18)
         .map(|i| DeviceMem::view(0x1000 + i * 0x1000, 1 << 20))
         .collect();
-    let routes = decode_segment_routes(&p, &tensors, &init, &devp).unwrap();
+    let routes = decode_segment_routes(&p, &tensors, &init, &devp, 0).unwrap();
     let DecodeSegmentRoute::KdaDecodeFused(a) = routes[1] else {
         panic!("segment 1 must route to the raw object")
     };
@@ -2225,6 +2225,11 @@ fn cached_kda_intra_route_requires_a_pure_bt64_d128_segment() {
         routes[1],
         PrefillSegmentRoute::KdaChunkIntraWaveItems { grid: 256, .. }
     ));
+    rebase_kda_key_factor_routes(&mut routes, 600);
+    assert!(matches!(
+        routes[1],
+        PrefillSegmentRoute::KdaChunkIntraWaveItems { args, .. } if args.t == 600
+    ));
 
     prog.insts[1].i[2] = 64;
     let fallback = moe_mxfp4_routes(&prog, &tensors, &devp).unwrap();
@@ -2679,7 +2684,10 @@ fn nope_mla_prefill_routes_to_four_waves_and_is_gated_at_load() {
         let mut prog = segmented_prog(&[op], &[0]);
         prog.insts[0].i[3] = 0x8000_0040;
         prog.insts[0].t[7] = packet::dev::TENSOR_NONE16;
-        assert!(!packed_mla_compatible(&prog, false));
+        // bf16 NoPE packs on the packed V2 flash object's NoPE arm (marker-gated at load).
+        assert_eq!(packed_mla_compatible(&prog, false), op == DevOp::FlashMlaPrefill);
+        assert_eq!(packed_mla_nope(&prog), op == DevOp::FlashMlaPrefill);
+        assert!(!token_batch_body_compatible(&prog, false));
         assert_eq!(
             derive_segments_for(&prog, true).unwrap(),
             [4],
@@ -6382,6 +6390,27 @@ fn token_batch_seam_norms_stay_on_the_primary_object() {
         derive_packed_plain_segments(&plain_prog).unwrap(),
         [false; 4]
     );
+    // A GLM-5.3 packed sibling's TP8 seam norm runs on a 1024-row band of the 8192 rung; its
+    // band-local rows are not packed rows, so it leaves the packed-norm object and its segment
+    // carries no span table or parked mask.
+    let sibling = ProgramRole::PackedSibling { of_rows: 8192 };
+    let sibling_prog = prog(
+        sibling,
+        vec![
+            inst(DevOp::RmsNorm, 8192),
+            inst(DevOp::RmsNorm, 1024),
+            inst(DevOp::FlashMlaPrefillFp8, 8192),
+        ],
+        &[0, 1, 2],
+    );
+    assert_eq!(
+        derive_packed_segment_families(&sibling_prog).unwrap(),
+        [5, 0, 6]
+    );
+    assert_eq!(
+        derive_packed_plain_segments(&sibling_prog).unwrap(),
+        [false, true, false]
+    );
 }
 
 #[test]
@@ -6505,4 +6534,23 @@ fn rowband_twins_are_the_full_width_declarations_only() {
         .map(|(td, _)| td.bytes)
         .sum();
     assert_eq!(skipped, 800 + 400 + 240);
+}
+
+#[test]
+fn kda_carry_split_plan_keeps_segments_chunk_aligned_and_nonempty() {
+    assert_eq!(kda_carry_split_plan(8192, 0), None);
+    assert_eq!(kda_carry_split_plan(8192, 1), None);
+    assert_eq!(kda_carry_split_plan(2047, 4), None);
+    assert_eq!(kda_carry_split_plan(2048, 8), Some((2, 1024)));
+    assert_eq!(kda_carry_split_plan(8192, 2), Some((2, 4096)));
+    assert_eq!(kda_carry_split_plan(8192, 3), Some((3, 2752)));
+    for t in (2048..20000).step_by(37) {
+        for max in 2..10 {
+            let Some((nseg, seg)) = kda_carry_split_plan(t, max) else {
+                continue;
+            };
+            assert!(seg % 64 == 0 && nseg >= 2 && nseg <= max);
+            assert!((nseg - 1) * seg < t && nseg * seg >= t, "t={t} max={max}");
+        }
+    }
 }

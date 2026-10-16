@@ -282,26 +282,75 @@ __device__ void d_dsa_pool_expand(int32_t* __restrict__ out, const int32_t* __re
                                   unsigned n_groups, unsigned pool_size, unsigned slice, unsigned nblk) {
     const unsigned topk = n_groups * pool_size;
     const unsigned out_cols = topk + pool_size - 1;
-    const unsigned total = rows * out_cols;
     const int q_pos0 = (int)kv_len[0] - (int)rows;
-    for (unsigned idx = slice * PLOW_THREADS + threadIdx.x; idx < total; idx += nblk * PLOW_THREADS) {
-        const unsigned row = idx / out_cols;
-        const unsigned col = idx % out_cols;
+    /* Row-major walk: the per-row geometry is computed once per row, not per element. */
+    for (unsigned row = slice; row < rows; row += nblk) {
         const int seq_len = q_pos0 + (int)row + 1;
         const int pool_len = seq_len / (int)pool_size;
         const int tail_start = pool_len * (int)pool_size;
         const int tail_count = seq_len - tail_start;
-        int result;
-        if (col < topk) {
-            const unsigned g = col / pool_size;
-            const unsigned o = col % pool_size;
-            const int pid = pool_ids[(size_t)row * n_groups + g];
-            result = (pid >= 0) ? (pid * (int)pool_size + (int)o) : -1;
-        } else {
-            const int tail_off = (int)col - (int)topk;
-            result = (tail_off < tail_count) ? (tail_start + tail_off) : -1;
+        const int32_t* const pr = pool_ids + (size_t)row * n_groups;
+        int32_t* const orow = out + (size_t)row * out_cols;
+        for (unsigned col = threadIdx.x; col < out_cols; col += PLOW_THREADS) {
+            int result;
+            if (col < topk) {
+                const int pid = pr[col / pool_size];
+                result = (pid >= 0) ? (pid * (int)pool_size + (int)(col % pool_size)) : -1;
+            } else {
+                const int tail_off = (int)col - (int)topk;
+                result = (tail_off < tail_count) ? (tail_start + tail_off) : -1;
+            }
+            orow[col] = result;
         }
-        out[idx] = result;
+    }
+}
+
+/* op 124, i3 = 2 (PLOW_GLM_ROWSPLIT_ATTN on the pooled chain): this rank's band rows
+ * [band0, band0 + band) as one-query gather tables for plow_mla_pf_gather, whose 8-query pack is
+ * then one query's 64 heads as eight 8-head groups. Per local row l: count = out_cols, then
+ * [cap] positions (-1 -> row 0) and [cap] membership words (0xFF selected, 0 not), the
+ * IndexUnionPf layout. Same expansion as d_dsa_pool_expand. */
+__device__ void d_dsa_pool_expand_table(unsigned char* __restrict__ uni,
+                                        const int32_t* __restrict__ pool_ids,
+                                        const int32_t* __restrict__ kv_len, unsigned rows,
+                                        unsigned n_groups, unsigned pool_size, unsigned band0,
+                                        unsigned band, unsigned cap, unsigned slice,
+                                        unsigned nblk) {
+    const unsigned topk = n_groups * pool_size;
+    const unsigned out_cols = topk + pool_size - 1;
+    const unsigned walk = (out_cols + 63u) / 64u * 64u;
+    const unsigned hdr = (band * 4u + 255u) / 256u * 256u;
+    const int q_pos0 = (int)kv_len[0] - (int)rows;
+    for (unsigned l = slice; l < band; l += nblk) {
+        const unsigned row = band0 + l;
+        unsigned* const pos = (unsigned*)(uni + hdr + (size_t)l * cap * 12u);
+        unsigned* const msk = pos + cap;
+        /* A band row past the chunk attends token 0 alone: finite padding, never read. */
+        if (threadIdx.x == 0) ((unsigned*)uni)[l] = row < rows ? out_cols : 1u;
+        if (row >= rows) {
+            if (threadIdx.x < 64u) {
+                pos[threadIdx.x] = 0u;
+                msk[threadIdx.x] = threadIdx.x == 0u ? 0xFFu : 0u;
+            }
+            continue;
+        }
+        const int seq_len = q_pos0 + (int)row + 1;
+        const int pool_len = seq_len / (int)pool_size;
+        const int tail_start = pool_len * (int)pool_size;
+        const int tail_count = seq_len - tail_start;
+        const int32_t* const pr = pool_ids + (size_t)row * n_groups;
+        for (unsigned col = threadIdx.x; col < walk; col += PLOW_THREADS) {
+            int v = -1;
+            if (col < topk) {
+                const int pid = pr[col / pool_size];
+                v = (pid >= 0) ? (pid * (int)pool_size + (int)(col % pool_size)) : -1;
+            } else if (col < out_cols) {
+                const int tail_off = (int)col - (int)topk;
+                v = (tail_off < tail_count) ? (tail_start + tail_off) : -1;
+            }
+            pos[col] = v >= 0 ? (unsigned)v : 0u;
+            msk[col] = v >= 0 ? 0xFFu : 0u;
+        }
     }
 }
 
@@ -359,6 +408,69 @@ __device__ void d_dsa_q_quant(uint8_t* __restrict__ q_fp8, float* __restrict__ q
                 quant_fp8(PLOW_QUANT_SCALE_DIV(x, scale, inv_scale));
             if (d == 0) q_scale[row] = scale;
         }
+    }
+}
+
+/* Decode pool expand for ONE row, COMPACT: the min(pools, n_groups) selected pools (the per-row
+ * radix pads -1 at the end) expand first, the incomplete-pool tail follows them, -1 after — so
+ * the gather's first min(width, kv_len) slots hold every selected token. Threads [t0, ..) step. */
+__device__ __forceinline__ void dsa_pool_expand_row(int32_t* __restrict__ out,
+                                                    const int32_t* __restrict__ pid, int len,
+                                                    unsigned ng, unsigned ps, unsigned t0,
+                                                    unsigned step) {
+    const unsigned cols = ng * ps + ps - 1u;
+    const int npool = len / (int)ps;
+    const int nv = npool < (int)ng ? npool : (int)ng;
+    const int tail0 = npool * (int)ps, ntail = len - tail0;
+    for (unsigned c = t0; c < cols; c += step) {
+        const int ci = (int)c;
+        int v = -1;
+        if (ci < nv * (int)ps) {
+            const int p = pid[ci / (int)ps];
+            v = p >= 0 ? p * (int)ps + ci % (int)ps : -1;
+        } else if (ci - nv * (int)ps < ntail) {
+            v = tail0 + (ci - nv * (int)ps);
+        }
+        out[c] = v;
+    }
+}
+
+/* op 126, one WAVE per row (PLOW_DSA_QQUANT_WAVE): lane l holds dims l and l+64, so the six
+ * strides below 64 are lane shuffles and stride 64 is in-lane — no LDS, no block barriers, eight
+ * rows per workgroup in flight. Each butterfly output is the same a+b / a-b of the same operands as
+ * dsa_hadamard128_stage, and the absmax is a max: bit-identical to d_dsa_q_quant at head_dim 128. */
+__device__ void d_dsa_q_quant_wave(uint8_t* __restrict__ q_fp8, float* __restrict__ q_scale,
+                                   const bf16* __restrict__ q_raw, unsigned n_rows, unsigned slice,
+                                   unsigned nblk) {
+    const unsigned lane = threadIdx.x & 63u, wave = threadIdx.x >> 6;
+    constexpr unsigned NW = PLOW_THREADS / 64u;
+    for (unsigned row = slice * NW + wave; row < n_rows; row += nblk * NW) {
+        float x0 = bf2f(q_raw[(size_t)row * 128u + lane]);
+        float x1 = bf2f(q_raw[(size_t)row * 128u + 64u + lane]);
+#pragma unroll
+        for (unsigned s = 1u; s < 64u; s <<= 1) {
+            const float p0 = __shfl_xor(x0, (int)s, 64);
+            const float p1 = __shfl_xor(x1, (int)s, 64);
+            x0 = (lane & s) ? (p0 - x0) : (x0 + p0);
+            x1 = (lane & s) ? (p1 - x1) : (x1 + p1);
+        }
+        {
+            const float a = x0, b = x1;
+            x0 = a + b;
+            x1 = a - b;
+        }
+        x0 = bf2f(f2bf(x0 * 0.08838834764831845f));
+        x1 = bf2f(f2bf(x1 * 0.08838834764831845f));
+        float ax = fmaxf(fabsf(x0), fabsf(x1));
+#pragma unroll
+        for (int off = 32; off > 0; off >>= 1) ax = fmaxf(ax, __shfl_xor(ax, off, 64));
+        const float absmax = fmaxf(ax, 1e-4f);
+        float scale, inv_scale;
+        plow_round_scale(absmax, PLOW_FP8_E4M3_MAX, &scale, &inv_scale);
+        q_fp8[(size_t)row * 128u + lane] = quant_fp8(PLOW_QUANT_SCALE_DIV(x0, scale, inv_scale));
+        q_fp8[(size_t)row * 128u + 64u + lane] =
+            quant_fp8(PLOW_QUANT_SCALE_DIV(x1, scale, inv_scale));
+        if (lane == 0u) q_scale[row] = scale;
     }
 }
 

@@ -3,6 +3,7 @@
 
 #[cfg(feature = "hf-tokenizer")]
 mod detok;
+pub mod engram;
 pub mod guided;
 pub mod logprobs;
 pub mod rules;

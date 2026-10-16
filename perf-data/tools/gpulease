@@ -257,9 +257,10 @@ release_all() {
   for fd in $(seq $FD_BASE $((FD - 1))); do eval "exec $fd>&-" 2>/dev/null; done
   GOT=""; NGOT=0; FD=$FD_BASE
 }
-# NVIDIA cards hosting a process that bypassed the lease; a partial lease skips them.
+# Cards hosting a process that bypassed the lease; a partial lease skips them. On AMD
+# foreign() already intersects amd-smi's pid list with the per-card VRAM signal (busy_gpus).
 tenant_cards() {
-  [ "$VENDOR" = nvidia ] && [ "$WANT" -lt "$NGPU" ] || return 0
+  [ "$VENDOR" != none ] && [ "$WANT" -lt "$NGPU" ] || return 0
   foreign | sed -n 's/^gpu\([0-9]*\):.*/\1/p' | sort -u | tr '\n' ' '
 }
 try_acquire() {

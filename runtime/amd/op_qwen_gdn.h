@@ -303,7 +303,7 @@ __device__ void d_qwen_headnorm_rope_t(bf16* out, const bf16* in, const bf16* ga
                                        const int* active, unsigned heads, unsigned dim,
                                        unsigned rotary, unsigned batch, unsigned context,
                                        unsigned normalize, float eps, float offset, unsigned slice,
-                                       unsigned nblk, unsigned prefill) {
+                                       unsigned nblk, unsigned prefill, unsigned nope = 0) {
     const unsigned lane = threadIdx.x & (PLOW_WAVE - 1u), wave = threadIdx.x >> 6;
     const unsigned waves = blockDim.x >> 6;
     for (unsigned row = slice * waves + wave; row < batch * heads; row += nblk * waves) {
@@ -329,16 +329,30 @@ __device__ void d_qwen_headnorm_rope_t(bf16* out, const bf16* in, const bf16* ga
             }
         }
         if (rotary) {
-            const unsigned half = rotary >> 1;
-            /* Unconditional: a shuffle under divergence leaves the inactive lanes' contribution
-             * undefined, so every lane exchanges and only the rotary section applies the result. */
-            const float partner = __shfl_xor(x[0], half, PLOW_WAVE);
-            if (lane < rotary) {
-                /* vLLM stores its Qwen rotary cache in the model BF16 dtype; the round is load
-                 * bearing — the tables are f32 in HBM and the reference reads them as bf16. */
-                const float c = bf2f(f2bf(cos[(size_t)pos * half + (lane & (half - 1u))]));
-                const float s = bf2f(f2bf(sin[(size_t)pos * half + (lane & (half - 1u))]));
-                x[0] = lane < half ? x[0] * c - partner * s : x[0] * c + partner * s;
+            const unsigned rotary_dim = rotary & 0x7FFFFFFFu;
+            const bool interleaved = (rotary & 0x80000000u) != 0;
+            const unsigned half = rotary_dim >> 1;
+            const unsigned j_rot = nope / PLOW_WAVE;
+            if (interleaved) {
+                const float partner = __shfl_xor(x[j_rot], 1, PLOW_WAVE);
+                if (lane < rotary_dim) {
+                    const unsigned pair_idx = lane >> 1;
+                    const float c = cos[(size_t)pos * half + pair_idx];
+                    const float s = sin[(size_t)pos * half + pair_idx];
+                    const float ps = partner * s;
+                    x[j_rot] = __builtin_fmaf(x[j_rot], c, (lane & 1u) == 0u ? -ps : ps);
+                }
+            } else {
+                /* Unconditional: a shuffle under divergence leaves the inactive lanes' contribution
+                 * undefined, so every lane exchanges and only the rotary section applies the result. */
+                const float partner = __shfl_xor(x[j_rot], half, PLOW_WAVE);
+                if (lane < rotary_dim) {
+                    /* vLLM stores its Qwen rotary cache in the model BF16 dtype; the round is load
+                     * bearing — the tables are f32 in HBM and the reference reads them as bf16. */
+                    const float c = bf2f(f2bf(cos[(size_t)pos * half + (lane & (half - 1u))]));
+                    const float s = bf2f(f2bf(sin[(size_t)pos * half + (lane & (half - 1u))]));
+                    x[j_rot] = lane < half ? x[j_rot] * c - partner * s : x[j_rot] * c + partner * s;
+                }
             }
         }
         const size_t dest = context
@@ -355,21 +369,23 @@ __device__ void d_qwen_headnorm_rope(bf16* out, const bf16* in, const bf16* gamm
                                      const int* active, unsigned heads, unsigned dim,
                                      unsigned rotary, unsigned batch, unsigned context,
                                      unsigned normalize, float eps, float offset, unsigned slice,
-                                     unsigned nblk, unsigned prefill) {
-    /* `rotary <= PLOW_WAVE` keeps the rotated section inside register 0, which is what makes the
-     * partner a single `lane ^ (rotary/2)` shuffle. Qwen3.5 uses rotary = 64 on a 256-wide head. */
-    if ((dim % PLOW_WAVE) || (rotary && (rotary > PLOW_WAVE || (rotary & (rotary - 1u))))) {
+                                     unsigned nblk, unsigned prefill, unsigned nope = 0) {
+    const unsigned rotary_dim = rotary & 0x7FFFFFFFu;
+    if ((dim % PLOW_WAVE) || (rotary_dim && (rotary_dim > PLOW_WAVE || (rotary_dim & (rotary_dim - 1u)))) ||
+        (nope % PLOW_WAVE) || (nope + rotary_dim > dim)) {
         if (threadIdx.x == 0) __builtin_trap();
         return;
     }
 #define PLOW_QWEN_HNR_CALL(PL_)                                                                    \
     d_qwen_headnorm_rope_t<PL_>(out, in, gamma, cos, sin, positions, active, heads, dim, rotary,   \
-                                batch, context, normalize, eps, offset, slice, nblk, prefill)
+                                batch, context, normalize, eps, offset, slice, nblk, prefill, nope)
     switch (dim) {
         case 64: PLOW_QWEN_HNR_CALL(1); break;
         case 128: PLOW_QWEN_HNR_CALL(2); break;
         case 192: PLOW_QWEN_HNR_CALL(3); break;
         case 256: PLOW_QWEN_HNR_CALL(4); break;
+        case 384: PLOW_QWEN_HNR_CALL(6); break;
+        case 512: PLOW_QWEN_HNR_CALL(8); break;
         default:
             if (threadIdx.x == 0) __builtin_trap();
             return;

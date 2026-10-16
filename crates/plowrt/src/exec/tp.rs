@@ -184,10 +184,20 @@ pub struct PeerLayout {
 pub const PARTIAL_SLOTS: u64 = 3;
 
 impl PeerLayout {
-    /// `PLOW_XR_TAG_SLOT_BYTES` (dev_isa.h): bytes per tagged one-shot slot.
+    /// `PLOW_XR_TAG_SLOT_BYTES_DEFAULT` (dev_isa.h): bytes per tagged one-shot slot.
     pub const XR_TAG_SLOT: u64 = 20480;
-    /// Widest `[1, hidden]` message the slot holds at three bf16 per 8-byte word.
+    /// Widest `[1, hidden]` message the default slot holds at three bf16 per 8-byte word.
     pub const XR_TAG_MAX_WIDTH: u32 = (Self::XR_TAG_SLOT / 8 * 3) as u32;
+
+    /// The served slot (`PLOW_XR_TAG_SLOT`, default [`Self::XR_TAG_SLOT`]).
+    pub fn xr_tag_slot_cfg() -> u64 {
+        crate::config::RuntimeConfig::get().amd.xr_tag_slot as u64
+    }
+
+    /// Widest message the served slot holds.
+    pub fn xr_tag_max_width_cfg() -> u32 {
+        (Self::xr_tag_slot_cfg() / 8 * 3) as u32
+    }
 
     /// Cross-GPU counters a program needs: **one gate per one-shot `XReduce`
     /// (decode), two per `XReduceTwoShot` (prefill — the reduce-scatter and
@@ -251,7 +261,7 @@ impl PeerLayout {
         // device derives it from the packet's status id and `PLOW_XR_TAG_SLOT_BYTES`, so the
         // slot is a constant here too — and the per-token zeroing covers it in one pass.
         let xr_tag_off = xstatus_off + XCTR_STRIDE as u64;
-        let xr_tag_slot = Self::XR_TAG_SLOT;
+        let xr_tag_slot = Self::xr_tag_slot_cfg();
         let total = xr_tag_off + 4 * xr_tag_slot;
         Some(PeerLayout {
             hidden,
@@ -623,13 +633,20 @@ impl TpGroup {
     /// [`TpGroup::launch_token`] is the only sanctioned way to get the order
     /// right.
     pub fn zero_xctr(&self) -> Result<()> {
+        // Every rank's copy is in flight before the first wait: the per-rank submit+completion
+        // round trip (~17 us) was paid n_gpu times in series on every token.
         for r in &self.ranks {
             r.backend
                 .peer()
                 .ok_or_else(|| {
                     RuntimeError::Device(format!("rank {} lost its peer facility", r.rank))
                 })?
-                .zero_peer(r.xctr, self.layout.xstate_bytes())?;
+                .zero_peer_submit(r.xctr, self.layout.xstate_bytes())?;
+        }
+        for r in &self.ranks {
+            if let Some(p) = r.backend.peer() {
+                p.zero_peer_wait()?;
+            }
         }
         Ok(())
     }

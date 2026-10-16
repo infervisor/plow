@@ -446,6 +446,9 @@ pub struct Builder {
     lean_moe_stage1_segments: bool,
     /// Isolate fixed-order f32 grouped-MoE prefill combines.
     lean_moe_combine_segments: bool,
+    /// Isolate block-fp8 W8A16 grouped-MoE prefill GLU / down packets for the dedicated gfx950
+    /// object (`moe_fp8_pf_gfx950.elf`).
+    lean_moe_fp8_segments: bool,
     /// Rewrite eligible replicated-input grouped-MoE prefill boundaries to whole-expert/full-I.
     moe_prefill_ep_degree: Option<u32>,
     /// Isolate BT64/D128 chunk-KDA intra packets and mark them for the wave-item object.
@@ -459,6 +462,7 @@ pub struct Builder {
     lean_kda_key_factor_segments: bool,
     /// Isolate adjacent FlashMlaDecode+MlaMergeFold pairs for a gfx950 object.
     decode_mla_segments: bool,
+    decode_mla_kvw_segments: bool,
     decode_mla_bf16_segments: bool,
     /// Isolate adjacent grouped decode GLU+DOWN pairs for ordered raw launches.
     decode_grouped_moe_segments: bool,
@@ -473,6 +477,12 @@ pub struct Builder {
     /// Slices per machine-filling decode GEMV, as a multiple of `n_cu`. 1 (default) ⇒
     /// byte-identical. See [`Builder::set_gemv_split`].
     gemv_split: u32,
+    /// Largest split-K factor for a `GemmSmall` (0/1 = off). See [`Builder::set_gemm_small_splitk`].
+    gemm_small_splitk: u32,
+    /// Split-K as two packets (partials, then a gated reduce). See [`Builder::set_gemm_small_splitk_2p`].
+    gemm_small_splitk_2p: bool,
+    /// See [`Builder::set_gemm_small_group_s`].
+    gemm_small_group_s: u32,
     /// Re-declaring a tensor name returns the existing handle instead of appending.
     /// `false` (default) ⇒ byte-identical. See [`Builder::set_tensor_dedup`].
     tensor_dedup: bool,
@@ -584,6 +594,54 @@ fn lean_moe_stage1_inst(inst: &DevInst) -> bool {
         && inst.i[6] == 0
         && inst.i[7] == 0
         && inst.t[..8].iter().all(|&t| t != TENSOR_NONE)
+}
+
+/// Block-fp8 (i3 = 1) grouped GLU the dedicated object owns: dense TP layout (no EP, no
+/// preshuffle), I and H multiples of 128, bf16 activations (i7 = 0, t6/t7 absent) or 1x128 fp8
+/// activations (i7 = 2: t6 = input scales at pitch i4, t7 = output scales).
+pub fn lean_moe_fp8_glu_inst(d: &DevInst) -> bool {
+    d.op == DevOp::MoeGroupGluPf as u16
+        && d.i[0] != 0
+        && d.i[0].is_multiple_of(128)
+        && d.i[1] != 0
+        && d.i[1].is_multiple_of(128)
+        && d.i[2] != 0
+        && d.i[2] <= 512
+        && d.i[3] == 1
+        && d.i[6] == 0
+        && d.t[..6].iter().all(|&t| t != TENSOR_NONE)
+        && match d.i[7] {
+            0 => d.i[4] == 0 && d.t[6] == TENSOR_NONE && d.t[7] == TENSOR_NONE,
+            2 => d.i[4] != 0 && d.t[6] != TENSOR_NONE && d.t[7] != TENSOR_NONE,
+            _ => false,
+        }
+}
+
+/// The f32-scatter down twin: H % 256 == 0, I % 128 == 0 and I >= 256; i7 = 0 (bf16 A) or 2
+/// (fp8 A with its 1x128 scales in t5). i7 = 3 is the W8A8 arm with the weighted combine fused
+/// (PLOW_MOE_FP8_PF_ACC): t0 is the bf16 [T][H] output, i4 = routing slots per token. Only the
+/// dedicated object has that arm.
+pub fn lean_moe_fp8_down_inst(d: &DevInst) -> bool {
+    d.op == DevOp::MoeGroupDownPf as u16
+        && d.i[0] != 0
+        && d.i[0].is_multiple_of(256)
+        && d.i[1] >= 256
+        && d.i[1].is_multiple_of(128)
+        && d.i[2] != 0
+        && d.i[2] <= 512
+        && d.i[3] == 1
+        && (d.i[4] == 0 || d.i[7] == 3)
+        && d.i[5] == 0
+        && d.i[6] == 0
+        && d.t[..5].iter().all(|&t| t != TENSOR_NONE)
+        && match d.i[7] {
+            0 => d.t[5] == TENSOR_NONE,
+            2 => d.t[5] != TENSOR_NONE,
+            3 => d.t[5] != TENSOR_NONE && d.i[4] != 0,
+            _ => false,
+        }
+        && d.t[6] != TENSOR_NONE
+        && d.t[7] != TENSOR_NONE
 }
 
 fn lean_moe_combine_inst(inst: &DevInst) -> bool {
@@ -706,6 +764,7 @@ impl Builder {
             lean_moe_stage2_segments: false,
             lean_moe_stage1_segments: false,
             lean_moe_combine_segments: false,
+            lean_moe_fp8_segments: false,
             moe_prefill_ep_degree: None,
             kda_intra_wave_items_segments: false,
             kda_carry_regstate_segments: false,
@@ -713,6 +772,7 @@ impl Builder {
             kda_carry_keyfeed_segments: false,
             lean_kda_key_factor_segments: false,
             decode_mla_segments: false,
+            decode_mla_kvw_segments: false,
             decode_mla_bf16_segments: false,
             decode_grouped_moe_segments: false,
             xreduce_wave_rs_segments: false,
@@ -720,6 +780,9 @@ impl Builder {
             attn_res_f32mix_segments: false,
             native_gemma4_glu_segments: false,
             gemv_split: 1,
+            gemm_small_splitk: 0,
+            gemm_small_splitk_2p: false,
+            gemm_small_group_s: 0,
             tensor_dedup: false,
             cu_cap: None,
             tr_dropped: 0,
@@ -879,6 +942,14 @@ impl Builder {
         self.lean_moe_combine_segments = enabled;
     }
 
+    pub fn set_lean_moe_fp8_segments(&mut self, enabled: bool) {
+        self.lean_moe_fp8_segments = enabled;
+    }
+
+    pub fn lean_moe_fp8_segments(&self) -> bool {
+        self.lean_moe_fp8_segments
+    }
+
     /// Enable the model-independent replicated-input expert-parallel rewrite.
     ///
     /// Eligibility is proven from the emitted graph: an MXFP4 align/GLU/down/combine chain
@@ -919,6 +990,12 @@ impl Builder {
         self.decode_mla_segments = enabled;
     }
 
+    /// With decode-MLA segments: a HeadNormRope directly before a FlashMlaDecode+MlaMergeFold
+    /// pair (the latent KV writer) joins that pair's segment.
+    pub fn set_decode_mla_kvw_segments(&mut self, enabled: bool) {
+        self.decode_mla_kvw_segments = enabled;
+    }
+
     pub fn set_decode_grouped_moe_segments(&mut self, enabled: bool) {
         self.decode_grouped_moe_segments = enabled;
     }
@@ -941,6 +1018,163 @@ impl Builder {
     /// See `PLOW_GEMV_SPLIT` in `devgen` for the knob and the measurement.
     pub fn set_gemv_split(&mut self, s: u32) {
         self.gemv_split = s.clamp(1, 16);
+    }
+
+    /// Split-K for the plain bf16 `GemmSmall` (64x128 tile) packets emitted after this call:
+    /// a packet whose tile count leaves most of its workgroups idle gets `i6 = S` (the largest
+    /// power of two <= `max_s` with `tiles * S <= workgroups` and `K % (S * 128) == 0`), an fp32
+    /// partial workspace in `t5` and a per-tile counter row in `t6` (interp.hip
+    /// `d_gemm_small_splitk`). NOT bit-identical: S partial sums are added in slice order.
+    /// 0/1 = off, byte-identical.
+    pub fn set_gemm_small_splitk(&mut self, max_s: u32) {
+        self.gemm_small_splitk = max_s.min(16);
+    }
+
+    /// Split-K `GemmSmall` as TWO packets: the tile items write fp32 partials (`i7 = 1`, no
+    /// counter), then a second `GemmSmall` gated on the first sums them in slice order over all
+    /// its workgroups (`i7 = 2`). Same values as the one-packet form, whose per-item agent-scope
+    /// acq_rel counter costs a cache-wide L2 writeback + invalidate. `false` = one packet.
+    pub fn set_gemm_small_splitk_2p(&mut self, on: bool) {
+        self.gemm_small_splitk_2p = on;
+    }
+
+    fn apply_gemm_small_splitk(&mut self, op: DevOp, slices: usize, inst: &mut DevInst) {
+        if self.gemm_small_splitk < 2
+            || op != DevOp::GemmSmall
+            || inst.t[3] != TENSOR_NONE
+            || inst.t[5] != TENSOR_NONE
+            || inst.t[6] != TENSOR_NONE
+            || inst.i[4] != 0
+            || inst.i[5] != 0
+            || inst.i[6] != 0
+            || inst.i[7] != 0
+        {
+            return;
+        }
+        let (m, n, k) = (inst.i[0], inst.i[1], inst.i[2]);
+        let tiles = m.div_ceil(64) * n.div_ceil(128);
+        let mut s = 1u32;
+        while s * 2 <= self.gemm_small_splitk
+            && tiles * s * 2 <= slices as u32
+            && k % (s * 2 * 128) == 0
+        {
+            s *= 2;
+        }
+        if s < 2 {
+            return;
+        }
+        let id = self.ops.len();
+        let part = self.tensor(
+            &format!("act.splitk.{id}.m{m}n{n}s{s}.part"),
+            u64::from(s) * u64::from(m) * u64::from(n) * 4,
+        );
+        let ctr = self.tensor(&format!("act.splitk.{id}.m{m}n{n}s{s}.ctr"), u64::from(tiles) * 4);
+        inst.t[5] = part;
+        inst.t[6] = ctr;
+        inst.i[6] = s;
+        if self.gemm_small_splitk_2p {
+            inst.i[7] = 1;
+        }
+    }
+
+    /// PLOW_GLM_KDA_PROJ_GROUP: emit the bf16 `GemmSmall` projections `segs` = `(C, A, B, N, K)`
+    /// over `m` rows as ONE partials packet (`i7 = 3`) plus, when any is split, ONE reduce packet
+    /// (`i7 = 4`), instead of a packet pair each. Each segment keeps the split factor
+    /// [`Builder::set_gemm_small_splitk`] would give its own packet (interp.hip
+    /// `exec_gemm_small_group`), so the outputs are bit-identical. `t7` is a u32 descriptor
+    /// `[nseg, {C, A, B, N, K, S, part} x nseg]`; `t0..t2` / `i0..i2` repeat segment 0. `None`
+    /// when a segment would split but the two-packet form is off.
+    /// Split factor override for [`Builder::emit_gemm_small_group`] (0 = each segment's own
+    /// split-K factor, bit-identical).
+    pub fn set_gemm_small_group_s(&mut self, s: u32) {
+        self.gemm_small_group_s = s;
+    }
+
+    /// Whether [`Builder::emit_gemm_small_group`] can emit: split-K off, or its two-packet form.
+    pub fn gemm_small_group_ok(&self) -> bool {
+        self.gemm_small_splitk < 2 || self.gemm_small_splitk_2p
+    }
+
+    pub fn emit_gemm_small_group(
+        &mut self,
+        m: u32,
+        segs: &[(u32, u32, u32, u32, u32)],
+        deps: &[u32],
+    ) -> Option<u32> {
+        assert!(!segs.is_empty() && segs.len() <= 8);
+        let slices = self.n_cu;
+        let split = |max_s: u32, n: u32, k: u32| {
+            let tiles = m.div_ceil(64) * n.div_ceil(128);
+            let mut s = 1u32;
+            while max_s >= 2 && s * 2 <= max_s && tiles * s * 2 <= slices && k % (s * 2 * 128) == 0
+            {
+                s *= 2;
+            }
+            s
+        };
+        // `group_s` (PLOW_GLM_KDA_PROJ_GROUP_S): every segment splits by the largest power of two
+        // <= it that divides K into 128-wide slices, whatever its tile count. The group already
+        // fills the grid, so fewer, longer slices cut the fp32 partial traffic. NOT
+        // bit-identical to the per-projection split.
+        let gs = self.gemm_small_group_s;
+        let ss: Vec<u32> = segs
+            .iter()
+            .map(|&(_, _, _, n, k)| {
+                if gs >= 1 {
+                    let mut s = 1u32;
+                    while s * 2 <= gs.min(16) && k % (s * 2 * 128) == 0 {
+                        s *= 2;
+                    }
+                    s
+                } else {
+                    split(self.gemm_small_splitk, n, k)
+                }
+            })
+            .collect();
+        let any_split = ss.iter().any(|&s| s > 1);
+        if any_split && !self.gemm_small_splitk_2p {
+            return None;
+        }
+        let id = self.ops.len();
+        let mut words = vec![segs.len() as u32];
+        for (g, (&(c, a, w, n, k), &s)) in segs.iter().zip(&ss).enumerate() {
+            let part = if s > 1 {
+                self.tensor(
+                    &format!("act.splitk.{id}.g{g}.m{m}n{n}k{k}s{s}.part"),
+                    u64::from(s) * u64::from(m) * u64::from(n) * 4,
+                )
+            } else {
+                TENSOR_NONE
+            };
+            words.extend([c, a, w, n, k, s, part]);
+        }
+        let bytes: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+        let desc = self.tensor_init(&format!("act.gemm_group.m{m}.{id}.desc"), bytes);
+        let (c0, a0, w0, n0, k0) = segs[0];
+        let cus: Vec<u32> = (0..self.n_cu).collect();
+        let part = self.emit(DevOp::GemmSmall, cus.clone(), deps, |d| {
+            d.t[0] = c0;
+            d.t[1] = a0;
+            d.t[2] = w0;
+            d.t[7] = desc;
+            d.i[0] = m;
+            d.i[1] = n0;
+            d.i[2] = k0;
+            d.i[7] = 3;
+        });
+        if !any_split {
+            return Some(part);
+        }
+        Some(self.emit(DevOp::GemmSmall, cus, &[part], |d| {
+            d.t[0] = c0;
+            d.t[1] = a0;
+            d.t[2] = w0;
+            d.t[7] = desc;
+            d.i[0] = m;
+            d.i[1] = n0;
+            d.i[2] = k0;
+            d.i[7] = 4;
+        }))
     }
 
     /// Re-declaring a name returns the EXISTING handle and grows it to the larger byte count,
@@ -1164,12 +1398,15 @@ impl Builder {
             j: [0; 2],
         };
         f(&mut inst);
+        self.apply_gemm_small_splitk(op, cus.len(), &mut inst);
         // AFTER the closure: the immediates do not exist until it has run.
         tune_dump_gemv(op, &inst);
         let counter = self.ops.len() as u32;
         // Uniform by default: an op that does not tell the builder its per-slice costs is
         // assumed balanced, which makes `select_granularity` fall back to coarse counters.
         let work = vec![1u32; cus.len()];
+        let reduce = (op == DevOp::GemmSmall && inst.i[7] == 1).then_some(inst);
+        let rcus = reduce.map(|_| cus.clone());
         self.ops.push(Op {
             inst,
             isolated: false,
@@ -1180,6 +1417,22 @@ impl Builder {
             counter,
             work,
         });
+        if let (Some(mut r), Some(rcus)) = (reduce, rcus) {
+            r.i[7] = 2;
+            let rc = self.ops.len() as u32;
+            let work = vec![1u32; rcus.len()];
+            self.ops.push(Op {
+                inst: r,
+                isolated: false,
+                keep_single_grid: false,
+                join: self.cur_join,
+                cus: rcus,
+                deps: vec![Dep::Coarse(counter)],
+                counter: rc,
+                work,
+            });
+            return rc;
+        }
         counter
     }
 
@@ -1204,6 +1457,16 @@ impl Builder {
     /// The dependencies op `counter` was emitted with.
     pub fn deps_of(&self, counter: u32) -> Vec<Dep> {
         self.ops[counter as usize].deps.clone()
+    }
+
+    /// The instruction op `counter` was emitted with.
+    pub fn inst(&self, counter: u32) -> &DevInst {
+        &self.ops[counter as usize].inst
+    }
+
+    /// Adjust op `counter`'s instruction after emission (its slices, deps and work stay).
+    pub fn patch(&mut self, counter: u32, f: impl FnOnce(&mut DevInst)) {
+        f(&mut self.ops[counter as usize].inst);
     }
 
     /// As [`Builder::emit_dep`], but supplying the per-slice cost the cost model predicts.
@@ -1751,6 +2014,34 @@ impl Builder {
         i as u32
     }
 
+    fn ep_ineligibility_report(&self, degree: u32) -> String {
+        let mut out = String::new();
+        for op in self.ops.iter() {
+            let g = &op.inst;
+            if g.op != DevOp::MoeGroupGluPf as u16 {
+                continue;
+            }
+            let full_i = g.i[0].checked_mul(degree);
+            out.push_str(&format!(
+                "\n  MoeGroupGluPf enc=i[3]={} (EP needs 2=MXFP4), ep=i[6]={} (needs 0), \
+                 imoe=i[0]={} hidden=i[1]={} n_exp=i[2]={}; full_i={:?} (needs %128==0), \
+                 hidden%128={}, n_exp>=degree: {}",
+                g.i[3],
+                g.i[6],
+                g.i[0],
+                g.i[1],
+                g.i[2],
+                full_i,
+                g.i[1] % 128,
+                g.i[2] >= degree,
+            ));
+        }
+        if out.is_empty() {
+            out.push_str("\n  the graph emits no MoeGroupGluPf at all");
+        }
+        out
+    }
+
     fn rewrite_replicated_moe_prefill_ep(&mut self, degree: u32) -> usize {
         assert!(degree > 1, "EP degree must exceed one");
         let mut chains = Vec::new();
@@ -1780,7 +2071,11 @@ impl Builder {
                 c.op == DevOp::MoeCombinePf as u16
                     && c.t[3] == d.t[0]
                     && c.i[0] == d.i[0]
-                    && c.i[1] == 16
+                    // i[1] is the combine's top_k. This used to require == 16, which is Kimi-K3's
+                    // top_k and not a property of the rewrite: DeepSeek-V4.1 routes top-6 and was
+                    // silently ineligible. What the rewrite actually needs is a real per-slot
+                    // combine (k > 1) whose k agrees with the align's, which is checked below.
+                    && c.i[1] > 1
                     && c.i[2] != 0
                     && c.i[3..].iter().all(|&v| v == 0)
             }) else {
@@ -1808,7 +2103,9 @@ impl Builder {
                         && a.t[0] == g.t[4]
                         && a.i[0] == self.ops[combine].inst.i[2]
                         && a.i[1] == g.i[2]
-                        && a.i[2] == 16)
+                        // ...and the align's top_k must be the combine's, rather than both being
+                        // required to be the literal 16.
+                        && a.i[2] == self.ops[combine].inst.i[1])
                         .then_some(i)
                 })
                 .collect();
@@ -1900,13 +2197,31 @@ impl Builder {
         chains.len()
     }
 
+    /// Drop every op after the first `n`, for BISECTION.
+    ///
+    /// A diagnostic, and the only sound direction to cut: dependencies point BACKWARDS, so no
+    /// surviving op can reference one this drops, and `finish` then computes waits and successors
+    /// over the remaining prefix exactly as if the emitter had stopped there. Cutting anywhere
+    /// but the tail would leave a dangling counter.
+    ///
+    /// Exists because a per-op cost on real hardware cannot be had any other way on this stack:
+    /// the interpreter is a MEGAKERNEL, so one launch covers the whole layer and a kernel-level
+    /// profiler reports one number for 34 ops. Emitting prefixes and differencing their run times
+    /// is the profiler.
+    pub fn truncate_ops(&mut self, n: usize) {
+        if n < self.ops.len() {
+            self.ops.truncate(n);
+        }
+    }
+
     pub fn finish(mut self) -> Program {
         let knobs = knobs();
         if let Some(degree) = self.moe_prefill_ep_degree {
             let rewritten = self.rewrite_replicated_moe_prefill_ep(degree);
             assert!(
                 rewritten != 0,
-                "replicated MoE EP requested at degree {degree}, but the complete graph has no eligible MXFP4 align/GLU/down/combine -> TP-reduction boundary"
+                "replicated MoE EP requested at degree {degree}, but the complete graph has no eligible MXFP4 align/GLU/down/combine -> TP-reduction boundary.{}",
+                self.ep_ineligibility_report(degree)
             );
             eprintln!("  whole-graph placement: {rewritten} routed-MoE boundaries use EP{degree}");
         }
@@ -2252,8 +2567,18 @@ impl Builder {
             .ops
             .iter()
             .any(|op| op.inst.op == DevOp::FlashMlaPrefillFp8 as u16 && op.inst.j[1] != 0);
+        // A GATHERED op 51 -- t[7] = the per-pack union table -- has an arm on the FOUR-WAVE
+        // object only; the 8-wave interpreter traps on it by design rather than attend the full
+        // causal range of a model trained sparse. So the routing is a property of the PACKET and
+        // not of a knob: emitting one of these without V2 segmentation cannot produce a program
+        // that runs at all.
+        let mla_gather_union = self
+            .ops
+            .iter()
+            .any(|op| op.inst.op == DevOp::FlashMlaPrefill as u16 && op.inst.t[7] != TENSOR_NONE);
         let mla_v2 = !uniseg
             && (split_mla
+                || mla_gather_union
                 || match knobs.mla_pf_v2 {
                     Some(explicit) => explicit,
                     // A placed packet is an AMD production artifact. Isolating a pure MLA flash
@@ -2280,6 +2605,9 @@ impl Builder {
             && self.lean_moe_combine_segments
             && self.ops.iter().any(|op| lean_moe_combine_inst(&op.inst));
         let moe_prefill_ep = self.moe_prefill_ep_degree.is_some();
+        let lean_moe_fp8 = !uniseg
+            && self.lean_moe_fp8_segments
+            && self.ops.iter().any(|op| lean_moe_fp8_glu_inst(&op.inst));
         let lean_attn_res_f32mix = !uniseg
             && self.attn_res_f32mix_segments
             && self
@@ -2301,11 +2629,13 @@ impl Builder {
         let lean_kda_key_factor = !uniseg
             && (self.lean_kda_key_factor_segments || kda_carry_regstate || kda_wu_lean)
             && (0..self.ops.len()).any(|i| lean_kda_key_factor_pair(&self.ops, i));
+        let mla_flash = |op: u16| {
+            op == DevOp::FlashMlaDecode as u16 || op == DevOp::FlashGatherDecode as u16
+        };
         let decode_mla_segments = !uniseg
             && self.decode_mla_segments
             && self.ops.windows(2).any(|pair| {
-                pair[0].inst.op == DevOp::FlashMlaDecode as u16
-                    && pair[1].inst.op == DevOp::MlaMergeFold as u16
+                mla_flash(pair[0].inst.op) && pair[1].inst.op == DevOp::MlaMergeFold as u16
             });
         let bf16_pair = |i: usize| {
             self.ops.get(i..i + 2).is_some_and(|pair| {
@@ -2397,6 +2727,15 @@ impl Builder {
         let v2_env = knobs.seg_v2.clone();
         let seg_v2 = v2_env.as_deref() == Some("1");
         let seg_q8 = seg_v2 || v2_env.as_deref() == Some("q8");
+        let moe_w8a8_dec_pair = |i: usize| {
+            self.ops.get(i..i + 2).is_some_and(|pair| {
+                pair[0].inst.op == DevOp::MoeGroupGluPf as u16
+                    && pair[1].inst.op == DevOp::MoeGroupDownPf as u16
+                    && crate::dev::moe_w8a8_dec_marked_parts(pair[0].inst.op, &pair[0].inst.i, pair[0].inst.j[1])
+                    && crate::dev::moe_w8a8_dec_marked_parts(pair[1].inst.op, &pair[1].inst.i, pair[1].inst.j[1])
+            })
+        };
+        let decode_w8a8_moe = !uniseg && (0..self.ops.len()).any(moe_w8a8_dec_pair);
         let wave_class = |i: usize| -> u8 {
             let op = self.ops[i].inst.op;
             if decode_mla_bf16 && (bf16_pair(i) || (i > 0 && bf16_pair(i - 1))) {
@@ -2418,6 +2757,11 @@ impl Builder {
                         && self.ops[i - 1].inst.op == DevOp::MoeGroupGluFp8Blk as u16))
             {
                 20
+            } else if decode_w8a8_moe
+                && (moe_w8a8_dec_pair(i) || (i > 0 && moe_w8a8_dec_pair(i - 1)))
+            {
+                // PLOW_MOE_W8A8_DEC: the marked GLU+DOWN pair is one raw two-launch segment.
+                30
             } else if op == DevOp::MlaMaterializePack as u16 {
                 14
             } else if op == DevOp::FlashMlaMaterializedPrefill as u16 {
@@ -2456,6 +2800,12 @@ impl Builder {
                 && self.ops[i].inst.i[5] > 1
             {
                 24
+            } else if lean_moe_fp8 && lean_moe_fp8_glu_inst(&self.ops[i].inst) {
+                // The dedicated block-fp8 grouped-MoE object owns each of these two packets as
+                // its own segment (bit-identical to the interpreter arms).
+                28
+            } else if lean_moe_fp8 && lean_moe_fp8_down_inst(&self.ops[i].inst) {
+                29
             } else if lean_moe_stage2 && lean_moe_stage2_pair(&self.ops, i) {
                 // The standalone gfx950 kernel owns exactly the deterministic Down scatter.
                 // Combine stays in the following interpreter segment and preserves fixed-order
@@ -2471,14 +2821,20 @@ impl Builder {
                 // The f32-mix AttnRes object owns exactly one packet per segment.
                 25
             } else if decode_mla_segments
-                && ((op == DevOp::FlashMlaDecode as u16
+                && ((mla_flash(op)
                     && self
                         .ops
                         .get(i + 1)
                         .is_some_and(|next| next.inst.op == DevOp::MlaMergeFold as u16))
                     || (op == DevOp::MlaMergeFold as u16
                         && i > 0
-                        && self.ops[i - 1].inst.op == DevOp::FlashMlaDecode as u16))
+                        && mla_flash(self.ops[i - 1].inst.op))
+                    || (self.decode_mla_kvw_segments
+                        && op == DevOp::HeadNormRope as u16
+                        && self.ops.get(i + 1..i + 3).is_some_and(|pair| {
+                            mla_flash(pair[0].inst.op)
+                                && pair[1].inst.op == DevOp::MlaMergeFold as u16
+                        })))
             {
                 18
             } else if isolate_xreduce && op == DevOp::XReduceTwoShot as u16 {
@@ -2611,14 +2967,19 @@ impl Builder {
                 || op.inst.op == DevOp::IndexTpPf as u16
                 || op.inst.op == DevOp::IndexFp8Decode as u16
                 || op.inst.op == DevOp::IndexFp8Prefill as u16
+                || (op.inst.op == DevOp::GemvF32 as u16
+                    && (op.inst.i[7] == crate::dev::HC_MIX_RAW_MARK
+                        || op.inst.i[7] == crate::dev::HC_AITER_MARK))
                 || op.inst.op == DevOp::GemmLtPf as u16
                 || op.inst.op == DevOp::GemmBlkPf as u16
+                || op.inst.op == DevOp::GemmGroupPf as u16
                 || (op.inst.op == DevOp::MlaMergeFold as u16 && op.inst.i[5] == 1)
                 || (op.inst.op == DevOp::FlashMlaDecodeFp8 as u16 && op.isolated)
         }) || native_gemma4_glu
             || lean_moe_stage2
             || lean_moe_stage1
             || lean_moe_combine
+            || lean_moe_fp8
             || lean_attn_res_f32mix
             || moe_prefill_ep
             || lean_kda_intra
@@ -2629,11 +2990,31 @@ impl Builder {
             || decode_mla_segments
             || decode_mla_bf16
             || decode_grouped_moe
+            || decode_w8a8_moe
             || isolate_xreduce;
+        let router_sig: Vec<bool> = self
+            .ops
+            .iter()
+            .map(|op| {
+                op.inst.op == DevOp::GemmF32 as u16
+                    && op.inst.i[7] == crate::dev::ROUTER_RAW_MARK
+                    && op.inst.i[5] & crate::dev::ROUTER_RAW_SIGNAL != 0
+            })
+            .collect();
+        let router_signal = |i: usize| router_sig[i];
         let same_segment_dep = |consumer: usize, dep: &Dep| {
             let producer = dep.producer() as usize;
-            let raw_moe_pair_edge =
-                decode_grouped_moe && wave_class(consumer) == 20 && wave_class(producer) == 20;
+            // A signalling raw router bumps its counter itself; its next segment keeps the wait.
+            if raw_segmented
+                && router_signal(producer)
+                && seg_of[consumer] == seg_of[producer] + 1
+            {
+                return true;
+            }
+            let raw_moe_pair_edge = (decode_grouped_moe
+                && wave_class(consumer) == 20
+                && wave_class(producer) == 20)
+                || (decode_w8a8_moe && wave_class(consumer) == 30 && wave_class(producer) == 30);
             let raw_mla_pair_edge =
                 decode_mla_bf16 && wave_class(consumer) == 27 && wave_class(producer) == 27;
             !raw_moe_pair_edge
@@ -2820,6 +3201,11 @@ impl Builder {
 
         for (idx, op) in self.ops.iter().enumerate() {
             let mut inst = op.inst;
+            if router_signal(idx) {
+                let threshold = op.cus.len() as u32;
+                assert!(threshold < 1024 && op.counter < 1 << 20, "router signal fields");
+                inst.i[5] |= threshold << 2 | op.counter << 12;
+            }
             if kda_carry_keyfeed
                 && inst.op == DevOp::KdaChunkWu as u16
                 && lean_kda_key_factor_pair(&self.ops, idx)

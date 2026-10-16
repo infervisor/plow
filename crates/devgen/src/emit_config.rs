@@ -482,6 +482,11 @@ pub struct EmitConfig {
     #[arg(long, env = "PLOW_XR_DEC_CUS")]
     pub xr_dec_cus: Option<u32>,
 
+    /// DECODE all-reduces of at least N elements (a batched rung's [rows, hidden]) take the
+    /// two-shot (reduce-scatter + all-gather) instead of the one-shot. Bit-identical.
+    #[arg(long, env = "PLOW_XR_DEC_TWOSHOT_MIN")]
+    pub xr_dec_twoshot_min: Option<u32>,
+
     /// Use reduce-scatter/all-gather for complete folded-gather collectives. The second
     /// partial is added while the reduced slices are gathered. Default on; `=0` is the
     /// rollback to the one-shot collective.
@@ -537,6 +542,26 @@ pub struct EmitConfig {
     /// default; this is the sweep handle for a re-measurement.
     #[arg(long, env = "PLOW_MLA_NS")]
     pub mla_ns: Option<u32>,
+    /// Items per gathered query pack in the V4.1 sparse prefill (1 = the un-split arm).
+    #[arg(long, env = "PLOW_MLA_GATHER_SPLIT", default_value_t = 2)]
+    pub mla_gather_split: u32,
+
+    /// Row bands on the V4.1 attention TP seam (1 = the unbanded emit).
+    #[arg(long, env = "PLOW_DSV41_XR_BAND", default_value_t = 1)]
+    pub dsv41_xr_band: u32,
+
+    /// CU prefix each band's collective runs on; unset = the whole seam width.
+    #[arg(long, env = "PLOW_DSV41_XR_BAND_CUS")]
+    pub dsv41_xr_band_cus: Option<u32>,
+
+    /// Sequence-parallel V4.1 seams: the mHC and norms run on this rank's `t/tp` band.
+    #[arg(long, env = "PLOW_DSV41_SEQ_PAR", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
+    pub dsv41_seq_par: bool,
+
+    /// Ceiling instrument: run the V4.1 mHC and norm packets over `t/tp` rows. WRONG ANSWER by
+    /// construction -- it prices sequence parallelism, it does not implement it.
+    #[arg(long, env = "PLOW_DSV41_SP_ABL", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
+    pub dsv41_sp_abl: bool,
 
     #[arg(long = "k3-ns", env = "PLOW_K3_NS", hide = true)]
     legacy_k3_ns: Option<u32>,
@@ -572,6 +597,13 @@ pub struct EmitConfig {
     #[arg(long, env = "PLOW_GLM_GF")]
     pub glm_gf: Option<u32>,
 
+    /// Batched dense MLA decode rungs on gfx950 split the KV only to one work item per CU (rows x
+    /// head-groups x nsplit <= n_cu) instead of the max-ctx split count. Not bit-identical (the
+    /// online-softmax partials regroup); GLM-5.3-Flash TP8 greedy streams matched at B=8/32/128.
+    /// Rung 1 is unchanged. `=0` is the rollback.
+    #[arg(long, env = "PLOW_GLM_MLA_NS_ROWS", default_value_t = true, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
+    pub glm_mla_ns_rows: bool,
+
     /// Vocab-column-parallel lm_head.
     #[arg(long, env = "GLM_SHARD_HEAD", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
     pub glm_shard_head: bool,
@@ -602,6 +634,15 @@ pub struct EmitConfig {
     /// Experimental TP8 CDNA4 original Q-B and FP8 MLA projections.
     #[arg(long, env = "PLOW_GLM_MLA_W8A8", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
     pub glm_mla_w8a8: bool,
+    /// GLM-5.3-Flash KDA prefill: q|k|v|g_a|f_a|b as one grouped GEMM segment.
+    #[arg(long, env = "PLOW_KDA_PF_GROUP_GEMM", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
+    pub kda_pf_group_gemm: bool,
+    /// GLM-5.3-Flash MLA prefill: q_a|kv_a as one grouped GEMM segment.
+    #[arg(long, env = "PLOW_GLM_PF_QKVA_GROUP", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
+    pub glm_pf_qkva_group: bool,
+    /// With the grouped prefill GEMMs: also route KDA o_proj/g_b/f_b and MLA q_absorb/o_proj.
+    #[arg(long, env = "PLOW_PF_GEMM_ROUTE_ALL", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
+    pub pf_gemm_route_all: bool,
     /// MLA W8A8 prefill in the expanded (MHA) form vLLM runs: kv_b GEMM + D=256 flash.
     #[arg(long, env = "PLOW_GLM_MLA_MHA", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
     pub glm_mla_mha: bool,
@@ -729,6 +770,12 @@ pub struct EmitConfig {
     #[arg(long = "emit-kda-decode-fused", env = "PLOW_KDA_DECODE_FUSED", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
     pub kda_decode_fused: bool,
 
+    /// Emit each batched decode rung's KDA Conv3 -> StateStepG -> GatedNorm chain as one
+    /// standalone op-125 boundary (descriptor version 3): the interpreter's bodies, one workgroup
+    /// per (row, head). Bit-identical. Default on; `=0` rollback.
+    #[arg(long = "emit-kda-decode-wide", env = "PLOW_KDA_DECODE_WIDE", default_value_t = true, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
+    pub kda_decode_wide: bool,
+
     /// Materialize MLA Q/K/V and emit the standalone asymmetric gfx950 prefill boundary.
     /// Opt-in candidate: exact for the first chunk, continuation chunks still diverge.
     #[arg(long, env = "PLOW_MLA_MATERIALIZED_PREFILL", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
@@ -852,7 +899,7 @@ pub struct EmitConfig {
     pub gemv_wg_tuning: Option<String>,
 
     /// Route GLM's DSA indexer through the prefill chain (requires `has_dsa`).
-    #[arg(long, env = "PLOW_GLM_DSA_PF", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
+    #[arg(long, env = "PLOW_GLM_DSA_PF", default_value_t = true, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
     pub glm_dsa_pf: bool,
     /// Sparse prefill flash on mla_sparse_pf.h (8-query packs, bf16 latent out, no merge).
     #[arg(long, env = "PLOW_GLM_DSA_PF_B8", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
@@ -864,10 +911,22 @@ pub struct EmitConfig {
     /// DSA indexer wk + weights_proj as one dual GemmSmall packet (objects need PLOW_DSA_PREP=1).
     #[arg(long, env = "PLOW_GLM_DSA_KW_DUAL", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
     pub glm_dsa_kw_dual: bool,
+    /// Pooled DSA decode: stash folds into the pool compress and the expand into the per-row select.
+    #[arg(long, env = "PLOW_GLM_DSA_FUSE", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
+    pub glm_dsa_fuse: bool,
     /// DSA prefill: op 118 also writes op 119's union table (PLOW_DSA_SELECT_V3 objects) and the
     /// op 119 is marked skipped; objects without the arm run both ops as before.
     #[arg(long, env = "PLOW_GLM_DSA_SEL_UNION", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
     pub glm_dsa_sel_union: bool,
+    /// Pooled DSA prefill: each TP rank scores and selects its own `T/tp` query band (q index
+    /// projection, quant, score, top-k), then one all-gather of the pool ids through peer slot 4.
+    #[arg(long, env = "PLOW_GLM_DSA_PF_SHARD", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
+    pub glm_dsa_pf_shard: bool,
+    /// Pooled DSA prefill on a row-split sibling of the 8192 rung: each TP rank selects for its
+    /// own `T/tp` query band and attends it at all heads after a q all-to-all; the ordinary rung
+    /// stays dense and only writes the indexer pool cache.
+    #[arg(long, env = "PLOW_GLM_DSA_PF_A2A", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
+    pub glm_dsa_pf_a2a: bool,
 
     /// Set by [`super::apply_production_defaults`] when this emit is the QUALIFIED GLM target —
     /// gfx942, TP8, 304 CU. The nine knobs whose accessors read it are `Option<bool>` precisely
@@ -971,6 +1030,14 @@ pub struct EmitConfig {
     #[arg(long, env = "PLOW_GLM_GEMM_LT_DECODE_EXT", value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
     pub glm_gemm_lt_decode_ext: Option<bool>,
 
+    /// Decode rungs of at least this many rows route their BF16 projections (KDA/MLA
+    /// projections, shared expert, router, lm_head) through the prefill GEMM tile family
+    /// (`pick_tile`) instead of the row-bucketed GEMV walk, whose per-row VALU cost made a
+    /// 128-row GLM-5.3-Flash step spend 126 of 162 ms in GEMV on gfx950. Unset = off (every
+    /// packet byte-identical); the one-row rung is never routed.
+    #[arg(long, env = "PLOW_GLM_DECODE_GEMM_ROWS")]
+    pub glm_decode_gemm_rows: Option<u32>,
+
     /// Use native gfx942 FP32 MLA fold GEMMs during prefill.
     /// On by default for GLM on gfx942 TP8; `=false` is the rollback.
     #[arg(long, env = "PLOW_GLM_FOLD_LT", value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
@@ -989,6 +1056,27 @@ pub struct EmitConfig {
     /// `--glm-gemm-lt`.
     #[arg(long, env = "PLOW_GLM_GEMM_LT_PF_EXT")]
     pub glm_gemm_lt_pf_ext: Option<String>,
+    /// GLM-5.3-Flash gfx950 prefill: comma list of dense BF16 projections that run the pinned
+    /// gfx950 hipBLASLt object (`glm_lt_gfx950.elf`) as their own segment: `q_a`, `kv_a`,
+    /// `q_absorb`, `mla_o`, `kda_o`, `kda_gb`. Unset => byte-identical.
+    #[arg(long, env = "PLOW_GLM53_GEMM_LT")]
+    pub glm53_gemm_lt: Option<String>,
+    /// Smallest prefill bucket (rows) `PLOW_GLM53_GEMM_LT` routes.
+    #[arg(long, env = "PLOW_GLM53_GEMM_LT_MIN_ROWS", default_value_t = 2048)]
+    pub glm53_gemm_lt_min_rows: u32,
+    /// Largest prefill bucket (rows) `PLOW_GLM53_GEMM_LT` routes.
+    #[arg(long, env = "PLOW_GLM53_GEMM_LT_MAX_ROWS", default_value_t = 8192)]
+    pub glm53_gemm_lt_max_rows: u32,
+    /// GLM-5.3-Flash gfx950 decode: comma list of dense BF16 projections that run the pinned
+    /// gfx950 hipBLASLt object as their own segment at the `PLOW_GLM53_GEMM_LT_DEC_RUNGS` rungs:
+    /// `q_a`, `kv_a`, `q_absorb`, `mla_o`, `kda_o`, `kda_qkv`, `kda_gfa` (g_a, f_a), `kda_gb`
+    /// (g_b, f_b), `kda_b`, `lm_head` (TP8 vocab shard). A routed KDA layer drops the PLOW_GLM_KDA_PROJ_GROUP packets. Unset =>
+    /// byte-identical.
+    #[arg(long, env = "PLOW_GLM53_GEMM_LT_DEC")]
+    pub glm53_gemm_lt_dec: Option<String>,
+    /// Decode rungs `PLOW_GLM53_GEMM_LT_DEC` routes (comma list).
+    #[arg(long, env = "PLOW_GLM53_GEMM_LT_DEC_RUNGS", default_value = "32,128")]
+    pub glm53_gemm_lt_dec_rungs: String,
 
     /// Cap the dispatch width of every blocked GEMV. Unset ⇒ byte-identical.
     #[arg(long, env = "PLOW_GLM_GEMV_WG")]
@@ -997,6 +1085,185 @@ pub struct EmitConfig {
     /// Fold W_o into the MLA prefill flash epilogue. Reassociated, logit-gate class.
     #[arg(long, env = "PLOW_GLM_OFOLD", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
     pub glm_ofold: bool,
+
+    /// GLM-5.3-Flash decode: fold the RmsNorm after a KDA layer's and every FFN's
+    /// HyperConnPre into that packet (one packet less per sublayer). Bit-identical.
+    #[arg(long, env = "PLOW_GLM_HC_NORM_FOLD", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
+    pub glm_hc_norm_fold: bool,
+
+    /// GLM-5.3-Flash decode: fold each HyperConnPost that a HyperConnPre follows into that
+    /// pre's mHC mix GemvF32 (rows * 24 <= workgroups). Bit-identical.
+    #[arg(long, env = "PLOW_GLM_HC_POST_FOLD", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
+    pub glm_hc_post_fold: bool,
+
+    /// GLM-5.3-Flash one-row decode: run each HyperConnPre on the last-arriving workgroup of its
+    /// mHC mix GemvF32 (one packet and one hop less per sublayer). Bit-identical.
+    #[arg(long, env = "PLOW_GLM_HC_PRE_TAIL", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
+    pub glm_hc_pre_tail: bool,
+
+    /// GLM-5.3-Flash sequence-parallel prefill (`PLOW_GLM_SEQ_PAR`): score and top-k the router on
+    /// this rank's row band and gather the route table out of peer slot 5, as
+    /// `PLOW_GLM_SEQ_PAR_PROJ` does, without the projection half. Same kernels per row.
+    #[arg(long, env = "PLOW_GLM53_SP_ROUTER", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
+    pub glm53_sp_router: bool,
+
+    /// GLM-5.3-Flash sequence-parallel prefill: a KDA layer's input RMSNorm runs on this rank's
+    /// row band and the normed rows are gathered (as the MLA and FFN seams do), instead of
+    /// gathering the raw layer input and norming all rows on every rank. Same kernel per row.
+    #[arg(long, env = "PLOW_GLM53_SP_KDA_NORM", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
+    pub glm53_sp_kda_norm: bool,
+
+    /// GLM-5.3-Flash packed-prefill siblings keep the lean KDA chunk segment marks (intra
+    /// wave-item, lean Wu, register-state/key-fed carry) as singleton segments, so the runtime
+    /// can run the single-sequence lean objects once per span (`PLOW_AMD_PACKED_LEAN_KDA`).
+    #[arg(long, env = "PLOW_GLM53_PACKED_LEAN_KDA", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
+    pub glm53_packed_lean_kda: bool,
+
+    /// GLM-5.3-Flash: pass plowc's L2 layout to the decode rungs (and, with
+    /// `PLOW_L2_PLACE_PREFILL=1`, the prefill buckets) so the object's two-level gate fires.
+    #[arg(long, env = "PLOW_GLM53_L2_PLACE", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
+    pub glm53_l2_place: bool,
+
+    /// GLM-5.3-Flash decode rungs with at least this many rows isolate each MLA
+    /// FlashMlaDecode+MlaMergeFold pair as a decode-MLA segment at GF=8 (all heads of the rank in
+    /// one work item), for the lean object built with PLOW_MLA_DEC_HPACK=1. NOT bit-identical.
+    #[arg(long, env = "PLOW_GLM53_MLA_HPACK_ROWS")]
+    pub glm53_mla_hpack_rows: Option<u32>,
+
+    /// GLM-5.3-Flash prefill band seams: HyperConnPost + mix and HyperConnPre + input RmsNorm as
+    /// AITER's fused mHC pair (FFN and SP-normed KDA inputs). NOT bit-identical.
+    #[arg(long, env = "PLOW_GLM53_PF_HC_AITER", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
+    pub glm53_pf_hc_aiter: bool,
+
+    /// With `PLOW_GLM53_MLA_HPACK_ROWS`: the latent KV writer (HeadNormRope) that precedes each
+    /// pair joins its decode-MLA segment, one interpreter segment less per MLA layer.
+    #[arg(long, env = "PLOW_GLM53_MLA_SEG_KVW", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
+    pub glm53_mla_seg_kvw: bool,
+
+    /// GLM-5.3-Flash DSA decode rungs with at least this many rows run the sparse
+    /// FlashGatherDecode on the head-packed decode-MLA segment kernel (GF=8) over the index table.
+    #[arg(long, env = "PLOW_GLM53_MLA_HPACK_GATHER")]
+    pub glm53_mla_hpack_gather: Option<u32>,
+
+    /// GLM-5.3-Flash decode: the HyperConnPost-folded mHC mix GemvF32 runs only on the
+    /// workgroups that own an output, and under the one-row pre tail each output's K is split
+    /// over this many workgroups (partials reduced in step order by the last). Bit-identical.
+    #[arg(long, env = "PLOW_GLM_HC_MIX_SPLIT")]
+    pub glm_hc_mix_split: Option<u32>,
+
+    /// GLM-5.3-Flash batched decode (rows > 1): HyperConnPost + mHC mix GemvF32 + HyperConnPre
+    /// (+ its folded RmsNorm) in one packet; the pre runs per row group on the mix's
+    /// last-arriving workgroup. Two packets less per sublayer. Bit-identical.
+    #[arg(long, env = "PLOW_GLM_HC_FUSE_DEC", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
+    pub glm_hc_fuse_dec: bool,
+
+    /// GLM-5.3-Flash batched decode: a KDA layer's eight split-K GemmSmall projections as two
+    /// grouped packet pairs (q/k/v/g_a/f_a/b from x, then g_b/f_b) instead of eight pairs that
+    /// the all-workgroup packets ran back to back. Same split per projection: bit-identical.
+    #[arg(long, env = "PLOW_GLM_KDA_PROJ_GROUP", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
+    pub glm_kda_proj_group: bool,
+
+    /// GLM-5.3-Flash one-row decode: with PLOW_GLM_HC_FUSE_DEC, the folded mHC mix + pre tail runs
+    /// on its 24 output workgroups only (one counter per row) instead of the whole grid. Bit-identical.
+    #[arg(long, env = "PLOW_GLM_HC_FUSE_R1", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
+    pub glm_hc_fuse_r1: bool,
+
+    /// With PLOW_GLM_HC_FUSE_R1 + variant bit 1: the one-row fused mHC mix packet runs as its own
+    /// segment on the standalone hc_mix_decode object (same bodies). Bit-identical.
+    #[arg(long, env = "PLOW_GLM_HC_MIX_RAW", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
+    pub glm_hc_mix_raw: bool,
+
+    /// Decode MoE router: the score GEMV and its top-k tail as one raw segment on
+    /// `router_decode_gfx950.elf` (GemmF32 routers only). Same table bytes.
+    #[arg(long, env = "PLOW_GLM_ROUTER_RAW", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
+    pub glm_router_raw: bool,
+
+    /// With PLOW_GLM_ROUTER_RAW at one row: the raw router bumps its consumers' counter and the
+    /// following MoE segment launches without the queue barrier, so the shared expert overlaps it.
+    #[arg(long, env = "PLOW_GLM_ROUTER_SIGNAL", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
+    pub glm_router_signal: bool,
+
+    /// One-row clamped shared expert: the pair Glu folds into the down GEMV's staged activation
+    /// (Gemv norm = 3 + act, t4 = up, f1 = limit). Same bytes into the down; one hop fewer.
+    #[arg(long, env = "PLOW_GLM_SHARED_GLU_DOWN", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
+    pub glm_shared_glu_down: bool,
+
+    /// One-row GLM MoE under TP: the combine (shared + routed slots) folds into the tagged
+    /// XReduce publish (`PLOW_XR_COMBINE_FOLD` with the shared row in t6). One hop fewer.
+    #[arg(long, env = "PLOW_GLM_XR_COMBINE", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
+    pub glm_xr_combine: bool,
+
+    /// Batched decode KDA: emit g_b after f_a/b so the six x-fed hipBLASLt projections are
+    /// adjacent (runtime PLOW_AMD_LT_CONCURRENT then drops their barriers). Same math.
+    #[arg(long, env = "PLOW_GLM_KDA_LT_ORDER", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
+    pub glm_kda_lt_order: bool,
+
+    /// Decode mHC with post + norm folded: AITER's fused post+mix and pre+Sinkhorn+RmsNorm
+    /// kernels (mhc_aiter_gfx950.elf) as one raw segment. NOT bit-identical.
+    #[arg(long, env = "PLOW_GLM_HC_AITER", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
+    pub glm_hc_aiter: bool,
+
+    /// GLM-5.3-Flash decode: the sparse-MLA layers' input RmsNorm folds into the attention-side
+    /// HyperConnPre (the AITER pre+Sinkhorn+RmsNorm kernel under PLOW_GLM_HC_AITER), as on the
+    /// KDA and FFN sides; the MLA block then reads the normed rows and emits no norm packet.
+    #[arg(long, env = "PLOW_GLM_HC_FOLD_MLA", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
+    pub glm_hc_fold_mla: bool,
+
+    /// PLOW_GLM_HC_AITER applies only to rungs with at least this many rows (unset = every rung).
+    #[arg(long, env = "PLOW_GLM_HC_AITER_MIN_ROWS")]
+    pub glm_hc_aiter_min_rows: Option<u32>,
+
+    /// PLOW_KDA_DECODE_WIDE applies only to rungs with at least this many rows (unset = 2).
+    #[arg(long, env = "PLOW_KDA_DECODE_WIDE_MIN_ROWS")]
+    pub kda_decode_wide_min_rows: Option<u32>,
+
+    /// PLOW_GLM_KDA_PROJ_GROUP split override: every grouped projection splits K by the largest
+    /// power of two <= this (fewer fp32 partials than the per-projection split-K). NOT bit-identical.
+    #[arg(long, env = "PLOW_GLM_KDA_PROJ_GROUP_S")]
+    pub glm_kda_proj_group_s: Option<u32>,
+
+    /// GLM-5.3-Flash one-row decode: the KDA low-rank gate's g_a projection as GemvQkvg's fourth
+    /// stream next to q/k/v (one packet and one hop less per KDA layer).
+    #[arg(long, env = "PLOW_GLM_KDA_QKVG_R1", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
+    pub glm_kda_qkvg_r1: bool,
+
+    /// PLOW_GLM_HC_FUSE_DEC body variant bits: 1 = register-resident pre + norm tail, 2 = the
+    /// rows arm walks W eight steps per load batch, 4 = one row per unit (units loop over the
+    /// grid) instead of two rows per tail, 8 = rows arm without the tail (the pre stays its own
+    /// packet), 16 = rows * 24 <= CUs rungs above one row keep the unfused pre. Bit-identical.
+    #[arg(long, env = "PLOW_GLM_HC_FUSE_VARIANT")]
+    pub glm_hc_fuse_variant: Option<u32>,
+
+    /// PLOW_KDA_DECODE_FUSED only on programs with at least this many rows (GLM-5.3-Flash MI350X
+    /// TP8: the standalone object wins at B=8, the in-interpreter arm at one row).
+    #[arg(long, env = "PLOW_KDA_DECODE_FUSED_MIN_ROWS")]
+    pub kda_decode_fused_min_rows: Option<u32>,
+
+
+    /// GLM-5.3-Flash batched decode (rows > 1): largest split-K factor for the bf16 GemmSmall
+    /// projections whose 64x128 tiles leave most workgroups idle (0 = off). NOT bit-identical.
+    #[arg(long, env = "PLOW_GLM_DEC_SPLITK")]
+    pub glm_dec_splitk: Option<u32>,
+
+    /// PLOW_GLM_DEC_SPLITK applies only to decode rungs of at most this many rows (unset = all).
+    /// Measured: B=32 gains, B=128 loses.
+    #[arg(long, env = "PLOW_GLM_DEC_SPLITK_MAX_ROWS")]
+    pub glm_dec_splitk_max_rows: Option<u32>,
+
+    /// PLOW_GLM_DEC_SPLITK as two packets: partials, then a gated all-workgroup reduce (same
+    /// values as the one-packet form, no per-item agent-scope acq_rel). Needs objects with the arm.
+    #[arg(long, env = "PLOW_GLM_DEC_SPLITK_2P", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
+    pub glm_dec_splitk_2p: bool,
+
+    /// GLM-5.3-Flash batched decode (rungs the HyperConnPost fold does not cover): fold each
+    /// HyperConnPost into the one-shot XReduce that produces its block output. Bit-identical.
+    #[arg(long, env = "PLOW_GLM_XR_HCPOST", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
+    pub glm_xr_hcpost: bool,
+
+    /// GLM batched decode: the shared expert's elementwise Glu spans rows * I / 512 workgroups
+    /// instead of one. Bit-identical.
+    #[arg(long, env = "PLOW_GLM_DECODE_GLU_ROWS", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
+    pub glm_decode_glu_rows: bool,
 
     /// Causal KV-split factor for the V2 MLA prefill flash (2..=8; unset/1 = unsplit).
     #[arg(long, env = "PLOW_GLM_PF_NS")]
@@ -1206,6 +1473,35 @@ pub struct EmitConfig {
     #[arg(long, env = "PLOW_MOE_COMBINE_LEAN", default_value_t = true, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
     pub moe_combine_lean: bool,
 
+    /// Isolate block-fp8 W8A16 grouped-MoE prefill GLU / down packets for the
+    /// dedicated gfx950 object (`moe_fp8_pf_gfx950.elf`, bit-identical to the interpreter arms).
+    #[arg(long, env = "PLOW_MOE_FP8_PF_LEAN", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
+    pub moe_fp8_pf_lean: bool,
+
+    /// Smallest prefill bucket (rows) that isolates those segments. Default 0 = every bucket:
+    /// end to end the route wins at all of them (TP8 W8A8 pack ms, every bucket vs >= 8192 only:
+    /// 128 65.1/69.4, 512 79.6/83.2, 1024 86.6/91.7, 2048 102.4/106.1, 8192 228.0/227.7).
+    #[arg(long, env = "PLOW_MOE_FP8_PF_MIN_ROWS", default_value_t = 0)]
+    pub moe_fp8_pf_min_rows: u32,
+
+    /// Programs that isolate the dedicated MoE segments quantize the GLU input with a separate
+    /// QuantFp8Block128 (GLU i7 = 2) instead of the staging quant (i7 = 6), which the dedicated
+    /// object has no arm for. Bit-identical. `=0` keeps the staging quant (interpreter MoE).
+    #[arg(long, env = "PLOW_MOE_FP8_PF_XQ", default_value_t = true, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
+    pub moe_fp8_pf_xq: bool,
+
+    /// Fuse the weighted combine into the dedicated W8A8 down (i7 = 3): bf16 pair atomics into
+    /// the FFN reduce-scatter source, seeded by the shared-expert down (or zeroed under the
+    /// shared fold); no `part` scatter, no MoeCombinePf. NOT bit-identical (bf16 accumulation in
+    /// arrival order, run-to-run nondeterministic). Sequence-parallel TP seam only.
+    #[arg(long, env = "PLOW_MOE_FP8_PF_ACC", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
+    pub moe_fp8_pf_acc: bool,
+
+    /// Also isolate the dedicated MoE segments in the packed-prefill siblings (one launch over
+    /// every span's rows: MoE has no cross-row state). Default off.
+    #[arg(long, env = "PLOW_MOE_FP8_PF_PACKED", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
+    pub moe_fp8_pf_packed: bool,
+
     /// Emit prefill AttnRes packets with the f32-mix contract (separate output-norm epsilon in
     /// `f[1]`) and isolate them for the gfx950 `attn_res_f32mix` object. Default on; tokens
     /// differ from the BF16-seam contract by design. `=0` is the rollback to the interpreter
@@ -1217,6 +1513,9 @@ pub struct EmitConfig {
     /// (T >= 1024). Default on; `=0` is the rollback to the single align packet.
     #[arg(long, env = "PLOW_MOE_ALIGN_PAR", default_value_t = true, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
     pub moe_align_par: bool,
+    /// `PLOW_DSV41_OPS`: truncate the V4.1 block to its first n ops. Profiling only.
+    #[arg(long, env = "PLOW_DSV41_OPS")]
+    pub dsv41_ops: Option<u32>,
 
     /// GLM TP8 prefill on the AITER MoE route: the shared expert's down projection writes the
     /// MoE seam's reduce-scatter source and the fused call accumulates the routed partials onto
@@ -1246,6 +1545,36 @@ pub struct EmitConfig {
     /// evidence measured only on GLM. Flip only alongside a Kimi/DeepSeek accuracy run.
     #[arg(long, env = "PLOW_MOE_PF_DET", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
     pub moe_pf_det: bool,
+
+    /// W8A8 block-FP8 grouped MoE prefill on gfx950 (ops 85/86 i[7]=2): 1x128 FP8 activations
+    /// (`QuantFp8Block128` on the routed input, the GLU epilogue quantizes its output for DOWN),
+    /// fp8 x fp8 MFMA with the [128,128] weight scales, f32 part scatter. Needs `plow_moe_pf_w8a8_arm`
+    /// (the packet's plow_config.h sets `PLOW_MOE_PF_W8A8`). Opt-in: changes numerics.
+    #[arg(long, env = "PLOW_MOE_PF_W8A8", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
+    pub moe_pf_w8a8: bool,
+
+    /// Two-term FP8 activations for `PLOW_MOE_PF_W8A8` (ops 85/86 i[7]=4/5): x ~= s*(hi + lo/16),
+    /// split in the GLU's staging from the bf16 rows (no QuantFp8Block128), the GLU output stored as
+    /// [hi | lo] rows for DOWN. ~bf16 activation precision at fp8 MFMA rate. Requires PLOW_MOE_PF_W8A8.
+    #[arg(long, env = "PLOW_MOE_PF_W8A8_SPLIT", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
+    pub moe_pf_w8a8_split: bool,
+
+    /// `PLOW_MOE_PF_W8A8` on the grouped DECODE rungs too (rows > 1): routed MoE and dense FFN
+    /// ops 85/86 run the W8A8 arm (1x128 activation quant at the rung's pitch). Rung 1 keeps its
+    /// per-expert W8A16 GEMVs. Requires PLOW_MOE_PF_W8A8.
+    #[arg(long, env = "PLOW_MOE_DEC_W8A8", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
+    pub moe_dec_w8a8: bool,
+
+    /// With PLOW_MOE_DEC_W8A8 (+ FQ): each decode-rung routed GLU+DOWN pair is marked (i6) and
+    /// runs as one segment on the standalone moe_w8a8_dec object (same bodies). Bit-identical.
+    #[arg(long, env = "PLOW_MOE_W8A8_DEC", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
+    pub moe_w8a8_dec: bool,
+
+    /// `PLOW_MOE_PF_W8A8` single-term GLU quantizes its bf16 input rows in the A staging (GLU
+    /// i[7] = 6) instead of a separate QuantFp8Block128: bit-identical, one op and the xq/xs
+    /// round trip fewer per MoE/dense layer. Default on; `=0` restores the quant op.
+    #[arg(long, env = "PLOW_MOE_PF_W8A8_FQ", default_value_t = true, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
+    pub moe_pf_w8a8_fq: bool,
 
     /// Build the lean gfx950 MoE stage-1 A4-reuse object with the K256 register-B body
     /// (`-DPLOW_MOE1_BODY=1`, bit-identical output). Opt-in; packets are unchanged, the
@@ -1603,6 +1932,7 @@ impl EmitConfig {
             xr_cus: env_u32("PLOW_XR_CUS"),
             glm_pf_small_cus: env_str("PLOW_GLM_PF_SMALL_CUS"),
             xr_dec_cus: env_u32("PLOW_XR_DEC_CUS"),
+            xr_dec_twoshot_min: env_u32("PLOW_XR_DEC_TWOSHOT_MIN"),
             xr2_gather: env_opt_out("PLOW_XR2_GATHER"),
             no_xreduce: env_bool("PLOW_NO_XREDUCE"),
             moe_prefill: env_str("PLOW_MOE_PREFILL"),
@@ -1614,12 +1944,18 @@ impl EmitConfig {
             k3_full: env_bool_default_true("K3_FULL"),
             k3_fuse_a: env_bool("PLOW_K3_FUSE_A"),
             mla_ns: env_u32("PLOW_MLA_NS"),
+            mla_gather_split: env_u32("PLOW_MLA_GATHER_SPLIT").unwrap_or(2),
+            dsv41_xr_band: env_u32("PLOW_DSV41_XR_BAND").unwrap_or(1),
+            dsv41_xr_band_cus: env_u32("PLOW_DSV41_XR_BAND_CUS"),
+            dsv41_seq_par: env_bool("PLOW_DSV41_SEQ_PAR"),
+            dsv41_sp_abl: env_bool("PLOW_DSV41_SP_ABL"),
             legacy_k3_ns: env_u32("PLOW_K3_NS"),
             legacy_glm_ns: env_u32("PLOW_GLM_NS"),
             k3_prefill: env_str("K3_PREFILL"),
             glm_dsa: env_str("PLOW_GLM_DSA"),
             glm_gf: env_u32("PLOW_GLM_GF"),
             glm_shard_head: env_bool("GLM_SHARD_HEAD"),
+            glm_mla_ns_rows: env_bool_default_true("PLOW_GLM_MLA_NS_ROWS"),
             glm_moe_coresident: env_u32("GLM_MOE_CORESIDENT"),
             glm_shared_cus: env_u32("GLM_SHARED_CUS"),
             glm_spine_cus: env_str("GLM_SPINE_CUS"),
@@ -1627,6 +1963,9 @@ impl EmitConfig {
             glm_oproj_w8a8: env_bool("PLOW_GLM_OPROJ_W8A8"),
             glm_qkva_w8a8: env_bool("PLOW_GLM_QKVA_W8A8"),
             glm_mla_w8a8: env_bool("PLOW_GLM_MLA_W8A8"),
+            kda_pf_group_gemm: env_bool("PLOW_KDA_PF_GROUP_GEMM"),
+            glm_pf_qkva_group: env_bool("PLOW_GLM_PF_QKVA_GROUP"),
+            pf_gemm_route_all: env_bool("PLOW_PF_GEMM_ROUTE_ALL"),
             glm_mla_mha: env_bool("PLOW_GLM_MLA_MHA"),
             glm_decode_shared_fold: env_bool("PLOW_GLM_DECODE_SHARED_FOLD"),
             glm_norm_q128: env_bool("PLOW_GLM_NORM_Q128"),
@@ -1679,6 +2018,7 @@ impl EmitConfig {
             k3_fuse_ngemv: env_str("PLOW_K3_FUSE_NGEMV"),
             k3_kda_conv_step_db: env_bool("PLOW_K3_KDA_CONV_STEP_DB"),
             kda_decode_fused: env_bool("PLOW_KDA_DECODE_FUSED"),
+            kda_decode_wide: env_opt_out("PLOW_KDA_DECODE_WIDE"),
             mla_materialized_prefill: env_bool("PLOW_MLA_MATERIALIZED_PREFILL"),
             kda_chunk: env_bool_opt("PLOW_KDA_CHUNK"),
             kda_chunk_qpre: env_opt_out("PLOW_KDA_CHUNK_QPRE"),
@@ -1702,11 +2042,14 @@ impl EmitConfig {
             fuse_quant: env_opt_out("PLOW_FUSE_QUANT"),
             gemv_wg: env_u32("PLOW_GEMV_WG"),
             gemv_wg_tuning: env_str("PLOW_GEMV_WG_TUNING"),
-            glm_dsa_pf: env_bool("PLOW_GLM_DSA_PF"),
+            glm_dsa_pf: env_bool_default_true("PLOW_GLM_DSA_PF"),
             glm_dsa_pf_b8: env_bool("PLOW_GLM_DSA_PF_B8"),
             glm_dsa_kprep: env_bool("PLOW_GLM_DSA_KPREP"),
             glm_dsa_kw_dual: env_bool("PLOW_GLM_DSA_KW_DUAL"),
+            glm_dsa_fuse: env_bool("PLOW_GLM_DSA_FUSE"),
             glm_dsa_sel_union: env_bool("PLOW_GLM_DSA_SEL_UNION"),
+            glm_dsa_pf_shard: env_bool("PLOW_GLM_DSA_PF_SHARD"),
+            glm_dsa_pf_a2a: env_bool("PLOW_GLM_DSA_PF_A2A"),
             glm_production_defaults: false,
             glm_fp8_kv: env_bool_opt("PLOW_GLM_FP8_KV"),
             glm_moe_aiter: env_bool_opt("PLOW_GLM_MOE_AITER"),
@@ -1724,11 +2067,52 @@ impl EmitConfig {
             glm_gemm_lt: env_bool_opt("PLOW_GLM_GEMM_LT"),
             glm_gemm_lt_decode: env_bool_opt("PLOW_GLM_GEMM_LT_DECODE"),
             glm_gemm_lt_decode_ext: env_bool_opt("PLOW_GLM_GEMM_LT_DECODE_EXT"),
+            glm_decode_gemm_rows: env_u32("PLOW_GLM_DECODE_GEMM_ROWS"),
             glm_fold_lt: env_bool_opt("PLOW_GLM_FOLD_LT"),
             glm_gemm_blk: env_str("PLOW_GLM_GEMM_BLK"),
             glm_gemm_lt_pf_ext: env_str("PLOW_GLM_GEMM_LT_PF_EXT"),
+            glm53_gemm_lt: env_str("PLOW_GLM53_GEMM_LT"),
+            glm53_gemm_lt_min_rows: env_u32("PLOW_GLM53_GEMM_LT_MIN_ROWS").unwrap_or(2048),
+            glm53_gemm_lt_max_rows: env_u32("PLOW_GLM53_GEMM_LT_MAX_ROWS").unwrap_or(8192),
+            glm53_gemm_lt_dec: env_str("PLOW_GLM53_GEMM_LT_DEC"),
+            glm53_gemm_lt_dec_rungs: env_str("PLOW_GLM53_GEMM_LT_DEC_RUNGS")
+                .unwrap_or_else(|| "32,128".into()),
             glm_gemv_wg: env_u32("PLOW_GLM_GEMV_WG"),
             glm_ofold: env_bool("PLOW_GLM_OFOLD"),
+            glm_hc_norm_fold: env_bool("PLOW_GLM_HC_NORM_FOLD"),
+            glm_hc_post_fold: env_bool("PLOW_GLM_HC_POST_FOLD"),
+            glm_hc_pre_tail: env_bool("PLOW_GLM_HC_PRE_TAIL"),
+            glm53_sp_router: env_bool("PLOW_GLM53_SP_ROUTER"),
+            glm53_sp_kda_norm: env_bool("PLOW_GLM53_SP_KDA_NORM"),
+            glm53_packed_lean_kda: env_bool("PLOW_GLM53_PACKED_LEAN_KDA"),
+            glm53_l2_place: env_bool("PLOW_GLM53_L2_PLACE"),
+            glm53_mla_hpack_rows: env_u32("PLOW_GLM53_MLA_HPACK_ROWS"),
+            glm53_pf_hc_aiter: env_bool("PLOW_GLM53_PF_HC_AITER"),
+            glm53_mla_seg_kvw: env_bool("PLOW_GLM53_MLA_SEG_KVW"),
+            glm53_mla_hpack_gather: env_u32("PLOW_GLM53_MLA_HPACK_GATHER"),
+            glm_hc_mix_split: env_u32("PLOW_GLM_HC_MIX_SPLIT"),
+            glm_hc_fuse_dec: env_bool("PLOW_GLM_HC_FUSE_DEC"),
+            glm_kda_proj_group: env_bool("PLOW_GLM_KDA_PROJ_GROUP"),
+            glm_hc_fuse_r1: env_bool("PLOW_GLM_HC_FUSE_R1"),
+            glm_hc_mix_raw: env_bool("PLOW_GLM_HC_MIX_RAW"),
+            glm_router_raw: env_bool("PLOW_GLM_ROUTER_RAW"),
+            glm_router_signal: env_bool("PLOW_GLM_ROUTER_SIGNAL"),
+            glm_shared_glu_down: env_bool("PLOW_GLM_SHARED_GLU_DOWN"),
+            glm_xr_combine: env_bool("PLOW_GLM_XR_COMBINE"),
+            glm_kda_lt_order: env_bool("PLOW_GLM_KDA_LT_ORDER"),
+            glm_hc_aiter: env_bool("PLOW_GLM_HC_AITER"),
+            glm_hc_fold_mla: env_bool("PLOW_GLM_HC_FOLD_MLA"),
+            glm_hc_aiter_min_rows: env_u32("PLOW_GLM_HC_AITER_MIN_ROWS"),
+            kda_decode_wide_min_rows: env_u32("PLOW_KDA_DECODE_WIDE_MIN_ROWS"),
+            glm_kda_proj_group_s: env_u32("PLOW_GLM_KDA_PROJ_GROUP_S"),
+            glm_kda_qkvg_r1: env_bool("PLOW_GLM_KDA_QKVG_R1"),
+            glm_hc_fuse_variant: env_u32("PLOW_GLM_HC_FUSE_VARIANT"),
+            kda_decode_fused_min_rows: env_u32("PLOW_KDA_DECODE_FUSED_MIN_ROWS"),
+            glm_dec_splitk: env_u32("PLOW_GLM_DEC_SPLITK"),
+            glm_dec_splitk_max_rows: env_u32("PLOW_GLM_DEC_SPLITK_MAX_ROWS"),
+            glm_dec_splitk_2p: env_bool("PLOW_GLM_DEC_SPLITK_2P"),
+            glm_xr_hcpost: env_bool("PLOW_GLM_XR_HCPOST"),
+            glm_decode_glu_rows: env_bool("PLOW_GLM_DECODE_GLU_ROWS"),
             glm_pf_ns: env_u32("PLOW_GLM_PF_NS"),
             glm_router_overlap: env_u32("PLOW_GLM_ROUTER_OVERLAP"),
             glm_dsa_pf_span: env_u32("PLOW_GLM_DSA_PF_SPAN").unwrap_or(1),
@@ -1759,13 +2143,26 @@ impl EmitConfig {
             gemv_prefetch: env_bool("PLOW_GEMV_PREFETCH"),
             moe_stage2_lean: env_opt_out("PLOW_MOE_STAGE2_LEAN"),
             moe_align_par: env_opt_out("PLOW_MOE_ALIGN_PAR"),
+            dsv41_ops: std::env::var("PLOW_DSV41_OPS")
+                .ok()
+                .and_then(|v| v.trim().parse::<u32>().ok()),
             glm_moe_shared_seed: env_bool("PLOW_GLM_MOE_SHARED_SEED"),
             seq_par_seams: env_opt_out("PLOW_SEQ_PAR_SEAMS"),
             moe_prefill_ep: env_bool("PLOW_MOE_PREFILL_EP"),
             moe_stage1_lean: env_opt_out("PLOW_MOE_STAGE1_LEAN"),
             moe_combine_lean: env_bool_default_true("PLOW_MOE_COMBINE_LEAN"),
+            moe_fp8_pf_lean: env_bool("PLOW_MOE_FP8_PF_LEAN"),
+            moe_fp8_pf_min_rows: env_u32("PLOW_MOE_FP8_PF_MIN_ROWS").unwrap_or(0),
+            moe_fp8_pf_xq: env_bool_default_true("PLOW_MOE_FP8_PF_XQ"),
+            moe_fp8_pf_acc: env_bool("PLOW_MOE_FP8_PF_ACC"),
+            moe_fp8_pf_packed: env_bool("PLOW_MOE_FP8_PF_PACKED"),
             attnres_f32mix: env_opt_out("PLOW_ATTNRES_F32MIX"),
             moe_pf_det: env_bool("PLOW_MOE_PF_DET"),
+            moe_pf_w8a8: env_bool("PLOW_MOE_PF_W8A8"),
+            moe_pf_w8a8_split: env_bool("PLOW_MOE_PF_W8A8_SPLIT"),
+            moe_dec_w8a8: env_bool("PLOW_MOE_DEC_W8A8"),
+            moe_w8a8_dec: env_bool("PLOW_MOE_W8A8_DEC"),
+            moe_pf_w8a8_fq: env_bool_default_true("PLOW_MOE_PF_W8A8_FQ"),
             moe_stage1_body: env_bool("PLOW_MOE_STAGE1_BODY"),
             moe_stage2_body: env_bool("PLOW_MOE_STAGE2_BODY"),
             no_glu_fuse: env_bool("PLOW_NO_GLU_FUSE"),
@@ -1991,6 +2388,12 @@ impl EmitConfig {
     pub fn glm_gemm_lt_decode(&self) -> bool {
         self.glm_gemm_lt_decode
             .unwrap_or(self.glm_production_defaults)
+    }
+
+    /// `PLOW_GLM_DECODE_GEMM_ROWS`: does a `rows`-row decode rung take the GEMM tile family?
+    /// Never at one row, where the GEMV is the measured floor and the blob stays byte-identical.
+    pub fn glm_decode_gemm_rows_on(&self, rows: u32) -> bool {
+        rows > 1 && self.glm_decode_gemm_rows.is_some_and(|thr| rows >= thr.max(2))
     }
 
     pub fn glm_decode_gemm_group(&self) -> bool {

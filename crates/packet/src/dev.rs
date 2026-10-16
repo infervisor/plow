@@ -62,6 +62,35 @@ pub const GEMM_WIDE_C8_TAG: u32 = (128 << 16) | 384;
 /// nothing, and the arm's absence check would pass on a packet that is missing
 /// an operand.
 pub const TENSOR_NONE_I: u32 = TENSOR_NONE16 as u32;
+/// GemvF32 i7 marker (PLOW_GLM_HC_MIX_RAW): the one-row fused mHC mix packet is an isolated
+/// segment the runtime routes to `hc_mix_decode_gfx950.elf`; the interpreter ignores i7.
+pub const HC_MIX_RAW_MARK: u32 = 0x4843_4d58;
+/// PLOW_GLM_HC_AITER: a GemvF32 run as the AITER fused mHC raw segment.
+pub const HC_AITER_MARK: u32 = 0x4843_4149;
+/// GemmF32 i7 marker (PLOW_GLM_ROUTER_RAW): the decode router score GEMV and its top-k tail as
+/// one isolated segment the runtime routes to `router_decode_gfx950.elf`. t3 = routing table,
+/// t4 = score bias, t5 = per-row arrival counters; i3 = top-k, i4 = router flags, i5 = shared
+/// tail slot (bit 0) | ROUTER_RAW_SIGNAL, i6 = n_group | topk_group << 16; f0 = route scale.
+/// The interpreter never runs it.
+pub const ROUTER_RAW_MARK: u32 = 0x5254_5241;
+/// i5 bit of a `ROUTER_RAW_MARK` instruction: the next segment's consumers keep their counter
+/// waits on it and the kernel bumps that counter. The packet builder fills i5 bits 2..12 with the
+/// wait threshold and bits 12.. with the counter id.
+pub const ROUTER_RAW_SIGNAL: u32 = 2;
+/// MoeGroupGluPf (i7 = 6) / MoeGroupDownPf (i7 = 2) j1 (= fj[2]) high half (PLOW_MOE_W8A8_DEC):
+/// the decode pair is one segment the runtime routes to `moe_w8a8_dec_gfx950.elf`; the low half
+/// is the align's tile-count bound. The interpreter's W8A8 arms ignore j1 (i6 is the EP degree).
+pub const MOE_W8A8_DEC_MARK: u32 = 0x4d57_0000;
+
+pub fn moe_w8a8_dec_marked_parts(op: u16, i: &[u32; 8], j1: u32) -> bool {
+    j1 & 0xffff_0000 == MOE_W8A8_DEC_MARK
+        && ((op == DevOp::MoeGroupGluPf as u16 && i[7] == 6)
+            || (op == DevOp::MoeGroupDownPf as u16 && i[7] == 2))
+}
+
+pub fn moe_w8a8_dec_marked(inst: &DevInst64) -> bool {
+    moe_w8a8_dec_marked_parts(inst.op, &inst.i, inst.fj[2])
+}
 
 /// uint32 slots between adjacent counters — one 128-byte cache line.
 ///
@@ -2258,6 +2287,121 @@ pub enum DevOp {
     /// [`DevOp::FlashPrefillFp8`] sites read it (their `i7` high half).
     /// `t0=out(u32[rows]) t1=ids(u32[rows])` · `i0=rows`.
     MmSpanExtent = 210,
+    /// Prefill grouped bf16 GEMM over one concatenated weight: `C_g[T, N_g] = x[T, K] .
+    /// W[r_g .. r_g + N_g, K]^T` for up to six column groups (`r_g` = sum of the earlier `N_g`),
+    /// each written row-major to its own output. A standalone segment route
+    /// (`gemm_group_pf_gfx950`), never an interpreter case.
+    /// `t0=x t1=weight t2=out0 t3=out1? t4=out2? t5=out3? t6=out4? t7=out5?` ·
+    /// `i0=T i1=K i2=N0 i3=N1 i4=N2 i5=N3 i6=N4 i7=N5` (`N=0`: unused group).
+    GemmGroupPf = 211,
+    /// DeepSeek-V4 CSA2: the learned-pooling KV compressor (`op_compress.h`
+    /// `d_compress_pool`, `[DSV4-COMPRESS]`). One workgroup per compressed entry,
+    /// grid-strided over `n_pools`; the per-channel softmax pools `ratio` source rows
+    /// into one cache row, RMSNorms it, applies RoPE, and quantizes. `i7 = rotate`
+    /// selects the template arm: 0 = the fp8 path, 1 = the Hadamard-rotated fp4 path
+    /// (the ROTATE=true instantiation, different clamp constants), and 2 = V4.1's, which
+    /// is the unrotated template with the epilogue stopped after the norm.
+    /// `t0=out t1=kv t2=score t3=ape t4=gamma t5=cosb t6=sinb t7=pos(decode only)` ·
+    /// `i0=n_pools i1=ratio i2=coff i3=d i4=rd i5=qblk i6=out_base i7=rotate` · `f0=eps`.
+    ///
+    /// A non-null `t7` makes it a DECODE call — the kernel gates on
+    /// `(pos[0] + 1) % ratio == 0` and takes the output slot from `pos[0]` instead
+    /// of `i6`, so the decode packet needs no per-step immediate patching.
+    CompressPool = 212,
+    /// DeepSeek-V4 CSA2's conjugate rotation on the attention output's last `rd`
+    /// dims (`op_compress.h` `d_rope_inverse_o`, `[DSV4-IROPE]`). In place.
+    /// `t0=o(in/out) t1=cosb t2=sinb t3=pos` · `i0=n_tok i1=n_head i2=D i3=rd i4=pos0`.
+    ///
+    /// STRUCTURAL, not cosmetic: `o` mixes cached rows each rotated by its OWN
+    /// position, so de-rotating by the QUERY's position is what leaves a
+    /// position-independent latent for the fixed `wo_a`. Interleaved (GPT-J) pairs,
+    /// NOT the half-split [`DevOp::HeadNormRope`] defaults to. `t3` supersedes `i4`
+    /// when present, for the same reason [`DevOp::CompressPool`]'s does.
+    RopeInverseO = 213,
+    /// DeepSeek-V4.1's Engram conditional memory: the gate + mix (`op_engram.h`
+    /// `d_engram_gate`, `[DSV41-ENGRAM]`). In place on `t0`.
+    /// `t0=x(bf16[T][n][hidden], in/out) t1=kv(bf16[T][(n+1)*hidden]) t2=q_weight
+    /// t3=k_weight t4=token_mask(u8[T])` · `i0=T i1=n i2=hidden` · `f0=norm_eps`.
+    ///
+    /// Only the THIRD stage of Engram is an opcode. The n-gram hash is integer work over
+    /// token ids alone, with its primes, multipliers and compressed-token map fixed at
+    /// load time from the tokenizer, so it arrives as a host-built tensor like `pos`. The
+    /// embed and `wkv` projection are an ordinary gathered fp8 read and fp8 block-scale
+    /// GEMM. What is left, and what this computes, is the gate: a per-(token, hc copy)
+    /// normalized dot of the stream against the key, through a SIGNED sqrt before the
+    /// sigmoid, with the shared value added into every copy under it.
+    ///
+    /// `t4 = 0` shuts the gate and the token passes through UNTOUCHED -- it does not get a
+    /// zero value added. That distinction is the whole point of masking image spans, which
+    /// take part in no n-gram.
+    EngramGate = 214,
+    /// DeepSeek-V4.1 Engram stage 2: the gathered table read (`op_engram.h`
+    /// `d_engram_embed`, `[DSV41-ENGRAM]`).
+    /// `t0=out(bf16[T][n_cols*head_dim]) t1=table(fp8 e4m3 OCP) t2=scale(ue8m0)
+    /// t3=ids(i32[T][n_cols])` · `i0=T i1=n_cols i2=head_dim i3=blk i4=vocab_start
+    /// i5=part_rows`.
+    ///
+    /// `i4 = `[`TENSOR_NONE_I`] (the wire sentinel, 0xFFFF -- NOT zero, because rank 0's
+    /// base IS zero) means DERIVE the shard base as `rank * i5`. One program
+    /// serves all eight ranks, so the emitter cannot write `vocab_start` as an immediate
+    /// -- and does not need to patch it per rank either, since the interpreter has
+    /// `prog.rank`. `ParallelEngramEmbedding` places rank `r` at `r * part_num_embeddings`
+    /// and nowhere else (`model.py:303-305`), so this is the placement rather than a
+    /// convention. An explicit `i4` still wins, which is what a single-rank test passes.
+    ///
+    /// The output is laid out flat as one `n_cols * head_dim` row per token, which is
+    /// exactly what the `wkv` GEMM consumes, so no reshape sits between them.
+    ///
+    /// The table is sharded over its ROWS -- it is the largest tensor in the checkpoint,
+    /// 384 006 168 rows of 256 fp8 -- so an id outside `[i4, i4 + i5)` writes ZEROS and the
+    /// emitter's [`DevOp::XReduce`] sums the ranks back together.
+    ///
+    /// `i3 = blk` is 32 for V4.1 (`weight_block_size [32, 32]`), NOT the `[128, 128]` grid
+    /// V4 used. Getting it wrong rescales every lookup and faults nowhere.
+    EngramEmbed = 215,
+    /// DeepSeek-V4.1 block-fp8 prefill GEMM at a `[32, 32]` **ue8m0** scale grid
+    /// (`op_gemm_common.h` `d_gemm_fp8_mx` -> `d_gemm_t<WFP8MX>`).
+    ///
+    /// `t0=out(bf16[T][N]) t1=x(bf16[T][K]) t2=w(fp8 e4m3 OCP[N][K])
+    /// t3=scale(ue8m0[ceil(N/32)][ceil(K/32)])` · `i0=T i1=N i2=K`.
+    ///
+    /// The scale grid is row-major with K innermost. `K % 32 == 0` is REQUIRED -- the kernel is
+    /// the KEXACT instantiation at BK=32 -- and every V4.1 projection satisfies it by
+    /// construction, since the scale grid could not exist otherwise.
+    ///
+    /// **A SEPARATE OPCODE FROM [`DevOp::GemmFp8Blk`], NOT A FLAG ON IT.** Op 107 indexes its
+    /// grid as `S[(n>>7) * ceil(K/128) + (k>>7)]` with **f32** entries; this one is blocked 32
+    /// on BOTH axes with **byte** entries. Handing 107 a V4.1 scale handle does not fault -- it
+    /// rescales every output, and the model merely gets worse. Encoding that in the opcode is
+    /// what makes the mismatch a load-time refusal instead of a silent one.
+    ///
+    /// Every V4.1 projection lowers to this: `wq_a`/`wq_b`/`wkv`/`wo_a`/`wo_b`, the shared
+    /// expert, `engram.wkv` and `indexer.wq_b` -- 39.8% of an 8k prefill's FLOPs. The routed
+    /// experts do NOT; they are MXFP4 on ops 85/86.
+    GemmFp8Mx = 216,
+    /// DeepSeek-V4.1's compressed-row tail: interleaved RoPE on the last `rd` channels, then
+    /// the blockwise fake quant, one workgroup per row (`op_compress.h`
+    /// `d_compress_rope_quant`, `[DSV41-CQUANT]`).
+    /// `t0=out t1=src t2=cosb t3=sinb t4=pos` ·
+    /// `i0=n_rows i1=d i2=rd i3=qblk i4=ratio i5=row_base i6=qmode i7=n_head`.
+    ///
+    /// V4.1 SPLIT WHAT V4 FUSED. [`DevOp::CompressPool`] with `i7 = 2` stops after the norm,
+    /// because `Compressor.forward` returns the latent before RoPE for the indexer to consume;
+    /// this op is the rest, and it serves both consumers of that latent —
+    /// `i6 = 2` (fp4 e2m1, E4M3 scale) with `i3 = 16` is the compressed KV cache,
+    /// `i6 = 1` (fp4 e2m1, E8M0 scale) with `i3 = 32` is the indexer's keys.
+    /// The whole row is quantized either way; the rope tail stays bf16 only on
+    /// [`DevOp::CompressPool`]'s V4 arm.
+    ///
+    /// `t0` and `t1` must NOT alias: the indexer reads `src`, and the reference's in-place rope
+    /// is a write-after-read the packet order does not express. `t4` supersedes `i5` when
+    /// present, for the same reason [`DevOp::CompressPool`]'s `t7` does.
+    ///
+    /// `i7 = n_head` (**default 1**) makes a row `[n_head][d]` rotated at ONE position — the
+    /// indexer's queries, `apply_rotary_emb(q[..., -rd:], freqs_cis[start:end])` over
+    /// `[b, s, n_heads, index_head_dim]` then `fp4_act_quant(q, 32, True)` (`model.py:550-552`).
+    /// A third call site, differing from the other two only in `i3`/`i6`/`i7`.
+    CompressRopeQuant = 217,
 }
 
 /// [`DevOp::FlashPrefillFp8`]'s split count (`i7` low half).
@@ -2303,6 +2447,10 @@ pub const ACT_ROUND_BF16: u32 = 18;
 /// GLU-family `act` code for GPT-OSS's `swiglu_oai` (pair form, `f0 = alpha`, `f1 = limit`).
 /// Codes 0/1/2 are gelu_tanh / silu / situ; see [`DevOp::Glu`].
 pub const ACT_SWIGLU_OAI: u32 = 3;
+/// GLU-family `act` code for the clamped SwiGLU `silu(min(g, L)) * clamp(u, ±L)` (pair form,
+/// `f1 = L`): DeepSeek-V4 and GLM-5.3-Flash `swiglu_limit`. Only the pair-form epilogues
+/// (`moe_glu`, `act_glu_pair`) serve it; the gate-only GEMM/GEMV GLU epilogues poison it to NaN.
+pub const ACT_SWIGLU_CLAMP: u32 = 4;
 /// [`DevOp::HeadNormRope`] `i5 = pair_mode`: force half-split (NeoX) pairing at every `hd`.
 pub const ROPE_PAIR_HALF: u32 = 2;
 /// [`DevOp::HeadNormRope`] `i5 = pair_mode`: the DSA indexer key prep (PLOW_DSA_PREP) — LayerNorm
@@ -2527,6 +2675,13 @@ impl DevOp {
         DevOp::ChunkAttentionF32,
         DevOp::MmRowsBf16,
         DevOp::MmSpanExtent,
+        DevOp::GemmGroupPf,
+        DevOp::CompressPool,
+        DevOp::RopeInverseO,
+        DevOp::EngramGate,
+        DevOp::EngramEmbed,
+        DevOp::GemmFp8Mx,
+        DevOp::CompressRopeQuant,
     ];
 
     /// Recover the opcode from its wire discriminant, or `None` for a value no
@@ -2758,6 +2913,13 @@ impl DevOp {
             DevOp::ChunkAttentionF32 => "PLOW_DOP_CHUNK_ATTENTION_F32",
             DevOp::MmRowsBf16 => "PLOW_DOP_MM_ROWS_BF16",
             DevOp::MmSpanExtent => "PLOW_DOP_MM_SPAN_EXTENT",
+            DevOp::GemmGroupPf => "PLOW_DOP_GEMM_GROUP_PF",
+            DevOp::CompressPool => "PLOW_DOP_COMPRESS_POOL",
+            DevOp::RopeInverseO => "PLOW_DOP_ROPE_INVERSE_O",
+            DevOp::EngramGate => "PLOW_DOP_ENGRAM_GATE",
+            DevOp::EngramEmbed => "PLOW_DOP_ENGRAM_EMBED",
+            DevOp::GemmFp8Mx => "PLOW_DOP_GEMM_FP8_MX",
+            DevOp::CompressRopeQuant => "PLOW_DOP_COMPRESS_ROPE_QUANT",
         }
     }
 
@@ -2816,7 +2978,9 @@ impl DevOp {
     /// 206 -> 210 for `RmsNormF32 = 206` .. `MmRowsBf16 = 209` (multimodal towers and LM
     /// soft-token rows).
     /// 210 -> 211 for `MmSpanExtent = 210` (bidirectional media spans).
-    pub const COUNT: u16 = 211;
+    /// 211 -> 212 for `GemmGroupPf = 211` (grouped prefill projection route).
+    /// 212 -> 218 for `CompressPool = 212` .. `CompressRopeQuant = 217` (DeepSeek-V4.1).
+    pub const COUNT: u16 = 218;
 
     /// The `(M, N, K, quant)` a decode-GEMV opcode carries, or `None` if this is not one.
     ///

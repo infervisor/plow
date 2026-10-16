@@ -34,7 +34,10 @@
 # PROD_COOLDOWN (25) s unmeasured, PROD_ARGS (extra client args: distributions, SLOs); cells q<1000*rate>.
 # Records <resdir>/provenance.json for the strict report (serving_comparison.py render): plow needs
 # KV_DTYPE (or PRECISION) and, for a PLOWRT outside a git checkout, PLOWRT_GIT_SHA.
-# CPU host (no nvidia-smi): peak memory is the server's summed Pss (cpu_peak_mem.py), vLLM drops
+# READY_S (900) bounds the server readiness wait; a large MoE load needs ~3600.
+# AMD host (amd-smi, no nvidia-smi): peak memory is board VRAM over the visible GPUs
+# (gpu_peak_mem.py --amd); PYREF is normally scripts/bench/vllm-rocm-client.sh (Docker image).
+# CPU host (no nvidia-smi/amd-smi): peak memory is the server's summed Pss (cpu_peak_mem.py), vLLM drops
 # --gpu-memory-utilization, and a containerised server is sampled through its cgroup. llamacpp
 # serves GGUF (BF16 for a matched comparison) with LLAMA_IMAGE (ghcr.io/ggml-org/llama.cpp:full)
 # and LLAMA_ARGS (llama-server flags); PYREF stays the vLLM client.
@@ -57,7 +60,8 @@ fi
 CONCS=${CONCS:-1 8 32 64 128} ISL=${ISL:-1000} OSL=${OSL:-128} REPS=${REPS:-2}
 SAMPLED=${SAMPLED---temperature 1 --top-p 0.95}
 mkdir -p "$RES"
-CPU_HOST=; command -v nvidia-smi >/dev/null 2>&1 || CPU_HOST=1
+CPU_HOST=; command -v nvidia-smi >/dev/null 2>&1 || command -v amd-smi >/dev/null 2>&1 \
+    || command -v rocminfo >/dev/null 2>&1 || CPU_HOST=1
 SERVER_CONTAINER=
 VLLM_GPU_ARGS="--gpu-memory-utilization ${VLLM_MEM:-0.85}"
 [ -n "$CPU_HOST" ] && VLLM_GPU_ARGS=
@@ -103,6 +107,10 @@ memory_start() { # tag
         nvidia-smi --query-compute-apps=timestamp,pid,used_memory \
             --format=csv,noheader,nounits -lms 100 > "$RES/$1.memory.csv" 2> "$RES/$1.memory.log" &
         memory_sampler_pid=$!
+    else
+        python3 "$HERE/scripts/bench/gpu_peak_mem.py" --amd --out "$RES/$1.peak_gpu_memory_mib.txt" \
+            2> "$RES/$1.memory.log" &
+        memory_sampler_pid=$!
     fi
 }
 memory_stop() {
@@ -120,7 +128,7 @@ memory_finish() { # tag
     fi
 }
 trap 'memory_stop; pb_metrics_stop; pb_serve_stop; [ -n "$SERVER_CONTAINER" ] && sudo -n docker rm -f "$SERVER_CONTAINER" >/dev/null 2>&1' EXIT
-pb_serve_wait 900 || exit 3
+pb_serve_wait "${READY_S:-900}" || exit 3
 if [ "${3:-}" = --needle ]; then
     needle_template_args=()
     if [ -n "${NEEDLE_CHAT_TEMPLATE_HF:-}" ]; then

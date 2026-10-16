@@ -1251,6 +1251,7 @@ fn glm_ref_cfg() -> GlmCfg {
         softmax_layers: vec![],
         has_dsa: true,
         quark_mixed: false,
+        swiglu_limit: None,
     }
 }
 
@@ -4460,6 +4461,150 @@ fn glm_routed_w8a8_preserves_pipeline_and_bf16_reduction() {
 }
 
 #[test]
+fn moe_pf_w8a8_marks_grouped_pair_and_quantizes_input() {
+    let _guard = crate::test_env::env_guard();
+    let _env = crate::test_env::EnvScope::set(&[
+        ("PLOW_MOE_PF_W8A8", "1"),
+        ("PLOW_MOE_PF_W8A8_FQ", "0"),
+        ("PLOW_UNISEG", "1"),
+        ("PLOW_GLM_DSA", "0"),
+    ]);
+    for tp in [4, 8] {
+        let mut c = glm_ref_cfg();
+        c.tp = tp;
+        let (h, inter) = (c.hidden, c.moe_inter / tp);
+        let rows = 128;
+        let mut decl = Builder::new(256);
+        let n = declare_glm_rows_batched(&mut decl, &c, 512, &[3], rows, rows, MoeEnc::Fp8Blk);
+        let tensors = decl.tensors();
+        assert_eq!(tensors[n.routed_xq as usize].bytes, (rows * h) as u64);
+        assert_eq!(tensors[n.routed_xs as usize].bytes, (rows * (h / 128) * 4) as u64);
+        let mut b = Builder::new(256);
+        b.adopt_tensors(tensors);
+        let all = b.all();
+        emit_glm_block_prefill(
+            &mut b,
+            &c,
+            &n,
+            0,
+            512,
+            rows,
+            MoeEnc::Fp8Blk,
+            n.x,
+            n.xnext,
+            &[],
+            &mut 0,
+            &all,
+            None,
+        );
+        let p = b.finish();
+        let q = p
+            .insts
+            .iter()
+            .find(|d| d.op == DevOp::QuantFp8Block128 as u16 && d.t[0] == n.routed_xq)
+            .expect("routed input quant");
+        assert_eq!((q.t[1], q.t[2], q.i[0], q.i[1]), (n.xn2, n.routed_xs, rows, h));
+        let glu = p.insts.iter().find(|d| d.op == DevOp::MoeGroupGluPf as u16).unwrap();
+        assert_eq!(
+            (glu.t[1], glu.t[6], glu.t[7], glu.i[0], glu.i[4], glu.i[7]),
+            (n.routed_xq, n.routed_xs, n.fu_scale, inter, rows, 2)
+        );
+        let down = p.insts.iter().find(|d| d.op == DevOp::MoeGroupDownPf as u16).unwrap();
+        assert_eq!((down.t[1], down.t[5], down.i[7]), (n.fu_g, n.fu_scale, 2));
+        assert_ne!(n.fu_scale, TENSOR_NONE);
+    }
+}
+
+#[test]
+fn moe_pf_w8a8_split_reads_bf16_input_without_quant() {
+    let _guard = crate::test_env::env_guard();
+    let _env = crate::test_env::EnvScope::set(&[
+        ("PLOW_MOE_PF_W8A8", "1"),
+        ("PLOW_MOE_PF_W8A8_SPLIT", "1"),
+        ("PLOW_UNISEG", "1"),
+        ("PLOW_GLM_DSA", "0"),
+    ]);
+    let mut c = glm_ref_cfg();
+    c.tp = 8;
+    let inter = c.moe_inter / 8;
+    let rows = 128;
+    let mut decl = Builder::new(256);
+    let n = declare_glm_rows_batched(&mut decl, &c, 512, &[3], rows, rows, MoeEnc::Fp8Blk);
+    let tensors = decl.tensors();
+    let mut b = Builder::new(256);
+    b.adopt_tensors(tensors);
+    let all = b.all();
+    emit_glm_block_prefill(
+        &mut b,
+        &c,
+        &n,
+        0,
+        512,
+        rows,
+        MoeEnc::Fp8Blk,
+        n.x,
+        n.xnext,
+        &[],
+        &mut 0,
+        &all,
+        None,
+    );
+    let p = b.finish();
+    assert!(!p.insts.iter().any(|d| d.op == DevOp::QuantFp8Block128 as u16 && d.t[1] == n.xn2));
+    let glu = p.insts.iter().find(|d| d.op == DevOp::MoeGroupGluPf as u16).unwrap();
+    assert_eq!(
+        (glu.t[1], glu.t[7], glu.i[0], glu.i[4], glu.i[7]),
+        (n.xn2, n.fu_scale, inter, rows, 4)
+    );
+    let down = p.insts.iter().find(|d| d.op == DevOp::MoeGroupDownPf as u16).unwrap();
+    assert_eq!((down.t[1], down.t[5], down.i[7]), (n.fu_g, n.fu_scale, 4));
+}
+
+#[test]
+fn moe_pf_w8a8_fq_quantizes_in_the_glu() {
+    let _guard = crate::test_env::env_guard();
+    let _env = crate::test_env::EnvScope::set(&[
+        ("PLOW_MOE_PF_W8A8", "1"),
+        ("PLOW_UNISEG", "1"),
+        ("PLOW_GLM_DSA", "0"),
+    ]);
+    let mut c = glm_ref_cfg();
+    c.tp = 8;
+    let inter = c.moe_inter / 8;
+    let rows = 128;
+    let mut decl = Builder::new(256);
+    let n = declare_glm_rows_batched(&mut decl, &c, 512, &[3], rows, rows, MoeEnc::Fp8Blk);
+    let tensors = decl.tensors();
+    let mut b = Builder::new(256);
+    b.adopt_tensors(tensors);
+    let all = b.all();
+    emit_glm_block_prefill(
+        &mut b,
+        &c,
+        &n,
+        0,
+        512,
+        rows,
+        MoeEnc::Fp8Blk,
+        n.x,
+        n.xnext,
+        &[],
+        &mut 0,
+        &all,
+        None,
+    );
+    let p = b.finish();
+    assert!(!p.insts.iter().any(|d| d.op == DevOp::QuantFp8Block128 as u16 && d.t[1] == n.xn2));
+    let glu = p.insts.iter().find(|d| d.op == DevOp::MoeGroupGluPf as u16).unwrap();
+    assert_eq!(
+        (glu.t[1], glu.t[7], glu.i[0], glu.i[4], glu.i[7]),
+        (n.xn2, n.fu_scale, inter, rows, 6)
+    );
+    let down = p.insts.iter().find(|d| d.op == DevOp::MoeGroupDownPf as u16).unwrap();
+    assert_eq!((down.t[1], down.t[5], down.i[7]), (n.fu_g, n.fu_scale, 2));
+}
+
+#[test]
 #[should_panic(expected = "PLOW_GLM_ROUTED_W8A8 requires")]
 fn glm_routed_w8a8_refuses_bf16_weights() {
     let _guard = crate::test_env::env_guard();
@@ -4533,6 +4678,7 @@ fn glm53_ref_cfg() -> GlmCfg {
         softmax_layers: vec![false, false], // both layers KDA, no MLA layer needed here
         has_dsa: false,
         quark_mixed: false,
+        swiglu_limit: None,
     }
 }
 
@@ -4576,6 +4722,62 @@ fn glm53_program_assembly_keeps_every_tensor_handle_in_the_final_table() {
                 inst.op,
                 tensors.len()
             );
+        }
+    }
+}
+
+/// A GLM-5.3 packed-prefill sibling samples every span's last row: `RowGather` over the host's
+/// `in.pf_term` table, the head as a tiled GEMM over those rows (row 0 onward, so the host's
+/// last-row `a_row0` patch must not apply), and an argmax over the same rows. The ordinary
+/// prefill program keeps its one-row `Gemv` tail.
+#[test]
+fn glm53_packed_sibling_tail_samples_every_span() {
+    let _guard = crate::test_env::env_guard();
+    let c = glm53_ref_cfg();
+    let layers: Vec<u32> = (0..c.layers).collect();
+    let enc = MoeEnc::from_flags(false, false);
+    let rows = 128;
+    let mut tb = Builder::new(256);
+    let n = declare_glm_rows_batched_for_prefill(&mut tb, &c, 1024, &layers, rows, 128, enc, &[rows]);
+    let s = declare_glm53(&mut tb, &c, rows, 128, n.pos);
+    let tensors = tb.tensors();
+    let build = |packed: bool| {
+        let mut b = Builder::new(256);
+        b.set_tensor_dedup(true);
+        b.adopt_tensors(tensors.clone());
+        b.set_packed_prefill_segments(packed);
+        emit_glm53_program(&mut b, &c, &n, &s, 1024, rows, 128, enc, true);
+        b.finish()
+    };
+    let plain = build(false);
+    assert!(!plain.insts.iter().any(|d| d.op == DevOp::RowGather as u16));
+    let packed = build(true);
+    let gather: Vec<_> = packed
+        .insts
+        .iter()
+        .filter(|d| d.op == DevOp::RowGather as u16)
+        .collect();
+    assert_eq!(gather.len(), 1);
+    assert_eq!(gather[0].i[0], 128);
+    assert_eq!(gather[0].i[2], rows);
+    let name = |h: u32| packed.tensors[h as usize].name.as_str();
+    assert_eq!(name(gather[0].t[2]), "in.pf_term");
+    let head = packed
+        .insts
+        .iter()
+        .find(|d| d.t[0] == n.logits)
+        .expect("packed tail writes the logits");
+    assert_ne!(head.op, DevOp::Gemv as u16);
+    assert_eq!((head.t[1], head.i[0]), (gather[0].t[0], 128));
+    let argmax = packed
+        .insts
+        .iter()
+        .find(|d| d.op == DevOp::Argmax as u16)
+        .expect("argmax");
+    assert_eq!(argmax.i[1], 128);
+    for inst in &packed.insts {
+        for &h in &inst.t {
+            assert!(h == TENSOR_NONE || (h as usize) < packed.tensors.len());
         }
     }
 }
@@ -6844,6 +7046,8 @@ fn glm_seq_par_proj_routes_on_the_band() {
         &mut xgate,
         &all,
         false,
+        None,
+        GLM_ROUTER_FLAGS,
     );
     let p = b.finish();
     let name = |h: u32| p.tensors[h as usize].name.as_str();
@@ -6951,6 +7155,8 @@ fn glm_router_overlap_runs_the_band_router_beside_the_hidden_gather() {
             &mut xgate,
             &all,
             false,
+            None,
+            GLM_ROUTER_FLAGS,
         );
         (n, c, b.finish())
     };
@@ -7094,6 +7300,8 @@ fn glm_gemm_lt_pf_ext_routes_the_interpreter_projections() {
             &mut xgate,
             &all,
             false,
+            None,
+            GLM_ROUTER_FLAGS,
         );
         b.finish()
     };
@@ -8172,4 +8380,72 @@ fn glm_mla_strided_wv_preserves_bf16_boundary_and_rung_domain() {
         assert_eq!(p.insts[merge + 1].op, DevOp::MlaBmmFp8 as u16);
         assert_eq!(p.insts[merge + 1].i, [rows, 8, 256, 512, 0, stride, 0, 0]);
     }
+}
+
+/// GLM-5.3-Flash keeps `quantization_config` beside `text_config`, not inside it, and carries
+/// `swiglu_limit`: the cfg must see block-fp8 experts and the clamped GLU, and the dense FFN
+/// must emit the clamp code with the limit in `f1` (GLM-5.2 stays on SiLU, `f1` untouched).
+#[test]
+fn glm5_next_cfg_reads_root_quantization_and_clamped_swiglu() {
+    let _guard = crate::test_env::env_guard();
+    let dir = std::env::temp_dir().join(format!("plow-glm5-next-cfg-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let config = serde_json::json!({
+        "model_type": "glm5_next",
+        "quantization_config": {"quant_method": "fp8", "fmt": "e4m3",
+                                "activation_scheme": "dynamic", "weight_block_size": [128, 128]},
+        "text_config": {
+            "model_type": "glm5_next_text", "num_hidden_layers": 2,
+            "hidden_size": 4096, "num_attention_heads": 64,
+            "kv_lora_rank": 512, "q_lora_rank": 1536,
+            "qk_nope_head_dim": 256, "qk_rope_head_dim": 0, "v_head_dim": 256,
+            "mla_use_nope": true, "vocab_size": 128, "rms_norm_eps": 1e-5,
+            "n_routed_experts": 288, "num_experts_per_tok": 8,
+            "moe_intermediate_size": 2048, "intermediate_size": 12288,
+            "first_k_dense_replace": 2, "routed_scaling_factor": 2.5,
+            "swiglu_limit": 10.0, "index_kpool": 4,
+            "mhc": true, "hc_mult": 4, "hc_sinkhorn_iters": 20, "hc_eps": 1e-6,
+            "linear_attn_config": {"full_attn_layers": [1]}
+        }
+    });
+    std::fs::write(dir.join("config.json"), config.to_string()).unwrap();
+    let c = cfg_glm(&dir);
+    assert_eq!(c.swiglu_limit, Some(10.0));
+    assert_eq!(c.prefix, "model.language_model.");
+    assert_eq!(c.softmax_layers, vec![false, true]);
+    assert_eq!(mla_ckpt_enc(&dir), Some(MoeEnc::Fp8Blk));
+    assert_eq!(glm_glu_act(&c), (packet::dev::ACT_SWIGLU_CLAMP, 10.0));
+
+    let mut b = Builder::new(256);
+    let n = declare_glm_rows_batched(&mut b, &c, 1, &[0], 1, 1, MoeEnc::Fp8Blk);
+    let all = b.all();
+    let norm = b.emit(DevOp::RmsNorm, all.clone(), &[], |d| {
+        d.t[0] = n.xn2;
+        d.t[1] = n.x;
+        d.t[2] = n.lw[0].gpost;
+        d.i[0] = 1;
+        d.i[1] = c.hidden;
+        d.f[0] = c.eps;
+    });
+    emit_glm_dense_ffn(&mut b, &c, &n, 0, 1, MoeEnc::Fp8Blk, n.xnext, norm, &mut 0, &all, false);
+    let p = b.finish();
+    let glu = p
+        .insts
+        .iter()
+        .find(|d| d.op == DevOp::DenseGluFp8Blk as u16)
+        .expect("block-fp8 dense GLU");
+    assert_eq!(glu.i[5], packet::dev::ACT_SWIGLU_CLAMP);
+    assert_eq!(glu.f[1], 10.0);
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn glm_decode_projections_never_take_gemm_med() {
+    // The GLM_SHARD_HEAD B=128 shard is a prefill GemmMed pick; the decode route must not keep it.
+    let shard = pick_tile(128, 154880 / 8, 4096, 256, kernelcaps::QuantScheme::None);
+    assert_eq!(shard, DevOp::GemmMed);
+    assert_eq!(glm_decode_tile_of(shard), DevOp::GemmSmall);
+    assert_eq!(glm_decode_tile_of(DevOp::Gemm), DevOp::Gemm);
+    assert_eq!(glm_decode_tile_of(DevOp::GemmSmall), DevOp::GemmSmall);
+    assert_eq!(glm_decode_tile_of(DevOp::GemmWide), DevOp::GemmSmall);
 }

@@ -186,6 +186,17 @@ __device__ __forceinline__ const int* plow_packed_span_kv_len(const PlowProgram*
     return kv_len + s->slot;
 }
 
+/* Workgroup slice for the span whose work items start at `off` in the packet's running item
+ * count. Span loops run every span on every workgroup in turn; starting each span's item 0 on
+ * workgroup `off % nblk` instead of 0 spreads short spans (one-row decode spans) across the
+ * machine instead of piling them onto the first workgroups. A rotation is a permutation of
+ * slices, so each item still has exactly one owner. */
+__device__ __forceinline__ unsigned plow_packed_span_slice(unsigned slice, unsigned nblk,
+                                                          size_t off) {
+    const unsigned r = (unsigned)(off % nblk);
+    return slice >= r ? slice - r : slice + nblk - r;
+}
+
 __device__ __forceinline__ const PlowPrefillSpan* plow_packed_prefill_span(
     const PlowProgram* prog, uint32_t index) {
     if (!plow_packed_prefill_enabled(prog) || index >= prog->n_prefill_spans) __builtin_trap();
@@ -193,9 +204,14 @@ __device__ __forceinline__ const PlowPrefillSpan* plow_packed_prefill_span(
     if (!span->n_rows) __builtin_trap();
     const uint32_t end = span->row0 + span->n_rows;
     if (end < span->row0 || end > prog->n_prefill_rows) __builtin_trap();
+#if PLOW_PACKED_KDA_RIDER
+    /* The host's KDA view (PLOW_AMD_RIDER_KDA) starts past the leading one-row spans. */
+    if (index && (span - 1)->row0 + (span - 1)->n_rows != span->row0) __builtin_trap();
+#else
     if ((index == 0u && span->row0 != plow_packed_prefill_band(prog)) ||
         (index && (span - 1)->row0 + (span - 1)->n_rows != span->row0))
         __builtin_trap();
+#endif
     if (prog->prefill_parked[span->row0] || prog->prefill_parked[end - 1u]) __builtin_trap();
     return span;
 }

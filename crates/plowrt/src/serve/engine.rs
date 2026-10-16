@@ -10,9 +10,12 @@
 //! per-backend tick body: how many sequences it serves, and what its stop set
 //! is. Everything richer stays inside the variant.
 //!
-//! What is deliberately NOT here: VMM/prefix sharing, the S1 `ModelManager`,
-//! and multi-model residency. Those are CUDA-only today and stay CUDA-only —
-//! an AMD serve is one model, B fixed sequence slots, no paging.
+//! The AMD engine is slotted too (B fixed sequence slots with per-slot prefix
+//! snapshots, packed prefill), and an AMD serve holds several engines: models
+//! and `--dp` ranks, each placed on its own TP group (`AmdServe::load_on`) by
+//! `serve::placement`, all resident. What stays CUDA-only: VMM paging and the
+//! cross-request VMM prefix probe, and the S1 `ModelManager` (VRAM-budgeted
+//! residency switching and eviction).
 
 use std::sync::Arc;
 
@@ -133,6 +136,35 @@ pub trait SeqEngine {
     fn take_packed_tokens(&mut self) -> Vec<(usize, u32)> {
         Vec::new()
     }
+    /// Whether the live decode rows may ride a packed prefill launch as one-row spans.
+    fn mixed_pack_ready(&self) -> bool {
+        false
+    }
+    /// Cut `slot`'s pending prefill chunk to its first `rows` rows (the rest becomes its next
+    /// chunk). No-op where the backend plans no chunks.
+    fn shrink_prefill_chunk(&mut self, _slot: usize, _rows: u32) -> crate::Result<()> {
+        Ok(())
+    }
+    /// Whether one launch of chunks `rows` costs no more rung rows than running each alone.
+    fn pack_pays(&self, _rows: &[u32]) -> bool {
+        true
+    }
+    /// Consecutive group sizes a planned pack of chunks `rows` runs as (`PLOW_AMD_PACK_FILL`).
+    fn pack_groups(&self, rows: &[u32]) -> Vec<usize> {
+        vec![rows.len()]
+    }
+    /// [`Self::advance_packed_prefill`] with decode `feeds` riding as one-row spans;
+    /// `output[i]` receives feed `i`'s next token; `Ok(false)` if they did not ride.
+    fn advance_packed_mixed(
+        &mut self,
+        _members: &[(usize, &[u32])],
+        _feeds: &[(usize, u32)],
+        _output: &mut [u32],
+    ) -> crate::Result<bool> {
+        Err(crate::RuntimeError::Rejected(
+            "mixed packed launch unavailable".into(),
+        ))
+    }
     /// Apply a retained session's resume before seeding pack cursors: this backend packs fresh
     /// prompts, so the isolated path (which otherwise resumes) may never see them.
     fn resume_before_pack(&self) -> bool {
@@ -200,6 +232,16 @@ pub trait SeqEngine {
         false
     }
     fn prepare_packed_prefill_slot(
+        &mut self,
+        _slot: usize,
+        _prompt: &[u32],
+        _max_rows: u32,
+    ) -> crate::Result<()> {
+        Ok(())
+    }
+    /// Build `slot`'s prefill cursor without running a chunk, so a back-to-back tick
+    /// (`PLOW_PF_BACK_TO_BACK`) knows the first chunk's rows before admitting it.
+    fn prepare_prefill_slot(
         &mut self,
         _slot: usize,
         _prompt: &[u32],
@@ -636,10 +678,38 @@ mod amd_serve {
             }
         }
 
+        fn clone_prefix(&mut self, src: usize, dst: usize) -> Result<bool> {
+            match self {
+                Self::One(e) => e.clone_prefix(src, dst),
+                Self::Tp(g) => g.clone_prefix(src, dst),
+            }
+        }
+
+        fn prefix_clone_capable(&self) -> bool {
+            match self {
+                Self::One(e) => e.prefix_clone_capable(),
+                Self::Tp(g) => (0..g.n_gpu()).all(|rank| g.rank(rank).prefix_clone_capable()),
+            }
+        }
+
+        fn has_snapshot(&self, slot: usize) -> bool {
+            match self {
+                Self::One(e) => e.has_snapshot(slot),
+                Self::Tp(g) => g.has_snapshot(slot),
+            }
+        }
+
         fn snapshot_carried(&mut self, slot: usize, rows: u32) -> Result<()> {
             match self {
                 Self::One(e) => e.snapshot_carried(slot, rows),
                 Self::Tp(g) => g.snapshot_carried(slot, rows),
+            }
+        }
+
+        fn snapshot_carried_many(&mut self, items: &[(usize, u32)]) -> Result<()> {
+            match self {
+                Self::One(e) => e.snapshot_carried_many(items),
+                Self::Tp(g) => g.snapshot_carried_many(items),
             }
         }
 
@@ -690,6 +760,19 @@ mod amd_serve {
                 Ranks::One(e) => e,
                 Ranks::Tp(g) => g.rank(0),
             }
+        }
+
+        /// Row `at` of `act.logits`, `shard` bytes per rank, concatenated over the first
+        /// `dst.len() / shard` ranks (one under a replicated head, all under a sharded one).
+        fn read_logits_row(&self, at: usize, shard: usize, dst: &mut [u8]) -> Result<()> {
+            for (r, d) in dst.chunks_exact_mut(shard).enumerate() {
+                let e = match self {
+                    Ranks::One(e) => e,
+                    Ranks::Tp(g) => g.rank(r),
+                };
+                e.read_tensor_range("act.logits", (at * shard) as u64, d)?;
+            }
+            Ok(())
         }
 
         fn ctr_snapshot(&mut self, program: usize) -> Result<Vec<u32>> {
@@ -868,8 +951,21 @@ mod amd_serve {
         /// recurrent state is snapshotted. Invariant: the snapshot corresponds to
         /// `cached_prompt[..snap_at]`, so a new prompt matching that span may resume from it.
         prefix_cache: bool,
+        /// Per-slot snapshots can move between slots ([`Self::adopt_prefix`]).
+        prefix_clone: bool,
         cached_prompt: Vec<Vec<u32>>,
         snap_at: Vec<u32>,
+        /// Under an end arm (`PLOW_PREFIX_ARM_END`) the snapshot sits after the prompt's last
+        /// row, so a resume there has no row left to produce the first token. Per slot: the
+        /// token that prefill sampled after `cached_prompt[..snap_at]` and its raw `act.logits`
+        /// row (empty when the packet keeps none), so an identical prompt resumes at its end and
+        /// goes straight to decode. `None` whenever the snapshot is not an end arm.
+        end_tok: Vec<Option<u32>>,
+        end_logits: Vec<Vec<u8>>,
+        /// `(slot, first token)` of each prompt the last packed prefill completed.
+        packed_tokens: Vec<(usize, u32)>,
+        /// [`Self::packed_terminal`], decided once from the loaded programs.
+        packed_terminal: std::cell::OnceCell<bool>,
         cached_rows: Vec<u32>,
         /// Per-slot generation, bumped on release. Carried on every token-batch request and
         /// re-checked by the planner and the commit, so a slot recycled mid-step cannot be
@@ -892,6 +988,13 @@ mod amd_serve {
         /// the prefix cache already produces, so it joins at the same seam
         /// rather than adding a second notion of "already prefilled".
         head_rows: Vec<u32>,
+        /// The `act.logits` row holding each slot's most recent sampled token: 0 after a
+        /// per-slot prefill (the prefill tail writes ONE logit row, `i[0] = 1`), the slot after a
+        /// decode dispatch (slot-indexed rows), `usize::MAX` when no readable row exists (a
+        /// token-batch body samples its band rows). Reading row `slot` after a prefill served
+        /// another slot's stale decode logits as the first token's logprobs (FP32 gate: KL 5.3
+        /// at position 0, 0.2 after).
+        lp_row: Vec<usize>,
         /// Width of the decode rung the last dispatch ran, so a rung CHANGE can be logged
         /// once instead of every step. It is the only externally visible evidence that the
         /// ladder is engaging, and a measurement that cannot show that is not a measurement.
@@ -901,6 +1004,13 @@ mod amd_serve {
         /// The TP token-batch route: staging for the slot-band plan plus the body programs the
         /// group carries. `None` when the blob has no bodies or the route is not requested.
         token_batch_tp: Option<TokenBatchTp>,
+        /// Element width of one `act.logits` row (2 = bf16, 4 = f32) when the decode programs
+        /// leave a full-vocab row per slot behind the device argmax; `None` keeps host logprobs
+        /// refused (sharded lm_head fold, fused argmax, or no row writer found).
+        logits_elem: Option<usize>,
+        /// Ranks whose `act.logits` rows concatenate to the full vocab: the TP width under a
+        /// vocab-column-parallel lm_head (`GLM_SHARD_HEAD`, folded by `XArgmaxFin`), else 1.
+        logits_shards: usize,
         diagnostics: Option<EngineDiagnostics>,
         counter_snapshot_dir: Option<PathBuf>,
         tensor_snapshot: Option<TensorSnapshotConfig>,
@@ -1100,6 +1210,62 @@ mod amd_serve {
         Ok(())
     }
 
+    /// Consecutive group sizes for a pack of chunks `rows` on a prefill ladder `rungs` (ascending).
+    /// A pack filling less than 3/4 of its rung runs as groups that each fit the next narrower
+    /// rung: four 1024-row chunks fill half the 8192 rung but exactly two 2048 rungs.
+    fn split_pack(rows: &[u32], rungs: &[u32]) -> Vec<usize> {
+        let whole = vec![rows.len()];
+        let total: u64 = rows.iter().map(|&r| r as u64).sum();
+        let Some(rung) = rungs.iter().copied().find(|&w| w as u64 >= total) else {
+            return whole;
+        };
+        if total * 4 >= rung as u64 * 3 {
+            return whole;
+        }
+        let Some(lower) = rungs.iter().copied().filter(|&w| w < rung).max() else {
+            return whole;
+        };
+        if rows.iter().any(|&r| r > lower) {
+            return whole;
+        }
+        let mut groups = Vec::new();
+        let (mut n, mut sum) = (0usize, 0u32);
+        for &r in rows {
+            if n > 0 && sum + r > lower {
+                groups.push(n);
+                (n, sum) = (0, 0);
+            }
+            n += 1;
+            sum += r;
+        }
+        groups.push(n);
+        if groups.len() == 1 {
+            whole
+        } else {
+            groups
+        }
+    }
+
+    /// `(program, decode rows ride)` for a mixed pack: `combined` covers the prefill spans plus
+    /// the decode rows, `prefill_only` the prefill spans alone. The decode rows ride only on the
+    /// prefill spans' own rung and within its span table; a pack whose decode rows would outgrow
+    /// every rung still runs its prefill spans alone.
+    fn mixed_pack_route(
+        combined: Option<usize>,
+        prefill_only: Option<usize>,
+        spans: usize,
+        width: impl Fn(usize) -> Option<u32>,
+        span_limit: impl Fn(usize) -> u32,
+    ) -> Option<(usize, bool)> {
+        match (combined, prefill_only) {
+            (Some(c), Some(p)) if width(p) != width(c) || spans > span_limit(c) as usize => {
+                Some((p, false))
+            }
+            (Some(c), _) => Some((c, true)),
+            (None, p) => p.map(|p| (p, false)),
+        }
+    }
+
     fn commit_packed_prefill(
         cursors: &mut [Option<PfCursor>],
         completed: &[(usize, crate::exec::amd::ChunkStep)],
@@ -1155,10 +1321,18 @@ mod amd_serve {
         true
     }
 
-    fn packable_prefill_step(cur: &PfCursor, max_rows: u32) -> Option<crate::exec::amd::ChunkStep> {
+    /// `terminal`: the packed tail samples every span's last row, so a final chunk may pack —
+    /// including an end-arm snapshot boundary, which the pack takes after its launch. A snapshot
+    /// boundary inside the prompt stays isolated.
+    fn packable_prefill_step(
+        cur: &PfCursor,
+        max_rows: u32,
+        terminal: bool,
+    ) -> Option<crate::exec::amd::ChunkStep> {
         let step = *cur.steps.get(cur.next)?;
-        (cur.next + 1 < cur.steps.len()
-            && cur.snap_after != Some(cur.next)
+        let last = cur.next + 1 == cur.steps.len();
+        ((!last || terminal)
+            && (cur.snap_after != Some(cur.next) || (last && terminal))
             && step.clen <= max_rows)
             .then_some(step)
     }
@@ -1374,6 +1548,9 @@ mod amd_serve {
     /// Shortest prefix worth caching. Below this the snapshot/restore pair costs more than the
     /// prefill it skips, and it churns the slot's cached prompt for nothing.
     const MIN_PREFIX: u32 = 128;
+    /// `lp_row` of a slot whose first token came from an end resume: its logits are the host
+    /// copy in `end_logits`.
+    const END_LOGITS_ROW: usize = usize::MAX - 1;
 
     fn stage_parked(parked: &mut [u32], advance: &[usize]) {
         parked.fill(1);
@@ -1409,16 +1586,31 @@ mod amd_serve {
         a.iter().zip(b).take_while(|(x, y)| x == y).count()
     }
 
-    fn prefix_plan(cached: &[u32], snap: u32, armed: bool, prompt: &[u32]) -> (u32, u32) {
+    fn prefix_plan(
+        cached: &[u32],
+        snap: u32,
+        armed: bool,
+        prompt: &[u32],
+        arm_end: bool,
+        end_hit: bool,
+    ) -> (u32, u32) {
         let cap = prompt.len().saturating_sub(1) as u32;
-        let lcp = (common_prefix_len(cached, prompt) as u32).min(cap);
-        if armed && snap > 0 && snap <= lcp {
+        let full = common_prefix_len(cached, prompt) as u32;
+        let lcp = full.min(cap);
+        // `end_hit`: the snapshot is an end arm with its first token kept, so a prompt equal to
+        // `cached[..snap]` resumes at its last row and runs no chunk.
+        let whole = end_hit && snap as usize == prompt.len() && full == snap;
+        if armed && snap > 0 && (snap <= lcp || whole) {
             (snap, 0)
         } else if cap >= MIN_PREFIX {
             (
                 0,
-                if lcp >= MIN_PREFIX {
+                // Under an end arm, a prompt the cached one covers up to its last token is a
+                // re-send: it runs cold and unsplit again, so a repeat streams what the first did.
+                if lcp >= MIN_PREFIX && !(arm_end && lcp == cap) {
                     lcp
+                } else if arm_end {
+                    prompt.len() as u32
                 } else {
                     cap / 32 * 32
                 },
@@ -1434,6 +1626,48 @@ mod amd_serve {
             .min(max_ctx.saturating_sub(1) as u32)
     }
 
+    /// Element width of the `act.logits` row the decode programs write, when host logprobs can
+    /// read it: a `Gemv` (bf16) or `GemvF32` / `GemmF32` (f32) lm_head writing `act.logits`, and
+    /// no fused `GemvArgmax` in any decode program. The flag is a sharded-head fold
+    /// (`XArgmaxFin`): each rank's row is its vocab slice, gathered in rank order.
+    fn logits_row_elem(blob: &crate::asset::devblob::DevBlob) -> (Option<usize>, bool) {
+        let sharded = blob.decode_progs().iter().any(|p| {
+            p.insts
+                .iter()
+                .any(|d| d.op == packet::dev::DevOp::XArgmaxFin as u16)
+        });
+        (logits_row_elem_width(blob), sharded)
+    }
+
+    fn logits_row_elem_width(blob: &crate::asset::devblob::DevBlob) -> Option<usize> {
+        use packet::dev::DevOp;
+        let logits = blob.tensors.iter().position(|t| t.name == "act.logits")? as u16;
+        let mut elem = None;
+        for prog in blob.decode_progs() {
+            for d in &prog.insts {
+                if d.op == DevOp::GemvArgmax as u16 {
+                    return None;
+                }
+                if d.t[0] != logits {
+                    continue;
+                }
+                let w = if d.op == DevOp::Gemv as u16 {
+                    2
+                } else if d.op == DevOp::GemvF32 as u16 || d.op == DevOp::GemmF32 as u16 {
+                    4
+                } else {
+                    continue;
+                };
+                match elem {
+                    None => elem = Some(w),
+                    Some(prev) if prev != w => return None,
+                    Some(_) => {}
+                }
+            }
+        }
+        elem
+    }
+
     fn slot_decode_position(pos: u32, live: bool, cursor: Option<&PfCursor>, prefix: bool) -> u32 {
         cursor.map_or(if live || prefix { pos } else { 0 }, |cur| cur.frontier)
     }
@@ -1447,17 +1681,36 @@ mod amd_serve {
         /// so under a `gpulease` the visible ordinals `0..n` are the leased
         /// cards.
         pub fn load(blob_path: &Path, hsaco_dir: &Path, checkpoint: Option<&Path>) -> Result<Self> {
+            Self::load_on(blob_path, hsaco_dir, checkpoint, 0)
+        }
+
+        /// The packet's TP degree (1 for a single-GPU packet).
+        pub fn packet_tp(blob_path: &Path) -> Result<u32> {
+            let raw = std::fs::read(blob_path)
+                .map_err(|e| RuntimeError::Device(format!("read {}: {e}", blob_path.display())))?;
+            let meta = crate::asset::devblob::DevBlob::parse_l2(&raw, true)?;
+            Ok(meta.tp.map(|t| t.n_gpu).unwrap_or(1).max(1))
+        }
+
+        /// [`AmdServe::load`] on the visible ordinals `first..first + tp`: one data-parallel
+        /// replica of a node that holds several (`--dp`).
+        pub fn load_on(
+            blob_path: &Path,
+            hsaco_dir: &Path,
+            checkpoint: Option<&Path>,
+            first: u8,
+        ) -> Result<Self> {
             let raw = std::fs::read(blob_path)
                 .map_err(|e| RuntimeError::Device(format!("read {}: {e}", blob_path.display())))?;
             // METADATA ONLY -- this reads the TP fan-out to decide single-GPU vs TP group and
             // then drops the blob; it never dispatches. The L2-placement guard belongs to the
             // engine (which checks the code object for `plow_l2_place_dispatch_1`), so refusing
             // here just blocked `serve` on every placed blob before the engine saw it.
-            let n_gpu = crate::asset::devblob::DevBlob::parse_l2(&raw, true)?
-                .tp
-                .map(|t| t.n_gpu)
-                .unwrap_or(1)
-                .max(1);
+            let meta = crate::asset::devblob::DevBlob::parse_l2(&raw, true)?;
+            let n_gpu = meta.tp.map(|t| t.n_gpu).unwrap_or(1).max(1);
+            let (logits_elem, logits_sharded) = logits_row_elem(&meta);
+            let logits_shards = if logits_sharded { n_gpu as usize } else { 1 };
+            drop(meta);
             drop(raw);
 
             let stop_ids = Arc::new(match checkpoint {
@@ -1470,12 +1723,12 @@ mod amd_serve {
             });
 
             let ranks = if n_gpu == 1 {
-                let be = Arc::new(crate::device::hsa::HsaBackend::new(0)?);
+                let be = Arc::new(crate::device::hsa::HsaBackend::new(first)?);
                 Ranks::One(AmdEngine::load(be, blob_path, hsaco_dir, checkpoint)?)
             } else {
                 let mut backends = Vec::with_capacity(n_gpu as usize);
                 for d in 0..n_gpu {
-                    backends.push(Arc::new(crate::device::hsa::HsaBackend::new(d as u8)?));
+                    backends.push(Arc::new(crate::device::hsa::HsaBackend::new(first + d as u8)?));
                 }
                 Ranks::Tp(AmdTpGroup::load(
                     backends, blob_path, hsaco_dir, checkpoint,
@@ -1557,9 +1810,11 @@ mod amd_serve {
                 && !crate::config::RuntimeConfig::get().fusion
                 && ranks.prefix_cache_capable()
                 && has_prefill;
+            let prefix_clone = prefix_cache && ranks.prefix_clone_capable();
             tracing::info!(
                 requested = crate::config::RuntimeConfig::get().prefix_cache,
                 selected = prefix_cache,
+                cross_slot = prefix_clone,
                 "AMD prefix cache selection"
             );
             let token_batch_tp = match &ranks {
@@ -1614,8 +1869,13 @@ mod amd_serve {
                 decode_only: !has_prefill,
                 max_ctx,
                 prefix_cache,
+                prefix_clone,
                 cached_prompt: vec![Vec::new(); batch],
                 snap_at: vec![0; batch],
+                end_tok: vec![None; batch],
+                end_logits: vec![Vec::new(); batch],
+                packed_tokens: Vec::new(),
+                packed_terminal: std::cell::OnceCell::new(),
                 cached_rows: vec![0; batch],
                 slot_generation: vec![0; batch],
                 pf: (0..batch).map(|_| None).collect(),
@@ -1626,9 +1886,12 @@ mod amd_serve {
                 },
                 prefill_turn: 0,
                 head_rows: vec![0; batch],
+                lp_row: (0..batch).collect(),
                 last_rung: 0,
                 cursor_split_ns: (0, 0),
                 token_batch_tp,
+                logits_elem,
+                logits_shards,
                 diagnostics: None,
                 counter_snapshot_dir,
                 tensor_snapshot,
@@ -1830,7 +2093,9 @@ mod amd_serve {
                 }
                 last
             } else {
-                let (resume, arm) = self.plan_prefix(slot, prompt);
+                self.adopt_prefix(slot, prompt)?;
+                // Whole-prompt prefill always runs a chunk, so it cannot take an end resume.
+                let (resume, arm) = self.plan_prefix(slot, prompt, false);
                 self.cached_rows[slot] = resume;
                 if resume == 0 {
                     self.invalidate_prefix(slot);
@@ -1875,13 +2140,14 @@ mod amd_serve {
                     // it valid (the new prompt agrees over that span); an arm replaces it;
                     // anything else makes it stale, so drop it.
                     self.cached_prompt[slot] = prompt.to_vec();
-                    if arm > 0 {
+                    if arm > 0 || resume == 0 {
                         self.snap_at[slot] = arm;
-                    } else if resume == 0 {
-                        self.snap_at[slot] = 0;
+                        self.end_tok[slot] = None;
                     }
                 }
                 self.pos[slot] = prompt.len() as u32;
+                // The isolated prefill tail samples `in.ids[0]` from logits row 0.
+                self.lp_row[slot] = 0;
                 t
             };
             if let Some(diagnostics) = self.diagnostics.as_mut() {
@@ -1901,7 +2167,64 @@ mod amd_serve {
         ///
         /// Both are clamped to `len - 1`: a chunk with `clen == 0` would set the lm_head's
         /// `a_row0 = clen - 1` to `u32::MAX`, and an identical prompt must still produce a token.
-        fn plan_prefix(&self, slot: usize, prompt: &[u32]) -> (u32, u32) {
+        /// Cross-slot prefix reuse. A slot's snapshot only serves prompts seated on that slot,
+        /// and admission seats on the lowest free slot, so under concurrency a shared prefix
+        /// almost never meets its snapshot. When another slot holds a longer armed prefix of
+        /// `prompt` than `slot` does, copy it in (KV rows + carried-state snapshot) and record it
+        /// as `slot`'s own, so the plan below resumes from it. The seat does not move, so the
+        /// decode rung is unchanged.
+        fn adopt_prefix(&mut self, slot: usize, prompt: &[u32]) -> Result<()> {
+            if !self.prefix_cache || !self.prefix_clone {
+                return Ok(());
+            }
+            let cap = prompt.len().saturating_sub(1);
+            let covered = |cached: &[u32], snap: u32, end: bool| {
+                let lcp = common_prefix_len(cached, prompt);
+                snap > 0
+                    && (snap as usize <= lcp.min(cap)
+                        || (end && snap as usize == prompt.len() && lcp >= prompt.len()))
+            };
+            let own = if self.ranks.has_snapshot(slot)
+                && covered(
+                    &self.cached_prompt[slot],
+                    self.snap_at[slot],
+                    self.end_tok[slot].is_some(),
+                ) {
+                self.snap_at[slot]
+            } else {
+                0
+            };
+            let Some(donor) = (0..self.batch)
+                .filter(|&d| {
+                    d != slot
+                        && self.snap_at[d] > own
+                        && covered(
+                            &self.cached_prompt[d],
+                            self.snap_at[d],
+                            self.end_tok[d].is_some(),
+                        )
+                        && self.ranks.has_snapshot(d)
+                })
+                .max_by_key(|&d| self.snap_at[d])
+            else {
+                return Ok(());
+            };
+            let snap = self.snap_at[donor];
+            if self.ranks.clone_prefix(donor, slot)? {
+                tracing::debug!(donor, slot, snap, "amd: prefix adopted from another slot");
+                self.cached_prompt[slot] = self.cached_prompt[donor][..snap as usize].to_vec();
+                self.snap_at[slot] = snap;
+                self.end_tok[slot] = self.end_tok[donor];
+                let src = std::mem::take(&mut self.end_logits[donor]);
+                self.end_logits[slot].clone_from(&src);
+                self.end_logits[donor] = src;
+            }
+            Ok(())
+        }
+
+        /// `end_resume`: the caller can complete a prompt without running a chunk (see
+        /// `end_tok`), so an end-armed snapshot may serve the identical prompt.
+        fn plan_prefix(&self, slot: usize, prompt: &[u32], end_resume: bool) -> (u32, u32) {
             if !self.prefix_cache {
                 return (0, 0);
             }
@@ -1909,17 +2232,75 @@ mod amd_serve {
                 Ranks::One(e) => e.has_snapshot(slot),
                 Ranks::Tp(g) => g.has_snapshot(slot),
             };
-            prefix_plan(&self.cached_prompt[slot], self.snap_at[slot], armed, prompt)
+            prefix_plan(
+                &self.cached_prompt[slot],
+                self.snap_at[slot],
+                armed,
+                prompt,
+                crate::config::RuntimeConfig::get().prefix_arm_end,
+                end_resume && self.end_tok[slot].is_some(),
+            )
         }
 
         pub fn cached_rows(&self, slot: usize) -> usize {
             self.cached_rows.get(slot).copied().unwrap_or(0) as usize
         }
 
+        /// `slot`'s most recent full-vocab logits row, read back from rank 0 (every rank holds
+        /// the same replicated row behind its device argmax; `in.ids` and `act.logits` are both
+        /// slot-indexed), or concatenated over the ranks' vocab slices under a sharded head.
+        /// `false` when the packet keeps no such row (see `logits_elem`).
+        pub fn logits_row(&self, slot: usize, out: &mut Vec<f32>) -> bool {
+            let Some(elem) = self.logits_elem else {
+                return false;
+            };
+            let Some(total) = self.ranks.rank0().tensor_bytes("act.logits") else {
+                return false;
+            };
+            let shard = total as usize / self.batch;
+            let row = shard * self.logits_shards;
+            let Some(&at) = self.lp_row.get(slot) else {
+                return false;
+            };
+            let mut bytes;
+            if at == END_LOGITS_ROW {
+                bytes = self.end_logits[slot].clone();
+            } else {
+                if at >= self.batch || shard == 0 || shard % elem != 0 {
+                    return false;
+                }
+                bytes = vec![0u8; row];
+                if let Err(err) = self.ranks.read_logits_row(at, shard, &mut bytes) {
+                    tracing::warn!(error = %err, slot, "amd: logits row readback failed");
+                    return false;
+                }
+            }
+            if bytes.len() != row || row % elem != 0 {
+                return false;
+            }
+            out.clear();
+            out.reserve(row / elem);
+            if elem == 2 {
+                out.extend(
+                    bytes
+                        .chunks_exact(2)
+                        .map(|c| f32::from_bits(u32::from(u16::from_le_bytes([c[0], c[1]])) << 16)),
+                );
+            } else {
+                out.extend(
+                    bytes
+                        .chunks_exact(4)
+                        .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])),
+                );
+            }
+            true
+        }
+
         /// A miss is about to overwrite this slot's KV from row zero. Make the old snapshot
         /// ineligible before the first write so cancellation or a device error cannot later pair
         /// old recurrent state with the newly overwritten KV rows.
         fn invalidate_prefix(&mut self, slot: usize) {
+            self.end_tok[slot] = None;
             invalidate_prefix_metadata(
                 self.prefix_cache,
                 &mut self.cached_prompt,
@@ -1985,7 +2366,10 @@ mod amd_serve {
                 let (resume, arm) = if shared {
                     (self.ranks.attach_shared_prefix(slot, prompt)?, 0)
                 } else {
-                    self.plan_prefix(slot, prompt)
+                    self.adopt_prefix(slot, prompt)?;
+                    // A token-batch member must take rows, so that route keeps end resumes off.
+                    let end_resume = self.token_batch_rows(1, 0, 1).is_none();
+                    self.plan_prefix(slot, prompt, end_resume)
                 };
                 self.cursor_split_ns = (clear_ns, t_attach.elapsed().as_nanos() as u64);
                 if shared {
@@ -2026,11 +2410,16 @@ mod amd_serve {
                     )
                 };
                 let (steps, snap_after) = {
-                    if resume > 0 {
+                    if resume == n {
+                        // An end resume: no rows left, `prefill_chunk_rows` completes it with the
+                        // kept first token.
+                        (Vec::new(), None)
+                    } else if resume > 0 {
                         (plan(resume, n)?, None)
                     } else if arm > 0 {
                         let head = plan(0, arm)?;
-                        let tail = plan(arm, n)?;
+                        // An end arm (`PLOW_PREFIX_ARM_END`) snapshots after the last chunk.
+                        let tail = if arm < n { plan(arm, n)? } else { Vec::new() };
                         let cut = head.len();
                         let mut all = head;
                         all.extend(tail);
@@ -2095,6 +2484,14 @@ mod amd_serve {
             let t_all = std::time::Instant::now();
             self.prepare_prefill_cursor(slot, prompt, tick_max_bucket)?;
             let cursor_ns = t_all.elapsed().as_nanos() as u64;
+            if self.pf[slot]
+                .as_ref()
+                .is_some_and(|cur| cur.steps.is_empty())
+            {
+                return self
+                    .finish_end_resume(slot, prompt)
+                    .map(|t| (Some(t), None));
+            }
             let g = &mut self.ranks;
             let max_bucket = self.prefill_chunk_rows.min(tick_max_bucket);
             let pending = {
@@ -2208,10 +2605,27 @@ mod amd_serve {
                 return Ok((None, ran));
             }
             let tok = g.read_prefill_token()?;
-            tracing::debug!(slot, tok, n = prompt.len(), "pf complete");
+            self.finish_packed_prompt(slot, prompt, tok, 0)?;
+            Ok((Some(tok), ran))
+        }
+
+        /// A prompt's last chunk landed with first token `tok`, sampled from logits row `row`
+        /// (0 for an isolated chunk, the span index in a span-sampling pack): make the slot live
+        /// and do the prefix-cache bookkeeping.
+        fn finish_packed_prompt(
+            &mut self,
+            slot: usize,
+            prompt: &[u32],
+            tok: u32,
+            row: usize,
+        ) -> Result<()> {
+            let cur = self.pf[slot]
+                .take()
+                .expect("a finishing prompt has a cursor");
+            self.lp_row[slot] = row;
+            tracing::debug!(slot, tok, n = prompt.len(), row, "pf complete");
             let n = prompt.len() as u32;
             let (resume, arm) = (cur.resume, cur.arm);
-            self.pf[slot] = None;
             self.pos[slot] = n;
             self.live[slot] = true;
             if self.prefix_cache {
@@ -2220,13 +2634,15 @@ mod amd_serve {
                 // else makes it stale.
                 self.cached_prompt[slot].clear();
                 self.cached_prompt[slot].extend_from_slice(prompt);
-                if arm > 0 {
+                if arm > 0 || resume == 0 {
                     self.snap_at[slot] = arm;
-                } else if resume == 0 {
-                    self.snap_at[slot] = 0;
+                    self.end_tok[slot] = None;
+                }
+                if arm == n {
+                    self.keep_end_token(slot, tok, row)?;
                 }
             }
-            Ok((Some(tok), ran))
+            Ok(())
         }
 
         pub fn mixed_step_rows(&self, decode_rows: usize, prefill_rows: usize) -> Option<u32> {
@@ -2237,6 +2653,58 @@ mod amd_serve {
                 Ranks::One(e) => e.mixed_step_rows(decode_rows, prefill_rows),
                 Ranks::Tp(_) => None,
             }
+        }
+
+        /// Keep `tok` and the logits row behind it with `slot`'s end-arm snapshot.
+        fn keep_end_token(&mut self, slot: usize, tok: u32, logits_row: usize) -> Result<()> {
+            self.end_tok[slot] = Some(tok);
+            let row = &mut self.end_logits[slot];
+            row.clear();
+            if self.logits_elem.is_none() {
+                return Ok(());
+            }
+            let Some(total) = self.ranks.rank0().tensor_bytes("act.logits") else {
+                return Ok(());
+            };
+            let shard = total as usize / self.batch;
+            row.resize(shard * self.logits_shards, 0);
+            // The prefill tail wrote this prompt's logits at `logits_row` (`lp_row`).
+            self.ranks.read_logits_row(logits_row, shard, row)
+        }
+
+        /// Complete an end resume: the KV rows and the restored recurrence already hold the
+        /// whole prompt, so the first token is the one the arming prefill sampled.
+        fn finish_end_resume(&mut self, slot: usize, prompt: &[u32]) -> Result<u32> {
+            let tok = self.end_tok[slot].ok_or_else(|| {
+                RuntimeError::Device(format!("slot {slot}: end resume without a kept token"))
+            })?;
+            self.pf[slot] = None;
+            self.pos[slot] = prompt.len() as u32;
+            self.live[slot] = true;
+            self.lp_row[slot] = if self.end_logits[slot].is_empty() {
+                usize::MAX
+            } else {
+                END_LOGITS_ROW
+            };
+            self.cached_prompt[slot].clear();
+            self.cached_prompt[slot].extend_from_slice(prompt);
+            tracing::debug!(slot, tok, n = prompt.len(), "pf end resume");
+            Ok(tok)
+        }
+
+        pub fn prepare_prefill_slot(
+            &mut self,
+            slot: usize,
+            prompt: &[u32],
+            max_rows: u32,
+        ) -> Result<()> {
+            let chunked = (self.chunk_prefill || self.ranks.shared_prefix_enabled())
+                && !self.decode_only
+                && prompt.len() > 1;
+            if !chunked || self.live.get(slot) != Some(&false) {
+                return Ok(());
+            }
+            self.prepare_prefill_cursor(slot, prompt, max_rows)
         }
 
         pub fn prepare_packed_prefill_slot(
@@ -2250,7 +2718,8 @@ mod amd_serve {
             if prompt.len() <= 1
                 || (self.mixed_step_rows(1, 1).is_none()
                     && self.token_batch_rows(1, 0, 1).is_none()
-                    && !self.packed_prefill_reachable(max_rows))
+                    && !self.packed_prefill_reachable(max_rows)
+                    && !self.packed_prompt_reachable(prompt.len() as u32, max_rows))
             {
                 return Ok(());
             }
@@ -2769,6 +3238,13 @@ mod amd_serve {
                         .step(g, rows, &requests, generations, frontiers, max_ctx, output),
                 },
             )?;
+            // The body samples band rows; no slot-indexed logits row exists for these tokens.
+            for &(slot, _) in feeds {
+                self.lp_row[slot] = usize::MAX;
+            }
+            for &(slot, _, _) in members {
+                self.lp_row[slot] = usize::MAX;
+            }
             if self.prefix_cache {
                 // As the terminal-prefill path does, except that no second transformer pass
                 // produced the first token.
@@ -2776,10 +3252,9 @@ mod amd_serve {
                     let prompt = members.iter().find(|m| m.0 == slot).unwrap().1;
                     self.cached_prompt[slot].clear();
                     self.cached_prompt[slot].extend_from_slice(prompt);
-                    if cur.arm > 0 {
+                    if cur.arm > 0 || cur.resume == 0 {
                         self.snap_at[slot] = cur.arm;
-                    } else if cur.resume == 0 {
-                        self.snap_at[slot] = 0;
+                        self.end_tok[slot] = None;
                     }
                 }
             }
@@ -2790,7 +3265,8 @@ mod amd_serve {
         /// exists. The mux's step budget admits an isolated chunk only when this fits.
         pub fn next_prefill_rows(&self, slot: usize) -> Option<u32> {
             let cur = self.pf.get(slot)?.as_ref()?;
-            cur.steps.get(cur.next).map(|step| step.clen)
+            // An end resume runs no rows; 1 keeps it a planned, always-fitting candidate.
+            Some(cur.steps.get(cur.next).map_or(1, |step| step.clen))
         }
 
         /// The AMD arm as the step planner sees it: the budget is the widest compiled prefill
@@ -2881,11 +3357,43 @@ mod amd_serve {
             max_rows: u32,
         ) -> Option<packet::dev::PrefillSpan> {
             let cur = self.pf.get(slot)?.as_ref()?;
-            let step = packable_prefill_step(cur, max_rows)?;
-            let program = self.packed_prefill_program(step.clen, max_rows, true, Some(step.c0))?;
+            let terminal = self.packed_terminal();
+            let step = packable_prefill_step(cur, max_rows, terminal)?;
+            // A span-sampling pack runs ragged: the planner caps its live rows at `max_rows`, so
+            // the rung may be wider than the tick budget (four 1k prompts in the 8192 rung).
+            let cap = if terminal { u32::MAX } else { max_rows };
+            let program = self.packed_prefill_program(step.clen, cap, true, Some(step.c0))?;
             let mut span = self.prefill_span(slot, max_rows)?;
             span.program = u32::try_from(program).ok()?;
             Some(span)
+        }
+
+        pub fn take_packed_tokens(&mut self) -> Vec<(usize, u32)> {
+            std::mem::take(&mut self.packed_tokens)
+        }
+
+        /// Whether every packed rung's tail samples each span's last row, so final chunks pack
+        /// and the pack returns their first tokens.
+        fn packed_terminal(&self) -> bool {
+            *self.packed_terminal.get_or_init(|| {
+                let e = self.ranks.rank0();
+                let mut rungs = e
+                    .prefill_rungs()
+                    .filter(|&(prog, _)| e.packed_prefill_prog_for(prog).is_some())
+                    .peekable();
+                rungs.peek().is_some() && rungs.all(|(prog, _)| e.packed_prefill_terms(prog) > 0)
+            })
+        }
+
+        /// Whether two prompts of `n` tokens fit one packed rung no wider than `max_rows`
+        /// (a span-sampling tail packs whole prompts).
+        fn packed_prompt_reachable(&self, n: u32, max_rows: u32) -> bool {
+            let rows = n.saturating_mul(2);
+            self.packed_terminal()
+                && rows <= max_rows
+                && self
+                    .packed_prefill_program(rows, u32::MAX, true, None)
+                    .is_some()
         }
 
         /// Whether a pack could form at all, i.e. whether two chunks of the configured size fit
@@ -2945,19 +3453,176 @@ mod amd_serve {
         }
 
         /// Advance compatible, already-initialized prefill cursors in one packed dispatch.
-        /// Final chunks remain isolated because the current model prefill head exposes one
-        /// sampled token, not one result per span. Snapshot boundaries remain isolated too.
+        /// Final chunks pack only when the packed tail samples every span (`packed_terminal`);
+        /// otherwise they, and snapshot boundaries, remain isolated.
         pub fn advance_packed_prefill(&mut self, members: &[(usize, &[u32])]) -> Result<()> {
             if members.len() < 2 {
                 return Err(RuntimeError::Rejected(
                     "packed prefill requires at least two cursors".into(),
                 ));
             }
+            self.advance_packed(members, &[], &mut []).map(drop)
+        }
 
-            let mut spans = Vec::with_capacity(members.len());
-            let mut slices = Vec::with_capacity(members.len());
+        /// A pack runs every row of its rung, parked ones included, so it pays only while its
+        /// rung is no wider than the members' isolated rungs together: four 1024-row chunks
+        /// fill the 8192 rung as four 2048-rung launches would, but two 2048-row chunks in the
+        /// 8192 rung run twice the rows of two 2048-rung launches.
+        pub fn pack_pays(&self, rows: &[u32]) -> bool {
+            let rung = |n: u32| {
+                self.ranks
+                    .rank0()
+                    .prefill_rungs()
+                    .map(|(_, width)| width)
+                    .filter(|&width| width >= n)
+                    .min()
+            };
+            let isolated: Option<u32> = rows.iter().map(|&n| rung(n)).sum();
+            match (rung(rows.iter().sum()), isolated) {
+                (Some(packed), Some(isolated)) => packed <= isolated,
+                _ => true,
+            }
+        }
+
+        /// [`split_pack`] over this packet's prefill ladder under `PLOW_AMD_PACK_FILL`.
+        pub fn pack_groups(&self, rows: &[u32]) -> Vec<usize> {
+            if !crate::config::RuntimeConfig::get().amd.pack_fill {
+                return vec![rows.len()];
+            }
+            let mut rungs: Vec<u32> =
+                self.ranks.rank0().prefill_rungs().map(|(_, width)| width).collect();
+            rungs.sort_unstable();
+            split_pack(rows, &rungs)
+        }
+
+        /// Whether the live decode rows may ride a packed prefill launch (`PLOW_AMD_MIXED_PACK`).
+        pub fn mixed_pack_ready(&self) -> bool {
+            crate::config::RuntimeConfig::get().amd_mixed_pack
+                && self.chunk_prefill
+                && !self.decode_only
+                && self.packed_terminal()
+        }
+
+        /// [`Self::advance_packed_prefill`] with the decode `feeds` riding the same launch as
+        /// one-row spans ahead of the prefill spans — the H100 unified token batch's lowering
+        /// (`exec/gpu/token_batch.rs`): each decode row is a span at `pos[slot]` on its own KV
+        /// and recurrent state, and the packed tail samples it. `output[i]` receives feed `i`'s
+        /// next token; `pos` advances as a decode step would. `Ok(false)`: the feeds would have
+        /// widened the rung or overflowed the span table, so only the prefill spans ran.
+        pub fn advance_packed_mixed(
+            &mut self,
+            members: &[(usize, &[u32])],
+            feeds: &[(usize, u32)],
+            output: &mut [u32],
+        ) -> Result<bool> {
+            if !self.mixed_pack_ready()
+                || members.is_empty()
+                || feeds.is_empty()
+                || output.len() != feeds.len()
+            {
+                return Err(RuntimeError::Rejected("invalid AMD mixed pack".into()));
+            }
+            self.advance_packed(members, feeds, output)
+        }
+
+        /// `PLOW_AMD_RIDE_FILL`: cut `slot`'s pending chunk to `rows` so it fills a pack's gap.
+        pub fn shrink_prefill_chunk(&mut self, slot: usize, rows: u32) -> Result<()> {
+            let Some(step) = self
+                .pf
+                .get(slot)
+                .and_then(Option::as_ref)
+                .and_then(|cur| cur.steps.get(cur.next).copied())
+            else {
+                return Ok(());
+            };
+            let max_bucket = self.prefill_chunk_rows.max(step.clen);
+            let g = &self.ranks;
+            let cur = self.pf[slot].as_mut().expect("pending step checked above");
+            shrink_pending_prefill(cur, rows, |a, b| g.plan_span_at_most(a, b, max_bucket))
+        }
+
+        /// `PLOW_AMD_MIXED_RIDE_TRIM`: shorten the last member's pending chunk so `riders` one-row
+        /// decode spans fit the rung the prefill spans already fill; the cut rows become its next
+        /// chunk. A member left under 64 rows is not cut (the riders then step separately).
+        fn trim_pack_for_riders(&mut self, members: &[(usize, &[u32])], riders: u32) -> Result<()> {
+            let pending = |slot: usize| {
+                self.pf
+                    .get(slot)
+                    .and_then(Option::as_ref)
+                    .and_then(|cur| cur.steps.get(cur.next).copied())
+            };
+            let Some(pf_rows) = members
+                .iter()
+                .map(|&(slot, _)| pending(slot).map(|s| s.clen))
+                .sum::<Option<u32>>()
+            else {
+                return Ok(());
+            };
+            let Some(width) = self
+                .packed_prefill_program(pf_rows, u32::MAX, false, None)
+                .and_then(|prog| self.prefill_prog_t(prog))
+            else {
+                return Ok(());
+            };
+            let excess = (pf_rows + riders).saturating_sub(width);
+            let Some(&(slot, _)) = members.last() else {
+                return Ok(());
+            };
+            let Some(step) = pending(slot) else {
+                return Ok(());
+            };
+            if excess == 0 || step.clen < excess + 64 {
+                return Ok(());
+            }
+            let max_bucket = self.prefill_chunk_rows.max(step.clen);
+            let g = &self.ranks;
+            let cur = self.pf[slot].as_mut().expect("pending step checked above");
+            shrink_pending_prefill(cur, step.clen - excess, |a, b| {
+                g.plan_span_at_most(a, b, max_bucket)
+            })
+        }
+
+        /// `Ok(true)` iff the decode `feeds` rode the launch.
+        fn advance_packed(
+            &mut self,
+            members: &[(usize, &[u32])],
+            mut feeds: &[(usize, u32)],
+            output: &mut [u32],
+        ) -> Result<bool> {
+            if !feeds.is_empty() && crate::config::RuntimeConfig::get().amd.mixed_ride_trim {
+                self.trim_pack_for_riders(members, feeds.len() as u32)?;
+            }
+            let terminal = self.packed_terminal();
+            let n = feeds.len() + members.len();
+            let mut spans = Vec::with_capacity(n);
+            let mut slices: Vec<&[u32]> = Vec::with_capacity(n);
             let mut completed = Vec::with_capacity(members.len());
             let mut row0 = 0u32;
+            for (i, &(slot, _)) in feeds.iter().enumerate() {
+                self.check_slot(slot)?;
+                if !self.live[slot]
+                    || self.pf[slot].is_some()
+                    || self.pos[slot] as usize + 1 >= self.max_ctx
+                    || feeds[..i].iter().any(|&(prior, _)| prior == slot)
+                {
+                    return Err(RuntimeError::Rejected(format!(
+                        "invalid mixed decode slot {slot}"
+                    )));
+                }
+                let pos = self.pos[slot];
+                spans.push(PrefillSpan {
+                    row0,
+                    n_rows: 1,
+                    slot: slot as u32,
+                    flags: 0,
+                    kv_row0: pos,
+                    kv_len: pos + 1,
+                    state_slot: slot as u32,
+                    program: 0,
+                });
+                slices.push(std::slice::from_ref(&feeds[i].1));
+                row0 += 1;
+            }
             for &(slot, prompt) in members {
                 if spans
                     .iter()
@@ -2982,12 +3647,13 @@ mod amd_serve {
                         "packed prefill slot {slot} cursor is past its plan"
                     ))
                 })?;
-                if cur.next + 1 == cur.steps.len() {
+                let last = cur.next + 1 == cur.steps.len();
+                if last && !terminal {
                     return Err(RuntimeError::Rejected(format!(
                         "packed prefill slot {slot} is on its final chunk; use isolated prefill to collect its sampled token"
                     )));
                 }
-                if cur.snap_after == Some(cur.next) {
+                if cur.snap_after == Some(cur.next) && !(last && terminal) {
                     return Err(RuntimeError::Rejected(format!(
                         "packed prefill slot {slot} is on a prefix snapshot boundary; use isolated prefill"
                     )));
@@ -3017,11 +3683,43 @@ mod amd_serve {
             }
 
             let lowest = spans.iter().map(|s| s.kv_row0).min();
-            let prog = self
-                .packed_prefill_program(row0, u32::MAX, false, lowest)
-                .ok_or_else(|| {
-                    RuntimeError::Rejected(format!("no packed prefill rung covers {row0} rows"))
-                })?;
+            let combined = self.packed_prefill_program(row0, u32::MAX, false, lowest);
+            // The decode rows ride only when they fit the prefill spans' own rung and span
+            // table; otherwise the pack runs without them and the caller steps them separately.
+            let d0 = feeds.len();
+            let prog = if d0 > 0 {
+                let pf_rows = row0 - d0 as u32;
+                let pf_lowest = spans[d0..].iter().map(|s| s.kv_row0).min();
+                let pf_prog = self.packed_prefill_program(pf_rows, u32::MAX, false, pf_lowest);
+                let route = mixed_pack_route(
+                    combined,
+                    pf_prog,
+                    spans.len(),
+                    |p| self.prefill_prog_t(p),
+                    |p| self.packed_prefill_span_limit(p),
+                );
+                if let Some((_, false)) = route {
+                    spans.drain(..d0);
+                    slices.drain(..d0);
+                    for span in &mut spans {
+                        span.row0 -= d0 as u32;
+                    }
+                    row0 = pf_rows;
+                    feeds = &[];
+                }
+                route.map(|(prog, _)| prog)
+            } else {
+                combined
+            };
+            let prog = prog.ok_or_else(|| {
+                RuntimeError::Rejected(format!("no packed prefill rung covers {row0} rows"))
+            })?;
+            if spans.len() > self.packed_prefill_span_limit(prog) as usize {
+                return Err(RuntimeError::Rejected(format!(
+                    "packed prefill program {prog} takes fewer than {} spans",
+                    spans.len()
+                )));
+            }
             for span in &mut spans {
                 span.program = prog as u32;
             }
@@ -3041,7 +3739,74 @@ mod amd_serve {
                 Ranks::One(e) => e.prefill_packed_chunk(&spans, &slices, &parked)?,
                 Ranks::Tp(g) => g.prefill_packed_chunk(&spans, &slices, &parked)?,
             }
+            let post_t = crate::config::RuntimeConfig::get().pf_packlog.then(std::time::Instant::now);
+            // Span `s` sampled into `in.ids[s]` and logits row `s`. Read them before the cursors
+            // move, so a failed read leaves every member re-runnable.
+            let finishing: Vec<usize> = completed
+                .iter()
+                .enumerate()
+                .filter(|&(_, &(slot, _))| {
+                    self.pf[slot]
+                        .as_ref()
+                        .is_some_and(|cur| cur.next + 1 == cur.steps.len())
+                })
+                .map(|(s, _)| s)
+                .collect();
+            // Decode feeds are spans `[0, D)`; prefill member `s` is span `D + s`.
+            let d = feeds.len();
+            let sampled = finishing.last().map_or(d, |&s| d + s + 1);
+            let tokens = if sampled == 0 {
+                Vec::new()
+            } else {
+                match &mut self.ranks {
+                    Ranks::One(e) => e.read_sampled_batched(sampled)?,
+                    Ranks::Tp(g) => g.read_sampled_rows_agreed(sampled)?,
+                }
+            };
+            let read_t = post_t.map(|t| t.elapsed());
+            if d > 0 {
+                output.copy_from_slice(&tokens[..d]);
+            }
+            for (i, &(slot, _)) in feeds.iter().enumerate() {
+                self.pos[slot] += 1;
+                self.lp_row[slot] = i;
+            }
+            let snaps: Vec<(usize, u32)> = finishing
+                .iter()
+                .map(|&s| completed[s])
+                .filter(|&(slot, _)| {
+                    let cur = self.pf[slot].as_ref().expect("validated above");
+                    cur.snap_after == Some(cur.next)
+                })
+                .map(|(slot, step)| (slot, step.c0 + step.clen))
+                .collect();
+            if crate::config::RuntimeConfig::get().amd.packed_snap_batch {
+                if !snaps.is_empty() {
+                    self.ranks.snapshot_carried_many(&snaps)?;
+                }
+            } else {
+                for &(slot, rows) in &snaps {
+                    self.ranks.snapshot_carried(slot, rows)?;
+                }
+            }
+            let snap_t = post_t.map(|t| t.elapsed());
             commit_packed_prefill(&mut self.pf, &completed);
+            for &s in &finishing {
+                let (slot, _) = completed[s];
+                let tok = tokens[d + s];
+                self.finish_packed_prompt(slot, members[s].1, tok, d + s)?;
+                self.packed_tokens.push((slot, tok));
+            }
+            if let (Some(t), Some(read), Some(snap)) = (post_t, read_t, snap_t) {
+                eprintln!(
+                    "PACKLOG POST spans={} finishing={} read_us={:.0} snap_us={:.0} finish_us={:.0}",
+                    spans.len(),
+                    finishing.len(),
+                    read.as_secs_f64() * 1e6,
+                    (snap - read).as_secs_f64() * 1e6,
+                    (t.elapsed() - snap).as_secs_f64() * 1e6,
+                );
+            }
             if let Some(diagnostics) = self.diagnostics.as_mut() {
                 for &(slot, step) in &completed {
                     diagnostics.push_prefill(PrefillSelection {
@@ -3052,7 +3817,7 @@ mod amd_serve {
                     });
                 }
             }
-            Ok(())
+            Ok(d > 0)
         }
 
         pub fn prefill_turn(&self) -> usize {
@@ -3277,6 +4042,9 @@ mod amd_serve {
             }
             self.advance_stage = advance;
             result?;
+            for &(s, _) in feeds {
+                self.lp_row[s] = s;
+            }
             Ok(quantum)
         }
 
@@ -3310,6 +4078,9 @@ mod amd_serve {
             }
             self.advance_stage = advance;
             let out = result?;
+            for &(s, _) in feeds {
+                self.lp_row[s] = s;
+            }
             Ok(feeds.iter().map(|&(s, _)| (s, out[s])).collect())
         }
 
@@ -3419,7 +4190,9 @@ mod amd_serve {
 
         /// One dispatch that advances only `slot`, returning its token.
         fn dispatch(&mut self, slot: usize) -> Result<u32> {
-            Ok(self.dispatch_all(&[slot])?[slot])
+            let tok = self.dispatch_all(&[slot])?[slot];
+            self.lp_row[slot] = slot;
+            Ok(tok)
         }
 
         /// ONE decode dispatch advancing all `batch` rows on the device;
@@ -3568,6 +4341,7 @@ mod amd_serve {
                         tracing::info!(rung = w, occupied = rows, "decode ladder rung");
                         self.last_rung = w;
                     }
+                    crate::obs::tick::trace_rung(w);
                     e.upload_parked(&self.parked_stage)?;
                     e.seed_ids(&self.next_id)?;
                     let started = measure_dispatch.then(std::time::Instant::now);
@@ -3588,6 +4362,7 @@ mod amd_serve {
                         tracing::info!(rung = w, occupied = rows, "decode ladder rung");
                         self.last_rung = w;
                     }
+                    crate::obs::tick::trace_rung(w);
                     let run = g.decode_prog_advancing(dp, &self.kvlen_stage, &self.parked_stage);
                     if g.rank(0).prog_dense_exact(run) {
                         park_kvlen(&mut self.kvlen_stage, &self.parked_stage);
@@ -3662,7 +4437,8 @@ mod amd_serve {
     mod tests {
         use super::{
             body_respects_plan, cap_chunks_to_bodies, commit_mixed_prefill, commit_packed_prefill,
-            invalidate_prefix_metadata, mixed_cursor_rows, mixed_prefill_continuation_fits,
+            invalidate_prefix_metadata, mixed_cursor_rows, mixed_pack_route, split_pack,
+            mixed_prefill_continuation_fits,
             mixed_prefill_padding_fits, multistep_feeds_armable, packable_prefill_step,
             parse_snapshot_tensors, slot_decode_position, snapshot_file_component,
             split_pending_prefill, split_terminal_prefill, stage_parked, terminal_prefill_cursor,
@@ -3670,6 +4446,18 @@ mod amd_serve {
             DEFAULT_SNAPSHOT_TENSORS, MAX_SNAPSHOT_TENSORS,
         };
         use crate::exec::amd::ChunkStep;
+
+        #[test]
+        fn split_pack_fills_the_narrower_rung() {
+            let rungs = [128, 512, 2048, 8192];
+            assert_eq!(split_pack(&[1024; 4], &rungs), vec![2, 2]);
+            assert_eq!(split_pack(&[1024; 3], &rungs), vec![2, 1]);
+            assert_eq!(split_pack(&[1024; 6], &rungs), vec![6]);
+            assert_eq!(split_pack(&[1024; 2], &rungs), vec![2]);
+            assert_eq!(split_pack(&[4096, 1024], &rungs), vec![2]);
+            assert_eq!(split_pack(&[300, 300], &rungs), vec![1, 1]);
+            assert_eq!(split_pack(&[9000], &rungs), vec![1]);
+        }
 
         #[test]
         fn a_body_runs_only_the_attention_kind_its_member_was_planned_on() {
@@ -4221,17 +5009,79 @@ mod amd_serve {
         #[test]
         fn prefix_admission_preserves_replay_row_and_rejects_evicted_or_changed_state() {
             let prompt: Vec<u32> = (0..1024).collect();
-            assert_eq!(super::prefix_plan(&[], 0, false, &prompt), (0, 992));
-            assert_eq!(super::prefix_plan(&prompt, 992, true, &prompt), (992, 0));
-            assert_eq!(super::prefix_plan(&prompt, 992, false, &prompt), (0, 1023));
+            assert_eq!(
+                super::prefix_plan(&[], 0, false, &prompt, false, false),
+                (0, 992)
+            );
+            assert_eq!(
+                super::prefix_plan(&prompt, 992, true, &prompt, false, false),
+                (992, 0)
+            );
+            assert_eq!(
+                super::prefix_plan(&prompt, 992, false, &prompt, false, false),
+                (0, 1023)
+            );
             let mut changed = prompt.clone();
             changed[0] = 9999;
-            assert_eq!(super::prefix_plan(&prompt, 992, true, &changed), (0, 992));
             assert_eq!(
-                super::prefix_plan(&prompt, 992, true, &prompt[..128]),
+                super::prefix_plan(&prompt, 992, true, &changed, false, false),
+                (0, 992)
+            );
+            assert_eq!(
+                super::prefix_plan(&prompt, 992, true, &prompt[..128], false, false),
                 (0, 0)
             );
-            assert_eq!(super::prefix_plan(&[], 0, false, &prompt[..1]), (0, 0));
+            assert_eq!(
+                super::prefix_plan(&[], 0, false, &prompt[..1], false, false),
+                (0, 0)
+            );
+            assert_eq!(
+                super::prefix_plan(&[], 0, false, &prompt, true, false),
+                (0, 1024)
+            );
+            let next: Vec<u32> = (0..1030).collect();
+            assert_eq!(
+                super::prefix_plan(&prompt, 1024, true, &next, true, false),
+                (1024, 0)
+            );
+            assert_eq!(
+                super::prefix_plan(&prompt, 1024, true, &prompt, true, false),
+                (0, 1024)
+            );
+            assert_eq!(
+                super::prefix_plan(&next, 1030, true, &prompt, true, false),
+                (0, 1024)
+            );
+            assert_eq!(
+                super::prefix_plan(&next, 1030, true, &next[..600], true, false),
+                (0, 600)
+            );
+            // An end arm that kept its first token: the identical prompt resumes at its end, a
+            // continuation still resumes there, a shorter prefix still runs cold.
+            assert_eq!(
+                super::prefix_plan(&prompt, 1024, true, &prompt, true, true),
+                (1024, 0)
+            );
+            assert_eq!(
+                super::prefix_plan(&prompt, 1024, true, &next, true, true),
+                (1024, 0)
+            );
+            assert_eq!(
+                super::prefix_plan(&next, 1024, true, &prompt, true, true),
+                (1024, 0)
+            );
+            assert_eq!(
+                super::prefix_plan(&prompt, 1024, false, &prompt, true, true),
+                (0, 1024)
+            );
+            assert_eq!(
+                super::prefix_plan(&prompt, 1024, true, &prompt[..1000], true, true),
+                (0, 1000)
+            );
+            assert_eq!(
+                super::prefix_plan(&prompt, 1024, true, &changed, true, true),
+                (0, 1024)
+            );
         }
 
         #[test]
@@ -4451,6 +5301,20 @@ mod amd_serve {
         }
 
         #[test]
+        fn a_full_width_pack_runs_its_prefill_alone_when_decode_rows_overflow_every_rung() {
+            // Programs 0..=3 are the 128, 512, 2048 and 8192 rungs, 64 spans each.
+            let width = |p: usize| [128u32, 512, 2048, 8192].get(p).copied();
+            let limit = |_| 64;
+            // 8192 prefill rows fill the widest rung: no rung covers them plus a decode row.
+            assert_eq!(mixed_pack_route(None, Some(3), 9, width, limit), Some((3, false)));
+            assert_eq!(mixed_pack_route(Some(3), Some(3), 9, width, limit), Some((3, true)));
+            assert_eq!(mixed_pack_route(Some(3), Some(2), 9, width, limit), Some((2, false)));
+            assert_eq!(mixed_pack_route(Some(3), Some(3), 65, width, limit), Some((3, false)));
+            assert_eq!(mixed_pack_route(Some(3), None, 9, width, limit), Some((3, true)));
+            assert_eq!(mixed_pack_route(None, None, 9, width, limit), None);
+        }
+
+        #[test]
         fn packed_prefill_eligibility_excludes_final_snapshot_and_oversized_steps() {
             let step = ChunkStep {
                 prog: 2,
@@ -4465,10 +5329,26 @@ mod amd_serve {
                 resume: 0,
                 arm: 0,
             };
-            assert_eq!(packable_prefill_step(&cursor(0, None), 3), Some(step));
-            assert_eq!(packable_prefill_step(&cursor(0, None), 2), None);
-            assert_eq!(packable_prefill_step(&cursor(0, Some(0)), 3), None);
-            assert_eq!(packable_prefill_step(&cursor(1, None), 3), None);
+            for terminal in [false, true] {
+                assert_eq!(
+                    packable_prefill_step(&cursor(0, None), 3, terminal),
+                    Some(step)
+                );
+                assert_eq!(packable_prefill_step(&cursor(0, None), 2, terminal), None);
+                assert_eq!(
+                    packable_prefill_step(&cursor(0, Some(0)), 3, terminal),
+                    None
+                );
+            }
+            assert_eq!(packable_prefill_step(&cursor(1, None), 3, false), None);
+            // A span-sampling tail packs the final chunk, end-arm snapshot included.
+            let last = ChunkStep { c0: 7, ..step };
+            assert_eq!(packable_prefill_step(&cursor(1, None), 3, true), Some(last));
+            assert_eq!(
+                packable_prefill_step(&cursor(1, Some(1)), 3, true),
+                Some(last)
+            );
+            assert_eq!(packable_prefill_step(&cursor(1, Some(1)), 3, false), None);
         }
 
         #[test]
@@ -4625,6 +5505,29 @@ impl SeqEngine for AmdServe {
     fn advance_packed_prefill(&mut self, members: &[(usize, &[u32])]) -> crate::Result<()> {
         AmdServe::advance_packed_prefill(self, members)
     }
+    fn take_packed_tokens(&mut self) -> Vec<(usize, u32)> {
+        AmdServe::take_packed_tokens(self)
+    }
+    fn mixed_pack_ready(&self) -> bool {
+        AmdServe::mixed_pack_ready(self)
+    }
+    fn shrink_prefill_chunk(&mut self, slot: usize, rows: u32) -> crate::Result<()> {
+        AmdServe::shrink_prefill_chunk(self, slot, rows)
+    }
+    fn pack_pays(&self, rows: &[u32]) -> bool {
+        AmdServe::pack_pays(self, rows)
+    }
+    fn pack_groups(&self, rows: &[u32]) -> Vec<usize> {
+        AmdServe::pack_groups(self, rows)
+    }
+    fn advance_packed_mixed(
+        &mut self,
+        members: &[(usize, &[u32])],
+        feeds: &[(usize, u32)],
+        output: &mut [u32],
+    ) -> crate::Result<bool> {
+        AmdServe::advance_packed_mixed(self, members, feeds, output)
+    }
     fn prefill_frontier(&self, slot: usize) -> Option<usize> {
         AmdServe::prefill_frontier(self, slot)
     }
@@ -4636,6 +5539,9 @@ impl SeqEngine for AmdServe {
     }
     fn cached_rows(&self, slot: usize) -> usize {
         AmdServe::cached_rows(self, slot)
+    }
+    fn logits_row(&self, slot: usize, out: &mut Vec<f32>) -> bool {
+        AmdServe::logits_row(self, slot, out)
     }
     fn prefill_chunked_at_most(
         &mut self,
@@ -4684,6 +5590,14 @@ impl SeqEngine for AmdServe {
         max_rows: u32,
     ) -> crate::Result<()> {
         AmdServe::prepare_packed_prefill_slot(self, slot, prompt, max_rows)
+    }
+    fn prepare_prefill_slot(
+        &mut self,
+        slot: usize,
+        prompt: &[u32],
+        max_rows: u32,
+    ) -> crate::Result<()> {
+        AmdServe::prepare_prefill_slot(self, slot, prompt, max_rows)
     }
     fn terminal_prefill_ready(&self, slot: usize, prompt: &[u32]) -> bool {
         AmdServe::terminal_prefill_ready(self, slot, prompt)

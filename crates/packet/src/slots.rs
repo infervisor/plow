@@ -332,6 +332,13 @@ const DOC: &[S] = &[
     S { op: DevOp::ChunkAttentionF32, t: &["out", "q", "k", "v", "rel_k", "qscale?", "valid?"], i: &["rows", "heads", "head_width", "chunk", "past", "future", "positions", "left"], f: &["kscale", "cap"], j: &[] },
     S { op: DevOp::MmRowsBf16, t: &["x", "ids", "table", "slab"], i: &["rows", "width", "cap", "slab_rows"], f: &[], j: &[] },
     S { op: DevOp::MmSpanExtent, t: &["out", "ids"], i: &["rows"], f: &[], j: &[] },
+    S { op: DevOp::GemmGroupPf, t: &["x", "weight", "out0", "out1?", "out2?", "out3?", "out4?", "out5?"], i: &["T", "K", "N0", "N1", "N2", "N3", "N4", "N5"], f: &[], j: &[] },
+    S { op: DevOp::CompressPool, t: &["out", "kv", "score", "ape", "gamma", "cosb", "sinb", "pos"], i: &["n_pools", "ratio", "coff", "d", "rd", "qblk", "out_base", "rotate"], f: &["eps"], j: &[] },
+    S { op: DevOp::RopeInverseO, t: &["o", "cosb", "sinb", "pos"], i: &["n_tok", "n_head", "D", "rd", "pos0"], f: &[], j: &[] },
+    S { op: DevOp::EngramGate, t: &["x", "kv", "q_weight", "k_weight", "token_mask"], i: &["T", "n", "hidden"], f: &["norm_eps"], j: &[] },
+    S { op: DevOp::EngramEmbed, t: &["out", "table", "scale", "ids"], i: &["T", "n_cols", "head_dim", "blk", "vocab_start", "part_rows"], f: &[], j: &[] },
+    S { op: DevOp::GemmFp8Mx, t: &["out", "x", "w", "scale"], i: &["T", "N", "K"], f: &[], j: &[] },
+    S { op: DevOp::CompressRopeQuant, t: &["out", "src", "cosb", "sinb", "pos"], i: &["n_rows", "d", "rd", "qblk", "ratio", "row_base", "qmode", "n_head"], f: &[], j: &[] },
 ];
 
 /// Ops that say "As [`DevOp::X`]" / "twin of [`DevOp::X`]" / "Same operands as

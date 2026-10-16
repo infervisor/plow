@@ -49,6 +49,9 @@ pub fn op_classes(op: DevOp) -> &'static [&'static str] {
         | MlaMaterializePack
         | FlashMlaMaterializedPrefill
         | DsaPoolCompress
+        | CompressPool
+        | CompressRopeQuant
+        | RopeInverseO
         | DsaPoolExpand
         | DsaPoolStash
         | DsaQQuant
@@ -125,6 +128,7 @@ pub fn op_classes(op: DevOp) -> &'static [&'static str] {
         | GemmWideFp8
         | GemmC5Fp8
         | GemmFp8Blk
+        | GemmFp8Mx
         | GemmGluMxfp4
         | GemmSplitK
         | GemmF32
@@ -138,14 +142,18 @@ pub fn op_classes(op: DevOp) -> &'static [&'static str] {
         | MlaBmmFp8
         | Conv1dF32
         | ConvTranspose1dF32 => &["gemm"],
-        GemmLtPf | GemmBlkPf => &["gemm", "native_route"],
+        GemmLtPf | GemmBlkPf | GemmGroupPf => &["gemm", "native_route"],
 
         Gemv | GemvGlu | GemvQkv | GemvFp8 | GemvGluFp8 | GemvFp8Blk | GemvSz | GemvGluSz
         | GemvMxfp4 | GemvGluMxfp4 | GemvQkvg | GemvQkvMxfp4 | GemvQkvFp8 | GemvF32
         | GemvAffineQ4 => &["gemv"],
 
         RmsNorm | RowRms | NormResidual | AddNorm | NormResidualNorm | LayerNorm | QwenRmsNorm
-        | QwenGatedNorm | KdaGatedNorm | LayerNormF32 | RowStatsF32 | RmsNormF32 => &["norm"],
+        | QwenGatedNorm | KdaGatedNorm | LayerNormF32 | RowStatsF32 | RmsNormF32
+        // Engram's gate is two RMS reductions over `hidden` driving a gated residual add, so
+        // its cost and its knob scope are a norm's, not the hc machinery's -- it mixes INTO the
+        // mHC stream but carries none of the Sinkhorn/combine state HyperConnPre does.
+        | EngramGate => &["norm"],
 
         KdaConv
         | KdaGate
@@ -175,7 +183,10 @@ pub fn op_classes(op: DevOp) -> &'static [&'static str] {
 
         Argmax | ArgmaxFin | GemvArgmax | RowGather | ArgmaxF32 => &["sample"],
 
-        Nop | Residual | Sum4Bf16 | Glu | Embed | SoftCap | QuantFp8 | SituGlu | ZeroF32
+        // Engram's table read is a gather-and-dequantize, the same shape of work as `Embed`
+        // and `RowGather` -- no reduction, no coupling between rows.
+        EngramEmbed
+        | Nop | Residual | Sum4Bf16 | Glu | Embed | SoftCap | QuantFp8 | SituGlu | ZeroF32
         | CastF32Bf16 | PerLayerInput | GluStrided | ScaledAddF32 | GluF32 | SiluF32 | ReluF32
         | BroadcastAddF32 | EmbedF16F32 | EmbedOverlayBf16 | EmbedPosBf16 | PackNcfwRowsF32
         | QuantFp8Block128 | GatherRowsF32 | CopyColsF32 | UnaryF32 | BinaryF32 | RandF32

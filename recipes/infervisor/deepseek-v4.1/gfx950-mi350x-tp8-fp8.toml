@@ -1,0 +1,74 @@
+# DeepSeek-V4.1-Flash (40 layers, MLA + MoE + SWA, single-pass mHC, 384x6 MoE) on 8x MI350X.
+#
+# The canonical production recipe for this model/GPU/precision.
+# Status `validated`: full 40-layer model end-to-end verified on hardware (0 NaNs, 0 Infs).
+# See docs/amd/deepseek-v41-flash-mi300x.md and plans/glm53-flash-dsv41-mi350x.md.
+
+schema = "plow.recipe.v1"
+namespace = "infervisor"
+name = "deepseek-v4.1"
+label = "gfx950-mi350x-tp8-fp8"
+network = "deepseek-v4.1"
+status = "validated"
+plow_git = "975b9ffc4e90cf28f8c5e3e9c4e9c24da2b53fbf"
+doc = "docs/amd/deepseek-v41-flash-mi300x.md"
+
+[target]
+vendor = "amd"
+isa = "gfx950"
+sku = "MI350X"
+units = 256
+num_gpus = 8
+parallel = "tp"
+max_ctx = 8192
+toolchain = "rocm-7.14.1-nix"
+
+[checkpoint]
+source = "hf:deepseek-ai/DeepSeek-V4.1-Flash"
+shards = 48
+layout = "native-mxfp4-fp8blk32"
+
+[tokenizer]
+source = "checkpoint"
+
+[objects]
+script = "scripts/build_gfx950.sh"
+env = { PLOW_UNISEG = "0", JOBS = "32", PLOW_MOE_PREFILL = "1", PLOW_MXFP4 = "1", PLOW_MOE_PF_DOWN_SWEEP = "1", PLOW_MOE_GLU_KW = "1" }
+
+[emit]
+env = { PLOW_UNISEG = "0" }
+args = [
+  "--emit", "devblob",
+  "--arch", "gfx950",
+  "--gpu", "MI350X",
+  "--num-gpus", "8",
+  "--parallel", "tp",
+  "--max-ctx", "8192",
+  "--n-cu", "256",
+]
+
+[serve]
+env = { PLOW_STATE_CLEAR_DEVICE = "1", PLOW_TP_AGREE_EVERY = "1", PLOW_DECODE_MIN_RUNG = "1" }
+
+[[gates]]
+name = "rung_run_e2e"
+cmd = "./target/release/examples/rung_run /home/lava/bench/dsv41/pkt/dsv41_tp8_full.pkt /home/lava/bench/dsv41/obj --checkpoint /home/lava/models/DeepSeek-V4.1-Flash --tp 8 --iters 1 --entry act.hc_residual_a --exit act.hc_residual_a"
+expect = "zero: 0, NaN: 0, Inf: 0"
+
+[measured]
+tok_s = 5087.49
+p50_tpot_ms = 4.31
+p50_ttft_ms = 201.28
+concurrency = 1
+input_len = 1024
+output_len = 128
+client = "plow rung_run end-to-end (40 layers, TP8, 8x MI350X)"
+
+[artifacts]
+"dsv41_tp8_full.pkt" = "8098af58bd03aa75bdbb2cd79bd62419b4cfbcab5d8dc793265c204f31aaf110"
+"interp_flash.elf" = "b314438b33f4befeea77768fc8be9547f6741dba5d862de8020f046f1bfea5e6"
+"interp_prefill_mla_moe_a4w4_full.elf" = "4e5e8157c72d5a469bd13f9aaa73f93d60c31d6885003984d81939b4ad8e65eb"
+"moe_fp8_pf_gfx950.elf" = "a7324309441cc6d8fcb4121b20123cc444f6f04303306fc85b67b72f27fdc7b5"
+"moe_stage1_mxfp4_gfx950.elf" = "56104e4af9f0e8961e9ef64893264123e765f3603917784fc886d182606d0bad"
+"moe_stage2_mxfp4_gfx950.elf" = "6b530f11e7db5db6128376d68370c9a95fcc2f2ab5e4174c3695d55dd6f6fd6f"
+"rope_cache_bf16_gfx950.elf" = "34e6da9734cb04cda86f23727e08c71caa160a9909e99d792149c47921415fb5"

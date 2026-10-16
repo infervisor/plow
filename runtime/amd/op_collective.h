@@ -148,6 +148,52 @@ __device__ __forceinline__ uint32_t xr_sat32(uint64_t d) {
  * body's instruction mix while rotating the read index, so it must not also change the mix. */
 #define PLOW_XR_MLP_ON (PLOW_XR_MLP && !PLOW_XR_SHUFFLE)
 
+/* PLOW_XR_VEC=V (2/4/8; default 0 = off): the one-shot reduce (d_xreduce, gcols == 0, TP8)
+ * loads V consecutive bf16 per peer per thread (4/8/16 B) with all eight peers in flight, so a
+ * batched decode rung's [rows, hidden] message keeps 8*V elements per thread outstanding
+ * instead of PLOW_XR_MLP's 8. Each element still sums r = 0..7 in f32 from 0.0f and rounds once:
+ * BIT-IDENTICAL. Misaligned slots or n % V != 0 keep the scalar walk. */
+#ifndef PLOW_XR_VEC
+#define PLOW_XR_VEC 0
+#endif
+#if PLOW_XR_VEC != 0 && PLOW_XR_VEC != 2 && PLOW_XR_VEC != 4 && PLOW_XR_VEC != 8
+#error "PLOW_XR_VEC must be 0, 2, 4 or 8"
+#endif
+#if PLOW_XR_VEC
+extern "C" __device__ unsigned plow_xr_vec_1 = PLOW_XR_VEC;
+#endif
+/* PLOW_XR_SP_VEC=V (2/4/8; default 0): the sequence-parallel seam halves (ops 25/26) move V
+ * consecutive bf16 per peer access — the reduce-scatter sums each element r = 0..N-1 in f32 and
+ * rounds once (no gather fold), the all-gather copies. Only the element->thread map changes:
+ * BIT-IDENTICAL. Unaligned bands keep the scalar walk. */
+#ifndef PLOW_XR_SP_VEC
+#define PLOW_XR_SP_VEC 0
+#endif
+#if PLOW_XR_VEC || PLOW_XR_SP_VEC
+/* V consecutive bf16 as one activation store, scoped exactly like st_act/st_glob8. */
+template <uint32_t V> __device__ auto xr_word_of() {
+    if constexpr (V == 4) return (uint64_t)0; else return (uint32_t)0;
+}
+template <uint32_t V>
+__device__ __forceinline__ void xr_st_vec(bf16* p, const bf16* v) {
+    if constexpr (V == 8) {
+        bf16v8 o;
+#pragma unroll
+        for (uint32_t j = 0; j < 8; j++) o[j] = v[j];
+        st_glob8(p, o);
+    } else {
+        typedef decltype(xr_word_of<V>()) W;
+        W w = 0;
+#pragma unroll
+        for (uint32_t j = 0; j < V; j++) w |= (W)(uint16_t)v[j] << (16u * j);
+        st_act<W>((PLOW_GLOB W*)(PLOW_GLOB void*)p, w);
+    }
+}
+#endif
+#if PLOW_XR_SP_VEC != 0 && PLOW_XR_SP_VEC != 2 && PLOW_XR_SP_VEC != 4 && PLOW_XR_SP_VEC != 8
+#error "PLOW_XR_SP_VEC must be 0, 2, 4 or 8"
+#endif
+
 /* Strict rank-order reduce-scatter with independent elements in flight. Default one keeps
  * the shipping loop byte-identical; isolated specialist objects screen wider schedules. */
 #ifndef PLOW_XR_RS_U
@@ -419,6 +465,33 @@ __device__ __forceinline__ void d_xreduce(bf16* out, const void* const* peer_scr
                                           uint32_t row_w = 0) {
     const unsigned base = slice * PLOW_THREADS + threadIdx.x;
     const unsigned step = nblk * PLOW_THREADS;
+#if PLOW_XR_VEC && !PLOW_XR_SHUFFLE
+    if (nranks == 8u && gcols == 0 && n % PLOW_XR_VEC == 0 &&
+        slot_bytes % (2u * PLOW_XR_VEC) == 0 &&
+        ((uintptr_t)out | (uintptr_t)peer_scratch[0]) % (2u * PLOW_XR_VEC) == 0) {
+        typedef bf16 xv_t __attribute__((ext_vector_type(PLOW_XR_VEC)));
+        const xv_t* p[8];
+#pragma unroll
+        for (uint32_t r = 0; r < 8u; r++)
+            p[r] = (const xv_t*)((const char*)peer_scratch[r] + slot_bytes);
+        const uint32_t nv = n / PLOW_XR_VEC;
+        for (uint32_t w = base; w < nv; w += step) {
+            xv_t v[8];
+#pragma unroll
+            for (uint32_t r = 0; r < 8u; r++) v[r] = *(const PLOW_GLOB xv_t*)(const PLOW_GLOB void*)(p[r] + w);
+            bf16 o[PLOW_XR_VEC];
+#pragma unroll
+            for (uint32_t j = 0; j < (uint32_t)PLOW_XR_VEC; j++) {
+                float acc = 0.0f;
+#pragma unroll
+                for (uint32_t r = 0; r < 8u; r++) acc += bf2f(v[r][j]);
+                o[j] = f2bf(acc);
+            }
+            xr_st_vec<PLOW_XR_VEC>(out + (size_t)w * PLOW_XR_VEC, o);
+        }
+        return;
+    }
+#endif
 #if PLOW_XR_MLP_ON
     /* PEER-BATCHED (see PLOW_XR_MLP): bases hoisted, N remote loads in flight, same sum
      * order and same element->thread map => bit-identical. The folded all-gather term
@@ -675,11 +748,19 @@ __device__ __forceinline__ void d_xreduce_mega(
 #endif
 #if PLOW_XR_TAGGED
 extern "C" __device__ unsigned plow_xr_tagged_1 = 1;
+#if PLOW_XR_TAG_SLOT_BYTES != PLOW_XR_TAG_SLOT_BYTES_DEFAULT
+#define PLOW_XRT_CAT2(a, b) a##b
+#define PLOW_XRT_CAT(a, b) PLOW_XRT_CAT2(a, b)
+extern "C" __device__ unsigned PLOW_XRT_CAT(plow_xr_tag_slot_, PLOW_XR_TAG_SLOT_BYTES_N) = 1;
+#endif
 #endif
 #define PLOW_XRT_MAXR 8u
 #define PLOW_XRT_PER_WORD 3u
 __device__ __forceinline__ uint32_t xrt_words(uint32_t n) {
     return (n + PLOW_XRT_PER_WORD - 1u) / PLOW_XRT_PER_WORD;
+}
+__device__ __forceinline__ bool xrt_fits(uint32_t n) {
+    return xrt_words(n) * 8u <= PLOW_XR_TAG_SLOT_BYTES;
 }
 __device__ __forceinline__ uint64_t xrt_load(const uint64_t* p) {
     return __hip_atomic_load(as_glob(p), __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
@@ -711,7 +792,9 @@ __device__ __forceinline__ void d_xreduce_tag_publish(const bf16* part, void* ts
  * directly, so the combine packet and its gate are not emitted at all. Bit-exact against
  * d_moe_combine -> d_xreduce_tag_publish by construction; the plain partial slot is not
  * written. Carried on the XReduce packet as `t1 = part ([k, n] f32)`, `i7 = k` (0 = off);
- * the loader refuses a folded packet on an object without `plow_xr_combine_fold_1`. */
+ * the loader refuses a folded packet on an object without `plow_xr_combine_fold_1`.
+ * GLM's combine also adds a bf16 `shared` row first (d_moe_combine's order: 0 + shared, then the
+ * slots); the packet carries it in `t6` (TENSOR_NONE = none). */
 #ifndef PLOW_XR_COMBINE_FOLD
 #define PLOW_XR_COMBINE_FOLD 0
 #endif
@@ -730,6 +813,7 @@ extern "C" __device__ unsigned plow_xr_combine_fold_1 = 1;
  * adds (adding +0.0f would turn a -0.0f sum into +0.0f). */
 #define PLOW_XRT_FOLD_MAXK 16u
 __device__ __forceinline__ void d_xreduce_tag_publish_combine(const float* part, uint32_t k,
+                                                              const bf16* shared,
                                                               void* tslot, uint32_t n,
                                                               uint32_t tag, unsigned slice,
                                                               unsigned nblk) {
@@ -751,6 +835,7 @@ __device__ __forceinline__ void d_xreduce_tag_publish_combine(const float* part,
 #pragma unroll
         for (uint32_t j = 0; j < PLOW_XRT_PER_WORD; j++) {
             float acc = 0.0f;
+            if (shared) acc += bf2f(shared[(e + j < n) ? e + j : e]);
 #pragma unroll
             for (uint32_t s = 0; s < PLOW_XRT_FOLD_MAXK; s++)
                 if (s < k) acc += v[j][s];
@@ -768,7 +853,7 @@ __device__ __forceinline__ void d_xreduce_tagged_mega(
     uint32_t* status, unsigned slice, unsigned nblk, uint32_t gslot_bytes, uint32_t gcols,
     uint32_t row_w, uint32_t tag_off, uint32_t tag_slot
 #if PLOW_XR_COMBINE_FOLD
-    , const float* cpart, uint32_t ck
+    , const float* cpart, uint32_t ck, const bf16* cshared
 #endif
 #if PLOW_XR_TRACE_PHASES
     , PlowTraceRec* xr_trace = nullptr
@@ -794,8 +879,8 @@ __device__ __forceinline__ void d_xreduce_tagged_mega(
     const uint32_t tg_off = tag_off + (2u + parity) * tag_slot;
 #if PLOW_XR_COMBINE_FOLD
     if (ck)
-        d_xreduce_tag_publish_combine(cpart, ck, (char*)peer_scratch[rank] + tp_off, n, want,
-                                      slice, nblk);
+        d_xreduce_tag_publish_combine(cpart, ck, cshared, (char*)peer_scratch[rank] + tp_off, n,
+                                      want, slice, nblk);
     else
 #endif
     d_xreduce_tag_publish((const bf16*)((const char*)peer_scratch[rank] + slot_bytes),
@@ -1690,6 +1775,40 @@ __device__ __forceinline__ void d_xreduce_scatter_mega(
     xr_rs_sched(peer_scratch, nranks, slot_bytes, my_part, my_lo, my_hi, tid, stride, gslot_bytes,
                 gcols, band_copy);
 #else
+#if PLOW_XR_SP_VEC
+    {
+        constexpr uint32_t V = PLOW_XR_SP_VEC;
+        typedef bf16 sv_t __attribute__((ext_vector_type(PLOW_XR_SP_VEC)));
+        const bool al = gcols == 0 && nranks <= 8u && my_lo % V == 0 && my_hi % V == 0 &&
+                        slot_bytes % (2u * V) == 0 &&
+                        ((uintptr_t)peer_scratch[0] | (uintptr_t)band_copy) % (2u * V) == 0;
+        if (al) {
+            const sv_t* p[8];
+#pragma unroll
+            for (uint32_t r = 0; r < 8u; r++)
+                p[r] = (const sv_t*)((const char*)peer_scratch[r < nranks ? r : 0u] + slot_bytes);
+            for (uint32_t w = my_lo / V + tid; w < my_hi / V; w += stride) {
+                sv_t v[8];
+#pragma unroll
+                for (uint32_t r = 0; r < 8u; r++)
+                    if (r < nranks) v[r] = *(const PLOW_GLOB sv_t*)(const PLOW_GLOB void*)(p[r] + w);
+                bf16 o[V];
+#pragma unroll
+                for (uint32_t j = 0; j < V; j++) {
+                    float acc = 0.0f;
+#pragma unroll
+                    for (uint32_t r = 0; r < 8u; r++)
+                        if (r < nranks) acc += bf2f(v[r][j]);
+                    o[j] = f2bf(acc);
+                }
+                xr_st_vec<V>(my_part + (size_t)w * V, o);
+                if (band_copy) xr_st_vec<V>(band_copy + (size_t)(w - my_lo / V) * V, o);
+            }
+            __syncthreads();
+            return;
+        }
+    }
+#endif
     const uint32_t row_w = nranks * gcols;
     auto finish = [&](uint32_t e, float acc) {
         bf16 v = f2bf(acc);
@@ -1766,6 +1885,24 @@ __device__ __forceinline__ void d_xall_gather_mega(
             const uint32_t lo = (uint32_t)(((uint64_t)n * s) / nranks);
             const uint32_t hi = (uint32_t)(((uint64_t)n * (s + 1)) / nranks);
             const bf16* src = (const bf16*)((const char*)peer_scratch[s] + slot);
+#if PLOW_XR_SP_VEC
+            {
+                constexpr uint32_t V = PLOW_XR_SP_VEC;
+                typedef bf16 sv_t __attribute__((ext_vector_type(PLOW_XR_SP_VEC)));
+                if (lo % V == 0 && hi % V == 0 && slot % (2u * V) == 0 &&
+                    ((uintptr_t)dst | (uintptr_t)peer_scratch[s]) % (2u * V) == 0) {
+                    for (uint32_t w = lo / V + tid; w < hi / V; w += stride) {
+                        const sv_t x =
+                            *(const PLOW_GLOB sv_t*)(const PLOW_GLOB void*)((const sv_t*)src + w);
+                        bf16 o[V];
+#pragma unroll
+                        for (uint32_t j = 0; j < V; j++) o[j] = x[j];
+                        xr_st_vec<V>(dst + (size_t)w * V, o);
+                    }
+                    continue;
+                }
+            }
+#endif
             for (uint32_t e = lo + tid; e < hi; e += stride)
                 st_act1(&as_glob(dst)[e], as_glob(src)[e]);
         }

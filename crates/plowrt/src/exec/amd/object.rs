@@ -403,6 +403,13 @@ pub(super) const PREFILL_ARM_MARKERS: &[(&str, &[&str])] = &[
     // ns packets at the nsplit=1 partial layout while the merge reads ns — refuse.
     ("PLOW_MLA_PF_NS", &["plow_mla_pf_ns_arm"]),
     ("PLOW_MOE_PF_A8", &["plow_moe_pf_a8_arm"]),
+    // W8A8 grouped MoE prefill (ops 85/86 i[7] >= 2), a build axis the packet's plow_config.h
+    // turns on. Without it the shipped body reads fp8 rows as bf16 (or i[7] as part16). Refuse.
+    ("PLOW_MOE_PF_W8A8", &["plow_moe_pf_w8a8_arm"]),
+    // i[7] >= 4: the two-term SPLIT arm. An object predating it runs i[7] = 4 as W8A16 on fp8 rows.
+    ("PLOW_MOE_PF_W8A8_SPLIT", &["plow_moe_pf_w8a8_split_arm"]),
+    // GLU i[7] = 6: the staging-quant single-term arm (PLOW_MOE_PF_W8A8_FQ).
+    ("PLOW_MOE_PF_W8A8_FQ", &["plow_moe_pf_w8a8_fq_arm"]),
     // DSA indexer prep (HeadNormRope pair_mode 3). An object without the arm runs it as the plain
     // rope on the un-normed key: no trap. A BUILD axis (`#if PLOW_DSA_PREP`).
     ("PLOW_DSA_PREP", &["plow_dsa_prep_arm"]),
@@ -449,6 +456,8 @@ pub(super) const PREFILL_ARM_MARKERS: &[(&str, &[&str])] = &[
             "d_kda_conv",
         ],
     ),
+    ("PLOW_DSV41_ENGRAM", &["plow_dsv41_engram_arm"]),
+    ("PLOW_DSV41_BLKFP8", &["plow_dsv41_blkfp8_arm"]),
 ];
 
 /// DECODE-object arms, the twin of [`PREFILL_ARM_MARKERS`] for the other object.
@@ -702,6 +711,11 @@ pub(super) fn check_materialized_residual_input<'a>(
 pub(super) const XR_TAGGED_SYM: &str = "plow_xr_tagged_1";
 
 pub(super) const DECODE_ARM_MARKERS: &[(&str, &[&str])] = &[
+    // PLOW_MOE_DEC_W8A8: grouped decode MoE/dense ops 85/86 with i[7] >= 2 (>= 4: SPLIT). Without
+    // the arm the W8A16 body reads fp8 rows as bf16: wrong, no trap.
+    ("PLOW_MOE_PF_W8A8", &["plow_moe_pf_w8a8_arm"]),
+    ("PLOW_MOE_PF_W8A8_SPLIT", &["plow_moe_pf_w8a8_split_arm"]),
+    ("PLOW_MOE_PF_W8A8_FQ", &["plow_moe_pf_w8a8_fq_arm"]),
     ("PLOW_DSA_SELECT_LOCAL", &["plow_dsa_select_local_arm"]),
     // DCP owner gather (ops 181-183): without the arm the flash reads unwritten gather buffers.
     ("PLOW_DCP_GATHER", &["plow_dcp_gather_1"]),
@@ -723,10 +737,27 @@ pub(super) const DECODE_ARM_MARKERS: &[(&str, &[&str])] = &[
     // class, same treatment — and here the marker is genuinely load-bearing rather than a
     // vintage stamp, because the fold is a BUILD AXIS: an unarmed object has no fold body.
     ("PLOW_GLM_FUSE_QNORM", &["plow_glm_fuse_qnorm_arm"]),
+    // The GLM-5.3-Flash decode RmsNorm folded into HyperConnPre (op 128 i4 = 1, t7 = gamma,
+    // i5 = out). An object without the arm never writes the normed row: stale data, no trap.
+    ("PLOW_GLM_HC_NORM_FOLD", &["plow_glm_hc_norm_fold_arm"]),
+    // The HyperConnPost folded into the mHC mix GemvF32 (op 135 i3 = 1). Same silent class.
+    ("PLOW_GLM_HC_POST_FOLD", &["plow_glm_hc_post_fold_arm"]),
+    // The one-row HyperConnPre run by the mix GemvF32's last workgroup (op 135 i4 = 1). Same
+    // silent class.
+    ("PLOW_GLM_HC_PRE_TAIL", &["plow_glm_hc_pre_tail_arm"]),
+    // The mix split over S workgroups per output (op 135 i4 = 2). Same silent class.
+    ("PLOW_GLM_HC_MIX_SPLIT", &["plow_glm_hc_mix_split_arm"]),
+    // Batched post + mix + pre in one packet (op 135 i4 = 3). Same silent class.
+    ("PLOW_GLM_HC_FUSE_DEC", &["plow_glm_hc_fuse_dec_arm"]),
+    // Grouped GemmSmall projections (i7 = 3/4). An object without the arm runs segment 0 only.
+    ("PLOW_GLM_KDA_PROJ_GROUP", &["plow_gemm_small_group_arm"]),
     // The K3 latent MoeCombine folded into the tagged one-shot publish (XReduce t1 = part,
     // i7 = k). An object without the arm publishes the plain partial slot, which no packet
     // wrote — stale data, no trap. A BUILD axis (`#if PLOW_XR_COMBINE_FOLD`).
     ("PLOW_XR_COMBINE_FOLD", &["plow_xr_combine_fold_1"]),
+    // The GLM-5.3-Flash HyperConnPost folded into the batched decode XReduce (t2..t5, j0 =
+    // hidden). An object without the arm never writes the new residual stream. `#if PLOW_XR_HCPOST`.
+    ("PLOW_XR_HCPOST", &["plow_xr_hcpost_1"]),
     // The K3 f_b GEMV folded into KdaStateStepG's prologue (flags bit 2, t4 = f_a, j1 = W_fb).
     // An object without the arm reads f_a's 128 values as the head's gate logits — finite,
     // no trap, wrong. A BUILD axis (`#if PLOW_KDA_FB_FOLD`).
@@ -753,7 +784,13 @@ pub(super) fn required_moe_pf_accum<'a>(
     progs
         .into_iter()
         .flat_map(|p| &p.insts)
-        .any(|inst| inst.op == DevOp::MoeGroupDownPf as u16 && inst.i[field] != 0)
+        // i7 = 3 (PLOW_MOE_FP8_PF_ACC) spells its slot count in i4; that down runs only on the
+        // dedicated object, never the interpreter's atomic arm.
+        .any(|inst| {
+            inst.op == DevOp::MoeGroupDownPf as u16
+                && inst.i[field] != 0
+                && !(field == 4 && inst.i[7] == 3)
+        })
 }
 
 /// Refuse a DECODE code object that does not carry the arms the packet needs.
@@ -912,7 +949,7 @@ pub(super) const KDA_INTRA_WAVE_ITEMS_MARKERS: [&str; 6] = [
     "plow_kda_intra_wave_items_wave64_1",
     "plow_kda_intra_wave_items_no_spill_1",
     "plow_kda_intra_wave_items_static_lds_131072",
-    "plow_kda_intra_wave_items_vgpr_le_96",
+    "plow_kda_intra_wave_items_vgpr_le_256",
 ];
 
 pub(super) const KDA_CARRY_REGSTATE_MARKERS: [&str; 6] = [
@@ -934,6 +971,8 @@ pub(super) const KDA_WU_LEAN_MARKERS: [&str; 6] = [
     "plow_kda_wu_lean_vgpr_le_256",
 ];
 pub(super) const KDA_WU_LEAN_LDS: u32 = 46_080;
+/// `gemm_group_pf.hip`'s static LDS: the 128x384 double-buffered stage.
+pub(super) const GEMM_GROUP_LDS: u32 = 147_456;
 
 pub(super) const KDA_CARRY_KEYFEED_MARKERS: [&str; 7] = [
     "plow_kda_carry_keyfeed_abi_1",
@@ -1084,6 +1123,19 @@ pub(super) fn packet_decode_arm_requirements<'a>(
 ) -> Vec<String> {
     let insts = || progs.clone().into_iter().flat_map(|p| &p.insts);
     let mut requires = Vec::new();
+    let w8a8 = |inst: &DevInst64| {
+        (inst.op == DevOp::MoeGroupGluPf as u16 || inst.op == DevOp::MoeGroupDownPf as u16)
+            && inst.i[7] >= 2
+    };
+    if insts().any(|inst| w8a8(inst)) {
+        requires.push("PLOW_MOE_PF_W8A8=1".to_owned());
+    }
+    if insts().any(|inst| w8a8(inst) && (inst.i[7] == 4 || inst.i[7] == 5)) {
+        requires.push("PLOW_MOE_PF_W8A8_SPLIT=1".to_owned());
+    }
+    if insts().any(|inst| w8a8(inst) && inst.i[7] == 6) {
+        requires.push("PLOW_MOE_PF_W8A8_FQ=1".to_owned());
+    }
     if insts().any(|inst| inst.op == DevOp::IndexSelect as u16 && inst.i[4] == 1) {
         requires.push("PLOW_DSA_SELECT_LOCAL=1".to_owned());
     }
@@ -1111,6 +1163,11 @@ pub(super) fn packet_decode_arm_requirements<'a>(
     }
     if insts().any(|inst| inst.op == DevOp::XReduce as u16 && inst.i[7] != 0) {
         requires.push("PLOW_XR_COMBINE_FOLD=1".to_owned());
+    }
+    if insts()
+        .any(|inst| inst.op == DevOp::XReduce as u16 && inst.t[2] != packet::dev::TENSOR_NONE16)
+    {
+        requires.push("PLOW_XR_HCPOST=1".to_owned());
     }
     if insts().any(|inst| inst.op == DevOp::KdaStateStepG as u16 && inst.i[4] & 4 != 0) {
         requires.push("PLOW_KDA_FB_FOLD=1".to_owned());
@@ -1151,14 +1208,29 @@ pub(super) fn packet_prefill_arm_requirements<'a>(
     }) {
         requires.push("PLOW_MOE_PREFILL=1".to_owned());
     }
+    // i[7] >= 2 on ops 85/86 is the W8A8 arm (PLOW_MOE_PF_W8A8), not part16/a8.
+    let w8a8 = |inst: &DevInst64| {
+        (inst.op == DevOp::MoeGroupGluPf as u16 || inst.op == DevOp::MoeGroupDownPf as u16)
+            && inst.i[7] >= 2
+    };
     if insts().any(|inst| {
         matches!(inst.op, op if op == DevOp::MoeGroupDownPf as u16 || op == DevOp::MoeCombinePf as u16)
             && inst.i[7] != 0
+            && !w8a8(inst)
     }) {
         requires.push("PLOW_MOE_PF_PART16=1".to_owned());
     }
-    if insts().any(|inst| inst.op == DevOp::MoeGroupGluPf as u16 && inst.i[7] != 0) {
+    if insts().any(|inst| inst.op == DevOp::MoeGroupGluPf as u16 && inst.i[7] != 0 && !w8a8(inst)) {
         requires.push("PLOW_MOE_PF_A8=1".to_owned());
+    }
+    if insts().any(|inst| w8a8(inst) && (inst.i[7] == 4 || inst.i[7] == 5)) {
+        requires.push("PLOW_MOE_PF_W8A8_SPLIT=1".to_owned());
+    }
+    if insts().any(|inst| w8a8(inst) && inst.i[7] == 6) {
+        requires.push("PLOW_MOE_PF_W8A8_FQ=1".to_owned());
+    }
+    if insts().any(|inst| w8a8(inst)) {
+        requires.push("PLOW_MOE_PF_W8A8=1".to_owned());
     }
     // The shared-expert fold's constant `k+1`th routing slot (op 83 i[5]). An object without the
     // arm writes only the top-k slots, so the shared expert — which every token passes through —
@@ -1797,6 +1869,9 @@ pub(super) const PACKED_PREFILL_MLA_NORM_SEG_SYM: &str = "plow_packed_prefill_ml
 pub(super) const PACKED_PREFILL_BAND_SYM: &str = "plow_packed_prefill_band_1";
 pub(super) const PACKED_PREFILL_MLA_FLASH_SEG_SYM: &str =
     "plow_packed_prefill_mla_flash_segments_1";
+/// The packed V2 flash object runs NoPE (DR = 0) spans; required when the packet's packed
+/// programs carry NoPE `FlashMlaPrefill`.
+pub(super) const PACKED_PREFILL_MLA_NOPE_SYM: &str = "plow_packed_prefill_mla_nope_1";
 pub(super) const PACKED_PREFILL_KDA_SEG_SYM: &str = "plow_packed_prefill_kda_serial_segments_1";
 pub(super) const PACKED_PREFILL_KDA_CHUNK_SEG_SYM: &str =
     "plow_packed_prefill_kda_chunk_segments_1";
@@ -2210,6 +2285,29 @@ pub(super) fn check_dsa_select_local(
                 }
                 continue;
             }
+            if d.i[4] == 4 {
+                // Pooled batched decode (GLM-5.3-Flash kpool): op 118's per-row radix, one
+                // workgroup per row, row r over Score[r * i0] into idx[r * i1].
+                let rows = p.t;
+                let cap = |slot: u16, need: u64| {
+                    tensors
+                        .get(usize::from(slot))
+                        .is_some_and(|t| t.bytes >= need)
+                };
+                if !p.role.is_decode_rung()
+                    || d.i[5] != rows
+                    || u32::from(d.blocks) != rows
+                    || d.i[2] < 2
+                    || !cap(d.t[0], u64::from(rows) * u64::from(d.i[1]) * 4)
+                    || !cap(d.t[1], u64::from(rows) * u64::from(d.i[0]) * 4)
+                    || !cap(d.t[4], u64::from(rows) * 4)
+                {
+                    return Err(RuntimeError::Device(
+                        "pooled batched DSA selection requires a decode rung, one workgroup per row, pool_size > 1 and row-sized operands".into(),
+                    ));
+                }
+                continue;
+            }
             let err = || {
                 RuntimeError::Device(
                 "local DSA selection requires unpacked gfx942 TP8 decode rows 2/4/8/16/32, unpooled top2048 and row-sized operands".into())
@@ -2301,7 +2399,7 @@ pub(super) fn check_xalltoall_heads(
 ) -> Result<()> {
     let err = || {
         RuntimeError::Device(
-            "row-split attention's head/row all-to-all requires gfx942 TP8 with \
+            "row-split attention's head/row all-to-all requires gfx942/gfx950 TP8 with \
              self-consistent row/head geometry"
                 .into(),
         )
@@ -2314,7 +2412,7 @@ pub(super) fn check_xalltoall_heads(
         {
             let (rpr, nh_l, dsz, nh_total, n_gpu, dir, hg) =
                 (d.i[0], d.i[1], d.i[2], d.i[3], d.i[5], d.i[7], d.fj[1]);
-            if arch != "gfx942"
+            if !matches!(arch, "gfx942" | "gfx950")
                 || n_gpu != 8
                 || dir > 1
                 || rpr == 0

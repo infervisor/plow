@@ -30,7 +30,7 @@
   }
  },
  "interp_decode_mxfp4": {
-  "plow_exec": {
+  "plow_exec|plow_interp_dec": {
    "require_min": {
     "v_cvt_scalef32_pk_bf16_fp4": 16,
     "v_dot2c_f32_bf16": 16

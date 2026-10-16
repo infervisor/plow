@@ -173,6 +173,17 @@ impl KdaCfg {
             && self.eps.is_finite()
     }
 
+    /// Whether the standalone batched-decode chain (`PLOW_KDA_DECODE_WIDE`, op 125 descriptor
+    /// version 3) carries this shape: the D rung its object instantiates and the conv width the
+    /// interpreter's independent-row conv window holds.
+    pub fn supports_decode_wide(&self) -> bool {
+        self.heads > 0
+            && self.head_dim == 128
+            && self.bv > 0
+            && (1..=8).contains(&self.conv_w)
+            && self.eps.is_finite()
+    }
+
     /// Bytes of the fused arm's per-layer rendezvous scratch: per head one counter word plus
     /// q, k, g and o words (`PLOW_KDA_FUSED_SCRATCH_WORDS`, op_kda.h), 8 bytes each.
     pub fn fused_arm_scratch_bytes(&self) -> u64 {
@@ -274,6 +285,40 @@ pub struct KdaWeights {
     /// `[D]` f32, SHARED by all `H` heads.
     pub o_norm: u32,
     pub ln_w: u32,
+    /// `PLOW_KDA_PF_GROUP_GEMM`: the loader-built `[q | k | v | g_a | f_a | b]` row concatenation
+    /// of this rank's slices (`derived.in_proj_cat.weight`), or `TENSOR_NONE`.
+    pub in_cat: u32,
+}
+
+/// One bf16 prefill projection `out[t, n] = x[t, k] . w[n, k]^T` as its own [`DevOp::GemmGroupPf`]
+/// segment (one group).
+#[allow(clippy::too_many_arguments)]
+pub fn emit_pf_gemm_route(
+    b: &mut Builder,
+    out: u32,
+    x: u32,
+    w: u32,
+    t: u32,
+    n: u32,
+    k: u32,
+    deps: &[u32],
+) -> u32 {
+    let c = b.emit(DevOp::GemmGroupPf, vec![0], deps, |d| {
+        d.t[..3].copy_from_slice(&[x, w, out]);
+        d.t[3..].fill(crate::TENSOR_NONE);
+        d.i[..3].copy_from_slice(&[t, k, n]);
+    });
+    b.isolate(c);
+    c
+}
+
+/// `PLOW_KDA_PF_GROUP_GEMM`: a prefill (`t > 1`, not batched decode) low-rank-gate KDA layer runs
+/// its six input projections as ONE [`DevOp::GemmGroupPf`] segment over [`KdaWeights::in_cat`].
+pub fn pf_group_gemm(c: &KdaCfg) -> bool {
+    !c.full_rank_gate
+        && crate::emit_config::active().kda_pf_group_gemm
+        && crate::emit_is_amd()
+        && crate::amd_target::active().1 == hwspec::IsaLevel::Gfx950
 }
 
 /// Declare one KDA layer's 14 checkpoint tensors under `prefix`.
@@ -340,6 +385,15 @@ pub fn declare_kda_weights(
         dt_bias: f32t(b, format!("{prefix}dt_bias"), p),
         o_norm: f32t(b, format!("{prefix}o_norm.weight"), hd),
         ln_w: bf(b, format!("{ln_prefix}input_layernorm.weight"), h),
+        in_cat: if pf_group_gemm(c) {
+            bf(
+                b,
+                format!("{prefix}derived.in_proj_cat.weight"),
+                (3 * p + 2 * hd + c.heads as u64) * h,
+            )
+        } else {
+            crate::TENSOR_NONE
+        },
     }
 }
 
@@ -518,9 +572,19 @@ fn emit_control_linears(
             emit_parallel_linear2(b, fa, b_raw, x, w_fa, w_b, t, hd, nh, hi, n_cu, &[dep]);
         (counter, counter)
     } else {
+        let fa_lt = seq_rows
+            .then(|| crate::mla::emit_glm53_lt_dec(b, fa, x, w_fa, t, hd, hi, &[dep]))
+            .flatten();
+        let b_lt = seq_rows
+            .then(|| crate::mla::emit_glm53_lt_dec(b, b_raw, x, w_b, t, nh, hi, &[dep]))
+            .flatten();
         (
-            crate::k3::emit_k3_linear(b, fa, x, w_fa, t, hd, hi, n_cu, seq_rows, &[dep]),
-            crate::k3::emit_k3_linear(b, b_raw, x, w_b, t, nh, hi, n_cu, seq_rows, &[dep]),
+            fa_lt.unwrap_or_else(|| {
+                crate::k3::emit_k3_linear(b, fa, x, w_fa, t, hd, hi, n_cu, seq_rows, &[dep])
+            }),
+            b_lt.unwrap_or_else(|| {
+                crate::k3::emit_k3_linear(b, b_raw, x, w_b, t, nh, hi, n_cu, seq_rows, &[dep])
+            }),
         )
     }
 }
@@ -625,6 +689,7 @@ pub fn emit_kda_mixer(
             crate::emit_is_amd() && crate::amd_target::active().1 == hwspec::IsaLevel::Gfx950
         }),
         crate::emit_config::active().kda_decode_fused
+            && t >= crate::emit_config::active().kda_decode_fused_min_rows.unwrap_or(1)
             && crate::amd_target::active().1 == hwspec::IsaLevel::Gfx950,
         seq_rows,
     )
@@ -687,23 +752,25 @@ fn emit_kda_mixer_ex(
     // L3 (`PLOW_KDA_FB_FOLD`): at decode the f_b GEMV folds into `KdaStateStepG`'s prologue.
     // Only the plain Conv3 -> StepG chain carries the arm; f_a's row rides the step's `t4`, the
     // weight its `j1`, and `f_raw` is never declared.
-    let fb_fold = t == 1
-        && !seq_rows
-        && fuse
-        && !chunk
-        && !decode_fused
-        && st.conv_state_alt.is_none()
-        && crate::emit_config::active().kda_fb_fold;
     // L7 (`PLOW_KDA_DECODE_FUSED_ARM`): the same chain as ONE packet on the step's slice map.
     // Composes with the f_b fold (bit 2 + bit 3); everything else the fold excludes, it excludes.
+    // A ladder's one-row program (`seq_rows`, t == 1) takes it too: row 0's state and windows sit
+    // at offset 0 exactly as in the single-sequence program, and the arm honours `parked[0]`.
     let fused_arm = t == 1
-        && !seq_rows
         && fuse
         && !chunk
         && !decode_fused
         && st.conv_state_alt.is_none()
         && crate::emit_config::active().kda_decode_fused_arm
         && c.supports_decode_fused_arm(n_cu);
+    // Under `seq_rows` the fold rides only the fused arm: the per-row StepG has no fold arm.
+    let fb_fold = t == 1
+        && (!seq_rows || fused_arm)
+        && fuse
+        && !chunk
+        && !decode_fused
+        && st.conv_state_alt.is_none()
+        && crate::emit_config::active().kda_fb_fold;
 
     // Activations. q, k and v stay three separate [T, H*D] buffers all the way through: the three
     // projections are independent packets, the three convs are independent packets, and the state
@@ -787,14 +854,67 @@ fn emit_kda_mixer_ex(
     // transpose at load, for any of the eight.
     // `Gemv` at t == 1, a tiled GEMM above it — see [`crate::k3::emit_k3_linear`]. The seam is
     // here rather than at the call sites because all eight projections take it.
+    // PLOW_GLM_KDA_PROJ_GROUP (batched decode rows): every projection takes the GemmSmall tile
+    // and the split-K two-packet form (or no split), so the eight can run as two groups.
+    let mut kda_group: Option<(u32, u32)> = None;
+    let mut return_qkvg: Option<(u32, u32)> = None;
+    let mut defer_gb: Option<(u32, u32, u32)> = None;
+    if let OutputGate::LowRank { .. } = w.gate {
+        let small = |n: u32, k: u32| {
+            crate::mla::glm_decode_gemm_tile(t, n, k, n_cu) == Some(DevOp::GemmSmall)
+        };
+        if crate::emit_config::active().glm_kda_proj_group
+            && !crate::mla::glm53_lt_dec_rung(t)
+            && seq_rows
+            && t > 1
+            && !fb_fold
+            && !fuse_qkvg(t, hi)
+            && small(p, hi)
+            && small(hd, hi)
+            && small(nh, hi)
+            && small(p, hd)
+            && b.gemm_small_group_ok()
+        {
+            kda_group = Some((u32::MAX, u32::MAX));
+        }
+    }
     let gemv = |b: &mut Builder, out: u32, row: u32, wt: u32, n: u32, k: u32, dep: u32| {
+        if seq_rows {
+            if let Some(c) = crate::mla::emit_glm53_lt_dec(b, out, row, wt, t, n, k, &[dep]) {
+                return c;
+            }
+        }
         crate::k3::emit_k3_linear(b, out, row, wt, t, n, k, n_cu, seq_rows, &[dep])
     };
     // P1-P4 collapse into ONE packet along the OUTPUT axis. See [`fuse_qkvg`] for why that is the
     // safe direction and the LDS bound that decides it; P5/P6 stay separate because their weights
     // (`[128,7168]` and `[96,7168]`) are 1/128th and 1/96th of a projection each — concatenating
     // them onto a 49152-wide sweep would buy two gates and hand two of the 256 CUs a ragged tail.
-    let (c_q, c_k, c_v, c_g) = match (w.gate, fuse_qkvg(t, hi)) {
+    let group = (t > 1 && !seq_rows && w.in_cat != crate::TENSOR_NONE).then(|| {
+        let OutputGate::LowRank { g_b_proj, .. } = w.gate else {
+            unreachable!("in_cat is declared only for the low-rank gate")
+        };
+        let ga = bft(b, format!("{a}g_a"), tt * hd as u64);
+        let c = b.emit(DevOp::GemmGroupPf, vec![0], &[c_ln], |d| {
+            d.t[..8].copy_from_slice(&[x, w.in_cat, raw[0], raw[1], raw[2], ga, fa, b_raw]);
+            d.i[..8].copy_from_slice(&[t, hi, p, p, p, hd, hd, nh]);
+        });
+        b.isolate(c);
+        let c_gb = if let Some(c) =
+            crate::mla::emit_glm53_lt_gemm(b, g_raw, ga, g_b_proj, t, p, hd, &[c])
+        {
+            c
+        } else if crate::emit_config::active().pf_gemm_route_all {
+            emit_pf_gemm_route(b, g_raw, ga, g_b_proj, t, p, hd, &[c])
+        } else {
+            gemv(b, g_raw, ga, g_b_proj, p, hd, c)
+        };
+        (c, c_gb)
+    });
+    let (c_q, c_k, c_v, c_g) = if let Some((c, c_gb)) = group {
+        (c, c, c, c_gb)
+    } else {
+        match (w.gate, fuse_qkvg(t, hi)) {
         (OutputGate::FullRank { g_proj }, true) => {
             let f = b.emit(DevOp::GemvQkvg, all.clone(), &[c_ln], |d| {
                 d.t[0] = raw[0];
@@ -823,13 +943,67 @@ fn emit_kda_mixer_ex(
             gemv(b, raw[2], x, w.v_proj, p, hi, c_ln),
             gemv(b, g_raw, x, g_proj, p, hi, c_ln),
         ),
+        (OutputGate::LowRank { g_a_proj, g_b_proj }, false) if kda_group.is_some() => {
+            // PLOW_GLM_KDA_PROJ_GROUP: q/k/v/g_a/f_a/b (all from x) as one GemmSmall group,
+            // then g_b/f_b (K = head_dim) as a second. Bit-identical (Builder::emit_gemm_small_group).
+            let ga = bft(b, format!("{a}g_a"), tt * hd as u64);
+            let g1 = b
+                .emit_gemm_small_group(
+                    t,
+                    &[
+                        (raw[0], x, w.q_proj, p, hi),
+                        (raw[1], x, w.k_proj, p, hi),
+                        (raw[2], x, w.v_proj, p, hi),
+                        (ga, x, g_a_proj, hd, hi),
+                        (fa, x, w.f_a_proj, hd, hi),
+                        (b_raw, x, w.b_proj, nh, hi),
+                    ],
+                    &[c_ln],
+                )
+                .expect("kda_group checked the split form");
+            let g2 = b
+                .emit_gemm_small_group(
+                    t,
+                    &[(g_raw, ga, g_b_proj, p, hd), (f_raw, fa, w.f_b_proj, p, hd)],
+                    &[g1],
+                )
+                .expect("kda_group checked the split form");
+            kda_group = Some((g1, g2));
+            (g1, g1, g1, g2)
+        }
         (OutputGate::LowRank { g_a_proj, g_b_proj }, fuse_qkv) => {
             // No fourth (gate) stream to fuse — GLM5-Next's gate is low-rank, so it rides the
             // same two-GEMV shape as the forget gate (P5/P7) below, not the QKV fusion. q/k/v
             // still fuse into ONE [`DevOp::GemvQkv`] under the same decode-only/LDS-arena bound
             // `fuse_qkvg` already checks — GemvQkv's arena is a strict subset of GemvQkvg's
             // (three streams, not four), so the same gate is conservative, not approximate.
-            let (cq, ck, cv) = if fuse_qkv {
+            let ga = bft(b, format!("{a}g_a"), tt * hd as u64);
+            // PLOW_GLM_KDA_QKVG_R1: the low-rank gate's down-projection g_a rides the q/k/v sweep
+            // as GemvQkvg's fourth stream (Ng = head_dim), so g_b no longer waits on its own packet.
+            if fuse_qkv && crate::emit_config::active().glm_kda_qkvg_r1 {
+                let f = b.emit(DevOp::GemvQkvg, all.clone(), &[c_ln], |d| {
+                    d.t[0] = raw[0];
+                    d.t[1] = x;
+                    d.t[2] = w.q_proj;
+                    d.t[3] = raw[1];
+                    d.t[4] = w.k_proj;
+                    d.t[5] = raw[2];
+                    d.t[6] = w.v_proj;
+                    d.t[7] = ga;
+                    d.i[0] = t;
+                    d.i[1] = p;
+                    d.i[2] = hi;
+                    d.i[3] = p;
+                    d.i[4] = p;
+                    d.i[5] = hd;
+                    d.i[6] = g_a_proj;
+                });
+                let c_gb = gemv(b, g_raw, ga, g_b_proj, p, hd, f);
+                return_qkvg = Some((f, c_gb));
+            }
+            let (cq, ck, cv) = if let Some((f, _)) = return_qkvg {
+                (f, f, f)
+            } else if fuse_qkv {
                 let f = b.emit(DevOp::GemvQkv, all.clone(), &[c_ln], |d| {
                     d.t[0] = raw[0];
                     d.t[1] = x;
@@ -853,13 +1027,27 @@ fn emit_kda_mixer_ex(
                 )
             };
             // g_a: down-projection to head_dim, mirrors `fa`/`c_fa` below exactly.
-            let ga = bft(b, format!("{a}g_a"), tt * hd as u64);
-            let c_ga = gemv(b, ga, x, g_a_proj, hd, hi, c_ln);
-            let c_gb = gemv(b, g_raw, ga, g_b_proj, p, hd, c_ga);
+            let c_gb = if let Some((_, c_gb)) = return_qkvg {
+                c_gb
+            } else {
+                let c_ga = gemv(b, ga, x, g_a_proj, hd, hi, c_ln);
+                if seq_rows && t > 1 && crate::emit_config::active().glm_kda_lt_order {
+                    defer_gb = Some((c_ga, ga, g_b_proj));
+                    c_ga
+                } else {
+                    gemv(b, g_raw, ga, g_b_proj, p, hd, c_ga)
+                }
+            };
             (cq, ck, cv, c_gb)
         }
+    }
     };
-    let (c_fa, c_bb) = emit_control_linears(
+    let (c_fa, c_bb) = if let Some((g1, _)) = kda_group {
+        (g1, g1)
+    } else if let Some((c, _)) = group {
+        (c, c)
+    } else {
+        emit_control_linears(
         b,
         fa,
         b_raw,
@@ -874,11 +1062,20 @@ fn emit_kda_mixer_ex(
         seq_rows,
         c_ln,
         t == 1 && crate::whole_graph_parallel_linear2(hd, nh, hi),
-    );
+    )
+    };
+    let c_g = match defer_gb {
+        Some((c_ga, ga, g_b_proj)) => gemv(b, g_raw, ga, g_b_proj, p, hd, c_ga),
+        None => c_g,
+    };
     // P7 — forget-gate up-projection. The forget gate stays LOW RANK 128 even though the output
     // gate is full rank; that asymmetry is `use_full_rank_gate`'s and it is easy to get backwards.
-    let c_fb = if fb_fold {
+    let c_fb = if let Some((_, g2)) = kda_group {
+        g2
+    } else if fb_fold {
         c_fa
+    } else if group.is_some() && crate::emit_config::active().pf_gemm_route_all {
+        emit_pf_gemm_route(b, f_raw, fa, w.f_b_proj, t, p, hd, &[c_fa])
     } else {
         gemv(b, f_raw, fa, w.f_b_proj, p, hd, c_fa)
     };
@@ -948,9 +1145,13 @@ fn emit_kda_mixer_ex(
             d.i[3] = c.bv;
             // bit0 l2norm, bit2 (PLOW_KDA_F_FB_FOLD) t4 = f_a / j1 = W_fb, bit3
             // (PLOW_KDA_F_FUSED_ARM) the fused chain with t7 = the descriptor.
-            d.i[4] = 1 | if fb_fold { 4 } else { 0 } | 8;
+            d.i[4] = 1 | if seq_rows { 2 } else { 0 } | if fb_fold { 4 } else { 0 } | 8;
             d.i[5] = w.dt_bias;
             d.i[6] = gate_mode;
+            // bit1 (seq_rows, t == 1): `i[7]` is the parked mask, read only under that flag.
+            if let Some(pk) = parked {
+                d.i[7] = pk;
+            }
             d.f[0] = scale;
             d.f[1] = lower_bound;
             if fb_fold {
@@ -1002,6 +1203,71 @@ fn emit_kda_mixer_ex(
             d.i[5] = 1 | if seq_rows { 2 } else { 0 };
             d.i[6] = gate_mode;
             d.i[7] = 2;
+            d.f[0] = scale;
+            d.f[1] = lower_bound;
+            d.j[1] = c.eps.to_bits();
+        });
+        let c_o = gemv(b, attn, y, w.o_proj, hi, p, c_fused);
+        return (c_o, attn);
+    }
+
+    // PLOW_KDA_DECODE_WIDE: a batched rung's Conv3 -> StateStepG -> GatedNorm chain as one
+    // standalone op-125 boundary (descriptor version 3, one workgroup per (row, head)) running the
+    // interpreter's own bodies, so it is bit-identical to the chain below.
+    if seq_rows
+        && t > 1
+        && fuse
+        && !chunk
+        && st.conv_state_alt.is_none()
+        && crate::emit_config::active().kda_decode_wide
+        && t >= crate::emit_config::active().kda_decode_wide_min_rows.unwrap_or(2)
+        // The v3 object is built for gfx950 only (MI350X, 256 CUs).
+        && crate::emit_is_amd()
+        && n_cu == 256
+        && c.supports_decode_wide()
+    {
+        let handles = [
+            w.conv_w[0],
+            w.conv_w[1],
+            w.conv_w[2],
+            st.conv_state[0],
+            st.conv_state[1],
+            st.conv_state[2],
+            w.a_log,
+            w.dt_bias,
+            w.o_norm,
+            g_raw,
+            parked.unwrap_or(packet::dev::TENSOR_NONE_I),
+            mix[0],
+            mix[1],
+            mix[2],
+            o,
+        ];
+        let mut descriptor = Vec::with_capacity(handles.len() * 4);
+        for handle in handles {
+            descriptor.extend_from_slice(&handle.to_le_bytes());
+        }
+        let desc = b.tensor_init(&format!("{a}decode_wide.desc"), descriptor);
+        let mut deps = vec![c_q, c_k, c_v, c_g, c_fb, c_bb];
+        deps.sort_unstable();
+        deps.dedup();
+        let c_fused = b.emit(DevOp::KdaDecodeFused, all.clone(), &deps, |d| {
+            d.t[0] = y;
+            d.t[1] = raw[0];
+            d.t[2] = raw[1];
+            d.t[3] = raw[2];
+            d.t[4] = f_raw;
+            d.t[5] = b_raw;
+            d.t[6] = st.state;
+            d.t[7] = desc;
+            d.i[0] = t;
+            d.i[1] = nh;
+            d.i[2] = hd;
+            d.i[3] = c.bv;
+            d.i[4] = c.conv_w;
+            d.i[5] = 1 | 2;
+            d.i[6] = gate_mode;
+            d.i[7] = 3;
             d.f[0] = scale;
             d.f[1] = lower_bound;
             d.j[1] = c.eps.to_bits();
@@ -1300,7 +1566,17 @@ fn emit_kda_mixer_ex(
     });
 
     // P12 — out projection. The residual is NOT here: see `emit_kda_layer`.
-    let c_o = gemv(b, attn, y, w.o_proj, hi, p, c_norm);
+    let lt_o = group
+        .is_some()
+        .then(|| crate::mla::emit_glm53_lt_gemm(b, attn, y, w.o_proj, t, hi, p, &[c_norm]))
+        .flatten();
+    let c_o = if let Some(c) = lt_o {
+        c
+    } else if group.is_some() && crate::emit_config::active().pf_gemm_route_all {
+        emit_pf_gemm_route(b, attn, y, w.o_proj, t, hi, p, &[c_norm])
+    } else {
+        gemv(b, attn, y, w.o_proj, hi, p, c_norm)
+    };
     (c_o, attn)
 }
 
@@ -1922,6 +2198,9 @@ mod tests {
 
     #[test]
     fn chunk_kda_override_is_shape_gated() {
+        // The legacy chain these probes compare against, not the batched-rung v3 boundary.
+        let _guard = crate::test_env::env_guard();
+        let _wide = crate::test_env::EnvScope::set(&[("PLOW_KDA_DECODE_WIDE", "0")]);
         let build = |t: u32, seq_rows: bool, enabled: bool| {
             let c = KdaCfg {
                 heads: 12,
@@ -2492,6 +2771,9 @@ mod tests {
 
     #[test]
     fn standalone_decode_fusion_is_shape_gated_and_falls_back_byte_identically() {
+        // The legacy chain these probes compare against, not the batched-rung v3 boundary.
+        let _guard = crate::test_env::env_guard();
+        let _wide = crate::test_env::EnvScope::set(&[("PLOW_KDA_DECODE_WIDE", "0")]);
         let supported = KdaCfg {
             heads: 12,
             head_dim: 128,
@@ -2536,6 +2818,35 @@ mod tests {
         let legacy_b8 = build_decode_fused_probe(&supported, 8, false, false);
         let invalid_b8 = build_decode_fused_probe(&supported, 8, false, true);
         assert_eq!(invalid_b8.to_blob(), legacy_b8.to_blob());
+    }
+
+    /// PLOW_KDA_DECODE_WIDE (default on): a batched rung's chain is ONE op-125 v3 boundary whose
+    /// descriptor names the chain's own intermediates; one-row and unbatched programs keep theirs.
+    #[test]
+    fn batched_rung_chain_is_one_v3_boundary() {
+        let _guard = crate::test_env::env_guard();
+        let c = KdaCfg {
+            heads: 12,
+            bv: 8,
+            ..k3()
+        };
+        let n = |p: &packet::devbuild::Program, op: DevOp| {
+            p.insts.iter().filter(|i| i.op == op as u16).count()
+        };
+        let wide = build_decode_fused_probe(&c, 8, true, false);
+        assert_eq!(n(&wide, DevOp::KdaDecodeFused), 1);
+        for old in [DevOp::KdaConv3, DevOp::KdaStateStepG, DevOp::KdaGatedNorm] {
+            assert_eq!(n(&wide, old), 0, "{old:?}");
+        }
+        let v3 = wide.insts.iter().find(|i| i.op == DevOp::KdaDecodeFused as u16).unwrap();
+        assert_eq!(v3.i, [8, 12, 128, 8, 4, 3, 1, 3]);
+        assert_eq!(wide.tensors[v3.t[7] as usize].bytes, 60);
+        let one = build_decode_fused_probe(&c, 1, false, false);
+        assert_eq!(n(&one, DevOp::KdaDecodeFused), 0);
+        let _off = crate::test_env::EnvScope::set(&[("PLOW_KDA_DECODE_WIDE", "0")]);
+        let legacy = build_decode_fused_probe(&c, 8, true, false);
+        assert_eq!(n(&legacy, DevOp::KdaDecodeFused), 0);
+        assert_eq!(n(&legacy, DevOp::KdaStateStepG), 1);
     }
 
     #[test]

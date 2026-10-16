@@ -2098,7 +2098,8 @@ template <int D>
 __device__ void d_flash_merge(bf16* __restrict__ O_, const float* __restrict__ Opart_,
                               const float* __restrict__ mlpart_, unsigned n_batch,
                               unsigned n_head, unsigned nsplit, unsigned slice, unsigned nblk,
-                              const bf16* __restrict__ sinks_ = nullptr, unsigned flat = 0) {
+                              const void* __restrict__ sinks_ = nullptr, unsigned flat = 0,
+                              bool sinks_f32 = false) {
     /* All three came out of the tensor table, so all three were generic: the Opart reads were
      * flat_load_dword and the O writes flat_store_short. Nothing about the ACCESS was wrong --
      * they are coalesced -- they were just on the slow path. */
@@ -2153,7 +2154,8 @@ __device__ void d_flash_merge(bf16* __restrict__ O_, const float* __restrict__ O
          * no-sink arithmetic below is bit-for-bit the pre-sinks merge. */
         float rescale = 1.0f;
         if (sinks) {
-            const float sink = FA_SCALE(bf2f(sinks[h]));
+            const float raw_sink = sinks_f32 ? ((const float*)sinks)[h] : bf2f(((const bf16*)sinks)[h]);
+            const float sink = FA_SCALE(raw_sink);
             if (sink > gm) {
                 rescale = FA_EXP(gm - sink);
                 gl = gl * rescale + 1.0f;
@@ -2528,12 +2530,19 @@ __device__ void d_flash_mla_decode(float* __restrict__ Opart, float* __restrict_
             const unsigned ksub = lane % KL, krl = lane / KL;
 #pragma unroll FA_MLA_KUNROLL
             for (unsigned p = 0; p < KPASS; p++) {
-                const unsigned rl = wave * KRW + p * KR + krl;
+                /* FA_DEC_ILV: d_flash_decode's interleaved map (a short split's rows spread over
+                 * ceil(per/KR) waves instead of all landing in wave 0). Same bijection onto the
+                 * tile and the same per-row dot, so bit-identical; at KL=1 KPASS is 1 and the two
+                 * maps coincide. */
+                const unsigned rl = FA_DEC_ILV ? (p * (PLOW_WAVES * KR) + wave * KR + krl)
+                                               : (wave * KRW + p * KR + krl);
                 const unsigned kv = kv0 + rl;
                 /* dense: cache row (kv & kv_mask); gather: the selected index ibase[kv]. */
-                const unsigned row = GATHER ? (kv < hi ? (unsigned)ibase[kv] : 0u) : (kv & kv_mask);
+                /* A negative selected index (an unfilled pooled-selection slot) is masked. */
+                const int gi = (GATHER && kv < hi) ? ibase[kv] : 0;
+                const unsigned row = GATHER ? (gi > 0 ? (unsigned)gi : 0u) : (kv & kv_mask);
                 const bool keep =
-                    GATHER ? (kv < hi)
+                    GATHER ? (kv < hi && gi >= 0)
                            : (kv < hi && kv <= qpos && (!window || (qpos - kv) < window));
                 float s0[GF];
 #pragma unroll
@@ -2683,7 +2692,7 @@ __device__ void d_flash_mla_decode(float* __restrict__ Opart, float* __restrict_
 #pragma unroll
                 for (int c = 0; c < VU; c++) {
                     const unsigned t = kv0 + r + (unsigned)c * NG;
-                    const size_t vrow = GATHER ? (size_t)(unsigned)ibase[t] : (t & kv_mask);
+                    const size_t vrow = GATHER ? (size_t)(unsigned)max(ibase[t], 0) : (t & kv_mask);
                     if constexpr (FP8) {
                         vv[c] = fp8v8_to_bf16v8(ld_glob_fp8v8(cb8 + vrow * DK + dbase));
                         vsf[c] = csc[vrow];
@@ -2706,7 +2715,7 @@ __device__ void d_flash_mla_decode(float* __restrict__ Opart, float* __restrict_
                 }
             }
             for (; r < rmax; r += NG) {
-                const size_t vrow = GATHER ? (size_t)(unsigned)ibase[kv0 + r] : ((kv0 + r) & kv_mask);
+                const size_t vrow = GATHER ? (size_t)(unsigned)max(ibase[kv0 + r], 0) : ((kv0 + r) & kv_mask);
                 bf16v8 v;
                 float vsf = 1.0f;
                 if constexpr (FP8) {
@@ -3680,6 +3689,37 @@ __device__ __forceinline__ bf16 mla_pf2_f2bf(float f) {
 #endif
 }
 
+/* PLOW_MLA_PF2_DPP — the V2 softmax's quarter-wave (16-lane) xor butterflies as DPP moves
+ * instead of ds_bpermute. Each step reads a partner that holds the SAME value as the xor partner:
+ * after the d=1,2 steps every lane of a quad is equal, so row_half_mirror (i -> 7-i) lands in
+ * the xor-4 partner's quad, and after d=4 every 8-lane half is equal, so row_mirror (i -> 15-i)
+ * lands in the xor-8 partner's half. Same operands, same order: bit-identical max and sum, with
+ * no LDS round trip on the per-tile dependency chain (8 per row per KV tile). The callers'
+ * loops run d = 1, 2, 4, 8 with a full wave active. */
+#ifndef PLOW_MLA_PF2_DPP
+#define PLOW_MLA_PF2_DPP 0
+#endif
+/* PLOW_MLA_PF2_PCVT — the running-max arm's P strip through mla_pf2_f2bf (RNE, no NaN guard).
+ * p = exp2(sv - mnew) with sv <= mnew, or 0 when the row max is still -inf, times a finite
+ * positive dequant scale on the fp8 arm: never NaN or Inf, so the guard is dead and the value is
+ * f2bf's. Removes the per-element exec-mask branch the guard lowers to. */
+#ifndef PLOW_MLA_PF2_PCVT
+#define PLOW_MLA_PF2_PCVT 0
+#endif
+__device__ __forceinline__ float mla_pf2_xor16(float v, int d) {
+#if PLOW_MLA_PF2_DPP
+    const int x = __builtin_bit_cast(int, v);
+    int r;
+    if (d == 1) r = __builtin_amdgcn_update_dpp(0, x, 0xB1, 0xF, 0xF, false);       /* [1,0,3,2] */
+    else if (d == 2) r = __builtin_amdgcn_update_dpp(0, x, 0x4E, 0xF, 0xF, false);  /* [2,3,0,1] */
+    else if (d == 4) r = __builtin_amdgcn_update_dpp(0, x, 0x141, 0xF, 0xF, false); /* half mirror */
+    else r = __builtin_amdgcn_update_dpp(0, x, 0x140, 0xF, 0xF, false);             /* row mirror */
+    return __builtin_bit_cast(float, r);
+#else
+    return __shfl_xor(v, d, PLOW_WAVE);
+#endif
+}
+
 /* ------------------------------------------------------------------------------------
  * PLOW_MLA_PF_SV — the V-STAGE arm. OPT-IN, default OFF, BIT-IDENTICAL (it moves LDS
  * addresses and load ISSUE ORDER only; every MFMA sees the same operands in the same
@@ -3754,7 +3794,8 @@ __device__ void d_flash_mla_prefill_v2(float* __restrict__ Opart, float* __restr
                                        const unsigned char* __restrict__ uni = nullptr,
                                        unsigned cap = 0, unsigned ns = 1, bool ofold = false,
                                        const float* __restrict__ kv_scale = nullptr,
-                                       unsigned krot_fp8 = 0) {
+                                       unsigned krot_fp8 = 0,
+                                       unsigned out_split = 0) {
     constexpr int RW = 16;                 /* q rows per wave                    */
     constexpr int BQ = 4 * RW;             /* 64 — the 4-wave tile               */
     constexpr int BKV = FA_MLA_PF2_BKV;    /* kv rows per staged slab            */
@@ -3821,6 +3862,9 @@ __device__ void d_flash_mla_prefill_v2(float* __restrict__ Opart, float* __restr
      * growing with ctx (top-k is capped). Requires n_head == 8 (the emitter gates). */
     constexpr unsigned QP = 8; /* queries per pack; 64 rows = QP * 8 heads (GATHER) */
     const unsigned n_qt = GATHER ? (n_tok + QP - 1) / QP : (n_tok + BQ - 1) / BQ;
+    const unsigned out_sp0 = out_split & 0xffu;
+    const unsigned out_nsplit = (out_split >> 8) & 0xffu;
+    const unsigned gsplit = (out_split >> 16) & 0xffu;
     /* ns = CAUSAL KV-SPLIT (dense only; i6 on the packet, 0/1 = off). A work item becomes
      * (q-tile, head, split) and each split owns a ceil-equal share of the TILE's OWN causal
      * range — so splits are near-equal work and the item count multiplies, which is what
@@ -3828,15 +3872,31 @@ __device__ void d_flash_mla_prefill_v2(float* __restrict__ Opart, float* __restr
      * inside the packet). A split past the tile's causal tiles is DEAD: its walk is empty,
      * the epilogue writes (m=-inf, l=0, O=0), and d_mla_merge_fold weighs it 0 by the same
      * branch-free select the decode splits use. */
-    const unsigned nsp = GATHER ? 1u : (ns ? ns : 1u);
-    const unsigned n_work = GATHER ? n_batch * n_qt : n_batch * n_qt * n_head * nsp;
+    const unsigned nsp = GATHER ? (gsplit ? gsplit : 1u) : (ns ? ns : 1u);
+    const unsigned n_work = GATHER ? n_batch * n_qt * nsp : n_batch * n_qt * n_head * nsp;
 
     for (unsigned w = slice; w < n_work; w += nblk) {
-        const unsigned sp = GATHER ? 0u : w % nsp;
-        const unsigned wq = GATHER ? w : w / nsp;
+#if PLOW_MLA_PF_SNAKE
+        /* Heaviest causal tile first, rounds dealt boustrophedon over the workgroups: the fold
+         * below leaves a workgroup's strided tiles correlated (max/mean 1.53 at 8k from row 0,
+         * 1.18 at c0=8k; measured util 0.64). Items are independent partials, so only the
+         * item->workgroup map moves. A partial last round keeps the forward order. */
+        const unsigned rnd = w / nblk;
+        const unsigned wi = (!GATHER && (rnd & 1u) && n_work - rnd * nblk >= nblk)
+                                ? rnd * nblk + (nblk - 1u - (w - rnd * nblk))
+                                : w;
+#else
+        const unsigned wi = w;
+#endif
+        const unsigned sp = wi % nsp;
+        const unsigned wq = wi / nsp;
         const unsigned h = GATHER ? 0u : wq % n_head;
         const unsigned rest = GATHER ? wq : wq / n_head;
+#if PLOW_MLA_PF_SNAKE
+        const unsigned qt = GATHER ? mla_pf_fold(rest % n_qt, n_qt) : n_qt - 1u - rest % n_qt;
+#else
         const unsigned qt = mla_pf_fold(rest % n_qt, n_qt);
+#endif
         const unsigned b = rest / n_qt;
 
         const unsigned len = (unsigned)kv_len[b];
@@ -3877,6 +3937,13 @@ __device__ void d_flash_mla_prefill_v2(float* __restrict__ Opart, float* __restr
             const unsigned hi = kv_lo + (sp + 1u) * cpt * (unsigned)BKV;
             walk_end = (hi < kv_end) ? hi : kv_end;
             if (walk_lo >= kv_end) walk_end = walk_lo; /* dead split */
+        } else if (GATHER && nsp > 1) {
+            const unsigned ntl = (ucount + (unsigned)BKV - 1) / (unsigned)BKV;
+            const unsigned cpt = (ntl + nsp - 1) / nsp;
+            walk_lo = sp * cpt * (unsigned)BKV;
+            const unsigned hi = (sp + 1u) * cpt * (unsigned)BKV;
+            walk_end = (hi < ucount) ? hi : ucount;
+            if (walk_lo >= ucount) walk_end = walk_lo; /* dead split */
         }
 
         const auto* cbase = as_glob(Ckv) + (size_t)b * kv_stride * DK;
@@ -4263,7 +4330,7 @@ __device__ void d_flash_mla_prefill_v2(float* __restrict__ Opart, float* __restr
                     float rmax = fmaxf(sv[0], sv[1]);
 #pragma unroll
                     for (int d = 1; d < 16; d <<= 1)
-                        rmax = fmaxf(rmax, __shfl_xor(rmax, d, PLOW_WAVE));
+                        rmax = fmaxf(rmax, mla_pf2_xor16(rmax, d));
                     const float fnew =
                         fmaxf(m_st[i], __builtin_ceilf(rmax) + (float)FA_MLA_PF2_FRAME);
                     const float corr = (m_st[i] == FA_NEG_INF) ? 0.0f : FA_EXP(m_st[i] - fnew);
@@ -4338,7 +4405,7 @@ __device__ void d_flash_mla_prefill_v2(float* __restrict__ Opart, float* __restr
                     rmax = fmaxf(rmax, sv[nt]);
                 }
 #pragma unroll
-                for (int d = 1; d < 16; d <<= 1) rmax = fmaxf(rmax, __shfl_xor(rmax, d, PLOW_WAVE));
+                for (int d = 1; d < 16; d <<= 1) rmax = fmaxf(rmax, mla_pf2_xor16(rmax, d));
                 const float mnew = fmaxf(m_st[i], rmax);
                 const float corr = (m_st[i] == FA_NEG_INF) ? 0.0f : FA_EXP(m_st[i] - mnew);
                 float lsum = 0.0f;
@@ -4349,7 +4416,7 @@ __device__ void d_flash_mla_prefill_v2(float* __restrict__ Opart, float* __restr
                     lsum += p;
                 }
 #pragma unroll
-                for (int d = 1; d < 16; d <<= 1) lsum += __shfl_xor(lsum, d, PLOW_WAVE);
+                for (int d = 1; d < 16; d <<= 1) lsum += mla_pf2_xor16(lsum, d);
                 l_st[i] = l_st[i] * corr + lsum;
                 m_st[i] = mnew;
 #pragma unroll
@@ -4373,7 +4440,11 @@ __device__ void d_flash_mla_prefill_v2(float* __restrict__ Opart, float* __restr
 #else
                         p *= csc[scale_row(kv0 + (unsigned)nt * 16 + fr)];
 #endif
+#if PLOW_MLA_PF2_PCVT
+                    Pw[pindex(kg * 4 + (unsigned)i, (unsigned)nt * 16 + fr)] = mla_pf2_f2bf(p);
+#else
                     Pw[pindex(kg * 4 + (unsigned)i, (unsigned)nt * 16 + fr)] = f2bf(p);
+#endif
                 }
 #endif
 
@@ -4457,7 +4528,7 @@ __device__ void d_flash_mla_prefill_v2(float* __restrict__ Opart, float* __restr
 #pragma unroll
         for (int i = 0; i < 4; i++) {
 #pragma unroll
-            for (int d = 1; d < 16; d <<= 1) l_st[i] += __shfl_xor(l_st[i], d, PLOW_WAVE);
+            for (int d = 1; d < 16; d <<= 1) l_st[i] += mla_pf2_xor16(l_st[i], d);
         }
 #endif
 #pragma unroll
@@ -4466,7 +4537,9 @@ __device__ void d_flash_mla_prefill_v2(float* __restrict__ Opart, float* __restr
             const unsigned qi = GATHER ? q_base + (row_i >> 3) : my_q0 + kg * 4 + i;
             const unsigned hh = GATHER ? (row_i & 7u) : h;
             if (qi >= n_tok) continue;
-            const size_t oh = (((size_t)b * n_tok + qi) * n_head + hh) * nsp + sp;
+            const unsigned eff_nsplit = out_nsplit ? out_nsplit : nsp;
+            const unsigned eff_sp = out_sp0 + sp;
+            const size_t oh = (((size_t)b * n_tok + qi) * n_head + hh) * eff_nsplit + eff_sp;
             if (ofold) {
                 /* W_ofold epilogue: normalized bf16 rows for the fused o-GEMM. ns==1 is the
                  * emit contract (the fold consumes the un-split l), so nsp==1/sp==0 and oh
@@ -4736,6 +4809,372 @@ __device__ void d_flash_mla_decode_mfma(float* __restrict__ Opart, float* __rest
         __syncthreads();
     }
 }
+
+#define FA_MLA_HP8_LDS_FLOATS(DK) \
+    ((((32 + 8) * ((DK) + FA_PAD) + PLOW_WAVES * 8 * 32) * 2 + PLOW_WAVES * 8 * 32 * 4) / 4)
+/* MLA decode, 8-HEAD PACKED MFMA, NoPE (GLM-5.3-Flash TP8: 8 heads per rank, latent 512, no
+ * rope). Built only into the decode-MLA segment object (PLOW_MLA_DEC_HPACK=1).
+ *
+ * One work item = (row b, KV split sp) carrying all 8 heads, so each latent tile is read from
+ * HBM once instead of once per head-group. Differences from d_flash_mla_decode_mfma above,
+ * which this replaces for that shape: Q is staged in LDS once per item (the generic kernel
+ * re-read a global Q fragment on every k-step of every tile), the KV tile is staged with 16-byte
+ * loads and prefetched into registers one tile ahead, and the QK contraction is split over the
+ * eight waves (4 of the 32 k-steps each, reduced through LDS) instead of recomputed by all.
+ * Only accumulator elements 0..3 (m < 8) are live. Emits the same (o, m, l) partials.
+ * GATHER (idx != nullptr, DSA decode): KV slot j of row b reads latent row idx[b*idx_w + j]
+ * over min(kv_len, idx_w) slots; a negative entry is masked. */
+template <int DK>
+__device__ void d_flash_mla_decode_hp8(float* __restrict__ Opart, float* __restrict__ mlpart,
+                                       const bf16* __restrict__ Qabs,
+                                       const bf16* __restrict__ Ckv,
+                                       const int* __restrict__ kv_len, unsigned n_batch,
+                                       unsigned kv_stride, float scale, unsigned nsplit,
+                                       unsigned slice, unsigned nblk, float* lds_,
+                                       const int* __restrict__ idx = nullptr,
+                                       unsigned idx_w = 0) {
+    constexpr int NH = 8;
+    constexpr int BKV = 32;
+    constexpr int STRIDE = DK + FA_PAD;
+    constexpr int NK = DK / MFMA_K;               /* 32 k-steps */
+    constexpr int KPW = NK / PLOW_WAVES;          /* k-steps per wave */
+    constexpr int CPW = DK / PLOW_WAVES;          /* output cols per wave */
+    constexpr int NDT = CPW / MFMA_N;             /* out d-tiles per wave */
+    constexpr int CH = DK / 8;                    /* 16-byte chunks per latent row */
+    constexpr int TPT = BKV * CH / PLOW_THREADS;  /* tile chunks per thread */
+    static_assert(NK % PLOW_WAVES == 0 && CPW % MFMA_N == 0 && (BKV * CH) % PLOW_THREADS == 0,
+                  "hp8 tiling");
+    static_assert(NH * CH <= PLOW_THREADS, "one Q chunk per thread");
+
+    bf16* Ksm = (bf16*)lds_;                      /* [BKV][STRIDE] */
+    bf16* Qsm = Ksm + BKV * STRIDE;               /* [NH][STRIDE]  */
+    bf16* Psm = Qsm + NH * STRIDE;                /* [WAVES][NH][BKV] */
+    float* Sred = (float*)(Psm + PLOW_WAVES * NH * BKV); /* [WAVES][NH][BKV] */
+
+    const unsigned tid = threadIdx.x;
+    const unsigned lane = tid & 63;
+    const unsigned wave = tid >> 6;
+    const unsigned frow = mfma_frag_row(lane);
+    const unsigned accn = mfma_acc_n(lane);
+    const unsigned ncol0 = wave * CPW;
+    const bf16x8 zero8 = (bf16x8)(bf16_t)0.0f;
+
+    const unsigned n_work = n_batch * nsplit;
+    for (unsigned w = slice; w < n_work; w += nblk) {
+        const unsigned sp = w % nsplit;
+        const unsigned b = w / nsplit;
+        const unsigned klen = (unsigned)kv_len[b];
+        const unsigned len = idx && idx_w < klen ? idx_w : klen;
+        const unsigned per = (len + nsplit - 1) / nsplit;
+        const unsigned lo = sp * per < len ? sp * per : len;
+        const unsigned hi = lo + per < len ? lo + per : len;
+        const auto* cbase = as_glob(Ckv) + (size_t)b * kv_stride * DK;
+        const int* ib = idx ? idx + (size_t)b * idx_w : nullptr;
+
+        __syncthreads();
+        if (tid < NH * CH) {
+            const unsigned h = tid / CH, c = tid % CH;
+            *(bf16v8*)&Qsm[h * STRIDE + c * 8] = ld_glob8(as_glob(Qabs) + ((size_t)b * NH + h) * DK + c * 8);
+        }
+        bf16v8 nxt[TPT];
+        auto fetch = [&](unsigned kv0) {
+#pragma unroll
+            for (int j = 0; j < TPT; j++) {
+                const unsigned e = tid + (unsigned)j * PLOW_THREADS;
+                const unsigned kv = kv0 + e / CH;
+                const int row = kv < hi ? (ib ? ib[kv] : (int)kv) : -1;
+                nxt[j] = row >= 0 ? ld_glob8(cbase + (size_t)row * DK + (e % CH) * 8) : (bf16v8)(bf16)0.0f;
+            }
+        };
+        if (lo < hi) fetch(lo);
+
+        f32x16 oacc[NDT];
+#pragma unroll
+        for (int t = 0; t < NDT; t++) oacc[t] = (f32x16)(0.0f);
+        float m_st[4], l_st[4];
+#pragma unroll
+        for (int i = 0; i < 4; i++) { m_st[i] = FA_NEG_INF; l_st[i] = 0.0f; }
+
+        for (unsigned kv0 = lo; kv0 < hi; kv0 += BKV) {
+            __syncthreads();
+#pragma unroll
+            for (int j = 0; j < TPT; j++) {
+                const unsigned e = tid + (unsigned)j * PLOW_THREADS;
+                *(bf16v8*)&Ksm[(e / CH) * STRIDE + (e % CH) * 8] = nxt[j];
+            }
+            __syncthreads();
+            if (kv0 + BKV < hi) fetch(kv0 + BKV);
+
+            /* QK partial over this wave's KPW k-steps: S[m = head][n = kv]. */
+            f32x16 s = (f32x16)(0.0f);
+#pragma unroll
+            for (int q = 0; q < KPW; q++) {
+                const unsigned d0 = mfma_frag_k(lane, (wave * KPW + q) * MFMA_K);
+                bf16x8 qf = zero8, kf;
+                if (frow < NH) {
+                    const bf16v8 qv = ld_lds8(&Qsm[frow * STRIDE + d0]);
+                    __builtin_memcpy(&qf, &qv, 16);
+                }
+                const bf16v8 kv8 = ld_lds8(&Ksm[frow * STRIDE + d0]);
+                __builtin_memcpy(&kf, &kv8, 16);
+                s = plow_mfma_bf16_32x32(qf, kf, s);
+            }
+#pragma unroll
+            for (int i = 0; i < 4; i++)
+                Sred[(wave * NH + mfma_acc_m(lane, i)) * BKV + accn] = s[i];
+            __syncthreads();
+
+            float p[4];
+#pragma unroll
+            for (int i = 0; i < 4; i++) {
+                const unsigned m = mfma_acc_m(lane, i);
+                float acc = 0.0f;
+#pragma unroll
+                for (int ww = 0; ww < PLOW_WAVES; ww++) acc += Sred[(ww * NH + m) * BKV + accn];
+                const bool live = kv0 + accn < hi && (!ib || ib[kv0 + accn] >= 0);
+                p[i] = live ? acc * FA_SCALE(scale) : FA_NEG_INF;
+            }
+#pragma unroll
+            for (int i = 0; i < 4; i++) {
+                const float rmax = half_wave_max(p[i]);
+                const float mnew = fmaxf(m_st[i], rmax);
+                const float corr = (m_st[i] == FA_NEG_INF) ? 0.0f : FA_EXP(m_st[i] - mnew);
+                const float pe = (mnew == FA_NEG_INF) ? 0.0f : FA_EXP(p[i] - mnew);
+                l_st[i] = l_st[i] * corr + half_wave_sum(pe);
+                m_st[i] = mnew;
+                p[i] = pe;
+#pragma unroll
+                for (int t = 0; t < NDT; t++) oacc[t][i] *= corr;
+            }
+            bf16* myP = Psm + wave * NH * BKV;
+#pragma unroll
+            for (int i = 0; i < 4; i++) myP[mfma_acc_m(lane, i) * BKV + accn] = f2bf(p[i]);
+            __syncthreads();
+
+            /* O += P . V over this wave's CPW latent columns. */
+#pragma unroll
+            for (int t = 0; t < NDT; t++) {
+#pragma unroll
+                for (int ks = 0; ks < BKV; ks += MFMA_K) {
+                    const unsigned kk = mfma_frag_k(lane, ks);
+                    bf16x8 pf = zero8, vf;
+                    if (frow < NH) {
+                        const bf16v8 pv = ld_lds8(&myP[frow * BKV + kk]);
+                        __builtin_memcpy(&pf, &pv, 16);
+                    }
+                    const unsigned col = ncol0 + t * MFMA_N + frow;
+#pragma unroll
+                    for (int j = 0; j < 8; j++) {
+                        const bf16 vv = Ksm[(kk + j) * STRIDE + col];
+                        bf16_t vb;
+                        __builtin_memcpy(&vb, &vv, 2);
+                        vf[j] = vb;
+                    }
+                    oacc[t] = plow_mfma_bf16_32x32(pf, vf, oacc[t]);
+                }
+            }
+        }
+
+#pragma unroll
+        for (int t = 0; t < NDT; t++) {
+#pragma unroll
+            for (int i = 0; i < 4; i++) {
+                const unsigned m = mfma_acc_m(lane, i);
+                const unsigned d = ncol0 + t * MFMA_N + accn;
+                st_act<float>(&Opart[((size_t)(b * NH + m) * nsplit + sp) * DK + d], oacc[t][i]);
+            }
+        }
+        if (wave == 0 && accn == 0) {
+#pragma unroll
+            for (int i = 0; i < 4; i++) {
+                float* ml = mlpart + ((size_t)(b * NH + mfma_acc_m(lane, i)) * nsplit + sp) * 2;
+                st_act<float>(&ml[0], m_st[i]);
+                st_act<float>(&ml[1], l_st[i]);
+            }
+        }
+    }
+}
+
+#ifndef PLOW_MLA_DEC_HP8_ASYNC
+#define PLOW_MLA_DEC_HP8_ASYNC 0 /* NS: hp8 KV ring stages (PLOW_MLA_DEC_HP8_ASYNC object knob) */
+#endif
+#if PLOW_MLA_DEC_HP8_ASYNC && PLOW_CDNA4
+#define FA_MLA_HP8A_LDS_FLOATS(DK, NS) \
+    (((NS) * 32 * ((DK) + FA_PAD) + 8 * ((DK) + FA_PAD) + PLOW_WAVES * 8 * 32) / 2 + PLOW_WAVES * 8 * 32)
+/* d_flash_mla_decode_hp8 with the KV tiles moved HBM -> LDS by cp_async16 (no VGPR staging)
+ * through an NS-stage ring, NS-1 tiles in flight. Same QK / softmax / PV arithmetic as hp8, so
+ * the partials are bit-identical. Each wave moves 4 of a tile's 32 latent rows (one 1 KiB row
+ * per wave issue); rows past `hi` re-read row hi-1 (finite, masked to p = 0). */
+template <int NS>
+__device__ __forceinline__ void fa_hp8a_wait_tiles(unsigned after) {
+    /* vmcnt counts this wave's loads; 4 per tile. */
+    if (NS >= 4 && after >= 2) asm volatile("s_waitcnt vmcnt(8)" ::: "memory");
+    else if (NS >= 3 && after >= 1) asm volatile("s_waitcnt vmcnt(4)" ::: "memory");
+    else asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
+}
+
+template <int DK, int NS>
+__device__ void d_flash_mla_decode_hp8_async(float* __restrict__ Opart, float* __restrict__ mlpart,
+                          const bf16* __restrict__ Qabs, const bf16* __restrict__ Ckv,
+                          const int* __restrict__ kv_len, unsigned n_batch, unsigned kv_stride,
+                          float scale, unsigned nsplit, unsigned slice, unsigned nblk,
+                          float* lds_) {
+    constexpr int NH = 8;
+    constexpr int BKV = 32;
+    constexpr int STRIDE = DK + FA_PAD;
+    constexpr int NK = DK / MFMA_K;
+    constexpr int KPW = NK / PLOW_WAVES;
+    constexpr int CPW = DK / PLOW_WAVES;
+    constexpr int NDT = CPW / MFMA_N;
+    constexpr int CH = DK / 8;
+    constexpr int RPW = BKV / PLOW_WAVES; /* latent rows per wave per tile */
+    static_assert(DK == 8 * PLOW_WAVE && RPW == 4 && NS >= 2 && NS <= 4, "hp8 async tiling");
+
+    bf16* Kring = (bf16*)lds_;                    /* [NS][BKV][STRIDE] */
+    bf16* Qsm = Kring + NS * BKV * STRIDE;        /* [NH][STRIDE] */
+    bf16* Psm = Qsm + NH * STRIDE;                /* [WAVES][NH][BKV] */
+    float* Sred = (float*)(Psm + PLOW_WAVES * NH * BKV);
+
+    const unsigned tid = threadIdx.x;
+    const unsigned lane = tid & 63;
+    const unsigned wave = tid >> 6;
+    const unsigned frow = mfma_frag_row(lane);
+    const unsigned accn = mfma_acc_n(lane);
+    const unsigned ncol0 = wave * CPW;
+    const bf16x8 zero8 = (bf16x8)(bf16_t)0.0f;
+
+    const unsigned n_work = n_batch * nsplit;
+    for (unsigned w = slice; w < n_work; w += nblk) {
+        const unsigned sp = w % nsplit;
+        const unsigned b = w / nsplit;
+        const unsigned len = (unsigned)kv_len[b];
+        const unsigned per = (len + nsplit - 1) / nsplit;
+        const unsigned lo = sp * per < len ? sp * per : len;
+        const unsigned hi = lo + per < len ? lo + per : len;
+        const auto* cbase = as_glob(Ckv) + (size_t)b * kv_stride * DK;
+        const unsigned ntile = (hi - lo + BKV - 1) / BKV;
+
+        __syncthreads();
+        if (tid < NH * CH) {
+            const unsigned h = tid / CH, c = tid % CH;
+            *(bf16v8*)&Qsm[h * STRIDE + c * 8] = ld_glob8(as_glob(Qabs) + ((size_t)b * NH + h) * DK + c * 8);
+        }
+        auto issue = [&](unsigned t) {
+            bf16* st = Kring + (t % NS) * BKV * STRIDE;
+#pragma unroll
+            for (int r = 0; r < RPW; r++) {
+                const unsigned row = wave * RPW + r;
+                unsigned kv = lo + t * BKV + row;
+                kv = kv < hi ? kv : hi - 1;
+                cp_async16(cbase + (size_t)kv * DK + lane * 8, st + row * STRIDE);
+            }
+        };
+#pragma unroll
+        for (int t = 0; t < NS - 1; t++)
+            if ((unsigned)t < ntile) issue(t);
+
+        f32x16 oacc[NDT];
+#pragma unroll
+        for (int t = 0; t < NDT; t++) oacc[t] = (f32x16)(0.0f);
+        float m_st[4], l_st[4];
+#pragma unroll
+        for (int i = 0; i < 4; i++) { m_st[i] = FA_NEG_INF; l_st[i] = 0.0f; }
+
+        for (unsigned t = 0; t < ntile; t++) {
+            const unsigned kv0 = lo + t * BKV;
+            const unsigned left = ntile - 1 - t;
+            fa_hp8a_wait_tiles<NS>(left < (unsigned)(NS - 2) ? left : (unsigned)(NS - 2));
+            __syncthreads();
+            if (t + NS - 1 < ntile) issue(t + NS - 1);
+            const bf16* Ksm = Kring + (t % NS) * BKV * STRIDE;
+
+            f32x16 s = (f32x16)(0.0f);
+#pragma unroll
+            for (int q = 0; q < KPW; q++) {
+                const unsigned d0 = mfma_frag_k(lane, (wave * KPW + q) * MFMA_K);
+                bf16x8 qf = zero8, kf;
+                if (frow < NH) {
+                    const bf16v8 qv = ld_lds8(&Qsm[frow * STRIDE + d0]);
+                    __builtin_memcpy(&qf, &qv, 16);
+                }
+                const bf16v8 kv8 = ld_lds8(&Ksm[frow * STRIDE + d0]);
+                __builtin_memcpy(&kf, &kv8, 16);
+                s = plow_mfma_bf16_32x32(qf, kf, s);
+            }
+#pragma unroll
+            for (int i = 0; i < 4; i++)
+                Sred[(wave * NH + mfma_acc_m(lane, i)) * BKV + accn] = s[i];
+            __syncthreads();
+
+            float p[4];
+#pragma unroll
+            for (int i = 0; i < 4; i++) {
+                const unsigned m = mfma_acc_m(lane, i);
+                float acc = 0.0f;
+#pragma unroll
+                for (int ww = 0; ww < PLOW_WAVES; ww++) acc += Sred[(ww * NH + m) * BKV + accn];
+                p[i] = (kv0 + accn < hi) ? acc * FA_SCALE(scale) : FA_NEG_INF;
+            }
+#pragma unroll
+            for (int i = 0; i < 4; i++) {
+                const float rmax = half_wave_max(p[i]);
+                const float mnew = fmaxf(m_st[i], rmax);
+                const float corr = (m_st[i] == FA_NEG_INF) ? 0.0f : FA_EXP(m_st[i] - mnew);
+                const float pe = (mnew == FA_NEG_INF) ? 0.0f : FA_EXP(p[i] - mnew);
+                l_st[i] = l_st[i] * corr + half_wave_sum(pe);
+                m_st[i] = mnew;
+                p[i] = pe;
+#pragma unroll
+                for (int t2 = 0; t2 < NDT; t2++) oacc[t2][i] *= corr;
+            }
+            bf16* myP = Psm + wave * NH * BKV;
+#pragma unroll
+            for (int i = 0; i < 4; i++) myP[mfma_acc_m(lane, i) * BKV + accn] = f2bf(p[i]);
+            __syncthreads();
+
+#pragma unroll
+            for (int t2 = 0; t2 < NDT; t2++) {
+#pragma unroll
+                for (int ks = 0; ks < BKV; ks += MFMA_K) {
+                    const unsigned kk = mfma_frag_k(lane, ks);
+                    bf16x8 pf = zero8, vf;
+                    if (frow < NH) {
+                        const bf16v8 pv = ld_lds8(&myP[frow * BKV + kk]);
+                        __builtin_memcpy(&pf, &pv, 16);
+                    }
+                    const unsigned col = ncol0 + t2 * MFMA_N + frow;
+#pragma unroll
+                    for (int j = 0; j < 8; j++) {
+                        const bf16 vv = Ksm[(kk + j) * STRIDE + col];
+                        bf16_t vb;
+                        __builtin_memcpy(&vb, &vv, 2);
+                        vf[j] = vb;
+                    }
+                    oacc[t2] = plow_mfma_bf16_32x32(pf, vf, oacc[t2]);
+                }
+            }
+        }
+
+#pragma unroll
+        for (int t = 0; t < NDT; t++) {
+#pragma unroll
+            for (int i = 0; i < 4; i++) {
+                const unsigned m = mfma_acc_m(lane, i);
+                const unsigned d = ncol0 + t * MFMA_N + accn;
+                st_act<float>(&Opart[((size_t)(b * NH + m) * nsplit + sp) * DK + d], oacc[t][i]);
+            }
+        }
+        if (wave == 0 && accn == 0) {
+#pragma unroll
+            for (int i = 0; i < 4; i++) {
+                float* ml = mlpart + ((size_t)(b * NH + mfma_acc_m(lane, i)) * nsplit + sp) * 2;
+                st_act<float>(&ml[0], m_st[i]);
+                st_act<float>(&ml[1], l_st[i]);
+            }
+        }
+    }
+}
+#endif
 
 /* ATTN_SELECT — on-device top-k KV selection (DeepSeek DSA).            [DEEPSEEK-MLA]
  * sparse-attn-design.md §3.2. The attention twin of the MoE router: scores the indexer
@@ -5095,6 +5534,38 @@ __device__ void d_index_score_kpool(float* __restrict__ Score, const uint8_t* __
     const auto* const Wg = as_glob(W);
     const unsigned tid = threadIdx.x;
     const unsigned HI = index_heads;
+    /* Batched decode: (row, PLOW_THREADS-pool chunk) items spread over the workgroups instead of
+     * every workgroup walking every row. Same per-element arithmetic as the loop below. */
+    if (!prefill && n_batch > 1u && !FAKEQ) {
+        const unsigned nch = (pool_stride + PLOW_THREADS - 1u) / PLOW_THREADS;
+        for (unsigned it = slice; it < n_batch * nch; it += nblk) {
+            const unsigned b = it / nch, p0 = (it % nch) * PLOW_THREADS;
+            const unsigned len = (unsigned)kv_len[b] / pool_size;
+            if (p0 >= len) continue;
+            __syncthreads();
+            for (unsigned i = tid; i < HI * (unsigned)DI; i += PLOW_THREADS)
+                qlds[i] = Qg[(size_t)b * HI * DI + i];
+            __syncthreads();
+            const unsigned p = p0 + tid;
+            if (p >= len) continue;
+            const auto* wb = Wg + (size_t)b * HI;
+            const auto* qs = Qs + (size_t)b * HI;
+            const size_t kbatch = (size_t)b * pool_stride;
+            const auto* kp = Kg + (kbatch + p) * DI;
+            const float ks = Ks[kbatch + p];
+            float s = 0.0f;
+            for (unsigned h = 0; h < HI; h++) {
+                float d = 0.0f;
+                const uint8_t* qh = qlds + (size_t)h * DI;
+                for (int i = 0; i < DI; i++) d += dequant_fp8(qh[i]) * dequant_fp8(kp[i]);
+                d = bf2f(f2bf(d));
+                d *= ks;
+                s += wb[h] * qs[h] * (d > 0.0f ? d : 0.0f);
+            }
+            Sc[kbatch + p] = s * scale;
+        }
+        return;
+    }
     for (unsigned b = 0; b < n_batch; b++) {
         const unsigned token_len = prefill ? (unsigned)(kv_len[0] - (int)n_batch + (int)b + 1)
                                            : (unsigned)kv_len[b];
@@ -5134,6 +5605,222 @@ __device__ void d_index_score_kpool(float* __restrict__ Score, const uint8_t* __
             Sc[(size_t)b * pool_stride + p] = s * scale;
         }
         __syncthreads();
+    }
+}
+
+/* Pooled (kpool) index score on MFMA (PLOW_DSA_KPOOL_MFMA). Same logit as d_index_score_kpool:
+ *   logit[b][p] = scale * sum_h W[b][h]*Qscale[b][h] * relu(bf16(q_fp8[b][h].k_fp8[p]) * Kscale[p])
+ * The fp8 q and pooled keys are exact in bf16, so the [32 heads x 128].[128 x 32 pools] dot runs as
+ * d_index_score_mfma's 32x32x16 bf16 MFMA (fp32 accumulate; only the summation order differs from
+ * the scalar body). Work items are (row group, TILE_N-pool slab) over `slice`. Decode: one row per
+ * group, K row base b*pool_stride, len = kv_len[b]/pool_size, the query tile restaged only when the
+ * row changes. Prefill: RG consecutive query rows share the one chunk cache, so the key slab is
+ * staged once per group and each row's query tile is swapped in (len = causal row length/pool). */
+template <int DI, int HIc, int TILE_N = PLOW_WAVES * 32, int RG = 8>
+__device__ void d_index_score_kpool_mfma(float* __restrict__ Score, const uint8_t* __restrict__ Qfp8,
+                                         const float* __restrict__ Qscale,
+                                         const uint8_t* __restrict__ Kfp8,
+                                         const float* __restrict__ Kscale, const float* __restrict__ W,
+                                         const int* __restrict__ kv_len, unsigned n_batch,
+                                         unsigned pool_stride, unsigned pool_size, bool prefill,
+                                         float scale, unsigned slice, unsigned nblk, bf16* qlds,
+                                         bf16* ktile, float* wlds, float* kslds) {
+    static_assert(HIc == 32 && DI % 16 == 0, "32 heads, whole MFMA k-steps");
+    constexpr int NK = DI / MFMA_K;
+    constexpr int QSTRIDE = DI + FA_PAD, KSTRIDE = DI + FA_PAD;
+    auto* const Sc = as_glob(Score);
+    const auto* const Qg = as_glob(Qfp8);
+    const auto* const Qs = as_glob(Qscale);
+    const auto* const Kg = as_glob(Kfp8);
+    const auto* const Ks = as_glob(Kscale);
+    const auto* const Wg = as_glob(W);
+    const unsigned tid = threadIdx.x;
+    const unsigned lane = tid & 63, wave = tid >> 6;
+    const unsigned frow = mfma_frag_row(lane);
+    const unsigned nslab = (pool_stride + TILE_N - 1) / TILE_N;
+    const unsigned rg = prefill ? (unsigned)RG : 1u;
+    const unsigned ngrp = (n_batch + rg - 1) / rg;
+    auto row_len = [&](unsigned b) -> unsigned {
+        const unsigned tok = prefill ? (unsigned)(kv_len[0] - (int)n_batch + (int)b + 1)
+                                     : (unsigned)kv_len[b];
+        return tok / pool_size;
+    };
+    unsigned staged = ~0u;
+    bf16x8 qf[NK];
+    for (unsigned it = slice; it < ngrp * nslab; it += nblk) {
+        /* Slab-major: a row-major order with nblk a multiple of nslab pinned every workgroup to one
+         * slab index, so the few workgroups owning slab 0 ran every row (4.8 ms vs 76 us median). */
+        const unsigned g = it % ngrp, base = (it / ngrp) * TILE_N;
+        const unsigned b0 = g * rg;
+        const unsigned b1 = (b0 + rg < n_batch ? b0 + rg : n_batch);
+        /* Prefill rows grow by one token per row, so the group's last row is its longest. */
+        const unsigned lmax = row_len(b1 - 1);
+        if (base >= lmax) continue;
+        const size_t kb = prefill ? 0u : (size_t)b0 * pool_stride;
+        __syncthreads();
+        for (unsigned c = tid; c < (unsigned)TILE_N * (DI / 8); c += PLOW_THREADS) {
+            const unsigned row = c / (DI / 8), c8 = (c % (DI / 8)) * 8;
+            const unsigned p = base + row;
+            *(bf16v8*)&ktile[row * KSTRIDE + c8] =
+                (p < lmax) ? fp8v8_to_bf16v8(ld_glob_fp8v8(&Kg[(kb + p) * DI + c8])) : bf16v8_zero();
+        }
+        for (unsigned r = tid; r < (unsigned)TILE_N; r += PLOW_THREADS)
+            kslds[r] = (base + r < lmax) ? Ks[kb + base + r] : 0.0f;
+        for (unsigned b = b0; b < b1; b++) {
+            const unsigned len = row_len(b);
+            if (base >= len) continue;
+            if (b != staged) {
+                if (b != b0) __syncthreads(); /* previous row's qlds/wlds readers done */
+                for (unsigned e = tid; e < (unsigned)HIc * (DI / 8); e += PLOW_THREADS) {
+                    const unsigned h = e / (DI / 8), c8 = (e % (DI / 8)) * 8;
+                    *(bf16v8*)&qlds[h * QSTRIDE + c8] =
+                        fp8v8_to_bf16v8(ld_glob_fp8v8(&Qg[(size_t)b * HIc * DI + h * DI + c8]));
+                }
+                for (unsigned i = tid; i < (unsigned)HIc; i += PLOW_THREADS)
+                    wlds[i] = Wg[(size_t)b * HIc + i] * Qs[(size_t)b * HIc + i];
+            }
+            __syncthreads();
+            if (b != staged) {
+#pragma unroll
+                for (int s = 0; s < NK; s++) {
+                    const unsigned d0 = mfma_frag_k(lane, s * MFMA_K);
+                    qf[s] = __builtin_bit_cast(bf16x8, ld_lds8(&qlds[frow * QSTRIDE + d0]));
+                }
+                staged = b;
+            }
+            if (wave < TILE_N / 32 && base + wave * 32 < len) {
+                const unsigned krow0 = wave * 32;
+                f32x16 acc = (f32x16)(0.0f);
+#pragma unroll
+                for (int s = 0; s < NK; s++) {
+                    const unsigned d0 = mfma_frag_k(lane, s * MFMA_K);
+                    const bf16x8 kf =
+                        __builtin_bit_cast(bf16x8, ld_lds8(&ktile[(krow0 + frow) * KSTRIDE + d0]));
+                    acc = plow_mfma_bf16_32x32(qf[s], kf, acc);
+                }
+                const unsigned mbase = 4 * (lane / 32);
+                const float ks = kslds[krow0 + (lane & 31)];
+                float part = 0.0f;
+#pragma unroll
+                for (int i = 0; i < 16; i++) {
+                    const unsigned h = mbase + (i % 4) + 8 * (i / 4);
+                    const float d = bf2f(f2bf(acc[i])) * ks;
+                    part += wlds[h] * (d > 0.0f ? d : 0.0f);
+                }
+                part += __shfl_xor(part, 32, PLOW_WAVE);
+                if (lane < 32) {
+                    const unsigned p = base + krow0 + lane;
+                    if (p < len) st_act<float>(&Sc[(size_t)b * pool_stride + p], part * scale);
+                }
+            }
+        }
+    }
+}
+
+#ifndef DSA_KPOOL_RPW
+#define DSA_KPOOL_RPW 4u /* rows per wave per staged key slab */
+#endif
+/* PLOW_DSA_KPOOL_ROWWAVE: prefill form of d_index_score_kpool_mfma with one query ROW per WAVE.
+ * The old prefill walk swapped each row's query tile through LDS behind two workgroup barriers per
+ * row and ran one 32-pool MFMA tile per wave per row; here a work item stages the TILE_N-pool key
+ * slab once, every wave holds its own row's query fragment and head weights in registers and walks
+ * the whole slab. Per-element arithmetic and summation order are unchanged (bit-identical). */
+template <int DI, int HIc, int TILE_N>
+__device__ void d_index_score_kpool_rowwave(float* __restrict__ Score,
+                                            const uint8_t* __restrict__ Qfp8,
+                                            const float* __restrict__ Qscale,
+                                            const uint8_t* __restrict__ Kfp8,
+                                            const float* __restrict__ Kscale,
+                                            const float* __restrict__ W,
+                                            const int* __restrict__ kv_len, unsigned n_tok,
+                                            unsigned pool_stride, unsigned pool_size, float scale,
+                                            unsigned slice, unsigned nblk, bf16* ktile,
+                                            float* kslds, unsigned row_begin = 0u,
+                                            unsigned row_end = ~0u) {
+    static_assert(HIc == 32 && DI % 16 == 0, "32 heads, whole MFMA k-steps");
+    constexpr int NK = DI / MFMA_K;
+    constexpr int KSTRIDE = DI + FA_PAD;
+    constexpr unsigned RG = PLOW_WAVES * DSA_KPOOL_RPW;
+    auto* const Sc = as_glob(Score);
+    const auto* const Qg = as_glob(Qfp8);
+    const auto* const Qs = as_glob(Qscale);
+    const auto* const Kg = as_glob(Kfp8);
+    const auto* const Ks = as_glob(Kscale);
+    const auto* const Wg = as_glob(W);
+    const unsigned tid = threadIdx.x;
+    const unsigned lane = tid & 63, wave = tid >> 6;
+    const unsigned frow = mfma_frag_row(lane);
+    const unsigned mbase = 4 * (lane / 32);
+    const unsigned nslab = (pool_stride + TILE_N - 1) / TILE_N;
+    /* Band mode (PLOW_GLM_DSA_PF_SHARD): rows [row_begin, row_end) of the n_tok-row chunk. */
+    const unsigned r_end = row_end < n_tok ? row_end : n_tok;
+    const unsigned r_beg = row_begin < r_end ? row_begin : r_end;
+    const unsigned ngrp = (r_end - r_beg + RG - 1) / RG;
+    const int len_tok = as_glob(kv_len)[0];
+    auto row_len = [&](unsigned b) -> unsigned {
+        return (unsigned)(len_tok - (int)n_tok + (int)b + 1) / pool_size;
+    };
+    unsigned staged = ~0u;
+    bf16x8 qf[NK];
+    float wr[16];
+    for (unsigned it = slice; it < ngrp * nslab; it += nblk) {
+        const unsigned g = it % ngrp, base = (it / ngrp) * TILE_N;
+        const unsigned b0 = r_beg + g * RG;
+        const unsigned b1 = (b0 + RG < r_end ? b0 + RG : r_end);
+        const unsigned lmax = row_len(b1 - 1);
+        if (base >= lmax) continue;
+        __syncthreads();
+        for (unsigned c = tid; c < (unsigned)TILE_N * (DI / 8); c += PLOW_THREADS) {
+            const unsigned row = c / (DI / 8), c8 = (c % (DI / 8)) * 8;
+            const unsigned p = base + row;
+            *(bf16v8*)&ktile[row * KSTRIDE + c8] =
+                (p < lmax) ? fp8v8_to_bf16v8(ld_glob_fp8v8(&Kg[(size_t)p * DI + c8])) : bf16v8_zero();
+        }
+        for (unsigned r = tid; r < (unsigned)TILE_N; r += PLOW_THREADS)
+            kslds[r] = (base + r < lmax) ? Ks[base + r] : 0.0f;
+        __syncthreads();
+#pragma unroll 1
+        for (unsigned b = b0 + wave; b < b1; b += PLOW_WAVES) {
+        const unsigned len = row_len(b);
+        if (base >= len) continue;
+        if (b != staged) {
+            const uint8_t* const qrow = Qg + (size_t)b * HIc * DI + (size_t)frow * DI;
+#pragma unroll
+            for (int s2 = 0; s2 < NK; s2++)
+                qf[s2] = __builtin_bit_cast(
+                    bf16x8, fp8v8_to_bf16v8(ld_glob_fp8v8(&qrow[mfma_frag_k(lane, s2 * MFMA_K)])));
+#pragma unroll
+            for (int i = 0; i < 16; i++) {
+                const unsigned h = mbase + (i % 4) + 8 * (i / 4);
+                wr[i] = Wg[(size_t)b * HIc + h] * Qs[(size_t)b * HIc + h];
+            }
+            staged = b;
+        }
+#pragma unroll 1
+        for (unsigned st = 0; st < (unsigned)TILE_N; st += 32u) {
+            if (base + st >= len) break;
+            f32x16 acc = (f32x16)(0.0f);
+#pragma unroll
+            for (int s2 = 0; s2 < NK; s2++) {
+                const unsigned d0 = mfma_frag_k(lane, s2 * MFMA_K);
+                const bf16x8 kf =
+                    __builtin_bit_cast(bf16x8, ld_lds8(&ktile[(st + frow) * KSTRIDE + d0]));
+                acc = plow_mfma_bf16_32x32(qf[s2], kf, acc);
+            }
+            const float ks = kslds[st + (lane & 31)];
+            float part = 0.0f;
+#pragma unroll
+            for (int i = 0; i < 16; i++) {
+                const float d = bf2f(f2bf(acc[i])) * ks;
+                part += wr[i] * (d > 0.0f ? d : 0.0f);
+            }
+            part += __shfl_xor(part, 32, PLOW_WAVE);
+            if (lane < 32) {
+                const unsigned p = base + st + lane;
+                if (p < len) st_act<float>(&Sc[(size_t)b * pool_stride + p], part * scale);
+            }
+        }
+        }
     }
 }
 
@@ -5975,7 +6662,9 @@ __device__ __forceinline__ void idxsel_v2_find(unsigned* hist, unsigned* red, un
 __device__ void d_index_select_pf_v2(int* __restrict__ idx, const float* __restrict__ Score,
                                      const int* __restrict__ kv_len, unsigned n_tok,
                                      unsigned top_k, unsigned kv_stride, unsigned slice,
-                                     unsigned nblk, unsigned* hist, unsigned* red) {
+                                     unsigned nblk, unsigned* hist, unsigned* red,
+                                     unsigned pool_size = 1u, unsigned row_begin = 0u,
+                                     unsigned row_end = ~0u) {
     constexpr unsigned PER = IDXSEL_V2_PER;
     const auto* const Sc = as_glob(Score);
     int* const ib = as_glob(idx);
@@ -5983,9 +6672,10 @@ __device__ void d_index_select_pf_v2(int* __restrict__ idx, const float* __restr
     const unsigned len = (unsigned)as_glob(kv_len)[0];
     const unsigned q_pos0 = len - n_tok;
     unsigned nxt[PER];
+    const unsigned r_end = row_end < n_tok ? row_end : n_tok;
     auto fetch = [&](unsigned t) {
-        const unsigned rl = q_pos0 + t + 1u;
-        const bool want = t < n_tok && rl > top_k && rl <= PER * PLOW_THREADS;
+        const unsigned rl = (q_pos0 + t + 1u) / pool_size;
+        const bool want = t < r_end && rl > top_k && rl <= PER * PLOW_THREADS;
         const float* const sr = Sc + (size_t)t * kv_stride;
 #pragma unroll
         for (unsigned u = 0; u < PER; u++) {
@@ -5995,9 +6685,9 @@ __device__ void d_index_select_pf_v2(int* __restrict__ idx, const float* __restr
             nxt[u] = b;
         }
     };
-    fetch(slice);
-    for (unsigned t = slice; t < n_tok; t += nblk) {
-        const unsigned row_len = q_pos0 + t + 1u;
+    fetch(row_begin + slice);
+    for (unsigned t = row_begin + slice; t < r_end; t += nblk) {
+        const unsigned row_len = (q_pos0 + t + 1u) / pool_size;
         int* const row = ib + (size_t)t * top_k;
         if (row_len <= top_k) {
             for (unsigned s = tid; s < top_k; s += PLOW_THREADS)
@@ -6008,7 +6698,7 @@ __device__ void d_index_select_pf_v2(int* __restrict__ idx, const float* __restr
         }
         if (row_len > PER * PLOW_THREADS) {
             d_index_select_pf<true>(idx, Score, kv_len, n_tok, top_k, kv_stride, 0u, 1u, hist,
-                                    red + 8, 1u, t, t + 1u);
+                                    red + 8, pool_size, t, t + 1u);
             fetch(t + nblk);
             continue;
         }
@@ -6580,7 +7270,10 @@ __device__ void d_index_union_pf(unsigned char* __restrict__ uni,
         int* const upos = (int*)(uni + hdr + (size_t)qt * cap * 12u);
         unsigned* const ulo = (unsigned*)(uni + hdr + (size_t)qt * cap * 12u + (size_t)cap * 4u);
         unsigned* const uhi = (unsigned*)(uni + hdr + (size_t)qt * cap * 12u + (size_t)cap * 8u);
-        for (unsigned s = tid; s < tile_end; s += PLOW_THREADS) atomicExch(&mrow[s], 0ull);
+        /* Plain L2-coherent load/store (agent-scope relaxed atomics), not RMW: the zeroing and
+         * the compaction read only need to see this workgroup's atomicOr results at L2. */
+        for (unsigned s = tid; s < tile_end; s += PLOW_THREADS)
+            __hip_atomic_store(&mrow[s], 0ull, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
         __syncthreads();
         for (unsigned e = tid; e < P * top_k; e += PLOW_THREADS) {
             const unsigned ql = e / top_k;
@@ -6600,7 +7293,7 @@ __device__ void d_index_union_pf(unsigned char* __restrict__ uni,
         for (unsigned c0 = 0; c0 < tile_end; c0 += PLOW_THREADS) {
             const unsigned s = c0 + tid;
             const unsigned long long m =
-                (s < tile_end) ? atomicOr(&mrow[s], 0ull) : 0ull;
+                (s < tile_end) ? __hip_atomic_load(&mrow[s], __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT) : 0ull;
             const unsigned flag = m != 0ull;
             const unsigned lane = tid % PLOW_WAVE, wave = tid / PLOW_WAVE;
             const unsigned long long bits = __ballot(flag);

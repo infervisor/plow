@@ -89,6 +89,7 @@ pub(super) fn snapshot_regions<'a>(
     if batch == 0 || max_ctx == 0 {
         return None;
     }
+    let instructions_all = instructions.clone();
     let mut known = vec![false; tensors.len()];
     let mut needed = vec![false; tensors.len()];
     let mut regions = Vec::new();
@@ -136,6 +137,39 @@ pub(super) fn snapshot_regions<'a>(
         }
         let dst = d.t[0] as usize;
         if !tensors.get(dst).is_some_and(|t| t.name.starts_with("kv.")) {
+            continue;
+        }
+        // Pooled DSA indexer (GLM-5.3): the compressed pool cache is append-only like the
+        // latent cache; the incomplete-pool tail ring is per-slot state, snapshotted whole.
+        if d.op == DevOp::DsaPoolCompress as u16 {
+            for k in [0usize, 1] {
+                let i = d.t[k] as usize;
+                if !tensors.get(i).is_some_and(|t| t.name.starts_with("kv.")) {
+                    return None;
+                }
+                known[i] = true;
+            }
+            continue;
+        }
+        if d.op == DevOp::DsaPoolStash as u16 {
+            for k in [0usize, 1] {
+                let i = d.t[k] as usize;
+                let t = tensors.get(i)?;
+                if !t.name.starts_with("kv.") || t.bytes == 0 || t.bytes % batch as u64 != 0 {
+                    return None;
+                }
+                known[i] = true;
+                if !regions.iter().any(|r: &Region| r.tensor == i) {
+                    regions.push(Region {
+                        tensor: i,
+                        slot_bytes: t.bytes / batch as u64,
+                        heads: 1,
+                        ring: 0,
+                        window: 0,
+                        row_bytes: 0,
+                    });
+                }
+            }
             continue;
         }
         if d.op == DevOp::HeadNormRope as u16 || d.op == DevOp::HeadNormRopeFp8 as u16 {
@@ -217,8 +251,9 @@ pub(super) fn snapshot_regions<'a>(
             }
         }
     }
+    let used = referenced(tensors.len(), instructions_all);
     for (i, t) in tensors.iter().enumerate() {
-        if t.name.starts_with("kv.") && !t.name.contains("blkres") && !known[i] {
+        if t.name.starts_with("kv.") && !t.name.contains("blkres") && !known[i] && used[i] {
             return None;
         }
         if needed[i] && !regions.iter().any(|r| r.tensor == i) {
@@ -226,6 +261,139 @@ pub(super) fn snapshot_regions<'a>(
         }
     }
     Some(regions)
+}
+/// A full-context KV tensor's per-slot layout `[heads][stride_rows][row_bytes]`, as its
+/// `HeadNormRope` writer addresses it: the first `rows` rows of every head are a prompt prefix.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) struct CloneSpan {
+    pub tensor: usize,
+    pub slot_bytes: u64,
+    heads: u32,
+    stride_rows: u32,
+    row_bytes: u64,
+    /// Tokens per row: 1, or the DSA pool size for the compressed indexer cache (a prefix of
+    /// `rows` tokens owns its `rows / pool` complete pools; the tail rides the snapshot ring).
+    pool: u32,
+}
+impl CloneSpan {
+    pub fn copy_spans(&self, rows: u32, mut copy: impl FnMut(u64, u64)) {
+        let head_bytes = u64::from(self.stride_rows) * self.row_bytes;
+        let bytes = u64::from((rows / self.pool.max(1)).min(self.stride_rows)) * self.row_bytes;
+        for head in 0..u64::from(self.heads) {
+            copy(head * head_bytes, bytes);
+        }
+    }
+}
+
+/// The KV a prompt prefix occupies outside the snapshot regions: every `kv.*` tensor that is
+/// neither carried state nor a snapshot region must be a full-context cache with one
+/// `HeadNormRope` geometry, so a prefix can be copied from one slot to another. `None` (no
+/// cross-slot reuse) for anything else: rings, pooled indexers, unknown writers.
+pub(super) fn clone_spans<'a>(
+    tensors: &[DevTensor],
+    instructions: impl Iterator<Item = &'a DevInst64> + Clone,
+    regions: &[Region],
+    batch: usize,
+) -> Option<Vec<CloneSpan>> {
+    if batch == 0 {
+        return None;
+    }
+    let used = referenced(tensors.len(), instructions.clone());
+    let mut spans: Vec<CloneSpan> = Vec::new();
+    for d in instructions {
+        if d.op == DevOp::DsaPoolCompress as u16 {
+            let (pool, hd) = (d.i[1].max(1), d.i[2]);
+            for (k, row_bytes) in [(0usize, u64::from(hd)), (1, 4)] {
+                let index = d.t[k] as usize;
+                let tensor = tensors.get(index)?;
+                let slot_bytes = tensor.bytes / batch as u64;
+                if row_bytes == 0 || tensor.bytes % batch as u64 != 0 || slot_bytes % row_bytes != 0
+                {
+                    return None;
+                }
+                let span = CloneSpan {
+                    tensor: index,
+                    slot_bytes,
+                    heads: 1,
+                    stride_rows: u32::try_from(slot_bytes / row_bytes).ok()?,
+                    row_bytes,
+                    pool,
+                };
+                match spans.iter().find(|s| s.tensor == index) {
+                    Some(prior) if prior != &span => return None,
+                    Some(_) => {}
+                    None => spans.push(span),
+                }
+            }
+            continue;
+        }
+        let fp8 = d.op == DevOp::HeadNormRopeFp8 as u16;
+        if !fp8 && d.op != DevOp::HeadNormRope as u16 {
+            continue;
+        }
+        let elem = if fp8 { 1 } else { 2 };
+        let mut add = |index: usize, row_bytes: u64| -> Option<()> {
+            let tensor = tensors.get(index)?;
+            if !tensor.name.starts_with("kv.") || d.fj[2] != u32::MAX {
+                return Some(());
+            }
+            let (heads, stride_rows) = (d.i[1], d.fj[1]);
+            let slot_bytes = tensor.bytes / batch as u64;
+            if heads == 0
+                || stride_rows == 0
+                || row_bytes == 0
+                || tensor.bytes % batch as u64 != 0
+                || slot_bytes != u64::from(heads) * u64::from(stride_rows) * row_bytes
+            {
+                return None;
+            }
+            let span = CloneSpan {
+                tensor: index,
+                slot_bytes,
+                heads,
+                stride_rows,
+                row_bytes,
+                pool: 1,
+            };
+            match spans.iter().find(|s| s.tensor == index) {
+                Some(prior) if prior != &span => None,
+                Some(_) => Some(()),
+                None => {
+                    spans.push(span);
+                    Some(())
+                }
+            }
+        };
+        add(d.t[0] as usize, u64::from(d.i[2]) * elem)?;
+        if fp8 {
+            add(d.t[6] as usize, 4)?;
+        }
+    }
+    for (i, t) in tensors.iter().enumerate() {
+        if t.name.starts_with("kv.")
+            && !super::is_carried_state(&t.name)
+            && !regions.iter().any(|r| r.tensor == i)
+            && !spans.iter().any(|s| s.tensor == i)
+            && used[i]
+        {
+            return None;
+        }
+    }
+    Some(spans)
+}
+
+/// Tensors some instruction names: a declared `kv.*` no program touches (the pooled DSA packet's
+/// unused per-token indexer cache) holds nothing a prefix could own.
+fn referenced<'a>(n: usize, instructions: impl Iterator<Item = &'a DevInst64>) -> Vec<bool> {
+    let mut used = vec![false; n];
+    for d in instructions {
+        for &h in &d.t {
+            if let Some(u) = used.get_mut(h as usize) {
+                *u = true;
+            }
+        }
+    }
+    used
 }
 #[cfg(test)]
 mod tests {
@@ -393,6 +561,32 @@ mod tests {
             );
         }
         std::fs::remove_dir_all(dir).unwrap();
+    }
+    #[test]
+    fn full_context_kv_clones_by_head_prefix_and_unknown_kv_refuses() {
+        let tensors = [tensor("kv.3.ckv", 4 * 2 * 64 * 1024), tensor("kv.0.state", 4 * 256)];
+        let mut d = DevInst64::default();
+        d.op = DevOp::HeadNormRope as u16;
+        d.t[0] = 0;
+        d.i[1] = 2;
+        d.i[2] = 512;
+        d.fj[1] = 64;
+        d.fj[2] = u32::MAX;
+        let regions = snapshot_regions(&tensors, [d].iter(), 4, 64).unwrap();
+        let spans = clone_spans(&tensors, [d].iter(), &regions, 4).unwrap();
+        assert_eq!(spans.len(), 1);
+        let mut copies = Vec::new();
+        spans[0].copy_spans(10, |off, bytes| copies.push((off, bytes)));
+        assert_eq!(copies, [(0, 10 * 1024), (64 * 1024, 10 * 1024)]);
+        let extra = [
+            tensor("kv.3.ckv", 4 * 2 * 64 * 1024),
+            tensor("kv.0.state", 4 * 256),
+            tensor("kv.5.kidx", 4 * 64),
+        ];
+        assert!(clone_spans(&extra, [d].iter(), &regions, 4).is_none());
+        let mut ring = d;
+        ring.fj[2] = 63;
+        assert!(clone_spans(&tensors, [ring].iter(), &[], 4).is_none());
     }
     fn tensor(name: &str, bytes: u64) -> DevTensor {
         DevTensor {

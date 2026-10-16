@@ -286,6 +286,11 @@ pub(crate) const PREFILL_ROW_FIELDS: &[(DevOp, RowField)] = &[
     (DevOp::IndexScorePf, RowField::Rows(0)),
     (DevOp::IndexSelectPf, RowField::Rows(0)),
     (DevOp::IndexUnionPf, RowField::Rows(0)),
+    // The pooled chain derives each row's causal length from `kv_len[0] - rows`, like the three
+    // above; at the bucket width a ragged chunk's rows sat before position 0.
+    (DevOp::IndexScoreKpool, RowField::Rows(0)),
+    (DevOp::DsaPoolExpand, RowField::Rows(0)),
+    (DevOp::DsaQQuant, RowField::RowsTimes(0)),
     (DevOp::MlaMergeFold, RowField::Rows(0)),
     (DevOp::MoeRouterTopkPf, RowField::Rows(4)),
     (DevOp::MoeAlignPf, RowField::Rows(0)),
@@ -296,6 +301,12 @@ pub(crate) const PREFILL_ROW_FIELDS: &[(DevOp, RowField)] = &[
     (DevOp::MoeCombineNormGemmaPf, RowField::Rows(2)),
     (DevOp::XReduce, RowField::RowsTimes(0)),
     (DevOp::XReduceTwoShot, RowField::RowsTimes(0)),
+    // GLM-5.3-Flash's hyper-connection chain, three per layer: `T` in i0 for both HyperConn ops
+    // and `M` for the mix projection GemvF32. Unpatched, a 4096-token prompt in the 8192 bucket
+    // ran all three over 8192 rows — 408 of the 763 ms prefill on gfx950 (per-op trace).
+    (DevOp::HyperConnPre, RowField::Rows(0)),
+    (DevOp::HyperConnPost, RowField::Rows(0)),
+    (DevOp::GemvF32, RowField::Rows(0)),
 ];
 
 pub(crate) fn prefill_row_field(op: u16) -> Option<RowField> {
@@ -377,7 +388,8 @@ pub(crate) fn rebase_chunk_rows(
         } else if op == DevOp::DsaPoolCompress as u16 {
             let pool_size = d.i[1].max(1);
             d.i[0] = clen / pool_size;
-        } else if op == DevOp::DsaPoolStash as u16 {
+        } else if op == DevOp::DsaPoolStash as u16 && d.i[4] != 1 {
+            // `i[4] = 1` is the per-span packed form; it addresses rows through the span table.
             let pool_size = d.i[0].max(1);
             let pad = t.saturating_sub(clen);
             let complete = (clen / pool_size) * pool_size;
@@ -397,6 +409,11 @@ pub(crate) fn rebase_chunk_rows(
         {
             continue;
         }
+        // PLOW_GLM_DSA_PF_A2A: the band gather flash counts virtual rows (band x head groups);
+        // `rebase_band_rows` sizes it with the band.
+        if is_a2a_flash(d, names) {
+            continue;
+        }
         match prefill_row_field(op) {
             Some(RowField::Rows(f)) if d.i[f] == t => d.i[f] = clen,
             Some(RowField::RowsTimes(f)) if d.i[f] > 0 && d.i[f] % t == 0 => {
@@ -405,6 +422,12 @@ pub(crate) fn rebase_chunk_rows(
             _ => {}
         }
     }
+}
+
+/// The `PLOW_GLM_DSA_PF_A2A` band gather flash: its q is the all-to-all's `act.qa_rs`.
+fn is_a2a_flash(d: &DevInst64, names: &[String]) -> bool {
+    d.op == DevOp::FlashMlaPrefill as u16
+        && names.get(d.t[2] as usize).is_some_and(|n| n == "act.qa_rs")
 }
 
 /// Rows of each rank's band when a `t`-row sequence-parallel bucket carries `clen` live rows
@@ -437,6 +460,36 @@ pub(crate) fn rebase_band_rows(
         }
     };
     for d in insts.iter_mut() {
+        // PLOW_GLM_DSA_PF_SHARD: the band score/select (i6 = band rows) follow the band, so
+        // their rows match the rescaled pool-id all-gather slices.
+        if (d.op == DevOp::IndexScoreKpool as u16 || d.op == DevOp::IndexSelectPf as u16)
+            && d.i[6] == tb
+        {
+            d.i[6] = b;
+        }
+        // PLOW_GLM_DSA_PF_A2A: the band tables, both all-to-alls, the band flash and fold.
+        if d.op == DevOp::DsaPoolExpand as u16 && d.i[3] == 2 && d.i[4] == tb {
+            d.i[4] = b;
+        }
+        if d.op == DevOp::XAllToAllHeads as u16 && d.i[0] == tb {
+            d.i[0] = b;
+        }
+        if names.get(d.t[0] as usize).is_some_and(|n| n == "act.qa_rs") {
+            if let Some(RowField::Rows(f)) = prefill_row_field(d.op) {
+                if d.i[f] == tb {
+                    d.i[f] = b;
+                }
+            }
+        }
+        if d.op == DevOp::MlaMergeFold as u16
+            && d.i[0] == tb
+            && names.get(d.t[0] as usize).is_some_and(|n| n == "act.oat_rs_tp")
+        {
+            d.i[0] = b;
+        }
+        if is_a2a_flash(d, names) && d.i[4] % tb == 0 {
+            d.i[4] = d.i[4] / tb * b;
+        }
         if d.op == DevOp::XReduceScatter as u16 {
             d.i[0] = rescale(d.i[0], t, tp * b);
         } else if d.op == DevOp::XAllGather as u16 {
@@ -847,7 +900,7 @@ mod row_field_tests {
     /// the field must BE the row count; `RowsTimes` rescales, so its field is rows times a
     /// per-instruction width.
     const ROW_NAMES: &[&str] = &["rows", "ntok", "n_tok", "T", "M", "n_batch"];
-    const ELEM_NAMES: &[&str] = &["n", "H"];
+    const ELEM_NAMES: &[&str] = &["n", "H", "n_rows"];
 
     /// Every entry's field index must name a row field in the slot table.
     ///
@@ -912,13 +965,13 @@ mod row_field_tests {
     fn every_gemm_opcode_is_either_row_shrunk_or_exempt() {
         /// `Gemm*` opcodes deliberately NOT in `PREFILL_ROW_FIELDS`, with the reason.
         ///
-        /// Both of these are NATIVE-ROUTED and already shrink themselves: the route owns a
-        /// `rebase(rows)` that re-picks the kernel for the live row count
-        /// (`amd_gemm_lt.rs:21`, `amd_gemm_blk.rs:157`, both driven from `patch_prefill`).
+        /// All of these are NATIVE-ROUTED and already shrink themselves from `patch_prefill`:
+        /// `GemmLtPf`/`GemmBlkPf` own a `rebase(rows)` that re-picks the kernel for the live row
+        /// count (`amd_gemm_lt.rs:21`, `amd_gemm_blk.rs:157`); `GemmGroupPf` sets `args.t = rows`.
         /// Adding them to the table would shrink `i[0]` a SECOND time, and `rebase` derives its
         /// band cap and its `rows != i[0]` guard from that same field -- so the table would feed
         /// the route an already-shrunk bucket and break the sequence-parallel band case.
-        const EXEMPT: &[DevOp] = &[DevOp::GemmLtPf, DevOp::GemmBlkPf];
+        const EXEMPT: &[DevOp] = &[DevOp::GemmLtPf, DevOp::GemmBlkPf, DevOp::GemmGroupPf];
         let mut missing = Vec::new();
         for op in DevOp::ALL {
             let name = format!("{op:?}");

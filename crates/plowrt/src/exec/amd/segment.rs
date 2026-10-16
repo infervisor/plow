@@ -128,15 +128,21 @@ impl AmdEngine {
             return "interpreter";
         }
         let active = self.packed_prefill.is_some_and(|b| b.prog == p);
+        if active && self.packed_lean_kda_segment(p, seg) {
+            return "kda_lean_spans";
+        }
         match route {
             PrefillSegmentRoute::SparseMla(_) if active => return "mla_sparse_aiter_spans",
             PrefillSegmentRoute::SparseMla(route) if route.active => return "mla_sparse_aiter",
             PrefillSegmentRoute::MoeAiter(_) => return "moe_aiter_fp8",
+            PrefillSegmentRoute::HcAiter { .. } => return "hc_aiter",
             PrefillSegmentRoute::IndexTp(_) if active => return "index_tp_spans",
             PrefillSegmentRoute::IndexTp(_) => return "index_tp",
             PrefillSegmentRoute::GemmLt(_) => return "gemm_lt",
             PrefillSegmentRoute::GemmBlk(_) => return "gemm_blk",
             PrefillSegmentRoute::MlaFold(_) => return "mla_fold",
+            PrefillSegmentRoute::MlaPfDense(_) if active => return "mla_pf_dense_spans",
+            PrefillSegmentRoute::MlaPfDense(_) => return "mla_pf_dense",
             _ => {}
         }
         if !active {
@@ -167,6 +173,7 @@ impl AmdEngine {
                 PrefillSegmentRoute::KdaChunkCarryKeyfeed { .. } => {
                     return "kda_carry_keyfeed";
                 }
+                PrefillSegmentRoute::GemmGroup { .. } => return "gemm_group",
                 PrefillSegmentRoute::KdaChunkKeyFactorWu { .. }
                     if self.k_kda_key_factor_wu.is_some() =>
                 {
@@ -190,6 +197,12 @@ impl AmdEngine {
                 }
                 PrefillSegmentRoute::MoeCombine(_) if self.k_moe_combine.is_some() => {
                     return "moe_combine";
+                }
+                PrefillSegmentRoute::MoeFp8Glu { .. } if self.k_moe_fp8_pf.is_some() => {
+                    return "moe_fp8_glu";
+                }
+                PrefillSegmentRoute::MoeFp8Down { .. } if self.k_moe_fp8_pf.is_some() => {
+                    return "moe_fp8_down";
                 }
                 PrefillSegmentRoute::MoeEpAlign(_) if self.k_moe_ep_align.is_some() => {
                     return "moe_ep_align";

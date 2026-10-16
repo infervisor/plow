@@ -21,15 +21,28 @@ def save(path, value):
     temporary.replace(path)
 
 
+def gpu_count():
+    """Cards on the box as gpulease counts them (nvidia-smi -L lines; one amd-smi process entry per GPU)."""
+    if Path("/dev/nvidiactl").exists():
+        smi = subprocess.run(["nvidia-smi", "-L"], capture_output=True, text=True)
+        return None if smi.returncode else len(smi.stdout.splitlines())
+    if Path("/dev/kfd").exists():
+        smi = subprocess.run(["amd-smi", "process", "--json"], capture_output=True, text=True)
+        try:
+            return None if smi.returncode else len([e for e in json.loads(smi.stdout) if "gpu" in e])
+        except (ValueError, TypeError):
+            return None
+    return None
+
+
 def tenant_blocks(audit, ngpu):
-    """True unless `ngpu` NVIDIA cards are free of foreign processes (gpulease leases around them)."""
+    """True unless `ngpu` cards are free of foreign processes (gpulease leases around them)."""
     if audit.strip() == "GPU: no foreign compute procs":
         return False
-    smi = subprocess.run(["nvidia-smi", "-L"], capture_output=True, text=True) if Path("/dev/nvidiactl").exists() else None
-    if smi is None or smi.returncode:
+    total = gpu_count()
+    if not total:
         return True
     busy = {line.split(":")[0] for line in audit.splitlines() if line.startswith("gpu")}
-    total = len(smi.stdout.splitlines())
     return ngpu >= total or total - len(busy) < ngpu
 
 
