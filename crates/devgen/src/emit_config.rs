@@ -542,6 +542,10 @@ pub struct EmitConfig {
     /// default; this is the sweep handle for a re-measurement.
     #[arg(long, env = "PLOW_MLA_NS")]
     pub mla_ns: Option<u32>,
+    /// Pin the Muse Spark flash-decode `nsplit`. Unset = the CU-filling default; the sweep handle
+    /// for the split-count screen.
+    #[arg(long, env = "PLOW_MUSE_DECODE_NS")]
+    pub muse_decode_ns: Option<u32>,
     /// Items per gathered query pack in the V4.1 sparse prefill (1 = the un-split arm).
     #[arg(long, env = "PLOW_MLA_GATHER_SPLIT", default_value_t = 2)]
     pub mla_gather_split: u32,
@@ -1944,6 +1948,7 @@ impl EmitConfig {
             k3_full: env_bool_default_true("K3_FULL"),
             k3_fuse_a: env_bool("PLOW_K3_FUSE_A"),
             mla_ns: env_u32("PLOW_MLA_NS"),
+            muse_decode_ns: env_u32("PLOW_MUSE_DECODE_NS"),
             mla_gather_split: env_u32("PLOW_MLA_GATHER_SPLIT").unwrap_or(2),
             dsv41_xr_band: env_u32("PLOW_DSV41_XR_BAND").unwrap_or(1),
             dsv41_xr_band_cus: env_u32("PLOW_DSV41_XR_BAND_CUS"),

@@ -642,7 +642,8 @@ pub enum DevOp {
     /// dot); this cheap 1-CU op does the score transform (sigmoid|softmax) + `e_score_correction_bias`
     /// on SELECTION only + group-limited top-k with lowest-id tie-break + norm_topk + route_scale over
     /// the precomputed logits. Byte-for-byte the selection logic of [`DevOp::MoeRouter`], minus the GEMV.
-    /// `t0=table t1=logit(bf16[n_exp]) t3=bias(f32[n_exp] or 0)` · `i1=n_exp i2=k i3=flags` · `f0=route_scale`.
+    /// `t0=table t1=logit(bf16[n_exp]) t3=bias(f32[n_exp] or 0)` · `i1=n_exp i2=k i3=flags` ·
+    /// `f0=route_scale f1=logit_scale?` (scales the logit before the transform; 0 = 1).
     MoeRouterTopk = 56,
 
     /// FUSED MLA merge + W_uv fold (`d_mla_merge_fold`) — replaces the [`DevOp::FlashMerge`] +
@@ -2402,6 +2403,23 @@ pub enum DevOp {
     /// `[b, s, n_heads, index_head_dim]` then `fp4_act_quant(q, 32, True)` (`model.py:550-552`).
     /// A third call site, differing from the other two only in `i3`/`i6`/`i7`.
     CompressRopeQuant = 217,
+    /// Muse Spark row RMSNorm (`op_muse.h` `d_muse_rmsnorm`), one workgroup per row.
+    /// `t0=out(bf16[rows][dim]) t1=x(bf16) t2=w(bf16[dim])?` · `i0=rows i1=dim i2=mode` · `f0=eps`.
+    /// `mode` 0: `x*r*w` (`w` absent = weightless); 1 CENTERED: `x*r*(1+w)`;
+    /// 2 INPUT_SCALED: `y = bf16(x*(1+w))`, `y*r(y)`. Every product is rounded to bf16 where the
+    /// reference rounds it.
+    MuseRmsNorm = 218,
+    /// Muse Spark gated residual, `out = bf16(alpha*res + beta*h)` with
+    /// `beta = sigmoid(g/T)` and `alpha = sqrt(max(sigmoid(-g/T)*(1+beta), eps))` computed in f32
+    /// from the bf16 gate parameter. `t0=out t1=res t2=h t3=g(bf16[n])` · `i0=n i1=rows` ·
+    /// `f0=T f1=eps`. `out` may alias `res`.
+    MuseResidualGate = 219,
+    /// Muse Spark expert combine with the per-(token, expert) input-scaled post-expert norm.
+    /// `part` is the grouped down projection's `gate * y`; per slot this recovers
+    /// `y = bf16(part/gate)`, applies the input-scaled RMSNorm, and sums `gate * norm(y)` in f32.
+    /// `t0=out(bf16[H]) t1=part(f32[k][H]) t2=table t3=w(bf16[H])` · `i0=H i1=k` · `f0=eps`.
+    /// Decode (one token) only.
+    MuseMoeCombineNorm = 220,
 }
 
 /// [`DevOp::FlashPrefillFp8`]'s split count (`i7` low half).
@@ -2682,6 +2700,9 @@ impl DevOp {
         DevOp::EngramEmbed,
         DevOp::GemmFp8Mx,
         DevOp::CompressRopeQuant,
+        DevOp::MuseRmsNorm,
+        DevOp::MuseResidualGate,
+        DevOp::MuseMoeCombineNorm,
     ];
 
     /// Recover the opcode from its wire discriminant, or `None` for a value no
@@ -2920,6 +2941,9 @@ impl DevOp {
             DevOp::EngramEmbed => "PLOW_DOP_ENGRAM_EMBED",
             DevOp::GemmFp8Mx => "PLOW_DOP_GEMM_FP8_MX",
             DevOp::CompressRopeQuant => "PLOW_DOP_COMPRESS_ROPE_QUANT",
+            DevOp::MuseRmsNorm => "PLOW_DOP_MUSE_RMSNORM",
+            DevOp::MuseResidualGate => "PLOW_DOP_MUSE_RESIDUAL_GATE",
+            DevOp::MuseMoeCombineNorm => "PLOW_DOP_MUSE_MOE_COMBINE_NORM",
         }
     }
 
@@ -2980,7 +3004,8 @@ impl DevOp {
     /// 210 -> 211 for `MmSpanExtent = 210` (bidirectional media spans).
     /// 211 -> 212 for `GemmGroupPf = 211` (grouped prefill projection route).
     /// 212 -> 218 for `CompressPool = 212` .. `CompressRopeQuant = 217` (DeepSeek-V4.1).
-    pub const COUNT: u16 = 218;
+    /// 218 -> 221 for `MuseRmsNorm = 218` .. `MuseMoeCombineNorm = 220` (Muse Spark).
+    pub const COUNT: u16 = 221;
 
     /// The `(M, N, K, quant)` a decode-GEMV opcode carries, or `None` if this is not one.
     ///

@@ -2049,6 +2049,9 @@ pub(super) const QWEN_GDN_ARM_OPS: &[DevOp] = &[
     DevOp::QwenGdnConvPrefill,
     DevOp::QwenGdnQkvPrep,
     DevOp::QwenGdnGatePrep,
+    DevOp::MuseRmsNorm,
+    DevOp::MuseResidualGate,
+    DevOp::MuseMoeCombineNorm,
 ];
 
 /// The first Qwen GDN opcode in these programs, or `None` if the packet needs no Qwen arm.

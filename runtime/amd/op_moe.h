@@ -415,9 +415,12 @@ __device__ void d_moe_router_topk(unsigned char* table, const bf16* logit, const
                                   unsigned n_exp, unsigned k, unsigned flags, float route_scale,
                                   unsigned slice, unsigned nblk, float* lds,
                                   unsigned n_group = 0, unsigned topk_group = 0,
-                                  const int32_t* tid2eid = nullptr, int token_id = 0) {
+                                  const int32_t* tid2eid = nullptr, int token_id = 0,
+                                  float logit_scale = 0.0f) {
     (void)nblk;
     if (slice != 0) return; /* emitted on 1 CU; guard is belt-and-braces */
+    /* Muse Spark scales the f32 logit before the transform; 0 (every other packet) is exactly 1. */
+    const float ls = logit_scale != 0.0f ? logit_scale : 1.0f;
     const bool sigmoid = (flags & 1u) != 0;
     const bool norm_topk = (flags & 2u) != 0;
     /* DeepSeek-V4 arms. All three default off, so every GLM / DeepSeek-V3 / Qwen / Mixtral /
@@ -461,15 +464,15 @@ __device__ void d_moe_router_topk(unsigned char* table, const bf16* logit, const
                    * threshold=20 linear tail differs from this by less than an f32 ulp at
                    * every l where it fires. */
         for (unsigned e = tid; e < n_exp; e += PLOW_THREADS) {
-            const float l = f32log ? lf32[e] : bf2f(logit[e]);
+            const float l = (f32log ? lf32[e] : bf2f(logit[e])) * ls;
             lds[e] = sqrtf(log1pf(expf(-fabsf(l))) + fmaxf(l, 0.0f));
         }
     } else if (sigmoid) { /* the hot GLM/DS path — parallel, per-expert independent */
         for (unsigned e = tid; e < n_exp; e += PLOW_THREADS)
-            lds[e] = 1.0f / (1.0f + expf(-(f32log ? lf32[e] : bf2f(logit[e]))));
+            lds[e] = 1.0f / (1.0f + expf(-(f32log ? lf32[e] : bf2f(logit[e])) * ls));
     } else {       /* softmax needs a global max+sum; keep it exactly serial on thread 0 (rare) */
         for (unsigned e = tid; e < n_exp; e += PLOW_THREADS)
-            lds[e] = f32log ? lf32[e] : bf2f(logit[e]);
+            lds[e] = (f32log ? lf32[e] : bf2f(logit[e])) * ls;
         __syncthreads();
         if (tid == 0) {
             float m = -1e30f;

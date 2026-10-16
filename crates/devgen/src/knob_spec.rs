@@ -1244,6 +1244,7 @@ pub const EMIT: &[KnobSpec] = &[
     KnobSpec::new("emit.k3_full", Some("K3_FULL"), Layer::Emit, Domain::Bool, ON, DIAG),
     KnobSpec::new("emit.k3_fuse_a", Some("PLOW_K3_FUSE_A"), Layer::Emit, Domain::Bool, OFF, OPT_IN),
     KnobSpec::new("emit.mla_ns", Some("PLOW_MLA_NS"), Layer::Emit, U32, UNSET, OPT_IN),
+    KnobSpec::new("emit.muse_decode_ns", Some("PLOW_MUSE_DECODE_NS"), Layer::Emit, U32, UNSET, OPT_IN),
     KnobSpec::new("emit.legacy_k3_ns", Some("PLOW_K3_NS"), Layer::Emit, U32, UNSET, DIAG),
     KnobSpec::new("emit.legacy_glm_ns", Some("PLOW_GLM_NS"), Layer::Emit, U32, UNSET, DIAG),
     KnobSpec::new("emit.layers", Some("PLOW_LAYERS"), Layer::Emit, Domain::Str, UNSET, DIAG),

@@ -334,6 +334,11 @@ pub fn run(
             for slot in 0..batch {
                 engine.dump_slot_kv(dir, &format!("rank{rank}"), slot, ctx)?;
             }
+            for (name, reference) in &stages {
+                let mut bytes = vec![0; reference.len()];
+                engine.read_tensor(name, &mut bytes)?;
+                std::fs::write(dir.join(format!("rank{rank}.{name}.bin")), bytes)?;
+            }
         }
         for (name, reference) in &stages {
             let mut bytes = vec![0; reference.len()];

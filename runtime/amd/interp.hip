@@ -334,6 +334,9 @@ extern "C" __device__ unsigned plow_dsa_prep_arm = 1;
 #include "op_qwen_gdn.h"
 #endif
 #include "op_moe.h"
+#if PLOW_QWEN_GDN
+#include "op_muse.h"
+#endif
 /* PLOW_MOE_PF_W8A8: the W8A8 block-FP8 arm of ops 85/86 (packet i[7] >= 2). A build axis the
  * packet's plow_config.h turns on, so an object built for any other packet is unchanged. */
 #ifndef PLOW_MOE_PF_W8A8
@@ -6063,10 +6066,12 @@ __device__ static void plow_exec(CInst in_v, unsigned slice, CTens T_v, plow_sme
             /* i6=n_group i7=topk_group (DeepSeek-V3 / Kimi K2 group-limited routing; 0 or 1
              * means flat top-k, which is every GLM/Qwen/Mixtral packet and is bit-identical
              * to before). */
+            /* f1 = logit scale applied before the score transform (Muse Spark's
+             * output_multiplier); 0 in every other packet, which the kernel reads as 1. */
             d_moe_router_topk((unsigned char*)TEN(0), (const bf16*)TEN(1),
                               (in->i[3] & 4u) ? (const float*)TEN(3) : nullptr, in->i[1], in->i[2],
                               in->i[3], in->fj[0].f, slice, nblk, (float*)sm->raw, in->i[6],
-                              in->i[7]);
+                              in->i[7], nullptr, 0, in->fj[1].f);
             break;
 #endif
 #if !PLOW_DECODE_INVENTORY_PRUNE || PLOW_HAS_MOE_EXPERT_GLU
@@ -6587,6 +6592,21 @@ __device__ static void plow_exec(CInst in_v, unsigned slice, CTens T_v, plow_sme
             d_qwen_gdn_gate_prep((float*)TEN(0), (float*)TEN(1), (const bf16*)TEN(2),
                                  (const bf16*)TEN(3), (const bf16*)TEN(4), (const bf16*)TEN(5),
                                  in->i[0], in->i[1], slice, nblk);
+            break;
+        /* Muse Spark (op_muse.h): built with the Qwen arms, checked by the same marker. */
+        case PLOW_DOP_MUSE_RMSNORM:
+            d_muse_rmsnorm((bf16*)TEN(0), (const bf16*)TEN(1), (const bf16*)TEN(2), in->i[0],
+                           in->i[1], in->i[2], in->fj[0].f, slice, nblk, sm->part);
+            break;
+        case PLOW_DOP_MUSE_RESIDUAL_GATE:
+            d_muse_residual_gate((bf16*)TEN(0), (const bf16*)TEN(1), (const bf16*)TEN(2),
+                                 (const bf16*)TEN(3), in->i[0], in->i[1], in->fj[0].f,
+                                 in->fj[1].f, slice, nblk);
+            break;
+        case PLOW_DOP_MUSE_MOE_COMBINE_NORM:
+            d_muse_moe_combine_norm((bf16*)TEN(0), (const float*)TEN(1),
+                                    (const unsigned char*)TEN(2), (const bf16*)TEN(3), in->i[0],
+                                    in->i[1], in->fj[0].f, slice, nblk, (float*)sm->raw);
             break;
 #endif
         case PLOW_DOP_ROPE_INVERSE_O:

@@ -209,7 +209,7 @@ const DOC: &[S] = &[
     S { op: DevOp::FlashMlaDecode, t: &["Opart", "mlpart", "Qabs", "Qrope", "Ckv", "Krope", "kv_len", "qr_cos?"], i: &["n_batch", "n_head", "kv_stride", "window", "nsplit", "kv_mask", "qr_sin", "gf"], f: &["scale"], j: &[] },
     S { op: DevOp::OUvFold, t: &["O", "Olat", "Wuv"], i: &["n_batch", "n_head", "V"], f: &[], j: &[] },
     S { op: DevOp::FlashGatherDecode, t: &["Opart", "mlpart", "Qabs", "Qrope", "Ckv", "Krope", "kv_len", "idx"], i: &["n_batch", "n_head", "kv_stride", "", "nsplit", "kv_mask", "top_k"], f: &["scale"], j: &[] },
-    S { op: DevOp::MoeRouterTopk, t: &["table", "logit", "", "bias"], i: &["", "n_exp", "k", "flags"], f: &["route_scale"], j: &[] },
+    S { op: DevOp::MoeRouterTopk, t: &["table", "logit", "", "bias"], i: &["", "n_exp", "k", "flags"], f: &["route_scale", "logit_scale?"], j: &[] },
     S { op: DevOp::MlaMergeFold, t: &["O", "Opart", "mlpart", "Wuv"], i: &["n_batch", "n_head", "V", "group", "nsplit", "native_fp32"], f: &[], j: &[] },
     S { op: DevOp::IndexScore, t: &["Score", "Qidx", "Kidx", "W", "kv_len"], i: &["n_batch", "index_heads", "kv_stride", "index_head_dim"], f: &["scale"], j: &[] },
     S { op: DevOp::IndexSelect, t: &["idx", "Score", "gHist", "gCtl", "kv_len"], i: &["len_max", "top_k", "pool_size", "batch_row", "local_rows"], f: &[], j: &[] },
@@ -339,6 +339,9 @@ const DOC: &[S] = &[
     S { op: DevOp::EngramEmbed, t: &["out", "table", "scale", "ids"], i: &["T", "n_cols", "head_dim", "blk", "vocab_start", "part_rows"], f: &[], j: &[] },
     S { op: DevOp::GemmFp8Mx, t: &["out", "x", "w", "scale"], i: &["T", "N", "K"], f: &[], j: &[] },
     S { op: DevOp::CompressRopeQuant, t: &["out", "src", "cosb", "sinb", "pos"], i: &["n_rows", "d", "rd", "qblk", "ratio", "row_base", "qmode", "n_head"], f: &[], j: &[] },
+    S { op: DevOp::MuseRmsNorm, t: &["out", "x", "w?"], i: &["rows", "dim", "mode"], f: &["eps"], j: &[] },
+    S { op: DevOp::MuseResidualGate, t: &["out", "res", "h", "g"], i: &["n", "rows"], f: &["T", "eps"], j: &[] },
+    S { op: DevOp::MuseMoeCombineNorm, t: &["out", "part", "table", "w"], i: &["H", "k"], f: &["eps"], j: &[] },
 ];
 
 /// Ops that say "As [`DevOp::X`]" / "twin of [`DevOp::X`]" / "Same operands as

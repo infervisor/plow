@@ -71,6 +71,7 @@ pub fn op_classes(op: DevOp) -> &'static [&'static str] {
         | MoeExpertGlu
         | MoeExpertDown
         | MoeCombine
+        | MuseMoeCombineNorm
         | MoeExpertGluFp8Blk
         | MoeExpertDownFp8Blk
         | MoeGroupGluFp8Blk
@@ -149,6 +150,7 @@ pub fn op_classes(op: DevOp) -> &'static [&'static str] {
         | GemvAffineQ4 => &["gemv"],
 
         RmsNorm | RowRms | NormResidual | AddNorm | NormResidualNorm | LayerNorm | QwenRmsNorm
+        | MuseRmsNorm
         | QwenGatedNorm | KdaGatedNorm | LayerNormF32 | RowStatsF32 | RmsNormF32
         // Engram's gate is two RMS reductions over `hidden` driving a gated residual add, so
         // its cost and its knob scope are a norm's, not the hc machinery's -- it mixes INTO the
@@ -190,7 +192,7 @@ pub fn op_classes(op: DevOp) -> &'static [&'static str] {
         | CastF32Bf16 | PerLayerInput | GluStrided | ScaledAddF32 | GluF32 | SiluF32 | ReluF32
         | BroadcastAddF32 | EmbedF16F32 | EmbedOverlayBf16 | EmbedPosBf16 | PackNcfwRowsF32
         | QuantFp8Block128 | GatherRowsF32 | CopyColsF32 | UnaryF32 | BinaryF32 | RandF32
-        | RopeAxialF32 | MmRowsBf16 | MmSpanExtent => &["elementwise"],
+        | RopeAxialF32 | MmRowsBf16 | MmSpanExtent | MuseResidualGate => &["elementwise"],
     }
 }
 

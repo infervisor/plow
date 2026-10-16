@@ -1520,6 +1520,16 @@ enum {
      * experts do NOT use it; they are MXFP4 on ops 85/86. */
     PLOW_DOP_GEMM_FP8_MX = 216,
     PLOW_DOP_COMPRESS_ROPE_QUANT = 217,
+    /* Muse Spark (op_muse.h). Row RMSNorm: t0=out t1=x t2=w? i0=rows i1=dim i2=mode
+     * (0 x*r*w | 1 centered x*r*(1+w) | 2 input-scaled y=bf16(x*(1+w)), y*r(y)) f0=eps. */
+    PLOW_DOP_MUSE_RMSNORM = 218,
+    /* out = bf16(alpha*res + beta*h), beta = sigmoid(g/T), alpha = sqrt(max(sigmoid(-g/T)*(1+beta),
+     * eps)). t0=out t1=res t2=h t3=g(bf16[n]) i0=n i1=rows f0=T f1=eps. */
+    PLOW_DOP_MUSE_RESIDUAL_GATE = 219,
+    /* out[h] = sum_j gate_j * norm_is(bf16(part[j][h] / gate_j)), the input-scaled post-expert
+     * norm before the weighted combine. t0=out(bf16[H]) t1=part(f32[k][H]) t2=table t3=w(bf16[H])
+     * i0=H i1=k f0=eps. One token. */
+    PLOW_DOP_MUSE_MOE_COMBINE_NORM = 220,
 
     PLOW_DOP__COUNT
 };
