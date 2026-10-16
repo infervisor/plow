@@ -29,16 +29,16 @@ interpreter's indexer score/select/union chain adds ~4.2 ms per MLA layer per 8k
 
 ## Qualified wins
 
-Two qualified serving wins on the consolidated v23 build ([comparison.md](comparison.md), [comparison.csv](comparison.csv)):
-- `isl4096-g8`: **15,346.7 tok/s** vs vLLM 14,650.4 tok/s (**1.048x win**, +4.8% throughput; TTFT P99 1,141.5 ms vs 2,290.6 ms, 2.0x faster).
-- `isl1024-g8`: **5,554.7 tok/s** vs vLLM 5,255.7 tok/s (**1.057x win**, +5.7% throughput; TTFT P99 361.0 ms vs 1,764.9 ms, 4.9x faster).
+Two qualified serving wins on the consolidated v28 build ([comparison.md](comparison.md), [comparison.csv](comparison.csv)):
+- `isl4096-g8`: **18,029.0 tok/s** vs vLLM 14,650.4 tok/s (**1.231x win**, +23.1% throughput; TTFT P99 740.9 ms vs 2,290.6 ms, 3.1x faster; TPOT P99 13.86 ms vs 25.48 ms, 1.8x faster).
+- `isl1024-g8`: **6,115.8 tok/s** vs vLLM 5,255.7 tok/s (**1.164x win**, +16.4% throughput; TTFT P99 383.2 ms vs 1,764.9 ms, 4.6x faster; TPOT P99 11.28 ms vs 19.29 ms, 1.7x faster).
 
 Prior v20 throughput was 0.68-0.94x vLLM's:
 
 | isl | c1 | c8 | c32 | c64 | c128 |
 |---|---|---|---|---|---|
-| 1024 | 0.85 | 1.06 (v23) | 0.71 | 0.70 | 0.80 (v23) |
-| 4096 | 0.89 (v23) | 1.05 (v23) | 0.77 | 0.82 (v23) | 0.80 (v23) |
+| 1024 | 0.89 (v28) | 1.16 (v28) | 0.86 (v28) | 0.78 (v28) | 0.76 (v28) |
+| 4096 | 0.90 (v28) | 1.23 (v28) | 0.89 (v28) | 0.84 (v28) | 0.82 (v28) |
 | 16384 | 0.87 (v23) | 0.91 (v23) | 0.89 (v23) | 0.80 | 0.77 (v23) |
 | 32768 | 0.83 | 0.79 | | | |
 | 61440 | 0.76 | 0.68 | | | |
