@@ -8,8 +8,7 @@
 //! turns), `SIM_MARGIN` (admission rows past prompt + output), `SIM_GROW` (map output rows as decode
 //! reaches them, preempting on failure), `SIM_RING_DECODE` (ring rows a slot keeps after its
 //! prefill: 1024 = paged sliding rings), and `SIM_SCALE` with `SIM_UNMAP_US` / `SIM_RELEASE_US` to
-//! pace the reclaimer thread in real time instead of draining it per call. `SIM_POLICY_LEGACY=1`
-//! runs the flag/tier policy AMD's shared prefix uses. The scripted cells below (`cell_*`) drive the same engine logic over a small
+//! pace the reclaimer thread in real time instead of draining it per call. The scripted cells below (`cell_*`) drive the same engine logic over a small
 //! pool and run as ordinary tests.
 use super::*;
 use std::collections::{HashMap, VecDeque};
@@ -327,9 +326,6 @@ fn vmm_sim_agentic() {
         kv.enable_strict_publish();
     }
     kv.enable_pressure_eviction(floor);
-    if env_u64("SIM_POLICY_LEGACY", 0) == 1 {
-        kv.set_policy(Policy::Legacy);
-    }
     let k = Kv {
         kv,
         ring: 2048,
@@ -626,20 +622,13 @@ const RIG_TTL: std::time::Duration = std::time::Duration::from_secs(60);
 impl Rig {
     /// `cap`: device bytes; `gran`: VMM granularity (block = gran / 8 rows at hd 4 x 2 B);
     /// `uniform`: no sliding layers (a stub snapshot per boundary).
-    fn new(policy: Policy, uniform: bool, cap: u64, gran: u64, batch: u32) -> Rig {
-        Self::new_with(policy, uniform, cap, gran, batch, true)
+    fn new(uniform: bool, cap: u64, gran: u64, batch: u32) -> Rig {
+        Self::new_with(uniform, cap, gran, batch, true)
     }
 
     /// `strict`: FP8 KV's strict publish (`resolve_prefix_hazard`), the production pool's
     /// mode; `false` models a BF16-KV geometry.
-    fn new_with(
-        policy: Policy,
-        uniform: bool,
-        cap: u64,
-        gran: u64,
-        batch: u32,
-        strict: bool,
-    ) -> Rig {
+    fn new_with(uniform: bool, cap: u64, gran: u64, batch: u32, strict: bool) -> Rig {
         let geo = VmmGeometry {
             full_layers: vec![3],
             kvh_full: 1,
@@ -662,7 +651,6 @@ impl Rig {
             gran,
         });
         let mut kv = VmmKv::new(ops, geo, gran, 0).expect("pool");
-        kv.set_policy(policy);
         kv.enable_pressure_eviction(1);
         if strict {
             kv.enable_strict_publish();
@@ -689,10 +677,7 @@ impl Rig {
     }
 
     fn check(&self) {
-        let inner = self.k.kv.shared.inner.lock();
-        if inner.policy == Policy::Tree {
-            policy::check_tree(&inner);
-        }
+        policy::check_tree(&self.k.kv.shared.inner.lock());
     }
 
     /// `GpuEngine::admit_packed_slot` without the wait: attach, map, return the attached rows.
@@ -872,7 +857,7 @@ fn conv_prompt(c: u32, sys: usize, first: usize) -> Vec<u32> {
 #[test]
 fn cell_no_session_conversation_keeps_one_boundary() {
     for uniform in [false, true] {
-        let mut r = Rig::new(Policy::Tree, uniform, 1 << 20, 64, 2);
+        let mut r = Rig::new(uniform, 1 << 20, 64, 2);
         let mut p = conv_prompt(1, 40, 200);
         let (rows, mut reply) = r.turn(0, &p, 30);
         assert_eq!(rows, 0);
@@ -905,7 +890,7 @@ fn cell_host_tier_keeps_prompt_ends_the_device_cannot() {
         // 16 KiB snapshots (64 rows x 256 B) against 128 B columns (two 64 B blocks): the
         // device holds every conversation's blocks (~80 KiB at the last turn, plus two live
         // windows) and about four prompt ends.
-        let mut r = Rig::new(Policy::Tree, false, 176 << 10, 64, 2);
+        let mut r = Rig::new(false, 176 << 10, 64, 2);
         r.k.snap_row = 256;
         if host {
             r.k.kv.enable_host_tier(1 << 20, 16_500).unwrap();
@@ -954,7 +939,7 @@ fn cell_host_tier_keeps_prompt_ends_the_device_cannot() {
 /// without one (no protection, no output publish, one boundary per conversation).
 #[test]
 fn cell_session_ttl_zero_is_no_session() {
-    let mut r = Rig::new(Policy::Tree, false, 1 << 20, 64, 2);
+    let mut r = Rig::new(false, 1 << 20, 64, 2);
     let mut p = conv_prompt(2, 40, 200);
     let (_, mut reply) = r.turn_session(0, &p, 30, 0);
     for t in 1..4 {
@@ -977,7 +962,7 @@ fn cell_session_boundary_is_protected_within_ttl() {
     // About eight prompt ends fit (16 KiB snapshots, 128 B columns): fourteen evict.
     const CONVS: u32 = 14;
     let run = |ttl_ms: u64| {
-        let mut r = Rig::new(Policy::Tree, false, 176 << 10, 64, 2);
+        let mut r = Rig::new(false, 176 << 10, 64, 2);
         r.k.snap_row = 256;
         let p0 = conv_prompt(0, 0, 240);
         let (_, reply0) = r.turn_session(0, &p0, 30, ttl_ms);
@@ -1014,7 +999,7 @@ fn cell_session_boundary_is_protected_within_ttl() {
 /// and the session's next turn attaches the surviving ancestor.
 #[test]
 fn cell_session_demoted_after_ttl() {
-    let mut r = Rig::new(Policy::Tree, false, 1 << 20, 64, 2);
+    let mut r = Rig::new(false, 1 << 20, 64, 2);
     let first = r.shared_pair(&conv_prompt(40, 288, 120), &conv_prompt(41, 288, 120), 20);
     assert!(first >= 256);
     let ps = conv_prompt(42, 288, 120);
@@ -1057,7 +1042,7 @@ fn cell_session_demoted_after_ttl() {
 /// that request lets go, and then with its private suffix.
 #[test]
 fn cell_session_demotion_waits_for_a_live_mapping() {
-    let mut r = Rig::new(Policy::Tree, false, 1 << 20, 64, 2);
+    let mut r = Rig::new(false, 1 << 20, 64, 2);
     let p = conv_prompt(70, 40, 200);
     r.turn_session(0, &p, 30, 20);
     let blocks = r.kv().stats().cache_blocks;
@@ -1081,7 +1066,7 @@ fn cell_session_demotion_waits_for_a_live_mapping() {
 /// An attach by the session's next turn refreshes the boundary's TTL.
 #[test]
 fn cell_session_attach_refreshes_ttl() {
-    let mut r = Rig::new(Policy::Tree, false, 1 << 20, 64, 2);
+    let mut r = Rig::new(false, 1 << 20, 64, 2);
     let p1 = conv_prompt(50, 40, 200);
     let (_, reply) = r.turn_session(0, &p1, 30, 80);
     std::thread::sleep(std::time::Duration::from_millis(50));
@@ -1113,7 +1098,7 @@ fn cell_session_attach_refreshes_ttl() {
 /// supersedes the last) and every turn attaches it.
 #[test]
 fn cell_session_conversation_keeps_one_protected_boundary() {
-    let mut r = Rig::new(Policy::Tree, false, 1 << 20, 64, 2);
+    let mut r = Rig::new(false, 1 << 20, 64, 2);
     let mut p = conv_prompt(60, 40, 200);
     let (_, mut reply) = r.turn_session(0, &p, 30, 60_000);
     for t in 1..5u32 {
@@ -1139,7 +1124,7 @@ fn cell_parallel_pair_on_one_history() {
         let at = format!("via_inflight={via_inflight} diverge={diverge}");
         // 512-row blocks: as in production (4096-row blocks, 5.7K prompts) both prompt ends and
         // the shared end sit in one block, so strict publish lets either request publish it.
-        let mut r = Rig::new(Policy::Tree, false, 1 << 20, 4096, 3);
+        let mut r = Rig::new(false, 1 << 20, 4096, 3);
         let p1 = conv_prompt(3, 40, 520);
         let (_, reply) = r.turn(0, &p1, 30);
         // 834 rows: the shared end (833 / 32 * 32 = 832) lies past the 830 rows the next
@@ -1230,7 +1215,7 @@ fn cell_parallel_pair_on_one_history() {
 /// keeps D's pending continuation and is not retired behind C, so D's next turn attaches B.
 #[test]
 fn cell_parallel_pair_second_request_keeps_its_attach_point_under_strict_publish() {
-    let mut r = Rig::new(Policy::Tree, false, 1 << 20, 64, 3);
+    let mut r = Rig::new(false, 1 << 20, 64, 3);
     let p1 = conv_prompt(7, 40, 150);
     let (_, reply) = r.turn(0, &p1, 30);
     let b_rows = (p1.len() as u32 - 9) / 32 * 32;
@@ -1254,7 +1239,7 @@ fn cell_parallel_pair_second_request_keeps_its_attach_point_under_strict_publish
 /// wrong attach, and the cache stays bounded.
 #[test]
 fn cell_retry_and_regenerate() {
-    let mut r = Rig::new_with(Policy::Tree, false, 1 << 20, 64, 2, false);
+    let mut r = Rig::new_with(false, 1 << 20, 64, 2, false);
     let p1 = conv_prompt(4, 40, 200);
     let (_, r1) = r.turn(0, &p1, 30);
     let p2 = next_prompt(&p1, &r1, 4, 100, 90_000);
@@ -1294,7 +1279,7 @@ fn cell_retry_and_regenerate() {
 /// and the regenerate's next turn misses again. Pre-existing, policy-independent.
 #[test]
 fn cell_regenerate_under_strict_publish_gets_no_boundary() {
-    let mut r = Rig::new(Policy::Tree, false, 1 << 20, 64, 2);
+    let mut r = Rig::new(false, 1 << 20, 64, 2);
     let p1 = conv_prompt(4, 40, 200);
     let (_, r1) = r.turn(0, &p1, 30);
     let p2 = next_prompt(&p1, &r1, 4, 100, 90_000);
@@ -1309,43 +1294,33 @@ fn cell_regenerate_under_strict_publish_gets_no_boundary() {
 /// prompt whose end is not 32-aligned leaves a whole shared block past the shared end, which
 /// strict publish then refuses; production's 2048-row blocks cannot) under a cap of ~6
 /// snapshots: the shared
-/// end is attached by every new conversation (LRU refresh) and survives; under legacy it is
-/// kept by the share tier.
+/// end is attached by every new conversation (LRU refresh) and survives.
 #[test]
 fn cell_shared_system_prompt_under_pressure() {
-    for policy in [Policy::Tree, Policy::Legacy] {
-        // The shared 300 rows (37 columns of 128 B), two live windows' private rows and
-        // about six idle conversations' private rows (15 columns + a snapshot each).
-        let cap = 16 << 10;
-        let mut r = Rig::new(policy, false, cap, 64, 2);
-        let first = r.shared_pair(&conv_prompt(10, 288, 120), &conv_prompt(11, 288, 120), 20);
-        assert!(first >= 256, "{policy:?}: the pair's shared end: {first}");
-        let mut hits = 1;
-        for c in 2..20u32 {
-            let p = conv_prompt(10 + c, 288, 120);
-            let (rows, _) = r.turn((c % 2) as usize, &p, 20);
-            assert!(
-                rows >= 256,
-                "conversation {c} ({policy:?}): attached {rows} rows"
-            );
-            hits += 1;
-        }
-        assert_eq!(hits, 19);
-        let s = r.kv().stats();
-        assert_eq!(s.attach_shared, 19, "{policy:?}");
-        assert!(
-            s.snapshots_live <= 9,
-            "{policy:?}: {} live",
-            s.snapshots_live
-        );
+    // The shared 300 rows (37 columns of 128 B), two live windows' private rows and
+    // about six idle conversations' private rows (15 columns + a snapshot each).
+    let cap = 16 << 10;
+    let mut r = Rig::new(false, cap, 64, 2);
+    let first = r.shared_pair(&conv_prompt(10, 288, 120), &conv_prompt(11, 288, 120), 20);
+    assert!(first >= 256, "the pair's shared end: {first}");
+    let mut hits = 1;
+    for c in 2..20u32 {
+        let p = conv_prompt(10 + c, 288, 120);
+        let (rows, _) = r.turn((c % 2) as usize, &p, 20);
+        assert!(rows >= 256, "conversation {c}: attached {rows} rows");
+        hits += 1;
     }
+    assert_eq!(hits, 19);
+    let s = r.kv().stats();
+    assert_eq!(s.attach_shared, 19);
+    assert!(s.snapshots_live <= 9, "{} live", s.snapshots_live);
 }
 
 /// A waiter's reservation survives pressure: the checkpoint it waits for is never the LRU
 /// victim while the wait lasts, and is evictable once the wait ends (attach or cancel).
 #[test]
 fn cell_waiter_reservation_survives_pressure() {
-    let mut r = Rig::new(Policy::Tree, true, 1 << 20, 64, 3);
+    let mut r = Rig::new(true, 1 << 20, 64, 3);
     r.chunk = 32;
     let base: Vec<u32> = (0..200).collect();
     let (_, _) = r.turn(0, &base, 10); // boundary at (200-9)/32*32 = 160
@@ -1396,7 +1371,7 @@ fn cell_waiter_reservation_survives_pressure() {
 /// and retires with it (D remains the attach point; C's chain recomputes from nothing).
 #[test]
 fn cell_branch_point_retires_when_one_child_is_left() {
-    let mut r = Rig::new_with(Policy::Tree, true, 1 << 20, 64, 3, false);
+    let mut r = Rig::new_with(true, 1 << 20, 64, 3, false);
     let p1 = conv_prompt(5, 40, 200);
     let (_, r1) = r.turn(0, &p1, 30);
     let b_rows = (p1.len() as u32 - 9) / 32 * 32;
@@ -1452,7 +1427,7 @@ fn cell_branch_point_retires_when_one_child_is_left() {
 /// continuations: the first keeps it, the second retires it.
 #[test]
 fn cell_shared_end_is_structurally_exempt_prompt_end_is_not() {
-    let mut r = Rig::new(Policy::Tree, true, 1 << 20, 64, 2);
+    let mut r = Rig::new(true, 1 << 20, 64, 2);
     let a = conv_prompt(20, 288, 100);
     let b = conv_prompt(21, 288, 100);
     let rows_b = r.shared_pair(&a, &b, 10);
@@ -1494,7 +1469,7 @@ fn cell_shared_end_is_structurally_exempt_prompt_end_is_not() {
 /// turn-end touch refresh it and its ancestors.
 #[test]
 fn cell_recency_moves_on_attach_and_touch_only() {
-    let mut r = Rig::new(Policy::Tree, true, 1 << 20, 64, 2);
+    let mut r = Rig::new(true, 1 << 20, 64, 2);
     let a = conv_prompt(30, 288, 100);
     let b = conv_prompt(31, 288, 100);
     r.shared_pair(&a, &b, 10);
@@ -1535,7 +1510,7 @@ fn cell_recency_moves_on_attach_and_touch_only() {
 /// this.
 #[test]
 fn cell_strict_publish_refuses_a_sequential_shared_end() {
-    let mut r = Rig::new(Policy::Tree, true, 1 << 20, 64, 2);
+    let mut r = Rig::new(true, 1 << 20, 64, 2);
     let a = conv_prompt(60, 288, 100);
     let b = conv_prompt(61, 288, 100);
     r.turn(0, &a, 10);
@@ -1582,7 +1557,7 @@ fn cell_sliding_only_geometry_is_refused_explicitly() {
 /// (pressure) restores it at the turn end; a surviving one is only touched (no copy).
 #[test]
 fn cell_turn_end_restores_an_evicted_prompt_end() {
-    let mut r = Rig::new(Policy::Tree, false, 1 << 20, 64, 2);
+    let mut r = Rig::new(false, 1 << 20, 64, 2);
     let p = conv_prompt(40, 40, 200);
     let rows = r.admit(0, &p);
     assert_eq!(rows, 0);

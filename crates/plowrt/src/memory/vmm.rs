@@ -1154,15 +1154,6 @@ struct BoundaryKey {
     id: u64,
 }
 
-/// Which retention policy the pool runs: the boundary tree with one LRU (`Tree`, the CUDA
-/// engine) or the flag/tier policy of release 0.1.2 (`Legacy`, AMD's shared prefix).
-/// Mechanism (radix blocks, snapshots, copies, reclaim) is shared.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum Policy {
-    Tree,
-    Legacy,
-}
-
 /// What a boundary was published as (a bit set: a dedup ORs the publisher's kind in).
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 pub struct Kind(u8);
@@ -1170,7 +1161,9 @@ pub struct Kind(u8);
 impl Kind {
     /// The last rows of a prompt: the conversation's next-turn attach point.
     pub const PROMPT_END: Kind = Kind(1);
-    /// Where a prompt stops sharing a recent or in-flight prompt (a system prompt).
+    /// Where a prompt stops sharing a recent or in-flight prompt (a system prompt), or (AMD's
+    /// shared prefix) a completed chunk boundary below the prompt end that other suffixes may
+    /// attach to. Never retired structurally: it survives by LRU refresh alone.
     pub const SHARED_END: Kind = Kind(2);
     /// A whole-block or chunk-end checkpoint inside a prompt (an in-flight waiter's target).
     pub const CHECKPOINT: Kind = Kind(4);
@@ -1368,7 +1361,7 @@ struct Snap {
     protect_until: Option<std::time::Instant>,
     /// A spill whose fence failed: the device buffer is valid but never freed, never spilled.
     quarantined: bool,
-    /// Boundary tree ([`Policy::Tree`]): the longest retained boundary strictly below `rows`
+    /// Boundary tree: the longest retained boundary strictly below `rows`
     /// on this chain when this one was published, and the retained boundaries whose canonical
     /// parent this one is. Unlinked synchronously by every free (`unlink_snapshot`).
     parent: Option<u64>,
@@ -1377,8 +1370,6 @@ struct Snap {
     reusable_prompt: bool,
     /// Attaches served; a session's own boundary is attached at most once (its next turn).
     attaches: u32,
-    /// Published by a session's sequence ([`VmmKv::note_session`]).
-    session: bool,
     /// The publishing sequence's prompt rows: `rows >= prompt_rows` is a turn end.
     prompt_rows: u32,
     /// Published at a prompt's shared-prefix end ([`VmmKv::share_rows`]): seen on two prompts.
@@ -1468,11 +1459,8 @@ struct Inner {
     next_snap_id: u64,
     /// Last [`demote_expired`] sweep: at most one per [`SESSION_SWEEP`].
     session_sweep: Option<std::time::Instant>,
-    policy: Policy,
     /// [`VmmKv::enable_host_tier`]: `None` = evicted snapshots are freed.
     host: Option<HostTier>,
-    /// `seq` holds a session ([`VmmKv::note_session`]) until its next `begin_seq`.
-    session: Vec<bool>,
     /// Recent prompt heads ([`note_share`]).
     recent: std::collections::VecDeque<Box<[u32]>>,
     /// Per seq: where its prompt stops matching a recent prompt ([`VmmKv::share_rows`]).
@@ -1755,9 +1743,7 @@ impl VmmKv {
                 by_id: FxHashMap::default(),
                 next_snap_id: 0,
                 session_sweep: None,
-                policy: Policy::Tree,
                 host: None,
-                session: vec![false; batch],
                 recent: std::collections::VecDeque::new(),
                 share: vec![0; batch],
                 release_queued: 0,
@@ -1952,19 +1938,13 @@ impl VmmKv {
     /// prefetch`). The tier is the second level of the boundary tree's LRU: a device eviction
     /// spills, a full tier drops its least recently used host snapshot. Every pinned chunk is
     /// allocated here, at bring-up (the first proves the backend has a host tier; a failed
-    /// one caps the tier); the background thread only restores prefetches. Off by default;
-    /// `Policy::Tree` only.
+    /// one caps the tier); the background thread only restores prefetches. Off by default.
     pub fn enable_host_tier(&mut self, cap_bytes: u64, slot_bytes: u64) -> Result<()> {
         let s = &self.shared;
         let cap_slots = u32::try_from(cap_bytes / slot_bytes.max(1)).unwrap_or(u32::MAX);
         if slot_bytes == 0 || cap_slots == 0 {
             return Err(RuntimeError::Rejected(
                 "vmm: host tier smaller than one snapshot".into(),
-            ));
-        }
-        if self.policy() != Policy::Tree {
-            return Err(RuntimeError::Rejected(
-                "vmm: host tier needs the tree policy".into(),
             ));
         }
         let chunk_slots = u32::try_from((HOST_CHUNK_BYTES / slot_bytes).max(1))
@@ -2123,16 +2103,6 @@ impl VmmKv {
     /// `PLOW_VMM_PUBLISH_SHARED`.
     pub fn enable_shared_publish(&mut self) {
         self.shared_publish = true;
-    }
-
-    /// Run the flag/tier retention policy of release 0.1.2 instead of the boundary tree (AMD's
-    /// shared prefix). Set once at bringup.
-    pub fn set_policy(&mut self, policy: Policy) {
-        self.shared.inner.lock().policy = policy;
-    }
-
-    pub fn policy(&self) -> Policy {
-        self.shared.inner.lock().policy
     }
 
     /// A request waits in [`Self::inflight_prefix`] for the boundary at `tokens[..rows]`.
@@ -2295,7 +2265,6 @@ impl VmmKv {
         // A request that ended without continuing its attach keeps its `pending` on the
         // boundary (never retired behind a sibling; LRU takes it).
         inner.seqs[seq].lineage = None;
-        inner.session[seq] = false;
         inner.share[seq] = 0;
         let before = inner.stats;
         let t0 = std::time::Instant::now();
@@ -2803,9 +2772,6 @@ impl VmmKv {
             return;
         }
         let mut inner = self.shared.inner.lock();
-        if inner.policy != Policy::Tree {
-            return;
-        }
         inner.seqs[seq].session_ttl = Some(ttl);
         if let Some(id) = inner.seqs[seq].attached {
             if let Some(snap) = snap_mut(&mut inner, id).filter(|s| s.kind.has(Kind::PROMPT_END)) {
@@ -2906,7 +2872,7 @@ impl VmmKv {
             // Boundary tree: a prompt identical to the owner's up to its last row is the same
             // history (a parallel pair, a retry): the owner's prompt end serves it, so no
             // shared end is named (a window copy no later turn could match; 2026-10-14).
-            let same_history = inner.policy == Policy::Tree && raw >= owner_rows;
+            let same_history = raw >= owner_rows;
             let common = raw / 32 * 32;
             let share = match inner.share[owner] as usize {
                 0 => common,
@@ -3037,9 +3003,7 @@ impl VmmKv {
         continue_lineage(&mut inner, seq, id, parent);
         let superseded = note_end(&mut inner, seq, id, kind);
         protect(&mut inner, seq, id, kind);
-        if let Some(l) = lineage.filter(|&l| {
-            l != id && inner.policy == Policy::Tree && inner.seqs[seq].lineage.is_none()
-        }) {
+        if let Some(l) = lineage.filter(|&l| l != id && inner.seqs[seq].lineage.is_none()) {
             policy::try_retire(s, &mut inner, l);
         }
         if let Some(a) = superseded {
@@ -3074,7 +3038,7 @@ impl VmmKv {
                 // used: it is the conversation's next-turn attach point (a first conversation on
                 // a fresh server, or one whose lead is unique, missed its whole turn 2), and an
                 // unique one-shot prompt's copy is the first thing eviction takes.
-                if inner.policy != Policy::Tree || !kind.has(Kind::PROMPT_END) {
+                if !kind.has(Kind::PROMPT_END) {
                     inner.stats.publishes_skipped += 1;
                     return Ok(());
                 }
@@ -3367,7 +3331,6 @@ impl VmmKv {
                     referenced: false,
                     reusable_prompt: false,
                     attaches: 0,
-                    session: false,
                     prompt_rows: 0,
                     share: false,
                 });
@@ -3664,7 +3627,6 @@ fn hot(tick: u64, snap: &Snap) -> bool {
 /// (32-row aligned): a system prompt seen by two sequences ends there. The engine
 /// publishes that boundary while prefill passes it, so later sequences attach to it.
 fn note_share(inner: &mut Inner, seq: usize, prompt: &[u32], attached: u32) {
-    let tree = inner.policy == Policy::Tree;
     let common = inner
         .recent
         .iter()
@@ -3677,7 +3639,7 @@ fn note_share(inner: &mut Inner, seq: usize, prompt: &[u32], attached: u32) {
         // Boundary tree: a recent prompt matched to its end (the same history, or a truncated
         // copy of it) or one this prompt is a prefix of showed no divergence: its prompt end
         // serves this prompt, a shared end there would be a window copy no later turn matches.
-        .filter(|&(c, len)| !tree || (c < len && c < prompt.len()))
+        .filter(|&(c, len)| c < len && c < prompt.len())
         .map(|(c, _)| c)
         .max()
         .unwrap_or(0);
@@ -3771,9 +3733,7 @@ fn publish_locked(
         rows => rows,
     };
     let reusable_prompt = (rows as usize) < prompt_rows;
-    // A shared-prefix end is not the session's own boundary: `retire_superseded` keeps it.
     let share = rows == inner.share[seq];
-    let session = inner.session[seq] && !share;
     let tail = &tokens[n_pub * s.block_rows as usize..rows as usize];
 
     let m = inner.cache.lookup(&hashes, tokens);
@@ -3781,11 +3741,7 @@ fn publish_locked(
     // `rows` on this chain (the same walk `try_attach` does), not whatever this sequence
     // happened to attach, so an identical boundary published from two attach points has one
     // parent.
-    let parent = if inner.policy == Policy::Tree {
-        policy::canonical_parent(inner, &m, tokens, rows, s.block_rows)
-    } else {
-        None
-    };
+    let parent = policy::canonical_parent(inner, &m, tokens, rows, s.block_rows);
     // Scale/KV consistency hazard: if the lookup finds MORE pre-existing whole blocks than
     // this sequence itself is currently attached to (`held`, unmodified since the `try_attach`
     // that started this request), those extra blocks came from some OTHER publish — a
@@ -3813,25 +3769,23 @@ fn publish_locked(
         }
         // The same boundary published from the blocks this one would have aliased (the other
         // request of a same-history pair) is this request's continuation all the same.
-        if inner.policy == Policy::Tree {
-            let chain = chain_hash(&tokens[..rows as usize]);
-            let twin = inner
-                .published
-                .values()
-                .flatten()
-                .find(|snap| snap.rows == rows && snap.chain == chain)
-                .map(|snap| (snap.id, snap.parent));
-            if let Some((id, parent)) = twin {
-                let lineage = inner.seqs[seq].lineage;
-                continue_lineage(inner, seq, id, parent);
-                let superseded = note_end(inner, seq, id, kind);
-                protect(inner, seq, id, kind);
-                if let Some(l) = lineage.filter(|_| inner.seqs[seq].lineage.is_none()) {
-                    policy::try_retire(s, inner, l);
-                }
-                if let Some(a) = superseded {
-                    policy::try_retire(s, inner, a);
-                }
+        let chain = chain_hash(&tokens[..rows as usize]);
+        let twin = inner
+            .published
+            .values()
+            .flatten()
+            .find(|snap| snap.rows == rows && snap.chain == chain)
+            .map(|snap| (snap.id, snap.parent));
+        if let Some((id, parent)) = twin {
+            let lineage = inner.seqs[seq].lineage;
+            continue_lineage(inner, seq, id, parent);
+            let superseded = note_end(inner, seq, id, kind);
+            protect(inner, seq, id, kind);
+            if let Some(l) = lineage.filter(|_| inner.seqs[seq].lineage.is_none()) {
+                policy::try_retire(s, inner, l);
+            }
+            if let Some(a) = superseded {
+                policy::try_retire(s, inner, a);
             }
         }
         return Ok(PublishLocked::Done {
@@ -3923,11 +3877,8 @@ fn publish_locked(
             list.iter_mut()
                 .find(|snap| snap.rows == rows && snap.tail == tail)
         }) {
-        // The tree refreshes recency on consumer demand only (an attach, the turn-end touch):
-        // a republish of an identical boundary proves nothing about its next use.
-        if inner.policy == Policy::Legacy {
-            snap.last_used = tick;
-        }
+        // Recency refreshes on consumer demand only (an attach, the turn-end touch): a
+        // republish of an identical boundary proves nothing about its next use.
         snap.kind |= kind;
         snap.reusable_prompt |= reusable_prompt;
         snap.share |= share;
@@ -3973,7 +3924,6 @@ fn publish_locked(
             // before it and attaches to the prompt-end boundary instead.
             reusable_prompt,
             attaches: 0,
-            session,
             prompt_rows: prompt_rows as u32,
             share,
         });
@@ -3992,16 +3942,12 @@ fn publish_locked(
         }
         (id, None)
     };
-    let mut superseded = None;
-    let mut continued = None;
-    if inner.policy == Policy::Tree {
-        policy::link(inner, id, parent);
-        let lineage = inner.seqs[seq].lineage;
-        continue_lineage(inner, seq, id, parent);
-        continued = lineage.filter(|&l| l != id && inner.seqs[seq].lineage.is_none());
-        superseded = note_end(inner, seq, id, kind);
-        protect(inner, seq, id, kind);
-    }
+    policy::link(inner, id, parent);
+    let lineage = inner.seqs[seq].lineage;
+    continue_lineage(inner, seq, id, parent);
+    let continued = lineage.filter(|&l| l != id && inner.seqs[seq].lineage.is_none());
+    let superseded = note_end(inner, seq, id, kind);
+    protect(inner, seq, id, kind);
     if cold {
         trim_cache_cold(s, inner);
     } else {
@@ -4009,13 +3955,13 @@ fn publish_locked(
     }
     // Retire the superseded parent only behind a boundary that survived its own trim: the
     // superseded one is otherwise the chain's only attach point.
-    if inner.policy == Policy::Tree && inner.by_id.contains_key(&id) {
+    if inner.by_id.contains_key(&id) {
         policy::retire_parent_of(s, inner, id);
         for a in [superseded, continued].into_iter().flatten() {
             policy::try_retire(s, inner, a);
         }
     }
-    if let Some(held) = unheld.filter(|_| inner.policy == Policy::Tree) {
+    if let Some(held) = unheld {
         if inner.by_id.contains_key(&held) {
             policy::try_retire(s, inner, held);
         }
@@ -4642,10 +4588,7 @@ fn demote_expired(s: &Shared, inner: &mut Inner) {
 /// attached). Returns that ancestor when no prompt end is left on it, for the
 /// single-continuation rule (the caller applies it when `id` is safe).
 fn note_end(inner: &mut Inner, seq: usize, id: u64, kind: Kind) -> Option<u64> {
-    if inner.policy != Policy::Tree
-        || !kind.has(Kind::PROMPT_END)
-        || inner.seqs[seq].ended == Some(id)
-    {
+    if !kind.has(Kind::PROMPT_END) || inner.seqs[seq].ended == Some(id) {
         return None;
     }
     let snap = snap_mut(inner, id)?;
@@ -4675,9 +4618,7 @@ fn drop_snapshot_hold(inner: &mut Inner, seq: usize) -> Option<u64> {
 
 fn release_snapshot_hold(s: &Shared, inner: &mut Inner, seq: usize) {
     if let Some(id) = drop_snapshot_hold(inner, seq) {
-        if inner.policy == Policy::Tree {
-            policy::try_retire(s, inner, id);
-        }
+        policy::try_retire(s, inner, id);
     }
     // The fine-chain counterpart: like the snapshot hold above (not like the native radix
     // `held`/`hashes` below, which `release_prefix_hold` keeps for the whole request because
@@ -5208,10 +5149,8 @@ fn evict_dead_leaf(s: &Shared, inner: &mut Inner) -> bool {
     true
 }
 
-/// Suffix-first: dead blocks, then output-only snapshots, then the least-recently-used
-/// unshared boundary together with the suffix blocks only it made attachable (back to the
-/// previous usable boundary), shared boundaries last, then whole LRU entries. `false` when
-/// pinned.
+/// Fine chunks, then dead blocks, then the boundary tree's one LRU
+/// ([`policy::evict_one_tree`]). `false` when pinned.
 fn evict_one(s: &Shared, inner: &mut Inner, preserve_hot: bool) -> bool {
     cache_changed(s);
     if evict_one_fine(s, inner) {
@@ -5220,152 +5159,7 @@ fn evict_one(s: &Shared, inner: &mut Inner, preserve_hot: bool) -> bool {
     if evict_dead_leaf(s, inner) {
         return true;
     }
-    if inner.policy == Policy::Tree {
-        return policy::evict_one_tree(s, inner, preserve_hot);
-    }
-    let awaited = inner.awaited.clone();
-    let tick = inner.snapshot_tick;
-    // Output-only boundaries cannot replay the original prompt. Reclaim them
-    // before removing prompt snapshots or the KV blocks those snapshots need.
-    if let Some((node, index)) = inner
-        .published
-        .iter()
-        .flat_map(|(&node, snaps)| {
-            snaps
-                .iter()
-                .enumerate()
-                .map(move |(i, snap)| (node, i, snap))
-        })
-        .filter(|(_, _, snap)| {
-            snap.users == 0 && !snap.reusable_prompt && !snap_awaited(&awaited, snap)
-        })
-        .min_by_key(|(_, _, snap)| snap.last_used)
-        .map(|(node, index, _)| (node, index))
-    {
-        remove_snapshot(s, inner, node, index);
-        return true;
-    }
-    // A radix lease protects shared KV, but snapshots are only needed while
-    // restoring an attachment. Protect the most recently reused snapshot
-    // against unique-tail bursts, while that reuse is recent; the rest remain LRU so new
-    // prefixes fit. A session's own boundary attached once is spent, not hot.
-    let protected = inner
-        .published
-        .values()
-        .flatten()
-        .filter(|snap| {
-            snap.users == 0
-                && snap.referenced
-                && hot(tick, snap)
-                && (!snap.session || snap.tail.is_empty() || snap.attaches >= 2)
-        })
-        .max_by_key(|snap| snap.last_used)
-        .map(|snap| snap.id);
-    // One unit: the LRU boundary (a session's newest, after `retire_superseded`) and the
-    // blocks that become dead with it. A session's boundary its next turn already attached
-    // goes first (spent: that turn runs now; `retire_superseded` frees it at the turn's prompt
-    // end), then a session's whole-block checkpoint under its tailed boundary. Any other prompt
-    // end inside a block is a conversation's next attach point, with or without `X-Session-Id`,
-    // and ranks with the whole-block checkpoint under it by LRU: ranking every such tail first
-    // evicted each conversation's newest prompt end once it passed one block (Gemma-4 26B,
-    // open-loop chat without session ids: 43% cached tokens vs 78% with them). A boundary
-    // attached twice or more and used within `SHARED_RECENT_TICKS` (a reuse distance in
-    // publishes + attaches, not a time) is a shared prefix in use (a system prompt) and goes
-    // last; a session-pinned one (`pin_prefix`) or a recently used shared-prefix end (a system
-    // prompt below one block sits on no pinnable node) just before it. Nothing is exempt for
-    // good: an idle twice-attached end ages into plain LRU (2026-10-14).
-    let pinned = inner.cache.pinned();
-    if let Some((node, index)) = inner
-        .published
-        .iter()
-        .flat_map(|(&node, snaps)| {
-            let tailed = snaps
-                .iter()
-                .any(|snap| snap.session && !snap.tail.is_empty());
-            let pin = node.is_some_and(|key| pinned.contains(&key));
-            snaps.iter().enumerate().map(move |(i, snap)| {
-                let spent = snap.session
-                    && (!snap.tail.is_empty() && snap.attaches == 1
-                        || snap.tail.is_empty() && tailed && snap.attaches == 0);
-                (node, i, snap, pin, !spent)
-            })
-        })
-        .filter(|(_, _, snap, ..)| {
-            snap.users == 0 && Some(snap.id) != protected && !snap_awaited(&awaited, snap)
-        })
-        .min_by_key(|(_, _, snap, pin, rank)| {
-            (
-                // A boundary attached twice is a shared prefix only while it keeps being
-                // used: a system prompt is touched every few requests, a conversation's
-                // prompt end attached by two of its own requests is not, and ranked last
-                // for good such ends filled the cache (production, 2026-10-14: 335 of
-                // 335 slots, every fresh prompt end evicted within its own decode).
-                snap.attaches >= 2 && hot(tick, snap),
-                // A shared-prefix end is exempt only while it is in use (see retire_superseded).
-                *pin || (snap.share && hot(tick, snap)),
-                *rank,
-                snap.last_used,
-            )
-        })
-        .map(|(node, index, ..)| (node, index))
-    {
-        let before = inner.stats.cache_bytes;
-        remove_snapshot(s, inner, node, index);
-        let mut blocks = 0;
-        while evict_dead_leaf(s, inner) {
-            blocks += 1;
-        }
-        inner.stats.eviction_units += 1;
-        inner.stats.eviction_unit_bytes += before - inner.stats.cache_bytes;
-        tracing::debug!(
-            freed = before - inner.stats.cache_bytes,
-            blocks,
-            "vmm prefix eviction unit"
-        );
-        return true;
-    }
-    let published = &inner.published;
-    let Some(key) = inner.cache.evict_lru_where(|key| {
-        published
-            .get(&Some(key))
-            .is_none_or(|list| list.iter().all(|snap| !snap_awaited(&awaited, snap)))
-    }) else {
-        let Some((node, index)) = inner
-            .published
-            .iter()
-            .flat_map(|(&node, snaps)| {
-                snaps
-                    .iter()
-                    .enumerate()
-                    .map(move |(i, snap)| (node, i, snap))
-            })
-            .filter(|(_, _, snap)| snap.users == 0 && !snap_awaited(&awaited, snap))
-            .min_by_key(|(_, _, snap)| (Some(snap.id) == protected, snap.last_used))
-            .map(|(node, index, _)| (node, index))
-        else {
-            return false;
-        };
-        // Active radix leases can exceed the soft budget. Keep their hot
-        // snapshot until retirement, but allow OOM reclamation to remove it.
-        if preserve_hot
-            && inner.stats.cache_blocks > 0
-            && Some(inner.published[&node][index].id) == protected
-        {
-            return false;
-        }
-        remove_snapshot(s, inner, node, index);
-        return true;
-    };
-    if let Some(ids) = inner.node_blocks.remove(&key) {
-        inner.stats.cache_blocks -= ids.len() as u64;
-        inner.stats.cache_bytes -= ids.len() as u64 * s.block_bytes;
-        for id in ids {
-            deref_block(s, inner, id);
-        }
-    }
-    drop_node_snapshots(s, inner, key);
-    inner.stats.nodes_evicted += 1;
-    true
+    policy::evict_one_tree(s, inner, preserve_hot)
 }
 
 fn remove_snapshot(s: &Shared, inner: &mut Inner, node: Option<(u32, u32)>, index: usize) {
@@ -7058,25 +6852,6 @@ mod tests {
         pool_with_cap(ops, 0)
     }
 
-    /// The 0.1.2 flag/tier policy (AMD's shared prefix): the tests below that encode its tiers
-    /// and chained checkpoints run on it.
-    fn legacy(mut p: VmmKv) -> VmmKv {
-        p.set_policy(Policy::Legacy);
-        p
-    }
-
-    fn legacy_pool(ops: Arc<MockVmm>) -> VmmKv {
-        legacy(pool(ops))
-    }
-
-    fn legacy_pool_with_cap(ops: Arc<MockVmm>, cache_cap: u64) -> VmmKv {
-        legacy(pool_with_cap(ops, cache_cap))
-    }
-
-    fn legacy_uniform_pool(ops: Arc<MockVmm>) -> VmmKv {
-        legacy(uniform_pool(ops))
-    }
-
     fn pool_with_cap(ops: Arc<MockVmm>, cache_cap: u64) -> VmmKv {
         let geo = VmmGeometry {
             full_layers: vec![3],
@@ -7416,7 +7191,7 @@ mod tests {
     fn cached_rows_are_reread_only_when_the_cache_moves() {
         use crate::serve::mux::{refresh_cached_rows, Job, JobOpts};
         let ops = Arc::new(MockVmm::default());
-        let p = legacy_uniform_pool(ops.clone());
+        let p = uniform_pool(ops.clone());
         let probe = p.prefix_probe().expect("prefix reuse");
         let pr = prompt(17);
         let job = |prompt: Vec<u32>, prefix| {
@@ -7552,50 +7327,6 @@ mod tests {
             });
             println!("{n:>5} {len:>6} {rehash:>12.1} {unchanged:>14.1} {moved:>12.1}");
         }
-    }
-
-    /// `enable_shared_publish` (legacy policy): a lead seen on one sequence only never
-    /// snapshots; the second sequence with that lead publishes and the third attaches. Another
-    /// lead stays unpublished.
-    #[test]
-    fn shared_publish_skips_first_sighting_and_publishes_the_second() {
-        let ops = Arc::new(MockVmm::default());
-        let mut p = legacy_uniform_pool(ops.clone());
-        p.enable_shared_publish();
-        let pr = prompt(32);
-        assert!(p.try_attach(0, &pr).unwrap().is_none());
-        p.ensure_rows(0, 32).unwrap();
-        p.publish_at(0, &pr, 20, 4, |_| {
-            panic!("first sighting must not snapshot")
-        })
-        .unwrap();
-        assert_eq!(p.stats().publishes_skipped, 1);
-        assert_eq!(p.stats().cache_blocks, 0);
-        p.begin_seq(0);
-        p.ensure_rows(1, 1).unwrap();
-        assert!(
-            p.try_attach(1, &pr).unwrap().is_none(),
-            "nothing published on first sighting"
-        );
-        p.ensure_rows(1, 32).unwrap();
-        p.publish_at(1, &pr, 20, 4, |_| Ok(())).unwrap();
-        assert_eq!(p.stats().publishes_skipped, 1);
-        p.ensure_rows(0, 1).unwrap();
-        let a = p
-            .try_attach(0, &pr)
-            .unwrap()
-            .expect("second sighting published");
-        assert_eq!(a.rows, 20);
-        p.begin_seq(0);
-        let other: Vec<u32> = pr.iter().map(|t| t + 1).collect();
-        p.ensure_rows(0, 1).unwrap();
-        assert!(p.try_attach(0, &other).unwrap().is_none());
-        p.ensure_rows(0, 32).unwrap();
-        p.publish_at(0, &other, 20, 4, |_| {
-            panic!("unseen lead must not snapshot")
-        })
-        .unwrap();
-        assert_eq!(p.stats().publishes_skipped, 2);
     }
 
     /// Boundary tree: an unseen lead's prompt end publishes anyway (the first conversation's
@@ -7747,68 +7478,6 @@ mod tests {
         policy::check_tree(&p.shared.inner.lock());
     }
 
-    /// A twice-attached boundary leaves the shared-prefix eviction tier once it has not been
-    /// used for `SHARED_RECENT_TICKS`: a stale one is evicted before an older single-attach one.
-    /// (The most recently attached boundary, `b`, is the one `evict_one` always protects.)
-    #[test]
-    fn stale_twice_attached_boundary_is_evicted_before_a_fresh_one() {
-        let ops = Arc::new(MockVmm::default());
-        let p = legacy_uniform_pool(ops.clone());
-        let a = prompt(30);
-        let mut b = prompt(30);
-        b[0] = 99;
-        let mut c = prompt(30);
-        c[0] = 98;
-        let publish = |pr: &[u32]| {
-            p.begin_seq(0);
-            assert!(p.try_attach(0, pr).unwrap().is_none());
-            p.ensure_rows(0, 30).unwrap();
-            p.publish_at(0, pr, 12, 4, |_| Ok(())).unwrap();
-        };
-        let attach = |pr: &[u32]| {
-            p.begin_seq(1);
-            p.ensure_rows(1, 1).unwrap();
-            assert_eq!(p.try_attach(1, pr).unwrap().expect("boundary").rows, 12);
-            p.finish_attach(1);
-        };
-        publish(&a);
-        attach(&a);
-        attach(&a);
-        publish(&c);
-        attach(&c);
-        publish(&b);
-        attach(&b);
-        p.begin_seq(1);
-        assert_eq!(p.stats().snapshots_live, 3);
-        assert_eq!(
-            p.stats().snapshots_shared,
-            1,
-            "a's boundary is in the shared tier"
-        );
-        {
-            let mut inner = p.shared.inner.lock();
-            assert!(evict_one(&p.shared, &mut inner, false));
-        }
-        assert_eq!(p.cached_rows(&c), 0, "single-attach c went first");
-        assert_eq!(
-            p.cached_rows(&a),
-            12,
-            "recently shared a stays although it is the LRU"
-        );
-        p.shared.inner.lock().snapshot_tick += SHARED_RECENT_TICKS + 1;
-        assert_eq!(
-            p.stats().snapshots_shared,
-            0,
-            "a aged out of the shared tier"
-        );
-        {
-            let mut inner = p.shared.inner.lock();
-            assert!(evict_one(&p.shared, &mut inner, false));
-        }
-        assert_eq!(p.cached_rows(&a), 0, "stale a evicted");
-        assert_eq!(p.cached_rows(&b), 12);
-    }
-
     /// The second prompt sharing a 300-row head with a recent one names the shared end
     /// (32-row aligned); a short common head names nothing.
     #[test]
@@ -7892,47 +7561,20 @@ mod tests {
         assert_eq!(p.inflight_prefix(1, &b, 16, &[0]), Some((0, 288)));
     }
 
-    /// A whole-block boundary has no tail: it is what the second request sharing a prefix
-    /// attaches to, so it publishes on the first sighting while the tailed end still waits.
-    #[test]
-    fn shared_publish_keeps_whole_block_checkpoints_on_the_first_sighting() {
-        let ops = Arc::new(MockVmm::default());
-        let mut p = legacy_uniform_pool(ops.clone());
-        p.enable_shared_publish();
-        let pr = prompt(21);
-        assert!(p.try_attach(0, &pr).unwrap().is_none());
-        p.ensure_rows(0, 21).unwrap();
-        p.publish_at(0, &pr, 16, 4, |_| Ok(())).unwrap();
-        p.publish_at(0, &pr, 20, 4, |_| panic!("tailed end of a first sighting"))
-            .unwrap();
-        assert_eq!(p.stats().publishes_skipped, 1);
-        p.begin_seq(0);
-        let mut next = prompt(16);
-        next.extend([901, 902]);
-        p.ensure_rows(1, 1).unwrap();
-        assert_eq!(
-            p.try_attach(1, &next)
-                .unwrap()
-                .expect("second sighting hits")
-                .rows,
-            16
-        );
-    }
-
     /// An admission check that finds no owner to wait on must not count the prompt: its own
     /// attach does, and a double count let every prompt pass the gate on its first sighting.
+    /// (A prompt end publishes on the first sighting anyway, cold; a checkpoint does not.)
     #[test]
     fn inflight_check_without_an_owner_leaves_the_sighting_to_the_attach() {
         let ops = Arc::new(MockVmm::default());
         let mut p = pool(ops);
         p.enable_shared_publish();
-        p.set_policy(Policy::Legacy);
         let pr = prompt(21);
         assert_eq!(p.inflight_prefix(0, &pr, u32::MAX, &[]), None);
         p.begin_seq(0);
         assert!(p.try_attach(0, &pr).unwrap().is_none());
         p.ensure_rows(0, 21).unwrap();
-        p.publish_at(0, &pr, 20, 4, |_| panic!("counted twice"))
+        p.publish_kind(0, &pr, 20, Kind::CHECKPOINT, 4, |_| panic!("counted twice"))
             .unwrap();
         assert_eq!(p.stats().publishes_skipped, 1);
     }
@@ -8144,25 +7786,71 @@ mod tests {
     }
 
     /// A conversation's prompt end inside a block is its next turn's attach point, without
-    /// `X-Session-Id` too: eviction takes the older whole-block checkpoint under it first.
+    /// `X-Session-Id` too: the older whole-block checkpoint under it is retired structurally
+    /// once the prompt end continues it, and the blocks stay.
+    /// AMD's shared prefix under the boundary tree: a chunk end below the prompt end is a
+    /// shared end, so the prompt end continuing it does not retire it; it stays while an attach
+    /// holds it, survives pressure while it is the most recently used, and is an ordinary LRU
+    /// victim once idle.
+    #[test]
+    fn shared_chunk_end_is_kept_while_used_and_evicted_by_lru_when_idle() {
+        let ops = Arc::new(MockVmm::default());
+        let p = pool_with_cap(ops, 512);
+        let a = prompt(17);
+        p.try_attach(0, &a).unwrap();
+        p.ensure_rows(0, 17).unwrap();
+        p.publish_kind(0, &a, 8, Kind::SHARED_END, 48, |_| Ok(()))
+            .unwrap();
+        p.publish_at(0, &a, 16, 48, |_| Ok(())).unwrap();
+        p.begin_seq(0);
+        assert_eq!(p.stats().snapshots_retired, 0);
+        let mut b = a[..8].to_vec();
+        b.extend((0..9).map(|i| 900 + i));
+        let hit = p.try_attach(1, &b).unwrap().expect("chunk end attachable");
+        assert_eq!(hit.rows, 8);
+        // Unique prompts push the pool past its cap while seq 1 still holds the chunk end.
+        let mut ever_evicted = 0;
+        for first in 100..110u32 {
+            let mut u = prompt(17);
+            u[0] = first;
+            p.begin_seq(0);
+            p.try_attach(0, &u).unwrap();
+            p.ensure_rows(0, 17).unwrap();
+            p.publish_at(0, &u, 16, 48, |_| Ok(())).unwrap();
+            ever_evicted = p.stats().snapshots_evicted;
+        }
+        p.begin_seq(0);
+        assert!(ever_evicted > 0, "no pressure");
+        assert_eq!(p.cached_rows(&b), 8, "held chunk end evicted");
+        p.finish_attach(1);
+        p.begin_seq(1);
+        for first in 200..210u32 {
+            let mut u = prompt(17);
+            u[0] = first;
+            p.begin_seq(0);
+            p.try_attach(0, &u).unwrap();
+            p.ensure_rows(0, 17).unwrap();
+            p.publish_at(0, &u, 16, 48, |_| Ok(())).unwrap();
+        }
+        p.begin_seq(0);
+        assert_eq!(p.cached_rows(&b), 0, "idle chunk end outlived LRU pressure");
+        assert!(p.stats().cache_bytes <= 512);
+        policy::check_tree(&p.shared.inner.lock());
+    }
+
     #[test]
     fn prompt_end_outlives_the_older_checkpoint_under_it() {
         let ops = Arc::new(MockVmm::default());
-        let p = legacy_pool(ops);
+        let p = pool(ops);
         let a = prompt(21);
         p.try_attach(0, &a).unwrap();
         p.ensure_rows(0, 21).unwrap();
         p.publish_at(0, &a, 16, 48, |_| Ok(())).unwrap();
         p.publish_at(0, &a, 20, 48, |_| Ok(())).unwrap();
         p.begin_seq(0);
-        assert_eq!(p.stats().snapshot_bytes, 96);
-        {
-            let mut inner = p.shared.inner.lock();
-            assert!(evict_one(&p.shared, &mut inner, true));
-            assert_eq!(inner.stats.snapshot_bytes, 48);
-            assert_eq!(inner.stats.cache_blocks, 4);
-            assert_eq!(inner.stats.nodes_evicted, 0);
-        }
+        let s = p.stats();
+        assert_eq!((s.snapshot_bytes, s.snapshots_retired), (48, 1));
+        assert_eq!((s.cache_blocks, s.nodes_evicted), (4, 0));
         let mut b = a[..20].to_vec();
         b.extend([900, 901, 902]);
         p.ensure_rows(1, 1).unwrap();
@@ -8658,7 +8346,7 @@ mod tests {
     #[test]
     fn cache_budget_trims_after_active_radix_leases_release() {
         let ops = Arc::new(MockVmm::default());
-        let p = legacy_pool_with_cap(ops.clone(), 448);
+        let p = pool_with_cap(ops.clone(), 448);
         let a = prompt(17);
         p.try_attach(0, &a).unwrap();
         p.ensure_rows(0, 17).unwrap();
@@ -8666,16 +8354,16 @@ mod tests {
         p.try_attach(1, &a).unwrap().expect("shared prefix");
         p.ensure_rows(0, 25).unwrap();
         p.publish(0, &prompt(25), 64, |_| Ok(())).unwrap();
-        assert_eq!(p.stats().cache_bytes, 576);
-        assert_eq!(p.stats().snapshot_bytes, 192);
-        assert_eq!(ops.frees.load(Ordering::SeqCst), 1);
+        // Over the cap while seq 1's attach holds the 16-row boundary its continuation supersedes.
+        assert_eq!(p.stats().cache_bytes, 640);
+        assert_eq!(p.stats().snapshot_bytes, 256);
+        assert_eq!(ops.frees.load(Ordering::SeqCst), 0);
 
         p.finish_attach(1);
-        assert_eq!(p.stats().cache_bytes, 576);
-        assert_eq!(p.stats().snapshot_bytes, 192);
+        assert_eq!(p.stats().cache_bytes, 448);
+        assert_eq!(p.stats().snapshot_bytes, 64);
         p.begin_seq(0);
         assert!(p.stats().cache_bytes <= 448);
-        assert_eq!(p.stats().snapshot_bytes, 192);
         assert_eq!(ops.frees.load(Ordering::SeqCst), 1);
     }
 
@@ -9119,8 +8807,7 @@ mod tests {
     }
 
     /// A snapshot larger than a slot is freed as before and counted as a fallback; a
-    /// backend without pinned memory cannot enable the tier at all; neither can the legacy
-    /// policy.
+    /// backend without pinned memory cannot enable the tier at all.
     #[test]
     fn host_tier_falls_back_to_freeing_when_it_cannot_take_a_snapshot() {
         let ops = Arc::new(MockVmm::default());
@@ -9143,9 +8830,6 @@ mod tests {
         let _b = publish_tailed(&p, &ops, 0, 20, 0xB2);
         assert_eq!(p.stats().snapshots_evicted, 1);
         assert_eq!(p.stats().snapshots_spilled, 0);
-
-        let mut p = legacy_pool_with_cap(Arc::new(MockVmm::default()), 448);
-        assert!(p.enable_host_tier(4 * 192, 192).is_err());
     }
 
     /// With copies still in flight: the trim credits them and returns without waiting, the
@@ -9612,11 +9296,12 @@ mod tests {
     #[test]
     fn short_boundaries_match_tokens_and_leave_a_token_to_recompute() {
         let ops = Arc::new(MockVmm::default());
-        let p = legacy_pool_with_cap(ops, 256);
+        let p = pool_with_cap(ops, 256);
         let tokens = prompt(7);
         p.try_attach(0, &tokens).unwrap();
         p.ensure_rows(0, 7).unwrap();
-        p.publish_at(0, &tokens, 4, 32, |_| Ok(())).unwrap();
+        p.publish_kind(0, &tokens, 4, Kind::SHARED_END, 32, |_| Ok(()))
+            .unwrap();
         p.publish_at(0, &tokens, 6, 48, |_| Ok(())).unwrap();
         p.begin_seq(0);
 
@@ -9640,11 +9325,12 @@ mod tests {
     #[test]
     fn partial_boundary_shares_only_complete_blocks() {
         let ops = Arc::new(MockVmm::default());
-        let p = legacy_pool(ops.clone());
+        let p = pool(ops.clone());
         let tokens = prompt(25);
         p.try_attach(0, &tokens).unwrap();
         p.ensure_rows(0, 25).unwrap();
-        p.publish_at(0, &tokens, 16, 64, |_| Ok(())).unwrap();
+        p.publish_kind(0, &tokens, 16, Kind::SHARED_END, 64, |_| Ok(()))
+            .unwrap();
         p.publish_at(0, &tokens, 21, 96, |_| Ok(())).unwrap();
         p.begin_seq(0);
         assert_eq!(p.try_attach(0, &tokens[..21]).unwrap().unwrap().rows, 16);
@@ -9665,63 +9351,9 @@ mod tests {
     }
 
     #[test]
-    fn hot_short_snapshot_survives_publishers_holding_full_blocks() {
-        let ops = Arc::new(MockVmm::default());
-        let p = legacy_pool_with_cap(ops, 192);
-        let prime = prompt(7);
-        p.try_attach(0, &prime).unwrap();
-        p.ensure_rows(0, 7).unwrap();
-        p.publish_at(0, &prime, 6, 48, |_| Ok(())).unwrap();
-        p.begin_seq(0);
-        let request = prompt(9);
-        assert_eq!(p.try_attach(1, &request).unwrap().unwrap().rows, 6);
-        p.ensure_rows(1, 9).unwrap();
-        p.finish_attach(1);
-        p.publish_at(1, &request, 8, 48, |_| Ok(())).unwrap();
-
-        assert_eq!(p.stats().cache_bytes, 176);
-        assert_eq!(p.stats().snapshot_bytes, 48);
-        assert_eq!(p.stats().snapshots_evicted, 1);
-        let mut next = request;
-        next[6] ^= 1;
-        assert_eq!(p.try_attach(0, &next).unwrap().unwrap().rows, 6);
-    }
-
-    #[test]
-    fn reused_short_prefix_survives_a_burst_of_unique_tails() {
-        let ops = Arc::new(MockVmm::default());
-        let p = legacy_pool_with_cap(ops, 96);
-        let publish = |first| {
-            let mut tokens = prompt(7);
-            tokens[0] = first;
-            p.begin_seq(0);
-            p.try_attach(0, &tokens).unwrap();
-            p.ensure_rows(0, 7).unwrap();
-            p.publish_at(0, &tokens, 6, 48, |_| Ok(())).unwrap();
-            tokens
-        };
-        let a = publish(10);
-        let hit = p.try_attach(1, &a).unwrap().unwrap();
-        p.finish_attach(1);
-        p.begin_seq(1);
-        let b = publish(20);
-        for first in 100..116 {
-            publish(first);
-        }
-        let c = publish(30);
-        assert_eq!(p.try_attach(1, &a).unwrap().unwrap().snap_va, hit.snap_va);
-        p.begin_seq(1);
-        assert!(p.try_attach(1, &b).unwrap().is_none());
-        p.begin_seq(1);
-        assert_eq!(p.try_attach(1, &c).unwrap().unwrap().rows, 6);
-        assert!(p.stats().cache_bytes <= 96);
-        assert_eq!(p.stats().snapshots_evicted, 17);
-    }
-
-    #[test]
     fn reused_snapshots_leave_room_for_a_new_prefix() {
         let ops = Arc::new(MockVmm::default());
-        let p = legacy_pool_with_cap(ops, 96);
+        let p = pool_with_cap(ops, 96);
         for first in [10, 20, 30] {
             let mut tokens = prompt(7);
             tokens[0] = first;
@@ -9742,109 +9374,9 @@ mod tests {
     }
 
     #[test]
-    fn output_snapshots_leave_room_for_reusable_prompt_boundaries() {
-        let p = legacy_pool_with_cap(Arc::new(MockVmm::default()), 400);
-        let mut short = prompt(7);
-        short[0] = 99;
-        p.try_attach(0, &short).unwrap();
-        p.ensure_rows(0, 7).unwrap();
-        p.publish_at(0, &short, 6, 48, |_| Ok(())).unwrap();
-        p.begin_seq(0);
-
-        let long = prompt(17);
-        p.try_attach(0, &long).unwrap();
-        p.ensure_rows(0, 21).unwrap();
-        p.publish_at(0, &long, 16, 48, |_| Ok(())).unwrap();
-        p.try_attach(1, &short).unwrap().unwrap();
-        p.finish_attach(1);
-
-        let generated = prompt(21);
-        p.publish_at(0, &generated, 18, 48, |_| Ok(())).unwrap();
-        p.publish_at(0, &generated, 20, 48, |_| Ok(())).unwrap();
-        p.begin_seq(1);
-        let attached = p
-            .try_attach(1, &long)
-            .unwrap()
-            .expect("prompt boundary retained");
-        assert_eq!(attached.rows, 16);
-        assert!(p.stats().cache_bytes <= 400);
-        assert_eq!(p.stats().snapshots_evicted, 1);
-    }
-
-    #[test]
-    fn output_snapshot_reused_by_a_followup_gets_prompt_priority() {
-        let p = legacy_pool_with_cap(Arc::new(MockVmm::default()), 96);
-        let tokens = prompt(7);
-        p.try_attach(0, &tokens[..3]).unwrap();
-        p.ensure_rows(0, 7).unwrap();
-        p.publish_at(0, &tokens[..3], 2, 48, |_| Ok(())).unwrap();
-        p.publish_at(0, &tokens[..5], 4, 48, |_| Ok(())).unwrap();
-        assert_eq!(p.try_attach(1, &tokens[..5]).unwrap().unwrap().rows, 4);
-        p.finish_attach(1);
-        p.begin_seq(1);
-        p.publish_at(0, &tokens, 6, 48, |_| Ok(())).unwrap();
-        assert_eq!(p.try_attach(1, &tokens).unwrap().unwrap().rows, 4);
-        assert_eq!(p.stats().cache_bytes, 96);
-        assert_eq!(p.stats().snapshots_evicted, 1);
-    }
-
-    #[test]
-    fn new_long_prompt_snapshot_survives_its_output_tail() {
-        let ops = Arc::new(MockVmm::default());
-        let p = legacy_pool_with_cap(ops, 400);
-        for first in [10, 20] {
-            let mut tokens = prompt(7);
-            tokens[0] = first;
-            p.begin_seq(0);
-            p.try_attach(0, &tokens).unwrap();
-            p.ensure_rows(0, 7).unwrap();
-            p.publish_at(0, &tokens, 6, 48, |_| Ok(())).unwrap();
-            p.begin_seq(1);
-            p.try_attach(1, &tokens).unwrap().unwrap();
-            p.finish_attach(1);
-        }
-        let tokens = prompt(18);
-        p.begin_seq(0);
-        p.try_attach(0, &tokens).unwrap();
-        p.ensure_rows(0, 18).unwrap();
-        p.publish_at(0, &tokens, 16, 48, |_| Ok(())).unwrap();
-        p.publish_at(0, &tokens, 17, 48, |_| Ok(())).unwrap();
-        p.begin_seq(0);
-        p.begin_seq(1);
-        assert_eq!(p.try_attach(1, &tokens[..17]).unwrap().unwrap().rows, 16);
-        assert_eq!(p.stats().cache_bytes, 400);
-        assert_eq!(p.stats().snapshots_evicted, 1);
-    }
-
-    #[test]
-    fn active_radix_leases_do_not_flush_the_hot_snapshot_at_the_soft_cap() {
-        let ops = Arc::new(MockVmm::default());
-        let p = legacy_pool_with_cap(ops, 176);
-        let short = prompt(7);
-        p.try_attach(0, &short).unwrap();
-        p.ensure_rows(0, 7).unwrap();
-        p.publish_at(0, &short, 6, 48, |_| Ok(())).unwrap();
-        p.begin_seq(0);
-        p.try_attach(1, &short).unwrap().unwrap();
-        p.finish_attach(1);
-        p.begin_seq(1);
-        let long = prompt(17);
-        p.try_attach(0, &long).unwrap().unwrap();
-        p.finish_attach(0);
-        p.ensure_rows(0, 17).unwrap();
-        p.publish_at(0, &long, 16, 48, |_| Ok(())).unwrap();
-        assert_eq!(p.stats().cache_bytes, 304);
-        assert_eq!(p.try_attach(1, &short).unwrap().unwrap().rows, 6);
-        p.finish_attach(1);
-        p.begin_seq(1);
-        p.begin_seq(0);
-        assert!(p.stats().cache_bytes <= 176);
-    }
-
-    #[test]
     fn oom_reclamation_can_evict_the_last_reused_snapshot() {
         let ops = Arc::new(MockVmm::default());
-        let p = legacy_pool_with_cap(ops, 176);
+        let p = pool_with_cap(ops, 176);
         let tokens = prompt(7);
         p.try_attach(0, &tokens).unwrap();
         p.ensure_rows(0, 7).unwrap();

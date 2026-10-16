@@ -2,7 +2,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 use crate::asset::devblob::{DevBlob, DevTensor};
-use crate::memory::vmm::{Attach, VmmGeometry, VmmKv, VmmOps};
+use crate::memory::vmm::{Attach, Kind, VmmGeometry, VmmKv, VmmOps};
 use crate::{Result, RuntimeError};
 use packet::dev::DevOp;
 
@@ -405,10 +405,6 @@ impl SharedPrefix {
                 (cache_cap / total_row_bytes * row_bytes * tensors.len() as u64).max(1)
             };
             let mut pool = VmmKv::new_tensors(ops.clone(), geometry, granularity, cap, &keys)?;
-            // AMD publishes every completed chunk as an attach point for other suffixes; the
-            // boundary tree's structural retire is the CUDA conversation policy (a migration of
-            // this path is explicit, not implied).
-            pool.set_policy(crate::memory::vmm::Policy::Legacy);
             pool.enable_block_recycling(
                 pool_cap / total_row_bytes * row_bytes * tensors.len() as u64,
             );
@@ -782,6 +778,13 @@ impl SharedPrefix {
         if rows == 0 {
             return Ok(());
         }
+        // A completed chunk below the prompt end is an attach point for other suffixes: the
+        // boundary tree would retire it structurally once this prompt's next chunk continues it.
+        let kind = if frontier as usize >= prompt.len() {
+            Kind::PROMPT_END
+        } else {
+            Kind::SHARED_END
+        };
         // Resolve every group's orphaned-blocks hazard (see `Inner::strict_publish`) BEFORE
         // any group publishes, not per-group and not stopping at the first: each group has
         // its own block size and its own independent radix tree, so a hazard (or its
@@ -816,10 +819,11 @@ impl SharedPrefix {
                     |chunk, va| self.copy_fine_chunk(index, slot, chunk * self.fine_rows, va, true),
                 )?;
             } else {
-                group.pool.publish_at(
+                group.pool.publish_kind(
                     slot,
                     prompt,
                     rows,
+                    kind,
                     self.snapshot_bytes(index, rows),
                     |snapshot| self.copy_snapshot(index, slot, rows, snapshot, true),
                 )?;
@@ -1597,6 +1601,49 @@ mod tests {
         assert_rows(&ops, &bases, 1, u64::from(rows), 17);
         cache.release(1);
         assert!(cache.deferred.is_none());
+    }
+
+    /// The boundary tree retires a boundary once one continuation extends it; AMD's chunk ends
+    /// below the prompt end publish as shared ends, so a request's own later chunks do not
+    /// retire the attach point other suffixes share (strict publish: a request that missed it
+    /// could not republish it either).
+    #[test]
+    fn chunk_ends_stay_attachable_after_the_prompt_continues_them() {
+        let ops = Arc::new(Driver::default());
+        let (mut cache, bases) = cache(ops.clone());
+        let common: Vec<u32> = (0..128).collect();
+        let suffixed = |first: u32| -> Vec<u32> {
+            let mut p = common.clone();
+            p.extend(first..first + 72);
+            p
+        };
+        let (a, b, c) = (suffixed(5000), suffixed(9000), suffixed(13000));
+        cache.begin_slot(0).unwrap();
+        assert_eq!(cache.stage_attach(0, &a).unwrap(), 0);
+        cache.ensure_rows(0, 200).unwrap();
+        fill(&ops, &bases, 0, 200, 17);
+        for frontier in [64, 128, 192, 200] {
+            cache.publish_completed_chunk(0, &a, frontier).unwrap();
+        }
+        cache.release(0);
+        for (slot, prompt) in [(1, &b), (2, &c)] {
+            cache.begin_slot(slot).unwrap();
+            assert_eq!(
+                cache.stage_attach(slot, prompt).unwrap(),
+                128,
+                "slot {slot}"
+            );
+            cache.commit_attach(slot, 128).unwrap();
+            cache.ensure_rows(slot, 200).unwrap();
+            for frontier in [192, 200] {
+                cache
+                    .publish_completed_chunk(slot, prompt, frontier)
+                    .unwrap();
+            }
+            cache.release(slot);
+        }
+        drop(cache);
+        ops.free(bases[3]);
     }
 
     #[test]

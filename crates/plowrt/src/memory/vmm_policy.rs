@@ -1,4 +1,4 @@
-//! Boundary-tree retention policy ([`Policy::Tree`]): every published boundary records its
+//! Boundary-tree retention policy (every pool, CUDA and AMD): every published boundary records its
 //! canonical parent (the longest retained boundary below it on its chain) and the retained
 //! boundaries that continue it; eviction is one LRU over unreserved entries, an attach refreshes
 //! the attached boundary and its ancestors, and a boundary is retired structurally once exactly

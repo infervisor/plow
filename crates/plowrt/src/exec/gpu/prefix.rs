@@ -513,7 +513,6 @@ impl GpuEngine {
                     if !full_scale.is_empty() {
                         kv.enable_strict_publish();
                     }
-                    tracing::info!(policy = ?kv.policy(), "vmm prefix: retention policy");
                     let host_cap = rt.vmm_host_cache_bytes();
                     if host_cap > 0 {
                         // The largest snapshot a publish can produce (`vmm_snap_bytes` at
