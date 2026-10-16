@@ -32,7 +32,8 @@ gpu = "5090"
 arch = "sm_120a"
 n_cu = 170
 n_gpu = 1
-max_ctx = 2048
+# 128 slots x 2048 ctx = 28 GiB of KV does not fit 32 GB; 1024 holds a 30 s clip (L4 WER parity).
+max_ctx = 1024
 
 [emit]
 emit = "devblob+cubin"
