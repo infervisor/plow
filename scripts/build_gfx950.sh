@@ -189,8 +189,7 @@ case "${PLOW_MLA_DEC_FOLD_MFMA:-0}" in
 esac
 case "${PLOW_MOE_GLU_KW:-0}" in
   0) ;;
-  1) DEC_KNOBS="$DEC_KNOBS -DPLOW_MOE_GLU_KW=1"
-     A4W4_BK="$A4W4_BK -DPLOW_MOE_GLU_KW=1" ;;
+  1) A4W4_BK="$A4W4_BK -DPLOW_MOE_GLU_KW=1" ;;
   *) echo "PLOW_MOE_GLU_KW must be 0 or 1" >&2; exit 2 ;;
 esac
 # PLOW_MOE_DEC_W8_SPLITN: the W8A8 decode GLU on 128-column tiles when 256-column tiles would
@@ -1175,6 +1174,10 @@ BUILD_MLA=0; [ "${PLOW_MLA_PREFILL:-0}" = 1 ] && BUILD_MLA=1
 # to the bf16 prefill, 256 VGPR / 0 AGPR / occ 2 / spill 2 — the grouped GEMM costs occupancy
 # nothing, and its 81920 B double-buffered tile fits inside the interpreter's existing arena.
 BUILD_MOE=0; [ "${PLOW_MOE_PREFILL:-0}" = 1 ] && { BUILD_MOE=1; BUILD_MLA=1; }
+if [ -n "${PLOW_HSACO_CONFIG:-}" ]; then
+  grep -Eq '^#define PLOW_PACKET_OBJECT_REQUIRES "([^"]* )?PLOW_MOE_PREFILL=1( |")' "$PLOW_HSACO_CONFIG" && { BUILD_MOE=1; BUILD_MLA=1; }
+  grep -Eq '^#define PLOW_PACKET_OBJECT_REQUIRES "([^"]* )?PLOW_MOE_PF_A4W4=1( |")' "$PLOW_HSACO_CONFIG" && BUILD_MXFP4=1
+fi
 # L2-DOMAIN DISPATCH (PLOW_L2_PLACE=1). Makes a workgroup take its global-queue window from the
 # XCD it is PHYSICALLY running on (HW_REG_XCC_ID) instead of from the host's `cur_seg`, so all 8
 # domains drain concurrently in one launch and a consumer reads its producer out of the same XCD's
@@ -1782,7 +1785,7 @@ if [ -f "$EXPECT" ] && command -v python3 >/dev/null; then
         --expect "$REPO/scripts/asm_expect_gfx950_mfma4.json" $MFMA4_ELFS | tail -20
     fi
   elif [ -n "${PLOW_HSACO_CONFIG:-}" ] &&
-       grep -qx '#define PLOW_PACKET_HAS_INDEX_SCORE 1' "$PLOW_HSACO_CONFIG"; then
+       grep -Eq '(#define PLOW_PACKET_HAS_INDEX_SCORE 1|PLOW_MOE_PF_A4W4=1)' "$PLOW_HSACO_CONFIG"; then
     DEFAULT_ELFS=""
     DSA_DECODE_ELFS=""
     QUARK_FP8KV_ELFS=""
