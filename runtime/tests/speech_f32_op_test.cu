@@ -134,7 +134,10 @@ static void** upload_table(const std::vector<void*>& ptrs) {
 }
 
 static int g_nblk = 132, g_fail = 0;
-static const size_t kSmem = SP_ARENA_FLOATS * sizeof(float);
+/* SP_ARENA_FLOATS depends on __CUDA_ARCH__ (sm_89/sm_120: 99 KiB blocks), which the host pass
+ * does not see: main() reads the device's value. */
+__device__ unsigned k_arena_floats = SP_ARENA_FLOATS;
+static size_t kSmem;
 
 enum Mode { FP32, BF16, INT, F64 };
 
@@ -1151,6 +1154,9 @@ int main(int argc, char** argv) {
     cudaDeviceProp prop;
     CK(cudaGetDeviceProperties(&prop, 0));
     g_nblk = prop.multiProcessorCount;
+    unsigned arena_floats;
+    CK(cudaMemcpyFromSymbol(&arena_floats, k_arena_floats, sizeof(arena_floats)));
+    kSmem = (size_t)arena_floats * sizeof(float);
     CK(cudaFuncSetAttribute(k_speech, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)kSmem));
     printf("speech_f32_op_test on %s (%d SMs), nblk=%d, arena=%zu B\n", prop.name, g_nblk, g_nblk, kSmem);
 
@@ -1321,6 +1327,97 @@ int main(int argc, char** argv) {
             bench(name, c, 4.0 * rows * 104 * 1024, 0);
         }
         return 0;
+    }
+    if (argc > 1 && !strcmp(argv[1], "--bench-qwen-asr")) {
+        /* The Qwen3-ASR encoder's instructions at a 64-chunk bucket (832 rows) with the packet's
+         * flags; argv[2] = d_model (896: 0.6B, 1024: 1.7B). Requests of 7 chunks (91 rows) set the
+         * reference split and the attention group table. */
+        const unsigned d = argc > 2 ? (unsigned)atoi(argv[2]) : 1024u, M = 832u;
+        std::vector<uint32_t> rows(M), table{0};
+        for (unsigned r0 = 0; r0 < M; r0 += 91u) {
+            const unsigned n = std::min(91u, M - r0);
+            for (unsigned r = r0; r < r0 + n; r++) rows[r] = n;
+            table[0]++;
+            table.push_back(r0);
+            table.push_back(n);
+        }
+        auto dense = [&](const char* name, unsigned n, unsigned k, unsigned flags, bool bias) {
+            Case c;
+            unsigned o = c.out((size_t)M * n), x = c.f32((size_t)M * k, 1.f), w = c.bf16((size_t)n * k, 0.05f);
+            unsigned b = bias ? c.f32(n, 0.1f) : PLOW_TENSOR_NONE, r = c.u32(rows);
+            c.in.op = PLOW_DOP_DENSE_GEMM_F32;
+            c.in.t[0] = o; c.in.t[1] = x; c.in.t[2] = w; c.in.t[3] = b; c.in.t[4] = r;
+            c.in.i[0] = M; c.in.i[1] = n; c.in.i[2] = k; c.in.i[7] = flags; c.in.fj[1].u = (unsigned)g_nblk;
+            char full[96];
+            snprintf(full, sizeof(full), "DenseGemmF32 %s %ux%ux%u f%u", name, M, n, k, flags);
+            bench(full, c, 2.0 * M * n * k, 0);
+        };
+        bench_conv(64, 128, 100, 1, 480, 512);
+        bench_conv(64, 64, 50, 480, 480, 256);
+        bench_conv(64, 32, 25, 480, 480, 256);
+        {
+            Case c;
+            unsigned o = c.out((size_t)M * 480 * 16), x = c.f32((size_t)64 * 480 * 16 * 13, 1.f);
+            c.in.op = PLOW_DOP_PACK_NCFW_ROWS_F32; c.in.t[0] = o; c.in.t[1] = x;
+            c.in.i[0] = M; c.in.i[1] = 480; c.in.i[2] = 16; c.in.i[3] = 13; c.in.i[4] = 64;
+            bench("PackNcfwRowsF32 832x480x16 b64", c, 0, 8.0 * M * 480 * 16);
+        }
+        dense("conv_out", d, 7680, 141, false);
+        dense("q/k/v/o", d, d, 141, true);
+        dense("fc1 gelu", 4 * d, d, 143, true);
+        dense("fc2", d, 4 * d, 141, true);
+        {
+            Case c;
+            const size_t n = (size_t)M * d;
+            unsigned o = c.out(n), a = c.f32(n, 3.f), b = c.f32(n, 3.f);
+            c.in.op = PLOW_DOP_SCALED_ADD_F32; c.in.t[0] = o; c.in.t[1] = a; c.in.t[2] = b;
+            c.in.i[0] = (unsigned)n; c.in.i[1] = 1; c.in.fj[0].f = 1.f;
+            bench("ScaledAddF32 bf16 832xd", c, 0, 12.0 * n);
+        }
+        {
+            Case c;
+            unsigned o = c.out((size_t)M * d), x = c.f32((size_t)M * d, 2.f, 0.5f);
+            unsigned g = c.f32(d, 0.5f, 1.f), b = c.f32(d, 0.2f);
+            c.in.op = PLOW_DOP_LAYERNORM_F32;
+            c.in.t[0] = o; c.in.t[1] = x; c.in.t[2] = g; c.in.t[3] = b;
+            c.in.i[0] = M; c.in.i[1] = d; c.in.i[2] = 3; c.in.fj[0].f = 1e-5f;
+            bench("LayerNormF32 ordered bf16 832xd", c, 0, 8.0 * M * d);
+        }
+        {
+            Case c;
+            const size_t n = (size_t)M * d;
+            unsigned o = c.out(n), q = c.f32(n, 1.f), k = c.f32(n, 1.f), v = c.f32(n, 1.f), vr = c.u32(table);
+            c.in.op = PLOW_DOP_GROUPED_ATTENTION_F32;
+            c.in.t[0] = o; c.in.t[1] = q; c.in.t[2] = k; c.in.t[3] = v; c.in.t[4] = vr;
+            c.in.i[0] = M; c.in.i[1] = d; c.in.i[2] = 64; c.in.i[3] = 104; c.in.i[4] = 15;
+            bench("GroupedAttentionF32 832xd g104 packed", c, 4.0 * M * 104 * d, 0);
+        }
+        return 0;
+    }
+    if (argc > 1 && !strcmp(argv[1], "--test-qwen-asr")) {
+        /* The Qwen3-ASR encoder's ops only, for an object built with the packet's PLOW_SPEECH_OPS. */
+        t_dense("DenseGemmF32 qwen q 300x1024x1024", 300, 1024, 1024, 1 | 4, 0, 0, 0, 0, true);
+        t_dense("DenseGemmF32 gelu 200x512x384", 200, 512, 384, 2 | 4, 0, 0, 0, 0, true);
+        t_dense("DenseGemmF32 tc-bf16 qwen q 104x1024x1024 splitk", 104, 1024, 1024, 1 | 4 | 8, 0, 0, 0, 0, true, true);
+        t_dense("DenseGemmF32 tc-bf16 fc2 104x1024x4096 splitk", 104, 1024, 4096, 1 | 4 | 8, 0, 0, 0, 0, true, true);
+        t_dense_ref(1024, 1024, {104, 52, 156, 13, 390, 208});
+        t_dense_ref(1024, 4096, {104, 52, 260});
+        t_dense_ref(4096, 1024, {104, 52});
+        t_dense_ref(1024, 7680, {104, 52, 156});
+        t_conv("Conv2dF32 tc-3xtf32 qwen stage1", 2, 128, 100, 1, 48, 3, 2, 1, 1, 512 | 64 | 128 | (2 << 2) | (2 << 4));
+        t_conv("Conv2dF32 tc-bf16 qwen stage2", 2, 64, 50, 48, 64, 3, 2, 1, 1, 256 | 64 | 128 | (2 << 2) | (2 << 4));
+        t_conv("Conv2dF32 tc-bf16 wide multi-tile", 8, 64, 50, 48, 320, 3, 2, 1, 1, 256 | 64 | 128 | (2 << 2) | (2 << 4));
+        {
+            const uint32_t seed = rng_s;
+            t_conv("Conv2dF32 tc-bf16 qwen stage3 480", 3, 16, 25, 480, 480, 3, 2, 1, 1, 256 | 64 | 128 | (2 << 2) | (2 << 4));
+            rng_s = seed;
+            t_conv("Conv2dF32 ffma qwen stage3 480 (same data)", 3, 16, 25, 480, 480, 3, 2, 1, 1, 64 | 128 | (2 << 2) | (2 << 4));
+        }
+        t_layernorm("LayerNormF32 ordered bf16", 100, 1024, 3, true);
+        t_grouped("GroupedAttentionF32 qwen 300 v290", 300, 1024, 64, 104, 7, 290);
+        t_grouped_table("GroupedAttentionF32 qwen packed table", 13 * 19, {4, 0, 104, 104, 36, 143, 35, 182, 60});
+        printf("%s: %d failure(s)\n", g_fail ? "FAIL" : "PASS", g_fail);
+        return g_fail ? 1 : 0;
     }
     if (argc > 1 && !strcmp(argv[1], "--bench-only")) {
         bench_signal();

@@ -60,6 +60,17 @@ __device__ __forceinline__ float sp_bf16(float v) { return __bfloat162float(__fl
  * bf16-rounded probabilities and GELUs on the golden's side of a rounding boundary. */
 __device__ __forceinline__ float sp_expf(float x) { return (float)exp((double)x); }
 __device__ __forceinline__ float sp_tanhf(float x) { return (float)tanh((double)x); }
+/* The erf-GELU's exp(-z^2) in float on sm_120, where FP64 runs at 1/64 rate: the double form was
+ * most of the Qwen3-ASR conv front end. rtx-5090, 64-chunk bucket, ms: conv1 2.784 -> 0.808,
+ * conv2 4.228 -> 3.739, fc1 0.146 -> 0.084. Same bf16 GELUs as the double form on every
+ * speech_f32_op_test case; the attention softmax keeps sp_expf (float exp moved its outputs). */
+__device__ __forceinline__ float sp_gelu_expf(float x) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ == 1200
+    return expf(x);
+#else
+    return sp_expf(x);
+#endif
+}
 __device__ __forceinline__ float sp_f16(uint16_t h) { return __half2float(__ushort_as_half(h)); }
 __device__ __forceinline__ float sp_sigmoid(float x) {
     return __fdiv_rn(1.0f, __fadd_rn(1.0f, sp_expf(-x)));
@@ -80,7 +91,7 @@ __device__ __forceinline__ float sp_gelu_erf_bf16(float value) {
     p = __fadd_rn(__fmul_rn(p, t), 1.421413741f);
     p = __fsub_rn(__fmul_rn(p, t), 0.284496736f);
     p = __fadd_rn(__fmul_rn(p, t), 0.254829592f);
-    const float r = __fmul_rn(__fmul_rn(p, t), sp_expf(__fmul_rn(-z, z)));
+    const float r = __fmul_rn(__fmul_rn(p, t), sp_gelu_expf(__fmul_rn(-z, z)));
     return sp_bf16(__fmul_rn(__fmul_rn(0.5f, value), z < 0.0f ? r : __fsub_rn(2.0f, r)));
 }
 
