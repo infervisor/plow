@@ -19,10 +19,11 @@ parallel = "tp"
 
 [checkpoint]
 source = "hf:Qwen/Qwen3-ASR-0.6B"
+revision = "5eb144179a02acc5e5ba31e748d22b0cf3e303b0"
 
 [cell]
 name = "qwen3-asr-0.6b-rtx5090"
-hf_dir = "{hf:Qwen/Qwen3-ASR-0.6B}"
+hf_dir = "{hf:Qwen/Qwen3-ASR-0.6B@5eb144179a02acc5e5ba31e748d22b0cf3e303b0}"
 gpu = "5090"
 arch = "sm_120a"
 n_cu = 170
