@@ -48,6 +48,30 @@ __device__ __forceinline__ bf16v8 bf16v8_zero() {
     return r;
 }
 
+/* PLOW_NV_RAW_NARROW (default off): megakernel-friendly forms for the 1-CTA decode bodies. Inside
+ * the interpreter, bf16v8 loads land in a staging quartet and are PRMT-unpacked at once (serialising
+ * the loads) and tid-derived indices are spilled across the interpreter loop. These keep each
+ * 8 x bf16 chunk PACKED in a uint4 until its arithmetic use, re-read %tid.x per body, and convert
+ * with the same __bfloat162float / __float2bfloat16 as the bf16v8 path (identical values). */
+#ifndef PLOW_NV_RAW_NARROW
+#define PLOW_NV_RAW_NARROW 0
+#endif
+__device__ __forceinline__ unsigned plow_tid() {
+    unsigned t;
+    asm volatile("mov.u32 %0, %%tid.x;" : "=r"(t));
+    return t;
+}
+__device__ __forceinline__ uint4 plow_ld_u4(const __nv_bfloat16* p, bool ok) {
+    return ok ? *(const uint4*)p : make_uint4(0u, 0u, 0u, 0u);
+}
+/* Element j (compile-time after unrolling) of a packed 8 x bf16 chunk; x[0] is the low half. */
+__device__ __forceinline__ float plow_bf_at(const uint4& v, int j) {
+    const unsigned w = j < 2 ? v.x : j < 4 ? v.y : j < 6 ? v.z : v.w;
+    return __bfloat162float(__ushort_as_bfloat16((unsigned short)((j & 1) ? (w >> 16) : (w & 0xffffu))));
+}
+__device__ __forceinline__ unsigned plow_bf_pack(__nv_bfloat16 lo, __nv_bfloat16 hi) {
+    return (unsigned)__bfloat16_as_ushort(lo) | ((unsigned)__bfloat16_as_ushort(hi) << 16);
+}
 __device__ __forceinline__ unsigned short pack_fp8_e4m3(float lo, float hi) {
     return (unsigned short)__nv_cvt_float2_to_fp8x2(make_float2(lo, hi), __NV_SATFINITE, __NV_E4M3);
 }
@@ -64,6 +88,17 @@ __device__ __forceinline__ float block_sum(float v, float* part) {
      * value is bit-identical) instead of thread 0 folding while 255 threads idle across a
      * second barrier + smem broadcast round trip. 3 barriers -> 2; the trailing barrier stays:
      * part[] is a reused arena slot, no thread may race ahead and clobber it. */
+    float r = part[0];
+#pragma unroll
+    for (unsigned w = 1; w < PLOW_NV_WARPS; w++) r += part[w];
+    __syncthreads();
+    return r;
+}
+/* block_sum with the caller's tid (PLOW_NV_RAW_NARROW bodies): same fold order, same barriers. */
+__device__ __forceinline__ float block_sum_tid(float v, float* part, unsigned tid) {
+    v = warp_sum32(v);
+    if ((tid & PLOW_NV_LANE_MASK) == 0) part[tid >> PLOW_NV_WARP_SHIFT] = v;
+    __syncthreads();
     float r = part[0];
 #pragma unroll
     for (unsigned w = 1; w < PLOW_NV_WARPS; w++) r += part[w];

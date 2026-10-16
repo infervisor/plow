@@ -14030,6 +14030,10 @@ impl GpuEngine {
     /// a normal cubin.
     pub fn trace_reset(&self) -> Result<()> {
         self.be.module_global_zero(&self.module, "g_tr_n", 4)?;
+        self.be
+            .module_global_zero(&self.module, "g_tl_cnt", 160 * 4)?;
+        self.be
+            .module_global_zero(&self.module, "g_tl_ph", 160 * 3 * 8)?;
         Ok(())
     }
 
@@ -14072,6 +14076,24 @@ impl GpuEngine {
         let mut raw = Vec::new();
         if !self.be.module_global_bytes(module, "g_tr_n", 4, &mut raw)? {
             return Ok(None);
+        }
+        // PLOW_NV_TRACE=2: the all-block timeline. File = u32 per-block counts [160], then the
+        // per-block slots (160 x 1536 x 8 little-endian u64).
+        if let Some(path) = crate::config::RuntimeConfig::get().amd.trace_raw.as_ref() {
+            let mut cnt = Vec::new();
+            // A module that recorded nothing (FA after FAT) must not overwrite the other's file.
+            if self
+                .be
+                .module_global_bytes(module, "g_tl_cnt", 160 * 4, &mut cnt)?
+                && cnt.iter().any(|&b| b != 0)
+            {
+                let mut tl = Vec::new();
+                self.be
+                    .module_global_bytes(module, "g_tl", 160 * 1536 * 64, &mut tl)?;
+                cnt.extend_from_slice(&tl);
+                let p = format!("{path}.tl");
+                std::fs::write(&p, &cnt).map_err(|e| RuntimeError::Device(format!("{p}: {e}")))?;
+            }
         }
         let n = u32::from_le_bytes(raw[..4].try_into().expect("4B")) as usize;
         if n == 0 {

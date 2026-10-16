@@ -27,6 +27,22 @@
 #include "sm120_common.cuh"
 #include <cuda_fp8.h> /* __nv_fp8_e4m3 — the T11 fused activation quant */
 
+/* PLOW_NV_TRACE=2 phase stamps inside the 1-CTA norm bodies (interp_sm120.cu copies them into the
+ * packet's timeline record). Measurement builds only. */
+#if defined(PLOW_NV_TRACE) && PLOW_NV_TRACE >= 2
+__device__ unsigned long long g_tl_ph[160][3];
+#define PLOW_TL_PH(k)                                                                              \
+    do {                                                                                           \
+        if (threadIdx.x == 0 && blockIdx.x < 160) {                                                \
+            unsigned long long t_;                                                                 \
+            asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t_));                                 \
+            g_tl_ph[blockIdx.x][k] = t_;                                                           \
+        }                                                                                          \
+    } while (0)
+#else
+#define PLOW_TL_PH(k) do {} while (0)
+#endif
+
 #ifndef PLOW_NV_GEMMA3
 #define PLOW_NV_GEMMA3 0
 #endif
@@ -207,7 +223,52 @@ static __device__ void d_rmsnorm(__nv_bfloat16* __restrict__ out, const __nv_bfl
         }
         return;
     }
+    PLOW_TL_PH(0);
     const bool fits = (feat <= RN_REG * PLOW_NV_THREADS) && ((feat & 7u) == 0);
+#if PLOW_NV_RAW_NARROW
+    /* Packed twin of the fits arm below (sm120_common.cuh PLOW_NV_RAW_NARROW): same element map,
+     * accumulation order, reduction and rounding. */
+    if (fits && !xq) {
+        const unsigned tid = plow_tid();
+        for (unsigned row = slice; row < rows; row += nblk) {
+            const size_t base = (size_t)row * feat;
+            const size_t obase = (size_t)(out_row0 + row) * feat;
+            uint4 v[RN_VEC], w[RN_VEC];
+#pragma unroll
+            for (int c = 0; c < RN_VEC; c++) {
+                const unsigned i = (tid + (unsigned)c * PLOW_NV_THREADS) * 8;
+                v[c] = plow_ld_u4(x + base + i, i < feat);
+                w[c] = plow_ld_u4(gamma + i, gamma && i < feat);
+            }
+            float ss = 0.0f;
+#pragma unroll
+            for (int c = 0; c < RN_VEC; c++)
+#pragma unroll
+                for (int j = 0; j < 8; j++) {
+                    const float f = plow_bf_at(v[c], j);
+                    ss += f * f;
+                }
+            const float inv = rsqrtf(block_sum_tid(ss, part, tid) * __fdividef(1.0f, (float)feat) + eps);
+            PLOW_TL_PH(1);
+#pragma unroll
+            for (int c = 0; c < RN_VEC; c++) {
+                const unsigned i = (tid + (unsigned)c * PLOW_NV_THREADS) * 8;
+                if (i < feat) {
+                    unsigned o[4];
+#pragma unroll
+                    for (int j = 0; j < 8; j += 2) {
+                        const float g0 = gamma ? norm_weight(plow_bf_at(w[c], j)) : 1.0f;
+                        const float g1 = gamma ? norm_weight(plow_bf_at(w[c], j + 1)) : 1.0f;
+                        o[j / 2] = plow_bf_pack(__float2bfloat16(plow_bf_at(v[c], j) * inv * g0),
+                                                __float2bfloat16(plow_bf_at(v[c], j + 1) * inv * g1));
+                    }
+                    *(uint4*)(out + obase + i) = make_uint4(o[0], o[1], o[2], o[3]);
+                }
+            }
+        }
+        return;
+    }
+#endif
     for (unsigned row = slice; row < rows; row += nblk) {
         const size_t base = (size_t)row * feat;
         const size_t obase = (size_t)(out_row0 + row) * feat;
@@ -232,6 +293,7 @@ static __device__ void d_rmsnorm(__nv_bfloat16* __restrict__ out, const __nv_bfl
                     ss += f * f;
                 }
             const float inv = rsqrtf(block_sum(ss, part) * __fdividef(1.0f, (float)feat) + eps);
+            PLOW_TL_PH(1);
             if (!xq) {
 #pragma unroll
                 for (int c = 0; c < RN_VEC; c++) {
@@ -777,7 +839,80 @@ static __device__ void d_norm_residual_norm(__nv_bfloat16* __restrict__ out, __n
         return;
     }
 #endif
+    PLOW_TL_PH(0);
     const bool fits = (feat <= RN_REG * PLOW_NV_THREADS) && ((feat & 7u) == 0);
+#if PLOW_NV_RAW_NARROW
+    /* Packed twin of the fits arm below (sm120_common.cuh PLOW_NV_RAW_NARROW): same element map,
+     * accumulation order, reductions and roundings; `resid` may alias `a` (each thread reads its
+     * own elements before writing them). */
+    if (fits) {
+        const unsigned tid = plow_tid();
+        for (unsigned row = slice; row < rows; row += nblk) {
+            const size_t base = (size_t)row * feat;
+            uint4 av[RN_VEC], bv[RN_VEC], wb[RN_VEC], wn[RN_VEC];
+#pragma unroll
+            for (int c = 0; c < RN_VEC; c++) {
+                const unsigned i = (tid + (unsigned)c * PLOW_NV_THREADS) * 8;
+                const bool ok = i < feat;
+                av[c] = plow_ld_u4(a + base + i, ok);
+                bv[c] = plow_ld_u4(b + base + i, ok);
+                wb[c] = plow_ld_u4(gb + i, gb && ok);
+                wn[c] = plow_ld_u4(gn + i, gn && ok);
+            }
+            float ssb = 0.0f;
+#pragma unroll
+            for (int c = 0; c < RN_VEC; c++)
+#pragma unroll
+                for (int j = 0; j < 8; j++) {
+                    const float f = plow_bf_at(bv[c], j);
+                    ssb += f * f;
+                }
+            const float invb = rsqrtf(block_sum_tid(ssb, part, tid) / (float)feat + eps);
+            PLOW_TL_PH(1);
+            uint4 rv[RN_VEC];
+            float ssr = 0.0f;
+#pragma unroll
+            for (int c = 0; c < RN_VEC; c++) {
+                unsigned r[4];
+#pragma unroll
+                for (int j = 0; j < 8; j += 2) {
+                    __nv_bfloat16 h[2];
+#pragma unroll
+                    for (int e = 0; e < 2; e++) {
+                        const float g = gb ? norm_weight(plow_bf_at(wb[c], j + e)) : 1.0f;
+                        const float f =
+                            (plow_bf_at(av[c], j + e) + gemma_postnorm_round(plow_bf_at(bv[c], j + e) * invb * g)) *
+                            scale;
+                        h[e] = __float2bfloat16(f);
+                        const float rf = __bfloat162float(h[e]);
+                        ssr += rf * rf;
+                    }
+                    r[j / 2] = plow_bf_pack(h[0], h[1]);
+                }
+                rv[c] = make_uint4(r[0], r[1], r[2], r[3]);
+            }
+            const float invr = rsqrtf(block_sum_tid(ssr, part, tid) / (float)feat + eps);
+            PLOW_TL_PH(2);
+#pragma unroll
+            for (int c = 0; c < RN_VEC; c++) {
+                const unsigned i = (tid + (unsigned)c * PLOW_NV_THREADS) * 8;
+                if (i < feat) {
+                    unsigned o[4];
+#pragma unroll
+                    for (int j = 0; j < 8; j += 2) {
+                        const float g0 = gn ? norm_weight(plow_bf_at(wn[c], j)) : 1.0f;
+                        const float g1 = gn ? norm_weight(plow_bf_at(wn[c], j + 1)) : 1.0f;
+                        o[j / 2] = plow_bf_pack(__float2bfloat16(plow_bf_at(rv[c], j) * invr * g0),
+                                                __float2bfloat16(plow_bf_at(rv[c], j + 1) * invr * g1));
+                    }
+                    *(uint4*)(resid + base + i) = rv[c];
+                    *(uint4*)(out + base + i) = make_uint4(o[0], o[1], o[2], o[3]);
+                }
+            }
+        }
+        return;
+    }
+#endif
     for (unsigned row = slice; row < rows; row += nblk) {
         const size_t base = (size_t)row * feat;
         if (fits) {
@@ -806,6 +941,7 @@ static __device__ void d_norm_residual_norm(__nv_bfloat16* __restrict__ out, __n
                     ssb += f * f;
                 }
             const float invb = rsqrtf(block_sum(ssb, part) / (float)feat + eps);
+            PLOW_TL_PH(1);
             /* resid = (a + norm(b)*gb) * scale, ROUNDED to bf16; the second reduction runs over
              * the rounded value, exactly reproducing NORM_RESIDUAL's store + RMSNORM's reload. */
             bf16v8 rv[RN_VEC];
@@ -826,6 +962,7 @@ static __device__ void d_norm_residual_norm(__nv_bfloat16* __restrict__ out, __n
                 rv[c] = r;
             }
             const float invr = rsqrtf(block_sum(ssr, part) / (float)feat + eps);
+            PLOW_TL_PH(2);
 #pragma unroll
             for (int c = 0; c < RN_VEC; c++) {
                 const unsigned i = (threadIdx.x + (unsigned)c * PLOW_NV_THREADS) * 8;
