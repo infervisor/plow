@@ -341,6 +341,7 @@ const DOC: &[S] = &[
     S { op: DevOp::CompressRopeQuant, t: &["out", "src", "cosb", "sinb", "pos"], i: &["n_rows", "d", "rd", "qblk", "ratio", "row_base", "qmode", "n_head"], f: &[], j: &[] },
     S { op: DevOp::MuseRmsNorm, t: &["out", "x", "w?", "band_out?"], i: &["rows", "dim", "mode", "band_cols?"], f: &["eps", "oscale"], j: &[] },
     S { op: DevOp::MuseResidualGate, t: &["out", "res", "h", "g"], i: &["n", "rows"], f: &["T", "eps"], j: &[] },
+    S { op: DevOp::MuseNormGateNorm, t: &["out_res", "h", "w1?", "res", "g", "out_n", "w2?", "band_out?"], i: &["rows", "dim", "mode1", "mode2", "band_cols?", "gate_eps", "oscale"], f: &["eps1", "eps2"], j: &["", "T"] },
     S { op: DevOp::MuseMoeCombineNorm, t: &["out", "part", "table", "w", "band_out?"], i: &["H", "k", "ybf", "rows?", "band_cols?"], f: &["eps"], j: &[] },
 ];
 

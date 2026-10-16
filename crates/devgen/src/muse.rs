@@ -236,6 +236,23 @@ impl Tp {
     }
 }
 
+/// One row norm's weight (`TENSOR_NONE` = weightless), mode, eps and output scale (0 = 1).
+#[derive(Clone, Copy)]
+struct NormSpec {
+    w: u32,
+    mode: u32,
+    eps: f32,
+    oscale: f32,
+}
+
+/// The norm that follows a layer when [`DevOp::MuseNormGateNorm`] takes it into the layer's
+/// tail: the next layer's input norm, or the final norm.
+#[derive(Clone, Copy)]
+struct NextNorm {
+    out: u32,
+    n: NormSpec,
+}
+
 struct Acts {
     x: u32,
     xnext: u32,
@@ -363,6 +380,37 @@ impl Emitter<'_> {
             }
         })
     }
+    /// `out_res = gate_res(res, norm(h | n1), g)`, then `out_n = norm(out_res | n2)` in one
+    /// [`DevOp::MuseNormGateNorm`] (a [`Self::norm`] / [`Self::residual_gate`] / [`Self::norm`]
+    /// chain).
+    #[allow(clippy::too_many_arguments)]
+    fn norm_gate_norm(
+        &mut self,
+        out_res: u32,
+        h: u32,
+        n1: NormSpec,
+        res: u32,
+        g: u32,
+        out_n: u32,
+        n2: NormSpec,
+        dep: &[u32],
+        band: Option<(u32, u32)>,
+    ) -> u32 {
+        let (dim, t, temp) = (self.c.hidden, self.t, self.c.temperature);
+        self.b.emit(DevOp::MuseNormGateNorm, self.rows(), dep, |d| {
+            d.t = [out_res, h, n1.w, res, g, out_n, n2.w, TENSOR_NONE];
+            d.i[..4].copy_from_slice(&[t, dim, n1.mode, n2.mode]);
+            if let Some((bm, cols)) = band {
+                d.t[7] = bm;
+                d.i[4] = cols;
+            }
+            d.i[5] = RESIDUAL_GATE_EPS.to_bits();
+            d.i[6] = n2.oscale.to_bits();
+            d.f[0] = n1.eps;
+            d.f[1] = n2.eps;
+            d.j[1] = temp.to_bits();
+        })
+    }
     fn residual_gate(&mut self, out: u32, res: u32, h: u32, g: u32, deps: &[u32]) -> u32 {
         let (n, t) = (self.c.hidden, self.t);
         let (temp, cus) = (self.c.temperature, self.cus((t * n).div_ceil(512)));
@@ -426,7 +474,17 @@ impl Emitter<'_> {
         })
     }
 
-    fn layer(&mut self, l: usize, src: u32, dst: u32, dep: Option<u32>) -> u32 {
+    /// `normed`: `act.hn` already holds this layer's input norm (the previous tail wrote it).
+    /// `next`: fuse the following norm into this layer's tail.
+    fn layer(
+        &mut self,
+        l: usize,
+        src: u32,
+        dst: u32,
+        dep: Option<u32>,
+        normed: bool,
+        next: Option<NextNorm>,
+    ) -> u32 {
         let c = self.c;
         let p = format!("{PREFIX}layers.{l}.");
         let (h, hd, m, e, t) = (c.hidden, c.hd, c.moe_hidden, c.n_exp, self.t);
@@ -472,11 +530,30 @@ impl Emitter<'_> {
         let vc = self.w(&format!("kv.{l}.v"), slots * kd64 * self.ctx as u64 * BF16);
 
         // ---- attention ----
-        let d_hn = self.norm(hn, src, w_in, h, NORM_CENTERED, c.eps, dep.as_slice(), None);
-        let d_q = self.proj(q_raw, hn, wq, qd, h, d_hn);
-        let d_k = self.proj(k_raw, hn, wk, kd, h, d_hn);
-        let d_v = self.proj(v_raw, hn, wv, kd, h, d_hn);
-        let d_g = self.proj(gate, hn, wg, qd, h, d_hn);
+        let ngn = self.ngn();
+        let d_hn = if normed {
+            dep.expect("a fused input norm has a producer")
+        } else {
+            self.norm(hn, src, w_in, h, NORM_CENTERED, c.eps, dep.as_slice(), None)
+        };
+        let qkvg = t == 1
+            && !self.prefill
+            && emit_config::active().muse_qkvg
+            && crate::gemv_staged_rows(t) as u64 * h64 <= crate::gm_lds_halves();
+        let (d_q, d_k, d_v, d_g) = if qkvg {
+            let f = self.b.emit(DevOp::GemvQkvg, self.b.all(), &[d_hn], |d| {
+                d.t[..8].copy_from_slice(&[q_raw, hn, wq, k_raw, wk, v_raw, wv, gate]);
+                d.i[..7].copy_from_slice(&[t, qd, h, kd, kd, qd, wg]);
+            });
+            (f, f, f, f)
+        } else {
+            (
+                self.proj(q_raw, hn, wq, qd, h, d_hn),
+                self.proj(k_raw, hn, wk, kd, h, d_hn),
+                self.proj(v_raw, hn, wv, kd, h, d_hn),
+                self.proj(gate, hn, wg, qd, h, d_hn),
+            )
+        };
         let rope = c.rope[l];
         let d_qn = self.head_norm(q, q_raw, nh, rope, false, true, d_q);
         let d_kn = self.head_norm(kc, k_raw, nkv, rope, true, true, d_k);
@@ -523,12 +600,18 @@ impl Emitter<'_> {
         } else {
             self.proj(o, at, wo, h, qd, d_gate)
         };
-        let d_pn = self.norm(on, o, TENSOR_NONE, h, NORM_PLAIN, c.post_eps, &[d_o], None);
-        let d_xm = self.residual_gate(xmid, src, on, g_attn, &[d_pn]);
+        let band = (latent && t > 1).then(|| (hn2_bm, pre_k));
+        let d_hn2 = if ngn {
+            let n1 = NormSpec { w: TENSOR_NONE, mode: NORM_PLAIN, eps: c.post_eps, oscale: 0.0 };
+            let n2 = NormSpec { w: w_ff, mode: NORM_CENTERED, eps: c.eps, oscale: 0.0 };
+            self.norm_gate_norm(xmid, o, n1, src, g_attn, hn2, n2, &[d_o], band)
+        } else {
+            let d_pn = self.norm(on, o, TENSOR_NONE, h, NORM_PLAIN, c.post_eps, &[d_o], None);
+            let d_xm = self.residual_gate(xmid, src, on, g_attn, &[d_pn]);
+            self.norm(hn2, xmid, w_ff, h, NORM_CENTERED, c.eps, &[d_xm], band)
+        };
 
         // ---- latent MoE ----
-        let band = (latent && t > 1).then(|| (hn2_bm, pre_k));
-        let d_hn2 = self.norm(hn2, xmid, w_ff, h, NORM_CENTERED, c.eps, &[d_xm], band);
         let d_rl = self.b.emit(DevOp::GemvF32, self.b.all(), &[d_hn2], |d| {
             d.t[0] = rlogit;
             d.t[1] = hn2;
@@ -673,8 +756,18 @@ impl Emitter<'_> {
         } else {
             self.proj(y, ylat, w_postp, h, m, d_cmb)
         };
+        if let Some(nx) = next.filter(|_| ngn) {
+            let n1 = NormSpec { w: w_post, mode: NORM_INPUT_SCALED, eps: c.post_eps, oscale: 0.0 };
+            return self.norm_gate_norm(dst, y, n1, xmid, g_ff, nx.out, nx.n, &[d_y], None);
+        }
         let d_yn = self.norm(yn, y, w_post, h, NORM_INPUT_SCALED, c.post_eps, &[d_y], None);
         self.residual_gate(dst, xmid, yn, g_ff, &[d_yn])
+    }
+
+    /// [`DevOp::MuseNormGateNorm`] replaces the norm / gate / norm chains (one-row decode,
+    /// opt-in; the batched rungs are not measured).
+    fn ngn(&self) -> bool {
+        !self.prefill && self.t == 1 && emit_config::active().muse_ngn
     }
 }
 
@@ -877,21 +970,41 @@ fn program(
         dep = Some(em.norm(x, e.emb, TENSOR_NONE, h, NORM_PLAIN, c.eps, &[d_emb], None));
     }
     let last = s.layers.end - 1;
+    let ngn = em.ngn();
+    let mut normed = false;
     for l in s.layers.clone() {
         let dst = if l == last && !full { xnext } else { x };
-        dep = Some(em.layer(l, x, dst, dep));
+        // The norm after this layer, when the tail fuses it.
+        let next = if !ngn {
+            None
+        } else if l < last {
+            let w = em.w(&format!("{PREFIX}layers.{}.input_layernorm.weight", l + 1), h64 * BF16);
+            Some(NextNorm { out: em.a.hn, n: NormSpec { w, mode: NORM_CENTERED, eps: c.eps, oscale: 0.0 } })
+        } else if full {
+            let w = em.w(&format!("{PREFIX}norm.weight"), h64 * BF16);
+            let n = NormSpec { w, mode: NORM_PLAIN, eps: c.eps, oscale: c.output_multiplier };
+            Some(NextNorm { out: em.a.hn, n })
+        } else {
+            None
+        };
+        dep = Some(em.layer(l, x, dst, dep, normed, next));
+        normed = next.is_some();
     }
     if let Some(e) = &ends {
         let w_final = em.w(&format!("{PREFIX}norm.weight"), h64 * BF16);
         let lm = em.w("lm_head.weight", c.vocab as u64 * h64 * BF16);
         let (hn, vocab, mult, cap) = (em.a.hn, c.vocab, c.output_multiplier, c.softcap);
         // `cap * tanh(mult * logits / cap)`: the multiplier rides the final norm's output.
-        let d_fn = em.b.emit(DevOp::MuseRmsNorm, em.rows(), dep.as_slice(), |d| {
-            d.t[..3].copy_from_slice(&[hn, x, w_final]);
-            d.i[..3].copy_from_slice(&[t, h, NORM_PLAIN]);
-            d.f[0] = c.eps;
-            d.f[1] = mult;
-        });
+        let d_fn = if normed {
+            dep.expect("the last layer's tail wrote the final norm")
+        } else {
+            em.b.emit(DevOp::MuseRmsNorm, em.rows(), dep.as_slice(), |d| {
+                d.t[..3].copy_from_slice(&[hn, x, w_final]);
+                d.i[..3].copy_from_slice(&[t, h, NORM_PLAIN]);
+                d.f[0] = c.eps;
+                d.f[1] = mult;
+            })
+        };
         // Prefill scores its last row only (a_row0, which the host moves to the chunk's last
         // real row); decode scores every slot.
         let (lm_op, lm_rows) = match (prefill, t) {

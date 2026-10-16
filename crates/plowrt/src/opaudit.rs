@@ -288,6 +288,7 @@ pub fn classify(op: DevOp) -> OpClass {
         DevOp::RmsNorm => a_rows("i0=rows"),
         DevOp::MuseRmsNorm => a_rows("i0=rows"),
         DevOp::MuseResidualGate => a_rows("i1=rows"),
+        DevOp::MuseNormGateNorm => a_rows("i0=rows"),
         DevOp::RowRms => a_rows("i0=rows"),
         DevOp::Residual | DevOp::Sum4Bf16 => a_elem("i0=n"),
         DevOp::Glu => a_elem("i0=n"),

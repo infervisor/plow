@@ -1122,6 +1122,13 @@ esac
 if [ "$decode_inventory_prune" = 1 ]; then
   DEC="$DEC -DPLOW_DECODE_INVENTORY_PRUNE=1"
 fi
+# PLOW_FA_MERGE_LDS=1 (opt-in, bit-identical): the decode flash merge stages its splits in LDS
+# in one load round (op_attention_common.h [MERGE-LDS]).
+case "${PLOW_FA_MERGE_LDS:-0}" in
+  0) ;;
+  1) DEC="$DEC -DPLOW_FA_MERGE_LDS=1" ;;
+  *) echo "PLOW_FA_MERGE_LDS must be 0 or 1" >&2; exit 2 ;;
+esac
 if [ -n "$MUSE_AX" ]; then
   DEC="$DEC $MUSE_AX"
   echo "   Muse Spark packet: plain objects carry $MUSE_AX"
@@ -1131,6 +1138,12 @@ if [ -n "$MUSE_AX" ]; then
     0) ;;
     1) DEC="$DEC -DPLOW_MOE_DEC_A4=1" ;;
     *) echo "PLOW_MUSE_DEC_A4W4 must be 0 or 1" >&2; exit 2 ;;
+  esac
+  # PLOW_MUSE_CMB_ILP=1 (opt-in, bit-identical): the combine-norm's k loads issue together.
+  case "${PLOW_MUSE_CMB_ILP:-0}" in
+    0) ;;
+    1) DEC="$DEC -DPLOW_MUSE_CMB_ILP=1" ;;
+    *) echo "PLOW_MUSE_CMB_ILP must be 0 or 1" >&2; exit 2 ;;
   esac
 fi
 echo "   decode GEMV batch bucket: PLOW_GEMV_MM=$GVMM walk=$WALK inventory_prune=$decode_inventory_prune (PLOW_DECODE_BATCH=${PLOW_DECODE_BATCH:-1})"

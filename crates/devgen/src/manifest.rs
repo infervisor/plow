@@ -1750,6 +1750,7 @@ fn backend_amd(
         || has("MuseRmsNorm")
         || has("MuseResidualGate")
         || has("MuseMoeCombineNorm")
+        || has("MuseNormGateNorm")
     {
         req.push("PLOW_QWEN_GDN=1".into());
     }

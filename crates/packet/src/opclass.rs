@@ -151,6 +151,7 @@ pub fn op_classes(op: DevOp) -> &'static [&'static str] {
 
         RmsNorm | RowRms | NormResidual | AddNorm | NormResidualNorm | LayerNorm | QwenRmsNorm
         | MuseRmsNorm
+        | MuseNormGateNorm
         | QwenGatedNorm | KdaGatedNorm | LayerNormF32 | RowStatsF32 | RmsNormF32
         // Engram's gate is two RMS reductions over `hidden` driving a gated residual add, so
         // its cost and its knob scope are a norm's, not the hc machinery's -- it mixes INTO the

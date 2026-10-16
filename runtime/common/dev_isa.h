@@ -1537,6 +1537,12 @@ enum {
      * bf16 gate*y of MOE_GROUP_DOWN_PF's part16 scatter. i3 = rows (0 = 1; one workgroup per
      * row), t4/i4 = band-major copy as MUSE_RMSNORM. */
     PLOW_DOP_MUSE_MOE_COMBINE_NORM = 220,
+    /* Ops 218 -> 219 -> 218 fused (decode objects), one workgroup per row:
+     * out_n = norm2(out_res), out_res = gate_res(res, norm1(h), g).
+     * t0=out_res t1=h t2=w1? t3=res t4=g t5=out_n t6=w2? t7=band?
+     * i0=rows i1=dim i2=mode1 i3=mode2 i4=band width (0: none) i5=gate eps (f32 bits)
+     * i6=out_n scale (f32 bits, 0 = 1) f0=eps1 f1=eps2 j1=T (f32 bits). */
+    PLOW_DOP_MUSE_NORM_GATE_NORM = 221,
 
     PLOW_DOP__COUNT
 };

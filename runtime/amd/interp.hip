@@ -1699,14 +1699,15 @@ extern "C" __device__ unsigned plow_flash_merge_hd_64 = 1;
 #endif
 
 __device__ __forceinline__ void exec_flash_merge(CInst in, CTens T, unsigned n_batch,
-                                                 unsigned slice, unsigned nblk) {
+                                                 unsigned slice, unsigned nblk,
+                                                 float* lds = nullptr) {
 #define TEN(k) (in->t[k] == PLOW_TENSOR_NONE ? nullptr : T[in->t[k]])
     /* t3 = OPTIONAL attention sinks: bf16[n_head] (GPT-OSS) or float[n_head] (DeepSeek-V4.1, i4=1 or D=512). */
     const void* const sinks = TEN(3);
     const bool sinks_f32 = (in->i[4] == 1u) || (in->i[3] == 512u);
 #define PLOW_AMD_FLASH_MERGE(DD)                                                                 \
     d_flash_merge<DD>((bf16*)TEN(0), (const float*)TEN(1), (const float*)TEN(2), n_batch,        \
-                      in->i[1], in->i[2], slice, nblk, sinks, in->i[6], sinks_f32)
+                      in->i[1], in->i[2], slice, nblk, sinks, in->i[6], sinks_f32, lds)
     if (in->i[3] == 128) PLOW_AMD_FLASH_MERGE(128);
     else if (in->i[3] == 256) PLOW_AMD_FLASH_MERGE(256);
     else if (in->i[3] == 512) PLOW_AMD_FLASH_MERGE(512);
@@ -5730,7 +5731,11 @@ __device__ static void plow_exec(CInst in_v, unsigned slice, CTens T_v, plow_sme
         /* split-KV prefill ALWAYS needs the merge, so it lives in this bucket too */
 #if !PLOW_MIXED_STEP && (!PLOW_DECODE_INVENTORY_PRUNE || PLOW_HAS_FLASH_MERGE)
         case PLOW_DOP_FLASH_MERGE:
-            exec_flash_merge(in, T, PLOW_RUNTIME_ROWS(in->i[0]), slice, nblk);
+            exec_flash_merge(in, T, PLOW_RUNTIME_ROWS(in->i[0]), slice, nblk,
+                             PLOW_FA_MERGE_LDS && (size_t)in->i[2] * (in->i[3] + 2u) * sizeof(float)
+                                                          <= sizeof(sm->raw)
+                                 ? (float*)sm->raw
+                                 : nullptr);
             break;
 #endif
 #endif
@@ -6300,7 +6305,11 @@ __device__ static void plow_exec(CInst in_v, unsigned slice, CTens T_v, plow_sme
                 break;
             }
 #endif
-            exec_flash_merge(in, T, PLOW_RUNTIME_ROWS(in->i[0]), slice, nblk);
+            exec_flash_merge(in, T, PLOW_RUNTIME_ROWS(in->i[0]), slice, nblk,
+                             PLOW_FA_MERGE_LDS && (size_t)in->i[2] * (in->i[3] + 2u) * sizeof(float)
+                                                          <= sizeof(sm->raw)
+                                 ? (float*)sm->raw
+                                 : nullptr);
             break;
 #endif
 #endif /* bucket */
@@ -6634,6 +6643,16 @@ __device__ static void plow_exec(CInst in_v, unsigned slice, CTens T_v, plow_sme
                                     in->i[1], in->fj[0].f, slice, nblk, (float*)sm->raw, in->i[2],
                                     in->i[3], in->i[4] ? (bf16*)TEN(4) : nullptr, in->i[4]);
             break;
+#if !PLOW_BUCKET_PREFILL && (!PLOW_DECODE_INVENTORY_PRUNE || PLOW_HAS_MUSE_NORM_GATE_NORM)
+        case PLOW_DOP_MUSE_NORM_GATE_NORM:
+            d_muse_norm_gate_norm((bf16*)TEN(0), (bf16*)TEN(5), (const bf16*)TEN(1),
+                                  (const bf16*)TEN(2), (const bf16*)TEN(3), (const bf16*)TEN(4),
+                                  (const bf16*)TEN(6), in->i[0], in->i[1], in->i[2], in->i[3],
+                                  in->fj[0].f, in->fj[1].f, in->fj[2].f, __uint_as_float(in->i[5]),
+                                  __uint_as_float(in->i[6]), slice, nblk, sm->part,
+                                  in->i[4] ? (bf16*)TEN(7) : nullptr, in->i[4]);
+            break;
+#endif
 #endif
         case PLOW_DOP_ROPE_INVERSE_O:
             d_rope_inverse_o((bf16*)TEN(0), (const float*)TEN(1), (const float*)TEN(2),

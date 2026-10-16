@@ -555,6 +555,12 @@ pub struct EmitConfig {
     /// each (default) instead of replicated on every rank.
     #[arg(long, env = "PLOW_MUSE_LATENT_TP", default_value_t = true, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
     pub muse_latent_tp: bool,
+    /// Muse Spark one-row decode: q/k/v/gate projections as one `GemvQkvg` (LDS-bounded).
+    #[arg(long, env = "PLOW_MUSE_QKVG", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
+    pub muse_qkvg: bool,
+    /// Muse Spark one-row decode: each norm / residual gate / norm chain as one `MuseNormGateNorm`.
+    #[arg(long, env = "PLOW_MUSE_NGN", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
+    pub muse_ngn: bool,
     /// Items per gathered query pack in the V4.1 sparse prefill (1 = the un-split arm).
     #[arg(long, env = "PLOW_MLA_GATHER_SPLIT", default_value_t = 2)]
     pub mla_gather_split: u32,
@@ -1960,6 +1966,8 @@ impl EmitConfig {
             mla_ns: env_u32("PLOW_MLA_NS"),
             muse_decode_ns: env_u32("PLOW_MUSE_DECODE_NS"),
             muse_latent_tp: env_bool_default_true("PLOW_MUSE_LATENT_TP"),
+            muse_qkvg: env_bool("PLOW_MUSE_QKVG"),
+            muse_ngn: env_bool("PLOW_MUSE_NGN"),
             mla_gather_split: env_u32("PLOW_MLA_GATHER_SPLIT").unwrap_or(2),
             dsv41_xr_band: env_u32("PLOW_DSV41_XR_BAND").unwrap_or(1),
             dsv41_xr_band_cus: env_u32("PLOW_DSV41_XR_BAND_CUS"),

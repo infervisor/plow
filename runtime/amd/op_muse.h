@@ -12,6 +12,11 @@
 #define PLOW_MUSE_NORM_PLAIN 0u
 #define PLOW_MUSE_NORM_CENTERED 1u
 #define PLOW_MUSE_NORM_INPUT_SCALED 2u
+/* Opt-in (bit-identical): the one-row TP combine-norm reads its routing table once and issues
+ * its k loads together. */
+#ifndef PLOW_MUSE_CMB_ILP
+#define PLOW_MUSE_CMB_ILP 0
+#endif
 
 __device__ __forceinline__ float muse_sigmoid(float x) { return 1.0f / (1.0f + expf(-x)); }
 
@@ -91,6 +96,92 @@ __device__ void d_muse_residual_gate(bf16* out, const bf16* res, const bf16* h, 
     }
 }
 
+/* Row chunks op 221 keeps in registers between its two norms (dim <= chunks * 8 * threads). */
+#define PLOW_MUSE_NGN_CHUNKS 2u
+
+/* ---- op 221 (decode objects): row norm -> gated residual -> row norm, one workgroup per row ----
+ * Ops 218 -> 219 -> 218 in one packet: every intermediate is rounded to bf16 where those ops store
+ * it and every sum keeps their per-thread order, so it is bit-identical to the three-op chain.
+ * `out_res` = the gated residual (may alias `res`); `out_n` = its norm (+ band copy). */
+__device__ void d_muse_norm_gate_norm(bf16* out_res, bf16* out_n, const bf16* h, const bf16* w1,
+                                      const bf16* res, const bf16* g, const bf16* w2,
+                                      unsigned rows, unsigned dim, unsigned mode1, unsigned mode2,
+                                      float eps1, float eps2, float temperature, float geps,
+                                      float oscale, unsigned slice, unsigned nblk, float* part,
+                                      bf16* bm = nullptr, unsigned bw = 0) {
+    if (oscale == 0.0f) oscale = 1.0f;
+    if (mode1 > PLOW_MUSE_NORM_INPUT_SCALED || mode2 > PLOW_MUSE_NORM_INPUT_SCALED ||
+        (mode1 != PLOW_MUSE_NORM_PLAIN && !w1) || (mode2 != PLOW_MUSE_NORM_PLAIN && !w2) ||
+        (dim & 7u) != 0u || dim > PLOW_MUSE_NGN_CHUNKS * PLOW_THREADS * 8u || (bw & 7u) != 0u ||
+        (bw && dim % bw != 0u)) {
+        if (threadIdx.x == 0) __builtin_trap();
+        return;
+    }
+    const bool hw1 = w1 != nullptr, hw2 = w2 != nullptr;
+    for (unsigned row = slice; row < rows; row += nblk) {
+        const bf16* hr = h + (size_t)row * dim;
+        const bf16* rr = res + (size_t)row * dim;
+        bf16* orr = out_res + (size_t)row * dim;
+        bf16* on = out_n + (size_t)row * dim;
+        float ss = 0.0f;
+#pragma unroll 4
+        for (unsigned i = threadIdx.x * 8u; i < dim; i += PLOW_THREADS * 8u) {
+            const bf16v8 v = ld_glob8(hr + i);
+            const bf16v8 a = hw1 ? ld_glob8(w1 + i) : bf16v8_zero();
+#pragma unroll
+            for (unsigned j = 0; j < 8; j++) {
+                const float f = muse_norm_in(bf2f(v[j]), bf2f(a[j]), mode1);
+                ss += f * f;
+            }
+        }
+        const float r1 = rsqrtf(block_sum(ss, part) / (float)dim + eps1);
+        float ss2 = 0.0f;
+        bf16v8 keep[PLOW_MUSE_NGN_CHUNKS];
+#pragma unroll
+        for (unsigned c = 0; c < PLOW_MUSE_NGN_CHUNKS; c++) {
+            const unsigned i = (c * PLOW_THREADS + threadIdx.x) * 8u;
+            if (i >= dim) break;
+            const bf16v8 v = ld_glob8(hr + i);
+            const bf16v8 a = hw1 ? ld_glob8(w1 + i) : bf16v8_zero();
+            const bf16v8 rv = ld_glob8(rr + i);
+            const bf16v8 gv = ld_glob8(g + i);
+            const bf16v8 b = hw2 ? ld_glob8(w2 + i) : bf16v8_zero();
+            bf16v8 o;
+#pragma unroll
+            for (unsigned j = 0; j < 8; j++) {
+                const float aw = bf2f(a[j]);
+                const bf16 y1 =
+                    f2bf(muse_norm_in(bf2f(v[j]), aw, mode1) * r1 * muse_norm_gain(aw, hw1, mode1));
+                const float wg = bf2f(gv[j]) / temperature;
+                const float beta = muse_sigmoid(wg);
+                const float alpha = sqrtf(fmaxf(muse_sigmoid(-wg) * (1.0f + beta), geps));
+                o[j] = f2bf(alpha * bf2f(rv[j]) + beta * bf2f(y1));
+                const float f = muse_norm_in(bf2f(o[j]), bf2f(b[j]), mode2);
+                ss2 += f * f;
+            }
+            st_glob8(orr + i, o);
+            keep[c] = o;
+        }
+        const float r2 = rsqrtf(block_sum(ss2, part) / (float)dim + eps2);
+#pragma unroll
+        for (unsigned c = 0; c < PLOW_MUSE_NGN_CHUNKS; c++) {
+            const unsigned i = (c * PLOW_THREADS + threadIdx.x) * 8u;
+            if (i >= dim) break;
+            const bf16v8 o = keep[c];
+            const bf16v8 b = hw2 ? ld_glob8(w2 + i) : bf16v8_zero();
+            bf16v8 y;
+#pragma unroll
+            for (unsigned j = 0; j < 8; j++) {
+                const float bw2 = bf2f(b[j]);
+                y[j] = f2bf(muse_norm_in(bf2f(o[j]), bw2, mode2) * r2 *
+                            muse_norm_gain(bw2, hw2, mode2) * oscale);
+            }
+            st_glob8(on + i, y);
+            muse_st_band(bm, bw, rows, row, i, y);
+        }
+    }
+}
+
 /* ---- op 220: post-expert input-scaled norm, then the weighted combine ----
  * `part[j]` is `gate_j * y_j` (f32) from the grouped down projection; the reference norms `y_j`
  * (its bf16 expert output) before weighting. `ybf` (i2, TP) reads `part` as bf16 `[k][H]` the
@@ -112,6 +203,82 @@ __device__ __forceinline__ float muse_expert_y(const float* part, size_t i, unsi
 __device__ __forceinline__ float muse_expert_z(float p, float gate, float w, unsigned ybf) {
     return ybf == 1u ? bf2f(f2bf(p * (1.0f + w))) : muse_post_expert_z(p, gate, w);
 }
+
+#if PLOW_MUSE_CMB_ILP
+/* muse_moe_combine_norm_row for bf16 `part` (TP) and k <= 8, with the same arithmetic in the same
+ * order: the routing table is read once up front and every pass issues its k loads before the
+ * first use. The generic row re-reads the table per slot and gates each load on it, a chain of
+ * dependent round trips (~21 us at k = 8, H = 4096). */
+#define PLOW_MUSE_CMB_K 8u
+__device__ void muse_moe_combine_norm_row_k8(bf16* out, const bf16* part,
+                                             const unsigned char* table, const bf16* w, unsigned H,
+                                             unsigned k, float eps, unsigned slice, unsigned nblk,
+                                             float* lds, unsigned ybf, bf16* bm, unsigned bw,
+                                             unsigned rows, unsigned row) {
+    float* wpart = lds;                                 /* [PLOW_WAVES][k] */
+    float* rinv = lds + PLOW_WAVES * PLOW_MUSE_MAX_TOPK; /* [k] */
+    float gate[PLOW_MUSE_CMB_K], ss[PLOW_MUSE_CMB_K];
+    bool live[PLOW_MUSE_CMB_K];
+#pragma unroll
+    for (unsigned j = 0; j < PLOW_MUSE_CMB_K; j++) {
+        gate[j] = j < k ? moe_slot_gate(table, j) : 0.0f;
+        live[j] = j < k && moe_slot_expert(table, j) != PLOW_EXPERT_UNUSED && gate[j] > 0.0f;
+        ss[j] = 0.0f;
+    }
+    for (unsigned i = threadIdx.x * 8u; i < H; i += PLOW_THREADS * 8u) {
+        const bf16v8 wv = ld_glob8(w + i);
+        bf16v8 yv[PLOW_MUSE_CMB_K];
+#pragma unroll
+        for (unsigned j = 0; j < PLOW_MUSE_CMB_K; j++)
+            if (j < k) yv[j] = ld_glob8(part + (size_t)j * H + i);
+#pragma unroll
+        for (unsigned j = 0; j < PLOW_MUSE_CMB_K; j++) {
+            if (!live[j]) continue;
+#pragma unroll
+            for (unsigned e = 0; e < 8; e++) {
+                const float z = muse_expert_z(bf2f(yv[j][e]), gate[j], bf2f(wv[e]), ybf);
+                ss[j] += z * z;
+            }
+        }
+    }
+    const unsigned wave = threadIdx.x >> 6, lane = threadIdx.x & 63;
+#pragma unroll
+    for (unsigned j = 0; j < PLOW_MUSE_CMB_K; j++) {
+        if (j >= k) break;
+        const float v = wave_sum(ss[j]);
+        if (lane == 0) wpart[wave * PLOW_MUSE_MAX_TOPK + j] = v;
+    }
+    __syncthreads();
+    if (threadIdx.x < k) {
+        const unsigned j = threadIdx.x;
+        float t = 0.0f;
+#pragma unroll
+        for (unsigned v = 0; v < PLOW_WAVES; v++) t += wpart[v * PLOW_MUSE_MAX_TOPK + j];
+        const bool lj =
+            moe_slot_expert(table, j) != PLOW_EXPERT_UNUSED && moe_slot_gate(table, j) > 0.0f;
+        rinv[j] = lj ? rsqrtf(t / (float)H + eps) : 0.0f;
+    }
+    __syncthreads();
+    for (unsigned d = slice * PLOW_THREADS + threadIdx.x; d < H; d += nblk * PLOW_THREADS) {
+        float y[PLOW_MUSE_CMB_K];
+#pragma unroll
+        for (unsigned j = 0; j < PLOW_MUSE_CMB_K; j++)
+            if (j < k) y[j] = bf2f(part[(size_t)j * H + d]);
+        const float wd = bf2f(w[d]);
+        float acc = 0.0f;
+#pragma unroll
+        for (unsigned j = 0; j < PLOW_MUSE_CMB_K; j++) {
+            if (j >= k) break;
+            if (rinv[j] == 0.0f) continue;
+            const float z = muse_expert_z(y[j], gate[j], wd, ybf);
+            acc += gate[j] * bf2f(f2bf(z * rinv[j]));
+        }
+        out[d] = f2bf(acc);
+        if (bw) bm[(size_t)(d / bw) * rows * bw + (size_t)row * bw + d % bw] = f2bf(acc);
+    }
+    __syncthreads();
+}
+#endif
 
 __device__ void muse_moe_combine_norm_row(bf16* out, const float* part,
                                           const unsigned char* table, const bf16* w, unsigned H,
@@ -191,6 +358,13 @@ __device__ void d_muse_moe_combine_norm(bf16* out, const float* part, const unsi
         return;
     }
     if (rows <= 1u) {
+#if PLOW_MUSE_CMB_ILP
+        if (ybf && k <= PLOW_MUSE_CMB_K) {
+            muse_moe_combine_norm_row_k8(out, (const bf16*)part, table, w, H, k, eps, slice, nblk,
+                                         lds, ybf, bm, bw, 1u, 0u);
+            return;
+        }
+#endif
         muse_moe_combine_norm_row(out, part, table, w, H, k, eps, slice, nblk, lds, ybf, bm, bw,
                                   1u, 0u);
         return;

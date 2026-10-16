@@ -2430,6 +2430,13 @@ pub enum DevOp {
     /// bf16 `[rows][k][H]`, 1 = unweighted `y`, 2 = `gate * y`. `rows` (0 = 1): one workgroup per
     /// row; `band_cols` as [`DevOp::MuseRmsNorm`].
     MuseMoeCombineNorm = 220,
+    /// Muse Spark [`DevOp::MuseRmsNorm`] -> [`DevOp::MuseResidualGate`] -> [`DevOp::MuseRmsNorm`]
+    /// in one packet, one workgroup per row, bit-identical to the chain.
+    /// `t0=out_res t1=h t2=w1? t3=res t4=g t5=out_n t6=w2? t7=band_out?` ·
+    /// `i0=rows i1=dim i2=mode1 i3=mode2 i4=band_cols? i5=gate_eps i6=oscale` · `f0=eps1 f1=eps2`
+    /// · `j1=T`. `gate_eps`, `oscale` (0 = 1) and `T` are f32 bit patterns; `out_res` may alias
+    /// `res`.
+    MuseNormGateNorm = 221,
 }
 
 /// [`DevOp::FlashPrefillFp8`]'s split count (`i7` low half).
@@ -2713,6 +2720,7 @@ impl DevOp {
         DevOp::MuseRmsNorm,
         DevOp::MuseResidualGate,
         DevOp::MuseMoeCombineNorm,
+        DevOp::MuseNormGateNorm,
     ];
 
     /// Recover the opcode from its wire discriminant, or `None` for a value no
@@ -2954,6 +2962,7 @@ impl DevOp {
             DevOp::MuseRmsNorm => "PLOW_DOP_MUSE_RMSNORM",
             DevOp::MuseResidualGate => "PLOW_DOP_MUSE_RESIDUAL_GATE",
             DevOp::MuseMoeCombineNorm => "PLOW_DOP_MUSE_MOE_COMBINE_NORM",
+            DevOp::MuseNormGateNorm => "PLOW_DOP_MUSE_NORM_GATE_NORM",
         }
     }
 
@@ -3014,8 +3023,8 @@ impl DevOp {
     /// 210 -> 211 for `MmSpanExtent = 210` (bidirectional media spans).
     /// 211 -> 212 for `GemmGroupPf = 211` (grouped prefill projection route).
     /// 212 -> 218 for `CompressPool = 212` .. `CompressRopeQuant = 217` (DeepSeek-V4.1).
-    /// 218 -> 221 for `MuseRmsNorm = 218` .. `MuseMoeCombineNorm = 220` (Muse Spark).
-    pub const COUNT: u16 = 221;
+    /// 218 -> 222 for `MuseRmsNorm = 218` .. `MuseNormGateNorm = 221` (Muse Spark).
+    pub const COUNT: u16 = 222;
 
     /// The `(M, N, K, quant)` a decode-GEMV opcode carries, or `None` if this is not one.
     ///

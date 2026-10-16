@@ -41,15 +41,20 @@ source = "checkpoint"
 
 # `PLOW_XR_TAG_SLOT = "90112"`: the decode tag slot must hold the k*moe_hidden = 32768-element
 # expert reduce (the default 20480 B slot fails the tagged one-shot contract); serve carries the same.
+# `PLOW_FA_MERGE_LDS` / `PLOW_MUSE_CMB_ILP` (decode objects, bit-identical): the flash merge
+# stages its splits in LDS; the one-row combine-norm reads its routing table once.
 [objects]
 script = "scripts/build_gfx950.sh"
-env = { PLOW_XR_TAG_SLOT = "90112" }
+env = { PLOW_XR_TAG_SLOT = "90112", PLOW_FA_MERGE_LDS = "1", PLOW_MUSE_CMB_ILP = "1" }
 
 # `PLOW_MUSE_LATENT_TP` (default 1): pre/post_expert_proj row-parallel. TP8 block 1: 524/526 us
 # vs 531/533 us replicated, same numerics, 6.9 GB/rank less weight.
 # Ladder 1,8,32: rungs 8/32 match the B=1 run of each slot (per-row rel_l2 <= 6.7e-3, same routing).
+# Rung 1 only, bit-identical logits on 440 decode-walk positions: `PLOW_MUSE_QKVG` (one GemvQkvg
+# for q/k/v/gate) and `PLOW_MUSE_NGN` (norm -> residual gate -> norm as one MuseNormGateNorm).
+# With the two object knobs: plowrt bench c1 TPOT 18.26 -> 16.32 ms; c8/c32 unchanged.
 [emit]
-env = { PLOW_DECODE_BATCH_LADDER = "1,8,32" }
+env = { PLOW_DECODE_BATCH_LADDER = "1,8,32", PLOW_MUSE_QKVG = "1", PLOW_MUSE_NGN = "1" }
 args = [
   "--emit", "devblob",
   "--arch", "gfx950",
