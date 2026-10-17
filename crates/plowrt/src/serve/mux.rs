@@ -7501,7 +7501,7 @@ fn slot_rng01_at(slot: &Slot, k: usize) -> f32 {
 #[cfg(feature = "cuda")]
 fn dev_sample_spec(slot: &Slot) -> Option<crate::exec::gpu::DevSample> {
     let p = &slot.gen.params;
-    if p.temperature <= 0.0 || p.needs_host_logits() {
+    if p.is_greedy() || p.needs_host_logits() {
         return None;
     }
     Some(crate::exec::gpu::DevSample {
@@ -7555,7 +7555,7 @@ fn gpu_finish_token(
             || p.frequency_penalty != 0.0
             || !p.logit_bias.is_empty();
         // Greedy logprobs rows keep the device argmax (same bf16 row, same lowest-id tie-break).
-        let tok = if p.temperature <= 0.0 && !adjusted {
+        let tok = if p.is_greedy() && !adjusted {
             argmax_tok
         } else {
             let raw = (stats.is_some() && adjusted).then(|| logits.clone());
@@ -7605,7 +7605,7 @@ fn greedy_stats_k(p: &crate::text::sample::SamplingParams) -> Option<u32> {
         || p.presence_penalty != 0.0
         || p.frequency_penalty != 0.0
         || !p.logit_bias.is_empty();
-    (p.temperature <= 0.0 && !adjusted)
+    (p.is_greedy() && !adjusted)
         .then(|| u32::from(req.top.min(crate::text::logprobs::MAX_TOP_LOGPROBS)))
 }
 
@@ -7837,7 +7837,7 @@ fn cfg_draw(slot: &mut Slot) -> u32 {
 
 #[cfg(feature = "cuda")]
 fn gpu_argmax_eligible(params: &crate::text::sample::SamplingParams) -> bool {
-    params.temperature <= 0.0 && !params.needs_host_logits()
+    params.is_greedy() && !params.needs_host_logits()
 }
 
 /// §HOSTT: close a timed decode engine call and open its emit loop (`tokens` = the tick's count
@@ -10273,6 +10273,9 @@ mod tests {
         let mut params = crate::text::sample::SamplingParams::default();
         assert!(!gpu_argmax_eligible(&params));
         params.temperature = 0.0;
+        assert!(gpu_argmax_eligible(&params));
+        params.temperature = 1.0;
+        params.top_k = 1;
         assert!(gpu_argmax_eligible(&params));
         params.repetition_penalty = 1.1;
         assert!(!gpu_argmax_eligible(&params));

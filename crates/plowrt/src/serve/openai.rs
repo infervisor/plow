@@ -75,13 +75,14 @@ impl SamplingFields {
     /// sign.
     pub fn validate(&self) -> Result<(), ParamError> {
         range(self.temperature, "temperature", 0.0, 2.0, false)?;
-        range(self.top_p, "top_p", 0.0, 1.0, true)?;
+        let top_p_lo_open = self.temperature != Some(0.0);
+        range(self.top_p, "top_p", 0.0, 1.0, top_p_lo_open)?;
         range(self.min_p, "min_p", 0.0, 1.0, false)?;
         range(
             self.repetition_penalty,
             "repetition_penalty",
             0.0,
-            2.0,
+            100.0,
             true,
         )?;
         range(self.presence_penalty, "presence_penalty", -2.0, 2.0, false)?;
@@ -674,6 +675,25 @@ mod tests {
         f.apply(&mut p);
         assert_eq!(p.top_k, 0);
         assert!(f.validate().is_ok());
+    }
+
+    #[test]
+    fn high_repetition_penalty_and_greedy_top_p_zero_are_valid() {
+        let f = SamplingFields {
+            repetition_penalty: Some(2.5),
+            temperature: Some(0.0),
+            top_p: Some(0.0),
+            ..Default::default()
+        };
+        assert!(f.validate().is_ok());
+
+        // But top_p: 0.0 with temperature > 0.0 must be rejected
+        let invalid = SamplingFields {
+            temperature: Some(0.7),
+            top_p: Some(0.0),
+            ..Default::default()
+        };
+        assert!(invalid.validate().is_err());
     }
 
     use super::{Content, ContentPart, ImageUrl};
