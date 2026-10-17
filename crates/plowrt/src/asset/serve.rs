@@ -113,6 +113,12 @@ pub fn resolve(asset_dir: &Path, checkpoint_dir: &Path) -> Result<ServeInfo> {
     let manifest = ServeManifest::parse(&bytes).map_err(RuntimeError::Device)?;
     if !manifest.weights.is_empty() {
         serve_manifest::verify_pins(checkpoint_dir, &manifest.weights).map_err(|e| {
+            // A missing tensor says more than a shard header digest: name it when it is the cause.
+            if let Some(pkt) = &pkt {
+                if let Some(err) = missing_weights_refusal(pkt, checkpoint_dir) {
+                    return err;
+                }
+            }
             RuntimeError::Device(format!(
                 "model {}: {e} (checkpoint from {}; pass `--assets {},checkpoint=<dir>` with the \
                  checkpoint the packet was emitted against)",
@@ -133,6 +139,16 @@ pub fn resolve(asset_dir: &Path, checkpoint_dir: &Path) -> Result<ServeInfo> {
         multimodal,
         from_packet: true,
     })
+}
+
+/// The [`crate::asset::checkpoint::missing_weights_error`] for `pkt` against `checkpoint_dir`, when
+/// the checkpoint lacks a tensor the packet binds.
+fn missing_weights_refusal(pkt: &Path, checkpoint_dir: &Path) -> Option<RuntimeError> {
+    let raw = std::fs::read(pkt).ok()?;
+    let blob = crate::asset::devblob::DevBlob::parse(&raw).ok()?;
+    let missing = crate::asset::checkpoint::missing_weights(&blob, &raw, checkpoint_dir).ok()?;
+    (!missing.is_empty())
+        .then(|| crate::asset::checkpoint::missing_weights_error(checkpoint_dir, &missing))
 }
 
 /// Where a bundle's checkpoint came from (see [`checkpoint_dir`]).

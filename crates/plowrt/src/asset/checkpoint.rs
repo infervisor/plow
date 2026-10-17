@@ -123,6 +123,137 @@ struct Entry {
     dtype: safetensors::Dtype,
 }
 
+/// Every `*.safetensors` file in `dir`, sorted: the shard set [`Checkpoint::open`] maps.
+fn shard_paths(dir: &Path) -> Result<Vec<std::path::PathBuf>> {
+    let mut paths: Vec<_> = std::fs::read_dir(dir)
+        .map_err(|source| RuntimeError::Io {
+            path: dir.to_path_buf(),
+            source,
+        })?
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| p.is_file() && p.extension().map(|e| e == "safetensors").unwrap_or(false))
+        .collect();
+    paths.sort();
+    if paths.is_empty() {
+        return Err(RuntimeError::Device(format!(
+            "no *.safetensors in {}",
+            dir.display()
+        )));
+    }
+    Ok(paths)
+}
+
+/// Whether the loaders fill blob tensor `index` (`name`) from the checkpoint: a checkpoint
+/// weight name that is not a packed-prefill request table.
+pub(crate) fn is_checkpoint_tensor(
+    index: usize,
+    name: &str,
+    packed: Option<&plow_asset::packed_prefill::Manifest>,
+) -> bool {
+    let declared_runtime = packed.is_some_and(|m| {
+        (index == usize::from(m.slot) && name == "pf.request.slot")
+            || (index == usize::from(m.request) && name == "pf.request.table")
+            || m.stages.iter().enumerate().any(|(k, s)| {
+                (index == usize::from(s.slot) && name == format!("pf.request.slot.{k}"))
+                    || (index == usize::from(s.request) && name == format!("pf.request.table.{k}"))
+            })
+            || m.maps.iter().any(|map| {
+                index == usize::from(map.slots)
+                    && name == format!("pf.request.maps.{}", map.original)
+            })
+    });
+    !declared_runtime && packet::names::is_checkpoint_weight(name)
+}
+
+/// The checkpoint tensors `blob` binds that no shard header in `dir` declares, in table order.
+/// Reads only the safetensors headers, so a load can refuse before any device work instead of
+/// failing mid-upload.
+pub(crate) fn missing_weights(
+    blob: &crate::asset::devblob::DevBlob,
+    raw: &[u8],
+    dir: &Path,
+) -> Result<Vec<String>> {
+    let packed = blob
+        .reserved_metadata(raw, plow_asset::packed_prefill::SECTION)?
+        .map(|bytes| {
+            serde_json::from_slice::<plow_asset::packed_prefill::Manifest>(bytes)
+                .map_err(|e| RuntimeError::Rejected(format!("packed prefill metadata: {e}")))
+        })
+        .transpose()?;
+    let caches: Vec<usize> = crate::memory::vmm::LiveKvLayout::manifest(blob, raw)?
+        .map(|m| {
+            m.caches
+                .iter()
+                .flat_map(|c| c.pair.into_iter().chain(c.scales.into_iter().flatten()))
+                .map(usize::from)
+                .collect()
+        })
+        .unwrap_or_default();
+    let mut have = std::collections::HashSet::new();
+    for path in shard_paths(dir)? {
+        use std::io::Read;
+        let io = |source| RuntimeError::Io {
+            path: path.clone(),
+            source,
+        };
+        let mut f = std::fs::File::open(&path).map_err(io)?;
+        let mut len = [0u8; 8];
+        f.read_exact(&mut len).map_err(io)?;
+        let n = u64::from_le_bytes(len);
+        let size = f.metadata().map_err(io)?.len();
+        if n > size.saturating_sub(8) || n > 512 << 20 {
+            return Err(RuntimeError::Device(format!(
+                "safetensors {}: header length {n} out of range ({size} bytes)",
+                path.display()
+            )));
+        }
+        let mut header = vec![0u8; n as usize];
+        f.read_exact(&mut header).map_err(io)?;
+        let names: serde_json::Map<String, serde_json::Value> = serde_json::from_slice(&header)
+            .map_err(|e| {
+                RuntimeError::Device(format!("safetensors {}: bad header: {e}", path.display()))
+            })?;
+        have.extend(names.into_iter().map(|(k, _)| k));
+    }
+    Ok(blob
+        .tensors
+        .iter()
+        .enumerate()
+        .filter(|(i, t)| {
+            !caches.contains(i)
+                && is_checkpoint_tensor(*i, &t.name, packed.as_ref())
+                && !have.contains(&t.name)
+        })
+        .map(|(_, t)| t.name.clone())
+        .collect())
+}
+
+/// The load refusal for [`missing_weights`]: names the tensors and, for the FP8 lm_head twin, the
+/// shard that provides it.
+pub(crate) fn missing_weights_error(dir: &Path, missing: &[String]) -> RuntimeError {
+    const SHOWN: usize = 8;
+    let mut names = missing[..missing.len().min(SHOWN)].join(", ");
+    if missing.len() > SHOWN {
+        names += &format!(", ... ({} more)", missing.len() - SHOWN);
+    }
+    let head = missing
+        .iter()
+        .any(|n| n.starts_with("fp8/") && n.contains("embed_tokens.weight"));
+    RuntimeError::Device(format!(
+        "checkpoint {} lacks {} tensor(s) the packet binds: {names}{}",
+        dir.display(),
+        missing.len(),
+        if head {
+            ". The packet was emitted with PLOW_FP8_HEAD=1 and reads the FP8 lm_head twin: add it \
+             with `python3 scripts/quantize_fp8_head.py <checkpoint> <checkpoint>` (writes \
+             model-head.safetensors) or serve the checkpoint the packet was emitted against"
+        } else {
+            ". Serve the checkpoint the packet was emitted against"
+        }
+    ))
+}
+
 /// Sub-timings for [`Checkpoint::open`] (`PLOW_LOAD_PROFILE`).
 #[derive(Default, Clone, Debug)]
 pub(crate) struct CheckpointOpenTiming {
@@ -149,24 +280,9 @@ impl Checkpoint {
         let mut shadowed = FxHashMap::default();
 
         let t_scan = std::time::Instant::now();
-        let mut paths: Vec<_> = std::fs::read_dir(dir)
-            .map_err(|source| RuntimeError::Io {
-                path: dir.to_path_buf(),
-                source,
-            })?
-            .flatten()
-            .map(|e| e.path())
-            .filter(|p| p.is_file() && p.extension().map(|e| e == "safetensors").unwrap_or(false))
-            .collect();
-        paths.sort();
+        let paths = shard_paths(dir)?;
         if let Some(t) = timing.as_mut() {
             t.scan_ms = t_scan.elapsed().as_secs_f64() * 1e3;
-        }
-        if paths.is_empty() {
-            return Err(RuntimeError::Device(format!(
-                "no *.safetensors in {}",
-                dir.display()
-            )));
         }
         tracing::info!(shards = paths.len(), "found safetensors shards");
         for path in &paths {
@@ -736,4 +852,73 @@ pub(crate) fn read_eos_ids(dir: &Path) -> Vec<u32> {
 /// Stop ids a chat turn needs beyond `eos_token_id` (`plow_asset::serve_manifest::chat_stop_ids`).
 pub(crate) fn chat_stop_ids(dir: &Path, eos: &[u32]) -> Vec<u32> {
     plow_asset::serve_manifest::chat_stop_ids(dir, eos)
+}
+
+#[cfg(test)]
+mod missing_weights_tests {
+    use super::*;
+    use packet::dev::DevOp;
+    use packet::devbuild::{Builder, Model};
+
+    fn shard(path: &Path, names: &[&str]) {
+        let mut hdr = serde_json::Map::new();
+        for (i, n) in names.iter().enumerate() {
+            hdr.insert(
+                (*n).into(),
+                serde_json::json!({"dtype": "BF16", "shape": [1], "data_offsets": [2 * i, 2 * i + 2]}),
+            );
+        }
+        let h = serde_json::to_vec(&hdr).unwrap();
+        let mut b = (h.len() as u64).to_le_bytes().to_vec();
+        b.extend(h);
+        b.extend(vec![0u8; 2 * names.len()]);
+        std::fs::write(path, b).unwrap();
+    }
+
+    #[test]
+    fn fp8_head_twin_absent_from_the_checkpoint_is_named() {
+        let head = "fp8/model.language_model.embed_tokens.weight";
+        let mut b = Builder::new(1);
+        let logits = b.tensor("act.logits", 4);
+        let emb = b.tensor("model.language_model.embed_tokens.weight", 2);
+        let w8 = b.tensor(head, 1);
+        let s8 = b.tensor(&format!("{head}_scale"), 4);
+        b.emit(DevOp::GemvFp8, vec![0], &[], |d| {
+            d.t[..3].copy_from_slice(&[logits, emb, w8]);
+            d.t[5] = s8;
+        });
+        let p = b.finish();
+        let model = Model {
+            n_cu: 1,
+            target: 0,
+            tensors: p.tensors.clone(),
+            progs: vec![p],
+            prog_t: vec![1],
+            gen: vec![],
+            kv_row_insts: vec![],
+        };
+        let raw = model.to_blob();
+        let blob = crate::asset::devblob::DevBlob::parse(&raw).unwrap();
+        let dir = std::env::temp_dir().join(format!("plow-missing-weights-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        shard(
+            &dir.join("model.safetensors"),
+            &["model.language_model.embed_tokens.weight"],
+        );
+        let missing = missing_weights(&blob, &raw, &dir).unwrap();
+        assert_eq!(missing, [head.to_string(), format!("{head}_scale")]);
+        let msg = missing_weights_error(&dir, &missing).to_string();
+        assert!(
+            msg.contains(head) && msg.contains("quantize_fp8_head.py"),
+            "{msg}"
+        );
+        // The head twin as a sidecar shard next to the single-file checkpoint satisfies it.
+        shard(
+            &dir.join("model-head.safetensors"),
+            &[head, &format!("{head}_scale")],
+        );
+        assert!(missing_weights(&blob, &raw, &dir).unwrap().is_empty());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
 }
