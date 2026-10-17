@@ -6247,6 +6247,11 @@ fn pf_itl_budget_ms() -> u32 {
 }
 
 #[cfg(feature = "cuda")]
+fn pf_itl_force() -> bool {
+    crate::config::RuntimeConfig::get().pf_itl_force()
+}
+
+#[cfg(feature = "cuda")]
 fn pf_admit_overlap() -> bool {
     crate::config::RuntimeConfig::get().pf_admit_overlap
 }
@@ -6550,7 +6555,7 @@ fn gpu_prefill_batched_pass(
                 .filter(|_| {
                     decode_rows > 0
                         && pf_itl_budget_ms() > 0
-                        && itl_owed_rows(slots, cap, withheld, queued_rows) <= budget_max
+                        && (pf_itl_force() || itl_owed_rows(slots, cap, withheld, queued_rows) <= budget_max)
                 })
                 .map(|rung| itl_rung_rows(e, rung, decode_rows));
             AdmitRoom::new(ready, admit_launch_rows(launch_cap, rung), decode_rows)
@@ -6738,7 +6743,7 @@ fn gpu_prefill_batched_pass(
         // prefill rows/s), so the budget yields to throughput until the backlog drains.
         let budget_on = decode_rows > 0
             && pf_itl_budget_ms() > 0
-            && itl_owed_rows(slots, cap, withheld, queued_rows) <= budget_max;
+            && (pf_itl_force() || itl_owed_rows(slots, cap, withheld, queued_rows) <= budget_max);
         let media_spans = candidates.iter().any(|c| {
             slots[c.span.slot as usize]
                 .as_ref()

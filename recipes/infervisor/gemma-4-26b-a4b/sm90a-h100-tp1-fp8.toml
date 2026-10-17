@@ -140,7 +140,7 @@ PLOW_PF_SEG_FA512 = "1"
 # Pinned wide (8192 launches). The auto width objective measured TTFT p50 -20..40% but tok/s -2..3%
 # at 4K c16/c32, TTFT p99 +9..16% and FP8 agentic c128 -11% tok/s (p99 3.6x): narrow 4096 launches
 # cost ~8% more per row (2026-10-08 auto-vs-pin A/B, docs/bringup/results/gemma26b-h100-20261009).
-PLOW_PF_INTERLEAVE = "0"
+PLOW_PF_INTERLEAVE = "1024"
 # Sliding rings mapped per admitted slot instead of 128 x 200 MiB preallocated: free device memory
 # after load 26 -> 52 GiB for the KV admission budget and the prefix cache. Production chat (no
 # session ids, 2.2 req/s, ~5.7K-token prompts, human think times; replay --think-median-s 45) with

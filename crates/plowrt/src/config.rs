@@ -595,6 +595,19 @@ pub struct RuntimeConfig {
     )]
     pub pf_itl_budget_ms: u32,
 
+    /// Force enforcement of ITL budget even when there is prefill backlog (`itl_owed_rows > budget_max`).
+    /// When disabled, ITL budget yields to prefill throughput when backlog exceeds a full launch.
+    /// When enabled (default), decode is never dropped and prefill rungs remain clamped to the ITL budget.
+    #[arg(long = "pf-itl-force", env = "PLOW_PF_ITL_FORCE", hide = true, default_value_t = true, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
+    pub pf_itl_force: bool,
+
+    /// CUDA VMM prefix cache: enforce strict publish where a request must hold all whole blocks
+    /// matched by radix lookup before publishing a boundary snapshot. When false (default),
+    /// sequential requests sharing a common system prompt can publish their shared-end boundary
+    /// and allow subsequent requests to attach to the full prefix.
+    #[arg(long = "vmm-strict-publish", env = "PLOW_VMM_STRICT_PUBLISH", hide = true, default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
+    pub vmm_strict_publish: bool,
+
     /// CUDA VMM prefix snapshots: copy the fp8 ring scales and full-layer scale prefixes as one
     /// pitched copy per tensor (all KV heads) instead of one copy per head. Same bytes; a
     /// Gemma-4 26B snapshot drops from ~10^3 copies to ~10^2.
@@ -2959,6 +2972,22 @@ impl RuntimeConfig {
         select_compat(
             self.vmm_publish_shared,
             Self::env_bool("PLOW_VMM_PUBLISH_SHARED"),
+            !Self::is_initialized(),
+        )
+    }
+
+    pub(crate) fn vmm_strict_publish(&self) -> bool {
+        select_compat(
+            self.vmm_strict_publish,
+            Self::env_bool("PLOW_VMM_STRICT_PUBLISH"),
+            !Self::is_initialized(),
+        )
+    }
+
+    pub(crate) fn pf_itl_force(&self) -> bool {
+        select_compat(
+            self.pf_itl_force,
+            Self::env_bool("PLOW_PF_ITL_FORCE"),
             !Self::is_initialized(),
         )
     }
