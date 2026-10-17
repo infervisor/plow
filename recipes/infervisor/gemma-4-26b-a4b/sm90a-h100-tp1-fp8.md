@@ -105,9 +105,14 @@ plowrt serve --model infervisor/gemma-4-26b-a4b:sm90a-h100-tp1-fp8 --port 8080
 # Equivalently, from a locally built asset directory:
 nix develop --command env \
   PLOW_DECODE_MAX_RUNG=128 \
+  PLOW_DECODE_PIPELINE=1 \
   PLOW_LT_FP8_FAST_ACCUM_MAX_K=8192 \
+  PLOW_LT_RUNG_ALGOS=true \
   PLOW_MULTISTEP=0 \
+  PLOW_PF_ADMIT_OVERLAP=1 \
   PLOW_PF_INTERLEAVE=1024 \
+  PLOW_PF_ITL_BUDGET_MS=12 \
+  PLOW_PF_ITL_FORCE=1 \
   PLOW_PF_SEG_FA512=1 \
   PLOW_PF_SEG_PURE=fp8 \
   PLOW_PREFIX_CACHE=1 \
@@ -115,6 +120,10 @@ nix develop --command env \
   PLOW_TOKEN_BATCH=1 \
   PLOW_VMM_LIVE_RINGS=1 \
   PLOW_VMM_PREFIX=1 \
+  PLOW_VMM_RING_PARK=8 \
+  PLOW_VMM_SNAP_PITCHED=1 \
+  PLOW_VMM_SNAP_POOL=4 \
+  PLOW_VMM_STRICT_PUBLISH=0 \
   ./target/release/plowrt serve --assets $ASSETS --port 8080
 ```
 <!-- /plow:recipe:serve -->

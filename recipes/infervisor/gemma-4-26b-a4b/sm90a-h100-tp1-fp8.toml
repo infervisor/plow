@@ -159,6 +159,14 @@ PLOW_LT_FP8_FAST_ACCUM_MAX_K = "8192"
 # production 0.957-0.964, Mann-Whitney p 0.27; trim p 0.49). Evidence: /opt/dlami/nvme/lava-tts/g26next/er/attr3/ATTR3.txt.
 PLOW_TERMINAL_LT = "0"
 PLOW_LT_RUNG_ALGOS = "true"
+PLOW_PF_ITL_BUDGET_MS = "12"
+PLOW_DECODE_PIPELINE = "1"
+PLOW_VMM_RING_PARK = "8"
+PLOW_PF_ADMIT_OVERLAP = "1"
+PLOW_VMM_SNAP_PITCHED = "1"
+PLOW_VMM_SNAP_POOL = "4"
+PLOW_PF_ITL_FORCE = "1"
+PLOW_VMM_STRICT_PUBLISH = "0"
 
 [bench]
 backend = "openai"
