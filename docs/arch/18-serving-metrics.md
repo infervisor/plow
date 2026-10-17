@@ -53,21 +53,21 @@ boundaries need not match vLLM's to use the same dashboard queries.
 | Exported vLLM family | Type | Plow event / meaning |
 |---|---|---|
 | `num_requests_running`, `num_requests_waiting` | Gauge | Occupied request slots; pending ingress jobs |
-| `prompt_tokens_total` | Counter | Computed prompt rows, excluding reused prefix tokens |
+| `prompt_tokens_total` | Counter | All prompt tokens, computed plus reused prefix tokens (vLLM's total) |
 | `prompt_tokens_cached_total` | Counter | Prompt tokens attached from a prefix |
 | `generation_tokens_total` | Counter | Generated tokens, including EOS/stop tokens |
 | `request_success_total` | Counter | Normal completion, labeled by `finished_reason` |
 | `time_to_first_token_seconds` | Histogram | Handler arrival to first generated token |
 | `inter_token_latency_seconds` | Histogram | Host observation interval between generated tokens |
-| `request_time_per_output_token_seconds` | Histogram | Per completed request `(last-first)/(outputs-1)`; no sample for one output |
+| `request_time_per_output_token_seconds` | Histogram | Per completed request `(last-first)/(outputs-1)`; zero for one output, as vLLM |
 | `e2e_request_latency_seconds` | Histogram | Arrival to normal completion |
 | `request_queue_time_seconds` | Histogram | Mux submission to slot admission |
 | `request_inference_time_seconds` | Histogram | Slot admission to normal completion |
 | `request_prefill_time_seconds` | Histogram | Slot admission to first generated token |
 | `request_decode_time_seconds` | Histogram | First to last generated token of a completed request |
 | `request_prompt_tokens`, `request_prefill_kv_computed_tokens` | Histogram | Completed request's total and uncached prompt length |
-| `request_generation_tokens` | Histogram | Completed request's generated length |
-| `request_params_max_tokens` | Histogram | Requested output limit at mux submission, including refused submissions |
+| `request_generation_tokens`, `request_max_num_generation_tokens` | Histogram | Completed request's generated length (one sequence per request) |
+| `request_params_max_tokens` | Histogram | Completed request's requested output limit |
 | `prefix_cache_queries_total` | Counter | Prompt tokens queried for prefix cache reuse |
 | `prefix_cache_hits_total` | Counter | Prompt tokens attached from prefix cache |
 

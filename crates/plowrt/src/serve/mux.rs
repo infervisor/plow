@@ -816,7 +816,6 @@ impl ModelMux {
         ingress: Option<IngressGuard<'_>>,
     ) -> std::result::Result<(), SubmitError> {
         Metrics::inc(&self.metrics.requests);
-        self.metrics.serving.max_tokens.tokens(job.gen.max_tokens);
         if self.shed_queue_depth() {
             Metrics::inc(&self.metrics.rejected);
             Metrics::inc(&self.metrics.shed_queue);
@@ -860,7 +859,6 @@ impl ModelMux {
     /// that bounds its own requests in flight.
     pub async fn submit_wait(&self, job: Job) -> std::result::Result<(), SubmitError> {
         Metrics::inc(&self.metrics.requests);
-        self.metrics.serving.max_tokens.tokens(job.gen.max_tokens);
         while !self.reserve_queue() {
             tokio::select! {
                 _ = self.tx.closed() => {
@@ -2836,6 +2834,7 @@ fn admit_session(
         arrived,
         job.arrived,
         job.prompt_ids.len(),
+        job.gen.max_tokens,
     ));
     if let Some(session) = &session {
         retention.table.forget(session);
