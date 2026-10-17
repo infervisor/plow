@@ -6232,6 +6232,14 @@ fn emit_phase(
         } else {
             None
         };
+        // PLOW_GEMMA_MOE_GQ_HOIST: queue the router tail right behind its score slices. The
+        // global queue ranks it one step later than the dense GLU, so every workgroup claimed a
+        // dense slice first and the tail sat unclaimed (measured 3-16 us/layer at B=4..16) on
+        // the path the expert GLU waits on. Order-only.
+        let gq_hoist = decode && emit_config::active().gemma_moe_gq_hoist;
+        if let (Some(c_rt), true) = (c_rt_hoist, gq_hoist) {
+            b.gq_hoist(c_rt);
+        }
         // PLOW_QNORM_FUSE: the pre-FF RmsNorm carried the quant (t3/t4) — c_pf IS it. The
         // fuse_norm (decode) arm never fuses, so only the RmsNorm branch can set qnorm_fuse.
         let dmlp = if qnorm_fuse {
@@ -6617,6 +6625,10 @@ fn emit_phase(
                             d.i[1] = c.hidden;
                             d.f[0] = c.eps;
                         });
+                        // The expert GLU's other input: same queue starvation as the router tail.
+                        if gq_hoist {
+                            b.gq_hoist(c_xn2_local);
+                        }
                         b.emit(
                             DevOp::MoeExpertGluGemmaFp8,
                             glu_cus,
@@ -6728,9 +6740,9 @@ fn emit_phase(
                 // BOTH bf16 (8.04→8.22) and fp8 (6.03→6.21) @40ctx — the 1-block 4-pass scalar
                 // body costs more than the packet boundary it removes, and its reduction order
                 // differs from the vectorized NormResidualNorm (last-ulp bf16 flips → token
-                // drift vs the pair). Oracle is bit-exact vs its own golden. Default OFF; only
-                // worth revisiting as a register-cached vectorized body that replicates NRN's
-                // summation order. Opt in: PLOW_GEMMA_MOE_TAIL_FUSE=1.
+                // drift vs the pair). The NVIDIA body is now op70's body + NRN's body in one CTA
+                // (b staged in smem), bit-exact to the pair by construction. Opt in:
+                // PLOW_GEMMA_MOE_TAIL_FUSE=1.
                 let tail_fuse = emit_config::active().gemma_moe_tail_fuse;
                 // op72 IS batched now (op_moe.cuh: per-row block loop, `part` rows k*H apart),
                 // so the old B=1-only assert is gone. At B=1 it still emits one block and runs

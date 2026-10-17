@@ -3005,6 +3005,8 @@ __device__ __forceinline__ void plow_exec(const PlowDevInst* in, void* const* T,
 #if PLOW_HAS_MOE_COMBINE_RESID_NORM_GEMMA
     /* Fused MoE layer tail: combine + post_ffn norm + sandwich residual + next input norm. */
     case PLOW_DOP_MOE_COMBINE_RESID_NORM_GEMMA:
+        /* arena: op70's f32[H] staging + the bf16[H] b row staged after it */
+        if (((in->i[0] + 7u) & ~7u) + (in->i[0] + 1u) / 2u > PLOW_NV_ARENA_FLOATS) __trap();
         d_moe_combine_resid_norm_gemma((__nv_bfloat16*)TEN(0), (__nv_bfloat16*)TEN(1),
                                        (const float*)TEN(2), (const __nv_bfloat16*)TEN(3),
                                        (const __nv_bfloat16*)TEN(4), (const __nv_bfloat16*)TEN(5),

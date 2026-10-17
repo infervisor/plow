@@ -317,6 +317,8 @@ struct Op {
     inst: DevInst,
     isolated: bool,
     keep_single_grid: bool,
+    /// See [`Builder::gq_hoist`].
+    gq_hoist: bool,
     /// Host-join epoch (see [`Builder::host_join`]); a change between consecutive ops opens a
     /// new segment regardless of wave class or `PLOW_UNISEG`.
     join: u32,
@@ -880,7 +882,13 @@ impl Builder {
             for d in &self.ops[i].deps {
                 let p = d.producer() as usize;
                 if p < i && seg_of.is_none_or(|seg| seg[p] == seg[i]) {
-                    let cost = if self.ops[p].inst.blocks <= 1 { 3 } else { 1 };
+                    let cost = if self.ops[i].gq_hoist {
+                        0
+                    } else if self.ops[p].inst.blocks <= 1 {
+                        3
+                    } else {
+                        1
+                    };
                     s = s.max(start[p] + cost);
                 }
             }
@@ -1333,6 +1341,15 @@ impl Builder {
         self.ops[counter as usize].isolated = true;
     }
 
+    /// Global-queue order only: rank op `counter` WITH its latest producer instead of after it,
+    /// so the ASAP sort queues it right behind that producer's slices (ties keep emit order,
+    /// which is topological) rather than behind the wide ops of the producer's successor rank.
+    /// For a narrow op on the critical chain whose wide siblings are slack: workgroups that
+    /// claimed the siblings first would otherwise keep it unclaimed until they finish.
+    pub fn gq_hoist(&mut self, counter: u32) {
+        self.ops[counter as usize].gq_hoist = true;
+    }
+
     pub fn set_decode_mla_bf16_segments(&mut self) {
         self.deny_uniseg();
         self.decode_mla_bf16_segments = true;
@@ -1414,6 +1431,7 @@ impl Builder {
             inst,
             isolated: false,
             keep_single_grid: false,
+            gq_hoist: false,
             join: self.cur_join,
             cus,
             deps,
@@ -1428,6 +1446,7 @@ impl Builder {
                 inst: r,
                 isolated: false,
                 keep_single_grid: false,
+                gq_hoist: false,
                 join: self.cur_join,
                 cus: rcus,
                 deps: vec![Dep::Coarse(counter)],
@@ -5300,6 +5319,32 @@ mod l2_placement_tests {
     /// K3's MoE layer shape: a b=1 router chain emitted BEFORE an independent shared-expert pair
     /// that was ready earlier. ASAP ordering must hoist the pair ahead of the gated chain in
     /// every XCD window, keep every window topological, and leave the static streams alone.
+    #[test]
+    fn gq_hoist_queues_a_narrow_tail_behind_its_producer() {
+        let emit = |hoist: bool| {
+            let mut b = Builder::new(8);
+            b.deny_uniseg();
+            let all: Vec<u32> = (0..8).collect();
+            let nrn = b.emit(DevOp::NormResidualNorm, vec![0], &[], |_| {});
+            let score = b.emit(DevOp::MoeRouterGemmaScoreFast, vec![0, 1], &[nrn], |_| {});
+            let topk = b.emit(DevOp::MoeRouterGemmaTopk, vec![0], &[score], |_| {});
+            let glu = b.emit(DevOp::GemvGluFp8, all.clone(), &[nrn], |_| {});
+            let eglu = b.emit(DevOp::MoeExpertGluGemmaFp8, all, &[topk], |_| {});
+            if hoist {
+                b.gq_hoist(topk);
+            }
+            (b.finish(), [score, topk, glu, eglu])
+        };
+        let first = |p: &Program, inst: u32| p.gq_stream.iter().position(|e| e.inst == inst).unwrap();
+        let (base, [score, topk, glu, eglu]) = emit(false);
+        assert!(first(&base, glu) < first(&base, topk), "unhoisted: dense GLU claims first");
+        let (p, _) = emit(true);
+        assert_eq!(p.stream, base.stream, "static streams must not move");
+        let last_score = p.gq_stream.iter().rposition(|e| e.inst == score).unwrap();
+        assert_eq!(first(&p, topk), last_score + 1, "topk right behind its producer");
+        assert!(first(&p, topk) < first(&p, glu) && first(&p, glu) < first(&p, eglu));
+    }
+
     #[test]
     fn gq_asap_order_hoists_ready_packets_ahead_of_gated_ones() {
         let l = L2Layout {

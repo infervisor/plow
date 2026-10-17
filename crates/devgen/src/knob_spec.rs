@@ -1241,6 +1241,7 @@ pub const EMIT: &[KnobSpec] = &[
     KnobSpec::new("emit.gemma_moe_dec_group", Some("PLOW_GEMMA_MOE_DEC_GROUP"), Layer::Emit, U32, GEMMA4_MOE_DEC_GROUP_DEFAULT, MOE_LT_EMIT_QUALIFIED),
     KnobSpec::new("emit.gemma_moe_router_exact", Some("PLOW_GEMMA_MOE_ROUTER_EXACT"), Layer::Emit, Domain::Bool, OFF, OPT_IN),
     KnobSpec::new("emit.gemma_moe_tail_fuse", Some("PLOW_GEMMA_MOE_TAIL_FUSE"), Layer::Emit, Domain::Bool, OFF, OPT_IN),
+    KnobSpec::new("emit.gemma_moe_gq_hoist", Some("PLOW_GEMMA_MOE_GQ_HOIST"), Layer::Emit, Domain::Bool, OFF, OPT_IN),
     KnobSpec::new("emit.k3_full", Some("K3_FULL"), Layer::Emit, Domain::Bool, ON, DIAG),
     KnobSpec::new("emit.k3_fuse_a", Some("PLOW_K3_FUSE_A"), Layer::Emit, Domain::Bool, OFF, OPT_IN),
     KnobSpec::new("emit.mla_ns", Some("PLOW_MLA_NS"), Layer::Emit, U32, UNSET, OPT_IN),

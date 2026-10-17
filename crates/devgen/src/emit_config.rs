@@ -522,9 +522,13 @@ pub struct EmitConfig {
     #[arg(long, env = "PLOW_GEMMA_MOE_ROUTER_EXACT", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
     pub gemma_moe_router_exact: bool,
 
-    /// Fuse MoE-combine residual/norm tail (B=1 only, reorders summation).
+    /// Fuse the Gemma-4 MoE layer tail (op70 + NormResidualNorm) into one op72 packet per row.
     #[arg(long, env = "PLOW_GEMMA_MOE_TAIL_FUSE", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
     pub gemma_moe_tail_fuse: bool,
+
+    /// Queue the Gemma-4 decode router tail and expert-input norm right behind their producers.
+    #[arg(long, env = "PLOW_GEMMA_MOE_GQ_HOIST", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
+    pub gemma_moe_gq_hoist: bool,
 
     // ──────────────────────────────────────────────────────────────────────────
     // MLA / hybrid (K3) model family
@@ -1940,6 +1944,7 @@ impl EmitConfig {
             gemma_moe_dec_group: env_u32("PLOW_GEMMA_MOE_DEC_GROUP"),
             gemma_moe_router_exact: env_bool("PLOW_GEMMA_MOE_ROUTER_EXACT"),
             gemma_moe_tail_fuse: env_bool("PLOW_GEMMA_MOE_TAIL_FUSE"),
+            gemma_moe_gq_hoist: env_bool("PLOW_GEMMA_MOE_GQ_HOIST"),
             k3_full: env_bool_default_true("K3_FULL"),
             k3_fuse_a: env_bool("PLOW_K3_FUSE_A"),
             mla_ns: env_u32("PLOW_MLA_NS"),
