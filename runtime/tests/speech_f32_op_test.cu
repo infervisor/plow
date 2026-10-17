@@ -1422,6 +1422,10 @@ int main(int argc, char** argv) {
             t_conv("Conv2dF32 ffma qwen stage3 480 (same data)", 3, 16, 25, 480, 480, 3, 2, 1, 1, 64 | 128 | (2 << 2) | (2 << 4));
         }
         t_layernorm("LayerNormF32 ordered bf16", 100, 1024, 3, true);
+        t_layernorm("LayerNormF32 ordered bf16 d896", 156, 896, 3, true);
+        t_layernorm("LayerNormF32 ordered ragged", 45, 1000, 2, true);
+        t_layernorm("LayerNormF32 ordered odd width", 37, 1001, 2, true);
+        t_layernorm("LayerNormF32 ordered bf16 two chunks", 19, 2050, 3, true);
         t_grouped("GroupedAttentionF32 qwen 300 v290", 300, 1024, 64, 104, 7, 290);
         t_grouped_table("GroupedAttentionF32 qwen packed table", 13 * 19, {4, 0, 104, 104, 36, 143, 35, 182, 60});
         t_grouped_table("GroupedAttentionF32 qwen packed table 10 ragged", 832,

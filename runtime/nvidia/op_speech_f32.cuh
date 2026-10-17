@@ -2398,7 +2398,34 @@ static __device__ __noinline__ void d_conv2d_f32(float* __restrict__ out, const 
  * SPL_COLS chunks (coalesced) and lane 0 runs the golden's serial float chains over smem, which is
  * the only way to reproduce its rounding; the chain (~4 cycles per element) bounds the op. */
 #define SPL_COLS 1024
-static_assert(PLOW_NV_WARPS * SPL_COLS <= SP_ARENA_FLOATS, "layernorm row stage");
+/* Per warp a row stage and its squares, then gamma and beta for the block. */
+static_assert((2 * PLOW_NV_WARPS + 2) * SPL_COLS + 32 <= SP_ARENA_FLOATS, "layernorm smem");
+/* acc + s[0] + ... + s[n-1] in order. Refilling each register slot right after it is consumed
+ * keeps D loads ahead of the chain; load-then-use exposes the smem latency (~30 cycles per 4 adds,
+ * ~3x the chain). The refills are unconditional, reading up to 4 D floats past s[n] (in the arena,
+ * unused): guarded, they compile to branches. s is 16-byte aligned. */
+static __device__ __forceinline__ float sp_chain_sum(const float* s, unsigned n, float acc) {
+    constexpr unsigned D = 8;
+    const float4* p = (const float4*)s;
+    const unsigned n4 = n / 4u;
+    float4 b[D];
+#pragma unroll
+    for (unsigned k = 0; k < D; k++) b[k] = p[k];
+    unsigned i = 0;
+    for (; i + D <= n4; i += D) {
+#pragma unroll
+        for (unsigned k = 0; k < D; k++) {
+            const float4 w = b[k];
+            b[k] = p[i + D + k];
+            acc = __fadd_rn(__fadd_rn(__fadd_rn(__fadd_rn(acc, w.x), w.y), w.z), w.w);
+        }
+    }
+#pragma unroll
+    for (unsigned k = 0; k < D; k++)
+        if (i + k < n4) acc = __fadd_rn(__fadd_rn(__fadd_rn(__fadd_rn(acc, b[k].x), b[k].y), b[k].z), b[k].w);
+    for (unsigned c = n4 * 4u; c < n; c++) acc = __fadd_rn(acc, s[c]);
+    return acc;
+}
 /* With `stats` (RowStatsF32, 204) only [rows][2] = (mean, inverse std) is written. */
 /* LayerNormF32 (double statistics) over rows of 128..512 columns: each lane holds its float4s of
  * R rows in registers, so a row is read once and R rows' loads are in flight together (one row
@@ -2487,21 +2514,21 @@ static __device__ __noinline__ void d_layernorm_f32(float* __restrict__ out, con
     const unsigned lane = threadIdx.x & 31u, warp = threadIdx.x >> 5;
     if (flags & 2u) {
         float* xs = arena + warp * SPL_COLS;
+        float* ss = arena + (PLOW_NV_WARPS + warp) * SPL_COLS;
         const float ff = (float)feat;
         const bool vec = (feat & 3u) == 0 && sp_aligned(x, 16);
         const bool whole = feat <= SPL_COLS;
-        /* The fast epilogue's gamma/beta loads issue before the serial chains, which hide them. */
         const bool fast = whole && vec && (!gamma || sp_aligned(gamma, 16)) && (!beta || sp_aligned(beta, 16)) &&
                           out && sp_aligned(out, 16);
         constexpr unsigned U = SPL_COLS / 128u;
-        float4 gv[U], bv[U];
-#pragma unroll
-        for (unsigned u = 0; u < U; u++) {
-            const unsigned c = lane * 4u + u * 128u;
-            gv[u] = make_float4(1.f, 1.f, 1.f, 1.f);
-            bv[u] = make_float4(0.f, 0.f, 0.f, 0.f);
-            if (fast && c < feat && gamma) gv[u] = __ldg((const float4*)(gamma + c));
-            if (fast && c < feat && beta) bv[u] = __ldg((const float4*)(beta + c));
+        /* The fast epilogue's gamma/beta, staged once (in registers they crowd the chains). */
+        float* gs = arena + 2u * PLOW_NV_WARPS * SPL_COLS;
+        if (fast) {
+            for (unsigned c = threadIdx.x * 4u; c < feat; c += PLOW_NV_THREADS * 4u) {
+                *(float4*)(gs + c) = gamma ? __ldg((const float4*)(gamma + c)) : make_float4(1.f, 1.f, 1.f, 1.f);
+                *(float4*)(gs + SPL_COLS + c) = beta ? __ldg((const float4*)(beta + c)) : make_float4(0.f, 0.f, 0.f, 0.f);
+            }
+            __syncthreads();
         }
         for (unsigned row = slice * PLOW_NV_WARPS + warp; row < rows; row += nblk * PLOW_NV_WARPS) {
             const float* xr = x + (size_t)row * feat;
@@ -2528,32 +2555,27 @@ static __device__ __noinline__ void d_layernorm_f32(float* __restrict__ out, con
                             for (unsigned c = lane; c < nc; c += 32u) xs[c] = xr[c0 + c];
                         __syncwarp();
                     }
-                    if (lane == 0) {
-                        unsigned c = 0;
-                        if (pass == 0) {
-#pragma unroll 8
-                            for (; c + 4 <= nc; c += 4) {
-                                const float4 v = *(const float4*)(xs + c);
-                                acc = __fadd_rn(__fadd_rn(__fadd_rn(__fadd_rn(acc, v.x), v.y), v.z), v.w);
-                            }
-                            for (; c < nc; c++) acc = __fadd_rn(acc, xs[c]);
-                        } else {
-#pragma unroll 8
-                            for (; c + 4 <= nc; c += 4) {
+                    if (pass == 1) {
+                        /* The squares are off the chain: each lane rounds its own (x - mean)^2. */
+                        if ((nc & 3u) == 0) {
+#pragma unroll
+                            for (unsigned u = 0; u < U; u++) {
+                                const unsigned c = lane * 4u + u * 128u;
+                                if (c >= nc) continue;
                                 const float4 v = *(const float4*)(xs + c);
                                 const float a = __fsub_rn(v.x, mean), b = __fsub_rn(v.y, mean);
                                 const float d = __fsub_rn(v.z, mean), e = __fsub_rn(v.w, mean);
-                                acc = __fadd_rn(acc, __fmul_rn(a, a));
-                                acc = __fadd_rn(acc, __fmul_rn(b, b));
-                                acc = __fadd_rn(acc, __fmul_rn(d, d));
-                                acc = __fadd_rn(acc, __fmul_rn(e, e));
+                                *(float4*)(ss + c) =
+                                    make_float4(__fmul_rn(a, a), __fmul_rn(b, b), __fmul_rn(d, d), __fmul_rn(e, e));
                             }
-                            for (; c < nc; c++) {
+                        } else
+                            for (unsigned c = lane; c < nc; c += 32u) {
                                 const float v = __fsub_rn(xs[c], mean);
-                                acc = __fadd_rn(acc, __fmul_rn(v, v));
+                                ss[c] = __fmul_rn(v, v);
                             }
-                        }
+                        __syncwarp();
                     }
+                    if (lane == 0) acc = sp_chain_sum(pass == 0 ? xs : ss, nc, acc);
                     __syncwarp();
                 }
                 if (pass == 0) mean = __shfl_sync(0xffffffffu, __fdiv_rn(acc, ff), 0);
@@ -2571,9 +2593,10 @@ static __device__ __noinline__ void d_layernorm_f32(float* __restrict__ out, con
                 for (unsigned u = 0; u < U; u++) {
                     const unsigned c = lane * 4u + u * 128u;
                     if (c >= feat) continue;
-                    const float4 xv = *(const float4*)(xs + c);
-                    const float xa[4] = {xv.x, xv.y, xv.z, xv.w}, ga[4] = {gv[u].x, gv[u].y, gv[u].z, gv[u].w},
-                                ba[4] = {bv[u].x, bv[u].y, bv[u].z, bv[u].w};
+                    const float4 xv = *(const float4*)(xs + c), gv = *(const float4*)(gs + c),
+                                 bv = *(const float4*)(gs + SPL_COLS + c);
+                    const float xa[4] = {xv.x, xv.y, xv.z, xv.w}, ga[4] = {gv.x, gv.y, gv.z, gv.w},
+                                ba[4] = {bv.x, bv.y, bv.z, bv.w};
                     float y[4];
 #pragma unroll
                     for (int q = 0; q < 4; q++) {
