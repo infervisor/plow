@@ -1380,12 +1380,13 @@ __device__ __forceinline__ unsigned sp_w_width(unsigned M, unsigned N, unsigned 
  * fc2 117.3 -> 57.3, conv_out 241.6 -> 114.6; d 1024 43.1 -> 22.5, 86.7 -> 62.8, 133.1 -> 63.6. */
 #define SPN_NS 3u
 #define SPN_LD 72u
-template <unsigned BN>
+template <unsigned BN, unsigned BM = SPT_BM>
 struct SpN {
-    static constexpr unsigned NJ = BN / 16, NQ = (NJ + 1) / 2, B_BYTES = BN * SPN_LD * 2,
-                              A_BYTES = SPT_BM * SPN_LD * 2, RING = SPN_NS * B_BYTES, LDO = BN + 8;
-    static_assert(BN % 16 == 0, "two warps of whole n8 columns");
-    static_assert(RING + 2 * A_BYTES <= SP_ARENA_FLOATS * 4 && SPT_BM * LDO * 4 <= SP_ARENA_FLOATS * 4,
+    static constexpr unsigned WM = BM / 16u, WN = PLOW_NV_WARPS / WM, NJ = BN / WN / 8u, NQ = (NJ + 1) / 2,
+                              B_BYTES = BN * SPN_LD * 2, A_BYTES = BM * SPN_LD * 2, RING = SPN_NS * B_BYTES,
+                              LDO = BN + 8;
+    static_assert(BN % (WN * 8u) == 0, "whole n8 columns per warp");
+    static_assert(RING + 2 * A_BYTES <= SP_ARENA_FLOATS * 4 && BM * LDO * 4 <= SP_ARENA_FLOATS * 4,
                   "reference tile stages");
 };
 __device__ __forceinline__ void sp_ldsm2(unsigned (&r)[4], const void* p) {
@@ -1395,24 +1396,25 @@ __device__ __forceinline__ void sp_ldsm2(unsigned (&r)[4], const void* p) {
 }
 /* SPLIT: walk k-steps [s0, s1), store each chunk that starts in [s0, own) to its slot instead of
  * folding, and return the rows' chunks in `ch` (sp_tcn_gemm). */
-template <unsigned BN, bool SPLIT = false>
+template <unsigned BN, bool SPLIT = false, unsigned BM = SPT_BM>
 static __device__ __forceinline__ void sp_tcn_tile(unsigned m0, unsigned n0, unsigned M, unsigned N, unsigned K,
                                                    const SpRowF32& la, const SpRowBf16& lb, float* arena,
-                                                   float (&acc)[SpN<BN>::NJ][4], const SpRefSplit& rs,
+                                                   float (&acc)[SpN<BN, BM>::NJ][4], const SpRefSplit& rs,
                                                    unsigned s0 = 0u, unsigned s1 = 0u, unsigned own = 0u,
                                                    float* slots = nullptr, unsigned cmin = 1u, unsigned* ch = nullptr) {
-    using C = SpN<BN>;
+    using C = SpN<BN, BM>;
+    static_assert(!SPLIT || BM == SPT_BM, "split slots hold 64-row tiles");
     constexpr unsigned NJ = C::NJ;
     char* smem = (char*)arena;
     __nv_bfloat16* abuf = (__nv_bfloat16*)(smem + C::RING);
     const unsigned tid = threadIdx.x, lane = tid & 31u, warp = tid >> 5;
-    const unsigned wm = (warp & 3u) * 16u, wn = (warp >> 2) * (BN / 2), g = lane >> 2;
+    const unsigned wm = (warp % C::WM) * 16u, wn = (warp / C::WM) * (BN / C::WN), g = lane >> 2;
     const unsigned nk = (K + 63u) / 64u;
     if (!SPLIT) s1 = nk;
-    float4 av[4];
+    float4 av[BM / 16u];
     auto a_fetch = [&](unsigned kt) {
 #pragma unroll
-        for (unsigned p = 0; p < 4; p++) {
+        for (unsigned p = 0; p < BM / 16u; p++) {
             const unsigned e = tid + p * PLOW_NV_THREADS, r = e >> 4, k = kt * 64u + (e & 15u) * 4u;
             av[p] = kt < s1 && m0 + r < M && k < K ? __ldcg((const float4*)(la.p + (size_t)(m0 + r) * la.k + k))
                                                    : make_float4(0.f, 0.f, 0.f, 0.f);
@@ -1420,12 +1422,12 @@ static __device__ __forceinline__ void sp_tcn_tile(unsigned m0, unsigned n0, uns
     };
     auto a_store = [&](unsigned buf) {
 #pragma unroll
-        for (unsigned p = 0; p < 4; p++) {
+        for (unsigned p = 0; p < BM / 16u; p++) {
             const unsigned e = tid + p * PLOW_NV_THREADS;
             uint2 u;
             u.x = sp_pack_bf16(make_float2(av[p].x, av[p].y));
             u.y = sp_pack_bf16(make_float2(av[p].z, av[p].w));
-            *(uint2*)(abuf + buf * (SPT_BM * SPN_LD) + (e >> 4) * SPN_LD + (e & 15u) * 4u) = u;
+            *(uint2*)(abuf + buf * (BM * SPN_LD) + (e >> 4) * SPN_LD + (e & 15u) * 4u) = u;
         }
     };
     auto issue_b = [&](unsigned kt) {
@@ -1470,7 +1472,7 @@ static __device__ __forceinline__ void sp_tcn_tile(unsigned m0, unsigned n0, uns
         issue_b(kt + SPN_NS - 1);
         a_fetch(kt + 1u);
         const __nv_bfloat16* bs = (const __nv_bfloat16*)(smem + (kt % SPN_NS) * C::B_BYTES);
-        const __nv_bfloat16* ab = abuf + (kt & 1u) * (SPT_BM * SPN_LD);
+        const __nv_bfloat16* ab = abuf + (kt & 1u) * (BM * SPN_LD);
         float part[NJ][4];
 #pragma unroll
         for (unsigned j = 0; j < NJ; j++)
@@ -1530,20 +1532,21 @@ static __device__ __forceinline__ void sp_tcn_tile(unsigned m0, unsigned n0, uns
     asm volatile("cp.async.wait_group 0;\n" ::);
     __syncthreads();
 }
-/* sp_tc_store for the 64 x BN tile. */
-template <unsigned BN, class EP>
+/* sp_tc_store for the BM x BN tile. */
+template <unsigned BN, unsigned BM = SPT_BM, class EP>
 static __device__ __forceinline__ void sp_tcn_store(unsigned m0, unsigned n0, unsigned M, unsigned N, const EP& ep,
-                                                    const float (&acc)[SpN<BN>::NJ][4], float* arena) {
-    constexpr unsigned LDO = SpN<BN>::LDO, GROUPS = SPT_BM * BN / 4u;
+                                                    const float (&acc)[SpN<BN, BM>::NJ][4], float* arena) {
+    using C = SpN<BN, BM>;
+    constexpr unsigned LDO = C::LDO, GROUPS = BM * BN / 4u;
     const unsigned lane = threadIdx.x & 31u, warp = threadIdx.x >> 5;
-    const unsigned mb = (warp & 3u) * 16u + (lane >> 2), nb = (warp >> 2) * (BN / 2) + (lane & 3u) * 2u;
+    const unsigned mb = (warp % C::WM) * 16u + (lane >> 2), nb = (warp / C::WM) * (BN / C::WN) + (lane & 3u) * 2u;
 #pragma unroll
-    for (unsigned j = 0; j < SpN<BN>::NJ; j++)
+    for (unsigned j = 0; j < C::NJ; j++)
 #pragma unroll
         for (unsigned h = 0; h < 2; h++)
             *(float2*)(arena + (mb + h * 8u) * LDO + nb + j * 8u) = make_float2(acc[j][2 * h], acc[j][2 * h + 1]);
     __syncthreads();
-    const unsigned rows = min(SPT_BM, M - m0), cols = min(BN, N - n0);
+    const unsigned rows = min(BM, M - m0), cols = min(BN, N - n0);
     constexpr unsigned G = (GROUPS + PLOW_NV_THREADS - 1) / PLOW_NV_THREADS;
     float4 ld[G];
 #pragma unroll
@@ -1637,29 +1640,31 @@ static __device__ __forceinline__ void sp_tcn_fold(unsigned K, const float* slot
                     }
     }
 }
-template <unsigned BN, class EP>
+template <unsigned BN, unsigned BM = SPT_BM, class EP>
 static __device__ __forceinline__ void sp_tcn_gemm(unsigned M, unsigned N, unsigned K, const SpRowF32& la,
                                                    const SpRowBf16& lb, const EP& ep, unsigned slice, unsigned nblk,
                                                    float* arena, float* scratch, const SpRefSplit& rs) {
     constexpr unsigned TILE = SPT_BM * BN;
-    const unsigned tn = (N + BN - 1) / BN, tiles = ((M + SPT_BM - 1) / SPT_BM) * tn, nk = (K + 63u) / 64u;
-    /* 160-wide tiles are chosen only past one round of 80-wide ones (sp_tcn_wide): never split. */
-    const unsigned S = BN == 80u && scratch && tiles <= SPT_TICKETS && tiles * 2u <= nblk ? nblk / tiles : 1u;
+    const unsigned tn = (N + BN - 1) / BN, tiles = ((M + BM - 1) / BM) * tn, nk = (K + 63u) / 64u;
+    /* Only 64 x 80 tiles split (sp_tcn_shape picks the others where no split could pay). */
+    const unsigned S = BN == 80u && BM == SPT_BM && scratch && tiles <= SPT_TICKETS && tiles * 2u <= nblk
+                           ? nblk / tiles : 1u;
     const unsigned cap = S > 1u ? rs.ncu * SPN_SPLIT_FLOATS / tiles / TILE : 0u;
     for (unsigned w = slice; w < tiles * S; w += nblk) {
         const unsigned tile = w / S, s = w - tile * S;
-        const unsigned m0 = (tile / tn) * SPT_BM, n0 = (tile % tn) * BN;
-        float acc[SpN<BN>::NJ][4];
+        const unsigned m0 = (tile / tn) * BM, n0 = (tile % tn) * BN;
+        float acc[SpN<BN, BM>::NJ][4];
         const SpTcnPart p = S > 1u ? sp_tcn_part(m0, s, S, cap, M, N, K, rs, arena) : SpTcnPart{1u, 0u, nk, nk, nk};
         if (s >= p.parts) continue;
-        if (BN != 80u || p.parts == 1u) {
-            sp_tcn_tile<BN>(m0, n0, M, N, K, la, lb, arena, acc, rs);
-            sp_tcn_store<BN>(m0, n0, M, N, ep, acc, arena);
+        if (BN != 80u || BM != SPT_BM || p.parts == 1u) {
+            sp_tcn_tile<BN, false, BM>(m0, n0, M, N, K, la, lb, arena, acc, rs);
+            sp_tcn_store<BN, BM>(m0, n0, M, N, ep, acc, arena);
             continue;
         }
         float* slots = scratch + SPT_TICKETS + (size_t)tile * cap * TILE;
         unsigned ch[2];
-        sp_tcn_tile<BN, BN == 80u>(m0, n0, M, N, K, la, lb, arena, acc, rs, p.lo, p.hi, p.own, slots, p.cmin, ch);
+        sp_tcn_tile<BN, BN == 80u && BM == SPT_BM, BM>(m0, n0, M, N, K, la, lb, arena, acc, rs, p.lo, p.hi, p.own,
+                                                       slots, p.cmin, ch);
         __threadfence();
         __syncthreads();
         unsigned* tickets = (unsigned*)scratch;
@@ -1670,8 +1675,10 @@ static __device__ __forceinline__ void sp_tcn_gemm(unsigned M, unsigned N, unsig
         __syncthreads();
         if (!last) continue;
         __threadfence();
-        sp_tcn_fold<BN>(K, slots, p.cmin, ch, acc);
-        sp_tcn_store<BN>(m0, n0, M, N, ep, acc, arena);
+        if constexpr (BM == SPT_BM) {
+            sp_tcn_fold<BN>(K, slots, p.cmin, ch, acc);
+            sp_tcn_store<BN>(m0, n0, M, N, ep, acc, arena);
+        }
         if (threadIdx.x == 0) tickets[tile] = 0u;
     }
 }
@@ -1682,6 +1689,29 @@ __device__ __forceinline__ bool sp_tcn_wide(unsigned M, unsigned N, unsigned nbl
     const unsigned r80 = (mt * ((N + 79u) / 80u) + nblk - 1u) / nblk;
     const unsigned r160 = (mt * ((N + 159u) / 160u) + nblk - 1u) / nblk;
     return r160 * 2u <= r80;
+}
+/* Reference tile shape: 0 = 64x80, 1 = 64x160, 2 = 32x64, 3 = 32x160. Up to 16 k-steps (never a
+ * split, sp_tcn_part) the fewest rounds x (k-steps x (tile area + SPN_STEP_AREA) + SPN_TILE_AREA):
+ * a step costs its area plus a fixed part, a tile its prologue and store (fit to the RTX 5090
+ * harness, M 104..832); longer K keeps 64 rows, whose 80-wide tiles may split. */
+#define SPN_STEP_AREA 1230u
+#define SPN_TILE_AREA 21500u
+__device__ __forceinline__ unsigned sp_tcn_shape(unsigned M, unsigned N, unsigned K, unsigned nblk) {
+#ifdef SPN_FORCE_SHAPE
+    return SPN_FORCE_SHAPE;
+#endif
+    const unsigned wide = sp_tcn_wide(M, N, nblk), nk = (K + 63u) / 64u;
+    if (nk > 16u) return wide;
+    const unsigned bm[4] = {64u, 64u, 32u, 32u}, bn[4] = {80u, 160u, 64u, 160u};
+    unsigned best = wide, cost = ~0u;
+#pragma unroll
+    for (unsigned s = 0; s < 4; s++) {
+        const unsigned tiles = (M + bm[s] - 1u) / bm[s] * ((N + bn[s] - 1u) / bn[s]);
+        const unsigned c =
+            (tiles + nblk - 1u) / nblk * (nk * (bm[s] * bn[s] + SPN_STEP_AREA) + SPN_TILE_AREA);
+        if (c < cost) cost = c, best = s;
+    }
+    return best;
 }
 
 /* DenseGemmF32 (170). flags: 1 = bf16-round, 2 = bf16 erf-GELU (implies the round), 4 = bf16
@@ -1729,8 +1759,12 @@ static __device__ __noinline__ void d_dense_gemm_f32(float* __restrict__ out, co
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ == 1200
             if (rs && !ln) {
                 const SpRowBf16 lb{wb, k, stride, true};
-                if (sp_tcn_wide(m, n, nblk)) sp_tcn_gemm<160>(m, n, k, la, lb, ep, slice, nblk, arena, scratch, *rs);
-                else sp_tcn_gemm<80>(m, n, k, la, lb, ep, slice, nblk, arena, scratch, *rs);
+                switch (sp_tcn_shape(m, n, k, nblk)) {
+                case 0: sp_tcn_gemm<80>(m, n, k, la, lb, ep, slice, nblk, arena, scratch, *rs); break;
+                case 1: sp_tcn_gemm<160>(m, n, k, la, lb, ep, slice, nblk, arena, scratch, *rs); break;
+                case 2: sp_tcn_gemm<64, 32>(m, n, k, la, lb, ep, slice, nblk, arena, scratch, *rs); break;
+                default: sp_tcn_gemm<160, 32>(m, n, k, la, lb, ep, slice, nblk, arena, scratch, *rs); break;
+                }
                 return;
             }
 #endif
