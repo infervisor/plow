@@ -78,11 +78,13 @@ PLOW_ATTENTION_DECODE_BALANCE_GF = "4"
 PLOW_FA_MMAQK = "3"
 PLOW_DECODE_BATCH_LADDER = "1,2,4,8,16,32,64,128"
 PLOW_EMIT_DECODE_CUBLASLT = "1"
-PLOW_EMIT_DECODE_CUBLASLT_MIN_ROWS = "64"
+PLOW_EMIT_DECODE_CUBLASLT_MIN_ROWS = "4"
 PLOW_EMIT_DECODE_CUBLASLT_HEAD = "1"
 PLOW_EMIT_PREFILL_CUBLASLT = "1"
 PLOW_PF_LADDER_APPEND = "256,1088,1152,2112,4160,4224"
-PLOW_FUSE_ARGMAX = "0"
+PLOW_FUSE_ARGMAX = "1"
+PLOW_EMIT_MOE_DEC_LT = "1"
+PLOW_GEMMA_MOE_DEC_GROUP = "4"
 PLOW_GEMMA_MOE_ROUTER_EXACT = "0"
 # Emit-time on purpose: plowc compiles the decode interpreters (interp_sm90a{,_fp8kv,_gw}.cubin,
 # whose hashes change with it) and nvcc appends this; the [objects] script builds no op_moe object.
@@ -158,6 +160,8 @@ PLOW_LT_FP8_FAST_ACCUM_MAX_K = "8192"
 # (kl_p95 1.153), with PLOW_TERMINAL_LT=0 passed 6 of 6 (kl_p95 median 0.856; top1_decisive 0.960-0.961 vs
 # production 0.957-0.964, Mann-Whitney p 0.27; trim p 0.49). Evidence: /opt/dlami/nvme/lava-tts/g26next/er/attr3/ATTR3.txt.
 PLOW_TERMINAL_LT = "0"
+PLOW_MOE_DEC_LT = "4"
+PLOW_LT_RUNG_ALGOS = "true"
 
 [bench]
 backend = "openai"
