@@ -7308,7 +7308,10 @@ fn emit_phase(
     // PLOW_FP8_HEAD: weight-only fp8 lm_head (GemvFp8, dequant-on-load, per-row scale).
     // The tied embedding LOOKUP stays bf16 (reads the original table); only the head GEMV
     // reads the fp8 twin. Own reporting row — vLLM's fp8 recipe keeps lm_head bf16.
-    let fp8_head = decode && n.head8 != TENSOR_NONE;
+    // Rungs on the cuBLASLt head keep the bf16 table: the library has no weight-only FP8 GEMM.
+    let lt_head =
+        emit_config::active().decode_cublaslt_at(t) && emit_config::active().decode_cublaslt_head;
+    let fp8_head = decode && n.head8 != TENSOR_NONE && !lt_head;
     // PLOW_MX4_HEAD: the same trade at w4 — 2.01 GB of bf16 tied head -> 0.53 GB of e2m1
     // + E8M0 block scales. Decode only; the tied EMBED lookup still reads the bf16 table.
     let mx4_head = decode && n.head4 != TENSOR_NONE;
@@ -7317,8 +7320,6 @@ fn emit_phase(
     // Argmax packets. Greedy B=1 decode on the bf16 head only (fp8 head keeps the classic path).
     // In a multi-rung decode ladder, all rungs must share the same instruction sequence shape,
     // so GemvArgmax is prohibited under ladders.
-    let lt_head =
-        emit_config::active().decode_cublaslt_at(t) && emit_config::active().decode_cublaslt_head;
     let fuse_am = fuse_argmax_on()
         && !lt_head
         && decode
