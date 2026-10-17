@@ -2778,6 +2778,147 @@ static __device__ __forceinline__ void sp_ga_pv(float* o, const float* p, const 
         }
     }
 }
+/* hw 64 with K, V and q staged. The query rows in (group, head, row) order are cut into 8-row
+ * chunks (a row per warp) costing rows x (keys + SPA_ROW_KEYS), and every (group, head) costs
+ * SPA_SEG_COST more for staging its K/V; a block takes the chunks starting in its 1/nblk of the
+ * total, so ragged packed windows load the grid evenly, and stages K/V once per (group, head) it
+ * touches. K rows are padded to 68 floats (conflict-free float4 reads). Chains and their orders are
+ * the general body's. */
+#define SPA_ROW_KEYS 32u
+#define SPA_SEG_COST 384u
+static __device__ __forceinline__ void sp_ga_slabs64(float* __restrict__ context, const float* __restrict__ query,
+                                                     const float* __restrict__ key, const float* __restrict__ value,
+                                                     const unsigned* valid, bool table, unsigned valid_rows,
+                                                     unsigned width, unsigned heads, unsigned groups,
+                                                     unsigned group_rows, unsigned flags, unsigned slice,
+                                                     unsigned nblk, float* arena) {
+    constexpr unsigned HW = 64u, KS = HW + 4u, W = PLOW_NV_WARPS;
+    const unsigned lane = threadIdx.x & 31u, warp = threadIdx.x >> 5;
+    float* sc = arena + warp * 256u;
+    float* ks = arena + SPA_SCORE_FLOATS;
+    float* vs = ks + group_rows * KS;
+    float* qs = vs + group_rows * HW + warp * HW;
+    const float scale = __fsqrt_rn((float)HW);
+    const auto window = [&](unsigned g, unsigned& first) {
+        first = table ? valid[1u + 2u * g] : g * group_rows;
+        const unsigned span = table ? min(valid[2u + 2u * g], group_rows) : group_rows;
+        return (first < valid_rows ? min(first + span, valid_rows) : first) - first;
+    };
+    unsigned long long total = 0;
+    for (unsigned g = 0; g < groups; g++) {
+        unsigned first;
+        const unsigned long long n = window(g, first);
+        if (n) total += SPA_SEG_COST + n * (n + SPA_ROW_KEYS);
+    }
+    /* A chunk starting at cost c is this block's when lo <= c * nblk < hi. */
+    const unsigned long long lo = total * heads * slice, hi = lo + total * heads;
+    unsigned long long cost = 0;
+    for (unsigned g = 0; g < groups && cost * nblk < hi; g++) {
+        unsigned first;
+        const unsigned n = window(g, first);
+        if (!n) continue;
+        const unsigned long long row = n + SPA_ROW_KEYS, seg = SPA_SEG_COST + n * row;
+        if ((cost + heads * seg) * nblk <= lo) {
+            cost += heads * seg;
+            continue;
+        }
+        for (unsigned head = 0; head < heads && cost * nblk < hi; head++, cost += seg) {
+            const unsigned long long c0 = (cost + SPA_SEG_COST) * nblk, step = W * row * nblk;
+            const unsigned long long nch = (n + W - 1u) / W;
+            const unsigned q0 = (unsigned)(c0 >= lo ? 0ull : min((lo - c0 + step - 1u) / step, nch));
+            const unsigned q1 = (unsigned)(c0 >= hi ? 0ull : min((hi - c0 + step - 1u) / step, nch));
+            if (q0 >= q1) continue;
+            const unsigned r0 = q0 * W, r1 = min(q1 * W, n);
+            const float* kb = key + (size_t)first * width + head * HW;
+            const float* vb = value + (size_t)first * width + head * HW;
+            const float* qb = query + (size_t)first * width + head * HW;
+            float2 qn = make_float2(0.f, 0.f);
+            if (r0 + warp < r1) qn = ((const float2*)(qb + (size_t)(r0 + warp) * width))[lane];
+            __syncthreads();
+            for (unsigned e0 = threadIdx.x; e0 < n * (HW / 4u); e0 += PLOW_NV_THREADS * SPA_CHAINS) {
+                float4 kv[SPA_CHAINS], vv[SPA_CHAINS];
+#pragma unroll
+                for (int u = 0; u < SPA_CHAINS; u++) {
+                    const unsigned e = e0 + u * PLOW_NV_THREADS, r = e / (HW / 4u), c = (e % (HW / 4u)) * 4u;
+                    if (e < n * (HW / 4u)) {
+                        kv[u] = *(const float4*)(kb + (size_t)r * width + c);
+                        vv[u] = *(const float4*)(vb + (size_t)r * width + c);
+                    }
+                }
+#pragma unroll
+                for (int u = 0; u < SPA_CHAINS; u++) {
+                    const unsigned e = e0 + u * PLOW_NV_THREADS, r = e / (HW / 4u), c = (e % (HW / 4u)) * 4u;
+                    if (e < n * (HW / 4u)) {
+                        *(float4*)(ks + r * KS + c) = kv[u];
+                        *(float4*)(vs + r * HW + c) = vv[u];
+                    }
+                }
+            }
+            __syncthreads();
+            for (unsigned r = r0 + warp; r < r1; r += W) {
+                const unsigned row = first + r;
+                ((float2*)qs)[lane] = qn;
+                if (r + W < r1) qn = ((const float2*)(qb + (size_t)(r + W) * width))[lane];
+                __syncwarp();
+                float mx = -INFINITY;
+                for (unsigned j0 = lane; j0 < n; j0 += 32u * SPA_CHAINS) {
+                    const float4* kr[SPA_CHAINS];
+                    float sv[SPA_CHAINS];
+#pragma unroll
+                    for (int u = 0; u < SPA_CHAINS; u++) {
+                        const unsigned j = j0 + 32u * u;
+                        kr[u] = (const float4*)(ks + (j < n ? j : 0u) * KS);
+                        sv[u] = 0.f;
+                    }
+#pragma unroll 4
+                    for (unsigned c = 0; c < HW / 4u; c++) {
+                        const float4 qv = ((const float4*)qs)[c];
+#pragma unroll
+                        for (int u = 0; u < SPA_CHAINS; u++) {
+                            const float4 kv = kr[u][c];
+                            sv[u] = __fadd_rn(sv[u], __fmul_rn(qv.x, kv.x));
+                            sv[u] = __fadd_rn(sv[u], __fmul_rn(qv.y, kv.y));
+                            sv[u] = __fadd_rn(sv[u], __fmul_rn(qv.z, kv.z));
+                            sv[u] = __fadd_rn(sv[u], __fmul_rn(qv.w, kv.w));
+                        }
+                    }
+#pragma unroll
+                    for (int u = 0; u < SPA_CHAINS; u++) {
+                        const unsigned j = j0 + 32u * u;
+                        if (j >= n) break;
+                        float v = flags & 1u ? sp_bf16(sv[u]) : sv[u];
+                        v = __fdiv_rn(v, scale);
+                        sc[j] = v;
+                        mx = fmaxf(mx, v);
+                    }
+                }
+                mx = sp_warp_max(mx);
+                for (unsigned j = lane; j < n; j += 32u) sc[j] = sp_expf(__fsub_rn(sc[j], mx));
+                __syncwarp();
+                float den = 0.f;
+#pragma unroll 8
+                for (unsigned j = 0; j < n; j++) den = __fadd_rn(den, sc[j]);
+                __syncwarp();
+                for (unsigned j = lane; j < n; j += 32u) {
+                    const float p = __fdiv_rn(sc[j], den);
+                    sc[j] = flags & 2u ? sp_bf16(p) : p;
+                }
+                __syncwarp();
+                float a0 = 0.f, a1 = 0.f;
+#pragma unroll 8
+                for (unsigned j = 0; j < n; j++) {
+                    const float pj = sc[j];
+                    const float2 v = *(const float2*)(vs + j * HW + 2u * lane);
+                    a0 = __fadd_rn(a0, __fmul_rn(pj, v.x));
+                    a1 = __fadd_rn(a1, __fmul_rn(pj, v.y));
+                }
+                if (flags & 4u) a0 = sp_bf16(a0), a1 = sp_bf16(a1);
+                *(float2*)(context + (size_t)row * width + head * HW + 2u * lane) = make_float2(a0, a1);
+                __syncwarp();
+            }
+        }
+    }
+}
 static __device__ __noinline__ void d_grouped_attention_f32(float* __restrict__ context, const float* __restrict__ query,
                                                const float* __restrict__ key, const float* __restrict__ value,
                                                const unsigned* valid, unsigned rows, unsigned width,
@@ -2803,6 +2944,12 @@ static __device__ __noinline__ void d_grouped_attention_f32(float* __restrict__ 
     float* qs = vs + vfl + warp * hw;
     const float scale = __fsqrt_rn((float)hw);
     const bool vec = hw % 4u == 0 && width % 4u == 0 && sp_aligned(key, 16) && sp_aligned(value, 16);
+    if (hw == 64u && vec && sp_aligned(query, 8) && sp_aligned(context, 8) &&
+        SPA_SCORE_FLOATS + group_rows * (2u * 64u + 4u) + PLOW_NV_WARPS * 64u <= SP_ARENA_FLOATS) {
+        sp_ga_slabs64(context, query, key, value, valid, table, valid_rows, width, heads, groups, group_rows, flags,
+                      slice, nblk, arena);
+        return;
+    }
     for (unsigned item = slice; item < groups * heads * chunks; item += nblk) {
         const unsigned chunk = item % chunks, gh = item / chunks, g = gh / heads, head = gh - g * heads;
         const unsigned first = table ? valid[1u + 2u * g] : g * group_rows;

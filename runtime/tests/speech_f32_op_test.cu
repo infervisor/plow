@@ -1424,6 +1424,8 @@ int main(int argc, char** argv) {
         t_layernorm("LayerNormF32 ordered bf16", 100, 1024, 3, true);
         t_grouped("GroupedAttentionF32 qwen 300 v290", 300, 1024, 64, 104, 7, 290);
         t_grouped_table("GroupedAttentionF32 qwen packed table", 13 * 19, {4, 0, 104, 104, 36, 143, 35, 182, 60});
+        t_grouped_table("GroupedAttentionF32 qwen packed table 10 ragged", 832,
+                        {10, 0, 104, 104, 104, 208, 104, 312, 52, 364, 104, 468, 91, 559, 67, 626, 37, 663, 27, 690, 12});
         printf("%s: %d failure(s)\n", g_fail ? "FAIL" : "PASS", g_fail);
         return g_fail ? 1 : 0;
     }
