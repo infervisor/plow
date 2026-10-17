@@ -2526,6 +2526,10 @@ static __device__ void d_moe_combine_resid_norm_gemma(
         const bf16* __restrict__ g_po, const bf16* __restrict__ gn, unsigned H, unsigned k,
         float eps, float ls, unsigned slice, unsigned nblk, unsigned nrow,
         float* arena) {
+#if PLOW_NV_PREFILL || PLOW_NV_NRN_WPR
+    /* NormResidualNorm picks a row-count-dependent arm here; the per-row call below would not. */
+    __trap();
+#endif
     const unsigned stride = nblk ? nblk : 1u;
     for (unsigned row = slice; row < nrow; row += stride) {
         /* Both callees take the arena as a __restrict__ pointer, and nvcc then lets a restrict

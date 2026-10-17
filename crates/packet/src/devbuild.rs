@@ -5316,9 +5316,6 @@ mod l2_placement_tests {
         );
     }
 
-    /// K3's MoE layer shape: a b=1 router chain emitted BEFORE an independent shared-expert pair
-    /// that was ready earlier. ASAP ordering must hoist the pair ahead of the gated chain in
-    /// every XCD window, keep every window topological, and leave the static streams alone.
     #[test]
     fn gq_hoist_queues_a_narrow_tail_behind_its_producer() {
         let emit = |hoist: bool| {
@@ -5345,6 +5342,9 @@ mod l2_placement_tests {
         assert!(first(&p, topk) < first(&p, glu) && first(&p, glu) < first(&p, eglu));
     }
 
+    /// K3's MoE layer shape: a b=1 router chain emitted BEFORE an independent shared-expert pair
+    /// that was ready earlier. ASAP ordering must hoist the pair ahead of the gated chain in
+    /// every XCD window, keep every window topological, and leave the static streams alone.
     #[test]
     fn gq_asap_order_hoists_ready_packets_ahead_of_gated_ones() {
         let l = L2Layout {
