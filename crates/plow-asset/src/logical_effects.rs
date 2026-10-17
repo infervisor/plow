@@ -65,7 +65,11 @@ pub(crate) fn outputs(d: &DevInst64) -> Result<&'static [usize], String> {
         // The multi-output QB/split variants require their own footprint audit.
         GemmFp8Block128 if d.i[4] == 0 && d.t[5..].iter().all(|&h| h == TENSOR_NONE16) => Ok(&[0]),
         MlaBmmFp8 if d.i[4] == 0 => Ok(&[0]),
-        // The split-K workspace (tickets + partials) is written by every DenseGemmF32 sharing it.
+        // Flag 128 (reference split): t4 is the read-only per-row reference table and t5 the packed
+        // split-K workspace. Otherwise t4 is the split-K workspace (tickets + partials), written by
+        // every DenseGemmF32 sharing it.
+        DenseGemmF32 if d.i[7] & 128 != 0 && d.t[5] != TENSOR_NONE16 => Ok(&[0, 5]),
+        DenseGemmF32 if d.i[7] & 128 != 0 => Ok(&[0]),
         DenseGemmF32 if d.t[4] != TENSOR_NONE16 => Ok(&[0, 4]),
         LstmCellF32 => Ok(&[0, 1]),
         Q8GemmF32
@@ -441,6 +445,22 @@ mod tests {
             assert_eq!(value["address_map"].as_array().unwrap().len(), 2);
             assert_eq!(value["protocol"]["waits"][2], json!([0, 1]));
         });
+    }
+
+    #[test]
+    fn dense_reference_split_writes_its_packed_workspace_not_the_row_table() {
+        let mut d = DevInst64 {
+            op: DevOp::DenseGemmF32 as u16,
+            blocks: 1,
+            fj: [0; 3],
+            t: [0, 1, 2, TENSOR_NONE16, 4, 5, TENSOR_NONE16, TENSOR_NONE16],
+            i: [0, 0, 0, 0, 0, 0, 0, 128 | 8 | 4],
+        };
+        assert_eq!(outputs(&d).unwrap(), &[0, 5]);
+        d.t[5] = TENSOR_NONE16;
+        assert_eq!(outputs(&d).unwrap(), &[0]);
+        d.i[7] = 8 | 4;
+        assert_eq!(outputs(&d).unwrap(), &[0, 4]);
     }
 
     #[test]
