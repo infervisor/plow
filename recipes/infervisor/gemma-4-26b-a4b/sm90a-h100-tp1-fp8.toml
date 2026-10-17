@@ -5,6 +5,8 @@
 # (compressed-tensors W8 per-channel / A8 dynamic per-token; shard sha256 aeb3c810..., e5efcdd2...),
 # re-keyed to plow's fp8/ contract without requantizing:
 #   python3 scripts/gemma4_fp8_hub_rekey.py <hub snapshot> <re-keyed dir>
+#   python3 scripts/quantize_fp8_head.py <re-keyed dir> <re-keyed dir>   (PLOW_FP8_HEAD twin: writes the
+#   0.74 GB model-head.safetensors beside model.safetensors; plowrt refuses a packet whose checkpoint lacks it)
 #   PLOW_CAMPAIGN_NO_NIX=1 (box without nix only) PLOW_FP8_CKPT=<re-keyed dir> \
 #   python3 scripts/campaign/campaign.py build recipes/infervisor/gemma-4-26b-a4b/sm90a-h100-tp1-fp8.toml --out <fresh dir>
 #
@@ -111,6 +113,16 @@ PLOW_EMIT_MOE_PF_LT = "1"
 # 0.9602 vs ctrl 0.9642; long gate PASS: kl_mean 0.1627 vs ctrl 0.1515 / vLLM 0.165, kl_p99 3.18, top1 0.9638.
 # Evidence: g26-pfrung REPORT.md sections 6 and 13-14 (res2, ab/g-p1, ab/gl-p1).
 PLOW_NO_GLU_FUSE = "1"
+# Decode lm_head on rungs 1-16 reads a per-row e4m3 twin of the tied embedding (GemvFp8 + SoftCap + Argmax; the
+# embedding gather, the prefill terminal and the cuBLASLt head at >= 32 rows keep bf16). Qualified 2026-10-17 on
+# the kit plowrt 16c08ef8: step_bench ctx 6144 B1/B2/B4/B8/B16 4.611/5.334/6.311/7.415/9.797 -> 4.403/5.093/
+# 6.120/7.162/9.614 ms, B32-128 digests identical. c16 FP32 gate 3+3 runs PASS: kl_trim_mean 0.1300/0.1307/0.1310
+# vs ctrl 0.1255/0.1298/0.1422, kl_p95 0.92/0.92/0.92 vs 0.83/0.85/1.03, top1_decisive 0.960/0.959/0.960 vs
+# 0.962/0.954/0.958, over 203/218/202 vs 200/202/211; c1 (deterministic) trim 0.1441 vs 0.1390, p95 0.99 vs 0.89,
+# top1 0.959 vs 0.962, within every c16 limit. Prod-fidelity replay 1.8/s: TPOT p50/p99 10.55/20.52 -> 9.88/19.39 ms,
+# TTFT p50/p99 45.9/247.0 -> 43.6/242.7 ms, cached 79.8%, 0 errors. A fused FP8 GemvArgmax measured slower than
+# this unfused chain (B2 +0.10 ms). Evidence: /opt/dlami/nvme/lava-tts/g26-perf-push/g26-lmhead-fp8.
+PLOW_FP8_HEAD = "1"
 
 [objects]
 script = "scripts/build_sm90a_gemma4_segments.sh"
