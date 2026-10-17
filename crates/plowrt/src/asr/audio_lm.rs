@@ -271,17 +271,18 @@ impl PacketAudioEncoder {
                 "{total} audio chunks exceed the packed encoder"
             )));
         }
-        let programs = self
+        let (bucket, programs) = self
             .packed
             .iter()
             .find(|&&(chunks, _)| chunks >= total)
-            .map(|(_, p)| p.clone())
+            .map(|(chunks, p)| (*chunks, p.clone()))
             .unwrap();
         let chunk = self.chunking.chunk_frames;
         let chunk_rows = chunk.div_ceil(self.chunking.frame_stride);
         let mut input = vec![0.0f32; total * self.feature_bins * chunk];
         let mut table = vec![0u32];
-        let mut reference = vec![0u32; total * chunk_rows];
+        // Reference rows 0 mark the bucket's padding rows, which the dense split plan skips.
+        let mut reference = vec![0u32; bucket * chunk_rows];
         let mut spans = Vec::with_capacity(items.len());
         let mut first = 0;
         for features in items {

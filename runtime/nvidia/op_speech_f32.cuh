@@ -1570,12 +1570,14 @@ static __device__ __forceinline__ void sp_tcn_store(unsigned m0, unsigned n0, un
  * part must save more k-steps than that. */
 #define SPN_SPLIT_MIN_SAVE 16u
 /* Block-uniform plan of item (tile at m0, part s): splits at multiples of cmax; part s owns each
- * row's chunks that start in [lo, own) and walks to the end of the last of them (hi). */
+ * row's chunks that start in [lo, own) and walks to the end of the last of them (hi). Reference
+ * rows 0 mark a bucket's padding rows: they take no part in the plan and a split tile leaves them
+ * at the epilogue of 0; a tile of padding only is skipped (parts 0). */
 struct SpTcnPart { unsigned parts, lo, own, hi, cmin; };
 __device__ __forceinline__ SpTcnPart sp_tcn_part(unsigned m0, unsigned s, unsigned S, unsigned cap, unsigned M,
                                                  unsigned N, unsigned K, const SpRefSplit& rs, float* arena) {
     const unsigned tid = threadIdx.x, row = m0 + tid, nk = (K + 63u) / 64u;
-    const bool live = tid < SPT_BM && row < M;
+    const bool live = tid < SPT_BM && row < M && rs.rows[row] != 0u;
     const unsigned c = live ? sp_ref_chunk(rs.rows[row], N, K, rs.ncu) : 0u;
     unsigned* red = (unsigned*)arena;
     if (tid < SPT_BM) {
@@ -1587,6 +1589,10 @@ __device__ __forceinline__ SpTcnPart sp_tcn_part(unsigned m0, unsigned s, unsign
     }
     __syncthreads();
     const unsigned cmin = min(red[0], red[2]), cmax = max(red[1], red[3]);
+    if (!cmax) {
+        __syncthreads();
+        return SpTcnPart{0u, 0u, nk, nk, nk};
+    }
     const unsigned units = (nk + cmax - 1u) / cmax, per = (units + min(S, units) - 1u) / min(S, units);
     const bool split = cmax < nk && (nk + cmin - 1u) / cmin <= cap && per * cmax + SPN_SPLIT_MIN_SAVE <= nk;
     SpTcnPart p{split ? (units + per - 1u) / per : 1u, 0u, nk, nk, cmin};
