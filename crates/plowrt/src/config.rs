@@ -596,16 +596,18 @@ pub struct RuntimeConfig {
     pub pf_itl_budget_ms: u32,
 
     /// Force enforcement of ITL budget even when there is prefill backlog (`itl_owed_rows > budget_max`).
-    /// When disabled, ITL budget yields to prefill throughput when backlog exceeds a full launch.
-    /// When enabled (default), decode is never dropped and prefill rungs remain clamped to the ITL budget.
-    #[arg(long = "pf-itl-force", env = "PLOW_PF_ITL_FORCE", hide = true, default_value_t = true, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
+    /// When disabled (default), ITL budget yields to prefill throughput when backlog exceeds a full launch.
+    /// When enabled, prefill rungs stay clamped to the budget under backlog: on the G26 FP8 production replay
+    /// (6.5 req/s) budget 12 ms + force took TTFT p50 44 ms -> 12.7 s as the prefill queue grew without bound.
+    #[arg(long = "pf-itl-force", env = "PLOW_PF_ITL_FORCE", hide = true, default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
     pub pf_itl_force: bool,
 
     /// CUDA VMM prefix cache: enforce strict publish where a request must hold all whole blocks
-    /// matched by radix lookup before publishing a boundary snapshot. When false (default),
+    /// matched by radix lookup before publishing a boundary snapshot (default). When false,
     /// sequential requests sharing a common system prompt can publish their shared-end boundary
-    /// and allow subsequent requests to attach to the full prefix.
-    #[arg(long = "vmm-strict-publish", env = "PLOW_VMM_STRICT_PUBLISH", hide = true, default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
+    /// over blocks another prefill wrote, pairing them with this prefill's FP8 full-layer scales:
+    /// on G26 FP8, cache-hit greedy output then differed from cold output on 12 of 15 prompts vs 7.
+    #[arg(long = "vmm-strict-publish", env = "PLOW_VMM_STRICT_PUBLISH", hide = true, default_value_t = true, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
     pub vmm_strict_publish: bool,
 
     /// CUDA VMM prefix snapshots: copy the fp8 ring scales and full-layer scale prefixes as one
