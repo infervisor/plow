@@ -769,14 +769,18 @@ impl PacketPrefix {
             }
             None => [packet::dev::TENSOR_NONE; 3],
         };
-        let blocks = dense_blocks(
-            rows,
-            stage.output_width,
-            stage.input_width,
-            tensor_cores,
-            stage.split == DenseSplit::Parallel,
-            self.model.n_cu,
-        );
+        // A reference split spreads small tiles over every CU (sp_tcn_gemm's packed split-K).
+        let blocks = match stage.split {
+            DenseSplit::Reference(_) if tensor_cores => self.model.n_cu,
+            _ => dense_blocks(
+                rows,
+                stage.output_width,
+                stage.input_width,
+                tensor_cores,
+                stage.split == DenseSplit::Parallel,
+                self.model.n_cu,
+            ),
+        };
         if let DenseSplit::Reference(rows_ref) = stage.split {
             if !tensor_cores
                 || stage.layer_norm.is_some()
@@ -790,17 +794,19 @@ impl PacketPrefix {
             }
         }
         // Declared under either split, so both lowerings share one tensor table.
-        let scratch = if tensor_cores {
-            let scratch = builder.tensor(
+        let splitk = if tensor_cores {
+            builder.tensor(
                 DENSE_SPLITK_SCRATCH,
-                (u64::from(DENSE_SPLITK_TICKETS) + u64::from(self.model.n_cu) * 64 * 64) * 4,
-            );
-            match stage.split {
-                DenseSplit::Parallel => scratch,
-                DenseSplit::Reference(rows_ref) => rows_ref,
-            }
+                (u64::from(DENSE_SPLITK_TICKETS)
+                    + u64::from(self.model.n_cu) * DENSE_SPLITK_SLOTS_PER_CU * 64 * 64)
+                    * 4,
+            )
         } else {
             packet::dev::TENSOR_NONE
+        };
+        let scratch = match stage.split {
+            DenseSplit::Reference(rows_ref) if tensor_cores => rows_ref,
+            _ => splitk,
         };
         let reference = matches!(stage.split, DenseSplit::Reference(_));
         let flags = flags | (u32::from(reference) << 7);
@@ -812,6 +818,9 @@ impl PacketPrefix {
             |instruction| {
                 instruction.t[..5].copy_from_slice(&[output, source, weight, bias, scratch]);
                 instruction.t[5..8].copy_from_slice(&prologue);
+                if reference {
+                    instruction.t[5] = splitk;
+                }
                 instruction.i[..4].copy_from_slice(&[
                     rows,
                     stage.output_width,
@@ -2164,9 +2173,12 @@ fn conv1d_units(stage: &Conv1dF32Stage<'_>, transpose: bool, out_rows: u32, n_cu
 }
 
 /// Split-K scratch shared by every tensor-core DenseGemmF32 (each in its own program, so they
-/// never overlap): `DENSE_SPLITK_TICKETS` zeroed u32 tickets, then one 64x64 f32 partial per block.
+/// never overlap): `DENSE_SPLITK_TICKETS` zeroed u32 tickets, then `DENSE_SPLITK_SLOTS_PER_CU`
+/// 64x64 f32 partials per CU (a parallel split uses one per block; a reference split's chunk
+/// slots, SPN_SPLIT_FLOATS in op_speech_f32.cuh, use all of them).
 const DENSE_SPLITK_SCRATCH: &str = "scratch.dense_f32_splitk";
 const DENSE_SPLITK_TICKETS: u32 = 1024;
+const DENSE_SPLITK_SLOTS_PER_CU: u64 = 8;
 
 /// DenseGemmF32 slices, mirroring the interpreter's decomposition (op_speech_f32.cuh): FP32 FFMA
 /// uses 128x128 tiles; the tensor-core path 64x64 tiles, split over K (BK = 64) until the tiles

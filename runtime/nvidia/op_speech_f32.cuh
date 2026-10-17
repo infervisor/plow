@@ -1393,10 +1393,14 @@ __device__ __forceinline__ void sp_ldsm2(unsigned (&r)[4], const void* p) {
                  : "=r"(r[0]), "=r"(r[1])
                  : "r"((unsigned)__cvta_generic_to_shared(p)));
 }
-template <unsigned BN>
+/* SPLIT: walk k-steps [s0, s1), store each chunk that starts in [s0, own) to its slot instead of
+ * folding, and return the rows' chunks in `ch` (sp_tcn_gemm). */
+template <unsigned BN, bool SPLIT = false>
 static __device__ __forceinline__ void sp_tcn_tile(unsigned m0, unsigned n0, unsigned M, unsigned N, unsigned K,
                                                    const SpRowF32& la, const SpRowBf16& lb, float* arena,
-                                                   float (&acc)[SpN<BN>::NJ][4], const SpRefSplit& rs) {
+                                                   float (&acc)[SpN<BN>::NJ][4], const SpRefSplit& rs,
+                                                   unsigned s0 = 0u, unsigned s1 = 0u, unsigned own = 0u,
+                                                   float* slots = nullptr, unsigned cmin = 1u, unsigned* ch = nullptr) {
     using C = SpN<BN>;
     constexpr unsigned NJ = C::NJ;
     char* smem = (char*)arena;
@@ -1404,12 +1408,13 @@ static __device__ __forceinline__ void sp_tcn_tile(unsigned m0, unsigned n0, uns
     const unsigned tid = threadIdx.x, lane = tid & 31u, warp = tid >> 5;
     const unsigned wm = (warp & 3u) * 16u, wn = (warp >> 2) * (BN / 2), g = lane >> 2;
     const unsigned nk = (K + 63u) / 64u;
+    if (!SPLIT) s1 = nk;
     float4 av[4];
     auto a_fetch = [&](unsigned kt) {
 #pragma unroll
         for (unsigned p = 0; p < 4; p++) {
             const unsigned e = tid + p * PLOW_NV_THREADS, r = e >> 4, k = kt * 64u + (e & 15u) * 4u;
-            av[p] = kt < nk && m0 + r < M && k < K ? __ldcg((const float4*)(la.p + (size_t)(m0 + r) * la.k + k))
+            av[p] = kt < s1 && m0 + r < M && k < K ? __ldcg((const float4*)(la.p + (size_t)(m0 + r) * la.k + k))
                                                    : make_float4(0.f, 0.f, 0.f, 0.f);
         }
     };
@@ -1424,7 +1429,7 @@ static __device__ __forceinline__ void sp_tcn_tile(unsigned m0, unsigned n0, uns
         }
     };
     auto issue_b = [&](unsigned kt) {
-        if (kt < nk) {
+        if (kt < s1) {
             __nv_bfloat16* bs = (__nv_bfloat16*)(smem + (kt % SPN_NS) * C::B_BYTES);
             const unsigned k0 = kt * 64u;
 #pragma unroll
@@ -1442,18 +1447,24 @@ static __device__ __forceinline__ void sp_tcn_tile(unsigned m0, unsigned n0, uns
     for (unsigned h = 0; h < 2; h++) {
         const unsigned row = m0 + wm + g + h * 8u;
         chunk[h] = row < M ? sp_ref_chunk(rs.rows[row], N, K, rs.ncu) : nk;
-        fold[h] = chunk[h] - 1u;
+        fold[h] = s0 / chunk[h] * chunk[h] + chunk[h] - 1u;
+        if constexpr (SPLIT) ch[h] = chunk[h];
     }
-    float tot[NJ][4];
+    float tot[SPLIT ? 1 : NJ][4];
 #pragma unroll
     for (unsigned j = 0; j < NJ; j++)
 #pragma unroll
-        for (unsigned r = 0; r < 4; r++) acc[j][r] = tot[j][r] = 0.f;
-    a_fetch(0u);
-    a_store(0u);
+        for (unsigned r = 0; r < 4; r++) acc[j][r] = 0.f;
+    if constexpr (!SPLIT)
 #pragma unroll
-    for (unsigned s = 0; s + 1 < SPN_NS; s++) issue_b(s);
-    for (unsigned kt = 0; kt < nk; kt++) {
+        for (unsigned j = 0; j < NJ; j++)
+#pragma unroll
+            for (unsigned r = 0; r < 4; r++) tot[j][r] = 0.f;
+    a_fetch(s0);
+    a_store(s0 & 1u);
+#pragma unroll
+    for (unsigned s = 0; s + 1 < SPN_NS; s++) issue_b(s0 + s);
+    for (unsigned kt = s0; kt < s1; kt++) {
         asm volatile("cp.async.wait_group %0;\n" ::"n"(SPN_NS - 2));
         __syncthreads();
         issue_b(kt + SPN_NS - 1);
@@ -1480,7 +1491,7 @@ static __device__ __forceinline__ void sp_tcn_tile(unsigned m0, unsigned n0, uns
             for (unsigned j = 0; j < NJ; j++)
                 sp_mma_bf16x(part[j], a, b[j >> 1][(j & 1u) * 2], b[j >> 1][(j & 1u) * 2 + 1]);
         }
-        if (kt + 1 < nk) a_store((kt + 1u) & 1u);
+        if (kt + 1 < s1) a_store((kt + 1u) & 1u);
 #pragma unroll
         for (unsigned j = 0; j < NJ; j++)
 #pragma unroll
@@ -1488,19 +1499,30 @@ static __device__ __forceinline__ void sp_tcn_tile(unsigned m0, unsigned n0, uns
 #pragma unroll
         for (unsigned h = 0; h < 2; h++) {
             if (chunk[h] >= nk || (kt != fold[h] && kt + 1u < nk)) continue;
-            fold[h] += chunk[h];
+            if constexpr (SPLIT) {
+                const unsigned start = fold[h] + 1u - chunk[h];
+                float2* dst = (float2*)(slots + (size_t)(start / cmin) * (SPT_BM * BN)) + h * PLOW_NV_THREADS + tid;
 #pragma unroll
-            for (unsigned j = 0; j < NJ; j++)
-#pragma unroll
-                for (unsigned r = 2 * h; r < 2 * h + 2; r++) {
-                    tot[j][r] = __fadd_rn(tot[j][r], acc[j][r]);
-                    acc[j][r] = 0.f;
+                for (unsigned j = 0; j < NJ; j++) {
+                    if (start >= s0 && start < own)
+                        __stcg(dst + j * 2u * PLOW_NV_THREADS, make_float2(acc[j][2 * h], acc[j][2 * h + 1]));
+                    acc[j][2 * h] = acc[j][2 * h + 1] = 0.f;
                 }
+            } else {
+#pragma unroll
+                for (unsigned j = 0; j < NJ; j++)
+#pragma unroll
+                    for (unsigned r = 2 * h; r < 2 * h + 2; r++) {
+                        tot[j][r] = __fadd_rn(tot[j][r], acc[j][r]);
+                        acc[j][r] = 0.f;
+                    }
+            }
+            fold[h] += chunk[h];
         }
     }
 #pragma unroll
     for (unsigned h = 0; h < 2; h++)
-        if (chunk[h] < nk)
+        if (!SPLIT && chunk[h] < nk)
 #pragma unroll
             for (unsigned j = 0; j < NJ; j++)
 #pragma unroll
@@ -1536,16 +1558,121 @@ static __device__ __forceinline__ void sp_tcn_store(unsigned m0, unsigned n0, un
     }
     __syncthreads();
 }
+/* Packed split-K: tiles split over idle blocks (sp_tcn_part). A block stores each chunk partial
+ * it owns in slot (chunk start / cmin); the last to arrive folds a row's slots in chunk order from
+ * 0, as sp_tcn_tile's tot does: the same bits. Scratch: SPT_TICKETS tickets, then
+ * SPN_SPLIT_FLOATS per CU of slots. */
+#define SPN_SPLIT_FLOATS (8u * SPT_BM * SPT_BN)
+/* Plan, ticket, fold and the second store cost ~8 us (~10 k-steps) at 1 tile per block: a split
+ * part must save more k-steps than that. */
+#define SPN_SPLIT_MIN_SAVE 16u
+/* Block-uniform plan of item (tile at m0, part s): splits at multiples of cmax; part s owns each
+ * row's chunks that start in [lo, own) and walks to the end of the last of them (hi). */
+struct SpTcnPart { unsigned parts, lo, own, hi, cmin; };
+__device__ __forceinline__ SpTcnPart sp_tcn_part(unsigned m0, unsigned s, unsigned S, unsigned cap, unsigned M,
+                                                 unsigned N, unsigned K, const SpRefSplit& rs, float* arena) {
+    const unsigned tid = threadIdx.x, row = m0 + tid, nk = (K + 63u) / 64u;
+    const bool live = tid < SPT_BM && row < M;
+    const unsigned c = live ? sp_ref_chunk(rs.rows[row], N, K, rs.ncu) : 0u;
+    unsigned* red = (unsigned*)arena;
+    if (tid < SPT_BM) {
+        const unsigned lo = __reduce_min_sync(~0u, live ? c : ~0u), hi = __reduce_max_sync(~0u, c);
+        if ((tid & 31u) == 0) {
+            red[(tid >> 5) * 2u] = lo;
+            red[(tid >> 5) * 2u + 1u] = hi;
+        }
+    }
+    __syncthreads();
+    const unsigned cmin = min(red[0], red[2]), cmax = max(red[1], red[3]);
+    const unsigned units = (nk + cmax - 1u) / cmax, per = (units + min(S, units) - 1u) / min(S, units);
+    const bool split = cmax < nk && (nk + cmin - 1u) / cmin <= cap && per * cmax + SPN_SPLIT_MIN_SAVE <= nk;
+    SpTcnPart p{split ? (units + per - 1u) / per : 1u, 0u, nk, nk, cmin};
+    if (p.parts > 1u && s < p.parts) {
+        p.lo = s * per * cmax;
+        p.own = min(nk, p.lo + per * cmax);
+        if (tid < SPT_BM) {
+            const unsigned e = __reduce_max_sync(~0u, live ? min(nk, (p.own + c - 1u) / c * c) : 0u);
+            if ((tid & 31u) == 0) red[4u + (tid >> 5)] = e;
+        }
+        __syncthreads();
+        p.hi = max(red[4], red[5]);
+    }
+    __syncthreads();
+    return p;
+}
+/* Every slot of both row halves in flight at once (a round trip is ~1 us), folded in order. */
+template <unsigned BN>
+static __device__ __forceinline__ void sp_tcn_fold(unsigned K, const float* slots, unsigned cmin,
+                                                   const unsigned (&ch)[2], float (&acc)[SpN<BN>::NJ][4]) {
+    constexpr unsigned NJ = SpN<BN>::NJ, U = 8u;
+    const unsigned nk = (K + 63u) / 64u;
+    const float2* mine = (const float2*)slots + threadIdx.x;
+    unsigned n[2];
+#pragma unroll
+    for (unsigned h = 0; h < 2; h++) n[h] = ch[h] < nk ? (nk + ch[h] - 1u) / ch[h] : 0u;
+#pragma unroll
+    for (unsigned j = 0; j < NJ; j++)
+#pragma unroll
+        for (unsigned r = 0; r < 4; r++) acc[j][r] = 0.f;
+    for (unsigned i = 0; i < max(n[0], n[1]); i += U) {
+        float2 v[2][U][NJ];
+#pragma unroll
+        for (unsigned h = 0; h < 2; h++)
+#pragma unroll
+            for (unsigned u = 0; u < U; u++)
+#pragma unroll
+                for (unsigned j = 0; j < NJ; j++)
+                    v[h][u][j] = i + u < n[h] ? __ldcg(mine + (size_t)((i + u) * ch[h] / cmin) * (SPT_BM * BN / 2u) +
+                                                       (j * 2u + h) * PLOW_NV_THREADS)
+                                              : make_float2(0.f, 0.f);
+#pragma unroll
+        for (unsigned h = 0; h < 2; h++)
+#pragma unroll
+            for (unsigned u = 0; u < U; u++)
+                if (i + u < n[h])
+#pragma unroll
+                    for (unsigned j = 0; j < NJ; j++) {
+                        acc[j][2 * h] = __fadd_rn(acc[j][2 * h], v[h][u][j].x);
+                        acc[j][2 * h + 1] = __fadd_rn(acc[j][2 * h + 1], v[h][u][j].y);
+                    }
+    }
+}
 template <unsigned BN, class EP>
 static __device__ __forceinline__ void sp_tcn_gemm(unsigned M, unsigned N, unsigned K, const SpRowF32& la,
                                                    const SpRowBf16& lb, const EP& ep, unsigned slice, unsigned nblk,
-                                                   float* arena, const SpRefSplit& rs) {
-    const unsigned tn = (N + BN - 1) / BN, tiles = ((M + SPT_BM - 1) / SPT_BM) * tn;
-    for (unsigned tile = slice; tile < tiles; tile += nblk) {
+                                                   float* arena, float* scratch, const SpRefSplit& rs) {
+    constexpr unsigned TILE = SPT_BM * BN;
+    const unsigned tn = (N + BN - 1) / BN, tiles = ((M + SPT_BM - 1) / SPT_BM) * tn, nk = (K + 63u) / 64u;
+    /* 160-wide tiles are chosen only past one round of 80-wide ones (sp_tcn_wide): never split. */
+    const unsigned S = BN == 80u && scratch && tiles <= SPT_TICKETS && tiles * 2u <= nblk ? nblk / tiles : 1u;
+    const unsigned cap = S > 1u ? rs.ncu * SPN_SPLIT_FLOATS / tiles / TILE : 0u;
+    for (unsigned w = slice; w < tiles * S; w += nblk) {
+        const unsigned tile = w / S, s = w - tile * S;
         const unsigned m0 = (tile / tn) * SPT_BM, n0 = (tile % tn) * BN;
         float acc[SpN<BN>::NJ][4];
-        sp_tcn_tile<BN>(m0, n0, M, N, K, la, lb, arena, acc, rs);
+        const SpTcnPart p = S > 1u ? sp_tcn_part(m0, s, S, cap, M, N, K, rs, arena) : SpTcnPart{1u, 0u, nk, nk, nk};
+        if (s >= p.parts) continue;
+        if (BN != 80u || p.parts == 1u) {
+            sp_tcn_tile<BN>(m0, n0, M, N, K, la, lb, arena, acc, rs);
+            sp_tcn_store<BN>(m0, n0, M, N, ep, acc, arena);
+            continue;
+        }
+        float* slots = scratch + SPT_TICKETS + (size_t)tile * cap * TILE;
+        unsigned ch[2];
+        sp_tcn_tile<BN, BN == 80u>(m0, n0, M, N, K, la, lb, arena, acc, rs, p.lo, p.hi, p.own, slots, p.cmin, ch);
+        __threadfence();
+        __syncthreads();
+        unsigned* tickets = (unsigned*)scratch;
+        unsigned* flag = (unsigned*)arena;
+        if (threadIdx.x == 0) *flag = atomicAdd(tickets + tile, 1u);
+        __syncthreads();
+        const bool last = *flag == p.parts - 1u;
+        __syncthreads();
+        if (!last) continue;
+        __threadfence();
+        sp_tcn_fold<BN>(K, slots, p.cmin, ch, acc);
         sp_tcn_store<BN>(m0, n0, M, N, ep, acc, arena);
+        if (threadIdx.x == 0) tickets[tile] = 0u;
     }
 }
 /* 160-wide tiles when their rounds over the blocks cost no more than 80-wide ones (fc1, N = 4 d:
@@ -1560,7 +1687,8 @@ __device__ __forceinline__ bool sp_tcn_wide(unsigned M, unsigned N, unsigned nbl
 /* DenseGemmF32 (170). flags: 1 = bf16-round, 2 = bf16 erf-GELU (implies the round), 4 = bf16
  * weights, 8 = A (and f32 W) bf16-representable -> bf16 tensor cores, 16 = 3xTF32 tensor cores.
  * i5 != 0: weight row stride, and i6 < i5 names a one-hot weight column added in. t4: optional
- * split-K scratch (sp_tc_gemm); with flag 128 instead per-row reference rows (SpRefSplit, j0 units). */
+ * split-K scratch (sp_tc_gemm); with flag 128 instead per-row reference rows (SpRefSplit, j0 units) and
+ * t5 the optional packed split-K scratch (sp_tcn_gemm). */
 struct SpDenseEpi {
     float* out; const float* bias; const void* w; unsigned n, stride, onehot, flags, relu;
     __device__ void operator()(unsigned m, unsigned c, float acc) const {
@@ -1601,8 +1729,8 @@ static __device__ __noinline__ void d_dense_gemm_f32(float* __restrict__ out, co
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ == 1200
             if (rs && !ln) {
                 const SpRowBf16 lb{wb, k, stride, true};
-                if (sp_tcn_wide(m, n, nblk)) sp_tcn_gemm<160>(m, n, k, la, lb, ep, slice, nblk, arena, *rs);
-                else sp_tcn_gemm<80>(m, n, k, la, lb, ep, slice, nblk, arena, *rs);
+                if (sp_tcn_wide(m, n, nblk)) sp_tcn_gemm<160>(m, n, k, la, lb, ep, slice, nblk, arena, scratch, *rs);
+                else sp_tcn_gemm<80>(m, n, k, la, lb, ep, slice, nblk, arena, scratch, *rs);
                 return;
             }
 #endif
@@ -5469,7 +5597,7 @@ static __device__ __noinline__ void d_speech_f32(const PlowDevInst* in, void* co
             const SpRefSplit rs{(const unsigned*)SP_TEN(4), in->fj[1].u};
             d_dense_gemm_f32((float*)SP_TEN(0), (const float*)SP_TEN(1), SP_TEN(2), (const float*)SP_TEN(3), in->i[0],
                              in->i[1], in->i[2], in->i[3], in->i[4], in->i[5], in->i[6], in->i[7], slice, nblk, arena,
-                             nullptr, nullptr, &rs);
+                             (float*)SP_TEN(5), nullptr, &rs);
             break;
         }
         d_dense_gemm_f32((float*)SP_TEN(0), (const float*)SP_TEN(1), SP_TEN(2), (const float*)SP_TEN(3), in->i[0],

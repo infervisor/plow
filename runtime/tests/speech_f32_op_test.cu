@@ -225,9 +225,10 @@ static void round_bf16(Case& c, unsigned id) {
         memcpy(&p[i], &u, 4);
     }
 }
-/* Split-K scratch for the tensor-core GEMMs: tickets + one 64x64 partial per block. */
+/* Split-K scratch for the tensor-core GEMMs: tickets + one 64x64 partial per block, or the packed
+ * reference split's slots. */
 static unsigned splitk_scratch(Case& c) {
-    const size_t bytes = (SPT_TICKETS + (size_t)g_nblk * SPT_BM * SPT_BN) * 4;
+    const size_t bytes = (SPT_TICKETS + (size_t)g_nblk * SPN_SPLIT_FLOATS) * 4;
     unsigned id = c.add(bytes);
     memset(c.host[id].data(), 0, bytes);
     return id;
@@ -277,7 +278,7 @@ static void t_dense_ref(unsigned n, unsigned k, std::vector<unsigned> items) {
     void** td = upload_table(c.dev);
     PlowDevInst in = c.in;
     in.op = PLOW_DOP_DENSE_GEMM_F32;
-    in.t[0] = o; in.t[1] = x; in.t[2] = w; in.t[3] = b; in.t[4] = table;
+    in.t[0] = o; in.t[1] = x; in.t[2] = w; in.t[3] = b; in.t[4] = table; in.t[5] = scratch;
     in.i[0] = m; in.i[1] = n; in.i[2] = k; in.i[7] = 1 | 4 | 8 | 128; in.fj[1].u = 132;
     k_speech<<<g_nblk, 256, kSmem>>>(in, td);
     CK(cudaDeviceSynchronize());
@@ -1330,9 +1331,10 @@ int main(int argc, char** argv) {
     }
     if (argc > 1 && !strcmp(argv[1], "--bench-qwen-asr")) {
         /* The Qwen3-ASR encoder's instructions at a 64-chunk bucket (832 rows) with the packet's
-         * flags; argv[2] = d_model (896: 0.6B, 1024: 1.7B). Requests of 7 chunks (91 rows) set the
-         * reference split and the attention group table. */
-        const unsigned d = argc > 2 ? (unsigned)atoi(argv[2]) : 1024u, M = 832u;
+         * flags; argv[2] = d_model (896: 0.6B, 1024: 1.7B), argv[3] = bucket rows (13 per chunk).
+         * Requests of 7 chunks (91 rows) set the reference split and the attention group table. */
+        const unsigned d = argc > 2 ? (unsigned)atoi(argv[2]) : 1024u, M = argc > 3 ? (unsigned)atoi(argv[3]) : 832u;
+        const unsigned B = M / 13u;
         std::vector<uint32_t> rows(M), table{0};
         for (unsigned r0 = 0; r0 < M; r0 += 91u) {
             const unsigned n = std::min(91u, M - r0);
@@ -1344,23 +1346,23 @@ int main(int argc, char** argv) {
         auto dense = [&](const char* name, unsigned n, unsigned k, unsigned flags, bool bias) {
             Case c;
             unsigned o = c.out((size_t)M * n), x = c.f32((size_t)M * k, 1.f), w = c.bf16((size_t)n * k, 0.05f);
-            unsigned b = bias ? c.f32(n, 0.1f) : PLOW_TENSOR_NONE, r = c.u32(rows);
+            unsigned b = bias ? c.f32(n, 0.1f) : PLOW_TENSOR_NONE, r = c.u32(rows), sc = splitk_scratch(c);
             c.in.op = PLOW_DOP_DENSE_GEMM_F32;
-            c.in.t[0] = o; c.in.t[1] = x; c.in.t[2] = w; c.in.t[3] = b; c.in.t[4] = r;
+            c.in.t[0] = o; c.in.t[1] = x; c.in.t[2] = w; c.in.t[3] = b; c.in.t[4] = r; c.in.t[5] = sc;
             c.in.i[0] = M; c.in.i[1] = n; c.in.i[2] = k; c.in.i[7] = flags; c.in.fj[1].u = (unsigned)g_nblk;
             char full[96];
             snprintf(full, sizeof(full), "DenseGemmF32 %s %ux%ux%u f%u", name, M, n, k, flags);
             bench(full, c, 2.0 * M * n * k, 0);
         };
-        bench_conv(64, 128, 100, 1, 480, 512);
-        bench_conv(64, 64, 50, 480, 480, 256);
-        bench_conv(64, 32, 25, 480, 480, 256);
+        bench_conv(B, 128, 100, 1, 480, 512);
+        bench_conv(B, 64, 50, 480, 480, 256);
+        bench_conv(B, 32, 25, 480, 480, 256);
         {
             Case c;
-            unsigned o = c.out((size_t)M * 480 * 16), x = c.f32((size_t)64 * 480 * 16 * 13, 1.f);
+            unsigned o = c.out((size_t)M * 480 * 16), x = c.f32((size_t)B * 480 * 16 * 13, 1.f);
             c.in.op = PLOW_DOP_PACK_NCFW_ROWS_F32; c.in.t[0] = o; c.in.t[1] = x;
-            c.in.i[0] = M; c.in.i[1] = 480; c.in.i[2] = 16; c.in.i[3] = 13; c.in.i[4] = 64;
-            bench("PackNcfwRowsF32 832x480x16 b64", c, 0, 8.0 * M * 480 * 16);
+            c.in.i[0] = M; c.in.i[1] = 480; c.in.i[2] = 16; c.in.i[3] = 13; c.in.i[4] = B;
+            bench("PackNcfwRowsF32 Mx480x16", c, 0, 8.0 * M * 480 * 16);
         }
         dense("conv_out", d, 7680, 141, false);
         dense("q/k/v/o", d, d, 141, true);
@@ -1372,7 +1374,7 @@ int main(int argc, char** argv) {
             unsigned o = c.out(n), a = c.f32(n, 3.f), b = c.f32(n, 3.f);
             c.in.op = PLOW_DOP_SCALED_ADD_F32; c.in.t[0] = o; c.in.t[1] = a; c.in.t[2] = b;
             c.in.i[0] = (unsigned)n; c.in.i[1] = 1; c.in.fj[0].f = 1.f;
-            bench("ScaledAddF32 bf16 832xd", c, 0, 12.0 * n);
+            bench("ScaledAddF32 bf16 Mxd", c, 0, 12.0 * n);
         }
         {
             Case c;
@@ -1381,7 +1383,7 @@ int main(int argc, char** argv) {
             c.in.op = PLOW_DOP_LAYERNORM_F32;
             c.in.t[0] = o; c.in.t[1] = x; c.in.t[2] = g; c.in.t[3] = b;
             c.in.i[0] = M; c.in.i[1] = d; c.in.i[2] = 3; c.in.fj[0].f = 1e-5f;
-            bench("LayerNormF32 ordered bf16 832xd", c, 0, 8.0 * M * d);
+            bench("LayerNormF32 ordered bf16 Mxd", c, 0, 8.0 * M * d);
         }
         {
             Case c;
@@ -1390,7 +1392,7 @@ int main(int argc, char** argv) {
             c.in.op = PLOW_DOP_GROUPED_ATTENTION_F32;
             c.in.t[0] = o; c.in.t[1] = q; c.in.t[2] = k; c.in.t[3] = v; c.in.t[4] = vr;
             c.in.i[0] = M; c.in.i[1] = d; c.in.i[2] = 64; c.in.i[3] = 104; c.in.i[4] = 15;
-            bench("GroupedAttentionF32 832xd g104 packed", c, 4.0 * M * 104 * d, 0);
+            bench("GroupedAttentionF32 Mxd g104 packed", c, 4.0 * M * 104 * d, 0);
         }
         return 0;
     }
@@ -1404,6 +1406,10 @@ int main(int argc, char** argv) {
         t_dense_ref(1024, 4096, {104, 52, 260});
         t_dense_ref(4096, 1024, {104, 52});
         t_dense_ref(1024, 7680, {104, 52, 156});
+        t_dense_ref(896, 3584, {91, 13, 26, 39, 52});
+        t_dense_ref(896, 896, {91, 65, 13, 130});
+        t_dense_ref(896, 7680, {91, 91, 26});
+        t_dense_ref(896, 3584, {91, 91, 91, 91, 91, 91, 91, 91, 91, 13});
         t_conv("Conv2dF32 tc-3xtf32 qwen stage1", 2, 128, 100, 1, 48, 3, 2, 1, 1, 512 | 64 | 128 | (2 << 2) | (2 << 4));
         t_conv("Conv2dF32 tc-bf16 qwen stage2", 2, 64, 50, 48, 64, 3, 2, 1, 1, 256 | 64 | 128 | (2 << 2) | (2 << 4));
         t_conv("Conv2dF32 tc-bf16 wide multi-tile", 8, 64, 50, 48, 320, 3, 2, 1, 1, 256 | 64 | 128 | (2 << 2) | (2 << 4));
