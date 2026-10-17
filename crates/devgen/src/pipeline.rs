@@ -865,7 +865,10 @@ impl PacketPrefix {
         let addend = builder.tensor_init(stage.addend, init);
         builder.emit(
             DevOp::ScaledAddF32,
-            repeated(self.model.n_cu, elements.div_ceil(1024)),
+            repeated(
+                self.model.n_cu,
+                elements.div_ceil(1024).min(self.model.n_cu),
+            ),
             &[],
             |instruction| {
                 instruction.t[..3].copy_from_slice(&[output, self.output, addend]);
@@ -904,7 +907,10 @@ impl PacketPrefix {
         let output = builder.tensor(stage.output, u64::from(elements) * 4);
         builder.emit(
             DevOp::ScaledAddF32,
-            repeated(self.model.n_cu, elements.div_ceil(1024)),
+            repeated(
+                self.model.n_cu,
+                elements.div_ceil(1024).min(self.model.n_cu),
+            ),
             &[],
             |instruction| {
                 instruction.t[..3].copy_from_slice(&[output, a, b]);

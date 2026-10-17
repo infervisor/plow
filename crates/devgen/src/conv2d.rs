@@ -107,7 +107,7 @@ impl Conv2dPackets {
             .ok_or("row-pack element count overflows")?;
         builder.emit(
             DevOp::PackNcfwRowsF32,
-            repeated(model.n_cu, elements.div_ceil(1024)),
+            repeated(model.n_cu, elements.div_ceil(1024).min(model.n_cu)),
             &[],
             |instruction| {
                 instruction.t[..2].copy_from_slice(&[output, self.output]);
