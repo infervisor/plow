@@ -2690,6 +2690,18 @@ impl RuntimeConfig {
     }
 
     #[cfg(feature = "cuda")]
+    pub(crate) fn nv_vmm_live_rings_explicitly_pinned(&self, assets_dir: &std::path::Path) -> bool {
+        let spec = self
+            .nv
+            .vmm_live_rings_models
+            .clone()
+            .or_else(|| Self::env_nonempty("PLOW_VMM_LIVE_RINGS_MODELS"));
+        spec.is_some_and(|spec| {
+            served_name(assets_dir).is_some_and(|slug| spec.split(',').any(|m| m.trim() == slug))
+        })
+    }
+
+    #[cfg(feature = "cuda")]
     pub(crate) fn nv_ns_live(&self) -> bool {
         select_compat(
             self.nv.nv_ns_live,
@@ -3664,15 +3676,18 @@ mod tests {
         ])
         .cfg;
         assert_eq!(cfg.nv_vmm_live_rings_for(&llm), Some(true));
+        assert!(cfg.nv_vmm_live_rings_explicitly_pinned(&llm));
         assert_eq!(
             cfg.nv_vmm_live_rings_for(&tts),
             Some(false),
             "an unlisted model keeps the global setting"
         );
+        assert!(!cfg.nv_vmm_live_rings_explicitly_pinned(&tts));
         assert_eq!(
             cfg.nv_vmm_live_rings_for(&root.join("missing")),
             Some(false)
         );
+        assert!(!cfg.nv_vmm_live_rings_explicitly_pinned(&root.join("missing")));
         assert!(!cfg.nv.pin_resident);
         let cfg = Cli::parse_from([
             "plowrt",

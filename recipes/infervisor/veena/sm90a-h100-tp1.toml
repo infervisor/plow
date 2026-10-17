@@ -83,8 +83,7 @@ PLOW_NV_DENSE_TUNE = "1"
 # algorithms per rung (step_bench B=32..64 -3..-5%, digests equal).
 [serve]
 extra_args = ["--decode-pipeline"]
-# Env, not flags, so every launcher (campaign serve/gate, plowbench.sh probes) applies it.
-env = { PLOW_VMM_PREFIX = "1", PLOW_LT_RUNG_ALGOS = "true", PLOW_DECODE_PIPELINE = "1", PLOW_TTS_FIRST_LOOKAHEAD = "1", PLOW_VMM_LIVE_RINGS = "0" }
+env = { PLOW_VMM_PREFIX = "1", PLOW_LT_RUNG_ALGOS = "true", PLOW_DECODE_PIPELINE = "1", PLOW_TTS_FIRST_LOOKAHEAD = "1" }
 
 [bench]
 kind = "speech"
