@@ -510,7 +510,7 @@ impl GpuEngine {
                         kv.enable_shared_publish();
                     }
                     // FP8 full-layer scales snapshot over `[0, p_a)`, not just the tail.
-                    if !full_scale.is_empty() {
+                    if !full_scale.is_empty() && rt.vmm_strict_publish() {
                         kv.enable_strict_publish();
                     }
                     let host_cap = rt.vmm_host_cache_bytes();

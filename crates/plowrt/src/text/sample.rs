@@ -32,6 +32,12 @@ pub struct SamplingParams {
 }
 
 impl SamplingParams {
+    /// Whether sampling is effectively greedy (deterministic argmax).
+    #[inline]
+    pub fn is_greedy(&self) -> bool {
+        self.temperature <= f32::EPSILON || self.top_k == 1
+    }
+
     /// Whether this row must be sampled on the HOST.
     ///
     /// The device sampler covers temperature/top_k/top_p/min_p but owns no
@@ -112,15 +118,30 @@ thread_local! {
 /// presence/frequency penalties are defined over.
 pub fn apply_penalties(logits: &mut [f32], prior: &[u32], params: &SamplingParams) {
     if params.repetition_penalty != 1.0 {
-        for &t in prior {
-            if let Some(l) = logits.get_mut(t as usize) {
-                *l = if *l > 0.0 {
-                    *l / params.repetition_penalty
-                } else {
-                    *l * params.repetition_penalty
-                };
-            }
+        thread_local! {
+            static REPETITION_SEEN: RefCell<Vec<u64>> = RefCell::new(Vec::new());
         }
+        REPETITION_SEEN.with(|seen| {
+            let mut seen = seen.borrow_mut();
+            let words = logits.len().div_ceil(64);
+            if seen.len() < words {
+                seen.resize(words, 0);
+            }
+            seen[..words].fill(0);
+            for &t in prior {
+                let (w, bit) = (t as usize / 64, 1u64 << (t % 64));
+                if let (Some(l), Some(s)) = (logits.get_mut(t as usize), seen.get_mut(w)) {
+                    if *s & bit == 0 {
+                        *s |= bit;
+                        *l = if *l > 0.0 {
+                            *l / params.repetition_penalty
+                        } else {
+                            *l * params.repetition_penalty
+                        };
+                    }
+                }
+            }
+        });
     }
     if params.presence_penalty != 0.0 || params.frequency_penalty != 0.0 {
         PENALTY_COUNTS.with(|c| {
@@ -161,7 +182,7 @@ pub fn sample_with_scratch(
     // Structured-decoding mask: forbid disallowed tokens (§L guided).
     let allowed = |i: usize| mask.map_or(true, |m| m.get(i).copied().unwrap_or(false));
 
-    if params.temperature <= f32::EPSILON {
+    if params.is_greedy() {
         // Greedy over the allowed set.
         let mut best = 0usize;
         let mut best_v = f32::NEG_INFINITY;
@@ -202,7 +223,9 @@ pub fn sample_with_scratch(
         *v /= sum;
     }
     let desc = |a: &(usize, f32), b: &(usize, f32)| {
-        b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal)
+        b.1.partial_cmp(&a.1)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.0.cmp(&b.0))
     };
     // Top-k first selects, then sorts only the k survivors: a full sort of a 262k vocabulary
     // costs milliseconds per row.
@@ -321,6 +344,9 @@ fn sample_guided(
     let Some(u) = u else {
         return argmax(scratch);
     };
+    if p.temperature <= f32::EPSILON {
+        return argmax(scratch);
+    }
     if p.repetition_penalty != 1.0 {
         thread_local! {
             static SEEN: std::cell::RefCell<Vec<u64>> = const { std::cell::RefCell::new(Vec::new()) };
@@ -360,7 +386,7 @@ fn sample_guided(
     }
     if p.top_p < 1.0 {
         let mut order: Vec<usize> = (0..scratch.len()).filter(|&i| scratch[i] > 0.0).collect();
-        order.sort_by(|&a, &b| scratch[b].total_cmp(&scratch[a]));
+        order.sort_by(|&a, &b| scratch[b].total_cmp(&scratch[a]).then_with(|| a.cmp(&b)));
         let (mut acc, mut cut) = (0.0f32, order.len());
         for (k, &i) in order.iter().enumerate() {
             acc += scratch[i];
@@ -453,5 +479,64 @@ mod tests {
         let token = sample_with_scratch(&logits, &params, Some(&mask), 0.0, &mut scratch);
 
         assert_eq!(token, 2);
+    }
+
+    #[test]
+    fn apply_penalties_deduplicates_repetition_penalty() {
+        let mut logits1 = vec![2.0, -2.0, 1.0];
+        let mut logits2 = vec![2.0, -2.0, 1.0];
+        let params = SamplingParams {
+            repetition_penalty: 1.2,
+            ..SamplingParams::default()
+        };
+        // prior with token 0 once, token 1 once
+        apply_penalties(&mut logits1, &[0, 1], &params);
+        // prior with repeated occurrences: token 0 five times, token 1 three times
+        apply_penalties(&mut logits2, &[0, 0, 0, 0, 0, 1, 1, 1], &params);
+        assert_eq!(logits1, logits2);
+        assert!((logits1[0] - (2.0 / 1.2)).abs() < 1e-6);
+        assert!((logits1[1] - (-2.0 * 1.2)).abs() < 1e-6);
+    }
+
+    #[test]
+    fn top_k_1_is_greedy_and_matches_argmax() {
+        let logits = [1.0, 5.0, 3.0, 2.0];
+        let params = SamplingParams {
+            temperature: 0.7,
+            top_k: 1,
+            ..SamplingParams::default()
+        };
+        assert!(params.is_greedy());
+        assert_eq!(sample(&logits, &params, None, 0.99), 1);
+    }
+
+    #[test]
+    fn tie_breaking_selects_lowest_index() {
+        let logits = [2.0, 2.0, 1.0, 0.5];
+        let params = SamplingParams {
+            temperature: 1.0,
+            top_k: 2,
+            top_p: 1.0,
+            ..SamplingParams::default()
+        };
+        // Both tokens 0 and 1 have identical logits (2.0). Ties must break by lowest index.
+        assert_eq!(sample(&logits, &params, None, 0.0), 0);
+    }
+
+    #[test]
+    fn sample_guided_zero_temperature_does_not_nan() {
+        let p = CfgParams {
+            cfg_weight: 0.5,
+            temperature: 0.0,
+            min_p: 0.0,
+            top_p: 1.0,
+            repetition_penalty: 1.2,
+        };
+        let cond = [1.0, 3.0, 2.0];
+        let uncond = [1.0, 1.0, 0.0];
+        let mut s = Vec::new();
+        // Even if u is Some, zero temperature must return argmax without NaN.
+        let tok = sample_cfg(&p, &cond, &uncond, [1], Some(0.5), &mut s);
+        assert_eq!(tok, 1);
     }
 }

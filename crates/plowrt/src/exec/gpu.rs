@@ -4525,12 +4525,21 @@ impl GpuEngine {
                     }
                 }
                 let configured_rings = config.nv_vmm_live_rings_for(assets_dir);
-                let rings = live_rings_for_capacity(
-                    configured_rings,
-                    live,
-                    live_kv_manifest.as_ref().map(|manifest| manifest.max_ctx),
-                    live_kv_manifest.as_ref().map(|manifest| manifest.batch),
-                );
+                let explicit_model_pinned = config.nv_vmm_live_rings_explicitly_pinned(assets_dir);
+                let auto_scope_unsupported = !live && prefix_layout.is_none() && !explicit_model_pinned;
+                let rings = if auto_scope_unsupported {
+                    if configured_rings == Some(true) {
+                        tracing::info!("live rings scoped off: model lacks VMM prefix layout and live KV geometry");
+                    }
+                    false
+                } else {
+                    live_rings_for_capacity(
+                        configured_rings,
+                        live,
+                        live_kv_manifest.as_ref().map(|manifest| manifest.max_ctx),
+                        live_kv_manifest.as_ref().map(|manifest| manifest.batch),
+                    )
+                };
                 if rings && configured_rings.is_none() {
                     tracing::info!(
                         max_ctx = live_kv_manifest.as_ref().map(|manifest| manifest.max_ctx),
