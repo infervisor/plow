@@ -373,6 +373,9 @@ pub fn template_messages(
             if let Some(r) = &m.reasoning_content {
                 v["reasoning_content"] = json!(r);
             }
+            if let Some(r) = &m.reasoning {
+                v["reasoning"] = json!(r);
+            }
             if let Some(n) = &m.name {
                 v["name"] = json!(n);
             }

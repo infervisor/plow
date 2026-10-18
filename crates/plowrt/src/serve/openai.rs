@@ -210,6 +210,9 @@ pub struct ChatRequest {
     /// rather than closing it and opening a new one.
     #[serde(default)]
     pub continue_final_message: Option<bool>,
+    /// vLLM extension (default true): `false` ends the prompt after the last message.
+    #[serde(default)]
+    pub add_generation_prompt: Option<bool>,
     /// Per-request template override, for checkpoints that ship none.
     #[serde(default)]
     pub chat_template: Option<String>,
@@ -390,6 +393,10 @@ pub struct Message {
     /// the whole trace landed in `content` as literal text.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reasoning_content: Option<String>,
+    /// The same trace under vLLM's current name; templates read either (Gemma 4:
+    /// `message.get('reasoning') or message.get('reasoning_content')`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning: Option<String>,
     /// An assistant turn's calls, validated by `serve::tools::request`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tool_calls: Option<serde_json::Value>,

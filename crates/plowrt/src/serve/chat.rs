@@ -257,6 +257,7 @@ async fn chat_completions_with(
         kwargs: req.chat_template_kwargs.clone().unwrap_or_default(),
         reasoning_effort: req.reasoning_effort.clone(),
         continue_final_message: req.continue_final_message.unwrap_or(false),
+        no_generation_prompt: req.add_generation_prompt == Some(false),
         tools: tool_plan.template_tools.clone(),
     };
     let mut prompt = crate::obs::ttft::timed(&crate::obs::ttft::TEMPLATE, || {

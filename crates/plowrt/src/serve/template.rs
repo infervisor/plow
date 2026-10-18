@@ -33,6 +33,8 @@ pub struct RenderOpts {
     /// vLLM `continue_final_message`: render the last assistant turn as a
     /// prefix to continue instead of opening a fresh one.
     pub continue_final_message: bool,
+    /// vLLM `add_generation_prompt: false`: end the prompt after the last message.
+    pub no_generation_prompt: bool,
     /// OpenAI `tools`, bound as the template's `tools` (`None` renders as Python `None`).
     pub tools: Option<serde_json::Value>,
 }
@@ -302,7 +304,7 @@ impl ChatTemplate {
         ctx.insert("messages".into(), Value::from_serialize(messages));
         ctx.insert(
             "add_generation_prompt".into(),
-            Value::from(!opts.continue_final_message),
+            Value::from(!opts.continue_final_message && !opts.no_generation_prompt),
         );
         ctx.insert(
             "continue_final_message".into(),
@@ -323,7 +325,7 @@ impl ChatTemplate {
             ctx.insert(k.clone(), Value::from_serialize(v));
         }
 
-        tmpl.render(Value::from_serialize(&ctx)).map_err(|e| {
+        let rendered = tmpl.render(Value::from_serialize(&ctx)).map_err(|e| {
             // minijinja chains the cause; the innermost is the template's own
             // `raise_exception` message, which is the useful half.
             let mut msg = e.to_string();
@@ -333,8 +335,40 @@ impl ChatTemplate {
                 src = next;
             }
             msg
-        })
+        })?;
+        if opts.continue_final_message {
+            return continue_final(rendered, messages);
+        }
+        Ok(rendered)
     }
+}
+
+/// `transformers`' `continue_final_message`: cut the render right after the final message's
+/// text, so the model continues it instead of seeing its turn closed (most templates, Gemma 4's
+/// among them, close every turn whatever `add_generation_prompt` says).
+fn continue_final(mut rendered: String, messages: &[serde_json::Value]) -> Result<String, String> {
+    let content = messages.last().and_then(|m| m.get("content"));
+    let text = match content {
+        Some(serde_json::Value::String(s)) => Some(s.as_str()),
+        Some(serde_json::Value::Array(parts)) => parts
+            .iter()
+            .rev()
+            .find_map(|p| p.get("text").and_then(|t| t.as_str())),
+        _ => None,
+    }
+    .ok_or("continue_final_message is set but the final message has no text to continue")?;
+    let at = rendered.rfind(text.trim()).ok_or(
+        "continue_final_message is set but the final message does not appear in the chat after \
+         applying the chat template",
+    )?;
+    let lead = text.trim_start();
+    let end = if rendered[at..].starts_with(lead) {
+        at + lead.len()
+    } else {
+        at + text.trim().len()
+    };
+    rendered.truncate(end);
+    Ok(rendered)
 }
 
 #[cfg(test)]

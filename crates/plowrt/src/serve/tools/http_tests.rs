@@ -85,13 +85,19 @@ impl Drop for TempDir {
 }
 
 fn harness() -> Harness {
+    harness_for("gemma4-e4b")
+}
+
+/// `fixture`: a `tests/fixtures/toolcall` family (`gemma4-12b` carries the 26B's template).
+fn harness_for(fixture: &str) -> Harness {
     static SEQ: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
     let n = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let dir = std::env::temp_dir().join(format!("plowrt-tool-http-{}-{n}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
-    let fx =
-        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/toolcall/gemma4-e4b");
+    let fx = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/toolcall")
+        .join(fixture);
     std::fs::copy(
         fx.join("chat_template.jinja"),
         dir.join("chat_template.jinja"),
@@ -614,4 +620,66 @@ async fn a_call_cut_by_max_tokens_finishes_length() {
         v["choices"][0]["message"]["tool_calls"][0]["function"]["arguments"],
         "{\"city\":\"Par"
     );
+}
+
+/// `continue_final_message` continues the last assistant turn: the prompt ends right after its
+/// text, as `transformers` cuts it. Gemma 4's template closes every turn (`<turn|>`), so binding
+/// `add_generation_prompt: false` alone ended the prompt on a closed turn.
+#[tokio::test]
+async fn continue_final_message_ends_the_prompt_inside_the_final_turn() {
+    let h = harness_for("gemma4-12b");
+    h.reply(&[" Paris."]);
+    let msgs = json!([{"role": "user", "content": "Capital of France?"},
+                      {"role": "assistant", "content": "The capital of France is"}]);
+    let (code, body) = h
+        .json(json!({"messages": msgs, "continue_final_message": true, "add_generation_prompt": false}))
+        .await;
+    assert_eq!(code, StatusCode::OK, "{body}");
+    assert!(
+        h.last_prompt()
+            .ends_with("<|turn>model\nThe capital of France is"),
+        "{:?}",
+        h.last_prompt()
+    );
+    // `add_generation_prompt: false` alone closes the turn and opens no model turn.
+    let (code, _) = h
+        .json(json!({"messages": user("hi"), "add_generation_prompt": false}))
+        .await;
+    assert_eq!(code, StatusCode::OK);
+    assert!(
+        h.last_prompt().ends_with("<|turn>user\nhi<turn|>\n"),
+        "{:?}",
+        h.last_prompt()
+    );
+}
+
+/// vLLM 0.28 names a replayed trace `reasoning` (and maps `reasoning_content` onto it); the
+/// template reads either, so a tool loop replayed with `reasoning` must render it.
+#[tokio::test]
+async fn replayed_reasoning_field_is_rendered_like_reasoning_content() {
+    let h = harness_for("gemma4-12b");
+    h.reply(&["It is 18C."]);
+    let hist = |field: &str| {
+        let mut call = json!({"role": "assistant", "content": null,
+            "tool_calls": [{"id": "call_1", "type": "function",
+                "function": {"name": "get_weather", "arguments": "{\"city\": \"Paris\"}"}}]});
+        call[field] = json!("Need the weather tool.");
+        json!([{"role": "user", "content": "Weather in Paris?"}, call,
+               {"role": "tool", "tool_call_id": "call_1", "content": "18C"}])
+    };
+    let mut prompts = Vec::new();
+    for field in ["reasoning", "reasoning_content"] {
+        let (code, body) = h
+            .json(json!({"messages": hist(field), "tools": tools(),
+                         "chat_template_kwargs": {"enable_thinking": true}}))
+            .await;
+        assert_eq!(code, StatusCode::OK, "{body}");
+        prompts.push(h.last_prompt());
+    }
+    assert!(
+        prompts[0].contains("<|channel>thought\nNeed the weather tool.\n<channel|>"),
+        "{:?}",
+        prompts[0]
+    );
+    assert_eq!(prompts[0], prompts[1]);
 }
