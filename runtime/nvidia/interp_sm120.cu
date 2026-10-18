@@ -716,9 +716,9 @@ extern "C" __device__ __constant__ unsigned plow_fp8_kv_abi = 1;
 /* ---- DEAD-ARM GATING for model-specialized objects (h100-interp arm-ablation) -----------
  * MLA (DeepSeek/GLM/Kimi latent attention), MAMBA (Nemotron-3 SSD mixer) and DSA (GLM sparse
  * lightning-indexer) are op families a Gemma model NEVER emits. They follow the PLOW_NV_GEMMA /
- * PLOW_NV_W8A8 precedent: DEFAULT 1 keeps every existing object BYTE-IDENTICAL (the sm_120 cubins
- * and the op-test build never pass these flags). build_sm90a_cubin.sh passes =0 for the Gemma
- * serving objects it builds. A gated-out opcode falls through to `default: __trap()`, so a
+ * PLOW_NV_W8A8 precedent: DEFAULT 1 keeps every existing object BYTE-IDENTICAL (the sm_120 decode
+ * and prefill cubins and the op-test build never pass these flags). build_sm90a_cubin.sh passes =0
+ * for the Gemma serving objects it builds; the speech objects pass MAMBA=0 (CMake _ax_speech). A gated-out opcode falls through to `default: __trap()`, so a
  * mis-targeted packet fails loudly rather than silently emitting zeros.
  *
  * MEASURED PAYOFF. THE NUMBERS ARE PER-ARCH AND THEY DO NOT TRANSFER — quote the right row.
