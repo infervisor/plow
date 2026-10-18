@@ -831,6 +831,7 @@ static __device__ void d_moe_router_gemma_score(float* __restrict__ score,
  * ((x*inv)*s)*root, B>1: (x*inv)*(s*root)), and each lane's fmaf chain and the warp sum are
  * unchanged. */
 #define PLOW_R9_NC ((PLOW_MOE_XN_MAX + GV_STEP - 1u) / GV_STEP)
+static_assert(PLOW_MOE_XN_MAX <= 2u * 256u * 8u, "V9 stages two 8-wide vectors per thread");
 static __device__ __noinline__ void plow_moe_router_score_v9(
     float* __restrict__ score, const bf16* __restrict__ resid, const bf16* __restrict__ proj,
     const bf16* __restrict__ scale, unsigned H, unsigned n_exp, float root, float eps,
@@ -915,7 +916,10 @@ static __device__ void d_moe_router_gemma_score_fast(float* __restrict__ score,
     __shared__ float red[32];
     __shared__ float invs[PLOW_MOE_MAXB];
 #if PLOW_NV_GEMV_RB && PLOW_NV_ROUTER_V9 && !PLOW_MOE_XN_BF16 && !PLOW_MOE_ROUTER_WIDE
-    if (blockDim.x == 256u && (H & 7u) == 0u && H <= PLOW_MOE_XN_MAX && (n_exp & 7u) == 0u) {
+    /* nrow <= 16: from B=32 a CTA runs 4+ rounds and the per-round barriers lose to the arm
+     * below (B=128 +0.30 ms). */
+    if (blockDim.x == 256u && (H & 7u) == 0u && H <= PLOW_MOE_XN_MAX && (n_exp & 7u) == 0u &&
+        nrow <= 16u) {
         plow_moe_router_score_v9(score, resid, proj, scale, H, n_exp, root, eps, slice, nblk, nrow,
                                  arena);
         return;
