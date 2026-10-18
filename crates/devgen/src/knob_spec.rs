@@ -2352,6 +2352,7 @@ pub const OBJECT_DEFINES: &[KnobSpec] = &[
     KnobSpec::new("def.PLOW_NV_INST_PRELOAD", None, Layer::ObjectDefine, Domain::Str, UNSET, OPT_IN),
     KnobSpec::new("def.PLOW_NV_ROUTER_V8", None, Layer::ObjectDefine, Domain::Str, UNSET, OPT_IN),
     KnobSpec::new("def.PLOW_NV_TOPK_V4", None, Layer::ObjectDefine, Domain::Str, UNSET, OPT_IN),
+    KnobSpec::new("def.PLOW_NV_ROUTER_V9", None, Layer::ObjectDefine, Domain::Str, UNSET, OPT_IN),
     KnobSpec::new("def.PLOW_NV_W8A16_ASYNC", None, Layer::ObjectDefine, Domain::Str, UNSET, OPT_IN),
     KnobSpec::new("def.PLOW_NV_W8A16_PREFETCH", None, Layer::ObjectDefine, Domain::Str, UNSET, OPT_IN),
     KnobSpec::new("def.PLOW_NV_W8A16_WGMMA", None, Layer::ObjectDefine, Domain::Str, UNSET, OPT_IN),

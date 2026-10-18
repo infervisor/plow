@@ -440,6 +440,9 @@ static __global__ void plow_moe_slot_glu_fp8_blk(bf16* __restrict__ fu, const bf
 #ifndef PLOW_NV_TOPK_V4
 #define PLOW_NV_TOPK_V4 0
 #endif
+#ifndef PLOW_NV_ROUTER_V9
+#define PLOW_NV_ROUTER_V9 0
+#endif
 #ifndef PLOW_MOE_ROUTER_WIDE
 #define PLOW_MOE_ROUTER_WIDE 0
 #endif
@@ -819,6 +822,83 @@ static __device__ void d_moe_router_gemma_score(float* __restrict__ score,
     }
 }
 
+#if PLOW_NV_GEMV_RB && PLOW_NV_ROUTER_V9
+/* op69 with ONE dependent global round per CTA-round instead of three (row RMS, scale staging,
+ * then 3 x 4-chunk weight rounds: 4.8 + 1.3 + 4.1 us at B=4). Every lane issues all of its pair's
+ * weight chunks up front, each thread loads its resid/scale vectors in the same round, and h2 is
+ * staged from registers. Bit-exact with the arms it replaces: the RMS is plow_moe_row_rms's RB
+ * block partition (which plow_moe_rms_warp replays), h2 keeps each arm's association (B=1:
+ * ((x*inv)*s)*root, B>1: (x*inv)*(s*root)), and each lane's fmaf chain and the warp sum are
+ * unchanged. */
+#define PLOW_R9_NC ((PLOW_MOE_XN_MAX + GV_STEP - 1u) / GV_STEP)
+static __device__ __noinline__ void plow_moe_router_score_v9(
+    float* __restrict__ score, const bf16* __restrict__ resid, const bf16* __restrict__ proj,
+    const bf16* __restrict__ scale, unsigned H, unsigned n_exp, float root, float eps,
+    unsigned slice, unsigned nblk, unsigned nrow, float* __restrict__ h2) {
+    const unsigned tid = threadIdx.x, lane = tid & 31u, warp = tid >> 5, nvec = H >> 3;
+    __shared__ float red9[8];
+    for (unsigned base = slice * 8u; base < nrow * n_exp; base += nblk * 8u) {
+        const unsigned row = base / n_exp;
+        const unsigned e = base + warp - row * n_exp;
+        const bf16* pr = proj + (size_t)e * H;
+        bf16v8 wv[PLOW_R9_NC];
+#pragma unroll
+        for (unsigned c = 0; c < PLOW_R9_NC; c++) {
+            const unsigned kk = c * GV_STEP + lane * 8u;
+            wv[c] = kk < H ? ld_glob8(pr + kk) : bf16v8_zero();
+        }
+        const bf16* rr = resid + (size_t)row * H;
+        bf16v8 xv[2], sv[2];
+#pragma unroll
+        for (unsigned q = 0; q < 2u; q++) {
+            const unsigned v = tid + q * 256u;
+            xv[q] = v < nvec ? ld_glob8(rr + v * 8u) : bf16v8_zero();
+            sv[q] = v < nvec ? ld_glob8(scale + v * 8u) : bf16v8_zero();
+        }
+        float part = 0.0f;
+#pragma unroll
+        for (unsigned q = 0; q < 2u; q++) {
+            if (tid + q * 256u >= nvec) continue;
+#pragma unroll
+            for (int j = 0; j < 8; j++) {
+                const float v = __bfloat162float(xv[q].x[j]);
+                part += v * v;
+            }
+        }
+        part = plow_warp_sum(part);
+        if (lane == 0) red9[warp] = part;
+        __syncthreads();
+        float t = 0.0f;
+#pragma unroll
+        for (unsigned i = 0; i < 8u; i++) t += red9[i];
+        const float invrms = rsqrtf(t / (float)H + eps);
+        PLOW_TL_PH(0);
+#pragma unroll
+        for (unsigned q = 0; q < 2u; q++) {
+            const unsigned v = tid + q * 256u;
+            if (v >= nvec) continue;
+#pragma unroll
+            for (int j = 0; j < 8; j++) {
+                const float x = __bfloat162float(xv[q].x[j]), s = __bfloat162float(sv[q].x[j]);
+                h2[v * 8u + j] = nrow == 1u ? x * invrms * s * root : x * invrms * (s * root);
+            }
+        }
+        __syncthreads();
+        PLOW_TL_PH(1);
+        float acc = 0.0f;
+#pragma unroll
+        for (unsigned c = 0; c < PLOW_R9_NC; c++) {
+            const unsigned kk = c * GV_STEP + lane * 8u;
+            if (kk < H) acc = dot8_fx(wv[c], h2 + kk, acc);
+        }
+        acc = plow_warp_sum(acc);
+        if (lane == 0) score[(size_t)row * n_exp + e] = acc;
+        PLOW_TL_PH(2);
+        __syncthreads(); /* h2 / red9 are rewritten by the next round */
+    }
+}
+#endif
+
 /* Association-changing fast experiment: identical block/expert mapping and RMS transform as the
  * exact scorer, but a conventional strided lane dot + warp reduction replaces the ordered shuffle
  * replay. Kept as a distinct opcode so a fast experiment can never silently change exact packets. */
@@ -834,6 +914,13 @@ static __device__ void d_moe_router_gemma_score_fast(float* __restrict__ score,
     const unsigned warp = tid >> 5;
     __shared__ float red[32];
     __shared__ float invs[PLOW_MOE_MAXB];
+#if PLOW_NV_GEMV_RB && PLOW_NV_ROUTER_V9 && !PLOW_MOE_XN_BF16 && !PLOW_MOE_ROUTER_WIDE
+    if (blockDim.x == 256u && (H & 7u) == 0u && H <= PLOW_MOE_XN_MAX && (n_exp & 7u) == 0u) {
+        plow_moe_router_score_v9(score, resid, proj, scale, H, n_exp, root, eps, slice, nblk, nrow,
+                                 arena);
+        return;
+    }
+#endif
 #if PLOW_NV_GEMV_RB
     /* BATCH>1: only the rows this CTA scores. Round j's 8 pairs start at slice*8 + j*nblk*8, a
      * multiple of 8, so with 8 | n_exp they lie in one row: 2 rows per CTA at B=16, not 16.
