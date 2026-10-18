@@ -254,7 +254,6 @@ pub struct RuntimeConfig {
     #[arg(
         long = "asr-encode-hold-ms",
         env = "PLOW_ASR_ENCODE_HOLD_MS",
-        hide = true,
         default_value_t = 0,
         global = true
     )]
