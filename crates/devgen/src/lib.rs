@@ -9353,6 +9353,29 @@ pub(crate) fn require_moe_topk(top_k: u32, model: &str) {
     );
 }
 
+/// Refuse group-limited routing that keeps fewer than `top_k` experts (or groups too small for
+/// the top-2 group score): the retained-expert half of `plow_route_group_ok` in
+/// runtime/common/moe_route_key.h; divisibility is the caller's assert. Below it the routers'
+/// rank select and the serial reference no longer pick the same experts.
+pub(crate) fn require_moe_groups(
+    n_exp: u32,
+    top_k: u32,
+    n_group: u32,
+    topk_group: u32,
+    model: &str,
+) {
+    if n_group <= 1 || topk_group == 0 || topk_group >= n_group {
+        return;
+    }
+    let gsz = n_exp / n_group;
+    assert!(
+        gsz >= 2 && topk_group * gsz >= top_k,
+        "{model}: group-limited routing keeps topk_group * n_exp / n_group = {topk_group} * \
+         {gsz} experts (groups of {gsz}), fewer than top_k = {top_k} or groups smaller than the \
+         top-2 group score needs; the selection would fall into masked experts"
+    );
+}
+
 /// Refuse to emit an MLA packet whose positional encoding this compiler cannot determine.
 ///
 /// Same discipline and same call site as [`require_moe_topk`]: run at the `config.json` parse,

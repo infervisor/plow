@@ -64,6 +64,23 @@ fn moe_topk_refusal_is_a_threshold_and_names_the_model() {
     );
 }
 
+#[test]
+fn moe_group_refusal_is_the_retained_expert_threshold() {
+    require_moe_groups(256, 8, 8, 4, "deepseek_v3");
+    require_moe_groups(128, 16, 8, 1, "edge");
+    require_moe_groups(896, 16, 1, 1, "flat");
+    require_moe_groups(128, 16, 64, 64, "identity");
+    for (n_exp, k, g, tg) in [(128, 16, 64, 4), (128, 17, 8, 1), (128, 8, 128, 64)] {
+        let err =
+            std::panic::catch_unwind(|| require_moe_groups(n_exp, k, g, tg, "bad")).unwrap_err();
+        let msg = err
+            .downcast_ref::<String>()
+            .map(String::as_str)
+            .unwrap_or("");
+        assert!(msg.contains("bad") && msg.contains("top_k"), "{msg}");
+    }
+}
+
 /// The list must equal what `interp.hip` actually dispatches — PARSED, not restated. A
 /// hand-maintained copy of a fact in another file is the drift `manifest.rs` was written to
 /// stop; this is the same discipline `packet`'s `dev_abi` test applies to `dev_isa.h`.
