@@ -105,7 +105,11 @@ PLOW_GEMMA_MOE_ROUTER_EXACT = "0"
 # packet at ctx 1024/5600/16000 B1 -3.7/-3.9/-3.9%, B8 -4.5/-4.0/-3.5%, B32 -2.5/-2.3/-1.7%, token digests identical on
 # all 18 rungs + VMM kv_len 4094/4095/8191; memcheck clean; FP32 short PASS (kl_mean 0.1877, top1 0.9632) and long PASS
 # (0.1331, top1 0.9736; same-run control 0.1306 / 0.9671). Evidence: g26-pfrung REPORT.md section 25 (dec/ab-fin, ab/g-fin).
-NVCC_APPEND_FLAGS = "-DPLOW_MOE_FP8_DEDUP=1 -DPLOW_NV_FA_RG8=2 -DPLOW_NV_RAW_NARROW=1 -DPLOW_NV_INST_PRELOAD=1 -DPLOW_NV_ROUTER_V8=1 -DPLOW_NV_TOPK_V4=1"
+# -DPLOW_NV_ROUTER_V9=1: one-round router score body at B<=16 (2026-10-18, bit-exact): step_bench ctx 6144 vs the
+# same recipe build without it B1 4.392/4.389, B4 6.066/5.934, B8 7.132/7.031, B16 9.617/9.473 ms, digests identical on
+# B1..B128 and ctx 4094/4095/8191; replay A/B (2 interleaved rounds) TPOT p50 9.85 -> 9.79 ms, 0 errors.
+# Evidence: /opt/dlami/nvme/lava-tts/g26-perf-push/g26-router (runs/gb*, replay.txt).
+NVCC_APPEND_FLAGS = "-DPLOW_MOE_FP8_DEDUP=1 -DPLOW_NV_FA_RG8=2 -DPLOW_NV_RAW_NARROW=1 -DPLOW_NV_INST_PRELOAD=1 -DPLOW_NV_ROUTER_V8=1 -DPLOW_NV_TOPK_V4=1 -DPLOW_NV_ROUTER_V9=1"
 PLOW_EMIT_MOE_PF_LT = "1"
 # Dense gate|up as two FP8 cuBLASLt GEMMs + Glu/Quant (qualified 2026-10-15, packet bd9c0722e368, plowrt 2dff2171):
 # prefill rungs at prefix 0 128/256/1024/4096 rows 15.69/17.53/26.46/81.33 vs 17.24/18.33/30.81/96.23 ms
