@@ -109,7 +109,13 @@ PLOW_GEMMA_MOE_ROUTER_EXACT = "0"
 # same recipe build without it B1 4.392/4.389, B4 6.066/5.934, B8 7.132/7.031, B16 9.617/9.473 ms, digests identical on
 # B1..B128 and ctx 4094/4095/8191; replay A/B (2 interleaved rounds) TPOT p50 9.85 -> 9.79 ms, 0 errors.
 # Evidence: /opt/dlami/nvme/lava-tts/g26-perf-push/g26-router (runs/gb*, replay.txt).
-NVCC_APPEND_FLAGS = "-DPLOW_MOE_FP8_DEDUP=1 -DPLOW_NV_FA_RG8=2 -DPLOW_NV_RAW_NARROW=1 -DPLOW_NV_INST_PRELOAD=1 -DPLOW_NV_ROUTER_V8=1 -DPLOW_NV_TOPK_V4=1 -DPLOW_NV_ROUTER_V9=1"
+# -DPLOW_NV_FA_RG8S=1: the RG8 decode body streams each iteration's K/V rows and scales through a warp-private
+# two-stage cp.async smem ring (launch arena 40960 -> 82560 B); same lane map and arithmetic, bit-identical.
+# Qualified 2026-10-18 (g26-attn): step_bench ctx 6144 B1/B2/B4/B8/B16 4.38/5.07/6.08/7.11/9.59 -> 4.37/5.01/5.89/6.86/
+# 9.02 ms (with the RG8 word-convert commit), TOK_STREAM digests identical on every rung and at VMM kv_len
+# 4094/4095/4096/8191/8192 x B1/B4/B16; prod-fidelity replay 1.8/s TPOT p50/p99 10.02/20.71 -> 9.47/19.18 ms, TTFT
+# p50/p99 45.2/249.3 -> 42.8/227.7 ms, 0 errors. Evidence: /opt/dlami/nvme/lava-tts/g26-perf-push/g26-attn.
+NVCC_APPEND_FLAGS = "-DPLOW_MOE_FP8_DEDUP=1 -DPLOW_NV_FA_RG8=2 -DPLOW_NV_RAW_NARROW=1 -DPLOW_NV_INST_PRELOAD=1 -DPLOW_NV_ROUTER_V8=1 -DPLOW_NV_TOPK_V4=1 -DPLOW_NV_ROUTER_V9=1 -DPLOW_NV_FA_RG8S=1"
 PLOW_EMIT_MOE_PF_LT = "1"
 # Dense gate|up as two FP8 cuBLASLt GEMMs + Glu/Quant (qualified 2026-10-15, packet bd9c0722e368, plowrt 2dff2171):
 # prefill rungs at prefix 0 128/256/1024/4096 rows 15.69/17.53/26.46/81.33 vs 17.24/18.33/30.81/96.23 ms

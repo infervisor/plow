@@ -1100,8 +1100,17 @@ static_assert(PLOW_NV_GEMV_STAGING_BYTES <= PLOW_NV_BASE_ARENA_FLOATS * sizeof(f
     (PLOW_NV_NON_FP8_ARENA_FLOATS > PLOW_NV_FP8_DECODE_WGMMA_ARENA_FLOATS ? PLOW_NV_NON_FP8_ARENA_FLOATS : PLOW_NV_FP8_DECODE_WGMMA_ARENA_FLOATS)
 #define PLOW_NV_ARENA_FLOATS00                                                                \
     (PLOW_NV_ARENA_FLOATS000 > PLOW_NV_FP8TC_ARENA_FLOATS ? PLOW_NV_ARENA_FLOATS000 : PLOW_NV_FP8TC_ARENA_FLOATS)
-#define PLOW_NV_ARENA_FLOATS0                                                                 \
+/* The staged FP8 decode ring (PLOW_NV_FA_RG8S) joins the launch claims only, like the K8 slots. */
+#if PLOW_FP8_KV && PLOW_NV_GEMMA && !PLOW_NV_LEAN_DECODE
+#define PLOW_NV_RG8S_ARENA_FLOATS                                                             \
+    (FA_RG8S_SMEM_FLOATS(512) > FA_RG8S_SMEM_FLOATS(256) ? FA_RG8S_SMEM_FLOATS(512) : FA_RG8S_SMEM_FLOATS(256))
+#else
+#define PLOW_NV_RG8S_ARENA_FLOATS 0u
+#endif
+#define PLOW_NV_ARENA_FLOATS0_                                                                \
     (PLOW_NV_ARENA_FLOATS00 > PLOW_NV_K8_ARENA_FLOATS ? PLOW_NV_ARENA_FLOATS00 : PLOW_NV_K8_ARENA_FLOATS)
+#define PLOW_NV_ARENA_FLOATS0                                                                 \
+    (PLOW_NV_ARENA_FLOATS0_ > PLOW_NV_RG8S_ARENA_FLOATS ? PLOW_NV_ARENA_FLOATS0_ : PLOW_NV_RG8S_ARENA_FLOATS)
 #if PLOW_NV_SPEECH
 #define PLOW_NV_ARENA_FLOATS1                                                                 \
     (PLOW_NV_ARENA_FLOATS0 > PLOW_NV_MOE_GROUP_ARENA ? PLOW_NV_ARENA_FLOATS0 : PLOW_NV_MOE_GROUP_ARENA)
@@ -4644,9 +4653,14 @@ extern "C" __global__ void __launch_bounds__(PLOW_NV_THREADS)
     else
         __trap();
 }
-extern "C" __device__ unsigned PLOW_SYM(plow_rider_smem256) = FA_DEC_SMEM_FLOATS(256, 2) * sizeof(float);
-extern "C" __device__ unsigned PLOW_SYM(plow_rider_smem512) =
-    FA_DEC_SMEM_FLOATS(512, PLOW_NV_FA_GF_FULL) * sizeof(float);
+/* An FP8 rider runs the RG8 body, whose staged ring (PLOW_NV_FA_RG8S) sits past the decode claim. */
+#define PLOW_RIDER_SMEM(D, GF)                                                                \
+    ((PLOW_FP8_KV && FA_RG8S_SMEM_FLOATS(D) > (unsigned)FA_DEC_SMEM_FLOATS(D, GF) ? FA_RG8S_SMEM_FLOATS(D) \
+                                                                                  : (unsigned)FA_DEC_SMEM_FLOATS(D, GF)) * \
+     sizeof(float))
+extern "C" __device__ unsigned PLOW_SYM(plow_rider_smem256) = PLOW_RIDER_SMEM(256, 2);
+extern "C" __device__ unsigned PLOW_SYM(plow_rider_smem512) = PLOW_RIDER_SMEM(512, PLOW_NV_FA_GF_FULL);
+#undef PLOW_RIDER_SMEM
 extern "C" __device__ unsigned PLOW_SYM(plow_rider_fp8_kv) = PLOW_FP8_KV;
 extern "C" __device__ unsigned PLOW_SYM(plow_rider_gf512) = PLOW_NV_FA_GF_FULL;
 #endif
