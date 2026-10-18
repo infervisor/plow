@@ -473,6 +473,14 @@ async fn chat_completions_with(
     // the marker themselves).
     let reasoning_mode = crate::serve::reasoning::ReasoningMode::for_bundle(&bundle);
     let mut reasoning_open = reasoning_mode.prompt_opens(&prompt);
+    // Reasoning on in the rendered prompt: the trace is left open, or the template's own switch
+    // (Gemma 4 / Qwen3 `enable_thinking`) is on for this request.
+    let thinking = reasoning_mode.markers().is_some()
+        && (reasoning_open
+            || (state.chat_templated(&req.model)
+                && bundle
+                    .chat_template()
+                    .is_some_and(|t| t.thinking_requested(&render_opts.kwargs))));
     // A forced `tool_choice` writes the call's opener for the model, so the generation starts
     // inside the call (after closing a trace the prompt left open), and is validated at the end.
     let opener = tool_plan.parse.as_ref().and_then(|s| s.opener());
@@ -660,6 +668,7 @@ async fn chat_completions_with(
         };
     }
 
+    let tally = crate::obs::serving::ReasoningTally::admitted(state.model_metrics(key), thinking);
     let request_id = request_id();
     // Stamped ONCE and repeated on every chunk of a stream, as OpenAI does.
     let created = now_secs();
@@ -682,6 +691,7 @@ async fn chat_completions_with(
             lp_fmt,
             tool_stream,
             run,
+            tally,
         );
         let mut response = crate::serve::session::hold_until_sent(sse.into_response(), in_flight);
         response.headers_mut().extend(stamped);
@@ -698,6 +708,7 @@ async fn chat_completions_with(
             lp_fmt,
             tool_stream,
             run,
+            tally,
         )
         .await
     };
@@ -1033,6 +1044,7 @@ async fn buffer_and_reply(
     lp_fmt: Option<crate::serve::logprobs::TokenText>,
     mut tools: Option<crate::serve::tools::stream::ToolStream>,
     mut run: crate::serve::turns::StageRun,
+    tally: crate::obs::serving::ReasoningTally,
 ) -> Response {
     let mut calls: Vec<crate::serve::openai::ToolCall> = Vec::new();
     let mut text = String::new();
@@ -1156,6 +1168,7 @@ async fn buffer_and_reply(
     let trace_tokens = tools
         .as_ref()
         .map_or(split.trace_tokens, |ts| ts.split.trace_tokens);
+    tally.finished(trace_tokens);
     if trace_tokens > 0 {
         if let Some(u) = usage.as_mut() {
             u.completion_tokens_details = Some(CompletionTokensDetails {
@@ -1243,6 +1256,7 @@ fn sse_response(
     lp_fmt: Option<crate::serve::logprobs::TokenText>,
     tools: Option<crate::serve::tools::stream::ToolStream>,
     run: crate::serve::turns::StageRun,
+    tally: crate::obs::serving::ReasoningTally,
 ) -> Response {
     // State threaded through the unfold: the receiver, and the tail frames
     // (optional usage-only chunk, then [DONE]) drained one per poll.
@@ -1267,6 +1281,7 @@ fn sse_response(
         request_id: String,
         model: String,
         lp_fmt: Option<crate::serve::logprobs::TokenText>,
+        tally: crate::obs::serving::ReasoningTally,
     }
     let body = stream::unfold(
         SseState {
@@ -1283,6 +1298,7 @@ fn sse_response(
             request_id,
             model,
             lp_fmt,
+            tally,
         },
         move |mut st| {
             async move {
@@ -1389,6 +1405,7 @@ fn sse_response(
                             r => r.as_openai(),
                         };
                         let trace_tokens = ts.split.trace_tokens;
+                        st.tally.finished(trace_tokens);
                         let mut frames: Vec<Bytes> = tail.into_iter().collect();
                         let mut last = ChatChunk {
                             id: st.request_id.clone(),
@@ -1434,6 +1451,7 @@ fn sse_response(
                         // this generation; abandoning it truncated the streamed
                         // `reasoning_content` against the buffered path.
                         let (flushed_r, flushed_c) = st.split.finish();
+                        st.tally.finished(st.split.trace_tokens);
                         let ch = ChunkChoice {
                             index: 0,
                             delta: Delta {

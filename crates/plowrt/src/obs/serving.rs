@@ -316,6 +316,41 @@ pub struct ServingMetrics {
     pub run_packets: Histogram,
     /// Time to first output per turn stage (`serve::turns::Kind`: ASR final, LLM TTFT, TTS TTFA).
     pub turn_stage: [Histogram; 3],
+    /// Chat requests whose rendered prompt has reasoning on, and the generated tokens their
+    /// reasoning splitter attributed to the trace (see [`ReasoningTally`]).
+    pub thinking_requests: AtomicU64,
+    pub reasoning_tokens: AtomicU64,
+    pub request_reasoning_tokens: Histogram,
+}
+
+/// One chat request's reasoning accounting, recorded once when its response finishes.
+pub struct ReasoningTally {
+    pub metrics: Arc<Metrics>,
+    /// The rendered prompt has reasoning on (counted at admission).
+    pub thinking: bool,
+}
+
+impl ReasoningTally {
+    /// Counts the admitted request when `thinking`.
+    pub fn admitted(metrics: Arc<Metrics>, thinking: bool) -> Self {
+        if thinking {
+            metrics.serving.thinking_requests.fetch_add(1, Relaxed);
+        }
+        Self { metrics, thinking }
+    }
+
+    /// `trace_tokens`: the splitter's count, the same number `reasoning_tokens` reports in
+    /// `usage`. Requests that neither asked for reasoning nor produced a trace stay out of the
+    /// histogram.
+    pub fn finished(&self, trace_tokens: u64) {
+        let m = &self.metrics.serving;
+        if trace_tokens > 0 {
+            m.reasoning_tokens.fetch_add(trace_tokens, Relaxed);
+        }
+        if self.thinking || trace_tokens > 0 {
+            m.request_reasoning_tokens.tokens(trace_tokens as usize);
+        }
+    }
 }
 
 pub fn escape_label(value: &str) -> String {
@@ -415,6 +450,18 @@ impl ServingMetrics {
             |m: &Metrics, _| m.serving.prompt_cached.load(Relaxed)
         );
         scalar!("plowrt_requests_aborted_total", "counter", "Admitted requests dropped without normal completion or preemption; includes errors and disconnects.", |m: &Metrics, _| if m.serving.asr.cohort.load(Relaxed) { m.serving.asr.cancelled.load(Relaxed) } else { m.serving.aborted.load(Relaxed) });
+        scalar!(
+            "plowrt_requests_thinking_total",
+            "counter",
+            "Admitted chat requests whose rendered prompt has reasoning on (template thinking switch or a prompt that leaves the trace open).",
+            |m: &Metrics, _| m.serving.thinking_requests.load(Relaxed)
+        );
+        scalar!(
+            "plowrt_reasoning_tokens_total",
+            "counter",
+            "Generated tokens attributed to the reasoning trace, markers included; counted when a chat response finishes.",
+            |m: &Metrics, _| m.serving.reasoning_tokens.load(Relaxed)
+        );
         scalar!(
             "plowrt_requests_preempted_total",
             "counter",
@@ -588,6 +635,13 @@ impl ServingMetrics {
             LATENCY,
             1e6,
             "First through last generated token of completed requests."
+        );
+        hist!(
+            "plowrt_request_reasoning_tokens",
+            request_reasoning_tokens,
+            TOKENS,
+            1.0,
+            "Reasoning-trace tokens per finished chat request that had reasoning on or produced a trace."
         );
         hist!(
             "vllm:request_prompt_tokens",

@@ -51,6 +51,9 @@ pub struct ChatTemplate {
     pub tools: crate::serve::tools::ToolSupport,
     /// The reasoning-trace markers its model writes, when the template shows any.
     pub reasoning: Option<(&'static str, &'static str)>,
+    /// The kwarg that switches the template's reasoning on, and its value when a request omits
+    /// it (read from a probe render at load).
+    pub thinking_knob: Option<(&'static str, bool)>,
 }
 
 impl std::fmt::Debug for ChatTemplate {
@@ -271,10 +274,48 @@ impl ChatTemplate {
             source,
             tools: crate::serve::tools::ToolSupport::None,
             reasoning: crate::serve::tools::reasoning_markers(&text),
+            thinking_knob: None,
         };
         t.tools = crate::serve::tools::ToolSupport::probe(&t, &text);
+        t.thinking_knob = t.probe_thinking_knob(&text);
         tracing::info!(source = %t.source, tools = ?t.tools, "chat template tool support");
         Some(Arc::new(t))
+    }
+
+    /// Whether a request's `chat_template_kwargs` leave the template's reasoning switch on.
+    pub fn thinking_requested(&self, kwargs: &BTreeMap<String, serde_json::Value>) -> bool {
+        self.thinking_knob.is_some_and(|(knob, default)| {
+            kwargs.get(knob).map_or(default, |v| match v {
+                serde_json::Value::Null => false,
+                serde_json::Value::Bool(b) => *b,
+                serde_json::Value::Number(n) => n.as_f64() != Some(0.0),
+                serde_json::Value::String(s) => !s.is_empty(),
+                serde_json::Value::Array(a) => !a.is_empty(),
+                serde_json::Value::Object(o) => !o.is_empty(),
+            })
+        })
+    }
+
+    /// The first of the known reasoning switches the template reads, with its default: a render
+    /// without the kwarg equal to the one with it `true` means reasoning is on by default.
+    fn probe_thinking_knob(&self, text: &str) -> Option<(&'static str, bool)> {
+        let knob = ["enable_thinking", "thinking"]
+            .into_iter()
+            .find(|k| text.contains(k))?;
+        let msgs = [serde_json::json!({"role": "user", "content": "hi"})];
+        let with = |on: Option<bool>| {
+            let mut opts = RenderOpts::default();
+            if let Some(on) = on {
+                opts.kwargs.insert(knob.into(), serde_json::Value::Bool(on));
+            }
+            self.render_with(&msgs, &opts).ok()
+        };
+        let (none, on, off) = (with(None), with(Some(true)), with(Some(false)));
+        // A knob that changes nothing is not a switch.
+        if none.is_none() || on == off {
+            return None;
+        }
+        Some((knob, none == on))
     }
 
     /// Render `messages` with `add_generation_prompt=true` and no extra

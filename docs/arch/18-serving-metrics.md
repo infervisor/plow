@@ -113,6 +113,28 @@ latencies consequently have different boundaries.
 | `plowrt_tick_batch_size` | Histogram | Occupied slots at tick submission |
 | `plowrt_tick_generation_tokens` | Histogram | Generated outputs per returned tick |
 | `plowrt_run_packets` | Histogram | Existing executor-reported packet accounting at normal request completion |
+| `plowrt_requests_thinking_total` | Counter | Admitted chat requests whose rendered prompt has reasoning on |
+| `plowrt_reasoning_tokens_total` | Counter | Generated tokens attributed to the reasoning trace |
+| `plowrt_request_reasoning_tokens` | Histogram | Trace tokens per finished chat request that had reasoning on or produced a trace |
+
+**Reasoning.** A request counts as *thinking* when the model frames a separable trace
+(`serve::reasoning::ReasoningMode` is not `None`) and either the rendered prompt leaves the trace
+open (GLM-5.x, Gemma 4 after a tool result with thinking on) or the template's own switch is on
+for it: `chat_template_kwargs.enable_thinking` (or `thinking`), with the template's default when
+the request omits it (read from a probe render at load; Gemma 4 defaults off, Qwen3 on). vLLM's
+mapping applies first: `reasoning_effort` other than `"none"` sets `enable_thinking: true` unless
+the request set it. It is counted once, after the job is admitted to the dispatcher; only
+`/v1/chat/completions` splits reasoning (`/v1/completions` returns raw text and is not counted).
+
+Reasoning tokens are the splitter's own count (`ReasoningSplit::trace_tokens`), the number
+`usage.completion_tokens_details.reasoning_tokens` reports, so streamed and buffered responses
+count the same generation identically. It includes the trace's marker tokens (Gemma 4:
+`<|channel>`, `thought`, `<channel|>`), so an empty thought channel after a tool result counts 3-4
+tokens; vLLM's figure excludes the markers. A generation cut by `max_tokens` inside its trace
+counts every generated token. Both are recorded when the response finishes (`stop`, `length`,
+`tool_calls`); a request that errors or whose client disconnects is not counted. The hot path is
+unchanged (the splitter already counted per token); finishing adds one atomic add and one
+histogram bin.
 
 Existing scheduler metrics also have `plowrt_model_` counterparts: arrival rate,
 queueing utilization, batch and hold sums/counts, admission shedding, selected

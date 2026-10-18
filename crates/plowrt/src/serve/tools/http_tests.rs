@@ -685,6 +685,75 @@ async fn replayed_reasoning_field_is_rendered_like_reasoning_content() {
 }
 
 impl Harness {
+    /// `(plowrt_requests_thinking_total, plowrt_reasoning_tokens_total, histogram count)`.
+    async fn reasoning_metrics(&self) -> (u64, u64, u64) {
+        let req = Request::get("/metrics").body(Body::empty()).unwrap();
+        let resp = self.app.clone().oneshot(req).await.unwrap();
+        let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+        let text = String::from_utf8(bytes.to_vec()).unwrap();
+        let read = |name: &str| {
+            let line = format!("{name}{{model_name=\"toolm\",engine=\"0\"}} ");
+            text.lines()
+                .find_map(|l| l.strip_prefix(&line))
+                .unwrap_or_else(|| panic!("{name} missing:\n{text}"))
+                .parse()
+                .unwrap()
+        };
+        (
+            read("plowrt_requests_thinking_total"),
+            read("plowrt_reasoning_tokens_total"),
+            read("plowrt_request_reasoning_tokens_count"),
+        )
+    }
+}
+
+/// Thinking off counts nothing; thinking on counts the request and its trace tokens, the same
+/// for a buffered and a streamed response, and equal to `usage.reasoning_tokens`; a generation
+/// cut inside its trace still counts what it generated.
+#[tokio::test]
+async fn reasoning_metrics_count_thinking_requests_and_trace_tokens() {
+    let h = harness_for("gemma4-12b");
+    let on = json!({"enable_thinking": true});
+    h.reply(&["Four", "."]);
+    let (code, _) = h.json(json!({"messages": user("2+2?")})).await;
+    assert_eq!(code, StatusCode::OK);
+    let _ = h.sse(json!({"messages": user("2+2?")})).await;
+    assert_eq!(h.reasoning_metrics().await, (0, 0, 0), "thinking off");
+
+    let trace = toks("<|channel>thought\nTwo plus two is four.<channel|>Four.");
+    let pieces: Vec<&str> = trace.iter().map(String::as_str).collect();
+    h.reply(&pieces);
+    let (code, body) = h
+        .json(json!({"messages": user("2+2?"), "chat_template_kwargs": on}))
+        .await;
+    assert_eq!(code, StatusCode::OK, "{body}");
+    let usage = body["usage"]["completion_tokens_details"]["reasoning_tokens"]
+        .as_u64()
+        .unwrap();
+    assert!(usage > 0);
+    assert_eq!(h.reasoning_metrics().await, (1, usage, 1), "buffered");
+    let (frames, _) = h
+        .sse(json!({"messages": user("2+2?"), "chat_template_kwargs": on,
+                    "stream_options": {"include_usage": true}}))
+        .await;
+    let streamed = frames.last().unwrap()["usage"]["completion_tokens_details"]["reasoning_tokens"]
+        .as_u64()
+        .unwrap();
+    assert_eq!(streamed, usage);
+    assert_eq!(h.reasoning_metrics().await, (2, 2 * usage, 2), "streamed");
+
+    // `max_tokens` lands inside the trace: finish `length`, every generated token is trace.
+    let cut = &pieces[..4];
+    h.reply(cut);
+    let (code, body) = h
+        .json(json!({"messages": user("2+2?"), "chat_template_kwargs": on, "max_tokens": 4}))
+        .await;
+    assert_eq!(code, StatusCode::OK, "{body}");
+    assert_eq!(body["choices"][0]["finish_reason"], "length");
+    assert_eq!(h.reasoning_metrics().await, (3, 2 * usage + 4, 3), "cut");
+}
+
+impl Harness {
     async fn post_to(&self, path: &str, body: &str) -> (StatusCode, Value) {
         let req = Request::post(path)
             .header("content-type", "application/json")
