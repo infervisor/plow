@@ -290,7 +290,7 @@ impl ToolStream {
     }
 
     /// `text: None` is the end of the generation.
-    fn step(&mut self, text: Option<&str>, _cut: bool) {
+    fn step(&mut self, text: Option<&str>, cut: bool) {
         if !self.carry {
             self.content.clear();
             self.has_content = false;
@@ -313,6 +313,9 @@ impl ToolStream {
                     p.push(&self.cbuf, &mut out);
                 }
                 if text.is_none() {
+                    if cut {
+                        p.cut();
+                    }
                     p.finish(&mut out);
                 }
             }

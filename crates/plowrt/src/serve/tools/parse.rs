@@ -140,6 +140,9 @@ pub fn escape_into(dst: &mut String, s: &str) {
 pub trait Parser: Send {
     fn push(&mut self, s: &str, out: &mut Out);
     fn finish(&mut self, out: &mut Out);
+    /// The generation was cut (`max_tokens`): a call head it ended inside is the start of a
+    /// call, not text.
+    fn cut(&mut self) {}
 }
 
 pub fn parser(spec: &ParseSpec) -> Box<dyn Parser> {
@@ -253,6 +256,7 @@ struct Framed<B: Body> {
     /// A fresh body, cloned at each region start.
     proto: B,
     spec: ParseSpec,
+    cut: bool,
 }
 
 impl<B: Body + 'static> Framed<B> {
@@ -266,6 +270,7 @@ impl<B: Body + 'static> Framed<B> {
             body: body.clone(),
             proto: body,
             spec,
+            cut: false,
         })
     }
 
@@ -317,8 +322,9 @@ impl<B: Body + 'static> Framed<B> {
                 St::Going if !eof => return i,
                 St::Going => {
                     // The turn ended inside the region: a started call is closed by the caller.
+                    // An unresolved head is text, unless `max_tokens` cut it short.
                     self.in_call = false;
-                    if !self.started {
+                    if !self.started && !self.cut {
                         out.put_text(self.start);
                         out.put_text(&self.raw);
                         out.put_text(&s[i..]);
@@ -331,6 +337,10 @@ impl<B: Body + 'static> Framed<B> {
 }
 
 impl<B: Body + 'static> Parser for Framed<B> {
+    fn cut(&mut self) {
+        self.cut = true;
+    }
+
     fn push(&mut self, s: &str, out: &mut Out) {
         if self.buf.is_empty() {
             let n = self.run(s, false, out);

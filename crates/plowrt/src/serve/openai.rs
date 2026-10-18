@@ -177,8 +177,13 @@ pub struct ChatRequest {
     /// completions and deprecated `max_tokens`; current clients (including
     /// `vllm bench serve --backend openai-chat`) send only the new name.
     /// Accept both, or the cap is silently ignored and generation runs to EOS.
-    #[serde(default, alias = "max_completion_tokens")]
+    /// Read through [`ChatRequest::normalize`], which folds `max_completion_tokens` in.
+    #[serde(default)]
     pub max_tokens: Option<u32>,
+    /// Takes precedence over `max_tokens`, as in vLLM. Separate fields rather than a serde
+    /// alias: a body carrying both (several SDK wrappers send both) was a duplicate-field 422.
+    #[serde(default)]
+    pub max_completion_tokens: Option<u32>,
     #[serde(flatten)]
     pub sampling: SamplingFields,
     /// vLLM extension: run to `max_tokens` instead of stopping at eos. Sent by
@@ -250,6 +255,23 @@ pub struct ChatRequest {
     /// split from `content` and counted in `reasoning_tokens`).
     #[serde(default)]
     pub include_reasoning: Option<bool>,
+}
+
+impl ChatRequest {
+    /// Fold the request's alternative spellings into the fields the handler reads:
+    /// `max_completion_tokens` into `max_tokens`, and vLLM's `reasoning_effort` into the
+    /// template's `enable_thinking` (on unless `"none"`), unless the request set that itself.
+    pub fn normalize(&mut self) {
+        if let Some(m) = self.max_completion_tokens.take() {
+            self.max_tokens = Some(m);
+        }
+        if let Some(effort) = &self.reasoning_effort {
+            self.chat_template_kwargs
+                .get_or_insert_with(BTreeMap::new)
+                .entry("enable_thinking".into())
+                .or_insert_with(|| serde_json::Value::Bool(effort != "none"));
+        }
+    }
 }
 
 /// Stop matching runs on the serialized dispatcher for every generated token, in time
@@ -649,6 +671,8 @@ mod tests {
                 "stream_options":{"include_usage":true}}"#,
         )
         .expect("deserializes");
+        let mut req = req;
+        req.normalize();
         assert_eq!(req.seed, Some(u64::MAX), "a full-width u64 seed survived");
         assert_eq!(req.max_tokens, Some(128), "the OpenAI alias still applies");
         assert!(req.stream);

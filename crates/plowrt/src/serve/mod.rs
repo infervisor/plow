@@ -2064,6 +2064,25 @@ pub(crate) fn api_error(
 }
 
 /// The same, for a `RuntimeError`: status and code derived from the variant.
+/// A body that is not the request's JSON. A schema mismatch is 400, as OpenAI and vLLM answer
+/// it: axum's 422 surfaces in the OpenAI SDKs as `UnprocessableEntityError`, which a client
+/// handling `BadRequestError` does not catch.
+pub(crate) fn json_rejection(
+    e: axum::extract::rejection::JsonRejection,
+) -> axum::response::Response {
+    let status = match e.status() {
+        axum::http::StatusCode::UNPROCESSABLE_ENTITY => axum::http::StatusCode::BAD_REQUEST,
+        s => s,
+    };
+    api_error(
+        status,
+        e.body_text(),
+        "invalid_request_error",
+        Some("invalid_json"),
+        None,
+    )
+}
+
 pub(crate) fn api_error_for(err: &RuntimeError) -> axum::response::Response {
     let status = status_for(err);
     let (kind, code) = match err {

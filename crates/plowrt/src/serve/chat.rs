@@ -81,15 +81,7 @@ async fn chat_completions_with(
 ) -> Response {
     let Json(mut req) = match req {
         Ok(r) => r,
-        Err(e) => {
-            return crate::serve::api_error(
-                e.status(),
-                e.body_text(),
-                "invalid_request_error",
-                Some("invalid_json"),
-                None,
-            )
-        }
+        Err(e) => return crate::serve::json_rejection(e),
     };
 
     // ALIASES. `model` may be a name this bundle merely answers to (vLLM's
@@ -97,6 +89,7 @@ async fn chat_completions_with(
     // slug runs — residency, the manager, the mux, the metrics map — so an
     // alias never grows a second key for the same model. The response still
     // echoes the name the client sent, as vLLM does.
+    req.normalize();
     let requested_model = req.model.clone();
     if let Some(canonical) = state.registry.resolve(&req.model) {
         req.model = canonical;
@@ -179,7 +172,12 @@ async fn chat_completions_with(
             );
         }
     }
-    if req.response_format.as_ref().is_some_and(|v| !v.is_null()) {
+    // `{"type": "text"}` is the default format and asks for nothing; SDK wrappers send it.
+    if req
+        .response_format
+        .as_ref()
+        .is_some_and(|v| !v.is_null() && v.get("type").and_then(|t| t.as_str()) != Some("text"))
+    {
         return crate::serve::api_error(
             axum::http::StatusCode::BAD_REQUEST,
             "`response_format` is not implemented by this server; it is refused rather than \

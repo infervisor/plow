@@ -683,3 +683,115 @@ async fn replayed_reasoning_field_is_rendered_like_reasoning_content() {
     );
     assert_eq!(prompts[0], prompts[1]);
 }
+
+impl Harness {
+    async fn post_to(&self, path: &str, body: &str) -> (StatusCode, Value) {
+        let req = Request::post(path)
+            .header("content-type", "application/json")
+            .body(Body::from(body.to_string()))
+            .unwrap();
+        let resp = self.app.clone().oneshot(req).await.unwrap();
+        let status = resp.status();
+        let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+        (status, serde_json::from_slice(&bytes).unwrap())
+    }
+}
+
+/// Request-shape parity with vLLM: `max_tokens` and `max_completion_tokens` together (the
+/// latter wins), `response_format: text`, `reasoning_effort` turning Gemma 4's thinking on,
+/// schema errors as 400 with the error envelope, and `/v1/completions`' default of 16 tokens.
+#[tokio::test]
+async fn request_fields_are_read_as_vllm_reads_them() {
+    let h = harness_for("gemma4-12b");
+    let many: Vec<String> = (0..20).map(|i| format!("w{i} ")).collect();
+    let many: Vec<&str> = many.iter().map(String::as_str).collect();
+    h.reply(&many);
+    let (code, body) = h
+        .json(json!({"messages": user("hi"), "max_tokens": 100, "max_completion_tokens": 5}))
+        .await;
+    assert_eq!(code, StatusCode::OK, "{body}");
+    assert_eq!(
+        body["choices"][0]["finish_reason"], "length",
+        "5 wins over 100"
+    );
+
+    let (code, body) = h
+        .json(json!({"messages": user("hi"), "response_format": {"type": "text"}}))
+        .await;
+    assert_eq!(code, StatusCode::OK, "{body}");
+    let (code, _) = h
+        .json(json!({"messages": user("hi"), "response_format": {"type": "json_object"}}))
+        .await;
+    assert_eq!(code, StatusCode::BAD_REQUEST);
+
+    h.reply(&["ok"]);
+    for (extra, thinks) in [
+        (json!({"reasoning_effort": "high"}), true),
+        (json!({"reasoning_effort": "none"}), false),
+        (
+            json!({"reasoning_effort": "high", "chat_template_kwargs": {"enable_thinking": false}}),
+            false,
+        ),
+        (json!({}), false),
+    ] {
+        let mut b = json!({"messages": user("hi")});
+        for (k, v) in extra.as_object().unwrap() {
+            b[k] = v.clone();
+        }
+        let (code, body) = h.json(b).await;
+        assert_eq!(code, StatusCode::OK, "{body}");
+        assert_eq!(h.last_prompt().contains("<|think|>"), thinks, "{extra}");
+    }
+
+    for bad in [
+        r#"{"model": "toolm", "messages": "hi"}"#,
+        r#"{"model": "toolm"}"#,
+        r#"{"model": "toolm", "messages": [{"role": "user", "content": "hi"}], "max_tokens": -5}"#,
+    ] {
+        let (code, body) = h.post_to("/v1/chat/completions", bad).await;
+        assert_eq!(code, StatusCode::BAD_REQUEST, "{bad}");
+        assert_eq!(body["error"]["code"], "invalid_json", "{body}");
+    }
+
+    h.reply(&many);
+    let (code, body) = h
+        .post_to(
+            "/v1/completions",
+            r#"{"model": "toolm", "prompt": "Hello"}"#,
+        )
+        .await;
+    assert_eq!(code, StatusCode::OK, "{body}");
+    assert_eq!(
+        body["choices"][0]["finish_reason"], "length",
+        "default 16 < 20"
+    );
+}
+
+/// `max_tokens` landing inside a call's head (before its name is complete) used to return the
+/// head's syntax as the answer (`content: "call:get_weather"`); it is call framing, not text.
+#[tokio::test]
+async fn a_call_head_cut_by_max_tokens_is_not_content() {
+    let h = harness();
+    let pieces = ["Checking.", "<|tool_call>", "call", ":get", "_weather"];
+    h.reply(&pieces);
+    let (_, v) = h
+        .json(json!({"messages": user("w"), "tools": tools(), "max_tokens": 5}))
+        .await;
+    assert_eq!(v["choices"][0]["finish_reason"], "length");
+    assert_eq!(v["choices"][0]["message"]["content"], "Checking.", "{v}");
+    let (frames, _) = h
+        .sse(json!({"messages": user("w"), "tools": tools(), "max_tokens": 5}))
+        .await;
+    let (content, _, calls, finish) = accumulate(&frames);
+    assert_eq!((content.as_str(), calls.len()), ("Checking.", 0));
+    assert_eq!(finish.as_deref(), Some("length"));
+    // A turn that ENDS (not cut) inside a head still returns it as text.
+    let (_, v) = h
+        .json(json!({"messages": user("w"), "tools": tools(), "max_tokens": 50}))
+        .await;
+    assert_eq!(v["choices"][0]["finish_reason"], "stop");
+    assert_eq!(
+        v["choices"][0]["message"]["content"],
+        "Checking.call:get_weather"
+    );
+}
