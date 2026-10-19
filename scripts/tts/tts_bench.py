@@ -70,6 +70,7 @@ def main():
     ap.add_argument("--n", type=int, default=16)
     ap.add_argument("--stream", action="store_true")
     ap.add_argument("--greedy", action="store_true")
+    ap.add_argument("--repetition-penalty", type=float, default=None)
     ap.add_argument("--out", required=True)
     ap.add_argument("--tag", default=None)
     ap.add_argument("--wav", action="store_true")
@@ -83,6 +84,8 @@ def main():
     os.makedirs(args.out, exist_ok=True)
     tag = args.tag or f"{'stream' if args.stream else 'full'}_c{args.conc}"
     extra = dict(temperature=0.0) if args.greedy else {}
+    if args.repetition_penalty is not None:
+        extra["repetition_penalty"] = args.repetition_penalty
     prompts = VEENA_PROMPTS if args.prompt_set == "veena" else [("default", t) for t in CBX_TEXTS]
     if args.prompt_set == "chatterbox-mtl":
         prompts = [("default", t) for _, t in MTL_PROMPTS]

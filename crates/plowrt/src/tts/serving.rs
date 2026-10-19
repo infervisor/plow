@@ -769,7 +769,7 @@ async fn speech_with(
         max_tokens: req.max_tokens,
         temperature: req.temperature.unwrap_or(c.temperature),
         top_p: req.top_p.unwrap_or(c.top_p),
-        repetition_penalty: req.repetition_penalty.unwrap_or(1.0),
+        repetition_penalty: req.repetition_penalty.unwrap_or(c.repetition_penalty),
         seed: req.seed,
     };
     let segs: Vec<Segment> = super::segments(&req.input, c.segment_chars())

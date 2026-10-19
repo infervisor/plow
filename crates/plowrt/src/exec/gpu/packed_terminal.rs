@@ -483,15 +483,15 @@ impl PackedTerminal {
         e: &mut GpuEngine,
         rows: &[u32],
         live: usize,
-        specs: Option<&[DevSample]>,
+        specs: Option<(&[DevSample], &[u32])>,
     ) -> Result<usize> {
         let i = self.stage_rows(rows);
         if rows.is_empty() {
             return Ok(i);
         }
         self.launch(e, live, i)?;
-        if let Some(specs) = specs {
-            if let Err(error) = e.launch_sampler_rows(specs) {
+        if let Some((specs, slots)) = specs {
+            if let Err(error) = e.launch_sampler_rows(specs, slots) {
                 let _ = e.be.stream_synchronize(&e.stream);
                 return Err(error);
             }

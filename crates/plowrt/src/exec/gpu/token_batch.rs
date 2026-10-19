@@ -275,6 +275,8 @@ impl GpuEngine {
                         .collect();
                     specs.iter().any(|s| s.temp > 0.0).then_some(specs)
                 });
+            let spec_slots: smallvec::SmallVec<[u32; 32]> =
+                plan.sample_owners.iter().map(|owner| owner.slot).collect();
             let completed: smallvec::SmallVec<[_; 16]> = plan
                 .pending
                 .iter()
@@ -352,7 +354,12 @@ impl GpuEngine {
                 .expect("capability checked at load");
             let t_term = timed.then(std::time::Instant::now);
             let sampled = terminal
-                .begin_rows(self, &sample_rows, real_rows, specs.as_deref())
+                .begin_rows(
+                    self,
+                    &sample_rows,
+                    real_rows,
+                    specs.as_deref().map(|s| (s, spec_slots.as_slice())),
+                )
                 .and_then(|i| {
                     if let Some(gpu) = gpu.as_mut() {
                         gpu.end(self);

@@ -16,8 +16,11 @@
  * top_p boundary token. t <= 0 is greedy argmax with the ARGMAX tie-break (lowest index wins),
  * byte-identical to d_argmax_fin.
  *
+ * The repetition penalty runs as its own pass: decode -> plow_penalize -> plow_sample ->
+ * plow_count, over a per-slot `[V]` u32 history of the slot's generated tokens.
+ *
  * NOT handled on device (host keeps these; the engine only routes rows the device can finish):
- *   - repetition/frequency/presence penalties (need per-row token history — DeviceRunState),
+ *   - frequency/presence penalties and logit bias,
  *   - structured-decoding masks,
  *   - the pathological no-truncation config (top_k==0 && top_p>=1 && min_p==0): the kept set is
  *     the full vocab and index-order inverse-CDF over 262k is pointless work — the host path is
@@ -375,6 +378,37 @@ extern "C" __global__ void plow_advance(
     ring[(size_t)b * K + step] = ids[b];
     pos[b] += 1;
     kvlen[b] += 1;
+}
+
+/* Repetition penalty in place, as `text::sample::apply_penalties` (HF's
+ * RepetitionPenaltyLogitsProcessor): once for each token in the row's history
+ * (counts[hist_row[b]][i] > 0), l > 0 ? l / p : l * p, rounded back to bf16. One block per row;
+ * pen[b] == 1 leaves the row untouched. */
+extern "C" __global__ void plow_penalize(
+    __nv_bfloat16* __restrict__ logits, const float* __restrict__ pen,
+    const unsigned* __restrict__ hist_row, const unsigned* __restrict__ counts, unsigned V, unsigned B) {
+    const unsigned b = blockIdx.x;
+    if (b >= B) return;
+    const float p = pen[b];
+    if (p == 1.0f) return;
+    __nv_bfloat16* row = logits + (size_t)b * V;
+    const unsigned* cnt = counts + (size_t)hist_row[b] * V;
+    for (unsigned i = threadIdx.x; i < V; i += blockDim.x) {
+        if (cnt[i] == 0u) continue;
+        const float l = __bfloat162float(row[i]);
+        row[i] = __float2bfloat16_rn(l > 0.0f ? __fdiv_rn(l, p) : __fmul_rn(l, p));
+    }
+}
+
+/* Append each penalized row's drawn token (ids[b], after plow_sample) to its history. One thread
+ * per row. */
+extern "C" __global__ void plow_count(
+    const int* __restrict__ ids, const float* __restrict__ pen, const unsigned* __restrict__ hist_row,
+    unsigned* __restrict__ counts, unsigned V, unsigned B) {
+    const unsigned b = blockIdx.x * blockDim.x + threadIdx.x;
+    if (b >= B || pen[b] == 1.0f) return;
+    const int t = ids[b];
+    if (t >= 0 && (unsigned)t < V) counts[(size_t)hist_row[b] * V + (unsigned)t] += 1u;
 }
 
 extern "C" __global__ void plow_sample(

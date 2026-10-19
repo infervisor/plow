@@ -118,6 +118,7 @@ fn device_sampler_serve_integration() {
             top_p: 1.0,
             min_p: 0.0,
             rng01: rng_at(step),
+            penalty: 1.0,
         };
         v
     };
@@ -199,8 +200,9 @@ fn device_rows_match_host_sampler_distribution() {
                 top_p,
                 min_p: 0.0,
                 rng01: u,
+                penalty: 1.0,
             };
-            e.sample_rows_on_device(&[spec], &mut tok)
+            e.sample_rows_on_device(&[spec], &[0], &mut tok)
                 .expect("device draw");
             *dev.entry(tok[0]).or_default() += 1;
         }
@@ -222,5 +224,83 @@ fn device_rows_match_host_sampler_distribution() {
             tv <= bound,
             "device and host samplers disagree: TV {tv} > {bound}"
         );
+    }
+}
+
+/// The device repetition penalty on a real logits row: a top_k=1 draw after `plow_penalize` is
+/// the host's argmax after `apply_penalties` (bf16-rounded, as the device stores it). Compact row
+/// 0 reads slot 1's history (`pen_seed_history`), and `plow_count` appends each draw to it.
+///
+/// `PLOW_GPU_TEST=1 PLOW_GPU_ASSETS=<packet with sample_sm120.cubin>`.
+#[test]
+fn device_penalty_matches_host_argmax() {
+    use plowrt::text::sample::{apply_penalties, SamplingParams};
+    if std::env::var("PLOW_GPU_TEST").as_deref() != Ok("1") {
+        eprintln!("skipped: set PLOW_GPU_TEST=1 (needs GPU + assets)");
+        return;
+    }
+    let assets = PathBuf::from(std::env::var("PLOW_GPU_ASSETS").expect("PLOW_GPU_ASSETS"));
+    let be = Arc::new(CudaBackend::new(0).expect("CUDA backend"));
+    let mut e = GpuEngine::load(be, &assets, &assets.join("checkpoint")).expect("engine load");
+    assert!(e.dev_penalty(), "device penalty kernels did not load");
+    assert!(e.batch() >= 2, "needs two slots");
+    let prompt: Vec<u32> = (0..48u32).map(|i| 2 + (i * 7919) % 30000).collect();
+    let bf16_round = |x: f32| {
+        let u = x.to_bits();
+        f32::from_bits((u.wrapping_add(0x7fff + ((u >> 16) & 1)) >> 16) << 16)
+    };
+    let argmax = |v: &[f32]| {
+        let mut best = 0usize;
+        for (i, &x) in v.iter().enumerate() {
+            if x > v[best] {
+                best = i;
+            }
+        }
+        best as u32
+    };
+    let fresh_logits = |e: &mut GpuEngine| {
+        e.begin_slot(0, prompt.len() + 4).expect("begin");
+        e.prefill_slot(0, &prompt).expect("prefill");
+        let mut logits = Vec::new();
+        e.logits_row(0, &mut logits).expect("logits");
+        logits
+    };
+    let spec = |penalty: f32| DevSample {
+        temp: 1.0,
+        top_k: 1,
+        top_p: 1.0,
+        min_p: 0.0,
+        rng01: 0.5,
+        penalty,
+    };
+    let logits = fresh_logits(&mut e);
+    let top = argmax(&logits);
+
+    // Penalty 1 and an empty history both leave the argmax.
+    e.pen_seed_history(0, &[]).expect("seed");
+    let mut tok = [0u32];
+    e.sample_rows_on_device(&[spec(1.0)], &[0], &mut tok)
+        .expect("draw");
+    assert_eq!(tok[0], top);
+    fresh_logits(&mut e);
+    e.sample_rows_on_device(&[spec(5.0)], &[0], &mut tok)
+        .expect("draw");
+    assert_eq!(tok[0], top, "an empty history must not penalize");
+
+    // Slot 1's history holds the argmax: compact row 0 draws past it, then counts its draw.
+    let mut history = vec![top, top, 17];
+    e.pen_seed_history(1, &history).expect("seed");
+    for round in 0..3 {
+        let mut host = fresh_logits(&mut e);
+        let params = SamplingParams {
+            repetition_penalty: 5.0,
+            ..Default::default()
+        };
+        apply_penalties(&mut host, &history, &params);
+        let host: Vec<f32> = host.into_iter().map(bf16_round).collect();
+        e.sample_rows_on_device(&[spec(5.0)], &[1], &mut tok)
+            .expect("draw");
+        assert_eq!(tok[0], argmax(&host), "round {round}: device penalty draw");
+        history.push(tok[0]);
     }
 }

@@ -57,23 +57,9 @@ fn cpu_sample(bf: &[u16], t: f32, top_k: i32, top_p: f32, min_p: f32, rng01: f32
 
 const SRC: &str = include_str!("../../../runtime/nvidia/sample_sm120.cu");
 
-/// Launch config buffers for a B-row sample, all rows sharing one logits row.
-struct Case {
-    t: f32,
-    top_k: i32,
-    top_p: f32,
-    min_p: f32,
-}
-
-#[test]
-fn device_sampler_matches_cpu_reference() {
-    if std::env::var("PLOW_GPU_TEST").as_deref() != Ok("1") {
-        eprintln!("skipped: set PLOW_GPU_TEST=1 (needs GPU + nvcc)");
-        return;
-    }
-
-    // Build the sampler cubin.
-    let dir = std::env::temp_dir().join(format!("plowrt-sample-{}", std::process::id()));
+/// Build the sampler cubin with nvcc into a per-process temp dir.
+fn build_cubin(tag: &str) -> Vec<u8> {
+    let dir = std::env::temp_dir().join(format!("plowrt-{tag}-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     let src = dir.join("sample_sm120.cu");
     let cubin = dir.join("sample_sm120.cubin");
@@ -96,7 +82,25 @@ fn device_sampler_matches_cpu_reference() {
         "nvcc: {}",
         String::from_utf8_lossy(&out.stderr)
     );
-    let image = std::fs::read(&cubin).unwrap();
+    std::fs::read(&cubin).unwrap()
+}
+
+/// Launch config buffers for a B-row sample, all rows sharing one logits row.
+struct Case {
+    t: f32,
+    top_k: i32,
+    top_p: f32,
+    min_p: f32,
+}
+
+#[test]
+fn device_sampler_matches_cpu_reference() {
+    if std::env::var("PLOW_GPU_TEST").as_deref() != Ok("1") {
+        eprintln!("skipped: set PLOW_GPU_TEST=1 (needs GPU + nvcc)");
+        return;
+    }
+
+    let image = build_cubin("sample");
 
     let be = CudaBackend::new(0).expect("CUDA backend");
     let module = be.module_load(&image).unwrap();
@@ -276,5 +280,130 @@ fn device_sampler_matches_cpu_reference() {
             );
         }
     }
+    be.module_unload(&module).unwrap();
+}
+
+/// `plow_penalize` against `text::sample::apply_penalties` (bit-exact after the bf16 rounding the
+/// device stores), and `plow_count`: rows with penalty 1 are untouched, each row reads and appends
+/// to the history row `hist_row` maps it to, out-of-range ids are not counted.
+#[test]
+#[allow(non_snake_case)]
+fn device_penalty_matches_host() {
+    if std::env::var("PLOW_GPU_TEST").as_deref() != Ok("1") {
+        eprintln!("skipped: set PLOW_GPU_TEST=1 (needs GPU + nvcc)");
+        return;
+    }
+    let image = build_cubin("penalty");
+    let be = CudaBackend::new(0).expect("CUDA backend");
+    let module = be.module_load(&image).unwrap();
+    let f_pen = be.get_function(&module, "plow_penalize").unwrap();
+    let f_count = be.get_function(&module, "plow_count").unwrap();
+    let threads = be
+        .module_global_u32(&module, "plow_sample_threads")
+        .unwrap()
+        .unwrap_or(256);
+    let stream = be.stream_create().unwrap();
+
+    let (V, H) = (8191usize, 6usize);
+    let pen = [1.3f32, 1.0, 0.8, 1.3, 1.3];
+    let hist_row = [5u32, 5, 2, 0, 1];
+    let ids = [7i32, 9, 3, V as i32, 42];
+    let B = pen.len();
+    let histories: Vec<Vec<u32>> = (0..H)
+        .map(|h| match h {
+            5 => vec![0, 7, 100, 8190, 7],
+            2 => vec![3, 50, 4000],
+            1 => vec![42],
+            _ => Vec::new(),
+        })
+        .collect();
+    let mut counts = vec![0u32; H * V];
+    for (h, toks) in histories.iter().enumerate() {
+        for &t in toks {
+            counts[h * V + t as usize] += 1;
+        }
+    }
+    let logits: Vec<u16> = (0..B * V)
+        .map(|i| {
+            let x = ((i.wrapping_mul(2654435761) >> 7) % 4001) as f32 / 200.0 - 10.0;
+            f32_to_bf16_bits(x)
+        })
+        .collect();
+
+    let d_logits = be.alloc(0, (B * V * 2) as u64).unwrap();
+    let d_pen = be.alloc(0, (B * 4) as u64).unwrap();
+    let d_hist = be.alloc(0, (B * 4) as u64).unwrap();
+    let d_ids = be.alloc(0, (B * 4) as u64).unwrap();
+    let d_counts = be.alloc(0, (H * V * 4) as u64).unwrap();
+    be.upload(&d_logits, 0, bytemuck::cast_slice(&logits))
+        .unwrap();
+    be.upload(&d_pen, 0, bytemuck::cast_slice(&pen)).unwrap();
+    be.upload(&d_hist, 0, bytemuck::cast_slice(&hist_row))
+        .unwrap();
+    be.upload(&d_ids, 0, bytemuck::cast_slice(&ids)).unwrap();
+    be.upload(&d_counts, 0, bytemuck::cast_slice(&counts))
+        .unwrap();
+
+    let (mut p_x, mut p_pen, mut p_hist, mut p_cnt) =
+        (d_logits.base, d_pen.base, d_hist.base, d_counts.base);
+    let (mut p_v, mut p_b) = (V as u32, B as u32);
+    let mut a = [
+        &mut p_x as *mut u64 as *mut std::ffi::c_void,
+        &mut p_pen as *mut u64 as *mut std::ffi::c_void,
+        &mut p_hist as *mut u64 as *mut std::ffi::c_void,
+        &mut p_cnt as *mut u64 as *mut std::ffi::c_void,
+        &mut p_v as *mut u32 as *mut std::ffi::c_void,
+        &mut p_b as *mut u32 as *mut std::ffi::c_void,
+    ];
+    be.launch_kernel(f_pen, B as u32, threads, 0, &mut a, Some(&stream))
+        .unwrap();
+    p_x = d_ids.base;
+    let mut a = [
+        &mut p_x as *mut u64 as *mut std::ffi::c_void,
+        &mut p_pen as *mut u64 as *mut std::ffi::c_void,
+        &mut p_hist as *mut u64 as *mut std::ffi::c_void,
+        &mut p_cnt as *mut u64 as *mut std::ffi::c_void,
+        &mut p_v as *mut u32 as *mut std::ffi::c_void,
+        &mut p_b as *mut u32 as *mut std::ffi::c_void,
+    ];
+    be.launch_kernel(f_count, 1, 256, 0, &mut a, Some(&stream))
+        .unwrap();
+    be.stream_synchronize(&stream).unwrap();
+    let mut got = vec![0u16; B * V];
+    be.download(&d_logits, 0, bytemuck::cast_slice_mut(&mut got))
+        .unwrap();
+    let mut got_counts = vec![0u32; H * V];
+    be.download(&d_counts, 0, bytemuck::cast_slice_mut(&mut got_counts))
+        .unwrap();
+
+    for b in 0..B {
+        let row = &logits[b * V..(b + 1) * V];
+        let mut host: Vec<f32> = row.iter().map(|&x| bf16_bits_to_f32(x)).collect();
+        let params = plowrt::text::sample::SamplingParams {
+            repetition_penalty: pen[b],
+            ..Default::default()
+        };
+        plowrt::text::sample::apply_penalties(&mut host, &histories[hist_row[b] as usize], &params);
+        let want: Vec<u16> = host.iter().map(|&x| f32_to_bf16_bits(x)).collect();
+        let diff = (0..V).filter(|&i| got[b * V + i] != want[i]).count();
+        assert_eq!(
+            diff, 0,
+            "row {b}: {diff} logits differ from the host penalty"
+        );
+        let touched = (0..V).filter(|&i| got[b * V + i] != row[i]).count();
+        if pen[b] == 1.0 || histories[hist_row[b] as usize].is_empty() {
+            assert_eq!(touched, 0, "row {b} must be untouched");
+        } else {
+            assert!(touched > 0, "row {b} was not penalized");
+        }
+    }
+
+    let mut want_counts = counts.clone();
+    for b in 0..B {
+        if pen[b] != 1.0 && (ids[b] as usize) < V {
+            want_counts[hist_row[b] as usize * V + ids[b] as usize] += 1;
+        }
+    }
+    assert!(got_counts == want_counts, "plow_count history mismatch");
     be.module_unload(&module).unwrap();
 }
