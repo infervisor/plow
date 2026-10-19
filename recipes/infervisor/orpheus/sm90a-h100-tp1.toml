@@ -8,15 +8,15 @@
 # Checkpoint: unsloth/orpheus-3b-0.1-ft, the ungated mirror of canopylabs/orpheus-3b-0.1-ft (gated;
 # no token on the build box). Every decode/prefill knob is the Veena H100 recipe's, measured there on
 # the identical Llama-3.2-3B shapes; none was re-measured on Orpheus (time-boxed bring-up).
-# Gate (H100, orpheus-perf 276f4db8): Whisper CER median 0.000 (n=80), 0/80 clips CER > 0.3. The profile's
-# repetition penalty 1.1 (sampled on device) ends the loops that ran 6/80 clips past CER 0.3 and 15% of
-# requests to the token cap without it. Streaming c1 TTFA 82 ms, RTF 0.30; c64 78 / c128 95 audio s/s.
+# Gate (H100, ac793626 + split-bf16 SNAC): Whisper CER median 0.000 (n=80), 0/80 clips CER > 0.3. The
+# profile's repetition penalty 1.1 (sampled on device) ends the loops that ran 6/80 clips past CER 0.3 and
+# 15% of requests to the token cap without it. Streaming c1 TTFA 82 ms, RTF 0.30; c64 87 / c128 111 audio s/s.
 
 schema = "plow.recipe.v1"
 namespace = "infervisor"
 name = "orpheus"
 label = "sm90a-h100-tp1"
-plow_git = "3e2fb6efc3f3d67f5b11649a5bdc057e5ab489da"
+plow_git = "ac79362640911e3ba7f3c7624bf43bff16880ead"
 network = "llama"
 doc = "docs/runtime/tts.md"
 tracker = "docs/runtime/h100-speech-recipes.md"
@@ -80,6 +80,9 @@ PLOW_FUSE_KV_HNR = "1"
 # tuning (gemv_k8 + L2 prefetch, tensor-core decode scores, classic B=1 GEMVs below K 3840).
 PLOW_EMIT_PACKED_PREFILL_SMALL_HD = "1"
 PLOW_NV_DENSE_TUNE = "1"
+# SNAC pointwise convs on split-bf16 warpgroup MMA (parity vs 3xTF32 rel-L2 1.5e-5): served c64
+# 78 -> 87, c128 94 -> 111 audio s/s, c128 p90 TTFA 2.6-3.0 -> 1.0-1.3 s; c1/c32 unchanged.
+PLOW_EMIT_SNAC_SPLIT_BF16 = "1"
 
 # Served flags (campaign serve/bench/gate). Scheduling follows the default `auto` objective: the
 # lookahead-1 decode pipeline (greedy c64/c128 +3-5%, c1 TPOT and CER unchanged), adaptive
