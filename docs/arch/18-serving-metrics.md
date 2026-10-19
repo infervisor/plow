@@ -56,7 +56,7 @@ boundaries need not match vLLM's to use the same dashboard queries.
 | `prompt_tokens_total` | Counter | All prompt tokens, computed plus reused prefix tokens (vLLM's total) |
 | `prompt_tokens_cached_total` | Counter | Prompt tokens attached from a prefix |
 | `generation_tokens_total` | Counter | Generated tokens, including EOS/stop tokens |
-| `request_success_total` | Counter | Normal completion, labeled by `finished_reason` |
+| `request_success_total` | Counter | Finished requests by `finished_reason`: `stop`, `length`, and `abort` (client disconnect or error, as vLLM counts it) |
 | `time_to_first_token_seconds` | Histogram | Handler arrival to first generated token |
 | `inter_token_latency_seconds` | Histogram | Host observation interval between generated tokens |
 | `request_time_per_output_token_seconds` | Histogram | Per completed request `(last-first)/(outputs-1)`; zero for one output, as vLLM |
@@ -107,6 +107,8 @@ latencies consequently have different boundaries.
 | `plowrt_model_ready` | Gauge | Installed dispatcher with admission enabled |
 | `plowrt_model_requests_total`, `plowrt_model_rejected_total` | Counter | Submitted jobs and ingress/admission refusals |
 | `plowrt_requests_aborted_total` | Counter | Admitted work dropped without normal completion or residency preemption |
+| `plowrt_requests_aborted_before_first_token_total` | Counter | Aborts with no generated token yet (client gave up in queue or prefill) |
+| `plowrt_request_aborted_elapsed_seconds` | Histogram | Arrival to abort; a peak at a fixed time means a client timeout |
 | `plowrt_requests_preempted_total` | Counter | Requests terminated by residency reclamation |
 | `plowrt_tick_errors_total` | Counter | Device-fault or worker-failure ticks |
 | `plowrt_tick_duration_seconds{phase=...}` | Histogram | Returned tick wall time, including worker submission |

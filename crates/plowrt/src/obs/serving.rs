@@ -281,6 +281,9 @@ pub struct ServingMetrics {
     pub generation: AtomicU64,
     pub success: [AtomicU64; 2],
     pub aborted: AtomicU64,
+    /// Aborts that came before the first generated token, and arrival-to-abort time of every abort.
+    pub aborted_before_first: AtomicU64,
+    pub aborted_elapsed: Histogram,
     pub preempted: AtomicU64,
     pub tick_errors: AtomicU64,
     /// Completed requests judged against `PLOW_TTFT_SLO_MS` / `PLOW_TBT_SLO_MS`, and how many
@@ -451,6 +454,12 @@ impl ServingMetrics {
         );
         scalar!("plowrt_requests_aborted_total", "counter", "Admitted requests dropped without normal completion or preemption; includes errors and disconnects.", |m: &Metrics, _| if m.serving.asr.cohort.load(Relaxed) { m.serving.asr.cancelled.load(Relaxed) } else { m.serving.aborted.load(Relaxed) });
         scalar!(
+            "plowrt_requests_aborted_before_first_token_total",
+            "counter",
+            "Aborted requests that had not produced a token (client gave up while queued or in prefill).",
+            |m: &Metrics, _| m.serving.aborted_before_first.load(Relaxed)
+        );
+        scalar!(
             "plowrt_requests_thinking_total",
             "counter",
             "Admitted chat requests whose rendered prompt has reasoning on (template thinking switch or a prompt that leaves the trace open).",
@@ -553,21 +562,20 @@ impl ServingMetrics {
             out,
             "vllm:request_success_total",
             "counter",
-            "Requests completed normally by finish reason.",
+            "Finished requests by finish reason; `abort` as vLLM counts it (client disconnect or error).",
         );
         for ((_, m, _), labels) in models.iter().zip(&labels) {
-            for (i, reason) in ["stop", "length"].iter().enumerate() {
+            let cohort = m.serving.asr.cohort.load(Relaxed);
+            for (i, reason) in ["stop", "length", "abort"].iter().enumerate() {
                 let _ = writeln!(
                     out,
                     "vllm:request_success_total{{{labels},finished_reason=\"{reason}\"}} {}",
-                    if m.serving.asr.cohort.load(Relaxed) {
-                        if i == 0 {
-                            m.serving.asr.completed.load(Relaxed)
-                        } else {
-                            0
-                        }
-                    } else {
-                        m.serving.success[i].load(Relaxed)
+                    match (cohort, i) {
+                        (true, 0) => m.serving.asr.completed.load(Relaxed),
+                        (true, 2) => m.serving.asr.cancelled.load(Relaxed),
+                        (true, _) => 0,
+                        (false, 2) => m.serving.aborted.load(Relaxed),
+                        (false, _) => m.serving.success[i].load(Relaxed),
                     }
                 );
             }
@@ -607,6 +615,13 @@ impl ServingMetrics {
             LATENCY,
             1e6,
             "Arrival through normal completion."
+        );
+        hist!(
+            "plowrt_request_aborted_elapsed_seconds",
+            aborted_elapsed,
+            LATENCY,
+            1e6,
+            "Arrival through abort; a peak at a fixed time points at a client timeout."
         );
         hist!(
             "vllm:request_queue_time_seconds",
@@ -922,7 +937,12 @@ impl Drop for RequestMetrics {
     fn drop(&mut self) {
         self.metrics.serving.running.fetch_sub(1, Relaxed);
         if !self.finished {
-            self.metrics.serving.aborted.fetch_add(1, Relaxed);
+            let m = &self.metrics.serving;
+            m.aborted.fetch_add(1, Relaxed);
+            if self.first.is_none() {
+                m.aborted_before_first.fetch_add(1, Relaxed);
+            }
+            m.aborted_elapsed.duration(self.arrived.elapsed());
         }
     }
 }
@@ -980,11 +1000,13 @@ mod tests {
         let mut aborted = RequestMetrics::new(m.clone(), now, now, 20, 8);
         aborted.token(0);
         drop(aborted);
+        drop(RequestMetrics::new(m.clone(), now, now, 20, 8));
         let mut preempted = RequestMetrics::new(m.clone(), now, now, 20, 8);
         preempted.finish(FinishReason::Preempted, 0);
         drop(preempted);
         assert_eq!(m.serving.running.load(Relaxed), 0);
-        assert_eq!(m.serving.aborted.load(Relaxed), 1);
+        assert_eq!(m.serving.aborted.load(Relaxed), 2);
+        assert_eq!(m.serving.aborted_before_first.load(Relaxed), 1);
         assert_eq!(m.serving.preempted.load(Relaxed), 1);
         assert_eq!(m.serving.success[0].load(Relaxed), 0);
     }
@@ -1014,6 +1036,10 @@ mod tests {
             format!("vllm:request_params_max_tokens_sum{l} 16\n"),
             format!("vllm:request_max_num_generation_tokens_count{l} 1\n"),
             format!("vllm:request_max_num_generation_tokens_sum{l} 1\n"),
+            format!("vllm:request_success_total{{model_name=\"g\",engine=\"0\",finished_reason=\"stop\"}} 1\n"),
+            format!("vllm:request_success_total{{model_name=\"g\",engine=\"0\",finished_reason=\"abort\"}} 1\n"),
+            format!("plowrt_requests_aborted_before_first_token_total{l} 0\n"),
+            format!("plowrt_request_aborted_elapsed_seconds_count{l} 1\n"),
         ] {
             assert!(out.contains(&line), "missing {line}");
         }
