@@ -435,7 +435,8 @@ pub struct Message {
 pub struct ResponseMessage {
     pub role: &'static str,
     pub content: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    /// vLLM's field name for the trace.
+    #[serde(rename = "reasoning", skip_serializing_if = "Option::is_none")]
     pub reasoning_content: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tool_calls: Option<Vec<ToolCall>>,
@@ -860,8 +861,8 @@ pub struct Delta {
     pub role: Option<&'static str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub content: Option<String>,
-    /// Streamed thinking trace, before the answer starts.
-    #[serde(skip_serializing_if = "Option::is_none")]
+    /// Streamed thinking trace, before the answer starts; vLLM's field name.
+    #[serde(rename = "reasoning", skip_serializing_if = "Option::is_none")]
     pub reasoning_content: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tool_calls: Option<Vec<ToolCallDelta>>,

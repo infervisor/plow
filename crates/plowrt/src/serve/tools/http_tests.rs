@@ -257,7 +257,7 @@ fn accumulate(
         };
         let d = &c["delta"];
         content.push_str(d["content"].as_str().unwrap_or_default());
-        reasoning.push_str(d["reasoning_content"].as_str().unwrap_or_default());
+        reasoning.push_str(d["reasoning"].as_str().unwrap_or_default());
         for t in d["tool_calls"].as_array().into_iter().flatten() {
             let i = t["index"].as_u64().unwrap() as usize;
             if let Some(id) = t["id"].as_str() {
@@ -544,7 +544,7 @@ async fn reasoning_is_separated_from_content() {
     let (_, v) = h.json(json!({"messages": user("2+2?")})).await;
     let m = &v["choices"][0]["message"];
     assert_eq!(
-        (m["content"].as_str(), m["reasoning_content"].as_str()),
+        (m["content"].as_str(), m["reasoning"].as_str()),
         (Some("It is 4."), Some("The user wants 2+2."))
     );
     assert_eq!(
@@ -561,16 +561,22 @@ async fn reasoning_is_separated_from_content() {
     let (_, v) = h
         .json(json!({"messages": user("2+2?"), "include_reasoning": false}))
         .await;
-    assert!(v["choices"][0]["message"]
-        .get("reasoning_content")
-        .is_none());
+    assert!(v["choices"][0]["message"].get("reasoning").is_none());
     assert_eq!(v["choices"][0]["message"]["content"], "It is 4.");
     let (frames, _) = h
         .sse(json!({"messages": user("2+2?"), "include_reasoning": false}))
         .await;
     assert!(!frames
         .iter()
-        .any(|f| f.to_string().contains("reasoning_content")));
+        .any(|f| f.to_string().contains("\"reasoning\"")));
+    // a turn cut inside its trace answers `content: null`, as vLLM does
+    h.reply(&["<|channel>", "thought", "\n", "Still", " thinking"]);
+    let (_, v) = h.json(json!({"messages": user("2+2?")})).await;
+    let m = &v["choices"][0]["message"];
+    assert_eq!(
+        (&m["content"], m["reasoning"].as_str()),
+        (&Value::Null, Some("Still thinking"))
+    );
 }
 
 #[tokio::test]
@@ -601,7 +607,7 @@ async fn a_tool_loop_answers_without_leaking_the_thought_channel() {
     );
     let m = &v["choices"][0]["message"];
     assert_eq!(m["content"], "It is 18°C in Paris.");
-    assert!(m.get("reasoning_content").is_none() && m.get("tool_calls").is_none());
+    assert!(m.get("reasoning").is_none() && m.get("tool_calls").is_none());
     assert_eq!(v["choices"][0]["finish_reason"], "stop");
     let (frames, _) = h.sse(json!({"messages": convo, "tools": tools()})).await;
     let (content, _, calls, _) = accumulate(&frames);

@@ -1136,7 +1136,7 @@ async fn buffer_and_reply(
     };
     // The generation prompt leaves `<think>` open on GLM, so the raw text is
     // "<trace></think><answer>". Split it: `content` carries the answer alone
-    // and the trace goes to `reasoning_content`, which is where a reasoning
+    // and the trace goes to `reasoning` (vLLM's name), which is where a reasoning
     // model's clients look for it. A model that never opened a trace is
     // unaffected — `split_reasoning` returns the whole string as the answer.
     match tools.as_mut() {
@@ -1163,11 +1163,12 @@ async fn buffer_and_reply(
         let t = reasoning_buf.trim();
         (include_reasoning && !t.is_empty()).then(|| t.to_string())
     };
-    // A turn that is only calls answers `content: null`, as OpenAI does.
-    let answer = (calls.is_empty() || !answer_buf.trim().is_empty()).then_some(answer_buf);
     let trace_tokens = tools
         .as_ref()
         .map_or(split.trace_tokens, |ts| ts.split.trace_tokens);
+    // A turn that is only calls, or only a trace, answers `content: null`, as vLLM does.
+    let answer = ((calls.is_empty() && trace_tokens == 0) || !answer_buf.trim().is_empty())
+        .then_some(answer_buf);
     tally.finished(trace_tokens);
     if trace_tokens > 0 {
         if let Some(u) = usage.as_mut() {

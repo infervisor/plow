@@ -132,7 +132,7 @@ struct DeltaFrame<'a> {
     role: Option<&'static str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     content: Option<&'a str>,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(rename = "reasoning", skip_serializing_if = "Option::is_none")]
     reasoning_content: Option<&'a str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     tool_calls: Option<Deltas<'a>>,
