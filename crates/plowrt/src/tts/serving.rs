@@ -1221,6 +1221,9 @@ async fn collect_codes(
     Ok((codes, n))
 }
 
+/// Banked audio a stream keeps beyond producing a wider window before it waits for one.
+const STREAM_WIDE_SLACK_S: f64 = 1.0;
+
 /// The emission plan for a stream holding `n` complete frames of which `emitted` are sent:
 /// `Some((window_start, window_end, emit_to))`, or `None` when nothing new is ready.
 ///
@@ -1463,9 +1466,24 @@ async fn stream_task(
             }
         }
         let first_audio = first.is_none() && emitted == 0;
-        let chunk = (model.codec.min_frames + 1)
+        let mut chunk = (model.codec.min_frames + 1)
             .saturating_sub(model.codec.window)
             .max(1);
+        // Every window re-decodes `window - 1` frames of context, so the smallest window spends
+        // most of its codec work on context (Orpheus c128: 43% of GPU time). A stream whose banked
+        // audio outlasts producing a wider window waits for one.
+        if let (Some(t), Some(t0), false) = (playing, first_frame_at, done) {
+            let lead = sent as f64 / sr - t.elapsed().as_secs_f64();
+            let per_frame = t0.elapsed().as_secs_f64() / (frames.len() / fc).max(1) as f64;
+            if let Some(w) = [4, 2]
+                .into_iter()
+                .map(|k| (k * model.codec.min_frames).min(model.codec.max_frames))
+                .map(|f| (f + 1).saturating_sub(model.codec.window))
+                .find(|&c| c > chunk && lead >= c as f64 * per_frame + STREAM_WIDE_SLACK_S)
+            {
+                chunk = w;
+            }
+        }
         let lookahead = if emitted == 0 {
             model
                 .codec

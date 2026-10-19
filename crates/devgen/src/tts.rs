@@ -77,7 +77,9 @@ pub const ORPHEUS: SpeechProfile = SpeechProfile {
     max_new_tokens_cap: 1800,
     temperature: 0.6,
     top_p: 0.8,
-    repetition_penalty: 1.0,
+    // H100 c64, 214 requests: 1.0 ran 32 to the token cap (repetition loops, 5/81 clips CER > 0.3);
+    // 1.1, 1.2 and 1.3 ran none, all clips CER <= 0.3.
+    repetition_penalty: 1.1,
 };
 
 /// Chatterbox T3 (`tts.t3_cfg.v1`): a causal LM whose prefill rows are host embeddings (the
