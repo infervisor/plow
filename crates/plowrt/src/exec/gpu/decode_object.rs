@@ -195,6 +195,9 @@ pub(super) fn load_gemv_wide(
         &format!("_Z{}{stem}_gw11PlowProgram", stem.len() + 3),
     )?;
     GpuEngine::check_packet_pairing_suffix(be, &module, assets, "_gw")?;
+    if be.module_global_u32(&module, "plow_row_slot_1")? != be.module_global_u32(main, "plow_row_slot_1")? {
+        return Err(reject(&format!("{file}: plow_row_slot_1 differs from the decode object")));
+    }
     for symbol in ["plow_block", "plow_dyn_kvrow", "plow_gemv_mm_cap"] {
         if be.module_global_u32(&module, &format!("{symbol}_gw"))?
             != be.module_global_u32(main, symbol)?

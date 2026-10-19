@@ -74,8 +74,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut ride: Option<(usize, Vec<usize>)> = None;
     let mut ride_dump = None::<std::path::PathBuf>;
     let (mut dump_names, mut dump_dir) = (None::<String>, None::<String>);
+    let mut spec = SpecArgs::default();
     while let Some(a) = args.next() {
         match a.as_str() {
+            // `--spec oracle|adversarial|ngram`: speculative verify identity gate (see spec_bench).
+            "--spec" => spec.mode = Some(args.next().ok_or("--spec MODE")?),
+            "--spec-k" => spec.k = args.next().ok_or("--spec-k K")?.parse()?,
+            "--spec-rung" => spec.rung = args.next().ok_or("--spec-rung R")?.parse()?,
+            "--spec-poison" => spec.poison = true,
+            "--nsplit-kvlen" => spec.nsplit_kvlen = Some(args.next().ok_or("--nsplit-kvlen N")?.parse()?),
             "--max-segments" => {
                 max_segments = Some(args.next().ok_or("--max-segments N")?.parse()?)
             }
@@ -341,6 +348,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             record_inputs(histories, &last, &toks, 1);
         }
         last.copy_from_slice(&toks);
+    }
+    if let Some(mode) = spec.mode.clone() {
+        let prompts: Vec<Vec<u32>> = (0..slots).map(prompt_for).collect();
+        return spec_bench(&mut e, &assets, &spec, &mode, &prompts, &last, ctx + warmup, steps);
     }
     if let Some((lo, hi, step)) = seg_sweep {
         let base_pos: Vec<usize> = (0..slots).map(|_| ctx + warmup).collect();
@@ -724,5 +735,159 @@ mod tests {
             single,
             vec![vec![10, 11, 12, 13, 14], vec![20, 21, 22, 23, 24]]
         );
+    }
+}
+
+#[derive(Default)]
+struct SpecArgs {
+    mode: Option<String>,
+    k: usize,
+    rung: usize,
+    poison: bool,
+    nsplit_kvlen: Option<u32>,
+}
+
+/// `--spec MODE`: the span-mode verify identity gate. A plain greedy run of `steps` tokens per
+/// slot at a fixed rung (`--spec-rung R`, and `--nsplit-kvlen N` for a fixed dense split) is the
+/// reference; the slots are rewound and the same tokens regenerated through `spec_verify` +
+/// `spec_commit` with drafts from MODE: `oracle` (the reference's next tokens, all accepted),
+/// `adversarial` (every draft wrong, all rejected), `ngram` (prompt lookup over each slot's
+/// history). `--spec-poison` NaN-fills every uncommitted row after each verify. Prints
+/// `SPEC_IDENTITY ok|MISMATCH` and the verify cost.
+#[cfg(feature = "cuda")]
+#[allow(clippy::too_many_arguments)]
+fn spec_bench(
+    e: &mut plowrt::exec::gpu::GpuEngine,
+    assets: &std::path::Path,
+    a: &SpecArgs,
+    mode: &str,
+    prompts: &[Vec<u32>],
+    last: &[u32],
+    base: usize,
+    steps: usize,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use plowrt::exec::gpu::spec::SpecSpan;
+    use plowrt::orch::speculative::ngram_propose;
+    use std::time::Instant;
+    let slots = last.len();
+    let max_k = e.spec_enable(assets)?;
+    if a.k > max_k || slots * (a.k + 1) > a.rung.max(1) && a.rung > 0 {
+        return Err(format!("k {} (max {max_k}) x {slots} slots exceeds rung {}", a.k, a.rung).into());
+    }
+    e.set_debug_min_rung(a.rung);
+    e.set_debug_nsplit_kvlen(a.nsplit_kvlen);
+    for b in 0..slots {
+        e.snapshot_slot(b)?;
+    }
+    // Reference: plain greedy decode at the fixed rung.
+    let mut cur = last.to_vec();
+    let mut reference = vec![Vec::with_capacity(steps); slots];
+    let feeds = |cur: &[u32]| -> Vec<(usize, u32)> { cur.iter().copied().enumerate().collect() };
+    let mut toks = Vec::new();
+    let t0 = Instant::now();
+    for _ in 0..steps {
+        e.step_slots(&feeds(&cur), &mut toks)?;
+        for (b, &t) in toks.iter().enumerate() {
+            reference[b].push(t);
+        }
+        cur.copy_from_slice(&toks);
+    }
+    let plain_ms = t0.elapsed().as_secs_f64() * 1e3 / steps.max(1) as f64;
+    for b in 0..slots {
+        e.rewind_slot(b, base)?;
+    }
+
+    let vocab = e.vocab() as u32;
+    let mut out: Vec<Vec<u32>> = vec![Vec::with_capacity(steps); slots];
+    let mut hist: Vec<Vec<u32>> = prompts.to_vec();
+    for (h, &t) in hist.iter_mut().zip(last) {
+        h.push(t);
+    }
+    let mut pending = last.to_vec();
+    let (mut ticks, mut drafted, mut accepted, mut verify_ms) = (0usize, 0usize, 0usize, 0f64);
+    let mut n_spans = 0usize;
+    let mut inputs: Vec<Vec<u32>> = vec![Vec::new(); slots];
+    let mut draft = Vec::new();
+    let mut verdicts = Vec::new();
+    while out.iter().any(|o| o.len() < steps) {
+        let live: Vec<usize> = (0..slots).filter(|&b| out[b].len() < steps).collect();
+        for &b in &live {
+            let i = out[b].len();
+            let k = a.k.min(steps - i - 1);
+            match mode {
+                "oracle" => {
+                    draft.clear();
+                    draft.extend_from_slice(&reference[b][i..i + k]);
+                }
+                "adversarial" => {
+                    draft.clear();
+                    draft.extend(reference[b][i..i + k].iter().map(|&t| (t + 1) % vocab));
+                }
+                "ngram" => ngram_propose(&hist[b], k, 1, 4, &mut draft),
+                m => return Err(format!("unknown --spec mode {m}").into()),
+            }
+            inputs[b].clear();
+            inputs[b].push(pending[b]);
+            inputs[b].extend_from_slice(&draft);
+            drafted += inputs[b].len() - 1;
+        }
+        let spans: Vec<SpecSpan> = live
+            .iter()
+            .map(|&b| SpecSpan { slot: b, tokens: &inputs[b] })
+            .collect();
+        let t = Instant::now();
+        e.spec_verify(&spans, &[], &mut verdicts)?;
+        verify_ms += t.elapsed().as_secs_f64() * 1e3;
+        ticks += 1;
+        n_spans += spans.len();
+        for (sp, v) in spans.iter().zip(&verdicts) {
+            let n = usize::from(v.n_emit);
+            let p0 = e.slot_pos(sp.slot) as u32;
+            if a.poison {
+                e.spec_poison_rows(sp.slot, p0 + n as u32, p0 + sp.tokens.len() as u32)?;
+            }
+            e.spec_commit(sp, v)?;
+            accepted += usize::from(v.n_acc);
+            let emitted = &v.tokens[..n];
+            out[sp.slot].extend_from_slice(emitted);
+            hist[sp.slot].extend_from_slice(emitted);
+            pending[sp.slot] = emitted[n - 1];
+        }
+    }
+    let mut ok = true;
+    for b in 0..slots {
+        out[b].truncate(steps);
+        if out[b] != reference[b] {
+            ok = false;
+            let at = out[b].iter().zip(&reference[b]).position(|(x, y)| x != y);
+            println!("  slot {b}: first divergence at {at:?}");
+        }
+    }
+    let digest = |s: &[Vec<u32>]| {
+        let mut d: u64 = 0xcbf29ce484222325;
+        for i in 0..steps {
+            for v in s {
+                d = (d ^ u64::from(v[i])).wrapping_mul(0x100000001b3);
+            }
+        }
+        d
+    };
+    println!(
+        "SPEC_IDENTITY {} mode={mode} slots={slots} k={} rung={} base={base} steps={steps} \
+         poison={} ref_fnv={:016x} spec_fnv={:016x} ticks={ticks} drafted={drafted} accepted={accepted} \
+         mean_emit={:.3} plain_ms={plain_ms:.3} verify_ms={:.3}",
+        if ok { "ok" } else { "MISMATCH" },
+        a.k,
+        a.rung,
+        a.poison,
+        digest(&reference),
+        digest(&out),
+        (steps * slots) as f64 / n_spans as f64,
+        verify_ms / ticks as f64,
+    );
+    if ok {
+        Ok(())
+    } else {
+        Err("speculative verify diverged from the plain reference".into())
     }
 }

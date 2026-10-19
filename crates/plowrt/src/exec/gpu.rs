@@ -93,6 +93,7 @@ pub mod packet_exec;
 mod riders;
 mod segment_gates;
 mod shared_tail;
+pub mod spec;
 mod token_batch;
 use cublaslt::{CublasLtDecodeRoute, LibraryRoute};
 use decode_rung::{
@@ -2795,6 +2796,13 @@ pub struct GpuEngine {
     /// Bytes of every batch-major `kv.*` tensor one cache row takes (static per-slot KV).
     kv_row_bytes: u64,
     slot_generations: Vec<u32>,
+    /// Span-mode verify (`in.rowslot` packets); see [`spec`].
+    spec: Option<spec::SpecRt>,
+    /// Per slot, one past the highest KV row any launch wrote (verify writes past `pos`).
+    kv_hw: Vec<u32>,
+    /// Bench-only launch overrides ([`Self::set_debug_min_rung`], [`Self::set_debug_nsplit_kvlen`]).
+    debug_min_rows: usize,
+    debug_nsplit_kvlen: Option<u32>,
 }
 
 /// Full model-load wall timeline (`PLOW_LOAD_PROFILE=1`).
@@ -5762,6 +5770,10 @@ impl GpuEngine {
         // threshold (plow_gw_min_rows, default GV_MM_MAX + 1) with its full claim (the wide-GEMV
         // ring). At 2/4 rows the two objects are within ~1% either way (Chatterbox's CFG pair is
         // 1% faster on the ordinary one).
+        // Span mode needs every decode object to honour `in.rowslot`; load_gemv_wide refuses a
+        // `_gw` sibling whose marker differs from this one.
+        let row_slot_obj = decode_objects.is_none()
+            && be.module_global_u32(&module, "plow_row_slot_1")?.is_some();
         let gemv_wide = match gemv_mm_cap {
             Some(_)
                 if decode_objects.is_none()
@@ -7209,6 +7221,13 @@ impl GpuEngine {
             None => (None, 0),
         };
 
+        let spec = spec::SpecRt::load(
+            &be,
+            blob.tensors.iter().position(|t| t.name == "in.rowslot"),
+            row_slot_obj,
+            batch,
+            &blob.decode_progs(),
+        )?;
         let resume_ring_slack = live_kv_manifest
             .clone()
             .or_else(|| blob.with_packet_view(plow_asset::live_kv::emit).ok())
@@ -7350,7 +7369,12 @@ impl GpuEngine {
                 .checked_div(batch as u64 * (blob.tensors[t_pos].bytes / 4))
                 .unwrap_or(0),
             slot_generations: vec![0; batch],
+            spec,
+            kv_hw: vec![0; batch],
+            debug_min_rows: 0,
+            debug_nsplit_kvlen: None,
         };
+        engine.spec_upload_identity()?;
         engine.mm_spans = engine.handle_of("act.mm_span").is_some();
         engine.packed_terminal = packed_terminal::PackedTerminal::load(&engine)?;
         engine.shared_tail =
@@ -7852,6 +7876,7 @@ impl GpuEngine {
             p.queue.forget(b);
         }
         self.slot_generations[b] = self.slot_generations[b].wrapping_add(1);
+        self.kv_hw[b] = 0;
         if let Some(state) = &self.recurrent {
             for &(index, stride) in &state.tensors {
                 self.be.memset_d8_async(
@@ -7972,7 +7997,7 @@ impl GpuEngine {
             && rows < self.max_ctx
             && self
                 .resume_ring_slack
-                .is_none_or(|s| self.pos[b] as usize - rows <= s as usize)
+                .is_none_or(|s| self.pos[b].max(self.kv_hw[b]) as usize - rows <= s as usize)
             && self.pipe.as_ref().is_none_or(|p| !p.holds(b));
         if let Some(r) = self.resume_rows.get_mut(b) {
             *r = if ok { rows as u32 } else { 0 };
@@ -8220,6 +8245,7 @@ impl GpuEngine {
     }
 
     fn patch_nv_nsplit(&mut self, kvlen: u32) -> Result<()> {
+        let kvlen = self.debug_nsplit_kvlen.unwrap_or(kvlen);
         if let Some(launch) = &self.gen_decode_launch {
             launch
                 .max_kv
@@ -8753,6 +8779,7 @@ impl GpuEngine {
             .map(|contexts| contexts.select(&self.pos, slots))
             .transpose()?
             .flatten();
+        let highest = highest.max(self.debug_min_rows.saturating_sub(1));
         Ok(decode_selection(self.decode_rung(highest), band))
     }
 
