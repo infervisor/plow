@@ -814,6 +814,7 @@ mod tests {
             max_ctx: ctx,
             position: 1,
             kv_length: 0,
+            row_slot: None,
             caches: vec![
                 plow_asset::live_kv::Cache {
                     pair: [3, 4],
