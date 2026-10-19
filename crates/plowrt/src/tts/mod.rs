@@ -49,6 +49,8 @@ pub struct SpeechContract {
     pub max_new_tokens_cap: usize,
     pub temperature: f32,
     pub top_p: f32,
+    /// Default repetition penalty; 1.0 (none) on packets without one.
+    pub repetition_penalty: f32,
 }
 
 impl SpeechContract {
@@ -99,6 +101,7 @@ impl SpeechContract {
             max_new_tokens_cap: get("tokens.max_new_cap")? as usize,
             temperature: f32p("sampling.temperature_f32")?,
             top_p: f32p("sampling.top_p_f32")?,
+            repetition_penalty: f32p("sampling.repetition_penalty_f32").unwrap_or(1.0),
         };
         if !c.prompt_template.contains("{input}") || !c.voice_token.contains("{voice}") {
             return Err(RuntimeError::Rejected(
@@ -544,6 +547,18 @@ mod tests {
         assert_eq!(c.suffix, [128260, 128261, 128257]);
         assert_eq!(c.stops, [128258, 128262]);
         assert_eq!(c.temperature, 0.4);
+        assert_eq!(c.repetition_penalty, 1.0);
+        let mut with_pen = pipeline();
+        with_pen.parameters.insert(
+            "sampling.repetition_penalty_f32".into(),
+            u64::from(1.1f32.to_bits()),
+        );
+        assert_eq!(
+            SpeechContract::from_pipeline(&with_pen)
+                .unwrap()
+                .repetition_penalty,
+            1.1
+        );
         let mut bad = pipeline();
         bad.parameters.remove("stop.1");
         assert!(SpeechContract::from_pipeline(&bad).is_err());

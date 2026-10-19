@@ -30,6 +30,8 @@ pub struct SpeechProfile {
     pub max_new_tokens_cap: u64,
     pub temperature: f32,
     pub top_p: f32,
+    /// Default repetition penalty (1.0 = none).
+    pub repetition_penalty: f32,
 }
 
 /// maya-research/Veena (model card): [SOH] <spk_v> text [EOH] [SOA] [SOS] -> SNAC codes, stop on
@@ -52,6 +54,7 @@ pub const VEENA: SpeechProfile = SpeechProfile {
     max_new_tokens_cap: 1400,
     temperature: 0.4,
     top_p: 0.9,
+    repetition_penalty: 1.0,
 };
 
 /// canopylabs/orpheus-3b-0.1-ft (orpheus_tts `_format_prompt`): [SOH] BOS "voice: text" [EOT]
@@ -74,6 +77,7 @@ pub const ORPHEUS: SpeechProfile = SpeechProfile {
     max_new_tokens_cap: 1800,
     temperature: 0.6,
     top_p: 0.8,
+    repetition_penalty: 1.0,
 };
 
 /// Chatterbox T3 (`tts.t3_cfg.v1`): a causal LM whose prefill rows are host embeddings (the
@@ -237,6 +241,10 @@ pub fn speech_pipeline_section(
         u64::from(p.temperature.to_bits()),
     );
     put("sampling.top_p_f32".into(), u64::from(p.top_p.to_bits()));
+    put(
+        "sampling.repetition_penalty_f32".into(),
+        u64::from(p.repetition_penalty.to_bits()),
+    );
     meta.validate(model.progs.len(), |name| {
         model
             .tensors
