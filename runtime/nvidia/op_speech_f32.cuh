@@ -3260,7 +3260,11 @@ __device__ __forceinline__ float spg_post(unsigned post, float x, float p) {
 __device__ __forceinline__ const float* spwg_wsplit(const SpConvArgs& a) {
     return (const float*)((const char*)a.w + (((size_t)a.cout * a.cg * a.kernel * 4u + 1023u) & ~(size_t)1023u));
 }
-template <unsigned BN, bool TAPS, unsigned P, bool GR = false>
+/* CT: a merged-phase ConvTranspose1d (kernel 2*stride, phase-major weights): row m = (b, q) of
+ * ep.n_p rows per item, column n = (phase, o), k = (tap, ci) reading input row q - tap; output
+ * row t = q*stride + phase - before, stores skipped outside [0, out_rows), zero past convt_len.
+ * BN divides cout, so a tile is one phase. */
+template <unsigned BN, bool TAPS, unsigned P, bool GR = false, bool CT = false>
 static __device__ __forceinline__ void sp_wg_gemm(unsigned M, unsigned N, unsigned K, const float* x, const float* w,
                                                   const SpConvEpi1& ep, unsigned slice, unsigned nblk) {
     char* sm = (char*)sm90_align1024(sp_smem);
@@ -3289,7 +3293,15 @@ static __device__ __forceinline__ void sp_wg_gemm(unsigned M, unsigned N, unsign
     bool pending = false; /* bulk stores reading `stage` */
     for (unsigned tile = slice; tile < tiles; tile += nblk) {
         const unsigned mg = tile / tn, gi = GR ? mg % G : 0u, m0 = (GR ? mg / G : mg) * 128u, n0 = (tile % tn) * BN,
-                       og = gi * N;
+                       og = gi * N, ph = CT ? n0 / a.cout : 0u, col = CT ? n0 - ph * a.cout : og + n0;
+        /* CT: row m's output base; geo = inside the output geometry, live = also within convt_len. */
+        auto ct_base = [&](unsigned m, bool& geo, bool& live) {
+            const unsigned b = m / ep.n_p;
+            const int t = (int)((m - b * ep.n_p) * a.stride + ph) - (int)a.before;
+            geo = t >= 0 && t < (int)a.out_rows;
+            live = geo && t < a.convt_len(b);
+            return ((size_t)b * a.out_rows + (geo ? (unsigned)t : 0u)) * a.cout;
+        };
         /* B rows (tap-major weights) are contiguous: row n at w + n * K. Pointwise A rows too: row m
          * at x + m * K. With taps, a k-tile lies in one tap (cin % 64 == 0) and A row m of item b,
          * output row t, reads input row t + tap * dil - before of b (zero outside its length).
@@ -3305,10 +3317,11 @@ static __device__ __forceinline__ void sp_wg_gemm(unsigned M, unsigned N, unsign
         if constexpr (TAPS) {
 #pragma unroll
             for (unsigned p = 0; p < 8; p++) {
-                const unsigned m = min(m0 + sr + 16u * p, M - 1u), b = m / a.out_rows, t = m - b * a.out_rows;
+                const unsigned m = min(m0 + sr + 16u * p, M - 1u), rows = CT ? ep.n_p : a.out_rows, b = m / rows,
+                               t = m - b * rows;
                 xb[p] = x + (size_t)b * a.in_rows * a.cin + sc;
-                t0[p] = (int)t - (int)a.before;
-                len[p] = p < ma && t < a.conv_len(b) ? (int)a.length(b) : 0;
+                t0[p] = CT ? (int)t : (int)t - (int)a.before;
+                len[p] = p < ma && (CT || t < a.conv_len(b)) ? (int)a.length(b) : 0;
             }
         }
         float4 va[8], vb[WS ? 1u : BN / 16u];
@@ -3319,7 +3332,7 @@ static __device__ __forceinline__ void sp_wg_gemm(unsigned M, unsigned N, unsign
                 const unsigned tap = k / a.cin, ci = k - tap * a.cin;
 #pragma unroll
                 for (unsigned p = 0; p < 8; p++) {
-                    const int u = t0[p] + (int)(tap * a.dil);
+                    const int u = CT ? t0[p] - (int)tap : t0[p] + (int)(tap * a.dil);
                     float4 v = make_float4(0.f, 0.f, 0.f, 0.f);
                     if (kin && (unsigned)u < (unsigned)len[p]) v = __ldg((const float4*)(xb[p] + (size_t)u * a.cin + ci));
                     if (leaky) {
@@ -3360,7 +3373,7 @@ static __device__ __forceinline__ void sp_wg_gemm(unsigned M, unsigned N, unsign
             sm90_cp_commit();
         };
         load(0u);
-        const float bpre = a.bias && tid < BN && n0 + tid < N ? __ldg(a.bias + og + n0 + tid) : 0.f;
+        const float bpre = a.bias && tid < BN && n0 + tid < N ? __ldg(a.bias + col + tid) : 0.f;
         if (pending) {
             asm volatile("cp.async.bulk.wait_group.read 0;\n" ::: "memory");
             pending = false;
@@ -3429,6 +3442,12 @@ static __device__ __forceinline__ void sp_wg_gemm(unsigned M, unsigned N, unsign
 #pragma unroll
         for (unsigned h = 0; h < 2; h++) {
             const unsigned m = m0 + rw + 8u * h;
+            if constexpr (CT) {
+                bool geo = false, live = false;
+                base[h] = m < M ? ct_base(m, geo, live) : 0;
+                ok[h] = m < M && live;
+                continue;
+            }
             base[h] = m < M ? ep.row_base(m) : 0;
             ok[h] = m < M && (long long)base[h] >= 0;
             if (!ok[h]) base[h] = ~base[h];
@@ -3466,9 +3485,10 @@ static __device__ __forceinline__ void sp_wg_gemm(unsigned M, unsigned N, unsign
         __syncthreads();
         if (tid < 128u && m0 + tid < M) {
             const unsigned m = m0 + tid, cols = min(BN, N - n0);
-            size_t base = ep.row_base(m);
+            bool geo = true, live;
+            size_t base = CT ? ct_base(m, geo, live) : ep.row_base(m);
             if ((long long)base < 0) base = ~base;
-            spwg_bulk_store(a.out + base + og + n0, stage + tid * LDO, cols * 4u);
+            if (geo) spwg_bulk_store(a.out + base + col, stage + tid * LDO, cols * 4u);
             asm volatile("cp.async.bulk.commit_group;\n" ::: "memory");
             pending = true;
         }
@@ -3488,6 +3508,22 @@ __device__ __forceinline__ bool spg_eligible(const SpConvArgs& a) {
     return (pw || taps) && spg_post_ok(a.post) && a.cout % 4u == 0 && sp_aligned(a.out, 16) &&
            (!a.residual || sp_aligned(a.residual, 8)) && (!a.bias || sp_aligned(a.bias, 8)) && sp_aligned(a.w, 16) &&
            sp_aligned(a.x, 16);
+}
+/* Merged-phase ConvTranspose1d on wgmma: two taps per phase (kernel 2*stride), phase-major
+ * weights with the pre-split image, no activations, residual or output padding. */
+__device__ __forceinline__ bool spg_ct_eligible(const SpConvArgs& a) {
+    return a.phasemajor && a.kernel == 2u * a.stride && a.groups == 1u && a.opad == 0u && a.pre == 0u &&
+           a.post == 0u && !a.alpha && !a.residual && !a.wf16 && a.cin % 64u == 0 && a.cout % 64u == 0 &&
+           sp_aligned(a.out, 16) && (!a.bias || sp_aligned(a.bias, 8)) && sp_aligned(a.w, 16) && sp_aligned(a.x, 16);
+}
+__device__ __forceinline__ void sp_wg_run_ct(const SpConvArgs& a, unsigned slice, unsigned nblk) {
+    const unsigned Q = (a.out_rows + a.before + a.stride - 1u) / a.stride, M = a.batch * Q, N = a.stride * a.cout;
+    const SpConvEpi1 ep{a, 0u, Q, 0u, 0u, true, true};
+    const unsigned mt = (M + 127u) / 128u, r128 = (mt * (N / 128u) + nblk - 1u) / nblk,
+                   r64 = (mt * (N / 64u) + nblk - 1u) / nblk;
+    const float* w = spwg_wsplit(a);
+    if (a.cout % 128u == 0 && 20u * r128 <= 13u * r64) sp_wg_gemm<128, true, 0, false, true>(M, N, 2u * a.cin, a.x, w, ep, slice, nblk);
+    else sp_wg_gemm<64, true, 0, false, true>(M, N, 2u * a.cin, a.x, w, ep, slice, nblk);
 }
 __device__ __forceinline__ void sp_wg_run(const SpConvArgs& a, unsigned slice, unsigned nblk) {
     const unsigned M = a.batch * a.out_rows;
@@ -3528,6 +3564,13 @@ __device__ __forceinline__ unsigned sp_w_conv_width(const PlowDevInst* in, const
 /* The wgmma arm of Conv1dF32 (flags bit 17), dispatched from the interpreter's inlined body:
  * wgmma in a called function is serialized (ptxas C7510). False when the op does not qualify. */
 __device__ __forceinline__ bool sp_wg_conv1d(const PlowDevInst* in, void* const* T, unsigned slice, unsigned nblk) {
+    if (in->op == PLOW_DOP_CONV_TRANSPOSE1D_F32) {
+        if (!sp_op_on(PLOW_DOP_CONV_TRANSPOSE1D_F32) || ((in->fj[2].u >> 17) & 3u) != 3u) return false;
+        SpConvArgs a;
+        if (!sp_conv_args(in, T, true, a) || !spg_ct_eligible(a)) return false;
+        sp_wg_run_ct(a, slice, nblk);
+        return true;
+    }
     if (!sp_op_on(PLOW_DOP_CONV1D_F32) || in->op != PLOW_DOP_CONV1D_F32 || !((in->fj[2].u >> 17) & 1u)) return false;
     SpConvArgs a;
     if (!sp_conv_args(in, T, false, a) || !spg_eligible(a)) return false;

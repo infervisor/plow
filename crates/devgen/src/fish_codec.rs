@@ -554,6 +554,7 @@ fn program_for(
         c.pad = 0;
         c.pad_after = Some(b.kernel - b.stride);
         c.len = len_in;
+        c.input_is_temp = true;
         cur = fused_conv(&mut p, fuse, splits, cur.output, cur.done, c)?;
         rows *= b.stride;
         for (j, &d) in b.dilations.iter().enumerate() {

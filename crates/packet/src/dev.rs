@@ -2184,7 +2184,10 @@ pub enum DevOp {
     /// residual`, summed over `s*stride + k = t + crop_before` within `o`'s group.
     /// `out_rows = (in_rows-1)*stride + kernel + output_padding - crop_before - crop_after`.
     /// `lengths`, activations, `alpha` and flags as [`DevOp::Conv1dF32`] (no pad mode); outputs
-    /// past item `b`'s `(L-1)*stride + kernel + output_padding - crops` are zero.
+    /// past item `b`'s `(L-1)*stride + kernel + output_padding - crops` are zero. Flag bits 17 | 18
+    /// (sm_90a): with phase-major weights (bit 15), `kernel == 2*stride`, one group, no output
+    /// padding, activations, alpha or residual, and channels % 64 == 0, one split-bf16 wgmma GEMM
+    /// over all phases (`[stride*out_channels][2*in_channels]`, its pre-split image appended).
     /// `t0=out t1=x t2=weight(f32|f16[in_channels,out_channels/groups,kernel]) t3=bias? t4=alpha?
     /// t5=residual? t6=lengths(u32[batch])?` ·
     /// `i0=batch i1=in_rows i2=in_channels i3=out_channels i4=kernel i5=stride

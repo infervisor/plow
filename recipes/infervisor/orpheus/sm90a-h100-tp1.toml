@@ -82,6 +82,10 @@ PLOW_EMIT_PACKED_PREFILL_SMALL_HD = "1"
 PLOW_NV_DENSE_TUNE = "1"
 # SNAC pointwise convs on split-bf16 warpgroup MMA (parity vs 3xTF32 rel-L2 1.5e-5): served c64
 # 78 -> 87, c128 94 -> 111 audio s/s, c128 p90 TTFA 2.6-3.0 -> 1.0-1.3 s; c1/c32 unchanged.
+# The flag also routes the four ConvT upsamplers to one merged-phase wgmma GEMM after an in-place
+# snake (tts-api-std 2026-10-19, A/B vs noise-epilogue build, same plowrt, 2 reps): codec b32.f8
+# 11.8 -> 6.4 ms; served c64 88 -> 100, c128 116 -> 142 audio s/s, c128 TTFA 610 -> 360 ms; c1
+# unchanged. PCM rel-L2 vs 3xTF32 3.4e-5; Whisper CER median 0.000 (n=80) both arms.
 PLOW_EMIT_SNAC_SPLIT_BF16 = "1"
 
 # Served flags (campaign serve/bench/gate). Scheduling follows the default `auto` objective: the

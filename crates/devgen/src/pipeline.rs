@@ -490,6 +490,34 @@ fn wgmma_weight_split_bytes(f32_bytes: u64, n: u32, k: u32) -> u64 {
 }
 
 impl Conv1dF32Stage<'_> {
+    /// A transposed conv the merged-phase wgmma path takes (flag bits 17 | 18; op_speech_f32.cuh
+    /// `spg_ct_eligible`).
+    pub fn convt_wgmma_ok(&self) -> bool {
+        self.wgmma
+            && self.split_bf16
+            && self.weight_tap_major
+            && !self.weight_f16
+            && self.groups == 1
+            && self.kernel == 2 * self.stride
+            && self.dilation_or_output_padding == 0
+            && self.input_activation == Activation::None
+            && self.output_activation == Activation::None
+            && self.alpha.is_none()
+            && self.residual.is_none()
+            && self.in_channels % 64 == 0
+            && self.out_channels % 64 == 0
+    }
+
+    /// `(n, k)` of the pre-split wgmma B operand: `[out][kernel * in]`, or a transposed conv's
+    /// merged phases `[stride * out][2 * in]`.
+    pub fn split_geometry(&self, transpose: bool) -> (u32, u32) {
+        if transpose {
+            (self.stride * self.out_channels, 2 * self.in_channels)
+        } else {
+            (self.out_channels, self.in_channels * self.kernel)
+        }
+    }
+
     /// Output rows per item, or `None` for an empty output.
     pub fn out_rows(&self, transpose: bool) -> Option<u32> {
         let (before, after) = (u64::from(self.pad_before), u64::from(self.pad_after));
@@ -1401,9 +1429,10 @@ impl StageProgram {
                 && !(stage.input_activation == Activation::Snake
                     && stage.output_activation == Activation::Snake
                     && stage.alpha.is_some()))
+            || (stage.weight_split && transpose && !stage.convt_wgmma_ok())
             || (stage.weight_split
-                && (transpose
-                    || stage.groups != 1
+                && !transpose
+                && (stage.groups != 1
                     || stage.weight_f16
                     || !(stage.wgmma && stage.split_bf16)
                     || !(stage.kernel == 1 || stage.weight_tap_major)))
@@ -1429,11 +1458,8 @@ impl StageProgram {
             product(&[stage.out_channels, stage.in_channels / stage.groups, taps])?
                 * if stage.weight_f16 { 2 } else { 4 };
         if stage.weight_split {
-            weight_bytes = wgmma_weight_split_bytes(
-                weight_bytes,
-                stage.out_channels,
-                stage.in_channels * stage.kernel,
-            );
+            let (n, k) = stage.split_geometry(transpose);
+            weight_bytes = wgmma_weight_split_bytes(weight_bytes, n, k);
         }
         let weight = self.resolve(stage.weight, weight_bytes, "convolution weight")?;
         let bias = match stage.bias {
@@ -2211,6 +2237,49 @@ fn repeated(n_cu: u32, blocks: u32) -> Vec<u32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn convt_wgmma_split_geometry() {
+        let mut s = Conv1dF32Stage {
+            output: TensorRef::Named("o"),
+            weight: TensorRef::Named("w"),
+            bias: None,
+            alpha: None,
+            residual: None,
+            lengths: None,
+            batch: 2,
+            in_rows: 33,
+            in_channels: 1024,
+            out_channels: 512,
+            kernel: 16,
+            stride: 8,
+            dilation_or_output_padding: 0,
+            groups: 1,
+            pad_before: 4,
+            pad_after: 4,
+            pad_mode: PadMode::Zero,
+            input_activation: Activation::None,
+            output_activation: Activation::None,
+            slope: 0.0,
+            weight_f16: false,
+            split_bf16: true,
+            weight_tap_major: true,
+            wgmma: true,
+            weight_split: true,
+            dual_alpha: false,
+        };
+        assert!(s.convt_wgmma_ok());
+        assert_eq!(s.split_geometry(true), (8 * 512, 2 * 1024));
+        assert_eq!(s.split_geometry(false), (512, 16 * 1024));
+        s.input_activation = Activation::Snake;
+        assert!(!s.convt_wgmma_ok());
+        s.input_activation = Activation::None;
+        s.out_channels = 96;
+        assert!(!s.convt_wgmma_ok());
+        s.out_channels = 512;
+        s.kernel = 8;
+        assert!(!s.convt_wgmma_ok());
+    }
 
     #[test]
     fn describes_backend_neutral_causal_pipeline() {
