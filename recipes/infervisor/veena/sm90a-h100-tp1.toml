@@ -76,6 +76,10 @@ PLOW_FUSE_KV_HNR = "1"
 # tuning (gemv_k8 + L2 prefetch, tensor-core decode scores, classic B=1 GEMVs below K 3840).
 PLOW_EMIT_PACKED_PREFILL_SMALL_HD = "1"
 PLOW_NV_DENSE_TUNE = "1"
+# SNAC pointwise convs on split-bf16 warpgroup MMA (tts-api-std 2026-10-19, A/B vs the b451c8c6 kit,
+# same plowrt, 2 reps): served c64 77 -> 85, c128 91-93 -> 109 audio s/s, c128 TTFA 1.1 -> 0.7 s;
+# c1/c32 unchanged. Whisper CER median 0.005 (n=80).
+PLOW_EMIT_SNAC_SPLIT_BF16 = "1"
 
 # Served flags (campaign serve/bench/gate). Scheduling follows the default `auto` objective: the
 # lookahead-1 decode pipeline (greedy c64/c128 +3-5%, c1 TPOT and CER unchanged), adaptive
