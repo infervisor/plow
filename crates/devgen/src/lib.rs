@@ -1892,6 +1892,13 @@ fn tiles(m: u32, n: u32) -> u32 {
 /// written by prefill and appended to by decode, and the 57 GiB of weights is not getting
 /// loaded twice.
 #[allow(dead_code)]
+/// Span-mode decode rows are declared only for FP8-KV packets; other KV formats refuse the knob.
+fn span_verify_on(fp8_kv: bool) -> bool {
+    let on = emit_config::active().span_verify;
+    assert!(!on || fp8_kv, "PLOW_EMIT_SPAN_VERIFY needs PLOW_FP8_KV");
+    on
+}
+
 struct Tn {
     ids: u32,
     encoder_overlay: u32,
@@ -1906,6 +1913,9 @@ struct Tn {
     speech_pos: u32,
     pos: u32,
     kvlen: u32,
+    // Span-mode decode (PLOW_EMIT_SPAN_VERIFY): per-row KV slot map [dbatch], slot | bit-31 NO_STORE.
+    rowslot: u32,
+    rowslot_rows: u32,
     cos_s: u32,
     sin_s: u32,
     cos_f: u32,
@@ -2279,6 +2289,12 @@ fn declare(
         pos: b.tensor("in.pos", ctx as u64 * I32),
         // BATCH>1 (serving pending #4): one KV length per sequence. dbatch==1 => I32, identical.
         kvlen: b.tensor("in.kvlen", dbatch as u64 * I32),
+        rowslot: if span_verify_on(fp8_kv) {
+            b.tensor("in.rowslot", dbatch as u64 * I32)
+        } else {
+            TENSOR_NONE
+        },
+        rowslot_rows: dbatch,
         cos_s: b.tensor_gen("in.cos_slide", cs_s.byte_len(), cs_s),
         sin_s: b.tensor_gen("in.sin_slide", sn_s.byte_len(), sn_s),
         cos_f: b.tensor_gen("in.cos_full", cs_f.byte_len(), cs_f),
@@ -5558,6 +5574,11 @@ fn emit_phase(
         // 3.01 us/op), so 30 layers is 0.090 ms of a 5.378 ms B=1 step.
         // t6 carries the fp8 per-row scale, so this needs bf16 KV; hn_split would put the two
         // on DIFFERENT CU sets, so it needs the default placement too.
+        let span_kv = decode && n.rowslot != TENSOR_NONE;
+        assert!(
+            !span_kv || (fp8_kv && gemv_family && !fuse_hnr && !shared),
+            "PLOW_EMIT_SPAN_VERIFY needs the FP8-KV GEMV decode family"
+        );
         let fuse_kv = decode
             && !fuse_hnr
             && !shared
@@ -5578,6 +5599,9 @@ fn emit_phase(
                 d.t[4] = sn;
                 d.t[5] = n.pos;
                 d.t[6] = n.kcs[l];
+                if span_kv {
+                    d.t[7] = n.rowslot;
+                }
                 d.i[0] = t;
                 d.i[1] = kvh;
                 d.i[2] = hd;
@@ -5632,6 +5656,9 @@ fn emit_phase(
                 d.t[1] = v_src;
                 d.t[5] = n.pos;
                 d.t[6] = n.vcs[l];
+                if span_kv {
+                    d.t[7] = n.rowslot;
+                }
                 d.i[0] = t;
                 d.i[1] = kvh;
                 d.i[2] = hd;
@@ -5684,22 +5711,28 @@ fn emit_phase(
                     })
                     .collect()
             };
+            // Span mode: rows of one sequence read each other's K/V rows written in this launch,
+            // so the K/V edges wait for every row's store (all heads' items, scales included).
+            let kv_edge = |producer: u32| {
+                if span_kv {
+                    Dep::Coarse(producer)
+                } else {
+                    Dep::Fine {
+                        producer,
+                        map: mk(true),
+                    }
+                }
+            };
             let mut deps = vec![
                 Dep::Fine {
                     producer: c_qn,
                     map: mk(false),
                 },
-                Dep::Fine {
-                    producer: c_kn,
-                    map: mk(true),
-                },
+                kv_edge(c_kn),
             ];
             // fuse_kv makes c_vn == c_kn: one producer, one edge (the K map is the V map).
             if c_vn != c_kn {
-                deps.push(Dep::Fine {
-                    producer: c_vn,
-                    map: mk(true),
-                });
+                deps.push(kv_edge(c_vn));
             }
             deps
         };
@@ -5842,6 +5875,12 @@ fn emit_phase(
                 // only for B>1 so the B=1 packet stays byte-identical (j[0] default 0 => no check).
                 if t > 1 {
                     d.j[0] = t * kvh * kvr;
+                }
+                if span_kv {
+                    // A row's slot is any engine slot, not a row of this rung.
+                    assert!(!dec_fused, "span mode has no merge-fold arm");
+                    d.j[0] = n.rowslot_rows * kvh * kvr;
+                    d.j[1] = n.rowslot;
                 }
                 if dec_fused {
                     assert!(

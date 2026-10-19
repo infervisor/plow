@@ -382,6 +382,12 @@ pub struct EmitConfig {
     #[arg(long, env = "PLOW_FUSE_KV_HNR", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
     pub fuse_kv_hnr: bool,
 
+    /// Speculative-decode verify on the decode rungs: declare `in.rowslot` (row -> KV slot map),
+    /// bind it on the FP8-KV store and flash-decode sites, and make flash wait on every row's K/V
+    /// store. Needs objects built with -DPLOW_NV_ROW_SLOT=1.
+    #[arg(long, env = "PLOW_EMIT_SPAN_VERIFY", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
+    pub span_verify: bool,
+
     /// Blocks for the one-row MoE combine (arms the all-block combine; 0/1 = today's single CTA).
     #[arg(long, env = "PLOW_MOE_COMBINE_BLOCKS")]
     pub moe_combine_blocks: Option<u32>,
@@ -1914,6 +1920,7 @@ impl EmitConfig {
             nv_fa_split_prefill: env_bool_default_true("PLOW_NV_FA_SPLIT_PREFILL"),
             hn_split: env_bool("PLOW_HN_SPLIT"),
             fuse_kv_hnr: env_bool("PLOW_FUSE_KV_HNR"),
+            span_verify: env_bool("PLOW_EMIT_SPAN_VERIFY"),
             moe_combine_blocks: env_u32("PLOW_MOE_COMBINE_BLOCKS"),
             fa_gf_full: env_u32("PLOW_FA_GF_FULL"),
             attention_decode_balance_gf: env_u32("PLOW_ATTENTION_DECODE_BALANCE_GF"),
