@@ -6835,7 +6835,7 @@ fn gpu_prefill_batched_pass(
             })
             .filter_map(|(i, c0, len)| {
                 // A share cut by the planner must still not split a media span.
-                let s = slots[i].as_ref()?;
+                let (s, _) = pack_row(slots, i)?;
                 if !s.mm.as_deref().is_some_and(|j| j.spans()) {
                     return Some((i, c0, len));
                 }

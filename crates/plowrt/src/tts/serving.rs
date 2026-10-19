@@ -725,6 +725,9 @@ async fn speech_with(
     if req.speed.is_some_and(|s| s != 1.0) {
         return bad("only speed 1.0 is supported", "speed");
     }
+    if req.language.is_some() {
+        return bad("this model has no language selection", "language");
+    }
     let tok = bundle.tokenizer();
     let voice = req.voice.clone();
     if !c.voices.is_empty() {
