@@ -11286,7 +11286,7 @@ fn emit_dense_gqa(
     let mut speech_ops = 0u64;
     if let Some(dir) = ecfg.tts_codec.as_deref().filter(|_| !block_mode) {
         let sites = whole_graph_audio_sites().0;
-        let (model, section) = codec::lower_snac(dir, n_cu, m.target, sites)
+        let (model, section) = codec::lower_snac(dir, n_cu, m.target, sites, ecfg.snac_split_bf16)
             .unwrap_or_else(|error| panic!("codec packet: {error}"));
         let path = std::path::Path::new(&out).with_file_name(tts::CODEC_PACKET);
         speech_ops |= manifest::speech_ops(&model);

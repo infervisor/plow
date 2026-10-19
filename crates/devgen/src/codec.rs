@@ -11,6 +11,7 @@
 //! rewrite's fused sites over the SNAC graph (`nn_graph` `snac`, `rewrite` conv1d rules), subject
 //! to [`ConvFusions`]' cost model; without sites they are the hand choices below.
 
+use std::cell::RefCell;
 use std::collections::BTreeMap;
 
 use crate::pipeline::{
@@ -134,6 +135,7 @@ pub fn lower_snac(
     n_cu: u32,
     target: u32,
     sites: Option<&RewriteSites>,
+    split_bf16: bool,
 ) -> Result<(packet::devbuild::Model, packet::devbuild::SectionData), String> {
     let cfg = SnacConfig::parse(
         &serde_json::from_slice(
@@ -216,6 +218,8 @@ pub fn lower_snac(
         input_shape: vec![u64::from(max_rows), u64::from(cfg.frame_codes)],
     };
 
+    // Pointwise convs on split-bf16 warpgroup MMA (`PLOW_EMIT_SNAC_SPLIT_BF16`): weight -> (cout, cin * k).
+    let splits = split_bf16.then(|| RefCell::new(BTreeMap::new()));
     let mut roles = BTreeMap::new();
     for &(batch, frames) in SNAC_CAPACITIES {
         let program = prefix.model.progs.len();
@@ -229,6 +233,7 @@ pub fn lower_snac(
             seed,
             &lengths,
             &per_level,
+            splits.as_ref(),
         )?;
         roles.insert(format!("decode.b{batch}.f{frames}"), program as u32);
     }
@@ -246,6 +251,9 @@ pub fn lower_snac(
                 if b.cin % 4 == 0 && b.cout >= 16 {
                     bytes = to_phase_major(&bytes, b.cin, b.cout, b.kernel, b.stride);
                 }
+            }
+            if let Some((n, k)) = splits.as_ref().and_then(|s| s.borrow().get(name).copied()) {
+                bytes = crate::pipeline::wgmma_weight_split(&bytes, n, k);
             }
             if dtype != "F32" || bytes.len() as u64 != tensor.bytes {
                 return Err(format!(
@@ -272,6 +280,7 @@ fn snac_program(
     seed: u32,
     lengths: &[u32],
     per_level: &[u32],
+    splits: Option<&RefCell<BTreeMap<String, (u32, u32)>>>,
 ) -> Result<PacketPrefix, String> {
     let latent = cfg.latent_dim;
     let t0 = frames * cfg.vq_strides[0];
@@ -371,11 +380,12 @@ fn snac_program(
     );
     c.groups = latent;
     c.pad = 3;
-    let e = fused_conv(&mut p, fuse, z_h, last.unwrap(), c)?;
+    let e = fused_conv(&mut p, fuse, splits, z_h, last.unwrap(), c)?;
     let pre_out = cfg.blocks.first().map_or(latent, |b| b.cin);
     let mut x = fused_conv(
         &mut p,
         fuse,
+        splits,
         e.output,
         e.done,
         conv(
@@ -407,7 +417,7 @@ fn snac_program(
         c.dilation = b.output_padding;
         c.pad = b.padding;
         c.len = lengths[i];
-        let up = fused_conv(&mut p, fuse, x.output, x.done, c)?;
+        let up = fused_conv(&mut p, fuse, splits, x.output, x.done, c)?;
         rows = (rows - 1) * b.stride + b.kernel + b.output_padding - 2 * b.padding;
         let len = lengths[i + 1];
         // Noise injection: x + n[b, t] * (x @ Wn^T), n ~ N(0, 1) keyed (seed, block, item, row).
@@ -445,7 +455,7 @@ fn snac_program(
             1,
         );
         c.len = len;
-        let proj = fused_conv(&mut p, fuse, up.output, up.done, c)?;
+        let proj = fused_conv(&mut p, fuse, splits, up.output, up.done, c)?;
         let scaled = p.binary_f32(
             proj.output,
             noise.output,
@@ -495,7 +505,7 @@ fn snac_program(
             c.groups = b.cout;
             c.pad = 3 * d;
             c.len = len;
-            let h = fused_conv(&mut p, fuse, x.output, x.done, c)?;
+            let h = fused_conv(&mut p, fuse, splits, x.output, x.done, c)?;
             let target = if x.output == a_handle {
                 "act.codec.b"
             } else {
@@ -515,7 +525,7 @@ fn snac_program(
             c.residual = Some(x.output);
             c.len = len;
             c.input_is_temp = true;
-            x = fused_conv(&mut p, fuse, h.output, h.done, c)?;
+            x = fused_conv(&mut p, fuse, splits, h.output, h.done, c)?;
         }
     }
     let last_c = cfg.blocks.last().map_or(latent, |b| b.cout);
@@ -533,7 +543,7 @@ fn snac_program(
     c.act_out = Activation::Tanh;
     c.pad = 3;
     c.len = lengths[cfg.blocks.len()];
-    let out = fused_conv(&mut p, fuse, x.output, x.done, c)?;
+    let out = fused_conv(&mut p, fuse, splits, x.output, x.done, c)?;
     debug_assert_eq!(out.output, p_handle(&p, "act.codec.pcm"));
     Ok(p.finish(batch * frames))
 }
@@ -605,6 +615,7 @@ struct Conv {
 fn fused_conv(
     p: &mut StageProgram,
     fuse: ConvFusions<'_>,
+    splits: Option<&RefCell<BTreeMap<String, (u32, u32)>>>,
     x: u32,
     dep: u32,
     c: Conv,
@@ -637,6 +648,15 @@ fn fused_conv(
         )?;
         (x, dep) = (e.output, e.done);
     }
+    // S3Gen's rule: ungrouped pointwise convs carry the pre-split wgmma B operand.
+    let split = splits.is_some_and(|s| {
+        let on = !c.transpose && c.groups == 1 && c.cin % 4 == 0 && c.kernel == 1;
+        if on {
+            let name = c.weight.trim_start_matches("w.").to_string();
+            s.borrow_mut().insert(name, (c.cout, c.cin * c.kernel));
+        }
+        on
+    });
     let e = p.conv1d_f32(
         x,
         c.transpose,
@@ -671,10 +691,10 @@ fn fused_conv(
             },
             slope: 0.0,
             weight_f16: false,
-            split_bf16: false,
+            split_bf16: splits.is_some() && !c.transpose,
             weight_tap_major: phase_major(&c),
-            wgmma: false,
-            weight_split: false,
+            wgmma: splits.is_some(),
+            weight_split: split,
         },
     )?;
     let out_rows = if c.transpose {
