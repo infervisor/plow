@@ -85,6 +85,7 @@ mod gemv_decode_role;
 pub mod manifest;
 pub mod mm;
 pub mod modular;
+mod mtp;
 mod mxfp4_moe_role;
 pub mod pipeline;
 mod projection_rewrite;
@@ -2032,6 +2033,8 @@ struct Tn {
     xqi: u32,
     asi: u32,
     lw: Vec<LW>,
+    /// Speculative draft tensors (`PLOW_EMIT_SPEC`).
+    mtp: Option<mtp::Tensors>,
 }
 struct LW {
     bq: u32,
@@ -2634,6 +2637,7 @@ fn declare(
         kcs: Vec::new(),
         vcs: Vec::new(),
         lw: Vec::new(),
+        mtp: None,
     };
     let mut t = t;
     for l in 0..c.layers {
@@ -3039,6 +3043,9 @@ fn declare(
             edn8: ex4[2],
             edns: ex4[3],
         });
+    }
+    if emit_config::active().emit_spec {
+        t.mtp = Some(mtp::declare(b, c, dbatch, t.rowslot != TENSOR_NONE));
     }
     t
 }
@@ -10640,6 +10647,7 @@ fn emit_dense_gqa(
         "decode rungs {rungs:?} are ambiguous after prefill buckets {tlist:?}: \
          packet::devbuild::decode_rung_lo must preserve the emitted phase boundary"
     );
+    let mut rung_progs = Vec::new();
     for (ri, &rb) in rungs.iter().enumerate() {
         let mut bd = Builder::new(n_cu);
         bd.set_fuse_materialized_residual_inputs(ecfg.fuse_residual_input);
@@ -10663,6 +10671,7 @@ fn emit_dense_gqa(
             emitter.emit_decode(&mut bd, rb, dmode, sink)
         });
         shared_tail_marks.push(bd.shared_tail_mark());
+        rung_progs.push((rb, progs.len()));
         progs.push(bd.finish());
         tlist.push(rb);
     }
@@ -10965,6 +10974,9 @@ fn emit_dense_gqa(
         let manifest =
             modular::build_modular_manifest(c.layers, modular_progs, &buckets, &[dbatch]);
         sections.push(modular::modular_pipeline_section(&manifest));
+    }
+    if let Some(t) = &emitter.tn.mtp {
+        sections.extend(mtp::sections(&dir, &c, &emitter.tn, t, &m, &rung_progs));
     }
     if let Some(ref path) = embed_cubin {
         sections.push(packet::devbuild::SectionData {

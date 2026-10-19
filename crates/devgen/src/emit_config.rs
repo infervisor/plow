@@ -388,6 +388,15 @@ pub struct EmitConfig {
     #[arg(long, env = "PLOW_EMIT_SPAN_VERIFY", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
     pub span_verify: bool,
 
+    /// Speculative-decode draft programs (Gemma-4 assistant) in the packet; needs
+    /// PLOW_SPEC_DRAFT_DIR and the re-keyed `model-mtp.safetensors` beside the target shards.
+    #[arg(long, env = "PLOW_EMIT_SPEC", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
+    pub emit_spec: bool,
+
+    /// The draft model's HF directory (config.json, tokenizer.json, safetensors) for PLOW_EMIT_SPEC.
+    #[arg(long, env = "PLOW_SPEC_DRAFT_DIR")]
+    pub spec_draft_dir: Option<String>,
+
     /// Blocks for the one-row MoE combine (arms the all-block combine; 0/1 = today's single CTA).
     #[arg(long, env = "PLOW_MOE_COMBINE_BLOCKS")]
     pub moe_combine_blocks: Option<u32>,
@@ -1921,6 +1930,8 @@ impl EmitConfig {
             hn_split: env_bool("PLOW_HN_SPLIT"),
             fuse_kv_hnr: env_bool("PLOW_FUSE_KV_HNR"),
             span_verify: env_bool("PLOW_EMIT_SPAN_VERIFY"),
+            emit_spec: env_bool("PLOW_EMIT_SPEC"),
+            spec_draft_dir: env_str("PLOW_SPEC_DRAFT_DIR"),
             moe_combine_blocks: env_u32("PLOW_MOE_COMBINE_BLOCKS"),
             fa_gf_full: env_u32("PLOW_FA_GF_FULL"),
             attention_decode_balance_gf: env_u32("PLOW_ATTENTION_DECODE_BALANCE_GF"),
