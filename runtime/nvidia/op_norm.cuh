@@ -1344,6 +1344,11 @@ static __device__ void d_headnorm_rope_fp8(uint8_t* __restrict__ out, float* __r
             t = w >> nsh; hh = w & (nhead - 1u);
         } else { t = w / nhead; hh = w % nhead; }
         const size_t ibase = ((size_t)t * nhead + hh) * hd;
+#if PLOW_NV_ROW_SLOT
+        /* Span-mode decode (speculative verify): a negative map entry (bit 31) is a NO_STORE padding
+         * row. Skipped before the address is formed, whether or not MASKED_PADDING is compiled. */
+        if (pfslot && pfslot[t] < 0) continue;
+#endif
         /* KV write (out_stride!=0 always here): per-row slot map (batched prefill), per-batch ring
          * when n_batch_kv!=0 (pos[t]-derived row; ==1 is the patch-free B=1 decode ring), else
          * legacy single-ring — EXACTLY d_headnorm_rope's obase. */
