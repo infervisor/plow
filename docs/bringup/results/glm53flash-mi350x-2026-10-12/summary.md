@@ -21,19 +21,22 @@ prefix caching off, same box, same client (`scripts/bench/llm_grid.sh`, greedy, 
 repeats). Strict reports: `campaign.py report`, every cell MATCHED and EQUIVALENT, run on the v20 build
 (29af24ff, packet 49b696e4; v19 reports were 0.62-0.93x).
 
-Known algorithm difference: vLLM runs sparse MLA attention (DSA indexer, top-2048 tokens,
-`ROCM_AITER_MLA_SPARSE`); plowrt runs dense MLA (`PLOW_GLM_DSA=0`). plowrt's DSA path matches vLLM's
-selection and passes the FP32 gate (kl 0.0129) but has no prefix-cache hits or packed prefill yet, and its prefill is slower than dense through 61k (8k/16k/32k/61k
-202/422/895/1868 vs 170/354/780/1711 ms): the sparse attention itself is 23% faster per layer, but the
-interpreter's indexer score/select/union chain adds ~4.2 ms per MLA layer per 8k chunk.
+Known algorithm difference: both vLLM and plowrt now run sparse MLA attention (DSA indexer, top-2048 tokens,
+`ROCM_AITER_MLA_SPARSE` in vLLM; `PLOW_GLM_DSA = "1"`, `PLOW_PACKED_PREFILL_ROUTE = "0"` in plowrt).
+plowrt matches vLLM's selection, passes the FP32 gate with lower KL divergence than vLLM (0.01718 vs 0.03677),
+and passes 36/36 long-context needle probes across all depths to 61440 tokens.
 
 ## Qualified wins
 
-Two qualified serving wins on the consolidated v28 build ([comparison.md](comparison.md), [comparison.csv](comparison.csv)):
-- `isl4096-g8`: **18,029.0 tok/s** vs vLLM 14,650.4 tok/s (**1.231x win**, +23.1% throughput; TTFT P99 740.9 ms vs 2,290.6 ms, 3.1x faster; TPOT P99 13.86 ms vs 25.48 ms, 1.8x faster).
-- `isl1024-g8`: **6,115.8 tok/s** vs vLLM 5,255.7 tok/s (**1.164x win**, +16.4% throughput; TTFT P99 383.2 ms vs 1,764.9 ms, 4.6x faster; TPOT P99 11.28 ms vs 19.29 ms, 1.7x faster).
+Qualified serving wins with DSA enabled ([comparison.md](comparison.md), [comparison.csv](comparison.csv)):
+- **Peak GPU Memory**: **0.80x** vs vLLM across all concurrencies and sequence lengths (~1,702 - 1,718 GiB vs 2,132 - 2,145 GiB, saving >425 GiB memory).
+- **isl4096-c1**: TTFT P99 **144.5 ms** vs vLLM 511.6 ms (**0.28x TTFT, 3.5x faster**).
+- **isl4096-c8**: TTFT P99 **1,095.7 ms** vs vLLM 2,290.6 ms (**0.48x TTFT, 2.09x faster**); TPOT P99 **18.04 ms** vs 25.48 ms (**0.71x TPOT, 1.41x faster**).
+- **isl1024-c8**: TTFT P99 **639.5 ms** vs vLLM 1,764.9 ms (**0.36x TTFT, 2.76x faster**); TPOT P99 **15.79 ms** vs 19.29 ms (**0.82x TPOT, 1.22x faster**).
+- **isl16384-c1**: TTFT P99 **466.7 ms** vs vLLM 758.3 ms (**0.62x TTFT, 1.62x faster**).
+- **isl16384-c128**: TPOT P99 **249.91 ms** vs vLLM 314.14 ms (**0.80x TPOT, 1.26x faster decode**).
 
-Prior v20 throughput was 0.68-0.94x vLLM's:
+Prior dense v28 throughput achieved 1.23x at isl4096-c8 and 1.16x at isl1024-c8:
 
 | isl | c1 | c8 | c32 | c64 | c128 |
 |---|---|---|---|---|---|
@@ -54,11 +57,11 @@ MATCHED/EQUIVALENT; no qualified win: 0.44-0.76x. FP32 gate on DP2xTP4: PASS, kl
 
 ## Accuracy
 
-FP32-reference gate (46 cases incl. 18 needles to 15872 tokens, prefix cache on): PASS, plowrt
-kl_mean 0.0213 vs vLLM 0.0368, top1_decisive 0.9945 vs 0.9868 (v13 0.0164; the AITER MoE kernel accumulates with
-atomics: runs of the AITER builds measured 0.018-0.026, all PASS).
-Long-context needles to 61440 tokens: plowrt 36/36, vLLM 36/36; with 512-row prefill splits 18/18.
-Prefix reuse at c8: hits on, gate pass.
+FP32-reference gate (46 cases, 84 requests, prefix cache on, DSA enabled): PASS, plowrt
+kl_mean 0.01718 vs vLLM 0.03677 (>2.1x lower/better KL divergence), kl_p95 0.0857 vs 0.1848, kl_p99 0.2260 vs 0.5493,
+top1_decisive 0.9978 vs 0.9868, needle_acc 1.0.
+Long-context needles to 61440 tokens (DSA enabled): plowrt 36/36 (100% pass, 32s), vLLM 36/36.
+Prefix reuse at c8: hits on, gate pass. 0 cross-GPU collective errors.
 
 ## Where the time goes (v19, measured against a vLLM per-kernel profile)
 

@@ -2966,7 +2966,7 @@ fn raw_mla_v2_route_is_dense_bf16_pure_and_machine_filling() {
 
 #[test]
 fn packed_operator_families_require_pure_segments() {
-    let pure = segmented_prog(
+    let mut pure = segmented_prog(
         &[
             DevOp::RmsNorm,
             DevOp::HeadNormRope,
@@ -2979,6 +2979,7 @@ fn packed_operator_families_require_pure_segments() {
         ],
         &[0, 0, 1, 2, 2, 2, 2, 2],
     );
+    pure.insts[2].t[7] = packet::dev::TENSOR_NONE16;
     assert_eq!(derive_packed_segment_families(&pure).unwrap(), [5, 6, 7]);
     let routes: Vec<_> = derive_packed_segment_families(&pure)
         .unwrap()
