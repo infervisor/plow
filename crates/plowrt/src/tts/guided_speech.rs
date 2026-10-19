@@ -986,6 +986,7 @@ impl GuidedSpeech {
                     } else {
                         0
                     },
+                    depth: None,
                 })),
                 prefix: None,
                 tenant: None,

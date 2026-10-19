@@ -2799,6 +2799,8 @@ pub struct GpuEngine {
     slot_generations: Vec<u32>,
     /// Fish S2 depth stage ([`fish_depth`]); `None` for every other packet.
     fish: Option<fish_depth::FishDepth>,
+    /// The serial prefill's last chunk's terminal row (its lm_head row of `act.hn`).
+    pf_terminal_row: u32,
 }
 
 /// Full model-load wall timeline (`PLOW_LOAD_PROFILE=1`).
@@ -7371,9 +7373,11 @@ impl GpuEngine {
                 .unwrap_or(0),
             slot_generations: vec![0; batch],
             fish: None,
+            pf_terminal_row: 0,
         };
         engine.mm_spans = engine.handle_of("act.mm_span").is_some();
         engine.packed_terminal = packed_terminal::PackedTerminal::load(&engine)?;
+        engine.fish = fish_depth::FishDepth::load_if_present(&engine, assets_dir)?;
         engine.shared_tail =
             shared_tail::SharedTail::load(&engine, &blob, kv_shared_tail_metadata.as_ref())?;
         engine.token_batch = token_batch::CudaTokenBatch::load(&engine);
@@ -11614,6 +11618,7 @@ impl GpuEngine {
         }
         // Patch this bucket's instruction stream for the chunk, then enqueue
         // the covering window as an async H2D on the engine stream.
+        self.pf_terminal_row = (real - 1) as u32;
         {
             let b = &mut self.prefill[bi];
             for &ix in &b.rope_sites {

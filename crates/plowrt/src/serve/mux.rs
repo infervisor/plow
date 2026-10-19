@@ -523,6 +523,7 @@ type HeldToken = (
     u32,
     String,
     Option<Box<crate::text::logprobs::TokenLogprobs>>,
+    Option<Box<[u32]>>,
 );
 
 /// A request whose prefill splices host rows over prompt positions (`EmbedOverlayBf16`: the
@@ -550,6 +551,50 @@ pub struct SpeechJob {
     /// A voice turn's stream: tokens its first audio renders from. Its ticks are the turn's first
     /// audio until then and stream decode after, so the first render outranks them (0: unknown).
     pub first_tokens: usize,
+    /// A depth-stage packet (`tts.depth_lm.v1`): each step's token comes from the packet's depth
+    /// stage, which also samples the frame's codes ([`StreamChunk::Token::frame`]).
+    pub depth: Option<DepthJob>,
+}
+
+/// One request's depth-stage sampling, and its class -> token map.
+#[derive(Clone, Copy, Debug)]
+pub struct DepthJob {
+    pub seed: u64,
+    pub temperature: f32,
+    pub top_p: f32,
+    pub top_k: u32,
+    pub ras_temperature: f32,
+    pub ras_top_p: f32,
+    /// Token of class `c < stop_class`: `semantic_base + c`; the stop class emits `stop_token`.
+    pub semantic_base: u32,
+    pub stop_class: u32,
+    pub stop_token: u32,
+}
+
+impl DepthJob {
+    #[cfg(feature = "cuda")]
+    fn row(&self, slot: usize, hidden_row: u32, step: usize) -> crate::exec::gpu::FishRow {
+        crate::exec::gpu::FishRow {
+            slot,
+            hidden_row,
+            seed: self.seed,
+            step: step as u32,
+            temperature: self.temperature,
+            top_p: self.top_p,
+            top_k: self.top_k,
+            ras_temperature: self.ras_temperature,
+            ras_top_p: self.ras_top_p,
+        }
+    }
+
+    /// The step's token and, unless it stops, the frame's codes.
+    fn token(&self, codes: &[u32]) -> (u32, Option<Box<[u32]>>) {
+        if codes[0] >= self.stop_class {
+            (self.stop_token, None)
+        } else {
+            (self.semantic_base + codes[0], Some(codes.into()))
+        }
+    }
 }
 
 /// The unconditional member of a CFG pair and the guided sampling chain.
@@ -977,6 +1022,8 @@ struct Slot {
     resume: usize,
     /// The next token's OpenAI logprobs, set by the sampler when the request asked for them.
     lp: Option<Box<crate::text::logprobs::TokenLogprobs>>,
+    /// The next token's frame codes (depth-stage packets).
+    frame: Option<Box<[u32]>>,
     /// Emitted tokens the engine's device repetition-penalty history for this slot counts
     /// (`usize::MAX`: unknown, reseeded before the next device draw).
     #[cfg_attr(not(feature = "cuda"), allow(dead_code))]
@@ -2892,6 +2939,7 @@ fn admit_session(
         held_finish: None,
         parked_at: None,
         lp: None,
+        frame: None,
         prefix: job.opts.prefix,
         mm: job.opts.mm,
     });
@@ -3970,6 +4018,10 @@ fn run_one_tick(
                                 let t_emit =
                                     host_engine_call(t_call, feeds.len(), tokens_this_tick);
                                 decode_progress = completed_decode(&feeds, 1);
+                                if let Err(err) = gpu_depth_frames(&mut *e, &feeds, &mut slots, &mut toks) {
+                                    note_fault(&mut tick_fault, &err);
+                                    fail_feeds(&mut slots, &feeds, &arena, &err);
+                                }
                                 let cfg_drawn = if cfg_dev {
                                     gpu_cfg_advance(&feeds, &mut slots, 1);
                                     true
@@ -7282,6 +7334,15 @@ fn gpu_prefill_advance(
     if let Some(base) = slot.speech.as_ref().and_then(|s| s.pos_base) {
         e.write_tensor_ordered("in.pos_base", (slot_idx * 4) as u64, &base.to_le_bytes())?;
     }
+    if let Some(job) = slot.speech.as_ref().and_then(|s| s.depth) {
+        e.fish_reset_slot(slot_idx)?;
+        e.fish_logits_to_slot(slot_idx)?;
+        let mut codes = Vec::new();
+        e.fish_depth_step(&[job.row(slot_idx, e.prefill_terminal_row(), 0)], &mut codes)?;
+        let (tok, frame) = job.token(&codes);
+        slot.frame = frame;
+        return Ok(Some(tok));
+    }
     if let Some(run) = slot.cfg.as_mut() {
         e.logits_row(0, &mut run.cond)?;
         return Ok(Some(cfg_draw(slot)));
@@ -7794,6 +7855,46 @@ fn greedy_device_logprobs(
     Ok(Some(stats_logprobs(&out, k as usize, req.raw_logits)))
 }
 
+/// Depth-stage packets: sample every fed depth slot's frame after the backbone step (decode row
+/// = slot) and put its token in `toks`, its codes on the slot.
+#[cfg(feature = "cuda")]
+fn gpu_depth_frames(
+    e: &mut crate::exec::gpu::GpuEngine,
+    feeds: &[(usize, u32)],
+    slots: &mut [Option<Slot>],
+    toks: &mut [u32],
+) -> crate::Result<()> {
+    let rows: Vec<(usize, DepthJob)> = feeds
+        .iter()
+        .enumerate()
+        .filter_map(|(k, &(i, _))| {
+            let s = slots[i].as_ref()?;
+            Some((k, s.speech.as_ref()?.depth?))
+        })
+        .collect();
+    if rows.is_empty() {
+        return Ok(());
+    }
+    let fish: Vec<_> = rows
+        .iter()
+        .map(|&(k, job)| {
+            let i = feeds[k].0;
+            job.row(i, i as u32, slots[i].as_ref().map_or(0, |s| s.step))
+        })
+        .collect();
+    let mut codes = Vec::new();
+    e.fish_depth_step(&fish, &mut codes)?;
+    let n = codes.len() / rows.len();
+    for (r, &(k, job)) in rows.iter().enumerate() {
+        let (tok, frame) = job.token(&codes[r * n..(r + 1) * n]);
+        toks[k] = tok;
+        if let Some(slot) = slots[feeds[k].0].as_mut() {
+            slot.frame = frame;
+        }
+    }
+    Ok(())
+}
+
 /// Draw every fed CFG owner's token from ONE download of the step's logits rows (instead of two
 /// synchronous row reads per pair) into its `toks` entry. Returns whether any was drawn.
 #[cfg(feature = "cuda")]
@@ -8190,12 +8291,12 @@ fn handle_produced_token(
     };
     // A stop token's chunk carries only bytes released by the end of the stream.
     if !stop_token || !delta.is_empty() {
-        let (id, lp) = if stop_token {
-            (crate::serve::stream::TEXT_ONLY, None)
+        let (id, lp, frame) = if stop_token {
+            (crate::serve::stream::TEXT_ONLY, None, None)
         } else {
-            (token, slot.lp.take())
+            (token, slot.lp.take(), slot.frame.take())
         };
-        if send_or_hold(slot, (id, delta, lp)) {
+        if send_or_hold(slot, (id, delta, lp, frame)) {
             if let Some(taken) = slot_opt.take() {
                 release_kv(arena, taken.kv);
             }
@@ -8241,14 +8342,19 @@ fn handle_produced_token(
 /// Send one token chunk, or hold it and park the slot while the consumer is behind or earlier
 /// chunks still wait; one channel entry stays free for the terminal. True when the consumer is
 /// gone.
-fn send_or_hold(slot: &mut Slot, (id, text, logprobs): HeldToken) -> bool {
+fn send_or_hold(slot: &mut Slot, (id, text, logprobs, frame): HeldToken) -> bool {
     if slot.parked_at.is_none() && slot.respond.capacity() > 1 {
         return slot
             .respond
-            .try_send(StreamChunk::Token { id, text, logprobs })
+            .try_send(StreamChunk::Token {
+                id,
+                text,
+                logprobs,
+                frame,
+            })
             .is_err();
     }
-    slot.held.push((id, text, logprobs));
+    slot.held.push((id, text, logprobs, frame));
     slot.parked_at.get_or_insert_with(Instant::now);
     false
 }
@@ -8274,10 +8380,15 @@ fn flush_parked(slot_opt: &mut Option<Slot>, arena: &Option<SharedKvState>) -> b
         .capacity()
         .saturating_sub(1)
         .min(slot.held.len());
-    for (id, text, logprobs) in slot.held.drain(..room) {
+    for (id, text, logprobs, frame) in slot.held.drain(..room) {
         let _ = slot
             .respond
-            .try_send(StreamChunk::Token { id, text, logprobs });
+            .try_send(StreamChunk::Token {
+                id,
+                text,
+                logprobs,
+                frame,
+            });
     }
     // PARK_TIMEOUT bounds a consumer that stopped reading, not one that reads slowly.
     if room > 0 && !slot.held.is_empty() {
@@ -8458,6 +8569,7 @@ pub(crate) fn scripted_mux(
                         id: 7,
                         text,
                         logprobs,
+                        frame: None,
                     })
                     .await
                     .is_err()
@@ -10256,6 +10368,7 @@ mod tests {
                 session: None,
                 resume: 0,
                 lp: None,
+        frame: None,
                 prefix: None,
             }),
             rx,

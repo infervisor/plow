@@ -543,7 +543,7 @@ pub fn speech_model(
             tracing::info!(pipeline = %contract.pipeline, sample_rate = contract.sample_rate, "tts: speech pipeline bound");
             let realtime = super::realtime::RealTime::new(
                 contract.frame_samples as f64 / f64::from(contract.sample_rate),
-                contract.frame_codes,
+                contract.tokens_per_frame(),
             );
             Some(Arc::new(SpeechModel {
                 contract,
@@ -858,7 +858,7 @@ async fn speech_with(
         chars: segs.iter().map(|s| s.chars).collect(),
         budget: segs
             .iter()
-            .map(|s| s.gen.max_tokens / c.frame_codes)
+            .map(|s| s.gen.max_tokens / c.tokens_per_frame())
             .collect(),
     };
     let ticket = match model.realtime.admit(need).await {
@@ -875,7 +875,7 @@ async fn speech_with(
     let opts = crate::serve::mux::JobOpts {
         class,
         raw_tokens: true,
-        speech: None,
+        speech: maker.speech(&first),
         session: ids.session.as_ref().and_then(|_| {
             ids.ticket(
                 crate::serve::session::row_keys(&first.prompt_ids, &[], &[]),
@@ -1084,12 +1084,45 @@ impl SegmentMaker {
         gen.params.top_k = self.top_k;
         gen.seed = Some(self.seed.wrapping_add(k as u64));
         gen.stop_token_ids = c.stops.clone();
+        if c.depth {
+            // The depth stage samples the frame; the backbone's own draw is discarded.
+            gen.params = Default::default();
+            gen.params.temperature = 0.0;
+        }
         Segment {
             text: text.to_owned(),
             prompt_ids,
             gen,
             chars: text.chars().count(),
         }
+    }
+}
+
+impl SegmentMaker {
+    /// A depth-stage packet's per-segment sampling (`None` for codec-token packets).
+    fn speech(&self, s: &Segment) -> Option<Box<crate::serve::mux::SpeechJob>> {
+        let c = &self.contract;
+        c.depth.then(|| {
+            // The reference keeps temperature and top-p as bf16 tensors (0.7 -> 0.69921875).
+            let bf16 = |x: f32| {
+                let b = x.to_bits();
+                f32::from_bits((b + 0x7fff + ((b >> 16) & 1)) & 0xffff_0000)
+            };
+            Box::new(crate::serve::mux::SpeechJob {
+                depth: Some(crate::serve::mux::DepthJob {
+                    seed: s.gen.seed.unwrap_or(self.seed),
+                    temperature: bf16(self.temperature),
+                    top_p: bf16(self.top_p),
+                    top_k: if self.top_k == 0 { c.top_k } else { self.top_k } as u32,
+                    ras_temperature: bf16(1.0),
+                    ras_top_p: bf16(0.9),
+                    semantic_base: c.audio_token_base,
+                    stop_class: c.codebook,
+                    stop_token: c.stops[0],
+                }),
+                ..Default::default()
+            })
+        })
     }
 }
 
@@ -1149,7 +1182,7 @@ impl Later {
         let opts = crate::serve::mux::JobOpts {
             class: self.class,
             raw_tokens: true,
-            speech: None,
+            speech: self.maker.speech(&s),
             session: None,
             turn: None,
             continuing: false,
@@ -1248,13 +1281,10 @@ async fn collect_codes(
     let (mut codes, mut n) = (Vec::new(), 0);
     while let Some(chunk) = rx.recv().await {
         match chunk {
-            StreamChunk::Token { id, .. } => {
+            StreamChunk::Token { id, frame, .. } => {
                 n += 1;
-                if let Some(code) = c.code_of(codes.len(), id) {
-                    codes.push(code);
-                    if codes.len() % c.frame_codes == 0 {
-                        ticket.frame();
-                    }
+                if c.push_codes(&mut codes, id, frame.as_deref()) {
+                    ticket.frame();
                 }
             }
             StreamChunk::Done { .. } => break,
@@ -1383,18 +1413,15 @@ async fn stream_task(
                     let (mut codes, mut frames) = (Vec::new(), 0);
                     loop {
                         match rx.recv().await {
-                            Some(StreamChunk::Token { id, .. }) => {
-                                if let Some(code) = c.code_of(codes.len(), id) {
-                                    codes.push(code);
-                                    if codes.len() % fc == 0 {
-                                        frames += 1;
-                                        lm.frame();
-                                        if ftx
-                                            .send(SegMsg::Frame(codes[codes.len() - fc..].to_vec()))
-                                            .is_err()
-                                        {
-                                            return;
-                                        }
+                            Some(StreamChunk::Token { id, frame, .. }) => {
+                                if c.push_codes(&mut codes, id, frame.as_deref()) {
+                                    frames += 1;
+                                    lm.frame();
+                                    if ftx
+                                        .send(SegMsg::Frame(codes[codes.len() - fc..].to_vec()))
+                                        .is_err()
+                                    {
+                                        return;
                                     }
                                 }
                                 if lm_cut.load(SeqCst) == tag {

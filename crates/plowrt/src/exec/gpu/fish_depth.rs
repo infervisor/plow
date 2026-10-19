@@ -59,6 +59,25 @@ fn reject(e: impl std::fmt::Display) -> RuntimeError {
 }
 
 impl FishDepth {
+    /// The packet's depth stage, `None` when it carries none.
+    pub(super) fn load_if_present(e: &GpuEngine, assets: &Path) -> Result<Option<Self>> {
+        let Some(pkt) = DevBlob::find_in_dir(assets)? else {
+            return Ok(None);
+        };
+        let raw = std::fs::read(&pkt).map_err(|source| RuntimeError::Io {
+            path: pkt.clone(),
+            source,
+        })?;
+        let blob = DevBlob::parse(&raw)?;
+        if blob
+            .reserved_metadata(&raw, plow_asset::fish_depth::SECTION)?
+            .is_none()
+        {
+            return Ok(None);
+        }
+        Self::load(e, assets).map(Some)
+    }
+
     fn load(e: &GpuEngine, assets: &Path) -> Result<Self> {
         let pkt = DevBlob::find_in_dir(assets)?
             .ok_or_else(|| reject(format!("no packet in {}", assets.display())))?;
@@ -255,6 +274,11 @@ impl GpuEngine {
             out.extend_from_slice(&codes[row.slot * k..row.slot * k + k]);
         }
         Ok(())
+    }
+
+    /// The row of `act.hn` holding the last serial prefill's terminal hidden.
+    pub fn prefill_terminal_row(&self) -> u32 {
+        self.pf_terminal_row
     }
 
     /// Write prompt frame codes (`[rows][codebooks]`, row = prompt position) before a prefill.

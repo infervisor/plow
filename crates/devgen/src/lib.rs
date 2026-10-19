@@ -10789,6 +10789,10 @@ fn emit_dense_gqa(
         );
     } else if let Some(name) = ecfg.tts_profile.as_deref().filter(|_| !block_mode) {
         let profile = tts::profile(name).unwrap_or_else(|e| panic!("{e}"));
+        assert!(
+            profile.depth == emitter.tn.fish.is_some(),
+            "tts profile {name}: a depth-stage profile needs a frame-embedding checkpoint, and back"
+        );
         sections.push(
             tts::speech_pipeline_section(
                 &m,
@@ -10808,7 +10812,7 @@ fn emit_dense_gqa(
                     },
                 },
                 profile,
-                c.out_vocab(),
+                c.vocab,
             )
             .unwrap_or_else(|error| panic!("speech packet pipeline: {error}")),
         );

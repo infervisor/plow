@@ -53,6 +53,11 @@ pub struct SpeechContract {
     pub top_p: f32,
     /// Default repetition penalty; 1.0 (none) on packets without one.
     pub repetition_penalty: f32,
+    /// Default top-k; 0 (none) on packets without one.
+    pub top_k: usize,
+    /// Frames come from the packet's depth stage: one LM token per frame (`audio_token_base +
+    /// class`), its `frame_codes` codes riding beside it (the stream chunk's `frame`).
+    pub depth: bool,
 }
 
 impl SpeechContract {
@@ -104,6 +109,8 @@ impl SpeechContract {
             temperature: f32p("sampling.temperature_f32")?,
             top_p: f32p("sampling.top_p_f32")?,
             repetition_penalty: f32p("sampling.repetition_penalty_f32").unwrap_or(1.0),
+            top_k: get("sampling.top_k").unwrap_or(0) as usize,
+            depth: get("frames.depth").unwrap_or(0) != 0,
         };
         if !c.prompt_template.contains("{input}") || !c.voice_token.contains("{voice}") {
             return Err(RuntimeError::Rejected(
@@ -145,13 +152,13 @@ impl SpeechContract {
 
     pub fn max_new_tokens(&self, input: &str) -> usize {
         let frames = (input.chars().count() as f32 * self.per_char_frames) as usize;
-        (frames * self.frame_codes + 21).min(self.max_new_tokens_cap)
+        (frames * self.tokens_per_frame() + 21).min(self.max_new_tokens_cap)
     }
 
     /// Longest input whose [`Self::max_new_tokens`] the cap does not clip; a longer one is spoken
     /// as [`segments`] of at most this many characters.
     pub fn segment_chars(&self) -> usize {
-        let frames = self.max_new_tokens_cap.saturating_sub(21) / self.frame_codes.max(1);
+        let frames = self.max_new_tokens_cap.saturating_sub(21) / self.tokens_per_frame();
         let fits = |c: usize| (c as f32 * self.per_char_frames) as usize <= frames;
         let mut c = (frames as f32 / self.per_char_frames) as usize;
         while c > 1 && !fits(c) {
@@ -192,10 +199,40 @@ impl SpeechContract {
             top_p: self.top_p,
             repetition_penalty: self.repetition_penalty,
             max_tokens: self.max_new_tokens_cap,
-            top_k: Some(0),
+            top_k: Some(self.top_k),
             cfg_weight: None,
             instructions: false,
             voice_cloning: false,
+        }
+    }
+
+    /// LM tokens per audio frame.
+    pub fn tokens_per_frame(&self) -> usize {
+        if self.depth {
+            1
+        } else {
+            self.frame_codes.max(1)
+        }
+    }
+
+    /// Append the codes LM token `id` (with its depth-stage `frame`) carries; true when they
+    /// complete a frame.
+    pub fn push_codes(&self, codes: &mut Vec<i32>, id: u32, frame: Option<&[u32]>) -> bool {
+        if self.depth {
+            return match frame {
+                Some(f) if f.len() == self.frame_codes => {
+                    codes.extend(f.iter().map(|&x| x as i32));
+                    true
+                }
+                _ => false,
+            };
+        }
+        match self.code_of(codes.len(), id) {
+            Some(code) => {
+                codes.push(code);
+                codes.len() % self.frame_codes == 0
+            }
+            None => false,
         }
     }
 

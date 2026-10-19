@@ -32,6 +32,11 @@ pub struct SpeechProfile {
     pub top_p: f32,
     /// Default repetition penalty (1.0 = none).
     pub repetition_penalty: f32,
+    /// Default top-k (0 = none).
+    pub top_k: u64,
+    /// Frames come from the packet's depth stage (`fish_depth.json`): each LM token is one frame
+    /// (`audio_token_base + class`) whose `frame_codes` codes ride beside it.
+    pub depth: bool,
 }
 
 /// maya-research/Veena (model card): [SOH] <spk_v> text [EOH] [SOA] [SOS] -> SNAC codes, stop on
@@ -55,6 +60,8 @@ pub const VEENA: SpeechProfile = SpeechProfile {
     temperature: 0.4,
     top_p: 0.9,
     repetition_penalty: 1.0,
+    top_k: 0,
+    depth: false,
 };
 
 /// canopylabs/orpheus-3b-0.1-ft (orpheus_tts `_format_prompt`): [SOH] BOS "voice: text" [EOT]
@@ -80,6 +87,34 @@ pub const ORPHEUS: SpeechProfile = SpeechProfile {
     // H100 c64, 214 requests: 1.0 ran 32 to the token cap (repetition loops, 5/81 clips CER > 0.3);
     // 1.1, 1.2 and 1.3 ran none, all clips CER <= 0.3.
     repetition_penalty: 1.1,
+    top_k: 0,
+    depth: false,
+};
+
+/// fishaudio/s2-pro (fish-speech `inference.py`, no reference): system "convert the provided text
+/// to speech", user "<|speaker:0|>text", assistant "<|voice|>" -> one semantic token per 21.5 Hz
+/// frame (151678 + class) plus 9 depth codebooks, stop on <|im_end|>. Sampling: T 0.7, top-p 0.7,
+/// top-k 30 (RAS in the depth stage).
+pub const FISH: SpeechProfile = SpeechProfile {
+    prompt_template: "<|speaker:0|>{input}",
+    voice_token: "{voice}",
+    voices: &["default"],
+    prefix: &[151644, 8948, 198, 14166, 279, 3897, 1467, 311, 8806, 151645, 198, 151644, 872, 198],
+    suffix: &[151645, 198, 151644, 77091, 198, 151673],
+    stops: &[151645],
+    sample_rate: 44100,
+    frame_codes: 10,
+    codebook: 4096,
+    frame_samples: 2048,
+    audio_token_base: 151678,
+    // 21.5 frames/s over ~11-15 characters/s English; the official per-chunk budget is 1024 frames.
+    per_char_frames: 2.4,
+    max_new_tokens_cap: 1024,
+    temperature: 0.7,
+    top_p: 0.7,
+    repetition_penalty: 1.0,
+    top_k: 30,
+    depth: true,
 };
 
 /// Chatterbox T3 (`tts.t3_cfg.v1`): a causal LM whose prefill rows are host embeddings (the
@@ -180,8 +215,9 @@ pub fn profile(name: &str) -> Result<&'static SpeechProfile, String> {
     match name {
         "veena" => Ok(&VEENA),
         "orpheus" => Ok(&ORPHEUS),
+        "fish" => Ok(&FISH),
         other => Err(format!(
-            "unknown tts profile {other:?} (known: veena, orpheus)"
+            "unknown tts profile {other:?} (known: veena, orpheus, fish)"
         )),
     }
 }
@@ -192,7 +228,8 @@ pub fn speech_pipeline_section(
     p: &SpeechProfile,
     vocab: u32,
 ) -> Result<SectionData, String> {
-    if p.audio_token_base + p.frame_codes * p.codebook > u64::from(vocab) {
+    let audio_rows = if p.depth { 1 } else { p.frame_codes };
+    if p.audio_token_base + audio_rows * p.codebook > u64::from(vocab) {
         return Err("tts profile audio codes exceed the vocabulary".into());
     }
     let causal = causal_pipeline_section(model, spec)?;
@@ -243,6 +280,8 @@ pub fn speech_pipeline_section(
         u64::from(p.temperature.to_bits()),
     );
     put("sampling.top_p_f32".into(), u64::from(p.top_p.to_bits()));
+    put("sampling.top_k".into(), p.top_k);
+    put("frames.depth".into(), u64::from(p.depth));
     put(
         "sampling.repetition_penalty_f32".into(),
         u64::from(p.repetition_penalty.to_bits()),
