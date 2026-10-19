@@ -19,6 +19,38 @@ struct Loaded {
     arg: DevProgram,
     counter_bytes: usize,
     _tables: Vec<DeviceMem>,
+    /// Host image of the instructions, and the full-attention flash (`i5`) and merge (`i2`)
+    /// split-count sites re-pointed at the live kv_len like the decode rungs' (any split count
+    /// up to the baked one is exact; more splits measured slower).
+    insts: Vec<packet::dev::DevInst64>,
+    sites: Vec<(usize, bool)>,
+    baked: u32,
+    cur: u32,
+}
+
+/// Full-attention (`hd 512`) flash-decode and merge sites, and their common baked split count.
+fn split_sites(insts: &[packet::dev::DevInst64]) -> Result<(Vec<(usize, bool)>, u32)> {
+    use packet::dev::DevOp;
+    let mut sites = Vec::new();
+    let mut baked = None;
+    for (i, d) in insts.iter().enumerate() {
+        let site = if d.op == DevOp::FlashDecodeFp8 as u16 && d.i[6] == 512 {
+            Some((false, d.i[5]))
+        } else if d.op == DevOp::FlashMerge as u16 && d.i[3] == 512 {
+            Some((true, d.i[2]))
+        } else {
+            None
+        };
+        if let Some((merge, ns)) = site {
+            if *baked.get_or_insert(ns) != ns {
+                return Err(reject(
+                    "full-attention split counts differ within a draft program",
+                ));
+            }
+            sites.push((i, merge));
+        }
+    }
+    Ok((sites, baked.unwrap_or(1)))
 }
 
 pub(super) struct SpecDraft {
@@ -75,10 +107,15 @@ impl SpecDraft {
             .map(|p| {
                 let (arg, _, counter_bytes, tables) =
                     super::mixed_step::upload_program(&e.be, p, e.d_tens.base, 0, 0)?;
+                let (sites, baked) = split_sites(&p.insts)?;
                 Ok(Loaded {
                     arg,
                     counter_bytes,
                     _tables: tables,
+                    insts: p.insts.clone(),
+                    sites,
+                    baked,
+                    cur: baked,
                 })
             })
             .collect::<Result<Vec<_>>>()?;
@@ -86,6 +123,7 @@ impl SpecDraft {
             e.be.host_alloc_pinned((manifest.kmax as usize + 5) * rows * 4)?;
         tracing::info!(
             programs = programs.len(),
+            baked_splits = ?programs.iter().map(|p| p.baked).collect::<std::collections::BTreeSet<_>>(),
             kmax = manifest.kmax,
             rows,
             family = %manifest.family,
@@ -181,6 +219,28 @@ impl GpuEngine {
                     &self.stream,
                 )?;
             }
+        }
+        let kv_max = pos.iter().copied().max().unwrap_or(1);
+        let prog = &mut d.programs[p.index as usize];
+        let want = crate::exec::kvrow::nv_dense_live_nsplit(prog.baked, kv_max);
+        if want != prog.cur && !prog.sites.is_empty() {
+            for &(i, merge) in &prog.sites {
+                if merge {
+                    prog.insts[i].i[2] = want;
+                } else {
+                    prog.insts[i].i[5] = want;
+                }
+            }
+            // SAFETY: the image lives in `prog` and is not touched again before this launch's
+            // stream synchronize (a later stage of the same program syncs first).
+            unsafe {
+                self.be.memcpy_htod_async(
+                    prog.arg.insts,
+                    super::pod_bytes(&prog.insts),
+                    &self.stream,
+                )?;
+            }
+            prog.cur = want;
         }
         d.selected = Some((k, p.index as usize, rows.len()));
         Ok(())

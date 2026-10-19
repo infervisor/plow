@@ -75,6 +75,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut ride_dump = None::<std::path::PathBuf>;
     let (mut dump_names, mut dump_dir) = (None::<String>, None::<String>);
     let mut spec = SpecArgs::default();
+    let mut prompt_file = None::<String>;
     while let Some(a) = args.next() {
         match a.as_str() {
             // `--spec oracle|adversarial|ngram`: speculative verify identity gate (see spec_bench).
@@ -82,6 +83,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             "--spec-k" => spec.k = args.next().ok_or("--spec-k K")?.parse()?,
             "--spec-rung" => spec.rung = args.next().ok_or("--spec-rung R")?.parse()?,
             "--spec-poison" => spec.poison = true,
+            // `--prompt-tokens FILE`: JSON array of token-id prompts; slot b takes prompt b mod n,
+            // which must hold at least CTX tokens (truncated to CTX).
+            "--prompt-tokens" => prompt_file = Some(args.next().ok_or("--prompt-tokens FILE")?),
             // `--draft-bench ITERS`: time the packet's draft programs at k = 1..=kmax (see draft_bench).
             "--draft-bench" => {
                 spec.draft_iters = args.next().ok_or("--draft-bench ITERS")?.parse()?
@@ -196,7 +200,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             "execution_phase": "prefill_output",
         })
     };
+    let file_prompts: Option<Vec<Vec<u32>>> = prompt_file
+        .map(|f| -> Result<_, Box<dyn std::error::Error>> {
+            let p: Vec<Vec<u32>> = serde_json::from_slice(&std::fs::read(&f)?)?;
+            if p.is_empty() || p.iter().any(|x| x.len() < ctx) {
+                return Err(format!("{f}: every prompt needs at least {ctx} tokens").into());
+            }
+            Ok(p)
+        })
+        .transpose()?;
     let prompt_for = |b: usize| -> Vec<u32> {
+        if let Some(p) = &file_prompts {
+            return p[b % p.len()][..ctx].to_vec();
+        }
         let bb = if same { 0 } else { b as u32 };
         if spread {
             let mut x = 0x9e37_79b9u32 ^ (bb + 1).wrapping_mul(0x85eb_ca6b);
@@ -795,6 +811,9 @@ fn draft_bench(
             &drafts[..k as usize]
         );
     }
+    if let Some(dir) = std::env::var_os("STEP_BENCH_DRAFT_DUMP").map(std::path::PathBuf::from) {
+        draft_dump(e, &dir, &rows)?;
+    }
     let k = kmax as usize;
     let mut cur = last.to_vec();
     let mut reference = vec![Vec::with_capacity(k); rows.len()];
@@ -821,6 +840,67 @@ fn draft_bench(
         agree.iter().sum::<usize>() as f64 / rows.len() as f64,
         reference[0]
     );
+    Ok(())
+}
+
+/// Bench-only: per slot, the draft's inputs, the activations one k=1 draft leaves behind (layer 3
+/// for the per-layer ones), and the slot's target KV for the drafter's layers, for an offline
+/// reference diff (`STEP_BENCH_DRAFT_DUMP=dir`).
+#[cfg(feature = "cuda")]
+fn draft_dump(
+    e: &mut plowrt::exec::gpu::GpuEngine,
+    dir: &std::path::Path,
+    rows: &[(usize, u32, u32)],
+) -> Result<(), Box<dyn std::error::Error>> {
+    std::fs::create_dir_all(dir)?;
+    let slots = e.tensor_bytes("in.kvlen").ok_or("no in.kvlen")? as usize / 4;
+    let read = |e: &plowrt::exec::gpu::GpuEngine, name: &str, off: u64, len: usize| {
+        let mut v = vec![0u8; len];
+        e.read_tensor_range(name, off, &mut v).map(|_| v)
+    };
+    let mut toks = Vec::new();
+    for &(b, token, hrow) in rows {
+        let pos = e.slot_pos(b);
+        e.spec_draft_stage(&[(b, token, hrow)], 7)?;
+        e.spec_draft_run(&mut toks)?;
+        let drafts7 = toks.clone();
+        e.spec_draft_stage(&[(b, token, hrow)], 1)?;
+        e.spec_draft_run(&mut toks)?;
+        let d = dir.join(format!("slot{b}"));
+        std::fs::create_dir_all(&d)?;
+        let hidden = e.tensor_bytes("act.mtp.h").ok_or("no act.mtp.h")? as usize / 16;
+        std::fs::write(d.join("act.hn.bin"), read(e, "act.hn", hrow as u64 * hidden as u64, hidden)?)?;
+        for n in ["e", "h", "x1", "x2", "x", "xn", "q", "qn", "at", "og", "hn", "fu", "dg", "logits"] {
+            let name = format!("act.mtp.{n}");
+            let row = e.tensor_bytes(&name).ok_or("missing")? as usize / 16;
+            std::fs::write(d.join(format!("{name}.bin")), read(e, &name, 0, row)?)?;
+        }
+        // Sliding ring whole; full layer only the committed rows per head (the rest is unmapped).
+        for (l, kvh, row_bytes) in [(28usize, 0usize, 0usize), (29, 2, 512)] {
+            for (t, elt) in [("k", 1), ("v", 1), ("k_scale", 4), ("v_scale", 4)] {
+                let name = format!("kv.{l}.{t}");
+                let per = e.tensor_bytes(&name).ok_or("missing kv")? as usize / slots;
+                let bytes = if kvh == 0 {
+                    read(e, &name, (b * per) as u64, per)?
+                } else {
+                    let (head, row) = (per / kvh, if elt == 1 { row_bytes } else { 4 });
+                    let mut v = Vec::new();
+                    for h in 0..kvh {
+                        v.extend(read(e, &name, (b * per + h * head) as u64, pos * row)?);
+                    }
+                    v
+                };
+                std::fs::write(d.join(format!("{name}.bin")), bytes)?;
+            }
+        }
+        std::fs::write(
+            d.join("meta.json"),
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "slot": b, "token": token, "hidden_row": hrow, "pos": pos,
+                "draft1": toks[0], "drafts7": drafts7,
+            }))?,
+        )?;
+    }
     Ok(())
 }
 
@@ -891,12 +971,35 @@ fn spec_bench(
     let mut inputs: Vec<Vec<u32>> = vec![Vec::new(); slots];
     let mut draft = Vec::new();
     let mut verdicts = Vec::new();
+    // `mtp`: the packet's draft programs. A slot's draft input is its pending token and the verify
+    // row that produced it; the first tick verifies the pending token alone to get that row.
+    let mut hrow: Vec<Option<u32>> = vec![None; slots];
+    let mut mtp = Vec::new();
+    let mut draft_ms = 0f64;
+    if mode == "mtp" {
+        e.spec_draft_enable(assets)?;
+    }
     while out.iter().any(|o| o.len() < steps) {
         let live: Vec<usize> = (0..slots).filter(|&b| out[b].len() < steps).collect();
-        for &b in &live {
+        let drafting = mode == "mtp" && live.iter().all(|&b| hrow[b].is_some());
+        if drafting {
+            let rows: Vec<(usize, u32, u32)> =
+                live.iter().map(|&b| (b, pending[b], hrow[b].unwrap())).collect();
+            let t = Instant::now();
+            e.spec_draft_stage(&rows, a.k as u32)?;
+            e.spec_draft_run(&mut mtp)?;
+            draft_ms += t.elapsed().as_secs_f64() * 1e3;
+        }
+        for (li, &b) in live.iter().enumerate() {
             let i = out[b].len();
             let k = a.k.min(steps - i - 1);
             match mode {
+                "mtp" => {
+                    draft.clear();
+                    if drafting {
+                        draft.extend_from_slice(&mtp[li * a.k..li * a.k + k]);
+                    }
+                }
                 "oracle" => {
                     draft.clear();
                     draft.extend_from_slice(&reference[b][i..i + k]);
@@ -945,6 +1048,7 @@ fn spec_bench(
             out[sp.slot].extend_from_slice(emitted);
             hist[sp.slot].extend_from_slice(emitted);
             pending[sp.slot] = emitted[n - 1];
+            hrow[sp.slot] = Some(v.hrow);
         }
     }
     let mut ok = true;
@@ -968,7 +1072,7 @@ fn spec_bench(
     println!(
         "SPEC_IDENTITY {} mode={mode} slots={slots} k={} rung={} base={base} steps={steps} \
          poison={} ref_fnv={:016x} spec_fnv={:016x} ticks={ticks} drafted={drafted} accepted={accepted} \
-         mean_emit={:.3} plain_ms={plain_ms:.3} verify_ms={:.3}",
+         mean_emit={:.3} plain_ms={plain_ms:.3} verify_ms={:.3} draft_ms={:.3}",
         if ok { "ok" } else { "MISMATCH" },
         a.k,
         a.rung,
@@ -977,6 +1081,7 @@ fn spec_bench(
         digest(&out),
         (steps * slots) as f64 / n_spans as f64,
         verify_ms / ticks as f64,
+        draft_ms / ticks as f64,
     );
     if ok {
         Ok(())

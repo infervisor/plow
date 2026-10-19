@@ -84,3 +84,56 @@ impl Manifest {
             .min_by_key(|p| p.rows)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn manifest() -> Manifest {
+        Manifest {
+            version: VERSION,
+            family: "gemma4_assistant".into(),
+            kmax: 2,
+            programs: [(1, 1), (1, 2), (4, 1), (4, 2)]
+                .iter()
+                .enumerate()
+                .map(|(index, &(rows, k))| DraftProgram {
+                    rows,
+                    k,
+                    index: index as u32,
+                })
+                .collect(),
+            tensors: DraftTensors {
+                tokens: vec![1, 2, 3],
+                hidden_row: 4,
+                position: 5,
+                kv_len: 6,
+                slot: 7,
+                hidden: 8,
+                hidden_rows: 128,
+            },
+            shard: "model-mtp.safetensors".into(),
+            shard_sha256: String::new(),
+        }
+    }
+
+    #[test]
+    fn selects_the_narrowest_covering_program() {
+        let m = manifest();
+        m.validate(4, 9).unwrap();
+        assert_eq!(m.select(1, 2).map(|p| p.index), Some(1));
+        assert_eq!(m.select(3, 1).map(|p| p.index), Some(2));
+        assert!(m.select(5, 1).is_none());
+        assert!(m.select(1, 3).is_none());
+    }
+
+    #[test]
+    fn refuses_bad_handles_and_program_indices() {
+        let m = manifest();
+        assert!(m.validate(3, 9).is_err());
+        assert!(m.validate(4, 8).is_err());
+        let mut short = manifest();
+        short.tensors.tokens.pop();
+        assert!(short.validate(4, 9).is_err());
+    }
+}
