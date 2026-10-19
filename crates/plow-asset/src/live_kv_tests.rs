@@ -617,3 +617,46 @@ fn flash_decode_slot_map_is_optional_and_has_a_runtime_i32_extent() {
     }
     assert!(validate(None, |d| d.t[7] = 4).is_err());
 }
+
+/// Span mode: with `in.rowslot` declared, every decode FP8 writer carries it in t7 and every
+/// decode FP8 reader in j1 — an omitted or foreign binding is refused.
+#[test]
+fn span_row_slot_binds_every_fp8_decode_access() {
+    let span = |ds: &mut Vec<DevInst64>, ts: &mut Vec<Tensor<'_>>| {
+        fp8_cache(ds, ts);
+        ts.push(Tensor {
+            name: "in.rowslot",
+            bytes: 8,
+            initialized: false,
+        });
+        let h = (ts.len() - 1) as u16;
+        ds[0].fj[2] = u32::from(h);
+        ds[1].t[7] = h;
+        ds[2].t[7] = h;
+    };
+    validate_all(None, span).unwrap();
+    let mutations: &[fn(&mut Vec<DevInst64>, &mut Vec<Tensor<'_>>)] = &[
+        |ds, _| ds[0].fj[2] = 0,
+        |ds, _| ds[1].t[7] = TENSOR_NONE16,
+        |ds, _| ds[2].t[7] = 7,
+        |ds, _| ds[0].fj[2] = 4,
+        |_, ts| ts.last_mut().unwrap().bytes = 4,
+        |_, ts| ts.last_mut().unwrap().initialized = true,
+    ];
+    for (i, mutate) in mutations.iter().enumerate() {
+        assert!(
+            validate_all(None, |ds, ts| {
+                span(ds, ts);
+                mutate(ds, ts);
+            })
+            .is_err(),
+            "mutation {i}"
+        );
+    }
+    // Without the declared map, a bound writer or reader is refused too.
+    assert!(validate_all(None, |ds, ts| {
+        fp8_cache(ds, ts);
+        ds[0].fj[2] = 2;
+    })
+    .is_err());
+}

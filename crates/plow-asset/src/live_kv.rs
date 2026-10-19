@@ -461,8 +461,7 @@ impl Manifest {
                             && (d.i[2], d.i[6], d.i[3], d.i[4], d.i[7])
                                 == (c.heads, c.hd, c.stride, c.window, c.mask)
                             && (!fp8
-                                || d.fj[2] == 0
-                                || self.row_slot.is_some_and(|r| d.fj[2] == u32::from(r)))
+                                || d.fj[2] == self.row_slot.map_or(0, u32::from))
                     };
                     // A repeated reader of one pair is KV sharing (Gemma-4 E-series), same geometry.
                     require(valid, "attention reader contract")?;
@@ -565,10 +564,12 @@ impl Manifest {
                                         // the slot-6 arm above validates the cache half.
                                         op == DevOp::HeadNormRope && c.scales.is_none()
                                     } else {
-                                        d.t[7] == TENSOR_NONE16
-                                            || (!prefill
-                                                && op == DevOp::HeadNormRopeFp8
-                                                && Some(d.t[7]) == self.row_slot)
+                                        // Span mode: every decode FP8 writer carries the map.
+                                        d.t[7]
+                                            == match self.row_slot {
+                                                Some(r) if !prefill && op == DevOp::HeadNormRopeFp8 => r,
+                                                _ => TENSOR_NONE16,
+                                            }
                                     })
                                     && (if prefill {
                                         d.i[6] == 0

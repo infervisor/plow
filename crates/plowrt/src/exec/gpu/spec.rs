@@ -57,6 +57,16 @@ pub(super) struct SpecRt {
     d_stop: DeviceMem,
     accept: Option<(KernelFn, Module)>,
     sites: Vec<KvSite>,
+    /// The last verify's spans, each committable once and only against the state it ran on.
+    pending: Vec<Pending>,
+}
+
+struct Pending {
+    slot: usize,
+    generation: u32,
+    pos: u32,
+    tokens: Vec<u32>,
+    verdict: SpecVerdict,
 }
 
 const STOP_MAX: usize = 64;
@@ -114,6 +124,7 @@ impl SpecRt {
             d_stop: be.alloc(0, (STOP_MAX * 4) as u64)?,
             accept: None,
             sites,
+            pending: Vec::new(),
         }))
     }
 }
@@ -201,8 +212,9 @@ impl GpuEngine {
     ) -> Result<()> {
         let reject = |m: String| Err(RuntimeError::Rejected(format!("spec_verify: {m}")));
         let bsz = self.batch;
-        if self.spec.as_ref().is_none_or(|s| s.accept.is_none()) {
-            return reject("not enabled (spec_enable)".into());
+        match self.spec.as_mut() {
+            Some(s) if s.accept.is_some() => s.pending.clear(),
+            _ => return reject("not enabled (spec_enable)".into()),
         }
         if spans.is_empty() || spans.len() > bsz || stop.len() > STOP_MAX {
             return reject(format!("{} spans, {} stop ids", spans.len(), stop.len()));
@@ -248,6 +260,11 @@ impl GpuEngine {
             .max()
             .expect("nonempty");
         self.patch_nv_nsplit(max_kvlen)?;
+        // Rows up to the span ends are about to be written, whatever happens after submission.
+        for sp in spans {
+            let hw = self.pos[sp.slot] + sp.tokens.len() as u32;
+            self.kv_hw[sp.slot] = self.kv_hw[sp.slot].max(hw);
+        }
 
         let pad_slot = spans[0].slot as u32 | SPEC_NO_STORE;
         let s = self.spec.as_mut().expect("checked");
@@ -285,6 +302,62 @@ impl GpuEngine {
             stop_h[..stop.len()].copy_from_slice(stop);
         }
         let n_spans = spans.len();
+        if let Err(e) = self.spec_submit(selection, launch_rows, rows, n_spans, stop.len()) {
+            // Plain launches must not see the span map, and staging may still be in flight.
+            let _ = self.spec_upload_identity();
+            let _ = self.be.stream_synchronize(&self.stream);
+            return Err(e);
+        }
+        let verdict_bytes = n_spans * std::mem::size_of::<SpecVerdict>();
+        let s = self.spec.as_ref().expect("checked");
+        let dev: &[SpecVerdict] = bytemuck::cast_slice(&s.verdicts.as_slice()[..verdict_bytes]);
+        let argmax: &[i32] = bytemuck::cast_slice(&self.stage.section(0)[..rows * 4]);
+        let argmax: Vec<u32> = argmax.iter().map(|&t| t as u32).collect();
+        verdicts.clear();
+        let mut r = 0usize;
+        for (sp, v) in spans.iter().zip(dev) {
+            let n = sp.tokens.len();
+            let gold = accept_greedy(
+                sp.tokens,
+                &argmax[r..r + n],
+                r as u32,
+                self.slot_generations[sp.slot],
+                stop,
+            );
+            if *v != gold {
+                return reject(format!(
+                    "device verdict {v:?} differs from the host golden {gold:?}"
+                ));
+            }
+            let hw = self.pos[sp.slot] + n as u32;
+            self.kv_hw[sp.slot] = self.kv_hw[sp.slot].max(hw);
+            verdicts.push(*v);
+            r += n;
+        }
+        let pending: Vec<Pending> = spans
+            .iter()
+            .zip(verdicts.iter())
+            .map(|(sp, v)| Pending {
+                slot: sp.slot,
+                generation: self.slot_generations[sp.slot],
+                pos: self.pos[sp.slot],
+                tokens: sp.tokens.to_vec(),
+                verdict: *v,
+            })
+            .collect();
+        self.spec.as_mut().expect("checked").pending = pending;
+        Ok(())
+    }
+
+    /// Uploads, verify launch, identity restore, accept launch and read-backs, then the sync.
+    fn spec_submit(
+        &mut self,
+        selection: super::decode_rung::DecodeSelection,
+        launch_rows: usize,
+        rows: usize,
+        n_spans: usize,
+        n_stop: usize,
+    ) -> Result<()> {
         // SAFETY: every pinned source lives on `self` past the stream synchronize below; each
         // copy is within its [batch]-sized tensor or buffer.
         unsafe {
@@ -303,10 +376,10 @@ impl GpuEngine {
                 &s.spans.as_slice()[..span_bytes],
                 &self.stream,
             )?;
-            if !stop.is_empty() {
+            if n_stop > 0 {
                 self.be.memcpy_htod_async(
                     s.d_stop.base,
-                    &s.stop.as_slice()[..stop.len() * 4],
+                    &s.stop.as_slice()[..n_stop * 4],
                     &self.stream,
                 )?;
             }
@@ -325,7 +398,7 @@ impl GpuEngine {
         let mut a_spans = s.d_spans.base;
         let mut a_n = n_spans as u32;
         let mut a_stop = s.d_stop.base;
-        let mut a_nstop = stop.len() as u32;
+        let mut a_nstop = n_stop as u32;
         let mut a_out = s.d_verdicts.base;
         let mut args = [
             &mut a_ids as *mut u64 as *mut std::ffi::c_void,
@@ -359,34 +432,7 @@ impl GpuEngine {
                 &self.stream,
             )?;
         }
-        self.be.stream_synchronize(&self.stream)?;
-
-        let s = self.spec.as_ref().expect("checked");
-        let dev: &[SpecVerdict] = bytemuck::cast_slice(&s.verdicts.as_slice()[..verdict_bytes]);
-        let argmax: &[i32] = bytemuck::cast_slice(&self.stage.section(0)[..rows * 4]);
-        let argmax: Vec<u32> = argmax.iter().map(|&t| t as u32).collect();
-        verdicts.clear();
-        let mut r = 0usize;
-        for (sp, v) in spans.iter().zip(dev) {
-            let n = sp.tokens.len();
-            let gold = accept_greedy(
-                sp.tokens,
-                &argmax[r..r + n],
-                r as u32,
-                self.slot_generations[sp.slot],
-                stop,
-            );
-            if *v != gold {
-                return reject(format!(
-                    "device verdict {v:?} differs from the host golden {gold:?}"
-                ));
-            }
-            let hw = self.pos[sp.slot] + n as u32;
-            self.kv_hw[sp.slot] = self.kv_hw[sp.slot].max(hw);
-            verdicts.push(*v);
-            r += n;
-        }
-        Ok(())
+        self.be.stream_synchronize(&self.stream)
     }
 
     /// Commit one verified span: its first `n_emit` input tokens now own committed KV rows; rows
@@ -394,10 +440,23 @@ impl GpuEngine {
     pub fn spec_commit(&mut self, span: &SpecSpan<'_>, v: &SpecVerdict) -> Result<()> {
         let b = span.slot;
         let n = usize::from(v.n_emit);
-        if v.req_gen != self.slot_generations[b] || n == 0 || n > span.tokens.len() {
-            return Err(RuntimeError::Rejected(format!(
-                "spec_commit: stale or malformed verdict for slot {b}"
-            )));
+        let stale = || {
+            RuntimeError::Rejected(format!(
+                "spec_commit: no matching verify for slot {b} (stale, replayed or altered)"
+            ))
+        };
+        let s = self.spec.as_mut().ok_or_else(stale)?;
+        let ix = s.pending.iter().position(|p| p.slot == b).ok_or_else(stale)?;
+        let p = s.pending.swap_remove(ix);
+        if b >= self.batch
+            || p.generation != self.slot_generations[b]
+            || p.pos != self.pos[b]
+            || p.tokens != span.tokens
+            || p.verdict != *v
+            || n == 0
+            || n > span.tokens.len()
+        {
+            return Err(stale());
         }
         self.pos[b] += n as u32;
         if self.vmm_prefix_enabled() {

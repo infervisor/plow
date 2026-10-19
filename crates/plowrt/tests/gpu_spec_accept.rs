@@ -48,7 +48,8 @@ fn device_accept_matches_host_golden() {
         x ^= x << 5;
         x % m
     };
-    let stop = [3u32, 7];
+    // 11 is also a draft token, so stops land inside accepted runs as well as on corrections.
+    let stop = [11u32, 7];
     for round in 0..64 {
         let (mut spans, mut inputs, mut argmax) = (Vec::new(), Vec::new(), Vec::new());
         for s in 0..37u32 {
