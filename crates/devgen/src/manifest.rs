@@ -1067,6 +1067,12 @@ fn tuning(s: &Shapes, arch: &str) -> Map<String, Value> {
         t.insert("fa_rg".into(), json!(1));
         t.insert("fa_rg_wide".into(), json!(1));
     }
+    // * `gemv_pf_ops`: the decode object's pre-gate prefetch op set (PLOW_NV_GEMV_PF_OPS opt-in).
+    if arch.starts_with("sm_") && crate::emit_config::active().gemv_prefetch {
+        if let Some(v) = crate::emit_config::active().nv_gemv_pf_ops {
+            t.insert("gemv_pf_ops".into(), json!(v));
+        }
+    }
     // * `fa_v3_splitkv`: the fused v3 flash prefill carries the split-KV workspace (`fa_ws`).
     if s.fa_ws_slots > 0 {
         t.insert("fa_v3_splitkv".into(), json!(s.fa_ws_slots));
@@ -3251,6 +3257,11 @@ pub fn config_header(manifest: &Value) -> String {
             if let Some(v) = t.get("fa_mmaqk").and_then(Value::as_u64) {
                 out.push_str(&format!(
                     "#ifndef PLOW_NV_FA_MMAQK\n#define PLOW_NV_FA_MMAQK {v}\n#endif\n"
+                ));
+            }
+            if let Some(v) = t.get("gemv_pf_ops").and_then(Value::as_u64) {
+                out.push_str(&format!(
+                    "#ifndef PLOW_NV_GEMV_PF_OPS\n#define PLOW_NV_GEMV_PF_OPS {v}u\n#endif\n"
                 ));
             }
             if let Some(v) = t.get("gf_light512").and_then(Value::as_u64) {

@@ -1191,6 +1191,11 @@ pub struct EmitConfig {
     #[arg(long, env = "PLOW_GEMV_PREFETCH", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
     pub gemv_prefetch: bool,
 
+    /// The NVIDIA pre-gate prefetch's op set (`gemv_pf_ops`, with PLOW_GEMV_PREFETCH): Gemv 1,
+    /// GemvGlu 2, GemvQkv 4, AddNorm 8, HeadNormRope 16, hd128 FlashDecode 32. Unset = 7.
+    #[arg(long, env = "PLOW_NV_GEMV_PF_OPS")]
+    pub nv_gemv_pf_ops: Option<u32>,
+
     /// Isolate compatible MXFP4 grouped-MoE Down+Combine prefill boundaries for the standalone
     /// deterministic stage-2 object. Default on; `=0` is the rollback to the interpreter route.
     #[arg(long, env = "PLOW_MOE_STAGE2_LEAN", default_value_t = true, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
@@ -1745,6 +1750,7 @@ impl EmitConfig {
             kda_fb_fold: env_bool("PLOW_KDA_FB_FOLD"),
             kda_decode_fused_arm: env_bool("PLOW_KDA_DECODE_FUSED_ARM"),
             gemv_prefetch: env_bool("PLOW_GEMV_PREFETCH"),
+            nv_gemv_pf_ops: env_u32("PLOW_NV_GEMV_PF_OPS"),
             moe_stage2_lean: env_opt_out("PLOW_MOE_STAGE2_LEAN"),
             moe_align_par: env_opt_out("PLOW_MOE_ALIGN_PAR"),
             glm_moe_shared_seed: env_bool("PLOW_GLM_MOE_SHARED_SEED"),

@@ -1297,6 +1297,7 @@ pub const EMIT: &[KnobSpec] = &[
     KnobSpec::new("emit.kda_fb_fold", Some("PLOW_KDA_FB_FOLD"), Layer::Emit, Domain::Bool, OFF, OPT_IN),
     KnobSpec::new("emit.kda_decode_fused_arm", Some("PLOW_KDA_DECODE_FUSED_ARM"), Layer::Emit, Domain::Bool, OFF, OPT_IN),
     KnobSpec::new("emit.gemv_prefetch", Some("PLOW_GEMV_PREFETCH"), Layer::Emit, Domain::Bool, GEMMA4_HOPPER_DENSE_ON, GEMV_PREFETCH_QUALIFIED),
+    KnobSpec::new("emit.nv_gemv_pf_ops", Some("PLOW_NV_GEMV_PF_OPS"), Layer::Emit, U32, UNSET, OPT_IN),
     KnobSpec::new("emit.moe_stage2_lean", Some("PLOW_MOE_STAGE2_LEAN"), Layer::Emit, Domain::Bool, ON, PROMOTED),
     KnobSpec::new("emit.moe_stage1_lean", Some("PLOW_MOE_STAGE1_LEAN"), Layer::Emit, Domain::Bool, ON, PROMOTED),
     KnobSpec::new("emit.moe_combine_lean", Some("PLOW_MOE_COMBINE_LEAN"), Layer::Emit, Domain::Bool, ON, PROMOTED),

@@ -3376,7 +3376,13 @@ extern "C" __device__ unsigned plow_fp8_m1_arm = 0;
 #endif
 #if PLOW_GEMV_PREFETCH && !PLOW_NV_PREFILL && PLOW_NV_GEMV_MMA
 /* Claim-ahead weight prefetch (op_gemv_mma.cuh): the walks the decode object runs for these
- * packets, fold arms excluded. PLOW_NV_GEMV_PF_OPS selects Gemv (1), GemvGlu (2), GemvQkv (4). */
+ * packets, fold arms excluded. PLOW_NV_GEMV_PF_OPS selects Gemv (1), GemvGlu (2), GemvQkv (4),
+ * and the light ops between them (manifest `gemv_pf_ops`), whose gate-independent rows otherwise
+ * come from HBM after the gate: AddNorm (8) its gamma and residual rows, HeadNormRope (16) its
+ * gamma and the tokens' cos/sin rows, hd128 FlashDecode (32) the head of the block's first item,
+ * one GEMV budget each of K and V. Qwen3-ASR rtx-5090 step_bench ctx 1024 B=1/16/32: AddNorm
+ * 0.6B 1.335/2.568/4.003 -> 1.272/2.524/3.938 ms, 1.7B 2.669/4.006/5.379 -> 2.602/3.949/5.309;
+ * FlashDecode 0.6B B=16/32 2.524/3.965, 1.7B 3.945/5.326. */
 #ifndef PLOW_NV_GEMV_PF_OPS
 #define PLOW_NV_GEMV_PF_OPS 7u
 #endif
@@ -3384,6 +3390,51 @@ __device__ __forceinline__ void plow_gemv_prefetch(const PlowDevInst* in, void* 
                                                    unsigned slice, unsigned nblk) {
     auto W = [&](int k) { return (const __nv_bfloat16*)T[in->t[k]]; };
     switch (in->op) {
+#if PLOW_NV_GEMV_PF_OPS & 8u
+    case PLOW_DOP_ADD_NORM:
+        if ((in->i[1] & 7u) == 0u) {
+            const unsigned feat = in->i[1];
+            if (threadIdx.x == 0u) {
+                if (in->t[4] != PLOW_TENSOR_NONE) gvmma_pf_l2(W(4), feat * 2u);
+            } else {
+                for (unsigned row = slice + (threadIdx.x - 1u) * nblk; row < in->i[0]; row += (blockDim.x - 1u) * nblk)
+                    gvmma_pf_l2(W(2) + (size_t)row * feat, feat * 2u);
+            }
+        }
+        break;
+#endif
+#if PLOW_NV_GEMV_PF_OPS & 16u
+    case PLOW_DOP_HEADNORM_ROPE: {
+        const unsigned hd = in->i[2];
+        if (threadIdx.x == 0u && in->t[2] != PLOW_TENSOR_NONE) gvmma_pf_l2(W(2), hd * 2u);
+        if (in->t[3] != PLOW_TENSOR_NONE && in->t[5] != PLOW_TENSOR_NONE && threadIdx.x >= 1u &&
+            threadIdx.x <= in->i[0]) {
+            const size_t row = (size_t)((const int*)T[in->t[5]])[threadIdx.x - 1u] * (hd / 2u);
+            gvmma_pf_l2((const __nv_bfloat16*)((const float*)T[in->t[3]] + row), hd * 2u);
+            gvmma_pf_l2((const __nv_bfloat16*)((const float*)T[in->t[4]] + row), hd * 2u);
+        }
+        break;
+    }
+#endif
+#if (PLOW_NV_GEMV_PF_OPS & 32u) && !PLOW_NV_KV_ILV
+    case PLOW_DOP_FLASH_DECODE:
+        if (threadIdx.x < 2u && in->i[6] == PLOW_NV_FA_HD && in->i[7] == 0xFFFFFFFFu) {
+            const unsigned n_head = in->i[1], n_kv_head = in->i[2], nsplit = in->i[5];
+            const unsigned n_grp = n_head / PLOW_NV_FA_GF, gqa = n_head / n_kv_head;
+            if (slice >= in->i[0] * n_grp * nsplit) break;
+            const unsigned sp = slice % nsplit, hg = (slice / nsplit) % n_grp, b = slice / (nsplit * n_grp);
+            const unsigned len = (unsigned)((const int*)T[in->t[5]])[b], window = in->i[4];
+            const unsigned slot = in->t[6] != PLOW_TENSOR_NONE ? (unsigned)max(((const int*)T[in->t[6]])[b], 0) : b;
+            const unsigned first = (window && len > window) ? (len - window) : 0u;
+            const unsigned per = (len - first + nsplit - 1u) / nsplit, lo = first + sp * per;
+            unsigned hi = lo + per < len ? lo + per : len;
+            if (hi > lo + PLOW_NV_GEMV_PF_BYTES / (PLOW_NV_FA_HD * 2u)) hi = lo + PLOW_NV_GEMV_PF_BYTES / (PLOW_NV_FA_HD * 2u);
+            if (hi <= lo) break;
+            const size_t off = (((size_t)slot * n_kv_head + (hg * PLOW_NV_FA_GF) / gqa) * in->i[3] + lo) * PLOW_NV_FA_HD;
+            gvmma_pf_l2(W(threadIdx.x ? 4 : 3) + off, (hi - lo) * PLOW_NV_FA_HD * 2u);
+        }
+        break;
+#endif
     case PLOW_DOP_GEMV:
         if ((PLOW_NV_GEMV_PF_OPS & 1u) && in->i[3] == 0u) gvmma_pf_rows(W(2), in->i[1], in->i[2], slice, nblk);
         break;
