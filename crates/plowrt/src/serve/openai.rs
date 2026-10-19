@@ -936,6 +936,9 @@ pub struct ModelCard {
     /// sending a request whose `temperature` would be discarded.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub x_plow_sampling: Option<&'static str>,
+    /// A speech model's voices, languages, sample rate, formats and sampling defaults.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub x_plow_speech: Option<serde_json::Value>,
 }
 
 /// Unix seconds, for the `created` field every OpenAI object carries.

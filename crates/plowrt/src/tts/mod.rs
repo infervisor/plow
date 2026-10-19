@@ -7,6 +7,8 @@
 //! by the codec stage the contract names ([`codec`]). See docs/arch/24-tts-pipelines.md.
 
 #[cfg(feature = "cuda")]
+pub mod api;
+#[cfg(feature = "cuda")]
 pub mod codec;
 #[cfg(feature = "cuda")]
 pub mod guided_lm;
@@ -161,6 +163,42 @@ impl SpeechContract {
         c.max(1)
     }
 
+    /// What a client may send this model ([`api::SpeechSpec`]). Without `prompt.voices`, the
+    /// voices are the tokenizer's special tokens that fill `voice_token`.
+    #[cfg(feature = "cuda")]
+    pub fn spec(&self, tok: &dyn crate::text::tokenizer::Tokenize) -> api::SpeechSpec {
+        let mut voices = if self.voices.is_empty() {
+            let (pre, post) = self
+                .voice_token
+                .split_once("{voice}")
+                .unwrap_or((&self.voice_token, ""));
+            tok.special_tokens()
+                .iter()
+                .filter_map(|t| t.strip_prefix(pre)?.strip_suffix(post))
+                .filter(|v| !v.is_empty())
+                .map(str::to_owned)
+                .collect()
+        } else {
+            self.voices.clone()
+        };
+        voices.sort_unstable();
+        voices.dedup();
+        api::SpeechSpec {
+            voices,
+            languages: Vec::new(),
+            default_language: None,
+            sample_rate: self.sample_rate,
+            temperature: self.temperature,
+            top_p: self.top_p,
+            repetition_penalty: self.repetition_penalty,
+            max_tokens: self.max_new_tokens_cap,
+            top_k: Some(0),
+            cfg_weight: None,
+            instructions: false,
+            voice_cloning: false,
+        }
+    }
+
     /// Codebook id of the `n`-th kept audio token, or `None` when `tok` is not the code its frame
     /// position expects (dropped, as the reference decoder drops out-of-range ids).
     pub fn code_of(&self, n: usize, tok: u32) -> Option<i32> {
@@ -171,8 +209,8 @@ impl SpeechContract {
     }
 }
 
-/// Longest `input` a codec-LM speech request takes, in characters (400 beyond): about 7 minutes
-/// of English audio, spoken as [`segments`].
+/// Longest `input` a speech request takes, in characters (400 beyond): about 7 minutes of English
+/// audio, spoken as [`segments`].
 pub const MAX_INPUT_CHARS: usize = 4096;
 
 /// `text` as consecutive slices of at most `max` characters, outer whitespace trimmed: whole

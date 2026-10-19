@@ -43,6 +43,8 @@ pub struct GuidedLmContract {
     pub repetition_penalty: f32,
     /// Speech tokens at the end of an utterance whose audio is cut (the reference drops them).
     pub trim_tail_tokens: usize,
+    /// Text tokens per segment of a long input (`text.segment_text_tokens`).
+    pub segment_text_tokens: Option<usize>,
 }
 
 impl GuidedLmContract {
@@ -81,6 +83,10 @@ impl GuidedLmContract {
                 .get("lm.trim_tail_tokens")
                 .copied()
                 .unwrap_or(0) as usize,
+            segment_text_tokens: p
+                .parameters
+                .get("text.segment_text_tokens")
+                .map(|&v| v as usize),
         })
     }
 
@@ -220,6 +226,10 @@ impl PromptTables {
 
     pub fn voices(&self) -> impl Iterator<Item = &str> {
         self.voices.keys().map(String::as_str)
+    }
+
+    pub fn languages(&self) -> impl Iterator<Item = &str> {
+        self.rules.languages()
     }
 
     /// The language a request selects (`None` for a packet without language selection).
@@ -446,6 +456,7 @@ mod tests {
             top_p: 1.0,
             repetition_penalty: 1.2,
             trim_tail_tokens: 0,
+            segment_text_tokens: None,
         }
     }
 
