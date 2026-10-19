@@ -344,9 +344,6 @@ fn sample_guided(
     let Some(u) = u else {
         return argmax(scratch);
     };
-    if p.temperature <= f32::EPSILON {
-        return argmax(scratch);
-    }
     if p.repetition_penalty != 1.0 {
         thread_local! {
             static SEEN: std::cell::RefCell<Vec<u64>> = const { std::cell::RefCell::new(Vec::new()) };
@@ -369,6 +366,9 @@ fn sample_guided(
                 }
             }
         });
+    }
+    if p.temperature <= f32::EPSILON {
+        return argmax(scratch);
     }
     let inv_t = 1.0 / p.temperature;
     let m = scratch.iter().copied().fold(f32::NEG_INFINITY, f32::max);
@@ -537,6 +537,14 @@ mod tests {
         let mut s = Vec::new();
         // Even if u is Some, zero temperature must return argmax without NaN.
         let tok = sample_cfg(&p, &cond, &uncond, [1], Some(0.5), &mut s);
+        assert_eq!(tok, 1);
+        // ...and still applies the repetition penalty before the argmax.
+        let p = CfgParams {
+            cfg_weight: 0.0,
+            repetition_penalty: 3.0,
+            ..p
+        };
+        let tok = sample_cfg(&p, &[2.0, 1.5], &[2.0, 1.5], [0], Some(0.5), &mut s);
         assert_eq!(tok, 1);
     }
 }

@@ -5332,13 +5332,21 @@ mod l2_placement_tests {
             }
             (b.finish(), [score, topk, glu, eglu])
         };
-        let first = |p: &Program, inst: u32| p.gq_stream.iter().position(|e| e.inst == inst).unwrap();
+        let first =
+            |p: &Program, inst: u32| p.gq_stream.iter().position(|e| e.inst == inst).unwrap();
         let (base, [score, topk, glu, eglu]) = emit(false);
-        assert!(first(&base, glu) < first(&base, topk), "unhoisted: dense GLU claims first");
+        assert!(
+            first(&base, glu) < first(&base, topk),
+            "unhoisted: dense GLU claims first"
+        );
         let (p, _) = emit(true);
         assert_eq!(p.stream, base.stream, "static streams must not move");
         let last_score = p.gq_stream.iter().rposition(|e| e.inst == score).unwrap();
-        assert_eq!(first(&p, topk), last_score + 1, "topk right behind its producer");
+        assert_eq!(
+            first(&p, topk),
+            last_score + 1,
+            "topk right behind its producer"
+        );
         assert!(first(&p, topk) < first(&p, glu) && first(&p, glu) < first(&p, eglu));
     }
 

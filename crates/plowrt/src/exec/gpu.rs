@@ -3960,7 +3960,10 @@ impl GpuEngine {
         );
         let missing = crate::asset::checkpoint::missing_weights(&blob, &raw, checkpoint_dir)?;
         if !missing.is_empty() {
-            return Err(crate::asset::checkpoint::missing_weights_error(checkpoint_dir, &missing));
+            return Err(crate::asset::checkpoint::missing_weights_error(
+                checkpoint_dir,
+                &missing,
+            ));
         }
         let mut live_kv_manifest = crate::memory::vmm::LiveKvLayout::manifest(&blob, &raw)?;
         let mut packed_prefill_metadata = blob
@@ -4510,7 +4513,8 @@ impl GpuEngine {
                 }
                 let configured_rings = config.nv_vmm_live_rings_for(assets_dir);
                 let explicit_model_pinned = config.nv_vmm_live_rings_explicitly_pinned(assets_dir);
-                let auto_scope_unsupported = !live && prefix_layout.is_none() && !explicit_model_pinned;
+                let auto_scope_unsupported =
+                    !live && prefix_layout.is_none() && !explicit_model_pinned;
                 let rings = if auto_scope_unsupported {
                     if configured_rings == Some(true) {
                         tracing::info!("live rings scoped off: model lacks VMM prefix layout and live KV geometry");

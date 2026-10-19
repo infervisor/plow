@@ -370,7 +370,9 @@ pub fn template_messages(
         .enumerate()
         .map(|(i, m)| {
             let mut v = json!({"role": m.role, "content": m.template_content()});
-            if let Some(r) = &m.reasoning_content {
+            // Responses carry vLLM's `reasoning`; most templates (Qwen3, DeepSeek-R1, GLM) read
+            // only `reasoning_content`.
+            if let Some(r) = m.reasoning_content.as_ref().or(m.reasoning.as_ref()) {
                 v["reasoning_content"] = json!(r);
             }
             if let Some(r) = &m.reasoning {
@@ -683,6 +685,13 @@ mod tests {
         assert!(
             m[0].get("tool_calls").is_none(),
             "absent, not null: Llama tests `'tool_calls' in message`"
+        );
+        let replayed =
+            req(json!({"messages": [{"role": "assistant", "content": "a", "reasoning": "think"}]}));
+        let m = template_messages(&replayed.messages, true).unwrap();
+        assert_eq!(
+            (&m[0]["reasoning_content"], &m[0]["reasoning"]),
+            (&json!("think"), &json!("think"))
         );
         let s = template_messages(&r.messages, false).unwrap();
         assert_eq!(

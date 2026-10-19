@@ -143,12 +143,18 @@ pub fn resolve(asset_dir: &Path, checkpoint_dir: &Path) -> Result<ServeInfo> {
 
 /// The [`crate::asset::checkpoint::missing_weights_error`] for `pkt` against `checkpoint_dir`, when
 /// the checkpoint lacks a tensor the packet binds.
+#[cfg(any(feature = "cuda", feature = "hsa", feature = "cpu"))]
 fn missing_weights_refusal(pkt: &Path, checkpoint_dir: &Path) -> Option<RuntimeError> {
     let raw = std::fs::read(pkt).ok()?;
     let blob = crate::asset::devblob::DevBlob::parse(&raw).ok()?;
     let missing = crate::asset::checkpoint::missing_weights(&blob, &raw, checkpoint_dir).ok()?;
     (!missing.is_empty())
         .then(|| crate::asset::checkpoint::missing_weights_error(checkpoint_dir, &missing))
+}
+
+#[cfg(not(any(feature = "cuda", feature = "hsa", feature = "cpu")))]
+fn missing_weights_refusal(_pkt: &Path, _checkpoint_dir: &Path) -> Option<RuntimeError> {
+    None
 }
 
 /// Where a bundle's checkpoint came from (see [`checkpoint_dir`]).

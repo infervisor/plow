@@ -6554,7 +6554,8 @@ fn gpu_prefill_batched_pass(
                 .filter(|_| {
                     decode_rows > 0
                         && pf_itl_budget_ms() > 0
-                        && (pf_itl_force() || itl_owed_rows(slots, cap, withheld, queued_rows) <= budget_max)
+                        && (pf_itl_force()
+                            || itl_owed_rows(slots, cap, withheld, queued_rows) <= budget_max)
                 })
                 .map(|rung| itl_rung_rows(e, rung, decode_rows));
             AdmitRoom::new(ready, admit_launch_rows(launch_cap, rung), decode_rows)
