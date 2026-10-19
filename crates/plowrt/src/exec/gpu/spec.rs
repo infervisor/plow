@@ -75,6 +75,10 @@ struct Pending {
 const STOP_MAX: usize = 64;
 
 impl SpecRt {
+    pub(super) fn row_slot_object(&self) -> bool {
+        self.object
+    }
+
     /// Any launch or rewind other than the verify itself ends the verify's transaction.
     pub(super) fn end_pending(&mut self) -> Result<()> {
         if self.map_dirty {

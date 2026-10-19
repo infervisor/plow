@@ -521,6 +521,7 @@ fn program(
                 i.t[2] = w.q_norm;
                 i.t[5] = t.position;
                 i.i[0] = rows;
+                i.f[0] = d.eps;
             });
             let c_fa = b.emit(
                 DevOp::FlashDecodeFp8,

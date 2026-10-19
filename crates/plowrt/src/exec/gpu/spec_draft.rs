@@ -82,21 +82,53 @@ impl SpecDraft {
         let bytes = blob
             .reserved_metadata(&raw, plow_asset::spec_draft::PROGRAMS_SECTION)?
             .ok_or_else(|| reject("draft programs section missing"))?;
-        if blob.tensors.len() != e.devp.len() || blob.n_cu != e.grid {
+        // The programs address this engine's tensor table: same packet tensors, in order.
+        if blob.n_cu != e.grid
+            || blob.tensors.len() != e.devp.len()
+            || blob
+                .tensors
+                .iter()
+                .zip(e.tensor_names.iter().zip(&e.devp))
+                .any(|(t, (name, mem))| t.name != *name || mem.len < t.bytes)
+        {
             return Err(reject("packet does not match the loaded engine"));
+        }
+        // FP8 attention honours `in.spec.slot` only in objects that export the row-slot marker.
+        if !e.spec.as_ref().is_some_and(|s| s.row_slot_object()) {
+            return Err(reject("decode object lacks plow_row_slot_1"));
         }
         let section =
             plow_asset::aux_program::parse(bytes, e.grid, e.devp.len()).map_err(reject)?;
         manifest
             .validate(section.programs.len(), e.devp.len())
             .map_err(reject)?;
-        let rows = manifest.programs.iter().map(|p| p.rows).max().unwrap_or(0) as usize;
         let t = &manifest.tensors;
-        for &h in t
-            .tokens
-            .iter()
-            .chain([t.hidden_row, t.position, t.kv_len, t.slot].iter())
-        {
+        let mut inputs: Vec<u16> = t.tokens.clone();
+        inputs.extend([t.hidden_row, t.position, t.kv_len, t.slot]);
+        let mut distinct = inputs.clone();
+        distinct.sort_unstable();
+        distinct.dedup();
+        if distinct.len() != inputs.len() || inputs.contains(&t.hidden) {
+            return Err(reject("aliased draft input tensors"));
+        }
+        for p in &manifest.programs {
+            let prog = &section.programs[p.index as usize];
+            // Step 0 gathers `rows` hidden rows (of `i1` elements) out of `hidden_rows`.
+            let gather_ok = prog.insts.iter().any(|d| {
+                d.op == packet::dev::DevOp::RowGather as u16
+                    && d.t[1] == t.hidden
+                    && d.t[2] == t.hidden_row
+                    && d.i[0] == p.rows
+                    && d.i[2] == t.hidden_rows
+                    && e.devp[usize::from(t.hidden)].len
+                        >= u64::from(t.hidden_rows) * u64::from(d.i[1]) * 2
+            });
+            if prog.rows != p.rows || !gather_ok {
+                return Err(reject(format!("program {} geometry", p.index)));
+            }
+        }
+        let rows = manifest.programs.iter().map(|p| p.rows).max().unwrap_or(0) as usize;
+        for &h in &inputs {
             if e.devp[usize::from(h)].len < rows as u64 * 4 {
                 return Err(reject(format!("tensor {h} holds fewer than {rows} rows")));
             }
@@ -168,6 +200,11 @@ impl GpuEngine {
     /// `hidden_row` is the row of the packet's hidden activation that produced `token` in the
     /// last decode or verify launch; the draft reads the slot's committed KV only.
     pub fn spec_draft_stage(&mut self, rows: &[(usize, u32, u32)], k: u32) -> Result<()> {
+        if rows.is_empty() {
+            return Err(reject("no rows"));
+        }
+        // The previous launch may still read the stage and the instruction image.
+        self.be.stream_synchronize(&self.stream)?;
         let vocab = self.vocab() as u32;
         let batch = self.batch;
         let pos: Vec<u32> = rows
@@ -211,7 +248,7 @@ impl GpuEngine {
             (kmax + 3, t.kv_len),
             (kmax + 4, t.slot),
         ] {
-            // SAFETY: the pinned stage outlives the stream synchronize in `spec_draft_run`.
+            // SAFETY: the pinned stage is rewritten only after the next stage's synchronize.
             unsafe {
                 self.be.memcpy_htod_async(
                     self.devp[usize::from(h)].base,
@@ -231,8 +268,7 @@ impl GpuEngine {
                     prog.insts[i].i[5] = want;
                 }
             }
-            // SAFETY: the image lives in `prog` and is not touched again before this launch's
-            // stream synchronize (a later stage of the same program syncs first).
+            // SAFETY: the image lives in `prog`; the next stage synchronizes before touching it.
             unsafe {
                 self.be.memcpy_htod_async(
                     prog.arg.insts,
