@@ -239,11 +239,12 @@ impl GpuEngine {
             rows += k + 1;
         }
         let need = rows.max(self.debug_min_rows);
-        let Some(rung) = self.decode_rung(need - 1) else {
+        if need > bsz {
             return reject(format!("{need} rows exceed the decode ladder"));
-        };
-        let selection = decode_selection(Some(rung), None);
-        let launch_rows = self.decode_rungs[rung].rows;
+        }
+        // `None` is the widest program (the engine's own kernarg), as for plain launches.
+        let selection = decode_selection(self.decode_rung(need - 1), None);
+        let launch_rows = self.selected_decode(selection).map_or(bsz, |r| r.rows);
 
         if let Some(v) = &mut self.vmm {
             if let Some(rings) = &mut v.rings {
