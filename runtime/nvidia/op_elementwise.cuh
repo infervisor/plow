@@ -162,7 +162,8 @@ static __device__ __forceinline__ float sf_neg_log_exp1(unsigned long long seed,
 static __device__ void d_sample_fish(unsigned* __restrict__ out, const __nv_bfloat16* __restrict__ logits,
                                      const float* __restrict__ params, const unsigned* __restrict__ topk,
                                      const unsigned long long* __restrict__ seed, const unsigned* __restrict__ step,
-                                     unsigned* __restrict__ hist, unsigned rows, unsigned vocab, unsigned out_stride,
+                                     unsigned* __restrict__ hist, unsigned* __restrict__ out_flat, unsigned rows,
+                                     unsigned vocab, unsigned out_stride,
                                      unsigned out_col0, unsigned coord, unsigned window, unsigned flags,
                                      unsigned lstride, unsigned ras_limit, unsigned slice, unsigned nblk,
                                      float* arena) {
@@ -231,6 +232,7 @@ static __device__ void d_sample_fish(unsigned* __restrict__ out, const __nv_bflo
                 h[step[r] % window] = c + 1u;
             }
             out[(size_t)r * out_stride + out_col0] = c;
+            if (out_flat) out_flat[r] = c;
         }
         __syncthreads();
     }

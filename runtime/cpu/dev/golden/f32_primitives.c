@@ -448,6 +448,7 @@ G_K(g_sample_fish_bf16) {
     const uint64_t* seed = PLOW_CPU_TEN(in, T, 4);
     const uint32_t* step = PLOW_CPU_TEN(in, T, 5);
     uint32_t* hist = PLOW_CPU_TEN(in, T, 6);
+    uint32_t* out_flat = PLOW_CPU_TEN(in, T, 7);
     const uint32_t rows = in->i[0], vocab = in->i[1], ostride = in->i[2], ocol = in->i[3], coord = in->i[4];
     const uint32_t window = in->i[5], flags = in->i[6], ls = in->i[7] ? in->i[7] : vocab, ras_limit = in->fj[1].u;
     for (uint32_t r = slice; r < rows; r += nblk) {
@@ -496,6 +497,7 @@ G_K(g_sample_fish_bf16) {
         }
         if ((flags & 1u) && hist && window) hist[(size_t)r * window + step[r] % window] = c + 1u;
         out[(size_t)r * ostride + ocol] = c;
+        if (out_flat) out_flat[r] = c;
     }
 }
 

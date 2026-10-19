@@ -77,6 +77,7 @@ pub mod asr;
 pub mod asr_subsampling;
 pub mod codec;
 pub mod fish_codec;
+mod fish_depth;
 pub mod conformer;
 pub mod conv2d;
 mod decode_objects;
@@ -1903,7 +1904,9 @@ struct Tn {
     // Per prefill row, the rows after it in its bidirectional media span (`MmSpanExtent`).
     mm_span: u32,
     // Codec-frame input embedding: per-row frame codes and the codebook table (TENSOR_NONE: off).
+    // Prefill reads host-written prompt rows; decode reads per-slot rows the depth stage writes.
     frame_codes: u32,
+    frame_dcodes: u32,
     frame_cb: u32,
     // Chatterbox T3 decode: per-slot speech start and the learned speech-position table.
     pos_base: u32,
@@ -2026,6 +2029,8 @@ struct Tn {
     xqi: u32,
     asi: u32,
     lw: Vec<LW>,
+    /// Fish S2 depth-stage tensors (a frame embedding's packet).
+    fish: Option<fish_depth::Tensors>,
 }
 struct LW {
     bq: u32,
@@ -2273,6 +2278,10 @@ fn declare(
         },
         frame_codes: match &c.frame {
             Some(f) => b.tensor("in.frame_codes", u64::from(ctx * f.codebooks) * I32),
+            None => TENSOR_NONE,
+        },
+        frame_dcodes: match &c.frame {
+            Some(f) => b.tensor("in.fish.dcodes", u64::from(dbatch * f.codebooks) * I32),
             None => TENSOR_NONE,
         },
         frame_cb: match &c.frame {
@@ -2637,6 +2646,7 @@ fn declare(
         kcs: Vec::new(),
         vcs: Vec::new(),
         lw: Vec::new(),
+        fish: None,
     };
     let mut t = t;
     for l in 0..c.layers {
@@ -3042,6 +3052,9 @@ fn declare(
             edn8: ex4[2],
             edns: ex4[3],
         });
+    }
+    if c.frame.is_some() {
+        t.fish = Some(fish_depth::declare(b, c, dbatch));
     }
     t
 }
@@ -4303,7 +4316,8 @@ fn emit_phase(
     } else if let Some(f) = &c.frame {
         assert!(escale == 1.0, "a frame embedding has its own divisor");
         b.emit(DevOp::EmbedFrameBf16, rows.clone(), &[], |d| {
-            d.t[..5].copy_from_slice(&[n.x, n.emb, n.ids, n.frame_cb, n.frame_codes]);
+            let codes = if decode { n.frame_dcodes } else { n.frame_codes };
+            d.t[..5].copy_from_slice(&[n.x, n.emb, n.ids, n.frame_cb, codes]);
             d.i[..7].copy_from_slice(&[t, c.hidden, c.vocab, f.codebooks, f.cb_size, f.lo, f.rows]);
             d.f[0] = f.div;
         })
@@ -10952,6 +10966,9 @@ fn emit_dense_gqa(
         let manifest =
             modular::build_modular_manifest(c.layers, modular_progs, &buckets, &[dbatch]);
         sections.push(modular::modular_pipeline_section(&manifest));
+    }
+    if let Some(t) = &emitter.tn.fish {
+        sections.extend(fish_depth::sections(&c, &emitter.tn, t, &m, &rungs));
     }
     if let Some(ref path) = embed_cubin {
         sections.push(packet::devbuild::SectionData {

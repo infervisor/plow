@@ -2420,9 +2420,10 @@ pub enum DevOp {
     /// counter hash of `(seed[r], step[r], i4, draw, i)`. Flag bit 0 (RAS): when `step[r] > 0` and
     /// the class is `< j0` and in the row's `i5`-entry history (`class + 1`, 0 = empty), redraw with
     /// draw 1 at `(ras_T, ras_P)`; the final class enters slot `step[r] % i5`. `top_k[r] == 0`
-    /// skips the row. Writes `out[r*i2 + i3]`.
+    /// skips the row. Writes `out[r*i2 + i3]`, and `out_flat[r]` when present.
     /// `t0=out(u32) t1=logits(bf16[rows][i7 or vocab]) t2=params(f32[rows][4]: T, top_p, ras_T,
-    /// ras_P) t3=top_k(u32[rows]) t4=seed(u64[rows]) t5=step(u32[rows]) t6=history(u32[rows][i5])?` ·
+    /// ras_P) t3=top_k(u32[rows]) t4=seed(u64[rows]) t5=step(u32[rows]) t6=history(u32[rows][i5])?
+    /// t7=out_flat(u32[rows])?` ·
     /// `i0=rows i1=vocab i2=out_stride i3=out_col0 i4=coord i5=ras_window i6=flags
     /// i7=logit_stride` · `j0=ras_limit`.
     SampleFishBf16 = 219,

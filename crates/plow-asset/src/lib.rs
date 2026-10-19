@@ -712,6 +712,7 @@ pub mod packed_prefill;
 pub mod kv_ring;
 pub mod media_geometry;
 pub mod multimodal;
+pub mod fish_depth;
 pub mod packet_pipeline;
 pub mod serve_manifest;
 pub mod speech_contract;

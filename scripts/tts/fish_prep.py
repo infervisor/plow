@@ -14,7 +14,8 @@ naming; the runtime binds roles):
                                             (class 4096, the stop); config `plow_head_rows` = 4097
   fish.codebook_embed.weight             <- audio_decoder.codebook_embeddings.weight [10*4096, 2560]
   fish.depth.layers.N.* / fish.depth.{embed,head,norm}.weight
-                                         <- audio_decoder.layers.N.* / embeddings / output / norm
+                                         <- audio_decoder.layers.N.* / embeddings (+ a zero stop row)
+                                            / output / norm
 S2 Pro rotates interleaved pairs (x[2i], x[2i+1]); plow's kernels rotate half-split pairs
 (x[i], x[i+64]). Permuting every head's q and k rows (and the q/k norm weights) to [evens, odds]
 makes the half-split rotation compute the same thing: q.k is invariant under a shared permutation
@@ -88,7 +89,9 @@ def main():
     for n in range(ac["n_layer"]):
         block(sd, f"audio_decoder.layers.{n}", f"fish.depth.layers.{n}", ac["n_head"], ac["n_local_heads"], dhd,
               bool(ac.get("attention_qk_norm", False)), dperm, out)
-    out["fish.depth.embed.weight"] = sd["audio_decoder.embeddings.weight"]
+    # A zero row past the codebook: the depth stage embeds the stop class as zeros.
+    de = sd["audio_decoder.embeddings.weight"]
+    out["fish.depth.embed.weight"] = torch.cat([de, torch.zeros_like(de[:1])])
     out["fish.depth.head.weight"] = sd["audio_decoder.output.weight"]
     out["fish.depth.norm.weight"] = sd["audio_decoder.norm.weight"]
     out = {k: v.to(torch.bfloat16).contiguous() for k, v in out.items()}

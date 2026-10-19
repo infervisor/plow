@@ -84,6 +84,8 @@ mod decode_context;
 mod decode_object;
 use decode_object::{BoundDecodeObject, DecodeModule};
 mod decode_rung;
+mod fish_depth;
+pub use fish_depth::{FishInfo, FishRow};
 mod gen_decode;
 mod mixed_step;
 mod moe_lt;
@@ -2795,6 +2797,8 @@ pub struct GpuEngine {
     /// Bytes of every batch-major `kv.*` tensor one cache row takes (static per-slot KV).
     kv_row_bytes: u64,
     slot_generations: Vec<u32>,
+    /// Fish S2 depth stage ([`fish_depth`]); `None` for every other packet.
+    fish: Option<fish_depth::FishDepth>,
 }
 
 /// Full model-load wall timeline (`PLOW_LOAD_PROFILE=1`).
@@ -7366,6 +7370,7 @@ impl GpuEngine {
                 .checked_div(batch as u64 * (blob.tensors[t_pos].bytes / 4))
                 .unwrap_or(0),
             slot_generations: vec![0; batch],
+            fish: None,
         };
         engine.mm_spans = engine.handle_of("act.mm_span").is_some();
         engine.packed_terminal = packed_terminal::PackedTerminal::load(&engine)?;
