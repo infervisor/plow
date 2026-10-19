@@ -178,6 +178,34 @@ pub(crate) fn cfg_gpt_oss(v: &Value) -> GptOssCfg {
     c
 }
 
+/// A codec-frame input embedding (`EmbedFrameBf16`): a token in `lo..lo + rows` adds the
+/// `codebooks` rows `cb_table[k * cb_size + code_k]` from `in.frame_codes`, then divides by `div`.
+#[derive(Clone, Debug)]
+pub(crate) struct FrameEmbed {
+    pub(crate) table: String,
+    pub(crate) codebooks: u32,
+    pub(crate) cb_size: u32,
+    pub(crate) lo: u32,
+    pub(crate) rows: u32,
+    pub(crate) div: f32,
+    pub(crate) depth: FishDepth,
+}
+
+/// Fish S2's per-frame depth transformer (`fish.depth.*`): `positions` steps over a fresh KV,
+/// position 0 the backbone's final hidden, then one sampled codebook per later position.
+#[derive(Clone, Debug)]
+pub(crate) struct FishDepth {
+    pub(crate) layers: u32,
+    pub(crate) hidden: u32,
+    pub(crate) heads: u32,
+    pub(crate) kv_heads: u32,
+    pub(crate) head_dim: u32,
+    pub(crate) inter: u32,
+    pub(crate) eps: f32,
+    pub(crate) theta: f32,
+    pub(crate) positions: u32,
+}
+
 pub(crate) struct Cfg {
     pub(crate) arch: Arch,
     pub(crate) hidden: u32,
@@ -241,9 +269,23 @@ pub(crate) struct Cfg {
     pub(crate) kv_shared: u32,
     // Gemma-4 E2B doubles the dense MLP width on the trailing KV-shared layers (`use_double_wide_mlp`).
     pub(crate) double_wide_mlp: bool,
+    /// Rows of an untied `lm_head` when it emits fewer classes than the embedding table holds
+    /// (`plow_head_rows`: a speech LM whose prompt text embeds from the full vocabulary but whose
+    /// head covers only its audio tokens); 0: `vocab`.
+    pub(crate) head_rows: u32,
+    pub(crate) frame: Option<FrameEmbed>,
 }
 
 impl Cfg {
+    /// Classes the head emits: `head_rows` when set, else `vocab`.
+    pub(crate) fn out_vocab(&self) -> u32 {
+        if self.head_rows == 0 {
+            self.vocab
+        } else {
+            self.head_rows
+        }
+    }
+
     /// The layer whose KV cache layer `l` reads: itself, or (KV sharing) the last non-shared
     /// layer of the same attention type.
     pub(crate) fn kv_source(&self, l: usize) -> usize {
@@ -434,6 +476,8 @@ fn cfg_gemma(v: &Value, flat: bool) -> Cfg {
         ple: t["hidden_size_per_layer_input"].as_u64().unwrap_or(0) as u32,
         kv_shared: t["num_kv_shared_layers"].as_u64().unwrap_or(0) as u32,
         double_wide_mlp: t["use_double_wide_mlp"].as_bool().unwrap_or(false),
+        head_rows: 0,
+        frame: None,
     };
     if c.moe {
         crate::require_moe_topk(c.top_k, "gemma4 (enable_moe_block)");
@@ -543,6 +587,8 @@ fn cfg_gemma3(v: &Value) -> Cfg {
         ple: 0,
         kv_shared: 0,
         double_wide_mlp: false,
+        head_rows: 0,
+        frame: None,
     }
 }
 
@@ -627,6 +673,35 @@ fn cfg_llama_qwen(v: &Value, arch: Arch) -> Cfg {
         ple: 0,
         kv_shared: 0,
         double_wide_mlp: false,
+        head_rows: v["plow_head_rows"].as_u64().map_or(0, |r| r as u32),
+        frame: v.get("fish_s2").map(|f| {
+            let g = |k: &str| f[k].as_u64().unwrap_or_else(|| panic!("fish_s2.{k}")) as u32;
+            FrameEmbed {
+                table: "fish.codebook_embed.weight".into(),
+                codebooks: g("codebooks"),
+                cb_size: g("codebook_size"),
+                lo: g("semantic_base"),
+                rows: g("semantic_tokens"),
+                div: (1.0 / f["frame_scale"].as_f64().expect("fish_s2.frame_scale")) as f32,
+                depth: {
+                    let d = &f["depth"];
+                    let u = |k: &str| d[k].as_u64().unwrap_or_else(|| panic!("fish_s2.depth.{k}")) as u32;
+                    let x = |k: &str| d[k].as_f64().unwrap_or_else(|| panic!("fish_s2.depth.{k}")) as f32;
+                    assert!(d["qk_norm"] != true, "fish_s2.depth.qk_norm is unsupported");
+                    FishDepth {
+                        layers: u("layers"),
+                        hidden: u("hidden"),
+                        heads: u("heads"),
+                        kv_heads: u("kv_heads"),
+                        head_dim: u("head_dim"),
+                        inter: u("intermediate"),
+                        eps: x("eps"),
+                        theta: x("rope_theta"),
+                        positions: u("positions"),
+                    }
+                },
+            }
+        }),
     }
 }
 
@@ -687,6 +762,8 @@ fn cfg_bert(v: &Value) -> Cfg {
         ple: 0,
         kv_shared: 0,
         double_wide_mlp: false,
+        head_rows: 0,
+        frame: None,
     }
 }
 
@@ -759,6 +836,8 @@ fn cfg_modernbert(v: &Value) -> Cfg {
         ple: 0,
         kv_shared: 0,
         double_wide_mlp: false,
+        head_rows: 0,
+        frame: None,
     }
 }
 

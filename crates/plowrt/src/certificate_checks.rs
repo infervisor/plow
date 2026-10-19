@@ -1322,6 +1322,7 @@ mod tests {
                 weight_tap_major: false,
                 wgmma: false,
                 weight_split: false,
+                dual_alpha: false,
             },
             h[1],
         )

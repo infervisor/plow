@@ -315,6 +315,8 @@ const DOC: &[S] = &[
     S { op: DevOp::PackNcfwRowsF32, t: &["out", "x"], i: &["rows", "channels", "frames", "width", "batches"], f: &[], j: &[] },
     S { op: DevOp::GroupedAttentionF32, t: &["context", "query", "key", "value", "valid_rows?"], i: &["rows", "width", "head_width", "group_rows", "flags"], f: &[], j: &[] },
     S { op: DevOp::EmbedPosBf16, t: &["out", "table", "tokens", "pos_table", "pos", "base"], i: &["rows", "width", "vocab", "pos_rows"], f: &[], j: &[] },
+    S { op: DevOp::EmbedFrameBf16, t: &["out", "table", "tokens", "cb_table", "codes"], i: &["rows", "width", "vocab", "K", "cb_size", "frame_lo", "frame_rows"], f: &["div"], j: &[] },
+    S { op: DevOp::SampleFishBf16, t: &["out", "logits", "params", "top_k", "seed", "step", "history?"], i: &["rows", "vocab", "out_stride", "out_col0", "coord", "ras_window", "flags", "logit_stride"], f: &[], j: &["ras_limit"] },
     S { op: DevOp::EmbedOverlayBf16, t: &["out", "table", "tokens", "overlay", "overlay_index"], i: &["rows", "width", "vocab", "overlay_rows"], f: &[], j: &[] },
     S { op: DevOp::GatherRowsF32, t: &["out", "table", "index?"], i: &["rows", "width", "vocab", "rows_per_item", "repeat", "index_item_stride", "table_item_stride", "flags"], f: &[], j: &["out_stride", "out_col0"] },
     S { op: DevOp::CopyColsF32, t: &["out", "x"], i: &["items", "rows", "cols", "in_stride", "in_offset", "out_stride", "out_offset", "flags"], f: &[], j: &["in_item_stride", "out_item_stride"] },

@@ -115,6 +115,127 @@ static __device__ void d_embed_pos(__nv_bfloat16* __restrict__ out, const __nv_b
     }
 }
 
+/* EmbedFrameBf16 (op 218): a frame token adds its K codebook rows (bf16 sum), then / div; see dev.rs. */
+static __device__ void d_embed_frame(__nv_bfloat16* __restrict__ out, const __nv_bfloat16* __restrict__ table,
+                                     const unsigned* __restrict__ tokens, const __nv_bfloat16* __restrict__ cb,
+                                     const unsigned* __restrict__ codes, unsigned rows, unsigned width,
+                                     unsigned vocab, unsigned K, unsigned cb_size, unsigned frame_lo,
+                                     unsigned frame_rows, float div, unsigned slice, unsigned nblk) {
+    for (unsigned r = slice; r < rows; r += nblk) {
+        const unsigned tok = tokens[r];
+        if (tok >= vocab) { __trap(); return; }
+        const __nv_bfloat16* a = table + (size_t)tok * width;
+        __nv_bfloat16* o = out + (size_t)r * width;
+        if (tok - frame_lo >= frame_rows) {
+            for (unsigned i = threadIdx.x; i < width; i += PLOW_NV_THREADS) o[i] = a[i];
+            continue;
+        }
+        const unsigned* c = codes + (size_t)r * K;
+        for (unsigned k = 0; k < K; k++)
+            if (c[k] >= cb_size) { __trap(); return; }
+        for (unsigned i = threadIdx.x; i < width; i += PLOW_NV_THREADS) {
+            float s = 0.f;
+            for (unsigned k = 0; k < K; k++)
+                s += __bfloat162float(cb[((size_t)k * cb_size + c[k]) * width + i]);
+            const float t = __bfloat162float(__float2bfloat16_rn(
+                __bfloat162float(a[i]) + __bfloat162float(__float2bfloat16_rn(s))));
+            o[i] = __float2bfloat16_rn(__fdiv_rn(t, div));
+        }
+    }
+}
+
+/* SampleFishBf16 (op 219): Fish S2 sampling, one block per row; see dev.rs. Arena: PLOW_NV_WARPS u64
+ * + PLOW_NV_WARPS f32 reduction slots, 64 selected classes and logits, then the row as bf16 bits. */
+static __device__ __forceinline__ unsigned long long sf_mix(unsigned long long z) {
+    z += 0x9e3779b97f4a7c15ull;
+    z = (z ^ (z >> 30)) * 0xbf58476d1ce4e5b9ull;
+    z = (z ^ (z >> 27)) * 0x94d049bb133111ebull;
+    return z ^ (z >> 31);
+}
+static __device__ __forceinline__ float sf_neg_log_exp1(unsigned long long seed, unsigned step, unsigned coord,
+                                                        unsigned draw, unsigned i) {
+    unsigned long long z = sf_mix(seed ^ sf_mix(((unsigned long long)step << 32) | coord));
+    z = sf_mix(z ^ (((unsigned long long)draw << 32) | i));
+    const float u = ((float)(z >> 40) + 0.5f) * (1.0f / 16777216.0f);
+    return -logf(-logf(u));
+}
+static __device__ void d_sample_fish(unsigned* __restrict__ out, const __nv_bfloat16* __restrict__ logits,
+                                     const float* __restrict__ params, const unsigned* __restrict__ topk,
+                                     const unsigned long long* __restrict__ seed, const unsigned* __restrict__ step,
+                                     unsigned* __restrict__ hist, unsigned rows, unsigned vocab, unsigned out_stride,
+                                     unsigned out_col0, unsigned coord, unsigned window, unsigned flags,
+                                     unsigned lstride, unsigned ras_limit, unsigned slice, unsigned nblk,
+                                     float* arena) {
+    unsigned long long* part = (unsigned long long*)arena;
+    float* fpart = (float*)(part + PLOW_NV_WARPS);
+    unsigned* sel = (unsigned*)(fpart + PLOW_NV_WARPS);
+    float* sv = (float*)(sel + 64);
+    unsigned short* L = (unsigned short*)(sv + 64);
+    const unsigned ls = lstride ? lstride : vocab;
+    for (unsigned r = slice; r < rows; r += nblk) {
+        const unsigned K = min(min(topk[r], 64u), vocab);
+        if (!K) continue;
+        const unsigned short* lg = (const unsigned short*)(logits + (size_t)r * ls);
+        float m = -INFINITY;
+        for (unsigned i = threadIdx.x; i < vocab; i += PLOW_NV_THREADS) {
+            const unsigned short b = lg[i];
+            L[i] = b;
+            m = fmaxf(m, __uint_as_float((unsigned)b << 16));
+        }
+        m = block_max(m, fpart);
+        float z = 0.f;
+        for (unsigned i = threadIdx.x; i < vocab; i += PLOW_NV_THREADS)
+            z += expf(__uint_as_float((unsigned)L[i] << 16) - m);
+        z = block_sum(z, fpart);
+        for (unsigned k = 0; k < K; k++) {
+            unsigned long long best = 0;
+            for (unsigned i = threadIdx.x; i < vocab; i += PLOW_NV_THREADS) {
+                unsigned short b = L[i];
+                const unsigned long long p = amax_pack(*(const __nv_bfloat16*)&b, i);
+                best = p > best ? p : best;
+            }
+            best = block_max_u64(best, part);
+            if (threadIdx.x == 0) {
+                const unsigned idx = ~(unsigned)best;
+                sel[k] = idx;
+                sv[k] = __uint_as_float((unsigned)L[idx] << 16);
+                L[idx] = 0xFF80u;
+            }
+            __syncthreads();
+        }
+        if (threadIdx.x == 0) {
+            const float* p = params + (size_t)r * 4u;
+            auto pick = [&](float t, float top_p, unsigned draw) {
+                float cum = 0.f;
+                unsigned n = 0;
+                for (unsigned i = 0; i < K; i++) {
+                    cum += expf(sv[i] - m) / z;
+                    if (i > 0 && cum > top_p) break;
+                    n = i + 1u;
+                }
+                const float inv = 1.0f / fmaxf(t, 1e-5f);
+                unsigned best = 0;
+                float bv = -INFINITY;
+                for (unsigned i = 0; i < n; i++) {
+                    const float v = (sv[i] - sv[0]) * inv + sf_neg_log_exp1(seed[r], step[r], coord, draw, i);
+                    if (v > bv) { bv = v; best = i; }
+                }
+                return sel[best];
+            };
+            unsigned c = pick(p[0], p[1], 0u);
+            if ((flags & 1u) && hist && window) {
+                unsigned* h = hist + (size_t)r * window;
+                bool seen = false;
+                for (unsigned w = 0; w < window; w++) seen |= h[w] == c + 1u;
+                if (step[r] > 0 && c < ras_limit && seen) c = pick(p[2], p[3], 1u);
+                h[step[r] % window] = c + 1u;
+            }
+            out[(size_t)r * out_stride + out_col0] = c;
+        }
+        __syncthreads();
+    }
+}
+
 /* Compact hidden-row gather — the unified token batch's terminal row selection.
  *
  * out[s][h] = x[rows[s]][h], for s in [0, S), over H features.

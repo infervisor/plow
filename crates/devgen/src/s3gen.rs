@@ -688,6 +688,7 @@ impl<'s> Ops<'s> {
                     weight_tap_major: tap_major,
                     wgmma: true,
                     weight_split: split,
+                    dual_alpha: false,
                 },
             )
         })
@@ -1184,6 +1185,7 @@ impl Lowering<'_> {
                         relative: true,
                         key_length_heads: HEADS,
                         prefix: None,
+                        window: 0,
                     },
                 )
             },
@@ -1708,6 +1710,7 @@ impl Lowering<'_> {
                                 rows: pp,
                                 h16: self.cfg.attn_h16,
                             }),
+                            window: 0,
                         },
                     )
                 },
@@ -1738,6 +1741,7 @@ impl Lowering<'_> {
                     relative: false,
                     key_length_heads: 0,
                     prefix: None,
+                    window: 0,
                 },
             )
         })?;

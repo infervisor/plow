@@ -448,6 +448,9 @@ pub struct Conv1dF32Stage<'a> {
     /// which an ungrouped wgmma conv copies as its B operand; without it such a conv takes the
     /// other paths.
     pub weight_split: bool,
+    /// Flag bit 19: `alpha` is `[in_channels | out_channels]`, a snake input activation's
+    /// parameters then a snake output activation's (one conv applying both).
+    pub dual_alpha: bool,
 }
 
 /// The pre-split B operand of an ungrouped wgmma conv (flag bit 18), appended to its f32 weights
@@ -592,6 +595,9 @@ pub struct AttentionF32Stage<'a> {
     pub key_length_heads: u32,
     /// Keys before each item's own: rows of a cached prefix block (see [`AttentionPrefix`]).
     pub prefix: Option<AttentionPrefix>,
+    /// Causal sliding window (flag bits 16..31): key `j` is visible from row `r` iff
+    /// `r - window < j <= r`; 0 = unbounded.
+    pub window: u32,
 }
 
 /// A key prefix for [`AttentionF32Stage`]: item `b` first attends to the `rows` rows of block
@@ -1387,8 +1393,14 @@ impl StageProgram {
             || !valid_activation(stage.input_activation)
             || !valid_activation(stage.output_activation)
             // One alpha tensor: a snake output activation reads it per output channel, so the
-            // input takes no activation.
-            || (stage.output_activation == Activation::Snake && stage.input_activation != Activation::None)
+            // input takes no activation unless bit 19 splits the tensor between two snakes.
+            || (stage.output_activation == Activation::Snake
+                && stage.input_activation != Activation::None
+                && !stage.dual_alpha)
+            || (stage.dual_alpha
+                && !(stage.input_activation == Activation::Snake
+                    && stage.output_activation == Activation::Snake
+                    && stage.alpha.is_some()))
             || (stage.weight_split
                 && (transpose
                     || stage.groups != 1
@@ -1430,12 +1442,15 @@ impl StageProgram {
             }
             None => packet::dev::TENSOR_NONE,
         };
+        let alpha_channels = if stage.dual_alpha {
+            stage.in_channels + stage.out_channels
+        } else {
+            stage.in_channels.max(stage.out_channels)
+        };
         let alpha = match stage.alpha {
-            Some(alpha) => self.resolve(
-                alpha,
-                u64::from(stage.in_channels.max(stage.out_channels)) * 4,
-                "convolution alpha",
-            )?,
+            Some(alpha) => {
+                self.resolve(alpha, u64::from(alpha_channels) * 4, "convolution alpha")?
+            }
             None => packet::dev::TENSOR_NONE,
         };
         if let Some(residual) = stage.residual {
@@ -1459,7 +1474,8 @@ impl StageProgram {
             | (u32::from(stage.split_bf16) << 14)
             | (u32::from(stage.weight_tap_major) << 15)
             | (u32::from(stage.wgmma && stage.split_bf16) << 17)
-            | (u32::from(stage.weight_split) << 18);
+            | (u32::from(stage.weight_split) << 18)
+            | (u32::from(stage.dual_alpha) << 19);
         let op = if transpose {
             DevOp::ConvTranspose1dF32
         } else {
@@ -1757,6 +1773,9 @@ impl StageProgram {
         if stage.key_length_heads != 0 && (!stage.relative || stage.q_rows <= 112) {
             return Err("attention key length groups: relative attention only".into());
         }
+        if stage.window != 0 && (!stage.causal || stage.window > 0xFFFF || stage.prefix.is_some()) {
+            return Err("attention window: causal, at most 65535 rows, no prefix".into());
+        }
         if let Some(p) = stage.prefix {
             if stage.bias.is_some() || stage.causal || p.rows == 0 {
                 return Err(
@@ -1832,7 +1851,8 @@ impl StageProgram {
                     | (u32::from(tc) << 1)
                     | (u32::from(stage.relative) << 2)
                     | (u32::from(stage.prefix.is_some_and(|p| p.h16)) << 4)
-                    | (stage.key_length_heads << 8),
+                    | (stage.key_length_heads << 8)
+                    | (stage.window << 16),
                 stage.prefix.map_or(stage.bias_head_stride, |p| p.rows),
             ];
             d.f[0] = stage.scale;
@@ -2497,6 +2517,7 @@ mod tests {
             weight_tap_major: false,
             wgmma: false,
             weight_split: false,
+            dual_alpha: false,
         };
         let mut p = prefix.program();
         let a = p
@@ -2669,6 +2690,7 @@ mod tests {
                 rows: pre,
                 h16,
             }),
+            window: 0,
         };
         assert!(p
             .attention_f32(h[0], h[0], h[0], &[f.done], attention(48, true))
@@ -2714,6 +2736,7 @@ mod tests {
                     relative: false,
                     key_length_heads: 0,
                     prefix: None,
+                    window: 0,
                 },
             )
             .unwrap()

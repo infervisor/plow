@@ -76,6 +76,7 @@ use mla::{glm_emit_block, glm_main, kimi_emit_block, nemotron_emit_block, MlaArc
 pub mod asr;
 pub mod asr_subsampling;
 pub mod codec;
+pub mod fish_codec;
 pub mod conformer;
 pub mod conv2d;
 mod decode_objects;
@@ -1901,6 +1902,9 @@ struct Tn {
     mm_slab: u32,
     // Per prefill row, the rows after it in its bidirectional media span (`MmSpanExtent`).
     mm_span: u32,
+    // Codec-frame input embedding: per-row frame codes and the codebook table (TENSOR_NONE: off).
+    frame_codes: u32,
+    frame_cb: u32,
     // Chatterbox T3 decode: per-slot speech start and the learned speech-position table.
     pos_base: u32,
     speech_pos: u32,
@@ -2206,7 +2210,11 @@ fn declare(
                                        // GLM-5.2's untied head takes the column-parallel arm under `GLM_SHARD_HEAD=1` for a measured
                                        // -0.26 ms/token, bit-identical (perf-data/glm52-decode-emitter-abs.md §1). Sharding a TIED
                                        // head additionally needs the per-rank vocab offset on the `emb` read.
-    let vocab_sh = c.vocab;
+    let vocab_sh = c.out_vocab();
+    assert!(
+        c.head_rows == 0 || !c.tied,
+        "plow_head_rows needs an untied lm_head of those rows"
+    );
     let ac = |b: &mut Builder, n: &str, sz: u64| b.tensor(&format!("act.{n}"), sz);
 
     // RoPE tables are declared as RECIPES, not expanded bytes: at ctx=131072 the four
@@ -2263,6 +2271,17 @@ fn declare(
         } else {
             TENSOR_NONE
         },
+        frame_codes: match &c.frame {
+            Some(f) => b.tensor("in.frame_codes", u64::from(ctx * f.codebooks) * I32),
+            None => TENSOR_NONE,
+        },
+        frame_cb: match &c.frame {
+            Some(f) => b.tensor(
+                &f.table,
+                u64::from(f.codebooks * f.cb_size) * u64::from(c.hidden) * BF16,
+            ),
+            None => TENSOR_NONE,
+        },
         pos_base: if c.speech_pos_rows > 0 {
             b.tensor("in.pos_base", dbatch as u64 * I32)
         } else {
@@ -2298,7 +2317,7 @@ fn declare(
                 } else {
                     "lm_head.weight"
                 },
-                (c.vocab * c.hidden) as u64 * BF16,
+                (c.out_vocab() * c.hidden) as u64 * BF16,
             )
         },
         head8: if c.tied && emit_config::active().fp8_head && !mx4_head_on() {
@@ -4176,7 +4195,7 @@ fn emit_phase(
     let heads = c.heads / tp; // this rank's q-heads
                               // inter_l is per-layer (E2B doubles the dense MLP on trailing KV-shared layers); defined inside
                               // the layer loop below as `c.inter_for_layer(l) / tp`.
-    let vocab_l = c.vocab; // lm_head REPLICATED under TP (Phase 2); see declare() note above
+    let vocab_l = c.out_vocab(); // lm_head REPLICATED under TP (Phase 2); see declare() note above
     let mut xgate: u32 = 0; // xctr gate-id allocator for XReduce (unique per collective)
                             // XReduce runs on a REDUCED CU set (F-lever). The all-reduce is a
                             // tiny memory-bound sum over the H-vector, but EVERY participating workgroup takes a SYSTEM-scope
@@ -4280,6 +4299,13 @@ fn emit_phase(
                 n.encoder_overlay_index,
             ]);
             d.i[..4].copy_from_slice(&[t, c.hidden, c.vocab, c.encoder_overlay_rows]);
+        })
+    } else if let Some(f) = &c.frame {
+        assert!(escale == 1.0, "a frame embedding has its own divisor");
+        b.emit(DevOp::EmbedFrameBf16, rows.clone(), &[], |d| {
+            d.t[..5].copy_from_slice(&[n.x, n.emb, n.ids, n.frame_cb, n.frame_codes]);
+            d.i[..7].copy_from_slice(&[t, c.hidden, c.vocab, f.codebooks, f.cb_size, f.lo, f.rows]);
+            d.f[0] = f.div;
         })
     } else if decode && c.speech_pos_rows > 0 {
         b.emit(DevOp::EmbedPosBf16, rows.clone(), &[], |d| {
@@ -10768,7 +10794,7 @@ fn emit_dense_gqa(
                     },
                 },
                 profile,
-                c.vocab,
+                c.out_vocab(),
             )
             .unwrap_or_else(|error| panic!("speech packet pipeline: {error}")),
         );
@@ -11286,8 +11312,16 @@ fn emit_dense_gqa(
     let mut speech_ops = 0u64;
     if let Some(dir) = ecfg.tts_codec.as_deref().filter(|_| !block_mode) {
         let sites = whole_graph_audio_sites().0;
-        let (model, section) = codec::lower_snac(dir, n_cu, m.target, sites, ecfg.snac_split_bf16)
-            .unwrap_or_else(|error| panic!("codec packet: {error}"));
+        let fish = std::fs::read(dir.join("config.json"))
+            .ok()
+            .and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok())
+            .is_some_and(|v| v["model_type"] == "fish_dac");
+        let (model, section) = if fish {
+            fish_codec::lower_fish_dac(dir, n_cu, m.target, ecfg.snac_split_bf16)
+        } else {
+            codec::lower_snac(dir, n_cu, m.target, sites, ecfg.snac_split_bf16)
+        }
+        .unwrap_or_else(|error| panic!("codec packet: {error}"));
         let path = std::path::Path::new(&out).with_file_name(tts::CODEC_PACKET);
         speech_ops |= manifest::speech_ops(&model);
         write_sidecar_packet(&path, &model, &[section]);

@@ -2224,8 +2224,9 @@ pub enum DevOp {
     /// reads `query[(b*q_rows + r)*in_stride + h*head_width ..]`, key/value row `j`
     /// `key[(b*kv_rows + j)*in_stride + k_col0 + h*head_width ..]` (`v_col0` for value;
     /// `in_stride` 0 = `heads*head_width`). Score `f0 * q.k + bias[h*bias_head_stride +
-    /// r*kv_rows + j]`, softmax over keys `j < key_lengths[b]` (and `j <= r` with flag bit 0); a
-    /// row with no visible key is zero. Output is dense `[batch,q_rows,heads*head_width]`.
+    /// r*kv_rows + j]`, softmax over keys `j < key_lengths[b]` (and `j <= r` with flag bit 0,
+    /// and `j > r - window` with a causal `window = flags >> 16`, 0 = none); a row with no visible
+    /// key is zero. Output is dense `[batch,q_rows,heads*head_width]`.
     /// `head_width` is 64, or a multiple of 8 up to 128 (e.g. 72). Flag bit 1 allows 3xTF32 tensor
     /// cores at 64 (FP32-accurate).
     /// With `prefix` (a cached key prefix), item `b`'s keys are rows `[0, i7)` of block
@@ -2260,7 +2261,8 @@ pub enum DevOp {
     /// In-place axial rotate-half RoPE: each head (at `h*head_stride`, `head_stride` 0 =
     /// `head_width`, row stride `stride` 0 = `heads*head_stride`) splits into `axes` segments of
     /// `head_width/axes`; segment `a` rotates its halves by `pos[r][a] * theta^(-2i/segment)`.
-    /// Flag bit 0 rounds cos/sin, the products and the sums to bf16 (torch's bf16 arithmetic).
+    /// Flag bit 0 rounds cos/sin, the products and the sums to bf16 (torch's bf16 arithmetic); bit 1
+    /// rounds only cos/sin (an fp32 rotation by a bf16 table).
     /// `t0=x t1=pos(u32[rows][axes])` · `i0=rows i1=heads i2=head_width i3=stride i4=axes
     /// i5=head_stride i6=flags` · `f0=theta`.
     RopeAxialF32 = 207,
@@ -2402,6 +2404,28 @@ pub enum DevOp {
     /// `[b, s, n_heads, index_head_dim]` then `fp4_act_quant(q, 32, True)` (`model.py:550-552`).
     /// A third call site, differing from the other two only in `i3`/`i6`/`i7`.
     CompressRopeQuant = 217,
+    /// Token embedding, plus a codec frame's codebook rows on frame tokens (Fish S2 input):
+    /// row r is a frame row when `frame_lo <= tokens[r] < frame_lo + frame_rows`, then
+    /// `out[r] = bf16(bf16(table[tokens[r]] + bf16(sum_k cb_table[k*cb_size + codes[r*K + k]])) / div)`
+    /// (torch's bf16 order: the codebook sum rounds once), else `out[r] = table[tokens[r]]`.
+    /// `t0=out(bf16[rows,width]) t1=table(bf16[vocab,width]) t2=tokens(u32[rows])
+    /// t3=cb_table(bf16[K*cb_size,width]) t4=codes(u32[rows,K])` ·
+    /// `i0=rows i1=width i2=vocab i3=K i4=cb_size i5=frame_lo i6=frame_rows` · `f0=div`.
+    /// A token >= vocab or a frame code >= cb_size traps.
+    EmbedFrameBf16 = 218,
+    /// Fish S2 sampling of a bf16 logit row (one block per row): the top `min(top_k[r], 64)`
+    /// classes by logit, cut by nucleus at temperature 1 over the whole row (keep class `i` while
+    /// the cumulative probability through `i` is `<= top_p`; the first always stays), then an
+    /// exponential race at temperature `T`: `argmax (l_i - l_0) / T - ln E_i`, `E_i ~ Exp(1)` from a
+    /// counter hash of `(seed[r], step[r], i4, draw, i)`. Flag bit 0 (RAS): when `step[r] > 0` and
+    /// the class is `< j0` and in the row's `i5`-entry history (`class + 1`, 0 = empty), redraw with
+    /// draw 1 at `(ras_T, ras_P)`; the final class enters slot `step[r] % i5`. `top_k[r] == 0`
+    /// skips the row. Writes `out[r*i2 + i3]`.
+    /// `t0=out(u32) t1=logits(bf16[rows][i7 or vocab]) t2=params(f32[rows][4]: T, top_p, ras_T,
+    /// ras_P) t3=top_k(u32[rows]) t4=seed(u64[rows]) t5=step(u32[rows]) t6=history(u32[rows][i5])?` ·
+    /// `i0=rows i1=vocab i2=out_stride i3=out_col0 i4=coord i5=ras_window i6=flags
+    /// i7=logit_stride` · `j0=ras_limit`.
+    SampleFishBf16 = 219,
 }
 
 /// [`DevOp::FlashPrefillFp8`]'s split count (`i7` low half).
@@ -2682,6 +2706,8 @@ impl DevOp {
         DevOp::EngramEmbed,
         DevOp::GemmFp8Mx,
         DevOp::CompressRopeQuant,
+        DevOp::EmbedFrameBf16,
+        DevOp::SampleFishBf16,
     ];
 
     /// Recover the opcode from its wire discriminant, or `None` for a value no
@@ -2920,6 +2946,8 @@ impl DevOp {
             DevOp::EngramEmbed => "PLOW_DOP_ENGRAM_EMBED",
             DevOp::GemmFp8Mx => "PLOW_DOP_GEMM_FP8_MX",
             DevOp::CompressRopeQuant => "PLOW_DOP_COMPRESS_ROPE_QUANT",
+            DevOp::EmbedFrameBf16 => "PLOW_DOP_EMBED_FRAME_BF16",
+            DevOp::SampleFishBf16 => "PLOW_DOP_SAMPLE_FISH_BF16",
         }
     }
 
@@ -2980,7 +3008,9 @@ impl DevOp {
     /// 210 -> 211 for `MmSpanExtent = 210` (bidirectional media spans).
     /// 211 -> 212 for `GemmGroupPf = 211` (grouped prefill projection route).
     /// 212 -> 218 for `CompressPool = 212` .. `CompressRopeQuant = 217` (DeepSeek-V4.1).
-    pub const COUNT: u16 = 218;
+    /// 218 -> 219 for `EmbedFrameBf16 = 218` (Fish S2 codec-frame input embedding).
+    /// 219 -> 220 for `SampleFishBf16 = 219` (Fish S2 in-program sampling).
+    pub const COUNT: u16 = 220;
 
     /// The `(M, N, K, quant)` a decode-GEMV opcode carries, or `None` if this is not one.
     ///

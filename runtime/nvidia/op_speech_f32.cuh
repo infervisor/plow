@@ -2650,6 +2650,9 @@ __device__ __forceinline__ int sp_pad_row(int u, int length, unsigned mode) {
 
 struct SpConvArgs {
     float* out; const float* x; const void* w; const float* bias; const float* alpha;
+    /* The output activation's per-channel parameter: `alpha`, or `alpha + cin` with flags bit 19
+     * (one tensor [cin | cout] carrying an input and an output snake). */
+    const float* post_alpha;
     const float* residual; const unsigned* lengths; const float* row_scale;
     unsigned batch, in_rows, cin, cout, kernel, stride, dil, groups, cg, ng, before, after, mode, pre,
         post, wf16, tapmajor, phasemajor, ptaps, out_rows, opad, cg_mul, cg_shift;
@@ -2675,7 +2678,7 @@ struct SpConvArgs {
     }
     /* oi = row * cout + o. Conv1d's optional row_scale multiplies after the output activation. */
     __device__ void store(size_t oi, unsigned o, float acc) const {
-        float v = post ? sp_act_call(post, acc, alpha ? alpha[o] : slope) : acc;
+        float v = post ? sp_act_call(post, acc, post_alpha ? post_alpha[o] : slope) : acc;
         if (row_scale) v = __fmul_rn(row_scale[oi / cout], v);
         out[oi] = residual ? __fadd_rn(v, residual[oi]) : v;
     }
@@ -2711,8 +2714,13 @@ __device__ __forceinline__ bool sp_conv_args(const PlowDevInst* in, void* const*
     a.phasemajor = transpose ? (flags >> 15) & 1u : 0u;
     a.ptaps = a.stride ? (a.kernel + a.stride - 1u) / a.stride : 0u;
     a.slope = in->fj[0].f;
+    const bool dual = (flags >> 19) & 1u;
+    a.post_alpha = dual && a.alpha ? a.alpha + a.cin : a.alpha;
+    /* One alpha serves a snake output only without an input activation, unless bit 19 splits it
+     * (then both activations are snakes). */
+    const bool alpha_ok = dual ? a.pre == 12u && a.post == 12u && a.alpha : !(a.post == 12u && a.pre != 0u);
     if (!a.kernel || !a.stride || !a.dil || !a.groups || a.cin % a.groups || a.cout % a.groups ||
-        a.mode > 2u || !sp_act_conv_ok(a.pre) || !sp_act_conv_ok(a.post) || (a.post == 12u && a.pre != 0u) || !a.in_rows)
+        a.mode > 2u || !sp_act_conv_ok(a.pre) || !sp_act_conv_ok(a.post) || !alpha_ok || !a.in_rows)
         return false;
     a.cg = a.cin / a.groups; a.ng = a.cout / a.groups;
     a.cg_shift = 0;
@@ -2847,6 +2855,19 @@ static __device__ __forceinline__ bool sp_conv1d_depthwise(const SpConvArgs& a, 
             const float* xk = xs + (size_t)(k * a.dil) * SPD_TC;
 #pragma unroll
             for (unsigned r = 0; r < RPT; r++) acc[r] = fmaf(xk[(size_t)(r * a.stride) * SPD_TC], w, acc[r]);
+        }
+        /* A plain snake output (SNAC's snake before the next pointwise conv) inlines: the generic
+         * store's out-of-line activation call would keep every accumulator on the stack. */
+        if (a.post == 12u && !a.row_scale && !a.residual) {
+            const float pa = a.post_alpha ? a.post_alpha[ch] : a.slope;
+#pragma unroll
+            for (unsigned r = 0; r < RPT; r++) {
+                const unsigned t = t0 + rg * RPT + r;
+                if (t >= a.out_rows) break;
+                const size_t oi = ((size_t)b * a.out_rows + t) * a.cout + ch;
+                a.out[oi] = t >= out_len ? 0.f : sp_snake(acc[r], pa);
+            }
+            continue;
         }
 #pragma unroll
         for (unsigned r = 0; r < RPT; r++) {
@@ -3041,7 +3062,7 @@ __device__ __forceinline__ void sp_ep4(const SpConvEpi1& ep, unsigned m, unsigne
         const unsigned o = ep.n0 + n + q;
         if (!ok) { ep.a.out[base + o] = 0.f; continue; }
         const float acc = ep.a.bias ? __fadd_rn(v[q], ep.a.bias[o]) : v[q];
-        float y = ep.a.post ? sp_act_call(ep.a.post, acc, ep.a.alpha ? ep.a.alpha[o] : ep.a.slope) : acc;
+        float y = ep.a.post ? sp_act_call(ep.a.post, acc, ep.a.post_alpha ? ep.a.post_alpha[o] : ep.a.slope) : acc;
         if (ep.a.row_scale) y = __fmul_rn(ep.a.row_scale[base / ep.a.cout], y);
         ep.a.out[base + o] = ep.a.residual ? __fadd_rn(y, rr[q]) : y;
     }
@@ -3063,7 +3084,7 @@ static __device__ __forceinline__ void sp_w_conv_rows(unsigned m0, unsigned n0, 
     for (unsigned j = 0; j < 4; j++) {
         const unsigned o = nb + j * 8u;
         bias[j] = a.bias && o < N ? __ldg((const float2*)(a.bias + o)) : make_float2(0.f, 0.f);
-        alpha[j] = a.alpha && o < N ? make_float2(a.alpha[o], a.alpha[o + 1]) : make_float2(a.slope, a.slope);
+        alpha[j] = a.post_alpha && o < N ? make_float2(a.post_alpha[o], a.post_alpha[o + 1]) : make_float2(a.slope, a.slope);
     }
     /* Per fragment row pair: row bases and residual loads before the stores (out may alias
      * residual, so later loads cannot move above earlier stores). */
@@ -3425,7 +3446,7 @@ static __device__ __forceinline__ void sp_wg_gemm(unsigned M, unsigned N, unsign
             const unsigned c = 8u * g + cw, o = n0 + c;
             const bool on = o < N;
             const float2 bias = *(const float2*)(bias_s + c);
-            const float2 alpha = a.alpha && on ? make_float2(a.alpha[og + o], a.alpha[og + o + 1]) : make_float2(a.slope, a.slope);
+            const float2 alpha = a.post_alpha && on ? make_float2(a.post_alpha[og + o], a.post_alpha[og + o + 1]) : make_float2(a.slope, a.slope);
 #pragma unroll
             for (unsigned h = 0; h < 2; h++) {
                 float2 y = make_float2(0.f, 0.f);
@@ -3646,6 +3667,7 @@ static __device__ __noinline__ void sp_attention_f32(const PlowDevInst* in, void
     const unsigned hw = RAGGED ? in->i[4] : (unsigned)HW;
     const unsigned width = heads * hw, stride = in->i[5] ? in->i[5] : width;
     const bool causal = in->i[6] & 1u;
+    const unsigned win = causal ? in->i[6] >> 16 : 0u;
     const unsigned bias_hs = in->i[7], k_col0 = in->fj[1].u, v_col0 = in->fj[2].u;
     const float scale = in->fj[0].f;
     const bool vec = stride % 4u == 0 && k_col0 % 4u == 0 && v_col0 % 4u == 0 && sp_aligned(query, 16) &&
@@ -3685,7 +3707,7 @@ static __device__ __noinline__ void sp_attention_f32(const PlowDevInst* in, void
 #pragma unroll
             for (int c = 0; c < 4 * CB; c++) o[i][c] = 0.f;
         }
-        for (unsigned k0 = 0; k0 < kend; k0 += BK) {
+        for (unsigned k0 = win && q0 >= win ? (q0 - win + 1u) / BK * BK : 0u; k0 < kend; k0 += BK) {
             /* K/V are not prefetched across tiles: holding them in registers through the tile
              * spills in the interpreter object. */
             float4 kr[PER], vr[PER];
@@ -3742,7 +3764,7 @@ static __device__ __noinline__ void sp_attention_f32(const PlowDevInst* in, void
                     const unsigned kj = k0 + (j >> 2) * 64 + tx * 4 + (j & 3);
                     float v = s[i][j] * scale;
                     if (!full) {
-                        if (kj < kend && (!causal || kj <= r)) {
+                        if (kj < kend && (!causal || kj <= r) && (!win || kj + win > r)) {
                             if (bias && r < q_rows) v += bias[(size_t)h * bias_hs + (size_t)r * kv_rows + kj];
                         } else {
                             v = -INFINITY;
@@ -3835,6 +3857,7 @@ static __device__ __noinline__ void sp_attention_tc64(const PlowDevInst* in, voi
     const unsigned batch = in->i[0], q_rows = in->i[1], kv_rows = in->i[2], heads = in->i[3];
     const unsigned width = heads * HW, stride = in->i[5] ? in->i[5] : width;
     const bool causal = in->i[6] & 1u;
+    const unsigned win = causal ? in->i[6] >> 16 : 0u;
     const unsigned bias_hs = in->i[7], k_col0 = in->fj[1].u, v_col0 = in->fj[2].u;
     const float scale = in->fj[0].f;
     const unsigned tid = threadIdx.x, lane = tid & 31u, warp = tid >> 5, g = lane >> 2, t = lane & 3u;
@@ -3885,8 +3908,9 @@ static __device__ __noinline__ void sp_attention_tc64(const PlowDevInst* in, voi
             asm volatile("cp.async.commit_group;\n" ::);
         };
         const unsigned nkt = (kend + SPQ_BK - 1) / SPQ_BK;
-        issue(0);
-        for (unsigned kt = 0; kt < nkt; kt++) {
+        const unsigned kt0 = win && q0 >= win ? (q0 - win + 1u) / SPQ_BK : 0u;
+        issue(kt0);
+        for (unsigned kt = kt0; kt < nkt; kt++) {
             asm volatile("cp.async.wait_group 0;\n" ::);
             __syncthreads();
             issue(kt + 1);
@@ -3917,7 +3941,7 @@ static __device__ __noinline__ void sp_attention_tc64(const PlowDevInst* in, voi
                 for (int r = 0; r < 4; r++) {
                     const unsigned kj = k0 + j * 8 + 2 * t + (r & 1), row = r < 2 ? ra : rb;
                     float v = sc[j][r] * scale;
-                    if (kj < kend && (!causal || kj <= row)) {
+                    if (kj < kend && (!causal || kj <= row) && (!win || kj + win > row)) {
                         if (bias && row < q_rows) v += bias[(size_t)h * bias_hs + (size_t)row * kv_rows + kj];
                     } else {
                         v = -INFINITY;
@@ -4031,6 +4055,8 @@ static __device__ __noinline__ void sp_attention_tc64p(const PlowDevInst* in, vo
      * (h, r, j) reading entry kv_rows - 1 - r + j; bits 8-15: key lengths per group of that many
      * heads (0: per item). */
     const bool causal = in->i[6] & 1u, rel = REL && (in->i[6] & 4u);
+    /* bits 16-31 (causal): sliding window, key j visible from row r iff r - win < j <= r. */
+    const unsigned win = causal ? in->i[6] >> 16 : 0u;
     const unsigned lgroup = REL ? (in->i[6] >> 8) & 255u : 0u;
     const unsigned bias_hs = in->i[7], k_col0 = in->fj[1].u, v_col0 = in->fj[2].u;
     /* Scores in log2 units, so the softmax runs on exp2f (as accurate as expf, cheaper). */
@@ -4050,10 +4076,15 @@ static __device__ __noinline__ void sp_attention_tc64p(const PlowDevInst* in, vo
         unsigned kend = klen;
         if (lgroup)
             for (unsigned hs = 0; hs < nh; hs++) kend = max(kend, visible(h0 + hs));
+        unsigned kbeg = 0;
         if (causal) {
-            unsigned top = 0;
-            for (unsigned w = u0; w < u0 + 8u && w < tiles; w++) top = max(top, (w % n16) * 16u + 16u);
+            unsigned top = 0, bottom = ~0u;
+            for (unsigned w = u0; w < u0 + 8u && w < tiles; w++) {
+                top = max(top, (w % n16) * 16u + 16u);
+                bottom = min(bottom, (w % n16) * 16u);
+            }
             kend = min(kend, top);
+            if (win && bottom >= win) kbeg = bottom - win + 1u;
         }
         const unsigned ra = q0 + g, rb = ra + 8u;
         /* Bias rows of ra and rb (null past q_rows), indexed by key. */
@@ -4104,9 +4135,9 @@ static __device__ __noinline__ void sp_attention_tc64p(const PlowDevInst* in, vo
             }
             asm volatile("cp.async.commit_group;\n" ::);
         };
-        const unsigned nkt = (kend + KT - 1) / KT;
-        issue(0);
-        for (unsigned kt = 0; kt < nkt; kt++) {
+        const unsigned nkt = (kend + KT - 1) / KT, kt0 = kbeg / KT;
+        issue(kt0);
+        for (unsigned kt = kt0; kt < nkt; kt++) {
             asm volatile("cp.async.wait_group 0;\n" ::);
             __syncthreads();
             issue(kt + 1);
@@ -4138,7 +4169,7 @@ static __device__ __noinline__ void sp_attention_tc64p(const PlowDevInst* in, vo
                 for (int r = 0; r < 4; r++) {
                     const unsigned kj = k0 + j * 8 + 2 * t + (r & 1), row = r < 2 ? ra : rb;
                     float v = sc[j][r] * scale;
-                    if (kj < klen && (!causal || kj <= row)) {
+                    if (kj < klen && (!causal || kj <= row) && (!win || kj + win > row)) {
                         if (brow[r >> 1]) v += brow[r >> 1][kj] * 1.4426950408889634f;
                     } else {
                         v = -INFINITY;
@@ -4733,6 +4764,10 @@ static __device__ __noinline__ void d_rope_axial_f32(const PlowDevInst* in, void
             p[0] = sp_bf16(__fadd_rn(sp_bf16(__fmul_rn(x1, c)), sp_bf16(__fmul_rn(-x2, s))));
             p[half] = sp_bf16(__fadd_rn(sp_bf16(__fmul_rn(x2, c)), sp_bf16(__fmul_rn(x1, s))));
         } else {
+            if (flags & 2u) {
+                c = sp_bf16(c);
+                s = sp_bf16(s);
+            }
             p[0] = __fsub_rn(__fmul_rn(x1, c), __fmul_rn(x2, s));
             p[half] = __fadd_rn(__fmul_rn(x2, c), __fmul_rn(x1, s));
         }

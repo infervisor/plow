@@ -590,6 +590,7 @@ struct ConvSpec {
     bool wide = false; /* flags bit 14: split-bf16 wide tiles */
     bool tapmajor = false; /* flags bit 15: weights [cout][kernel][cin/groups] */
     bool wg = false; /* flags bit 17: the wgmma arm of the pointwise wide tile (sm_90a) */
+    bool dual = false; /* flags bit 19: alpha [cin | cout], an input then an output snake */
 };
 
 static unsigned conv_out_rows(const ConvSpec& s, bool transpose) {
@@ -652,7 +653,7 @@ static void build_conv(Case& c, const ConvSpec& s, bool transpose, unsigned& o) 
     const bool wsplit = s.wg && !transpose && s.groups == 1 && !s.f16;
     if (wsplit) append_wsplit(c.host[w], s.cout, s.cin * s.kernel);
     unsigned b = s.bias ? c.f32(s.cout, 0.2f) : PLOW_TENSOR_NONE;
-    unsigned a = s.alpha ? c.f32(std::max(s.cin, s.cout), 0.4f, 0.6f) : PLOW_TENSOR_NONE;
+    unsigned a = s.alpha ? c.f32(s.dual ? s.cin + s.cout : std::max(s.cin, s.cout), 0.4f, 0.6f) : PLOW_TENSOR_NONE;
     unsigned r = s.residual ? c.f32((size_t)s.batch * out_rows * s.cout, 1.f) : PLOW_TENSOR_NONE;
     unsigned l = s.lengths.empty() ? PLOW_TENSOR_NONE : c.u32(s.lengths);
     if (s.row_scale) c.in.t[7] = c.f32((size_t)s.batch * out_rows, 1.f);
@@ -662,7 +663,8 @@ static void build_conv(Case& c, const ConvSpec& s, bool transpose, unsigned& o) 
     c.in.i[4] = s.kernel; c.in.i[5] = s.stride; c.in.i[6] = s.dil_or_opad; c.in.i[7] = s.groups;
     c.in.fj[0].f = s.slope; c.in.fj[1].u = pads(s.before, s.after);
     c.in.fj[2].u = conv_flags(s.mode, s.pre, s.post, s.f16) | (s.tc ? 1u << 13 : 0u) | (s.wide ? 1u << 14 : 0u) |
-                   (s.tapmajor ? 1u << 15 : 0u) | (s.wg ? 1u << 17 : 0u) | (wsplit ? 1u << 18 : 0u);
+                   (s.tapmajor ? 1u << 15 : 0u) | (s.wg ? 1u << 17 : 0u) | (wsplit ? 1u << 18 : 0u) |
+                   (s.dual ? 1u << 19 : 0u);
 }
 
 static void t_conv1d(const char* name, const ConvSpec& s, double tol = 2e-5) {
@@ -1412,6 +1414,23 @@ int main(int argc, char** argv) {
         t_conv1d("Conv1dF32 row_scale tc pointwise +res len", rs[0]);
         t_conv1d("Conv1dF32 row_scale ffma pointwise +res", rs[1]);
         t_conv1d("Conv1dF32 row_scale depthwise snake +res", rs[2]);
+    }
+    {
+        /* SNAC residual unit: the depthwise conv applies the pointwise conv's snake too (bit 19). */
+        for (unsigned dil : {1u, 3u, 9u}) {
+            char name[64];
+            snprintf(name, sizeof(name), "Conv1dF32 depthwise k7 d%u snake->snake dual len", dil);
+            ConvSpec d = {2, 2048, 512, 512, 7, 1, dil, 512, 3 * dil, 3 * dil, 0, 12, 12, false, true, true, false,
+                          {2048, 1501}, 0.f};
+            d.dual = true;
+            t_conv1d(name, d);
+        }
+        ConvSpec r = {2, 300, 64, 64, 7, 1, 3, 64, 9, 9, 0, 12, 12, false, true, true, true, {300, 211}, 0.f};
+        r.dual = true;
+        t_conv1d("Conv1dF32 depthwise snake->snake dual +res", r);
+        ConvSpec t = {2, 257, 64, 96, 3, 1, 1, 1, 1, 1, 0, 12, 12, false, true, true, false, {257, 100}, 0.f, true};
+        t.dual = true;
+        t_conv1d("Conv1dF32 dense k3 snake->snake dual tc", t);
     }
     t_attention("AttentionF32 tc 8x64 2x1200 lengths", 2, 1200, 8, 64, {1200, 1000}, false, false, false, true);
     t_attention("AttentionF32 tc 8x64 causal bias fused", 2, 300, 8, 64, {300, 217}, true, true, true, true);
