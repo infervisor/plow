@@ -82,6 +82,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             "--spec-k" => spec.k = args.next().ok_or("--spec-k K")?.parse()?,
             "--spec-rung" => spec.rung = args.next().ok_or("--spec-rung R")?.parse()?,
             "--spec-poison" => spec.poison = true,
+            // `--draft-bench ITERS`: time the packet's draft programs at k = 1..=kmax (see draft_bench).
+            "--draft-bench" => {
+                spec.draft_iters = args.next().ok_or("--draft-bench ITERS")?.parse()?
+            }
             "--nsplit-kvlen" => spec.nsplit_kvlen = Some(args.next().ok_or("--nsplit-kvlen N")?.parse()?),
             "--max-segments" => {
                 max_segments = Some(args.next().ok_or("--max-segments N")?.parse()?)
@@ -348,6 +352,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             record_inputs(histories, &last, &toks, 1);
         }
         last.copy_from_slice(&toks);
+    }
+    if spec.draft_iters > 0 {
+        return draft_bench(&mut e, &assets, &last, spec.draft_iters);
     }
     if let Some(mode) = spec.mode.clone() {
         let prompts: Vec<Vec<u32>> = (0..slots).map(prompt_for).collect();
@@ -745,6 +752,76 @@ struct SpecArgs {
     rung: usize,
     poison: bool,
     nsplit_kvlen: Option<u32>,
+    draft_iters: usize,
+}
+
+#[cfg(feature = "cuda")]
+/// `--draft-bench ITERS`: after the warmup steps, row `b` of the hidden activation is slot `b`'s
+/// last decode row and `last[b]` the token it produced, which is exactly a draft's input. Times
+/// the draft program at every `k` (ITERS back-to-back launches, inputs staged once), then checks
+/// the deepest draft against the target's own greedy continuation (prefix agreement).
+fn draft_bench(
+    e: &mut plowrt::exec::gpu::GpuEngine,
+    assets: &std::path::Path,
+    last: &[u32],
+    iters: usize,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use std::time::Instant;
+    let kmax = e.spec_draft_enable(assets)?;
+    let mut toks = Vec::new();
+    let rows: Vec<(usize, u32, u32)> = last
+        .iter()
+        .enumerate()
+        .map(|(b, &t)| (b, t, b as u32))
+        .collect();
+    let mut drafts = Vec::new();
+    for k in 1..=kmax {
+        e.spec_draft_stage(&rows, k)?;
+        for _ in 0..3 {
+            e.spec_draft_launch()?;
+        }
+        e.spec_draft_sync()?;
+        let t0 = Instant::now();
+        for _ in 0..iters {
+            e.spec_draft_launch()?;
+        }
+        e.spec_draft_sync()?;
+        let ms = t0.elapsed().as_secs_f64() * 1e3 / iters as f64;
+        e.spec_draft_run(&mut drafts)?;
+        println!(
+            "DRAFT B={} k={k} ms={ms:.4} per_token_ms={:.4} row0={:?}",
+            rows.len(),
+            ms / f64::from(k),
+            &drafts[..k as usize]
+        );
+    }
+    let k = kmax as usize;
+    let mut cur = last.to_vec();
+    let mut reference = vec![Vec::with_capacity(k); rows.len()];
+    for _ in 0..k {
+        let feeds: Vec<(usize, u32)> = cur.iter().copied().enumerate().collect();
+        e.step_slots(&feeds, &mut toks)?;
+        for (b, &t) in toks.iter().enumerate() {
+            reference[b].push(t);
+        }
+        cur.copy_from_slice(&toks);
+    }
+    let agree: Vec<usize> = (0..rows.len())
+        .map(|b| {
+            drafts[b * k..(b + 1) * k]
+                .iter()
+                .zip(&reference[b])
+                .take_while(|(d, r)| d == r)
+                .count()
+        })
+        .collect();
+    println!(
+        "DRAFT_AGREE B={} k={k} mean_prefix={:.3} per_row={agree:?} ref0={:?}",
+        rows.len(),
+        agree.iter().sum::<usize>() as f64 / rows.len() as f64,
+        reference[0]
+    );
+    Ok(())
 }
 
 /// `--spec MODE`: the span-mode verify identity gate. A plain greedy run of `steps` tokens per
@@ -773,7 +850,11 @@ fn spec_bench(
     let slots = last.len();
     let max_k = e.spec_enable(assets)?;
     if a.k > max_k || slots * (a.k + 1) > a.rung.max(1) && a.rung > 0 {
-        return Err(format!("k {} (max {max_k}) x {slots} slots exceeds rung {}", a.k, a.rung).into());
+        return Err(format!(
+            "k {} (max {max_k}) x {slots} slots exceeds rung {}",
+            a.k, a.rung
+        )
+        .into());
     }
     e.set_debug_min_rung(a.rung);
     e.set_debug_nsplit_kvlen(a.nsplit_kvlen);
@@ -834,7 +915,10 @@ fn spec_bench(
         }
         let spans: Vec<SpecSpan> = live
             .iter()
-            .map(|&b| SpecSpan { slot: b, tokens: &inputs[b] })
+            .map(|&b| SpecSpan {
+                slot: b,
+                tokens: &inputs[b],
+            })
             .collect();
         if a.poison {
             // Every row this launch writes holds NaN first: a row read before its own span's

@@ -94,6 +94,7 @@ mod riders;
 mod segment_gates;
 mod shared_tail;
 pub mod spec;
+mod spec_draft;
 mod token_batch;
 use cublaslt::{CublasLtDecodeRoute, LibraryRoute};
 use decode_rung::{
@@ -2798,6 +2799,7 @@ pub struct GpuEngine {
     slot_generations: Vec<u32>,
     /// Span-mode verify (`in.rowslot` packets); see [`spec`].
     spec: Option<spec::SpecRt>,
+    spec_draft: Option<spec_draft::SpecDraft>,
     /// Per slot, one past the highest KV row any launch wrote (verify writes past `pos`).
     kv_hw: Vec<u32>,
     /// Bench-only launch overrides ([`Self::set_debug_min_rung`], [`Self::set_debug_nsplit_kvlen`]).
@@ -7370,6 +7372,7 @@ impl GpuEngine {
                 .unwrap_or(0),
             slot_generations: vec![0; batch],
             spec,
+            spec_draft: None,
             kv_hw: vec![0; batch],
             debug_min_rows: 0,
             debug_nsplit_kvlen: None,
