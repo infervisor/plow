@@ -3,8 +3,11 @@
 
 The fp8 checkpoint produced for the body weights does NOT carry the embedding
 table, so a blob emitted with PLOW_FP8_HEAD=1 binds `fp8/<prefix>embed_tokens.*`
-to nothing and the engine memory-faults at the first head GEMV (plowrt does not
-refuse the missing tensor — see the task list). This writes the missing shard.
+to nothing and plowrt refuses to load it. This writes the missing shard,
+`model-head.safetensors`, into <fp8_dir>: plowrt maps every *.safetensors in the
+checkpoint dir, so it loads beside a single-file model.safetensors or a
+model-N-of-M set. Emit the packet against the dir that holds it (the packet pins
+every shard).
 
 Convention matches the body quantizer exactly (verified against
 layers.0.q_proj: scale = amax(row)/448, W8 = e4m3(W/scale), per-OUTPUT-row):

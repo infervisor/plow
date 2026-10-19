@@ -316,6 +316,41 @@ pub struct ServingMetrics {
     pub run_packets: Histogram,
     /// Time to first output per turn stage (`serve::turns::Kind`: ASR final, LLM TTFT, TTS TTFA).
     pub turn_stage: [Histogram; 3],
+    /// Chat requests whose rendered prompt has reasoning on, and the generated tokens their
+    /// reasoning splitter attributed to the trace (see [`ReasoningTally`]).
+    pub thinking_requests: AtomicU64,
+    pub reasoning_tokens: AtomicU64,
+    pub request_reasoning_tokens: Histogram,
+}
+
+/// One chat request's reasoning accounting, recorded once when its response finishes.
+pub struct ReasoningTally {
+    pub metrics: Arc<Metrics>,
+    /// The rendered prompt has reasoning on (counted at admission).
+    pub thinking: bool,
+}
+
+impl ReasoningTally {
+    /// Counts the admitted request when `thinking`.
+    pub fn admitted(metrics: Arc<Metrics>, thinking: bool) -> Self {
+        if thinking {
+            metrics.serving.thinking_requests.fetch_add(1, Relaxed);
+        }
+        Self { metrics, thinking }
+    }
+
+    /// `trace_tokens`: the splitter's count, the same number `reasoning_tokens` reports in
+    /// `usage`. Requests that neither asked for reasoning nor produced a trace stay out of the
+    /// histogram.
+    pub fn finished(&self, trace_tokens: u64) {
+        let m = &self.metrics.serving;
+        if trace_tokens > 0 {
+            m.reasoning_tokens.fetch_add(trace_tokens, Relaxed);
+        }
+        if self.thinking || trace_tokens > 0 {
+            m.request_reasoning_tokens.tokens(trace_tokens as usize);
+        }
+    }
 }
 
 pub fn escape_label(value: &str) -> String {
@@ -385,8 +420,9 @@ impl ServingMetrics {
         scalar!(
             "vllm:prompt_tokens_total",
             "counter",
-            "Computed prompt tokens, recorded at first generated token.",
+            "Prompt tokens including prefix-cache hits, recorded at first generated token.",
             |m: &Metrics, _| m.serving.prompt_computed.load(Relaxed)
+                + m.serving.prompt_cached.load(Relaxed)
         );
         scalar!(
             "vllm:prompt_tokens_cached_total",
@@ -414,6 +450,18 @@ impl ServingMetrics {
             |m: &Metrics, _| m.serving.prompt_cached.load(Relaxed)
         );
         scalar!("plowrt_requests_aborted_total", "counter", "Admitted requests dropped without normal completion or preemption; includes errors and disconnects.", |m: &Metrics, _| if m.serving.asr.cohort.load(Relaxed) { m.serving.asr.cancelled.load(Relaxed) } else { m.serving.aborted.load(Relaxed) });
+        scalar!(
+            "plowrt_requests_thinking_total",
+            "counter",
+            "Admitted chat requests whose rendered prompt has reasoning on (template thinking switch or a prompt that leaves the trace open).",
+            |m: &Metrics, _| m.serving.thinking_requests.load(Relaxed)
+        );
+        scalar!(
+            "plowrt_reasoning_tokens_total",
+            "counter",
+            "Generated tokens attributed to the reasoning trace, markers included; counted when a chat response finishes.",
+            |m: &Metrics, _| m.serving.reasoning_tokens.load(Relaxed)
+        );
         scalar!(
             "plowrt_requests_preempted_total",
             "counter",
@@ -589,6 +637,13 @@ impl ServingMetrics {
             "First through last generated token of completed requests."
         );
         hist!(
+            "plowrt_request_reasoning_tokens",
+            request_reasoning_tokens,
+            TOKENS,
+            1.0,
+            "Reasoning-trace tokens per finished chat request that had reasoning on or produced a trace."
+        );
+        hist!(
             "vllm:request_prompt_tokens",
             prompt_tokens,
             TOKENS,
@@ -610,11 +665,18 @@ impl ServingMetrics {
             "Generated length of normally completed requests."
         );
         hist!(
+            "vllm:request_max_num_generation_tokens",
+            output_tokens,
+            TOKENS,
+            1.0,
+            "Generated length of normally completed requests (one sequence per request)."
+        );
+        hist!(
             "vllm:request_params_max_tokens",
             max_tokens,
             TOKENS,
             1.0,
-            "Requested maximum output tokens at submission."
+            "Requested maximum output tokens of normally completed requests."
         );
         hist!(
             "plowrt_tick_generation_tokens",
@@ -758,11 +820,18 @@ pub struct RequestMetrics {
     tokens: usize,
     prompt: usize,
     cached: usize,
+    max_tokens: usize,
     finished: bool,
 }
 
 impl RequestMetrics {
-    pub fn new(metrics: Arc<Metrics>, arrived: Instant, queued: Instant, prompt: usize) -> Self {
+    pub fn new(
+        metrics: Arc<Metrics>,
+        arrived: Instant,
+        queued: Instant,
+        prompt: usize,
+        max_tokens: usize,
+    ) -> Self {
         let admitted = Instant::now();
         metrics.serving.running.fetch_add(1, Relaxed);
         metrics
@@ -778,6 +847,7 @@ impl RequestMetrics {
             tokens: 0,
             prompt,
             cached: 0,
+            max_tokens,
             finished: false,
         }
     }
@@ -821,9 +891,11 @@ impl RequestMetrics {
         if let (Some(first), Some(last)) = (self.first, self.last) {
             let decode = last.saturating_duration_since(first);
             m.decode.duration(decode);
-            if self.tokens > 1 {
-                m.tpot.duration(decode.div_f64((self.tokens - 1) as f64));
-            }
+            m.tpot.duration(if self.tokens > 1 {
+                decode.div_f64((self.tokens - 1) as f64)
+            } else {
+                Duration::ZERO
+            });
             let targets = crate::config::RuntimeConfig::get().slo_targets();
             if targets.active() {
                 let ttft_ms = first.saturating_duration_since(self.arrived).as_secs_f64() * 1e3;
@@ -839,6 +911,9 @@ impl RequestMetrics {
         m.prompt_tokens.tokens(self.prompt);
         m.computed_tokens.tokens(self.prompt - self.cached);
         m.output_tokens.tokens(self.tokens);
+        if self.max_tokens > 0 {
+            m.max_tokens.tokens(self.max_tokens);
+        }
         m.run_packets.tokens(packets);
     }
 }
@@ -890,7 +965,7 @@ mod tests {
     fn request_lifecycle_distinguishes_success_abort_and_preemption() {
         let m = Arc::new(Metrics::default());
         let now = Instant::now();
-        let mut r = RequestMetrics::new(m.clone(), now, now, 100);
+        let mut r = RequestMetrics::new(m.clone(), now, now, 100, 8);
         assert_eq!(m.serving.running.load(Relaxed), 1);
         r.token(40);
         r.token(40);
@@ -902,16 +977,46 @@ mod tests {
         assert_eq!(m.serving.prompt_computed.load(Relaxed), 60);
         assert_eq!(m.serving.prompt_cached.load(Relaxed), 40);
         assert_eq!(m.serving.generation.load(Relaxed), 2);
-        let mut aborted = RequestMetrics::new(m.clone(), now, now, 20);
+        let mut aborted = RequestMetrics::new(m.clone(), now, now, 20, 8);
         aborted.token(0);
         drop(aborted);
-        let mut preempted = RequestMetrics::new(m.clone(), now, now, 20);
+        let mut preempted = RequestMetrics::new(m.clone(), now, now, 20, 8);
         preempted.finish(FinishReason::Preempted, 0);
         drop(preempted);
         assert_eq!(m.serving.running.load(Relaxed), 0);
         assert_eq!(m.serving.aborted.load(Relaxed), 1);
         assert_eq!(m.serving.preempted.load(Relaxed), 1);
         assert_eq!(m.serving.success[0].load(Relaxed), 0);
+    }
+
+    #[test]
+    fn vllm_families_match_vllm_request_accounting() {
+        let m = Arc::new(Metrics::default());
+        let now = Instant::now();
+        let mut r = RequestMetrics::new(m.clone(), now, now, 100, 16);
+        r.token(40);
+        r.finish(FinishReason::Stop, 1);
+        drop(r);
+        let mut aborted = RequestMetrics::new(m.clone(), now, now, 10, 32);
+        aborted.token(0);
+        drop(aborted);
+        let mut out = String::new();
+        ServingMetrics::write(&mut out, &[("g".into(), m, true)]);
+        let l = "{model_name=\"g\",engine=\"0\"}";
+        for line in [
+            format!("vllm:prompt_tokens_total{l} 110\n"),
+            format!("vllm:prompt_tokens_cached_total{l} 40\n"),
+            format!("vllm:prefix_cache_queries_total{l} 110\n"),
+            format!("vllm:time_to_first_token_seconds_count{l} 2\n"),
+            format!("vllm:e2e_request_latency_seconds_count{l} 1\n"),
+            format!("vllm:request_time_per_output_token_seconds_count{l} 1\n"),
+            format!("vllm:request_params_max_tokens_count{l} 1\n"),
+            format!("vllm:request_params_max_tokens_sum{l} 16\n"),
+            format!("vllm:request_max_num_generation_tokens_count{l} 1\n"),
+            format!("vllm:request_max_num_generation_tokens_sum{l} 1\n"),
+        ] {
+            assert!(out.contains(&line), "missing {line}");
+        }
     }
 
     #[test]

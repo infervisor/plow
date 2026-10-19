@@ -6232,6 +6232,14 @@ fn emit_phase(
         } else {
             None
         };
+        // PLOW_GEMMA_MOE_GQ_HOIST: queue the router tail right behind its score slices. The
+        // global queue ranks it one step later than the dense GLU, so every workgroup claimed a
+        // dense slice first and the tail sat unclaimed (measured 3-16 us/layer at B=4..16) on
+        // the path the expert GLU waits on. Order-only.
+        let gq_hoist = decode && emit_config::active().gemma_moe_gq_hoist;
+        if let (Some(c_rt), true) = (c_rt_hoist, gq_hoist) {
+            b.gq_hoist(c_rt);
+        }
         // PLOW_QNORM_FUSE: the pre-FF RmsNorm carried the quant (t3/t4) — c_pf IS it. The
         // fuse_norm (decode) arm never fuses, so only the RmsNorm branch can set qnorm_fuse.
         let dmlp = if qnorm_fuse {
@@ -6617,6 +6625,10 @@ fn emit_phase(
                             d.i[1] = c.hidden;
                             d.f[0] = c.eps;
                         });
+                        // The expert GLU's other input: same queue starvation as the router tail.
+                        if gq_hoist {
+                            b.gq_hoist(c_xn2_local);
+                        }
                         b.emit(
                             DevOp::MoeExpertGluGemmaFp8,
                             glu_cus,
@@ -6728,9 +6740,9 @@ fn emit_phase(
                 // BOTH bf16 (8.04→8.22) and fp8 (6.03→6.21) @40ctx — the 1-block 4-pass scalar
                 // body costs more than the packet boundary it removes, and its reduction order
                 // differs from the vectorized NormResidualNorm (last-ulp bf16 flips → token
-                // drift vs the pair). Oracle is bit-exact vs its own golden. Default OFF; only
-                // worth revisiting as a register-cached vectorized body that replicates NRN's
-                // summation order. Opt in: PLOW_GEMMA_MOE_TAIL_FUSE=1.
+                // drift vs the pair). The NVIDIA body is now op70's body + NRN's body in one CTA
+                // (b staged in smem), bit-exact to the pair by construction. Opt in:
+                // PLOW_GEMMA_MOE_TAIL_FUSE=1.
                 let tail_fuse = emit_config::active().gemma_moe_tail_fuse;
                 // op72 IS batched now (op_moe.cuh: per-row block loop, `part` rows k*H apart),
                 // so the old B=1-only assert is gone. At B=1 it still emits one block and runs
@@ -7308,7 +7320,10 @@ fn emit_phase(
     // PLOW_FP8_HEAD: weight-only fp8 lm_head (GemvFp8, dequant-on-load, per-row scale).
     // The tied embedding LOOKUP stays bf16 (reads the original table); only the head GEMV
     // reads the fp8 twin. Own reporting row — vLLM's fp8 recipe keeps lm_head bf16.
-    let fp8_head = decode && n.head8 != TENSOR_NONE;
+    // Rungs on the cuBLASLt head keep the bf16 table: the library has no weight-only FP8 GEMM.
+    let lt_head =
+        emit_config::active().decode_cublaslt_at(t) && emit_config::active().decode_cublaslt_head;
+    let fp8_head = decode && n.head8 != TENSOR_NONE && !lt_head;
     // PLOW_MX4_HEAD: the same trade at w4 — 2.01 GB of bf16 tied head -> 0.53 GB of e2m1
     // + E8M0 block scales. Decode only; the tied EMBED lookup still reads the bf16 table.
     let mx4_head = decode && n.head4 != TENSOR_NONE;
@@ -7317,8 +7332,6 @@ fn emit_phase(
     // Argmax packets. Greedy B=1 decode on the bf16 head only (fp8 head keeps the classic path).
     // In a multi-rung decode ladder, all rungs must share the same instruction sequence shape,
     // so GemvArgmax is prohibited under ladders.
-    let lt_head =
-        emit_config::active().decode_cublaslt_at(t) && emit_config::active().decode_cublaslt_head;
     let fuse_am = fuse_argmax_on()
         && !lt_head
         && decode
@@ -9337,6 +9350,29 @@ pub(crate) fn require_moe_topk(top_k: u32, model: &str) {
          PLOW_MOE_MAX_TOPK and devgen::MOE_MAX_TOPK together (a drift test enforces the pair) \
          after re-checking the LDS carve at op_moe.h and the megakernel's register budget.",
         top_k - MOE_MAX_TOPK
+    );
+}
+
+/// Refuse group-limited routing that keeps fewer than `top_k` experts (or groups too small for
+/// the top-2 group score): the retained-expert half of `plow_route_group_ok` in
+/// runtime/common/moe_route_key.h; divisibility is the caller's assert. Below it the routers'
+/// rank select and the serial reference no longer pick the same experts.
+pub(crate) fn require_moe_groups(
+    n_exp: u32,
+    top_k: u32,
+    n_group: u32,
+    topk_group: u32,
+    model: &str,
+) {
+    if n_group <= 1 || topk_group == 0 || topk_group >= n_group {
+        return;
+    }
+    let gsz = n_exp / n_group;
+    assert!(
+        gsz >= 2 && topk_group * gsz >= top_k,
+        "{model}: group-limited routing keeps topk_group * n_exp / n_group = {topk_group} * \
+         {gsz} experts (groups of {gsz}), fewer than top_k = {top_k} or groups smaller than the \
+         top-2 group score needs; the selection would fall into masked experts"
     );
 }
 

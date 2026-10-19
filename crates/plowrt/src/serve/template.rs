@@ -33,6 +33,8 @@ pub struct RenderOpts {
     /// vLLM `continue_final_message`: render the last assistant turn as a
     /// prefix to continue instead of opening a fresh one.
     pub continue_final_message: bool,
+    /// vLLM `add_generation_prompt: false`: end the prompt after the last message.
+    pub no_generation_prompt: bool,
     /// OpenAI `tools`, bound as the template's `tools` (`None` renders as Python `None`).
     pub tools: Option<serde_json::Value>,
 }
@@ -49,6 +51,9 @@ pub struct ChatTemplate {
     pub tools: crate::serve::tools::ToolSupport,
     /// The reasoning-trace markers its model writes, when the template shows any.
     pub reasoning: Option<(&'static str, &'static str)>,
+    /// The kwarg that switches the template's reasoning on, and its value when a request omits
+    /// it (read from a probe render at load).
+    pub thinking_knob: Option<(&'static str, bool)>,
 }
 
 impl std::fmt::Debug for ChatTemplate {
@@ -269,10 +274,48 @@ impl ChatTemplate {
             source,
             tools: crate::serve::tools::ToolSupport::None,
             reasoning: crate::serve::tools::reasoning_markers(&text),
+            thinking_knob: None,
         };
         t.tools = crate::serve::tools::ToolSupport::probe(&t, &text);
+        t.thinking_knob = t.probe_thinking_knob(&text);
         tracing::info!(source = %t.source, tools = ?t.tools, "chat template tool support");
         Some(Arc::new(t))
+    }
+
+    /// Whether a request's `chat_template_kwargs` leave the template's reasoning switch on.
+    pub fn thinking_requested(&self, kwargs: &BTreeMap<String, serde_json::Value>) -> bool {
+        self.thinking_knob.is_some_and(|(knob, default)| {
+            kwargs.get(knob).map_or(default, |v| match v {
+                serde_json::Value::Null => false,
+                serde_json::Value::Bool(b) => *b,
+                serde_json::Value::Number(n) => n.as_f64() != Some(0.0),
+                serde_json::Value::String(s) => !s.is_empty(),
+                serde_json::Value::Array(a) => !a.is_empty(),
+                serde_json::Value::Object(o) => !o.is_empty(),
+            })
+        })
+    }
+
+    /// The first of the known reasoning switches the template reads, with its default: a render
+    /// without the kwarg equal to the one with it `true` means reasoning is on by default.
+    fn probe_thinking_knob(&self, text: &str) -> Option<(&'static str, bool)> {
+        let knob = ["enable_thinking", "thinking"]
+            .into_iter()
+            .find(|k| text.contains(k))?;
+        let msgs = [serde_json::json!({"role": "user", "content": "hi"})];
+        let with = |on: Option<bool>| {
+            let mut opts = RenderOpts::default();
+            if let Some(on) = on {
+                opts.kwargs.insert(knob.into(), serde_json::Value::Bool(on));
+            }
+            self.render_with(&msgs, &opts).ok()
+        };
+        let (none, on, off) = (with(None), with(Some(true)), with(Some(false)));
+        // A knob that changes nothing is not a switch.
+        if none.is_none() || on == off {
+            return None;
+        }
+        Some((knob, none == on))
     }
 
     /// Render `messages` with `add_generation_prompt=true` and no extra
@@ -302,7 +345,7 @@ impl ChatTemplate {
         ctx.insert("messages".into(), Value::from_serialize(messages));
         ctx.insert(
             "add_generation_prompt".into(),
-            Value::from(!opts.continue_final_message),
+            Value::from(!opts.continue_final_message && !opts.no_generation_prompt),
         );
         ctx.insert(
             "continue_final_message".into(),
@@ -323,7 +366,7 @@ impl ChatTemplate {
             ctx.insert(k.clone(), Value::from_serialize(v));
         }
 
-        tmpl.render(Value::from_serialize(&ctx)).map_err(|e| {
+        let rendered = tmpl.render(Value::from_serialize(&ctx)).map_err(|e| {
             // minijinja chains the cause; the innermost is the template's own
             // `raise_exception` message, which is the useful half.
             let mut msg = e.to_string();
@@ -333,8 +376,40 @@ impl ChatTemplate {
                 src = next;
             }
             msg
-        })
+        })?;
+        if opts.continue_final_message {
+            return continue_final(rendered, messages);
+        }
+        Ok(rendered)
     }
+}
+
+/// `transformers`' `continue_final_message`: cut the render right after the final message's
+/// text, so the model continues it instead of seeing its turn closed (most templates, Gemma 4's
+/// among them, close every turn whatever `add_generation_prompt` says).
+fn continue_final(mut rendered: String, messages: &[serde_json::Value]) -> Result<String, String> {
+    let content = messages.last().and_then(|m| m.get("content"));
+    let text = match content {
+        Some(serde_json::Value::String(s)) => Some(s.as_str()),
+        Some(serde_json::Value::Array(parts)) => parts
+            .iter()
+            .rev()
+            .find_map(|p| p.get("text").and_then(|t| t.as_str())),
+        _ => None,
+    }
+    .ok_or("continue_final_message is set but the final message has no text to continue")?;
+    let at = rendered.rfind(text.trim()).ok_or(
+        "continue_final_message is set but the final message does not appear in the chat after \
+         applying the chat template",
+    )?;
+    let lead = text.trim_start();
+    let end = if rendered[at..].starts_with(lead) {
+        at + lead.len()
+    } else {
+        at + text.trim().len()
+    };
+    rendered.truncate(end);
+    Ok(rendered)
 }
 
 #[cfg(test)]

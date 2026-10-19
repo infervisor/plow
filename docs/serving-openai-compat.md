@@ -104,7 +104,8 @@ emitter exists. Likewise `kimi_k25` — the two Kimi-K2.5 checkpoints on this ho
 **Reasoning is split from the answer.** With thinking left open the raw generation is
 `<trace></think><answer>`, and `</think>` is `special: false` in GLM's added tokens, so
 `skip_special_tokens` does NOT remove it. `content` now carries the answer alone and the trace
-goes to `reasoning_content`, on both the buffered and the streamed path.
+goes to `reasoning` (vLLM 0.28's name; a turn with only a trace answers `content: null`), on both
+the buffered and the streamed path. History accepts `reasoning` or `reasoning_content`.
 
 **The asset bundle must carry the tokenizer-side files.** It used to symlink `tokenizer.json`
 alone, so the template was unreachable, the Qwen2 pre-tokenizer fix-up could never fire, and
@@ -171,7 +172,7 @@ parser each:
 | `llama3_json` | Llama 3.1 / 3.2 / 3.3 | an answer that opens with `{"name": .., "parameters": {..}}` (or `<\|python_tag\|>`), `;`-separated |
 | `mistral` | Mistral v0.3 (`[TOOL_CALLS] [..]`) and v11+ (`[TOOL_CALLS]NAME[ARGS]{..}`) | ids are 9 alphanumerics, as the template requires |
 | `kimi_k2` | Kimi-K2 | `<\|tool_call_begin\|>functions.NAME:IDX<\|tool_call_argument_begin\|>{..}`; the id is kept |
-| `harmony` | gpt-oss | `commentary to=functions.NAME` messages; `analysis` → `reasoning_content` |
+| `harmony` | gpt-oss | `commentary to=functions.NAME` messages; `analysis` → `reasoning` |
 | `deepseek_v3` | DeepSeek V3 / R1 with a tools template (vLLM's `tool_chat_template_deepseek{v3,r1}.jinja`) | `<｜tool▁call▁begin｜>function<｜tool▁sep｜>NAME\n```json\n{..}\n```<｜tool▁call▁end｜>` |
 | `deepseek_v31` | DeepSeek V3.1 with a tools template (vLLM's `tool_chat_template_deepseekv31.jinja`) | `<｜tool▁call▁begin｜>NAME<｜tool▁sep｜>{..}<｜tool▁call▁end｜>` |
 
@@ -249,7 +250,7 @@ no markers; its markers are special tokens, so these requests decode with specia
 and gpt-oss's `analysis` channel (the harmony parser, with or without tools). This fixes the
 Gemma 4 leak where, after a tool result, the model's own `<|channel>thought\n<channel|>` came
 back as `thought\n` at the start of `content`. vLLM's `include_reasoning: false` drops
-`reasoning_content` from the response; the trace is still split out and counted in
+`reasoning` from the response; the trace is still split out and counted in
 `reasoning_tokens`.
 
 **Cost.** `tests/tool_stream_bench.rs` (release, `--ignored --nocapture`) measures the per-token

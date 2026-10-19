@@ -524,7 +524,7 @@ const STAGE: usize = 64 << 20;
 /// the launch loudly (never silent), so a stale value here cannot corrupt.
 const SMEM_PF: u32 = 21312 * 4;
 
-use crate::asset::checkpoint::Checkpoint;
+use crate::asset::checkpoint::{is_checkpoint_tensor, Checkpoint};
 
 /// One uploaded prefill bucket (`t == chunk size`), run under the `_pf`
 /// object. Its instruction stream is host-patched per chunk (KV write row,
@@ -3876,26 +3876,6 @@ pub enum PrefillStep {
     Done(u32),
 }
 
-fn is_checkpoint_tensor(
-    index: usize,
-    name: &str,
-    packed: Option<&plow_asset::packed_prefill::Manifest>,
-) -> bool {
-    let declared_runtime = packed.is_some_and(|m| {
-        (index == usize::from(m.slot) && name == "pf.request.slot")
-            || (index == usize::from(m.request) && name == "pf.request.table")
-            || m.stages.iter().enumerate().any(|(k, s)| {
-                (index == usize::from(s.slot) && name == format!("pf.request.slot.{k}"))
-                    || (index == usize::from(s.request) && name == format!("pf.request.table.{k}"))
-            })
-            || m.maps.iter().any(|map| {
-                index == usize::from(map.slots)
-                    && name == format!("pf.request.maps.{}", map.original)
-            })
-    });
-    !declared_runtime && packet::names::is_checkpoint_weight(name)
-}
-
 impl GpuEngine {
     /// Bring the model up on the device: blob + cubin + weights + decode
     /// tables. Slow (a 12B checkpoint is ~22 GiB of H2D) — called once at
@@ -3978,6 +3958,13 @@ impl GpuEngine {
             programs = blob.progs.len(),
             "parsed PLOWDEV blob"
         );
+        let missing = crate::asset::checkpoint::missing_weights(&blob, &raw, checkpoint_dir)?;
+        if !missing.is_empty() {
+            return Err(crate::asset::checkpoint::missing_weights_error(
+                checkpoint_dir,
+                &missing,
+            ));
+        }
         let mut live_kv_manifest = crate::memory::vmm::LiveKvLayout::manifest(&blob, &raw)?;
         let mut packed_prefill_metadata = blob
             .reserved_metadata(&raw, plow_asset::packed_prefill::SECTION)?
@@ -4525,12 +4512,22 @@ impl GpuEngine {
                     }
                 }
                 let configured_rings = config.nv_vmm_live_rings_for(assets_dir);
-                let rings = live_rings_for_capacity(
-                    configured_rings,
-                    live,
-                    live_kv_manifest.as_ref().map(|manifest| manifest.max_ctx),
-                    live_kv_manifest.as_ref().map(|manifest| manifest.batch),
-                );
+                let explicit_model_pinned = config.nv_vmm_live_rings_explicitly_pinned(assets_dir);
+                let auto_scope_unsupported =
+                    !live && prefix_layout.is_none() && !explicit_model_pinned;
+                let rings = if auto_scope_unsupported {
+                    if configured_rings == Some(true) {
+                        tracing::info!("live rings scoped off: model lacks VMM prefix layout and live KV geometry");
+                    }
+                    false
+                } else {
+                    live_rings_for_capacity(
+                        configured_rings,
+                        live,
+                        live_kv_manifest.as_ref().map(|manifest| manifest.max_ctx),
+                        live_kv_manifest.as_ref().map(|manifest| manifest.batch),
+                    )
+                };
                 if rings && configured_rings.is_none() {
                     tracing::info!(
                         max_ctx = live_kv_manifest.as_ref().map(|manifest| manifest.max_ctx),

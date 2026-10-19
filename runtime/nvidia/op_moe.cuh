@@ -440,6 +440,9 @@ static __global__ void plow_moe_slot_glu_fp8_blk(bf16* __restrict__ fu, const bf
 #ifndef PLOW_NV_TOPK_V4
 #define PLOW_NV_TOPK_V4 0
 #endif
+#ifndef PLOW_NV_ROUTER_V9
+#define PLOW_NV_ROUTER_V9 0
+#endif
 #ifndef PLOW_MOE_ROUTER_WIDE
 #define PLOW_MOE_ROUTER_WIDE 0
 #endif
@@ -819,6 +822,84 @@ static __device__ void d_moe_router_gemma_score(float* __restrict__ score,
     }
 }
 
+#if PLOW_NV_GEMV_RB && PLOW_NV_ROUTER_V9
+/* op69 with ONE dependent global round per CTA-round instead of three (row RMS, scale staging,
+ * then 3 x 4-chunk weight rounds: 4.8 + 1.3 + 4.1 us at B=4). Every lane issues all of its pair's
+ * weight chunks up front, each thread loads its resid/scale vectors in the same round, and h2 is
+ * staged from registers. Bit-exact with the arms it replaces: the RMS is plow_moe_row_rms's RB
+ * block partition (which plow_moe_rms_warp replays), h2 keeps each arm's association (B=1:
+ * ((x*inv)*s)*root, B>1: (x*inv)*(s*root)), and each lane's fmaf chain and the warp sum are
+ * unchanged. */
+#define PLOW_R9_NC ((PLOW_MOE_XN_MAX + GV_STEP - 1u) / GV_STEP)
+static_assert(PLOW_MOE_XN_MAX <= 2u * 256u * 8u, "V9 stages two 8-wide vectors per thread");
+static __device__ __noinline__ void plow_moe_router_score_v9(
+    float* __restrict__ score, const bf16* __restrict__ resid, const bf16* __restrict__ proj,
+    const bf16* __restrict__ scale, unsigned H, unsigned n_exp, float root, float eps,
+    unsigned slice, unsigned nblk, unsigned nrow, float* __restrict__ h2) {
+    const unsigned tid = threadIdx.x, lane = tid & 31u, warp = tid >> 5, nvec = H >> 3;
+    __shared__ float red9[8];
+    for (unsigned base = slice * 8u; base < nrow * n_exp; base += nblk * 8u) {
+        const unsigned row = base / n_exp;
+        const unsigned e = base + warp - row * n_exp;
+        const bf16* pr = proj + (size_t)e * H;
+        bf16v8 wv[PLOW_R9_NC];
+#pragma unroll
+        for (unsigned c = 0; c < PLOW_R9_NC; c++) {
+            const unsigned kk = c * GV_STEP + lane * 8u;
+            wv[c] = kk < H ? ld_glob8(pr + kk) : bf16v8_zero();
+        }
+        const bf16* rr = resid + (size_t)row * H;
+        bf16v8 xv[2], sv[2];
+#pragma unroll
+        for (unsigned q = 0; q < 2u; q++) {
+            const unsigned v = tid + q * 256u;
+            xv[q] = v < nvec ? ld_glob8(rr + v * 8u) : bf16v8_zero();
+            sv[q] = v < nvec ? ld_glob8(scale + v * 8u) : bf16v8_zero();
+        }
+        float part = 0.0f;
+#pragma unroll
+        for (unsigned q = 0; q < 2u; q++) {
+            if (tid + q * 256u >= nvec) continue;
+#pragma unroll
+            for (int j = 0; j < 8; j++) {
+                const float v = __bfloat162float(xv[q].x[j]);
+                part += v * v;
+            }
+        }
+        part = plow_warp_sum(part);
+        if (lane == 0) red9[warp] = part;
+        __syncthreads();
+        float t = 0.0f;
+#pragma unroll
+        for (unsigned i = 0; i < 8u; i++) t += red9[i];
+        const float invrms = rsqrtf(t / (float)H + eps);
+        PLOW_TL_PH(0);
+#pragma unroll
+        for (unsigned q = 0; q < 2u; q++) {
+            const unsigned v = tid + q * 256u;
+            if (v >= nvec) continue;
+#pragma unroll
+            for (int j = 0; j < 8; j++) {
+                const float x = __bfloat162float(xv[q].x[j]), s = __bfloat162float(sv[q].x[j]);
+                h2[v * 8u + j] = nrow == 1u ? x * invrms * s * root : x * invrms * (s * root);
+            }
+        }
+        __syncthreads();
+        PLOW_TL_PH(1);
+        float acc = 0.0f;
+#pragma unroll
+        for (unsigned c = 0; c < PLOW_R9_NC; c++) {
+            const unsigned kk = c * GV_STEP + lane * 8u;
+            if (kk < H) acc = dot8_fx(wv[c], h2 + kk, acc);
+        }
+        acc = plow_warp_sum(acc);
+        if (lane == 0) score[(size_t)row * n_exp + e] = acc;
+        PLOW_TL_PH(2);
+        __syncthreads(); /* h2 / red9 are rewritten by the next round */
+    }
+}
+#endif
+
 /* Association-changing fast experiment: identical block/expert mapping and RMS transform as the
  * exact scorer, but a conventional strided lane dot + warp reduction replaces the ordered shuffle
  * replay. Kept as a distinct opcode so a fast experiment can never silently change exact packets. */
@@ -834,6 +915,16 @@ static __device__ void d_moe_router_gemma_score_fast(float* __restrict__ score,
     const unsigned warp = tid >> 5;
     __shared__ float red[32];
     __shared__ float invs[PLOW_MOE_MAXB];
+#if PLOW_NV_GEMV_RB && PLOW_NV_ROUTER_V9 && !PLOW_MOE_XN_BF16 && !PLOW_MOE_ROUTER_WIDE
+    /* nrow <= 16: from B=32 a CTA runs 4+ rounds and the per-round barriers lose to the arm
+     * below (B=128 +0.30 ms). */
+    if (blockDim.x == 256u && (H & 7u) == 0u && H <= PLOW_MOE_XN_MAX && (n_exp & 7u) == 0u &&
+        nrow <= 16u) {
+        plow_moe_router_score_v9(score, resid, proj, scale, H, n_exp, root, eps, slice, nblk, nrow,
+                                 arena);
+        return;
+    }
+#endif
 #if PLOW_NV_GEMV_RB
     /* BATCH>1: only the rows this CTA scores. Round j's 8 pairs start at slice*8 + j*nblk*8, a
      * multiple of 8, so with 8 | n_exp they lie in one row: 2 rows per CTA at B=16, not 16.
@@ -2509,120 +2600,43 @@ static __device__ void d_moe_combine_norm_gemma(bf16* __restrict__ out,
 }
 
 /* ---- FUSED MoE LAYER TAIL (PLOW_DOP_MOE_COMBINE_RESID_NORM_GEMMA) -----
- * (MoeCombineNormGemma -> NormResidualNorm) in ONE packet: removes a 1-block packet
- * boundary from every layer's critical tail (comb -> NRN -> next-layer QKV).
- * Bit-exact to the pair: b and the new residual are ROUNDED to bf16 before the next
- * reduction reads them, reproducing the two ops' HBM round trips without the traffic.
+ * (MoeCombineNormGemma -> NormResidualNorm) in ONE packet: removes a packet boundary from every
+ * layer's critical tail (comb -> NRN -> next-layer QKV).
  *   b  = h1 + RMSNorm(sum_k part, g_pf2)          (op70's output)
  *   x  = (x + RMSNorm(b, g_po)) * ls  (rounded)   (the running residual)
  *   hn = RMSNorm(x, gn)                           (next sublayer's input)
- * arena holds one f32[H] staging row, overwritten pass to pass. */
+ * Bit-exact to the pair BY CONSTRUCTION: per row it runs op70's own body, staging the bf16 `b`
+ * in smem instead of HBM, then the NormResidualNorm body reading it back. The same object
+ * compiles both bodies for the standalone ops, so every arm (RB / RAW_NARROW / generic) matches.
+ * Arena: op70's f32[H] staging, then b at roundup8(H) floats (the caller checks capacity);
+ * NormResidualNorm's block-sum scratch is arena[0..8), free once op70's row barrier passes. */
 static __device__ void d_moe_combine_resid_norm_gemma(
         bf16* __restrict__ hn_all, bf16* __restrict__ x_all,
         const float* __restrict__ part_all, const bf16* __restrict__ h1_all,
         const bf16* __restrict__ g_pf2,
         const bf16* __restrict__ g_po, const bf16* __restrict__ gn, unsigned H, unsigned k,
         float eps, float ls, unsigned slice, unsigned nblk, unsigned nrow,
-        float* __restrict__ arena) {
-    const unsigned tid = threadIdx.x;
-    const unsigned nth = blockDim.x;
-    const unsigned lane = tid & 31u, warp = tid >> 5;
-    __shared__ float red[32];
-    const unsigned nw = (nth + 31u) >> 5;
-    const unsigned stride = nblk ? nblk : 1u;
-
-#define P9_BLOCK_RED(ssv, out)                                                                     \
-    do {                                                                                           \
-        float s_ = plow_warp_sum(ssv);                                                             \
-        if (lane == 0) red[warp] = s_;                                                             \
-        __syncthreads();                                                                           \
-        if (tid == 0) {                                                                            \
-            float t_ = 0.0f;                                                                       \
-            for (unsigned i_ = 0; i_ < nw; i_++) t_ += red[i_];                                    \
-            red[0] = rsqrtf(t_ / (float)H + eps);                                                  \
-        }                                                                                          \
-        __syncthreads();                                                                           \
-        out = red[0];                                                                              \
-    } while (0)
-
-    /* BATCH B>1: one CTA per row, mirroring d_moe_combine_norm_gemma's loop. `part` rows are
-     * k*H f32 apart, every other per-row tensor is H apart; the gammas are per-feature. At B=1
-     * (nrow==1, one emitted block) this runs exactly once on block 0, so the B=1 instruction
-     * stream and arithmetic are unchanged -- which is what lets the fusion be A/B'd at C1
-     * without this loop being a second variable. */
-    for (unsigned row = slice; row < nrow; row += stride) {
-        bf16* const hn = hn_all + (size_t)row * H;
-        bf16* const x = x_all + (size_t)row * H;
-        const float* const part = part_all + (size_t)row * k * H;
-        const bf16* const h1 = h1_all + (size_t)row * H;
-
-        /* Pass 1: combine (sum over slots), ss of the f32 combine. */
-        float ss = 0.0f;
-#if PLOW_NV_GEMV_RB
-        /* float4 twin. At B=1 this op runs on ONE CTA and pass 1 moves ~90 KB of the op's
-         * ~120 KB per row, so it dominates. The scalar form is why the tail fuse measured
-         * NEGATIVE (+0.18 ms) when it was first tried -- devgen's own comment says the fusion is
-         * "only worth revisiting as a register-cached vectorized body", which is this.
-         * `part` rows are H f32 apart and H % 8 == 0 by the emitter's contract, so the float4 reads
-         * are aligned. The ss grouping changes, hence its rounding; it was already a parallel
-         * reduction, and the arena values written are bit-identical. */
-        if ((H & 3u) == 0u) {
-            for (unsigned h = tid * 4u; h < H; h += nth * 4u) {
-                float4 acc4 = make_float4(0.f, 0.f, 0.f, 0.f);
-                for (unsigned slot = 0; slot < k; slot++) {
-                    const float4 v = *(const float4*)(part + (size_t)slot * H + h);
-                    acc4.x += v.x; acc4.y += v.y; acc4.z += v.z; acc4.w += v.w;
-                }
-                *(float4*)(arena + h) = acc4;
-                ss += acc4.x * acc4.x + acc4.y * acc4.y + acc4.z * acc4.z + acc4.w * acc4.w;
-            }
-        } else
+        float* arena) {
+#if PLOW_NV_PREFILL || PLOW_NV_NRN_WPR
+    /* NormResidualNorm picks a row-count-dependent arm here; the per-row call below would not. */
+    __trap();
 #endif
-        for (unsigned h = tid; h < H; h += nth) {
-            float acc = 0.0f;
-            for (unsigned slot = 0; slot < k; slot++) acc += part[(size_t)slot * H + h];
-            arena[h] = acc;
-            ss += acc * acc;
-        }
-        float inv1;
-        P9_BLOCK_RED(ss, inv1);
-
-        /* Pass 2: b = bf16(comb*inv1*g_pf2 + h1); ss over the ROUNDED b. */
-        ss = 0.0f;
-        for (unsigned h = tid; h < H; h += nth) {
-            const float v = arena[h] * inv1 * __bfloat162float(g_pf2[h]);
-            const bf16 bh = __float2bfloat16(v + __bfloat162float(h1[h]));
-            const float bf = __bfloat162float(bh);
-            arena[h] = bf;
-            ss += bf * bf;
-        }
-        __syncthreads(); /* red[] reused */
-        float inv2;
-        P9_BLOCK_RED(ss, inv2);
-
-        /* Pass 3: r = bf16((x + b*inv2*g_po) * ls); ss over the ROUNDED r. */
-        ss = 0.0f;
-        for (unsigned h = tid; h < H; h += nth) {
-            const float v =
-                (__bfloat162float(x[h]) + arena[h] * inv2 * __bfloat162float(g_po[h])) * ls;
-            const bf16 rh = __float2bfloat16(v);
-            const float rf = __bfloat162float(rh);
-            arena[h] = rf;
-            ss += rf * rf;
-        }
-        __syncthreads();
-        float inv3;
-        P9_BLOCK_RED(ss, inv3);
-
-        /* Pass 4: store the new residual and the next-sublayer normed input. */
-        for (unsigned h = tid; h < H; h += nth) {
-            const float rf = arena[h];
-            x[h] = __float2bfloat16(rf);
-            hn[h] = __float2bfloat16(rf * inv3 * __bfloat162float(gn[h]));
-        }
-        __syncthreads(); /* arena/red reused by the next row */
+    const unsigned stride = nblk ? nblk : 1u;
+    for (unsigned row = slice; row < nrow; row += stride) {
+        /* Both callees take the arena as a __restrict__ pointer, and nvcc then lets a restrict
+         * load cross __syncthreads (see gemv_nrn_smem): NRN's reads of bs were hoisted above op70's
+         * stores and decoded garbage. Each call gets an opaque copy of the arena pointer, produced
+         * after the previous call's trailing barrier. */
+        float* ar = arena;
+        asm volatile("" : "+l"(ar)::"memory");
+        d_moe_combine_norm_gemma((bf16*)(ar + ((H + 7u) & ~7u)), part_all + (size_t)row * k * H,
+                                 h1_all + (size_t)row * H, g_pf2, H, k, eps, 0u, 1u, 1u, ar);
+        asm volatile("" : "+l"(ar)::"memory");
+        bf16* const x = x_all + (size_t)row * H;
+        d_norm_residual_norm(hn_all + (size_t)row * H, x, x, (const bf16*)(ar + ((H + 7u) & ~7u)), g_po, gn,
+                             1u, H, eps, ls, 0u, 1u, ar);
+        __syncthreads(); /* the arena is reused by the next row */
     }
-#undef P9_BLOCK_RED
 }
 
 /* ---- ROW-BLOCKED FUSED NORM + EXPERT GLU (PLOW_NV_GEMV_RB, H100 campaign E2) -------------

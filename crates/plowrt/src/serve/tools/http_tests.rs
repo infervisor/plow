@@ -85,13 +85,19 @@ impl Drop for TempDir {
 }
 
 fn harness() -> Harness {
+    harness_for("gemma4-e4b")
+}
+
+/// `fixture`: a `tests/fixtures/toolcall` family (`gemma4-12b` carries the 26B's template).
+fn harness_for(fixture: &str) -> Harness {
     static SEQ: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
     let n = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let dir = std::env::temp_dir().join(format!("plowrt-tool-http-{}-{n}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
-    let fx =
-        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/toolcall/gemma4-e4b");
+    let fx = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/toolcall")
+        .join(fixture);
     std::fs::copy(
         fx.join("chat_template.jinja"),
         dir.join("chat_template.jinja"),
@@ -251,7 +257,7 @@ fn accumulate(
         };
         let d = &c["delta"];
         content.push_str(d["content"].as_str().unwrap_or_default());
-        reasoning.push_str(d["reasoning_content"].as_str().unwrap_or_default());
+        reasoning.push_str(d["reasoning"].as_str().unwrap_or_default());
         for t in d["tool_calls"].as_array().into_iter().flatten() {
             let i = t["index"].as_u64().unwrap() as usize;
             if let Some(id) = t["id"].as_str() {
@@ -538,7 +544,7 @@ async fn reasoning_is_separated_from_content() {
     let (_, v) = h.json(json!({"messages": user("2+2?")})).await;
     let m = &v["choices"][0]["message"];
     assert_eq!(
-        (m["content"].as_str(), m["reasoning_content"].as_str()),
+        (m["content"].as_str(), m["reasoning"].as_str()),
         (Some("It is 4."), Some("The user wants 2+2."))
     );
     assert_eq!(
@@ -555,16 +561,22 @@ async fn reasoning_is_separated_from_content() {
     let (_, v) = h
         .json(json!({"messages": user("2+2?"), "include_reasoning": false}))
         .await;
-    assert!(v["choices"][0]["message"]
-        .get("reasoning_content")
-        .is_none());
+    assert!(v["choices"][0]["message"].get("reasoning").is_none());
     assert_eq!(v["choices"][0]["message"]["content"], "It is 4.");
     let (frames, _) = h
         .sse(json!({"messages": user("2+2?"), "include_reasoning": false}))
         .await;
     assert!(!frames
         .iter()
-        .any(|f| f.to_string().contains("reasoning_content")));
+        .any(|f| f.to_string().contains("\"reasoning\"")));
+    // a turn cut inside its trace answers `content: null`, as vLLM does
+    h.reply(&["<|channel>", "thought", "\n", "Still", " thinking"]);
+    let (_, v) = h.json(json!({"messages": user("2+2?")})).await;
+    let m = &v["choices"][0]["message"];
+    assert_eq!(
+        (&m["content"], m["reasoning"].as_str()),
+        (&Value::Null, Some("Still thinking"))
+    );
 }
 
 #[tokio::test]
@@ -595,7 +607,7 @@ async fn a_tool_loop_answers_without_leaking_the_thought_channel() {
     );
     let m = &v["choices"][0]["message"];
     assert_eq!(m["content"], "It is 18°C in Paris.");
-    assert!(m.get("reasoning_content").is_none() && m.get("tool_calls").is_none());
+    assert!(m.get("reasoning").is_none() && m.get("tool_calls").is_none());
     assert_eq!(v["choices"][0]["finish_reason"], "stop");
     let (frames, _) = h.sse(json!({"messages": convo, "tools": tools()})).await;
     let (content, _, calls, _) = accumulate(&frames);
@@ -613,5 +625,248 @@ async fn a_call_cut_by_max_tokens_finishes_length() {
     assert_eq!(
         v["choices"][0]["message"]["tool_calls"][0]["function"]["arguments"],
         "{\"city\":\"Par"
+    );
+}
+
+/// `continue_final_message` continues the last assistant turn: the prompt ends right after its
+/// text, as `transformers` cuts it. Gemma 4's template closes every turn (`<turn|>`), so binding
+/// `add_generation_prompt: false` alone ended the prompt on a closed turn.
+#[tokio::test]
+async fn continue_final_message_ends_the_prompt_inside_the_final_turn() {
+    let h = harness_for("gemma4-12b");
+    h.reply(&[" Paris."]);
+    let msgs = json!([{"role": "user", "content": "Capital of France?"},
+                      {"role": "assistant", "content": "The capital of France is"}]);
+    let (code, body) = h
+        .json(json!({"messages": msgs, "continue_final_message": true, "add_generation_prompt": false}))
+        .await;
+    assert_eq!(code, StatusCode::OK, "{body}");
+    assert!(
+        h.last_prompt()
+            .ends_with("<|turn>model\nThe capital of France is"),
+        "{:?}",
+        h.last_prompt()
+    );
+    // `add_generation_prompt: false` alone closes the turn and opens no model turn.
+    let (code, _) = h
+        .json(json!({"messages": user("hi"), "add_generation_prompt": false}))
+        .await;
+    assert_eq!(code, StatusCode::OK);
+    assert!(
+        h.last_prompt().ends_with("<|turn>user\nhi<turn|>\n"),
+        "{:?}",
+        h.last_prompt()
+    );
+}
+
+/// vLLM 0.28 names a replayed trace `reasoning` (and maps `reasoning_content` onto it); the
+/// template reads either, so a tool loop replayed with `reasoning` must render it.
+#[tokio::test]
+async fn replayed_reasoning_field_is_rendered_like_reasoning_content() {
+    let h = harness_for("gemma4-12b");
+    h.reply(&["It is 18C."]);
+    let hist = |field: &str| {
+        let mut call = json!({"role": "assistant", "content": null,
+            "tool_calls": [{"id": "call_1", "type": "function",
+                "function": {"name": "get_weather", "arguments": "{\"city\": \"Paris\"}"}}]});
+        call[field] = json!("Need the weather tool.");
+        json!([{"role": "user", "content": "Weather in Paris?"}, call,
+               {"role": "tool", "tool_call_id": "call_1", "content": "18C"}])
+    };
+    let mut prompts = Vec::new();
+    for field in ["reasoning", "reasoning_content"] {
+        let (code, body) = h
+            .json(json!({"messages": hist(field), "tools": tools(),
+                         "chat_template_kwargs": {"enable_thinking": true}}))
+            .await;
+        assert_eq!(code, StatusCode::OK, "{body}");
+        prompts.push(h.last_prompt());
+    }
+    assert!(
+        prompts[0].contains("<|channel>thought\nNeed the weather tool.\n<channel|>"),
+        "{:?}",
+        prompts[0]
+    );
+    assert_eq!(prompts[0], prompts[1]);
+}
+
+impl Harness {
+    /// `(plowrt_requests_thinking_total, plowrt_reasoning_tokens_total, histogram count)`.
+    async fn reasoning_metrics(&self) -> (u64, u64, u64) {
+        let req = Request::get("/metrics").body(Body::empty()).unwrap();
+        let resp = self.app.clone().oneshot(req).await.unwrap();
+        let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+        let text = String::from_utf8(bytes.to_vec()).unwrap();
+        let read = |name: &str| {
+            let line = format!("{name}{{model_name=\"toolm\",engine=\"0\"}} ");
+            text.lines()
+                .find_map(|l| l.strip_prefix(&line))
+                .unwrap_or_else(|| panic!("{name} missing:\n{text}"))
+                .parse()
+                .unwrap()
+        };
+        (
+            read("plowrt_requests_thinking_total"),
+            read("plowrt_reasoning_tokens_total"),
+            read("plowrt_request_reasoning_tokens_count"),
+        )
+    }
+}
+
+/// Thinking off counts nothing; thinking on counts the request and its trace tokens, the same
+/// for a buffered and a streamed response, and equal to `usage.reasoning_tokens`; a generation
+/// cut inside its trace still counts what it generated.
+#[tokio::test]
+async fn reasoning_metrics_count_thinking_requests_and_trace_tokens() {
+    let h = harness_for("gemma4-12b");
+    let on = json!({"enable_thinking": true});
+    h.reply(&["Four", "."]);
+    let (code, _) = h.json(json!({"messages": user("2+2?")})).await;
+    assert_eq!(code, StatusCode::OK);
+    let _ = h.sse(json!({"messages": user("2+2?")})).await;
+    assert_eq!(h.reasoning_metrics().await, (0, 0, 0), "thinking off");
+
+    let trace = toks("<|channel>thought\nTwo plus two is four.<channel|>Four.");
+    let pieces: Vec<&str> = trace.iter().map(String::as_str).collect();
+    h.reply(&pieces);
+    let (code, body) = h
+        .json(json!({"messages": user("2+2?"), "chat_template_kwargs": on}))
+        .await;
+    assert_eq!(code, StatusCode::OK, "{body}");
+    let usage = body["usage"]["completion_tokens_details"]["reasoning_tokens"]
+        .as_u64()
+        .unwrap();
+    assert!(usage > 0);
+    assert_eq!(h.reasoning_metrics().await, (1, usage, 1), "buffered");
+    let (frames, _) = h
+        .sse(json!({"messages": user("2+2?"), "chat_template_kwargs": on,
+                    "stream_options": {"include_usage": true}}))
+        .await;
+    let streamed = frames.last().unwrap()["usage"]["completion_tokens_details"]["reasoning_tokens"]
+        .as_u64()
+        .unwrap();
+    assert_eq!(streamed, usage);
+    assert_eq!(h.reasoning_metrics().await, (2, 2 * usage, 2), "streamed");
+
+    // `max_tokens` lands inside the trace: finish `length`, every generated token is trace.
+    let cut = &pieces[..4];
+    h.reply(cut);
+    let (code, body) = h
+        .json(json!({"messages": user("2+2?"), "chat_template_kwargs": on, "max_tokens": 4}))
+        .await;
+    assert_eq!(code, StatusCode::OK, "{body}");
+    assert_eq!(body["choices"][0]["finish_reason"], "length");
+    assert_eq!(h.reasoning_metrics().await, (3, 2 * usage + 4, 3), "cut");
+}
+
+impl Harness {
+    async fn post_to(&self, path: &str, body: &str) -> (StatusCode, Value) {
+        let req = Request::post(path)
+            .header("content-type", "application/json")
+            .body(Body::from(body.to_string()))
+            .unwrap();
+        let resp = self.app.clone().oneshot(req).await.unwrap();
+        let status = resp.status();
+        let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+        (status, serde_json::from_slice(&bytes).unwrap())
+    }
+}
+
+/// Request-shape parity with vLLM: `max_tokens` and `max_completion_tokens` together (the
+/// latter wins), `response_format: text`, `reasoning_effort` turning Gemma 4's thinking on,
+/// schema errors as 400 with the error envelope, and `/v1/completions`' default of 16 tokens.
+#[tokio::test]
+async fn request_fields_are_read_as_vllm_reads_them() {
+    let h = harness_for("gemma4-12b");
+    let many: Vec<String> = (0..20).map(|i| format!("w{i} ")).collect();
+    let many: Vec<&str> = many.iter().map(String::as_str).collect();
+    h.reply(&many);
+    let (code, body) = h
+        .json(json!({"messages": user("hi"), "max_tokens": 100, "max_completion_tokens": 5}))
+        .await;
+    assert_eq!(code, StatusCode::OK, "{body}");
+    assert_eq!(
+        body["choices"][0]["finish_reason"], "length",
+        "5 wins over 100"
+    );
+
+    let (code, body) = h
+        .json(json!({"messages": user("hi"), "response_format": {"type": "text"}}))
+        .await;
+    assert_eq!(code, StatusCode::OK, "{body}");
+    let (code, _) = h
+        .json(json!({"messages": user("hi"), "response_format": {"type": "json_object"}}))
+        .await;
+    assert_eq!(code, StatusCode::BAD_REQUEST);
+
+    h.reply(&["ok"]);
+    for (extra, thinks) in [
+        (json!({"reasoning_effort": "high"}), true),
+        (json!({"reasoning_effort": "none"}), false),
+        (
+            json!({"reasoning_effort": "high", "chat_template_kwargs": {"enable_thinking": false}}),
+            false,
+        ),
+        (json!({}), false),
+    ] {
+        let mut b = json!({"messages": user("hi")});
+        for (k, v) in extra.as_object().unwrap() {
+            b[k] = v.clone();
+        }
+        let (code, body) = h.json(b).await;
+        assert_eq!(code, StatusCode::OK, "{body}");
+        assert_eq!(h.last_prompt().contains("<|think|>"), thinks, "{extra}");
+    }
+
+    for bad in [
+        r#"{"model": "toolm", "messages": "hi"}"#,
+        r#"{"model": "toolm"}"#,
+        r#"{"model": "toolm", "messages": [{"role": "user", "content": "hi"}], "max_tokens": -5}"#,
+    ] {
+        let (code, body) = h.post_to("/v1/chat/completions", bad).await;
+        assert_eq!(code, StatusCode::BAD_REQUEST, "{bad}");
+        assert_eq!(body["error"]["code"], "invalid_json", "{body}");
+    }
+
+    h.reply(&many);
+    let (code, body) = h
+        .post_to(
+            "/v1/completions",
+            r#"{"model": "toolm", "prompt": "Hello"}"#,
+        )
+        .await;
+    assert_eq!(code, StatusCode::OK, "{body}");
+    assert_eq!(
+        body["choices"][0]["finish_reason"], "length",
+        "default 16 < 20"
+    );
+}
+
+/// `max_tokens` landing inside a call's head (before its name is complete) used to return the
+/// head's syntax as the answer (`content: "call:get_weather"`); it is call framing, not text.
+#[tokio::test]
+async fn a_call_head_cut_by_max_tokens_is_not_content() {
+    let h = harness();
+    let pieces = ["Checking.", "<|tool_call>", "call", ":get", "_weather"];
+    h.reply(&pieces);
+    let (_, v) = h
+        .json(json!({"messages": user("w"), "tools": tools(), "max_tokens": 5}))
+        .await;
+    assert_eq!(v["choices"][0]["finish_reason"], "length");
+    assert_eq!(v["choices"][0]["message"]["content"], "Checking.", "{v}");
+    let (frames, _) = h
+        .sse(json!({"messages": user("w"), "tools": tools(), "max_tokens": 5}))
+        .await;
+    let (content, _, calls, finish) = accumulate(&frames);
+    assert_eq!((content.as_str(), calls.len()), ("Checking.", 0));
+    assert_eq!(finish.as_deref(), Some("length"));
+    // A turn that ENDS (not cut) inside a head still returns it as text.
+    let (_, v) = h
+        .json(json!({"messages": user("w"), "tools": tools(), "max_tokens": 50}))
+        .await;
+    assert_eq!(v["choices"][0]["finish_reason"], "stop");
+    assert_eq!(
+        v["choices"][0]["message"]["content"],
+        "Checking.call:get_weather"
     );
 }

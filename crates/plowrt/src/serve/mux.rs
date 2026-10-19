@@ -816,7 +816,6 @@ impl ModelMux {
         ingress: Option<IngressGuard<'_>>,
     ) -> std::result::Result<(), SubmitError> {
         Metrics::inc(&self.metrics.requests);
-        self.metrics.serving.max_tokens.tokens(job.gen.max_tokens);
         if self.shed_queue_depth() {
             Metrics::inc(&self.metrics.rejected);
             Metrics::inc(&self.metrics.shed_queue);
@@ -860,7 +859,6 @@ impl ModelMux {
     /// that bounds its own requests in flight.
     pub async fn submit_wait(&self, job: Job) -> std::result::Result<(), SubmitError> {
         Metrics::inc(&self.metrics.requests);
-        self.metrics.serving.max_tokens.tokens(job.gen.max_tokens);
         while !self.reserve_queue() {
             tokio::select! {
                 _ = self.tx.closed() => {
@@ -2836,6 +2834,7 @@ fn admit_session(
         arrived,
         job.arrived,
         job.prompt_ids.len(),
+        job.gen.max_tokens,
     ));
     if let Some(session) = &session {
         retention.table.forget(session);
@@ -6247,6 +6246,11 @@ fn pf_itl_budget_ms() -> u32 {
 }
 
 #[cfg(feature = "cuda")]
+fn pf_itl_force() -> bool {
+    crate::config::RuntimeConfig::get().pf_itl_force()
+}
+
+#[cfg(feature = "cuda")]
 fn pf_admit_overlap() -> bool {
     crate::config::RuntimeConfig::get().pf_admit_overlap
 }
@@ -6550,7 +6554,8 @@ fn gpu_prefill_batched_pass(
                 .filter(|_| {
                     decode_rows > 0
                         && pf_itl_budget_ms() > 0
-                        && itl_owed_rows(slots, cap, withheld, queued_rows) <= budget_max
+                        && (pf_itl_force()
+                            || itl_owed_rows(slots, cap, withheld, queued_rows) <= budget_max)
                 })
                 .map(|rung| itl_rung_rows(e, rung, decode_rows));
             AdmitRoom::new(ready, admit_launch_rows(launch_cap, rung), decode_rows)
@@ -6738,7 +6743,7 @@ fn gpu_prefill_batched_pass(
         // prefill rows/s), so the budget yields to throughput until the backlog drains.
         let budget_on = decode_rows > 0
             && pf_itl_budget_ms() > 0
-            && itl_owed_rows(slots, cap, withheld, queued_rows) <= budget_max;
+            && (pf_itl_force() || itl_owed_rows(slots, cap, withheld, queued_rows) <= budget_max);
         let media_spans = candidates.iter().any(|c| {
             slots[c.span.slot as usize]
                 .as_ref()
@@ -7501,7 +7506,7 @@ fn slot_rng01_at(slot: &Slot, k: usize) -> f32 {
 #[cfg(feature = "cuda")]
 fn dev_sample_spec(slot: &Slot) -> Option<crate::exec::gpu::DevSample> {
     let p = &slot.gen.params;
-    if p.temperature <= 0.0 || p.needs_host_logits() {
+    if p.is_greedy() || p.needs_host_logits() {
         return None;
     }
     Some(crate::exec::gpu::DevSample {
@@ -7555,7 +7560,7 @@ fn gpu_finish_token(
             || p.frequency_penalty != 0.0
             || !p.logit_bias.is_empty();
         // Greedy logprobs rows keep the device argmax (same bf16 row, same lowest-id tie-break).
-        let tok = if p.temperature <= 0.0 && !adjusted {
+        let tok = if p.is_greedy() && !adjusted {
             argmax_tok
         } else {
             let raw = (stats.is_some() && adjusted).then(|| logits.clone());
@@ -7605,7 +7610,7 @@ fn greedy_stats_k(p: &crate::text::sample::SamplingParams) -> Option<u32> {
         || p.presence_penalty != 0.0
         || p.frequency_penalty != 0.0
         || !p.logit_bias.is_empty();
-    (p.temperature <= 0.0 && !adjusted)
+    (p.is_greedy() && !adjusted)
         .then(|| u32::from(req.top.min(crate::text::logprobs::MAX_TOP_LOGPROBS)))
 }
 
@@ -7837,7 +7842,7 @@ fn cfg_draw(slot: &mut Slot) -> u32 {
 
 #[cfg(feature = "cuda")]
 fn gpu_argmax_eligible(params: &crate::text::sample::SamplingParams) -> bool {
-    params.temperature <= 0.0 && !params.needs_host_logits()
+    params.is_greedy() && !params.needs_host_logits()
 }
 
 /// §HOSTT: close a timed decode engine call and open its emit loop (`tokens` = the tick's count
@@ -10273,6 +10278,9 @@ mod tests {
         let mut params = crate::text::sample::SamplingParams::default();
         assert!(!gpu_argmax_eligible(&params));
         params.temperature = 0.0;
+        assert!(gpu_argmax_eligible(&params));
+        params.temperature = 1.0;
+        params.top_k = 1;
         assert!(gpu_argmax_eligible(&params));
         params.repetition_penalty = 1.1;
         assert!(!gpu_argmax_eligible(&params));

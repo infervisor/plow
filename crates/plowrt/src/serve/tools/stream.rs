@@ -132,7 +132,7 @@ struct DeltaFrame<'a> {
     role: Option<&'static str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     content: Option<&'a str>,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(rename = "reasoning", skip_serializing_if = "Option::is_none")]
     reasoning_content: Option<&'a str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     tool_calls: Option<Deltas<'a>>,
@@ -290,7 +290,7 @@ impl ToolStream {
     }
 
     /// `text: None` is the end of the generation.
-    fn step(&mut self, text: Option<&str>, _cut: bool) {
+    fn step(&mut self, text: Option<&str>, cut: bool) {
         if !self.carry {
             self.content.clear();
             self.has_content = false;
@@ -313,6 +313,9 @@ impl ToolStream {
                     p.push(&self.cbuf, &mut out);
                 }
                 if text.is_none() {
+                    if cut {
+                        p.cut();
+                    }
                     p.finish(&mut out);
                 }
             }

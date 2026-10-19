@@ -340,6 +340,18 @@ __device__ __forceinline__ void fp8v8_to_f32(fp8v8 w, float out[8]) {
         out[2 * j + 1] = f.y;
     }
 }
+/* fp8v8_to_f32 on the 8 bytes as two words: the converts take each 16-bit half in place instead of
+ * the byte-by-byte repack the uint8_t view compiles to (same converts, same values). */
+__device__ __forceinline__ void fp8w2_to_f32(uint2 w, float out[8]) {
+#pragma unroll
+    for (int j = 0; j < 4; j++) {
+        const unsigned word = j < 2 ? w.x : w.y;
+        __half2_raw h = __nv_cvt_fp8x2_to_halfraw2((__nv_fp8x2_storage_t)(word >> (16 * (j & 1))), __NV_E4M3);
+        float2 f = __half22float2(*reinterpret_cast<__half2*>(&h));
+        out[2 * j] = f.x;
+        out[2 * j + 1] = f.y;
+    }
+}
 /* f32 -> one e4m3 byte; hardware round-to-nearest-even + saturation to 448 (same rounding the
  * offline w8a8 activation quant uses in d_quant_fp8). */
 __device__ __forceinline__ uint8_t quant_fp8(float v) {
@@ -1000,6 +1012,32 @@ __device__ __forceinline__ void fa_decode_rg_item(
 #ifndef PLOW_NV_FA_RG8_U256
 #define PLOW_NV_FA_RG8_U256 8
 #endif
+/* Staged rows (PLOW_NV_FA_RG8S): the register body has U rows per warp in flight and nothing
+ * while it computes. Here each warp streams the SAME rows through a private smem ring of
+ * PLOW_NV_FA_RG8S_STAGES iterations with cp.async, so NSTG-1 iterations are in flight during the
+ * dot products. Lane map, row clamp, online softmax and fold are the register body's: the
+ * partials are bit-identical. Rows past `hi` are never copied (the clamp copies row hi - 1). */
+#ifndef PLOW_NV_FA_RG8S
+#define PLOW_NV_FA_RG8S 0
+#endif
+#ifndef PLOW_NV_FA_RG8S_STAGES
+#define PLOW_NV_FA_RG8S_STAGES 2
+#endif
+#define FA_RG8_U(D) ((D) == 256 ? PLOW_NV_FA_RG8_U256 : PLOW_NV_FA_RG8_U)
+/* One warp's stage: U rows of K, U of V, then U k scales and U v scales. */
+#define FA_RG8S_WST(D) ((2u * (unsigned)FA_RG8_U(D) * (D) + 8u * (unsigned)FA_RG8_U(D) + 15u) / 16u * 16u)
+#define FA_RG8S_RING_OFF(D) ((PLOW_NV_WARPS * ((D) + 2u) + 31u) / 32u * 32u)
+#define FA_RG8S_SMEM_FLOATS(D) \
+    (PLOW_NV_FA_RG8S ? FA_RG8S_RING_OFF(D) + PLOW_NV_WARPS * PLOW_NV_FA_RG8S_STAGES * FA_RG8S_WST(D) / 4u : 0u)
+__device__ __forceinline__ void fa_rg8s_cp16(unsigned dst, const void* src) {
+    asm volatile("cp.async.cg.shared.global [%0], [%1], 16;\n" ::"r"(dst), "l"(src) : "memory");
+}
+__device__ __forceinline__ void fa_rg8s_cp4(unsigned dst, const void* src) {
+    asm volatile("cp.async.ca.shared.global [%0], [%1], 4;\n" ::"r"(dst), "l"(src) : "memory");
+}
+template <int N> __device__ __forceinline__ void fa_rg8s_wait() {
+    asm volatile("cp.async.wait_group %0;\n" ::"n"(N) : "memory");
+}
 template <int D, int GF>
 __device__ __forceinline__ void fa_decode_rg8_item(
     float* __restrict__ Opart, float* __restrict__ mlpart, const __nv_bfloat16* __restrict__ Q,
@@ -1009,8 +1047,36 @@ __device__ __forceinline__ void fa_decode_rg8_item(
     float scale, float* lds) {
     static_assert(D == 256 || D == 512, "FP8 row-group decode: hd256 / hd512");
     constexpr unsigned NCH = D / 256, NGRP = PLOW_NV_WARPS;
-    constexpr int U = D == 256 ? PLOW_NV_FA_RG8_U256 : PLOW_NV_FA_RG8_U, E = 8 * NCH;
+    constexpr int U = FA_RG8_U(D), E = 8 * NCH;
     const unsigned tid = threadIdx.x, lane = tid & 31u, grp = tid >> 5;
+#if PLOW_NV_FA_RG8S
+    constexpr unsigned NSTG = PLOW_NV_FA_RG8S_STAGES, KB = (unsigned)U * D, WST = FA_RG8S_WST(D);
+    static_assert(NSTG >= 2 && NSTG <= 8 && KB % 512u == 0 && 2u * U <= 32u, "RG8S stage shape");
+    const unsigned char* const wring = (const unsigned char*)(lds + FA_RG8S_RING_OFF(D)) + grp * NSTG * WST;
+    const unsigned wring_s = (unsigned)__cvta_generic_to_shared(wring);
+    const unsigned nit = hi > lo ? (hi - lo + NGRP * U - 1u) / (NGRP * U) : 0u;
+    /* One commit group per iteration (empty past the last), so wait_group<NSTG-1> retires `it`. */
+    auto issue = [&](unsigned it) {
+        if (it < nit) {
+            const unsigned dst = wring_s + (it % NSTG) * WST, r0 = lo + it * (NGRP * U) + grp;
+#pragma unroll
+            for (unsigned i = 0; i < 2u * KB / 512u; i++) {
+                const unsigned q = (i * 32u + lane) % (KB / 16u), u = q / (D / 16u), col = q % (D / 16u);
+                const unsigned r = min(r0 + NGRP * u, hi - 1u) & kv_mask;
+                fa_rg8s_cp16(dst + (i * 512u >= KB ? KB : 0u) + u * D + col * 16u,
+                             (i * 512u >= KB ? vb8 : kb8) + (size_t)r * D + col * 16u);
+            }
+            if (lane < 2u * U) {
+                const unsigned u = lane % U, r = min(r0 + NGRP * u, hi - 1u) & kv_mask;
+                fa_rg8s_cp4(dst + 2u * KB + lane * 4u, (lane < (unsigned)U ? ksc : vsc) + r);
+            }
+        }
+        fa_cp_commit();
+    };
+    /* Ahead of the Q loads: the first stages' latency overlaps them. */
+#pragma unroll
+    for (unsigned j = 0; j + 1u < NSTG; j++) issue(j);
+#endif
     float qf[GF][E], m[GF], l[GF], o[GF][E];
 #pragma unroll
     for (int g = 0; g < GF; g++) {
@@ -1029,26 +1095,47 @@ __device__ __forceinline__ void fa_decode_rg8_item(
     /* Block-uniform trip count: the score reductions are full-warp shuffles. */
     for (unsigned base = lo; base < hi; base += NGRP * U) {
         const unsigned r0 = base + grp;
-        fp8v8 k8[U][NCH], v8[U][NCH];
+        uint2 k8[U][NCH], v8[U][NCH];
         float ks[U], vs[U];
+#if PLOW_NV_FA_RG8S
+        {
+            const unsigned it = (base - lo) / (NGRP * U);
+            __syncwarp(); /* every lane has read the stage the next issue overwrites */
+            issue(it + NSTG - 1u);
+            fa_rg8s_wait<NSTG - 1>();
+            __syncwarp(); /* the scales were copied by other lanes */
+            const unsigned char* st = wring + (it % NSTG) * WST;
+#pragma unroll
+            for (int u = 0; u < U; u++) {
+#pragma unroll
+                for (int c = 0; c < (int)NCH; c++) {
+                    k8[u][c] = *(const uint2*)(st + u * D + c * 256u + lane * 8u);
+                    v8[u][c] = *(const uint2*)(st + KB + u * D + c * 256u + lane * 8u);
+                }
+                ks[u] = ((const float*)(st + 2u * KB))[u];
+                vs[u] = ((const float*)(st + 2u * KB))[U + u];
+            }
+        }
+#else
 #pragma unroll
         for (int u = 0; u < U; u++) {
             const unsigned r = min(r0 + NGRP * (unsigned)u, hi - 1u) & kv_mask;
 #pragma unroll
             for (int c = 0; c < (int)NCH; c++) {
                 const size_t off = (size_t)r * D + c * 256u + lane * 8u;
-                k8[u][c] = ld_glob_fp8v8(kb8 + off);
-                v8[u][c] = ld_glob_fp8v8(vb8 + off);
+                k8[u][c] = *(const uint2*)(kb8 + off);
+                v8[u][c] = *(const uint2*)(vb8 + off);
             }
             ks[u] = ksc[r];
             vs[u] = vsc[r];
         }
+#endif
         float sc[GF][U];
 #pragma unroll
         for (int u = 0; u < U; u++) {
             float kf[E];
 #pragma unroll
-            for (int c = 0; c < (int)NCH; c++) fp8v8_to_f32(k8[u][c], kf + c * 8);
+            for (int c = 0; c < (int)NCH; c++) fp8w2_to_f32(k8[u][c], kf + c * 8);
 #pragma unroll
             for (int g = 0; g < GF; g++) {
                 float d = 0.0f;
@@ -1067,9 +1154,13 @@ __device__ __forceinline__ void fa_decode_rg8_item(
             /* No live row yet: shift by 0 so dead rows weigh ex2(NEG_INF) = 0. */
             const float mref = mx > FA_NEG_INF ? mx : 0.0f;
             const float corr = FA_EXP(m[g] - mref);
+            /* Warp-uniform (the butterfly leaves every lane the same score bits); x * 1 == x. l stays
+             * unconditional: its multiply contracts with the first p add below. */
             l[g] *= corr;
+            if (corr != 1.0f) {
 #pragma unroll
-            for (int i = 0; i < E; i++) o[g][i] *= corr;
+                for (int i = 0; i < E; i++) o[g][i] *= corr;
+            }
             m[g] = mx;
 #pragma unroll
             for (int u = 0; u < U; u++) {
@@ -1082,7 +1173,7 @@ __device__ __forceinline__ void fa_decode_rg8_item(
         for (int u = 0; u < U; u++) {
             float vf[E];
 #pragma unroll
-            for (int c = 0; c < (int)NCH; c++) fp8v8_to_f32(v8[u][c], vf + c * 8);
+            for (int c = 0; c < (int)NCH; c++) fp8w2_to_f32(v8[u][c], vf + c * 8);
 #pragma unroll
             for (int g = 0; g < GF; g++)
 #pragma unroll

@@ -253,6 +253,7 @@ pub(crate) const PREFILL_ROW_FIELDS: &[(DevOp, RowField)] = &[
     (DevOp::GemmWideFp8, RowField::Rows(0)),
     (DevOp::GemmGluFp8, RowField::Rows(0)),
     (DevOp::GemmFp8Blk, RowField::Rows(0)),
+    (DevOp::GemmFp8Mx, RowField::Rows(0)),
     (DevOp::GemmFp8Block128, RowField::Rows(0)),
     // Its a_scale is laid out [K/128][M]: left at the bucket width while the GEMM above shrinks to
     // the live rows, the GEMM read every K group after the first at the wrong stride (garbage on

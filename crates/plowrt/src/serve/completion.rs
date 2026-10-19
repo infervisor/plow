@@ -77,6 +77,9 @@ pub async fn completions(
     response
 }
 
+/// OpenAI's and vLLM's `max_tokens` default for `/v1/completions` (chat's is the context).
+const COMPLETIONS_DEFAULT_MAX_TOKENS: usize = 16;
+
 async fn completions_with(
     state: Arc<AppState>,
     // `Result<Json<..>, JsonRejection>` rather than `Json<..>`: axum's default
@@ -88,15 +91,7 @@ async fn completions_with(
 ) -> Response {
     let Json(mut req) = match req {
         Ok(r) => r,
-        Err(e) => {
-            return crate::serve::api_error(
-                e.status(),
-                e.body_text(),
-                "invalid_request_error",
-                Some("invalid_json"),
-                None,
-            )
-        }
+        Err(e) => return crate::serve::json_rejection(e),
     };
 
     // Aliases, resolved once before any slug-keyed lookup — see `chat`.
@@ -353,8 +348,11 @@ async fn completions_with(
     }
     let n_prompt = prompt_ids.len();
     if req.max_tokens.is_none() {
-        gen.max_tokens =
-            crate::serve::default_max_tokens(gen.max_tokens, state.max_ctx(&req.model), n_prompt);
+        gen.max_tokens = crate::serve::default_max_tokens(
+            COMPLETIONS_DEFAULT_MAX_TOKENS.max(gen.min_tokens),
+            state.max_ctx(&req.model),
+            n_prompt,
+        );
     }
     if let Some(e) =
         crate::serve::context_overflow(state.max_ctx(&req.model), n_prompt, gen.max_tokens)

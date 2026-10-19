@@ -75,13 +75,14 @@ impl SamplingFields {
     /// sign.
     pub fn validate(&self) -> Result<(), ParamError> {
         range(self.temperature, "temperature", 0.0, 2.0, false)?;
-        range(self.top_p, "top_p", 0.0, 1.0, true)?;
+        let top_p_lo_open = self.temperature != Some(0.0);
+        range(self.top_p, "top_p", 0.0, 1.0, top_p_lo_open)?;
         range(self.min_p, "min_p", 0.0, 1.0, false)?;
         range(
             self.repetition_penalty,
             "repetition_penalty",
             0.0,
-            2.0,
+            100.0,
             true,
         )?;
         range(self.presence_penalty, "presence_penalty", -2.0, 2.0, false)?;
@@ -176,8 +177,13 @@ pub struct ChatRequest {
     /// completions and deprecated `max_tokens`; current clients (including
     /// `vllm bench serve --backend openai-chat`) send only the new name.
     /// Accept both, or the cap is silently ignored and generation runs to EOS.
-    #[serde(default, alias = "max_completion_tokens")]
+    /// Read through [`ChatRequest::normalize`], which folds `max_completion_tokens` in.
+    #[serde(default)]
     pub max_tokens: Option<u32>,
+    /// Takes precedence over `max_tokens`, as in vLLM. Separate fields rather than a serde
+    /// alias: a body carrying both (several SDK wrappers send both) was a duplicate-field 422.
+    #[serde(default)]
+    pub max_completion_tokens: Option<u32>,
     #[serde(flatten)]
     pub sampling: SamplingFields,
     /// vLLM extension: run to `max_tokens` instead of stopping at eos. Sent by
@@ -209,6 +215,9 @@ pub struct ChatRequest {
     /// rather than closing it and opening a new one.
     #[serde(default)]
     pub continue_final_message: Option<bool>,
+    /// vLLM extension (default true): `false` ends the prompt after the last message.
+    #[serde(default)]
+    pub add_generation_prompt: Option<bool>,
     /// Per-request template override, for checkpoints that ship none.
     #[serde(default)]
     pub chat_template: Option<String>,
@@ -246,6 +255,23 @@ pub struct ChatRequest {
     /// split from `content` and counted in `reasoning_tokens`).
     #[serde(default)]
     pub include_reasoning: Option<bool>,
+}
+
+impl ChatRequest {
+    /// Fold the request's alternative spellings into the fields the handler reads:
+    /// `max_completion_tokens` into `max_tokens`, and vLLM's `reasoning_effort` into the
+    /// template's `enable_thinking` (on unless `"none"`), unless the request set that itself.
+    pub fn normalize(&mut self) {
+        if let Some(m) = self.max_completion_tokens.take() {
+            self.max_tokens = Some(m);
+        }
+        if let Some(effort) = &self.reasoning_effort {
+            self.chat_template_kwargs
+                .get_or_insert_with(BTreeMap::new)
+                .entry("enable_thinking".into())
+                .or_insert_with(|| serde_json::Value::Bool(effort != "none"));
+        }
+    }
 }
 
 /// Stop matching runs on the serialized dispatcher for every generated token, in time
@@ -389,6 +415,10 @@ pub struct Message {
     /// the whole trace landed in `content` as literal text.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reasoning_content: Option<String>,
+    /// The same trace under vLLM's current name; templates read either (Gemma 4:
+    /// `message.get('reasoning') or message.get('reasoning_content')`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning: Option<String>,
     /// An assistant turn's calls, validated by `serve::tools::request`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tool_calls: Option<serde_json::Value>,
@@ -405,7 +435,8 @@ pub struct Message {
 pub struct ResponseMessage {
     pub role: &'static str,
     pub content: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    /// vLLM's field name for the trace.
+    #[serde(rename = "reasoning", skip_serializing_if = "Option::is_none")]
     pub reasoning_content: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tool_calls: Option<Vec<ToolCall>>,
@@ -641,6 +672,8 @@ mod tests {
                 "stream_options":{"include_usage":true}}"#,
         )
         .expect("deserializes");
+        let mut req = req;
+        req.normalize();
         assert_eq!(req.seed, Some(u64::MAX), "a full-width u64 seed survived");
         assert_eq!(req.max_tokens, Some(128), "the OpenAI alias still applies");
         assert!(req.stream);
@@ -674,6 +707,25 @@ mod tests {
         f.apply(&mut p);
         assert_eq!(p.top_k, 0);
         assert!(f.validate().is_ok());
+    }
+
+    #[test]
+    fn high_repetition_penalty_and_greedy_top_p_zero_are_valid() {
+        let f = SamplingFields {
+            repetition_penalty: Some(2.5),
+            temperature: Some(0.0),
+            top_p: Some(0.0),
+            ..Default::default()
+        };
+        assert!(f.validate().is_ok());
+
+        // But top_p: 0.0 with temperature > 0.0 must be rejected
+        let invalid = SamplingFields {
+            temperature: Some(0.7),
+            top_p: Some(0.0),
+            ..Default::default()
+        };
+        assert!(invalid.validate().is_err());
     }
 
     use super::{Content, ContentPart, ImageUrl};
@@ -809,8 +861,8 @@ pub struct Delta {
     pub role: Option<&'static str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub content: Option<String>,
-    /// Streamed thinking trace, before the answer starts.
-    #[serde(skip_serializing_if = "Option::is_none")]
+    /// Streamed thinking trace, before the answer starts; vLLM's field name.
+    #[serde(rename = "reasoning", skip_serializing_if = "Option::is_none")]
     pub reasoning_content: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tool_calls: Option<Vec<ToolCallDelta>>,

@@ -595,6 +595,21 @@ pub struct RuntimeConfig {
     )]
     pub pf_itl_budget_ms: u32,
 
+    /// Force enforcement of ITL budget even when there is prefill backlog (`itl_owed_rows > budget_max`).
+    /// When disabled (default), ITL budget yields to prefill throughput when backlog exceeds a full launch.
+    /// When enabled, prefill rungs stay clamped to the budget under backlog: on the G26 FP8 production replay
+    /// (6.5 req/s) budget 12 ms + force took TTFT p50 44 ms -> 12.7 s as the prefill queue grew without bound.
+    #[arg(long = "pf-itl-force", env = "PLOW_PF_ITL_FORCE", hide = true, default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
+    pub pf_itl_force: bool,
+
+    /// CUDA VMM prefix cache: enforce strict publish where a request must hold all whole blocks
+    /// matched by radix lookup before publishing a boundary snapshot (default). When false,
+    /// sequential requests sharing a common system prompt can publish their shared-end boundary
+    /// over blocks another prefill wrote, pairing them with this prefill's FP8 full-layer scales:
+    /// on G26 FP8, cache-hit greedy output then differed from cold output on 12 of 15 prompts vs 7.
+    #[arg(long = "vmm-strict-publish", env = "PLOW_VMM_STRICT_PUBLISH", hide = true, default_value_t = true, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
+    pub vmm_strict_publish: bool,
+
     /// CUDA VMM prefix snapshots: copy the fp8 ring scales and full-layer scale prefixes as one
     /// pitched copy per tensor (all KV heads) instead of one copy per head. Same bytes; a
     /// Gemma-4 26B snapshot drops from ~10^3 copies to ~10^2.
@@ -2690,6 +2705,18 @@ impl RuntimeConfig {
     }
 
     #[cfg(feature = "cuda")]
+    pub(crate) fn nv_vmm_live_rings_explicitly_pinned(&self, assets_dir: &std::path::Path) -> bool {
+        let spec = self
+            .nv
+            .vmm_live_rings_models
+            .clone()
+            .or_else(|| Self::env_nonempty("PLOW_VMM_LIVE_RINGS_MODELS"));
+        spec.is_some_and(|spec| {
+            served_name(assets_dir).is_some_and(|slug| spec.split(',').any(|m| m.trim() == slug))
+        })
+    }
+
+    #[cfg(feature = "cuda")]
     pub(crate) fn nv_ns_live(&self) -> bool {
         select_compat(
             self.nv.nv_ns_live,
@@ -2947,6 +2974,22 @@ impl RuntimeConfig {
         select_compat(
             self.vmm_publish_shared,
             Self::env_bool("PLOW_VMM_PUBLISH_SHARED"),
+            !Self::is_initialized(),
+        )
+    }
+
+    pub(crate) fn vmm_strict_publish(&self) -> bool {
+        select_compat(
+            self.vmm_strict_publish,
+            Self::env_bool("PLOW_VMM_STRICT_PUBLISH"),
+            !Self::is_initialized(),
+        )
+    }
+
+    pub(crate) fn pf_itl_force(&self) -> bool {
+        select_compat(
+            self.pf_itl_force,
+            Self::env_bool("PLOW_PF_ITL_FORCE"),
             !Self::is_initialized(),
         )
     }
@@ -3664,15 +3707,18 @@ mod tests {
         ])
         .cfg;
         assert_eq!(cfg.nv_vmm_live_rings_for(&llm), Some(true));
+        assert!(cfg.nv_vmm_live_rings_explicitly_pinned(&llm));
         assert_eq!(
             cfg.nv_vmm_live_rings_for(&tts),
             Some(false),
             "an unlisted model keeps the global setting"
         );
+        assert!(!cfg.nv_vmm_live_rings_explicitly_pinned(&tts));
         assert_eq!(
             cfg.nv_vmm_live_rings_for(&root.join("missing")),
             Some(false)
         );
+        assert!(!cfg.nv_vmm_live_rings_explicitly_pinned(&root.join("missing")));
         assert!(!cfg.nv.pin_resident);
         let cfg = Cli::parse_from([
             "plowrt",

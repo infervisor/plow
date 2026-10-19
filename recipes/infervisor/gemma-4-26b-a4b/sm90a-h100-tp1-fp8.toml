@@ -5,6 +5,8 @@
 # (compressed-tensors W8 per-channel / A8 dynamic per-token; shard sha256 aeb3c810..., e5efcdd2...),
 # re-keyed to plow's fp8/ contract without requantizing:
 #   python3 scripts/gemma4_fp8_hub_rekey.py <hub snapshot> <re-keyed dir>
+#   python3 scripts/quantize_fp8_head.py <re-keyed dir> <re-keyed dir>   (PLOW_FP8_HEAD twin: writes the
+#   0.74 GB model-head.safetensors beside model.safetensors; plowrt refuses a packet whose checkpoint lacks it)
 #   PLOW_CAMPAIGN_NO_NIX=1 (box without nix only) PLOW_FP8_CKPT=<re-keyed dir> \
 #   python3 scripts/campaign/campaign.py build recipes/infervisor/gemma-4-26b-a4b/sm90a-h100-tp1-fp8.toml --out <fresh dir>
 #
@@ -78,11 +80,11 @@ PLOW_ATTENTION_DECODE_BALANCE_GF = "4"
 PLOW_FA_MMAQK = "3"
 PLOW_DECODE_BATCH_LADDER = "1,2,4,8,16,32,64,128"
 PLOW_EMIT_DECODE_CUBLASLT = "1"
-PLOW_EMIT_DECODE_CUBLASLT_MIN_ROWS = "64"
+PLOW_EMIT_DECODE_CUBLASLT_MIN_ROWS = "32"
 PLOW_EMIT_DECODE_CUBLASLT_HEAD = "1"
 PLOW_EMIT_PREFILL_CUBLASLT = "1"
 PLOW_PF_LADDER_APPEND = "256,1088,1152,2112,4160,4224"
-PLOW_FUSE_ARGMAX = "0"
+PLOW_FUSE_ARGMAX = "1"
 PLOW_GEMMA_MOE_ROUTER_EXACT = "0"
 # Emit-time on purpose: plowc compiles the decode interpreters (interp_sm90a{,_fp8kv,_gw}.cubin,
 # whose hashes change with it) and nvcc appends this; the [objects] script builds no op_moe object.
@@ -103,7 +105,17 @@ PLOW_GEMMA_MOE_ROUTER_EXACT = "0"
 # packet at ctx 1024/5600/16000 B1 -3.7/-3.9/-3.9%, B8 -4.5/-4.0/-3.5%, B32 -2.5/-2.3/-1.7%, token digests identical on
 # all 18 rungs + VMM kv_len 4094/4095/8191; memcheck clean; FP32 short PASS (kl_mean 0.1877, top1 0.9632) and long PASS
 # (0.1331, top1 0.9736; same-run control 0.1306 / 0.9671). Evidence: g26-pfrung REPORT.md section 25 (dec/ab-fin, ab/g-fin).
-NVCC_APPEND_FLAGS = "-DPLOW_MOE_FP8_DEDUP=1 -DPLOW_NV_FA_RG8=2 -DPLOW_NV_RAW_NARROW=1 -DPLOW_NV_INST_PRELOAD=1 -DPLOW_NV_ROUTER_V8=1 -DPLOW_NV_TOPK_V4=1"
+# -DPLOW_NV_ROUTER_V9=1: one-round router score body at B<=16 (2026-10-18, bit-exact): step_bench ctx 6144 vs the
+# same recipe build without it B1 4.392/4.389, B4 6.066/5.934, B8 7.132/7.031, B16 9.617/9.473 ms, digests identical on
+# B1..B128 and ctx 4094/4095/8191; replay A/B (2 interleaved rounds) TPOT p50 9.85 -> 9.79 ms, 0 errors.
+# Evidence: /opt/dlami/nvme/lava-tts/g26-perf-push/g26-router (runs/gb*, replay.txt).
+# -DPLOW_NV_FA_RG8S=1: the RG8 decode body streams each iteration's K/V rows and scales through a warp-private
+# two-stage cp.async smem ring (launch arena 40960 -> 82560 B); same lane map and arithmetic, bit-identical.
+# Qualified 2026-10-18 (g26-attn): step_bench ctx 6144 B1/B2/B4/B8/B16 4.38/5.07/6.08/7.11/9.59 -> 4.37/5.01/5.89/6.86/
+# 9.02 ms (with the RG8 word-convert commit), TOK_STREAM digests identical on every rung and at VMM kv_len
+# 4094/4095/4096/8191/8192 x B1/B4/B16; prod-fidelity replay 1.8/s TPOT p50/p99 10.02/20.71 -> 9.47/19.18 ms, TTFT
+# p50/p99 45.2/249.3 -> 42.8/227.7 ms, 0 errors. Evidence: /opt/dlami/nvme/lava-tts/g26-perf-push/g26-attn.
+NVCC_APPEND_FLAGS = "-DPLOW_MOE_FP8_DEDUP=1 -DPLOW_NV_FA_RG8=2 -DPLOW_NV_RAW_NARROW=1 -DPLOW_NV_INST_PRELOAD=1 -DPLOW_NV_ROUTER_V8=1 -DPLOW_NV_TOPK_V4=1 -DPLOW_NV_ROUTER_V9=1 -DPLOW_NV_FA_RG8S=1"
 PLOW_EMIT_MOE_PF_LT = "1"
 # Dense gate|up as two FP8 cuBLASLt GEMMs + Glu/Quant (qualified 2026-10-15, packet bd9c0722e368, plowrt 2dff2171):
 # prefill rungs at prefix 0 128/256/1024/4096 rows 15.69/17.53/26.46/81.33 vs 17.24/18.33/30.81/96.23 ms
@@ -111,6 +123,16 @@ PLOW_EMIT_MOE_PF_LT = "1"
 # 0.9602 vs ctrl 0.9642; long gate PASS: kl_mean 0.1627 vs ctrl 0.1515 / vLLM 0.165, kl_p99 3.18, top1 0.9638.
 # Evidence: g26-pfrung REPORT.md sections 6 and 13-14 (res2, ab/g-p1, ab/gl-p1).
 PLOW_NO_GLU_FUSE = "1"
+# Decode lm_head on rungs 1-16 reads a per-row e4m3 twin of the tied embedding (GemvFp8 + SoftCap + Argmax; the
+# embedding gather, the prefill terminal and the cuBLASLt head at >= 32 rows keep bf16). Qualified 2026-10-17 on
+# the kit plowrt 16c08ef8: step_bench ctx 6144 B1/B2/B4/B8/B16 4.611/5.334/6.311/7.415/9.797 -> 4.403/5.093/
+# 6.120/7.162/9.614 ms, B32-128 digests identical. c16 FP32 gate 3+3 runs PASS: kl_trim_mean 0.1300/0.1307/0.1310
+# vs ctrl 0.1255/0.1298/0.1422, kl_p95 0.92/0.92/0.92 vs 0.83/0.85/1.03, top1_decisive 0.960/0.959/0.960 vs
+# 0.962/0.954/0.958, over 203/218/202 vs 200/202/211; c1 (deterministic) trim 0.1441 vs 0.1390, p95 0.99 vs 0.89,
+# top1 0.959 vs 0.962, within every c16 limit. Prod-fidelity replay 1.8/s: TPOT p50/p99 10.55/20.52 -> 9.88/19.39 ms,
+# TTFT p50/p99 45.9/247.0 -> 43.6/242.7 ms, cached 79.8%, 0 errors. A fused FP8 GemvArgmax measured slower than
+# this unfused chain (B2 +0.10 ms). Evidence: /opt/dlami/nvme/lava-tts/g26-perf-push/g26-lmhead-fp8.
+PLOW_FP8_HEAD = "1"
 
 [objects]
 script = "scripts/build_sm90a_gemma4_segments.sh"
@@ -158,6 +180,21 @@ PLOW_LT_FP8_FAST_ACCUM_MAX_K = "8192"
 # (kl_p95 1.153), with PLOW_TERMINAL_LT=0 passed 6 of 6 (kl_p95 median 0.856; top1_decisive 0.960-0.961 vs
 # production 0.957-0.964, Mann-Whitney p 0.27; trim p 0.49). Evidence: /opt/dlami/nvme/lava-tts/g26next/er/attr3/ATTR3.txt.
 PLOW_TERMINAL_LT = "0"
+PLOW_LT_RUNG_ALGOS = "true"
+# Production-fidelity replay A/B on H100, 2026-10-17 (agentic_turns --open-loop --prod-fidelity --rate 1.8, 300 s,
+# same packet cf7aadf783bf; /opt/dlami/nvme/lava-tts/g26-opt-v2-validate): budget 60 + force 0 + interleave 0 +
+# strict publish = production (TTFT p50/p99 45/242 ms, TPOT 10.4/20.5 ms, cached 79.8%, goodput 100%).
+# Budget 12 + PF_ITL_FORCE=1 + interleave 1024 + strict 0: TTFT p50 12.7 s, goodput 5.4%. Budget 12 alone (force 0):
+# TTFT p50/p99 109/1637 ms, TPOT 20.5/31.3 ms. Strict publish off: cache-hit greedy output differed from cold on
+# 12 of 15 prompts vs 7 with it on.
+PLOW_PF_ITL_BUDGET_MS = "60"
+PLOW_DECODE_PIPELINE = "1"
+PLOW_VMM_RING_PARK = "8"
+PLOW_PF_ADMIT_OVERLAP = "1"
+PLOW_VMM_SNAP_PITCHED = "1"
+PLOW_VMM_SNAP_POOL = "4"
+PLOW_PF_ITL_FORCE = "0"
+PLOW_VMM_STRICT_PUBLISH = "1"
 
 [bench]
 backend = "openai"

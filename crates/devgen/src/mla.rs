@@ -443,6 +443,13 @@ fn cfg_glm(dir: &Path) -> GlmCfg {
     );
     let model = v["model_type"].as_str().unwrap_or("<unknown model_type>");
     crate::require_moe_topk(g("num_experts_per_tok"), model);
+    crate::require_moe_groups(
+        g("n_routed_experts"),
+        g("num_experts_per_tok"),
+        n_group,
+        topk_group,
+        model,
+    );
     // RoPE theta: READ, never defaulted. Both spellings, because transformers 5.x moved the key —
     // GLM-5.2's config.json has NO top-level `rope_theta` and carries
     // `rope_parameters: {rope_theta: 8000000, rope_type: "default"}`. `mla_use_nope` (Kimi-K3)

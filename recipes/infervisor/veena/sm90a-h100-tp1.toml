@@ -62,13 +62,13 @@ PLOW_MAX_CHUNK = "512"
 PLOW_PF_LADDER_APPEND = "64,256"
 PLOW_DECODE_BATCH_LADDER = "1,2,4,8,16,32,48,64,96,128"
 PLOW_EMIT_PREFILL_CUBLASLT = "1"
-# Decode rungs of 32+ rows run their projections on cuBLASLt, with paired k|v and gate|up,
-# fused q|k|v and light kernels between library calls (step_bench ctx 384 B=32 4.60 -> 4.26 ms;
-# B=16 loses 3.61 -> 3.94). The lm_head runs its 16-aligned columns on cuBLASLt too (B=128 -3%).
+# Decode rungs of 48+ rows run their projections on cuBLASLt, with paired k|v and gate|up,
+# fused q|k|v and light kernels between library calls (step_bench ctx 1024 B=32 6.16 -> 5.42 ms
+# by staying on native interpreter GEMV; B=48+ wins on cuBLASLt). lm_head runs on cuBLASLt too.
 PLOW_EMIT_DECODE_CUBLASLT = "1"
 # hd128 row-group flash decode with merge fold (gated here; changes attention sum order).
 PLOW_NV_FA_FOLD = "1"
-PLOW_EMIT_DECODE_CUBLASLT_MIN_ROWS = "32"
+PLOW_EMIT_DECODE_CUBLASLT_MIN_ROWS = "48"
 PLOW_EMIT_DECODE_CUBLASLT_HEAD = "1"
 PLOW_NO_GLU_FUSE = "1"
 PLOW_FUSE_KV_HNR = "1"
@@ -82,8 +82,8 @@ PLOW_NV_DENSE_TUNE = "1"
 # multistep, and a one-frame (7-code) quantum at low load. --lt-rung-algos times cuBLASLt
 # algorithms per rung (step_bench B=32..64 -3..-5%, digests equal).
 [serve]
-# Env, not flags, so every launcher (campaign serve/gate, plowbench.sh probes) applies it.
-env = { PLOW_VMM_PREFIX = "1", PLOW_LT_RUNG_ALGOS = "true" }
+extra_args = ["--decode-pipeline"]
+env = { PLOW_VMM_PREFIX = "1", PLOW_LT_RUNG_ALGOS = "true", PLOW_DECODE_PIPELINE = "1" }
 
 [bench]
 kind = "speech"

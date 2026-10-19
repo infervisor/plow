@@ -81,15 +81,7 @@ async fn chat_completions_with(
 ) -> Response {
     let Json(mut req) = match req {
         Ok(r) => r,
-        Err(e) => {
-            return crate::serve::api_error(
-                e.status(),
-                e.body_text(),
-                "invalid_request_error",
-                Some("invalid_json"),
-                None,
-            )
-        }
+        Err(e) => return crate::serve::json_rejection(e),
     };
 
     // ALIASES. `model` may be a name this bundle merely answers to (vLLM's
@@ -97,6 +89,7 @@ async fn chat_completions_with(
     // slug runs — residency, the manager, the mux, the metrics map — so an
     // alias never grows a second key for the same model. The response still
     // echoes the name the client sent, as vLLM does.
+    req.normalize();
     let requested_model = req.model.clone();
     if let Some(canonical) = state.registry.resolve(&req.model) {
         req.model = canonical;
@@ -179,7 +172,12 @@ async fn chat_completions_with(
             );
         }
     }
-    if req.response_format.as_ref().is_some_and(|v| !v.is_null()) {
+    // `{"type": "text"}` is the default format and asks for nothing; SDK wrappers send it.
+    if req
+        .response_format
+        .as_ref()
+        .is_some_and(|v| !v.is_null() && v.get("type").and_then(|t| t.as_str()) != Some("text"))
+    {
         return crate::serve::api_error(
             axum::http::StatusCode::BAD_REQUEST,
             "`response_format` is not implemented by this server; it is refused rather than \
@@ -257,6 +255,7 @@ async fn chat_completions_with(
         kwargs: req.chat_template_kwargs.clone().unwrap_or_default(),
         reasoning_effort: req.reasoning_effort.clone(),
         continue_final_message: req.continue_final_message.unwrap_or(false),
+        no_generation_prompt: req.add_generation_prompt == Some(false),
         tools: tool_plan.template_tools.clone(),
     };
     let mut prompt = crate::obs::ttft::timed(&crate::obs::ttft::TEMPLATE, || {
@@ -474,6 +473,14 @@ async fn chat_completions_with(
     // the marker themselves).
     let reasoning_mode = crate::serve::reasoning::ReasoningMode::for_bundle(&bundle);
     let mut reasoning_open = reasoning_mode.prompt_opens(&prompt);
+    // Reasoning on in the rendered prompt: the trace is left open, or the template's own switch
+    // (Gemma 4 / Qwen3 `enable_thinking`) is on for this request.
+    let thinking = reasoning_mode.markers().is_some()
+        && (reasoning_open
+            || (state.chat_templated(&req.model)
+                && bundle
+                    .chat_template()
+                    .is_some_and(|t| t.thinking_requested(&render_opts.kwargs))));
     // A forced `tool_choice` writes the call's opener for the model, so the generation starts
     // inside the call (after closing a trace the prompt left open), and is validated at the end.
     let opener = tool_plan.parse.as_ref().and_then(|s| s.opener());
@@ -661,6 +668,7 @@ async fn chat_completions_with(
         };
     }
 
+    let tally = crate::obs::serving::ReasoningTally::admitted(state.model_metrics(key), thinking);
     let request_id = request_id();
     // Stamped ONCE and repeated on every chunk of a stream, as OpenAI does.
     let created = now_secs();
@@ -683,6 +691,7 @@ async fn chat_completions_with(
             lp_fmt,
             tool_stream,
             run,
+            tally,
         );
         let mut response = crate::serve::session::hold_until_sent(sse.into_response(), in_flight);
         response.headers_mut().extend(stamped);
@@ -699,6 +708,7 @@ async fn chat_completions_with(
             lp_fmt,
             tool_stream,
             run,
+            tally,
         )
         .await
     };
@@ -1034,6 +1044,7 @@ async fn buffer_and_reply(
     lp_fmt: Option<crate::serve::logprobs::TokenText>,
     mut tools: Option<crate::serve::tools::stream::ToolStream>,
     mut run: crate::serve::turns::StageRun,
+    tally: crate::obs::serving::ReasoningTally,
 ) -> Response {
     let mut calls: Vec<crate::serve::openai::ToolCall> = Vec::new();
     let mut text = String::new();
@@ -1125,7 +1136,7 @@ async fn buffer_and_reply(
     };
     // The generation prompt leaves `<think>` open on GLM, so the raw text is
     // "<trace></think><answer>". Split it: `content` carries the answer alone
-    // and the trace goes to `reasoning_content`, which is where a reasoning
+    // and the trace goes to `reasoning` (vLLM's name), which is where a reasoning
     // model's clients look for it. A model that never opened a trace is
     // unaffected — `split_reasoning` returns the whole string as the answer.
     match tools.as_mut() {
@@ -1152,11 +1163,13 @@ async fn buffer_and_reply(
         let t = reasoning_buf.trim();
         (include_reasoning && !t.is_empty()).then(|| t.to_string())
     };
-    // A turn that is only calls answers `content: null`, as OpenAI does.
-    let answer = (calls.is_empty() || !answer_buf.trim().is_empty()).then_some(answer_buf);
     let trace_tokens = tools
         .as_ref()
         .map_or(split.trace_tokens, |ts| ts.split.trace_tokens);
+    // A turn that is only calls, or only a trace, answers `content: null`, as vLLM does.
+    let answer = ((calls.is_empty() && trace_tokens == 0) || !answer_buf.trim().is_empty())
+        .then_some(answer_buf);
+    tally.finished(trace_tokens);
     if trace_tokens > 0 {
         if let Some(u) = usage.as_mut() {
             u.completion_tokens_details = Some(CompletionTokensDetails {
@@ -1244,6 +1257,7 @@ fn sse_response(
     lp_fmt: Option<crate::serve::logprobs::TokenText>,
     tools: Option<crate::serve::tools::stream::ToolStream>,
     run: crate::serve::turns::StageRun,
+    tally: crate::obs::serving::ReasoningTally,
 ) -> Response {
     // State threaded through the unfold: the receiver, and the tail frames
     // (optional usage-only chunk, then [DONE]) drained one per poll.
@@ -1268,6 +1282,7 @@ fn sse_response(
         request_id: String,
         model: String,
         lp_fmt: Option<crate::serve::logprobs::TokenText>,
+        tally: crate::obs::serving::ReasoningTally,
     }
     let body = stream::unfold(
         SseState {
@@ -1284,6 +1299,7 @@ fn sse_response(
             request_id,
             model,
             lp_fmt,
+            tally,
         },
         move |mut st| {
             async move {
@@ -1390,6 +1406,7 @@ fn sse_response(
                             r => r.as_openai(),
                         };
                         let trace_tokens = ts.split.trace_tokens;
+                        st.tally.finished(trace_tokens);
                         let mut frames: Vec<Bytes> = tail.into_iter().collect();
                         let mut last = ChatChunk {
                             id: st.request_id.clone(),
@@ -1435,6 +1452,7 @@ fn sse_response(
                         // this generation; abandoning it truncated the streamed
                         // `reasoning_content` against the buffered path.
                         let (flushed_r, flushed_c) = st.split.finish();
+                        st.tally.finished(st.split.trace_tokens);
                         let ch = ChunkChoice {
                             index: 0,
                             delta: Delta {
