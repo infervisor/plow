@@ -3,7 +3,8 @@
 //! order, with one set of messages, before it reaches the model's engine. A model's specifics
 //! (voices, languages, sample rate, sampling defaults, token budget, which optional controls it
 //! takes) live in the spec; the engines only see a [`Checked`] request. An optional control a model
-//! does not take (`top_k`, `cfg_weight`, `instructions`, `ref_audio`) is a 400 naming the field,
+//! does not take (`top_k`, `repetition_penalty`, `cfg_weight`, `instructions`, `ref_audio`) is a
+//! 400 naming the field,
 //! never silently dropped.
 
 use super::serving::SpeechRequest;
@@ -22,11 +23,14 @@ pub struct SpeechSpec {
     pub sample_rate: u32,
     pub temperature: f32,
     pub top_p: f32,
-    pub repetition_penalty: f32,
+    /// Default; `None`: the model's sampler has no repetition penalty.
+    pub repetition_penalty: Option<f32>,
     /// Largest `max_tokens`: the model's audio-token budget of one segment.
     pub max_tokens: usize,
     /// Default `top_k` (0: off); `None`: the model's sampler has no top-k.
     pub top_k: Option<usize>,
+    /// The largest `top_k` the sampler takes; set, top-k cannot be turned off.
+    pub top_k_max: Option<usize>,
     /// Default classifier-free guidance weight, logits = cond + w (cond - uncond); `None`: the
     /// model is not guided. (A `cfg_scale` s of uncond + s (cond - uncond) is w = s - 1.)
     pub cfg_weight: Option<f32>,
@@ -175,6 +179,20 @@ impl SpeechSpec {
                 "top_k",
             ));
         }
+        if let (Some(k), Some(max)) = (req.top_k, self.top_k_max) {
+            if k < 1 || k as usize > max {
+                return Err(invalid(
+                    format!("`top_k` must be in [1, {max}] for this model; got {k}"),
+                    "top_k",
+                ));
+            }
+        }
+        if req.repetition_penalty.is_some() && self.repetition_penalty.is_none() {
+            return Err(invalid(
+                "this model's sampler has no repetition penalty; omit `repetition_penalty`",
+                "repetition_penalty",
+            ));
+        }
         match req.cfg_weight {
             Some(_) if self.cfg_weight.is_none() => {
                 return Err(invalid(
@@ -209,7 +227,10 @@ impl SpeechSpec {
             sampling: Sampling {
                 temperature: req.temperature.unwrap_or(self.temperature),
                 top_p: req.top_p.unwrap_or(self.top_p),
-                repetition_penalty: req.repetition_penalty.unwrap_or(self.repetition_penalty),
+                repetition_penalty: req
+                    .repetition_penalty
+                    .or(self.repetition_penalty)
+                    .unwrap_or(1.0),
                 max_tokens: req.max_tokens,
                 // vLLM's -1 (off) is this sampler's 0.
                 top_k: self
@@ -241,6 +262,9 @@ impl SpeechSpec {
                 "repetition_penalty": self.repetition_penalty,
                 "cfg_weight": self.cfg_weight,
             },
+            "limits": {
+                "top_k_max": self.top_k_max,
+            },
         })
     }
 }
@@ -271,9 +295,10 @@ mod tests {
             sample_rate: 24000,
             temperature: 0.6,
             top_p: 0.8,
-            repetition_penalty: 1.1,
+            repetition_penalty: Some(1.1),
             max_tokens: 1000,
             top_k: Some(0),
+            top_k_max: None,
             cfg_weight: None,
             instructions: false,
             voice_cloning: false,
@@ -410,6 +435,27 @@ mod tests {
         let plain = spec(&[]);
         let c = plain.check(&req(serde_json::json!({"top_k": -1}))).unwrap();
         assert_eq!(c.sampling.top_k, Some(0));
+        // A depth-stage sampler: top-k always on and bounded, no repetition penalty.
+        let mut depth = spec(&[]);
+        depth.top_k = Some(30);
+        depth.top_k_max = Some(64);
+        depth.repetition_penalty = None;
+        for body in [
+            serde_json::json!({"top_k": 0}),
+            serde_json::json!({"top_k": -1}),
+            serde_json::json!({"top_k": 65}),
+        ] {
+            assert_eq!(depth.check(&req(body)).unwrap_err().param, "top_k");
+        }
+        let c = depth.check(&req(serde_json::json!({"top_k": 64}))).unwrap();
+        assert_eq!((c.sampling.top_k, c.sampling.repetition_penalty), (Some(64), 1.0));
+        assert_eq!(
+            depth
+                .check(&req(serde_json::json!({"repetition_penalty": 1.1})))
+                .unwrap_err()
+                .param,
+            "repetition_penalty"
+        );
         let mut cloning = spec(&[]);
         cloning.voice_cloning = true;
         assert_eq!(

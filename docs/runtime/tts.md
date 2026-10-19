@@ -580,11 +580,11 @@ it in one order with one set of messages, then runs on the model's engine (`tts:
 | `response_format` | `wav` (default) or `pcm` (s16le mono at the card's `sample_rate`) |
 | `stream` | chunked audio; the 200 and its headers go out with the first audio, so an error before any audio is a proper status and `server-timing` carries time to first audio |
 | `language` | one of the card's `languages` (default `default_language`); a model without languages rejects it |
-| `temperature`, `top_p`, `repetition_penalty` | honoured on every model (defaults: the card's `defaults`) |
+| `temperature`, `top_p` | honoured on every model (defaults: the card's `defaults`) |
 | `max_tokens` | the model's audio tokens per segment, 1..card `max_tokens` |
 | `seed` | same seed, text and settings: same audio; unseeded requests sample anew |
 | `speed` | 1.0 only |
-| `top_k`, `cfg_weight`, `instructions`, `ref_audio` + `ref_text` | optional controls: taken where the card declares them (`defaults.top_k`, `defaults.cfg_weight`, `instructions`, `voice_cloning`), else 400 naming the field |
+| `top_k`, `repetition_penalty`, `cfg_weight`, `instructions`, `ref_audio` + `ref_text` | optional controls: taken where the card declares them (`defaults.top_k`, `defaults.repetition_penalty`, `defaults.cfg_weight`, `instructions`, `voice_cloning`), else 400 naming the field; a sampler with a bounded top-k (`limits.top_k_max`, Fish S2) takes `top_k` in 1..that bound and cannot turn it off |
 
 A schema error (unknown field, wrong type) is 400 `invalid_json`; every 429 carries `Retry-After`.
 A whole reply carries `x-plow-audio-seconds` and `x-plow-lm-ms`. `cfg_weight` is

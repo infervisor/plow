@@ -62,6 +62,19 @@ def pct(xs, q):
     return xs[min(len(xs) - 1, int(q * len(xs)))]
 
 
+def card_sample_rate(url, model):
+    """The model card's `x_plow_speech.sample_rate` (None when the server publishes none)."""
+    try:
+        with urllib.request.urlopen(f"{url}/v1/models", timeout=10) as r:
+            cards = json.load(r)["data"]
+    except Exception:
+        return None
+    for c in cards:
+        if c.get("id") == model:
+            return (c.get("x_plow_speech") or {}).get("sample_rate")
+    return None
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--url", required=True)
@@ -79,7 +92,8 @@ def main():
     ap.add_argument("--voice", default=None, help="override every prompt's voice")
     ap.add_argument("--session", default=None, help="X-Session-Id prefix (one session per client thread)")
     args = ap.parse_args()
-    global SESSION, PROMPT_SET
+    global SESSION, PROMPT_SET, SR
+    SR = card_sample_rate(args.url, args.model) or SR
     SESSION, PROMPT_SET = args.session, args.prompt_set
     os.makedirs(args.out, exist_ok=True)
     tag = args.tag or f"{'stream' if args.stream else 'full'}_c{args.conc}"

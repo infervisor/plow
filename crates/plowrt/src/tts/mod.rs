@@ -197,9 +197,11 @@ impl SpeechContract {
             sample_rate: self.sample_rate,
             temperature: self.temperature,
             top_p: self.top_p,
-            repetition_penalty: self.repetition_penalty,
+            // The depth stage's sampler (SampleFishBf16) has no penalty and at most 64 candidates.
+            repetition_penalty: (!self.depth).then_some(self.repetition_penalty),
             max_tokens: self.max_new_tokens_cap,
             top_k: Some(self.top_k),
+            top_k_max: self.depth.then_some(64),
             cfg_weight: None,
             instructions: false,
             voice_cloning: false,

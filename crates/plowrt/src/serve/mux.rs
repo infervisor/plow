@@ -3523,7 +3523,9 @@ fn run_one_tick(
                 // them; the rung controller still owes that step its progress.
                 let feeds_before = decode_feed_extent(&feeds);
                 let mut unified_progress = None;
-                if e.pf_batch_enabled() {
+                // A depth stage samples each prompt's first frame in serial prefill's tail
+                // (`gpu_prefill_advance`); the packed completions do not run it.
+                if e.pf_batch_enabled() && !e.has_depth_stage() {
                     let compact = e.has_packed_terminal();
                     let mut completed = std::mem::take(&mut obs.host.prefill_tokens);
                     completed.clear();

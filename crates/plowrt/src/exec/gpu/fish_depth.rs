@@ -23,8 +23,8 @@ struct Loaded {
 pub(super) struct FishDepth {
     manifest: Manifest,
     programs: Vec<Loaded>,
-    /// Staging for the widest program: params `[rows][4]` f32, then top_k, step, hidden_row u32,
-    /// seed u64, then the read-back codes `[rows][codebooks]`.
+    /// Staging for the widest program: seed u64 (first, so aligned), params `[rows][4]` f32, then
+    /// top_k, step, hidden_row u32, then the read-back codes `[rows][codebooks]`.
     stage: PinnedHost,
     rows: usize,
 }
@@ -207,9 +207,9 @@ impl GpuEngine {
         let k = d.manifest.codebooks as usize;
         {
             let s = d.stage.as_mut_slice();
-            let (params, rest) = s.split_at_mut(d.rows * 16);
-            let (words, rest) = rest.split_at_mut(d.rows * 12);
-            let seeds = &mut rest[..d.rows * 8];
+            let (seeds, rest) = s.split_at_mut(d.rows * 8);
+            let (params, rest) = rest.split_at_mut(d.rows * 16);
+            let words = &mut rest[..d.rows * 12];
             let params: &mut [f32] = bytemuck::cast_slice_mut(params);
             let words: &mut [u32] = bytemuck::cast_slice_mut(words);
             let seeds: &mut [u64] = bytemuck::cast_slice_mut(seeds);
@@ -236,13 +236,14 @@ impl GpuEngine {
         }
         let t = d.manifest.tensors.clone();
         let bytes = d.stage.as_slice();
-        let (pw, ww, sw) = (d.rows * 16, d.rows * 12, d.rows * 8);
+        let (sw, pw, ww) = (d.rows * 8, d.rows * 16, d.rows * 12);
+        let words = sw + pw;
         for (h, at, len) in [
-            (t.params, 0, n * 16),
-            (t.top_k, pw, n * 4),
-            (t.step, pw + d.rows * 4, n * 4),
-            (t.hidden_row, pw + d.rows * 8, n * 4),
-            (t.seed, pw + ww, n * 8),
+            (t.seed, 0, n * 8),
+            (t.params, sw, n * 16),
+            (t.top_k, words, n * 4),
+            (t.step, words + d.rows * 4, n * 4),
+            (t.hidden_row, words + d.rows * 8, n * 4),
         ] {
             // SAFETY: the pinned stage is rewritten only after this call's synchronize.
             unsafe {
@@ -259,7 +260,7 @@ impl GpuEngine {
         let mut params = [&mut arg as *mut DevProgram as *mut std::ffi::c_void];
         self.be
             .launch_cooperative(self.f, self.grid, BLOCK, self.smem, &mut params, Some(&self.stream))?;
-        let codes_at = pw + ww + sw;
+        let codes_at = sw + pw + ww;
         // SAFETY: as the uploads.
         unsafe {
             self.be.memcpy_dtoh_async(
@@ -274,6 +275,11 @@ impl GpuEngine {
             out.extend_from_slice(&codes[row.slot * k..row.slot * k + k]);
         }
         Ok(())
+    }
+
+    /// Whether a depth stage is loaded: its prompts take serial prefill.
+    pub fn has_depth_stage(&self) -> bool {
+        self.fish.is_some()
     }
 
     /// The row of `act.hn` holding the last serial prefill's terminal hidden.
