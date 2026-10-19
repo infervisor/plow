@@ -3156,6 +3156,11 @@ fn run_one_tick(
                         ));
                     }
                 }
+                // Before any draw is planned: a failed history allocation turns the device
+                // penalty off, so penalized rows take the host path instead of failing the batch.
+                if e.dev_penalty() && slots.iter().flatten().any(dev_pen_row) {
+                    e.pen_reserve();
+                }
 
                 // Multimodal soft-token rows reach this engine's slab before any launch this tick reads
                 // them; a prompt row the table does not hold fails the request instead of reading pad.

@@ -9565,6 +9565,17 @@ impl GpuEngine {
         Ok(pen.counts.as_ref().expect("allocated").base)
     }
 
+    /// Allocate the penalty history now; on failure (KV already holds the memory) drop the device
+    /// penalty so [`Self::dev_penalty`] is false and penalized rows draw on the host.
+    pub fn pen_reserve(&mut self) {
+        if let Err(error) = self.pen_counts() {
+            tracing::warn!(%error, bytes = self.batch * self.vocab * 4, "device repetition penalty off: history allocation failed; penalized rows use the host sampler");
+            if let Some(s) = self.sampler.as_mut() {
+                s.pen = None;
+            }
+        }
+    }
+
     /// Reset `slot`'s device repetition-penalty history to the tokens of `history` (empty: an
     /// async clear; otherwise one synchronous upload).
     pub fn pen_seed_history(&mut self, slot: usize, history: &[u32]) -> Result<()> {
