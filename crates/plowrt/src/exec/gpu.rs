@@ -7955,6 +7955,9 @@ impl GpuEngine {
             }
         }
         // VMM rows below the old position stay mapped; only the prefix history shrinks with it.
+        if let Some(s) = &mut self.spec {
+            s.end_pending()?;
+        }
         self.seq_tokens[b].truncate(len);
         self.pos[b] = len as _;
         Ok(())
@@ -8804,7 +8807,15 @@ impl GpuEngine {
         }
     }
 
+    /// A plain decode launch: reads the identity row map and ends any pending verify.
     fn launch_selected_decode(&mut self, selection: DecodeSelection) -> Result<()> {
+        if let Some(s) = &mut self.spec {
+            s.end_pending()?;
+        }
+        self.launch_decode_program(selection)
+    }
+
+    fn launch_decode_program(&mut self, selection: DecodeSelection) -> Result<()> {
         if let Some(r) = self.selected_decode(selection) {
             if let Some(library) = &r.library {
                 return library.launch(&self.stream);

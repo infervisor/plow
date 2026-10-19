@@ -59,6 +59,9 @@ pub(super) struct SpecRt {
     sites: Vec<KvSite>,
     /// The last verify's spans, each committable once and only against the state it ran on.
     pending: Vec<Pending>,
+    /// The span map is (or may be) on the device: a failed restore leaves it there, and no
+    /// plain launch may run against it.
+    map_dirty: bool,
 }
 
 struct Pending {
@@ -72,6 +75,17 @@ struct Pending {
 const STOP_MAX: usize = 64;
 
 impl SpecRt {
+    /// Any launch or rewind other than the verify itself ends the verify's transaction.
+    pub(super) fn end_pending(&mut self) -> Result<()> {
+        if self.map_dirty {
+            return Err(RuntimeError::Device(
+                "span row map was not restored after a failed verify; engine unusable".into(),
+            ));
+        }
+        self.pending.clear();
+        Ok(())
+    }
+
     pub(super) fn load(
         be: &crate::device::cuda::CudaBackend,
         t_rowslot: Option<usize>,
@@ -125,6 +139,7 @@ impl SpecRt {
             accept: None,
             sites,
             pending: Vec::new(),
+            map_dirty: false,
         }))
     }
 }
@@ -213,7 +228,7 @@ impl GpuEngine {
         let reject = |m: String| Err(RuntimeError::Rejected(format!("spec_verify: {m}")));
         let bsz = self.batch;
         match self.spec.as_mut() {
-            Some(s) if s.accept.is_some() => s.pending.clear(),
+            Some(s) if s.accept.is_some() => s.end_pending()?,
             _ => return reject("not enabled (spec_enable)".into()),
         }
         if spans.is_empty() || spans.len() > bsz || stop.len() > STOP_MAX {
@@ -304,9 +319,13 @@ impl GpuEngine {
         }
         let n_spans = spans.len();
         if let Err(e) = self.spec_submit(selection, launch_rows, rows, n_spans, stop.len()) {
-            // Plain launches must not see the span map, and staging may still be in flight.
-            let _ = self.spec_upload_identity();
-            let _ = self.be.stream_synchronize(&self.stream);
+            // Plain launches must not see the span map, and staging may still be in flight: only
+            // a restore that drains cleanly clears the dirty flag.
+            self.spec.as_mut().expect("checked").map_dirty = true;
+            if self.spec_upload_identity().is_ok() && self.be.stream_synchronize(&self.stream).is_ok()
+            {
+                self.spec.as_mut().expect("checked").map_dirty = false;
+            }
             return Err(e);
         }
         let verdict_bytes = n_spans * std::mem::size_of::<SpecVerdict>();
@@ -366,7 +385,8 @@ impl GpuEngine {
                 self.be
                     .memcpy_htod_async(self.devp[t].base, self.stage.section(k), &self.stream)?;
             }
-            let s = self.spec.as_ref().expect("checked");
+            let s = self.spec.as_mut().expect("checked");
+            s.map_dirty = true;
             self.be
                 .memcpy_htod_async(self.devp[s.t_rowslot].base, s.rows.as_slice(), &self.stream)?;
             self.be
@@ -386,12 +406,13 @@ impl GpuEngine {
             }
         }
         self.reset_selected_decode_counters(selection)?;
-        self.launch_selected_decode(selection).map_err(|e| {
+        self.launch_decode_program(selection).map_err(|e| {
             tracing::warn!(launch_rows, rows, error = %e, "spec verify launch failed");
             e
         })?;
         // Plain launches after this one read the identity map again (stream order).
         self.spec_upload_identity()?;
+        self.spec.as_mut().expect("checked").map_dirty = false;
         let s = self.spec.as_ref().expect("checked");
         let (f, _) = s.accept.as_ref().expect("checked");
         let mut a_ids = self.devp[self.t_ids].base;

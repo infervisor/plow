@@ -752,7 +752,8 @@ struct SpecArgs {
 /// reference; the slots are rewound and the same tokens regenerated through `spec_verify` +
 /// `spec_commit` with drafts from MODE: `oracle` (the reference's next tokens, all accepted),
 /// `adversarial` (every draft wrong, all rejected), `ngram` (prompt lookup over each slot's
-/// history). `--spec-poison` NaN-fills every uncommitted row after each verify. Prints
+/// history). `--spec-poison` NaN-fills every row a verify will write before it runs, and every
+/// uncommitted row after it. Prints
 /// `SPEC_IDENTITY ok|MISMATCH` and the verify cost.
 #[cfg(feature = "cuda")]
 #[allow(clippy::too_many_arguments)]
@@ -835,6 +836,14 @@ fn spec_bench(
             .iter()
             .map(|&b| SpecSpan { slot: b, tokens: &inputs[b] })
             .collect();
+        if a.poison {
+            // Every row this launch writes holds NaN first: a row read before its own span's
+            // store lands (a missing intra-span dependency) poisons the output.
+            for sp in &spans {
+                let p0 = e.slot_pos(sp.slot) as u32;
+                e.spec_poison_rows(sp.slot, p0, p0 + sp.tokens.len() as u32)?;
+            }
+        }
         let t = Instant::now();
         e.spec_verify(&spans, &[], &mut verdicts)?;
         verify_ms += t.elapsed().as_secs_f64() * 1e3;
