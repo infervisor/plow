@@ -3252,6 +3252,7 @@ fn run_one_tick(
                     } else if obs.host.spec_backlog {
                         Some(crate::obs::serving::SpecSkip::Backlog)
                     } else {
+                        gpu_spec_policy(&*e, &mut obs.host, limits);
                         gate.err()
                     };
                     match skip {
@@ -8119,8 +8120,8 @@ impl crate::exec::gpu::spec::SpecSampler for SlotSpecSampler<'_> {
 
 /// Per fed row, the most drafts a speculative tick may give it (0 = it rides the verify as a
 /// plain row, sampled on the host when it needs to be). `Err` names the first row that cannot
-/// ride a verify at all (CFG pairs, speech rows, seeded sampled rows); `caps` then holds the rows
-/// before it. `ready` = the drafter holds the row's hidden.
+/// ride a verify at all (CFG pairs, speech rows, seeded sampled rows); such rows get cap 0.
+/// `ready` = the drafter holds the row's hidden.
 #[cfg(feature = "cuda")]
 fn gpu_spec_caps(
     e: &crate::exec::gpu::GpuEngine,
@@ -8132,19 +8133,24 @@ fn gpu_spec_caps(
 ) -> std::result::Result<(), crate::obs::serving::SpecSkip> {
     use crate::obs::serving::SpecSkip;
     caps.clear();
+    let mut blocker = None;
     for &(i, _) in feeds {
-        let s = slots[i].as_ref().ok_or(SpecSkip::CfgRow)?;
-        if s.cfg.is_some() {
-            return Err(SpecSkip::CfgRow);
-        }
-        if s.plain_decode() {
-            return Err(SpecSkip::PlainRow);
-        }
         // A seeded sampled row is reproducible only at plain decode's rung: riding a verify (even
         // undrafted) changes its logits' numerics, so its ticks stay plain.
-        if s.gen.seed.is_some() && !gpu_spec_draftable(&s.gen.params) {
-            return Err(SpecSkip::SeededSampledRow);
-        }
+        let blocked = match slots[i].as_ref() {
+            None => Some(SpecSkip::CfgRow),
+            Some(s) if s.cfg.is_some() => Some(SpecSkip::CfgRow),
+            Some(s) if s.plain_decode() => Some(SpecSkip::PlainRow),
+            Some(s) if s.gen.seed.is_some() && !gpu_spec_draftable(&s.gen.params) => {
+                Some(SpecSkip::SeededSampledRow)
+            }
+            Some(_) => None,
+        };
+        let Some(s) = slots[i].as_ref().filter(|_| blocked.is_none()) else {
+            blocker = blocker.or(blocked);
+            caps.push(0);
+            continue;
+        };
         let left = s
             .gen
             .max_tokens
@@ -8159,7 +8165,7 @@ fn gpu_spec_caps(
         };
         caps.push(cap);
     }
-    Ok(())
+    blocker.map_or(Ok(()), Err)
 }
 
 /// Whether a decode tick over `feeds` may speculate at all (before the policy weighs it); `caps`
@@ -8194,7 +8200,20 @@ fn gpu_spec_plan(
     host: &mut crate::exec::host::HostExecutor,
     limits: &crate::exec::gpu::SpecLimits,
 ) -> Option<crate::sched::spec::Plan> {
-    let policy = host.spec.get_or_insert_with(|| {
+    let mut caps = smallvec::SmallVec::new();
+    gpu_spec_caps(e, feeds, slots, limits.kmax, false, &mut caps).ok()?;
+    gpu_spec_policy(e, host, limits).plan(&caps)
+}
+
+/// The engine's speculation policy, built at the first pure decode tick so it measures plain
+/// steps from then on.
+#[cfg(feature = "cuda")]
+fn gpu_spec_policy<'h>(
+    e: &crate::exec::gpu::GpuEngine,
+    host: &'h mut crate::exec::host::HostExecutor,
+    limits: &crate::exec::gpu::SpecLimits,
+) -> &'h mut crate::sched::spec::SpecPolicy {
+    host.spec.get_or_insert_with(|| {
         let widths: Vec<usize> = e
             .effective_decode_rungs()
             .iter()
@@ -8206,10 +8225,7 @@ fn gpu_spec_plan(
             limits.kmax,
             &limits.draft_rows,
         )
-    });
-    let mut caps = smallvec::SmallVec::new();
-    gpu_spec_caps(e, feeds, slots, limits.kmax, false, &mut caps).ok()?;
-    policy.plan(&caps)
+    })
 }
 
 /// One speculative decode tick over `feeds` (no prefill this tick, decode pipeline drained):
@@ -8289,6 +8305,7 @@ fn gpu_spec_tick(
         );
         note_fault(tick_fault, &err);
         fail_feeds(slots, feeds, arena, &err);
+        metrics.serving.spec.skip(SpecSkip::Refused);
         return true;
     }
     if out.draft_rows > 0 {

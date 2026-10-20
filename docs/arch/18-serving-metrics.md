@@ -136,14 +136,16 @@ latencies consequently have different boundaries.
 **Speculation blockers.** Every decode tick (a tick with at least one decode row) of an engine
 serving `PLOW_SPEC` counts once: in `plowrt_spec_ticks_total` when a row drafted, else under the
 first `reason` that held, in this order: `prefill_tick` (the tick also prefills), `backlog`
-(requests wait for a slot), `cfg_row`, `plain_row` (speech/plain-only row), `seeded_sampled_row`
-(a seeded sampled row keeps its tick plain for reproducibility), `rows_over_limit` (decode rows
-at or above the widest span-capable verify rung), `no_greedy_rows` (no row may draft: sampled with
-`PLOW_SPEC_SAMPLED` off, logprobs, penalties or bias, or at its last token), `policy_no_gain` (the
-measured plan does not beat a plain step), `not_ready` (the verify ran but no row held drafter
-state yet, e.g. the first tick after a plain one), `refused` (the engine refused the tick before
-committing). A row is eligible when it could draft were the tick to speculate. The three families
-appear at the first decode tick, with the `spec_decode_*` ones.
+(requests wait for a slot), then whichever of `cfg_row`, `plain_row` (speech/plain-only row) and
+`seeded_sampled_row` (a seeded sampled row keeps its tick plain for reproducibility) the first such
+row in the batch has, `rows_over_limit` (decode rows at or above the widest span-capable verify
+rung), `no_greedy_rows` (no row may draft: logprobs, at its last token, or sampled, penalties or
+bias with `PLOW_SPEC_SAMPLED=0`), `policy_no_gain` (the measured plan does not beat a plain step),
+`not_ready` (the verify ran but no row held drafter state yet, e.g. the first tick after a plain
+one), `refused` (the engine refused the tick before committing, or failed it). A tick whose rows all
+finish while the decode pipeline drains counts nothing. A row is eligible when it could draft were
+the tick to speculate. The three families appear at the first decode tick, with the `spec_decode_*`
+ones.
 
 **Reasoning.** A request counts as *thinking* when the model frames a separable trace
 (`serve::reasoning::ReasoningMode` is not `None`) and either the rendered prompt leaves the trace
