@@ -50,6 +50,24 @@
 #ifndef PLOW_NV_GEMV_MMA_UNB
 #define PLOW_NV_GEMV_MMA_UNB 12
 #endif
+/* ADDNORM FOLD (manifest `norm_fold`, emit knob PLOW_DECODE_NORM_FOLD): the pre-norm decode packet
+ * `x += o; h = RMSNorm(x) * gamma` leaves the chain with its gate. The producer (the o_proj / down
+ * GEMV) adds bf16(acc) into the residual stream in place, writes h' = x * gamma unscaled and, per
+ * 8-column row block, each row's sum of squares ([N / 8][32] f32). The consumer (GemvQkv / GemvGlu)
+ * walks h' and scales its accumulators by inv[m] = rsqrt(sum / K + eps): h's bf16 rounding moves
+ * ahead of the 1/rms scale, everything else is the AddNorm's arithmetic. */
+#ifndef PLOW_NV_NORM_FOLD
+#define PLOW_NV_NORM_FOLD 0
+#endif
+struct GvFoldOut {
+    __nv_bfloat16* resid;
+    const __nv_bfloat16* gamma;
+    float* part;
+};
+struct GvFoldIn {
+    const float* part; /* the producer's N = the consumer's K: K / 8 row blocks of 32 rows */
+    float eps;
+};
 
 static __device__ __forceinline__ __nv_bfloat16 gemma_glu_epilogue(float gate, float up,
                                                                  unsigned act);
@@ -316,13 +334,107 @@ __device__ __forceinline__ void gvmma_store_tile(__nv_bfloat16* __restrict__ C, 
     }
 }
 
-template <bool BIAS, int MT = 1, bool ONE = false>
+#if PLOW_NV_NORM_FOLD
+/* Fold producer store: N % 8 == 0, so the lane's column pair is always in range. */
+template <int MT>
+__device__ __forceinline__ void gvmma_fold_store_tile(__nv_bfloat16* __restrict__ C, const float (&acc)[MT][4],
+                                                      unsigned nb, unsigned rows, unsigned N,
+                                                      const GvFoldOut& fo) {
+    const unsigned lane = threadIdx.x & PLOW_NV_LANE_MASK;
+    const unsigned g = lane >> 2, t = lane & 3;
+    const unsigned n = nb + 2u * t;
+    const float2 gm = __bfloat1622float2(*(const __nv_bfloat162*)(fo.gamma + n));
+    const float g0 = norm_weight(gm.x), g1 = norm_weight(gm.y);
+#pragma unroll
+    for (int mt = 0; mt < MT; mt++)
+#pragma unroll
+        for (int h = 0; h < 2; h++) {
+            const unsigned m = 16u * mt + 8u * h + g;
+            float ss = 0.0f;
+            if (m < rows) {
+                const size_t o = (size_t)m * N + n;
+                const float2 r = __bfloat1622float2(*(const __nv_bfloat162*)(fo.resid + o));
+                const float f0 = r.x + __bfloat162float(__float2bfloat16(acc[mt][2 * h]));
+                const float f1 = r.y + __bfloat162float(__float2bfloat16(acc[mt][2 * h + 1]));
+                *(__nv_bfloat162*)(fo.resid + o) = __floats2bfloat162_rn(f0, f1);
+                *(__nv_bfloat162*)(C + o) = __floats2bfloat162_rn(f0 * g0, f1 * g1);
+                ss = fmaf(f0, f0, f1 * f1);
+            }
+            ss += __shfl_xor_sync(0xffffffffu, ss, 1);
+            ss += __shfl_xor_sync(0xffffffffu, ss, 2);
+            if (t == 0u && m < rows) fo.part[(nb >> 3) * 32u + m] = ss;
+        }
+}
+
+__device__ __forceinline__ float* gvmma_fold_inv_smem() {
+    __shared__ float inv[32];
+    return inv;
+}
+/* Fold consumer: inv[m] for m < rows from the producer's K / 8 partials (K float4s, K <= 2048),
+ * summed in a fixed order (lane l's float4 covers rows 4(l & 7) .. +3 of row blocks
+ * l / 8 + 4w + 32i). Block-uniform. */
+__device__ __forceinline__ void gvmma_fold_inv(float* inv, const GvFoldIn& fi, unsigned rows, unsigned K) {
+    __shared__ float4 s[PLOW_NV_WARPS][8];
+    const unsigned lane = threadIdx.x & PLOW_NV_LANE_MASK, warp = threadIdx.x >> PLOW_NV_WARP_SHIFT;
+    const float4* p = (const float4*)fi.part;
+    float4 a = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+#pragma unroll
+    for (unsigned i = 0; i < 8u; i++) {
+        const unsigned k = threadIdx.x + i * PLOW_NV_THREADS;
+        if (k < K) {
+            const float4 v = __ldcg(p + k);
+            a.x += v.x;
+            a.y += v.y;
+            a.z += v.z;
+            a.w += v.w;
+        }
+    }
+#pragma unroll
+    for (unsigned o = 8u; o < 32u; o <<= 1) {
+        a.x += __shfl_xor_sync(0xffffffffu, a.x, o);
+        a.y += __shfl_xor_sync(0xffffffffu, a.y, o);
+        a.z += __shfl_xor_sync(0xffffffffu, a.z, o);
+        a.w += __shfl_xor_sync(0xffffffffu, a.w, o);
+    }
+    if (lane < 8u) s[warp][lane] = a;
+    __syncthreads();
+    if (threadIdx.x < rows) {
+        float r = 0.0f;
+#pragma unroll
+        for (unsigned w = 0; w < PLOW_NV_WARPS; w++) r += ((const float*)&s[w][threadIdx.x >> 2])[threadIdx.x & 3u];
+        inv[threadIdx.x] = rsqrtf(r * __fdividef(1.0f, (float)K) + fi.eps);
+    }
+    __syncthreads();
+}
+/* acc *= inv of each fragment row (rows past `rows` are never stored). */
+template <int NW, int MT>
+__device__ __forceinline__ void gvmma_fold_scale(float (&acc)[NW][MT][4]) {
+    const float* inv = gvmma_fold_inv_smem();
+    const unsigned g = (threadIdx.x & PLOW_NV_LANE_MASK) >> 2;
+#pragma unroll
+    for (int mt = 0; mt < MT; mt++) {
+        const float s0 = inv[(16u * mt + g) & 31u], s1 = inv[(16u * mt + g + 8u) & 31u];
+#pragma unroll
+        for (int i = 0; i < NW; i++) {
+            acc[i][mt][0] *= s0;
+            acc[i][mt][1] *= s0;
+            acc[i][mt][2] *= s1;
+            acc[i][mt][3] *= s1;
+        }
+    }
+}
+#endif
+
+template <bool BIAS, int MT = 1, bool ONE = false, bool FOLD = false>
 __device__ __forceinline__ void gemv_rows_mma(__nv_bfloat16* __restrict__ C,
                                               const __nv_bfloat16* __restrict__ x,
                                               const __nv_bfloat16* __restrict__ W, unsigned rows,
                                               unsigned N, unsigned K, unsigned slice,
                                               unsigned nblk,
-                                              const __nv_bfloat16* __restrict__ bias = nullptr) {
+                                              const __nv_bfloat16* __restrict__ bias = nullptr,
+                                              const GvFoldOut* fo = nullptr) {
+    static_assert(!FOLD || (!PLOW_NV_GEMV_MMA_PAIR && !PLOW_NV_GEMV_REM_SPLIT),
+                  "the norm fold takes the split-K and plain walks only");
     const unsigned lane = threadIdx.x & PLOW_NV_LANE_MASK;
     const unsigned warp = threadIdx.x >> PLOW_NV_WARP_SHIFT;
     const gvmma_range r = gvmma_partition(N, slice, nblk);
@@ -426,6 +538,10 @@ __device__ __forceinline__ void gemv_rows_mma(__nv_bfloat16* __restrict__ C,
 #pragma unroll
                     for (int j = 0; j < 4; j++) acc[0][mt][j] += red.v[slot][lane][mt * 4 + j];
             }
+#if PLOW_NV_NORM_FOLD
+            if constexpr (FOLD) gvmma_fold_store_tile<MT>(C, acc[0], rb << 3, rows, N, *fo);
+            else
+#endif
             gvmma_store_tile<BIAS, MT>(C, acc[0], rb << 3, rows, N, bias);
         }
         __syncthreads(); /* red is reused by the next call on this block */
@@ -473,17 +589,23 @@ __device__ __forceinline__ void gemv_rows_mma(__nv_bfloat16* __restrict__ C,
     for (unsigned rb = r.rb0 + warp; rb < r.rb1; rb += PLOW_NV_WARPS) {
         float acc[1][MT][4];
         gvmma_tile<1, MT, ONE>(acc, x, W1, rb << 3, rows, N, K);
+#if PLOW_NV_NORM_FOLD
+        if constexpr (FOLD) gvmma_fold_store_tile<MT>(C, acc[0], rb << 3, rows, N, *fo);
+        else
+#endif
         gvmma_store_tile<BIAS, MT>(C, acc[0], rb << 3, rows, N, bias);
     }
 }
 
-template <int MT = 1, bool ONE = false>
+template <int MT = 1, bool ONE = false, bool FOLD = false>
 __device__ __forceinline__ void gemv_glu_rows_mma(__nv_bfloat16* __restrict__ C,
                                                   const __nv_bfloat16* __restrict__ x,
                                                   const __nv_bfloat16* __restrict__ Wg,
                                                   const __nv_bfloat16* __restrict__ Wu,
                                                   unsigned rows, unsigned N, unsigned K,
-                                                  unsigned act, unsigned slice, unsigned nblk) {
+                                                  unsigned act, unsigned slice, unsigned nblk,
+                                                  const GvFoldIn* fi = nullptr) {
+    static_assert(!FOLD || !PLOW_NV_GEMV_REM_SPLIT, "the norm fold takes the split-K and plain walks only");
     const unsigned lane = threadIdx.x & PLOW_NV_LANE_MASK;
     const unsigned warp = threadIdx.x >> PLOW_NV_WARP_SHIFT;
     const unsigned g = lane >> 2, t = lane & 3;
@@ -542,6 +664,12 @@ __device__ __forceinline__ void gemv_glu_rows_mma(__nv_bfloat16* __restrict__ C,
             }
             __syncthreads(); /* red is reused by the up stream / the next call on this block */
         }
+#if PLOW_NV_NORM_FOLD
+        if constexpr (FOLD) {
+            gvmma_fold_inv(gvmma_fold_inv_smem(), *fi, rows, K);
+            if (part == 0u && live) gvmma_fold_scale(acc);
+        }
+#endif
         if (part == 0u && live) store(acc, rb);
         return;
     }
@@ -589,22 +717,44 @@ __device__ __forceinline__ void gemv_glu_rows_mma(__nv_bfloat16* __restrict__ C,
     return;
     }
 #endif
+#if PLOW_NV_NORM_FOLD
+    if constexpr (FOLD) {
+        /* One wave: inv lands between the walk and the stores. A wider N computes it first. */
+        if (r.rb1 - r.rb0 <= PLOW_NV_WARPS) {
+            const unsigned rb = r.rb0 + warp;
+            float acc[2][MT][4];
+            if (rb < r.rb1) gvmma_tile<2, MT, ONE>(acc, x, W2, rb << 3, rows, N, K);
+            gvmma_fold_inv(gvmma_fold_inv_smem(), *fi, rows, K);
+            if (rb < r.rb1) {
+                gvmma_fold_scale(acc);
+                store(acc, rb);
+            }
+            return;
+        }
+        gvmma_fold_inv(gvmma_fold_inv_smem(), *fi, rows, K);
+    }
+#endif
     for (unsigned rb = r.rb0 + warp; rb < r.rb1; rb += PLOW_NV_WARPS) {
         float acc[2][MT][4];
         gvmma_tile<2, MT, ONE>(acc, x, W2, rb << 3, rows, N, K);
+#if PLOW_NV_NORM_FOLD
+        if constexpr (FOLD) gvmma_fold_scale(acc);
+#endif
         store(acc, rb);
     }
 }
 
 /* Fused q|k|v: row blocks over the concatenated [0, Nq+Nk+Nv); Nq % 8 == Nk % 8 == 0 (caller
  * checks) so a block lies inside one matrix. */
-template <bool BIAS, int MT = 1, bool ONE = false>
+template <bool BIAS, int MT = 1, bool ONE = false, bool FOLD = false>
 __device__ __forceinline__ void gemv_qkv_rows_mma(
     __nv_bfloat16* Cq, __nv_bfloat16* Ck, __nv_bfloat16* Cv, const __nv_bfloat16* __restrict__ x,
     const __nv_bfloat16* __restrict__ Wq, const __nv_bfloat16* __restrict__ Wk,
     const __nv_bfloat16* __restrict__ Wv, unsigned rows, unsigned Nq, unsigned Nk, unsigned Nv,
     unsigned K, unsigned slice, unsigned nblk, const __nv_bfloat16* __restrict__ bq = nullptr,
-    const __nv_bfloat16* __restrict__ bk = nullptr, const __nv_bfloat16* __restrict__ bv = nullptr) {
+    const __nv_bfloat16* __restrict__ bk = nullptr, const __nv_bfloat16* __restrict__ bv = nullptr,
+    const GvFoldIn* fi = nullptr) {
+    static_assert(!FOLD || !PLOW_NV_GEMV_REM_SPLIT, "the norm fold takes the plain walk only");
     const unsigned lane = threadIdx.x & PLOW_NV_LANE_MASK;
     const unsigned warp = threadIdx.x >> PLOW_NV_WARP_SHIFT;
     const unsigned g = lane >> 2, t = lane & 3;
@@ -670,6 +820,43 @@ __device__ __forceinline__ void gemv_qkv_rows_mma(
     return;
     }
 #endif
+#if PLOW_NV_NORM_FOLD
+    if constexpr (FOLD) {
+        /* One wave: inv lands between the walk and the stores. A wider N computes it first. */
+        if (r.rb1 - r.rb0 <= PLOW_NV_WARPS) {
+            const unsigned rb = r.rb0 + warp;
+            const bool live = rb < r.rb1;
+            const unsigned gn = (live ? rb : r.rb0) << 3;
+            const __nv_bfloat16* W;
+            __nv_bfloat16* C;
+            const __nv_bfloat16* bias;
+            unsigned Nx, n0;
+            if (gn < Nq) { W = Wq; C = Cq; Nx = Nq; n0 = 0u; bias = bq; }
+            else if (gn < Nq + Nk) { W = Wk; C = Ck; Nx = Nk; n0 = Nq; bias = bk; }
+            else { W = Wv; C = Cv; Nx = Nv; n0 = Nq + Nk; bias = bv; }
+            const __nv_bfloat16* const W1[1] = {W};
+            float acc[1][MT][4];
+            if (live) gvmma_tile<1, MT, ONE>(acc, x, W1, gn - n0, rows, Nx, K);
+            gvmma_fold_inv(gvmma_fold_inv_smem(), *fi, rows, K);
+            if (!live) return;
+            gvmma_fold_scale(acc);
+            const unsigned n = (gn - n0) + 2u * t;
+            float b0 = 0.0f, b1 = 0.0f;
+            if constexpr (BIAS) {
+                b0 = (n < Nx) ? __bfloat162float(bias[n]) : 0.0f;
+                b1 = (n + 1u < Nx) ? __bfloat162float(bias[n + 1u]) : 0.0f;
+            }
+#pragma unroll
+            for (int mt = 0; mt < MT; mt++) {
+                const unsigned m0 = 16u * mt + g;
+                if (m0 < rows) gvmma_store2(C, Nx, m0, n, acc[0][mt][0] + b0, acc[0][mt][1] + b1);
+                if (m0 + 8u < rows) gvmma_store2(C, Nx, m0 + 8u, n, acc[0][mt][2] + b0, acc[0][mt][3] + b1);
+            }
+            return;
+        }
+        gvmma_fold_inv(gvmma_fold_inv_smem(), *fi, rows, K);
+    }
+#endif
     for (unsigned rb = r.rb0 + warp; rb < r.rb1; rb += PLOW_NV_WARPS) {
         const unsigned gn = rb << 3;
         const __nv_bfloat16* W;
@@ -682,6 +869,9 @@ __device__ __forceinline__ void gemv_qkv_rows_mma(
         const __nv_bfloat16* const W1[1] = {W};
         float acc[1][MT][4];
         gvmma_tile<1, MT, ONE>(acc, x, W1, gn - n0, rows, Nx, K);
+#if PLOW_NV_NORM_FOLD
+        if constexpr (FOLD) gvmma_fold_scale(acc);
+#endif
         const unsigned n = (gn - n0) + 2u * t;
         float b0 = 0.0f, b1 = 0.0f;
         if constexpr (BIAS) {
@@ -792,4 +982,16 @@ __device__ __forceinline__ void gvmma_pf_qkv(const __nv_bfloat16* Wq, const __nv
         gvmma_pf_l2(w, bytes);
     }
 }
+#if PLOW_NV_NORM_FOLD
+/* Fold producer: the residual row segments and gamma its epilogue reads (upper threads, clear of
+ * the weight heads). */
+__device__ __forceinline__ void gvmma_pf_fold(const __nv_bfloat16* resid, const __nv_bfloat16* gamma,
+                                              unsigned rows, unsigned N, unsigned slice, unsigned nblk) {
+    const gvmma_range r = gvmma_partition(N, slice, nblk);
+    if (r.rb1 <= r.rb0) return;
+    const unsigned bytes = (r.rb1 - r.rb0) * 16u, m = blockDim.x - 1u - threadIdx.x;
+    if (m < rows) gvmma_pf_l2(resid + (size_t)m * N + (r.rb0 << 3), bytes);
+    else if (m == rows) gvmma_pf_l2(gamma + (r.rb0 << 3), bytes);
+}
+#endif
 #endif

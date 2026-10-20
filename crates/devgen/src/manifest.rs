@@ -1305,6 +1305,12 @@ fn tuning(s: &Shapes, arch: &str) -> Map<String, Value> {
             t.insert("gemv_k8_ops".into(), json!(v));
         }
     }
+    // * `norm_fold` (PLOW_DECODE_NORM_FOLD opt-in): the decode object carries the AddNorm fold
+    //   arms the packet's o_proj / down / GemvGlu / GemvQkv use.
+    if arch.starts_with("sm_") && crate::emit_config::active().decode_norm_fold {
+        assert_eq!(arch, "sm_120a", "PLOW_DECODE_NORM_FOLD: sm_120a decode objects only");
+        t.insert("norm_fold".into(), json!(1));
+    }
     if sm90a && crate::emit_config::active().w8a8 && crate::emit_config::active().decode_cublaslt {
         t.insert("fp8_lt_decode".into(), json!(true));
     }
@@ -3181,6 +3187,11 @@ pub fn config_header(manifest: &Value) -> String {
                      #ifndef PLOW_NV_GEMV_K8_OPS\n#define PLOW_NV_GEMV_K8_OPS {v}u\n#endif\n\
                      #ifndef PLOW_NV_GEMV_K8_MAX\n#define PLOW_NV_GEMV_K8_MAX 16\n#endif\n#endif\n"
                 ));
+            }
+            if t.get("norm_fold").is_some() {
+                out.push_str(
+                    "#if !PLOW_NV_SPEECH && !PLOW_NV_PREFILL\n#ifndef PLOW_NV_NORM_FOLD\n#define PLOW_NV_NORM_FOLD 1\n#endif\n#endif\n",
+                );
             }
         }
         if manifest.get("arch").and_then(Value::as_str) == Some("sm_90a") {

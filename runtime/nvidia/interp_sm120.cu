@@ -2163,6 +2163,16 @@ __device__ __forceinline__ void plow_exec(const PlowDevInst* in, void* const* T,
      * every Qwen packet). i3=norm_flag selects the fused-norm GEMV, which this build does
      * NOT carry — trapped rather than silently skipping the norm. */
     case PLOW_DOP_GEMV:
+#if PLOW_NV_NORM_FOLD && PLOW_NV_GEMV_MMA
+        /* i3 == 8: AddNorm fold producer (op_gemv_mma.cuh GvFoldOut): t0 = x * gamma, t3 the residual
+         * stream (added in place), t4 the next norm's gamma, t5 the row-block partials. */
+        if (in->i[3] == 8u) {
+            d_gemv_fold((__nv_bfloat16*)TEN(0), (const __nv_bfloat16*)TEN(1), (const __nv_bfloat16*)TEN(2),
+                        in->i[0], in->i[1], in->i[2], slice, nblk,
+                        GvFoldOut{(__nv_bfloat16*)TEN(3), (const __nv_bfloat16*)TEN(4), (float*)TEN(5)});
+            break;
+        }
+#endif
 #if PLOW_NV_QWEN_GDN
         /* i3 == 4: Qwen residual + RMSNorm prologue (op_qwen_gdn.cuh d_qwen_fold_norm): x (t1) is
          * the norm output every block writes, t3 the residual stream out, i5 / i6 / i7 the
@@ -2308,6 +2318,17 @@ __device__ __forceinline__ void plow_exec(const PlowDevInst* in, void* const* T,
 
     /* Kernel arg order is (Nq, Nk, Nv, K): K lives in i2 but is passed LAST. */
     case PLOW_DOP_GEMV_QKV:
+#if PLOW_NV_NORM_FOLD && PLOW_NV_GEMV_MMA
+        /* t7: AddNorm fold consumer — x is x * gamma and t7 the producer's partials (f0 = eps). */
+        if (TEN(7)) {
+            d_gemv_qkv_fold((__nv_bfloat16*)TEN(0), (__nv_bfloat16*)TEN(3), (__nv_bfloat16*)TEN(5),
+                            (const __nv_bfloat16*)TEN(1), (const __nv_bfloat16*)TEN(2),
+                            (const __nv_bfloat16*)TEN(4), (const __nv_bfloat16*)TEN(6), in->i[0], in->i[1],
+                            in->i[3], in->i[4], in->i[2], slice, nblk,
+                            GvFoldIn{(const float*)TEN(7), in->fj[0].f});
+            break;
+        }
+#endif
 #if !PLOW_NV_PREFILL && PLOW_NV_GEMV_K8
         if ((PLOW_NV_GEMV_K8_OPS & 4u) && in->i[0] >= PLOW_NV_GEMV_K8_MIN && in->i[0] <= PLOW_NV_GEMV_K8_MAX &&
             !(in->i[5] && in->i[6] && in->i[7]) &&
@@ -2455,6 +2476,15 @@ __device__ __forceinline__ void plow_exec(const PlowDevInst* in, void* const* T,
                            slice, nblk);
                 break;
             }
+        }
+#endif
+#if PLOW_NV_NORM_FOLD && PLOW_NV_GEMV_MMA
+        /* t7: AddNorm fold consumer (see GEMV_QKV). */
+        if (TEN(7)) {
+            d_gemv_glu_fold((__nv_bfloat16*)TEN(0), (const __nv_bfloat16*)TEN(1), (const __nv_bfloat16*)TEN(2),
+                            (const __nv_bfloat16*)TEN(5), in->i[0], in->i[1], in->i[2], in->i[5], slice, nblk,
+                            GvFoldIn{(const float*)TEN(7), in->fj[0].f});
+            break;
         }
 #endif
 #if !PLOW_NV_PREFILL && PLOW_NV_GEMV_K8
@@ -3443,6 +3473,13 @@ __device__ __forceinline__ void plow_gemv_prefetch(const PlowDevInst* in, void* 
         break;
 #endif
     case PLOW_DOP_GEMV:
+#if PLOW_NV_NORM_FOLD
+        if (in->i[3] == 8u) {
+            if (PLOW_NV_GEMV_PF_OPS & 1u) gvmma_pf_rows(W(2), in->i[1], in->i[2], slice, nblk);
+            gvmma_pf_fold(W(3), W(4), in->i[0], in->i[1], slice, nblk);
+            break;
+        }
+#endif
         if ((PLOW_NV_GEMV_PF_OPS & 1u) && in->i[3] == 0u) gvmma_pf_rows(W(2), in->i[1], in->i[2], slice, nblk);
         break;
     case PLOW_DOP_GEMV_GLU:

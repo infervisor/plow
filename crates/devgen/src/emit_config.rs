@@ -387,6 +387,12 @@ pub struct EmitConfig {
     #[arg(long, env = "PLOW_DECODE_NARROW_TOP", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
     pub decode_narrow_top: bool,
 
+    /// sm_120a decode: the Qwen / Llama AddNorm packets fold into the GEMVs around them (o_proj /
+    /// down add into the residual stream and write x * gamma with row-block sums of squares; the
+    /// GemvGlu / GemvQkv after them scale by 1/rms). Changes the rounding point of the normed input.
+    #[arg(long, env = "PLOW_DECODE_NORM_FOLD", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
+    pub decode_norm_fold: bool,
+
     /// Blocks for the one-row MoE combine (arms the all-block combine; 0/1 = today's single CTA).
     #[arg(long, env = "PLOW_MOE_COMBINE_BLOCKS")]
     pub moe_combine_blocks: Option<u32>,
@@ -1586,6 +1592,7 @@ impl EmitConfig {
             hn_split: env_bool("PLOW_HN_SPLIT"),
             fuse_kv_hnr: env_bool("PLOW_FUSE_KV_HNR"),
             decode_narrow_top: env_bool("PLOW_DECODE_NARROW_TOP"),
+            decode_norm_fold: env_bool("PLOW_DECODE_NORM_FOLD"),
             moe_combine_blocks: env_u32("PLOW_MOE_COMBINE_BLOCKS"),
             fa_gf_full: env_u32("PLOW_FA_GF_FULL"),
             attention_decode_balance_gf: env_u32("PLOW_ATTENTION_DECODE_BALANCE_GF"),
