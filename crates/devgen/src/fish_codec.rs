@@ -19,7 +19,7 @@ use crate::pipeline::{
 };
 use crate::rewrite_lower::ConvFusions;
 
-type Splits<'a> = Option<&'a std::cell::RefCell<BTreeMap<String, (u32, u32)>>>;
+type Splits<'a> = Option<&'a std::cell::RefCell<BTreeMap<String, (u32, u32, u32)>>>;
 
 /// (batch, frames): streaming windows batched across streams, long utterances alone. The smallest
 /// frame count sets the stream chunk (`frames + 1 - stream.window_frames` = 17 frames): a capacity
@@ -249,7 +249,10 @@ pub fn lower_fish_dac(
                 bytes = crate::codec::to_phase_major(&bytes, cin, cout, kernel, stride);
             }
         }
-        if let Some((n, k)) = splits.as_ref().and_then(|s| s.borrow().get(name).copied()) {
+        if let Some((n, k, taps)) = splits.as_ref().and_then(|s| s.borrow().get(name).copied()) {
+            if taps > 1 {
+                bytes = crate::s3gen::to_tap_major(&bytes, n, k / taps, taps);
+            }
             bytes = crate::pipeline::wgmma_weight_split(&bytes, n, k);
         }
         if dtype != "F32" || bytes.len() as u64 != tensor.bytes {
@@ -285,7 +288,7 @@ impl Seq {
     #[allow(clippy::too_many_arguments)]
     fn dense(&mut self, splits: Splits<'_>, x: u32, out: &str, rows: u32, k: u32, n: u32, w: &str, b: Option<&str>) -> Result<u32, String> {
         let split = splits.is_some_and(|s| {
-            s.borrow_mut().insert(w.trim_start_matches("w.").to_string(), (n, k));
+            s.borrow_mut().insert(w.trim_start_matches("w.").to_string(), (n, k, 1));
             true
         });
         let dep = self.last;
@@ -390,7 +393,7 @@ fn program_for(
     frames: u32,
     codes: u32,
     lengths: &[u32],
-    splits: Option<&std::cell::RefCell<BTreeMap<String, (u32, u32)>>>,
+    splits: Option<&std::cell::RefCell<BTreeMap<String, (u32, u32, u32)>>>,
 ) -> Result<(PacketPrefix, u32), String> {
     let fc = cfg.sizes.len() as u32;
     let n = batch * frames;
@@ -527,6 +530,7 @@ fn program_for(
         input_is_temp: false,
         row_scale: None,
         alpha_out: None,
+        taps_wgmma: false,
     };
     let other = |e: u32| if e == x { "act.codec.b" } else { "act.codec.a" };
     let mut cur = Emitted { output: x, done: s.last };
@@ -593,6 +597,7 @@ fn program_for(
             let pre = w(&format!("ru{j}"));
             let mut c = conv("act.codec.c", format!("{pre}.c1.w"), Some(format!("{pre}.c1.b")), rows, b.cout, b.cout, 7);
             c.alpha_out = Some(format!("{pre}.a12"));
+            c.taps_wgmma = true;
             c.act_in = Activation::Snake;
             c.act_out = Activation::Snake;
             c.dilation = d;

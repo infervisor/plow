@@ -264,7 +264,10 @@ pub fn lower_snac(
                     bytes = to_phase_major(&bytes, b.cin, b.cout, b.kernel, b.stride);
                 }
             }
-            if let Some((n, k)) = splits.as_ref().and_then(|s| s.borrow().get(name).copied()) {
+            if let Some((n, k, taps)) = splits.as_ref().and_then(|s| s.borrow().get(name).copied()) {
+                if taps > 1 {
+                    bytes = crate::s3gen::to_tap_major(&bytes, n, k / taps, taps);
+                }
                 bytes = crate::pipeline::wgmma_weight_split(&bytes, n, k);
             }
             if dtype != "F32" || bytes.len() as u64 != tensor.bytes {
@@ -292,7 +295,7 @@ fn snac_program(
     seed: u32,
     lengths: &[u32],
     per_level: &[u32],
-    splits: Option<&RefCell<BTreeMap<String, (u32, u32)>>>,
+    splits: Option<&RefCell<BTreeMap<String, (u32, u32, u32)>>>,
 ) -> Result<PacketPrefix, String> {
     let latent = cfg.latent_dim;
     let t0 = frames * cfg.vq_strides[0];
@@ -380,6 +383,7 @@ fn snac_program(
         input_is_temp: false,
         row_scale: None,
         alpha_out: None,
+        taps_wgmma: false,
         pad_after: None,
     };
     let z_h = p_handle(&p, "act.codec.a");
@@ -615,6 +619,10 @@ pub(crate) struct Conv {
     /// A snake output activation with its own parameters: the `[in | out]` alpha tensor that
     /// replaces `alpha` (an input snake's `a1` then the output snake's `a2`).
     pub(crate) alpha_out: Option<String>,
+    /// Under split-bf16, a k-tap conv with 64-channel runs takes the wgmma taps path (tap-major
+    /// weights): its input activation runs as its own pass and a dual alpha `{unit}.a12` splits
+    /// into that pass's `{unit}.a1` and the conv's output `{unit}.a2`.
+    pub(crate) taps_wgmma: bool,
 }
 
 /// `c` with the fusions `fuse` decides; an unfused piece runs as its own `UnaryF32` /
@@ -623,7 +631,7 @@ pub(crate) struct Conv {
 pub(crate) fn fused_conv(
     p: &mut StageProgram,
     fuse: ConvFusions<'_>,
-    splits: Option<&RefCell<BTreeMap<String, (u32, u32)>>>,
+    splits: Option<&RefCell<BTreeMap<String, (u32, u32, u32)>>>,
     x: u32,
     dep: u32,
     c: Conv,
@@ -641,8 +649,23 @@ pub(crate) fn fused_conv(
         && c.residual.is_none()
         && c.row_scale.is_none()
         && !dual;
-    let fuse_in = act_in && !ct && (dual || fuse.input_act(&c.weight, c.kernel, true));
-    let fuse_out = c.act_out != Activation::None && (dual || fuse.output_act(&c.weight, true));
+    let taps = splits.is_some()
+        && c.taps_wgmma
+        && !c.transpose
+        && c.groups == 1
+        && c.kernel > 1
+        && c.cin % 64 == 0
+        && c.cout % 4 == 0
+        && c.row_scale.is_none();
+    let unit = c.alpha_out.as_deref().and_then(|a| a.strip_suffix(".a12"));
+    let (in_alpha, out_alpha) = match unit.filter(|_| taps) {
+        Some(u) => (Some(format!("{u}.a1")), Some(format!("{u}.a2"))),
+        None => (c.alpha.clone(), None),
+    };
+    let dual = dual && !taps;
+    let fuse_in = act_in && !ct && !taps && (dual || fuse.input_act(&c.weight, c.kernel, true));
+    let fuse_out =
+        c.act_out != Activation::None && (dual || taps || fuse.output_act(&c.weight, true));
     let fuse_res =
         c.residual.is_some() && (c.row_scale.is_some() || fuse.residual(&c.weight, true));
     let (mut x, mut dep) = (x, dep);
@@ -657,7 +680,7 @@ pub(crate) fn fused_conv(
             &[dep],
             UnaryF32Stage {
                 output,
-                param: c.alpha.as_deref().map(TensorRef::Named),
+                param: in_alpha.as_deref().map(TensorRef::Named),
                 rows: c.batch * c.in_rows,
                 width: c.cin,
                 stride: 0,
@@ -671,13 +694,13 @@ pub(crate) fn fused_conv(
     }
     // S3Gen's rule: ungrouped pointwise convs carry the pre-split wgmma B operand.
     let split = splits.is_some_and(|s| {
-        let on = ct || (!c.transpose && c.groups == 1 && c.cin % 4 == 0 && c.kernel == 1);
+        let on = ct || taps || (!c.transpose && c.groups == 1 && c.cin % 4 == 0 && c.kernel == 1);
         if on {
             let name = c.weight.trim_start_matches("w.").to_string();
             let nk = if ct {
-                (c.stride * c.cout, 2 * c.cin)
+                (c.stride * c.cout, 2 * c.cin, 1)
             } else {
-                (c.cout, c.cin * c.kernel)
+                (c.cout, c.cin * c.kernel, if taps { c.kernel } else { 1 })
             };
             s.borrow_mut().insert(name, nk);
         }
@@ -692,6 +715,8 @@ pub(crate) fn fused_conv(
         bias: c.bias.as_deref().map(TensorRef::Named),
         alpha: if dual {
             c.alpha_out.as_deref().map(TensorRef::Named)
+        } else if out_alpha.is_some() {
+            out_alpha.as_deref().map(TensorRef::Named)
         } else if fuse_in {
             c.alpha.as_deref().map(TensorRef::Named)
         } else {
@@ -719,7 +744,7 @@ pub(crate) fn fused_conv(
         slope: 0.0,
         weight_f16: false,
         split_bf16: splits.is_some() && (!c.transpose || ct),
-        weight_tap_major: phase_major(&c),
+        weight_tap_major: phase_major(&c) || taps,
         wgmma: splits.is_some(),
         weight_split: split,
         dual_alpha: dual,
@@ -941,9 +966,10 @@ mod tests {
             input_is_temp: true,
             row_scale: None,
             alpha_out: None,
+            taps_wgmma: false,
         };
         fused_conv(&mut p, ConvFusions(None), Some(&splits), x, first.done, c).unwrap();
-        assert_eq!(splits.borrow()["blk0.up.w"], (8 * 512, 2 * 1024));
+        assert_eq!(splits.borrow()["blk0.up.w"], (8 * 512, 2 * 1024, 1));
         let prefix = p.finish(1);
         let insts = &prefix.model.progs[0].insts;
         let ops: Vec<_> = insts
@@ -963,6 +989,92 @@ mod tests {
             prefix.model.tensors[ct.t[2] as usize].bytes,
             crate::pipeline::wgmma_weight_split(&vec![0u8; 512 * 1024 * 16 * 4], 8 * 512, 2 * 1024)
                 .len() as u64
+        );
+    }
+
+    /// A dual-snake k7 conv under split-bf16 with `taps_wgmma`: the input snake (`a1`) runs into
+    /// scratch (the input stays the residual stream), the conv takes the tap-major wgmma taps path
+    /// with the output snake (`a2`), and its weight carries the split image.
+    #[test]
+    fn k_tap_conv_takes_wgmma_taps_with_a_separate_input_snake() {
+        let mut b = Builder::new(4);
+        let x = b.tensor("act.codec.a", 2 * 40 * 768 * 4);
+        let len = b.tensor("lengths", 8);
+        let scratch = b.tensor("act.codec.s", 2 * 40 * 768 * 4);
+        let model = Model {
+            n_cu: 4,
+            target: 0,
+            tensors: b.tensors(),
+            progs: Vec::new(),
+            kv_row_insts: Vec::new(),
+            prog_t: Vec::new(),
+            gen: Vec::new(),
+        };
+        let prefix = PacketPrefix {
+            model,
+            programs: Vec::new(),
+            input: x,
+            output: x,
+            input_shape: vec![],
+        };
+        let mut p = prefix.program();
+        let first = p
+            .unary_f32(
+                x,
+                &[],
+                UnaryF32Stage {
+                    output: TensorRef::Handle(x),
+                    param: None,
+                    rows: 80,
+                    width: 768,
+                    stride: 0,
+                    col0: 0,
+                    kind: Activation::Tanh,
+                    p0: 0.0,
+                    p1: 0.0,
+                },
+            )
+            .unwrap();
+        let splits = RefCell::new(BTreeMap::new());
+        let c = Conv {
+            output: "act.codec.c",
+            weight: "w.dec.blk0.ru0.c1.w".into(),
+            bias: Some("w.dec.blk0.ru0.c1.b".into()),
+            alpha: None,
+            batch: 2,
+            in_rows: 40,
+            cin: 768,
+            cout: 768,
+            kernel: 7,
+            stride: 1,
+            dilation: 3,
+            groups: 1,
+            pad: 18,
+            pad_after: Some(0),
+            len,
+            act_in: Activation::Snake,
+            act_out: Activation::Snake,
+            residual: None,
+            transpose: false,
+            input_is_temp: false,
+            row_scale: None,
+            alpha_out: Some("w.dec.blk0.ru0.a12".into()),
+            taps_wgmma: true,
+        };
+        fused_conv(&mut p, ConvFusions(None), Some(&splits), x, first.done, c).unwrap();
+        assert_eq!(splits.borrow()["dec.blk0.ru0.c1.w"], (768, 7 * 768, 7));
+        let prefix = p.finish(1);
+        let insts = &prefix.model.progs[0].insts;
+        let (snake, conv) = (&insts[1], &insts[2]);
+        assert_eq!(DevOp::from_u16(snake.op), Some(DevOp::UnaryF32));
+        assert_eq!((snake.t[0], snake.t[1]), (scratch, x));
+        assert_eq!(prefix.model.tensors[snake.t[2] as usize].name, "w.dec.blk0.ru0.a1");
+        assert_eq!(DevOp::from_u16(conv.op), Some(DevOp::Conv1dF32));
+        assert_eq!(conv.t[1], scratch);
+        assert_eq!(prefix.model.tensors[conv.t[4] as usize].name, "w.dec.blk0.ru0.a2");
+        assert_eq!(
+            conv.j[1],
+            packet::dev::ACT_SNAKE << 8 | 1 << 13 | 1 << 14 | 1 << 15 | 1 << 17 | 1 << 18
         );
     }
 }

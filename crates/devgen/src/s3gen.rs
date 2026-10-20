@@ -2389,7 +2389,7 @@ struct Derived<'a> {
 }
 
 /// `[cout][cin][k]` f32 bytes -> `[cout][k][cin]`.
-fn to_tap_major(bytes: &[u8], cout: u32, cin: u32, k: u32) -> Vec<u8> {
+pub(crate) fn to_tap_major(bytes: &[u8], cout: u32, cin: u32, k: u32) -> Vec<u8> {
     let (cout, cin, k) = (cout as usize, cin as usize, k as usize);
     let mut out = vec![0u8; bytes.len()];
     for o in 0..cout {
