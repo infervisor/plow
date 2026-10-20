@@ -3155,6 +3155,11 @@ pub fn config_header(manifest: &Value) -> String {
                 "#if !PLOW_NV_SPEECH && !PLOW_NV_PREFILL\n#ifndef PLOW_NV_GEMV_MMA_B1\n#define PLOW_NV_GEMV_MMA_B1 1\n#endif\n#endif\n",
             );
         }
+        if let Some(v) = t.get("gemv_pf_ops").and_then(Value::as_u64) {
+            out.push_str(&format!(
+                "#ifndef PLOW_NV_GEMV_PF_OPS\n#define PLOW_NV_GEMV_PF_OPS {v}u\n#endif\n"
+            ));
+        }
         if manifest.get("arch").and_then(Value::as_str) == Some("sm_90a") {
             if let Some(ks) = t.get("xreg_k").and_then(Value::as_array) {
                 let any = ks
@@ -3257,11 +3262,6 @@ pub fn config_header(manifest: &Value) -> String {
             if let Some(v) = t.get("fa_mmaqk").and_then(Value::as_u64) {
                 out.push_str(&format!(
                     "#ifndef PLOW_NV_FA_MMAQK\n#define PLOW_NV_FA_MMAQK {v}\n#endif\n"
-                ));
-            }
-            if let Some(v) = t.get("gemv_pf_ops").and_then(Value::as_u64) {
-                out.push_str(&format!(
-                    "#ifndef PLOW_NV_GEMV_PF_OPS\n#define PLOW_NV_GEMV_PF_OPS {v}u\n#endif\n"
                 ));
             }
             if let Some(v) = t.get("gf_light512").and_then(Value::as_u64) {
