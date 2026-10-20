@@ -2140,11 +2140,21 @@ fn run_devblob(cli: &Cli) -> Result<PathBuf, Box<dyn std::error::Error>> {
 fn ensure_devblob_arch_supported(config_json: &str) -> Result<(), String> {
     let v: serde_json::Value =
         serde_json::from_str(config_json).map_err(|e| format!("invalid config.json: {e}"))?;
-    if v["model_type"].as_str() == Some("qwen3_5")
-        && (v.get("quantization_config").is_some()
-            || v["text_config"].get("quantization_config").is_some())
-    {
-        return Err("qwen3_5 native checkpoint FP8 lowering is not implemented yet".into());
+    if v["model_type"].as_str() == Some("qwen3_5") {
+        let qc = v.get("quantization_config").or_else(|| v["text_config"].get("quantization_config"));
+        if let Some(qc) = qc {
+            let block = qc["weight_block_size"]
+                .as_array()
+                .filter(|a| a.len() == 2)
+                .and_then(|a| Some([a[0].as_i64()?, a[1].as_i64()?]));
+            if qc["quant_method"].as_str() != Some("fp8")
+                || qc["fmt"].as_str() != Some("e4m3")
+                || qc["activation_scheme"].as_str() != Some("dynamic")
+                || block != Some([128, 128])
+            {
+                return Err("qwen3_5 unsupported quantization_config: expected dynamic fp8/e4m3 with weight_block_size=[128,128]".into());
+            }
+        }
     }
     Ok(())
 }
@@ -2262,7 +2272,12 @@ fn build_cubin_from_manifest(
     // `plow_qwen_prefill_arm = 0` and plowrt refuses the packet.
     let mut extra: Vec<String> = req
         .iter()
-        .filter(|d| d.starts_with("PLOW_NV_FA_GF=") || d.starts_with("PLOW_NV_QWEN_GDN="))
+        .filter(|d| {
+            d.starts_with("PLOW_NV_FA_GF=")
+                || d.starts_with("PLOW_NV_QWEN_GDN=")
+                || d.starts_with("PLOW_NV_FP8_M1=")
+                || d.starts_with("PLOW_NV_QUANT_FP8_VLLM=")
+        })
         .map(|d| format!("-D{d}"))
         .collect();
     for d in &rec {
@@ -3345,11 +3360,15 @@ mod cli_tests {
     fn qwen35_devblob_routes_bf16_and_rejects_unimplemented_fp8() {
         ensure_devblob_arch_supported(r#"{"model_type":"qwen3_5"}"#).unwrap();
         ensure_devblob_arch_supported(r#"{"model_type":"qwen3"}"#).unwrap();
+        ensure_devblob_arch_supported(
+            r#"{"model_type":"qwen3_5","quantization_config":{"quant_method":"fp8","fmt":"e4m3","activation_scheme":"dynamic","weight_block_size":[128,128]}}"#,
+        )
+        .unwrap();
         let err = ensure_devblob_arch_supported(
-            r#"{"model_type":"qwen3_5","quantization_config":{"quant_method":"fp8"}}"#,
+            r#"{"model_type":"qwen3_5","quantization_config":{"quant_method":"int4"}}"#,
         )
         .unwrap_err();
-        assert!(err.contains("FP8 lowering"));
+        assert!(err.contains("unsupported quantization_config"));
     }
 
     #[test]

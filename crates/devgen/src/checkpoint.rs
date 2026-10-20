@@ -188,14 +188,49 @@ fn shard_files(dir: &Path) -> Vec<PathBuf> {
             k.0
         );
     }
-    // THE fallback that was missing: single-file, no index (Gemma-4 12B).
-    vec![single.unwrap_or_else(|| {
-        panic!(
-            "{}: no safetensors checkpoint (looked for \
-             model-{{i}}-of-{{n}}[.partial].safetensors and model.safetensors)",
-            dir.display()
-        )
-    })]
+    if let Some(s) = single {
+        return vec![s];
+    }
+    let index_file = dir.join("model.safetensors.index.json");
+    if index_file.exists() {
+        if let Ok(bytes) = std::fs::read(&index_file) {
+            if let Ok(val) = serde_json::from_slice::<serde_json::Value>(&bytes) {
+                if let Some(wmap) = val.get("weight_map").and_then(|w| w.as_object()) {
+                    let mut filenames: Vec<String> = wmap
+                        .values()
+                        .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                        .collect();
+                    filenames.sort();
+                    filenames.dedup();
+                    let paths: Vec<PathBuf> = filenames
+                        .into_iter()
+                        .map(|f| dir.join(f))
+                        .filter(|p| p.exists())
+                        .collect();
+                    if !paths.is_empty() {
+                        return paths;
+                    }
+                }
+            }
+        }
+    }
+    let mut any: Vec<_> = std::fs::read_dir(dir)
+        .ok()
+        .into_iter()
+        .flatten()
+        .filter_map(Result::ok)
+        .map(|e| e.path())
+        .filter(|p| p.extension().is_some_and(|e| e == "safetensors"))
+        .collect();
+    if !any.is_empty() {
+        any.sort();
+        return any;
+    }
+    panic!(
+        "{}: no safetensors checkpoint (looked for \
+         model-{{i}}-of-{{n}}[.partial].safetensors and model.safetensors)",
+        dir.display()
+    )
 }
 
 pub(crate) fn layer_scalars(dir: &Path, layers: u32, prefix: &str) -> Vec<f32> {
@@ -418,14 +453,21 @@ pub(crate) fn validate_coverage(
     // Kimi-K3 is the live case: all 497 052 language-tower tensors are `language_model.model.…`
     // and ZERO start with `model.`, so a plan declared under `model.` would pass this gate
     // silently, allocate every weight, upload none, and decode from zeroed memory.
+    fn strip_quant(s: &str) -> &str {
+        s.strip_prefix("fp8/")
+            .or_else(|| s.strip_prefix("mxfp4/"))
+            .or_else(|| s.strip_prefix("affineq4/"))
+            .unwrap_or(s)
+    }
     let all = ckpt_names_all(dir);
-    let ckpt: HashSet<String> = all
+    let stripped_all: HashSet<String> = all.iter().map(|k| strip_quant(k).to_string()).collect();
+    let ckpt: HashSet<String> = stripped_all
         .iter()
         .filter(|k| k.starts_with(prefix))
         .cloned()
         .collect();
     if ckpt.is_empty() {
-        let ns = layer_namespaces(&all);
+        let ns = layer_namespaces(&stripped_all);
         return Err(format!(
             "weight prefix `{prefix}` matches NOTHING in {} ({} tensors).\n\
              The coverage gate below compares declared-vs-shipped WITHIN the prefix, so an \

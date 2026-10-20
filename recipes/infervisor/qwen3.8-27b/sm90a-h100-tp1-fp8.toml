@@ -1,0 +1,122 @@
+# Qwen3.8-27B FP8 on H100 SXM5: W8A8 weights, 16K context, decode ladder 1..48 slots,
+# live-KV allocation, packed prefill, recurrent GDN state. Canonical production recipe
+# for this model/GPU/precision.
+
+schema = "plow.recipe.v1"
+namespace = "infervisor"
+name = "qwen3.8-27b"
+label = "sm90a-h100-tp1-fp8"
+status = "provisional"
+plow_git = "15ae7ec8cb1041ee70f47b40646cbf21e7c56e21"
+network = "qwen3.5"
+
+[target]
+vendor = "nvidia"
+isa = "sm_90a"
+sku = "H100 SXM5"
+units = 132
+num_gpus = 1
+parallel = "tp"
+max_ctx = 16384
+toolchain = "cuda-12.9"
+
+[checkpoint]
+source = "hf:Qwen/Qwen3.8-27B-FP8"
+layout = "hf-fp8"
+
+[cell]
+name = "qwen38-27b.h100.fp8-16k-c1"
+model = "Qwen/Qwen3.8-27B-FP8"
+revision = "local"
+hf_dir = "{env:QWEN38_FP8_CHECKPOINT}"
+gpu = "H100 SXM5"
+arch = "sm_90a"
+n_cu = 132
+max_ctx = 16384
+precision = "w8a8"
+
+[[prep]]
+name = "gdn-prefill-lib"
+script = "scripts/build_sm90a_qwen_gdn.py"
+python = "{env:PYREF}"
+args = ["{out}/assets"]
+
+[[prep]]
+name = "gen-kernels"
+script = "scripts/gen_kernels/build_catalog.py"
+python = "python3"
+args = ["build", "{out}/assets", "--entries", "attn_pf_hd256_causal_ilv"]
+
+[[prep]]
+name = "gen-decode"
+script = "scripts/gen_kernels/build_catalog.py"
+python = "{env:PYREF}"
+args = ["build", "{out}/assets", "--entries", "attn_dec_hd256_gqa6_ilv"]
+[prep.env]
+TILELANG_DISABLE_CACHE = "1"
+TVM_FFI_DISABLE_TORCH_C_DLPACK = "1"
+
+[emit]
+emit = "devblob+cubin"
+args = []
+[emit.env]
+PLOW_FP8 = "1"
+PLOW_W8A8 = "1"
+PLOW_QWEN_W8A8_PREFILL = "1"
+PLOW_QWEN_FP8_M1_TMA = "0"
+PLOW_QWEN_SHARE_QUANT = "1"
+PLOW_QWEN_PREFILL = "128,1024,4096,8192"
+PLOW_DECODE_BATCH = "1"
+PLOW_DECODE_BATCH_LADDER = "1"
+PLOW_EMIT_PREFILL_CUBLASLT = "0"
+PLOW_EMIT_DECODE_CUBLASLT = "0"
+PLOW_EMIT_GEN_KERNELS = "attn_pf_hd256_causal_ilv,attn_dec_hd256_gqa6_ilv"
+PLOW_QWEN_KV_INTERLEAVE = "1"
+PLOW_EMIT_PACKED_PREFILL = "1"
+PLOW_NV_FA_RG_WIDE = "1"
+PLOW_NV_FA_RG_U = "8"
+PLOW_QWEN_GDN_ISOLATE = "16"
+PLOW_NV_GEMV_REM_SPLIT = "1"
+PLOW_NV_GEMV_K8_B1 = "1"
+
+[serve.env]
+PLOW_VMM_LIVE = "1"
+PLOW_PREFIX_CACHE = "0"
+[capabilities]
+decode_ladder = "Qwen FP8 native kernel constraint requires batch-1 decode"
+cublaslt_prefill = "Qwen FP8 prefill uses native W8A8 GEMM rather than cuBLASLt"
+
+[bench]
+backend = "openai"
+in_lens = "128 1024 4096"
+concs = "1"
+nprompt = 32
+outlen = 128
+warmups = 2
+seed = 42
+tokenizer = "{env:QWEN38_FP8_CHECKPOINT}"
+model_id = "checkpoint"
+gate_prompt = "<|im_start|>user\nWhat is the capital of France? Answer in one short sentence.<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
+
+[bench.profiles.realtime]
+in_lens = "128 1024 4096 7000 15000"
+concs = "1 4"
+nprompt = 32
+
+[bench.profiles.high_concurrency]
+in_lens = "128 1024 4096 7000 15000"
+concs = "16 32 64 128"
+nprompt = 384
+
+[gates]
+python = "{env:PYREF}"
+[gates.llm_fp32_ref]
+reference = "{env:QWEN38_FP32_REF}"
+eos = [248046, 248044]
+concurrency = [1]
+vllm_capture = { c1 = "{env:QWEN38_FP32_VLLM}" }
+cont_decisive_drop_max = 0.022
+kl_slack_max = 0.07
+kl_over_slack = 0.04
+cont_drop_max = 0.12
+

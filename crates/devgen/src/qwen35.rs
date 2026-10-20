@@ -137,10 +137,19 @@ impl Config {
                 .unwrap_or_else(|| panic!("qwen3_5 missing {name}"));
             u32::try_from(n).expect("qwen3_5 dimension exceeds u32")
         };
-        assert!(
-            v.get("quantization_config").is_none() && root.get("quantization_config").is_none(),
-            "qwen3_5 native checkpoint FP8 lowering is not implemented yet"
-        );
+        if let Some(qc) = root.get("quantization_config").or_else(|| v.get("quantization_config")) {
+            let block = qc["weight_block_size"]
+                .as_array()
+                .filter(|a| a.len() == 2)
+                .and_then(|a| Some([a[0].as_i64()?, a[1].as_i64()?]));
+            assert!(
+                qc["quant_method"].as_str() == Some("fp8")
+                    && qc["fmt"].as_str() == Some("e4m3")
+                    && qc["activation_scheme"].as_str() == Some("dynamic")
+                    && block == Some([128, 128]),
+                "qwen3_5 unsupported quantization_config: expected dynamic fp8/e4m3 with weight_block_size=[128,128]"
+            );
+        }
         assert_eq!(
             v["attention_bias"], false,
             "qwen3_5 biased attention unsupported"
@@ -1428,7 +1437,6 @@ pub(super) fn run(
         "qwen3_5 native CUDA path currently requires sm_90a"
     );
     assert_eq!(tp, 1, "qwen3_5 tensor parallelism is not implemented");
-    let fp8 = emit_config::active().fp8;
     // `[decode_batch]`, or the PLOW_DECODE_BATCH_LADDER rungs (one decode program each).
     let rungs = emit_config::active().decode_rungs();
     let batch = *rungs.last().expect("decode rungs");
@@ -1436,6 +1444,12 @@ pub(super) fn run(
     let root: Value =
         serde_json::from_slice(&std::fs::read(dir.join("config.json")).expect("config.json"))
             .expect("Qwen config JSON");
+    let fp8 = emit_config::active().fp8
+        || root.get("quantization_config").is_some()
+        || root
+            .get("text_config")
+            .and_then(|t| t.get("quantization_config"))
+            .is_some();
     let mut c = Config::parse(&root);
     if let Some(spec) = block {
         let selected = crate::block::parse_block(spec, c.layers.len());
@@ -1484,7 +1498,7 @@ pub(super) fn run(
             })
             .collect::<Vec<_>>(),
         c.block.map(|layer| layer..layer + 1),
-        &[],
+        &["weight_scale_inv", "weight_scale"],
         &[],
         &[],
     )
@@ -3034,11 +3048,24 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "native checkpoint FP8 lowering")]
+    #[should_panic(expected = "unsupported quantization_config")]
     fn rejects_unimplemented_fp8_checkpoint() {
         let mut v = fixture();
-        v["quantization_config"] = serde_json::json!({"quant_method":"fp8"});
+        v["quantization_config"] = serde_json::json!({"quant_method":"int4"});
         Config::parse(&v);
+    }
+
+    #[test]
+    fn accepts_valid_fp8_checkpoint_config() {
+        let mut v = fixture();
+        v["quantization_config"] = serde_json::json!({
+            "quant_method": "fp8",
+            "fmt": "e4m3",
+            "activation_scheme": "dynamic",
+            "weight_block_size": [128, 128]
+        });
+        let c = Config::parse(&v);
+        assert_eq!(c.layers.len(), 4);
     }
     #[test]
     fn attention_role_preserves_packets_and_combines_with_fp8_role() {

@@ -26,7 +26,7 @@
 #                      0 = no limit). Past it the run is stopped (rc 124, PREEMPTED).
 #   GPU_LEASE_VENDOR   override vendor detection (nvidia|amd|none)
 
-TIMEOUT=${GPU_LEASE_TIMEOUT:-1800}
+TIMEOUT=${GPU_LEASE_TIMEOUT:-10800}
 MAX_HOLD=${GPU_LEASE_MAX_HOLD:-7200}
 
 # `gpulease status` used to lease the box under the label "status" and run nothing.

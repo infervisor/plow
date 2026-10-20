@@ -10,10 +10,14 @@ target
 target/
 plow-out/
 models/
-build/.claude/worktrees/
+build/.claude
+.claude/worktrees/
 runtime/ubench/build/
 
-# Claude Code agent worktrees + session state (lives at .claude/, not build/.claude/)
+# Claude Code agent worktrees + session state (lives at .claude
+.claude/, not build/.claude
+.claude/)
+.claude
 .claude/
 build/
 build-*/
