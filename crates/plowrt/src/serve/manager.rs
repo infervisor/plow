@@ -1352,7 +1352,14 @@ impl ModelManager {
         let be = Arc::clone(&self.be);
         let (dir, ckpt) = (m.dir.clone(), m.ckpt.clone());
         let engine = on_own_thread("plow-load", move || {
-            crate::exec::gpu::GpuEngine::load(be, &dir, &ckpt)
+            let mut engine = crate::exec::gpu::GpuEngine::load(be, &dir, &ckpt)?;
+            if crate::config::RuntimeConfig::get().nv.spec {
+                match engine.spec_serve_enable(&dir) {
+                    Ok(limits) => tracing::info!(?limits, "speculative decoding on"),
+                    Err(e) => tracing::warn!(error = %e, "PLOW_SPEC set but speculative decoding unavailable"),
+                }
+            }
+            Ok(engine)
         })
         .await
         .and_then(|engine| engine)

@@ -324,6 +324,34 @@ pub struct ServingMetrics {
     pub thinking_requests: AtomicU64,
     pub reasoning_tokens: AtomicU64,
     pub request_reasoning_tokens: Histogram,
+    pub spec: SpecMetrics,
+}
+
+/// Speculative decoding counters with vLLM's semantics, counted at verification: one draft per span
+/// with `k > 0`, its `k` draft tokens, the drafts the verify accepted (an EOS inside the span ends
+/// the count; a host stop string later in the span does not), and per draft position the spans that
+/// accepted it. `kmax` 0 = speculation off (families not written).
+#[derive(Default)]
+pub struct SpecMetrics {
+    pub kmax: AtomicU64,
+    pub drafts: AtomicU64,
+    pub draft_tokens: AtomicU64,
+    pub accepted: AtomicU64,
+    pub accepted_per_pos: [AtomicU64; crate::orch::speculative::SPEC_KMAX],
+}
+
+impl SpecMetrics {
+    pub fn record(&self, k: u32, n_acc: u32) {
+        if k == 0 {
+            return;
+        }
+        self.drafts.fetch_add(1, Relaxed);
+        self.draft_tokens.fetch_add(u64::from(k), Relaxed);
+        self.accepted.fetch_add(u64::from(n_acc), Relaxed);
+        for c in &self.accepted_per_pos[..(n_acc as usize).min(self.accepted_per_pos.len())] {
+            c.fetch_add(1, Relaxed);
+        }
+    }
 }
 
 /// One chat request's reasoning accounting, recorded once when its response finishes.
@@ -578,6 +606,59 @@ impl ServingMetrics {
                         (false, _) => m.serving.success[i].load(Relaxed),
                     }
                 );
+            }
+        }
+        if models
+            .iter()
+            .any(|(_, m, _)| m.serving.spec.kmax.load(Relaxed) > 0)
+        {
+            let spec = |name: &str, help: &str, value: &dyn Fn(&SpecMetrics) -> u64| {
+                let mut out = String::new();
+                family(&mut out, name, "counter", help);
+                for ((_, m, _), labels) in models.iter().zip(&labels) {
+                    if m.serving.spec.kmax.load(Relaxed) > 0 {
+                        let _ = writeln!(out, "{name}{{{labels}}} {}", value(&m.serving.spec));
+                    }
+                }
+                out
+            };
+            out.push_str(&spec(
+                "vllm:spec_decode_num_drafts_total",
+                "Speculative verify spans that carried drafts.",
+                &|s| s.drafts.load(Relaxed),
+            ));
+            out.push_str(&spec(
+                "vllm:spec_decode_num_draft_tokens_total",
+                "Draft tokens proposed.",
+                &|s| s.draft_tokens.load(Relaxed),
+            ));
+            out.push_str(&spec(
+                "vllm:spec_decode_num_accepted_tokens_total",
+                "Draft tokens accepted.",
+                &|s| s.accepted.load(Relaxed),
+            ));
+            family(
+                out,
+                "vllm:spec_decode_num_accepted_tokens_per_pos_total",
+                "counter",
+                "Drafts accepted at each draft position.",
+            );
+            for ((_, m, _), labels) in models.iter().zip(&labels) {
+                let kmax = m.serving.spec.kmax.load(Relaxed) as usize;
+                for (pos, c) in m
+                    .serving
+                    .spec
+                    .accepted_per_pos
+                    .iter()
+                    .enumerate()
+                    .take(kmax)
+                {
+                    let _ = writeln!(
+                        out,
+                        "vllm:spec_decode_num_accepted_tokens_per_pos_total{{{labels},position=\"{pos}\"}} {}",
+                        c.load(Relaxed)
+                    );
+                }
             }
         }
         macro_rules! hist {
@@ -1043,6 +1124,40 @@ mod tests {
         ] {
             assert!(out.contains(&line), "missing {line}");
         }
+    }
+
+    #[test]
+    fn spec_decode_counters_use_vllm_names_and_positions() {
+        let m = Arc::new(Metrics::default());
+        let mut out = String::new();
+        ServingMetrics::write(&mut out, &[("g".into(), Arc::clone(&m), true)]);
+        assert!(
+            !out.contains("spec_decode"),
+            "absent while speculation is off"
+        );
+        m.serving.spec.kmax.store(3, Relaxed);
+        m.serving.spec.record(3, 2);
+        m.serving.spec.record(2, 0);
+        m.serving.spec.record(0, 0);
+        out.clear();
+        ServingMetrics::write(&mut out, &[("g".into(), m, true)]);
+        let l = "{model_name=\"g\",engine=\"0\"";
+        for line in [
+            format!("vllm:spec_decode_num_drafts_total{l}}} 2\n"),
+            format!("vllm:spec_decode_num_draft_tokens_total{l}}} 5\n"),
+            format!("vllm:spec_decode_num_accepted_tokens_total{l}}} 2\n"),
+            format!("vllm:spec_decode_num_accepted_tokens_per_pos_total{l},position=\"0\"}} 1\n"),
+            format!("vllm:spec_decode_num_accepted_tokens_per_pos_total{l},position=\"1\"}} 1\n"),
+            format!("vllm:spec_decode_num_accepted_tokens_per_pos_total{l},position=\"2\"}} 0\n"),
+        ] {
+            assert!(out.contains(&line), "missing {line}");
+        }
+        assert!(!out.contains("position=\"3\""));
+        assert_eq!(
+            out.matches("# TYPE vllm:spec_decode_num_drafts_total counter")
+                .count(),
+            1
+        );
     }
 
     #[test]
