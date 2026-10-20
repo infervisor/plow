@@ -3554,6 +3554,21 @@ mod tests {
         }
         assert_eq!(count, 31);
         check_operand_dependencies(&mapped.progs[0]);
+        let man = manifest::build(&mapped, "sm_90a", &LeanReport::skipped("fixture"));
+        assert_eq!(man["features"]["qwen_fp8_m1_tma"], true);
+        let req = man["backends"]["nvcc"]["requires"].as_array().unwrap();
+        for flag in [
+            "PLOW_NV_W8A8=1",
+            "PLOW_NV_FP8_M1=1",
+            "PLOW_NV_QUANT_FP8_VLLM=1",
+            "PLOW_NV_TMA_GEMM=1",
+            "PLOW_NV_FP8_M1_TMA=1",
+            "PLOW_NV_FP8_M1_XCACHE=1",
+            "PLOW_NV_FP8_M1_FAST_ACCUM=1",
+            "PLOW_NV_FP8_M1_BK1024=1",
+        ] {
+            assert!(req.contains(&serde_json::json!(flag)), "missing required flag {flag}");
+        }
     }
 
     #[test]

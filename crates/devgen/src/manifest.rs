@@ -1555,6 +1555,13 @@ fn backend_nvcc(f: &Map<String, Value>, t: &Map<String, Value>, s: &Shapes) -> V
         if on("qwen_gdn") {
             req.push("PLOW_NV_FP8_M1=1".into());
             req.push("PLOW_NV_QUANT_FP8_VLLM=1".into());
+            if on("qwen_fp8_m1_tma") {
+                req.push("PLOW_NV_TMA_GEMM=1".into());
+                req.push("PLOW_NV_FP8_M1_TMA=1".into());
+                req.push("PLOW_NV_FP8_M1_XCACHE=1".into());
+                req.push("PLOW_NV_FP8_M1_FAST_ACCUM=1".into());
+                req.push("PLOW_NV_FP8_M1_BK1024=1".into());
+            }
         }
     }
     if on("fp8_kv") {
@@ -2632,6 +2639,13 @@ fn build_inner(m: &Model, arch: &str, lean: &crate::LeanReport, packed_prefill: 
             json!({ "required": true, "define": "PLOW_MOE2_BODY" });
     }
     let mut f = features(&union);
+    if m.gen
+        .iter()
+        .any(|g| g.kind == packet::rope::GEN_TMAP_E4M3 && g.scale == 64)
+        || crate::emit_config::active().qwen_fp8_m1_tma
+    {
+        f.insert("qwen_fp8_m1_tma".into(), json!(true));
+    }
     if m.progs
         .iter()
         .flat_map(|p| &p.insts)

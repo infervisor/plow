@@ -19,6 +19,11 @@ Python runs only here; the runtime loads the cubin as a packet role object (plow
 import argparse, ctypes, hashlib, json, math, os, re, shlex, subprocess, sys, tempfile
 from pathlib import Path
 
+if "CXX" not in os.environ and os.path.exists("/usr/bin/g++-14"):
+    os.environ["CXX"] = "/usr/bin/g++-14"
+if "CC" not in os.environ and os.path.exists("/usr/bin/gcc-14"):
+    os.environ["CC"] = "/usr/bin/gcc-14"
+
 REPO = Path(__file__).resolve().parents[2]
 TABLE = REPO / "tuning/nvidia/sm_90a/h100-sxm5/gen_kernels.json"
 GEN_ATTEMPTS = 12
@@ -305,7 +310,7 @@ def body_digest(header):
 
 def nvcc_compile(name, header, out):
     from tilelang import env
-    nvcc = os.environ.get("PLOW_NVCC", "nvcc")
+    nvcc = os.environ.get("PLOW_NVCC") or ("/usr/local/cuda/bin/nvcc" if os.path.exists("/usr/local/cuda/bin/nvcc") else "nvcc")
     prepend = shlex.split(os.environ.get("NVCC_PREPEND_FLAGS", ""))
     append = shlex.split(os.environ.get("NVCC_APPEND_FLAGS", ""))
     wrapper = WRAPPERS[ENTRIES[name]["signature"]["op"]]

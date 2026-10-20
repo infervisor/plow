@@ -2275,8 +2275,9 @@ fn build_cubin_from_manifest(
         .filter(|d| {
             d.starts_with("PLOW_NV_FA_GF=")
                 || d.starts_with("PLOW_NV_QWEN_GDN=")
-                || d.starts_with("PLOW_NV_FP8_M1=")
+                || d.starts_with("PLOW_NV_FP8_M1")
                 || d.starts_with("PLOW_NV_QUANT_FP8_VLLM=")
+                || d.starts_with("PLOW_NV_TMA_GEMM=")
         })
         .map(|d| format!("-D{d}"))
         .collect();
