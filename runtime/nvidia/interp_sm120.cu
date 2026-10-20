@@ -2092,6 +2092,16 @@ __device__ __forceinline__ void plow_exec(const PlowDevInst* in, void* const* T,
                       in->i[1], in->i[2], in->i[3], in->i[4], in->i[5], in->i[6], in->i[7], in->fj[1].u, slice,
                       nblk, arena);
         break;
+    case PLOW_DOP_GEMV_F32_OUT:
+        d_gemv_f32out((float*)TEN(0), (const __nv_bfloat16*)TEN(1), (const __nv_bfloat16*)TEN(2), in->i[0],
+                      in->i[1], in->i[2], slice, nblk);
+        break;
+    case PLOW_DOP_SAMPLE_SMALL_F32:
+        d_sample_small((unsigned*)TEN(0), (const float*)TEN(1), (const float*)TEN(2), (const unsigned*)TEN(3),
+                       (const unsigned long long*)TEN(4), (unsigned*)TEN(5), (const unsigned*)TEN(6),
+                       (unsigned*)TEN(7), in->i[0], in->i[1], in->i[2], in->i[3], in->i[4], in->i[5], in->i[7],
+                       in->fj[1].u, slice, nblk, arena);
+        break;
     case PLOW_DOP_EMBED_FRAME_BF16:
         d_embed_frame((__nv_bfloat16*)TEN(0), (const __nv_bfloat16*)TEN(1), (const unsigned*)TEN(2),
                       (const __nv_bfloat16*)TEN(3), (const unsigned*)TEN(4), in->i[0], in->i[1], in->i[2],

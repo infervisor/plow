@@ -2051,7 +2051,8 @@ pub enum DevOp {
     /// `i0=rows i1=width i2=head_width i3=group_rows i4=flags`.
     GroupedAttentionF32 = 178,
     /// Gather BF16 token embeddings and replace selected rows with BF16-rounded FP32 overlay
-    /// rows. `overlay_index[row] == u32::MAX` selects `table[tokens[row]]`; every other value
+    /// rows. `overlay_index[row] == u32::MAX` selects `table[tokens[row]]`, `u32::MAX - 1` keeps
+    /// the row an earlier embed op wrote (frame rows of a speech prompt); every other value
     /// selects that overlay row. This is the generic encoder-to-decoder handoff for audio,
     /// image, and other multimodal pipelines.
     /// `t0=out(bf16[rows,width]) t1=table(bf16[vocab,width]) t2=tokens(u32[rows])
@@ -2430,6 +2431,24 @@ pub enum DevOp {
     /// `i0=rows i1=vocab i2=out_stride i3=out_col0 i4=coord i5=ras_window i6=flags
     /// i7=logit_stride` · `j0=ras_limit`.
     SampleFishBf16 = 219,
+    /// Decode GEMV with an fp32 result: `C[m][n] = sum_k x[m][k] * W[n][k]`, bf16 operands, fp32
+    /// products and accumulation, fp32 store (a reference that runs its head in fp32 on bf16
+    /// weights). `t0=C(f32[M,N]) t1=x(bf16[M,K]) t2=W(bf16[N,K])` · `i0=M i1=N i2=K` (K % 8 == 0).
+    GemvF32Out = 220,
+    /// Small-vocabulary sampling of an f32 logit row (one block per row; Breeze TTS): with a
+    /// `bitmap`, classes whose bit is set take the HF repetition penalty (`l > 0 ? l / pen : l *
+    /// pen`); then `/ T`, the top `min(ctl[r][0], 64)` classes (ties to the lower class), the shifted
+    /// nucleus when `top_p < 1` (keep class `i` while the probability mass before it is `<= top_p`;
+    /// the first always stays), and a Gumbel race `argmax l_i / T + G_i` with `G_i` from the
+    /// counter hash of `(seed[r], ctl[r][1], i4, 0, i)` (as [`DevOp::SampleFishBf16`]). A `force`
+    /// value other than `u32::MAX` replaces the draw (teacher forcing). The class sets its bitmap
+    /// bit, lands in `out[r*i2 + i3]`, and `eidx[r] = class + j0` (an embedding row). `ctl[r][0]
+    /// == 0` skips the row.
+    /// `t0=out(u32) t1=logits(f32[rows][i7 or vocab]) t2=params(f32[rows][4]: T, top_p, penalty, -)
+    /// t3=ctl(u32[rows][2]: top_k, step) t4=seed(u64[rows]) t5=bitmap(u32[rows][i5])?
+    /// t6=force(u32, out's layout)? t7=eidx(u32[rows])?` · `i0=rows i1=vocab i2=out_stride
+    /// i3=out_col0 i4=coord i5=bitmap_words i7=logit_stride` · `j0=eidx_offset`.
+    SampleSmallF32 = 221,
 }
 
 /// [`DevOp::FlashPrefillFp8`]'s split count (`i7` low half).
@@ -2712,6 +2731,8 @@ impl DevOp {
         DevOp::CompressRopeQuant,
         DevOp::EmbedFrameBf16,
         DevOp::SampleFishBf16,
+        DevOp::GemvF32Out,
+        DevOp::SampleSmallF32,
     ];
 
     /// Recover the opcode from its wire discriminant, or `None` for a value no
@@ -2952,6 +2973,8 @@ impl DevOp {
             DevOp::CompressRopeQuant => "PLOW_DOP_COMPRESS_ROPE_QUANT",
             DevOp::EmbedFrameBf16 => "PLOW_DOP_EMBED_FRAME_BF16",
             DevOp::SampleFishBf16 => "PLOW_DOP_SAMPLE_FISH_BF16",
+            DevOp::GemvF32Out => "PLOW_DOP_GEMV_F32_OUT",
+            DevOp::SampleSmallF32 => "PLOW_DOP_SAMPLE_SMALL_F32",
         }
     }
 
@@ -3014,7 +3037,8 @@ impl DevOp {
     /// 212 -> 218 for `CompressPool = 212` .. `CompressRopeQuant = 217` (DeepSeek-V4.1).
     /// 218 -> 219 for `EmbedFrameBf16 = 218` (Fish S2 codec-frame input embedding).
     /// 219 -> 220 for `SampleFishBf16 = 219` (Fish S2 in-program sampling).
-    pub const COUNT: u16 = 220;
+    /// 220 -> 222 for `GemvF32Out = 220`, `SampleSmallF32 = 221` (Breeze TTS depth stage).
+    pub const COUNT: u16 = 222;
 
     /// The `(M, N, K, quant)` a decode-GEMV opcode carries, or `None` if this is not one.
     ///

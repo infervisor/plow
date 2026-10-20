@@ -32,6 +32,22 @@ pub struct Tensors {
     pub frame_codes: u16,
     /// u32 `[ctx][codebooks]`: prompt frame rows the host writes before a prefill.
     pub prompt_codes: u16,
+    /// u32 `[rows][codebooks]`: classes to force (u32::MAX = sample); Breeze only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub force: Option<u16>,
+}
+
+/// The sampling policy of the depth programs, which fixes how the runtime stages a row.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Sampler {
+    /// `SampleFishBf16`: params (T, top_p, RAS T, RAS top_p), `top_k` and `step` tensors,
+    /// `history` = the RAS window.
+    #[default]
+    Fish,
+    /// `SampleSmallF32`: params (T, top_p, repetition penalty, -), `top_k` = `step` = one
+    /// `[rows][2]` (top_k, step) tensor, `history` = a `[rows][ras_window]` u32 class bitmap.
+    Breeze,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -45,6 +61,8 @@ pub struct Manifest {
     pub semantic_tokens: u32,
     pub stop_class: u32,
     pub ras_window: u32,
+    #[serde(default)]
+    pub sampler: Sampler,
     pub tensors: Tensors,
 }
 
@@ -62,12 +80,19 @@ impl Manifest {
             t.prompt_codes,
         ];
         if self.version != VERSION {
-            return Err(format!("fish_depth.json version {} (want {VERSION})", self.version));
+            return Err(format!(
+                "fish_depth.json version {} (want {VERSION})",
+                self.version
+            ));
         }
         if self.rows.len() != n_programs || self.rows.iter().any(|&r| r == 0) {
             return Err("fish_depth.json rows disagree with the programs".into());
         }
-        if handles.iter().any(|&h| usize::from(h) >= tensor_count) {
+        if handles
+            .iter()
+            .chain(&t.force)
+            .any(|&h| usize::from(h) >= tensor_count)
+        {
             return Err("fish_depth.json names a tensor the packet lacks".into());
         }
         if self.codebooks == 0 || self.stop_class != self.semantic_tokens {

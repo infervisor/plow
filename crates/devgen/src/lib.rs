@@ -3053,7 +3053,7 @@ fn declare(
             edns: ex4[3],
         });
     }
-    if c.frame.is_some() {
+    if c.frame.as_ref().is_some_and(|f| f.depth.is_some()) {
         t.fish = Some(fish_depth::declare(b, c, dbatch));
     }
     t
@@ -4297,13 +4297,24 @@ fn emit_phase(
     let fused = fused_epilogue;
 
     let escale = c.emb_scale;
+    let emit_frame = |b: &mut Builder, f: &FrameEmbed| {
+        assert!(escale == 1.0, "a frame embedding has its own divisor");
+        b.emit(DevOp::EmbedFrameBf16, rows.clone(), &[], |d| {
+            let codes = if decode { n.frame_dcodes } else { n.frame_codes };
+            d.t[..5].copy_from_slice(&[n.x, n.emb, n.ids, n.frame_cb, codes]);
+            d.i[..7].copy_from_slice(&[t, c.hidden, c.vocab, f.codebooks, f.cb_size, f.lo, f.rows]);
+            d.f[0] = f.div;
+        })
+    };
     // Block mode: no token embedding — `act.x` is uploaded by the harness (the
     // residual-stream input), so Embed would overwrite it. The first in-block
     // layer's RmsNorm reads `act.x` directly (its dep is `&[]`; see below).
     let mut dep = if block_mode {
         0u32
     } else if !decode && c.encoder_overlay_rows > 0 {
-        b.emit(DevOp::EmbedOverlayBf16, rows.clone(), &[], |d| {
+        // A frame-embedding prompt embeds its frame rows first; their overlay index keeps them.
+        let frame: Vec<u32> = c.frame.iter().map(|f| emit_frame(b, f)).collect();
+        b.emit(DevOp::EmbedOverlayBf16, rows.clone(), &frame, |d| {
             d.t[..5].copy_from_slice(&[
                 n.x,
                 n.emb,
@@ -4314,13 +4325,7 @@ fn emit_phase(
             d.i[..4].copy_from_slice(&[t, c.hidden, c.vocab, c.encoder_overlay_rows]);
         })
     } else if let Some(f) = &c.frame {
-        assert!(escale == 1.0, "a frame embedding has its own divisor");
-        b.emit(DevOp::EmbedFrameBf16, rows.clone(), &[], |d| {
-            let codes = if decode { n.frame_dcodes } else { n.frame_codes };
-            d.t[..5].copy_from_slice(&[n.x, n.emb, n.ids, n.frame_cb, codes]);
-            d.i[..7].copy_from_slice(&[t, c.hidden, c.vocab, f.codebooks, f.cb_size, f.lo, f.rows]);
-            d.f[0] = f.div;
-        })
+        emit_frame(b, f)
     } else if decode && c.speech_pos_rows > 0 {
         b.emit(DevOp::EmbedPosBf16, rows.clone(), &[], |d| {
             d.t[..6].copy_from_slice(&[n.x, n.emb, n.ids, n.speech_pos, n.pos, n.pos_base]);
@@ -10760,7 +10765,7 @@ fn emit_dense_gqa(
         sections.extend(
             tts::t3_text_tables_section(&dir).unwrap_or_else(|e| panic!("T3 text tables: {e}")),
         );
-    } else if c.encoder_overlay_rows > 0 && !block_mode {
+    } else if c.encoder_overlay_rows > 0 && c.frame.is_none() && !block_mode {
         sections.push(
             pipeline::causal_pipeline_section(
                 &m,
@@ -11287,7 +11292,7 @@ fn emit_dense_gqa(
         hetero_channel::plan(&m, channels, weights, channel_progs).unwrap_or_else(|e| panic!("{e}"))
     });
     let audio_blob =
-        (c.encoder_overlay_rows > 0 && c.speech_pos_rows == 0 && !block_mode).then(|| {
+        (c.encoder_overlay_rows > 0 && c.speech_pos_rows == 0 && c.frame.is_none() && !block_mode).then(|| {
             // Single-utterance buckets (forward.v1); on CUDA also packed buckets (chunks of several
             // utterances, each attending in its own windows and splitting K as its single bucket
             // would), the largest sizing every shared tensor.

@@ -320,6 +320,8 @@ pub fn classify(op: DevOp) -> OpClass {
         DevOp::EmbedPosBf16 => a_rows("i0=rows, token gather plus per-row learned position"),
         DevOp::EmbedFrameBf16 => a_rows("i0=rows, token gather plus a frame token's codebook rows"),
         DevOp::SampleFishBf16 => a_rows("i0=rows, one sampled class per logit row"),
+        DevOp::GemvF32Out => a_rows("i0=rows, an fp32 projection row per input row"),
+        DevOp::SampleSmallF32 => a_rows("i0=rows, one sampled class per logit row"),
         DevOp::LstmCellF32 => a_elem("i0=width, explicit state tensors"),
         DevOp::ArgmaxF32 => a_rows("i0=rows"),
         DevOp::ReluF32 => a_elem("i0=n"),

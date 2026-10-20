@@ -4,7 +4,7 @@
 
 use std::path::Path;
 
-use plow_asset::fish_depth::Manifest;
+use plow_asset::fish_depth::{Manifest, Sampler};
 
 use crate::asset::devblob::DevBlob;
 use crate::device::cuda::PinnedHost;
@@ -43,6 +43,8 @@ pub struct FishRow {
     pub top_k: u32,
     pub ras_temperature: f32,
     pub ras_top_p: f32,
+    /// HF repetition penalty on the backbone class (Breeze sampler; 1.0 = none).
+    pub repetition_penalty: f32,
 }
 
 /// What a Fish depth packet emits per frame.
@@ -117,7 +119,9 @@ impl FishDepth {
             || !need(t.seed, rows * 8)
             || !need(t.history, e.batch * manifest.ras_window as usize * 4)
             || !need(t.frame_codes, e.batch * k * 4)
-            || [t.top_k, t.step, t.hidden_row].iter().any(|&h| !need(h, rows * 4))
+            || [t.top_k, t.step, t.hidden_row]
+                .iter()
+                .any(|&h| !need(h, rows * 4))
         {
             return Err(reject("tensor sizes disagree with the program widths"));
         }
@@ -136,8 +140,14 @@ impl FishDepth {
                 })
             })
             .collect::<Result<Vec<_>>>()?;
-        let stage = e.be.host_alloc_pinned(rows * (16 + 12 + 8) + e.batch * k * 4)?;
-        tracing::info!(programs = programs.len(), rows, codebooks = k, "fish depth programs loaded");
+        let stage =
+            e.be.host_alloc_pinned(rows * (16 + 12 + 8) + e.batch * k * 4)?;
+        tracing::info!(
+            programs = programs.len(),
+            rows,
+            codebooks = k,
+            "fish depth programs loaded"
+        );
         Ok(Self {
             manifest,
             programs,
@@ -191,7 +201,12 @@ impl GpuEngine {
         r
     }
 
-    fn fish_launch(&mut self, d: &mut FishDepth, rows: &[FishRow], out: &mut Vec<u32>) -> Result<()> {
+    fn fish_launch(
+        &mut self,
+        d: &mut FishDepth,
+        rows: &[FishRow],
+        out: &mut Vec<u32>,
+    ) -> Result<()> {
         let batch = self.batch;
         let width = rows.iter().map(|r| r.slot + 1).max().unwrap_or(0);
         let p = d
@@ -199,7 +214,12 @@ impl GpuEngine {
             .iter()
             .filter(|p| p.rows as usize >= width)
             .min_by_key(|p| p.rows)
-            .ok_or_else(|| reject(format!("no program covers slot {}", width.saturating_sub(1))))?;
+            .ok_or_else(|| {
+                reject(format!(
+                    "no program covers slot {}",
+                    width.saturating_sub(1)
+                ))
+            })?;
         if rows.iter().any(|r| r.slot >= batch || r.top_k == 0) {
             return Err(reject("row slot out of range or top_k 0"));
         }
@@ -220,31 +240,50 @@ impl GpuEngine {
                 words[2 * d.rows + r] = r as u32;
                 seeds[r] = 0;
             }
+            let breeze = d.manifest.sampler == Sampler::Breeze;
             for row in rows {
                 let r = row.slot;
-                params[r * 4..r * 4 + 4].copy_from_slice(&[
-                    row.temperature,
-                    row.top_p,
-                    row.ras_temperature,
-                    row.ras_top_p,
-                ]);
+                params[r * 4..r * 4 + 4].copy_from_slice(&if breeze {
+                    [row.temperature, row.top_p, row.repetition_penalty, 1.0]
+                } else {
+                    [
+                        row.temperature,
+                        row.top_p,
+                        row.ras_temperature,
+                        row.ras_top_p,
+                    ]
+                });
                 words[r] = row.top_k;
                 words[d.rows + r] = row.step;
                 words[2 * d.rows + r] = row.hidden_row;
                 seeds[r] = row.seed;
+            }
+            if breeze {
+                // One [rows][2] (top_k, step) tensor: interleave into the top_k/step words.
+                let (k, s) = words[..2 * d.rows].split_at_mut(d.rows);
+                let ctl: Vec<u32> = (0..d.rows).flat_map(|r| [k[r], s[r]]).collect();
+                words[..2 * d.rows].copy_from_slice(&ctl);
             }
         }
         let t = d.manifest.tensors.clone();
         let bytes = d.stage.as_slice();
         let (sw, pw, ww) = (d.rows * 8, d.rows * 16, d.rows * 12);
         let words = sw + pw;
+        let ctl = if d.manifest.sampler == Sampler::Breeze {
+            [(t.top_k, words, n * 8), (t.top_k, words, 0)]
+        } else {
+            [(t.top_k, words, n * 4), (t.step, words + d.rows * 4, n * 4)]
+        };
         for (h, at, len) in [
             (t.seed, 0, n * 8),
             (t.params, sw, n * 16),
-            (t.top_k, words, n * 4),
-            (t.step, words + d.rows * 4, n * 4),
+            ctl[0],
+            ctl[1],
             (t.hidden_row, words + d.rows * 8, n * 4),
         ] {
+            if len == 0 {
+                continue;
+            }
             // SAFETY: the pinned stage is rewritten only after this call's synchronize.
             unsafe {
                 self.be.memcpy_htod_async(
@@ -258,8 +297,14 @@ impl GpuEngine {
             .memset_d8_async(p.arg.counters, 0, p.counter_bytes, &self.stream)?;
         let mut arg = p.arg;
         let mut params = [&mut arg as *mut DevProgram as *mut std::ffi::c_void];
-        self.be
-            .launch_cooperative(self.f, self.grid, BLOCK, self.smem, &mut params, Some(&self.stream))?;
+        self.be.launch_cooperative(
+            self.f,
+            self.grid,
+            BLOCK,
+            self.smem,
+            &mut params,
+            Some(&self.stream),
+        )?;
         let codes_at = sw + pw + ww;
         // SAFETY: as the uploads.
         unsafe {
@@ -270,7 +315,8 @@ impl GpuEngine {
             )?;
         }
         self.be.stream_synchronize(&self.stream)?;
-        let codes: &[u32] = bytemuck::cast_slice(&d.stage.as_slice()[codes_at..codes_at + n * k * 4]);
+        let codes: &[u32] =
+            bytemuck::cast_slice(&d.stage.as_slice()[codes_at..codes_at + n * k * 4]);
         for row in rows {
             out.extend_from_slice(&codes[row.slot * k..row.slot * k + k]);
         }

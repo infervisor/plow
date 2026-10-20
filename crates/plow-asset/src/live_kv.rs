@@ -784,6 +784,8 @@ fn direct_operands(op: DevOp, d: &DevInst64, packet: &Packet<'_>) -> Result<()> 
                 | DevOp::EmbedPosBf16
                 | DevOp::EmbedFrameBf16
                 | DevOp::SampleFishBf16
+                | DevOp::GemvF32Out
+                | DevOp::SampleSmallF32
                 | DevOp::MmRowsBf16
                 | DevOp::MmSpanExtent
                 | DevOp::Argmax

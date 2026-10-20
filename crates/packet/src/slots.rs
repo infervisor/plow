@@ -316,6 +316,8 @@ const DOC: &[S] = &[
     S { op: DevOp::GroupedAttentionF32, t: &["context", "query", "key", "value", "valid_rows?"], i: &["rows", "width", "head_width", "group_rows", "flags"], f: &[], j: &[] },
     S { op: DevOp::EmbedPosBf16, t: &["out", "table", "tokens", "pos_table", "pos", "base"], i: &["rows", "width", "vocab", "pos_rows"], f: &[], j: &[] },
     S { op: DevOp::EmbedFrameBf16, t: &["out", "table", "tokens", "cb_table", "codes"], i: &["rows", "width", "vocab", "K", "cb_size", "frame_lo", "frame_rows"], f: &["div"], j: &[] },
+    S { op: DevOp::GemvF32Out, t: &["C", "x", "W"], i: &["M", "N", "K"], f: &[], j: &[] },
+    S { op: DevOp::SampleSmallF32, t: &["out", "logits", "params", "ctl", "seed", "bitmap?", "force?", "eidx?"], i: &["rows", "vocab", "out_stride", "out_col0", "coord", "bitmap_words", "", "logit_stride"], f: &[], j: &["eidx_offset"] },
     S { op: DevOp::SampleFishBf16, t: &["out", "logits", "params", "top_k", "seed", "step", "history?", "out_flat?"], i: &["rows", "vocab", "out_stride", "out_col0", "coord", "ras_window", "flags", "logit_stride"], f: &[], j: &["ras_limit"] },
     S { op: DevOp::EmbedOverlayBf16, t: &["out", "table", "tokens", "overlay", "overlay_index"], i: &["rows", "width", "vocab", "overlay_rows"], f: &[], j: &[] },
     S { op: DevOp::GatherRowsF32, t: &["out", "table", "index?"], i: &["rows", "width", "vocab", "rows_per_item", "repeat", "index_item_stride", "table_item_stride", "flags"], f: &[], j: &["out_stride", "out_col0"] },

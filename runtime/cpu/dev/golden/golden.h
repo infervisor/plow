@@ -61,6 +61,8 @@ G_K(g_embed_overlay_bf16);
 G_K(g_embed_pos_bf16);
 G_K(g_embed_frame_bf16);
 G_K(g_sample_fish_bf16);
+G_K(g_gemv_f32_out);
+G_K(g_sample_small_f32);
 G_K(g_lstm_cell_f32);
 G_K(g_argmax_f32);
 G_K(g_relu_f32);

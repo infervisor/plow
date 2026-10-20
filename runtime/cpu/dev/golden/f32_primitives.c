@@ -359,6 +359,7 @@ G_K(g_embed_overlay_bf16) {
     for (uint32_t index = lo; index < hi; index++) {
         const uint32_t row = index / width, column = index % width;
         const uint32_t selected = overlay_index[row];
+        if (selected == UINT32_MAX - 1) continue;
         if (selected == UINT32_MAX) {
             if (tokens[row] >= vocab) return;
             out[index] = table[(size_t)tokens[row] * width + column];
@@ -498,6 +499,88 @@ G_K(g_sample_fish_bf16) {
         if ((flags & 1u) && hist && window) hist[(size_t)r * window + step[r] % window] = c + 1u;
         out[(size_t)r * ostride + ocol] = c;
         if (out_flat) out_flat[r] = c;
+    }
+}
+
+/* GemvF32Out (220): fp32 rows, the device's per-element fma order over k. */
+G_K(g_gemv_f32_out) {
+    (void)ctx;
+    float* c = PLOW_CPU_TEN(in, T, 0);
+    const plow_bf16* x = PLOW_CPU_TEN(in, T, 1);
+    const plow_bf16* w = PLOW_CPU_TEN(in, T, 2);
+    const uint32_t m_rows = in->i[0], n_out = in->i[1], k_in = in->i[2];
+    uint32_t lo, hi;
+    g_range(n_out, slice, nblk, &lo, &hi);
+    for (uint32_t m = 0; m < m_rows; m++)
+        for (uint32_t n = lo; n < hi; n++) {
+            float acc = 0.f;
+            for (uint32_t k = 0; k < k_in; k++)
+                acc = fmaf(plow_bf2f(x[(size_t)m * k_in + k]), plow_bf2f(w[(size_t)n * k_in + k]), acc);
+            c[(size_t)m * n_out + n] = acc;
+        }
+}
+
+/* SampleSmallF32 (221), one row per slice step; the device's selection and arithmetic order. */
+G_K(g_sample_small_f32) {
+    (void)ctx;
+    uint32_t* out = PLOW_CPU_TEN(in, T, 0);
+    const float* logits = PLOW_CPU_TEN(in, T, 1);
+    const float* params = PLOW_CPU_TEN(in, T, 2);
+    const uint32_t* ctl = PLOW_CPU_TEN(in, T, 3);
+    const uint64_t* seed = PLOW_CPU_TEN(in, T, 4);
+    uint32_t* bitmap = PLOW_CPU_TEN(in, T, 5);
+    const uint32_t* force = PLOW_CPU_TEN(in, T, 6);
+    uint32_t* eidx = PLOW_CPU_TEN(in, T, 7);
+    const uint32_t rows = in->i[0], vocab = in->i[1], ostride = in->i[2], ocol = in->i[3], coord = in->i[4];
+    const uint32_t words = in->i[5], ls = in->i[7] ? in->i[7] : vocab, eoff = in->fj[1].u;
+    for (uint32_t r = slice; r < rows; r += nblk) {
+        uint32_t K = ctl[2u * r] < 64u ? ctl[2u * r] : 64u;
+        if (K > vocab) K = vocab;
+        if (!K || vocab > 4096u) continue;
+        const float* p = params + (size_t)r * 4u;
+        const uint32_t* bm = bitmap ? bitmap + (size_t)r * words : NULL;
+        float L[4096], sv[64];
+        uint32_t sel[64];
+        for (uint32_t i = 0; i < vocab; i++) {
+            float v = logits[(size_t)r * ls + i];
+            if (bm && ((bm[i >> 5] >> (i & 31u)) & 1u)) v = v > 0.f ? v / p[2] : v * p[2];
+            L[i] = v / p[0];
+        }
+        for (uint32_t k = 0; k < K; k++) {
+            uint32_t best = 0;
+            for (uint32_t i = 1; i < vocab; i++)
+                if (L[i] > L[best]) best = i;
+            sel[k] = best;
+            sv[k] = L[best];
+            L[best] = -INFINITY;
+        }
+        uint32_t n = K;
+        if (p[1] < 1.f) {
+            float z = 0.f, cum = 0.f;
+            for (uint32_t i = 0; i < K; i++) z += expf(sv[i] - sv[0]);
+            for (uint32_t i = 0; i < K; i++) {
+                if (i > 0 && cum > p[1]) {
+                    n = i;
+                    break;
+                }
+                cum += expf(sv[i] - sv[0]) / z;
+            }
+        }
+        uint32_t best = 0;
+        float bv = -INFINITY;
+        for (uint32_t i = 0; i < n; i++) {
+            const float v = sv[i] + g_sf_gumbel(seed[r], ctl[2u * r + 1u], coord, 0u, i);
+            if (v > bv) {
+                bv = v;
+                best = i;
+            }
+        }
+        uint32_t c = sel[best];
+        const size_t o = (size_t)r * ostride + ocol;
+        if (force && force[o] != UINT32_MAX) c = force[o];
+        if (bitmap) bitmap[(size_t)r * words + (c >> 5)] |= 1u << (c & 31u);
+        out[o] = c;
+        if (eidx) eidx[r] = c + eoff;
     }
 }
 

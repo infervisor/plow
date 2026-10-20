@@ -198,6 +198,10 @@ name = "fish_gen"
 required-features = ["cuda"]
 
 [[example]]
+name = "breeze_gen"
+required-features = ["cuda"]
+
+[[example]]
 name = "s1_switch_bench"
 required-features = ["cuda"]
 

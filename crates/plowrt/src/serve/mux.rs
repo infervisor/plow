@@ -583,6 +583,7 @@ impl DepthJob {
             top_p: self.top_p,
             top_k: self.top_k,
             ras_temperature: self.ras_temperature,
+            repetition_penalty: 1.0,
             ras_top_p: self.ras_top_p,
         }
     }

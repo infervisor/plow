@@ -12,9 +12,17 @@
 //! keeps its codes; the rest of its work lands in per-frame scratch, so a prompt's first frame
 //! runs at any width covering its slot (its logits copied to that row, `hrow` naming the prompt's
 //! terminal row).
+//!
+//! Breeze TTS 2 (`FishDepth::breeze`) runs the same frame schedule with its own pieces: the backbone
+//! class comes from an fp32 head (`GemvF32Out` over `lm_head`) sampled with the HF repetition
+//! penalty over a per-slot class bitmap (`SampleSmallF32`), each position's input (the gathered
+//! hidden, then frame-table row `(j - 1) * cb_size + code`) is projected from the backbone width,
+//! RoPE is the depth decoder's own llama3 table, and position `j` samples from fp32 head `j - 1`.
+//! `in.breeze.force` (u32::MAX = sample) teacher-forces classes for the gates.
 
 use packet::dev::{DevOp, TENSOR_NONE};
 use packet::devbuild::{Builder, Program, SectionData, SECT_METADATA};
+use packet::rope::GenTensor;
 use plow_asset::fish_depth as manifest;
 
 use crate::config::{Cfg, FishDepth};
@@ -25,6 +33,10 @@ const I32: u64 = 4;
 const F32: u64 = 4;
 /// Backbone sampler RAS window (Fish `inference.py`: the last 10 row-0 tokens).
 const RAS_WINDOW: u32 = 10;
+/// Breeze's backbone repetition bitmap: one bit per class (codes and the stop class).
+fn bitmap_words(classes: u32) -> u32 {
+    classes.div_ceil(32)
+}
 
 struct LayerW {
     in_ln: u32,
@@ -41,6 +53,17 @@ struct LayerW {
 pub(crate) struct Tensors {
     d: FishDepth,
     classes: u32,
+    /// Breeze: the backbone-width input row, its projector, the fp32 heads and logits, the next
+    /// position's embedding row, forced classes and the depth RoPE tables.
+    xin: u32,
+    proj: u32,
+    heads: Vec<u32>,
+    blogits: u32,
+    dlogits: Vec<u32>,
+    eidx: u32,
+    force: u32,
+    cos: u32,
+    sin: u32,
     params: u32,
     top_k: u32,
     seed: u32,
@@ -72,28 +95,105 @@ pub(crate) struct Tensors {
 }
 
 pub(crate) fn declare(b: &mut Builder, c: &Cfg, dbatch: u32) -> Tensors {
-    let f = c.frame.as_ref().expect("fish depth needs the frame embedding");
-    let d = f.depth.clone();
+    let f = c
+        .frame
+        .as_ref()
+        .expect("fish depth needs the frame embedding");
+    let d = f.depth.clone().expect("fish depth config");
     assert!(
-        d.positions == f.codebooks && d.head_dim == c.hd_full && f64::from(d.theta) == c.theta_full,
+        d.positions == f.codebooks
+            && (d.breeze || (d.head_dim == c.hd_full && f64::from(d.theta) == c.theta_full)),
         "fish depth: positions == codebooks, and the backbone's full RoPE tables (head_dim, theta)"
     );
     let (r, h) = (u64::from(dbatch), u64::from(d.hidden));
-    let (qd, kd) = (u64::from(d.heads * d.head_dim), u64::from(d.kv_heads * d.head_dim));
+    let (qd, kd) = (
+        u64::from(d.heads * d.head_dim),
+        u64::from(d.kv_heads * d.head_dim),
+    );
     let classes = c.out_vocab();
-    let w = |b: &mut Builder, s: &str, n: u64| b.tensor(&format!("fish.depth.{s}"), n * BF16);
+    let pre = if d.breeze {
+        "breeze.depth"
+    } else {
+        "fish.depth"
+    };
+    let w = |b: &mut Builder, s: &str, n: u64| b.tensor(&format!("{pre}.{s}"), n * BF16);
     let a = |b: &mut Builder, s: &str, n: u64| b.tensor(&format!("act.fish.{s}"), n);
     let konst = |b: &mut Builder, name: String, v: u32| {
         b.tensor_init(&name, (0..dbatch).flat_map(|_| v.to_le_bytes()).collect())
     };
     let kv = u64::from(d.kv_heads * d.positions * d.head_dim) * r * BF16;
+    let dc = u64::from(d_classes(f));
+    let (top_k, step) = if d.breeze {
+        let ctl = b.tensor("in.breeze.ctl", r * 2 * I32);
+        (ctl, ctl)
+    } else {
+        (
+            b.tensor("in.fish.top_k", r * I32),
+            b.tensor("in.fish.step", r * I32),
+        )
+    };
+    let (cos, sin) = if d.breeze {
+        let [cs, sn] = GenTensor::rope_pair(
+            d.positions,
+            d.head_dim,
+            f64::from(d.theta),
+            1.0,
+            d.rope_scale,
+        );
+        (
+            b.tensor_gen("in.breeze.cos", cs.byte_len(), cs),
+            b.tensor_gen("in.breeze.sin", sn.byte_len(), sn),
+        )
+    } else {
+        (TENSOR_NONE, TENSOR_NONE)
+    };
+    let opt = |b: &mut Builder, s: &str, n: u64| if d.breeze { a(b, s, n) } else { TENSOR_NONE };
     Tensors {
         classes,
+        xin: opt(b, "xin", r * u64::from(c.hidden) * BF16),
+        proj: if d.breeze {
+            w(b, "proj.weight", h * u64::from(c.hidden))
+        } else {
+            TENSOR_NONE
+        },
+        heads: if d.breeze {
+            (0..d.positions - 1)
+                .map(|j| w(b, &format!("head.{j}.weight"), dc * h))
+                .collect()
+        } else {
+            Vec::new()
+        },
+        blogits: opt(b, "blogits", r * u64::from(classes) * F32),
+        dlogits: if d.breeze {
+            (1..d.positions)
+                .map(|j| a(b, &format!("dlogits.{j}"), r * dc * F32))
+                .collect()
+        } else {
+            Vec::new()
+        },
+        eidx: opt(b, "eidx", r * I32),
+        force: if d.breeze {
+            b.tensor_init(
+                "in.breeze.force",
+                vec![0xFF; (r * u64::from(f.codebooks) * I32) as usize],
+            )
+        } else {
+            TENSOR_NONE
+        },
+        cos,
+        sin,
         params: b.tensor("in.fish.params", r * 4 * F32),
-        top_k: b.tensor("in.fish.top_k", r * I32),
+        top_k,
         seed: b.tensor("in.fish.seed", r * 8),
-        step: b.tensor("in.fish.step", r * I32),
-        hist: b.tensor("in.fish.hist", r * u64::from(RAS_WINDOW) * I32),
+        step,
+        hist: if d.breeze {
+            b.tensor(
+                "in.breeze.bitmap",
+                r * u64::from(bitmap_words(classes)) * I32,
+            )
+        } else {
+            b.tensor("in.fish.hist", r * u64::from(RAS_WINDOW) * I32)
+        },
         hrow: b.tensor("in.fish.hrow", r * I32),
         pos: (0..d.positions)
             .map(|j| konst(b, format!("c.fish.pos.{j}"), j))
@@ -118,10 +218,22 @@ pub(crate) fn declare(b: &mut Builder, c: &Cfg, dbatch: u32) -> Tensors {
         og: a(b, "og", r * h * BF16),
         fu: a(b, "fu", r * u64::from(d.inter) * BF16),
         dg: a(b, "dg", r * h * BF16),
-        logits: a(b, "logits", r * u64::from(d_classes(f)) * BF16),
+        logits: if d.breeze {
+            TENSOR_NONE
+        } else {
+            a(b, "logits", r * dc * BF16)
+        },
         // One row past the codebook: the stop class embeds as zeros (scripts/tts/fish_prep.py).
-        embed: w(b, "embed.weight", u64::from(d_classes(f) + 1) * h),
-        head: w(b, "head.weight", u64::from(d_classes(f)) * h),
+        embed: if d.breeze {
+            TENSOR_NONE
+        } else {
+            w(b, "embed.weight", (dc + 1) * h)
+        },
+        head: if d.breeze {
+            TENSOR_NONE
+        } else {
+            w(b, "head.weight", dc * h)
+        },
         norm: w(b, "norm.weight", h),
         layers: (0..d.layers)
             .map(|l| {
@@ -144,12 +256,25 @@ pub(crate) fn declare(b: &mut Builder, c: &Cfg, dbatch: u32) -> Tensors {
     }
 }
 
-/// Classes of the depth head: one codebook's codes.
+/// Classes of the depth head: one codebook's codes (Breeze: the 2048 valid of 2051 rows; the
+/// reference masks the rest).
 fn d_classes(f: &crate::config::FrameEmbed) -> u32 {
-    f.cb_size
+    if f.depth.as_ref().is_some_and(|d| d.breeze) {
+        f.rows
+    } else {
+        f.cb_size
+    }
 }
 
-fn program(c: &Cfg, n: &Tn, t: &Tensors, tensors: &[packet::devbuild::TensorDecl], n_cu: u32, rows: u32, hidden_rows: u32) -> Program {
+fn program(
+    c: &Cfg,
+    n: &Tn,
+    t: &Tensors,
+    tensors: &[packet::devbuild::TensorDecl],
+    n_cu: u32,
+    rows: u32,
+    hidden_rows: u32,
+) -> Program {
     let f = c.frame.as_ref().unwrap();
     let d = &t.d;
     let mut b = Builder::new(n_cu);
@@ -169,7 +294,16 @@ fn program(c: &Cfg, n: &Tn, t: &Tensors, tensors: &[packet::devbuild::TensorDecl
             i.t[5] = t.step;
             i.t[6] = if ras { t.hist } else { TENSOR_NONE };
             i.t[7] = t.codes[j as usize];
-            i.i = [rows, vocab, f.codebooks, j, j, if ras { RAS_WINDOW } else { 0 }, u32::from(ras), 0];
+            i.i = [
+                rows,
+                vocab,
+                f.codebooks,
+                j,
+                j,
+                if ras { RAS_WINDOW } else { 0 },
+                u32::from(ras),
+                0,
+            ];
             i.j[0] = f.cb_size;
         })
     };
@@ -183,27 +317,79 @@ fn program(c: &Cfg, n: &Tn, t: &Tensors, tensors: &[packet::devbuild::TensorDecl
             i.i[2] = kin;
         })
     };
-    let c0 = sample(&mut b, &[], n.logits, t.classes, 0, true);
+    let sample_small =
+        |b: &mut Builder, dep: &[u32], logits: u32, vocab: u32, j: u32, penalty: bool| {
+            b.emit(DevOp::SampleSmallF32, rset.clone(), dep, |i| {
+                i.t = [
+                    n.frame_dcodes,
+                    logits,
+                    t.params,
+                    t.top_k,
+                    t.seed,
+                    if penalty { t.hist } else { TENSOR_NONE },
+                    t.force,
+                    t.eidx,
+                ];
+                i.i = [
+                    rows,
+                    vocab,
+                    f.codebooks,
+                    j,
+                    j,
+                    bitmap_words(t.classes),
+                    0,
+                    0,
+                ];
+                i.j[0] = j * f.cb_size;
+            })
+        };
+    let gemv_f32 = |b: &mut Builder, dep: &[u32], out: u32, x: u32, w: u32, nout: u32, kin: u32| {
+        b.emit(DevOp::GemvF32Out, all.clone(), dep, |i| {
+            i.t[0] = out;
+            i.t[1] = x;
+            i.t[2] = w;
+            i.i[0] = rows;
+            i.i[1] = nout;
+            i.i[2] = kin;
+        })
+    };
     let g = b.emit(DevOp::RowGather, rset.clone(), &[], |i| {
-        i.t[0] = t.x;
+        i.t[0] = if d.breeze { t.xin } else { t.x };
         i.t[1] = n.hn;
         i.t[2] = t.hrow;
         i.i[0] = rows;
         i.i[1] = c.hidden;
         i.i[2] = hidden_rows;
     });
+    let c0 = if d.breeze {
+        let bl = gemv_f32(&mut b, &[g], t.blogits, t.xin, n.head, t.classes, c.hidden);
+        sample_small(&mut b, &[bl], t.blogits, t.classes, 0, true)
+    } else {
+        sample(&mut b, &[], n.logits, t.classes, 0, true)
+    };
     let mut prev = vec![g];
     let mut code_dep = c0;
+    let (cos, sin) = if d.breeze {
+        (t.cos, t.sin)
+    } else {
+        (n.cos_f, n.sin_f)
+    };
     for j in 0..d.positions {
         if j > 0 {
             prev = vec![b.emit(DevOp::Embed, rset.clone(), &[code_dep], |i| {
-                i.t[0] = t.x;
-                i.t[1] = t.embed;
-                i.t[2] = t.codes[j as usize - 1];
+                if d.breeze {
+                    i.t[..3].copy_from_slice(&[t.xin, n.frame_cb, t.eidx]);
+                    i.i[1] = c.hidden;
+                } else {
+                    i.t[..3].copy_from_slice(&[t.x, t.embed, t.codes[j as usize - 1]]);
+                    i.i[1] = d.hidden;
+                }
                 i.i[0] = rows;
-                i.i[1] = d.hidden;
                 i.f[0] = 1.0;
             })];
+        }
+        if d.breeze {
+            prev = vec![gemv(&mut b, &prev, t.x, t.xin, t.proj, d.hidden, c.hidden)];
         }
         let mut dep = b.emit(DevOp::RmsNorm, rset.clone(), &prev, |i| {
             i.t[0] = t.xn;
@@ -219,30 +405,59 @@ fn program(c: &Cfg, n: &Tn, t: &Tensors, tensors: &[packet::devbuild::TensorDecl
                 i.i[..5].copy_from_slice(&[rows, qd, d.hidden, kd, kd]);
             });
             let hnr = |b: &mut Builder, out: u32, x: u32, heads: u32, rope: bool, kv: bool| {
-                b.emit(DevOp::HeadNormRope, span((rows * heads).div_ceil(8)), &[c_qkv], |i| {
-                    i.t[0] = out;
-                    i.t[1] = x;
-                    if rope {
-                        i.t[3] = n.cos_f;
-                        i.t[4] = n.sin_f;
-                    }
-                    i.t[5] = t.pos[j as usize];
-                    i.i[..7].copy_from_slice(&[rows, heads, d.head_dim, 0, 1, 0, if kv { rows } else { 0 }]);
-                    i.f[0] = d.eps;
-                    if kv {
-                        // Per-row ring of `positions` rows written at pos[row] = j (n_batch_kv armed
-                        // at every width: the legacy arm addresses by out_row0 + row).
-                        i.j[0] = d.positions;
-                        i.j[1] = u32::MAX;
-                    }
-                })
+                b.emit(
+                    DevOp::HeadNormRope,
+                    span((rows * heads).div_ceil(8)),
+                    &[c_qkv],
+                    |i| {
+                        i.t[0] = out;
+                        i.t[1] = x;
+                        if rope {
+                            i.t[3] = cos;
+                            i.t[4] = sin;
+                        }
+                        i.t[5] = t.pos[j as usize];
+                        i.i[..7].copy_from_slice(&[
+                            rows,
+                            heads,
+                            d.head_dim,
+                            0,
+                            1,
+                            0,
+                            if kv { rows } else { 0 },
+                        ]);
+                        i.f[0] = d.eps;
+                        if kv {
+                            // Per-row ring of `positions` rows written at pos[row] = j (n_batch_kv armed
+                            // at every width: the legacy arm addresses by out_row0 + row).
+                            i.j[0] = d.positions;
+                            i.j[1] = u32::MAX;
+                        }
+                    },
+                )
             };
             let c_q = hnr(&mut b, t.q, t.qg, d.heads, true, false);
             let c_k = hnr(&mut b, t.kc[l], t.kg, d.kv_heads, true, true);
             let c_v = hnr(&mut b, t.vc[l], t.vg, d.kv_heads, false, true);
             let c_fa = b.emit(DevOp::FlashDecode, all.clone(), &[c_q, c_k, c_v], |i| {
-                i.t[..6].copy_from_slice(&[t.opart, t.mlpart, t.q, t.kc[l], t.vc[l], t.len[j as usize]]);
-                i.i = [rows, d.heads, d.kv_heads, d.positions, 0, 1, d.head_dim, u32::MAX];
+                i.t[..6].copy_from_slice(&[
+                    t.opart,
+                    t.mlpart,
+                    t.q,
+                    t.kc[l],
+                    t.vc[l],
+                    t.len[j as usize],
+                ]);
+                i.i = [
+                    rows,
+                    d.heads,
+                    d.kv_heads,
+                    d.positions,
+                    0,
+                    1,
+                    d.head_dim,
+                    u32::MAX,
+                ];
                 i.f[0] = 1.0 / (d.head_dim as f32).sqrt();
                 if rows > 1 {
                     i.j[0] = rows * d.kv_heads * d.positions;
@@ -278,8 +493,28 @@ fn program(c: &Cfg, n: &Tn, t: &Tensors, tensors: &[packet::devbuild::TensorDecl
                 i.f[0] = d.eps;
             });
         }
-        if j > 0 {
-            let c_lm = gemv(&mut b, &[dep], t.logits, t.xn, t.head, d_classes(f), d.hidden);
+        if j > 0 && d.breeze {
+            let lg = t.dlogits[j as usize - 1];
+            let c_lm = gemv_f32(
+                &mut b,
+                &[dep],
+                lg,
+                t.xn,
+                t.heads[j as usize - 1],
+                d_classes(f),
+                d.hidden,
+            );
+            code_dep = sample_small(&mut b, &[c_lm], lg, d_classes(f), j, false);
+        } else if j > 0 {
+            let c_lm = gemv(
+                &mut b,
+                &[dep],
+                t.logits,
+                t.xn,
+                t.head,
+                d_classes(f),
+                d.hidden,
+            );
             code_dep = sample(&mut b, &[c_lm], t.logits, d_classes(f), j, false);
         } else {
             // Position 0's logits are discarded; its KV write is the point.
@@ -297,8 +532,7 @@ pub(crate) fn sections(
     model: &packet::devbuild::Model,
     rungs: &[u32],
 ) -> Vec<SectionData> {
-    let hidden_rows =
-        (model.tensors[n.hn as usize].bytes / (u64::from(c.hidden) * BF16)) as u32;
+    let hidden_rows = (model.tensors[n.hn as usize].bytes / (u64::from(c.hidden) * BF16)) as u32;
     let programs: Vec<Program> = rungs
         .iter()
         .map(|&rows| program(c, n, t, &model.tensors, model.n_cu, rows, hidden_rows))
@@ -337,7 +571,16 @@ pub(crate) fn sections(
         semantic_base: f.lo,
         semantic_tokens: f.rows,
         stop_class: t.classes - 1,
-        ras_window: RAS_WINDOW,
+        ras_window: if t.d.breeze {
+            bitmap_words(t.classes)
+        } else {
+            RAS_WINDOW
+        },
+        sampler: if t.d.breeze {
+            manifest::Sampler::Breeze
+        } else {
+            manifest::Sampler::Fish
+        },
         tensors: manifest::Tensors {
             params: h(t.params),
             top_k: h(t.top_k),
@@ -347,6 +590,7 @@ pub(crate) fn sections(
             hidden_row: h(t.hrow),
             frame_codes: h(n.frame_dcodes),
             prompt_codes: h(n.frame_codes),
+            force: (t.force != TENSOR_NONE).then(|| h(t.force)),
         },
     };
     m.validate(programs.len(), model.tensors.len())

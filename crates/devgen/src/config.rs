@@ -188,7 +188,7 @@ pub(crate) struct FrameEmbed {
     pub(crate) lo: u32,
     pub(crate) rows: u32,
     pub(crate) div: f32,
-    pub(crate) depth: FishDepth,
+    pub(crate) depth: Option<FishDepth>,
 }
 
 /// Fish S2's per-frame depth transformer (`fish.depth.*`): `positions` steps over a fresh KV,
@@ -204,6 +204,11 @@ pub(crate) struct FishDepth {
     pub(crate) eps: f32,
     pub(crate) theta: f32,
     pub(crate) positions: u32,
+    /// Breeze's depth decoder: inputs (backbone hidden, frame-table rows) projected from the
+    /// backbone width, its own RoPE tables, one fp32 head per position, fp32 backbone head and
+    /// `SampleSmallF32` sampling (weights `breeze.depth.*`).
+    pub(crate) breeze: bool,
+    pub(crate) rope_scale: RopeScale,
 }
 
 pub(crate) struct Cfg {
@@ -354,6 +359,46 @@ pub(crate) fn cfg_from(dir: &Path) -> Cfg {
         return cfg_modernbert(&v);
     }
     let mut c = cfg_llama_qwen(&v, arch);
+    // Breeze-style speech LM: prompt rows arrive as host overlay rows, generated frames embed as the
+    // sum of their codebook rows (`EmbedFrameBf16` over a zero token table).
+    if let Some(f) = v.get("plow_frame_embed") {
+        let g = |k: &str| f[k].as_u64().unwrap_or_else(|| panic!("plow_frame_embed.{k}")) as u32;
+        assert!(c.frame.is_none(), "plow_frame_embed and fish_s2 are exclusive");
+        c.frame = Some(FrameEmbed {
+            table: f["table"].as_str().expect("plow_frame_embed.table").into(),
+            codebooks: g("codebooks"),
+            cb_size: g("codebook_size"),
+            lo: g("lo"),
+            rows: g("rows"),
+            div: f["div"].as_f64().map_or(1.0, |d| d as f32),
+            depth: f.get("depth").map(|d| {
+                let u = |k: &str| d[k].as_u64().unwrap_or_else(|| panic!("plow_frame_embed.depth.{k}")) as u32;
+                let x = |k: &str| d[k].as_f64().unwrap_or_else(|| panic!("plow_frame_embed.depth.{k}"));
+                let s = &d["rope_scaling"];
+                assert_eq!(s["rope_type"], "llama3", "plow_frame_embed.depth.rope_scaling");
+                let sx = |k: &str| s[k].as_f64().unwrap_or_else(|| panic!("depth.rope_scaling.{k}"));
+                FishDepth {
+                    layers: u("layers"),
+                    hidden: u("hidden"),
+                    heads: u("heads"),
+                    kv_heads: u("kv_heads"),
+                    head_dim: u("head_dim"),
+                    inter: u("intermediate"),
+                    eps: x("eps") as f32,
+                    theta: x("rope_theta") as f32,
+                    positions: u("positions"),
+                    breeze: true,
+                    rope_scale: RopeScale::Llama3 {
+                        factor: sx("factor"),
+                        low: sx("low_freq_factor"),
+                        high: sx("high_freq_factor"),
+                        orig: sx("original_max_position_embeddings"),
+                    },
+                }
+            }),
+        });
+        c.encoder_overlay_rows = g("overlay_rows");
+    }
     if let Some(t3) = v.get("chatterbox_t3") {
         c.encoder_overlay_rows = t3["overlay_rows"]
             .as_u64()
@@ -683,7 +728,7 @@ fn cfg_llama_qwen(v: &Value, arch: Arch) -> Cfg {
                 lo: g("semantic_base"),
                 rows: g("semantic_tokens"),
                 div: (1.0 / f["frame_scale"].as_f64().expect("fish_s2.frame_scale")) as f32,
-                depth: {
+                depth: Some({
                     let d = &f["depth"];
                     let u = |k: &str| d[k].as_u64().unwrap_or_else(|| panic!("fish_s2.depth.{k}")) as u32;
                     let x = |k: &str| d[k].as_f64().unwrap_or_else(|| panic!("fish_s2.depth.{k}")) as f32;
@@ -698,8 +743,10 @@ fn cfg_llama_qwen(v: &Value, arch: Arch) -> Cfg {
                         eps: x("eps"),
                         theta: x("rope_theta"),
                         positions: u("positions"),
+                        breeze: false,
+                        rope_scale: RopeScale::None,
                     }
-                },
+                }),
             }
         }),
     }
