@@ -77,14 +77,23 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         for _ in 0..frames {
             let feeds: Vec<(usize, u32)> = rows
                 .iter()
-                .map(|(r, class)| (r.slot, info.semantic_base + if *class == info.stop_class { 0 } else { *class }))
+                .map(|(r, class)| {
+                    (
+                        r.slot,
+                        info.semantic_base + if *class == info.stop_class { 0 } else { *class },
+                    )
+                })
                 .collect();
             let t = std::time::Instant::now();
             e.step_slots(&feeds, &mut toks)?;
             backbone += t.elapsed().as_secs_f64();
             let step: Vec<FishRow> = rows
                 .iter()
-                .map(|(r, _)| FishRow { step: r.step + 1, hidden_row: r.slot as u32, ..*r })
+                .map(|(r, _)| FishRow {
+                    step: r.step + 1,
+                    hidden_row: r.slot as u32,
+                    ..*r
+                })
                 .collect();
             codes.clear();
             let t = std::time::Instant::now();

@@ -448,7 +448,10 @@ mod tests {
             assert_eq!(depth.check(&req(body)).unwrap_err().param, "top_k");
         }
         let c = depth.check(&req(serde_json::json!({"top_k": 64}))).unwrap();
-        assert_eq!((c.sampling.top_k, c.sampling.repetition_penalty), (Some(64), 1.0));
+        assert_eq!(
+            (c.sampling.top_k, c.sampling.repetition_penalty),
+            (Some(64), 1.0)
+        );
         assert_eq!(
             depth
                 .check(&req(serde_json::json!({"repetition_penalty": 1.1})))

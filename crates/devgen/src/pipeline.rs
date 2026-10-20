@@ -1564,8 +1564,16 @@ impl StageProgram {
         let output = self.resolve(stage.output, bytes, "unary output")?;
         let param = match stage.param {
             Some(param) => {
-                let arrays = if stage.kind == Activation::SnakeBeta { 2 } else { 1 };
-                self.resolve(param, u64::from(stage.width) * 4 * arrays, "unary parameter")?
+                let arrays = if stage.kind == Activation::SnakeBeta {
+                    2
+                } else {
+                    1
+                };
+                self.resolve(
+                    param,
+                    u64::from(stage.width) * 4 * arrays,
+                    "unary parameter",
+                )?
             }
             None => packet::dev::TENSOR_NONE,
         };

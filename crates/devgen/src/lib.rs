@@ -76,13 +76,13 @@ use mla::{glm_emit_block, glm_main, kimi_emit_block, nemotron_emit_block, MlaArc
 pub mod asr;
 pub mod asr_subsampling;
 pub mod codec;
-pub mod fish_codec;
-mod fish_depth;
 pub mod conformer;
 pub mod conv2d;
 mod decode_objects;
 mod dense_cublaslt;
 pub mod dispatch_audit;
+pub mod fish_codec;
+mod fish_depth;
 mod gemv_decode_role;
 pub mod manifest;
 pub mod mm;
@@ -4318,7 +4318,11 @@ fn emit_phase(
     let emit_frame = |b: &mut Builder, f: &FrameEmbed| {
         assert!(escale == 1.0, "a frame embedding has its own divisor");
         b.emit(DevOp::EmbedFrameBf16, rows.clone(), &[], |d| {
-            let codes = if decode { n.frame_dcodes } else { n.frame_codes };
+            let codes = if decode {
+                n.frame_dcodes
+            } else {
+                n.frame_codes
+            };
             d.t[..5].copy_from_slice(&[n.x, n.emb, n.ids, n.frame_cb, codes]);
             d.i[..7].copy_from_slice(&[t, c.hidden, c.vocab, f.codebooks, f.cb_size, f.lo, f.rows]);
             d.f[0] = f.div;
@@ -10867,9 +10871,7 @@ fn emit_dense_gqa(
                         tokens: emitter.tn.ids,
                         positions: emitter.tn.pos,
                         kv_lengths: emitter.tn.kvlen,
-                        overlay: profile
-                            .text_encoder
-                            .map(|_| emitter.tn.encoder_overlay),
+                        overlay: profile.text_encoder.map(|_| emitter.tn.encoder_overlay),
                         overlay_index: profile
                             .text_encoder
                             .map(|_| emitter.tn.encoder_overlay_index),
@@ -11351,48 +11353,49 @@ fn emit_dense_gqa(
         hetero_channel::plan(&m, channels, weights, channel_progs).unwrap_or_else(|e| panic!("{e}"))
     });
     let audio_blob =
-        (c.encoder_overlay_rows > 0 && c.speech_pos_rows == 0 && c.frame.is_none() && !block_mode).then(|| {
-            // Single-utterance buckets (forward.v1); on CUDA also packed buckets (chunks of several
-            // utterances, each attending in its own windows and splitting K as its single bucket
-            // would), the largest sizing every shared tensor.
-            let packed: &[u32] = if arch.starts_with("sm_") || target_is_cpu(&arch, &gpu) {
-                &[192, 160, 128, 96, 80, 64, 48, 40, 32, 24, 16, 12, 8, 4]
-            } else {
-                &[]
-            };
-            let single: &[u32] = &[3000, 400, 800, 1200, 1600, 2000];
-            let buckets = asr::qwen::audio_buckets(
-                packed,
-                single,
-                emit_config::active().asr_packed_max_chunks,
-            );
-            let audio_dims = asr::qwen::AudioDims::from_checkpoint(&dir)
-                .unwrap_or_else(|error| panic!("Qwen audio encoder dims: {error}"));
-            let lower = |bucket: &asr::qwen::AudioBucket| {
-                bucket
-                    .lower(n_cu, audio_dims)
-                    .unwrap_or_else(|error| panic!("Qwen audio packet lowering: {error}"))
-            };
-            let (base, rest) = buckets.split_first().expect("single-utterance capacities");
-            let mut encoder = lower(base);
-            for bucket in rest {
+        (c.encoder_overlay_rows > 0 && c.speech_pos_rows == 0 && c.frame.is_none() && !block_mode)
+            .then(|| {
+                // Single-utterance buckets (forward.v1); on CUDA also packed buckets (chunks of several
+                // utterances, each attending in its own windows and splitting K as its single bucket
+                // would), the largest sizing every shared tensor.
+                let packed: &[u32] = if arch.starts_with("sm_") || target_is_cpu(&arch, &gpu) {
+                    &[192, 160, 128, 96, 80, 64, 48, 40, 32, 24, 16, 12, 8, 4]
+                } else {
+                    &[]
+                };
+                let single: &[u32] = &[3000, 400, 800, 1200, 1600, 2000];
+                let buckets = asr::qwen::audio_buckets(
+                    packed,
+                    single,
+                    emit_config::active().asr_packed_max_chunks,
+                );
+                let audio_dims = asr::qwen::AudioDims::from_checkpoint(&dir)
+                    .unwrap_or_else(|error| panic!("Qwen audio encoder dims: {error}"));
+                let lower = |bucket: &asr::qwen::AudioBucket| {
+                    bucket
+                        .lower(n_cu, audio_dims)
+                        .unwrap_or_else(|error| panic!("Qwen audio packet lowering: {error}"))
+                };
+                let (base, rest) = buckets.split_first().expect("single-utterance capacities");
+                let mut encoder = lower(base);
+                for bucket in rest {
+                    encoder
+                        .merge_capacity(lower(bucket))
+                        .unwrap_or_else(|error| panic!("Qwen audio packet capacity: {error}"));
+                }
+                encoder.prefix.model.target = m.target;
                 encoder
-                    .merge_capacity(lower(bucket))
-                    .unwrap_or_else(|error| panic!("Qwen audio packet capacity: {error}"));
-            }
-            encoder.prefix.model.target = m.target;
-            encoder
-                .embed_checkpoint(&dir)
-                .unwrap_or_else(|error| panic!("Qwen audio packet weights: {error}"));
-            encoder.embed_frontend(
-                asr::qwen::whisper_frontend(&dir)
-                    .unwrap_or_else(|error| panic!("Qwen audio frontend: {error}")),
-            );
-            let section = encoder
-                .pipeline_section(base.feature_frames())
-                .unwrap_or_else(|error| panic!("Qwen audio packet metadata: {error}"));
-            (encoder.prefix.model, section)
-        });
+                    .embed_checkpoint(&dir)
+                    .unwrap_or_else(|error| panic!("Qwen audio packet weights: {error}"));
+                encoder.embed_frontend(
+                    asr::qwen::whisper_frontend(&dir)
+                        .unwrap_or_else(|error| panic!("Qwen audio frontend: {error}")),
+                );
+                let section = encoder
+                    .pipeline_section(base.feature_frames())
+                    .unwrap_or_else(|error| panic!("Qwen audio packet metadata: {error}"));
+                (encoder.prefix.model, section)
+            });
     std::fs::write(&out, blob).unwrap();
     let mut speech_ops = 0u64;
     if let Some(dir) = ecfg.tts_codec.as_deref().filter(|_| !block_mode) {

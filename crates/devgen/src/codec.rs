@@ -264,7 +264,8 @@ pub fn lower_snac(
                     bytes = to_phase_major(&bytes, b.cin, b.cout, b.kernel, b.stride);
                 }
             }
-            if let Some((n, k, taps)) = splits.as_ref().and_then(|s| s.borrow().get(name).copied()) {
+            if let Some((n, k, taps)) = splits.as_ref().and_then(|s| s.borrow().get(name).copied())
+            {
                 if taps > 1 {
                     bytes = crate::s3gen::to_tap_major(&bytes, n, k / taps, taps);
                 }
@@ -1074,10 +1075,16 @@ mod tests {
         let (snake, conv) = (&insts[1], &insts[2]);
         assert_eq!(DevOp::from_u16(snake.op), Some(DevOp::UnaryF32));
         assert_eq!((snake.t[0], snake.t[1]), (scratch, x));
-        assert_eq!(prefix.model.tensors[snake.t[2] as usize].name, "w.dec.blk0.ru0.a1");
+        assert_eq!(
+            prefix.model.tensors[snake.t[2] as usize].name,
+            "w.dec.blk0.ru0.a1"
+        );
         assert_eq!(DevOp::from_u16(conv.op), Some(DevOp::Conv1dF32));
         assert_eq!(conv.t[1], scratch);
-        assert_eq!(prefix.model.tensors[conv.t[4] as usize].name, "w.dec.blk0.ru0.a2");
+        assert_eq!(
+            prefix.model.tensors[conv.t[4] as usize].name,
+            "w.dec.blk0.ru0.a2"
+        );
         assert_eq!(
             conv.j[1],
             packet::dev::ACT_SNAKE << 8 | 1 << 13 | 1 << 14 | 1 << 15 | 1 << 17 | 1 << 18
