@@ -196,9 +196,17 @@ PLOW_VMM_SNAP_POOL = "4"
 PLOW_PF_ITL_FORCE = "0"
 PLOW_VMM_STRICT_PUBLISH = "1"
 
-# Speculative decoding drafter (Gemma-4 assistant MTP, 4 layers over target layers 28/29 KV). Off until
-# the P3 serving gates qualify it: emit = true builds span verify (decode objects plus their `_rs`
-# row-slot twins) and the draft programs into the packet, serve = true makes PLOW_SPEC=1 its default.
+# Speculative decoding drafter (Gemma-4 assistant MTP, 4 layers over target layers 28/29 KV): emit = true builds span
+# verify (decode objects plus their `_rs` row-slot twins) and the draft programs into the packet, draft_fp8 = "all" binds
+# the per-row e4m3 twins of every draft GEMV and the head (model-mtp-fp8.safetensors), serve = true makes PLOW_SPEC=1 the
+# packet's serve default. Spec runs on pure decode ticks (no prefill, nothing queued) of <= 16 verify rows.
+# Qualified 2026-10-20 (g26-mtp P3, plowrt e41abda0; evidence /opt/dlami/nvme/lava-tts/g26-mtp/P3-DESIGN.md "Results",
+# p3/{g1,ga,gb,gc,s1}): plain decode on the twin packet = Kit 1 (ctx 6144 B1..B128 within noise, TOK_STREAM digests
+# identical); FP32 gate spec on vs off, same packet + binary: c1 kl_trim_mean 0.140-0.141 vs 0.144, c16 0.152-0.161 vs
+# 0.154-0.168, long c4 PASS 3/4 vs 3/3 (one cont_decisive 13/20 vs 13.5), trimmed KL 0.090-0.098 vs 0.102-0.111;
+# prod-fidelity replay vs Kit 1 (2 rounds each): TPOT p50/p99 9.41,9.52/21.96,20.81 -> bf16 drafter 4.99,4.97/16.02,16.54,
+# FP8 drafter 4.65,4.67/15.61,14.23 ms; TTFT p50/p99 47.0,43.4/246.6,240.6 -> 38.9,37.2/215.2,209.5 (FP8); cached 79.8%,
+# goodput 100%, 0 errors; agentic16k C32/C64/C128 within Kit 1's run-to-run spread; API smoke 37/37.
 [spec]
 kind = "gemma4_assistant"
 draft_dir = "{env:G26_MTP_ASSISTANT}"
@@ -206,8 +214,9 @@ draft_revision = "hub 6e5aaaf4; model.safetensors sha256 006c8713b29b046e296c0f0
 shard_sha256 = "9e899298473493a366df2548e5f4398e17237394df3b9715583457718048b314"
 k_max = 7
 rows = [1, 2, 4, 8, 16]
-emit = false
-serve = false
+draft_fp8 = "all"
+emit = true
+serve = true
 
 [bench]
 backend = "openai"
