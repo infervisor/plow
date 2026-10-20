@@ -47,6 +47,7 @@ except Exception:
     generate_roofline_report = None
 import rung_env
 import rung_sweep
+import spec_env
 
 REPO = Path(__file__).resolve().parents[2]
 GPULEASE = REPO / "perf-data" / "tools" / "gpulease"
@@ -516,7 +517,7 @@ def packet_serve_defaults(r: dict, out: Path) -> tuple[dict[str, str], list[str]
     host paths or commas, which would tie the frozen packet to one machine or break the list."""
     known = runtime_knobs()
     keep, skipped = {}, []
-    for k, v in r.get("serve", {}).get("env", {}).items():
+    for k, v in {**r.get("serve", {}).get("env", {}), **spec_env.serve_env(r)}.items():
         v = expand(str(v), out, lenient=True)
         if k in SERVE_DEFAULTS_EXCLUDED:
             continue
@@ -551,7 +552,10 @@ def cmd_build(a: argparse.Namespace) -> None:
     for key in ("cell", "emit", "bench"):
         if key not in r:
             die(f"{a.recipe}: missing [{key}]")
-    cell, emit = r["cell"], r["emit"]
+    if errs := spec_env.errors(r):
+        die("; ".join(errs))
+    cell, emit = r["cell"], dict(r["emit"])
+    emit["env"] = {**spec_env.emit_env(r), **emit.get("env", {})}
     if getattr(a, "hf_dir", None):
         cell["hf_dir"] = a.hf_dir
     out = Path(a.out).resolve()

@@ -196,6 +196,19 @@ PLOW_VMM_SNAP_POOL = "4"
 PLOW_PF_ITL_FORCE = "0"
 PLOW_VMM_STRICT_PUBLISH = "1"
 
+# Speculative decoding drafter (Gemma-4 assistant MTP, 4 layers over target layers 28/29 KV). Off until
+# the P3 serving gates qualify it: emit = true builds span verify (decode objects plus their `_rs`
+# row-slot twins) and the draft programs into the packet, serve = true makes PLOW_SPEC=1 its default.
+[spec]
+kind = "gemma4_assistant"
+draft_dir = "{env:G26_MTP_ASSISTANT}"
+draft_revision = "hub 6e5aaaf4; model.safetensors sha256 006c8713b29b046e296c0f0b7c524aa9264ae07ae8b0c3888b9bc062242297ff"
+shard_sha256 = "9e899298473493a366df2548e5f4398e17237394df3b9715583457718048b314"
+k_max = 7
+rows = [1, 2, 4, 8, 16]
+emit = false
+serve = false
+
 [bench]
 backend = "openai"
 in_lens = "128 1024 4096"

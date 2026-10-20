@@ -33,6 +33,7 @@ import plow_dist as pd
 
 sys.path.insert(0, str(Path(__file__).resolve().parent / "campaign"))
 import rung_env  # noqa: E402
+import spec_env  # noqa: E402
 
 SECTIONS = ("prepare", "objects", "emit", "serve", "gates")
 
@@ -43,9 +44,15 @@ def env_prefix(env: dict) -> list[str]:
 
 def block_prepare(r: dict) -> str:
     steps = r.get("prepare") or []
-    if not steps:
+    prep = spec_env.prepare_commands(r)
+    if not steps and not prep:
         return "# This model needs no preparation step."
     out = []
+    if prep:
+        out.append(f"# [spec] drafter {r['spec']['kind']} @ {r['spec']['draft_revision']}: re-key it beside the target shards")
+        out += [f"nix develop --command {c}" for c in prep]
+        out.append(f"# produces: $CKPT/{spec_env.SHARD} (sha256 {r['spec']['shard_sha256']})")
+        out.append("")
     for s in steps:
         shell = s.get("shell", "nix develop")
         args = " ".join(s.get("args") or [])
@@ -78,8 +85,10 @@ def block_emit(r: dict) -> str:
     e = r.get("emit") or {}
     if not e:
         return "# This recipe does not emit: see `refusal`."
+    if errs := spec_env.errors(r):
+        raise SystemExit("render_recipe: " + "; ".join(errs))
     out = ["nix develop --command env \\"]
-    out += env_prefix(e.get("env") or {})
+    out += env_prefix({**spec_env.emit_env(r), **(e.get("env") or {})})
     src = rung_env.recipe_source_errors(r)
     if src:
         raise SystemExit("render_recipe: " + "; ".join(src))
@@ -97,7 +106,9 @@ def block_emit(r: dict) -> str:
 
 
 def block_serve(r: dict) -> str:
-    s = r.get("serve") or {}
+    s = dict(r.get("serve") or {})
+    if spec_env.serve_env(r):
+        s["env"] = {**(s.get("env") or {}), **spec_env.serve_env(r)}
     ref = f"{r.get('namespace', 'infervisor')}/{r['name']}:{r['label']}"
     out = [
         "# From the distribution — resolves the variant for this machine:",
@@ -317,6 +328,17 @@ def self_test() -> None:
     out = render(scaffold(rung), rung)
     assert "PLOW_EMIT_RUNG_ENV='prefill:128:PLOW_NO_GLU_FUSE=1;prefill:4096:PLOW_NO_GLU_FUSE=0'" in out, out
     assert render(out, rung) == out
+
+    # [spec] renders its derived emit knobs, the re-key step and the serve default.
+    spec = dict(recipe, spec={"kind": "gemma4_assistant", "draft_dir": "$DRAFT", "draft_revision": "r1",
+                              "shard_sha256": "a" * 64, "k_max": 7, "rows": [1, 2, 4, 8, 16],
+                              "emit": True, "serve": True})
+    out = render(scaffold(spec), spec)
+    assert "PLOW_SPEC_ROWS=1,2,4,8,16" in out and "PLOW_EMIT_SPAN_VERIFY=1" in out, out
+    assert 'gemma4_mtp_rekey.py $DRAFT "$CKPT"' in out and "PLOW_SPEC=1" in out, out
+    off = dict(spec, spec=dict(spec["spec"], emit=False, serve=False))
+    out = render(scaffold(off), off)
+    assert "PLOW_EMIT_SPEC" not in out and "PLOW_SPEC=1" not in out and "gemma4_mtp_rekey.py" in out
 
     # A refused recipe renders without inventing an emit command.
     refused = {
