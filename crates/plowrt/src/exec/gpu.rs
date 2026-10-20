@@ -2557,6 +2557,8 @@ pub struct GpuEngine {
     qwen_prefill: Option<crate::device::cuda::qwen_gdn::NativeGdn>,
     /// The packet carries `act.mm_span` (bidirectional media spans): chunks must not split them.
     mm_spans: bool,
+    /// An encoder-mode packet (`act.enc_out`, bidirectional): a prompt is one launch, never split.
+    encoder: bool,
     packet_roles: [Option<PacketRole>; plow_asset::segment_roles::MAX_ROLE as usize],
     decode_packet_roles: Vec<u8>,
     cublaslt_decode: Vec<Option<LibraryRoute>>,
@@ -7254,6 +7256,7 @@ impl GpuEngine {
             seg_pf,
             qwen_prefill,
             mm_spans: false,
+            encoder: false,
             packet_roles,
             cublaslt_decode,
             cublaslt_decode_graph: None,
@@ -7377,6 +7380,7 @@ impl GpuEngine {
             pf_terminal_row: 0,
         };
         engine.mm_spans = engine.handle_of("act.mm_span").is_some();
+        engine.encoder = engine.handle_of("act.enc_out").is_some();
         engine.packed_terminal = packed_terminal::PackedTerminal::load(&engine)?;
         engine.fish = fish_depth::FishDepth::load_if_present(&engine, assets_dir)?;
         engine.shared_tail =
@@ -11487,6 +11491,13 @@ impl GpuEngine {
             .count();
         if n_allowed == 0 {
             return smallest;
+        }
+        if self.encoder {
+            // Past the widest allowed rung the launch splits and `prefill_chunk` reports Progress.
+            return self.prefill[..n_allowed]
+                .iter()
+                .position(|b| b.t as usize >= rem)
+                .unwrap_or(n_allowed - 1);
         }
         // NO top-rung shortcut: "largest rung that still fills" is not optimal. Under a
         // 4224-row top rung an 8192-row prompt takes [4224, 3968->4096] = 128 padded rows,

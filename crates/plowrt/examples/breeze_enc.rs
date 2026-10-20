@@ -26,7 +26,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     e.write_tensor("in.enc.span_local", 0, bytemuck::cast_slice(&local))?;
     e.write_tensor("in.enc.span_full", 0, bytemuck::cast_slice(&full))?;
     let t0 = std::time::Instant::now();
-    match e.prefill_chunk(0, &ids, n)? {
+    match e.prefill_chunk(0, &ids, usize::MAX)? {
         PrefillStep::Done(_) => {}
         PrefillStep::Progress(p) => {
             return Err(format!("segment split at row {p}: no bucket covers {n}").into())

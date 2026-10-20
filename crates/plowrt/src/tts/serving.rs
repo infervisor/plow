@@ -500,6 +500,8 @@ fn whole_response(wav: bool, sample_rate: u32, pcm: &[f32], lm_ms: f64) -> Respo
 pub struct SpeechModel {
     pub contract: SpeechContract,
     codec: Codec,
+    /// The contract's text encoder: its rows are every prompt row.
+    encoder: Option<Arc<super::text_encoder::TextEncoder>>,
     realtime: Arc<super::realtime::RealTime>,
     spec: OnceLock<SpeechSpec>,
 }
@@ -540,6 +542,13 @@ pub fn speech_model(
                     codec.frame_codes, codec.frame_samples, contract.frame_codes, contract.frame_samples
                 ));
             }
+            let encoder = match &contract.text_encoder {
+                Some(sub) => Some(Arc::new(super::text_encoder::TextEncoder::load(
+                    &assets.join(sub),
+                    device,
+                )?)),
+                None => None,
+            };
             tracing::info!(pipeline = %contract.pipeline, sample_rate = contract.sample_rate, "tts: speech pipeline bound");
             let realtime = super::realtime::RealTime::new(
                 contract.frame_samples as f64 / f64::from(contract.sample_rate),
@@ -548,6 +557,7 @@ pub fn speech_model(
             Some(Arc::new(SpeechModel {
                 contract,
                 codec,
+                encoder,
                 realtime,
                 spec: OnceLock::new(),
             }))
@@ -840,6 +850,13 @@ async fn speech_with(
         tok: Arc::clone(tok),
         contract: c.clone(),
         voice: voice.clone(),
+        instructions: req
+            .instructions
+            .as_deref()
+            .map(str::trim)
+            .filter(|i| !i.is_empty())
+            .map(str::to_owned),
+        encoder: model.encoder.clone(),
         max_tokens: checked.sampling.max_tokens,
         temperature: checked.sampling.temperature,
         top_p: checked.sampling.top_p,
@@ -871,17 +888,26 @@ async fn speech_with(
         crate::serve::mux::JobClass::Normal
     };
     let first = segs[0].clone();
+    let speech = match maker.speech(&first) {
+        Ok(s) => s,
+        Err(e) => return server_error(e),
+    };
     let (tx, rx) = stream_mod::channel();
     let opts = crate::serve::mux::JobOpts {
         class,
         raw_tokens: true,
-        speech: maker.speech(&first),
-        session: ids.session.as_ref().and_then(|_| {
-            ids.ticket(
-                crate::serve::session::row_keys(&first.prompt_ids, &[], &[]),
-                report,
-            )
-        }),
+        speech,
+        // Encoder prompts' ids are placeholders: no session can key on them.
+        session: ids
+            .session
+            .as_ref()
+            .filter(|_| first.enc_ids.is_none())
+            .and_then(|_| {
+                ids.ticket(
+                    crate::serve::session::row_keys(&first.prompt_ids, &[], &[]),
+                    report,
+                )
+            }),
         turn: ids.turn_key.clone(),
         continuing: run.continuing(),
         prefix: None,
@@ -1045,7 +1071,10 @@ const SPLIT_MIN_CHARS: usize = 40;
 #[derive(Clone)]
 struct Segment {
     text: String,
+    /// With a text encoder: zeros sizing the prefill; every row is the encoder's row of
+    /// `enc_ids`, encoded when the segment is submitted.
     prompt_ids: Vec<u32>,
+    enc_ids: Option<Vec<u32>>,
     gen: crate::serve::GenParams,
     chars: usize,
 }
@@ -1055,6 +1084,8 @@ struct SegmentMaker {
     tok: Arc<dyn crate::text::tokenizer::Tokenize>,
     contract: SpeechContract,
     voice: String,
+    instructions: Option<String>,
+    encoder: Option<Arc<super::text_encoder::TextEncoder>>,
     max_tokens: Option<usize>,
     temperature: f32,
     top_p: f32,
@@ -1067,12 +1098,22 @@ struct SegmentMaker {
 impl SegmentMaker {
     fn make(&self, k: usize, text: &str) -> Segment {
         let c = &self.contract;
-        let mut prompt_ids = c.prefix.clone();
-        prompt_ids.extend(
-            self.tok
-                .encode_with_special_tokens(&c.prompt_text(&self.voice, text), false),
-        );
-        prompt_ids.extend_from_slice(&c.suffix);
+        let tok = self.encoder.as_ref().map_or(&self.tok, |e| &e.tok);
+        let ids = |instructions: Option<&str>| {
+            let mut ids = c.prefix.clone();
+            ids.extend(tok.encode_with_special_tokens(
+                &c.prompt_text(&self.voice, instructions, text),
+                false,
+            ));
+            ids.extend_from_slice(&c.suffix);
+            ids
+        };
+        let mut prompt_ids = ids(self.instructions.as_deref());
+        let enc_ids = self.encoder.is_some().then(|| {
+            let ids = prompt_ids.clone();
+            prompt_ids.fill(0);
+            ids
+        });
         let mut gen = crate::serve::GenParams::default();
         gen.max_tokens = self
             .max_tokens
@@ -1092,6 +1133,7 @@ impl SegmentMaker {
         Segment {
             text: text.to_owned(),
             prompt_ids,
+            enc_ids,
             gen,
             chars: text.chars().count(),
         }
@@ -1099,31 +1141,54 @@ impl SegmentMaker {
 }
 
 impl SegmentMaker {
-    /// A depth-stage packet's per-segment sampling (`None` for codec-token packets).
-    fn speech(&self, s: &Segment) -> Option<Box<crate::serve::mux::SpeechJob>> {
+    /// A depth-stage packet's per-segment sampling and, with a text encoder, its prompt rows
+    /// (`None` for codec-token packets).
+    fn speech(&self, s: &Segment) -> Result<Option<Box<crate::serve::mux::SpeechJob>>, String> {
         let c = &self.contract;
-        c.depth.then(|| {
+        if !c.depth {
+            return Ok(None);
+        }
+        let encode = |ids: &[u32]| -> Result<(Vec<f32>, Vec<u32>), String> {
+            let e = self.encoder.as_ref().ok_or("no text encoder")?;
+            Ok((
+                tokio::task::block_in_place(|| e.encode(ids))?,
+                (0..ids.len() as u32).collect(),
+            ))
+        };
+        let (overlay, overlay_pos) = match &s.enc_ids {
+            Some(ids) => encode(ids)?,
+            None => Default::default(),
+        };
+        {
             // The reference keeps temperature and top-p as bf16 tensors (0.7 -> 0.69921875).
             let bf16 = |x: f32| {
                 let b = x.to_bits();
                 f32::from_bits((b + 0x7fff + ((b >> 16) & 1)) & 0xffff_0000)
             };
-            Box::new(crate::serve::mux::SpeechJob {
+            // Breeze's reference samples with f32 parameters.
+            let param = |x: f32| if c.breeze_sampler { x } else { bf16(x) };
+            Ok(Some(Box::new(crate::serve::mux::SpeechJob {
+                overlay,
+                overlay_pos,
                 depth: Some(crate::serve::mux::DepthJob {
                     seed: s.gen.seed.unwrap_or(self.seed),
-                    temperature: bf16(self.temperature),
-                    top_p: bf16(self.top_p),
+                    temperature: param(self.temperature),
+                    top_p: param(self.top_p),
                     top_k: if self.top_k == 0 { c.top_k } else { self.top_k } as u32,
                     ras_temperature: bf16(1.0),
                     ras_top_p: bf16(0.9),
-                    repetition_penalty: 1.0,
+                    repetition_penalty: if c.breeze_sampler {
+                        self.repetition_penalty
+                    } else {
+                        1.0
+                    },
                     semantic_base: c.audio_token_base,
                     stop_class: c.codebook,
                     stop_token: c.stops[0],
                 }),
                 ..Default::default()
-            })
-        })
+            })))
+        }
     }
 }
 
@@ -1179,11 +1244,12 @@ impl Later {
             s.gen.seed =
                 Some(s.gen.seed.unwrap_or(self.seed ^ k as u64) ^ ((attempt as u64) << 48));
         }
+        let speech = self.maker.speech(&s)?;
         let (tx, rx) = stream_mod::channel();
         let opts = crate::serve::mux::JobOpts {
             class: self.class,
             raw_tokens: true,
-            speech: self.maker.speech(&s),
+            speech,
             session: None,
             turn: None,
             continuing: false,

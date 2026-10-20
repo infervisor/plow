@@ -10857,14 +10857,22 @@ fn emit_dense_gqa(
                     max_context: ctx,
                     hidden: c.hidden,
                     decode_capacity: dbatch,
-                    overlay_rows: 0,
+                    overlay_rows: if profile.text_encoder.is_some() {
+                        c.encoder_overlay_rows
+                    } else {
+                        0
+                    },
                     ordered_dispatch: false,
                     tensors: pipeline::CausalPipelineTensors {
                         tokens: emitter.tn.ids,
                         positions: emitter.tn.pos,
                         kv_lengths: emitter.tn.kvlen,
-                        overlay: None,
-                        overlay_index: None,
+                        overlay: profile
+                            .text_encoder
+                            .map(|_| emitter.tn.encoder_overlay),
+                        overlay_index: profile
+                            .text_encoder
+                            .map(|_| emitter.tn.encoder_overlay_index),
                     },
                 },
                 profile,

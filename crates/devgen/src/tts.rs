@@ -37,6 +37,14 @@ pub struct SpeechProfile {
     /// Frames come from the packet's depth stage (`fish_depth.json`): each LM token is one frame
     /// (`audio_token_base + class`) whose `frame_codes` codes ride beside it.
     pub depth: bool,
+    /// The depth stage's sampler: 0 = Fish (bf16 parameters, RAS, no penalty), 1 = Breeze
+    /// (f32 parameters, backbone repetition penalty).
+    pub depth_sampler: u64,
+    /// Rendered into the template's `{instructions}` with `{instructions}` = the request's text.
+    pub instructions: Option<&'static str>,
+    /// Sub-bundle of an encoder-mode packet whose `act.enc_out` rows are the whole prompt's
+    /// embeddings (the `overlay` role): the prompt ids only size the prefill.
+    pub text_encoder: Option<&'static str>,
 }
 
 /// maya-research/Veena (model card): [SOH] <spk_v> text [EOH] [SOA] [SOS] -> SNAC codes, stop on
@@ -62,6 +70,9 @@ pub const VEENA: SpeechProfile = SpeechProfile {
     repetition_penalty: 1.0,
     top_k: 0,
     depth: false,
+    depth_sampler: 0,
+    instructions: None,
+    text_encoder: None,
 };
 
 /// canopylabs/orpheus-3b-0.1-ft (orpheus_tts `_format_prompt`): [SOH] BOS "voice: text" [EOT]
@@ -89,6 +100,9 @@ pub const ORPHEUS: SpeechProfile = SpeechProfile {
     repetition_penalty: 1.1,
     top_k: 0,
     depth: false,
+    depth_sampler: 0,
+    instructions: None,
+    text_encoder: None,
 };
 
 /// fishaudio/s2-pro (fish-speech `inference.py`, no reference): system "convert the provided text
@@ -99,7 +113,9 @@ pub const FISH: SpeechProfile = SpeechProfile {
     prompt_template: "<|speaker:0|>{input}",
     voice_token: "{voice}",
     voices: &["default"],
-    prefix: &[151644, 8948, 198, 14166, 279, 3897, 1467, 311, 8806, 151645, 198, 151644, 872, 198],
+    prefix: &[
+        151644, 8948, 198, 14166, 279, 3897, 1467, 311, 8806, 151645, 198, 151644, 872, 198,
+    ],
     suffix: &[151645, 198, 151644, 77091, 198, 151673],
     stops: &[151645],
     sample_rate: 44100,
@@ -115,6 +131,40 @@ pub const FISH: SpeechProfile = SpeechProfile {
     repetition_penalty: 1.0,
     top_k: 30,
     depth: true,
+    depth_sampler: 0,
+    instructions: None,
+    text_encoder: None,
+};
+
+/// BreezeBlue/Breeze-TTS-2 (`breeze_infer/templates.py`): each text segment `<bos>[S0]text` (voice
+/// design: `[S0]<ins_bos>instruction<ins_eos>text`) runs through the T5Gemma2 text encoder; its
+/// projected rows are the backbone prompt. One cb0 class per 12.5 Hz frame (EOS = class 2048) plus
+/// 15 depth codebooks. Sampling (`runtime.py`, `infer.py`): T 0.9, top-k 50, top-p 1.0,
+/// repetition penalty 1.1 on cb0, max 1500 frames.
+pub const BREEZE: SpeechProfile = SpeechProfile {
+    prompt_template: "[{voice}]{instructions}{input}",
+    voice_token: "[{voice}]",
+    voices: &["S0"],
+    prefix: &[2],
+    suffix: &[],
+    stops: &[2048],
+    sample_rate: 24000,
+    frame_codes: 16,
+    codebook: 2048,
+    frame_samples: 1920,
+    audio_token_base: 0,
+    // 12.5 frames/s over ~4 characters/s Mandarin (~2.8 frames per character; English needs
+    // ~1). Segments of (1500 - 21) / 3.2 = 462 characters stay inside the encoder's 512 rows.
+    per_char_frames: 3.2,
+    max_new_tokens_cap: 1500,
+    temperature: 0.9,
+    top_p: 1.0,
+    repetition_penalty: 1.1,
+    top_k: 50,
+    depth: true,
+    depth_sampler: 1,
+    instructions: Some("<ins_bos>{instructions}<ins_eos>"),
+    text_encoder: Some("text_encoder"),
 };
 
 /// Chatterbox T3 (`tts.t3_cfg.v1`): a causal LM whose prefill rows are host embeddings (the
@@ -216,8 +266,9 @@ pub fn profile(name: &str) -> Result<&'static SpeechProfile, String> {
         "veena" => Ok(&VEENA),
         "orpheus" => Ok(&ORPHEUS),
         "fish" => Ok(&FISH),
+        "breeze" => Ok(&BREEZE),
         other => Err(format!(
-            "unknown tts profile {other:?} (known: veena, orpheus, fish)"
+            "unknown tts profile {other:?} (known: veena, orpheus, fish, breeze)"
         )),
     }
 }
@@ -251,6 +302,12 @@ pub fn speech_pipeline_section(
     }
     pipe.strings
         .insert("codec.packet".into(), CODEC_PACKET.into());
+    if let Some(t) = p.instructions {
+        pipe.strings.insert("prompt.instructions".into(), t.into());
+    }
+    if let Some(t) = p.text_encoder {
+        pipe.strings.insert("text.encoder".into(), t.into());
+    }
     let params = &mut pipe.parameters;
     let mut put = |k: String, v: u64| {
         params.insert(k, v);
@@ -282,6 +339,7 @@ pub fn speech_pipeline_section(
     put("sampling.top_p_f32".into(), u64::from(p.top_p.to_bits()));
     put("sampling.top_k".into(), p.top_k);
     put("frames.depth".into(), u64::from(p.depth));
+    put("frames.depth_sampler".into(), p.depth_sampler);
     put(
         "sampling.repetition_penalty_f32".into(),
         u64::from(p.repetition_penalty.to_bits()),

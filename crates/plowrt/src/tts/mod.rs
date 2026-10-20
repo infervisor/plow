@@ -19,6 +19,8 @@ pub mod guided_speech;
 pub mod realtime;
 #[cfg(feature = "cuda")]
 pub mod serving;
+#[cfg(feature = "cuda")]
+pub mod text_encoder;
 
 use std::path::Path;
 
@@ -58,6 +60,14 @@ pub struct SpeechContract {
     /// Frames come from the packet's depth stage: one LM token per frame (`audio_token_base +
     /// class`), its `frame_codes` codes riding beside it (the stream chunk's `frame`).
     pub depth: bool,
+    /// The depth stage samples like Breeze (f32 parameters, backbone repetition penalty), not
+    /// like Fish (bf16 parameters, RAS, no penalty).
+    pub breeze_sampler: bool,
+    /// Rendered into the template's `{instructions}` (`{instructions}` = the request's text);
+    /// `None`: the model takes no instructions.
+    pub instructions: Option<String>,
+    /// Sub-bundle of the encoder-mode packet whose output rows are the prompt's embeddings.
+    pub text_encoder: Option<String>,
 }
 
 impl SpeechContract {
@@ -111,6 +121,9 @@ impl SpeechContract {
             repetition_penalty: f32p("sampling.repetition_penalty_f32").unwrap_or(1.0),
             top_k: get("sampling.top_k").unwrap_or(0) as usize,
             depth: get("frames.depth").unwrap_or(0) != 0,
+            breeze_sampler: get("frames.depth_sampler").unwrap_or(0) == 1,
+            instructions: p.strings.get("prompt.instructions").cloned(),
+            text_encoder: p.strings.get("text.encoder").cloned(),
         };
         if !c.prompt_template.contains("{input}") || !c.voice_token.contains("{voice}") {
             return Err(RuntimeError::Rejected(
@@ -139,9 +152,14 @@ impl SpeechContract {
     }
 
     /// The packet's prompt template; the tokenizer encodes it between prefix and suffix.
-    pub fn prompt_text(&self, voice: &str, input: &str) -> String {
+    pub fn prompt_text(&self, voice: &str, instructions: Option<&str>, input: &str) -> String {
+        let ins = match (&self.instructions, instructions) {
+            (Some(t), Some(i)) => t.replace("{instructions}", i),
+            _ => String::new(),
+        };
         self.prompt_template
             .replace("{voice}", voice)
+            .replace("{instructions}", &ins)
             .replace("{input}", input)
     }
 
@@ -197,13 +215,14 @@ impl SpeechContract {
             sample_rate: self.sample_rate,
             temperature: self.temperature,
             top_p: self.top_p,
-            // The depth stage's sampler (SampleFishBf16) has no penalty and at most 64 candidates.
-            repetition_penalty: (!self.depth).then_some(self.repetition_penalty),
+            // Both depth samplers take at most 64 candidates; Fish's (SampleFishBf16) has no penalty.
+            repetition_penalty: (!self.depth || self.breeze_sampler)
+                .then_some(self.repetition_penalty),
             max_tokens: self.max_new_tokens_cap,
             top_k: Some(self.top_k),
             top_k_max: self.depth.then_some(64),
             cfg_weight: None,
-            instructions: false,
+            instructions: self.instructions.is_some(),
             voice_cloning: false,
         }
     }

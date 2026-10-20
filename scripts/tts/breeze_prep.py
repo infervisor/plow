@@ -17,7 +17,7 @@ codebook rows. So:
                                              (codebook J + 1)
 Rows 2048..2050 of the native heads are suppressed by the reference samplers, so they are dropped.
 """
-import argparse, glob, json, os
+import argparse, glob, json, os, shutil
 
 import torch
 from safetensors.torch import load_file, save_file
@@ -82,6 +82,10 @@ def main():
     )
     json.dump(qwen, open(f"{args.out}/config.json", "w"), indent=1)
     json.dump({"eos_token_id": [CODES]}, open(f"{args.out}/generation_config.json", "w"))
+    # The speech contract's prompt framing and voice check read the Breeze (Gemma3) tokenizer.
+    for f in ("tokenizer.json", "tokenizer_config.json", "special_tokens_map.json"):
+        if os.path.exists(f"{src}/{f}"):
+            shutil.copy(f"{src}/{f}", f"{args.out}/{f}")
 
 
 if __name__ == "__main__":
