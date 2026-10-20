@@ -13,11 +13,13 @@ use packet::dev::DevOp;
 
 use crate::codec::{fused_conv, p_handle, Conv};
 use crate::pipeline::{
-    Activation, AttentionF32Stage, BinaryF32Stage, BinaryOp, CopyColsF32Stage, DenseActivation,
-    DenseF32ProgramStage, DenseWeight, Emitted, GatherRowsF32Stage, LayerNormRowsF32Stage,
-    PacketPrefix, StageProgram, TensorRef, UnaryF32Stage,
+    Activation, AttentionF32Stage, BinaryF32Stage, BinaryOp, Conv1dF32Stage, CopyColsF32Stage,
+    Emitted, GatherRowsF32Stage, LayerNormRowsF32Stage, PacketPrefix, PadMode, StageProgram,
+    TensorRef, UnaryF32Stage,
 };
 use crate::rewrite_lower::ConvFusions;
+
+type Splits<'a> = Option<&'a std::cell::RefCell<BTreeMap<String, (u32, u32)>>>;
 
 /// (batch, frames): short streaming windows batched across streams, long utterances alone.
 pub const CAPACITIES: &[(u32, u32)] = &[
@@ -270,24 +272,45 @@ impl Seq {
         e.output
     }
 
-    fn dense(&mut self, x: u32, out: &str, rows: u32, k: u32, n: u32, w: &str, b: Option<&str>) -> Result<u32, String> {
+    /// `x @ w^T + b` as a pointwise Conv1dF32 (weights `[n][k]`), on split-bf16 wgmma with `splits`.
+    #[allow(clippy::too_many_arguments)]
+    fn dense(&mut self, splits: Splits<'_>, x: u32, out: &str, rows: u32, k: u32, n: u32, w: &str, b: Option<&str>) -> Result<u32, String> {
+        let split = splits.is_some_and(|s| {
+            s.borrow_mut().insert(w.trim_start_matches("w.").to_string(), (n, k));
+            true
+        });
         let dep = self.last;
-        let e = self.p().dense_f32(
+        let e = self.p().conv1d_f32(
             x,
+            false,
             &[dep],
-            DenseF32ProgramStage {
+            Conv1dF32Stage {
                 output: TensorRef::Named(out),
                 weight: TensorRef::Named(w),
                 bias: b.map(TensorRef::Named),
-                rows,
-                input_width: k,
-                output_width: n,
-                activation: DenseActivation::None,
-                round_bf16: false,
-                weight_type: DenseWeight::F32,
-                operands_bf16_exact: false,
-                tf32x3: true,
-                layer_norm: None,
+                alpha: None,
+                residual: None,
+                lengths: None,
+                batch: 1,
+                in_rows: rows,
+                in_channels: k,
+                out_channels: n,
+                kernel: 1,
+                stride: 1,
+                dilation_or_output_padding: 1,
+                groups: 1,
+                pad_before: 0,
+                pad_after: 0,
+                pad_mode: PadMode::Zero,
+                input_activation: Activation::None,
+                output_activation: Activation::None,
+                slope: 0.0,
+                weight_f16: false,
+                split_bf16: split,
+                weight_tap_major: false,
+                wgmma: split,
+                weight_split: split,
+                dual_alpha: false,
             },
         )?;
         Ok(self.done(e))
@@ -424,7 +447,7 @@ fn program_for(
     for l in 0..cfg.layers {
         let w = |s: &str| format!("w.post.layers.{l}.{s}");
         s.rms(x, h, n, dim, &w("attn_norm"), cfg.eps)?;
-        let qkv = s.dense(h, "act.codec.c", n, dim, 3 * dim, &w("wqkv"), None)?;
+        let qkv = s.dense(splits, h, "act.codec.c", n, dim, 3 * dim, &w("wqkv"), None)?;
         // q and k are adjacent: one rotation over 2 * heads heads of the 3 * dim rows.
         s.raw(DevOp::RopeAxialF32, u64::from(n * 2 * heads * hd / 2).div_ceil(2048), qkv, |d| {
             d.t[..2].copy_from_slice(&[qkv, pos]);
@@ -459,14 +482,14 @@ fn program_for(
             },
         )?;
         let at = s.done(e);
-        s.dense(at, "act.codec.b", n, dim, dim, &w("wo_s"), None)?;
+        s.dense(splits, at, "act.codec.b", n, dim, dim, &w("wo_s"), None)?;
         s.binary(x, h, BinaryOp::Add, n, dim)?;
         s.rms(x, h, n, dim, &w("ffn_norm"), cfg.eps)?;
-        let g = s.dense(h, "act.codec.c", n, dim, cfg.inter, &w("w1"), None)?;
-        let u = s.dense(h, "act.codec.s", n, dim, cfg.inter, &w("w3"), None)?;
+        let g = s.dense(splits, h, "act.codec.c", n, dim, cfg.inter, &w("w1"), None)?;
+        let u = s.dense(splits, h, "act.codec.s", n, dim, cfg.inter, &w("w3"), None)?;
         s.unary(g, Activation::Silu, n, cfg.inter)?;
         s.binary(g, u, BinaryOp::Mul, n, cfg.inter)?;
-        s.dense(g, "act.codec.b", n, cfg.inter, dim, &w("w2_s"), None)?;
+        s.dense(splits, g, "act.codec.b", n, cfg.inter, dim, &w("w2_s"), None)?;
         s.binary(x, h, BinaryOp::Add, n, dim)?;
     }
     s.rms(x, x, n, dim, "w.post.norm", cfg.eps)?;
@@ -529,9 +552,9 @@ fn program_for(
             },
         )?;
         s = Seq { p: Some(p), last: e.done };
-        let y = s.dense(dw.output, "act.codec.s", batch * rows, dim, 4 * dim, &w("cnx.1.w"), Some(&w("cnx.1.b")))?;
+        let y = s.dense(splits, dw.output, "act.codec.s", batch * rows, dim, 4 * dim, &w("cnx.1.w"), Some(&w("cnx.1.b")))?;
         s.unary(y, Activation::GeluErf, batch * rows, 4 * dim)?;
-        let z = s.dense(y, "act.codec.c", batch * rows, 4 * dim, dim, &w("cnx.2.w_s"), Some(&w("cnx.2.b_s")))?;
+        let z = s.dense(splits, y, "act.codec.c", batch * rows, 4 * dim, dim, &w("cnx.2.w_s"), Some(&w("cnx.2.b_s")))?;
         s.binary(up.output, z, BinaryOp::Add, batch * rows, dim)?;
         cur = Emitted { output: up.output, done: s.last };
     }

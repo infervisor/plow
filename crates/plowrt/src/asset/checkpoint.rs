@@ -166,7 +166,8 @@ pub(crate) fn is_checkpoint_tensor(
     !declared_runtime && packet::names::is_checkpoint_weight(name)
 }
 
-/// The checkpoint tensors `blob` binds that no shard header in `dir` declares, in table order.
+/// The checkpoint tensors `blob` binds that no shard header in `dir` declares, in table order
+/// (tensors the packet carries data for are uploaded from the packet).
 /// Reads only the safetensors headers, so a load can refuse before any device work instead of
 /// failing mid-upload.
 pub(crate) fn missing_weights(
@@ -222,6 +223,7 @@ pub(crate) fn missing_weights(
         .enumerate()
         .filter(|(i, t)| {
             !caches.contains(i)
+                && t.init.is_none()
                 && is_checkpoint_tensor(*i, &t.name, packed.as_ref())
                 && !have.contains(&t.name)
         })
@@ -883,9 +885,12 @@ mod missing_weights_tests {
         let emb = b.tensor("model.language_model.embed_tokens.weight", 2);
         let w8 = b.tensor(head, 1);
         let s8 = b.tensor(&format!("{head}_scale"), 4);
+        // A constant the packet carries its own bytes for is never asked of the checkpoint.
+        let konst = b.tensor_init("c.depth.pos.0", vec![0; 4]);
         b.emit(DevOp::GemvFp8, vec![0], &[], |d| {
             d.t[..3].copy_from_slice(&[logits, emb, w8]);
             d.t[5] = s8;
+            d.t[6] = konst;
         });
         let p = b.finish();
         let model = Model {
