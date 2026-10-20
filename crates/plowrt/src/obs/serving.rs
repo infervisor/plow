@@ -338,6 +338,58 @@ pub struct SpecMetrics {
     pub draft_tokens: AtomicU64,
     pub accepted: AtomicU64,
     pub accepted_per_pos: [AtomicU64; crate::orch::speculative::SPEC_KMAX],
+    /// Decode ticks that ran at least one draft.
+    pub ticks: AtomicU64,
+    /// Decode ticks that ran plain (or verified without drafts), by first blocker.
+    pub skipped: [AtomicU64; SpecSkip::ALL.len()],
+    /// Decode rows that could draft (drafting sampling params, tokens and context left), summed
+    /// over decode ticks.
+    pub eligible_rows: AtomicU64,
+}
+
+/// Why a decode tick of a speculation-serving engine carried no drafts.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SpecSkip {
+    PrefillTick,
+    Backlog,
+    CfgRow,
+    PlainRow,
+    SeededSampledRow,
+    RowsOverLimit,
+    NoGreedyRows,
+    PolicyNoGain,
+    NotReady,
+    Refused,
+}
+
+impl SpecSkip {
+    pub const ALL: [SpecSkip; 10] = [
+        SpecSkip::PrefillTick,
+        SpecSkip::Backlog,
+        SpecSkip::CfgRow,
+        SpecSkip::PlainRow,
+        SpecSkip::SeededSampledRow,
+        SpecSkip::RowsOverLimit,
+        SpecSkip::NoGreedyRows,
+        SpecSkip::PolicyNoGain,
+        SpecSkip::NotReady,
+        SpecSkip::Refused,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            SpecSkip::PrefillTick => "prefill_tick",
+            SpecSkip::Backlog => "backlog",
+            SpecSkip::CfgRow => "cfg_row",
+            SpecSkip::PlainRow => "plain_row",
+            SpecSkip::SeededSampledRow => "seeded_sampled_row",
+            SpecSkip::RowsOverLimit => "rows_over_limit",
+            SpecSkip::NoGreedyRows => "no_greedy_rows",
+            SpecSkip::PolicyNoGain => "policy_no_gain",
+            SpecSkip::NotReady => "not_ready",
+            SpecSkip::Refused => "refused",
+        }
+    }
 }
 
 impl SpecMetrics {
@@ -351,6 +403,10 @@ impl SpecMetrics {
         for c in &self.accepted_per_pos[..(n_acc as usize).min(self.accepted_per_pos.len())] {
             c.fetch_add(1, Relaxed);
         }
+    }
+
+    pub fn skip(&self, why: SpecSkip) {
+        self.skipped[why as usize].fetch_add(1, Relaxed);
     }
 }
 
@@ -637,6 +693,35 @@ impl ServingMetrics {
                 "Draft tokens accepted.",
                 &|s| s.accepted.load(Relaxed),
             ));
+            out.push_str(&spec(
+                "plowrt_spec_ticks_total",
+                "Decode ticks that ran at least one draft.",
+                &|s| s.ticks.load(Relaxed),
+            ));
+            out.push_str(&spec(
+                "plowrt_spec_eligible_rows_total",
+                "Decode rows that could draft, summed over decode ticks.",
+                &|s| s.eligible_rows.load(Relaxed),
+            ));
+            family(
+                out,
+                "plowrt_spec_skipped_ticks_total",
+                "counter",
+                "Decode ticks without drafts, by first blocker.",
+            );
+            for ((_, m, _), labels) in models.iter().zip(&labels) {
+                if m.serving.spec.kmax.load(Relaxed) == 0 {
+                    continue;
+                }
+                for why in SpecSkip::ALL {
+                    let _ = writeln!(
+                        out,
+                        "plowrt_spec_skipped_ticks_total{{{labels},reason=\"{}\"}} {}",
+                        why.label(),
+                        m.serving.spec.skipped[why as usize].load(Relaxed)
+                    );
+                }
+            }
             family(
                 out,
                 "vllm:spec_decode_num_accepted_tokens_per_pos_total",
@@ -1153,6 +1238,10 @@ mod tests {
             assert!(out.contains(&line), "missing {line}");
         }
         assert!(!out.contains("position=\"3\""));
+        assert!(out.contains(&format!(
+            "plowrt_spec_skipped_ticks_total{l},reason=\"prefill_tick\"}} 0\n"
+        )));
+        assert!(out.contains(&format!("plowrt_spec_eligible_rows_total{l}}} 0\n")));
         assert_eq!(
             out.matches("# TYPE vllm:spec_decode_num_drafts_total counter")
                 .count(),

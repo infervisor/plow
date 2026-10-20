@@ -3229,6 +3229,37 @@ fn run_one_tick(
                     }
                 }
 
+                // Speculation census (`plowrt_spec_*`): every decode tick of a speculating engine
+                // counts its draftable rows and, unless it may speculate, its first blocker.
+                let spec_metrics = e
+                    .spec_serving()
+                    .filter(|_| !feeds.is_empty())
+                    .map(|limits| (limits, state.model_metrics(slug)));
+                let mut spec_open = false;
+                if let Some((limits, m)) = &spec_metrics {
+                    let sm = &m.serving.spec;
+                    if sm.kmax.load(Ordering::Relaxed) == 0 {
+                        sm.kmax.store(u64::from(limits.kmax), Ordering::Relaxed);
+                    }
+                    let mut caps = smallvec::SmallVec::new();
+                    let gate = gpu_spec_gate(&*e, &feeds, &slots, limits, &mut caps);
+                    sm.eligible_rows.fetch_add(
+                        caps.iter().filter(|&&c| c > 0).count() as u64,
+                        Ordering::Relaxed,
+                    );
+                    let skip = if did_prefill {
+                        Some(crate::obs::serving::SpecSkip::PrefillTick)
+                    } else if obs.host.spec_backlog {
+                        Some(crate::obs::serving::SpecSkip::Backlog)
+                    } else {
+                        gate.err()
+                    };
+                    match skip {
+                        Some(why) => sm.skip(why),
+                        None => spec_open = true,
+                    }
+                }
+
                 // A mixed packet variant executes existing decode rows and a
                 // prefix of waiting prefill rows in one compiler-emitted program.
                 // Keep each prompt's last token for the ordinary decode path so
@@ -3757,12 +3788,17 @@ fn run_one_tick(
                     // falls through to the per-token path below.
                     // Speculation runs only in pure decode ticks with nobody queued (their
                     // prefill comes first), on a drained pipeline.
-                    let spec_plan = if !did_prefill && !obs.host.spec_backlog {
-                        gpu_spec_plan(&*e, &feeds, &slots, &mut obs.host, || {
-                            state.model_metrics(slug)
-                        })
-                    } else {
-                        None
+                    let spec_plan = match &spec_metrics {
+                        Some((limits, m)) if spec_open => {
+                            let plan = gpu_spec_plan(&*e, &feeds, &slots, &mut obs.host, limits);
+                            if plan.is_none() {
+                                m.serving
+                                    .spec
+                                    .skip(crate::obs::serving::SpecSkip::PolicyNoGain);
+                            }
+                            plan
+                        }
+                        _ => None,
                     };
                     let mut spec_ran = false;
                     if let Some(plan) = spec_plan {
@@ -3791,15 +3827,14 @@ fn run_one_tick(
                             obs.host.pipe_tokens = done;
                             feeds = gpu_decode_feeds(&slots, cap);
                         }
-                        if !feeds.is_empty() {
-                            let metrics = state.model_metrics(slug);
+                        if let (false, Some((_, metrics))) = (feeds.is_empty(), &spec_metrics) {
                             spec_ran = gpu_spec_tick(
                                 &mut *e,
                                 plan,
                                 &feeds,
                                 &mut slots,
                                 &mut obs.host,
-                                &metrics,
+                                metrics,
                                 &arena,
                                 bundle,
                                 stop.as_slice(),
@@ -8083,8 +8118,9 @@ impl crate::exec::gpu::spec::SpecSampler for SlotSpecSampler<'_> {
 }
 
 /// Per fed row, the most drafts a speculative tick may give it (0 = it rides the verify as a
-/// plain row, sampled on the host when it needs to be). `None` when a row cannot ride a verify
-/// at all (CFG pairs, speech rows, seeded sampled rows). `ready` = the drafter holds the row's hidden.
+/// plain row, sampled on the host when it needs to be). `Err` names the first row that cannot
+/// ride a verify at all (CFG pairs, speech rows, seeded sampled rows); `caps` then holds the rows
+/// before it. `ready` = the drafter holds the row's hidden.
 #[cfg(feature = "cuda")]
 fn gpu_spec_caps(
     e: &crate::exec::gpu::GpuEngine,
@@ -8092,18 +8128,22 @@ fn gpu_spec_caps(
     slots: &[Option<Slot>],
     kmax: u32,
     ready: bool,
-    caps: &mut Vec<u32>,
-) -> Option<()> {
+    caps: &mut smallvec::SmallVec<[u32; 16]>,
+) -> std::result::Result<(), crate::obs::serving::SpecSkip> {
+    use crate::obs::serving::SpecSkip;
     caps.clear();
     for &(i, _) in feeds {
-        let s = slots[i].as_ref()?;
+        let s = slots[i].as_ref().ok_or(SpecSkip::CfgRow)?;
+        if s.cfg.is_some() {
+            return Err(SpecSkip::CfgRow);
+        }
+        if s.plain_decode() {
+            return Err(SpecSkip::PlainRow);
+        }
         // A seeded sampled row is reproducible only at plain decode's rung: riding a verify (even
         // undrafted) changes its logits' numerics, so its ticks stay plain.
-        if s.cfg.is_some()
-            || s.plain_decode()
-            || (s.gen.seed.is_some() && !gpu_spec_draftable(&s.gen.params))
-        {
-            return None;
+        if s.gen.seed.is_some() && !gpu_spec_draftable(&s.gen.params) {
+            return Err(SpecSkip::SeededSampledRow);
         }
         let left = s
             .gen
@@ -8119,27 +8159,42 @@ fn gpu_spec_caps(
         };
         caps.push(cap);
     }
-    Some(())
+    Ok(())
 }
 
-/// The tick's speculation plan, or `None` for a plain tick: the engine serves speculation, no
-/// row needs a plain-only path, and the measured plan beats the plain step. Planned as if every
-/// greedy row's drafter state were ready; [`gpu_spec_tick`] drafts only the rows whose is.
+/// Whether a decode tick over `feeds` may speculate at all (before the policy weighs it); `caps`
+/// gets [`gpu_spec_caps`] as if every drafter state were ready.
+#[cfg(feature = "cuda")]
+fn gpu_spec_gate(
+    e: &crate::exec::gpu::GpuEngine,
+    feeds: &[(usize, u32)],
+    slots: &[Option<Slot>],
+    limits: &crate::exec::gpu::SpecLimits,
+    caps: &mut smallvec::SmallVec<[u32; 16]>,
+) -> std::result::Result<(), crate::obs::serving::SpecSkip> {
+    use crate::obs::serving::SpecSkip;
+    gpu_spec_caps(e, feeds, slots, limits.kmax, false, caps)?;
+    if feeds.len() >= limits.max_rows {
+        return Err(SpecSkip::RowsOverLimit);
+    }
+    if caps.iter().all(|&c| c == 0) {
+        return Err(SpecSkip::NoGreedyRows);
+    }
+    Ok(())
+}
+
+/// The tick's speculation plan for a tick [`gpu_spec_gate`] opened, or `None` for a plain tick:
+/// the measured plan does not beat the plain step. Planned as if every greedy row's drafter
+/// state were ready; [`gpu_spec_tick`] drafts only the rows whose is.
 #[cfg(feature = "cuda")]
 fn gpu_spec_plan(
     e: &crate::exec::gpu::GpuEngine,
     feeds: &[(usize, u32)],
     slots: &[Option<Slot>],
     host: &mut crate::exec::host::HostExecutor,
-    metrics: impl FnOnce() -> Arc<Metrics>,
+    limits: &crate::exec::gpu::SpecLimits,
 ) -> Option<crate::sched::spec::Plan> {
-    let limits = e.spec_serving()?;
     let policy = host.spec.get_or_insert_with(|| {
-        metrics()
-            .serving
-            .spec
-            .kmax
-            .store(u64::from(limits.kmax), Ordering::Relaxed);
         let widths: Vec<usize> = e
             .effective_decode_rungs()
             .iter()
@@ -8152,11 +8207,8 @@ fn gpu_spec_plan(
             &limits.draft_rows,
         )
     });
-    if feeds.is_empty() || feeds.len() >= limits.max_rows {
-        return None;
-    }
-    let mut caps = Vec::with_capacity(feeds.len());
-    gpu_spec_caps(e, feeds, slots, limits.kmax, false, &mut caps)?;
+    let mut caps = smallvec::SmallVec::new();
+    gpu_spec_caps(e, feeds, slots, limits.kmax, false, &mut caps).ok()?;
     policy.plan(&caps)
 }
 
@@ -8183,11 +8235,13 @@ fn gpu_spec_tick(
     disconnected: &mut [bool],
 ) -> bool {
     use crate::exec::gpu::{SpecRow, SpecTick};
+    use crate::obs::serving::SpecSkip;
     let Some(limits) = e.spec_serving() else {
         return false;
     };
-    let mut caps = Vec::with_capacity(feeds.len());
-    if gpu_spec_caps(e, feeds, slots, limits.kmax, true, &mut caps).is_none() {
+    let mut caps = smallvec::SmallVec::new();
+    if let Err(why) = gpu_spec_caps(e, feeds, slots, limits.kmax, true, &mut caps) {
+        metrics.serving.spec.skip(why);
         return false;
     }
     let mut ks = Vec::with_capacity(feeds.len());
@@ -8222,6 +8276,7 @@ fn gpu_spec_tick(
         // A refusal that committed nothing leaves every slot as it was: the plain path serves the tick.
         if matches!(err, crate::RuntimeError::Rejected(_)) && out.committed == 0 {
             tracing::warn!(error = %err, "spec tick refused; plain step");
+            metrics.serving.spec.skip(SpecSkip::Refused);
             return false;
         }
         tracing::warn!(
@@ -8235,6 +8290,11 @@ fn gpu_spec_tick(
         note_fault(tick_fault, &err);
         fail_feeds(slots, feeds, arena, &err);
         return true;
+    }
+    if out.draft_rows > 0 {
+        metrics.serving.spec.ticks.fetch_add(1, Ordering::Relaxed);
+    } else {
+        metrics.serving.spec.skip(SpecSkip::NotReady);
     }
     if let Some(p) = host.spec.as_mut() {
         p.observe_step(out.rows, out.verify_ms);
