@@ -181,8 +181,11 @@ pub(super) fn load_gemv_wide(
         if rows64 { "64" } else { "" },
         if kv_abi == Some(1) { "_fp8kv" } else { "" }
     );
-    let Ok(image) = std::fs::read(assets.join(&file)) else {
-        return Ok(None);
+    let path = assets.join(&file);
+    let image = match std::fs::read(&path) {
+        Ok(image) => image,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(source) => return Err(RuntimeError::Io { path, source }),
     };
     if cubin::global_u32(&image, "plow_fp8_kv_abi") != kv_abi {
         return Err(reject(&format!(
@@ -195,8 +198,12 @@ pub(super) fn load_gemv_wide(
         &format!("_Z{}{stem}_gw11PlowProgram", stem.len() + 3),
     )?;
     GpuEngine::check_packet_pairing_suffix(be, &module, assets, "_gw")?;
-    if be.module_global_u32(&module, "plow_row_slot_1")? != be.module_global_u32(main, "plow_row_slot_1")? {
-        return Err(reject(&format!("{file}: plow_row_slot_1 differs from the decode object")));
+    if be.module_global_u32(&module, "plow_row_slot_1")?
+        != be.module_global_u32(main, "plow_row_slot_1")?
+    {
+        return Err(reject(&format!(
+            "{file}: plow_row_slot_1 differs from the decode object"
+        )));
     }
     for symbol in ["plow_block", "plow_dyn_kvrow", "plow_gemv_mm_cap"] {
         if be.module_global_u32(&module, &format!("{symbol}_gw"))?
@@ -240,6 +247,77 @@ pub(super) fn load_gemv_wide(
         })
     };
     Ok(Some((min_rows, (object(narrow), object(smem)))))
+}
+
+/// The `_rs` twin of the main decode object (`<source stem>_rs.cubin`): the same interpreter
+/// built with `PLOW_NV_ROW_SLOT`, for speculative verify and draft launches. Plain launches keep
+/// the main object, which skips the slot map. `None` when the packet ships none; a twin whose
+/// pairing, arena or ABI differs from the main object is refused. Returns the object at the
+/// main object's full and narrow claims.
+pub(super) fn load_row_slot_twin(
+    be: &Arc<CudaBackend>,
+    assets: &Path,
+    source: &str,
+    kernel: &str,
+    main: &Module,
+    grid: u32,
+    smem: u32,
+    smem_narrow: u32,
+) -> Result<Option<(Arc<BoundDecodeObject>, Arc<BoundDecodeObject>)>> {
+    let Some(stem) = source.strip_suffix(".cubin").filter(|s| !s.contains('/')) else {
+        return Ok(None);
+    };
+    let file = format!("{stem}_rs.cubin");
+    let path = assets.join(&file);
+    let image = match std::fs::read(&path) {
+        Ok(image) => image,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(source) => return Err(RuntimeError::Io { path, source }),
+    };
+    let module = DecodeModule::load(be, &image)?;
+    let function = be.get_function(&module, kernel)?;
+    GpuEngine::check_packet_pairing_suffix(be, &module, assets, "")?;
+    if be.module_global_u32(&module, "plow_row_slot_1")? != Some(1) {
+        return Err(reject(&format!("{file}: no plow_row_slot_1")));
+    }
+    for symbol in [
+        "plow_block",
+        "plow_dyn_kvrow",
+        "plow_gemv_mm_cap",
+        "plow_fp8_kv_abi",
+        "plow_kv_layout",
+        "plow_arena_bytes",
+        "plow_arena_bytes_narrow",
+        "plow_segment_gq_abi",
+        "plow_cublaslt_decode_abi",
+    ] {
+        if be.module_global_u32(&module, symbol)? != be.module_global_u32(main, symbol)? {
+            return Err(reject(&format!(
+                "{file}: {symbol} differs from the decode object"
+            )));
+        }
+    }
+    be.set_max_dynamic_smem(function, smem)?;
+    if be.occupancy_blocks_per_sm(function, BLOCK, smem as usize)? * be.sm_count() < grid {
+        return Err(reject(&format!(
+            "{file}: cannot hold the decode grid {grid}"
+        )));
+    }
+    tracing::info!(
+        file,
+        smem,
+        "row-slot decode twin loaded for speculative launches"
+    );
+    let object = |smem| {
+        Arc::new(BoundDecodeObject {
+            function,
+            grid,
+            block: BLOCK,
+            smem,
+            _module: Arc::clone(&module),
+        })
+    };
+    Ok(Some((object(smem), object(smem_narrow))))
 }
 
 impl BoundDecodeObject {

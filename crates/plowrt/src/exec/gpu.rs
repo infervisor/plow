@@ -95,6 +95,8 @@ mod segment_gates;
 mod shared_tail;
 pub mod spec;
 mod spec_draft;
+mod spec_serve;
+pub use spec_serve::{SpecLimits, SpecRow, SpecTick};
 mod token_batch;
 use cublaslt::{CublasLtDecodeRoute, LibraryRoute};
 use decode_rung::{
@@ -2800,6 +2802,10 @@ pub struct GpuEngine {
     /// Span-mode verify (`in.rowslot` packets); see [`spec`].
     spec: Option<spec::SpecRt>,
     spec_draft: Option<spec_draft::SpecDraft>,
+    /// `_rs` twin of the decode object (full, narrow claim) for speculative launches, and whether
+    /// the next decode launch is one.
+    row_slot_twin: Option<(Arc<BoundDecodeObject>, Arc<BoundDecodeObject>)>,
+    span_launch: bool,
     /// Per slot, one past the highest KV row any launch wrote (verify writes past `pos`).
     kv_hw: Vec<u32>,
     /// Bench-only launch overrides ([`Self::set_debug_min_rung`], [`Self::set_debug_nsplit_kvlen`]).
@@ -4332,7 +4338,7 @@ impl GpuEngine {
         // are misnamed still serves, and a wrong-arch image is refused here with
         // a message instead of by the driver with an opaque code.
         let want_sm = cc.0 * 10 + cc.1;
-        let (module, f, _kname, smem, grid, _dec_source, _image_len) = {
+        let (module, f, kname, smem, grid, dec_source, _image_len) = {
             let run = || -> Result<_> {
                 let selected = if let Some(metadata) = &decode_objects {
                     let spec = &metadata.objects
@@ -5774,8 +5780,27 @@ impl GpuEngine {
         // 1% faster on the ordinary one).
         // Span mode needs every decode object to honour `in.rowslot`; load_gemv_wide refuses a
         // `_gw` sibling whose marker differs from this one.
-        let row_slot_obj = decode_objects.is_none()
-            && be.module_global_u32(&module, "plow_row_slot_1")?.is_some();
+        let row_slot_obj =
+            decode_objects.is_none() && be.module_global_u32(&module, "plow_row_slot_1")?.is_some();
+        // Otherwise speculative launches run the `_rs` twin (plain launches skip the slot map).
+        let row_slot_twin = if row_slot_obj
+            || decode_objects.is_some()
+            || nv_config.cubin.is_some()
+            || nv_config.kernel.is_some()
+        {
+            None
+        } else {
+            decode_object::load_row_slot_twin(
+                &be,
+                assets_dir,
+                &dec_source,
+                &kname,
+                &module,
+                grid,
+                smem,
+                smem_narrow,
+            )?
+        };
         let gemv_wide = match gemv_mm_cap {
             Some(_)
                 if decode_objects.is_none()
@@ -7226,7 +7251,7 @@ impl GpuEngine {
         let spec = spec::SpecRt::load(
             &be,
             blob.tensors.iter().position(|t| t.name == "in.rowslot"),
-            row_slot_obj,
+            row_slot_obj || row_slot_twin.is_some(),
             batch,
             &blob.decode_progs(),
         )?;
@@ -7373,6 +7398,8 @@ impl GpuEngine {
             slot_generations: vec![0; batch],
             spec,
             spec_draft: None,
+            row_slot_twin,
+            span_launch: false,
             kv_hw: vec![0; batch],
             debug_min_rows: 0,
             debug_nsplit_kvlen: None,
@@ -8821,11 +8848,25 @@ impl GpuEngine {
     fn launch_decode_program(&mut self, selection: DecodeSelection) -> Result<()> {
         if let Some(r) = self.selected_decode(selection) {
             if let Some(library) = &r.library {
+                if self.span_launch {
+                    return Err(RuntimeError::Rejected(
+                        "speculative launch on a library-routed rung".into(),
+                    ));
+                }
                 return library.launch(&self.stream);
             }
             let mut arg = r.kernarg;
             let mut params = [&mut arg as *mut DevProgram as *mut std::ffi::c_void];
-            let object = r.object.as_deref();
+            if self.span_launch && r.object.is_some() {
+                return Err(RuntimeError::Rejected(
+                    "speculative launch on a sibling decode object".into(),
+                ));
+            }
+            let twin = match (&self.row_slot_twin, self.span_launch) {
+                (Some((full, narrow)), true) => Some(if r.group_arena { full } else { narrow }),
+                _ => None,
+            };
+            let object = twin.map(|o| &**o).or(r.object.as_deref());
             self.be.launch_cooperative(
                 object.map_or(self.f, |o| o.function),
                 object.map_or(self.grid, |o| o.grid),
@@ -8841,9 +8882,24 @@ impl GpuEngine {
                 &mut params,
                 Some(&self.stream),
             )
+        } else if self.span_launch {
+            Err(RuntimeError::Rejected(
+                "speculative launch on the widest rung".into(),
+            ))
         } else {
             self.launch_decode()
         }
+    }
+
+    /// The widest verify launch a speculative tick may use: the interpreter-only rungs. Library
+    /// routes (graph captures, light segments) and sibling objects run on the identity map only.
+    pub fn spec_max_rows(&self) -> usize {
+        self.decode_rungs
+            .iter()
+            .take_while(|r| r.library.is_none() && r.object.is_none())
+            .map(|r| r.rows)
+            .last()
+            .unwrap_or(0)
     }
 
     fn reset_decode_counters(&self) -> Result<()> {

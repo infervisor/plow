@@ -1318,6 +1318,12 @@ fn tuning(s: &Shapes, arch: &str) -> Map<String, Value> {
             //   E4B: B=1 +0.25 ms and B>=64 +0.2 ms, so hd <= 128 only.
             t.insert("gemv_l2pf".into(), json!(65536));
         }
+        // * `row_slot_twin`: a span-verify packet (PLOW_EMIT_SPAN_VERIFY) gets `_rs` twins of its
+        //   decode objects built with PLOW_NV_ROW_SLOT; plain launches keep the objects without the
+        //   slot map (it measured +0.6..1.5% on every plain rung).
+        if crate::emit_config::active().span_verify {
+            t.insert("row_slot_twin".into(), json!(1));
+        }
         // * `gemv_wide`: rungs past GV_MM_MAX stream the weights once on wgmma
         //   (op_gemv_wide_sm90.cuh) instead of ceil(B / 32) mma.sync passes. Its split-K tiles are
         //   written by other blocks than their owner, so only dense packets (coarse gates) take it.

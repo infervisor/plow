@@ -403,6 +403,18 @@ pub struct EmitConfig {
     #[arg(long, env = "PLOW_SPEC_DRAFT_FP8", value_parser = clap::builder::PossibleValuesParser::new(["head", "all"]))]
     pub spec_draft_fp8: Option<String>,
 
+    /// Deepest draft program for PLOW_EMIT_SPEC (default 7).
+    #[arg(long, env = "PLOW_SPEC_KMAX")]
+    pub spec_kmax: Option<u32>,
+
+    /// Draft program row counts for PLOW_EMIT_SPEC, comma list (default 1,2,4,8,16).
+    #[arg(long, env = "PLOW_SPEC_ROWS")]
+    pub spec_rows: Option<String>,
+
+    /// Pin: the re-keyed draft shard's sha256; the emit refuses any other bytes.
+    #[arg(long, env = "PLOW_SPEC_SHARD_SHA256")]
+    pub spec_shard_sha256: Option<String>,
+
     /// Blocks for the one-row MoE combine (arms the all-block combine; 0/1 = today's single CTA).
     #[arg(long, env = "PLOW_MOE_COMBINE_BLOCKS")]
     pub moe_combine_blocks: Option<u32>,
@@ -1939,6 +1951,9 @@ impl EmitConfig {
             emit_spec: env_bool("PLOW_EMIT_SPEC"),
             spec_draft_dir: env_str("PLOW_SPEC_DRAFT_DIR"),
             spec_draft_fp8: env_str("PLOW_SPEC_DRAFT_FP8"),
+            spec_kmax: env_u32("PLOW_SPEC_KMAX"),
+            spec_rows: env_str("PLOW_SPEC_ROWS"),
+            spec_shard_sha256: env_str("PLOW_SPEC_SHARD_SHA256"),
             moe_combine_blocks: env_u32("PLOW_MOE_COMBINE_BLOCKS"),
             fa_gf_full: env_u32("PLOW_FA_GF_FULL"),
             attention_decode_balance_gf: env_u32("PLOW_ATTENTION_DECODE_BALANCE_GF"),

@@ -17,8 +17,35 @@ use serde_json::Value;
 use crate::config::Cfg;
 use crate::Tn;
 
-pub(crate) const KMAX: u32 = 7;
-const ROWS: [u32; 5] = [1, 2, 4, 8, 16];
+/// Deepest draft program (`PLOW_SPEC_KMAX`, default 7; the verify span holds at most 15).
+fn kmax() -> u32 {
+    let k = crate::emit_config::active().spec_kmax.unwrap_or(7);
+    if !(1..=15).contains(&k) {
+        refuse(format!("PLOW_SPEC_KMAX={k}: 1..=15"));
+    }
+    k
+}
+
+/// Draft program row counts (`PLOW_SPEC_ROWS`, default 1,2,4,8,16), ascending.
+fn rows_list() -> Vec<u32> {
+    let Some(spec) = crate::emit_config::active().spec_rows.clone() else {
+        return vec![1, 2, 4, 8, 16];
+    };
+    let rows: Vec<u32> = spec
+        .split(',')
+        .map(|r| {
+            r.trim()
+                .parse()
+                .unwrap_or_else(|_| refuse(format!("PLOW_SPEC_ROWS={spec:?}")))
+        })
+        .collect();
+    if rows.is_empty() || rows.contains(&0) || rows.windows(2).any(|w| w[0] >= w[1]) {
+        refuse(format!(
+            "PLOW_SPEC_ROWS={spec:?}: ascending positive row counts"
+        ));
+    }
+    rows
+}
 const SHARD: &str = "model-mtp.safetensors";
 const FP8_SHARD: &str = "model-mtp-fp8.safetensors";
 const AMAX_BLOCKS: u32 = 64;
@@ -298,9 +325,8 @@ pub(crate) fn declare(b: &mut Builder, c: &Cfg, dbatch: u32, span_verify: bool) 
         );
     }
     let cfg = DraftCfg::load(c);
-    let rows = ROWS
-        .iter()
-        .copied()
+    let rows = rows_list()
+        .into_iter()
         .filter(|&r| r <= dbatch)
         .max()
         .unwrap_or(1);
@@ -312,7 +338,7 @@ pub(crate) fn declare(b: &mut Builder, c: &Cfg, dbatch: u32, span_verify: bool) 
     );
     let qd = (c.heads * c.hd_slide.max(c.hd_full)) as u64;
     let w = |b: &mut Builder, s: &str, sz: u64| b.tensor(&format!("mtp.{s}"), sz * BF16);
-    let tokens = (0..=KMAX)
+    let tokens = (0..=kmax())
         .map(|j| b.tensor(&format!("in.spec.tokens.{j}"), r * I32))
         .collect();
     let a = |b: &mut Builder, s: &str, sz: u64| b.tensor(&format!("act.mtp.{s}"), sz);
@@ -729,14 +755,23 @@ pub(crate) fn sections(
             }
         }
     }
+    let shard_sha256 = sha256_file(&shard);
+    if let Some(pin) = &crate::emit_config::active().spec_shard_sha256 {
+        if *pin != shard_sha256 {
+            refuse(format!(
+                "{SHARD} sha256 {shard_sha256}, PLOW_SPEC_SHARD_SHA256 pins {pin}"
+            ));
+        }
+    }
+    let (kmax, row_list) = (kmax(), rows_list());
     let mut programs = Vec::new();
     let mut table = Vec::new();
-    for &rows in ROWS.iter().filter(|&&r| r <= t.rows) {
+    for &rows in row_list.iter().filter(|&&r| r <= t.rows) {
         let Some(&(_, pi)) = rung_progs.iter().find(|&&(r, _)| r == rows) else {
             continue;
         };
         let s = sites(c, n, &t.cfg, &model.progs[pi]);
-        for k in 1..=KMAX {
+        for k in 1..=kmax {
             table.push(spec_draft::DraftProgram {
                 rows,
                 k,
@@ -747,7 +782,7 @@ pub(crate) fn sections(
     }
     if programs.is_empty() {
         refuse(format!(
-            "no target decode rung of {ROWS:?} rows to copy attention geometry from"
+            "no target decode rung of {row_list:?} rows to copy attention geometry from"
         ));
     }
     let packed: Vec<Vec<_>> = programs
@@ -779,7 +814,7 @@ pub(crate) fn sections(
     let manifest = spec_draft::Manifest {
         version: spec_draft::VERSION,
         family: "gemma4_assistant".into(),
-        kmax: KMAX,
+        kmax,
         programs: table,
         tensors: spec_draft::DraftTensors {
             tokens: t.tokens.iter().map(|&h| h16(h)).collect(),
@@ -791,13 +826,13 @@ pub(crate) fn sections(
             hidden_rows: n.rowslot_rows,
         },
         shard: SHARD.into(),
-        shard_sha256: sha256_file(&shard),
+        shard_sha256,
     };
     manifest
         .validate(programs.len(), model.tensors.len())
         .unwrap_or_else(|e| refuse(e));
     eprintln!(
-        "  spec draft: {} programs (rows {:?}, k 1..={KMAX})",
+        "  spec draft: {} programs (rows {:?}, k 1..={kmax})",
         programs.len(),
         manifest
             .programs

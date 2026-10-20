@@ -10,7 +10,7 @@ use plow_asset::spec_draft::Manifest;
 
 use crate::asset::devblob::DevBlob;
 use crate::device::cuda::PinnedHost;
-use crate::device::DeviceMem;
+use crate::device::{Backend, DeviceMem};
 use crate::{Result, RuntimeError};
 
 use super::{CudaBackend, DevProgram, GpuEngine, BLOCK};
@@ -60,6 +60,11 @@ pub(super) struct SpecDraft {
     stage: PinnedHost,
     rows: usize,
     selected: Option<(u32, usize, usize)>,
+    /// Per slot, the hidden row its pending token came from, saved at the verify that produced
+    /// it, and the `(generation, position)` it is valid for.
+    hidden_bytes: u64,
+    hidden_snap: DeviceMem,
+    hidden_at: Vec<Option<(u32, u32)>>,
 }
 
 fn reject(e: impl std::fmt::Display) -> RuntimeError {
@@ -82,11 +87,31 @@ impl SpecDraft {
         let bytes = blob
             .reserved_metadata(&raw, plow_asset::spec_draft::PROGRAMS_SECTION)?
             .ok_or_else(|| reject("draft programs section missing"))?;
+        // Under PLOW_LIVE_CTX the engine re-declared the packet at its live bound; the draft
+        // programs address the same full-attention caches and take the same restride.
+        let ceiling = crate::exec::ctx_bound::declared_ctx(&blob).unwrap_or(0);
+        let live = e.max_ctx as u32;
+        let mut sized = None;
+        if live != ceiling {
+            if live > ceiling {
+                return Err(reject(format!("widened live context {live} > {ceiling}")));
+            }
+            let mut narrowed = DevBlob::parse(&raw)?;
+            crate::exec::ctx_bound::narrow(&mut narrowed, live)?;
+            sized = Some(narrowed);
+        }
+        let sized_tensors = sized.as_ref().map_or(&blob.tensors, |b| &b.tensors);
+        let rewritten: Vec<u16> = (0..blob.tensors.len())
+            .filter(|&h| {
+                blob.tensors[h].name.starts_with("kv.")
+                    && sized_tensors[h].bytes != blob.tensors[h].bytes
+            })
+            .map(|h| h as u16)
+            .collect();
         // The programs address this engine's tensor table: same packet tensors, in order.
         if blob.n_cu != e.grid
             || blob.tensors.len() != e.devp.len()
-            || blob
-                .tensors
+            || sized_tensors
                 .iter()
                 .zip(e.tensor_names.iter().zip(&e.devp))
                 .any(|(t, (name, mem))| t.name != *name || mem.len < t.bytes)
@@ -97,8 +122,24 @@ impl SpecDraft {
         if !e.spec.as_ref().is_some_and(|s| s.row_slot_object()) {
             return Err(reject("decode object lacks plow_row_slot_1"));
         }
-        let section =
+        let mut section =
             plow_asset::aux_program::parse(bytes, e.grid, e.devp.len()).map_err(reject)?;
+        if live != ceiling {
+            for p in &mut section.programs {
+                packet::ctx_bound::restride_matching(&mut p.insts, ceiling, live, |h| {
+                    rewritten.contains(&h)
+                });
+                if let Some((k, op, slot)) =
+                    packet::ctx_bound::residual_ceiling(&p.insts, ceiling, |h| {
+                        rewritten.contains(&h)
+                    })
+                {
+                    return Err(reject(format!(
+                        "instruction {k} (op {op}) keeps the emitted ctx in {slot:?}"
+                    )));
+                }
+            }
+        }
         manifest
             .validate(section.programs.len(), e.devp.len())
             .map_err(reject)?;
@@ -127,6 +168,18 @@ impl SpecDraft {
                 return Err(reject(format!("program {} geometry", p.index)));
             }
         }
+        let mut hidden_bytes = None;
+        for p in &section.programs {
+            for d in &p.insts {
+                if d.op == packet::dev::DevOp::RowGather as u16 && d.t[1] == t.hidden {
+                    let b = u64::from(d.i[1]) * 2;
+                    if *hidden_bytes.get_or_insert(b) != b {
+                        return Err(reject("draft programs gather different hidden widths"));
+                    }
+                }
+            }
+        }
+        let hidden_bytes = hidden_bytes.ok_or_else(|| reject("no hidden gather"))?;
         let rows = manifest.programs.iter().map(|p| p.rows).max().unwrap_or(0) as usize;
         for &h in &inputs {
             if e.devp[usize::from(h)].len < rows as u64 * 4 {
@@ -167,6 +220,9 @@ impl SpecDraft {
             stage,
             rows,
             selected: None,
+            hidden_bytes,
+            hidden_snap: e.be.alloc(0, hidden_bytes * e.batch as u64)?,
+            hidden_at: vec![None; e.batch],
         })
     }
 
@@ -315,7 +371,72 @@ impl GpuEngine {
             .as_ref()
             .ok_or_else(|| reject("not enabled"))?;
         let (_, index, _) = d.selected.ok_or_else(|| reject("nothing staged"))?;
-        d.launch(&self.be, self.f, self.grid, self.smem, &self.stream, index)
+        let (f, smem) = self
+            .row_slot_twin
+            .as_ref()
+            .map_or((self.f, self.smem), |(full, _)| (full.function, full.smem));
+        d.launch(&self.be, f, self.grid, smem, &self.stream, index)
+    }
+
+    /// Whether slot `b` holds the hidden its pending token came from (saved by the verify that
+    /// produced it; any later step or slot reuse moves the position or generation past it).
+    pub fn spec_draft_ready(&self, b: usize) -> bool {
+        self.spec_draft.as_ref().is_some_and(|d| {
+            d.hidden_at.get(b).copied().flatten() == Some((self.slot_generations[b], self.pos[b]))
+        })
+    }
+
+    /// Copy verify row `row`'s hidden aside for slot `b`, valid once `b` sits at `pos`. On the
+    /// stream right after the verify, before any launch can overwrite the row.
+    pub(super) fn spec_hidden_save(&mut self, b: usize, row: u32, pos: u32) -> Result<()> {
+        let Some(d) = self.spec_draft.as_mut() else {
+            return Ok(());
+        };
+        let h = d.manifest.tensors.hidden;
+        if row >= d.manifest.tensors.hidden_rows {
+            return Err(reject(format!("hidden row {row}")));
+        }
+        let n = d.hidden_bytes;
+        self.be.memcpy_dtod_async(
+            d.hidden_snap.base + b as u64 * n,
+            self.devp[usize::from(h)].base + u64::from(row) * n,
+            n,
+            &self.stream,
+        )?;
+        d.hidden_at[b] = Some((self.slot_generations[b], pos));
+        Ok(())
+    }
+
+    /// Put slot `b`'s saved hidden at row `row` of the hidden tensor for the next draft.
+    pub(super) fn spec_hidden_restore(&mut self, b: usize, row: u32) -> Result<()> {
+        if !self.spec_draft_ready(b) {
+            return Err(reject(format!(
+                "slot {b}: no saved hidden for its pending token"
+            )));
+        }
+        let d = self.spec_draft.as_ref().expect("ready");
+        let h = d.manifest.tensors.hidden;
+        let n = d.hidden_bytes;
+        self.be.memcpy_dtod_async(
+            self.devp[usize::from(h)].base + u64::from(row) * n,
+            d.hidden_snap.base + b as u64 * n,
+            n,
+            &self.stream,
+        )
+    }
+
+    /// `(deepest k, draft program row counts)` of the loaded drafter.
+    pub(super) fn spec_draft_shape(&self) -> Option<(u32, Vec<usize>)> {
+        let d = self.spec_draft.as_ref()?;
+        let mut rows: Vec<usize> = d
+            .manifest
+            .programs
+            .iter()
+            .map(|p| p.rows as usize)
+            .collect();
+        rows.sort_unstable();
+        rows.dedup();
+        Some((d.manifest.kmax, rows))
     }
 
     pub fn spec_draft_sync(&self) -> Result<()> {

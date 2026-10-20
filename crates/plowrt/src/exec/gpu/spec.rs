@@ -11,9 +11,7 @@ use std::path::Path;
 
 use crate::device::cuda::{KernelFn, PinnedHost};
 use crate::device::{Backend, DeviceMem, Module};
-use crate::orch::speculative::{
-    accept_greedy, SpecSpanDev, SpecVerdict, SPEC_KMAX, SPEC_NO_STORE,
-};
+use crate::orch::speculative::{accept_greedy, SpecSpanDev, SpecVerdict, SPEC_KMAX, SPEC_NO_STORE};
 use crate::{Result, RuntimeError};
 
 use super::decode_rung::decode_selection;
@@ -192,12 +190,15 @@ impl GpuEngine {
             source,
         })?;
         let module = self.be.module_load(&image)?;
-        let f = self.be.get_function(&module, "plow_spec_accept").map_err(|_| {
-            RuntimeError::Rejected(format!(
-                "speculative verify: {} lacks plow_spec_accept",
-                cubin.display()
-            ))
-        })?;
+        let f = self
+            .be
+            .get_function(&module, "plow_spec_accept")
+            .map_err(|_| {
+                RuntimeError::Rejected(format!(
+                    "speculative verify: {} lacks plow_spec_accept",
+                    cubin.display()
+                ))
+            })?;
         self.spec.as_mut().expect("checked").accept = Some((f, module));
         let ring_k = self
             .resume_ring_slack
@@ -260,6 +261,12 @@ impl GpuEngine {
         let need = rows.max(self.debug_min_rows);
         if need > bsz {
             return reject(format!("{need} rows exceed the decode ladder"));
+        }
+        if need > self.spec_max_rows() {
+            return reject(format!(
+                "{need} rows exceed the rungs speculative launches can run ({})",
+                self.spec_max_rows()
+            ));
         }
         // `None` is the widest program (the engine's own kernarg), as for plain launches.
         let selection = decode_selection(self.decode_rung(need - 1), None);
@@ -326,7 +333,8 @@ impl GpuEngine {
             // Plain launches must not see the span map, and staging may still be in flight: only
             // a restore that drains cleanly clears the dirty flag.
             self.spec.as_mut().expect("checked").map_dirty = true;
-            if self.spec_upload_identity().is_ok() && self.be.stream_synchronize(&self.stream).is_ok()
+            if self.spec_upload_identity().is_ok()
+                && self.be.stream_synchronize(&self.stream).is_ok()
             {
                 self.spec.as_mut().expect("checked").map_dirty = false;
             }
@@ -386,13 +394,19 @@ impl GpuEngine {
         // copy is within its [batch]-sized tensor or buffer.
         unsafe {
             for (k, t) in [(0, self.t_ids), (1, self.t_pos), (2, self.t_kvlen)] {
-                self.be
-                    .memcpy_htod_async(self.devp[t].base, self.stage.section(k), &self.stream)?;
+                self.be.memcpy_htod_async(
+                    self.devp[t].base,
+                    self.stage.section(k),
+                    &self.stream,
+                )?;
             }
             let s = self.spec.as_mut().expect("checked");
             s.map_dirty = true;
-            self.be
-                .memcpy_htod_async(self.devp[s.t_rowslot].base, s.rows.as_slice(), &self.stream)?;
+            self.be.memcpy_htod_async(
+                self.devp[s.t_rowslot].base,
+                s.rows.as_slice(),
+                &self.stream,
+            )?;
             self.be
                 .memcpy_htod_async(s.d_inputs.base, s.inputs.as_slice(), &self.stream)?;
             let span_bytes = n_spans * std::mem::size_of::<SpecSpanDev>();
@@ -410,7 +424,10 @@ impl GpuEngine {
             }
         }
         self.reset_selected_decode_counters(selection)?;
-        self.launch_decode_program(selection).map_err(|e| {
+        self.span_launch = true;
+        let launched = self.launch_decode_program(selection);
+        self.span_launch = false;
+        launched.map_err(|e| {
             tracing::warn!(launch_rows, rows, error = %e, "spec verify launch failed");
             e
         })?;
@@ -472,7 +489,11 @@ impl GpuEngine {
             ))
         };
         let s = self.spec.as_mut().ok_or_else(stale)?;
-        let ix = s.pending.iter().position(|p| p.slot == b).ok_or_else(stale)?;
+        let ix = s
+            .pending
+            .iter()
+            .position(|p| p.slot == b)
+            .ok_or_else(stale)?;
         let p = s.pending.swap_remove(ix);
         if b >= self.batch
             || p.generation != self.slot_generations[b]
@@ -504,7 +525,8 @@ impl GpuEngine {
             for row in from..to {
                 let cell = u64::from(row & site.mask);
                 for h in 0..u64::from(site.heads) {
-                    let line = (b as u64 * u64::from(site.heads) + h) * u64::from(site.stride) + cell;
+                    let line =
+                        (b as u64 * u64::from(site.heads) + h) * u64::from(site.stride) + cell;
                     let hd = u64::from(site.hd);
                     self.be.memset_d8_async(
                         self.devp[site.cache].base + line * hd,
