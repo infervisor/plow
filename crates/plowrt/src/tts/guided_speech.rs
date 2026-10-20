@@ -980,6 +980,8 @@ impl GuidedSpeech {
                         },
                         history: vec![c.start_speech],
                         seed: Some(seed),
+                        uncond_ids: Vec::new(),
+                        uncond_overlay_pos: Vec::new(),
                     }),
                     // Streams only: a whole reply's first audio needs every token.
                     first_tokens: if class == JobClass::Critical {

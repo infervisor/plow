@@ -842,6 +842,19 @@ async fn speech_with(
         Err(r) => return r,
     };
     let c = &model.contract;
+    // The guidance contrasts the instructed voice with the uninstructed one.
+    if c.depth_cfg()
+        && checked.sampling.cfg_weight.is_some_and(|w| w > 0.0)
+        && req
+            .instructions
+            .as_deref()
+            .is_none_or(|i| i.trim().is_empty())
+    {
+        return bad(
+            "`cfg_weight` guides the voice towards `instructions`; give instructions or omit it",
+            "cfg_weight",
+        );
+    }
     let voice = req.voice.clone();
     let wav = checked.wav;
     // Past the cap the reference budget clips the audio: a longer input is spoken in order as
@@ -857,6 +870,7 @@ async fn speech_with(
             .filter(|i| !i.is_empty())
             .map(str::to_owned),
         encoder: model.encoder.clone(),
+        cfg_weight: checked.sampling.cfg_weight.unwrap_or(0.0),
         max_tokens: checked.sampling.max_tokens,
         temperature: checked.sampling.temperature,
         top_p: checked.sampling.top_p,
@@ -1075,6 +1089,8 @@ struct Segment {
     /// `enc_ids`, encoded when the segment is submitted.
     prompt_ids: Vec<u32>,
     enc_ids: Option<Vec<u32>>,
+    /// A guided segment's unconditional encoder ids (the prompt without its instructions).
+    uncond_ids: Option<Vec<u32>>,
     gen: crate::serve::GenParams,
     chars: usize,
 }
@@ -1086,6 +1102,8 @@ struct SegmentMaker {
     voice: String,
     instructions: Option<String>,
     encoder: Option<Arc<super::text_encoder::TextEncoder>>,
+    /// Depth-stage CFG weight w (scale s = 1 + w); 0 = off.
+    cfg_weight: f32,
     max_tokens: Option<usize>,
     temperature: f32,
     top_p: f32,
@@ -1109,6 +1127,7 @@ impl SegmentMaker {
             ids
         };
         let mut prompt_ids = ids(self.instructions.as_deref());
+        let uncond_ids = (self.cfg_weight > 0.0 && self.encoder.is_some()).then(|| ids(None));
         let enc_ids = self.encoder.is_some().then(|| {
             let ids = prompt_ids.clone();
             prompt_ids.fill(0);
@@ -1134,6 +1153,7 @@ impl SegmentMaker {
             text: text.to_owned(),
             prompt_ids,
             enc_ids,
+            uncond_ids,
             gen,
             chars: text.chars().count(),
         }
@@ -1159,6 +1179,27 @@ impl SegmentMaker {
             Some(ids) => encode(ids)?,
             None => Default::default(),
         };
+        let cfg = match &s.uncond_ids {
+            Some(ids) => {
+                let (uncond_overlay, uncond_overlay_pos) = encode(ids)?;
+                Some(crate::serve::mux::CfgJob {
+                    uncond_overlay,
+                    params: crate::text::sample::CfgParams {
+                        cfg_weight: self.cfg_weight,
+                        temperature: 0.0,
+                        min_p: 0.0,
+                        top_p: 1.0,
+                        repetition_penalty: 1.0,
+                    },
+                    history: Vec::new(),
+                    seed: None,
+                    uncond_ids: vec![0; ids.len()],
+                    uncond_overlay_pos,
+                })
+            }
+            None => None,
+        };
+        let cfg_scale = cfg.as_ref().map(|_| 1.0 + self.cfg_weight);
         {
             // The reference keeps temperature and top-p as bf16 tensors (0.7 -> 0.69921875).
             let bf16 = |x: f32| {
@@ -1168,6 +1209,7 @@ impl SegmentMaker {
             // Breeze's reference samples with f32 parameters.
             let param = |x: f32| if c.breeze_sampler { x } else { bf16(x) };
             Ok(Some(Box::new(crate::serve::mux::SpeechJob {
+                cfg,
                 overlay,
                 overlay_pos,
                 depth: Some(crate::serve::mux::DepthJob {
@@ -1182,6 +1224,7 @@ impl SegmentMaker {
                     } else {
                         1.0
                     },
+                    cfg_scale,
                     semantic_base: c.audio_token_base,
                     stop_class: c.codebook,
                     stop_token: c.stops[0],

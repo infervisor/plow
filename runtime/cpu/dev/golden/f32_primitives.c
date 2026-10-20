@@ -535,7 +535,10 @@ G_K(g_sample_small_f32) {
     const uint32_t rows = in->i[0], vocab = in->i[1], ostride = in->i[2], ocol = in->i[3], coord = in->i[4];
     const uint32_t words = in->i[5], ls = in->i[7] ? in->i[7] : vocab, eoff = in->fj[1].u;
     for (uint32_t r = slice; r < rows; r += nblk) {
-        uint32_t K = ctl[2u * r] < 64u ? ctl[2u * r] : 64u;
+        const uint32_t cw = ctl[2u * r];
+        if (cw & (1u << 30)) continue;
+        const int guide = (cw >> 31) & 1u;
+        uint32_t K = (cw & ~(3u << 30)) < 64u ? (cw & ~(3u << 30)) : 64u;
         if (K > vocab) K = vocab;
         if (!K || vocab > 4096u) continue;
         const float* p = params + (size_t)r * 4u;
@@ -544,6 +547,11 @@ G_K(g_sample_small_f32) {
         uint32_t sel[64];
         for (uint32_t i = 0; i < vocab; i++) {
             float v = logits[(size_t)r * ls + i];
+            if (guide) {
+                const float u = logits[(size_t)(r + 1u) * ls + i];
+                const volatile float d = v - u, m = p[3] * d;
+                v = u + m;
+            }
             if (bm && ((bm[i >> 5] >> (i & 31u)) & 1u)) v = v > 0.f ? v / p[2] : v * p[2];
             L[i] = v / p[0];
         }
@@ -582,6 +590,10 @@ G_K(g_sample_small_f32) {
         if (bitmap) bitmap[(size_t)r * words + (c >> 5)] |= 1u << (c & 31u);
         out[o] = c;
         if (eidx) eidx[r] = c + eoff;
+        if (guide) {
+            out[o + ostride] = c;
+            if (eidx) eidx[r + 1u] = c + eoff;
+        }
     }
 }
 

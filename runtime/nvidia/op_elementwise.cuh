@@ -293,14 +293,21 @@ static __device__ void d_sample_small(unsigned* __restrict__ out, const float* _
     float* L = sv + 64;
     const unsigned ls = lstride ? lstride : vocab;
     for (unsigned r = slice; r < rows; r += nblk) {
-        const unsigned K = min(min(ctl[2u * r], 64u), vocab);
+        /* A CFG pair (plow_asset::fish_depth GUIDE / FOLLOW bits): the guide row r samples
+         * u + s (c - u) over rows (r, r + 1) = (cond, uncond) and writes both; the follower skips. */
+        const unsigned cw = ctl[2u * r];
+        if (cw & (1u << 30)) continue;
+        const bool guide = cw & (1u << 31);
+        const unsigned K = min(min(cw & ~(3u << 30), 64u), vocab);
         if (!K) continue;
         const float* p = params + (size_t)r * 4u;
-        const float t = p[0], pen = p[2];
+        const float t = p[0], pen = p[2], cs = p[3];
         const unsigned* bm = bitmap ? bitmap + (size_t)r * words : nullptr;
         const float* lg = logits + (size_t)r * ls;
+        const float* lu = guide ? lg + ls : nullptr;
         for (unsigned i = threadIdx.x; i < vocab; i += PLOW_NV_THREADS) {
             float v = lg[i];
+            if (lu) v = __fadd_rn(lu[i], __fmul_rn(cs, __fsub_rn(v, lu[i])));
             if (bm && ((bm[i >> 5] >> (i & 31u)) & 1u)) v = v > 0.f ? __fdiv_rn(v, pen) : v * pen;
             L[i] = __fdiv_rn(v, t);
         }
@@ -344,6 +351,10 @@ static __device__ void d_sample_small(unsigned* __restrict__ out, const float* _
             if (bm) bitmap[(size_t)r * words + (c >> 5)] |= 1u << (c & 31u);
             out[o] = c;
             if (eidx) eidx[r] = c + eoff;
+            if (guide) {
+                out[o + out_stride] = c;
+                if (eidx) eidx[r + 1] = c + eoff;
+            }
         }
         __syncthreads();
     }

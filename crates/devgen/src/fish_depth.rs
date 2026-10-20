@@ -581,6 +581,7 @@ pub(crate) fn sections(
         } else {
             manifest::Sampler::Fish
         },
+        pair_cfg: t.d.breeze,
         tensors: manifest::Tensors {
             params: h(t.params),
             top_k: h(t.top_k),

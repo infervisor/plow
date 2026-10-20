@@ -13,6 +13,10 @@
 //! PROMPT_CODES every prompt row is a text row. PROMPT_CODES (`[prompt rows][1 + codebooks]`)
 //! lays out a mixed prompt: a row whose first word is 0 takes the next text row, 1 is a reference
 //! frame with the given codes.
+//!
+//! `BREEZE_CFG=S:UNCOND_ENC.f32` runs a CFG pair: slot 1 prefills the unconditional text rows,
+//! each frame samples `u + S (c - u)` in the depth stage, and the logits files carry both rows
+//! (cond, uncond) per frame.
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -76,6 +80,36 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             Ok(())
         };
 
+    // The unconditional member first: its terminal hidden survives the owner's prefill on the host.
+    let cfg: Option<(f32, Vec<f32>)> = std::env::var("BREEZE_CFG").ok().map(|v| {
+        let (s, f) = v.split_once(':').expect("BREEZE_CFG=S:UNCOND_ENC.f32");
+        (s.parse().unwrap(), read(f))
+    });
+    let mut uncond_hidden = vec![0u8; HIDDEN * 2];
+    if let Some((_, u)) = &cfg {
+        let m = u.len() / HIDDEN;
+        e.begin_slot(1, m + nf + 1)?;
+        e.write_tensor("in.encoder_overlay", 0, bytemuck::cast_slice(u))?;
+        let index: Vec<u32> = (0..m as u32).collect();
+        let mut c0 = 0;
+        loop {
+            let hi = m.min(c0 + e.pf_max_rows().max(1));
+            e.write_tensor(
+                "in.encoder_overlay_index",
+                0,
+                bytemuck::cast_slice(&index[c0..hi]),
+            )?;
+            match e.prefill_chunk(1, &vec![0u32; m], m)? {
+                PrefillStep::Done(_) => break,
+                PrefillStep::Progress(p) => c0 = p,
+            }
+        }
+        e.read_tensor_range(
+            "act.hn",
+            u64::from(e.prefill_terminal_row()) * (HIDDEN * 2) as u64,
+            &mut uncond_hidden,
+        )?;
+    }
     e.begin_slot(0, n + nf + 1)?;
     e.write_tensor("in.encoder_overlay", 0, bytemuck::cast_slice(&enc))?;
     // A frame row's token is its codebook-0 code; text rows embed from the overlay.
@@ -99,6 +133,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
     hidden_row(&e, e.prefill_terminal_row(), &mut out)?;
+    let uncond_row = u32::from(e.prefill_terminal_row() == 0);
+    if cfg.is_some() {
+        e.write_tensor_ordered(
+            "act.hn",
+            u64::from(uncond_row) * (HIDDEN * 2) as u64,
+            &uncond_hidden,
+        )?;
+    }
+    let rows = 1 + usize::from(cfg.is_some());
     let info = e.fish_depth_enable(&assets)?;
     e.fish_reset_slot(0)?;
     let classes = info.stop_class as usize + 1;
@@ -124,6 +167,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         ras_temperature: 1.0,
         ras_top_p: 1.0,
         repetition_penalty: 1.1,
+        cfg: cfg.as_ref().map(|(s, _)| (*s, uncond_row)),
     };
     let (mut toks, mut codes, mut sampled) = (Vec::new(), Vec::new(), Vec::new());
     for f in frames.chunks_exact(CODEBOOKS) {
@@ -134,16 +178,23 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             assert_eq!(&codes[..], f, "forced frame codes");
         }
         sampled.extend_from_slice(&codes);
-        read_f32(&e, "act.fish.blogits", classes, &mut blogits)?;
+        read_f32(&e, "act.fish.blogits", rows * classes, &mut blogits)?;
         for j in 1..CODEBOOKS {
-            read_f32(&e, &format!("act.fish.dlogits.{j}"), 2048, &mut depth)?;
+            read_f32(
+                &e,
+                &format!("act.fish.dlogits.{j}"),
+                rows * 2048,
+                &mut depth,
+            )?;
         }
         if codes[0] == info.stop_class {
             break;
         }
-        e.step_slots(&[(0, codes[0])], &mut toks)?;
+        let feeds: Vec<(usize, u32)> = (0..rows).map(|s| (s, codes[0])).collect();
+        e.step_slots(&feeds, &mut toks)?;
         hidden_row(&e, 0, &mut out)?;
         row.hidden_row = 0;
+        row.cfg = row.cfg.map(|(s, _)| (s, 1));
         row.step += 1;
     }
     std::fs::write(&a[5], bytemuck::cast_slice(&out))?;

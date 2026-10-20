@@ -45,6 +45,9 @@ pub struct FishRow {
     pub ras_top_p: f32,
     /// HF repetition penalty on the backbone class (Breeze sampler; 1.0 = none).
     pub repetition_penalty: f32,
+    /// A CFG pair (`pair_cfg` packets): (scale s, the unconditional member's hidden row). Slot
+    /// `slot + 1` runs the unconditional depth pass and receives the same codes.
+    pub cfg: Option<(f32, u32)>,
 }
 
 /// What a Fish depth packet emits per frame.
@@ -54,6 +57,7 @@ pub struct FishInfo {
     pub semantic_base: u32,
     pub semantic_tokens: u32,
     pub stop_class: u32,
+    pub pair_cfg: bool,
 }
 
 fn reject(e: impl std::fmt::Display) -> RuntimeError {
@@ -167,6 +171,7 @@ impl GpuEngine {
             semantic_base: m.semantic_base,
             semantic_tokens: m.semantic_tokens,
             stop_class: m.stop_class,
+            pair_cfg: m.pair_cfg,
         };
         self.fish = Some(d);
         Ok(info)
@@ -208,7 +213,14 @@ impl GpuEngine {
         out: &mut Vec<u32>,
     ) -> Result<()> {
         let batch = self.batch;
-        let width = rows.iter().map(|r| r.slot + 1).max().unwrap_or(0);
+        let width = rows
+            .iter()
+            .map(|r| r.slot + 1 + usize::from(r.cfg.is_some()))
+            .max()
+            .unwrap_or(0);
+        if rows.iter().any(|r| r.cfg.is_some()) && !d.manifest.pair_cfg {
+            return Err(reject("packet's sampler takes no CFG pairs"));
+        }
         let p = d
             .programs
             .iter()
@@ -220,8 +232,16 @@ impl GpuEngine {
                     width.saturating_sub(1)
                 ))
             })?;
-        if rows.iter().any(|r| r.slot >= batch || r.top_k == 0) {
-            return Err(reject("row slot out of range or top_k 0"));
+        let partner = |r: &FishRow| r.cfg.map(|_| r.slot + 1);
+        if rows.iter().any(|r| {
+            r.slot + usize::from(r.cfg.is_some()) >= batch
+                || r.top_k == 0
+                || r.top_k & (plow_asset::fish_depth::GUIDE | plow_asset::fish_depth::FOLLOW) != 0
+                || rows.iter().any(|o| partner(o) == Some(r.slot))
+        }) {
+            return Err(reject(
+                "row slot out of range, top_k 0 or out of range, or a slot on a CFG partner",
+            ));
         }
         let n = p.rows as usize;
         let k = d.manifest.codebooks as usize;
@@ -257,6 +277,16 @@ impl GpuEngine {
                 words[d.rows + r] = row.step;
                 words[2 * d.rows + r] = row.hidden_row;
                 seeds[r] = row.seed;
+                if let Some((s, uncond_row)) = row.cfg {
+                    use plow_asset::fish_depth::{FOLLOW, GUIDE};
+                    params[r * 4 + 3] = s;
+                    words[r] |= GUIDE;
+                    params.copy_within(r * 4..r * 4 + 4, (r + 1) * 4);
+                    words[r + 1] = row.top_k | FOLLOW;
+                    words[d.rows + r + 1] = row.step;
+                    words[2 * d.rows + r + 1] = uncond_row;
+                    seeds[r + 1] = row.seed;
+                }
             }
             if breeze {
                 // One [rows][2] (top_k, step) tensor: interleave into the top_k/step words.

@@ -221,10 +221,17 @@ impl SpeechContract {
             max_tokens: self.max_new_tokens_cap,
             top_k: Some(self.top_k),
             top_k_max: self.depth.then_some(64),
-            cfg_weight: None,
+            // Breeze guides against the uninstructed prompt: w = s - 1, off by default.
+            cfg_weight: self.depth_cfg().then_some(0.0),
             instructions: self.instructions.is_some(),
             voice_cloning: false,
         }
+    }
+
+    /// Classifier-free guidance in the depth stage, contrasting with the prompt without its
+    /// instructions.
+    pub fn depth_cfg(&self) -> bool {
+        self.breeze_sampler && self.instructions.is_some()
     }
 
     /// LM tokens per audio frame.

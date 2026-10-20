@@ -66,6 +66,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 ras_temperature: bf16(1.0),
                 ras_top_p: bf16(0.9),
                 repetition_penalty: 1.0,
+                cfg: None,
             };
             codes.clear();
             e.fish_depth_step(&[row], &mut codes)?;
@@ -121,6 +122,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         ras_temperature: bf16(1.0),
         repetition_penalty: 1.0,
         ras_top_p: bf16(0.9),
+        cfg: None,
     };
     let mut out = Vec::new();
     let mut codes = Vec::new();

@@ -45,10 +45,14 @@ pub enum Sampler {
     /// `history` = the RAS window.
     #[default]
     Fish,
-    /// `SampleSmallF32`: params (T, top_p, repetition penalty, -), `top_k` = `step` = one
+    /// `SampleSmallF32`: params (T, top_p, repetition penalty, CFG scale), `top_k` = `step` = one
     /// `[rows][2]` (top_k, step) tensor, `history` = a `[rows][ras_window]` u32 class bitmap.
     Breeze,
 }
+
+/// `top_k` word role bits of a [`Manifest::pair_cfg`] sampler.
+pub const GUIDE: u32 = 1 << 31;
+pub const FOLLOW: u32 = 1 << 30;
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -63,6 +67,11 @@ pub struct Manifest {
     pub ras_window: u32,
     #[serde(default)]
     pub sampler: Sampler,
+    /// The sampler takes CFG pairs: a guide row (`top_k` bit [`GUIDE`], scale in `params[3]`)
+    /// samples `u + s (c - u)` over its own and the next row's logits and writes the code to both;
+    /// the follower row (bit [`FOLLOW`]) samples nothing.
+    #[serde(default)]
+    pub pair_cfg: bool,
     pub tensors: Tensors,
 }
 
