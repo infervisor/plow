@@ -876,7 +876,30 @@ fn draft_dump(
             std::fs::write(d.join(format!("{name}.bin")), read(e, &name, 0, row)?)?;
         }
         // Sliding ring whole; full layer only the committed rows per head (the rest is unmapped).
-        for (l, kvh, row_bytes) in [(28usize, 0usize, 0usize), (29, 2, 512)] {
+        // `STEP_BENCH_DRAFT_DUMP_KV=<sliding layer>,<full layer>:<kv heads>:<head dim>` (default:
+        // the 26B-A4B assistant's 28 and 29:2:512; the 12B assistant is 46,47:1:512).
+        let spec =
+            std::env::var("STEP_BENCH_DRAFT_DUMP_KV").unwrap_or_else(|_| "28,29:2:512".into());
+        let kv_layers = spec
+            .split(',')
+            .map(|f| {
+                let bad = || {
+                    format!(
+                        "STEP_BENCH_DRAFT_DUMP_KV: {f:?} is not <layer> or <layer>:<heads>:<dim>"
+                    )
+                };
+                let v = f
+                    .split(':')
+                    .map(|x| x.parse::<usize>().map_err(|_| bad()))
+                    .collect::<Result<Vec<_>, _>>()?;
+                match v[..] {
+                    [l] => Ok((l, 0, 0)),
+                    [l, h, d] if h > 0 && d > 0 => Ok((l, h, d)),
+                    _ => Err(bad()),
+                }
+            })
+            .collect::<Result<Vec<_>, String>>()?;
+        for &(l, kvh, row_bytes) in &kv_layers {
             for (t, elt) in [("k", 1), ("v", 1), ("k_scale", 4), ("v_scale", 4)] {
                 let name = format!("kv.{l}.{t}");
                 let per = e.tensor_bytes(&name).ok_or("missing kv")? as usize / slots;
@@ -884,6 +907,10 @@ fn draft_dump(
                     read(e, &name, (b * per) as u64, per)?
                 } else {
                     let (head, row) = (per / kvh, if elt == 1 { row_bytes } else { 4 });
+                    if per % kvh != 0 || pos * row > head {
+                        let m = format!("{name}: {kvh} x {pos} rows x {row} B exceed {per} B/slot");
+                        return Err(m.into());
+                    }
                     let mut v = Vec::new();
                     for h in 0..kvh {
                         v.extend(read(e, &name, (b * per + h * head) as u64, pos * row)?);

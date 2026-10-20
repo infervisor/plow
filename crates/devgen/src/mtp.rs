@@ -86,8 +86,8 @@ impl DraftCfg {
             }
         };
         want(
-            v["model_type"] == "gemma4_assistant",
-            "model_type is not gemma4_assistant",
+            v["model_type"] == "gemma4_assistant" || v["model_type"] == "gemma4_unified_assistant",
+            "model_type is neither gemma4_assistant nor gemma4_unified_assistant",
         );
         want(
             v["use_ordered_embeddings"] != true,
@@ -165,6 +165,15 @@ impl DraftCfg {
                 && rp["full_attention"]["rope_theta"].as_f64() == Some(c.theta_full)
                 && rp["full_attention"]["partial_rotary_factor"].as_f64() == Some(c.rope_frac_full),
             "rope parameters differ from the target layers the draft reads",
+        );
+        want(
+            rp["full_attention"]["rope_type"] == "proportional"
+                && rp["sliding_attention"]["rope_type"] == "default"
+                && rp["sliding_attention"]["partial_rotary_factor"].as_f64().unwrap_or(1.0) == 1.0
+                && ["full_attention", "sliding_attention"]
+                    .iter()
+                    .all(|t| rp[*t]["factor"].as_f64().unwrap_or(1.0) == 1.0),
+            "rope types/scaling differ from the target's (proportional full, default sliding, unscaled)",
         );
         let reader = crate::checkpoint::TensorReader::open(&dir)
             .unwrap_or_else(|e| refuse(format!("draft checkpoint: {e}")));

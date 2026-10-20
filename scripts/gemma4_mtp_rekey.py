@@ -32,8 +32,8 @@ def main():
         sys.exit(__doc__)
     src, dst = sys.argv[1], sys.argv[2]
     cfg = json.load(open(os.path.join(src, "config.json")))
-    if cfg.get("model_type") != "gemma4_assistant":
-        sys.exit(f"{src}: model_type {cfg.get('model_type')!r} is not gemma4_assistant")
+    if cfg.get("model_type") not in ("gemma4_assistant", "gemma4_unified_assistant"):
+        sys.exit(f"{src}: model_type {cfg.get('model_type')!r} is not a Gemma-4 assistant")
     backbone = cfg["backbone_hidden_size"]
     path = os.path.join(src, "model.safetensors")
     with open(path, "rb") as f:
