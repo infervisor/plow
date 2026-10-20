@@ -1116,6 +1116,7 @@ impl SegmentMaker {
                     top_k: if self.top_k == 0 { c.top_k } else { self.top_k } as u32,
                     ras_temperature: bf16(1.0),
                     ras_top_p: bf16(0.9),
+                    repetition_penalty: 1.0,
                     semantic_base: c.audio_token_base,
                     stop_class: c.codebook,
                     stop_token: c.stops[0],

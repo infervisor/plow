@@ -121,6 +121,8 @@ pub fn arm_of(op: DevOp, i: &[u32; 8]) -> Arm {
             Some(format!("flags{:x}", i[4]))
         }
         DevOp::GemmWide if i[7] == GEMM_WIDE_C8_TAG => Some("tile128x384x64".into()),
+        // A bf16 prefill carrying a span table (encoder bidirectional rows): the PIPE=0 body.
+        DevOp::FlashPrefill if i[7] >> 16 != 0 => Some("span".into()),
         _ => None,
     };
     Arm {
@@ -828,6 +830,12 @@ fn features(union: &BTreeSet<Arm>) -> Map<String, Value> {
     // above, but a packet that only READS a pre-quantized cache (a resumed session, a prefix
     // shared between requests) has no writer in its stream, and the object it needs is exactly
     // the same one.
+    f.insert(
+        "prefill_span".into(),
+        json!(union
+            .iter()
+            .any(|a| a.op == "FlashPrefill" && a.variant.as_deref() == Some("span"))),
+    );
     f.insert(
         "fp8_kv".into(),
         json!(
@@ -1559,6 +1567,9 @@ fn backend_nvcc(f: &Map<String, Value>, t: &Map<String, Value>, s: &Shapes) -> V
     }
     if on("fp8_kv") {
         req.push("PLOW_FP8_KV=1".into());
+    }
+    if on("prefill_span") {
+        req.push("PLOW_NV_FA_PIPE=0".into());
     }
     if on("prefill") {
         req.push("PLOW_NV_PREFILL=1".into());

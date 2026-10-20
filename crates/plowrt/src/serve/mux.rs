@@ -565,6 +565,8 @@ pub struct DepthJob {
     pub top_k: u32,
     pub ras_temperature: f32,
     pub ras_top_p: f32,
+    /// HF repetition penalty on the backbone class (the Breeze sampler; 1.0 = none).
+    pub repetition_penalty: f32,
     /// Token of class `c < stop_class`: `semantic_base + c`; the stop class emits `stop_token`.
     pub semantic_base: u32,
     pub stop_class: u32,
@@ -583,7 +585,7 @@ impl DepthJob {
             top_p: self.top_p,
             top_k: self.top_k,
             ras_temperature: self.ras_temperature,
-            repetition_penalty: 1.0,
+            repetition_penalty: self.repetition_penalty,
             ras_top_p: self.ras_top_p,
         }
     }
@@ -4021,7 +4023,9 @@ fn run_one_tick(
                                 let t_emit =
                                     host_engine_call(t_call, feeds.len(), tokens_this_tick);
                                 decode_progress = completed_decode(&feeds, 1);
-                                if let Err(err) = gpu_depth_frames(&mut *e, &feeds, &mut slots, &mut toks) {
+                                if let Err(err) =
+                                    gpu_depth_frames(&mut *e, &feeds, &mut slots, &mut toks)
+                                {
                                     note_fault(&mut tick_fault, &err);
                                     fail_feeds(&mut slots, &feeds, &arena, &err);
                                 }
@@ -7341,7 +7345,10 @@ fn gpu_prefill_advance(
         e.fish_reset_slot(slot_idx)?;
         e.fish_logits_to_slot(slot_idx)?;
         let mut codes = Vec::new();
-        e.fish_depth_step(&[job.row(slot_idx, e.prefill_terminal_row(), 0)], &mut codes)?;
+        e.fish_depth_step(
+            &[job.row(slot_idx, e.prefill_terminal_row(), 0)],
+            &mut codes,
+        )?;
         let (tok, frame) = job.token(&codes);
         slot.frame = frame;
         return Ok(Some(tok));
@@ -8384,14 +8391,12 @@ fn flush_parked(slot_opt: &mut Option<Slot>, arena: &Option<SharedKvState>) -> b
         .saturating_sub(1)
         .min(slot.held.len());
     for (id, text, logprobs, frame) in slot.held.drain(..room) {
-        let _ = slot
-            .respond
-            .try_send(StreamChunk::Token {
-                id,
-                text,
-                logprobs,
-                frame,
-            });
+        let _ = slot.respond.try_send(StreamChunk::Token {
+            id,
+            text,
+            logprobs,
+            frame,
+        });
     }
     // PARK_TIMEOUT bounds a consumer that stopped reading, not one that reads slowly.
     if room > 0 && !slot.held.is_empty() {
@@ -10371,7 +10376,7 @@ mod tests {
                 session: None,
                 resume: 0,
                 lp: None,
-        frame: None,
+                frame: None,
                 prefix: None,
             }),
             rx,

@@ -278,6 +278,10 @@ pub(crate) struct Cfg {
     /// (`plow_head_rows`: a speech LM whose prompt text embeds from the full vocabulary but whose
     /// head covers only its audio tokens); 0: `vocab`.
     pub(crate) head_rows: u32,
+    /// `plow_encoder`: a bidirectional text encoder (Breeze's T5Gemma2): prefill attention sees
+    /// every key of its segment within the window on both sides, and the head projects every row
+    /// into `act.enc_out` (`[rows][head_rows]`) instead of the last row's logits.
+    pub(crate) encoder: bool,
     pub(crate) frame: Option<FrameEmbed>,
 }
 
@@ -362,8 +366,14 @@ pub(crate) fn cfg_from(dir: &Path) -> Cfg {
     // Breeze-style speech LM: prompt rows arrive as host overlay rows, generated frames embed as the
     // sum of their codebook rows (`EmbedFrameBf16` over a zero token table).
     if let Some(f) = v.get("plow_frame_embed") {
-        let g = |k: &str| f[k].as_u64().unwrap_or_else(|| panic!("plow_frame_embed.{k}")) as u32;
-        assert!(c.frame.is_none(), "plow_frame_embed and fish_s2 are exclusive");
+        let g = |k: &str| {
+            f[k].as_u64()
+                .unwrap_or_else(|| panic!("plow_frame_embed.{k}")) as u32
+        };
+        assert!(
+            c.frame.is_none(),
+            "plow_frame_embed and fish_s2 are exclusive"
+        );
         c.frame = Some(FrameEmbed {
             table: f["table"].as_str().expect("plow_frame_embed.table").into(),
             codebooks: g("codebooks"),
@@ -372,11 +382,24 @@ pub(crate) fn cfg_from(dir: &Path) -> Cfg {
             rows: g("rows"),
             div: f["div"].as_f64().map_or(1.0, |d| d as f32),
             depth: f.get("depth").map(|d| {
-                let u = |k: &str| d[k].as_u64().unwrap_or_else(|| panic!("plow_frame_embed.depth.{k}")) as u32;
-                let x = |k: &str| d[k].as_f64().unwrap_or_else(|| panic!("plow_frame_embed.depth.{k}"));
+                let u = |k: &str| {
+                    d[k].as_u64()
+                        .unwrap_or_else(|| panic!("plow_frame_embed.depth.{k}"))
+                        as u32
+                };
+                let x = |k: &str| {
+                    d[k].as_f64()
+                        .unwrap_or_else(|| panic!("plow_frame_embed.depth.{k}"))
+                };
                 let s = &d["rope_scaling"];
-                assert_eq!(s["rope_type"], "llama3", "plow_frame_embed.depth.rope_scaling");
-                let sx = |k: &str| s[k].as_f64().unwrap_or_else(|| panic!("depth.rope_scaling.{k}"));
+                assert_eq!(
+                    s["rope_type"], "llama3",
+                    "plow_frame_embed.depth.rope_scaling"
+                );
+                let sx = |k: &str| {
+                    s[k].as_f64()
+                        .unwrap_or_else(|| panic!("depth.rope_scaling.{k}"))
+                };
                 FishDepth {
                     layers: u("layers"),
                     hidden: u("hidden"),
@@ -522,6 +545,7 @@ fn cfg_gemma(v: &Value, flat: bool) -> Cfg {
         kv_shared: t["num_kv_shared_layers"].as_u64().unwrap_or(0) as u32,
         double_wide_mlp: t["use_double_wide_mlp"].as_bool().unwrap_or(false),
         head_rows: 0,
+        encoder: false,
         frame: None,
     };
     if c.moe {
@@ -632,7 +656,8 @@ fn cfg_gemma3(v: &Value) -> Cfg {
         ple: 0,
         kv_shared: 0,
         double_wide_mlp: false,
-        head_rows: 0,
+        head_rows: v["plow_head_rows"].as_u64().map_or(0, |r| r as u32),
+        encoder: v["plow_encoder"].as_bool().unwrap_or(false),
         frame: None,
     }
 }
@@ -719,6 +744,7 @@ fn cfg_llama_qwen(v: &Value, arch: Arch) -> Cfg {
         kv_shared: 0,
         double_wide_mlp: false,
         head_rows: v["plow_head_rows"].as_u64().map_or(0, |r| r as u32),
+        encoder: false,
         frame: v.get("fish_s2").map(|f| {
             let g = |k: &str| f[k].as_u64().unwrap_or_else(|| panic!("fish_s2.{k}")) as u32;
             FrameEmbed {
@@ -730,8 +756,12 @@ fn cfg_llama_qwen(v: &Value, arch: Arch) -> Cfg {
                 div: (1.0 / f["frame_scale"].as_f64().expect("fish_s2.frame_scale")) as f32,
                 depth: Some({
                     let d = &f["depth"];
-                    let u = |k: &str| d[k].as_u64().unwrap_or_else(|| panic!("fish_s2.depth.{k}")) as u32;
-                    let x = |k: &str| d[k].as_f64().unwrap_or_else(|| panic!("fish_s2.depth.{k}")) as f32;
+                    let u = |k: &str| {
+                        d[k].as_u64().unwrap_or_else(|| panic!("fish_s2.depth.{k}")) as u32
+                    };
+                    let x = |k: &str| {
+                        d[k].as_f64().unwrap_or_else(|| panic!("fish_s2.depth.{k}")) as f32
+                    };
                     assert!(d["qk_norm"] != true, "fish_s2.depth.qk_norm is unsupported");
                     FishDepth {
                         layers: u("layers"),
@@ -810,6 +840,7 @@ fn cfg_bert(v: &Value) -> Cfg {
         kv_shared: 0,
         double_wide_mlp: false,
         head_rows: 0,
+        encoder: false,
         frame: None,
     }
 }
@@ -884,6 +915,7 @@ fn cfg_modernbert(v: &Value) -> Cfg {
         kv_shared: 0,
         double_wide_mlp: false,
         head_rows: 0,
+        encoder: false,
         frame: None,
     }
 }

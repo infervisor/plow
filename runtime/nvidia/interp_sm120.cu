@@ -1755,11 +1755,13 @@ __device__ __forceinline__ void plow_exec(const PlowDevInst* in, void* const* T,
         if (in->i[6] == 256)
             /* t7 (sm_90a TMA only): GEN_TMAP_KV_PAIR blob for the wgmma arm's K/V stager;
              * TENSOR_NONE -> nullptr -> cp.async staging, packets stay byte-compatible. */
+            /* i7 = nsplit | span handle << 16 (an encoder's bidirectional rows; 0 = causal). */
             d_flash_prefill_mux<256, 64, PLOW_NV_FA256_BKV>(
                 (const int*)TEN(6), (float*)TEN(0), (float*)TEN(1), (const __nv_bfloat16*)TEN(2),
                 (const __nv_bfloat16*)TEN(3), (const __nv_bfloat16*)TEN(4), (__nv_bfloat16*)TEN(5),
-                in->i[0], in->i[1], in->i[2], in->i[3], in->i[4], in->i[5], in->i[7], in->fj[1].u,
-                in->fj[2].u, in->fj[0].f, slice, nblk, arena, TEN(7));
+                in->i[0], in->i[1], in->i[2], in->i[3], in->i[4], in->i[5], in->i[7] & 0xFFFFu,
+                in->fj[1].u, in->fj[2].u, in->fj[0].f, slice, nblk, arena, TEN(7),
+                in->i[7] >> 16 ? (const unsigned*)T[in->i[7] >> 16] : nullptr);
         else
 #endif
 #if !PLOW_NV_FA_ONLY_HD256_EXACT && !PLOW_NV_FA_ONLY_HD256_ONLY

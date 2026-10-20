@@ -1903,6 +1903,9 @@ struct Tn {
     mm_slab: u32,
     // Per prefill row, the rows after it in its bidirectional media span (`MmSpanExtent`).
     mm_span: u32,
+    /// Encoder mode: per-row bidirectional reach (FlashPrefill span tables) of the sliding and
+    /// the full layers, host-written per segment.
+    enc_span: [u32; 2],
     // Codec-frame input embedding: per-row frame codes and the codebook table (TENSOR_NONE: off).
     // Prefill reads host-written prompt rows; decode reads per-slot rows the depth stage writes.
     frame_codes: u32,
@@ -1975,6 +1978,8 @@ struct Tn {
     fu: u32,
     dg: u32,
     logits: u32,
+    /// Encoder mode: every prefill row through the head (`[rows][head_rows]` bf16).
+    enc_out: u32,
     amax: u32,
     // TP (n_gpu>1) peer-mapped partial slots: the row-parallel
     // o_proj/down write their partial H-vector here (tp-host binds them into peer_scratch),
@@ -2276,6 +2281,14 @@ fn declare(
         } else {
             TENSOR_NONE
         },
+        enc_span: if c.encoder {
+            [
+                b.tensor("in.enc.span_local", rows as u64 * I32),
+                b.tensor("in.enc.span_full", rows as u64 * I32),
+            ]
+        } else {
+            [TENSOR_NONE; 2]
+        },
         frame_codes: match &c.frame {
             Some(f) => b.tensor("in.frame_codes", u64::from(ctx * f.codebooks) * I32),
             None => TENSOR_NONE,
@@ -2497,6 +2510,11 @@ fn declare(
         // this is 512 KB, not the 2.1 GB a full-T lm_head would need at ctx=4096. Vocab-column-
         // sharded. BATCH>1 decode reads B rows (one per sequence), so *dbatch; dbatch==1 identical.
         logits: ac(b, "logits", (dbatch * vocab_sh) as u64 * BF16),
+        enc_out: if c.encoder {
+            ac(b, "enc_out", (rows * vocab_sh) as u64 * BF16)
+        } else {
+            TENSOR_NONE
+        },
         // Per-block argmax partials, one packed u64 each. Needs no zeroing between steps:
         // every block writes its own slot unconditionally. BATCH>1: [dbatch][AMAX_BLOCKS].
         // E5 PLOW_FUSE_ARGMAX: the fused lm_head epilogue (GemvArgmax) runs on all n_cu blocks,
@@ -5926,8 +5944,21 @@ fn emit_phase(
                     "bidirectional media spans need the fused FP8-KV prefill attention (PLOW_FP8_KV)"
                 );
                 n.mm_span
+            } else if c.encoder && !decode {
+                assert!(
+                    !fp8_kv && fused && ns == 1,
+                    "encoder attention needs the fused one-split bf16-KV prefill"
+                );
+                n.enc_span[usize::from(full)]
             } else {
                 0
+            };
+            // Encoder: keys `q - (window+1)/2 + 1 ..= q + span` (T5Gemma2's bidirectional local
+            // window); a full layer sees its whole segment.
+            let att_win = match (c.encoder && !decode, full) {
+                (true, true) => t,
+                (true, false) => c.window.div_ceil(2),
+                _ => win,
             };
             let fa_deps: Vec<u32> = if shared {
                 vec![c_qn]
@@ -5963,7 +5994,7 @@ fn emit_phase(
                 d.i[2] = heads;
                 d.i[3] = kvh;
                 d.i[4] = 0;
-                d.i[5] = win;
+                d.i[5] = att_win;
                 d.i[6] = hd;
                 d.i[7] = ns | span_attention << 16;
                 d.f[0] = c.attn_scale;
@@ -5980,7 +6011,7 @@ fn emit_phase(
         // the projections still run the full launch. The runtime binds each stage's tables by
         // position (`packed_prefill::stage_map`), which its validate proves.
         let stages = match stage_rows(c) {
-            Some(s) if !gemv_family && !decode && !full && !shared && !amd => {
+            Some(s) if !gemv_family && !decode && !full && !shared && !amd && !c.encoder => {
                 t.min(request_chunk(c.window)).div_ceil(s)
             }
             _ => 1,
@@ -7353,6 +7384,26 @@ fn emit_phase(
             Some("0") => false,
             _ => amd,
         };
+    // Encoder mode: the head projects every prefill row (Breeze's text_encoder_proj); no logits,
+    // no sampling.
+    if c.encoder && !decode {
+        let op = pick_tile(t, vocab_l, c.hidden, n_cu, kernelcaps::QuantScheme::None);
+        let tm = (tma_gemm && matches!(op, DevOp::Gemm | DevOp::GemmMed | DevOp::GemmSmall))
+            .then(|| (tmap(head_src, t, c.hidden), tmap(head_w, vocab_l, c.hidden)));
+        b.emit(op, all.clone(), &[c_f], |d| {
+            d.t[0] = n.enc_out;
+            d.t[1] = head_src;
+            d.t[2] = head_w;
+            d.i[0] = t;
+            d.i[1] = vocab_l;
+            d.i[2] = c.hidden;
+            if let Some((ma, mb)) = tm {
+                d.i[6] = ma;
+                d.i[7] = mb;
+            }
+        });
+        return;
+    }
     let (lm_m, lm_row0) = if decode { (t, 0) } else { (1, t - 1) };
     let lm_op = if gemv_family || pf_gemv_head {
         DevOp::Gemv
