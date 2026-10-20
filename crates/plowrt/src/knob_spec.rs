@@ -643,6 +643,7 @@ pub const RUNTIME: &[KnobSpec] = &[
     KnobSpec::new("rt.cfg_device", Some("PLOW_CFG_DEVICE"), Layer::Runtime, Domain::Bool, OFF, DIAG),
     KnobSpec::new("rt.decode_pipeline", Some("PLOW_DECODE_PIPELINE"), Layer::Runtime, Domain::Bool, UNSET, DIAG),
     KnobSpec::new("rt.spec", Some("PLOW_SPEC"), Layer::Runtime, Domain::Bool, OFF, OPT_IN),
+    KnobSpec::new("rt.spec_sampled", Some("PLOW_SPEC_SAMPLED"), Layer::Runtime, Domain::Bool, OFF, OPT_IN),
     KnobSpec::new("rt.vmm_prefix", Some("PLOW_VMM_PREFIX"), Layer::Runtime, Domain::Bool, UNSET, OPT_IN),
     KnobSpec::new("rt.vmm_live", Some("PLOW_VMM_LIVE"), Layer::Runtime, Domain::Bool, OFF, OPT_IN),
     KnobSpec::new("rt.vmm_live_rings", Some("PLOW_VMM_LIVE_RINGS"), Layer::Runtime, Domain::Bool, UNSET, OPT_IN),

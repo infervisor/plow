@@ -11,11 +11,13 @@ use std::path::Path;
 
 use crate::device::cuda::{KernelFn, PinnedHost};
 use crate::device::{Backend, DeviceMem, Module};
-use crate::orch::speculative::{accept_greedy, SpecSpanDev, SpecVerdict, SPEC_KMAX, SPEC_NO_STORE};
+use crate::orch::speculative::{
+    accept_greedy, accept_sampled, SpecSpanDev, SpecVerdict, SPEC_KMAX, SPEC_NO_STORE,
+};
 use crate::{Result, RuntimeError};
 
 use super::decode_rung::decode_selection;
-use super::GpuEngine;
+use super::{DevSample, GpuEngine};
 use packet::dev::{DevOp, TENSOR_NONE16};
 
 /// One sequence's verify span: `tokens[0]` is the slot's pending token (position `pos[slot]`),
@@ -23,6 +25,28 @@ use packet::dev::{DevOp, TENSOR_NONE16};
 pub struct SpecSpan<'a> {
     pub slot: usize,
     pub tokens: &'a [u32],
+    pub draw: SpecDraw,
+}
+
+/// How a span's verify rows choose their tokens: exactly as plain decode would for the row
+/// ([`accept_sampled`]).
+#[derive(Clone, Copy, Debug)]
+pub enum SpecDraw {
+    /// The verify launch's argmax (greedy, no penalties or bias).
+    Argmax,
+    /// `plow_sample` with these parameters, like plain device-sampled decode; `rng01` is unused
+    /// (row `j` draws [`SpecSampler::draws`]`[j]`).
+    Device(DevSample),
+    /// The host sampler over each row's downloaded logits ([`SpecSampler::host`]).
+    Host,
+}
+
+/// The request state sampled spans draw from (the engine holds none of it).
+pub trait SpecSampler {
+    /// Span `i`'s uniforms: `out[j]` is verify row `j`'s (`tokens` = the span's inputs).
+    fn draws(&mut self, i: usize, tokens: &[u32], out: &mut [f32]);
+    /// Span `i`'s token for verify row `j` from that row's logits (which it may modify).
+    fn host(&mut self, i: usize, tokens: &[u32], j: usize, logits: &mut [f32]) -> u32;
 }
 
 /// One FP8-KV store site's cache geometry (cache bytes `[slot][head][stride][hd]`, f32 scales
@@ -222,12 +246,14 @@ impl GpuEngine {
         self.debug_nsplit_kvlen = kvlen;
     }
 
-    /// Run the target over every span in one decode-rung launch and accept greedily.
-    /// Commits nothing: call [`Self::spec_commit`] per span with its verdict.
+    /// Run the target over every span in one decode-rung launch and accept each span by its
+    /// [`SpecDraw`] (`sampler` serves the non-argmax ones). Commits nothing: call
+    /// [`Self::spec_commit`] per span with its verdict.
     pub fn spec_verify(
         &mut self,
         spans: &[SpecSpan<'_>],
         stop: &[u32],
+        mut sampler: Option<&mut dyn SpecSampler>,
         verdicts: &mut Vec<SpecVerdict>,
     ) -> Result<()> {
         let reject = |m: String| Err(RuntimeError::Rejected(format!("spec_verify: {m}")));
@@ -255,6 +281,16 @@ impl GpuEngine {
             }
             if self.pos[sp.slot] as usize + k >= self.max_ctx {
                 return reject(format!("slot {}: context exhausted", sp.slot));
+            }
+            match sp.draw {
+                SpecDraw::Argmax => {}
+                SpecDraw::Device(_) if self.sampler.is_none() => {
+                    return reject(format!("slot {}: no device sampler", sp.slot));
+                }
+                _ if sampler.is_none() => {
+                    return reject(format!("slot {}: sampled span without draws", sp.slot));
+                }
+                _ => {}
             }
             rows += k + 1;
         }
@@ -328,8 +364,30 @@ impl GpuEngine {
             let stop_h: &mut [u32] = bytemuck::cast_slice_mut(s.stop.as_mut_slice());
             stop_h[..stop.len()].copy_from_slice(stop);
         }
+        // Every verify row's plain-decode draw when a span samples on the device; argmax and
+        // host rows take the greedy argmax (identical to the verify's own).
+        let mut dev_rows = Vec::new();
+        if spans
+            .iter()
+            .any(|sp| matches!(sp.draw, SpecDraw::Device(_)))
+        {
+            let sampler = sampler.as_deref_mut().expect("checked");
+            let mut u = [0f32; SPEC_KMAX + 1];
+            for (i, sp) in spans.iter().enumerate() {
+                let n = sp.tokens.len();
+                match sp.draw {
+                    SpecDraw::Device(d) => {
+                        sampler.draws(i, sp.tokens, &mut u[..n]);
+                        dev_rows.extend(u[..n].iter().map(|&rng01| DevSample { rng01, ..d }));
+                    }
+                    _ => dev_rows.extend(std::iter::repeat_n(DevSample::greedy(), n)),
+                }
+            }
+        }
         let n_spans = spans.len();
-        if let Err(e) = self.spec_submit(selection, launch_rows, rows, n_spans, stop.len()) {
+        if let Err(e) =
+            self.spec_submit(selection, launch_rows, rows, n_spans, stop.len(), &dev_rows)
+        {
             // Plain launches must not see the span map, and staging may still be in flight: only
             // a restore that drains cleanly clears the dirty flag.
             self.spec.as_mut().expect("checked").map_dirty = true;
@@ -342,28 +400,41 @@ impl GpuEngine {
         }
         let verdict_bytes = n_spans * std::mem::size_of::<SpecVerdict>();
         let s = self.spec.as_ref().expect("checked");
-        let dev: &[SpecVerdict] = bytemuck::cast_slice(&s.verdicts.as_slice()[..verdict_bytes]);
-        let argmax: &[i32] = bytemuck::cast_slice(&self.stage.section(0)[..rows * 4]);
-        let argmax: Vec<u32> = argmax.iter().map(|&t| t as u32).collect();
+        let dev: Vec<SpecVerdict> =
+            bytemuck::cast_slice(&s.verdicts.as_slice()[..verdict_bytes]).to_vec();
+        let ids: &[i32] = bytemuck::cast_slice(&self.stage.section(0)[..rows * 4]);
+        let ids: Vec<u32> = ids.iter().map(|&t| t as u32).collect();
         verdicts.clear();
+        let mut logits = Vec::new();
         let mut r = 0usize;
-        for (sp, v) in spans.iter().zip(dev) {
+        for (i, (sp, v)) in spans.iter().zip(&dev).enumerate() {
             let n = sp.tokens.len();
-            let gold = accept_greedy(
-                sp.tokens,
-                &argmax[r..r + n],
-                r as u32,
-                self.slot_generations[sp.slot],
-                stop,
-            );
-            if *v != gold {
-                return reject(format!(
-                    "device verdict {v:?} differs from the host golden {gold:?}"
-                ));
-            }
+            let req_gen = self.slot_generations[sp.slot];
+            let verdict = if let SpecDraw::Host = sp.draw {
+                // The device accepted the argmax; the host samples the rows it needs.
+                let sampler = sampler.as_deref_mut().expect("checked");
+                accept_sampled(
+                    sp.tokens,
+                    |j| {
+                        self.logits_row(r + j, &mut logits)?;
+                        Ok::<_, RuntimeError>(sampler.host(i, sp.tokens, j, &mut logits))
+                    },
+                    r as u32,
+                    req_gen,
+                    stop,
+                )?
+            } else {
+                let gold = accept_greedy(sp.tokens, &ids[r..r + n], r as u32, req_gen, stop);
+                if *v != gold {
+                    return reject(format!(
+                        "device verdict {v:?} differs from the host golden {gold:?}"
+                    ));
+                }
+                gold
+            };
             let hw = self.pos[sp.slot] + n as u32;
             self.kv_hw[sp.slot] = self.kv_hw[sp.slot].max(hw);
-            verdicts.push(*v);
+            verdicts.push(verdict);
             r += n;
         }
         let pending: Vec<Pending> = spans
@@ -381,7 +452,9 @@ impl GpuEngine {
         Ok(())
     }
 
-    /// Uploads, verify launch, identity restore, accept launch and read-backs, then the sync.
+    /// Uploads, verify launch, identity restore, the sampled rows' `plow_sample` (when
+    /// `dev_rows` is non-empty: one spec per verify row), accept launch and read-backs, then the
+    /// sync.
     fn spec_submit(
         &mut self,
         selection: super::decode_rung::DecodeSelection,
@@ -389,6 +462,7 @@ impl GpuEngine {
         rows: usize,
         n_spans: usize,
         n_stop: usize,
+        dev_rows: &[DevSample],
     ) -> Result<()> {
         // SAFETY: every pinned source lives on `self` past the stream synchronize below; each
         // copy is within its [batch]-sized tensor or buffer.
@@ -434,6 +508,11 @@ impl GpuEngine {
         // Plain launches after this one read the identity map again (stream order).
         self.spec_upload_identity()?;
         self.spec.as_mut().expect("checked").map_dirty = false;
+        if !dev_rows.is_empty() {
+            debug_assert_eq!(dev_rows.len(), rows);
+            // Overwrites `in.ids[..rows]` with each row's draw; the accept below reads them.
+            self.launch_sampler_rows(dev_rows)?;
+        }
         let s = self.spec.as_ref().expect("checked");
         let (f, _) = s.accept.as_ref().expect("checked");
         let mut a_ids = self.devp[self.t_ids].base;

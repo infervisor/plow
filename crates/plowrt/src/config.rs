@@ -1316,6 +1316,12 @@ pub struct NvidiaRuntimeConfig {
     #[arg(long = "spec", env = "PLOW_SPEC", value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", default_value_t = false, global = true)]
     pub spec: bool,
 
+    /// With `PLOW_SPEC`: sampled rows (temperature > 0, penalties, logit bias) draft too, and
+    /// each verify row is sampled exactly as plain decode would sample it (lossless rejection
+    /// sampling against the deterministic drafter). Off: such rows decode plainly in the verify.
+    #[arg(long = "spec-sampled", env = "PLOW_SPEC_SAMPLED", value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", default_value_t = false, global = true)]
+    pub spec_sampled: bool,
+
     /// VMM prefix reuse. Automatically enabled for eligible Hopper hybrid BF16-KV packets.
     #[arg(long = "vmm-prefix", env = "PLOW_VMM_PREFIX", value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
     pub vmm_prefix: Option<bool>,

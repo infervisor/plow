@@ -9,7 +9,7 @@ use std::time::Instant;
 use crate::orch::speculative::SpecVerdict;
 use crate::{Result, RuntimeError};
 
-use super::spec::SpecSpan;
+use super::spec::{SpecDraw, SpecSampler, SpecSpan};
 use super::GpuEngine;
 
 /// What a speculative tick may ask of this engine.
@@ -24,11 +24,13 @@ pub struct SpecLimits {
 }
 
 /// One row of a speculative tick: `k = 0` decodes the pending token plainly inside the verify.
+/// `draw` picks the row's tokens (a non-argmax row with `k = 0` is one plain sampled step).
 #[derive(Clone, Copy, Debug)]
 pub struct SpecRow {
     pub slot: usize,
     pub token: u32,
     pub k: u32,
+    pub draw: SpecDraw,
 }
 
 /// A tick's outcome, per row in request order: the verdict and the verify row of its pending
@@ -81,7 +83,14 @@ impl GpuEngine {
     /// Draft `k` tokens for every row with `k > 0` (each needs [`Self::spec_draft_ready`]),
     /// verify every row's span in one launch, commit each verdict and save the hidden each new
     /// pending token came from. A failure before the verify leaves every slot as it was.
-    pub fn spec_tick(&mut self, rows: &[SpecRow], stop: &[u32], out: &mut SpecTick) -> Result<()> {
+    /// `sampler` serves the rows that do not take the argmax (span index = row index).
+    pub fn spec_tick(
+        &mut self,
+        rows: &[SpecRow],
+        stop: &[u32],
+        sampler: Option<&mut dyn SpecSampler>,
+        out: &mut SpecTick,
+    ) -> Result<()> {
         out.verdicts.clear();
         out.committed = 0;
         if self.pipe_busy() {
@@ -130,12 +139,13 @@ impl GpuEngine {
             spans.push(SpecSpan {
                 slot: r.slot,
                 tokens: &out.tokens[at..at + n],
+                draw: r.draw,
             });
             at += n;
         }
         out.rows = at;
         let t = Instant::now();
-        self.spec_verify(&spans, stop, &mut out.verdicts)?;
+        self.spec_verify(&spans, stop, sampler, &mut out.verdicts)?;
         out.verify_ms = t.elapsed().as_secs_f64() * 1e3;
         for (sp, v) in spans.iter().zip(&out.verdicts) {
             let pos = self.pos[sp.slot] + u32::from(v.n_emit);

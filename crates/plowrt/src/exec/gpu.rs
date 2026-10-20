@@ -3620,7 +3620,7 @@ struct PackedTokenReq<'a> {
 /// spec array can carry greedy and stochastic rows together. `rng01` is the
 /// request's per-step uniform draw (`serve::seeded_unit_with`), so a fixed seed is
 /// reproducible.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 pub struct DevSample {
     pub temp: f32,
     pub top_k: i32,

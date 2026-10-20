@@ -83,6 +83,21 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             "--spec-k" => spec.k = args.next().ok_or("--spec-k K")?.parse()?,
             "--spec-rung" => spec.rung = args.next().ok_or("--spec-rung R")?.parse()?,
             "--spec-poison" => spec.poison = true,
+            // `--spec-sample T,TOP_K,TOP_P,MIN_P`: sampled verify (see spec_bench); `--spec-host`
+            // samples the verify rows on the host instead of with `plow_sample`.
+            "--spec-sample" => {
+                let v: Vec<f32> = args
+                    .next()
+                    .ok_or("--spec-sample T,TOP_K,TOP_P,MIN_P")?
+                    .split(',')
+                    .map(str::parse)
+                    .collect::<Result<_, _>>()?;
+                let [temp, top_k, top_p, min_p] = v[..] else {
+                    return Err("--spec-sample T,TOP_K,TOP_P,MIN_P".into());
+                };
+                spec.sample = Some((temp, top_k as usize, top_p, min_p));
+            }
+            "--spec-host" => spec.host = true,
             // `--prompt-tokens FILE`: JSON array of token-id prompts; slot b takes prompt b mod n,
             // which must hold at least CTX tokens (truncated to CTX).
             "--prompt-tokens" => prompt_file = Some(args.next().ok_or("--prompt-tokens FILE")?),
@@ -769,6 +784,48 @@ struct SpecArgs {
     poison: bool,
     nsplit_kvlen: Option<u32>,
     draft_iters: usize,
+    sample: Option<(f32, usize, f32, f32)>,
+    host: bool,
+}
+
+/// `--spec-sample`'s draws: slot `b`'s uniform for output token `i` (the `seeded_unit_with` grid),
+/// and each verify row's host sample for the device-vs-host check.
+#[cfg(feature = "cuda")]
+struct BenchSampler {
+    params: plowrt::text::sample::SamplingParams,
+    /// Per span: (slot, tokens it has emitted).
+    spans: Vec<(usize, usize)>,
+    prior: Vec<u32>,
+}
+
+#[cfg(feature = "cuda")]
+fn bench_unit(b: usize, i: usize) -> f32 {
+    let mut h = 0x9E37_79B9_7F4A_7C15u64 ^ ((b as u64) << 32 | i as u64);
+    h = (h ^ (h >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    h = (h ^ (h >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    ((h ^ (h >> 31)) % 10_000) as f32 / 10_000.0
+}
+
+#[cfg(feature = "cuda")]
+impl plowrt::exec::gpu::spec::SpecSampler for BenchSampler {
+    fn draws(&mut self, i: usize, _: &[u32], out: &mut [f32]) {
+        let (b, at) = self.spans[i];
+        for (j, u) in out.iter_mut().enumerate() {
+            *u = bench_unit(b, at + j);
+        }
+    }
+
+    fn host(&mut self, i: usize, tokens: &[u32], j: usize, logits: &mut [f32]) -> u32 {
+        let (b, at) = self.spans[i];
+        plowrt::orch::speculative::host_row_sample(
+            logits,
+            &self.params,
+            &[],
+            &tokens[1..=j],
+            bench_unit(b, at + j),
+            &mut self.prior,
+        )
+    }
 }
 
 #[cfg(feature = "cuda")]
@@ -948,8 +1005,12 @@ fn draft_dump(
 /// `spec_commit` with drafts from MODE: `oracle` (the reference's next tokens, all accepted),
 /// `adversarial` (every draft wrong, all rejected), `ngram` (prompt lookup over each slot's
 /// history). `--spec-poison` NaN-fills every row a verify will write before it runs, and every
-/// uncommitted row after it. Prints
-/// `SPEC_IDENTITY ok|MISMATCH` and the verify cost.
+/// uncommitted row after it. `--spec-sample T,TOP_K,TOP_P,MIN_P` makes the reference a plain
+/// sampled run (`plow_sample`, or the host sampler with `--spec-host`; draw `bench_unit(slot, i)`
+/// for token `i`) and samples the verify rows with plain decode's sampler and draws, so the
+/// streams must still match; each
+/// device-sampled verdict is also recomputed on the host from the downloaded verify logits
+/// (`SPEC_SAMPLE_HOST`). Prints `SPEC_IDENTITY ok|MISMATCH` and the verify cost.
 #[cfg(feature = "cuda")]
 #[allow(clippy::too_many_arguments)]
 fn spec_bench(
@@ -962,7 +1023,7 @@ fn spec_bench(
     base: usize,
     steps: usize,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    use plowrt::exec::gpu::spec::SpecSpan;
+    use plowrt::exec::gpu::spec::{SpecDraw, SpecSpan};
     use plowrt::orch::speculative::ngram_propose;
     use std::time::Instant;
     let slots = last.len();
@@ -979,14 +1040,69 @@ fn spec_bench(
     for b in 0..slots {
         e.snapshot_slot(b)?;
     }
-    // Reference: plain greedy decode at the fixed rung.
+    let dev = a
+        .sample
+        .map(|(temp, top_k, top_p, min_p)| plowrt::exec::gpu::DevSample {
+            temp,
+            top_k: top_k as i32,
+            top_p,
+            min_p,
+            rng01: 0.0,
+        });
+    if dev.is_some() && !e.dev_sample_enabled() {
+        return Err("--spec-sample needs the device sampler (sample_sm120.cubin)".into());
+    }
+    let mut sampler = BenchSampler {
+        params: plowrt::text::sample::SamplingParams {
+            temperature: dev.map_or(0.0, |d| d.temp),
+            top_k: dev.map_or(0, |d| d.top_k as usize),
+            top_p: dev.map_or(1.0, |d| d.top_p),
+            min_p: dev.map_or(0.0, |d| d.min_p),
+            ..Default::default()
+        },
+        spans: Vec::new(),
+        prior: Vec::new(),
+    };
+    let draw = match dev {
+        None => SpecDraw::Argmax,
+        Some(_) if a.host => SpecDraw::Host,
+        Some(d) => SpecDraw::Device(d),
+    };
+    let mut logits = Vec::new();
+    // Reference: plain decode (greedy, device-sampled, or host-sampled) at the fixed rung.
     let mut cur = last.to_vec();
     let mut reference = vec![Vec::with_capacity(steps); slots];
     let feeds = |cur: &[u32]| -> Vec<(usize, u32)> { cur.iter().copied().enumerate().collect() };
     let mut toks = Vec::new();
+    let mut specs = vec![plowrt::exec::gpu::DevSample::greedy(); e.batch()];
     let t0 = Instant::now();
-    for _ in 0..steps {
-        e.step_slots(&feeds(&cur), &mut toks)?;
+    for i in 0..steps {
+        if let Some(d) = dev {
+            for (b, s) in specs.iter_mut().enumerate().take(slots) {
+                *s = plowrt::exec::gpu::DevSample {
+                    rng01: bench_unit(b, i),
+                    ..d
+                };
+            }
+        }
+        if a.host && dev.is_some() {
+            // `--spec-host`'s reference is plain host-sampled decode.
+            e.step_slots(&feeds(&cur), &mut toks)?;
+            for (b, t) in toks.iter_mut().enumerate() {
+                e.logits_row(b, &mut logits)?;
+                let u = bench_unit(b, i);
+                *t = plowrt::orch::speculative::host_row_sample(
+                    &mut logits,
+                    &sampler.params,
+                    &[],
+                    &[],
+                    u,
+                    &mut sampler.prior,
+                );
+            }
+        } else {
+            e.step_slots_sampled(&feeds(&cur), dev.map(|_| specs.as_slice()), &mut toks)?;
+        }
         for (b, &t) in toks.iter().enumerate() {
             reference[b].push(t);
         }
@@ -1014,6 +1130,7 @@ fn spec_bench(
     let mut hrow: Vec<Option<u32>> = vec![None; slots];
     let mut mtp = Vec::new();
     let mut draft_ms = 0f64;
+    let (mut host_rows, mut host_spans, mut host_mismatch) = (0usize, 0usize, 0usize);
     if mode == "mtp" {
         e.spec_draft_enable(assets)?;
     }
@@ -1059,8 +1176,13 @@ fn spec_bench(
             .map(|&b| SpecSpan {
                 slot: b,
                 tokens: &inputs[b],
+                draw,
             })
             .collect();
+        sampler.spans.clear();
+        sampler
+            .spans
+            .extend(live.iter().map(|&b| (b, out[b].len())));
         if a.poison {
             // Every row this launch writes holds NaN first: a row read before its own span's
             // store lands (a missing intra-span dependency) poisons the output.
@@ -1070,8 +1192,31 @@ fn spec_bench(
             }
         }
         let t = Instant::now();
-        e.spec_verify(&spans, &[], &mut verdicts)?;
+        e.spec_verify(&spans, &[], Some(&mut sampler), &mut verdicts)?;
         verify_ms += t.elapsed().as_secs_f64() * 1e3;
+        if let SpecDraw::Device(_) = draw {
+            use plowrt::exec::gpu::spec::SpecSampler;
+            let mut r = 0u32;
+            for (i, (sp, v)) in spans.iter().zip(&verdicts).enumerate() {
+                let host = plowrt::orch::speculative::accept_sampled(
+                    sp.tokens,
+                    |j| {
+                        e.logits_row(r as usize + j, &mut logits)?;
+                        host_rows += 1;
+                        Ok::<_, plowrt::RuntimeError>(sampler.host(i, sp.tokens, j, &mut logits))
+                    },
+                    r,
+                    v.req_gen,
+                    &[],
+                )?;
+                host_spans += 1;
+                if host != *v {
+                    host_mismatch += 1;
+                    println!("  slot {}: device {v:?} vs host {host:?}", sp.slot);
+                }
+                r += sp.tokens.len() as u32;
+            }
+        }
         ticks += 1;
         n_spans += spans.len();
         for (sp, v) in spans.iter().zip(&verdicts) {
@@ -1088,6 +1233,11 @@ fn spec_bench(
             pending[sp.slot] = emitted[n - 1];
             hrow[sp.slot] = Some(v.hrow);
         }
+    }
+    if let SpecDraw::Device(_) = draw {
+        println!(
+            "SPEC_SAMPLE_HOST spans={host_spans} rows={host_rows} verdict_mismatch={host_mismatch}"
+        );
     }
     let mut ok = true;
     for b in 0..slots {
@@ -1109,12 +1259,18 @@ fn spec_bench(
     };
     println!(
         "SPEC_IDENTITY {} mode={mode} slots={slots} k={} rung={} base={base} steps={steps} \
-         poison={} ref_fnv={:016x} spec_fnv={:016x} ticks={ticks} drafted={drafted} accepted={accepted} \
+         poison={} sample={:?} draw={} ref_fnv={:016x} spec_fnv={:016x} ticks={ticks} drafted={drafted} accepted={accepted} \
          mean_emit={:.3} plain_ms={plain_ms:.3} verify_ms={:.3} draft_ms={:.3}",
         if ok { "ok" } else { "MISMATCH" },
         a.k,
         a.rung,
         a.poison,
+        a.sample,
+        match draw {
+            SpecDraw::Argmax => "argmax",
+            SpecDraw::Device(_) => "device",
+            SpecDraw::Host => "host",
+        },
         digest(&reference),
         digest(&out),
         (steps * slots) as f64 / n_spans as f64,

@@ -8007,6 +8007,81 @@ fn gpu_spec_draftable(p: &crate::text::sample::SamplingParams) -> bool {
         && p.logit_bias.is_empty()
 }
 
+/// Rows that draft: greedy ones, and with `PLOW_SPEC_SAMPLED` every row without logprobs.
+#[cfg(feature = "cuda")]
+fn gpu_spec_drafts(p: &crate::text::sample::SamplingParams) -> bool {
+    gpu_spec_draftable(p)
+        || (crate::config::RuntimeConfig::get().nv.spec_sampled && p.logprobs.is_none())
+}
+
+/// How a drafting row's verify rows choose tokens: plain decode's own sampler and draws for the
+/// row (device `plow_sample` where plain decode samples on the device, else the host sampler
+/// with the penalties over the row's history and the span's drafts).
+#[cfg(feature = "cuda")]
+fn gpu_spec_draw(e: &crate::exec::gpu::GpuEngine, s: &Slot) -> crate::exec::gpu::spec::SpecDraw {
+    use crate::exec::gpu::spec::SpecDraw;
+    if gpu_spec_draftable(&s.gen.params) {
+        return SpecDraw::Argmax;
+    }
+    match dev_sample_spec(s).filter(|_| e.dev_sample_enabled()) {
+        Some(d) => SpecDraw::Device(d),
+        None => SpecDraw::Host,
+    }
+}
+
+/// Plain decode's draws for the verify rows of sampled spans (span `i` = `rows[i]`).
+#[cfg(feature = "cuda")]
+struct SlotSpecSampler<'a> {
+    slots: &'a [Option<Slot>],
+    rows: &'a [crate::exec::gpu::SpecRow],
+    prior: Vec<u32>,
+    /// The last host span's draws, so its rows hash the history once.
+    host_draws: Option<(usize, [f32; crate::orch::speculative::SPEC_KMAX + 1])>,
+}
+
+#[cfg(feature = "cuda")]
+impl SlotSpecSampler<'_> {
+    fn slot(&self, i: usize) -> &Slot {
+        self.slots[self.rows[i].slot].as_ref().expect("fed slot")
+    }
+}
+
+#[cfg(feature = "cuda")]
+impl crate::exec::gpu::spec::SpecSampler for SlotSpecSampler<'_> {
+    fn draws(&mut self, i: usize, tokens: &[u32], out: &mut [f32]) {
+        let s = self.slot(i);
+        crate::serve::seeded_units_ext(
+            &s.prompt_ids,
+            &s.out_ids,
+            &tokens[1..],
+            s.step,
+            s.gen.seed,
+            out,
+        );
+    }
+
+    fn host(&mut self, i: usize, tokens: &[u32], j: usize, logits: &mut [f32]) -> u32 {
+        let u = match self.host_draws {
+            Some((at, u)) if at == i => u,
+            _ => {
+                let mut u = [0f32; crate::orch::speculative::SPEC_KMAX + 1];
+                self.draws(i, tokens, &mut u[..tokens.len()]);
+                self.host_draws = Some((i, u));
+                u
+            }
+        };
+        let s = self.slots[self.rows[i].slot].as_ref().expect("fed slot");
+        crate::orch::speculative::host_row_sample(
+            logits,
+            &s.gen.params,
+            &s.out_ids,
+            &tokens[1..=j],
+            u[j],
+            &mut self.prior,
+        )
+    }
+}
+
 /// Per fed row, the most drafts a speculative tick may give it (0 = it rides the verify as a
 /// plain row, sampled on the host when it needs to be). `None` when a row cannot ride a verify
 /// at all (CFG pairs, speech rows). `ready` = the drafter holds the row's hidden.
@@ -8032,7 +8107,7 @@ fn gpu_spec_caps(
             .saturating_sub(s.step)
             .saturating_sub(1);
         let room = e.max_ctx().saturating_sub(e.slot_pos(i) + 1);
-        let cap = if gpu_spec_draftable(&s.gen.params) && (!ready || e.spec_draft_ready(i)) {
+        let cap = if gpu_spec_drafts(&s.gen.params) && (!ready || e.spec_draft_ready(i)) {
             (kmax as usize).min(left).min(room) as u32
         } else {
             0
@@ -8082,8 +8157,9 @@ fn gpu_spec_plan(
 
 /// One speculative decode tick over `feeds` (no prefill this tick, decode pipeline drained):
 /// draft, verify, commit, then stream each row's tokens through the same funnel plain decode
-/// uses. Greedy rows emit their accepted drafts plus the verify token; other rows take their
-/// one token from the verify row's logits like a plain step. `false` leaves the tick to the
+/// uses. Drafting rows emit their accepted drafts plus the verify row's token (argmax, or the
+/// plain-decode sample with `PLOW_SPEC_SAMPLED`); other rows take their one token from the
+/// verify row's logits like a plain step. `false` leaves the tick to the
 /// plain path (speculation does not pay, or the engine refused before touching any slot).
 #[cfg(feature = "cuda")]
 #[allow(clippy::too_many_arguments)]
@@ -8111,13 +8187,33 @@ fn gpu_spec_tick(
     }
     let mut ks = Vec::with_capacity(feeds.len());
     crate::sched::spec::SpecPolicy::depths(&caps, plan, &mut ks);
+    // `None`: the row rides the verify as a plain step finished on the host.
+    let draws: Vec<Option<crate::exec::gpu::spec::SpecDraw>> = feeds
+        .iter()
+        .map(|&(i, _)| {
+            let s = slots[i].as_ref().expect("fed slot");
+            gpu_spec_drafts(&s.gen.params).then(|| gpu_spec_draw(e, s))
+        })
+        .collect();
     let rows: Vec<SpecRow> = feeds
         .iter()
         .zip(&ks)
-        .map(|(&(slot, token), &k)| SpecRow { slot, token, k })
+        .zip(&draws)
+        .map(|((&(slot, token), &k), d)| SpecRow {
+            slot,
+            token,
+            k,
+            draw: d.unwrap_or(crate::exec::gpu::spec::SpecDraw::Argmax),
+        })
         .collect();
     let mut out = SpecTick::default();
-    if let Err(err) = e.spec_tick(&rows, stop, &mut out) {
+    let mut sampler = SlotSpecSampler {
+        slots,
+        rows: &rows,
+        prior: Vec::new(),
+        host_draws: None,
+    };
+    if let Err(err) = e.spec_tick(&rows, stop, Some(&mut sampler), &mut out) {
         // A refusal that committed nothing leaves every slot as it was: the plain path serves the tick.
         if matches!(err, crate::RuntimeError::Rejected(_)) && out.committed == 0 {
             tracing::warn!(error = %err, "spec tick refused; plain step");
@@ -8141,14 +8237,9 @@ fn gpu_spec_tick(
             p.observe_draft(out.draft_rows, out.draft_k, out.draft_ms);
         }
     }
-    for ((r, &row0), v) in rows.iter().zip(&out.row0).zip(&out.verdicts) {
+    for (((r, &row0), v), draw) in rows.iter().zip(&out.row0).zip(&out.verdicts).zip(&draws) {
         let i = r.slot;
-        let Some((greedy, logprobs)) = slots[i].as_ref().map(|s| {
-            (
-                gpu_spec_draftable(&s.gen.params),
-                s.gen.params.logprobs.is_some(),
-            )
-        }) else {
+        let Some(logprobs) = slots[i].as_ref().map(|s| s.gen.params.logprobs.is_some()) else {
             continue;
         };
         if r.k > 0 {
@@ -8157,7 +8248,7 @@ fn gpu_spec_tick(
                 p.observe_verdict(r.k, u32::from(v.n_acc));
             }
         }
-        if !greedy {
+        if draw.is_none() {
             gpu_finish_and_emit_token(
                 e,
                 row0 as usize,
@@ -8174,7 +8265,7 @@ fn gpu_spec_tick(
             );
             continue;
         }
-        // Emitted token `j` is the argmax of verify row `row0 + j`.
+        // Emitted token `j` is verify row `row0 + j`'s argmax or plain-decode sample.
         for (j, &token) in v.tokens[..usize::from(v.n_emit)].iter().enumerate() {
             if slots[i].is_none() {
                 break;
