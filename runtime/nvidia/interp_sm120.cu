@@ -259,9 +259,13 @@ extern "C" __device__ __constant__ unsigned plow_pf_fp8_request_abi = 1;
 #endif
 #include "op_norm.cuh"
 #include "op_gemm.cuh"
-#if defined(PLOW_NV_HOPPER) && !PLOW_NV_PREFILL
+#if !PLOW_NV_PREFILL
 #include "op_gemv_k8_sm90.cuh"
 #if PLOW_NV_GEMV_K8
+/* The walks that take it: Gemv (1), GemvGlu (2), GemvQkv (4). */
+#ifndef PLOW_NV_GEMV_K8_OPS
+#define PLOW_NV_GEMV_K8_OPS 7u
+#endif
 /* Widest activation rung the K-split walk takes: the decode object holds rungs <= 4 (1-tile arm
  * only), the _gw object 8..32. */
 #ifndef PLOW_NV_GEMV_K8_MAX_GW
@@ -1060,7 +1064,7 @@ static_assert(PLOW_NV_GEMV_STAGING_BYTES <= PLOW_NV_BASE_ARENA_FLOATS * sizeof(f
 #endif
 /* The K-split GEMV's reduction (op_gemv_k8_sm90.cuh) runs on the narrow claim: NW=2 x 8 split
  * slots x 128 floats per 8-row activation tile. */
-#if defined(PLOW_NV_HOPPER) && !PLOW_NV_PREFILL && PLOW_NV_GEMV_K8
+#if !PLOW_NV_PREFILL && PLOW_NV_GEMV_K8
 #define PLOW_NV_K8_ARENA_FLOATS (2u * 8u * 128u * ((PLOW_NV_GEMV_K8_MAX + 7u) / 8u))
 #else
 #define PLOW_NV_K8_ARENA_FLOATS 0u
@@ -2191,8 +2195,9 @@ __device__ __forceinline__ void plow_exec(const PlowDevInst* in, void* const* T,
                        (__nv_bfloat16*)arena);
             break;
         }
-#if defined(PLOW_NV_HOPPER) && !PLOW_NV_PREFILL && PLOW_NV_GEMV_K8
-        if (in->i[0] >= PLOW_NV_GEMV_K8_MIN && in->i[0] <= PLOW_NV_GEMV_K8_MAX && !TEN(7) && k8_split(in->i[1], in->i[2], nblk)) {
+#if !PLOW_NV_PREFILL && PLOW_NV_GEMV_K8
+        if ((PLOW_NV_GEMV_K8_OPS & 1u) && in->i[0] >= PLOW_NV_GEMV_K8_MIN && in->i[0] <= PLOW_NV_GEMV_K8_MAX && !TEN(7) &&
+            k8_split(in->i[1], in->i[2], nblk)) {
             const K8Mats mats{{(const __nv_bfloat16*)TEN(2), nullptr, nullptr},
                               {(__nv_bfloat16*)TEN(0), nullptr, nullptr}, {in->i[1], 0u, 0u}};
             PLOW_NV_K8_CALL(1, mats, (const __nv_bfloat16*)TEN(1) + (size_t)in->i[4] * in->i[2], 0u);
@@ -2303,8 +2308,9 @@ __device__ __forceinline__ void plow_exec(const PlowDevInst* in, void* const* T,
 
     /* Kernel arg order is (Nq, Nk, Nv, K): K lives in i2 but is passed LAST. */
     case PLOW_DOP_GEMV_QKV:
-#if defined(PLOW_NV_HOPPER) && !PLOW_NV_PREFILL && PLOW_NV_GEMV_K8
-        if (in->i[0] >= PLOW_NV_GEMV_K8_MIN && in->i[0] <= PLOW_NV_GEMV_K8_MAX && !(in->i[5] && in->i[6] && in->i[7]) &&
+#if !PLOW_NV_PREFILL && PLOW_NV_GEMV_K8
+        if ((PLOW_NV_GEMV_K8_OPS & 4u) && in->i[0] >= PLOW_NV_GEMV_K8_MIN && in->i[0] <= PLOW_NV_GEMV_K8_MAX &&
+            !(in->i[5] && in->i[6] && in->i[7]) &&
             k8_split(in->i[1] + in->i[3] + in->i[4], in->i[2], nblk)) {
             const K8Mats mats{{(const __nv_bfloat16*)TEN(2), (const __nv_bfloat16*)TEN(4),
                                (const __nv_bfloat16*)TEN(6)},
@@ -2451,8 +2457,9 @@ __device__ __forceinline__ void plow_exec(const PlowDevInst* in, void* const* T,
             }
         }
 #endif
-#if defined(PLOW_NV_HOPPER) && !PLOW_NV_PREFILL && PLOW_NV_GEMV_K8
-        if (in->i[0] >= PLOW_NV_GEMV_K8_MIN && in->i[0] <= PLOW_NV_GEMV_K8_MAX && k8_split(in->i[1], in->i[2], nblk)) {
+#if !PLOW_NV_PREFILL && PLOW_NV_GEMV_K8
+        if ((PLOW_NV_GEMV_K8_OPS & 2u) && in->i[0] >= PLOW_NV_GEMV_K8_MIN && in->i[0] <= PLOW_NV_GEMV_K8_MAX &&
+            k8_split(in->i[1], in->i[2], nblk)) {
             const K8Mats mats{{(const __nv_bfloat16*)TEN(2), (const __nv_bfloat16*)TEN(5), nullptr},
                               {(__nv_bfloat16*)TEN(0), nullptr, nullptr}, {in->i[1], 0u, 0u}};
             PLOW_NV_K8_CALL(2, mats, (const __nv_bfloat16*)TEN(1), in->i[5]);

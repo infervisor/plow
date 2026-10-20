@@ -1291,6 +1291,20 @@ fn tuning(s: &Shapes, arch: &str) -> Map<String, Value> {
     {
         t.insert("gemv_mma_b1".into(), json!(1));
     }
+    // * `gemv_k8_ops` (PLOW_NV_GEMV_K8_OPS opt-in): rungs 2..16 of those walks take the K-split
+    //   walk (op_gemv_k8_sm90.cuh, mma.sync only), which streams on ceil(N / 170) rows per block
+    //   where gvmma_partition leaves 42 blocks idle. Qwen3-ASR 1.7B rtx-5090 ctx 1024 B=1/4/16/32,
+    //   Gemv + GemvQkv (5): 2.707/3.022/4.026/5.394 -> 2.733/2.893/3.819/5.399 ms, token digests
+    //   unchanged; the 0.6B loses (B=16 +2.3%: N=1024 is 7 rows a block, the mma half empty).
+    if arch == "sm_120a"
+        && s.moe_down_inter == 0
+        && s.decode_batch >= 2
+        && s.decode_gemv_k.iter().all(|k| k % 32 == 0)
+    {
+        if let Some(v) = crate::emit_config::active().nv_gemv_k8_ops {
+            t.insert("gemv_k8_ops".into(), json!(v));
+        }
+    }
     if sm90a && crate::emit_config::active().w8a8 && crate::emit_config::active().decode_cublaslt {
         t.insert("fp8_lt_decode".into(), json!(true));
     }
@@ -3159,6 +3173,15 @@ pub fn config_header(manifest: &Value) -> String {
             out.push_str(&format!(
                 "#ifndef PLOW_NV_GEMV_PF_OPS\n#define PLOW_NV_GEMV_PF_OPS {v}u\n#endif\n"
             ));
+        }
+        if manifest.get("arch").and_then(Value::as_str) == Some("sm_120a") {
+            if let Some(v) = t.get("gemv_k8_ops").and_then(Value::as_u64) {
+                out.push_str(&format!(
+                    "#if !PLOW_NV_SPEECH && !PLOW_NV_PREFILL\n#ifndef PLOW_NV_GEMV_K8\n#define PLOW_NV_GEMV_K8 1\n#endif\n\
+                     #ifndef PLOW_NV_GEMV_K8_OPS\n#define PLOW_NV_GEMV_K8_OPS {v}u\n#endif\n\
+                     #ifndef PLOW_NV_GEMV_K8_MAX\n#define PLOW_NV_GEMV_K8_MAX 16\n#endif\n#endif\n"
+                ));
+            }
         }
         if manifest.get("arch").and_then(Value::as_str) == Some("sm_90a") {
             if let Some(ks) = t.get("xreg_k").and_then(Value::as_array) {

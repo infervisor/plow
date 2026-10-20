@@ -1201,6 +1201,11 @@ pub struct EmitConfig {
     #[arg(long, env = "PLOW_NV_GEMV_PF_OPS")]
     pub nv_gemv_pf_ops: Option<u32>,
 
+    /// sm_120a decode: the walks that take the K-split GEMV (`gemv_k8_ops`) at rungs 2..16: Gemv
+    /// 1, GemvGlu 2, GemvQkv 4. Unset = the mma walks only.
+    #[arg(long, env = "PLOW_NV_GEMV_K8_OPS")]
+    pub nv_gemv_k8_ops: Option<u32>,
+
     /// Isolate compatible MXFP4 grouped-MoE Down+Combine prefill boundaries for the standalone
     /// deterministic stage-2 object. Default on; `=0` is the rollback to the interpreter route.
     #[arg(long, env = "PLOW_MOE_STAGE2_LEAN", default_value_t = true, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
@@ -1757,6 +1762,7 @@ impl EmitConfig {
             kda_decode_fused_arm: env_bool("PLOW_KDA_DECODE_FUSED_ARM"),
             gemv_prefetch: env_bool("PLOW_GEMV_PREFETCH"),
             nv_gemv_pf_ops: env_u32("PLOW_NV_GEMV_PF_OPS"),
+            nv_gemv_k8_ops: env_u32("PLOW_NV_GEMV_K8_OPS"),
             moe_stage2_lean: env_opt_out("PLOW_MOE_STAGE2_LEAN"),
             moe_align_par: env_opt_out("PLOW_MOE_ALIGN_PAR"),
             glm_moe_shared_seed: env_bool("PLOW_GLM_MOE_SHARED_SEED"),
