@@ -8084,7 +8084,7 @@ impl crate::exec::gpu::spec::SpecSampler for SlotSpecSampler<'_> {
 
 /// Per fed row, the most drafts a speculative tick may give it (0 = it rides the verify as a
 /// plain row, sampled on the host when it needs to be). `None` when a row cannot ride a verify
-/// at all (CFG pairs, speech rows). `ready` = the drafter holds the row's hidden.
+/// at all (CFG pairs, speech rows, seeded sampled rows). `ready` = the drafter holds the row's hidden.
 #[cfg(feature = "cuda")]
 fn gpu_spec_caps(
     e: &crate::exec::gpu::GpuEngine,
@@ -8097,7 +8097,12 @@ fn gpu_spec_caps(
     caps.clear();
     for &(i, _) in feeds {
         let s = slots[i].as_ref()?;
-        if s.cfg.is_some() || s.plain_decode() {
+        // A seeded sampled row is reproducible only at plain decode's rung: riding a verify (even
+        // undrafted) changes its logits' numerics, so its ticks stay plain.
+        if s.cfg.is_some()
+            || s.plain_decode()
+            || (s.gen.seed.is_some() && !gpu_spec_draftable(&s.gen.params))
+        {
             return None;
         }
         let left = s
