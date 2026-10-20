@@ -48,6 +48,13 @@ PY=${PY:-python3}
 mkdir -p "$RES"
 RT="$RES/plowrt"
 cp "${PLOWRT_BIN:-$HERE/target/release/plowrt}" "$RT" || exit 2
+for cand in "$L/../lib/libcublasLt.so.13" "$L/libcublasLt.so.13" "$(dirname "${PLOWRT_BIN:-}")/libcublasLt.so.13"; do
+    if [ -f "$cand" ] && [ ! -e "$RES/libcublasLt.so.13" ]; then
+        cp -p "$cand" "$RES/" 2>/dev/null || true
+        break
+    fi
+done
+export LD_LIBRARY_PATH="$RES:${LD_LIBRARY_PATH:-}"
 PB_SERVER_PORT=${PORT:-$(pb_free_port)}; PB_SERVER_LOG="$RES/serve.log"
 # LLM last: its KV admission budget is sampled from what the speech models leave.
 # shellcheck disable=SC2086
