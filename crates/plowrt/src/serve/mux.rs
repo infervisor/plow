@@ -7952,7 +7952,12 @@ fn gpu_depth_frames(
         })
         .collect();
     let mut codes = Vec::new();
+    let t = crate::obs::host::on().then(Instant::now);
     e.fish_depth_step(&fish, &mut codes)?;
+    if let Some(t) = t {
+        let width = fish.iter().map(|r| r.slot + 1 + usize::from(r.cfg.is_some())).max();
+        crate::obs::host::depth_step(t.elapsed(), fish.len(), width.unwrap_or(0));
+    }
     let n = codes.len() / rows.len();
     for (r, &(k, job)) in rows.iter().enumerate() {
         let (tok, frame) = job.token(&codes[r * n..(r + 1) * n]);

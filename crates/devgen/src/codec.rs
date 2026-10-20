@@ -655,7 +655,7 @@ pub(crate) fn fused_conv(
         && !c.transpose
         && c.groups == 1
         && c.kernel > 1
-        && c.cin % 64 == 0
+        && c.cin % 4 == 0
         && c.cout % 4 == 0
         && c.row_scale.is_none();
     let unit = c.alpha_out.as_deref().and_then(|a| a.strip_suffix(".a12"));

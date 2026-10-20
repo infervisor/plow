@@ -2466,6 +2466,24 @@ static __device__ __noinline__ void d_unary_f32(const PlowDevInst* in, void* con
     const float p0 = in->fj[0].f;
     if (kind == 19u) { /* SnakeBeta: param = [a | r] */
         if (!param) return;
+        if (width % 4u == 0 && stride % 4u == 0 && col0 % 4u == 0 && sp_aligned(x, 16) && sp_aligned(out, 16) &&
+            sp_aligned(param, 16)) {
+            const unsigned w4 = width / 4u;
+            sp_batched<4>(
+                rows * w4, slice, nblk,
+                [&](unsigned e) {
+                    const unsigned row = e / w4;
+                    return ((const float4*)(x + (size_t)row * stride + col0))[e - row * w4];
+                },
+                [&](unsigned e, float4 v) {
+                    const unsigned row = e / w4, c = (e - row * w4) * 4u;
+                    const float4 a = __ldg((const float4*)(param + c)), r = __ldg((const float4*)(param + width + c));
+                    *(float4*)(out + (size_t)row * stride + col0 + c) =
+                        make_float4(fmaf(r.x, sp_sin2(v.x * a.x), v.x), fmaf(r.y, sp_sin2(v.y * a.y), v.y),
+                                    fmaf(r.z, sp_sin2(v.z * a.z), v.z), fmaf(r.w, sp_sin2(v.w * a.w), v.w));
+                });
+            return;
+        }
         sp_batched<4>(
             rows * width, slice, nblk,
             [&](unsigned e) {

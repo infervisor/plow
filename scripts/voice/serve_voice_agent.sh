@@ -65,11 +65,14 @@ if [ "$MODE" = serve ]; then
     wait "$PB_SERVER_PID"
     exit $?
 fi
+ASR_M=${ASR_MODEL:-$(jq -r '.served_name // "qwen3-asr"' "$A/weights.json" 2>/dev/null || echo "qwen3-asr")}
+LLM_M=${LLM_MODEL:-$(jq -r '.served_name // "gemma-4-e4b"' "$L/weights.json" 2>/dev/null || echo "gemma-4-e4b")}
+TTS_M=${TTS_MODEL:-$(jq -r '.served_name // "chatterbox-mtl"' "$S/weights.json" 2>/dev/null || echo "chatterbox-mtl")}
 for n in "${@:-10}"; do
     curl -fsS "$URL/metrics" > "$RES/metrics-$n.before" 2>/dev/null
     # shellcheck disable=SC2086
     "$PY" "$HERE/scripts/voice/call_sim.py" --url "$URL" --calls "$n" --turns "${TURNS:-3}" \
-        --asr-model qwen3-asr --llm-model gemma-4-e4b --tts-model chatterbox-mtl \
+        --asr-model "$ASR_M" --llm-model "$LLM_M" --tts-model "$TTS_M" \
         --manifest "$MANIFEST" ${CALL_ARGS:---language en} --out "$RES/calls$n.json" 2>&1 | tail -2
     curl -fsS "$URL/metrics" > "$RES/metrics-$n.after" 2>/dev/null
 done
