@@ -8318,7 +8318,7 @@ fn gpu_spec_draw(e: &crate::exec::gpu::GpuEngine, s: &Slot) -> crate::exec::gpu:
     if gpu_spec_draftable(&s.gen.params) {
         return SpecDraw::Argmax;
     }
-    match dev_sample_spec(s).filter(|_| e.dev_sample_enabled()) {
+    match dev_sample_spec(s, e.dev_penalty()).filter(|_| e.dev_sample_enabled()) {
         Some(d) => SpecDraw::Device(d),
         None => SpecDraw::Host,
     }

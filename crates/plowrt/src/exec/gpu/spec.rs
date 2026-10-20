@@ -367,6 +367,7 @@ impl GpuEngine {
         // Every verify row's plain-decode draw when a span samples on the device; argmax and
         // host rows take the greedy argmax (identical to the verify's own).
         let mut dev_rows = Vec::new();
+        let mut dev_slots = Vec::new();
         if spans
             .iter()
             .any(|sp| matches!(sp.draw, SpecDraw::Device(_)))
@@ -375,6 +376,7 @@ impl GpuEngine {
             let mut u = [0f32; SPEC_KMAX + 1];
             for (i, sp) in spans.iter().enumerate() {
                 let n = sp.tokens.len();
+                dev_slots.extend(std::iter::repeat_n(sp.slot as u32, n));
                 match sp.draw {
                     SpecDraw::Device(d) => {
                         sampler.draws(i, sp.tokens, &mut u[..n]);
@@ -386,7 +388,7 @@ impl GpuEngine {
         }
         let n_spans = spans.len();
         if let Err(e) =
-            self.spec_submit(selection, launch_rows, rows, n_spans, stop.len(), &dev_rows)
+            self.spec_submit(selection, launch_rows, rows, n_spans, stop.len(), &dev_rows, &dev_slots)
         {
             // Plain launches must not see the span map, and staging may still be in flight: only
             // a restore that drains cleanly clears the dirty flag.
@@ -463,6 +465,7 @@ impl GpuEngine {
         n_spans: usize,
         n_stop: usize,
         dev_rows: &[DevSample],
+        dev_slots: &[u32],
     ) -> Result<()> {
         // SAFETY: every pinned source lives on `self` past the stream synchronize below; each
         // copy is within its [batch]-sized tensor or buffer.
@@ -511,7 +514,7 @@ impl GpuEngine {
         if !dev_rows.is_empty() {
             debug_assert_eq!(dev_rows.len(), rows);
             // Overwrites `in.ids[..rows]` with each row's draw; the accept below reads them.
-            self.launch_sampler_rows(dev_rows)?;
+            self.launch_sampler_rows(dev_rows, dev_slots)?;
         }
         let s = self.spec.as_ref().expect("checked");
         let (f, _) = s.accept.as_ref().expect("checked");
