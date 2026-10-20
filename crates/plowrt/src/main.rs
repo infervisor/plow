@@ -4075,10 +4075,7 @@ async fn bringup_runtime(
             state.install_managers(managers.clone());
             // One co-tenant turn per group, installed before `load_initial`
             // spawns the first dispatcher — a mux resolves its turn at spawn.
-            let tenants: Vec<usize> = (0..layout.groups.len())
-                .map(|g| layout.assignment.iter().filter(|&&a| a == g).count())
-                .collect();
-            state.install_group_turns(&tenants, true);
+            state.install_device_turns(layout.groups.len(), true);
             // Load each group's initial residents. Sequential: the loads are
             // H2D-bound and share host bandwidth, so overlapping them buys
             // little while making a failure harder to attribute. DP ranks are
