@@ -49,13 +49,13 @@ max_ctx = 4096
 name = "slow-checkpoint"
 script = "scripts/tts/fish_prep.py"
 python = "{env:PYREF}"
-args = ["{out}/prep/slow"]
+args = ["{out}/prep/slow", "1de9996b6be38b745688de084d87a5633f714e4e"]
 
 [[prep]]
 name = "codec-export"
 script = "scripts/tts/fish_codec_export.py"
 python = "{env:PYREF}"
-args = ["{out}/prep/codec"]
+args = ["{out}/prep/codec", "1de9996b6be38b745688de084d87a5633f714e4e"]
 
 [emit]
 emit = "devblob+cubin"

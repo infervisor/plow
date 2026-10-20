@@ -44,6 +44,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut e = GpuEngine::load(be, &assets, &PathBuf::from(&a[2]))?;
     let info = e.fish_depth_enable(&assets)?;
     let prompt = read_u32(&a[3]);
+    if let Some(p) = opt("--prompt-codes") {
+        e.fish_prompt_codes(&read_u32(&p))?;
+    }
     if let Some(n) = opt("--slots").map(|v| v.parse::<usize>().unwrap()) {
         let mut rows = Vec::new();
         let mut codes = Vec::new();
@@ -99,9 +102,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             n as f64 * f / (backbone + depth)
         );
         return Ok(());
-    }
-    if let Some(p) = opt("--prompt-codes") {
-        e.fish_prompt_codes(&read_u32(&p))?;
     }
     e.begin_slot(0, prompt.len() + frames + 1)?;
     e.fish_reset_slot(0)?;

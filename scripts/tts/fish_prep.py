@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Fish Audio S2 Pro (fishaudio/s2-pro) -> a plow-compilable checkpoint directory.
 
-  HF_HOME=... python scripts/tts/fish_prep.py OUT_DIR
+  HF_HOME=... python scripts/tts/fish_prep.py OUT_DIR REVISION
 
 The slow AR is Qwen3-4B-shaped, so the directory is a Qwen3 checkpoint (the compiler keeps checkpoint
 naming; the runtime binds roles):
@@ -62,10 +62,11 @@ def block(sd, src, dst, heads, kv_heads, hd, qk_norm, perm, out):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("out")
+    ap.add_argument("revision")
     args = ap.parse_args()
     hub = os.environ.get("HF_HUB_CACHE") or os.path.join(
         os.environ.get("HF_HOME", os.path.expanduser("~/.cache/huggingface")), "hub")
-    src = sorted(glob.glob(os.path.join(hub, REPO, "snapshots/*")))[-1]
+    src = os.path.join(hub, REPO, "snapshots", args.revision)
     cfg = json.load(open(f"{src}/config.json"))
     tc, ac = cfg["text_config"], cfg["audio_decoder_config"]
     sd = {}

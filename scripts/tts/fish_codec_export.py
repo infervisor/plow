@@ -16,9 +16,8 @@ OUT_DIR/config.json. Decode path only:
   dec.blk{i}.snake / .up.{w,b} / .ru{j}.{a1, c1.w, c1.b, a2, c2.w, c2.b}
   dec.out.snake / dec.out.{w,b}   then tanh
 
-  HF_HOME=... python scripts/tts/fish_codec_export.py OUT_DIR
+  HF_HOME=... python scripts/tts/fish_codec_export.py OUT_DIR REVISION
 """
-import glob
 import json
 import os
 import sys
@@ -29,7 +28,7 @@ REPO = "models--fishaudio--s2-pro"
 
 
 def main():
-    if len(sys.argv) != 2:
+    if len(sys.argv) != 3:
         sys.exit(__doc__)
     from safetensors.torch import save_file
 
@@ -37,7 +36,7 @@ def main():
     os.makedirs(out, exist_ok=True)
     hub = os.environ.get("HF_HUB_CACHE") or os.path.join(
         os.environ.get("HF_HOME", os.path.expanduser("~/.cache/huggingface")), "hub")
-    src = sorted(glob.glob(os.path.join(hub, REPO, "snapshots/*")))[-1]
+    src = os.path.join(hub, REPO, "snapshots", sys.argv[2])
     sd = torch.load(f"{src}/codec.pth", map_location="cpu", weights_only=True)
     sd = sd.get("state_dict", sd)
     T = {}
