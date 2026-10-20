@@ -4806,6 +4806,7 @@ impl GpuEngine {
                     )));
                 }
                 if !packet_cache
+                    && td.init.is_none()
                     && is_checkpoint_tensor(i, &td.name, packed_prefill_metadata.as_ref())
                 {
                     let src = ckpt.tensor(&td.name).ok_or_else(|| {

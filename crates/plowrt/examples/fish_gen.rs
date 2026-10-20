@@ -3,10 +3,12 @@
 //! u32, the stop frame excluded) for the codec gate.
 //!
 //!   fish_gen ASSETS CKPT PROMPT.u32 OUT.u32 [--prompt-codes CODES.u32] [--frames N] [--seed S]
-//!            [--temperature T] [--top-p P] [--top-k K]
+//!            [--temperature T] [--top-p P] [--top-k K] [--slots N]
 //!
 //! PROMPT.u32 holds token ids; prompt frame rows (reference audio) take their codes from
 //! `--prompt-codes` (`[prompt rows][codebooks]`). `--top-k 1` is greedy and matches the goldens.
+//! `--slots N` instead times N slots stepped together for `--frames` steps (seeds `S..S+N`; a stop
+//! frame is fed as class 0 so the width stays N) and prints the depth and backbone ms per step.
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -42,6 +44,62 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut e = GpuEngine::load(be, &assets, &PathBuf::from(&a[2]))?;
     let info = e.fish_depth_enable(&assets)?;
     let prompt = read_u32(&a[3]);
+    if let Some(n) = opt("--slots").map(|v| v.parse::<usize>().unwrap()) {
+        let mut rows = Vec::new();
+        let mut codes = Vec::new();
+        for slot in 0..n {
+            e.begin_slot(slot, prompt.len() + frames + 1)?;
+            e.fish_reset_slot(slot)?;
+            e.prefill_slot(slot, &prompt)?;
+            e.fish_logits_to_slot(slot)?;
+            let row = FishRow {
+                slot,
+                hidden_row: e.prefill_terminal_row(),
+                seed: seed + slot as u64,
+                step: 0,
+                temperature,
+                top_p,
+                top_k,
+                ras_temperature: bf16(1.0),
+                ras_top_p: bf16(0.9),
+            };
+            codes.clear();
+            e.fish_depth_step(&[row], &mut codes)?;
+            rows.push((row, codes[0]));
+        }
+        let mut toks = Vec::new();
+        let (mut depth, mut backbone) = (0.0f64, 0.0f64);
+        for _ in 0..frames {
+            let feeds: Vec<(usize, u32)> = rows
+                .iter()
+                .map(|(r, class)| (r.slot, info.semantic_base + if *class == info.stop_class { 0 } else { *class }))
+                .collect();
+            let t = std::time::Instant::now();
+            e.step_slots(&feeds, &mut toks)?;
+            backbone += t.elapsed().as_secs_f64();
+            let step: Vec<FishRow> = rows
+                .iter()
+                .map(|(r, _)| FishRow { step: r.step + 1, hidden_row: r.slot as u32, ..*r })
+                .collect();
+            codes.clear();
+            let t = std::time::Instant::now();
+            e.fish_depth_step(&step, &mut codes)?;
+            depth += t.elapsed().as_secs_f64();
+            for (k, (r, class)) in rows.iter_mut().enumerate() {
+                *r = step[k];
+                *class = codes[k * info.codebooks];
+            }
+        }
+        let f = frames.max(1) as f64;
+        println!(
+            "slots {n} backbone_ms {:.2} depth_ms {:.2} step_ms {:.2} frames_per_s {:.0}",
+            backbone * 1e3 / f,
+            depth * 1e3 / f,
+            (backbone + depth) * 1e3 / f,
+            n as f64 * f / (backbone + depth)
+        );
+        return Ok(());
+    }
     if let Some(p) = opt("--prompt-codes") {
         e.fish_prompt_codes(&read_u32(&p))?;
     }

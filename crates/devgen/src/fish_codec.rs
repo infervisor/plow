@@ -21,15 +21,15 @@ use crate::rewrite_lower::ConvFusions;
 
 type Splits<'a> = Option<&'a std::cell::RefCell<BTreeMap<String, (u32, u32)>>>;
 
-/// (batch, frames): short streaming windows batched across streams, long utterances alone.
+/// (batch, frames): streaming windows batched across streams, long utterances alone. The smallest
+/// frame count sets the stream chunk (`frames + 1 - stream.window_frames` = 17 frames): a capacity
+/// under the 48-frame window would re-decode the whole window for every frame.
 pub const CAPACITIES: &[(u32, u32)] = &[
-    (1, 16),
-    (4, 16),
-    (16, 16),
-    (32, 16),
     (1, 64),
+    (2, 64),
     (4, 64),
     (8, 64),
+    (16, 64),
     (1, 256),
     (2, 256),
     (1, 512),
@@ -229,15 +229,24 @@ pub fn lower_fish_dac(
             }
             None => reader.read(name)?,
         };
-        if let Some(b) = cfg
+        // Every ConvT whose Conv takes phase-major weights (`codec::phase_major`): the decoder
+        // blocks' upsamplers and the post-transformer ConvNeXt upsamplers (kernel = stride).
+        let convt = cfg
             .blocks
             .iter()
             .enumerate()
             .find(|(i, _)| name == format!("dec.blk{i}.up.w"))
-            .map(|(_, b)| b)
-        {
-            if b.cin % 4 == 0 && b.cout >= 16 {
-                bytes = crate::codec::to_phase_major(&bytes, b.cin, b.cout, b.kernel, b.stride);
+            .map(|(_, b)| (b.cin, b.cout, b.kernel, b.stride))
+            .or_else(|| {
+                cfg.ups
+                    .iter()
+                    .enumerate()
+                    .find(|(u, _)| name == format!("up{u}.convt.w"))
+                    .map(|(_, &(stride, _))| (cfg.dim, cfg.dim, stride, stride))
+            });
+        if let Some((cin, cout, kernel, stride)) = convt {
+            if cin % 4 == 0 && cout >= 16 {
+                bytes = crate::codec::to_phase_major(&bytes, cin, cout, kernel, stride);
             }
         }
         if let Some((n, k)) = splits.as_ref().and_then(|s| s.borrow().get(name).copied()) {
