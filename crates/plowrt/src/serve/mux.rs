@@ -1971,6 +1971,7 @@ pub fn spawn(
                 } else {
                     0
                 };
+                taken_obs.host.spec_backlog = !waiting.is_empty();
             }
             let arena_ref = arena.clone();
             let kv_pages_for_tick = kv_pages_range.clone();
@@ -3838,7 +3839,66 @@ fn run_one_tick(
                     // frees it (mid-quantum EOS — extra device tokens past the stop
                     // are discarded). Remaining output budgets cap K. Any sampling adjustment
                     // falls through to the per-token path below.
-                    let use_pipe = e.pipe_enabled() && gpu_pipe_rows(&feeds, &slots);
+                    // Speculation runs only in pure decode ticks with nobody queued (their
+                    // prefill comes first), on a drained pipeline.
+                    let spec_plan = if !did_prefill && !obs.host.spec_backlog {
+                        gpu_spec_plan(&*e, &feeds, &slots, &mut obs.host, || {
+                            state.model_metrics(slug)
+                        })
+                    } else {
+                        None
+                    };
+                    let mut spec_ran = false;
+                    if let Some(plan) = spec_plan {
+                        if e.pipe_busy() {
+                            let mut done = std::mem::take(&mut obs.host.pipe_tokens);
+                            match e.pipe_drain(&mut done) {
+                                Ok(()) => {
+                                    for &(i, token) in &done {
+                                        if slots[i].is_some() {
+                                            disconnected[i] |= gpu_emit_slot_token(
+                                                &mut slots[i],
+                                                &arena,
+                                                bundle,
+                                                token,
+                                                &mut tokens_this_tick,
+                                                stop.as_slice(),
+                                            );
+                                        }
+                                    }
+                                }
+                                Err(err) => {
+                                    note_fault(&mut tick_fault, &err);
+                                    fail_feeds(&mut slots, &feeds, &arena, &err);
+                                }
+                            }
+                            obs.host.pipe_tokens = done;
+                            feeds = gpu_decode_feeds(&slots, cap);
+                        }
+                        if !feeds.is_empty() {
+                            let metrics = state.model_metrics(slug);
+                            spec_ran = gpu_spec_tick(
+                                &mut *e,
+                                plan,
+                                &feeds,
+                                &mut slots,
+                                &mut obs.host,
+                                &metrics,
+                                &arena,
+                                bundle,
+                                stop.as_slice(),
+                                &mut tokens_this_tick,
+                                &mut tick_fault,
+                                &mut disconnected,
+                            );
+                            if spec_ran {
+                                decode_progress = completed_decode(&feeds, 1);
+                            }
+                        } else {
+                            spec_ran = true;
+                        }
+                    }
+                    let use_pipe = !spec_ran && e.pipe_enabled() && gpu_pipe_rows(&feeds, &slots);
                     // Device-sampleable rows ride the quantum too when the sampler is loaded:
                     // `plow_sample` runs between each decode and advance.
                     let sampled_multi = e.multistep_sampling();
@@ -3862,7 +3922,8 @@ fn run_one_tick(
                                 })
                                 .unwrap_or(true)
                         });
-                    if use_pipe {
+                    if spec_ran {
+                    } else if use_pipe {
                         // Look ahead only while every row owes a token past the one this tick
                         // completes; a stop the host cannot foresee costs one discarded step.
                         let lookahead = feeds.iter().all(|&(i, _)| {
@@ -3872,8 +3933,15 @@ fn run_one_tick(
                         });
                         let mut done = std::mem::take(&mut obs.host.pipe_tokens);
                         let t_call = crate::obs::host::on().then(Instant::now);
+                        let t_step = Instant::now();
                         match e.pipe_step(&feeds, lookahead, &mut done) {
                             Ok(()) => {
+                                if let Some(p) = obs.host.spec.as_mut() {
+                                    p.observe_step(
+                                        feeds.len(),
+                                        t_step.elapsed().as_secs_f64() * 1e3,
+                                    );
+                                }
                                 let t_emit =
                                     host_engine_call(t_call, feeds.len(), tokens_this_tick);
                                 decode_progress = completed_decode(&feeds, 1);
@@ -4031,10 +4099,11 @@ fn run_one_tick(
                         };
                         match step_res {
                             Ok(()) => {
-                                obs.host.ride.observe_step(
-                                    feeds.len(),
-                                    t_step.elapsed().as_secs_f64() * 1e3,
-                                );
+                                let ms = t_step.elapsed().as_secs_f64() * 1e3;
+                                obs.host.ride.observe_step(feeds.len(), ms);
+                                if let Some(p) = obs.host.spec.as_mut() {
+                                    p.observe_step(feeds.len(), ms);
+                                }
                                 if dev_specs.is_some() {
                                     gpu_pen_counted(&*e, &mut slots, feeds.iter().map(|f| f.0), 1);
                                 }
@@ -8220,6 +8289,316 @@ fn gpu_finish_and_emit_token(
             fail_slot(slot_opt, arena, err);
         }
     }
+}
+
+/// Greedy rows whose token is the verify argmax (logprobs are read from each emitted token's
+/// verify row); penalties and logit bias reshape the logits and decode plainly.
+#[cfg(feature = "cuda")]
+fn gpu_spec_draftable(p: &crate::text::sample::SamplingParams) -> bool {
+    p.is_greedy()
+        && p.repetition_penalty == 1.0
+        && p.presence_penalty == 0.0
+        && p.frequency_penalty == 0.0
+        && p.logit_bias.is_empty()
+}
+
+/// Rows that draft: greedy ones, and with `PLOW_SPEC_SAMPLED` every row without logprobs.
+#[cfg(feature = "cuda")]
+fn gpu_spec_drafts(p: &crate::text::sample::SamplingParams) -> bool {
+    gpu_spec_draftable(p)
+        || (crate::config::RuntimeConfig::get().nv.spec_sampled && p.logprobs.is_none())
+}
+
+/// How a drafting row's verify rows choose tokens: plain decode's own sampler and draws for the
+/// row (device `plow_sample` where plain decode samples on the device, else the host sampler
+/// with the penalties over the row's history and the span's drafts).
+#[cfg(feature = "cuda")]
+fn gpu_spec_draw(e: &crate::exec::gpu::GpuEngine, s: &Slot) -> crate::exec::gpu::spec::SpecDraw {
+    use crate::exec::gpu::spec::SpecDraw;
+    if gpu_spec_draftable(&s.gen.params) {
+        return SpecDraw::Argmax;
+    }
+    match dev_sample_spec(s).filter(|_| e.dev_sample_enabled()) {
+        Some(d) => SpecDraw::Device(d),
+        None => SpecDraw::Host,
+    }
+}
+
+/// Plain decode's draws for the verify rows of sampled spans (span `i` = `rows[i]`).
+#[cfg(feature = "cuda")]
+struct SlotSpecSampler<'a> {
+    slots: &'a [Option<Slot>],
+    rows: &'a [crate::exec::gpu::SpecRow],
+    prior: Vec<u32>,
+    /// The last host span's draws, so its rows hash the history once.
+    host_draws: Option<(usize, [f32; crate::orch::speculative::SPEC_KMAX + 1])>,
+}
+
+#[cfg(feature = "cuda")]
+impl SlotSpecSampler<'_> {
+    fn slot(&self, i: usize) -> &Slot {
+        self.slots[self.rows[i].slot].as_ref().expect("fed slot")
+    }
+}
+
+#[cfg(feature = "cuda")]
+impl crate::exec::gpu::spec::SpecSampler for SlotSpecSampler<'_> {
+    fn draws(&mut self, i: usize, tokens: &[u32], out: &mut [f32]) {
+        let s = self.slot(i);
+        crate::serve::seeded_units_ext(
+            &s.prompt_ids,
+            &s.out_ids,
+            &tokens[1..],
+            s.step,
+            s.gen.seed,
+            out,
+        );
+    }
+
+    fn host(&mut self, i: usize, tokens: &[u32], j: usize, logits: &mut [f32]) -> u32 {
+        let u = match self.host_draws {
+            Some((at, u)) if at == i => u,
+            _ => {
+                let mut u = [0f32; crate::orch::speculative::SPEC_KMAX + 1];
+                self.draws(i, tokens, &mut u[..tokens.len()]);
+                self.host_draws = Some((i, u));
+                u
+            }
+        };
+        let s = self.slots[self.rows[i].slot].as_ref().expect("fed slot");
+        crate::orch::speculative::host_row_sample(
+            logits,
+            &s.gen.params,
+            &s.out_ids,
+            &tokens[1..=j],
+            u[j],
+            &mut self.prior,
+        )
+    }
+}
+
+/// Per fed row, the most drafts a speculative tick may give it (0 = it rides the verify as a
+/// plain row, sampled on the host when it needs to be). `None` when a row cannot ride a verify
+/// at all (CFG pairs, speech rows, seeded sampled rows). `ready` = the drafter holds the row's hidden.
+#[cfg(feature = "cuda")]
+fn gpu_spec_caps(
+    e: &crate::exec::gpu::GpuEngine,
+    feeds: &[(usize, u32)],
+    slots: &[Option<Slot>],
+    kmax: u32,
+    ready: bool,
+    caps: &mut Vec<u32>,
+) -> Option<()> {
+    caps.clear();
+    for &(i, _) in feeds {
+        let s = slots[i].as_ref()?;
+        // A seeded sampled row is reproducible only at plain decode's rung: riding a verify (even
+        // undrafted) changes its logits' numerics, so its ticks stay plain.
+        if s.cfg.is_some()
+            || s.plain_decode()
+            || (s.gen.seed.is_some() && !gpu_spec_draftable(&s.gen.params))
+        {
+            return None;
+        }
+        let left = s
+            .gen
+            .max_tokens
+            .max(1)
+            .saturating_sub(s.step)
+            .saturating_sub(1);
+        let room = e.max_ctx().saturating_sub(e.slot_pos(i) + 1);
+        let cap = if gpu_spec_drafts(&s.gen.params) && (!ready || e.spec_draft_ready(i)) {
+            (kmax as usize).min(left).min(room) as u32
+        } else {
+            0
+        };
+        caps.push(cap);
+    }
+    Some(())
+}
+
+/// The tick's speculation plan, or `None` for a plain tick: the engine serves speculation, no
+/// row needs a plain-only path, and the measured plan beats the plain step. Planned as if every
+/// greedy row's drafter state were ready; [`gpu_spec_tick`] drafts only the rows whose is.
+#[cfg(feature = "cuda")]
+fn gpu_spec_plan(
+    e: &crate::exec::gpu::GpuEngine,
+    feeds: &[(usize, u32)],
+    slots: &[Option<Slot>],
+    host: &mut crate::exec::host::HostExecutor,
+    metrics: impl FnOnce() -> Arc<Metrics>,
+) -> Option<crate::sched::spec::Plan> {
+    let limits = e.spec_serving()?;
+    let policy = host.spec.get_or_insert_with(|| {
+        metrics()
+            .serving
+            .spec
+            .kmax
+            .store(u64::from(limits.kmax), Ordering::Relaxed);
+        let widths: Vec<usize> = e
+            .effective_decode_rungs()
+            .iter()
+            .map(|&w| w as usize)
+            .collect();
+        crate::sched::spec::SpecPolicy::new(
+            &widths,
+            limits.max_rows,
+            limits.kmax,
+            &limits.draft_rows,
+        )
+    });
+    if feeds.is_empty() || feeds.len() >= limits.max_rows {
+        return None;
+    }
+    let mut caps = Vec::with_capacity(feeds.len());
+    gpu_spec_caps(e, feeds, slots, limits.kmax, false, &mut caps)?;
+    policy.plan(&caps)
+}
+
+/// One speculative decode tick over `feeds` (no prefill this tick, decode pipeline drained):
+/// draft, verify, commit, then stream each row's tokens through the same funnel plain decode
+/// uses. Drafting rows emit their accepted drafts plus the verify row's token (argmax, or the
+/// plain-decode sample with `PLOW_SPEC_SAMPLED`); other rows take their one token from the
+/// verify row's logits like a plain step. `false` leaves the tick to the
+/// plain path (speculation does not pay, or the engine refused before touching any slot).
+#[cfg(feature = "cuda")]
+#[allow(clippy::too_many_arguments)]
+fn gpu_spec_tick(
+    e: &mut crate::exec::gpu::GpuEngine,
+    plan: crate::sched::spec::Plan,
+    feeds: &[(usize, u32)],
+    slots: &mut [Option<Slot>],
+    host: &mut crate::exec::host::HostExecutor,
+    metrics: &Metrics,
+    arena: &Option<SharedKvState>,
+    bundle: &ModelBundle,
+    stop: &[u32],
+    tokens_this_tick: &mut usize,
+    tick_fault: &mut Option<crate::DeviceErrorInfo>,
+    disconnected: &mut [bool],
+) -> bool {
+    use crate::exec::gpu::{SpecRow, SpecTick};
+    let Some(limits) = e.spec_serving() else {
+        return false;
+    };
+    let mut caps = Vec::with_capacity(feeds.len());
+    if gpu_spec_caps(e, feeds, slots, limits.kmax, true, &mut caps).is_none() {
+        return false;
+    }
+    let mut ks = Vec::with_capacity(feeds.len());
+    crate::sched::spec::SpecPolicy::depths(&caps, plan, &mut ks);
+    // `None`: the row rides the verify as a plain step finished on the host.
+    let draws: Vec<Option<crate::exec::gpu::spec::SpecDraw>> = feeds
+        .iter()
+        .map(|&(i, _)| {
+            let s = slots[i].as_ref().expect("fed slot");
+            gpu_spec_drafts(&s.gen.params).then(|| gpu_spec_draw(e, s))
+        })
+        .collect();
+    let rows: Vec<SpecRow> = feeds
+        .iter()
+        .zip(&ks)
+        .zip(&draws)
+        .map(|((&(slot, token), &k), d)| SpecRow {
+            slot,
+            token,
+            k,
+            draw: d.unwrap_or(crate::exec::gpu::spec::SpecDraw::Argmax),
+        })
+        .collect();
+    let mut out = SpecTick::default();
+    let mut sampler = SlotSpecSampler {
+        slots,
+        rows: &rows,
+        prior: Vec::new(),
+        host_draws: None,
+    };
+    if let Err(err) = e.spec_tick(&rows, stop, Some(&mut sampler), &mut out) {
+        // A refusal that committed nothing leaves every slot as it was: the plain path serves the tick.
+        if matches!(err, crate::RuntimeError::Rejected(_)) && out.committed == 0 {
+            tracing::warn!(error = %err, "spec tick refused; plain step");
+            return false;
+        }
+        tracing::warn!(
+            error = %err,
+            error_code = ?err.device_code(),
+            fatal = err.is_fatal(),
+            fed = feeds.len(),
+            model = bundle.network(),
+            "gpu: speculative decode failed"
+        );
+        note_fault(tick_fault, &err);
+        fail_feeds(slots, feeds, arena, &err);
+        return true;
+    }
+    if let Some(p) = host.spec.as_mut() {
+        p.observe_step(out.rows, out.verify_ms);
+        if out.draft_rows > 0 {
+            p.observe_draft(out.draft_rows, out.draft_k, out.draft_ms);
+        }
+    }
+    for (((r, &row0), v), draw) in rows.iter().zip(&out.row0).zip(&out.verdicts).zip(&draws) {
+        let i = r.slot;
+        let Some(logprobs) = slots[i].as_ref().map(|s| s.gen.params.logprobs.is_some()) else {
+            continue;
+        };
+        if r.k > 0 {
+            metrics.serving.spec.record(r.k, u32::from(v.n_acc));
+            if let Some(p) = host.spec.as_mut() {
+                p.observe_verdict(r.k, u32::from(v.n_acc));
+            }
+        }
+        if draw.is_none() {
+            gpu_finish_and_emit_token(
+                e,
+                row0 as usize,
+                i,
+                &mut slots[i],
+                arena,
+                bundle,
+                v.tokens[0],
+                false,
+                tokens_this_tick,
+                stop,
+                tick_fault,
+                disconnected,
+            );
+            continue;
+        }
+        // Emitted token `j` is verify row `row0 + j`'s argmax or plain-decode sample.
+        for (j, &token) in v.tokens[..usize::from(v.n_emit)].iter().enumerate() {
+            if slots[i].is_none() {
+                break;
+            }
+            tracing::debug!(token, slot = i, "gpu: token (speculative)");
+            if logprobs {
+                gpu_finish_and_emit_token(
+                    e,
+                    row0 as usize + j,
+                    i,
+                    &mut slots[i],
+                    arena,
+                    bundle,
+                    token,
+                    false,
+                    tokens_this_tick,
+                    stop,
+                    tick_fault,
+                    disconnected,
+                );
+            } else {
+                disconnected[i] |= gpu_emit_slot_token(
+                    &mut slots[i],
+                    arena,
+                    bundle,
+                    token,
+                    tokens_this_tick,
+                    stop,
+                );
+            }
+        }
+    }
+    true
 }
 
 /// Incremental detokenize over a bounded window (TGI scheme): decode only

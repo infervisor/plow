@@ -30,6 +30,7 @@ import plow_dist as pd
 REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO / "scripts" / "campaign"))
 import rung_env  # noqa: E402
+import spec_env  # noqa: E402
 
 
 class Invalid(pd.Fail):
@@ -114,7 +115,14 @@ def check_emit(recipe: dict, build_json: dict) -> list[str]:
     # `unrecorded_env` names knobs read outside EmitConfig. They shaped the
     # packet just as much, so a recipe may state them and they must agree.
     observed.update(ec.get("unrecorded_env") or {})
-    requested = (recipe.get("emit") or {}).get("env") or {}
+    # `[spec]` derives its knobs; a drafter dir stated through `{env:...}` is a host path the
+    # shard pin already identifies, so only its presence is checked.
+    derived = spec_env.emit_env(recipe)
+    if "{env:" in derived.get("PLOW_SPEC_DRAFT_DIR", ""):
+        need("PLOW_SPEC_DRAFT_DIR" in observed, "emit: [spec] builds a drafter but the build recorded no PLOW_SPEC_DRAFT_DIR")
+        observed = {k: v for k, v in observed.items() if k != "PLOW_SPEC_DRAFT_DIR"}
+        derived.pop("PLOW_SPEC_DRAFT_DIR")
+    requested = {**derived, **((recipe.get("emit") or {}).get("env") or {})}
     exact_map(requested, observed, "emit")
     check_rung_env(rungs, build_json, observed)
 
@@ -291,6 +299,8 @@ def check(recipe_path: Path, bundle: Path | None, objects: Path | None, strict: 
 
     notes += check_lowrung_tiers(recipe)
     recipe_rung_env(recipe)
+    spec_errors = spec_env.errors(recipe)
+    need(not spec_errors, "; ".join(spec_errors))
 
     if bundle:
         bj = pd.load_json(bundle / "build.json") if (bundle / "build.json").exists() else {}
@@ -444,6 +454,25 @@ def self_test() -> None:
         except pd.Fail as e:
             assert "no such knob" in str(e)
 
+        # [spec]: derived knobs must match the build record; a malformed table fails.
+        spec = json.loads(json.dumps(good))
+        spec["spec"] = {"kind": "gemma4_assistant", "draft_dir": "{env:DRAFT}", "draft_revision": "r1",
+                        "shard_sha256": "b" * 64, "k_max": 7, "rows": [1, 2, 4, 8, 16],
+                        "emit": False, "serve": False}
+        assert not any("contradictory" in n for n in check(write(spec), bundle, objects, strict=False))
+        spec["spec"]["emit"] = True
+        try:
+            check(write(spec), bundle, objects, strict=False)
+            raise AssertionError("accepted [spec] knobs the build did not record")
+        except pd.Fail as e:
+            assert "no such knob" in str(e) or "no PLOW_SPEC_DRAFT_DIR" in str(e), e
+        spec["spec"]["k_max"] = 99
+        try:
+            check(write(spec), bundle, objects, strict=False)
+            raise AssertionError("accepted k_max 99")
+        except pd.Fail as e:
+            assert "k_max" in str(e), e
+
         # Target disagreements.
         for field, value in [("isa", "gfx950"), ("units", 256), ("num_gpus", 4)]:
             bad = json.loads(json.dumps(good))
@@ -551,6 +580,8 @@ def to_toml(doc: dict) -> str:
             return "true" if v else "false"
         if isinstance(v, (int, float)):
             return str(v)
+        if isinstance(v, list):
+            return "[" + ", ".join(val(x) for x in v) + "]"
         return json.dumps(str(v))
 
     # Keys are always quoted: an artifact name like `model.pkt` is ONE key, and

@@ -609,12 +609,14 @@ pub(super) fn light_segments(
                     let d = &g.insts[inst];
                     match op(inst) {
                         Some(DevOp::HeadNormRope) => attn_hd(d.i[2]) && d.i[5] == 0,
+                        // A span packet's `t7` row-slot map: the light bodies store and read by
+                        // row, which is the identity map every plain launch uploads (speculative
+                        // launches never take a library rung, see `spec_max_rows`).
                         Some(DevOp::HeadNormRopeFp8) => {
                             functions.fp8_attn
                                 && attn_hd(d.i[2])
                                 && d.i[5] == 0
                                 && d.t[6] != packet::dev::TENSOR_NONE16
-                                && d.t[7] == packet::dev::TENSOR_NONE16
                         }
                         Some(DevOp::FlashDecode) => attn_hd(d.i[6]),
                         Some(DevOp::FlashDecodeFp8) => {

@@ -386,6 +386,39 @@ pub struct EmitConfig {
     #[arg(long, env = "PLOW_FUSE_KV_HNR", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
     pub fuse_kv_hnr: bool,
 
+    /// Speculative-decode verify on the decode rungs: declare `in.rowslot` (row -> KV slot map),
+    /// bind it on the FP8-KV store and flash-decode sites, and make flash wait on every row's K/V
+    /// store. Needs objects built with -DPLOW_NV_ROW_SLOT=1.
+    #[arg(long, env = "PLOW_EMIT_SPAN_VERIFY", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
+    pub span_verify: bool,
+
+    /// Speculative-decode draft programs (Gemma-4 assistant) in the packet; needs
+    /// PLOW_SPEC_DRAFT_DIR and the re-keyed `model-mtp.safetensors` beside the target shards.
+    #[arg(long, env = "PLOW_EMIT_SPEC", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
+    pub emit_spec: bool,
+
+    /// The draft model's HF directory (config.json, tokenizer.json, safetensors) for PLOW_EMIT_SPEC.
+    #[arg(long, env = "PLOW_SPEC_DRAFT_DIR")]
+    pub spec_draft_dir: Option<String>,
+
+    /// FP8 (w8a16, per-row scale) draft weights from `model-mtp-fp8.safetensors`
+    /// (`scripts/gemma4_mtp_fp8.py`): `head` = the tied draft head only, `all` = the head and every
+    /// draft GEMV. Unset = bf16 drafter.
+    #[arg(long, env = "PLOW_SPEC_DRAFT_FP8", value_parser = clap::builder::PossibleValuesParser::new(["head", "all"]))]
+    pub spec_draft_fp8: Option<String>,
+
+    /// Deepest draft program for PLOW_EMIT_SPEC (default 7).
+    #[arg(long, env = "PLOW_SPEC_KMAX")]
+    pub spec_kmax: Option<u32>,
+
+    /// Draft program row counts for PLOW_EMIT_SPEC, comma list (default 1,2,4,8,16).
+    #[arg(long, env = "PLOW_SPEC_ROWS")]
+    pub spec_rows: Option<String>,
+
+    /// Pin: the re-keyed draft shard's sha256; the emit refuses any other bytes.
+    #[arg(long, env = "PLOW_SPEC_SHARD_SHA256")]
+    pub spec_shard_sha256: Option<String>,
+
     /// Blocks for the one-row MoE combine (arms the all-block combine; 0/1 = today's single CTA).
     #[arg(long, env = "PLOW_MOE_COMBINE_BLOCKS")]
     pub moe_combine_blocks: Option<u32>,
@@ -1919,6 +1952,13 @@ impl EmitConfig {
             nv_fa_split_prefill: env_bool_default_true("PLOW_NV_FA_SPLIT_PREFILL"),
             hn_split: env_bool("PLOW_HN_SPLIT"),
             fuse_kv_hnr: env_bool("PLOW_FUSE_KV_HNR"),
+            span_verify: env_bool("PLOW_EMIT_SPAN_VERIFY"),
+            emit_spec: env_bool("PLOW_EMIT_SPEC"),
+            spec_draft_dir: env_str("PLOW_SPEC_DRAFT_DIR"),
+            spec_draft_fp8: env_str("PLOW_SPEC_DRAFT_FP8"),
+            spec_kmax: env_u32("PLOW_SPEC_KMAX"),
+            spec_rows: env_str("PLOW_SPEC_ROWS"),
+            spec_shard_sha256: env_str("PLOW_SPEC_SHARD_SHA256"),
             moe_combine_blocks: env_u32("PLOW_MOE_COMBINE_BLOCKS"),
             fa_gf_full: env_u32("PLOW_FA_GF_FULL"),
             attention_decode_balance_gf: env_u32("PLOW_ATTENTION_DECODE_BALANCE_GF"),

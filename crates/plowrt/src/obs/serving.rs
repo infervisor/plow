@@ -281,6 +281,9 @@ pub struct ServingMetrics {
     pub generation: AtomicU64,
     pub success: [AtomicU64; 2],
     pub aborted: AtomicU64,
+    /// Aborts that came before the first generated token, and arrival-to-abort time of every abort.
+    pub aborted_before_first: AtomicU64,
+    pub aborted_elapsed: Histogram,
     pub preempted: AtomicU64,
     pub tick_errors: AtomicU64,
     /// Completed requests judged against `PLOW_TTFT_SLO_MS` / `PLOW_TBT_SLO_MS`, and how many
@@ -321,6 +324,34 @@ pub struct ServingMetrics {
     pub thinking_requests: AtomicU64,
     pub reasoning_tokens: AtomicU64,
     pub request_reasoning_tokens: Histogram,
+    pub spec: SpecMetrics,
+}
+
+/// Speculative decoding counters with vLLM's semantics, counted at verification: one draft per span
+/// with `k > 0`, its `k` draft tokens, the drafts the verify accepted (an EOS inside the span ends
+/// the count; a host stop string later in the span does not), and per draft position the spans that
+/// accepted it. `kmax` 0 = speculation off (families not written).
+#[derive(Default)]
+pub struct SpecMetrics {
+    pub kmax: AtomicU64,
+    pub drafts: AtomicU64,
+    pub draft_tokens: AtomicU64,
+    pub accepted: AtomicU64,
+    pub accepted_per_pos: [AtomicU64; crate::orch::speculative::SPEC_KMAX],
+}
+
+impl SpecMetrics {
+    pub fn record(&self, k: u32, n_acc: u32) {
+        if k == 0 {
+            return;
+        }
+        self.drafts.fetch_add(1, Relaxed);
+        self.draft_tokens.fetch_add(u64::from(k), Relaxed);
+        self.accepted.fetch_add(u64::from(n_acc), Relaxed);
+        for c in &self.accepted_per_pos[..(n_acc as usize).min(self.accepted_per_pos.len())] {
+            c.fetch_add(1, Relaxed);
+        }
+    }
 }
 
 /// One chat request's reasoning accounting, recorded once when its response finishes.
@@ -451,6 +482,12 @@ impl ServingMetrics {
         );
         scalar!("plowrt_requests_aborted_total", "counter", "Admitted requests dropped without normal completion or preemption; includes errors and disconnects.", |m: &Metrics, _| if m.serving.asr.cohort.load(Relaxed) { m.serving.asr.cancelled.load(Relaxed) } else { m.serving.aborted.load(Relaxed) });
         scalar!(
+            "plowrt_requests_aborted_before_first_token_total",
+            "counter",
+            "Aborted requests that had not produced a token (client gave up while queued or in prefill).",
+            |m: &Metrics, _| m.serving.aborted_before_first.load(Relaxed)
+        );
+        scalar!(
             "plowrt_requests_thinking_total",
             "counter",
             "Admitted chat requests whose rendered prompt has reasoning on (template thinking switch or a prompt that leaves the trace open).",
@@ -553,23 +590,75 @@ impl ServingMetrics {
             out,
             "vllm:request_success_total",
             "counter",
-            "Requests completed normally by finish reason.",
+            "Finished requests by finish reason; `abort` as vLLM counts it (client disconnect or error).",
         );
         for ((_, m, _), labels) in models.iter().zip(&labels) {
-            for (i, reason) in ["stop", "length"].iter().enumerate() {
+            let cohort = m.serving.asr.cohort.load(Relaxed);
+            for (i, reason) in ["stop", "length", "abort"].iter().enumerate() {
                 let _ = writeln!(
                     out,
                     "vllm:request_success_total{{{labels},finished_reason=\"{reason}\"}} {}",
-                    if m.serving.asr.cohort.load(Relaxed) {
-                        if i == 0 {
-                            m.serving.asr.completed.load(Relaxed)
-                        } else {
-                            0
-                        }
-                    } else {
-                        m.serving.success[i].load(Relaxed)
+                    match (cohort, i) {
+                        (true, 0) => m.serving.asr.completed.load(Relaxed),
+                        (true, 2) => m.serving.asr.cancelled.load(Relaxed),
+                        (true, _) => 0,
+                        (false, 2) => m.serving.aborted.load(Relaxed),
+                        (false, _) => m.serving.success[i].load(Relaxed),
                     }
                 );
+            }
+        }
+        if models
+            .iter()
+            .any(|(_, m, _)| m.serving.spec.kmax.load(Relaxed) > 0)
+        {
+            let spec = |name: &str, help: &str, value: &dyn Fn(&SpecMetrics) -> u64| {
+                let mut out = String::new();
+                family(&mut out, name, "counter", help);
+                for ((_, m, _), labels) in models.iter().zip(&labels) {
+                    if m.serving.spec.kmax.load(Relaxed) > 0 {
+                        let _ = writeln!(out, "{name}{{{labels}}} {}", value(&m.serving.spec));
+                    }
+                }
+                out
+            };
+            out.push_str(&spec(
+                "vllm:spec_decode_num_drafts_total",
+                "Speculative verify spans that carried drafts.",
+                &|s| s.drafts.load(Relaxed),
+            ));
+            out.push_str(&spec(
+                "vllm:spec_decode_num_draft_tokens_total",
+                "Draft tokens proposed.",
+                &|s| s.draft_tokens.load(Relaxed),
+            ));
+            out.push_str(&spec(
+                "vllm:spec_decode_num_accepted_tokens_total",
+                "Draft tokens accepted.",
+                &|s| s.accepted.load(Relaxed),
+            ));
+            family(
+                out,
+                "vllm:spec_decode_num_accepted_tokens_per_pos_total",
+                "counter",
+                "Drafts accepted at each draft position.",
+            );
+            for ((_, m, _), labels) in models.iter().zip(&labels) {
+                let kmax = m.serving.spec.kmax.load(Relaxed) as usize;
+                for (pos, c) in m
+                    .serving
+                    .spec
+                    .accepted_per_pos
+                    .iter()
+                    .enumerate()
+                    .take(kmax)
+                {
+                    let _ = writeln!(
+                        out,
+                        "vllm:spec_decode_num_accepted_tokens_per_pos_total{{{labels},position=\"{pos}\"}} {}",
+                        c.load(Relaxed)
+                    );
+                }
             }
         }
         macro_rules! hist {
@@ -607,6 +696,13 @@ impl ServingMetrics {
             LATENCY,
             1e6,
             "Arrival through normal completion."
+        );
+        hist!(
+            "plowrt_request_aborted_elapsed_seconds",
+            aborted_elapsed,
+            LATENCY,
+            1e6,
+            "Arrival through abort; a peak at a fixed time points at a client timeout."
         );
         hist!(
             "vllm:request_queue_time_seconds",
@@ -922,7 +1018,12 @@ impl Drop for RequestMetrics {
     fn drop(&mut self) {
         self.metrics.serving.running.fetch_sub(1, Relaxed);
         if !self.finished {
-            self.metrics.serving.aborted.fetch_add(1, Relaxed);
+            let m = &self.metrics.serving;
+            m.aborted.fetch_add(1, Relaxed);
+            if self.first.is_none() {
+                m.aborted_before_first.fetch_add(1, Relaxed);
+            }
+            m.aborted_elapsed.duration(self.arrived.elapsed());
         }
     }
 }
@@ -980,11 +1081,13 @@ mod tests {
         let mut aborted = RequestMetrics::new(m.clone(), now, now, 20, 8);
         aborted.token(0);
         drop(aborted);
+        drop(RequestMetrics::new(m.clone(), now, now, 20, 8));
         let mut preempted = RequestMetrics::new(m.clone(), now, now, 20, 8);
         preempted.finish(FinishReason::Preempted, 0);
         drop(preempted);
         assert_eq!(m.serving.running.load(Relaxed), 0);
-        assert_eq!(m.serving.aborted.load(Relaxed), 1);
+        assert_eq!(m.serving.aborted.load(Relaxed), 2);
+        assert_eq!(m.serving.aborted_before_first.load(Relaxed), 1);
         assert_eq!(m.serving.preempted.load(Relaxed), 1);
         assert_eq!(m.serving.success[0].load(Relaxed), 0);
     }
@@ -1014,9 +1117,47 @@ mod tests {
             format!("vllm:request_params_max_tokens_sum{l} 16\n"),
             format!("vllm:request_max_num_generation_tokens_count{l} 1\n"),
             format!("vllm:request_max_num_generation_tokens_sum{l} 1\n"),
+            format!("vllm:request_success_total{{model_name=\"g\",engine=\"0\",finished_reason=\"stop\"}} 1\n"),
+            format!("vllm:request_success_total{{model_name=\"g\",engine=\"0\",finished_reason=\"abort\"}} 1\n"),
+            format!("plowrt_requests_aborted_before_first_token_total{l} 0\n"),
+            format!("plowrt_request_aborted_elapsed_seconds_count{l} 1\n"),
         ] {
             assert!(out.contains(&line), "missing {line}");
         }
+    }
+
+    #[test]
+    fn spec_decode_counters_use_vllm_names_and_positions() {
+        let m = Arc::new(Metrics::default());
+        let mut out = String::new();
+        ServingMetrics::write(&mut out, &[("g".into(), Arc::clone(&m), true)]);
+        assert!(
+            !out.contains("spec_decode"),
+            "absent while speculation is off"
+        );
+        m.serving.spec.kmax.store(3, Relaxed);
+        m.serving.spec.record(3, 2);
+        m.serving.spec.record(2, 0);
+        m.serving.spec.record(0, 0);
+        out.clear();
+        ServingMetrics::write(&mut out, &[("g".into(), m, true)]);
+        let l = "{model_name=\"g\",engine=\"0\"";
+        for line in [
+            format!("vllm:spec_decode_num_drafts_total{l}}} 2\n"),
+            format!("vllm:spec_decode_num_draft_tokens_total{l}}} 5\n"),
+            format!("vllm:spec_decode_num_accepted_tokens_total{l}}} 2\n"),
+            format!("vllm:spec_decode_num_accepted_tokens_per_pos_total{l},position=\"0\"}} 1\n"),
+            format!("vllm:spec_decode_num_accepted_tokens_per_pos_total{l},position=\"1\"}} 1\n"),
+            format!("vllm:spec_decode_num_accepted_tokens_per_pos_total{l},position=\"2\"}} 0\n"),
+        ] {
+            assert!(out.contains(&line), "missing {line}");
+        }
+        assert!(!out.contains("position=\"3\""));
+        assert_eq!(
+            out.matches("# TYPE vllm:spec_decode_num_drafts_total counter")
+                .count(),
+            1
+        );
     }
 
     #[test]

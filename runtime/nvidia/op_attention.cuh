@@ -2105,6 +2105,12 @@ __device__ void d_flash_decode(float* __restrict__ Opart, float* __restrict__ ml
             if (physical < 0) __trap();
             slot = (unsigned)physical;
         }
+#if PLOW_NV_ROW_SLOT
+        /* Span-mode decode: bit 31 is the NO_STORE flag of a padding row; it still reads its slot. */
+        else if (decode_slot) {
+            slot = (unsigned)decode_slot[b] & 0x7FFFFFFFu;
+        }
+#endif
         const unsigned h0 = hg * GF;
         const unsigned hkv = h0 / gqa;
 
@@ -2127,7 +2133,7 @@ __device__ void d_flash_decode(float* __restrict__ Opart, float* __restrict__ ml
             if (kv_cap && (((size_t)slot * n_kv_head + hkv) * kv_stride + (kv_stride - 1)) >= kv_cap)
                 __trap();
         } else {
-            if (kv_cap && (((size_t)b * n_kv_head + hkv) * kv_stride + (kv_stride - 1)) >= kv_cap)
+            if (kv_cap && (((size_t)slot * n_kv_head + hkv) * kv_stride + (kv_stride - 1)) >= kv_cap)
                 __trap();
         }
 #endif
@@ -2159,6 +2165,9 @@ __device__ void d_flash_decode(float* __restrict__ Opart, float* __restrict__ ml
                     const unsigned b2 = w2 / (nsplit * n_grp);
                     unsigned slot2 = b2;
                     if constexpr (SLOTMAP) slot2 = (unsigned)max(decode_slot[b2], 0);
+#if PLOW_NV_ROW_SLOT
+                    else if (decode_slot) slot2 = (unsigned)decode_slot[b2] & 0x7FFFFFFFu;
+#endif
                     const unsigned len2 = (unsigned)kv_len[b2];
                     const unsigned first2 = (window && len2 > window) ? (len2 - window) : 0u;
                     const unsigned per2 = (len2 - first2 + nsplit - 1) / nsplit;

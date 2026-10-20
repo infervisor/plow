@@ -169,7 +169,7 @@ const DOC: &[S] = &[
     S { op: DevOp::GemvQkvg, t: &["q_out", "x", "W_q", "k_out", "W_k", "v_out", "W_v", "g_out"], i: &["M", "Nq", "K", "Nk", "Nv", "Ng", "W_g"], f: &[], j: &[] },
     // i3 != 0 is the NRN fold (AMD decode): t1 becomes `a` (the residual in), t3/t4/t6/t7 carry
     // resid_out/b/gamma_b/gamma_n, f0=eps f1=layer_scale. See gemv_nrn_lds in op_gemm.h.
-    S { op: DevOp::GemvFp8, t: &["C", "x", "W", "resid_out", "b", "w_scale", "gamma_b", "gamma_n"], i: &["M", "N", "K", "nrn", "a_row0"], f: &["eps", "scale"], j: &[] },
+    S { op: DevOp::GemvFp8, t: &["C", "x", "W", "resid_out?", "b?", "w_scale", "gamma_b?", "gamma_n?"], i: &["M", "N", "K", "nrn", "a_row0"], f: &["eps", "scale"], j: &[] },
     S { op: DevOp::GemvGluFp8, t: &["fu", "x", "W_gate", "gate_scale", "up_scale", "W_up"], i: &["M", "N", "K", "resid_out", "b", "act", "gamma_b", "gamma_n"], f: &["eps", "scale"], j: &["", "nrn"] },
     S { op: DevOp::QuantFp8, t: &["xq", "x", "a_scale", "gate?", "up?"], i: &["M", "K", "act"], f: &[], j: &[] },
     S { op: DevOp::QuantFp8Block128, t: &["xq", "x", "a_scale"], i: &["M", "K"], f: &[], j: &[] },

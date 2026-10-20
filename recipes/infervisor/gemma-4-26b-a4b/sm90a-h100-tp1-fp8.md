@@ -10,7 +10,10 @@ the markers is hand-written.
 
 <!-- plow:recipe:prepare -->
 ```bash
-# This model needs no preparation step.
+# [spec] drafter gemma4_assistant @ hub 6e5aaaf4; model.safetensors sha256 006c8713b29b046e296c0f0b7c524aa9264ae07ae8b0c3888b9bc062242297ff: re-key it beside the target shards
+nix develop --command python3 scripts/gemma4_mtp_rekey.py "$G26_MTP_ASSISTANT" "$CKPT"
+nix develop --command python3 scripts/gemma4_mtp_fp8.py "$CKPT"
+# produces: $CKPT/model-mtp.safetensors (sha256 9e899298473493a366df2548e5f4398e17237394df3b9715583457718048b314)
 ```
 <!-- /plow:recipe:prepare -->
 
@@ -46,6 +49,8 @@ nix develop --command env \
   PLOW_EMIT_MOE_PF_LT=1 \
   PLOW_EMIT_PACKED_PREFILL=1 \
   PLOW_EMIT_PREFILL_CUBLASLT=1 \
+  PLOW_EMIT_SPAN_VERIFY=1 \
+  PLOW_EMIT_SPEC=1 \
   PLOW_FA_MMAQK=3 \
   PLOW_FP8=1 \
   PLOW_FP8_HEAD=1 \
@@ -61,6 +66,11 @@ nix develop --command env \
   PLOW_SEG_PURE_GEMM=fp8 \
   PLOW_SLIDING_NS_CAP=1 \
   PLOW_SLIDING_NS_GRID=1 \
+  PLOW_SPEC_DRAFT_DIR={env:G26_MTP_ASSISTANT} \
+  PLOW_SPEC_DRAFT_FP8=all \
+  PLOW_SPEC_KMAX=7 \
+  PLOW_SPEC_ROWS=1,2,4,8,16 \
+  PLOW_SPEC_SHARD_SHA256=9e899298473493a366df2548e5f4398e17237394df3b9715583457718048b314 \
   PLOW_TMA_GEMM=1 \
   PLOW_W8A8=1 \
   ./target/release/plowc \
@@ -117,6 +127,7 @@ nix develop --command env \
   PLOW_PF_SEG_FA512=1 \
   PLOW_PF_SEG_PURE=fp8 \
   PLOW_PREFIX_CACHE=1 \
+  PLOW_SPEC=1 \
   PLOW_TERMINAL_LT=0 \
   PLOW_TOKEN_BATCH=1 \
   PLOW_VMM_LIVE_RINGS=1 \

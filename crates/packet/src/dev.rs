@@ -318,7 +318,7 @@ pub enum DevOp {
     /// causal KV-split `ns`, bit 8 = `W_ofold`) — and the two ops never meet: 22 is decode,
     /// 51 is prefill.
     GemvQkv = 22,
-    /// `t0=C t1=x t2=W(fp8) t3=resid_out t4=b t5=w_scale(f32[N]) t6=gamma_b t7=gamma_n` ·
+    /// `t0=C t1=x t2=W(fp8) t3=resid_out? t4=b? t5=w_scale(f32[N]) t6=gamma_b? t7=gamma_n?` ·
     /// `i0=M i1=N i2=K i3=nrn i4=a_row0` · `f0=eps f1=scale`. The fp8 (w8a16) twin
     /// of [`DevOp::Gemv`]: the weight row is `uint8[K]` OCP e4m3, so decode streams HALF the bytes
     /// (~2x the bandwidth-bound decode roofline). Each fp8 is converted to bf16 on load and the
