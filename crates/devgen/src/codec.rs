@@ -663,9 +663,15 @@ pub(crate) fn fused_conv(
         None => (c.alpha.clone(), None),
     };
     let dual = dual && !taps;
-    let fuse_in = act_in && !ct && !taps && (dual || fuse.input_act(&c.weight, c.kernel, true));
-    let fuse_out =
-        c.act_out != Activation::None && (dual || taps || fuse.output_act(&c.weight, true));
+    // SnakeBeta (two parameter arrays) only runs as its own unary pass.
+    let fuse_in = act_in
+        && c.act_in != Activation::SnakeBeta
+        && !ct
+        && !taps
+        && (dual || fuse.input_act(&c.weight, c.kernel, true));
+    let fuse_out = c.act_out != Activation::None
+        && c.act_out != Activation::SnakeBeta
+        && (dual || taps || fuse.output_act(&c.weight, true));
     let fuse_res =
         c.residual.is_some() && (c.row_scale.is_some() || fuse.residual(&c.weight, true));
     let (mut x, mut dep) = (x, dep);

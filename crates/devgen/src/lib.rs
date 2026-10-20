@@ -11341,7 +11341,7 @@ fn emit_dense_gqa(
         let fish = std::fs::read(dir.join("config.json"))
             .ok()
             .and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok())
-            .is_some_and(|v| v["model_type"] == "fish_dac");
+            .is_some_and(|v| v["model_type"] == "fish_dac" || v["model_type"] == "qwen3_tts_12hz");
         let (model, section) = if fish {
             fish_codec::lower_fish_dac(dir, n_cu, m.target, ecfg.snac_split_bf16)
         } else {

@@ -314,6 +314,8 @@ pub enum Activation {
     Clamp,
     ScaleShift,
     Relu,
+    /// [`packet::dev::ACT_SNAKE_BETA`]: unary only (its parameter is two arrays).
+    SnakeBeta,
 }
 
 impl Activation {
@@ -336,6 +338,7 @@ impl Activation {
             Activation::Clamp => ACT_CLAMP,
             Activation::ScaleShift => ACT_SCALE_SHIFT,
             Activation::Relu => ACT_RELU,
+            Activation::SnakeBeta => ACT_SNAKE_BETA,
         }
     }
 }
@@ -1560,7 +1563,10 @@ impl StageProgram {
         self.input(x, bytes, "unary input")?;
         let output = self.resolve(stage.output, bytes, "unary output")?;
         let param = match stage.param {
-            Some(param) => self.resolve(param, u64::from(stage.width) * 4, "unary parameter")?,
+            Some(param) => {
+                let arrays = if stage.kind == Activation::SnakeBeta { 2 } else { 1 };
+                self.resolve(param, u64::from(stage.width) * 4 * arrays, "unary parameter")?
+            }
             None => packet::dev::TENSOR_NONE,
         };
         let elements = product(&[stage.rows, stage.width])?;

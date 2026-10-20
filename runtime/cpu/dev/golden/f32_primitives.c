@@ -502,7 +502,8 @@ G_K(g_sample_fish_bf16) {
     }
 }
 
-/* GemvF32Out (220): fp32 rows, the device's per-element fma order over k. */
+/* GemvF32Out (220): fp32 rows, sequential fma over k (the device sums lane partials, so results
+ * agree to fp32 rounding, not bit for bit). */
 G_K(g_gemv_f32_out) {
     (void)ctx;
     float* c = PLOW_CPU_TEN(in, T, 0);
@@ -999,6 +1000,11 @@ G_K(g_unary_f32) {
     for (uint32_t row = lo; row < hi; row++)
         for (uint32_t column = 0; column < width; column++) {
             const size_t i = (size_t)row * stride + col0 + column;
+            if (kind == 19u) { /* SnakeBeta: param = [a | r] */
+                const float s = sinf(x[i] * param[column]);
+                out[i] = fmaf(param[width + column], s * s, x[i]);
+                continue;
+            }
             out[i] = g_act_f32(kind, x[i], param ? param[column] : in->fj[0].f, in->fj[1].f);
         }
 }

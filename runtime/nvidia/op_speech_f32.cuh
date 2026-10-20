@@ -2464,6 +2464,20 @@ static __device__ __noinline__ void d_unary_f32(const PlowDevInst* in, void* con
     const unsigned stride = in->i[3] ? in->i[3] : width, col0 = in->i[4];
     if (!width || (uint64_t)rows * width > 0xFFFFFFFFull) return;
     const float p0 = in->fj[0].f;
+    if (kind == 19u) { /* SnakeBeta: param = [a | r] */
+        if (!param) return;
+        sp_batched<4>(
+            rows * width, slice, nblk,
+            [&](unsigned e) {
+                const unsigned row = e / width;
+                return x[(size_t)row * stride + col0 + e - row * width];
+            },
+            [&](unsigned e, float v) {
+                const unsigned row = e / width, c = e - row * width;
+                out[(size_t)row * stride + col0 + c] = fmaf(param[width + c], sp_sin2(v * param[c]), v);
+            });
+        return;
+    }
     const bool vec = width % 4u == 0 && stride % 4u == 0 && col0 % 4u == 0 && sp_aligned(x, 16) &&
                      sp_aligned(out, 16) && (!param || sp_aligned(param, 16));
     if (vec) {

@@ -2437,7 +2437,8 @@ pub enum DevOp {
     GemvF32Out = 220,
     /// Small-vocabulary sampling of an f32 logit row (one block per row; Breeze TTS): with a
     /// `bitmap`, classes whose bit is set take the HF repetition penalty (`l > 0 ? l / pen : l *
-    /// pen`); then `/ T`, the top `min(ctl[r][0], 64)` classes (ties to the lower class), the shifted
+    /// pen`); then `/ T`, the top `min(ctl[r][0], 64)` classes (exactly that many: ties at the cutoff
+    /// go to the lower class, where HF's threshold keeps every tied class), the shifted
     /// nucleus when `top_p < 1` (keep class `i` while the probability mass before it is `<= top_p`;
     /// the first always stays), and a Gumbel race `argmax l_i / T + G_i` with `G_i` from the
     /// counter hash of `(seed[r], ctl[r][1], i4, 0, i)` (as [`DevOp::SampleFishBf16`]). A `force`
@@ -2490,6 +2491,9 @@ pub const ACT_SQRT: u32 = 16;
 pub const ACT_GELU_TANH: u32 = 17;
 /// Round to bf16, round-to-nearest-even ([`DevOp::UnaryF32`] only).
 pub const ACT_ROUND_BF16: u32 = 18;
+/// SnakeBeta `x + r sin^2(a x)` with `a = param[c]`, `r = param[width + c]` (the exporter's
+/// `exp(alpha)` and `1 / (exp(beta) + 1e-9)`; [`DevOp::UnaryF32`] only, `param` required).
+pub const ACT_SNAKE_BETA: u32 = 19;
 
 /// GLU-family `act` code for GPT-OSS's `swiglu_oai` (pair form, `f0 = alpha`, `f1 = limit`).
 /// Codes 0/1/2 are gelu_tanh / silu / situ; see [`DevOp::Glu`].

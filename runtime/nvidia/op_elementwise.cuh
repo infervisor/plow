@@ -275,7 +275,7 @@ static __device__ void d_gemv_f32out(float* __restrict__ C, const __nv_bfloat16*
 /* SampleSmallF32 (op 221): one block per row of f32 logits; see dev.rs. Arena: PLOW_NV_WARPS u64 +
  * PLOW_NV_WARPS f32 reduction slots, 64 selected classes and values, then the row (f32). */
 static __device__ __forceinline__ unsigned long long f32_key(float f, unsigned i) {
-    const unsigned b = __float_as_uint(f);
+    const unsigned b = __float_as_uint(f + 0.f); /* -0 ranks as +0 (the golden's comparison) */
     const unsigned key = (b & 0x80000000u) ? ~b : (b | 0x80000000u);
     return ((unsigned long long)key << 32) | (unsigned long long)(~i);
 }
