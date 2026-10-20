@@ -20,6 +20,7 @@ use crate::Tn;
 pub(crate) const KMAX: u32 = 7;
 const ROWS: [u32; 5] = [1, 2, 4, 8, 16];
 const SHARD: &str = "model-mtp.safetensors";
+const FP8_SHARD: &str = "model-mtp-fp8.safetensors";
 const AMAX_BLOCKS: u32 = 64;
 const BF16: u64 = 2;
 const I32: u64 = 4;
@@ -49,7 +50,8 @@ fn draft_dir() -> std::path::PathBuf {
         .into()
 }
 
-fn safetensors_header(path: &Path) -> serde_json::Map<String, Value> {
+/// The tensor entries and the `__metadata__` object of a safetensors file.
+fn safetensors_header(path: &Path) -> (serde_json::Map<String, Value>, Value) {
     use std::io::Read;
     let mut f =
         std::fs::File::open(path).unwrap_or_else(|e| refuse(format!("{}: {e}", path.display())));
@@ -61,8 +63,8 @@ fn safetensors_header(path: &Path) -> serde_json::Map<String, Value> {
         .unwrap_or_else(|e| refuse(format!("{}: {e}", path.display())));
     let mut v: serde_json::Map<String, Value> = serde_json::from_slice(&h)
         .unwrap_or_else(|e| refuse(format!("{}: bad header: {e}", path.display())));
-    v.remove("__metadata__");
-    v
+    let meta = v.remove("__metadata__").unwrap_or(Value::Null);
+    (v, meta)
 }
 
 impl DraftCfg {
@@ -257,6 +259,8 @@ struct LayerW {
 
 pub(crate) struct Tensors {
     cfg: DraftCfg,
+    /// bf16 weight handle -> (e4m3 twin, f32 per-row scale) under PLOW_SPEC_DRAFT_FP8.
+    fp8: std::collections::HashMap<u32, (u32, u32)>,
     rows: u32,
     tokens: Vec<u32>,
     hidden_row: u32,
@@ -312,7 +316,7 @@ pub(crate) fn declare(b: &mut Builder, c: &Cfg, dbatch: u32, span_verify: bool) 
         .map(|j| b.tensor(&format!("in.spec.tokens.{j}"), r * I32))
         .collect();
     let a = |b: &mut Builder, s: &str, sz: u64| b.tensor(&format!("act.mtp.{s}"), sz);
-    let t = Tensors {
+    let mut t = Tensors {
         rows,
         tokens,
         hidden_row: b.tensor("in.spec.hidden_row", r * I32),
@@ -363,7 +367,33 @@ pub(crate) fn declare(b: &mut Builder, c: &Cfg, dbatch: u32, span_verify: bool) 
             })
             .collect(),
         cfg,
+        fp8: Default::default(),
     };
+    let fp8 = crate::emit_config::active().spec_draft_fp8.clone();
+    let twins: Vec<u32> = match fp8.as_deref() {
+        None => Vec::new(),
+        Some("head") => vec![t.emb],
+        Some("all") => [t.emb, t.pre_e, t.pre_h, t.post]
+            .into_iter()
+            .chain(
+                t.layers
+                    .iter()
+                    .flat_map(|l| [l.q, l.o, l.gate, l.up, l.down]),
+            )
+            .collect(),
+        Some(o) => refuse(format!("PLOW_SPEC_DRAFT_FP8={o} (head | all)")),
+    };
+    let shapes = t.cfg.expected(c);
+    for h in twins {
+        let name = b.tensor_name(h).to_string();
+        let (_, shape) = shapes
+            .iter()
+            .find(|(n, _)| *n == name)
+            .unwrap_or_else(|| refuse(format!("no shape for {name}")));
+        let w8 = b.tensor(&format!("fp8/{name}"), shape[0] * shape[1]);
+        let s8 = b.tensor(&format!("fp8/{name}_scale"), shape[0] * 4);
+        t.fp8.insert(h, (w8, s8));
+    }
     t
 }
 
@@ -466,10 +496,20 @@ fn program(
     let span = |n: u32| -> Vec<u32> { (0..n.max(1).min(n_cu)).collect() };
     let nb = if rows > 1 { rows } else { 0 };
     let gemv = |b: &mut Builder, dep: &[u32], out: u32, x: u32, w: u32, nout: u32, kin: u32| {
-        b.emit(DevOp::Gemv, all.clone(), dep, |i| {
+        let w8 = t.fp8.get(&w).copied();
+        let op = if w8.is_some() {
+            DevOp::GemvFp8
+        } else {
+            DevOp::Gemv
+        };
+        b.emit(op, all.clone(), dep, |i| {
             i.t[0] = out;
             i.t[1] = x;
             i.t[2] = w;
+            if let Some((w8, s8)) = w8 {
+                i.t[2] = w8;
+                i.t[5] = s8;
+            }
             i.i[0] = rows;
             i.i[1] = nout;
             i.i[2] = kin;
@@ -562,11 +602,23 @@ fn program(
                 i.f[0] = d.eps;
                 i.f[1] = 1.0;
             });
-            let c_gu = b.emit(DevOp::GemvGlu, all.clone(), &[c_r1], |i| {
+            let glu8 = t.fp8.get(&w.gate).zip(t.fp8.get(&w.up));
+            let glu_op = if glu8.is_some() {
+                DevOp::GemvGluFp8
+            } else {
+                DevOp::GemvGlu
+            };
+            let c_gu = b.emit(glu_op, all.clone(), &[c_r1], |i| {
                 i.t[0] = t.fu;
                 i.t[1] = t.hn;
                 i.t[2] = w.gate;
                 i.t[5] = w.up;
+                if let Some((&(g8, gs), &(u8, us))) = glu8 {
+                    i.t[2] = g8;
+                    i.t[5] = u8;
+                    i.t[3] = gs;
+                    i.t[4] = us;
+                }
                 i.i[0] = rows;
                 i.i[1] = d.inter;
                 i.i[2] = d.hidden;
@@ -621,7 +673,7 @@ pub(crate) fn sections(
         &dir.join("tokenizer.json"),
     );
     let shard = dir.join(SHARD);
-    let header = safetensors_header(&shard);
+    let (header, _) = safetensors_header(&shard);
     let expected = t.cfg.expected(c);
     for (name, shape) in &expected {
         let got = header
@@ -644,6 +696,38 @@ pub(crate) fn sections(
             header.len(),
             expected.len()
         ));
+    }
+    if !t.fp8.is_empty() {
+        let (fp8, meta) = safetensors_header(&dir.join(FP8_SHARD));
+        if meta["source_shard_sha256"].as_str() != Some(sha256_file(&shard).as_str()) {
+            refuse(format!("{FP8_SHARD} was not made from this {SHARD}"));
+        }
+        for &h in t.fp8.keys() {
+            let name = &model.tensors[h as usize].name;
+            let (_, shape) = expected
+                .iter()
+                .find(|(n, _)| n == name)
+                .expect("declared twin");
+            for (suffix, dtype, dims) in [
+                ("", "F8_E4M3", shape.clone()),
+                ("_scale", "F32", vec![shape[0]]),
+            ] {
+                let key = format!("fp8/{name}{suffix}");
+                let got = fp8
+                    .get(&key)
+                    .unwrap_or_else(|| refuse(format!("{FP8_SHARD} lacks {key}")));
+                let gd: Vec<u64> = got["shape"]
+                    .as_array()
+                    .map(|a| a.iter().filter_map(Value::as_u64).collect())
+                    .unwrap_or_default();
+                if gd != dims || got["dtype"] != dtype {
+                    refuse(format!(
+                        "{FP8_SHARD} {key}: {gd:?} {} (expected {dims:?} {dtype})",
+                        got["dtype"]
+                    ));
+                }
+            }
+        }
     }
     let mut programs = Vec::new();
     let mut table = Vec::new();

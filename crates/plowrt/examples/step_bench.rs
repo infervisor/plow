@@ -811,6 +811,17 @@ fn draft_bench(
             &drafts[..k as usize]
         );
     }
+    // `STEP_BENCH_DRAFT_TRACE=1` with a -DPLOW_NV_TRACE object: block 0's per-op profile of one
+    // k = kmax draft launch (PLOW_TRACE_RAW gets the ordered packets).
+    if std::env::var_os("STEP_BENCH_DRAFT_TRACE").is_some() {
+        e.spec_draft_stage(&rows, kmax)?;
+        e.trace_reset()?;
+        e.spec_draft_launch()?;
+        e.spec_draft_sync()?;
+        if let Some(profile) = e.trace_summary()? {
+            println!("DRAFT_TRACE B={} k={kmax}\n{profile}", rows.len());
+        }
+    }
     if let Some(dir) = std::env::var_os("STEP_BENCH_DRAFT_DUMP").map(std::path::PathBuf::from) {
         draft_dump(e, &dir, &rows)?;
     }
