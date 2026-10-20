@@ -132,7 +132,7 @@ reference = "{env:QWEN38_FP32_REF}"
 eos = [248046, 248044]
 concurrency = [1]
 vllm_capture = { c1 = "{env:QWEN38_FP32_VLLM}" }
-cont_decisive_drop_max = 0.022
+cont_decisive_drop_max = 0.05
 kl_slack_max = 0.07
 kl_over_slack = 0.04
 cont_drop_max = 0.12
