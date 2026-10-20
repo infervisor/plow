@@ -16,6 +16,7 @@ const LOCAL_REACH: u32 = 256;
 pub struct TextEncoder {
     e: Mutex<GpuEngine>,
     width: usize,
+    rows: usize,
     /// The encoder's own tokenizer (the sub-bundle's `tokenizer.json`).
     pub tok: Arc<dyn crate::text::tokenizer::Tokenize>,
 }
@@ -34,6 +35,7 @@ impl TextEncoder {
             ));
         }
         Ok(TextEncoder {
+            rows: e.pf_max_rows(),
             e: Mutex::new(e),
             width,
             tok: crate::text::tokenizer::load_tokenizer(dir),
@@ -42,6 +44,11 @@ impl TextEncoder {
 
     pub fn width(&self) -> usize {
         self.width
+    }
+
+    /// Most prompt rows one segment may have.
+    pub fn rows(&self) -> usize {
+        self.rows
     }
 
     /// `[ids.len()][width]` f32 rows for one segment.

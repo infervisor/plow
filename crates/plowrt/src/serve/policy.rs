@@ -340,7 +340,7 @@ pub fn co_sched(models: usize, amd: bool) -> crate::serve::cosched::CoSched {
     }
     match (models > 1, amd, objective()) {
         (false, _, _) => CoSched::Free,
-        (true, true, _) | (true, false, Objective::Throughput) => CoSched::Rr,
+        (true, true, _) => CoSched::Rr,
         (true, false, _) => CoSched::Deadline,
     }
 }

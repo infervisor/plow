@@ -4041,8 +4041,12 @@ fn run_one_tick(
                                 let t_emit =
                                     host_engine_call(t_call, feeds.len(), tokens_this_tick);
                                 decode_progress = completed_decode(&feeds, 1);
-                                if let Err(err) =
-                                    gpu_depth_frames(&mut *e, &feeds, &mut slots, &mut toks)
+                                let depth = e.has_depth_stage();
+                                if let Err(err) = depth
+                                    .then(|| {
+                                        gpu_depth_frames(&mut *e, &feeds, &mut slots, &mut toks)
+                                    })
+                                    .unwrap_or(Ok(()))
                                 {
                                     note_fault(&mut tick_fault, &err);
                                     fail_feeds(&mut slots, &feeds, &arena, &err);
@@ -4069,8 +4073,13 @@ fn run_one_tick(
                                 }
                                 for (&(i, _), &argmax_tok) in feeds.iter().zip(toks.iter()) {
                                     let slot_opt = &mut slots[i];
-                                    let was_dev = cfg_drawn
-                                        && slot_opt.as_ref().is_some_and(|s| s.cfg.is_some())
+                                    // A depth slot's token is the depth stage's cb0 draw (its frame).
+                                    let was_dev = depth
+                                        && slot_opt.as_ref().is_some_and(|s| {
+                                            s.speech.as_ref().is_some_and(|sp| sp.depth.is_some())
+                                        })
+                                        || cfg_drawn
+                                            && slot_opt.as_ref().is_some_and(|s| s.cfg.is_some())
                                         || dev_specs
                                             .as_ref()
                                             .map(|_| {
@@ -7757,6 +7766,14 @@ fn gpu_finish_token(
     slot: &mut Slot,
     argmax_tok: u32,
 ) -> Result<u32> {
+    if slot
+        .speech
+        .as_ref()
+        .and_then(|s| s.depth.as_ref())
+        .is_some()
+    {
+        return Ok(argmax_tok);
+    }
     if let Some(run) = slot.cfg.as_mut() {
         e.logits_row(row + 1, &mut run.uncond)?;
         e.logits_row(row, &mut run.cond)?;

@@ -878,11 +878,15 @@ async fn speech_with(
         top_k: checked.sampling.top_k.unwrap_or(0),
         seed: checked.seed,
     };
-    let segs: Vec<Segment> = super::segments(&req.input, c.segment_chars())
-        .into_iter()
-        .enumerate()
-        .map(|(k, t)| maker.make(k, t))
-        .collect();
+    let mut segs: Vec<Segment> = Vec::new();
+    for t in super::segments(&req.input, c.segment_chars()) {
+        if !maker.make_fitting(t, &mut segs) {
+            return bad(
+                "`instructions` leave no room for text in the text encoder's prompt",
+                "instructions",
+            );
+        }
+    }
 
     let need = super::realtime::Need {
         stream: req.stream,
@@ -1161,6 +1165,33 @@ impl SegmentMaker {
 }
 
 impl SegmentMaker {
+    /// Append `text`'s segments: a text-encoder prompt is one launch, so a segment whose prompt
+    /// exceeds the encoder is halved (at whitespace when it can) until each fits. `false` when a
+    /// single character does not fit.
+    fn make_fitting(&self, text: &str, out: &mut Vec<Segment>) -> bool {
+        let s = self.make(out.len(), text);
+        let rows = self.encoder.as_ref().map_or(usize::MAX, |e| e.rows());
+        if s.enc_ids.as_ref().is_none_or(|ids| ids.len() <= rows) {
+            out.push(s);
+            return true;
+        }
+        let chars: Vec<char> = text.chars().collect();
+        if chars.len() < 2 {
+            return false;
+        }
+        let mid = chars.len() / 2;
+        let cut = (1..mid)
+            .rev()
+            .find(|&i| chars[i].is_whitespace())
+            .unwrap_or(mid);
+        let (a, b) = chars.split_at(cut);
+        [a, b].iter().all(|half| {
+            let half: String = half.iter().collect();
+            let half = half.trim();
+            half.is_empty() || self.make_fitting(half, out)
+        })
+    }
+
     /// A depth-stage packet's per-segment sampling and, with a text encoder, its prompt rows
     /// (`None` for codec-token packets).
     fn speech(&self, s: &Segment) -> Result<Option<Box<crate::serve::mux::SpeechJob>>, String> {
@@ -1208,15 +1239,23 @@ impl SegmentMaker {
             };
             // Breeze's reference samples with f32 parameters.
             let param = |x: f32| if c.breeze_sampler { x } else { bf16(x) };
+            // The depth samplers divide by temperature: greedy is top-k 1 at temperature 1.
+            let greedy = self.temperature <= 0.0;
             Ok(Some(Box::new(crate::serve::mux::SpeechJob {
                 cfg,
                 overlay,
                 overlay_pos,
                 depth: Some(crate::serve::mux::DepthJob {
                     seed: s.gen.seed.unwrap_or(self.seed),
-                    temperature: param(self.temperature),
+                    temperature: if greedy { 1.0 } else { param(self.temperature) },
                     top_p: param(self.top_p),
-                    top_k: if self.top_k == 0 { c.top_k } else { self.top_k } as u32,
+                    top_k: if greedy {
+                        1
+                    } else if self.top_k == 0 {
+                        c.top_k as u32
+                    } else {
+                        self.top_k as u32
+                    },
                     ras_temperature: bf16(1.0),
                     ras_top_p: bf16(0.9),
                     repetition_penalty: if c.breeze_sampler {

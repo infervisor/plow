@@ -15,6 +15,8 @@ are the same steps by hand):
 | Veena | `recipes/infervisor/veena/sm90a-h100-tp1.toml` |
 | Chatterbox | `recipes/infervisor/chatterbox/sm90a-h100-tp1.toml` |
 | Chatterbox Multilingual V3 | `recipes/infervisor/chatterbox-mtl/sm90a-h100-tp1.toml` |
+| Fish S2 Pro (non-commercial weights) | `recipes/infervisor/fish-s2-pro/sm90a-h100-tp1.toml` |
+| Breeze TTS 2 (non-commercial weights) | `recipes/infervisor/breeze-tts-2/sm90a-h100-tp1.toml` |
 | Qwen3-ASR | `recipes/infervisor/qwen3-asr/sm90a-h100-tp1.toml` |
 
 ```sh
@@ -582,7 +584,7 @@ it in one order with one set of messages, then runs on the model's engine (`tts:
 | `language` | one of the card's `languages` (default `default_language`); a model without languages rejects it |
 | `temperature`, `top_p` | honoured on every model (defaults: the card's `defaults`) |
 | `max_tokens` | the model's audio tokens per segment, 1..card `max_tokens` |
-| `seed` | same seed, text and settings: same audio; unseeded requests sample anew |
+| `seed` | same seed, text and settings at the same concurrency: same speech tokens (batched decode is not bitwise batch-invariant); whole and stream replies share those tokens, but the windowed stream codec differs from a whole decode (~2% rel-L2 on Veena; identical on Breeze); unseeded requests sample anew |
 | `speed` | 1.0 only |
 | `top_k`, `repetition_penalty`, `cfg_weight`, `instructions`, `ref_audio` + `ref_text` | optional controls: taken where the card declares them (`defaults.top_k`, `defaults.repetition_penalty`, `defaults.cfg_weight`, `instructions`, `voice_cloning`), else 400 naming the field; a sampler with a bounded top-k (`limits.top_k_max`, Fish S2) takes `top_k` in 1..that bound and cannot turn it off |
 

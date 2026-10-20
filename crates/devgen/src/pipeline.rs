@@ -1575,6 +1575,9 @@ impl StageProgram {
                     "unary parameter",
                 )?
             }
+            None if stage.kind == Activation::SnakeBeta => {
+                return Err("SnakeBeta needs its alpha/beta parameter".into())
+            }
             None => packet::dev::TENSOR_NONE,
         };
         let elements = product(&[stage.rows, stage.width])?;

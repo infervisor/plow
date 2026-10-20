@@ -553,7 +553,7 @@ G_K(g_sample_small_f32) {
                 v = u + m;
             }
             if (bm && ((bm[i >> 5] >> (i & 31u)) & 1u)) v = v > 0.f ? v / p[2] : v * p[2];
-            L[i] = v / p[0];
+            L[i] = p[0] > 0.f ? v / p[0] : v;
         }
         for (uint32_t k = 0; k < K; k++) {
             uint32_t best = 0;

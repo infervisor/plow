@@ -10270,6 +10270,11 @@ fn emit_dense_gqa(
         c.mm_spans = contract.has_spans();
         (towers, contract)
     });
+    // The span handle shares i7 with the split count; only the NVIDIA FlashPrefill arm reads it.
+    assert!(
+        !c.encoder || arch.starts_with("sm_"),
+        "encoder-mode packets (plow_encoder) target sm_* only"
+    );
     // Resolve the block range now that layer count is known. `l` -> l..l+1;
     // `l..r` -> that half-open range. Absent => the full model (0..layers),
     // which makes every gated site below byte-identical to the pre-block path.

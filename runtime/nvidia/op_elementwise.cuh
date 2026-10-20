@@ -309,7 +309,7 @@ static __device__ void d_sample_small(unsigned* __restrict__ out, const float* _
             float v = lg[i];
             if (lu) v = __fadd_rn(lu[i], __fmul_rn(cs, __fsub_rn(v, lu[i])));
             if (bm && ((bm[i >> 5] >> (i & 31u)) & 1u)) v = v > 0.f ? __fdiv_rn(v, pen) : v * pen;
-            L[i] = __fdiv_rn(v, t);
+            L[i] = t > 0.f ? __fdiv_rn(v, t) : v;
         }
         __syncthreads();
         for (unsigned k = 0; k < K; k++) {

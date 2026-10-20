@@ -2,8 +2,6 @@
 //! stages each row's sampling inputs, launches the packet's depth program of a width covering the
 //! rows' slots on the decode interpreter, and reads each row's frame codes back.
 
-use std::path::Path;
-
 use plow_asset::fish_depth::{Manifest, Sampler};
 
 use crate::asset::devblob::DevBlob;
@@ -65,50 +63,23 @@ fn reject(e: impl std::fmt::Display) -> RuntimeError {
 }
 
 impl FishDepth {
-    /// The packet's depth stage, `None` when it carries none.
-    pub(super) fn load_if_present(e: &GpuEngine, assets: &Path) -> Result<Option<Self>> {
-        let Some(pkt) = DevBlob::find_in_dir(assets)? else {
+    /// The packet's depth stage, `None` when it carries none; read from the engine's own blob.
+    pub(super) fn load_if_present(
+        e: &GpuEngine,
+        blob: &DevBlob,
+        raw: &[u8],
+    ) -> Result<Option<Self>> {
+        let Some(meta) = blob.reserved_metadata(raw, plow_asset::fish_depth::SECTION)? else {
             return Ok(None);
         };
-        let raw = std::fs::read(&pkt).map_err(|source| RuntimeError::Io {
-            path: pkt.clone(),
-            source,
-        })?;
-        let blob = DevBlob::parse(&raw)?;
-        if blob
-            .reserved_metadata(&raw, plow_asset::fish_depth::SECTION)?
-            .is_none()
-        {
-            return Ok(None);
-        }
-        Self::load(e, assets).map(Some)
-    }
-
-    fn load(e: &GpuEngine, assets: &Path) -> Result<Self> {
-        let pkt = DevBlob::find_in_dir(assets)?
-            .ok_or_else(|| reject(format!("no packet in {}", assets.display())))?;
-        let raw = std::fs::read(&pkt).map_err(|source| RuntimeError::Io {
-            path: pkt.clone(),
-            source,
-        })?;
-        let blob = DevBlob::parse(&raw)?;
-        let meta = blob
-            .reserved_metadata(&raw, plow_asset::fish_depth::SECTION)?
-            .ok_or_else(|| reject("packet carries no depth stage"))?;
         let manifest: Manifest = serde_json::from_slice(meta).map_err(reject)?;
         let bytes = blob
-            .reserved_metadata(&raw, plow_asset::fish_depth::PROGRAMS_SECTION)?
+            .reserved_metadata(raw, plow_asset::fish_depth::PROGRAMS_SECTION)?
             .ok_or_else(|| reject("depth programs section missing"))?;
-        if blob.n_cu != e.grid
-            || blob.tensors.len() != e.devp.len()
-            || blob
-                .tensors
-                .iter()
-                .zip(e.tensor_names.iter().zip(&e.devp))
-                .any(|(t, (name, mem))| t.name != *name || mem.len < t.bytes)
-        {
-            return Err(reject("packet does not match the loaded engine"));
-        }
+        Self::load(e, manifest, bytes).map(Some)
+    }
+
+    fn load(e: &GpuEngine, manifest: Manifest, bytes: &[u8]) -> Result<Self> {
         let section =
             plow_asset::aux_program::parse(bytes, e.grid, e.devp.len()).map_err(reject)?;
         manifest
@@ -123,9 +94,15 @@ impl FishDepth {
             || !need(t.seed, rows * 8)
             || !need(t.history, e.batch * manifest.ras_window as usize * 4)
             || !need(t.frame_codes, e.batch * k * 4)
-            || [t.top_k, t.step, t.hidden_row]
-                .iter()
-                .any(|&h| !need(h, rows * 4))
+            || !need(
+                t.top_k,
+                rows * if manifest.sampler == Sampler::Breeze {
+                    8
+                } else {
+                    4
+                },
+            )
+            || [t.step, t.hidden_row].iter().any(|&h| !need(h, rows * 4))
         {
             return Err(reject("tensor sizes disagree with the program widths"));
         }
@@ -162,24 +139,28 @@ impl FishDepth {
 }
 
 impl GpuEngine {
-    /// Load the packet's depth stage (a Fish S2 packet).
-    pub fn fish_depth_enable(&mut self, assets: &Path) -> Result<FishInfo> {
-        let d = FishDepth::load(self, assets)?;
-        let m = &d.manifest;
-        let info = FishInfo {
+    /// The loaded depth stage's frame layout (a depth-stage packet).
+    pub fn fish_info(&self) -> Result<FishInfo> {
+        let m = &self
+            .fish
+            .as_ref()
+            .ok_or_else(|| reject("not enabled"))?
+            .manifest;
+        Ok(FishInfo {
             codebooks: m.codebooks as usize,
             semantic_base: m.semantic_base,
             semantic_tokens: m.semantic_tokens,
             stop_class: m.stop_class,
             pair_cfg: m.pair_cfg,
-        };
-        self.fish = Some(d);
-        Ok(info)
+        })
     }
 
     /// Start a request on `slot`: an empty RAS history.
     pub fn fish_reset_slot(&mut self, slot: usize) -> Result<()> {
         let d = self.fish.as_ref().ok_or_else(|| reject("not enabled"))?;
+        if slot >= self.batch {
+            return Err(reject("slot out of range"));
+        }
         let w = d.manifest.ras_window as usize * 4;
         let h = &self.devp[usize::from(d.manifest.tensors.history)];
         self.be
@@ -188,6 +169,9 @@ impl GpuEngine {
 
     /// A prompt's first frame samples from prefill's logits (row 0): move them to `slot`'s row.
     pub fn fish_logits_to_slot(&mut self, slot: usize) -> Result<()> {
+        if slot >= self.batch {
+            return Err(reject("slot out of range"));
+        }
         if slot == 0 {
             return Ok(());
         }

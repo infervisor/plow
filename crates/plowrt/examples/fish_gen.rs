@@ -42,7 +42,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let assets = PathBuf::from(&a[1]);
     let be = Arc::new(plowrt::device::cuda::CudaBackend::new(0)?);
     let mut e = GpuEngine::load(be, &assets, &PathBuf::from(&a[2]))?;
-    let info = e.fish_depth_enable(&assets)?;
+    let info = e.fish_info()?;
     let prompt = read_u32(&a[3]);
     if let Some(p) = opt("--prompt-codes") {
         e.fish_prompt_codes(&read_u32(&p))?;
@@ -122,7 +122,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let ttft = t0.elapsed();
     let mut row = FishRow {
         slot: 0,
-        hidden_row: prompt.len() as u32 - 1,
+        hidden_row: e.prefill_terminal_row(),
         seed,
         step: 0,
         temperature,

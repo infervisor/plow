@@ -142,7 +142,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         )?;
     }
     let rows = 1 + usize::from(cfg.is_some());
-    let info = e.fish_depth_enable(&assets)?;
+    let info = e.fish_info()?;
     e.fish_reset_slot(0)?;
     let classes = info.stop_class as usize + 1;
     let (mut blogits, mut depth) = (Vec::new(), Vec::new());

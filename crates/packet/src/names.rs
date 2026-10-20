@@ -58,7 +58,8 @@
 ///
 /// Kept as data, not as a chain of `||`, so a test can assert over the constant rather than
 /// re-spelling the literals it is supposed to be checking.
-pub const RUNTIME_PREFIXES: &[&str] = &["act.", "in.", "kv.", "moe.", "tmap.", "state.", "scratch."];
+pub const RUNTIME_PREFIXES: &[&str] =
+    &["act.", "in.", "kv.", "moe.", "tmap.", "state.", "scratch."];
 
 /// True for a name in one of the [`RUNTIME_PREFIXES`] namespaces.
 pub fn is_runtime_tensor(name: &str) -> bool {
