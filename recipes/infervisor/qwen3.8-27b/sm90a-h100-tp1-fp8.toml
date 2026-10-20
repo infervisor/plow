@@ -6,8 +6,8 @@ schema = "plow.recipe.v1"
 namespace = "infervisor"
 name = "qwen3.8-27b"
 label = "sm90a-h100-tp1-fp8"
-status = "provisional"
-plow_git = "15ae7ec8cb1041ee70f47b40646cbf21e7c56e21"
+status = "emits"
+plow_git = "6fb60f44f9cc94201accd570ec671f7e025d5051"
 network = "qwen3.5"
 
 [target]
@@ -20,13 +20,16 @@ parallel = "tp"
 max_ctx = 16384
 toolchain = "cuda-12.9"
 
+# The packet binds per-row `fp8/<name>` + `fp8/<name>_scale` twins, which the hub FP8 checkpoint
+# ([128,128] `weight_scale_inv` grid) does not carry: build them from the BF16 checkpoint with
+# `scripts/qwen38_fp8_rekey.py <bf16-dir> <out-dir>` and point QWEN38_FP8_CHECKPOINT at the output.
 [checkpoint]
-source = "hf:Qwen/Qwen3.8-27B-FP8"
-layout = "hf-fp8"
+source = "hf:Qwen/Qwen3.8-27B"
+layout = "plow-fp8-rekey"
 
 [cell]
 name = "qwen38-27b.h100.fp8-16k-c1"
-model = "Qwen/Qwen3.8-27B-FP8"
+model = "Qwen/Qwen3.8-27B"
 revision = "local"
 hf_dir = "{env:QWEN38_FP8_CHECKPOINT}"
 gpu = "H100 SXM5"
@@ -107,6 +110,7 @@ gate_prompt = "<|im_start|>user\nWhat is the capital of France? Answer in one sh
 # 71.6 out tok/s, TPOT p50 12.3 ms, TTFT p50 194 ms, memory 71.6 GiB. Infervisor achieves
 # 39.5 out tok/s (+108% over non-TMA baseline 18.9 tok/s), TPOT p50 22.8 ms (2x speedup over
 # non-TMA 46.0 ms), TTFT p50 333 ms, memory 31.2 GiB (0.44x memory footprint vs vLLM, 56% less memory).
+# That packet's prefill object lacked PLOW_NV_FP8_PF_SCALE_WFIRST (arm guard relaxed); re-measure.
 [measured]
 tok_s = 39.5
 p50_tpot_ms = 22.8
@@ -120,19 +124,14 @@ in_lens = "128 1024 4096 7000 15000"
 concs = "1 4"
 nprompt = 32
 
-[bench.profiles.high_concurrency]
-in_lens = "128 1024 4096 7000 15000"
-concs = "16 32 64 128"
-nprompt = 384
-
 [gates]
 python = "{env:PYREF}"
 [gates.llm_fp32_ref]
 reference = "{env:QWEN38_FP32_REF}"
 eos = [248046, 248044]
-concurrency = [1]
-vllm_capture = { c1 = "{env:QWEN38_FP32_VLLM}" }
-cont_decisive_drop_max = 0.05
+concurrency = [1, 8, 32]
+vllm_capture = { c1 = "{env:QWEN38_FP32_VLLM}", c8 = "{env:QWEN38_FP32_VLLM_C8}", c32 = "{env:QWEN38_FP32_VLLM_C32}" }
+cont_decisive_drop_max = 0.022
 kl_slack_max = 0.07
 kl_over_slack = 0.04
 cont_drop_max = 0.12

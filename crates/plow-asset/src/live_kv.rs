@@ -685,7 +685,10 @@ fn direct_operands(op: DevOp, d: &DevInst64, packet: &Packet<'_>) -> Result<()> 
                 return Ok(());
             }
             if d.i[6] != 0 {
-                require(d.i[7] != 0 && d.i[3] != 0, "missing FP8 GLU tensor-map operands")?;
+                require(
+                    d.i[7] != 0 && d.i[3] != 0,
+                    "missing FP8 GLU tensor-map operands",
+                )?;
             }
             for (handle, source, rows, is_weight) in [
                 (d.i[6], d.t[1], u64::from(d.i[0]), false),
