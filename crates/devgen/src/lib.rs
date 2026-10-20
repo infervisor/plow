@@ -4201,7 +4201,13 @@ fn emit_phase(
     let rows_max = chunk_rows(c, ctx);
     let xr_elems = t * c.hidden;
     let slot_b = rows_max * c.hidden * BF16 as u32;
-    let rows: Vec<u32> = (0..t.min(n_cu).max(1)).collect();
+    let narrow_top = decode && gemv_family && emit_config::active().decode_narrow_top;
+    let nrows = t.min(n_cu).max(1);
+    let rows: Vec<u32> = if narrow_top {
+        (n_cu - nrows..n_cu).collect()
+    } else {
+        (0..nrows).collect()
+    };
     // Elementwise ops sized to their ACTUAL work, not handed the whole machine.
     //
     // A decode residual is 5376 elements. On 256 CUs that is 21 elements each -- the op is
@@ -5386,8 +5392,16 @@ fn emit_phase(
         // MEASURED (n=6 interleaved, Gemma-4-31B bf16, ctx 1024): 4 -> 32 workgroups is
         // 18.057 -> 18.460 ms/token, a REGRESSION. Do not widen this without first changing the
         // head->wave map, which cannot be done at hd=256 without breaking pair locality.
-        let hn_cus: Vec<u32> = (0..((t * heads).div_ceil(8)).min(n_cu).max(1)).collect();
-        let nhn = hn_cus.len() as u32;
+        let nhn = (t * heads).div_ceil(8).min(n_cu).max(1);
+        // PLOW_DECODE_NARROW_TOP mirrors the sets onto the last CUs.
+        let hn_range = |lo: u32, hi: u32| -> Vec<u32> {
+            if narrow_top {
+                (n_cu - hi..n_cu - lo).collect()
+            } else {
+                (lo..hi).collect()
+            }
+        };
+        let hn_cus: Vec<u32> = hn_range(0, nhn);
         // q/k/v HEADNORM ON DISJOINT CU SETS. The three are mutually INDEPENDENT -- each depends
         // only on its own projection, never on the others -- but all three were emitted on the
         // SAME `hn_cus`, so a workgroup had to finish q before it could start k. At decode
@@ -5417,7 +5431,7 @@ fn emit_phase(
         let hn_split = 3 * nhn <= n_cu && emit_config::active().hn_split;
         let hn_set = |i: u32| -> Vec<u32> {
             if hn_split {
-                (i * nhn..(i + 1) * nhn).collect()
+                hn_range(i * nhn, (i + 1) * nhn)
             } else {
                 hn_cus.clone()
             }

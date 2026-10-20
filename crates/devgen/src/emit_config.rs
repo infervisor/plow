@@ -382,6 +382,11 @@ pub struct EmitConfig {
     #[arg(long, env = "PLOW_FUSE_KV_HNR", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
     pub fuse_kv_hnr: bool,
 
+    /// GEMV-family decode: the row-parallel norms and the head-norms run on the TOP CUs, clear
+    /// of the GEMV and attention slices that fill the machine from CU 0.
+    #[arg(long, env = "PLOW_DECODE_NARROW_TOP", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
+    pub decode_narrow_top: bool,
+
     /// Blocks for the one-row MoE combine (arms the all-block combine; 0/1 = today's single CTA).
     #[arg(long, env = "PLOW_MOE_COMBINE_BLOCKS")]
     pub moe_combine_blocks: Option<u32>,
@@ -1575,6 +1580,7 @@ impl EmitConfig {
             nv_fa_split_prefill: env_bool_default_true("PLOW_NV_FA_SPLIT_PREFILL"),
             hn_split: env_bool("PLOW_HN_SPLIT"),
             fuse_kv_hnr: env_bool("PLOW_FUSE_KV_HNR"),
+            decode_narrow_top: env_bool("PLOW_DECODE_NARROW_TOP"),
             moe_combine_blocks: env_u32("PLOW_MOE_COMBINE_BLOCKS"),
             fa_gf_full: env_u32("PLOW_FA_GF_FULL"),
             attention_decode_balance_gf: env_u32("PLOW_ATTENTION_DECODE_BALANCE_GF"),
