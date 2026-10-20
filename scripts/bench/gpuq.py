@@ -78,7 +78,6 @@ def work(root):
             with (root / (path.stem + ".log")).open("ab") as log:
                 # The runner outlives submitters; a later job must not inherit the first job's Plow knobs.
                 child_env = {key: value for key, value in os.environ.items() if not key.startswith("PLOW_")}
-                child_env.setdefault("GPU_LEASE_TIMEOUT", "14400")
                 # Metal has no SMI process audit or gpulease/flock utility.
                 # Share an advisory lock across queue roots on this Mac.
                 metal_lock = None

@@ -635,25 +635,20 @@ fn direct_operands(op: DevOp, d: &DevInst64, packet: &Packet<'_>) -> Result<()> 
             if d.i[6] == 0 && d.i[7] == 0 {
                 return Ok(());
             }
-            if d.i[6] != 0 {
-                require(d.i[7] != 0, "missing FP8 GEMM tensor-map operands")?;
-            }
-            for (handle, source, rows, is_weight) in [
-                (d.i[6], d.t[1], u64::from(d.i[0]) + u64::from(d.i[4]), false),
-                (d.i[7], d.t[2], u64::from(d.i[1]), true),
+            // The M=1 TMA path streams activations without a map and tiles weights at 64 rows.
+            let m1 = d.i[0] == 1 && d.i[6] == 0;
+            require(d.i[6] != 0 || m1, "missing FP8 GEMM tensor-map operands")?;
+            for (handle, source, rows) in [
+                (d.i[6], d.t[1], u64::from(d.i[0]) + u64::from(d.i[4])),
+                (d.i[7], d.t[2], u64::from(d.i[1])),
             ] {
-                if handle == 0 {
+                if handle == 0 && m1 {
                     continue;
                 }
                 let mut generators = packet.generated.iter().filter(|g| g.tensor == handle);
                 let g = generators
                     .next()
                     .ok_or("missing FP8 GEMM tensor-map operands")?;
-                let scale_ok = if is_weight {
-                    g.scale == 128 || (d.i[0] == 1 && g.scale == 64)
-                } else {
-                    g.scale == 128
-                };
                 require(
                     handle != 0
                         && handle < u32::from(TENSOR_NONE16)
@@ -666,7 +661,7 @@ fn direct_operands(op: DevOp, d: &DevInst64, packet: &Packet<'_>) -> Result<()> 
                         && g.hd % 128 == 0
                         && rows > 0
                         && rows <= u64::from(g.ctx)
-                        && scale_ok
+                        && (g.scale == 128 || (m1 && g.scale == 64))
                         && packet
                             .tensors
                             .get(handle as usize)
@@ -684,29 +679,15 @@ fn direct_operands(op: DevOp, d: &DevInst64, packet: &Packet<'_>) -> Result<()> 
             if d.i[3] == 0 && d.i[6] == 0 && d.i[7] == 0 {
                 return Ok(());
             }
-            if d.i[6] != 0 {
-                require(
-                    d.i[7] != 0 && d.i[3] != 0,
-                    "missing FP8 GLU tensor-map operands",
-                )?;
-            }
-            for (handle, source, rows, is_weight) in [
-                (d.i[6], d.t[1], u64::from(d.i[0]), false),
-                (d.i[7], d.t[2], u64::from(d.i[1]), true),
-                (d.i[3], d.t[5], u64::from(d.i[1]), true),
+            for (handle, source, rows) in [
+                (d.i[6], d.t[1], u64::from(d.i[0])),
+                (d.i[7], d.t[2], u64::from(d.i[1])),
+                (d.i[3], d.t[5], u64::from(d.i[1])),
             ] {
-                if handle == 0 {
-                    continue;
-                }
                 let mut generators = packet.generated.iter().filter(|g| g.tensor == handle);
                 let g = generators
                     .next()
                     .ok_or("missing FP8 GLU tensor-map operands")?;
-                let scale_ok = if is_weight {
-                    g.scale == 128 || (d.i[0] == 1 && g.scale == 64)
-                } else {
-                    g.scale == 128
-                };
                 require(
                     handle != 0
                         && handle < u32::from(TENSOR_NONE16)
@@ -719,7 +700,7 @@ fn direct_operands(op: DevOp, d: &DevInst64, packet: &Packet<'_>) -> Result<()> 
                         && g.hd % 128 == 0
                         && rows > 0
                         && rows <= u64::from(g.ctx)
-                        && scale_ok
+                        && g.scale == 128
                         && packet
                             .tensors
                             .get(handle as usize)

@@ -188,49 +188,14 @@ fn shard_files(dir: &Path) -> Vec<PathBuf> {
             k.0
         );
     }
-    if let Some(s) = single {
-        return vec![s];
-    }
-    let index_file = dir.join("model.safetensors.index.json");
-    if index_file.exists() {
-        if let Ok(bytes) = std::fs::read(&index_file) {
-            if let Ok(val) = serde_json::from_slice::<serde_json::Value>(&bytes) {
-                if let Some(wmap) = val.get("weight_map").and_then(|w| w.as_object()) {
-                    let mut filenames: Vec<String> = wmap
-                        .values()
-                        .filter_map(|v| v.as_str().map(|s| s.to_string()))
-                        .collect();
-                    filenames.sort();
-                    filenames.dedup();
-                    let paths: Vec<PathBuf> = filenames
-                        .into_iter()
-                        .map(|f| dir.join(f))
-                        .filter(|p| p.exists())
-                        .collect();
-                    if !paths.is_empty() {
-                        return paths;
-                    }
-                }
-            }
-        }
-    }
-    let mut any: Vec<_> = std::fs::read_dir(dir)
-        .ok()
-        .into_iter()
-        .flatten()
-        .filter_map(Result::ok)
-        .map(|e| e.path())
-        .filter(|p| p.extension().is_some_and(|e| e == "safetensors"))
-        .collect();
-    if !any.is_empty() {
-        any.sort();
-        return any;
-    }
-    panic!(
-        "{}: no safetensors checkpoint (looked for \
-         model-{{i}}-of-{{n}}[.partial].safetensors and model.safetensors)",
-        dir.display()
-    )
+    // THE fallback that was missing: single-file, no index (Gemma-4 12B).
+    vec![single.unwrap_or_else(|| {
+        panic!(
+            "{}: no safetensors checkpoint (looked for \
+             model-{{i}}-of-{{n}}[.partial].safetensors and model.safetensors)",
+            dir.display()
+        )
+    })]
 }
 
 pub(crate) fn layer_scalars(dir: &Path, layers: u32, prefix: &str) -> Vec<f32> {

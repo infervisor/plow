@@ -16,13 +16,8 @@ Python runs only here; the runtime loads the cubin as a packet role object (plow
 `nix develop .#tilelang` provides the pinned generator (TileLang 0.1.12) and nvcc 12.9 for
 `build`; tune/bench also need a CUDA torch (that shell's torch is CPU-only).
 """
-import argparse, ctypes, hashlib, json, math, os, re, shlex, subprocess, sys, tempfile
+import argparse, ctypes, hashlib, json, math, os, re, subprocess, sys, tempfile
 from pathlib import Path
-
-if "CXX" not in os.environ and os.path.exists("/usr/bin/g++-14"):
-    os.environ["CXX"] = "/usr/bin/g++-14"
-if "CC" not in os.environ and os.path.exists("/usr/bin/gcc-14"):
-    os.environ["CC"] = "/usr/bin/gcc-14"
 
 REPO = Path(__file__).resolve().parents[2]
 TABLE = REPO / "tuning/nvidia/sm_90a/h100-sxm5/gen_kernels.json"
@@ -310,18 +305,16 @@ def body_digest(header):
 
 def nvcc_compile(name, header, out):
     from tilelang import env
-    nvcc = os.environ.get("PLOW_NVCC") or ("/usr/local/cuda/bin/nvcc" if os.path.exists("/usr/local/cuda/bin/nvcc") else "nvcc")
-    prepend = shlex.split(os.environ.get("NVCC_PREPEND_FLAGS", ""))
-    append = shlex.split(os.environ.get("NVCC_APPEND_FLAGS", ""))
+    nvcc = os.environ.get("PLOW_NVCC", "nvcc")
     wrapper = WRAPPERS[ENTRIES[name]["signature"]["op"]]
     with tempfile.TemporaryDirectory() as tmp:
         hpath = Path(tmp) / f"{name}_body.cuh"
         hpath.write_text(header)
-        cmd = [nvcc, *prepend, "-std=c++20", "-arch=sm_90a", "-O3", "-cubin", "-w", "-Xcudafe",
+        cmd = [nvcc, "-std=c++20", "-arch=sm_90a", "-O3", "-cubin", "-w", "-Xcudafe",
                "--diag_suppress=177", "-Xptxas=-v", f"-I{env.TILELANG_TEMPLATE_PATH}",
                f"-I{env.CUTLASS_INCLUDE_DIR}", f"-I{REPO / 'runtime/common'}",
                f"-I{REPO / 'runtime/nvidia'}", f'-DPLOW_GEN_BODY="{hpath}"',
-               *ENTRIES[name].get("defines", ()), *append, "-o", str(out), str(wrapper)]
+               *ENTRIES[name].get("defines", ()), "-o", str(out), str(wrapper)]
         res = subprocess.run(cmd, capture_output=True, text=True)
         if res.returncode:
             sys.exit(f"nvcc failed for {name}:\n{res.stderr[-4000:]}")
