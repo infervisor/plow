@@ -1004,10 +1004,20 @@ mod tests {
     /// with the output snake (`a2`), and its weight carries the split image.
     #[test]
     fn k_tap_conv_takes_wgmma_taps_with_a_separate_input_snake() {
+        k_tap_conv(768);
+    }
+
+    /// 96 channels (DAC's last block) take the same taps route; the runtime picks its wide tile.
+    #[test]
+    fn k_tap_conv_96_channels_takes_the_taps_route() {
+        k_tap_conv(96);
+    }
+
+    fn k_tap_conv(ch: u32) {
         let mut b = Builder::new(4);
-        let x = b.tensor("act.codec.a", 2 * 40 * 768 * 4);
+        let x = b.tensor("act.codec.a", 2 * 40 * u64::from(ch) * 4);
         let len = b.tensor("lengths", 8);
-        let scratch = b.tensor("act.codec.s", 2 * 40 * 768 * 4);
+        let scratch = b.tensor("act.codec.s", 2 * 40 * u64::from(ch) * 4);
         let model = Model {
             n_cu: 4,
             target: 0,
@@ -1033,7 +1043,7 @@ mod tests {
                     output: TensorRef::Handle(x),
                     param: None,
                     rows: 80,
-                    width: 768,
+                    width: ch,
                     stride: 0,
                     col0: 0,
                     kind: Activation::Tanh,
@@ -1050,8 +1060,8 @@ mod tests {
             alpha: None,
             batch: 2,
             in_rows: 40,
-            cin: 768,
-            cout: 768,
+            cin: ch,
+            cout: ch,
             kernel: 7,
             stride: 1,
             dilation: 3,
@@ -1069,7 +1079,7 @@ mod tests {
             taps_wgmma: true,
         };
         fused_conv(&mut p, ConvFusions(None), Some(&splits), x, first.done, c).unwrap();
-        assert_eq!(splits.borrow()["dec.blk0.ru0.c1.w"], (768, 7 * 768, 7));
+        assert_eq!(splits.borrow()["dec.blk0.ru0.c1.w"], (ch, 7 * ch, 7));
         let prefix = p.finish(1);
         let insts = &prefix.model.progs[0].insts;
         let (snake, conv) = (&insts[1], &insts[2]);
