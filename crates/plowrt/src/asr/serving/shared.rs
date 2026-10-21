@@ -491,6 +491,7 @@ impl SharedAsr {
                     cfg: None,
                     first_tokens: 0,
                     depth: None,
+                    encode: None,
                 })),
                 prefix: None,
                 tenant: None,

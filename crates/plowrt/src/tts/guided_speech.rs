@@ -990,6 +990,7 @@ impl GuidedSpeech {
                         0
                     },
                     depth: None,
+                    encode: None,
                 })),
                 prefix: None,
                 tenant: None,

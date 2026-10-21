@@ -1200,36 +1200,37 @@ impl SegmentMaker {
         if !c.depth {
             return Ok(None);
         }
-        let encode = |ids: &[u32]| -> Result<(Vec<f32>, Vec<u32>), String> {
-            let e = self.encoder.as_ref().ok_or("no text encoder")?;
-            Ok((
-                tokio::task::block_in_place(|| e.encode(ids))?,
-                (0..ids.len() as u32).collect(),
-            ))
-        };
-        let (overlay, overlay_pos) = match &s.enc_ids {
-            Some(ids) => encode(ids)?,
-            None => Default::default(),
-        };
-        let cfg = match &s.uncond_ids {
-            Some(ids) => {
-                let (uncond_overlay, uncond_overlay_pos) = encode(ids)?;
-                Some(crate::serve::mux::CfgJob {
-                    uncond_overlay,
-                    params: crate::text::sample::CfgParams {
-                        cfg_weight: self.cfg_weight,
-                        temperature: 0.0,
-                        min_p: 0.0,
-                        top_p: 1.0,
-                        repetition_penalty: 1.0,
-                    },
-                    history: Vec::new(),
-                    seed: None,
-                    uncond_ids: vec![0; ids.len()],
-                    uncond_overlay_pos,
-                })
+        let overlay_pos = s
+            .enc_ids
+            .as_ref()
+            .map_or(Vec::new(), |ids| (0..ids.len() as u32).collect());
+        let cfg = s.uncond_ids.as_ref().map(|ids| crate::serve::mux::CfgJob {
+            uncond_overlay: Vec::new(),
+            params: crate::text::sample::CfgParams {
+                cfg_weight: self.cfg_weight,
+                temperature: 0.0,
+                min_p: 0.0,
+                top_p: 1.0,
+                repetition_penalty: 1.0,
+            },
+            history: Vec::new(),
+            seed: None,
+            uncond_ids: vec![0; ids.len()],
+            uncond_overlay_pos: (0..ids.len() as u32).collect(),
+        });
+        let encode: Option<crate::serve::mux::SpeechEncode> = match (&s.enc_ids, &self.encoder) {
+            (None, _) => None,
+            (Some(_), None) => return Err("no text encoder".into()),
+            (Some(ids), Some(e)) => {
+                let (e, ids, uncond) = (e.clone(), ids.clone(), s.uncond_ids.clone());
+                Some(Box::new(move |sp: &mut crate::serve::mux::SpeechJob| {
+                    sp.overlay = e.encode(&ids)?;
+                    if let (Some(ids), Some(cfg)) = (uncond, sp.cfg.as_mut()) {
+                        cfg.uncond_overlay = e.encode(&ids)?;
+                    }
+                    Ok(())
+                }))
             }
-            None => None,
         };
         let cfg_scale = cfg.as_ref().map(|_| 1.0 + self.cfg_weight);
         {
@@ -1244,8 +1245,9 @@ impl SegmentMaker {
             let greedy = self.temperature <= 0.0;
             Ok(Some(Box::new(crate::serve::mux::SpeechJob {
                 cfg,
-                overlay,
+                overlay: Vec::new(),
                 overlay_pos,
+                encode,
                 depth: Some(crate::serve::mux::DepthJob {
                     seed: s.gen.seed.unwrap_or(self.seed),
                     temperature: if greedy { 1.0 } else { param(self.temperature) },

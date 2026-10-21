@@ -554,7 +554,13 @@ pub struct SpeechJob {
     /// A depth-stage packet (`tts.depth_lm.v1`): each step's token comes from the packet's depth
     /// stage, which also samples the frame's codes ([`StreamChunk::Token::frame`]).
     pub depth: Option<DepthJob>,
+    /// Fills `overlay` (and the CFG member's `uncond_overlay`) on the engine thread before the
+    /// first prefill chunk: a text encoder launched beside running decode steps waits behind
+    /// their persistent kernels at every one of its launches.
+    pub encode: Option<SpeechEncode>,
 }
+
+pub type SpeechEncode = Box<dyn FnOnce(&mut SpeechJob) -> std::result::Result<(), String> + Send>;
 
 /// One request's depth-stage sampling, and its class -> token map.
 #[derive(Clone, Copy, Debug)]
@@ -6625,7 +6631,7 @@ fn gpu_prefill_batched_pass(
             .iter()
             .flatten()
             .filter_map(|s| s.speech.as_deref())
-            .find(|sp| !sp.overlay_pos.is_empty())
+            .find(|sp| !sp.overlay.is_empty())
             .map_or(1, |sp| sp.overlay.len() / sp.overlay_pos.len());
         bytes as usize / 4 / hidden.max(1)
     });
@@ -7267,6 +7273,11 @@ fn gpu_prefill_advance(
         }
         if let Some(ttl) = slot.session.as_ref().and_then(|s| s.pin_ttl()) {
             e.hold_session_prefix(slot_idx, ttl);
+        }
+    }
+    if let Some(sp) = slot.speech.as_deref_mut() {
+        if let Some(encode) = sp.encode.take() {
+            encode(sp).map_err(crate::RuntimeError::Rejected)?;
         }
     }
     if let Some(sp) = slot.speech.as_deref() {
