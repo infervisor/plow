@@ -725,6 +725,9 @@ async fn speech_with(
     if req.speed.is_some_and(|s| s != 1.0) {
         return bad("only speed 1.0 is supported", "speed");
     }
+    if req.language.is_some() {
+        return bad("this model has no language selection", "language");
+    }
     let tok = bundle.tokenizer();
     let voice = req.voice.clone();
     if !c.voices.is_empty() {
@@ -766,7 +769,7 @@ async fn speech_with(
         max_tokens: req.max_tokens,
         temperature: req.temperature.unwrap_or(c.temperature),
         top_p: req.top_p.unwrap_or(c.top_p),
-        repetition_penalty: req.repetition_penalty.unwrap_or(1.0),
+        repetition_penalty: req.repetition_penalty.unwrap_or(c.repetition_penalty),
         seed: req.seed,
     };
     let segs: Vec<Segment> = super::segments(&req.input, c.segment_chars())

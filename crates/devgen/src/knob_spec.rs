@@ -1203,6 +1203,7 @@ pub const EMIT: &[KnobSpec] = &[
     KnobSpec::new("emit.nv_gemv_rem_split", Some("PLOW_NV_GEMV_REM_SPLIT"), Layer::Emit, Domain::Bool, OFF, OPT_IN),
     KnobSpec::new("emit.packed_prefill_small_hd", Some("PLOW_EMIT_PACKED_PREFILL_SMALL_HD"), Layer::Emit, Domain::Bool, OFF, OPT_IN),
     KnobSpec::new("emit.s3gen_attn_h16", Some("PLOW_EMIT_S3GEN_ATTN_H16"), Layer::Emit, Domain::Bool, OFF, OPT_IN),
+    KnobSpec::new("emit.snac_split_bf16", Some("PLOW_EMIT_SNAC_SPLIT_BF16"), Layer::Emit, Domain::Bool, OFF, OPT_IN),
     KnobSpec::new("emit.nv_fa_mma_hd128", Some("PLOW_NV_FA_MMA_HD128"), Layer::Emit, Domain::Bool, OFF, OPT_IN),
     KnobSpec::new("emit.nv_gemv_k8_b1", Some("PLOW_NV_GEMV_K8_B1"), Layer::Emit, Domain::Bool, OFF, OPT_IN),
     KnobSpec::new("emit.nv_fa_rg_wide", Some("PLOW_NV_FA_RG_WIDE"), Layer::Emit, Domain::Bool, OFF, OPT_IN),

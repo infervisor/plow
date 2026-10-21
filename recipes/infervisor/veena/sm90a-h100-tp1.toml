@@ -82,7 +82,7 @@ PLOW_NV_DENSE_TUNE = "1"
 # multistep, and a one-frame (7-code) quantum at low load. --lt-rung-algos times cuBLASLt
 # algorithms per rung (step_bench B=32..64 -3..-5%, digests equal).
 [serve]
-extra_args = ["--decode-pipeline"]
+extra_args = "--decode-pipeline"
 env = { PLOW_VMM_PREFIX = "1", PLOW_LT_RUNG_ALGOS = "true", PLOW_DECODE_PIPELINE = "1" }
 
 [bench]

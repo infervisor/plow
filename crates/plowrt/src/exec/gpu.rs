@@ -3627,6 +3627,8 @@ pub struct DevSample {
     pub top_p: f32,
     pub min_p: f32,
     pub rng01: f32,
+    /// Repetition penalty over the row's device history (`plow_penalize`); 1.0 = none.
+    pub penalty: f32,
 }
 
 impl DevSample {
@@ -3638,6 +3640,7 @@ impl DevSample {
             top_p: 1.0,
             min_p: 0.0,
             rng01: 0.0,
+            penalty: 1.0,
         }
     }
 }
@@ -3676,6 +3679,19 @@ struct Sampler {
     cfg: Option<CfgSlab>,
     /// Steps of guided draws staged by [`GpuEngine::stage_cfg`] for the next decode call.
     cfg_staged: usize,
+    /// `plow_penalize` + `plow_count` (absent on older objects: repetition-penalty rows keep the
+    /// host draw).
+    pen: Option<PenSlab>,
+}
+
+/// Device repetition penalty: `[batch]` f32 penalties then `[batch]` u32 history rows, staged
+/// through pinned memory, and the `[batch][vocab]` u32 history counts (allocated on first use).
+struct PenSlab {
+    f_pen: KernelFn,
+    f_count: KernelFn,
+    host: PinnedHost,
+    dev: DeviceMem,
+    counts: Option<DeviceMem>,
 }
 
 /// Batched logprob statistics: `[batch][3]` u32 requests (row, token, k) in, `[batch]
@@ -7664,6 +7680,19 @@ impl GpuEngine {
         let d_params = be.alloc(0, slab as u64)?;
         let d_escratch = be.alloc(0, (batch * vocab * 4) as u64)?;
         let f_cfg = be.get_function(&module, "plow_sample_cfg").ok();
+        let pen = match (
+            be.get_function(&module, "plow_penalize"),
+            be.get_function(&module, "plow_count"),
+        ) {
+            (Ok(f_pen), Ok(f_count)) => Some(PenSlab {
+                f_pen,
+                f_count,
+                host: be.host_alloc_pinned(2 * batch * 4)?,
+                dev: be.alloc(0, (2 * batch * 4) as u64)?,
+                counts: None,
+            }),
+            _ => None,
+        };
         let lp = match be.get_function(&module, "plow_logprob_stats") {
             Ok(f) => Some((f, be.alloc(0, (LOGPROB_STATS_MAX * 4) as u64)?)),
             Err(_) => None,
@@ -7678,7 +7707,7 @@ impl GpuEngine {
             }),
             Err(_) => None,
         };
-        tracing::info!(cubin = %cubin.display(), cfg = f_cfg.is_some(), "device sampler enabled (PLOW_DEV_SAMPLE=1)");
+        tracing::info!(cubin = %cubin.display(), cfg = f_cfg.is_some(), penalty = pen.is_some(), "device sampler enabled (PLOW_DEV_SAMPLE=1)");
         Ok(Some(Sampler {
             f,
             _module: module,
@@ -7692,6 +7721,7 @@ impl GpuEngine {
             lp_rows,
             cfg: None,
             cfg_staged: 0,
+            pen,
         }))
     }
 
@@ -8569,6 +8599,10 @@ impl GpuEngine {
                     &self.stream,
                 )?;
             }
+            let penalized = self.stage_penalty(specs, |b| b as u32)?;
+            if penalized {
+                self.launch_penalty(false, bsz)?;
+            }
             let dp = |k: u64| sdp + k * (bsz * 4) as u64;
             let mut a_logits = self.devp[self.t_logits].base;
             let mut a_ids = self.devp[self.t_ids].base;
@@ -8589,6 +8623,9 @@ impl GpuEngine {
             ];
             self.be
                 .launch_kernel(sf, bsz as u32, sthreads, 0, &mut a, Some(&self.stream))?;
+            if penalized {
+                self.launch_penalty(true, bsz)?;
+            }
         }
         if cfg_steps > 0 {
             self.launch_cfg(0)?;
@@ -9121,6 +9158,10 @@ impl GpuEngine {
         } else {
             None
         };
+        let penalized = match sample {
+            Some((specs, _)) => self.stage_penalty(specs, |b| b as u32)?,
+            None => false,
+        };
 
         // Enqueue [memset → decode → (sample) → advance] × K on the stream — no sync.
         let advance_grid = (bsz as u32).div_ceil(256);
@@ -9130,6 +9171,9 @@ impl GpuEngine {
             self.reset_selected_decode_counters(rung)?;
             self.launch_selected_decode(rung)?;
             if let Some((sf, sdp, ses, sthreads)) = sampler_args {
+                if penalized {
+                    self.launch_penalty(false, bsz)?;
+                }
                 let dp = |j: u64| sdp + j * (bsz * 4) as u64;
                 let mut a_logits = self.devp[self.t_logits].base;
                 let mut a_ids = self.devp[self.t_ids].base;
@@ -9150,6 +9194,9 @@ impl GpuEngine {
                 ];
                 self.be
                     .launch_kernel(sf, bsz as u32, sthreads, 0, &mut a, Some(&self.stream))?;
+                if penalized {
+                    self.launch_penalty(true, bsz)?;
+                }
             }
             if cfg_steps > 0 {
                 self.launch_cfg(step)?;
@@ -9593,6 +9640,128 @@ impl GpuEngine {
         self.sampler.as_ref().is_some_and(|s| s.f_cfg.is_some())
     }
 
+    /// Whether rows with a repetition penalty can draw on the device ([`DevSample::penalty`]).
+    pub fn dev_penalty(&self) -> bool {
+        self.sampler.as_ref().is_some_and(|s| s.pen.is_some())
+    }
+
+    /// The `[batch][vocab]` penalty history, zeroed on first use.
+    fn pen_counts(&mut self) -> Result<u64> {
+        let bytes = self.batch * self.vocab * 4;
+        let pen = self
+            .sampler
+            .as_mut()
+            .and_then(|s| s.pen.as_mut())
+            .ok_or_else(|| RuntimeError::Rejected("no device repetition penalty".into()))?;
+        if pen.counts.is_none() {
+            let counts = self.be.alloc(0, bytes as u64)?;
+            self.be
+                .memset_d8_async(counts.base, 0, bytes, &self.stream)?;
+            pen.counts = Some(counts);
+        }
+        Ok(pen.counts.as_ref().expect("allocated").base)
+    }
+
+    /// Allocate the penalty history now; on failure (KV already holds the memory) drop the device
+    /// penalty so [`Self::dev_penalty`] is false and penalized rows draw on the host.
+    pub fn pen_reserve(&mut self) {
+        if let Err(error) = self.pen_counts() {
+            tracing::warn!(%error, bytes = self.batch * self.vocab * 4, "device repetition penalty off: history allocation failed; penalized rows use the host sampler");
+            if let Some(s) = self.sampler.as_mut() {
+                s.pen = None;
+            }
+        }
+    }
+
+    /// Reset `slot`'s device repetition-penalty history to the tokens of `history` (empty: an
+    /// async clear; otherwise one synchronous upload).
+    pub fn pen_seed_history(&mut self, slot: usize, history: &[u32]) -> Result<()> {
+        let vocab = self.vocab;
+        if slot >= self.batch {
+            return Err(RuntimeError::Rejected(format!(
+                "penalty slot {slot} out of range"
+            )));
+        }
+        let base = self.pen_counts()? + (slot * vocab * 4) as u64;
+        if history.is_empty() {
+            return self.be.memset_d8_async(base, 0, vocab * 4, &self.stream);
+        }
+        let mut row = vec![0u32; vocab];
+        for &t in history {
+            if let Some(c) = row.get_mut(t as usize) {
+                *c += 1;
+            }
+        }
+        // SAFETY: `row` outlives the stream synchronize below.
+        unsafe {
+            self.be
+                .memcpy_htod_async(base, bytemuck::cast_slice(&row), &self.stream)?;
+        }
+        self.be.stream_synchronize(&self.stream)
+    }
+
+    /// Stage `specs`' repetition penalties (row r's history row `hist(r)`) for
+    /// [`Self::launch_penalty`]; `false` (nothing staged) when no row is penalized.
+    fn stage_penalty(&mut self, specs: &[DevSample], hist: impl Fn(usize) -> u32) -> Result<bool> {
+        if specs.iter().all(|s| s.penalty == 1.0) {
+            return Ok(false);
+        }
+        self.pen_counts()?;
+        let bsz = self.batch;
+        let pen = self
+            .sampler
+            .as_mut()
+            .and_then(|s| s.pen.as_mut())
+            .expect("pen_counts checked");
+        {
+            let (p, h) = pen.host.as_mut_slice().split_at_mut(bsz * 4);
+            let p: &mut [f32] = bytemuck::cast_slice_mut(p);
+            let h: &mut [u32] = bytemuck::cast_slice_mut(h);
+            for (r, s) in specs.iter().enumerate() {
+                p[r] = s.penalty;
+                h[r] = hist(r);
+            }
+        }
+        // SAFETY: the pinned slab lives on self; every caller synchronizes the stream before the
+        // slab is written again.
+        unsafe {
+            self.be
+                .memcpy_htod_async(pen.dev.base, pen.host.as_slice(), &self.stream)?;
+        }
+        Ok(true)
+    }
+
+    /// Enqueue `plow_penalize` (before `plow_sample`) or `plow_count` (after it) over the first
+    /// `rows` rows staged by [`Self::stage_penalty`].
+    fn launch_penalty(&mut self, count: bool, rows: usize) -> Result<()> {
+        let smp = self.sampler.as_ref().expect("staged");
+        let pen = smp.pen.as_ref().expect("staged");
+        let mut a_x = if count {
+            self.devp[self.t_ids].base
+        } else {
+            self.devp[self.t_logits].base
+        };
+        let mut a_pen = pen.dev.base;
+        let mut a_hist = pen.dev.base + (self.batch * 4) as u64;
+        let mut a_cnt = pen.counts.as_ref().expect("staged").base;
+        let (mut a_v, mut a_b) = (self.vocab as u32, rows as u32);
+        let mut a = [
+            &mut a_x as *mut u64 as *mut std::ffi::c_void,
+            &mut a_pen as *mut u64 as *mut std::ffi::c_void,
+            &mut a_hist as *mut u64 as *mut std::ffi::c_void,
+            &mut a_cnt as *mut u64 as *mut std::ffi::c_void,
+            &mut a_v as *mut u32 as *mut std::ffi::c_void,
+            &mut a_b as *mut u32 as *mut std::ffi::c_void,
+        ];
+        let (f, grid, block) = if count {
+            (pen.f_count, (rows as u32).div_ceil(256), 256)
+        } else {
+            (pen.f_pen, rows as u32, smp.threads)
+        };
+        self.be
+            .launch_kernel(f, grid, block, 0, &mut a, Some(&self.stream))
+    }
+
     fn cfg_slab(&mut self) -> Result<&mut CfgSlab> {
         let (bsz, vocab) = (self.batch, self.vocab);
         let smp = self
@@ -9681,9 +9850,10 @@ impl GpuEngine {
     }
 
     /// Enqueue `plow_sample` over the first `specs.len()` rows of `act.logits`, overwriting those
-    /// `in.ids` entries (the compact terminal's layout: sample row r at logits row r). The caller
-    /// reads `in.ids` back after it, on the same stream.
-    pub(crate) fn launch_sampler_rows(&mut self, specs: &[DevSample]) -> Result<()> {
+    /// `in.ids` entries (the compact terminal's layout: sample row r at logits row r). Row r's
+    /// repetition-penalty history is slot `slots[r]`'s. The caller reads `in.ids` back after it,
+    /// on the same stream.
+    pub(crate) fn launch_sampler_rows(&mut self, specs: &[DevSample], slots: &[u32]) -> Result<()> {
         let bsz = self.batch;
         let rows = specs.len();
         let Some(smp) = self.sampler.as_mut() else {
@@ -9693,6 +9863,9 @@ impl GpuEngine {
             return Err(RuntimeError::Rejected(format!(
                 "sampler rows {rows} outside 1..={bsz}"
             )));
+        }
+        if slots.len() != rows || slots.iter().any(|&s| s as usize >= bsz) {
+            return Err(RuntimeError::Rejected("sampler rows: bad slot map".into()));
         }
         {
             let raw = smp.params.as_mut_slice();
@@ -9720,6 +9893,10 @@ impl GpuEngine {
             self.be
                 .memcpy_htod_async(sdp, &smp.params.as_slice()[..5 * bsz * 4], &self.stream)?;
         }
+        let penalized = self.stage_penalty(specs, |r| slots[r])?;
+        if penalized {
+            self.launch_penalty(false, rows)?;
+        }
         let dp = |k: u64| sdp + k * (bsz * 4) as u64;
         let mut a_logits = self.devp[self.t_logits].base;
         let mut a_ids = self.devp[self.t_ids].base;
@@ -9739,12 +9916,22 @@ impl GpuEngine {
             &mut a_b as *mut u32 as *mut std::ffi::c_void,
         ];
         self.be
-            .launch_kernel(sf, rows as u32, sthreads, 0, &mut a, Some(&self.stream))
+            .launch_kernel(sf, rows as u32, sthreads, 0, &mut a, Some(&self.stream))?;
+        if penalized {
+            self.launch_penalty(true, rows)?;
+        }
+        Ok(())
     }
 
-    /// Draw rows `0..specs.len()` of `act.logits` on the device and wait for the tokens.
-    pub fn sample_rows_on_device(&mut self, specs: &[DevSample], out: &mut [u32]) -> Result<()> {
-        self.launch_sampler_rows(specs)?;
+    /// Draw rows `0..specs.len()` of `act.logits` on the device (row r's penalty history is slot
+    /// `slots[r]`'s) and wait for the tokens.
+    pub fn sample_rows_on_device(
+        &mut self,
+        specs: &[DevSample],
+        slots: &[u32],
+        out: &mut [u32],
+    ) -> Result<()> {
+        self.launch_sampler_rows(specs, slots)?;
         self.be.stream_synchronize(&self.stream)?;
         let mut raw = vec![0u8; specs.len() * 4];
         self.be.download(&self.devp[self.t_ids], 0, &mut raw)?;

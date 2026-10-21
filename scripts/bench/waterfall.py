@@ -32,9 +32,9 @@ import vllm_metrics  # noqa: E402
 def cells_log(res):
     order = []
     for ln in open(f"{res}/cells.log"):
-        k, tag, _ = ln.split()
-        if k == "CELL_BEGIN":
-            order.append(tag)
+        parts = ln.split()
+        if len(parts) >= 2 and parts[0] == "CELL_BEGIN":
+            order.append(parts[1])
     return order
 
 

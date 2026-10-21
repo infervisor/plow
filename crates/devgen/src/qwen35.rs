@@ -1469,6 +1469,7 @@ pub(super) fn run(
             ladder(&c, ctx, n_cu, target, fp8, &buckets, &rungs)
         }
     };
+    let shipped = crate::checkpoint::shipped_names(dir);
     validate_coverage(
         dir,
         &c.prefix,
@@ -1476,8 +1477,10 @@ pub(super) fn run(
             .iter()
             .filter_map(|t| {
                 // Sidecars are derived from these exact checkpoint matrices; scales add no source.
+                // A re-keyed checkpoint ships the twin itself in place of its bf16 source.
                 match t.name.strip_prefix("fp8/") {
                     Some(name) if name.ends_with("_scale") => None,
+                    Some(_) if shipped.contains(&t.name) => Some(t.name.clone()),
                     Some(name) => Some(name.to_string()),
                     None => Some(t.name.clone()),
                 }
@@ -3388,6 +3391,11 @@ mod tests {
             }
             let m = model_prefill(&c, 8192, 132, 0, &[128], 1, true);
             assert_eq!(m.prog_t, [128, 1]);
+            let man = manifest::build(&m, "sm_90a", &LeanReport::skipped("fixture"));
+            let req = man["backends"]["nvcc"]["requires"].as_array().unwrap();
+            for flag in ["PLOW_NV_FP8_PF_SCALE_WFIRST=1", "PLOW_NV_TMA_GEMM=1"] {
+                assert!(req.contains(&serde_json::json!(flag)), "missing {flag}");
+            }
             for (g, rows) in m.progs.iter().zip([128, 1]) {
                 let matmuls: Vec<_> = g
                     .insts
@@ -3527,6 +3535,24 @@ mod tests {
         }
         assert_eq!(count, 31);
         check_operand_dependencies(&mapped.progs[0]);
+        let man = manifest::build(&mapped, "sm_90a", &LeanReport::skipped("fixture"));
+        assert_eq!(man["features"]["qwen_fp8_m1_tma"], true);
+        let req = man["backends"]["nvcc"]["requires"].as_array().unwrap();
+        for flag in [
+            "PLOW_NV_W8A8=1",
+            "PLOW_NV_FP8_M1=1",
+            "PLOW_NV_QUANT_FP8_VLLM=1",
+            "PLOW_NV_TMA_GEMM=1",
+            "PLOW_NV_FP8_M1_TMA=1",
+            "PLOW_NV_FP8_M1_XCACHE=1",
+            "PLOW_NV_FP8_M1_FAST_ACCUM=1",
+            "PLOW_NV_FP8_M1_BK1024=1",
+        ] {
+            assert!(
+                req.contains(&serde_json::json!(flag)),
+                "missing required flag {flag}"
+            );
+        }
     }
 
     #[test]

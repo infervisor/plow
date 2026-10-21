@@ -169,5 +169,49 @@ class PackedQuantizationTests(unittest.TestCase):
                          "model.layers.7.self_attn.o_proj.weight")
 
 
+class RekeyTests(unittest.TestCase):
+    def test_rekey_keeps_shards_and_replaces_every_projection(self):
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        root = Path(temporary.name)
+        source, out = root / "source", root / "out"
+        source.mkdir()
+        (source / "config.json").write_text("{}")
+        part1 = {
+            "model.language_model.layers.0.mlp.up_proj.weight": torch.tensor([[1., -2.], [0., 0.]], dtype=torch.bfloat16),
+            "model.language_model.layers.0.input_layernorm.weight": torch.tensor([3., 4.], dtype=torch.bfloat16),
+        }
+        part2 = {
+            "mtp.layers.0.self_attn.q_proj.weight": torch.tensor([[0.5, 0.25]], dtype=torch.bfloat16),
+            "model.language_model.embed_tokens.weight": torch.tensor([[5., 6.]], dtype=torch.bfloat16),
+        }
+        save_file(part1, source / "part1.safetensors")
+        save_file(part2, source / "part2.safetensors")
+        mapping = {k: "part1.safetensors" for k in part1} | {k: "part2.safetensors" for k in part2}
+        (source / "model.safetensors.index.json").write_text(json.dumps({"weight_map": mapping}))
+        with patch("sys.argv", ["q", str(source), str(out), "--rekey"]), contextlib.redirect_stdout(io.StringIO()):
+            quant.main()
+        index = json.loads((out / "model.safetensors.index.json").read_text())["weight_map"]
+        self.assertTrue((out / "config.json").is_symlink())
+        for shard, tensors in [("part1.safetensors", part1), ("part2.safetensors", part2)]:
+            actual = load_file(out / shard)
+            for name, weight in tensors.items():
+                if name.endswith("proj.weight"):
+                    w = weight.float()
+                    amax = w.abs().amax(dim=1)
+                    scale = torch.where(amax > 0, amax / 448, torch.ones_like(amax))
+                    expected = (w / scale[:, None]).to(torch.float8_e4m3fn)
+                    self.assertNotIn(name, actual)
+                    self.assertTrue(torch.equal(actual["fp8/" + name].view(torch.uint8), expected.view(torch.uint8)))
+                    self.assertTrue(torch.equal(actual["fp8/" + name + "_scale"], scale))
+                    self.assertEqual(index["fp8/" + name], shard)
+                    self.assertEqual(index["fp8/" + name + "_scale"], shard)
+                else:
+                    self.assertTrue(torch.equal(actual[name], weight))
+                    self.assertEqual(index[name], shard)
+        with patch("sys.argv", ["q", str(source), str(out), "--rekey"]):
+            with self.assertRaises(FileExistsError):
+                quant.main()
+
 if __name__ == "__main__":
     unittest.main()

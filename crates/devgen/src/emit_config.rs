@@ -340,6 +340,10 @@ pub struct EmitConfig {
     #[arg(long, env = "PLOW_EMIT_S3GEN_ATTN_H16", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
     pub s3gen_attn_h16: bool,
 
+    /// SNAC pointwise convs on split-bf16 warpgroup MMA with pre-split weights (sm_90 speech object).
+    #[arg(long, env = "PLOW_EMIT_SNAC_SPLIT_BF16", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
+    pub snac_split_bf16: bool,
+
     /// Packed prefill for hd64/hd128 attention (the live-KV and packed contracts accept them).
     #[arg(long, env = "PLOW_EMIT_PACKED_PREFILL_SMALL_HD", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
     pub packed_prefill_small_hd: bool,
@@ -1939,6 +1943,7 @@ impl EmitConfig {
             nv_gemv_rem_split: env_bool("PLOW_NV_GEMV_REM_SPLIT"),
             packed_prefill_small_hd: env_bool("PLOW_EMIT_PACKED_PREFILL_SMALL_HD"),
             s3gen_attn_h16: env_bool("PLOW_EMIT_S3GEN_ATTN_H16"),
+            snac_split_bf16: env_bool("PLOW_EMIT_SNAC_SPLIT_BF16"),
             nv_fa_mma_hd128: env_bool("PLOW_NV_FA_MMA_HD128"),
             nv_gemv_k8_b1: env_bool("PLOW_NV_GEMV_K8_B1"),
             nv_fa_rg_wide: env_bool("PLOW_NV_FA_RG_WIDE"),

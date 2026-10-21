@@ -46,8 +46,13 @@ impl SamplingParams {
     /// row downloaded. One predicate so the eligibility checks in `serve::mux`
     /// cannot drift apart from the set of knobs this struct carries.
     pub fn needs_host_logits(&self) -> bool {
-        self.repetition_penalty != 1.0
-            || self.presence_penalty != 0.0
+        self.repetition_penalty != 1.0 || self.needs_host_logits_except_repetition()
+    }
+
+    /// [`Self::needs_host_logits`] for a sampler that applies `repetition_penalty` itself (the
+    /// device sampler with its per-slot history).
+    pub fn needs_host_logits_except_repetition(&self) -> bool {
+        self.presence_penalty != 0.0
             || self.frequency_penalty != 0.0
             || !self.logit_bias.is_empty()
             || self.logprobs.is_some()
@@ -496,6 +501,33 @@ mod tests {
         assert_eq!(logits1, logits2);
         assert!((logits1[0] - (2.0 / 1.2)).abs() < 1e-6);
         assert!((logits1[1] - (-2.0 * 1.2)).abs() < 1e-6);
+    }
+
+    #[test]
+    fn repetition_penalty_alone_is_device_eligible() {
+        let rep = SamplingParams {
+            repetition_penalty: 1.1,
+            ..SamplingParams::default()
+        };
+        assert!(rep.needs_host_logits());
+        assert!(!rep.needs_host_logits_except_repetition());
+        for other in [
+            SamplingParams {
+                presence_penalty: 0.5,
+                ..rep.clone()
+            },
+            SamplingParams {
+                frequency_penalty: 0.5,
+                ..rep.clone()
+            },
+            SamplingParams {
+                logit_bias: vec![(3, 1.0)],
+                ..rep.clone()
+            },
+        ] {
+            assert!(other.needs_host_logits_except_repetition());
+        }
+        assert!(!SamplingParams::default().needs_host_logits());
     }
 
     #[test]

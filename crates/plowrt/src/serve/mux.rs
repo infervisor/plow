@@ -977,6 +977,10 @@ struct Slot {
     resume: usize,
     /// The next token's OpenAI logprobs, set by the sampler when the request asked for them.
     lp: Option<Box<crate::text::logprobs::TokenLogprobs>>,
+    /// Emitted tokens the engine's device repetition-penalty history for this slot counts
+    /// (`usize::MAX`: unknown, reseeded before the next device draw).
+    #[cfg_attr(not(feature = "cuda"), allow(dead_code))]
+    dev_pen_counted: usize,
     /// [`JobOpts::prefix`], consumed by the prefix-cache attach.
     #[cfg_attr(not(feature = "cuda"), allow(dead_code))]
     prefix: Option<crate::memory::vmm::PrefixKey>,
@@ -2848,6 +2852,7 @@ fn admit_session(
         telemetry,
         prompt_ids: job.prompt_ids,
         out_ids: Vec::new(),
+        dev_pen_counted: usize::MAX,
         gen: job.gen,
         arrived: job.arrived,
         stop_tail: String::new(),
@@ -3151,6 +3156,11 @@ fn run_one_tick(
                             )),
                         ));
                     }
+                }
+                // Before any draw is planned: a failed history allocation turns the device
+                // penalty off, so penalized rows take the host path instead of failing the batch.
+                if e.dev_penalty() && slots.iter().flatten().any(dev_pen_row) {
+                    e.pen_reserve();
                 }
 
                 // Multimodal soft-token rows reach this engine's slab before any launch this tick reads
@@ -3568,8 +3578,11 @@ fn run_one_tick(
                                 continue;
                             }
                         }
-                        let was_dev =
-                            dev_sampled && slots[i].as_ref().and_then(dev_row_spec).is_some();
+                        let was_dev = dev_sampled
+                            && slots[i]
+                                .as_ref()
+                                .and_then(|s| dev_row_spec(s, e.dev_penalty()))
+                                .is_some();
                         gpu_finish_and_emit_token(
                             &mut *e,
                             row,
@@ -3854,6 +3867,7 @@ fn run_one_tick(
                     // Device-sampleable rows ride the quantum too when the sampler is loaded:
                     // `plow_sample` runs between each decode and advance.
                     let sampled_multi = e.multistep_sampling();
+                    let pen = e.dev_penalty();
                     let use_multi = !use_pipe
                         && steps > 1
                         && e.multistep_quantum().is_some()
@@ -3869,7 +3883,7 @@ fn run_one_tick(
                                     }
                                     !s.plain_decode()
                                         && (gpu_argmax_eligible(&s.gen.params)
-                                            || (sampled_multi && dev_sample_spec(s).is_some()))
+                                            || (sampled_multi && dev_sample_spec(s, pen).is_some()))
                                 })
                                 .unwrap_or(true)
                         });
@@ -3942,7 +3956,9 @@ fn run_one_tick(
                         let mut specs: Vec<crate::exec::gpu::DevSample> = Vec::new();
                         let mut draws: Vec<f32> = Vec::new();
                         for &(i, _) in &feeds {
-                            if let Some(spec) = slots[i].as_ref().and_then(dev_sample_spec) {
+                            if let Some(spec) =
+                                slots[i].as_ref().and_then(|s| dev_sample_spec(s, pen))
+                            {
                                 if specs.is_empty() {
                                     specs = vec![crate::exec::gpu::DevSample::greedy(); e.batch()];
                                     draws = vec![0.0; e.batch() * quantum];
@@ -3958,7 +3974,8 @@ fn run_one_tick(
                             |b: usize, k: usize| draws.get(b * quantum + k).copied().unwrap_or(0.0);
                         let sample = (!specs.is_empty())
                             .then_some((specs.as_slice(), &rng as &dyn Fn(usize, usize) -> f32));
-                        let staged = gpu_stage_cfg(&mut *e, &feeds, &mut slots, requested);
+                        let staged = gpu_pen_sync(&mut *e, &mut slots, feeds.iter().map(|f| f.0))
+                            .and_then(|()| gpu_stage_cfg(&mut *e, &feeds, &mut slots, requested));
                         let t_call = crate::obs::host::on().then(Instant::now);
                         let t_step = Instant::now();
                         let cut = || quantum_cut.fire();
@@ -3976,6 +3993,7 @@ fn run_one_tick(
                                     t_step.elapsed().as_secs_f64() * 1e3 / k.max(1) as f64,
                                 );
                                 gpu_cfg_advance(&feeds, &mut slots, k);
+                                gpu_pen_counted(&*e, &mut slots, feeds.iter().map(|f| f.0), k);
                                 let t_emit =
                                     host_engine_call(t_call, feeds.len(), tokens_this_tick);
                                 decode_progress = completed_decode(&feeds, k);
@@ -4024,7 +4042,7 @@ fn run_one_tick(
                                 let mut v = vec![crate::exec::gpu::DevSample::greedy(); cap];
                                 for &(i, _) in &feeds {
                                     if let Some(slot) = slots[i].as_ref() {
-                                        if let Some(spec) = dev_sample_spec(slot) {
+                                        if let Some(spec) = dev_sample_spec(slot, pen) {
                                             v[i] = spec;
                                         }
                                     }
@@ -4035,20 +4053,24 @@ fn run_one_tick(
                             };
                         let t_call = crate::obs::host::on().then(Instant::now);
                         let t_step = Instant::now();
-                        let (cfg_dev, step_res) =
-                            match gpu_stage_cfg(&mut *e, &feeds, &mut slots, 1) {
-                                Ok(d) => (
-                                    d,
-                                    e.step_slots_sampled(&feeds, dev_specs.as_deref(), &mut toks),
-                                ),
-                                Err(err) => (false, Err(err)),
-                            };
+                        let staged = gpu_pen_sync(&mut *e, &mut slots, feeds.iter().map(|f| f.0))
+                            .and_then(|()| gpu_stage_cfg(&mut *e, &feeds, &mut slots, 1));
+                        let (cfg_dev, step_res) = match staged {
+                            Ok(d) => (
+                                d,
+                                e.step_slots_sampled(&feeds, dev_specs.as_deref(), &mut toks),
+                            ),
+                            Err(err) => (false, Err(err)),
+                        };
                         match step_res {
                             Ok(()) => {
                                 let ms = t_step.elapsed().as_secs_f64() * 1e3;
                                 obs.host.ride.observe_step(feeds.len(), ms);
                                 if let Some(p) = obs.host.spec.as_mut() {
                                     p.observe_step(feeds.len(), ms);
+                                }
+                                if dev_specs.is_some() {
+                                    gpu_pen_counted(&*e, &mut slots, feeds.iter().map(|f| f.0), 1);
                                 }
                                 let t_emit =
                                     host_engine_call(t_call, feeds.len(), tokens_this_tick);
@@ -4080,9 +4102,9 @@ fn run_one_tick(
                                         || dev_specs
                                             .as_ref()
                                             .map(|_| {
-                                                slot_opt
-                                                    .as_ref()
-                                                    .map_or(false, |s| dev_sample_spec(s).is_some())
+                                                slot_opt.as_ref().map_or(false, |s| {
+                                                    dev_sample_spec(s, pen).is_some()
+                                                })
                                             })
                                             .unwrap_or(false);
                                     gpu_finish_and_emit_token(
@@ -6940,7 +6962,7 @@ fn gpu_prefill_batched_pass(
             })
             .filter_map(|(i, c0, len)| {
                 // A share cut by the planner must still not split a media span.
-                let s = slots[i].as_ref()?;
+                let (s, _) = pack_row(slots, i)?;
                 if !s.mm.as_deref().is_some_and(|j| j.spans()) {
                     return Some((i, c0, len));
                 }
@@ -6969,6 +6991,14 @@ fn gpu_prefill_batched_pass(
         let riders = if unified { feeds.len() } else { 0 };
         let mut window_time: Option<WindowTime> = None;
         let t_launch = Instant::now();
+        let pen = e.dev_penalty();
+        let pen_synced = gpu_pen_sync(
+            e,
+            slots,
+            pack.iter()
+                .map(|p| p.0)
+                .chain(feeds.iter().map(|f| f.0).filter(|_| unified)),
+        );
         let res = if unified {
             use plow_asset::token_batch::{Phase, Request, Selection};
             // A feed or pack entry whose slot vanished mid-tick is skipped, not a panic:
@@ -7001,10 +7031,17 @@ fn gpu_prefill_batched_pass(
                 })
             });
             let requests: smallvec::SmallVec<[_; 16]> = decode.chain(prefill).collect();
-            let result = if !window.is_empty() {
+            let result = if let Err(err) = pen_synced {
+                Err(err)
+            } else if !window.is_empty() {
                 let sampled = e.dev_sample_enabled();
                 *dev_sampled = sampled;
-                let spec = |slot: u32| slots.get(slot as usize)?.as_ref().and_then(dev_row_spec);
+                let spec = |slot: u32| {
+                    slots
+                        .get(slot as usize)?
+                        .as_ref()
+                        .and_then(|s| dev_row_spec(s, pen))
+                };
                 let spec: Option<&dyn Fn(u32) -> Option<crate::exec::gpu::DevSample>> =
                     sampled.then_some(&spec);
                 let jobs = &mut window;
@@ -7017,7 +7054,10 @@ fn gpu_prefill_batched_pass(
                 // logits and walks the vocabulary once per row, serially, inside the tick.
                 *dev_sampled = true;
                 e.token_batch_step_sampled(&requests, unified_output, &|slot| {
-                    slots.get(slot as usize)?.as_ref().and_then(dev_row_spec)
+                    slots
+                        .get(slot as usize)?
+                        .as_ref()
+                        .and_then(|s| dev_row_spec(s, pen))
                 })
             } else {
                 e.token_batch_step(&requests, unified_output)
@@ -7031,10 +7071,10 @@ fn gpu_prefill_batched_pass(
             }
             result
         } else {
-            let staged = match overlay_rows {
+            let staged = pen_synced.and_then(|()| match overlay_rows {
                 Some(_) => gpu_speech_pack_inputs(e, slots, &pack),
                 None => Ok(()),
-            };
+            });
             let reqs: Vec<PfBatchReq> = pack
                 .iter()
                 .map(|&(i, c0, len)| PfBatchReq {
@@ -7062,7 +7102,7 @@ fn gpu_prefill_batched_pass(
                         .map(|&(i, _)| {
                             slots[i]
                                 .as_ref()
-                                .and_then(dev_row_spec)
+                                .and_then(|s| dev_row_spec(s, pen))
                                 .unwrap_or_else(crate::exec::gpu::DevSample::greedy)
                         })
                         .collect();
@@ -7071,7 +7111,9 @@ fn gpu_prefill_batched_pass(
                     }
                     let mut ids: smallvec::SmallVec<[u32; 16]> =
                         smallvec::smallvec![0; specs.len()];
-                    e.sample_rows_on_device(&specs, &mut ids)?;
+                    let rows: smallvec::SmallVec<[u32; 16]> =
+                        completed.iter().map(|&(i, _)| i as u32).collect();
+                    e.sample_rows_on_device(&specs, &rows, &mut ids)?;
                     for (entry, id) in completed.iter_mut().zip(ids) {
                         entry.1 = id;
                     }
@@ -7113,6 +7155,9 @@ fn gpu_prefill_batched_pass(
         }
         match res {
             Ok(()) => {
+                if *dev_sampled {
+                    gpu_pen_counted(e, slots, completed.iter().map(|c| c.0), 1);
+                }
                 if unified {
                     feeds.clear();
                 }
@@ -7346,9 +7391,13 @@ fn gpu_prefill_advance(
         e.logits_row(0, &mut run.cond)?;
         return Ok(Some(cfg_draw(slot)));
     }
-    if let Some(spec) = dev_row_spec(slot).filter(|_| e.dev_sample_enabled()) {
+    if let Some(spec) = dev_row_spec(slot, e.dev_penalty()).filter(|_| e.dev_sample_enabled()) {
+        gpu_pen_sync_slot(e, slot_idx, slot)?;
         let mut tok = [0u32];
-        e.sample_rows_on_device(&[spec], &mut tok)?;
+        e.sample_rows_on_device(&[spec], &[slot_idx as u32], &mut tok)?;
+        if spec.penalty != 1.0 {
+            slot.dev_pen_counted += 1;
+        }
         return Ok(Some(tok[0]));
     }
     gpu_finish_token(e, 0, slot, tok).map(Some)
@@ -7602,16 +7651,20 @@ fn slot_rng01_at(slot: &Slot, k: usize) -> f32 {
 }
 
 /// Device-sampling eligibility for a slot (plan stage 4). `Some(spec)` when the
-/// row is `temperature>0` and needs no per-row token history — the device
-/// sampler handles temperature/top_k/top_p/min_p but not the penalties or the
-/// logit bias, so those rows keep the host path (see
+/// row is `temperature>0` and needs no host logits — the device sampler handles
+/// temperature/top_k/top_p/min_p and, when `pen` ([`GpuEngine::dev_penalty`]) on a non-CFG
+/// row, the repetition penalty; the other penalties and the logit bias keep the host path (see
 /// [`SamplingParams::needs_host_logits`]). `rng01` is the same per-step seeded
 /// draw the host uses, so a fixed seed stays reproducible. Greedy rows return
 /// `None` (the device argmax already equals `ARGMAX_FIN`).
 #[cfg(feature = "cuda")]
-fn dev_sample_spec(slot: &Slot) -> Option<crate::exec::gpu::DevSample> {
+fn dev_sample_spec(slot: &Slot, pen: bool) -> Option<crate::exec::gpu::DevSample> {
     let p = &slot.gen.params;
-    if p.is_greedy() || p.needs_host_logits() {
+    let dev_pen = pen && slot.cfg.is_none();
+    if p.is_greedy()
+        || p.needs_host_logits_except_repetition()
+        || (p.repetition_penalty != 1.0 && !dev_pen)
+    {
         return None;
     }
     Some(crate::exec::gpu::DevSample {
@@ -7620,14 +7673,72 @@ fn dev_sample_spec(slot: &Slot) -> Option<crate::exec::gpu::DevSample> {
         top_p: p.top_p,
         min_p: p.min_p,
         rng01: slot_rng01(slot),
+        penalty: p.repetition_penalty,
     })
 }
 
 /// The spec a token-batch row is drawn with on the device: a stochastic, non-CFG row that needs
 /// no host logits. `None` keeps the argmax and the host path.
 #[cfg(feature = "cuda")]
-fn dev_row_spec(slot: &Slot) -> Option<crate::exec::gpu::DevSample> {
-    slot.cfg.is_none().then(|| dev_sample_spec(slot)).flatten()
+fn dev_row_spec(slot: &Slot, pen: bool) -> Option<crate::exec::gpu::DevSample> {
+    slot.cfg
+        .is_none()
+        .then(|| dev_sample_spec(slot, pen))
+        .flatten()
+}
+
+/// Whether `slot` draws on the device with its repetition penalty, over the engine's history of
+/// its tokens.
+#[cfg(feature = "cuda")]
+fn dev_pen_row(slot: &Slot) -> bool {
+    dev_row_spec(slot, true).is_some_and(|s| s.penalty != 1.0)
+}
+
+/// Before a device draw: reseed the device penalty history of a penalized slot unless it counts
+/// exactly the slot's emitted tokens (a new slot, a host-sampled step, a discarded suffix).
+#[cfg(feature = "cuda")]
+fn gpu_pen_sync_slot(e: &mut crate::exec::gpu::GpuEngine, i: usize, slot: &mut Slot) -> Result<()> {
+    if e.dev_penalty() && dev_pen_row(slot) && slot.dev_pen_counted != slot.out_ids.len() {
+        e.pen_seed_history(i, &slot.out_ids)?;
+        slot.dev_pen_counted = slot.out_ids.len();
+    }
+    Ok(())
+}
+
+#[cfg(feature = "cuda")]
+fn gpu_pen_sync(
+    e: &mut crate::exec::gpu::GpuEngine,
+    slots: &mut [Option<Slot>],
+    rows: impl IntoIterator<Item = usize>,
+) -> Result<()> {
+    for i in rows {
+        if let Some(slot) = slots.get_mut(i).and_then(Option::as_mut) {
+            gpu_pen_sync_slot(e, i, slot)?;
+        }
+    }
+    Ok(())
+}
+
+/// After a device draw of `steps` tokens per row: `plow_count` added them to the history.
+#[cfg(feature = "cuda")]
+fn gpu_pen_counted(
+    e: &crate::exec::gpu::GpuEngine,
+    slots: &mut [Option<Slot>],
+    rows: impl IntoIterator<Item = usize>,
+    steps: usize,
+) {
+    if !e.dev_penalty() {
+        return;
+    }
+    for i in rows {
+        if let Some(slot) = slots
+            .get_mut(i)
+            .and_then(Option::as_mut)
+            .filter(|s| dev_pen_row(s))
+        {
+            slot.dev_pen_counted = slot.dev_pen_counted.saturating_add(steps);
+        }
+    }
 }
 
 /// Unmodified greedy requests keep the device argmax. Sampling adjustments
@@ -8059,7 +8170,7 @@ fn gpu_spec_draw(e: &crate::exec::gpu::GpuEngine, s: &Slot) -> crate::exec::gpu:
     if gpu_spec_draftable(&s.gen.params) {
         return SpecDraw::Argmax;
     }
-    match dev_sample_spec(s).filter(|_| e.dev_sample_enabled()) {
+    match dev_sample_spec(s, false).filter(|_| e.dev_sample_enabled()) {
         Some(d) => SpecDraw::Device(d),
         None => SpecDraw::Host,
     }
@@ -10575,6 +10686,7 @@ mod tests {
                 telemetry: None,
                 prompt_ids: vec![1, 2, 3],
                 out_ids: Vec::new(),
+                dev_pen_counted: usize::MAX,
                 gen: GenParams::default(),
                 respond,
                 prefix_offset: 0,
