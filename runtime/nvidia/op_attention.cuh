@@ -1857,6 +1857,7 @@ __device__ void d_flash_decode(float* __restrict__ Opart, float* __restrict__ ml
                         GF >= 2 && GF <= 4 && !FP8KV && !SZKV;
     if constexpr (!RG) {
         if (out) __trap(); /* a merge-folded packet needs the row-group body */
+        if (nrf) __trap();
     }
     /* A work item carries GF CONSECUTIVE query heads sharing one KV head (needs GF | gqa).
      * Indexing by head-GROUP, not by kv_head, is what makes GF < gqa correct. */
@@ -1946,7 +1947,7 @@ __device__ void d_flash_decode(float* __restrict__ Opart, float* __restrict__ ml
             const __nv_bfloat16* qs = nullptr;
 #if PLOW_NV_HNR_FOLD
             if (nrf) {
-                if (PLOW_NV_KV_ILV) __trap();
+                if (PLOW_NV_KV_ILV || PLOW_NV_FA_RGT || PLOW_NV_FA_RGM || SLOTMAP) __trap();
                 /* The HeadNormRope packets' rows, computed by this item: its GF q heads into smem,
                  * and on the split holding the new row (one item per KV head: gqa == GF) the k / v
                  * rows into the cache where HeadNormRope stores them, before any warp reads them. */

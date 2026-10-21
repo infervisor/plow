@@ -1945,6 +1945,10 @@ struct Tn {
     // the o_proj / down GEMV writes them, the GemvGlu / GemvQkv after it reads them. One tensor
     // across layers (each producer sits behind the previous consumer). TENSOR_NONE otherwise.
     nfp: u32,
+    // HeadNormRope fold (PLOW_DECODE_HNR_FOLD): per layer, the u32 descriptor FlashDecode's t7
+    // reads ({qg, kg, vg, gamma_q, gamma_k, cos, sin, pos, eps bits, qk_skip, v_skip}). Declared
+    // here because the decode rung builders' own tensors do not survive. Empty otherwise.
+    hnrd: Vec<u32>,
     // Gemma-4 E-series per-layer inputs (TENSOR_NONE elsewhere): the packed embedding table
     // [vocab][L*P], the context projection [L*P][H] and its norm gamma [P]; activations
     // `ple_raw` (token part), `ple_pp` (projection) and `ple` (combined) are [rows][L*P] bf16.
@@ -2627,6 +2631,7 @@ fn declare(
         kcs: Vec::new(),
         vcs: Vec::new(),
         lw: Vec::new(),
+        hnrd: Vec::new(),
     };
     let mut t = t;
     for l in 0..c.layers {
@@ -3032,6 +3037,31 @@ fn declare(
             edn8: ex4[2],
             edns: ex4[3],
         });
+    }
+    if emit_config::active().decode_hnr_fold && !emit_is_amd() && !emit_is_apple() {
+        for l in 0..c.layers as usize {
+            let (cs, sn) = if c.is_full[l] {
+                (t.cos_f, t.sin_f)
+            } else {
+                (t.cos_s, t.sin_s)
+            };
+            let w = &t.lw[l];
+            let words = [
+                t.qg,
+                t.kg,
+                t.vg,
+                w.qn,
+                w.kn,
+                cs,
+                sn,
+                t.pos,
+                c.eps.to_bits(),
+                u32::from(!c.has_qk_norm),
+                u32::from(!c.has_v_norm),
+            ];
+            let desc = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+            t.hnrd.push(b.tensor_init(&format!("hnr_fold.desc.{l}"), desc));
+        }
     }
     t
 }
@@ -5561,7 +5591,19 @@ fn emit_phase(
         } else {
             0
         };
-        let c_qn = if fuse_hnr {
+        // HEADNORMROPE FOLD (PLOW_DECODE_HNR_FOLD; op_attention.cuh d_flash_decode `nrf`): no
+        // HeadNormRope packets; each flash item norms+ropes its GF q heads into smem, and the item
+        // whose split holds the new row writes k/v into the cache first. One item per KV head
+        // (gqa == GF) and pos[]-addressed writes (n_batch_kv armed) are kernel preconditions.
+        let hnr_fold = decode
+            && fuse_qkv
+            && l < n.hnrd.len()
+            && !fp8_kv
+            && heads / kvh == gf
+            && hd == 128
+            && rope_pair == 0
+            && (t > 1 || seq_rows);
+        let c_qn = if fuse_hnr || hnr_fold {
             0 // no packet: the fold computes q's norm+rope in flash's staging
         } else {
             b.emit_dep(
@@ -5610,7 +5652,7 @@ fn emit_phase(
             && c_k == c_v
             && qk_skip == v_skip
             && emit_config::active().fuse_kv_hnr;
-        let c_kn = if fuse_hnr || shared {
+        let c_kn = if fuse_hnr || shared || hnr_fold {
             0
         } else {
             b.emit_dep(hn_op, hn_set(1), hn_dep(c_k, nk, kvh), |d| {
@@ -5653,7 +5695,7 @@ fn emit_phase(
                 }
             })
         };
-        if decode && !fuse_hnr && !shared {
+        if decode && !fuse_hnr && !shared && !hnr_fold {
             kv_rows.push(c_kn);
         }
         // v_norm: WEIGHTLESS (gamma NONE) and NO RoPE (cos NONE).
@@ -5667,7 +5709,7 @@ fn emit_phase(
         };
         let c_vn = if fuse_kv {
             c_kn // ONE instruction writes both rows; i[3] (the write row) is shared
-        } else if fuse_hnr || shared {
+        } else if fuse_hnr || shared || hnr_fold {
             0
         } else {
             b.emit_dep(hn_op, hn_set(2), vn_dep, |d| {
@@ -5688,7 +5730,7 @@ fn emit_phase(
                 }
             })
         };
-        if decode && !fuse_hnr && !shared && !fuse_kv {
+        if decode && !fuse_hnr && !shared && !fuse_kv && !hnr_fold {
             kv_rows.push(c_vn);
         }
 
@@ -5697,6 +5739,9 @@ fn emit_phase(
         // PREVIOUS decode step (a previous launch), so within this program flash depends only on
         // the three headnorms' work for its own head — not on all of them.
         let fa_dep = || -> Vec<Dep> {
+            if hnr_fold {
+                return vec![Dep::Coarse(c_q)];
+            }
             if shared {
                 return vec![Dep::Coarse(c_qn)];
             }
@@ -5871,6 +5916,9 @@ fn emit_phase(
                 d.t[6] = n.kcs[l];
                 d.t[7] = n.vcs[l]; // fp8-KV per-row scales (NONE in bf16 mode)
                                    // BATCH>1: n_batch = t (one query row per sequence, each with its own KV ring).
+                if hnr_fold {
+                    d.t[7] = n.hnrd[l];
+                }
                 d.i[0] = t;
                 d.i[1] = heads;
                 d.i[2] = kvh;
