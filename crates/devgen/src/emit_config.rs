@@ -1203,7 +1203,8 @@ pub struct EmitConfig {
     pub gemv_prefetch: bool,
 
     /// The NVIDIA pre-gate prefetch's op set (`gemv_pf_ops`, with PLOW_GEMV_PREFETCH): Gemv 1,
-    /// GemvGlu 2, GemvQkv 4, AddNorm 8, HeadNormRope 16, hd128 FlashDecode 32. Unset = 7.
+    /// GemvGlu 2, GemvQkv 4, AddNorm 8, HeadNormRope 16, hd128 FlashDecode 32, the next hd128
+    /// FlashDecode's KV from the GEMV / norm entries before it 64. Unset = 7.
     #[arg(long, env = "PLOW_NV_GEMV_PF_OPS")]
     pub nv_gemv_pf_ops: Option<u32>,
 

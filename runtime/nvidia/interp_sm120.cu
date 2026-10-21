@@ -3438,7 +3438,10 @@ extern "C" __device__ unsigned plow_fp8_m1_arm = 0;
  * gamma and the tokens' cos/sin rows, hd128 FlashDecode (32) the head of the block's first item,
  * one GEMV budget each of K and V. Qwen3-ASR rtx-5090 step_bench ctx 1024 B=1/16/32: AddNorm
  * 0.6B 1.335/2.568/4.003 -> 1.272/2.524/3.938 ms, 1.7B 2.669/4.006/5.379 -> 2.602/3.949/5.309;
- * FlashDecode 0.6B B=16/32 2.524/3.965, 1.7B 3.945/5.326. */
+ * FlashDecode 0.6B B=16/32 2.524/3.965, 1.7B 3.945/5.326.
+ * FlashDecode ahead (64): the GEMV / norm entries up to FD_AHEAD instructions before an hd128
+ * FlashDecode stream that FD's KV past the head (32), FD_AHEAD_ROWS rows of K and V per entry,
+ * while the narrow GEMVs between leave HBM idle. */
 #ifndef PLOW_NV_GEMV_PF_OPS
 #define PLOW_NV_GEMV_PF_OPS 7u
 #endif
@@ -3511,6 +3514,47 @@ __device__ __forceinline__ void plow_gemv_prefetch(const PlowDevInst* in, void* 
         break;
     }
 }
+#if (PLOW_NV_GEMV_PF_OPS & 64u) && !PLOW_NV_KV_ILV
+constexpr unsigned FD_AHEAD = 4u, FD_AHEAD_ROWS = 128u;
+__device__ __forceinline__ bool plow_fd_ahead_op(unsigned op) {
+    return op == PLOW_DOP_GEMV || op == PLOW_DOP_GEMV_GLU || op == PLOW_DOP_GEMV_QKV ||
+           op == PLOW_DOP_ADD_NORM || op == PLOW_DOP_HEADNORM_ROPE || op == PLOW_DOP_RMSNORM;
+}
+/* Threads 0 / 1 (K / V). By instruction, not by block: the global queue hands that FD slice to
+ * whichever block claims it. The scan crosses only GEMV / norm ops, so it stops at the sampler
+ * that ends every decode program and never reads past the instruction array. */
+__device__ __forceinline__ void plow_fd_ahead(const PlowDevInst* in, void* const* T, unsigned slice,
+                                              unsigned nblk_grid) {
+    if (!plow_fd_ahead_op(in->op)) return;
+    unsigned d = 1u;
+    while (in[d].op != PLOW_DOP_FLASH_DECODE) {
+        if (d == FD_AHEAD || !plow_fd_ahead_op(in[d].op)) return;
+        d++;
+    }
+    const PlowDevInst* fd = in + d;
+    if (fd->i[6] != PLOW_NV_FA_HD || fd->i[7] != 0xFFFFFFFFu) return;
+    const unsigned n_head = fd->i[1], n_kv_head = fd->i[2], nsplit = fd->i[5], window = fd->i[4];
+    const unsigned n_grp = n_head / PLOW_NV_FA_GF, gqa = n_head / n_kv_head;
+    const unsigned n_work = fd->i[0] * n_grp * nsplit, nblk = fd->blocks ? fd->blocks : nblk_grid;
+    unsigned skip = PLOW_NV_GEMV_PF_BYTES / (PLOW_NV_FA_HD * 2u) + (d - 1u) * FD_AHEAD_ROWS;
+    for (unsigned w = slice; w < n_work; w += nblk) {
+        const unsigned sp = w % nsplit, hg = (w / nsplit) % n_grp, b = w / (nsplit * n_grp);
+        const unsigned len = (unsigned)((const int*)T[fd->t[5]])[b];
+        const unsigned slot = fd->t[6] != PLOW_TENSOR_NONE ? (unsigned)max(((const int*)T[fd->t[6]])[b], 0) : b;
+        const unsigned first = (window && len > window) ? (len - window) : 0u;
+        const unsigned per = (len - first + nsplit - 1u) / nsplit, lo = first + sp * per;
+        const unsigned rows = lo < len ? min(per, len - lo) : 0u;
+        if (skip >= rows) {
+            skip -= rows;
+            continue;
+        }
+        const unsigned a = lo + skip, n = min(FD_AHEAD_ROWS, rows - skip);
+        const size_t off = (((size_t)slot * n_kv_head + (hg * PLOW_NV_FA_GF) / gqa) * fd->i[3] + a) * PLOW_NV_FA_HD;
+        gvmma_pf_l2((const __nv_bfloat16*)T[fd->t[threadIdx.x ? 4 : 3]] + off, n * PLOW_NV_FA_HD * 2u);
+        return;
+    }
+}
+#endif
 #endif
 #if PLOW_FP8TC_PF && PLOW_NV_FP8_DECODE_TC_ACTIVE
 __device__ __forceinline__ void plow_fp8tc_prefetch(const PlowDevInst* in, void* const* T,
@@ -3772,6 +3816,9 @@ __global__ __launch_bounds__(PLOW_NV_THREADS, PLOW_NV_MINBLK) void PLOW_SYM(inte
 
 #if PLOW_GEMV_PREFETCH && !PLOW_NV_PREFILL && PLOW_NV_GEMV_MMA
         if (wait_len) plow_gemv_prefetch(in, prog.tensors, e.slice, in->blocks ? in->blocks : nblk_grid);
+#if (PLOW_NV_GEMV_PF_OPS & 64u) && !PLOW_NV_KV_ILV
+        if (wait_len && threadIdx.x < 2u) plow_fd_ahead(in, prog.tensors, e.slice, nblk_grid);
+#endif
 #endif
 #if PLOW_FP8TC_PF && PLOW_NV_FP8_DECODE_TC_ACTIVE
         if (wait_len) plow_fp8tc_prefetch(in, prog.tensors, e.slice, in->blocks ? in->blocks : nblk_grid);
