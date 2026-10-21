@@ -290,6 +290,25 @@ contract (`media_geometry.v1`) bounds every step's slots, inputs and code/PCM ad
 Windowed vs stateful (H100, same client): Fish c1 TTFA 46 -> 37 ms, c32 21.6 -> 29.6 audio s/s
 (RTF 1.17 -> 0.87); Breeze c1 49 -> 40 ms, c32 25.6 -> 31.3 (RTF 1.08 -> 0.84); CER unchanged.
 
+Breeze's text encoder runs on the engine thread before a request's first prefill chunk: run
+beside decode steps, each of its launches waited behind a persistent decode kernel (9.4 ms alone,
+155 ms + 189 ms lock wait at c8). c8 TTFA 422 -> 57 ms, c32 31.3 -> 35.8 audio s/s.
+
+### Fish S2 and Breeze vs their official servers
+
+H100, same texts (`chatterbox_ref.PROMPTS`), default sampling, no CFG, streamed. The official
+servers take one request at a time (Breeze answers 409 while busy, fish-speech queues), so their
+throughput is their `/batch` endpoint (Breeze) or 8 queued clients (Fish).
+
+| | TTFA c1 | RTF c1 | audio s/s c1 | audio s/s loaded | TTFA loaded |
+|---|---|---|---|---|---|
+| Fish, fish-speech `api_server --compile` | 1135 ms | 0.54 | 2.0 | 2.0 (c8) | 17.8 s |
+| Fish, plowrt | 37 ms | 0.23 | 4.3 | 21.4 (c8), 29.6 (c32) | 49 ms (c8) |
+| Breeze, `breeze_infer.api --fast-all` | 57.5 ms | 0.29 | 3.3 | 3.7 (batch 32) | |
+| Breeze, plowrt | 40 ms | 0.19 | 5.2 | 25.8 (c8), 35.8 (c32) | 57 ms (c8) |
+
+SGLang-omni (Fish) was not measured here.
+
 ### Streaming windows
 
 A stream renders only its new tokens: `s3gen.pkt` carries cached-prompt capacities
