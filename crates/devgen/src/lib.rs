@@ -3060,7 +3060,7 @@ fn declare(
                 u32::from(!c.has_v_norm),
             ];
             let desc = words.iter().flat_map(|w| w.to_le_bytes()).collect();
-            t.hnrd.push(b.tensor_init(&format!("hnr_fold.desc.{l}"), desc));
+            t.hnrd.push(b.tensor_init(&format!("in.hnr_fold.desc.{l}"), desc));
         }
     }
     t

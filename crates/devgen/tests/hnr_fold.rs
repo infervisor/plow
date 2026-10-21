@@ -49,7 +49,7 @@ fn qwen3_hnr_fold_drops_the_headnorm_packets() {
                 let pos = model.tensors.iter().position(|t| t.name == "in.pos").unwrap() as u32;
                 let descs: Vec<u32> = (0..2)
                     .filter_map(|l| {
-                        let name = format!("hnr_fold.desc.{l}");
+                        let name = format!("in.hnr_fold.desc.{l}");
                         model.tensors.iter().position(|t| t.name == name).map(|i| i as u32)
                     })
                     .collect();
