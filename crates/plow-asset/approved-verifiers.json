@@ -28,6 +28,13 @@
       "toolchain": "leanprover/lean4:v4.15.0",
       "commit": "a0e7c740",
       "note": "codec_lm stateful stream steps (slots, step frames, step inputs, codes/PCM addressing); user-approved 2026-10-21"
+    },
+    {
+      "sha256": "c4efbfc33a67b1e85e69aa7b107aff3120a3b0cb0d0561f968f3da680a3396ac",
+      "lean_sources_sha256": "cd73ab655671f09153852aed5ef9ffb1f4bc3ee1f0adc7aea5876b423873c7e1",
+      "toolchain": "leanprover/lean4:v4.15.0",
+      "commit": "e4f3718c",
+      "note": "speech_fusion conv row-scale tensors cover the footprint (SNAC slab sites); user-approved 2026-10-21"
     }
   ]
 }
