@@ -2806,6 +2806,8 @@ pub struct GpuEngine {
     /// the next decode launch is one.
     row_slot_twin: Option<(Arc<BoundDecodeObject>, Arc<BoundDecodeObject>)>,
     span_launch: bool,
+    /// Verdicts of token-batch verify spans not yet taken by the scheduler.
+    tb_verdicts: Vec<(usize, u32, crate::orch::speculative::SpecVerdict)>,
     /// Per slot, one past the highest KV row any launch wrote (verify writes past `pos`).
     kv_hw: Vec<u32>,
     /// Bench-only launch overrides ([`Self::set_debug_min_rung`], [`Self::set_debug_nsplit_kvlen`]).
@@ -7416,6 +7418,7 @@ impl GpuEngine {
             spec_draft: None,
             row_slot_twin,
             span_launch: false,
+            tb_verdicts: Vec::new(),
             kv_hw: vec![0; batch],
             debug_min_rows: 0,
             debug_nsplit_kvlen: None,
@@ -8020,6 +8023,7 @@ impl GpuEngine {
         }
         self.seq_tokens[b].truncate(len);
         self.pos[b] = len as _;
+        self.spec_hidden_forget(b);
         Ok(())
     }
 
@@ -8553,6 +8557,7 @@ impl GpuEngine {
             tracing::warn!(launch_rows, ?feeds, ?pos, error = %e, "decode launch failed");
             e
         })?;
+        self.spec_hidden_save_plain(feeds, 1)?;
         if let Some(t) = &self.timing {
             self.be.event_record(&t.ev[2], &self.stream)?;
         }
@@ -9509,6 +9514,7 @@ impl GpuEngine {
         }
         self.reset_selected_decode_counters(rung)?;
         self.launch_selected_decode(rung)?;
+        self.spec_hidden_save_plain(feeds, 1)?;
         let mut a_ids = self.devp[self.t_ids].base;
         let mut a_pos = self.devp[self.t_pos].base;
         let mut a_kvl = self.devp[self.t_kvlen].base;

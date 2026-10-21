@@ -3538,6 +3538,7 @@ fn run_one_tick(
                         &mut obs.host.ride,
                         aging,
                         obs.host.queued_prefill_rows,
+                        &mut obs.host.ride_spans,
                     ) {
                         if tick_fault.is_none() {
                             tick_fault = Some(f);
@@ -3617,6 +3618,19 @@ fn run_one_tick(
                         );
                     }
                     obs.host.prefill_tokens = completed;
+                    if let Some((_, m)) = &spec_metrics {
+                        gpu_emit_ride_verdicts(
+                            &mut *e,
+                            &mut slots,
+                            &mut obs.host,
+                            m,
+                            &arena,
+                            bundle,
+                            stop.as_slice(),
+                            &mut tokens_this_tick,
+                            &mut disconnected,
+                        );
+                    }
                     if !compact {
                         for i in 0..slots.len().min(cap) {
                             let Some(s) = slots[i].as_ref() else { continue };
@@ -6621,6 +6635,7 @@ fn gpu_prefill_batched_pass(
     ride: &mut crate::sched::ride::RideCost,
     aging: std::time::Duration,
     queued_rows: usize,
+    spans: &mut Vec<smallvec::SmallVec<[u32; 8]>>,
 ) -> Option<crate::DeviceErrorInfo> {
     use crate::exec::gpu::PfBatchReq;
 
@@ -6632,6 +6647,7 @@ fn gpu_prefill_batched_pass(
     // (`sched::ride`): decided once, when the launch's bucket is known.
     let mut ride_open = unified && !feeds.is_empty();
     let withheld = usize::from(!compact);
+    spans.clear();
     let mut decode_rows = if unified { feeds.len() } else { 0 };
     let mut tick_fault: Option<crate::DeviceErrorInfo> = None;
     let budget_max = e.pf_max_rows();
@@ -6988,6 +7004,17 @@ fn gpu_prefill_batched_pass(
                 t.elapsed().as_secs_f64() * 1e6
             );
         }
+        // Riders' drafts fill the rows the launch's bucket pads anyway, within the terminal's
+        // sample rows (one per rider and per packed prompt). Drafted before the launch's clock:
+        // the ride costs price launches, not drafts.
+        if unified && compact && !feeds.is_empty() {
+            let rows = pack.iter().map(|p| p.2).sum::<usize>() + feeds.len();
+            let slack = e
+                .pf_cover_rows(rows)
+                .saturating_sub(rows)
+                .min(e.batch().saturating_sub(feeds.len() + pack.len()));
+            gpu_spec_riders(e, feeds, slots, slack, spans);
+        }
         let riders = if unified { feeds.len() } else { 0 };
         let mut window_time: Option<WindowTime> = None;
         let t_launch = Instant::now();
@@ -7004,15 +7031,20 @@ fn gpu_prefill_batched_pass(
             // A feed or pack entry whose slot vanished mid-tick is skipped, not a panic:
             // the tick thread must outlive one inconsistent row, and the slot re-feeds
             // next tick from live state.
-            let decode = feeds.iter().filter_map(|&(i, ref token)| {
+            let decode = feeds.iter().enumerate().filter_map(|(f, &(i, ref token))| {
                 let slot = slots[i].as_ref()?;
+                let span = spans.get(f).filter(|t| t.len() > 1);
                 Some(Request {
                     id: i as u32,
                     slot: i as u32,
                     state_slot: i as u32,
                     generation: e.slot_generation(i)?,
-                    phase: Phase::Decode,
-                    tokens: std::slice::from_ref(token),
+                    phase: if span.is_some() {
+                        Phase::Verify
+                    } else {
+                        Phase::Decode
+                    },
+                    tokens: span.map_or(std::slice::from_ref(token), |t| t.as_slice()),
                     prompt_len: slot.prompt_ids.len() as u32,
                     selection: Selection::default(),
                 })
@@ -7036,13 +7068,8 @@ fn gpu_prefill_batched_pass(
             } else if !window.is_empty() {
                 let sampled = e.dev_sample_enabled();
                 *dev_sampled = sampled;
-                let spec = |slot: u32| {
-                    slots
-                        .get(slot as usize)?
-                        .as_ref()
-                        .and_then(|s| dev_row_spec(s, pen))
-                };
-                let spec: Option<&dyn Fn(u32) -> Option<crate::exec::gpu::DevSample>> =
+                let spec = |slot: u32, j: u32| ride_row_spec(slots, feeds, spans, pen, slot, j);
+                let spec: Option<&dyn Fn(u32, u32) -> Option<crate::exec::gpu::DevSample>> =
                     sampled.then_some(&spec);
                 let jobs = &mut window;
                 let timed = &mut window_time;
@@ -7053,11 +7080,8 @@ fn gpu_prefill_batched_pass(
                 // Stochastic rows draw on the device: a host draw downloads the row's 512 KiB of
                 // logits and walks the vocabulary once per row, serially, inside the tick.
                 *dev_sampled = true;
-                e.token_batch_step_sampled(&requests, unified_output, &|slot| {
-                    slots
-                        .get(slot as usize)?
-                        .as_ref()
-                        .and_then(|s| dev_row_spec(s, pen))
+                e.token_batch_step_sampled(&requests, unified_output, &|slot, j| {
+                    ride_row_spec(slots, feeds, spans, pen, slot, j)
                 })
             } else {
                 e.token_batch_step(&requests, unified_output)
@@ -8270,6 +8294,11 @@ fn gpu_spec_caps(
             .saturating_sub(1);
         let room = e.max_ctx().saturating_sub(e.slot_pos(i) + 1);
         let cap = if gpu_spec_drafts(&s.gen.params) && (!ready || e.spec_draft_ready(i)) {
+            let kmax = if gpu_spec_draftable(&s.gen.params) {
+                kmax
+            } else {
+                kmax.min(crate::config::RuntimeConfig::get().nv.spec_sampled_kmax)
+            };
             (kmax as usize).min(left).min(room) as u32
         } else {
             0
@@ -8492,6 +8521,161 @@ fn gpu_spec_tick(
         }
     }
     true
+}
+
+/// `PLOW_SPEC_RIDE`: per decode feed riding a prefill launch, its pending token plus drafts that
+/// fit `slack` padded rows, when it may draft and its tokens come from the device (argmax or
+/// `plow_sample`); empty when it rides plainly.
+#[cfg(feature = "cuda")]
+fn gpu_spec_riders(
+    e: &mut crate::exec::gpu::GpuEngine,
+    feeds: &[(usize, u32)],
+    slots: &[Option<Slot>],
+    slack: usize,
+    out: &mut Vec<smallvec::SmallVec<[u32; 8]>>,
+) {
+    out.clear();
+    let ride_k = crate::config::RuntimeConfig::get().nv.spec_ride;
+    if ride_k == 0 {
+        return;
+    }
+    let Some(limits) = e.spec_serving() else {
+        return;
+    };
+    let mut caps = smallvec::SmallVec::new();
+    if gpu_spec_caps(e, feeds, slots, limits.kmax, true, &mut caps).is_err() {
+        return;
+    }
+    let dev = e.dev_sample_enabled();
+    for (&(i, _), cap) in feeds.iter().zip(caps.iter_mut()) {
+        let device = slots[i].as_ref().is_some_and(|s| {
+            s.gen.params.logprobs.is_none()
+                && (gpu_spec_draftable(&s.gen.params) || (dev && dev_row_spec(s, false).is_some()))
+        });
+        if !device {
+            *cap = 0;
+        }
+    }
+    // One draft launch: at most its widest program's rows draft.
+    let widest = limits.draft_rows.last().copied().unwrap_or(0);
+    for cap in caps.iter_mut().filter(|c| **c > 0).skip(widest) {
+        *cap = 0;
+    }
+    // Depths within `slack` rows: every drafting row one deeper per round while rows remain.
+    let mut depth: smallvec::SmallVec<[u32; 16]> = smallvec::smallvec![0; caps.len()];
+    let mut left = slack;
+    for d in 1..=ride_k.min(limits.kmax) {
+        if left == 0 {
+            break;
+        }
+        for (x, &c) in depth.iter_mut().zip(&caps) {
+            if left > 0 && c >= d {
+                *x = d;
+                left -= 1;
+            }
+        }
+    }
+    let caps = depth;
+    // Drafted before the launch: the draft delays the prompts in it.
+    let rows: smallvec::SmallVec<[(usize, u32); 16]> = feeds
+        .iter()
+        .zip(&caps)
+        .filter(|(_, &cap)| cap > 0)
+        .map(|(&f, _)| f)
+        .collect();
+    let k = caps.iter().copied().max().unwrap_or(0);
+    let (mut drafted, mut drafts) = (Vec::new(), Vec::new());
+    if !rows.is_empty() {
+        if let Err(err) = e.spec_draft_rows(&rows, k, &mut drafted, &mut drafts) {
+            tracing::warn!(error = %err, "gpu: rider draft failed");
+            drafted.clear();
+        }
+    }
+    let mut at = 0;
+    let mut row = 0;
+    for (&(_, token), &cap) in feeds.iter().zip(&caps) {
+        let mut tokens = smallvec::SmallVec::new();
+        if cap > 0 {
+            if drafted.get(row).copied().unwrap_or(false) {
+                tokens.push(token);
+                tokens.extend_from_slice(&drafts[at..at + cap as usize]);
+                at += k as usize;
+            }
+            row += 1;
+        }
+        out.push(tokens);
+    }
+}
+
+/// The device draw of sample row `j` of `slot` in a token batch: plain decode's, and for a verify
+/// span (`spans`, per feed) the one plain decode would use at that output position once the
+/// span's earlier drafts were emitted.
+#[cfg(feature = "cuda")]
+fn ride_row_spec(
+    slots: &[Option<Slot>],
+    feeds: &[(usize, u32)],
+    spans: &[smallvec::SmallVec<[u32; 8]>],
+    pen: bool,
+    slot: u32,
+    j: u32,
+) -> Option<crate::exec::gpu::DevSample> {
+    let s = slots.get(slot as usize)?.as_ref()?;
+    let span = feeds
+        .iter()
+        .zip(spans)
+        .find(|((i, _), t)| *i == slot as usize && t.len() > 1)
+        .map(|(_, t)| t);
+    // The device penalty history lacks a span's drafts: penalised span rows draw on the host.
+    let mut spec = dev_row_spec(s, pen && span.is_none())?;
+    if let Some(t) = span {
+        let mut u = [0f32; crate::orch::speculative::SPEC_KMAX + 1];
+        let n = (j as usize + 1).min(t.len());
+        crate::serve::seeded_units_ext(
+            &s.prompt_ids,
+            &s.out_ids,
+            &t[1..],
+            s.step,
+            s.gen.seed,
+            &mut u[..n],
+        );
+        spec.rng01 = u[n - 1];
+    }
+    Some(spec)
+}
+
+/// Stream the tokens of the verify spans token batches committed since the last call.
+#[cfg(feature = "cuda")]
+#[allow(clippy::too_many_arguments)]
+fn gpu_emit_ride_verdicts(
+    e: &mut crate::exec::gpu::GpuEngine,
+    slots: &mut [Option<Slot>],
+    host: &mut crate::exec::host::HostExecutor,
+    metrics: &Metrics,
+    arena: &Option<SharedKvState>,
+    bundle: &ModelBundle,
+    stop: &[u32],
+    tokens_this_tick: &mut usize,
+    disconnected: &mut [bool],
+) {
+    let mut verdicts = std::mem::take(&mut host.ride_verdicts);
+    e.take_token_batch_verdicts(&mut verdicts);
+    for &(i, k, ref v) in &verdicts {
+        if e.slot_generation(i) != Some(v.req_gen) {
+            continue;
+        }
+        metrics.serving.spec.record(k, u32::from(v.n_acc));
+        if let Some(p) = host.spec.as_mut() {
+            p.observe_verdict(k, u32::from(v.n_acc));
+        }
+        for &token in &v.tokens[..usize::from(v.n_emit)] {
+            if slots[i].is_none() {
+                break;
+            }
+            disconnected[i] |=
+                gpu_emit_slot_token(&mut slots[i], arena, bundle, token, tokens_this_tick, stop);
+        }
+    }
+    host.ride_verdicts = verdicts;
 }
 
 /// Incremental detokenize over a bounded window (TGI scheme): decode only
