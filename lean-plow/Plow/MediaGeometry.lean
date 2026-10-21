@@ -179,6 +179,9 @@ structure CodecLm where
   lmFrameCodes : Nat
   lmFrameSamples : Nat
   tokenBase : Nat
+  /-- The LM's audio token count from `tokenBase`: one per code (`frameCodes * codebook`), or one
+  per frame (`codebook`) when a depth stage samples the other codes. -/
+  audioTokens : Nat
   maxNewTokens : Nat
   promptTokens : Nat
   maxContext : Nat
@@ -201,9 +204,10 @@ def CodecLm.Contract (c : CodecLm) : Prop :=
   0 < c.frameCodes ∧ 0 < c.codebook ∧ c.codesCapacity % c.frameCodes = 0 ∧
   c.frames * c.frameSamples ≤ c.pcmCapacity ∧
   0 < c.windowFrames ∧ c.windowFrames + c.lookaheadFrames ≤ c.frames ∧
-  c.tokenBase + c.frameCodes * c.codebook ≤ 2 ^ 31 ∧
+  c.tokenBase + c.audioTokens ≤ 2 ^ 31 ∧
   c.maxNewTokens + c.promptTokens < c.maxContext ∧ c.maxContext < 2 ^ 32 ∧
-  (∀ s ∈ c.stops, s < 2 ^ 31 ∧ (s < c.tokenBase ∨ c.tokenBase + c.frameCodes * c.codebook ≤ s))
+  (∀ s ∈ c.stops, s < 2 ^ 31 ∧ (s < c.tokenBase ∨ c.tokenBase + c.audioTokens ≤ s)) ∧
+  (c.audioTokens = c.frameCodes * c.codebook ∨ c.audioTokens = c.codebook)
 
 instance (c : CodecLm) : Decidable c.Contract := by unfold CodecLm.Contract; exact inferInstance
 
@@ -384,13 +388,15 @@ def parseFamily (j : Json) : Except String Family := do
       vocab := (← nat j "vocab"), maxSymbolsPerFrame := (← nat j "max_symbols_per_frame") }
   | "codec_lm" =>
     exactKeys j ["kind", "lm_sample_rate", "lm_codebook", "lm_frame_codes", "lm_frame_samples",
-      "token_base", "max_new_tokens", "prompt_tokens", "max_context", "stops", "codec_sample_rate",
+      "token_base", "audio_tokens", "max_new_tokens", "prompt_tokens", "max_context", "stops",
+      "codec_sample_rate",
       "codebook", "frame_codes", "frame_samples", "codes_capacity", "pcm_capacity", "window_frames",
       "lookahead_frames"]
     return .codecLm {
       lmSampleRate := (← nat j "lm_sample_rate"), lmCodebook := (← nat j "lm_codebook"),
       lmFrameCodes := (← nat j "lm_frame_codes"), lmFrameSamples := (← nat j "lm_frame_samples"),
-      tokenBase := (← nat j "token_base"), maxNewTokens := (← nat j "max_new_tokens"),
+      tokenBase := (← nat j "token_base"), audioTokens := (← nat j "audio_tokens"),
+      maxNewTokens := (← nat j "max_new_tokens"),
       promptTokens := (← nat j "prompt_tokens"), maxContext := (← nat j "max_context"),
       stops := (← nats j "stops"), codecSampleRate := (← nat j "codec_sample_rate"),
       codebook := (← nat j "codebook"), frameCodes := (← nat j "frame_codes"),
