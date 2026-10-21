@@ -493,6 +493,43 @@ fn fp8_gemm_maps_match_sources_and_extents() {
 }
 
 #[test]
+fn fp8_m1_weight_map_is_gemm_fp8_only_and_64_rows() {
+    for (op, box_rows, input_map, ok) in [
+        (DevOp::GemmFp8, 64, 0, true),
+        (DevOp::GemmFp8, 128, 0, false),
+        (DevOp::GemmMedFp8, 64, 0, false),
+        (DevOp::GemmSmallFp8, 64, 0, false),
+        (DevOp::GemmFp8, 64, 7, false),
+    ] {
+        let result = validate_generated(None, |insts, tensors, generated| {
+            for _ in 0..2 {
+                tensors.push(Tensor {
+                    name: "tmap",
+                    bytes: 128,
+                    initialized: false,
+                });
+            }
+            let mut a = packet::rope::GenTensor::tmap_e4m3(4, 1, 256, 128);
+            a.tensor = 7;
+            generated.push(a);
+            let mut w = packet::rope::GenTensor::tmap_e4m3(5, 4, 256, box_rows);
+            w.tensor = 8;
+            generated.push(w);
+            let mut d = inst(op);
+            d.t[1] = 4;
+            d.t[2] = 5;
+            d.i = [1, 4, 256, 0, 0, 0, input_map, 8];
+            insts.push(d);
+        });
+        assert_eq!(
+            result.is_ok(),
+            ok,
+            "{op:?} box {box_rows} map {input_map}: {result:?}"
+        );
+    }
+}
+
+#[test]
 fn fp8_glu_maps_match_all_three_sources_and_extents() {
     for mutation in 0..13 {
         let result = validate_generated(None, |insts, tensors, generated| {
