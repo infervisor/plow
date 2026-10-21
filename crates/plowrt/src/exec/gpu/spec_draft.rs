@@ -522,7 +522,11 @@ impl GpuEngine {
 
     /// A rewind can revisit a keyed position with another history.
     pub(super) fn spec_hidden_forget(&mut self, b: usize) {
-        if let Some(slot) = self.spec_draft.as_mut().and_then(|d| d.hidden_at.get_mut(b)) {
+        if let Some(slot) = self
+            .spec_draft
+            .as_mut()
+            .and_then(|d| d.hidden_at.get_mut(b))
+        {
             *slot = None;
         }
     }

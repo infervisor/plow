@@ -773,12 +773,18 @@ fn verify_spans_follow_prefill_and_sample_every_row() {
     assert_eq!(plan.real_rows, 8);
     assert_eq!(plan.sample_input_rows, vec![0, 3, 4, 5, 6, 7]);
     assert_eq!(
-        plan.sample_owners.iter().map(|o| o.request).collect::<Vec<_>>(),
+        plan.sample_owners
+            .iter()
+            .map(|o| o.request)
+            .collect::<Vec<_>>(),
         vec![10, 12, 11, 11, 11, 11]
     );
     assert_eq!(&plan.positions[4..8], &[200, 201, 202, 203]);
     let v = plan.pending.iter().find(|p| p.request == 11).unwrap();
-    assert_eq!((v.expected_frontier, v.new_frontier, v.sample_index), (200, 204, Some(2)));
+    assert_eq!(
+        (v.expected_frontier, v.new_frontier, v.sample_index),
+        (200, 204, Some(2))
+    );
     let early = Request {
         phase: Phase::Verify,
         ..decode(11, 1, 250, &V)

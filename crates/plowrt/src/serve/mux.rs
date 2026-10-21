@@ -8525,7 +8525,14 @@ fn ride_row_spec(
     if let Some(t) = span {
         let mut u = [0f32; crate::orch::speculative::SPEC_KMAX + 1];
         let n = (j as usize + 1).min(t.len());
-        crate::serve::seeded_units_ext(&s.prompt_ids, &s.out_ids, &t[1..], s.step, s.gen.seed, &mut u[..n]);
+        crate::serve::seeded_units_ext(
+            &s.prompt_ids,
+            &s.out_ids,
+            &t[1..],
+            s.step,
+            s.gen.seed,
+            &mut u[..n],
+        );
         spec.rng01 = u[n - 1];
     }
     Some(spec)

@@ -527,7 +527,9 @@ impl TokenBatchStaging {
             .plan
             .pending
             .iter_mut()
-            .find(|c| c.slot == slot && c.expected_frontier < frontier && frontier <= c.new_frontier)
+            .find(|c| {
+                c.slot == slot && c.expected_frontier < frontier && frontier <= c.new_frontier
+            })
             .ok_or(StageError::FrontierChanged {
                 slot,
                 expected: frontier,

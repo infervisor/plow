@@ -105,7 +105,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             "--draft-bench" => {
                 spec.draft_iters = args.next().ok_or("--draft-bench ITERS")?.parse()?
             }
-            "--nsplit-kvlen" => spec.nsplit_kvlen = Some(args.next().ok_or("--nsplit-kvlen N")?.parse()?),
+            "--nsplit-kvlen" => {
+                spec.nsplit_kvlen = Some(args.next().ok_or("--nsplit-kvlen N")?.parse()?)
+            }
             "--max-segments" => {
                 max_segments = Some(args.next().ok_or("--max-segments N")?.parse()?)
             }
@@ -389,7 +391,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     if let Some(mode) = spec.mode.clone() {
         let prompts: Vec<Vec<u32>> = (0..slots).map(prompt_for).collect();
-        return spec_bench(&mut e, &assets, &spec, &mode, &prompts, &last, ctx + warmup, steps);
+        return spec_bench(
+            &mut e,
+            &assets,
+            &spec,
+            &mode,
+            &prompts,
+            &last,
+            ctx + warmup,
+            steps,
+        );
     }
     if let Some((lo, hi, step)) = seg_sweep {
         let base_pos: Vec<usize> = (0..slots).map(|_| ctx + warmup).collect();
@@ -937,8 +948,13 @@ fn draft_dump(
         let d = dir.join(format!("slot{b}"));
         std::fs::create_dir_all(&d)?;
         let hidden = e.tensor_bytes("act.mtp.h").ok_or("no act.mtp.h")? as usize / 16;
-        std::fs::write(d.join("act.hn.bin"), read(e, "act.hn", hrow as u64 * hidden as u64, hidden)?)?;
-        for n in ["e", "h", "x1", "x2", "x", "xn", "q", "qn", "at", "og", "hn", "fu", "dg", "logits"] {
+        std::fs::write(
+            d.join("act.hn.bin"),
+            read(e, "act.hn", hrow as u64 * hidden as u64, hidden)?,
+        )?;
+        for n in [
+            "e", "h", "x1", "x2", "x", "xn", "q", "qn", "at", "og", "hn", "fu", "dg", "logits",
+        ] {
             let name = format!("act.mtp.{n}");
             let row = e.tensor_bytes(&name).ok_or("missing")? as usize / 16;
             std::fs::write(d.join(format!("{name}.bin")), read(e, &name, 0, row)?)?;
@@ -1138,8 +1154,10 @@ fn spec_bench(
         let live: Vec<usize> = (0..slots).filter(|&b| out[b].len() < steps).collect();
         let drafting = mode == "mtp" && live.iter().all(|&b| hrow[b].is_some());
         if drafting {
-            let rows: Vec<(usize, u32, u32)> =
-                live.iter().map(|&b| (b, pending[b], hrow[b].unwrap())).collect();
+            let rows: Vec<(usize, u32, u32)> = live
+                .iter()
+                .map(|&b| (b, pending[b], hrow[b].unwrap()))
+                .collect();
             let t = Instant::now();
             e.spec_draft_stage(&rows, a.k as u32)?;
             e.spec_draft_run(&mut mtp)?;
