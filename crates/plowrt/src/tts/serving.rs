@@ -9,7 +9,8 @@
 //! submitted to that model's continuous-batching mux like a completion; the codec stage runs on
 //! the model's [`Codec`] worker. `stream: true` returns chunked audio: each new frame decodes a
 //! window of the codec's `stream.window_frames` and emits the frames that have
-//! `stream.lookahead_frames` of right context (both `codec.pkt` parameters).
+//! `stream.lookahead_frames` of right context (both `codec.pkt` parameters). A stateful codec
+//! (`stream.stateful`) instead decodes each frame once, in steps on the stream's codec slot.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -1469,6 +1470,14 @@ fn stream_step(
     })
 }
 
+/// New frames the next stateful codec step of a stream holding `n` complete frames, `emitted`
+/// of them sent, decodes: every committed frame up to `cap`; a segment's first step waits for
+/// `first` frames until the segment is done.
+fn step_plan(n: usize, emitted: usize, done: bool, first: usize, cap: usize) -> Option<usize> {
+    let new = n.saturating_sub(emitted);
+    (new > 0 && (done || emitted > 0 || new >= first)).then(|| new.min(cap))
+}
+
 enum SegMsg {
     Frame(Vec<i32>),
     /// The current segment attempt generated its last frame. A multi-segment drain then waits for
@@ -1637,6 +1646,13 @@ async fn stream_task(
     // Dropping the rest of the current attempt (cut short).
     let mut skipping = false;
     let mut first_frame_at: Option<Instant> = None;
+    // A stateful codec decodes each new frame once on this stream's slot; without a free slot
+    // the stream decodes windows.
+    let mut slot: Option<super::codec::StreamSlot> = None;
+    let mut windowed = model.codec.step_frames == 0;
+    let first_frames = crate::config::RuntimeConfig::get()
+        .tts_stream_first_frames
+        .max(1);
     loop {
         let mut done = false;
         let msg = frx.recv().await;
@@ -1648,6 +1664,9 @@ async fn stream_task(
                     (frames, emitted, skipping) = (Vec::new(), 0, false);
                     attempt += 1;
                     joiner.next_segment();
+                    if let Some(s) = slot.as_mut() {
+                        s.restart();
+                    }
                     continue;
                 }
                 Some(SegMsg::Err(_)) => {}
@@ -1657,6 +1676,9 @@ async fn stream_task(
                     joiner.next_segment();
                     (frames, emitted, skipping) = (Vec::new(), 0, false);
                     (seg, attempt) = (seg + 1, 0);
+                    if let Some(s) = slot.as_mut() {
+                        s.restart();
+                    }
                 }
             }
         }
@@ -1696,10 +1718,14 @@ async fn stream_task(
             model.codec.lookahead
         };
         let n = frames.len() / fc;
+        if !windowed && slot.is_none() && n > emitted && !skipping {
+            slot = model.codec.acquire_slot();
+            windowed = slot.is_none();
+        }
         // A short first lookahead buys time to first audio, but the next window needs the full
         // lookahead: hold the first audio until it covers producing those frames at the measured
         // frame rate (a stream near real time otherwise underruns right after its first chunk).
-        if first_audio && !done && lookahead < model.codec.lookahead {
+        if windowed && first_audio && !done && lookahead < model.codec.lookahead {
             let Some(t0) = first_frame_at.filter(|_| n >= 2) else {
                 continue;
             };
@@ -1722,22 +1748,44 @@ async fn stream_task(
                 continue;
             }
         }
-        if let Some((s, e, upto)) =
-            stream_step(n, emitted, done, model.codec.window, lookahead, chunk)
-                .filter(|_| !skipping)
-        {
-            let window = frames[s * fc..e * fc].to_vec();
-            let urgency = if first_audio {
+        // Windowed: one window per message. Stateful: steps until every committed frame is out.
+        while !skipping {
+            let urgency = if first.is_none() && emitted == 0 {
                 Urgency::First
             } else {
                 Urgency::Stream
             };
-            let wseed = seed ^ segment_salt(seg) ^ (emitted as u64).wrapping_mul(0x9E37_79B9);
-            match model.codec.decode(window, e - s, wseed, urgency).await {
-                Ok(pcm) => {
-                    let Some(fresh) = pcm.get((emitted - s) * fs..(upto - s) * fs) else {
+            // (PCM, its first fresh frame, frames emitted after it, frames decoded)
+            let decoded = if let Some(slot) = slot.as_mut() {
+                let Some(k) = step_plan(n, emitted, done, first_frames, model.codec.step_frames)
+                else {
+                    break;
+                };
+                let codes = frames[emitted * fc..(emitted + k) * fc].to_vec();
+                model
+                    .codec
+                    .step(slot, codes, k, urgency)
+                    .await
+                    .map(|pcm| (pcm, 0, emitted + k, k))
+            } else {
+                let Some((s, e, upto)) =
+                    stream_step(n, emitted, done, model.codec.window, lookahead, chunk)
+                else {
+                    break;
+                };
+                let window = frames[s * fc..e * fc].to_vec();
+                let wseed = seed ^ segment_salt(seg) ^ (emitted as u64).wrapping_mul(0x9E37_79B9);
+                model
+                    .codec
+                    .decode(window, e - s, wseed, urgency)
+                    .await
+                    .map(|pcm| (pcm, emitted - s, upto, e - s))
+            };
+            match decoded {
+                Ok((pcm, skip, upto, decoded)) => {
+                    let Some(fresh) = pcm.get(skip * fs..(skip + upto - emitted) * fs) else {
                         return drop(
-                            out.send(Err(std::io::Error::other(short_window(pcm.len(), e - s))))
+                            out.send(Err(std::io::Error::other(short_window(pcm.len(), decoded))))
                                 .await,
                         );
                     };
@@ -1778,6 +1826,9 @@ async fn stream_task(
                     }
                 }
                 Err(e) => return drop(out.send(Err(std::io::Error::other(e))).await),
+            }
+            if windowed {
+                break;
             }
         }
         if done {
@@ -1875,6 +1926,33 @@ mod tests {
             speech_failure(SpeechError::Failed(long.to_string())).status(),
             StatusCode::BAD_REQUEST
         );
+    }
+
+    /// Stateful steps decode every committed frame once, in order, at most CAP per step; a
+    /// segment's first step waits for FIRST frames unless the segment is done.
+    #[test]
+    fn step_plan_covers_each_frame_once() {
+        const CAP: usize = 17;
+        assert_eq!(step_plan(3, 0, false, 4, CAP), None);
+        assert_eq!(step_plan(3, 0, true, 4, CAP), Some(3));
+        assert_eq!(step_plan(4, 0, false, 4, CAP), Some(4));
+        assert_eq!(step_plan(5, 4, false, 4, CAP), Some(1));
+        assert_eq!(step_plan(40, 4, false, 4, CAP), Some(CAP));
+        assert_eq!(step_plan(4, 4, true, 4, CAP), None);
+        for total in 1..60 {
+            for arrive in 1..20 {
+                let (mut emitted, mut seen, mut n) = (0, Vec::new(), 0);
+                while n < total || emitted < total {
+                    n = (n + arrive).min(total);
+                    while let Some(k) = step_plan(n, emitted, n == total, 4, CAP) {
+                        assert!(k <= CAP && (emitted > 0 || k >= 4.min(total)));
+                        seen.extend(emitted..emitted + k);
+                        emitted += k;
+                    }
+                }
+                assert_eq!(seen, (0..total).collect::<Vec<_>>());
+            }
+        }
     }
 
     /// Every frame is emitted exactly once, in order, each with LOOKAHEAD right context until
