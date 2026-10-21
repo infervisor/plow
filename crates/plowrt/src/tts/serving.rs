@@ -1474,8 +1474,15 @@ fn stream_step(
 /// of them sent, decodes: every committed frame up to `cap`; a segment's first step waits for
 /// `first` frames until the segment is done.
 fn step_plan(n: usize, emitted: usize, done: bool, first: usize, cap: usize) -> Option<usize> {
+    // A step costs about the same at 1 frame as at `cap`: after the first, each step waits for as
+    // many new frames as were already emitted (their audio covers producing them), up to `cap`.
     let new = n.saturating_sub(emitted);
-    (new > 0 && (done || emitted > 0 || new >= first)).then(|| new.min(cap))
+    let need = if emitted == 0 {
+        first
+    } else {
+        emitted.min(cap)
+    };
+    (new > 0 && (done || new >= need)).then(|| new.min(cap))
 }
 
 enum SegMsg {
@@ -1936,7 +1943,10 @@ mod tests {
         assert_eq!(step_plan(3, 0, false, 4, CAP), None);
         assert_eq!(step_plan(3, 0, true, 4, CAP), Some(3));
         assert_eq!(step_plan(4, 0, false, 4, CAP), Some(4));
-        assert_eq!(step_plan(5, 4, false, 4, CAP), Some(1));
+        assert_eq!(step_plan(5, 4, false, 4, CAP), None);
+        assert_eq!(step_plan(8, 4, false, 4, CAP), Some(4));
+        assert_eq!(step_plan(30, 21, false, 4, CAP), None);
+        assert_eq!(step_plan(38, 21, false, 4, CAP), Some(CAP));
         assert_eq!(step_plan(40, 4, false, 4, CAP), Some(CAP));
         assert_eq!(step_plan(4, 4, true, 4, CAP), None);
         for total in 1..60 {

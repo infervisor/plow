@@ -211,11 +211,12 @@ pub struct RuntimeConfig {
     pub tts_first_lookahead: usize,
 
     /// New frames a speech stream's FIRST stateful codec step waits for (stateful `codec.pkt`
-    /// only); later steps decode whatever frames are committed, up to `stream.step_frames`.
+    /// only); each later step waits for as many new frames as were already emitted, up to
+    /// `stream.step_frames`.
     #[arg(
         long = "tts-stream-first-frames",
         env = "PLOW_TTS_STREAM_FIRST_FRAMES",
-        default_value_t = 4,
+        default_value_t = 1,
         global = true
     )]
     pub tts_stream_first_frames: usize,
