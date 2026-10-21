@@ -367,6 +367,37 @@ impl GpuEngine {
         Ok(())
     }
 
+    /// Draft `k` tokens now for each `(slot, pending token)` row whose hidden is ready (and whose
+    /// drafts stay inside the context): `out` gets `k` tokens per drafted row, in row order, and
+    /// `drafted[i]` says whether row `i` was.
+    pub fn spec_draft_rows(
+        &mut self,
+        rows: &[(usize, u32)],
+        k: u32,
+        drafted: &mut Vec<bool>,
+        out: &mut Vec<u32>,
+    ) -> Result<()> {
+        drafted.clear();
+        out.clear();
+        let mut stage = Vec::with_capacity(rows.len());
+        for &(slot, token) in rows {
+            let ok = self.spec_draft_ready(slot) && self.pos[slot] + k < self.max_ctx as u32;
+            if ok {
+                stage.push((slot, token, stage.len() as u32));
+            }
+            drafted.push(ok);
+        }
+        if stage.is_empty() || k == 0 {
+            drafted.fill(false);
+            return Ok(());
+        }
+        for &(slot, _, row) in &stage {
+            self.spec_hidden_restore(slot, row)?;
+        }
+        self.spec_draft_stage(&stage, k)?;
+        self.spec_draft_run(out)
+    }
+
     /// Launch the staged draft program without reading it back (bench timing).
     pub fn spec_draft_launch(&mut self) -> Result<()> {
         let d = self

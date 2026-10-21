@@ -73,6 +73,12 @@ pub struct HostExecutor {
     /// Requests wait behind the slots: speculation yields to their prefill.
     #[cfg(feature = "cuda")]
     pub spec_backlog: bool,
+    /// Verify-span verdicts of prefill launches (`PLOW_SPEC_RIDE`), reused per tick.
+    #[cfg(feature = "cuda")]
+    pub ride_verdicts: Vec<(usize, u32, crate::orch::speculative::SpecVerdict)>,
+    /// Per decode feed of a prefill launch, its verify span (empty: it rides plainly).
+    #[cfg(feature = "cuda")]
+    pub ride_spans: Vec<smallvec::SmallVec<[u32; 8]>>,
     /// Input text a TOKENIZE packet encodes into `token_ids` (when the host owns
     /// tokenization). Empty for the `--net` path (input is already `tokens`).
     pub input_text: Option<String>,

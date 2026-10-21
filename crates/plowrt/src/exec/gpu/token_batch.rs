@@ -140,6 +140,16 @@ impl StepClock {
 }
 
 impl GpuEngine {
+    /// `(slot, drafts, verdict)` of every verify span the token batches since the last call
+    /// committed.
+    pub fn take_token_batch_verdicts(
+        &mut self,
+        out: &mut Vec<(usize, u32, crate::orch::speculative::SpecVerdict)>,
+    ) {
+        out.clear();
+        out.append(&mut self.tb_verdicts);
+    }
+
     pub fn token_batch_enabled(&self) -> bool {
         self.token_batch.is_some()
     }
@@ -163,7 +173,7 @@ impl GpuEngine {
         &mut self,
         requests: &[Request<'_>],
         output: &mut Vec<(u32, u32)>,
-        spec: &dyn Fn(u32) -> Option<DevSample>,
+        spec: &dyn Fn(u32, u32) -> Option<DevSample>,
     ) -> Result<()> {
         self.token_batch_step_inner(requests, output, Some(spec), None)
     }
@@ -176,7 +186,7 @@ impl GpuEngine {
         &mut self,
         requests: &[Request<'_>],
         output: &mut Vec<(u32, u32)>,
-        spec: Option<&dyn Fn(u32) -> Option<DevSample>>,
+        spec: Option<&dyn Fn(u32, u32) -> Option<DevSample>>,
         window: &mut dyn FnMut(&mut GpuEngine),
     ) -> Result<()> {
         self.token_batch_step_inner(requests, output, spec, Some(window))
@@ -186,7 +196,7 @@ impl GpuEngine {
         &mut self,
         requests: &[Request<'_>],
         output: &mut Vec<(u32, u32)>,
-        spec: Option<&dyn Fn(u32) -> Option<DevSample>>,
+        spec: Option<&dyn Fn(u32, u32) -> Option<DevSample>>,
         mut window: Option<&mut dyn FnMut(&mut GpuEngine)>,
     ) -> Result<()> {
         output.clear();
@@ -194,6 +204,7 @@ impl GpuEngine {
             RuntimeError::Rejected("CUDA unified token-batch capability unavailable".into())
         })?;
         let mut body_enqueued = false;
+        let verdicts_before = self.tb_verdicts.len();
         // Multimodal soft-token rows (bit 31): the prefill buckets this batch runs replace them
         // from the slab (MmRowsBf16).
         let mm_rows = self
@@ -266,12 +277,37 @@ impl GpuEngine {
             let sample_rows: smallvec::SmallVec<[u32; 32]> =
                 plan.sample_input_rows.iter().copied().collect();
             let real_rows = plan.real_rows as usize;
+            // Verify spans (`Phase::Verify`, planned last): `(slot, first sample, rows, frontier)`.
+            let verifies: smallvec::SmallVec<[(usize, u32, u32, u32); 8]> = plan
+                .pending
+                .iter()
+                .zip(&plan.phases)
+                .filter(|(_, phase)| **phase == Phase::Verify)
+                .filter_map(|(p, _)| {
+                    Some((
+                        p.slot as usize,
+                        p.sample_index?,
+                        p.new_frontier - p.expected_frontier,
+                        p.expected_frontier,
+                    ))
+                })
+                .collect();
             let specs: Option<smallvec::SmallVec<[DevSample; 32]>> =
                 spec.filter(|_| self.sampler.is_some()).and_then(|spec| {
+                    // Row `j` of a verify span takes plain decode's draw for its output position.
+                    let plain = verifies.first().map_or(usize::MAX, |v| v.1 as usize);
                     let specs: smallvec::SmallVec<[DevSample; 32]> = plan
                         .sample_owners
                         .iter()
-                        .map(|owner| spec(owner.slot).unwrap_or_else(DevSample::greedy))
+                        .enumerate()
+                        .map(|(i, owner)| {
+                            let j = verifies
+                                .iter()
+                                .find(|v| v.0 == owner.slot as usize)
+                                .filter(|_| i >= plain)
+                                .map_or(0, |v| i as u32 - v.1);
+                            spec(owner.slot, j).unwrap_or_else(DevSample::greedy)
+                        })
                         .collect();
                     specs.iter().any(|s| s.temp > 0.0).then_some(specs)
                 });
@@ -359,12 +395,14 @@ impl GpuEngine {
                         // The drafter's next input: each sample row's final-norm hidden.
                         let (src, pitch) = terminal.hidden_rows();
                         let owners = state.staging.pending_plan().map(|p| &p.sample_owners);
+                        let plain = verifies.first().map_or(usize::MAX, |v| v.1 as usize);
                         self.spec_hidden_save_rows(
                             src,
                             pitch,
                             owners
                                 .into_iter()
                                 .flatten()
+                                .take(plain)
                                 .enumerate()
                                 .map(|(row, o)| (o.slot as usize, row as u32)),
                         )?;
@@ -401,8 +439,53 @@ impl GpuEngine {
                         .map_err(|error| RuntimeError::Rejected(error.to_string()))
                 });
             let terminal_ns = t_term.map_or(0, |t| t.elapsed().as_nanos() as u64);
+            let verdicts = sampled.and_then(|()| {
+                if verifies.is_empty() {
+                    return Ok(0);
+                }
+                // Accept each verify span from its sampled rows and keep only its emitted
+                // inputs: rows past them are dead, their KV never read.
+                let stop = Arc::clone(self.stop_ids());
+                let plain = verifies[0].1 as usize;
+                for &(slot, first, n, start) in &verifies {
+                    let tokens = requests
+                        .iter()
+                        .find(|r| r.phase == Phase::Verify && r.slot as usize == slot)
+                        .expect("planned")
+                        .tokens;
+                    let ids: smallvec::SmallVec<[u32; 8]> = output
+                        [first as usize..(first + n) as usize]
+                        .iter()
+                        .map(|&(_, id)| id)
+                        .collect();
+                    let v = crate::orch::speculative::accept_greedy(
+                        tokens,
+                        &ids,
+                        first,
+                        self.slot_generations[slot],
+                        &stop,
+                    );
+                    state
+                        .staging
+                        .shorten(slot as u32, start + u32::from(v.n_emit))
+                        .map_err(|error| RuntimeError::Rejected(error.to_string()))?;
+                    self.kv_hw[slot] = self.kv_hw[slot].max(start + n);
+                    self.tb_verdicts.push((slot, n - 1, v));
+                }
+                output.truncate(plain);
+                let (src, pitch) = terminal.hidden_rows();
+                let rows: smallvec::SmallVec<[(usize, u32); 8]> = self.tb_verdicts
+                    [self.tb_verdicts.len() - verifies.len()..]
+                    .iter()
+                    .map(|(slot, _, v)| (*slot, v.hrow))
+                    .collect();
+                if tail_rows.is_none() {
+                    self.spec_hidden_save_rows(src, pitch, rows.into_iter())?;
+                }
+                Ok(verifies.len())
+            });
             self.packed_terminal = Some(terminal);
-            sampled?;
+            verdicts?;
             if timed {
                 steptime::add(enqueue_ns, terminal_ns, rows as u64);
                 steptime::log_every(8);
@@ -414,7 +497,8 @@ impl GpuEngine {
             self.spec_hidden_commit(true);
             if self.vmm_prefix_enabled() {
                 for chunk in &chunks {
-                    self.seq_tokens[chunk.slot].extend_from_slice(chunk.tokens);
+                    let n = (self.pos[chunk.slot] as usize - chunk.c0).min(chunk.tokens.len());
+                    self.seq_tokens[chunk.slot].extend_from_slice(&chunk.tokens[..n]);
                 }
                 for chunk in &chunks {
                     self.vmm_publish_shared(chunk.slot, chunk.c0 as u32);
@@ -455,6 +539,7 @@ impl GpuEngine {
             Ok(())
         })();
         if result.is_err() {
+            self.tb_verdicts.truncate(verdicts_before);
             self.spec_hidden_commit(false);
             if body_enqueued {
                 let _ = self.be.stream_synchronize(&self.stream);

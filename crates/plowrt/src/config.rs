@@ -1329,6 +1329,12 @@ pub struct NvidiaRuntimeConfig {
     #[arg(long = "spec-sampled-kmax", env = "PLOW_SPEC_SAMPLED_KMAX", default_value_t = 3, global = true)]
     pub spec_sampled_kmax: u32,
 
+    /// With `PLOW_SPEC`: decode rows riding a prefill launch carry up to this many drafts as
+    /// verify rows in the rows its bucket pads (drafted just before the launch); their tokens are
+    /// accepted like a speculative tick's. 0 = off.
+    #[arg(long = "spec-ride", env = "PLOW_SPEC_RIDE", default_value_t = 0, global = true)]
+    pub spec_ride: u32,
+
     /// VMM prefix reuse. Automatically enabled for eligible Hopper hybrid BF16-KV packets.
     #[arg(long = "vmm-prefix", env = "PLOW_VMM_PREFIX", value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
     pub vmm_prefix: Option<bool>,

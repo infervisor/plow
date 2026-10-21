@@ -645,7 +645,7 @@ fn ride_bench(
             phase,
             tokens,
             prompt_len: match phase {
-                Phase::Decode => ctx as u32,
+                Phase::Decode | Phase::Verify => ctx as u32,
                 Phase::Prefill => prompt.len() as u32,
             },
             selection: Selection::default(),

@@ -645,6 +645,7 @@ pub const RUNTIME: &[KnobSpec] = &[
     KnobSpec::new("rt.spec", Some("PLOW_SPEC"), Layer::Runtime, Domain::Bool, OFF, OPT_IN),
     KnobSpec::new("rt.spec_sampled", Some("PLOW_SPEC_SAMPLED"), Layer::Runtime, Domain::Bool, ON, PROMOTED),
     KnobSpec::new("rt.spec_sampled_kmax", Some("PLOW_SPEC_SAMPLED_KMAX"), Layer::Runtime, U32, Default::Static(Val::Nat(3)), PROMOTED),
+    KnobSpec::new("rt.spec_ride", Some("PLOW_SPEC_RIDE"), Layer::Runtime, U32, Default::Static(Val::Nat(0)), OPT_IN),
     KnobSpec::new("rt.vmm_prefix", Some("PLOW_VMM_PREFIX"), Layer::Runtime, Domain::Bool, UNSET, OPT_IN),
     KnobSpec::new("rt.vmm_live", Some("PLOW_VMM_LIVE"), Layer::Runtime, Domain::Bool, OFF, OPT_IN),
     KnobSpec::new("rt.vmm_live_rings", Some("PLOW_VMM_LIVE_RINGS"), Layer::Runtime, Domain::Bool, UNSET, OPT_IN),

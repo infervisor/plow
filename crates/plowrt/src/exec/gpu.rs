@@ -2806,6 +2806,8 @@ pub struct GpuEngine {
     /// the next decode launch is one.
     row_slot_twin: Option<(Arc<BoundDecodeObject>, Arc<BoundDecodeObject>)>,
     span_launch: bool,
+    /// Verdicts of token-batch verify spans not yet taken by the scheduler.
+    tb_verdicts: Vec<(usize, u32, crate::orch::speculative::SpecVerdict)>,
     /// Per slot, one past the highest KV row any launch wrote (verify writes past `pos`).
     kv_hw: Vec<u32>,
     /// Bench-only launch overrides ([`Self::set_debug_min_rung`], [`Self::set_debug_nsplit_kvlen`]).
@@ -7400,6 +7402,7 @@ impl GpuEngine {
             spec_draft: None,
             row_slot_twin,
             span_launch: false,
+            tb_verdicts: Vec::new(),
             kv_hw: vec![0; batch],
             debug_min_rows: 0,
             debug_nsplit_kvlen: None,

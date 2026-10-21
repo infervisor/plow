@@ -517,6 +517,26 @@ impl TokenBatchStaging {
         Ok(())
     }
 
+    /// Commit fewer rows of `slot`'s span than planned (a verify span's rejected drafts):
+    /// its frontier advances to `frontier`, at least one row past where it started.
+    pub fn shorten(&mut self, slot: u32, frontier: u32) -> Result<(), StageError> {
+        if !self.pending {
+            return Err(StageError::NoPendingPlan);
+        }
+        let commit = self
+            .plan
+            .pending
+            .iter_mut()
+            .find(|c| c.slot == slot && c.expected_frontier < frontier && frontier <= c.new_frontier)
+            .ok_or(StageError::FrontierChanged {
+                slot,
+                expected: frontier,
+                actual: frontier,
+            })?;
+        commit.new_frontier = frontier;
+        Ok(())
+    }
+
     /// Scatter `S` device-produced ids to their logical requests, in sample order. Exactly one
     /// delivery per selected row: the owner comes from [`token_batch::SampleOwner`], not from
     /// the row number, because packed rows, physical slots and compact output rows are three
