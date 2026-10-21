@@ -3744,6 +3744,9 @@ static __device__ __noinline__ void d_conv1d_f32(const PlowDevInst* in, void* co
 /* ---- AttentionF32 (203): fp32 flash attention. Optional key prefix (t6, t7, i7): item b's keys
  * are rows [0, i7) of prefix block t7[b] (t6 is [blocks][i7][K | V], 2 * heads * hw wide) followed
  * by its kv_rows own rows; key lengths count both. No bias or causal mask with a prefix.
+ * Stream mode (flags bit 3, causal, no prefix or bias): Q/K/V share item rows [kv_rows]; the first
+ * i7 = L are carried history, query r is row L + r, and keys before L - min(t7[b], L) (t7: stream
+ * position u32[batch]) are absent.
  * One block per (item, head, 64-query tile); BK-key
  * tiles staged through smem; a thread owns 4 query
  * rows x 4*BK/64 keys of S and 4 rows x head_width/16 columns of O, with the row statistics
@@ -3778,8 +3781,9 @@ static __device__ __noinline__ void sp_attention_f32(const PlowDevInst* in, void
     const unsigned* lengths = (const unsigned*)SP_TEN(4);
     const float* prefix = (const float*)SP_TEN(6);
     const unsigned* pidx = (const unsigned*)SP_TEN(7);
-    const unsigned pre = prefix ? in->i[7] : 0u;
-    const float* bias = prefix ? nullptr : (const float*)SP_TEN(5);
+    const bool stream = in->i[6] & 8u;
+    const unsigned pre = prefix ? in->i[7] : 0u, hist = stream ? in->i[7] : 0u;
+    const float* bias = prefix || stream ? nullptr : (const float*)SP_TEN(5);
     const unsigned batch = in->i[0], q_rows = in->i[1], kv_rows = in->i[2], heads = in->i[3];
     const unsigned hw = RAGGED ? in->i[4] : (unsigned)HW;
     const unsigned width = heads * hw, stride = in->i[5] ? in->i[5] : width;
@@ -3795,9 +3799,11 @@ static __device__ __noinline__ void sp_attention_f32(const PlowDevInst* in, void
     static_assert(QPER * PLOW_NV_THREADS == SPF_BQ * D4 && PER * PLOW_NV_THREADS == BK * D4, "stage coverage");
     for (unsigned item = slice; item < batch * heads * qtiles; item += nblk) {
         const unsigned qt = item % qtiles, bh = item / qtiles, h = bh % heads, b = bh / heads;
-        const unsigned q0 = qt * SPF_BQ;
+        const unsigned q0 = qt * SPF_BQ, qa = hist + q0;
         const unsigned klen = lengths && lengths[b] < pre + kv_rows ? lengths[b] : pre + kv_rows;
-        const unsigned kend = causal ? min(klen, q0 + SPF_BQ) : klen;
+        const unsigned kend = causal ? min(klen, qa + SPF_BQ) : klen;
+        const unsigned left = stream ? hist - min(pidx[b], hist) : 0u;
+        const unsigned qrow0 = stream ? b * kv_rows + hist : b * q_rows;
         /* Every stage issues all of its loads into registers before the first smem store: with
          * one block per SM, a load-store-load loop exposes the full memory latency per element. */
         {
@@ -3807,7 +3813,7 @@ static __device__ __noinline__ void sp_attention_f32(const PlowDevInst* in, void
                 const unsigned e = tid + p * PLOW_NV_THREADS, r = e / D4, d = (e - r * D4) * 4u;
                 qv[p] = make_float4(0.f, 0.f, 0.f, 0.f);
                 if (q0 + r < q_rows && (!RAGGED || d < hw))
-                    qv[p] = sp_ld4(query + ((size_t)b * q_rows + q0 + r) * stride + h * hw + d, vec);
+                    qv[p] = sp_ld4(query + ((size_t)qrow0 + q0 + r) * stride + h * hw + d, vec);
             }
             __syncthreads();
 #pragma unroll
@@ -3824,7 +3830,7 @@ static __device__ __noinline__ void sp_attention_f32(const PlowDevInst* in, void
 #pragma unroll
             for (int c = 0; c < 4 * CB; c++) o[i][c] = 0.f;
         }
-        for (unsigned k0 = win && q0 >= win ? (q0 - win + 1u) / BK * BK : 0u; k0 < kend; k0 += BK) {
+        for (unsigned k0 = max(left, win && qa >= win ? qa - win + 1u : 0u) / BK * BK; k0 < kend; k0 += BK) {
             /* K/V are not prefetched across tiles: holding them in registers through the tile
              * spills in the interpreter object. */
             float4 kr[PER], vr[PER];
@@ -3874,14 +3880,14 @@ static __device__ __noinline__ void sp_attention_f32(const PlowDevInst* in, void
             const bool full = k0 + BK <= kend && !causal && !bias;
 #pragma unroll
             for (int i = 0; i < 4; i++) {
-                const unsigned r = q0 + ty * 4 + i;
+                const unsigned r = q0 + ty * 4 + i, rk = hist + r;
                 float mt = -INFINITY;
 #pragma unroll
                 for (int j = 0; j < 4 * KG; j++) {
                     const unsigned kj = k0 + (j >> 2) * 64 + tx * 4 + (j & 3);
                     float v = s[i][j] * scale;
                     if (!full) {
-                        if (kj < kend && (!causal || kj <= r) && (!win || kj + win > r)) {
+                        if (kj < kend && kj >= left && (!causal || kj <= rk) && (!win || kj + win > rk)) {
                             if (bias && r < q_rows) v += bias[(size_t)h * bias_hs + (size_t)r * kv_rows + kj];
                         } else {
                             v = -INFINITY;
@@ -4791,8 +4797,8 @@ static __device__ __noinline__ void d_attention_f32(const PlowDevInst* in, void*
     const bool vec = stride % 4u == 0 && in->fj[1].u % 4u == 0 && in->fj[2].u % 4u == 0 &&
                      sp_aligned(SP_TEN(1), 16) && sp_aligned(SP_TEN(2), 16) && sp_aligned(SP_TEN(3), 16) &&
                      sp_aligned(SP_TEN(0), 8) && (!SP_TEN(6) || sp_aligned(SP_TEN(6), 16));
-    /* flags bit 1 (i6): 3xTF32 tensor cores. */
-    if (in->i[4] == 64u && (in->i[6] & 2u) && vec) {
+    /* flags bit 1 (i6): 3xTF32 tensor cores; stream mode (bit 3) runs the fp32 kernel only. */
+    if (in->i[4] == 64u && (in->i[6] & 2u) && !(in->i[6] & 8u) && vec) {
         /* Packed query tiles once a run of 8 spans at most 2 heads (KT 32), 3 (KT 24) or 5 (KT 16). */
         const unsigned n16 = (in->i[1] + 15u) / 16u;
         if (in->i[6] & 0xFF04u) sp_attention_tc64p<32, 2, true>(in, T, slice, nblk); /* devgen: q_rows > 112 */

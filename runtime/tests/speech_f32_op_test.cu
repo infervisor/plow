@@ -1011,6 +1011,26 @@ static void t_attention(const char* name, unsigned batch, unsigned rows, unsigne
     run(name, c, g_attention_f32, {o}, FP32, 2e-5);
 }
 
+/* Stream mode: fused QKV item rows [hist carried | n new]; positions mask absent history, and the
+ * TC flag must fall back to the fp32 kernel. */
+static void t_attention_stream(const char* name, unsigned batch, unsigned hist, unsigned n, unsigned win,
+                               std::vector<uint32_t> pos, std::vector<uint32_t> lengths, bool tc) {
+    Case c;
+    const unsigned heads = 4, hw = 64, width = heads * hw, stride = 3 * width, rows = hist + n;
+    unsigned o = c.out((size_t)batch * n * width);
+    unsigned qkv = c.f32((size_t)batch * rows * stride, 1.f);
+    unsigned ps = c.u32(pos);
+    unsigned l = lengths.empty() ? PLOW_TENSOR_NONE : c.u32(lengths);
+    c.in.op = PLOW_DOP_ATTENTION_F32;
+    c.in.t[0] = o; c.in.t[1] = qkv; c.in.t[2] = qkv; c.in.t[3] = qkv; c.in.t[4] = l; c.in.t[5] = PLOW_TENSOR_NONE;
+    c.in.t[6] = PLOW_TENSOR_NONE; c.in.t[7] = ps;
+    c.in.i[0] = batch; c.in.i[1] = n; c.in.i[2] = rows; c.in.i[3] = heads; c.in.i[4] = hw;
+    c.in.i[5] = stride; c.in.i[6] = 1u | 8u | (tc ? 2u : 0u) | (win << 16); c.in.i[7] = hist;
+    c.in.fj[0].f = 0.125f;
+    c.in.fj[1].u = width; c.in.fj[2].u = 2 * width;
+    run(name, c, g_attention_f32, {o}, FP32, 2e-5);
+}
+
 /* Keys = [prefix block index[b] (pre rows, [K | V] rows) | own rows of a fused QKV tensor]. */
 static void t_attention_prefix(const char* name, unsigned batch, unsigned rows, unsigned pre, unsigned blocks,
                                std::vector<uint32_t> index, std::vector<uint32_t> lengths, bool tc) {
@@ -1645,6 +1665,10 @@ int main(int argc, char** argv) {
     t_attention_prefix_h16("AttentionF32 h16 prefix 300+264 lengths", 3, 264, 300, 3, {2, 0, 1}, {564, 400, 300});
 #endif
     t_stream_tail();
+    t_attention_stream("attn stream L127 n17 w128", 4, 127, 17, 128, {0, 5, 127, 4000}, {144, 140, 130, 144}, false);
+    t_attention_stream("attn stream L127 n17 w128 tc", 3, 127, 17, 128, {0, 1, 300}, {}, true);
+    t_attention_stream("attn stream L71 n80 w72", 2, 71, 80, 72, {0, 1000}, {151, 100}, false);
+    t_attention_stream("attn stream L127 n1 w128", 5, 127, 1, 128, {0, 1, 126, 127, 128}, {}, false);
 
     if (argc > 1 && !strcmp(argv[1], "--bench")) {
         bench_signal();

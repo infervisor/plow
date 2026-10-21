@@ -1154,8 +1154,11 @@ G_K(g_attention_f32) {
      * 2 * width wide), then its kv_rows own rows. */
     const float* prefix = PLOW_CPU_TEN(in, T, 6);
     const uint32_t* prefix_index = PLOW_CPU_TEN(in, T, 7);
+    /* i6 bit 3, stream mode: Q/K/V share item rows; the first i7 are carried history, query r is
+     * row i7 + r, and keys before i7 - min(t7[b], i7) (t7: stream position) are absent. */
+    const uint32_t stream = in->i[6] & 8u, hist = stream ? in->i[7] : 0u;
     const uint32_t pre = prefix ? in->i[7] : 0u;
-    const float* bias = prefix ? NULL : PLOW_CPU_TEN(in, T, 5);
+    const float* bias = prefix || stream ? NULL : PLOW_CPU_TEN(in, T, 5);
     const uint32_t batch = in->i[0], q_rows = in->i[1], kv_rows = in->i[2], heads = in->i[3];
     const uint32_t hw = in->i[4], width = heads * hw;
     const uint32_t stride = in->i[5] ? in->i[5] : width, causal = in->i[6] & 1u;
@@ -1171,9 +1174,12 @@ G_K(g_attention_f32) {
     for (uint32_t index = lo; index < hi; index++) {
         const uint32_t b = index / (heads * q_rows), h = index / q_rows % heads, r = index % q_rows;
         uint32_t visible = g_item_rows(key_lengths, lgroup ? (b * heads + h) / lgroup : b, pre + kv_rows);
-        if (causal && r + 1u < visible) visible = r + 1u;
-        const uint32_t win = causal ? in->i[6] >> 16 : 0u, first = win && r + 1u > win ? r + 1u - win : 0u;
-        const float* q = query + ((size_t)b * q_rows + r) * stride + (size_t)h * hw;
+        const uint32_t rk = hist + r;
+        if (causal && rk + 1u < visible) visible = rk + 1u;
+        const uint32_t win = causal ? in->i[6] >> 16 : 0u, left = stream ? hist - (prefix_index[b] < hist ? prefix_index[b] : hist) : 0u;
+        uint32_t first = win && rk + 1u > win ? rk + 1u - win : 0u;
+        if (first < left) first = left;
+        const float* q = query + ((size_t)(stream ? b * kv_rows + hist : b * q_rows) + r) * stride + (size_t)h * hw;
         double maximum = -INFINITY;
         for (uint32_t j = first; j < visible; j++) {
             const float* k = j < pre ? prefix + ((size_t)prefix_index[b] * pre + j) * 2u * width + (size_t)h * hw

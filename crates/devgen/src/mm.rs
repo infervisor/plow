@@ -1399,6 +1399,7 @@ fn lower_vision_capacity(
                 key_length_heads: 0,
                 prefix: None,
                 window: 0,
+                stream: None,
             },
         )?;
         let a = seq.done(e);

@@ -658,6 +658,18 @@ pub struct AttentionF32Stage<'a> {
     /// Causal sliding window (flag bits 16..31): key `j` is visible from row `r` iff
     /// `r - window < j <= r`; 0 = unbounded.
     pub window: u32,
+    /// Stream mode (flag bit 3): see [`AttentionStream`].
+    pub stream: Option<AttentionStream>,
+}
+
+/// Stream mode for [`AttentionF32Stage`]: query, key and value share each item's `kv_rows` rows;
+/// the first `history` are carried keys (a [`DevOp::StreamTailF32`] gather), query `r` is row
+/// `history + r` (`kv_rows = history + q_rows`), and keys before `history - min(pos[b], history)`
+/// are absent (`pos`: u32 stream position per item).
+#[derive(Clone, Copy)]
+pub struct AttentionStream {
+    pub pos: u32,
+    pub history: u32,
 }
 
 /// A key prefix for [`AttentionF32Stage`]: item `b` first attends to the `rows` rows of block
@@ -1930,6 +1942,26 @@ impl StageProgram {
         if stage.window != 0 && (!stage.causal || stage.window > 0xFFFF || stage.prefix.is_some()) {
             return Err("attention window: causal, at most 65535 rows, no prefix".into());
         }
+        if let Some(st) = stage.stream {
+            if !stage.causal
+                || stage.prefix.is_some()
+                || stage.bias.is_some()
+                || stage.relative
+                || stage.key_length_heads != 0
+                || st.history == 0
+                || stage.kv_rows != st.history + stage.q_rows
+            {
+                return Err(
+                    "attention stream: causal, no prefix or bias, kv_rows = history + q_rows"
+                        .into(),
+                );
+            }
+            self.input(
+                st.pos,
+                u64::from(stage.batch) * 4,
+                "attention stream positions",
+            )?;
+        }
         if let Some(p) = stage.prefix {
             if stage.bias.is_some() || stage.causal || p.rows == 0 {
                 return Err(
@@ -1970,7 +2002,7 @@ impl StageProgram {
         let output = self.resolve(stage.output, f32_bytes(out_elements)?, "attention output")?;
         // head_width 64 runs 3xTF32 tensor cores (flag bit 1), one block per run of 8 16-row query
         // tiles in each item's (head, tile) order (per head when a head has a single tile).
-        let tc = stage.head_width == 64;
+        let tc = stage.head_width == 64 && stage.stream.is_none();
         let n16 = stage.q_rows.div_ceil(16);
         let units = match (tc, n16 >= 2) {
             (true, true) => {
@@ -1992,7 +2024,11 @@ impl StageProgram {
                 stage.key_lengths.unwrap_or(packet::dev::TENSOR_NONE),
                 bias,
                 stage.prefix.map_or(packet::dev::TENSOR_NONE, |p| p.table),
-                stage.prefix.map_or(packet::dev::TENSOR_NONE, |p| p.index),
+                stage
+                    .prefix
+                    .map(|p| p.index)
+                    .or(stage.stream.map(|st| st.pos))
+                    .unwrap_or(packet::dev::TENSOR_NONE),
             ]);
             d.i = [
                 stage.batch,
@@ -2004,10 +2040,14 @@ impl StageProgram {
                 u32::from(stage.causal)
                     | (u32::from(tc) << 1)
                     | (u32::from(stage.relative) << 2)
+                    | (u32::from(stage.stream.is_some()) << 3)
                     | (u32::from(stage.prefix.is_some_and(|p| p.h16)) << 4)
                     | (stage.key_length_heads << 8)
                     | (stage.window << 16),
-                stage.prefix.map_or(stage.bias_head_stride, |p| p.rows),
+                stage.prefix.map_or(
+                    stage.stream.map_or(stage.bias_head_stride, |st| st.history),
+                    |p| p.rows,
+                ),
             ];
             d.f[0] = stage.scale;
             d.j = [stage.k_col0, stage.v_col0];
@@ -2888,6 +2928,7 @@ mod tests {
                 h16,
             }),
             window: 0,
+            stream: None,
         };
         assert!(p
             .attention_f32(h[0], h[0], h[0], &[f.done], attention(48, true))
@@ -2992,6 +3033,55 @@ mod tests {
     }
 
     #[test]
+    fn attention_stream_encodes_history_and_positions() {
+        let (b, hist, n, width) = (3u32, 127u32, 17u32, 4 * 64u32);
+        let (prefix, h) = prefix_with(&[
+            ("z", u64::from(b * (hist + n) * 3 * width) * 4),
+            ("pos", u64::from(b) * 4),
+        ]);
+        let stage = |kv_rows, causal, stream| AttentionF32Stage {
+            output: TensorRef::Named("ctx"),
+            key_lengths: None,
+            bias: None,
+            batch: b,
+            q_rows: n,
+            kv_rows,
+            heads: 4,
+            head_width: 64,
+            in_stride: 3 * width,
+            k_col0: width,
+            v_col0: 2 * width,
+            causal,
+            scale: 0.125,
+            bias_head_stride: 0,
+            relative: false,
+            key_length_heads: 0,
+            prefix: None,
+            window: 128,
+            stream,
+        };
+        let st = Some(AttentionStream {
+            pos: h[1],
+            history: hist,
+        });
+        let mut p = prefix.program();
+        assert!(p
+            .attention_f32(h[0], h[0], h[0], &[], stage(hist + n + 1, true, st))
+            .is_err());
+        assert!(p
+            .attention_f32(h[0], h[0], h[0], &[], stage(hist + n, false, st))
+            .is_err());
+        p.attention_f32(h[0], h[0], h[0], &[], stage(hist + n, true, st))
+            .unwrap();
+        let prefix = p.finish(0);
+        let d = &prefix.model.progs[0].insts[0];
+        assert_eq!(d.t[7], h[1]);
+        assert_eq!(d.i[6] & 0xF, 1 | 8, "causal + stream, no tensor-core bit");
+        assert_eq!(d.i[6] >> 16, 128);
+        assert_eq!(d.i[7], hist);
+    }
+
+    #[test]
     fn single_stage_appends_and_validation() {
         let (prefix, h) = prefix_with(&[("q", 2 * 50 * 128 * 4), ("f0", 2 * 480 * 4)]);
         let prefix = prefix
@@ -3018,6 +3108,7 @@ mod tests {
                     key_length_heads: 0,
                     prefix: None,
                     window: 0,
+                    stream: None,
                 },
             )
             .unwrap()

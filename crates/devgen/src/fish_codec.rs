@@ -616,6 +616,7 @@ fn program_for(
                 key_length_heads: 0,
                 prefix: None,
                 window: cfg.window,
+                stream: None,
             },
         )?;
         let at = s.done(e);
