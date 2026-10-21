@@ -3515,17 +3515,20 @@ __device__ __forceinline__ void plow_gemv_prefetch(const PlowDevInst* in, void* 
     }
 }
 #if (PLOW_NV_GEMV_PF_OPS & 64u) && !PLOW_NV_KV_ILV
-constexpr unsigned FD_AHEAD = 4u, FD_AHEAD_ROWS = 128u;
+constexpr unsigned FD_AHEAD = 4u, FD_AHEAD_ROWS = 128u, FD_AHEAD_MIN_ROWS = 16u;
 __device__ __forceinline__ bool plow_fd_ahead_op(unsigned op) {
     return op == PLOW_DOP_GEMV || op == PLOW_DOP_GEMV_GLU || op == PLOW_DOP_GEMV_QKV ||
            op == PLOW_DOP_ADD_NORM || op == PLOW_DOP_HEADNORM_ROPE || op == PLOW_DOP_RMSNORM;
 }
-/* Threads 0 / 1 (K / V). By instruction, not by block: the global queue hands that FD slice to
- * whichever block claims it. The scan crosses only GEMV / norm ops, so it stops at the sampler
- * that ends every decode program and never reads past the instruction array. */
+/* The block's last two threads (K / V), not the gate pollers: the scan's dependent instruction
+ * loads would delay the poll. By instruction, not by block: the global queue hands that FD slice
+ * to whichever block claims it. The scan crosses only GEMV / norm ops, so it stops at the sampler
+ * that ends every decode program and never reads past the instruction array. i0 is the rows
+ * (batch) of every op it starts from; below FD_AHEAD_MIN_ROWS the KV is a few MB and the scan
+ * cost the 0.6B B=1 / B=4 steps 6.5% / 3.5%. */
 __device__ __forceinline__ void plow_fd_ahead(const PlowDevInst* in, void* const* T, unsigned slice,
                                               unsigned nblk_grid) {
-    if (!plow_fd_ahead_op(in->op)) return;
+    if (!plow_fd_ahead_op(in->op) || in->i[0] < FD_AHEAD_MIN_ROWS) return;
     unsigned d = 1u;
     while (in[d].op != PLOW_DOP_FLASH_DECODE) {
         if (d == FD_AHEAD || !plow_fd_ahead_op(in[d].op)) return;
@@ -3550,7 +3553,7 @@ __device__ __forceinline__ void plow_fd_ahead(const PlowDevInst* in, void* const
         }
         const unsigned a = lo + skip, n = min(FD_AHEAD_ROWS, rows - skip);
         const size_t off = (((size_t)slot * n_kv_head + (hg * PLOW_NV_FA_GF) / gqa) * fd->i[3] + a) * PLOW_NV_FA_HD;
-        gvmma_pf_l2((const __nv_bfloat16*)T[fd->t[threadIdx.x ? 4 : 3]] + off, n * PLOW_NV_FA_HD * 2u);
+        gvmma_pf_l2((const __nv_bfloat16*)T[fd->t[(threadIdx.x & 1u) ? 4 : 3]] + off, n * PLOW_NV_FA_HD * 2u);
         return;
     }
 }
@@ -3817,7 +3820,7 @@ __global__ __launch_bounds__(PLOW_NV_THREADS, PLOW_NV_MINBLK) void PLOW_SYM(inte
 #if PLOW_GEMV_PREFETCH && !PLOW_NV_PREFILL && PLOW_NV_GEMV_MMA
         if (wait_len) plow_gemv_prefetch(in, prog.tensors, e.slice, in->blocks ? in->blocks : nblk_grid);
 #if (PLOW_NV_GEMV_PF_OPS & 64u) && !PLOW_NV_KV_ILV
-        if (wait_len && threadIdx.x < 2u) plow_fd_ahead(in, prog.tensors, e.slice, nblk_grid);
+        if (wait_len && threadIdx.x >= blockDim.x - 2u) plow_fd_ahead(in, prog.tensors, e.slice, nblk_grid);
 #endif
 #endif
 #if PLOW_FP8TC_PF && PLOW_NV_FP8_DECODE_TC_ACTIVE
