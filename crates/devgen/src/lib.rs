@@ -3038,7 +3038,7 @@ fn declare(
             edns: ex4[3],
         });
     }
-    if emit_config::active().decode_hnr_fold && !emit_is_amd() && !emit_is_apple() {
+    if emit_config::active().decode_hnr_fold.unwrap_or(0) > 0 && !emit_is_amd() && !emit_is_apple() {
         for l in 0..c.layers as usize {
             let (cs, sn) = if c.is_full[l] {
                 (t.cos_f, t.sin_f)
@@ -5598,6 +5598,7 @@ fn emit_phase(
         let hnr_fold = decode
             && fuse_qkv
             && l < n.hnrd.len()
+            && emit_config::active().decode_hnr_fold.is_some_and(|rows| t >= rows)
             && !fp8_kv
             && heads / kvh == gf
             && hd == 128

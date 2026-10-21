@@ -234,18 +234,23 @@ fn validate_decode_ladder_impl(blob: &DevBlob, segmented: bool, routed: &[bool])
     let widest = programs.last().expect("multiple programs");
     let mut compatible = true;
     let mut same_shape = true;
-    let mut normalized = [Vec::new(), Vec::new(), Vec::new()];
+    let mut normalized: [Vec<_>; 6] = Default::default();
     for (index, g) in programs.iter().enumerate() {
         let folded = g.insts.iter().any(|d| {
             matches!(DevOp::from_u16(d.op), Some(DevOp::Gemv | DevOp::GemvGlu)) && d.i[3] == 4
         });
+        // devgen PLOW_DECODE_HNR_FOLD=<rows>: the rungs from `rows` up carry no HeadNormRope.
+        let hnr_folded = g
+            .insts
+            .iter()
+            .any(|d| d.op == DevOp::FlashDecode as u16 && d.t[7] != TENSOR_NONE16);
         let class = if routed.get(index).copied().unwrap_or(false) {
             1
         } else if folded {
             2
         } else {
             0
-        };
+        } + if hnr_folded { 3 } else { 0 };
         let normalized = &mut normalized[class];
         let logical = splitk.as_ref().map(|proof| &proof.canonical[index]);
         if let Some(proof) = &splitk {

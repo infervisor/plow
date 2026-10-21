@@ -1313,7 +1313,7 @@ fn tuning(s: &Shapes, arch: &str) -> Map<String, Value> {
     }
     // * `hnr_fold` (PLOW_DECODE_HNR_FOLD opt-in): the decode object's FlashDecode carries the
     //   HeadNormRope fold arm the packet's flash packets use.
-    if arch.starts_with("sm_") && crate::emit_config::active().decode_hnr_fold {
+    if arch.starts_with("sm_") && crate::emit_config::active().decode_hnr_fold.unwrap_or(0) > 0 {
         assert_eq!(arch, "sm_120a", "PLOW_DECODE_HNR_FOLD: sm_120a decode objects only");
         t.insert("hnr_fold".into(), json!(1));
     }

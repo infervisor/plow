@@ -14,18 +14,19 @@ struct Args {
     emit: devgen::emit_config::EmitConfig,
 }
 
-/// PLOW_DECODE_HNR_FOLD: no decode rung carries a HeadNormRope; every FlashDecode's t7 names its
-/// layer's descriptor, whose position word is `in.pos`.
+/// PLOW_DECODE_HNR_FOLD=<rows>: the decode rungs of at least `rows` rows carry no HeadNormRope and
+/// every FlashDecode's t7 names its layer's descriptor, whose position word is `in.pos`; the
+/// narrower rungs keep the HeadNormRope packets.
 #[test]
 fn qwen3_hnr_fold_drops_the_headnorm_packets() {
     let root = std::path::Path::new(env!("CARGO_TARGET_TMPDIR")).join("qwen3_hnr_fold");
     std::fs::create_dir_all(&root).unwrap();
     std::fs::write(root.join("config.json"), CONFIG).unwrap();
-    for fold in [false, true] {
+    for fold in [0u32, 1, 32] {
         let mut cfg = Args::try_parse_from(["test"]).unwrap().emit;
         cfg.decode_batch = 32;
         cfg.decode_ladder = Some("1,16,32".into());
-        cfg.decode_hnr_fold = fold;
+        cfg.decode_hnr_fold = Some(fold);
         cfg.emit_packed_prefill = Some(true);
         cfg.packed_prefill_small_hd = true;
         devgen::run_verified(
@@ -53,7 +54,7 @@ fn qwen3_hnr_fold_drops_the_headnorm_packets() {
                         model.tensors.iter().position(|t| t.name == name).map(|i| i as u32)
                     })
                     .collect();
-                assert_eq!(descs.len(), if fold { 2 } else { 0 });
+                assert_eq!(descs.len(), if fold > 0 { 2 } else { 0 });
                 for &d in &descs {
                     let w = model.tensors[d as usize].init.as_deref().unwrap();
                     assert_eq!(w.len(), 44);
@@ -61,22 +62,23 @@ fn qwen3_hnr_fold_drops_the_headnorm_packets() {
                 }
                 let lo = packet::devbuild::decode_rung_lo(&model.prog_t);
                 assert_eq!(&model.prog_t[lo..], &[1, 16, 32]);
-                for p in &model.progs[lo..] {
+                for (p, &rows) in model.progs[lo..].iter().zip(&model.prog_t[lo..]) {
+                    let folded = fold > 0 && rows >= fold;
                     let hnr = p.insts.iter().filter(|i| i.op == DevOp::HeadNormRope as u16).count();
-                    assert_eq!(hnr == 0, fold);
+                    assert_eq!(hnr == 0, folded);
                     let fd: Vec<u32> = p
                         .insts
                         .iter()
                         .filter(|i| i.op == DevOp::FlashDecode as u16)
                         .map(|i| i.t[7] as u32)
                         .collect();
-                    assert_eq!(fd, if fold { descs.clone() } else { vec![TENSOR_NONE; 2] });
+                    assert_eq!(fd, if folded { descs.clone() } else { vec![TENSOR_NONE; 2] });
                 }
                 Ok(devgen::LeanReport::skipped("structural contract test"))
             })),
         );
         let config = std::fs::read_to_string(root.join("plow_config.h")).unwrap();
-        assert_eq!(config.contains("#define PLOW_NV_HNR_FOLD 1"), fold);
+        assert_eq!(config.contains("#define PLOW_NV_HNR_FOLD 1"), fold > 0);
     }
     std::fs::remove_dir_all(root).unwrap();
 }
