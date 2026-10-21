@@ -13,8 +13,9 @@ actually emits (`plow_asset::speech_fusion` derives the input).
   statistics of its input; a tensor no instruction writes keeps its contents), and
   `ln_site_gemm_eq` closes the GEMM equivalence.
 * Conv1dF32 `row_scale`: `conv_row_scale_residual_eq` holds per element. `ConvSite.Contract`
-  recomputes `out_rows` from the raw fields and checks the scale is `[batch][out_rows]`, the
-  residual has the output's size and neither aliases the scale; `conv_site_in_bounds` gives
+  recomputes `out_rows` from the raw fields and checks the scale covers `[batch][out_rows]`, the
+  output and residual cover `[batch][out_rows][out_channels]` (slab tensors may be larger), and
+  neither aliases the scale; `conv_site_in_bounds` gives
   every `(b, t, c)` element's scale and residual index in bounds.
 -/
 import Lean.Data.Json
@@ -107,9 +108,10 @@ def ConvSite.outRows (s : ConvSite) : Nat :=
 def ConvSite.Contract (s : ConvSite) : Prop :=
   0 < s.batch ∧ 0 < s.outChannels ∧ 0 < s.kernel ∧ 0 < s.stride ∧ 0 < s.dilation ∧
   s.dilation * (s.kernel - 1) + 1 ≤ s.inRows + s.padBefore + s.padAfter ∧
-  s.rowScaleBytes = 4 * (s.batch * s.outRows) ∧
-  s.outBytes = 4 * (s.batch * s.outRows * s.outChannels) ∧
-  s.residualBytes = s.outBytes ∧ s.rowScaleIsOut = false ∧ s.rowScaleIsResidual = false
+  4 * (s.batch * s.outRows) ≤ s.rowScaleBytes ∧
+  4 * (s.batch * s.outRows * s.outChannels) ≤ s.outBytes ∧
+  4 * (s.batch * s.outRows * s.outChannels) ≤ s.residualBytes ∧
+  s.rowScaleIsOut = false ∧ s.rowScaleIsResidual = false
 
 instance (s : ConvSite) : Decidable s.Contract := by unfold ConvSite.Contract; infer_instance
 
