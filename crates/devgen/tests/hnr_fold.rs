@@ -26,6 +26,8 @@ fn qwen3_hnr_fold_drops_the_headnorm_packets() {
         cfg.decode_batch = 32;
         cfg.decode_ladder = Some("1,16,32".into());
         cfg.decode_hnr_fold = fold;
+        cfg.emit_packed_prefill = Some(true);
+        cfg.packed_prefill_small_hd = true;
         devgen::run_verified(
             devgen::EmitArgs {
                 dir: root.clone(),
