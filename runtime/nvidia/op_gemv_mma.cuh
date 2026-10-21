@@ -65,9 +65,14 @@
  * activations for its 8-row blocks (0.6B down at B=32: 196 KB of them per 48 KB of weights). A
  * unit is 64 output rows (one row block per warp) x K / sb, sb the largest of 8 / 4 / 2 with
  * (N / 64) * sb <= nblk units; the group's last block sums the sb partials in order (bit-stable
- * across runs, not bit-identical to the row walk) and runs the epilogue. */
+ * across runs, not bit-identical to the row walk) and runs the epilogue. `gemv_xk_qkv` (knob
+ * PLOW_DECODE_GEMV_XK_QKV) splits the GemvQkv walk (plain and fold consumer) the same way; its own
+ * define because the 1.7B object loses ~1% on every rung to the arm's presence alone. */
 #ifndef PLOW_NV_GEMV_XK
 #define PLOW_NV_GEMV_XK 0
+#endif
+#ifndef PLOW_NV_GEMV_XK_QKV
+#define PLOW_NV_GEMV_XK_QKV 0
 #endif
 struct GvFoldOut {
     __nv_bfloat16* resid;
@@ -446,16 +451,19 @@ __device__ __forceinline__ unsigned gvmma_xk_sb(unsigned rows, unsigned N, unsig
     while (sb > 1u && (ng * sb > nblk || (nkb % sb) != 0u)) sb >>= 1;
     return sb > 1u && ng * sb <= 256u ? sb : 0u;
 }
-template <bool BIAS, int MT, bool ONE, bool FOLD>
+/* FOLD: the fold producer's epilogue; FOLD_IN: the fold consumer's inv scale. W / C / N are the
+ * matrix holding the unit's rows, n0 its first row in the concatenated range the units walk. */
+template <bool BIAS, int MT, bool ONE, bool FOLD, bool FOLD_IN = false>
 __device__ __forceinline__ void gvmma_xk_unit(__nv_bfloat16* __restrict__ C, const __nv_bfloat16* __restrict__ x,
                                               const __nv_bfloat16* __restrict__ W, unsigned rows, unsigned N,
                                               unsigned K, unsigned slice, unsigned sb,
-                                              const __nv_bfloat16* __restrict__ bias, const GvFoldOut* fo) {
+                                              const __nv_bfloat16* __restrict__ bias, const GvFoldOut* fo,
+                                              const GvFoldIn* fi = nullptr, unsigned n0 = 0u) {
     const unsigned lane = threadIdx.x & PLOW_NV_LANE_MASK, warp = threadIdx.x >> PLOW_NV_WARP_SHIFT;
     const unsigned g = slice / sb, s = slice % sb, rb = g * PLOW_NV_WARPS + warp, span = (K >> 5) / sb;
     const __nv_bfloat16* const W1[1] = {W};
     float acc[1][MT][4];
-    gvmma_tile<1, MT, ONE>(acc, x, W1, rb << 3, rows, N, K, s * span, (s + 1u) * span);
+    gvmma_tile<1, MT, ONE>(acc, x, W1, (rb << 3) - n0, rows, N, K, s * span, (s + 1u) * span);
     constexpr unsigned F = 32u * MT * 4u;
     float* P = gvmma_xk_part + ((size_t)(g * sb + s) * PLOW_NV_WARPS + warp) * F;
 #pragma unroll
@@ -472,11 +480,11 @@ __device__ __forceinline__ void gvmma_xk_unit(__nv_bfloat16* __restrict__ C, con
     }
     __syncthreads();
     if (!last) return;
-    float sum[MT][4];
+    float sum[1][MT][4];
 #pragma unroll
     for (int mt = 0; mt < MT; mt++)
 #pragma unroll
-        for (int j = 0; j < 4; j++) sum[mt][j] = 0.0f;
+        for (int j = 0; j < 4; j++) sum[0][mt][j] = 0.0f;
 #pragma unroll
     for (unsigned q = 0; q < 8u; q++) {
         if (q < sb) {
@@ -484,14 +492,18 @@ __device__ __forceinline__ void gvmma_xk_unit(__nv_bfloat16* __restrict__ C, con
 #pragma unroll
             for (int mt = 0; mt < MT; mt++)
 #pragma unroll
-                for (int j = 0; j < 4; j++) sum[mt][j] += __ldcg(Q + (mt * 4 + j) * 32u + lane);
+                for (int j = 0; j < 4; j++) sum[0][mt][j] += __ldcg(Q + (mt * 4 + j) * 32u + lane);
         }
     }
 #if PLOW_NV_NORM_FOLD
-    if constexpr (FOLD) gvmma_fold_store_tile<MT>(C, sum, rb << 3, rows, N, *fo);
+    if constexpr (FOLD_IN) {
+        gvmma_fold_inv(gvmma_fold_inv_smem(), *fi, rows, K);
+        gvmma_fold_scale(sum);
+    }
+    if constexpr (FOLD) gvmma_fold_store_tile<MT>(C, sum[0], (rb << 3) - n0, rows, N, *fo);
     else
 #endif
-    gvmma_store_tile<BIAS, MT>(C, sum, rb << 3, rows, N, bias);
+    gvmma_store_tile<BIAS, MT>(C, sum[0], (rb << 3) - n0, rows, N, bias);
     if (threadIdx.x == 0) atomicExch(gvmma_xk_cnt + g, 0u);
 }
 #endif
@@ -836,6 +848,22 @@ __device__ __forceinline__ void gemv_qkv_rows_mma(
     const unsigned lane = threadIdx.x & PLOW_NV_LANE_MASK;
     const unsigned warp = threadIdx.x >> PLOW_NV_WARP_SHIFT;
     const unsigned g = lane >> 2, t = lane & 3;
+#if PLOW_NV_GEMV_XK && PLOW_NV_GEMV_XK_QKV
+    /* Cross-block split-K over the concatenated rows; a 64-row unit lies inside one matrix. */
+    if constexpr (MT <= 2) {
+        if (const unsigned sb = ((Nq | Nk) & 63u) ? 0u : gvmma_xk_sb(rows, Nq + Nk + Nv, K, nblk)) {
+            if (slice < ((Nq + Nk + Nv) >> 6) * sb) {
+                const unsigned gn = (slice / sb) << 6;
+                const bool iq = gn < Nq, ik = !iq && gn < Nq + Nk;
+                gvmma_xk_unit<BIAS, MT, ONE, false, FOLD>(iq ? Cq : ik ? Ck : Cv, x, iq ? Wq : ik ? Wk : Wv, rows,
+                                                          iq ? Nq : ik ? Nk : Nv, K, slice, sb,
+                                                          iq ? bq : ik ? bk : bv, nullptr, fi,
+                                                          iq ? 0u : ik ? Nq : Nq + Nk);
+            }
+            return;
+        }
+    }
+#endif
     const gvmma_range r = gvmma_partition(Nq + Nk + Nv, slice, nblk);
     /* Waves of one row block per warp; a short last wave splits its row blocks over K. MT 1 only
      * (see gemv_rows_mma). */
@@ -1000,12 +1028,12 @@ __device__ __forceinline__ void gvmma_pf_heads(const __nv_bfloat16* W, unsigned 
  * columns and gamma (any of the group's blocks may run the epilogue). */
 __device__ __forceinline__ void gvmma_pf_xk(const __nv_bfloat16* W, const __nv_bfloat16* resid,
                                             const __nv_bfloat16* gamma, unsigned rows, unsigned N,
-                                            unsigned K, unsigned slice, unsigned sb) {
+                                            unsigned K, unsigned slice, unsigned sb, unsigned n0 = 0u) {
     const unsigned g = slice / sb, s = slice % sb, kspan = K / sb;
     unsigned bytes = PLOW_NV_GEMV_PF_BYTES / 64u;
     if (bytes > kspan * 2u) bytes = kspan * 2u;
     bytes &= ~127u;
-    if (W && bytes && threadIdx.x < 64u) gvmma_pf_l2(W + (size_t)(g * 64u + threadIdx.x) * K + s * kspan, bytes);
+    if (W && bytes && threadIdx.x < 64u) gvmma_pf_l2(W + (size_t)(g * 64u + threadIdx.x - n0) * K + s * kspan, bytes);
     if (resid) {
         const unsigned m = blockDim.x - 1u - threadIdx.x;
         if (m < rows) gvmma_pf_l2(resid + (size_t)m * N + g * 64u, 128u);

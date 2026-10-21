@@ -3517,6 +3517,16 @@ __device__ __forceinline__ void plow_gemv_prefetch(const PlowDevInst* in, void* 
         if ((PLOW_NV_GEMV_PF_OPS & 2u) && in->fj[2].u == 0u) gvmma_pf_glu(W(2), W(5), in->i[1], in->i[2], slice, nblk);
         break;
     case PLOW_DOP_GEMV_QKV:
+#if PLOW_NV_GEMV_XK && PLOW_NV_GEMV_XK_QKV
+        if (!((in->i[1] | in->i[3]) & 63u))
+            if (const unsigned sb = gvmma_xk_sb(in->i[0], in->i[1] + in->i[3] + in->i[4], in->i[2], nblk)) {
+                const unsigned gn = (slice / sb) << 6, nq = in->i[1], nqk = nq + in->i[3];
+                if ((PLOW_NV_GEMV_PF_OPS & 4u) && slice < ((nqk + in->i[4]) >> 6) * sb)
+                    gvmma_pf_xk(gn < nq ? W(2) : gn < nqk ? W(4) : W(6), nullptr, nullptr, in->i[0], 0u, in->i[2],
+                                slice, sb, gn < nq ? 0u : gn < nqk ? nq : nqk);
+                break;
+            }
+#endif
         if (PLOW_NV_GEMV_PF_OPS & 4u) gvmma_pf_qkv(W(2), W(4), W(6), in->i[1], in->i[3], in->i[4], in->i[2], slice, nblk);
         break;
     default:
@@ -3536,8 +3546,11 @@ __device__ __forceinline__ bool plow_fd_ahead_op(unsigned op) {
  * (batch) of every op it starts from; below FD_AHEAD_MIN_ROWS the KV is a few MB and the scan
  * cost the 0.6B B=1 / B=4 steps 6.5% / 3.5%. */
 __device__ __forceinline__ void plow_fd_ahead(const PlowDevInst* in, void* const* T, unsigned slice,
-                                              unsigned nblk_grid) {
+                                              unsigned nblk_grid, const PlowWait* gate, const uint32_t* counters) {
     if (!plow_fd_ahead_op(in->op) || in->i[0] < FD_AHEAD_MIN_ROWS) return;
+    /* Only while the entry's first gate is still closed: at an open gate the scan's dependent
+     * loads sit on this block's critical path (0.6B B=32 -0.7%). */
+    if (ctr_poll(PLOW_CTR(counters, gate->id)) >= gate->threshold) return;
     unsigned d = 1u;
     while (in[d].op != PLOW_DOP_FLASH_DECODE) {
         if (d == FD_AHEAD || !plow_fd_ahead_op(in[d].op)) return;
@@ -3829,7 +3842,8 @@ __global__ __launch_bounds__(PLOW_NV_THREADS, PLOW_NV_MINBLK) void PLOW_SYM(inte
 #if PLOW_GEMV_PREFETCH && !PLOW_NV_PREFILL && PLOW_NV_GEMV_MMA
         if (wait_len) plow_gemv_prefetch(in, prog.tensors, e.slice, in->blocks ? in->blocks : nblk_grid);
 #if (PLOW_NV_GEMV_PF_OPS & 64u) && !PLOW_NV_KV_ILV
-        if (wait_len && threadIdx.x >= blockDim.x - 2u) plow_fd_ahead(in, prog.tensors, e.slice, nblk_grid);
+        if (wait_len && threadIdx.x >= blockDim.x - 2u)
+            plow_fd_ahead(in, prog.tensors, e.slice, nblk_grid, prog.waits + wait_ofs, prog.counters);
 #endif
 #endif
 #if PLOW_FP8TC_PF && PLOW_NV_FP8_DECODE_TC_ACTIVE
