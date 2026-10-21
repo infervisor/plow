@@ -73,6 +73,8 @@ pub struct HostExecutor {
     /// Requests wait behind the slots: speculation yields to their prefill.
     #[cfg(feature = "cuda")]
     pub spec_backlog: bool,
+    #[cfg(feature = "cuda")]
+    pub spec_bufs: crate::exec::gpu::SpecTickBufs,
     /// Input text a TOKENIZE packet encodes into `token_ids` (when the host owns
     /// tokenization). Empty for the `--net` path (input is already `tokens`).
     pub input_text: Option<String>,

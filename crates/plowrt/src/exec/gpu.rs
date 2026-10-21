@@ -98,7 +98,7 @@ mod shared_tail;
 pub mod spec;
 mod spec_draft;
 mod spec_serve;
-pub use spec_serve::{SpecLimits, SpecRow, SpecTick};
+pub use spec_serve::{SpecLimits, SpecRow, SpecTick, SpecTickBufs};
 mod token_batch;
 use cublaslt::{CublasLtDecodeRoute, LibraryRoute};
 use decode_rung::{

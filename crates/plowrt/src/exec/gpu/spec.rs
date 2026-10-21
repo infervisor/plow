@@ -84,13 +84,25 @@ pub(super) struct SpecRt {
     /// The span map is (or may be) on the device: a failed restore leaves it there, and no
     /// plain launch may run against it.
     map_dirty: bool,
+    scratch: VerifyScratch,
+}
+
+/// Per-verify host buffers, kept across ticks so a verify allocates nothing.
+#[derive(Default)]
+struct VerifyScratch {
+    dev_rows: Vec<DevSample>,
+    dev_slots: Vec<u32>,
+    verdicts: Vec<SpecVerdict>,
+    ids: Vec<u32>,
+    logits: Vec<f32>,
 }
 
 struct Pending {
     slot: usize,
     generation: u32,
     pos: u32,
-    tokens: Vec<u32>,
+    tokens: [u32; SPEC_KMAX + 1],
+    n: usize,
     verdict: SpecVerdict,
 }
 
@@ -165,6 +177,7 @@ impl SpecRt {
             accept: None,
             sites,
             pending: Vec::new(),
+            scratch: VerifyScratch::default(),
             map_dirty: false,
         }))
     }
@@ -269,11 +282,10 @@ impl GpuEngine {
             self.resume_ring_slack
                 .map_or(SPEC_KMAX, |s| (s as usize).saturating_sub(1)),
         );
-        let mut seen = vec![false; bsz];
         let mut rows = 0usize;
-        for sp in spans {
+        for (i, sp) in spans.iter().enumerate() {
             let k = sp.tokens.len().wrapping_sub(1);
-            if sp.slot >= bsz || std::mem::replace(&mut seen[sp.slot], true) {
+            if sp.slot >= bsz || spans[..i].iter().any(|p| p.slot == sp.slot) {
                 return reject(format!("slot {} out of range or repeated", sp.slot));
             }
             if sp.tokens.is_empty() || k > max_k {
@@ -364,10 +376,47 @@ impl GpuEngine {
             let stop_h: &mut [u32] = bytemuck::cast_slice_mut(s.stop.as_mut_slice());
             stop_h[..stop.len()].copy_from_slice(stop);
         }
+        let mut sc = std::mem::take(&mut s.scratch);
+        let r = self.spec_verify_run(
+            spans,
+            stop,
+            sampler,
+            verdicts,
+            selection,
+            launch_rows,
+            rows,
+            &mut sc,
+        );
+        if let Some(s) = self.spec.as_mut() {
+            s.scratch = sc;
+        }
+        r
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn spec_verify_run(
+        &mut self,
+        spans: &[SpecSpan<'_>],
+        stop: &[u32],
+        mut sampler: Option<&mut dyn SpecSampler>,
+        verdicts: &mut Vec<SpecVerdict>,
+        selection: super::decode_rung::DecodeSelection,
+        launch_rows: usize,
+        rows: usize,
+        sc: &mut VerifyScratch,
+    ) -> Result<()> {
+        let reject = |m: String| Err(RuntimeError::Rejected(format!("spec_verify: {m}")));
         // Every verify row's plain-decode draw when a span samples on the device; argmax and
         // host rows take the greedy argmax (identical to the verify's own).
-        let mut dev_rows = Vec::new();
-        let mut dev_slots = Vec::new();
+        let VerifyScratch {
+            dev_rows,
+            dev_slots,
+            verdicts: dev,
+            ids,
+            logits,
+        } = sc;
+        dev_rows.clear();
+        dev_slots.clear();
         if spans
             .iter()
             .any(|sp| matches!(sp.draw, SpecDraw::Device(_)))
@@ -387,9 +436,15 @@ impl GpuEngine {
             }
         }
         let n_spans = spans.len();
-        if let Err(e) =
-            self.spec_submit(selection, launch_rows, rows, n_spans, stop.len(), &dev_rows, &dev_slots)
-        {
+        if let Err(e) = self.spec_submit(
+            selection,
+            launch_rows,
+            rows,
+            n_spans,
+            stop.len(),
+            dev_rows,
+            dev_slots,
+        ) {
             // Plain launches must not see the span map, and staging may still be in flight: only
             // a restore that drains cleanly clears the dirty flag.
             self.spec.as_mut().expect("checked").map_dirty = true;
@@ -402,14 +457,16 @@ impl GpuEngine {
         }
         let verdict_bytes = n_spans * std::mem::size_of::<SpecVerdict>();
         let s = self.spec.as_ref().expect("checked");
-        let dev: Vec<SpecVerdict> =
-            bytemuck::cast_slice(&s.verdicts.as_slice()[..verdict_bytes]).to_vec();
-        let ids: &[i32] = bytemuck::cast_slice(&self.stage.section(0)[..rows * 4]);
-        let ids: Vec<u32> = ids.iter().map(|&t| t as u32).collect();
+        dev.clear();
+        dev.extend_from_slice(bytemuck::cast_slice(
+            &s.verdicts.as_slice()[..verdict_bytes],
+        ));
+        let staged: &[i32] = bytemuck::cast_slice(&self.stage.section(0)[..rows * 4]);
+        ids.clear();
+        ids.extend(staged.iter().map(|&t| t as u32));
         verdicts.clear();
-        let mut logits = Vec::new();
         let mut r = 0usize;
-        for (i, (sp, v)) in spans.iter().zip(&dev).enumerate() {
+        for (i, (sp, v)) in spans.iter().zip(dev.iter()).enumerate() {
             let n = sp.tokens.len();
             let req_gen = self.slot_generations[sp.slot];
             let verdict = if let SpecDraw::Host = sp.draw {
@@ -418,8 +475,8 @@ impl GpuEngine {
                 accept_sampled(
                     sp.tokens,
                     |j| {
-                        self.logits_row(r + j, &mut logits)?;
-                        Ok::<_, RuntimeError>(sampler.host(i, sp.tokens, j, &mut logits))
+                        self.logits_row(r + j, logits)?;
+                        Ok::<_, RuntimeError>(sampler.host(i, sp.tokens, j, logits))
                     },
                     r as u32,
                     req_gen,
@@ -439,18 +496,22 @@ impl GpuEngine {
             verdicts.push(verdict);
             r += n;
         }
-        let pending: Vec<Pending> = spans
-            .iter()
-            .zip(verdicts.iter())
-            .map(|(sp, v)| Pending {
-                slot: sp.slot,
-                generation: self.slot_generations[sp.slot],
-                pos: self.pos[sp.slot],
-                tokens: sp.tokens.to_vec(),
-                verdict: *v,
-            })
-            .collect();
-        self.spec.as_mut().expect("checked").pending = pending;
+        let (generations, pos) = (&self.slot_generations, &self.pos);
+        let s = self.spec.as_mut().expect("checked");
+        s.pending.clear();
+        s.pending
+            .extend(spans.iter().zip(verdicts.iter()).map(|(sp, v)| {
+                let mut tokens = [0; SPEC_KMAX + 1];
+                tokens[..sp.tokens.len()].copy_from_slice(sp.tokens);
+                Pending {
+                    slot: sp.slot,
+                    generation: generations[sp.slot],
+                    pos: pos[sp.slot],
+                    tokens,
+                    n: sp.tokens.len(),
+                    verdict: *v,
+                }
+            }));
         Ok(())
     }
 
@@ -580,7 +641,7 @@ impl GpuEngine {
         if b >= self.batch
             || p.generation != self.slot_generations[b]
             || p.pos != self.pos[b]
-            || p.tokens != span.tokens
+            || p.tokens[..p.n] != *span.tokens
             || p.verdict != *v
             || n == 0
             || n > span.tokens.len()

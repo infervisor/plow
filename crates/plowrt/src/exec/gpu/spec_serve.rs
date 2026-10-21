@@ -35,6 +35,17 @@ pub struct SpecRow {
 
 /// A tick's outcome, per row in request order: the verdict and the verify row of its pending
 /// token (where a host-sampled row reads its logits).
+/// A serving loop's per-tick speculation buffers, reused so a tick allocates nothing.
+#[derive(Default)]
+pub struct SpecTickBufs {
+    pub caps: Vec<u32>,
+    pub ks: Vec<u32>,
+    /// `None`: the row rides the verify as a plain step finished on the host.
+    pub draws: Vec<Option<SpecDraw>>,
+    pub rows: Vec<SpecRow>,
+    pub tick: SpecTick,
+}
+
 #[derive(Default)]
 pub struct SpecTick {
     pub verdicts: Vec<SpecVerdict>,

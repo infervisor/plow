@@ -8001,41 +8001,51 @@ fn gpu_depth_frames(
     slots: &mut [Option<Slot>],
     toks: &mut [u32],
 ) -> crate::Result<()> {
-    let rows: Vec<(usize, DepthJob)> = feeds
-        .iter()
-        .enumerate()
-        .filter_map(|(k, &(i, _))| {
+    type Bufs = (
+        Vec<(usize, DepthJob)>,
+        Vec<crate::exec::gpu::FishRow>,
+        Vec<u32>,
+    );
+    thread_local! {
+        static BUFS: std::cell::RefCell<Bufs> = const {
+            std::cell::RefCell::new((Vec::new(), Vec::new(), Vec::new()))
+        };
+    }
+    BUFS.with_borrow_mut(|(rows, fish, codes)| {
+        rows.clear();
+        rows.extend(feeds.iter().enumerate().filter_map(|(k, &(i, _))| {
             let s = slots[i].as_ref()?;
             Some((k, s.speech.as_ref()?.depth?))
-        })
-        .collect();
-    if rows.is_empty() {
-        return Ok(());
-    }
-    let fish: Vec<_> = rows
-        .iter()
-        .map(|&(k, job)| {
+        }));
+        if rows.is_empty() {
+            return Ok(());
+        }
+        fish.clear();
+        fish.extend(rows.iter().map(|&(k, job)| {
             let i = feeds[k].0;
             let uncond = job.cfg_scale.map(|_| i as u32 + 1);
             job.row(i, i as u32, slots[i].as_ref().map_or(0, |s| s.step), uncond)
-        })
-        .collect();
-    let mut codes = Vec::new();
-    let t = crate::obs::host::on().then(Instant::now);
-    e.fish_depth_step(&fish, &mut codes)?;
-    if let Some(t) = t {
-        let width = fish.iter().map(|r| r.slot + 1 + usize::from(r.cfg.is_some())).max();
-        crate::obs::host::depth_step(t.elapsed(), fish.len(), width.unwrap_or(0));
-    }
-    let n = codes.len() / rows.len();
-    for (r, &(k, job)) in rows.iter().enumerate() {
-        let (tok, frame) = job.token(&codes[r * n..(r + 1) * n]);
-        toks[k] = tok;
-        if let Some(slot) = slots[feeds[k].0].as_mut() {
-            slot.frame = frame;
+        }));
+        codes.clear();
+        let t = crate::obs::host::on().then(Instant::now);
+        e.fish_depth_step(fish, codes)?;
+        if let Some(t) = t {
+            let width = fish
+                .iter()
+                .map(|r| r.slot + 1 + usize::from(r.cfg.is_some()))
+                .max();
+            crate::obs::host::depth_step(t.elapsed(), fish.len(), width.unwrap_or(0));
         }
-    }
-    Ok(())
+        let n = codes.len() / rows.len();
+        for (r, &(k, job)) in rows.iter().enumerate() {
+            let (tok, frame) = job.token(&codes[r * n..(r + 1) * n]);
+            toks[k] = tok;
+            if let Some(slot) = slots[feeds[k].0].as_mut() {
+                slot.frame = frame;
+            }
+        }
+        Ok(())
+    })
 }
 
 /// Draw every fed CFG owner's token from ONE download of the step's logits rows (instead of two
@@ -8318,7 +8328,9 @@ fn gpu_spec_draw(e: &crate::exec::gpu::GpuEngine, s: &Slot) -> crate::exec::gpu:
     if gpu_spec_draftable(&s.gen.params) {
         return SpecDraw::Argmax;
     }
-    match dev_sample_spec(s, e.dev_penalty()).filter(|_| e.dev_sample_enabled()) {
+    // Penalized rows sample on the host: a device verify row would read the slot's committed
+    // history without the span's earlier drafts, and `plow_count` would add the rejected tail.
+    match dev_sample_spec(s, false).filter(|_| e.dev_sample_enabled()) {
         Some(d) => SpecDraw::Device(d),
         None => SpecDraw::Host,
     }
@@ -8450,9 +8462,9 @@ fn gpu_spec_plan(
     if feeds.is_empty() || feeds.len() >= limits.max_rows {
         return None;
     }
-    let mut caps = Vec::with_capacity(feeds.len());
-    gpu_spec_caps(e, feeds, slots, limits.kmax, false, &mut caps)?;
-    policy.plan(&caps)
+    let caps = &mut host.spec_bufs.caps;
+    gpu_spec_caps(e, feeds, slots, limits.kmax, false, caps)?;
+    policy.plan(caps)
 }
 
 /// One speculative decode tick over `feeds` (no prefill this tick, decode pipeline drained):
@@ -8477,43 +8489,46 @@ fn gpu_spec_tick(
     tick_fault: &mut Option<crate::DeviceErrorInfo>,
     disconnected: &mut [bool],
 ) -> bool {
-    use crate::exec::gpu::{SpecRow, SpecTick};
+    use crate::exec::gpu::SpecRow;
     let Some(limits) = e.spec_serving() else {
         return false;
     };
-    let mut caps = Vec::with_capacity(feeds.len());
-    if gpu_spec_caps(e, feeds, slots, limits.kmax, true, &mut caps).is_none() {
+    let crate::exec::gpu::SpecTickBufs {
+        caps,
+        ks,
+        draws,
+        rows,
+        tick: out,
+    } = &mut host.spec_bufs;
+    if gpu_spec_caps(e, feeds, slots, limits.kmax, true, caps).is_none() {
         return false;
     }
-    let mut ks = Vec::with_capacity(feeds.len());
-    crate::sched::spec::SpecPolicy::depths(&caps, plan, &mut ks);
-    // `None`: the row rides the verify as a plain step finished on the host.
-    let draws: Vec<Option<crate::exec::gpu::spec::SpecDraw>> = feeds
-        .iter()
-        .map(|&(i, _)| {
-            let s = slots[i].as_ref().expect("fed slot");
-            gpu_spec_drafts(&s.gen.params).then(|| gpu_spec_draw(e, s))
-        })
-        .collect();
-    let rows: Vec<SpecRow> = feeds
-        .iter()
-        .zip(&ks)
-        .zip(&draws)
-        .map(|((&(slot, token), &k), d)| SpecRow {
-            slot,
-            token,
-            k,
-            draw: d.unwrap_or(crate::exec::gpu::spec::SpecDraw::Argmax),
-        })
-        .collect();
-    let mut out = SpecTick::default();
+    crate::sched::spec::SpecPolicy::depths(caps, plan, ks);
+    draws.clear();
+    draws.extend(feeds.iter().map(|&(i, _)| {
+        let s = slots[i].as_ref().expect("fed slot");
+        gpu_spec_drafts(&s.gen.params).then(|| gpu_spec_draw(e, s))
+    }));
+    rows.clear();
+    rows.extend(
+        feeds
+            .iter()
+            .zip(ks.iter())
+            .zip(draws.iter())
+            .map(|((&(slot, token), &k), d)| SpecRow {
+                slot,
+                token,
+                k,
+                draw: d.unwrap_or(crate::exec::gpu::spec::SpecDraw::Argmax),
+            }),
+    );
     let mut sampler = SlotSpecSampler {
         slots,
-        rows: &rows,
+        rows,
         prior: Vec::new(),
         host_draws: None,
     };
-    if let Err(err) = e.spec_tick(&rows, stop, Some(&mut sampler), &mut out) {
+    if let Err(err) = e.spec_tick(rows, stop, Some(&mut sampler), out) {
         // A refusal that committed nothing leaves every slot as it was: the plain path serves the tick.
         if matches!(err, crate::RuntimeError::Rejected(_)) && out.committed == 0 {
             tracing::warn!(error = %err, "spec tick refused; plain step");
@@ -8537,7 +8552,12 @@ fn gpu_spec_tick(
             p.observe_draft(out.draft_rows, out.draft_k, out.draft_ms);
         }
     }
-    for (((r, &row0), v), draw) in rows.iter().zip(&out.row0).zip(&out.verdicts).zip(&draws) {
+    for (((r, &row0), v), draw) in rows
+        .iter()
+        .zip(&out.row0)
+        .zip(&out.verdicts)
+        .zip(draws.iter())
+    {
         let i = r.slot;
         let Some(logprobs) = slots[i].as_ref().map(|s| s.gen.params.logprobs.is_some()) else {
             continue;

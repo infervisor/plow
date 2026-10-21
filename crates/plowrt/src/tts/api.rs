@@ -143,6 +143,19 @@ impl SpeechSpec {
                 "instructions",
             ));
         }
+        // Prompt text is tokenized on the request path, once per segment split.
+        for (text, param) in [
+            (&req.instructions, "instructions"),
+            (&req.ref_text, "ref_text"),
+        ] {
+            let n = text.as_deref().map_or(0, |t| t.chars().count());
+            if n > MAX_INPUT_CHARS {
+                return Err(invalid(
+                    format!("`{param}` is {n} characters; at most {MAX_INPUT_CHARS} are accepted"),
+                    param,
+                ));
+            }
+        }
         if req.ref_audio.is_some() || req.ref_text.is_some() {
             if !self.voice_cloning {
                 return Err(invalid(
@@ -477,8 +490,15 @@ mod tests {
 
     #[test]
     fn input_and_max_tokens_limits() {
-        let s = spec(&[]);
+        let mut s = spec(&[]);
+        s.instructions = true;
+        s.voice_cloning = true;
         let long = "a".repeat(MAX_INPUT_CHARS + 1);
+        for param in ["instructions", "ref_text"] {
+            let mut body = serde_json::json!({"ref_audio": "UklGRg==", "ref_text": "hi"});
+            body[param] = long.clone().into();
+            assert_eq!(s.check(&req(body)).unwrap_err().param, param);
+        }
         assert_eq!(
             s.check(&req(serde_json::json!({"input": long})))
                 .unwrap_err()

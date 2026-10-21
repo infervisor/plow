@@ -1048,6 +1048,7 @@ fn spec_bench(
             top_p,
             min_p,
             rng01: 0.0,
+            penalty: 1.0,
         });
     if dev.is_some() && !e.dev_sample_enabled() {
         return Err("--spec-sample needs the device sampler (sample_sm120.cubin)".into());

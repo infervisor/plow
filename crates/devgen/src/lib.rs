@@ -1891,10 +1891,6 @@ fn tiles(m: u32, n: u32) -> u32 {
     m.div_ceil(BM) * n.div_ceil(BN)
 }
 
-/// Every tensor the model touches. Prefill and decode SHARE this table: the KV cache is
-/// written by prefill and appended to by decode, and the 57 GiB of weights is not getting
-/// loaded twice.
-#[allow(dead_code)]
 /// Span-mode decode rows are declared only for FP8-KV packets; other KV formats refuse the knob.
 fn span_verify_on(fp8_kv: bool) -> bool {
     let on = emit_config::active().span_verify;
@@ -1902,6 +1898,10 @@ fn span_verify_on(fp8_kv: bool) -> bool {
     on
 }
 
+/// Every tensor the model touches. Prefill and decode SHARE this table: the KV cache is
+/// written by prefill and appended to by decode, and the 57 GiB of weights is not getting
+/// loaded twice.
+#[allow(dead_code)]
 struct Tn {
     ids: u32,
     encoder_overlay: u32,
