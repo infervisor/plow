@@ -18,7 +18,7 @@ use crate::config::Cfg;
 use crate::Tn;
 
 /// Deepest draft program (`PLOW_SPEC_KMAX`, default 7; the verify span holds at most 15).
-fn kmax() -> u32 {
+pub(crate) fn kmax() -> u32 {
     let k = crate::emit_config::active().spec_kmax.unwrap_or(7);
     if !(1..=15).contains(&k) {
         refuse(format!("PLOW_SPEC_KMAX={k}: 1..=15"));
@@ -60,16 +60,16 @@ pub(crate) struct DraftCfg {
     layer_scalar: Vec<f32>,
 }
 
-fn refuse(what: String) -> ! {
+pub(crate) fn refuse(what: String) -> ! {
     panic!("PLOW_EMIT_SPEC: {what}")
 }
 
-fn sha256_file(path: &Path) -> String {
+pub(crate) fn sha256_file(path: &Path) -> String {
     let bytes = std::fs::read(path).unwrap_or_else(|e| refuse(format!("{}: {e}", path.display())));
     plow_asset::knob::sha256_hex(&bytes)
 }
 
-fn draft_dir() -> std::path::PathBuf {
+pub(crate) fn draft_dir() -> std::path::PathBuf {
     crate::emit_config::active()
         .spec_draft_dir
         .clone()
@@ -78,7 +78,7 @@ fn draft_dir() -> std::path::PathBuf {
 }
 
 /// The tensor entries and the `__metadata__` object of a safetensors file.
-fn safetensors_header(path: &Path) -> (serde_json::Map<String, Value>, Value) {
+pub(crate) fn safetensors_header(path: &Path) -> (serde_json::Map<String, Value>, Value) {
     use std::io::Read;
     let mut f =
         std::fs::File::open(path).unwrap_or_else(|e| refuse(format!("{}: {e}", path.display())));

@@ -81,6 +81,7 @@ pub mod conv2d;
 mod decode_objects;
 mod dense_cublaslt;
 pub mod dispatch_audit;
+mod dspark;
 mod gemv_decode_role;
 pub mod manifest;
 pub mod mm;
@@ -2035,6 +2036,8 @@ struct Tn {
     lw: Vec<LW>,
     /// Speculative draft tensors (`PLOW_EMIT_SPEC`).
     mtp: Option<mtp::Tensors>,
+    /// DSpark context tail (`PLOW_EMIT_SPEC`, `PLOW_SPEC_KIND=gemma4_dspark`).
+    dspark: Option<dspark::Tensors>,
 }
 struct LW {
     bq: u32,
@@ -2638,6 +2641,7 @@ fn declare(
         vcs: Vec::new(),
         lw: Vec::new(),
         mtp: None,
+        dspark: None,
     };
     let mut t = t;
     for l in 0..c.layers {
@@ -3044,7 +3048,22 @@ fn declare(
             edns: ex4[3],
         });
     }
-    if emit_config::active().emit_spec {
+    if dspark::enabled() {
+        let src = (0..c.layers as usize)
+            .rev()
+            .find(|&l| c.is_full[l] && !c.kv_is_shared(l))
+            .expect("DSpark context: the target has no full layer");
+        let kv_src = [t.kc[src], t.vc[src], t.kcs[src], t.vcs[src]];
+        t.dspark = Some(dspark::declare(
+            b,
+            c,
+            rows.max(dbatch),
+            fp8,
+            w8a8,
+            fp8_kv,
+            kv_src,
+        ));
+    } else if emit_config::active().emit_spec {
         t.mtp = Some(mtp::declare(b, c, dbatch, t.rowslot != TENSOR_NONE));
     }
     t
@@ -4778,6 +4797,14 @@ fn emit_phase(
     // (b tensor, gamma_b, gamma_n, layer_scale) of a skipped NRN2, consumed by the next
     // iteration's q/k/v emission. Crosses loop iterations by construction.
     let mut nrn_pending: Option<(u32, u32, u32, f32)> = None;
+    // DSpark context (dspark.rs): the last tapped-residual copy, and this program's last full
+    // layer's K/V writers, which the tail clones onto the drafter's KV layers.
+    let mut ds_copy: Option<u32> = None;
+    let mut ds_writers: Option<(DevInst, DevInst)> = None;
+    assert!(
+        n.dspark.is_none() || (!block_mode && !hj && !fuse_nrn),
+        "DSpark context needs whole-model, unsplit programs without the NRN fold"
+    );
     // First layer of the trailing KV-shared run: a prefill program marks where its row-local
     // tail begins (plow_asset::kv_shared_tail).
     let shared_tail_start = (!block_mode && !hj && tp == 1 && block.end == c.layers as usize)
@@ -5681,6 +5708,13 @@ fn emit_phase(
         };
         if decode && !fuse_hnr && !shared && !fuse_kv {
             kv_rows.push(c_vn);
+        }
+        if n.dspark.is_some() && full && !shared {
+            assert!(
+                !fuse_hnr && !fuse_kv && c_kn != c_vn,
+                "DSpark context clones separate K and V cache writers"
+            );
+            ds_writers = Some((*b.inst(c_kn), *b.inst(c_vn)));
         }
 
         // headnorm -> flash. A flash work item is (batch, head, split); it reads Q for its own
@@ -7284,6 +7318,21 @@ fn emit_phase(
             rec(cr);
             cr
         };
+        // DSpark tap: copy the post-layer residual (after layer_scalar) before the next layer
+        // rewrites n.x; the chain waits on the copy, so that write cannot overtake its read.
+        if let Some(ds) = n.dspark.as_ref() {
+            if let Some(j) = ds.tap_of(l) {
+                assert!(moe_fused_tail.is_none(), "DSpark taps a dense residual");
+                dep = b.emit(DevOp::Residual, elem(t * c.hidden), &[dep], |d| {
+                    d.t[0] = ds.tap[j];
+                    d.t[1] = n.x;
+                    d.t[2] = n.x;
+                    d.i[0] = t * c.hidden;
+                    d.f[0] = 0.5;
+                });
+                ds_copy = Some(dep);
+            }
+        }
         if let Some(channel) = channel {
             channel.borrow_mut().push(plow_asset::hetero_channel::Span {
                 layer: l as u32,
@@ -7310,6 +7359,44 @@ fn emit_phase(
         return;
     }
 
+    if let Some(ds) = n.dspark.as_ref() {
+        emit_dspark_tail(
+            b,
+            c,
+            ds,
+            t,
+            ds_copy.expect("DSpark context: no tapped layer in this program"),
+            ds_writers.expect("DSpark context: no full-layer K/V writer in this program"),
+            &elem,
+            &|b: &mut Builder, src: u32, after: u32| {
+                if w8a8 && (!gemv_family || fp8_lt_decode) {
+                    quant(b, ds.xq, ds.xs, src, c.hidden, after)
+                } else {
+                    after
+                }
+            },
+            &|b: &mut Builder, out: u32, a: u32, p: dspark::Proj, dep: u32| {
+                proj(
+                    b,
+                    out,
+                    a,
+                    p.w,
+                    p.w8,
+                    p.scale,
+                    TENSOR_NONE,
+                    ds.xq,
+                    ds.xs,
+                    t,
+                    p.n,
+                    c.hidden,
+                    TENSOR_NONE,
+                    all.clone(),
+                    &[dep],
+                )
+            },
+            rows.clone(),
+        );
+    }
     // In the fused path the last layer's end-of-layer fused norm already applied the FINAL norm
     // (its next_gin was n.fin), so n.hn holds the final-normed row and c_f is just that dep.
     let c_f = if seam_fused(b, n.fin) {
@@ -7539,6 +7626,75 @@ const AMAX_BLOCKS: u32 = 64;
 /// argument in [`Builder::set_gemv_split`] requires, so this is a clean performance null and not a
 /// correctness question. **Attacking the straggler tail needs the wave assignment inside
 /// `gemv_rows` to become dynamic too; splitting packets alone cannot pay for the rounding.**
+/// The DSpark context tail (dspark.rs): `s = sum_j fc_j(tap_j)` as one serial chain over one
+/// quant/partial buffer, `xn = hidden_norm(s)`, then per drafter layer `k = k_proj(xn)` stored
+/// through clones of the program's own last full-layer K/V writers (`rope(k_norm(k))` and the
+/// weightless `v_norm(k)`), so every row lands at its own position and slot exactly as the
+/// target's does. `after` is the last tap copy, which every earlier copy precedes.
+#[allow(clippy::too_many_arguments)]
+fn emit_dspark_tail(
+    b: &mut Builder,
+    c: &Cfg,
+    ds: &dspark::Tensors,
+    t: u32,
+    mut after: u32,
+    (kw, vw): (DevInst, DevInst),
+    elem: &dyn Fn(u32) -> Vec<u32>,
+    quant: &dyn Fn(&mut Builder, u32, u32) -> u32,
+    proj: &dyn Fn(&mut Builder, u32, u32, dspark::Proj, u32) -> u32,
+    rows: Vec<u32>,
+) {
+    for (j, &f) in ds.fc.iter().enumerate() {
+        let dq = quant(b, ds.tap[j], after);
+        let g = proj(b, if j == 0 { ds.s } else { ds.y }, ds.tap[j], f, dq);
+        after = if j == 0 {
+            g
+        } else {
+            b.emit(DevOp::Residual, elem(t * c.hidden), &[g], |d| {
+                d.t[0] = ds.s;
+                d.t[1] = ds.s;
+                d.t[2] = ds.y;
+                d.i[0] = t * c.hidden;
+                d.f[0] = 1.0;
+            })
+        };
+    }
+    let cn = b.emit(DevOp::RmsNorm, rows, &[after], |d| {
+        d.t[0] = ds.xn;
+        d.t[1] = ds.s;
+        d.t[2] = ds.hidden_norm;
+        d.i[0] = t;
+        d.i[1] = c.hidden;
+        d.f[0] = ds.eps();
+    });
+    let dq = quant(b, ds.xn, cn);
+    let clone = |b: &mut Builder, src: &DevInst, dep: u32, f: &dyn Fn(&mut DevInst)| {
+        let op = DevOp::from_u16(src.op).expect("KV writer opcode");
+        b.emit(op, (0..src.blocks as u32).collect(), &[dep], |d| {
+            d.t = src.t;
+            d.i = src.i;
+            d.f = src.f;
+            d.j = src.j;
+            f(d);
+        });
+    };
+    for (i, &kp) in ds.k_proj.iter().enumerate() {
+        let ck = proj(b, ds.k[i], ds.xn, kp, dq);
+        let [kc, vc, ks, vs] = ds.kv[i];
+        clone(b, &kw, ck, &|d| {
+            d.t[0] = kc;
+            d.t[1] = ds.k[i];
+            d.t[2] = ds.k_norm[i];
+            d.t[6] = ks;
+        });
+        clone(b, &vw, ck, &|d| {
+            d.t[0] = vc;
+            d.t[1] = ds.k[i];
+            d.t[6] = vs;
+        });
+    }
+}
+
 fn gemv_split() -> u32 {
     emit_config::active().gemv_split
 }
@@ -10978,6 +11134,9 @@ fn emit_dense_gqa(
     if let Some(t) = &emitter.tn.mtp {
         sections.extend(mtp::sections(&dir, &c, &emitter.tn, t, &m, &rung_progs));
     }
+    if let Some(t) = &emitter.tn.dspark {
+        sections.extend(dspark::sections(&dir, &c, t));
+    }
     if let Some(ref path) = embed_cubin {
         sections.push(packet::devbuild::SectionData {
             kind: packet::devbuild::SECT_CUBIN,
@@ -11222,8 +11381,16 @@ fn emit_dense_gqa(
     }
     if !block_mode {
         sections.push(
-            serve_section::section(&dir, ecfg.serve_defaults.as_deref())
-                .unwrap_or_else(|error| panic!("serve manifest: {error}")),
+            serve_section::section(
+                &dir,
+                ecfg.serve_defaults.as_deref(),
+                &emitter
+                    .tn
+                    .dspark
+                    .as_ref()
+                    .map_or_else(Vec::new, |d| d.kv_layers(&c)),
+            )
+            .unwrap_or_else(|error| panic!("serve manifest: {error}")),
         );
     }
     if let Some((_, contract)) = &mm_towers {

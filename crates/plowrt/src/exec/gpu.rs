@@ -4014,7 +4014,36 @@ impl GpuEngine {
                     .map_err(|e| RuntimeError::Rejected(format!("kv-shared tail metadata: {e}")))
             })
             .transpose()?;
+        // A block drafter's KV layers are written by every target program but read by no target
+        // attention, so the live-KV manifest does not describe them: serve such a packet on the
+        // VMM prefix layout (serve.json lists them as full layers) at its emitted context.
+        let spec_context = blob
+            .reserved_metadata(&raw, plow_asset::spec_context::SECTION)?
+            .map(|bytes| {
+                let m = serde_json::from_slice::<plow_asset::spec_context::Manifest>(bytes)
+                    .map_err(|e| RuntimeError::Rejected(format!("spec context: {e}")))?;
+                m.validate(m.kv_layers.first().copied().unwrap_or(0))
+                    .map_err(RuntimeError::Rejected)?;
+                for l in &m.kv_layers {
+                    for s in ["k", "v"] {
+                        let name = format!("kv.{l}.{s}");
+                        if !blob.tensors.iter().any(|t| t.name == name) {
+                            return Err(RuntimeError::Rejected(format!(
+                                "spec context: drafter KV layer {name} is not declared"
+                            )));
+                        }
+                    }
+                }
+                Ok(m)
+            })
+            .transpose()?;
         let config = RuntimeConfig::get();
+        if spec_context.is_some() && config.live_ctx_for(assets_dir).is_some() {
+            return Err(RuntimeError::Rejected(
+                "PLOW_LIVE_CTX cannot rebound a packet carrying drafter KV layers (spec.context.json)"
+                    .into(),
+            ));
+        }
         let mut packet_max_ctx = blob
             .tensors
             .iter()
@@ -4574,6 +4603,13 @@ impl GpuEngine {
                 if rings && !live && !prefix_rings {
                     return Err(RuntimeError::Rejected(
                         "live rings require PLOW_VMM_LIVE=1 or the VMM prefix layout".into(),
+                    ));
+                }
+                if live && spec_context.is_some() {
+                    return Err(RuntimeError::Rejected(
+                        "live KV allocation does not describe drafter KV layers \
+                         (spec.context.json): serve with the VMM prefix cache"
+                            .into(),
                     ));
                 }
                 if live {

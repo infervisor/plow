@@ -708,6 +708,7 @@ pub mod segment_roles;
 
 pub mod kv_shared_tail;
 pub mod packed_prefill;
+pub mod spec_context;
 pub mod spec_draft;
 
 pub mod kv_ring;
