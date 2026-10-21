@@ -207,6 +207,10 @@ PLOW_VMM_STRICT_PUBLISH = "1"
 # prod-fidelity replay vs Kit 1 (2 rounds each): TPOT p50/p99 9.41,9.52/21.96,20.81 -> bf16 drafter 4.99,4.97/16.02,16.54,
 # FP8 drafter 4.65,4.67/15.61,14.23 ms; TTFT p50/p99 47.0,43.4/246.6,240.6 -> 38.9,37.2/215.2,209.5 (FP8); cached 79.8%,
 # goodput 100%, 0 errors; agentic16k C32/C64/C128 within Kit 1's run-to-run spread; API smoke 37/37.
+# Serving concurrencies (2026-10-21, Kit 2.1 plowrt fad522c4 + packet b86ec26e, FP32 gate spec on vs the spec-off arm
+# of the same binary and packet as the same-concurrency peer; evidence /home/lava/scratch/g26-spec-c8c32): c8 PASS
+# kl_trim_mean 0.141 vs 0.132, top1_decisive 0.962 vs 0.957, over-0.1 203 vs 214; c32 PASS 0.119 vs 0.137, 0.970 vs
+# 0.957, 207 vs 226; needles 18/18. Spec-off at c8/c32 sits inside the c16 margins below (top1 0.957, trimmed 0.13-0.14).
 [spec]
 kind = "gemma4_assistant"
 draft_dir = "{env:G26_MTP_ASSISTANT}"
