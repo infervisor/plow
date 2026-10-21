@@ -8159,6 +8159,11 @@ fn gpu_spec_caps(
             .saturating_sub(1);
         let room = e.max_ctx().saturating_sub(e.slot_pos(i) + 1);
         let cap = if gpu_spec_drafts(&s.gen.params) && (!ready || e.spec_draft_ready(i)) {
+            let kmax = if gpu_spec_draftable(&s.gen.params) {
+                kmax
+            } else {
+                kmax.min(crate::config::RuntimeConfig::get().nv.spec_sampled_kmax)
+            };
             (kmax as usize).min(left).min(room) as u32
         } else {
             0
