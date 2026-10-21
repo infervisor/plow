@@ -1317,6 +1317,13 @@ fn tuning(s: &Shapes, arch: &str) -> Map<String, Value> {
         assert_eq!(arch, "sm_120a", "PLOW_DECODE_HNR_FOLD: sm_120a decode objects only");
         t.insert("hnr_fold".into(), json!(1));
     }
+    // * `gemv_xk` (PLOW_DECODE_GEMV_XK opt-in): the first rung whose Gemv walk splits K over blocks.
+    if let Some(rows) = crate::emit_config::active().decode_gemv_xk.filter(|&r| r > 0) {
+        if arch.starts_with("sm_") {
+            assert_eq!(arch, "sm_120a", "PLOW_DECODE_GEMV_XK: sm_120a decode objects only");
+            t.insert("gemv_xk".into(), json!(rows));
+        }
+    }
     if sm90a && crate::emit_config::active().w8a8 && crate::emit_config::active().decode_cublaslt {
         t.insert("fp8_lt_decode".into(), json!(true));
     }
@@ -3203,6 +3210,11 @@ pub fn config_header(manifest: &Value) -> String {
                 out.push_str(
                     "#if !PLOW_NV_SPEECH && !PLOW_NV_PREFILL\n#ifndef PLOW_NV_HNR_FOLD\n#define PLOW_NV_HNR_FOLD 1\n#endif\n#endif\n",
                 );
+            }
+            if let Some(v) = t.get("gemv_xk").and_then(Value::as_u64) {
+                out.push_str(&format!(
+                    "#if !PLOW_NV_SPEECH && !PLOW_NV_PREFILL\n#ifndef PLOW_NV_GEMV_XK\n#define PLOW_NV_GEMV_XK {v}u\n#endif\n#endif\n"
+                ));
             }
         }
         if manifest.get("arch").and_then(Value::as_str) == Some("sm_90a") {

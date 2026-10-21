@@ -392,6 +392,11 @@ pub struct EmitConfig {
     /// decode rungs of at least this many rows (1 = every rung). Unset / 0 = off.
     #[arg(long, env = "PLOW_DECODE_HNR_FOLD")]
     pub decode_hnr_fold: Option<u32>,
+    /// sm_120a decode: the Gemv walk (o_proj / down) splits K over blocks on the rungs of at least
+    /// this many rows (64-row units, the group's last block sums the partials in a fixed order).
+    /// Changes the f32 summation order. Unset / 0 = off.
+    #[arg(long, env = "PLOW_DECODE_GEMV_XK")]
+    pub decode_gemv_xk: Option<u32>,
 
     /// Blocks for the one-row MoE combine (arms the all-block combine; 0/1 = today's single CTA).
     #[arg(long, env = "PLOW_MOE_COMBINE_BLOCKS")]
@@ -1594,6 +1599,7 @@ impl EmitConfig {
             fuse_kv_hnr: env_bool("PLOW_FUSE_KV_HNR"),
             decode_norm_fold: env_bool("PLOW_DECODE_NORM_FOLD"),
             decode_hnr_fold: env_u32("PLOW_DECODE_HNR_FOLD"),
+            decode_gemv_xk: env_u32("PLOW_DECODE_GEMV_XK"),
             moe_combine_blocks: env_u32("PLOW_MOE_COMBINE_BLOCKS"),
             fa_gf_full: env_u32("PLOW_FA_GF_FULL"),
             attention_decode_balance_gf: env_u32("PLOW_ATTENTION_DECODE_BALANCE_GF"),

@@ -59,6 +59,16 @@
 #ifndef PLOW_NV_NORM_FOLD
 #define PLOW_NV_NORM_FOLD 0
 #endif
+/* CROSS-BLOCK SPLIT-K (manifest `gemv_xk`, emit knob PLOW_DECODE_GEMV_XK = the first rung, sm_120a
+ * decode): from that many rows the Gemv walk (o_proj / down, plain and fold producer) splits K over
+ * blocks instead of only over warps. The row walk's every block reads all rows x K of the
+ * activations for its 8-row blocks (0.6B down at B=32: 196 KB of them per 48 KB of weights). A
+ * unit is 64 output rows (one row block per warp) x K / sb, sb the largest of 8 / 4 / 2 with
+ * (N / 64) * sb <= nblk units; the group's last block sums the sb partials in order (bit-stable
+ * across runs, not bit-identical to the row walk) and runs the epilogue. */
+#ifndef PLOW_NV_GEMV_XK
+#define PLOW_NV_GEMV_XK 0
+#endif
 struct GvFoldOut {
     __nv_bfloat16* resid;
     const __nv_bfloat16* gamma;
@@ -425,6 +435,66 @@ __device__ __forceinline__ void gvmma_fold_scale(float (&acc)[NW][MT][4]) {
 }
 #endif
 
+#if PLOW_NV_GEMV_XK
+/* Fragments of every unit's warps; a group's counter is reset by its last block. */
+__device__ float gvmma_xk_part[256u * PLOW_NV_WARPS * 32u * 8u];
+__device__ unsigned gvmma_xk_cnt[256];
+__device__ __forceinline__ unsigned gvmma_xk_sb(unsigned rows, unsigned N, unsigned K, unsigned nblk) {
+    if (rows < PLOW_NV_GEMV_XK || (N & 63u) || (K & 31u)) return 0u;
+    const unsigned ng = N >> 6, nkb = K >> 5;
+    unsigned sb = 8u;
+    while (sb > 1u && (ng * sb > nblk || (nkb % sb) != 0u)) sb >>= 1;
+    return sb > 1u && ng * sb <= 256u ? sb : 0u;
+}
+template <bool BIAS, int MT, bool ONE, bool FOLD>
+__device__ __forceinline__ void gvmma_xk_unit(__nv_bfloat16* __restrict__ C, const __nv_bfloat16* __restrict__ x,
+                                              const __nv_bfloat16* __restrict__ W, unsigned rows, unsigned N,
+                                              unsigned K, unsigned slice, unsigned sb,
+                                              const __nv_bfloat16* __restrict__ bias, const GvFoldOut* fo) {
+    const unsigned lane = threadIdx.x & PLOW_NV_LANE_MASK, warp = threadIdx.x >> PLOW_NV_WARP_SHIFT;
+    const unsigned g = slice / sb, s = slice % sb, rb = g * PLOW_NV_WARPS + warp, span = (K >> 5) / sb;
+    const __nv_bfloat16* const W1[1] = {W};
+    float acc[1][MT][4];
+    gvmma_tile<1, MT, ONE>(acc, x, W1, rb << 3, rows, N, K, s * span, (s + 1u) * span);
+    constexpr unsigned F = 32u * MT * 4u;
+    float* P = gvmma_xk_part + ((size_t)(g * sb + s) * PLOW_NV_WARPS + warp) * F;
+#pragma unroll
+    for (int mt = 0; mt < MT; mt++)
+#pragma unroll
+        for (int j = 0; j < 4; j++) P[(mt * 4 + j) * 32u + lane] = acc[0][mt][j];
+    /* The interpreter's signal pattern (fa_decode_rg_item's merge fold). */
+    __shared__ unsigned last;
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        __threadfence();
+        last = atomicAdd(gvmma_xk_cnt + g, 1u) == sb - 1u;
+        __threadfence();
+    }
+    __syncthreads();
+    if (!last) return;
+    float sum[MT][4];
+#pragma unroll
+    for (int mt = 0; mt < MT; mt++)
+#pragma unroll
+        for (int j = 0; j < 4; j++) sum[mt][j] = 0.0f;
+#pragma unroll
+    for (unsigned q = 0; q < 8u; q++) {
+        if (q < sb) {
+            const float* Q = gvmma_xk_part + ((size_t)(g * sb + q) * PLOW_NV_WARPS + warp) * F;
+#pragma unroll
+            for (int mt = 0; mt < MT; mt++)
+#pragma unroll
+                for (int j = 0; j < 4; j++) sum[mt][j] += __ldcg(Q + (mt * 4 + j) * 32u + lane);
+        }
+    }
+#if PLOW_NV_NORM_FOLD
+    if constexpr (FOLD) gvmma_fold_store_tile<MT>(C, sum, rb << 3, rows, N, *fo);
+    else
+#endif
+    gvmma_store_tile<BIAS, MT>(C, sum, rb << 3, rows, N, bias);
+    if (threadIdx.x == 0) atomicExch(gvmma_xk_cnt + g, 0u);
+}
+#endif
 template <bool BIAS, int MT = 1, bool ONE = false, bool FOLD = false>
 __device__ __forceinline__ void gemv_rows_mma(__nv_bfloat16* __restrict__ C,
                                               const __nv_bfloat16* __restrict__ x,
@@ -441,6 +511,14 @@ __device__ __forceinline__ void gemv_rows_mma(__nv_bfloat16* __restrict__ C,
     const __nv_bfloat16* const W1[1] = {W};
     const unsigned per = r.rb1 - r.rb0;
     const unsigned nkb = K >> 5;
+#if PLOW_NV_GEMV_XK
+    if constexpr (MT <= 2) {
+        if (const unsigned sb = gvmma_xk_sb(rows, N, K, nblk)) {
+            if (slice < (N >> 6) * sb) gvmma_xk_unit<BIAS, MT, ONE, FOLD>(C, x, W, rows, N, K, slice, sb, bias, fo);
+            return;
+        }
+    }
+#endif
 #if PLOW_NV_GEMV_MMA_PAIR
     /* TWO ROW BLOCKS PER K-STEP. A k-step's cost is mostly its round trip, not its bytes: the
      * two-stream GLU step measured 1.56x a one-stream step while moving 2x the weights (GLU walks
@@ -917,6 +995,24 @@ __device__ __forceinline__ void gvmma_pf_heads(const __nv_bfloat16* W, unsigned 
     for (unsigned p = threadIdx.x; p < nrow * S; p += blockDim.x)
         gvmma_pf_l2(W + (size_t)(row0 + p / S) * K + (p % S) * span, bytes);
 }
+#if PLOW_NV_GEMV_XK
+/* The cross-block unit's 64 weight rows at its K span; a fold producer's also the group's residual
+ * columns and gamma (any of the group's blocks may run the epilogue). */
+__device__ __forceinline__ void gvmma_pf_xk(const __nv_bfloat16* W, const __nv_bfloat16* resid,
+                                            const __nv_bfloat16* gamma, unsigned rows, unsigned N,
+                                            unsigned K, unsigned slice, unsigned sb) {
+    const unsigned g = slice / sb, s = slice % sb, kspan = K / sb;
+    unsigned bytes = PLOW_NV_GEMV_PF_BYTES / 64u;
+    if (bytes > kspan * 2u) bytes = kspan * 2u;
+    bytes &= ~127u;
+    if (W && bytes && threadIdx.x < 64u) gvmma_pf_l2(W + (size_t)(g * 64u + threadIdx.x) * K + s * kspan, bytes);
+    if (resid) {
+        const unsigned m = blockDim.x - 1u - threadIdx.x;
+        if (m < rows) gvmma_pf_l2(resid + (size_t)m * N + g * 64u, 128u);
+        else if (m == rows) gvmma_pf_l2(gamma + g * 64u, 128u);
+    }
+}
+#endif
 /* gemv_rows_mma: R row blocks in the first wave, S K-spans each. */
 __device__ __forceinline__ void gvmma_pf_rows(const __nv_bfloat16* W, unsigned N, unsigned K,
                                               unsigned slice, unsigned nblk) {
