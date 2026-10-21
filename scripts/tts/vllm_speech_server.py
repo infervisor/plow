@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""The existing-method baseline for Veena: vLLM (async engine, CUDA graphs) + PyTorch SNAC behind
+"""The existing-method baseline for Veena and Orpheus (`--profile orpheus`): vLLM (async engine, CUDA graphs) + PyTorch SNAC behind
 the same OpenAI `POST /v1/audio/speech` contract plowrt serves (Orpheus-FastAPI style).
 
 Same prompt framing, stop ids, token budget and sampling defaults as plowrt's speech pipeline;
@@ -38,12 +38,14 @@ def main():
     ap.add_argument("--model", default=None)
     ap.add_argument("--gpu-mem", type=float, default=0.6)
     ap.add_argument("--max-seqs", type=int, default=64)
+    ap.add_argument("--profile", choices=["veena", "orpheus"], default="veena")
     args = ap.parse_args()
     from huggingface_hub import snapshot_download
     from transformers import AutoTokenizer
     from vllm import AsyncEngineArgs, AsyncLLMEngine, SamplingParams
     from snac import SNAC
-    model = args.model or snapshot_download("maya-research/Veena")
+    orpheus = args.profile == "orpheus"
+    model = args.model or snapshot_download("canopylabs/orpheus-3b-0.1-ft" if orpheus else "maya-research/Veena")
     tok = AutoTokenizer.from_pretrained(model)
     engine = AsyncLLMEngine.from_engine_args(AsyncEngineArgs(
         model=model, dtype="bfloat16", max_model_len=2048, gpu_memory_utilization=args.gpu_mem,
@@ -64,17 +66,26 @@ def main():
 
     @app.get("/v1/models")
     async def models():
-        return {"data": [{"id": "veena"}]}
+        return {"data": [{"id": args.profile}]}
 
     @app.post("/v1/audio/speech")
     async def speech(req: Request):
         body = await req.json()
-        text, voice = body["input"], body.get("voice", "kavya")
+        text, voice = body["input"], body.get("voice", "tara" if orpheus else "kavya")
         stream, wav = bool(body.get("stream")), body.get("response_format", "wav") == "wav"
-        ids = [SOH, *tok.encode(f"<spk_{voice}> {text}", add_special_tokens=False), EOH, SOA, SOS]
-        sp = SamplingParams(temperature=body.get("temperature", 0.4), top_p=body.get("top_p", 0.9),
-                            max_tokens=body.get("max_tokens") or max_new(text), stop_token_ids=[EOS_SPEECH, EOA],
-                            seed=body.get("seed"))
+        if orpheus:
+            # The Orpheus packet's framing, stops, budget and sampling defaults.
+            ids = [128259, 128000, *tok.encode(f"{voice}: {text}", add_special_tokens=False),
+                   128009, 128260, 128261, 128257]
+            sp = SamplingParams(temperature=body.get("temperature", 0.6), top_p=body.get("top_p", 0.8),
+                                repetition_penalty=body.get("repetition_penalty", 1.1),
+                                max_tokens=body.get("max_tokens") or min(int(len(text) * 1.8) * 7 + 21, 1800),
+                                stop_token_ids=[128258], seed=body.get("seed"))
+        else:
+            ids = [SOH, *tok.encode(f"<spk_{voice}> {text}", add_special_tokens=False), EOH, SOA, SOS]
+            sp = SamplingParams(temperature=body.get("temperature", 0.4), top_p=body.get("top_p", 0.9),
+                                max_tokens=body.get("max_tokens") or max_new(text), stop_token_ids=[EOS_SPEECH, EOA],
+                                seed=body.get("seed"))
         gen = engine.generate({"prompt_token_ids": ids}, sp, request_id=uuid.uuid4().hex)
 
         async def codes_stream():

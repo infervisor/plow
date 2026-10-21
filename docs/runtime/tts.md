@@ -294,6 +294,20 @@ Breeze's text encoder runs on the engine thread before a request's first prefill
 beside decode steps, each of its launches waited behind a persistent decode kernel (9.4 ms alone,
 155 ms + 189 ms lock wait at c8). c8 TTFA 422 -> 57 ms, c32 31.3 -> 35.8 audio s/s.
 
+### Veena and Orpheus vs vLLM + SNAC
+
+H100, 2026-10-21, same client (`tts_bench.py`, streamed), the packets' prompt framing, stops,
+budgets and sampling on both sides. Baseline: `vllm_speech_server.py` (vLLM 0.28 async engine,
+CUDA graphs, PyTorch SNAC per window; `--profile orpheus` for Orpheus), driven by
+`vllm_speech_probe.sh`. Cells are audio s/s, median TTFA.
+
+| | c1 | c8 | c32 | c64 |
+|---|---|---|---|---|
+| Veena, vLLM + SNAC | 3.1, 94 ms | 13.8, 216 ms | 38.7, 1254 ms | 78.3, 1034 ms |
+| Veena, plowrt | 3.4, 81 ms | 22.3, 92 ms | 53.0, 187 ms | 98.2, 195 ms |
+| Orpheus, vLLM + SNAC | 3.1, 94 ms | 14.9, 229 ms | 42.7, 1017 ms | 79.8, 1012 ms |
+| Orpheus, plowrt | 3.3, 82 ms | 22.5, 93 ms | 63.8, 116 ms | 101.3, 194 ms |
+
 ### Fish S2 and Breeze vs their official servers
 
 H100, same texts (`chatterbox_ref.PROMPTS`), default sampling, no CFG, streamed. The official
