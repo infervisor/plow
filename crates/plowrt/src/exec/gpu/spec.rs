@@ -387,9 +387,15 @@ impl GpuEngine {
             }
         }
         let n_spans = spans.len();
-        if let Err(e) =
-            self.spec_submit(selection, launch_rows, rows, n_spans, stop.len(), &dev_rows, &dev_slots)
-        {
+        if let Err(e) = self.spec_submit(
+            selection,
+            launch_rows,
+            rows,
+            n_spans,
+            stop.len(),
+            &dev_rows,
+            &dev_slots,
+        ) {
             // Plain launches must not see the span map, and staging may still be in flight: only
             // a restore that drains cleanly clears the dirty flag.
             self.spec.as_mut().expect("checked").map_dirty = true;
