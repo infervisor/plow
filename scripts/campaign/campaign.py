@@ -663,6 +663,24 @@ def cmd_build(a: argparse.Namespace) -> None:
             if run(nix(["bash", str(REPO / objects["script"]), str(out / "objects")]), oenv, log):
                 die("object build failed; see build.log")
 
+    # Stage packets a bundle carries beside its LM (Breeze's text encoder): each its own emit into
+    # assets/<name>, from its own checkpoint and env (the LM emit's env does not apply).
+    sub_env = {}
+    for sub in r.get("sub_emit", []):
+        print(f"== sub emit {sub['name']}", file=sys.stderr)
+        sargs = [
+            str(plowc),
+            "--hf-dir", expand(sub["hf_dir"], out),
+            "--gpu", cell["gpu"], "--arch", cell["arch"], "--n-cu", str(cell["n_cu"]),
+            "--emit", sub.get("emit", "devblob+cubin"),
+            *[expand(x, out) for x in sub.get("args", [])],
+        ]
+        if sub.get("max_ctx"):
+            sargs.extend(["--max-ctx", str(sub["max_ctx"])])
+        sub_env[sub["name"]] = {k: expand(v, out) for k, v in sub.get("env", {}).items()}
+        if run(nix([*sargs, "--out", str(assets / sub["name"])]), env_with(os.environ, sub_env[sub["name"]]), log):
+            die(f"sub emit {sub['name']} failed; see build.log")
+
     ck = cell.get("checkpoint_dir")
     if ck:
         # A composed checkpoint (BF16 shards + fp8/ twins) replaces the emit's snapshot link.
@@ -696,6 +714,7 @@ def cmd_build(a: argparse.Namespace) -> None:
             "role_env": {**(roles or {}).get("env", {}), **overrides},
             "object_env": object_env,
             "rung_env": rungs or None,
+            "sub_emit_env": sub_env or None,
         },
         "cell": cell,
         "overrides": overrides,

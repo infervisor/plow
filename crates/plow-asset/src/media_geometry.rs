@@ -84,10 +84,20 @@ fn codec_lm(p: &PacketPipeline, sidecars: &[MediaPacket<'_>]) -> Result<Value, S
         .checked_add(param(p, "prompt.suffix.count")?)
         .and_then(|n| n.checked_add(u64::from(p.strings.contains_key("prompt.voice_token"))))
         .ok_or("codec LM: prompt length overflows")?;
+    // A depth-stage LM emits one token per frame; a codec-token LM one per code.
+    let codebook = param(p, "codec.codebook")?;
+    let audio_tokens = if p.parameters.get("frames.depth").copied().unwrap_or(0) != 0 {
+        codebook
+    } else {
+        codebook
+            .checked_mul(param(p, "codec.frame_codes")?)
+            .ok_or("codec LM: audio token range overflows")?
+    };
     Ok(json!({"kind": "codec_lm",
         "lm_sample_rate": param(p, "audio.sample_rate")?, "lm_codebook": param(p, "codec.codebook")?,
         "lm_frame_codes": param(p, "codec.frame_codes")?, "lm_frame_samples": param(p, "codec.frame_samples")?,
-        "token_base": param(p, "audio.token_base")?, "max_new_tokens": param(p, "tokens.max_new_cap")?,
+        "token_base": param(p, "audio.token_base")?, "audio_tokens": audio_tokens,
+        "max_new_tokens": param(p, "tokens.max_new_cap")?,
         "prompt_tokens": prompt, "max_context": param(p, "max_context")?, "stops": listed(p, "stop")?,
         "codec_sample_rate": param(c, "audio.sample_rate")?, "codebook": param(c, "codec.codebook")?,
         "frame_codes": param(c, "codec.frame_codes")?, "frame_samples": param(c, "codec.frame_samples")?,

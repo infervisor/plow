@@ -81,6 +81,8 @@ pub mod conv2d;
 mod decode_objects;
 mod dense_cublaslt;
 pub mod dispatch_audit;
+pub mod fish_codec;
+mod fish_depth;
 mod gemv_decode_role;
 pub mod manifest;
 pub mod mm;
@@ -1901,6 +1903,14 @@ struct Tn {
     mm_slab: u32,
     // Per prefill row, the rows after it in its bidirectional media span (`MmSpanExtent`).
     mm_span: u32,
+    /// Encoder mode: per-row bidirectional reach (FlashPrefill span tables) of the sliding and
+    /// the full layers, host-written per segment.
+    enc_span: [u32; 2],
+    // Codec-frame input embedding: per-row frame codes and the codebook table (TENSOR_NONE: off).
+    // Prefill reads host-written prompt rows; decode reads per-slot rows the depth stage writes.
+    frame_codes: u32,
+    frame_dcodes: u32,
+    frame_cb: u32,
     // Chatterbox T3 decode: per-slot speech start and the learned speech-position table.
     pos_base: u32,
     speech_pos: u32,
@@ -1968,6 +1978,8 @@ struct Tn {
     fu: u32,
     dg: u32,
     logits: u32,
+    /// Encoder mode: every prefill row through the head (`[rows][head_rows]` bf16).
+    enc_out: u32,
     amax: u32,
     // TP (n_gpu>1) peer-mapped partial slots: the row-parallel
     // o_proj/down write their partial H-vector here (tp-host binds them into peer_scratch),
@@ -2022,6 +2034,8 @@ struct Tn {
     xqi: u32,
     asi: u32,
     lw: Vec<LW>,
+    /// Fish S2 depth-stage tensors (a frame embedding's packet).
+    fish: Option<fish_depth::Tensors>,
 }
 struct LW {
     bq: u32,
@@ -2206,7 +2220,11 @@ fn declare(
                                        // GLM-5.2's untied head takes the column-parallel arm under `GLM_SHARD_HEAD=1` for a measured
                                        // -0.26 ms/token, bit-identical (perf-data/glm52-decode-emitter-abs.md §1). Sharding a TIED
                                        // head additionally needs the per-rank vocab offset on the `emb` read.
-    let vocab_sh = c.vocab;
+    let vocab_sh = c.out_vocab();
+    assert!(
+        c.head_rows == 0 || !c.tied,
+        "plow_head_rows needs an untied lm_head of those rows"
+    );
     let ac = |b: &mut Builder, n: &str, sz: u64| b.tensor(&format!("act.{n}"), sz);
 
     // RoPE tables are declared as RECIPES, not expanded bytes: at ctx=131072 the four
@@ -2263,6 +2281,29 @@ fn declare(
         } else {
             TENSOR_NONE
         },
+        enc_span: if c.encoder {
+            [
+                b.tensor("in.enc.span_local", rows as u64 * I32),
+                b.tensor("in.enc.span_full", rows as u64 * I32),
+            ]
+        } else {
+            [TENSOR_NONE; 2]
+        },
+        frame_codes: match &c.frame {
+            Some(f) => b.tensor("in.frame_codes", u64::from(ctx * f.codebooks) * I32),
+            None => TENSOR_NONE,
+        },
+        frame_dcodes: match &c.frame {
+            Some(f) => b.tensor("in.fish.dcodes", u64::from(dbatch * f.codebooks) * I32),
+            None => TENSOR_NONE,
+        },
+        frame_cb: match &c.frame {
+            Some(f) => b.tensor(
+                &f.table,
+                u64::from(f.codebooks * f.cb_size) * u64::from(c.hidden) * BF16,
+            ),
+            None => TENSOR_NONE,
+        },
         pos_base: if c.speech_pos_rows > 0 {
             b.tensor("in.pos_base", dbatch as u64 * I32)
         } else {
@@ -2298,7 +2339,7 @@ fn declare(
                 } else {
                     "lm_head.weight"
                 },
-                (c.vocab * c.hidden) as u64 * BF16,
+                (c.out_vocab() * c.hidden) as u64 * BF16,
             )
         },
         head8: if c.tied && emit_config::active().fp8_head && !mx4_head_on() {
@@ -2469,6 +2510,11 @@ fn declare(
         // this is 512 KB, not the 2.1 GB a full-T lm_head would need at ctx=4096. Vocab-column-
         // sharded. BATCH>1 decode reads B rows (one per sequence), so *dbatch; dbatch==1 identical.
         logits: ac(b, "logits", (dbatch * vocab_sh) as u64 * BF16),
+        enc_out: if c.encoder {
+            ac(b, "enc_out", (rows * vocab_sh) as u64 * BF16)
+        } else {
+            TENSOR_NONE
+        },
         // Per-block argmax partials, one packed u64 each. Needs no zeroing between steps:
         // every block writes its own slot unconditionally. BATCH>1: [dbatch][AMAX_BLOCKS].
         // E5 PLOW_FUSE_ARGMAX: the fused lm_head epilogue (GemvArgmax) runs on all n_cu blocks,
@@ -2618,6 +2664,7 @@ fn declare(
         kcs: Vec::new(),
         vcs: Vec::new(),
         lw: Vec::new(),
+        fish: None,
     };
     let mut t = t;
     for l in 0..c.layers {
@@ -3023,6 +3070,9 @@ fn declare(
             edn8: ex4[2],
             edns: ex4[3],
         });
+    }
+    if c.frame.as_ref().is_some_and(|f| f.depth.is_some()) {
+        t.fish = Some(fish_depth::declare(b, c, dbatch));
     }
     t
 }
@@ -4176,7 +4226,7 @@ fn emit_phase(
     let heads = c.heads / tp; // this rank's q-heads
                               // inter_l is per-layer (E2B doubles the dense MLP on trailing KV-shared layers); defined inside
                               // the layer loop below as `c.inter_for_layer(l) / tp`.
-    let vocab_l = c.vocab; // lm_head REPLICATED under TP (Phase 2); see declare() note above
+    let vocab_l = c.out_vocab(); // lm_head REPLICATED under TP (Phase 2); see declare() note above
     let mut xgate: u32 = 0; // xctr gate-id allocator for XReduce (unique per collective)
                             // XReduce runs on a REDUCED CU set (F-lever). The all-reduce is a
                             // tiny memory-bound sum over the H-vector, but EVERY participating workgroup takes a SYSTEM-scope
@@ -4265,13 +4315,28 @@ fn emit_phase(
     let fused = fused_epilogue;
 
     let escale = c.emb_scale;
+    let emit_frame = |b: &mut Builder, f: &FrameEmbed| {
+        assert!(escale == 1.0, "a frame embedding has its own divisor");
+        b.emit(DevOp::EmbedFrameBf16, rows.clone(), &[], |d| {
+            let codes = if decode {
+                n.frame_dcodes
+            } else {
+                n.frame_codes
+            };
+            d.t[..5].copy_from_slice(&[n.x, n.emb, n.ids, n.frame_cb, codes]);
+            d.i[..7].copy_from_slice(&[t, c.hidden, c.vocab, f.codebooks, f.cb_size, f.lo, f.rows]);
+            d.f[0] = f.div;
+        })
+    };
     // Block mode: no token embedding — `act.x` is uploaded by the harness (the
     // residual-stream input), so Embed would overwrite it. The first in-block
     // layer's RmsNorm reads `act.x` directly (its dep is `&[]`; see below).
     let mut dep = if block_mode {
         0u32
     } else if !decode && c.encoder_overlay_rows > 0 {
-        b.emit(DevOp::EmbedOverlayBf16, rows.clone(), &[], |d| {
+        // A frame-embedding prompt embeds its frame rows first; their overlay index keeps them.
+        let frame: Vec<u32> = c.frame.iter().map(|f| emit_frame(b, f)).collect();
+        b.emit(DevOp::EmbedOverlayBf16, rows.clone(), &frame, |d| {
             d.t[..5].copy_from_slice(&[
                 n.x,
                 n.emb,
@@ -4281,6 +4346,8 @@ fn emit_phase(
             ]);
             d.i[..4].copy_from_slice(&[t, c.hidden, c.vocab, c.encoder_overlay_rows]);
         })
+    } else if let Some(f) = &c.frame {
+        emit_frame(b, f)
     } else if decode && c.speech_pos_rows > 0 {
         b.emit(DevOp::EmbedPosBf16, rows.clone(), &[], |d| {
             d.t[..6].copy_from_slice(&[n.x, n.emb, n.ids, n.speech_pos, n.pos, n.pos_base]);
@@ -5881,8 +5948,21 @@ fn emit_phase(
                     "bidirectional media spans need the fused FP8-KV prefill attention (PLOW_FP8_KV)"
                 );
                 n.mm_span
+            } else if c.encoder && !decode {
+                assert!(
+                    !fp8_kv && fused && ns == 1,
+                    "encoder attention needs the fused one-split bf16-KV prefill"
+                );
+                n.enc_span[usize::from(full)]
             } else {
                 0
+            };
+            // Encoder: keys `q - (window+1)/2 + 1 ..= q + span` (T5Gemma2's bidirectional local
+            // window); a full layer sees its whole segment.
+            let att_win = match (c.encoder && !decode, full) {
+                (true, true) => t,
+                (true, false) => c.window.div_ceil(2),
+                _ => win,
             };
             let fa_deps: Vec<u32> = if shared {
                 vec![c_qn]
@@ -5918,7 +5998,7 @@ fn emit_phase(
                 d.i[2] = heads;
                 d.i[3] = kvh;
                 d.i[4] = 0;
-                d.i[5] = win;
+                d.i[5] = att_win;
                 d.i[6] = hd;
                 d.i[7] = ns | span_attention << 16;
                 d.f[0] = c.attn_scale;
@@ -5935,7 +6015,7 @@ fn emit_phase(
         // the projections still run the full launch. The runtime binds each stage's tables by
         // position (`packed_prefill::stage_map`), which its validate proves.
         let stages = match stage_rows(c) {
-            Some(s) if !gemv_family && !decode && !full && !shared && !amd => {
+            Some(s) if !gemv_family && !decode && !full && !shared && !amd && !c.encoder => {
                 t.min(request_chunk(c.window)).div_ceil(s)
             }
             _ => 1,
@@ -7308,6 +7388,26 @@ fn emit_phase(
             Some("0") => false,
             _ => amd,
         };
+    // Encoder mode: the head projects every prefill row (Breeze's text_encoder_proj); no logits,
+    // no sampling.
+    if c.encoder && !decode {
+        let op = pick_tile(t, vocab_l, c.hidden, n_cu, kernelcaps::QuantScheme::None);
+        let tm = (tma_gemm && matches!(op, DevOp::Gemm | DevOp::GemmMed | DevOp::GemmSmall))
+            .then(|| (tmap(head_src, t, c.hidden), tmap(head_w, vocab_l, c.hidden)));
+        b.emit(op, all.clone(), &[c_f], |d| {
+            d.t[0] = n.enc_out;
+            d.t[1] = head_src;
+            d.t[2] = head_w;
+            d.i[0] = t;
+            d.i[1] = vocab_l;
+            d.i[2] = c.hidden;
+            if let Some((ma, mb)) = tm {
+                d.i[6] = ma;
+                d.i[7] = mb;
+            }
+        });
+        return;
+    }
     let (lm_m, lm_row0) = if decode { (t, 0) } else { (1, t - 1) };
     let lm_op = if gemv_family || pf_gemv_head {
         DevOp::Gemv
@@ -10170,6 +10270,11 @@ fn emit_dense_gqa(
         c.mm_spans = contract.has_spans();
         (towers, contract)
     });
+    // The span handle shares i7 with the split count; only the NVIDIA FlashPrefill arm reads it.
+    assert!(
+        !c.encoder || arch.starts_with("sm_"),
+        "encoder-mode packets (plow_encoder) target sm_* only"
+    );
     // Resolve the block range now that layer count is known. `l` -> l..l+1;
     // `l..r` -> that half-open range. Absent => the full model (0..layers),
     // which makes every gated site below byte-identical to the pre-block path.
@@ -10720,7 +10825,7 @@ fn emit_dense_gqa(
         sections.extend(
             tts::t3_text_tables_section(&dir).unwrap_or_else(|e| panic!("T3 text tables: {e}")),
         );
-    } else if c.encoder_overlay_rows > 0 && !block_mode {
+    } else if c.encoder_overlay_rows > 0 && c.frame.is_none() && !block_mode {
         sections.push(
             pipeline::causal_pipeline_section(
                 &m,
@@ -10749,6 +10854,10 @@ fn emit_dense_gqa(
         );
     } else if let Some(name) = ecfg.tts_profile.as_deref().filter(|_| !block_mode) {
         let profile = tts::profile(name).unwrap_or_else(|e| panic!("{e}"));
+        assert!(
+            profile.depth == emitter.tn.fish.is_some(),
+            "tts profile {name}: a depth-stage profile needs a frame-embedding checkpoint, and back"
+        );
         sections.push(
             tts::speech_pipeline_section(
                 &m,
@@ -10757,14 +10866,20 @@ fn emit_dense_gqa(
                     max_context: ctx,
                     hidden: c.hidden,
                     decode_capacity: dbatch,
-                    overlay_rows: 0,
+                    overlay_rows: if profile.text_encoder.is_some() {
+                        c.encoder_overlay_rows
+                    } else {
+                        0
+                    },
                     ordered_dispatch: false,
                     tensors: pipeline::CausalPipelineTensors {
                         tokens: emitter.tn.ids,
                         positions: emitter.tn.pos,
                         kv_lengths: emitter.tn.kvlen,
-                        overlay: None,
-                        overlay_index: None,
+                        overlay: profile.text_encoder.map(|_| emitter.tn.encoder_overlay),
+                        overlay_index: profile
+                            .text_encoder
+                            .map(|_| emitter.tn.encoder_overlay_index),
                     },
                 },
                 profile,
@@ -10926,6 +11041,9 @@ fn emit_dense_gqa(
         let manifest =
             modular::build_modular_manifest(c.layers, modular_progs, &buckets, &[dbatch]);
         sections.push(modular::modular_pipeline_section(&manifest));
+    }
+    if let Some(t) = &emitter.tn.fish {
+        sections.extend(fish_depth::sections(&c, &emitter.tn, t, &m, &rungs));
     }
     if let Some(ref path) = embed_cubin {
         sections.push(packet::devbuild::SectionData {
@@ -11240,54 +11358,63 @@ fn emit_dense_gqa(
         hetero_channel::plan(&m, channels, weights, channel_progs).unwrap_or_else(|e| panic!("{e}"))
     });
     let audio_blob =
-        (c.encoder_overlay_rows > 0 && c.speech_pos_rows == 0 && !block_mode).then(|| {
-            // Single-utterance buckets (forward.v1); on CUDA also packed buckets (chunks of several
-            // utterances, each attending in its own windows and splitting K as its single bucket
-            // would), the largest sizing every shared tensor.
-            let packed: &[u32] = if arch.starts_with("sm_") || target_is_cpu(&arch, &gpu) {
-                &[192, 160, 128, 96, 80, 64, 48, 40, 32, 24, 16, 12, 8, 4]
-            } else {
-                &[]
-            };
-            let single: &[u32] = &[3000, 400, 800, 1200, 1600, 2000];
-            let buckets = asr::qwen::audio_buckets(
-                packed,
-                single,
-                emit_config::active().asr_packed_max_chunks,
-            );
-            let audio_dims = asr::qwen::AudioDims::from_checkpoint(&dir)
-                .unwrap_or_else(|error| panic!("Qwen audio encoder dims: {error}"));
-            let lower = |bucket: &asr::qwen::AudioBucket| {
-                bucket
-                    .lower(n_cu, audio_dims)
-                    .unwrap_or_else(|error| panic!("Qwen audio packet lowering: {error}"))
-            };
-            let (base, rest) = buckets.split_first().expect("single-utterance capacities");
-            let mut encoder = lower(base);
-            for bucket in rest {
+        (c.encoder_overlay_rows > 0 && c.speech_pos_rows == 0 && c.frame.is_none() && !block_mode)
+            .then(|| {
+                // Single-utterance buckets (forward.v1); on CUDA also packed buckets (chunks of several
+                // utterances, each attending in its own windows and splitting K as its single bucket
+                // would), the largest sizing every shared tensor.
+                let packed: &[u32] = if arch.starts_with("sm_") || target_is_cpu(&arch, &gpu) {
+                    &[192, 160, 128, 96, 80, 64, 48, 40, 32, 24, 16, 12, 8, 4]
+                } else {
+                    &[]
+                };
+                let single: &[u32] = &[3000, 400, 800, 1200, 1600, 2000];
+                let buckets = asr::qwen::audio_buckets(
+                    packed,
+                    single,
+                    emit_config::active().asr_packed_max_chunks,
+                );
+                let audio_dims = asr::qwen::AudioDims::from_checkpoint(&dir)
+                    .unwrap_or_else(|error| panic!("Qwen audio encoder dims: {error}"));
+                let lower = |bucket: &asr::qwen::AudioBucket| {
+                    bucket
+                        .lower(n_cu, audio_dims)
+                        .unwrap_or_else(|error| panic!("Qwen audio packet lowering: {error}"))
+                };
+                let (base, rest) = buckets.split_first().expect("single-utterance capacities");
+                let mut encoder = lower(base);
+                for bucket in rest {
+                    encoder
+                        .merge_capacity(lower(bucket))
+                        .unwrap_or_else(|error| panic!("Qwen audio packet capacity: {error}"));
+                }
+                encoder.prefix.model.target = m.target;
                 encoder
-                    .merge_capacity(lower(bucket))
-                    .unwrap_or_else(|error| panic!("Qwen audio packet capacity: {error}"));
-            }
-            encoder.prefix.model.target = m.target;
-            encoder
-                .embed_checkpoint(&dir)
-                .unwrap_or_else(|error| panic!("Qwen audio packet weights: {error}"));
-            encoder.embed_frontend(
-                asr::qwen::whisper_frontend(&dir)
-                    .unwrap_or_else(|error| panic!("Qwen audio frontend: {error}")),
-            );
-            let section = encoder
-                .pipeline_section(base.feature_frames())
-                .unwrap_or_else(|error| panic!("Qwen audio packet metadata: {error}"));
-            (encoder.prefix.model, section)
-        });
+                    .embed_checkpoint(&dir)
+                    .unwrap_or_else(|error| panic!("Qwen audio packet weights: {error}"));
+                encoder.embed_frontend(
+                    asr::qwen::whisper_frontend(&dir)
+                        .unwrap_or_else(|error| panic!("Qwen audio frontend: {error}")),
+                );
+                let section = encoder
+                    .pipeline_section(base.feature_frames())
+                    .unwrap_or_else(|error| panic!("Qwen audio packet metadata: {error}"));
+                (encoder.prefix.model, section)
+            });
     std::fs::write(&out, blob).unwrap();
     let mut speech_ops = 0u64;
     if let Some(dir) = ecfg.tts_codec.as_deref().filter(|_| !block_mode) {
         let sites = whole_graph_audio_sites().0;
-        let (model, section) = codec::lower_snac(dir, n_cu, m.target, sites, ecfg.snac_split_bf16)
-            .unwrap_or_else(|error| panic!("codec packet: {error}"));
+        let fish = std::fs::read(dir.join("config.json"))
+            .ok()
+            .and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok())
+            .is_some_and(|v| v["model_type"] == "fish_dac" || v["model_type"] == "qwen3_tts_12hz");
+        let (model, section) = if fish {
+            fish_codec::lower_fish_dac(dir, n_cu, m.target, ecfg.snac_split_bf16)
+        } else {
+            codec::lower_snac(dir, n_cu, m.target, sites, ecfg.snac_split_bf16)
+        }
+        .unwrap_or_else(|error| panic!("codec packet: {error}"));
         let path = std::path::Path::new(&out).with_file_name(tts::CODEC_PACKET);
         speech_ops |= manifest::speech_ops(&model);
         write_sidecar_packet(&path, &model, &[section]);

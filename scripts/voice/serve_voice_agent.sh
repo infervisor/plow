@@ -48,6 +48,13 @@ PY=${PY:-python3}
 mkdir -p "$RES"
 RT="$RES/plowrt"
 cp "${PLOWRT_BIN:-$HERE/target/release/plowrt}" "$RT" || exit 2
+for cand in "$L/../lib/libcublasLt.so.13" "$L/libcublasLt.so.13" "$(dirname "${PLOWRT_BIN:-}")/libcublasLt.so.13"; do
+    if [ -f "$cand" ] && [ ! -e "$RES/libcublasLt.so.13" ]; then
+        cp -p "$cand" "$RES/" 2>/dev/null || true
+        break
+    fi
+done
+export LD_LIBRARY_PATH="$RES:${LD_LIBRARY_PATH:-}"
 PB_SERVER_PORT=${PORT:-$(pb_free_port)}; PB_SERVER_LOG="$RES/serve.log"
 # LLM last: its KV admission budget is sampled from what the speech models leave.
 # shellcheck disable=SC2086
@@ -65,11 +72,14 @@ if [ "$MODE" = serve ]; then
     wait "$PB_SERVER_PID"
     exit $?
 fi
+ASR_M=${ASR_MODEL:-$(jq -r '.served_name // "qwen3-asr"' "$A/weights.json" 2>/dev/null || echo "qwen3-asr")}
+LLM_M=${LLM_MODEL:-$(jq -r '.served_name // "gemma-4-e4b"' "$L/weights.json" 2>/dev/null || echo "gemma-4-e4b")}
+TTS_M=${TTS_MODEL:-$(jq -r '.served_name // "chatterbox-mtl"' "$S/weights.json" 2>/dev/null || echo "chatterbox-mtl")}
 for n in "${@:-10}"; do
     curl -fsS "$URL/metrics" > "$RES/metrics-$n.before" 2>/dev/null
     # shellcheck disable=SC2086
     "$PY" "$HERE/scripts/voice/call_sim.py" --url "$URL" --calls "$n" --turns "${TURNS:-3}" \
-        --asr-model qwen3-asr --llm-model gemma-4-e4b --tts-model chatterbox-mtl \
+        --asr-model "$ASR_M" --llm-model "$LLM_M" --tts-model "$TTS_M" \
         --manifest "$MANIFEST" ${CALL_ARGS:---language en} --out "$RES/calls$n.json" 2>&1 | tail -2
     curl -fsS "$URL/metrics" > "$RES/metrics-$n.after" 2>/dev/null
 done

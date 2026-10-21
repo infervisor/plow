@@ -15,6 +15,8 @@ are the same steps by hand):
 | Veena | `recipes/infervisor/veena/sm90a-h100-tp1.toml` |
 | Chatterbox | `recipes/infervisor/chatterbox/sm90a-h100-tp1.toml` |
 | Chatterbox Multilingual V3 | `recipes/infervisor/chatterbox-mtl/sm90a-h100-tp1.toml` |
+| Fish S2 Pro (non-commercial weights) | `recipes/infervisor/fish-s2-pro/sm90a-h100-tp1.toml` |
+| Breeze TTS 2 (non-commercial weights) | `recipes/infervisor/breeze-tts-2/sm90a-h100-tp1.toml` |
 | Qwen3-ASR | `recipes/infervisor/qwen3-asr/sm90a-h100-tp1.toml` |
 
 ```sh
@@ -565,6 +567,33 @@ Admission: requests past the slots queue (4 engine batches of ingress; the ASR f
 its own requests in flight at 256 and waits for mux room instead of answering 429). A CFG
 request takes two slots, so the 128-slot rung serves 64 Chatterbox requests; the rest queue
 (`DECODE_RUNG_MAX` = 128 is the packet format's decode/prefill boundary).
+
+## API (every speech model)
+
+`POST /v1/audio/speech` behaves the same on every speech model. Each model declares a
+`tts::api::SpeechSpec` from its packet (voices, languages and default, sample rate, sampling
+defaults, `max_tokens` cap, and which optional controls it takes); every request is checked against
+it in one order with one set of messages, then runs on the model's engine (`tts::serving`).
+`GET /v1/models` shows the spec as the card's `x_plow_speech`.
+
+| Field | Every model |
+|---|---|
+| `model`, `input`, `voice` | required; `input` at most 4096 characters, spoken as sentence segments; `voice` one of the card's `voices` |
+| `response_format` | `wav` (default) or `pcm` (s16le mono at the card's `sample_rate`) |
+| `stream` | chunked audio; the 200 and its headers go out with the first audio, so an error before any audio is a proper status and `server-timing` carries time to first audio |
+| `language` | one of the card's `languages` (default `default_language`); a model without languages rejects it |
+| `temperature`, `top_p` | honoured on every model (defaults: the card's `defaults`) |
+| `max_tokens` | the model's audio tokens per segment, 1..card `max_tokens` |
+| `seed` | same seed, text and settings at the same concurrency: same speech tokens (batched decode is not bitwise batch-invariant); whole and stream replies share those tokens, but the windowed stream codec differs from a whole decode (~2% rel-L2 on Veena; identical on Breeze); SNAC codecs also draw their noise from the seed, so greedy (`temperature` 0) replies there share tokens but not PCM across seeds; unseeded requests sample anew |
+| `speed` | 1.0 only |
+| `top_k`, `repetition_penalty`, `cfg_weight`, `instructions`, `ref_audio` + `ref_text` | optional controls: taken where the card declares them (`defaults.top_k`, `defaults.repetition_penalty`, `defaults.cfg_weight`, `instructions`, `voice_cloning`), else 400 naming the field; a sampler with a bounded top-k (`limits.top_k_max`, Fish S2) takes `top_k` in 1..that bound and cannot turn it off |
+
+A schema error (unknown field, wrong type) is 400 `invalid_json`; every 429 carries `Retry-After`.
+A whole reply carries `x-plow-audio-seconds` and `x-plow-lm-ms`. `cfg_weight` is
+cond + w (cond - uncond); a model trained with `cfg_scale` s of uncond + s (cond - uncond) takes
+w = s - 1. Guided models (Chatterbox) segment long inputs by text tokens
+(`text.segment_text_tokens`, default 125 per segment) so one segment stays inside the speech-token
+budget in every language; later segments resume no session.
 
 ## Long inputs and real-time admission (codec-LM: Veena, Orpheus)
 

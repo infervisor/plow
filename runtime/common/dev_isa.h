@@ -1520,6 +1520,14 @@ enum {
      * experts do NOT use it; they are MXFP4 on ops 85/86. */
     PLOW_DOP_GEMM_FP8_MX = 216,
     PLOW_DOP_COMPRESS_ROPE_QUANT = 217,
+    /* out[r] = table[tok] (+ codebook rows of a frame token, scaled): see DevOp::EmbedFrameBf16. */
+    PLOW_DOP_EMBED_FRAME_BF16 = 218,
+    /* Fish S2 top-k / nucleus / exponential-race sampling of a bf16 logit row; see DevOp::SampleFishBf16. */
+    PLOW_DOP_SAMPLE_FISH_BF16 = 219,
+    /* bf16 x . bf16 W^T -> f32 rows (fp32 accumulate); see DevOp::GemvF32Out. */
+    PLOW_DOP_GEMV_F32_OUT = 220,
+    /* Penalty / top-k / nucleus / Gumbel sampling of an f32 logit row; see DevOp::SampleSmallF32. */
+    PLOW_DOP_SAMPLE_SMALL_F32 = 221,
 
     PLOW_DOP__COUNT
 };

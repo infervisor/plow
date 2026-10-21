@@ -36,6 +36,8 @@ pub enum StreamChunk {
         id: u32,
         text: String,
         logprobs: Option<Box<crate::text::logprobs::TokenLogprobs>>,
+        /// A depth-stage speech packet's frame codes for this token.
+        frame: Option<Box<[u32]>>,
     },
     /// Terminal event: stop condition met. `executed` is the aggregate packet
     /// count for the whole request (feeds observability, not the wire).

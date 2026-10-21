@@ -19,7 +19,7 @@ fn families() -> Vec<Value> {
                 {"kernel": 1, "stride": 1, "pad_before": 0, "pad_after": 0}],
             "frames": 376, "joint_rows": 376, "blank": 13087, "vocab": 13087, "max_symbols_per_frame": 10}),
         json!({"kind": "codec_lm", "lm_sample_rate": 24000, "lm_codebook": 4096, "lm_frame_codes": 7,
-            "lm_frame_samples": 2048, "token_base": 128266, "max_new_tokens": 1400, "prompt_tokens": 5,
+            "lm_frame_samples": 2048, "token_base": 128266, "audio_tokens": 28672, "max_new_tokens": 1400, "prompt_tokens": 5,
             "max_context": 2048, "stops": [128258, 128262], "codec_sample_rate": 24000, "codebook": 4096,
             "frame_codes": 7, "frame_samples": 2048, "codes_capacity": 3584, "pcm_capacity": 1048576,
             "window_frames": 6, "lookahead_frames": 2}),

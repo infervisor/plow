@@ -22,6 +22,7 @@ use std::path::Path;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc};
 
+use super::api::{Sampling, SpeechSpec};
 use super::codec::{Codec, Decoded, Window};
 use super::guided_lm::{GuidedLmContract, PromptTables};
 use crate::sched::admission::DownstreamCredit;
@@ -43,6 +44,11 @@ pub enum SpeechError {
 
 /// The vocoder packet beside the LM packet.
 pub const VOCODER: &str = "s3gen.pkt";
+
+/// Text tokens per segment of a long input, unless the packet sets `text.segment_text_tokens`:
+/// speech runs up to ~8 speech tokens per text token in every language, so 125 text tokens stay
+/// inside a 1000-token speech budget.
+const SEGMENT_TEXT_TOKENS: usize = 125;
 
 /// Longest a whole (non-streamed) reply waits for stream windows once its tokens are complete.
 const WHOLE_MAX_WAIT: std::time::Duration = std::time::Duration::from_secs(2);
@@ -241,7 +247,10 @@ pub struct GuidedSpeech {
     tables: PromptTables,
     render: parking_lot::Mutex<mpsc::Sender<S3Msg>>,
     next_id: AtomicUsize,
+    /// The vocoder packet's `audio.sample_rate`.
     pub sample_rate: u32,
+    /// Voices both the prompt tables and the vocoder know; the packet's languages and sampling.
+    pub spec: SpeechSpec,
     /// The vocoder's `stream.first_tokens`.
     first_tokens: usize,
 }
@@ -840,7 +849,7 @@ impl GuidedSpeech {
         let tables = PromptTables::load(assets, c.hidden)?;
         let trim_tail = c.trim_tail_tokens;
         let (s_tx, s_rx) = mpsc::channel::<S3Msg>();
-        let (s_ready_tx, s_ready_rx) = mpsc::channel::<Result<usize>>();
+        let (s_ready_tx, s_ready_rx) = mpsc::channel::<Result<(usize, u32, Vec<String>)>>();
         let vocoder_path = crate::exec::packet_runtime::stage_packet(
             &assets.join("model.pkt"),
             "vocoder.packet",
@@ -858,7 +867,11 @@ impl GuidedSpeech {
                     Ok(sc) => sc,
                     Err(e) => return drop(s_ready_tx.send(Err(RuntimeError::Rejected(e)))),
                 };
-                let _ = s_ready_tx.send(Ok(sc.first));
+                let _ = s_ready_tx.send(Ok((
+                    sc.first,
+                    sc.sample_rate as u32,
+                    vocoder.voices.clone(),
+                )));
                 render_loop(
                     &vocoder,
                     crate::sched::cost::id(&vocoder_path.to_string_lossy()),
@@ -868,26 +881,51 @@ impl GuidedSpeech {
                 );
             })
             .map_err(|e| RuntimeError::Device(e.to_string()))?;
-        let first_tokens = s_ready_rx
+        let (first_tokens, sample_rate, rendered) = s_ready_rx
             .recv()
             .map_err(|e| RuntimeError::Device(e.to_string()))??;
+        let mut voices: Vec<String> = tables
+            .voices()
+            .filter(|v| rendered.iter().any(|r| r == v))
+            .map(str::to_owned)
+            .collect();
+        voices.sort_unstable();
+        let mut languages: Vec<String> = tables.languages().map(str::to_owned).collect();
+        languages.sort_unstable();
+        let spec = SpeechSpec {
+            voices,
+            languages,
+            default_language: tables.language(None)?,
+            sample_rate,
+            temperature: c.temperature,
+            top_p: c.top_p,
+            repetition_penalty: Some(c.repetition_penalty),
+            max_tokens: c.max_speech_tokens,
+            top_k: None,
+            top_k_max: None,
+            cfg_weight: Some(c.cfg_weight),
+            instructions: false,
+            voice_cloning: false,
+        };
         Ok(GuidedSpeech {
             c,
             tables,
             render: parking_lot::Mutex::new(s_tx),
             next_id: AtomicUsize::new(0),
-            sample_rate: 24000,
+            sample_rate,
+            spec,
             first_tokens,
         })
     }
 
     /// The mux job for one request: both CFG members' prefill rows as overlays, the decode
-    /// position base, the packet's sampling chain.
+    /// position base, the packet's sampling chain with the request's values.
     fn job(
         &self,
         voice: &str,
         text: &str,
         lang: Option<&str>,
+        sampling: &Sampling,
         seed: u64,
         class: JobClass,
         respond: crate::serve::stream::ChunkSender,
@@ -900,7 +938,7 @@ impl GuidedSpeech {
         let uncond = self.tables.prefill_rows(c, voice, &ids, true)?;
         let n = cond.len() / c.hidden;
         let mut gen = crate::serve::GenParams::default();
-        gen.max_tokens = c.max_speech_tokens;
+        gen.max_tokens = sampling.max_tokens.unwrap_or(c.max_speech_tokens);
         gen.params.temperature = 0.0;
         gen.stop_token_ids = vec![c.stop_speech];
         // Every row is an overlay; the last (BOS) is also a decode embedding at `pos_base`, which
@@ -933,9 +971,17 @@ impl GuidedSpeech {
                     pos_base: Some(n as u32 - 1),
                     cfg: Some(CfgJob {
                         uncond_overlay: uncond,
-                        params: c.cfg(),
+                        params: crate::text::sample::CfgParams {
+                            temperature: sampling.temperature,
+                            top_p: sampling.top_p,
+                            repetition_penalty: sampling.repetition_penalty,
+                            cfg_weight: sampling.cfg_weight.unwrap_or(c.cfg_weight),
+                            ..c.cfg()
+                        },
                         history: vec![c.start_speech],
                         seed: Some(seed),
+                        uncond_ids: Vec::new(),
+                        uncond_overlay_pos: Vec::new(),
                     }),
                     // Streams only: a whole reply's first audio needs every token.
                     first_tokens: if class == JobClass::Critical {
@@ -943,6 +989,7 @@ impl GuidedSpeech {
                     } else {
                         0
                     },
+                    depth: None,
                 })),
                 prefix: None,
                 tenant: None,
@@ -959,19 +1006,12 @@ impl GuidedSpeech {
         voice: String,
         text: String,
         lang: Option<&str>,
+        sampling: &Sampling,
         seed: u64,
         reply: Reply,
         ids: &crate::serve::session::RequestIds,
         report: Option<crate::serve::session::Report>,
     ) -> std::result::Result<(), SpeechError> {
-        if !self.tables.voices().any(|v| v == voice) {
-            let mut known: Vec<_> = self.tables.voices().collect();
-            known.sort_unstable();
-            return Err(SpeechError::Invalid(
-                format!("unknown voice {voice:?}; voices: {}", known.join(", ")),
-                "voice",
-            ));
-        }
         let (respond, mut tokens) = crate::serve::stream::channel();
         let probe = match &reply {
             Reply::Stream(tx) => Some(tx.clone()),
@@ -983,7 +1023,9 @@ impl GuidedSpeech {
             JobClass::Normal
         };
         let job = self
-            .job(&voice, &text, lang, seed, class, respond, ids, report)
+            .job(
+                &voice, &text, lang, sampling, seed, class, respond, ids, report,
+            )
             .map_err(|e| SpeechError::Invalid(e.to_string(), "input"))?;
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let render = self.render.lock().clone();
@@ -1040,9 +1082,20 @@ impl GuidedSpeech {
         Ok(())
     }
 
-    /// The request's language as the packet's text rules resolve it (400 on an unsupported one).
-    pub fn language(&self, lang: Option<&str>) -> std::result::Result<Option<String>, String> {
-        self.tables.language(lang).map_err(|e| e.to_string())
+    /// Longest segment of `text` (in characters) for one generation: its text-token density
+    /// scaled to the packet's `text.segment_text_tokens`.
+    pub fn segment_chars(&self, text: &str, lang: Option<&str>) -> usize {
+        let budget = self
+            .c
+            .segment_text_tokens
+            .unwrap_or(SEGMENT_TEXT_TOKENS)
+            .max(1);
+        let chars = text.chars().count().max(1);
+        let tokens = self
+            .tables
+            .text_ids(text, lang)
+            .map_or(chars, |t| t.len().max(1));
+        (budget * chars / tokens).max(1)
     }
 
     pub async fn synthesize(
@@ -1051,6 +1104,7 @@ impl GuidedSpeech {
         voice: String,
         text: String,
         lang: Option<&str>,
+        sampling: &Sampling,
         seed: u64,
         ids: &crate::serve::session::RequestIds,
         report: Option<crate::serve::session::Report>,
@@ -1061,6 +1115,7 @@ impl GuidedSpeech {
             voice,
             text,
             lang,
+            sampling,
             seed,
             Reply::Whole(reply),
             ids,
@@ -1078,12 +1133,23 @@ impl GuidedSpeech {
         voice: String,
         text: String,
         lang: Option<&str>,
+        sampling: &Sampling,
         seed: u64,
         ids: &crate::serve::session::RequestIds,
         report: Option<crate::serve::session::Report>,
     ) -> std::result::Result<tokio::sync::mpsc::UnboundedReceiver<StreamEvent>, SpeechError> {
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
-        self.submit(mux, voice, text, lang, seed, Reply::Stream(tx), ids, report)?;
+        self.submit(
+            mux,
+            voice,
+            text,
+            lang,
+            sampling,
+            seed,
+            Reply::Stream(tx),
+            ids,
+            report,
+        )?;
         Ok(rx)
     }
 }

@@ -314,6 +314,8 @@ pub enum Activation {
     Clamp,
     ScaleShift,
     Relu,
+    /// [`packet::dev::ACT_SNAKE_BETA`]: unary only (its parameter is two arrays).
+    SnakeBeta,
 }
 
 impl Activation {
@@ -336,6 +338,7 @@ impl Activation {
             Activation::Clamp => ACT_CLAMP,
             Activation::ScaleShift => ACT_SCALE_SHIFT,
             Activation::Relu => ACT_RELU,
+            Activation::SnakeBeta => ACT_SNAKE_BETA,
         }
     }
 }
@@ -448,6 +451,9 @@ pub struct Conv1dF32Stage<'a> {
     /// which an ungrouped wgmma conv copies as its B operand; without it such a conv takes the
     /// other paths.
     pub weight_split: bool,
+    /// Flag bit 19: `alpha` is `[in_channels | out_channels]`, a snake input activation's
+    /// parameters then a snake output activation's (one conv applying both).
+    pub dual_alpha: bool,
 }
 
 /// The pre-split B operand of an ungrouped wgmma conv (flag bit 18), appended to its f32 weights
@@ -487,6 +493,34 @@ fn wgmma_weight_split_bytes(f32_bytes: u64, n: u32, k: u32) -> u64 {
 }
 
 impl Conv1dF32Stage<'_> {
+    /// A transposed conv the merged-phase wgmma path takes (flag bits 17 | 18; op_speech_f32.cuh
+    /// `spg_ct_eligible`).
+    pub fn convt_wgmma_ok(&self) -> bool {
+        self.wgmma
+            && self.split_bf16
+            && self.weight_tap_major
+            && !self.weight_f16
+            && self.groups == 1
+            && self.kernel == 2 * self.stride
+            && self.dilation_or_output_padding == 0
+            && self.input_activation == Activation::None
+            && self.output_activation == Activation::None
+            && self.alpha.is_none()
+            && self.residual.is_none()
+            && self.in_channels % 64 == 0
+            && self.out_channels % 64 == 0
+    }
+
+    /// `(n, k)` of the pre-split wgmma B operand: `[out][kernel * in]`, or a transposed conv's
+    /// merged phases `[stride * out][2 * in]`.
+    pub fn split_geometry(&self, transpose: bool) -> (u32, u32) {
+        if transpose {
+            (self.stride * self.out_channels, 2 * self.in_channels)
+        } else {
+            (self.out_channels, self.in_channels * self.kernel)
+        }
+    }
+
     /// Output rows per item, or `None` for an empty output.
     pub fn out_rows(&self, transpose: bool) -> Option<u32> {
         let (before, after) = (u64::from(self.pad_before), u64::from(self.pad_after));
@@ -592,6 +626,9 @@ pub struct AttentionF32Stage<'a> {
     pub key_length_heads: u32,
     /// Keys before each item's own: rows of a cached prefix block (see [`AttentionPrefix`]).
     pub prefix: Option<AttentionPrefix>,
+    /// Causal sliding window (flag bits 16..31): key `j` is visible from row `r` iff
+    /// `r - window < j <= r`; 0 = unbounded.
+    pub window: u32,
 }
 
 /// A key prefix for [`AttentionF32Stage`]: item `b` first attends to the `rows` rows of block
@@ -1387,11 +1424,18 @@ impl StageProgram {
             || !valid_activation(stage.input_activation)
             || !valid_activation(stage.output_activation)
             // One alpha tensor: a snake output activation reads it per output channel, so the
-            // input takes no activation.
-            || (stage.output_activation == Activation::Snake && stage.input_activation != Activation::None)
+            // input takes no activation unless bit 19 splits the tensor between two snakes.
+            || (stage.output_activation == Activation::Snake
+                && stage.input_activation != Activation::None
+                && !stage.dual_alpha)
+            || (stage.dual_alpha
+                && !(stage.input_activation == Activation::Snake
+                    && stage.output_activation == Activation::Snake
+                    && stage.alpha.is_some()))
+            || (stage.weight_split && transpose && !stage.convt_wgmma_ok())
             || (stage.weight_split
-                && (transpose
-                    || stage.groups != 1
+                && !transpose
+                && (stage.groups != 1
                     || stage.weight_f16
                     || !(stage.wgmma && stage.split_bf16)
                     || !(stage.kernel == 1 || stage.weight_tap_major)))
@@ -1417,11 +1461,8 @@ impl StageProgram {
             product(&[stage.out_channels, stage.in_channels / stage.groups, taps])?
                 * if stage.weight_f16 { 2 } else { 4 };
         if stage.weight_split {
-            weight_bytes = wgmma_weight_split_bytes(
-                weight_bytes,
-                stage.out_channels,
-                stage.in_channels * stage.kernel,
-            );
+            let (n, k) = stage.split_geometry(transpose);
+            weight_bytes = wgmma_weight_split_bytes(weight_bytes, n, k);
         }
         let weight = self.resolve(stage.weight, weight_bytes, "convolution weight")?;
         let bias = match stage.bias {
@@ -1430,12 +1471,15 @@ impl StageProgram {
             }
             None => packet::dev::TENSOR_NONE,
         };
+        let alpha_channels = if stage.dual_alpha {
+            stage.in_channels + stage.out_channels
+        } else {
+            stage.in_channels.max(stage.out_channels)
+        };
         let alpha = match stage.alpha {
-            Some(alpha) => self.resolve(
-                alpha,
-                u64::from(stage.in_channels.max(stage.out_channels)) * 4,
-                "convolution alpha",
-            )?,
+            Some(alpha) => {
+                self.resolve(alpha, u64::from(alpha_channels) * 4, "convolution alpha")?
+            }
             None => packet::dev::TENSOR_NONE,
         };
         if let Some(residual) = stage.residual {
@@ -1459,7 +1503,8 @@ impl StageProgram {
             | (u32::from(stage.split_bf16) << 14)
             | (u32::from(stage.weight_tap_major) << 15)
             | (u32::from(stage.wgmma && stage.split_bf16) << 17)
-            | (u32::from(stage.weight_split) << 18);
+            | (u32::from(stage.weight_split) << 18)
+            | (u32::from(stage.dual_alpha) << 19);
         let op = if transpose {
             DevOp::ConvTranspose1dF32
         } else {
@@ -1518,7 +1563,21 @@ impl StageProgram {
         self.input(x, bytes, "unary input")?;
         let output = self.resolve(stage.output, bytes, "unary output")?;
         let param = match stage.param {
-            Some(param) => self.resolve(param, u64::from(stage.width) * 4, "unary parameter")?,
+            Some(param) => {
+                let arrays = if stage.kind == Activation::SnakeBeta {
+                    2
+                } else {
+                    1
+                };
+                self.resolve(
+                    param,
+                    u64::from(stage.width) * 4 * arrays,
+                    "unary parameter",
+                )?
+            }
+            None if stage.kind == Activation::SnakeBeta => {
+                return Err("SnakeBeta needs its alpha/beta parameter".into())
+            }
             None => packet::dev::TENSOR_NONE,
         };
         let elements = product(&[stage.rows, stage.width])?;
@@ -1757,6 +1816,9 @@ impl StageProgram {
         if stage.key_length_heads != 0 && (!stage.relative || stage.q_rows <= 112) {
             return Err("attention key length groups: relative attention only".into());
         }
+        if stage.window != 0 && (!stage.causal || stage.window > 0xFFFF || stage.prefix.is_some()) {
+            return Err("attention window: causal, at most 65535 rows, no prefix".into());
+        }
         if let Some(p) = stage.prefix {
             if stage.bias.is_some() || stage.causal || p.rows == 0 {
                 return Err(
@@ -1832,7 +1894,8 @@ impl StageProgram {
                     | (u32::from(tc) << 1)
                     | (u32::from(stage.relative) << 2)
                     | (u32::from(stage.prefix.is_some_and(|p| p.h16)) << 4)
-                    | (stage.key_length_heads << 8),
+                    | (stage.key_length_heads << 8)
+                    | (stage.window << 16),
                 stage.prefix.map_or(stage.bias_head_stride, |p| p.rows),
             ];
             d.f[0] = stage.scale;
@@ -2193,6 +2256,49 @@ mod tests {
     use super::*;
 
     #[test]
+    fn convt_wgmma_split_geometry() {
+        let mut s = Conv1dF32Stage {
+            output: TensorRef::Named("o"),
+            weight: TensorRef::Named("w"),
+            bias: None,
+            alpha: None,
+            residual: None,
+            lengths: None,
+            batch: 2,
+            in_rows: 33,
+            in_channels: 1024,
+            out_channels: 512,
+            kernel: 16,
+            stride: 8,
+            dilation_or_output_padding: 0,
+            groups: 1,
+            pad_before: 4,
+            pad_after: 4,
+            pad_mode: PadMode::Zero,
+            input_activation: Activation::None,
+            output_activation: Activation::None,
+            slope: 0.0,
+            weight_f16: false,
+            split_bf16: true,
+            weight_tap_major: true,
+            wgmma: true,
+            weight_split: true,
+            dual_alpha: false,
+        };
+        assert!(s.convt_wgmma_ok());
+        assert_eq!(s.split_geometry(true), (8 * 512, 2 * 1024));
+        assert_eq!(s.split_geometry(false), (512, 16 * 1024));
+        s.input_activation = Activation::Snake;
+        assert!(!s.convt_wgmma_ok());
+        s.input_activation = Activation::None;
+        s.out_channels = 96;
+        assert!(!s.convt_wgmma_ok());
+        s.out_channels = 512;
+        s.kernel = 8;
+        assert!(!s.convt_wgmma_ok());
+    }
+
+    #[test]
     fn describes_backend_neutral_causal_pipeline() {
         let mut tensors = Builder::new(2);
         let tokens = tensors.tensor("in.ids", 512 * 4);
@@ -2497,6 +2603,7 @@ mod tests {
             weight_tap_major: false,
             wgmma: false,
             weight_split: false,
+            dual_alpha: false,
         };
         let mut p = prefix.program();
         let a = p
@@ -2669,6 +2776,7 @@ mod tests {
                 rows: pre,
                 h16,
             }),
+            window: 0,
         };
         assert!(p
             .attention_f32(h[0], h[0], h[0], &[f.done], attention(48, true))
@@ -2714,6 +2822,7 @@ mod tests {
                     relative: false,
                     key_length_heads: 0,
                     prefix: None,
+                    window: 0,
                 },
             )
             .unwrap()

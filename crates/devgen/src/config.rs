@@ -178,6 +178,39 @@ pub(crate) fn cfg_gpt_oss(v: &Value) -> GptOssCfg {
     c
 }
 
+/// A codec-frame input embedding (`EmbedFrameBf16`): a token in `lo..lo + rows` adds the
+/// `codebooks` rows `cb_table[k * cb_size + code_k]` from `in.frame_codes`, then divides by `div`.
+#[derive(Clone, Debug)]
+pub(crate) struct FrameEmbed {
+    pub(crate) table: String,
+    pub(crate) codebooks: u32,
+    pub(crate) cb_size: u32,
+    pub(crate) lo: u32,
+    pub(crate) rows: u32,
+    pub(crate) div: f32,
+    pub(crate) depth: Option<FishDepth>,
+}
+
+/// Fish S2's per-frame depth transformer (`fish.depth.*`): `positions` steps over a fresh KV,
+/// position 0 the backbone's final hidden, then one sampled codebook per later position.
+#[derive(Clone, Debug)]
+pub(crate) struct FishDepth {
+    pub(crate) layers: u32,
+    pub(crate) hidden: u32,
+    pub(crate) heads: u32,
+    pub(crate) kv_heads: u32,
+    pub(crate) head_dim: u32,
+    pub(crate) inter: u32,
+    pub(crate) eps: f32,
+    pub(crate) theta: f32,
+    pub(crate) positions: u32,
+    /// Breeze's depth decoder: inputs (backbone hidden, frame-table rows) projected from the
+    /// backbone width, its own RoPE tables, one fp32 head per position, fp32 backbone head and
+    /// `SampleSmallF32` sampling (weights `breeze.depth.*`).
+    pub(crate) breeze: bool,
+    pub(crate) rope_scale: RopeScale,
+}
+
 pub(crate) struct Cfg {
     pub(crate) arch: Arch,
     pub(crate) hidden: u32,
@@ -241,9 +274,27 @@ pub(crate) struct Cfg {
     pub(crate) kv_shared: u32,
     // Gemma-4 E2B doubles the dense MLP width on the trailing KV-shared layers (`use_double_wide_mlp`).
     pub(crate) double_wide_mlp: bool,
+    /// Rows of an untied `lm_head` when it emits fewer classes than the embedding table holds
+    /// (`plow_head_rows`: a speech LM whose prompt text embeds from the full vocabulary but whose
+    /// head covers only its audio tokens); 0: `vocab`.
+    pub(crate) head_rows: u32,
+    /// `plow_encoder`: a bidirectional text encoder (Breeze's T5Gemma2): prefill attention sees
+    /// every key of its segment within the window on both sides, and the head projects every row
+    /// into `act.enc_out` (`[rows][head_rows]`) instead of the last row's logits.
+    pub(crate) encoder: bool,
+    pub(crate) frame: Option<FrameEmbed>,
 }
 
 impl Cfg {
+    /// Classes the head emits: `head_rows` when set, else `vocab`.
+    pub(crate) fn out_vocab(&self) -> u32 {
+        if self.head_rows == 0 {
+            self.vocab
+        } else {
+            self.head_rows
+        }
+    }
+
     /// The layer whose KV cache layer `l` reads: itself, or (KV sharing) the last non-shared
     /// layer of the same attention type.
     pub(crate) fn kv_source(&self, l: usize) -> usize {
@@ -312,6 +363,65 @@ pub(crate) fn cfg_from(dir: &Path) -> Cfg {
         return cfg_modernbert(&v);
     }
     let mut c = cfg_llama_qwen(&v, arch);
+    // Breeze-style speech LM: prompt rows arrive as host overlay rows, generated frames embed as the
+    // sum of their codebook rows (`EmbedFrameBf16` over a zero token table).
+    if let Some(f) = v.get("plow_frame_embed") {
+        let g = |k: &str| {
+            f[k].as_u64()
+                .unwrap_or_else(|| panic!("plow_frame_embed.{k}")) as u32
+        };
+        assert!(
+            c.frame.is_none(),
+            "plow_frame_embed and fish_s2 are exclusive"
+        );
+        c.frame = Some(FrameEmbed {
+            table: f["table"].as_str().expect("plow_frame_embed.table").into(),
+            codebooks: g("codebooks"),
+            cb_size: g("codebook_size"),
+            lo: g("lo"),
+            rows: g("rows"),
+            div: f["div"].as_f64().map_or(1.0, |d| d as f32),
+            depth: f.get("depth").map(|d| {
+                let u = |k: &str| {
+                    d[k].as_u64()
+                        .unwrap_or_else(|| panic!("plow_frame_embed.depth.{k}"))
+                        as u32
+                };
+                let x = |k: &str| {
+                    d[k].as_f64()
+                        .unwrap_or_else(|| panic!("plow_frame_embed.depth.{k}"))
+                };
+                let s = &d["rope_scaling"];
+                assert_eq!(
+                    s["rope_type"], "llama3",
+                    "plow_frame_embed.depth.rope_scaling"
+                );
+                let sx = |k: &str| {
+                    s[k].as_f64()
+                        .unwrap_or_else(|| panic!("depth.rope_scaling.{k}"))
+                };
+                FishDepth {
+                    layers: u("layers"),
+                    hidden: u("hidden"),
+                    heads: u("heads"),
+                    kv_heads: u("kv_heads"),
+                    head_dim: u("head_dim"),
+                    inter: u("intermediate"),
+                    eps: x("eps") as f32,
+                    theta: x("rope_theta") as f32,
+                    positions: u("positions"),
+                    breeze: true,
+                    rope_scale: RopeScale::Llama3 {
+                        factor: sx("factor"),
+                        low: sx("low_freq_factor"),
+                        high: sx("high_freq_factor"),
+                        orig: sx("original_max_position_embeddings"),
+                    },
+                }
+            }),
+        });
+        c.encoder_overlay_rows = g("overlay_rows");
+    }
     if let Some(t3) = v.get("chatterbox_t3") {
         c.encoder_overlay_rows = t3["overlay_rows"]
             .as_u64()
@@ -434,6 +544,9 @@ fn cfg_gemma(v: &Value, flat: bool) -> Cfg {
         ple: t["hidden_size_per_layer_input"].as_u64().unwrap_or(0) as u32,
         kv_shared: t["num_kv_shared_layers"].as_u64().unwrap_or(0) as u32,
         double_wide_mlp: t["use_double_wide_mlp"].as_bool().unwrap_or(false),
+        head_rows: 0,
+        encoder: false,
+        frame: None,
     };
     if c.moe {
         crate::require_moe_topk(c.top_k, "gemma4 (enable_moe_block)");
@@ -543,6 +656,9 @@ fn cfg_gemma3(v: &Value) -> Cfg {
         ple: 0,
         kv_shared: 0,
         double_wide_mlp: false,
+        head_rows: v["plow_head_rows"].as_u64().map_or(0, |r| r as u32),
+        encoder: v["plow_encoder"].as_bool().unwrap_or(false),
+        frame: None,
     }
 }
 
@@ -627,6 +743,42 @@ fn cfg_llama_qwen(v: &Value, arch: Arch) -> Cfg {
         ple: 0,
         kv_shared: 0,
         double_wide_mlp: false,
+        head_rows: v["plow_head_rows"].as_u64().map_or(0, |r| r as u32),
+        encoder: false,
+        frame: v.get("fish_s2").map(|f| {
+            let g = |k: &str| f[k].as_u64().unwrap_or_else(|| panic!("fish_s2.{k}")) as u32;
+            FrameEmbed {
+                table: "fish.codebook_embed.weight".into(),
+                codebooks: g("codebooks"),
+                cb_size: g("codebook_size"),
+                lo: g("semantic_base"),
+                rows: g("semantic_tokens"),
+                div: (1.0 / f["frame_scale"].as_f64().expect("fish_s2.frame_scale")) as f32,
+                depth: Some({
+                    let d = &f["depth"];
+                    let u = |k: &str| {
+                        d[k].as_u64().unwrap_or_else(|| panic!("fish_s2.depth.{k}")) as u32
+                    };
+                    let x = |k: &str| {
+                        d[k].as_f64().unwrap_or_else(|| panic!("fish_s2.depth.{k}")) as f32
+                    };
+                    assert!(d["qk_norm"] != true, "fish_s2.depth.qk_norm is unsupported");
+                    FishDepth {
+                        layers: u("layers"),
+                        hidden: u("hidden"),
+                        heads: u("heads"),
+                        kv_heads: u("kv_heads"),
+                        head_dim: u("head_dim"),
+                        inter: u("intermediate"),
+                        eps: x("eps"),
+                        theta: x("rope_theta"),
+                        positions: u("positions"),
+                        breeze: false,
+                        rope_scale: RopeScale::None,
+                    }
+                }),
+            }
+        }),
     }
 }
 
@@ -687,6 +839,9 @@ fn cfg_bert(v: &Value) -> Cfg {
         ple: 0,
         kv_shared: 0,
         double_wide_mlp: false,
+        head_rows: 0,
+        encoder: false,
+        frame: None,
     }
 }
 
@@ -759,6 +914,9 @@ fn cfg_modernbert(v: &Value) -> Cfg {
         ple: 0,
         kv_shared: 0,
         double_wide_mlp: false,
+        head_rows: 0,
+        encoder: false,
+        frame: None,
     }
 }
 

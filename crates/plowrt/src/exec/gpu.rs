@@ -84,6 +84,8 @@ mod decode_context;
 mod decode_object;
 use decode_object::{BoundDecodeObject, DecodeModule};
 mod decode_rung;
+mod fish_depth;
+pub use fish_depth::{FishInfo, FishRow};
 mod gen_decode;
 mod mixed_step;
 mod moe_lt;
@@ -2555,6 +2557,8 @@ pub struct GpuEngine {
     qwen_prefill: Option<crate::device::cuda::qwen_gdn::NativeGdn>,
     /// The packet carries `act.mm_span` (bidirectional media spans): chunks must not split them.
     mm_spans: bool,
+    /// An encoder-mode packet (`act.enc_out`, bidirectional): a prompt is one launch, never split.
+    encoder: bool,
     packet_roles: [Option<PacketRole>; plow_asset::segment_roles::MAX_ROLE as usize],
     decode_packet_roles: Vec<u8>,
     cublaslt_decode: Vec<Option<LibraryRoute>>,
@@ -2795,6 +2799,10 @@ pub struct GpuEngine {
     /// Bytes of every batch-major `kv.*` tensor one cache row takes (static per-slot KV).
     kv_row_bytes: u64,
     slot_generations: Vec<u32>,
+    /// Fish S2 depth stage ([`fish_depth`]); `None` for every other packet.
+    fish: Option<fish_depth::FishDepth>,
+    /// The serial prefill's last chunk's terminal row (its lm_head row of `act.hn`).
+    pf_terminal_row: u32,
 }
 
 /// Full model-load wall timeline (`PLOW_LOAD_PROFILE=1`).
@@ -4800,6 +4808,7 @@ impl GpuEngine {
                     )));
                 }
                 if !packet_cache
+                    && td.init.is_none()
                     && is_checkpoint_tensor(i, &td.name, packed_prefill_metadata.as_ref())
                 {
                     let src = ckpt.tensor(&td.name).ok_or_else(|| {
@@ -7247,6 +7256,7 @@ impl GpuEngine {
             seg_pf,
             qwen_prefill,
             mm_spans: false,
+            encoder: false,
             packet_roles,
             cublaslt_decode,
             cublaslt_decode_graph: None,
@@ -7366,9 +7376,13 @@ impl GpuEngine {
                 .checked_div(batch as u64 * (blob.tensors[t_pos].bytes / 4))
                 .unwrap_or(0),
             slot_generations: vec![0; batch],
+            fish: None,
+            pf_terminal_row: 0,
         };
         engine.mm_spans = engine.handle_of("act.mm_span").is_some();
+        engine.encoder = engine.handle_of("act.enc_out").is_some();
         engine.packed_terminal = packed_terminal::PackedTerminal::load(&engine)?;
+        engine.fish = fish_depth::FishDepth::load_if_present(&engine, &blob, &raw)?;
         engine.shared_tail =
             shared_tail::SharedTail::load(&engine, &blob, kv_shared_tail_metadata.as_ref())?;
         engine.token_batch = token_batch::CudaTokenBatch::load(&engine);
@@ -11478,6 +11492,13 @@ impl GpuEngine {
         if n_allowed == 0 {
             return smallest;
         }
+        if self.encoder {
+            // Past the widest allowed rung the launch splits and `prefill_chunk` reports Progress.
+            return self.prefill[..n_allowed]
+                .iter()
+                .position(|b| b.t as usize >= rem)
+                .unwrap_or(n_allowed - 1);
+        }
         // NO top-rung shortcut: "largest rung that still fills" is not optimal. Under a
         // 4224-row top rung an 8192-row prompt takes [4224, 3968->4096] = 128 padded rows,
         // where [4096, 4096] is the same two launches with none. The DP below already
@@ -11609,6 +11630,7 @@ impl GpuEngine {
         }
         // Patch this bucket's instruction stream for the chunk, then enqueue
         // the covering window as an async H2D on the engine stream.
+        self.pf_terminal_row = (real - 1) as u32;
         {
             let b = &mut self.prefill[bi];
             for &ix in &b.rope_sites {

@@ -1,0 +1,111 @@
+# Breeze TTS 2 (BreezeBlue/Breeze-TTS-2) on H100: a Qwen3-shaped backbone over a 2049-class head
+# (cb0 codes + EOS) whose every prompt row is a T5Gemma2 text-encoder row (the `text_encoder/`
+# sub-bundle, a bidirectional encoder-mode Gemma3 packet), a 12-layer depth stage sampling the 15
+# residual codebooks inside one cooperative aux program per decode rung (SampleSmallF32: penalty,
+# top-k, nucleus; CFG pairs), and the Qwen3-TTS-Tokenizer-12Hz decoder lowered to codec.pkt
+# (SnakeBeta, 24 kHz). Served through the standard speech API (`breeze` speech profile:
+# instructions = voice design, cfg_weight = CFG scale - 1). Weights are under a non-commercial
+# license.
+#
+#   PLOW_CAMPAIGN_NO_NIX=1 (this box only) PYREF=<python with torch + safetensors> \
+#   python3 scripts/campaign/campaign.py build recipes/infervisor/breeze-tts-2/sm90a-h100-tp1.toml --out <fresh dir>
+#
+# Gates: text encoder vs an FP32 CPU replay of the official encoder (1.0-1.2% rel-L2; the official
+# bf16 run is 1.5%), backbone/depth teacher-forced vs the official goldens (breeze_gen), codec PCM
+# vs an FP64 CPU decode (7e-4), Whisper CER of served speech.
+
+schema = "plow.recipe.v1"
+namespace = "infervisor"
+name = "breeze-tts-2"
+label = "sm90a-h100-tp1"
+plow_git = "9f5babb0f27cf7d1abd1aadc255915c06883b853"
+network = "qwen3"
+doc = "docs/runtime/tts.md"
+tracker = "docs/runtime/h100-speech-recipes.md"
+
+[target]
+vendor = "nvidia"
+isa = "sm_90a"
+sku = "H100 SXM5"
+units = 132
+num_gpus = 1
+parallel = "tp"
+
+[checkpoint]
+source = "hf:BreezeBlue/Breeze-TTS-2"
+revision = "3e28c5151381a722f1d8661b4118c298caa77aa4"
+
+[cell]
+name = "breeze-tts-2-h100"
+hf_dir = "{out}/prep/backbone"
+gpu = "h100"
+arch = "sm_90a"
+n_cu = 132
+n_gpu = 1
+max_ctx = 2048
+
+[[prep]]
+name = "backbone-checkpoint"
+script = "scripts/tts/breeze_prep.py"
+python = "{env:PYREF}"
+args = ["{out}/prep/backbone", "3e28c5151381a722f1d8661b4118c298caa77aa4"]
+
+[[prep]]
+name = "text-encoder-checkpoint"
+script = "scripts/tts/breeze_enc_prep.py"
+python = "{env:PYREF}"
+args = ["{out}/prep/encoder", "3e28c5151381a722f1d8661b4118c298caa77aa4"]
+
+[[prep]]
+name = "codec-export"
+script = "scripts/tts/breeze_codec_export.py"
+python = "{env:PYREF}"
+args = ["{out}/prep/codec", "3e28c5151381a722f1d8661b4118c298caa77aa4"]
+
+[emit]
+emit = "devblob+cubin"
+args = ["--served-name", "breeze-tts-2"]
+[emit.env]
+PLOW_TTS_PROFILE = "breeze"
+PLOW_TTS_CODEC_DIR = "{out}/prep/codec"
+PLOW_VERIFY_BIN = "{repo}/lean-plow/.lake/build/bin/plow_verify"
+PLOW_EMIT_SNAC_SPLIT_BF16 = "1"
+# Every prompt row is an encoder row (prompts ~20-500 rows); decode up to 64 concurrent streams.
+PLOW_MAX_CHUNK = "512"
+PLOW_PF_LADDER_APPEND = "64,256"
+PLOW_DECODE_BATCH_LADDER = "1,2,4,8,16,32,48,64"
+# Fish S2 Pro's measured Qwen3 decode set (same backbone family).
+PLOW_EMIT_DECODE_CUBLASLT = "1"
+PLOW_EMIT_DECODE_CUBLASLT_MIN_ROWS = "48"
+PLOW_NV_FA_FOLD = "1"
+PLOW_NO_GLU_FUSE = "1"
+PLOW_FUSE_KV_HNR = "1"
+PLOW_NV_DENSE_TUNE = "1"
+
+# The T5Gemma2 text encoder: one bidirectional launch per text segment (FlashPrefill span arm,
+# PLOW_NV_FA_PIPE=0), every row through the projector head. Gemma production prefill defaults
+# (cuBLASLt prefill) do not apply to an encoder.
+[[sub_emit]]
+name = "text_encoder"
+hf_dir = "{out}/prep/encoder"
+max_ctx = 512
+args = ["--served-name", "breeze-tts-2-text-encoder"]
+[sub_emit.env]
+PLOW_VERIFY_BIN = "{repo}/lean-plow/.lake/build/bin/plow_verify"
+PLOW_EMIT_PREFILL_CUBLASLT = "0"
+PLOW_MAX_CHUNK = "512"
+PLOW_PF_LADDER_APPEND = "64,128,256"
+
+[bench]
+kind = "speech"
+client = "scripts/tts/tts_bench.py"
+arms = ["--conc 1 --stream --wav --n 16 --prompt-set chatterbox --voice S0", "--conc 1 --n 16 --prompt-set chatterbox --voice S0 --tag full_c1", "--conc 8 --stream --n 32 --prompt-set chatterbox --voice S0", "--conc 32 --stream --n 64 --prompt-set chatterbox --voice S0", "--conc 64 --stream --n 128 --prompt-set chatterbox --voice S0"]
+
+[gates]
+python = "{env:PYREF}"
+[gates.tts_cer]
+arms = ["--conc 1 --stream --wav --n 16 --prompt-set chatterbox --voice S0", "--conc 32 --stream --wav --n 64 --prompt-set chatterbox --voice S0"]
+cer_median_max = 0.1
+
+[serve]
+env = { PLOW_VMM_PREFIX = "1" }

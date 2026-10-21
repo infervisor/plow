@@ -122,6 +122,30 @@ impl Window {
     }
 }
 
+static DEPTH: std::sync::Mutex<(u64, u64, u64, u64)> = std::sync::Mutex::new((0, 0, 0, 0));
+
+/// One depth-stage step over `rows` rows on a program covering `width` slots.
+pub fn depth_step(t: Duration, rows: usize, width: usize) {
+    let mut d = DEPTH.lock().unwrap();
+    *d = (
+        d.0 + 1,
+        d.1 + t.as_nanos() as u64,
+        d.2 + rows as u64,
+        d.3 + width as u64,
+    );
+    if d.0 == WINDOW {
+        let n = d.0 as f64;
+        tracing::info!(
+            steps = d.0,
+            depth_us = format!("{:.1}", d.1 as f64 / n / 1e3),
+            rows = format!("{:.2}", d.2 as f64 / n),
+            width = format!("{:.2}", d.3 as f64 / n),
+            "HOSTT depth"
+        );
+        *d = (0, 0, 0, 0);
+    }
+}
+
 /// Engine thread: a request's first output token was just handed to its stream.
 pub fn first_token(prompt: usize, since_submit: Duration) {
     tracing::info!(

@@ -490,6 +490,7 @@ impl SharedAsr {
                     pos_base: None,
                     cfg: None,
                     first_tokens: 0,
+                    depth: None,
                 })),
                 prefix: None,
                 tenant: None,

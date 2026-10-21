@@ -2258,8 +2258,8 @@ fn build_cubin_from_manifest(
         args.push("-DPLOW_SM120_CUBIN_SEG=ON".into());
     }
     // A required hd128 GQA grouping is correctness (the kernel traps on GF not dividing gqa).
-    // The Qwen GDN arms have no CMake option; without the define the prefill object reports
-    // `plow_qwen_prefill_arm = 0` and plowrt refuses the packet.
+    // The Qwen GDN arms, the Gemma3 (1 + w) norm and the span-attention staging (FA_PIPE=0)
+    // have no CMake option; without the define plowrt refuses the packet at load.
     let mut extra: Vec<String> = req
         .iter()
         .filter(|d| {
@@ -2273,6 +2273,8 @@ fn build_cubin_from_manifest(
                 || d.starts_with("PLOW_NV_QUANT_FP8_VLLM=")
                 || d.starts_with("PLOW_NV_TMA_GEMM=")
                 || d.starts_with("PLOW_NV_FP8_PF_SCALE_WFIRST=")
+                || d.starts_with("PLOW_NV_GEMMA3=")
+                || d.starts_with("PLOW_NV_FA_PIPE=")
         })
         .map(|d| format!("-D{d}"))
         .collect();

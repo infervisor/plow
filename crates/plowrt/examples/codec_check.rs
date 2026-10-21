@@ -1,4 +1,5 @@
 //! Decode codes through an asset's `codec.pkt`: `codec_check ASSETS CODES.i32 FRAMES SEED OUT.f32`
+//! (ASSETS may name the `.pkt` itself, for an asset emitted without a speech pipeline).
 //! (CODES.i32 = [items][frames][frame_codes] little-endian i32; items = file size / frame bytes).
 
 #[cfg(not(feature = "cuda"))]
@@ -13,9 +14,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     if args.len() != 6 {
         return Err("usage: codec_check ASSETS CODES.i32 FRAMES SEED OUT.f32".into());
     }
-    let codec = std::sync::Arc::new(plowrt::tts::codec::Codec::load(std::path::Path::new(
-        &args[1],
-    ))?);
+    let assets = std::path::Path::new(&args[1]);
+    let codec = std::sync::Arc::new(if assets.extension().is_some_and(|e| e == "pkt") {
+        plowrt::tts::codec::Codec::load_packet(assets)?
+    } else {
+        plowrt::tts::codec::Codec::load(assets)?
+    });
     let frames: usize = args[3].parse()?;
     let seed: u64 = args[4].parse()?;
     let raw = std::fs::read(&args[2])?;

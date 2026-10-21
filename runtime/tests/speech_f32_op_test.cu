@@ -590,6 +590,7 @@ struct ConvSpec {
     bool wide = false; /* flags bit 14: split-bf16 wide tiles */
     bool tapmajor = false; /* flags bit 15: weights [cout][kernel][cin/groups] */
     bool wg = false; /* flags bit 17: the wgmma arm of the pointwise wide tile (sm_90a) */
+    bool dual = false; /* flags bit 19: alpha [cin | cout], an input then an output snake */
 };
 
 static unsigned conv_out_rows(const ConvSpec& s, bool transpose) {
@@ -649,10 +650,12 @@ static void build_conv(Case& c, const ConvSpec& s, bool transpose, unsigned& o) 
                 for (unsigned k = 0; k < s.kernel; k++)
                     memcpy(&c.host[w][(((size_t)o * s.kernel + k) * cg + i) * es], &src[(((size_t)o * cg + i) * s.kernel + k) * es], es);
     }
-    const bool wsplit = s.wg && !transpose && s.groups == 1 && !s.f16;
-    if (wsplit) append_wsplit(c.host[w], s.cout, s.cin * s.kernel);
+    /* ConvTranspose: the merged-phase image [stride*cout][2*cin] of phase-major weights. */
+    const bool wsplit = s.wg && s.groups == 1 && !s.f16 && (!transpose || (s.tapmajor && s.kernel == 2 * s.stride));
+    if (wsplit && transpose) append_wsplit(c.host[w], s.stride * s.cout, 2 * s.cin);
+    else if (wsplit) append_wsplit(c.host[w], s.cout, s.cin * s.kernel);
     unsigned b = s.bias ? c.f32(s.cout, 0.2f) : PLOW_TENSOR_NONE;
-    unsigned a = s.alpha ? c.f32(std::max(s.cin, s.cout), 0.4f, 0.6f) : PLOW_TENSOR_NONE;
+    unsigned a = s.alpha ? c.f32(s.dual ? s.cin + s.cout : std::max(s.cin, s.cout), 0.4f, 0.6f) : PLOW_TENSOR_NONE;
     unsigned r = s.residual ? c.f32((size_t)s.batch * out_rows * s.cout, 1.f) : PLOW_TENSOR_NONE;
     unsigned l = s.lengths.empty() ? PLOW_TENSOR_NONE : c.u32(s.lengths);
     if (s.row_scale) c.in.t[7] = c.f32((size_t)s.batch * out_rows, 1.f);
@@ -662,7 +665,8 @@ static void build_conv(Case& c, const ConvSpec& s, bool transpose, unsigned& o) 
     c.in.i[4] = s.kernel; c.in.i[5] = s.stride; c.in.i[6] = s.dil_or_opad; c.in.i[7] = s.groups;
     c.in.fj[0].f = s.slope; c.in.fj[1].u = pads(s.before, s.after);
     c.in.fj[2].u = conv_flags(s.mode, s.pre, s.post, s.f16) | (s.tc ? 1u << 13 : 0u) | (s.wide ? 1u << 14 : 0u) |
-                   (s.tapmajor ? 1u << 15 : 0u) | (s.wg ? 1u << 17 : 0u) | (wsplit ? 1u << 18 : 0u);
+                   (s.tapmajor ? 1u << 15 : 0u) | (s.wg ? 1u << 17 : 0u) | (wsplit ? 1u << 18 : 0u) |
+                   (s.dual ? 1u << 19 : 0u);
 }
 
 static void t_conv1d(const char* name, const ConvSpec& s, double tol = 2e-5) {
@@ -1413,6 +1417,23 @@ int main(int argc, char** argv) {
         t_conv1d("Conv1dF32 row_scale ffma pointwise +res", rs[1]);
         t_conv1d("Conv1dF32 row_scale depthwise snake +res", rs[2]);
     }
+    {
+        /* SNAC residual unit: the depthwise conv applies the pointwise conv's snake too (bit 19). */
+        for (unsigned dil : {1u, 3u, 9u}) {
+            char name[64];
+            snprintf(name, sizeof(name), "Conv1dF32 depthwise k7 d%u snake->snake dual len", dil);
+            ConvSpec d = {2, 2048, 512, 512, 7, 1, dil, 512, 3 * dil, 3 * dil, 0, 12, 12, false, true, true, false,
+                          {2048, 1501}, 0.f};
+            d.dual = true;
+            t_conv1d(name, d);
+        }
+        ConvSpec r = {2, 300, 64, 64, 7, 1, 3, 64, 9, 9, 0, 12, 12, false, true, true, true, {300, 211}, 0.f};
+        r.dual = true;
+        t_conv1d("Conv1dF32 depthwise snake->snake dual +res", r);
+        ConvSpec t = {2, 257, 64, 96, 3, 1, 1, 1, 1, 1, 0, 12, 12, false, true, true, false, {257, 100}, 0.f, true};
+        t.dual = true;
+        t_conv1d("Conv1dF32 dense k3 snake->snake dual tc", t);
+    }
     t_attention("AttentionF32 tc 8x64 2x1200 lengths", 2, 1200, 8, 64, {1200, 1000}, false, false, false, true);
     t_attention("AttentionF32 tc 8x64 causal bias fused", 2, 300, 8, 64, {300, 217}, true, true, true, true);
     t_attention("AttentionF32 tc 4x64 ragged rows", 1, 77, 4, 64, {}, false, false, false, true);
@@ -1472,6 +1493,32 @@ int main(int argc, char** argv) {
         ConvSpec g8{2, 300, 256, 4 * 68, 1, 1, 1, 4, 0, 0, 0, 0, 0, false, true, false, true, {300, 123}, 0.f, true};
         g8.wide = g8.wg = true;
         t_conv1d("Conv1dF32 wgmma grouped pointwise g4 +res len", g8, 1e-4);
+        /* Merged-phase ConvTranspose1d (kernel 2*stride, phase-major): SNAC's four upsamplers,
+         * Fish's causal crop, T=1, lengths 0/1/T-1, no bias. */
+        struct CT { const char* name; ConvSpec s; };
+        const CT cts[] = {
+            {"ConvT wgmma s8 1024->512 crop4 len", {2, 33, 1024, 512, 16, 8, 0, 1, 4, 4, 0, 0, 0, false, true, false, false, {33, 17}, 0.f, true}},
+            {"ConvT wgmma s8 512->256 T1", {4, 1, 512, 256, 16, 8, 0, 1, 4, 4, 0, 0, 0, false, true, false, false, {}, 0.f, true}},
+            {"ConvT wgmma s4 256->128 len 0/1/T-1", {4, 200, 256, 128, 8, 4, 0, 1, 2, 2, 0, 0, 0, false, true, false, false, {200, 0, 1, 199}, 0.f, true}},
+            {"ConvT wgmma s2 128->64 len", {2, 1000, 128, 64, 4, 2, 0, 1, 1, 1, 0, 0, 0, false, true, false, false, {1000, 513}, 0.f, true}},
+            {"ConvT wgmma s8 causal 512->256 nobias", {3, 64, 512, 256, 16, 8, 0, 1, 0, 8, 0, 0, 0, false, false, false, false, {64, 63, 5}, 0.f, true}},
+            {"ConvT wgmma s4 big M 256->128", {32, 257, 256, 128, 8, 4, 0, 1, 2, 2, 0, 0, 0, false, true, false, false, {}, 0.f, true}},
+        };
+        /* The GPU reads a weight copy whose f32 part is NaN (golden keeps the clean one), so a
+         * fallback off the split image fails. */
+        for (const CT& t : cts) {
+            ConvSpec g = t.s;
+            g.wide = g.tapmajor = g.wg = true;
+            Case c; unsigned o;
+            build_conv(c, g, true, o);
+            const PlowDevInst ref = c.in;
+            const unsigned w = c.in.t[2], wp = c.add(c.host[w].size());
+            c.host[wp] = c.host[w];
+            const float nan = NAN;
+            for (size_t i = 0; i < (size_t)g.stride * g.cout * 2 * g.cin; i++) memcpy(&c.host[wp][i * 4], &nan, 4);
+            c.in.t[2] = wp;
+            run(t.name, c, g_conv_transpose1d_f32, {o}, FP32, 1e-4, 0, nullptr, &ref);
+        }
 #endif
         ConvSpec w7{2, 300, 64, 64, 7, 1, 3, 1, 9, 9, 0, 0, 12, false, true, true, true, {300, 170}, 0.f, true};
         t_conv1d("Conv1dF32 k7 snake-out +res (64x64 tiles)", w7);

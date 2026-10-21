@@ -14,6 +14,13 @@
       "toolchain": "leanprover/lean4:v4.15.0",
       "commit": "lean-correctness",
       "note": "dispatch table, proof audit, media_geometry.v1, kv_ring.v1, vmm_trace.v1, speech_fusion.v1"
+    },
+    {
+      "sha256": "af355f94208f0c83ec0e6fd49ad76ee8f7eb286422ce15b147139199e6763729",
+      "lean_sources_sha256": "0e576faf8cd7aa773e51cf6d12b3ad1a5f0c577f1e8575d7ca88ced12ef0f3dc",
+      "toolchain": "leanprover/lean4:v4.15.0",
+      "commit": "tts-api-std",
+      "note": "codec_lm audio_tokens (depth-stage LMs: stop tokens inside the codebook); user-approved 2026-10-21"
     }
   ]
 }
