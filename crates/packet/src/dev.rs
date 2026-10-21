@@ -2450,6 +2450,17 @@ pub enum DevOp {
     /// t6=force(u32, out's layout)? t7=eidx(u32[rows])?` · `i0=rows i1=vocab i2=out_stride
     /// i3=out_col0 i4=coord i5=bitmap_words i7=logit_stride` · `j0=eidx_offset`.
     SampleSmallF32 = 221,
+    /// FP32 stream tail: the last `L` rows a streaming stage carries between chunks, per slot.
+    /// Gather (mode 0) builds `z(f32[B][L+N][Cz])`: rows `[0, L)` hold `state[slot[b]]` in
+    /// columns `[zc0, zc0+C)` (zeros when `pos[b] == 0`, a fresh stream) and zeros elsewhere;
+    /// row `L + r` is `src[(b*N + r)*src_stride ..][..Cz]`. Store (mode 1) reads only `z`:
+    /// `state[slot[b]][i] = z[b][n[b] + i][zc0..zc0+C]` for `i < L`, the tail after `n[b]` new rows.
+    /// `slot[b] >= slots` or `n[b] > N` traps.
+    /// Store takes no `z` output or `pos`; its `src` is `z`.
+    /// `t0=z(f32)|NONE t1=src(f32) t2=state(f32[slots][L][C]) t3=slot(u32[B]) t4=n(u32[B])
+    /// t5=pos(u32[B])?` ·
+    /// `i0=B i1=L i2=N i3=C i4=Cz i5=zc0 i6=src_stride i7=mode` · `j0=slots`.
+    StreamTailF32 = 222,
 }
 
 /// [`DevOp::FlashPrefillFp8`]'s split count (`i7` low half).
@@ -2737,6 +2748,7 @@ impl DevOp {
         DevOp::SampleFishBf16,
         DevOp::GemvF32Out,
         DevOp::SampleSmallF32,
+        DevOp::StreamTailF32,
     ];
 
     /// Recover the opcode from its wire discriminant, or `None` for a value no
@@ -2979,6 +2991,7 @@ impl DevOp {
             DevOp::SampleFishBf16 => "PLOW_DOP_SAMPLE_FISH_BF16",
             DevOp::GemvF32Out => "PLOW_DOP_GEMV_F32_OUT",
             DevOp::SampleSmallF32 => "PLOW_DOP_SAMPLE_SMALL_F32",
+            DevOp::StreamTailF32 => "PLOW_DOP_STREAM_TAIL_F32",
         }
     }
 
@@ -3042,7 +3055,8 @@ impl DevOp {
     /// 218 -> 219 for `EmbedFrameBf16 = 218` (Fish S2 codec-frame input embedding).
     /// 219 -> 220 for `SampleFishBf16 = 219` (Fish S2 in-program sampling).
     /// 220 -> 222 for `GemvF32Out = 220`, `SampleSmallF32 = 221` (Breeze TTS depth stage).
-    pub const COUNT: u16 = 222;
+    /// 222 -> 223 for `StreamTailF32 = 222` (stateful streaming codec windows).
+    pub const COUNT: u16 = 223;
 
     /// The `(M, N, K, quant)` a decode-GEMV opcode carries, or `None` if this is not one.
     ///

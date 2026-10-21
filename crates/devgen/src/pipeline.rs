@@ -410,6 +410,35 @@ pub struct CopyColsF32Stage<'a> {
     pub out_offset: u32,
 }
 
+/// [`DevOp::StreamTailF32`] mode.
+#[derive(Clone, Copy)]
+pub enum StreamTailF32Mode<'a> {
+    /// `output` = `z`: the carried tail (zeros on a fresh stream) then `rows` source rows.
+    Gather {
+        output: TensorRef<'a>,
+        src: u32,
+        pos: u32,
+        src_stride: u32,
+    },
+    /// The state takes `z` rows `[n[b], n[b] + tail)`.
+    Store { z: u32 },
+}
+
+#[derive(Clone, Copy)]
+pub struct StreamTailF32Stage<'a> {
+    pub mode: StreamTailF32Mode<'a>,
+    pub state: TensorRef<'a>,
+    pub slot: u32,
+    pub n: u32,
+    pub items: u32,
+    pub slots: u32,
+    pub tail: u32,
+    pub rows: u32,
+    pub cols: u32,
+    pub z_cols: u32,
+    pub z_col0: u32,
+}
+
 /// [`DevOp::Conv1dF32`] (`transpose == false`) or [`DevOp::ConvTranspose1dF32`]. For the
 /// transpose, `dilation_or_output_padding` is the output padding and the pads are crops.
 #[derive(Clone, Copy)]
@@ -1388,6 +1417,88 @@ impl StageProgram {
             ];
             d.j = [stage.in_item_stride, stage.out_item_stride];
         })
+    }
+
+    /// [`DevOp::StreamTailF32`]: the emitted output is `z` (gather) or the state (store).
+    pub fn stream_tail_f32(
+        &mut self,
+        deps: &[u32],
+        stage: StreamTailF32Stage<'_>,
+    ) -> Result<Emitted, String> {
+        if stage.items == 0
+            || stage.slots == 0
+            || stage.tail == 0
+            || stage.rows == 0
+            || stage.cols == 0
+            || u64::from(stage.z_col0) + u64::from(stage.cols) > u64::from(stage.z_cols)
+        {
+            return Err("invalid stream-tail geometry".into());
+        }
+        let state_bytes = f32_bytes(product(&[stage.slots, stage.tail, stage.cols])?)?;
+        let state = self.resolve(stage.state, state_bytes, "stream-tail state")?;
+        let per_item = u64::from(stage.items) * 4;
+        self.input(stage.slot, per_item, "stream-tail slots")?;
+        self.input(stage.n, per_item, "stream-tail new rows")?;
+        let z_rows = stage
+            .tail
+            .checked_add(stage.rows)
+            .ok_or("stream-tail rows overflow")?;
+        let z_elements = product(&[stage.items, z_rows, stage.z_cols])?;
+        let z_bytes = f32_bytes(z_elements)?;
+        let ints = |src_stride, mode| {
+            [
+                stage.items,
+                stage.tail,
+                stage.rows,
+                stage.cols,
+                stage.z_cols,
+                stage.z_col0,
+                src_stride,
+                mode,
+            ]
+        };
+        match stage.mode {
+            StreamTailF32Mode::Gather {
+                output,
+                src,
+                pos,
+                src_stride,
+            } => {
+                self.input(pos, per_item, "stream-tail positions")?;
+                let span = (product(&[stage.items, stage.rows])? - 1) * u64::from(src_stride)
+                    + u64::from(stage.z_cols);
+                self.input(src, f32_bytes(span)?, "stream-tail source")?;
+                let z = self.resolve(output, z_bytes, "stream-tail output")?;
+                let elements = u32_elements(z_elements, "stream-tail gather")?;
+                self.emit(
+                    DevOp::StreamTailF32,
+                    u64::from(elements).div_ceil(2048),
+                    deps,
+                    z,
+                    |d| {
+                        d.t[..6].copy_from_slice(&[z, src, state, stage.slot, stage.n, pos]);
+                        d.i = ints(src_stride, 0);
+                        d.j = [stage.slots, 0];
+                    },
+                )
+            }
+            StreamTailF32Mode::Store { z } => {
+                self.input(z, z_bytes, "stream-tail z")?;
+                let elements = product(&[stage.items, stage.tail, stage.cols])?;
+                u32_elements(elements, "stream-tail store")?;
+                self.emit(
+                    DevOp::StreamTailF32,
+                    elements.div_ceil(2048),
+                    deps,
+                    state,
+                    |d| {
+                        d.t[1..5].copy_from_slice(&[z, state, stage.slot, stage.n]);
+                        d.i = ints(0, 1);
+                        d.j = [stage.slots, 0];
+                    },
+                )
+            }
+        }
     }
 
     /// [`DevOp::Conv1dF32`], or [`DevOp::ConvTranspose1dF32`] with `transpose`.
@@ -2794,6 +2905,90 @@ mod tests {
             (Some(DevOp::CopyColsF32), 1)
         );
         assert_eq!(insts[1].i[6], 2 | 16);
+    }
+
+    #[test]
+    fn stream_tail_gather_store_and_validation() {
+        let (b, slots, tail, rows, cols, z_cols, z_col0) =
+            (3u32, 4u32, 6u32, 10u32, 32u32, 48u32, 8u32);
+        let (prefix, h) = prefix_with(&[
+            ("src", u64::from(b * rows * 64) * 4),
+            ("slot", 12),
+            ("n", 12),
+            ("pos", 12),
+        ]);
+        let mut p = prefix.program();
+        let stage = |mode, tail, rows, cols, z_col0| StreamTailF32Stage {
+            mode,
+            state: TensorRef::Named("state.tail"),
+            slot: h[1],
+            n: h[2],
+            items: b,
+            slots,
+            tail,
+            rows,
+            cols,
+            z_cols,
+            z_col0,
+        };
+        let gather = |src_stride| StreamTailF32Mode::Gather {
+            output: TensorRef::Named("z"),
+            src: h[0],
+            pos: h[3],
+            src_stride,
+        };
+        for (tail, rows, cols, z_col0) in [
+            (0, rows, cols, z_col0),
+            (tail, 0, cols, z_col0),
+            (tail, rows, z_cols + 1, 0),
+            (tail, rows, cols, z_cols - cols + 1),
+        ] {
+            assert!(p
+                .stream_tail_f32(&[], stage(gather(64), tail, rows, cols, z_col0))
+                .is_err());
+        }
+        assert!(p
+            .stream_tail_f32(&[], stage(gather(65), tail, rows, cols, z_col0))
+            .is_err());
+        let g = p
+            .stream_tail_f32(&[], stage(gather(64), tail, rows, cols, z_col0))
+            .unwrap();
+        let st = p
+            .stream_tail_f32(
+                &[g.done],
+                stage(
+                    StreamTailF32Mode::Store { z: g.output },
+                    tail,
+                    rows,
+                    cols,
+                    z_col0,
+                ),
+            )
+            .unwrap();
+        let prefix = p.finish(0);
+        let tensors = &prefix.model.tensors;
+        let insts = &prefix.model.progs[0].insts;
+        assert_eq!(insts.len(), 2);
+        assert_eq!(
+            tensors[g.output as usize].bytes,
+            u64::from(b * (tail + rows) * z_cols) * 4
+        );
+        assert_eq!(
+            tensors[st.output as usize].bytes,
+            u64::from(slots * tail * cols) * 4
+        );
+        assert_eq!(DevOp::from_u16(insts[0].op), Some(DevOp::StreamTailF32));
+        assert_eq!(
+            insts[0].t[..6],
+            [g.output, h[0], st.output, h[1], h[2], h[3]]
+        );
+        assert_eq!(insts[0].i, [b, tail, rows, cols, z_cols, z_col0, 64, 0]);
+        assert_eq!(insts[0].j, [slots, 0]);
+        assert_eq!(insts[1].t[0], packet::dev::TENSOR_NONE);
+        assert_eq!(insts[1].t[1..5], [g.output, st.output, h[1], h[2]]);
+        assert_eq!(insts[1].t[5], packet::dev::TENSOR_NONE);
+        assert_eq!(insts[1].i, [b, tail, rows, cols, z_cols, z_col0, 0, 1]);
+        assert!(!prefix.model.to_blob().is_empty());
     }
 
     #[test]

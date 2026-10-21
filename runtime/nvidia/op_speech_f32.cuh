@@ -2455,6 +2455,48 @@ static __device__ __noinline__ void d_copy_cols_f32(const PlowDevInst* in, void*
         });
 }
 
+/* StreamTailF32 (222): one element of z (gather) or of the stored tail (store) per index. */
+static __device__ __noinline__ void d_stream_tail_f32(const PlowDevInst* in, void* const* T, unsigned slice,
+                                                      unsigned nblk) {
+    const float* src = (const float*)SP_TEN(1);
+    float* state = (float*)SP_TEN(2);
+    const unsigned* slot = (const unsigned*)SP_TEN(3);
+    const unsigned* nrows = (const unsigned*)SP_TEN(4);
+    const unsigned B = in->i[0], L = in->i[1], N = in->i[2], C = in->i[3], Cz = in->i[4], zc0 = in->i[5];
+    const unsigned slots = in->fj[1].u;
+    if (in->i[7] == 0u) {
+        float* z = (float*)SP_TEN(0);
+        const unsigned* pos = (const unsigned*)SP_TEN(5);
+        const unsigned zr = L + N;
+        if ((uint64_t)B * zr * Cz > 0xFFFFFFFFull) { __trap(); return; }
+        sp_batched<8>(
+            B * zr * Cz, slice, nblk,
+            [&](unsigned e) {
+                const unsigned rr = e / Cz, c = e - rr * Cz, b = rr / zr, r = rr - b * zr;
+                if (r >= L) return src[((size_t)b * N + (r - L)) * in->i[6] + c];
+                if (c < zc0 || c - zc0 >= C || pos[b] == 0u) return 0.f;
+                const unsigned s = slot[b];
+                if (s >= slots) __trap();
+                return state[((size_t)s * L + r) * C + (c - zc0)];
+            },
+            [&](unsigned e, float v) { z[e] = v; });
+        return;
+    }
+    if ((uint64_t)B * L * C > 0xFFFFFFFFull) { __trap(); return; }
+    sp_batched<8>(
+        B * L * C, slice, nblk,
+        [&](unsigned e) {
+            const unsigned rr = e / C, c = e - rr * C, b = rr / L, i = rr - b * L;
+            const unsigned n = nrows[b];
+            if (n > N || slot[b] >= slots) __trap();
+            return src[((size_t)b * (L + N) + n + i) * Cz + zc0 + c];
+        },
+        [&](unsigned e, float v) {
+            const unsigned rr = e / C, c = e - rr * C, b = rr / L, i = rr - b * L;
+            state[((size_t)slot[b] * L + i) * C + c] = v;
+        });
+}
+
 /* UnaryF32 (199). */
 static __device__ __noinline__ void d_unary_f32(const PlowDevInst* in, void* const* T, unsigned slice, unsigned nblk) {
     float* out = (float*)SP_TEN(0);
@@ -5052,6 +5094,7 @@ static __device__ __noinline__ void d_speech_f32(const PlowDevInst* in, void* co
     case PLOW_DOP_RMSNORM_F32: d_rmsnorm_f32(in, T, slice, nblk); break;
     case PLOW_DOP_ROPE_AXIAL_F32: d_rope_axial_f32(in, T, slice, nblk); break;
     case PLOW_DOP_CHUNK_ATTENTION_F32: d_chunk_attention_f32(in, T, slice, nblk, arena); break;
+    case PLOW_DOP_STREAM_TAIL_F32: d_stream_tail_f32(in, T, slice, nblk); break;
     SP_CASE(ROW_STATS_F32)
         d_layernorm_f32(nullptr, (const float*)SP_TEN(1), nullptr, nullptr, in->i[0], in->i[1], in->i[2], in->fj[0].f,
                         slice, nblk, arena, (float*)SP_TEN(0));

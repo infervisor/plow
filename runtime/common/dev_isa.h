@@ -1528,6 +1528,8 @@ enum {
     PLOW_DOP_GEMV_F32_OUT = 220,
     /* Penalty / top-k / nucleus / Gumbel sampling of an f32 logit row; see DevOp::SampleSmallF32. */
     PLOW_DOP_SAMPLE_SMALL_F32 = 221,
+    /* Per-slot carried tail rows of a streaming FP32 stage (gather | store); see DevOp::StreamTailF32. */
+    PLOW_DOP_STREAM_TAIL_F32 = 222,
 
     PLOW_DOP__COUNT
 };

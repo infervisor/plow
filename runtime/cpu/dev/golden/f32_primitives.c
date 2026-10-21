@@ -865,6 +865,37 @@ G_K(g_copy_cols_f32) {
     }
 }
 
+/* StreamTailF32 (222), one item per slice step; an out-of-range slot or n[b] (a device trap)
+ * leaves the item unwritten. */
+G_K(g_stream_tail_f32) {
+    (void)ctx;
+    const float* src = PLOW_CPU_TEN(in, T, 1);
+    float* state = PLOW_CPU_TEN(in, T, 2);
+    const uint32_t* slot = PLOW_CPU_TEN(in, T, 3);
+    const uint32_t* nrows = PLOW_CPU_TEN(in, T, 4);
+    const uint32_t L = in->i[1], N = in->i[2], C = in->i[3], Cz = in->i[4], zc0 = in->i[5];
+    const uint32_t slots = in->fj[1].u;
+    uint32_t lo, hi;
+    g_range(in->i[0], slice, nblk, &lo, &hi);
+    for (uint32_t b = lo; b < hi; b++) {
+        if (slot[b] >= slots || nrows[b] > N) continue;
+        float* tail = state + (size_t)slot[b] * L * C;
+        if (in->i[7] == 0u) {
+            const uint32_t* pos = PLOW_CPU_TEN(in, T, 5);
+            float* z = (float*)PLOW_CPU_TEN(in, T, 0) + (size_t)b * (L + N) * Cz;
+            for (uint32_t r = 0; r < L; r++)
+                for (uint32_t c = 0; c < Cz; c++)
+                    z[(size_t)r * Cz + c] =
+                        pos[b] && c >= zc0 && c - zc0 < C ? tail[(size_t)r * C + c - zc0] : 0.0f;
+            for (uint32_t r = 0; r < N; r++)
+                memcpy(z + (size_t)(L + r) * Cz, src + ((size_t)b * N + r) * in->i[6], (size_t)Cz * 4);
+        } else {
+            const float* z = src + ((size_t)b * (L + N) + nrows[b]) * Cz + zc0;
+            for (uint32_t r = 0; r < L; r++) memcpy(tail + (size_t)r * C, z + (size_t)r * Cz, (size_t)C * 4);
+        }
+    }
+}
+
 /* Input row `u` of an item with `length` valid rows under pad `mode`; -1 reads as zero. */
 static int64_t g_pad_row(int64_t u, int64_t length, uint32_t mode) {
     if (u >= 0 && u < length) return u;
