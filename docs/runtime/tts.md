@@ -308,6 +308,10 @@ CUDA graphs, PyTorch SNAC per window; `--profile orpheus` for Orpheus), driven b
 | Orpheus, vLLM + SNAC | 3.1, 94 ms | 14.9, 229 ms | 42.7, 1017 ms | 79.8, 1012 ms |
 | Orpheus, plowrt | 3.3, 82 ms | 22.5, 93 ms | 63.8, 116 ms | 101.3, 194 ms |
 
+Chatterbox (English) vs the stock `chatterbox-tts` path (`chatterbox_ref.py`, one request at a
+time, whole replies): RTF 0.64, 1.6 audio s/s, ~2.4 s to audio (T3 20.2 ms / token). plowrt:
+8.8 audio s/s and 133 ms TTFA at c1, 54.1 audio s/s at c32. Chatterbox Multilingual: below.
+
 ### Fish S2 and Breeze vs their official servers
 
 H100, same texts (`chatterbox_ref.PROMPTS`), default sampling, no CFG, streamed. The official
