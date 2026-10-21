@@ -75,3 +75,32 @@ differ between server restarts; drop it from `[serve].env` for restart-stable di
 
 `scripts/voice/serve_voice_agent.sh` co-serves the three built asset dirs with `--co-sched
 deadline`; `scripts/voice/call_sim.py` + `slo_table.py` report per-call SLOs.
+
+### Gemma 4 26B FP8 + Qwen3-ASR + Chatterbox-MTL (50 Concurrent Calls Qualified)
+
+To serve **50 concurrent calls** on a single NVIDIA H100 80GB SXM5 co-serving
+`Qwen3-ASR (1.7B)` + `Gemma-4-26B-A4B-it FP8` + `Chatterbox-MTL (T3 + S3Gen v3)`:
+
+1. **Continuous Cross-Model Batching**: `PLOW_TOKEN_BATCH=1` unifies execution batches across models.
+2. **Vocoder Stream Batch Capping**: `PLOW_TTS_TURN_BATCH=16` caps vocoder launches to 16 parallel streams, bounding render hold time to $\le 440\text{ ms}$ and eliminating tail latency spikes on LLM TTFT and ASR final.
+3. **Speculative Decoding**: `PLOW_SPEC=1` with Gemma-4 assistant MTP drafter (`k_max=7`, `rows=16`) reduces LLM decode turns by ~40%.
+4. **Deadline Co-Scheduling**: `--co-sched deadline` schedules `Urgency::Final` turns with immediate priority over background batches.
+5. **Zero-Latency Yielding**: `PLOW_MULTISTEP=0` ensures decode batches do not block latency-critical turn transitions.
+
+#### Hardware Results (1x H100 80GB SXM5, 3 turns/call)
+
+| calls | ASR final | ASR partial | LLM TTFT | TTS TTFA | E2E first audio | underrun | errors | wall | SLOs |
+|---|---|---|---|---|---|---|---|---|---|
+| 30 | 104/268 | 105/655 | 47/261 | 340/639 | 915/1626 | 0/90 | 0 | 78 s | **pass** |
+| 50 | 121/479 | 76/424 | 59/420 | 363/779 | 1194/2460 | 0/150 | 0 | 86 s | **pass** |
+
+*Cells p50/p95 ms; underrun = turns with > 100 ms playback underrun / turns without error.*
+
+Server-Timing breakdown (p50/p95 ms):
+
+| calls | ASR queue | ASR wait-turn | ASR device | LLM queue | LLM wait-turn | LLM device | TTS queue | TTS wait-turn | TTS device | LLM over SLO |
+|---|---|---|---|---|---|---|---|---|---|---|
+| 30 | 32/96 | 69/227 | 0/0 | 0/27 | 10/236 | 22/38 | 1/334 | 220/384 | 43/87 | - |
+| 50 | 42/113 | 73/419 | 0/0 | 0/28 | 29/396 | 23/43 | 1/311 | 278/549 | 52/111 | - |
+
+Reproduction: `scripts/voice/bench_gemma26b_voice50.sh`.
