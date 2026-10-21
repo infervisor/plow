@@ -1469,6 +1469,7 @@ pub(super) fn run(
             ladder(&c, ctx, n_cu, target, fp8, &buckets, &rungs)
         }
     };
+    let shipped = crate::checkpoint::shipped_names(dir);
     validate_coverage(
         dir,
         &c.prefix,
@@ -1476,8 +1477,10 @@ pub(super) fn run(
             .iter()
             .filter_map(|t| {
                 // Sidecars are derived from these exact checkpoint matrices; scales add no source.
+                // A re-keyed checkpoint ships the twin itself in place of its bf16 source.
                 match t.name.strip_prefix("fp8/") {
                     Some(name) if name.ends_with("_scale") => None,
+                    Some(_) if shipped.contains(&t.name) => Some(t.name.clone()),
                     Some(name) => Some(name.to_string()),
                     None => Some(t.name.clone()),
                 }

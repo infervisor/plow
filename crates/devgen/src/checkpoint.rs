@@ -266,6 +266,19 @@ pub(crate) fn layer_scalars(dir: &Path, layers: u32, prefix: &str) -> Vec<f32> {
     out
 }
 
+/// Every tensor name `dir`'s shards carry, verbatim; empty when it has no shards.
+pub(crate) fn shipped_names(dir: &Path) -> HashSet<String> {
+    let has_shards = std::fs::read_dir(dir).is_ok_and(|rd| {
+        rd.filter_map(Result::ok)
+            .any(|e| e.path().extension().and_then(|x| x.to_str()) == Some("safetensors"))
+    });
+    if has_shards {
+        ckpt_names_all(dir)
+    } else {
+        HashSet::new()
+    }
+}
+
 /// Every tensor name the checkpoint actually ships, unfiltered.
 fn ckpt_names_all(dir: &Path) -> HashSet<String> {
     let mut out = HashSet::new();
@@ -418,21 +431,14 @@ pub(crate) fn validate_coverage(
     // Kimi-K3 is the live case: all 497 052 language-tower tensors are `language_model.model.…`
     // and ZERO start with `model.`, so a plan declared under `model.` would pass this gate
     // silently, allocate every weight, upload none, and decode from zeroed memory.
-    fn strip_quant(s: &str) -> &str {
-        s.strip_prefix("fp8/")
-            .or_else(|| s.strip_prefix("mxfp4/"))
-            .or_else(|| s.strip_prefix("affineq4/"))
-            .unwrap_or(s)
-    }
     let all = ckpt_names_all(dir);
-    let stripped_all: HashSet<String> = all.iter().map(|k| strip_quant(k).to_string()).collect();
-    let ckpt: HashSet<String> = stripped_all
+    let ckpt: HashSet<String> = all
         .iter()
         .filter(|k| k.starts_with(prefix))
         .cloned()
         .collect();
     if ckpt.is_empty() {
-        let ns = layer_namespaces(&stripped_all);
+        let ns = layer_namespaces(&all);
         return Err(format!(
             "weight prefix `{prefix}` matches NOTHING in {} ({} tensors).\n\
              The coverage gate below compares declared-vs-shipped WITHIN the prefix, so an \

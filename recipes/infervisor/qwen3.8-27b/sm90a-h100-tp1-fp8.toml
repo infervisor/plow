@@ -22,7 +22,8 @@ toolchain = "cuda-12.9"
 
 # The packet binds per-row `fp8/<name>` + `fp8/<name>_scale` twins, which the hub FP8 checkpoint
 # ([128,128] `weight_scale_inv` grid) does not carry: build them from the BF16 checkpoint with
-# `scripts/qwen38_fp8_rekey.py <bf16-dir> <out-dir>` and point QWEN38_FP8_CHECKPOINT at the output.
+# `perf-data/tools/quantize_fp8.py <bf16-dir> <out-dir> --rekey` and point QWEN38_FP8_CHECKPOINT at
+# the output.
 [checkpoint]
 source = "hf:Qwen/Qwen3.8-27B"
 layout = "plow-fp8-rekey"
@@ -88,7 +89,6 @@ PLOW_NV_GEMV_K8_B1 = "1"
 PLOW_VMM_LIVE = "1"
 PLOW_PREFIX_CACHE = "0"
 PLOW_PF_INTERLEAVE = "0"
-PLOW_OBJECTIVE = "throughput"
 PLOW_MAX_QUEUED_REQUESTS = "128"
 [capabilities]
 decode_ladder = "Qwen FP8 native kernel constraint requires batch-1 decode"
@@ -111,6 +111,7 @@ gate_prompt = "<|im_start|>user\nWhat is the capital of France? Answer in one sh
 # 39.5 out tok/s (+108% over non-TMA baseline 18.9 tok/s), TPOT p50 22.8 ms (2x speedup over
 # non-TMA 46.0 ms), TTFT p50 333 ms, memory 31.2 GiB (0.44x memory footprint vs vLLM, 56% less memory).
 # That packet's prefill object lacked PLOW_NV_FP8_PF_SCALE_WFIRST (arm guard relaxed); re-measure.
+# Serving objective stays auto: c8/c32 serving throughput is not yet measured.
 [measured]
 tok_s = 39.5
 p50_tpot_ms = 22.8

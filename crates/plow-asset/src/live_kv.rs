@@ -636,7 +636,7 @@ fn direct_operands(op: DevOp, d: &DevInst64, packet: &Packet<'_>) -> Result<()> 
                 return Ok(());
             }
             // The M=1 TMA path streams activations without a map and tiles weights at 64 rows.
-            let m1 = d.i[0] == 1 && d.i[6] == 0;
+            let m1 = op == DevOp::GemmFp8 && d.i[0] == 1 && d.i[6] == 0;
             require(d.i[6] != 0 || m1, "missing FP8 GEMM tensor-map operands")?;
             for (handle, source, rows) in [
                 (d.i[6], d.t[1], u64::from(d.i[0]) + u64::from(d.i[4])),
@@ -661,7 +661,7 @@ fn direct_operands(op: DevOp, d: &DevInst64, packet: &Packet<'_>) -> Result<()> 
                         && g.hd % 128 == 0
                         && rows > 0
                         && rows <= u64::from(g.ctx)
-                        && (g.scale == 128 || (m1 && g.scale == 64))
+                        && g.scale == if m1 { 64 } else { 128 }
                         && packet
                             .tensors
                             .get(handle as usize)
