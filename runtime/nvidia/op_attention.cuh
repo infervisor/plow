@@ -836,7 +836,7 @@ __device__ __forceinline__ void hnr_row(__nv_bfloat16* __restrict__ out, const _
                                         const float* __restrict__ cosb, const float* __restrict__ sinb,
                                         unsigned pos, float eps, unsigned skip_norm, unsigned lane);
 #endif
-template <int D, int GF>
+template <int D, int GF, bool QS = false>
 __device__ __forceinline__ void fa_decode_rg_item(
     float* __restrict__ Opart, float* __restrict__ mlpart, __nv_bfloat16* __restrict__ out,
     const __nv_bfloat16* __restrict__ Q, const __nv_bfloat16* __restrict__ kbase,
@@ -846,7 +846,7 @@ __device__ __forceinline__ void fa_decode_rg_item(
     const __nv_bfloat16* qs = nullptr) {
     /* D > 256: a warp owns a row and each lane NCH 8-element chunks, 256 elements apart.
      * `rs`: elements between consecutive KV rows (D head-major, kvh * D interleaved).
-     * `qs`: the item's GF query heads in smem ([GF][D], the HeadNormRope fold) instead of Q. */
+     * QS: `qs` holds the item's GF query heads in smem ([GF][D], the HeadNormRope fold) instead of Q. */
     constexpr unsigned NCH = D > 256 ? D / 256 : 1;
     constexpr unsigned LPR = D / (8 * NCH), GPW = 32u / LPR, NGRP = PLOW_NV_WARPS * GPW;
     constexpr int U = D > 256 ? (PLOW_NV_FA_RG_U > 2 ? 2 : PLOW_NV_FA_RG_U) : PLOW_NV_FA_RG_U;
@@ -858,7 +858,7 @@ __device__ __forceinline__ void fa_decode_rg_item(
     for (int g = 0; g < GF; g++) {
 #pragma unroll
         for (int c = 0; c < (int)NCH; c++) {
-            const bf16v8 q8 = qs ? ld_smem8(qs + g * D + c * LPR * 8u + sub * 8u)
+            const bf16v8 q8 = QS ? ld_smem8(qs + g * D + c * LPR * 8u + sub * 8u)
                                  : ld_glob8(Q + ((size_t)b * n_head + h0 + g) * D + c * LPR * 8u + sub * 8u);
 #pragma unroll
             for (int i = 0; i < 8; i++) {
@@ -1837,8 +1837,11 @@ __device__ __forceinline__ void fa_decode_d64_item(float* __restrict__ op, float
 }
 
 /* CLONE != 0: a separate instantiation for a second caller (a light kernel), so the
- * interpreter's copy keeps its single-caller inlining and registers. */
-template <int D, int GF, bool FP8KV = false, bool SZKV = false, bool SLOTMAP = false, int CLONE = 0>
+ * interpreter's copy keeps its single-caller inlining and registers. NRF: the HeadNormRope fold's
+ * own instantiation, so the unfolded rungs keep the plain body's code (with a runtime `nrf` arm,
+ * q17 B16 ran +2% with the fold off at that rung). */
+template <int D, int GF, bool FP8KV = false, bool SZKV = false, bool SLOTMAP = false, int CLONE = 0,
+          bool NRF = false>
 __device__ void d_flash_decode(float* __restrict__ Opart, float* __restrict__ mlpart,
                                const __nv_bfloat16* __restrict__ Q,
                                const __nv_bfloat16* __restrict__ K,
@@ -1857,7 +1860,7 @@ __device__ void d_flash_decode(float* __restrict__ Opart, float* __restrict__ ml
                         GF >= 2 && GF <= 4 && !FP8KV && !SZKV;
     if constexpr (!RG) {
         if (out) __trap(); /* a merge-folded packet needs the row-group body */
-        if (nrf) __trap();
+        if constexpr (NRF) __trap();
     }
     /* A work item carries GF CONSECUTIVE query heads sharing one KV head (needs GF | gqa).
      * Indexing by head-GROUP, not by kv_head, is what makes GF < gqa correct. */
@@ -1946,7 +1949,7 @@ __device__ void d_flash_decode(float* __restrict__ Opart, float* __restrict__ ml
         if constexpr (RG) {
             const __nv_bfloat16* qs = nullptr;
 #if PLOW_NV_HNR_FOLD
-            if (nrf) {
+            if constexpr (NRF) {
                 if (PLOW_NV_KV_ILV || PLOW_NV_FA_RGT || PLOW_NV_FA_RGM || SLOTMAP) __trap();
                 /* The HeadNormRope packets' rows, computed by this item: its GF q heads into smem,
                  * and on the split holding the new row (one item per KV head: gqa == GF) the k / v
@@ -2001,9 +2004,9 @@ __device__ void d_flash_decode(float* __restrict__ Opart, float* __restrict__ ml
                                       merge_ctr ? merge_ctr + b * n_grp + hg : nullptr, rgt_ring,
                                       rgt_bars, rgt_seq);
 #else
-            fa_decode_rg_item<D, GF>(Opart, mlpart, out, Q, kbase, vbase, b, n_head, h0, nsplit,
-                                     sp, lo, hi, kv_mask, scale, lds,
-                                     merge_ctr ? merge_ctr + b * n_grp + hg : nullptr, kv_rs, qs);
+            fa_decode_rg_item<D, GF, NRF>(Opart, mlpart, out, Q, kbase, vbase, b, n_head, h0, nsplit,
+                                          sp, lo, hi, kv_mask, scale, lds,
+                                          merge_ctr ? merge_ctr + b * n_grp + hg : nullptr, kv_rs, qs);
 #endif
             continue;
         }
@@ -2629,11 +2632,10 @@ __device__ __noinline__ void d_flash_decode_slots(
     const __nv_bfloat16* V, const int* kv_len, unsigned n_batch, unsigned n_head,
     unsigned n_kv_head, unsigned kv_stride, unsigned window, float scale, unsigned nsplit,
     unsigned kv_mask, unsigned slice, unsigned nblk, float* lds, unsigned kv_cap,
-    const int* decode_slot, __nv_bfloat16* out = nullptr, unsigned* merge_ctr = nullptr,
-    const FaNrf* nrf = nullptr) {
+    const int* decode_slot, __nv_bfloat16* out = nullptr, unsigned* merge_ctr = nullptr) {
     d_flash_decode<D, GF, false, false, true, CLONE>(
         Opart, mlpart, Q, K, V, kv_len, n_batch, n_head, n_kv_head, kv_stride, window, scale,
-        nsplit, kv_mask, slice, nblk, lds, kv_cap, nullptr, nullptr, decode_slot, out, merge_ctr, nrf);
+        nsplit, kv_mask, slice, nblk, lds, kv_cap, nullptr, nullptr, decode_slot, out, merge_ctr);
 }
 
 /* Combine the split partials: standard online-softmax merge, work unit = (batch, head).
