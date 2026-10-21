@@ -387,6 +387,10 @@ pub struct EmitConfig {
     /// GemvGlu / GemvQkv after them scale by 1/rms). Changes the rounding point of the normed input.
     #[arg(long, env = "PLOW_DECODE_NORM_FOLD", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
     pub decode_norm_fold: bool,
+    /// sm_120a decode: the q / k / v HeadNormRope packets fold into FlashDecode (each item norms
+    /// and ropes its own query heads, and the split holding the new row writes its k / v).
+    #[arg(long, env = "PLOW_DECODE_HNR_FOLD", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
+    pub decode_hnr_fold: bool,
 
     /// Blocks for the one-row MoE combine (arms the all-block combine; 0/1 = today's single CTA).
     #[arg(long, env = "PLOW_MOE_COMBINE_BLOCKS")]
@@ -1587,6 +1591,7 @@ impl EmitConfig {
             hn_split: env_bool("PLOW_HN_SPLIT"),
             fuse_kv_hnr: env_bool("PLOW_FUSE_KV_HNR"),
             decode_norm_fold: env_bool("PLOW_DECODE_NORM_FOLD"),
+            decode_hnr_fold: env_bool("PLOW_DECODE_HNR_FOLD"),
             moe_combine_blocks: env_u32("PLOW_MOE_COMBINE_BLOCKS"),
             fa_gf_full: env_u32("PLOW_FA_GF_FULL"),
             attention_decode_balance_gf: env_u32("PLOW_ATTENTION_DECODE_BALANCE_GF"),

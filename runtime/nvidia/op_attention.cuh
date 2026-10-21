@@ -817,15 +817,36 @@ __device__ __noinline__ void fa_fold_tail(__nv_bfloat16* __restrict__ out,
 #if PLOW_NV_KV_ILV && (PLOW_NV_FA_RGT || PLOW_NV_FA_RGM)
 #error "PLOW_NV_KV_ILV: the RGT / RGM bulk copies assume head-major rows"
 #endif
+#ifndef PLOW_NV_HNR_FOLD
+#define PLOW_NV_HNR_FOLD 0
+#endif
+/* HeadNormRope folded into flash decode (manifest `hnr_fold`): the raw projections, the q/k norm
+ * weights and the rope tables, resolved from the packet's descriptor (t7). */
+struct FaNrf {
+    const __nv_bfloat16 *qg, *kg, *vg, *gq, *gk;
+    const float *cs, *sn;
+    const int* pos;
+    float eps;
+    unsigned qk_skip, v_skip;
+};
+#if PLOW_NV_HNR_FOLD
+template <int HD>
+__device__ __forceinline__ void hnr_row(__nv_bfloat16* __restrict__ out, const __nv_bfloat16* __restrict__ x,
+                                        const __nv_bfloat16* __restrict__ gamma,
+                                        const float* __restrict__ cosb, const float* __restrict__ sinb,
+                                        unsigned pos, float eps, unsigned skip_norm, unsigned lane);
+#endif
 template <int D, int GF>
 __device__ __forceinline__ void fa_decode_rg_item(
     float* __restrict__ Opart, float* __restrict__ mlpart, __nv_bfloat16* __restrict__ out,
     const __nv_bfloat16* __restrict__ Q, const __nv_bfloat16* __restrict__ kbase,
     const __nv_bfloat16* __restrict__ vbase, unsigned b, unsigned n_head, unsigned h0,
     unsigned nsplit, unsigned sp, unsigned lo, unsigned hi, unsigned kv_mask, float scale,
-    float* lds, unsigned* __restrict__ ctr, unsigned rs = (unsigned)D) {
+    float* lds, unsigned* __restrict__ ctr, unsigned rs = (unsigned)D,
+    const __nv_bfloat16* qs = nullptr) {
     /* D > 256: a warp owns a row and each lane NCH 8-element chunks, 256 elements apart.
-     * `rs`: elements between consecutive KV rows (D head-major, kvh * D interleaved). */
+     * `rs`: elements between consecutive KV rows (D head-major, kvh * D interleaved).
+     * `qs`: the item's GF query heads in smem ([GF][D], the HeadNormRope fold) instead of Q. */
     constexpr unsigned NCH = D > 256 ? D / 256 : 1;
     constexpr unsigned LPR = D / (8 * NCH), GPW = 32u / LPR, NGRP = PLOW_NV_WARPS * GPW;
     constexpr int U = D > 256 ? (PLOW_NV_FA_RG_U > 2 ? 2 : PLOW_NV_FA_RG_U) : PLOW_NV_FA_RG_U;
@@ -837,7 +858,8 @@ __device__ __forceinline__ void fa_decode_rg_item(
     for (int g = 0; g < GF; g++) {
 #pragma unroll
         for (int c = 0; c < (int)NCH; c++) {
-            const bf16v8 q8 = ld_glob8(Q + ((size_t)b * n_head + h0 + g) * D + c * LPR * 8u + sub * 8u);
+            const bf16v8 q8 = qs ? ld_smem8(qs + g * D + c * LPR * 8u + sub * 8u)
+                                 : ld_glob8(Q + ((size_t)b * n_head + h0 + g) * D + c * LPR * 8u + sub * 8u);
 #pragma unroll
             for (int i = 0; i < 8; i++) {
                 qf[g][c * 8 + i] = __bfloat162float(q8.x[i]) * FA_SCALE(scale);
@@ -1829,7 +1851,8 @@ __device__ void d_flash_decode(float* __restrict__ Opart, float* __restrict__ ml
                                const float* __restrict__ v_scale = nullptr,
                                const int* __restrict__ decode_slot = nullptr,
                                __nv_bfloat16* __restrict__ out = nullptr,
-                               unsigned* __restrict__ merge_ctr = nullptr) {
+                               unsigned* __restrict__ merge_ctr = nullptr,
+                               const FaNrf* __restrict__ nrf = nullptr) {
     constexpr bool RG = PLOW_NV_FA_RG && (D == 128 || (PLOW_NV_FA_RG_WIDE && (D == 256 || D == 512))) &&
                         GF >= 2 && GF <= 4 && !FP8KV && !SZKV;
     if constexpr (!RG) {
@@ -1920,6 +1943,30 @@ __device__ void d_flash_decode(float* __restrict__ Opart, float* __restrict__ ml
             continue;
         }
         if constexpr (RG) {
+            const __nv_bfloat16* qs = nullptr;
+#if PLOW_NV_HNR_FOLD
+            if (nrf) {
+                if (PLOW_NV_KV_ILV) __trap();
+                /* The HeadNormRope packets' rows, computed by this item: its GF q heads into smem,
+                 * and on the split holding the new row (one item per KV head: gqa == GF) the k / v
+                 * rows into the cache where HeadNormRope stores them, before any warp reads them. */
+                __shared__ __align__(16) __nv_bfloat16 nrf_q[GF * D];
+                const unsigned pos = (unsigned)nrf->pos[b];
+                if (warp < (unsigned)GF) {
+                    hnr_row<D>(nrf_q + warp * D, nrf->qg + ((size_t)b * n_head + h0 + warp) * D, nrf->gq,
+                               nrf->cs, nrf->sn, pos, nrf->eps, nrf->qk_skip, lane);
+                } else if (warp < (unsigned)GF + 2u && lo <= qpos && qpos < hi) {
+                    const bool k = warp == (unsigned)GF;
+                    const size_t row = (size_t)b * n_kv_head + hkv;
+                    __nv_bfloat16* dst = (__nv_bfloat16*)(k ? K : V) + (row * kv_stride + (pos & kv_mask)) * D;
+                    hnr_row<D>(dst, (k ? nrf->kg : nrf->vg) + row * D, k ? nrf->gk : nullptr,
+                               k ? nrf->cs : nullptr, k ? nrf->sn : nullptr, pos, nrf->eps,
+                               k ? nrf->qk_skip : nrf->v_skip, lane);
+                }
+                __syncthreads();
+                qs = nrf_q;
+            }
+#endif
 #if PLOW_NV_FA_RGM
             if constexpr (D <= 256) {
                 /* The block's next item, for the ring to prefetch (same formulas as above). */
@@ -1955,7 +2002,7 @@ __device__ void d_flash_decode(float* __restrict__ Opart, float* __restrict__ ml
 #else
             fa_decode_rg_item<D, GF>(Opart, mlpart, out, Q, kbase, vbase, b, n_head, h0, nsplit,
                                      sp, lo, hi, kv_mask, scale, lds,
-                                     merge_ctr ? merge_ctr + b * n_grp + hg : nullptr, kv_rs);
+                                     merge_ctr ? merge_ctr + b * n_grp + hg : nullptr, kv_rs, qs);
 #endif
             continue;
         }
@@ -2581,10 +2628,11 @@ __device__ __noinline__ void d_flash_decode_slots(
     const __nv_bfloat16* V, const int* kv_len, unsigned n_batch, unsigned n_head,
     unsigned n_kv_head, unsigned kv_stride, unsigned window, float scale, unsigned nsplit,
     unsigned kv_mask, unsigned slice, unsigned nblk, float* lds, unsigned kv_cap,
-    const int* decode_slot, __nv_bfloat16* out = nullptr, unsigned* merge_ctr = nullptr) {
+    const int* decode_slot, __nv_bfloat16* out = nullptr, unsigned* merge_ctr = nullptr,
+    const FaNrf* nrf = nullptr) {
     d_flash_decode<D, GF, false, false, true, CLONE>(
         Opart, mlpart, Q, K, V, kv_len, n_batch, n_head, n_kv_head, kv_stride, window, scale,
-        nsplit, kv_mask, slice, nblk, lds, kv_cap, nullptr, nullptr, decode_slot, out, merge_ctr);
+        nsplit, kv_mask, slice, nblk, lds, kv_cap, nullptr, nullptr, decode_slot, out, merge_ctr, nrf);
 }
 
 /* Combine the split partials: standard online-softmax merge, work unit = (batch, head).

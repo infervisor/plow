@@ -1161,6 +1161,49 @@ static __device__ void d_headnorm_rope(__nv_bfloat16* __restrict__ hnr_out,
     }
 }
 
+#if PLOW_NV_HNR_FOLD
+/* One (token, head) row of d_headnorm_rope's E-per-lane half-split body, for the flash-decode
+ * fold (op_attention.cuh FaNrf): the same element map, reduction and rotate, one warp per row. */
+template <int HD>
+__device__ __forceinline__ void hnr_row(__nv_bfloat16* __restrict__ out, const __nv_bfloat16* __restrict__ x,
+                                        const __nv_bfloat16* __restrict__ gamma,
+                                        const float* __restrict__ cosb, const float* __restrict__ sinb,
+                                        unsigned pos, float eps, unsigned skip_norm, unsigned lane) {
+    static_assert(HD == 128, "the fold mirrors the hd128 arm of d_headnorm_rope");
+    constexpr unsigned E = HD / 32, H2 = HD / 2, EH = H2 / 32;
+    float v[E], g[E];
+#pragma unroll
+    for (unsigned e = 0; e < E; e++) {
+        v[e] = __bfloat162float(x[lane + e * 32]);
+        g[e] = gamma ? norm_weight(__bfloat162float(gamma[lane + e * 32])) : 1.0f;
+    }
+    float inv = 1.0f;
+    if (!skip_norm) {
+        float ss = 0.0f;
+#pragma unroll
+        for (unsigned e = 0; e < E; e++) ss += v[e] * v[e];
+        inv = rsqrtf(warp_sum32(ss) * __fdividef(1.0f, (float)HD) + eps);
+    }
+#pragma unroll
+    for (unsigned e = 0; e < E; e++) v[e] = gemma3_bf16_round(v[e] * inv * g[e]);
+    if (cosb) {
+        const size_t p = (size_t)pos * H2;
+        float r[E];
+#pragma unroll
+        for (unsigned e = 0; e < E; e++) {
+            const unsigned i = lane + e * 32;
+            const unsigned j = (i < H2) ? i : (i - H2);
+            const float c = gemma3_bf16_round(cosb[p + j]), s = gemma3_bf16_round(sinb[p + j]);
+            r[e] = (e < EH) ? (v[e] * c - v[e + EH] * s) : (v[e] * c + v[e - EH] * s);
+        }
+#pragma unroll
+        for (unsigned e = 0; e < E; e++) v[e] = r[e];
+    }
+#pragma unroll
+    for (unsigned e = 0; e < E; e++) out[lane + e * 32] = __float2bfloat16(v[e]);
+}
+#endif
+
 /* FP8 (e4m3) KV-cache twin of d_headnorm_rope (PLOW_FP8_KV). IDENTICAL norm+RoPE math — it produces
  * the SAME v[e] — but the store quantizes to e4m3 with a PER-ROW scale so flash reads HALF the bytes.
  *

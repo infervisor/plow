@@ -2617,6 +2617,21 @@ __device__ __forceinline__ void plow_exec(const PlowDevInst* in, void* const* T,
         const unsigned fold = in->fj[2].u;
         __nv_bfloat16* const fold_out = fold ? (__nv_bfloat16*)T[fold & 0xFFFFu] : nullptr;
         unsigned* const fold_ctr = fold ? (unsigned*)T[fold >> 16] : nullptr;
+        const FaNrf* nrfp = nullptr;
+#if PLOW_NV_HNR_FOLD
+        /* HeadNormRope fold: t7 = u32 descriptor {qg, kg, vg, gamma_q, gamma_k, cos, sin, pos,
+         * eps bits, qk_skip, v_skip}; needs one item per KV head (gqa == GF). */
+        FaNrf nrf;
+        if (TEN(7)) {
+            const unsigned* dsc = (const unsigned*)TEN(7);
+            auto h = [&](int k) -> const void* { return dsc[k] >= PLOW_TENSOR_NONE ? nullptr : T[dsc[k]]; };
+            nrf = FaNrf{(const __nv_bfloat16*)h(0), (const __nv_bfloat16*)h(1), (const __nv_bfloat16*)h(2),
+                        (const __nv_bfloat16*)h(3), (const __nv_bfloat16*)h(4), (const float*)h(5),
+                        (const float*)h(6), (const int*)h(7), __uint_as_float(dsc[8]), dsc[9], dsc[10]};
+            if (gqa != PLOW_NV_FA_GF || in->i[6] != 128u) { __trap(); break; }
+            nrfp = &nrf;
+        }
+#endif
 #define PLOW_NV_FLASH_DECODE(DD, GG)                                                            \
     do {                                                                                       \
         if (TEN(6))                                                                            \
@@ -2625,14 +2640,14 @@ __device__ __forceinline__ void plow_exec(const PlowDevInst* in, void* const* T,
                 (const __nv_bfloat16*)TEN(3), (const __nv_bfloat16*)TEN(4),                   \
                 (const int*)TEN(5), in->i[0], in->i[1], in->i[2], in->i[3], in->i[4],         \
                 in->fj[0].f, in->i[5], in->i[7], slice, nblk, arena, in->fj[1].u,              \
-                (const int*)TEN(6), fold_out, fold_ctr);                                        \
+                (const int*)TEN(6), fold_out, fold_ctr, nrfp);                                  \
         else                                                                                   \
             d_flash_decode<DD, GG>(                                                            \
                 (float*)TEN(0), (float*)TEN(1), (const __nv_bfloat16*)TEN(2),                  \
                 (const __nv_bfloat16*)TEN(3), (const __nv_bfloat16*)TEN(4),                   \
                 (const int*)TEN(5), in->i[0], in->i[1], in->i[2], in->i[3], in->i[4],         \
                 in->fj[0].f, in->i[5], in->i[7], slice, nblk, arena, in->fj[1].u, nullptr,     \
-                nullptr, nullptr, fold_out, fold_ctr);                                         \
+                nullptr, nullptr, fold_out, fold_ctr, nrfp);                                   \
     } while (0)
 #if PLOW_HAS_FLASH_HD64
         if (in->i[6] == 64 && PLOW_HAS_FLASH_HD64) {

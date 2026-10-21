@@ -1311,6 +1311,12 @@ fn tuning(s: &Shapes, arch: &str) -> Map<String, Value> {
         assert_eq!(arch, "sm_120a", "PLOW_DECODE_NORM_FOLD: sm_120a decode objects only");
         t.insert("norm_fold".into(), json!(1));
     }
+    // * `hnr_fold` (PLOW_DECODE_HNR_FOLD opt-in): the decode object's FlashDecode carries the
+    //   HeadNormRope fold arm the packet's flash packets use.
+    if arch.starts_with("sm_") && crate::emit_config::active().decode_hnr_fold {
+        assert_eq!(arch, "sm_120a", "PLOW_DECODE_HNR_FOLD: sm_120a decode objects only");
+        t.insert("hnr_fold".into(), json!(1));
+    }
     if sm90a && crate::emit_config::active().w8a8 && crate::emit_config::active().decode_cublaslt {
         t.insert("fp8_lt_decode".into(), json!(true));
     }
@@ -3191,6 +3197,11 @@ pub fn config_header(manifest: &Value) -> String {
             if t.get("norm_fold").is_some() {
                 out.push_str(
                     "#if !PLOW_NV_SPEECH && !PLOW_NV_PREFILL\n#ifndef PLOW_NV_NORM_FOLD\n#define PLOW_NV_NORM_FOLD 1\n#endif\n#endif\n",
+                );
+            }
+            if t.get("hnr_fold").is_some() {
+                out.push_str(
+                    "#if !PLOW_NV_SPEECH && !PLOW_NV_PREFILL\n#ifndef PLOW_NV_HNR_FOLD\n#define PLOW_NV_HNR_FOLD 1\n#endif\n#endif\n",
                 );
             }
         }
