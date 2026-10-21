@@ -5,16 +5,16 @@
 #     recipes/infervisor/qwen3-asr-0.6b/sm120a-rtx5090-tp1.toml --out <fresh dir>
 #
 # Gate: WER on the 73-clip LibriSpeech dummy set = 4.261% (c1, c16, c64). Decode ctx 1024
-# B=1/16/32 = 57/64/65% of the 1672 GB/s roofline (B=1: interpreter per-op latency). Served vs
-# vLLM 0.31.0 on the same box and client (73 clips at c1/c16, the 292-clip x4 set at c64/c128),
-# mean of 2 interleaved reps: c1 p50 38 vs 87 ms; RTFx c16 901 vs 485, c64 1687 vs 669, c128
-# 1735 vs 743 (c128 p90 590 vs 1400 ms).
+# B=1/16/32 = 63/74/78% of the 1672 GB/s roofline (B=1: interpreter per-op latency). Served vs
+# vLLM 0.31.0 on the same box and client (73 clips at c1/c16, the 292-clip x4 set at c64/c128;
+# driver 595.91), mean of 2 interleaved reps: c1 p50 34 vs 68 ms; RTFx c16 957 vs 501, c64 1678
+# vs 783, c128 1724 vs 896 (c128 p90 625 vs 1198 ms).
 
 schema = "plow.recipe.v1"
 namespace = "infervisor"
 name = "qwen3-asr-0.6b"
 label = "sm120a-rtx5090-tp1"
-plow_git = "937130a99691c1e073d59a4eb1bd92812c7c1eb3"
+plow_git = "90e8df0729cccb0d5423977cdba4968ca832e312"
 network = "qwen3"
 doc = "docs/runtime/asr.md"
 
@@ -61,6 +61,14 @@ PLOW_NV_FA_FOLD = "1"
 # Claim-ahead L2 weight prefetch: step_bench ctx 512 B=1/8/16/32 1.601/1.760/2.082/2.906 ->
 # 1.433/1.662/2.038/2.917 ms (+ devgen's B=1 MMA walk: 1.301/1.660/2.033/2.907), digests unchanged.
 PLOW_GEMV_PREFETCH = "1"
+# The claim-ahead prefetch also takes the AddNorm (8) / HeadNormRope (16) rows and the hd128
+# FlashDecode KV head (32); AddNorm folds into the GEMVs around it; HeadNormRope folds into
+# FlashDecode on the B=32 rung (below it the fold's pre-gate KV prefetch slows QKV). step_bench
+# ctx 1024 B=1/4/16/32 (3 reps): 1.330/1.558/2.618/4.016 -> 1.231/1.367/2.470/3.783 ms, token
+# digests unchanged.
+PLOW_NV_GEMV_PF_OPS = "63"
+PLOW_DECODE_NORM_FOLD = "1"
+PLOW_DECODE_HNR_FOLD = "32"
 PLOW_EMIT_PACKED_PREFILL = "1"
 PLOW_EMIT_PACKED_PREFILL_SMALL_HD = "1"
 # 192-chunk packed encoder buckets (~5.7 GB of FP32 activations) + 21 GiB of KV exceed 32 GB;

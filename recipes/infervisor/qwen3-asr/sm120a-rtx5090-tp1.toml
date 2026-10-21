@@ -4,16 +4,17 @@
 #   nix develop --command python3 scripts/campaign/campaign.py build \
 #     recipes/infervisor/qwen3-asr/sm120a-rtx5090-tp1.toml --out <fresh dir>
 #
-# Gate: WER on the 73-clip LibriSpeech dummy set = 3.913% (c1, c16, c64). Decode ctx 1024
-# B=1/16/32 = 79/76/76% of the 1672 GB/s roofline. Served vs vLLM 0.31.0 on the same box and
-# client (73 clips at c1/c16, the 292-clip x4 set at c64/c128), mean of 2 interleaved reps: c1 p50
-# 67 vs 117 ms; RTFx c16 503 vs 375, c64 1025 vs 612, c128 1074 vs 747 (c128 p90 1040 vs 1397 ms).
+# Gate: WER on the 73-clip LibriSpeech dummy set = 3.739% (c1, c16, c64). Decode ctx 1024
+# B=1/16/32 = 83/86/81% of the 1672 GB/s roofline. Served vs vLLM 0.31.0 on the same box and
+# client (73 clips at c1/c16, the 292-clip x4 set at c64/c128; driver 595.91), mean of 2
+# interleaved reps: c1 p50 63 vs 100 ms; RTFx c16 489 vs 422, c64 1026 vs 693, c128 1055 vs 826
+# (c128 p90 1057 vs 1271 ms).
 
 schema = "plow.recipe.v1"
 namespace = "infervisor"
 name = "qwen3-asr"
 label = "sm120a-rtx5090-tp1"
-plow_git = "937130a99691c1e073d59a4eb1bd92812c7c1eb3"
+plow_git = "90e8df0729cccb0d5423977cdba4968ca832e312"
 network = "qwen3"
 doc = "docs/runtime/asr.md"
 
@@ -62,6 +63,13 @@ PLOW_NV_FA_FOLD = "1"
 # Claim-ahead L2 weight prefetch: step_bench ctx 512 B=1/8/16/32 2.977/3.221/3.777/4.287 ->
 # 2.722/3.091/3.469/4.270 ms, token digests unchanged; 16/32/128/256 KiB budgets no better.
 PLOW_GEMV_PREFETCH = "1"
+# The claim-ahead prefetch also takes the AddNorm (8) / HeadNormRope (16) rows and the hd128
+# FlashDecode KV head (32); AddNorm folds into the GEMVs around it. step_bench ctx 1024
+# B=1/4/16/32 (3 reps): 2.673/2.987/3.990/5.340 -> 2.555/2.695/3.703/5.336 ms, token digests
+# unchanged. PLOW_DECODE_HNR_FOLD = "32" takes B=32 to 5.177 but its object costs the unfolded
+# rungs ~1% (B=16 3.750).
+PLOW_NV_GEMV_PF_OPS = "63"
+PLOW_DECODE_NORM_FOLD = "1"
 PLOW_EMIT_PACKED_PREFILL = "1"
 PLOW_EMIT_PACKED_PREFILL_SMALL_HD = "1"
 # 192-chunk packed encoder buckets (~5.7 GB of FP32 activations) + 21 GiB of KV exceed 32 GB;
