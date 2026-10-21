@@ -194,6 +194,16 @@ structure CodecLm where
   pcmCapacity : Nat
   windowFrames : Nat
   lookaheadFrames : Nat
+  /-- Stateful stream slots (`state.codec.*` rows); 0 = windowed streaming only. -/
+  streamSlots : Nat
+  stepFrames : Nat
+  /-- (batch, new frames) of each `step.b{B}.f{N}` program. -/
+  steps : List (Nat × Nat)
+  slotCapacity : Nat
+  posCapacity : Nat
+  ropeCapacity : Nat
+  /-- `stream.n.{k}` elements per time resolution. -/
+  newRowsCapacities : List Nat
   deriving Repr
 
 def CodecLm.frames (c : CodecLm) : Nat := c.codesCapacity / c.frameCodes
@@ -207,7 +217,11 @@ def CodecLm.Contract (c : CodecLm) : Prop :=
   c.tokenBase + c.audioTokens ≤ 2 ^ 31 ∧
   c.maxNewTokens + c.promptTokens < c.maxContext ∧ c.maxContext < 2 ^ 32 ∧
   (∀ s ∈ c.stops, s < 2 ^ 31 ∧ (s < c.tokenBase ∨ c.tokenBase + c.audioTokens ≤ s)) ∧
-  (c.audioTokens = c.frameCodes * c.codebook ∨ c.audioTokens = c.codebook)
+  (c.audioTokens = c.frameCodes * c.codebook ∨ c.audioTokens = c.codebook) ∧
+  (c.streamSlots = 0 → c.steps = []) ∧ c.stepFrames ≤ c.frames ∧
+  (∀ s ∈ c.steps, 0 < s.1 ∧ s.1 ≤ c.streamSlots ∧ 0 < s.2 ∧ s.2 ≤ c.stepFrames ∧
+    s.1 ≤ c.slotCapacity ∧ s.1 ≤ c.posCapacity ∧ s.1 * s.2 ≤ c.ropeCapacity ∧
+    s.1 * s.2 ≤ c.frames ∧ ∀ k ∈ c.newRowsCapacities, s.1 ≤ k)
 
 instance (c : CodecLm) : Decidable c.Contract := by unfold CodecLm.Contract; exact inferInstance
 
@@ -225,6 +239,28 @@ theorem CodecLm.addresses_in_bounds (c : CodecLm) (h : c.Contract) {f j t : Nat}
   · have : (f + 1) * c.frameSamples ≤ c.frames * c.frameSamples := Nat.mul_le_mul_right _ hf
     rw [Nat.add_mul] at this
     omega
+
+/-- A stateful step's item `i` reads its slot, position and new-row count inside their inputs,
+    its slot names a stream slot, and its new frame `r` has rope, code and PCM addresses
+    inside their tensors. -/
+theorem CodecLm.step_addresses_in_bounds (c : CodecLm) (h : c.Contract) {b n i r j t : Nat}
+    (hs : (b, n) ∈ c.steps) (hi : i < b) (hr : r < n) (hj : j < c.frameCodes)
+    (ht : t < c.frameSamples) :
+    i < c.streamSlots ∧ i < c.slotCapacity ∧ i < c.posCapacity ∧
+    (∀ k ∈ c.newRowsCapacities, i < k) ∧ i * n + r < c.ropeCapacity ∧
+    (i * n + r) * c.frameCodes + j < c.codesCapacity ∧
+    (i * n + r) * c.frameSamples + t < c.pcmCapacity := by
+  have hc := h
+  obtain ⟨_, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, hstep⟩ := h
+  obtain ⟨_, hslots, _, _, hslot, hpos, hrope, hframes, hnew⟩ := hstep _ hs
+  simp only at hslots hslot hpos hrope hframes hnew
+  have hrow : i * n + r < b * n := by
+    have : (i + 1) * n ≤ b * n := Nat.mul_le_mul_right _ hi
+    rw [Nat.add_mul] at this
+    omega
+  have ⟨hcode, hpcm⟩ := c.addresses_in_bounds hc (f := i * n + r) (by omega) hj ht
+  exact ⟨by omega, by omega, by omega, fun k hk => by have := hnew k hk; omega, by omega,
+    hcode, hpcm⟩
 
 /-- An audio token decodes to a code position below `frameCodes` and a code below the
     codebook, and no stop token is an audio token. -/
@@ -391,7 +427,8 @@ def parseFamily (j : Json) : Except String Family := do
       "token_base", "audio_tokens", "max_new_tokens", "prompt_tokens", "max_context", "stops",
       "codec_sample_rate",
       "codebook", "frame_codes", "frame_samples", "codes_capacity", "pcm_capacity", "window_frames",
-      "lookahead_frames"]
+      "lookahead_frames", "stream_slots", "step_frames", "steps", "slot_capacity", "pos_capacity",
+      "rope_capacity", "new_rows_capacities"]
     return .codecLm {
       lmSampleRate := (← nat j "lm_sample_rate"), lmCodebook := (← nat j "lm_codebook"),
       lmFrameCodes := (← nat j "lm_frame_codes"), lmFrameSamples := (← nat j "lm_frame_samples"),
@@ -402,7 +439,12 @@ def parseFamily (j : Json) : Except String Family := do
       codebook := (← nat j "codebook"), frameCodes := (← nat j "frame_codes"),
       frameSamples := (← nat j "frame_samples"), codesCapacity := (← nat j "codes_capacity"),
       pcmCapacity := (← nat j "pcm_capacity"), windowFrames := (← nat j "window_frames"),
-      lookaheadFrames := (← nat j "lookahead_frames") }
+      lookaheadFrames := (← nat j "lookahead_frames"),
+      streamSlots := (← nat j "stream_slots"), stepFrames := (← nat j "step_frames"),
+      steps := (← j.getObjValAs? (List (Nat × Nat)) "steps"),
+      slotCapacity := (← nat j "slot_capacity"), posCapacity := (← nat j "pos_capacity"),
+      ropeCapacity := (← nat j "rope_capacity"),
+      newRowsCapacities := (← nats j "new_rows_capacities") }
   | "guided_lm" =>
     exactKeys j ["kind", "speech_vocab", "start_speech", "stop_speech", "valid_below", "text_vocab",
       "start_text", "stop_text", "max_speech_tokens", "speech_positions", "overlay_rows", "max_context"]

@@ -1,5 +1,5 @@
-//! `media_geometry.v1`: the production families (values from the 4de53bf6 H100 bundles) are
-//! accepted; each single-field mutation that breaks a contract is rejected.
+//! `media_geometry.v1`: the production families (values from the 4de53bf6 H100 bundles; the
+//! stateful codec LM from the Fish S2 Pro stream-step bundle) are accepted; each single-field mutation that breaks a contract is rejected.
 
 use serde_json::{json, Value};
 
@@ -22,7 +22,16 @@ fn families() -> Vec<Value> {
             "lm_frame_samples": 2048, "token_base": 128266, "audio_tokens": 28672, "max_new_tokens": 1400, "prompt_tokens": 5,
             "max_context": 2048, "stops": [128258, 128262], "codec_sample_rate": 24000, "codebook": 4096,
             "frame_codes": 7, "frame_samples": 2048, "codes_capacity": 3584, "pcm_capacity": 1048576,
-            "window_frames": 6, "lookahead_frames": 2}),
+            "window_frames": 6, "lookahead_frames": 2, "stream_slots": 0, "step_frames": 0, "steps": [],
+            "slot_capacity": 0, "pos_capacity": 0, "rope_capacity": 0, "new_rows_capacities": []}),
+        json!({"kind": "codec_lm", "lm_sample_rate": 44100, "lm_codebook": 4096, "lm_frame_codes": 10,
+            "lm_frame_samples": 2048, "token_base": 151678, "audio_tokens": 4096, "max_new_tokens": 1024,
+            "prompt_tokens": 21, "max_context": 4096, "stops": [151645], "codec_sample_rate": 44100,
+            "codebook": 4096, "frame_codes": 10, "frame_samples": 2048, "codes_capacity": 10240,
+            "pcm_capacity": 2097152, "window_frames": 48, "lookahead_frames": 0, "stream_slots": 32,
+            "step_frames": 17, "steps": [[1, 1], [1, 17], [1, 4], [16, 17], [32, 17], [4, 17], [8, 17]],
+            "slot_capacity": 32, "pos_capacity": 32, "rope_capacity": 544,
+            "new_rows_capacities": [32, 32, 32, 32, 32, 32, 32]}),
         json!({"kind": "guided_lm", "speech_vocab": 8194, "start_speech": 6561, "stop_speech": 6562,
             "valid_below": 6561, "text_vocab": 704, "start_text": 255, "stop_text": 0,
             "max_speech_tokens": 1000, "speech_positions": 4100, "overlay_rows": 512, "max_context": 2048}),
@@ -60,15 +69,30 @@ fn production_media_contracts_hold_and_each_mutation_rejects() {
         (2, "stops", json!([130000])),
         (2, "max_new_tokens", json!(2043)),
         (2, "window_frames", json!(-1)),
-        (3, "start_speech", json!(8194)),
-        (3, "speech_positions", json!(1001)),
-        (4, "input_elements", json!(575)),
-        (4, "state_sizes", json!([128, 128, 128])),
-        (4, "kind", json!("vad2")),
-        (5, "tokens", json!([2147483648u64])),
-        (5, "table_capacity", json!(12288)),
-        (5, "slab_bytes", json!(62914561)),
-        (5, "lm_hidden", json!(2560)),
+        (4, "start_speech", json!(8194)),
+        (4, "speech_positions", json!(1001)),
+        (5, "input_elements", json!(575)),
+        (5, "state_sizes", json!([128, 128, 128])),
+        (5, "kind", json!("vad2")),
+        (6, "tokens", json!([2147483648u64])),
+        (6, "table_capacity", json!(12288)),
+        (6, "slab_bytes", json!(62914561)),
+        (6, "lm_hidden", json!(2560)),
+        (3, "steps", json!([[33, 17]])),
+        (3, "steps", json!([[1, 18]])),
+        (3, "steps", json!([[1, 0]])),
+        (3, "step_frames", json!(16)),
+        (3, "rope_capacity", json!(543)),
+        (3, "pos_capacity", json!(31)),
+        (3, "slot_capacity", json!(31)),
+        (
+            3,
+            "new_rows_capacities",
+            json!([32, 32, 32, 31, 32, 32, 32]),
+        ),
+        (3, "stream_slots", json!(0)),
+        (3, "codes_capacity", json!(5430)),
+        (2, "steps", json!([[1, 1]])),
         (0, "unknown", json!(1)),
     ];
     for (family, field, value) in &mutations {

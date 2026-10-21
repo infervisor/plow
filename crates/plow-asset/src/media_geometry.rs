@@ -93,7 +93,7 @@ fn codec_lm(p: &PacketPipeline, sidecars: &[MediaPacket<'_>]) -> Result<Value, S
             .checked_mul(param(p, "codec.frame_codes")?)
             .ok_or("codec LM: audio token range overflows")?
     };
-    Ok(json!({"kind": "codec_lm",
+    let mut family = json!({"kind": "codec_lm",
         "lm_sample_rate": param(p, "audio.sample_rate")?, "lm_codebook": param(p, "codec.codebook")?,
         "lm_frame_codes": param(p, "codec.frame_codes")?, "lm_frame_samples": param(p, "codec.frame_samples")?,
         "token_base": param(p, "audio.token_base")?, "audio_tokens": audio_tokens,
@@ -103,7 +103,36 @@ fn codec_lm(p: &PacketPipeline, sidecars: &[MediaPacket<'_>]) -> Result<Value, S
         "frame_codes": param(c, "codec.frame_codes")?, "frame_samples": param(c, "codec.frame_samples")?,
         "codes_capacity": elements(c, "codes")?, "pcm_capacity": elements(c, "pcm")?,
         "window_frames": param(c, "stream.window_frames")?,
-        "lookahead_frames": param(c, "stream.lookahead_frames")?}))
+        "lookahead_frames": param(c, "stream.lookahead_frames")?,
+        "stream_slots": 0, "step_frames": 0, "steps": [], "slot_capacity": 0, "pos_capacity": 0,
+        "rope_capacity": 0, "new_rows_capacities": []});
+    if c.parameters.get("stream.stateful").copied().unwrap_or(0) != 0 {
+        family.as_object_mut().unwrap().extend(stateful_codec(c)?);
+    }
+    Ok(family)
+}
+
+/// The stateful stream steps `step.b{B}.f{N}` and the inputs they index.
+fn stateful_codec(c: &PacketPipeline) -> Result<serde_json::Map<String, Value>, String> {
+    let steps: Vec<[u64; 2]> = c
+        .programs
+        .keys()
+        .filter_map(|role| {
+            let (b, n) = role.strip_prefix("step.b")?.split_once(".f")?;
+            Some([b.parse().ok()?, n.parse().ok()?])
+        })
+        .collect();
+    let new_rows = (0..param(c, "lengths.count")?)
+        .map(|k| elements(c, &format!("stream.n.{k}")))
+        .collect::<Result<Vec<_>, _>>()?;
+    let Value::Object(m) = json!({"stream_slots": param(c, "stream.slots")?,
+        "step_frames": param(c, "stream.step_frames")?, "steps": steps,
+        "slot_capacity": elements(c, "stream.slot")?, "pos_capacity": elements(c, "stream.pos")?,
+        "rope_capacity": elements(c, "stream.rope_pos")?, "new_rows_capacities": new_rows})
+    else {
+        unreachable!()
+    };
+    Ok(m)
 }
 
 fn guided_lm(p: &PacketPipeline) -> Result<Value, String> {
@@ -310,6 +339,51 @@ mod tests {
         assert_eq!(family["codes_capacity"], 3584);
         assert_eq!(family["pcm_capacity"], 1048576);
         assert_eq!(family["stops"], serde_json::json!([128258]));
+    }
+
+    #[test]
+    fn stateful_codec_declares_its_steps() {
+        let (lm, mut codec) = codec_lm();
+        let windowed = request(&packet("model.pkt", &lm), &[packet("codec.pkt", &codec)])
+            .unwrap()
+            .unwrap();
+        assert_eq!(windowed["families"][0]["stream_slots"], 0);
+        assert_eq!(windowed["families"][0]["steps"], serde_json::json!([]));
+        let c = &mut codec[0];
+        for (k, v) in [
+            ("stream.stateful", 1),
+            ("stream.slots", 4),
+            ("stream.step_frames", 17),
+            ("lengths.count", 1),
+        ] {
+            c.parameters.insert(k.into(), v);
+        }
+        c.programs.insert("step.b1.f1".into(), 1);
+        c.programs.insert("step.b4.f17".into(), 2);
+        for (role, n) in [
+            ("stream.slot", 4),
+            ("stream.pos", 4),
+            ("stream.rope_pos", 68),
+            ("stream.n.0", 4),
+        ] {
+            c.tensors.insert(
+                role.into(),
+                PipelineTensor {
+                    name: format!("in.codec.{role}"),
+                    dtype: PipelineDType::U32,
+                    shape: vec![n],
+                },
+            );
+        }
+        let family = &request(&packet("model.pkt", &lm), &[packet("codec.pkt", &codec)])
+            .unwrap()
+            .unwrap()["families"][0];
+        assert_eq!(family["stream_slots"], 4);
+        assert_eq!(family["steps"], serde_json::json!([[1, 1], [4, 17]]));
+        assert_eq!(family["rope_capacity"], 68);
+        assert_eq!(family["new_rows_capacities"], serde_json::json!([4]));
+        codec[0].tensors.remove("stream.n.0");
+        assert!(request(&packet("model.pkt", &lm), &[packet("codec.pkt", &codec)]).is_err());
     }
 
     #[test]
