@@ -5,6 +5,9 @@ use packet::dev::{StreamEnt, Wait};
 pub(super) struct PackedTerminal {
     template: [DevInst64; 5],
     capacity: usize,
+    /// The head's input: row `i` = sample row `i`'s final-norm hidden, `hidden_bytes` pitched.
+    hidden: u64,
+    hidden_bytes: u64,
     rows: DeviceMem,
     _selected: DeviceMem,
     _normalized: DeviceMem,
@@ -264,6 +267,8 @@ impl PackedTerminal {
         Ok(Some(Self {
             template: first,
             capacity,
+            hidden: head_input,
+            hidden_bytes: u64::from(hidden) * 2,
             rows,
             _selected: selected,
             _normalized: normalized,
@@ -348,6 +353,10 @@ impl PackedTerminal {
         self.host_rows[i].clear();
         self.host_rows[i].extend_from_slice(rows);
         i
+    }
+
+    pub(super) fn hidden_rows(&self) -> (u64, u64) {
+        (self.hidden, self.hidden_bytes)
     }
 
     pub(super) fn skip_next(&mut self) {

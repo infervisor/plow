@@ -7990,6 +7990,7 @@ impl GpuEngine {
         }
         self.seq_tokens[b].truncate(len);
         self.pos[b] = len as _;
+        self.spec_hidden_forget(b);
         Ok(())
     }
 
@@ -8523,6 +8524,7 @@ impl GpuEngine {
             tracing::warn!(launch_rows, ?feeds, ?pos, error = %e, "decode launch failed");
             e
         })?;
+        self.spec_hidden_save_plain(feeds, 1)?;
         if let Some(t) = &self.timing {
             self.be.event_record(&t.ev[2], &self.stream)?;
         }
@@ -9462,6 +9464,7 @@ impl GpuEngine {
         }
         self.reset_selected_decode_counters(rung)?;
         self.launch_selected_decode(rung)?;
+        self.spec_hidden_save_plain(feeds, 1)?;
         let mut a_ids = self.devp[self.t_ids].base;
         let mut a_pos = self.devp[self.t_pos].base;
         let mut a_kvl = self.devp[self.t_kvlen].base;

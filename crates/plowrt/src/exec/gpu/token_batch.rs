@@ -351,9 +351,24 @@ impl GpuEngine {
                 .take()
                 .expect("capability checked at load");
             let t_term = timed.then(std::time::Instant::now);
+            let snap = tail_rows.is_none() && self.spec_draft.is_some();
             let sampled = terminal
                 .begin_rows(self, &sample_rows, real_rows, specs.as_deref())
                 .and_then(|i| {
+                    if snap {
+                        // The drafter's next input: each sample row's final-norm hidden.
+                        let (src, pitch) = terminal.hidden_rows();
+                        let owners = state.staging.pending_plan().map(|p| &p.sample_owners);
+                        self.spec_hidden_save_rows(
+                            src,
+                            pitch,
+                            owners
+                                .into_iter()
+                                .flatten()
+                                .enumerate()
+                                .map(|(row, o)| (o.slot as usize, row as u32)),
+                        )?;
+                    }
                     if let Some(gpu) = gpu.as_mut() {
                         gpu.end(self);
                     }
@@ -396,6 +411,7 @@ impl GpuEngine {
                 .staging
                 .commit_after_device_success(&mut self.pos, &self.slot_generations)
                 .map_err(|error| RuntimeError::Rejected(error.to_string()))?;
+            self.spec_hidden_commit(true);
             if self.vmm_prefix_enabled() {
                 for chunk in &chunks {
                     self.seq_tokens[chunk.slot].extend_from_slice(chunk.tokens);
@@ -439,6 +455,7 @@ impl GpuEngine {
             Ok(())
         })();
         if result.is_err() {
+            self.spec_hidden_commit(false);
             if body_enqueued {
                 let _ = self.be.stream_synchronize(&self.stream);
             }
