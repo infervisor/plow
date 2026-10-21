@@ -277,6 +277,19 @@ Served (`tts_bench.py --prompt-set chatterbox-mtl`, 24 prompts in 8 languages, ~
 
 The table above is before streaming windows and the codec readback fix (2026-09-27).
 
+### Stateful stream codec (Fish S2, Breeze)
+
+A codec packet with `stream.stateful` = 1 carries step programs `step.b{B}.f{N}` that decode only
+a stream's new frames and keep every causal context (conv tails, attention K/V rings) in per-slot
+state, `stream.slots` (32) slots. Stream output then equals a whole decode (rel-L2 1.2-1.8e-5 vs
+0.50 for the 48-frame replay window on random Fish codes). The first step takes
+`PLOW_TTS_STREAM_FIRST_FRAMES` (1) frames; later steps wait for min(emitted, `stream.step_frames`)
+new frames. With every slot held, a stream falls back to the windowed path. The `codec_lm` media
+contract (`media_geometry.v1`) bounds every step's slots, inputs and code/PCM addresses.
+
+Windowed vs stateful (H100, same client): Fish c1 TTFA 46 -> 37 ms, c32 21.6 -> 29.6 audio s/s
+(RTF 1.17 -> 0.87); Breeze c1 49 -> 40 ms, c32 25.6 -> 31.3 (RTF 1.08 -> 0.84); CER unchanged.
+
 ### Streaming windows
 
 A stream renders only its new tokens: `s3gen.pkt` carries cached-prompt capacities
@@ -584,7 +597,7 @@ it in one order with one set of messages, then runs on the model's engine (`tts:
 | `language` | one of the card's `languages` (default `default_language`); a model without languages rejects it |
 | `temperature`, `top_p` | honoured on every model (defaults: the card's `defaults`) |
 | `max_tokens` | the model's audio tokens per segment, 1..card `max_tokens` |
-| `seed` | same seed, text and settings at the same concurrency: same speech tokens (batched decode is not bitwise batch-invariant); whole and stream replies share those tokens, but the windowed stream codec differs from a whole decode (~2% rel-L2 on Veena; identical on Breeze); SNAC codecs also draw their noise from the seed, so greedy (`temperature` 0) replies there share tokens but not PCM across seeds; unseeded requests sample anew |
+| `seed` | same seed, text and settings at the same concurrency: same speech tokens (batched decode is not bitwise batch-invariant); whole and stream replies share those tokens, but the windowed stream codec differs from a whole decode (~2% rel-L2 on Veena); the stateful codecs (Fish S2, Breeze) match it to ~1e-5 rel-L2 (fp32 summation order, so not bitwise); SNAC codecs also draw their noise from the seed, so greedy (`temperature` 0) replies there share tokens but not PCM across seeds; unseeded requests sample anew |
 | `speed` | 1.0 only |
 | `top_k`, `repetition_penalty`, `cfg_weight`, `instructions`, `ref_audio` + `ref_text` | optional controls: taken where the card declares them (`defaults.top_k`, `defaults.repetition_penalty`, `defaults.cfg_weight`, `instructions`, `voice_cloning`), else 400 naming the field; a sampler with a bounded top-k (`limits.top_k_max`, Fish S2) takes `top_k` in 1..that bound and cannot turn it off |
 
