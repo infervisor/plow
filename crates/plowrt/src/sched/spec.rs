@@ -12,6 +12,9 @@
 
 pub const MARGIN: f64 = 1.03;
 pub const EXPLORE: u32 = 64;
+/// Exploration ticks before a draft is verified: a row drafts from the hidden its last verify
+/// saved, so after plain ticks the first exploration tick only saves it and the next one drafts.
+const EXPLORE_TICKS: u32 = 2;
 const ALPHA: f64 = 0.1;
 const ACCEPT_ALPHA: f64 = 0.02;
 const ACCEPT_PRIOR: f64 = 0.7;
@@ -50,6 +53,7 @@ pub struct SpecPolicy {
     /// `accept[j]`: P(draft `j + 1` accepted | drafts `..=j` accepted).
     accept: Vec<f64>,
     since_spec: u32,
+    explore_left: u32,
 }
 
 impl SpecPolicy {
@@ -63,6 +67,7 @@ impl SpecPolicy {
             draft: vec![Ewma::default(); draft_rows.len()],
             accept: vec![ACCEPT_PRIOR; kmax as usize],
             since_spec: 0,
+            explore_left: 0,
         }
     }
 
@@ -86,6 +91,7 @@ impl SpecPolicy {
 
     /// A span of `k` drafts accepted its first `n_acc`.
     pub fn observe_verdict(&mut self, k: u32, n_acc: u32) {
+        self.explore_left = 0;
         for j in 0..k.min(n_acc + 1).min(self.kmax) as usize {
             let hit = if (j as u32) < n_acc { 1.0 } else { 0.0 };
             self.accept[j] += ACCEPT_ALPHA * (hit - self.accept[j]);
@@ -160,7 +166,13 @@ impl SpecPolicy {
         }
         let (gain, k, width) = best?;
         self.since_spec += 1;
-        if gain < MARGIN && self.since_spec < EXPLORE {
+        if gain >= MARGIN {
+            self.explore_left = 0;
+        } else if self.explore_left > 0 {
+            self.explore_left -= 1;
+        } else if self.since_spec >= EXPLORE {
+            self.explore_left = EXPLORE_TICKS - 1;
+        } else {
             return None;
         }
         self.since_spec = 0;
@@ -252,6 +264,23 @@ mod tests {
         let mut p = measured(0.05);
         let ran = (0..EXPLORE).filter(|_| p.plan(&[7; 4]).is_some()).count();
         assert_eq!(ran, 1, "one exploration tick per window");
+    }
+
+    #[test]
+    fn exploration_lasts_until_a_draft_is_verified() {
+        let mut p = measured(0.05);
+        let ran: Vec<bool> = (0..EXPLORE + 2)
+            .map(|_| p.plan(&[7; 4]).is_some())
+            .collect();
+        assert_eq!(ran.iter().filter(|&&r| r).count(), 2, "{ran:?}");
+        assert!(ran[EXPLORE as usize - 1] && ran[EXPLORE as usize]);
+        let mut p = measured(0.05);
+        (0..EXPLORE).for_each(|_| _ = p.plan(&[7; 4]));
+        p.observe_verdict(3, 0);
+        assert!(
+            p.plan(&[7; 4]).is_none(),
+            "a verified draft ends the exploration"
+        );
     }
 
     #[test]
