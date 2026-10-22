@@ -292,6 +292,8 @@ alone is ~10.7k lines and emits the shipped GLM-5.3 TP8 programs.
 | DPU integration | 🔲 | Needed for cross-node RDMA |
 | Dynamic indirection table | 🔲 | Needed for MoE routing |
 | In-place packet rewriting | 🔲 | Fine-grained dynamism |
+| Speculative decoding, MTP assistant drafter | 🔧 | CUDA; Gemma-4 12B/26B. AMD accept kernel untested |
+| Speculative decoding, DSpark block drafter | 🔲 | Paused; D1/D2 on branch `g12-dspark`, plan in [25-dspark-pending.md](25-dspark-pending.md) |
 
 ---
 
