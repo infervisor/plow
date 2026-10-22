@@ -2318,9 +2318,10 @@ impl Lowering<'_> {
                 },
             )
         })?;
-        if self.mode == Mode::Cached {
+        if matches!(self.mode, Mode::Cached | Mode::Slot) {
             // A window continues its stream's source: phase = the host's phase at sample `seam`
             // plus the window's own increments from there; the phase at `next_seam` goes back.
+            // A seam past the window (a whole render) adds the host's phase to the integral.
             let at = Gather {
                 rows: b,
                 width: nh,

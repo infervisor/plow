@@ -21,7 +21,7 @@ import numpy as np
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
-from s3gen_packet_check import PIPE, Packet, rel, rnormal  # noqa: E402
+from s3gen_packet_check import PIPE, Packet, rel, rnormal, runiform  # noqa: E402
 
 MEL = 80
 
@@ -46,7 +46,13 @@ class SlotPacket(Packet):
         for i, (t, (pt, pf, sp)) in enumerate(zip(toks, voices)):
             tk[i, :len(t)] = t
             st[i, :len(pt)], sf_[i, :len(pf)], ss[i], sl[i] = pt, pf, sp, len(pt)
+        # A whole render: seam out of range, phase = the synth programs' stream-2 draw.
+        nh = self.params["vocoder.harmonics"]
+        ph = np.zeros((cb, nh), np.float32)
+        for i, sd in enumerate(seeds):
+            ph[i, 1:] = [(runiform(sd, 2, h, 0) - np.float32(0.5)) * np.float32(2 * np.pi) for h in range(1, nh)]
         files = {"codes": tk, "voice": np.arange(cb, dtype=np.uint32) % S,
+                 "phase": ph, "seam": np.full(cb, 0xFFFFFFFF, np.uint32), "next_seam": np.zeros(cb, np.uint32),
                  "seed": np.array(list(seeds) + [0] * (cb - B), np.uint64),
                  "lengths.0": np.array([len(t) for t in toks] + [0] * (cb - B), np.uint32),
                  "slot.prompt_token": st, "slot.prompt_feat": sf_, "slot.spks": ss, "slot.prompt_len": sl}

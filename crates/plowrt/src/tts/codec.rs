@@ -44,6 +44,27 @@ pub struct SlotVoice {
     pub spks: Vec<f32>,
 }
 
+/// A voice-slot render's NSF initial phases (per harmonic): the `synth` programs' own draw
+/// (`RandF32` stream 2 at (harmonic, 0), `(u - 0.5) * tau`, harmonic 0 at 0), fed through the
+/// window phase input with an out-of-range seam so a whole render matches `synth` bit for bit.
+pub fn source_phase(seed: u64, harmonics: usize) -> Vec<f32> {
+    let mix = |z: u64| {
+        let z = z.wrapping_add(0x9E37_79B9_7F4A_7C15);
+        let z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        let z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        z ^ (z >> 31)
+    };
+    (0..harmonics as u64)
+        .map(|h| {
+            if h == 0 {
+                return 0.0;
+            }
+            let x = mix(seed ^ mix((2u64 << 56) ^ (h << 32)));
+            ((x >> 40) as f32 * (1.0 / 16_777_216.0) - 0.5) * std::f32::consts::TAU
+        })
+        .collect()
+}
+
 /// Called by the codec worker between the program segments of one launch (see
 /// [`Codec::set_yield`]).
 pub type YieldHook = std::sync::Arc<dyn Fn() + Send + Sync>;
@@ -244,8 +265,8 @@ impl Job {
     fn family(&self) -> Family {
         match (&self.window, &self.step, &self.clone) {
             (_, Some(_), _) => Family::Step,
-            (Some(_), None, _) => Family::Window,
-            (None, None, Some(_)) => Family::Slot,
+            (_, None, Some(_)) => Family::Slot,
+            (Some(_), None, None) => Family::Window,
             (None, None, None) => Family::Decode,
         }
     }
@@ -851,7 +872,7 @@ fn bind(path: &Path, device: u8) -> Result<Bound, String> {
         .iter()
         .all(Option::is_some)
         .then(|| phase.map(Option::unwrap));
-    if !cached.is_empty() && phase.is_none() {
+    if !(cached.is_empty() && slot_caps.is_empty()) && phase.is_none() {
         return Err("cached codec capacities without the window phase tensors".into());
     }
     Ok(Bound {
@@ -1151,11 +1172,27 @@ impl Bound {
                 .map_err(e)?;
         }
         let nh = self.harmonics;
-        let windows = if window { self.phase } else { None };
+        let windows = if window || family == Family::Slot {
+            self.phase
+        } else {
+            None
+        };
         if let Some([phase, _, seam, next_seam]) = windows {
             let mut p = vec![0f32; phase.bytes / 4];
             let (mut s, mut ns) = (vec![0u32; seam.bytes / 4], vec![0u32; next_seam.bytes / 4]);
-            for (i, w) in jobs.iter().filter_map(|j| j.window.as_ref()).enumerate() {
+            for (i, j) in jobs.iter().enumerate() {
+                let whole;
+                let w = match &j.window {
+                    Some(w) => w,
+                    None => {
+                        whole = Window {
+                            seam: u32::MAX,
+                            next_seam: 0,
+                            phase: source_phase(j.seed, nh),
+                        };
+                        &whole
+                    }
+                };
                 p[i * nh..][..w.phase.len().min(nh)]
                     .copy_from_slice(&w.phase[..w.phase.len().min(nh)]);
                 (s[i], ns[i]) = (w.seam, w.next_seam);
@@ -1220,7 +1257,7 @@ impl Bound {
             .enumerate()
             .map(|(i, j)| Decoded {
                 pcm: pcm[i * per..i * per + j.frames * self.frame_samples].to_vec(),
-                phase: if window {
+                phase: if j.window.is_some() && windows.is_some() {
                     phase_out[i * nh..(i + 1) * nh].to_vec()
                 } else {
                     Vec::new()
@@ -1310,6 +1347,19 @@ mod tests {
             reply: tokio::sync::oneshot::channel().0,
             _work: None,
         }
+    }
+
+    #[test]
+    fn source_phase_matches_the_synth_draw() {
+        // scripts/tts/s3gen_packet_check.py runiform(111, 2, h, 0), (u - 0.5) * tau in f32.
+        let bits: Vec<u32> = source_phase(111, 9).iter().map(|x| x.to_bits()).collect();
+        assert_eq!(
+            bits,
+            [
+                0x0, 0xbffbbefa, 0x3e1a7124, 0xbf9c05b2, 0xc006eb65, 0x3fbae945, 0xbffb37cd,
+                0xc0259018, 0x3ec18d7f
+            ]
+        );
     }
 
     #[test]
