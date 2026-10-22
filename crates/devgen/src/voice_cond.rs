@@ -1426,17 +1426,54 @@ fn conv2d(
 /// `len_t` garbage. Each conv's output is masked past `len_t` where a 3x3 conv reads it.
 fn fcm(s: &mut Seq, fbank: u32, t: u32, len_t: u32) -> Result<u32, String> {
     const C: u32 = 32;
-    let (x, mut w) = conv2d(s, fbank, "act.vc.f0", (t, 80, 1, C), "w.camp.fcm.c0", (3, 1), true, false)?;
+    let (x, mut w) = conv2d(
+        s,
+        fbank,
+        "act.vc.f0",
+        (t, 80, 1, C),
+        "w.camp.fcm.c0",
+        (3, 1),
+        true,
+        false,
+    )?;
     let mut x = s.mask_rows(x, "act.vc.fx", t, w * C, len_t)?;
     for l in 1..=2 {
         for i in 0..2 {
             let p = format!("w.camp.fcm.l{l}.{i}");
             let ws = if i == 0 { 2 } else { 1 };
-            let (y, ow) = conv2d(s, x, "act.vc.f1", (t, w, C, C), &format!("{p}.c1"), (3, ws), true, false)?;
+            let (y, ow) = conv2d(
+                s,
+                x,
+                "act.vc.f1",
+                (t, w, C, C),
+                &format!("{p}.c1"),
+                (3, ws),
+                true,
+                false,
+            )?;
             let y = s.mask_rows(y, "act.vc.f1m", t, ow * C, len_t)?;
-            let (y, _) = conv2d(s, y, "act.vc.f2", (t, ow, C, C), &format!("{p}.c2"), (3, 1), false, false)?;
+            let (y, _) = conv2d(
+                s,
+                y,
+                "act.vc.f2",
+                (t, ow, C, C),
+                &format!("{p}.c2"),
+                (3, 1),
+                false,
+                false,
+            )?;
             let sc = if i == 0 {
-                conv2d(s, x, "act.vc.fsc", (t, w, C, C), &format!("{p}.sc"), (1, ws), false, false)?.0
+                conv2d(
+                    s,
+                    x,
+                    "act.vc.fsc",
+                    (t, w, C, C),
+                    &format!("{p}.sc"),
+                    (1, ws),
+                    false,
+                    false,
+                )?
+                .0
             } else {
                 x
             };
@@ -1448,7 +1485,16 @@ fn fcm(s: &mut Seq, fbank: u32, t: u32, len_t: u32) -> Result<u32, String> {
             w = ow;
         }
     }
-    let (x, _) = conv2d(s, x, "act.vc.fcm", (t, w, C, C), "w.camp.fcm.c2", (3, 2), true, true)?;
+    let (x, _) = conv2d(
+        s,
+        x,
+        "act.vc.fcm",
+        (t, w, C, C),
+        "w.camp.fcm.c2",
+        (3, 2),
+        true,
+        true,
+    )?;
     Ok(x)
 }
 
@@ -1511,7 +1557,16 @@ fn voice_encoder(s: &mut Seq, cfg: &Cfg, d: Dims) -> Result<(), String> {
     )?;
     let wt = s.done(e);
     let vm = s.len_affine(lt, "act.vc.vm", (1, 160, 160), (0, u32::MAX), None)?;
-    let (p, frames) = s.power_stft(wt, "act.vc.spec", d.s16s, lt, "w.fe.stft400.w", (400, 160, 200), 402, PadMode::Reflect)?;
+    let (p, frames) = s.power_stft(
+        wt,
+        "act.vc.spec",
+        d.s16s,
+        lt,
+        "w.fe.stft400.w",
+        (400, 160, 200),
+        402,
+        PadMode::Reflect,
+    )?;
     let ncap = ve_partials(frames);
     // The partial windows reach past the last frame: those rows are zero, as the reference pads.
     let rows = (ncap - 1) * VE_STEP + VE_FRAMES;

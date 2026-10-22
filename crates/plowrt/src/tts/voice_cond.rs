@@ -16,6 +16,13 @@ use crate::exec::packet_runtime::{
 pub const PACKET: &str = "voice_cond.pkt";
 const DRIVER: &str = "voice.encode.v1";
 
+/// Why a clip did not encode: the clip itself (a client error) or the device.
+#[derive(Debug)]
+pub enum EncodeError {
+    Input(String),
+    Device(String),
+}
+
 /// A cloned voice: the LM's conditioning rows (`[rows][hidden]`) and the vocoder's slot.
 #[derive(Debug)]
 pub struct ClonedVoice {
@@ -94,23 +101,23 @@ impl VoiceCond {
     }
 
     /// The voice of `pcm` (mono, at `sample_rate`), emotion exaggeration `exaggeration`.
-    pub fn encode(&self, pcm: &[f32], exaggeration: f32) -> Result<ClonedVoice, String> {
+    pub fn encode(&self, pcm: &[f32], exaggeration: f32) -> Result<ClonedVoice, EncodeError> {
         let (cap, programs) = self
             .capacities
             .iter()
             .find(|c| c.0 >= pcm.len() && !pcm.is_empty())
             .ok_or_else(|| {
-                format!(
+                EncodeError::Input(format!(
                     "reference audio of {} samples; the voice encoder takes 1..={}",
                     pcm.len(),
                     self.max_samples()
-                )
+                ))
             })?;
         let mut padded = vec![0f32; *cap];
         padded[..pcm.len()].copy_from_slice(pcm);
         let io = &self.io;
         let mut rt = self.runtime.lock();
-        let e = |x: crate::RuntimeError| format!("voice encoder: {x}");
+        let e = |x: crate::RuntimeError| EncodeError::Device(format!("voice encoder: {x}"));
         rt.write_tensor_at(io.pcm, 0, bytemuck::cast_slice(&padded))
             .map_err(e)?;
         rt.write_tensor(io.samples, &(pcm.len() as u32).to_le_bytes())
@@ -127,8 +134,15 @@ impl VoiceCond {
         rt.read_tensor(io.prompt_len, bytemuck::cast_slice_mut(&mut p))
             .map_err(e)?;
         let p = p[0] as usize;
+        if p > io.tokens.bytes / 4 || 2 * p * 80 > io.prompt_mel.bytes / 4 {
+            return Err(EncodeError::Device(format!(
+                "voice encoder: prompt length {p} exceeds its outputs"
+            )));
+        }
         if p == 0 {
-            return Err("reference audio is too short to clone".into());
+            return Err(EncodeError::Input(
+                "reference audio is too short to clone".into(),
+            ));
         }
         let mut prompt_token = vec![0u32; p];
         rt.read_tensor_at(io.tokens, 0, bytemuck::cast_slice_mut(&mut prompt_token))

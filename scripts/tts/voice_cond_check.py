@@ -70,6 +70,32 @@ def e2e(a):
     return 0 if ok else 1
 
 
+def edge(a):
+    ok, rng = True, np.random.default_rng(0)
+    clips = {"1 sample": rng.standard_normal(1), "100 samples": rng.standard_normal(100),
+             "400 samples": rng.standard_normal(400), "0.1 s noise": 0.1 * rng.standard_normal(2400),
+             "3 s silence": np.zeros(72000), "5 s full scale": np.sign(rng.standard_normal(120000))}
+    for name, w in clips.items():
+        w = w.astype(np.float32)
+        try:
+            res, _ = run(a, "encode.c5", {"pcm": w, "samples": np.array([len(w)], np.uint32),
+                                          "exaggeration": np.array([0.5], np.float32)},
+                         {"out.vc.t3_count": np.uint32, "out.vc.prompt_len": np.uint32, "out.vc.prompt_mel": np.float32,
+                          "out.vc.spks": np.float32, "out.vc.rows": np.float32})
+        except RuntimeError as e:
+            ok = False
+            print(f"{name:<16} FAULT {str(e)[-300:]}")
+            continue
+        P = int(res["out.vc.prompt_len"][0])
+        fin = all(np.isfinite(res[k][: 2 * P * 80 if k == "out.vc.prompt_mel" else None]).all()
+                  for k in ("out.vc.prompt_mel", "out.vc.spks", "out.vc.rows"))
+        good = fin and P <= 250
+        ok &= good
+        print(f"{name:<16} T3 {int(res['out.vc.t3_count'][0]):3d}  P {P:3d}  finite {fin}  {'ok' if good else 'FAIL'}")
+    print("OVERALL:", "PASS" if ok else "FAIL")
+    return 0 if ok else 1
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--packet", required=True)
@@ -78,12 +104,15 @@ def main():
     ap.add_argument("--cap", type=int, default=10)
     ap.add_argument("--stages", default="front,tok,camp")
     ap.add_argument("--e2e", nargs="*", help="golden dirs: run encode.c{S} on each wav24_full")
+    ap.add_argument("--edge", action="store_true", help="tiny / silent clips: no fault, finite outputs")
     a = ap.parse_args()
     G = lambda k: np.load(os.path.join(a.golden, k + ".npy"))
     u32 = lambda v: np.array([v], np.uint32)
     stages, ok = a.stages.split(","), True
     if a.e2e is not None:
         return e2e(a)
+    if a.edge:
+        return edge(a)
 
     def gate(name, got, ref, tol):
         nonlocal ok

@@ -25,7 +25,7 @@ use std::sync::{mpsc, Arc};
 use super::api::{Sampling, SpeechSpec};
 use super::codec::{Codec, Decoded, Window};
 use super::guided_lm::{GuidedLmContract, PromptTables};
-use super::voice_cond::{ClonedVoice, VoiceCond};
+use super::voice_cond::{ClonedVoice, EncodeError, VoiceCond};
 use crate::sched::admission::DownstreamCredit;
 use crate::serve::mux::{CfgJob, Job, JobClass, JobOpts, ModelMux, SpeechJob, SubmitError};
 use crate::serve::stream::StreamChunk;
@@ -997,9 +997,10 @@ impl GuidedSpeech {
                 return Ok(Voice::Cloned(v));
             }
         }
-        let v = vc
-            .encode(pcm, CLONE_EXAGGERATION)
-            .map_err(|e| SpeechError::Invalid(e, "ref_audio"))?;
+        let v = vc.encode(pcm, CLONE_EXAGGERATION).map_err(|e| match e {
+            EncodeError::Input(m) => SpeechError::Invalid(m, "ref_audio"),
+            EncodeError::Device(m) => SpeechError::Failed(m),
+        })?;
         if v.rows.len() != self.tables.voice_rows_len() {
             return Err(SpeechError::Failed(
                 "voice conditioning rows disagree with the LM's voices".into(),
