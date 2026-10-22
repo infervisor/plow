@@ -42,6 +42,13 @@
       "toolchain": "leanprover/lean4:v4.15.0",
       "commit": "b8924059",
       "note": "codec_lm voice-cloning reference encoder (clone frames, PCM/codes capacities, eos code); user-approved 2026-10-22"
+    },
+    {
+      "sha256": "2b1dc5e473ed78988ff97600ebd2a050d40e942d989b5a3147bd8493dd927172",
+      "lean_sources_sha256": "e183433fccfef1c13999ce5711aad0acb73c5b1049fdbcdd73a4dc842c8f26de",
+      "toolchain": "leanprover/lean4:v4.15.0",
+      "commit": "403ff874",
+      "note": "codec_lm cloning end frame optional (Fish S2 Pro reference prompts); user-approved 2026-10-22"
     }
   ]
 }
