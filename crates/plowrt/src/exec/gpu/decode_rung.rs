@@ -232,6 +232,7 @@ fn validate_decode_ladder_impl(blob: &DevBlob, segmented: bool, routed: &[bool])
         return Ok(false);
     }
     let widest = programs.last().expect("multiple programs");
+    let widest_rows = widest.t;
     let mut compatible = true;
     let mut same_shape = true;
     let mut normalized = [Vec::new(), Vec::new(), Vec::new()];
@@ -456,6 +457,8 @@ fn validate_decode_ladder_impl(blob: &DevBlob, segmented: bool, routed: &[bool])
     }
     let tensor_id = |name: &str| blob.tensors.iter().position(|t| t.name == name);
     let pos = tensor_id("in.pos").ok_or_else(|| reject("missing position tensor"))?;
+    // Span-mode packets bind the per-row slot map on every FP8 KV writer (t7).
+    let row_slot = tensor_id("in.rowslot").map_or(TENSOR_NONE16, |h| h as u16);
     let kvlen = tensor_id("in.kvlen").ok_or_else(|| reject("missing KV length tensor"))?;
     let ids = tensor_id("in.ids").ok_or_else(|| reject("missing token tensor"))?;
     if blob.tensors[kvlen].bytes < u64::from(widest.t) * 4
@@ -552,7 +555,13 @@ fn validate_decode_ladder_impl(blob: &DevBlob, segmented: bool, routed: &[bool])
                 {
                     return Err(reject("invalid KV length handle or split count"));
                 }
-                let bound = u64::from(g.t)
+                // A span-mode row (slot map in j1) may address any slot of the widest rung.
+                let slots = if row_slot != TENSOR_NONE16 && d.fj[2] == u32::from(row_slot) {
+                    widest_rows
+                } else {
+                    g.t
+                };
+                let bound = u64::from(slots)
                     .checked_mul(u64::from(d.i[2]))
                     .and_then(|n| n.checked_mul(u64::from(d.i[3])))
                     .ok_or_else(|| reject("KV bounds overflow"))?;
@@ -639,7 +648,7 @@ fn validate_decode_ladder_impl(blob: &DevBlob, segmented: bool, routed: &[bool])
                     }
                     Some(DevOp::HeadNormRope | DevOp::HeadNormRopeFp8) if operand == 0 => {
                         if (d.op == DevOp::HeadNormRopeFp8 as u16) != scale.is_some()
-                            || scale.is_some_and(|scale| d.t[6] != scale || d.t[7] != TENSOR_NONE16)
+                            || scale.is_some_and(|scale| d.t[6] != scale || d.t[7] != row_slot)
                         {
                             return Err(reject("KV writer encoding or scale changes across rungs"));
                         }

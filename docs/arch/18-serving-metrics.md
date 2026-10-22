@@ -56,7 +56,7 @@ boundaries need not match vLLM's to use the same dashboard queries.
 | `prompt_tokens_total` | Counter | All prompt tokens, computed plus reused prefix tokens (vLLM's total) |
 | `prompt_tokens_cached_total` | Counter | Prompt tokens attached from a prefix |
 | `generation_tokens_total` | Counter | Generated tokens, including EOS/stop tokens |
-| `request_success_total` | Counter | Normal completion, labeled by `finished_reason` |
+| `request_success_total` | Counter | Finished requests by `finished_reason`: `stop`, `length`, and `abort` (client disconnect or error, as vLLM counts it) |
 | `time_to_first_token_seconds` | Histogram | Handler arrival to first generated token |
 | `inter_token_latency_seconds` | Histogram | Host observation interval between generated tokens |
 | `request_time_per_output_token_seconds` | Histogram | Per completed request `(last-first)/(outputs-1)`; zero for one output, as vLLM |
@@ -70,6 +70,10 @@ boundaries need not match vLLM's to use the same dashboard queries.
 | `request_params_max_tokens` | Histogram | Completed request's requested output limit |
 | `prefix_cache_queries_total` | Counter | Prompt tokens queried for prefix cache reuse |
 | `prefix_cache_hits_total` | Counter | Prompt tokens attached from prefix cache |
+| `spec_decode_num_drafts_total` | Counter | Speculative verify spans that carried drafts (`PLOW_SPEC`; one per row per speculative tick) |
+| `spec_decode_num_draft_tokens_total` | Counter | Draft tokens proposed |
+| `spec_decode_num_accepted_tokens_total` | Counter | Draft tokens accepted; a stop token inside the span ends the count, the target's own (bonus) token is never counted |
+| `spec_decode_num_accepted_tokens_per_pos_total` | Counter | Per `position` (0 = first draft), spans that accepted the draft at that position |
 
 All names in the table carry the `vllm:` prefix. Token counters record prompt
 accounting at the first output because that is when all prefix attachment and
@@ -77,6 +81,13 @@ prefill work is known. A request that fails before its first output can have
 performed uncounted prefill work. Generated tokens remain counted if the client
 disconnects later. Normal completion records success when the model finishes;
 it does not certify that the client received the final HTTP/SSE bytes.
+
+The `spec_decode_*` families appear only for a model serving with `PLOW_SPEC`, from its first decode tick
+(positions `0..k_max-1`); mean acceptance length is `1 + accepted / drafts`, as
+in vLLM. Rows that ride a speculative tick without drafts (sampled, penalty or
+logit-bias rows, rows without drafter state yet) are not counted as drafts. A
+drafting row emits its accepted drafts and the verify token together, so ITL
+observes the burst spacing while request TPOT covers the full interval.
 
 The HTTP arrival timestamp starts inside the handler after request validation
 and model residency checks, before tokenization. It excludes network transit,
@@ -95,7 +106,7 @@ latencies consequently have different boundaries.
 * `iteration_tokens_total`: Plow's mux tick can contain several engine steps
   and prefill chunks. A generated-output-only count would misrepresent vLLM's
   engine-step input-plus-output measure.
-* Scheduler KV preemption, block lifetime sampling, speculation, disaggregated
+* Scheduler KV preemption, block lifetime sampling, disaggregated
   KV connectors, multimodal caches, LoRA, NaN detection, CUDA-graph statistics,
   and MFU/per-GPU counters: no equivalent common serving event is implemented.
   Unsupported features are omitted rather than exported as reassuring zeros.
@@ -107,6 +118,8 @@ latencies consequently have different boundaries.
 | `plowrt_model_ready` | Gauge | Installed dispatcher with admission enabled |
 | `plowrt_model_requests_total`, `plowrt_model_rejected_total` | Counter | Submitted jobs and ingress/admission refusals |
 | `plowrt_requests_aborted_total` | Counter | Admitted work dropped without normal completion or residency preemption |
+| `plowrt_requests_aborted_before_first_token_total` | Counter | Aborts with no generated token yet (client gave up in queue or prefill) |
+| `plowrt_request_aborted_elapsed_seconds` | Histogram | Arrival to abort; a peak at a fixed time means a client timeout |
 | `plowrt_requests_preempted_total` | Counter | Requests terminated by residency reclamation |
 | `plowrt_tick_errors_total` | Counter | Device-fault or worker-failure ticks |
 | `plowrt_tick_duration_seconds{phase=...}` | Histogram | Returned tick wall time, including worker submission |
@@ -116,6 +129,23 @@ latencies consequently have different boundaries.
 | `plowrt_requests_thinking_total` | Counter | Admitted chat requests whose rendered prompt has reasoning on |
 | `plowrt_reasoning_tokens_total` | Counter | Generated tokens attributed to the reasoning trace |
 | `plowrt_request_reasoning_tokens` | Histogram | Trace tokens per finished chat request that had reasoning on or produced a trace |
+| `plowrt_spec_ticks_total` | Counter | Decode ticks that ran at least one draft (`PLOW_SPEC`) |
+| `plowrt_spec_skipped_ticks_total{reason=...}` | Counter | Decode ticks of a speculating engine that carried no draft, by first blocker |
+| `plowrt_spec_eligible_rows_total` | Counter | Decode rows that could draft, summed over decode ticks |
+
+**Speculation blockers.** Every decode tick (a tick with at least one decode row) of an engine
+serving `PLOW_SPEC` counts once: in `plowrt_spec_ticks_total` when a row drafted, else under the
+first `reason` that held, in this order: `prefill_tick` (the tick also prefills), `backlog`
+(requests wait for a slot), then whichever of `cfg_row`, `plain_row` (speech/plain-only row) and
+`seeded_sampled_row` (a seeded sampled row keeps its tick plain for reproducibility) the first such
+row in the batch has, `rows_over_limit` (decode rows at or above the widest span-capable verify
+rung), `no_greedy_rows` (no row may draft: logprobs, at its last token, or sampled, penalties or
+bias with `PLOW_SPEC_SAMPLED=0`), `policy_no_gain` (the measured plan does not beat a plain step),
+`not_ready` (the verify ran but no row held drafter state yet, e.g. the first tick after a plain
+one), `refused` (the engine refused the tick before committing, or failed it). A tick whose rows all
+finish while the decode pipeline drains counts nothing. A row is eligible when it could draft were
+the tick to speculate. The three families appear at the first decode tick, with the `spec_decode_*`
+ones.
 
 **Reasoning.** A request counts as *thinking* when the model frames a separable trace
 (`serve::reasoning::ReasoningMode` is not `None`) and either the rendered prompt leaves the trace

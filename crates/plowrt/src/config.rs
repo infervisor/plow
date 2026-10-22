@@ -1321,6 +1321,41 @@ pub struct NvidiaRuntimeConfig {
     #[arg(long = "decode-pipeline", env = "PLOW_DECODE_PIPELINE", hide = true, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
     pub decode_pipeline: Option<bool>,
 
+    /// Speculative decoding with the packet's drafter (CUDA; packets emitted with
+    /// `PLOW_EMIT_SPEC`): pure decode ticks of greedy rows draft and verify when the measured
+    /// plan beats the plain step. Off by default.
+    #[arg(long = "spec", env = "PLOW_SPEC", value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", default_value_t = false, global = true)]
+    pub spec: bool,
+
+    /// With `PLOW_SPEC`: sampled rows (temperature > 0, penalties, logit bias) draft too, and
+    /// each verify row is sampled exactly as plain decode would sample it (lossless rejection
+    /// sampling against the deterministic drafter). On by default: without it sampled traffic
+    /// never drafts (G26 prod-shape replay at t=0.7: 0 drafts, TPOT p50 17 ms vs 10 ms with it).
+    /// Off: such rows decode plainly in the verify.
+    #[arg(long = "spec-sampled", env = "PLOW_SPEC_SAMPLED", value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", default_value_t = true, global = true)]
+    pub spec_sampled: bool,
+
+    /// With `PLOW_SPEC_SAMPLED`: the most drafts a sampled row carries per tick (greedy rows keep
+    /// the drafter's depth). G26 prod at t=1.0 accepted 0.1% of draft position 4 and nothing past.
+    #[arg(
+        long = "spec-sampled-kmax",
+        env = "PLOW_SPEC_SAMPLED_KMAX",
+        default_value_t = 3,
+        global = true
+    )]
+    pub spec_sampled_kmax: u32,
+
+    /// With `PLOW_SPEC`: decode rows riding a prefill launch carry up to this many drafts as
+    /// verify rows in the rows its bucket pads (drafted just before the launch); their tokens are
+    /// accepted like a speculative tick's. 0 = off.
+    #[arg(
+        long = "spec-ride",
+        env = "PLOW_SPEC_RIDE",
+        default_value_t = 0,
+        global = true
+    )]
+    pub spec_ride: u32,
+
     /// VMM prefix reuse. Automatically enabled for eligible Hopper hybrid BF16-KV packets.
     #[arg(long = "vmm-prefix", env = "PLOW_VMM_PREFIX", value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
     pub vmm_prefix: Option<bool>,

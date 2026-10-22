@@ -54,6 +54,10 @@ pub struct Manifest {
     pub max_ctx: u32,
     pub position: u16,
     pub kv_length: u16,
+    /// Span-mode decode (`PLOW_EMIT_SPAN_VERIFY`): `in.rowslot`, the per-row KV slot map every
+    /// decode cache writer takes in t7 and every decode reader in j1.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub row_slot: Option<u16>,
     pub caches: Vec<Cache>,
     pub maps: Vec<Map>,
     pub programs: Vec<String>,
@@ -182,6 +186,7 @@ pub fn emit(packet: &Packet<'_>) -> Result<Manifest> {
         max_ctx,
         position,
         kv_length: handle("in.kvlen")?,
+        row_slot: handle("in.rowslot").ok(),
         caches,
         maps,
         programs: packet.programs.iter().map(program_digest).collect(),
@@ -241,6 +246,16 @@ impl Manifest {
                 && tensor(self.kv_length)?.bytes == self.batch as u64 * 4,
             "runtime position/length extent",
         )?;
+        if let Some(h) = self.row_slot {
+            require(
+                h != self.position
+                    && h != self.kv_length
+                    && tensor(h)?.name == "in.rowslot"
+                    && tensor(h)?.bytes == self.batch as u64 * 4
+                    && !tensor(h)?.initialized,
+                "runtime row-slot extent",
+            )?;
+        }
         let mut caches = BTreeMap::new();
         let mut handles = BTreeSet::new();
         let mut scales = BTreeMap::new();
@@ -445,6 +460,7 @@ impl Manifest {
                             && d.i[0] == p.rows
                             && (d.i[2], d.i[6], d.i[3], d.i[4], d.i[7])
                                 == (c.heads, c.hd, c.stride, c.window, c.mask)
+                            && (!fp8 || d.fj[2] == self.row_slot.map_or(0, u32::from))
                     };
                     // A repeated reader of one pair is KV sharing (Gemma-4 E-series), same geometry.
                     require(valid, "attention reader contract")?;
@@ -547,7 +563,16 @@ impl Manifest {
                                         // the slot-6 arm above validates the cache half.
                                         op == DevOp::HeadNormRope && c.scales.is_none()
                                     } else {
-                                        d.t[7] == TENSOR_NONE16
+                                        // Span mode: every decode FP8 writer carries the map.
+                                        d.t[7]
+                                            == match self.row_slot {
+                                                Some(r)
+                                                    if !prefill && op == DevOp::HeadNormRopeFp8 =>
+                                                {
+                                                    r
+                                                }
+                                                _ => TENSOR_NONE16,
+                                            }
                                     })
                                     && (if prefill {
                                         d.i[6] == 0

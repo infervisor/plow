@@ -754,3 +754,49 @@ fn the_dense_gqa_pair_claims_its_output_segment() {
     caps.can_run_output()
         .expect("RowGather is descriptor-aware");
 }
+
+/// A verify span (pending token + drafts) is planned after the prefill spans, so the leading
+/// one-row decode riders and every earlier sample index keep their place; each of its rows is a
+/// sample row owned by its request.
+#[test]
+fn verify_spans_follow_prefill_and_sample_every_row() {
+    static A: [u32; 1] = [7];
+    static V: [u32; 4] = [5, 6, 7, 8];
+    static C: [u32; 3] = [3; 3];
+    let (frontiers, generations) = tables(&[100, 200, 10]);
+    let verify = Request {
+        phase: Phase::Verify,
+        ..decode(11, 1, 150, &V)
+    };
+    let requests = [verify, decode(10, 0, 100, &A), prefill(12, 2, 13, &C)];
+    let plan = plan(&requests, &frontiers, &generations, 16, 8192, 0).unwrap();
+    assert_eq!(plan.real_rows, 8);
+    assert_eq!(plan.sample_input_rows, vec![0, 3, 4, 5, 6, 7]);
+    assert_eq!(
+        plan.sample_owners
+            .iter()
+            .map(|o| o.request)
+            .collect::<Vec<_>>(),
+        vec![10, 12, 11, 11, 11, 11]
+    );
+    assert_eq!(&plan.positions[4..8], &[200, 201, 202, 203]);
+    let v = plan.pending.iter().find(|p| p.request == 11).unwrap();
+    assert_eq!(
+        (v.expected_frontier, v.new_frontier, v.sample_index),
+        (200, 204, Some(2))
+    );
+    let early = Request {
+        phase: Phase::Verify,
+        ..decode(11, 1, 250, &V)
+    };
+    assert!(plan_into(
+        &[early],
+        &frontiers,
+        &generations,
+        16,
+        8192,
+        0,
+        &mut Plan::with_capacity(16, 4)
+    )
+    .is_err());
+}

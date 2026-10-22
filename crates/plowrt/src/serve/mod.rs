@@ -172,6 +172,20 @@ mod tests {
     use axum::http::StatusCode;
 
     #[test]
+    fn span_draws_match_plain_draws() {
+        use super::{seeded_unit_with, seeded_units_ext};
+        let (prompt, out, ext) = ([3u32, 9, 27], [1u32, 4], [7u32, 7, 2]);
+        for seed in [None, Some(42)] {
+            let mut d = [0f32; 4];
+            seeded_units_ext(&prompt, &out, &ext, 5, seed, &mut d);
+            for (j, &x) in d.iter().enumerate() {
+                let hist: Vec<u32> = out.iter().chain(&ext[..j]).copied().collect();
+                assert_eq!(x, seeded_unit_with(&prompt, &hist, 5 + j, seed));
+            }
+        }
+    }
+
+    #[test]
     fn generation_default_allows_long_responses() {
         assert_eq!(GenParams::default().max_tokens, 4096);
     }
@@ -405,18 +419,52 @@ pub(crate) fn seeded_unit_with(prompt: &[u32], out: &[u32], step: usize, seed: O
     (fnv_seed(prompt, out, step, seed) % 10_000) as f32 / 10_000.0
 }
 
-fn fnv_seed(prompt: &[u32], out: &[u32], step: usize, seed: Option<u64>) -> u64 {
+/// [`seeded_unit_with`] for each speculative verify row: `draws[j]` is the draw plain decode
+/// uses at `step + j` once `ext[..j]` have been emitted after `out`.
+pub(crate) fn seeded_units_ext(
+    prompt: &[u32],
+    out: &[u32],
+    ext: &[u32],
+    step: usize,
+    seed: Option<u64>,
+    draws: &mut [f32],
+) {
+    assert!(draws.len() <= ext.len() + 1);
+    let mut h = fnv_history(fnv_init(seed), prompt.iter().chain(out.iter()));
+    for (j, d) in draws.iter_mut().enumerate() {
+        if j > 0 {
+            h = fnv_history(h, std::iter::once(&ext[j - 1]));
+        }
+        *d = (fnv_step(h, step + j) % 10_000) as f32 / 10_000.0;
+    }
+}
+
+fn fnv_init(seed: Option<u64>) -> u64 {
     let mut h = 1469598103934665603u64;
     if let Some(s) = seed {
         h ^= s;
         h = h.wrapping_mul(1099511628211);
     }
-    for &t in prompt.iter().chain(out.iter()) {
+    h
+}
+
+fn fnv_history<'a>(mut h: u64, tokens: impl Iterator<Item = &'a u32>) -> u64 {
+    for &t in tokens {
         h ^= t as u64;
         h = h.wrapping_mul(1099511628211);
     }
-    h ^= step as u64;
-    h.wrapping_mul(1099511628211)
+    h
+}
+
+fn fnv_step(h: u64, step: usize) -> u64 {
+    (h ^ step as u64).wrapping_mul(1099511628211)
+}
+
+fn fnv_seed(prompt: &[u32], out: &[u32], step: usize, seed: Option<u64>) -> u64 {
+    fnv_step(
+        fnv_history(fnv_init(seed), prompt.iter().chain(out.iter())),
+        step,
+    )
 }
 
 /// Reference logits distribution: deterministic, request-seeded, peaked at a

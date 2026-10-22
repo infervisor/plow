@@ -522,6 +522,10 @@ option(PLOW_CUBIN_ROUTED_DECODE "Also emit the _routed decode cubin for cuBLASLt
 option(PLOW_CUBIN_SPEECH "Also emit the _speech decode cubin carrying the FP32 speech arms (ASR encoder)" OFF)
 option(PLOW_CUBIN_FP8_TC64_DEPTH2 "Emit a separate depth-2 FP8 TC64 decode cubin" OFF)
 option(PLOW_CUBIN_GEMV_WIDE "Also emit the _gw decode cubin carrying the wide-rung wgmma GEMV (sm_90a)" OFF)
+# Speculative-decode verify/draft launches need the row -> KV slot map (-DPLOW_NV_ROW_SLOT=1); it
+# costs plain decode ~1%, so the decode objects get a `_rs` twin carrying it and plain launches keep
+# the object without it.
+option(PLOW_CUBIN_ROW_SLOT_TWIN "Also emit _rs twins of the decode cubins with PLOW_NV_ROW_SLOT=1" OFF)
 
 # GQA fusion factor for the FULL-attention (hd512) flash-decode instantiation.
 # Measured: GF_FULL should equal `gqa` when the full layers have kv_heads == 1
@@ -613,6 +617,8 @@ if(PLOW_SM120_CUBIN OR PLOW_SM90A_CUBIN OR PLOW_SM89_CUBIN)
     set(_ax_routed -DPLOW_NV_DECODE_ROUTED=1)
     set(_ax_speech -DPLOW_NV_SPEECH=1)
     set(_ax_gw -DPLOW_NV_GW_OBJECT=1)
+    set(_ax_rs -DPLOW_NV_ROW_SLOT=1)
+    set(_ax_gw_rs ${_ax_gw} ${_ax_rs})
     set(_ax_gw64 ${_ax_gw} -DPLOW_FP8TC_U8=2 -DPLOW_FP8TC_U8G=2)
     if(PLOW_NV_PF_GEMV_HEAD)
         list(APPEND _ax_prefill -DPLOW_NV_PF_GEMV_HEAD=1)
@@ -626,6 +632,7 @@ if(PLOW_SM120_CUBIN OR PLOW_SM90A_CUBIN OR PLOW_SM89_CUBIN)
     # dequants at the smem stage (cp.async cannot convert fp8 inline), so PIPE=0 is
     # the legacy all-layer arm and PIPE=1 is the px4 fp8-mma arm FASTPF selects.
     set(_ax_fp8kv -DPLOW_FP8_KV=1)
+    set(_ax_fp8kv_rs ${_ax_fp8kv} ${_ax_rs})
     set(_ax_routed_fp8kv ${_ax_routed} ${_ax_fp8kv})
     if(PLOW_FP8_KV_FASTPF)
         set(_ax_fp8kv_pf -DPLOW_FP8_KV=1 -DPLOW_NV_FA_PIPE=1)
@@ -698,6 +705,10 @@ if(PLOW_SM120_CUBIN OR PLOW_SM90A_CUBIN OR PLOW_SM89_CUBIN)
             string(LENGTH "${_vstem}_gw" _len_gw)
             list(APPEND _cubin_rows
                 "${_vstem}_gw|_Z${_len_gw}${_vstem}_gw11PlowProgram|_ax_decode|_ax_gw")
+            if(PLOW_CUBIN_ROW_SLOT_TWIN)
+                list(APPEND _cubin_rows
+                    "${_vstem}_gw_rs|_Z${_len_gw}${_vstem}_gw11PlowProgram|_ax_decode|_ax_gw_rs")
+            endif()
             if(PLOW_CUBIN_FP8_TC64_DEPTH2)
                 list(APPEND _cubin_rows
                     "${_vstem}_gw64|_Z${_len_gw}${_vstem}_gw11PlowProgram|_ax_decode|_ax_gw64")
@@ -707,6 +718,12 @@ if(PLOW_SM120_CUBIN OR PLOW_SM90A_CUBIN OR PLOW_SM89_CUBIN)
             list(APPEND _cubin_rows
                 "${_vstem}_fp8kv|${_ksym_dec}|_ax_decode|_ax_fp8kv"
                 "${_vstem}_pf_fp8kv|${_ksym_pf}|_ax_prefill|_ax_fp8kv_pf")
+        endif()
+        if(PLOW_CUBIN_ROW_SLOT_TWIN)
+            list(APPEND _cubin_rows "${_vstem}_rs|${_ksym_dec}|_ax_decode|_ax_rs")
+            if(PLOW_SM120_CUBIN_FP8KV)
+                list(APPEND _cubin_rows "${_vstem}_fp8kv_rs|${_ksym_dec}|_ax_decode|_ax_fp8kv_rs")
+            endif()
         endif()
         if(PLOW_SM120_CUBIN_SEG OR PLOW_CUBIN_PACKED_PREFILL)
             string(LENGTH "${_vstem}_pfseg" _len_pfseg)

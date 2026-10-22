@@ -920,7 +920,9 @@ impl GpuEngine {
             tracing::debug!(slot = b, p_a, "vmm: boundary touched");
             return true;
         }
-        if !v.slide.is_empty() && rows - p_a > v.ring as u32 - g.window {
+        // Rejected speculative rows past `pos` were written too: the ring wrapped to the high water.
+        let written = rows.max(self.kv_hw[b]);
+        if !v.slide.is_empty() && written - p_a > v.ring as u32 - g.window {
             trace_refusal(b, p_a, Refusal::RingWrapped);
             tracing::debug!(
                 slot = b,
@@ -929,7 +931,7 @@ impl GpuEngine {
                 ring = v.ring,
                 window = g.window,
                 slack = v.ring as u32 - g.window,
-                diff = rows - p_a,
+                diff = written - p_a,
                 "vmm: publish_boundary skipped: ring overflow"
             );
             return false;

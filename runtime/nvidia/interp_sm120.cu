@@ -46,6 +46,11 @@ extern "C" __device__ unsigned plow_mixed_interpreter
  * can-fire are different claims, and only the second licenses a measurement. */
 extern "C" __device__ unsigned plow_token_batch_abi_1 = 1;
 extern "C" __device__ unsigned plow_row_gather_1 = 1;
+#if PLOW_NV_ROW_SLOT
+/* Span-mode decode (speculative verify): HEADNORM_ROPE_FP8 stores and FLASH_DECODE_FP8 reads
+ * honour the in.rowslot map (slot | bit-31 NO_STORE). The engine verifies only with this. */
+extern "C" __device__ unsigned plow_row_slot_1 = 1;
+#endif
 #ifndef PLOW_NV_ENTRY_TRACE
 #define PLOW_NV_ENTRY_TRACE 0
 #endif
@@ -1989,7 +1994,7 @@ __device__ __forceinline__ void plow_exec(const PlowDevInst* in, void* const* T,
 #if PLOW_FP8_KV
     // t6 retains the scale; packed objects use t7 for the row-to-slot map.
     case PLOW_DOP_HEADNORM_ROPE_FP8:
-#if PLOW_NV_PACKED_REQUEST
+#if PLOW_NV_PACKED_REQUEST || PLOW_NV_ROW_SLOT
 #define PLOW_HNR_FP8_SLOT , (const int*)TEN(7)
 #else
 #define PLOW_HNR_FP8_SLOT
@@ -2701,6 +2706,12 @@ __device__ __forceinline__ void plow_exec(const PlowDevInst* in, void* const* T,
      * (t6=k_scale t7=v_scale) in the flash inner loop; online-softmax/merge unchanged. */
     case PLOW_DOP_FLASH_DECODE_FP8: {
         const unsigned gqa = in->i[1] / in->i[2];
+#if PLOW_NV_ROW_SLOT
+/* Span-mode decode: j1 (fj[2]) is the in.rowslot handle, 0 = row t is slot t. */
+#define PLOW_FA_FP8_SLOT , in->fj[2].u ? (const int*)T[in->fj[2].u] : nullptr
+#else
+#define PLOW_FA_FP8_SLOT
+#endif
 #if PLOW_NV_GEMMA
         if (in->i[6] == 256) {
             if ((gqa % 2u) != 0) { __trap(); break; }
@@ -2708,14 +2719,14 @@ __device__ __forceinline__ void plow_exec(const PlowDevInst* in, void* const* T,
                 (float*)TEN(0), (float*)TEN(1), (const __nv_bfloat16*)TEN(2),
                 (const __nv_bfloat16*)TEN(3), (const __nv_bfloat16*)TEN(4), (const int*)TEN(5),
                 in->i[0], in->i[1], in->i[2], in->i[3], in->i[4], in->fj[0].f, in->i[5], in->i[7],
-                slice, nblk, arena, in->fj[1].u, (const float*)TEN(6), (const float*)TEN(7));
+                slice, nblk, arena, in->fj[1].u, (const float*)TEN(6), (const float*)TEN(7) PLOW_FA_FP8_SLOT);
         } else if (in->i[6] == 512) {
             if ((gqa % PLOW_NV_FA_GF_FULL) != 0) { __trap(); break; }
             d_flash_decode<512, PLOW_NV_FA_GF_FULL, true>(
                 (float*)TEN(0), (float*)TEN(1), (const __nv_bfloat16*)TEN(2),
                 (const __nv_bfloat16*)TEN(3), (const __nv_bfloat16*)TEN(4), (const int*)TEN(5),
                 in->i[0], in->i[1], in->i[2], in->i[3], in->i[4], in->fj[0].f, in->i[5], in->i[7],
-                slice, nblk, arena, in->fj[1].u, (const float*)TEN(6), (const float*)TEN(7));
+                slice, nblk, arena, in->fj[1].u, (const float*)TEN(6), (const float*)TEN(7) PLOW_FA_FP8_SLOT);
         } else {
             __trap();
         }
@@ -2726,8 +2737,9 @@ __device__ __forceinline__ void plow_exec(const PlowDevInst* in, void* const* T,
             (float*)TEN(0), (float*)TEN(1), (const __nv_bfloat16*)TEN(2),
             (const __nv_bfloat16*)TEN(3), (const __nv_bfloat16*)TEN(4), (const int*)TEN(5),
             in->i[0], in->i[1], in->i[2], in->i[3], in->i[4], in->fj[0].f, in->i[5], in->i[7],
-            slice, nblk, arena, in->fj[1].u, (const float*)TEN(6), (const float*)TEN(7));
+            slice, nblk, arena, in->fj[1].u, (const float*)TEN(6), (const float*)TEN(7) PLOW_FA_FP8_SLOT);
 #endif
+#undef PLOW_FA_FP8_SLOT
         break;
     }
 #endif /* PLOW_FP8_KV */

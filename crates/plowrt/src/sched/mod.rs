@@ -19,6 +19,7 @@ pub mod prefill;
 pub mod ride;
 pub mod rungs;
 pub mod slo;
+pub mod spec;
 pub mod step;
 
 use crate::asset::{Bucket, ModelBundle, Phase};

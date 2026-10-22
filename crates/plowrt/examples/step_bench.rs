@@ -74,8 +74,40 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut ride: Option<(usize, Vec<usize>)> = None;
     let mut ride_dump = None::<std::path::PathBuf>;
     let (mut dump_names, mut dump_dir) = (None::<String>, None::<String>);
+    let mut spec = SpecArgs::default();
+    let mut prompt_file = None::<String>;
     while let Some(a) = args.next() {
         match a.as_str() {
+            // `--spec oracle|adversarial|ngram`: speculative verify identity gate (see spec_bench).
+            "--spec" => spec.mode = Some(args.next().ok_or("--spec MODE")?),
+            "--spec-k" => spec.k = args.next().ok_or("--spec-k K")?.parse()?,
+            "--spec-rung" => spec.rung = args.next().ok_or("--spec-rung R")?.parse()?,
+            "--spec-poison" => spec.poison = true,
+            // `--spec-sample T,TOP_K,TOP_P,MIN_P`: sampled verify (see spec_bench); `--spec-host`
+            // samples the verify rows on the host instead of with `plow_sample`.
+            "--spec-sample" => {
+                let v: Vec<f32> = args
+                    .next()
+                    .ok_or("--spec-sample T,TOP_K,TOP_P,MIN_P")?
+                    .split(',')
+                    .map(str::parse)
+                    .collect::<Result<_, _>>()?;
+                let [temp, top_k, top_p, min_p] = v[..] else {
+                    return Err("--spec-sample T,TOP_K,TOP_P,MIN_P".into());
+                };
+                spec.sample = Some((temp, top_k as usize, top_p, min_p));
+            }
+            "--spec-host" => spec.host = true,
+            // `--prompt-tokens FILE`: JSON array of token-id prompts; slot b takes prompt b mod n,
+            // which must hold at least CTX tokens (truncated to CTX).
+            "--prompt-tokens" => prompt_file = Some(args.next().ok_or("--prompt-tokens FILE")?),
+            // `--draft-bench ITERS`: time the packet's draft programs at k = 1..=kmax (see draft_bench).
+            "--draft-bench" => {
+                spec.draft_iters = args.next().ok_or("--draft-bench ITERS")?.parse()?
+            }
+            "--nsplit-kvlen" => {
+                spec.nsplit_kvlen = Some(args.next().ok_or("--nsplit-kvlen N")?.parse()?)
+            }
             "--max-segments" => {
                 max_segments = Some(args.next().ok_or("--max-segments N")?.parse()?)
             }
@@ -185,7 +217,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             "execution_phase": "prefill_output",
         })
     };
+    let file_prompts: Option<Vec<Vec<u32>>> = prompt_file
+        .map(|f| -> Result<_, Box<dyn std::error::Error>> {
+            let p: Vec<Vec<u32>> = serde_json::from_slice(&std::fs::read(&f)?)?;
+            if p.is_empty() || p.iter().any(|x| x.len() < ctx) {
+                return Err(format!("{f}: every prompt needs at least {ctx} tokens").into());
+            }
+            Ok(p)
+        })
+        .transpose()?;
     let prompt_for = |b: usize| -> Vec<u32> {
+        if let Some(p) = &file_prompts {
+            return p[b % p.len()][..ctx].to_vec();
+        }
         let bb = if same { 0 } else { b as u32 };
         if spread {
             let mut x = 0x9e37_79b9u32 ^ (bb + 1).wrapping_mul(0x85eb_ca6b);
@@ -341,6 +385,22 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             record_inputs(histories, &last, &toks, 1);
         }
         last.copy_from_slice(&toks);
+    }
+    if spec.draft_iters > 0 {
+        return draft_bench(&mut e, &assets, &last, spec.draft_iters);
+    }
+    if let Some(mode) = spec.mode.clone() {
+        let prompts: Vec<Vec<u32>> = (0..slots).map(prompt_for).collect();
+        return spec_bench(
+            &mut e,
+            &assets,
+            &spec,
+            &mode,
+            &prompts,
+            &last,
+            ctx + warmup,
+            steps,
+        );
     }
     if let Some((lo, hi, step)) = seg_sweep {
         let base_pos: Vec<usize> = (0..slots).map(|_| ctx + warmup).collect();
@@ -596,7 +656,7 @@ fn ride_bench(
             phase,
             tokens,
             prompt_len: match phase {
-                Phase::Decode => ctx as u32,
+                Phase::Decode | Phase::Verify => ctx as u32,
                 Phase::Prefill => prompt.len() as u32,
             },
             selection: Selection::default(),
@@ -724,5 +784,521 @@ mod tests {
             single,
             vec![vec![10, 11, 12, 13, 14], vec![20, 21, 22, 23, 24]]
         );
+    }
+}
+
+#[derive(Default)]
+struct SpecArgs {
+    mode: Option<String>,
+    k: usize,
+    rung: usize,
+    poison: bool,
+    nsplit_kvlen: Option<u32>,
+    draft_iters: usize,
+    sample: Option<(f32, usize, f32, f32)>,
+    host: bool,
+}
+
+/// `--spec-sample`'s draws: slot `b`'s uniform for output token `i` (the `seeded_unit_with` grid),
+/// and each verify row's host sample for the device-vs-host check.
+#[cfg(feature = "cuda")]
+struct BenchSampler {
+    params: plowrt::text::sample::SamplingParams,
+    /// Per span: (slot, tokens it has emitted).
+    spans: Vec<(usize, usize)>,
+    prior: Vec<u32>,
+}
+
+#[cfg(feature = "cuda")]
+fn bench_unit(b: usize, i: usize) -> f32 {
+    let mut h = 0x9E37_79B9_7F4A_7C15u64 ^ ((b as u64) << 32 | i as u64);
+    h = (h ^ (h >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    h = (h ^ (h >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    ((h ^ (h >> 31)) % 10_000) as f32 / 10_000.0
+}
+
+#[cfg(feature = "cuda")]
+impl plowrt::exec::gpu::spec::SpecSampler for BenchSampler {
+    fn draws(&mut self, i: usize, _: &[u32], out: &mut [f32]) {
+        let (b, at) = self.spans[i];
+        for (j, u) in out.iter_mut().enumerate() {
+            *u = bench_unit(b, at + j);
+        }
+    }
+
+    fn host(&mut self, i: usize, tokens: &[u32], j: usize, logits: &mut [f32]) -> u32 {
+        let (b, at) = self.spans[i];
+        plowrt::orch::speculative::host_row_sample(
+            logits,
+            &self.params,
+            &[],
+            &tokens[1..=j],
+            bench_unit(b, at + j),
+            &mut self.prior,
+        )
+    }
+}
+
+#[cfg(feature = "cuda")]
+/// `--draft-bench ITERS`: after the warmup steps, row `b` of the hidden activation is slot `b`'s
+/// last decode row and `last[b]` the token it produced, which is exactly a draft's input. Times
+/// the draft program at every `k` (ITERS back-to-back launches, inputs staged once), then checks
+/// the deepest draft against the target's own greedy continuation (prefix agreement).
+fn draft_bench(
+    e: &mut plowrt::exec::gpu::GpuEngine,
+    assets: &std::path::Path,
+    last: &[u32],
+    iters: usize,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use std::time::Instant;
+    let kmax = e.spec_draft_enable(assets)?;
+    let mut toks = Vec::new();
+    let rows: Vec<(usize, u32, u32)> = last
+        .iter()
+        .enumerate()
+        .map(|(b, &t)| (b, t, b as u32))
+        .collect();
+    let mut drafts = Vec::new();
+    for k in 1..=kmax {
+        e.spec_draft_stage(&rows, k)?;
+        for _ in 0..3 {
+            e.spec_draft_launch()?;
+        }
+        e.spec_draft_sync()?;
+        let t0 = Instant::now();
+        for _ in 0..iters {
+            e.spec_draft_launch()?;
+        }
+        e.spec_draft_sync()?;
+        let ms = t0.elapsed().as_secs_f64() * 1e3 / iters as f64;
+        e.spec_draft_run(&mut drafts)?;
+        println!(
+            "DRAFT B={} k={k} ms={ms:.4} per_token_ms={:.4} row0={:?}",
+            rows.len(),
+            ms / f64::from(k),
+            &drafts[..k as usize]
+        );
+    }
+    // `STEP_BENCH_DRAFT_TRACE=1` with a -DPLOW_NV_TRACE object: block 0's per-op profile of one
+    // k = kmax draft launch (PLOW_TRACE_RAW gets the ordered packets).
+    if std::env::var_os("STEP_BENCH_DRAFT_TRACE").is_some() {
+        e.spec_draft_stage(&rows, kmax)?;
+        e.trace_reset()?;
+        e.spec_draft_launch()?;
+        e.spec_draft_sync()?;
+        if let Some(profile) = e.trace_summary()? {
+            println!("DRAFT_TRACE B={} k={kmax}\n{profile}", rows.len());
+        }
+    }
+    if let Some(dir) = std::env::var_os("STEP_BENCH_DRAFT_DUMP").map(std::path::PathBuf::from) {
+        draft_dump(e, &dir, &rows)?;
+    }
+    let k = kmax as usize;
+    let mut cur = last.to_vec();
+    let mut reference = vec![Vec::with_capacity(k); rows.len()];
+    for _ in 0..k {
+        let feeds: Vec<(usize, u32)> = cur.iter().copied().enumerate().collect();
+        e.step_slots(&feeds, &mut toks)?;
+        for (b, &t) in toks.iter().enumerate() {
+            reference[b].push(t);
+        }
+        cur.copy_from_slice(&toks);
+    }
+    let agree: Vec<usize> = (0..rows.len())
+        .map(|b| {
+            drafts[b * k..(b + 1) * k]
+                .iter()
+                .zip(&reference[b])
+                .take_while(|(d, r)| d == r)
+                .count()
+        })
+        .collect();
+    println!(
+        "DRAFT_AGREE B={} k={k} mean_prefix={:.3} per_row={agree:?} ref0={:?}",
+        rows.len(),
+        agree.iter().sum::<usize>() as f64 / rows.len() as f64,
+        reference[0]
+    );
+    Ok(())
+}
+
+/// Bench-only: per slot, the draft's inputs, the activations one k=1 draft leaves behind (layer 3
+/// for the per-layer ones), and the slot's target KV for the drafter's layers, for an offline
+/// reference diff (`STEP_BENCH_DRAFT_DUMP=dir`).
+#[cfg(feature = "cuda")]
+fn draft_dump(
+    e: &mut plowrt::exec::gpu::GpuEngine,
+    dir: &std::path::Path,
+    rows: &[(usize, u32, u32)],
+) -> Result<(), Box<dyn std::error::Error>> {
+    std::fs::create_dir_all(dir)?;
+    let slots = e.tensor_bytes("in.kvlen").ok_or("no in.kvlen")? as usize / 4;
+    let read = |e: &plowrt::exec::gpu::GpuEngine, name: &str, off: u64, len: usize| {
+        let mut v = vec![0u8; len];
+        e.read_tensor_range(name, off, &mut v).map(|_| v)
+    };
+    let mut toks = Vec::new();
+    for &(b, token, hrow) in rows {
+        let pos = e.slot_pos(b);
+        e.spec_draft_stage(&[(b, token, hrow)], 7)?;
+        e.spec_draft_run(&mut toks)?;
+        let drafts7 = toks.clone();
+        e.spec_draft_stage(&[(b, token, hrow)], 1)?;
+        e.spec_draft_run(&mut toks)?;
+        let d = dir.join(format!("slot{b}"));
+        std::fs::create_dir_all(&d)?;
+        let hidden = e.tensor_bytes("act.mtp.h").ok_or("no act.mtp.h")? as usize / 16;
+        std::fs::write(
+            d.join("act.hn.bin"),
+            read(e, "act.hn", hrow as u64 * hidden as u64, hidden)?,
+        )?;
+        for n in [
+            "e", "h", "x1", "x2", "x", "xn", "q", "qn", "at", "og", "hn", "fu", "dg", "logits",
+        ] {
+            let name = format!("act.mtp.{n}");
+            let row = e.tensor_bytes(&name).ok_or("missing")? as usize / 16;
+            std::fs::write(d.join(format!("{name}.bin")), read(e, &name, 0, row)?)?;
+        }
+        // Sliding ring whole; full layer only the committed rows per head (the rest is unmapped).
+        // `STEP_BENCH_DRAFT_DUMP_KV=<sliding layer>,<full layer>:<kv heads>:<head dim>` (default:
+        // the 26B-A4B assistant's 28 and 29:2:512; the 12B assistant is 46,47:1:512).
+        let spec =
+            std::env::var("STEP_BENCH_DRAFT_DUMP_KV").unwrap_or_else(|_| "28,29:2:512".into());
+        let kv_layers = spec
+            .split(',')
+            .map(|f| {
+                let bad = || {
+                    format!(
+                        "STEP_BENCH_DRAFT_DUMP_KV: {f:?} is not <layer> or <layer>:<heads>:<dim>"
+                    )
+                };
+                let v = f
+                    .split(':')
+                    .map(|x| x.parse::<usize>().map_err(|_| bad()))
+                    .collect::<Result<Vec<_>, _>>()?;
+                match v[..] {
+                    [l] => Ok((l, 0, 0)),
+                    [l, h, d] if h > 0 && d > 0 => Ok((l, h, d)),
+                    _ => Err(bad()),
+                }
+            })
+            .collect::<Result<Vec<_>, String>>()?;
+        for &(l, kvh, row_bytes) in &kv_layers {
+            for (t, elt) in [("k", 1), ("v", 1), ("k_scale", 4), ("v_scale", 4)] {
+                let name = format!("kv.{l}.{t}");
+                let per = e.tensor_bytes(&name).ok_or("missing kv")? as usize / slots;
+                let bytes = if kvh == 0 {
+                    read(e, &name, (b * per) as u64, per)?
+                } else {
+                    let (head, row) = (per / kvh, if elt == 1 { row_bytes } else { 4 });
+                    if per % kvh != 0 || pos * row > head {
+                        let m = format!("{name}: {kvh} x {pos} rows x {row} B exceed {per} B/slot");
+                        return Err(m.into());
+                    }
+                    let mut v = Vec::new();
+                    for h in 0..kvh {
+                        v.extend(read(e, &name, (b * per + h * head) as u64, pos * row)?);
+                    }
+                    v
+                };
+                std::fs::write(d.join(format!("{name}.bin")), bytes)?;
+            }
+        }
+        std::fs::write(
+            d.join("meta.json"),
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "slot": b, "token": token, "hidden_row": hrow, "pos": pos,
+                "draft1": toks[0], "drafts7": drafts7,
+            }))?,
+        )?;
+    }
+    Ok(())
+}
+
+/// `--spec MODE`: the span-mode verify identity gate. A plain greedy run of `steps` tokens per
+/// slot at a fixed rung (`--spec-rung R`, and `--nsplit-kvlen N` for a fixed dense split) is the
+/// reference; the slots are rewound and the same tokens regenerated through `spec_verify` +
+/// `spec_commit` with drafts from MODE: `oracle` (the reference's next tokens, all accepted),
+/// `adversarial` (every draft wrong, all rejected), `ngram` (prompt lookup over each slot's
+/// history). `--spec-poison` NaN-fills every row a verify will write before it runs, and every
+/// uncommitted row after it. `--spec-sample T,TOP_K,TOP_P,MIN_P` makes the reference a plain
+/// sampled run (`plow_sample`, or the host sampler with `--spec-host`; draw `bench_unit(slot, i)`
+/// for token `i`) and samples the verify rows with plain decode's sampler and draws, so the
+/// streams must still match; each
+/// device-sampled verdict is also recomputed on the host from the downloaded verify logits
+/// (`SPEC_SAMPLE_HOST`). Prints `SPEC_IDENTITY ok|MISMATCH` and the verify cost.
+#[cfg(feature = "cuda")]
+#[allow(clippy::too_many_arguments)]
+fn spec_bench(
+    e: &mut plowrt::exec::gpu::GpuEngine,
+    assets: &std::path::Path,
+    a: &SpecArgs,
+    mode: &str,
+    prompts: &[Vec<u32>],
+    last: &[u32],
+    base: usize,
+    steps: usize,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use plowrt::exec::gpu::spec::{SpecDraw, SpecSpan};
+    use plowrt::orch::speculative::ngram_propose;
+    use std::time::Instant;
+    let slots = last.len();
+    let max_k = e.spec_enable(assets)?;
+    if a.k > max_k || slots * (a.k + 1) > a.rung.max(1) && a.rung > 0 {
+        return Err(format!(
+            "k {} (max {max_k}) x {slots} slots exceeds rung {}",
+            a.k, a.rung
+        )
+        .into());
+    }
+    e.set_debug_min_rung(a.rung);
+    e.set_debug_nsplit_kvlen(a.nsplit_kvlen);
+    for b in 0..slots {
+        e.snapshot_slot(b)?;
+    }
+    let dev = a
+        .sample
+        .map(|(temp, top_k, top_p, min_p)| plowrt::exec::gpu::DevSample {
+            temp,
+            top_k: top_k as i32,
+            top_p,
+            min_p,
+            rng01: 0.0,
+            penalty: 1.0,
+        });
+    if dev.is_some() && !e.dev_sample_enabled() {
+        return Err("--spec-sample needs the device sampler (sample_sm120.cubin)".into());
+    }
+    let mut sampler = BenchSampler {
+        params: plowrt::text::sample::SamplingParams {
+            temperature: dev.map_or(0.0, |d| d.temp),
+            top_k: dev.map_or(0, |d| d.top_k as usize),
+            top_p: dev.map_or(1.0, |d| d.top_p),
+            min_p: dev.map_or(0.0, |d| d.min_p),
+            ..Default::default()
+        },
+        spans: Vec::new(),
+        prior: Vec::new(),
+    };
+    let draw = match dev {
+        None => SpecDraw::Argmax,
+        Some(_) if a.host => SpecDraw::Host,
+        Some(d) => SpecDraw::Device(d),
+    };
+    let mut logits = Vec::new();
+    // Reference: plain decode (greedy, device-sampled, or host-sampled) at the fixed rung.
+    let mut cur = last.to_vec();
+    let mut reference = vec![Vec::with_capacity(steps); slots];
+    let feeds = |cur: &[u32]| -> Vec<(usize, u32)> { cur.iter().copied().enumerate().collect() };
+    let mut toks = Vec::new();
+    let mut specs = vec![plowrt::exec::gpu::DevSample::greedy(); e.batch()];
+    let t0 = Instant::now();
+    for i in 0..steps {
+        if let Some(d) = dev {
+            for (b, s) in specs.iter_mut().enumerate().take(slots) {
+                *s = plowrt::exec::gpu::DevSample {
+                    rng01: bench_unit(b, i),
+                    ..d
+                };
+            }
+        }
+        if a.host && dev.is_some() {
+            // `--spec-host`'s reference is plain host-sampled decode.
+            e.step_slots(&feeds(&cur), &mut toks)?;
+            for (b, t) in toks.iter_mut().enumerate() {
+                e.logits_row(b, &mut logits)?;
+                let u = bench_unit(b, i);
+                *t = plowrt::orch::speculative::host_row_sample(
+                    &mut logits,
+                    &sampler.params,
+                    &[],
+                    &[],
+                    u,
+                    &mut sampler.prior,
+                );
+            }
+        } else {
+            e.step_slots_sampled(&feeds(&cur), dev.map(|_| specs.as_slice()), &mut toks)?;
+        }
+        for (b, &t) in toks.iter().enumerate() {
+            reference[b].push(t);
+        }
+        cur.copy_from_slice(&toks);
+    }
+    let plain_ms = t0.elapsed().as_secs_f64() * 1e3 / steps.max(1) as f64;
+    for b in 0..slots {
+        e.rewind_slot(b, base)?;
+    }
+
+    let vocab = e.vocab() as u32;
+    let mut out: Vec<Vec<u32>> = vec![Vec::with_capacity(steps); slots];
+    let mut hist: Vec<Vec<u32>> = prompts.to_vec();
+    for (h, &t) in hist.iter_mut().zip(last) {
+        h.push(t);
+    }
+    let mut pending = last.to_vec();
+    let (mut ticks, mut drafted, mut accepted, mut verify_ms) = (0usize, 0usize, 0usize, 0f64);
+    let mut n_spans = 0usize;
+    let mut inputs: Vec<Vec<u32>> = vec![Vec::new(); slots];
+    let mut draft = Vec::new();
+    let mut verdicts = Vec::new();
+    // `mtp`: the packet's draft programs. A slot's draft input is its pending token and the verify
+    // row that produced it; the first tick verifies the pending token alone to get that row.
+    let mut hrow: Vec<Option<u32>> = vec![None; slots];
+    let mut mtp = Vec::new();
+    let mut draft_ms = 0f64;
+    let (mut host_rows, mut host_spans, mut host_mismatch) = (0usize, 0usize, 0usize);
+    if mode == "mtp" {
+        e.spec_draft_enable(assets)?;
+    }
+    while out.iter().any(|o| o.len() < steps) {
+        let live: Vec<usize> = (0..slots).filter(|&b| out[b].len() < steps).collect();
+        let drafting = mode == "mtp" && live.iter().all(|&b| hrow[b].is_some());
+        if drafting {
+            let rows: Vec<(usize, u32, u32)> = live
+                .iter()
+                .map(|&b| (b, pending[b], hrow[b].unwrap()))
+                .collect();
+            let t = Instant::now();
+            e.spec_draft_stage(&rows, a.k as u32)?;
+            e.spec_draft_run(&mut mtp)?;
+            draft_ms += t.elapsed().as_secs_f64() * 1e3;
+        }
+        for (li, &b) in live.iter().enumerate() {
+            let i = out[b].len();
+            let k = a.k.min(steps - i - 1);
+            match mode {
+                "mtp" => {
+                    draft.clear();
+                    if drafting {
+                        draft.extend_from_slice(&mtp[li * a.k..li * a.k + k]);
+                    }
+                }
+                "oracle" => {
+                    draft.clear();
+                    draft.extend_from_slice(&reference[b][i..i + k]);
+                }
+                "adversarial" => {
+                    draft.clear();
+                    draft.extend(reference[b][i..i + k].iter().map(|&t| (t + 1) % vocab));
+                }
+                "ngram" => ngram_propose(&hist[b], k, 1, 4, &mut draft),
+                m => return Err(format!("unknown --spec mode {m}").into()),
+            }
+            inputs[b].clear();
+            inputs[b].push(pending[b]);
+            inputs[b].extend_from_slice(&draft);
+            drafted += inputs[b].len() - 1;
+        }
+        let spans: Vec<SpecSpan> = live
+            .iter()
+            .map(|&b| SpecSpan {
+                slot: b,
+                tokens: &inputs[b],
+                draw,
+            })
+            .collect();
+        sampler.spans.clear();
+        sampler
+            .spans
+            .extend(live.iter().map(|&b| (b, out[b].len())));
+        if a.poison {
+            // Every row this launch writes holds NaN first: a row read before its own span's
+            // store lands (a missing intra-span dependency) poisons the output.
+            for sp in &spans {
+                let p0 = e.slot_pos(sp.slot) as u32;
+                e.spec_poison_rows(sp.slot, p0, p0 + sp.tokens.len() as u32)?;
+            }
+        }
+        let t = Instant::now();
+        e.spec_verify(&spans, &[], Some(&mut sampler), &mut verdicts)?;
+        verify_ms += t.elapsed().as_secs_f64() * 1e3;
+        if let SpecDraw::Device(_) = draw {
+            use plowrt::exec::gpu::spec::SpecSampler;
+            let mut r = 0u32;
+            for (i, (sp, v)) in spans.iter().zip(&verdicts).enumerate() {
+                let host = plowrt::orch::speculative::accept_sampled(
+                    sp.tokens,
+                    |j| {
+                        e.logits_row(r as usize + j, &mut logits)?;
+                        host_rows += 1;
+                        Ok::<_, plowrt::RuntimeError>(sampler.host(i, sp.tokens, j, &mut logits))
+                    },
+                    r,
+                    v.req_gen,
+                    &[],
+                )?;
+                host_spans += 1;
+                if host != *v {
+                    host_mismatch += 1;
+                    println!("  slot {}: device {v:?} vs host {host:?}", sp.slot);
+                }
+                r += sp.tokens.len() as u32;
+            }
+        }
+        ticks += 1;
+        n_spans += spans.len();
+        for (sp, v) in spans.iter().zip(&verdicts) {
+            let n = usize::from(v.n_emit);
+            let p0 = e.slot_pos(sp.slot) as u32;
+            if a.poison {
+                e.spec_poison_rows(sp.slot, p0 + n as u32, p0 + sp.tokens.len() as u32)?;
+            }
+            e.spec_commit(sp, v)?;
+            accepted += usize::from(v.n_acc);
+            let emitted = &v.tokens[..n];
+            out[sp.slot].extend_from_slice(emitted);
+            hist[sp.slot].extend_from_slice(emitted);
+            pending[sp.slot] = emitted[n - 1];
+            hrow[sp.slot] = Some(v.hrow);
+        }
+    }
+    if let SpecDraw::Device(_) = draw {
+        println!(
+            "SPEC_SAMPLE_HOST spans={host_spans} rows={host_rows} verdict_mismatch={host_mismatch}"
+        );
+    }
+    let mut ok = true;
+    for b in 0..slots {
+        out[b].truncate(steps);
+        if out[b] != reference[b] {
+            ok = false;
+            let at = out[b].iter().zip(&reference[b]).position(|(x, y)| x != y);
+            println!("  slot {b}: first divergence at {at:?}");
+        }
+    }
+    let digest = |s: &[Vec<u32>]| {
+        let mut d: u64 = 0xcbf29ce484222325;
+        for i in 0..steps {
+            for v in s {
+                d = (d ^ u64::from(v[i])).wrapping_mul(0x100000001b3);
+            }
+        }
+        d
+    };
+    println!(
+        "SPEC_IDENTITY {} mode={mode} slots={slots} k={} rung={} base={base} steps={steps} \
+         poison={} sample={:?} draw={} ref_fnv={:016x} spec_fnv={:016x} ticks={ticks} drafted={drafted} accepted={accepted} \
+         mean_emit={:.3} plain_ms={plain_ms:.3} verify_ms={:.3} draft_ms={:.3}",
+        if ok { "ok" } else { "MISMATCH" },
+        a.k,
+        a.rung,
+        a.poison,
+        a.sample,
+        match draw {
+            SpecDraw::Argmax => "argmax",
+            SpecDraw::Device(_) => "device",
+            SpecDraw::Host => "host",
+        },
+        digest(&reference),
+        digest(&out),
+        (steps * slots) as f64 / n_spans as f64,
+        verify_ms / ticks as f64,
+        draft_ms / ticks as f64,
+    );
+    if ok {
+        Ok(())
+    } else {
+        Err("speculative verify diverged from the plain reference".into())
     }
 }
