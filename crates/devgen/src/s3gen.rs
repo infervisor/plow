@@ -316,7 +316,7 @@ pub fn lower_s3gen(
     let slots: Vec<(u32, u32)> = S3GEN_SLOT_CAPACITIES
         .iter()
         .copied()
-        .filter(|&(_, n)| cfg.clone_slots > 0 && n <= cfg.max_tokens)
+        .filter(|&(b, n)| b <= cfg.clone_slots && n <= cfg.max_tokens)
         .collect();
     let bmax = caps
         .iter()

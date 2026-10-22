@@ -337,6 +337,8 @@ impl VoiceSlots {
                     tok[..p].copy_from_slice(&v.prompt_token);
                     let mut feat = vec![0f32; 2 * pm * 80];
                     feat[..v.prompt_feat.len()].copy_from_slice(&v.prompt_feat);
+                    // Unmapped until every table is written: a failed write leaves no voice on it.
+                    self.resident[s] = None;
                     let [t, f, k, l] = self.tables;
                     rt.write_tensor_at(t, s * pm * 4, bytemuck::cast_slice(&tok))
                         .map_err(e)?;
@@ -953,7 +955,12 @@ impl Bound {
         if let Some(v) = &j.clone {
             let pm = self.voice_slots.as_ref().map_or(0, |s| s.prompt_max);
             let p = v.prompt_token.len();
-            if p == 0 || p > pm || v.prompt_feat.len() != 2 * p * 80 || v.spks.len() != 80 {
+            if p == 0
+                || p > pm
+                || v.prompt_feat.len() != 2 * p * 80
+                || v.spks.len() != 80
+                || !v.prompt_feat.iter().chain(&v.spks).all(|x| x.is_finite())
+            {
                 return Err("cloned voice does not fit the codec's voice slots");
             }
             if self.capacity(Family::Slot, 1, j.frames).is_none() {
