@@ -7368,14 +7368,14 @@ fn emit_phase(
             ds_copy.expect("DSpark context: no tapped layer in this program"),
             ds_writers.expect("DSpark context: no full-layer K/V writer in this program"),
             &elem,
-            &|b: &mut Builder, src: u32, after: u32| {
+            &|b: &mut Builder, j: usize, src: u32, after: u32| {
                 if w8a8 && (!gemv_family || fp8_lt_decode) {
-                    quant(b, ds.xq, ds.xs, src, c.hidden, after)
+                    quant(b, ds.xq[j], ds.xs[j], src, c.hidden, after)
                 } else {
                     after
                 }
             },
-            &|b: &mut Builder, out: u32, a: u32, p: dspark::Proj, dep: u32| {
+            &|b: &mut Builder, j: usize, out: u32, a: u32, p: dspark::Proj, dep: u32| {
                 proj(
                     b,
                     out,
@@ -7384,8 +7384,8 @@ fn emit_phase(
                     p.w8,
                     p.scale,
                     TENSOR_NONE,
-                    ds.xq,
-                    ds.xs,
+                    ds.xq[j],
+                    ds.xs[j],
                     t,
                     p.n,
                     c.hidden,
@@ -7585,6 +7585,88 @@ fn emit_phase(
 /// vocab in one strided pass per thread.
 const AMAX_BLOCKS: u32 = 64;
 
+/// The DSpark context tail (dspark.rs): `s = sum_j fc_j(tap_j)`, `xn = hidden_norm(s)`, then per
+/// drafter layer `k = k_proj(xn)` stored through clones of the program's own last full-layer K/V
+/// writers (`rope(k_norm(k))` and the weightless `v_norm(k)`), so every row lands at its own
+/// position and slot exactly as the target's does. Each phase quantizes all its inputs first and
+/// then runs its projections back to back on per-tap buffers: on the cuBLASLt rungs (decode 128,
+/// prefill) that is one library run per phase instead of one per projection. The sum keeps the
+/// tap order. `after` is the last tap copy, which every earlier copy precedes.
+#[allow(clippy::too_many_arguments)]
+fn emit_dspark_tail(
+    b: &mut Builder,
+    c: &Cfg,
+    ds: &dspark::Tensors,
+    t: u32,
+    after: u32,
+    (kw, vw): (DevInst, DevInst),
+    elem: &dyn Fn(u32) -> Vec<u32>,
+    quant: &dyn Fn(&mut Builder, usize, u32, u32) -> u32,
+    proj: &dyn Fn(&mut Builder, usize, u32, u32, dspark::Proj, u32) -> u32,
+    rows: Vec<u32>,
+) {
+    let dq: Vec<u32> = (0..ds.fc.len())
+        .map(|j| quant(b, j, ds.tap[j], after))
+        .collect();
+    let g: Vec<u32> = ds
+        .fc
+        .iter()
+        .enumerate()
+        .map(|(j, &f)| proj(b, j, ds.y[j], ds.tap[j], f, dq[j]))
+        .collect();
+    let mut sum = g[0];
+    for j in 1..g.len() {
+        let a = if j == 1 { ds.y[0] } else { ds.s };
+        sum = b.emit(DevOp::Residual, elem(t * c.hidden), &[sum, g[j]], |d| {
+            d.t[0] = ds.s;
+            d.t[1] = a;
+            d.t[2] = ds.y[j];
+            d.i[0] = t * c.hidden;
+            d.f[0] = 1.0;
+        });
+    }
+    let s = if g.len() == 1 { ds.y[0] } else { ds.s };
+    let cn = b.emit(DevOp::RmsNorm, rows, &[sum], |d| {
+        d.t[0] = ds.xn;
+        d.t[1] = s;
+        d.t[2] = ds.hidden_norm;
+        d.i[0] = t;
+        d.i[1] = c.hidden;
+        d.f[0] = ds.eps();
+    });
+    let dq = quant(b, 0, ds.xn, cn);
+    let clone = |b: &mut Builder, src: &DevInst, dep: u32, f: &dyn Fn(&mut DevInst)| {
+        let op = DevOp::from_u16(src.op).expect("KV writer opcode");
+        b.emit(op, (0..src.blocks as u32).collect(), &[dep], |d| {
+            d.t = src.t;
+            d.i = src.i;
+            d.f = src.f;
+            d.j = src.j;
+            f(d);
+        });
+    };
+    let ck: Vec<u32> = ds
+        .k_proj
+        .iter()
+        .enumerate()
+        .map(|(i, &kp)| proj(b, 0, ds.k[i], ds.xn, kp, dq))
+        .collect();
+    for (i, &ck) in ck.iter().enumerate() {
+        let [kc, vc, ks, vs] = ds.kv[i];
+        clone(b, &kw, ck, &|d| {
+            d.t[0] = kc;
+            d.t[1] = ds.k[i];
+            d.t[2] = ds.k_norm[i];
+            d.t[6] = ks;
+        });
+        clone(b, &vw, ck, &|d| {
+            d.t[0] = vc;
+            d.t[1] = ds.k[i];
+            d.t[6] = vs;
+        });
+    }
+}
+
 /// L2 — FINER DECODE-GEMV SLICES. `PLOW_GEMV_SPLIT=S` emits `S * n_cu` slices for the
 /// machine-filling `Gemv` / `GemvGlu` / `GemvQkv` packets of the DECODE program instead of `n_cu`,
 /// so a workgroup that finishes early claims another slice off the global queue instead of waiting
@@ -7626,75 +7708,6 @@ const AMAX_BLOCKS: u32 = 64;
 /// argument in [`Builder::set_gemv_split`] requires, so this is a clean performance null and not a
 /// correctness question. **Attacking the straggler tail needs the wave assignment inside
 /// `gemv_rows` to become dynamic too; splitting packets alone cannot pay for the rounding.**
-/// The DSpark context tail (dspark.rs): `s = sum_j fc_j(tap_j)` as one serial chain over one
-/// quant/partial buffer, `xn = hidden_norm(s)`, then per drafter layer `k = k_proj(xn)` stored
-/// through clones of the program's own last full-layer K/V writers (`rope(k_norm(k))` and the
-/// weightless `v_norm(k)`), so every row lands at its own position and slot exactly as the
-/// target's does. `after` is the last tap copy, which every earlier copy precedes.
-#[allow(clippy::too_many_arguments)]
-fn emit_dspark_tail(
-    b: &mut Builder,
-    c: &Cfg,
-    ds: &dspark::Tensors,
-    t: u32,
-    mut after: u32,
-    (kw, vw): (DevInst, DevInst),
-    elem: &dyn Fn(u32) -> Vec<u32>,
-    quant: &dyn Fn(&mut Builder, u32, u32) -> u32,
-    proj: &dyn Fn(&mut Builder, u32, u32, dspark::Proj, u32) -> u32,
-    rows: Vec<u32>,
-) {
-    for (j, &f) in ds.fc.iter().enumerate() {
-        let dq = quant(b, ds.tap[j], after);
-        let g = proj(b, if j == 0 { ds.s } else { ds.y }, ds.tap[j], f, dq);
-        after = if j == 0 {
-            g
-        } else {
-            b.emit(DevOp::Residual, elem(t * c.hidden), &[g], |d| {
-                d.t[0] = ds.s;
-                d.t[1] = ds.s;
-                d.t[2] = ds.y;
-                d.i[0] = t * c.hidden;
-                d.f[0] = 1.0;
-            })
-        };
-    }
-    let cn = b.emit(DevOp::RmsNorm, rows, &[after], |d| {
-        d.t[0] = ds.xn;
-        d.t[1] = ds.s;
-        d.t[2] = ds.hidden_norm;
-        d.i[0] = t;
-        d.i[1] = c.hidden;
-        d.f[0] = ds.eps();
-    });
-    let dq = quant(b, ds.xn, cn);
-    let clone = |b: &mut Builder, src: &DevInst, dep: u32, f: &dyn Fn(&mut DevInst)| {
-        let op = DevOp::from_u16(src.op).expect("KV writer opcode");
-        b.emit(op, (0..src.blocks as u32).collect(), &[dep], |d| {
-            d.t = src.t;
-            d.i = src.i;
-            d.f = src.f;
-            d.j = src.j;
-            f(d);
-        });
-    };
-    for (i, &kp) in ds.k_proj.iter().enumerate() {
-        let ck = proj(b, ds.k[i], ds.xn, kp, dq);
-        let [kc, vc, ks, vs] = ds.kv[i];
-        clone(b, &kw, ck, &|d| {
-            d.t[0] = kc;
-            d.t[1] = ds.k[i];
-            d.t[2] = ds.k_norm[i];
-            d.t[6] = ks;
-        });
-        clone(b, &vw, ck, &|d| {
-            d.t[0] = vc;
-            d.t[1] = ds.k[i];
-            d.t[6] = vs;
-        });
-    }
-}
-
 fn gemv_split() -> u32 {
     emit_config::active().gemv_split
 }

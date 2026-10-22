@@ -405,7 +405,17 @@ fn the_context_tail_adds_ops_and_changes_no_target_instruction() {
     let fname = |h: u32| fp8.tensors[h as usize].0.as_str();
     assert!(prefill
         .iter()
-        .any(|d| d.op == DevOp::QuantFp8 as u16 && fname(d.t[0]) == "act.dspark.xq"));
+        .any(|d| d.op == DevOp::QuantFp8 as u16 && fname(d.t[0]) == "act.dspark.xq1"));
+    // Each projection phase runs back to back (one cuBLASLt run per phase on library rungs).
+    for prefix in ["fp8/dspark.fc.", "fp8/dspark.layers."] {
+        let at: Vec<usize> = prefill
+            .iter()
+            .enumerate()
+            .filter(|(_, d)| d.t[2] != TENSOR_NONE && fname(d.t[2]).starts_with(prefix))
+            .map(|(i, _)| i)
+            .collect();
+        assert!(at.len() >= 2 && at.windows(2).all(|w| w[1] == w[0] + 1), "{prefix}: {at:?}");
+    }
     let _ = std::fs::remove_dir_all(dir);
 }
 

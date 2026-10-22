@@ -213,10 +213,12 @@ pub(crate) struct Tensors {
     pub(crate) k_proj: Vec<Proj>,
     pub(crate) k_norm: Vec<u32>,
     pub(crate) hidden_norm: u32,
-    /// Tail scratch: activation quant (w8a8), one partial, the sum, its norm, per-layer k.
-    pub(crate) xq: u32,
-    pub(crate) xs: u32,
-    pub(crate) y: u32,
+    /// Tail scratch, per tap: activation quant (w8a8) and projection, so every projection of a
+    /// phase runs back to back (one library-routed run per phase on the cuBLASLt rungs); then the
+    /// sum, its norm and per-layer k.
+    pub(crate) xq: Vec<u32>,
+    pub(crate) xs: Vec<u32>,
+    pub(crate) y: Vec<u32>,
     pub(crate) s: u32,
     pub(crate) xn: u32,
     pub(crate) k: Vec<u32>,
@@ -337,17 +339,27 @@ pub(crate) fn declare(
             })
             .collect(),
         hidden_norm: b.tensor("dspark.hidden_norm.weight", h * BF16),
-        xq: if w8a8 {
-            a(b, "xq", r * h)
-        } else {
-            packet::dev::TENSOR_NONE
-        },
-        xs: if w8a8 {
-            a(b, "xs", r * F32)
-        } else {
-            packet::dev::TENSOR_NONE
-        },
-        y: a(b, "y", r * h * BF16),
+        xq: (0..cfg.taps.len())
+            .map(|j| {
+                if w8a8 {
+                    a(b, &format!("xq{j}"), r * h)
+                } else {
+                    packet::dev::TENSOR_NONE
+                }
+            })
+            .collect(),
+        xs: (0..cfg.taps.len())
+            .map(|j| {
+                if w8a8 {
+                    a(b, &format!("xs{j}"), r * F32)
+                } else {
+                    packet::dev::TENSOR_NONE
+                }
+            })
+            .collect(),
+        y: (0..cfg.taps.len())
+            .map(|j| a(b, &format!("y{j}"), r * h * BF16))
+            .collect(),
         s: a(b, "s", r * h * BF16),
         xn: a(b, "xn", r * h * BF16),
         k: (0..cfg.layers)
