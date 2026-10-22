@@ -91,11 +91,36 @@ def main():
         ok &= n3 == len(t3) and eq3 == len(t3) and P == len(gt) and eqg == len(gt)
         print(f"tok ({us / 1e3:.2f} ms): G6 T3 tokens {eq3}/{len(t3)} (count {n3})  s3gen tokens {eqg}/{len(gt)} (P {P})")
     if "camp" in stages:
-        fcm = G("camp_fcm")[0].T
-        res, us = run(a, f"stage.camp.c{a.cap}", {"act.vc.fcm": fcm, "act.vc.tfb": u32(len(fcm))},
-                      {"out.vc.spks": np.float32})
+        fb, fcm = G("campplus_fbank"), G("camp_fcm")[0].T
+        rows = (a.cap * 16000 - 400) // 160 + 1
+        fbp = np.zeros((rows, 80), np.float32)
+        fbp[: len(fb)] = fb
+        res, us = run(a, f"stage.camp.c{a.cap}", {"act.vc.fbank": fbp, "act.vc.tfb": u32(len(fb))},
+                      {"act.vc.fcm": np.float32, "out.vc.spks": np.float32})
         print(f"camp ({us / 1e3:.2f} ms):")
-        gate("G8 spks80 (from golden FCM)", res["out.vc.spks"], G("s3gen_spks80").reshape(-1), 1e-4)
+        gate("   CAMPPlus FCM", res["act.vc.fcm"][: fcm.size], fcm, 1e-4)
+        gate("G8 spks80", res["out.vc.spks"], G("s3gen_spks80").reshape(-1), 1e-4)
+    if "ve" in stages:
+        w16s = G("wav16_librosa").astype(np.float32)
+        res, us = run(a, f"stage.ve.c{a.cap}", {"act.vc.w16s": w16s, "act.vc.l16s": u32(len(w16s))},
+                      {"act.vc.wt": np.float32, "act.vc.lt": np.uint32, "act.vc.nparts": np.uint32,
+                       "act.vc.parts": np.float32, "act.vc.spk": np.float32})
+        wt, lt, n = G("ve_wav16_trimmed"), int(res["act.vc.lt"][0]), int(res["act.vc.nparts"][0])
+        parts = G("ve_partials")
+        print(f"ve ({us / 1e3:.2f} ms): trimmed {lt} (ref {len(wt)})  partials {n} (ref {len(parts)})")
+        ok &= lt == len(wt) and n == len(parts)
+        gate("G5 trimmed 16k", res["act.vc.wt"][: len(wt)], wt, 1e-6)
+        gate("G5 VE partials", res["act.vc.parts"][: parts.size], parts, 1e-5)
+        gate("G7 VE speaker embedding", res["act.vc.spk"], G("t3_speaker_emb").reshape(-1), 1e-4)
+    if "cond" in stages:
+        t3 = G("t3_cond_prompt_speech_tokens").reshape(-1).astype(np.uint32)
+        res, us = run(a, f"stage.cond.c{a.cap}",
+                      {"act.vc.spk": G("t3_speaker_emb").reshape(-1), "out.vc.t3_tokens": t3,
+                       "out.vc.t3_count": u32(len(t3)), "exaggeration": np.array([0.5], np.float32)},
+                      {"out.vc.rows": np.float32})
+        ref = G("t3_cond_rows")
+        print(f"cond ({us / 1e3:.2f} ms):")
+        gate("G9 T3 cond rows", res["out.vc.rows"][: ref.size], ref, 1e-4)
     print("OVERALL:", "PASS" if ok else "FAIL")
     return 0 if ok else 1
 

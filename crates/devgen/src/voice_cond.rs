@@ -90,6 +90,26 @@ impl Seq {
         Ok(self.done(e))
     }
 
+    fn relu_inplace(&mut self, x: u32, rows: u32, width: u32) -> Result<u32, String> {
+        let dep = self.last;
+        let e = self.p().unary_f32(
+            x,
+            &[dep],
+            UnaryF32Stage {
+                output: TensorRef::Handle(x),
+                param: None,
+                rows,
+                width,
+                stride: 0,
+                col0: 0,
+                kind: Activation::Relu,
+                p0: 0.0,
+                p1: 0.0,
+            },
+        )?;
+        Ok(self.done(e))
+    }
+
     fn scale_shift(
         &mut self,
         x: u32,
@@ -1237,10 +1257,12 @@ pub fn lower_voice_cond(
     let mut roles = std::collections::BTreeMap::new();
     for &secs in CAPACITIES {
         let d = Dims::of(secs);
-        let stages: [(&str, &dyn Fn(&mut Seq) -> Result<(), String>); 3] = [
+        let stages: [(&str, &dyn Fn(&mut Seq) -> Result<(), String>); 5] = [
             ("front", &|s| front(s, &cfg, d, io)),
             ("tok", &|s| tokens(s, d, io)),
             ("camp", &|s| speaker(s, &cfg, d, io)),
+            ("ve", &|s| voice_encoder(s, &cfg, d)),
+            ("cond", &|s| t3_rows(s, &cfg, io)),
         ];
         for (k, (name, body)) in stages.iter().enumerate() {
             let program = prefix.model.progs.len() as u32;
@@ -1365,11 +1387,77 @@ fn tokens(s: &mut Seq, d: Dims, io: Io) -> Result<(), String> {
 }
 
 /// CAMPPlus x-vector -> the s3gen speaker vector `spk_embed_affine(normalize(x))`.
+/// One FP32 Conv2dF32 over `[frames][width][cin]` (channels last), kernel `k` (pad `k / 2` on
+/// both axes), width stride `ws`, bias + optional ReLU, into `out` (`fcw`: `[frames][cout][width]`).
+#[allow(clippy::too_many_arguments)]
+fn conv2d(
+    s: &mut Seq,
+    x: u32,
+    out: &str,
+    (frames, width, cin, cout): (u32, u32, u32, u32),
+    w: &str,
+    (k, ws): (u32, u32),
+    relu: bool,
+    fcw: bool,
+) -> Result<(u32, u32), String> {
+    let ow = (width + 2 * (k / 2) - k) / ws + 1;
+    let o = s
+        .p()
+        .declare(out, u64::from(frames) * u64::from(ow) * u64::from(cout) * 4);
+    let wt = s.p().declare(
+        &format!("{w}.wt"),
+        u64::from(cout) * u64::from(cin) * u64::from(k * k) * 4,
+    );
+    let b = s.p().declare(&format!("{w}.b"), u64::from(cout) * 4);
+    // FP32 weights on 3xTF32 tensor cores (bit 9), weight_f32 (bit 6), layouts in bits 2-5.
+    let flags = u32::from(relu) << 1 | u32::from(fcw) << 2 | 1 << 6 | 1 << 9 | ws << 16;
+    let units = u64::from((frames * ow).div_ceil(64) * cout.div_ceil(64));
+    s.raw(DevOp::Conv2dF32, units, o, |di| {
+        di.t[..4].copy_from_slice(&[o, x, wt, b]);
+        di.i = [frames, width, cin, cout, k, 1, k / 2, k / 2];
+        di.j[0] = flags;
+        di.j[1] = 1;
+    })?;
+    Ok((o, ow))
+}
+
+/// CAMPPlus FCM on the masked fbank `[t][80]` (valid rows `len_t`): 2-D residual conv stack over
+/// (time, freq) with freq strides 2, 2, 2 -> `[t][32][10]` = `[t][320]` (channel-major), rows past
+/// `len_t` garbage. Each conv's output is masked past `len_t` where a 3x3 conv reads it.
+fn fcm(s: &mut Seq, fbank: u32, t: u32, len_t: u32) -> Result<u32, String> {
+    const C: u32 = 32;
+    let (x, mut w) = conv2d(s, fbank, "act.vc.f0", (t, 80, 1, C), "w.camp.fcm.c0", (3, 1), true, false)?;
+    let mut x = s.mask_rows(x, "act.vc.fx", t, w * C, len_t)?;
+    for l in 1..=2 {
+        for i in 0..2 {
+            let p = format!("w.camp.fcm.l{l}.{i}");
+            let ws = if i == 0 { 2 } else { 1 };
+            let (y, ow) = conv2d(s, x, "act.vc.f1", (t, w, C, C), &format!("{p}.c1"), (3, ws), true, false)?;
+            let y = s.mask_rows(y, "act.vc.f1m", t, ow * C, len_t)?;
+            let (y, _) = conv2d(s, y, "act.vc.f2", (t, ow, C, C), &format!("{p}.c2"), (3, 1), false, false)?;
+            let sc = if i == 0 {
+                conv2d(s, x, "act.vc.fsc", (t, w, C, C), &format!("{p}.sc"), (1, ws), false, false)?.0
+            } else {
+                x
+            };
+            let out = format!("act.vc.fx{l}{i}");
+            let mut c = conv(&out, "c.vc.ones", t, ow * C, ow * C);
+            (c.groups, c.lengths, c.residual) = (ow * C, Some(len_t), Some(sc));
+            let sum = s.conv(y, c)?;
+            x = s.relu_inplace(sum, t, ow * C)?;
+            w = ow;
+        }
+    }
+    let (x, _) = conv2d(s, x, "act.vc.fcm", (t, w, C, C), "w.camp.fcm.c2", (3, 2), true, true)?;
+    Ok(x)
+}
+
 fn speaker(s: &mut Seq, cfg: &Cfg, d: Dims, io: Io) -> Result<(), String> {
     let max = u32::MAX;
     let tfb = s.p().declare("act.vc.tfb", 4);
     let th = s.len_affine(tfb, "act.vc.th", (1, 1, 2), (0, max), None)?;
-    let fcm = s.p().declare("act.vc.fcm", u64::from(d.fbank * 320) * 4);
+    let fbank = s.p().declare("act.vc.fbank", u64::from(d.fbank * 80) * 4);
+    let fcm = fcm(s, fbank, d.fbank, tfb)?;
     let x = camp_xvector(
         s,
         fcm,
@@ -1387,9 +1475,108 @@ fn speaker(s: &mut Seq, cfg: &Cfg, d: Dims, io: Io) -> Result<(), String> {
     })?;
     let mut c = conv("out.vc.spks", "w.spks.w", 1, 192, 80);
     c.bias = Some(TensorRef::Named("w.spks.b"));
-    let _ = (io, cfg.ve_layers, cfg.speech_vocab);
+    let _ = io;
     s.conv(x, c)?;
     Ok(())
+}
+
+/// VoiceEncoder partials of a `frames`-row mel: the most a clip of that length makes.
+fn ve_partials(frames: u32) -> u32 {
+    (frames.saturating_sub(51) / VE_STEP).max(1)
+}
+
+const VE_STEP: u32 = 77;
+const VE_TRIM_FRAME: u32 = 2048;
+const VE_TRIM_HOP: u32 = 512;
+
+/// The T3 speaker embedding: trim the whole 16 kHz clip (top_db 20), its 40-bin power mel,
+/// 160-frame partials every 77 frames, the VoiceEncoder -> `act.vc.spk`.
+fn voice_encoder(s: &mut Seq, cfg: &Cfg, d: Dims) -> Result<(), String> {
+    let w16s = s.p().declare("act.vc.w16s", u64::from(d.s16s) * 4);
+    let l16s = s.p().declare("act.vc.l16s", 4);
+    let dep = s.last;
+    let (e, lt) = s.p().trim_silence_f32(
+        w16s,
+        l16s,
+        &[dep],
+        crate::pipeline::TrimSilenceF32Stage {
+            output: TensorRef::Named("act.vc.wt"),
+            len_out: TensorRef::Named("act.vc.lt"),
+            items: 1,
+            cap: d.s16s,
+            frame: VE_TRIM_FRAME,
+            hop: VE_TRIM_HOP,
+            top_db: 20.0,
+        },
+    )?;
+    let wt = s.done(e);
+    let vm = s.len_affine(lt, "act.vc.vm", (1, 160, 160), (0, u32::MAX), None)?;
+    let (p, frames) = s.power_stft(wt, "act.vc.spec", d.s16s, lt, "w.fe.stft400.w", (400, 160, 200), 402, PadMode::Reflect)?;
+    let ncap = ve_partials(frames);
+    // The partial windows reach past the last frame: those rows are zero, as the reference pads.
+    let rows = (ncap - 1) * VE_STEP + VE_FRAMES;
+    let zero = s.p().declare("c.vc.zero", 4096);
+    let dep = s.last;
+    let e = s.p().copy_cols_f32(
+        zero,
+        &[dep],
+        CopyColsF32Stage {
+            output: TensorRef::Named("act.vc.vmel"),
+            items: 1,
+            rows,
+            cols: VE_MELS,
+            in_item_stride: 0,
+            in_stride: 0,
+            in_offset: 0,
+            out_item_stride: 0,
+            out_stride: VE_MELS,
+            out_offset: 0,
+        },
+    )?;
+    s.done(e);
+    let mut c = conv("act.vc.vmel", "w.fe.mel40x2", frames, 402, VE_MELS);
+    c.lengths = Some(vm);
+    let mel = s.conv(p, c)?;
+    let n = s.len_affine(vm, "act.vc.nparts", (1, -51, VE_STEP), (1, ncap), None)?;
+    let dep = s.last;
+    let e = s.p().gather_rows_f32(
+        &[dep],
+        crate::pipeline::GatherRowsF32Stage {
+            output: TensorRef::Named("act.vc.parts"),
+            table: TensorRef::Handle(mel),
+            table_rows: rows,
+            index: None,
+            rows: ncap * VE_FRAMES,
+            width: VE_MELS,
+            vocab: VE_FRAMES,
+            rows_per_item: VE_FRAMES,
+            repeat: 1,
+            index_item_stride: 0,
+            table_item_stride: VE_STEP,
+            table_f16: false,
+            accumulate: false,
+            out_stride: 0,
+            out_col0: 0,
+        },
+    )?;
+    let parts = s.done(e);
+    let spk = s.p().declare("act.vc.spk", u64::from(VE_HIDDEN) * 4);
+    ve(s, parts, ncap, n, cfg.ve_layers, spk)
+}
+
+/// T3CondEnc rows from the speaker embedding and the T3 prompt tokens.
+fn t3_rows(s: &mut Seq, cfg: &Cfg, io: Io) -> Result<(), String> {
+    let spk = s.p().declare("act.vc.spk", u64::from(VE_HIDDEN) * 4);
+    cond(
+        s,
+        spk,
+        io.t3_tokens,
+        T3_TOKENS,
+        io.t3_count,
+        cfg.speech_vocab,
+        io.exaggeration,
+        io.rows,
+    )
 }
 
 fn section(

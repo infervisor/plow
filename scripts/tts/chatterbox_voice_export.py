@@ -30,6 +30,7 @@ S3Tokenizer V2 encoder (shared by the T3 and s3gen prompt tokens):
 
 CAMPPlus x-vector (eval BatchNorms folded; Conv2d in torch layout [cout][cin][freq][time]):
   camp.fcm.c0.{w,b}, camp.fcm.l{1,2}.{0,1}.c{1,2}.{w,b} (+ .sc.{w,b} shortcut), camp.fcm.c2.{w,b}
+  camp.fcm.*.wt               the same weights as [cout][cin][time][freq] (plow Conv2dF32: frames = time)
   camp.tdnn.{w,b}             conv k5 s2 p2 (+BN, ReLU)
   camp.d{blk}.{i}.bn1.{s,t}   pre-activation BN as scale / shift (then ReLU), zero past the
                               layer's input channels up to the block's concat width
@@ -507,6 +508,8 @@ def main():
         print(f"G7 VE speaker embedding      rel {rel(v, r):.2e}  cos {v @ r / np.linalg.norm(r):.7f}")
         rows = cond_ref(T, cfg, r.astype(np.float64), G("t3_cond_prompt_speech_tokens").reshape(-1), a.exaggeration)
         print(f"G9 T3 cond rows              rel {rel(rows, G('t3_cond_rows')):.2e}  rows {len(rows)}")
+    for k in [k for k in T if k.startswith("camp.fcm.") and k.endswith(".w")]:
+        T[k + "t"] = T[k].swapaxes(2, 3)
     from safetensors.torch import save_file
     os.makedirs(a.out, exist_ok=True)
     save_file({k: torch.from_numpy(np.ascontiguousarray(v)).float() for k, v in T.items()},
