@@ -53,6 +53,7 @@ fn draft_config(dir: &Path, vocab: u64) {
         "attention_k_eq_v":true, "hidden_size_per_layer_input":0, "vocab_size":{vocab},
         "num_target_layers":4, "target_layer_ids":[1,2], "block_size":3, "mask_token_id":4,
         "markov_head_type":"vanilla", "markov_rank":16, "enable_confidence_head":false,
+        "final_logit_softcapping":30.0,
         "rms_norm_eps":1e-6, "layer_types":["full_attention","full_attention"],
         "rope_parameters":{{"full_attention":{{"partial_rotary_factor":0.25,
             "rope_theta":1000000.0,"rope_type":"proportional"}}}}
@@ -393,7 +394,11 @@ fn the_context_tail_adds_ops_and_changes_no_target_instruction() {
     );
 
     // FP8 W8A8: the tail binds the twins and quantizes its activations for the GEMMs.
-    let (_, fp8) = emit(&dir, |c| {
+    // The draft program (FP8 twins) checks the drafter's token ids against the target's.
+    let tok = r#"{"model":{"type":"BPE"},"added_tokens":[]}"#;
+    std::fs::write(dir.join("tokenizer.json"), tok).unwrap();
+    std::fs::write(draft.join("tokenizer.json"), tok).unwrap();
+    let (fp8_blob, fp8) = emit(&dir, |c| {
         on(&draft)(c);
         c.fp8 = true;
         c.w8a8 = true;
@@ -414,7 +419,30 @@ fn the_context_tail_adds_ops_and_changes_no_target_instruction() {
             .filter(|(_, d)| d.t[2] != TENSOR_NONE && fname(d.t[2]).starts_with(prefix))
             .map(|(i, _)| i)
             .collect();
-        assert!(at.len() >= 2 && at.windows(2).all(|w| w[1] == w[0] + 1), "{prefix}: {at:?}");
+        assert!(
+            at.len() >= 2 && at.windows(2).all(|w| w[1] == w[0] + 1),
+            "{prefix}: {at:?}"
+        );
+    }
+
+    // ... and carries the block draft programs (block 3: rows up to 16, k 1..=3).
+    let spec: plow_asset::spec_draft::Manifest = serde_json::from_value(json_at(
+        &fp8_blob,
+        r#"{"version":1,"family":"gemma4_dspark","kmax""#,
+    ))
+    .unwrap();
+    let b = spec.block.as_ref().expect("block drafter");
+    assert_eq!((b.size, b.mask_token, spec.kmax), (3, 4, 3));
+    assert!(spec.tensors.hidden.is_none() && spec.tensors.hidden_row.is_none());
+    assert!(spec
+        .programs
+        .iter()
+        .all(|p| p.rows * 3 <= 64 && (1..=3).contains(&p.k)));
+    for name in [
+        "fp8/dspark.lm_head.weight",
+        "dspark.markov_head.markov_w2.weight",
+    ] {
+        assert!(names.contains(&name), "{name}");
     }
     let _ = std::fs::remove_dir_all(dir);
 }

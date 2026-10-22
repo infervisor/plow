@@ -11,8 +11,9 @@
 //! target, the twins in `model-dspark-fp8.safetensors` (`scripts/gemma4_dspark_fp8.py`).
 use std::path::Path;
 
-use packet::devbuild::{Builder, SectionData, SECT_METADATA};
-use plow_asset::spec_context;
+use packet::dev::{DevInst, DevOp};
+use packet::devbuild::{Builder, Program, SectionData, SECT_METADATA};
+use plow_asset::{spec_context, spec_draft};
 use serde_json::Value;
 
 use crate::config::{Arch, Cfg};
@@ -38,6 +39,9 @@ pub(crate) struct DraftCfg {
     markov_rank: u32,
     confidence: bool,
     eps: f32,
+    block: u32,
+    mask_token: u32,
+    softcap: f32,
 }
 
 impl DraftCfg {
@@ -138,6 +142,12 @@ impl DraftCfg {
             markov_rank: u("markov_rank"),
             confidence: v["enable_confidence_head"] == true,
             eps: v["rms_norm_eps"].as_f64().unwrap_or(1e-6) as f32,
+            block,
+            mask_token: u("mask_token_id"),
+            softcap: v["final_logit_softcapping"]
+                .as_f64()
+                .unwrap_or_else(|| refuse("draft config: final_logit_softcapping missing".into()))
+                as f32,
         }
     }
 
@@ -225,6 +235,8 @@ pub(crate) struct Tensors {
     fp8: bool,
     w8a8: bool,
     fp8_kv: bool,
+    /// The draft program's tensors (FP8 target with span verify only).
+    draft: Option<Draft>,
 }
 
 impl Tensors {
@@ -254,6 +266,7 @@ pub(crate) fn declare(
     w8a8: bool,
     fp8_kv: bool,
     kv_src: [u32; 4],
+    span_verify: bool,
 ) -> Tensors {
     if c.arch != Arch::Gemma4 || c.tp != 1 || c.moe || c.ple != 0 || c.kv_shared != 0 {
         refuse(
@@ -312,7 +325,7 @@ pub(crate) fn declare(
     };
     let a = |b: &mut Builder, s: &str, sz: u64| b.tensor(&format!("act.dspark.{s}"), sz);
     let kd = c.kvh_full * c.hd_full;
-    Tensors {
+    let mut t = Tensors {
         kv,
         tap: (0..cfg.taps.len())
             .map(|j| a(b, &format!("tap{j}"), r * h * BF16))
@@ -369,7 +382,12 @@ pub(crate) fn declare(
         fp8,
         w8a8,
         fp8_kv,
+        draft: None,
+    };
+    if fp8 && span_verify {
+        t.draft = Some(declare_draft(b, c, &t.cfg));
     }
+    t
 }
 
 fn dims(entry: &Value) -> Vec<u64> {
@@ -379,8 +397,16 @@ fn dims(entry: &Value) -> Vec<u64> {
         .unwrap_or_default()
 }
 
-/// Check the shards against the drafter config and describe the context in `spec.context.json`.
-pub(crate) fn sections(dir: &Path, c: &Cfg, t: &Tensors) -> Vec<SectionData> {
+/// Check the shards against the drafter config, describe the context in `spec.context.json` and,
+/// with the draft tensors declared, emit the draft programs (`spec.json`).
+pub(crate) fn sections(
+    dir: &Path,
+    c: &Cfg,
+    n: &crate::Tn,
+    t: &Tensors,
+    model: &packet::devbuild::Model,
+    rung_progs: &[(u32, usize)],
+) -> Vec<SectionData> {
     let shard = dir.join(SHARD);
     let (header, meta) = safetensors_header(&shard);
     // The fc column blocks are per tap: the shard must come from this very config.
@@ -479,9 +505,609 @@ pub(crate) fn sections(dir: &Path, c: &Cfg, t: &Tensors) -> Vec<SectionData> {
         "  spec context: {FAMILY} taps {:?} -> kv layers {:?} ({})",
         m.taps, m.kv_layers, m.kv_elem
     );
-    vec![SectionData {
+    let mut out = vec![SectionData {
         kind: SECT_METADATA,
         name: spec_context::SECTION.into(),
         data: serde_json::to_vec(&m).expect("spec.context.json"),
-    }]
+    }];
+    if let Some(d) = &t.draft {
+        let full = (0..c.layers as usize)
+            .rev()
+            .find(|&l| c.is_full[l] && !c.kv_is_shared(l))
+            .expect("full layer");
+        out.extend(draft_sections(
+            dir,
+            c,
+            t,
+            d,
+            n.kc[full],
+            model,
+            rung_progs,
+            &m.shard_sha256,
+        ));
+    }
+    out
+}
+
+/// GEMV row ceiling of the decode interpreter's FP8 arms (`gemv_fp8_wgmma_supported`): a draft
+/// program's block rows `size * rows` must fit.
+const GEMV_ROWS: u32 = 64;
+const AMAX_BLOCKS: u32 = 64;
+const I32: u64 = 4;
+
+/// One drafter layer of the draft program: FP8 twins `(e4m3, per-row scale)` for every GEMV.
+struct DraftLayer {
+    in_ln: u32,
+    q: (u32, u32),
+    q_norm: u32,
+    o: (u32, u32),
+    post_attn: u32,
+    pre_ffn: u32,
+    gate: (u32, u32),
+    up: (u32, u32),
+    down: (u32, u32),
+    post_ffn: u32,
+}
+
+/// The draft program's tensors: inputs per block row (`[size * rows]`) and per request
+/// (`tokens`, `[rows]`), activations sized for the widest program.
+pub(crate) struct Draft {
+    rows: u32,
+    size: u32,
+    mask: u32,
+    tokens: Vec<u32>,
+    ids: u32,
+    pos: u32,
+    kv_len: u32,
+    slot: u32,
+    store: u32,
+    /// Per block position `i`: the block rows `r * size + i` (`[rows]` u32, packet constants).
+    pick: Vec<u32>,
+    x: u32,
+    xn: u32,
+    q: u32,
+    qn: u32,
+    k: u32,
+    at: u32,
+    og: u32,
+    hn: u32,
+    fu: u32,
+    dg: u32,
+    logits: u32,
+    lg: u32,
+    e: u32,
+    bias: u32,
+    sum: u32,
+    amax: u32,
+    emb: u32,
+    norm: u32,
+    head: (u32, u32),
+    w1: u32,
+    w2: u32,
+    layers: Vec<DraftLayer>,
+}
+
+fn declare_draft(b: &mut Builder, c: &Cfg, cfg: &DraftCfg) -> Draft {
+    let size = cfg.block;
+    let rows = crate::mtp::rows_list()
+        .into_iter()
+        .filter(|&r| r * size <= GEMV_ROWS)
+        .max()
+        .unwrap_or_else(|| refuse(format!("no draft row count fits {GEMV_ROWS} block rows")));
+    let (h, v, hd, r) = (
+        c.hidden as u64,
+        c.vocab as u64,
+        c.hd_full as u64,
+        cfg.markov_rank as u64,
+    );
+    let br = (rows * size) as u64;
+    let qd = cfg.heads as u64 * hd;
+    let inter = cfg.inter as u64;
+    let w = |b: &mut Builder, name: &str, n: u64| b.tensor(name, n * BF16);
+    let w8 = |b: &mut Builder, name: &str, n: u64, k: u64| {
+        (
+            b.tensor(&format!("fp8/{name}"), n * k),
+            b.tensor(&format!("fp8/{name}_scale"), n * F32),
+        )
+    };
+    let a = |b: &mut Builder, s: &str, sz: u64| b.tensor(&format!("act.dspark.d.{s}"), sz);
+    let inp = |b: &mut Builder, s: &str, n: u64| b.tensor(&format!("in.spec.{s}"), n * I32);
+    let layers = (0..cfg.layers)
+        .map(|l| {
+            let p = format!("dspark.layers.{l}.");
+            DraftLayer {
+                in_ln: w(b, &format!("{p}input_layernorm.weight"), h),
+                q: w8(b, &format!("{p}self_attn.q_proj.weight"), qd, h),
+                q_norm: w(b, &format!("{p}self_attn.q_norm.weight"), hd),
+                o: w8(b, &format!("{p}self_attn.o_proj.weight"), h, qd),
+                post_attn: w(b, &format!("{p}post_attention_layernorm.weight"), h),
+                pre_ffn: w(b, &format!("{p}pre_feedforward_layernorm.weight"), h),
+                gate: w8(b, &format!("{p}mlp.gate_proj.weight"), inter, h),
+                up: w8(b, &format!("{p}mlp.up_proj.weight"), inter, h),
+                down: w8(b, &format!("{p}mlp.down_proj.weight"), h, inter),
+                post_ffn: w(b, &format!("{p}post_feedforward_layernorm.weight"), h),
+            }
+        })
+        .collect();
+    let pick = (0..size)
+        .map(|i| {
+            let init: Vec<u8> = (0..rows)
+                .flat_map(|r| (r * size + i).to_le_bytes())
+                .collect();
+            b.tensor_init(&format!("in.dspark.pick.{i}"), init)
+        })
+        .collect();
+    Draft {
+        rows,
+        size,
+        mask: cfg.mask_token,
+        tokens: (0..=kmax().min(size))
+            .map(|j| inp(b, &format!("tokens.{j}"), rows as u64))
+            .collect(),
+        ids: inp(b, "block.ids", br),
+        pos: inp(b, "block.pos", br),
+        kv_len: inp(b, "block.kv_len", br),
+        slot: inp(b, "block.slot", br),
+        store: inp(b, "block.store", br),
+        pick,
+        x: a(b, "x", br * h * BF16),
+        xn: a(b, "xn", br * h * BF16),
+        q: a(b, "q", br * qd * BF16),
+        qn: a(b, "qn", br * qd * BF16),
+        k: a(b, "k", br * hd * BF16),
+        at: a(b, "at", br * qd * BF16),
+        og: a(b, "og", br * h * BF16),
+        hn: a(b, "hn", br * h * BF16),
+        fu: a(b, "fu", br * inter * BF16),
+        dg: a(b, "dg", br * h * BF16),
+        logits: a(b, "logits", br * v * BF16),
+        lg: a(b, "lg", rows as u64 * v * BF16),
+        e: a(b, "e", rows as u64 * r * BF16),
+        bias: a(b, "bias", rows as u64 * v * BF16),
+        sum: a(b, "sum", rows as u64 * v * BF16),
+        amax: a(b, "amax", rows as u64 * AMAX_BLOCKS as u64 * 8),
+        emb: w(b, "dspark.embed_tokens.weight", v * h),
+        norm: w(b, "dspark.norm.weight", h),
+        head: w8(b, "dspark.lm_head.weight", v, h),
+        w1: w(b, "dspark.markov_head.markov_w1.weight", v * r),
+        w2: w(b, "dspark.markov_head.markov_w2.weight", v * r),
+        layers,
+    }
+}
+
+/// Each drafter layer's `layer_scalar` from the re-keyed shard the packet binds (a bf16 scalar
+/// the residual tail folds in at emit time).
+fn layer_scalars(shard: &Path, layers: u32) -> Vec<f32> {
+    use std::io::{Read, Seek, SeekFrom};
+    let (header, _) = safetensors_header(shard);
+    let mut f =
+        std::fs::File::open(shard).unwrap_or_else(|e| refuse(format!("{}: {e}", shard.display())));
+    let mut len = [0u8; 8];
+    f.read_exact(&mut len)
+        .unwrap_or_else(|e| refuse(format!("{SHARD}: {e}")));
+    let base = 8 + u64::from_le_bytes(len);
+    (0..layers)
+        .map(|l| {
+            let name = format!("dspark.layers.{l}.layer_scalar");
+            let ofs = header[&name]["data_offsets"][0]
+                .as_u64()
+                .unwrap_or_else(|| refuse(format!("{SHARD} {name}: no offsets")));
+            let mut v = [0u8; 2];
+            f.seek(SeekFrom::Start(base + ofs))
+                .and_then(|_| f.read_exact(&mut v))
+                .unwrap_or_else(|e| refuse(format!("{SHARD} {name}: {e}")));
+            f32::from_bits(u32::from(u16::from_le_bytes(v)) << 16)
+        })
+        .collect()
+}
+
+/// The target rung instructions the draft copies its geometry from: the embedding (scale), the
+/// last full layer's q HeadNormRope, FlashDecodeFp8 and FlashMerge, and per drafter layer the
+/// context tail's K and V writers (`kv.{L+l}`).
+struct Sites {
+    embed: DevInst,
+    q_rope: DevInst,
+    flash: DevInst,
+    merge: DevInst,
+    writers: Vec<(DevInst, DevInst)>,
+}
+
+fn sites(t: &Tensors, full_kc: u32, target: &Program) -> Sites {
+    let insts = &target.insts;
+    let find = |what: &str, f: &dyn Fn(&DevInst) -> bool| -> DevInst {
+        *insts
+            .iter()
+            .find(|i| f(i))
+            .unwrap_or_else(|| refuse(format!("draft geometry: target rung has no {what}")))
+    };
+    let embed = find("Embed", &|i| i.op == DevOp::Embed as u16);
+    let fa = insts
+        .iter()
+        .position(|i| i.op == DevOp::FlashDecodeFp8 as u16 && i.t[3] == full_kc)
+        .unwrap_or_else(|| refuse("draft geometry: no full-layer FP8 flash decode".into()));
+    let flash = insts[fa];
+    let q_rope = *insts[..fa]
+        .iter()
+        .rev()
+        .find(|i| i.op == DevOp::HeadNormRope as u16 && i.t[0] == flash.t[2])
+        .unwrap_or_else(|| refuse("draft geometry: no full-layer q HeadNormRope".into()));
+    let merge = *insts[fa..]
+        .iter()
+        .find(|i| i.op == DevOp::FlashMerge as u16 && i.t[1] == flash.t[0])
+        .unwrap_or_else(|| refuse("draft geometry: no full-layer FlashMerge".into()));
+    let writers =
+        t.kv.iter()
+            .map(|kv| {
+                let w = |cache: u32| {
+                    find("drafter KV writer", &|i| {
+                        i.op == DevOp::HeadNormRopeFp8 as u16 && i.t[0] == cache
+                    })
+                };
+                (w(kv[0]), w(kv[1]))
+            })
+            .collect();
+    Sites {
+        embed,
+        q_rope,
+        flash,
+        merge,
+        writers,
+    }
+}
+
+/// One `(rows, k)` draft program: the non-causal block forward over the drafter layers (block
+/// K/V stored at `c..c+size` through the context tail's writers, every block row attending
+/// `c + size` rows of its sequence), the drafter head over every block row, then `k` sequential
+/// Markov stages: `d_{i+1} = argmax(cap(L_i) + cap(w2 . w1[d_i]))`, `d_0` the pending token.
+fn program(
+    c: &Cfg,
+    t: &Tensors,
+    d: &Draft,
+    tensors: &[packet::devbuild::TensorDecl],
+    n_cu: u32,
+    s: &Sites,
+    scalars: &[f32],
+    rows: u32,
+    k: u32,
+) -> Program {
+    let mut b = Builder::new(n_cu);
+    b.adopt_tensors(tensors.to_vec());
+    b.force_uniseg();
+    let all: Vec<u32> = (0..n_cu).collect();
+    let br = rows * d.size;
+    let bset: Vec<u32> = (0..br).collect();
+    let rset: Vec<u32> = (0..rows).collect();
+    let span = |n: u32| -> Vec<u32> { (0..n.max(1).min(n_cu)).collect() };
+    let elem = |n: u32| span(n.div_ceil(512 * 8));
+    let (h, hd, v) = (c.hidden, c.hd_full, c.vocab);
+    let qd = t.cfg.heads * hd;
+    let gemv8 = |b: &mut Builder,
+                 dep: &[u32],
+                 out: u32,
+                 x: u32,
+                 w: (u32, u32),
+                 m: u32,
+                 n: u32,
+                 kin: u32| {
+        b.emit(DevOp::GemvFp8, all.clone(), dep, |i| {
+            i.t[0] = out;
+            i.t[1] = x;
+            i.t[2] = w.0;
+            i.t[5] = w.1;
+            i.i[0] = m;
+            i.i[1] = n;
+            i.i[2] = kin;
+        })
+    };
+    let c_e = b.emit(DevOp::Embed, bset.clone(), &[], |i| {
+        i.t[0] = d.x;
+        i.t[1] = d.emb;
+        i.t[2] = d.ids;
+        i.i[0] = br;
+        i.i[1] = h;
+        i.i[2] = s.embed.i[2];
+        i.f[0] = s.embed.f[0];
+    });
+    let mut dep = b.emit(DevOp::RmsNorm, bset.clone(), &[c_e], |i| {
+        i.t[0] = d.xn;
+        i.t[1] = d.x;
+        i.t[2] = d.layers[0].in_ln;
+        i.i[0] = br;
+        i.i[1] = h;
+        i.f[0] = t.cfg.eps;
+    });
+    for (l, w) in d.layers.iter().enumerate() {
+        let c_q = gemv8(&mut b, &[dep], d.q, d.xn, w.q, br, qd, h);
+        let c_qn = b.emit(
+            DevOp::HeadNormRope,
+            span(s.q_rope.blocks as u32),
+            &[c_q],
+            |i| {
+                crate::mtp::args(i, &s.q_rope);
+                i.t[0] = d.qn;
+                i.t[1] = d.q;
+                i.t[2] = w.q_norm;
+                i.t[5] = d.pos;
+                i.i[0] = br;
+                i.f[0] = t.cfg.eps;
+            },
+        );
+        let kp = t.k_proj[l];
+        let c_k = gemv8(&mut b, &[dep], d.k, d.xn, (kp.w8, kp.scale), br, kp.n, h);
+        let (kw, vw) = &s.writers[l];
+        let store = |b: &mut Builder, src: &DevInst| {
+            b.emit(
+                DevOp::HeadNormRopeFp8,
+                span(src.blocks as u32),
+                &[c_k],
+                |i| {
+                    crate::mtp::args(i, src);
+                    i.t[1] = d.k;
+                    i.t[5] = d.pos;
+                    i.t[7] = d.store;
+                    i.i[0] = br;
+                },
+            )
+        };
+        let c_kw = store(&mut b, kw);
+        let c_vw = store(&mut b, vw);
+        let [kc, vc, ks, vs] = t.kv[l];
+        let c_fa = b.emit(
+            DevOp::FlashDecodeFp8,
+            span(s.flash.blocks as u32),
+            &[c_qn, c_kw, c_vw],
+            |i| {
+                crate::mtp::args(i, &s.flash);
+                i.t[2] = d.qn;
+                i.t[3] = kc;
+                i.t[4] = vc;
+                i.t[5] = d.kv_len;
+                i.t[6] = ks;
+                i.t[7] = vs;
+                i.i[0] = br;
+                i.j[1] = d.slot;
+            },
+        );
+        let c_mg = b.emit(
+            DevOp::FlashMerge,
+            span(s.merge.blocks as u32),
+            &[c_fa],
+            |i| {
+                crate::mtp::args(i, &s.merge);
+                i.t[0] = d.at;
+                i.i[0] = br;
+            },
+        );
+        let c_o = gemv8(&mut b, &[c_mg], d.og, d.at, w.o, br, h, qd);
+        let c_r1 = b.emit(DevOp::NormResidualNorm, bset.clone(), &[c_o], |i| {
+            i.t[0] = d.hn;
+            i.t[1] = d.x;
+            i.t[2] = d.x;
+            i.t[3] = d.og;
+            i.t[4] = w.post_attn;
+            i.t[5] = w.pre_ffn;
+            i.i[0] = br;
+            i.i[1] = h;
+            i.f[0] = t.cfg.eps;
+            i.f[1] = 1.0;
+        });
+        let c_gu = b.emit(DevOp::GemvGluFp8, all.clone(), &[c_r1], |i| {
+            i.t[0] = d.fu;
+            i.t[1] = d.hn;
+            i.t[2] = w.gate.0;
+            i.t[5] = w.up.0;
+            i.t[3] = w.gate.1;
+            i.t[4] = w.up.1;
+            i.i[0] = br;
+            i.i[1] = t.cfg.inter;
+            i.i[2] = h;
+            i.i[5] = c.mlp_act;
+        });
+        let c_d = gemv8(&mut b, &[c_gu], d.dg, d.fu, w.down, br, h, t.cfg.inter);
+        let next = d.layers.get(l + 1).map_or(d.norm, |n| n.in_ln);
+        dep = b.emit(DevOp::NormResidualNorm, bset.clone(), &[c_d], |i| {
+            i.t[0] = d.xn;
+            i.t[1] = d.x;
+            i.t[2] = d.x;
+            i.t[3] = d.dg;
+            i.t[4] = w.post_ffn;
+            i.t[5] = next;
+            i.i[0] = br;
+            i.i[1] = h;
+            i.f[0] = t.cfg.eps;
+            i.f[1] = scalars[l];
+        });
+    }
+    // Raw logits of every block row: each term is capped once, in the Markov stages.
+    let c_lm = gemv8(&mut b, &[dep], d.logits, d.xn, d.head, br, v, h);
+    let nb = if rows > 1 { rows } else { 0 };
+    let mut prev = vec![c_lm];
+    for i in 0..k as usize {
+        let c_g = b.emit(DevOp::RowGather, rset.clone(), &prev, |x| {
+            x.t[0] = d.lg;
+            x.t[1] = d.logits;
+            x.t[2] = d.pick[i];
+            x.i[0] = rows;
+            x.i[1] = v;
+            x.i[2] = br;
+        });
+        let c_cl = b.emit(DevOp::SoftCap, elem(rows * v), &[c_g], |x| {
+            x.t[0] = d.lg;
+            x.t[1] = d.lg;
+            x.i[0] = rows * v;
+            x.f[0] = t.cfg.softcap;
+        });
+        let c_em = b.emit(DevOp::Embed, rset.clone(), &prev, |x| {
+            x.t[0] = d.e;
+            x.t[1] = d.w1;
+            x.t[2] = d.tokens[i];
+            x.i[0] = rows;
+            x.i[1] = t.cfg.markov_rank;
+            x.f[0] = 1.0;
+        });
+        let c_b = b.emit(DevOp::Gemv, all.clone(), &[c_em], |x| {
+            x.t[0] = d.bias;
+            x.t[1] = d.e;
+            x.t[2] = d.w2;
+            x.i[0] = rows;
+            x.i[1] = v;
+            x.i[2] = t.cfg.markov_rank;
+        });
+        let c_cb = b.emit(DevOp::SoftCap, elem(rows * v), &[c_b], |x| {
+            x.t[0] = d.bias;
+            x.t[1] = d.bias;
+            x.i[0] = rows * v;
+            x.f[0] = t.cfg.softcap;
+        });
+        let c_s = b.emit(DevOp::Residual, elem(rows * v), &[c_cl, c_cb], |x| {
+            x.t[0] = d.sum;
+            x.t[1] = d.lg;
+            x.t[2] = d.bias;
+            x.i[0] = rows * v;
+            x.f[0] = 1.0;
+        });
+        let c_am = b.emit(DevOp::Argmax, (0..AMAX_BLOCKS).collect(), &[c_s], |x| {
+            x.t[0] = d.amax;
+            x.t[1] = d.sum;
+            x.i[0] = v;
+            x.i[1] = nb;
+        });
+        prev = vec![b.emit(DevOp::ArgmaxFin, vec![0], &[c_am], |x| {
+            x.t[0] = d.tokens[i + 1];
+            x.t[1] = d.amax;
+            x.i[0] = AMAX_BLOCKS;
+            x.i[1] = nb;
+        })];
+    }
+    b.finish()
+}
+
+/// The draft programs for every `(rows, k)` whose block fits a target decode rung, as
+/// `spec.json` + the programs section.
+fn draft_sections(
+    dir: &Path,
+    c: &Cfg,
+    t: &Tensors,
+    d: &Draft,
+    full_kc: u32,
+    model: &packet::devbuild::Model,
+    rung_progs: &[(u32, usize)],
+    shard_sha256: &str,
+) -> Vec<SectionData> {
+    // The DSpark checkpoint ships no tokenizer (it drafts in the target's vocabulary, checked by
+    // size in `DraftCfg::load`); one that does must agree with the target's.
+    let draft_tok = draft_dir().join("tokenizer.json");
+    if draft_tok.exists() {
+        crate::mtp::check_tokenizer(&draft_tok, &dir.join("tokenizer.json"));
+    }
+    let kmax = kmax().min(d.size);
+    let scalars = layer_scalars(&dir.join(SHARD), t.cfg.layers);
+    let mut programs = Vec::new();
+    let mut table = Vec::new();
+    for rows in crate::mtp::rows_list().into_iter().filter(|&r| r <= d.rows) {
+        // The flash/merge scratch of the narrowest rung holding the block rows.
+        let Some(&(_, pi)) = rung_progs
+            .iter()
+            .filter(|&&(r, _)| r >= rows * d.size)
+            .min_by_key(|&&(r, _)| r)
+        else {
+            continue;
+        };
+        let s = sites(t, full_kc, &model.progs[pi]);
+        for k in 1..=kmax {
+            table.push(spec_draft::DraftProgram {
+                rows,
+                k,
+                index: programs.len() as u32,
+            });
+            programs.push(program(
+                c,
+                t,
+                d,
+                &model.tensors,
+                model.n_cu,
+                &s,
+                &scalars,
+                rows,
+                k,
+            ));
+        }
+    }
+    if programs.is_empty() {
+        refuse("no target decode rung holds a draft block".into());
+    }
+    let packed: Vec<Vec<_>> = programs
+        .iter()
+        .map(|p| p.insts.iter().map(|i| i.pack()).collect())
+        .collect();
+    let views: Vec<plow_asset::program::Program<'_>> = programs
+        .iter()
+        .zip(&packed)
+        .zip(&table)
+        .map(|((p, insts), e)| plow_asset::program::Program {
+            rows: e.rows,
+            role: packet::devbuild::ProgramRole::DecodeRung { rows: e.rows },
+            n_counter: p.n_counter,
+            insts,
+            stream: &p.stream,
+            stream_ofs: &p.stream_ofs,
+            stream_len: &p.stream_len,
+            waits: &p.waits,
+            succs: &p.succs,
+            gq_stream: &p.gq_stream,
+            gq_seg_ofs: &p.gq_seg_ofs,
+            l2_domains: p.l2_domains,
+        })
+        .collect();
+    let bytes = plow_asset::aux_program::encode(model.n_cu, model.tensors.len(), &views)
+        .unwrap_or_else(|e| refuse(format!("draft programs: {e}")));
+    let h16 = |h: u32| u16::try_from(h).unwrap_or_else(|_| refuse(format!("handle {h}")));
+    let manifest = spec_draft::Manifest {
+        version: spec_draft::VERSION,
+        family: FAMILY.into(),
+        kmax,
+        programs: table,
+        tensors: spec_draft::DraftTensors {
+            tokens: d.tokens.iter().map(|&h| h16(h)).collect(),
+            hidden_row: None,
+            position: h16(d.pos),
+            kv_len: h16(d.kv_len),
+            slot: h16(d.slot),
+            hidden: None,
+            hidden_rows: 0,
+        },
+        block: Some(spec_draft::BlockDraft {
+            size: d.size,
+            mask_token: d.mask,
+            ids: h16(d.ids),
+            store_slot: h16(d.store),
+        }),
+        shard: SHARD.into(),
+        shard_sha256: shard_sha256.into(),
+    };
+    manifest
+        .validate(programs.len(), model.tensors.len())
+        .unwrap_or_else(|e| refuse(e));
+    eprintln!(
+        "  spec draft: {FAMILY} {} programs (rows {:?}, block {}, k 1..={kmax})",
+        programs.len(),
+        manifest
+            .programs
+            .iter()
+            .map(|p| p.rows)
+            .collect::<std::collections::BTreeSet<_>>(),
+        d.size
+    );
+    vec![
+        SectionData {
+            kind: SECT_METADATA,
+            name: spec_draft::SECTION.into(),
+            data: serde_json::to_vec(&manifest).expect("spec.json"),
+        },
+        SectionData {
+            kind: SECT_METADATA,
+            name: spec_draft::PROGRAMS_SECTION.into(),
+            data: bytes,
+        },
+    ]
 }

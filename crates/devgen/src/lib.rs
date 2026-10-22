@@ -3062,6 +3062,7 @@ fn declare(
             w8a8,
             fp8_kv,
             kv_src,
+            t.rowslot != TENSOR_NONE,
         ));
     } else if emit_config::active().emit_spec {
         t.mtp = Some(mtp::declare(b, c, dbatch, t.rowslot != TENSOR_NONE));
@@ -11148,7 +11149,7 @@ fn emit_dense_gqa(
         sections.extend(mtp::sections(&dir, &c, &emitter.tn, t, &m, &rung_progs));
     }
     if let Some(t) = &emitter.tn.dspark {
-        sections.extend(dspark::sections(&dir, &c, t));
+        sections.extend(dspark::sections(&dir, &c, &emitter.tn, t, &m, &rung_progs));
     }
     if let Some(ref path) = embed_cubin {
         sections.push(packet::devbuild::SectionData {
