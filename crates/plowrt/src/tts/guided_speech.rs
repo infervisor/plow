@@ -53,6 +53,9 @@ const SEGMENT_TEXT_TOKENS: usize = 125;
 
 /// The emotion exaggeration of cloned voices (Chatterbox's default; the packet voices bake theirs).
 const CLONE_EXAGGERATION: f32 = 0.5;
+/// Recent reference clips and their voices: a repeated clip skips the encoder and keeps its
+/// vocoder slot (slots match by `Arc` identity).
+const CLONE_CACHE: usize = 16;
 
 /// Longest a whole (non-streamed) reply waits for stream windows once its tokens are complete.
 const WHOLE_MAX_WAIT: std::time::Duration = std::time::Duration::from_secs(2);
@@ -266,6 +269,8 @@ pub struct GuidedSpeech {
     first_tokens: usize,
     /// Zero-shot cloning: the voice-conditioning packet (with a vocoder that has voice slots).
     voice_cond: Option<VoiceCond>,
+    /// (clip, voice), most recent last.
+    clones: parking_lot::Mutex<Vec<(Arc<[f32]>, Arc<ClonedVoice>)>>,
 }
 
 struct Utterance {
@@ -967,6 +972,7 @@ impl GuidedSpeech {
             spec,
             first_tokens,
             voice_cond,
+            clones: parking_lot::Mutex::new(Vec::new()),
         })
     }
 
@@ -982,6 +988,15 @@ impl GuidedSpeech {
         let vc = self.voice_cond.as_ref().ok_or_else(|| {
             SpeechError::Invalid("this model has no voice cloning".into(), "ref_audio")
         })?;
+        {
+            let mut cache = self.clones.lock();
+            if let Some(i) = cache.iter().position(|(clip, _)| **clip == *pcm) {
+                let hit = cache.remove(i);
+                let v = Arc::clone(&hit.1);
+                cache.push(hit);
+                return Ok(Voice::Cloned(v));
+            }
+        }
         let v = vc
             .encode(pcm, CLONE_EXAGGERATION)
             .map_err(|e| SpeechError::Invalid(e, "ref_audio"))?;
@@ -990,7 +1005,17 @@ impl GuidedSpeech {
                 "voice conditioning rows disagree with the LM's voices".into(),
             ));
         }
-        Ok(Voice::Cloned(Arc::new(v)))
+        let v = Arc::new(v);
+        let mut cache = self.clones.lock();
+        // A concurrent request may have encoded the same clip: keep the first voice.
+        if let Some((_, first)) = cache.iter().find(|(clip, _)| **clip == *pcm) {
+            return Ok(Voice::Cloned(Arc::clone(first)));
+        }
+        if cache.len() == CLONE_CACHE {
+            cache.remove(0);
+        }
+        cache.push((Arc::from(pcm), Arc::clone(&v)));
+        Ok(Voice::Cloned(v))
     }
 
     /// The mux job for one request: both CFG members' prefill rows as overlays, the decode

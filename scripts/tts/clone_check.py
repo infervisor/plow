@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
-"""Voice cloning through `POST /v1/audio/speech` (`ref_audio` + `ref_text`): whole and streamed
+"""Voice cloning through `POST /v1/audio/speech` (`ref_audio`, + `ref_text` for models that take a
+transcript; without --ref-text the model must refuse one): whole and streamed
 replies for each prompt text, written as OUT/clone_{whole,stream}_NN.wav with OUT/texts.json for
 scripts/tts/asr_check.py, plus the request checks a cloning model must answer with 400.
 
-  python scripts/tts/clone_check.py --url URL --model ID --ref REF.wav --ref-text "..." --out OUT [--voice S0] [--conc 8]
+  python scripts/tts/clone_check.py --url URL --model ID --ref REF.wav [--ref-text "..."] --out OUT [--voice S0] [--conc 8]
 """
 import argparse
 import base64
@@ -67,7 +68,7 @@ def main():
     ap.add_argument("--url", required=True)
     ap.add_argument("--model", required=True)
     ap.add_argument("--ref", required=True)
-    ap.add_argument("--ref-text", required=True)
+    ap.add_argument("--ref-text")
     ap.add_argument("--voice", default="S0")
     ap.add_argument("--out", required=True)
     ap.add_argument("--n", type=int, default=8)
@@ -76,7 +77,9 @@ def main():
     a = ap.parse_args()
     os.makedirs(a.out, exist_ok=True)
     ref = base64.b64encode(open(a.ref, "rb").read()).decode()
-    base = dict(model=a.model, voice=a.voice, ref_audio=ref, ref_text=a.ref_text, response_format="pcm")
+    base = dict(model=a.model, voice=a.voice, ref_audio=ref, response_format="pcm")
+    if a.ref_text:
+        base["ref_text"] = a.ref_text
     texts, rows = {}, []
 
     def run(i):
@@ -93,7 +96,9 @@ def main():
             rows.append(dict(name=name, stream=stream, ttfa_ms=1000 * ttfa, latency_s=total, audio_s=audio))
     json.dump(texts, open(f"{a.out}/texts.json", "w"), indent=1)
     checks = {
-        "ref_audio without ref_text": status(a.url, dict(model=a.model, voice=a.voice, input="Hi there.", ref_audio=ref)),
+        ("ref_audio without ref_text" if a.ref_text else "ref_text on a ref_audio-only model"): status(
+            a.url, dict(model=a.model, voice=a.voice, input="Hi there.", ref_audio=ref,
+                        **({} if a.ref_text else {"ref_text": "Hi there."}))),
         "ref_audio not base64": status(a.url, dict(base, input="Hi there.", ref_audio="@@not-audio@@")),
         "ref_audio too long": status(a.url, dict(base, input="Hi there.", ref_audio=base64.b64encode(
             wav_bytes(b"\0\0" * (a.sr * 30), a.sr)).decode())),

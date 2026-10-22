@@ -90,6 +90,7 @@ def main():
     ap.add_argument("--warmup", type=int, default=2)
     ap.add_argument("--prompt-set", choices=["veena", "chatterbox", "chatterbox-mtl"], default="veena")
     ap.add_argument("--voice", default=None, help="override every prompt's voice")
+    ap.add_argument("--ref-audio", default=None, help="clone every request's voice from this wav")
     ap.add_argument("--session", default=None, help="X-Session-Id prefix (one session per client thread)")
     args = ap.parse_args()
     global SESSION, PROMPT_SET, SR
@@ -100,6 +101,9 @@ def main():
     extra = dict(temperature=0.0) if args.greedy else {}
     if args.repetition_penalty is not None:
         extra["repetition_penalty"] = args.repetition_penalty
+    if args.ref_audio:
+        import base64
+        extra["ref_audio"] = base64.b64encode(open(args.ref_audio, "rb").read()).decode()
     prompts = VEENA_PROMPTS if args.prompt_set == "veena" else [("default", t) for t in CBX_TEXTS]
     if args.prompt_set == "chatterbox-mtl":
         prompts = [("default", t) for _, t in MTL_PROMPTS]
