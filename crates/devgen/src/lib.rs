@@ -100,6 +100,7 @@ pub mod segment_resource;
 pub mod tts;
 pub mod tune_demand;
 pub mod vad;
+pub mod voice_cond;
 
 // # THE `PLOW_*` FLAG AUDIT (target dependence)
 //
@@ -11498,6 +11499,15 @@ fn emit_dense_gqa(
         speech_ops |= manifest::speech_ops(&model);
         write_sidecar_packet(&path, &model, &[section]);
         eprintln!("  s3gen packet -> {}", path.display());
+        let voice = dir.join("voice");
+        if voice.join("config.json").is_file() {
+            let (model, section) = voice_cond::lower_voice_cond(&voice, n_cu, m.target)
+                .unwrap_or_else(|error| panic!("voice conditioning packet: {error}"));
+            let path = std::path::Path::new(&out).with_file_name(voice_cond::PACKET);
+            speech_ops |= manifest::speech_ops(&model);
+            write_sidecar_packet(&path, &model, &[section]);
+            eprintln!("  voice conditioning packet -> {}", path.display());
+        }
     }
     if let Some((towers, _)) = &mm_towers {
         let (images, frames) = mm::ladders();
