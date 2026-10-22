@@ -245,6 +245,24 @@ async fn speech_on_guided(
     mut run: crate::serve::turns::StageRun,
 ) -> Response {
     let lang = checked.language.clone();
+    let voice = match (&req.ref_audio, w.clone_input()) {
+        (None, _) => super::guided_speech::Voice::Named(req.voice.clone()),
+        (Some(audio), Some((rate, max))) => {
+            let pcm = match reference_pcm(audio, rate, max) {
+                Ok(p) => p,
+                Err((msg, param)) => return bad(msg, param),
+            };
+            let enc = Arc::clone(&w);
+            match tokio::task::spawn_blocking(move || enc.clone_voice(&pcm)).await {
+                Ok(Ok(v)) => v,
+                Ok(Err(e)) => return speech_failure(e),
+                Err(e) => {
+                    return speech_failure(super::guided_speech::SpeechError::Failed(e.to_string()))
+                }
+            }
+        }
+        (Some(_), None) => return bad("this model has no voice cloning", "ref_audio"),
+    };
     let segs: Vec<String> =
         super::segments(&req.input, w.segment_chars(&req.input, lang.as_deref()))
             .into_iter()
@@ -258,7 +276,7 @@ async fn speech_on_guided(
     if req.stream {
         let first = match w.synthesize_stream(
             &mux,
-            req.voice.clone(),
+            voice.clone(),
             segs[0].clone(),
             lang.as_deref(),
             &checked.sampling,
@@ -275,7 +293,7 @@ async fn speech_on_guided(
         let (head_tx, head_rx) = tokio::sync::oneshot::channel();
         let wav = checked.wav.then(|| wav_header(w.sample_rate, u32::MAX));
         tokio::spawn(guided_stream_task(
-            w, mux, req.voice, segs, checked, later_ids, first, out_tx, head_tx, t_arrive, run,
+            w, mux, voice, segs, checked, later_ids, first, out_tx, head_tx, t_arrive, run,
         ));
         return stream_response(out_rx, head_rx, wav, in_flight, cache).await;
     }
@@ -286,7 +304,7 @@ async fn speech_on_guided(
         let a = match w
             .synthesize(
                 &mux,
-                req.voice.clone(),
+                voice.clone(),
                 text.clone(),
                 lang.as_deref(),
                 &checked.sampling,
@@ -339,7 +357,7 @@ async fn speech_on_guided(
 async fn guided_stream_task(
     w: Arc<super::guided_speech::GuidedSpeech>,
     mux: crate::serve::mux::ModelMux,
-    voice: String,
+    voice: super::guided_speech::Voice,
     segs: Vec<String>,
     checked: Checked,
     later_ids: RequestIds,
@@ -1116,15 +1134,8 @@ async fn speech_with(
 const MUTE_RETRIES: usize = 1;
 const SPLIT_MIN_CHARS: usize = 40;
 
-/// Decode, resample and frame a cloning reference; its codes come later, on the engine thread.
-fn ref_clip(
-    model: &SpeechModel,
-    tok: &Arc<dyn crate::text::tokenizer::Tokenize>,
-    voice: &str,
-    enc: &Arc<super::ref_encoder::RefEncoder>,
-    audio: &str,
-    text: &str,
-) -> Result<RefClip, (String, &'static str)> {
+/// A cloning reference (base64 or a data URL) as mono PCM at `rate`, at most `max` samples.
+fn reference_pcm(audio: &str, rate: u32, max: usize) -> Result<Vec<f32>, (String, &'static str)> {
     use crate::serve::mm::media;
     use base64::Engine as _;
     let bad = |m: String| (m, "ref_audio");
@@ -1135,7 +1146,6 @@ fn ref_clip(
             .decode(audio.trim())
             .map_err(|e| bad(format!("`ref_audio` is not base64 audio: {e}")))?
     };
-    let (max, rate) = (enc.max_samples(), enc.sample_rate);
     let seconds = max as f64 / f64::from(rate);
     let (pcm, from) = media::decode_audio(&bytes, "", seconds + 1.0).map_err(bad)?;
     let pcm = media::resample(&pcm, from, rate).map_err(bad)?;
@@ -1144,6 +1154,20 @@ fn ref_clip(
             "`ref_audio` must hold audio of at most {seconds:.2} s"
         )));
     }
+    Ok(pcm)
+}
+
+/// Decode, resample and frame a cloning reference; its codes come later, on the engine thread.
+fn ref_clip(
+    model: &SpeechModel,
+    tok: &Arc<dyn crate::text::tokenizer::Tokenize>,
+    voice: &str,
+    enc: &Arc<super::ref_encoder::RefEncoder>,
+    audio: &str,
+    text: &str,
+) -> Result<RefClip, (String, &'static str)> {
+    let bad = |m: String| (m, "ref_audio");
+    let pcm = reference_pcm(audio, enc.sample_rate, enc.max_samples())?;
     let c = &model.contract;
     let Some(clone) = &c.clone else {
         return Err(bad("this model has no voice cloning".into()));

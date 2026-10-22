@@ -621,6 +621,28 @@ impl Codec {
         .map(|d| d.pcm)
     }
 
+    /// [`Self::decode_window`] in a cloned voice, on the voice-slot capacities.
+    pub async fn decode_slot_window(
+        &self,
+        codes: Vec<i32>,
+        frames: usize,
+        seed: u64,
+        voice: std::sync::Arc<SlotVoice>,
+        window: Window,
+    ) -> Result<Decoded, String> {
+        self.submit(
+            codes,
+            frames,
+            seed,
+            0,
+            Urgency::Stream,
+            Some(window),
+            None,
+            Some(voice),
+        )
+        .await
+    }
+
     /// A stream window on the cached capacities (`max_window > 0`).
     pub async fn decode_window(
         &self,

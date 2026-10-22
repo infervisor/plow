@@ -36,8 +36,10 @@ pub struct SpeechSpec {
     pub cfg_weight: Option<f32>,
     /// Takes `instructions`: a free-text description of the voice or delivery.
     pub instructions: bool,
-    /// Takes `ref_audio` + `ref_text`: zero-shot cloning of the reference's voice.
+    /// Takes `ref_audio`: zero-shot cloning of the reference's voice.
     pub voice_cloning: bool,
+    /// Cloning also takes the reference's transcript `ref_text` (required); unset, it is refused.
+    pub clone_transcript: bool,
 }
 
 /// The request's sampling, the spec's defaults filled in.
@@ -163,7 +165,13 @@ impl SpeechSpec {
                     "ref_audio",
                 ));
             }
-            if req.ref_audio.is_none() || req.ref_text.is_none() {
+            if !self.clone_transcript && req.ref_text.is_some() {
+                return Err(invalid(
+                    "this model clones from `ref_audio` alone; omit `ref_text`",
+                    "ref_text",
+                ));
+            }
+            if req.ref_audio.is_none() || (self.clone_transcript && req.ref_text.is_none()) {
                 return Err(invalid(
                     "voice cloning needs both `ref_audio` and its transcript `ref_text`",
                     if req.ref_audio.is_none() {
@@ -268,6 +276,7 @@ impl SpeechSpec {
             "max_tokens": self.max_tokens,
             "instructions": self.instructions,
             "voice_cloning": self.voice_cloning,
+            "clone_transcript": self.voice_cloning && self.clone_transcript,
             "defaults": {
                 "temperature": self.temperature,
                 "top_p": self.top_p,
@@ -315,6 +324,7 @@ mod tests {
             cfg_weight: None,
             instructions: false,
             voice_cloning: false,
+            clone_transcript: true,
         }
     }
 
@@ -486,6 +496,19 @@ mod tests {
                 serde_json::json!({"ref_audio": "UklGRg==", "ref_text": "hi"})
             ))
             .is_ok());
+        cloning.clone_transcript = false;
+        assert!(cloning
+            .check(&req(serde_json::json!({"ref_audio": "UklGRg=="})))
+            .is_ok());
+        assert_eq!(
+            cloning
+                .check(&req(
+                    serde_json::json!({"ref_audio": "UklGRg==", "ref_text": "hi"})
+                ))
+                .unwrap_err()
+                .param,
+            "ref_text"
+        );
     }
 
     #[test]

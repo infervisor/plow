@@ -247,19 +247,33 @@ impl PromptTables {
         Ok(enc.get_ids().to_vec())
     }
 
-    /// The prefill rows ([rows][hidden] f32) for one CFG member.
+    /// Conditioning floats of a packet voice (every voice has the same row count).
+    pub fn voice_rows_len(&self) -> usize {
+        self.voices.values().next().map_or(0, Vec::len)
+    }
+
+    /// A packet voice's conditioning rows.
+    pub fn voice_rows(&self, voice: &str) -> Result<&[f32]> {
+        self.voices
+            .get(voice)
+            .map(Vec::as_slice)
+            .ok_or_else(|| RuntimeError::Rejected(format!("unknown voice {voice:?}")))
+    }
+
+    /// The prefill rows ([rows][hidden] f32) for one CFG member, after the voice's rows `cond`.
     pub fn prefill_rows(
         &self,
         c: &GuidedLmContract,
-        voice: &str,
+        cond: &[f32],
         text_ids: &[u32],
         uncond: bool,
     ) -> Result<Vec<f32>> {
         let h = self.hidden;
-        let cond = self
-            .voices
-            .get(voice)
-            .ok_or_else(|| RuntimeError::Rejected(format!("unknown voice {voice:?}")))?;
+        if cond.is_empty() || cond.len() % h != 0 {
+            return Err(RuntimeError::Rejected(format!(
+                "voice conditioning is not [rows][{h}]"
+            )));
+        }
         let ids: Vec<u32> = std::iter::once(c.start_text)
             .chain(text_ids.iter().copied())
             .chain(std::iter::once(c.stop_text))
@@ -394,10 +408,11 @@ impl GuidedLm {
     ) -> Result<(Vec<u32>, Vec<f32>, Vec<f32>)> {
         let lang = self.tables.language(lang)?;
         let ids = self.tables.text_ids(text, lang.as_deref())?;
-        let rows = self.tables.prefill_rows(&self.c, voice, &ids, false)?;
+        let v = self.tables.voice_rows(voice)?.to_vec();
+        let rows = self.tables.prefill_rows(&self.c, &v, &ids, false)?;
         self.prefill_member(0, &rows)?;
         let cond = self.logits.clone();
-        let rows = self.tables.prefill_rows(&self.c, voice, &ids, true)?;
+        let rows = self.tables.prefill_rows(&self.c, &v, &ids, true)?;
         self.prefill_member(1, &rows)?;
         Ok((ids, cond, self.logits.clone()))
     }
@@ -412,10 +427,11 @@ impl GuidedLm {
     ) -> Result<Vec<u32>> {
         let lang = self.tables.language(lang)?;
         let ids = self.tables.text_ids(text, lang.as_deref())?;
-        let rows = self.tables.prefill_rows(&self.c, voice, &ids, true)?;
+        let v = self.tables.voice_rows(voice)?.to_vec();
+        let rows = self.tables.prefill_rows(&self.c, &v, &ids, true)?;
         self.prefill_member(1, &rows)?;
         std::mem::swap(&mut self.logits, &mut self.uncond);
-        let rows = self.tables.prefill_rows(&self.c, voice, &ids, false)?;
+        let rows = self.tables.prefill_rows(&self.c, &v, &ids, false)?;
         self.prefill_member(0, &rows)?;
         let p = self.c.cfg();
         let mut out = Vec::new();

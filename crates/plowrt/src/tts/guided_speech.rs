@@ -25,6 +25,7 @@ use std::sync::{mpsc, Arc};
 use super::api::{Sampling, SpeechSpec};
 use super::codec::{Codec, Decoded, Window};
 use super::guided_lm::{GuidedLmContract, PromptTables};
+use super::voice_cond::{ClonedVoice, VoiceCond};
 use crate::sched::admission::DownstreamCredit;
 use crate::serve::mux::{CfgJob, Job, JobClass, JobOpts, ModelMux, SpeechJob, SubmitError};
 use crate::serve::stream::StreamChunk;
@@ -49,6 +50,9 @@ pub const VOCODER: &str = "s3gen.pkt";
 /// speech runs up to ~8 speech tokens per text token in every language, so 125 text tokens stay
 /// inside a 1000-token speech budget.
 const SEGMENT_TEXT_TOKENS: usize = 125;
+
+/// The emotion exaggeration of cloned voices (Chatterbox's default; the packet voices bake theirs).
+const CLONE_EXAGGERATION: f32 = 0.5;
 
 /// Longest a whole (non-streamed) reply waits for stream windows once its tokens are complete.
 const WHOLE_MAX_WAIT: std::time::Duration = std::time::Duration::from_secs(2);
@@ -212,11 +216,18 @@ enum Reply {
     Stream(tokio::sync::mpsc::UnboundedSender<StreamEvent>),
 }
 
+/// A request's voice: one of the packet's, or a reference clip's ([`GuidedSpeech::clone_voice`]).
+#[derive(Clone, Debug)]
+pub enum Voice {
+    Named(String),
+    Cloned(Arc<ClonedVoice>),
+}
+
 enum S3Msg {
     /// `turn`: the voice turn's times, looked up once at submit (render deadlines).
     Open {
         id: usize,
-        voice: String,
+        voice: Voice,
         seed: u64,
         reply: Reply,
         turn: Option<crate::serve::turns::TurnTimes>,
@@ -253,10 +264,12 @@ pub struct GuidedSpeech {
     pub spec: SpeechSpec,
     /// The vocoder's `stream.first_tokens`.
     first_tokens: usize,
+    /// Zero-shot cloning: the voice-conditioning packet (with a vocoder that has voice slots).
+    voice_cond: Option<VoiceCond>,
 }
 
 struct Utterance {
-    voice: String,
+    voice: Voice,
     seed: u64,
     reply: Reply,
     tokens: Vec<u32>,
@@ -457,6 +470,12 @@ fn initial_phase(seed: u64, harmonics: usize) -> Vec<f32> {
             }
         })
         .collect()
+}
+
+/// Where a render's voice lives on the vocoder.
+enum Target {
+    Packet(u32),
+    Slot(Arc<super::codec::SlotVoice>),
 }
 
 /// `cost_id`: the vocoder's id in [`crate::sched::cost`].
@@ -776,7 +795,15 @@ fn render_loop(
             .zip(&spans)
             .map(|(k, &span)| {
                 let u = &live[k];
-                let voice = vocoder.voices.iter().position(|v| *v == u.voice);
+                let target = match &u.voice {
+                    Voice::Named(n) => vocoder
+                        .voices
+                        .iter()
+                        .position(|v| v == n)
+                        .map(|v| Target::Packet(v as u32))
+                        .ok_or_else(|| format!("unknown voice {n:?}")),
+                    Voice::Cloned(c) => Ok(Target::Slot(Arc::clone(&c.slot))),
+                };
                 let codes: Vec<i32> = u.tokens[span.start..span.end]
                     .iter()
                     .map(|&t| t as i32)
@@ -787,20 +814,28 @@ fn render_loop(
                 let seed = u.seed ^ (span.start as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
                 let frames = span.end - span.start;
                 async move {
-                    match (voice, window) {
-                        (Some(v), Some(w)) => {
+                    let whole = |pcm| Decoded {
+                        pcm,
+                        phase: Vec::new(),
+                    };
+                    match (target, window) {
+                        (Ok(Target::Packet(v)), Some(w)) => {
+                            vocoder.decode_window(codes, frames, seed, v, w).await
+                        }
+                        (Ok(Target::Packet(v)), None) => vocoder
+                            .decode_voice(codes, frames, seed, v)
+                            .await
+                            .map(whole),
+                        (Ok(Target::Slot(slot)), Some(w)) => {
                             vocoder
-                                .decode_window(codes, frames, seed, v as u32, w)
+                                .decode_slot_window(codes, frames, seed, slot, w)
                                 .await
                         }
-                        (Some(v), None) => vocoder
-                            .decode_voice(codes, frames, seed, v as u32)
+                        (Ok(Target::Slot(slot)), None) => vocoder
+                            .decode_slot(codes, frames, seed, slot)
                             .await
-                            .map(|pcm| Decoded {
-                                pcm,
-                                phase: Vec::new(),
-                            }),
-                        (None, _) => Err(format!("unknown voice {:?}", u.voice)),
+                            .map(whole),
+                        (Err(e), _) => Err(e),
                     }
                 }
             })
@@ -849,7 +884,7 @@ impl GuidedSpeech {
         let tables = PromptTables::load(assets, c.hidden)?;
         let trim_tail = c.trim_tail_tokens;
         let (s_tx, s_rx) = mpsc::channel::<S3Msg>();
-        let (s_ready_tx, s_ready_rx) = mpsc::channel::<Result<(usize, u32, Vec<String>)>>();
+        let (s_ready_tx, s_ready_rx) = mpsc::channel::<Result<(usize, u32, Vec<String>, usize)>>();
         let vocoder_path = crate::exec::packet_runtime::stage_packet(
             &assets.join("model.pkt"),
             "vocoder.packet",
@@ -871,6 +906,7 @@ impl GuidedSpeech {
                     sc.first,
                     sc.sample_rate as u32,
                     vocoder.voices.clone(),
+                    vocoder.prompt_max,
                 )));
                 render_loop(
                     &vocoder,
@@ -881,7 +917,7 @@ impl GuidedSpeech {
                 );
             })
             .map_err(|e| RuntimeError::Device(e.to_string()))?;
-        let (first_tokens, sample_rate, rendered) = s_ready_rx
+        let (first_tokens, sample_rate, rendered, prompt_max) = s_ready_rx
             .recv()
             .map_err(|e| RuntimeError::Device(e.to_string()))??;
         let mut voices: Vec<String> = tables
@@ -890,6 +926,20 @@ impl GuidedSpeech {
             .map(str::to_owned)
             .collect();
         voices.sort_unstable();
+        let voice_cond = if prompt_max > 0 {
+            let path = crate::exec::packet_runtime::stage_packet(
+                &assets.join("model.pkt"),
+                "voice_cond.packet",
+                super::voice_cond::PACKET,
+            )?;
+            if path.is_file() {
+                Some(VoiceCond::load(&path, device).map_err(RuntimeError::Device)?)
+            } else {
+                None
+            }
+        } else {
+            None
+        };
         let mut languages: Vec<String> = tables.languages().map(str::to_owned).collect();
         languages.sort_unstable();
         let spec = SpeechSpec {
@@ -905,7 +955,8 @@ impl GuidedSpeech {
             top_k_max: None,
             cfg_weight: Some(c.cfg_weight),
             instructions: false,
-            voice_cloning: false,
+            voice_cloning: voice_cond.is_some(),
+            clone_transcript: false,
         };
         Ok(GuidedSpeech {
             c,
@@ -915,14 +966,38 @@ impl GuidedSpeech {
             sample_rate,
             spec,
             first_tokens,
+            voice_cond,
         })
+    }
+
+    /// The voice-conditioning packet's sample rate and longest clip (samples), with cloning.
+    pub fn clone_input(&self) -> Option<(u32, usize)> {
+        self.voice_cond
+            .as_ref()
+            .map(|v| (v.sample_rate, v.max_samples()))
+    }
+
+    /// A reference clip's voice (mono PCM at [`Self::clone_input`]'s rate). Blocks on the GPU.
+    pub fn clone_voice(&self, pcm: &[f32]) -> std::result::Result<Voice, SpeechError> {
+        let vc = self.voice_cond.as_ref().ok_or_else(|| {
+            SpeechError::Invalid("this model has no voice cloning".into(), "ref_audio")
+        })?;
+        let v = vc
+            .encode(pcm, CLONE_EXAGGERATION)
+            .map_err(|e| SpeechError::Invalid(e, "ref_audio"))?;
+        if v.rows.len() != self.tables.voice_rows_len() {
+            return Err(SpeechError::Failed(
+                "voice conditioning rows disagree with the LM's voices".into(),
+            ));
+        }
+        Ok(Voice::Cloned(Arc::new(v)))
     }
 
     /// The mux job for one request: both CFG members' prefill rows as overlays, the decode
     /// position base, the packet's sampling chain with the request's values.
     fn job(
         &self,
-        voice: &str,
+        voice: &Voice,
         text: &str,
         lang: Option<&str>,
         sampling: &Sampling,
@@ -934,8 +1009,12 @@ impl GuidedSpeech {
     ) -> Result<Job> {
         let c = &self.c;
         let ids = self.tables.text_ids(text, lang)?;
-        let cond = self.tables.prefill_rows(c, voice, &ids, false)?;
-        let uncond = self.tables.prefill_rows(c, voice, &ids, true)?;
+        let rows = match voice {
+            Voice::Named(n) => self.tables.voice_rows(n)?,
+            Voice::Cloned(v) => &v.rows,
+        };
+        let cond = self.tables.prefill_rows(c, rows, &ids, false)?;
+        let uncond = self.tables.prefill_rows(c, rows, &ids, true)?;
         let n = cond.len() / c.hidden;
         let mut gen = crate::serve::GenParams::default();
         gen.max_tokens = sampling.max_tokens.unwrap_or(c.max_speech_tokens);
@@ -1006,7 +1085,7 @@ impl GuidedSpeech {
     fn submit(
         &self,
         mux: &ModelMux,
-        voice: String,
+        voice: Voice,
         text: String,
         lang: Option<&str>,
         sampling: &Sampling,
@@ -1104,7 +1183,7 @@ impl GuidedSpeech {
     pub async fn synthesize(
         &self,
         mux: &ModelMux,
-        voice: String,
+        voice: Voice,
         text: String,
         lang: Option<&str>,
         sampling: &Sampling,
@@ -1133,7 +1212,7 @@ impl GuidedSpeech {
     pub fn synthesize_stream(
         &self,
         mux: &ModelMux,
-        voice: String,
+        voice: Voice,
         text: String,
         lang: Option<&str>,
         sampling: &Sampling,
@@ -1164,7 +1243,7 @@ mod tests {
     fn stream(tokens: usize) -> (Utterance, tokio::sync::mpsc::UnboundedReceiver<StreamEvent>) {
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
         let u = Utterance {
-            voice: String::new(),
+            voice: Voice::Named(String::new()),
             seed: 1,
             reply: Reply::Stream(tx),
             tokens: vec![0; tokens],

@@ -23,6 +23,8 @@ pub mod ref_encoder;
 pub mod serving;
 #[cfg(feature = "cuda")]
 pub mod text_encoder;
+#[cfg(feature = "cuda")]
+pub mod voice_cond;
 
 use std::path::Path;
 
@@ -266,6 +268,7 @@ impl SpeechContract {
             cfg_weight: self.depth_cfg().then_some(0.0),
             instructions: self.instructions.is_some(),
             voice_cloning: self.clone.is_some(),
+            clone_transcript: true,
         }
     }
 
