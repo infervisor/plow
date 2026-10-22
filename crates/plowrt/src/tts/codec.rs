@@ -35,6 +35,15 @@ pub struct Window {
     pub phase: Vec<f32>,
 }
 
+/// A cloned voice's conditionals for the voice-slot capacities (`vsynth`): its prompt speech
+/// tokens, their `[2 * tokens][80]` prompt mels and the `[80]` speaker vector.
+#[derive(Debug)]
+pub struct SlotVoice {
+    pub prompt_token: Vec<u32>,
+    pub prompt_feat: Vec<f32>,
+    pub spks: Vec<f32>,
+}
+
 /// Called by the codec worker between the program segments of one launch (see
 /// [`Codec::set_yield`]).
 pub type YieldHook = std::sync::Arc<dyn Fn() + Send + Sync>;
@@ -209,6 +218,7 @@ enum Family {
     Decode,
     Window,
     Step,
+    Slot,
 }
 
 enum Msg {
@@ -224,6 +234,7 @@ struct Job {
     urgency: Urgency,
     window: Option<Window>,
     step: Option<Step>,
+    clone: Option<std::sync::Arc<SlotVoice>>,
     reply: tokio::sync::oneshot::Sender<Result<Decoded, String>>,
     /// Backlog charged to the feeding model's mux until this job is answered.
     _work: Option<crate::sched::admission::DownstreamWork>,
@@ -231,10 +242,11 @@ struct Job {
 
 impl Job {
     fn family(&self) -> Family {
-        match (&self.window, &self.step) {
-            (_, Some(_)) => Family::Step,
-            (Some(_), None) => Family::Window,
-            (None, None) => Family::Decode,
+        match (&self.window, &self.step, &self.clone) {
+            (_, Some(_), _) => Family::Step,
+            (Some(_), None, _) => Family::Window,
+            (None, None, Some(_)) => Family::Slot,
+            (None, None, None) => Family::Decode,
         }
     }
 }
@@ -264,6 +276,8 @@ pub struct Codec {
     pub parameters: std::collections::BTreeMap<String, u64>,
     /// Most new frames one stateful step decodes (0: the packet has no step programs).
     pub step_frames: usize,
+    /// Most prompt tokens a [`SlotVoice`] may have (0: the packet has no voice slots).
+    pub prompt_max: usize,
     slots: Option<std::sync::Arc<Mutex<SlotPool>>>,
 }
 
@@ -286,6 +300,63 @@ struct StepIo {
     pcm_buf: Vec<f32>,
 }
 
+/// The packet's voice slot tables (`slot.prompt_token`, `slot.prompt_feat`, `slot.spks`,
+/// `slot.prompt_len`) and the voice each slot holds; the worker assigns slots per launch.
+struct VoiceSlots {
+    tables: [PacketTensor; 4],
+    prompt_max: usize,
+    resident: Vec<Option<std::sync::Arc<SlotVoice>>>,
+    used: Vec<u64>,
+    clock: u64,
+}
+
+impl VoiceSlots {
+    /// Slots for `voices` (at most one launch's worth), writing the tables of those not resident.
+    fn assign(
+        &mut self,
+        rt: &mut dyn crate::exec::packet_runtime::PacketRuntime,
+        voices: &[&std::sync::Arc<SlotVoice>],
+    ) -> Result<Vec<u32>, String> {
+        let e = |x: crate::RuntimeError| x.to_string();
+        let mut out: Vec<u32> = Vec::with_capacity(voices.len());
+        for v in voices {
+            self.clock += 1;
+            let hit = self
+                .resident
+                .iter()
+                .position(|r| r.as_ref().is_some_and(|r| std::sync::Arc::ptr_eq(r, v)));
+            let s = match hit {
+                Some(s) => s,
+                None => {
+                    let s = (0..self.resident.len())
+                        .filter(|s| !out.contains(&(*s as u32)))
+                        .min_by_key(|&s| self.used[s])
+                        .ok_or("more cloned voices in a launch than voice slots")?;
+                    let (pm, p) = (self.prompt_max, v.prompt_token.len());
+                    let mut tok = vec![0u32; pm];
+                    tok[..p].copy_from_slice(&v.prompt_token);
+                    let mut feat = vec![0f32; 2 * pm * 80];
+                    feat[..v.prompt_feat.len()].copy_from_slice(&v.prompt_feat);
+                    let [t, f, k, l] = self.tables;
+                    rt.write_tensor_at(t, s * pm * 4, bytemuck::cast_slice(&tok))
+                        .map_err(e)?;
+                    rt.write_tensor_at(f, s * feat.len() * 4, bytemuck::cast_slice(&feat))
+                        .map_err(e)?;
+                    rt.write_tensor_at(k, s * 80 * 4, bytemuck::cast_slice(&v.spks))
+                        .map_err(e)?;
+                    rt.write_tensor_at(l, s * 4, &(p as u32).to_le_bytes())
+                        .map_err(e)?;
+                    self.resident[s] = Some((*v).clone());
+                    s
+                }
+            };
+            self.used[s] = self.clock;
+            out.push(s as u32);
+        }
+        Ok(out)
+    }
+}
+
 struct Bound {
     runtime: Box<dyn crate::exec::packet_runtime::PacketRuntime>,
     /// (batch, frames, programs in order), ascending by batch * frames.
@@ -296,6 +367,9 @@ struct Bound {
     steps: Vec<Capacity>,
     step_io: Option<StepIo>,
     slots: Option<std::sync::Arc<Mutex<SlotPool>>>,
+    /// Voice-slot capacities (`vsynth`) and the slots their items read.
+    slot_caps: Vec<Capacity>,
+    voice_slots: Option<VoiceSlots>,
     /// Window source phase in/out and seams (packets with cached capacities).
     phase: Option<[PacketTensor; 4]>,
     harmonics: usize,
@@ -378,6 +452,7 @@ impl Codec {
                     bound.cached.iter().map(|c| (c.0, c.1)).collect::<Vec<_>>(),
                     bound.steps.iter().map(|c| c.1).max().unwrap_or(0),
                     bound.slots.clone(),
+                    bound.voice_slots.as_ref().map_or(0, |v| v.prompt_max),
                 );
                 let _ = ready_tx.send(Ok(info));
                 run(rx, bound);
@@ -397,6 +472,7 @@ impl Codec {
             window_capacities,
             step_frames,
             slots,
+            prompt_max,
         ) = ready_rx.recv().map_err(|e| e.to_string())??;
         Ok(Codec {
             tx: Mutex::new(tx),
@@ -414,6 +490,7 @@ impl Codec {
             window_capacities,
             parameters,
             step_frames,
+            prompt_max,
             slots,
         })
     }
@@ -452,7 +529,7 @@ impl Codec {
             pos: slot.pos,
         };
         let pcm = self
-            .submit(codes, frames, 0, 0, urgency, None, Some(step))
+            .submit(codes, frames, 0, 0, urgency, None, Some(step), None)
             .await?
             .pcm;
         slot.pos += frames;
@@ -499,6 +576,28 @@ impl Codec {
             .map(|d| d.pcm)
     }
 
+    /// [`Self::decode`] in a cloned voice, on the voice-slot capacities (`prompt_max > 0`).
+    pub async fn decode_slot(
+        &self,
+        codes: Vec<i32>,
+        frames: usize,
+        seed: u64,
+        voice: std::sync::Arc<SlotVoice>,
+    ) -> Result<Vec<f32>, String> {
+        self.submit(
+            codes,
+            frames,
+            seed,
+            0,
+            Urgency::Stream,
+            None,
+            None,
+            Some(voice),
+        )
+        .await
+        .map(|d| d.pcm)
+    }
+
     /// A stream window on the cached capacities (`max_window > 0`).
     pub async fn decode_window(
         &self,
@@ -521,7 +620,7 @@ impl Codec {
         urgency: Urgency,
         window: Option<Window>,
     ) -> Result<Decoded, String> {
-        self.submit(codes, frames, seed, voice, urgency, window, None)
+        self.submit(codes, frames, seed, voice, urgency, window, None, None)
             .await
     }
 
@@ -535,6 +634,7 @@ impl Codec {
         urgency: Urgency,
         window: Option<Window>,
         step: Option<Step>,
+        clone: Option<std::sync::Arc<SlotVoice>>,
     ) -> Result<Decoded, String> {
         let (reply, rx) = tokio::sync::oneshot::channel();
         let _work = self.credit.as_ref().map(|c| c.work());
@@ -548,6 +648,7 @@ impl Codec {
                 urgency,
                 window,
                 step,
+                clone,
                 reply,
                 _work,
             }))
@@ -570,6 +671,8 @@ fn bind(path: &Path, device: u8) -> Result<Bound, String> {
         Default::default();
     let mut steps: std::collections::BTreeMap<(usize, usize), Vec<(usize, usize)>> =
         Default::default();
+    let mut vsynth: std::collections::BTreeMap<(usize, usize), Vec<(usize, usize)>> =
+        Default::default();
     let mut prefill: std::collections::BTreeMap<u32, Vec<(usize, usize)>> = Default::default();
     for (role, program) in pipeline.programs() {
         let parts: Vec<&str> = role.split('.').collect();
@@ -590,12 +693,12 @@ fn bind(path: &Path, device: u8) -> Result<Bound, String> {
                     steps.entry(key).or_default().push((0, program));
                 }
             }
-            ["synth", b, t, stage] | ["csynth", b, t, stage] => {
+            [kind @ ("synth" | "csynth" | "vsynth"), b, t, stage] => {
                 if let (Some(key), Ok(stage)) = (dims(b, t, "b", "t"), stage.parse::<usize>()) {
-                    let family = if parts[0] == "synth" {
-                        &mut sequences
-                    } else {
-                        &mut cached
+                    let family = match *kind {
+                        "synth" => &mut sequences,
+                        "csynth" => &mut cached,
+                        _ => &mut vsynth,
                     };
                     family.entry(key).or_default().push((stage, program));
                 }
@@ -626,6 +729,7 @@ fn bind(path: &Path, device: u8) -> Result<Bound, String> {
         };
     let capacities = family(sequences);
     let cached = family(cached);
+    let slot_caps = family(vsynth);
     let stateful = pipeline.parameter("stream.stateful").unwrap_or(0) == 1;
     let steps = if stateful { family(steps) } else { Vec::new() };
     if capacities.is_empty() {
@@ -674,11 +778,42 @@ fn bind(path: &Path, device: u8) -> Result<Bound, String> {
     // Run every capacity once now: each program sequence is captured as a CUDA graph on first
     // use, and a capture that overlaps another thread's context synchronize (the LM engine) fails.
     let t = std::time::Instant::now();
-    for (_, _, programs) in capacities.iter().chain(&cached).chain(&steps) {
+    let voice_slots = if slot_caps.is_empty() {
+        None
+    } else {
+        let t = |k: &str| pipeline.tensor(k).map_err(e);
+        let tables = [
+            t("slot.prompt_token")?,
+            t("slot.prompt_feat")?,
+            t("slot.spks")?,
+            t("slot.prompt_len")?,
+        ];
+        let n = param("voice.slots")?;
+        if slot_caps.iter().any(|c| c.0 > n) {
+            return Err("codec voice-slot capacity exceeds its voice slots".into());
+        }
+        // Empty slots (prompt length 0) until a launch assigns them.
+        for t in tables {
+            runtime.write_tensor(t, &vec![0u8; t.bytes]).map_err(e)?;
+        }
+        Some(VoiceSlots {
+            tables,
+            prompt_max: param("prompt.max")?,
+            resident: vec![None; n],
+            used: vec![0; n],
+            clock: 0,
+        })
+    };
+    for (_, _, programs) in capacities
+        .iter()
+        .chain(&cached)
+        .chain(&steps)
+        .chain(&slot_caps)
+    {
         runtime.run_sequence(programs).map_err(e)?;
     }
     tracing::info!(
-        capacities = capacities.len() + cached.len() + steps.len(),
+        capacities = capacities.len() + cached.len() + steps.len() + slot_caps.len(),
         ms = t.elapsed().as_millis() as u64,
         "codec graphs warmed"
     );
@@ -724,6 +859,8 @@ fn bind(path: &Path, device: u8) -> Result<Bound, String> {
         steps,
         step_io,
         cached,
+        slot_caps,
+        voice_slots,
         phase,
         harmonics: pipeline
             .parameter("vocoder.harmonics")
@@ -803,6 +940,7 @@ impl Bound {
             Family::Decode => &self.capacities,
             Family::Window => &self.cached,
             Family::Step => &self.steps,
+            Family::Slot => &self.slot_caps,
         };
         smallest(caps, batch, frames)
     }
@@ -811,6 +949,16 @@ impl Bound {
     fn check(&self, j: &Job) -> Result<(), &'static str> {
         if j.frames == 0 || j.codes.len() != j.frames * self.frame_codes {
             return Err("codec job has no frames or a partial frame");
+        }
+        if let Some(v) = &j.clone {
+            let pm = self.voice_slots.as_ref().map_or(0, |s| s.prompt_max);
+            let p = v.prompt_token.len();
+            if p == 0 || p > pm || v.prompt_feat.len() != 2 * p * 80 || v.spks.len() != 80 {
+                return Err("cloned voice does not fit the codec's voice slots");
+            }
+            if self.capacity(Family::Slot, 1, j.frames).is_none() {
+                return Err("cloned-voice render exceeds every voice-slot capacity");
+            }
         }
         let Some(step) = j.step else { return Ok(()) };
         if self.capacity(Family::Step, 1, j.frames).is_none() {
@@ -938,11 +1086,7 @@ impl Bound {
     fn decode(&mut self, jobs: &[Job]) -> Result<Vec<Decoded>, String> {
         let frames = jobs.iter().map(|j| j.frames).max().unwrap_or(0);
         let window = jobs[0].window.is_some();
-        let family = if window {
-            Family::Window
-        } else {
-            Family::Decode
-        };
+        let family = jobs[0].family();
         let (cb, cf, programs) = self
             .capacity(family, jobs.len(), frames)
             .cloned()
@@ -982,10 +1126,18 @@ impl Bound {
         self.runtime
             .write_tensor(self.seed, bytemuck::cast_slice(&seeds))
             .map_err(e)?;
+        let slots = match (family, self.voice_slots.as_mut()) {
+            (Family::Slot, Some(vs)) => {
+                let voices: Vec<_> = jobs.iter().filter_map(|j| j.clone.as_ref()).collect();
+                Some(vs.assign(self.runtime.as_mut(), &voices)?)
+            }
+            (Family::Slot, None) => return Err("codec packet has no voice slots".into()),
+            _ => None,
+        };
         if let Some(voice) = self.voice {
             let mut v = vec![0u32; voice.bytes / 4];
             for (i, j) in jobs.iter().enumerate() {
-                v[i] = j.voice;
+                v[i] = slots.as_ref().map_or(j.voice, |s| s[i]);
             }
             self.runtime
                 .write_tensor(voice, bytemuck::cast_slice(&v))
@@ -1077,6 +1229,7 @@ fn run(rx: mpsc::Receiver<Msg>, mut codec: Bound) {
         .iter()
         .chain(&codec.cached)
         .chain(&codec.steps)
+        .chain(&codec.slot_caps)
         .map(|c| c.0)
         .max()
         .unwrap_or(1);
@@ -1146,6 +1299,7 @@ mod tests {
                 slot: SlotId { index, gen: 0 },
                 pos: 0,
             }),
+            clone: None,
             reply: tokio::sync::oneshot::channel().0,
             _work: None,
         }

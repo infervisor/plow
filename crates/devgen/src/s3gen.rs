@@ -94,6 +94,20 @@ pub const S3GEN_CACHED_CAPACITIES: &[(u32, u32)] = &[
     (64, 64),
 ];
 
+/// Voice-slot capacities (`vsynth`): the reference CFM over a runtime-written voice slot's prompt
+/// (up to `prompt_max` tokens) + tokens; items of different prompt lengths share a batch.
+pub const S3GEN_SLOT_CAPACITIES: &[(u32, u32)] = &[
+    (1, 32),
+    (1, 64),
+    (1, 128),
+    (1, 256),
+    (1, 512),
+    (4, 64),
+    (4, 128),
+    (8, 64),
+    (8, 128),
+];
+
 const D_ENC: u32 = 512;
 const D_CFM: u32 = 256;
 const HEADS: u32 = 8;
@@ -129,6 +143,9 @@ struct Config {
     audio_limit: f32,
     /// Voice caches pre-formatted for the 3xFP16 cached attention (`PLOW_EMIT_S3GEN_ATTN_H16`).
     attn_h16: bool,
+    /// Voice slots' prompt capacity (tokens) and count; 0 slots = none.
+    prompt_max: u32,
+    clone_slots: u32,
 }
 
 impl Config {
@@ -204,6 +221,8 @@ impl Config {
             trim: u(v, "trim")?,
             audio_limit: f("audio_limit")?,
             attn_h16: false,
+            prompt_max: v["prompt_max"].as_u64().unwrap_or(0) as u32,
+            clone_slots: v["clone_slots"].as_u64().unwrap_or(0) as u32,
         })
     }
 
@@ -279,6 +298,7 @@ pub fn lower_s3gen(
         || cfg.voices.is_empty()
         || cfg.n_fft != 4 * cfg.hop
         || cfg.harmonics == 0
+        || (cfg.clone_slots > 0 && cfg.prompt_max < cfg.prompt)
     {
         return Err("unsupported S3Gen export".into());
     }
@@ -293,13 +313,25 @@ pub fn lower_s3gen(
         .copied()
         .filter(|&(_, n)| n <= cfg.max_tokens)
         .collect();
+    let slots: Vec<(u32, u32)> = S3GEN_SLOT_CAPACITIES
+        .iter()
+        .copied()
+        .filter(|&(_, n)| cfg.clone_slots > 0 && n <= cfg.max_tokens)
+        .collect();
     let bmax = caps
         .iter()
         .chain(&cached)
+        .chain(&slots)
         .map(|c| c.0)
         .max()
         .ok_or("no S3Gen capacity fits max_tokens")?;
-    let nmax = caps.iter().chain(&cached).map(|c| c.1).max().unwrap_or(1);
+    let nmax = caps
+        .iter()
+        .chain(&cached)
+        .chain(&slots)
+        .map(|c| c.1)
+        .max()
+        .unwrap_or(1);
     let mut model = packet::devbuild::Model {
         n_cu,
         target,
@@ -320,6 +352,15 @@ pub fn lower_s3gen(
         seam: builder.tensor("in.s3gen.seam", u64::from(bmax) * 4),
         next_seam: builder.tensor("in.s3gen.next_seam", u64::from(bmax) * 4),
         nmax,
+        slot: (cfg.clone_slots > 0).then(|| {
+            let (s, pm) = (u64::from(cfg.clone_slots), u64::from(cfg.prompt_max));
+            Slot {
+                token: builder.tensor("in.s3gen.slot.prompt_token", s * pm * 4),
+                feat: builder.tensor("in.s3gen.slot.prompt_feat", s * 2 * pm * u64::from(MEL) * 4),
+                spks: builder.tensor("in.s3gen.slot.spks", s * u64::from(MEL) * 4),
+                plen: builder.tensor("in.s3gen.slot.prompt_len", s * 4),
+            }
+        }),
         lengths: {
             let h: Vec<u32> = (0..7)
                 .map(|k| builder.tensor(&format!("act.s3gen.len.{k}"), u64::from(bmax) * 4))
@@ -359,6 +400,7 @@ pub fn lower_s3gen(
     let all: Vec<(u32, u32, Mode)> = voices
         .chain(family(&caps, Mode::Full))
         .chain(family(&cached, Mode::Cached))
+        .chain(family(&slots, Mode::Slot))
         .collect();
     for (batch, tokens, mode) in all {
         let lo = Lowering {
@@ -371,6 +413,7 @@ pub fn lower_s3gen(
         let role = match mode {
             Mode::Full => format!("synth.b{batch}.t{tokens}"),
             Mode::Cached => format!("csynth.b{batch}.t{tokens}"),
+            Mode::Slot => format!("vsynth.b{batch}.t{tokens}"),
             Mode::Prefill(v) => format!("prefill.v{v}"),
         };
         let mut stage = 0;
@@ -461,7 +504,18 @@ struct Inputs {
     seam: u32,
     next_seam: u32,
     nmax: u32,
+    slot: Option<Slot>,
     lengths: Lengths,
+}
+
+/// Runtime-written voice slots: `[S][prompt_max]` prompt tokens, `[S][2 prompt_max][80]` prompt
+/// mels (zero past the slot's `2 prompt_len` rows), `[S][80]` speaker vectors, `[S]` prompt lengths.
+#[derive(Clone, Copy)]
+struct Slot {
+    token: u32,
+    feat: u32,
+    spks: u32,
+    plen: u32,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -473,6 +527,9 @@ enum Mode {
     Prefill(u32),
     /// The CFM over the tokens only, attending to [cached prompt K/V | own K/V].
     Cached,
+    /// [`Mode::Full`] over a voice slot: item rows are [prompt | tokens | padding] at the slot's
+    /// prompt length, within `prompt_max` + tokens.
+    Slot,
 }
 
 /// A [`StageProgram`] with read/write hazard tracking: every op depends on the last writer of
@@ -1074,8 +1131,16 @@ fn kv_cache(step: usize, k: u32) -> String {
 }
 
 impl Lowering<'_> {
+    fn prompt(&self) -> u32 {
+        if self.mode == Mode::Slot {
+            self.cfg.prompt_max
+        } else {
+            self.cfg.prompt
+        }
+    }
+
     fn t0(&self) -> u32 {
-        self.cfg.prompt + self.n
+        self.prompt() + self.n
     }
 
     fn t1(&self) -> u32 {
@@ -1100,7 +1165,7 @@ impl Lowering<'_> {
         if self.mode == Mode::Cached {
             PROMPT_TAIL_ROWS
         } else {
-            2 * self.cfg.prompt
+            2 * self.prompt()
         }
     }
 
@@ -1238,29 +1303,9 @@ impl Lowering<'_> {
         o.copy(x, out, (self.b, t, c), (c, self.b * c, 0), (t * c, c, 0))
     }
 
-    fn encoder(&self, o: &mut Ops) -> Result<(), String> {
-        let (cfg, inp, b, n) = (self.cfg, self.inputs, self.b, self.n);
-        let (t0, t1, p) = (self.t0(), self.t1(), cfg.prompt);
-        let nv = cfg.voices.len() as u32;
-        for k in 0..inp.lengths.all().len() {
-            let table = format!("s3gen.len.{k}");
-            let g = Gather {
-                rows: b,
-                width: 1,
-                vocab: inp.nmax + 1,
-                per_item: 1,
-                repeat: 1,
-                index_stride: 1,
-                ..Default::default()
-            };
-            o.gather(
-                Table::Weight(&table, inp.nmax + 1),
-                Some(inp.count),
-                &format!("act.s3gen.len.{k}"),
-                g,
-            )?;
-        }
-        // Token ids [b][prompt | tokens] (u32 bit patterns moved by the f32 copy / gather).
+    /// Built-in voices' token ids: `[b][voice prompt | tokens]`.
+    fn voice_tokens(&self, o: &mut Ops, t0: u32, p: u32, nv: u32) -> Result<u32, String> {
+        let (inp, b, n) = (self.inputs, self.b, self.n);
         if n > 0 {
             o.copy(
                 inp.tokens,
@@ -1285,6 +1330,139 @@ impl Lowering<'_> {
                 ..Default::default()
             },
         )?;
+        Ok(idx)
+    }
+
+    fn encoder(&self, o: &mut Ops) -> Result<(), String> {
+        let (cfg, inp, b, n) = (self.cfg, self.inputs, self.b, self.n);
+        let (t0, t1, p) = (self.t0(), self.t1(), self.prompt());
+        let nv = cfg.voices.len() as u32;
+        let slot = inp.slot.filter(|_| self.mode == Mode::Slot);
+        let plen = match slot {
+            Some(s) => Some(o.gather(
+                Table::Tensor(s.plen, cfg.clone_slots),
+                Some(inp.voice),
+                "act.s3gen.plen",
+                Gather {
+                    rows: b,
+                    width: 1,
+                    vocab: cfg.clone_slots,
+                    per_item: 1,
+                    repeat: 1,
+                    index_stride: 1,
+                    ..Default::default()
+                },
+            )?),
+            None => None,
+        };
+        for k in 0..inp.lengths.all().len() {
+            if let (Some(plen), 0 | 1) = (plen, k) {
+                // Prompt-dependent resolutions: the slot's row of the [prompt][count] table.
+                let lrow = o.gather(
+                    Table::Weight(&format!("s3gen.lenp.{k}"), p + 1),
+                    Some(plen),
+                    "act.s3gen.lrow",
+                    Gather {
+                        rows: b,
+                        width: inp.nmax + 1,
+                        vocab: p + 1,
+                        per_item: 1,
+                        repeat: 1,
+                        index_stride: 1,
+                        ..Default::default()
+                    },
+                )?;
+                o.gather(
+                    Table::Tensor(lrow, b * (inp.nmax + 1)),
+                    Some(inp.count),
+                    &format!("act.s3gen.len.{k}"),
+                    Gather {
+                        rows: b,
+                        width: 1,
+                        vocab: inp.nmax + 1,
+                        per_item: 1,
+                        repeat: 1,
+                        index_stride: 1,
+                        table_stride: inp.nmax + 1,
+                        ..Default::default()
+                    },
+                )?;
+                continue;
+            }
+            let table = format!("s3gen.len.{k}");
+            let g = Gather {
+                rows: b,
+                width: 1,
+                vocab: inp.nmax + 1,
+                per_item: 1,
+                repeat: 1,
+                index_stride: 1,
+                ..Default::default()
+            };
+            o.gather(
+                Table::Weight(&table, inp.nmax + 1),
+                Some(inp.count),
+                &format!("act.s3gen.len.{k}"),
+                g,
+            )?;
+        }
+        // Token ids [b][prompt | tokens] (u32 bit patterns moved by the f32 copy / gather).
+        let idx = if let (Some(s), Some(plen)) = (slot, plen) {
+            // [b][slot prompt (prompt_max) | tokens], then each row's source column.
+            o.gather(
+                Table::Tensor(s.token, cfg.clone_slots),
+                Some(inp.voice),
+                "act.s3gen.src",
+                Gather {
+                    rows: b,
+                    width: p,
+                    vocab: cfg.clone_slots,
+                    per_item: 1,
+                    repeat: 1,
+                    index_stride: 1,
+                    out_stride: t0,
+                    ..Default::default()
+                },
+            )?;
+            let src = o.copy(
+                inp.tokens,
+                "act.s3gen.src",
+                (b, 1, n),
+                (n, n, 0),
+                (t0, t0, p),
+            )?;
+            let cix = o.gather(
+                Table::Weight(&format!("s3gen.ix.tok.t{n}"), p + 1),
+                Some(plen),
+                "act.s3gen.cix",
+                Gather {
+                    rows: b,
+                    width: t0,
+                    vocab: p + 1,
+                    per_item: 1,
+                    repeat: 1,
+                    index_stride: 1,
+                    ..Default::default()
+                },
+            )?;
+            o.gather(
+                Table::Tensor(src, b * t0),
+                Some(cix),
+                "act.s3gen.idx",
+                Gather {
+                    rows: b * t0,
+                    width: 1,
+                    vocab: t0,
+                    per_item: t0,
+                    repeat: 1,
+                    index_stride: t0,
+                    table_stride: t0,
+                    ..Default::default()
+                },
+            )?
+        } else {
+            self.voice_tokens(o, t0, p, nv)?
+        };
         let e0 = o.gather(
             Table::Weight("emb", cfg.vocab),
             Some(idx),
@@ -1394,14 +1572,18 @@ impl Lowering<'_> {
             (MEL, b * MEL, (t1 - tc) * b * MEL),
             (tc * w, w, MEL),
         )?;
+        let (spks, voices) = match slot {
+            Some(s) => (Table::Tensor(s.spks, cfg.clone_slots), cfg.clone_slots),
+            None => (Table::Weight("voice.spks", nv), nv),
+        };
         o.gather(
-            Table::Weight("voice.spks", nv),
+            spks,
             Some(inp.voice),
             "act.s3gen.x320",
             Gather {
                 rows: b * tc,
                 width: MEL,
-                vocab: nv,
+                vocab: voices,
                 per_item: tc,
                 repeat: tc,
                 index_stride: 1,
@@ -1456,14 +1638,18 @@ impl Lowering<'_> {
             )?;
         } else {
             let pf = 2 * p;
+            let (feat, voices) = match slot {
+                Some(s) => (Table::Tensor(s.feat, cfg.clone_slots), cfg.clone_slots),
+                None => (Table::Weight("voice.prompt_feat", nv), nv),
+            };
             let cond = o.gather(
-                Table::Weight("voice.prompt_feat", nv),
+                feat,
                 Some(inp.voice),
                 "act.s3gen.cond",
                 Gather {
                     rows: b,
                     width: pf * MEL,
-                    vocab: nv,
+                    vocab: voices,
                     per_item: 1,
                     repeat: 1,
                     index_stride: 1,
@@ -1986,13 +2172,46 @@ impl Lowering<'_> {
         let f = rows_out[2];
         let (lg, lf, lw) = (inp.lengths.gen, inp.lengths.stage[2], inp.lengths.wav);
         let xt = o.names["act.s3gen.xt"];
-        let mel = o.copy(
-            xt,
-            "act.s3gen.mel",
-            (b, g, MEL),
-            (tc * MEL, MEL, self.mel0() * MEL),
-            (g * MEL, MEL, 0),
-        )?;
+        let mel = if self.mode == Mode::Slot {
+            // Generated rows start at each item's 2 * prompt_len.
+            let gix = o.gather(
+                Table::Weight(&format!("s3gen.ix.gen.t{}", self.n), cfg.prompt_max + 1),
+                Some(o.names["act.s3gen.plen"]),
+                "act.s3gen.gix",
+                Gather {
+                    rows: b,
+                    width: g,
+                    vocab: cfg.prompt_max + 1,
+                    per_item: 1,
+                    repeat: 1,
+                    index_stride: 1,
+                    ..Default::default()
+                },
+            )?;
+            o.gather(
+                Table::Tensor(xt, b * tc),
+                Some(gix),
+                "act.s3gen.mel",
+                Gather {
+                    rows: b * g,
+                    width: MEL,
+                    vocab: tc,
+                    per_item: g,
+                    repeat: 1,
+                    index_stride: g,
+                    table_stride: tc,
+                    ..Default::default()
+                },
+            )?
+        } else {
+            o.copy(
+                xt,
+                "act.s3gen.mel",
+                (b, g, MEL),
+                (tc * MEL, MEL, self.mel0() * MEL),
+                (g * MEL, MEL, 0),
+            )?
+        };
         // F0 predictor.
         let mut v = mel;
         let mut cin = MEL;
@@ -2470,6 +2689,34 @@ impl Derived<'_> {
             }
             _ => {}
         }
+        let (pm, nmax) = (self.cfg.prompt_max, self.nmax);
+        if let Some(k) = name.strip_prefix("s3gen.lenp.") {
+            let k: u32 = k.parse().map_err(|_| name.to_string())?;
+            return Ok((0..=pm)
+                .flat_map(|p| (0..=nmax).map(move |n| (k + 1) * (n + p)))
+                .flat_map(u32::to_le_bytes)
+                .collect());
+        }
+        if let Some(n) = name.strip_prefix("s3gen.ix.tok.t") {
+            let n: u32 = n.parse().map_err(|_| name.to_string())?;
+            return Ok((0..=pm)
+                .flat_map(|p| {
+                    (0..pm + n).map(move |r| match r {
+                        r if r < p => r,
+                        r if r < p + n => pm + r - p,
+                        _ => u32::MAX,
+                    })
+                })
+                .flat_map(u32::to_le_bytes)
+                .collect());
+        }
+        if let Some(n) = name.strip_prefix("s3gen.ix.gen.t") {
+            let n: u32 = n.parse().map_err(|_| name.to_string())?;
+            return Ok((0..=pm)
+                .flat_map(|p| (0..2 * n).map(move |r| 2 * p + r))
+                .flat_map(u32::to_le_bytes)
+                .collect());
+        }
         if let Some(k) = name
             .strip_prefix("s3gen.len.")
             .and_then(|k| k.parse::<usize>().ok())
@@ -2632,6 +2879,24 @@ fn pipeline_section(
         ("render.yield_programs".into(), u64::from(CFM_PARTS)),
         ("vocoder.harmonics".into(), u64::from(cfg.harmonics)),
     ]);
+    let mut parameters = parameters;
+    if let Some(s) = inputs.slot {
+        let (n, pm) = (u64::from(cfg.clone_slots), u64::from(cfg.prompt_max));
+        let f32s = |h: u32, n: u64| PipelineTensor {
+            name: t(h),
+            dtype: PipelineDType::F32,
+            shape: vec![n],
+        };
+        tensors.insert("slot.prompt_token".into(), u32s(s.token, n * pm));
+        tensors.insert(
+            "slot.prompt_feat".into(),
+            f32s(s.feat, n * 2 * pm * u64::from(MEL)),
+        );
+        tensors.insert("slot.spks".into(), f32s(s.spks, n * u64::from(MEL)));
+        tensors.insert("slot.prompt_len".into(), u32s(s.plen, n));
+        parameters.insert("prompt.max".into(), pm);
+        parameters.insert("voice.slots".into(), n);
+    }
     let strings = BTreeMap::from([("voices".into(), cfg.voices.join("\n"))]);
     let metadata = PacketPipelines {
         version: VERSION,
