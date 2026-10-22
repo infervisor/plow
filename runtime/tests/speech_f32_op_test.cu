@@ -48,6 +48,7 @@ GOLDEN(g_copy_cols_f32);
 GOLDEN(g_stream_tail_f32);
 GOLDEN(g_reduce_rows_f32);
 GOLDEN(g_length_affine_u32);
+GOLDEN(g_trim_silence_f32);
 GOLDEN(g_conv1d_f32);
 GOLDEN(g_conv_transpose1d_f32);
 GOLDEN(g_unary_f32);
@@ -331,7 +332,8 @@ static void t_conv(const char* name, unsigned batches, unsigned frames, unsigned
                    unsigned oc, unsigned kernel, unsigned stride, unsigned pb, unsigned pa,
                    unsigned flags) {
     Case c;
-    const unsigned of = (frames + pb + pa - kernel) / stride + 1, ow = (width + pb + pa - kernel) / stride + 1;
+    const unsigned ws = flags >> 16 ? flags >> 16 : stride;
+    const unsigned of = (frames + pb + pa - kernel) / stride + 1, ow = (width + pb + pa - kernel) / ws + 1;
     const unsigned stored = flags & 1u ? 1u : ic;
     unsigned o = c.out((size_t)batches * of * ow * oc);
     unsigned x = c.f32((size_t)batches * frames * width * ic, 1.f);
@@ -820,6 +822,97 @@ static void t_length_affine() {
         c.in.i[0] = items; c.in.i[1] = a.mul; c.in.i[2] = (unsigned)a.add; c.in.i[3] = a.div;
         c.in.i[4] = a.lo; c.in.i[5] = a.hi;
         run(a.name, c, g_length_affine_u32, {o}, INT);
+    }
+}
+
+/* LstmCellF32 rows: c in place, h rows into a time-major [x | h] buffer at a column offset. */
+static void t_lstm_rows() {
+    Case c; const unsigned width = 256, rows = 25, zw = 296, t = 3;
+    const size_t zn = (size_t)(t + 2) * rows * zw;
+    unsigned z = c.f32(zn, 1.f), cs = c.f32((size_t)rows * width, 2.f), g = c.f32((size_t)rows * 4 * width, 4.f);
+    c.in.op = PLOW_DOP_LSTM_CELL_F32; c.in.t[0] = z; c.in.t[1] = cs; c.in.t[2] = g; c.in.t[3] = cs;
+    c.in.i[0] = width; c.in.i[1] = rows; c.in.i[2] = zw; c.in.i[3] = (t + 1) * rows * zw + 40;
+    run("LstmCellF32 25 rows h strided", c, g_lstm_cell_f32, {z, cs}, FP32);
+}
+
+/* AttentionF32 head_width 256: separate query rows and a fused [K | V] buffer under one stride. */
+static void t_attention_w256(const char* name, unsigned batch, unsigned q_rows, unsigned kv_rows, unsigned heads,
+                             std::vector<uint32_t> lengths, bool causal, bool bias, unsigned pad) {
+    Case c;
+    const unsigned hw = 256, width = heads * hw, stride = 2 * width + pad;
+    unsigned o = c.out((size_t)batch * q_rows * width);
+    unsigned q = c.f32((size_t)batch * q_rows * stride, 1.f), kv = c.f32((size_t)batch * kv_rows * stride, 1.f);
+    unsigned l = lengths.empty() ? PLOW_TENSOR_NONE : c.u32(lengths);
+    unsigned bs = bias ? c.f32((size_t)heads * q_rows * kv_rows, 1.f) : PLOW_TENSOR_NONE;
+    c.in.op = PLOW_DOP_ATTENTION_F32;
+    c.in.t[0] = o; c.in.t[1] = q; c.in.t[2] = kv; c.in.t[3] = kv; c.in.t[4] = l; c.in.t[5] = bs;
+    c.in.i[0] = batch; c.in.i[1] = q_rows; c.in.i[2] = kv_rows; c.in.i[3] = heads; c.in.i[4] = hw;
+    c.in.i[5] = stride; c.in.i[6] = causal; c.in.i[7] = q_rows * kv_rows;
+    c.in.fj[0].f = 1.0f / 16.0f;
+    c.in.fj[1].u = pad; c.in.fj[2].u = width + pad;
+    run(name, c, g_attention_f32, {o}, FP32, 2e-5);
+}
+
+/* TrimSilenceF32 against librosa 0.11 effects.trim(frame 2048, hop 512) indices, computed in
+ * Python over these exact signals (xorshift-free LCG noise times piecewise amplitudes). */
+struct TrimSeg { unsigned end; float amp; };
+struct TrimVec { unsigned seed, len_in; std::vector<TrimSeg> segs; unsigned s20, e20, s60, e60; };
+static std::vector<TrimVec> trim_vectors() {
+    std::vector<TrimSeg> f;
+    for (unsigned k = 0; k < 16; k++) f.push_back({1500u * (k + 1), ldexpf(1.f, -(int)k)});
+    f.push_back({~0u, 0.f});
+    return {
+        {1, 20000, {{5000, 0.f}, {14000, 0.5f}, {~0u, 0.001f}}, 4096, 15360, 4096, 20000},
+        {2, 7000, {{~0u, 0.f}}, 0, 7000, 0, 7000},
+        {3, 12345, {{~0u, 0.25f}}, 0, 12345, 0, 12345},
+        {4, 300, {{~0u, 0.5f}}, 0, 300, 0, 300},
+        {5, 30000, {{3000, 3e-3f}, {9000, 0.5f}, {~0u, 0.f}}, 2048, 10240, 0, 10240},
+        {6, 24000, f, 0, 6656, 0, 16384},
+        {7, 22000, {{2000, 0.f}, {4000, 0.3f}, {15000, 0.f}, {16000, 0.3f}, {~0u, 0.f}}, 1024, 17408, 1024, 17408},
+    };
+}
+static void trim_signal(const TrimVec& v, float* x, unsigned cap) {
+    uint32_t st = v.seed;
+    unsigned si = 0;
+    const unsigned len = v.len_in < cap ? v.len_in : cap;
+    for (unsigned i = 0; i < cap; i++) {
+        st = st * 1664525u + 1013904223u;
+        const float u = (float)((int)(st >> 8) - 8388608) / 8388608.0f;
+        while (i >= v.segs[si].end) si++;
+        x[i] = i < len ? u * v.segs[si].amp : 0.f;
+    }
+}
+static void t_trim_silence() {
+    const std::vector<TrimVec> vs = trim_vectors();
+    const unsigned cap = 24000, items = (unsigned)vs.size();
+    for (float top_db : {20.f, 60.f, 0.f}) {
+        Case c;
+        unsigned o = c.out((size_t)items * cap), x = c.add((size_t)items * cap * 4), lo = c.out(items);
+        std::vector<uint32_t> li;
+        for (unsigned b = 0; b < items; b++) {
+            trim_signal(vs[b], (float*)c.host[x].data() + (size_t)b * cap, cap);
+            li.push_back(vs[b].len_in);
+        }
+        unsigned l = c.u32(li);
+        c.in.op = PLOW_DOP_TRIM_SILENCE_F32; c.in.t[0] = o; c.in.t[1] = x; c.in.t[2] = l; c.in.t[3] = lo;
+        c.in.i[0] = items; c.in.i[1] = cap; c.in.i[2] = 2048; c.in.i[3] = 512; c.in.fj[0].f = top_db;
+        char name[64];
+        snprintf(name, sizeof(name), "TrimSilenceF32 top_db %g", top_db);
+        run(name, c, g_trim_silence_f32, {o, lo}, INT);
+        /* The golden's result (host buffers) against librosa's [start, end). */
+        const float* xs = (const float*)c.host[x].data();
+        const float* os = (const float*)c.host[o].data();
+        const uint32_t* ls = (const uint32_t*)c.host[lo].data();
+        bool ok = true;
+        for (unsigned b = 0; b < items; b++) {
+            const unsigned s0 = top_db == 0.f ? 0 : top_db == 20.f ? vs[b].s20 : vs[b].s60;
+            const unsigned e0 = top_db == 0.f ? 0 : top_db == 20.f ? vs[b].e20 : vs[b].e60;
+            if (ls[b] != e0 - s0) ok = false;
+            for (unsigned i = 0; i < cap && ok; i++)
+                if (os[(size_t)b * cap + i] != (i < e0 - s0 ? xs[(size_t)b * cap + s0 + i] : 0.f)) ok = false;
+        }
+        printf("  %-34s librosa indices -> %s\n", name, ok ? "PASS" : "FAIL");
+        if (!ok) g_fail = 1;
     }
 }
 
@@ -1740,6 +1833,17 @@ int main(int argc, char** argv) {
     t_attention_stream("attn stream L127 n17 w128 tc", 3, 127, 17, 128, {0, 1, 300}, {}, true);
     t_attention_stream("attn stream L71 n80 w72", 2, 71, 80, 72, {0, 1000}, {151, 100}, false);
     t_attention_stream("attn stream L127 n1 w128", 5, 127, 1, 128, {0, 1, 126, 127, 128}, {}, false);
+    /* Voice-conditioning extensions (after the fixed-seed cases, so their data is unchanged). */
+    t_lstm_rows();
+    t_trim_silence();
+    t_attention_w256("AttentionF32 w256 4x256 q32 kv150 lengths", 3, 32, 150, 4, {150, 97, 1}, false, false, 0);
+    t_attention_w256("AttentionF32 w256 q70 kv150 unaligned", 2, 70, 150, 4, {}, false, false, 1);
+    t_attention_w256("AttentionF32 w256 causal bias", 2, 100, 100, 2, {100, 61}, true, true, 0);
+    t_conv("Conv2dF32 fcm 3x3 s(1,2) ffma", 2, 150, 80, 32, 32, 3, 1, 1, 1, 64 | 2 | (2u << 16));
+    t_conv("Conv2dF32 fcm 3x3 s(1,2) tc-3xtf32 NFCW", 1, 150, 80, 32, 32, 3, 1, 1, 1, 512 | 64 | (1 << 2) | (2u << 16));
+    t_conv("Conv2dF32 fcm 1x1 s(1,2) shortcut tc-3xtf32", 1, 150, 80, 32, 32, 1, 1, 0, 0, 512 | 64 | (2u << 16));
+    t_conv("Conv2dF32 3x3 s(2,1) tc-bf16 wide", 2, 64, 50, 48, 320, 3, 2, 1, 1, 256 | 64 | (2 << 2) | (1u << 16));
+    t_conv("Conv2dF32 depthwise s(1,3) f16 NCFW in", 2, 17, 31, 24, 24, 3, 1, 1, 1, 1 | (2 << 4) | (3u << 16));
 
     if (argc > 1 && !strcmp(argv[1], "--bench")) {
         bench_signal();

@@ -54,6 +54,7 @@ void plow_cpu_register_golden(plow_cpu_kernel_fn* tab) {
     tab[PLOW_DOP_STREAM_TAIL_F32] = g_stream_tail_f32;
     tab[PLOW_DOP_REDUCE_ROWS_F32] = g_reduce_rows_f32;
     tab[PLOW_DOP_LENGTH_AFFINE_U32] = g_length_affine_u32;
+    tab[PLOW_DOP_TRIM_SILENCE_F32] = g_trim_silence_f32;
     tab[PLOW_DOP_CONV1D_F32] = g_conv1d_f32;
     tab[PLOW_DOP_CONV_TRANSPOSE1D_F32] = g_conv_transpose1d_f32;
     tab[PLOW_DOP_UNARY_F32] = g_unary_f32;

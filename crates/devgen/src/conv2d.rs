@@ -39,6 +39,8 @@ pub struct Conv2dStage<'a> {
     pub bias: &'a str,
     pub kernel: u32,
     pub stride: u32,
+    /// Width-axis stride, at most 65535 (0 = `stride`; `stride` always strides frames).
+    pub width_stride: u32,
     pub pad_before: u32,
     pub pad_after: u32,
     pub input_channels: u32,
@@ -174,8 +176,14 @@ pub fn lower(
     let mut layout = spec.input_layout;
     let mut dependency = None;
     for (index, stage) in stages.iter().enumerate() {
+        let width_stride = if stage.width_stride == 0 {
+            stage.stride
+        } else {
+            stage.width_stride
+        };
         if stage.kernel == 0
             || stage.stride == 0
+            || stage.width_stride > 0xFFFF
             || stage.input_channels != channels
             || stage.output_channels == 0
             || (stage.kind == ConvKind::Depthwise && stage.input_channels != stage.output_channels)
@@ -192,7 +200,7 @@ pub fn lower(
         let output_width = output_extent(
             width,
             stage.kernel,
-            stage.stride,
+            width_stride,
             stage.pad_before,
             stage.pad_after,
         )?;
@@ -228,6 +236,7 @@ pub fn lower(
         let pointwise = stage.kind == ConvKind::Standard
             && stage.kernel == 1
             && stage.stride == 1
+            && width_stride == 1
             && stage.pad_before == 0
             && stage.pad_after == 0
             && layout == ConvLayout::ChannelsLast;
@@ -281,7 +290,8 @@ pub fn lower(
                 ]);
                 instruction.j[0] = flags(stage, layout)
                     | (u32::from(tensor_cores) << 8)
-                    | (u32::from(tf32x3) << 9);
+                    | (u32::from(tf32x3) << 9)
+                    | (stage.width_stride << 16);
                 instruction.j[1] = spec.batches;
             },
         ));
@@ -395,6 +405,7 @@ mod tests {
                 bias: "conv.bias",
                 kernel: 3,
                 stride: 2,
+                width_stride: 0,
                 pad_before: 1,
                 pad_after: 1,
                 input_channels: 1,
@@ -431,6 +442,7 @@ mod tests {
                 bias: "conv.bias",
                 kernel: 3,
                 stride: 2,
+                width_stride: 0,
                 pad_before: 2,
                 pad_after: 1,
                 input_channels: 1,
@@ -446,5 +458,41 @@ mod tests {
         assert_eq!((packets.output_frames, packets.output_width), (1501, 65));
         assert_eq!(packets.model.progs[0].insts[0].blocks, 3052);
         assert_eq!(packets.model.progs[0].insts[0].j[0], 2 << 2 | 1 << 1);
+    }
+
+    #[test]
+    fn width_stride_strides_width_only() {
+        let stage = |width_stride| Conv2dStage {
+            weight: "conv.weight",
+            bias: "conv.bias",
+            kernel: 3,
+            stride: 1,
+            width_stride,
+            pad_before: 1,
+            pad_after: 1,
+            input_channels: 32,
+            output_channels: 32,
+            kind: ConvKind::Standard,
+            activation: ConvActivation::Relu,
+            output_layout: ConvLayout::ChannelsLast,
+            weight_type: ConvWeight::F32,
+        };
+        let spec = Conv2dSpec {
+            batches: 1,
+            input_frames: 200,
+            input_width: 80,
+            input_channels: 32,
+            input_layout: ConvLayout::ChannelsLast,
+        };
+        let packets = lower(spec, &[stage(2)], 4).unwrap();
+        assert_eq!((packets.output_frames, packets.output_width), (200, 40));
+        let inst = &packets.model.progs[0].insts[0];
+        assert_eq!(inst.i[5], 1);
+        assert_eq!(inst.j[0] >> 16, 2);
+        assert_eq!(
+            packets.model.tensors[packets.output as usize].bytes,
+            200 * 40 * 32 * 4
+        );
+        assert!(lower(spec, &[stage(0x10000)], 4).is_err());
     }
 }

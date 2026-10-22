@@ -90,6 +90,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 bias: names.bias(),
                 kernel,
                 stride,
+                width_stride: 0,
                 pad_before: if kernel == 3 { 2 } else { 0 },
                 pad_after: if kernel == 3 { 1 } else { 0 },
                 input_channels,

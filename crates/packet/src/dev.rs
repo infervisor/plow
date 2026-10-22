@@ -2017,8 +2017,11 @@ pub enum DevOp {
     /// Gather one FP16 embedding row and convert it to FP32.
     /// `t0=out(f32) t1=table(f16) t2=token(u32)` · `i0=vocab i1=width`.
     EmbedF16F32 = 171,
-    /// One FP32 LSTM cell after the input and recurrent projections have been summed. Gates are
-    /// contiguous `[input,forget,cell,output]`. `t0=h_new t1=c_new t2=gates t3=c_prev` · `i0=width`.
+    /// FP32 LSTM cells after the input and recurrent projections have been summed, over `rows`
+    /// independent rows (0 = 1). Gates are row-dense `[rows][input,forget,cell,output][width]`,
+    /// `c_prev`/`c_new` row-dense `[rows][width]` (in place allowed); row `r`'s h is written at
+    /// `h_new + h_out_offset + r * h_out_stride` (stride 0 = `width`).
+    /// `t0=h_new t1=c_new t2=gates t3=c_prev` · `i0=width i1=rows i2=h_out_stride i3=h_out_offset`.
     LstmCellF32 = 172,
     /// Row-wise FP32 argmax. `t0=ids(u32) t1=x(f32)` · `i0=rows i1=width`.
     ArgmaxF32 = 173,
@@ -2031,8 +2034,9 @@ pub enum DevOp {
     /// bit 1 applies ReLU, bits 2..3 select output layout, bits 4..5 select input layout
     /// (`0=NHWC, 1=NFCW, 2=NCFW`), bit 6 selects FP32 weights, and bit 7 applies erf-GELU with
     /// BF16 rounding. Precision hints: bit 8 asserts the input and FP32 weights are
-    /// BF16-representable (BF16 tensor cores), bit 9 allows 3xTF32 tensor cores.
-    /// `j1=batch` defaults to one.
+    /// BF16-representable (BF16 tensor cores), bit 9 allows 3xTF32 tensor cores. Bits 16..31
+    /// are the width-axis stride (0 = `stride`, which then strides both axes; `stride` always
+    /// strides frames). `j1=batch` defaults to one.
     /// `t0=out t1=x t2=weight t3=bias(f32)` ·
     /// `i0=in_frames i1=in_width i2=in_channels i3=out_channels i4=kernel i5=stride
     /// i6=pad_before i7=pad_after j0=flags j1=batch`.
@@ -2231,8 +2235,8 @@ pub enum DevOp {
     /// r*kv_rows + j]`, softmax over keys `j < key_lengths[b]` (and `j <= r` with flag bit 0,
     /// and `j > r - window` with a causal `window = flags >> 16`, 0 = none); a row with no visible
     /// key is zero. Output is dense `[batch,q_rows,heads*head_width]`.
-    /// `head_width` is 64, or a multiple of 8 up to 128 (e.g. 72). Flag bit 1 allows 3xTF32 tensor
-    /// cores at 64 (FP32-accurate).
+    /// `head_width` is 64, a multiple of 8 up to 128 (e.g. 72), or 256 (no prefix, stream or
+    /// relative bias). Flag bit 1 allows 3xTF32 tensor cores at 64 (FP32-accurate).
     /// With `prefix` (a cached key prefix), item `b`'s keys are rows `[0, i7)` of block
     /// `prefix_index[b]` of `prefix` (`[blocks][i7][K | V]`, `2*heads*head_width` wide) followed
     /// by its `kv_rows` own rows (key lengths count both; `i7` is the prefix row count; no bias,
@@ -2475,6 +2479,15 @@ pub enum DevOp {
     /// `t0=out(u32[items]) t1=in(u32[items]) t2=min_with(u32[items])?` ·
     /// `i0=items i1=mul i2=add i3=div i4=lo i5=hi`.
     LengthAffineU32 = 224,
+    /// librosa `effects.trim(top_db, ref=max)` per item over `L = min(len_in[b], cap)` samples:
+    /// frame `f < 1 + (L + 2*(frame/2) - frame) / hop` has `mse[f]` = mean of `x^2` over samples
+    /// `f*hop - frame/2 + [0, frame)` (zero outside `[0, L)`, f64); `db = 10 log10(max(1e-10,
+    /// mse)) - 10 log10(max(1e-10, max_f mse))`. With `first`/`last` the extreme frames where
+    /// `db > -top_db`: `out[0..n) = x[first*hop .. min(L, (last+1)*hop))`, `len_out = n`, rest of
+    /// the row zero; no such frame gives `n = 0`. `out` must not alias `pcm`.
+    /// `t0=out(f32[items][cap]) t1=pcm(f32[items][cap]) t2=len_in(u32[items])
+    /// t3=len_out(u32[items])` · `i0=items i1=cap i2=frame i3=hop` · `f0=top_db`.
+    TrimSilenceF32 = 225,
 }
 
 /// [`DevOp::FlashPrefillFp8`]'s split count (`i7` low half).
@@ -2767,6 +2780,7 @@ impl DevOp {
         DevOp::StreamTailF32,
         DevOp::ReduceRowsF32,
         DevOp::LengthAffineU32,
+        DevOp::TrimSilenceF32,
     ];
 
     /// Recover the opcode from its wire discriminant, or `None` for a value no
@@ -3012,6 +3026,7 @@ impl DevOp {
             DevOp::StreamTailF32 => "PLOW_DOP_STREAM_TAIL_F32",
             DevOp::ReduceRowsF32 => "PLOW_DOP_REDUCE_ROWS_F32",
             DevOp::LengthAffineU32 => "PLOW_DOP_LENGTH_AFFINE_U32",
+            DevOp::TrimSilenceF32 => "PLOW_DOP_TRIM_SILENCE_F32",
         }
     }
 
@@ -3078,7 +3093,8 @@ impl DevOp {
     /// 222 -> 223 for `StreamTailF32 = 222` (stateful streaming codec windows).
     /// 223 -> 225 for `ReduceRowsF32 = 223`, `LengthAffineU32 = 224` (voice-conditioning
     /// front-ends).
-    pub const COUNT: u16 = 225;
+    /// 225 -> 226 for `TrimSilenceF32 = 225` (reference-audio silence trim).
+    pub const COUNT: u16 = 226;
 
     /// The `(M, N, K, quant)` a decode-GEMV opcode carries, or `None` if this is not one.
     ///

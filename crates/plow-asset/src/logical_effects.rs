@@ -64,6 +64,7 @@ pub(crate) fn outputs(d: &DevInst64) -> Result<&'static [usize], String> {
         | RopeAxialF32 => 2,
         ChunkAttentionF32 => 5,
         LstmCellF32 => 3,
+        TrimSilenceF32 => 4,
         _ => return Err(format!("unaudited logical effects for {op:?}")),
     };
     if d.t[..required].contains(&TENSOR_NONE16) {
@@ -82,6 +83,7 @@ pub(crate) fn outputs(d: &DevInst64) -> Result<&'static [usize], String> {
         // The split-K workspace (tickets + partials) is written by every DenseGemmF32 sharing it.
         DenseGemmF32 if d.t[4] != TENSOR_NONE16 => Ok(&[0, 4]),
         LstmCellF32 => Ok(&[0, 1]),
+        TrimSilenceF32 => Ok(&[0, 3]),
         Q8GemmF32
         | LayerNormF32
         | ScaledAddF32

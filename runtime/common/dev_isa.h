@@ -1534,6 +1534,8 @@ enum {
     PLOW_DOP_REDUCE_ROWS_F32 = 223,
     /* out = min(clamp(floor((in*mul + add)/div), lo, hi), min_with) in i64; see DevOp::LengthAffineU32. */
     PLOW_DOP_LENGTH_AFFINE_U32 = 224,
+    /* librosa trim(top_db, ref=max) of a 1-D signal per item; see DevOp::TrimSilenceF32. */
+    PLOW_DOP_TRIM_SILENCE_F32 = 225,
 
     PLOW_DOP__COUNT
 };

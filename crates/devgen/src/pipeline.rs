@@ -466,6 +466,18 @@ pub struct LengthAffineU32Stage<'a> {
     pub hi: u32,
 }
 
+/// [`DevOp::TrimSilenceF32`]: `output` `[items][cap]` f32, `len_out` `[items]` u32.
+#[derive(Clone, Copy)]
+pub struct TrimSilenceF32Stage<'a> {
+    pub output: TensorRef<'a>,
+    pub len_out: TensorRef<'a>,
+    pub items: u32,
+    pub cap: u32,
+    pub frame: u32,
+    pub hop: u32,
+    pub top_db: f32,
+}
+
 #[derive(Clone, Copy)]
 pub struct StreamTailF32Stage<'a> {
     pub mode: StreamTailF32Mode<'a>,
@@ -1661,6 +1673,46 @@ impl StageProgram {
         })
     }
 
+    /// [`DevOp::TrimSilenceF32`] over `pcm` (`[items][cap]` f32) and `len_in` (`[items]` u32).
+    /// Returns the trimmed signal and the `len_out` handle.
+    pub fn trim_silence_f32(
+        &mut self,
+        pcm: u32,
+        len_in: u32,
+        deps: &[u32],
+        stage: TrimSilenceF32Stage<'_>,
+    ) -> Result<(Emitted, u32), String> {
+        if stage.items == 0
+            || stage.cap == 0
+            || stage.frame == 0
+            || stage.hop == 0
+            || !stage.top_db.is_finite()
+        {
+            return Err("invalid silence-trim stage".into());
+        }
+        let bytes = f32_bytes(product(&[stage.items, stage.cap])?)?;
+        self.input(pcm, bytes, "silence-trim input")?;
+        let lengths = u64::from(stage.items) * 4;
+        self.input(len_in, lengths, "silence-trim lengths")?;
+        let output = self.resolve(stage.output, bytes, "silence-trim output")?;
+        let len_out = self.resolve(stage.len_out, lengths, "silence-trim output lengths")?;
+        if output == pcm || len_out == len_in {
+            return Err("silence trim: outputs must not alias the inputs".into());
+        }
+        let e = self.emit(
+            DevOp::TrimSilenceF32,
+            u64::from(stage.items),
+            deps,
+            output,
+            |d| {
+                d.t[..4].copy_from_slice(&[output, pcm, len_in, len_out]);
+                d.i[..4].copy_from_slice(&[stage.items, stage.cap, stage.frame, stage.hop]);
+                d.f[0] = stage.top_db;
+            },
+        )?;
+        Ok((e, len_out))
+    }
+
     /// [`DevOp::Conv1dF32`], or [`DevOp::ConvTranspose1dF32`] with `transpose`.
     pub fn conv1d_f32(
         &mut self,
@@ -2024,9 +2076,16 @@ impl StageProgram {
             || stage.q_rows == 0
             || stage.kv_rows == 0
             || stage.heads == 0
-            || !(stage.head_width == 64 || (stage.head_width % 8 == 0 && stage.head_width <= 128))
+            || !(stage.head_width == 64
+                || stage.head_width == 256
+                || (stage.head_width % 8 == 0 && stage.head_width <= 128))
         {
             return Err("invalid attention geometry".into());
+        }
+        if stage.head_width == 256
+            && (stage.prefix.is_some() || stage.stream.is_some() || stage.relative)
+        {
+            return Err("attention head_width 256: no prefix, stream or relative bias".into());
         }
         let width = stage
             .heads
@@ -2165,6 +2224,10 @@ impl StageProgram {
                 product(&[stage.batch, tiles.div_ceil(8)])?
             }
             (true, false) => product(&[stage.batch, stage.heads])?,
+            // head_width 256 runs 32-query tiles.
+            (false, _) if stage.head_width == 256 => {
+                product(&[stage.batch, stage.heads, stage.q_rows.div_ceil(32)])?
+            }
             (false, _) => product(&[stage.batch, stage.heads, stage.q_rows.div_ceil(64)])?,
         };
         self.emit(DevOp::AttentionF32, units, deps, output, |d| {
@@ -3168,6 +3231,41 @@ mod tests {
     }
 
     #[test]
+    fn trim_silence_emit_and_validate() {
+        let (items, cap) = (2u32, 1000u32);
+        let (prefix, h) = prefix_with(&[("pcm", u64::from(items * cap) * 4), ("len", 8)]);
+        let mut p = prefix.program();
+        let stage = |frame, top_db| TrimSilenceF32Stage {
+            output: TensorRef::Named("trim"),
+            len_out: TensorRef::Named("trim.len"),
+            items,
+            cap,
+            frame,
+            hop: 512,
+            top_db,
+        };
+        assert!(p.trim_silence_f32(h[0], h[1], &[], stage(0, 20.0)).is_err());
+        assert!(p
+            .trim_silence_f32(h[0], h[1], &[], stage(2048, f32::NAN))
+            .is_err());
+        let mut alias = stage(2048, 20.0);
+        alias.output = TensorRef::Handle(h[0]);
+        assert!(p.trim_silence_f32(h[0], h[1], &[], alias).is_err());
+        let (e, len_out) = p
+            .trim_silence_f32(h[0], h[1], &[], stage(2048, 20.0))
+            .unwrap();
+        let prefix = p.finish(0);
+        let tensors = &prefix.model.tensors;
+        let inst = &prefix.model.progs[0].insts[0];
+        assert_eq!(tensors[e.output as usize].bytes, u64::from(items * cap) * 4);
+        assert_eq!(tensors[len_out as usize].bytes, u64::from(items) * 4);
+        assert_eq!(DevOp::from_u16(inst.op), Some(DevOp::TrimSilenceF32));
+        assert_eq!(inst.t[..4], [e.output, h[0], h[1], len_out]);
+        assert_eq!(inst.i[..4], [items, cap, 2048, 512]);
+        assert_eq!(inst.f[0], 20.0);
+    }
+
+    #[test]
     fn stream_tail_gather_store_and_validation() {
         let (b, slots, tail, rows, cols, z_cols, z_col0) =
             (3u32, 4u32, 6u32, 10u32, 32u32, 48u32, 8u32);
@@ -3298,6 +3396,64 @@ mod tests {
         assert_eq!(d.i[6] & 0xF, 1 | 8, "causal + stream, no tensor-core bit");
         assert_eq!(d.i[6] >> 16, 128);
         assert_eq!(d.i[7], hist);
+    }
+
+    #[test]
+    fn attention_head_width_256_general_path_only() {
+        let (b, q, kv, heads) = (2u32, 32u32, 150u32, 4u32);
+        let width = heads * 256;
+        let (prefix, h) = prefix_with(&[
+            ("q", u64::from(b * q * 2 * width) * 4),
+            ("kv", u64::from(b * kv * 2 * width) * 4),
+            ("len", 8),
+            ("pos", 8),
+        ]);
+        let stage = |q_rows, kv_rows, in_stride, v_col0| AttentionF32Stage {
+            output: TensorRef::Named("ctx"),
+            key_lengths: Some(h[2]),
+            bias: None,
+            batch: b,
+            q_rows,
+            kv_rows,
+            heads,
+            head_width: 256,
+            in_stride,
+            k_col0: 0,
+            v_col0,
+            causal: false,
+            scale: 0.0625,
+            bias_head_stride: 0,
+            relative: false,
+            key_length_heads: 0,
+            prefix: None,
+            window: 0,
+            stream: None,
+        };
+        let mut p = prefix.program();
+        let mut bad = stage(q, kv, 2 * width, width);
+        bad.stream = Some(AttentionStream {
+            pos: h[3],
+            history: 1,
+        });
+        bad.causal = true;
+        bad.kv_rows = q + 1;
+        assert!(p.attention_f32(h[1], h[1], h[1], &[], bad).is_err());
+        let mut bad = stage(q, kv, 2 * width, width);
+        bad.head_width = 192;
+        assert!(p.attention_f32(h[1], h[1], h[1], &[], bad).is_err());
+        let e = p
+            .attention_f32(h[0], h[1], h[1], &[], stage(q, kv, 2 * width, width))
+            .unwrap();
+        let prefix = p.finish(0);
+        let d = &prefix.model.progs[0].insts[0];
+        assert_eq!(
+            prefix.model.tensors[e.output as usize].bytes,
+            u64::from(b * q * width) * 4
+        );
+        assert_eq!(d.i[..6], [b, q, kv, heads, 256, 2 * width]);
+        assert_eq!(d.i[6], 0, "no tensor-core bit");
+        assert_eq!(d.j, [0, width]);
+        assert_eq!(d.blocks, 4);
     }
 
     #[test]

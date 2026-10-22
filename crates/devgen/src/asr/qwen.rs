@@ -442,6 +442,7 @@ fn lower(
             bias,
             kernel: 3,
             stride: 2,
+            width_stride: 0,
             pad_before: 1,
             pad_after: 1,
             input_channels: if index == 0 { 1 } else { 480 },

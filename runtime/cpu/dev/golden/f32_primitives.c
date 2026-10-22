@@ -236,10 +236,11 @@ G_K(g_conv2d_f32) {
     const uint32_t kernel = in->i[4], stride = in->i[5];
     const uint32_t pad_before = in->i[6], pad_after = in->i[7], flags = in->fj[1].u;
     const uint32_t batches = in->fj[2].u ? in->fj[2].u : 1u;
+    const uint32_t width_stride = flags >> 16 ? flags >> 16 : stride;
     if (!kernel || !stride || frames + pad_before + pad_after < kernel ||
         width + pad_before + pad_after < kernel) return;
     const uint32_t output_frames = (frames + pad_before + pad_after - kernel) / stride + 1u;
-    const uint32_t output_width = (width + pad_before + pad_after - kernel) / stride + 1u;
+    const uint32_t output_width = (width + pad_before + pad_after - kernel) / width_stride + 1u;
     const uint32_t depthwise = flags & 1u, relu = flags & 2u;
     const uint32_t output_layout = (flags >> 2u) & 3u, input_layout = (flags >> 4u) & 3u;
     const uint32_t weight_f32 = flags & 64u, gelu_erf_bf16 = flags & 128u;
@@ -262,7 +263,7 @@ G_K(g_conv2d_f32) {
             const int64_t input_frame = (int64_t)output_frame * stride + ky - pad_before;
             if (input_frame < 0 || input_frame >= frames) continue;
             for (uint32_t kx = 0; kx < kernel; kx++) {
-                const int64_t input_x = (int64_t)output_x * stride + kx - pad_before;
+                const int64_t input_x = (int64_t)output_x * width_stride + kx - pad_before;
                 if (input_x < 0 || input_x >= width) continue;
                 for (uint32_t input_channel = channel_start; input_channel < channel_end;
                      input_channel++) {
@@ -603,16 +604,21 @@ G_K(g_lstm_cell_f32) {
     float* c_new = PLOW_CPU_TEN(in, T, 1);
     const float* gates = PLOW_CPU_TEN(in, T, 2);
     const float* c_prev = PLOW_CPU_TEN(in, T, 3);
-    const uint32_t width = in->i[0];
+    const uint32_t width = in->i[0], rows = in->i[1] ? in->i[1] : 1u;
+    const uint32_t h_stride = in->i[2] ? in->i[2] : width, h_offset = in->i[3];
+    if ((uint64_t)rows * width > UINT32_MAX) return;
     uint32_t lo, hi;
-    g_range(width, slice, nblk, &lo, &hi);
-    for (uint32_t i = lo; i < hi; i++) {
-        const float input = g_sigmoid(gates[i]);
-        const float forget = g_sigmoid(gates[width + i]);
-        const float cell = tanhf(gates[2u * width + i]);
-        const float output = g_sigmoid(gates[3u * width + i]);
-        c_new[i] = forget * c_prev[i] + input * cell;
-        h_new[i] = output * tanhf(c_new[i]);
+    g_range(rows * width, slice, nblk, &lo, &hi);
+    for (uint32_t e = lo; e < hi; e++) {
+        const uint32_t r = e / width, i = e % width;
+        const float* g = gates + (size_t)r * 4u * width;
+        const float input = g_sigmoid(g[i]);
+        const float forget = g_sigmoid(g[width + i]);
+        const float cell = tanhf(g[2u * width + i]);
+        const float output = g_sigmoid(g[3u * width + i]);
+        const float c = forget * c_prev[e] + input * cell;
+        c_new[e] = c;
+        h_new[h_offset + (size_t)r * h_stride + i] = output * tanhf(c);
     }
 }
 
@@ -959,6 +965,61 @@ G_K(g_length_affine_u32) {
         int64_t q = v / div - (v % div < 0);
         q = q < lo ? lo : q > hi ? hi : q;
         out[b] = min_with && min_with[b] < (uint64_t)q ? min_with[b] : (uint32_t)q;
+    }
+}
+
+/* TrimSilenceF32 (225), one item per slice step: librosa rms (center, zero pad) power in f64, dB
+ * against the maximum frame, first/last frame above -top_db. */
+static double g_trim_mse(const float* x, uint32_t len, uint32_t frame, uint32_t hop, uint32_t f) {
+    const int64_t s0 = (int64_t)f * hop - frame / 2u;
+    double sum = 0.0;
+    for (uint32_t j = 0; j < frame; j++) {
+        const int64_t s = s0 + j;
+        if (s >= 0 && s < len) sum += (double)x[s] * x[s];
+    }
+    return sum / frame;
+}
+
+G_K(g_trim_silence_f32) {
+    (void)ctx;
+    float* out = PLOW_CPU_TEN(in, T, 0);
+    const float* pcm = PLOW_CPU_TEN(in, T, 1);
+    const uint32_t* len_in = PLOW_CPU_TEN(in, T, 2);
+    uint32_t* len_out = PLOW_CPU_TEN(in, T, 3);
+    const uint32_t cap = in->i[1], frame = in->i[2], hop = in->i[3];
+    const double top_db = in->fj[0].f;
+    if (!frame || !hop) return;
+    uint32_t lo, hi;
+    g_range(in->i[0], slice, nblk, &lo, &hi);
+    for (uint32_t b = lo; b < hi; b++) {
+        const float* x = pcm + (size_t)b * cap;
+        const uint32_t len = len_in[b] < cap ? len_in[b] : cap;
+        const uint64_t padded = (uint64_t)len + 2u * (frame / 2u);
+        const uint32_t frames = padded < frame ? 0u : (uint32_t)((padded - frame) / hop + 1u);
+        double ref = 0.0;
+        for (uint32_t f = 0; f < frames; f++) {
+            const double m = g_trim_mse(x, len, frame, hop, f);
+            if (m > ref) ref = m;
+        }
+        /* In bels (dB / 10), so no product can contract into the difference. */
+        const double ref_b = log10(ref > 1e-10 ? ref : 1e-10), floor_b = -top_db / 10.0;
+        int64_t first = -1, last = -1;
+        for (uint32_t f = 0; f < frames; f++) {
+            const double m = g_trim_mse(x, len, frame, hop, f);
+            if (log10(m > 1e-10 ? m : 1e-10) - ref_b > floor_b) {
+                if (first < 0) first = f;
+                last = f;
+            }
+        }
+        uint32_t start = 0, n = 0;
+        if (first >= 0) {
+            const uint64_t end = (uint64_t)(last + 1) * hop;
+            start = (uint32_t)((uint64_t)first * hop);
+            n = (uint32_t)((end < len ? end : len) - start);
+        }
+        float* o = out + (size_t)b * cap;
+        for (uint32_t i = 0; i < cap; i++) o[i] = i < n ? x[start + i] : 0.0f;
+        len_out[b] = n;
     }
 }
 
