@@ -7361,6 +7361,7 @@ fn emit_phase(
     }
 
     if let Some(ds) = n.dspark.as_ref() {
+        let ds_lt = w8a8 && (!gemv_family || fp8_lt_decode);
         emit_dspark_tail(
             b,
             c,
@@ -7370,7 +7371,7 @@ fn emit_phase(
             ds_writers.expect("DSpark context: no full-layer K/V writer in this program"),
             &elem,
             &|b: &mut Builder, j: usize, src: u32, after: u32| {
-                if w8a8 && (!gemv_family || fp8_lt_decode) {
+                if ds_lt {
                     quant(b, ds.xq[j], ds.xs[j], src, c.hidden, after)
                 } else {
                     after
@@ -7396,6 +7397,7 @@ fn emit_phase(
                 )
             },
             rows.clone(),
+            ds_lt,
         );
     }
     // In the fused path the last layer's end-of-layer fused norm already applied the FINAL norm
@@ -7589,10 +7591,12 @@ const AMAX_BLOCKS: u32 = 64;
 /// The DSpark context tail (dspark.rs): `s = sum_j fc_j(tap_j)`, `xn = hidden_norm(s)`, then per
 /// drafter layer `k = k_proj(xn)` stored through clones of the program's own last full-layer K/V
 /// writers (`rope(k_norm(k))` and the weightless `v_norm(k)`), so every row lands at its own
-/// position and slot exactly as the target's does. Each phase quantizes all its inputs first and
-/// then runs its projections back to back on per-tap buffers: on the cuBLASLt rungs (decode 128,
-/// prefill) that is one library run per phase instead of one per projection. The sum keeps the
-/// tap order. `after` is the last tap copy, which every earlier copy precedes.
+/// position and slot exactly as the target's does. `phased` (the cuBLASLt rungs: decode 128,
+/// prefill) quantizes all of a phase's inputs first and runs its projections back to back on
+/// per-tap buffers, one library run per phase instead of one per projection; the GEMV rungs keep
+/// one serial project-then-add chain, measured faster there (ctx 1K B4 +0.68% vs +1.19% step
+/// time, B32 +0.81% vs +1.59%). Either way the sum keeps the tap order, so the drafter KV bytes
+/// match. `after` is the last tap copy, which every earlier copy precedes.
 #[allow(clippy::too_many_arguments)]
 fn emit_dspark_tail(
     b: &mut Builder,
@@ -7605,28 +7609,37 @@ fn emit_dspark_tail(
     quant: &dyn Fn(&mut Builder, usize, u32, u32) -> u32,
     proj: &dyn Fn(&mut Builder, usize, u32, u32, dspark::Proj, u32) -> u32,
     rows: Vec<u32>,
+    phased: bool,
 ) {
-    let dq: Vec<u32> = (0..ds.fc.len())
-        .map(|j| quant(b, j, ds.tap[j], after))
-        .collect();
-    let g: Vec<u32> = ds
-        .fc
-        .iter()
-        .enumerate()
-        .map(|(j, &f)| proj(b, j, ds.y[j], ds.tap[j], f, dq[j]))
-        .collect();
-    let mut sum = g[0];
-    for j in 1..g.len() {
+    let n = ds.fc.len();
+    let add = |b: &mut Builder, j: usize, sum: u32, g: u32| {
         let a = if j == 1 { ds.y[0] } else { ds.s };
-        sum = b.emit(DevOp::Residual, elem(t * c.hidden), &[sum, g[j]], |d| {
+        b.emit(DevOp::Residual, elem(t * c.hidden), &[sum, g], |d| {
             d.t[0] = ds.s;
             d.t[1] = a;
             d.t[2] = ds.y[j];
             d.i[0] = t * c.hidden;
             d.f[0] = 1.0;
-        });
+        })
+    };
+    let mut sum = after;
+    if phased {
+        let dq: Vec<u32> = (0..n).map(|j| quant(b, j, ds.tap[j], after)).collect();
+        let g: Vec<u32> = (0..n)
+            .map(|j| proj(b, j, ds.y[j], ds.tap[j], ds.fc[j], dq[j]))
+            .collect();
+        sum = g[0];
+        for j in 1..n {
+            sum = add(b, j, sum, g[j]);
+        }
+    } else {
+        for j in 0..n {
+            let dq = quant(b, j, ds.tap[j], sum);
+            let g = proj(b, j, ds.y[j], ds.tap[j], ds.fc[j], dq);
+            sum = if j == 0 { g } else { add(b, j, sum, g) };
+        }
     }
-    let s = if g.len() == 1 { ds.y[0] } else { ds.s };
+    let s = if n == 1 { ds.y[0] } else { ds.s };
     let cn = b.emit(DevOp::RmsNorm, rows, &[sum], |d| {
         d.t[0] = ds.xn;
         d.t[1] = s;
@@ -7646,13 +7659,7 @@ fn emit_dspark_tail(
             f(d);
         });
     };
-    let ck: Vec<u32> = ds
-        .k_proj
-        .iter()
-        .enumerate()
-        .map(|(i, &kp)| proj(b, 0, ds.k[i], ds.xn, kp, dq))
-        .collect();
-    for (i, &ck) in ck.iter().enumerate() {
+    let write = |b: &mut Builder, i: usize, ck: u32| {
         let [kc, vc, ks, vs] = ds.kv[i];
         clone(b, &kw, ck, &|d| {
             d.t[0] = kc;
@@ -7665,6 +7672,18 @@ fn emit_dspark_tail(
             d.t[1] = ds.k[i];
             d.t[6] = vs;
         });
+    };
+    let mut ck = Vec::with_capacity(ds.k_proj.len());
+    for (i, &kp) in ds.k_proj.iter().enumerate() {
+        ck.push(proj(b, 0, ds.k[i], ds.xn, kp, dq));
+        if !phased {
+            write(b, i, ck[i]);
+        }
+    }
+    if phased {
+        for (i, &ck) in ck.iter().enumerate() {
+            write(b, i, ck);
+        }
     }
 }
 
