@@ -1,6 +1,6 @@
 //! `media_geometry.v1`: the production families (values from the 4de53bf6 H100 bundles; the
 //! stateful codec LM from the Fish S2 Pro stream-step bundle, the cloning ones from Breeze TTS 2 (end
-//! frame) and Fish S2 Pro (none)) are
+//! frame) and Fish S2 Pro (none), the cloning guided LM from Chatterbox) are
 //! accepted; each single-field mutation that breaks a contract is rejected.
 
 use serde_json::{json, Value};
@@ -50,7 +50,11 @@ fn families() -> Vec<Value> {
             "clone_frame_samples": 1920, "clone_frame_codes": 16, "clone_codebook": 2048, "clone_eos_code": [0]}),
         json!({"kind": "guided_lm", "speech_vocab": 8194, "start_speech": 6561, "stop_speech": 6562,
             "valid_below": 6561, "text_vocab": 704, "start_text": 255, "stop_text": 0,
-            "max_speech_tokens": 1000, "speech_positions": 4100, "overlay_rows": 512, "max_context": 2048}),
+            "max_speech_tokens": 1000, "speech_positions": 4100, "overlay_rows": 512, "max_context": 2048,
+            "lm_hidden": 0, "clone_seconds": [], "clone_sample_rate": 0, "clone_pcm_capacity": 0,
+            "clone_rows": 0, "clone_rows_elements": 0, "clone_prompt_tokens": 0, "clone_prompt_mel": 0,
+            "clone_spks": 0, "vocoder_prompt_max": 0, "vocoder_slots": 0, "vocoder_slot_tokens": 0,
+            "vocoder_slot_mel": 0, "vocoder_slot_spks": 0, "vocoder_slot_lens": 0}),
         json!({"kind": "vad", "frame_samples": 512, "context_samples": 64, "input_elements": 576,
             "state_banks": 2, "state_sizes": [128, 128, 128, 128], "min_speech_ms": 250,
             "max_duration_ms": 600000}),
@@ -67,6 +71,14 @@ fn families() -> Vec<Value> {
             "new_rows_capacities": [32, 32, 32, 32, 32, 32, 32], "clone_frames": [128, 256, 32, 512, 64],
             "clone_pcm_capacity": 1048576, "clone_codes_capacity": 5120, "clone_sample_rate": 44100,
             "clone_frame_samples": 2048, "clone_frame_codes": 10, "clone_codebook": 4096, "clone_eos_code": []}),
+        json!({"kind": "guided_lm", "speech_vocab": 8194, "start_speech": 6561, "stop_speech": 6562,
+            "valid_below": 6561, "text_vocab": 704, "start_text": 255, "stop_text": 0,
+            "max_speech_tokens": 1000, "speech_positions": 4100, "overlay_rows": 512, "max_context": 2048,
+            "lm_hidden": 1024, "clone_seconds": [10, 20, 5], "clone_sample_rate": 24000,
+            "clone_pcm_capacity": 480000, "clone_rows": 34, "clone_rows_elements": 34816,
+            "clone_prompt_tokens": 251, "clone_prompt_mel": 40000, "clone_spks": 80,
+            "vocoder_prompt_max": 250, "vocoder_slots": 8, "vocoder_slot_tokens": 2000,
+            "vocoder_slot_mel": 320000, "vocoder_slot_spks": 640, "vocoder_slot_lens": 8}),
     ]
 }
 
@@ -129,6 +141,20 @@ fn production_media_contracts_hold_and_each_mutation_rejects() {
         (4, "clone_codes_capacity", json!(4095)),
         (4, "clone_sample_rate", json!(44100)),
         (4, "clone_frames", json!([0])),
+        (9, "clone_rows_elements", json!(34815)),
+        (9, "lm_hidden", json!(1536)),
+        (9, "clone_rows", json!(0)),
+        (9, "vocoder_prompt_max", json!(249)),
+        (9, "clone_prompt_mel", json!(0)),
+        (9, "clone_spks", json!(192)),
+        (9, "vocoder_slots", json!(0)),
+        (9, "vocoder_slot_tokens", json!(1999)),
+        (9, "vocoder_slot_mel", json!(319999)),
+        (9, "vocoder_slot_spks", json!(639)),
+        (9, "vocoder_slot_lens", json!(7)),
+        (9, "clone_pcm_capacity", json!(479999)),
+        (9, "clone_seconds", json!([0, 5])),
+        (5, "lm_hidden", json!(null)),
         (0, "unknown", json!(1)),
     ];
     for (family, field, value) in &mutations {

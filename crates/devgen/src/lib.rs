@@ -10870,6 +10870,9 @@ fn emit_dense_gqa(
                 emitter.tn.pos_base,
                 &c.speech_params,
                 &dir,
+                ecfg.tts_vocoder
+                    .as_deref()
+                    .is_some_and(|v| v.join("voice").join("config.json").is_file()),
             )
             .unwrap_or_else(|error| panic!("T3 speech packet pipeline: {error}")),
         );

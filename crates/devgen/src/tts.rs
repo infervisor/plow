@@ -217,6 +217,7 @@ pub fn t3_pipeline_section(
     pos_base: u32,
     params: &[(String, u64)],
     dir: &std::path::Path,
+    voice_cond: bool,
 ) -> Result<SectionData, String> {
     use plow_asset::packet_pipeline::{PipelineDType, PipelineTensor};
     let causal = causal_pipeline_section(model, spec)?;
@@ -251,6 +252,10 @@ pub fn t3_pipeline_section(
     // the unconditional CFG member keeps positions but drops the text table.
     pipe.strings
         .insert("vocoder.packet".into(), crate::s3gen::PACKET.into());
+    if voice_cond {
+        pipe.strings
+            .insert("voice_cond.packet".into(), crate::voice_cond::PACKET.into());
+    }
     pipe.parameters.insert("prompt.bos_repeat".into(), 2);
     pipe.parameters.insert("cfg.uncond_drops_text".into(), 1);
     match t3_text_frontend(dir)? {

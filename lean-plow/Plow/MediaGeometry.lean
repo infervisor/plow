@@ -3,8 +3,8 @@
 
 Integer geometry of the speech and multimodal packet contracts, read from the packets' pipeline
 sections and tensor shapes: audio-LM overlay capacity and context fit, RNNT frame transforms and
-symbol bound, codec-LM token/code/PCM addressing, guided-LM token domains, VAD frame/state
-layout, and multimodal soft-token ids. `check_sound` is the acceptance theorem; the lemmas after
+symbol bound, codec-LM token/code/PCM addressing, guided-LM token domains and voice-clone slots,
+VAD frame/state layout, and multimodal soft-token ids. `check_sound` is the acceptance theorem; the lemmas after
 each contract are what an accepted contract buys for every input up to the declared maxima.
 
 All arithmetic is over `Nat`. Wire values are u32 token ids and u64 parameters; the Rust side
@@ -321,15 +321,75 @@ structure GuidedLm where
   speechPositions : Nat
   overlayRows : Nat
   maxContext : Nat
+  /-- Voice cloning's encoder (`voice.encode.v1`): its `encode.c{S}` capacities in seconds ([] = no
+  cloning), PCM input, LM conditioning rows (`t3.rows` rows of `lmHidden`), and the vocoder prompt
+  it emits: `P = min(gen.tokens, gen.prompt_mel / 160)` tokens, `2P` mel rows of 80, an 80-wide
+  speaker vector. The vocoder holds `vocoderSlots` voices of up to `vocoderPromptMax` tokens. -/
+  lmHidden : Nat
+  cloneSeconds : List Nat
+  cloneSampleRate : Nat
+  clonePcmCapacity : Nat
+  cloneRows : Nat
+  cloneRowsElements : Nat
+  clonePromptTokens : Nat
+  clonePromptMel : Nat
+  cloneSpks : Nat
+  vocoderPromptMax : Nat
+  vocoderSlots : Nat
+  vocoderSlotTokens : Nat
+  vocoderSlotMel : Nat
+  vocoderSlotSpks : Nat
+  vocoderSlotLens : Nat
   deriving Repr
+
+/-- Longest vocoder prompt the voice encoder can emit. -/
+def GuidedLm.promptCap (g : GuidedLm) : Nat := min g.clonePromptTokens (g.clonePromptMel / 160)
 
 def GuidedLm.Contract (g : GuidedLm) : Prop :=
   g.startSpeech < g.speechVocab ∧ g.stopSpeech < g.speechVocab ∧
   g.validBelow ≤ g.startSpeech ∧ g.validBelow ≤ g.stopSpeech ∧
   g.startText < g.textVocab ∧ g.stopText < g.textVocab ∧
-  g.maxSpeechTokens + 2 ≤ g.speechPositions ∧ g.overlayRows ≤ g.maxContext ∧ g.maxContext < 2 ^ 32
+  g.maxSpeechTokens + 2 ≤ g.speechPositions ∧ g.overlayRows ≤ g.maxContext ∧ g.maxContext < 2 ^ 32 ∧
+  (g.cloneSeconds = [] ∨
+    (0 < g.cloneRows ∧ g.cloneRowsElements = g.cloneRows * g.lmHidden ∧
+     0 < g.promptCap ∧ g.promptCap ≤ g.vocoderPromptMax ∧ g.cloneSpks = 80 ∧
+     0 < g.vocoderSlots ∧ g.vocoderSlots * g.vocoderPromptMax ≤ g.vocoderSlotTokens ∧
+     g.vocoderSlots * (2 * g.vocoderPromptMax * 80) ≤ g.vocoderSlotMel ∧
+     g.vocoderSlots * 80 ≤ g.vocoderSlotSpks ∧ g.vocoderSlots ≤ g.vocoderSlotLens ∧
+     ∀ s ∈ g.cloneSeconds, 0 < s ∧ s * g.cloneSampleRate ≤ g.clonePcmCapacity))
 
 instance (g : GuidedLm) : Decidable g.Contract := by unfold GuidedLm.Contract; exact inferInstance
+
+theorem slot_row_lt {k n w j : Nat} (hk : k < n) (hj : j < w) : k * w + j < n * w := by
+  have : (k + 1) * w ≤ n * w := Nat.mul_le_mul_right _ hk
+  rw [Nat.add_mul] at this
+  omega
+
+/-- A clip of `s` seconds (a clone capacity) reads its samples inside the encoder's PCM input; an
+    emitted prompt of `p` tokens reads its tokens and `2p` mel rows inside the encoder's outputs and
+    fits a vocoder slot; slot `k`'s prompt token `i`, mel value `j`, speaker value `c` and length
+    land inside the vocoder's slot tables. -/
+theorem GuidedLm.clone_addresses_in_bounds (g : GuidedLm) (h : g.Contract) {s t p k i j c : Nat}
+    (hc : g.cloneSeconds ≠ []) (hs : s ∈ g.cloneSeconds) (ht : t < s * g.cloneSampleRate)
+    (hp : p ≤ g.promptCap) (hk : k < g.vocoderSlots) (hi : i < g.vocoderPromptMax)
+    (hj : j < 2 * g.vocoderPromptMax * 80) (hcs : c < 80) :
+    t < g.clonePcmCapacity ∧ p ≤ g.clonePromptTokens ∧ 2 * p * 80 ≤ g.clonePromptMel ∧
+    p ≤ g.vocoderPromptMax ∧ g.cloneSpks = 80 ∧
+    k * g.vocoderPromptMax + i < g.vocoderSlotTokens ∧
+    k * (2 * g.vocoderPromptMax * 80) + j < g.vocoderSlotMel ∧
+    k * 80 + c < g.vocoderSlotSpks ∧ k < g.vocoderSlotLens := by
+  obtain ⟨_, _, _, _, _, _, _, _, _, hclone⟩ := h
+  rcases hclone with hnil | ⟨_, _, _, hpm, hspk, _, htok, hmel, hspks, hlens, hcaps⟩
+  · exact absurd hnil hc
+  obtain ⟨_, hpcm⟩ := hcaps s hs
+  have hpt : p ≤ g.clonePromptTokens := Nat.le_trans hp (Nat.min_le_left _ _)
+  have hpm' : p ≤ g.clonePromptMel / 160 := Nat.le_trans hp (Nat.min_le_right _ _)
+  have hmel' : 2 * p * 80 ≤ g.clonePromptMel := by
+    have := (Nat.le_div_iff_mul_le (by decide : 0 < 160)).1 hpm'
+    omega
+  exact ⟨by omega, hpt, hmel', by omega, hspk,
+    by have := slot_row_lt hk hi; omega, by have := slot_row_lt hk hj; omega,
+    by have := slot_row_lt hk hcs; omega, by omega⟩
 
 /-! ## VAD (`vad.frame.v1`) -/
 
@@ -490,13 +550,25 @@ def parseFamily (j : Json) : Except String Family := do
       cloneEosCode := (← nats j "clone_eos_code") }
   | "guided_lm" =>
     exactKeys j ["kind", "speech_vocab", "start_speech", "stop_speech", "valid_below", "text_vocab",
-      "start_text", "stop_text", "max_speech_tokens", "speech_positions", "overlay_rows", "max_context"]
+      "start_text", "stop_text", "max_speech_tokens", "speech_positions", "overlay_rows", "max_context",
+      "lm_hidden", "clone_seconds", "clone_sample_rate", "clone_pcm_capacity", "clone_rows",
+      "clone_rows_elements", "clone_prompt_tokens", "clone_prompt_mel", "clone_spks",
+      "vocoder_prompt_max", "vocoder_slots", "vocoder_slot_tokens", "vocoder_slot_mel",
+      "vocoder_slot_spks", "vocoder_slot_lens"]
     return .guidedLm {
       speechVocab := (← nat j "speech_vocab"), startSpeech := (← nat j "start_speech"),
       stopSpeech := (← nat j "stop_speech"), validBelow := (← nat j "valid_below"),
       textVocab := (← nat j "text_vocab"), startText := (← nat j "start_text"), stopText := (← nat j "stop_text"),
       maxSpeechTokens := (← nat j "max_speech_tokens"), speechPositions := (← nat j "speech_positions"),
-      overlayRows := (← nat j "overlay_rows"), maxContext := (← nat j "max_context") }
+      overlayRows := (← nat j "overlay_rows"), maxContext := (← nat j "max_context"),
+      lmHidden := (← nat j "lm_hidden"), cloneSeconds := (← nats j "clone_seconds"),
+      cloneSampleRate := (← nat j "clone_sample_rate"), clonePcmCapacity := (← nat j "clone_pcm_capacity"),
+      cloneRows := (← nat j "clone_rows"), cloneRowsElements := (← nat j "clone_rows_elements"),
+      clonePromptTokens := (← nat j "clone_prompt_tokens"), clonePromptMel := (← nat j "clone_prompt_mel"),
+      cloneSpks := (← nat j "clone_spks"), vocoderPromptMax := (← nat j "vocoder_prompt_max"),
+      vocoderSlots := (← nat j "vocoder_slots"), vocoderSlotTokens := (← nat j "vocoder_slot_tokens"),
+      vocoderSlotMel := (← nat j "vocoder_slot_mel"), vocoderSlotSpks := (← nat j "vocoder_slot_spks"),
+      vocoderSlotLens := (← nat j "vocoder_slot_lens") }
   | "vad" =>
     exactKeys j ["kind", "frame_samples", "context_samples", "input_elements", "state_banks",
       "state_sizes", "min_speech_ms", "max_duration_ms"]
