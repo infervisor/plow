@@ -205,7 +205,8 @@ structure CodecLm where
   /-- `stream.n.{k}` elements per time resolution. -/
   newRowsCapacities : List Nat
   /-- Voice cloning's reference encoder (`codec.encode.v1`): its `encode.f{F}` frame capacities
-  ([] = no cloning), PCM and code tensors, frame geometry, and the end frame's code. -/
+  ([] = no cloning), PCM and code tensors, frame geometry, and the end frame's code ([] = the
+  reference has no end frame). -/
   cloneFrames : List Nat
   clonePcmCapacity : Nat
   cloneCodesCapacity : Nat
@@ -213,7 +214,7 @@ structure CodecLm where
   cloneFrameSamples : Nat
   cloneFrameCodes : Nat
   cloneCodebook : Nat
-  cloneEosCode : Nat
+  cloneEosCode : List Nat
   deriving Repr
 
 def CodecLm.frames (c : CodecLm) : Nat := c.codesCapacity / c.frameCodes
@@ -235,7 +236,7 @@ def CodecLm.Contract (c : CodecLm) : Prop :=
   (c.cloneFrames = [] ∨
     (c.cloneSampleRate = c.codecSampleRate ∧ c.cloneFrameSamples = c.frameSamples ∧
      c.cloneFrameCodes = c.frameCodes ∧ c.cloneCodebook = c.codebook ∧
-     c.cloneEosCode < c.codebook ∧
+     (∀ e ∈ c.cloneEosCode, e < c.codebook) ∧
      ∀ f ∈ c.cloneFrames, 0 < f ∧ f * c.frameSamples ≤ c.clonePcmCapacity ∧
        f * c.frameCodes ≤ c.cloneCodesCapacity))
 
@@ -285,7 +286,7 @@ theorem CodecLm.clone_addresses_in_bounds (c : CodecLm) (h : c.Contract) {f i k 
     (hc : c.cloneFrames ≠ []) (hf : f ∈ c.cloneFrames) (hi : i < f) (hk : k < c.frameCodes)
     (ht : t < c.frameSamples) (hcode : code < c.cloneCodebook) :
     i * c.frameSamples + t < c.clonePcmCapacity ∧ i * c.frameCodes + k < c.cloneCodesCapacity ∧
-    code < c.codebook ∧ c.cloneEosCode < c.codebook := by
+    code < c.codebook ∧ ∀ e ∈ c.cloneEosCode, e < c.codebook := by
   obtain ⟨_, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, hclone⟩ := h
   rcases hclone with hnil | ⟨_, _, _, hcb, heos, hcaps⟩
   · exact absurd hnil hc
@@ -486,7 +487,7 @@ def parseFamily (j : Json) : Except String Family := do
       cloneSampleRate := (← nat j "clone_sample_rate"),
       cloneFrameSamples := (← nat j "clone_frame_samples"),
       cloneFrameCodes := (← nat j "clone_frame_codes"), cloneCodebook := (← nat j "clone_codebook"),
-      cloneEosCode := (← nat j "clone_eos_code") }
+      cloneEosCode := (← nats j "clone_eos_code") }
   | "guided_lm" =>
     exactKeys j ["kind", "speech_vocab", "start_speech", "stop_speech", "valid_below", "text_vocab",
       "start_text", "stop_text", "max_speech_tokens", "speech_positions", "overlay_rows", "max_context"]

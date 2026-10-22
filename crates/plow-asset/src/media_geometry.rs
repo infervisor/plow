@@ -107,7 +107,7 @@ fn codec_lm(p: &PacketPipeline, sidecars: &[MediaPacket<'_>]) -> Result<Value, S
         "stream_slots": 0, "step_frames": 0, "steps": [], "slot_capacity": 0, "pos_capacity": 0,
         "rope_capacity": 0, "new_rows_capacities": [], "clone_frames": [], "clone_pcm_capacity": 0,
         "clone_codes_capacity": 0, "clone_sample_rate": 0, "clone_frame_samples": 0,
-        "clone_frame_codes": 0, "clone_codebook": 0, "clone_eos_code": 0});
+        "clone_frame_codes": 0, "clone_codebook": 0, "clone_eos_code": []});
     if c.parameters.get("stream.stateful").copied().unwrap_or(0) != 0 {
         family.as_object_mut().unwrap().extend(stateful_codec(c)?);
     }
@@ -128,7 +128,7 @@ fn codec_lm(p: &PacketPipeline, sidecars: &[MediaPacket<'_>]) -> Result<Value, S
             "clone_sample_rate": param(e, "audio.sample_rate")?,
             "clone_frame_samples": param(e, "codec.frame_samples")?,
             "clone_frame_codes": param(e, "codec.frame_codes")?,
-            "clone_codebook": param(e, "codec.codebook")?, "clone_eos_code": param(p, "clone.eos_code")?})
+            "clone_codebook": param(e, "codec.codebook")?, "clone_eos_code": p.parameters.get("clone.eos_code").map_or(Vec::new(), |&c| vec![c])})
         else {
             unreachable!()
         };

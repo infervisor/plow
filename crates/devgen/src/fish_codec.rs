@@ -448,7 +448,7 @@ impl Seq {
         Ok(self.done(e))
     }
 
-    fn rms(
+    pub(crate) fn rms(
         &mut self,
         x: u32,
         out: u32,

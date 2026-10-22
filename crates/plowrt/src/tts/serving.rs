@@ -553,7 +553,8 @@ pub fn speech_model(
                 None => None,
             };
             let ref_encoder = match &contract.clone {
-                Some((file, _)) => {
+                Some(clone) => {
+                    let file = &clone.encoder;
                     let e = super::ref_encoder::RefEncoder::load(&assets.join(file), device)?;
                     if e.frame_codes != contract.frame_codes
                         || e.frame_samples != contract.frame_samples
@@ -945,11 +946,11 @@ async fn speech_with(
         class,
         raw_tokens: true,
         speech,
-        // Encoder prompts' ids are placeholders: no session can key on them.
+        // Encoder and cloning prompts' ids are placeholders: no session can key on them.
         session: ids
             .session
             .as_ref()
-            .filter(|_| first.enc_ids.is_none())
+            .filter(|_| first.enc_ids.is_none() && first.reference.is_none())
             .and_then(|_| {
                 ids.ticket(
                     crate::serve::session::row_keys(&first.prompt_ids, &[], &[]),
@@ -1144,9 +1145,13 @@ fn ref_clip(
         )));
     }
     let c = &model.contract;
+    let Some(clone) = &c.clone else {
+        return Err(bad("this model has no voice cloning".into()));
+    };
     let tok = model.encoder.as_ref().map_or(tok, |e| &e.tok);
-    let mut ids = c.prefix.clone();
+    let mut ids = clone.head.clone();
     ids.extend(tok.encode_with_special_tokens(&c.prompt_text(voice, None, text.trim()), false));
+    ids.extend_from_slice(&clone.mid);
     if model.encoder.as_ref().is_some_and(|e| ids.len() > e.rows()) {
         return Err((
             "`ref_text` does not fit the text encoder's prompt".into(),
@@ -1156,6 +1161,7 @@ fn ref_clip(
     Ok(RefClip {
         ids,
         frames: pcm.len().div_ceil(enc.frame_samples),
+        eos: clone.eos_code,
         pcm,
         encoder: Arc::clone(enc),
         codes: OnceLock::new(),
@@ -1173,7 +1179,7 @@ struct Segment {
     /// A guided segment's unconditional encoder ids (the prompt without its instructions).
     uncond_ids: Option<Vec<u32>>,
     /// Voice cloning: the prompt opens with the reference (its transcript's rows, its frames and
-    /// the end frame); `enc_ids` / `uncond_ids` are the text's segment after it.
+    /// any end frame); `enc_ids` / `uncond_ids` are the text's segment after it.
     reference: Option<Arc<RefClip>>,
     gen: crate::serve::GenParams,
     chars: usize,
@@ -1181,11 +1187,14 @@ struct Segment {
 
 /// A request's voice-cloning reference.
 struct RefClip {
-    /// The transcript's prompt segment (encoder ids with a text encoder, else token ids).
+    /// The transcript's prompt segment (encoder ids with a text encoder, else token ids): the
+    /// contract's clone head, the transcript, its mid.
     ids: Vec<u32>,
     /// The reference audio at the encoder's rate; `frames` = its frame count.
     pcm: Vec<f32>,
     frames: usize,
+    /// The end frame's code on every codebook, when the reference has one.
+    eos: Option<u32>,
     encoder: Arc<super::ref_encoder::RefEncoder>,
     /// `[frames][frame_codes]`, encoded on the engine thread by the first segment to prefill.
     codes: OnceLock<Result<Vec<u32>, String>>,
@@ -1194,7 +1203,7 @@ struct RefClip {
 impl RefClip {
     /// Prompt rows ahead of the text's segment: transcript, frames, end frame.
     fn rows(&self) -> usize {
-        self.ids.len() + self.frames + 1
+        self.ids.len() + self.frames + usize::from(self.eos.is_some())
     }
 
     fn codes(&self) -> Result<&[u32], String> {
@@ -1206,11 +1215,13 @@ impl RefClip {
 
     /// `[rows][frame_codes]` codes of those rows (zeros on the transcript's), and each frame's
     /// first code.
-    fn frame_codes(&self, frame_codes: usize, eos: u32) -> Result<(Vec<u32>, Vec<u32>), String> {
+    fn frame_codes(&self, frame_codes: usize) -> Result<(Vec<u32>, Vec<u32>), String> {
         let codes = self.codes()?;
         let mut v = vec![0; self.ids.len() * frame_codes];
         v.extend_from_slice(codes);
-        v.extend(std::iter::repeat_n(eos, frame_codes));
+        if let Some(eos) = self.eos {
+            v.extend(std::iter::repeat_n(eos, frame_codes));
+        }
         Ok((v, codes.iter().step_by(frame_codes).copied().collect()))
     }
 }
@@ -1238,8 +1249,13 @@ impl SegmentMaker {
     fn make(&self, k: usize, text: &str) -> Segment {
         let c = &self.contract;
         let tok = self.encoder.as_ref().map_or(&self.tok, |e| &e.tok);
+        // A cloning prompt's text segment follows the reference with the clone tail.
+        let lead = match (&self.reference, &c.clone) {
+            (Some(_), Some(clone)) => &clone.tail,
+            _ => &c.prefix,
+        };
         let ids = |instructions: Option<&str>| {
-            let mut ids = c.prefix.clone();
+            let mut ids = lead.clone();
             ids.extend(tok.encode_with_special_tokens(
                 &c.prompt_text(&self.voice, instructions, text),
                 false,
@@ -1254,7 +1270,7 @@ impl SegmentMaker {
             prompt_ids.fill(0);
             ids
         });
-        if let (Some(r), Some((_, eos))) = (&self.reference, &c.clone) {
+        if let Some(r) = &self.reference {
             let mut head = if self.encoder.is_some() {
                 vec![0; r.ids.len()]
             } else {
@@ -1262,7 +1278,7 @@ impl SegmentMaker {
             };
             // Each frame row's token is its first code's class (filled in once encoded).
             head.extend(std::iter::repeat_n(c.audio_token_base, r.frames));
-            head.push(c.audio_token_base + eos);
+            head.extend(r.eos.map(|eos| c.audio_token_base + eos));
             head.append(&mut prompt_ids);
             prompt_ids = head;
         }
@@ -1371,12 +1387,12 @@ impl SegmentMaker {
                     s.enc_ids.clone(),
                     s.uncond_ids.clone(),
                 );
-                let reference = s.reference.clone().zip(c.clone.as_ref().map(|c| c.1));
+                let reference = s.reference.clone();
                 let (k, base) = (c.frame_codes, c.audio_token_base);
                 Box::new(
                     move |sp: &mut crate::serve::mux::SpeechJob, prompt: &mut [u32]| {
-                        if let Some((r, eos)) = &reference {
-                            let (codes, first) = r.frame_codes(k, *eos)?;
+                        if let Some(r) = &reference {
+                            let (codes, first) = r.frame_codes(k)?;
                             let rows = r.ids.len()..r.ids.len() + r.frames;
                             for (t, &c0) in prompt[rows.clone()].iter_mut().zip(&first) {
                                 *t = base + c0;

@@ -83,6 +83,7 @@ mod dense_cublaslt;
 pub mod dispatch_audit;
 pub mod fish_codec;
 mod fish_depth;
+pub mod fish_encoder;
 mod gemv_decode_role;
 pub mod manifest;
 pub mod mimi_encoder;
@@ -11422,8 +11423,16 @@ fn emit_dense_gqa(
         eprintln!("  codec packet -> {}", path.display());
         let enc = dir.join("encoder");
         if enc.join("config.json").is_file() {
-            let (model, section) = mimi_encoder::lower_mimi_encoder(&enc, n_cu, m.target)
-                .unwrap_or_else(|error| panic!("reference encoder packet: {error}"));
+            let fish = std::fs::read(enc.join("config.json"))
+                .ok()
+                .and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok())
+                .is_some_and(|v| v["model_type"] == "fish_dac_encoder");
+            let (model, section) = if fish {
+                fish_encoder::lower_fish_encoder(&enc, n_cu, m.target)
+            } else {
+                mimi_encoder::lower_mimi_encoder(&enc, n_cu, m.target)
+            }
+            .unwrap_or_else(|error| panic!("reference encoder packet: {error}"));
             let path = std::path::Path::new(&out).with_file_name(mimi_encoder::PACKET);
             speech_ops |= manifest::speech_ops(&model);
             write_sidecar_packet(&path, &model, &[section]);

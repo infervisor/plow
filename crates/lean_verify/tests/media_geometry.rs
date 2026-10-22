@@ -1,5 +1,6 @@
 //! `media_geometry.v1`: the production families (values from the 4de53bf6 H100 bundles; the
-//! stateful codec LM from the Fish S2 Pro stream-step bundle, the cloning one from Breeze TTS 2) are
+//! stateful codec LM from the Fish S2 Pro stream-step bundle, the cloning ones from Breeze TTS 2 (end
+//! frame) and Fish S2 Pro (none)) are
 //! accepted; each single-field mutation that breaks a contract is rejected.
 
 use serde_json::{json, Value};
@@ -26,7 +27,7 @@ fn families() -> Vec<Value> {
             "window_frames": 6, "lookahead_frames": 2, "stream_slots": 0, "step_frames": 0, "steps": [],
             "slot_capacity": 0, "pos_capacity": 0, "rope_capacity": 0, "new_rows_capacities": [], "clone_frames": [], "clone_pcm_capacity": 0,
             "clone_codes_capacity": 0, "clone_sample_rate": 0, "clone_frame_samples": 0, "clone_frame_codes": 0,
-            "clone_codebook": 0, "clone_eos_code": 0}),
+            "clone_codebook": 0, "clone_eos_code": []}),
         json!({"kind": "codec_lm", "lm_sample_rate": 44100, "lm_codebook": 4096, "lm_frame_codes": 10,
             "lm_frame_samples": 2048, "token_base": 151678, "audio_tokens": 4096, "max_new_tokens": 1024,
             "prompt_tokens": 21, "max_context": 4096, "stops": [151645], "codec_sample_rate": 44100,
@@ -36,7 +37,7 @@ fn families() -> Vec<Value> {
             "slot_capacity": 32, "pos_capacity": 32, "rope_capacity": 544,
             "new_rows_capacities": [32, 32, 32, 32, 32, 32, 32], "clone_frames": [], "clone_pcm_capacity": 0,
             "clone_codes_capacity": 0, "clone_sample_rate": 0, "clone_frame_samples": 0, "clone_frame_codes": 0,
-            "clone_codebook": 0, "clone_eos_code": 0}),
+            "clone_codebook": 0, "clone_eos_code": []}),
         json!({"kind": "codec_lm", "lm_sample_rate": 24000, "lm_codebook": 2048, "lm_frame_codes": 16,
             "lm_frame_samples": 1920, "token_base": 0, "audio_tokens": 2048, "max_new_tokens": 1500,
             "prompt_tokens": 2, "max_context": 2048, "stops": [2048], "codec_sample_rate": 24000,
@@ -46,7 +47,7 @@ fn families() -> Vec<Value> {
             "slot_capacity": 32, "pos_capacity": 32, "rope_capacity": 544,
             "new_rows_capacities": [32, 32, 32, 32, 32, 32, 32], "clone_frames": [128, 256, 32, 64],
             "clone_pcm_capacity": 491520, "clone_codes_capacity": 4096, "clone_sample_rate": 24000,
-            "clone_frame_samples": 1920, "clone_frame_codes": 16, "clone_codebook": 2048, "clone_eos_code": 0}),
+            "clone_frame_samples": 1920, "clone_frame_codes": 16, "clone_codebook": 2048, "clone_eos_code": [0]}),
         json!({"kind": "guided_lm", "speech_vocab": 8194, "start_speech": 6561, "stop_speech": 6562,
             "valid_below": 6561, "text_vocab": 704, "start_text": 255, "stop_text": 0,
             "max_speech_tokens": 1000, "speech_positions": 4100, "overlay_rows": 512, "max_context": 2048}),
@@ -56,6 +57,16 @@ fn families() -> Vec<Value> {
         json!({"kind": "multimodal", "hidden": 3840, "lm_hidden": 3840, "pad_token": 0,
             "tokens": [258880, 255999, 256000], "slab_rows": 8192, "table_capacity": 16384,
             "slab_bytes": 62914560, "table_bytes": 131072}),
+        json!({"kind": "codec_lm", "lm_sample_rate": 44100, "lm_codebook": 4096, "lm_frame_codes": 10,
+            "lm_frame_samples": 2048, "token_base": 151678, "audio_tokens": 4096, "max_new_tokens": 1024,
+            "prompt_tokens": 21, "max_context": 4096, "stops": [151645], "codec_sample_rate": 44100,
+            "codebook": 4096, "frame_codes": 10, "frame_samples": 2048, "codes_capacity": 10240,
+            "pcm_capacity": 2097152, "window_frames": 48, "lookahead_frames": 0, "stream_slots": 32,
+            "step_frames": 17, "steps": [[1, 1], [1, 17], [1, 4], [16, 17], [32, 17], [4, 17], [8, 17]],
+            "slot_capacity": 32, "pos_capacity": 32, "rope_capacity": 544,
+            "new_rows_capacities": [32, 32, 32, 32, 32, 32, 32], "clone_frames": [128, 256, 32, 512, 64],
+            "clone_pcm_capacity": 1048576, "clone_codes_capacity": 5120, "clone_sample_rate": 44100,
+            "clone_frame_samples": 2048, "clone_frame_codes": 10, "clone_codebook": 4096, "clone_eos_code": []}),
     ]
 }
 
@@ -110,7 +121,10 @@ fn production_media_contracts_hold_and_each_mutation_rejects() {
         (2, "steps", json!([[1, 1]])),
         (4, "clone_frame_codes", json!(15)),
         (4, "clone_codebook", json!(2049)),
-        (4, "clone_eos_code", json!(2048)),
+        (4, "clone_eos_code", json!([2048])),
+        (8, "clone_eos_code", json!([4096])),
+        (8, "clone_codebook", json!(1024)),
+        (8, "clone_codes_capacity", json!(5119)),
         (4, "clone_pcm_capacity", json!(491519)),
         (4, "clone_codes_capacity", json!(4095)),
         (4, "clone_sample_rate", json!(44100)),

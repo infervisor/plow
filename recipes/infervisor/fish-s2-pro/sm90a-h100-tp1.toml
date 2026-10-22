@@ -57,6 +57,12 @@ script = "scripts/tts/fish_codec_export.py"
 python = "{env:PYREF}"
 args = ["{out}/prep/codec", "1de9996b6be38b745688de084d87a5633f714e4e"]
 
+[[prep]]
+name = "ref-encoder-export"
+script = "scripts/tts/fish_encoder_export.py"
+python = "{env:PYREF}"
+args = ["{out}/prep/codec/encoder", "1de9996b6be38b745688de084d87a5633f714e4e"]
+
 [emit]
 emit = "devblob+cubin"
 args = ["--served-name", "fish-s2-pro"]

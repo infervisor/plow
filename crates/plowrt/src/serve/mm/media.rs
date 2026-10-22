@@ -408,11 +408,70 @@ pub fn resample(x: &[f32], from: u32, to: u32) -> MediaResult<Vec<f32>> {
     if ratio > 1024.0 {
         return Err(format!("cannot resample {from} Hz to {to} Hz"));
     }
-    let cutoff = ratio.min(1.0);
-    let zeros = 32.0;
-    let half = zeros / cutoff;
-    let beta = 8.6f64;
-    let bessel_i0 = |v: f64| {
+    let k = Kernel::new(ratio);
+    let n_out = ((x.len() as f64) * ratio).round() as usize;
+    // to / from = l / m: output i sits at input i * m / l, so its taps depend only on the phase
+    // (i * m) % l. A filter per phase replaces each tap's Bessel and sine (a 4 s clip at 24 to
+    // 44.1 kHz: ~0.5 s of CPU per tap, milliseconds per phase).
+    let g = gcd(from, to);
+    let (l, m) = (u64::from(to / g), u64::from(from / g));
+    if l > 4096 {
+        return Ok(resample_per_tap(x, ratio, &k, n_out));
+    }
+    let phases: Vec<(i64, Vec<f64>)> = (0..l)
+        .map(|p| {
+            let frac = p as f64 / l as f64;
+            let lo = (frac - k.half).ceil() as i64;
+            let hi = (frac + k.half).floor() as i64;
+            (lo, (lo..=hi).map(|j| k.weight(frac - j as f64)).collect())
+        })
+        .collect();
+    let out = (0..n_out as u64)
+        .map(|i| {
+            let (base, p) = ((i * m / l) as i64, (i * m % l) as usize);
+            let (lo, w) = &phases[p];
+            let mut acc = 0.0f64;
+            for (t, &w) in w.iter().enumerate() {
+                let j = base + lo + t as i64;
+                if j >= 0 && (j as usize) < x.len() {
+                    acc += f64::from(x[j as usize]) * w;
+                }
+            }
+            acc as f32
+        })
+        .collect();
+    Ok(out)
+}
+
+fn gcd(a: u32, b: u32) -> u32 {
+    if b == 0 {
+        a
+    } else {
+        gcd(b, a % b)
+    }
+}
+
+/// The Kaiser-windowed sinc of [`resample`].
+struct Kernel {
+    cutoff: f64,
+    half: f64,
+    beta: f64,
+    norm: f64,
+}
+
+impl Kernel {
+    fn new(ratio: f64) -> Self {
+        let cutoff = ratio.min(1.0);
+        let beta = 8.6f64;
+        Kernel {
+            cutoff,
+            half: 32.0 / cutoff,
+            beta,
+            norm: Self::bessel_i0(beta),
+        }
+    }
+
+    fn bessel_i0(v: f64) -> f64 {
         let (mut sum, mut term, mut k) = (1.0f64, 1.0f64, 1.0f64);
         while term > 1e-12 * sum {
             term *= (v / (2.0 * k)).powi(2);
@@ -420,35 +479,39 @@ pub fn resample(x: &[f32], from: u32, to: u32) -> MediaResult<Vec<f32>> {
             k += 1.0;
         }
         sum
-    };
-    let norm = bessel_i0(beta);
-    let n_out = ((x.len() as f64) * ratio).round() as usize;
-    let out = (0..n_out)
+    }
+
+    /// Tap weight at input distance `d`.
+    fn weight(&self, d: f64) -> f64 {
+        let arg = d * self.cutoff;
+        let sinc = if arg.abs() < 1e-12 {
+            1.0
+        } else {
+            (std::f64::consts::PI * arg).sin() / (std::f64::consts::PI * arg)
+        };
+        let r = d / self.half;
+        let win = if r.abs() >= 1.0 {
+            0.0
+        } else {
+            Self::bessel_i0(self.beta * (1.0 - r * r).sqrt()) / self.norm
+        };
+        sinc * win * self.cutoff
+    }
+}
+
+fn resample_per_tap(x: &[f32], ratio: f64, k: &Kernel, n_out: usize) -> Vec<f32> {
+    (0..n_out)
         .map(|i| {
             let t = i as f64 / ratio;
-            let lo = ((t - half).ceil() as i64).max(0);
-            let hi = ((t + half).floor() as i64).min(x.len() as i64 - 1);
+            let lo = ((t - k.half).ceil() as i64).max(0);
+            let hi = ((t + k.half).floor() as i64).min(x.len() as i64 - 1);
             let mut acc = 0.0f64;
             for j in lo..=hi {
-                let d = t - j as f64;
-                let arg = d * cutoff;
-                let sinc = if arg.abs() < 1e-12 {
-                    1.0
-                } else {
-                    (std::f64::consts::PI * arg).sin() / (std::f64::consts::PI * arg)
-                };
-                let r = d / half;
-                let win = if r.abs() >= 1.0 {
-                    0.0
-                } else {
-                    bessel_i0(beta * (1.0 - r * r).sqrt()) / norm
-                };
-                acc += f64::from(x[j as usize]) * sinc * win * cutoff;
+                acc += f64::from(x[j as usize]) * k.weight(t - j as f64);
             }
             acc as f32
         })
-        .collect();
-    Ok(out)
+        .collect()
 }
 
 /// Parameters of the `semicausal_log_mel` processor (contract `audio` modality).
@@ -808,6 +871,33 @@ mod tests {
         assert!(resample(&[0.5; 4], 16_000, 0).is_err());
         assert!(resample(&[0.5; 4], 1, 16_000).is_err());
         assert_eq!(resample(&[0.5; 4], 16_000, 16_000).unwrap().len(), 4);
+    }
+
+    #[test]
+    fn polyphase_resample_matches_per_tap() {
+        let x: Vec<f32> = (0..9000)
+            .map(|i| {
+                ((i as f32) * 0.37).sin() * 0.5 + ((i * 7919 % 1000) as f32 / 1000.0 - 0.5) * 0.1
+            })
+            .collect();
+        for (from, to) in [
+            (24_000, 44_100),
+            (44_100, 16_000),
+            (48_000, 24_000),
+            (16_000, 24_000),
+        ] {
+            let ratio = f64::from(to) / f64::from(from);
+            let n_out = ((x.len() as f64) * ratio).round() as usize;
+            let want = resample_per_tap(&x, ratio, &Kernel::new(ratio), n_out);
+            let got = resample(&x, from, to).unwrap();
+            assert_eq!(got.len(), want.len());
+            let err = got
+                .iter()
+                .zip(&want)
+                .map(|(a, b)| (a - b).abs())
+                .fold(0f32, f32::max);
+            assert!(err < 1e-6, "{from} -> {to}: {err}");
+        }
     }
 
     #[test]
