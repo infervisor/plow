@@ -35,6 +35,13 @@
       "toolchain": "leanprover/lean4:v4.15.0",
       "commit": "e4f3718c",
       "note": "speech_fusion conv row-scale tensors cover the footprint (SNAC slab sites); user-approved 2026-10-21"
+    },
+    {
+      "sha256": "b3dc5f1611412f37fc5081313614777821f5fe391190c17c847d4f3c2511c099",
+      "lean_sources_sha256": "9278a48e75b3ea261be3f92c6c71d2226389ac60b9cab2367e12a998be600360",
+      "toolchain": "leanprover/lean4:v4.15.0",
+      "commit": "b8924059",
+      "note": "codec_lm voice-cloning reference encoder (clone frames, PCM/codes capacities, eos code); user-approved 2026-10-22"
     }
   ]
 }
