@@ -25,7 +25,7 @@ use crate::pipeline::{
 };
 use crate::rewrite_lower::ConvFusions;
 
-type Splits<'a> = Option<&'a std::cell::RefCell<BTreeMap<String, (u32, u32, u32)>>>;
+pub(crate) type Splits<'a> = Option<&'a std::cell::RefCell<BTreeMap<String, (u32, u32, u32)>>>;
 
 /// (batch, frames): streaming windows batched across streams, long utterances alone. The smallest
 /// frame count sets the stream chunk (`frames + 1 - stream.window_frames` = 17 frames): a capacity
@@ -366,24 +366,24 @@ fn lower_programs(
 }
 
 /// A transformer / ConvNeXt step chain inside one program: each op depends on the previous.
-struct Seq {
-    p: Option<StageProgram>,
-    last: u32,
+pub(crate) struct Seq {
+    pub(crate) p: Option<StageProgram>,
+    pub(crate) last: u32,
 }
 
 impl Seq {
-    fn p(&mut self) -> &mut StageProgram {
+    pub(crate) fn p(&mut self) -> &mut StageProgram {
         self.p.as_mut().unwrap()
     }
 
-    fn done(&mut self, e: Emitted) -> u32 {
+    pub(crate) fn done(&mut self, e: Emitted) -> u32 {
         self.last = e.done;
         e.output
     }
 
     /// `x @ w^T + b` as a pointwise Conv1dF32 (weights `[n][k]`), on split-bf16 wgmma with `splits`.
     #[allow(clippy::too_many_arguments)]
-    fn dense(
+    pub(crate) fn dense(
         &mut self,
         splits: Splits<'_>,
         x: u32,
@@ -436,7 +436,7 @@ impl Seq {
         Ok(self.done(e))
     }
 
-    fn raw(
+    pub(crate) fn raw(
         &mut self,
         op: DevOp,
         units: u64,
@@ -465,7 +465,7 @@ impl Seq {
         })
     }
 
-    fn binary(
+    pub(crate) fn binary(
         &mut self,
         a: u32,
         b: u32,
@@ -493,7 +493,13 @@ impl Seq {
         Ok(self.done(e))
     }
 
-    fn unary(&mut self, x: u32, kind: Activation, rows: u32, width: u32) -> Result<u32, String> {
+    pub(crate) fn unary(
+        &mut self,
+        x: u32,
+        kind: Activation,
+        rows: u32,
+        width: u32,
+    ) -> Result<u32, String> {
         let dep = self.last;
         let e = self.p().unary_f32(
             x,

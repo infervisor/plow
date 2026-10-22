@@ -18,6 +18,8 @@ pub mod guided_speech;
 #[cfg(feature = "cuda")]
 pub mod realtime;
 #[cfg(feature = "cuda")]
+pub mod ref_encoder;
+#[cfg(feature = "cuda")]
 pub mod serving;
 #[cfg(feature = "cuda")]
 pub mod text_encoder;
@@ -68,6 +70,9 @@ pub struct SpeechContract {
     pub instructions: Option<String>,
     /// Sub-bundle of the encoder-mode packet whose output rows are the prompt's embeddings.
     pub text_encoder: Option<String>,
+    /// Voice cloning: the reference encoder packet beside the LM, and the code every codebook of
+    /// the end frame after the reference frames carries.
+    pub clone: Option<(String, u32)>,
 }
 
 impl SpeechContract {
@@ -124,6 +129,10 @@ impl SpeechContract {
             breeze_sampler: get("frames.depth_sampler").unwrap_or(0) == 1,
             instructions: p.strings.get("prompt.instructions").cloned(),
             text_encoder: p.strings.get("text.encoder").cloned(),
+            clone: match p.strings.get("clone.encoder") {
+                Some(f) => Some((f.clone(), get("clone.eos_code")? as u32)),
+                None => None,
+            },
         };
         if !c.prompt_template.contains("{input}") || !c.voice_token.contains("{voice}") {
             return Err(RuntimeError::Rejected(
@@ -224,7 +233,7 @@ impl SpeechContract {
             // Breeze guides against the uninstructed prompt: w = s - 1, off by default.
             cfg_weight: self.depth_cfg().then_some(0.0),
             instructions: self.instructions.is_some(),
-            voice_cloning: false,
+            voice_cloning: self.clone.is_some(),
         }
     }
 

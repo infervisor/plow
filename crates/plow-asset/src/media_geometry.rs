@@ -105,9 +105,34 @@ fn codec_lm(p: &PacketPipeline, sidecars: &[MediaPacket<'_>]) -> Result<Value, S
         "window_frames": param(c, "stream.window_frames")?,
         "lookahead_frames": param(c, "stream.lookahead_frames")?,
         "stream_slots": 0, "step_frames": 0, "steps": [], "slot_capacity": 0, "pos_capacity": 0,
-        "rope_capacity": 0, "new_rows_capacities": []});
+        "rope_capacity": 0, "new_rows_capacities": [], "clone_frames": [], "clone_pcm_capacity": 0,
+        "clone_codes_capacity": 0, "clone_sample_rate": 0, "clone_frame_samples": 0,
+        "clone_frame_codes": 0, "clone_codebook": 0, "clone_eos_code": 0});
     if c.parameters.get("stream.stateful").copied().unwrap_or(0) != 0 {
         family.as_object_mut().unwrap().extend(stateful_codec(c)?);
+    }
+    if p.strings.contains_key("clone.encoder") {
+        let e = sidecar(p, "clone.encoder", sidecars, |e| {
+            e.driver == "codec.encode.v1"
+        })?;
+        let frames: Vec<u64> = e
+            .programs
+            .keys()
+            .filter_map(|role| role.strip_prefix("encode.f")?.parse().ok())
+            .collect();
+        if frames.is_empty() {
+            return Err("clone.encoder has no encode.f{F} program".into());
+        }
+        let Value::Object(m) = json!({"clone_frames": frames,
+            "clone_pcm_capacity": elements(e, "pcm")?, "clone_codes_capacity": elements(e, "codes")?,
+            "clone_sample_rate": param(e, "audio.sample_rate")?,
+            "clone_frame_samples": param(e, "codec.frame_samples")?,
+            "clone_frame_codes": param(e, "codec.frame_codes")?,
+            "clone_codebook": param(e, "codec.codebook")?, "clone_eos_code": param(p, "clone.eos_code")?})
+        else {
+            unreachable!()
+        };
+        family.as_object_mut().unwrap().extend(m);
     }
     Ok(family)
 }
@@ -384,6 +409,40 @@ mod tests {
         assert_eq!(family["new_rows_capacities"], serde_json::json!([4]));
         codec[0].tensors.remove("stream.n.0");
         assert!(request(&packet("model.pkt", &lm), &[packet("codec.pkt", &codec)]).is_err());
+    }
+
+    #[test]
+    fn clone_encoder_declares_its_capacities() {
+        let (mut lm, codec) = codec_lm();
+        lm[0]
+            .strings
+            .insert("clone.encoder".into(), "ref_encoder.pkt".into());
+        lm[0].parameters.insert("clone.eos_code".into(), 0);
+        let mut enc = pipeline(
+            "codec.encode",
+            "codec.encode.v1",
+            &[
+                ("audio.sample_rate", 24000),
+                ("codec.frame_samples", 2048),
+                ("codec.frame_codes", 7),
+                ("codec.codebook", 4096),
+            ],
+            &[],
+            &[("pcm", vec![131072]), ("codes", vec![64, 7])],
+        );
+        enc.programs = BTreeMap::from([("encode.f32".into(), 0), ("encode.f64".into(), 1)]);
+        let enc = vec![enc];
+        let sidecars = [packet("codec.pkt", &codec), packet("ref_encoder.pkt", &enc)];
+        let family = &request(&packet("model.pkt", &lm), &sidecars)
+            .unwrap()
+            .unwrap()["families"][0];
+        assert_eq!(family["clone_frames"], serde_json::json!([32, 64]));
+        assert_eq!(family["clone_codes_capacity"], 448);
+        assert_eq!(family["clone_frame_codes"], 7);
+        assert!(
+            request(&packet("model.pkt", &lm), &sidecars[..1]).is_err(),
+            "declared encoder absent"
+        );
     }
 
     #[test]

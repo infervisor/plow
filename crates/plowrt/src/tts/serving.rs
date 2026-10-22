@@ -503,6 +503,8 @@ pub struct SpeechModel {
     codec: Codec,
     /// The contract's text encoder: its rows are every prompt row.
     encoder: Option<Arc<super::text_encoder::TextEncoder>>,
+    /// The contract's reference encoder (voice cloning).
+    ref_encoder: Option<Arc<super::ref_encoder::RefEncoder>>,
     realtime: Arc<super::realtime::RealTime>,
     spec: OnceLock<SpeechSpec>,
 }
@@ -550,6 +552,22 @@ pub fn speech_model(
                 )?)),
                 None => None,
             };
+            let ref_encoder = match &contract.clone {
+                Some((file, _)) => {
+                    let e = super::ref_encoder::RefEncoder::load(&assets.join(file), device)?;
+                    if e.frame_codes != contract.frame_codes
+                        || e.frame_samples != contract.frame_samples
+                        || e.sample_rate != contract.sample_rate
+                    {
+                        return Err(format!(
+                            "{file} frames ({} codes, {} samples at {} Hz) disagree with the speech contract",
+                            e.frame_codes, e.frame_samples, e.sample_rate
+                        ));
+                    }
+                    Some(Arc::new(e))
+                }
+                None => None,
+            };
             tracing::info!(pipeline = %contract.pipeline, sample_rate = contract.sample_rate, "tts: speech pipeline bound");
             let realtime = super::realtime::RealTime::new(
                 contract.frame_samples as f64 / f64::from(contract.sample_rate),
@@ -559,6 +577,7 @@ pub fn speech_model(
                 contract,
                 codec,
                 encoder,
+                ref_encoder,
                 realtime,
                 spec: OnceLock::new(),
             }))
@@ -858,6 +877,15 @@ async fn speech_with(
     }
     let voice = req.voice.clone();
     let wav = checked.wav;
+    let reference = match (&req.ref_audio, &req.ref_text, &model.ref_encoder) {
+        (Some(audio), Some(text), Some(enc)) => {
+            match ref_clip(&model, tok, &voice, enc, audio, text) {
+                Ok(r) => Some(Arc::new(r)),
+                Err((msg, param)) => return bad(msg, param),
+            }
+        }
+        _ => None,
+    };
     // Past the cap the reference budget clips the audio: a longer input is spoken in order as
     // sentence-sized segments, each with its full budget.
     let maker = SegmentMaker {
@@ -871,6 +899,7 @@ async fn speech_with(
             .filter(|i| !i.is_empty())
             .map(str::to_owned),
         encoder: model.encoder.clone(),
+        reference,
         cfg_weight: checked.sampling.cfg_weight.unwrap_or(0.0),
         max_tokens: checked.sampling.max_tokens,
         temperature: checked.sampling.temperature,
@@ -1086,6 +1115,53 @@ async fn speech_with(
 const MUTE_RETRIES: usize = 1;
 const SPLIT_MIN_CHARS: usize = 40;
 
+/// Decode, resample and frame a cloning reference; its codes come later, on the engine thread.
+fn ref_clip(
+    model: &SpeechModel,
+    tok: &Arc<dyn crate::text::tokenizer::Tokenize>,
+    voice: &str,
+    enc: &Arc<super::ref_encoder::RefEncoder>,
+    audio: &str,
+    text: &str,
+) -> Result<RefClip, (String, &'static str)> {
+    use crate::serve::mm::media;
+    use base64::Engine as _;
+    let bad = |m: String| (m, "ref_audio");
+    let bytes = if audio.starts_with("data:") {
+        media::data_url(audio).map_err(bad)?.1
+    } else {
+        base64::engine::general_purpose::STANDARD
+            .decode(audio.trim())
+            .map_err(|e| bad(format!("`ref_audio` is not base64 audio: {e}")))?
+    };
+    let (max, rate) = (enc.max_samples(), enc.sample_rate);
+    let seconds = max as f64 / f64::from(rate);
+    let (pcm, from) = media::decode_audio(&bytes, "", seconds + 1.0).map_err(bad)?;
+    let pcm = media::resample(&pcm, from, rate).map_err(bad)?;
+    if pcm.is_empty() || pcm.len() > max {
+        return Err(bad(format!(
+            "`ref_audio` must hold audio of at most {seconds:.2} s"
+        )));
+    }
+    let c = &model.contract;
+    let tok = model.encoder.as_ref().map_or(tok, |e| &e.tok);
+    let mut ids = c.prefix.clone();
+    ids.extend(tok.encode_with_special_tokens(&c.prompt_text(voice, None, text.trim()), false));
+    if model.encoder.as_ref().is_some_and(|e| ids.len() > e.rows()) {
+        return Err((
+            "`ref_text` does not fit the text encoder's prompt".into(),
+            "ref_text",
+        ));
+    }
+    Ok(RefClip {
+        ids,
+        frames: pcm.len().div_ceil(enc.frame_samples),
+        pcm,
+        encoder: Arc::clone(enc),
+        codes: OnceLock::new(),
+    })
+}
+
 /// One segment's LM job.
 #[derive(Clone)]
 struct Segment {
@@ -1096,8 +1172,47 @@ struct Segment {
     enc_ids: Option<Vec<u32>>,
     /// A guided segment's unconditional encoder ids (the prompt without its instructions).
     uncond_ids: Option<Vec<u32>>,
+    /// Voice cloning: the prompt opens with the reference (its transcript's rows, its frames and
+    /// the end frame); `enc_ids` / `uncond_ids` are the text's segment after it.
+    reference: Option<Arc<RefClip>>,
     gen: crate::serve::GenParams,
     chars: usize,
+}
+
+/// A request's voice-cloning reference.
+struct RefClip {
+    /// The transcript's prompt segment (encoder ids with a text encoder, else token ids).
+    ids: Vec<u32>,
+    /// The reference audio at the encoder's rate; `frames` = its frame count.
+    pcm: Vec<f32>,
+    frames: usize,
+    encoder: Arc<super::ref_encoder::RefEncoder>,
+    /// `[frames][frame_codes]`, encoded on the engine thread by the first segment to prefill.
+    codes: OnceLock<Result<Vec<u32>, String>>,
+}
+
+impl RefClip {
+    /// Prompt rows ahead of the text's segment: transcript, frames, end frame.
+    fn rows(&self) -> usize {
+        self.ids.len() + self.frames + 1
+    }
+
+    fn codes(&self) -> Result<&[u32], String> {
+        self.codes
+            .get_or_init(|| self.encoder.encode(&self.pcm))
+            .as_deref()
+            .map_err(Clone::clone)
+    }
+
+    /// `[rows][frame_codes]` codes of those rows (zeros on the transcript's), and each frame's
+    /// first code.
+    fn frame_codes(&self, frame_codes: usize, eos: u32) -> Result<(Vec<u32>, Vec<u32>), String> {
+        let codes = self.codes()?;
+        let mut v = vec![0; self.ids.len() * frame_codes];
+        v.extend_from_slice(codes);
+        v.extend(std::iter::repeat_n(eos, frame_codes));
+        Ok((v, codes.iter().step_by(frame_codes).copied().collect()))
+    }
 }
 
 /// Builds a segment's prompt and generation parameters from its text.
@@ -1107,6 +1222,7 @@ struct SegmentMaker {
     voice: String,
     instructions: Option<String>,
     encoder: Option<Arc<super::text_encoder::TextEncoder>>,
+    reference: Option<Arc<RefClip>>,
     /// Depth-stage CFG weight w (scale s = 1 + w); 0 = off.
     cfg_weight: f32,
     max_tokens: Option<usize>,
@@ -1138,6 +1254,18 @@ impl SegmentMaker {
             prompt_ids.fill(0);
             ids
         });
+        if let (Some(r), Some((_, eos))) = (&self.reference, &c.clone) {
+            let mut head = if self.encoder.is_some() {
+                vec![0; r.ids.len()]
+            } else {
+                r.ids.clone()
+            };
+            // Each frame row's token is its first code's class (filled in once encoded).
+            head.extend(std::iter::repeat_n(c.audio_token_base, r.frames));
+            head.push(c.audio_token_base + eos);
+            head.append(&mut prompt_ids);
+            prompt_ids = head;
+        }
         let mut gen = crate::serve::GenParams::default();
         gen.max_tokens = self
             .max_tokens
@@ -1159,6 +1287,7 @@ impl SegmentMaker {
             prompt_ids,
             enc_ids,
             uncond_ids,
+            reference: self.reference.clone(),
             gen,
             chars: text.chars().count(),
         }
@@ -1200,10 +1329,20 @@ impl SegmentMaker {
         if !c.depth {
             return Ok(None);
         }
-        let overlay_pos = s
-            .enc_ids
-            .as_ref()
-            .map_or(Vec::new(), |ids| (0..ids.len() as u32).collect());
+        // With a reference, the text's segment follows its rows; with a text encoder, the
+        // transcript's rows are overlay rows too.
+        let (head, ref_ids) = match (&s.reference, &self.encoder) {
+            (Some(r), Some(_)) => (r.rows(), Some(r.ids.clone())),
+            (Some(r), None) => (r.rows(), None),
+            (None, _) => (0, None),
+        };
+        let rows = |ids: &[u32]| -> Vec<u32> {
+            let lead = ref_ids.as_ref().map_or(0, |r| r.len() as u32);
+            (0..lead)
+                .chain(head as u32..(head + ids.len()) as u32)
+                .collect()
+        };
+        let overlay_pos = s.enc_ids.as_deref().map_or(Vec::new(), rows);
         let cfg = s.uncond_ids.as_ref().map(|ids| crate::serve::mux::CfgJob {
             uncond_overlay: Vec::new(),
             params: crate::text::sample::CfgParams {
@@ -1215,23 +1354,56 @@ impl SegmentMaker {
             },
             history: Vec::new(),
             seed: None,
-            uncond_ids: vec![0; ids.len()],
-            uncond_overlay_pos: (0..ids.len() as u32).collect(),
+            uncond_ids: s.prompt_ids[..head]
+                .iter()
+                .copied()
+                .chain(std::iter::repeat_n(0, ids.len()))
+                .collect(),
+            uncond_overlay_pos: rows(ids),
         });
-        let encode: Option<crate::serve::mux::SpeechEncode> = match (&s.enc_ids, &self.encoder) {
-            (None, _) => None,
-            (Some(_), None) => return Err("no text encoder".into()),
-            (Some(ids), Some(e)) => {
-                let (e, ids, uncond) = (e.clone(), ids.clone(), s.uncond_ids.clone());
-                Some(Box::new(move |sp: &mut crate::serve::mux::SpeechJob| {
-                    sp.overlay = e.encode(&ids)?;
-                    if let (Some(ids), Some(cfg)) = (uncond, sp.cfg.as_mut()) {
-                        cfg.uncond_overlay = e.encode(&ids)?;
-                    }
-                    Ok(())
-                }))
-            }
-        };
+        if s.enc_ids.is_some() && self.encoder.is_none() {
+            return Err("no text encoder".into());
+        }
+        let encode: Option<crate::serve::mux::SpeechEncode> =
+            (s.enc_ids.is_some() || s.reference.is_some()).then(|| {
+                let (e, ids, uncond) = (
+                    self.encoder.clone(),
+                    s.enc_ids.clone(),
+                    s.uncond_ids.clone(),
+                );
+                let reference = s.reference.clone().zip(c.clone.as_ref().map(|c| c.1));
+                let (k, base) = (c.frame_codes, c.audio_token_base);
+                Box::new(
+                    move |sp: &mut crate::serve::mux::SpeechJob, prompt: &mut [u32]| {
+                        if let Some((r, eos)) = &reference {
+                            let (codes, first) = r.frame_codes(k, *eos)?;
+                            let rows = r.ids.len()..r.ids.len() + r.frames;
+                            for (t, &c0) in prompt[rows.clone()].iter_mut().zip(&first) {
+                                *t = base + c0;
+                            }
+                            if let Some(cfg) = sp.cfg.as_mut() {
+                                for (t, &c0) in cfg.uncond_ids[rows].iter_mut().zip(&first) {
+                                    *t = base + c0;
+                                }
+                            }
+                            sp.frame_codes = codes;
+                        }
+                        let (Some(e), Some(ids)) = (e, ids) else {
+                            return Ok(());
+                        };
+                        // Each text segment is its own encoder launch (positions from 0).
+                        let lead = match &ref_ids {
+                            Some(r) => e.encode(r)?,
+                            None => Vec::new(),
+                        };
+                        sp.overlay = [lead.as_slice(), &e.encode(&ids)?].concat();
+                        if let (Some(ids), Some(cfg)) = (uncond, sp.cfg.as_mut()) {
+                            cfg.uncond_overlay = [lead.as_slice(), &e.encode(&ids)?].concat();
+                        }
+                        Ok(())
+                    },
+                ) as crate::serve::mux::SpeechEncode
+            });
         let cfg_scale = cfg.as_ref().map(|_| 1.0 + self.cfg_weight);
         {
             // The reference keeps temperature and top-p as bf16 tensors (0.7 -> 0.69921875).
@@ -1248,6 +1420,8 @@ impl SegmentMaker {
                 overlay: Vec::new(),
                 overlay_pos,
                 encode,
+                frame_codes: Vec::new(),
+                frame_codes_per_row: c.frame_codes,
                 depth: Some(crate::serve::mux::DepthJob {
                     seed: s.gen.seed.unwrap_or(self.seed),
                     temperature: if greedy { 1.0 } else { param(self.temperature) },

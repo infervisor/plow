@@ -85,6 +85,7 @@ pub mod fish_codec;
 mod fish_depth;
 mod gemv_decode_role;
 pub mod manifest;
+pub mod mimi_encoder;
 pub mod mm;
 pub mod modular;
 mod mxfp4_moe_role;
@@ -11419,6 +11420,15 @@ fn emit_dense_gqa(
         speech_ops |= manifest::speech_ops(&model);
         write_sidecar_packet(&path, &model, &[section]);
         eprintln!("  codec packet -> {}", path.display());
+        let enc = dir.join("encoder");
+        if enc.join("config.json").is_file() {
+            let (model, section) = mimi_encoder::lower_mimi_encoder(&enc, n_cu, m.target)
+                .unwrap_or_else(|error| panic!("reference encoder packet: {error}"));
+            let path = std::path::Path::new(&out).with_file_name(mimi_encoder::PACKET);
+            speech_ops |= manifest::speech_ops(&model);
+            write_sidecar_packet(&path, &model, &[section]);
+            eprintln!("  reference encoder packet -> {}", path.display());
+        }
     }
     if let Some(dir) = ecfg.tts_vocoder.as_deref().filter(|_| !block_mode) {
         let sites = whole_graph_audio_sites().1;

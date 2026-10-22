@@ -204,6 +204,16 @@ structure CodecLm where
   ropeCapacity : Nat
   /-- `stream.n.{k}` elements per time resolution. -/
   newRowsCapacities : List Nat
+  /-- Voice cloning's reference encoder (`codec.encode.v1`): its `encode.f{F}` frame capacities
+  ([] = no cloning), PCM and code tensors, frame geometry, and the end frame's code. -/
+  cloneFrames : List Nat
+  clonePcmCapacity : Nat
+  cloneCodesCapacity : Nat
+  cloneSampleRate : Nat
+  cloneFrameSamples : Nat
+  cloneFrameCodes : Nat
+  cloneCodebook : Nat
+  cloneEosCode : Nat
   deriving Repr
 
 def CodecLm.frames (c : CodecLm) : Nat := c.codesCapacity / c.frameCodes
@@ -221,7 +231,13 @@ def CodecLm.Contract (c : CodecLm) : Prop :=
   (c.streamSlots = 0 → c.steps = []) ∧ c.stepFrames ≤ c.frames ∧
   (∀ s ∈ c.steps, 0 < s.1 ∧ s.1 ≤ c.streamSlots ∧ 0 < s.2 ∧ s.2 ≤ c.stepFrames ∧
     s.1 ≤ c.slotCapacity ∧ s.1 ≤ c.posCapacity ∧ s.1 * s.2 ≤ c.ropeCapacity ∧
-    s.1 * s.2 ≤ c.frames ∧ ∀ k ∈ c.newRowsCapacities, s.1 ≤ k)
+    s.1 * s.2 ≤ c.frames ∧ ∀ k ∈ c.newRowsCapacities, s.1 ≤ k) ∧
+  (c.cloneFrames = [] ∨
+    (c.cloneSampleRate = c.codecSampleRate ∧ c.cloneFrameSamples = c.frameSamples ∧
+     c.cloneFrameCodes = c.frameCodes ∧ c.cloneCodebook = c.codebook ∧
+     c.cloneEosCode < c.codebook ∧
+     ∀ f ∈ c.cloneFrames, 0 < f ∧ f * c.frameSamples ≤ c.clonePcmCapacity ∧
+       f * c.frameCodes ≤ c.cloneCodesCapacity))
 
 instance (c : CodecLm) : Decidable c.Contract := by unfold CodecLm.Contract; exact inferInstance
 
@@ -251,7 +267,7 @@ theorem CodecLm.step_addresses_in_bounds (c : CodecLm) (h : c.Contract) {b n i r
     (i * n + r) * c.frameCodes + j < c.codesCapacity ∧
     (i * n + r) * c.frameSamples + t < c.pcmCapacity := by
   have hc := h
-  obtain ⟨_, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, hstep⟩ := h
+  obtain ⟨_, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, hstep, _⟩ := h
   obtain ⟨_, hslots, _, _, hslot, hpos, hrope, hframes, hnew⟩ := hstep _ hs
   simp only at hslots hslot hpos hrope hframes hnew
   have hrow : i * n + r < b * n := by
@@ -261,6 +277,24 @@ theorem CodecLm.step_addresses_in_bounds (c : CodecLm) (h : c.Contract) {b n i r
   have ⟨hcode, hpcm⟩ := c.addresses_in_bounds hc (f := i * n + r) (by omega) hj ht
   exact ⟨by omega, by omega, by omega, fun k hk => by have := hnew k hk; omega, by omega,
     hcode, hpcm⟩
+
+/-- A reference clip of `f` frames (a clone capacity) reads its samples and writes its codes inside
+    the encoder's tensors, and each code (below the encoder's codebook) is a codec code, so its
+    frame token `tokenBase + code` is an audio token. -/
+theorem CodecLm.clone_addresses_in_bounds (c : CodecLm) (h : c.Contract) {f i k t code : Nat}
+    (hc : c.cloneFrames ≠ []) (hf : f ∈ c.cloneFrames) (hi : i < f) (hk : k < c.frameCodes)
+    (ht : t < c.frameSamples) (hcode : code < c.cloneCodebook) :
+    i * c.frameSamples + t < c.clonePcmCapacity ∧ i * c.frameCodes + k < c.cloneCodesCapacity ∧
+    code < c.codebook ∧ c.cloneEosCode < c.codebook := by
+  obtain ⟨_, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, hclone⟩ := h
+  rcases hclone with hnil | ⟨_, _, _, hcb, heos, hcaps⟩
+  · exact absurd hnil hc
+  obtain ⟨_, hpcm, hcodes⟩ := hcaps f hf
+  have hrow (w : Nat) (j : Nat) (hj : j < w) : i * w + j < f * w := by
+    have : (i + 1) * w ≤ f * w := Nat.mul_le_mul_right _ hi
+    rw [Nat.add_mul] at this
+    omega
+  exact ⟨by have := hrow _ _ ht; omega, by have := hrow _ _ hk; omega, by omega, heos⟩
 
 /-- An audio token decodes to a code position below `frameCodes` and a code below the
     codebook, and no stop token is an audio token. -/
@@ -428,7 +462,9 @@ def parseFamily (j : Json) : Except String Family := do
       "codec_sample_rate",
       "codebook", "frame_codes", "frame_samples", "codes_capacity", "pcm_capacity", "window_frames",
       "lookahead_frames", "stream_slots", "step_frames", "steps", "slot_capacity", "pos_capacity",
-      "rope_capacity", "new_rows_capacities"]
+      "rope_capacity", "new_rows_capacities", "clone_frames", "clone_pcm_capacity",
+      "clone_codes_capacity", "clone_sample_rate", "clone_frame_samples", "clone_frame_codes",
+      "clone_codebook", "clone_eos_code"]
     return .codecLm {
       lmSampleRate := (← nat j "lm_sample_rate"), lmCodebook := (← nat j "lm_codebook"),
       lmFrameCodes := (← nat j "lm_frame_codes"), lmFrameSamples := (← nat j "lm_frame_samples"),
@@ -444,7 +480,13 @@ def parseFamily (j : Json) : Except String Family := do
       steps := (← j.getObjValAs? (List (Nat × Nat)) "steps"),
       slotCapacity := (← nat j "slot_capacity"), posCapacity := (← nat j "pos_capacity"),
       ropeCapacity := (← nat j "rope_capacity"),
-      newRowsCapacities := (← nats j "new_rows_capacities") }
+      newRowsCapacities := (← nats j "new_rows_capacities"),
+      cloneFrames := (← nats j "clone_frames"), clonePcmCapacity := (← nat j "clone_pcm_capacity"),
+      cloneCodesCapacity := (← nat j "clone_codes_capacity"),
+      cloneSampleRate := (← nat j "clone_sample_rate"),
+      cloneFrameSamples := (← nat j "clone_frame_samples"),
+      cloneFrameCodes := (← nat j "clone_frame_codes"), cloneCodebook := (← nat j "clone_codebook"),
+      cloneEosCode := (← nat j "clone_eos_code") }
   | "guided_lm" =>
     exactKeys j ["kind", "speech_vocab", "start_speech", "stop_speech", "valid_below", "text_vocab",
       "start_text", "stop_text", "max_speech_tokens", "speech_positions", "overlay_rows", "max_context"]

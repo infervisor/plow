@@ -62,6 +62,13 @@ script = "scripts/tts/breeze_codec_export.py"
 python = "{env:PYREF}"
 args = ["{out}/prep/codec", "3e28c5151381a722f1d8661b4118c298caa77aa4"]
 
+# Voice cloning: the Mimi reference-audio encoder, lowered to ref_encoder.pkt beside codec.pkt.
+[[prep]]
+name = "ref-encoder-export"
+script = "scripts/tts/mimi_encoder_export.py"
+python = "{env:PYREF}"
+args = ["{out}/prep/codec/encoder", "3e28c5151381a722f1d8661b4118c298caa77aa4"]
+
 [emit]
 emit = "devblob+cubin"
 args = ["--served-name", "breeze-tts-2"]

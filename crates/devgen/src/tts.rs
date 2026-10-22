@@ -45,6 +45,10 @@ pub struct SpeechProfile {
     /// Sub-bundle of an encoder-mode packet whose `act.enc_out` rows are the whole prompt's
     /// embeddings (the `overlay` role): the prompt ids only size the prefill.
     pub text_encoder: Option<&'static str>,
+    /// Voice cloning through the reference encoder packet: the prompt is the reference
+    /// transcript's segment, the reference frames (one frame token each, its codes in
+    /// `in.frame_codes`), an end frame whose every code is this value, then the text's segment.
+    pub clone_eos_code: Option<u64>,
 }
 
 /// maya-research/Veena (model card): [SOH] <spk_v> text [EOH] [SOA] [SOS] -> SNAC codes, stop on
@@ -73,6 +77,7 @@ pub const VEENA: SpeechProfile = SpeechProfile {
     depth_sampler: 0,
     instructions: None,
     text_encoder: None,
+    clone_eos_code: None,
 };
 
 /// canopylabs/orpheus-3b-0.1-ft (orpheus_tts `_format_prompt`): [SOH] BOS "voice: text" [EOT]
@@ -103,6 +108,7 @@ pub const ORPHEUS: SpeechProfile = SpeechProfile {
     depth_sampler: 0,
     instructions: None,
     text_encoder: None,
+    clone_eos_code: None,
 };
 
 /// fishaudio/s2-pro (fish-speech `inference.py`, no reference): system "convert the provided text
@@ -134,6 +140,7 @@ pub const FISH: SpeechProfile = SpeechProfile {
     depth_sampler: 0,
     instructions: None,
     text_encoder: None,
+    clone_eos_code: None,
 };
 
 /// BreezeBlue/Breeze-TTS-2 (`breeze_infer/templates.py`): each text segment `<bos>[S0]text` (voice
@@ -165,6 +172,9 @@ pub const BREEZE: SpeechProfile = SpeechProfile {
     depth_sampler: 1,
     instructions: Some("<ins_bos>{instructions}<ins_eos>"),
     text_encoder: Some("text_encoder"),
+    // `ref_clone_tata`: [TE(<bos>[S0]ref_text)] [ref frames] [audio_eos: codebook_eos_token_id 0
+    // on every codebook] [TE(<bos>[S0]text)].
+    clone_eos_code: Some(0),
 };
 
 /// Chatterbox T3 (`tts.t3_cfg.v1`): a causal LM whose prefill rows are host embeddings (the
@@ -307,6 +317,11 @@ pub fn speech_pipeline_section(
     }
     if let Some(t) = p.text_encoder {
         pipe.strings.insert("text.encoder".into(), t.into());
+    }
+    if let Some(code) = p.clone_eos_code {
+        pipe.strings
+            .insert("clone.encoder".into(), crate::mimi_encoder::PACKET.into());
+        pipe.parameters.insert("clone.eos_code".into(), code);
     }
     let params = &mut pipe.parameters;
     let mut put = |k: String, v: u64| {

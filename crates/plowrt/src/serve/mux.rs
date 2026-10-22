@@ -554,13 +554,20 @@ pub struct SpeechJob {
     /// A depth-stage packet (`tts.depth_lm.v1`): each step's token comes from the packet's depth
     /// stage, which also samples the frame's codes ([`StreamChunk::Token::frame`]).
     pub depth: Option<DepthJob>,
-    /// Fills `overlay` (and the CFG member's `uncond_overlay`) on the engine thread before the
-    /// first prefill chunk: a text encoder launched beside running decode steps waits behind
-    /// their persistent kernels at every one of its launches.
+    /// Fills `overlay` (and the CFG member's `uncond_overlay`), and the prompt's frame rows (their
+    /// tokens in the given prompt ids and the partner's, their `frame_codes`), on the engine
+    /// thread before the first prefill chunk: an encoder launched beside running decode steps
+    /// waits behind their persistent kernels at every one of its launches.
     pub encode: Option<SpeechEncode>,
+    /// `[rows][frame_codes_per_row]` codes of the prompt's frame rows (`in.frame_codes`, the
+    /// `EmbedFrameBf16` prompt input), zeros elsewhere, staged per prefill chunk for both CFG
+    /// members; empty = no frame rows. Past its end every row's codes are zero.
+    pub frame_codes: Vec<u32>,
+    pub frame_codes_per_row: usize,
 }
 
-pub type SpeechEncode = Box<dyn FnOnce(&mut SpeechJob) -> std::result::Result<(), String> + Send>;
+pub type SpeechEncode =
+    Box<dyn FnOnce(&mut SpeechJob, &mut [u32]) -> std::result::Result<(), String> + Send>;
 
 /// One request's depth-stage sampling, and its class -> token map.
 #[derive(Clone, Copy, Debug)]
@@ -7277,7 +7284,7 @@ fn gpu_prefill_advance(
     }
     if let Some(sp) = slot.speech.as_deref_mut() {
         if let Some(encode) = sp.encode.take() {
-            encode(sp).map_err(crate::RuntimeError::Rejected)?;
+            encode(sp, &mut slot.prompt_ids).map_err(crate::RuntimeError::Rejected)?;
         }
     }
     if let Some(sp) = slot.speech.as_deref() {
@@ -7292,7 +7299,7 @@ fn gpu_prefill_advance(
             };
             let mut c0 = 0;
             loop {
-                gpu_speech_prefill_inputs(e, partner, c0, &cfg.uncond_overlay, pos, sp.pos_base)?;
+                gpu_speech_prefill_inputs(e, partner, c0, &cfg.uncond_overlay, pos, sp)?;
                 match e.prefill_chunk(partner, ids, usize::MAX)? {
                     PrefillStep::Progress(end) => c0 = end,
                     PrefillStep::Done(_) => break,
@@ -7312,14 +7319,7 @@ fn gpu_prefill_advance(
                 e.write_tensor_ordered("in.pos_base", (partner * 4) as u64, &base.to_le_bytes())?;
             }
         }
-        gpu_speech_prefill_inputs(
-            e,
-            slot_idx,
-            slot.pf_pos,
-            &sp.overlay,
-            &sp.overlay_pos,
-            sp.pos_base,
-        )?;
+        gpu_speech_prefill_inputs(e, slot_idx, slot.pf_pos, &sp.overlay, &sp.overlay_pos, sp)?;
     }
     let tok = if e.has_prefill() {
         let staged = slot.pf_pos == 0 && slot.prefix.is_some();
@@ -7455,9 +7455,9 @@ pub fn check_speech_packet(e: &crate::exec::gpu::GpuEngine) -> Result<()> {
 }
 
 /// Stage a speech job's per-slot inputs for its next prefill chunk starting at prompt row `c0`:
-/// the overlay rows that chunk covers (compacted to overlay row 0) and a chunk-relative
-/// `in.encoder_overlay_index`. Rewritten before EVERY chunk: the overlay tensor is shared by all
-/// slots and another job may have prefilled in between.
+/// the overlay rows that chunk covers (compacted to overlay row 0), a chunk-relative
+/// `in.encoder_overlay_index` and the chunk's frame codes. Rewritten before EVERY chunk: these
+/// tensors are shared by all slots and another job may have prefilled in between.
 #[cfg(feature = "cuda")]
 fn gpu_speech_prefill_inputs(
     e: &mut crate::exec::gpu::GpuEngine,
@@ -7465,12 +7465,28 @@ fn gpu_speech_prefill_inputs(
     c0: usize,
     overlay: &[f32],
     overlay_pos: &[u32],
-    pos_base: Option<u32>,
+    sp: &SpeechJob,
 ) -> Result<()> {
     // A decode launch covering this row before the prompt is in must not find a stale base above
     // its reset position (`EmbedPosBf16` traps on pos < base); the real base lands at Done.
-    if c0 == 0 && pos_base.is_some() {
+    if c0 == 0 && sp.pos_base.is_some() {
         e.write_tensor_ordered("in.pos_base", (slot_idx * 4) as u64, &0u32.to_le_bytes())?;
+    }
+    if !sp.frame_codes.is_empty() {
+        let k = sp.frame_codes_per_row.max(1);
+        let rows = e
+            .tensor_bytes("in.frame_codes")
+            .ok_or_else(|| crate::RuntimeError::Rejected("packet has no in.frame_codes".into()))?
+            as usize
+            / 4
+            / k;
+        let window = rows.min(e.pf_max_rows().max(1));
+        let mut codes = vec![0u32; window * k];
+        let have = sp.frame_codes.len().saturating_sub(c0 * k).min(window * k);
+        if have > 0 {
+            codes[..have].copy_from_slice(&sp.frame_codes[c0 * k..c0 * k + have]);
+        }
+        e.write_tensor("in.frame_codes", 0, bytemuck::cast_slice(&codes))?;
     }
     if overlay_pos.is_empty() {
         return Ok(());
@@ -7488,7 +7504,13 @@ fn gpu_speech_prefill_inputs(
     // Every row a prefill launch may read, padded bucket rows included.
     let window = index_rows.min(e.pf_max_rows().max(1));
     let mut index = Vec::new();
-    let (lo, hi) = speech_overlay_index(overlay_pos, c0, window, &mut index);
+    // A frame-code prompt's other rows keep what `EmbedFrameBf16` wrote (reference frames).
+    let rest = if sp.frame_codes.is_empty() {
+        u32::MAX
+    } else {
+        OVERLAY_KEEP
+    };
+    let (lo, hi) = speech_overlay_index(overlay_pos, c0, window, rest, &mut index);
     if hi > lo {
         e.write_tensor(
             "in.encoder_overlay",
@@ -7499,19 +7521,25 @@ fn gpu_speech_prefill_inputs(
     e.write_tensor("in.encoder_overlay_index", 0, bytemuck::cast_slice(&index))
 }
 
+/// `EmbedOverlayBf16` index that leaves the row an earlier embed op wrote.
+#[cfg(any(feature = "cuda", test))]
+const OVERLAY_KEEP: u32 = 0xFFFF_FFFE;
+
 /// The chunk-relative overlay index for launch rows `[c0, c0 + window)`: the overlay rows
-/// `lo..hi` whose prompt positions fall there, renumbered from 0; every other row `u32::MAX`.
+/// `lo..hi` whose prompt positions fall there, renumbered from 0; every other row `rest`
+/// (`u32::MAX` = token-table row, [`OVERLAY_KEEP`] = the earlier embed op's row).
 #[cfg(any(feature = "cuda", test))]
 fn speech_overlay_index(
     pos: &[u32],
     c0: usize,
     window: usize,
+    rest: u32,
     index: &mut Vec<u32>,
 ) -> (usize, usize) {
     let lo = pos.partition_point(|&p| (p as usize) < c0);
     let hi = pos.partition_point(|&p| (p as usize) < c0.saturating_add(window));
     index.clear();
-    index.resize(window, u32::MAX);
+    index.resize(window, rest);
     for (k, &p) in pos[lo..hi].iter().enumerate() {
         index[p as usize - c0] = k as u32;
     }
@@ -8724,14 +8752,32 @@ mod tests {
         // Audio rows at prompt positions 3..9 of a prompt chunked 4 rows at a time.
         let pos: Vec<u32> = (3..9).collect();
         let mut index = Vec::new();
-        assert_eq!(speech_overlay_index(&pos, 0, 4, &mut index), (0, 1));
+        assert_eq!(
+            speech_overlay_index(&pos, 0, 4, u32::MAX, &mut index),
+            (0, 1)
+        );
         assert_eq!(index, [u32::MAX, u32::MAX, u32::MAX, 0]);
-        assert_eq!(speech_overlay_index(&pos, 4, 4, &mut index), (1, 5));
+        assert_eq!(
+            speech_overlay_index(&pos, 4, 4, u32::MAX, &mut index),
+            (1, 5)
+        );
         assert_eq!(index, [0, 1, 2, 3]);
-        assert_eq!(speech_overlay_index(&pos, 8, 4, &mut index), (5, 6));
+        assert_eq!(
+            speech_overlay_index(&pos, 8, 4, u32::MAX, &mut index),
+            (5, 6)
+        );
         assert_eq!(index, [0, u32::MAX, u32::MAX, u32::MAX]);
-        assert_eq!(speech_overlay_index(&pos, 12, 4, &mut index), (6, 6));
+        assert_eq!(
+            speech_overlay_index(&pos, 12, 4, u32::MAX, &mut index),
+            (6, 6)
+        );
         assert!(index.iter().all(|&i| i == u32::MAX));
+        // A cloning prompt's reference frames keep their frame embedding.
+        assert_eq!(
+            speech_overlay_index(&pos, 8, 4, OVERLAY_KEEP, &mut index),
+            (5, 6)
+        );
+        assert_eq!(index, [0, OVERLAY_KEEP, OVERLAY_KEEP, OVERLAY_KEEP]);
     }
 
     #[cfg(feature = "cuda")]
