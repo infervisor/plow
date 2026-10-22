@@ -2721,6 +2721,9 @@ pub struct GpuEngine {
     seq_tokens: Vec<Vec<u32>>,
     /// A prompt's prefix-cache key staged for the next attach of that slot (DP router hashes).
     staged_prefix: Vec<Option<crate::memory::vmm::PrefixKey>>,
+    /// The slot's prompt rows are not determined by its ids (frame codes beside them): its first
+    /// prefill chunk never attaches a cached prefix.
+    prefix_attach_off: Vec<bool>,
     /// A launch's host window is open ([`Self::token_batch_step_window`]): snapshot restores skip
     /// their stream drain and their holds wait in `deferred_attach` for the step's own drain.
     window_open: bool,
@@ -7378,6 +7381,7 @@ impl GpuEngine {
             kv_pressure_events: 0,
             seq_tokens: vec![Vec::new(); batch],
             staged_prefix: vec![None; batch],
+            prefix_attach_off: vec![false; batch],
             window_open: false,
             deferred_attach: Vec::new(),
             window_event: None,
@@ -8104,6 +8108,7 @@ impl GpuEngine {
 
     pub fn retire_slot(&mut self, b: usize, cache_output: bool) {
         self.staged_prefix[b] = None;
+        self.prefix_attach_off[b] = false;
         if let Some(p) = self.pipe.as_mut() {
             if p.queue.defer_retire(b, cache_output) {
                 return;
@@ -8150,6 +8155,7 @@ impl GpuEngine {
 
     fn reset_packed_admission(&mut self, b: usize) {
         self.staged_prefix[b] = None;
+        self.prefix_attach_off[b] = false;
         if self.packed_admission[b] == PackedAdmission::Ready {
             self.kv_admission_epoch = self.kv_admission_epoch.wrapping_add(1);
         }
@@ -11528,7 +11534,7 @@ impl GpuEngine {
         }
         // VMM: first chunk of a fresh sequence consults the prefix cache —
         // a hit shares the whole-block prefix and moves the frontier there.
-        if self.pos[b] == 0 && self.vmm_prefix_enabled() {
+        if self.pos[b] == 0 && self.vmm_prefix_enabled() && !self.prefix_attach_off[b] {
             self.vmm_attach(b, prompt, None)?;
         }
         let c0 = self.pos[b] as usize;

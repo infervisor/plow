@@ -891,6 +891,12 @@ impl GpuEngine {
         self.staged_prefix[b] = key;
     }
 
+    /// Whether slot `b`'s next sequence may attach a cached prefix: `false` for prompts whose rows
+    /// are not keyed by their ids alone (speech frame codes staged per chunk).
+    pub fn set_prefix_attach(&mut self, b: usize, on: bool) {
+        self.prefix_attach_off[b] = !on;
+    }
+
     /// [`Self::attach_prompt`] with the prompt's block hashes already computed.
     pub fn attach_prompt_keyed(
         &mut self,
@@ -898,7 +904,7 @@ impl GpuEngine {
         prompt: &[u32],
         key: Option<crate::memory::vmm::PrefixKey>,
     ) -> Result<usize> {
-        if self.pos[b] == 0 && self.vmm_prefix_enabled() {
+        if self.pos[b] == 0 && self.vmm_prefix_enabled() && !self.prefix_attach_off[b] {
             self.vmm_attach(b, prompt, key)?;
         }
         Ok(self.pos[b] as usize)

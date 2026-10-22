@@ -7416,11 +7416,21 @@ fn gpu_prefill_advance(
             encode(sp, &mut slot.prompt_ids).map_err(crate::RuntimeError::Rejected)?;
         }
     }
+    if slot.pf_pos == 0 {
+        // Frame rows' embeddings come from their staged codes, not their ids: a cached prefix
+        // keyed by the ids would misplace them.
+        let keyed = slot
+            .speech
+            .as_deref()
+            .is_none_or(|sp| sp.frame_codes.is_empty());
+        e.set_prefix_attach(slot_idx, keyed);
+    }
     if let Some(sp) = slot.speech.as_deref() {
         // The pair prefills as one unit: the unconditional member to completion on the partner
         // first, its last-row logits stashed before the owner's prefill overwrites row 0.
         if let (0, Some(cfg), Some(run)) = (slot.pf_pos, sp.cfg.as_ref(), slot.cfg.as_mut()) {
             let partner = slot_idx + 1;
+            e.set_prefix_attach(partner, sp.frame_codes.is_empty());
             let (ids, pos) = if cfg.uncond_ids.is_empty() {
                 (&slot.prompt_ids, &sp.overlay_pos)
             } else {
