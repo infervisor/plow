@@ -1327,6 +1327,11 @@ fn tuning(s: &Shapes, arch: &str) -> Map<String, Value> {
             }
         }
     }
+    // * `gemv_w_cs` (PLOW_DECODE_GEMV_W_CS opt-in): the GEMV walks load weights evict-first.
+    if arch.starts_with("sm_") && crate::emit_config::active().decode_gemv_w_cs {
+        assert_eq!(arch, "sm_120a", "PLOW_DECODE_GEMV_W_CS: sm_120a decode objects only");
+        t.insert("gemv_w_cs".into(), json!(1));
+    }
     if sm90a && crate::emit_config::active().w8a8 && crate::emit_config::active().decode_cublaslt {
         t.insert("fp8_lt_decode".into(), json!(true));
     }
@@ -3222,6 +3227,11 @@ pub fn config_header(manifest: &Value) -> String {
             if t.get("gemv_xk_qkv").is_some() {
                 out.push_str(
                     "#if !PLOW_NV_SPEECH && !PLOW_NV_PREFILL\n#ifndef PLOW_NV_GEMV_XK_QKV\n#define PLOW_NV_GEMV_XK_QKV 1\n#endif\n#endif\n",
+                );
+            }
+            if t.get("gemv_w_cs").is_some() {
+                out.push_str(
+                    "#if !PLOW_NV_SPEECH && !PLOW_NV_PREFILL\n#ifndef PLOW_NV_GEMV_W_CS\n#define PLOW_NV_GEMV_W_CS 1\n#endif\n#endif\n",
                 );
             }
         }

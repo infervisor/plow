@@ -400,6 +400,10 @@ pub struct EmitConfig {
     /// sm_120a decode, with PLOW_DECODE_GEMV_XK: the GemvQkv walk splits K over blocks too.
     #[arg(long, env = "PLOW_DECODE_GEMV_XK_QKV", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
     pub decode_gemv_xk_qkv: bool,
+    /// sm_120a decode: the GEMV walks load weights evict-first (dead until the next token), so
+    /// L2 keeps the claim-ahead prefetches; the GemvGlu prefetch budget grows to 96 KiB.
+    #[arg(long, env = "PLOW_DECODE_GEMV_W_CS", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
+    pub decode_gemv_w_cs: bool,
 
     /// Blocks for the one-row MoE combine (arms the all-block combine; 0/1 = today's single CTA).
     #[arg(long, env = "PLOW_MOE_COMBINE_BLOCKS")]
@@ -1604,6 +1608,7 @@ impl EmitConfig {
             decode_hnr_fold: env_u32("PLOW_DECODE_HNR_FOLD"),
             decode_gemv_xk: env_u32("PLOW_DECODE_GEMV_XK"),
             decode_gemv_xk_qkv: env_bool("PLOW_DECODE_GEMV_XK_QKV"),
+            decode_gemv_w_cs: env_bool("PLOW_DECODE_GEMV_W_CS"),
             moe_combine_blocks: env_u32("PLOW_MOE_COMBINE_BLOCKS"),
             fa_gf_full: env_u32("PLOW_FA_GF_FULL"),
             attention_decode_balance_gf: env_u32("PLOW_ATTENTION_DECODE_BALANCE_GF"),

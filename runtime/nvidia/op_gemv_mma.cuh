@@ -50,6 +50,23 @@
 #ifndef PLOW_NV_GEMV_MMA_UNB
 #define PLOW_NV_GEMV_MMA_UNB 12
 #endif
+/* Weight k-steps load evict-first (manifest `gemv_w_cs`, recipe opt-in), as the FlashDecode item's
+ * KV rows do: a consumed weight line is dead until the next token, and plain loads let it push
+ * the claim-ahead prefetches (the next op's weights, the FlashDecode-ahead KV) out of L2 first.
+ * The GemvGlu prefetch then pays for a 96 KiB budget (0.6B B=16 blocks own 96 KiB of gate + up;
+ * without evict-first, 96 KiB is no faster than 64). step_bench ctx 1024 B=1/16/32 medians:
+ * 0.6B 1.223/2.165/3.447 -> 1.230/2.104/3.379 ms, 1.7B 2.558/3.694/5.043 -> 2.517/3.620/4.989,
+ * token digests unchanged. */
+#ifndef PLOW_NV_GEMV_W_CS
+#define PLOW_NV_GEMV_W_CS 0
+#endif
+__device__ __forceinline__ uint4 gvmma_ldw(const __nv_bfloat16* p) {
+#if PLOW_NV_GEMV_W_CS
+    return __ldcs((const uint4*)p);
+#else
+    return *(const uint4*)p;
+#endif
+}
 /* ADDNORM FOLD (manifest `norm_fold`, emit knob PLOW_DECODE_NORM_FOLD): the pre-norm decode packet
  * `x += o; h = RMSNorm(x) * gamma` leaves the chain with its gate. The producer (the o_proj / down
  * GEMV) adds bf16(acc) into the residual stream in place, writes h' = x * gamma unscaled and, per
@@ -242,7 +259,7 @@ __device__ __forceinline__ void gvmma_tile(float (&acc)[NW][MT][4], const __nv_b
 #pragma unroll
         for (unsigned u = 0; u < UNB; u++)
 #pragma unroll
-            for (int i = 0; i < NW; i++) wv[i][u] = *(const uint4*)(w[i] + (kb + u) * 32u);
+            for (int i = 0; i < NW; i++) wv[i][u] = gvmma_ldw(w[i] + (kb + u) * 32u);
 #pragma unroll
         for (unsigned u = 0; u < UNB; u++) {
 #pragma unroll
@@ -260,7 +277,7 @@ __device__ __forceinline__ void gvmma_tile(float (&acc)[NW][MT][4], const __nv_b
     for (; kb < nkb; kb++) {
         uint4 wv[NW];
 #pragma unroll
-        for (int i = 0; i < NW; i++) wv[i] = *(const uint4*)(w[i] + kb * 32u);
+        for (int i = 0; i < NW; i++) wv[i] = gvmma_ldw(w[i] + kb * 32u);
 #pragma unroll
         for (int mt = 0; mt < MT; mt++) {
             const uint4 a0 = *(const uint4*)(xr[mt][0] + kb * 32u);
@@ -1010,9 +1027,13 @@ __device__ __forceinline__ void gemv_qkv_rows_mma(
 __device__ __forceinline__ void gvmma_pf_l2(const __nv_bfloat16* p, unsigned bytes) {
     asm volatile("cp.async.bulk.prefetch.L2.global [%0], %1;" ::"l"(p), "r"(bytes) : "memory");
 }
+#ifndef PLOW_NV_GEMV_PF_GLU_BYTES
+#define PLOW_NV_GEMV_PF_GLU_BYTES (PLOW_NV_GEMV_W_CS ? 98304u : PLOW_NV_GEMV_PF_BYTES)
+#endif
 /* Bytes per head: the budget over `heads`, at most one span, whole 128 B lines. */
-__device__ __forceinline__ unsigned gvmma_pf_bytes(unsigned heads, unsigned span_cols) {
-    unsigned b = PLOW_NV_GEMV_PF_BYTES / heads;
+__device__ __forceinline__ unsigned gvmma_pf_bytes(unsigned heads, unsigned span_cols,
+                                                   unsigned budget = PLOW_NV_GEMV_PF_BYTES) {
+    unsigned b = budget / heads;
     if (b > span_cols * 2u) b = span_cols * 2u;
     return b & ~127u;
 }
@@ -1080,7 +1101,7 @@ __device__ __forceinline__ void gvmma_pf_glu(const __nv_bfloat16* Wg, const __nv
     const unsigned row0 = r.rb0 << 3;
     const unsigned R = per < PLOW_NV_WARPS ? per : PLOW_NV_WARPS;
     const unsigned nrow = (R << 3) < N - row0 ? (R << 3) : N - row0;
-    const unsigned bytes = gvmma_pf_bytes(2u * nrow, K);
+    const unsigned bytes = gvmma_pf_bytes(2u * nrow, K, PLOW_NV_GEMV_PF_GLU_BYTES);
     if (!bytes) return;
     gvmma_pf_heads(Wg, row0, nrow, K, 1u, bytes);
     gvmma_pf_heads(Wu, row0, nrow, K, 1u, bytes);
