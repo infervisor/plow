@@ -127,7 +127,12 @@ static DEPTH: std::sync::Mutex<(u64, u64, u64, u64)> = std::sync::Mutex::new((0,
 /// One depth-stage step over `rows` rows on a program covering `width` slots.
 pub fn depth_step(t: Duration, rows: usize, width: usize) {
     let mut d = DEPTH.lock().unwrap();
-    *d = (d.0 + 1, d.1 + t.as_nanos() as u64, d.2 + rows as u64, d.3 + width as u64);
+    *d = (
+        d.0 + 1,
+        d.1 + t.as_nanos() as u64,
+        d.2 + rows as u64,
+        d.3 + width as u64,
+    );
     if d.0 == WINDOW {
         let n = d.0 as f64;
         tracing::info!(

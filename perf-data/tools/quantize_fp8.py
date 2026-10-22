@@ -27,6 +27,8 @@ Both single-file checkpoints (`model.safetensors`) and sharded checkpoints
 
 Usage: quantize_fp8.py <src-model-dir> <out-dir> [prefix]
   prefix default "model.language_model." (Gemma-4 multimodal re-export).
+  --rekey writes a complete checkpoint instead: every shard of the source with each projection
+  (any prefix, MTP included) replaced in place by its twins, a new index, configs symlinked.
   --scale-mode packed-tensor uses one scalar per vLLM packed dense matrix, broadcast
   into the existing scale vectors. Output tensors remain separate row-major matrices.
   --scale-mode vllm-channel uses the vLLM 0.28 per-channel weight scale floor.
@@ -82,7 +84,7 @@ def open_sources(src_dir):
     return weight_map, shards
 
 
-def build_plan(weight_map, shards, prefix, layers):
+def plan_entries(names, weight_map, shards):
     """Return fp8 twins as (out_w, out_s, source, weight_shape, scale_shape, N, K).
 
     Safetensors preserves the fused experts' 3-D shape for documentation, while the device
@@ -90,22 +92,29 @@ def build_plan(weight_map, shards, prefix, layers):
     dimension (`shape[:-1]`), which is byte-equivalent to the packet's flat declaration.
     """
     plan = []
-    for l in range(layers):
-        for proj in PROJS + GDN_PROJS + EXPERT_PROJS:
-            name = f"{prefix}layers.{l}.{proj}"
-            if name not in weight_map:
-                continue
-            hdr, _, _, _ = shards[weight_map[name]]
-            shape = list(hdr[name]["shape"])
-            if len(shape) < 2:
-                raise ValueError(f"{name}: expected matrix-like weight, got shape {shape}")
-            K = shape[-1]
-            N = 1
-            for d in shape[:-1]:
-                N *= d
-            plan.append((f"fp8/{name}", f"fp8/{name}_scale", name,
-                         shape, shape[:-1], N, K))
+    for name in names:
+        hdr, _, _, _ = shards[weight_map[name]]
+        shape = list(hdr[name]["shape"])
+        if len(shape) < 2:
+            raise ValueError(f"{name}: expected matrix-like weight, got shape {shape}")
+        K = shape[-1]
+        N = 1
+        for d in shape[:-1]:
+            N *= d
+        plan.append((f"fp8/{name}", f"fp8/{name}_scale", name,
+                     shape, shape[:-1], N, K))
     return plan
+
+
+def build_plan(weight_map, shards, prefix, layers):
+    names = [f"{prefix}layers.{l}.{proj}" for l in range(layers)
+             for proj in PROJS + GDN_PROJS + EXPERT_PROJS]
+    return plan_entries([n for n in names if n in weight_map], weight_map, shards)
+
+
+def rekey_plan(weight_map, shards):
+    suffixes = tuple("." + p for p in PROJS + GDN_PROJS + EXPERT_PROJS)
+    return plan_entries(sorted(n for n in weight_map if n.endswith(suffixes)), weight_map, shards)
 
 
 PACKED_SUFFIXES = {
@@ -178,17 +187,96 @@ def packed_scales(plan, weight_map, shards):
     return scales, groups
 
 
+def quantize(src_name, shape, N, K, mode, scales, weight_map, shards, sources):
+    """Yield the e4m3 row chunks of one twin, then its f32 scale bytes as the final item."""
+    scale_parts = []
+    digest = hashlib.sha256() if mode == "vllm-channel" else None
+    for w, raw in source_chunks(src_name, N, K, weight_map, shards):
+        if digest is not None:
+            digest.update(raw)
+            if not torch.isfinite(w).all():
+                raise ValueError(f"{src_name}: nonfinite source weight")
+        if mode == "packed-tensor":
+            scale = torch.full((w.shape[0],), scales[src_name], dtype=torch.float32)
+            q = (w * scale.unsqueeze(1).reciprocal()).clamp(-E4M3_MAX, E4M3_MAX).to(torch.float8_e4m3fn)
+        elif mode == "vllm-channel":
+            scale = (w.abs().amax(dim=1) / E4M3_MAX).clamp_min(1 / (E4M3_MAX * 512))
+            q = (w / scale.unsqueeze(1)).clamp(-E4M3_MAX, E4M3_MAX).to(torch.float8_e4m3fn)
+        else:
+            amax = w.abs().amax(dim=1)
+            scale = torch.where(amax > 0, amax / E4M3_MAX, torch.ones_like(amax))
+            q = (w / scale.unsqueeze(1)).to(torch.float8_e4m3fn)
+        yield raw_bytes(q.view(torch.uint8))
+        scale_parts.append(raw_bytes(scale.to(torch.float32)))
+    if digest is not None:
+        sources[src_name] = {"shape": shape, "sha256": digest.hexdigest()}
+    yield b"".join(scale_parts)
+
+
+def write_header(o, meta):
+    hdr_bytes = json.dumps(meta, separators=(",", ":")).encode("utf-8")
+    hdr_bytes += b" " * ((-len(hdr_bytes)) % 8)
+    o.write(struct.pack("<Q", len(hdr_bytes)))
+    o.write(hdr_bytes)
+
+
+def rekey(plan, mode, scales, weight_map, shards, src_dir, out_dir, sources):
+    """Write every source shard with each planned projection replaced by its twins."""
+    twins = {p[2]: p for p in plan}
+    out_map = {}
+    total = 0
+    for filename, (hdr, data0, mm, _) in shards.items():
+        names = sorted((n for n in hdr if n != "__metadata__"), key=lambda n: hdr[n]["data_offsets"][0])
+        meta, off = {}, 0
+        for name in names:
+            if name in twins:
+                wname, sname, _src, wshape, sshape, N, K = twins[name]
+                meta[wname] = {"dtype": "F8_E4M3", "shape": wshape, "data_offsets": [off, off + N * K]}
+                off += N * K
+                meta[sname] = {"dtype": "F32", "shape": sshape, "data_offsets": [off, off + N * 4]}
+                off += N * 4
+                out_map[wname] = out_map[sname] = filename
+            else:
+                a, e = hdr[name]["data_offsets"]
+                meta[name] = {**hdr[name], "data_offsets": [off, off + e - a]}
+                off += e - a
+                out_map[name] = filename
+        with open(os.path.join(out_dir, filename), "xb") as o:
+            write_header(o, meta)
+            for name in names:
+                if name in twins:
+                    _w, _s, _src, wshape, _ss, N, K = twins[name]
+                    for part in quantize(name, wshape, N, K, mode, scales, weight_map, shards, sources):
+                        o.write(part)
+                else:
+                    a, e = hdr[name]["data_offsets"]
+                    o.write(mm[data0 + a:data0 + e])
+        total += off
+        print(f"  {filename}: {sum(n in twins for n in names)} projections", flush=True)
+    with open(os.path.join(out_dir, "model.safetensors.index.json"), "w") as f:
+        json.dump({"metadata": {"total_size": total}, "weight_map": out_map}, f, indent=2)
+    for fname in os.listdir(src_dir):
+        if fname.endswith((".json", ".jinja", ".txt", ".model")) and not fname.endswith(".safetensors.index.json"):
+            dst = os.path.join(out_dir, fname)
+            if not os.path.lexists(dst):
+                os.symlink(os.path.join(os.path.realpath(src_dir), fname), dst)
+    return total
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("src_dir")
     parser.add_argument("out_dir")
     parser.add_argument("prefix", nargs="?", default="model.language_model.")
     parser.add_argument("--scale-mode", choices=["per-channel", "packed-tensor", "vllm-channel"], default="per-channel")
+    parser.add_argument("--rekey", action="store_true")
     args = parser.parse_args()
     src_dir, out_dir, prefix = args.src_dir, args.out_dir, args.prefix
     matching = args.scale_mode != "per-channel"
     if matching and os.path.exists(os.path.join(out_dir, "model.safetensors")):
         raise FileExistsError("matching export requires a new output file")
+    if args.rekey and os.path.exists(os.path.join(out_dir, "model.safetensors.index.json")):
+        raise FileExistsError("rekey requires a new output directory")
     weight_map, shards = open_sources(src_dir)
     layers = 1 + max(int(k.split("layers.")[1].split(".")[0])
                      for k in weight_map if "layers." in k)
@@ -196,7 +284,7 @@ def main():
           f"{len(shards)} shard(s)")
 
     # Dense matrices are 2-D; fused experts are 3-D but flatten to contiguous [N,K] rows.
-    plan = build_plan(weight_map, shards, prefix, layers)
+    plan = rekey_plan(weight_map, shards) if args.rekey else build_plan(weight_map, shards, prefix, layers)
     if not plan:
         raise ValueError("no supported projection weights found")
     scales, groups = ({}, {})
@@ -204,53 +292,29 @@ def main():
         scales, groups = packed_scales(plan, weight_map, shards)
         print(f"packed groups: {len(groups)}", flush=True)
 
-    meta, off = {}, 0
-    for wname, sname, _src, wshape, sshape, N, K in plan:
-        wb = N * K
-        meta[wname] = {"dtype": "F8_E4M3", "shape": wshape, "data_offsets": [off, off + wb]}
-        off += wb
-        sb = N * 4
-        meta[sname] = {"dtype": "F32", "shape": sshape, "data_offsets": [off, off + sb]}
-        off += sb
-    hdr_bytes = json.dumps(meta, separators=(",", ":")).encode("utf-8")
-    hdr_bytes += b" " * ((-len(hdr_bytes)) % 8)
-
     os.makedirs(out_dir, exist_ok=True)
-    out = os.path.join(out_dir, "model.safetensors")
-    written = 0
     sources = {}
-    with open(out, "xb" if matching else "wb") as o:
-        o.write(struct.pack("<Q", len(hdr_bytes)))
-        o.write(hdr_bytes)
-        assert o.tell() == 8 + len(hdr_bytes)
-        for i, (wname, sname, src_name, _wshape, _sshape, N, K) in enumerate(plan):
-            scale_parts = []
-            digest = hashlib.sha256() if args.scale_mode == "vllm-channel" else None
-            for w, _raw in source_chunks(src_name, N, K, weight_map, shards):
-                if digest is not None:
-                    digest.update(_raw)
-                    if not torch.isfinite(w).all():
-                        raise ValueError(f"{src_name}: nonfinite source weight")
-                if args.scale_mode == "packed-tensor":
-                    scale = torch.full((w.shape[0],), scales[src_name], dtype=torch.float32)
-                    q = (w * scale.unsqueeze(1).reciprocal()).clamp(-E4M3_MAX, E4M3_MAX).to(torch.float8_e4m3fn)
-                elif args.scale_mode == "vllm-channel":
-                    scale = (w.abs().amax(dim=1) / E4M3_MAX).clamp_min(1 / (E4M3_MAX * 512))
-                    q = (w / scale.unsqueeze(1)).clamp(-E4M3_MAX, E4M3_MAX).to(torch.float8_e4m3fn)
-                else:
-                    amax = w.abs().amax(dim=1)
-                    scale = torch.where(amax > 0, amax / E4M3_MAX, torch.ones_like(amax))
-                    q = (w / scale.unsqueeze(1)).to(torch.float8_e4m3fn)
-                o.write(raw_bytes(q.view(torch.uint8)))
-                scale_parts.append(raw_bytes(scale.to(torch.float32)))
-            for scale_bytes in scale_parts:
-                o.write(scale_bytes)
-            if digest is not None:
-                sources[src_name] = {"shape": _wshape, "sha256": digest.hexdigest()}
-            written += N * K + N * 4
-            if i % 40 == 0:
-                print(f"  [{i+1}/{len(plan)}] {src_name}  N={N} K={K}  "
-                      f"rows/chunk<={ROW_CHUNK}", flush=True)
+    if args.rekey:
+        written = rekey(plan, args.scale_mode, scales, weight_map, shards, src_dir, out_dir, sources)
+        out = out_dir
+    else:
+        meta, off = {}, 0
+        for wname, sname, _src, wshape, sshape, N, K in plan:
+            meta[wname] = {"dtype": "F8_E4M3", "shape": wshape, "data_offsets": [off, off + N * K]}
+            off += N * K
+            meta[sname] = {"dtype": "F32", "shape": sshape, "data_offsets": [off, off + N * 4]}
+            off += N * 4
+        out = os.path.join(out_dir, "model.safetensors")
+        written = 0
+        with open(out, "xb" if matching else "wb") as o:
+            write_header(o, meta)
+            for i, (wname, sname, src_name, wshape, _sshape, N, K) in enumerate(plan):
+                for part in quantize(src_name, wshape, N, K, args.scale_mode, scales, weight_map, shards, sources):
+                    o.write(part)
+                written += N * K + N * 4
+                if i % 40 == 0:
+                    print(f"  [{i+1}/{len(plan)}] {src_name}  N={N} K={K}  "
+                          f"rows/chunk<={ROW_CHUNK}", flush=True)
     for _, _, mm, backing in shards.values():
         mm.close()
         backing.close()

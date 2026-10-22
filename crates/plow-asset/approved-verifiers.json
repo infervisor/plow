@@ -21,6 +21,34 @@
       "toolchain": "leanprover/lean4:v4.15.0",
       "commit": "tts-api-std",
       "note": "codec_lm audio_tokens (depth-stage LMs: stop tokens inside the codebook); user-approved 2026-10-21"
+    },
+    {
+      "sha256": "c21ecd6a052bfbd3354b2117b420112130d0ad85ac4ebb9131f8e3401b22e1d1",
+      "lean_sources_sha256": "a01cc8c8b2fe0c1935b872c0ed6b684eca3fd1aa2e50202ea1914ef70b7d4d4e",
+      "toolchain": "leanprover/lean4:v4.15.0",
+      "commit": "a0e7c740",
+      "note": "codec_lm stateful stream steps (slots, step frames, step inputs, codes/PCM addressing); user-approved 2026-10-21"
+    },
+    {
+      "sha256": "c4efbfc33a67b1e85e69aa7b107aff3120a3b0cb0d0561f968f3da680a3396ac",
+      "lean_sources_sha256": "cd73ab655671f09153852aed5ef9ffb1f4bc3ee1f0adc7aea5876b423873c7e1",
+      "toolchain": "leanprover/lean4:v4.15.0",
+      "commit": "e4f3718c",
+      "note": "speech_fusion conv row-scale tensors cover the footprint (SNAC slab sites); user-approved 2026-10-21"
+    },
+    {
+      "sha256": "b3dc5f1611412f37fc5081313614777821f5fe391190c17c847d4f3c2511c099",
+      "lean_sources_sha256": "9278a48e75b3ea261be3f92c6c71d2226389ac60b9cab2367e12a998be600360",
+      "toolchain": "leanprover/lean4:v4.15.0",
+      "commit": "b8924059",
+      "note": "codec_lm voice-cloning reference encoder (clone frames, PCM/codes capacities, eos code); user-approved 2026-10-22"
+    },
+    {
+      "sha256": "2b1dc5e473ed78988ff97600ebd2a050d40e942d989b5a3147bd8493dd927172",
+      "lean_sources_sha256": "e183433fccfef1c13999ce5711aad0acb73c5b1049fdbcdd73a4dc842c8f26de",
+      "toolchain": "leanprover/lean4:v4.15.0",
+      "commit": "403ff874",
+      "note": "codec_lm cloning end frame optional (Fish S2 Pro reference prompts); user-approved 2026-10-22"
     }
   ]
 }

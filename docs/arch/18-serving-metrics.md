@@ -82,7 +82,7 @@ performed uncounted prefill work. Generated tokens remain counted if the client
 disconnects later. Normal completion records success when the model finishes;
 it does not certify that the client received the final HTTP/SSE bytes.
 
-The `spec_decode_*` families appear only for a model serving with `PLOW_SPEC`
+The `spec_decode_*` families appear only for a model serving with `PLOW_SPEC`, from its first decode tick
 (positions `0..k_max-1`); mean acceptance length is `1 + accepted / drafts`, as
 in vLLM. Rows that ride a speculative tick without drafts (sampled, penalty or
 logit-bias rows, rows without drafter state yet) are not counted as drafts. A
@@ -129,6 +129,23 @@ latencies consequently have different boundaries.
 | `plowrt_requests_thinking_total` | Counter | Admitted chat requests whose rendered prompt has reasoning on |
 | `plowrt_reasoning_tokens_total` | Counter | Generated tokens attributed to the reasoning trace |
 | `plowrt_request_reasoning_tokens` | Histogram | Trace tokens per finished chat request that had reasoning on or produced a trace |
+| `plowrt_spec_ticks_total` | Counter | Decode ticks that ran at least one draft (`PLOW_SPEC`) |
+| `plowrt_spec_skipped_ticks_total{reason=...}` | Counter | Decode ticks of a speculating engine that carried no draft, by first blocker |
+| `plowrt_spec_eligible_rows_total` | Counter | Decode rows that could draft, summed over decode ticks |
+
+**Speculation blockers.** Every decode tick (a tick with at least one decode row) of an engine
+serving `PLOW_SPEC` counts once: in `plowrt_spec_ticks_total` when a row drafted, else under the
+first `reason` that held, in this order: `prefill_tick` (the tick also prefills), `backlog`
+(requests wait for a slot), then whichever of `cfg_row`, `plain_row` (speech/plain-only row) and
+`seeded_sampled_row` (a seeded sampled row keeps its tick plain for reproducibility) the first such
+row in the batch has, `rows_over_limit` (decode rows at or above the widest span-capable verify
+rung), `no_greedy_rows` (no row may draft: logprobs, at its last token, or sampled, penalties or
+bias with `PLOW_SPEC_SAMPLED=0`), `policy_no_gain` (the measured plan does not beat a plain step),
+`not_ready` (the verify ran but no row held drafter state yet, e.g. the first tick after a plain
+one), `refused` (the engine refused the tick before committing, or failed it). A tick whose rows all
+finish while the decode pipeline drains counts nothing. A row is eligible when it could draft were
+the tick to speculate. The three families appear at the first decode tick, with the `spec_decode_*`
+ones.
 
 **Reasoning.** A request counts as *thinking* when the model frames a separable trace
 (`serve::reasoning::ReasoningMode` is not `None`) and either the rendered prompt leaves the trace

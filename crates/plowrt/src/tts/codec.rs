@@ -101,6 +101,121 @@ pub struct Decoded {
     pub phase: Vec<f32>,
 }
 
+/// A stream's codec state slot ([`Codec::acquire_slot`]); `gen` tells its reuses apart.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SlotId {
+    index: u32,
+    gen: u32,
+}
+
+#[derive(Clone, Copy, Default)]
+struct Slot {
+    gen: u32,
+    busy: bool,
+    /// A launch holding it failed: its state is lost until released.
+    failed: bool,
+    /// Frames committed (decoded) on it.
+    pos: usize,
+}
+
+/// The stateful step programs' stream slots, shared by the streams (acquire) and the codec worker
+/// (check, commit, release).
+pub struct SlotPool {
+    slots: Vec<Slot>,
+    free: Vec<u32>,
+    warned: bool,
+}
+
+impl SlotPool {
+    fn new(n: usize) -> Self {
+        SlotPool {
+            slots: vec![Slot::default(); n],
+            free: (0..n as u32).rev().collect(),
+            warned: false,
+        }
+    }
+
+    fn acquire(&mut self) -> Option<SlotId> {
+        let index = self.free.pop()?;
+        let s = &mut self.slots[index as usize];
+        (s.busy, s.failed, s.pos) = (true, false, 0);
+        Some(SlotId { index, gen: s.gen })
+    }
+
+    /// Frees `id` (a stale or repeated release is ignored); the worker calls it only once no
+    /// launch holds the slot.
+    fn release(&mut self, id: SlotId) {
+        let s = &mut self.slots[id.index as usize];
+        if s.busy && s.gen == id.gen {
+            (s.busy, s.gen) = (false, s.gen.wrapping_add(1));
+            self.free.push(id.index);
+        }
+    }
+
+    /// A step of `id` from frame `pos`: its committed position, or 0 to restart.
+    fn check(&self, id: SlotId, pos: usize) -> Result<(), &'static str> {
+        match self.slots.get(id.index as usize) {
+            Some(s) if s.busy && s.gen == id.gen => {
+                if s.failed {
+                    Err("codec stream slot failed")
+                } else if pos != 0 && pos != s.pos {
+                    Err("codec stream step out of order")
+                } else {
+                    Ok(())
+                }
+            }
+            _ => Err("stale codec stream slot"),
+        }
+    }
+
+    fn commit(&mut self, id: SlotId, pos: usize) {
+        self.slots[id.index as usize].pos = pos;
+    }
+
+    fn fail(&mut self, id: SlotId) {
+        self.slots[id.index as usize].failed = true;
+    }
+}
+
+/// A stream's hold on a codec slot; dropping it frees the slot once the worker reaches it, after
+/// every launch submitted before.
+pub struct StreamSlot {
+    id: SlotId,
+    pos: usize,
+    tx: mpsc::Sender<Msg>,
+}
+
+impl StreamSlot {
+    /// Decode the next steps as a new stream (state read as zeros).
+    pub fn restart(&mut self) {
+        self.pos = 0;
+    }
+}
+
+impl Drop for StreamSlot {
+    fn drop(&mut self) {
+        let _ = self.tx.send(Msg::Release(self.id));
+    }
+}
+
+#[derive(Clone, Copy)]
+struct Step {
+    slot: SlotId,
+    pos: usize,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Family {
+    Decode,
+    Window,
+    Step,
+}
+
+enum Msg {
+    Job(Job),
+    Release(SlotId),
+}
+
 struct Job {
     codes: Vec<i32>,
     frames: usize,
@@ -108,13 +223,24 @@ struct Job {
     voice: u32,
     urgency: Urgency,
     window: Option<Window>,
+    step: Option<Step>,
     reply: tokio::sync::oneshot::Sender<Result<Decoded, String>>,
     /// Backlog charged to the feeding model's mux until this job is answered.
     _work: Option<crate::sched::admission::DownstreamWork>,
 }
 
+impl Job {
+    fn family(&self) -> Family {
+        match (&self.window, &self.step) {
+            (_, Some(_)) => Family::Step,
+            (Some(_), None) => Family::Window,
+            (None, None) => Family::Decode,
+        }
+    }
+}
+
 pub struct Codec {
-    tx: Mutex<mpsc::Sender<Job>>,
+    tx: Mutex<mpsc::Sender<Msg>>,
     yield_hook: std::sync::Arc<Mutex<Option<YieldHook>>>,
     credit: Option<std::sync::Arc<crate::sched::admission::DownstreamCredit>>,
     /// Largest batch one launch holds.
@@ -136,9 +262,29 @@ pub struct Codec {
     pub window_capacities: Vec<(usize, usize)>,
     /// Optional packet parameters (e.g. a streaming schedule).
     pub parameters: std::collections::BTreeMap<String, u64>,
+    /// Most new frames one stateful step decodes (0: the packet has no step programs).
+    pub step_frames: usize,
+    slots: Option<std::sync::Arc<Mutex<SlotPool>>>,
 }
 
 type Capacity = (usize, usize, Vec<usize>);
+
+/// The step programs' per-launch inputs and host staging buffers.
+struct StepIo {
+    slot: PacketTensor,
+    pos: PacketTensor,
+    rope: PacketTensor,
+    /// `stream.n.{k}` per time resolution (rows per frame from [`Bound::lengths`]).
+    n: Vec<PacketTensor>,
+    slots: usize,
+    codes_buf: Vec<u32>,
+    slot_buf: Vec<u32>,
+    pos_buf: Vec<u32>,
+    rope_buf: Vec<u32>,
+    n_buf: Vec<u32>,
+    len_buf: Vec<u32>,
+    pcm_buf: Vec<f32>,
+}
 
 struct Bound {
     runtime: Box<dyn crate::exec::packet_runtime::PacketRuntime>,
@@ -146,6 +292,10 @@ struct Bound {
     capacities: Vec<Capacity>,
     /// The same for windows ([`Window`]) on the cached capacities.
     cached: Vec<Capacity>,
+    /// Stateful stream steps as (batch, new frames, [program]).
+    steps: Vec<Capacity>,
+    step_io: Option<StepIo>,
+    slots: Option<std::sync::Arc<Mutex<SlotPool>>>,
     /// Window source phase in/out and seams (packets with cached capacities).
     phase: Option<[PacketTensor; 4]>,
     harmonics: usize,
@@ -194,7 +344,7 @@ impl Codec {
 
     pub fn load_packet_on(path: &Path, device: u8) -> Result<Self, String> {
         let path = path.to_path_buf();
-        let (tx, rx) = mpsc::channel::<Job>();
+        let (tx, rx) = mpsc::channel::<Msg>();
         let (ready_tx, ready_rx) = mpsc::channel();
         let yield_hook = std::sync::Arc::new(Mutex::new(None));
         let hook = yield_hook.clone();
@@ -212,6 +362,7 @@ impl Codec {
                         .capacities
                         .iter()
                         .chain(&bound.cached)
+                        .chain(&bound.steps)
                         .map(|c| c.0)
                         .max()
                         .unwrap_or(1),
@@ -225,6 +376,8 @@ impl Codec {
                     bound.parameters.clone(),
                     max_window,
                     bound.cached.iter().map(|c| (c.0, c.1)).collect::<Vec<_>>(),
+                    bound.steps.iter().map(|c| c.1).max().unwrap_or(0),
+                    bound.slots.clone(),
                 );
                 let _ = ready_tx.send(Ok(info));
                 run(rx, bound);
@@ -242,6 +395,8 @@ impl Codec {
             parameters,
             max_window,
             window_capacities,
+            step_frames,
+            slots,
         ) = ready_rx.recv().map_err(|e| e.to_string())??;
         Ok(Codec {
             tx: Mutex::new(tx),
@@ -258,7 +413,50 @@ impl Codec {
             max_window,
             window_capacities,
             parameters,
+            step_frames,
+            slots,
         })
+    }
+
+    /// A slot for a stream's stateful steps; `None` without step programs or with every slot
+    /// held (the stream then decodes windows).
+    pub fn acquire_slot(&self) -> Option<StreamSlot> {
+        let mut pool = self.slots.as_ref()?.lock();
+        let Some(id) = pool.acquire() else {
+            if !std::mem::replace(&mut pool.warned, true) {
+                tracing::warn!(
+                    slots = pool.slots.len(),
+                    "tts: codec stream slots exhausted, streams fall back to windowed decode"
+                );
+            }
+            return None;
+        };
+        Some(StreamSlot {
+            id,
+            pos: 0,
+            tx: self.tx.lock().clone(),
+        })
+    }
+
+    /// The next `frames` frames (at most [`Self::step_frames`]) of `slot`'s stream ->
+    /// `frames * frame_samples` samples continuing its audio.
+    pub async fn step(
+        &self,
+        slot: &mut StreamSlot,
+        codes: Vec<i32>,
+        frames: usize,
+        urgency: Urgency,
+    ) -> Result<Vec<f32>, String> {
+        let step = Step {
+            slot: slot.id,
+            pos: slot.pos,
+        };
+        let pcm = self
+            .submit(codes, frames, 0, 0, urgency, None, Some(step))
+            .await?
+            .pcm;
+        slot.pos += frames;
+        Ok(pcm)
     }
 
     /// Split each launch into segments of `render.yield_programs` programs (a CFM step) and call
@@ -323,20 +521,36 @@ impl Codec {
         urgency: Urgency,
         window: Option<Window>,
     ) -> Result<Decoded, String> {
+        self.submit(codes, frames, seed, voice, urgency, window, None)
+            .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn submit(
+        &self,
+        codes: Vec<i32>,
+        frames: usize,
+        seed: u64,
+        voice: u32,
+        urgency: Urgency,
+        window: Option<Window>,
+        step: Option<Step>,
+    ) -> Result<Decoded, String> {
         let (reply, rx) = tokio::sync::oneshot::channel();
         let _work = self.credit.as_ref().map(|c| c.work());
         self.tx
             .lock()
-            .send(Job {
+            .send(Msg::Job(Job {
                 codes,
                 frames,
                 seed,
                 voice,
                 urgency,
                 window,
+                step,
                 reply,
                 _work,
-            })
+            }))
             .map_err(|_| "codec worker stopped".to_string())?;
         rx.await
             .map_err(|_| "codec worker dropped the job".to_string())?
@@ -354,6 +568,8 @@ fn bind(path: &Path, device: u8) -> Result<Bound, String> {
         Default::default();
     let mut cached: std::collections::BTreeMap<(usize, usize), Vec<(usize, usize)>> =
         Default::default();
+    let mut steps: std::collections::BTreeMap<(usize, usize), Vec<(usize, usize)>> =
+        Default::default();
     let mut prefill: std::collections::BTreeMap<u32, Vec<(usize, usize)>> = Default::default();
     for (role, program) in pipeline.programs() {
         let parts: Vec<&str> = role.split('.').collect();
@@ -367,6 +583,11 @@ fn bind(path: &Path, device: u8) -> Result<Bound, String> {
             ["decode", b, f] => {
                 if let Some(key) = dims(b, f, "b", "f") {
                     sequences.entry(key).or_default().push((0, program));
+                }
+            }
+            ["step", b, f] => {
+                if let Some(key) = dims(b, f, "b", "f") {
+                    steps.entry(key).or_default().push((0, program));
                 }
             }
             ["synth", b, t, stage] | ["csynth", b, t, stage] => {
@@ -405,18 +626,59 @@ fn bind(path: &Path, device: u8) -> Result<Bound, String> {
         };
     let capacities = family(sequences);
     let cached = family(cached);
+    let stateful = pipeline.parameter("stream.stateful").unwrap_or(0) == 1;
+    let steps = if stateful { family(steps) } else { Vec::new() };
     if capacities.is_empty() {
         return Err("codec packet declares no decode capacity".into());
     }
+    let mut runtime = runtime;
+    let step_io = if steps.is_empty() {
+        None
+    } else {
+        let slots = param("stream.slots")?;
+        let slot = pipeline.tensor("stream.slot").map_err(e)?;
+        let elems = |t: PacketTensor| vec![0u32; t.bytes / 4];
+        let pos = pipeline.tensor("stream.pos").map_err(e)?;
+        let rope = pipeline.tensor("stream.rope_pos").map_err(e)?;
+        let mut slot_buf = elems(slot);
+        if steps.iter().any(|&(b, n, _)| {
+            b > slots.min(slot_buf.len()).min(pos.bytes / 4) || b * n > rope.bytes / 4
+        }) {
+            return Err("codec step capacity exceeds its stream slots or inputs".into());
+        }
+        // Warm-up launches below take distinct slots (pos 0: state written as zeros).
+        for (b, v) in slot_buf.iter_mut().enumerate() {
+            *v = b as u32;
+        }
+        runtime
+            .write_tensor(slot, bytemuck::cast_slice(&slot_buf))
+            .map_err(e)?;
+        let n = (0..param("lengths.count")?)
+            .map(|k| pipeline.tensor(&format!("stream.n.{k}")).map_err(e))
+            .collect::<Result<Vec<_>, String>>()?;
+        Some(StepIo {
+            pos_buf: elems(pos),
+            rope_buf: elems(rope),
+            n_buf: elems(slot),
+            slot,
+            pos,
+            rope,
+            n,
+            slots,
+            codes_buf: Vec::new(),
+            len_buf: Vec::new(),
+            slot_buf,
+            pcm_buf: Vec::new(),
+        })
+    };
     // Run every capacity once now: each program sequence is captured as a CUDA graph on first
     // use, and a capture that overlaps another thread's context synchronize (the LM engine) fails.
     let t = std::time::Instant::now();
-    let mut runtime = runtime;
-    for (_, _, programs) in capacities.iter().chain(&cached) {
+    for (_, _, programs) in capacities.iter().chain(&cached).chain(&steps) {
         runtime.run_sequence(programs).map_err(e)?;
     }
     tracing::info!(
-        capacities = capacities.len() + cached.len(),
+        capacities = capacities.len() + cached.len() + steps.len(),
         ms = t.elapsed().as_millis() as u64,
         "codec graphs warmed"
     );
@@ -456,6 +718,11 @@ fn bind(path: &Path, device: u8) -> Result<Bound, String> {
         return Err("cached codec capacities without the window phase tensors".into());
     }
     Ok(Bound {
+        slots: step_io
+            .as_ref()
+            .map(|io| std::sync::Arc::new(Mutex::new(SlotPool::new(io.slots)))),
+        steps,
+        step_io,
         cached,
         phase,
         harmonics: pipeline
@@ -491,23 +758,193 @@ fn bind(path: &Path, device: u8) -> Result<Bound, String> {
     })
 }
 
+/// The smallest of `family` (ascending by batch * frames) holding `batch` items of `frames`.
+fn smallest(family: &[Capacity], batch: usize, frames: usize) -> Option<&Capacity> {
+    family.iter().find(|&&(b, f, _)| b >= batch && f >= frames)
+}
+
+/// Indices into `pending` (most urgent first) of one launch: the first job's family, then each
+/// later job of that family while `fits(family, batch, frames)`, never a stream slot twice.
+fn pack(
+    pending: &[Job],
+    max_batch: usize,
+    fits: impl Fn(Family, usize, usize) -> bool,
+) -> Vec<usize> {
+    let family = pending[0].family();
+    let mut frames = pending[0].frames;
+    let mut take = vec![0];
+    for (k, j) in pending.iter().enumerate().skip(1) {
+        if take.len() >= max_batch {
+            break;
+        }
+        if j.family() != family
+            || j.step.is_some_and(|s| {
+                take.iter().any(|&t| {
+                    pending[t]
+                        .step
+                        .is_some_and(|o| o.slot.index == s.slot.index)
+                })
+            })
+        {
+            continue;
+        }
+        if !fits(family, take.len() + 1, frames.max(j.frames)) {
+            break;
+        }
+        frames = frames.max(j.frames);
+        take.push(k);
+    }
+    take
+}
+
 impl Bound {
-    /// The smallest capacity (of the window family when `window`) holding `batch` items of
-    /// `frames` frames.
-    fn capacity(&self, window: bool, batch: usize, frames: usize) -> Option<&Capacity> {
-        let family = if window {
-            &self.cached
-        } else {
-            &self.capacities
+    fn capacity(&self, family: Family, batch: usize, frames: usize) -> Option<&Capacity> {
+        let caps = match family {
+            Family::Decode => &self.capacities,
+            Family::Window => &self.cached,
+            Family::Step => &self.steps,
         };
-        family.iter().find(|&&(b, f, _)| b >= batch && f >= frames)
+        smallest(caps, batch, frames)
+    }
+
+    /// Why `j` cannot launch, if it cannot.
+    fn check(&self, j: &Job) -> Result<(), &'static str> {
+        if j.frames == 0 || j.codes.len() != j.frames * self.frame_codes {
+            return Err("codec job has no frames or a partial frame");
+        }
+        let Some(step) = j.step else { return Ok(()) };
+        if self.capacity(Family::Step, 1, j.frames).is_none() {
+            return Err("codec stream step exceeds every step capacity");
+        }
+        match &self.slots {
+            Some(pool) => pool.lock().check(step.slot, step.pos),
+            None => Err("codec packet has no stream steps"),
+        }
+    }
+
+    fn launch(&mut self, jobs: &[Job]) -> Result<Vec<Decoded>, String> {
+        if jobs[0].step.is_none() {
+            return self.decode(jobs);
+        }
+        let out = self.step(jobs);
+        if let Some(pool) = &self.slots {
+            let mut pool = pool.lock();
+            for j in jobs {
+                let s = j.step.expect("one family per launch");
+                match out {
+                    Ok(_) => pool.commit(s.slot, s.pos + j.frames),
+                    Err(_) => pool.fail(s.slot),
+                }
+            }
+        }
+        out
+    }
+
+    /// One launch of stream steps on distinct slots; padding items take other slots with n = 0
+    /// and pos = 1, which rewrites their state unchanged.
+    fn step(&mut self, jobs: &[Job]) -> Result<Vec<Decoded>, String> {
+        let frames = jobs.iter().map(|j| j.frames).max().unwrap_or(0);
+        let (cb, cn, programs) = self
+            .capacity(Family::Step, jobs.len(), frames)
+            .cloned()
+            .ok_or_else(|| {
+                format!(
+                    "{} x {frames} step frames exceeds every capacity",
+                    jobs.len()
+                )
+            })?;
+        let (fc, fs) = (self.frame_codes, self.frame_samples);
+        let io = self
+            .step_io
+            .as_mut()
+            .ok_or("codec packet has no stream steps")?;
+        let t0 = std::time::Instant::now();
+        io.codes_buf.clear();
+        io.codes_buf.resize(cb * cn * fc, 0);
+        let mut spare = (0..io.slots as u32).filter(|&s| {
+            !jobs
+                .iter()
+                .any(|j| j.step.is_some_and(|st| st.slot.index == s))
+        });
+        for b in 0..cb {
+            let (slot, pos, n) = match jobs.get(b) {
+                Some(j) => {
+                    let st = j.step.expect("one family per launch");
+                    for (d, &c) in io.codes_buf[b * cn * fc..].iter_mut().zip(&j.codes) {
+                        *d = c.clamp(0, i32::MAX) as u32;
+                    }
+                    (st.slot.index, st.pos as u32, j.frames as u32)
+                }
+                None => (spare.next().ok_or("no spare codec stream slot")?, 1, 0),
+            };
+            (io.slot_buf[b], io.pos_buf[b], io.n_buf[b]) = (slot, pos, n);
+            for r in 0..cn {
+                io.rope_buf[b * cn + r] = pos + r as u32;
+            }
+        }
+        let e = |x: crate::RuntimeError| x.to_string();
+        let rt = &mut self.runtime;
+        rt.write_tensor_at(self.codes, 0, bytemuck::cast_slice(&io.codes_buf))
+            .map_err(e)?;
+        rt.write_tensor(io.slot, bytemuck::cast_slice(&io.slot_buf))
+            .map_err(e)?;
+        rt.write_tensor(io.pos, bytemuck::cast_slice(&io.pos_buf))
+            .map_err(e)?;
+        rt.write_tensor(io.rope, bytemuck::cast_slice(&io.rope_buf))
+            .map_err(e)?;
+        for (&t, &(_, per_frame)) in io.n.iter().zip(&self.lengths) {
+            io.len_buf.clear();
+            io.len_buf.resize(t.bytes / 4, 0);
+            for (l, &n) in io.len_buf.iter_mut().zip(&io.n_buf[..cb]) {
+                *l = n * per_frame as u32;
+            }
+            rt.write_tensor(t, bytemuck::cast_slice(&io.len_buf))
+                .map_err(e)?;
+        }
+        let t1 = std::time::Instant::now();
+        rt.run_sequence(&programs).map_err(e)?;
+        let gpu_us = rt.last_run_us();
+        let t2 = std::time::Instant::now();
+        io.pcm_buf.resize(cb * cn * fs, 0.0);
+        rt.read_tensor_at(
+            self.pcm,
+            0,
+            bytemuck::cast_slice_mut(&mut io.pcm_buf[..cb * cn * fs]),
+        )
+        .map_err(e)?;
+        tracing::debug!(
+            target: "plowrt::tts::codec_launch",
+            jobs = jobs.len(),
+            step = true,
+            frames,
+            cb,
+            cf = cn,
+            h2d_us = (t1 - t0).as_micros() as u64,
+            run_us = (t2 - t1).as_micros() as u64,
+            gpu_us = gpu_us as u64,
+            d2h_us = t2.elapsed().as_micros() as u64,
+            "codec launch"
+        );
+        Ok(jobs
+            .iter()
+            .enumerate()
+            .map(|(b, j)| Decoded {
+                pcm: io.pcm_buf[b * cn * fs..][..j.frames * fs].to_vec(),
+                phase: Vec::new(),
+            })
+            .collect())
     }
 
     fn decode(&mut self, jobs: &[Job]) -> Result<Vec<Decoded>, String> {
         let frames = jobs.iter().map(|j| j.frames).max().unwrap_or(0);
         let window = jobs[0].window.is_some();
+        let family = if window {
+            Family::Window
+        } else {
+            Family::Decode
+        };
         let (cb, cf, programs) = self
-            .capacity(window, jobs.len(), frames)
+            .capacity(family, jobs.len(), frames)
             .cloned()
             .ok_or_else(|| {
                 format!(
@@ -634,57 +1071,50 @@ impl Bound {
     }
 }
 
-fn run(rx: mpsc::Receiver<Job>, mut codec: Bound) {
+fn run(rx: mpsc::Receiver<Msg>, mut codec: Bound) {
     let max_batch = codec
         .capacities
         .iter()
         .chain(&codec.cached)
+        .chain(&codec.steps)
         .map(|c| c.0)
         .max()
         .unwrap_or(1);
     let mut pending: Vec<Job> = Vec::new();
     while let Ok(first) = rx.recv() {
-        pending.push(first);
-        pending.extend(rx.try_iter());
+        for m in std::iter::once(first).chain(rx.try_iter()) {
+            match m {
+                Msg::Job(j) => pending.push(j),
+                // The stream is gone and no launch holds its slot: drop its queued step.
+                Msg::Release(id) => {
+                    pending.retain(|j| j.step.is_none_or(|s| s.slot != id));
+                    if let Some(pool) = &codec.slots {
+                        pool.lock().release(id);
+                    }
+                }
+            }
+        }
         // Most urgent first; within an urgency longest first, so a launch's capacity is mostly
         // set by its first job.
         pending.sort_by_key(|j| (j.urgency, std::cmp::Reverse(j.frames)));
         while !pending.is_empty() {
-            // One family per launch: the first job's, then the next jobs of that family that fit.
-            let window = pending[0].window.is_some();
-            let mut frames = pending[0].frames;
-            let mut take = vec![0];
-            for (k, j) in pending.iter().enumerate().skip(1) {
-                if take.len() >= max_batch {
-                    break;
+            // A failed launch or a committed step can turn a queued job unlaunchable.
+            let mut k = 0;
+            while k < pending.len() {
+                match codec.check(&pending[k]) {
+                    Ok(()) => k += 1,
+                    Err(e) => drop(pending.remove(k).reply.send(Err(e.into()))),
                 }
-                if j.window.is_some() != window {
-                    continue;
-                }
-                if codec
-                    .capacity(window, take.len() + 1, frames.max(j.frames))
-                    .is_none()
-                {
-                    break;
-                }
-                frames = frames.max(j.frames);
-                take.push(k);
             }
+            if pending.is_empty() {
+                break;
+            }
+            let take = pack(&pending, max_batch, |f, b, n| {
+                codec.capacity(f, b, n).is_some()
+            });
             let mut batch: Vec<Job> = take.iter().rev().map(|&k| pending.remove(k)).collect();
             batch.reverse();
-            if frames == 0
-                || batch
-                    .iter()
-                    .any(|j| j.codes.len() != j.frames * codec.frame_codes)
-            {
-                for j in batch {
-                    let _ = j
-                        .reply
-                        .send(Err("codec job has no frames or a partial frame".into()));
-                }
-                continue;
-            }
-            match codec.decode(&batch) {
+            match codec.launch(&batch) {
                 Ok(pcm) => {
                     for (j, p) in batch.into_iter().zip(pcm) {
                         let _ = j.reply.send(Ok(p));
@@ -702,7 +1132,104 @@ fn run(rx: mpsc::Receiver<Job>, mut codec: Bound) {
 
 #[cfg(test)]
 mod tests {
-    use super::should_yield;
+    use super::*;
+
+    fn job(window: bool, frames: usize, slot: Option<u32>) -> Job {
+        Job {
+            codes: Vec::new(),
+            frames,
+            seed: 0,
+            voice: 0,
+            urgency: Urgency::Stream,
+            window: window.then(Window::default),
+            step: slot.map(|index| Step {
+                slot: SlotId { index, gen: 0 },
+                pos: 0,
+            }),
+            reply: tokio::sync::oneshot::channel().0,
+            _work: None,
+        }
+    }
+
+    #[test]
+    fn slot_pool_lifecycle() {
+        let mut pool = SlotPool::new(2);
+        let a = pool.acquire().unwrap();
+        let b = pool.acquire().unwrap();
+        assert_ne!(a.index, b.index);
+        assert!(
+            pool.acquire().is_none(),
+            "exhausted: the stream decodes windows"
+        );
+        assert_eq!(pool.check(a, 0), Ok(()));
+        assert!(pool.check(a, 3).is_err(), "nothing committed yet");
+        pool.commit(a, 3);
+        assert_eq!(pool.check(a, 3), Ok(()));
+        assert!(pool.check(a, 2).is_err());
+        assert_eq!(pool.check(a, 0), Ok(()), "a restart");
+        pool.release(a);
+        assert!(pool.check(a, 0).is_err(), "released");
+        let c = pool.acquire().unwrap();
+        assert_eq!(c.index, a.index);
+        assert_ne!(c.gen, a.gen);
+        assert!(
+            pool.check(a, 0).is_err(),
+            "a stale job never runs on the reused slot"
+        );
+        assert_eq!(pool.check(c, 0), Ok(()), "a reused slot starts fresh");
+        pool.release(a);
+        assert_eq!(pool.check(c, 0), Ok(()), "a stale release is ignored");
+        pool.fail(b);
+        assert!(pool.check(b, 0).is_err(), "failed until released");
+        pool.release(b);
+        let d = pool.acquire().unwrap();
+        assert_eq!((d.index, pool.check(d, 0)), (b.index, Ok(())));
+    }
+
+    #[test]
+    fn steps_pack_into_the_smallest_capacity() {
+        let caps: Vec<Capacity> = [
+            (1, 1),
+            (1, 4),
+            (1, 17),
+            (4, 17),
+            (8, 17),
+            (16, 17),
+            (32, 17),
+        ]
+        .map(|(b, n)| (b, n, Vec::new()))
+        .to_vec();
+        let at = |b, n| smallest(&caps, b, n).map(|c| (c.0, c.1));
+        assert_eq!(at(1, 1), Some((1, 1)));
+        assert_eq!(at(1, 3), Some((1, 4)));
+        assert_eq!(at(1, 5), Some((1, 17)));
+        assert_eq!(at(2, 1), Some((4, 17)));
+        assert_eq!(at(5, 17), Some((8, 17)));
+        assert_eq!(at(33, 1), None);
+        assert_eq!(at(1, 18), None);
+
+        // One family per launch, never a slot twice, at most `max_batch`.
+        let pending = [
+            job(false, 4, Some(3)),
+            job(false, 9, None),
+            job(false, 2, Some(3)),
+            job(true, 2, None),
+            job(false, 17, Some(5)),
+            job(false, 1, Some(7)),
+        ];
+        let fits = |f: Family, b, n| {
+            assert_eq!(f, Family::Step);
+            at(b, n).is_some()
+        };
+        assert_eq!(pack(&pending, 32, fits), vec![0, 4, 5]);
+        assert_eq!(pack(&pending, 2, fits), vec![0, 4]);
+        // A job past every capacity ends the launch.
+        assert_eq!(
+            pack(&pending, 32, |_, b, n| at(b, n.min(16)).is_some() && n <= 4),
+            vec![0]
+        );
+        assert_eq!(pack(&pending[1..], 32, |_, _, _| true), vec![0]);
+    }
     use crate::serve::cosched::{Band, Due};
     use std::time::{Duration, Instant};
 

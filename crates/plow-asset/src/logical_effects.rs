@@ -11,6 +11,18 @@ use crate::program::{Packet, Program};
 pub(crate) fn outputs(d: &DevInst64) -> Result<&'static [usize], String> {
     use DevOp::*;
     let op = DevOp::from_u16(d.op).ok_or("unknown kernel effects")?;
+    if op == StreamTailF32 {
+        // Gather writes z from src + state; store writes state from z alone.
+        let (required, writes): (&[usize], &'static [usize]) = match d.i[7] {
+            0 => (&[0, 1, 2, 3, 4, 5], &[0]),
+            1 => (&[1, 2, 3, 4], &[2]),
+            _ => return Err("unknown stream-tail mode".into()),
+        };
+        if required.iter().any(|&slot| d.t[slot] == TENSOR_NONE16) {
+            return Err("missing required effect operand".into());
+        }
+        return Ok(writes);
+    }
     let required = match op {
         Nop => 0,
         ZeroF32 => 1,
@@ -440,6 +452,60 @@ mod tests {
             );
             assert_eq!(value["address_map"].as_array().unwrap().len(), 2);
             assert_eq!(value["protocol"]["waits"][2], json!([0, 1]));
+        });
+    }
+
+    #[test]
+    fn stream_tail_store_is_a_state_write_and_gather_reads_state() {
+        let mut b = Builder::new(1);
+        let [src, z, state, slot, n, pos] =
+            ["src", "z", "state", "slot", "n", "pos"].map(|name| b.tensor(name, 64));
+        let gather = b.emit(DevOp::StreamTailF32, vec![0], &[], |d| {
+            d.t[..6].copy_from_slice(&[z, src, state, slot, n, pos]);
+            d.i = [1, 2, 2, 4, 4, 0, 4, 0];
+            d.j[0] = 1;
+        });
+        b.emit(DevOp::StreamTailF32, vec![0], &[gather], |d| {
+            d.t[1..5].copy_from_slice(&[z, state, slot, n]);
+            d.i = [1, 2, 2, 4, 4, 0, 0, 1];
+            d.j[0] = 1;
+        });
+        let p = b.finish();
+        let model = Model {
+            n_cu: 1,
+            target: 0,
+            tensors: p.tensors.clone(),
+            progs: vec![p],
+            kv_row_insts: vec![],
+            prog_t: vec![1],
+            gen: vec![],
+        };
+        crate::program::with_model(&model, |packet| {
+            let insts = packet.programs[0].insts;
+            assert_eq!(outputs(&insts[0]).unwrap(), &[0]);
+            assert_eq!(outputs(&insts[1]).unwrap(), &[2]);
+            let value = obligation(packet, 0).unwrap();
+            let entry = |handle: u32| {
+                value["address_map"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .find(|e| e["name"] == format!("tensor:{handle}"))
+                    .unwrap()
+                    .clone()
+            };
+            assert_eq!(entry(state)["writers"], json!([2]));
+            assert_eq!(entry(state)["readers"], json!([1, 2]));
+            assert_eq!(entry(z)["writers"], json!([1]));
+            assert_eq!(entry(z)["readers"], json!([1, 2]));
+            let none = TENSOR_NONE16;
+            let (mut no_pos, mut no_z, mut bad_mode) = (insts[0], insts[1], insts[1]);
+            no_pos.t[5] = none;
+            no_z.t[1] = none;
+            bad_mode.i[7] = 2;
+            for inst in [no_pos, no_z, bad_mode] {
+                assert!(outputs(&inst).is_err());
+            }
         });
     }
 

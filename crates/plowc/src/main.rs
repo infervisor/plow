@@ -2266,14 +2266,18 @@ fn build_cubin_from_manifest(
     let mut extra: Vec<String> = req
         .iter()
         .filter(|d| {
-            [
-                "PLOW_NV_FA_GF=",
-                "PLOW_NV_QWEN_GDN=",
-                "PLOW_NV_GEMMA3=",
-                "PLOW_NV_FA_PIPE=",
-            ]
-            .iter()
-            .any(|p| d.starts_with(p))
+            d.starts_with("PLOW_NV_FA_GF=")
+                || d.starts_with("PLOW_NV_QWEN_GDN=")
+                || d.starts_with("PLOW_NV_FP8_M1=")
+                || d.starts_with("PLOW_NV_FP8_M1_TMA=")
+                || d.starts_with("PLOW_NV_FP8_M1_XCACHE=")
+                || d.starts_with("PLOW_NV_FP8_M1_FAST_ACCUM=")
+                || d.starts_with("PLOW_NV_FP8_M1_BK1024=")
+                || d.starts_with("PLOW_NV_QUANT_FP8_VLLM=")
+                || d.starts_with("PLOW_NV_TMA_GEMM=")
+                || d.starts_with("PLOW_NV_FP8_PF_SCALE_WFIRST=")
+                || d.starts_with("PLOW_NV_GEMMA3=")
+                || d.starts_with("PLOW_NV_FA_PIPE=")
         })
         .map(|d| format!("-D{d}"))
         .collect();

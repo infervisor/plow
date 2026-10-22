@@ -65,6 +65,8 @@ pub(super) struct SpecDraft {
     hidden_bytes: u64,
     hidden_snap: DeviceMem,
     hidden_at: Vec<Option<(u32, u32)>>,
+    /// Slots whose snapshot a launch is rewriting, keyed when it commits.
+    staged_saves: Vec<usize>,
 }
 
 fn reject(e: impl std::fmt::Display) -> RuntimeError {
@@ -223,6 +225,7 @@ impl SpecDraft {
             hidden_bytes,
             hidden_snap: e.be.alloc(0, hidden_bytes * e.batch as u64)?,
             hidden_at: vec![None; e.batch],
+            staged_saves: Vec::with_capacity(e.batch),
         })
     }
 
@@ -364,6 +367,37 @@ impl GpuEngine {
         Ok(())
     }
 
+    /// Draft `k` tokens now for each `(slot, pending token)` row whose hidden is ready (and whose
+    /// drafts stay inside the context): `out` gets `k` tokens per drafted row, in row order, and
+    /// `drafted[i]` says whether row `i` was.
+    pub fn spec_draft_rows(
+        &mut self,
+        rows: &[(usize, u32)],
+        k: u32,
+        drafted: &mut Vec<bool>,
+        out: &mut Vec<u32>,
+    ) -> Result<()> {
+        drafted.clear();
+        out.clear();
+        let mut stage = Vec::with_capacity(rows.len());
+        for &(slot, token) in rows {
+            let ok = self.spec_draft_ready(slot) && self.pos[slot] + k < self.max_ctx as u32;
+            if ok {
+                stage.push((slot, token, stage.len() as u32));
+            }
+            drafted.push(ok);
+        }
+        if stage.is_empty() || k == 0 {
+            drafted.fill(false);
+            return Ok(());
+        }
+        for &(slot, _, row) in &stage {
+            self.spec_hidden_restore(slot, row)?;
+        }
+        self.spec_draft_stage(&stage, k)?;
+        self.spec_draft_run(out)
+    }
+
     /// Launch the staged draft program without reading it back (bench timing).
     pub fn spec_draft_launch(&mut self) -> Result<()> {
         let d = self
@@ -405,6 +439,96 @@ impl GpuEngine {
         )?;
         d.hidden_at[b] = Some((self.slot_generations[b], pos));
         Ok(())
+    }
+
+    /// After a plain decode launch over `feeds` (hidden row = slot): snapshot every fed slot's
+    /// row in one copy, valid once the slot sits at `pos[b] + advance`. Unfed slots inside the
+    /// copied range lose their snapshot.
+    pub(super) fn spec_hidden_save_plain(
+        &mut self,
+        feeds: &[(usize, u32)],
+        advance: u32,
+    ) -> Result<()> {
+        let Some(d) = self.spec_draft.as_mut() else {
+            return Ok(());
+        };
+        let (Some(lo), Some(hi)) = (
+            feeds.iter().map(|f| f.0).min(),
+            feeds.iter().map(|f| f.0).max(),
+        ) else {
+            return Ok(());
+        };
+        if hi as u32 >= d.manifest.tensors.hidden_rows || hi >= d.hidden_at.len() {
+            return Ok(());
+        }
+        d.hidden_at[lo..=hi].fill(None);
+        let n = d.hidden_bytes;
+        self.be.memcpy_dtod_async(
+            d.hidden_snap.base + lo as u64 * n,
+            self.devp[usize::from(d.manifest.tensors.hidden)].base + lo as u64 * n,
+            (hi - lo + 1) as u64 * n,
+            &self.stream,
+        )?;
+        for &(b, _) in feeds {
+            d.hidden_at[b] = Some((self.slot_generations[b], self.pos[b] + advance));
+        }
+        Ok(())
+    }
+
+    /// Snapshot `(slot, row)` pairs of a `row_bytes`-pitched final-norm activation at `src`
+    /// (the packed terminal's), keyed by [`Self::spec_hidden_commit`] once the launch commits.
+    pub(super) fn spec_hidden_save_rows(
+        &mut self,
+        src: u64,
+        row_bytes: u64,
+        rows: impl Iterator<Item = (usize, u32)>,
+    ) -> Result<()> {
+        let Some(d) = self
+            .spec_draft
+            .as_mut()
+            .filter(|d| d.hidden_bytes == row_bytes)
+        else {
+            return Ok(());
+        };
+        let n = d.hidden_bytes;
+        for (b, row) in rows {
+            if b >= d.hidden_at.len() {
+                continue;
+            }
+            d.hidden_at[b] = None;
+            self.be.memcpy_dtod_async(
+                d.hidden_snap.base + b as u64 * n,
+                src + u64::from(row) * n,
+                n,
+                &self.stream,
+            )?;
+            d.staged_saves.push(b);
+        }
+        Ok(())
+    }
+
+    /// The launch whose rows [`Self::spec_hidden_save_rows`] copied committed: each copied
+    /// slot's snapshot is its hidden at its current position. `false` drops them.
+    pub(super) fn spec_hidden_commit(&mut self, committed: bool) {
+        let Some(d) = self.spec_draft.as_mut() else {
+            return;
+        };
+        for b in d.staged_saves.drain(..) {
+            if committed {
+                d.hidden_at[b] = Some((self.slot_generations[b], self.pos[b]));
+            }
+        }
+    }
+
+    /// A rewind can revisit a keyed position with another history.
+    pub(super) fn spec_hidden_forget(&mut self, b: usize) {
+        if let Some(slot) = self
+            .spec_draft
+            .as_mut()
+            .and_then(|d| d.hidden_at.get_mut(b))
+        {
+            *slot = None;
+        }
     }
 
     /// Put slot `b`'s saved hidden at row `row` of the hidden tensor for the next draft.

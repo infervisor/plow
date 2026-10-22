@@ -70,6 +70,7 @@ G_K(g_broadcast_add_f32);
 G_K(g_grouped_attention_f32);
 G_K(g_gather_rows_f32);
 G_K(g_copy_cols_f32);
+G_K(g_stream_tail_f32);
 G_K(g_conv1d_f32);
 G_K(g_conv_transpose1d_f32);
 G_K(g_unary_f32);

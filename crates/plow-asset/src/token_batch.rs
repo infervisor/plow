@@ -73,6 +73,10 @@ fn require(ok: bool, reason: &str) -> Result<()> {
 pub enum Phase {
     Decode,
     Prefill,
+    /// A decode request's pending token followed by draft tokens, at or past the prompt end:
+    /// every row is sampled (row `j` predicts the token after input `j`). Planned after the
+    /// prefill spans; the frontier advances over every row, and the caller commits fewer.
+    Verify,
 }
 
 /// Per-row selection policy, attached to the LOGICAL REQUEST and therefore independent of row
@@ -172,8 +176,8 @@ pub struct PendingCommit {
     pub new_frontier: u32,
     /// The prompt is complete after this span, including spans already in decode.
     pub completes_prompt: bool,
-    /// Index into [`Plan::sample_input_rows`] / [`Plan::sample_owners`], or `None` for an
-    /// intermediate chunk that produces no output.
+    /// Index into [`Plan::sample_input_rows`] / [`Plan::sample_owners`] (the first of a verify
+    /// span's `n_rows`), or `None` for an intermediate chunk that produces no output.
     pub sample_index: Option<u32>,
 }
 
@@ -321,6 +325,13 @@ fn plan_inner(
                 .enumerate()
                 .filter(|(_, r)| r.phase == Phase::Prefill)
                 .map(|(i, _)| i),
+        )
+        .chain(
+            requests
+                .iter()
+                .enumerate()
+                .filter(|(_, r)| r.phase == Phase::Verify)
+                .map(|(i, _)| i),
         );
 
     for (position, index) in order.clone().enumerate() {
@@ -380,6 +391,13 @@ fn plan_inner(
                 )?;
                 end == request.prompt_len
             }
+            Phase::Verify => {
+                require(
+                    start >= request.prompt_len && request.prompt_len > 0,
+                    "verify span must start at or past the prompt end",
+                )?;
+                true
+            }
         };
 
         let row0 = u32::try_from(out.input_ids.len()).map_err(|_| "token batch: row offset")?;
@@ -406,13 +424,20 @@ fn plan_inner(
             // the next token. For a completing prompt that is the prompt's FINAL input token,
             // included in the body normally and sampled here, rather than replayed through a
             // decode pass.
-            out.sample_input_rows.push(row0 + n_rows - 1);
-            out.sample_owners.push(SampleOwner {
-                request: request.id,
-                slot: request.slot,
-                generation: request.generation,
-                selection: request.selection,
-            });
+            let first = if request.phase == Phase::Verify {
+                0
+            } else {
+                n_rows - 1
+            };
+            for row in row0 + first..row0 + n_rows {
+                out.sample_input_rows.push(row);
+                out.sample_owners.push(SampleOwner {
+                    request: request.id,
+                    slot: request.slot,
+                    generation: request.generation,
+                    selection: request.selection,
+                });
+            }
             s
         });
         out.pending.push(PendingCommit {

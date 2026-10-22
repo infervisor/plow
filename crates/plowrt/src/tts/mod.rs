@@ -18,6 +18,8 @@ pub mod guided_speech;
 #[cfg(feature = "cuda")]
 pub mod realtime;
 #[cfg(feature = "cuda")]
+pub mod ref_encoder;
+#[cfg(feature = "cuda")]
 pub mod serving;
 #[cfg(feature = "cuda")]
 pub mod text_encoder;
@@ -68,6 +70,20 @@ pub struct SpeechContract {
     pub instructions: Option<String>,
     /// Sub-bundle of the encoder-mode packet whose output rows are the prompt's embeddings.
     pub text_encoder: Option<String>,
+    /// Voice cloning through a reference encoder packet beside the LM.
+    pub clone: Option<CloneContract>,
+}
+
+/// A cloning prompt: `head`, the reference transcript's prompt text, `mid`, the reference frames
+/// (one frame token each), an end frame whose every code is `eos_code` (if any), `tail`, then the
+/// text's prompt text and the suffix. `head` and `tail` default to the prompt prefix.
+#[derive(Clone, Debug, PartialEq)]
+pub struct CloneContract {
+    pub encoder: String,
+    pub head: Vec<u32>,
+    pub mid: Vec<u32>,
+    pub tail: Vec<u32>,
+    pub eos_code: Option<u32>,
 }
 
 impl SpeechContract {
@@ -89,7 +105,7 @@ impl SpeechContract {
                 .collect()
         };
         let f32p = |k: &str| get(k).map(|v| f32::from_bits(v as u32));
-        let c = SpeechContract {
+        let mut c = SpeechContract {
             pipeline: p.name.clone(),
             prompt_template: p.strings.get("prompt.template").cloned().ok_or_else(|| {
                 RuntimeError::Rejected("speech pipeline lacks prompt.template".into())
@@ -124,7 +140,32 @@ impl SpeechContract {
             breeze_sampler: get("frames.depth_sampler").unwrap_or(0) == 1,
             instructions: p.strings.get("prompt.instructions").cloned(),
             text_encoder: p.strings.get("text.encoder").cloned(),
+            clone: None,
         };
+        if let Some(encoder) = p.strings.get("clone.encoder") {
+            let listed = |k: &str, or: &[u32]| -> Result<Vec<u32>> {
+                match p.strings.get(k) {
+                    Some(ids) => ids
+                        .split_ascii_whitespace()
+                        .map(|id| {
+                            id.parse().map_err(|_| {
+                                RuntimeError::Rejected(format!(
+                                    "speech pipeline {k}: bad id {id:?}"
+                                ))
+                            })
+                        })
+                        .collect(),
+                    None => Ok(or.to_vec()),
+                }
+            };
+            c.clone = Some(CloneContract {
+                encoder: encoder.clone(),
+                head: listed("clone.head", &c.prefix)?,
+                mid: listed("clone.mid", &[])?,
+                tail: listed("clone.tail", &c.prefix)?,
+                eos_code: p.parameters.get("clone.eos_code").map(|&v| v as u32),
+            });
+        }
         if !c.prompt_template.contains("{input}") || !c.voice_token.contains("{voice}") {
             return Err(RuntimeError::Rejected(
                 "speech prompt templates need {input} and {voice}".into(),
@@ -224,7 +265,7 @@ impl SpeechContract {
             // Breeze guides against the uninstructed prompt: w = s - 1, off by default.
             cfg_weight: self.depth_cfg().then_some(0.0),
             instructions: self.instructions.is_some(),
-            voice_cloning: false,
+            voice_cloning: self.clone.is_some(),
         }
     }
 

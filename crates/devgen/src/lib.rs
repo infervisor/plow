@@ -83,8 +83,10 @@ mod dense_cublaslt;
 pub mod dispatch_audit;
 pub mod fish_codec;
 mod fish_depth;
+pub mod fish_encoder;
 mod gemv_decode_role;
 pub mod manifest;
+pub mod mimi_encoder;
 pub mod mm;
 pub mod modular;
 mod mtp;
@@ -1891,6 +1893,10 @@ fn tiles(m: u32, n: u32) -> u32 {
     m.div_ceil(BM) * n.div_ceil(BN)
 }
 
+/// Every tensor the model touches. Prefill and decode SHARE this table: the KV cache is
+/// written by prefill and appended to by decode, and the 57 GiB of weights is not getting
+/// loaded twice.
+#[allow(dead_code)]
 /// Span-mode decode rows are declared only for FP8-KV packets; other KV formats refuse the knob.
 fn span_verify_on(fp8_kv: bool) -> bool {
     let on = emit_config::active().span_verify;
@@ -1898,10 +1904,6 @@ fn span_verify_on(fp8_kv: bool) -> bool {
     on
 }
 
-/// Every tensor the model touches. Prefill and decode SHARE this table: the KV cache is
-/// written by prefill and appended to by decode, and the 57 GiB of weights is not getting
-/// loaded twice.
-#[allow(dead_code)]
 struct Tn {
     ids: u32,
     encoder_overlay: u32,
@@ -11470,6 +11472,23 @@ fn emit_dense_gqa(
         speech_ops |= manifest::speech_ops(&model);
         write_sidecar_packet(&path, &model, &[section]);
         eprintln!("  codec packet -> {}", path.display());
+        let enc = dir.join("encoder");
+        if enc.join("config.json").is_file() {
+            let fish = std::fs::read(enc.join("config.json"))
+                .ok()
+                .and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok())
+                .is_some_and(|v| v["model_type"] == "fish_dac_encoder");
+            let (model, section) = if fish {
+                fish_encoder::lower_fish_encoder(&enc, n_cu, m.target)
+            } else {
+                mimi_encoder::lower_mimi_encoder(&enc, n_cu, m.target)
+            }
+            .unwrap_or_else(|error| panic!("reference encoder packet: {error}"));
+            let path = std::path::Path::new(&out).with_file_name(mimi_encoder::PACKET);
+            speech_ops |= manifest::speech_ops(&model);
+            write_sidecar_packet(&path, &model, &[section]);
+            eprintln!("  reference encoder packet -> {}", path.display());
+        }
     }
     if let Some(dir) = ecfg.tts_vocoder.as_deref().filter(|_| !block_mode) {
         let sites = whole_graph_audio_sites().1;

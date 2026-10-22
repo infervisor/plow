@@ -928,6 +928,9 @@ pub fn plan_requests_into_cover(
                     prompt_len: request.prompt_len,
                 });
             }
+            Phase::Verify => {
+                return Err("mixed step: verify spans run only in the unified token batch".into())
+            }
         }
     }
     plan_into_cover(

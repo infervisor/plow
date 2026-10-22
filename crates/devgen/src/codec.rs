@@ -608,6 +608,7 @@ pub(crate) struct Conv {
     pub(crate) pad: u32,
     /// Right pad (a transposed conv's right crop) when it differs from `pad`: causal convs.
     pub(crate) pad_after: Option<u32>,
+    /// Per-item valid input rows; `TENSOR_NONE` = every row.
     pub(crate) len: u32,
     pub(crate) act_in: Activation,
     pub(crate) act_out: Activation,
@@ -730,7 +731,7 @@ pub(crate) fn fused_conv(
             None
         },
         residual: if fuse_res { c.residual } else { None },
-        lengths: Some(c.len),
+        lengths: (c.len != packet::dev::TENSOR_NONE).then_some(c.len),
         batch: c.batch,
         in_rows: c.in_rows,
         in_channels: c.cin,

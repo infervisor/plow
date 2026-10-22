@@ -266,6 +266,19 @@ pub(crate) fn layer_scalars(dir: &Path, layers: u32, prefix: &str) -> Vec<f32> {
     out
 }
 
+/// Every tensor name `dir`'s shards carry, verbatim; empty when it has no shards.
+pub(crate) fn shipped_names(dir: &Path) -> HashSet<String> {
+    let has_shards = std::fs::read_dir(dir).is_ok_and(|rd| {
+        rd.filter_map(Result::ok)
+            .any(|e| e.path().extension().and_then(|x| x.to_str()) == Some("safetensors"))
+    });
+    if has_shards {
+        ckpt_names_all(dir)
+    } else {
+        HashSet::new()
+    }
+}
+
 /// Every tensor name the checkpoint actually ships, unfiltered.
 fn ckpt_names_all(dir: &Path) -> HashSet<String> {
     let mut out = HashSet::new();

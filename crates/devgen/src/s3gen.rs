@@ -1186,6 +1186,7 @@ impl Lowering<'_> {
                         key_length_heads: HEADS,
                         prefix: None,
                         window: 0,
+                        stream: None,
                     },
                 )
             },
@@ -1711,6 +1712,7 @@ impl Lowering<'_> {
                                 h16: self.cfg.attn_h16,
                             }),
                             window: 0,
+                            stream: None,
                         },
                     )
                 },
@@ -1742,6 +1744,7 @@ impl Lowering<'_> {
                     key_length_heads: 0,
                     prefix: None,
                     window: 0,
+                    stream: None,
                 },
             )
         })?;

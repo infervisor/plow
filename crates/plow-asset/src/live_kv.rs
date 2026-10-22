@@ -460,8 +460,7 @@ impl Manifest {
                             && d.i[0] == p.rows
                             && (d.i[2], d.i[6], d.i[3], d.i[4], d.i[7])
                                 == (c.heads, c.hd, c.stride, c.window, c.mask)
-                            && (!fp8
-                                || d.fj[2] == self.row_slot.map_or(0, u32::from))
+                            && (!fp8 || d.fj[2] == self.row_slot.map_or(0, u32::from))
                     };
                     // A repeated reader of one pair is KV sharing (Gemma-4 E-series), same geometry.
                     require(valid, "attention reader contract")?;
@@ -567,7 +566,11 @@ impl Manifest {
                                         // Span mode: every decode FP8 writer carries the map.
                                         d.t[7]
                                             == match self.row_slot {
-                                                Some(r) if !prefill && op == DevOp::HeadNormRopeFp8 => r,
+                                                Some(r)
+                                                    if !prefill && op == DevOp::HeadNormRopeFp8 =>
+                                                {
+                                                    r
+                                                }
                                                 _ => TENSOR_NONE16,
                                             }
                                     })
@@ -657,10 +660,16 @@ fn direct_operands(op: DevOp, d: &DevInst64, packet: &Packet<'_>) -> Result<()> 
             if d.i[6] == 0 && d.i[7] == 0 {
                 return Ok(());
             }
+            // The M=1 TMA path streams activations without a map and tiles weights at 64 rows.
+            let m1 = op == DevOp::GemmFp8 && d.i[0] == 1 && d.i[6] == 0;
+            require(d.i[6] != 0 || m1, "missing FP8 GEMM tensor-map operands")?;
             for (handle, source, rows) in [
                 (d.i[6], d.t[1], u64::from(d.i[0]) + u64::from(d.i[4])),
                 (d.i[7], d.t[2], u64::from(d.i[1])),
             ] {
+                if handle == 0 && m1 {
+                    continue;
+                }
                 let mut generators = packet.generated.iter().filter(|g| g.tensor == handle);
                 let g = generators
                     .next()
@@ -677,7 +686,7 @@ fn direct_operands(op: DevOp, d: &DevInst64, packet: &Packet<'_>) -> Result<()> 
                         && g.hd % 128 == 0
                         && rows > 0
                         && rows <= u64::from(g.ctx)
-                        && g.scale == 128
+                        && g.scale == if m1 { 64 } else { 128 }
                         && packet
                             .tensors
                             .get(handle as usize)

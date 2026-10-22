@@ -54,7 +54,9 @@ impl TextEncoder {
     /// `[ids.len()][width]` f32 rows for one segment.
     pub fn encode(&self, ids: &[u32]) -> Result<Vec<f32>, String> {
         let n = ids.len();
+        let t = std::time::Instant::now();
         let mut e = self.e.lock();
+        let wait = t.elapsed();
         if n == 0 || n > e.pf_max_rows() {
             return Err(format!(
                 "text segment of {n} tokens; the encoder takes 1..={}",
@@ -83,6 +85,12 @@ impl TextEncoder {
             Ok(raw)
         };
         let raw = run(&mut e).map_err(|err| format!("text encoder: {err}"))?;
+        tracing::debug!(
+            rows = n,
+            wait_us = wait.as_micros() as u64,
+            us = (t.elapsed() - wait).as_micros() as u64,
+            "text encode"
+        );
         Ok(raw
             .chunks_exact(2)
             .map(|b| f32::from_bits(u32::from(u16::from_le_bytes([b[0], b[1]])) << 16))

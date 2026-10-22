@@ -98,7 +98,7 @@ mod shared_tail;
 pub mod spec;
 mod spec_draft;
 mod spec_serve;
-pub use spec_serve::{SpecLimits, SpecRow, SpecTick, SpecTickBufs};
+pub use spec_serve::{SpecLimits, SpecRow, SpecTick};
 mod token_batch;
 use cublaslt::{CublasLtDecodeRoute, LibraryRoute};
 use decode_rung::{
@@ -2721,6 +2721,9 @@ pub struct GpuEngine {
     seq_tokens: Vec<Vec<u32>>,
     /// A prompt's prefix-cache key staged for the next attach of that slot (DP router hashes).
     staged_prefix: Vec<Option<crate::memory::vmm::PrefixKey>>,
+    /// The slot's prompt rows are not determined by its ids (frame codes beside them): its first
+    /// prefill chunk never attaches a cached prefix.
+    prefix_attach_off: Vec<bool>,
     /// A launch's host window is open ([`Self::token_batch_step_window`]): snapshot restores skip
     /// their stream drain and their holds wait in `deferred_attach` for the step's own drain.
     window_open: bool,
@@ -2814,6 +2817,8 @@ pub struct GpuEngine {
     /// the next decode launch is one.
     row_slot_twin: Option<(Arc<BoundDecodeObject>, Arc<BoundDecodeObject>)>,
     span_launch: bool,
+    /// Verdicts of token-batch verify spans not yet taken by the scheduler.
+    tb_verdicts: Vec<(usize, u32, crate::orch::speculative::SpecVerdict)>,
     /// Per slot, one past the highest KV row any launch wrote (verify writes past `pos`).
     kv_hw: Vec<u32>,
     /// Bench-only launch overrides ([`Self::set_debug_min_rung`], [`Self::set_debug_nsplit_kvlen`]).
@@ -7376,6 +7381,7 @@ impl GpuEngine {
             kv_pressure_events: 0,
             seq_tokens: vec![Vec::new(); batch],
             staged_prefix: vec![None; batch],
+            prefix_attach_off: vec![false; batch],
             window_open: false,
             deferred_attach: Vec::new(),
             window_event: None,
@@ -7428,6 +7434,7 @@ impl GpuEngine {
             spec_draft: None,
             row_slot_twin,
             span_launch: false,
+            tb_verdicts: Vec::new(),
             kv_hw: vec![0; batch],
             debug_min_rows: 0,
             debug_nsplit_kvlen: None,
@@ -8034,6 +8041,7 @@ impl GpuEngine {
         }
         self.seq_tokens[b].truncate(len);
         self.pos[b] = len as _;
+        self.spec_hidden_forget(b);
         Ok(())
     }
 
@@ -8100,6 +8108,7 @@ impl GpuEngine {
 
     pub fn retire_slot(&mut self, b: usize, cache_output: bool) {
         self.staged_prefix[b] = None;
+        self.prefix_attach_off[b] = false;
         if let Some(p) = self.pipe.as_mut() {
             if p.queue.defer_retire(b, cache_output) {
                 return;
@@ -8146,6 +8155,7 @@ impl GpuEngine {
 
     fn reset_packed_admission(&mut self, b: usize) {
         self.staged_prefix[b] = None;
+        self.prefix_attach_off[b] = false;
         if self.packed_admission[b] == PackedAdmission::Ready {
             self.kv_admission_epoch = self.kv_admission_epoch.wrapping_add(1);
         }
@@ -8567,6 +8577,7 @@ impl GpuEngine {
             tracing::warn!(launch_rows, ?feeds, ?pos, error = %e, "decode launch failed");
             e
         })?;
+        self.spec_hidden_save_plain(feeds, 1)?;
         if let Some(t) = &self.timing {
             self.be.event_record(&t.ev[2], &self.stream)?;
         }
@@ -9523,6 +9534,7 @@ impl GpuEngine {
         }
         self.reset_selected_decode_counters(rung)?;
         self.launch_selected_decode(rung)?;
+        self.spec_hidden_save_plain(feeds, 1)?;
         let mut a_ids = self.devp[self.t_ids].base;
         let mut a_pos = self.devp[self.t_pos].base;
         let mut a_kvl = self.devp[self.t_kvlen].base;
@@ -11522,7 +11534,7 @@ impl GpuEngine {
         }
         // VMM: first chunk of a fresh sequence consults the prefix cache —
         // a hit shares the whole-block prefix and moves the frontier there.
-        if self.pos[b] == 0 && self.vmm_prefix_enabled() {
+        if self.pos[b] == 0 && self.vmm_prefix_enabled() && !self.prefix_attach_off[b] {
             self.vmm_attach(b, prompt, None)?;
         }
         let c0 = self.pos[b] as usize;

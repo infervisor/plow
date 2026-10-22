@@ -179,7 +179,8 @@ pub fn op_classes(op: DevOp) -> &'static [&'static str] {
         | HyperConnPost
         | CausalDepthwiseConv1dF32
         | LstmCellF32
-        | CumSumF64 => &["recurrent"],
+        | CumSumF64
+        | StreamTailF32 => &["recurrent"],
 
         Argmax | ArgmaxFin | GemvArgmax | RowGather | ArgmaxF32 => &["sample"],
 

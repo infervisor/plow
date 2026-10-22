@@ -410,6 +410,35 @@ pub struct CopyColsF32Stage<'a> {
     pub out_offset: u32,
 }
 
+/// [`DevOp::StreamTailF32`] mode.
+#[derive(Clone, Copy)]
+pub enum StreamTailF32Mode<'a> {
+    /// `output` = `z`: the carried tail (zeros on a fresh stream) then `rows` source rows.
+    Gather {
+        output: TensorRef<'a>,
+        src: u32,
+        pos: u32,
+        src_stride: u32,
+    },
+    /// The state takes `z` rows `[n[b], n[b] + tail)`.
+    Store { z: u32 },
+}
+
+#[derive(Clone, Copy)]
+pub struct StreamTailF32Stage<'a> {
+    pub mode: StreamTailF32Mode<'a>,
+    pub state: TensorRef<'a>,
+    pub slot: u32,
+    pub n: u32,
+    pub items: u32,
+    pub slots: u32,
+    pub tail: u32,
+    pub rows: u32,
+    pub cols: u32,
+    pub z_cols: u32,
+    pub z_col0: u32,
+}
+
 /// [`DevOp::Conv1dF32`] (`transpose == false`) or [`DevOp::ConvTranspose1dF32`]. For the
 /// transpose, `dilation_or_output_padding` is the output padding and the pads are crops.
 #[derive(Clone, Copy)]
@@ -629,6 +658,18 @@ pub struct AttentionF32Stage<'a> {
     /// Causal sliding window (flag bits 16..31): key `j` is visible from row `r` iff
     /// `r - window < j <= r`; 0 = unbounded.
     pub window: u32,
+    /// Stream mode (flag bit 3): see [`AttentionStream`].
+    pub stream: Option<AttentionStream>,
+}
+
+/// Stream mode for [`AttentionF32Stage`]: query, key and value share each item's `kv_rows` rows;
+/// the first `history` are carried keys (a [`DevOp::StreamTailF32`] gather), query `r` is row
+/// `history + r` (`kv_rows = history + q_rows`), and keys before `history - min(pos[b], history)`
+/// are absent (`pos`: u32 stream position per item).
+#[derive(Clone, Copy)]
+pub struct AttentionStream {
+    pub pos: u32,
+    pub history: u32,
 }
 
 /// A key prefix for [`AttentionF32Stage`]: item `b` first attends to the `rows` rows of block
@@ -1390,6 +1431,88 @@ impl StageProgram {
         })
     }
 
+    /// [`DevOp::StreamTailF32`]: the emitted output is `z` (gather) or the state (store).
+    pub fn stream_tail_f32(
+        &mut self,
+        deps: &[u32],
+        stage: StreamTailF32Stage<'_>,
+    ) -> Result<Emitted, String> {
+        if stage.items == 0
+            || stage.slots == 0
+            || stage.tail == 0
+            || stage.rows == 0
+            || stage.cols == 0
+            || u64::from(stage.z_col0) + u64::from(stage.cols) > u64::from(stage.z_cols)
+        {
+            return Err("invalid stream-tail geometry".into());
+        }
+        let state_bytes = f32_bytes(product(&[stage.slots, stage.tail, stage.cols])?)?;
+        let state = self.resolve(stage.state, state_bytes, "stream-tail state")?;
+        let per_item = u64::from(stage.items) * 4;
+        self.input(stage.slot, per_item, "stream-tail slots")?;
+        self.input(stage.n, per_item, "stream-tail new rows")?;
+        let z_rows = stage
+            .tail
+            .checked_add(stage.rows)
+            .ok_or("stream-tail rows overflow")?;
+        let z_elements = product(&[stage.items, z_rows, stage.z_cols])?;
+        let z_bytes = f32_bytes(z_elements)?;
+        let ints = |src_stride, mode| {
+            [
+                stage.items,
+                stage.tail,
+                stage.rows,
+                stage.cols,
+                stage.z_cols,
+                stage.z_col0,
+                src_stride,
+                mode,
+            ]
+        };
+        match stage.mode {
+            StreamTailF32Mode::Gather {
+                output,
+                src,
+                pos,
+                src_stride,
+            } => {
+                self.input(pos, per_item, "stream-tail positions")?;
+                let span = (product(&[stage.items, stage.rows])? - 1) * u64::from(src_stride)
+                    + u64::from(stage.z_cols);
+                self.input(src, f32_bytes(span)?, "stream-tail source")?;
+                let z = self.resolve(output, z_bytes, "stream-tail output")?;
+                let elements = u32_elements(z_elements, "stream-tail gather")?;
+                self.emit(
+                    DevOp::StreamTailF32,
+                    u64::from(elements).div_ceil(2048),
+                    deps,
+                    z,
+                    |d| {
+                        d.t[..6].copy_from_slice(&[z, src, state, stage.slot, stage.n, pos]);
+                        d.i = ints(src_stride, 0);
+                        d.j = [stage.slots, 0];
+                    },
+                )
+            }
+            StreamTailF32Mode::Store { z } => {
+                self.input(z, z_bytes, "stream-tail z")?;
+                let elements = product(&[stage.items, stage.tail, stage.cols])?;
+                u32_elements(elements, "stream-tail store")?;
+                self.emit(
+                    DevOp::StreamTailF32,
+                    elements.div_ceil(2048),
+                    deps,
+                    state,
+                    |d| {
+                        d.t[1..5].copy_from_slice(&[z, state, stage.slot, stage.n]);
+                        d.i = ints(0, 1);
+                        d.j = [stage.slots, 0];
+                    },
+                )
+            }
+        }
+    }
+
     /// [`DevOp::Conv1dF32`], or [`DevOp::ConvTranspose1dF32`] with `transpose`.
     pub fn conv1d_f32(
         &mut self,
@@ -1819,6 +1942,26 @@ impl StageProgram {
         if stage.window != 0 && (!stage.causal || stage.window > 0xFFFF || stage.prefix.is_some()) {
             return Err("attention window: causal, at most 65535 rows, no prefix".into());
         }
+        if let Some(st) = stage.stream {
+            if !stage.causal
+                || stage.prefix.is_some()
+                || stage.bias.is_some()
+                || stage.relative
+                || stage.key_length_heads != 0
+                || st.history == 0
+                || stage.kv_rows != st.history + stage.q_rows
+            {
+                return Err(
+                    "attention stream: causal, no prefix or bias, kv_rows = history + q_rows"
+                        .into(),
+                );
+            }
+            self.input(
+                st.pos,
+                u64::from(stage.batch) * 4,
+                "attention stream positions",
+            )?;
+        }
         if let Some(p) = stage.prefix {
             if stage.bias.is_some() || stage.causal || p.rows == 0 {
                 return Err(
@@ -1859,7 +2002,7 @@ impl StageProgram {
         let output = self.resolve(stage.output, f32_bytes(out_elements)?, "attention output")?;
         // head_width 64 runs 3xTF32 tensor cores (flag bit 1), one block per run of 8 16-row query
         // tiles in each item's (head, tile) order (per head when a head has a single tile).
-        let tc = stage.head_width == 64;
+        let tc = stage.head_width == 64 && stage.stream.is_none();
         let n16 = stage.q_rows.div_ceil(16);
         let units = match (tc, n16 >= 2) {
             (true, true) => {
@@ -1881,7 +2024,11 @@ impl StageProgram {
                 stage.key_lengths.unwrap_or(packet::dev::TENSOR_NONE),
                 bias,
                 stage.prefix.map_or(packet::dev::TENSOR_NONE, |p| p.table),
-                stage.prefix.map_or(packet::dev::TENSOR_NONE, |p| p.index),
+                stage
+                    .prefix
+                    .map(|p| p.index)
+                    .or(stage.stream.map(|st| st.pos))
+                    .unwrap_or(packet::dev::TENSOR_NONE),
             ]);
             d.i = [
                 stage.batch,
@@ -1893,10 +2040,14 @@ impl StageProgram {
                 u32::from(stage.causal)
                     | (u32::from(tc) << 1)
                     | (u32::from(stage.relative) << 2)
+                    | (u32::from(stage.stream.is_some()) << 3)
                     | (u32::from(stage.prefix.is_some_and(|p| p.h16)) << 4)
                     | (stage.key_length_heads << 8)
                     | (stage.window << 16),
-                stage.prefix.map_or(stage.bias_head_stride, |p| p.rows),
+                stage.prefix.map_or(
+                    stage.stream.map_or(stage.bias_head_stride, |st| st.history),
+                    |p| p.rows,
+                ),
             ];
             d.f[0] = stage.scale;
             d.j = [stage.k_col0, stage.v_col0];
@@ -2777,6 +2928,7 @@ mod tests {
                 h16,
             }),
             window: 0,
+            stream: None,
         };
         assert!(p
             .attention_f32(h[0], h[0], h[0], &[f.done], attention(48, true))
@@ -2794,6 +2946,139 @@ mod tests {
             (Some(DevOp::CopyColsF32), 1)
         );
         assert_eq!(insts[1].i[6], 2 | 16);
+    }
+
+    #[test]
+    fn stream_tail_gather_store_and_validation() {
+        let (b, slots, tail, rows, cols, z_cols, z_col0) =
+            (3u32, 4u32, 6u32, 10u32, 32u32, 48u32, 8u32);
+        let (prefix, h) = prefix_with(&[
+            ("src", u64::from(b * rows * 64) * 4),
+            ("slot", 12),
+            ("n", 12),
+            ("pos", 12),
+        ]);
+        let mut p = prefix.program();
+        let stage = |mode, tail, rows, cols, z_col0| StreamTailF32Stage {
+            mode,
+            state: TensorRef::Named("state.tail"),
+            slot: h[1],
+            n: h[2],
+            items: b,
+            slots,
+            tail,
+            rows,
+            cols,
+            z_cols,
+            z_col0,
+        };
+        let gather = |src_stride| StreamTailF32Mode::Gather {
+            output: TensorRef::Named("z"),
+            src: h[0],
+            pos: h[3],
+            src_stride,
+        };
+        for (tail, rows, cols, z_col0) in [
+            (0, rows, cols, z_col0),
+            (tail, 0, cols, z_col0),
+            (tail, rows, z_cols + 1, 0),
+            (tail, rows, cols, z_cols - cols + 1),
+        ] {
+            assert!(p
+                .stream_tail_f32(&[], stage(gather(64), tail, rows, cols, z_col0))
+                .is_err());
+        }
+        assert!(p
+            .stream_tail_f32(&[], stage(gather(65), tail, rows, cols, z_col0))
+            .is_err());
+        let g = p
+            .stream_tail_f32(&[], stage(gather(64), tail, rows, cols, z_col0))
+            .unwrap();
+        let st = p
+            .stream_tail_f32(
+                &[g.done],
+                stage(
+                    StreamTailF32Mode::Store { z: g.output },
+                    tail,
+                    rows,
+                    cols,
+                    z_col0,
+                ),
+            )
+            .unwrap();
+        let prefix = p.finish(0);
+        let tensors = &prefix.model.tensors;
+        let insts = &prefix.model.progs[0].insts;
+        assert_eq!(insts.len(), 2);
+        assert_eq!(
+            tensors[g.output as usize].bytes,
+            u64::from(b * (tail + rows) * z_cols) * 4
+        );
+        assert_eq!(
+            tensors[st.output as usize].bytes,
+            u64::from(slots * tail * cols) * 4
+        );
+        assert_eq!(DevOp::from_u16(insts[0].op), Some(DevOp::StreamTailF32));
+        assert_eq!(
+            insts[0].t[..6],
+            [g.output, h[0], st.output, h[1], h[2], h[3]]
+        );
+        assert_eq!(insts[0].i, [b, tail, rows, cols, z_cols, z_col0, 64, 0]);
+        assert_eq!(insts[0].j, [slots, 0]);
+        assert_eq!(insts[1].t[0], packet::dev::TENSOR_NONE);
+        assert_eq!(insts[1].t[1..5], [g.output, st.output, h[1], h[2]]);
+        assert_eq!(insts[1].t[5], packet::dev::TENSOR_NONE);
+        assert_eq!(insts[1].i, [b, tail, rows, cols, z_cols, z_col0, 0, 1]);
+        assert!(!prefix.model.to_blob().is_empty());
+    }
+
+    #[test]
+    fn attention_stream_encodes_history_and_positions() {
+        let (b, hist, n, width) = (3u32, 127u32, 17u32, 4 * 64u32);
+        let (prefix, h) = prefix_with(&[
+            ("z", u64::from(b * (hist + n) * 3 * width) * 4),
+            ("pos", u64::from(b) * 4),
+        ]);
+        let stage = |kv_rows, causal, stream| AttentionF32Stage {
+            output: TensorRef::Named("ctx"),
+            key_lengths: None,
+            bias: None,
+            batch: b,
+            q_rows: n,
+            kv_rows,
+            heads: 4,
+            head_width: 64,
+            in_stride: 3 * width,
+            k_col0: width,
+            v_col0: 2 * width,
+            causal,
+            scale: 0.125,
+            bias_head_stride: 0,
+            relative: false,
+            key_length_heads: 0,
+            prefix: None,
+            window: 128,
+            stream,
+        };
+        let st = Some(AttentionStream {
+            pos: h[1],
+            history: hist,
+        });
+        let mut p = prefix.program();
+        assert!(p
+            .attention_f32(h[0], h[0], h[0], &[], stage(hist + n + 1, true, st))
+            .is_err());
+        assert!(p
+            .attention_f32(h[0], h[0], h[0], &[], stage(hist + n, false, st))
+            .is_err());
+        p.attention_f32(h[0], h[0], h[0], &[], stage(hist + n, true, st))
+            .unwrap();
+        let prefix = p.finish(0);
+        let d = &prefix.model.progs[0].insts[0];
+        assert_eq!(d.t[7], h[1]);
+        assert_eq!(d.i[6] & 0xF, 1 | 8, "causal + stream, no tensor-core bit");
+        assert_eq!(d.i[6] >> 16, 128);
+        assert_eq!(d.i[7], hist);
     }
 
     #[test]
@@ -2823,6 +3108,7 @@ mod tests {
                     key_length_heads: 0,
                     prefix: None,
                     window: 0,
+                    stream: None,
                 },
             )
             .unwrap()

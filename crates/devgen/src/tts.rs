@@ -45,6 +45,19 @@ pub struct SpeechProfile {
     /// Sub-bundle of an encoder-mode packet whose `act.enc_out` rows are the whole prompt's
     /// embeddings (the `overlay` role): the prompt ids only size the prefill.
     pub text_encoder: Option<&'static str>,
+    /// Voice cloning through the reference encoder packet.
+    pub clone: Option<CloneLayout>,
+}
+
+/// A cloning prompt: `head`, the reference transcript's prompt text, `mid`, the reference frames
+/// (one frame token each, its codes in `in.frame_codes`), an end frame whose every code is
+/// `eos_code` (if any), `tail`, then the text's prompt text and the suffix. `head` / `tail` =
+/// `None` keep the prompt prefix.
+pub struct CloneLayout {
+    pub head: Option<&'static [u64]>,
+    pub mid: &'static [u64],
+    pub tail: Option<&'static [u64]>,
+    pub eos_code: Option<u64>,
 }
 
 /// maya-research/Veena (model card): [SOH] <spk_v> text [EOH] [SOA] [SOS] -> SNAC codes, stop on
@@ -73,6 +86,7 @@ pub const VEENA: SpeechProfile = SpeechProfile {
     depth_sampler: 0,
     instructions: None,
     text_encoder: None,
+    clone: None,
 };
 
 /// canopylabs/orpheus-3b-0.1-ft (orpheus_tts `_format_prompt`): [SOH] BOS "voice: text" [EOT]
@@ -103,6 +117,7 @@ pub const ORPHEUS: SpeechProfile = SpeechProfile {
     depth_sampler: 0,
     instructions: None,
     text_encoder: None,
+    clone: None,
 };
 
 /// fishaudio/s2-pro (fish-speech `inference.py`, no reference): system "convert the provided text
@@ -134,6 +149,18 @@ pub const FISH: SpeechProfile = SpeechProfile {
     depth_sampler: 0,
     instructions: None,
     text_encoder: None,
+    // `generate_long` with a reference: system "convert the provided text to speech reference to
+    // the following:\n\nText:\n<|speaker:0|>ref_text\n\nSpeech:\n" + the reference frames, then
+    // the user turn; each text part is tokenized on its own, no end frame.
+    clone: Some(CloneLayout {
+        head: Some(&[
+            151644, 8948, 198, 14166, 279, 3897, 1467, 311, 8806, 5785, 311, 279, 2701, 1447, 1178,
+            510,
+        ]),
+        mid: &[271, 55625, 510],
+        tail: Some(&[151645, 198, 151644, 872, 198]),
+        eos_code: None,
+    }),
 };
 
 /// BreezeBlue/Breeze-TTS-2 (`breeze_infer/templates.py`): each text segment `<bos>[S0]text` (voice
@@ -165,6 +192,14 @@ pub const BREEZE: SpeechProfile = SpeechProfile {
     depth_sampler: 1,
     instructions: Some("<ins_bos>{instructions}<ins_eos>"),
     text_encoder: Some("text_encoder"),
+    // `ref_clone_tata`: [TE(<bos>[S0]ref_text)] [ref frames] [audio_eos: codebook_eos_token_id 0
+    // on every codebook] [TE(<bos>[S0]text)].
+    clone: Some(CloneLayout {
+        head: None,
+        mid: &[],
+        tail: None,
+        eos_code: Some(0),
+    }),
 };
 
 /// Chatterbox T3 (`tts.t3_cfg.v1`): a causal LM whose prefill rows are host embeddings (the
@@ -307,6 +342,23 @@ pub fn speech_pipeline_section(
     }
     if let Some(t) = p.text_encoder {
         pipe.strings.insert("text.encoder".into(), t.into());
+    }
+    if let Some(clone) = &p.clone {
+        pipe.strings
+            .insert("clone.encoder".into(), crate::mimi_encoder::PACKET.into());
+        if let Some(code) = clone.eos_code {
+            pipe.parameters.insert("clone.eos_code".into(), code);
+        }
+        // Space-separated ids: a pipeline holds at most 64 parameters.
+        for (list, key) in [
+            (clone.head, "clone.head"),
+            (Some(clone.mid), "clone.mid"),
+            (clone.tail, "clone.tail"),
+        ] {
+            let Some(list) = list else { continue };
+            let ids: Vec<String> = list.iter().map(u64::to_string).collect();
+            pipe.strings.insert(key.into(), ids.join(" "));
+        }
     }
     let params = &mut pipe.parameters;
     let mut put = |k: String, v: u64| {

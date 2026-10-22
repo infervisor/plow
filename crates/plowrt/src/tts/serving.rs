@@ -9,7 +9,8 @@
 //! submitted to that model's continuous-batching mux like a completion; the codec stage runs on
 //! the model's [`Codec`] worker. `stream: true` returns chunked audio: each new frame decodes a
 //! window of the codec's `stream.window_frames` and emits the frames that have
-//! `stream.lookahead_frames` of right context (both `codec.pkt` parameters).
+//! `stream.lookahead_frames` of right context (both `codec.pkt` parameters). A stateful codec
+//! (`stream.stateful`) instead decodes each frame once, in steps on the stream's codec slot.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -502,6 +503,8 @@ pub struct SpeechModel {
     codec: Codec,
     /// The contract's text encoder: its rows are every prompt row.
     encoder: Option<Arc<super::text_encoder::TextEncoder>>,
+    /// The contract's reference encoder (voice cloning).
+    ref_encoder: Option<Arc<super::ref_encoder::RefEncoder>>,
     realtime: Arc<super::realtime::RealTime>,
     spec: OnceLock<SpeechSpec>,
 }
@@ -549,6 +552,23 @@ pub fn speech_model(
                 )?)),
                 None => None,
             };
+            let ref_encoder = match &contract.clone {
+                Some(clone) => {
+                    let file = &clone.encoder;
+                    let e = super::ref_encoder::RefEncoder::load(&assets.join(file), device)?;
+                    if e.frame_codes != contract.frame_codes
+                        || e.frame_samples != contract.frame_samples
+                        || e.sample_rate != contract.sample_rate
+                    {
+                        return Err(format!(
+                            "{file} frames ({} codes, {} samples at {} Hz) disagree with the speech contract",
+                            e.frame_codes, e.frame_samples, e.sample_rate
+                        ));
+                    }
+                    Some(Arc::new(e))
+                }
+                None => None,
+            };
             tracing::info!(pipeline = %contract.pipeline, sample_rate = contract.sample_rate, "tts: speech pipeline bound");
             let realtime = super::realtime::RealTime::new(
                 contract.frame_samples as f64 / f64::from(contract.sample_rate),
@@ -558,6 +578,7 @@ pub fn speech_model(
                 contract,
                 codec,
                 encoder,
+                ref_encoder,
                 realtime,
                 spec: OnceLock::new(),
             }))
@@ -857,6 +878,15 @@ async fn speech_with(
     }
     let voice = req.voice.clone();
     let wav = checked.wav;
+    let reference = match (&req.ref_audio, &req.ref_text, &model.ref_encoder) {
+        (Some(audio), Some(text), Some(enc)) => {
+            match ref_clip(&model, tok, &voice, enc, audio, text) {
+                Ok(r) => Some(Arc::new(r)),
+                Err((msg, param)) => return bad(msg, param),
+            }
+        }
+        _ => None,
+    };
     // Past the cap the reference budget clips the audio: a longer input is spoken in order as
     // sentence-sized segments, each with its full budget.
     let maker = SegmentMaker {
@@ -870,6 +900,7 @@ async fn speech_with(
             .filter(|i| !i.is_empty())
             .map(str::to_owned),
         encoder: model.encoder.clone(),
+        reference,
         cfg_weight: checked.sampling.cfg_weight.unwrap_or(0.0),
         max_tokens: checked.sampling.max_tokens,
         temperature: checked.sampling.temperature,
@@ -915,11 +946,11 @@ async fn speech_with(
         class,
         raw_tokens: true,
         speech,
-        // Encoder prompts' ids are placeholders: no session can key on them.
+        // Encoder and cloning prompts' ids are placeholders: no session can key on them.
         session: ids
             .session
             .as_ref()
-            .filter(|_| first.enc_ids.is_none())
+            .filter(|_| first.enc_ids.is_none() && first.reference.is_none())
             .and_then(|_| {
                 ids.ticket(
                     crate::serve::session::row_keys(&first.prompt_ids, &[], &[]),
@@ -1085,6 +1116,58 @@ async fn speech_with(
 const MUTE_RETRIES: usize = 1;
 const SPLIT_MIN_CHARS: usize = 40;
 
+/// Decode, resample and frame a cloning reference; its codes come later, on the engine thread.
+fn ref_clip(
+    model: &SpeechModel,
+    tok: &Arc<dyn crate::text::tokenizer::Tokenize>,
+    voice: &str,
+    enc: &Arc<super::ref_encoder::RefEncoder>,
+    audio: &str,
+    text: &str,
+) -> Result<RefClip, (String, &'static str)> {
+    use crate::serve::mm::media;
+    use base64::Engine as _;
+    let bad = |m: String| (m, "ref_audio");
+    let bytes = if audio.starts_with("data:") {
+        media::data_url(audio).map_err(bad)?.1
+    } else {
+        base64::engine::general_purpose::STANDARD
+            .decode(audio.trim())
+            .map_err(|e| bad(format!("`ref_audio` is not base64 audio: {e}")))?
+    };
+    let (max, rate) = (enc.max_samples(), enc.sample_rate);
+    let seconds = max as f64 / f64::from(rate);
+    let (pcm, from) = media::decode_audio(&bytes, "", seconds + 1.0).map_err(bad)?;
+    let pcm = media::resample(&pcm, from, rate).map_err(bad)?;
+    if pcm.is_empty() || pcm.len() > max {
+        return Err(bad(format!(
+            "`ref_audio` must hold audio of at most {seconds:.2} s"
+        )));
+    }
+    let c = &model.contract;
+    let Some(clone) = &c.clone else {
+        return Err(bad("this model has no voice cloning".into()));
+    };
+    let tok = model.encoder.as_ref().map_or(tok, |e| &e.tok);
+    let mut ids = clone.head.clone();
+    ids.extend(tok.encode_with_special_tokens(&c.prompt_text(voice, None, text.trim()), false));
+    ids.extend_from_slice(&clone.mid);
+    if model.encoder.as_ref().is_some_and(|e| ids.len() > e.rows()) {
+        return Err((
+            "`ref_text` does not fit the text encoder's prompt".into(),
+            "ref_text",
+        ));
+    }
+    Ok(RefClip {
+        ids,
+        frames: pcm.len().div_ceil(enc.frame_samples),
+        eos: clone.eos_code,
+        pcm,
+        encoder: Arc::clone(enc),
+        codes: OnceLock::new(),
+    })
+}
+
 /// One segment's LM job.
 #[derive(Clone)]
 struct Segment {
@@ -1095,8 +1178,52 @@ struct Segment {
     enc_ids: Option<Vec<u32>>,
     /// A guided segment's unconditional encoder ids (the prompt without its instructions).
     uncond_ids: Option<Vec<u32>>,
+    /// Voice cloning: the prompt opens with the reference (its transcript's rows, its frames and
+    /// any end frame); `enc_ids` / `uncond_ids` are the text's segment after it.
+    reference: Option<Arc<RefClip>>,
     gen: crate::serve::GenParams,
     chars: usize,
+}
+
+/// A request's voice-cloning reference.
+struct RefClip {
+    /// The transcript's prompt segment (encoder ids with a text encoder, else token ids): the
+    /// contract's clone head, the transcript, its mid.
+    ids: Vec<u32>,
+    /// The reference audio at the encoder's rate; `frames` = its frame count.
+    pcm: Vec<f32>,
+    frames: usize,
+    /// The end frame's code on every codebook, when the reference has one.
+    eos: Option<u32>,
+    encoder: Arc<super::ref_encoder::RefEncoder>,
+    /// `[frames][frame_codes]`, encoded on the engine thread by the first segment to prefill.
+    codes: OnceLock<Result<Vec<u32>, String>>,
+}
+
+impl RefClip {
+    /// Prompt rows ahead of the text's segment: transcript, frames, end frame.
+    fn rows(&self) -> usize {
+        self.ids.len() + self.frames + usize::from(self.eos.is_some())
+    }
+
+    fn codes(&self) -> Result<&[u32], String> {
+        self.codes
+            .get_or_init(|| self.encoder.encode(&self.pcm))
+            .as_deref()
+            .map_err(Clone::clone)
+    }
+
+    /// `[rows][frame_codes]` codes of those rows (zeros on the transcript's), and each frame's
+    /// first code.
+    fn frame_codes(&self, frame_codes: usize) -> Result<(Vec<u32>, Vec<u32>), String> {
+        let codes = self.codes()?;
+        let mut v = vec![0; self.ids.len() * frame_codes];
+        v.extend_from_slice(codes);
+        if let Some(eos) = self.eos {
+            v.extend(std::iter::repeat_n(eos, frame_codes));
+        }
+        Ok((v, codes.iter().step_by(frame_codes).copied().collect()))
+    }
 }
 
 /// Builds a segment's prompt and generation parameters from its text.
@@ -1106,6 +1233,7 @@ struct SegmentMaker {
     voice: String,
     instructions: Option<String>,
     encoder: Option<Arc<super::text_encoder::TextEncoder>>,
+    reference: Option<Arc<RefClip>>,
     /// Depth-stage CFG weight w (scale s = 1 + w); 0 = off.
     cfg_weight: f32,
     max_tokens: Option<usize>,
@@ -1121,8 +1249,13 @@ impl SegmentMaker {
     fn make(&self, k: usize, text: &str) -> Segment {
         let c = &self.contract;
         let tok = self.encoder.as_ref().map_or(&self.tok, |e| &e.tok);
+        // A cloning prompt's text segment follows the reference with the clone tail.
+        let lead = match (&self.reference, &c.clone) {
+            (Some(_), Some(clone)) => &clone.tail,
+            _ => &c.prefix,
+        };
         let ids = |instructions: Option<&str>| {
-            let mut ids = c.prefix.clone();
+            let mut ids = lead.clone();
             ids.extend(tok.encode_with_special_tokens(
                 &c.prompt_text(&self.voice, instructions, text),
                 false,
@@ -1137,6 +1270,18 @@ impl SegmentMaker {
             prompt_ids.fill(0);
             ids
         });
+        if let Some(r) = &self.reference {
+            let mut head = if self.encoder.is_some() {
+                vec![0; r.ids.len()]
+            } else {
+                r.ids.clone()
+            };
+            // Each frame row's token is its first code's class (filled in once encoded).
+            head.extend(std::iter::repeat_n(c.audio_token_base, r.frames));
+            head.extend(r.eos.map(|eos| c.audio_token_base + eos));
+            head.append(&mut prompt_ids);
+            prompt_ids = head;
+        }
         let mut gen = crate::serve::GenParams::default();
         gen.max_tokens = self
             .max_tokens
@@ -1158,6 +1303,7 @@ impl SegmentMaker {
             prompt_ids,
             enc_ids,
             uncond_ids,
+            reference: self.reference.clone(),
             gen,
             chars: text.chars().count(),
         }
@@ -1199,37 +1345,81 @@ impl SegmentMaker {
         if !c.depth {
             return Ok(None);
         }
-        let encode = |ids: &[u32]| -> Result<(Vec<f32>, Vec<u32>), String> {
-            let e = self.encoder.as_ref().ok_or("no text encoder")?;
-            Ok((
-                tokio::task::block_in_place(|| e.encode(ids))?,
-                (0..ids.len() as u32).collect(),
-            ))
+        // With a reference, the text's segment follows its rows; with a text encoder, the
+        // transcript's rows are overlay rows too.
+        let (head, ref_ids) = match (&s.reference, &self.encoder) {
+            (Some(r), Some(_)) => (r.rows(), Some(r.ids.clone())),
+            (Some(r), None) => (r.rows(), None),
+            (None, _) => (0, None),
         };
-        let (overlay, overlay_pos) = match &s.enc_ids {
-            Some(ids) => encode(ids)?,
-            None => Default::default(),
+        let rows = |ids: &[u32]| -> Vec<u32> {
+            let lead = ref_ids.as_ref().map_or(0, |r| r.len() as u32);
+            (0..lead)
+                .chain(head as u32..(head + ids.len()) as u32)
+                .collect()
         };
-        let cfg = match &s.uncond_ids {
-            Some(ids) => {
-                let (uncond_overlay, uncond_overlay_pos) = encode(ids)?;
-                Some(crate::serve::mux::CfgJob {
-                    uncond_overlay,
-                    params: crate::text::sample::CfgParams {
-                        cfg_weight: self.cfg_weight,
-                        temperature: 0.0,
-                        min_p: 0.0,
-                        top_p: 1.0,
-                        repetition_penalty: 1.0,
+        let overlay_pos = s.enc_ids.as_deref().map_or(Vec::new(), rows);
+        let cfg = s.uncond_ids.as_ref().map(|ids| crate::serve::mux::CfgJob {
+            uncond_overlay: Vec::new(),
+            params: crate::text::sample::CfgParams {
+                cfg_weight: self.cfg_weight,
+                temperature: 0.0,
+                min_p: 0.0,
+                top_p: 1.0,
+                repetition_penalty: 1.0,
+            },
+            history: Vec::new(),
+            seed: None,
+            uncond_ids: s.prompt_ids[..head]
+                .iter()
+                .copied()
+                .chain(std::iter::repeat_n(0, ids.len()))
+                .collect(),
+            uncond_overlay_pos: rows(ids),
+        });
+        if s.enc_ids.is_some() && self.encoder.is_none() {
+            return Err("no text encoder".into());
+        }
+        let encode: Option<crate::serve::mux::SpeechEncode> =
+            (s.enc_ids.is_some() || s.reference.is_some()).then(|| {
+                let (e, ids, uncond) = (
+                    self.encoder.clone(),
+                    s.enc_ids.clone(),
+                    s.uncond_ids.clone(),
+                );
+                let reference = s.reference.clone();
+                let (k, base) = (c.frame_codes, c.audio_token_base);
+                Box::new(
+                    move |sp: &mut crate::serve::mux::SpeechJob, prompt: &mut [u32]| {
+                        if let Some(r) = &reference {
+                            let (codes, first) = r.frame_codes(k)?;
+                            let rows = r.ids.len()..r.ids.len() + r.frames;
+                            for (t, &c0) in prompt[rows.clone()].iter_mut().zip(&first) {
+                                *t = base + c0;
+                            }
+                            if let Some(cfg) = sp.cfg.as_mut() {
+                                for (t, &c0) in cfg.uncond_ids[rows].iter_mut().zip(&first) {
+                                    *t = base + c0;
+                                }
+                            }
+                            sp.frame_codes = codes;
+                        }
+                        let (Some(e), Some(ids)) = (e, ids) else {
+                            return Ok(());
+                        };
+                        // Each text segment is its own encoder launch (positions from 0).
+                        let lead = match &ref_ids {
+                            Some(r) => e.encode(r)?,
+                            None => Vec::new(),
+                        };
+                        sp.overlay = [lead.as_slice(), &e.encode(&ids)?].concat();
+                        if let (Some(ids), Some(cfg)) = (uncond, sp.cfg.as_mut()) {
+                            cfg.uncond_overlay = [lead.as_slice(), &e.encode(&ids)?].concat();
+                        }
+                        Ok(())
                     },
-                    history: Vec::new(),
-                    seed: None,
-                    uncond_ids: vec![0; ids.len()],
-                    uncond_overlay_pos,
-                })
-            }
-            None => None,
-        };
+                ) as crate::serve::mux::SpeechEncode
+            });
         let cfg_scale = cfg.as_ref().map(|_| 1.0 + self.cfg_weight);
         {
             // The reference keeps temperature and top-p as bf16 tensors (0.7 -> 0.69921875).
@@ -1243,8 +1433,11 @@ impl SegmentMaker {
             let greedy = self.temperature <= 0.0;
             Ok(Some(Box::new(crate::serve::mux::SpeechJob {
                 cfg,
-                overlay,
+                overlay: Vec::new(),
                 overlay_pos,
+                encode,
+                frame_codes: Vec::new(),
+                frame_codes_per_row: c.frame_codes,
                 depth: Some(crate::serve::mux::DepthJob {
                     seed: s.gen.seed.unwrap_or(self.seed),
                     temperature: if greedy { 1.0 } else { param(self.temperature) },
@@ -1469,6 +1662,21 @@ fn stream_step(
     })
 }
 
+/// New frames the next stateful codec step of a stream holding `n` complete frames, `emitted`
+/// of them sent, decodes: every committed frame up to `cap`; a segment's first step waits for
+/// `first` frames until the segment is done.
+fn step_plan(n: usize, emitted: usize, done: bool, first: usize, cap: usize) -> Option<usize> {
+    // A step costs about the same at 1 frame as at `cap`: after the first, each step waits for as
+    // many new frames as were already emitted (their audio covers producing them), up to `cap`.
+    let new = n.saturating_sub(emitted);
+    let need = if emitted == 0 {
+        first
+    } else {
+        emitted.min(cap)
+    };
+    (new > 0 && (done || new >= need)).then(|| new.min(cap))
+}
+
 enum SegMsg {
     Frame(Vec<i32>),
     /// The current segment attempt generated its last frame. A multi-segment drain then waits for
@@ -1637,6 +1845,13 @@ async fn stream_task(
     // Dropping the rest of the current attempt (cut short).
     let mut skipping = false;
     let mut first_frame_at: Option<Instant> = None;
+    // A stateful codec decodes each new frame once on this stream's slot; without a free slot
+    // the stream decodes windows.
+    let mut slot: Option<super::codec::StreamSlot> = None;
+    let mut windowed = model.codec.step_frames == 0;
+    let first_frames = crate::config::RuntimeConfig::get()
+        .tts_stream_first_frames
+        .max(1);
     loop {
         let mut done = false;
         let msg = frx.recv().await;
@@ -1648,6 +1863,9 @@ async fn stream_task(
                     (frames, emitted, skipping) = (Vec::new(), 0, false);
                     attempt += 1;
                     joiner.next_segment();
+                    if let Some(s) = slot.as_mut() {
+                        s.restart();
+                    }
                     continue;
                 }
                 Some(SegMsg::Err(_)) => {}
@@ -1657,6 +1875,9 @@ async fn stream_task(
                     joiner.next_segment();
                     (frames, emitted, skipping) = (Vec::new(), 0, false);
                     (seg, attempt) = (seg + 1, 0);
+                    if let Some(s) = slot.as_mut() {
+                        s.restart();
+                    }
                 }
             }
         }
@@ -1696,10 +1917,14 @@ async fn stream_task(
             model.codec.lookahead
         };
         let n = frames.len() / fc;
+        if !windowed && slot.is_none() && n > emitted && !skipping {
+            slot = model.codec.acquire_slot();
+            windowed = slot.is_none();
+        }
         // A short first lookahead buys time to first audio, but the next window needs the full
         // lookahead: hold the first audio until it covers producing those frames at the measured
         // frame rate (a stream near real time otherwise underruns right after its first chunk).
-        if first_audio && !done && lookahead < model.codec.lookahead {
+        if windowed && first_audio && !done && lookahead < model.codec.lookahead {
             let Some(t0) = first_frame_at.filter(|_| n >= 2) else {
                 continue;
             };
@@ -1722,22 +1947,44 @@ async fn stream_task(
                 continue;
             }
         }
-        if let Some((s, e, upto)) =
-            stream_step(n, emitted, done, model.codec.window, lookahead, chunk)
-                .filter(|_| !skipping)
-        {
-            let window = frames[s * fc..e * fc].to_vec();
-            let urgency = if first_audio {
+        // Windowed: one window per message. Stateful: steps until every committed frame is out.
+        while !skipping {
+            let urgency = if first.is_none() && emitted == 0 {
                 Urgency::First
             } else {
                 Urgency::Stream
             };
-            let wseed = seed ^ segment_salt(seg) ^ (emitted as u64).wrapping_mul(0x9E37_79B9);
-            match model.codec.decode(window, e - s, wseed, urgency).await {
-                Ok(pcm) => {
-                    let Some(fresh) = pcm.get((emitted - s) * fs..(upto - s) * fs) else {
+            // (PCM, its first fresh frame, frames emitted after it, frames decoded)
+            let decoded = if let Some(slot) = slot.as_mut() {
+                let Some(k) = step_plan(n, emitted, done, first_frames, model.codec.step_frames)
+                else {
+                    break;
+                };
+                let codes = frames[emitted * fc..(emitted + k) * fc].to_vec();
+                model
+                    .codec
+                    .step(slot, codes, k, urgency)
+                    .await
+                    .map(|pcm| (pcm, 0, emitted + k, k))
+            } else {
+                let Some((s, e, upto)) =
+                    stream_step(n, emitted, done, model.codec.window, lookahead, chunk)
+                else {
+                    break;
+                };
+                let window = frames[s * fc..e * fc].to_vec();
+                let wseed = seed ^ segment_salt(seg) ^ (emitted as u64).wrapping_mul(0x9E37_79B9);
+                model
+                    .codec
+                    .decode(window, e - s, wseed, urgency)
+                    .await
+                    .map(|pcm| (pcm, emitted - s, upto, e - s))
+            };
+            match decoded {
+                Ok((pcm, skip, upto, decoded)) => {
+                    let Some(fresh) = pcm.get(skip * fs..(skip + upto - emitted) * fs) else {
                         return drop(
-                            out.send(Err(std::io::Error::other(short_window(pcm.len(), e - s))))
+                            out.send(Err(std::io::Error::other(short_window(pcm.len(), decoded))))
                                 .await,
                         );
                     };
@@ -1778,6 +2025,9 @@ async fn stream_task(
                     }
                 }
                 Err(e) => return drop(out.send(Err(std::io::Error::other(e))).await),
+            }
+            if windowed {
+                break;
             }
         }
         if done {
@@ -1875,6 +2125,36 @@ mod tests {
             speech_failure(SpeechError::Failed(long.to_string())).status(),
             StatusCode::BAD_REQUEST
         );
+    }
+
+    /// Stateful steps decode every committed frame once, in order, at most CAP per step; a
+    /// segment's first step waits for FIRST frames unless the segment is done.
+    #[test]
+    fn step_plan_covers_each_frame_once() {
+        const CAP: usize = 17;
+        assert_eq!(step_plan(3, 0, false, 4, CAP), None);
+        assert_eq!(step_plan(3, 0, true, 4, CAP), Some(3));
+        assert_eq!(step_plan(4, 0, false, 4, CAP), Some(4));
+        assert_eq!(step_plan(5, 4, false, 4, CAP), None);
+        assert_eq!(step_plan(8, 4, false, 4, CAP), Some(4));
+        assert_eq!(step_plan(30, 21, false, 4, CAP), None);
+        assert_eq!(step_plan(38, 21, false, 4, CAP), Some(CAP));
+        assert_eq!(step_plan(40, 4, false, 4, CAP), Some(CAP));
+        assert_eq!(step_plan(4, 4, true, 4, CAP), None);
+        for total in 1..60 {
+            for arrive in 1..20 {
+                let (mut emitted, mut seen, mut n) = (0, Vec::new(), 0);
+                while n < total || emitted < total {
+                    n = (n + arrive).min(total);
+                    while let Some(k) = step_plan(n, emitted, n == total, 4, CAP) {
+                        assert!(k <= CAP && (emitted > 0 || k >= 4.min(total)));
+                        seen.extend(emitted..emitted + k);
+                        emitted += k;
+                    }
+                }
+                assert_eq!(seen, (0..total).collect::<Vec<_>>());
+            }
+        }
     }
 
     /// Every frame is emitted exactly once, in order, each with LOOKAHEAD right context until

@@ -2082,6 +2082,7 @@ __device__ __forceinline__ void plow_exec(const PlowDevInst* in, void* const* T,
     case PLOW_DOP_RMSNORM_F32:
     case PLOW_DOP_ROPE_AXIAL_F32:
     case PLOW_DOP_CHUNK_ATTENTION_F32:
+    case PLOW_DOP_STREAM_TAIL_F32:
 #if defined(PLOW_NV_HOPPER)
         if (sp_wg_conv1d(in, T, slice, nblk)) break;
 #endif
