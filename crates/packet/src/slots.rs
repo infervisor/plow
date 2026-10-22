@@ -327,6 +327,8 @@ const DOC: &[S] = &[
     S { op: DevOp::ConvTranspose1dF32, t: &["out", "x", "weight", "bias?", "alpha?", "residual?", "lengths?"], i: &["batch", "in_rows", "in_channels", "out_channels", "kernel", "stride", "output_padding", "groups"], f: &["slope"], j: &["crops", "flags"] },
     S { op: DevOp::UnaryF32, t: &["out", "x", "param?"], i: &["rows", "width", "kind", "stride", "col0"], f: &["p0", "p1"], j: &[] },
     S { op: DevOp::BinaryF32, t: &["out", "a", "b"], i: &["items", "rows", "width", "op", "b_item_stride", "b_row_stride", "b_col_stride", "flags"], f: &["scale"], j: &[] },
+    S { op: DevOp::ReduceRowsF32, t: &["out", "x", "lengths?"], i: &["items", "rows", "width", "op", "seg_rows", "stride", "col0"], f: &[], j: &[] },
+    S { op: DevOp::LengthAffineU32, t: &["out", "in", "min_with?"], i: &["items", "mul", "add", "div", "lo", "hi"], f: &[], j: &[] },
     S { op: DevOp::CumSumF64, t: &["out", "x", "column_scale?", "lengths?"], i: &["items", "rows", "width", "x_width", "flags"], f: &["scale", "post_scale"], j: &[] },
     S { op: DevOp::RandF32, t: &["out", "seed"], i: &["items", "rows", "width", "stream", "stream_shift", "coords", "a_offset", "b_offset"], f: &["scale", "offset"], j: &["", "flags"] },
     S { op: DevOp::AttentionF32, t: &["out", "query", "key", "value", "key_lengths?", "bias?", "prefix?", "prefix_index?"], i: &["batch", "q_rows", "kv_rows", "heads", "head_width", "in_stride", "flags", "bias_head_stride"], f: &["scale"], j: &["k_col0", "v_col0"] },

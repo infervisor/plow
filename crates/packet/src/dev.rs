@@ -2461,6 +2461,20 @@ pub enum DevOp {
     /// t5=pos(u32[B])?` ·
     /// `i0=B i1=L i2=N i3=C i4=Cz i5=zc0 i6=src_stride i7=mode` · `j0=slots`.
     StreamTailF32 = 222,
+    /// Masked column reductions over rows, accumulated in f64 and stored f32. Item `b` has
+    /// `L = min(lengths[b], rows)` valid rows (`rows` without `lengths`); the rows split into
+    /// `segs = ceil(rows / seg_rows)` segments, and segment `s` reduces the `n` valid rows
+    /// `[s*seg_rows, min((s+1)*seg_rows, L))` of column `col0 + c` (a short segment divides by
+    /// its own `n`). `op`: 0 sum, 1 mean, 2 max, 3 unbiased std (`n - 1`), 4 mean then std at
+    /// `out[b][s][W + c]`. `n == 0` (std: `n < 2`) writes 0; `op > 4` writes nothing.
+    /// `t0=out(f32[items][segs][W or 2W]) t1=x(f32[items][rows][stride]) t2=lengths(u32[items])?`
+    /// · `i0=items i1=rows i2=width i3=op i4=seg_rows(0=rows) i5=stride(0=width) i6=col0`.
+    ReduceRowsF32 = 223,
+    /// Device length arithmetic in i64: `out[b] = min(clamp(floor((in[b]*mul + add) / div), lo,
+    /// hi), min_with[b])`, `add` an i32 bit pattern. `div == 0` writes nothing.
+    /// `t0=out(u32[items]) t1=in(u32[items]) t2=min_with(u32[items])?` ·
+    /// `i0=items i1=mul i2=add i3=div i4=lo i5=hi`.
+    LengthAffineU32 = 224,
 }
 
 /// [`DevOp::FlashPrefillFp8`]'s split count (`i7` low half).
@@ -2505,6 +2519,8 @@ pub const ACT_ROUND_BF16: u32 = 18;
 /// SnakeBeta `x + r sin^2(a x)` with `a = param[c]`, `r = param[width + c]` (the exporter's
 /// `exp(alpha)` and `1 / (exp(beta) + 1e-9)`; [`DevOp::UnaryF32`] only, `param` required).
 pub const ACT_SNAKE_BETA: u32 = 19;
+/// Natural log `logf(x)` ([`DevOp::UnaryF32`] only).
+pub const ACT_LOG: u32 = 20;
 
 /// GLU-family `act` code for GPT-OSS's `swiglu_oai` (pair form, `f0 = alpha`, `f1 = limit`).
 /// Codes 0/1/2 are gelu_tanh / silu / situ; see [`DevOp::Glu`].
@@ -2749,6 +2765,8 @@ impl DevOp {
         DevOp::GemvF32Out,
         DevOp::SampleSmallF32,
         DevOp::StreamTailF32,
+        DevOp::ReduceRowsF32,
+        DevOp::LengthAffineU32,
     ];
 
     /// Recover the opcode from its wire discriminant, or `None` for a value no
@@ -2992,6 +3010,8 @@ impl DevOp {
             DevOp::GemvF32Out => "PLOW_DOP_GEMV_F32_OUT",
             DevOp::SampleSmallF32 => "PLOW_DOP_SAMPLE_SMALL_F32",
             DevOp::StreamTailF32 => "PLOW_DOP_STREAM_TAIL_F32",
+            DevOp::ReduceRowsF32 => "PLOW_DOP_REDUCE_ROWS_F32",
+            DevOp::LengthAffineU32 => "PLOW_DOP_LENGTH_AFFINE_U32",
         }
     }
 
@@ -3056,7 +3076,9 @@ impl DevOp {
     /// 219 -> 220 for `SampleFishBf16 = 219` (Fish S2 in-program sampling).
     /// 220 -> 222 for `GemvF32Out = 220`, `SampleSmallF32 = 221` (Breeze TTS depth stage).
     /// 222 -> 223 for `StreamTailF32 = 222` (stateful streaming codec windows).
-    pub const COUNT: u16 = 223;
+    /// 223 -> 225 for `ReduceRowsF32 = 223`, `LengthAffineU32 = 224` (voice-conditioning
+    /// front-ends).
+    pub const COUNT: u16 = 225;
 
     /// The `(M, N, K, quant)` a decode-GEMV opcode carries, or `None` if this is not one.
     ///

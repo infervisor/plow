@@ -316,6 +316,8 @@ pub enum Activation {
     Relu,
     /// [`packet::dev::ACT_SNAKE_BETA`]: unary only (its parameter is two arrays).
     SnakeBeta,
+    /// [`packet::dev::ACT_LOG`]: unary only.
+    Log,
 }
 
 impl Activation {
@@ -339,6 +341,7 @@ impl Activation {
             Activation::ScaleShift => ACT_SCALE_SHIFT,
             Activation::Relu => ACT_RELU,
             Activation::SnakeBeta => ACT_SNAKE_BETA,
+            Activation::Log => ACT_LOG,
         }
     }
 }
@@ -422,6 +425,45 @@ pub enum StreamTailF32Mode<'a> {
     },
     /// The state takes `z` rows `[n[b], n[b] + tail)`.
     Store { z: u32 },
+}
+
+/// [`DevOp::ReduceRowsF32`] reduction.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ReduceRowsOp {
+    Sum,
+    Mean,
+    Max,
+    /// Unbiased (`n - 1`).
+    Std,
+    /// Mean then std: the output is `2 * width` wide.
+    MeanStd,
+}
+
+#[derive(Clone, Copy)]
+pub struct ReduceRowsF32Stage<'a> {
+    pub output: TensorRef<'a>,
+    pub lengths: Option<u32>,
+    pub items: u32,
+    pub rows: u32,
+    pub width: u32,
+    pub op: ReduceRowsOp,
+    /// 0 = `rows` (one segment).
+    pub seg_rows: u32,
+    /// 0 = `width`.
+    pub stride: u32,
+    pub col0: u32,
+}
+
+#[derive(Clone, Copy)]
+pub struct LengthAffineU32Stage<'a> {
+    pub output: TensorRef<'a>,
+    pub min_with: Option<u32>,
+    pub items: u32,
+    pub mul: u32,
+    pub add: i32,
+    pub div: u32,
+    pub lo: u32,
+    pub hi: u32,
 }
 
 #[derive(Clone, Copy)]
@@ -1513,6 +1555,112 @@ impl StageProgram {
         }
     }
 
+    /// [`DevOp::ReduceRowsF32`]: output `[items][ceil(rows / seg_rows)][width or 2 * width]`.
+    pub fn reduce_rows_f32(
+        &mut self,
+        x: u32,
+        deps: &[u32],
+        stage: ReduceRowsF32Stage<'_>,
+    ) -> Result<Emitted, String> {
+        let seg_rows = if stage.seg_rows == 0 {
+            stage.rows
+        } else {
+            stage.seg_rows
+        };
+        let stride = if stage.stride == 0 {
+            stage.width
+        } else {
+            stage.stride
+        };
+        if stage.items == 0
+            || stage.rows == 0
+            || stage.width == 0
+            || u64::from(stage.col0) + u64::from(stage.width) > u64::from(stride)
+        {
+            return Err("invalid row-reduction geometry".into());
+        }
+        let x_rows = product(&[stage.items, stage.rows])?;
+        self.input(
+            x,
+            f32_bytes(x_rows * u64::from(stride))?,
+            "row-reduction input",
+        )?;
+        if let Some(lengths) = stage.lengths {
+            self.input(lengths, u64::from(stage.items) * 4, "row-reduction lengths")?;
+        }
+        let (op, out_width) = match stage.op {
+            ReduceRowsOp::Sum => (0, stage.width),
+            ReduceRowsOp::Mean => (1, stage.width),
+            ReduceRowsOp::Max => (2, stage.width),
+            ReduceRowsOp::Std => (3, stage.width),
+            ReduceRowsOp::MeanStd => (4, stage.width.checked_mul(2).ok_or("width overflows")?),
+        };
+        let segs = stage.rows.div_ceil(seg_rows);
+        let out_elements = product(&[stage.items, segs, out_width])?;
+        u32_elements(out_elements, "row reduction")?;
+        let output = self.resolve(
+            stage.output,
+            f32_bytes(out_elements)?,
+            "row-reduction output",
+        )?;
+        let threads = product(&[stage.items, segs, stage.width])?;
+        self.emit(
+            DevOp::ReduceRowsF32,
+            threads.div_ceil(256),
+            deps,
+            output,
+            |d| {
+                d.t[..3].copy_from_slice(&[
+                    output,
+                    x,
+                    stage.lengths.unwrap_or(packet::dev::TENSOR_NONE),
+                ]);
+                d.i[..7].copy_from_slice(&[
+                    stage.items,
+                    stage.rows,
+                    stage.width,
+                    op,
+                    stage.seg_rows,
+                    stage.stride,
+                    stage.col0,
+                ]);
+            },
+        )
+    }
+
+    /// [`DevOp::LengthAffineU32`].
+    pub fn length_affine_u32(
+        &mut self,
+        input: u32,
+        deps: &[u32],
+        stage: LengthAffineU32Stage<'_>,
+    ) -> Result<Emitted, String> {
+        if stage.items == 0 || stage.div == 0 || stage.lo > stage.hi {
+            return Err("invalid length-affine stage".into());
+        }
+        let bytes = u64::from(stage.items) * 4;
+        self.input(input, bytes, "length-affine input")?;
+        if let Some(min_with) = stage.min_with {
+            self.input(min_with, bytes, "length-affine bound")?;
+        }
+        let output = self.resolve(stage.output, bytes, "length-affine output")?;
+        self.emit(DevOp::LengthAffineU32, 1, deps, output, |d| {
+            d.t[..3].copy_from_slice(&[
+                output,
+                input,
+                stage.min_with.unwrap_or(packet::dev::TENSOR_NONE),
+            ]);
+            d.i[..6].copy_from_slice(&[
+                stage.items,
+                stage.mul,
+                stage.add as u32,
+                stage.div,
+                stage.lo,
+                stage.hi,
+            ]);
+        })
+    }
+
     /// [`DevOp::Conv1dF32`], or [`DevOp::ConvTranspose1dF32`] with `transpose`.
     pub fn conv1d_f32(
         &mut self,
@@ -1532,8 +1680,12 @@ impl StageProgram {
         stage: Conv1dF32Stage<'_>,
         row_scale: u32,
     ) -> Result<Emitted, String> {
-        let valid_activation =
-            |a: Activation| !matches!(a, Activation::Clamp | Activation::ScaleShift);
+        let valid_activation = |a: Activation| {
+            !matches!(
+                a,
+                Activation::Clamp | Activation::ScaleShift | Activation::Log
+            )
+        };
         if stage.batch == 0
             || stage.kernel == 0
             || stage.stride == 0
@@ -2080,7 +2232,11 @@ impl StageProgram {
     ) -> Result<Emitted, String> {
         let parameterless = !matches!(
             stage.activation,
-            Activation::LeakyRelu | Activation::Snake | Activation::Clamp | Activation::ScaleShift
+            Activation::LeakyRelu
+                | Activation::Snake
+                | Activation::Clamp
+                | Activation::ScaleShift
+                | Activation::Log
         );
         if stage.rows == 0
             || stage.width == 0
@@ -2946,6 +3102,69 @@ mod tests {
             (Some(DevOp::CopyColsF32), 1)
         );
         assert_eq!(insts[1].i[6], 2 | 16);
+    }
+
+    #[test]
+    fn reduce_rows_and_length_affine_emit_and_validate() {
+        let (items, rows, stride) = (2u32, 250u32, 96u32);
+        let (prefix, h) = prefix_with(&[
+            ("x", u64::from(items * rows * stride) * 4),
+            ("len", 8),
+            ("tok", 8),
+        ]);
+        let mut p = prefix.program();
+        let stage = |op, seg_rows, width, col0| ReduceRowsF32Stage {
+            output: TensorRef::Named("seg"),
+            lengths: Some(h[1]),
+            items,
+            rows,
+            width,
+            op,
+            seg_rows,
+            stride,
+            col0,
+        };
+        assert!(p
+            .reduce_rows_f32(h[0], &[], stage(ReduceRowsOp::Mean, 100, 80, 17))
+            .is_err());
+        assert!(p
+            .reduce_rows_f32(h[0], &[], stage(ReduceRowsOp::Mean, 100, 0, 0))
+            .is_err());
+        let r = p
+            .reduce_rows_f32(h[0], &[], stage(ReduceRowsOp::MeanStd, 100, 80, 16))
+            .unwrap();
+        let affine = |div, lo, hi| LengthAffineU32Stage {
+            output: TensorRef::Named("tok.len"),
+            min_with: Some(h[2]),
+            items,
+            mul: 1,
+            add: -51,
+            div,
+            lo,
+            hi,
+        };
+        assert!(p.length_affine_u32(h[1], &[], affine(0, 1, 9)).is_err());
+        assert!(p.length_affine_u32(h[1], &[], affine(77, 9, 1)).is_err());
+        let a = p
+            .length_affine_u32(h[1], &[r.done], affine(77, 1, u32::MAX))
+            .unwrap();
+        let prefix = p.finish(0);
+        let tensors = &prefix.model.tensors;
+        let insts = &prefix.model.progs[0].insts;
+        assert_eq!(
+            tensors[r.output as usize].bytes,
+            u64::from(items * 3 * 160) * 4
+        );
+        assert_eq!(DevOp::from_u16(insts[0].op), Some(DevOp::ReduceRowsF32));
+        assert_eq!(insts[0].t[..3], [r.output, h[0], h[1]]);
+        assert_eq!(insts[0].i[..7], [items, rows, 80, 4, 100, stride, 16]);
+        assert_eq!(tensors[a.output as usize].bytes, u64::from(items) * 4);
+        assert_eq!(DevOp::from_u16(insts[1].op), Some(DevOp::LengthAffineU32));
+        assert_eq!(insts[1].t[..3], [a.output, h[1], h[2]]);
+        assert_eq!(
+            insts[1].i[..6],
+            [items, 1, (-51i32) as u32, 77, 1, u32::MAX]
+        );
     }
 
     #[test]

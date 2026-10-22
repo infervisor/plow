@@ -46,6 +46,8 @@ GOLDEN(g_gemm_f32);
 GOLDEN(g_gather_rows_f32);
 GOLDEN(g_copy_cols_f32);
 GOLDEN(g_stream_tail_f32);
+GOLDEN(g_reduce_rows_f32);
+GOLDEN(g_length_affine_u32);
 GOLDEN(g_conv1d_f32);
 GOLDEN(g_conv_transpose1d_f32);
 GOLDEN(g_unary_f32);
@@ -751,6 +753,73 @@ static void t_unary() {
         char name[64];
         snprintf(name, sizeof(name), "UnaryF32 %s", names[kind]);
         run(name, c, g_unary_f32, {o}, FP32, kind == 12 ? 1e-5 : 2e-6);
+    }
+    {
+        /* ACT_LOG (20) over [1e-10, 10]. */
+        Case c; const unsigned rows = 97, width = 40, stride = 50, col0 = 7;
+        unsigned o = c.f32(rows * stride, 1.f), x = c.f32(rows * stride, 5.f, 5.f);
+        float* xs = (float*)c.host[x].data();
+        for (unsigned i = 0; i < rows * stride; i++) xs[i] = fabsf(xs[i]) + (i % 13 == 0 ? 1e-10f : 1e-3f);
+        c.in.op = PLOW_DOP_UNARY_F32; c.in.t[0] = o; c.in.t[1] = x;
+        c.in.i[0] = rows; c.in.i[1] = width; c.in.i[2] = 20; c.in.i[3] = stride; c.in.i[4] = col0;
+        run("UnaryF32 log", c, g_unary_f32, {o}, FP32, 2e-6);
+    }
+}
+
+/* ReduceRowsF32: every op over ceil-mode segments with lengths (short last segment, empty and
+ * single-row segments) and a column window; then global fbank-sized means. f64 in row order on
+ * both sides: bit-exact expected. */
+static void t_reduce_rows() {
+    static const char* names[5] = {"sum", "mean", "max", "std", "mean_std"};
+    for (unsigned op = 0; op < 5; op++) {
+        Case c; const unsigned items = 4, rows = 250, width = 37, seg = 100, stride = 50, col0 = 9;
+        const unsigned segs = 3, ow = op == 4 ? 2 * width : width;
+        unsigned o = c.out((size_t)items * segs * ow), x = c.f32((size_t)items * rows * stride, 3.f, 0.5f);
+        unsigned l = c.u32({250, 173, 201, 1000});
+        c.in.op = PLOW_DOP_REDUCE_ROWS_F32; c.in.t[0] = o; c.in.t[1] = x; c.in.t[2] = l;
+        c.in.i[0] = items; c.in.i[1] = rows; c.in.i[2] = width; c.in.i[3] = op; c.in.i[4] = seg;
+        c.in.i[5] = stride; c.in.i[6] = col0;
+        char name[64];
+        snprintf(name, sizeof(name), "ReduceRowsF32 seg100 %s", names[op]);
+        run(name, c, g_reduce_rows_f32, {o}, FP32, 0.0);
+    }
+    for (unsigned op : {1u, 4u}) {
+        Case c; const unsigned items = 2, rows = 1000, width = 80;
+        unsigned o = c.out((size_t)items * (op == 4 ? 2 : 1) * width), x = c.f32((size_t)items * rows * width, 4.f, -6.f);
+        unsigned l = c.u32({1000, 637});
+        c.in.op = PLOW_DOP_REDUCE_ROWS_F32; c.in.t[0] = o; c.in.t[1] = x; c.in.t[2] = l;
+        c.in.i[0] = items; c.in.i[1] = rows; c.in.i[2] = width; c.in.i[3] = op;
+        run(op == 1 ? "ReduceRowsF32 global mean 2x1000x80" : "ReduceRowsF32 global mean_std", c, g_reduce_rows_f32,
+            {o}, FP32, 0.0);
+    }
+    {
+        Case c; const unsigned items = 3, rows = 64, width = 512;
+        unsigned o = c.out((size_t)items * width), x = c.f32((size_t)items * rows * width, 2.f);
+        c.in.op = PLOW_DOP_REDUCE_ROWS_F32; c.in.t[0] = o; c.in.t[1] = x;
+        c.in.i[0] = items; c.in.i[1] = rows; c.in.i[2] = width; c.in.i[3] = 2;
+        run("ReduceRowsF32 max no lengths", c, g_reduce_rows_f32, {o}, FP32, 0.0);
+    }
+}
+
+/* LengthAffineU32: floor division of negative values, clamps, the elementwise bound; div 0 writes
+ * nothing (both sides keep the fill). */
+static void t_length_affine() {
+    struct A { const char* name; unsigned mul; int add; unsigned div, lo, hi; bool bound; };
+    for (const A& a : {A{"LengthAffineU32 VE windows bound", 1, -51, 77, 1, 0xFFFFFFFFu, true},
+                       A{"LengthAffineU32 fbank frames clamp", 1, -400, 160, 0, 50, false},
+                       A{"LengthAffineU32 x2+1 /4", 2, 1, 4, 0, 0xFFFFFFFFu, true},
+                       A{"LengthAffineU32 div 0 no write", 1, 0, 0, 0, 0xFFFFFFFFu, false}}) {
+        Case c; const unsigned items = 300;
+        std::vector<uint32_t> in(items), bound(items);
+        for (unsigned i = 0; i < items; i++) {
+            in[i] = i < 200 ? i * 3 : (rng_s = rng_s * 1664525u + 1013904223u);
+            bound[i] = (i * 7919u) % 600u;
+        }
+        unsigned o = c.out(items), x = c.u32(in), m = a.bound ? c.u32(bound) : PLOW_TENSOR_NONE;
+        c.in.op = PLOW_DOP_LENGTH_AFFINE_U32; c.in.t[0] = o; c.in.t[1] = x; c.in.t[2] = m;
+        c.in.i[0] = items; c.in.i[1] = a.mul; c.in.i[2] = (unsigned)a.add; c.in.i[3] = a.div;
+        c.in.i[4] = a.lo; c.in.i[5] = a.hi;
+        run(a.name, c, g_length_affine_u32, {o}, INT);
     }
 }
 
@@ -1665,6 +1734,8 @@ int main(int argc, char** argv) {
     t_attention_prefix_h16("AttentionF32 h16 prefix 300+264 lengths", 3, 264, 300, 3, {2, 0, 1}, {564, 400, 300});
 #endif
     t_stream_tail();
+    t_reduce_rows();
+    t_length_affine();
     t_attention_stream("attn stream L127 n17 w128", 4, 127, 17, 128, {0, 5, 127, 4000}, {144, 140, 130, 144}, false);
     t_attention_stream("attn stream L127 n17 w128 tc", 3, 127, 17, 128, {0, 1, 300}, {}, true);
     t_attention_stream("attn stream L71 n80 w72", 2, 71, 80, 72, {0, 1000}, {151, 100}, false);

@@ -346,6 +346,8 @@ pub fn classify(op: DevOp) -> OpClass {
         DevOp::GatherRowsF32
         | DevOp::CopyColsF32
         | DevOp::StreamTailF32
+        | DevOp::ReduceRowsF32
+        | DevOp::LengthAffineU32
         | DevOp::BinaryF32
         | DevOp::CumSumF64
         | DevOp::RandF32 => note(

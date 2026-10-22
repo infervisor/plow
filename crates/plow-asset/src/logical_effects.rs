@@ -55,6 +55,8 @@ pub(crate) fn outputs(d: &DevInst64) -> Result<&'static [usize], String> {
         | UnaryF32
         | BinaryF32
         | CumSumF64
+        | ReduceRowsF32
+        | LengthAffineU32
         | RandF32
         | AttentionF32
         | RowStatsF32
@@ -104,6 +106,8 @@ pub(crate) fn outputs(d: &DevInst64) -> Result<&'static [usize], String> {
         | UnaryF32
         | BinaryF32
         | CumSumF64
+        | ReduceRowsF32
+        | LengthAffineU32
         | RandF32
         | AttentionF32
         | RowStatsF32

@@ -816,6 +816,7 @@ static float g_act_f32(uint32_t kind, float x, float p0, float p1) {
     case 14: return x * p0 + p1;
     case 15: return x > 0.0f ? x : 0.0f;
     case 16: return sqrtf(x);
+    case 20: return logf(x);
     default: return x;
     }
 }
@@ -893,6 +894,71 @@ G_K(g_stream_tail_f32) {
             const float* z = src + ((size_t)b * (L + N) + nrows[b]) * Cz + zc0;
             for (uint32_t r = 0; r < L; r++) memcpy(tail + (size_t)r * C, z + (size_t)r * Cz, (size_t)C * 4);
         }
+    }
+}
+
+/* ReduceRowsF32 (223), one (item, segment) output row per slice step; f64 sums in row order. */
+G_K(g_reduce_rows_f32) {
+    (void)ctx;
+    float* out = PLOW_CPU_TEN(in, T, 0);
+    const float* x = PLOW_CPU_TEN(in, T, 1);
+    const uint32_t* lengths = PLOW_CPU_TEN(in, T, 2);
+    const uint32_t rows = in->i[1], width = in->i[2], op = in->i[3];
+    const uint32_t seg = in->i[4] ? in->i[4] : rows, stride = in->i[5] ? in->i[5] : width, col0 = in->i[6];
+    if (op > 4u || !rows || !width) return;
+    const uint32_t segs = rows / seg + (rows % seg != 0), ow = op == 4u ? 2u * width : width;
+    if ((uint64_t)in->i[0] * segs * ow > 0xFFFFFFFFull) return;
+    uint32_t lo, hi;
+    g_range(in->i[0] * segs, slice, nblk, &lo, &hi);
+    for (uint32_t bs = lo; bs < hi; bs++) {
+        const uint32_t b = bs / segs, r0 = bs % segs * seg;
+        const uint32_t len = lengths && lengths[b] < rows ? lengths[b] : rows;
+        const uint32_t n = len > r0 ? (len - r0 < seg ? len - r0 : seg) : 0;
+        const float* xs = x + ((size_t)b * rows + r0) * stride + col0;
+        float* o = out + (size_t)bs * ow;
+        for (uint32_t c = 0; c < width; c++) {
+            double sum = 0.0, mx = 0.0;
+            for (uint32_t r = 0; r < n; r++) {
+                const double v = xs[(size_t)r * stride + c];
+                sum += v;
+                if (r == 0 || v > mx) mx = v;
+            }
+            const double mean = n ? sum / n : 0.0;
+            double sd = 0.0;
+            if (op >= 3u && n >= 2) {
+                double ss = 0.0;
+                for (uint32_t r = 0; r < n; r++) {
+                    const double d = xs[(size_t)r * stride + c] - mean;
+                    ss += d * d;
+                }
+                sd = sqrt(ss / (n - 1));
+            }
+            switch (op) {
+            case 0: o[c] = (float)sum; break;
+            case 1: o[c] = (float)mean; break;
+            case 2: o[c] = (float)mx; break;
+            case 3: o[c] = (float)sd; break;
+            default: o[c] = (float)mean; o[width + c] = (float)sd; break;
+            }
+        }
+    }
+}
+
+/* LengthAffineU32 (224). */
+G_K(g_length_affine_u32) {
+    (void)ctx;
+    uint32_t* out = PLOW_CPU_TEN(in, T, 0);
+    const uint32_t* x = PLOW_CPU_TEN(in, T, 1);
+    const uint32_t* min_with = PLOW_CPU_TEN(in, T, 2);
+    const int64_t div = in->i[3], lo = in->i[4], hi = in->i[5];
+    if (!div) return;
+    uint32_t b0, b1;
+    g_range(in->i[0], slice, nblk, &b0, &b1);
+    for (uint32_t b = b0; b < b1; b++) {
+        const int64_t v = (int64_t)((uint64_t)x[b] * in->i[1]) + (int32_t)in->i[2];
+        int64_t q = v / div - (v % div < 0);
+        q = q < lo ? lo : q > hi ? hi : q;
+        out[b] = min_with && min_with[b] < (uint64_t)q ? min_with[b] : (uint32_t)q;
     }
 }
 

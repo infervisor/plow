@@ -1530,6 +1530,10 @@ enum {
     PLOW_DOP_SAMPLE_SMALL_F32 = 221,
     /* Per-slot carried tail rows of a streaming FP32 stage (gather | store); see DevOp::StreamTailF32. */
     PLOW_DOP_STREAM_TAIL_F32 = 222,
+    /* Masked per-segment column sum/mean/max/std over rows (f64); see DevOp::ReduceRowsF32. */
+    PLOW_DOP_REDUCE_ROWS_F32 = 223,
+    /* out = min(clamp(floor((in*mul + add)/div), lo, hi), min_with) in i64; see DevOp::LengthAffineU32. */
+    PLOW_DOP_LENGTH_AFFINE_U32 = 224,
 
     PLOW_DOP__COUNT
 };

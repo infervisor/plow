@@ -252,7 +252,7 @@ pub fn class_of(op: DevOp) -> RowClass {
         // The generic signal ops derive a row's item and position from its index (`rows_per_item`,
         // strides, `[batch][rows]` geometry); only the pure elementwise one is row-agnostic.
         GatherRowsF32 | CopyColsF32 | Conv1dF32 | ConvTranspose1dF32 | BinaryF32 | CumSumF64
-        | RandF32 | AttentionF32 | StreamTailF32 => RowClass::C,
+        | RandF32 | AttentionF32 | StreamTailF32 | ReduceRowsF32 | LengthAffineU32 => RowClass::C,
         // Per-row statistics: row-agnostic like LayerNormF32.
         RowStatsF32 | RmsNormF32 => RowClass::A,
         // Positions come from a per-row tensor; soft-token rows are found by their own id.

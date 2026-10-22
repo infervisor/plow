@@ -2344,6 +2344,7 @@ __device__ __forceinline__ void sp_with_act(unsigned kind, float p1, const B& bo
     case 16: body([](float x, float) { return sqrtf(x); }); break;
     case 17: body([](float x, float) { return sp_gelu_tanh(x); }); break;
     case 18: body([](float x, float) { return sp_bf16(x); }); break;
+    case 20: body([](float x, float) { return logf(x); }); break;
     default: body([](float x, float) { return x; }); break;
     }
 }
@@ -2367,6 +2368,7 @@ __device__ __forceinline__ float sp_act(unsigned kind, float x, float p0, float 
     case 16: return sqrtf(x);
     case 17: return sp_gelu_tanh(x);
     case 18: return sp_bf16(x);
+    case 20: return logf(x);
     default: return x;
     }
 }
@@ -2495,6 +2497,66 @@ static __device__ __noinline__ void d_stream_tail_f32(const PlowDevInst* in, voi
             const unsigned rr = e / C, c = e - rr * C, b = rr / L, i = rr - b * L;
             state[((size_t)slot[b] * L + i) * C + c] = v;
         });
+}
+
+/* ReduceRowsF32 (223): one (item, segment, column) per index, f64 in row order (the golden's). */
+static __device__ __noinline__ void d_reduce_rows_f32(const PlowDevInst* in, void* const* T, unsigned slice,
+                                                      unsigned nblk) {
+    float* out = (float*)SP_TEN(0);
+    const float* x = (const float*)SP_TEN(1);
+    const unsigned* lengths = (const unsigned*)SP_TEN(2);
+    const unsigned items = in->i[0], rows = in->i[1], width = in->i[2], op = in->i[3];
+    const unsigned seg = in->i[4] ? in->i[4] : rows, stride = in->i[5] ? in->i[5] : width, col0 = in->i[6];
+    if (op > 4u || !rows || !width) return;
+    const unsigned segs = rows / seg + (rows % seg != 0u), ow = op == 4u ? 2u * width : width;
+    if ((uint64_t)items * segs * ow > 0xFFFFFFFFull) return;
+    const unsigned n_out = items * segs * width;
+    for (unsigned e = slice * PLOW_NV_THREADS + threadIdx.x; e < n_out; e += nblk * PLOW_NV_THREADS) {
+        const unsigned bs = e / width, c = e - bs * width, b = bs / segs, r0 = (bs - b * segs) * seg;
+        const unsigned len = lengths && lengths[b] < rows ? lengths[b] : rows;
+        const unsigned n = len > r0 ? min(len - r0, seg) : 0u;
+        const float* xs = x + ((size_t)b * rows + r0) * stride + col0 + c;
+        double sum = 0.0, mx = 0.0;
+        for (unsigned r = 0; r < n; r++) {
+            const double v = xs[(size_t)r * stride];
+            sum = __dadd_rn(sum, v);
+            if (r == 0u || v > mx) mx = v;
+        }
+        const double mean = n ? sum / n : 0.0;
+        double sd = 0.0;
+        if (op >= 3u && n >= 2u) {
+            double ss = 0.0;
+            for (unsigned r = 0; r < n; r++) {
+                const double d = __dsub_rn(xs[(size_t)r * stride], mean);
+                ss = __dadd_rn(ss, __dmul_rn(d, d));
+            }
+            sd = sqrt(ss / (n - 1u));
+        }
+        float* o = out + (size_t)bs * ow + c;
+        switch (op) {
+        case 0: *o = (float)sum; break;
+        case 1: *o = (float)mean; break;
+        case 2: *o = (float)mx; break;
+        case 3: *o = (float)sd; break;
+        default: o[0] = (float)mean; o[width] = (float)sd; break;
+        }
+    }
+}
+
+/* LengthAffineU32 (224). */
+static __device__ __noinline__ void d_length_affine_u32(const PlowDevInst* in, void* const* T, unsigned slice,
+                                                        unsigned nblk) {
+    unsigned* out = (unsigned*)SP_TEN(0);
+    const unsigned* x = (const unsigned*)SP_TEN(1);
+    const unsigned* min_with = (const unsigned*)SP_TEN(2);
+    const long long div = in->i[3], lo = in->i[4], hi = in->i[5];
+    if (!div) return;
+    for (unsigned b = slice * PLOW_NV_THREADS + threadIdx.x; b < in->i[0]; b += nblk * PLOW_NV_THREADS) {
+        const long long v = (long long)((unsigned long long)x[b] * in->i[1]) + (int)in->i[2];
+        long long q = v / div - (v % div < 0);
+        q = q < lo ? lo : q > hi ? hi : q;
+        out[b] = min_with && min_with[b] < (unsigned long long)q ? min_with[b] : (unsigned)q;
+    }
 }
 
 /* UnaryF32 (199). */
@@ -5101,6 +5163,8 @@ static __device__ __noinline__ void d_speech_f32(const PlowDevInst* in, void* co
     case PLOW_DOP_ROPE_AXIAL_F32: d_rope_axial_f32(in, T, slice, nblk); break;
     case PLOW_DOP_CHUNK_ATTENTION_F32: d_chunk_attention_f32(in, T, slice, nblk, arena); break;
     case PLOW_DOP_STREAM_TAIL_F32: d_stream_tail_f32(in, T, slice, nblk); break;
+    case PLOW_DOP_REDUCE_ROWS_F32: d_reduce_rows_f32(in, T, slice, nblk); break;
+    case PLOW_DOP_LENGTH_AFFINE_U32: d_length_affine_u32(in, T, slice, nblk); break;
     SP_CASE(ROW_STATS_F32)
         d_layernorm_f32(nullptr, (const float*)SP_TEN(1), nullptr, nullptr, in->i[0], in->i[1], in->i[2], in->fj[0].f,
                         slice, nblk, arena, (float*)SP_TEN(0));
