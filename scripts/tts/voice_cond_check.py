@@ -35,6 +35,41 @@ def run(args, role, ins, outs):
     return res, us
 
 
+def e2e(a):
+    ok = True
+    for d in a.e2e:
+        G = lambda k: np.load(os.path.join(d, k + ".npy"))
+        w24 = G("wav24_full").astype(np.float32)
+        cap = next(c for c in (5, 10, 20) if c * 24000 >= len(w24))
+        res, us = run(a, f"encode.c{cap}",
+                      {"pcm": w24, "samples": np.array([len(w24)], np.uint32),
+                       "exaggeration": np.array([0.5], np.float32)},
+                      {"out.vc.t3_tokens": np.uint32, "out.vc.t3_count": np.uint32,
+                       "out.vc.gen_tokens": np.uint32, "out.vc.prompt_len": np.uint32,
+                       "out.vc.prompt_mel": np.float32, "out.vc.spks": np.float32, "act.vc.spk": np.float32,
+                       "out.vc.rows": np.float32})
+        t3, gt = G("t3_cond_prompt_speech_tokens").reshape(-1), G("s3gen_prompt_token").reshape(-1)
+        n3, P = int(res["out.vc.t3_count"][0]), int(res["out.vc.prompt_len"][0])
+        agree3 = float((res["out.vc.t3_tokens"][: len(t3)] == t3).mean())
+        eqg = int((res["out.vc.gen_tokens"][: len(gt)] == gt).sum())
+        pf, sp, rows = G("s3gen_prompt_feat")[0], G("t3_speaker_emb").reshape(-1), G("t3_cond_rows")
+        spk = res["act.vc.spk"]
+        cos = float(spk @ sp / np.linalg.norm(spk) / np.linalg.norm(sp))
+        r_mel = rel(res["out.vc.prompt_mel"][: pf.size], pf)
+        r_spks = rel(res["out.vc.spks"], G("s3gen_spks80").reshape(-1))
+        r_rows = rel(res["out.vc.rows"][: rows.size], rows)
+        # T3 tokens come off an approximation of librosa's soxr resampler, so a few flip (the
+        # reference's own two tokenizer paths agree on 76-90%); the rows follow the tokens.
+        good = (n3 == len(t3) and agree3 >= 0.95 and P == len(gt) and eqg == len(gt) and r_mel < 1e-4
+                and r_spks < 1e-4 and cos >= 0.999 and (agree3 < 1 or r_rows < 1e-4))
+        ok &= good
+        print(f"{os.path.basename(d.rstrip('/')):<12} {len(w24) / 24000:5.2f}s c{cap:<2} {us / 1e3:6.2f} ms  "
+              f"T3 {agree3 * len(t3):.0f}/{len(t3)} (n {n3})  gen {eqg}/{len(gt)} (P {P})  mel {r_mel:.1e}  "
+              f"spks {r_spks:.1e}  ve cos {cos:.6f}  rows {r_rows:.1e}  {'ok' if good else 'FAIL'}")
+    print("OVERALL:", "PASS" if ok else "FAIL")
+    return 0 if ok else 1
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--packet", required=True)
@@ -42,10 +77,13 @@ def main():
     ap.add_argument("--golden", required=True)
     ap.add_argument("--cap", type=int, default=10)
     ap.add_argument("--stages", default="front,tok,camp")
+    ap.add_argument("--e2e", nargs="*", help="golden dirs: run encode.c{S} on each wav24_full")
     a = ap.parse_args()
     G = lambda k: np.load(os.path.join(a.golden, k + ".npy"))
     u32 = lambda v: np.array([v], np.uint32)
     stages, ok = a.stages.split(","), True
+    if a.e2e is not None:
+        return e2e(a)
 
     def gate(name, got, ref, tol):
         nonlocal ok
