@@ -145,7 +145,7 @@ def metrics_snapshot(url):
     return dict(zip(KEYS, metric_values(txt)))
 
 
-async def one_turn(http, args, sid, history, system, user, max_tokens=None):
+async def one_turn(http, args, sid, history, system, user, max_tokens=None, end=False):
     import aiohttp
     max_tokens = max_tokens or args.max_tokens
     if args.api == "chat":
@@ -169,6 +169,8 @@ async def one_turn(http, args, sid, history, system, user, max_tokens=None):
     headers = {"Content-Type": "application/json"}
     if args.session_header:
         headers["X-Session-Id"] = sid
+        if end and args.session_end:
+            headers["X-Session-End"] = "1"
     t0 = time.perf_counter()
     ttft, text, usage, header_cached = None, [], None, None
     async with http.post(args.url + path, json=body, headers=headers,
@@ -361,7 +363,7 @@ async def run_open(args, systems, plan, users):
             live["inflight"] += 1
             try:
                 row, reply = await one_turn(http, args, f"{tag}-{s}", history, systems[sess["app"]],
-                                            users[s][k], turn["max_tokens"])
+                                            users[s][k], turn["max_tokens"], end=k + 1 == len(sess["turns"]))
                 row["error"] = None
             except Exception as e:  # noqa: BLE001 - recorded, the session stops
                 row, reply = dict(ttft_ms=None, tpot_ms=None, e2e_ms=None, prompt_tokens=0, completion_tokens=0,
@@ -461,6 +463,8 @@ def main(argv=None):
     ap.add_argument("--think-ms", type=float, default=0)
     ap.add_argument("--timeout", type=float, default=3600)
     ap.add_argument("--no-session-header", dest="session_header", action="store_false")
+    ap.add_argument("--session-end", action="store_true",
+                    help="open loop: send X-Session-End: 1 on a session's last planned turn (plowrt demotes its boundary)")
     ap.add_argument("--out", required=True)
     o = ap.add_argument_group("open loop (--open-loop): Poisson session arrivals, sampled turns/think/lengths")
     o.add_argument("--open-loop", action="store_true")

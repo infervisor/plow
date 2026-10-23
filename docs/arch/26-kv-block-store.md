@@ -110,6 +110,33 @@ Three conclusions, each contrary to a claim an earlier draft of this document ma
    hand-checkable traces, more seeds and the measured gaps before any column is quoted as a
    prediction.
 
+### 1.3 Where the lost tokens are (measured 2026-10-23, gpu03, plowrt MTP, 10-min arms)
+
+Per-request split of the replay's lost prompt tokens (`load.json`, first turn of a session vs
+later turns):
+
+| arm | hit | first turns: share of requests / token hit / zero-hit | later turns: token hit / zero-hit | lost tokens first : later |
+|---|---|---|---|---|
+| 45 s think, rate 1.8 (prod-like) | 47.6 % | 36 % / 13.5 % / 57 % | 66 % / 24 % | 58 : 42 |
+| 20 s think, rate 2.7 (saturated) | 51.3 % | 28 % / 14.0 % / 56 % | 65 % / 24 % | 48 : 52 |
+| 20 s think, rate 2.7, 60 GB host tier | 52.6 % | 29 % / 15.4 % / 52 % | 67 % / 22 % | 50 : 50 |
+
+Two losses of comparable size, with different fixes:
+
+* **First turns miss the shared system prompt.** A first turn can only hit its app's system
+  prompt (a quarter to a third of its tokens); 57 % of first turns attach nothing although
+  the four shared ends exist (1054 shared-end publishes, 682 shared attaches). A vLLM-style
+  pool hits the system prompt on every first turn. Attribution needs a `PLOW_PFX_TRACE` run
+  through `scripts/bench/pfx_shadow.py` (queued with the replay gate); candidates are the
+  strict-publish refusal of a sequential shared end and LRU churn of shared ends.
+* **A quarter of later turns find their boundary evicted** (zero cached tokens), the
+  retention loss Part A addresses; the 20 s arms are saturated (goodput 63–73 %, 32–56 in
+  flight), so their latencies measure overload and the host tier's +1.3 pt there is a lower
+  bound.
+
+Against vLLM 0.29 on the same 45 s stream (60.6 %), closing the later-turn loss alone (to ~88 %)
+is worth ~14 pt and the first-turn loss ~6.5 pt; either closes the gap, both pass it.
+
 ## Part A — Retention (the production fix)
 
 ### A.1 Host tier for boundary snapshots
