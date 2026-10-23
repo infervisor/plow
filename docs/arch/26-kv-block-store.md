@@ -1,10 +1,13 @@
-# 26 — KV block store: a content-addressed prefix cache under flat slots
+# 26 — Prefix cache retention and the KV block store
 
-**Status: design (2026-10-23), Codex-consulted, not implemented.** Replaces the boundary-snapshot
-prefix cache of `docs/arch/22-kv-cache.md` §7–§9 and the AMD `SharedPrefix` with one store.
-Model kernels are unchanged.
+**Status: design (2026-10-23), two Codex rounds, retention simulated, nothing implemented.**
+Part A says what actually moves the production hit rate and is implementable on today's
+snapshot cache. Part B is the content-addressed block store that replaces the boundary
+snapshots of `docs/arch/22-kv-cache.md` §7–§9 and the AMD `SharedPrefix` with one substrate,
+justified by extensibility and publish cost — not by hit rate. Model kernels are unchanged in
+both parts.
 
-## 1. Why
+## 1. The problem
 
 Production Gemma-4 26B-A4B FP8 on gpu04, from the engines' own metrics:
 
@@ -14,10 +17,9 @@ Production Gemma-4 26B-A4B FP8 on gpu04, from the engines' own metrics:
 | plowrt Kit 2.2 (MTP on), 10-22 06:22–07:02 | 10.2 | 142–370 | 19.8–22 | 63–65% | 2,002 |
 | vLLM 0.29 (prod flags), 10-22 day avg | 6.2 | 116 | 13.6 | 80.8% | ~1,100 |
 
-These are different days and different arrival rates, so they rank nothing by themselves. On gpu03
-with the **same recorded request stream** (`scripts/bench/agentic_turns.py --open-loop
---prod-fidelity`: production prompt shape, think median 10 s; two interleaved rounds agree
-within noise):
+Different days and arrival rates, so this ranks nothing. On gpu03 with the **same recorded
+request stream** (`scripts/bench/agentic_turns.py --open-loop --prod-fidelity`: production
+prompt shape, think median 10 s; two interleaved rounds agree within noise):
 
 | rate 1.8 → 6.5 req/s | TTFT p50/p99 | TPOT p50/p99 | hit |
 |---|---|---|---|
@@ -25,10 +27,10 @@ within noise):
 | plowrt, MTP off | 41 / 271 | 10.8 / 23.0 | 74.4% |
 | plowrt, MTP on | 40 / 238 | 5.2 / 19.1 | 74.6% |
 
-At rate 2.7 (9.2–9.7 req/s) vLLM 0.28 saturates (TPOT p99 227 ms, goodput 81%) while plowrt
-holds TTFT 65/438, TPOT 11.6/45.9, hit 74.8%. The vLLM 0.29 arms are queued (`ab.sh`,
-`ab-long.sh`). Per token plowrt leads; per retained session it does not, and that is what
-production at 10 req/s exposes. The cause is the snapshot cache's insertion cost per turn, below.
+At rate 2.7 (9.2–9.7 req/s) vLLM 0.28 saturates (TPOT p99 227–262 ms, goodput 81%) while plowrt
+holds TTFT 64/469, TPOT 13.0/46.2, hit 74.8%. The vLLM 0.29 arms and 45 s-think long arms are
+queued (`/home/lava/scratch/g26-vs-vllm/ab-long.sh`). Per token plowrt leads at every rate; the
+hit rates are equal on equal traffic. What production exposes is retention at 10 req/s.
 
 ### 1.1 Where the bytes go today (26B FP8, `exec/gpu/prefix.rs:682-751`)
 
@@ -43,51 +45,92 @@ layers × 2 × 2 heads × 512 B = 10 KiB, +80 B scales. A boundary snapshot at p
 
 plus whole 4096-row full-layer VMM blocks shared by multi-mapping (40 MiB per block over the
 10 tracks × 2 heads). Prod counters: 41 GB cache = 31.7 GB snapshots (261 live, ~121 MB) +
-9 GB shared blocks. Retire-on-publish keeps one boundary per session.
+9 GB shared blocks ≈ **156 MB per retained session**; retire-on-publish keeps one boundary per
+session.
 
-### 1.2 Capacity model: retention time, not occupancy
+**Both engines share this floor.** An independent 5.7K-token session is the window (106 MB)
+plus `Prefix` rows (5.7K × 10.3 KiB = 59 MB) ≈ 165 MB in vLLM 0.29 too, once its hybrid
+manager has freed the sliding rows outside the window (`SlidingWindowManager.
+remove_skipped_blocks`, `v1/core/single_type_kv_cache_manager.py:632`; freed blocks keep their
+hash in the free queue in free order, so under pressure they are the first of that request's
+blocks to be reused). The window cannot be rebuilt from fewer rows — each sliding layer's window
+depends on the previous layer's window back to row 0 — only re-prefilled from the tokens.
 
-Eviction is LRU over boundaries. A boundary survives until `capacity` bytes of newer insertions
-have passed it, so its retention time is
+### 1.2 What moves the hit rate: the retention simulation
 
-```
-T = cache_bytes / (turn_rate × bytes_inserted_per_turn)
-hit ≈ ceiling × P(think ≤ T) + shared-prefix hits
-```
+`scripts/bench/prefix_retention_sim.py` replays the harness plan (30 min, seed 7) through an
+LRU-by-bytes cache with the per-session bytes above, for the snapshot model (every turn inserts
+a fresh ~121 MB boundary and retires the previous) and an incremental model (a turn inserts only
+its new rows; the session's blocks move to MRU on a hit, as vLLM's and a block store's do). The
+in-simulation ceiling is 75% (it omits first-turn system-prompt hits; the unbounded-cache oracle
+of the same plan, `scripts/bench/prefix_oracle.py`, is **81.1%** with those, 32-row floor and
+9-row slack included).
+"ended-first" evicts sessions whose last turn has run before any live session — an oracle bound
+on what a session-end signal buys.
 
-where `ceiling` is the stream's own repeat fraction and `think` is the measured turn-gap
-distribution, not the harness's. For the replay plan the unbounded-cache oracle
-(`/home/lava/scratch/kv-store-p0/oracle.py`: exact prefix match, 32-row floor plus the 9-row
-prompt-end slack) is **81.1%** at rates 1.8 and 2.7 (81.75% unquantised); both engines measured
-~5 pt below it at 6.5 req/s with 10 s think, so even the short replay is retention-bound, not at
-the ceiling. Everything the design changes is in the denominator:
+| 10.8 req/s (rate 2.7) | LRU, 41 GB | incremental, 48 GB | ended-first, 41 GB | 101 GB | 191 GB | 191 GB + ended-first |
+|---|---|---|---|---|---|---|
+| think median 10 s | 73.4% | 71.5% | 75.0% | 75.0% | 75.0% | 75.0% |
+| think median 20 s | 55.2% | 54.4% | **74.9%** | 74.7% | 75.0% | 75.0% |
+| think median 45 s (σ 1.0) | 28.7% | 30.9% | 41.1% | 60.7% | 72.9% | 75.0% |
 
-| engine | bytes inserted per turn | T at 10 req/s, 41–48 GB |
-|---|---|---|
-| plowrt today | a new 106–121 MB snapshot **every** turn, overlap or not | ~34 s |
-| vLLM 0.29 | new tokens × ~120 KiB: ~12–36 MB for a continuing session, the whole prompt on a miss | ~80–100 s (pool size to be measured, §4.0) |
-| plowrt + store | new rows × 114 KiB: ~11–34 MB continuing, ~165 MB for a new session | ~80–100 s (same mechanism) |
+At 7.2 req/s and 10 s think every column is 74.4–74.9%: the cache is not binding, which is
+why the earlier 60 GB host-tier test at that rate measured +0.8 pt and why the replay's 75%
+matches both engines. Calibrating the snapshot column against production (74.4% at 5.85 req/s,
+63–65% at 10.2) puts the real think median near 15–20 s; the distribution itself is P0's first
+measurement.
 
-That is the whole gap on identical traffic: today a continuing session's turn displaces another
-session's entire boundary; vLLM's and the store's turns displace only their new rows. (The
-earlier `S = λ·L` occupancy framing predicted 23–47% for the measured 63–65%; it is wrong
-because retention is set by insertion churn, not by population.)
+Three conclusions, each contrary to a claim an earlier draft of this document made:
 
-**Both engines share the per-session byte floor.** An independent 5.7K-token session's state is
-the window (106 MB) plus `Prefix` rows (5.7K × 10.3 KiB = 59 MB) ≈ 165 MB in both engines once
-vLLM's hybrid manager has freed the sliding rows outside the window
-(`SlidingWindowManager.remove_skipped_blocks`, vLLM 0.29 `v1/core/single_type_kv_cache_manager.py:632`:
-freed blocks keep their hash in the free queue in free order, so under pressure they are the
-first of that request's blocks to be reused). The window cannot be rebuilt from fewer rows — each
-sliding layer's window depends on the previous layer's window back to row 0 — only re-prefilled
-from the tokens. So the design does not shrink the floor. It (a) matches vLLM's incremental
-insertion, (b) extends retention into host memory for both classes (249 GB RAM on gpu03 and
-gpu04), (c) demotes provably-unused boundaries ahead of LRU, and (d) keeps the per-token lead by
-leaving every kernel alone. At equal hit, the same-stream numbers above are the margin.
+1. **Incremental insertion does not raise retention.** Under LRU a hit moves the whole session to
+   MRU whether the engine re-inserts a snapshot or touches blocks, so reuse distance is the
+   bytes of *distinct sessions* touched since — identical in both models. vLLM's per-token
+   cache has no retention advantage over the snapshot cache at equal capacity, and a block
+   store would have none either.
+2. **LRU is already the right order among live sessions.** A lognormal think time has a
+   decreasing hazard, so the longest-idle session is the least likely to return next.
+3. **The levers are capacity and knowing which sessions ended.** A session-end signal is worth
+   up to +20 pt at 20 s think (to the ceiling) and +12 pt at 45 s; host capacity is worth +20
+   to +44 pt at 45 s. Both apply to today's snapshot cache unchanged.
 
-## 2. Design
+## Part A — Retention (the production fix)
 
-### 2.1 Row classes
+### A.1 Host tier for boundary snapshots
+
+Today's snapshot host tier (`PLOW_VMM_HOST_CACHE_MIB`, pinned 1 GiB chunks, 4 spills in flight,
+`vmm.rs:1933-2010`) is the right mechanism and was tested at the wrong rate. gpu03 and gpu04
+have 249 GB RAM (238 GB available on gpu04). Target 100 GB (≈ 600 extra sessions: the 101 GB
+column), allocated in bounded chunks after model load, with the 120 GB bring-up crash
+root-caused first (P0). Restore cost per hit: 121 MB over PCIe Gen5 at the measured ~25 GB/s ≈
+4.8 ms on the attach path, against a 40–70 ms TTFT; spill is async off the engine thread.
+vLLM 0.29 has the equivalent (`--kv-offloading-size`); production does not run it, and the
+gates compare against both configurations.
+
+### A.2 Session-end demotion
+
+A boundary whose session has ended is dead weight until LRU reaches it; with 150 s of TTL
+protection and 2.7 sessions/s ending at 10.8 req/s, dead state alone (≈ 67 GB) exceeds the
+device cache, so the TTL protects nothing under pressure. Signals, strongest first:
+
+1. an explicit end-of-session request header from the client (new, small API addition: the
+   session header exists, `SESSION_PROMPT_REWRITE` relies on it) — authoritative reclamation;
+2. HTTP abort or disconnect before the first token (11–17% of prod requests) — predictive;
+3. TTL expiry — predictive, already present.
+
+(1) is the only one that reaches the oracle column; (2) and (3) demote rather than reclaim: the
+boundary loses its pin but stays hashed and attachable until the space is actually needed, so a
+wrong prediction costs nothing but LRU position. How much of the gap (2) alone closes depends on
+the prod request mix and is a P0 measurement, not an assumption.
+
+### A.3 What Part A does not change
+
+Per-turn publish still copies 106–121 MB and retires the previous snapshot (335 GB/h on the
+engine stream, ~93 MB/s, plus VMM unmap/remap calls); recurrent-state models stay without a
+prefix cache; AMD keeps its own `SharedPrefix`. Those are Part B's reasons.
+
+## Part B — The KV block store
+
+### B.1 Row classes
 
 Every cache tensor the packet declares belongs to a **row class**: a retention rule plus the
 tensors it owns, each with its own source layout descriptor (base, slot stride, head stride,
@@ -103,36 +146,43 @@ its tensors.
 Classes come from the live-KV manifest (`crates/plow-asset/src/live_kv.rs`: `window`, `mask`,
 `stride`, `layout` per cache) and `serve_manifest::KvGeometry`; a packet whose caches do not
 map onto a class refuses the store rather than guessing. Retention rules are descriptors, so
-sink-plus-window or chunk-local attention are new rules, not new code paths. Multiple window
+sink-plus-window or chunk-local attention are new rules, not new code paths; several window
 sizes in one model are separate `Window(w)` classes.
 
 `State` is what Qwen3.8 27B and Kimi-K3 lack today ("recurrent GDN state has no prefix
 snapshot", `docs/bringup/results/qwen38-27b-h100/comparison.md`). Its contract is explicit:
 the packet exposes a capture op at an aligned row during prefill (the state after exactly `p`
 rows, not the slot's current state after the floor-32 rounding) and a restore op; speculative
-rollback must restore it too. A model without the capture op gets `Prefix`/`Window` only, and
-its boundaries are the exact prompt end.
+rollback must restore it too. A model with recurrent state and no capture op gets **no attach**
+(prefix cache off, as today): its attention rows are useless without the state. Drafter KV
+(`kv.48..52.*`-style tensors) is not cached by any class; a spec-decode hit re-primes the
+drafter as it does after a miss.
 
-### 2.2 Blocks and keys
+### B.2 Blocks and keys
 
 A **block** is `R` rows of one class, `R` = the packet's boundary quantum (32 today; hash
 granularity, physical block size and legal checkpoint alignment are three separate parameters
 of the class, derived per model and rejected when they do not divide). Layout `[tensor][row][hd]`
 so each tensor's rows are one run. On 26B FP8 a `Window` block is 3.3 MB, a `Prefix` block
-330 KB. Blocks live in per-class slabs — device, and optionally pinned host (§2.6) — with fixed
+330 KB. Blocks live in per-class slabs — device, and optionally pinned host (B.6) — with fixed
 block size per class (free lists, no fragmentation, bounded pointer tables).
 
 Identity: `(namespace, class, chain hash of tokens [0, (i+1)·R))` with the chained FxHash the
 radix `PrefixCache` already uses (`memory/vmm.rs:5990`), verified on lookup by comparing the
-whole matched prefix's tokens, as today. `namespace` = packet hash + cache format + adapter +
-positional config + a multimodal-input digest, so one store can serve more than one packet
-and never aliases across formats.
+whole matched prefix's tokens, as today. `namespace` = packet hash (which pins the checkpoint
+digest, cache format and positional config) + adapter id + a multimodal-input digest, so one
+store can serve more than one packet and never aliases across weights or formats.
 
 Blocks are **immutable once sealed**. A block is created `Filling`, becomes `Ready` when its
-scatter copy's completion event has fired, and only `Ready` blocks are visible to lookup. A
-partially written tail (rows past the last full `R`) is never a block; it is re-prefilled, as
-the 9-row prompt-end slack is today. Two publishers filling the same key race by key: the
-second finds `Filling` and waits on the first's event instead of copying.
+scatter copy's completion event has fired, or `Failed` if the copy or its allocation failed;
+only `Ready` blocks are visible to lookup, and a `Failed` block is freed once its event has
+fired (never before — the slab region may still be a DMA target). A partially written tail
+(rows past the last full `R`) is never a block; boundaries are always `R`-aligned (floored, as
+today's prompt end is), and the tail is re-prefilled like the 9-row slack. A boundary shorter
+than the window pins `Window` blocks `[0, p/R)` (the window clamps at row 0). Two publishers
+reaching the same key verify identity (namespace and the matched prefix's tokens) before
+coalescing; the second then waits on the first's event instead of copying, and a `Failed`
+outcome propagates to every waiter, which aborts its own publish.
 
 The radix tree remains the index. A node at depth `i` holds per class a block ref with its
 residency (`Device`, `Host`, `Migrating`, `Absent`) and two counts: **dependents** (boundaries
@@ -140,7 +190,7 @@ that need it) and **transfer holds** (gathers, spills, restores in flight). A **
 record at row `p` (`PROMPT_END`, `SHARED_END`, `CHECKPOINT` as today) owns its `State` blobs
 and depends on `Prefix` blocks `[0, p/R)` and `Window` blocks `[p/R − w/R, p/R)`.
 
-### 2.3 Publish (incremental, transactional)
+### B.3 Publish (incremental, transactional)
 
 Trigger points are unchanged (`exec/gpu/prefix.rs:913-1068`: prompt end, shared end, chunk
 checkpoint, awaited checkpoint). At boundary `p`:
@@ -150,21 +200,31 @@ checkpoint, awaited checkpoint). At boundary `p`:
    can write rows ≥ `p + (ring − window)`. An old shared boundary or an oversized chunk that
    violates this is refused (counter), never copied late.
 2. Walk the chain. Per node and class: `Ready`/`Filling` → take a dependency; `Absent` and
-   retained by this boundary → allocate from the slab (evicting per §2.5 if needed; failure
-   aborts the publish and releases what it took), enqueue the scatter, record the event.
+   retained by this boundary → allocate from the slab (evicting per B.5 if needed), enqueue the
+   scatter, record the event.
 3. Copy `State` blobs captured at `p`.
-4. **Commit**: only after every class succeeded, publish the boundary and then release the
-   previous same-session boundary's dependencies (retire-on-publish). Blocks whose dependents
-   and holds both reach 0 are not freed — they go to the slab's reclaim list in LRU order,
-   still `Ready` and hashed, exactly like vLLM's free queue, so an older boundary of the same
-   session can still hit until the space is actually needed.
+4. **Commit**: only after every class's copies have been submitted successfully, publish the
+   boundary (its blocks may still be `Filling`; attach waits on them) and then release the
+   previous same-session boundary's dependencies (retire-on-publish). A failure after some
+   copies were submitted commits nothing: the boundary is never recorded, the previous one
+   keeps its pins, and the new blocks go `Failed` and are freed after their events. Blocks
+   whose dependents and holds both reach 0 are not freed — they go to the slab's reclaim list
+   in LRU order, still `Ready` and hashed, like vLLM's free queue, so an older boundary of the
+   same session can still hit until the space is actually needed. A retired boundary stays
+   discoverable as an unpinned record until the first of its blocks is reclaimed, which
+   invalidates it.
+5. **Reservation**: a publish first reserves its incremental working set (new blocks plus a
+   bounded pointer-table slot) from the slab; if eviction cannot free it without touching held
+   or `Filling` blocks, the publish is refused (counter), never partially written.
 
-Per-turn cost becomes the new rows only: ~100–300 rows → 10–35 MB scattered, against 106–121 MB
-copied today; a cold session (no overlap) still copies its full state (~165 MB), and the gate
-measures the mix (§4). Strict publish (`PLOW_VMM_STRICT_PUBLISH`) and the orphaned-block
-hazard disappear: blocks are owned by the store, never by a slot.
+Per-turn copy becomes the new rows only: ~100–300 rows → 10–35 MB scattered, against 106–121 MB
+today; a cold session still copies its full state (~165 MB), and the gate measures the mix. This
+is a bandwidth and engine-thread saving, not a retention gain (§1.2). Blocks are owned by the
+store, never by a slot, so the store has no orphaned-block hazard; while whole-block VMM
+multi-mapping is retained (B.7) the existing strict-publish check stays in force for the mapped
+blocks.
 
-### 2.4 Attach
+### B.4 Attach
 
 For a prompt, pick the deepest boundary `p ≤ match` whose dependencies are all `Ready` and
 resident (device or host) and whose `State` blobs exist; `Filling` blocks are waited on
@@ -186,49 +246,45 @@ row count), one launch per class, CUDA and HIP, with a per-tensor `memcpy2D` fal
 attention or norm object changes; the live-KV contract, the `kv_ring.v1` Lean obligation, the
 TMA maps and FP8 scale addressing are untouched.
 
-### 2.5 Eviction and demotion
+### B.5 Eviction and demotion
 
 A boundary is **demoted** (its dependencies released, blocks to the reclaim list) or
 **evicted** (blocks reclaimed); a block with transfer holds is never reclaimed, and reclaiming
-a block invalidates every boundary that depends on it first. Victim order:
+a block invalidates every boundary that depends on it first. Victim order: reclaim-list blocks
+(LRU, no decision); demotion candidates per A.2 (ended, aborted, disconnected, TTL-expired);
+LRU over live boundaries with `SHARED_END` (system prompts) ranked by attach count; a victim
+block spills to the host slab if one is armed, else is reclaimed.
 
-1. reclaim-list blocks, LRU (no decision);
-2. **demotion candidates**: boundaries of requests that were aborted or disconnected before
-   the first token, and session-TTL-expired boundaries. This is a *prediction*, not a death
-   certificate — a retry can follow an abort — so demotion only drops the pin; the blocks stay
-   hashed on the reclaim list and the next turn still hits if the space was not needed;
-3. LRU over live boundaries; `SHARED_END` (system prompts) ranked by attach count;
-4. a victim block spills to the host slab if one is armed (§2.6), else is reclaimed.
+### B.6 Host tier
 
-An authoritative session-close signal (request header) would turn (2) from prediction into
-reclamation; it needs the prod request mix (no bodies are captured) and is a separate change.
+Per class, a pinned host slab (`PLOW_KV_STORE_HOST_MIB`, default 0), allocated in bounded
+chunks with a bounded number of transfers in flight; both classes tier (a session is 165 MB
+wherever it lives). Migration protocol: a block being spilled stays `Device` until its D2H
+event fires, then flips to `Host`; a restore pins the host source until the H2D event fires; a
+concurrent attach on a `Migrating` block waits on the event rather than racing it. A host
+allocation or D2H failure leaves the block `Device` and the eviction falls through to reclaim;
+an H2D failure fails that attach, which is unwound as today (`AttachUnwound`, the slot
+re-prefills) while the block stays `Host`; a cancelled request releases its transfer holds only
+when the in-flight event fires.
 
-### 2.6 Host tier
+Device budget with the tier armed, per class: `slab_bytes = cache_cap − live rings (ring_rows ×
+Window row bytes × admitted slots) − Prefix rows duplicated in live slots − in-flight transfer
+reservation (max transfers × block size)`; the host slab is sized independently and both are
+reported as `kv_store_bytes{class,tier}`.
 
-Per class, a pinned host slab (`PLOW_KV_STORE_HOST_MIB`, default 0), allocated at bring-up in
-bounded chunks with a bounded number of transfers in flight. Both classes tier: a session is
-165 MB wherever it lives, so a 150 GB tier holds ~900 extra sessions. Migration protocol: a
-block being spilled stays `Device` until its D2H event fires, then flips to `Host`; a restore
-pins the host source until the H2D event fires; a concurrent attach on a `Migrating` block waits
-on the event rather than racing it. The earlier whole-snapshot host test (60 GB: +0.8 pt hit,
-worse p99) ran at 1.8 req/s where retention was not binding, and 120 GB pinned at bring-up
-killed the server once; §4.0 repeats it at the production rate with bounded allocation and the
-crash root-caused before P2. vLLM 0.29 has CPU offloading (`--kv-offloading-size`); prod does not
-run it, and §4 compares against both configurations.
-
-### 2.7 What VMM still does
+### B.7 What VMM still does
 
 Per-slot sparse growth of the full-layer tracks (`ensure_rows`, premap) and the live rings.
-Multi-mapping of whole 4096-row blocks is kept through P1–P4 and removed (P5) only if the
+Multi-mapping of whole 4096-row blocks is kept through B-phases 1–4 and removed only if the
 measured `Prefix` gather cost and copy amplification are within the gate; until then an
 aligned whole block attaches by map and the store copies the rest. Cached `Prefix` rows then
-exist once in the store and once per live slot (≈59 MB × in-flight slots, ~1.5 GB at 27 slots).
+exist once in the store and once per live slot (≈ 59 MB × in-flight slots, ~1.5 GB at 27).
 
-### 2.8 Hardware and model coverage
+### B.8 Hardware and model coverage
 
 | | today | store |
 |---|---|---|
-| NVIDIA H100, TP=1 (Gemma-4 12B/26B) | VMM multi-map + snapshot copy | `Prefix` + `Window` + scales — **P1 scope** |
+| NVIDIA H100, TP=1 (Gemma-4 12B/26B) | VMM multi-map + snapshot copy | `Prefix` + `Window` + scales — first scope |
 | NVIDIA TP>1 | none | not in scope; the key carries a rank/shard id so a later TP attach can require a boundary `Ready` on every rank before any rank proceeds |
 | AMD MI300X/MI325X (GLM-5.3, DeepSeek, Kimi MLA) | `exec/amd/shared_prefix.rs`, VMM groups + tail copy | same store, `Prefix` over `ckv/krot/kidx/scale` with per-tensor descriptors (different row cadences allowed), HIP gather |
 | AMD per-slot route (`exec/amd/prefix.rs`) | carried state + ring windows, same slot only | `Window` + `State`, cross-slot |
@@ -241,7 +297,7 @@ The store is one Rust module (`memory/kv_store.rs`) over an ops trait: `alloc_sl
 synchronisation (CUDA/HIP events, synchronous copies on CPU); the index, boundary records,
 counts, state machine, eviction and host tier are shared.
 
-### 2.9 Rejected alternatives
+### B.9 Rejected alternatives
 
 - **Paged slots (vLLM block tables).** Every sliding read/write site (`op_attention.cuh` decode
   bodies and prefill stager, `op_norm.cuh` writers, TMA maps, FP8 scale indexing) would take a
@@ -250,82 +306,92 @@ counts, state machine, eviction and host tier are shared.
   these kernels. The store keeps the flat slot and copies instead.
 - **512-row blocked full-layer layout** for zero-copy `Prefix` mapping: a kernel addressing
   change for ≤ 3% of cache bytes. Not part of this proposal.
-- **Recomputing the window on attach**: not exact (§1.2); exact recompute is the full re-prefill
+- **Recomputing the window on attach**: not exact (§1.1); exact recompute is the full re-prefill
   the miss path already does.
 - **Lower-precision window storage**: changes numerics; the FP32 gate owns that budget.
+- **The block store as the retention fix**: §1.2 shows it is not one.
 
 ## 3. Expected outcome vs vLLM 0.29
 
-| | vLLM 0.29 device-only (prod flags) | vLLM 0.29 + CPU offload | plowrt today | plowrt + store |
-|---|---|---|---|---|
-| bytes / retained session | ~165 MB | ~165 MB | ~156 MB | ~165 MB |
-| bytes inserted / continuing turn | new tokens × 120 KiB | same | 106–121 MB | new rows × 114 KiB |
-| retention tiers | device | device + host | device | device + host, both classes |
-| dead-boundary demotion | none | none | TTL 150 s | abort/disconnect/TTL |
-| per-hit attach | 0 (in place) | H2D of offloaded blocks | ~121 MB D2D + map calls | ~165 MB D2D or H2D |
-| recurrent-state models | Mamba/GDN prefix caching | same | off | `State` class |
-| TTFT / TPOT at equal hit, same stream, 6.5 req/s | 82 / 11.5 ms (0.28) | — | 40 / 10.8 (MTP off), 40 / 5.2 (MTP on) | unchanged |
+| | vLLM 0.29 device-only (prod flags) | vLLM 0.29 + CPU offload | plowrt today | plowrt + Part A | + Part B |
+|---|---|---|---|---|---|
+| bytes / retained session | ~165 MB | ~165 MB | ~156 MB | ~156 MB | ~165 MB |
+| retention tiers | device | device + host | device | device + host (snapshots) | device + host (blocks) |
+| session-end demotion | none | none | TTL 150 s | header / abort / TTL | same |
+| hit at 10.8 req/s, think 20 s (sim) | 55% (48 GB) | ~75% | 55% | ~75% | same |
+| hit at 10.8 req/s, think 45 s (sim) | 31% | ~61% (100 GB) | 29% | 61% + end signal → up to 75% | same |
+| per-turn publish | in place | in place | 106–121 MB + map/unmap | same | 10–35 MB |
+| recurrent-state models | Mamba/GDN prefix caching | same | off | off | `State` |
+| TTFT / TPOT at equal hit, same stream, 6.5 req/s | 82 / 11.5 ms (0.28) | — | 40 / 10.8 (MTP off), 40 / 5.2 (MTP on) | unchanged | unchanged |
 
-The claim to verify, predeclared: at the production arrival rate and above, plowrt + store
-reaches a token hit rate within 2 pt of the oracle ceiling while holding its same-stream
-TTFT/TPOT, so its SLO goodput (TTFT ≤ 200 ms, TPOT ≤ 30 ms) exceeds vLLM 0.29's by ≥ 20% at
-10 req/s and its maximum sustainable rate by ≥ 20%, against vLLM both device-only and with
-offloading at the same host budget. Anything less is a tie and does not justify P5.
+Predeclared claim for Part A: at 10 req/s and above, plowrt reaches a token hit rate within 2 pt
+of the oracle ceiling while holding its same-stream TTFT/TPOT, so its SLO goodput (TTFT ≤ 200
+ms, TPOT ≤ 30 ms) exceeds vLLM 0.29's by ≥ 20% and its maximum sustainable rate by ≥ 20%,
+against vLLM both device-only and with offloading at the same host budget, with the device
+KV+cache budget set equal to vLLM's allocated KV bytes. Acceptance: 3 repetitions per arm, each
+individually above the threshold. Against vLLM with offloading the hit rates tie by
+construction (§1.2) and the win is the per-token margin plus whatever the end signal adds; that
+is stated, not hidden. Part B's claim is narrower: publish bytes −70% or better on the replay's
+turn mix, attach latency within 2% of today's, `State` models cached, with Part A's hit rate
+preserved.
 
 ## 4. Gates
 
 Each phase stops at a failing gate. Replays use identical recorded arrivals, prompts, output
 lengths and a cold cache (the harness on this branch lets explicit `--think-*` flags win over
 `--prod-fidelity`, which silently reset them to 10 s before); MTP-off arms are separate from
-MTP-on; the final numbers come from
-`campaign.py report` in the strict format of `docs/bringup/agent-tools.md`.
+MTP-on; final numbers come from `campaign.py report` in the strict format of
+`docs/bringup/agent-tools.md`.
 
-0. **Measure first (P0).** (a) The oracle ceiling of the recorded stream from the prompts alone
-   (unbounded cache, exact prefix match): done, 81.1% (§1.2). (b) The actual think-time distribution from prod
-   timestamps. (c) vLLM 0.29's real pool: allocated KV bytes, groups, page sizes, hybrid-manager
-   status, from its startup log — not `tokens × 120 KiB`. (d) The cheapest hypothesis: today's
-   snapshot cache with a bounded host tier (60 GB, crash root-caused) at rates 2.7 and 4.5. If
-   retention alone meets §3, the store must justify itself on the remaining rows of §3.
+0. **Measure first (P0).** (a) Oracle ceiling of the replay plan: done, 81.1% (§1.2). (b) The
+   production think-time distribution and the fraction of sessions whose end is detectable
+   (abort/disconnect) — from timestamps, no request bodies. (c) vLLM 0.29's real pool:
+   allocated KV bytes, groups, page sizes, hybrid-manager status, from its startup log. (d) The
+   120 GB pinned bring-up crash root-caused. (e) Today's snapshot cache with a bounded 60–100 GB
+   host tier at rates 2.7 and 4.5 with think 20 s and 45 s — the retention columns of §1.2
+   measured, not simulated.
 1. **Exactness.** Attach-then-decode logits (not only token digests) equal to the uncached
    prefill at ctx 4094/4095/8191 and window edges (`p − w ± 32`), BF16 and FP8, both layer
    kinds; the existing poison and boundary sweeps; multi-turn checkpoints and speculative
-   rollback on a `State` model.
-2. **Lifecycle faults.** Forced eviction, slab exhaustion, delayed copies, concurrent
+   rollback on a `State` model (Part B).
+2. **Lifecycle faults (Part B).** Forced eviction, slab exhaustion, delayed copies, concurrent
    attach/publish/spill on one key, cancellation mid-gather, slot reuse, hash collisions,
    partial-block boundaries, `Migrating` races — each with value checks.
 3. **Kernels untouched, interference bounded.** `step_bench` digests identical to the base
-   packet; serving ITL/TTFT under load within 2% of today's at rates 1.8 and 2.7 with the store
-   on; achieved gather/scatter bandwidth, copy amplification, pinned RSS and queue delay
-   reported.
+   packet; serving ITL/TTFT under load within 2% of today's at rates 1.8 and 2.7; achieved
+   copy bandwidth, copy amplification, pinned RSS and queue delay reported.
 4. **Serving win (§3).** Steady-state arms: warm-up longer than one retention turnover, then
    ≥ 3 session lifetimes at rates 2.7, 4.5 and overload, 3 repetitions, with offered vs
-   completed, backlog, timeouts and cancellations; ablations separating incremental publish,
-   demotion and host tier.
+   completed, backlog, timeouts and cancellations; ablations separating host tier, demotion
+   signal and (Part B) incremental publish.
 5. **Numerics.** FP32 gate at c1/c8/c32 unchanged.
-6. **Soak.** 1 h at rate 2.7: flat RSS, device mapped bytes, `kv_store_*` counters consistent,
-   no engine-thread stall > 1 ms attributable to the store (pfx_trace).
+6. **Soak.** 1 h at rate 2.7: flat RSS, device mapped bytes, counters consistent, no
+   engine-thread stall > 1 ms attributable to the cache (pfx_trace).
 
 ## 5. Phases
 
 | | content | gate |
 |---|---|---|
-| P0 | measurements of §4.0; vLLM 0.29 device-only and offload arms on gpu03 | — |
-| P1 | `memory/kv_store.rs`, CUDA ops, `Prefix` + `Window` (+ scales), block state machine, gather/scatter kernels, publish/attach at today's trigger points, today's eviction order, behind `PLOW_KV_STORE=1` (default off); TP=1 | 1, 2, 3, 4 device-only |
-| P2 | demotion (§2.5) and the per-class host tier | 4 incl. offload arm, 6 |
-| P3 | AMD: `SharedPrefix` and the per-slot route on the store; HIP gather | AMD rung + replay gates, when a box is available |
-| P4 | `State` class: capture op in the packet contract; GDN (Qwen3.8 27B), KDA (Kimi-K3) | 1 (state), 5 and replay on Qwen3.8 |
-| P5 | remove VMM multi-map, snapshot pool, strict publish, stale/park/recycle; rewrite `docs/arch/22` §7–9 | copy-amplification gate; all production recipes re-qualified |
+| P0 | §4.0 measurements; vLLM 0.29 device-only and offload arms on gpu03 | — |
+| A1 | bounded snapshot host tier (today's mechanism, allocation after load, chunked), default off, recipe knob | 0(e), 3, 4, 6 |
+| A2 | session-end header in the serve API + demotion on header/abort/disconnect (A.2), metrics `demote_{header,abort,disconnect,ttl}_total` | 4 with the end-signal ablation, 5 |
+| A3 | production deploy of A1+A2 on gpu04 (user go) and the same-hour comparison the Grafana endpoint allows | strict report |
+| B1 | `memory/kv_store.rs`, CUDA ops, `Prefix` + `Window` (+ scales), block state machine, gather/scatter kernels, publish/attach at today's trigger points, today's eviction order, behind `PLOW_KV_STORE=1` (default off); TP=1; tier and demotion carried over | 1, 2, 3, 4 device-only, 5 |
+| B2 | AMD: `SharedPrefix` and the per-slot route on the store; HIP gather | AMD rung + replay gates, when a box is available |
+| B3 | `State` class: capture op in the packet contract; GDN (Qwen3.8 27B), KDA (Kimi-K3) | 1 (state), 5 and replay on Qwen3.8 |
+| B4 | remove VMM multi-map, snapshot pool, strict publish, stale/park/recycle; rewrite `docs/arch/22` §7–9 | copy-amplification gate; all production recipes re-qualified |
 
-Metrics: `plowrt_kv_store_{blocks,bytes}{class,tier}`, `publish_{blocks,bytes,refused}_total`,
-`attach_{hits,misses,rows,wait}_total`, `attach_from_host_{total,bytes}`, `demote_{abort,
-disconnect,ttl}_total`, `evict_{lru,spill}_total`, `migrations_inflight`. The `plowrt_prefix_*`
-names stay for the kept semantics (hits, tokens attached/lost, boundaries).
+Metrics (Part B): `plowrt_kv_store_{blocks,bytes}{class,tier}`, `publish_{blocks,bytes,
+refused}_total`, `attach_{hits,misses,rows,wait}_total`, `attach_from_host_{total,bytes}`,
+`evict_{lru,spill}_total`, `migrations_inflight`; the `plowrt_prefix_*` names stay for the kept
+semantics.
 
 ## 6. Open questions
 
-1. `R` per model: 32 matches today's boundary quantum; the gather cost is per row, not per
-   block, so larger `R` only coarsens dedup. Decide on P0's oracle at 32 vs 64.
-2. A session-close header for authoritative reclamation (§2.5).
+1. The end-of-session header's shape and whether the production clients can send it; without
+   it A2 is limited to the abort/disconnect fraction P0(b) measures.
+2. `R` per model: 32 matches today's boundary quantum; the gather cost is per row, not per
+   block, so larger `R` only coarsens dedup.
 3. The `State` capture op's cost on the prefill rungs (one state copy per aligned checkpoint).
-4. Pinned-host allocation strategy (bring-up chunks vs on demand) after the 120 GB crash is
-   root-caused.
+4. Whether the simulation's per-session byte model holds for vLLM 0.29 once P0(c) gives the
+   real pool and page sizes.
