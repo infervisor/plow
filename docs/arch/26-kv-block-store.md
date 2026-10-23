@@ -1,6 +1,6 @@
 # 26 — Prefix cache retention and the KV block store
 
-**Status: design (2026-10-23), two Codex rounds, retention simulated, nothing implemented.**
+**Status: design (2026-10-23), reviewed, retention simulated, nothing implemented.**
 Part A says what actually moves the production hit rate and is implementable on today's
 snapshot cache. Part B is the content-addressed block store that replaces the boundary
 snapshots of `docs/arch/22-kv-cache.md` §7–§9 and the AMD `SharedPrefix` with one substrate,
@@ -27,10 +27,20 @@ prompt shape, think median 10 s; two interleaved rounds agree within noise):
 | plowrt, MTP off | 41 / 271 | 10.8 / 23.0 | 74.4% |
 | plowrt, MTP on | 40 / 238 | 5.2 / 19.1 | 74.6% |
 
-At rate 2.7 (9.2–9.7 req/s) vLLM 0.28 saturates (TPOT p99 227–262 ms, goodput 81%) while plowrt
-holds TTFT 64/469, TPOT 13.0/46.2, hit 74.8%. The vLLM 0.29 arms and 45 s-think long arms are
-queued (`/home/lava/scratch/g26-vs-vllm/ab-long.sh`). Per token plowrt leads at every rate; the
-hit rates are equal on equal traffic. What production exposes is retention at 10 req/s.
+At rate 2.7 (9.2–9.7 req/s):
+
+| 9.7 req/s | TTFT p50/p99 | TPOT p50/p99 | goodput | hit |
+|---|---|---|---|---|
+| vLLM 0.28 | 230 / 1323–1630 | 36–37 / 227–262 | 81% | 60.1% |
+| vLLM 0.29 (prod version) | 118 / 592 | 16.9 / 61.6 | 100% | 75.6% |
+| plowrt, MTP off | 69 / 524–590 | 20.0 / 44.6 | 100% | 74.4–74.6% |
+| plowrt, MTP on | 64–65 / 438–469 | 11.6–13.0 / 45.9–46.2 | 100% | 74.8% |
+
+vLLM 0.29 is the real baseline: it does not saturate at this rate, and without MTP its TPOT p50
+is *better* than plowrt's (16.9 vs 20.0 ms) while its TTFT is 1.8× worse. plowrt's per-token
+lead at high rate is therefore TTFT always, TPOT only with MTP on. Hit rates are equal on equal
+traffic. The 45 s-think long arms are queued (`/home/lava/scratch/g26-vs-vllm/ab-long.sh`). What
+production exposes is retention at 10 req/s.
 
 ### 1.1 Where the bytes go today (26B FP8, `exec/gpu/prefix.rs:682-751`)
 
@@ -380,8 +390,9 @@ MTP-on; final numbers come from `campaign.py report` in the strict format of
 
 0. **Measure first (P0).** (a) Oracle ceiling of the replay plan: done, 81.1% (§1.2). (b) The
    production think-time distribution and the fraction of sessions whose end is detectable
-   (abort/disconnect) — from timestamps, no request bodies. (c) vLLM 0.29's real pool:
-   allocated KV bytes, groups, page sizes, hybrid-manager status, from its startup log. (d) The
+   (abort/disconnect) — from timestamps, no request bodies. (c) vLLM 0.29's real pool: done
+   on gpu03 with the prod flags — "Available KV cache memory: 44.07 GiB", 419,749 tokens
+   (≈ 112.6 KB/token), 25.6× concurrency at 16K; the 48 GB simulation column holds. (d) The
    120 GB pinned bring-up crash root-caused. (e) Today's snapshot cache with a bounded 60–100 GB
    host tier at rates 2.7 and 4.5 with think 20 s and 45 s — the retention columns of §1.2
    measured, not simulated.
