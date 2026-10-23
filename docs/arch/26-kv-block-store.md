@@ -1,6 +1,6 @@
 # 26 — Prefix cache retention and the KV block store
 
-**Status: design (2026-10-23), reviewed, retention simulated; Part A implemented (A1, A2); B1 and B3 implemented and on by default (exactness gate passed 2026-10-23, replay and Qwen gates below); B2 parked (no AMD box); B4 on CUDA: the snapshot copy path, its pool and pitched knobs and the store switch are gone (the store is the only boundary storage); the VMM multi-map of whole full-layer blocks and the AMD snapshot path remain (§5).**
+**Status: design (2026-10-23), reviewed, retention simulated; Part A implemented (A1, A2); B1 and B3 implemented and on by default (exactness gate passed 2026-10-23, replay and Qwen gates below); B2 parked (no AMD box); B4 on CUDA: the snapshot copy path, its pool and pitched knobs and the store switch are gone and `Prefix` blocks hold every full-layer row, so nothing is multi-mapped (gates pending); the AMD snapshot path remains (§5).**
 Part A says what actually moves the production hit rate and is implementable on today's
 snapshot cache. Part B is the content-addressed block store that replaces the boundary
 snapshots of `docs/arch/22-kv-cache.md` §7–§9 and the AMD `SharedPrefix` with one substrate,
@@ -459,10 +459,11 @@ Known limits of B1 (accepted until B4, each gated rather than assumed):
 ### B.7 What VMM still does
 
 Per-slot sparse growth of the full-layer tracks (`ensure_rows`, premap) and the live rings.
-Multi-mapping of whole 4096-row blocks is kept through B-phases 1–4 and removed only if the
-measured `Prefix` gather cost and copy amplification are within the gate; until then an
-aligned whole block attaches by map and the store copies the rest. Cached `Prefix` rows then
-exist once in the store and once per live slot (≈ 59 MB × in-flight slots, ~1.5 GB at 27).
+On CUDA the store holds every full-layer row of a boundary (`Prefix` blocks, B4): the radix
+tree indexes boundaries only, a publish takes no block references, an attach maps the slot's
+own blocks and gathers every row into them, and the strict-publish scale hazard is moot.
+Cached `Prefix` rows exist once in the store and once per live slot (≈ 59 MB × in-flight
+slots, ~1.5 GB at 27). The whole-block multi-map code remains for the AMD shared prefix (B2).
 
 ### B.8 Hardware and model coverage
 
@@ -569,7 +570,7 @@ MTP-on; final numbers come from `campaign.py report` in the strict format of
 | B1 | `memory/kv_store.rs`, CUDA ops, `Prefix` + `Window` (+ scales), block state machine, gather/scatter kernels, publish/attach at today's trigger points, today's eviction order, on by default once its gates passed (the switch went with B4's first step); TP=1; tier and demotion carried over | 1, 2, 3, 4 device-only, 5 |
 | B2 | AMD: `SharedPrefix` and the per-slot route on the store; HIP gather. Parked: the pool substrate (`SnapStore::Blocks`, `SnapBlocks`, `publish_blocks`) compiles under `hsa`; the engine-side gather needs a box | AMD rung + replay gates, when a box is available |
 | B3 | `State` class: the engine's `state.*` tensors captured at a chunk end aligned to the boundary (B.6a); GDN (Qwen3.8 27B) first, KDA (Kimi-K3) when its state tensors follow the same contract | 1 (state), 5 and replay on Qwen3.8 |
-| B4 | done on CUDA: the contiguous snapshot copies, `PLOW_VMM_SNAP_{PITCHED,POOL}` and `PLOW_KV_STORE` removed, the store is unconditional. Remaining: a `Prefix` class for the whole full-layer blocks so VMM multi-map, strict publish and stale/park/recycle can go, and the AMD snapshot path (B2); rewrite `docs/arch/22` §7–9 | copy-amplification gate; all production recipes re-qualified |
+| B4 | done on CUDA: the contiguous snapshot copies, `PLOW_VMM_SNAP_{PITCHED,POOL}` and `PLOW_KV_STORE` removed, the store is unconditional, `Prefix` blocks hold every full-layer row (no multi-map, no strict publish in this mode). Remaining: the AMD snapshot and multi-map path (B2); ring park/recycle stay (live-ring admission latency, not boundary storage); rewrite `docs/arch/22` §7–9 | exactness + FP32 gates, replay vs the multi-map build and vLLM |
 
 Metrics (Part B): `plowrt_kv_store_{blocks,bytes}{class,tier}`, `publish_{blocks,bytes,
 refused}_total`, `attach_{hits,misses,rows,wait}_total`, `attach_from_host_{total,bytes}`,

@@ -1,12 +1,14 @@
 //! The KV block store on the CUDA engine (`docs/arch/26-kv-block-store.md` Part B, B1).
 //!
 //! A boundary at `p_a` rows is a set of blocks: the sliding windows' last `window` rows and
-//! their fp8 ring scales in 32-row **window** blocks, the full layers' partial-block rows (and
-//! their fp8 scales) in 32-row **tail** blocks, and the full layers' whole-block fp8 scale
-//! prefix in `block_rows`-row **scale** blocks (the scale tensors are flat per slot, so only a
-//! copy survives slot reuse). Every block is keyed by the chained hash of the tokens up to its
-//! last row, so two boundaries of one conversation, or two conversations on one system prompt,
-//! share every block their rows have in common: a turn publishes only its new rows.
+//! their fp8 ring scales in 32-row **window** blocks, every full-layer row `[0, p_a)` with its
+//! fp8 scales in 32-row **prefix** blocks (`Class::Tail`), and for a recurrent model its
+//! state in one **state** block. Every block is keyed by the chained hash of the tokens up to
+//! its last row, so two boundaries of one conversation, or two conversations on one system
+//! prompt, share every block their rows have in common: a turn publishes only its new rows.
+//! The store is the only storage of a boundary: the pool's radix tree indexes boundaries and
+//! multi-maps nothing (`VmmKv::enable_block_store(.., true)`); an attach maps the slot's own
+//! blocks (`ensure_rows`) and gathers every row into them.
 //!
 //! The copies are segment tables (one 16-byte-aligned run per tensor and head per block)
 //! executed by one `plow_kv_segcopy` launch on the engine stream (PTX embedded, driver-JIT at

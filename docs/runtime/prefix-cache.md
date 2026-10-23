@@ -194,9 +194,9 @@ boundary, `retire_superseded`). The previous binary is the rollback.
 ### KV block store (CUDA, always on, `docs/arch/26-kv-block-store.md`)
 
 A boundary is a set of content-addressed blocks instead of one contiguous
-snapshot: 32-row blocks of the sliding windows (and their fp8 ring scales), 32-row blocks of the
-full layers' partial block (and their fp8 scales), whole-block fp8 scale prefixes, and for a
-recurrent model one state block per boundary. Each block is keyed by the chained hash of the
+snapshot: 32-row blocks of the sliding windows (and their fp8 ring scales), 32-row blocks of
+every full-layer row with its fp8 scales, and for a recurrent model one state block per
+boundary. Nothing is multi-mapped: an attach maps the slot's own blocks and gathers the rows. Each block is keyed by the chained hash of the
 tokens up to its last row, so the boundaries of one conversation and conversations on one
 system prompt share blocks; a turn's publish copies only its new rows and a retire frees only the
 rows nothing else uses. The boundary tree above is unchanged: it still decides which boundary
