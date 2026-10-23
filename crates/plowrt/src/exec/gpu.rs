@@ -7260,7 +7260,10 @@ impl GpuEngine {
                     // shrinks it below that when the rings grow.
                     if let (0, Some(bs)) = (cache_cap, blocks.as_ref()) {
                         bs.set_device_cap(free.saturating_sub(floor));
-                        bs.set_device_floor(floor);
+                        // Slot growth beyond the block pool creates blocks from free memory:
+                        // the store stops a pool's worth above the floor so that does not
+                        // trip the OOM path on every new slot.
+                        bs.set_device_floor(floor + (config.kv_pool_mib() << 20));
                     }
                 }
             }

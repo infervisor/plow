@@ -4614,7 +4614,17 @@ fn create_block(s: &Shared, inner: &mut Inner) -> Result<u32> {
                 if e.is_fatal() {
                     return Err(e);
                 }
-                if !steal_stale(s, inner) && !evict_one(s, inner, false) {
+                if steal_stale(s, inner) {
+                    continue;
+                }
+                // The block store gives memory back first: chunks its released blocks empty
+                // (compacting if needed). Evicting a boundary only feeds its reclaim list, so
+                // that comes last.
+                let shrunk = inner
+                    .block_store
+                    .as_ref()
+                    .map_or(0, |hook| hook.shrink(s.block_bytes));
+                if shrunk == 0 && !evict_one(s, inner, false) {
                     return Err(RuntimeError::Oom(format!("vmm kv block: {e}")));
                 }
             }
@@ -8318,6 +8328,53 @@ mod tests {
         assert_eq!(ops.maps.load(Ordering::SeqCst), maps, "nothing multi-mapped");
         p.ensure_rows(1, 17).unwrap();
         assert!(ops.maps.load(Ordering::SeqCst) > maps, "the slot grows its own blocks");
+        p.finish_attach(1);
+        policy::check_tree(&p.shared.inner.lock());
+    }
+
+    /// Counts shrink requests and grants each in full.
+    #[derive(Default)]
+    struct ShrinkBlocks {
+        shrinks: AtomicU64,
+    }
+    impl SnapBlocks for ShrinkBlocks {
+        fn release(&self, _handle: u64) {}
+        fn spill(&self, _handle: u64) -> bool {
+            false
+        }
+        fn restore(&self, _handle: u64) -> Result<()> {
+            Ok(())
+        }
+        fn reap(&self) {}
+        fn pending_spill_bytes(&self) -> u64 {
+            0
+        }
+        fn shrink(&self, bytes: u64) -> u64 {
+            self.shrinks.fetch_add(1, Ordering::SeqCst);
+            bytes
+        }
+    }
+
+    /// A slot block the driver cannot create asks the store for memory before any boundary
+    /// is evicted: evicting only feeds the store's reclaim list, which frees nothing.
+    #[test]
+    fn slot_growth_oom_shrinks_the_store_before_evicting_a_boundary() {
+        let ops = Arc::new(MockVmm::default());
+        let p = pool(ops.clone());
+        let hook = Arc::new(ShrinkBlocks::default());
+        p.enable_block_store(hook.clone(), true);
+        let a = prompt(17);
+        p.try_attach(0, &a).unwrap();
+        p.ensure_rows(0, 17).unwrap();
+        p.publish_blocks(0, &a, 16, Kind::PROMPT_END, || Ok((7, 100)))
+            .unwrap();
+        let hit = p.try_attach(1, &a).unwrap().expect("hit");
+        assert_eq!(hit.rows, 16);
+        ops.fail_creates.store(1, Ordering::SeqCst);
+        p.ensure_rows(1, 17).unwrap();
+        assert_eq!(hook.shrinks.load(Ordering::SeqCst), 1, "one shrink for the failed create");
+        let st = p.stats();
+        assert_eq!((st.snapshots_live, st.nodes_evicted), (1, 0), "nothing evicted");
         p.finish_attach(1);
         policy::check_tree(&p.shared.inner.lock());
     }
