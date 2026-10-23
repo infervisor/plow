@@ -541,10 +541,16 @@ MTP-on; final numbers come from `campaign.py report` in the strict format of
    120 GB pinned bring-up crash root-caused. (e) Today's snapshot cache with a bounded 60–100 GB
    host tier at rates 2.7 and 4.5 with think 20 s and 45 s — the retention columns of §1.2
    measured, not simulated.
-1. **Exactness.** Attach-then-decode logits (not only token digests) equal to the uncached
-   prefill at ctx 4094/4095/8191 and window edges (`p − w ± 32`), BF16 and FP8, both layer
-   kinds; the existing poison and boundary sweeps; multi-turn checkpoints and speculative
-   rollback on a `State` model (Part B).
+1. **Exactness.** Attach-then-decode logits (not only token digests) equal to the snapshot
+   path's attach (the qualified production path) at ctx 1000–12000 across the window edges and
+   the 4094/4095/4096/8191/8192 boundaries, FP8 KV, both layer kinds, multi-turn with a
+   sibling branch per conversation: measured 0 of 40 turns differing (2026-10-23, store build
+   41196f68 against a803cf92 with the store off). The uncached prefill is **not** a valid
+   reference: the suffix prefill runs different GEMM shapes, so any attach differs from the
+   cold prefill at the first logprob (37 of 40 turns on the snapshot path itself, text flips
+   only on the flat-distribution 12K random-word prompts). The existing poison and boundary
+   sweeps; on a `State` model the within-path check (the same server probed twice, cold then
+   attached) and the FP32-reference gate at c1.
 2. **Lifecycle faults (Part B).** Forced eviction, slab exhaustion, delayed copies, concurrent
    attach/publish/spill on one key, cancellation mid-gather, slot reuse, hash collisions,
    partial-block boundaries, `Migrating` races — each with value checks.
