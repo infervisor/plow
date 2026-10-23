@@ -360,6 +360,14 @@ out free slots from its fullest chunk so that emptier chunks keep draining, and 
 whole chunks whose remaining blocks are all reclaimable (emptiest first), so a chunk's blocks are
 of one age and a few boundary evictions free a chunk rather than scattering holes.
 
+The second replay (budget 48 GiB) held only 27 GB of blocks with 209 live boundaries against
+the snapshot path's 40 GB and 245: boundaries die by LRU scattered over chunks, so chunks rarely
+emptied and the pressure loop evicted further boundaries to free whole ones. `shrink` now
+compacts: it drops the oldest unreferenced blocks in other chunks to make holes, moves the
+emptiest chunk's live blocks into them (one drained device copy each, `compactions_total`,
+`compact_bytes_total`) and releases the chunk; a chunk with a held, filling or spilling block
+is left alone. `device_reserved_bytes` (used plus holes) beside `device_bytes` shows the packing.
+
 Host tier, as measured on the first replay with a 60 GB tier: every spilled block was copied
 back by the next publish that met it (143k synchronous restores in ten minutes) and the host
 victim search scanned every block per spilled block, which held the engine thread (TPOT p50 8 →
@@ -394,7 +402,12 @@ added, so a turn costs its new rows, not a whole window. The pool's own host tie
 under the store; `PLOW_VMM_HOST_CACHE_MIB` caps the store's pinned slabs instead. Multi-mapping of
 whole full-layer blocks is unchanged (B.7).
 
-Recurrent models (B3): the prefill chunk that would cross the prompt-end boundary is cut to end
+Recurrent models (B3): the Qwen3.8 packet keeps head-interleaved rows in its full-attention
+caches (the LIVE manifest's `layout`), which the prefix geometry had mapped head-major, so the
+first prefix-mode request faulted at row 1024 of a slot; the geometry now folds those heads into
+the row (one track of `heads × hd` per layer), and the mapping, the tail blocks and the partial
+copies follow the rows the kernels write. The serve manifest's KV geometry also skips
+`linear_attention` layers instead of rejecting the config. The prefill chunk that would cross the prompt-end boundary is cut to end
 exactly there (`state_capture_cap`; only when at least the smallest prefill bucket is left to
 it) and the boundary is published at that chunk end, while the state tensors hold the state
 after its rows (`state_capture_publish`); the later prompt-end publish finds it and touches it.

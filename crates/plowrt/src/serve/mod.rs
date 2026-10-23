@@ -2395,6 +2395,9 @@ fn kv_store_metrics(state: &AppState, out: &mut String) {
         ("restores_total", "counter", "Blocks copied back from the host tier (memcpy fallback)."),
         ("host_reads_total", "counter", "Blocks a gather read from the host tier in place."),
         ("evictions_total", "counter", "Blocks dropped from a tier."),
+        ("compactions_total", "counter", "Live blocks moved so that a chunk could be released."),
+        ("compact_bytes_total", "counter", "Bytes those moves copied."),
+        ("device_reserved_bytes", "gauge", "Device bytes reserved in chunks (used plus holes)."),
         ("publishes_total", "counter", "Boundaries published into the store."),
         ("publish_us_total", "counter", "Engine-thread microseconds in publishes."),
         ("publish_sync_us_total", "counter", "Of which draining the stream."),
@@ -2432,6 +2435,9 @@ fn kv_store_metrics(state: &AppState, out: &mut String) {
              plowrt_kv_store_restores_total{{model=\"{slug}\"}} {}\n\
              plowrt_kv_store_host_reads_total{{model=\"{slug}\"}} {}\n\
              plowrt_kv_store_evictions_total{{model=\"{slug}\"}} {}\n\
+             plowrt_kv_store_compactions_total{{model=\"{slug}\"}} {}\n\
+             plowrt_kv_store_compact_bytes_total{{model=\"{slug}\"}} {}\n\
+             plowrt_kv_store_device_reserved_bytes{{model=\"{slug}\"}} {}\n\
              plowrt_kv_store_publishes_total{{model=\"{slug}\"}} {}\n\
              plowrt_kv_store_published_blocks_total{{model=\"{slug}\"}} {}\n\
              plowrt_kv_store_published_new_blocks_total{{model=\"{slug}\"}} {}\n\
@@ -2453,6 +2459,9 @@ fn kv_store_metrics(state: &AppState, out: &mut String) {
             s.store.restores,
             s.store.host_reads,
             s.store.evictions,
+            s.store.compactions,
+            s.store.compact_bytes,
+            s.store.device_reserved_bytes,
             s.publishes,
             s.published_blocks,
             s.published_new_blocks,

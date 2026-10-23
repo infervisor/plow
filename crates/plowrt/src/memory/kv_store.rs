@@ -35,6 +35,8 @@ pub trait StoreOps: Send + Sync {
     fn fence_done(&self, fence: u64) -> Result<bool>;
     /// H2D, complete on return.
     fn copy_htod(&self, va: u64, host: u64, bytes: u64) -> Result<()>;
+    /// D2D, complete on return.
+    fn copy_dtod(&self, dst: u64, src: u64, bytes: u64) -> Result<()>;
 }
 
 impl<T: VmmOps + ?Sized> StoreOps for T {
@@ -58,6 +60,9 @@ impl<T: VmmOps + ?Sized> StoreOps for T {
     }
     fn copy_htod(&self, va: u64, host: u64, bytes: u64) -> Result<()> {
         VmmOps::copy_htod(self, va, host, bytes)
+    }
+    fn copy_dtod(&self, dst: u64, src: u64, bytes: u64) -> Result<()> {
+        VmmOps::copy_dtod_sync(self, dst, src, bytes)
     }
 }
 
@@ -215,6 +220,26 @@ impl Slab {
         Ok(Some(first))
     }
 
+    /// A free slot in any chunk but `not`, the fullest first; no growth.
+    fn take_outside(&mut self, not: u32) -> Option<u32> {
+        let &(n, c) = self.by_free.iter().find(|&&(_, c)| c != not)?;
+        self.by_free.remove(&(n, c));
+        let s = self.free[c as usize].pop().expect("counted free slot");
+        if n > 1 {
+            self.by_free.insert((n - 1, c));
+        }
+        self.free_slots -= 1;
+        Some(s)
+    }
+
+    fn holes_outside(&self, not: u32) -> u64 {
+        self.free_slots - self.free[not as usize].len() as u64
+    }
+
+    fn chunk_of(&self, slot: u32) -> u32 {
+        slot / self.chunk_slots
+    }
+
     fn assign(&mut self, slot: u32, id: BlockId) {
         self.owner[slot as usize] = Some(id);
     }
@@ -303,6 +328,11 @@ pub struct StoreStats {
     /// Blocks a gather read from the host tier in place.
     pub host_reads: u64,
     pub evictions: u64,
+    /// Live blocks moved out of a chunk so that it could be released (`shrink`).
+    pub compactions: u64,
+    pub compact_bytes: u64,
+    /// Device bytes reserved in chunks (used + holes).
+    pub device_reserved_bytes: u64,
 }
 
 struct Inner {
@@ -892,6 +922,100 @@ impl KvStore {
                     .release_empty_chunks(|va| self.ops.free(va));
             }
         }
+        // Compaction: empty the emptiest chunk by dropping its reclaimable blocks and moving
+        // its live ones into holes elsewhere (one drained copy each), then release it. Holes
+        // are made first from the oldest blocks nothing references (the reclaim list), in
+        // other chunks. A chunk with a held, filling or spilling block, or more live blocks
+        // than holes can be made for, is left alone; the pool then evicts a boundary.
+        for ci in 0..inner.classes.len() {
+            if released >= bytes {
+                break;
+            }
+            'chunks: for chunk in inner.classes[ci].device.release_candidates() {
+                if released >= bytes {
+                    break;
+                }
+                let ids = inner.classes[ci].device.occupants(chunk);
+                let mut live = 0u64;
+                for &id in &ids {
+                    match inner.blocks[id as usize].as_ref() {
+                        Some(b) if b.holds > 0 || b.state == State::Filling => continue 'chunks,
+                        Some(b) if !matches!(b.place, Where::Device(_)) => continue 'chunks,
+                        Some(b) if b.dependents > 0 => live += 1,
+                        _ => {}
+                    }
+                }
+                let mut deficit = live.saturating_sub(inner.classes[ci].device.holes_outside(chunk));
+                if deficit > 0 {
+                    let mut requeue = Vec::new();
+                    while deficit > 0 {
+                        let Some(id) = inner.reclaim[ci].pop_front() else {
+                            break;
+                        };
+                        let Some(b) = inner.blocks[id as usize].as_ref() else {
+                            continue;
+                        };
+                        if b.dependents > 0 {
+                            continue;
+                        }
+                        let Where::Device(slot) = b.place else {
+                            requeue.push(id);
+                            continue;
+                        };
+                        if b.holds > 0
+                            || b.state == State::Filling
+                            || inner.classes[ci].device.chunk_of(slot) == chunk
+                        {
+                            requeue.push(id);
+                            continue;
+                        }
+                        self.drop_block(&mut inner, id);
+                        inner.stats.evictions += 1;
+                        deficit -= 1;
+                    }
+                    for id in requeue.into_iter().rev() {
+                        inner.reclaim[ci].push_front(id);
+                    }
+                    if deficit > 0 {
+                        continue;
+                    }
+                }
+                let bytes_per = inner.classes[ci].spec.block_bytes();
+                for id in ids {
+                    let Some(b) = inner.blocks[id as usize].as_ref() else {
+                        continue;
+                    };
+                    if b.dependents == 0 {
+                        self.drop_block(&mut inner, id);
+                        inner.stats.evictions += 1;
+                        continue;
+                    }
+                    let Where::Device(from) = b.place else {
+                        continue;
+                    };
+                    let Some(to) = inner.classes[ci].device.take_outside(chunk) else {
+                        break 'chunks;
+                    };
+                    let (src, dst) = {
+                        let d = &inner.classes[ci].device;
+                        (d.va(from), d.va(to))
+                    };
+                    if let Err(e) = self.ops.copy_dtod(dst, src, bytes_per) {
+                        inner.classes[ci].device.put(to);
+                        tracing::warn!(error = %e, "kv store: compaction copy failed");
+                        break 'chunks;
+                    }
+                    inner.classes[ci].device.assign(to, id);
+                    inner.classes[ci].device.put(from);
+                    inner.blocks[id as usize].as_mut().expect("block").place = Where::Device(to);
+                    inner.stats.compactions += 1;
+                    inner.stats.compact_bytes += bytes_per;
+                }
+                released += inner.classes[ci]
+                    .device
+                    .release_empty_chunks(|va| self.ops.free(va));
+            }
+        }
         for c in inner.classes.iter_mut() {
             released += c.device.release_empty_chunks(|va| self.ops.free(va));
         }
@@ -905,7 +1029,10 @@ impl KvStore {
     }
 
     pub fn stats(&self) -> StoreStats {
-        self.inner.lock().stats.clone()
+        let inner = self.inner.lock();
+        let mut s = inner.stats.clone();
+        s.device_reserved_bytes = inner.classes.iter().map(|c| c.device.reserved_bytes()).sum();
+        s
     }
 
     pub fn device_bytes(&self) -> u64 {
@@ -958,6 +1085,7 @@ mod tests {
         dev_alloc: AtomicU64,
         host_alloc: AtomicU64,
         htod: AtomicU64,
+        dtod: AtomicU64,
     }
 
     impl MockOps {
@@ -967,6 +1095,7 @@ mod tests {
                 dev_alloc: AtomicU64::new(0),
                 host_alloc: AtomicU64::new(0),
                 htod: AtomicU64::new(0),
+                dtod: AtomicU64::new(0),
             })
         }
     }
@@ -990,6 +1119,10 @@ mod tests {
         }
         fn copy_htod(&self, _va: u64, _host: u64, _bytes: u64) -> Result<()> {
             self.htod.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+        fn copy_dtod(&self, _dst: u64, _src: u64, _bytes: u64) -> Result<()> {
+            self.dtod.fetch_add(1, Ordering::SeqCst);
             Ok(())
         }
     }
@@ -1217,21 +1350,21 @@ mod tests {
             s.seal(id);
         }
         assert_eq!(s.device_bytes(), 2 * 64, "chunk 0 = blocks 1,2; chunk 1 = blocks 3,4");
-        // A reclaimable block in each chunk; at the cap a new block takes the oldest one's slot.
+        // A dead block in each chunk: compaction packs the two live ones into one chunk.
         s.release(&ids[1..3]);
-        s.shrink(64);
-        assert_eq!(s.device_bytes(), 2 * 64, "no chunk is all reclaimable yet");
+        assert_eq!(s.shrink(64), 64);
+        assert_eq!(s.device_bytes(), 64, "blocks 1 and 4 remain");
+        assert_eq!(ops.dtod.load(Ordering::SeqCst), 1);
+        // Under the cap a new block grows a chunk again (one slot of it free).
         let e = s.acquire(0, key(5)).unwrap();
         assert!(e.fill);
-        assert_eq!(s.device_bytes(), 2 * 64, "the new block took a reclaimed slot");
-        // Chunk 0 = blocks 1, 5; chunk 1 = block 3 (reclaimable), 4 (one dependent).
-        assert_eq!(s.shrink(64), 0);
+        assert_eq!(s.device_bytes(), 64 + 32);
+        assert_eq!(s.shrink(64), 0, "every block is referenced: nothing to release");
+        // Block 4 dies: its slot takes block 5, the sparse chunk goes back.
         s.release(&ids[3..]);
-        // Block 3 (if still there) and block 4 are reclaimable: whichever chunk only holds
-        // reclaimable blocks goes back.
         assert_eq!(s.shrink(64), 64);
-        assert_eq!(s.device_bytes(), 64);
-        assert!(s.acquire(0, key(4)).unwrap().fill, "block 4 was dropped with its chunk");
+        assert_eq!(s.device_bytes(), 64, "blocks 1 and 5, packed");
+        assert!(s.acquire(0, key(4)).unwrap().fill, "block 4 was dropped");
     }
 
     #[test]
@@ -1325,6 +1458,41 @@ mod tests {
         assert!(!s.spill(&[b.id]), "the only host slot is held");
         s.unhold(&[a.id]);
         assert_ne!(va, 0);
+    }
+
+    #[test]
+    fn shrink_compacts_a_sparse_chunk_into_holes_elsewhere() {
+        let ops = MockOps::new();
+        let s = KvStore::new(
+            ops.clone(),
+            vec![ClassSpec {
+                name: "window",
+                row_bytes: 8,
+                rows_per_block: 4,
+            }],
+            64, // two blocks per chunk
+            2 * 64,
+            0,
+        );
+        // Chunk 0 = blocks 1, 2; chunk 1 = blocks 3, 4. Blocks 2 and 3 die: a hole in each
+        // chunk, none releasable as is.
+        let ids: Vec<_> = (1..=4).map(|i| s.acquire(0, key(i)).unwrap().id).collect();
+        for &id in &ids {
+            s.seal(id);
+        }
+        s.release(&ids[1..3]);
+        assert_eq!(s.shrink(64), 64, "block 4 moved into chunk 0's hole, chunk 1 released");
+        assert_eq!(ops.dtod.load(Ordering::SeqCst), 1);
+        let st = s.stats();
+        assert_eq!((st.compactions, st.compact_bytes, st.device_reserved_bytes), (1, 32, 64));
+        assert_eq!(s.device_bytes(), 64, "blocks 1 and 4 remain, packed");
+        assert!(matches!(s.location(ids[3]), Some(Location::Device(_))));
+        assert!(!s.acquire(0, key(4)).unwrap().fill, "block 4 is still present");
+        // A held block pins its chunk: nothing to release.
+        s.hold(&[ids[0]]);
+        s.release(&[ids[3]]);
+        assert_eq!(s.shrink(64), 0);
+        s.unhold(&[ids[0]]);
     }
 
     #[test]

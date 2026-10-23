@@ -4148,6 +4148,9 @@ impl GpuEngine {
                     config,
                     be.compute_capability(),
                     granularity,
+                    live_kv_manifest
+                        .as_ref()
+                        .map_or(Some(false), |m| m.full_rows_interleaved()),
                 )
             });
         let prefix_requested = config.nv_prefix_requested(prefix_layout.is_some());

@@ -2500,6 +2500,32 @@ impl crate::memory::vmm::VmmOps for CudaBackend {
             "cuMemcpyHtoD(vmm restore)",
         )
     }
+
+    fn copy_dtod_sync(&self, dst: u64, src: u64, bytes: u64) -> Result<()> {
+        self.bind()?;
+        let mut tier = self.copy_tier.lock();
+        let tier = match tier.as_mut() {
+            Some(t) => t,
+            None => tier.insert(CopyTier {
+                stream: self.stream_create()?,
+                events: FxHashMap::default(),
+                spare: Vec::new(),
+                failed: Default::default(),
+            }),
+        };
+        // SAFETY: both ranges are live `bytes`-long device allocations from `alloc` that no
+        // stream touches until this returns (store contract); the copy is drained here.
+        self.check(
+            unsafe {
+                (self.api.cuMemcpyDtoDAsync_v2)(dst, src, bytes as usize, tier.stream.raw as CUstream)
+            },
+            "cuMemcpyDtoDAsync(kv store compaction)",
+        )?;
+        self.check(
+            unsafe { (self.api.cuStreamSynchronize)(tier.stream.raw as CUstream) },
+            "cuStreamSynchronize(kv store compaction)",
+        )
+    }
 }
 
 impl Drop for CudaBackend {

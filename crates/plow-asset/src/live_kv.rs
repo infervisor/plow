@@ -197,6 +197,15 @@ pub fn emit(packet: &Packet<'_>) -> Result<Manifest> {
 }
 
 impl Manifest {
+    /// Whether the full-attention caches (no window) keep head-interleaved rows
+    /// ([`LAYOUT_ROW_INTERLEAVED`]); `None` when they disagree. `Some(false)` with no full cache.
+    pub fn full_rows_interleaved(&self) -> Option<bool> {
+        let mut full = self.caches.iter().filter(|c| c.window == 0);
+        let first = full.next().map_or(LAYOUT_HEAD_MAJOR, |c| c.layout);
+        full.all(|c| c.layout == first)
+            .then_some(first == LAYOUT_ROW_INTERLEAVED)
+    }
+
     pub fn validate(&self, packet: &Packet<'_>) -> Result<()> {
         require(
             self.version

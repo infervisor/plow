@@ -196,12 +196,15 @@ impl GpuEngine {
         self.vmm.as_ref().and_then(|v| Some((v, v.prefix_kv()?)))
     }
 
+    /// `row_interleaved`: the LIVE manifest's full-cache row layout
+    /// ([`plow_asset::live_kv::Manifest::full_rows_interleaved`]); `None` = mixed, no layout.
     pub(crate) fn select_vmm_prefix_layout(
         blob: &DevBlob,
         kv: Option<&plow_asset::serve_manifest::KvGeometry>,
         config: &RuntimeConfig,
         capability: (u32, u32),
         granularity: u64,
+        row_interleaved: Option<bool>,
     ) -> Option<VmmPrefixLayout> {
         // Overlay rows (audio, voice conditioning) are not keyed by the prompt ids.
         if blob.tensors.iter().any(|t| t.name == "in.encoder_overlay") {
@@ -225,7 +228,7 @@ impl GpuEngine {
         {
             return None;
         }
-        let layout = Self::vmm_prefix_layout(blob, kv)?;
+        let layout = Self::vmm_prefix_layout(blob, kv, row_interleaved)?;
         if requested.is_none() {
             // Auto-selection is an allowlist of the geometry the sliding-ring
             // snapshot path was qualified on (Gemma 4 hybrid KV), not a
@@ -268,6 +271,7 @@ impl GpuEngine {
     pub(crate) fn vmm_prefix_layout(
         blob: &DevBlob,
         kv: Option<&plow_asset::serve_manifest::KvGeometry>,
+        row_interleaved: Option<bool>,
     ) -> Option<VmmPrefixLayout> {
         let batch = blob.decode_prog().ok()?.t;
         let packet_max_ctx = blob
@@ -287,6 +291,29 @@ impl GpuEngine {
             return None;
         };
         let find = |name: &str| blob.tensors.iter().position(|t| t.name == name);
+        // Head-interleaved full-layer rows (`[slot][ctx][head][hd]`, Qwen3.8): one position's
+        // heads are one row, so the geometry folds the heads into the row and every track is
+        // one head of `kvh * hd` elements; the mapping, the tail blocks and the partial copies
+        // then follow the rows the kernels write. Interleaved fp8 scales have no layout here.
+        match row_interleaved {
+            Some(false) => {}
+            Some(true) => {
+                if geo
+                    .full_layers
+                    .iter()
+                    .any(|&l| find(&format!("kv.{l}.k_scale")).is_some())
+                {
+                    tracing::warn!("vmm off: head-interleaved fp8 full-layer scales are not laid out");
+                    return None;
+                }
+                geo.hd_full *= geo.kvh_full;
+                geo.kvh_full = 1;
+            }
+            None => {
+                tracing::warn!("vmm off: full-layer caches disagree on their row layout");
+                return None;
+            }
+        }
 
         // KV dtype per layer group, resolved from the blob itself: the
         // emitter declares `kv.{l}.k_scale`/`.v_scale` iff that layer's cache
