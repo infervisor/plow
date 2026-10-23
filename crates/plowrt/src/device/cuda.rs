@@ -2439,10 +2439,11 @@ impl crate::memory::vmm::VmmOps for CudaBackend {
                 failed: Default::default(),
             }),
         };
+        let mut queued = Ok(());
         for &(dst, src, bytes) in copies {
             // SAFETY: both ranges are live `bytes`-long device allocations from `alloc` that no
             // stream touches until this returns (store contract); the copies are drained below.
-            self.check(
+            queued = self.check(
                 unsafe {
                     (self.api.cuMemcpyDtoDAsync_v2)(
                         dst,
@@ -2452,12 +2453,18 @@ impl crate::memory::vmm::VmmOps for CudaBackend {
                     )
                 },
                 "cuMemcpyDtoDAsync(kv store compaction)",
-            )?;
+            );
+            if queued.is_err() {
+                break;
+            }
         }
-        self.check(
+        // Drained on every exit: the caller hands the destination slots out again as soon as
+        // this returns, including after a failed enqueue with earlier copies still in flight.
+        let drained = self.check(
             unsafe { (self.api.cuStreamSynchronize)(tier.stream.raw as CUstream) },
             "cuStreamSynchronize(kv store compaction)",
-        )
+        );
+        queued.and(drained)
     }
 }
 

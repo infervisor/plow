@@ -862,14 +862,14 @@ impl KvStore {
         let budget = inner.host_cap.saturating_sub(reserved);
         let Inner { classes, host_spare, .. } = inner;
         let spare = &mut host_spare[class];
-        // Growth takes a chunk the grower allocated ahead; none ready = no growth now (the
-        // block stays on the device and the pool drops its boundary instead of stalling).
+        // Growth takes a chunk the grower allocated ahead; none ready = no growth now, the
+        // slot comes from a reclaim below or the block stays on the device.
         let taken = classes[class].host.take(budget, |_| {
             spare
                 .pop()
                 .ok_or_else(|| RuntimeError::Oom("kv store: no spare host chunk".into()))
         });
-        if let Some(s) = taken.ok()? {
+        if let Ok(Some(s)) = taken {
             return Some(s);
         }
         // The oldest zero-dependent host block of this class gives up its slot; stale entries
@@ -1492,6 +1492,38 @@ mod tests {
         s.seal(a.id);
         assert!(!s.spill(&[a.id]));
         assert_eq!(s.location(a.id), Some(Location::Device(a.va)));
+    }
+
+    #[test]
+    fn no_spare_host_chunk_reclaims_a_host_block_under_the_cap() {
+        // Cap for two chunks, one grown ahead: the second spill finds headroom but no spare.
+        let ops = MockOps::new();
+        let s = KvStore::new(
+            ops.clone(),
+            vec![ClassSpec {
+                name: "window",
+                row_bytes: 8,
+                rows_per_block: 4,
+            }],
+            32,
+            2 * 32,
+            2 * 32,
+        );
+        assert!(s.host_grow_step());
+        let a = s.acquire(0, key(1)).unwrap();
+        let b = s.acquire(0, key(2)).unwrap();
+        s.seal(a.id);
+        s.seal(b.id);
+        s.release(&[a.id, b.id]);
+        assert!(s.spill(&[a.id]));
+        s.reap();
+        assert_eq!(s.location(a.id), Some(Location::Host));
+        assert!(s.spill(&[b.id]), "a's host slot is reclaimed, not refused");
+        s.reap();
+        assert_eq!(s.location(a.id), None, "the oldest zero-dependent host block gave way");
+        assert_eq!(s.location(b.id), Some(Location::Host));
+        assert_eq!(s.stats().classes[0].host_blocks, 1);
+        assert_eq!(ops.host_alloc.load(Ordering::SeqCst), 32, "no second chunk");
     }
 
     #[test]
