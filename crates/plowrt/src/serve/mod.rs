@@ -2404,6 +2404,7 @@ fn kv_store_metrics(state: &AppState, out: &mut String) {
         ("host_grow_us_total", "counter", "Microseconds in host tier chunk allocations (pool lock held)."),
         ("spill_us_total", "counter", "Microseconds in spills (pool lock held)."),
         ("shrink_us_total", "counter", "Microseconds in shrinks and compaction (pool lock held)."),
+        ("shrinks_total", "counter", "Shrink calls (one per pressure-loop iteration)."),
         ("publishes_total", "counter", "Boundaries published into the store."),
         ("publish_us_total", "counter", "Engine-thread microseconds in publishes."),
         ("publish_sync_us_total", "counter", "Of which draining the stream."),
@@ -2450,6 +2451,7 @@ fn kv_store_metrics(state: &AppState, out: &mut String) {
              plowrt_kv_store_host_grow_us_total{{model=\"{slug}\"}} {}\n\
              plowrt_kv_store_spill_us_total{{model=\"{slug}\"}} {}\n\
              plowrt_kv_store_shrink_us_total{{model=\"{slug}\"}} {}\n\
+             plowrt_kv_store_shrinks_total{{model=\"{slug}\"}} {}\n\
              plowrt_kv_store_publishes_total{{model=\"{slug}\"}} {}\n\
              plowrt_kv_store_published_blocks_total{{model=\"{slug}\"}} {}\n\
              plowrt_kv_store_published_new_blocks_total{{model=\"{slug}\"}} {}\n\
@@ -2480,6 +2482,7 @@ fn kv_store_metrics(state: &AppState, out: &mut String) {
             s.store.host_grow_us,
             s.store.spill_us,
             s.store.shrink_us,
+            s.store.shrinks,
             s.publishes,
             s.published_blocks,
             s.published_new_blocks,

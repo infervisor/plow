@@ -1315,6 +1315,8 @@ pub trait SnapBlocks: Send + Sync {
     fn restore(&self, handle: u64) -> Result<()>;
     /// Retire completed spills.
     fn reap(&self);
+    /// Bytes of spills in flight (device memory coming free once they retire).
+    fn pending_spill_bytes(&self) -> u64;
     /// Device pressure: drop released blocks and give empty slabs back; bytes released.
     fn shrink(&self, bytes: u64) -> u64;
 }
@@ -4717,7 +4719,22 @@ fn trim_cache_by(
             // them, or one floor flushes every prefix the thread has not caught up with.
             // (Pooled blocks are not free and not credited; the pool cap bounds them.)
             let queued = inner.release_queued;
-            while free + (inner.release_queued - queued) + pending_spill_bytes(inner) < min_free {
+            loop {
+                // The store's spills in flight are credited too, and retired first so their
+                // device slots can go back: without either the loop evicted and spilled
+                // every boundary it had before one copy completed.
+                let store_pending = match &inner.block_store {
+                    Some(hook) => {
+                        hook.reap();
+                        hook.pending_spill_bytes()
+                    }
+                    None => 0,
+                };
+                if free + (inner.release_queued - queued) + pending_spill_bytes(inner) + store_pending
+                    >= min_free
+                {
+                    break;
+                }
                 // The block store gives memory back first: blocks of boundaries already evicted
                 // (its reclaim list) and the slabs they empty; evicting more boundaries only
                 // feeds that list.

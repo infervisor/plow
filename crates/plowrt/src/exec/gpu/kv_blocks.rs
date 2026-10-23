@@ -100,6 +100,7 @@ pub struct BlockServe {
     /// ([`GpuEngine::flush_deferred_attach`]).
     held: Mutex<Vec<Vec<BlockId>>>,
     stats: Mutex<BlockServeStats>,
+    grower_stop: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl BlockServe {
@@ -174,6 +175,23 @@ impl BlockServe {
             host_cap,
         ));
         let batch = g.batch as usize;
+        // Pinned chunks are allocated ahead on their own thread (`host_grow_step`), never
+        // under the pool lock; the thread ends with the store.
+        let grower_stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        if host_cap > 0 {
+            let store = Arc::clone(&store);
+            let stop = Arc::clone(&grower_stop);
+            std::thread::Builder::new()
+                .name("kv-store-host-grower".into())
+                .spawn(move || {
+                    while !stop.load(Ordering::Relaxed) {
+                        if !store.host_grow_step() {
+                            std::thread::sleep(std::time::Duration::from_millis(2));
+                        }
+                    }
+                })
+                .map_err(|e| RuntimeError::Rejected(format!("kv store: host grower: {e}")))?;
+        }
         tracing::info!(
             window_row,
             tail_row,
@@ -198,6 +216,7 @@ impl BlockServe {
             kernel,
             tables: Mutex::new((0..batch).map(|_| None).collect()),
             held: Mutex::new(vec![Vec::new(); batch]),
+            grower_stop,
             stats: Mutex::new(BlockServeStats::default()),
         }))
     }
@@ -256,6 +275,7 @@ impl BlockServe {
 
 impl Drop for BlockServe {
     fn drop(&mut self) {
+        self.grower_stop.store(true, Ordering::Relaxed);
         for t in self.tables.get_mut().iter_mut().flatten() {
             VmmOps::free(&*self.be, t.dev);
         }
@@ -296,6 +316,10 @@ impl SnapBlocks for BlockServe {
 
     fn reap(&self) {
         self.store.reap();
+    }
+
+    fn pending_spill_bytes(&self) -> u64 {
+        self.store.pending_spill_bytes()
     }
 
     fn shrink(&self, bytes: u64) -> u64 {

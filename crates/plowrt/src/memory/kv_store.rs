@@ -347,9 +347,10 @@ pub struct StoreStats {
     pub device_grow_us: u64,
     pub host_grows: u64,
     pub host_grow_us: u64,
-    /// Wall time in `spill` and `shrink` (both run under the pool lock).
+    /// Wall time in `spill` and `shrink` (both run under the pool lock), and shrink calls.
     pub spill_us: u64,
     pub shrink_us: u64,
+    pub shrinks: u64,
 }
 
 struct Inner {
@@ -372,8 +373,13 @@ struct Inner {
     reclaim: Vec<VecDeque<BlockId>>,
     /// The same for host-resident blocks (spilled with no dependent, or released on the host).
     host_reclaim: Vec<VecDeque<BlockId>>,
-    /// Blocks with a D2H copy in flight, oldest first ([`KvStore::reap`]).
-    spilling: VecDeque<BlockId>,
+    /// Blocks with a D2H copy in flight, oldest first, with their bytes ([`KvStore::reap`]).
+    spilling: VecDeque<(BlockId, u64)>,
+    /// Bytes of those copies: device memory the pool may count as coming free.
+    spilling_bytes: u64,
+    /// Pinned chunks per class allocated ahead by [`KvStore::host_grow_step`] (a pinned
+    /// allocation costs ~4 ms per 8 MiB; under the pool lock it was the host tier's TTFT tail).
+    host_spare: Vec<Vec<u64>>,
     tick: u64,
     stats: StoreStats,
 }
@@ -397,6 +403,8 @@ pub struct Acquire {
 const HOST_FLOOR_EVERY: u64 = 16;
 /// Device chunks allocated between two free-memory queries of the device-floor check.
 const DEVICE_FLOOR_EVERY: u64 = 8;
+/// Pinned bytes per class the host grower keeps allocated ahead (at least one chunk).
+const HOST_SPARE_BYTES: u64 = 256 << 20;
 
 impl KvStore {
     /// `device_cap` / `host_cap`: bytes the store may reserve on each tier over every class
@@ -438,6 +446,8 @@ impl KvStore {
                 reclaim: (0..n_classes).map(|_| VecDeque::new()).collect(),
                 host_reclaim: (0..n_classes).map(|_| VecDeque::new()).collect(),
                 spilling: VecDeque::new(),
+                spilling_bytes: 0,
+                host_spare: (0..n_classes).map(|_| Vec::new()).collect(),
                 tick: 0,
                 stats,
             }),
@@ -832,7 +842,8 @@ impl KvStore {
                 Ok(fence) => {
                     let b = inner.blocks[id as usize].as_mut().expect("block");
                     b.place = Where::Spilling { dev, host: h, fence };
-                    inner.spilling.push_back(id);
+                    inner.spilling.push_back((id, bytes));
+                    inner.spilling_bytes += bytes;
                     inner.stats.spills += 1;
                 }
                 Err(_) => {
@@ -846,41 +857,18 @@ impl KvStore {
     }
 
     fn host_slot(&self, inner: &mut Inner, class: usize) -> Option<u32> {
-        let ops = &self.ops;
+        // Spares are already paid for against the cap: only live chunks count here.
         let reserved: u64 = inner.classes.iter().map(|c| c.host.reserved_bytes()).sum();
-        if !inner.classes[class].host.has_free() && inner.host_reserve > 0 {
-            // Every `HOST_FLOOR_EVERY` chunks: is the host still above its reserve with that
-            // many more pinned? If not the tier stops growing here, for good.
-            let chunk = inner.classes[class].host.chunk_bytes();
-            if inner.stats.host_grows % HOST_FLOOR_EVERY == 0 {
-                if let Some((avail, _)) = crate::memory::vmm::host_mem_available() {
-                    if avail < chunk.saturating_mul(HOST_FLOOR_EVERY).saturating_add(inner.host_reserve)
-                    {
-                        if inner.host_cap > reserved {
-                            tracing::warn!(
-                                available_mib = avail >> 20,
-                                reserve_mib = inner.host_reserve >> 20,
-                                reserved_mib = reserved >> 20,
-                                "kv store: host tier frozen at the host reserve"
-                            );
-                        }
-                        inner.host_cap = reserved;
-                    }
-                }
-            }
-        }
         let budget = inner.host_cap.saturating_sub(reserved);
-        let mut grow_us = None;
-        let taken = inner.classes[class].host.take(budget, |bytes| {
-            let t = std::time::Instant::now();
-            let r = ops.host_alloc(bytes);
-            grow_us = Some(t.elapsed().as_micros() as u64);
-            r
+        let Inner { classes, host_spare, .. } = inner;
+        let spare = &mut host_spare[class];
+        // Growth takes a chunk the grower allocated ahead; none ready = no growth now (the
+        // block stays on the device and the pool drops its boundary instead of stalling).
+        let taken = classes[class].host.take(budget, |_| {
+            spare
+                .pop()
+                .ok_or_else(|| RuntimeError::Oom("kv store: no spare host chunk".into()))
         });
-        if let Some(us) = grow_us {
-            inner.stats.host_grows += 1;
-            inner.stats.host_grow_us += us;
-        }
         if let Some(s) = taken.ok()? {
             return Some(s);
         }
@@ -922,7 +910,7 @@ impl KvStore {
         let mut left = inner.spilling.len();
         while left > 0 {
             left -= 1;
-            let Some(id) = inner.spilling.pop_front() else {
+            let Some((id, queued)) = inner.spilling.pop_front() else {
                 return;
             };
             let (class, dev, host, fence, holds) = match inner.blocks[id as usize].as_ref() {
@@ -933,26 +921,31 @@ impl KvStore {
                     ..
                 }) => (*class, *dev, *host, *fence, *holds),
                 // Dropped or restored meanwhile: nothing to reap.
-                _ => continue,
+                _ => {
+                    inner.spilling_bytes -= queued;
+                    continue;
+                }
             };
             match self.ops.fence_done(fence) {
                 Ok(true) => {}
                 // Copies retire in order: the rest are still in flight.
                 Ok(false) => {
-                    inner.spilling.push_front(id);
+                    inner.spilling.push_front((id, queued));
                     return;
                 }
                 // Completion unproven: both slots stay as they are, never reused.
                 Err(_) => {
+                    inner.spilling_bytes -= queued;
                     inner.stats.fill_failures += 1;
                     continue;
                 }
             }
             // A transfer still reads the device copy: keep it until the hold drops.
             if holds > 0 {
-                inner.spilling.push_back(id);
+                inner.spilling.push_back((id, queued));
                 continue;
             }
+            inner.spilling_bytes -= queued;
             let bytes = inner.classes[class].spec.block_bytes();
             inner.classes[class].device.put(dev);
             let b = inner.blocks[id as usize].as_mut().expect("block");
@@ -978,6 +971,7 @@ impl KvStore {
         let t0 = std::time::Instant::now();
         let released = self.shrink_locked(&mut inner, bytes);
         inner.stats.shrink_us += t0.elapsed().as_micros() as u64;
+        inner.stats.shrinks += 1;
         released
     }
 
@@ -1134,6 +1128,85 @@ impl KvStore {
         self.inner.lock().device_cap = bytes;
     }
 
+    /// Host bytes the tier may still reserve: the cap less live chunks and spares.
+    fn host_budget(&self, inner: &Inner) -> u64 {
+        let reserved: u64 = inner.classes.iter().map(|c| c.host.reserved_bytes()).sum();
+        let spare: u64 = inner
+            .classes
+            .iter()
+            .zip(&inner.host_spare)
+            .map(|(c, s)| s.len() as u64 * c.host.chunk_bytes())
+            .sum();
+        inner.host_cap.saturating_sub(reserved + spare)
+    }
+
+    /// One step of the host grower thread: allocate a pinned chunk ahead for the class with
+    /// the fewest spare bytes under [`HOST_SPARE_BYTES`], outside the lock. `false` = nothing
+    /// to do (every class has its spares, or the cap or the host reserve is reached: then the
+    /// tier stops growing for good).
+    pub fn host_grow_step(&self) -> bool {
+        let (class, chunk) = {
+            let mut inner = self.inner.lock();
+            if inner.host_cap == 0 {
+                return false;
+            }
+            let budget = self.host_budget(&inner);
+            let pick = (0..inner.classes.len())
+                .map(|c| {
+                    let chunk = inner.classes[c].host.chunk_bytes();
+                    (inner.host_spare[c].len() as u64 * chunk, c, chunk)
+                })
+                .filter(|&(bytes, _, chunk)| bytes < HOST_SPARE_BYTES.max(chunk) && chunk <= budget)
+                .min();
+            let Some((_, class, chunk)) = pick else {
+                return false;
+            };
+            if inner.host_reserve > 0 && inner.stats.host_grows % HOST_FLOOR_EVERY == 0 {
+                if let Some((avail, _)) = crate::memory::vmm::host_mem_available() {
+                    if avail
+                        < chunk
+                            .saturating_mul(HOST_FLOOR_EVERY)
+                            .saturating_add(inner.host_reserve)
+                    {
+                        let reserved = inner.host_cap - budget;
+                        tracing::warn!(
+                            available_mib = avail >> 20,
+                            reserve_mib = inner.host_reserve >> 20,
+                            reserved_mib = reserved >> 20,
+                            "kv store: host tier frozen at the host reserve"
+                        );
+                        inner.host_cap = reserved;
+                        return false;
+                    }
+                }
+            }
+            // Counted before the allocation so a failed one is not retried every step.
+            inner.stats.host_grows += 1;
+            (class, chunk)
+        };
+        let t = std::time::Instant::now();
+        let ptr = self.ops.host_alloc(chunk);
+        let us = t.elapsed().as_micros() as u64;
+        let mut inner = self.inner.lock();
+        inner.stats.host_grow_us += us;
+        match ptr {
+            Ok(ptr) => {
+                inner.host_spare[class].push(ptr);
+                true
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "kv store: host tier allocation failed; tier frozen");
+                inner.host_cap = inner.host_cap - self.host_budget(&inner);
+                false
+            }
+        }
+    }
+
+    /// Bytes of D2H copies in flight: device memory the pool may count as coming free.
+    pub fn pending_spill_bytes(&self) -> u64 {
+        self.inner.lock().spilling_bytes
+    }
+
     /// Device bytes the store leaves free (see `Inner::device_floor`).
     pub fn set_device_floor(&self, bytes: u64) {
         self.inner.lock().device_floor = bytes;
@@ -1167,6 +1240,11 @@ impl Drop for KvStore {
             let chunk = c.host.chunk_bytes();
             for &ptr in &c.host.chunks {
                 self.ops.host_free(ptr, chunk);
+            }
+        }
+        for (c, spare) in inner.classes.iter().zip(&inner.host_spare) {
+            for &ptr in spare {
+                self.ops.host_free(ptr, c.host.chunk_bytes());
             }
         }
     }
@@ -1259,6 +1337,7 @@ mod tests {
             device_cap,
             host_cap,
         );
+        while s.host_grow_step() {}
         (ops, s)
     }
 
@@ -1533,6 +1612,7 @@ mod tests {
             .collect();
         // Device: one block per class; host: one slot per class (chunk = 32 B = one block).
         let s = KvStore::new(ops.clone(), classes, 32, 2 * 32, 2 * 32);
+        while s.host_grow_step() {}
         let a = s.acquire(0, key(1)).unwrap();
         let t = s.acquire(1, key(2)).unwrap();
         s.seal(a.id);
