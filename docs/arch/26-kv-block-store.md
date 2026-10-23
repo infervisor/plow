@@ -1,6 +1,6 @@
 # 26 — Prefix cache retention and the KV block store
 
-**Status: design (2026-10-23), reviewed, retention simulated; Part A implemented (A1, A2); B1 and B3 implemented and on by default (exactness gate passed 2026-10-23, replay and Qwen gates below); B2 parked (no AMD box); B4 on CUDA: the snapshot copy path, its pool and pitched knobs and the store switch are gone and `Prefix` blocks hold every full-layer row, so nothing is multi-mapped (gates pending); the AMD snapshot path remains (§5).**
+**Status: design (2026-10-23), reviewed, retention simulated; Part A implemented (A1, A2); B1 and B3 implemented and on by default (exactness gate passed 2026-10-23, replay and Qwen gates below); B2 parked (no AMD box); B4 on CUDA: the snapshot copy path, its pool and pitched knobs and the store switch are gone and `Prefix` blocks hold every full-layer row, so nothing is multi-mapped (replay 7, 2026-10-23: without a host tier the store is above the snapshot path and vLLM 0.29 on hit rate, TTFT and TPOT at 10 s think and 2.3 points under vLLM's hit rate at 45 s think, capacity-bound; the host tier under the store is not qualified, B.6a); the AMD snapshot path remains (§5).**
 Part A says what actually moves the production hit rate and is implementable on today's
 snapshot cache. Part B is the content-addressed block store that replaces the boundary
 snapshots of `docs/arch/22-kv-cache.md` §7–§9 and the AMD `SharedPrefix` with one substrate,
@@ -408,6 +408,35 @@ boundary (`reclaim_one`) and retries. The pool charges each publish the bytes it
 added, so a turn costs its new rows, not a whole window. The pool's own host tier is not armed
 under the store; `PLOW_VMM_HOST_CACHE_MIB` caps the store's pinned slabs instead. Multi-mapping of
 whole full-layer blocks is unchanged (B.7).
+
+Replay 7 (2026-10-23, `Prefix` blocks, no host tier, gpu03, 10-minute production-fidelity replay):
+at 10 s think and rate 2.7 the store hits 78.6 % with TTFT 53/358 ms and TPOT 10.1/37.7 ms
+(p50/p99) against the snapshot path's 74.6 % / 68/645 / 14.0/46.5 and vLLM 0.29's 75.6 % /
+119/592 / 16.9/61.6. Two fixes got it there: a slot block the driver could not create evicted
+boundaries whose blocks only fed the store's reclaim list (free memory stayed at the floor; now
+the pool asks the store to `shrink` first), and the KV admission budget counted only free memory
+plus pool blocks, so once the store's slabs held the card the budget fell to the floor and the
+mux queued requests (27286 budget denials; the slabs count as held). At 45 s think and rate 1.8
+the store hits 58.3 % (snapshot path 48.0 %, vLLM 60.6 %) with TTFT 87/401 ms and TPOT
+6.3/34.6 ms against vLLM's 147/569 and 13.5/53.0: 15.8 % of prompt tokens are lost to boundaries
+the device LRU dropped at a median age of 45.5 s, which is the think-time median, with the card
+at its floor throughout; the store holds about 236 boundaries at about 170 MB each (two thirds
+of a boundary is its 1024-row sliding window). The remaining gap at 45 s is capacity, so the
+lever is the host tier.
+
+The host tier under the store is not qualified. With the auto tier (214 GB) and session-end
+demotion the 45 s arm hit 60.0 % but with TTFT p99 7.4 s and TPOT p99 401 ms, and the 10 s arm
+fell to 66.1 %. Two causes found in its counters: the pool's OOM policy, inherited from its own
+slot tier where a host slot had to be freed for a spill, evicted cold host boundaries ahead of the
+device victim and fell back to the host LRU, which with the store frees no device bytes (1145
+boundaries spilled, 1143 evicted from the host again: the tier was a pass-through); and the host
+grower kept 256 MiB of pinned chunks ahead per class, so a burst of evictions emptied the spares
+and the spill was refused and the boundary dropped (403 of 1548). Both are fixed (device pressure
+never evicts a host-resident store boundary; 1 GiB ahead per class) and the arm is re-run with
+gauges for the longest single host allocation, shrink, publish and gather, since the remaining
+tail source (pinned allocation under the driver lock, or shrink and compaction under the store
+lock) is not yet attributed. Until the tier qualifies, the strict comparison runs the store with
+`PLOW_VMM_HOST_CACHE_MIB=0`.
 
 Recurrent models (B3): the Qwen3.8 packet keeps head-interleaved rows in its full-attention
 caches (the LIVE manifest's `layout`), which the prefix geometry had mapped head-major, so the
