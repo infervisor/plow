@@ -345,6 +345,10 @@ impl BlockServe {
         self.store.set_device_floor(bytes);
     }
 
+    pub fn device_reserved_bytes(&self) -> u64 {
+        self.store.device_reserved_bytes()
+    }
+
     pub fn host_cap(&self) -> u64 {
         self.store.host_cap()
     }

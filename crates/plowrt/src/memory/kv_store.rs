@@ -1233,6 +1233,12 @@ impl KvStore {
         let inner = self.inner.lock();
         inner.classes.iter().map(|c| c.device.used_bytes()).sum()
     }
+
+    /// Device bytes the store's slabs occupy, used or not: what it took from free memory.
+    pub fn device_reserved_bytes(&self) -> u64 {
+        let inner = self.inner.lock();
+        inner.classes.iter().map(|c| c.device.reserved_bytes()).sum()
+    }
 }
 
 impl Drop for KvStore {
