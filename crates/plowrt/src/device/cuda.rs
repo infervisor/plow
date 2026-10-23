@@ -144,7 +144,9 @@ const ATTR_PAGEABLE_USES_HOST_PAGE_TABLES: i32 = 100;
 const FUNC_ATTR_MAX_DYNAMIC_SHARED_SIZE_BYTES: i32 = 8;
 // cuMemHostAlloc flags.
 const MEMHOSTALLOC_PORTABLE: u32 = 1;
-const MEMHOSTALLOC_DEVICEMAP: u32 = 2;
+// cuMemHostRegister flags.
+const MEMHOSTREGISTER_PORTABLE: u32 = 1;
+const MEMHOSTREGISTER_DEVICEMAP: u32 = 2;
 // VMM enums (cuda.h): allocation type / location / access flags / granularity.
 const MEM_ALLOCATION_TYPE_PINNED: i32 = 1;
 const MEM_LOCATION_TYPE_DEVICE: i32 = 1;
@@ -253,6 +255,9 @@ driver_api! {
     cuMemsetD8_v2: fn(CUdeviceptr, u8, usize) -> CUresult,
     cuMemHostAlloc: fn(*mut *mut c_void, usize, u32) -> CUresult,
     cuMemFreeHost: fn(*mut c_void) -> CUresult,
+    cuMemHostRegister_v2: fn(*mut c_void, usize, u32) -> CUresult,
+    cuMemHostUnregister: fn(*mut c_void) -> CUresult,
+    cuMemHostGetDevicePointer_v2: fn(*mut CUdeviceptr, *mut c_void, u32) -> CUresult,
     cuLaunchCooperativeKernel:
         fn(CUfunction, u32, u32, u32, u32, u32, u32, u32, CUstream, *mut *mut c_void) -> CUresult,
     cuLaunchKernelEx: fn(*const CUlaunchConfig, CUfunction, *mut *mut c_void, *mut *mut c_void) -> CUresult,
@@ -2302,27 +2307,80 @@ impl crate::memory::vmm::VmmOps for CudaBackend {
     }
 
     /// Device-mapped as well as pinned: a kernel reads a host-resident KV block in place (under
-    /// unified addressing the device pointer is the host pointer).
+    /// unified addressing the device pointer is the host pointer). The pages are faulted in by
+    /// an anonymous populated mapping first and registered after: `cuMemHostAlloc` does the
+    /// faulting (page reclaim, zeroing) under the driver lock, and one 8 MiB chunk took up to
+    /// 247 ms on a box whose page cache had to give way while every CUDA call of the engine
+    /// thread waited behind it.
     fn host_tier_alloc(&self, bytes: u64) -> Result<u64> {
-        self.host_alloc_flags(bytes as usize, MEMHOSTALLOC_PORTABLE | MEMHOSTALLOC_DEVICEMAP)
-            .map(|p| p as u64)
+        let len = bytes as usize;
+        // SAFETY: a fresh anonymous private mapping; MAP_FAILED is checked.
+        let p = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                len,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_PRIVATE | libc::MAP_ANONYMOUS | libc::MAP_POPULATE,
+                -1,
+                0,
+            )
+        };
+        if p == libc::MAP_FAILED {
+            return Err(RuntimeError::Oom(format!(
+                "vmm host tier: mmap({bytes}): {}",
+                std::io::Error::last_os_error()
+            )));
+        }
+        // SAFETY: `p` is the `len`-byte mapping above; on every error path it is unmapped once.
+        let registered = self.bind().and_then(|()| {
+            self.check(
+                unsafe {
+                    (self.api.cuMemHostRegister_v2)(
+                        p,
+                        len,
+                        MEMHOSTREGISTER_PORTABLE | MEMHOSTREGISTER_DEVICEMAP,
+                    )
+                },
+                "cuMemHostRegister(vmm host tier)",
+            )
+        });
+        if let Err(e) = registered {
+            unsafe { libc::munmap(p, len) };
+            return Err(e);
+        }
+        let mut dp: CUdeviceptr = 0;
+        // SAFETY: `p` is registered; out-pointer for the device address.
+        let rc = unsafe { (self.api.cuMemHostGetDevicePointer_v2)(&mut dp, p, 0) };
+        if rc != 0 || dp != p as u64 {
+            // SAFETY: registered and mapped above, released once here.
+            unsafe {
+                let _ = (self.api.cuMemHostUnregister)(p);
+                libc::munmap(p, len);
+            }
+            return Err(RuntimeError::Device(format!(
+                "vmm host tier: registered memory is not device-addressable at its host address (rc={rc})"
+            )));
+        }
+        Ok(p as u64)
     }
 
     fn host_tier_free(&self, ptr: u64, bytes: u64) {
-        // SAFETY: ptr from `host_tier_alloc`, freed exactly once (pool contract).
+        // SAFETY: ptr/bytes from `host_tier_alloc`, released exactly once (pool contract).
         let rc = unsafe {
             let _ = bind_context(&self.api, self.ctx, self.freer.context_id);
-            (self.api.cuMemFreeHost)(ptr as *mut c_void)
+            let rc = (self.api.cuMemHostUnregister)(ptr as *mut c_void);
+            libc::munmap(ptr as *mut c_void, bytes as usize);
+            rc
         };
         if rc != 0 {
             if self.is_poisoned() {
                 tracing::debug!(
                     rc,
                     bytes,
-                    "cuMemFreeHost(vmm host tier) failed (context poisoned)"
+                    "cuMemHostUnregister(vmm host tier) failed (context poisoned)"
                 );
             } else {
-                tracing::warn!(rc, bytes, "cuMemFreeHost(vmm host tier) failed");
+                tracing::warn!(rc, bytes, "cuMemHostUnregister(vmm host tier) failed");
             }
         }
     }
