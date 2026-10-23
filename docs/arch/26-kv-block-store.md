@@ -126,9 +126,12 @@ Two losses of comparable size, with different fixes:
 * **First turns miss the shared system prompt.** A first turn can only hit its app's system
   prompt (a quarter to a third of its tokens); 57 % of first turns attach nothing although
   the four shared ends exist (1054 shared-end publishes, 682 shared attaches). A vLLM-style
-  pool hits the system prompt on every first turn. Attribution needs a `PLOW_PFX_TRACE` run
-  through `scripts/bench/pfx_shadow.py` (queued with the replay gate); candidates are the
-  strict-publish refusal of a sequential shared end and LRU churn of shared ends.
+  pool hits the system prompt on every first turn. Attributed (store replay, 2026-10-23): no
+  first turn missed before memory pressure began and 24–66 % missed after it. Under load every
+  session boundary sits inside its TTL, so the shared ends were the only unprotected victims of
+  the boundary LRU and were evicted and republished in a loop (267–1276 shared-end publishes
+  per 10 min). Fix: a shared end that served two attaches is shielded like a session inside
+  its TTL (B.5).
 * **A quarter of later turns find their boundary evicted** (zero cached tokens), the
   retention loss Part A addresses; the 20 s arms are saturated (goodput 63–73 %, 32–56 in
   flight), so their latencies measure overload and the host tier's +1.3 pt there is a lower
@@ -326,14 +329,18 @@ A boundary is **demoted** (its dependencies released, blocks to the reclaim list
 **evicted** (blocks reclaimed); a block with transfer holds is never reclaimed, and reclaiming
 a block invalidates every boundary that depends on it first. Victim order: reclaim-list blocks
 (LRU, no decision); demotion candidates per A.2 (ended, aborted, disconnected, TTL-expired);
-LRU over live boundaries with `SHARED_END` (system prompts) ranked by attach count; a victim
-block spills to the host slab if one is armed, else is reclaimed.
+LRU over live boundaries; a victim block spills to the host slab if one is armed, else is
+reclaimed. **Shielded** boundaries (a session boundary inside its TTL, a `SHARED_END` that has
+served at least two attaches and is not cold) are victims only once nothing unshielded is
+left, in the device LRU, the host LRU and the spill victim choice alike.
 
 ### B.6 Host tier
 
-Per class, a pinned host slab (`PLOW_KV_STORE_HOST_MIB`, default 0), allocated in bounded
-chunks with a bounded number of transfers in flight; both classes tier (a session is 165 MB
-wherever it lives). Migration protocol: a block being spilled stays `Device` until its D2H
+Per class, a pinned host slab allocated in bounded chunks with a bounded number of transfers
+in flight; both classes tier (a session is 165 MB wherever it lives). The tier is on by
+default and sized by the A1 rule (`MemAvailable` minus an eighth of RAM, at least 16 GiB, at
+start); growth re-reads `MemAvailable` every 16 chunks and stops for good once the reserve
+would be touched. `PLOW_VMM_HOST_CACHE_MIB` names a size instead, under the same rule. Migration protocol: a block being spilled stays `Device` until its D2H
 event fires, then flips to `Host`; a restore pins the host source until the H2D event fires; a
 concurrent attach on a `Migrating` block waits on the event rather than racing it. A host
 allocation or D2H failure leaves the block `Device` and the eviction falls through to reclaim;
@@ -439,6 +446,11 @@ Known limits of B1 (accepted until B4, each gated rather than assumed):
 * Slab chunks belong to the class that grew them; the budget moves between classes only when a
   chunk is released (`shrink`, run first under device pressure). The pool's byte charges are per
   publish (new blocks) and approximate; `plowrt_kv_store_{device,host}_bytes` are the truth.
+  Growth asks the backend for free memory every 8 chunks and stops while a chunk would take it
+  under the pool's floor: without that check the pool shrank the store and the next publish
+  grew it right back (58k chunk allocations and 66 GB of compaction copies in a 10-minute
+  replay, 24 s under the pool lock; `plowrt_kv_store_{device_grow,shrink,spill}_us_total`
+  attribute it).
 * Publish and non-window gathers drain the engine stream before sealing or releasing blocks
   (the snapshot path drained the same way); a launch-window gather keeps its holds until the
   step's drain. Hash chains are recomputed per publish (16K tokens, microseconds) and the
