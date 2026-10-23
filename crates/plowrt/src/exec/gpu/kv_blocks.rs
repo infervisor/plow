@@ -310,6 +310,10 @@ impl BlockServe {
         self.store.set_device_cap(bytes);
         tracing::info!(device_cap_mib = bytes >> 20, "kv store: device cap");
     }
+
+    pub fn set_host_reserve(&self, bytes: u64) {
+        self.store.set_host_reserve(bytes);
+    }
 }
 
 impl GpuEngine {
@@ -560,32 +564,44 @@ impl GpuEngine {
     /// rows, nothing else). Returns the chunk cap to use; `cap` when no alignment applies
     /// (no state class, boundary passed, or fewer rows left to it than the smallest bucket).
     pub(super) fn state_capture_cap(&self, b: usize, prompt: &[u32], c0: usize, cap: usize) -> usize {
-        let Some(bs) = self.kv_blocks().filter(|bs| bs.captures_state()) else {
+        let cut = self.state_capture_cut(b, prompt.len(), c0);
+        let smallest = self.prefill.first().map_or(usize::MAX, |p| p.t as usize);
+        if cut < smallest {
             return cap;
+        }
+        cap.min(cut)
+    }
+
+    /// Rows from `c0` to the prompt-end boundary of a `prompt_len`-token prompt on a recurrent
+    /// model whose state the store captures; `usize::MAX` when no cut applies (no state class,
+    /// attach off for the slot, boundary passed). Packed chunks take `min` with it so the chunk
+    /// ends exactly at the boundary and [`Self::state_capture_publish`] can capture there.
+    pub fn state_capture_cut(&self, b: usize, prompt_len: usize, c0: usize) -> usize {
+        let Some(bs) = self.kv_blocks().filter(|bs| bs.captures_state()) else {
+            return usize::MAX;
         };
         if self.prefix_attach_off[b] {
-            return cap;
+            return usize::MAX;
         }
-        let p_a = super::prefix::prompt_end_boundary(prompt.len() as u32) as usize;
-        let smallest = self.prefill.first().map_or(usize::MAX, |p| p.t as usize);
-        if c0 >= p_a || p_a - c0 < smallest {
-            return cap;
+        let p_a = super::prefix::prompt_end_boundary(prompt_len as u32) as usize;
+        if c0 >= p_a {
+            return usize::MAX;
         }
-        cap.min(p_a - c0)
+        p_a - c0
     }
 
     /// After a chunk that ended exactly at the prompt-end boundary of a recurrent model:
-    /// publish it now, while the state tensors hold the state at that row.
-    pub(super) fn state_capture_publish(&mut self, b: usize, prompt: &[u32]) {
+    /// publish it now, while the state tensors hold the state at that row. The slot's row
+    /// history must already cover the chunk.
+    pub(super) fn state_capture_publish(&mut self, b: usize, prompt_len: usize) {
         if !self.kv_blocks().is_some_and(|bs| bs.captures_state()) || self.prefix_attach_off[b] {
             return;
         }
-        let p_a = super::prefix::prompt_end_boundary(prompt.len() as u32);
-        if p_a == 0 || self.pos[b] != p_a {
+        let p_a = super::prefix::prompt_end_boundary(prompt_len as u32);
+        if p_a == 0 || self.pos[b] != p_a || self.seq_tokens[b].len() < p_a as usize {
             return;
         }
-        self.seq_tokens[b].clear();
-        self.seq_tokens[b].extend_from_slice(&prompt[..p_a as usize]);
+        self.seq_tokens[b].truncate(p_a as usize);
         self.publish_boundary(b, p_a, crate::memory::vmm::Kind::PROMPT_END);
     }
 

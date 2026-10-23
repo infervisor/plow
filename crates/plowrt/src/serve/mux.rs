@@ -3462,7 +3462,8 @@ fn run_one_tick(
                             let mut take = available
                                 .min(remaining)
                                 .min(pf_chunk_rows())
-                                .min(e.pf_request_max_rows());
+                                .min(e.pf_request_max_rows())
+                                .min(e.state_capture_cut(i, request.prompt_ids.len(), start));
                             if request.mm.as_deref().is_some_and(|j| j.spans()) {
                                 take = plow_asset::multimodal::span_safe_rows(
                                     &request.prompt_ids,
@@ -6942,7 +6943,9 @@ fn gpu_prefill_batched_pass(
                 if !e.packed_slot_ready(i) || s.step != 0 || n == 0 || pf_pos + withheld >= n {
                     return None;
                 }
-                let publish = e.pf_publish_cap(i, pf_pos);
+                let publish = e
+                    .pf_publish_cap(i, pf_pos)
+                    .min(e.state_capture_cut(i, n, pf_pos));
                 let mut remaining = e
                     .pf_plan_slice(n - withheld - pf_pos, chunk_cap)
                     .min(publish);

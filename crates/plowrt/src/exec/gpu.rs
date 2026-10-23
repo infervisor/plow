@@ -11602,7 +11602,11 @@ impl GpuEngine {
         // and other slots' sequences cannot observe a shifted table.
         let real = self.run_one_prefill_chunk(f_pf, b, prompt, c0, cap)?;
         self.pos[b] = (c0 + real) as u32;
-        self.state_capture_publish(b, prompt);
+        if self.kv_blocks().is_some_and(|bs| bs.captures_state()) {
+            self.seq_tokens[b].clear();
+            self.seq_tokens[b].extend_from_slice(&prompt[..c0 + real]);
+            self.state_capture_publish(b, n);
+        }
 
         if c0 + real < n {
             return Ok(PrefillStep::Progress(c0 + real));
@@ -13608,6 +13612,7 @@ impl GpuEngine {
                 let end = r.c0 + r.len;
                 self.seq_tokens[r.slot].clear();
                 self.seq_tokens[r.slot].extend_from_slice(&r.prompt[..end]);
+                self.state_capture_publish(r.slot, r.prompt.len());
             }
             if self.vmm_prefix_enabled() && r.c0 + r.len + 1 >= r.prompt.len() {
                 self.vmm_publish(r.slot, r.prompt.len().saturating_sub(1) as u32);
