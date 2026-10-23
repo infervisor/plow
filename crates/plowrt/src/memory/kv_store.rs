@@ -35,8 +35,10 @@ pub trait StoreOps: Send + Sync {
     fn fence_done(&self, fence: u64) -> Result<bool>;
     /// H2D, complete on return.
     fn copy_htod(&self, va: u64, host: u64, bytes: u64) -> Result<()>;
-    /// D2D, complete on return.
-    fn copy_dtod(&self, dst: u64, src: u64, bytes: u64) -> Result<()>;
+    /// D2D copies `(dst, src, bytes)`, all complete on return.
+    fn copy_dtod_batch(&self, copies: &[(u64, u64, u64)]) -> Result<()>;
+    /// Free device bytes now; `None` where the backend cannot say.
+    fn free_bytes(&self) -> Option<u64>;
 }
 
 impl<T: VmmOps + ?Sized> StoreOps for T {
@@ -61,8 +63,11 @@ impl<T: VmmOps + ?Sized> StoreOps for T {
     fn copy_htod(&self, va: u64, host: u64, bytes: u64) -> Result<()> {
         VmmOps::copy_htod(self, va, host, bytes)
     }
-    fn copy_dtod(&self, dst: u64, src: u64, bytes: u64) -> Result<()> {
-        VmmOps::copy_dtod_sync(self, dst, src, bytes)
+    fn copy_dtod_batch(&self, copies: &[(u64, u64, u64)]) -> Result<()> {
+        VmmOps::copy_dtod_batch_sync(self, copies)
+    }
+    fn free_bytes(&self) -> Option<u64> {
+        VmmOps::free_bytes(self)
     }
 }
 
@@ -350,6 +355,11 @@ pub struct StoreStats {
 struct Inner {
     classes: Vec<Class>,
     device_cap: u64,
+    /// Device bytes the store leaves free: growth asks the backend (every `DEVICE_FLOOR_EVERY`
+    /// chunks) and stops while a chunk would take free memory under it. 0 = unchecked. The pool
+    /// shrinks the store when the slots need memory; without this check the store grew right
+    /// back to its cap and the two thrashed (58k chunk allocations, 66 GB compacted in 10 min).
+    device_floor: u64,
     host_cap: u64,
     /// Host RAM the tier leaves to the rest of the machine; growth stops (the cap freezes at
     /// what is reserved) once `MemAvailable` would fall under it. 0 = unchecked.
@@ -385,6 +395,8 @@ pub struct Acquire {
 
 /// Host chunks allocated between two `MemAvailable` reads of the host-reserve check.
 const HOST_FLOOR_EVERY: u64 = 16;
+/// Device chunks allocated between two free-memory queries of the device-floor check.
+const DEVICE_FLOOR_EVERY: u64 = 8;
 
 impl KvStore {
     /// `device_cap` / `host_cap`: bytes the store may reserve on each tier over every class
@@ -417,6 +429,7 @@ impl KvStore {
             inner: parking_lot::Mutex::new(Inner {
                 classes,
                 device_cap,
+                device_floor: 0,
                 host_cap,
                 host_reserve: 0,
                 blocks: Vec::new(),
@@ -663,7 +676,19 @@ impl KvStore {
     fn device_slot(&self, inner: &mut Inner, class: usize) -> Result<u32> {
         let ops = &self.ops;
         let reserved: u64 = inner.classes.iter().map(|c| c.device.reserved_bytes()).sum();
-        let budget = inner.device_cap.saturating_sub(reserved);
+        let mut budget = inner.device_cap.saturating_sub(reserved);
+        if budget > 0
+            && !inner.classes[class].device.has_free()
+            && inner.device_floor > 0
+            && inner.stats.device_grows % DEVICE_FLOOR_EVERY == 0
+        {
+            let chunk = inner.classes[class].device.chunk_bytes();
+            if let Some(free) = ops.free_bytes() {
+                if free < chunk.saturating_mul(DEVICE_FLOOR_EVERY).saturating_add(inner.device_floor) {
+                    budget = 0;
+                }
+            }
+        }
         let mut grow_us = None;
         let taken = inner.classes[class].device.take(budget, |bytes| {
             let t = std::time::Instant::now();
@@ -1045,6 +1070,10 @@ impl KvStore {
                     }
                 }
                 let bytes_per = inner.classes[ci].spec.block_bytes();
+                // Every move of the chunk is queued, then drained once; the slots change
+                // owner only after the drain (a failed batch leaves the chunk as it was).
+                let mut moves: Vec<(BlockId, u32, u32)> = Vec::new();
+                let mut copies: Vec<(u64, u64, u64)> = Vec::new();
                 for id in ids {
                     let Some(b) = inner.blocks[id as usize].as_ref() else {
                         continue;
@@ -1058,22 +1087,35 @@ impl KvStore {
                         continue;
                     };
                     let Some(to) = inner.classes[ci].device.take_outside(chunk) else {
-                        break 'chunks;
+                        break;
                     };
-                    let (src, dst) = {
-                        let d = &inner.classes[ci].device;
-                        (d.va(from), d.va(to))
-                    };
-                    if let Err(e) = self.ops.copy_dtod(dst, src, bytes_per) {
-                        inner.classes[ci].device.put(to);
+                    let d = &inner.classes[ci].device;
+                    copies.push((d.va(to), d.va(from), bytes_per));
+                    moves.push((id, from, to));
+                }
+                let copied = if copies.is_empty() {
+                    Ok(())
+                } else {
+                    self.ops.copy_dtod_batch(&copies)
+                };
+                match copied {
+                    Ok(()) => {
+                        for &(id, from, to) in &moves {
+                            inner.classes[ci].device.assign(to, id);
+                            inner.classes[ci].device.put(from);
+                            inner.blocks[id as usize].as_mut().expect("block").place =
+                                Where::Device(to);
+                        }
+                        inner.stats.compactions += moves.len() as u64;
+                        inner.stats.compact_bytes += moves.len() as u64 * bytes_per;
+                    }
+                    Err(e) => {
+                        for &(_, _, to) in &moves {
+                            inner.classes[ci].device.put(to);
+                        }
                         tracing::warn!(error = %e, "kv store: compaction copy failed");
                         break 'chunks;
                     }
-                    inner.classes[ci].device.assign(to, id);
-                    inner.classes[ci].device.put(from);
-                    inner.blocks[id as usize].as_mut().expect("block").place = Where::Device(to);
-                    inner.stats.compactions += 1;
-                    inner.stats.compact_bytes += bytes_per;
                 }
                 released += inner.classes[ci]
                     .device
@@ -1090,6 +1132,11 @@ impl KvStore {
     /// [`Self::shrink`] releases them).
     pub fn set_device_cap(&self, bytes: u64) {
         self.inner.lock().device_cap = bytes;
+    }
+
+    /// Device bytes the store leaves free (see `Inner::device_floor`).
+    pub fn set_device_floor(&self, bytes: u64) {
+        self.inner.lock().device_floor = bytes;
     }
 
     /// Host RAM the tier must leave available (see `Inner::host_reserve`).
@@ -1190,9 +1237,12 @@ mod tests {
             self.htod.fetch_add(1, Ordering::SeqCst);
             Ok(())
         }
-        fn copy_dtod(&self, _dst: u64, _src: u64, _bytes: u64) -> Result<()> {
-            self.dtod.fetch_add(1, Ordering::SeqCst);
+        fn copy_dtod_batch(&self, copies: &[(u64, u64, u64)]) -> Result<()> {
+            self.dtod.fetch_add(copies.len() as u64, Ordering::SeqCst);
             Ok(())
+        }
+        fn free_bytes(&self) -> Option<u64> {
+            None
         }
     }
 

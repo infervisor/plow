@@ -7260,6 +7260,7 @@ impl GpuEngine {
                     // shrinks it below that when the rings grow.
                     if let (0, Some(bs)) = (cache_cap, blocks.as_ref()) {
                         bs.set_device_cap(free.saturating_sub(floor));
+                        bs.set_device_floor(floor);
                     }
                 }
             }

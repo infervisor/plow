@@ -159,10 +159,10 @@ pub trait VmmOps: Send + Sync {
     fn copy_htod(&self, _va: u64, _host_ptr: u64, _bytes: u64) -> Result<()> {
         Err(RuntimeError::Rejected("no host tier".into()))
     }
-    /// Device-to-device copy of `bytes`, drained when it returns on every stream (the block
-    /// store moves a block between slabs under pressure; the engine stream may reuse the
-    /// source slot right after). [`Self::copy_dtod`] orders only on the legacy stream.
-    fn copy_dtod_sync(&self, _dst: u64, _src: u64, _bytes: u64) -> Result<()> {
+    /// Device-to-device copies `(dst, src, bytes)`, all drained when it returns (the block
+    /// store moves blocks between slabs under pressure; the engine stream may reuse a source
+    /// slot right after). [`Self::copy_dtod_batch`] orders only on the legacy stream.
+    fn copy_dtod_batch_sync(&self, _copies: &[(u64, u64, u64)]) -> Result<()> {
         Err(RuntimeError::Rejected("no device copy".into()))
     }
 }

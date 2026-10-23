@@ -314,6 +314,10 @@ impl BlockServe {
     pub fn set_host_reserve(&self, bytes: u64) {
         self.store.set_host_reserve(bytes);
     }
+
+    pub fn set_device_floor(&self, bytes: u64) {
+        self.store.set_device_floor(bytes);
+    }
 }
 
 impl GpuEngine {

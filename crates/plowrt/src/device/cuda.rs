@@ -2427,7 +2427,7 @@ impl crate::memory::vmm::VmmOps for CudaBackend {
         )
     }
 
-    fn copy_dtod_sync(&self, dst: u64, src: u64, bytes: u64) -> Result<()> {
+    fn copy_dtod_batch_sync(&self, copies: &[(u64, u64, u64)]) -> Result<()> {
         self.bind()?;
         let mut tier = self.copy_tier.lock();
         let tier = match tier.as_mut() {
@@ -2439,14 +2439,21 @@ impl crate::memory::vmm::VmmOps for CudaBackend {
                 failed: Default::default(),
             }),
         };
-        // SAFETY: both ranges are live `bytes`-long device allocations from `alloc` that no
-        // stream touches until this returns (store contract); the copy is drained here.
-        self.check(
-            unsafe {
-                (self.api.cuMemcpyDtoDAsync_v2)(dst, src, bytes as usize, tier.stream.raw as CUstream)
-            },
-            "cuMemcpyDtoDAsync(kv store compaction)",
-        )?;
+        for &(dst, src, bytes) in copies {
+            // SAFETY: both ranges are live `bytes`-long device allocations from `alloc` that no
+            // stream touches until this returns (store contract); the copies are drained below.
+            self.check(
+                unsafe {
+                    (self.api.cuMemcpyDtoDAsync_v2)(
+                        dst,
+                        src,
+                        bytes as usize,
+                        tier.stream.raw as CUstream,
+                    )
+                },
+                "cuMemcpyDtoDAsync(kv store compaction)",
+            )?;
+        }
         self.check(
             unsafe { (self.api.cuStreamSynchronize)(tier.stream.raw as CUstream) },
             "cuStreamSynchronize(kv store compaction)",
