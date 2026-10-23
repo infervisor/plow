@@ -1202,6 +1202,11 @@ impl KvStore {
         }
     }
 
+    /// The host tier's cap now (0 = none; frozen caps are lower than the one armed).
+    pub fn host_cap(&self) -> u64 {
+        self.inner.lock().host_cap
+    }
+
     /// Bytes of D2H copies in flight: device memory the pool may count as coming free.
     pub fn pending_spill_bytes(&self) -> u64 {
         self.inner.lock().spilling_bytes

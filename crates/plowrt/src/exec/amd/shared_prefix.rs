@@ -460,7 +460,7 @@ impl SharedPrefix {
                 }
                 _ => (0, 0),
             };
-        let host_cap = crate::config::RuntimeConfig::get().vmm_host_cache_bytes();
+        let host_cap = crate::config::RuntimeConfig::get().vmm_host_cache_bytes().unwrap_or(0);
         if host_cap > 0 {
             for (idx, g) in groups.iter_mut().enumerate() {
                 let tail = u64::from(g.pool.block_rows().saturating_sub(1));

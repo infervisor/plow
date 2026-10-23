@@ -559,11 +559,11 @@ impl GpuEngine {
                 };
                 if serve.prefix_kv().is_some() {
                     // Host tier: what the host-reserve rule allows now, unless the knob names
-                    // a size (cut to the same rule by the store's growth check).
+                    // a size (cut to the same rule by the store's growth check) or 0 (off).
                     let auto = crate::memory::vmm::host_tier_auto();
                     let host_cap = match rt.vmm_host_cache_bytes() {
-                        0 => auto.map_or(0, |(cap, _)| cap),
-                        cap => cap,
+                        None => auto.map_or(0, |(cap, _)| cap),
+                        Some(cap) => cap,
                     };
                     match super::kv_blocks::BlockServe::new(
                         be,
@@ -983,7 +983,7 @@ pub(super) fn trace_init(v: &VmmServe) {
         max_ctx: g.max_ctx,
         batch: g.batch,
         snap_row_bytes: v.snap_row_bytes,
-        host_cap: crate::config::RuntimeConfig::get().vmm_host_cache_bytes(),
+        host_cap: v.blocks.as_ref().map_or(0, |b| b.host_cap()),
         boundary_quantum: 32,
         prompt_end_backoff: 1 + SESSION_PROMPT_REWRITE,
         ..Default::default()

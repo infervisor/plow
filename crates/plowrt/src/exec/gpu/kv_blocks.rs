@@ -342,6 +342,10 @@ impl BlockServe {
     pub fn set_device_floor(&self, bytes: u64) {
         self.store.set_device_floor(bytes);
     }
+
+    pub fn host_cap(&self) -> u64 {
+        self.store.host_cap()
+    }
 }
 
 impl GpuEngine {
