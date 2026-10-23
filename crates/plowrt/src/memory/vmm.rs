@@ -5047,7 +5047,7 @@ fn unwind_attach(
 
 /// `MemAvailable` of `/proc/meminfo` in bytes; `None` where it cannot be read.
 /// `(MemAvailable, MemTotal)` in bytes.
-fn host_mem_available() -> Option<(u64, u64)> {
+pub(crate) fn host_mem_available() -> Option<(u64, u64)> {
     let text = std::fs::read_to_string("/proc/meminfo").ok()?;
     let field = |key: &str| -> Option<u64> {
         let line = text.lines().find(|l| l.starts_with(key))?;
@@ -5059,7 +5059,14 @@ fn host_mem_available() -> Option<(u64, u64)> {
 
 /// Host RAM the pinned tier leaves to the rest of the machine: an eighth of it, at least
 /// 16 GiB (pinned pages cannot be reclaimed; a co-tenant build must not OOM-kill the server).
-fn host_reserve(total: u64) -> u64 {
+/// `host_tier_auto` is the tier the rule allows now: `MemAvailable` minus that reserve.
+pub(crate) fn host_tier_auto() -> Option<(u64, u64)> {
+    let (avail, total) = host_mem_available()?;
+    let reserve = host_reserve(total);
+    Some((avail.saturating_sub(reserve), reserve))
+}
+
+pub(crate) fn host_reserve(total: u64) -> u64 {
     (total / 8).max(16 << 30)
 }
 

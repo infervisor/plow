@@ -200,8 +200,12 @@ recurrent model one state block per boundary. Each block is keyed by the chained
 tokens up to its last row, so the boundaries of one conversation and conversations on one
 system prompt share blocks; a turn's publish copies only its new rows and a retire frees only the
 rows nothing else uses. The boundary tree above is unchanged: it still decides which boundary
-lives, spills (the store's pinned host tier, capped by `PLOW_VMM_HOST_CACHE_MIB`) or dies; the
+lives, spills (the store's pinned host tier) or dies; the
 store owns the bytes. Copies run as one `plow_kv_segcopy` launch per publish or attach.
+The host tier is on by default and sized by the host-reserve rule: `MemAvailable` minus an
+eighth of RAM (at least 16 GiB) at start, and it stops growing for good if `MemAvailable` would
+fall under that reserve (`kv store: host tier frozen`); `PLOW_VMM_HOST_CACHE_MIB` names a size
+instead, under the same rule.
 `/metrics`: `plowrt_kv_store_*` (residency per tier, dedup hits, fills, reclaims, refusals,
 spills, restores, publishes, gathers, segments, launches). Recurrent models (Qwen3.8 GDN) get
 prefix caching only through the store: the prefill chunk is cut at the prompt-end boundary and

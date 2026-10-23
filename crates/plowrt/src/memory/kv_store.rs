@@ -173,6 +173,10 @@ impl Slab {
         u64::from(self.live_chunks) * self.chunk_bytes()
     }
 
+    fn has_free(&self) -> bool {
+        self.free_slots > 0
+    }
+
     fn used_bytes(&self) -> u64 {
         self.reserved_bytes() - self.free_slots * self.slot_bytes
     }
@@ -347,6 +351,9 @@ struct Inner {
     classes: Vec<Class>,
     device_cap: u64,
     host_cap: u64,
+    /// Host RAM the tier leaves to the rest of the machine; growth stops (the cap freezes at
+    /// what is reserved) once `MemAvailable` would fall under it. 0 = unchecked.
+    host_reserve: u64,
     blocks: Vec<Option<Block>>,
     free_ids: Vec<BlockId>,
     index: FxHashMap<(usize, BlockKey), BlockId>,
@@ -375,6 +382,9 @@ pub struct Acquire {
     /// The caller must scatter the rows and then [`KvStore::seal`] or [`KvStore::fail`].
     pub fill: bool,
 }
+
+/// Host chunks allocated between two `MemAvailable` reads of the host-reserve check.
+const HOST_FLOOR_EVERY: u64 = 16;
 
 impl KvStore {
     /// `device_cap` / `host_cap`: bytes the store may reserve on each tier over every class
@@ -408,6 +418,7 @@ impl KvStore {
                 classes,
                 device_cap,
                 host_cap,
+                host_reserve: 0,
                 blocks: Vec::new(),
                 free_ids: Vec::new(),
                 index: FxHashMap::default(),
@@ -812,6 +823,27 @@ impl KvStore {
     fn host_slot(&self, inner: &mut Inner, class: usize) -> Option<u32> {
         let ops = &self.ops;
         let reserved: u64 = inner.classes.iter().map(|c| c.host.reserved_bytes()).sum();
+        if !inner.classes[class].host.has_free() && inner.host_reserve > 0 {
+            // Every `HOST_FLOOR_EVERY` chunks: is the host still above its reserve with that
+            // many more pinned? If not the tier stops growing here, for good.
+            let chunk = inner.classes[class].host.chunk_bytes();
+            if inner.stats.host_grows % HOST_FLOOR_EVERY == 0 {
+                if let Some((avail, _)) = crate::memory::vmm::host_mem_available() {
+                    if avail < chunk.saturating_mul(HOST_FLOOR_EVERY).saturating_add(inner.host_reserve)
+                    {
+                        if inner.host_cap > reserved {
+                            tracing::warn!(
+                                available_mib = avail >> 20,
+                                reserve_mib = inner.host_reserve >> 20,
+                                reserved_mib = reserved >> 20,
+                                "kv store: host tier frozen at the host reserve"
+                            );
+                        }
+                        inner.host_cap = reserved;
+                    }
+                }
+            }
+        }
         let budget = inner.host_cap.saturating_sub(reserved);
         let mut grow_us = None;
         let taken = inner.classes[class].host.take(budget, |bytes| {
@@ -1058,6 +1090,11 @@ impl KvStore {
     /// [`Self::shrink`] releases them).
     pub fn set_device_cap(&self, bytes: u64) {
         self.inner.lock().device_cap = bytes;
+    }
+
+    /// Host RAM the tier must leave available (see `Inner::host_reserve`).
+    pub fn set_host_reserve(&self, bytes: u64) {
+        self.inner.lock().host_reserve = bytes;
     }
 
     pub fn stats(&self) -> StoreStats {

@@ -586,14 +586,24 @@ impl GpuEngine {
                 blocks: None,
                 };
                 if rt.kv_store() && serve.prefix_kv().is_some() {
+                    // Host tier: what the host-reserve rule allows now, unless the knob names
+                    // a size (cut to the same rule by the store's growth check).
+                    let auto = crate::memory::vmm::host_tier_auto();
+                    let host_cap = match rt.vmm_host_cache_bytes() {
+                        0 => auto.map_or(0, |(cap, _)| cap),
+                        cap => cap,
+                    };
                     match super::kv_blocks::BlockServe::new(
                         be,
                         &serve,
                         if cache_cap > 0 { cache_cap } else { device_bytes / 4 },
-                        rt.vmm_host_cache_bytes(),
+                        host_cap,
                         state_tensors,
                     ) {
                         Ok(blocks) => {
+                            if let Some((_, reserve)) = auto {
+                                blocks.set_host_reserve(reserve);
+                            }
                             serve
                                 .kv
                                 .as_ref()
