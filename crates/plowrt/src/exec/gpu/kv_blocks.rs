@@ -297,8 +297,9 @@ impl GpuEngine {
         let (v, kv) = self.vmm_prefix().expect("block publish without prefix vmm");
         let bs = v.blocks.as_ref().expect("block publish without store");
         let toks = &self.seq_tokens[b][..p_a as usize];
-        let chain = chain_hashes(toks, ROWS_PER_BLOCK, SEED_CHAIN);
-        let check = chain_hashes(toks, ROWS_PER_BLOCK, SEED_CHECK);
+        let chain = chain_hashes::<rustc_hash::FxHasher>(toks, ROWS_PER_BLOCK, SEED_CHAIN);
+        let check =
+            chain_hashes::<std::collections::hash_map::DefaultHasher>(toks, ROWS_PER_BLOCK, SEED_CHECK);
         let plan = bs.plan(p_a, kv.geometry().window);
         let mut handle: Handle = Vec::with_capacity(plan.len());
         let mut fills: Vec<BlockId> = Vec::new();

@@ -220,6 +220,8 @@ struct Inner {
     /// Zero-dependent blocks in release order (oldest first); an entry may be stale (the block
     /// was re-acquired or dropped), checked when popped.
     reclaim: VecDeque<BlockId>,
+    /// Blocks with a D2H copy in flight, oldest first ([`KvStore::reap`]).
+    spilling: VecDeque<BlockId>,
     tick: u64,
     stats: StoreStats,
 }
@@ -274,6 +276,7 @@ impl KvStore {
                 free_ids: Vec::new(),
                 index: FxHashMap::default(),
                 reclaim: VecDeque::new(),
+                spilling: VecDeque::new(),
                 tick: 0,
                 stats,
             }),
@@ -578,6 +581,7 @@ impl KvStore {
                 Ok(fence) => {
                     let b = inner.blocks[id as usize].as_mut().expect("block");
                     b.place = Where::Spilling { dev, host: h, fence };
+                    inner.spilling.push_back(id);
                     inner.stats.spills += 1;
                 }
                 Err(_) => {
@@ -617,28 +621,34 @@ impl KvStore {
         Some(victim.2)
     }
 
-    /// Retire completed spills: the device slot frees, the block is host-resident.
+    /// Retire completed spills in order: the device slot frees, the block is host-resident. A
+    /// fence that cannot be queried is treated as retired only for a block that was dropped
+    /// meanwhile; otherwise the block stays `Spilling` (both copies kept, never reused).
     pub fn reap(&self) {
         let mut inner = self.inner.lock();
-        let ids: Vec<BlockId> = inner
-            .blocks
-            .iter()
-            .enumerate()
-            .filter(|(_, b)| matches!(b, Some(Block { place: Where::Spilling { .. }, .. })))
-            .map(|(i, _)| i as BlockId)
-            .collect();
-        for id in ids {
+        while let Some(&id) = inner.spilling.front() {
             let (class, dev, host, fence) = match inner.blocks[id as usize].as_ref() {
                 Some(Block {
                     class,
                     place: Where::Spilling { dev, host, fence },
                     ..
                 }) => (*class, *dev, *host, *fence),
-                _ => continue,
+                // Dropped or restored meanwhile: nothing to reap.
+                _ => {
+                    inner.spilling.pop_front();
+                    continue;
+                }
             };
-            if !self.ops.fence_done(fence).unwrap_or(true) {
-                continue;
+            match self.ops.fence_done(fence) {
+                Ok(true) => {}
+                Ok(false) => return,
+                Err(_) => {
+                    inner.spilling.pop_front();
+                    inner.stats.fill_failures += 1;
+                    continue;
+                }
             }
+            inner.spilling.pop_front();
             let bytes = inner.classes[class].spec.block_bytes();
             inner.classes[class].device.free.push(dev);
             let b = inner.blocks[id as usize].as_mut().expect("block");
@@ -676,15 +686,16 @@ impl Drop for KvStore {
     }
 }
 
-/// Chained 64-bit hashes of `tokens` per `rows` rows: entry `i` covers `tokens[..(i+1)*rows]`.
-/// `seed` selects the hash (the key's `chain` and its independent `check`).
-pub fn chain_hashes(tokens: &[u32], rows: u32, seed: u64) -> Vec<u64> {
+/// Chained 64-bit hashes of `tokens` per `rows` rows: entry `i` covers `tokens[..(i+1)*rows]`,
+/// hashed with `H` from `seed`. The key's `chain` and `check` use two unrelated hash
+/// functions (`FxHasher` and SipHash), not two seeds of one.
+pub fn chain_hashes<H: std::hash::Hasher + Default>(tokens: &[u32], rows: u32, seed: u64) -> Vec<u64> {
     use std::hash::Hasher;
     let rows = rows.max(1) as usize;
     let mut out = Vec::with_capacity(tokens.len() / rows);
     let mut prev = seed;
     for chunk in tokens.chunks_exact(rows) {
-        let mut h = rustc_hash::FxHasher::default();
+        let mut h = H::default();
         h.write_u64(prev);
         for &t in chunk {
             h.write_u32(t);
@@ -904,11 +915,13 @@ mod tests {
     #[test]
     fn chain_hashes_are_prefix_stable() {
         let t: Vec<u32> = (0..64).collect();
-        let a = chain_hashes(&t, 32, 0);
-        let b = chain_hashes(&t[..32], 32, 0);
+        let a = chain_hashes::<rustc_hash::FxHasher>(&t, 32, 0);
+        let b = chain_hashes::<rustc_hash::FxHasher>(&t[..32], 32, 0);
         assert_eq!(a.len(), 2);
         assert_eq!(a[0], b[0]);
         assert_ne!(a[0], a[1]);
-        assert_ne!(chain_hashes(&t, 32, 1)[0], a[0]);
+        assert_ne!(chain_hashes::<rustc_hash::FxHasher>(&t, 32, 1)[0], a[0]);
+        let c = chain_hashes::<std::collections::hash_map::DefaultHasher>(&t, 32, 0);
+        assert_ne!(c[0], a[0]);
     }
 }
