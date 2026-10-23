@@ -16,7 +16,8 @@ Production Gemma-4 26B-A4B FP8 on gpu04, from the engines' own metrics:
 
 These are different days and different arrival rates, so they rank nothing by themselves. On gpu03
 with the **same recorded request stream** (`scripts/bench/agentic_turns.py --open-loop
---prod-fidelity`, think median 45 s, two interleaved rounds, both agree within noise):
+--prod-fidelity`: production prompt shape, think median 10 s; two interleaved rounds agree
+within noise):
 
 | rate 1.8 → 6.5 req/s | TTFT p50/p99 | TPOT p50/p99 | hit |
 |---|---|---|---|
@@ -54,9 +55,12 @@ T = cache_bytes / (turn_rate × bytes_inserted_per_turn)
 hit ≈ ceiling × P(think ≤ T) + shared-prefix hits
 ```
 
-where `ceiling` is the stream's own repeat fraction (an unbounded-cache oracle computed from the
-recorded prompts, §4.0 — the observed 81% is a lower bound on it) and `think` is the measured
-turn-gap distribution, not the harness's. Everything the design changes is in the denominator:
+where `ceiling` is the stream's own repeat fraction and `think` is the measured turn-gap
+distribution, not the harness's. For the replay plan the unbounded-cache oracle
+(`/home/lava/scratch/kv-store-p0/oracle.py`: exact prefix match, 32-row floor plus the 9-row
+prompt-end slack) is **81.1%** at rates 1.8 and 2.7 (81.75% unquantised); both engines measured
+~5 pt below it at 6.5 req/s with 10 s think, so even the short replay is retention-bound, not at
+the ceiling. Everything the design changes is in the denominator:
 
 | engine | bytes inserted per turn | T at 10 req/s, 41–48 GB |
 |---|---|---|
@@ -271,11 +275,13 @@ offloading at the same host budget. Anything less is a tie and does not justify 
 ## 4. Gates
 
 Each phase stops at a failing gate. Replays use identical recorded arrivals, prompts, output
-lengths and a cold cache; MTP-off arms are separate from MTP-on; the final numbers come from
+lengths and a cold cache (the harness on this branch lets explicit `--think-*` flags win over
+`--prod-fidelity`, which silently reset them to 10 s before); MTP-off arms are separate from
+MTP-on; the final numbers come from
 `campaign.py report` in the strict format of `docs/bringup/agent-tools.md`.
 
 0. **Measure first (P0).** (a) The oracle ceiling of the recorded stream from the prompts alone
-   (unbounded cache, exact prefix match). (b) The actual think-time distribution from prod
+   (unbounded cache, exact prefix match): done, 81.1% (§1.2). (b) The actual think-time distribution from prod
    timestamps. (c) vLLM 0.29's real pool: allocated KV bytes, groups, page sizes, hybrid-manager
    status, from its startup log — not `tokens × 120 KiB`. (d) The cheapest hypothesis: today's
    snapshot cache with a bounded host tier (60 GB, crash root-caused) at rates 2.7 and 4.5. If
