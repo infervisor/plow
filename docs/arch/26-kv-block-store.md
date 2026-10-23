@@ -70,15 +70,15 @@ on what a session-end signal buys.
 
 | 10.8 req/s (rate 2.7) | LRU, 41 GB | incremental, 48 GB | ended-first, 41 GB | 101 GB | 191 GB | 191 GB + ended-first |
 |---|---|---|---|---|---|---|
-| think median 10 s | 73.4% | 71.5% | 75.0% | 75.0% | 75.0% | 75.0% |
-| think median 20 s | 55.2% | 54.4% | **74.9%** | 74.7% | 75.0% | 75.0% |
-| think median 45 s (σ 1.0) | 28.7% | 30.9% | 41.1% | 60.7% | 72.9% | 75.0% |
+| think median 10 s | 73.4% | 74.2% (74.4% snapshot at 48 GB) | 75.0% | 75.0% | 75.0% | 75.0% |
+| think median 20 s | 55.2% | 60.8% (62.3%) | **74.9%** | 74.7% | 75.0% | 75.0% |
+| think median 45 s (σ 1.0) | 28.7% | 32.9% (34.0%) | 41.1% | 60.7% | 72.9% | 75.0% |
 
 At 7.2 req/s and 10 s think every column is 74.4–74.9%: the cache is not binding, which is
 why the earlier 60 GB host-tier test at that rate measured +0.8 pt and why the replay's 75%
-matches both engines. Calibrating the snapshot column against production (74.4% at 5.85 req/s,
-63–65% at 10.2) puts the real think median near 15–20 s; the distribution itself is P0's first
-measurement.
+matches both engines. The snapshot column is consistent with production (74.4% at 5.85 req/s,
+63–65% at 10.2) at a think median somewhere in 15–20 s, but aggregate hit rates do not pin the
+distribution; measuring it is P0's first item.
 
 Three conclusions, each contrary to a claim an earlier draft of this document made:
 
@@ -87,11 +87,18 @@ Three conclusions, each contrary to a claim an earlier draft of this document ma
    bytes of *distinct sessions* touched since — identical in both models. vLLM's per-token
    cache has no retention advantage over the snapshot cache at equal capacity, and a block
    store would have none either.
-2. **LRU is already the right order among live sessions.** A lognormal think time has a
-   decreasing hazard, so the longest-idle session is the least likely to return next.
-3. **The levers are capacity and knowing which sessions ended.** A session-end signal is worth
-   up to +20 pt at 20 s think (to the ceiling) and +12 pt at 45 s; host capacity is worth +20
-   to +44 pt at 45 s. Both apply to today's snapshot cache unchanged.
+2. **LRU is close to the right order among live sessions** for this think distribution: a
+   lognormal hazard rises only below its mode (seconds here) and falls after it, so beyond the
+   first few seconds the longest-idle session is the least likely to return next. This is not a
+   proof of optimality (sessions differ in size and token value); it says a cleverer live-session
+   order is not where the points are.
+3. **The levers the simulation supports are capacity and knowing which sessions ended.** A
+   session-end signal is worth up to +20 pt at 20 s think (to the ceiling) and +12 pt at 45 s;
+   host capacity is worth +20 to +44 pt at 45 s. Both apply to today's snapshot cache unchanged.
+   The simulation's limits: whole-session recency (no block-level eviction or partial-prefix
+   hits), one seed, and no production think distribution — P0 validates it against
+   hand-checkable traces, more seeds and the measured gaps before any column is quoted as a
+   prediction.
 
 ## Part A — Retention (the production fix)
 
@@ -99,10 +106,17 @@ Three conclusions, each contrary to a claim an earlier draft of this document ma
 
 Today's snapshot host tier (`PLOW_VMM_HOST_CACHE_MIB`, pinned 1 GiB chunks, 4 spills in flight,
 `vmm.rs:1933-2010`) is the right mechanism and was tested at the wrong rate. gpu03 and gpu04
-have 249 GB RAM (238 GB available on gpu04). Target 100 GB (≈ 600 extra sessions: the 101 GB
-column), allocated in bounded chunks after model load, with the 120 GB bring-up crash
-root-caused first (P0). Restore cost per hit: 121 MB over PCIe Gen5 at the measured ~25 GB/s ≈
-4.8 ms on the attach path, against a 40–70 ms TTFT; spill is async off the engine thread.
+have 249 GB RAM (238 GB available on gpu04). A spilled snapshot keeps its whole-block `Prefix`
+handles **on device** (the radix blocks it alone keeps alive, `evict_unit`), ≈ 35 MB per session
+today (9 GB / 261), so the effective budget is `41 GB = dev_snapshots × 121 MB + all_sessions ×
+35 MB` with `host_snapshots = host_GB / 121 MB`: a 100 GB host tier gives ≈ 826 host + 77 device
+= ~900 retained sessions against 261 today (≈ the simulation's 141 GB total, between its 101
+and 191 GB columns). Allocation after model load in bounded chunks with partial-allocation
+fallback and transfer backpressure, after the 120 GB bring-up crash is root-caused (P0).
+Restore cost per host hit: 121 MB over PCIe Gen5 at the measured ~25 GB/s ≈ 4.8 ms on the
+attach path, against a 40–70 ms TTFT; spill is async off the engine thread. Host-hit latency,
+queue delay, spill/restore bytes, pinned RSS and p99 interference are reported separately from
+the hit rate.
 vLLM 0.29 has the equivalent (`--kv-offloading-size`); production does not run it, and the
 gates compare against both configurations.
 
@@ -119,8 +133,20 @@ device cache, so the TTL protects nothing under pressure. Signals, strongest fir
 
 (1) is the only one that reaches the oracle column; (2) and (3) demote rather than reclaim: the
 boundary loses its pin but stays hashed and attachable until the space is actually needed, so a
-wrong prediction costs nothing but LRU position. How much of the gap (2) alone closes depends on
-the prod request mix and is a P0 measurement, not an assumption.
+wrong prediction costs LRU position and, under pressure, a miss — not nothing. P0 measures the
+signals' precision and the reuse they lose; how much of the gap (2) alone closes depends on the
+prod request mix and is measured, not assumed.
+
+Ordering and ownership. The end header rides the session's final request; the request still
+publishes its prompt-end boundary (cheap, and a retry may hit it), and the boundary is recorded
+with a per-session **generation** and marked terminal *after* that publish, so a later
+publication of the same generation cannot re-pin it. A new request with the same session id
+starts the next generation and re-pins on attach (a retry is just that). Demotion releases only
+that session's own pin: `SHARED_END` boundaries, other sessions' dependencies and transfer holds
+are untouched, and a boundary with in-flight attaches is demoted only when they complete.
+Abort/disconnect means the client closed the connection before the response completed;
+a normally completed response or stream is not a signal. Tests: end-before-publish,
+concurrent turns of one session, retry after end, cancellation mid-attach — with value checks.
 
 ### A.3 What Part A does not change
 
@@ -212,10 +238,14 @@ checkpoint, awaited checkpoint). At boundary `p`:
    in LRU order, still `Ready` and hashed, like vLLM's free queue, so an older boundary of the
    same session can still hit until the space is actually needed. A retired boundary stays
    discoverable as an unpinned record until the first of its blocks is reclaimed, which
-   invalidates it.
+   invalidates it. A block that goes `Failed` after its boundary was committed invalidates
+   that boundary the same way; no attach can have used it, because attach waits for `Ready`.
 5. **Reservation**: a publish first reserves its incremental working set (new blocks plus a
    bounded pointer-table slot) from the slab; if eviction cannot free it without touching held
    or `Filling` blocks, the publish is refused (counter), never partially written.
+6. **Source lifetimes**: a slot is not retired or re-admitted until every scatter reading it
+   has fired its event (today's `vmm_snap_copy` drain, kept); pointer tables are a per-stream
+   ring reused only behind the launch event that consumed them.
 
 Per-turn copy becomes the new rows only: ~100–300 rows → 10–35 MB scattered, against 106–121 MB
 today; a cold session still copies its full state (~165 MB), and the gate measures the mix. This
@@ -284,8 +314,8 @@ exist once in the store and once per live slot (≈ 59 MB × in-flight slots, ~1
 
 | | today | store |
 |---|---|---|
-| NVIDIA H100, TP=1 (Gemma-4 12B/26B) | VMM multi-map + snapshot copy | `Prefix` + `Window` + scales — first scope |
-| NVIDIA TP>1 | none | not in scope; the key carries a rank/shard id so a later TP attach can require a boundary `Ready` on every rank before any rank proceeds |
+| NVIDIA H100, TP=1, one packet per process (Gemma-4 12B/26B) | VMM multi-map + snapshot copy | `Prefix` + `Window` + scales — **B1 acceptance scope**; multi-packet namespaces, TP and CPU/NUMA below are extensions outside it |
+| NVIDIA TP>1 | none | future; the key carries a rank/shard id so a later TP attach can require a boundary `Ready` on every rank before any rank proceeds |
 | AMD MI300X/MI325X (GLM-5.3, DeepSeek, Kimi MLA) | `exec/amd/shared_prefix.rs`, VMM groups + tail copy | same store, `Prefix` over `ckv/krot/kidx/scale` with per-tensor descriptors (different row cadences allowed), HIP gather |
 | AMD per-slot route (`exec/amd/prefix.rs`) | carried state + ring windows, same slot only | `Window` + `State`, cross-slot |
 | Qwen3.8 27B GDN, Kimi KDA | prefix cache off | `Prefix` + `State` once the capture op exists |
@@ -318,22 +348,27 @@ counts, state machine, eviction and host tier are shared.
 | bytes / retained session | ~165 MB | ~165 MB | ~156 MB | ~156 MB | ~165 MB |
 | retention tiers | device | device + host | device | device + host (snapshots) | device + host (blocks) |
 | session-end demotion | none | none | TTL 150 s | header / abort / TTL | same |
-| hit at 10.8 req/s, think 20 s (sim) | 55% (48 GB) | ~75% | 55% | ~75% | same |
-| hit at 10.8 req/s, think 45 s (sim) | 31% | ~61% (100 GB) | 29% | 61% + end signal → up to 75% | same |
+| hit at 10.8 req/s, think 20 s (sim) | 61% (48 GB) | ~75% | 55% (41 GB) | ~75% | same |
+| hit at 10.8 req/s, think 45 s (sim) | 33% | ~61% (100 GB) | 29% | 61% + end signal → up to 75% | same |
 | per-turn publish | in place | in place | 106–121 MB + map/unmap | same | 10–35 MB |
 | recurrent-state models | Mamba/GDN prefix caching | same | off | off | `State` |
 | TTFT / TPOT at equal hit, same stream, 6.5 req/s | 82 / 11.5 ms (0.28) | — | 40 / 10.8 (MTP off), 40 / 5.2 (MTP on) | unchanged | unchanged |
 
-Predeclared claim for Part A: at 10 req/s and above, plowrt reaches a token hit rate within 2 pt
-of the oracle ceiling while holding its same-stream TTFT/TPOT, so its SLO goodput (TTFT ≤ 200
-ms, TPOT ≤ 30 ms) exceeds vLLM 0.29's by ≥ 20% and its maximum sustainable rate by ≥ 20%,
-against vLLM both device-only and with offloading at the same host budget, with the device
-KV+cache budget set equal to vLLM's allocated KV bytes. Acceptance: 3 repetitions per arm, each
-individually above the threshold. Against vLLM with offloading the hit rates tie by
-construction (§1.2) and the win is the per-token margin plus whatever the end signal adds; that
-is stated, not hidden. Part B's claim is narrower: publish bytes −70% or better on the replay's
-turn mix, attach latency within 2% of today's, `State` models cached, with Part A's hit rate
-preserved.
+Predeclared hypotheses for Part A, over a finite load envelope (rates 2.7 and 4.5 of the
+prod-fidelity plan, think 20 s and 45 s, 100 GB host tier, end signal present on the replay's
+final turns and, separately, absent): (i) token hit rate within 2 pt of the oracle ceiling —
+the oracle's 6 pt above the simulation's 75% is the first-turn system-prompt share, four ~2K
+prompts that are always resident, which the measurement confirms rather than assumes; (ii)
+same-stream TTFT/TPOT held; hence (iii) SLO goodput (TTFT ≤ 200 ms, TPOT ≤ 30 ms) ≥ 20% above
+vLLM 0.29's and maximum sustainable rate ≥ 20% above, against vLLM device-only and with
+offloading at the same host budget, device KV+cache budget equal to vLLM's allocated KV bytes.
+These are hypotheses: the per-token margins above are vLLM 0.28 numbers and the hit-rate tie
+with offloading follows from the simulation, not from a measurement. Acceptance rule: 3
+repetitions per arm, paired by repetition; the mean paired difference's 95% confidence interval
+(t, n = 3) must lie entirely above the threshold. Part B's hypothesis is narrower: publish bytes
+−70% or better on the replay's turn mix, attach latency within 2% of today's, `State` models
+cached, with Part A's hit rate preserved — and a measured engine-thread or p99 benefit from the
+copy reduction, since ~93 MB/s of average copy traffic is not a cost by itself.
 
 ## 4. Gates
 

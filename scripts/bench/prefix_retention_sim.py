@@ -4,8 +4,8 @@
 
 Insertion models:
   snapshot     every turn inserts a fresh boundary snapshot and retires the previous one (plowrt today)
-  incremental  the first turn inserts window + prefix rows, later turns only their new rows; a hit moves
-               the whole session to MRU (vLLM's per-token cache, or a block store)
+  incremental  a session holds its bounded window plus its Prefix rows, which grow by the turn's new rows;
+               a hit moves the whole session to MRU (vLLM's per-token cache, or a block store)
 `--ended-first` evicts sessions whose last planned turn has run before any live session: the oracle bound
 on what a session-end signal buys. The per-session byte constants are Gemma-4 26B-A4B FP8.
 
@@ -23,7 +23,6 @@ import agentic_turns as ag  # noqa: E402
 
 WINDOW_BYTES = 1024 * 104_000      # 25 sliding layers, K+V, 8 heads, hd 256 fp8 + ring scales
 PREFIX_ROW_BYTES = 10_320          # 5 full layers, K+V, 2 heads, hd 512 fp8 + scales
-ROW_BYTES = 114_000                # one new row across both classes
 SNAPSHOT_BYTES = 121e6             # measured prod mean boundary snapshot
 SHARED_BLOCK_BYTES = 40 * 2**20    # one 4096-row block over 10 tracks x 2 heads
 
@@ -51,10 +50,9 @@ def simulate(plan, cap, model, ended_first, e2e=1.0):
             used -= prev
         if model == "snapshot":
             b = SNAPSHOT_BYTES + (p // 4096) * SHARED_BLOCK_BYTES
-        elif present:
-            b = prev + (turn["user_tokens"] + turn["max_tokens"]) * ROW_BYTES
         else:
-            b = WINDOW_BYTES + p * PREFIX_ROW_BYTES
+            # The window is bounded; only the Prefix rows grow with the boundary after this turn.
+            b = WINDOW_BYTES + (p + turn["max_tokens"]) * PREFIX_ROW_BYTES
         lru[si] = b
         used += b
         if ended_first and k == len(plan[si]["turns"]) - 1:
