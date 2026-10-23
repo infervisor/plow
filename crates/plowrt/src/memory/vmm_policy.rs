@@ -283,6 +283,27 @@ pub(super) fn evict_unit(s: &Shared, inner: &mut Inner, id: u64) {
     );
 }
 
+/// Spill one device boundary to the host tier ahead of need (the block store's spill-ahead
+/// thread): the LRU unheld, unawaited one, unshielded before shielded; a boundary the tier
+/// refuses (held in the store, no host slot) is skipped for the next, a few deep. `false` =
+/// nothing spilled.
+pub(super) fn spill_lru(s: &Shared, inner: &mut Inner) -> bool {
+    let now = std::time::Instant::now();
+    let awaited = inner.awaited.clone();
+    let mut candidates: Vec<(bool, u64, u64)> = inner
+        .published
+        .values()
+        .flatten()
+        .filter(|snap| snap.users == 0 && snap.on_device() && !snap_awaited(&awaited, snap))
+        .map(|snap| (snap.shielded(now), snap.last_used, snap.id))
+        .collect();
+    candidates.sort_unstable();
+    candidates
+        .iter()
+        .take(8)
+        .any(|&(_, _, id)| spill_unit(s, inner, id))
+}
+
 /// Test hook: the boundary tree's structural invariants over every published snapshot.
 #[cfg(test)]
 pub(super) fn check_tree(inner: &Inner) {

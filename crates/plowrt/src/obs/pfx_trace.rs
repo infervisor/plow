@@ -233,6 +233,8 @@ pub enum Trigger {
     Oom,
     /// `VmmKv::relieve`: memory given back to an allocation outside the pool.
     Relieve,
+    /// The block store's spill-ahead thread: a spill before any allocation needed the bytes.
+    Ahead,
 }
 
 /// Why a boundary was not published ([`Event::Refuse`]).

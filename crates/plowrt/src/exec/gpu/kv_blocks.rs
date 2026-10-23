@@ -29,6 +29,9 @@ use std::sync::Arc;
 
 const ROWS_PER_BLOCK: u32 = 32;
 const CHUNK_BYTES: u64 = 8 << 20;
+/// Device headroom the spill-ahead thread keeps for publishes when a host tier is armed
+/// (`VmmKv::spawn_spill_ahead`): about a second of boundaries at the production rate.
+pub const SPILL_AHEAD_BYTES: u64 = 2 << 30;
 const SEED_CHAIN: u64 = 0x9e37_79b9_7f4a_7c15;
 const SEED_CHECK: u64 = 0xc2b2_ae3d_27d4_eb4f;
 const SEGCOPY_PTX: &str = include_str!("../../../../../runtime/nvidia/kv_segcopy.ptx");
@@ -342,6 +345,10 @@ impl BlockServe {
 
     pub fn set_host_reserve(&self, bytes: u64) {
         self.store.set_host_reserve(bytes);
+    }
+
+    pub fn store(&self) -> Arc<KvStore> {
+        Arc::clone(&self.store)
     }
 
     pub fn set_device_floor(&self, bytes: u64) {

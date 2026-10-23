@@ -1683,6 +1683,11 @@ pub struct VmmKv {
     )>,
     /// [`Self::enable_host_tier`]'s chunk allocator and prefetch thread.
     host_join: Option<std::thread::JoinHandle<()>>,
+    /// [`Self::spawn_spill_ahead`]: stop flag + join.
+    spill_ahead: Option<(
+        Arc<std::sync::atomic::AtomicBool>,
+        std::thread::JoinHandle<()>,
+    )>,
 }
 
 impl VmmKv {
@@ -1849,6 +1854,7 @@ impl VmmKv {
             premap_join: None,
             precreate: None,
             host_join: None,
+            spill_ahead: None,
         };
         {
             let mut inner = shared.inner.lock();
@@ -3309,6 +3315,46 @@ impl VmmKv {
         })
     }
 
+    /// One step of the spill-ahead policy: the LRU device boundary moves to the block store's
+    /// host tier. `false` = no block store, or nothing it would take.
+    pub fn spill_ahead_one(&self) -> bool {
+        spill_ahead_step(&self.shared)
+    }
+
+    /// Spill-ahead thread for a block store with a host tier: while the store's device headroom
+    /// is under `headroom` bytes, the LRU boundary moves to the host, so a publish finds free
+    /// slots instead of spilling on the engine thread and re-spilling until one copy lands (the
+    /// 10 s replay paid 9 ms per publish that way, and the device tier drained to the host far
+    /// ahead of need). Completed spills are retired here as well.
+    pub fn spawn_spill_ahead(
+        &mut self,
+        store: Arc<crate::memory::kv_store::KvStore>,
+        headroom: u64,
+    ) {
+        if self.spill_ahead.is_some() {
+            return;
+        }
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let shared = Arc::clone(&self.shared);
+        let flag = Arc::clone(&stop);
+        let spawned = std::thread::Builder::new()
+            .name("vmm-spill-ahead".into())
+            .spawn(move || {
+                while !flag.load(Ordering::Relaxed) {
+                    store.reap();
+                    let spilled =
+                        store.device_headroom_bytes() < headroom && spill_ahead_step(&shared);
+                    if !spilled {
+                        std::thread::sleep(std::time::Duration::from_millis(2));
+                    }
+                }
+            });
+        match spawned {
+            Ok(j) => self.spill_ahead = Some((stop, j)),
+            Err(e) => tracing::warn!(error = %e, "vmm: spill-ahead thread not started"),
+        }
+    }
+
     /// [`Self::publish_kind`] with the boundary's bytes in the KV block store: `fill` runs with
     /// the lock released and returns the store handle and the bytes the publish added to the
     /// device (its new blocks; shared ones are charged to their first publisher). The handle is
@@ -4377,6 +4423,10 @@ impl Drop for VmmKv {
             stop.store(true, Ordering::Release);
             let _ = j.join();
         }
+        if let Some((stop, j)) = self.spill_ahead.take() {
+            stop.store(true, Ordering::Release);
+            let _ = j.join();
+        }
         if let Some(j) = self.host_join.take() {
             {
                 // Under the worker's mutex: it checks the flag and parks on `host_cv` without
@@ -5252,6 +5302,17 @@ fn complete_spill(s: &Shared, inner: &mut Inner, id: u64) {
 
 /// Block on the oldest spill and free its device buffer: the caller needs bytes now. A failed
 /// fence quarantines the entry instead (nothing freed) and the next one is tried.
+/// [`VmmKv::spill_ahead_one`] on the shared state (the spill-ahead thread holds no `VmmKv`).
+fn spill_ahead_step(s: &Shared) -> bool {
+    let mut inner = s.inner.lock();
+    if inner.block_store.is_none() {
+        return false;
+    }
+    with_cause(&mut inner, None, Some(Trigger::Ahead), |inner| {
+        policy::spill_lru(s, inner)
+    })
+}
+
 fn finish_oldest_spill(s: &Shared, inner: &mut Inner) -> bool {
     while let Some((id, _)) = inner.host.as_mut().and_then(|t| t.in_flight.pop_front()) {
         let Some(SnapStore::Spilling { fence, .. }) = snap_ref(inner, id).map(|snap| snap.store)
@@ -8428,6 +8489,36 @@ mod tests {
         let st = p.stats();
         assert_eq!((st.host_snapshots, st.snapshots_live), (2, 2));
         assert_eq!(p.cached_rows(&a), 16);
+        policy::check_tree(&p.shared.inner.lock());
+    }
+
+    /// Spill-ahead moves the LRU device boundary to the host before any allocation needs
+    /// the bytes; the boundary stays attachable; nothing on the device left = nothing spilled.
+    #[test]
+    fn spill_ahead_moves_the_lru_device_boundary_to_the_host() {
+        let ops = Arc::new(MockVmm::default());
+        let p = pool(ops.clone());
+        assert!(!p.spill_ahead_one(), "no block store");
+        p.enable_block_store(Arc::new(SpillBlocks), true);
+        let a = prompt(17);
+        p.try_attach(0, &a).unwrap();
+        p.ensure_rows(0, 17).unwrap();
+        p.publish_blocks(0, &a, 16, Kind::PROMPT_END, || Ok((7, 100)))
+            .unwrap();
+        p.begin_seq(0);
+        let b: Vec<u32> = (500..517).collect();
+        p.try_attach(0, &b).unwrap();
+        p.ensure_rows(0, 17).unwrap();
+        p.publish_blocks(0, &b, 16, Kind::PROMPT_END, || Ok((8, 100)))
+            .unwrap();
+        p.begin_seq(0);
+        assert!(p.spill_ahead_one());
+        let st = p.stats();
+        assert_eq!((st.host_snapshots, st.snapshots_live), (1, 2));
+        assert_eq!(p.cached_rows(&a), 16, "a (the LRU) is on the host, still attachable");
+        assert!(p.spill_ahead_one());
+        assert!(!p.spill_ahead_one(), "nothing left on the device");
+        assert_eq!(p.stats().host_snapshots, 2);
         policy::check_tree(&p.shared.inner.lock());
     }
 

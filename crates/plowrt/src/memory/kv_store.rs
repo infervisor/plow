@@ -1247,6 +1247,28 @@ impl KvStore {
         let inner = self.inner.lock();
         inner.classes.iter().map(|c| c.device.reserved_bytes()).sum()
     }
+
+    /// Device bytes acquires can take without a boundary being evicted: free slots of the
+    /// reserved chunks, blocks on the reclaim lists (an upper bound: stale entries count) and
+    /// the growth room under the cap and the floor.
+    pub fn device_headroom_bytes(&self) -> u64 {
+        let inner = self.inner.lock();
+        let mut bytes = 0u64;
+        for (c, class) in inner.classes.iter().enumerate() {
+            let slot = class.spec.block_bytes();
+            bytes += (class.device.free_slots + inner.reclaim[c].len() as u64) * slot;
+        }
+        let reserved: u64 = inner.classes.iter().map(|c| c.device.reserved_bytes()).sum();
+        let growth = inner.device_cap.saturating_sub(reserved);
+        let chunk = inner.classes.first().map_or(0, |c| c.device.chunk_bytes());
+        let room = match self.ops.free_bytes() {
+            Some(free) => growth.min(
+                free.saturating_sub(chunk.saturating_mul(DEVICE_FLOOR_EVERY) + inner.device_floor),
+            ),
+            None => growth,
+        };
+        bytes + room
+    }
 }
 
 impl Drop for KvStore {
@@ -1532,6 +1554,19 @@ mod tests {
         assert_eq!(s.location(b.id), Some(Location::Host));
         assert_eq!(s.stats().classes[0].host_blocks, 1);
         assert_eq!(ops.host_alloc.load(Ordering::SeqCst), 32, "no second chunk");
+    }
+
+    #[test]
+    fn device_headroom_counts_growth_free_slots_and_reclaimable_blocks() {
+        let (_, s) = store(4 * 32, 0); // chunk = 32 B = one block
+        assert_eq!(s.device_headroom_bytes(), 4 * 32, "all growth");
+        let a = s.acquire(0, key(1)).unwrap();
+        s.seal(a.id);
+        assert_eq!(s.device_headroom_bytes(), 3 * 32, "one block live");
+        s.release(&[a.id]);
+        assert_eq!(s.device_headroom_bytes(), 4 * 32, "released: reclaimable again");
+        s.set_device_cap(32);
+        assert_eq!(s.device_headroom_bytes(), 32, "no growth under the cap, one reclaimable");
     }
 
     #[test]

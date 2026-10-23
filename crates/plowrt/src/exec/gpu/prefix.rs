@@ -576,15 +576,18 @@ impl GpuEngine {
                             if let Some((_, reserve)) = auto {
                                 blocks.set_host_reserve(reserve);
                             }
-                            serve
-                                .kv
-                                .as_ref()
-                                .expect("prefix pool")
-                                .enable_block_store(
-                                    std::sync::Arc::clone(&blocks)
-                                        as std::sync::Arc<dyn crate::memory::vmm::SnapBlocks>,
-                                    true,
+                            let kv = serve.kv.as_mut().expect("prefix pool");
+                            kv.enable_block_store(
+                                std::sync::Arc::clone(&blocks)
+                                    as std::sync::Arc<dyn crate::memory::vmm::SnapBlocks>,
+                                true,
+                            );
+                            if host_cap > 0 {
+                                kv.spawn_spill_ahead(
+                                    blocks.store(),
+                                    super::kv_blocks::SPILL_AHEAD_BYTES,
                                 );
+                            }
                             serve.blocks = Some(blocks);
                         }
                         // The store is the boundary storage: without it nothing publishes
