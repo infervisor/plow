@@ -562,7 +562,7 @@ impl GpuEngine {
                     match super::kv_blocks::BlockServe::new(
                         be,
                         &serve,
-                        cache_cap.max(1 << 30),
+                        if cache_cap > 0 { cache_cap } else { device_bytes / 4 },
                         rt.vmm_host_cache_bytes(),
                         state_tensors,
                     ) {
@@ -579,6 +579,13 @@ impl GpuEngine {
                         }
                         Err(e) => tracing::warn!(error = %e, "kv store: off"),
                     }
+                }
+                // A recurrent model's boundary without its state is wrong on attach: no store,
+                // no prefix cache.
+                if !state_tensors.is_empty() && serve.blocks.is_none() && serve.prefix_kv().is_some() {
+                    return Err(RuntimeError::Rejected(
+                        "recurrent state needs the KV block store (PLOW_KV_STORE=1) for prefix caching".into(),
+                    ));
                 }
                 Ok(Some(serve))
             }

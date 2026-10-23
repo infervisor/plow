@@ -356,6 +356,20 @@ model with recurrent state is accepted only with the store on.
 Not a knob: the store adds `PLOW_KV_STORE` as its rollback switch and nothing else; the reserve,
 chunk size and class set are derived.
 
+Known limits of B1 (accepted until B4, each gated rather than assumed):
+* Dedup is keyed by tokens, as the radix tree's whole-block sharing already is; a 32-row block
+  computed under one prefill bucket or inherited prefix stands in for the same tokens computed
+  under another. KV rows and their fp8 scales travel in one block, filled together. The
+  exactness gate (store vs snapshot path, greedy multi-turn at block and window edges) and the
+  FP32 gate are the contract, not the hash.
+* Slab chunks belong to the class that grew them; the budget moves between classes only when a
+  chunk empties (`shrink`, run first under device pressure). The pool's byte charges are per
+  publish (new blocks) and approximate; `plowrt_kv_store_{device,host}_bytes` are the truth.
+* Publish and non-window gathers drain the engine stream before sealing or releasing blocks
+  (the snapshot path drained the same way); a launch-window gather keeps its holds until the
+  step's drain. Hash chains are recomputed per publish (16K tokens, microseconds) and the
+  segment table is uploaded synchronously per copy (~600 KB); both are below the copy itself.
+
 ### B.7 What VMM still does
 
 Per-slot sparse growth of the full-layer tracks (`ensure_rows`, premap) and the live rings.

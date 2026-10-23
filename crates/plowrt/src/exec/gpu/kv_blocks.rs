@@ -248,6 +248,14 @@ impl BlockServe {
     }
 }
 
+impl Drop for BlockServe {
+    fn drop(&mut self) {
+        for t in self.tables.get_mut().iter_mut().flatten() {
+            VmmOps::free(&*self.be, t.dev);
+        }
+    }
+}
+
 impl SnapBlocks for BlockServe {
     fn release(&self, handle: u64) {
         if let Some(h) = self.handles.lock().remove(&handle) {
@@ -277,6 +285,10 @@ impl SnapBlocks for BlockServe {
 
     fn reap(&self) {
         self.store.reap();
+    }
+
+    fn shrink(&self, bytes: u64) -> u64 {
+        self.store.shrink(bytes)
     }
 }
 
@@ -322,7 +334,14 @@ impl GpuEngine {
             let acquired = loop {
                 match bs.store.acquire(ci, key) {
                     Ok(a) => break a,
-                    Err(RuntimeError::Oom(_)) if kv.reclaim_one() => continue,
+                    // Retired spills free device slots; else the pool gives up a boundary.
+                    Err(RuntimeError::Oom(_)) if {
+                        bs.store.reap();
+                        kv.reclaim_one()
+                    } =>
+                    {
+                        continue
+                    }
                     Err(e) => {
                         abort(&handle, &fills);
                         return Err(e);
@@ -337,7 +356,11 @@ impl GpuEngine {
             }
         }
         if !segs.is_empty() {
-            if let Err(e) = self.run_segments(b, &segs) {
+            // Drain even a partially submitted table: the blocks are sealed or released after
+            // the engine stream is done with them.
+            let copied = self.run_segments(b, &segs);
+            let drained = self.be.stream_synchronize(&self.stream);
+            if let Err(e) = copied.and(drained) {
                 abort(&handle, &fills);
                 return Err(e);
             }
@@ -377,10 +400,16 @@ impl GpuEngine {
             }
             self.run_segments(b, &segs)
         })();
+        // Inside a launch window a successful gather is drained by the step
+        // (`flush_deferred_attach` drops the holds); every other outcome drains here.
+        let copied = if copied.is_ok() && self.window_open {
+            copied
+        } else {
+            copied.and(self.be.stream_synchronize(&self.stream))
+        };
         match copied {
             Ok(()) if self.window_open => bs.held.lock()[b].extend_from_slice(&ids),
-            Ok(()) => bs.store.unhold(&ids),
-            Err(_) => bs.store.unhold(&ids),
+            _ => bs.store.unhold(&ids),
         }
         copied?;
         let mut st = bs.stats.lock();

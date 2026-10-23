@@ -1300,6 +1300,8 @@ pub trait SnapBlocks: Send + Sync {
     fn restore(&self, handle: u64) -> Result<()>;
     /// Retire completed spills.
     fn reap(&self);
+    /// Device pressure: drop released blocks and give empty slabs back; bytes released.
+    fn shrink(&self, bytes: u64) -> u64;
 }
 
 impl SnapStore {
@@ -4701,9 +4703,18 @@ fn trim_cache_by(
             // (Pooled blocks are not free and not credited; the pool cap bounds them.)
             let queued = inner.release_queued;
             while free + (inner.release_queued - queued) + pending_spill_bytes(inner) < min_free {
-                if !with_cause(inner, None, Some(Trigger::MinFree), |inner| {
-                    evict_one(s, inner, true)
-                }) {
+                // The block store gives memory back first: blocks of boundaries already evicted
+                // (its reclaim list) and the slabs they empty; evicting more boundaries only
+                // feeds that list.
+                let shrunk = inner
+                    .block_store
+                    .as_ref()
+                    .map_or(0, |hook| hook.shrink(min_free - free));
+                if shrunk == 0
+                    && !with_cause(inner, None, Some(Trigger::MinFree), |inner| {
+                        evict_one(s, inner, true)
+                    })
+                {
                     break;
                 }
                 free = s.ops.free_bytes().unwrap_or(u64::MAX);
