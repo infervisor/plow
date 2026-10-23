@@ -516,6 +516,15 @@ pub fn is_runtime_env(env: &str) -> bool {
         .any(|k| k.env == Some(env) && !matches!(k.status, Status::Removed))
 }
 
+/// Whether `env` names a retired knob: a packet built before its removal may still carry a
+/// default for it, which is ignored rather than refused.
+pub fn is_removed_env(env: &str) -> bool {
+    RUNTIME
+        .iter()
+        .chain(RAW_ENV)
+        .any(|k| k.env == Some(env) && matches!(k.status, Status::Removed))
+}
+
 #[rustfmt::skip]
 pub const RUNTIME: &[KnobSpec] = &[
     KnobSpec::new("rt.rt_checkpoint", Some("PLOW_CHECKPOINT"), Layer::Runtime, Domain::Str, UNSET, OPT_IN),
