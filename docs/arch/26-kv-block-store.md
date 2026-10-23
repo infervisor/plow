@@ -380,6 +380,19 @@ A boundary the slot has moved past is not publishable for such a model (no state
 so a prompt end evicted during decode is not restored at the turn end. Prefix caching for a
 model with recurrent state is accepted only with the store on.
 
+Copy backend, measured (gpu03 H100, `kvstore-probe/segcopy`, random 8 KiB segments over a 2 GB
+arena, second repetition):
+
+| segments × bytes | memcpy loop submit / GPU | segcopy kernel submit / GPU |
+|---|---|---|
+| 12,800 × 8 KiB (a full window gather) | 32.1 ms / 32.1 ms (3.3 GB/s) | 0.07 ms / 0.16 ms (644 GB/s) |
+| 1,200 × 8 KiB (one turn's new rows) | 3.0 ms / 3.0 ms | 0.01 ms / 0.02 ms |
+| 2,560 × 16 KiB | 6.3 ms / 6.3 ms | 0.02 ms / 0.05 ms (886 GB/s) |
+| 12,800 × 128 B (ring scales) | 31.3 ms / 31.3 ms | 0.05 ms / 0.07 ms |
+
+A memcpy loop costs ~2.5 µs per segment whatever its size; the kernel is launch-bound at
+~0.1 ms. The store runs the kernel (PTX embedded); the loop is the fallback only.
+
 Not a knob: the store adds `PLOW_KV_STORE` as its rollback switch and nothing else; the reserve,
 chunk size and class set are derived.
 
