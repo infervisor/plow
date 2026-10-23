@@ -21,7 +21,8 @@ Folded / precomputed (all in fp64, stored fp32):
   voice.prompt_token [V][P] i32, voice.prompt_feat [V][Pf*80], voice.spks [V][80] (spk affine of
   the normalized x-vector). Every voice must have the same P and Pf = 2 P.
   --clone-slots S --prompt-max PMAX adds S runtime-written voice slots (prompts of up to PMAX tokens;
-  config prompt_max / clone_slots) rendered by the vsynth programs.
+  config prompt_max / clone_slots) rendered by the vsynth programs. --cache-slots C adds C prompt K/V
+  caches (about 2.3 GB each at PMAX 250) that cloned stream windows reuse (cvsynth, config cache_slots).
 """
 import argparse
 import glob
@@ -59,6 +60,7 @@ def main():
     ap.add_argument("--prompt-max", type=int, default=0,
                     help="voice-cloning slots' prompt capacity in tokens (0 = no slots)")
     ap.add_argument("--clone-slots", type=int, default=0, help="voice-cloning slots")
+    ap.add_argument("--cache-slots", type=int, default=0, help="cloned-voice prompt K/V caches")
     ap.add_argument("--weights", default="s3gen.safetensors", help="snapshot file (Multilingual V3: s3gen_v3.safetensors)")
     args = ap.parse_args()
     from safetensors.torch import save_file
@@ -269,7 +271,8 @@ def main():
     config = dict(
         model_type="chatterbox_s3gen", sampling_rate=24000, vocab=int(fl.input_embedding.num_embeddings),
         voices=[v[0] for v in V], prompt_tokens=P, max_tokens=args.max_tokens, relpos_rows=rows,
-        **(dict(prompt_max=pmax, clone_slots=args.clone_slots) if args.clone_slots else {}),
+        **(dict(prompt_max=pmax, clone_slots=args.clone_slots, cache_slots=args.cache_slots)
+           if args.clone_slots else {}),
         t_span=[float(x) for x in t_span], cfg_rate=float(dec.inference_cfg_rate),
         upsample=ups, source_downs=downs, source_resblocks=source_rbs, resblocks=rbs,
         n_fft=n_fft, hop=hop, harmonics=int(sg.harmonic_num) + 1, sine_amp=float(sg.sine_amp),

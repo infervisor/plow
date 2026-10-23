@@ -4,7 +4,7 @@
 //! zero-padded to the tensor; outputs are the whole tensor. Runs the first N programs of the
 //! sequence `ROLE.0, ROLE.1, ...` K times and prints the median GPU time per program.
 //! `--before ROLE2` runs the sequence `ROLE2.*` once first, with the `--before-in NAME=FILE`
-//! inputs (e.g. a packet's cache-filling programs).
+//! inputs that follow it (e.g. a packet's cache-filling programs); repeat it for several runs.
 
 #[cfg(not(feature = "cuda"))]
 fn main() {
@@ -25,14 +25,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let rt = &mut loaded.runtime;
     let mut programs = pipeline.program_sequence(&args[3])?;
     let (mut iters, mut inputs, mut outputs) = (1usize, Vec::new(), Vec::new());
-    let (mut before, mut before_inputs) = (None, Vec::new());
+    let mut before: Vec<(Vec<usize>, Vec<(PacketTensor, String)>)> = Vec::new();
     let mut it = args[4..].iter();
     while let Some(flag) = it.next() {
         let value = it.next().ok_or(format!("{flag} needs a value"))?;
         match flag.as_str() {
             "--stages" => programs.truncate(value.parse()?),
             "--iters" => iters = value.parse()?,
-            "--before" => before = Some(pipeline.program_sequence(value)?),
+            "--before" => before.push((pipeline.program_sequence(value)?, Vec::new())),
             "--in" | "--out" | "--before-in" => {
                 let (name, file) = value
                     .split_once('=')
@@ -43,7 +43,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 };
                 match flag.as_str() {
                     "--in" => inputs.push((tensor, file.to_string())),
-                    "--before-in" => before_inputs.push((tensor, file.to_string())),
+                    "--before-in" => before
+                        .last_mut()
+                        .ok_or("--before-in before any --before")?
+                        .1
+                        .push((tensor, file.to_string())),
                     _ => outputs.push((tensor, file.to_string())),
                 }
             }
@@ -68,9 +72,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         Ok(())
     };
-    if let Some(before) = &before {
-        write(rt, &before_inputs)?;
-        rt.run_sequence(before)?;
+    for (sequence, inputs) in &before {
+        write(rt, inputs)?;
+        rt.run_sequence(sequence)?;
     }
     write(rt, &inputs)?;
     let mut us = vec![Vec::with_capacity(iters); programs.len()];

@@ -240,6 +240,8 @@ enum Family {
     Window,
     Step,
     Slot,
+    /// A cloned-voice window on the slot cache capacities (`cvsynth`).
+    SlotCached,
 }
 
 enum Msg {
@@ -256,6 +258,8 @@ struct Job {
     window: Option<Window>,
     step: Option<Step>,
     clone: Option<std::sync::Arc<SlotVoice>>,
+    /// The clone's prompt K/V is resident in a cache slot (set by the worker).
+    cached: bool,
     reply: tokio::sync::oneshot::Sender<Result<Decoded, String>>,
     /// Backlog charged to the feeding model's mux until this job is answered.
     _work: Option<crate::sched::admission::DownstreamWork>,
@@ -265,6 +269,7 @@ impl Job {
     fn family(&self) -> Family {
         match (&self.window, &self.step, &self.clone) {
             (_, Some(_), _) => Family::Step,
+            (Some(_), None, Some(_)) if self.cached => Family::SlotCached,
             (_, None, Some(_)) => Family::Slot,
             (Some(_), None, None) => Family::Window,
             (None, None, None) => Family::Decode,
@@ -380,6 +385,21 @@ impl VoiceSlots {
     }
 }
 
+/// Cloned voices' prompt K/V caches (`cprefill` writes cache slot `cslot`); `cvsynth` windows
+/// attend to them. A prefill depends only on the voice, so an evicted voice refills identically.
+struct CacheSlots {
+    prefill: Vec<usize>,
+    cslot: PacketTensor,
+    resident: Vec<Option<std::sync::Arc<SlotVoice>>>,
+    used: Vec<std::time::Instant>,
+}
+
+/// A cache slot is taken from another voice only after this long unused: busier voices render
+/// on the voice-slot capacities instead of refilling caches every window.
+const CACHE_IDLE: std::time::Duration = std::time::Duration::from_secs(2);
+/// Cached windows attend to `2 P - 8` prompt rows plus 8 tail rows.
+const CACHE_MIN_PROMPT: usize = 4;
+
 struct Bound {
     runtime: Box<dyn crate::exec::packet_runtime::PacketRuntime>,
     /// (batch, frames, programs in order), ascending by batch * frames.
@@ -393,6 +413,9 @@ struct Bound {
     /// Voice-slot capacities (`vsynth`) and the slots their items read.
     slot_caps: Vec<Capacity>,
     voice_slots: Option<VoiceSlots>,
+    /// Cloned-voice window capacities over the slot caches (`cvsynth`).
+    cslot_caps: Vec<Capacity>,
+    cache_slots: Option<CacheSlots>,
     /// Window source phase in/out and seams (packets with cached capacities).
     phase: Option<[PacketTensor; 4]>,
     harmonics: usize,
@@ -694,6 +717,7 @@ impl Codec {
                 window,
                 step,
                 clone,
+                cached: false,
                 reply,
                 _work,
             }))
@@ -718,6 +742,9 @@ fn bind(path: &Path, device: u8) -> Result<Bound, String> {
         Default::default();
     let mut vsynth: std::collections::BTreeMap<(usize, usize), Vec<(usize, usize)>> =
         Default::default();
+    let mut cvsynth: std::collections::BTreeMap<(usize, usize), Vec<(usize, usize)>> =
+        Default::default();
+    let mut cprefill: Vec<(usize, usize)> = Vec::new();
     let mut prefill: std::collections::BTreeMap<u32, Vec<(usize, usize)>> = Default::default();
     for (role, program) in pipeline.programs() {
         let parts: Vec<&str> = role.split('.').collect();
@@ -738,14 +765,20 @@ fn bind(path: &Path, device: u8) -> Result<Bound, String> {
                     steps.entry(key).or_default().push((0, program));
                 }
             }
-            [kind @ ("synth" | "csynth" | "vsynth"), b, t, stage] => {
+            [kind @ ("synth" | "csynth" | "vsynth" | "cvsynth"), b, t, stage] => {
                 if let (Some(key), Ok(stage)) = (dims(b, t, "b", "t"), stage.parse::<usize>()) {
                     let family = match *kind {
                         "synth" => &mut sequences,
                         "csynth" => &mut cached,
-                        _ => &mut vsynth,
+                        "vsynth" => &mut vsynth,
+                        _ => &mut cvsynth,
                     };
                     family.entry(key).or_default().push((stage, program));
+                }
+            }
+            ["cprefill", stage] => {
+                if let Ok(stage) = stage.parse::<usize>() {
+                    cprefill.push((stage, program));
                 }
             }
             ["prefill", v, stage] => {
@@ -775,6 +808,7 @@ fn bind(path: &Path, device: u8) -> Result<Bound, String> {
     let capacities = family(sequences);
     let cached = family(cached);
     let slot_caps = family(vsynth);
+    let cslot_caps = family(cvsynth);
     let stateful = pipeline.parameter("stream.stateful").unwrap_or(0) == 1;
     let steps = if stateful { family(steps) } else { Vec::new() };
     if capacities.is_empty() {
@@ -849,13 +883,40 @@ fn bind(path: &Path, device: u8) -> Result<Bound, String> {
             clock: 0,
         })
     };
+    let cache_slots = if cslot_caps.is_empty() {
+        None
+    } else {
+        let n = param("voice.cache_slots")?;
+        if voice_slots.is_none() || cprefill.is_empty() || n == 0 {
+            return Err(
+                "codec slot-cache capacities need voice slots, cache slots and cprefill".into(),
+            );
+        }
+        let cslot = pipeline.tensor("cslot").map_err(e)?;
+        if cslot_caps.iter().any(|c| c.0 > cslot.bytes / 4) {
+            return Err("codec slot-cache capacity exceeds its cslot input".into());
+        }
+        runtime
+            .write_tensor(cslot, &vec![0u8; cslot.bytes])
+            .map_err(e)?;
+        Some(CacheSlots {
+            prefill: ordered(cprefill),
+            cslot,
+            resident: vec![None; n],
+            used: vec![std::time::Instant::now(); n],
+        })
+    };
     for (_, _, programs) in capacities
         .iter()
         .chain(&cached)
         .chain(&steps)
         .chain(&slot_caps)
+        .chain(&cslot_caps)
     {
         runtime.run_sequence(programs).map_err(e)?;
+    }
+    if let Some(c) = &cache_slots {
+        runtime.run_sequence(&c.prefill).map_err(e)?;
     }
     tracing::info!(
         capacities = capacities.len() + cached.len() + steps.len() + slot_caps.len(),
@@ -906,6 +967,8 @@ fn bind(path: &Path, device: u8) -> Result<Bound, String> {
         cached,
         slot_caps,
         voice_slots,
+        cslot_caps,
+        cache_slots,
         phase,
         harmonics: pipeline
             .parameter("vocoder.harmonics")
@@ -986,6 +1049,7 @@ impl Bound {
             Family::Window => &self.cached,
             Family::Step => &self.steps,
             Family::Slot => &self.slot_caps,
+            Family::SlotCached => &self.cslot_caps,
         };
         smallest(caps, batch, frames)
     }
@@ -1018,6 +1082,103 @@ impl Bound {
             Some(pool) => pool.lock().check(step.slot, step.pos),
             None => Err("codec packet has no stream steps"),
         }
+    }
+
+    /// Mark the cloned-voice windows whose voice holds (or now takes) a cache slot; a voice
+    /// without one renders on the voice-slot capacities.
+    fn place_caches(&mut self, pending: &mut [Job]) {
+        let Some(cs) = self.cache_slots.as_ref() else {
+            return;
+        };
+        let n = cs.resident.len();
+        for k in 0..pending.len() {
+            let j = &pending[k];
+            let Some(v) = j.clone.as_ref().filter(|_| j.window.is_some() && !j.cached) else {
+                continue;
+            };
+            if v.prompt_token.len() < CACHE_MIN_PROMPT
+                || smallest(&self.cslot_caps, 1, j.frames).is_none()
+            {
+                continue;
+            }
+            let v = std::sync::Arc::clone(v);
+            let cs = self.cache_slots.as_ref().expect("checked above");
+            let hit = cs
+                .resident
+                .iter()
+                .position(|r| r.as_ref().is_some_and(|r| std::sync::Arc::ptr_eq(r, &v)));
+            let victim = match hit {
+                Some(_) => None,
+                None => {
+                    let held = |s: usize| {
+                        cs.resident[s].as_ref().is_some_and(|r| {
+                            pending.iter().any(|p| {
+                                p.cached
+                                    && p.clone
+                                        .as_ref()
+                                        .is_some_and(|c| std::sync::Arc::ptr_eq(c, r))
+                            })
+                        })
+                    };
+                    (0..n)
+                        .filter(|&s| {
+                            cs.resident[s].is_none()
+                                || (!held(s) && cs.used[s].elapsed() >= CACHE_IDLE)
+                        })
+                        .min_by_key(|&s| (cs.resident[s].is_some(), cs.used[s]))
+                }
+            };
+            let slot = hit.or(victim.filter(|&s| match self.prefill_cache(s, &v) {
+                Ok(()) => true,
+                Err(err) => {
+                    tracing::warn!(error = %err, "tts: voice cache prefill failed");
+                    false
+                }
+            }));
+            if slot.is_some() {
+                for p in pending.iter_mut() {
+                    if p.window.is_some()
+                        && p.clone
+                            .as_ref()
+                            .is_some_and(|c| std::sync::Arc::ptr_eq(c, &v))
+                        && smallest(&self.cslot_caps, 1, p.frames).is_some()
+                    {
+                        p.cached = true;
+                    }
+                }
+            }
+        }
+    }
+
+    /// Cache slot `s` <- `v`'s prompt K/V: its tables into a voice slot, then `cprefill`
+    /// (prompt alone, seed 0x5eed, as the builtin voices' prefill).
+    fn prefill_cache(&mut self, s: usize, v: &std::sync::Arc<SlotVoice>) -> Result<(), String> {
+        let e = |x: crate::RuntimeError| x.to_string();
+        let cs = self.cache_slots.as_mut().ok_or("no slot caches")?;
+        cs.resident[s] = None;
+        let vs = self.voice_slots.as_mut().ok_or("no voice slots")?;
+        let table = vs.assign(self.runtime.as_mut(), &[v])?[0];
+        let (voice, Some(&(count, _))) =
+            (self.voice.ok_or("no voice input")?, self.lengths.first())
+        else {
+            return Err("slot cache prefill needs a length input".into());
+        };
+        let zero = |t: PacketTensor| vec![0u8; t.bytes];
+        let mut vb = zero(voice);
+        vb[..4].copy_from_slice(&table.to_le_bytes());
+        self.runtime.write_tensor(voice, &vb).map_err(e)?;
+        self.runtime.write_tensor(count, &zero(count)).map_err(e)?;
+        let mut sb = zero(self.seed);
+        sb[..8].copy_from_slice(&0x5eed_u64.to_le_bytes());
+        self.runtime.write_tensor(self.seed, &sb).map_err(e)?;
+        let cs = self.cache_slots.as_mut().expect("checked above");
+        let mut cb = zero(cs.cslot);
+        cb[..4].copy_from_slice(&(s as u32).to_le_bytes());
+        self.runtime.write_tensor(cs.cslot, &cb).map_err(e)?;
+        self.runtime.run_sequence(&cs.prefill).map_err(e)?;
+        cs.resident[s] = Some(std::sync::Arc::clone(v));
+        cs.used[s] = std::time::Instant::now();
+        Ok(())
     }
 
     fn launch(&mut self, jobs: &[Job]) -> Result<Vec<Decoded>, String> {
@@ -1176,14 +1337,35 @@ impl Bound {
         self.runtime
             .write_tensor(self.seed, bytemuck::cast_slice(&seeds))
             .map_err(e)?;
-        let slots = match (family, self.voice_slots.as_mut()) {
-            (Family::Slot, Some(vs)) => {
+        let slotted = matches!(family, Family::Slot | Family::SlotCached);
+        let slots = match (slotted, self.voice_slots.as_mut()) {
+            (true, Some(vs)) => {
                 let voices: Vec<_> = jobs.iter().filter_map(|j| j.clone.as_ref()).collect();
                 Some(vs.assign(self.runtime.as_mut(), &voices)?)
             }
-            (Family::Slot, None) => return Err("codec packet has no voice slots".into()),
+            (true, None) => return Err("codec packet has no voice slots".into()),
             _ => None,
         };
+        if family == Family::SlotCached {
+            let cs = self
+                .cache_slots
+                .as_mut()
+                .ok_or("codec packet has no slot caches")?;
+            let mut c = vec![0u32; cs.cslot.bytes / 4];
+            for (i, j) in jobs.iter().enumerate() {
+                let v = j.clone.as_ref().ok_or("cached window without a voice")?;
+                let k = cs
+                    .resident
+                    .iter()
+                    .position(|r| r.as_ref().is_some_and(|r| std::sync::Arc::ptr_eq(r, v)))
+                    .ok_or("cloned voice left its cache slot")?;
+                cs.used[k] = std::time::Instant::now();
+                c[i] = k as u32;
+            }
+            self.runtime
+                .write_tensor(cs.cslot, bytemuck::cast_slice(&c))
+                .map_err(e)?;
+        }
         if let Some(voice) = self.voice {
             let mut v = vec![0u32; voice.bytes / 4];
             for (i, j) in jobs.iter().enumerate() {
@@ -1194,11 +1376,7 @@ impl Bound {
                 .map_err(e)?;
         }
         let nh = self.harmonics;
-        let windows = if window || family == Family::Slot {
-            self.phase
-        } else {
-            None
-        };
+        let windows = if window || slotted { self.phase } else { None };
         if let Some([phase, _, seam, next_seam]) = windows {
             let mut p = vec![0f32; phase.bytes / 4];
             let (mut s, mut ns) = (vec![0u32; seam.bytes / 4], vec![0u32; next_seam.bytes / 4]);
@@ -1296,6 +1474,7 @@ fn run(rx: mpsc::Receiver<Msg>, mut codec: Bound) {
         .chain(&codec.cached)
         .chain(&codec.steps)
         .chain(&codec.slot_caps)
+        .chain(&codec.cslot_caps)
         .map(|c| c.0)
         .max()
         .unwrap_or(1);
@@ -1316,6 +1495,7 @@ fn run(rx: mpsc::Receiver<Msg>, mut codec: Bound) {
         // Most urgent first; within an urgency longest first, so a launch's capacity is mostly
         // set by its first job.
         pending.sort_by_key(|j| (j.urgency, std::cmp::Reverse(j.frames)));
+        codec.place_caches(&mut pending);
         while !pending.is_empty() {
             // A failed launch or a committed step can turn a queued job unlaunchable.
             let mut k = 0;
@@ -1366,6 +1546,7 @@ mod tests {
                 pos: 0,
             }),
             clone: None,
+            cached: false,
             reply: tokio::sync::oneshot::channel().0,
             _work: None,
         }
