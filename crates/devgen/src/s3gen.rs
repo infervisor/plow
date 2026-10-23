@@ -325,7 +325,9 @@ pub fn lower_s3gen(
         || cfg.n_fft != 4 * cfg.hop
         || cfg.harmonics == 0
         || (cfg.clone_slots > 0 && cfg.prompt_max < cfg.prompt)
-        || (cfg.cache_slots > 0 && (cfg.clone_slots == 0 || cfg.prompt_max < CACHE_MIN_PROMPT))
+        // A cached launch holds at most cache_slots distinct voices, each in a voice slot.
+        || (cfg.cache_slots > 0
+            && (cfg.cache_slots > cfg.clone_slots || cfg.prompt_max < CACHE_MIN_PROMPT))
     {
         return Err("unsupported S3Gen export".into());
     }
@@ -1568,7 +1570,7 @@ impl Lowering<'_> {
         // Token ids [b][prompt | tokens] (u32 bit patterns moved by the f32 copy / gather).
         let idx = if let (Some(s), Some(plen)) = (slot, plen) {
             // [b][slot prompt (prompt_max) | tokens], then each row's source column.
-            o.gather(
+            let prompt = o.gather(
                 Table::Tensor(s.token, cfg.clone_slots),
                 Some(inp.voice),
                 "act.s3gen.src",
@@ -1583,13 +1585,18 @@ impl Lowering<'_> {
                     ..Default::default()
                 },
             )?;
-            let src = o.copy(
-                inp.tokens,
-                "act.s3gen.src",
-                (b, 1, n),
-                (n, n, 0),
-                (t0, t0, p),
-            )?;
+            // A prefill (n = 0) has no tokens after the prompt.
+            let src = if n > 0 {
+                o.copy(
+                    inp.tokens,
+                    "act.s3gen.src",
+                    (b, 1, n),
+                    (n, n, 0),
+                    (t0, t0, p),
+                )?
+            } else {
+                prompt
+            };
             let cix = o.gather(
                 Table::Weight(&format!("s3gen.ix.tok.t{n}"), p + 1),
                 Some(plen),

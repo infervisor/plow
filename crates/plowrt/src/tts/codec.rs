@@ -1096,6 +1096,9 @@ impl Bound {
             let Some(v) = j.clone.as_ref().filter(|_| j.window.is_some() && !j.cached) else {
                 continue;
             };
+            if self.check(j).is_err() {
+                continue;
+            }
             if v.prompt_token.len() < CACHE_MIN_PROMPT
                 || smallest(&self.cslot_caps, 1, j.frames).is_none()
             {
