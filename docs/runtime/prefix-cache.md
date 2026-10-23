@@ -52,12 +52,12 @@ kept out of source control.
 
 ## Retention policy on the CUDA VMM pool: the boundary tree (2026-10)
 
-Mechanism (unchanged since 2026-09): the full-attention layers' KV is shared zero-copy as 2 MiB
-granules through a token-verified radix tree of whole blocks; everything else a prompt needs to
-resume at a row inside a block (the sliding layers' last `window` rows, the full-layer rows past
-the last whole block, FP8 scales) is a private *boundary snapshot* (`vmm_snap_bytes`, ~118 MiB per
-prompt end on Gemma-4 26B FP8, a stub on uniform full attention). Pressure eviction keeps free
-device memory above `PLOW_VMM_CACHE_MIN_FREE_MIB`.
+Mechanism (CUDA, 2026-10): every row a boundary needs lives in the KV block store (below) as
+32-row content-addressed blocks, one slab per row class — the full-attention layers' rows
+(`Prefix`), the sliding rings' last `window` rows (`Window`), a recurrent model's state (`State`),
+fp8 scales with their rows — with a pinned host tier beneath the device slabs. Nothing is
+multi-mapped: an attach gathers the rows into the slot's private blocks. Pressure eviction keeps
+free device memory above `PLOW_VMM_CACHE_MIN_FREE_MIB`.
 
 Policy (`crates/plowrt/src/memory/vmm_policy.rs`, `Policy::Tree`, the only CUDA policy):
 
@@ -133,50 +133,41 @@ snapshot is never freed on any path (LRU, retire, radix leaf eviction, strict pu
 eviction; a node's snapshots are freed one by one so each unlinks while the rest are indexed); `parent.rows < rows` and the parent lies on the chain; children sets hold
 retained ids only; a retire needs exactly one retained continuation.
 
-### Host tier: level 2 of the LRU (`PLOW_VMM_HOST_CACHE_MIB`, tree policy only)
+### Host tier: level 2 of the LRU (`PLOW_VMM_HOST_CACHE_MIB`)
 
 Production's loss is retention: at 300-370 requests/min the device holds a prompt end for 47-57 s
 against a median think time of 45 s, so a quarter of the turns come back after their end was
 evicted and re-render ~900 rows from a block-aligned ancestor. The device cannot grow; pinned
-host memory can. With the tier armed the device LRU's victim is *spilled*, not freed:
+host memory can. With the tier armed the device LRU's victim blocks are *spilled*, not freed:
 
-* The cap is cut at bring-up to `MemAvailable` minus a reserve of an eighth of `MemTotal` (at
-  least 16 GiB; `enable_host_tier`, a warning says by how much): pinned pages cannot be reclaimed,
-  and a 120 GB tier beside two co-tenant compiler builds was OOM-killed on the 249 GB lab box
-  (2026-10-22). No knob: the reserve is not a tuning parameter.
-* `SnapStore::{Device(va), Spilling{va,slot,fence}, Host(slot), Restoring(slot)}`. A spill is one
-  async D2H copy into a fixed host slot (the largest snapshot the engine can publish; chunks of
-  1 GiB are all pinned at bring-up: pinning takes the driver context lock, and growing them
-  while serving stalled every engine launch for seconds in the lab).
-  The device buffer outlives the fence: `reap_spills` (every trim) frees it once the copy
-  retired; the cap trim credits in-flight spills and never waits, OOM reclamation finishes the
-  oldest in-flight spill before queueing another; at most 4 are in flight.
-* The tier is the same LRU one level down: a device eviction spills; a full tier first drops its
-  least recently used host snapshot entirely (slot, node, dead blocks, `host_evictions`). The
-  radix blocks of a host-resident boundary stay on the device: the boundary is still found by
-  the same walk, `cached_rows` still counts it, admission still sees it.
-* An attach to a `Host` snapshot claims it (`Restoring`, so a prefetch or a second attach waits
-  instead of copying again) and restores it (`alloc_snapshot` + synchronous H2D) with the pool
-  lock released, under `users` so no eviction touches it; a failed restore unwinds the window to
-  a miss and leaves the snapshot on the host for the next try. An attach to a `Spilling`
-  snapshot waits for the fence and keeps the device copy (the slot goes back). A restored
-  snapshot is the MRU (no device/host ping-pong). The mux queues a restore at arrival
-  (`PrefixProbe::prefetch`, `Restoring`, held) so the copy overlaps the queueing; the attach
-  waits on it when it is still in flight.
-* A fence that cannot be queried or fails on wait, or a copy submitted without a fence,
-  quarantines the snapshot: the device buffer is valid (a D2H copy only reads it) but never
-  freed or spilled again, the host slot is never reused (`host_fence_failures`). The tier
-  counts quarantines independently of the snapshot, so teardown leaks the pinned chunks while
-  any exists, even after the snapshot itself was evicted.
-* Accounting: `cache_bytes`/`snapshot_bytes` stay device-only; `host_snapshots`,
-  `host_snapshot_bytes`, `host_capacity_bytes` are the tier's; `snapshots_spilled`,
-  `snapshots_restored`, `host_evictions`, `spill_fallbacks` (too large for a slot, no slot, copy
-  refused: freed as before), `host_prefetches`.
+* Size: unset = the host-reserve rule, `MemAvailable` minus an eighth of `MemTotal` (at least
+  16 GiB) at bring-up; growth re-reads `MemAvailable` every 16 chunks and stops for good once the
+  reserve would be touched (`kv store: host tier frozen at the host reserve`). `0` = device only.
+  Pinned pages cannot be reclaimed, and a 120 GB tier beside two co-tenant compiler builds was
+  OOM-killed on the 249 GB lab box (2026-10-22); the reserve is not a tuning parameter.
+* Nothing is pinned at bring-up. A grower thread (`kv-store-host-grower`) allocates chunks ahead,
+  up to 256 MiB of spare per class, outside the pool lock: pinning takes the driver context lock,
+  and growing under the lock while serving stalled every engine launch for seconds in the lab. A
+  spill that finds no spare fails and the pool frees the boundary instead.
+* `Where::{Device, Spilling { dev, host, fence }, Host}`. A spill is one async D2H copy per block
+  into a host slot of the block's class; the device slot is kept until the fence retires
+  (`reap_spills` on every trim; the pressure loop credits in-flight spill bytes and never waits).
+  A fence that cannot be queried leaves the block `Spilling` for good: both copies kept, neither
+  reused.
+* A host-resident block is read in place: its pinned slot is mapped into the device address
+  space and the gather kernel reads it over PCIe (`host_reads`); no restore copy and no device
+  allocation. The boundary stays in the tree, `cached_rows` still counts it, admission still sees
+  it; a later publish that needs the same rows re-fills them on the device.
+* Shielded boundaries (a session inside its TTL, a shared end that served two attaches) are
+  spilled only once nothing unshielded is left, and a full tier drops its least recently used
+  unshielded block rather than a shielded one.
+* Accounting: `plowrt_kv_store_*` reports residency per class and tier, `host_grows` and
+  `host_grow_us`, `spills` and `spill_us`, `shrinks` and `shrink_us`, `host_reads`, dedup hits,
+  fills, reclaims and refusals.
 
-Invariants (`host_tier_*`, `failed_*`, `prefetch_*`, `cell_host_tier_*` tests): exactly one
-owner per buffer (device or host) outside `Spilling`; a `Spilling`/`Restoring` snapshot is never
-freed, never a victim, never spilled twice; a held snapshot is never spilled; `users` releases
-exactly once per attach, prefetch or restore; a snapshot's blocks go only with the snapshot.
+Invariants (`memory::kv_store` tests): one owner per block outside `Spilling`; a block with
+transfer holds is never reclaimed or spilled; a `Spilling` block is never a victim and is never
+spilled twice; a block's rows go only with the block.
 
 The legacy 0.1.2 flag/tier policy (`Policy::Legacy`) is removed completely across all backends.
 Every pool (including AMD's shared-prefix path) now runs the boundary-tree retention policy:
