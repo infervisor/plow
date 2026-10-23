@@ -406,6 +406,8 @@ pub struct Acquire {
 const HOST_FLOOR_EVERY: u64 = 16;
 /// Device chunks allocated between two free-memory queries of the device-floor check.
 const DEVICE_FLOOR_EVERY: u64 = 8;
+/// Most bytes one `shrink` call releases (lock hold bound; the caller loops).
+const SHRINK_STEP_BYTES: u64 = 128 << 20;
 /// Pinned bytes per class the host grower keeps allocated ahead (at least one chunk): a burst
 /// of evictions spills several boundaries before the grower refills, a spill with no spare
 /// ready is refused and the boundary dropped instead.
@@ -974,7 +976,10 @@ impl KvStore {
     pub fn shrink(&self, bytes: u64) -> u64 {
         let mut inner = self.inner.lock();
         let t0 = std::time::Instant::now();
-        let released = self.shrink_locked(&mut inner, bytes);
+        // One call releases at most `SHRINK_STEP_BYTES` so the lock is dropped between steps
+        // (the pool's pressure loop calls again): a whole floor deficit in one call freed a
+        // hundred chunks while the engine thread's gather waited 150 ms for the lock.
+        let released = self.shrink_locked(&mut inner, bytes.min(SHRINK_STEP_BYTES));
         let us = t0.elapsed().as_micros() as u64;
         inner.stats.shrink_us += us;
         inner.stats.shrink_max_us = inner.stats.shrink_max_us.max(us);
