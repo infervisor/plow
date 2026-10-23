@@ -576,7 +576,9 @@ impl GpuEngine {
         }
         self.be.stream_synchronize(&self.stream)?;
         let kv = self.vmm.as_ref().and_then(|v| v.kv.as_ref());
-        for b in self.deferred_attach.drain(..) {
+        let slots: Vec<usize> = self.deferred_attach.drain(..).collect();
+        for b in slots {
+            self.blocks_unhold(b);
             if let Some(kv) = kv {
                 kv.finish_attach(b);
             }

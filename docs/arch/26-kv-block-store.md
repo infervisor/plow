@@ -1,6 +1,6 @@
 # 26 — Prefix cache retention and the KV block store
 
-**Status: design (2026-10-23), reviewed, retention simulated; Part A implemented (A1, A2), Part B in progress.**
+**Status: design (2026-10-23), reviewed, retention simulated; Part A implemented (A1, A2); B1 and B3 implemented behind `PLOW_KV_STORE` (gates pending); B2 parked (no AMD box); B4 not started.**
 Part A says what actually moves the production hit rate and is implementable on today's
 snapshot cache. Part B is the content-addressed block store that replaces the boundary
 snapshots of `docs/arch/22-kv-cache.md` §7–§9 and the AMD `SharedPrefix` with one substrate,
@@ -319,6 +319,43 @@ Window row bytes × admitted slots) − Prefix rows duplicated in live slots −
 reservation (max transfers × block size)`; the host slab is sized independently and both are
 reported as `kv_store_bytes{class,tier}`.
 
+### B.6a As implemented (B1, B3)
+
+`crates/plowrt/src/memory/kv_store.rs` is the store (classes, chained-hash keys with an
+independent check hash, `Filling`/`Ready`/`Failed`, dependents and transfer holds, release-order
+reclaim, one byte budget per tier shared by every class, per-class slabs grown in 64 MiB chunks,
+async spill with a fence per block and a synchronous restore). `crates/plowrt/src/exec/gpu/kv_blocks.rs`
+is the CUDA side: four classes — `window` (32 rows of every sliding ring and its fp8 ring scales),
+`tail` (32 rows of the full layers' partial block and their fp8 scales), `scale` (one whole
+block of the full layers' fp8 scale prefix) and `state` (one block per boundary: every
+`state.*` tensor's per-slot bytes, the recurrent state after the boundary's rows) — each block
+keyed by the chained FxHash of the tokens up to its last row. Copies are segment tables (one
+16-byte-aligned run per tensor and head per block) executed by one `plow_kv_segcopy` launch on
+the engine stream (`runtime/nvidia/kv_segcopy.cu`, shipped as PTX embedded in the binary and
+JIT-compiled by the driver at load; a backend without it runs the table as a memcpy loop).
+
+The boundary tree of `vmm.rs` keeps the policy: a snapshot is `SnapStore::Blocks{handle, state}`
+and the pool tells the store through the `SnapBlocks` hook when a boundary dies (`release`), when
+the device LRU would spill it (`spill`, the whole boundary; a full store host tier first gives up
+the pool's LRU host boundary under the same protection rules as the snapshot tier) and when an
+attach needs it back (`restore`). `VmmKv::publish_blocks` runs the engine's acquire-scatter-seal
+with the pool lock released; a store that is full refuses the acquire, the engine evicts one pool
+boundary (`reclaim_one`) and retries. The pool charges each publish the bytes its new blocks
+added, so a turn costs its new rows, not a whole window. The pool's own host tier is not armed
+under the store; `PLOW_VMM_HOST_CACHE_MIB` caps the store's pinned slabs instead. Multi-mapping of
+whole full-layer blocks is unchanged (B.7).
+
+Recurrent models (B3): the prefill chunk that would cross the prompt-end boundary is cut to end
+exactly there (`state_capture_cap`; only when at least the smallest prefill bucket is left to
+it) and the boundary is published at that chunk end, while the state tensors hold the state
+after its rows (`state_capture_publish`); the later prompt-end publish finds it and touches it.
+A boundary the slot has moved past is not publishable for such a model (no state to capture),
+so a prompt end evicted during decode is not restored at the turn end. Prefix caching for a
+model with recurrent state is accepted only with the store on.
+
+Not a knob: the store adds `PLOW_KV_STORE` as its rollback switch and nothing else; the reserve,
+chunk size and class set are derived.
+
 ### B.7 What VMM still does
 
 Per-slot sparse growth of the full-layer tracks (`ensure_rows`, premap) and the live rings.
@@ -430,8 +467,8 @@ MTP-on; final numbers come from `campaign.py report` in the strict format of
 | A2 | session-end header in the serve API + demotion on header/abort/disconnect (A.2), always on, metrics `session_end_{header,abort}_total` | 4 with the end-signal ablation, 5 |
 | A3 | production deploy of A1+A2 on gpu04 (user go) and the same-hour comparison the Grafana endpoint allows | strict report |
 | B1 | `memory/kv_store.rs`, CUDA ops, `Prefix` + `Window` (+ scales), block state machine, gather/scatter kernels, publish/attach at today's trigger points, today's eviction order, behind `PLOW_KV_STORE` (off until its gates pass, then on; the switch exists only until B4 removes the old path); TP=1; tier and demotion carried over | 1, 2, 3, 4 device-only, 5 |
-| B2 | AMD: `SharedPrefix` and the per-slot route on the store; HIP gather | AMD rung + replay gates, when a box is available |
-| B3 | `State` class: capture op in the packet contract; GDN (Qwen3.8 27B), KDA (Kimi-K3) | 1 (state), 5 and replay on Qwen3.8 |
+| B2 | AMD: `SharedPrefix` and the per-slot route on the store; HIP gather. Parked: the pool substrate (`SnapStore::Blocks`, `SnapBlocks`, `publish_blocks`) compiles under `hsa`; the engine-side gather needs a box | AMD rung + replay gates, when a box is available |
+| B3 | `State` class: the engine's `state.*` tensors captured at a chunk end aligned to the boundary (B.6a); GDN (Qwen3.8 27B) first, KDA (Kimi-K3) when its state tensors follow the same contract | 1 (state), 5 and replay on Qwen3.8 |
 | B4 | remove VMM multi-map, snapshot pool, strict publish, stale/park/recycle; rewrite `docs/arch/22` §7–9 | copy-amplification gate; all production recipes re-qualified |
 
 Metrics (Part B): `plowrt_kv_store_{blocks,bytes}{class,tier}`, `publish_{blocks,bytes,

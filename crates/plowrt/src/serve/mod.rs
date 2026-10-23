@@ -526,6 +526,8 @@ pub struct AppState {
     /// prefix sharing up) — a scrape must never queue behind a tick.
     #[cfg(any(feature = "cuda", feature = "hsa"))]
     vmm_stats: RwLock<FxHashMap<String, crate::memory::vmm::VmmStatsHandle>>,
+    #[cfg(feature = "cuda")]
+    kv_store: RwLock<FxHashMap<String, std::sync::Arc<crate::exec::gpu::KvStoreHandle>>>,
     /// Per-instance multimodal runtime (encoders on the instance's device, slab mirroring its
     /// engine's table): installed and removed with the engine.
     mm: RwLock<FxHashMap<String, Arc<mm::MmModel>>>,
@@ -634,6 +636,8 @@ impl AppState {
             gpu: RwLock::new(FxHashMap::default()),
             #[cfg(any(feature = "cuda", feature = "hsa"))]
             vmm_stats: RwLock::new(FxHashMap::default()),
+            #[cfg(feature = "cuda")]
+            kv_store: RwLock::new(FxHashMap::default()),
             mm: RwLock::new(FxHashMap::default()),
             #[cfg(feature = "cuda")]
             managers: std::sync::OnceLock::new(),
@@ -800,6 +804,10 @@ impl AppState {
         #[cfg(any(feature = "cuda", feature = "hsa"))]
         if let Some(h) = engine.vmm_stats_handle() {
             self.vmm_stats.write().insert(slug.clone(), h);
+        }
+        #[cfg(feature = "cuda")]
+        if let Some(h) = engine.kv_store_handle() {
+            self.kv_store.write().insert(slug.clone(), h);
         }
         self.max_ctx.write().insert(slug.clone(), engine.max_ctx());
         self.sampling_honoured
@@ -2097,6 +2105,8 @@ async fn metrics_handler(
             s.session_end_abort,
         );
     }
+    #[cfg(feature = "cuda")]
+    kv_store_metrics(&state, &mut out);
     (
         [("content-type", "text/plain; version=0.0.4; charset=utf-8")],
         out,
@@ -2360,4 +2370,82 @@ pub fn admin_app(state: Arc<AppState>) -> Router {
         .route("/v1/models/status", get(admin::status))
         .route("/v1/models/available", get(admin::available))
         .with_state(state)
+}
+
+/// `PLOW_KV_STORE`: the block store's residency and copy counters per model.
+#[cfg(feature = "cuda")]
+fn kv_store_metrics(state: &AppState, out: &mut String) {
+    use std::fmt::Write;
+    let stores = state.kv_store.read();
+    if stores.is_empty() {
+        return;
+    }
+    for (name, kind, help) in [
+        ("device_bytes", "gauge", "Block store bytes resident on the device."),
+        ("host_bytes", "gauge", "Block store bytes resident on the pinned host tier."),
+        ("device_blocks", "gauge", "Blocks resident on the device."),
+        ("host_blocks", "gauge", "Blocks resident on the host tier."),
+        ("dedup_hits_total", "counter", "Block acquisitions that found the block present (no copy)."),
+        ("fills_total", "counter", "Blocks filled by a publish."),
+        ("fill_failures_total", "counter", "Fills that did not complete (block refilled next time)."),
+        ("reclaims_total", "counter", "Released blocks reused for new ones."),
+        ("refusals_total", "counter", "Acquisitions refused for lack of device space (a boundary is evicted and the publish retried)."),
+        ("spills_total", "counter", "Blocks moved to the host tier."),
+        ("restores_total", "counter", "Blocks brought back from the host tier."),
+        ("evictions_total", "counter", "Blocks dropped from a tier."),
+        ("publishes_total", "counter", "Boundaries published into the store."),
+        ("published_blocks_total", "counter", "Blocks of published boundaries."),
+        ("published_new_blocks_total", "counter", "Blocks a publish had to fill (the rest were shared)."),
+        ("gathers_total", "counter", "Boundaries gathered into a slot."),
+        ("segments_total", "counter", "Copy segments issued."),
+        ("launches_total", "counter", "Segment-copy kernel launches."),
+        ("memcpy_segments_total", "counter", "Segments copied by the memcpy fallback."),
+    ] {
+        crate::obs::serving::family(out, &format!("plowrt_kv_store_{name}"), kind, help);
+    }
+    for (slug, h) in stores.iter() {
+        let s = h.stats();
+        let slug = crate::obs::serving::escape_label(slug);
+        let device_bytes: u64 = s.store.classes.iter().map(|c| c.device_bytes).sum();
+        let host_bytes: u64 = s.store.classes.iter().map(|c| c.host_bytes).sum();
+        let device_blocks: u64 = s.store.classes.iter().map(|c| c.device_blocks).sum();
+        let host_blocks: u64 = s.store.classes.iter().map(|c| c.host_blocks).sum();
+        let _ = write!(
+            out,
+            "plowrt_kv_store_device_bytes{{model=\"{slug}\"}} {device_bytes}\n\
+             plowrt_kv_store_host_bytes{{model=\"{slug}\"}} {host_bytes}\n\
+             plowrt_kv_store_device_blocks{{model=\"{slug}\"}} {device_blocks}\n\
+             plowrt_kv_store_host_blocks{{model=\"{slug}\"}} {host_blocks}\n\
+             plowrt_kv_store_dedup_hits_total{{model=\"{slug}\"}} {}\n\
+             plowrt_kv_store_fills_total{{model=\"{slug}\"}} {}\n\
+             plowrt_kv_store_fill_failures_total{{model=\"{slug}\"}} {}\n\
+             plowrt_kv_store_reclaims_total{{model=\"{slug}\"}} {}\n\
+             plowrt_kv_store_refusals_total{{model=\"{slug}\"}} {}\n\
+             plowrt_kv_store_spills_total{{model=\"{slug}\"}} {}\n\
+             plowrt_kv_store_restores_total{{model=\"{slug}\"}} {}\n\
+             plowrt_kv_store_evictions_total{{model=\"{slug}\"}} {}\n\
+             plowrt_kv_store_publishes_total{{model=\"{slug}\"}} {}\n\
+             plowrt_kv_store_published_blocks_total{{model=\"{slug}\"}} {}\n\
+             plowrt_kv_store_published_new_blocks_total{{model=\"{slug}\"}} {}\n\
+             plowrt_kv_store_gathers_total{{model=\"{slug}\"}} {}\n\
+             plowrt_kv_store_segments_total{{model=\"{slug}\"}} {}\n\
+             plowrt_kv_store_launches_total{{model=\"{slug}\"}} {}\n\
+             plowrt_kv_store_memcpy_segments_total{{model=\"{slug}\"}} {}\n",
+            s.store.dedup_hits,
+            s.store.fills,
+            s.store.fill_failures,
+            s.store.reclaims,
+            s.store.refusals,
+            s.store.spills,
+            s.store.restores,
+            s.store.evictions,
+            s.publishes,
+            s.published_blocks,
+            s.published_new_blocks,
+            s.gathers,
+            s.segments,
+            s.launches,
+            s.memcpy_segments,
+        );
+    }
 }

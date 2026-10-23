@@ -896,6 +896,15 @@ pub struct RuntimeConfig {
     #[arg(long = "vmm-stale-reserve", env = "PLOW_VMM_STALE_RESERVE", default_value_t = true, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
     pub vmm_stale_reserve: bool,
 
+    /// CUDA prefix cache: keep boundary snapshots in the content-addressed KV block store
+    /// (`docs/arch/26-kv-block-store.md`): 32-row blocks shared between the boundaries of a
+    /// conversation and between conversations on one system prompt, so a turn publishes only
+    /// its new rows; the host tier (`PLOW_VMM_HOST_CACHE_MIB`) then belongs to the store. `0` =
+    /// one contiguous snapshot copy per boundary. The rollback switch of the store's
+    /// qualification; it goes once the snapshot path is retired.
+    #[arg(long = "kv-store", env = "PLOW_KV_STORE", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
+    pub kv_store: bool,
+
     /// CUDA VMM prefix cache: snapshot a sequence's boundary into the cache only once its
     /// leading 32 tokens were seen on another sequence, so unique-prompt workloads pay no
     /// snapshot copies. `0` publishes every sequence.
@@ -3012,6 +3021,14 @@ impl RuntimeConfig {
         select_compat(
             self.vmm_stale_reserve,
             Self::env_bool("PLOW_VMM_STALE_RESERVE"),
+            !Self::is_initialized(),
+        )
+    }
+
+    pub(crate) fn kv_store(&self) -> bool {
+        select_compat(
+            self.kv_store,
+            Self::env_bool("PLOW_KV_STORE"),
             !Self::is_initialized(),
         )
     }

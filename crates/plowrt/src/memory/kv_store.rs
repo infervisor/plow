@@ -68,10 +68,6 @@ pub struct ClassSpec {
     /// Bytes of one row across every tensor of the class.
     pub row_bytes: u64,
     pub rows_per_block: u32,
-    /// Device bytes this class may hold (its slab grows in `chunk_bytes` steps up to this).
-    pub device_cap: u64,
-    /// Pinned host bytes this class may hold; 0 = no host tier for it.
-    pub host_cap: u64,
 }
 
 impl ClassSpec {
@@ -124,28 +120,31 @@ struct Block {
     tick: u64,
 }
 
-/// A slab of equal-size slots on one tier.
+/// A slab of equal-size slots on one tier. Slabs of one tier share the tier's byte budget:
+/// a class grows a chunk only while the budget allows, and chunks never move between classes.
 struct Slab {
     slot_bytes: u64,
     chunk_slots: u32,
     chunks: Vec<u64>,
     free: Vec<u32>,
     slots: u32,
-    cap_slots: u32,
 }
 
 impl Slab {
-    fn new(slot_bytes: u64, cap_bytes: u64, chunk_bytes: u64) -> Self {
-        let chunk_slots = u32::try_from((chunk_bytes / slot_bytes.max(1)).max(1)).unwrap_or(u32::MAX);
-        let cap_slots = u32::try_from(cap_bytes / slot_bytes.max(1)).unwrap_or(u32::MAX);
+    fn new(slot_bytes: u64, chunk_bytes: u64) -> Self {
+        let chunk_slots =
+            u32::try_from((chunk_bytes / slot_bytes.max(1)).max(1)).unwrap_or(u32::MAX);
         Slab {
             slot_bytes,
             chunk_slots,
             chunks: Vec::new(),
             free: Vec::new(),
             slots: 0,
-            cap_slots,
         }
+    }
+
+    fn chunk_bytes(&self) -> u64 {
+        u64::from(self.chunk_slots) * self.slot_bytes
     }
 
     fn va(&self, slot: u32) -> u64 {
@@ -157,22 +156,18 @@ impl Slab {
         u64::from(self.slots - self.free.len() as u32) * self.slot_bytes
     }
 
-    /// A free slot, growing by one chunk when none is free and the cap allows it.
-    fn take(&mut self, grow: impl FnOnce(u64) -> Result<u64>) -> Result<Option<u32>> {
+    /// A free slot, growing by one chunk when none is free and `budget` (bytes left on the
+    /// tier) covers a chunk.
+    fn take(&mut self, budget: u64, grow: impl FnOnce(u64) -> Result<u64>) -> Result<Option<u32>> {
         if let Some(s) = self.free.pop() {
             return Ok(Some(s));
         }
-        if self.slots >= self.cap_slots {
+        let n = self.chunk_slots;
+        if u64::from(n) * self.slot_bytes > budget {
             return Ok(None);
         }
-        let n = self.chunk_slots.min(self.cap_slots - self.slots);
         let base = grow(u64::from(n) * self.slot_bytes)?;
-        if n < self.chunk_slots {
-            // A short final chunk: keep slot arithmetic uniform by addressing it as a full one.
-            self.chunks.push(base);
-        } else {
-            self.chunks.push(base);
-        }
+        self.chunks.push(base);
         let first = self.slots;
         self.slots += n;
         // Hand out the chunk's slots in order; the first goes to the caller.
@@ -181,12 +176,16 @@ impl Slab {
         }
         Ok(Some(first))
     }
+
+    fn reserved_bytes(&self) -> u64 {
+        self.chunks.len() as u64 * self.chunk_bytes()
+    }
 }
 
 struct Class {
     spec: ClassSpec,
     device: Slab,
-    host: Option<Slab>,
+    host: Slab,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -213,6 +212,8 @@ pub struct StoreStats {
 
 struct Inner {
     classes: Vec<Class>,
+    device_cap: u64,
+    host_cap: u64,
     blocks: Vec<Option<Block>>,
     free_ids: Vec<BlockId>,
     index: FxHashMap<(usize, BlockKey), BlockId>,
@@ -239,14 +240,22 @@ pub struct Acquire {
 }
 
 impl KvStore {
-    pub fn new(ops: Arc<dyn StoreOps>, classes: Vec<ClassSpec>, chunk_bytes: u64) -> Self {
+    /// `device_cap` / `host_cap`: bytes the store may reserve on each tier over every class
+    /// (`host_cap == 0` = no host tier); slabs grow in `chunk_bytes` steps.
+    pub fn new(
+        ops: Arc<dyn StoreOps>,
+        classes: Vec<ClassSpec>,
+        chunk_bytes: u64,
+        device_cap: u64,
+        host_cap: u64,
+    ) -> Self {
         let classes = classes
             .into_iter()
             .map(|spec| {
                 let block = spec.block_bytes();
                 Class {
-                    device: Slab::new(block, spec.device_cap, chunk_bytes),
-                    host: (spec.host_cap > 0).then(|| Slab::new(block, spec.host_cap, chunk_bytes)),
+                    device: Slab::new(block, chunk_bytes),
+                    host: Slab::new(block, chunk_bytes),
                     spec,
                 }
             })
@@ -259,6 +268,8 @@ impl KvStore {
             ops,
             inner: parking_lot::Mutex::new(Inner {
                 classes,
+                device_cap,
+                host_cap,
                 blocks: Vec::new(),
                 free_ids: Vec::new(),
                 index: FxHashMap::default(),
@@ -414,15 +425,14 @@ impl KvStore {
                 let slot = self.device_slot(inner, class)?;
                 let bytes = inner.classes[class].spec.block_bytes();
                 let va = inner.classes[class].device.va(slot);
-                let host = inner.classes[class].host.as_ref().expect("host slab").va(h);
+                let host = inner.classes[class].host.va(h);
                 if state == State::Ready {
                     if let Err(e) = self.ops.copy_htod(va, host, bytes) {
                         inner.classes[class].device.free.push(slot);
                         return Err(e);
                     }
                 }
-                let c = &mut inner.classes[class];
-                c.host.as_mut().expect("host slab").free.push(h);
+                inner.classes[class].host.free.push(h);
                 let b = inner.blocks[id as usize].as_mut().expect("block");
                 b.place = Where::Device(slot);
                 inner.stats.restores += 1;
@@ -439,9 +449,11 @@ impl KvStore {
     /// reclaiming the oldest zero-dependent, unheld, settled block of the class.
     fn device_slot(&self, inner: &mut Inner, class: usize) -> Result<u32> {
         let ops = &self.ops;
+        let reserved: u64 = inner.classes.iter().map(|c| c.device.reserved_bytes()).sum();
+        let budget = inner.device_cap.saturating_sub(reserved);
         if let Some(s) = inner.classes[class]
             .device
-            .take(|bytes| ops.alloc(bytes))?
+            .take(budget, |bytes| ops.alloc(bytes))?
         {
             return Ok(s);
         }
@@ -498,12 +510,12 @@ impl KvStore {
             }
             Where::Spilling { dev, host, .. } => {
                 c.device.free.push(dev);
-                c.host.as_mut().expect("host slab").free.push(host);
+                c.host.free.push(host);
                 st.device_blocks -= 1;
                 st.device_bytes -= bytes;
             }
             Where::Host(h) => {
-                c.host.as_mut().expect("host slab").free.push(h);
+                c.host.free.push(h);
                 st.host_blocks -= 1;
                 st.host_bytes -= bytes;
             }
@@ -529,13 +541,17 @@ impl KvStore {
         n
     }
 
-    /// Move the device-resident, zero-dependent, unheld, `Ready` blocks among `ids` to the
-    /// class's host tier (D2H queued; the device slot frees when [`Self::reap`] sees the fence).
-    /// Returns how many were queued. A full host slab first drops its oldest zero-dependent
-    /// host block.
-    pub fn spill(&self, ids: &[BlockId]) -> u32 {
+    /// Move the device-resident, unheld, `Ready` blocks among `ids` to the host tier (D2H
+    /// queued; the device slot frees when [`Self::reap`] sees the fence). Dependents may
+    /// remain: an attach restores a host block ([`Self::ensure_device`]). Returns `true` when
+    /// every block of `ids` is off the device afterwards (queued, already on the host, or not
+    /// servable); `false` = the host tier is full, and whatever was queued stays queued.
+    pub fn spill(&self, ids: &[BlockId]) -> bool {
         let mut inner = self.inner.lock();
-        let mut n = 0;
+        if inner.host_cap == 0 {
+            return false;
+        }
+        let mut all = true;
         for &id in ids {
             let Some(b) = inner.blocks[id as usize].as_ref() else {
                 continue;
@@ -544,39 +560,42 @@ impl KvStore {
             let Where::Device(dev) = b.place else {
                 continue;
             };
-            if b.dependents > 0 || b.holds > 0 || b.state != State::Ready {
+            if b.state != State::Ready {
                 continue;
             }
-            if inner.classes[class].host.is_none() {
+            if b.holds > 0 {
+                all = false;
                 continue;
             }
             let Some(h) = self.host_slot(&mut inner, class) else {
+                all = false;
                 continue;
             };
             let bytes = inner.classes[class].spec.block_bytes();
             let va = inner.classes[class].device.va(dev);
-            let host = inner.classes[class].host.as_ref().expect("host slab").va(h);
+            let host = inner.classes[class].host.va(h);
             match self.ops.copy_dtoh_async(host, va, bytes) {
                 Ok(fence) => {
                     let b = inner.blocks[id as usize].as_mut().expect("block");
                     b.place = Where::Spilling { dev, host: h, fence };
                     inner.stats.spills += 1;
-                    n += 1;
                 }
                 Err(_) => {
-                    inner.classes[class].host.as_mut().expect("host slab").free.push(h);
+                    inner.classes[class].host.free.push(h);
+                    all = false;
                 }
             }
         }
-        n
+        all
     }
 
     fn host_slot(&self, inner: &mut Inner, class: usize) -> Option<u32> {
         let ops = &self.ops;
+        let reserved: u64 = inner.classes.iter().map(|c| c.host.reserved_bytes()).sum();
+        let budget = inner.host_cap.saturating_sub(reserved);
         let taken = inner.classes[class]
             .host
-            .as_mut()?
-            .take(|bytes| ops.host_alloc(bytes))
+            .take(budget, |bytes| ops.host_alloc(bytes))
             .ok()?;
         if let Some(s) = taken {
             return Some(s);
@@ -646,14 +665,12 @@ impl Drop for KvStore {
     fn drop(&mut self) {
         let inner = self.inner.get_mut();
         for c in &inner.classes {
-            let chunk = u64::from(c.device.chunk_slots) * c.device.slot_bytes;
             for &va in &c.device.chunks {
                 self.ops.free(va);
             }
-            if let Some(h) = &c.host {
-                for &ptr in &h.chunks {
-                    self.ops.host_free(ptr, chunk);
-                }
+            let chunk = c.host.chunk_bytes();
+            for &ptr in &c.host.chunks {
+                self.ops.host_free(ptr, chunk);
             }
         }
     }
@@ -732,10 +749,10 @@ mod tests {
                 name: "window",
                 row_bytes: 8,
                 rows_per_block: 4,
-                device_cap,
-                host_cap,
             }],
-            64,
+            32,
+            device_cap,
+            host_cap,
         );
         (ops, s)
     }
@@ -830,7 +847,7 @@ mod tests {
         let a = s.acquire(0, key(1)).unwrap();
         s.seal(a.id);
         s.release(&[a.id]);
-        assert_eq!(s.spill(&[a.id]), 1);
+        assert!(s.spill(&[a.id]));
         s.reap();
         assert_eq!(s.location(a.id), Some(Location::Host));
         assert_eq!(s.stats().classes[0].host_blocks, 1);
@@ -845,6 +862,30 @@ mod tests {
         assert_eq!(ops.htod.load(Ordering::SeqCst), 1);
         assert_eq!(s.stats().restores, 1);
         assert_eq!(s.location(a.id), Some(Location::Device(again.va)));
+    }
+
+    #[test]
+    fn a_live_block_spills_and_restores_on_the_next_use() {
+        let (ops, s) = store(32, 64);
+        let a = s.acquire(0, key(1)).unwrap();
+        s.seal(a.id);
+        assert!(s.spill(&[a.id]), "dependents do not pin a block to the device");
+        s.reap();
+        assert_eq!(s.location(a.id), Some(Location::Host));
+        let va = s.ensure_device(a.id).unwrap();
+        assert_eq!(s.location(a.id), Some(Location::Device(va)));
+        assert_eq!(ops.htod.load(Ordering::SeqCst), 1);
+        s.hold(&[a.id]);
+        assert!(!s.spill(&[a.id]), "a held block stays");
+    }
+
+    #[test]
+    fn host_tier_off_refuses_every_spill() {
+        let (_, s) = store(32, 0);
+        let a = s.acquire(0, key(1)).unwrap();
+        s.seal(a.id);
+        assert!(!s.spill(&[a.id]));
+        assert_eq!(s.location(a.id), Some(Location::Device(a.va)));
     }
 
     #[test]

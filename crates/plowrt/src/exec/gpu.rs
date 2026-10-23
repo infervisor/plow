@@ -77,6 +77,8 @@ fn check_dsa_decode_batch_arm(required: bool, arm: Option<u32>) -> Result<()> {
     Ok(())
 }
 
+mod kv_blocks;
+pub use kv_blocks::BlockServe as KvStoreHandle;
 mod prefix;
 use prefix::VmmServe;
 
@@ -4326,9 +4328,11 @@ impl GpuEngine {
             single_bound_decode || validate_decode_ladder(&blob)?
         };
         if recurrent.is_some() {
-            if prefix_requested {
+            // The block store captures the state at the boundary (`State` class); the
+            // contiguous snapshots cannot.
+            if prefix_requested && !config.kv_store() {
                 return Err(RuntimeError::Rejected(
-                    "recurrent state does not support prefix caching".into(),
+                    "recurrent state needs PLOW_KV_STORE=1 for prefix caching".into(),
                 ));
             }
             if !recurrent.as_ref().unwrap().tensors.is_empty()
@@ -4601,7 +4605,13 @@ impl GpuEngine {
                     }
                     Self::vmm_live_bringup(&be, &blob, rings, live_kv_manifest.as_ref()).map(Some)
                 } else {
-                    Self::vmm_bringup(&be, &blob, prefix_layout, prefix_rings)
+                    Self::vmm_bringup(
+                        &be,
+                        &blob,
+                        prefix_layout,
+                        prefix_rings,
+                        recurrent.as_ref().map_or(&[][..], |r| r.tensors.as_slice()),
+                    )
                 }
             };
             if let Some(tm) = load_tim.as_mut() {
@@ -11575,12 +11585,14 @@ impl GpuEngine {
         }
         let c0 = self.pos[b] as usize;
         debug_assert!(c0 < n, "prefill_chunk past the prompt end");
+        let cap = self.state_capture_cap(b, prompt, c0, cap);
 
         // The chunk launches against slot b's prebuilt tensor table (the
         // kernarg selects it) — the shared table is never touched, so decode
         // and other slots' sequences cannot observe a shifted table.
         let real = self.run_one_prefill_chunk(f_pf, b, prompt, c0, cap)?;
         self.pos[b] = (c0 + real) as u32;
+        self.state_capture_publish(b, prompt);
 
         if c0 + real < n {
             return Ok(PrefillStep::Progress(c0 + real));

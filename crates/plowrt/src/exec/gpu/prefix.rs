@@ -47,6 +47,8 @@ pub(super) struct VmmServe {
     /// Sliding ring rows (`min(max_ctx, KV_RING)`), a power of two.
     pub(super) ring: u64,
     pub(super) snap_row_bytes: u64,
+    /// `PLOW_KV_STORE`: boundaries live in the block store (`kv_blocks.rs`).
+    pub(super) blocks: Option<std::sync::Arc<super::kv_blocks::BlockServe>>,
 }
 
 impl VmmServe {
@@ -139,6 +141,7 @@ impl GpuEngine {
                 full_scale: Vec::new(),
                 ring: 0,
                 snap_row_bytes: 0,
+                blocks: None,
             });
         }
         let rings = if live_rings && !layout.ring_tensors.is_empty() {
@@ -181,6 +184,7 @@ impl GpuEngine {
             full_scale: Vec::new(),
             ring: 0,
             snap_row_bytes: 0,
+            blocks: None,
         })
     }
 
@@ -412,11 +416,14 @@ impl GpuEngine {
         })
     }
 
+    /// `state_tensors`: the engine's recurrent state tensors (`(devp index, per-slot bytes)`),
+    /// the block store's `State` class; empty for a model without one.
     pub(super) fn vmm_bringup(
         be: &Arc<CudaBackend>,
         blob: &DevBlob,
         layout: Option<VmmPrefixLayout>,
         live_rings: bool,
+        state_tensors: &[(usize, u64)],
     ) -> Result<Option<VmmServe>> {
         let Some(VmmPrefixLayout {
             geo,
@@ -486,7 +493,8 @@ impl GpuEngine {
             block_hint,
             cache_cap,
         ) {
-            Ok(mut kv) => Ok(Some(VmmServe {
+            Ok(mut kv) => {
+                let mut serve = VmmServe {
                 rings,
                 tensor_tracks: blob
                     .tensors
@@ -514,7 +522,7 @@ impl GpuEngine {
                         kv.enable_strict_publish();
                     }
                     let host_cap = rt.vmm_host_cache_bytes();
-                    if host_cap > 0 {
+                    if host_cap > 0 && !rt.kv_store() {
                         // The largest snapshot a publish can produce (`vmm_snap_bytes` at
                         // `max_ctx`): a full window, the fp8 full-layer scales over the whole
                         // context and the partial block's rows.
@@ -548,7 +556,32 @@ impl GpuEngine {
                 full_scale,
                 ring,
                 snap_row_bytes,
-            })),
+                blocks: None,
+                };
+                if rt.kv_store() && serve.prefix_kv().is_some() {
+                    match super::kv_blocks::BlockServe::new(
+                        be,
+                        &serve,
+                        cache_cap.max(1 << 30),
+                        rt.vmm_host_cache_bytes(),
+                        state_tensors,
+                    ) {
+                        Ok(blocks) => {
+                            serve
+                                .kv
+                                .as_ref()
+                                .expect("prefix pool")
+                                .enable_block_store(
+                                    std::sync::Arc::clone(&blocks)
+                                        as std::sync::Arc<dyn crate::memory::vmm::SnapBlocks>,
+                                );
+                            serve.blocks = Some(blocks);
+                        }
+                        Err(e) => tracing::warn!(error = %e, "kv store: off"),
+                    }
+                }
+                Ok(Some(serve))
+            }
             Err(e) => {
                 tracing::warn!(error = %e, "vmm off: pool bringup failed");
                 Ok(None)
@@ -795,16 +828,19 @@ impl GpuEngine {
         let Some(a) = att else {
             return Ok(());
         };
-        let expected_snap_bytes = self.vmm_snap_bytes(a.rows);
         let restored = (|| {
+            if a.rows % kv.block_rows() != 0 {
+                kv.ensure_rows(b, a.rows + 1)?;
+            }
+            if let Some(handle) = a.blocks {
+                return self.blocks_gather(b, handle);
+            }
+            let expected_snap_bytes = self.vmm_snap_bytes(a.rows);
             if a.snap_bytes != expected_snap_bytes {
                 return Err(RuntimeError::Rejected(format!(
                     "boundary snapshot layout drift: cached {} bytes, expected {expected_snap_bytes}",
                     a.snap_bytes
                 )));
-            }
-            if a.rows % kv.block_rows() != 0 {
-                kv.ensure_rows(b, a.rows + 1)?;
             }
             self.vmm_snap_copy(b, a.rows, a.snap_va, false)
         })();
@@ -910,7 +946,7 @@ impl GpuEngine {
         Ok(self.pos[b] as usize)
     }
 
-    fn publish_boundary(&self, b: usize, p_a: u32, kind: crate::memory::vmm::Kind) -> bool {
+    pub(super) fn publish_boundary(&self, b: usize, p_a: u32, kind: crate::memory::vmm::Kind) -> bool {
         let Some((v, kv)) = self.vmm_prefix() else {
             return false;
         };
@@ -925,6 +961,12 @@ impl GpuEngine {
         if kv.touch(b, toks, p_a, kind) {
             tracing::debug!(slot = b, p_a, "vmm: boundary touched");
             return true;
+        }
+        // Recurrent state exists only at the slot's current row: a boundary the slot has
+        // moved past has no state to capture (`state_capture_publish` publishes it in time).
+        if v.blocks.as_ref().is_some_and(|bs| bs.captures_state()) && rows != p_a {
+            trace_refusal(b, p_a, Refusal::NotPublishable);
+            return false;
         }
         // Rejected speculative rows past `pos` were written too: the ring wrapped to the high water.
         let written = rows.max(self.kv_hw[b]);
@@ -952,9 +994,14 @@ impl GpuEngine {
             return false;
         }
         let snap_bytes = self.vmm_snap_bytes(p_a);
-        if let Err(e) = kv.publish_kind(b, toks, p_a, kind, snap_bytes, |dst| {
-            self.vmm_snap_copy(b, p_a, dst, true)
-        }) {
+        let published = if v.blocks.is_some() {
+            kv.publish_blocks(b, toks, p_a, kind, || self.blocks_publish(b, p_a))
+        } else {
+            kv.publish_kind(b, toks, p_a, kind, snap_bytes, |dst| {
+                self.vmm_snap_copy(b, p_a, dst, true)
+            })
+        };
+        if let Err(e) = published {
             tracing::debug!(error = %e, slot = b, p_a, "vmm: publish_boundary skipped");
             trace_refusal(b, p_a, Refusal::Error);
             false
@@ -1170,6 +1217,11 @@ fn is_prompt_end(rows: u32, max_rows: u32, prompt: u32) -> bool {
 
 fn session_prompt_end(prompt: u32) -> u32 {
     prompt.saturating_sub(1 + SESSION_PROMPT_REWRITE)
+}
+
+/// The 32-row boundary a prompt of `prompt` rows publishes as its prompt end.
+pub(super) fn prompt_end_boundary(prompt: u32) -> u32 {
+    session_prompt_end(prompt) / 32 * 32
 }
 
 #[cfg(test)]
