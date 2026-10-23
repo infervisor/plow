@@ -7243,6 +7243,7 @@ impl GpuEngine {
         // Prefix cache: evict on real device pressure (`cuMemGetInfo`), not the static budget.
         // The floor is 2% of the device, at most half of what is free after load; a card the
         // rings nearly fill (26B: 5 GiB) keeps an eighth of it instead.
+        let blocks = vmm.as_ref().and_then(|v| v.blocks.clone());
         if let Some(kv) = vmm
             .as_mut()
             .and_then(|v| v.kv.as_mut())
@@ -7252,12 +7253,18 @@ impl GpuEngine {
                 let config = crate::config::RuntimeConfig::get();
                 if let Some(floor) = config.vmm_cache_min_free_bytes(total, Some(free)) {
                     kv.enable_pressure_eviction(floor);
+                    let cache_cap = config.prefix_cache_cap_bytes(total);
                     tracing::info!(
                         floor_mib = floor >> 20,
                         free_mib = free >> 20,
-                        cache_cap_mib = config.prefix_cache_cap_bytes(total) >> 20,
+                        cache_cap_mib = cache_cap >> 20,
                         "vmm prefix cache: pressure eviction armed (static cap is the fallback)"
                     );
+                    // The store may reserve what the pool could have grown to; pressure
+                    // shrinks it below that when the rings grow.
+                    if let (0, Some(bs)) = (cache_cap, blocks.as_ref()) {
+                        bs.set_device_cap(free.saturating_sub(floor));
+                    }
                 }
             }
         }

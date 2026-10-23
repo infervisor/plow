@@ -1,6 +1,6 @@
 # 26 — Prefix cache retention and the KV block store
 
-**Status: design (2026-10-23), reviewed, retention simulated; Part A implemented (A1, A2); B1 and B3 implemented behind `PLOW_KV_STORE` (gates pending); B2 parked (no AMD box); B4 not started.**
+**Status: design (2026-10-23), reviewed, retention simulated; Part A implemented (A1, A2); B1 and B3 implemented, `PLOW_KV_STORE` default on (exactness gate passed 2026-10-23, replay and Qwen gates below); B2 parked (no AMD box); B4 not started.**
 Part A says what actually moves the production hit rate and is implementable on today's
 snapshot cache. Part B is the content-addressed block store that replaces the boundary
 snapshots of `docs/arch/22-kv-cache.md` §7–§9 and the AMD `SharedPrefix` with one substrate,
@@ -350,8 +350,30 @@ reported as `kv_store_bytes{class,tier}`.
 
 `crates/plowrt/src/memory/kv_store.rs` is the store (classes, chained-hash keys with an
 independent check hash, `Filling`/`Ready`/`Failed`, dependents and transfer holds, release-order
-reclaim, one byte budget per tier shared by every class, per-class slabs grown in 64 MiB chunks,
-async spill with a fence per block and a synchronous restore). `crates/plowrt/src/exec/gpu/kv_blocks.rs`
+reclaim, one byte budget per tier shared by every class, per-class slabs grown in 8 MiB chunks,
+async spill with a fence per block and a synchronous restore). The device budget is the pool's
+pressure budget: free memory after load minus the eviction floor, set when pressure eviction is
+armed (an explicit `PLOW_VMM_CACHE_MIB` caps both the same way); the first replay with a quarter
+of the card as the budget held 21 GB against the snapshot path's 40 GB and lost 15 points of hit
+rate. Under pressure the pool asks the store to `shrink` before it evicts a boundary; a slab hands
+out free slots from its fullest chunk so that emptier chunks keep draining, and `shrink` releases
+whole chunks whose remaining blocks are all reclaimable (emptiest first), so a chunk's blocks are
+of one age and a few boundary evictions free a chunk rather than scattering holes.
+
+Host tier, as measured on the first replay with a 60 GB tier: every spilled block was copied
+back by the next publish that met it (143k synchronous restores in ten minutes) and the host
+victim search scanned every block per spilled block, which held the engine thread (TPOT p50 8 →
+50 ms). Now a publish that meets a host-resident block refills it from the rows it is publishing
+(one more segment of its launch, the host slot freed; `refills_total`), a restore happens on a
+gather only, and host victims come from a host reclaim list in release order, like device ones.
+A gather reads a host-resident block in place: the tier is pinned and device-mapped, so the
+block's host bytes are one more segment of the gather's launch (`host_reads_total`), nothing is
+copied back, and the block is promoted to the device only by the next publish that meets it.
+The memcpy fallback (no copy kernel) still restores first. Review fixes on the same change: `shrink`
+checks every live chunk before returning 0 (a bounded candidate scan could hide a releasable
+chunk while the pool evicted boundaries for nothing), a held host block is never refilled (a
+gather may be reading it), reclaim lists are per class (no re-walking other classes' entries),
+and a released chunk index is reused by the next growth. `crates/plowrt/src/exec/gpu/kv_blocks.rs`
 is the CUDA side: four classes — `window` (32 rows of every sliding ring and its fp8 ring scales),
 `tail` (32 rows of the full layers' partial block and their fp8 scales), `scale` (one whole
 block of the full layers' fp8 scale prefix) and `state` (one block per boundary: every
@@ -403,7 +425,7 @@ Known limits of B1 (accepted until B4, each gated rather than assumed):
   exactness gate (store vs snapshot path, greedy multi-turn at block and window edges) and the
   FP32 gate are the contract, not the hash.
 * Slab chunks belong to the class that grew them; the budget moves between classes only when a
-  chunk empties (`shrink`, run first under device pressure). The pool's byte charges are per
+  chunk is released (`shrink`, run first under device pressure). The pool's byte charges are per
   publish (new blocks) and approximate; `plowrt_kv_store_{device,host}_bytes` are the truth.
 * Publish and non-window gathers drain the engine stream before sealing or releasing blocks
   (the snapshot path drained the same way); a launch-window gather keeps its holds until the

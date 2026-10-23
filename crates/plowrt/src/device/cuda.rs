@@ -144,6 +144,7 @@ const ATTR_PAGEABLE_USES_HOST_PAGE_TABLES: i32 = 100;
 const FUNC_ATTR_MAX_DYNAMIC_SHARED_SIZE_BYTES: i32 = 8;
 // cuMemHostAlloc flags.
 const MEMHOSTALLOC_PORTABLE: u32 = 1;
+const MEMHOSTALLOC_DEVICEMAP: u32 = 2;
 // VMM enums (cuda.h): allocation type / location / access flags / granularity.
 const MEM_ALLOCATION_TYPE_PINNED: i32 = 1;
 const MEM_LOCATION_TYPE_DEVICE: i32 = 1;
@@ -1995,11 +1996,15 @@ impl CudaBackend {
     /// Raw pinned host memory (portable) — [`Self::host_alloc_pinned`]'s
     /// backing call; freed by `PinnedHost::drop`.
     fn host_alloc(&self, bytes: usize) -> Result<*mut u8> {
+        self.host_alloc_flags(bytes, MEMHOSTALLOC_PORTABLE)
+    }
+
+    fn host_alloc_flags(&self, bytes: usize, flags: u32) -> Result<*mut u8> {
         self.bind()?;
         let mut p: *mut c_void = std::ptr::null_mut();
         // SAFETY: out-pointer to a driver allocation.
         self.check(
-            unsafe { (self.api.cuMemHostAlloc)(&mut p, bytes, MEMHOSTALLOC_PORTABLE) },
+            unsafe { (self.api.cuMemHostAlloc)(&mut p, bytes, flags) },
             "cuMemHostAlloc",
         )?;
         Ok(p as *mut u8)
@@ -2370,8 +2375,11 @@ impl crate::memory::vmm::VmmOps for CudaBackend {
         released
     }
 
+    /// Device-mapped as well as pinned: a kernel reads a host-resident KV block in place (under
+    /// unified addressing the device pointer is the host pointer).
     fn host_tier_alloc(&self, bytes: u64) -> Result<u64> {
-        self.host_alloc(bytes as usize).map(|p| p as u64)
+        self.host_alloc_flags(bytes as usize, MEMHOSTALLOC_PORTABLE | MEMHOSTALLOC_DEVICEMAP)
+            .map(|p| p as u64)
     }
 
     fn host_tier_free(&self, ptr: u64, bytes: u64) {

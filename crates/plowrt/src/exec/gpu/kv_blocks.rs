@@ -26,7 +26,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 const ROWS_PER_BLOCK: u32 = 32;
-const CHUNK_BYTES: u64 = 64 << 20;
+const CHUNK_BYTES: u64 = 8 << 20;
 const SEED_CHAIN: u64 = 0x9e37_79b9_7f4a_7c15;
 const SEED_CHECK: u64 = 0xc2b2_ae3d_27d4_eb4f;
 const SEGCOPY_PTX: &str = include_str!("../../../../../runtime/nvidia/kv_segcopy.ptx");
@@ -73,6 +73,12 @@ pub struct BlockServeStats {
     pub segments: u64,
     pub launches: u64,
     pub memcpy_segments: u64,
+    /// Engine-thread wall time in publishes and gathers, and the part spent draining the
+    /// stream (the rest is hashing, acquires, table building and upload).
+    pub publish_us: u64,
+    pub publish_sync_us: u64,
+    pub gather_us: u64,
+    pub gather_sync_us: u64,
 }
 
 pub struct BlockServe {
@@ -272,7 +278,12 @@ impl SnapBlocks for BlockServe {
         self.store.spill(&ids)
     }
 
+    /// With the copy kernel a gather reads host-resident blocks in place, so nothing moves
+    /// here; the memcpy fallback copies them back first.
     fn restore(&self, handle: u64) -> Result<()> {
+        if self.kernel.is_some() {
+            return Ok(());
+        }
         let ids: Vec<BlockId> = match self.handles.lock().get(&handle) {
             Some(h) => h.iter().map(|&(_, _, id)| id).collect(),
             None => return Err(RuntimeError::Rejected("kv store: unknown boundary".into())),
@@ -292,6 +303,15 @@ impl SnapBlocks for BlockServe {
     }
 }
 
+impl BlockServe {
+    /// The device budget the pool's pressure regime leaves the store (set once free memory
+    /// after load is known).
+    pub fn set_device_cap(&self, bytes: u64) {
+        self.store.set_device_cap(bytes);
+        tracing::info!(device_cap_mib = bytes >> 20, "kv store: device cap");
+    }
+}
+
 impl GpuEngine {
     pub(super) fn kv_blocks(&self) -> Option<&Arc<BlockServe>> {
         self.vmm.as_ref().and_then(|v| v.blocks.as_ref())
@@ -306,6 +326,8 @@ impl GpuEngine {
     /// the pool evicts on a full store makes room), scatter the new ones from the rings and
     /// tracks, seal them. Returns the handle and the bytes the new blocks added.
     pub(super) fn blocks_publish(&self, b: usize, p_a: u32) -> Result<(u64, u64)> {
+        let t0 = std::time::Instant::now();
+        let mut sync_us = 0u64;
         let (v, kv) = self.vmm_prefix().expect("block publish without prefix vmm");
         let bs = v.blocks.as_ref().expect("block publish without store");
         let toks = &self.seq_tokens[b][..p_a as usize];
@@ -359,7 +381,9 @@ impl GpuEngine {
             // Drain even a partially submitted table: the blocks are sealed or released after
             // the engine stream is done with them.
             let copied = self.run_segments(b, &segs);
+            let ts = std::time::Instant::now();
             let drained = self.be.stream_synchronize(&self.stream);
+            sync_us = ts.elapsed().as_micros() as u64;
             if let Err(e) = copied.and(drained) {
                 abort(&handle, &fills);
                 return Err(e);
@@ -374,6 +398,8 @@ impl GpuEngine {
             st.publishes += 1;
             st.published_blocks += handle.len() as u64;
             st.published_new_blocks += fills.len() as u64;
+            st.publish_us += t0.elapsed().as_micros() as u64;
+            st.publish_sync_us += sync_us;
         }
         bs.handles.lock().insert(id, handle);
         Ok((id, new_bytes))
@@ -382,6 +408,7 @@ impl GpuEngine {
     /// Gather the boundary `handle` into slot `b`'s rings and tracks. Inside a launch window
     /// the copy is drained by the step and the blocks stay held until then.
     pub(super) fn blocks_gather(&self, b: usize, handle: u64) -> Result<()> {
+        let t0 = std::time::Instant::now();
         let (v, _) = self.vmm_prefix().expect("block gather without prefix vmm");
         let bs = v.blocks.as_ref().expect("block gather without store");
         let plan = bs
@@ -395,17 +422,27 @@ impl GpuEngine {
         let copied = (|| {
             let mut segs = Vec::new();
             for &(class, row0, id) in &plan {
-                let va = bs.store.ensure_device(id)?;
+                // The kernel reads a host-resident block in place (device-mapped tier); the
+                // memcpy fallback needs it on the device.
+                let va = if bs.kernel.is_some() {
+                    bs.store.gather_src(id)?.0
+                } else {
+                    bs.store.ensure_device(id)?
+                };
                 self.block_segments(b, class, row0, va, false, &mut segs);
             }
             self.run_segments(b, &segs)
         })();
         // Inside a launch window a successful gather is drained by the step
         // (`flush_deferred_attach` drops the holds); every other outcome drains here.
+        let mut sync_us = 0u64;
         let copied = if copied.is_ok() && self.window_open {
             copied
         } else {
-            copied.and(self.be.stream_synchronize(&self.stream))
+            let ts = std::time::Instant::now();
+            let r = copied.and(self.be.stream_synchronize(&self.stream));
+            sync_us = ts.elapsed().as_micros() as u64;
+            r
         };
         match copied {
             Ok(()) if self.window_open => bs.held.lock()[b].extend_from_slice(&ids),
@@ -414,6 +451,8 @@ impl GpuEngine {
         copied?;
         let mut st = bs.stats.lock();
         st.gathers += 1;
+        st.gather_us += t0.elapsed().as_micros() as u64;
+        st.gather_sync_us += sync_us;
         st.gathered_blocks += plan.len() as u64;
         Ok(())
     }

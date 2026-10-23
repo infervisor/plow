@@ -2389,11 +2389,17 @@ fn kv_store_metrics(state: &AppState, out: &mut String) {
         ("fills_total", "counter", "Blocks filled by a publish."),
         ("fill_failures_total", "counter", "Fills that did not complete (block refilled next time)."),
         ("reclaims_total", "counter", "Released blocks reused for new ones."),
+        ("refills_total", "counter", "Publishes that found their block on the host and refilled it on the device."),
         ("refusals_total", "counter", "Acquisitions refused for lack of device space (a boundary is evicted and the publish retried)."),
         ("spills_total", "counter", "Blocks moved to the host tier."),
-        ("restores_total", "counter", "Blocks brought back from the host tier."),
+        ("restores_total", "counter", "Blocks copied back from the host tier (memcpy fallback)."),
+        ("host_reads_total", "counter", "Blocks a gather read from the host tier in place."),
         ("evictions_total", "counter", "Blocks dropped from a tier."),
         ("publishes_total", "counter", "Boundaries published into the store."),
+        ("publish_us_total", "counter", "Engine-thread microseconds in publishes."),
+        ("publish_sync_us_total", "counter", "Of which draining the stream."),
+        ("gather_us_total", "counter", "Engine-thread microseconds in gathers."),
+        ("gather_sync_us_total", "counter", "Of which draining the stream."),
         ("published_blocks_total", "counter", "Blocks of published boundaries."),
         ("published_new_blocks_total", "counter", "Blocks a publish had to fill (the rest were shared)."),
         ("gathers_total", "counter", "Boundaries gathered into a slot."),
@@ -2420,9 +2426,11 @@ fn kv_store_metrics(state: &AppState, out: &mut String) {
              plowrt_kv_store_fills_total{{model=\"{slug}\"}} {}\n\
              plowrt_kv_store_fill_failures_total{{model=\"{slug}\"}} {}\n\
              plowrt_kv_store_reclaims_total{{model=\"{slug}\"}} {}\n\
+             plowrt_kv_store_refills_total{{model=\"{slug}\"}} {}\n\
              plowrt_kv_store_refusals_total{{model=\"{slug}\"}} {}\n\
              plowrt_kv_store_spills_total{{model=\"{slug}\"}} {}\n\
              plowrt_kv_store_restores_total{{model=\"{slug}\"}} {}\n\
+             plowrt_kv_store_host_reads_total{{model=\"{slug}\"}} {}\n\
              plowrt_kv_store_evictions_total{{model=\"{slug}\"}} {}\n\
              plowrt_kv_store_publishes_total{{model=\"{slug}\"}} {}\n\
              plowrt_kv_store_published_blocks_total{{model=\"{slug}\"}} {}\n\
@@ -2430,14 +2438,20 @@ fn kv_store_metrics(state: &AppState, out: &mut String) {
              plowrt_kv_store_gathers_total{{model=\"{slug}\"}} {}\n\
              plowrt_kv_store_segments_total{{model=\"{slug}\"}} {}\n\
              plowrt_kv_store_launches_total{{model=\"{slug}\"}} {}\n\
-             plowrt_kv_store_memcpy_segments_total{{model=\"{slug}\"}} {}\n",
+             plowrt_kv_store_memcpy_segments_total{{model=\"{slug}\"}} {}\n\
+             plowrt_kv_store_publish_us_total{{model=\"{slug}\"}} {}\n\
+             plowrt_kv_store_publish_sync_us_total{{model=\"{slug}\"}} {}\n\
+             plowrt_kv_store_gather_us_total{{model=\"{slug}\"}} {}\n\
+             plowrt_kv_store_gather_sync_us_total{{model=\"{slug}\"}} {}\n",
             s.store.dedup_hits,
             s.store.fills,
             s.store.fill_failures,
             s.store.reclaims,
+            s.store.refills,
             s.store.refusals,
             s.store.spills,
             s.store.restores,
+            s.store.host_reads,
             s.store.evictions,
             s.publishes,
             s.published_blocks,
@@ -2446,6 +2460,10 @@ fn kv_store_metrics(state: &AppState, out: &mut String) {
             s.segments,
             s.launches,
             s.memcpy_segments,
+            s.publish_us,
+            s.publish_sync_us,
+            s.gather_us,
+            s.gather_sync_us,
         );
     }
 }

@@ -21,7 +21,7 @@
 use super::vmm::VmmOps;
 use crate::{Result, RuntimeError};
 use rustc_hash::FxHashMap;
-use std::collections::VecDeque;
+use std::collections::{BTreeSet, VecDeque};
 use std::sync::Arc;
 
 /// The device/host operations the store needs; every [`VmmOps`] backend provides them.
@@ -126,8 +126,16 @@ struct Slab {
     slot_bytes: u64,
     chunk_slots: u32,
     chunks: Vec<u64>,
-    free: Vec<u32>,
-    slots: u32,
+    /// Free slots per chunk.
+    free: Vec<Vec<u32>>,
+    /// Chunks with free slots as `(free slots, chunk)`: the fullest first, the emptiest last.
+    by_free: BTreeSet<(u32, u32)>,
+    /// The block in each slot.
+    owner: Vec<Option<BlockId>>,
+    /// Released chunk indices, reused by the next growth.
+    dead: Vec<u32>,
+    live_chunks: u32,
+    free_slots: u64,
 }
 
 impl Slab {
@@ -139,7 +147,11 @@ impl Slab {
             chunk_slots,
             chunks: Vec::new(),
             free: Vec::new(),
-            slots: 0,
+            by_free: BTreeSet::new(),
+            owner: Vec::new(),
+            dead: Vec::new(),
+            live_chunks: 0,
+            free_slots: 0,
         }
     }
 
@@ -152,14 +164,25 @@ impl Slab {
             + u64::from(slot % self.chunk_slots) * self.slot_bytes
     }
 
-    fn used_bytes(&self) -> u64 {
-        self.reserved_bytes() - self.free.len() as u64 * self.slot_bytes
+    fn reserved_bytes(&self) -> u64 {
+        u64::from(self.live_chunks) * self.chunk_bytes()
     }
 
-    /// A free slot, growing by one chunk when none is free and `budget` (bytes left on the
-    /// tier) covers a chunk.
+    fn used_bytes(&self) -> u64 {
+        self.reserved_bytes() - self.free_slots * self.slot_bytes
+    }
+
+    /// A free slot from the fullest chunk that has one, so that emptier chunks keep draining
+    /// towards release; a new chunk when none is free and `budget` (bytes left on the tier)
+    /// covers it.
     fn take(&mut self, budget: u64, grow: impl FnOnce(u64) -> Result<u64>) -> Result<Option<u32>> {
-        if let Some(s) = self.free.pop() {
+        if let Some(&(n, c)) = self.by_free.iter().next() {
+            self.by_free.remove(&(n, c));
+            let s = self.free[c as usize].pop().expect("counted free slot");
+            if n > 1 {
+                self.by_free.insert((n - 1, c));
+            }
+            self.free_slots -= 1;
             return Ok(Some(s));
         }
         let n = self.chunk_slots;
@@ -167,41 +190,86 @@ impl Slab {
             return Ok(None);
         }
         let base = grow(u64::from(n) * self.slot_bytes)?;
-        self.chunks.push(base);
-        let first = self.slots;
-        self.slots += n;
-        // Hand out the chunk's slots in order; the first goes to the caller.
-        for s in (first + 1..first + n).rev() {
-            self.free.push(s);
+        let c = match self.dead.pop() {
+            Some(c) => {
+                self.chunks[c as usize] = base;
+                c
+            }
+            None => {
+                self.chunks.push(base);
+                self.free.push(Vec::new());
+                self.chunks.len() as u32 - 1
+            }
+        };
+        let first = c * n;
+        // The chunk's slots go out in order; the first to the caller.
+        self.free[c as usize] = (first + 1..first + n).rev().collect();
+        if self.owner.len() < (first + n) as usize {
+            self.owner.resize((first + n) as usize, None);
         }
+        if n > 1 {
+            self.by_free.insert((n - 1, c));
+        }
+        self.free_slots += u64::from(n - 1);
+        self.live_chunks += 1;
         Ok(Some(first))
     }
 
-    fn reserved_bytes(&self) -> u64 {
-        self.chunks.iter().filter(|&&va| va != 0).count() as u64 * self.chunk_bytes()
+    fn assign(&mut self, slot: u32, id: BlockId) {
+        self.owner[slot as usize] = Some(id);
     }
 
-    /// Release every chunk whose slots are all free (its slots leave the free list; the chunk
-    /// index stays, dead, so slot arithmetic is unchanged). Returns the bytes released.
+    /// Return `slot` to its chunk.
+    fn put(&mut self, slot: u32) {
+        self.owner[slot as usize] = None;
+        let c = slot / self.chunk_slots;
+        let n = self.free[c as usize].len() as u32;
+        if n > 0 {
+            self.by_free.remove(&(n, c));
+        }
+        self.free[c as usize].push(slot);
+        self.by_free.insert((n + 1, c));
+        self.free_slots += 1;
+    }
+
+    /// Release every chunk whose slots are all free (the chunk index stays, dead, so slot
+    /// arithmetic is unchanged). Returns the bytes released.
     fn release_empty_chunks(&mut self, mut free: impl FnMut(u64)) -> u64 {
-        let n = self.chunks.len();
-        if n == 0 {
-            return 0;
-        }
-        let mut per_chunk = vec![0u32; n];
-        for &s in &self.free {
-            per_chunk[(s / self.chunk_slots) as usize] += 1;
-        }
+        let n = self.chunk_slots;
         let mut released = 0;
-        for (i, &count) in per_chunk.iter().enumerate() {
-            if self.chunks[i] != 0 && count == self.chunk_slots {
-                free(self.chunks[i]);
-                self.chunks[i] = 0;
-                self.free.retain(|&s| s / self.chunk_slots != i as u32);
-                released += self.chunk_bytes();
+        while let Some(&(count, c)) = self.by_free.iter().next_back() {
+            if count < n {
+                break;
             }
+            self.by_free.remove(&(count, c));
+            self.free[c as usize].clear();
+            self.free_slots -= u64::from(n);
+            free(self.chunks[c as usize]);
+            self.chunks[c as usize] = 0;
+            self.dead.push(c);
+            self.live_chunks -= 1;
+            released += self.chunk_bytes();
         }
         released
+    }
+
+    /// Every live chunk, the ones with the most free slots first, then the full ones.
+    fn release_candidates(&self) -> Vec<u32> {
+        let mut out: Vec<u32> = self.by_free.iter().rev().map(|&(_, c)| c).collect();
+        out.extend(
+            (0..self.chunks.len() as u32)
+                .filter(|&c| self.chunks[c as usize] != 0 && self.free[c as usize].is_empty()),
+        );
+        out
+    }
+
+    fn occupants(&self, chunk: u32) -> Vec<BlockId> {
+        let first = (chunk * self.chunk_slots) as usize;
+        self.owner[first..first + self.chunk_slots as usize]
+            .iter()
+            .flatten()
+            .copied()
+            .collect()
     }
 }
 
@@ -227,9 +295,13 @@ pub struct StoreStats {
     pub fills: u64,
     pub fill_failures: u64,
     pub reclaims: u64,
+    /// Publishes that found their block on the host and refilled it on the device instead.
+    pub refills: u64,
     pub refusals: u64,
     pub spills: u64,
     pub restores: u64,
+    /// Blocks a gather read from the host tier in place.
+    pub host_reads: u64,
     pub evictions: u64,
 }
 
@@ -240,9 +312,11 @@ struct Inner {
     blocks: Vec<Option<Block>>,
     free_ids: Vec<BlockId>,
     index: FxHashMap<(usize, BlockKey), BlockId>,
-    /// Zero-dependent blocks in release order (oldest first); an entry may be stale (the block
-    /// was re-acquired or dropped), checked when popped.
-    reclaim: VecDeque<BlockId>,
+    /// Zero-dependent device blocks per class in release order (oldest first); an entry may be
+    /// stale (the block was re-acquired, dropped or spilled), checked when popped.
+    reclaim: Vec<VecDeque<BlockId>>,
+    /// The same for host-resident blocks (spilled with no dependent, or released on the host).
+    host_reclaim: Vec<VecDeque<BlockId>>,
     /// Blocks with a D2H copy in flight, oldest first ([`KvStore::reap`]).
     spilling: VecDeque<BlockId>,
     tick: u64,
@@ -285,6 +359,7 @@ impl KvStore {
                 }
             })
             .collect::<Vec<_>>();
+        let n_classes = classes.len();
         let stats = StoreStats {
             classes: classes.iter().map(|_| ClassStats::default()).collect(),
             ..Default::default()
@@ -298,7 +373,8 @@ impl KvStore {
                 blocks: Vec::new(),
                 free_ids: Vec::new(),
                 index: FxHashMap::default(),
-                reclaim: VecDeque::new(),
+                reclaim: (0..n_classes).map(|_| VecDeque::new()).collect(),
+                host_reclaim: (0..n_classes).map(|_| VecDeque::new()).collect(),
                 spilling: VecDeque::new(),
                 tick: 0,
                 stats,
@@ -320,10 +396,43 @@ impl KvStore {
         inner.tick += 1;
         let tick = inner.tick;
         if let Some(&id) = inner.index.get(&(class, key)) {
-            let va = self.ensure_device_locked(&mut inner, id)?;
+            // A host-resident block is refilled from the rows being published (one more segment
+            // of the publish's launch), never copied back: the host slot goes.
+            // A held host block is being read in place (a gather in flight): it stays where it
+            // is and the publish takes it as present.
+            let (refill, held_host) =
+                match inner.blocks[id as usize].as_ref().map(|b| (b.place, b.holds)) {
+                    Some((Where::Host(h), 0)) => (Some(h), None),
+                    Some((Where::Host(h), _)) => (None, Some(h)),
+                    _ => (None, None),
+                };
+            let va = match (refill, held_host) {
+                (None, Some(h)) => inner.classes[class].host.va(h),
+                (Some(h), _) => {
+                    let slot = self.device_slot(&mut inner, class)?;
+                    let bytes = inner.classes[class].spec.block_bytes();
+                    inner.classes[class].device.assign(slot, id);
+                    inner.classes[class].host.put(h);
+                    let st = &mut inner.stats.classes[class];
+                    st.host_blocks -= 1;
+                    st.host_bytes -= bytes;
+                    st.device_blocks += 1;
+                    st.device_bytes += bytes;
+                    let b = inner.blocks[id as usize].as_mut().expect("indexed block");
+                    b.place = Where::Device(slot);
+                    b.state = State::Filling;
+                    inner.classes[class].device.va(slot)
+                }
+                (None, None) => self.ensure_device_locked(&mut inner, id)?,
+            };
             let b = inner.blocks[id as usize].as_mut().expect("indexed block");
             b.dependents += 1;
             b.tick = tick;
+            if b.state == State::Filling && refill.is_some() {
+                inner.stats.fills += 1;
+                inner.stats.refills += 1;
+                return Ok(Acquire { id, va, fill: true });
+            }
             if b.state == State::Failed {
                 b.state = State::Filling;
                 inner.stats.fills += 1;
@@ -351,6 +460,7 @@ impl KvStore {
             tick,
         });
         inner.index.insert((class, key), id);
+        inner.classes[class].device.assign(slot, id);
         inner.stats.fills += 1;
         inner.stats.classes[class].device_blocks += 1;
         inner.stats.classes[class].device_bytes += inner.classes[class].spec.block_bytes();
@@ -390,7 +500,11 @@ impl KvStore {
             };
             b.dependents = b.dependents.saturating_sub(1);
             if b.dependents == 0 {
-                inner.reclaim.push_back(id);
+                let class = b.class;
+                match b.place {
+                    Where::Host(_) => inner.host_reclaim[class].push_back(id),
+                    _ => inner.reclaim[class].push_back(id),
+                }
             }
         }
     }
@@ -427,6 +541,29 @@ impl KvStore {
 
     /// The block's device bytes, restoring it from the host tier when needed, and a use tick.
     /// `Err` = no device slot could be made for the restore.
+    /// Where a gather reads the block: its device bytes, or its host bytes in place when it is
+    /// host-resident (`true`; the host tier is device-mapped). Nothing moves; a later publish
+    /// that meets the block refills it on the device. The caller holds the block meanwhile.
+    pub fn gather_src(&self, id: BlockId) -> Result<(u64, bool)> {
+        let mut inner = self.inner.lock();
+        inner.tick += 1;
+        let tick = inner.tick;
+        let b = inner.blocks[id as usize]
+            .as_mut()
+            .ok_or_else(|| RuntimeError::Rejected("kv store: no such block".into()))?;
+        b.tick = tick;
+        let (class, place) = (b.class, b.place);
+        Ok(match place {
+            Where::Device(s) | Where::Spilling { dev: s, .. } => {
+                (inner.classes[class].device.va(s), false)
+            }
+            Where::Host(h) => {
+                inner.stats.host_reads += 1;
+                (inner.classes[class].host.va(h), true)
+            }
+        })
+    }
+
     pub fn ensure_device(&self, id: BlockId) -> Result<u64> {
         let mut inner = self.inner.lock();
         inner.tick += 1;
@@ -454,11 +591,12 @@ impl KvStore {
                 let host = inner.classes[class].host.va(h);
                 if state == State::Ready {
                     if let Err(e) = self.ops.copy_htod(va, host, bytes) {
-                        inner.classes[class].device.free.push(slot);
+                        inner.classes[class].device.put(slot);
                         return Err(e);
                     }
                 }
-                inner.classes[class].host.free.push(h);
+                inner.classes[class].device.assign(slot, id);
+                inner.classes[class].host.put(h);
                 let b = inner.blocks[id as usize].as_mut().expect("block");
                 b.place = Where::Device(slot);
                 inner.stats.restores += 1;
@@ -487,38 +625,42 @@ impl KvStore {
         // skipped and re-queued where they still matter.
         let mut requeue = Vec::new();
         let mut found = None;
-        while let Some(id) = inner.reclaim.pop_front() {
+        while let Some(id) = inner.reclaim[class].pop_front() {
             let Some(b) = inner.blocks[id as usize].as_ref() else {
                 continue;
             };
             if b.dependents > 0 {
                 continue;
             }
-            if b.holds > 0 || b.state == State::Filling || b.class != class {
+            if b.holds > 0 || b.state == State::Filling {
                 requeue.push(id);
                 continue;
             }
             match b.place {
-                Where::Device(s) => {
-                    found = Some((id, s));
+                Where::Device(_) => {
+                    found = Some(id);
                     break;
                 }
-                _ => requeue.push(id),
+                // In flight to the host: `reap` queues it on the host list when it lands.
+                Where::Spilling { .. } => requeue.push(id),
+                Where::Host(_) => {}
             }
         }
         for id in requeue.into_iter().rev() {
-            inner.reclaim.push_front(id);
+            inner.reclaim[class].push_front(id);
         }
-        let Some((id, slot)) = found else {
+        let Some(id) = found else {
             inner.stats.refusals += 1;
             return Err(RuntimeError::Oom("kv store: class slab full".into()));
         };
-        // `drop_block` returns the slot to the free list; take it back for the caller.
+        // `drop_block` returns the victim's slot to its chunk; the take may prefer another
+        // hole of the class (the fullest chunk's).
         self.drop_block(inner, id);
-        let taken = inner.classes[class].device.free.pop();
-        debug_assert_eq!(taken, Some(slot));
         inner.stats.reclaims += 1;
-        Ok(slot)
+        let taken = inner.classes[class]
+            .device
+            .take(0, |_| Err(RuntimeError::Oom("kv store: no growth".into())))?;
+        Ok(taken.expect("the reclaimed slot is free"))
     }
 
     /// Forget a block entirely (its slots go back to their slabs).
@@ -533,7 +675,7 @@ impl KvStore {
         let st = &mut inner.stats.classes[b.class];
         match b.place {
             Where::Device(s) => {
-                c.device.free.push(s);
+                c.device.put(s);
                 st.device_blocks -= 1;
                 st.device_bytes -= bytes;
             }
@@ -544,7 +686,7 @@ impl KvStore {
                 st.device_bytes -= bytes;
             }
             Where::Host(h) => {
-                c.host.free.push(h);
+                c.host.put(h);
                 st.host_blocks -= 1;
                 st.host_bytes -= bytes;
             }
@@ -611,7 +753,7 @@ impl KvStore {
                     inner.stats.spills += 1;
                 }
                 Err(_) => {
-                    inner.classes[class].host.free.push(h);
+                    inner.classes[class].host.put(h);
                     all = false;
                 }
             }
@@ -630,23 +772,34 @@ impl KvStore {
         if let Some(s) = taken {
             return Some(s);
         }
-        // The oldest zero-dependent host block of this class gives up its slot.
-        let victim = inner
-            .blocks
-            .iter()
-            .enumerate()
-            .filter_map(|(i, b)| b.as_ref().map(|b| (i as BlockId, b)))
-            .filter(|(_, b)| b.class == class && b.dependents == 0 && b.holds == 0)
-            .filter_map(|(id, b)| match b.place {
-                Where::Host(h) => Some((b.tick, id, h)),
-                _ => None,
-            })
-            .min()?;
-        self.drop_block(inner, victim.1);
-        let taken = inner.classes[class].host.free.pop();
-        debug_assert_eq!(taken, Some(victim.2));
+        // The oldest zero-dependent host block of this class gives up its slot; stale entries
+        // (re-acquired, dropped, back on the device) are skipped, other classes' re-queued.
+        let mut requeue = Vec::new();
+        let mut victim = None;
+        while let Some(id) = inner.host_reclaim[class].pop_front() {
+            let Some(b) = inner.blocks[id as usize].as_ref() else {
+                continue;
+            };
+            if b.dependents > 0 || !matches!(b.place, Where::Host(_)) {
+                continue;
+            }
+            if b.holds > 0 {
+                requeue.push(id);
+                continue;
+            }
+            victim = Some(id);
+            break;
+        }
+        for id in requeue.into_iter().rev() {
+            inner.host_reclaim[class].push_front(id);
+        }
+        self.drop_block(inner, victim?);
         inner.stats.evictions += 1;
-        Some(victim.2)
+        inner.classes[class]
+            .host
+            .take(0, |_| Err(RuntimeError::Oom("kv store: no growth".into())))
+            .ok()
+            .flatten()
     }
 
     /// Retire completed spills in order: the device slot frees, the block is host-resident. A
@@ -689,9 +842,12 @@ impl KvStore {
                 continue;
             }
             let bytes = inner.classes[class].spec.block_bytes();
-            inner.classes[class].device.free.push(dev);
+            inner.classes[class].device.put(dev);
             let b = inner.blocks[id as usize].as_mut().expect("block");
             b.place = Where::Host(host);
+            if b.dependents == 0 {
+                inner.host_reclaim[class].push_back(id);
+            }
             let st = &mut inner.stats.classes[class];
             st.device_blocks -= 1;
             st.device_bytes -= bytes;
@@ -700,40 +856,52 @@ impl KvStore {
         }
     }
 
-    /// Give device memory back under pressure: drop zero-dependent, unheld, settled device
-    /// blocks from the reclaim list (oldest first) until `bytes` of slots are free, then release
-    /// every device chunk with no block left in it. Returns the bytes released to the device.
+    /// Give device memory back under pressure: release whole chunks whose remaining blocks are
+    /// all reclaimable (zero-dependent, unheld, settled, on the device), the emptiest chunks
+    /// first, until `bytes` are released; chunks that reclaims emptied go back too. Returns the
+    /// bytes released to the device. The pool evicts a boundary when this returns 0: its blocks
+    /// then become reclaimable and the chunks they sit in releasable.
     pub fn shrink(&self, bytes: u64) -> u64 {
         let mut inner = self.inner.lock();
-        let mut freed_slots = 0u64;
-        let mut requeue = Vec::new();
-        while freed_slots < bytes {
-            let Some(id) = inner.reclaim.pop_front() else {
-                break;
-            };
-            let Some(b) = inner.blocks[id as usize].as_ref() else {
-                continue;
-            };
-            if b.dependents > 0 {
-                continue;
+        let mut released = 0u64;
+        for ci in 0..inner.classes.len() {
+            // Every live chunk is checked before 0 is returned: the pool evicts a boundary on 0.
+            for chunk in inner.classes[ci].device.release_candidates() {
+                if released >= bytes {
+                    break;
+                }
+                let ids = inner.classes[ci].device.occupants(chunk);
+                let reclaimable = ids.iter().all(|&id| match inner.blocks[id as usize].as_ref() {
+                    Some(b) => {
+                        b.dependents == 0
+                            && b.holds == 0
+                            && b.state != State::Filling
+                            && matches!(b.place, Where::Device(_))
+                    }
+                    None => true,
+                });
+                if !reclaimable {
+                    continue;
+                }
+                for id in ids {
+                    self.drop_block(&mut inner, id);
+                    inner.stats.evictions += 1;
+                }
+                released += inner.classes[ci]
+                    .device
+                    .release_empty_chunks(|va| self.ops.free(va));
             }
-            if b.holds > 0 || b.state == State::Filling || !matches!(b.place, Where::Device(_)) {
-                requeue.push(id);
-                continue;
-            }
-            let class = b.class;
-            self.drop_block(&mut inner, id);
-            freed_slots += inner.classes[class].spec.block_bytes();
-            inner.stats.evictions += 1;
         }
-        for id in requeue.into_iter().rev() {
-            inner.reclaim.push_front(id);
-        }
-        let mut released = 0;
         for c in inner.classes.iter_mut() {
             released += c.device.release_empty_chunks(|va| self.ops.free(va));
         }
         released
+    }
+
+    /// The device bytes the store may reserve from now on (chunks already reserved stay until
+    /// [`Self::shrink`] releases them).
+    pub fn set_device_cap(&self, bytes: u64) {
+        self.inner.lock().device_cap = bytes;
     }
 
     pub fn stats(&self) -> StoreStats {
@@ -765,7 +933,6 @@ impl Drop for KvStore {
 /// hashed with `H` from `seed`. The key's `chain` and `check` use two unrelated hash
 /// functions (`FxHasher` and SipHash), not two seeds of one.
 pub fn chain_hashes<H: std::hash::Hasher + Default>(tokens: &[u32], rows: u32, seed: u64) -> Vec<u64> {
-    use std::hash::Hasher;
     let rows = rows.max(1) as usize;
     let mut out = Vec::with_capacity(tokens.len() / rows);
     let mut prev = seed;
@@ -942,12 +1109,23 @@ mod tests {
         assert!(b.fill);
         s.seal(b.id);
         s.release(&[b.id]);
-        // Restoring a needs b's slot: b is reclaimed (zero dependents), a comes back.
+        // A publish that meets the host block refills it from its own rows (b's slot is
+        // reclaimed); nothing is copied back and the host slot goes.
         let again = s.acquire(0, key(1)).unwrap();
-        assert!(!again.fill, "restored, not refilled");
+        assert!(again.fill, "refilled on the device, not restored");
+        assert_eq!(ops.htod.load(Ordering::SeqCst), 0);
+        assert_eq!((s.stats().refills, s.stats().classes[0].host_blocks), (1, 0));
+        assert_eq!(s.location(a.id), Some(Location::Device(again.va)));
+        // A gather (`ensure_device`) is the restore.
+        s.seal(again.id);
+        s.release(&[a.id]);
+        assert!(s.spill(&[a.id]));
+        s.reap();
+        assert_eq!(s.location(a.id), Some(Location::Host));
+        let va = s.ensure_device(a.id).unwrap();
         assert_eq!(ops.htod.load(Ordering::SeqCst), 1);
         assert_eq!(s.stats().restores, 1);
-        assert_eq!(s.location(a.id), Some(Location::Device(again.va)));
+        assert_eq!(s.location(a.id), Some(Location::Device(va)));
     }
 
     #[test]
@@ -1018,6 +1196,135 @@ mod tests {
         assert_eq!(released, 64, "two empty chunks went back");
         assert_eq!(s.device_bytes(), 2 * 32);
         assert!(s.acquire(0, key(1)).unwrap().fill, "dropped, refilled");
+    }
+
+    #[test]
+    fn allocation_fills_the_fullest_chunk_and_shrink_releases_whole_chunks() {
+        let ops = MockOps::new();
+        let s = KvStore::new(
+            ops.clone(),
+            vec![ClassSpec {
+                name: "window",
+                row_bytes: 8,
+                rows_per_block: 4,
+            }],
+            64, // two blocks per chunk
+            2 * 64,
+            0,
+        );
+        let ids: Vec<_> = (1..=4).map(|i| s.acquire(0, key(i)).unwrap().id).collect();
+        for &id in &ids {
+            s.seal(id);
+        }
+        assert_eq!(s.device_bytes(), 2 * 64, "chunk 0 = blocks 1,2; chunk 1 = blocks 3,4");
+        // A reclaimable block in each chunk; at the cap a new block takes the oldest one's slot.
+        s.release(&ids[1..3]);
+        s.shrink(64);
+        assert_eq!(s.device_bytes(), 2 * 64, "no chunk is all reclaimable yet");
+        let e = s.acquire(0, key(5)).unwrap();
+        assert!(e.fill);
+        assert_eq!(s.device_bytes(), 2 * 64, "the new block took a reclaimed slot");
+        // Chunk 0 = blocks 1, 5; chunk 1 = block 3 (reclaimable), 4 (one dependent).
+        assert_eq!(s.shrink(64), 0);
+        s.release(&ids[3..]);
+        // Block 3 (if still there) and block 4 are reclaimable: whichever chunk only holds
+        // reclaimable blocks goes back.
+        assert_eq!(s.shrink(64), 64);
+        assert_eq!(s.device_bytes(), 64);
+        assert!(s.acquire(0, key(4)).unwrap().fill, "block 4 was dropped with its chunk");
+    }
+
+    #[test]
+    fn shrink_checks_every_chunk_and_growth_reuses_released_indices() {
+        let ops = MockOps::new();
+        let s = KvStore::new(
+            ops.clone(),
+            vec![ClassSpec {
+                name: "window",
+                row_bytes: 8,
+                rows_per_block: 4,
+            }],
+            64, // two blocks per chunk
+            40 * 64,
+            0,
+        );
+        // 40 chunks, each holding one referenced block and one reclaimable one, except the
+        // last, whose two blocks are both reclaimable.
+        let ids: Vec<_> = (1..=80).map(|i| s.acquire(0, key(i)).unwrap().id).collect();
+        for &id in &ids {
+            s.seal(id);
+        }
+        for c in 0..40 {
+            s.release(&[ids[2 * c + 1]]);
+        }
+        s.release(&[ids[78]]);
+        assert_eq!(s.shrink(64), 64, "the last chunk is the only releasable one");
+        assert_eq!(s.device_bytes(), 39 * 64);
+        // Growth reuses the released chunk index: no new metadata.
+        let before = s.inner.lock().classes[0].device.chunks.len();
+        let n = s.acquire(0, key(100)).unwrap();
+        assert!(n.fill);
+        assert_eq!(s.inner.lock().classes[0].device.chunks.len(), before);
+        assert_eq!(s.device_bytes(), 40 * 64 - 32, "one slot of the regrown chunk is free");
+    }
+
+    #[test]
+    fn host_victims_are_per_class() {
+        let ops = MockOps::new();
+        let classes = ["window", "tail"]
+            .iter()
+            .map(|name| ClassSpec {
+                name,
+                row_bytes: 8,
+                rows_per_block: 4,
+            })
+            .collect();
+        // Device: one block per class; host: one slot per class (chunk = 32 B = one block).
+        let s = KvStore::new(ops.clone(), classes, 32, 2 * 32, 2 * 32);
+        let a = s.acquire(0, key(1)).unwrap();
+        let t = s.acquire(1, key(2)).unwrap();
+        s.seal(a.id);
+        s.seal(t.id);
+        s.release(&[a.id, t.id]);
+        assert!(s.spill(&[a.id, t.id]));
+        s.reap();
+        assert_eq!(s.location(a.id), Some(Location::Host));
+        // A second window block spills: the host is full for its class, the window block on
+        // the host is the victim, the tail block stays.
+        let a2 = s.acquire(0, key(3)).unwrap();
+        s.seal(a2.id);
+        s.release(&[a2.id]);
+        assert!(s.spill(&[a2.id]));
+        s.reap();
+        assert_eq!(s.location(a2.id), Some(Location::Host));
+        assert_eq!(s.location(a.id), None, "window victim dropped");
+        assert_eq!(s.location(t.id), Some(Location::Host), "tail untouched");
+    }
+
+    #[test]
+    fn a_gather_reads_a_host_block_in_place() {
+        let (ops, s) = store(32, 32); // one device slot, one host slot
+        let a = s.acquire(0, key(1)).unwrap();
+        s.seal(a.id);
+        s.release(&[a.id]);
+        assert!(s.spill(&[a.id]));
+        s.reap();
+        s.hold(&[a.id]);
+        let (va, from_host) = s.gather_src(a.id).unwrap();
+        assert!(from_host);
+        assert_eq!(ops.htod.load(Ordering::SeqCst), 0, "nothing copied back");
+        assert_eq!(s.location(a.id), Some(Location::Host), "the block stays on the host");
+        assert_eq!(s.stats().host_reads, 1);
+        // While the gather reads it, a publish meeting the block takes it as present and
+        // a spill of another block cannot take its host slot.
+        let again = s.acquire(0, key(1)).unwrap();
+        assert!(!again.fill, "held on the host: not refilled");
+        let b = s.acquire(0, key(2)).unwrap();
+        s.seal(b.id);
+        s.release(&[b.id]);
+        assert!(!s.spill(&[b.id]), "the only host slot is held");
+        s.unhold(&[a.id]);
+        assert_ne!(va, 0);
     }
 
     #[test]
