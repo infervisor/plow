@@ -351,6 +351,9 @@ pub struct StoreStats {
     pub spill_us: u64,
     pub shrink_us: u64,
     pub shrinks: u64,
+    /// The longest single host chunk allocation and shrink.
+    pub host_grow_max_us: u64,
+    pub shrink_max_us: u64,
 }
 
 struct Inner {
@@ -403,8 +406,10 @@ pub struct Acquire {
 const HOST_FLOOR_EVERY: u64 = 16;
 /// Device chunks allocated between two free-memory queries of the device-floor check.
 const DEVICE_FLOOR_EVERY: u64 = 8;
-/// Pinned bytes per class the host grower keeps allocated ahead (at least one chunk).
-const HOST_SPARE_BYTES: u64 = 256 << 20;
+/// Pinned bytes per class the host grower keeps allocated ahead (at least one chunk): a burst
+/// of evictions spills several boundaries before the grower refills, a spill with no spare
+/// ready is refused and the boundary dropped instead.
+const HOST_SPARE_BYTES: u64 = 1 << 30;
 
 impl KvStore {
     /// `device_cap` / `host_cap`: bytes the store may reserve on each tier over every class
@@ -970,7 +975,9 @@ impl KvStore {
         let mut inner = self.inner.lock();
         let t0 = std::time::Instant::now();
         let released = self.shrink_locked(&mut inner, bytes);
-        inner.stats.shrink_us += t0.elapsed().as_micros() as u64;
+        let us = t0.elapsed().as_micros() as u64;
+        inner.stats.shrink_us += us;
+        inner.stats.shrink_max_us = inner.stats.shrink_max_us.max(us);
         inner.stats.shrinks += 1;
         released
     }
@@ -1189,6 +1196,7 @@ impl KvStore {
         let us = t.elapsed().as_micros() as u64;
         let mut inner = self.inner.lock();
         inner.stats.host_grow_us += us;
+        inner.stats.host_grow_max_us = inner.stats.host_grow_max_us.max(us);
         match ptr {
             Ok(ptr) => {
                 inner.host_spare[class].push(ptr);

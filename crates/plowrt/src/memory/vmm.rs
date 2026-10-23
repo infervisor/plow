@@ -8379,6 +8379,58 @@ mod tests {
         policy::check_tree(&p.shared.inner.lock());
     }
 
+    /// Spills every boundary it is asked to.
+    struct SpillBlocks;
+    impl SnapBlocks for SpillBlocks {
+        fn release(&self, _handle: u64) {}
+        fn spill(&self, _handle: u64) -> bool {
+            true
+        }
+        fn restore(&self, _handle: u64) -> Result<()> {
+            Ok(())
+        }
+        fn reap(&self) {}
+        fn pending_spill_bytes(&self) -> u64 {
+            0
+        }
+        fn shrink(&self, _bytes: u64) -> u64 {
+            0
+        }
+    }
+
+    /// A host-resident store boundary occupies no device bytes: device pressure spills the
+    /// used device boundary instead of first evicting the cold host one (the pool's own tier
+    /// did that to free a host slot; the store's host cap is enforced at the spill).
+    #[test]
+    fn device_pressure_keeps_host_resident_store_boundaries() {
+        let ops = Arc::new(MockVmm::default());
+        let p = pool(ops.clone());
+        p.enable_block_store(Arc::new(SpillBlocks), true);
+        let a = prompt(17);
+        p.try_attach(0, &a).unwrap();
+        p.ensure_rows(0, 17).unwrap();
+        p.publish_blocks(0, &a, 16, Kind::PROMPT_END, || Ok((7, 100)))
+            .unwrap();
+        p.begin_seq(0);
+        assert!(p.reclaim_one(), "a (cold) spills");
+        assert_eq!(p.stats().host_snapshots, 1);
+        let b: Vec<u32> = (500..517).collect();
+        p.try_attach(0, &b).unwrap();
+        p.ensure_rows(0, 17).unwrap();
+        p.publish_blocks(0, &b, 16, Kind::PROMPT_END, || Ok((8, 100)))
+            .unwrap();
+        p.begin_seq(0);
+        let hit = p.try_attach(1, &b).unwrap().expect("hit");
+        assert_eq!(hit.rows, 16, "b is used once: no longer cold");
+        p.finish_attach(1);
+        p.begin_seq(1);
+        assert!(p.reclaim_one(), "b spills; the host boundary a stays");
+        let st = p.stats();
+        assert_eq!((st.host_snapshots, st.snapshots_live), (2, 2));
+        assert_eq!(p.cached_rows(&a), 16);
+        policy::check_tree(&p.shared.inner.lock());
+    }
+
     #[test]
     fn prompt_end_outlives_the_older_checkpoint_under_it() {
         let ops = Arc::new(MockVmm::default());

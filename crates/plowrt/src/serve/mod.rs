@@ -2410,6 +2410,10 @@ fn kv_store_metrics(state: &AppState, out: &mut String) {
         ("publish_sync_us_total", "counter", "Of which draining the stream."),
         ("gather_us_total", "counter", "Engine-thread microseconds in gathers."),
         ("gather_sync_us_total", "counter", "Of which draining the stream."),
+        ("host_grow_max_us", "gauge", "Longest single host tier chunk allocation."),
+        ("shrink_max_us", "gauge", "Longest single shrink (pool lock held)."),
+        ("publish_max_us", "gauge", "Longest single publish on the engine thread."),
+        ("gather_max_us", "gauge", "Longest single gather on the engine thread."),
         ("published_blocks_total", "counter", "Blocks of published boundaries."),
         ("published_new_blocks_total", "counter", "Blocks a publish had to fill (the rest were shared)."),
         ("gathers_total", "counter", "Boundaries gathered into a slot."),
@@ -2462,7 +2466,11 @@ fn kv_store_metrics(state: &AppState, out: &mut String) {
              plowrt_kv_store_publish_us_total{{model=\"{slug}\"}} {}\n\
              plowrt_kv_store_publish_sync_us_total{{model=\"{slug}\"}} {}\n\
              plowrt_kv_store_gather_us_total{{model=\"{slug}\"}} {}\n\
-             plowrt_kv_store_gather_sync_us_total{{model=\"{slug}\"}} {}\n",
+             plowrt_kv_store_gather_sync_us_total{{model=\"{slug}\"}} {}\n\
+             plowrt_kv_store_host_grow_max_us{{model=\"{slug}\"}} {}\n\
+             plowrt_kv_store_shrink_max_us{{model=\"{slug}\"}} {}\n\
+             plowrt_kv_store_publish_max_us{{model=\"{slug}\"}} {}\n\
+             plowrt_kv_store_gather_max_us{{model=\"{slug}\"}} {}\n",
             s.store.dedup_hits,
             s.store.fills,
             s.store.fill_failures,
@@ -2494,6 +2502,10 @@ fn kv_store_metrics(state: &AppState, out: &mut String) {
             s.publish_sync_us,
             s.gather_us,
             s.gather_sync_us,
+            s.store.host_grow_max_us,
+            s.store.shrink_max_us,
+            s.publish_max_us,
+            s.gather_max_us,
         );
     }
 }

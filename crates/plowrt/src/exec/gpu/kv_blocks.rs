@@ -81,6 +81,9 @@ pub struct BlockServeStats {
     pub publish_sync_us: u64,
     pub gather_us: u64,
     pub gather_sync_us: u64,
+    /// The longest single publish and gather.
+    pub publish_max_us: u64,
+    pub gather_max_us: u64,
 }
 
 pub struct BlockServe {
@@ -440,7 +443,9 @@ impl GpuEngine {
             st.publishes += 1;
             st.published_blocks += handle.len() as u64;
             st.published_new_blocks += fills.len() as u64;
-            st.publish_us += t0.elapsed().as_micros() as u64;
+            let us = t0.elapsed().as_micros() as u64;
+            st.publish_us += us;
+            st.publish_max_us = st.publish_max_us.max(us);
             st.publish_sync_us += sync_us;
         }
         bs.handles.lock().insert(id, handle);
@@ -493,7 +498,9 @@ impl GpuEngine {
         copied?;
         let mut st = bs.stats.lock();
         st.gathers += 1;
-        st.gather_us += t0.elapsed().as_micros() as u64;
+        let us = t0.elapsed().as_micros() as u64;
+        st.gather_us += us;
+        st.gather_max_us = st.gather_max_us.max(us);
         st.gather_sync_us += sync_us;
         st.gathered_blocks += plan.len() as u64;
         Ok(())

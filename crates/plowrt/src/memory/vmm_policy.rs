@@ -195,9 +195,13 @@ pub(super) fn evict_one_tree(s: &Shared, inner: &mut Inner, preserve_hot: bool) 
     if evict_dead_leaf(s, inner) {
         return true;
     }
+    // A block-store boundary on the host occupies no device bytes: device pressure never
+    // evicts one (the store's host cap is enforced when a spill needs a host slot).
+    let host_holds_device = inner.block_store.is_none();
     // A cold host boundary (published on a first sighting, never attached) ranks below every
     // used device boundary: it goes before the device victim is spilled or freed.
-    if victim.is_some_and(|id| !snap_ref(inner, id).is_some_and(Snap::cold)) {
+    if host_holds_device && victim.is_some_and(|id| !snap_ref(inner, id).is_some_and(Snap::cold))
+    {
         if let Some(id) = host_lru(inner).filter(|&id| snap_ref(inner, id).is_some_and(Snap::cold))
         {
             with_cause(inner, Some(Mechanism::Cold), None, |inner| {
@@ -217,9 +221,11 @@ pub(super) fn evict_one_tree(s: &Shared, inner: &mut Inner, preserve_hot: bool) 
     }
     // Every unprotected device boundary is held or awaited: the device bytes a host-resident
     // boundary still occupies (its blocks) are the next level of the same LRU.
-    if let Some(id) = host_lru(inner) {
-        evict_unit(s, inner, id);
-        return true;
+    if host_holds_device {
+        if let Some(id) = host_lru(inner) {
+            evict_unit(s, inner, id);
+            return true;
+        }
     }
     if let Some(id) = protected {
         if spill_unit(s, inner, id) {
