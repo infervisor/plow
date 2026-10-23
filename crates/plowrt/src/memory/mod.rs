@@ -4,6 +4,7 @@
 pub mod container;
 pub mod dma;
 pub mod kv;
+pub mod kv_store;
 pub mod pool;
 pub mod prefix;
 pub mod sram;

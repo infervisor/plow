@@ -259,6 +259,8 @@ pub struct JobOpts {
     /// Whose request this is ([`crate::serve::session::RequestIds::tenant`]): within a class, queued
     /// tenants are seated round-robin ([`Fair`]); `None` is a tenant of its own.
     pub tenant: Option<u64>,
+    /// The client's `X-Session-End`: the session's last turn ([`crate::serve::session::RequestIds::session_end`]).
+    pub session_end: bool,
     /// [`Fair`]'s start round, set when the job is first ordered in the queue (0: not yet).
     pub(crate) round: u64,
     /// Prefix rows the cache would attach, and the cache generation they were read at.
@@ -1050,6 +1052,8 @@ struct Slot {
     parked_at: Option<Instant>,
     /// A session request's retention seat; dropped with the slot, it retires the rows.
     session: Option<Seat>,
+    /// The session's last turn (`X-Session-End`): its prefix boundary is demoted at retire.
+    session_end: bool,
     /// Retained cache rows this sequence starts from (the engine keeps them at `begin_slot`).
     #[cfg_attr(not(feature = "cuda"), allow(dead_code))]
     resume: usize,
@@ -2927,6 +2931,7 @@ fn admit_session(
     let resume = resume.filter(|r| r.slot == idx).map_or(0, |r| r.rows);
     let speech = job.opts.speech.is_some();
     slots[idx] = Some(Slot {
+        session_end: job.opts.session_end,
         session: retention.seat(job.opts.session, idx, pair, speech, resume, metrics),
         resume,
         telemetry,
@@ -4286,6 +4291,9 @@ fn run_one_tick(
             })();
             for (slot, request) in result.0.iter().enumerate().take(e.batch()) {
                 if request.is_none() && slot_free(&result.0, slot) {
+                    if disconnected[slot] {
+                        e.note_disconnect(slot);
+                    }
                     e.retire_slot(slot, result.5.is_none() && !disconnected[slot]);
                 }
             }
@@ -6524,6 +6532,7 @@ struct WindowAdmit {
     total: usize,
     prefix: Option<crate::memory::vmm::PrefixKey>,
     pin: Option<std::time::Duration>,
+    session_end: bool,
     /// `None` until attempted.
     outcome: Option<Result<Option<usize>>>,
 }
@@ -6590,6 +6599,9 @@ fn admit_window(
         let admitted = e.admit_packed_slot(job.slot, &job.prompt, job.total);
         if let (Ok(Some(_)), Some(ttl)) = (&admitted, job.pin) {
             e.hold_session_prefix(job.slot, ttl);
+        }
+        if matches!(admitted, Ok(Some(_))) {
+            e.set_session_end(job.slot, job.session_end);
         }
         job.outcome = Some(admitted);
     }
@@ -6841,6 +6853,7 @@ fn gpu_prefill_batched_pass(
                         total,
                         prefix: request.prefix.take(),
                         pin: request.session.as_ref().and_then(|s| s.pin_ttl()),
+                        session_end: request.session_end,
                         outcome: None,
                     });
                     continue;
@@ -6866,6 +6879,9 @@ fn gpu_prefill_batched_pass(
                         .filter(|_| fresh)
                     {
                         e.hold_session_prefix(row, ttl);
+                    }
+                    if fresh {
+                        e.set_session_end(row, request.session_end);
                     }
                     if fresh
                         && request
@@ -7410,6 +7426,7 @@ fn gpu_prefill_advance(
         if let Some(ttl) = slot.session.as_ref().and_then(|s| s.pin_ttl()) {
             e.hold_session_prefix(slot_idx, ttl);
         }
+        e.set_session_end(slot_idx, slot.session_end);
     }
     if let Some(sp) = slot.speech.as_deref_mut() {
         if let Some(encode) = sp.encode.take() {
@@ -11140,6 +11157,7 @@ mod tests {
         let (respond, rx) = crate::serve::stream::channel();
         (
             Some(Slot {
+                session_end: false,
                 telemetry: None,
                 prompt_ids: vec![1, 2, 3],
                 out_ids: Vec::new(),

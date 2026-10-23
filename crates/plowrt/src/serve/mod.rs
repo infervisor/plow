@@ -1975,6 +1975,16 @@ async fn metrics_handler(
             "counter",
             "Bytes freed by session demotions.",
         ),
+        (
+            "session_end_header_total",
+            "counter",
+            "Session boundaries dropped to the cold LRU band on the client's X-Session-End.",
+        ),
+        (
+            "session_end_abort_total",
+            "counter",
+            "Session boundaries dropped to the cold LRU band on a client disconnect before the response completed.",
+        ),
     ] {
         crate::obs::serving::family(&mut out, &format!("plowrt_prefix_{name}"), kind, help);
     }
@@ -2032,7 +2042,9 @@ async fn metrics_handler(
              plowrt_prefix_host_fence_failures_total{{model=\"{slug}\"}} {}\n\
              plowrt_prefix_sessions_protected{{model=\"{slug}\"}} {}\n\
              plowrt_prefix_session_demotions_total{{model=\"{slug}\"}} {}\n\
-             plowrt_prefix_session_demoted_bytes_total{{model=\"{slug}\"}} {}\n",
+             plowrt_prefix_session_demoted_bytes_total{{model=\"{slug}\"}} {}\n\
+             plowrt_prefix_session_end_header_total{{model=\"{slug}\"}} {}\n\
+             plowrt_prefix_session_end_abort_total{{model=\"{slug}\"}} {}\n",
             s.attach_hits,
             s.attach_misses,
             s.tokens_queried,
@@ -2081,6 +2093,8 @@ async fn metrics_handler(
             s.sessions_protected,
             s.session_demotions,
             s.session_demoted_bytes,
+            s.session_end_header,
+            s.session_end_abort,
         );
     }
     (

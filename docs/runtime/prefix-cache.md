@@ -120,6 +120,13 @@ Policy (`crates/plowrt/src/memory/vmm_policy.rs`, `Policy::Tree`, the only CUDA 
   take an unprotected spill (that victim is freed instead).
   `/metrics`: `plowrt_prefix_sessions_protected`, `plowrt_prefix_session_demotions_total`,
   `plowrt_prefix_session_demoted_bytes_total`. Turn-end output boundaries are not published.
+* Session end (`X-Session-End: 1`, body `metadata.session_end`, or a client disconnect before the
+  response completed): at the slot's retire, after its turn-end publish, the session's prompt end
+  loses its TTL and moves to the cold band (`last_used` below every live boundary), so pressure
+  takes it before a live session's; the bytes stay until then and a retry or a later turn attaches
+  and re-warms it (`VmmKv::demote_session`, `cell_session_end_*`). The header is authoritative, the
+  disconnect predictive; neither is a knob. `/metrics`: `plowrt_prefix_session_end_header_total`,
+  `plowrt_prefix_session_end_abort_total`.
 
 Invariants (`vmm_sim_tests::cell_*`, `policy::check_tree`): a held, awaited or in-transfer
 snapshot is never freed on any path (LRU, retire, radix leaf eviction, strict publish's tail
@@ -133,6 +140,10 @@ against a median think time of 45 s, so a quarter of the turns come back after t
 evicted and re-render ~900 rows from a block-aligned ancestor. The device cannot grow; pinned
 host memory can. With the tier armed the device LRU's victim is *spilled*, not freed:
 
+* The cap is cut at bring-up to `MemAvailable` minus a reserve of an eighth of `MemTotal` (at
+  least 16 GiB; `enable_host_tier`, a warning says by how much): pinned pages cannot be reclaimed,
+  and a 120 GB tier beside two co-tenant compiler builds was OOM-killed on the 249 GB lab box
+  (2026-10-22). No knob: the reserve is not a tuning parameter.
 * `SnapStore::{Device(va), Spilling{va,slot,fence}, Host(slot), Restoring(slot)}`. A spill is one
   async D2H copy into a fixed host slot (the largest snapshot the engine can publish; chunks of
   1 GiB are all pinned at bring-up: pinning takes the driver context lock, and growing them

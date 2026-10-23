@@ -743,6 +743,35 @@ impl Rig {
         out
     }
 
+    /// [`Self::turn_session`] whose request carries an end-of-session signal: the demotion
+    /// lands after the turn-end publish and before the retire's `begin_seq`, as
+    /// `retire_slot` orders it.
+    fn turn_session_end(
+        &mut self,
+        b: usize,
+        prompt: &[u32],
+        reply: usize,
+        ttl_ms: u64,
+        signal: DemoteSignal,
+    ) -> (u32, Vec<u32>) {
+        let rows = self.admit(b, prompt);
+        self.k
+            .kv
+            .hold_session(b, std::time::Duration::from_millis(ttl_ms));
+        let mut toks = self.prefill(b, prompt, self.chunk);
+        let out: Vec<u32> = (0..reply)
+            .map(|i| ((toks.len() + i) as u32) ^ 0x4000_0000)
+            .collect();
+        toks.extend_from_slice(&out);
+        self.pos[b] = toks.len() as u32;
+        self.k.publish(b, &toks, toks.len() as u32);
+        self.k.kv.demote_session(b, signal);
+        self.k.kv.begin_seq(b);
+        self.pos[b] = 0;
+        self.check();
+        (rows, out)
+    }
+
     /// [`Self::turn`] for a request with `X-Session-Id` held for `ttl_ms` (0 = no retention).
     fn turn_session(
         &mut self,
@@ -1578,4 +1607,70 @@ fn cell_turn_end_restores_an_evicted_prompt_end() {
         (1, 2),
         "the surviving end was touched, not copied"
     );
+}
+
+/// `X-Session-End`: the session's prompt end loses its TTL and drops to the cold band, so
+/// pressure takes it before another session's live boundary; nothing is freed by the signal.
+#[test]
+fn cell_session_end_demotes_to_cold_first_victim() {
+    let mut r = Rig::new(false, 1 << 20, 64, 2);
+    // Two sessions on different system prompts: under strict publish a second conversation
+    // on one system prompt goes through `shared_pair`, which is not what this cell tests.
+    let p1 = conv_prompt(50, 0, 240);
+    let p2 = conv_prompt(51, 0, 340);
+    r.turn_session(1, &p2, 30, 80_000);
+    let before = r.live();
+    r.turn_session_end(0, &p1, 30, 80_000, DemoteSignal::Header);
+    assert_eq!(r.kv().stats().session_end_header, 1);
+    assert_eq!(r.live(), before + 1, "a signal frees nothing: {}", r.dump());
+    let end1 = (p1.len() as u32 - 9) / 32 * 32;
+    let end2 = (p2.len() as u32 - 9) / 32 * 32;
+    {
+        let inner = r.kv().shared.inner.lock();
+        let s1 = inner
+            .published
+            .values()
+            .flatten()
+            .find(|s| s.rows == end1 && s.kind.has(Kind::PROMPT_END))
+            .expect("session 0's prompt end");
+        assert!(s1.cold() && s1.protect_until.is_none(), "cold and unprotected");
+    }
+    {
+        let mut inner = r.kv().shared.inner.lock();
+        assert!(evict_one(&r.kv().shared, &mut inner, false));
+    }
+    let rows: Vec<u32> = r.snaps().iter().map(|s| s.0).collect();
+    assert!(!rows.contains(&end1), "the ended session went first: {rows:?}");
+    assert!(rows.contains(&end2), "the live session stayed: {rows:?}");
+    r.check();
+}
+
+/// A retry (or a later turn) after the end signal still attaches the boundary and re-warms it.
+#[test]
+fn cell_session_end_retry_rewarms_the_boundary() {
+    let mut r = Rig::new(false, 1 << 20, 64, 2);
+    let p1 = conv_prompt(50, 0, 240);
+    let (_, reply) = r.turn_session_end(0, &p1, 30, 80_000, DemoteSignal::Abort);
+    assert_eq!(r.kv().stats().session_end_abort, 1);
+    let p2 = next_prompt(&p1, &reply, 4, 100, 91_000);
+    let (rows, _) = r.turn_session(0, &p2, 10, 80_000);
+    assert!(rows > 0, "attached after the signal: {}", r.dump());
+    let end2 = (p2.len() as u32 - 9) / 32 * 32;
+    let inner = r.kv().shared.inner.lock();
+    let s2 = inner
+        .published
+        .values()
+        .flatten()
+        .find(|s| s.rows == end2 && s.kind.has(Kind::PROMPT_END))
+        .expect("the new prompt end");
+    assert!(!s2.cold() && s2.protect_until.is_some(), "warm and protected again");
+}
+
+/// An abort signal on a sequence that never attached or published is a no-op.
+#[test]
+fn cell_session_end_without_boundary_is_noop() {
+    let r = Rig::new(false, 1 << 20, 64, 2);
+    r.kv().demote_session(1, DemoteSignal::Abort);
+    assert_eq!(r.kv().stats().session_end_abort, 0);
+    r.check();
 }

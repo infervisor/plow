@@ -2724,6 +2724,12 @@ pub struct GpuEngine {
     /// The slot's prompt rows are not determined by its ids (frame codes beside them): its first
     /// prefill chunk never attaches a cached prefix.
     prefix_attach_off: Vec<bool>,
+    /// The slot's request is its session's last turn (`X-Session-End`): the prefix cache drops
+    /// the session's boundary to the cold band at retire ([`Self::retire_slot`]).
+    session_end: Vec<bool>,
+    /// The slot's client disconnected before the response completed (the mux's
+    /// `disconnected`): demoted the same way (predictive: the boundary stays attachable).
+    disconnected: Vec<bool>,
     /// A launch's host window is open ([`Self::token_batch_step_window`]): snapshot restores skip
     /// their stream drain and their holds wait in `deferred_attach` for the step's own drain.
     window_open: bool,
@@ -7382,6 +7388,8 @@ impl GpuEngine {
             seq_tokens: vec![Vec::new(); batch],
             staged_prefix: vec![None; batch],
             prefix_attach_off: vec![false; batch],
+            session_end: vec![false; batch],
+            disconnected: vec![false; batch],
             window_open: false,
             deferred_attach: Vec::new(),
             window_event: None,
@@ -8106,6 +8114,20 @@ impl GpuEngine {
         }
     }
 
+    /// Slot `b`'s request is its session's last turn (`X-Session-End`).
+    pub fn set_session_end(&mut self, b: usize, end: bool) {
+        if b < self.batch {
+            self.session_end[b] = end;
+        }
+    }
+
+    /// Slot `b`'s client disconnected before its response completed.
+    pub fn note_disconnect(&mut self, b: usize) {
+        if b < self.batch {
+            self.disconnected[b] = true;
+        }
+    }
+
     pub fn retire_slot(&mut self, b: usize, cache_output: bool) {
         self.staged_prefix[b] = None;
         self.prefix_attach_off[b] = false;
@@ -8117,6 +8139,8 @@ impl GpuEngine {
         }
         self.slot_generations[b] = self.slot_generations[b].wrapping_add(1);
         self.reset_packed_admission(b);
+        let session_end = std::mem::take(&mut self.session_end[b]);
+        let disconnected = std::mem::take(&mut self.disconnected[b]);
         if !self.vmm_active[b] {
             if let Some(rings) = self.vmm.as_mut().and_then(|v| v.rings.as_mut()) {
                 rings.release_idle(b);
@@ -8126,6 +8150,18 @@ impl GpuEngine {
         // The turn-end pass: restores or touches the prompt end (the next turn's attach point).
         if cache_output {
             self.vmm_publish(b, self.pos[b]);
+        }
+        // After the publish, so the signal demotes the boundary this turn just touched and the
+        // request cannot re-protect it.
+        let signal = if session_end {
+            Some(crate::memory::vmm::DemoteSignal::Header)
+        } else if disconnected {
+            Some(crate::memory::vmm::DemoteSignal::Abort)
+        } else {
+            None
+        };
+        if let (Some(signal), Some((_, kv))) = (signal, self.vmm_prefix()) {
+            kv.demote_session(b, signal);
         }
         self.trace_finish(b);
         self.pos[b] = 0;

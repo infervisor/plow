@@ -977,6 +977,10 @@ pub struct VmmStats {
     pub sessions_protected: u64,
     pub session_demotions: u64,
     pub session_demoted_bytes: u64,
+    /// Session boundaries dropped to the cold LRU band on an end-of-session signal
+    /// ([`VmmKv::demote_session`]): the client's `X-Session-End`, or a disconnect.
+    pub session_end_header: u64,
+    pub session_end_abort: u64,
     /// Suffix eviction units (a boundary plus the blocks only it kept attachable) and the
     /// bytes they freed.
     pub eviction_units: u64,
@@ -1146,6 +1150,15 @@ enum Job {
     Refill,
     /// Reply once every job queued before this one has been processed.
     Sync(std::sync::mpsc::Sender<()>),
+}
+
+/// Why a session's boundary is demoted ([`VmmKv::demote_session`]).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum DemoteSignal {
+    /// The client said so (`X-Session-End`).
+    Header,
+    /// The client went away before the response completed: a prediction.
+    Abort,
 }
 
 /// What a boundary was published as (a bit set: a dedup ORs the publisher's kind in).
@@ -1930,8 +1943,27 @@ impl VmmKv {
     /// spills, a full tier drops its least recently used host snapshot. Every pinned chunk is
     /// allocated here, at bring-up (the first proves the backend has a host tier; a failed
     /// one caps the tier); the background thread only restores prefetches. Off by default.
+    ///
+    /// Pinned pages are host RAM nobody else can reclaim, so the cap is cut to `MemAvailable −
+    /// reserve_bytes` first: a 120 GB tier on a shared 249 GB box left two co-tenant compiler
+    /// runs nothing, and the kernel's OOM killer took the server (the largest RSS).
     pub fn enable_host_tier(&mut self, cap_bytes: u64, slot_bytes: u64) -> Result<()> {
         let s = &self.shared;
+        let cap_bytes = match host_mem_available() {
+            Some((avail, total)) if cap_bytes.saturating_add(host_reserve(total)) > avail => {
+                let reserve_bytes = host_reserve(total);
+                let allowed = avail.saturating_sub(reserve_bytes);
+                tracing::warn!(
+                    requested_mib = cap_bytes >> 20,
+                    available_mib = avail >> 20,
+                    reserve_mib = reserve_bytes >> 20,
+                    capped_mib = allowed >> 20,
+                    "vmm host tier: cap cut to leave the host its reserve"
+                );
+                allowed
+            }
+            _ => cap_bytes,
+        };
         let cap_slots = u32::try_from(cap_bytes / slot_bytes.max(1)).unwrap_or(u32::MAX);
         if slot_bytes == 0 || cap_slots == 0 {
             return Err(RuntimeError::Rejected(
@@ -2775,6 +2807,37 @@ impl VmmKv {
             return;
         }
         self.shared.inner.lock().awaited[seq] = None;
+    }
+
+    /// `seq`'s session ended (`signal`): its prompt-end boundary — the one it published or
+    /// attached — loses its session protection and drops to the cold LRU band, below every
+    /// boundary a live session may still return to, so pressure takes it first. Nothing is
+    /// freed here: the boundary stays hashed and attachable (a retry or a later turn of the
+    /// same session re-warms it on attach), so a wrong signal costs LRU position, not a
+    /// re-prefill. Called at retire, after the turn's own publish, so the request cannot
+    /// re-protect what it just demoted.
+    pub fn demote_session(&self, seq: usize, signal: DemoteSignal) {
+        if !self.prefix_reuse {
+            return;
+        }
+        let mut inner = self.shared.inner.lock();
+        inner.seqs[seq].session_ttl = None;
+        let Some(id) = inner.seqs[seq].ended.or(inner.seqs[seq].attached) else {
+            return;
+        };
+        inner.cold_tick += 1;
+        let cold = inner.cold_tick;
+        let Some(snap) = snap_mut(&mut inner, id).filter(|s| s.kind.has(Kind::PROMPT_END))
+        else {
+            return;
+        };
+        snap.protect_until = None;
+        snap.last_used = cold;
+        match signal {
+            DemoteSignal::Header => inner.stats.session_end_header += 1,
+            DemoteSignal::Abort => inner.stats.session_end_abort += 1,
+        }
+        tracing::debug!(seq, id, ?signal, "vmm prefix: session boundary demoted to cold");
     }
 
     /// A sequence still prefilling a prompt that shares whole blocks with `prompt`, when its
@@ -4722,6 +4785,24 @@ fn unwind_attach(
     s.frontier[seq].store(0, Ordering::Release);
     release_prefix_hold(s, inner, seq);
     orphans
+}
+
+/// `MemAvailable` of `/proc/meminfo` in bytes; `None` where it cannot be read.
+/// `(MemAvailable, MemTotal)` in bytes.
+fn host_mem_available() -> Option<(u64, u64)> {
+    let text = std::fs::read_to_string("/proc/meminfo").ok()?;
+    let field = |key: &str| -> Option<u64> {
+        let line = text.lines().find(|l| l.starts_with(key))?;
+        let kib: u64 = line.split_whitespace().nth(1)?.parse().ok()?;
+        Some(kib << 10)
+    };
+    Some((field("MemAvailable:")?, field("MemTotal:")?))
+}
+
+/// Host RAM the pinned tier leaves to the rest of the machine: an eighth of it, at least
+/// 16 GiB (pinned pages cannot be reclaimed; a co-tenant build must not OOM-kill the server).
+fn host_reserve(total: u64) -> u64 {
+    (total / 8).max(16 << 30)
 }
 
 /// A device buffer holding the snapshot at `host_ptr` (no lock held: `alloc_snapshot` takes it

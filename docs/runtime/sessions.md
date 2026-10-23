@@ -7,6 +7,7 @@ Every OpenAI route (`/v1/chat/completions`, `/v1/completions`, `/v1/audio/speech
 |---|---|
 | `X-Request-Id` | Names one request. Echoed on the response (and in every transcription SSE event, and the WebSocket `ready` event); generated when absent. Within a session, a request id already in flight there is refused with 409 (`duplicate_request_id`). No other dedupe. |
 | `X-Session-Id` | Names a session of one model. After each of its requests finishes, the request's KV stays in its slot for the session's next request. Without it a request behaves exactly as before. It also links the call's requests across models into turns (below). |
+| `X-Session-End` | `1`/`true`: this request is the session's last turn (body `metadata.session_end` is the same). The request still publishes its prompt end (a retry hits it); at retire the prefix cache drops the session's boundary to the cold LRU band, so pressure takes it before any live session's. Nothing is freed by the signal itself. |
 | `X-Turn-Id` | The turn (one user utterance → transcript → reply → speech) a request serves. Inferred when absent. |
 | `traceparent` | W3C trace context. The trace id is propagated; each request gets its own span id. Invalid → ignored (`tracestate` is not read). |
 | `X-Turn-Budget-Ms` | End of user speech → first agent audio target for the turn (default `--turn-budget-ms`, 1500). |
@@ -136,7 +137,9 @@ Two mechanisms, one per KV layout, never both:
   use (pressure takes it only once nothing unprotected is left), then demoted: the snapshot and
   the blocks only it kept attachable are freed, newest block first; a shared system prompt
   stays under LRU. A later turn after demotion attaches whatever ancestor survives. `0` = no
-  special retention (same as no header). The reuse shows
+  special retention (same as no header). `X-Session-End` (or a client that disconnected before
+  the response completed) ends the retention early: the boundary stays attachable but goes
+  first under pressure. The reuse shows
   in `usage.prompt_tokens_details.cached_tokens`; the header says `prefix-cache`. The prefix cache
   stays off for overlay packets (their rows are not keyed by ids).
 

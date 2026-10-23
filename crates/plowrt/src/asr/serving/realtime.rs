@@ -1048,6 +1048,7 @@ fn launch(
     let opts = AsrOpts {
         final_pass: true,
         ids: Some(RequestIds {
+            session_end: false,
             turn_key: run.key(),
             ..ids.with_new_request()
         }),

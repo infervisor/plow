@@ -1,6 +1,6 @@
 # 26 — Prefix cache retention and the KV block store
 
-**Status: design (2026-10-23), reviewed, retention simulated, nothing implemented.**
+**Status: design (2026-10-23), reviewed, retention simulated; Part A implemented (A1, A2), Part B in progress.**
 Part A says what actually moves the production hit rate and is implementable on today's
 snapshot cache. Part B is the content-addressed block store that replaces the boundary
 snapshots of `docs/arch/22-kv-cache.md` §7–§9 and the AMD `SharedPrefix` with one substrate,
@@ -123,6 +123,10 @@ today (9 GB / 261), so the effective budget is `41 GB = dev_snapshots × 121 MB 
 = ~900 retained sessions against 261 today (≈ the simulation's 141 GB total, between its 101
 and 191 GB columns). Allocation after model load in bounded chunks with partial-allocation
 fallback and transfer backpressure, after the 120 GB bring-up crash is root-caused (P0).
+Root cause (kernel log, 2026-10-22 06:44 UTC): the host OOM killer took plowrt (123 GB pinned
+RSS) beside two co-tenant compiler builds of ~27 GB each; nothing in the tier itself failed.
+Implemented: the cap is cut to `MemAvailable` minus an eighth of `MemTotal` (floor 16 GiB) at
+bring-up, with a warning. The reserve is derived, not a knob.
 Restore cost per host hit: 121 MB over PCIe Gen5 at the measured ~25 GB/s ≈ 4.8 ms on the
 attach path, against a 40–70 ms TTFT; spill is async off the engine thread. Host-hit latency,
 queue delay, spill/restore bytes, pinned RSS and p99 interference are reported separately from
@@ -155,7 +159,10 @@ starts the next generation and re-pins on attach (a retry is just that). Demotio
 that session's own pin: `SHARED_END` boundaries, other sessions' dependencies and transfer holds
 are untouched, and a boundary with in-flight attaches is demoted only when they complete.
 Abort/disconnect means the client closed the connection before the response completed;
-a normally completed response or stream is not a signal. Tests: end-before-publish,
+a normally completed response or stream is not a signal. Implemented: `X-Session-End: 1`
+(body `metadata.session_end`) and the mux's disconnect flag reach `retire_slot`, which demotes
+after the turn-end publish (`VmmKv::demote_session`: TTL cleared, boundary moved to the cold
+band, counted per signal). Both signals are always on; neither adds a knob. Tests: end-before-publish,
 concurrent turns of one session, retry after end, cancellation mid-attach — with value checks.
 
 ### A.3 What Part A does not change
@@ -419,10 +426,10 @@ MTP-on; final numbers come from `campaign.py report` in the strict format of
 | | content | gate |
 |---|---|---|
 | P0 | §4.0 measurements; vLLM 0.29 device-only and offload arms on gpu03 | — |
-| A1 | bounded snapshot host tier (today's mechanism, allocation after load, chunked), default off, recipe knob | 0(e), 3, 4, 6 |
-| A2 | session-end header in the serve API + demotion on header/abort/disconnect (A.2), metrics `demote_{header,abort,disconnect,ttl}_total` | 4 with the end-signal ablation, 5 |
+| A1 | bounded snapshot host tier (today's mechanism, allocation after load, chunked); cap derived from host RAM, no new knob | 0(e), 3, 4, 6 |
+| A2 | session-end header in the serve API + demotion on header/abort/disconnect (A.2), always on, metrics `session_end_{header,abort}_total` | 4 with the end-signal ablation, 5 |
 | A3 | production deploy of A1+A2 on gpu04 (user go) and the same-hour comparison the Grafana endpoint allows | strict report |
-| B1 | `memory/kv_store.rs`, CUDA ops, `Prefix` + `Window` (+ scales), block state machine, gather/scatter kernels, publish/attach at today's trigger points, today's eviction order, behind `PLOW_KV_STORE=1` (default off); TP=1; tier and demotion carried over | 1, 2, 3, 4 device-only, 5 |
+| B1 | `memory/kv_store.rs`, CUDA ops, `Prefix` + `Window` (+ scales), block state machine, gather/scatter kernels, publish/attach at today's trigger points, today's eviction order, behind `PLOW_KV_STORE` (off until its gates pass, then on; the switch exists only until B4 removes the old path); TP=1; tier and demotion carried over | 1, 2, 3, 4 device-only, 5 |
 | B2 | AMD: `SharedPrefix` and the per-slot route on the store; HIP gather | AMD rung + replay gates, when a box is available |
 | B3 | `State` class: capture op in the packet contract; GDN (Qwen3.8 27B), KDA (Kimi-K3) | 1 (state), 5 and replay on Qwen3.8 |
 | B4 | remove VMM multi-map, snapshot pool, strict publish, stale/park/recycle; rewrite `docs/arch/22` §7–9 | copy-amplification gate; all production recipes re-qualified |
@@ -431,6 +438,9 @@ Metrics (Part B): `plowrt_kv_store_{blocks,bytes}{class,tier}`, `publish_{blocks
 refused}_total`, `attach_{hits,misses,rows,wait}_total`, `attach_from_host_{total,bytes}`,
 `evict_{lru,spill}_total`, `migrations_inflight`; the `plowrt_prefix_*` names stay for the kept
 semantics.
+
+Knobs: the work adds no permanent tuning knob. Behaviour that qualifies becomes the default;
+`PLOW_KV_STORE` is a rollback switch for the qualification window and goes with B4.
 
 ## 6. Open questions
 
