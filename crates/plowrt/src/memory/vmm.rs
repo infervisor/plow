@@ -1201,6 +1201,15 @@ impl Snap {
         self.last_used < COLD_BAND
     }
 
+    /// Goes only once nothing unshielded is left: a session boundary inside its TTL, or a
+    /// shared end (system prompt) that has served more than one attach. Without the second
+    /// rule the shared ends are the only unprotected boundaries under load, so every first
+    /// turn missed its system prompt while the sessions themselves were kept.
+    fn shielded(&self, now: std::time::Instant) -> bool {
+        self.protect_until.is_some_and(|t| t > now)
+            || (self.kind.has(Kind::SHARED_END) && self.attaches >= 2 && !self.cold())
+    }
+
     /// Resident on the device and not being copied: the device LRU's candidates.
     fn on_device(&self) -> bool {
         matches!(
@@ -5281,8 +5290,8 @@ fn host_lru(inner: &Inner) -> Option<u64> {
         .filter(|snap| {
             snap.users == 0 && snap.store.on_host() && !snap_awaited(&inner.awaited, snap)
         })
-        // A session boundary inside its TTL goes last here too.
-        .min_by_key(|snap| (snap.protect_until.is_some_and(|t| t > now), snap.last_used))
+        // A shielded boundary goes last here too.
+        .min_by_key(|snap| (snap.shielded(now), snap.last_used))
         .map(|snap| snap.id)
 }
 
@@ -5312,7 +5321,7 @@ fn spill_unit(s: &Shared, inner: &mut Inner, id: u64) -> bool {
     if tier.free.is_empty() {
         let now = std::time::Instant::now();
         let protected =
-            |id: u64| snap_ref(inner, id).is_some_and(|x| x.protect_until.is_some_and(|t| t > now));
+            |id: u64| snap_ref(inner, id).is_some_and(|x| x.shielded(now));
         match host_lru(inner) {
             // An unprotected victim never displaces a session boundary inside its TTL: it is
             // freed instead (the caller's fallback).
@@ -5350,7 +5359,7 @@ fn spill_blocks(s: &Shared, inner: &mut Inner, id: u64, handle: u64) -> bool {
     if !spilled {
         let now = std::time::Instant::now();
         let protected =
-            |id: u64| snap_ref(inner, id).is_some_and(|x| x.protect_until.is_some_and(|t| t > now));
+            |id: u64| snap_ref(inner, id).is_some_and(|x| x.shielded(now));
         match host_lru(inner) {
             Some(victim) if protected(victim) && !protected(id) => {}
             Some(victim)
@@ -5415,7 +5424,15 @@ fn snapshots_free(list: &[Snap], awaited: &[Option<Await>]) -> bool {
     list.iter().all(|snap| {
         snap.users == 0
             && !snap_awaited(awaited, snap)
-            && matches!(snap.store, SnapStore::Device(_) | SnapStore::Host(_))
+            && matches!(
+                snap.store,
+                SnapStore::Device(_)
+                    | SnapStore::Host(_)
+                    | SnapStore::Blocks {
+                        state: BlockState::Device | BlockState::Host,
+                        ..
+                    }
+            )
     })
 }
 
@@ -8190,6 +8207,43 @@ mod tests {
         }
         p.begin_seq(0);
         assert_eq!(p.cached_rows(&b), 0, "idle chunk end outlived LRU pressure");
+        assert!(p.stats().cache_bytes <= 512);
+        policy::check_tree(&p.shared.inner.lock());
+    }
+
+    /// A shared end that served two attaches is shielded like a session inside its TTL: idle
+    /// unique prompts push the pool past its cap, and it stays while any unshielded boundary
+    /// is left to evict.
+    #[test]
+    fn shared_end_in_use_outlives_unshielded_boundaries_under_pressure() {
+        let ops = Arc::new(MockVmm::default());
+        let p = pool_with_cap(ops, 512);
+        let a = prompt(17);
+        p.try_attach(0, &a).unwrap();
+        p.ensure_rows(0, 17).unwrap();
+        p.publish_kind(0, &a, 8, Kind::SHARED_END, 48, |_| Ok(()))
+            .unwrap();
+        p.begin_seq(0);
+        let mut b = a[..8].to_vec();
+        b.extend((0..9).map(|i| 900 + i));
+        for _ in 0..2 {
+            assert_eq!(p.try_attach(1, &b).unwrap().expect("shared end").rows, 8);
+            p.finish_attach(1);
+            p.begin_seq(1);
+        }
+        let mut ever_evicted = 0;
+        for first in 100..120u32 {
+            let mut u = prompt(17);
+            u[0] = first;
+            p.begin_seq(0);
+            p.try_attach(0, &u).unwrap();
+            p.ensure_rows(0, 17).unwrap();
+            p.publish_at(0, &u, 16, 48, |_| Ok(())).unwrap();
+            ever_evicted = p.stats().snapshots_evicted;
+        }
+        p.begin_seq(0);
+        assert!(ever_evicted > 0, "no pressure");
+        assert_eq!(p.cached_rows(&b), 8, "shared end in use evicted under pressure");
         assert!(p.stats().cache_bytes <= 512);
         policy::check_tree(&p.shared.inner.lock());
     }

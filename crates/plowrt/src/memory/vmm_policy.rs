@@ -158,8 +158,9 @@ pub(super) fn evict_one_tree(s: &Shared, inner: &mut Inner, preserve_hot: bool) 
     }
     let awaited = inner.awaited.clone();
     // One LRU key; the newest boundary goes when it is the last candidate (the request that
-    // published it is held by its lease, not by its snapshot). A session boundary inside its
-    // TTL goes only once nothing unprotected is left, the host tier's entries included.
+    // published it is held by its lease, not by its snapshot). A shielded boundary (session
+    // inside its TTL, shared end in use) goes only once nothing unshielded is left, the host
+    // tier's entries included.
     // The soft-cap trim (`preserve_hot`) keeps the most recently used boundary while a live
     // request maps its blocks (production's MRU exemption, without its tier); allocation OOM
     // may take it.
@@ -184,7 +185,7 @@ pub(super) fn evict_one_tree(s: &Shared, inner: &mut Inner, preserve_hot: bool) 
             .flatten()
             .filter(|snap| snap.users == 0 && snap.on_device() && !snap_awaited(&awaited, snap))
             .filter(|snap| Some(snap.id) != hot)
-            .filter(|snap| snap.protect_until.is_some_and(|t| t > now) == protected)
+            .filter(|snap| snap.shielded(now) == protected)
             .min_by_key(|snap| snap.last_used)
             .map(|snap| snap.id)
     };
