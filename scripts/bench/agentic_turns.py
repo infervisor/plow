@@ -489,13 +489,15 @@ def main(argv=None):
     o.add_argument("--prod-fidelity", action="store_true",
                    help="shape the open-loop mix like the G26 production capture (2026-10-14): ~2K shared "
                         "system prompt, ~3.6K first message, ~100-token later turns, 5 turns mean, prompts "
-                        "under 8K, 10 s median think; overrides those shape args")
+                        "under 8K, 10 s median think; sets those shape args unless given explicitly")
     o.add_argument("--max-model-len", type=int, default=16384)
     o.add_argument("--template-margin", type=int, default=512, help="tokens held back for the chat template")
     o.add_argument("--slo-ttft-ms", type=float, default=2000)
     o.add_argument("--slo-tpot-ms", type=float, default=100)
     args = ap.parse_args(argv)
     if args.prod_fidelity:
+        # Flags given explicitly on the command line win over the production shape.
+        given = {a.split("=", 1)[0] for a in (sys.argv[1:] if argv is None else argv)}
         # Production (plowrt metrics, 10.9K requests): prompt mean 5680 tokens, 99.5% <= 8192; computed
         # rows bimodal, 64% <= 512 (continuations) and 33% in 2K-8K (first turns, misses); 46 output
         # tokens. vLLM there caches 82%: its LRU keeps a session's prefix only for pool / (req/s x
@@ -504,7 +506,8 @@ def main(argv=None):
         for k, v in dict(apps=4, system_median=2000, system_sigma=0.3, first_median=3600, first_sigma=0.35,
                          tool_median=100, tool_sigma=0.8, turns_mean=5, out_median=46, out_sigma=0.6,
                          max_model_len=8192, think_median_s=10.0, think_sigma=0.8, think_max_s=120.0).items():
-            setattr(args, k, v)
+            if "--" + k.replace("_", "-") not in given:
+                setattr(args, k, v)
     if not args.open_loop and not args.sessions:
         ap.error("--sessions is required without --open-loop")
     args.url = args.url.rstrip("/")
