@@ -333,6 +333,14 @@ pub struct StoreStats {
     pub compact_bytes: u64,
     /// Device bytes reserved in chunks (used + holes).
     pub device_reserved_bytes: u64,
+    /// Chunk allocations per tier and the wall time they took (the pool lock is held).
+    pub device_grows: u64,
+    pub device_grow_us: u64,
+    pub host_grows: u64,
+    pub host_grow_us: u64,
+    /// Wall time in `spill` and `shrink` (both run under the pool lock).
+    pub spill_us: u64,
+    pub shrink_us: u64,
 }
 
 struct Inner {
@@ -645,10 +653,18 @@ impl KvStore {
         let ops = &self.ops;
         let reserved: u64 = inner.classes.iter().map(|c| c.device.reserved_bytes()).sum();
         let budget = inner.device_cap.saturating_sub(reserved);
-        if let Some(s) = inner.classes[class]
-            .device
-            .take(budget, |bytes| ops.alloc(bytes))?
-        {
+        let mut grow_us = None;
+        let taken = inner.classes[class].device.take(budget, |bytes| {
+            let t = std::time::Instant::now();
+            let r = ops.alloc(bytes);
+            grow_us = Some(t.elapsed().as_micros() as u64);
+            r
+        });
+        if let Some(us) = grow_us {
+            inner.stats.device_grows += 1;
+            inner.stats.device_grow_us += us;
+        }
+        if let Some(s) = taken? {
             return Ok(s);
         }
         // Reclaim in release order; stale entries (re-acquired, dropped, wrong tier) are
@@ -752,6 +768,7 @@ impl KvStore {
         if inner.host_cap == 0 {
             return false;
         }
+        let t0 = std::time::Instant::now();
         let mut all = true;
         for &id in ids {
             let Some(b) = inner.blocks[id as usize].as_ref() else {
@@ -788,6 +805,7 @@ impl KvStore {
                 }
             }
         }
+        inner.stats.spill_us += t0.elapsed().as_micros() as u64;
         all
     }
 
@@ -795,11 +813,18 @@ impl KvStore {
         let ops = &self.ops;
         let reserved: u64 = inner.classes.iter().map(|c| c.host.reserved_bytes()).sum();
         let budget = inner.host_cap.saturating_sub(reserved);
-        let taken = inner.classes[class]
-            .host
-            .take(budget, |bytes| ops.host_alloc(bytes))
-            .ok()?;
-        if let Some(s) = taken {
+        let mut grow_us = None;
+        let taken = inner.classes[class].host.take(budget, |bytes| {
+            let t = std::time::Instant::now();
+            let r = ops.host_alloc(bytes);
+            grow_us = Some(t.elapsed().as_micros() as u64);
+            r
+        });
+        if let Some(us) = grow_us {
+            inner.stats.host_grows += 1;
+            inner.stats.host_grow_us += us;
+        }
+        if let Some(s) = taken.ok()? {
             return Some(s);
         }
         // The oldest zero-dependent host block of this class gives up its slot; stale entries
@@ -893,6 +918,13 @@ impl KvStore {
     /// then become reclaimable and the chunks they sit in releasable.
     pub fn shrink(&self, bytes: u64) -> u64 {
         let mut inner = self.inner.lock();
+        let t0 = std::time::Instant::now();
+        let released = self.shrink_locked(&mut inner, bytes);
+        inner.stats.shrink_us += t0.elapsed().as_micros() as u64;
+        released
+    }
+
+    fn shrink_locked(&self, inner: &mut Inner, bytes: u64) -> u64 {
         let mut released = 0u64;
         for ci in 0..inner.classes.len() {
             // Every live chunk is checked before 0 is returned: the pool evicts a boundary on 0.
@@ -914,7 +946,7 @@ impl KvStore {
                     continue;
                 }
                 for id in ids {
-                    self.drop_block(&mut inner, id);
+                    self.drop_block(inner, id);
                     inner.stats.evictions += 1;
                 }
                 released += inner.classes[ci]
@@ -969,7 +1001,7 @@ impl KvStore {
                             requeue.push(id);
                             continue;
                         }
-                        self.drop_block(&mut inner, id);
+                        self.drop_block(inner, id);
                         inner.stats.evictions += 1;
                         deficit -= 1;
                     }
@@ -986,7 +1018,7 @@ impl KvStore {
                         continue;
                     };
                     if b.dependents == 0 {
-                        self.drop_block(&mut inner, id);
+                        self.drop_block(inner, id);
                         inner.stats.evictions += 1;
                         continue;
                     }

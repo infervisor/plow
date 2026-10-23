@@ -2398,6 +2398,12 @@ fn kv_store_metrics(state: &AppState, out: &mut String) {
         ("compactions_total", "counter", "Live blocks moved so that a chunk could be released."),
         ("compact_bytes_total", "counter", "Bytes those moves copied."),
         ("device_reserved_bytes", "gauge", "Device bytes reserved in chunks (used plus holes)."),
+        ("device_grows_total", "counter", "Device chunk allocations."),
+        ("device_grow_us_total", "counter", "Microseconds in device chunk allocations (pool lock held)."),
+        ("host_grows_total", "counter", "Host tier chunk allocations."),
+        ("host_grow_us_total", "counter", "Microseconds in host tier chunk allocations (pool lock held)."),
+        ("spill_us_total", "counter", "Microseconds in spills (pool lock held)."),
+        ("shrink_us_total", "counter", "Microseconds in shrinks and compaction (pool lock held)."),
         ("publishes_total", "counter", "Boundaries published into the store."),
         ("publish_us_total", "counter", "Engine-thread microseconds in publishes."),
         ("publish_sync_us_total", "counter", "Of which draining the stream."),
@@ -2438,6 +2444,12 @@ fn kv_store_metrics(state: &AppState, out: &mut String) {
              plowrt_kv_store_compactions_total{{model=\"{slug}\"}} {}\n\
              plowrt_kv_store_compact_bytes_total{{model=\"{slug}\"}} {}\n\
              plowrt_kv_store_device_reserved_bytes{{model=\"{slug}\"}} {}\n\
+             plowrt_kv_store_device_grows_total{{model=\"{slug}\"}} {}\n\
+             plowrt_kv_store_device_grow_us_total{{model=\"{slug}\"}} {}\n\
+             plowrt_kv_store_host_grows_total{{model=\"{slug}\"}} {}\n\
+             plowrt_kv_store_host_grow_us_total{{model=\"{slug}\"}} {}\n\
+             plowrt_kv_store_spill_us_total{{model=\"{slug}\"}} {}\n\
+             plowrt_kv_store_shrink_us_total{{model=\"{slug}\"}} {}\n\
              plowrt_kv_store_publishes_total{{model=\"{slug}\"}} {}\n\
              plowrt_kv_store_published_blocks_total{{model=\"{slug}\"}} {}\n\
              plowrt_kv_store_published_new_blocks_total{{model=\"{slug}\"}} {}\n\
@@ -2462,6 +2474,12 @@ fn kv_store_metrics(state: &AppState, out: &mut String) {
             s.store.compactions,
             s.store.compact_bytes,
             s.store.device_reserved_bytes,
+            s.store.device_grows,
+            s.store.device_grow_us,
+            s.store.host_grows,
+            s.store.host_grow_us,
+            s.store.spill_us,
+            s.store.shrink_us,
             s.publishes,
             s.published_blocks,
             s.published_new_blocks,
