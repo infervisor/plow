@@ -148,13 +148,14 @@ enum Mode { FP32, BF16, INT, F64 };
 /* pre: a GPU instruction run first (preparing an input); ref: the golden's instruction (c.in). */
 static void run(const char* name, Case& c, golden_fn golden, std::vector<unsigned> outs, Mode mode,
                 double tol = 1e-5, size_t flips = 0, const PlowDevInst* pre = nullptr,
-                const PlowDevInst* ref_in = nullptr) {
+                const PlowDevInst* ref_in = nullptr, size_t npre = 1) {
     c.upload();
     std::vector<void*> th;
     for (auto& h : c.host) th.push_back(h.data());
     golden(ref_in ? ref_in : &c.in, 0, 1, th.data(), nullptr);
     void** td = upload_table(c.dev);
-    if (pre) k_speech<<<g_nblk, 256, kSmem>>>(*pre, td);
+    if (pre)
+        for (size_t i = 0; i < npre; i++) k_speech<<<g_nblk, 256, kSmem>>>(pre[i], td);
     k_speech<<<g_nblk, 256, kSmem>>>(c.in, td);
     CK(cudaGetLastError());
     CK(cudaDeviceSynchronize());
@@ -1390,6 +1391,170 @@ static void bench_signal() {
     }
 }
 
+static std::vector<uint32_t> fetch(Case& c, unsigned id) {
+    std::vector<uint32_t> v(c.host[id].size() / 4);
+    CK(cudaMemcpy(v.data(), c.dev[id], c.host[id].size(), cudaMemcpyDeviceToHost));
+    return v;
+}
+static void verdict(const char* name, const char* what, bool pass) {
+    printf("  %-34s %s -> %s\n", name, what, pass ? "PASS" : "FAIL");
+    if (!pass) g_fail = 1;
+}
+
+/* Per-item prefix rows (AttentionF32 flags bit 5, t5 = pre_b per item). Separate Q/K/V; own K/V
+ * rows past each item's length are NaN / 1e30; prefix rows no user of a block reads are NaN
+ * (fp32 / tc routes) or, for h16, formatted tiles past the last one any user reads are NaN.
+ * route: 0 fp32 kernel (tc flag off), 1 tc (kernel chosen by q_rows), 2 h16. When every
+ * pre_b >= i7 the output is also compared bitwise with the flag-off instruction. */
+static void t_attention_prefix_rows(const char* name, int route, unsigned batch, unsigned q_rows, unsigned hw,
+                                    unsigned pre, unsigned blocks, std::vector<uint32_t> index,
+                                    std::vector<uint32_t> rows, std::vector<uint32_t> lengths) {
+    Case c;
+    const unsigned heads = 4, width = heads * hw, kv_rows = 50;
+    auto pre_b = [&](unsigned b) { return std::min(rows[b], pre); };
+    auto klen = [&](unsigned b) {
+        const unsigned all = pre_b(b) + kv_rows;
+        return lengths.empty() ? all : std::min(lengths[b], all);
+    };
+    unsigned o = c.out((size_t)batch * q_rows * width);
+    unsigned q = c.f32((size_t)batch * q_rows * width, 1.f);
+    unsigned k = c.f32((size_t)batch * kv_rows * width, 1.f);
+    unsigned v = c.f32((size_t)batch * kv_rows * width, 1.f);
+    unsigned pf = c.f32((size_t)blocks * pre * 2 * width, 1.f);
+    unsigned ix = c.u32(index), pr = c.u32(rows);
+    unsigned l = lengths.empty() ? PLOW_TENSOR_NONE : c.u32(lengths);
+    std::vector<unsigned> used(blocks, 0);
+    for (unsigned b = 0; b < batch; b++)
+        used[index[b]] = std::max(used[index[b]], route == 2 ? pre_b(b) : std::min(pre_b(b), klen(b)));
+    if (route != 2) {
+        float* P = (float*)c.host[pf].data();
+        for (unsigned blk = 0; blk < blocks; blk++)
+            for (size_t e = ((size_t)blk * pre + used[blk]) * 2 * width; e < (size_t)(blk + 1) * pre * 2 * width; e++)
+                P[e] = NAN;
+    }
+    float *K = (float*)c.host[k].data(), *V = (float*)c.host[v].data();
+    for (unsigned b = 0; b < batch; b++) {
+        const unsigned own = klen(b) > pre_b(b) ? klen(b) - pre_b(b) : 0u;
+        for (size_t e = ((size_t)b * kv_rows + own) * width; e < (size_t)(b + 1) * kv_rows * width; e++) {
+            K[e] = NAN;
+            V[e] = 1e30f;
+        }
+    }
+    c.in.op = PLOW_DOP_ATTENTION_F32;
+    c.in.t[0] = o; c.in.t[1] = q; c.in.t[2] = k; c.in.t[3] = v; c.in.t[4] = l; c.in.t[5] = pr;
+    c.in.t[6] = pf; c.in.t[7] = ix;
+    c.in.i[0] = batch; c.in.i[1] = q_rows; c.in.i[2] = kv_rows; c.in.i[3] = heads; c.in.i[4] = hw;
+    c.in.i[5] = 0; c.in.i[6] = (route ? 2u : 0u) | 32u; c.in.i[7] = pre;
+    c.in.fj[0].f = 0.125f;
+    const PlowDevInst ref = c.in;
+    std::vector<PlowDevInst> pres;
+#if defined(PLOW_NV_HOPPER)
+    if (route == 2) {
+        const unsigned npt = (pre + SPH_KT - 1) / SPH_KT, blk_floats = heads * npt * SPH_XS;
+        unsigned fm = c.out((size_t)blocks * blk_floats);
+        unsigned nan = c.out(blk_floats);
+        PlowDevInst f;
+        memset(&f, 0, sizeof(f));
+        for (auto& x : f.t) x = PLOW_TENSOR_NONE;
+        f.op = PLOW_DOP_COPY_COLS_F32;
+        f.t[0] = fm; f.t[1] = pf;
+        f.i[0] = blocks; f.i[1] = pre; f.i[2] = 2 * width; f.i[3] = 2 * width; f.i[7] = 1;
+        f.fj[1].u = pre * 2 * width; f.fj[2].u = blk_floats;
+        pres.push_back(f);
+        for (unsigned blk = 0; blk < blocks; blk++) {
+            const unsigned nu = (used[blk] + SPH_KT - 1) / SPH_KT;
+            if (nu == npt) continue;
+            PlowDevInst z = f;
+            z.t[1] = nan;
+            z.i[0] = heads; z.i[1] = 1; z.i[2] = (npt - nu) * SPH_XS; z.i[3] = 0; z.i[4] = 0; z.i[5] = 0;
+            z.i[6] = blk * blk_floats + nu * SPH_XS; z.i[7] = 0;
+            z.fj[1].u = 0; z.fj[2].u = npt * SPH_XS;
+            pres.push_back(z);
+        }
+        c.in.i[6] |= 16u;
+        c.in.t[6] = fm;
+    }
+#endif
+    run(name, c, g_attention_f32, {o}, FP32, 2e-5, 0, pres.empty() ? nullptr : pres.data(), &ref, pres.size());
+    bool full = true;
+    for (unsigned b = 0; b < batch; b++) full = full && rows[b] >= pre;
+    if (full) {
+        const std::vector<uint32_t> on = fetch(c, o);
+        PlowDevInst off = c.in;
+        off.i[6] &= ~32u;
+        off.t[5] = PLOW_TENSOR_NONE;
+        launch(off, c.dev);
+        verdict(name, "bitwise == flag off", fetch(c, o) == on);
+    }
+}
+
+/* CopyColsF32 flags bit 1 (plain): items land at group g; capacity in flag bits 8..31. */
+static void t_copy_cols_group(const char* name, unsigned g, unsigned capacity) {
+    Case c;
+    const unsigned items = 2, rows = 40, cols = 80, in_stride = 96, out_stride = 88;
+    unsigned o = c.out((size_t)capacity * rows * out_stride);
+    unsigned x = c.f32((size_t)items * rows * in_stride, 1.f);
+    unsigned gb = c.u32({g});
+    c.in.op = PLOW_DOP_COPY_COLS_F32; c.in.t[0] = o; c.in.t[1] = x; c.in.t[2] = gb;
+    c.in.i[0] = items; c.in.i[1] = rows; c.in.i[2] = cols; c.in.i[3] = in_stride; c.in.i[4] = 8;
+    c.in.i[5] = out_stride; c.in.i[6] = 3; c.in.i[7] = 2u | capacity << 8;
+    c.in.fj[1].u = rows * in_stride; c.in.fj[2].u = rows * out_stride;
+    run(name, c, g_copy_cols_f32, {o}, FP32, 0.0);
+}
+
+#if defined(PLOW_NV_HOPPER)
+/* CopyColsF32 format mode with a group: equals an ungrouped format shifted by g * items blocks;
+ * out-of-capacity groups write nothing; a short item over a long one leaves the short format's
+ * tiles exactly as a fresh write and the long one's later tiles untouched. */
+static void t_format_group() {
+    const char* name = "CopyColsF32 h16 format group";
+    Case c;
+    const unsigned heads = 4, width = heads * 64, items = 2, L = 45, S = 20, cap = 6;
+    const unsigned blk = heads * ((L + SPH_KT - 1) / SPH_KT) * SPH_XS;
+    const unsigned ns = heads * ((S + SPH_KT - 1) / SPH_KT) * SPH_XS;
+    unsigned xl = c.f32((size_t)items * L * 2 * width, 1.f), xs = c.f32((size_t)items * L * 2 * width, 1.f);
+    unsigned fresh = c.out((size_t)cap * blk), grp = c.out((size_t)cap * blk), guard = c.out((size_t)cap * blk);
+    unsigned freshs = c.out((size_t)cap * blk), reuse = c.out((size_t)cap * blk);
+    unsigned g2 = c.u32({2}), g0 = c.u32({0});
+    c.upload();
+    PlowDevInst f;
+    memset(&f, 0, sizeof(f));
+    for (auto& t : f.t) t = PLOW_TENSOR_NONE;
+    f.op = PLOW_DOP_COPY_COLS_F32;
+    f.i[0] = items; f.i[1] = L; f.i[2] = 2 * width; f.i[3] = 2 * width; f.i[7] = 1;
+    f.fj[1].u = L * 2 * width; f.fj[2].u = blk;
+    auto go = [&](unsigned out, unsigned x, unsigned rows, int g, unsigned capacity) {
+        PlowDevInst i = f;
+        i.t[0] = out; i.t[1] = x; i.i[1] = rows;
+        if (g >= 0) {
+            i.t[2] = g == 2 ? g2 : g0;
+            i.i[7] = 1u | 2u | capacity << 8;
+        }
+        launch(i, c.dev);
+    };
+    go(fresh, xl, L, -1, 0);
+    go(grp, xl, L, 2, cap);
+    go(guard, xl, L, 2, cap - 1);
+    go(freshs, xs, S, 0, cap);
+    go(reuse, xl, L, 2, cap);
+    go(reuse, xs, S, 2, cap);
+    const std::vector<uint32_t> a = fetch(c, fresh), b = fetch(c, grp), z = fetch(c, guard);
+    const std::vector<uint32_t> fs = fetch(c, freshs), r = fetch(c, reuse);
+    bool shift = true, none = true, tail = true;
+    for (size_t e = 0; e < (size_t)cap * blk; e++) {
+        const size_t it = e / blk, w = e % blk;
+        const bool in2 = it >= 2 * items && it < 3 * items;
+        shift = shift && b[e] == (in2 ? a[e - 2 * items * blk] : 0x7fc00badu);
+        none = none && z[e] == 0x7fc00badu;
+        const uint32_t want = !in2 ? 0x7fc00badu : w < ns ? fs[e - 2 * items * blk] : b[e];
+        tail = tail && r[e] == want;
+    }
+    verdict(name, "g=2 == ungrouped shifted", shift);
+    verdict(name, "(g+1)*items > capacity writes nothing", none);
+    verdict(name, "long->short reuse == fresh short", tail);
+}
+#endif
+
 int main(int argc, char** argv) {
     cudaDeviceProp prop;
     CK(cudaGetDeviceProperties(&prop, 0));
@@ -1844,6 +2009,47 @@ int main(int argc, char** argv) {
     t_conv("Conv2dF32 fcm 1x1 s(1,2) shortcut tc-3xtf32", 1, 150, 80, 32, 32, 1, 1, 0, 0, 512 | 64 | (2u << 16));
     t_conv("Conv2dF32 3x3 s(2,1) tc-bf16 wide", 2, 64, 50, 48, 320, 3, 2, 1, 1, 256 | 64 | (2 << 2) | (1u << 16));
     t_conv("Conv2dF32 depthwise s(1,3) f16 NCFW in", 2, 17, 31, 24, 24, 3, 1, 1, 1, 1 | (2 << 4) | (3u << 16));
+    /* Per-item prefix rows (AttentionF32 flag bit 5) on every route, and CopyColsF32 groups. */
+    {
+        const std::vector<uint32_t> idx = {0, 1, 0, 2, 1, 0, 2, 0};
+        const std::vector<uint32_t> sweep45 = {0, 1, 15, 16, 17, 44, 45, 900};
+        const std::vector<uint32_t> sweep48 = {17, 0, 47, 1, 48, 16, 15, 2};
+        /* cutting inside the own region, inside the prefix, and past the end */
+        const std::vector<uint32_t> len45 = {3, 1, 40, 16, 20, 60, 47, 90};
+        const std::vector<uint32_t> full = {45, 45, 45, 1000, 45, 45, 45, 45};
+        struct R { const char* name; int route; unsigned q, hw; };
+        const R routes[] = {
+            {"fp32 hw64", 0, 40, 64},   {"fp32 hw128", 0, 20, 128}, {"fp32 ragged hw72", 0, 33, 72},
+            {"tc64", 1, 16, 64},        {"tc64p<16,5>", 1, 40, 64}, {"tc64p<24,3>", 1, 72, 64},
+            {"tc64p<32,2>", 1, 136, 64},
+#if defined(PLOW_NV_HOPPER)
+            {"h16<3>", 2, 72, 64},      {"h16<2>", 2, 136, 64},
+#endif
+        };
+        for (const R& r : routes) {
+            char name[96];
+            snprintf(name, sizeof(name), "pre_b %s i7=45 sweep", r.name);
+            t_attention_prefix_rows(name, r.route, 8, r.q, r.hw, 45, 3, idx, sweep45, {});
+            snprintf(name, sizeof(name), "pre_b %s i7=45 lengths", r.name);
+            t_attention_prefix_rows(name, r.route, 8, r.q, r.hw, 45, 3, idx, sweep45, len45);
+            snprintf(name, sizeof(name), "pre_b %s i7=48 mixed", r.name);
+            t_attention_prefix_rows(name, r.route, 8, r.q, r.hw, 48, 3, {2, 2, 0, 1, 1, 0, 2, 0}, sweep48, {});
+            snprintf(name, sizeof(name), "pre_b %s all zero", r.name);
+            t_attention_prefix_rows(name, r.route, 8, r.q, r.hw, 45, 3, idx, std::vector<uint32_t>(8, 0), len45);
+            snprintf(name, sizeof(name), "pre_b %s full", r.name);
+            t_attention_prefix_rows(name, r.route, 8, r.q, r.hw, 45, 3, idx, full, {});
+            snprintf(name, sizeof(name), "pre_b %s full lengths", r.name);
+            t_attention_prefix_rows(name, r.route, 8, r.q, r.hw, 45, 3, idx, full, len45);
+        }
+        t_copy_cols_group("CopyColsF32 group g=0", 0, 6);
+        t_copy_cols_group("CopyColsF32 group g=2 (at capacity)", 2, 6);
+        t_copy_cols_group("CopyColsF32 group g=1 cap 4", 1, 4);
+        t_copy_cols_group("CopyColsF32 group g=3 guard", 3, 6);
+        t_copy_cols_group("CopyColsF32 group g=max guard", 0xFFFFFFFFu, 6);
+#if defined(PLOW_NV_HOPPER)
+        t_format_group();
+#endif
+    }
 
     if (argc > 1 && !strcmp(argv[1], "--bench")) {
         bench_signal();

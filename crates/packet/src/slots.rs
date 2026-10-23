@@ -321,7 +321,7 @@ const DOC: &[S] = &[
     S { op: DevOp::SampleFishBf16, t: &["out", "logits", "params", "top_k", "seed", "step", "history?", "out_flat?"], i: &["rows", "vocab", "out_stride", "out_col0", "coord", "ras_window", "flags", "logit_stride"], f: &[], j: &["ras_limit"] },
     S { op: DevOp::EmbedOverlayBf16, t: &["out", "table", "tokens", "overlay", "overlay_index"], i: &["rows", "width", "vocab", "overlay_rows"], f: &[], j: &[] },
     S { op: DevOp::GatherRowsF32, t: &["out", "table", "index?"], i: &["rows", "width", "vocab", "rows_per_item", "repeat", "index_item_stride", "table_item_stride", "flags"], f: &[], j: &["out_stride", "out_col0"] },
-    S { op: DevOp::CopyColsF32, t: &["out", "x"], i: &["items", "rows", "cols", "in_stride", "in_offset", "out_stride", "out_offset", "flags"], f: &[], j: &["in_item_stride", "out_item_stride"] },
+    S { op: DevOp::CopyColsF32, t: &["out", "x", "group?"], i: &["items", "rows", "cols", "in_stride", "in_offset", "out_stride", "out_offset", "flags"], f: &[], j: &["in_item_stride", "out_item_stride"] },
     S { op: DevOp::StreamTailF32, t: &["z?", "src", "state", "slot", "n", "pos?"], i: &["B", "L", "N", "C", "Cz", "zc0", "src_stride", "mode"], f: &[], j: &["slots"] },
     S { op: DevOp::Conv1dF32, t: &["out", "x", "weight", "bias?", "alpha?", "residual?", "lengths?", "row_scale?"], i: &["batch", "in_rows", "in_channels", "out_channels", "kernel", "stride", "dilation", "groups"], f: &["slope"], j: &["pads", "flags"] },
     S { op: DevOp::ConvTranspose1dF32, t: &["out", "x", "weight", "bias?", "alpha?", "residual?", "lengths?"], i: &["batch", "in_rows", "in_channels", "out_channels", "kernel", "stride", "output_padding", "groups"], f: &["slope"], j: &["crops", "flags"] },

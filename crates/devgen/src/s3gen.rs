@@ -919,6 +919,7 @@ impl<'s> Ops<'s> {
                     out_stride: dst.1,
                     out_offset: dst.2,
                 },
+                None,
             )
         })
     }
@@ -948,6 +949,7 @@ impl<'s> Ops<'s> {
                     out_stride: 0,
                     out_offset: dst.1,
                 },
+                None,
             )
         })
     }
@@ -1897,6 +1899,7 @@ impl Lowering<'_> {
                                 blocks: nv2,
                                 rows: pp,
                                 h16: self.cfg.attn_h16,
+                                rows_per_item: None,
                             }),
                             window: 0,
                             stream: None,

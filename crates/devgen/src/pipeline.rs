@@ -736,6 +736,9 @@ pub struct AttentionPrefix {
     pub blocks: u32,
     pub rows: u32,
     pub h16: bool,
+    /// u32[batch] (flag bit 5): item `b` reads only the first `min(rows_per_item[b], rows)` rows
+    /// of its block; its own keys follow them directly.
+    pub rows_per_item: Option<u32>,
 }
 
 /// Floats of one block of a pre-formatted attention prefix (`AttentionF32` flag bit 4): per
@@ -1387,11 +1390,14 @@ impl StageProgram {
         )
     }
 
+    /// With `group` (u32[1], flag bit 1) the items land at output items `g*items ..` with `g`
+    /// read on device; a `g` whose items would pass the output tensor's end writes nothing.
     pub fn copy_cols_f32(
         &mut self,
         x: u32,
         deps: &[u32],
         stage: CopyColsF32Stage<'_>,
+        group: Option<u32>,
     ) -> Result<Emitted, String> {
         if stage.items == 0 || stage.rows == 0 || stage.cols == 0 {
             return Err("invalid column-copy geometry".into());
@@ -1414,6 +1420,8 @@ impl StageProgram {
             stage.cols,
         );
         let output = self.resolve(stage.output, f32_bytes(span)?, "column-copy output")?;
+        let tail = span - u64::from(stage.items - 1) * u64::from(stage.out_item_stride);
+        let flags = self.copy_group(group, output, &stage, tail)?;
         let elements = product(&[stage.items, stage.rows, stage.cols])?;
         u32_elements(elements, "column copy")?;
         self.emit(
@@ -1422,8 +1430,8 @@ impl StageProgram {
             deps,
             output,
             |d| {
-                d.t[..2].copy_from_slice(&[output, x]);
-                d.i[..7].copy_from_slice(&[
+                d.t[..3].copy_from_slice(&[output, x, group.unwrap_or(packet::dev::TENSOR_NONE)]);
+                d.i = [
                     stage.items,
                     stage.rows,
                     stage.cols,
@@ -1431,21 +1439,45 @@ impl StageProgram {
                     stage.in_offset,
                     stage.out_stride,
                     stage.out_offset,
-                ]);
+                    flags,
+                ];
                 d.j = [stage.in_item_stride, stage.out_item_stride];
             },
         )
+    }
+
+    /// CopyColsF32 flag bits for an optional device group index: bit 1 and, in bits 8..31, how
+    /// many items of `out_item_stride` fit the output when the last one spans `tail` floats.
+    fn copy_group(
+        &self,
+        group: Option<u32>,
+        output: u32,
+        stage: &CopyColsF32Stage<'_>,
+        tail: u64,
+    ) -> Result<u32, String> {
+        let Some(group) = group else {
+            return Ok(0);
+        };
+        self.input(group, 4, "column-copy group")?;
+        if stage.out_item_stride == 0 {
+            return Err("column-copy group: out_item_stride must be nonzero".into());
+        }
+        let floats = self.builder.tensor_bytes(output) / 4;
+        let capacity = (floats - tail) / u64::from(stage.out_item_stride) + 1;
+        Ok(2 | (capacity.min(0xFF_FFFF) as u32) << 8)
     }
 
     /// [`DevOp::CopyColsF32`] format mode: `items` blocks of `rows` keys (`cols` = K | V of
     /// `cols / 128` heads of width 64) from the column-copy source geometry into an attention
     /// prefix table for [`AttentionPrefix::h16`]; block `b` at `b * out_item_stride + out_offset`
     /// (`out_stride` unused).
+    /// `group` as [`Self::copy_cols_f32`].
     pub fn format_prefix_h16(
         &mut self,
         x: u32,
         deps: &[u32],
         stage: CopyColsF32Stage<'_>,
+        group: Option<u32>,
     ) -> Result<Emitted, String> {
         if stage.items == 0 || stage.rows == 0 || stage.cols == 0 || stage.cols % 128 != 0 {
             return Err("invalid prefix-format geometry".into());
@@ -1468,9 +1500,10 @@ impl StageProgram {
             + u64::from(stage.items - 1) * u64::from(stage.out_item_stride)
             + block;
         let output = self.resolve(stage.output, f32_bytes(span)?, "prefix-format output")?;
+        let flags = self.copy_group(group, output, &stage, u64::from(stage.out_offset) + block)?;
         let units = product(&[stage.items, heads, stage.rows.div_ceil(16)])?.div_ceil(2);
         self.emit(DevOp::CopyColsF32, units, deps, output, |d| {
-            d.t[..2].copy_from_slice(&[output, x]);
+            d.t[..3].copy_from_slice(&[output, x, group.unwrap_or(packet::dev::TENSOR_NONE)]);
             d.i = [
                 stage.items,
                 stage.rows,
@@ -1479,7 +1512,7 @@ impl StageProgram {
                 stage.in_offset,
                 0,
                 stage.out_offset,
-                1,
+                1 | flags,
             ];
             d.j = [stage.in_item_stride, stage.out_item_stride];
         })
@@ -2179,6 +2212,13 @@ impl StageProgram {
                     "attention prefix: no bias or causal mask, and at least one row".into(),
                 );
             }
+            if let Some(rows) = p.rows_per_item {
+                self.input(
+                    rows,
+                    u64::from(stage.batch) * 4,
+                    "attention prefix rows per item",
+                )?;
+            }
             if p.h16 && (stage.head_width != 64 || stage.q_rows.div_ceil(16) < 4) {
                 return Err(
                     "pre-formatted attention prefix: head_width 64 and at least 4 query tiles"
@@ -2197,8 +2237,9 @@ impl StageProgram {
                 "attention prefix index",
             )?;
         }
-        let bias = match stage.bias {
-            Some(bias) => {
+        let bias = match (stage.bias, stage.prefix.and_then(|p| p.rows_per_item)) {
+            (_, Some(rows)) => rows,
+            (Some(bias), None) => {
                 let span = if stage.relative {
                     product(&[stage.q_rows, stage.heads, stage.bias_head_stride])?
                 } else {
@@ -2207,7 +2248,7 @@ impl StageProgram {
                 };
                 self.resolve(bias, f32_bytes(span)?, "attention bias")?
             }
-            None => packet::dev::TENSOR_NONE,
+            (None, None) => packet::dev::TENSOR_NONE,
         };
         let out_elements = product(&[stage.batch, stage.q_rows, width])?;
         let output = self.resolve(stage.output, f32_bytes(out_elements)?, "attention output")?;
@@ -2257,6 +2298,7 @@ impl StageProgram {
                     | (u32::from(stage.relative) << 2)
                     | (u32::from(stage.stream.is_some()) << 3)
                     | (u32::from(stage.prefix.is_some_and(|p| p.h16)) << 4)
+                    | (u32::from(stage.prefix.is_some_and(|p| p.rows_per_item.is_some())) << 5)
                     | (stage.key_length_heads << 8)
                     | (stage.window << 16),
                 stage.prefix.map_or(
@@ -2507,7 +2549,7 @@ impl PacketPrefix {
     }
 
     pub fn append_copy_cols_f32(self, x: u32, stage: CopyColsF32Stage<'_>) -> Result<Self, String> {
-        self.append_one(stage.rows, |p| p.copy_cols_f32(x, &[], stage))
+        self.append_one(stage.rows, |p| p.copy_cols_f32(x, &[], stage, None))
     }
 
     pub fn append_conv1d_f32(self, x: u32, stage: Conv1dF32Stage<'_>) -> Result<Self, String> {
@@ -3120,7 +3162,7 @@ mod tests {
             out_offset: 0,
         };
         let f = p
-            .format_prefix_h16(h[0], &[], copy(TensorRef::Named("cache")))
+            .format_prefix_h16(h[0], &[], copy(TensorRef::Named("cache")), None)
             .unwrap();
         let attention = |rows, h16| AttentionF32Stage {
             output: TensorRef::Named("ctx"),
@@ -3145,6 +3187,7 @@ mod tests {
                 blocks: 2,
                 rows: pre,
                 h16,
+                rows_per_item: None,
             }),
             window: 0,
             stream: None,
@@ -3165,6 +3208,124 @@ mod tests {
             (Some(DevOp::CopyColsF32), 1)
         );
         assert_eq!(insts[1].i[6], 2 | 16);
+    }
+
+    #[test]
+    fn prefix_rows_per_item_and_copy_group() {
+        let (b, rows, pre, heads) = (3u32, 72u32, 40u32, 2u32);
+        let width = heads * 64;
+        let block = u32::try_from(h16_prefix_floats(heads, pre)).unwrap();
+        let (prefix, h) = prefix_with(&[
+            ("qkv", u64::from(b * rows * 3 * width) * 4),
+            ("idx", u64::from(b) * 4),
+            ("pre", u64::from(b) * 4),
+            ("g", 4),
+            ("table", u64::from(5 * pre * 2 * width) * 4),
+            ("fmt", u64::from(4 * block + 7) * 4),
+            ("short", 8),
+        ]);
+        let mut p = prefix.program();
+        let copy = |output, out_item_stride| CopyColsF32Stage {
+            output,
+            items: 2,
+            rows: pre,
+            cols: 2 * width,
+            in_item_stride: rows * 3 * width,
+            in_stride: 3 * width,
+            in_offset: width,
+            out_item_stride,
+            out_stride: 2 * width,
+            out_offset: 0,
+        };
+        let plain = copy(TensorRef::Handle(h[4]), pre * 2 * width);
+        assert!(p.copy_cols_f32(h[0], &[], plain, Some(h[6])).is_ok());
+        assert!(p.copy_cols_f32(h[0], &[], plain, Some(99)).is_err());
+        assert!(p
+            .copy_cols_f32(h[0], &[], copy(TensorRef::Handle(h[4]), 0), Some(h[3]))
+            .is_err());
+        let c = p.copy_cols_f32(h[0], &[], plain, Some(h[3])).unwrap();
+        let f = p
+            .format_prefix_h16(h[0], &[], copy(TensorRef::Handle(h[5]), block), Some(h[3]))
+            .unwrap();
+        let attention = |rows_per_item, bias, causal| AttentionF32Stage {
+            output: TensorRef::Named("ctx"),
+            key_lengths: None,
+            bias,
+            batch: b,
+            q_rows: rows,
+            kv_rows: rows,
+            heads,
+            head_width: 64,
+            in_stride: 3 * width,
+            k_col0: width,
+            v_col0: 2 * width,
+            causal,
+            scale: 0.125,
+            bias_head_stride: 0,
+            relative: false,
+            key_length_heads: 0,
+            prefix: Some(AttentionPrefix {
+                table: h[4],
+                index: h[1],
+                blocks: 5,
+                rows: pre,
+                h16: false,
+                rows_per_item,
+            }),
+            window: 0,
+            stream: None,
+        };
+        assert!(p
+            .attention_f32(
+                h[0],
+                h[0],
+                h[0],
+                &[c.done],
+                attention(Some(h[6]), None, false)
+            )
+            .is_err());
+        assert!(p
+            .attention_f32(
+                h[0],
+                h[0],
+                h[0],
+                &[c.done],
+                attention(Some(h[2]), None, true)
+            )
+            .is_err());
+        assert!(p
+            .attention_f32(
+                h[0],
+                h[0],
+                h[0],
+                &[c.done],
+                attention(Some(h[2]), Some(TensorRef::Handle(h[4])), false)
+            )
+            .is_err());
+        p.attention_f32(
+            h[0],
+            h[0],
+            h[0],
+            &[c.done, f.done],
+            attention(Some(h[2]), None, false),
+        )
+        .unwrap();
+        p.attention_f32(h[0], h[0], h[0], &[c.done], attention(None, None, false))
+            .unwrap();
+        let prefix = p.finish(0);
+        let insts = &prefix.model.progs[0].insts;
+        let n = insts.len();
+        // "table" holds 5 items of pre * 2 * width, "fmt" 4 blocks (+7 floats).
+        assert_eq!((insts[n - 4].t[2], insts[n - 4].i[7]), (h[3], 2 | 5 << 8));
+        assert_eq!(
+            (insts[n - 3].t[2], insts[n - 3].i[7]),
+            (h[3], 1 | 2 | 4 << 8)
+        );
+        assert_eq!((insts[n - 2].t[5], insts[n - 2].i[6]), (h[2], 2 | 32));
+        assert_eq!(
+            (insts[n - 1].t[5], insts[n - 1].i[6]),
+            (packet::dev::TENSOR_NONE, 2)
+        );
     }
 
     #[test]

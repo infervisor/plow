@@ -323,6 +323,7 @@ fn snac_program(
                     out_stride: n,
                     out_offset: slot,
                 },
+                None,
             )?
             .done,
         );

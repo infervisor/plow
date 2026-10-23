@@ -478,6 +478,7 @@ fn program_for(
                     out_stride: fc,
                     out_offset: col,
                 },
+                None,
             )?;
             s.done(e);
             col += 1;

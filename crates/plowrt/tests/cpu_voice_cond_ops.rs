@@ -546,3 +546,283 @@ fn trim_silence_matches_librosa_indices() {
         }
     }
 }
+
+struct PrefixCase {
+    batch: usize,
+    q_rows: usize,
+    kv_rows: usize,
+    heads: usize,
+    hw: usize,
+    /// i7: rows per prefix block (the block stride).
+    pre: usize,
+    blocks: usize,
+    index: Vec<u32>,
+    prefix_rows: Option<Vec<u32>>,
+    lengths: Option<Vec<u32>>,
+}
+
+/// Runs the golden AttentionF32 with a key prefix; rows nobody may read are NaN.
+fn attention_prefix_golden(c: &PrefixCase) -> (Vec<f32>, Vec<f64>) {
+    let width = c.heads * c.hw;
+    let pre_b = |b: usize| {
+        c.prefix_rows
+            .as_ref()
+            .map_or(c.pre, |r| (r[b] as usize).min(c.pre))
+    };
+    let klen = |b: usize| {
+        let all = pre_b(b) + c.kv_rows;
+        c.lengths.as_ref().map_or(all, |l| (l[b] as usize).min(all))
+    };
+    let mut q = data(c.batch * c.q_rows * width, 51);
+    let mut k = data(c.batch * c.kv_rows * width, 52);
+    let mut v = data(c.batch * c.kv_rows * width, 53);
+    let mut prefix = data(c.blocks * c.pre * 2 * width, 54);
+    for blk in 0..c.blocks {
+        let used = (0..c.batch)
+            .filter(|&b| c.index[b] as usize == blk)
+            .map(|b| pre_b(b).min(klen(b)))
+            .max()
+            .unwrap_or(0);
+        for r in used..c.pre {
+            prefix[(blk * c.pre + r) * 2 * width..][..2 * width].fill(f32::NAN);
+        }
+    }
+    for b in 0..c.batch {
+        let own = klen(b).saturating_sub(pre_b(b));
+        for r in own..c.kv_rows {
+            k[(b * c.kv_rows + r) * width..][..width].fill(f32::NAN);
+            v[(b * c.kv_rows + r) * width..][..width].fill(1e30);
+        }
+    }
+    let mut index = c.index.clone();
+    let mut rows = c.prefix_rows.clone().unwrap_or_default();
+    let mut lengths = c.lengths.clone().unwrap_or_default();
+    let mut out = vec![f32::NAN; c.batch * c.q_rows * width];
+    let scale = 0.125f32;
+    let flags = if c.prefix_rows.is_some() { 32 } else { 0 };
+    let mut d = op(
+        DevOp::AttentionF32,
+        &[0, 1, 2, 3, 4, 5, 6, 7],
+        &[c.batch, c.q_rows, c.kv_rows, c.heads, c.hw, 0, flags, c.pre].map(|v| v as u32),
+    );
+    if c.lengths.is_none() {
+        d.t[4] = TENSOR_NONE16;
+    }
+    if c.prefix_rows.is_none() {
+        d.t[5] = TENSOR_NONE16;
+    }
+    d.fj = [scale.to_bits(), 0, 0];
+    run(
+        &d,
+        &[
+            ptr(&mut out),
+            ptr(&mut q),
+            ptr(&mut k),
+            ptr(&mut v),
+            ptr(&mut lengths),
+            ptr(&mut rows),
+            ptr(&mut prefix),
+            ptr(&mut index),
+        ],
+    );
+    let mut want = vec![0.0f64; out.len()];
+    for b in 0..c.batch {
+        let (pb, kl) = (pre_b(b), klen(b));
+        let blk = c.index[b] as usize;
+        for h in 0..c.heads {
+            let key = |j: usize, value: bool| -> &[f32] {
+                if j < pb {
+                    let o = (blk * c.pre + j) * 2 * width + usize::from(value) * width + h * c.hw;
+                    &prefix[o..][..c.hw]
+                } else {
+                    let o = (b * c.kv_rows + j - pb) * width + h * c.hw;
+                    &(if value { &v } else { &k })[o..][..c.hw]
+                }
+            };
+            for r in 0..c.q_rows {
+                let qr = &q[(b * c.q_rows + r) * width + h * c.hw..][..c.hw];
+                let s: Vec<f64> = (0..kl)
+                    .map(|j| {
+                        qr.iter()
+                            .zip(key(j, false))
+                            .map(|(&a, &x)| a as f64 * x as f64)
+                            .sum::<f64>()
+                            * scale as f64
+                    })
+                    .collect();
+                let m = s.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+                let e: Vec<f64> = s.iter().map(|x| (x - m).exp()).collect();
+                let den: f64 = e.iter().sum();
+                for col in 0..c.hw {
+                    want[(b * c.q_rows + r) * width + h * c.hw + col] = if kl == 0 {
+                        0.0
+                    } else {
+                        (0..kl)
+                            .map(|j| e[j] * key(j, true)[col] as f64)
+                            .sum::<f64>()
+                            / den
+                    };
+                }
+            }
+        }
+    }
+    (out, want)
+}
+
+fn check_prefix(c: &PrefixCase) {
+    let (got, want) = attention_prefix_golden(c);
+    for (i, (&g, &w)) in got.iter().zip(&want).enumerate() {
+        assert!(
+            (g as f64 - w).abs() <= 1e-5,
+            "pre={} rows={:?} [{i}] {g} vs {w}",
+            c.pre,
+            c.prefix_rows
+        );
+    }
+}
+
+#[test]
+fn attention_prefix_rows_per_item_against_reference() {
+    // i7 = 37 (not a multiple of 16); blocks reused by items with different pre_b.
+    for rows in [
+        vec![0u32, 1, 15, 16, 17, 36, 37, 1000],
+        vec![37; 8],
+        vec![0; 8],
+        vec![17, 0, 36, 1, 37, 16, 15, 2],
+    ] {
+        check_prefix(&PrefixCase {
+            batch: 8,
+            q_rows: 5,
+            kv_rows: 9,
+            heads: 2,
+            hw: 64,
+            pre: 37,
+            blocks: 3,
+            index: vec![0, 1, 0, 2, 1, 0, 2, 0],
+            prefix_rows: Some(rows.clone()),
+            lengths: None,
+        });
+        // Lengths cutting inside the own region (and one inside the prefix).
+        let lengths: Vec<u32> = rows
+            .iter()
+            .enumerate()
+            .map(|(b, &r)| r.min(37) + [3, 0, 8, 1, 5, 2, 9, 4][b])
+            .collect();
+        let mut short = lengths.clone();
+        short[2] = rows[2].min(37) / 2;
+        check_prefix(&PrefixCase {
+            batch: 8,
+            q_rows: 5,
+            kv_rows: 9,
+            heads: 2,
+            hw: 72,
+            pre: 37,
+            blocks: 3,
+            index: vec![2, 2, 0, 1, 1, 0, 2, 0],
+            prefix_rows: Some(rows),
+            lengths: Some(short),
+        });
+    }
+    check_prefix(&PrefixCase {
+        batch: 3,
+        q_rows: 4,
+        kv_rows: 6,
+        heads: 2,
+        hw: 64,
+        pre: 48,
+        blocks: 2,
+        index: vec![1, 0, 1],
+        prefix_rows: None,
+        lengths: Some(vec![54, 50, 20]),
+    });
+}
+
+#[test]
+fn attention_prefix_rows_all_full_is_bitwise_flag_off() {
+    let base = PrefixCase {
+        batch: 4,
+        q_rows: 6,
+        kv_rows: 7,
+        heads: 2,
+        hw: 64,
+        pre: 29,
+        blocks: 2,
+        index: vec![0, 1, 1, 0],
+        prefix_rows: None,
+        lengths: Some(vec![36, 30, 33, 29]),
+    };
+    let (off, _) = attention_prefix_golden(&base);
+    let (on, _) = attention_prefix_golden(&PrefixCase {
+        prefix_rows: Some(vec![29, 29, 400, 29]),
+        index: base.index.clone(),
+        lengths: base.lengths.clone(),
+        ..base
+    });
+    assert_eq!(
+        off.iter().map(|x| x.to_bits()).collect::<Vec<_>>(),
+        on.iter().map(|x| x.to_bits()).collect::<Vec<_>>()
+    );
+}
+
+/// CopyColsF32 flag bit 1: `[items][rows][cols]` into `out` item `g * items + b`, capacity in
+/// flag bits 8..31.
+fn copy_group(out: &mut [f32], x: &mut [f32], items: u32, rows: u32, g: u32, capacity: u32) {
+    let (cols, in_stride, out_stride) = (5u32, 7u32, 6u32);
+    let mut group = vec![g];
+    let mut d = op(
+        DevOp::CopyColsF32,
+        &[0, 1, 2],
+        &[
+            items,
+            rows,
+            cols,
+            in_stride,
+            1,
+            out_stride,
+            1,
+            2 | capacity << 8,
+        ],
+    );
+    d.fj = [0, rows * in_stride, 40 * out_stride];
+    run(&d, &[ptr(out), ptr(x), ptr(&mut group)]);
+}
+
+#[test]
+fn copy_cols_group_offsets_guard_and_reuse() {
+    let (items, capacity) = (2u32, 6u32);
+    let item = 40 * 6usize;
+    let x0 = data(items as usize * 40 * 7, 61);
+    let mut x = x0.clone();
+    let fresh = |rows: u32, g: u32| {
+        let mut out = vec![-1.0f32; capacity as usize * item];
+        let mut x = x0.clone();
+        copy_group(&mut out, &mut x, items, rows, g, capacity);
+        out
+    };
+    for g in [0u32, 2] {
+        let out = fresh(40, g);
+        for (i, &o) in out.iter().enumerate() {
+            let (it, r, c) = (i / item, i % item / 6, i % 6);
+            let want = if (it as u32) / items == g && c >= 1 {
+                let b = it - (g * items) as usize;
+                x0[b * 40 * 7 + r * 7 + 1 + c - 1]
+            } else {
+                -1.0
+            };
+            assert_eq!(o, want, "g={g} [{it}][{r}][{c}]");
+        }
+    }
+    // (g + 1) * items > capacity: nothing written.
+    assert!(fresh(40, 3).iter().all(|&o| o == -1.0));
+    assert!(fresh(40, u32::MAX).iter().all(|&o| o == -1.0));
+    // Long then short into group 2: rows < short as a fresh short write, the rest the long one.
+    let mut out = vec![-1.0f32; capacity as usize * item];
+    copy_group(&mut out, &mut x, items, 40, 2, capacity);
+    let long = out.clone();
+    copy_group(&mut out, &mut x, items, 11, 2, capacity);
+    let short = fresh(11, 2);
+    for (i, &o) in out.iter().enumerate() {
+        let r = i % item / 6;
+        assert_eq!(o, if r < 11 { short[i] } else { long[i] }, "[{i}]");
+    }
+}

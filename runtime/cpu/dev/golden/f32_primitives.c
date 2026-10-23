@@ -857,17 +857,25 @@ G_K(g_gather_rows_f32) {
     }
 }
 
+/* i7 bit 1: items land at output item g * items + b, g = t2[0]; nothing is written unless
+ * (g + 1) * items <= i7 >> 8. */
 G_K(g_copy_cols_f32) {
     (void)ctx;
     float* out = PLOW_CPU_TEN(in, T, 0);
     const float* x = PLOW_CPU_TEN(in, T, 1);
     const uint32_t items = in->i[0], rows = in->i[1], cols = in->i[2];
+    uint64_t base = 0;
+    if (in->i[7] & 2u) {
+        const uint32_t g = *(const uint32_t*)PLOW_CPU_TEN(in, T, 2);
+        if (((uint64_t)g + 1u) * items > (in->i[7] >> 8)) return;
+        base = (uint64_t)g * items;
+    }
     uint32_t lo, hi;
     g_range(items * rows, slice, nblk, &lo, &hi);
     for (uint32_t index = lo; index < hi; index++) {
         const uint32_t item = index / rows, row = index % rows;
         const float* src = x + (size_t)item * in->fj[1].u + (size_t)row * in->i[3] + in->i[4];
-        float* dst = out + (size_t)item * in->fj[2].u + (size_t)row * in->i[5] + in->i[6];
+        float* dst = out + (size_t)(base + item) * in->fj[2].u + (size_t)row * in->i[5] + in->i[6];
         for (uint32_t column = 0; column < cols; column++) dst[column] = src[column];
     }
 }
@@ -1277,14 +1285,16 @@ G_K(g_attention_f32) {
     const float* key = PLOW_CPU_TEN(in, T, 2);
     const float* value = PLOW_CPU_TEN(in, T, 3);
     const uint32_t* key_lengths = PLOW_CPU_TEN(in, T, 4);
-    /* Optional key prefix: item b's keys are rows [0, i7) of prefix block t7[b] ([K | V] rows,
-     * 2 * width wide), then its kv_rows own rows. */
+    /* Optional key prefix: item b's keys are rows [0, pre_b) of prefix block t7[b] ([K | V] rows,
+     * 2 * width wide, block stride i7 rows), then its kv_rows own rows. pre_b = i7, or with i6
+     * bit 5 min(t5[b], i7). */
     const float* prefix = PLOW_CPU_TEN(in, T, 6);
+    const uint32_t* prefix_rows = prefix && (in->i[6] & 32u) ? PLOW_CPU_TEN(in, T, 5) : NULL;
     const uint32_t* prefix_index = PLOW_CPU_TEN(in, T, 7);
     /* i6 bit 3, stream mode: Q/K/V share item rows; the first i7 are carried history, query r is
      * row i7 + r, and keys before i7 - min(t7[b], i7) (t7: stream position) are absent. */
     const uint32_t stream = in->i[6] & 8u, hist = stream ? in->i[7] : 0u;
-    const uint32_t pre = prefix ? in->i[7] : 0u;
+    const uint32_t pstride = prefix ? in->i[7] : 0u;
     const float* bias = prefix || stream ? NULL : PLOW_CPU_TEN(in, T, 5);
     const uint32_t batch = in->i[0], q_rows = in->i[1], kv_rows = in->i[2], heads = in->i[3];
     const uint32_t hw = in->i[4], width = heads * hw;
@@ -1293,13 +1303,14 @@ G_K(g_attention_f32) {
      * group of that many heads. */
     const uint32_t rel = in->i[6] & 4u, lgroup = (in->i[6] >> 8) & 255u;
     const uint32_t k_col0 = in->fj[1].u, v_col0 = in->fj[2].u;
-    if (!hw || !(pre + kv_rows)) return;
-    double* p = malloc(sizeof(double) * (pre + kv_rows));
+    if (!hw || !(pstride + kv_rows) || ((in->i[6] & 32u) && !prefix_rows)) return;
+    double* p = malloc(sizeof(double) * (pstride + kv_rows));
     double* acc = malloc(sizeof(double) * hw);
     uint32_t lo, hi;
     g_range(batch * heads * q_rows, slice, nblk, &lo, &hi);
     for (uint32_t index = lo; index < hi; index++) {
         const uint32_t b = index / (heads * q_rows), h = index / q_rows % heads, r = index % q_rows;
+        const uint32_t pre = prefix_rows && prefix_rows[b] < pstride ? prefix_rows[b] : pstride;
         uint32_t visible = g_item_rows(key_lengths, lgroup ? (b * heads + h) / lgroup : b, pre + kv_rows);
         const uint32_t rk = hist + r;
         if (causal && rk + 1u < visible) visible = rk + 1u;
@@ -1309,7 +1320,7 @@ G_K(g_attention_f32) {
         const float* q = query + ((size_t)(stream ? b * kv_rows + hist : b * q_rows) + r) * stride + (size_t)h * hw;
         double maximum = -INFINITY;
         for (uint32_t j = first; j < visible; j++) {
-            const float* k = j < pre ? prefix + ((size_t)prefix_index[b] * pre + j) * 2u * width + (size_t)h * hw
+            const float* k = j < pre ? prefix + ((size_t)prefix_index[b] * pstride + j) * 2u * width + (size_t)h * hw
                                      : key + ((size_t)b * kv_rows + j - pre) * stride + k_col0 + (size_t)h * hw;
             double dot = 0.0;
             for (uint32_t c = 0; c < hw; c++) dot += (double)q[c] * k[c];
@@ -1323,7 +1334,7 @@ G_K(g_attention_f32) {
         for (uint32_t c = 0; c < hw; c++) acc[c] = 0.0;
         for (uint32_t j = first; j < visible; j++) {
             const double e = exp(p[j] - maximum);
-            const float* v = j < pre ? prefix + ((size_t)prefix_index[b] * pre + j) * 2u * width + width + (size_t)h * hw
+            const float* v = j < pre ? prefix + ((size_t)prefix_index[b] * pstride + j) * 2u * width + width + (size_t)h * hw
                                      : value + ((size_t)b * kv_rows + j - pre) * stride + v_col0 + (size_t)h * hw;
             denominator += e;
             for (uint32_t c = 0; c < hw; c++) acc[c] += e * v[c];

@@ -2434,7 +2434,15 @@ static __device__ __noinline__ void d_gather_rows_f32(const PlowDevInst* in, voi
         });
 }
 
-/* CopyColsF32 (196). */
+/* CopyColsF32 (196). i7 bit 1: output item base g * items with g = t2[0]; nothing is written
+ * unless (g + 1) * items <= i7 >> 8 (the output's item capacity). */
+static __device__ __forceinline__ bool sp_copy_group(const PlowDevInst* in, void* const* T, unsigned& base) {
+    base = 0;
+    if (!(in->i[7] & 2u)) return true;
+    const unsigned g = *(const unsigned*)SP_TEN(2);
+    base = g * in->i[0];
+    return ((uint64_t)g + 1u) * in->i[0] <= (in->i[7] >> 8);
+}
 #if defined(PLOW_NV_HOPPER)
 static __device__ __noinline__ void d_prefix_format_h16(const PlowDevInst* in, void* const* T, unsigned slice,
                                                         unsigned nblk);
@@ -2452,6 +2460,8 @@ static __device__ __noinline__ void d_copy_cols_f32(const PlowDevInst* in, void*
     float* out = (float*)SP_TEN(0);
     const float* x = (const float*)SP_TEN(1);
     const unsigned items = in->i[0], rows = in->i[1], cols = in->i[2];
+    unsigned base;
+    if (!sp_copy_group(in, T, base)) return;
     if (!rows || !cols || (uint64_t)items * rows * cols > 0xFFFFFFFFull) return;
     sp_batched<8>(
         items * rows * cols, slice, nblk,
@@ -2461,7 +2471,7 @@ static __device__ __noinline__ void d_copy_cols_f32(const PlowDevInst* in, void*
         },
         [&](unsigned e, float v) {
             const unsigned rr = e / cols, c = e - rr * cols, item = rr / rows, row = rr - item * rows;
-            out[(size_t)item * in->fj[2].u + (size_t)row * in->i[5] + in->i[6] + c] = v;
+            out[((size_t)base + item) * in->fj[2].u + (size_t)row * in->i[5] + in->i[6] + c] = v;
         });
 }
 
@@ -3917,7 +3927,8 @@ static __device__ __noinline__ void sp_attention_f32(const PlowDevInst* in, void
     const float* prefix = (const float*)SP_TEN(6);
     const unsigned* pidx = (const unsigned*)SP_TEN(7);
     const bool stream = in->i[6] & 8u;
-    const unsigned pre = prefix ? in->i[7] : 0u, hist = stream ? in->i[7] : 0u;
+    const unsigned pstride = prefix ? in->i[7] : 0u, hist = stream ? in->i[7] : 0u;
+    const unsigned* prows = prefix && (in->i[6] & 32u) ? (const unsigned*)SP_TEN(5) : nullptr;
     const float* bias = prefix || stream ? nullptr : (const float*)SP_TEN(5);
     const unsigned batch = in->i[0], q_rows = in->i[1], kv_rows = in->i[2], heads = in->i[3];
     const unsigned hw = RAGGED ? in->i[4] : (unsigned)HW;
@@ -3935,6 +3946,7 @@ static __device__ __noinline__ void sp_attention_f32(const PlowDevInst* in, void
     for (unsigned item = slice; item < batch * heads * qtiles; item += nblk) {
         const unsigned qt = item % qtiles, bh = item / qtiles, h = bh % heads, b = bh / heads;
         const unsigned q0 = qt * SPF_BQ, qa = hist + q0;
+        const unsigned pre = prows ? min(prows[b], pstride) : pstride;
         const unsigned klen = lengths && lengths[b] < pre + kv_rows ? lengths[b] : pre + kv_rows;
         const unsigned kend = causal ? min(klen, qa + SPF_BQ) : klen;
         const unsigned left = stream ? hist - min(pidx[b], hist) : 0u;
@@ -3975,7 +3987,7 @@ static __device__ __noinline__ void sp_attention_f32(const PlowDevInst* in, void
                 kr[p] = vr[p] = make_float4(0.f, 0.f, 0.f, 0.f);
                 if (RAGGED && d >= hw) {
                 } else if (k0 + j < pre && k0 + j < kend) {
-                    const size_t pb = ((size_t)pidx[b] * pre + k0 + j) * (2u * width) + h * hw + d;
+                    const size_t pb = ((size_t)pidx[b] * pstride + k0 + j) * (2u * width) + h * hw + d;
                     kr[p] = sp_ld4(prefix + pb, vec);
                     vr[p] = sp_ld4(prefix + pb + width, vec);
                 } else if (k0 + j < kend) {
@@ -4110,7 +4122,8 @@ static __device__ __noinline__ void sp_attention_tc64(const PlowDevInst* in, voi
     const unsigned* lengths = (const unsigned*)SP_TEN(4);
     const float* prefix = (const float*)SP_TEN(6);
     const unsigned* pidx = (const unsigned*)SP_TEN(7);
-    const unsigned pre = prefix ? in->i[7] : 0u;
+    const unsigned pstride = prefix ? in->i[7] : 0u;
+    const unsigned* prows = prefix && (in->i[6] & 32u) ? (const unsigned*)SP_TEN(5) : nullptr;
     const float* bias = prefix ? nullptr : (const float*)SP_TEN(5);
     const unsigned batch = in->i[0], q_rows = in->i[1], kv_rows = in->i[2], heads = in->i[3];
     const unsigned width = heads * HW, stride = in->i[5] ? in->i[5] : width;
@@ -4123,6 +4136,7 @@ static __device__ __noinline__ void sp_attention_tc64(const PlowDevInst* in, voi
     for (unsigned item = slice; item < batch * heads * qtiles; item += nblk) {
         const unsigned qt = item % qtiles, bh = item / qtiles, h = bh % heads, b = bh / heads;
         const unsigned q0 = qt * SPQ_BQ;
+        const unsigned pre = prows ? min(prows[b], pstride) : pstride;
         const unsigned klen = lengths && lengths[b] < pre + kv_rows ? lengths[b] : pre + kv_rows;
         const unsigned kend = causal ? min(klen, q0 + SPQ_BQ) : klen;
         const unsigned ra = q0 + warp * 16u + g, rb = ra + 8u;
@@ -4152,7 +4166,7 @@ static __device__ __noinline__ void sp_attention_tc64(const PlowDevInst* in, voi
                     const bool ok = kj < kend;
                     const float *kp = key, *vp = value;
                     if (ok && kj < pre) {
-                        kp = prefix + ((size_t)pidx[b] * pre + kj) * (2u * width) + h * HW + d;
+                        kp = prefix + ((size_t)pidx[b] * pstride + kj) * (2u * width) + h * HW + d;
                         vp = kp + width;
                     } else if (ok) {
                         const size_t base = ((size_t)b * kv_rows + kj - pre) * stride + h * HW + d;
@@ -4305,7 +4319,8 @@ static __device__ __noinline__ void sp_attention_tc64p(const PlowDevInst* in, vo
     const unsigned* lengths = (const unsigned*)SP_TEN(4);
     const float* prefix = (const float*)SP_TEN(6);
     const unsigned* pidx = (const unsigned*)SP_TEN(7);
-    const unsigned pre = prefix ? in->i[7] : 0u;
+    const unsigned pstride = prefix ? in->i[7] : 0u;
+    const unsigned* prows = prefix && (in->i[6] & 32u) ? (const unsigned*)SP_TEN(5) : nullptr;
     const float* bias = prefix ? nullptr : (const float*)SP_TEN(5);
     const unsigned batch = in->i[0], q_rows = in->i[1], kv_rows = in->i[2], heads = in->i[3];
     const unsigned width = heads * HW, stride = in->i[5] ? in->i[5] : width;
@@ -4326,6 +4341,7 @@ static __device__ __noinline__ void sp_attention_tc64p(const PlowDevInst* in, vo
         const bool live = u < tiles;
         const unsigned h0 = u0 / n16, nh = min(u0 + 7u, tiles - 1u) / n16 - h0 + 1u;
         const unsigned h = live ? u / n16 : h0, q0 = live ? (u % n16) * 16u : 0u;
+        const unsigned pre = prows ? min(prows[b], pstride) : pstride;
         auto visible = [&](unsigned hh) {
             const unsigned li = lgroup ? (b * heads + hh) / lgroup : b;
             return lengths && lengths[li] < pre + kv_rows ? lengths[li] : pre + kv_rows;
@@ -4379,7 +4395,7 @@ static __device__ __noinline__ void sp_attention_tc64p(const PlowDevInst* in, vo
                     const bool ok = kj < kend;
                     const float *kp = key, *vp = value;
                     if (ok && kj < pre) {
-                        kp = prefix + ((size_t)pidx[b] * pre + kj) * (2u * width) + hh * HW + d;
+                        kp = prefix + ((size_t)pidx[b] * pstride + kj) * (2u * width) + hh * HW + d;
                         vp = kp + width;
                     } else if (ok) {
                         const size_t base = ((size_t)b * kv_rows + kj - pre) * stride + hh * HW + d;
@@ -4615,6 +4631,8 @@ static __device__ __noinline__ void d_prefix_format_h16(const PlowDevInst* in, v
     const unsigned items = in->i[0], rows = in->i[1], heads = in->i[2] / 128u, width = heads * 64u;
     const unsigned npt = (rows + SPH_KT - 1) / SPH_KT, units = items * heads * npt;
     const unsigned w = threadIdx.x % 128u;
+    unsigned base;
+    if (!sp_copy_group(in, T, base)) return;
     /* two units per pass, one per 128-thread half */
     for (unsigned u = slice * 2u + threadIdx.x / 128u; u < units; u += nblk * 2u) {
         const unsigned pt = u % npt, hh = (u / npt) % heads, item = u / (npt * heads), k0 = pt * SPH_KT;
@@ -4637,7 +4655,7 @@ static __device__ __noinline__ void d_prefix_format_h16(const PlowDevInst* in, v
                     for (int q = 0; q < 8; q++) v[s2 * 8 + q] = src[(size_t)kj * in->i[3] + width + n * 8 + q];
             }
         }
-        sp_h16_store_group(out + (size_t)item * in->fj[2].u + in->i[6] + ((size_t)hh * npt + pt) * SPH_XS, w, v);
+        sp_h16_store_group(out + ((size_t)base + item) * in->fj[2].u + in->i[6] + ((size_t)hh * npt + pt) * SPH_XS, w, v);
     }
 }
 
@@ -4657,14 +4675,16 @@ static __device__ __noinline__ void sp_attention_h16(const PlowDevInst* in, void
     const unsigned* lengths = (const unsigned*)SP_TEN(4);
     const float* pfmt = (const float*)SP_TEN(6);
     const unsigned* pidx = (const unsigned*)SP_TEN(7);
-    const unsigned batch = in->i[0], q_rows = in->i[1], kv_rows = in->i[2], heads = in->i[3], pre = in->i[7];
+    const unsigned batch = in->i[0], q_rows = in->i[1], kv_rows = in->i[2], heads = in->i[3], pstride = in->i[7];
     const unsigned width = heads * HW, stride = in->i[5] ? in->i[5] : width;
     const unsigned k_col0 = in->fj[1].u, v_col0 = in->fj[2].u;
+    /* flags bit 5: t5 = prefix rows per item (pre = min(t5[b], i7)); blocks keep npt tiles */
+    const unsigned* prows = in->i[6] & 32u ? (const unsigned*)SP_TEN(5) : nullptr;
     const float scale = in->fj[0].f * 1.4426950408889634f;
     const unsigned tid = threadIdx.x, lane = tid & 31u, warp = tid >> 5, g = lane >> 2, t = lane & 3u;
     const unsigned n16 = (q_rows + 15u) / 16u, tiles = heads * n16, runs = (tiles + 7u) / 8u;
     /* key position: prefix rows below kpre (valid below pre), then own row kpos - kpre */
-    const unsigned npt = (pre + KT - 1) / KT, kpre = npt * KT;
+    const unsigned npt = (pstride + KT - 1) / KT;
     if (tid == 0)
         for (int s = 0; s < NS; s++) {
             sm90_mbar_init(full + s, PLOW_NV_WARPS);
@@ -4677,12 +4697,14 @@ static __device__ __noinline__ void sp_attention_h16(const PlowDevInst* in, void
         const bool live = u < tiles;
         const unsigned h0 = u0 / n16, nh = min(u0 + 7u, tiles - 1u) / n16 - h0 + 1u;
         const unsigned h = live ? u / n16 : h0, q0 = live ? (u % n16) * 16u : 0u;
+        const unsigned pre = prows ? min(prows[b], pstride) : pstride, nptb = (pre + KT - 1) / KT,
+                       kpre = nptb * KT;
         const unsigned klen = lengths && lengths[b] < pre + kv_rows ? lengths[b] : pre + kv_rows;
         const unsigned own = klen > pre ? klen - pre : 0u, nkt = (kpre + own + KT - 1) / KT;
         const unsigned ra = q0 + g, rb = ra + 8u;
         auto load = [&](unsigned kt, float4 (&xr)[GI][4]) {
-            if (kt < npt) return;
-            const unsigned o0 = (kt - npt) * KT;
+            if (kt < nptb) return;
+            const unsigned o0 = (kt - nptb) * KT;
 #pragma unroll
             for (int i = 0; i < GI; i++) {
                 const unsigned e = tid + i * PLOW_NV_THREADS, hs = e / GH, w = e % GH;
@@ -4715,7 +4737,7 @@ static __device__ __noinline__ void sp_attention_h16(const PlowDevInst* in, void
         auto store = [&](unsigned r, const float4 (&xr)[GI][4]) {
             const unsigned s = r % NS, kt = r - c;
             float* X = arena + s * HS * XS;
-            if (kt < npt) {
+            if (kt < nptb) {
                 /* prefix tile: one bulk copy per head, completion counted in bytes */
                 if (tid == 0) {
                     if (r >= NS) sm90_mbar_wait(empty + s, (r / NS - 1) & 1u);
@@ -4802,7 +4824,7 @@ static __device__ __noinline__ void sp_attention_h16(const PlowDevInst* in, void
                 const float* Xh = arena + s * HS * XS + (h - h0) * XS;
                 const uint4* Kx = (const uint4*)Xh;
                 const uint4* Vx = (const uint4*)(Xh + KW);
-                const unsigned k0 = kt * KT, klim = kt < npt ? pre : kpre + own;
+                const unsigned k0 = kt * KT, klim = kt < nptb ? min(pre, klen) : kpre + own;
                 /* three accumulator sets (hi.hi, hi.lo, lo.hi): independent MMA chains */
                 float sq[3][NJ][4];
 #pragma unroll
@@ -5051,6 +5073,8 @@ static __device__ __noinline__ void sp_attention_w256(const PlowDevInst* in, voi
 static __device__ __noinline__ void d_attention_f32(const PlowDevInst* in, void* const* T, unsigned slice, unsigned nblk,
                                        float* arena) {
     arena = sp_smem;
+    /* flags bit 5: per-item prefix rows in t5 (requires a prefix) */
+    if ((in->i[6] & 32u) && (!SP_TEN(6) || !SP_TEN(5))) __trap();
     /* flags bit 4: the prefix is pre-formatted (sp_attention_h16) */
     if (in->i[6] & 16u) {
 #if defined(PLOW_NV_HOPPER)

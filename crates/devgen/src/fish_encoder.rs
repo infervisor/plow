@@ -537,6 +537,7 @@ fn program_for(
                 out_stride: fc,
                 out_offset: k as u32,
             },
+            None,
         )?;
         s.done(e);
         if k + 1 == cfg.sizes.len() {

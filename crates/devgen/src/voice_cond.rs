@@ -202,6 +202,7 @@ pub(crate) fn s3tok(
                 out_stride: d,
                 out_offset: 0,
             },
+            None,
         )?;
         let v = s.done(e);
         // q and k are each scaled by hd^-1/4 in the reference: one 1/8 on the scores.
@@ -359,6 +360,7 @@ impl Seq {
                 out_stride,
                 out_offset,
             },
+            None,
         )?;
         Ok(self.done(e))
     }
@@ -406,6 +408,7 @@ pub(crate) fn camp_xvector(
                 out_stride: width,
                 out_offset: cin,
             },
+            None,
         )?;
         let cat = s.done(e);
         for i in 0..n {
@@ -572,6 +575,7 @@ pub(crate) fn ve(
                 out_stride: b * w,
                 out_offset: 0,
             },
+            None,
         )?;
         s.done(e);
         // h_{-1} = 0, c = 0.
@@ -592,6 +596,7 @@ pub(crate) fn ve(
                     out_stride: stride,
                     out_offset: offset,
                 },
+                None,
             )?;
             Ok(s.done(e))
         };
@@ -788,6 +793,7 @@ pub(crate) fn cond(
             out_stride: d,
             out_offset: 0,
         },
+        None,
     )?;
     s.done(e);
     let dep = s.last;
@@ -806,6 +812,7 @@ pub(crate) fn cond(
             out_stride: d,
             out_offset: d,
         },
+        None,
     )?;
     s.done(e);
     // Emotion row = exaggeration * w (the input scalar broadcast).
@@ -845,6 +852,7 @@ pub(crate) fn cond(
             out_stride: d,
             out_offset: (n - 1) * d,
         },
+        None,
     )?;
     s.done(e);
     Ok(())
@@ -1587,6 +1595,7 @@ fn voice_encoder(s: &mut Seq, cfg: &Cfg, d: Dims) -> Result<(), String> {
             out_stride: VE_MELS,
             out_offset: 0,
         },
+        None,
     )?;
     s.done(e);
     let mut c = conv("act.vc.vmel", "w.fe.mel40x2", frames, 402, VE_MELS);

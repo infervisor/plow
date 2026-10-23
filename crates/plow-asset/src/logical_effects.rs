@@ -140,7 +140,8 @@ fn band(d: &DevInst64, slot: usize) -> Option<Band> {
     };
     match (DevOp::from_u16(d.op)?, slot) {
         // out[b*j1 + r*i5 + i6 + c], x[b*j0 + r*i3 + i4 + c], c < i2 (the prefix format, i7
-        // bit 0, writes whole item blocks).
+        // bit 0, writes whole item blocks). With a device group (i7 bit 1, t2 read) the output
+        // item is g*i0 + b: still a multiple of j1, so the same band.
         (DevOp::CopyColsF32, 0) if d.i[7] & 1 == 0 => make(d.i[5], d.i[6], d.i[2], d.fj[2]),
         (DevOp::CopyColsF32, 1) => make(d.i[3], d.i[4], d.i[2], d.fj[1]),
         // out[r*(j0 or width) + j1 + c], c < width.
@@ -512,6 +513,48 @@ mod tests {
             for inst in [no_pos, no_z, bad_mode] {
                 assert!(outputs(&inst).is_err());
             }
+        });
+    }
+
+    #[test]
+    fn copy_group_and_attention_prefix_rows_are_reads() {
+        let mut b = Builder::new(1);
+        let [x, out, g, ctx, q, rows, idx] =
+            ["x", "out", "g", "ctx", "q", "rows", "idx"].map(|name| b.tensor(name, 1024));
+        let copy = b.emit(DevOp::CopyColsF32, vec![0], &[], |d| {
+            d.t[..3].copy_from_slice(&[out, x, g]);
+            d.i = [1, 1, 4, 4, 0, 4, 0, 2 | 4 << 8];
+            d.j = [0, 4];
+        });
+        b.emit(DevOp::AttentionF32, vec![0], &[copy], |d| {
+            d.t = [ctx, q, q, q, packet::dev::TENSOR_NONE, rows, out, idx];
+            d.i = [1, 1, 1, 1, 64, 0, 32, 1];
+        });
+        let p = b.finish();
+        let model = Model {
+            n_cu: 1,
+            target: 0,
+            tensors: p.tensors.clone(),
+            progs: vec![p],
+            kv_row_insts: vec![],
+            prog_t: vec![1],
+            gen: vec![],
+        };
+        crate::program::with_model(&model, |packet| {
+            let value = obligation(packet, 0).unwrap();
+            let entry = |handle: u32| {
+                value["address_map"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .find(|e| e["name"] == format!("tensor:{handle}"))
+                    .unwrap()
+                    .clone()
+            };
+            assert_eq!(entry(g)["readers"], json!([1]));
+            assert_eq!(entry(g)["writers"], json!([]));
+            assert_eq!(entry(rows)["readers"], json!([2]));
+            assert_eq!(entry(out)["writers"], json!([1]));
         });
     }
 
