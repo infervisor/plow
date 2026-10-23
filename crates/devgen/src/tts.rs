@@ -32,6 +32,32 @@ pub struct SpeechProfile {
     pub top_p: f32,
     /// Default repetition penalty (1.0 = none).
     pub repetition_penalty: f32,
+    /// Default top-k (0 = none).
+    pub top_k: u64,
+    /// Frames come from the packet's depth stage (`fish_depth.json`): each LM token is one frame
+    /// (`audio_token_base + class`) whose `frame_codes` codes ride beside it.
+    pub depth: bool,
+    /// The depth stage's sampler: 0 = Fish (bf16 parameters, RAS, no penalty), 1 = Breeze
+    /// (f32 parameters, backbone repetition penalty).
+    pub depth_sampler: u64,
+    /// Rendered into the template's `{instructions}` with `{instructions}` = the request's text.
+    pub instructions: Option<&'static str>,
+    /// Sub-bundle of an encoder-mode packet whose `act.enc_out` rows are the whole prompt's
+    /// embeddings (the `overlay` role): the prompt ids only size the prefill.
+    pub text_encoder: Option<&'static str>,
+    /// Voice cloning through the reference encoder packet.
+    pub clone: Option<CloneLayout>,
+}
+
+/// A cloning prompt: `head`, the reference transcript's prompt text, `mid`, the reference frames
+/// (one frame token each, its codes in `in.frame_codes`), an end frame whose every code is
+/// `eos_code` (if any), `tail`, then the text's prompt text and the suffix. `head` / `tail` =
+/// `None` keep the prompt prefix.
+pub struct CloneLayout {
+    pub head: Option<&'static [u64]>,
+    pub mid: &'static [u64],
+    pub tail: Option<&'static [u64]>,
+    pub eos_code: Option<u64>,
 }
 
 /// maya-research/Veena (model card): [SOH] <spk_v> text [EOH] [SOA] [SOS] -> SNAC codes, stop on
@@ -55,6 +81,12 @@ pub const VEENA: SpeechProfile = SpeechProfile {
     temperature: 0.4,
     top_p: 0.9,
     repetition_penalty: 1.0,
+    top_k: 0,
+    depth: false,
+    depth_sampler: 0,
+    instructions: None,
+    text_encoder: None,
+    clone: None,
 };
 
 /// canopylabs/orpheus-3b-0.1-ft (orpheus_tts `_format_prompt`): [SOH] BOS "voice: text" [EOT]
@@ -80,6 +112,94 @@ pub const ORPHEUS: SpeechProfile = SpeechProfile {
     // H100 c64, 214 requests: 1.0 ran 32 to the token cap (repetition loops, 5/81 clips CER > 0.3);
     // 1.1, 1.2 and 1.3 ran none, all clips CER <= 0.3.
     repetition_penalty: 1.1,
+    top_k: 0,
+    depth: false,
+    depth_sampler: 0,
+    instructions: None,
+    text_encoder: None,
+    clone: None,
+};
+
+/// fishaudio/s2-pro (fish-speech `inference.py`, no reference): system "convert the provided text
+/// to speech", user "<|speaker:0|>text", assistant "<|voice|>" -> one semantic token per 21.5 Hz
+/// frame (151678 + class) plus 9 depth codebooks, stop on <|im_end|>. Sampling: T 0.7, top-p 0.7,
+/// top-k 30 (RAS in the depth stage).
+pub const FISH: SpeechProfile = SpeechProfile {
+    prompt_template: "<|speaker:0|>{input}",
+    voice_token: "{voice}",
+    voices: &["default"],
+    prefix: &[
+        151644, 8948, 198, 14166, 279, 3897, 1467, 311, 8806, 151645, 198, 151644, 872, 198,
+    ],
+    suffix: &[151645, 198, 151644, 77091, 198, 151673],
+    stops: &[151645],
+    sample_rate: 44100,
+    frame_codes: 10,
+    codebook: 4096,
+    frame_samples: 2048,
+    audio_token_base: 151678,
+    // 21.5 frames/s over ~11-15 characters/s English; the official per-chunk budget is 1024 frames.
+    per_char_frames: 2.4,
+    max_new_tokens_cap: 1024,
+    temperature: 0.7,
+    top_p: 0.7,
+    repetition_penalty: 1.0,
+    top_k: 30,
+    depth: true,
+    depth_sampler: 0,
+    instructions: None,
+    text_encoder: None,
+    // `generate_long` with a reference: system "convert the provided text to speech reference to
+    // the following:\n\nText:\n<|speaker:0|>ref_text\n\nSpeech:\n" + the reference frames, then
+    // the user turn; each text part is tokenized on its own, no end frame.
+    clone: Some(CloneLayout {
+        head: Some(&[
+            151644, 8948, 198, 14166, 279, 3897, 1467, 311, 8806, 5785, 311, 279, 2701, 1447, 1178,
+            510,
+        ]),
+        mid: &[271, 55625, 510],
+        tail: Some(&[151645, 198, 151644, 872, 198]),
+        eos_code: None,
+    }),
+};
+
+/// BreezeBlue/Breeze-TTS-2 (`breeze_infer/templates.py`): each text segment `<bos>[S0]text` (voice
+/// design: `[S0]<ins_bos>instruction<ins_eos>text`) runs through the T5Gemma2 text encoder; its
+/// projected rows are the backbone prompt. One cb0 class per 12.5 Hz frame (EOS = class 2048) plus
+/// 15 depth codebooks. Sampling (`runtime.py`, `infer.py`): T 0.9, top-k 50, top-p 1.0,
+/// repetition penalty 1.1 on cb0, max 1500 frames.
+pub const BREEZE: SpeechProfile = SpeechProfile {
+    prompt_template: "[{voice}]{instructions}{input}",
+    voice_token: "[{voice}]",
+    voices: &["S0"],
+    prefix: &[2],
+    suffix: &[],
+    stops: &[2048],
+    sample_rate: 24000,
+    frame_codes: 16,
+    codebook: 2048,
+    frame_samples: 1920,
+    audio_token_base: 0,
+    // 12.5 frames/s over ~4 characters/s Mandarin (~2.8 frames per character; English needs
+    // ~1). Segments of (1500 - 21) / 3.2 = 462 characters stay inside the encoder's 512 rows.
+    per_char_frames: 3.2,
+    max_new_tokens_cap: 1500,
+    temperature: 0.9,
+    top_p: 1.0,
+    repetition_penalty: 1.1,
+    top_k: 50,
+    depth: true,
+    depth_sampler: 1,
+    instructions: Some("<ins_bos>{instructions}<ins_eos>"),
+    text_encoder: Some("text_encoder"),
+    // `ref_clone_tata`: [TE(<bos>[S0]ref_text)] [ref frames] [audio_eos: codebook_eos_token_id 0
+    // on every codebook] [TE(<bos>[S0]text)].
+    clone: Some(CloneLayout {
+        head: None,
+        mid: &[],
+        tail: None,
+        eos_code: Some(0),
+    }),
 };
 
 /// Chatterbox T3 (`tts.t3_cfg.v1`): a causal LM whose prefill rows are host embeddings (the
@@ -97,6 +217,7 @@ pub fn t3_pipeline_section(
     pos_base: u32,
     params: &[(String, u64)],
     dir: &std::path::Path,
+    voice_cond: bool,
 ) -> Result<SectionData, String> {
     use plow_asset::packet_pipeline::{PipelineDType, PipelineTensor};
     let causal = causal_pipeline_section(model, spec)?;
@@ -131,6 +252,10 @@ pub fn t3_pipeline_section(
     // the unconditional CFG member keeps positions but drops the text table.
     pipe.strings
         .insert("vocoder.packet".into(), crate::s3gen::PACKET.into());
+    if voice_cond {
+        pipe.strings
+            .insert("voice_cond.packet".into(), crate::voice_cond::PACKET.into());
+    }
     pipe.parameters.insert("prompt.bos_repeat".into(), 2);
     pipe.parameters.insert("cfg.uncond_drops_text".into(), 1);
     match t3_text_frontend(dir)? {
@@ -180,8 +305,10 @@ pub fn profile(name: &str) -> Result<&'static SpeechProfile, String> {
     match name {
         "veena" => Ok(&VEENA),
         "orpheus" => Ok(&ORPHEUS),
+        "fish" => Ok(&FISH),
+        "breeze" => Ok(&BREEZE),
         other => Err(format!(
-            "unknown tts profile {other:?} (known: veena, orpheus)"
+            "unknown tts profile {other:?} (known: veena, orpheus, fish, breeze)"
         )),
     }
 }
@@ -192,7 +319,8 @@ pub fn speech_pipeline_section(
     p: &SpeechProfile,
     vocab: u32,
 ) -> Result<SectionData, String> {
-    if p.audio_token_base + p.frame_codes * p.codebook > u64::from(vocab) {
+    let audio_rows = if p.depth { 1 } else { p.frame_codes };
+    if p.audio_token_base + audio_rows * p.codebook > u64::from(vocab) {
         return Err("tts profile audio codes exceed the vocabulary".into());
     }
     let causal = causal_pipeline_section(model, spec)?;
@@ -214,6 +342,29 @@ pub fn speech_pipeline_section(
     }
     pipe.strings
         .insert("codec.packet".into(), CODEC_PACKET.into());
+    if let Some(t) = p.instructions {
+        pipe.strings.insert("prompt.instructions".into(), t.into());
+    }
+    if let Some(t) = p.text_encoder {
+        pipe.strings.insert("text.encoder".into(), t.into());
+    }
+    if let Some(clone) = &p.clone {
+        pipe.strings
+            .insert("clone.encoder".into(), crate::mimi_encoder::PACKET.into());
+        if let Some(code) = clone.eos_code {
+            pipe.parameters.insert("clone.eos_code".into(), code);
+        }
+        // Space-separated ids: a pipeline holds at most 64 parameters.
+        for (list, key) in [
+            (clone.head, "clone.head"),
+            (Some(clone.mid), "clone.mid"),
+            (clone.tail, "clone.tail"),
+        ] {
+            let Some(list) = list else { continue };
+            let ids: Vec<String> = list.iter().map(u64::to_string).collect();
+            pipe.strings.insert(key.into(), ids.join(" "));
+        }
+    }
     let params = &mut pipe.parameters;
     let mut put = |k: String, v: u64| {
         params.insert(k, v);
@@ -243,6 +394,9 @@ pub fn speech_pipeline_section(
         u64::from(p.temperature.to_bits()),
     );
     put("sampling.top_p_f32".into(), u64::from(p.top_p.to_bits()));
+    put("sampling.top_k".into(), p.top_k);
+    put("frames.depth".into(), u64::from(p.depth));
+    put("frames.depth_sampler".into(), p.depth_sampler);
     put(
         "sampling.repetition_penalty_f32".into(),
         u64::from(p.repetition_penalty.to_bits()),

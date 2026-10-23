@@ -15,6 +15,8 @@ are the same steps by hand):
 | Veena | `recipes/infervisor/veena/sm90a-h100-tp1.toml` |
 | Chatterbox | `recipes/infervisor/chatterbox/sm90a-h100-tp1.toml` |
 | Chatterbox Multilingual V3 | `recipes/infervisor/chatterbox-mtl/sm90a-h100-tp1.toml` |
+| Fish S2 Pro (non-commercial weights) | `recipes/infervisor/fish-s2-pro/sm90a-h100-tp1.toml` |
+| Breeze TTS 2 (non-commercial weights) | `recipes/infervisor/breeze-tts-2/sm90a-h100-tp1.toml` |
 | Qwen3-ASR | `recipes/infervisor/qwen3-asr/sm90a-h100-tp1.toml` |
 
 ```sh
@@ -274,6 +276,56 @@ Served (`tts_bench.py --prompt-set chatterbox-mtl`, 24 prompts in 8 languages, ~
 | 200 | 32.6 | 21.9 s | 9.3 | 29 / 32 s | stream 200/400 |
 
 The table above is before streaming windows and the codec readback fix (2026-09-27).
+
+### Stateful stream codec (Fish S2, Breeze)
+
+A codec packet with `stream.stateful` = 1 carries step programs `step.b{B}.f{N}` that decode only
+a stream's new frames and keep every causal context (conv tails, attention K/V rings) in per-slot
+state, `stream.slots` (32) slots. Stream output then equals a whole decode (rel-L2 1.2-1.8e-5 vs
+0.50 for the 48-frame replay window on random Fish codes). The first step takes
+`PLOW_TTS_STREAM_FIRST_FRAMES` (1) frames; later steps wait for min(emitted, `stream.step_frames`)
+new frames. With every slot held, a stream falls back to the windowed path. The `codec_lm` media
+contract (`media_geometry.v1`) bounds every step's slots, inputs and code/PCM addresses.
+
+Windowed vs stateful (H100, same client): Fish c1 TTFA 46 -> 37 ms, c32 21.6 -> 29.6 audio s/s
+(RTF 1.17 -> 0.87); Breeze c1 49 -> 40 ms, c32 25.6 -> 31.3 (RTF 1.08 -> 0.84); CER unchanged.
+
+Breeze's text encoder runs on the engine thread before a request's first prefill chunk: run
+beside decode steps, each of its launches waited behind a persistent decode kernel (9.4 ms alone,
+155 ms + 189 ms lock wait at c8). c8 TTFA 422 -> 57 ms, c32 31.3 -> 35.8 audio s/s.
+
+### Veena and Orpheus vs vLLM + SNAC
+
+H100, 2026-10-21, same client (`tts_bench.py`, streamed), the packets' prompt framing, stops,
+budgets and sampling on both sides. Baseline: `vllm_speech_server.py` (vLLM 0.28 async engine,
+CUDA graphs, PyTorch SNAC per window; `--profile orpheus` for Orpheus), driven by
+`vllm_speech_probe.sh`. Cells are audio s/s, median TTFA.
+
+| | c1 | c8 | c32 | c64 |
+|---|---|---|---|---|
+| Veena, vLLM + SNAC | 3.1, 94 ms | 13.8, 216 ms | 38.7, 1254 ms | 78.3, 1034 ms |
+| Veena, plowrt | 3.4, 81 ms | 22.3, 92 ms | 53.0, 187 ms | 98.2, 195 ms |
+| Orpheus, vLLM + SNAC | 3.1, 94 ms | 14.9, 229 ms | 42.7, 1017 ms | 79.8, 1012 ms |
+| Orpheus, plowrt | 3.3, 82 ms | 22.5, 93 ms | 63.8, 116 ms | 101.3, 194 ms |
+
+Chatterbox (English) vs the stock `chatterbox-tts` path (`chatterbox_ref.py`, one request at a
+time, whole replies): RTF 0.64, 1.6 audio s/s, ~2.4 s to audio (T3 20.2 ms / token). plowrt:
+8.8 audio s/s and 133 ms TTFA at c1, 54.1 audio s/s at c32. Chatterbox Multilingual: below.
+
+### Fish S2 and Breeze vs their official servers
+
+H100, same texts (`chatterbox_ref.PROMPTS`), default sampling, no CFG, streamed. The official
+servers take one request at a time (Breeze answers 409 while busy, fish-speech queues), so their
+throughput is their `/batch` endpoint (Breeze) or 8 queued clients (Fish).
+
+| | TTFA c1 | RTF c1 | audio s/s c1 | audio s/s loaded | TTFA loaded |
+|---|---|---|---|---|---|
+| Fish, fish-speech `api_server --compile` | 1135 ms | 0.54 | 2.0 | 2.0 (c8) | 17.8 s |
+| Fish, plowrt | 37 ms | 0.23 | 4.3 | 21.4 (c8), 29.6 (c32) | 49 ms (c8) |
+| Breeze, `breeze_infer.api --fast-all` | 57.5 ms | 0.29 | 3.3 | 3.7 (batch 32) | |
+| Breeze, plowrt | 40 ms | 0.19 | 5.2 | 25.8 (c8), 35.8 (c32) | 57 ms (c8) |
+
+SGLang-omni (Fish) was not measured here.
 
 ### Streaming windows
 
@@ -565,6 +617,34 @@ Admission: requests past the slots queue (4 engine batches of ingress; the ASR f
 its own requests in flight at 256 and waits for mux room instead of answering 429). A CFG
 request takes two slots, so the 128-slot rung serves 64 Chatterbox requests; the rest queue
 (`DECODE_RUNG_MAX` = 128 is the packet format's decode/prefill boundary).
+
+## API (every speech model)
+
+`POST /v1/audio/speech` behaves the same on every speech model. Each model declares a
+`tts::api::SpeechSpec` from its packet (voices, languages and default, sample rate, sampling
+defaults, `max_tokens` cap, and which optional controls it takes); every request is checked against
+it in one order with one set of messages, then runs on the model's engine (`tts::serving`).
+`GET /v1/models` shows the spec as the card's `x_plow_speech`.
+
+| Field | Every model |
+|---|---|
+| `model`, `input`, `voice` | required; `input` at most 4096 characters, spoken as sentence segments; `voice` one of the card's `voices` |
+| `response_format` | `wav` (default) or `pcm` (s16le mono at the card's `sample_rate`) |
+| `stream` | chunked audio; the 200 and its headers go out with the first audio, so an error before any audio is a proper status and `server-timing` carries time to first audio |
+| `language` | one of the card's `languages` (default `default_language`); a model without languages rejects it |
+| `temperature`, `top_p` | honoured on every model (defaults: the card's `defaults`) |
+| `max_tokens` | the model's audio tokens per segment, 1..card `max_tokens` |
+| `seed` | same seed, text and settings at the same concurrency: same speech tokens (batched decode is not bitwise batch-invariant); whole and stream replies share those tokens, but the windowed stream codec differs from a whole decode (~2% rel-L2 on Veena); the stateful codecs (Fish S2, Breeze) match it to ~1e-5 rel-L2 (fp32 summation order, so not bitwise); SNAC codecs also draw their noise from the seed, so greedy (`temperature` 0) replies there share tokens but not PCM across seeds; unseeded requests sample anew |
+| `speed` | 1.0 only |
+| `top_k`, `repetition_penalty`, `cfg_weight`, `instructions`, `ref_audio` + `ref_text` | optional controls: taken where the card declares them (`defaults.top_k`, `defaults.repetition_penalty`, `defaults.cfg_weight`, `instructions`, `voice_cloning`), else 400 naming the field; a sampler with a bounded top-k (`limits.top_k_max`, Fish S2) takes `top_k` in 1..that bound and cannot turn it off |
+| `ref_audio` + `ref_text` | voice cloning (Breeze, Fish S2): base64 or `data:` URL audio (wav, mp3, flac, ogg) of at most 20.48 s (Breeze) / 23.78 s (Fish) and its exact transcript; the reference encoder (`ref_encoder.pkt`) runs once per request on the engine thread before the first prefill chunk, and every segment's prompt opens with the contract's clone layout: transcript, reference frames, then an end frame (Breeze) or the system turn's close (Fish). The Fish encoder is FP32 and matches the official server's codes exactly (9.3 s clip: 200/200 frames, 105 ms on H100); the request never takes a session (its frame rows are placeholders until encoded) |
+
+A schema error (unknown field, wrong type) is 400 `invalid_json`; every 429 carries `Retry-After`.
+A whole reply carries `x-plow-audio-seconds` and `x-plow-lm-ms`. `cfg_weight` is
+cond + w (cond - uncond); a model trained with `cfg_scale` s of uncond + s (cond - uncond) takes
+w = s - 1. Guided models (Chatterbox) segment long inputs by text tokens
+(`text.segment_text_tokens`, default 125 per segment) so one segment stays inside the speech-token
+budget in every language; later segments resume no session.
 
 ## Long inputs and real-time admission (codec-LM: Veena, Orpheus)
 

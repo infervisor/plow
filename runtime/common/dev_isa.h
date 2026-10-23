@@ -1520,6 +1520,22 @@ enum {
      * experts do NOT use it; they are MXFP4 on ops 85/86. */
     PLOW_DOP_GEMM_FP8_MX = 216,
     PLOW_DOP_COMPRESS_ROPE_QUANT = 217,
+    /* out[r] = table[tok] (+ codebook rows of a frame token, scaled): see DevOp::EmbedFrameBf16. */
+    PLOW_DOP_EMBED_FRAME_BF16 = 218,
+    /* Fish S2 top-k / nucleus / exponential-race sampling of a bf16 logit row; see DevOp::SampleFishBf16. */
+    PLOW_DOP_SAMPLE_FISH_BF16 = 219,
+    /* bf16 x . bf16 W^T -> f32 rows (fp32 accumulate); see DevOp::GemvF32Out. */
+    PLOW_DOP_GEMV_F32_OUT = 220,
+    /* Penalty / top-k / nucleus / Gumbel sampling of an f32 logit row; see DevOp::SampleSmallF32. */
+    PLOW_DOP_SAMPLE_SMALL_F32 = 221,
+    /* Per-slot carried tail rows of a streaming FP32 stage (gather | store); see DevOp::StreamTailF32. */
+    PLOW_DOP_STREAM_TAIL_F32 = 222,
+    /* Masked per-segment column sum/mean/max/std over rows (f64); see DevOp::ReduceRowsF32. */
+    PLOW_DOP_REDUCE_ROWS_F32 = 223,
+    /* out = min(clamp(floor((in*mul + add)/div), lo, hi), min_with) in i64; see DevOp::LengthAffineU32. */
+    PLOW_DOP_LENGTH_AFFINE_U32 = 224,
+    /* librosa trim(top_db, ref=max) of a 1-D signal per item; see DevOp::TrimSilenceF32. */
+    PLOW_DOP_TRIM_SILENCE_F32 = 225,
 
     PLOW_DOP__COUNT
 };

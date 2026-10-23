@@ -536,6 +536,7 @@ pub const RUNTIME: &[KnobSpec] = &[
     KnobSpec::new("rt.token_batch", Some("PLOW_TOKEN_BATCH"), Layer::Runtime, Domain::Bool, ON, DIAG),
     KnobSpec::new("rt.prefix_cache", Some("PLOW_PREFIX_CACHE"), Layer::Runtime, Domain::Bool, ON, PROMOTED),
     KnobSpec::new("rt.tts_first_lookahead", Some("PLOW_TTS_FIRST_LOOKAHEAD"), Layer::Runtime, USIZE, Default::Static(Val::Nat(1)), OPT_IN),
+    KnobSpec::new("rt.tts_stream_first_frames", Some("PLOW_TTS_STREAM_FIRST_FRAMES"), Layer::Runtime, USIZE, Default::Static(Val::Nat(1)), OPT_IN),
     KnobSpec::new("rt.tts_realtime", Some("PLOW_TTS_REALTIME"), Layer::Runtime, Domain::Bool, ON, PROMOTED),
     KnobSpec::new("rt.tts_admit_wait_ms", Some("PLOW_TTS_ADMIT_WAIT_MS"), Layer::Runtime, USIZE, Default::Static(Val::Nat(6000)), OPT_IN),
     KnobSpec::new("rt.tts_turn_batch", Some("PLOW_TTS_TURN_BATCH"), Layer::Runtime, USIZE, Default::Static(Val::Nat(16)), DIAG),

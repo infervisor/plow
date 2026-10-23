@@ -62,6 +62,19 @@ def pct(xs, q):
     return xs[min(len(xs) - 1, int(q * len(xs)))]
 
 
+def card_sample_rate(url, model):
+    """The model card's `x_plow_speech.sample_rate` (None when the server publishes none)."""
+    try:
+        with urllib.request.urlopen(f"{url}/v1/models", timeout=10) as r:
+            cards = json.load(r)["data"]
+    except Exception:
+        return None
+    for c in cards:
+        if c.get("id") == model:
+            return (c.get("x_plow_speech") or {}).get("sample_rate")
+    return None
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--url", required=True)
@@ -77,15 +90,22 @@ def main():
     ap.add_argument("--warmup", type=int, default=2)
     ap.add_argument("--prompt-set", choices=["veena", "chatterbox", "chatterbox-mtl"], default="veena")
     ap.add_argument("--voice", default=None, help="override every prompt's voice")
+    ap.add_argument("--ref-audio", default=None, help="clone every request's voice from this wav (a comma list: cycled)")
     ap.add_argument("--session", default=None, help="X-Session-Id prefix (one session per client thread)")
     args = ap.parse_args()
-    global SESSION, PROMPT_SET
+    global SESSION, PROMPT_SET, SR
+    SR = card_sample_rate(args.url, args.model) or SR
     SESSION, PROMPT_SET = args.session, args.prompt_set
     os.makedirs(args.out, exist_ok=True)
     tag = args.tag or f"{'stream' if args.stream else 'full'}_c{args.conc}"
     extra = dict(temperature=0.0) if args.greedy else {}
     if args.repetition_penalty is not None:
         extra["repetition_penalty"] = args.repetition_penalty
+    refs = []
+    if args.ref_audio:
+        import base64
+        refs = [base64.b64encode(open(f, "rb").read()).decode() for f in args.ref_audio.split(",")]
+    per = lambda i: dict(extra, ref_audio=refs[i % len(refs)]) if refs else extra
     prompts = VEENA_PROMPTS if args.prompt_set == "veena" else [("default", t) for t in CBX_TEXTS]
     if args.prompt_set == "chatterbox-mtl":
         prompts = [("default", t) for _, t in MTL_PROMPTS]
@@ -93,10 +113,10 @@ def main():
         prompts = [(args.voice, t) for _, t in prompts]
     jobs = [(prompts[i % len(prompts)], i) for i in range(args.n)]
     for (spk, text), i in jobs[: args.warmup]:
-        one(args.url, args.model, spk, text, args.stream, 1000 + i, extra)
+        one(args.url, args.model, spk, text, args.stream, 1000 + i, per(i))
     t0 = time.perf_counter()
     with cf.ThreadPoolExecutor(args.conc) as ex:
-        res = list(ex.map(lambda j: one(args.url, args.model, j[0][0], j[0][1], args.stream, j[1] + 1, extra), jobs))
+        res = list(ex.map(lambda j: one(args.url, args.model, j[0][0], j[0][1], args.stream, j[1] + 1, per(j[1])), jobs))
     wall = time.perf_counter() - t0
     texts = {}
     rows = []

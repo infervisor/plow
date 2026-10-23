@@ -383,6 +383,7 @@ fn validate_decode_ladder_impl(blob: &DevBlob, segmented: bool, routed: &[bool])
                     | DevOp::AddNorm
                     | DevOp::Embed
                     | DevOp::EmbedPosBf16
+                    | DevOp::EmbedFrameBf16
                     | DevOp::FlashDecode
                     | DevOp::FlashDecodeFp8
                     | DevOp::FlashMerge,

@@ -84,6 +84,8 @@ mod decode_context;
 mod decode_object;
 use decode_object::{BoundDecodeObject, DecodeModule};
 mod decode_rung;
+mod fish_depth;
+pub use fish_depth::{FishInfo, FishRow};
 mod gen_decode;
 mod mixed_step;
 mod moe_lt;
@@ -2559,6 +2561,8 @@ pub struct GpuEngine {
     qwen_prefill: Option<crate::device::cuda::qwen_gdn::NativeGdn>,
     /// The packet carries `act.mm_span` (bidirectional media spans): chunks must not split them.
     mm_spans: bool,
+    /// An encoder-mode packet (`act.enc_out`, bidirectional): a prompt is one launch, never split.
+    encoder: bool,
     packet_roles: [Option<PacketRole>; plow_asset::segment_roles::MAX_ROLE as usize],
     decode_packet_roles: Vec<u8>,
     cublaslt_decode: Vec<Option<LibraryRoute>>,
@@ -2717,6 +2721,9 @@ pub struct GpuEngine {
     seq_tokens: Vec<Vec<u32>>,
     /// A prompt's prefix-cache key staged for the next attach of that slot (DP router hashes).
     staged_prefix: Vec<Option<crate::memory::vmm::PrefixKey>>,
+    /// The slot's prompt rows are not determined by its ids (frame codes beside them): its first
+    /// prefill chunk never attaches a cached prefix.
+    prefix_attach_off: Vec<bool>,
     /// A launch's host window is open ([`Self::token_batch_step_window`]): snapshot restores skip
     /// their stream drain and their holds wait in `deferred_attach` for the step's own drain.
     window_open: bool,
@@ -2799,6 +2806,10 @@ pub struct GpuEngine {
     /// Bytes of every batch-major `kv.*` tensor one cache row takes (static per-slot KV).
     kv_row_bytes: u64,
     slot_generations: Vec<u32>,
+    /// Fish S2 depth stage ([`fish_depth`]); `None` for every other packet.
+    fish: Option<fish_depth::FishDepth>,
+    /// The serial prefill's last chunk's terminal row (its lm_head row of `act.hn`).
+    pf_terminal_row: u32,
     /// Span-mode verify (`in.rowslot` packets); see [`spec`].
     spec: Option<spec::SpecRt>,
     spec_draft: Option<spec_draft::SpecDraft>,
@@ -4818,6 +4829,7 @@ impl GpuEngine {
                     )));
                 }
                 if !packet_cache
+                    && td.init.is_none()
                     && is_checkpoint_tensor(i, &td.name, packed_prefill_metadata.as_ref())
                 {
                     let src = ckpt.tensor(&td.name).ok_or_else(|| {
@@ -7295,6 +7307,7 @@ impl GpuEngine {
             seg_pf,
             qwen_prefill,
             mm_spans: false,
+            encoder: false,
             packet_roles,
             cublaslt_decode,
             cublaslt_decode_graph: None,
@@ -7368,6 +7381,7 @@ impl GpuEngine {
             kv_pressure_events: 0,
             seq_tokens: vec![Vec::new(); batch],
             staged_prefix: vec![None; batch],
+            prefix_attach_off: vec![false; batch],
             window_open: false,
             deferred_attach: Vec::new(),
             window_event: None,
@@ -7414,6 +7428,8 @@ impl GpuEngine {
                 .checked_div(batch as u64 * (blob.tensors[t_pos].bytes / 4))
                 .unwrap_or(0),
             slot_generations: vec![0; batch],
+            fish: None,
+            pf_terminal_row: 0,
             spec,
             spec_draft: None,
             row_slot_twin,
@@ -7425,7 +7441,9 @@ impl GpuEngine {
         };
         engine.spec_upload_identity()?;
         engine.mm_spans = engine.handle_of("act.mm_span").is_some();
+        engine.encoder = engine.handle_of("act.enc_out").is_some();
         engine.packed_terminal = packed_terminal::PackedTerminal::load(&engine)?;
+        engine.fish = fish_depth::FishDepth::load_if_present(&engine, &blob, &raw)?;
         engine.shared_tail =
             shared_tail::SharedTail::load(&engine, &blob, kv_shared_tail_metadata.as_ref())?;
         engine.token_batch = token_batch::CudaTokenBatch::load(&engine);
@@ -8090,6 +8108,7 @@ impl GpuEngine {
 
     pub fn retire_slot(&mut self, b: usize, cache_output: bool) {
         self.staged_prefix[b] = None;
+        self.prefix_attach_off[b] = false;
         if let Some(p) = self.pipe.as_mut() {
             if p.queue.defer_retire(b, cache_output) {
                 return;
@@ -8136,6 +8155,7 @@ impl GpuEngine {
 
     fn reset_packed_admission(&mut self, b: usize) {
         self.staged_prefix[b] = None;
+        self.prefix_attach_off[b] = false;
         if self.packed_admission[b] == PackedAdmission::Ready {
             self.kv_admission_epoch = self.kv_admission_epoch.wrapping_add(1);
         }
@@ -11514,7 +11534,7 @@ impl GpuEngine {
         }
         // VMM: first chunk of a fresh sequence consults the prefix cache —
         // a hit shares the whole-block prefix and moves the frontier there.
-        if self.pos[b] == 0 && self.vmm_prefix_enabled() {
+        if self.pos[b] == 0 && self.vmm_prefix_enabled() && !self.prefix_attach_off[b] {
             self.vmm_attach(b, prompt, None)?;
         }
         let c0 = self.pos[b] as usize;
@@ -11580,6 +11600,13 @@ impl GpuEngine {
             .count();
         if n_allowed == 0 {
             return smallest;
+        }
+        if self.encoder {
+            // Past the widest allowed rung the launch splits and `prefill_chunk` reports Progress.
+            return self.prefill[..n_allowed]
+                .iter()
+                .position(|b| b.t as usize >= rem)
+                .unwrap_or(n_allowed - 1);
         }
         // NO top-rung shortcut: "largest rung that still fills" is not optimal. Under a
         // 4224-row top rung an 8192-row prompt takes [4224, 3968->4096] = 128 padded rows,
@@ -11712,6 +11739,7 @@ impl GpuEngine {
         }
         // Patch this bucket's instruction stream for the chunk, then enqueue
         // the covering window as an async H2D on the engine stream.
+        self.pf_terminal_row = (real - 1) as u32;
         {
             let b = &mut self.prefill[bi];
             for &ix in &b.rope_sites {

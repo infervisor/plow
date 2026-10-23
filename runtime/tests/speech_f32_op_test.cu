@@ -45,6 +45,10 @@ GOLDEN(g_grouped_attention_f32);
 GOLDEN(g_gemm_f32);
 GOLDEN(g_gather_rows_f32);
 GOLDEN(g_copy_cols_f32);
+GOLDEN(g_stream_tail_f32);
+GOLDEN(g_reduce_rows_f32);
+GOLDEN(g_length_affine_u32);
+GOLDEN(g_trim_silence_f32);
 GOLDEN(g_conv1d_f32);
 GOLDEN(g_conv_transpose1d_f32);
 GOLDEN(g_unary_f32);
@@ -144,13 +148,14 @@ enum Mode { FP32, BF16, INT, F64 };
 /* pre: a GPU instruction run first (preparing an input); ref: the golden's instruction (c.in). */
 static void run(const char* name, Case& c, golden_fn golden, std::vector<unsigned> outs, Mode mode,
                 double tol = 1e-5, size_t flips = 0, const PlowDevInst* pre = nullptr,
-                const PlowDevInst* ref_in = nullptr) {
+                const PlowDevInst* ref_in = nullptr, size_t npre = 1) {
     c.upload();
     std::vector<void*> th;
     for (auto& h : c.host) th.push_back(h.data());
     golden(ref_in ? ref_in : &c.in, 0, 1, th.data(), nullptr);
     void** td = upload_table(c.dev);
-    if (pre) k_speech<<<g_nblk, 256, kSmem>>>(*pre, td);
+    if (pre)
+        for (size_t i = 0; i < npre; i++) k_speech<<<g_nblk, 256, kSmem>>>(pre[i], td);
     k_speech<<<g_nblk, 256, kSmem>>>(c.in, td);
     CK(cudaGetLastError());
     CK(cudaDeviceSynchronize());
@@ -328,7 +333,8 @@ static void t_conv(const char* name, unsigned batches, unsigned frames, unsigned
                    unsigned oc, unsigned kernel, unsigned stride, unsigned pb, unsigned pa,
                    unsigned flags) {
     Case c;
-    const unsigned of = (frames + pb + pa - kernel) / stride + 1, ow = (width + pb + pa - kernel) / stride + 1;
+    const unsigned ws = flags >> 16 ? flags >> 16 : stride;
+    const unsigned of = (frames + pb + pa - kernel) / stride + 1, ow = (width + pb + pa - kernel) / ws + 1;
     const unsigned stored = flags & 1u ? 1u : ic;
     unsigned o = c.out((size_t)batches * of * ow * oc);
     unsigned x = c.f32((size_t)batches * frames * width * ic, 1.f);
@@ -579,6 +585,62 @@ static void t_copy_cols() {
     run("CopyColsF32 broadcast into concat", c, g_copy_cols_f32, {o}, FP32);
 }
 
+/* StreamTailF32: gather (fresh streams zero their tail, column window zc0) and store (z rows
+ * n..n+L), against the golden; the chained case gathers then stores on the device. Copies only:
+ * tol 0. */
+static void st_inst(PlowDevInst& in, unsigned z, unsigned src, unsigned state, unsigned slot, unsigned n,
+                    unsigned pos, unsigned B, unsigned slots, unsigned L, unsigned N, unsigned C, unsigned Cz,
+                    unsigned zc0, unsigned src_stride, unsigned mode) {
+    in.op = PLOW_DOP_STREAM_TAIL_F32;
+    in.t[0] = z; in.t[1] = src; in.t[2] = state; in.t[3] = slot; in.t[4] = n; in.t[5] = pos;
+    in.i[0] = B; in.i[1] = L; in.i[2] = N; in.i[3] = C; in.i[4] = Cz; in.i[5] = zc0; in.i[6] = src_stride;
+    in.i[7] = mode; in.fj[1].u = slots;
+}
+static void t_stream_tail() {
+    struct G { const char* name; unsigned L, N, C, Cz, zc0, src_stride; };
+    for (const G& g : {G{"StreamTailF32 gather window zc0=9", 5, 7, 24, 40, 9, 48},
+                       G{"StreamTailF32 gather full width L>N", 8, 3, 32, 32, 0, 32}}) {
+        Case c; const unsigned B = 4, slots = 6;
+        unsigned z = c.out((size_t)B * (g.L + g.N) * g.Cz);
+        unsigned src = c.f32((size_t)(B * g.N - 1) * g.src_stride + g.Cz, 1.f);
+        unsigned state = c.f32((size_t)slots * g.L * g.C, 1.f);
+        unsigned slot = c.u32({3, 0, 5, 1}), n = c.u32({g.N, 0, 3, 1}), pos = c.u32({0, 12, 4, 0});
+        st_inst(c.in, z, src, state, slot, n, pos, B, slots, g.L, g.N, g.C, g.Cz, g.zc0, g.src_stride, 0);
+        run(g.name, c, g_stream_tail_f32, {z}, FP32, 0.0);
+    }
+    {
+        /* n = 0, n < L, n == L, n > L (= N) and a window: state rows read z rows n..n+L. */
+        Case c; const unsigned B = 4, slots = 6, L = 5, N = 7, C = 24, Cz = 40, zc0 = 9;
+        unsigned z = c.f32((size_t)B * (L + N) * Cz, 1.f);
+        unsigned state = c.f32((size_t)slots * L * C, 1.f);
+        unsigned slot = c.u32({2, 5, 0, 4}), n = c.u32({0, 3, 5, 7});
+        st_inst(c.in, PLOW_TENSOR_NONE, z, state, slot, n, PLOW_TENSOR_NONE, B, slots, L, N, C, Cz, zc0, 0, 1);
+        run("StreamTailF32 store n=0,<L,=L,>L zc0=9", c, g_stream_tail_f32, {state}, FP32, 0.0);
+    }
+    {
+        /* Device gather then store; items with pos = 0 and n = 0 must leave zeros. */
+        Case c; const unsigned B = 5, slots = 5, L = 6, N = 4, C = 16, Cz = 24, zc0 = 4, ss = 24;
+        unsigned z = c.out((size_t)B * (L + N) * Cz);
+        unsigned src = c.f32((size_t)B * N * ss, 1.f);
+        unsigned state = c.f32((size_t)slots * L * C, 1.f);
+        unsigned slot = c.u32({4, 1, 3, 0, 2}), n = c.u32({0, 4, 2, 0, 3}), pos = c.u32({0, 9, 0, 7, 3});
+        PlowDevInst gather;
+        memset(&gather, 0, sizeof(gather));
+        for (auto& t : gather.t) t = PLOW_TENSOR_NONE;
+        st_inst(gather, z, src, state, slot, n, pos, B, slots, L, N, C, Cz, zc0, ss, 0);
+        st_inst(c.in, PLOW_TENSOR_NONE, z, state, slot, n, PLOW_TENSOR_NONE, B, slots, L, N, C, Cz, zc0, 0, 1);
+        std::vector<void*> th;
+        for (auto& h : c.host) th.push_back(h.data());
+        g_stream_tail_f32(&gather, 0, 1, th.data(), nullptr);
+        run("StreamTailF32 gather->store chain", c, g_stream_tail_f32, {state}, FP32, 0.0, 0, &gather);
+        const float* st = (const float*)c.host[state].data();
+        bool zeros = true;
+        for (size_t i = 0; i < (size_t)L * C; i++) zeros &= st[(size_t)4 * L * C + i] == 0.f;
+        printf("  %-34s fresh n=0 slot zero -> %s\n", "StreamTailF32 chain", zeros ? "PASS" : "FAIL");
+        if (!zeros) g_fail = 1;
+    }
+}
+
 struct ConvSpec {
     unsigned batch, in_rows, cin, cout, kernel, stride, dil_or_opad, groups, before, after;
     unsigned mode, pre, post;
@@ -590,6 +652,7 @@ struct ConvSpec {
     bool wide = false; /* flags bit 14: split-bf16 wide tiles */
     bool tapmajor = false; /* flags bit 15: weights [cout][kernel][cin/groups] */
     bool wg = false; /* flags bit 17: the wgmma arm of the pointwise wide tile (sm_90a) */
+    bool dual = false; /* flags bit 19: alpha [cin | cout], an input then an output snake */
 };
 
 static unsigned conv_out_rows(const ConvSpec& s, bool transpose) {
@@ -649,10 +712,12 @@ static void build_conv(Case& c, const ConvSpec& s, bool transpose, unsigned& o) 
                 for (unsigned k = 0; k < s.kernel; k++)
                     memcpy(&c.host[w][(((size_t)o * s.kernel + k) * cg + i) * es], &src[(((size_t)o * cg + i) * s.kernel + k) * es], es);
     }
-    const bool wsplit = s.wg && !transpose && s.groups == 1 && !s.f16;
-    if (wsplit) append_wsplit(c.host[w], s.cout, s.cin * s.kernel);
+    /* ConvTranspose: the merged-phase image [stride*cout][2*cin] of phase-major weights. */
+    const bool wsplit = s.wg && s.groups == 1 && !s.f16 && (!transpose || (s.tapmajor && s.kernel == 2 * s.stride));
+    if (wsplit && transpose) append_wsplit(c.host[w], s.stride * s.cout, 2 * s.cin);
+    else if (wsplit) append_wsplit(c.host[w], s.cout, s.cin * s.kernel);
     unsigned b = s.bias ? c.f32(s.cout, 0.2f) : PLOW_TENSOR_NONE;
-    unsigned a = s.alpha ? c.f32(std::max(s.cin, s.cout), 0.4f, 0.6f) : PLOW_TENSOR_NONE;
+    unsigned a = s.alpha ? c.f32(s.dual ? s.cin + s.cout : std::max(s.cin, s.cout), 0.4f, 0.6f) : PLOW_TENSOR_NONE;
     unsigned r = s.residual ? c.f32((size_t)s.batch * out_rows * s.cout, 1.f) : PLOW_TENSOR_NONE;
     unsigned l = s.lengths.empty() ? PLOW_TENSOR_NONE : c.u32(s.lengths);
     if (s.row_scale) c.in.t[7] = c.f32((size_t)s.batch * out_rows, 1.f);
@@ -662,7 +727,8 @@ static void build_conv(Case& c, const ConvSpec& s, bool transpose, unsigned& o) 
     c.in.i[4] = s.kernel; c.in.i[5] = s.stride; c.in.i[6] = s.dil_or_opad; c.in.i[7] = s.groups;
     c.in.fj[0].f = s.slope; c.in.fj[1].u = pads(s.before, s.after);
     c.in.fj[2].u = conv_flags(s.mode, s.pre, s.post, s.f16) | (s.tc ? 1u << 13 : 0u) | (s.wide ? 1u << 14 : 0u) |
-                   (s.tapmajor ? 1u << 15 : 0u) | (s.wg ? 1u << 17 : 0u) | (wsplit ? 1u << 18 : 0u);
+                   (s.tapmajor ? 1u << 15 : 0u) | (s.wg ? 1u << 17 : 0u) | (wsplit ? 1u << 18 : 0u) |
+                   (s.dual ? 1u << 19 : 0u);
 }
 
 static void t_conv1d(const char* name, const ConvSpec& s, double tol = 2e-5) {
@@ -690,6 +756,164 @@ static void t_unary() {
         char name[64];
         snprintf(name, sizeof(name), "UnaryF32 %s", names[kind]);
         run(name, c, g_unary_f32, {o}, FP32, kind == 12 ? 1e-5 : 2e-6);
+    }
+    {
+        /* ACT_LOG (20) over [1e-10, 10]. */
+        Case c; const unsigned rows = 97, width = 40, stride = 50, col0 = 7;
+        unsigned o = c.f32(rows * stride, 1.f), x = c.f32(rows * stride, 5.f, 5.f);
+        float* xs = (float*)c.host[x].data();
+        for (unsigned i = 0; i < rows * stride; i++) xs[i] = fabsf(xs[i]) + (i % 13 == 0 ? 1e-10f : 1e-3f);
+        c.in.op = PLOW_DOP_UNARY_F32; c.in.t[0] = o; c.in.t[1] = x;
+        c.in.i[0] = rows; c.in.i[1] = width; c.in.i[2] = 20; c.in.i[3] = stride; c.in.i[4] = col0;
+        run("UnaryF32 log", c, g_unary_f32, {o}, FP32, 2e-6);
+    }
+}
+
+/* ReduceRowsF32: every op over ceil-mode segments with lengths (short last segment, empty and
+ * single-row segments) and a column window; then global fbank-sized means. f64 in row order on
+ * both sides: bit-exact expected. */
+static void t_reduce_rows() {
+    static const char* names[5] = {"sum", "mean", "max", "std", "mean_std"};
+    for (unsigned op = 0; op < 5; op++) {
+        Case c; const unsigned items = 4, rows = 250, width = 37, seg = 100, stride = 50, col0 = 9;
+        const unsigned segs = 3, ow = op == 4 ? 2 * width : width;
+        unsigned o = c.out((size_t)items * segs * ow), x = c.f32((size_t)items * rows * stride, 3.f, 0.5f);
+        unsigned l = c.u32({250, 173, 201, 1000});
+        c.in.op = PLOW_DOP_REDUCE_ROWS_F32; c.in.t[0] = o; c.in.t[1] = x; c.in.t[2] = l;
+        c.in.i[0] = items; c.in.i[1] = rows; c.in.i[2] = width; c.in.i[3] = op; c.in.i[4] = seg;
+        c.in.i[5] = stride; c.in.i[6] = col0;
+        char name[64];
+        snprintf(name, sizeof(name), "ReduceRowsF32 seg100 %s", names[op]);
+        run(name, c, g_reduce_rows_f32, {o}, FP32, 0.0);
+    }
+    for (unsigned op : {1u, 4u}) {
+        Case c; const unsigned items = 2, rows = 1000, width = 80;
+        unsigned o = c.out((size_t)items * (op == 4 ? 2 : 1) * width), x = c.f32((size_t)items * rows * width, 4.f, -6.f);
+        unsigned l = c.u32({1000, 637});
+        c.in.op = PLOW_DOP_REDUCE_ROWS_F32; c.in.t[0] = o; c.in.t[1] = x; c.in.t[2] = l;
+        c.in.i[0] = items; c.in.i[1] = rows; c.in.i[2] = width; c.in.i[3] = op;
+        run(op == 1 ? "ReduceRowsF32 global mean 2x1000x80" : "ReduceRowsF32 global mean_std", c, g_reduce_rows_f32,
+            {o}, FP32, 0.0);
+    }
+    {
+        Case c; const unsigned items = 3, rows = 64, width = 512;
+        unsigned o = c.out((size_t)items * width), x = c.f32((size_t)items * rows * width, 2.f);
+        c.in.op = PLOW_DOP_REDUCE_ROWS_F32; c.in.t[0] = o; c.in.t[1] = x;
+        c.in.i[0] = items; c.in.i[1] = rows; c.in.i[2] = width; c.in.i[3] = 2;
+        run("ReduceRowsF32 max no lengths", c, g_reduce_rows_f32, {o}, FP32, 0.0);
+    }
+}
+
+/* LengthAffineU32: floor division of negative values, clamps, the elementwise bound; div 0 writes
+ * nothing (both sides keep the fill). */
+static void t_length_affine() {
+    struct A { const char* name; unsigned mul; int add; unsigned div, lo, hi; bool bound; };
+    for (const A& a : {A{"LengthAffineU32 VE windows bound", 1, -51, 77, 1, 0xFFFFFFFFu, true},
+                       A{"LengthAffineU32 fbank frames clamp", 1, -400, 160, 0, 50, false},
+                       A{"LengthAffineU32 x2+1 /4", 2, 1, 4, 0, 0xFFFFFFFFu, true},
+                       A{"LengthAffineU32 div 0 no write", 1, 0, 0, 0, 0xFFFFFFFFu, false}}) {
+        Case c; const unsigned items = 300;
+        std::vector<uint32_t> in(items), bound(items);
+        for (unsigned i = 0; i < items; i++) {
+            in[i] = i < 200 ? i * 3 : (rng_s = rng_s * 1664525u + 1013904223u);
+            bound[i] = (i * 7919u) % 600u;
+        }
+        unsigned o = c.out(items), x = c.u32(in), m = a.bound ? c.u32(bound) : PLOW_TENSOR_NONE;
+        c.in.op = PLOW_DOP_LENGTH_AFFINE_U32; c.in.t[0] = o; c.in.t[1] = x; c.in.t[2] = m;
+        c.in.i[0] = items; c.in.i[1] = a.mul; c.in.i[2] = (unsigned)a.add; c.in.i[3] = a.div;
+        c.in.i[4] = a.lo; c.in.i[5] = a.hi;
+        run(a.name, c, g_length_affine_u32, {o}, INT);
+    }
+}
+
+/* LstmCellF32 rows: c in place, h rows into a time-major [x | h] buffer at a column offset. */
+static void t_lstm_rows() {
+    Case c; const unsigned width = 256, rows = 25, zw = 296, t = 3;
+    const size_t zn = (size_t)(t + 2) * rows * zw;
+    unsigned z = c.f32(zn, 1.f), cs = c.f32((size_t)rows * width, 2.f), g = c.f32((size_t)rows * 4 * width, 4.f);
+    c.in.op = PLOW_DOP_LSTM_CELL_F32; c.in.t[0] = z; c.in.t[1] = cs; c.in.t[2] = g; c.in.t[3] = cs;
+    c.in.i[0] = width; c.in.i[1] = rows; c.in.i[2] = zw; c.in.i[3] = (t + 1) * rows * zw + 40;
+    run("LstmCellF32 25 rows h strided", c, g_lstm_cell_f32, {z, cs}, FP32);
+}
+
+/* AttentionF32 head_width 256: separate query rows and a fused [K | V] buffer under one stride. */
+static void t_attention_w256(const char* name, unsigned batch, unsigned q_rows, unsigned kv_rows, unsigned heads,
+                             std::vector<uint32_t> lengths, bool causal, bool bias, unsigned pad) {
+    Case c;
+    const unsigned hw = 256, width = heads * hw, stride = 2 * width + pad;
+    unsigned o = c.out((size_t)batch * q_rows * width);
+    unsigned q = c.f32((size_t)batch * q_rows * stride, 1.f), kv = c.f32((size_t)batch * kv_rows * stride, 1.f);
+    unsigned l = lengths.empty() ? PLOW_TENSOR_NONE : c.u32(lengths);
+    unsigned bs = bias ? c.f32((size_t)heads * q_rows * kv_rows, 1.f) : PLOW_TENSOR_NONE;
+    c.in.op = PLOW_DOP_ATTENTION_F32;
+    c.in.t[0] = o; c.in.t[1] = q; c.in.t[2] = kv; c.in.t[3] = kv; c.in.t[4] = l; c.in.t[5] = bs;
+    c.in.i[0] = batch; c.in.i[1] = q_rows; c.in.i[2] = kv_rows; c.in.i[3] = heads; c.in.i[4] = hw;
+    c.in.i[5] = stride; c.in.i[6] = causal; c.in.i[7] = q_rows * kv_rows;
+    c.in.fj[0].f = 1.0f / 16.0f;
+    c.in.fj[1].u = pad; c.in.fj[2].u = width + pad;
+    run(name, c, g_attention_f32, {o}, FP32, 2e-5);
+}
+
+/* TrimSilenceF32 against librosa 0.11 effects.trim(frame 2048, hop 512) indices, computed in
+ * Python over these exact signals (xorshift-free LCG noise times piecewise amplitudes). */
+struct TrimSeg { unsigned end; float amp; };
+struct TrimVec { unsigned seed, len_in; std::vector<TrimSeg> segs; unsigned s20, e20, s60, e60; };
+static std::vector<TrimVec> trim_vectors() {
+    std::vector<TrimSeg> f;
+    for (unsigned k = 0; k < 16; k++) f.push_back({1500u * (k + 1), ldexpf(1.f, -(int)k)});
+    f.push_back({~0u, 0.f});
+    return {
+        {1, 20000, {{5000, 0.f}, {14000, 0.5f}, {~0u, 0.001f}}, 4096, 15360, 4096, 20000},
+        {2, 7000, {{~0u, 0.f}}, 0, 7000, 0, 7000},
+        {3, 12345, {{~0u, 0.25f}}, 0, 12345, 0, 12345},
+        {4, 300, {{~0u, 0.5f}}, 0, 300, 0, 300},
+        {5, 30000, {{3000, 3e-3f}, {9000, 0.5f}, {~0u, 0.f}}, 2048, 10240, 0, 10240},
+        {6, 24000, f, 0, 6656, 0, 16384},
+        {7, 22000, {{2000, 0.f}, {4000, 0.3f}, {15000, 0.f}, {16000, 0.3f}, {~0u, 0.f}}, 1024, 17408, 1024, 17408},
+    };
+}
+static void trim_signal(const TrimVec& v, float* x, unsigned cap) {
+    uint32_t st = v.seed;
+    unsigned si = 0;
+    const unsigned len = v.len_in < cap ? v.len_in : cap;
+    for (unsigned i = 0; i < cap; i++) {
+        st = st * 1664525u + 1013904223u;
+        const float u = (float)((int)(st >> 8) - 8388608) / 8388608.0f;
+        while (i >= v.segs[si].end) si++;
+        x[i] = i < len ? u * v.segs[si].amp : 0.f;
+    }
+}
+static void t_trim_silence() {
+    const std::vector<TrimVec> vs = trim_vectors();
+    const unsigned cap = 24000, items = (unsigned)vs.size();
+    for (float top_db : {20.f, 60.f, 0.f}) {
+        Case c;
+        unsigned o = c.out((size_t)items * cap), x = c.add((size_t)items * cap * 4), lo = c.out(items);
+        std::vector<uint32_t> li;
+        for (unsigned b = 0; b < items; b++) {
+            trim_signal(vs[b], (float*)c.host[x].data() + (size_t)b * cap, cap);
+            li.push_back(vs[b].len_in);
+        }
+        unsigned l = c.u32(li);
+        c.in.op = PLOW_DOP_TRIM_SILENCE_F32; c.in.t[0] = o; c.in.t[1] = x; c.in.t[2] = l; c.in.t[3] = lo;
+        c.in.i[0] = items; c.in.i[1] = cap; c.in.i[2] = 2048; c.in.i[3] = 512; c.in.fj[0].f = top_db;
+        char name[64];
+        snprintf(name, sizeof(name), "TrimSilenceF32 top_db %g", top_db);
+        run(name, c, g_trim_silence_f32, {o, lo}, INT);
+        /* The golden's result (host buffers) against librosa's [start, end). */
+        const float* xs = (const float*)c.host[x].data();
+        const float* os = (const float*)c.host[o].data();
+        const uint32_t* ls = (const uint32_t*)c.host[lo].data();
+        bool ok = true;
+        for (unsigned b = 0; b < items; b++) {
+            const unsigned s0 = top_db == 0.f ? 0 : top_db == 20.f ? vs[b].s20 : vs[b].s60;
+            const unsigned e0 = top_db == 0.f ? 0 : top_db == 20.f ? vs[b].e20 : vs[b].e60;
+            if (ls[b] != e0 - s0) ok = false;
+            for (unsigned i = 0; i < cap && ok; i++)
+                if (os[(size_t)b * cap + i] != (i < e0 - s0 ? xs[(size_t)b * cap + s0 + i] : 0.f)) ok = false;
+        }
+        printf("  %-34s librosa indices -> %s\n", name, ok ? "PASS" : "FAIL");
+        if (!ok) g_fail = 1;
     }
 }
 
@@ -950,6 +1174,26 @@ static void t_attention(const char* name, unsigned batch, unsigned rows, unsigne
     run(name, c, g_attention_f32, {o}, FP32, 2e-5);
 }
 
+/* Stream mode: fused QKV item rows [hist carried | n new]; positions mask absent history, and the
+ * TC flag must fall back to the fp32 kernel. */
+static void t_attention_stream(const char* name, unsigned batch, unsigned hist, unsigned n, unsigned win,
+                               std::vector<uint32_t> pos, std::vector<uint32_t> lengths, bool tc) {
+    Case c;
+    const unsigned heads = 4, hw = 64, width = heads * hw, stride = 3 * width, rows = hist + n;
+    unsigned o = c.out((size_t)batch * n * width);
+    unsigned qkv = c.f32((size_t)batch * rows * stride, 1.f);
+    unsigned ps = c.u32(pos);
+    unsigned l = lengths.empty() ? PLOW_TENSOR_NONE : c.u32(lengths);
+    c.in.op = PLOW_DOP_ATTENTION_F32;
+    c.in.t[0] = o; c.in.t[1] = qkv; c.in.t[2] = qkv; c.in.t[3] = qkv; c.in.t[4] = l; c.in.t[5] = PLOW_TENSOR_NONE;
+    c.in.t[6] = PLOW_TENSOR_NONE; c.in.t[7] = ps;
+    c.in.i[0] = batch; c.in.i[1] = n; c.in.i[2] = rows; c.in.i[3] = heads; c.in.i[4] = hw;
+    c.in.i[5] = stride; c.in.i[6] = 1u | 8u | (tc ? 2u : 0u) | (win << 16); c.in.i[7] = hist;
+    c.in.fj[0].f = 0.125f;
+    c.in.fj[1].u = width; c.in.fj[2].u = 2 * width;
+    run(name, c, g_attention_f32, {o}, FP32, 2e-5);
+}
+
 /* Keys = [prefix block index[b] (pre rows, [K | V] rows) | own rows of a fused QKV tensor]. */
 static void t_attention_prefix(const char* name, unsigned batch, unsigned rows, unsigned pre, unsigned blocks,
                                std::vector<uint32_t> index, std::vector<uint32_t> lengths, bool tc) {
@@ -1146,6 +1390,170 @@ static void bench_signal() {
         bench("AttentionF32 8x64 2x1200 (len 1200/1000)", c, 4.0 * heads * hw * rows * (1200.0 + 1000.0), 0);
     }
 }
+
+static std::vector<uint32_t> fetch(Case& c, unsigned id) {
+    std::vector<uint32_t> v(c.host[id].size() / 4);
+    CK(cudaMemcpy(v.data(), c.dev[id], c.host[id].size(), cudaMemcpyDeviceToHost));
+    return v;
+}
+static void verdict(const char* name, const char* what, bool pass) {
+    printf("  %-34s %s -> %s\n", name, what, pass ? "PASS" : "FAIL");
+    if (!pass) g_fail = 1;
+}
+
+/* Per-item prefix rows (AttentionF32 flags bit 5, t5 = pre_b per item). Separate Q/K/V; own K/V
+ * rows past each item's length are NaN / 1e30; prefix rows no user of a block reads are NaN
+ * (fp32 / tc routes) or, for h16, formatted tiles past the last one any user reads are NaN.
+ * route: 0 fp32 kernel (tc flag off), 1 tc (kernel chosen by q_rows), 2 h16. When every
+ * pre_b >= i7 the output is also compared bitwise with the flag-off instruction. */
+static void t_attention_prefix_rows(const char* name, int route, unsigned batch, unsigned q_rows, unsigned hw,
+                                    unsigned pre, unsigned blocks, std::vector<uint32_t> index,
+                                    std::vector<uint32_t> rows, std::vector<uint32_t> lengths) {
+    Case c;
+    const unsigned heads = 4, width = heads * hw, kv_rows = 50;
+    auto pre_b = [&](unsigned b) { return std::min(rows[b], pre); };
+    auto klen = [&](unsigned b) {
+        const unsigned all = pre_b(b) + kv_rows;
+        return lengths.empty() ? all : std::min(lengths[b], all);
+    };
+    unsigned o = c.out((size_t)batch * q_rows * width);
+    unsigned q = c.f32((size_t)batch * q_rows * width, 1.f);
+    unsigned k = c.f32((size_t)batch * kv_rows * width, 1.f);
+    unsigned v = c.f32((size_t)batch * kv_rows * width, 1.f);
+    unsigned pf = c.f32((size_t)blocks * pre * 2 * width, 1.f);
+    unsigned ix = c.u32(index), pr = c.u32(rows);
+    unsigned l = lengths.empty() ? PLOW_TENSOR_NONE : c.u32(lengths);
+    std::vector<unsigned> used(blocks, 0);
+    for (unsigned b = 0; b < batch; b++)
+        used[index[b]] = std::max(used[index[b]], route == 2 ? pre_b(b) : std::min(pre_b(b), klen(b)));
+    if (route != 2) {
+        float* P = (float*)c.host[pf].data();
+        for (unsigned blk = 0; blk < blocks; blk++)
+            for (size_t e = ((size_t)blk * pre + used[blk]) * 2 * width; e < (size_t)(blk + 1) * pre * 2 * width; e++)
+                P[e] = NAN;
+    }
+    float *K = (float*)c.host[k].data(), *V = (float*)c.host[v].data();
+    for (unsigned b = 0; b < batch; b++) {
+        const unsigned own = klen(b) > pre_b(b) ? klen(b) - pre_b(b) : 0u;
+        for (size_t e = ((size_t)b * kv_rows + own) * width; e < (size_t)(b + 1) * kv_rows * width; e++) {
+            K[e] = NAN;
+            V[e] = 1e30f;
+        }
+    }
+    c.in.op = PLOW_DOP_ATTENTION_F32;
+    c.in.t[0] = o; c.in.t[1] = q; c.in.t[2] = k; c.in.t[3] = v; c.in.t[4] = l; c.in.t[5] = pr;
+    c.in.t[6] = pf; c.in.t[7] = ix;
+    c.in.i[0] = batch; c.in.i[1] = q_rows; c.in.i[2] = kv_rows; c.in.i[3] = heads; c.in.i[4] = hw;
+    c.in.i[5] = 0; c.in.i[6] = (route ? 2u : 0u) | 32u; c.in.i[7] = pre;
+    c.in.fj[0].f = 0.125f;
+    const PlowDevInst ref = c.in;
+    std::vector<PlowDevInst> pres;
+#if defined(PLOW_NV_HOPPER)
+    if (route == 2) {
+        const unsigned npt = (pre + SPH_KT - 1) / SPH_KT, blk_floats = heads * npt * SPH_XS;
+        unsigned fm = c.out((size_t)blocks * blk_floats);
+        unsigned nan = c.out(blk_floats);
+        PlowDevInst f;
+        memset(&f, 0, sizeof(f));
+        for (auto& x : f.t) x = PLOW_TENSOR_NONE;
+        f.op = PLOW_DOP_COPY_COLS_F32;
+        f.t[0] = fm; f.t[1] = pf;
+        f.i[0] = blocks; f.i[1] = pre; f.i[2] = 2 * width; f.i[3] = 2 * width; f.i[7] = 1;
+        f.fj[1].u = pre * 2 * width; f.fj[2].u = blk_floats;
+        pres.push_back(f);
+        for (unsigned blk = 0; blk < blocks; blk++) {
+            const unsigned nu = (used[blk] + SPH_KT - 1) / SPH_KT;
+            if (nu == npt) continue;
+            PlowDevInst z = f;
+            z.t[1] = nan;
+            z.i[0] = heads; z.i[1] = 1; z.i[2] = (npt - nu) * SPH_XS; z.i[3] = 0; z.i[4] = 0; z.i[5] = 0;
+            z.i[6] = blk * blk_floats + nu * SPH_XS; z.i[7] = 0;
+            z.fj[1].u = 0; z.fj[2].u = npt * SPH_XS;
+            pres.push_back(z);
+        }
+        c.in.i[6] |= 16u;
+        c.in.t[6] = fm;
+    }
+#endif
+    run(name, c, g_attention_f32, {o}, FP32, 2e-5, 0, pres.empty() ? nullptr : pres.data(), &ref, pres.size());
+    bool full = true;
+    for (unsigned b = 0; b < batch; b++) full = full && rows[b] >= pre;
+    if (full) {
+        const std::vector<uint32_t> on = fetch(c, o);
+        PlowDevInst off = c.in;
+        off.i[6] &= ~32u;
+        off.t[5] = PLOW_TENSOR_NONE;
+        launch(off, c.dev);
+        verdict(name, "bitwise == flag off", fetch(c, o) == on);
+    }
+}
+
+/* CopyColsF32 flags bit 1 (plain): items land at group g; capacity in flag bits 8..31. */
+static void t_copy_cols_group(const char* name, unsigned g, unsigned capacity) {
+    Case c;
+    const unsigned items = 2, rows = 40, cols = 80, in_stride = 96, out_stride = 88;
+    unsigned o = c.out((size_t)capacity * rows * out_stride);
+    unsigned x = c.f32((size_t)items * rows * in_stride, 1.f);
+    unsigned gb = c.u32({g});
+    c.in.op = PLOW_DOP_COPY_COLS_F32; c.in.t[0] = o; c.in.t[1] = x; c.in.t[2] = gb;
+    c.in.i[0] = items; c.in.i[1] = rows; c.in.i[2] = cols; c.in.i[3] = in_stride; c.in.i[4] = 8;
+    c.in.i[5] = out_stride; c.in.i[6] = 3; c.in.i[7] = 2u | capacity << 8;
+    c.in.fj[1].u = rows * in_stride; c.in.fj[2].u = rows * out_stride;
+    run(name, c, g_copy_cols_f32, {o}, FP32, 0.0);
+}
+
+#if defined(PLOW_NV_HOPPER)
+/* CopyColsF32 format mode with a group: equals an ungrouped format shifted by g * items blocks;
+ * out-of-capacity groups write nothing; a short item over a long one leaves the short format's
+ * tiles exactly as a fresh write and the long one's later tiles untouched. */
+static void t_format_group() {
+    const char* name = "CopyColsF32 h16 format group";
+    Case c;
+    const unsigned heads = 4, width = heads * 64, items = 2, L = 45, S = 20, cap = 6;
+    const unsigned blk = heads * ((L + SPH_KT - 1) / SPH_KT) * SPH_XS;
+    const unsigned ns = heads * ((S + SPH_KT - 1) / SPH_KT) * SPH_XS;
+    unsigned xl = c.f32((size_t)items * L * 2 * width, 1.f), xs = c.f32((size_t)items * L * 2 * width, 1.f);
+    unsigned fresh = c.out((size_t)cap * blk), grp = c.out((size_t)cap * blk), guard = c.out((size_t)cap * blk);
+    unsigned freshs = c.out((size_t)cap * blk), reuse = c.out((size_t)cap * blk);
+    unsigned g2 = c.u32({2}), g0 = c.u32({0});
+    c.upload();
+    PlowDevInst f;
+    memset(&f, 0, sizeof(f));
+    for (auto& t : f.t) t = PLOW_TENSOR_NONE;
+    f.op = PLOW_DOP_COPY_COLS_F32;
+    f.i[0] = items; f.i[1] = L; f.i[2] = 2 * width; f.i[3] = 2 * width; f.i[7] = 1;
+    f.fj[1].u = L * 2 * width; f.fj[2].u = blk;
+    auto go = [&](unsigned out, unsigned x, unsigned rows, int g, unsigned capacity) {
+        PlowDevInst i = f;
+        i.t[0] = out; i.t[1] = x; i.i[1] = rows;
+        if (g >= 0) {
+            i.t[2] = g == 2 ? g2 : g0;
+            i.i[7] = 1u | 2u | capacity << 8;
+        }
+        launch(i, c.dev);
+    };
+    go(fresh, xl, L, -1, 0);
+    go(grp, xl, L, 2, cap);
+    go(guard, xl, L, 2, cap - 1);
+    go(freshs, xs, S, 0, cap);
+    go(reuse, xl, L, 2, cap);
+    go(reuse, xs, S, 2, cap);
+    const std::vector<uint32_t> a = fetch(c, fresh), b = fetch(c, grp), z = fetch(c, guard);
+    const std::vector<uint32_t> fs = fetch(c, freshs), r = fetch(c, reuse);
+    bool shift = true, none = true, tail = true;
+    for (size_t e = 0; e < (size_t)cap * blk; e++) {
+        const size_t it = e / blk, w = e % blk;
+        const bool in2 = it >= 2 * items && it < 3 * items;
+        shift = shift && b[e] == (in2 ? a[e - 2 * items * blk] : 0x7fc00badu);
+        none = none && z[e] == 0x7fc00badu;
+        const uint32_t want = !in2 ? 0x7fc00badu : w < ns ? fs[e - 2 * items * blk] : b[e];
+        tail = tail && r[e] == want;
+    }
+    verdict(name, "g=2 == ungrouped shifted", shift);
+    verdict(name, "(g+1)*items > capacity writes nothing", none);
+    verdict(name, "long->short reuse == fresh short", tail);
+}
+#endif
 
 int main(int argc, char** argv) {
     cudaDeviceProp prop;
@@ -1413,6 +1821,23 @@ int main(int argc, char** argv) {
         t_conv1d("Conv1dF32 row_scale ffma pointwise +res", rs[1]);
         t_conv1d("Conv1dF32 row_scale depthwise snake +res", rs[2]);
     }
+    {
+        /* SNAC residual unit: the depthwise conv applies the pointwise conv's snake too (bit 19). */
+        for (unsigned dil : {1u, 3u, 9u}) {
+            char name[64];
+            snprintf(name, sizeof(name), "Conv1dF32 depthwise k7 d%u snake->snake dual len", dil);
+            ConvSpec d = {2, 2048, 512, 512, 7, 1, dil, 512, 3 * dil, 3 * dil, 0, 12, 12, false, true, true, false,
+                          {2048, 1501}, 0.f};
+            d.dual = true;
+            t_conv1d(name, d);
+        }
+        ConvSpec r = {2, 300, 64, 64, 7, 1, 3, 64, 9, 9, 0, 12, 12, false, true, true, true, {300, 211}, 0.f};
+        r.dual = true;
+        t_conv1d("Conv1dF32 depthwise snake->snake dual +res", r);
+        ConvSpec t = {2, 257, 64, 96, 3, 1, 1, 1, 1, 1, 0, 12, 12, false, true, true, false, {257, 100}, 0.f, true};
+        t.dual = true;
+        t_conv1d("Conv1dF32 dense k3 snake->snake dual tc", t);
+    }
     t_attention("AttentionF32 tc 8x64 2x1200 lengths", 2, 1200, 8, 64, {1200, 1000}, false, false, false, true);
     t_attention("AttentionF32 tc 8x64 causal bias fused", 2, 300, 8, 64, {300, 217}, true, true, true, true);
     t_attention("AttentionF32 tc 4x64 ragged rows", 1, 77, 4, 64, {}, false, false, false, true);
@@ -1472,6 +1897,32 @@ int main(int argc, char** argv) {
         ConvSpec g8{2, 300, 256, 4 * 68, 1, 1, 1, 4, 0, 0, 0, 0, 0, false, true, false, true, {300, 123}, 0.f, true};
         g8.wide = g8.wg = true;
         t_conv1d("Conv1dF32 wgmma grouped pointwise g4 +res len", g8, 1e-4);
+        /* Merged-phase ConvTranspose1d (kernel 2*stride, phase-major): SNAC's four upsamplers,
+         * Fish's causal crop, T=1, lengths 0/1/T-1, no bias. */
+        struct CT { const char* name; ConvSpec s; };
+        const CT cts[] = {
+            {"ConvT wgmma s8 1024->512 crop4 len", {2, 33, 1024, 512, 16, 8, 0, 1, 4, 4, 0, 0, 0, false, true, false, false, {33, 17}, 0.f, true}},
+            {"ConvT wgmma s8 512->256 T1", {4, 1, 512, 256, 16, 8, 0, 1, 4, 4, 0, 0, 0, false, true, false, false, {}, 0.f, true}},
+            {"ConvT wgmma s4 256->128 len 0/1/T-1", {4, 200, 256, 128, 8, 4, 0, 1, 2, 2, 0, 0, 0, false, true, false, false, {200, 0, 1, 199}, 0.f, true}},
+            {"ConvT wgmma s2 128->64 len", {2, 1000, 128, 64, 4, 2, 0, 1, 1, 1, 0, 0, 0, false, true, false, false, {1000, 513}, 0.f, true}},
+            {"ConvT wgmma s8 causal 512->256 nobias", {3, 64, 512, 256, 16, 8, 0, 1, 0, 8, 0, 0, 0, false, false, false, false, {64, 63, 5}, 0.f, true}},
+            {"ConvT wgmma s4 big M 256->128", {32, 257, 256, 128, 8, 4, 0, 1, 2, 2, 0, 0, 0, false, true, false, false, {}, 0.f, true}},
+        };
+        /* The GPU reads a weight copy whose f32 part is NaN (golden keeps the clean one), so a
+         * fallback off the split image fails. */
+        for (const CT& t : cts) {
+            ConvSpec g = t.s;
+            g.wide = g.tapmajor = g.wg = true;
+            Case c; unsigned o;
+            build_conv(c, g, true, o);
+            const PlowDevInst ref = c.in;
+            const unsigned w = c.in.t[2], wp = c.add(c.host[w].size());
+            c.host[wp] = c.host[w];
+            const float nan = NAN;
+            for (size_t i = 0; i < (size_t)g.stride * g.cout * 2 * g.cin; i++) memcpy(&c.host[wp][i * 4], &nan, 4);
+            c.in.t[2] = wp;
+            run(t.name, c, g_conv_transpose1d_f32, {o}, FP32, 1e-4, 0, nullptr, &ref);
+        }
 #endif
         ConvSpec w7{2, 300, 64, 64, 7, 1, 3, 1, 9, 9, 0, 0, 12, false, true, true, true, {300, 170}, 0.f, true};
         t_conv1d("Conv1dF32 k7 snake-out +res (64x64 tiles)", w7);
@@ -1540,6 +1991,65 @@ int main(int argc, char** argv) {
     t_attention_prefix_h16("AttentionF32 h16 prefix 306+136", 2, 136, 306, 2, {1, 0}, {});
     t_attention_prefix_h16("AttentionF32 h16 prefix 300+264 lengths", 3, 264, 300, 3, {2, 0, 1}, {564, 400, 300});
 #endif
+    t_stream_tail();
+    t_reduce_rows();
+    t_length_affine();
+    t_attention_stream("attn stream L127 n17 w128", 4, 127, 17, 128, {0, 5, 127, 4000}, {144, 140, 130, 144}, false);
+    t_attention_stream("attn stream L127 n17 w128 tc", 3, 127, 17, 128, {0, 1, 300}, {}, true);
+    t_attention_stream("attn stream L71 n80 w72", 2, 71, 80, 72, {0, 1000}, {151, 100}, false);
+    t_attention_stream("attn stream L127 n1 w128", 5, 127, 1, 128, {0, 1, 126, 127, 128}, {}, false);
+    /* Voice-conditioning extensions (after the fixed-seed cases, so their data is unchanged). */
+    t_lstm_rows();
+    t_trim_silence();
+    t_attention_w256("AttentionF32 w256 4x256 q32 kv150 lengths", 3, 32, 150, 4, {150, 97, 1}, false, false, 0);
+    t_attention_w256("AttentionF32 w256 q70 kv150 unaligned", 2, 70, 150, 4, {}, false, false, 1);
+    t_attention_w256("AttentionF32 w256 causal bias", 2, 100, 100, 2, {100, 61}, true, true, 0);
+    t_conv("Conv2dF32 fcm 3x3 s(1,2) ffma", 2, 150, 80, 32, 32, 3, 1, 1, 1, 64 | 2 | (2u << 16));
+    t_conv("Conv2dF32 fcm 3x3 s(1,2) tc-3xtf32 NFCW", 1, 150, 80, 32, 32, 3, 1, 1, 1, 512 | 64 | (1 << 2) | (2u << 16));
+    t_conv("Conv2dF32 fcm 1x1 s(1,2) shortcut tc-3xtf32", 1, 150, 80, 32, 32, 1, 1, 0, 0, 512 | 64 | (2u << 16));
+    t_conv("Conv2dF32 3x3 s(2,1) tc-bf16 wide", 2, 64, 50, 48, 320, 3, 2, 1, 1, 256 | 64 | (2 << 2) | (1u << 16));
+    t_conv("Conv2dF32 depthwise s(1,3) f16 NCFW in", 2, 17, 31, 24, 24, 3, 1, 1, 1, 1 | (2 << 4) | (3u << 16));
+    /* Per-item prefix rows (AttentionF32 flag bit 5) on every route, and CopyColsF32 groups. */
+    {
+        const std::vector<uint32_t> idx = {0, 1, 0, 2, 1, 0, 2, 0};
+        const std::vector<uint32_t> sweep45 = {0, 1, 15, 16, 17, 44, 45, 900};
+        const std::vector<uint32_t> sweep48 = {17, 0, 47, 1, 48, 16, 15, 2};
+        /* cutting inside the own region, inside the prefix, and past the end */
+        const std::vector<uint32_t> len45 = {3, 1, 40, 16, 20, 60, 47, 90};
+        const std::vector<uint32_t> full = {45, 45, 45, 1000, 45, 45, 45, 45};
+        struct R { const char* name; int route; unsigned q, hw; };
+        const R routes[] = {
+            {"fp32 hw64", 0, 40, 64},   {"fp32 hw128", 0, 20, 128}, {"fp32 ragged hw72", 0, 33, 72},
+            {"tc64", 1, 16, 64},        {"tc64p<16,5>", 1, 40, 64}, {"tc64p<24,3>", 1, 72, 64},
+            {"tc64p<32,2>", 1, 136, 64},
+#if defined(PLOW_NV_HOPPER)
+            {"h16<3>", 2, 72, 64},      {"h16<2>", 2, 136, 64},
+#endif
+        };
+        for (const R& r : routes) {
+            char name[96];
+            snprintf(name, sizeof(name), "pre_b %s i7=45 sweep", r.name);
+            t_attention_prefix_rows(name, r.route, 8, r.q, r.hw, 45, 3, idx, sweep45, {});
+            snprintf(name, sizeof(name), "pre_b %s i7=45 lengths", r.name);
+            t_attention_prefix_rows(name, r.route, 8, r.q, r.hw, 45, 3, idx, sweep45, len45);
+            snprintf(name, sizeof(name), "pre_b %s i7=48 mixed", r.name);
+            t_attention_prefix_rows(name, r.route, 8, r.q, r.hw, 48, 3, {2, 2, 0, 1, 1, 0, 2, 0}, sweep48, {});
+            snprintf(name, sizeof(name), "pre_b %s all zero", r.name);
+            t_attention_prefix_rows(name, r.route, 8, r.q, r.hw, 45, 3, idx, std::vector<uint32_t>(8, 0), len45);
+            snprintf(name, sizeof(name), "pre_b %s full", r.name);
+            t_attention_prefix_rows(name, r.route, 8, r.q, r.hw, 45, 3, idx, full, {});
+            snprintf(name, sizeof(name), "pre_b %s full lengths", r.name);
+            t_attention_prefix_rows(name, r.route, 8, r.q, r.hw, 45, 3, idx, full, len45);
+        }
+        t_copy_cols_group("CopyColsF32 group g=0", 0, 6);
+        t_copy_cols_group("CopyColsF32 group g=2 (at capacity)", 2, 6);
+        t_copy_cols_group("CopyColsF32 group g=1 cap 4", 1, 4);
+        t_copy_cols_group("CopyColsF32 group g=3 guard", 3, 6);
+        t_copy_cols_group("CopyColsF32 group g=max guard", 0xFFFFFFFFu, 6);
+#if defined(PLOW_NV_HOPPER)
+        t_format_group();
+#endif
+    }
 
     if (argc > 1 && !strcmp(argv[1], "--bench")) {
         bench_signal();

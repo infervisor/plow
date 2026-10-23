@@ -49,6 +49,8 @@ def main():
         if sr != 16000:
             a = librosa.resample(a, orig_sr=sr, target_sr=16000)
         kw = dict(generate_kwargs=dict(language=lang, task="transcribe")) if lang else {}
+        if len(a) > 30 * 16000:
+            kw["return_timestamps"] = True  # Whisper's long-form decoding past one 30 s window
         hyp = asr({"raw": a.astype("float32"), "sampling_rate": 16000}, **kw)["text"]
         c = jiwer.cer(norm_lang(ref, lang), norm_lang(hyp, lang)) if lang else jiwer.cer(norm(ref), norm(hyp))
         cers.append(c)

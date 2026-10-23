@@ -84,26 +84,129 @@ fn codec_lm(p: &PacketPipeline, sidecars: &[MediaPacket<'_>]) -> Result<Value, S
         .checked_add(param(p, "prompt.suffix.count")?)
         .and_then(|n| n.checked_add(u64::from(p.strings.contains_key("prompt.voice_token"))))
         .ok_or("codec LM: prompt length overflows")?;
-    Ok(json!({"kind": "codec_lm",
+    // A depth-stage LM emits one token per frame; a codec-token LM one per code.
+    let codebook = param(p, "codec.codebook")?;
+    let audio_tokens = if p.parameters.get("frames.depth").copied().unwrap_or(0) != 0 {
+        codebook
+    } else {
+        codebook
+            .checked_mul(param(p, "codec.frame_codes")?)
+            .ok_or("codec LM: audio token range overflows")?
+    };
+    let mut family = json!({"kind": "codec_lm",
         "lm_sample_rate": param(p, "audio.sample_rate")?, "lm_codebook": param(p, "codec.codebook")?,
         "lm_frame_codes": param(p, "codec.frame_codes")?, "lm_frame_samples": param(p, "codec.frame_samples")?,
-        "token_base": param(p, "audio.token_base")?, "max_new_tokens": param(p, "tokens.max_new_cap")?,
+        "token_base": param(p, "audio.token_base")?, "audio_tokens": audio_tokens,
+        "max_new_tokens": param(p, "tokens.max_new_cap")?,
         "prompt_tokens": prompt, "max_context": param(p, "max_context")?, "stops": listed(p, "stop")?,
         "codec_sample_rate": param(c, "audio.sample_rate")?, "codebook": param(c, "codec.codebook")?,
         "frame_codes": param(c, "codec.frame_codes")?, "frame_samples": param(c, "codec.frame_samples")?,
         "codes_capacity": elements(c, "codes")?, "pcm_capacity": elements(c, "pcm")?,
         "window_frames": param(c, "stream.window_frames")?,
-        "lookahead_frames": param(c, "stream.lookahead_frames")?}))
+        "lookahead_frames": param(c, "stream.lookahead_frames")?,
+        "stream_slots": 0, "step_frames": 0, "steps": [], "slot_capacity": 0, "pos_capacity": 0,
+        "rope_capacity": 0, "new_rows_capacities": [], "clone_frames": [], "clone_pcm_capacity": 0,
+        "clone_codes_capacity": 0, "clone_sample_rate": 0, "clone_frame_samples": 0,
+        "clone_frame_codes": 0, "clone_codebook": 0, "clone_eos_code": []});
+    if c.parameters.get("stream.stateful").copied().unwrap_or(0) != 0 {
+        family.as_object_mut().unwrap().extend(stateful_codec(c)?);
+    }
+    if p.strings.contains_key("clone.encoder") {
+        let e = sidecar(p, "clone.encoder", sidecars, |e| {
+            e.driver == "codec.encode.v1"
+        })?;
+        let frames: Vec<u64> = e
+            .programs
+            .keys()
+            .filter_map(|role| role.strip_prefix("encode.f")?.parse().ok())
+            .collect();
+        if frames.is_empty() {
+            return Err("clone.encoder has no encode.f{F} program".into());
+        }
+        let Value::Object(m) = json!({"clone_frames": frames,
+            "clone_pcm_capacity": elements(e, "pcm")?, "clone_codes_capacity": elements(e, "codes")?,
+            "clone_sample_rate": param(e, "audio.sample_rate")?,
+            "clone_frame_samples": param(e, "codec.frame_samples")?,
+            "clone_frame_codes": param(e, "codec.frame_codes")?,
+            "clone_codebook": param(e, "codec.codebook")?, "clone_eos_code": p.parameters.get("clone.eos_code").map_or(Vec::new(), |&c| vec![c])})
+        else {
+            unreachable!()
+        };
+        family.as_object_mut().unwrap().extend(m);
+    }
+    Ok(family)
 }
 
-fn guided_lm(p: &PacketPipeline) -> Result<Value, String> {
-    Ok(json!({"kind": "guided_lm",
+/// The stateful stream steps `step.b{B}.f{N}` and the inputs they index.
+fn stateful_codec(c: &PacketPipeline) -> Result<serde_json::Map<String, Value>, String> {
+    let steps: Vec<[u64; 2]> = c
+        .programs
+        .keys()
+        .filter_map(|role| {
+            let (b, n) = role.strip_prefix("step.b")?.split_once(".f")?;
+            Some([b.parse().ok()?, n.parse().ok()?])
+        })
+        .collect();
+    let new_rows = (0..param(c, "lengths.count")?)
+        .map(|k| elements(c, &format!("stream.n.{k}")))
+        .collect::<Result<Vec<_>, _>>()?;
+    let Value::Object(m) = json!({"stream_slots": param(c, "stream.slots")?,
+        "step_frames": param(c, "stream.step_frames")?, "steps": steps,
+        "slot_capacity": elements(c, "stream.slot")?, "pos_capacity": elements(c, "stream.pos")?,
+        "rope_capacity": elements(c, "stream.rope_pos")?, "new_rows_capacities": new_rows})
+    else {
+        unreachable!()
+    };
+    Ok(m)
+}
+
+fn guided_lm(p: &PacketPipeline, sidecars: &[MediaPacket<'_>]) -> Result<Value, String> {
+    let mut family = json!({"kind": "guided_lm",
         "speech_vocab": param(p, "lm.speech_vocab")?, "start_speech": param(p, "lm.start_speech")?,
         "stop_speech": param(p, "lm.stop_speech")?, "valid_below": param(p, "lm.valid_below")?,
         "text_vocab": param(p, "lm.text_vocab")?, "start_text": param(p, "lm.start_text")?,
         "stop_text": param(p, "lm.stop_text")?, "max_speech_tokens": param(p, "lm.max_speech_tokens")?,
         "speech_positions": param(p, "lm.speech_pos_rows")?, "overlay_rows": param(p, "overlay_rows")?,
-        "max_context": param(p, "max_context")?}))
+        "max_context": param(p, "max_context")?, "lm_hidden": 0, "clone_seconds": [],
+        "clone_sample_rate": 0, "clone_pcm_capacity": 0, "clone_rows": 0, "clone_rows_elements": 0,
+        "clone_prompt_tokens": 0, "clone_prompt_mel": 0, "clone_spks": 0, "vocoder_prompt_max": 0,
+        "vocoder_slots": 0, "vocoder_slot_tokens": 0, "vocoder_slot_mel": 0, "vocoder_slot_spks": 0,
+        "vocoder_slot_lens": 0});
+    if p.strings.contains_key("voice_cond.packet") {
+        let e = sidecar(p, "voice_cond.packet", sidecars, |e| {
+            e.driver == "voice.encode.v1"
+        })?;
+        let v = sidecar(p, "vocoder.packet", sidecars, |v| {
+            v.tensors.contains_key("slot.prompt_token")
+        })?;
+        let mut seconds: Vec<u64> = e
+            .programs
+            .keys()
+            .filter_map(|role| {
+                let (s, _) = role.strip_prefix("encode.c")?.split_once('.')?;
+                s.parse().ok()
+            })
+            .collect();
+        seconds.dedup();
+        if seconds.is_empty() {
+            return Err("voice_cond.packet has no encode.c{S} program".into());
+        }
+        let Value::Object(m) = json!({"lm_hidden": param(p, "hidden")?, "clone_seconds": seconds,
+            "clone_sample_rate": param(e, "audio.sample_rate")?, "clone_pcm_capacity": elements(e, "pcm")?,
+            "clone_rows": param(e, "t3.rows")?, "clone_rows_elements": elements(e, "t3.rows")?,
+            "clone_prompt_tokens": elements(e, "gen.tokens")?,
+            "clone_prompt_mel": elements(e, "gen.prompt_mel")?, "clone_spks": elements(e, "gen.spks")?,
+            "vocoder_prompt_max": param(v, "prompt.max")?, "vocoder_slots": param(v, "voice.slots")?,
+            "vocoder_slot_tokens": elements(v, "slot.prompt_token")?,
+            "vocoder_slot_mel": elements(v, "slot.prompt_feat")?,
+            "vocoder_slot_spks": elements(v, "slot.spks")?,
+            "vocoder_slot_lens": elements(v, "slot.prompt_len")?})
+        else {
+            unreachable!()
+        };
+        family.as_object_mut().unwrap().extend(m);
+    }
+    Ok(family)
 }
 
 fn rnnt(p: &PacketPipeline, vocabulary: Option<usize>) -> Result<Value, String> {
@@ -189,7 +292,7 @@ pub fn request(
                 audio_lm(p, sidecars)?
             }
             "tts.codec_lm.v1" => codec_lm(p, sidecars)?,
-            "tts.guided_lm.v1" => guided_lm(p)?,
+            "tts.guided_lm.v1" => guided_lm(p, sidecars)?,
             "rnnt.greedy.v1" => rnnt(p, main.vocabulary)?,
             "vad.frame.v1" => vad(p)?,
             _ => continue,
@@ -300,6 +403,166 @@ mod tests {
         assert_eq!(family["codes_capacity"], 3584);
         assert_eq!(family["pcm_capacity"], 1048576);
         assert_eq!(family["stops"], serde_json::json!([128258]));
+    }
+
+    #[test]
+    fn stateful_codec_declares_its_steps() {
+        let (lm, mut codec) = codec_lm();
+        let windowed = request(&packet("model.pkt", &lm), &[packet("codec.pkt", &codec)])
+            .unwrap()
+            .unwrap();
+        assert_eq!(windowed["families"][0]["stream_slots"], 0);
+        assert_eq!(windowed["families"][0]["steps"], serde_json::json!([]));
+        let c = &mut codec[0];
+        for (k, v) in [
+            ("stream.stateful", 1),
+            ("stream.slots", 4),
+            ("stream.step_frames", 17),
+            ("lengths.count", 1),
+        ] {
+            c.parameters.insert(k.into(), v);
+        }
+        c.programs.insert("step.b1.f1".into(), 1);
+        c.programs.insert("step.b4.f17".into(), 2);
+        for (role, n) in [
+            ("stream.slot", 4),
+            ("stream.pos", 4),
+            ("stream.rope_pos", 68),
+            ("stream.n.0", 4),
+        ] {
+            c.tensors.insert(
+                role.into(),
+                PipelineTensor {
+                    name: format!("in.codec.{role}"),
+                    dtype: PipelineDType::U32,
+                    shape: vec![n],
+                },
+            );
+        }
+        let family = &request(&packet("model.pkt", &lm), &[packet("codec.pkt", &codec)])
+            .unwrap()
+            .unwrap()["families"][0];
+        assert_eq!(family["stream_slots"], 4);
+        assert_eq!(family["steps"], serde_json::json!([[1, 1], [4, 17]]));
+        assert_eq!(family["rope_capacity"], 68);
+        assert_eq!(family["new_rows_capacities"], serde_json::json!([4]));
+        codec[0].tensors.remove("stream.n.0");
+        assert!(request(&packet("model.pkt", &lm), &[packet("codec.pkt", &codec)]).is_err());
+    }
+
+    #[test]
+    fn clone_encoder_declares_its_capacities() {
+        let (mut lm, codec) = codec_lm();
+        lm[0]
+            .strings
+            .insert("clone.encoder".into(), "ref_encoder.pkt".into());
+        lm[0].parameters.insert("clone.eos_code".into(), 0);
+        let mut enc = pipeline(
+            "codec.encode",
+            "codec.encode.v1",
+            &[
+                ("audio.sample_rate", 24000),
+                ("codec.frame_samples", 2048),
+                ("codec.frame_codes", 7),
+                ("codec.codebook", 4096),
+            ],
+            &[],
+            &[("pcm", vec![131072]), ("codes", vec![64, 7])],
+        );
+        enc.programs = BTreeMap::from([("encode.f32".into(), 0), ("encode.f64".into(), 1)]);
+        let enc = vec![enc];
+        let sidecars = [packet("codec.pkt", &codec), packet("ref_encoder.pkt", &enc)];
+        let family = &request(&packet("model.pkt", &lm), &sidecars)
+            .unwrap()
+            .unwrap()["families"][0];
+        assert_eq!(family["clone_frames"], serde_json::json!([32, 64]));
+        assert_eq!(family["clone_codes_capacity"], 448);
+        assert_eq!(family["clone_frame_codes"], 7);
+        assert!(
+            request(&packet("model.pkt", &lm), &sidecars[..1]).is_err(),
+            "declared encoder absent"
+        );
+    }
+
+    #[test]
+    fn guided_voice_cond_declares_its_capacities() {
+        let mut lm = vec![pipeline(
+            "speech",
+            "tts.guided_lm.v1",
+            &[
+                ("lm.speech_vocab", 8194),
+                ("lm.start_speech", 6561),
+                ("lm.stop_speech", 6562),
+                ("lm.valid_below", 6561),
+                ("lm.text_vocab", 704),
+                ("lm.start_text", 255),
+                ("lm.stop_text", 0),
+                ("lm.max_speech_tokens", 1000),
+                ("lm.speech_pos_rows", 4100),
+                ("overlay_rows", 512),
+                ("max_context", 2048),
+                ("hidden", 1024),
+            ],
+            &[("vocoder.packet", "s3gen.pkt")],
+            &[],
+        )];
+        let mut enc = pipeline(
+            "voice.cond",
+            "voice.encode.v1",
+            &[("audio.sample_rate", 24000), ("t3.rows", 34)],
+            &[],
+            &[
+                ("pcm", vec![480000]),
+                ("t3.rows", vec![34816]),
+                ("gen.tokens", vec![250]),
+                ("gen.prompt_mel", vec![40000]),
+                ("gen.spks", vec![80]),
+            ],
+        );
+        enc.programs = BTreeMap::from([
+            ("encode.c10.0".into(), 0),
+            ("encode.c10.1".into(), 1),
+            ("encode.c20.0".into(), 2),
+            ("encode.c5.0".into(), 3),
+            ("stage.fe.c5.0".into(), 3),
+        ]);
+        let enc = vec![enc];
+        let voc = vec![pipeline(
+            "vocoder.synth",
+            "codec.v1",
+            &[("prompt.max", 250), ("voice.slots", 8)],
+            &[],
+            &[
+                ("slot.prompt_token", vec![2000]),
+                ("slot.prompt_feat", vec![320000]),
+                ("slot.spks", vec![640]),
+                ("slot.prompt_len", vec![8]),
+            ],
+        )];
+        let sidecars = [packet("s3gen.pkt", &voc), packet("voice_cond.pkt", &enc)];
+        let plain = &request(&packet("model.pkt", &lm), &[]).unwrap().unwrap()["families"][0];
+        assert_eq!(plain["clone_seconds"], serde_json::json!([]));
+        assert_eq!(plain["vocoder_slots"], 0);
+        lm[0]
+            .strings
+            .insert("voice_cond.packet".into(), "voice_cond.pkt".into());
+        let family = &request(&packet("model.pkt", &lm), &sidecars)
+            .unwrap()
+            .unwrap()["families"][0];
+        assert_eq!(family["clone_seconds"], serde_json::json!([10, 20, 5]));
+        assert_eq!(family["lm_hidden"], 1024);
+        assert_eq!(family["clone_rows_elements"], 34816);
+        assert_eq!(family["clone_prompt_mel"], 40000);
+        assert_eq!(family["vocoder_prompt_max"], 250);
+        assert_eq!(family["vocoder_slot_mel"], 320000);
+        assert!(
+            request(&packet("model.pkt", &lm), &sidecars[..1]).is_err(),
+            "declared voice encoder absent"
+        );
+        assert!(
+            request(&packet("model.pkt", &lm), &sidecars[1..]).is_err(),
+            "vocoder without voice slots"
+        );
     }
 
     #[test]

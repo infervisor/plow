@@ -1760,11 +1760,13 @@ __device__ __forceinline__ void plow_exec(const PlowDevInst* in, void* const* T,
         if (in->i[6] == 256)
             /* t7 (sm_90a TMA only): GEN_TMAP_KV_PAIR blob for the wgmma arm's K/V stager;
              * TENSOR_NONE -> nullptr -> cp.async staging, packets stay byte-compatible. */
+            /* i7 = nsplit | span handle << 16 (an encoder's bidirectional rows; 0 = causal). */
             d_flash_prefill_mux<256, 64, PLOW_NV_FA256_BKV>(
                 (const int*)TEN(6), (float*)TEN(0), (float*)TEN(1), (const __nv_bfloat16*)TEN(2),
                 (const __nv_bfloat16*)TEN(3), (const __nv_bfloat16*)TEN(4), (__nv_bfloat16*)TEN(5),
-                in->i[0], in->i[1], in->i[2], in->i[3], in->i[4], in->i[5], in->i[7], in->fj[1].u,
-                in->fj[2].u, in->fj[0].f, slice, nblk, arena, TEN(7));
+                in->i[0], in->i[1], in->i[2], in->i[3], in->i[4], in->i[5], in->i[7] & 0xFFFFu,
+                in->fj[1].u, in->fj[2].u, in->fj[0].f, slice, nblk, arena, TEN(7),
+                in->i[7] >> 16 ? (const unsigned*)T[in->i[7] >> 16] : nullptr);
         else
 #endif
 #if !PLOW_NV_FA_ONLY_HD256_EXACT && !PLOW_NV_FA_ONLY_HD256_ONLY
@@ -2080,6 +2082,10 @@ __device__ __forceinline__ void plow_exec(const PlowDevInst* in, void* const* T,
     case PLOW_DOP_RMSNORM_F32:
     case PLOW_DOP_ROPE_AXIAL_F32:
     case PLOW_DOP_CHUNK_ATTENTION_F32:
+    case PLOW_DOP_STREAM_TAIL_F32:
+    case PLOW_DOP_REDUCE_ROWS_F32:
+    case PLOW_DOP_LENGTH_AFFINE_U32:
+    case PLOW_DOP_TRIM_SILENCE_F32:
 #if defined(PLOW_NV_HOPPER)
         if (sp_wg_conv1d(in, T, slice, nblk)) break;
 #endif
@@ -2090,6 +2096,27 @@ __device__ __forceinline__ void plow_exec(const PlowDevInst* in, void* const* T,
         d_embed_pos((__nv_bfloat16*)TEN(0), (const __nv_bfloat16*)TEN(1), (const unsigned*)TEN(2),
                     (const __nv_bfloat16*)TEN(3), (const unsigned*)TEN(4), (const unsigned*)TEN(5),
                     in->i[0], in->i[1], in->i[2], in->i[3], slice, nblk);
+        break;
+    case PLOW_DOP_SAMPLE_FISH_BF16:
+        d_sample_fish((unsigned*)TEN(0), (const __nv_bfloat16*)TEN(1), (const float*)TEN(2), (const unsigned*)TEN(3),
+                      (const unsigned long long*)TEN(4), (const unsigned*)TEN(5), (unsigned*)TEN(6), (unsigned*)TEN(7), in->i[0],
+                      in->i[1], in->i[2], in->i[3], in->i[4], in->i[5], in->i[6], in->i[7], in->fj[1].u, slice,
+                      nblk, arena);
+        break;
+    case PLOW_DOP_GEMV_F32_OUT:
+        d_gemv_f32out((float*)TEN(0), (const __nv_bfloat16*)TEN(1), (const __nv_bfloat16*)TEN(2), in->i[0],
+                      in->i[1], in->i[2], slice, nblk);
+        break;
+    case PLOW_DOP_SAMPLE_SMALL_F32:
+        d_sample_small((unsigned*)TEN(0), (const float*)TEN(1), (const float*)TEN(2), (const unsigned*)TEN(3),
+                       (const unsigned long long*)TEN(4), (unsigned*)TEN(5), (const unsigned*)TEN(6),
+                       (unsigned*)TEN(7), in->i[0], in->i[1], in->i[2], in->i[3], in->i[4], in->i[5], in->i[7],
+                       in->fj[1].u, slice, nblk, arena);
+        break;
+    case PLOW_DOP_EMBED_FRAME_BF16:
+        d_embed_frame((__nv_bfloat16*)TEN(0), (const __nv_bfloat16*)TEN(1), (const unsigned*)TEN(2),
+                      (const __nv_bfloat16*)TEN(3), (const unsigned*)TEN(4), in->i[0], in->i[1], in->i[2],
+                      in->i[3], in->i[4], in->i[5], in->i[6], in->fj[0].f, slice, nblk);
         break;
 
     /* Terminal row selection for the unified token batch. One arm serves BOTH NVIDIA images:

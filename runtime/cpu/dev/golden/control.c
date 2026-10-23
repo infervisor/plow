@@ -38,6 +38,10 @@ void plow_cpu_register_golden(plow_cpu_kernel_fn* tab) {
     tab[PLOW_DOP_EMBED_F16_F32] = g_embed_f16_f32;
     tab[PLOW_DOP_EMBED_OVERLAY_BF16] = g_embed_overlay_bf16;
     tab[PLOW_DOP_EMBED_POS_BF16] = g_embed_pos_bf16;
+    tab[PLOW_DOP_EMBED_FRAME_BF16] = g_embed_frame_bf16;
+    tab[PLOW_DOP_SAMPLE_FISH_BF16] = g_sample_fish_bf16;
+    tab[PLOW_DOP_GEMV_F32_OUT] = g_gemv_f32_out;
+    tab[PLOW_DOP_SAMPLE_SMALL_F32] = g_sample_small_f32;
     tab[PLOW_DOP_LSTM_CELL_F32] = g_lstm_cell_f32;
     tab[PLOW_DOP_ARGMAX_F32] = g_argmax_f32;
     tab[PLOW_DOP_RELU_F32] = g_relu_f32;
@@ -47,6 +51,10 @@ void plow_cpu_register_golden(plow_cpu_kernel_fn* tab) {
     tab[PLOW_DOP_GROUPED_ATTENTION_F32] = g_grouped_attention_f32;
     tab[PLOW_DOP_GATHER_ROWS_F32] = g_gather_rows_f32;
     tab[PLOW_DOP_COPY_COLS_F32] = g_copy_cols_f32;
+    tab[PLOW_DOP_STREAM_TAIL_F32] = g_stream_tail_f32;
+    tab[PLOW_DOP_REDUCE_ROWS_F32] = g_reduce_rows_f32;
+    tab[PLOW_DOP_LENGTH_AFFINE_U32] = g_length_affine_u32;
+    tab[PLOW_DOP_TRIM_SILENCE_F32] = g_trim_silence_f32;
     tab[PLOW_DOP_CONV1D_F32] = g_conv1d_f32;
     tab[PLOW_DOP_CONV_TRANSPOSE1D_F32] = g_conv_transpose1d_f32;
     tab[PLOW_DOP_UNARY_F32] = g_unary_f32;

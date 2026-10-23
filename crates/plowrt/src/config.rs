@@ -210,6 +210,17 @@ pub struct RuntimeConfig {
     )]
     pub tts_first_lookahead: usize,
 
+    /// New frames a speech stream's FIRST stateful codec step waits for (stateful `codec.pkt`
+    /// only); each later step waits for as many new frames as were already emitted, up to
+    /// `stream.step_frames`.
+    #[arg(
+        long = "tts-stream-first-frames",
+        env = "PLOW_TTS_STREAM_FIRST_FRAMES",
+        default_value_t = 1,
+        global = true
+    )]
+    pub tts_stream_first_frames: usize,
+
     /// Real-time admission of codec-LM speech (`tts::realtime`): a request starts only while the
     /// decode step projected at one more request keeps every playing stream ahead of playback.
     #[arg(long = "tts-realtime", env = "PLOW_TTS_REALTIME", default_value_t = true, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]

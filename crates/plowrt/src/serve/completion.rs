@@ -523,6 +523,7 @@ async fn buffer_and_reply(
                 id,
                 text: delta,
                 logprobs,
+                ..
             } => {
                 run.first();
                 if let (Some(fmt), Some(lp)) = (&lp_fmt, &logprobs) {
@@ -635,7 +636,9 @@ fn sse_response(
                 }
             };
             let (choice, tail_usage, terminate) = match chunk {
-                StreamChunk::Token { id, text, logprobs } => {
+                StreamChunk::Token {
+                    id, text, logprobs, ..
+                } => {
                     let logprobs = st.lp_fmt.as_ref().map(|fmt| {
                         let mut lps = crate::serve::logprobs::CompletionLogprobs::default();
                         if let Some(lp) = &logprobs {

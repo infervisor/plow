@@ -149,7 +149,8 @@ pub fn op_classes(op: DevOp) -> &'static [&'static str] {
         | GemvAffineQ4 => &["gemv"],
 
         RmsNorm | RowRms | NormResidual | AddNorm | NormResidualNorm | LayerNorm | QwenRmsNorm
-        | QwenGatedNorm | KdaGatedNorm | LayerNormF32 | RowStatsF32 | RmsNormF32
+        | QwenGatedNorm | KdaGatedNorm | LayerNormF32 | RowStatsF32 | RmsNormF32 | ReduceRowsF32
+        | TrimSilenceF32
         // Engram's gate is two RMS reductions over `hidden` driving a gated residual add, so
         // its cost and its knob scope are a norm's, not the hc machinery's -- it mixes INTO the
         // mHC stream but carries none of the Sinkhorn/combine state HyperConnPre does.
@@ -179,7 +180,8 @@ pub fn op_classes(op: DevOp) -> &'static [&'static str] {
         | HyperConnPost
         | CausalDepthwiseConv1dF32
         | LstmCellF32
-        | CumSumF64 => &["recurrent"],
+        | CumSumF64
+        | StreamTailF32 => &["recurrent"],
 
         Argmax | ArgmaxFin | GemvArgmax | RowGather | ArgmaxF32 => &["sample"],
 
@@ -188,8 +190,9 @@ pub fn op_classes(op: DevOp) -> &'static [&'static str] {
         EngramEmbed
         | Nop | Residual | Sum4Bf16 | Glu | Embed | SoftCap | QuantFp8 | SituGlu | ZeroF32
         | CastF32Bf16 | PerLayerInput | GluStrided | ScaledAddF32 | GluF32 | SiluF32 | ReluF32
-        | BroadcastAddF32 | EmbedF16F32 | EmbedOverlayBf16 | EmbedPosBf16 | PackNcfwRowsF32
+        | BroadcastAddF32 | EmbedF16F32 | EmbedOverlayBf16 | EmbedPosBf16 | EmbedFrameBf16 | SampleFishBf16 | GemvF32Out | SampleSmallF32 | PackNcfwRowsF32
         | QuantFp8Block128 | GatherRowsF32 | CopyColsF32 | UnaryF32 | BinaryF32 | RandF32
+        | LengthAffineU32
         | RopeAxialF32 | MmRowsBf16 | MmSpanExtent => &["elementwise"],
     }
 }

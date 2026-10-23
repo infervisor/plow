@@ -5503,8 +5503,14 @@ __device__ void d_flash_prefill_mux(const int* __restrict__ req, float* __restri
                                     unsigned n_head, unsigned n_kv_head, unsigned q_pos0,
                                     unsigned window, unsigned nsplit, unsigned kv_stride,
                                     unsigned kv_mask, float scale, unsigned slice, unsigned nblk,
-                                    float* lds, const void* __restrict__ mapkv = nullptr) {
+                                    float* lds, const void* __restrict__ mapkv = nullptr,
+                                    const unsigned* __restrict__ span = nullptr) {
     KV_ILV_TRAP();
+    /* `span` (FlashPrefill i7 high half; an encoder's bidirectional rows, indexed by packed query
+     * row): only the PIPE=0, non-V3 body masks it. */
+#if PLOW_NV_FA_PIPE || PLOW_NV_FA_V3
+    if (span) { __trap(); return; }
+#endif
 #if PLOW_NV_PACKED_REQUEST
     if (req) {
         const unsigned count=(unsigned)req[0];
@@ -5563,6 +5569,8 @@ __device__ void d_flash_prefill_mux(const int* __restrict__ req, float* __restri
                 window,nsplit,kv_stride,kv_mask,scale,slice,nblk,lds
 #if PLOW_NV_FA_PIPE
                 ,nullptr,descriptor
+#else
+                ,nullptr,nullptr,span ? span+q0 : nullptr
 #endif
             );
             __syncthreads();
@@ -5611,6 +5619,9 @@ __device__ void d_flash_prefill_mux(const int* __restrict__ req, float* __restri
 #if PLOW_NV_FA_V3
                                          /* the single-request map covers the whole cache */
                                          , nullptr, req ? nullptr : mapkv
+#elif !PLOW_NV_FA_PIPE
+                                         , nullptr, nullptr,
+                                         span ? span + (req ? req[1 + 4 * r] : 0) : nullptr
 #endif
             );
         }

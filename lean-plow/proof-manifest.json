@@ -48,6 +48,7 @@
       {"theorem": "Plow.MediaGeometry.Rnnt.decode_steps_bounded"},
       {"theorem": "Plow.MediaGeometry.CodecLm.addresses_in_bounds", "checker": "Plow.MediaGeometry.CodecLm.Contract"},
       {"theorem": "Plow.MediaGeometry.CodecLm.token_decodes", "checker": "Plow.MediaGeometry.CodecLm.Contract"},
+      {"theorem": "Plow.MediaGeometry.GuidedLm.clone_addresses_in_bounds", "checker": "Plow.MediaGeometry.GuidedLm.Contract"},
       {"theorem": "Plow.MediaGeometry.Multimodal.soft_ids_disjoint", "checker": "Plow.MediaGeometry.Multimodal.Contract"}]},
     {"id": "kv_ring.v1", "scope": "kv_ring", "soundness": [
       {"theorem": "Plow.KvRing.checkLaunch_sound", "checker": "Plow.KvRing.checkLaunch"},

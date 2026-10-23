@@ -1,0 +1,103 @@
+# Fish Audio S2 Pro (fishaudio/s2-pro) on H100: Qwen3-4B-shaped slow AR over a 4097-class head
+# (semantic tokens + <|im_end|>), a 4-layer depth stage sampling the 9 residual codebooks inside one
+# cooperative aux program per decode rung (SampleFishBf16: top-k, nucleus, RAS), and the modded-DAC
+# codec lowered to codec.pkt (window-128 causal transformer, ConvNeXt upsamplers, snake decoder,
+# 44.1 kHz). Served through the standard speech API (`fish` speech profile). Weights are under the
+# Fish Audio research license (non-commercial).
+#
+#   PLOW_CAMPAIGN_NO_NIX=1 (this box only) PYREF=<python with torch + safetensors> \
+#   python3 scripts/campaign/campaign.py build recipes/infervisor/fish-s2-pro/sm90a-h100-tp1.toml --out <fresh dir>
+#
+# Streaming above ~16 concurrent requests is codec-bound (each 17-frame chunk re-decodes a 48-frame
+# window); plans/tts-depth-lm.md "Stateful streaming codec" is the fix.
+#
+# Gates: codec PCM vs scripts/tts/fish_codec_ref.py (torch, itself 2.6e-6 from the official decoder),
+# fish_gen greedy vs the official greedy codes, Whisper CER of served speech.
+
+schema = "plow.recipe.v1"
+namespace = "infervisor"
+name = "fish-s2-pro"
+label = "sm90a-h100-tp1"
+plow_git = "29a629ca44f1e102e74002cbb0542e468d7fb364"
+network = "qwen3"
+doc = "docs/runtime/tts.md"
+tracker = "docs/runtime/h100-speech-recipes.md"
+
+[target]
+vendor = "nvidia"
+isa = "sm_90a"
+sku = "H100 SXM5"
+units = 132
+num_gpus = 1
+parallel = "tp"
+
+[checkpoint]
+source = "hf:fishaudio/s2-pro"
+revision = "1de9996b6be38b745688de084d87a5633f714e4e"
+
+[cell]
+name = "fish-s2-pro-h100"
+# The Qwen3 checkpoint (restricted head, half-split RoPE rows) + depth sidecars the first prep writes.
+hf_dir = "{out}/prep/slow"
+gpu = "h100"
+arch = "sm_90a"
+n_cu = 132
+n_gpu = 1
+max_ctx = 4096
+
+[[prep]]
+name = "slow-checkpoint"
+script = "scripts/tts/fish_prep.py"
+python = "{env:PYREF}"
+args = ["{out}/prep/slow", "1de9996b6be38b745688de084d87a5633f714e4e"]
+
+[[prep]]
+name = "codec-export"
+script = "scripts/tts/fish_codec_export.py"
+python = "{env:PYREF}"
+args = ["{out}/prep/codec", "1de9996b6be38b745688de084d87a5633f714e4e"]
+
+[[prep]]
+name = "ref-encoder-export"
+script = "scripts/tts/fish_encoder_export.py"
+python = "{env:PYREF}"
+args = ["{out}/prep/codec/encoder", "1de9996b6be38b745688de084d87a5633f714e4e"]
+
+[emit]
+emit = "devblob+cubin"
+args = ["--served-name", "fish-s2-pro"]
+[emit.env]
+PLOW_TTS_PROFILE = "fish"
+PLOW_TTS_CODEC_DIR = "{out}/prep/codec"
+PLOW_VERIFY_BIN = "{repo}/lean-plow/.lake/build/bin/plow_verify"
+# Codec convs (pointwise projections, merged-phase ConvT, residual k7 taps) on split-bf16 wgmma:
+# codec decode.b16.f64 417 -> 156 ms, PCM rel-L2 vs the torch reference 6-7e-5, CER 0.000 (n=104).
+PLOW_EMIT_SNAC_SPLIT_BF16 = "1"
+# Speech-shaped prefill (prompts ~50-200 rows); decode up to 64 concurrent streams.
+PLOW_MAX_CHUNK = "512"
+PLOW_PF_LADDER_APPEND = "64,256"
+PLOW_DECODE_BATCH_LADDER = "1,2,4,8,16,32,48,64"
+# Veena's measured decode set (A/B on this model, same plowrt, fish_gen --slots backbone+depth ms
+# per step: 8 slots 11.47 -> 8.78, 32: 14.40 -> 13.30, 64: 21.16 -> 17.37; served stream c1
+# TTFA 89 -> 46 ms, c8 13.3 -> 17.3, c32 16.2 -> 20.7 audio s/s; Whisper CER 0.000 both, n=165/186).
+# cuBLASLt prefill is not emitted for qwen3.
+PLOW_EMIT_DECODE_CUBLASLT = "1"
+PLOW_EMIT_DECODE_CUBLASLT_MIN_ROWS = "48"
+PLOW_NV_FA_FOLD = "1"
+PLOW_NO_GLU_FUSE = "1"
+PLOW_FUSE_KV_HNR = "1"
+PLOW_NV_DENSE_TUNE = "1"
+
+[bench]
+kind = "speech"
+client = "scripts/tts/tts_bench.py"
+arms = ["--conc 1 --stream --wav --n 16 --prompt-set chatterbox", "--conc 1 --n 16 --prompt-set chatterbox --tag full_c1", "--conc 8 --stream --n 32 --prompt-set chatterbox", "--conc 32 --stream --n 64 --prompt-set chatterbox", "--conc 64 --stream --n 128 --prompt-set chatterbox"]
+
+[gates]
+python = "{env:PYREF}"
+[gates.tts_cer]
+arms = ["--conc 1 --stream --wav --n 16 --prompt-set chatterbox", "--conc 32 --stream --wav --n 64 --prompt-set chatterbox"]
+cer_median_max = 0.05
+
+[serve]
+env = { PLOW_VMM_PREFIX = "1" }

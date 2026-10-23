@@ -236,10 +236,11 @@ G_K(g_conv2d_f32) {
     const uint32_t kernel = in->i[4], stride = in->i[5];
     const uint32_t pad_before = in->i[6], pad_after = in->i[7], flags = in->fj[1].u;
     const uint32_t batches = in->fj[2].u ? in->fj[2].u : 1u;
+    const uint32_t width_stride = flags >> 16 ? flags >> 16 : stride;
     if (!kernel || !stride || frames + pad_before + pad_after < kernel ||
         width + pad_before + pad_after < kernel) return;
     const uint32_t output_frames = (frames + pad_before + pad_after - kernel) / stride + 1u;
-    const uint32_t output_width = (width + pad_before + pad_after - kernel) / stride + 1u;
+    const uint32_t output_width = (width + pad_before + pad_after - kernel) / width_stride + 1u;
     const uint32_t depthwise = flags & 1u, relu = flags & 2u;
     const uint32_t output_layout = (flags >> 2u) & 3u, input_layout = (flags >> 4u) & 3u;
     const uint32_t weight_f32 = flags & 64u, gelu_erf_bf16 = flags & 128u;
@@ -262,7 +263,7 @@ G_K(g_conv2d_f32) {
             const int64_t input_frame = (int64_t)output_frame * stride + ky - pad_before;
             if (input_frame < 0 || input_frame >= frames) continue;
             for (uint32_t kx = 0; kx < kernel; kx++) {
-                const int64_t input_x = (int64_t)output_x * stride + kx - pad_before;
+                const int64_t input_x = (int64_t)output_x * width_stride + kx - pad_before;
                 if (input_x < 0 || input_x >= width) continue;
                 for (uint32_t input_channel = channel_start; input_channel < channel_end;
                      input_channel++) {
@@ -359,6 +360,7 @@ G_K(g_embed_overlay_bf16) {
     for (uint32_t index = lo; index < hi; index++) {
         const uint32_t row = index / width, column = index % width;
         const uint32_t selected = overlay_index[row];
+        if (selected == UINT32_MAX - 1) continue;
         if (selected == UINT32_MAX) {
             if (tokens[row] >= vocab) return;
             out[index] = table[(size_t)tokens[row] * width + column];
@@ -391,22 +393,232 @@ G_K(g_embed_pos_bf16) {
     }
 }
 
+G_K(g_embed_frame_bf16) {
+    (void)ctx;
+    plow_bf16* out = PLOW_CPU_TEN(in, T, 0);
+    const plow_bf16* table = PLOW_CPU_TEN(in, T, 1);
+    const uint32_t* tokens = PLOW_CPU_TEN(in, T, 2);
+    const plow_bf16* cb = PLOW_CPU_TEN(in, T, 3);
+    const uint32_t* codes = PLOW_CPU_TEN(in, T, 4);
+    const uint32_t rows = in->i[0], width = in->i[1], vocab = in->i[2], K = in->i[3];
+    const uint32_t cb_size = in->i[4], frame_lo = in->i[5], frame_rows = in->i[6];
+    const float div = in->fj[0].f;
+    const uint64_t count64 = (uint64_t)rows * width;
+    if (!rows || !width || !vocab || count64 > UINT32_MAX) return;
+    uint32_t lo, hi;
+    g_range((uint32_t)count64, slice, nblk, &lo, &hi);
+    for (uint32_t index = lo; index < hi; index++) {
+        const uint32_t row = index / width, column = index % width, tok = tokens[row];
+        if (tok >= vocab) return;
+        const plow_bf16 a = table[(size_t)tok * width + column];
+        if (tok - frame_lo >= frame_rows) {
+            out[index] = a;
+            continue;
+        }
+        float s = 0.f;
+        for (uint32_t k = 0; k < K; k++) {
+            const uint32_t code = codes[(size_t)row * K + k];
+            if (code >= cb_size) return;
+            s += plow_bf2f(cb[((size_t)k * cb_size + code) * width + column]);
+        }
+        const float t = plow_bf2f(plow_f2bf(plow_bf2f(a) + plow_bf2f(plow_f2bf(s))));
+        out[index] = plow_f2bf(t / div);
+    }
+}
+
+static uint64_t g_sf_mix(uint64_t z) {
+    z += 0x9e3779b97f4a7c15ull;
+    z = (z ^ (z >> 30)) * 0xbf58476d1ce4e5b9ull;
+    z = (z ^ (z >> 27)) * 0x94d049bb133111ebull;
+    return z ^ (z >> 31);
+}
+
+static float g_sf_gumbel(uint64_t seed, uint32_t step, uint32_t coord, uint32_t draw, uint32_t i) {
+    uint64_t z = g_sf_mix(seed ^ g_sf_mix(((uint64_t)step << 32) | coord));
+    z = g_sf_mix(z ^ (((uint64_t)draw << 32) | i));
+    const float u = ((float)(z >> 40) + 0.5f) * (1.0f / 16777216.0f);
+    return -logf(-logf(u));
+}
+
+/* SampleFishBf16 (219), one row per slice step; the device's selection and arithmetic order. */
+G_K(g_sample_fish_bf16) {
+    (void)ctx;
+    uint32_t* out = PLOW_CPU_TEN(in, T, 0);
+    const plow_bf16* logits = PLOW_CPU_TEN(in, T, 1);
+    const float* params = PLOW_CPU_TEN(in, T, 2);
+    const uint32_t* topk = PLOW_CPU_TEN(in, T, 3);
+    const uint64_t* seed = PLOW_CPU_TEN(in, T, 4);
+    const uint32_t* step = PLOW_CPU_TEN(in, T, 5);
+    uint32_t* hist = PLOW_CPU_TEN(in, T, 6);
+    uint32_t* out_flat = PLOW_CPU_TEN(in, T, 7);
+    const uint32_t rows = in->i[0], vocab = in->i[1], ostride = in->i[2], ocol = in->i[3], coord = in->i[4];
+    const uint32_t window = in->i[5], flags = in->i[6], ls = in->i[7] ? in->i[7] : vocab, ras_limit = in->fj[1].u;
+    for (uint32_t r = slice; r < rows; r += nblk) {
+        uint32_t K = topk[r] < 64u ? topk[r] : 64u;
+        if (K > vocab) K = vocab;
+        if (!K) continue;
+        const plow_bf16* lg = logits + (size_t)r * ls;
+        float m = -INFINITY, z = 0.f, sv[64];
+        uint32_t sel[64];
+        for (uint32_t i = 0; i < vocab; i++) m = fmaxf(m, plow_bf2f(lg[i]));
+        for (uint32_t i = 0; i < vocab; i++) z += expf(plow_bf2f(lg[i]) - m);
+        for (uint32_t k = 0; k < K; k++) {
+            uint32_t best = UINT32_MAX;
+            for (uint32_t i = 0; i < vocab; i++) {
+                uint32_t taken = 0;
+                for (uint32_t q = 0; q < k; q++) taken |= sel[q] == i;
+                if (!taken && (best == UINT32_MAX || plow_bf2f(lg[i]) > plow_bf2f(lg[best]))) best = i;
+            }
+            sel[k] = best;
+            sv[k] = plow_bf2f(lg[best]);
+        }
+        const float* p = params + (size_t)r * 4u;
+        uint32_t c = 0;
+        for (uint32_t draw = 0; draw < 2; draw++) {
+            const float t = p[2 * draw], top_p = p[2 * draw + 1];
+            float cum = 0.f, bv = -INFINITY;
+            uint32_t n = 0, best = 0;
+            for (uint32_t i = 0; i < K; i++) {
+                cum += expf(sv[i] - m) / z;
+                if (i > 0 && cum > top_p) break;
+                n = i + 1u;
+            }
+            const float inv = 1.0f / fmaxf(t, 1e-5f);
+            for (uint32_t i = 0; i < n; i++) {
+                const float v = (sv[i] - sv[0]) * inv + g_sf_gumbel(seed[r], step[r], coord, draw, i);
+                if (v > bv) {
+                    bv = v;
+                    best = i;
+                }
+            }
+            c = sel[best];
+            if (draw || !(flags & 1u) || !hist || !window) break;
+            uint32_t seen = 0;
+            for (uint32_t w = 0; w < window; w++) seen |= hist[(size_t)r * window + w] == c + 1u;
+            if (!(step[r] > 0 && c < ras_limit && seen)) break;
+        }
+        if ((flags & 1u) && hist && window) hist[(size_t)r * window + step[r] % window] = c + 1u;
+        out[(size_t)r * ostride + ocol] = c;
+        if (out_flat) out_flat[r] = c;
+    }
+}
+
+/* GemvF32Out (220): fp32 rows, sequential fma over k (the device sums lane partials, so results
+ * agree to fp32 rounding, not bit for bit). */
+G_K(g_gemv_f32_out) {
+    (void)ctx;
+    float* c = PLOW_CPU_TEN(in, T, 0);
+    const plow_bf16* x = PLOW_CPU_TEN(in, T, 1);
+    const plow_bf16* w = PLOW_CPU_TEN(in, T, 2);
+    const uint32_t m_rows = in->i[0], n_out = in->i[1], k_in = in->i[2];
+    uint32_t lo, hi;
+    g_range(n_out, slice, nblk, &lo, &hi);
+    for (uint32_t m = 0; m < m_rows; m++)
+        for (uint32_t n = lo; n < hi; n++) {
+            float acc = 0.f;
+            for (uint32_t k = 0; k < k_in; k++)
+                acc = fmaf(plow_bf2f(x[(size_t)m * k_in + k]), plow_bf2f(w[(size_t)n * k_in + k]), acc);
+            c[(size_t)m * n_out + n] = acc;
+        }
+}
+
+/* SampleSmallF32 (221), one row per slice step; the device's selection and arithmetic order. */
+G_K(g_sample_small_f32) {
+    (void)ctx;
+    uint32_t* out = PLOW_CPU_TEN(in, T, 0);
+    const float* logits = PLOW_CPU_TEN(in, T, 1);
+    const float* params = PLOW_CPU_TEN(in, T, 2);
+    const uint32_t* ctl = PLOW_CPU_TEN(in, T, 3);
+    const uint64_t* seed = PLOW_CPU_TEN(in, T, 4);
+    uint32_t* bitmap = PLOW_CPU_TEN(in, T, 5);
+    const uint32_t* force = PLOW_CPU_TEN(in, T, 6);
+    uint32_t* eidx = PLOW_CPU_TEN(in, T, 7);
+    const uint32_t rows = in->i[0], vocab = in->i[1], ostride = in->i[2], ocol = in->i[3], coord = in->i[4];
+    const uint32_t words = in->i[5], ls = in->i[7] ? in->i[7] : vocab, eoff = in->fj[1].u;
+    for (uint32_t r = slice; r < rows; r += nblk) {
+        const uint32_t cw = ctl[2u * r];
+        if (cw & (1u << 30)) continue;
+        const int guide = (cw >> 31) & 1u;
+        uint32_t K = (cw & ~(3u << 30)) < 64u ? (cw & ~(3u << 30)) : 64u;
+        if (K > vocab) K = vocab;
+        if (!K || vocab > 4096u) continue;
+        const float* p = params + (size_t)r * 4u;
+        const uint32_t* bm = bitmap ? bitmap + (size_t)r * words : NULL;
+        float L[4096], sv[64];
+        uint32_t sel[64];
+        for (uint32_t i = 0; i < vocab; i++) {
+            float v = logits[(size_t)r * ls + i];
+            if (guide) {
+                const float u = logits[(size_t)(r + 1u) * ls + i];
+                const volatile float d = v - u, m = p[3] * d;
+                v = u + m;
+            }
+            if (bm && ((bm[i >> 5] >> (i & 31u)) & 1u)) v = v > 0.f ? v / p[2] : v * p[2];
+            L[i] = p[0] > 0.f ? v / p[0] : v;
+        }
+        for (uint32_t k = 0; k < K; k++) {
+            uint32_t best = 0;
+            for (uint32_t i = 1; i < vocab; i++)
+                if (L[i] > L[best]) best = i;
+            sel[k] = best;
+            sv[k] = L[best];
+            L[best] = -INFINITY;
+        }
+        uint32_t n = K;
+        if (p[1] < 1.f) {
+            float z = 0.f, cum = 0.f;
+            for (uint32_t i = 0; i < K; i++) z += expf(sv[i] - sv[0]);
+            for (uint32_t i = 0; i < K; i++) {
+                if (i > 0 && cum > p[1]) {
+                    n = i;
+                    break;
+                }
+                cum += expf(sv[i] - sv[0]) / z;
+            }
+        }
+        uint32_t best = 0;
+        float bv = -INFINITY;
+        for (uint32_t i = 0; i < n; i++) {
+            const float v = sv[i] + g_sf_gumbel(seed[r], ctl[2u * r + 1u], coord, 0u, i);
+            if (v > bv) {
+                bv = v;
+                best = i;
+            }
+        }
+        uint32_t c = sel[best];
+        const size_t o = (size_t)r * ostride + ocol;
+        if (force && force[o] != UINT32_MAX) c = force[o];
+        if (bitmap) bitmap[(size_t)r * words + (c >> 5)] |= 1u << (c & 31u);
+        out[o] = c;
+        if (eidx) eidx[r] = c + eoff;
+        if (guide) {
+            out[o + ostride] = c;
+            if (eidx) eidx[r + 1u] = c + eoff;
+        }
+    }
+}
+
 G_K(g_lstm_cell_f32) {
     (void)ctx;
     float* h_new = PLOW_CPU_TEN(in, T, 0);
     float* c_new = PLOW_CPU_TEN(in, T, 1);
     const float* gates = PLOW_CPU_TEN(in, T, 2);
     const float* c_prev = PLOW_CPU_TEN(in, T, 3);
-    const uint32_t width = in->i[0];
+    const uint32_t width = in->i[0], rows = in->i[1] ? in->i[1] : 1u;
+    const uint32_t h_stride = in->i[2] ? in->i[2] : width, h_offset = in->i[3];
+    if ((uint64_t)rows * width > UINT32_MAX) return;
     uint32_t lo, hi;
-    g_range(width, slice, nblk, &lo, &hi);
-    for (uint32_t i = lo; i < hi; i++) {
-        const float input = g_sigmoid(gates[i]);
-        const float forget = g_sigmoid(gates[width + i]);
-        const float cell = tanhf(gates[2u * width + i]);
-        const float output = g_sigmoid(gates[3u * width + i]);
-        c_new[i] = forget * c_prev[i] + input * cell;
-        h_new[i] = output * tanhf(c_new[i]);
+    g_range(rows * width, slice, nblk, &lo, &hi);
+    for (uint32_t e = lo; e < hi; e++) {
+        const uint32_t r = e / width, i = e % width;
+        const float* g = gates + (size_t)r * 4u * width;
+        const float input = g_sigmoid(g[i]);
+        const float forget = g_sigmoid(g[width + i]);
+        const float cell = tanhf(g[2u * width + i]);
+        const float output = g_sigmoid(g[3u * width + i]);
+        const float c = forget * c_prev[e] + input * cell;
+        c_new[e] = c;
+        h_new[h_offset + (size_t)r * h_stride + i] = output * tanhf(c);
     }
 }
 
@@ -610,6 +822,7 @@ static float g_act_f32(uint32_t kind, float x, float p0, float p1) {
     case 14: return x * p0 + p1;
     case 15: return x > 0.0f ? x : 0.0f;
     case 16: return sqrtf(x);
+    case 20: return logf(x);
     default: return x;
     }
 }
@@ -644,18 +857,177 @@ G_K(g_gather_rows_f32) {
     }
 }
 
+/* i7 bit 1: items land at output item g * items + b, g = t2[0]; nothing is written unless
+ * (g + 1) * items <= i7 >> 8. */
 G_K(g_copy_cols_f32) {
     (void)ctx;
     float* out = PLOW_CPU_TEN(in, T, 0);
     const float* x = PLOW_CPU_TEN(in, T, 1);
     const uint32_t items = in->i[0], rows = in->i[1], cols = in->i[2];
+    uint64_t base = 0;
+    if (in->i[7] & 2u) {
+        const uint32_t g = *(const uint32_t*)PLOW_CPU_TEN(in, T, 2);
+        if (((uint64_t)g + 1u) * items > (in->i[7] >> 8)) return;
+        base = (uint64_t)g * items;
+    }
     uint32_t lo, hi;
     g_range(items * rows, slice, nblk, &lo, &hi);
     for (uint32_t index = lo; index < hi; index++) {
         const uint32_t item = index / rows, row = index % rows;
         const float* src = x + (size_t)item * in->fj[1].u + (size_t)row * in->i[3] + in->i[4];
-        float* dst = out + (size_t)item * in->fj[2].u + (size_t)row * in->i[5] + in->i[6];
+        float* dst = out + (size_t)(base + item) * in->fj[2].u + (size_t)row * in->i[5] + in->i[6];
         for (uint32_t column = 0; column < cols; column++) dst[column] = src[column];
+    }
+}
+
+/* StreamTailF32 (222), one item per slice step; an out-of-range slot or n[b] (a device trap)
+ * leaves the item unwritten. */
+G_K(g_stream_tail_f32) {
+    (void)ctx;
+    const float* src = PLOW_CPU_TEN(in, T, 1);
+    float* state = PLOW_CPU_TEN(in, T, 2);
+    const uint32_t* slot = PLOW_CPU_TEN(in, T, 3);
+    const uint32_t* nrows = PLOW_CPU_TEN(in, T, 4);
+    const uint32_t L = in->i[1], N = in->i[2], C = in->i[3], Cz = in->i[4], zc0 = in->i[5];
+    const uint32_t slots = in->fj[1].u;
+    uint32_t lo, hi;
+    g_range(in->i[0], slice, nblk, &lo, &hi);
+    for (uint32_t b = lo; b < hi; b++) {
+        if (slot[b] >= slots || nrows[b] > N) continue;
+        float* tail = state + (size_t)slot[b] * L * C;
+        if (in->i[7] == 0u) {
+            const uint32_t* pos = PLOW_CPU_TEN(in, T, 5);
+            float* z = (float*)PLOW_CPU_TEN(in, T, 0) + (size_t)b * (L + N) * Cz;
+            for (uint32_t r = 0; r < L; r++)
+                for (uint32_t c = 0; c < Cz; c++)
+                    z[(size_t)r * Cz + c] =
+                        pos[b] && c >= zc0 && c - zc0 < C ? tail[(size_t)r * C + c - zc0] : 0.0f;
+            for (uint32_t r = 0; r < N; r++)
+                memcpy(z + (size_t)(L + r) * Cz, src + ((size_t)b * N + r) * in->i[6], (size_t)Cz * 4);
+        } else {
+            const float* z = src + ((size_t)b * (L + N) + nrows[b]) * Cz + zc0;
+            for (uint32_t r = 0; r < L; r++) memcpy(tail + (size_t)r * C, z + (size_t)r * Cz, (size_t)C * 4);
+        }
+    }
+}
+
+/* ReduceRowsF32 (223), one (item, segment) output row per slice step; f64 sums in row order. */
+G_K(g_reduce_rows_f32) {
+    (void)ctx;
+    float* out = PLOW_CPU_TEN(in, T, 0);
+    const float* x = PLOW_CPU_TEN(in, T, 1);
+    const uint32_t* lengths = PLOW_CPU_TEN(in, T, 2);
+    const uint32_t rows = in->i[1], width = in->i[2], op = in->i[3];
+    const uint32_t seg = in->i[4] ? in->i[4] : rows, stride = in->i[5] ? in->i[5] : width, col0 = in->i[6];
+    if (op > 4u || !rows || !width) return;
+    const uint32_t segs = rows / seg + (rows % seg != 0), ow = op == 4u ? 2u * width : width;
+    if ((uint64_t)in->i[0] * segs * ow > 0xFFFFFFFFull) return;
+    uint32_t lo, hi;
+    g_range(in->i[0] * segs, slice, nblk, &lo, &hi);
+    for (uint32_t bs = lo; bs < hi; bs++) {
+        const uint32_t b = bs / segs, r0 = bs % segs * seg;
+        const uint32_t len = lengths && lengths[b] < rows ? lengths[b] : rows;
+        const uint32_t n = len > r0 ? (len - r0 < seg ? len - r0 : seg) : 0;
+        const float* xs = x + ((size_t)b * rows + r0) * stride + col0;
+        float* o = out + (size_t)bs * ow;
+        for (uint32_t c = 0; c < width; c++) {
+            double sum = 0.0, mx = 0.0;
+            for (uint32_t r = 0; r < n; r++) {
+                const double v = xs[(size_t)r * stride + c];
+                sum += v;
+                if (r == 0 || v > mx) mx = v;
+            }
+            const double mean = n ? sum / n : 0.0;
+            double sd = 0.0;
+            if (op >= 3u && n >= 2) {
+                double ss = 0.0;
+                for (uint32_t r = 0; r < n; r++) {
+                    const double d = xs[(size_t)r * stride + c] - mean;
+                    ss += d * d;
+                }
+                sd = sqrt(ss / (n - 1));
+            }
+            switch (op) {
+            case 0: o[c] = (float)sum; break;
+            case 1: o[c] = (float)mean; break;
+            case 2: o[c] = (float)mx; break;
+            case 3: o[c] = (float)sd; break;
+            default: o[c] = (float)mean; o[width + c] = (float)sd; break;
+            }
+        }
+    }
+}
+
+/* LengthAffineU32 (224). */
+G_K(g_length_affine_u32) {
+    (void)ctx;
+    uint32_t* out = PLOW_CPU_TEN(in, T, 0);
+    const uint32_t* x = PLOW_CPU_TEN(in, T, 1);
+    const uint32_t* min_with = PLOW_CPU_TEN(in, T, 2);
+    const int64_t div = in->i[3], lo = in->i[4], hi = in->i[5];
+    if (!div) return;
+    uint32_t b0, b1;
+    g_range(in->i[0], slice, nblk, &b0, &b1);
+    for (uint32_t b = b0; b < b1; b++) {
+        const int64_t v = (int64_t)((uint64_t)x[b] * in->i[1]) + (int32_t)in->i[2];
+        int64_t q = v / div - (v % div < 0);
+        q = q < lo ? lo : q > hi ? hi : q;
+        out[b] = min_with && min_with[b] < (uint64_t)q ? min_with[b] : (uint32_t)q;
+    }
+}
+
+/* TrimSilenceF32 (225), one item per slice step: librosa rms (center, zero pad) power in f64, dB
+ * against the maximum frame, first/last frame above -top_db. */
+static double g_trim_mse(const float* x, uint32_t len, uint32_t frame, uint32_t hop, uint32_t f) {
+    const int64_t s0 = (int64_t)f * hop - frame / 2u;
+    double sum = 0.0;
+    for (uint32_t j = 0; j < frame; j++) {
+        const int64_t s = s0 + j;
+        if (s >= 0 && s < len) sum += (double)x[s] * x[s];
+    }
+    return sum / frame;
+}
+
+G_K(g_trim_silence_f32) {
+    (void)ctx;
+    float* out = PLOW_CPU_TEN(in, T, 0);
+    const float* pcm = PLOW_CPU_TEN(in, T, 1);
+    const uint32_t* len_in = PLOW_CPU_TEN(in, T, 2);
+    uint32_t* len_out = PLOW_CPU_TEN(in, T, 3);
+    const uint32_t cap = in->i[1], frame = in->i[2], hop = in->i[3];
+    const double top_db = in->fj[0].f;
+    if (!frame || !hop) return;
+    uint32_t lo, hi;
+    g_range(in->i[0], slice, nblk, &lo, &hi);
+    for (uint32_t b = lo; b < hi; b++) {
+        const float* x = pcm + (size_t)b * cap;
+        const uint32_t len = len_in[b] < cap ? len_in[b] : cap;
+        const uint64_t padded = (uint64_t)len + 2u * (frame / 2u);
+        const uint32_t frames = padded < frame ? 0u : (uint32_t)((padded - frame) / hop + 1u);
+        double ref = 0.0;
+        for (uint32_t f = 0; f < frames; f++) {
+            const double m = g_trim_mse(x, len, frame, hop, f);
+            if (m > ref) ref = m;
+        }
+        /* In bels (dB / 10), so no product can contract into the difference. */
+        const double ref_b = log10(ref > 1e-10 ? ref : 1e-10), floor_b = -top_db / 10.0;
+        int64_t first = -1, last = -1;
+        for (uint32_t f = 0; f < frames; f++) {
+            const double m = g_trim_mse(x, len, frame, hop, f);
+            if (log10(m > 1e-10 ? m : 1e-10) - ref_b > floor_b) {
+                if (first < 0) first = f;
+                last = f;
+            }
+        }
+        uint32_t start = 0, n = 0;
+        if (first >= 0) {
+            const uint64_t end = (uint64_t)(last + 1) * hop;
+            start = (uint32_t)((uint64_t)first * hop);
+            n = (uint32_t)((end < len ? end : len) - start);
+        }
+        float* o = out + (size_t)b * cap;
+        for (uint32_t i = 0; i < cap; i++) o[i] = i < n ? x[start + i] : 0.0f;
+        len_out[b] = n;
     }
 }
 
@@ -688,8 +1060,12 @@ G_K(g_conv1d_f32) {
     const uint32_t flags = in->fj[2].u, mode = flags & 3u;
     const uint32_t pre = (flags >> 4) & 15u, post = (flags >> 8) & 15u;
     const float slope = in->fj[0].f;
+    /* flags bit 19: alpha is [cin | cout], the output snake's parameters after the input's. */
+    const uint32_t dual = (flags >> 19) & 1u;
+    const float* post_alpha = dual && alpha ? alpha + cin : alpha;
+    const int alpha_ok = dual ? pre == 12u && post == 12u && alpha : !(post == 12u && pre != 0u);
     if (!kernel || !stride || !dilation || !groups || cin % groups || cout % groups ||
-        mode > 2u || !g_act_valid_conv(pre) || !g_act_valid_conv(post) || (post == 12u && pre != 0u))
+        mode > 2u || !g_act_valid_conv(pre) || !g_act_valid_conv(post) || !alpha_ok)
         return;
     const uint64_t span = (uint64_t)dilation * (kernel - 1u) + 1u;
     if (in_rows + pad_before + pad_after < span) return;
@@ -721,7 +1097,7 @@ G_K(g_conv1d_f32) {
                     sum += (double)v * g_weight(weight, (flags >> 12) & 1u, wi);
                 }
             }
-            float value = g_act_f32(post, (float)sum, alpha ? alpha[o] : slope, 0.0f);
+            float value = g_act_f32(post, (float)sum, post_alpha ? post_alpha[o] : slope, 0.0f);
             if (row_scale) value = row_scale[m] * value;
             out[oi] = residual ? value + residual[oi] : value;
         }
@@ -744,8 +1120,11 @@ G_K(g_conv_transpose1d_f32) {
     const uint32_t flags = in->fj[2].u;
     const uint32_t pre = (flags >> 4) & 15u, post = (flags >> 8) & 15u;
     const float slope = in->fj[0].f;
+    const uint32_t dual = (flags >> 19) & 1u;
+    const float* post_alpha = dual && alpha ? alpha + cin : alpha;
+    const int alpha_ok = dual ? pre == 12u && post == 12u && alpha : !(post == 12u && pre != 0u);
     if (!in_rows || !kernel || !stride || !groups || cin % groups || cout % groups ||
-        !g_act_valid_conv(pre) || !g_act_valid_conv(post) || (post == 12u && pre != 0u))
+        !g_act_valid_conv(pre) || !g_act_valid_conv(post) || !alpha_ok)
         return;
     const int64_t full = (int64_t)(in_rows - 1u) * stride + kernel + output_padding;
     if (full <= (int64_t)crop_before + crop_after) return;
@@ -781,7 +1160,7 @@ G_K(g_conv_transpose1d_f32) {
                     sum += (double)v * g_weight(weight, (flags >> 12) & 1u, wi);
                 }
             }
-            float value = g_act_f32(post, (float)sum, alpha ? alpha[o] : slope, 0.0f);
+            float value = g_act_f32(post, (float)sum, post_alpha ? post_alpha[o] : slope, 0.0f);
             out[oi] = residual ? value + residual[oi] : value;
         }
     }
@@ -799,6 +1178,11 @@ G_K(g_unary_f32) {
     for (uint32_t row = lo; row < hi; row++)
         for (uint32_t column = 0; column < width; column++) {
             const size_t i = (size_t)row * stride + col0 + column;
+            if (kind == 19u) { /* SnakeBeta: param = [a | r] */
+                const float s = sinf(x[i] * param[column]);
+                out[i] = fmaf(param[width + column], s * s, x[i]);
+                continue;
+            }
             out[i] = g_act_f32(kind, x[i], param ? param[column] : in->fj[0].f, in->fj[1].f);
         }
 }
@@ -901,12 +1285,17 @@ G_K(g_attention_f32) {
     const float* key = PLOW_CPU_TEN(in, T, 2);
     const float* value = PLOW_CPU_TEN(in, T, 3);
     const uint32_t* key_lengths = PLOW_CPU_TEN(in, T, 4);
-    /* Optional key prefix: item b's keys are rows [0, i7) of prefix block t7[b] ([K | V] rows,
-     * 2 * width wide), then its kv_rows own rows. */
+    /* Optional key prefix: item b's keys are rows [0, pre_b) of prefix block t7[b] ([K | V] rows,
+     * 2 * width wide, block stride i7 rows), then its kv_rows own rows. pre_b = i7, or with i6
+     * bit 5 min(t5[b], i7). */
     const float* prefix = PLOW_CPU_TEN(in, T, 6);
+    const uint32_t* prefix_rows = prefix && (in->i[6] & 32u) ? PLOW_CPU_TEN(in, T, 5) : NULL;
     const uint32_t* prefix_index = PLOW_CPU_TEN(in, T, 7);
-    const uint32_t pre = prefix ? in->i[7] : 0u;
-    const float* bias = prefix ? NULL : PLOW_CPU_TEN(in, T, 5);
+    /* i6 bit 3, stream mode: Q/K/V share item rows; the first i7 are carried history, query r is
+     * row i7 + r, and keys before i7 - min(t7[b], i7) (t7: stream position) are absent. */
+    const uint32_t stream = in->i[6] & 8u, hist = stream ? in->i[7] : 0u;
+    const uint32_t pstride = prefix ? in->i[7] : 0u;
+    const float* bias = prefix || stream ? NULL : PLOW_CPU_TEN(in, T, 5);
     const uint32_t batch = in->i[0], q_rows = in->i[1], kv_rows = in->i[2], heads = in->i[3];
     const uint32_t hw = in->i[4], width = heads * hw;
     const uint32_t stride = in->i[5] ? in->i[5] : width, causal = in->i[6] & 1u;
@@ -914,19 +1303,24 @@ G_K(g_attention_f32) {
      * group of that many heads. */
     const uint32_t rel = in->i[6] & 4u, lgroup = (in->i[6] >> 8) & 255u;
     const uint32_t k_col0 = in->fj[1].u, v_col0 = in->fj[2].u;
-    if (!hw || !(pre + kv_rows)) return;
-    double* p = malloc(sizeof(double) * (pre + kv_rows));
+    if (!hw || !(pstride + kv_rows) || ((in->i[6] & 32u) && !prefix_rows)) return;
+    double* p = malloc(sizeof(double) * (pstride + kv_rows));
     double* acc = malloc(sizeof(double) * hw);
     uint32_t lo, hi;
     g_range(batch * heads * q_rows, slice, nblk, &lo, &hi);
     for (uint32_t index = lo; index < hi; index++) {
         const uint32_t b = index / (heads * q_rows), h = index / q_rows % heads, r = index % q_rows;
+        const uint32_t pre = prefix_rows && prefix_rows[b] < pstride ? prefix_rows[b] : pstride;
         uint32_t visible = g_item_rows(key_lengths, lgroup ? (b * heads + h) / lgroup : b, pre + kv_rows);
-        if (causal && r + 1u < visible) visible = r + 1u;
-        const float* q = query + ((size_t)b * q_rows + r) * stride + (size_t)h * hw;
+        const uint32_t rk = hist + r;
+        if (causal && rk + 1u < visible) visible = rk + 1u;
+        const uint32_t win = causal ? in->i[6] >> 16 : 0u, left = stream ? hist - (prefix_index[b] < hist ? prefix_index[b] : hist) : 0u;
+        uint32_t first = win && rk + 1u > win ? rk + 1u - win : 0u;
+        if (first < left) first = left;
+        const float* q = query + ((size_t)(stream ? b * kv_rows + hist : b * q_rows) + r) * stride + (size_t)h * hw;
         double maximum = -INFINITY;
-        for (uint32_t j = 0; j < visible; j++) {
-            const float* k = j < pre ? prefix + ((size_t)prefix_index[b] * pre + j) * 2u * width + (size_t)h * hw
+        for (uint32_t j = first; j < visible; j++) {
+            const float* k = j < pre ? prefix + ((size_t)prefix_index[b] * pstride + j) * 2u * width + (size_t)h * hw
                                      : key + ((size_t)b * kv_rows + j - pre) * stride + k_col0 + (size_t)h * hw;
             double dot = 0.0;
             for (uint32_t c = 0; c < hw; c++) dot += (double)q[c] * k[c];
@@ -938,15 +1332,15 @@ G_K(g_attention_f32) {
         }
         double denominator = 0.0;
         for (uint32_t c = 0; c < hw; c++) acc[c] = 0.0;
-        for (uint32_t j = 0; j < visible; j++) {
+        for (uint32_t j = first; j < visible; j++) {
             const double e = exp(p[j] - maximum);
-            const float* v = j < pre ? prefix + ((size_t)prefix_index[b] * pre + j) * 2u * width + width + (size_t)h * hw
+            const float* v = j < pre ? prefix + ((size_t)prefix_index[b] * pstride + j) * 2u * width + width + (size_t)h * hw
                                      : value + ((size_t)b * kv_rows + j - pre) * stride + v_col0 + (size_t)h * hw;
             denominator += e;
             for (uint32_t c = 0; c < hw; c++) acc[c] += e * v[c];
         }
         float* o = out + ((size_t)b * q_rows + r) * width + (size_t)h * hw;
-        for (uint32_t c = 0; c < hw; c++) o[c] = visible ? (float)(acc[c] / denominator) : 0.0f;
+        for (uint32_t c = 0; c < hw; c++) o[c] = visible > first ? (float)(acc[c] / denominator) : 0.0f;
     }
     free(p);
     free(acc);

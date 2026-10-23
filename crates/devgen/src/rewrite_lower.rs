@@ -153,6 +153,15 @@ impl ConvFusions<'_> {
         kernel != 1 && self.has(Lowering::ConvInputAct, weight).unwrap_or(hand)
     }
 
+    /// A snake between a depthwise conv that applies its own snake input and a pointwise conv,
+    /// whose input activation never fuses ([`Self::input_act`]): the producer applies it as a
+    /// second snake on its output (`Conv1dF32Stage::dual_alpha`) instead of a separate pass. The
+    /// rewrite's two placements tie, so the lowering chooses; this holds whenever the producer's
+    /// input snake is fused.
+    pub(crate) fn snake_before_pointwise(self, producer: &str, producer_kernel: u32) -> bool {
+        self.input_act(producer, producer_kernel, true)
+    }
+
     pub(crate) fn output_act(self, weight: &str, hand: bool) -> bool {
         self.has(Lowering::ConvOutputAct, weight).unwrap_or(hand)
     }

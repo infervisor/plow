@@ -318,7 +318,11 @@ pub fn classify(op: DevOp) -> OpClass {
         DevOp::EmbedF16F32 => a_rows("single explicit token row"),
         DevOp::EmbedOverlayBf16 => a_rows("i0=rows, token gather with explicit row overlay"),
         DevOp::EmbedPosBf16 => a_rows("i0=rows, token gather plus per-row learned position"),
-        DevOp::LstmCellF32 => a_elem("i0=width, explicit state tensors"),
+        DevOp::EmbedFrameBf16 => a_rows("i0=rows, token gather plus a frame token's codebook rows"),
+        DevOp::SampleFishBf16 => a_rows("i0=rows, one sampled class per logit row"),
+        DevOp::GemvF32Out => a_rows("i0=rows, an fp32 projection row per input row"),
+        DevOp::SampleSmallF32 => a_rows("i0=rows, one sampled class per logit row"),
+        DevOp::LstmCellF32 => a_elem("i0=width x i1=rows, explicit state tensors"),
         DevOp::ArgmaxF32 => a_rows("i0=rows"),
         DevOp::ReluF32 => a_elem("i0=n"),
         DevOp::BroadcastAddF32 => a_rows("i0=rows"),
@@ -341,6 +345,10 @@ pub fn classify(op: DevOp) -> OpClass {
         DevOp::UnaryF32 => a_rows("i0=rows"),
         DevOp::GatherRowsF32
         | DevOp::CopyColsF32
+        | DevOp::StreamTailF32
+        | DevOp::ReduceRowsF32
+        | DevOp::LengthAffineU32
+        | DevOp::TrimSilenceF32
         | DevOp::BinaryF32
         | DevOp::CumSumF64
         | DevOp::RandF32 => note(

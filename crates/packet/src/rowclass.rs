@@ -95,8 +95,10 @@ pub fn class_of(op: DevOp) -> RowClass {
         | NormResidual | AddNorm | NormResidualNorm | PerLayerInput | GluStrided | QuantFp8
         | ZeroF32 | CastF32Bf16 | MlaOutGate | KdaGatedNorm | QwenGatedNorm | QwenQGateSplit
         | QwenSigmoidGate | QwenRmsNorm | LayerNormF32 | ScaledAddF32 | GluF32 | EmbedF16F32
-        | EmbedOverlayBf16 | EmbedPosBf16 | LstmCellF32 | ReluF32 | BroadcastAddF32
-        | QuantFp8Block128 => RowClass::A,
+        | EmbedOverlayBf16 | EmbedPosBf16 | EmbedFrameBf16 | SampleFishBf16 | GemvF32Out
+        | SampleSmallF32 | LstmCellF32 | ReluF32 | BroadcastAddF32 | QuantFp8Block128 => {
+            RowClass::A
+        }
         // `Embed` gathers rows of the EMBEDDING TABLE by token id — one id per row, no
         // position, no cross-row coupling. It is not a hidden-row gather; `RowGather` is.
         Embed => RowClass::A,
@@ -250,7 +252,8 @@ pub fn class_of(op: DevOp) -> RowClass {
         // The generic signal ops derive a row's item and position from its index (`rows_per_item`,
         // strides, `[batch][rows]` geometry); only the pure elementwise one is row-agnostic.
         GatherRowsF32 | CopyColsF32 | Conv1dF32 | ConvTranspose1dF32 | BinaryF32 | CumSumF64
-        | RandF32 | AttentionF32 => RowClass::C,
+        | RandF32 | AttentionF32 | StreamTailF32 | ReduceRowsF32 | LengthAffineU32
+        | TrimSilenceF32 => RowClass::C,
         // Per-row statistics: row-agnostic like LayerNormF32.
         RowStatsF32 | RmsNormF32 => RowClass::A,
         // Positions come from a per-row tensor; soft-token rows are found by their own id.

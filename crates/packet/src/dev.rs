@@ -2017,8 +2017,11 @@ pub enum DevOp {
     /// Gather one FP16 embedding row and convert it to FP32.
     /// `t0=out(f32) t1=table(f16) t2=token(u32)` · `i0=vocab i1=width`.
     EmbedF16F32 = 171,
-    /// One FP32 LSTM cell after the input and recurrent projections have been summed. Gates are
-    /// contiguous `[input,forget,cell,output]`. `t0=h_new t1=c_new t2=gates t3=c_prev` · `i0=width`.
+    /// FP32 LSTM cells after the input and recurrent projections have been summed, over `rows`
+    /// independent rows (0 = 1). Gates are row-dense `[rows][input,forget,cell,output][width]`,
+    /// `c_prev`/`c_new` row-dense `[rows][width]` (in place allowed); row `r`'s h is written at
+    /// `h_new + h_out_offset + r * h_out_stride` (stride 0 = `width`).
+    /// `t0=h_new t1=c_new t2=gates t3=c_prev` · `i0=width i1=rows i2=h_out_stride i3=h_out_offset`.
     LstmCellF32 = 172,
     /// Row-wise FP32 argmax. `t0=ids(u32) t1=x(f32)` · `i0=rows i1=width`.
     ArgmaxF32 = 173,
@@ -2031,8 +2034,9 @@ pub enum DevOp {
     /// bit 1 applies ReLU, bits 2..3 select output layout, bits 4..5 select input layout
     /// (`0=NHWC, 1=NFCW, 2=NCFW`), bit 6 selects FP32 weights, and bit 7 applies erf-GELU with
     /// BF16 rounding. Precision hints: bit 8 asserts the input and FP32 weights are
-    /// BF16-representable (BF16 tensor cores), bit 9 allows 3xTF32 tensor cores.
-    /// `j1=batch` defaults to one.
+    /// BF16-representable (BF16 tensor cores), bit 9 allows 3xTF32 tensor cores. Bits 16..31
+    /// are the width-axis stride (0 = `stride`, which then strides both axes; `stride` always
+    /// strides frames). `j1=batch` defaults to one.
     /// `t0=out t1=x t2=weight t3=bias(f32)` ·
     /// `i0=in_frames i1=in_width i2=in_channels i3=out_channels i4=kernel i5=stride
     /// i6=pad_before i7=pad_after j0=flags j1=batch`.
@@ -2051,7 +2055,8 @@ pub enum DevOp {
     /// `i0=rows i1=width i2=head_width i3=group_rows i4=flags`.
     GroupedAttentionF32 = 178,
     /// Gather BF16 token embeddings and replace selected rows with BF16-rounded FP32 overlay
-    /// rows. `overlay_index[row] == u32::MAX` selects `table[tokens[row]]`; every other value
+    /// rows. `overlay_index[row] == u32::MAX` selects `table[tokens[row]]`, `u32::MAX - 1` keeps
+    /// the row an earlier embed op wrote (frame rows of a speech prompt); every other value
     /// selects that overlay row. This is the generic encoder-to-decoder handoff for audio,
     /// image, and other multimodal pipelines.
     /// `t0=out(bf16[rows,width]) t1=table(bf16[vocab,width]) t2=tokens(u32[rows])
@@ -2156,8 +2161,11 @@ pub enum DevOp {
     /// prefix instead (`cols` = K | V of `cols/128` heads of width 64, `rows` keys): item `b` is
     /// written at `b*out_item_stride + out_offset` as `[head][ceil(rows/16)][2072]` 3xFP16 fragment
     /// tiles, the layout [`DevOp::AttentionF32`] flag bit 4 reads (`out_stride` unused).
-    /// `t0=out t1=x` · `i0=items i1=rows i2=cols i3=in_stride i4=in_offset i5=out_stride
-    /// i6=out_offset i7=flags` · `j0=in_item_stride j1=out_item_stride`.
+    /// Flag bit 1 (either mode): output item `b` is item `g*items + b` with `g = group[0]` read on
+    /// device; flag bits 8..31 are the output's item capacity, and nothing is written unless
+    /// `(g+1)*items <= capacity`.
+    /// `t0=out t1=x t2=group(u32[1])?` · `i0=items i1=rows i2=cols i3=in_stride i4=in_offset
+    /// i5=out_stride i6=out_offset i7=flags` · `j0=in_item_stride j1=out_item_stride`.
     CopyColsF32 = 196,
     /// Channels-last FP32 1D convolution, torch `Conv1d` semantics:
     /// `out[b][t][o] = post(bias[o] + sum_{k,i} pre(x[b][t*stride + k*dilation - pad_before][g*Cin/groups
@@ -2184,7 +2192,10 @@ pub enum DevOp {
     /// residual`, summed over `s*stride + k = t + crop_before` within `o`'s group.
     /// `out_rows = (in_rows-1)*stride + kernel + output_padding - crop_before - crop_after`.
     /// `lengths`, activations, `alpha` and flags as [`DevOp::Conv1dF32`] (no pad mode); outputs
-    /// past item `b`'s `(L-1)*stride + kernel + output_padding - crops` are zero.
+    /// past item `b`'s `(L-1)*stride + kernel + output_padding - crops` are zero. Flag bits 17 | 18
+    /// (sm_90a): with phase-major weights (bit 15), `kernel == 2*stride`, one group, no output
+    /// padding, activations, alpha or residual, and channels % 64 == 0, one split-bf16 wgmma GEMM
+    /// over all phases (`[stride*out_channels][2*in_channels]`, its pre-split image appended).
     /// `t0=out t1=x t2=weight(f32|f16[in_channels,out_channels/groups,kernel]) t3=bias? t4=alpha?
     /// t5=residual? t6=lengths(u32[batch])?` ·
     /// `i0=batch i1=in_rows i2=in_channels i3=out_channels i4=kernel i5=stride
@@ -2224,17 +2235,23 @@ pub enum DevOp {
     /// reads `query[(b*q_rows + r)*in_stride + h*head_width ..]`, key/value row `j`
     /// `key[(b*kv_rows + j)*in_stride + k_col0 + h*head_width ..]` (`v_col0` for value;
     /// `in_stride` 0 = `heads*head_width`). Score `f0 * q.k + bias[h*bias_head_stride +
-    /// r*kv_rows + j]`, softmax over keys `j < key_lengths[b]` (and `j <= r` with flag bit 0); a
-    /// row with no visible key is zero. Output is dense `[batch,q_rows,heads*head_width]`.
-    /// `head_width` is 64, or a multiple of 8 up to 128 (e.g. 72). Flag bit 1 allows 3xTF32 tensor
-    /// cores at 64 (FP32-accurate).
+    /// r*kv_rows + j]`, softmax over keys `j < key_lengths[b]` (and `j <= r` with flag bit 0,
+    /// and `j > r - window` with a causal `window = flags >> 16`, 0 = none); a row with no visible
+    /// key is zero. Output is dense `[batch,q_rows,heads*head_width]`.
+    /// `head_width` is 64, a multiple of 8 up to 128 (e.g. 72), or 256 (no prefix, stream or
+    /// relative bias). Flag bit 1 allows 3xTF32 tensor cores at 64 (FP32-accurate).
     /// With `prefix` (a cached key prefix), item `b`'s keys are rows `[0, i7)` of block
     /// `prefix_index[b]` of `prefix` (`[blocks][i7][K | V]`, `2*heads*head_width` wide) followed
     /// by its `kv_rows` own rows (key lengths count both; `i7` is the prefix row count; no bias,
-    /// no causal mask). Flag bit 4 (sm_90, head_width 64, at least 4 16-row query tiles): the
+    /// no causal mask). Flag bit 5 (with a prefix): `bias` is instead `prefix_rows` (u32[batch])
+    /// and item `b` reads only prefix rows `[0, pre_b)`, `pre_b = min(prefix_rows[b], i7)`, its
+    /// own rows following at key `pre_b` (key lengths count `pre_b` + own; blocks keep `i7` rows).
+    /// Flag bit 4 (sm_90, head_width 64, at least 4 16-row query tiles): the
     /// prefix is pre-formatted by [`DevOp::CopyColsF32`] flag bit 0 (`[blocks][heads][tiles][2072]`)
-    /// and the attention runs 3xFP16.
-    /// `t0=out t1=query t2=key t3=value t4=key_lengths(u32[batch])? t5=bias? t6=prefix?
+    /// and the attention runs 3xFP16; with bit 5 the formatted rows of the last read tile past
+    /// `pre_b` must be finite and not dominate its 8-column V blocks (the format writes zeros past
+    /// its `rows`).
+    /// `t0=out t1=query t2=key t3=value t4=key_lengths(u32[batch])? t5=bias|prefix_rows? t6=prefix?
     /// t7=prefix_index(u32[batch])?` ·
     /// `i0=batch i1=q_rows i2=kv_rows i3=heads i4=head_width i5=in_stride i6=flags
     /// i7=bias_head_stride` · `f0=scale` · `j0=k_col0 j1=v_col0`.
@@ -2260,7 +2277,8 @@ pub enum DevOp {
     /// In-place axial rotate-half RoPE: each head (at `h*head_stride`, `head_stride` 0 =
     /// `head_width`, row stride `stride` 0 = `heads*head_stride`) splits into `axes` segments of
     /// `head_width/axes`; segment `a` rotates its halves by `pos[r][a] * theta^(-2i/segment)`.
-    /// Flag bit 0 rounds cos/sin, the products and the sums to bf16 (torch's bf16 arithmetic).
+    /// Flag bit 0 rounds cos/sin, the products and the sums to bf16 (torch's bf16 arithmetic); bit 1
+    /// rounds only cos/sin (an fp32 rotation by a bf16 table).
     /// `t0=x t1=pos(u32[rows][axes])` · `i0=rows i1=heads i2=head_width i3=stride i4=axes
     /// i5=head_stride i6=flags` · `f0=theta`.
     RopeAxialF32 = 207,
@@ -2402,6 +2420,82 @@ pub enum DevOp {
     /// `[b, s, n_heads, index_head_dim]` then `fp4_act_quant(q, 32, True)` (`model.py:550-552`).
     /// A third call site, differing from the other two only in `i3`/`i6`/`i7`.
     CompressRopeQuant = 217,
+    /// Token embedding, plus a codec frame's codebook rows on frame tokens (Fish S2 input):
+    /// row r is a frame row when `frame_lo <= tokens[r] < frame_lo + frame_rows`, then
+    /// `out[r] = bf16(bf16(table[tokens[r]] + bf16(sum_k cb_table[k*cb_size + codes[r*K + k]])) / div)`
+    /// (torch's bf16 order: the codebook sum rounds once), else `out[r] = table[tokens[r]]`.
+    /// `t0=out(bf16[rows,width]) t1=table(bf16[vocab,width]) t2=tokens(u32[rows])
+    /// t3=cb_table(bf16[K*cb_size,width]) t4=codes(u32[rows,K])` ·
+    /// `i0=rows i1=width i2=vocab i3=K i4=cb_size i5=frame_lo i6=frame_rows` · `f0=div`.
+    /// A token >= vocab or a frame code >= cb_size traps.
+    EmbedFrameBf16 = 218,
+    /// Fish S2 sampling of a bf16 logit row (one block per row): the top `min(top_k[r], 64)`
+    /// classes by logit, cut by nucleus at temperature 1 over the whole row (keep class `i` while
+    /// the cumulative probability through `i` is `<= top_p`; the first always stays), then an
+    /// exponential race at temperature `T`: `argmax (l_i - l_0) / T - ln E_i`, `E_i ~ Exp(1)` from a
+    /// counter hash of `(seed[r], step[r], i4, draw, i)`. Flag bit 0 (RAS): when `step[r] > 0` and
+    /// the class is `< j0` and in the row's `i5`-entry history (`class + 1`, 0 = empty), redraw with
+    /// draw 1 at `(ras_T, ras_P)`; the final class enters slot `step[r] % i5`. `top_k[r] == 0`
+    /// skips the row. Writes `out[r*i2 + i3]`, and `out_flat[r]` when present.
+    /// `t0=out(u32) t1=logits(bf16[rows][i7 or vocab]) t2=params(f32[rows][4]: T, top_p, ras_T,
+    /// ras_P) t3=top_k(u32[rows]) t4=seed(u64[rows]) t5=step(u32[rows]) t6=history(u32[rows][i5])?
+    /// t7=out_flat(u32[rows])?` ·
+    /// `i0=rows i1=vocab i2=out_stride i3=out_col0 i4=coord i5=ras_window i6=flags
+    /// i7=logit_stride` · `j0=ras_limit`.
+    SampleFishBf16 = 219,
+    /// Decode GEMV with an fp32 result: `C[m][n] = sum_k x[m][k] * W[n][k]`, bf16 operands, fp32
+    /// products and accumulation, fp32 store (a reference that runs its head in fp32 on bf16
+    /// weights). `t0=C(f32[M,N]) t1=x(bf16[M,K]) t2=W(bf16[N,K])` · `i0=M i1=N i2=K` (K % 8 == 0).
+    GemvF32Out = 220,
+    /// Small-vocabulary sampling of an f32 logit row (one block per row; Breeze TTS): with a
+    /// `bitmap`, classes whose bit is set take the HF repetition penalty (`l > 0 ? l / pen : l *
+    /// pen`); then `/ T`, the top `min(ctl[r][0], 64)` classes (exactly that many: ties at the cutoff
+    /// go to the lower class, where HF's threshold keeps every tied class), the shifted
+    /// nucleus when `top_p < 1` (keep class `i` while the probability mass before it is `<= top_p`;
+    /// the first always stays), and a Gumbel race `argmax l_i / T + G_i` with `G_i` from the
+    /// counter hash of `(seed[r], ctl[r][1], i4, 0, i)` (as [`DevOp::SampleFishBf16`]). A `force`
+    /// value other than `u32::MAX` replaces the draw (teacher forcing). The class sets its bitmap
+    /// bit, lands in `out[r*i2 + i3]`, and `eidx[r] = class + j0` (an embedding row). `ctl[r][0]
+    /// == 0` skips the row.
+    /// `t0=out(u32) t1=logits(f32[rows][i7 or vocab]) t2=params(f32[rows][4]: T, top_p, penalty, -)
+    /// t3=ctl(u32[rows][2]: top_k, step) t4=seed(u64[rows]) t5=bitmap(u32[rows][i5])?
+    /// t6=force(u32, out's layout)? t7=eidx(u32[rows])?` · `i0=rows i1=vocab i2=out_stride
+    /// i3=out_col0 i4=coord i5=bitmap_words i7=logit_stride` · `j0=eidx_offset`.
+    SampleSmallF32 = 221,
+    /// FP32 stream tail: the last `L` rows a streaming stage carries between chunks, per slot.
+    /// Gather (mode 0) builds `z(f32[B][L+N][Cz])`: rows `[0, L)` hold `state[slot[b]]` in
+    /// columns `[zc0, zc0+C)` (zeros when `pos[b] == 0`, a fresh stream) and zeros elsewhere;
+    /// row `L + r` is `src[(b*N + r)*src_stride ..][..Cz]`. Store (mode 1) reads only `z`:
+    /// `state[slot[b]][i] = z[b][n[b] + i][zc0..zc0+C]` for `i < L`, the tail after `n[b]` new rows.
+    /// `slot[b] >= slots` or `n[b] > N` traps.
+    /// Store takes no `z` output or `pos`; its `src` is `z`.
+    /// `t0=z(f32)|NONE t1=src(f32) t2=state(f32[slots][L][C]) t3=slot(u32[B]) t4=n(u32[B])
+    /// t5=pos(u32[B])?` ·
+    /// `i0=B i1=L i2=N i3=C i4=Cz i5=zc0 i6=src_stride i7=mode` · `j0=slots`.
+    StreamTailF32 = 222,
+    /// Masked column reductions over rows, accumulated in f64 and stored f32. Item `b` has
+    /// `L = min(lengths[b], rows)` valid rows (`rows` without `lengths`); the rows split into
+    /// `segs = ceil(rows / seg_rows)` segments, and segment `s` reduces the `n` valid rows
+    /// `[s*seg_rows, min((s+1)*seg_rows, L))` of column `col0 + c` (a short segment divides by
+    /// its own `n`). `op`: 0 sum, 1 mean, 2 max, 3 unbiased std (`n - 1`), 4 mean then std at
+    /// `out[b][s][W + c]`. `n == 0` (std: `n < 2`) writes 0; `op > 4` writes nothing.
+    /// `t0=out(f32[items][segs][W or 2W]) t1=x(f32[items][rows][stride]) t2=lengths(u32[items])?`
+    /// · `i0=items i1=rows i2=width i3=op i4=seg_rows(0=rows) i5=stride(0=width) i6=col0`.
+    ReduceRowsF32 = 223,
+    /// Device length arithmetic in i64: `out[b] = min(clamp(floor((in[b]*mul + add) / div), lo,
+    /// hi), min_with[b])`, `add` an i32 bit pattern. `div == 0` writes nothing.
+    /// `t0=out(u32[items]) t1=in(u32[items]) t2=min_with(u32[items])?` ·
+    /// `i0=items i1=mul i2=add i3=div i4=lo i5=hi`.
+    LengthAffineU32 = 224,
+    /// librosa `effects.trim(top_db, ref=max)` per item over `L = min(len_in[b], cap)` samples:
+    /// frame `f < 1 + (L + 2*(frame/2) - frame) / hop` has `mse[f]` = mean of `x^2` over samples
+    /// `f*hop - frame/2 + [0, frame)` (zero outside `[0, L)`, f64); `db = 10 log10(max(1e-10,
+    /// mse)) - 10 log10(max(1e-10, max_f mse))`. With `first`/`last` the extreme frames where
+    /// `db > -top_db`: `out[0..n) = x[first*hop .. min(L, (last+1)*hop))`, `len_out = n`, rest of
+    /// the row zero; no such frame gives `n = 0`. `out` must not alias `pcm`.
+    /// `t0=out(f32[items][cap]) t1=pcm(f32[items][cap]) t2=len_in(u32[items])
+    /// t3=len_out(u32[items])` · `i0=items i1=cap i2=frame i3=hop` · `f0=top_db`.
+    TrimSilenceF32 = 225,
 }
 
 /// [`DevOp::FlashPrefillFp8`]'s split count (`i7` low half).
@@ -2443,6 +2537,11 @@ pub const ACT_SQRT: u32 = 16;
 pub const ACT_GELU_TANH: u32 = 17;
 /// Round to bf16, round-to-nearest-even ([`DevOp::UnaryF32`] only).
 pub const ACT_ROUND_BF16: u32 = 18;
+/// SnakeBeta `x + r sin^2(a x)` with `a = param[c]`, `r = param[width + c]` (the exporter's
+/// `exp(alpha)` and `1 / (exp(beta) + 1e-9)`; [`DevOp::UnaryF32`] only, `param` required).
+pub const ACT_SNAKE_BETA: u32 = 19;
+/// Natural log `logf(x)` ([`DevOp::UnaryF32`] only).
+pub const ACT_LOG: u32 = 20;
 
 /// GLU-family `act` code for GPT-OSS's `swiglu_oai` (pair form, `f0 = alpha`, `f1 = limit`).
 /// Codes 0/1/2 are gelu_tanh / silu / situ; see [`DevOp::Glu`].
@@ -2682,6 +2781,14 @@ impl DevOp {
         DevOp::EngramEmbed,
         DevOp::GemmFp8Mx,
         DevOp::CompressRopeQuant,
+        DevOp::EmbedFrameBf16,
+        DevOp::SampleFishBf16,
+        DevOp::GemvF32Out,
+        DevOp::SampleSmallF32,
+        DevOp::StreamTailF32,
+        DevOp::ReduceRowsF32,
+        DevOp::LengthAffineU32,
+        DevOp::TrimSilenceF32,
     ];
 
     /// Recover the opcode from its wire discriminant, or `None` for a value no
@@ -2920,6 +3027,14 @@ impl DevOp {
             DevOp::EngramEmbed => "PLOW_DOP_ENGRAM_EMBED",
             DevOp::GemmFp8Mx => "PLOW_DOP_GEMM_FP8_MX",
             DevOp::CompressRopeQuant => "PLOW_DOP_COMPRESS_ROPE_QUANT",
+            DevOp::EmbedFrameBf16 => "PLOW_DOP_EMBED_FRAME_BF16",
+            DevOp::SampleFishBf16 => "PLOW_DOP_SAMPLE_FISH_BF16",
+            DevOp::GemvF32Out => "PLOW_DOP_GEMV_F32_OUT",
+            DevOp::SampleSmallF32 => "PLOW_DOP_SAMPLE_SMALL_F32",
+            DevOp::StreamTailF32 => "PLOW_DOP_STREAM_TAIL_F32",
+            DevOp::ReduceRowsF32 => "PLOW_DOP_REDUCE_ROWS_F32",
+            DevOp::LengthAffineU32 => "PLOW_DOP_LENGTH_AFFINE_U32",
+            DevOp::TrimSilenceF32 => "PLOW_DOP_TRIM_SILENCE_F32",
         }
     }
 
@@ -2980,7 +3095,14 @@ impl DevOp {
     /// 210 -> 211 for `MmSpanExtent = 210` (bidirectional media spans).
     /// 211 -> 212 for `GemmGroupPf = 211` (grouped prefill projection route).
     /// 212 -> 218 for `CompressPool = 212` .. `CompressRopeQuant = 217` (DeepSeek-V4.1).
-    pub const COUNT: u16 = 218;
+    /// 218 -> 219 for `EmbedFrameBf16 = 218` (Fish S2 codec-frame input embedding).
+    /// 219 -> 220 for `SampleFishBf16 = 219` (Fish S2 in-program sampling).
+    /// 220 -> 222 for `GemvF32Out = 220`, `SampleSmallF32 = 221` (Breeze TTS depth stage).
+    /// 222 -> 223 for `StreamTailF32 = 222` (stateful streaming codec windows).
+    /// 223 -> 225 for `ReduceRowsF32 = 223`, `LengthAffineU32 = 224` (voice-conditioning
+    /// front-ends).
+    /// 225 -> 226 for `TrimSilenceF32 = 225` (reference-audio silence trim).
+    pub const COUNT: u16 = 226;
 
     /// The `(M, N, K, quant)` a decode-GEMV opcode carries, or `None` if this is not one.
     ///

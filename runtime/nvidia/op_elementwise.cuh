@@ -79,13 +79,15 @@ static __device__ void d_mm_span_extent(unsigned* __restrict__ out, const unsign
 }
 
 /* EmbedOverlayBf16 (op 179): a row is table[tokens[r]] unless overlay_index[r] names an
- * overlay row, which is BF16-rounded in (the CPU golden's plow_f2bf: round-to-nearest-even). */
+ * overlay row, which is BF16-rounded in (the CPU golden's plow_f2bf: round-to-nearest-even);
+ * index 0xFFFFFFFE keeps the row an earlier embed op wrote. */
 static __device__ void d_embed_overlay(__nv_bfloat16* __restrict__ out, const __nv_bfloat16* __restrict__ table,
                                        const unsigned* __restrict__ tokens, const float* __restrict__ overlay,
                                        const unsigned* __restrict__ overlay_index, unsigned rows, unsigned width,
                                        unsigned vocab, unsigned overlay_rows, unsigned slice, unsigned nblk) {
     for (unsigned r = slice; r < rows; r += nblk) {
         const unsigned sel = overlay_index[r];
+        if (sel == 0xFFFFFFFEu) continue;
         if (sel == 0xFFFFFFFFu) {
             if (tokens[r] >= vocab) { __trap(); return; }
             const __nv_bfloat16* src = table + (size_t)tokens[r] * width;
@@ -112,6 +114,249 @@ static __device__ void d_embed_pos(__nv_bfloat16* __restrict__ out, const __nv_b
         const __nv_bfloat16* b = pos_table + (size_t)p * width;
         for (unsigned i = threadIdx.x; i < width; i += PLOW_NV_THREADS)
             out[(size_t)r * width + i] = __float2bfloat16_rn(__bfloat162float(a[i]) + __bfloat162float(b[i]));
+    }
+}
+
+/* EmbedFrameBf16 (op 218): a frame token adds its K codebook rows (bf16 sum), then / div; see dev.rs. */
+static __device__ void d_embed_frame(__nv_bfloat16* __restrict__ out, const __nv_bfloat16* __restrict__ table,
+                                     const unsigned* __restrict__ tokens, const __nv_bfloat16* __restrict__ cb,
+                                     const unsigned* __restrict__ codes, unsigned rows, unsigned width,
+                                     unsigned vocab, unsigned K, unsigned cb_size, unsigned frame_lo,
+                                     unsigned frame_rows, float div, unsigned slice, unsigned nblk) {
+    for (unsigned r = slice; r < rows; r += nblk) {
+        const unsigned tok = tokens[r];
+        if (tok >= vocab) { __trap(); return; }
+        const __nv_bfloat16* a = table + (size_t)tok * width;
+        __nv_bfloat16* o = out + (size_t)r * width;
+        if (tok - frame_lo >= frame_rows) {
+            for (unsigned i = threadIdx.x; i < width; i += PLOW_NV_THREADS) o[i] = a[i];
+            continue;
+        }
+        const unsigned* c = codes + (size_t)r * K;
+        for (unsigned k = 0; k < K; k++)
+            if (c[k] >= cb_size) { __trap(); return; }
+        for (unsigned i = threadIdx.x; i < width; i += PLOW_NV_THREADS) {
+            float s = 0.f;
+            for (unsigned k = 0; k < K; k++)
+                s += __bfloat162float(cb[((size_t)k * cb_size + c[k]) * width + i]);
+            const float t = __bfloat162float(__float2bfloat16_rn(
+                __bfloat162float(a[i]) + __bfloat162float(__float2bfloat16_rn(s))));
+            o[i] = __float2bfloat16_rn(__fdiv_rn(t, div));
+        }
+    }
+}
+
+/* SampleFishBf16 (op 219): Fish S2 sampling, one block per row; see dev.rs. Arena: PLOW_NV_WARPS u64
+ * + PLOW_NV_WARPS f32 reduction slots, 64 selected classes and logits, then the row as bf16 bits. */
+static __device__ __forceinline__ unsigned long long sf_mix(unsigned long long z) {
+    z += 0x9e3779b97f4a7c15ull;
+    z = (z ^ (z >> 30)) * 0xbf58476d1ce4e5b9ull;
+    z = (z ^ (z >> 27)) * 0x94d049bb133111ebull;
+    return z ^ (z >> 31);
+}
+static __device__ __forceinline__ float sf_neg_log_exp1(unsigned long long seed, unsigned step, unsigned coord,
+                                                        unsigned draw, unsigned i) {
+    unsigned long long z = sf_mix(seed ^ sf_mix(((unsigned long long)step << 32) | coord));
+    z = sf_mix(z ^ (((unsigned long long)draw << 32) | i));
+    const float u = ((float)(z >> 40) + 0.5f) * (1.0f / 16777216.0f);
+    return -logf(-logf(u));
+}
+static __device__ void d_sample_fish(unsigned* __restrict__ out, const __nv_bfloat16* __restrict__ logits,
+                                     const float* __restrict__ params, const unsigned* __restrict__ topk,
+                                     const unsigned long long* __restrict__ seed, const unsigned* __restrict__ step,
+                                     unsigned* __restrict__ hist, unsigned* __restrict__ out_flat, unsigned rows,
+                                     unsigned vocab, unsigned out_stride,
+                                     unsigned out_col0, unsigned coord, unsigned window, unsigned flags,
+                                     unsigned lstride, unsigned ras_limit, unsigned slice, unsigned nblk,
+                                     float* arena) {
+    unsigned long long* part = (unsigned long long*)arena;
+    float* fpart = (float*)(part + PLOW_NV_WARPS);
+    unsigned* sel = (unsigned*)(fpart + PLOW_NV_WARPS);
+    float* sv = (float*)(sel + 64);
+    unsigned short* L = (unsigned short*)(sv + 64);
+    const unsigned ls = lstride ? lstride : vocab;
+    for (unsigned r = slice; r < rows; r += nblk) {
+        const unsigned K = min(min(topk[r], 64u), vocab);
+        if (!K) continue;
+        const unsigned short* lg = (const unsigned short*)(logits + (size_t)r * ls);
+        float m = -INFINITY;
+        for (unsigned i = threadIdx.x; i < vocab; i += PLOW_NV_THREADS) {
+            const unsigned short b = lg[i];
+            L[i] = b;
+            m = fmaxf(m, __uint_as_float((unsigned)b << 16));
+        }
+        m = block_max(m, fpart);
+        float z = 0.f;
+        for (unsigned i = threadIdx.x; i < vocab; i += PLOW_NV_THREADS)
+            z += expf(__uint_as_float((unsigned)L[i] << 16) - m);
+        z = block_sum(z, fpart);
+        for (unsigned k = 0; k < K; k++) {
+            unsigned long long best = 0;
+            for (unsigned i = threadIdx.x; i < vocab; i += PLOW_NV_THREADS) {
+                unsigned short b = L[i];
+                const unsigned long long p = amax_pack(*(const __nv_bfloat16*)&b, i);
+                best = p > best ? p : best;
+            }
+            best = block_max_u64(best, part);
+            if (threadIdx.x == 0) {
+                const unsigned idx = ~(unsigned)best;
+                sel[k] = idx;
+                sv[k] = __uint_as_float((unsigned)L[idx] << 16);
+                L[idx] = 0xFF80u;
+            }
+            __syncthreads();
+        }
+        if (threadIdx.x == 0) {
+            const float* p = params + (size_t)r * 4u;
+            auto pick = [&](float t, float top_p, unsigned draw) {
+                float cum = 0.f;
+                unsigned n = 0;
+                for (unsigned i = 0; i < K; i++) {
+                    cum += expf(sv[i] - m) / z;
+                    if (i > 0 && cum > top_p) break;
+                    n = i + 1u;
+                }
+                const float inv = 1.0f / fmaxf(t, 1e-5f);
+                unsigned best = 0;
+                float bv = -INFINITY;
+                for (unsigned i = 0; i < n; i++) {
+                    const float v = (sv[i] - sv[0]) * inv + sf_neg_log_exp1(seed[r], step[r], coord, draw, i);
+                    if (v > bv) { bv = v; best = i; }
+                }
+                return sel[best];
+            };
+            unsigned c = pick(p[0], p[1], 0u);
+            if ((flags & 1u) && hist && window) {
+                unsigned* h = hist + (size_t)r * window;
+                bool seen = false;
+                for (unsigned w = 0; w < window; w++) seen |= h[w] == c + 1u;
+                if (step[r] > 0 && c < ras_limit && seen) c = pick(p[2], p[3], 1u);
+                h[step[r] % window] = c + 1u;
+            }
+            out[(size_t)r * out_stride + out_col0] = c;
+            if (out_flat) out_flat[r] = c;
+        }
+        __syncthreads();
+    }
+}
+
+/* GemvF32Out (op 220): C[m][n] = sum_k x[m][k] * W[n][k] in fp32 (exact bf16 products, fp32 fma), stored
+ * fp32 — a reference that casts both operands to f32 before its matmul. A warp per output row, rows
+ * in blocks of 8 (W re-read once per block of rows). K % 8 == 0. */
+static __device__ void d_gemv_f32out(float* __restrict__ C, const __nv_bfloat16* __restrict__ x,
+                                     const __nv_bfloat16* __restrict__ W, unsigned M, unsigned N, unsigned K,
+                                     unsigned slice, unsigned nblk) {
+    const unsigned lane = threadIdx.x & PLOW_NV_LANE_MASK;
+    const unsigned warp = threadIdx.x >> PLOW_NV_WARP_SHIFT;
+    const unsigned per = (N + nblk - 1) / nblk;
+    const unsigned n0 = slice * per;
+    const unsigned n1 = min(n0 + per, N);
+    for (unsigned n = n0 + warp; n < n1; n += PLOW_NV_WARPS) {
+        const __nv_bfloat16* wr = W + (size_t)n * K;
+        for (unsigned m0 = 0; m0 < M; m0 += 8) {
+            float acc[8];
+#pragma unroll
+            for (int m = 0; m < 8; m++) acc[m] = 0.f;
+            for (unsigned k = lane * 8u; k < K; k += 32u * 8u) {
+                const bf16v8 wv = ld_glob8(wr + k);
+#pragma unroll
+                for (int m = 0; m < 8; m++)
+                    if (m0 + m < M) acc[m] = dot8(wv, ld_glob8(x + (size_t)(m0 + m) * K + k), acc[m]);
+            }
+#pragma unroll
+            for (int m = 0; m < 8; m++) {
+                const float t = warp_sum32(acc[m]);
+                if (lane == 0 && m0 + m < M) C[(size_t)(m0 + m) * N + n] = t;
+            }
+        }
+    }
+}
+
+/* SampleSmallF32 (op 221): one block per row of f32 logits; see dev.rs. Arena: PLOW_NV_WARPS u64 +
+ * PLOW_NV_WARPS f32 reduction slots, 64 selected classes and values, then the row (f32). */
+static __device__ __forceinline__ unsigned long long f32_key(float f, unsigned i) {
+    const unsigned b = __float_as_uint(f + 0.f); /* -0 ranks as +0 (the golden's comparison) */
+    const unsigned key = (b & 0x80000000u) ? ~b : (b | 0x80000000u);
+    return ((unsigned long long)key << 32) | (unsigned long long)(~i);
+}
+static __device__ void d_sample_small(unsigned* __restrict__ out, const float* __restrict__ logits,
+                                      const float* __restrict__ params, const unsigned* __restrict__ ctl,
+                                      const unsigned long long* __restrict__ seed, unsigned* __restrict__ bitmap,
+                                      const unsigned* __restrict__ force, unsigned* __restrict__ eidx,
+                                      unsigned rows, unsigned vocab, unsigned out_stride, unsigned out_col0,
+                                      unsigned coord, unsigned words, unsigned lstride, unsigned eoff,
+                                      unsigned slice, unsigned nblk, float* arena) {
+    unsigned long long* part = (unsigned long long*)arena;
+    float* fpart = (float*)(part + PLOW_NV_WARPS);
+    unsigned* sel = (unsigned*)(fpart + PLOW_NV_WARPS);
+    float* sv = (float*)(sel + 64);
+    float* L = sv + 64;
+    const unsigned ls = lstride ? lstride : vocab;
+    for (unsigned r = slice; r < rows; r += nblk) {
+        /* A CFG pair (plow_asset::fish_depth GUIDE / FOLLOW bits): the guide row r samples
+         * u + s (c - u) over rows (r, r + 1) = (cond, uncond) and writes both; the follower skips. */
+        const unsigned cw = ctl[2u * r];
+        if (cw & (1u << 30)) continue;
+        const bool guide = cw & (1u << 31);
+        const unsigned K = min(min(cw & ~(3u << 30), 64u), vocab);
+        if (!K) continue;
+        const float* p = params + (size_t)r * 4u;
+        const float t = p[0], pen = p[2], cs = p[3];
+        const unsigned* bm = bitmap ? bitmap + (size_t)r * words : nullptr;
+        const float* lg = logits + (size_t)r * ls;
+        const float* lu = guide ? lg + ls : nullptr;
+        for (unsigned i = threadIdx.x; i < vocab; i += PLOW_NV_THREADS) {
+            float v = lg[i];
+            if (lu) v = __fadd_rn(lu[i], __fmul_rn(cs, __fsub_rn(v, lu[i])));
+            if (bm && ((bm[i >> 5] >> (i & 31u)) & 1u)) v = v > 0.f ? __fdiv_rn(v, pen) : v * pen;
+            L[i] = t > 0.f ? __fdiv_rn(v, t) : v;
+        }
+        __syncthreads();
+        for (unsigned k = 0; k < K; k++) {
+            unsigned long long best = 0;
+            for (unsigned i = threadIdx.x; i < vocab; i += PLOW_NV_THREADS) {
+                const unsigned long long q = f32_key(L[i], i);
+                best = q > best ? q : best;
+            }
+            best = block_max_u64(best, part);
+            if (threadIdx.x == 0) {
+                const unsigned idx = ~(unsigned)best;
+                sel[k] = idx;
+                sv[k] = L[idx];
+                L[idx] = -INFINITY;
+            }
+            __syncthreads();
+        }
+        if (threadIdx.x == 0) {
+            const unsigned step = ctl[2u * r + 1u];
+            unsigned n = K;
+            if (p[1] < 1.f) {
+                float z = 0.f;
+                for (unsigned i = 0; i < K; i++) z += expf(sv[i] - sv[0]);
+                float cum = 0.f;
+                for (unsigned i = 0; i < K; i++) {
+                    if (i > 0 && cum > p[1]) { n = i; break; }
+                    cum += expf(sv[i] - sv[0]) / z;
+                }
+            }
+            unsigned best = 0;
+            float bv = -INFINITY;
+            for (unsigned i = 0; i < n; i++) {
+                const float v = sv[i] + sf_neg_log_exp1(seed[r], step, coord, 0u, i);
+                if (v > bv) { bv = v; best = i; }
+            }
+            unsigned c = sel[best];
+            const size_t o = (size_t)r * out_stride + out_col0;
+            if (force && force[o] != 0xFFFFFFFFu) c = force[o];
+            if (bm) bitmap[(size_t)r * words + (c >> 5)] |= 1u << (c & 31u);
+            out[o] = c;
+            if (eidx) eidx[r] = c + eoff;
+            if (guide) {
+                out[o + out_stride] = c;
+                if (eidx) eidx[r + 1] = c + eoff;
+            }
+        }
+        __syncthreads();
     }
 }
 

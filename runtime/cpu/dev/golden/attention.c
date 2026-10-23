@@ -32,7 +32,7 @@ G_K(g_flash_prefill) {
     plow_bf16* const O_final0 = PLOW_CPU_TEN(in, T, 5);
     const uint32_t n_q0 = in->i[0], n_kv0 = in->i[1], n_head = in->i[2], n_kv_head = in->i[3];
     const uint32_t q_pos00 = in->i[4], window = in->i[5], D = in->i[6];
-    const uint32_t nsplit0 = in->i[7] ? in->i[7] : 1u;
+    const uint32_t nsplit0 = (in->i[7] & 0xFFFFu) ? (in->i[7] & 0xFFFFu) : 1u;
     const float scale = in->fj[0].f;
     const uint32_t kv_stride = in->fj[1].u, kv_mask = in->fj[2].u;
     if (D > 512u) return;

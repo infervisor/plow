@@ -523,6 +523,7 @@ type HeldToken = (
     u32,
     String,
     Option<Box<crate::text::logprobs::TokenLogprobs>>,
+    Option<Box<[u32]>>,
 );
 
 /// A request whose prefill splices host rows over prompt positions (`EmbedOverlayBf16`: the
@@ -550,6 +551,76 @@ pub struct SpeechJob {
     /// A voice turn's stream: tokens its first audio renders from. Its ticks are the turn's first
     /// audio until then and stream decode after, so the first render outranks them (0: unknown).
     pub first_tokens: usize,
+    /// A depth-stage packet (`tts.depth_lm.v1`): each step's token comes from the packet's depth
+    /// stage, which also samples the frame's codes ([`StreamChunk::Token::frame`]).
+    pub depth: Option<DepthJob>,
+    /// Fills `overlay` (and the CFG member's `uncond_overlay`), and the prompt's frame rows (their
+    /// tokens in the given prompt ids and the partner's, their `frame_codes`), on the engine
+    /// thread before the first prefill chunk: an encoder launched beside running decode steps
+    /// waits behind their persistent kernels at every one of its launches.
+    pub encode: Option<SpeechEncode>,
+    /// `[rows][frame_codes_per_row]` codes of the prompt's frame rows (`in.frame_codes`, the
+    /// `EmbedFrameBf16` prompt input), zeros elsewhere, staged per prefill chunk for both CFG
+    /// members; empty = no frame rows. Past its end every row's codes are zero.
+    pub frame_codes: Vec<u32>,
+    pub frame_codes_per_row: usize,
+}
+
+pub type SpeechEncode =
+    Box<dyn FnOnce(&mut SpeechJob, &mut [u32]) -> std::result::Result<(), String> + Send>;
+
+/// One request's depth-stage sampling, and its class -> token map.
+#[derive(Clone, Copy, Debug)]
+pub struct DepthJob {
+    pub seed: u64,
+    pub temperature: f32,
+    pub top_p: f32,
+    pub top_k: u32,
+    pub ras_temperature: f32,
+    pub ras_top_p: f32,
+    /// HF repetition penalty on the backbone class (the Breeze sampler; 1.0 = none).
+    pub repetition_penalty: f32,
+    /// CFG scale s of a [`CfgJob`] pair sampled in the depth stage: `u + s (c - u)` for the
+    /// backbone class and every codebook (the host draws nothing).
+    pub cfg_scale: Option<f32>,
+    /// Token of class `c < stop_class`: `semantic_base + c`; the stop class emits `stop_token`.
+    pub semantic_base: u32,
+    pub stop_class: u32,
+    pub stop_token: u32,
+}
+
+impl DepthJob {
+    #[cfg(feature = "cuda")]
+    fn row(
+        &self,
+        slot: usize,
+        hidden_row: u32,
+        step: usize,
+        uncond_row: Option<u32>,
+    ) -> crate::exec::gpu::FishRow {
+        crate::exec::gpu::FishRow {
+            cfg: self.cfg_scale.zip(uncond_row),
+            slot,
+            hidden_row,
+            seed: self.seed,
+            step: step as u32,
+            temperature: self.temperature,
+            top_p: self.top_p,
+            top_k: self.top_k,
+            ras_temperature: self.ras_temperature,
+            repetition_penalty: self.repetition_penalty,
+            ras_top_p: self.ras_top_p,
+        }
+    }
+
+    /// The step's token and, unless it stops, the frame's codes.
+    fn token(&self, codes: &[u32]) -> (u32, Option<Box<[u32]>>) {
+        if codes[0] >= self.stop_class {
+            (self.stop_token, None)
+        } else {
+            (self.semantic_base + codes[0], Some(codes.into()))
+        }
+    }
 }
 
 /// The unconditional member of a CFG pair and the guided sampling chain.
@@ -561,6 +632,10 @@ pub struct CfgJob {
     pub history: Vec<u32>,
     /// `None` = greedy guided decoding.
     pub seed: Option<u64>,
+    /// The unconditional member's own prompt (ids and overlay positions) when it differs from the
+    /// owner's (Breeze drops the instruction); empty = the owner's.
+    pub uncond_ids: Vec<u32>,
+    pub uncond_overlay_pos: Vec<u32>,
 }
 
 /// A CFG owner's host state: its draws and reused logits buffers.
@@ -573,6 +648,9 @@ struct CfgRun {
     scratch: Vec<f32>,
     /// The engine holds this pair's penalty history: its draws run on the device.
     dev_seeded: bool,
+    /// A depth-stage pair: the unconditional member's terminal hidden row (bf16 bytes), saved
+    /// before the owner's prefill overwrites `act.hn`.
+    uncond_hidden: Vec<u8>,
 }
 
 /// Handle to a per-model dispatcher — cheap to clone (wraps a Sender).
@@ -977,6 +1055,8 @@ struct Slot {
     resume: usize,
     /// The next token's OpenAI logprobs, set by the sampler when the request asked for them.
     lp: Option<Box<crate::text::logprobs::TokenLogprobs>>,
+    /// The next token's frame codes (depth-stage packets).
+    frame: Option<Box<[u32]>>,
     /// Emitted tokens the engine's device repetition-penalty history for this slot counts
     /// (`usize::MAX`: unknown, reseeded before the next device draw).
     #[cfg_attr(not(feature = "cuda"), allow(dead_code))]
@@ -2886,6 +2966,7 @@ fn admit_session(
                 uncond: Vec::new(),
                 scratch: Vec::new(),
                 dev_seeded: false,
+                uncond_hidden: Vec::new(),
             })
         }),
         speech: job.opts.speech,
@@ -2893,6 +2974,7 @@ fn admit_session(
         held_finish: None,
         parked_at: None,
         lp: None,
+        frame: None,
         prefix: job.opts.prefix,
         mm: job.opts.mm,
     });
@@ -3508,7 +3590,9 @@ fn run_one_tick(
                 // them; the rung controller still owes that step its progress.
                 let feeds_before = decode_feed_extent(&feeds);
                 let mut unified_progress = None;
-                if e.pf_batch_enabled() {
+                // A depth stage samples each prompt's first frame in serial prefill's tail
+                // (`gpu_prefill_advance`); the packed completions do not run it.
+                if e.pf_batch_enabled() && !e.has_depth_stage() {
                     let compact = e.has_packed_terminal();
                     let mut completed = std::mem::take(&mut obs.host.prefill_tokens);
                     completed.clear();
@@ -4089,6 +4173,16 @@ fn run_one_tick(
                                 let t_emit =
                                     host_engine_call(t_call, feeds.len(), tokens_this_tick);
                                 decode_progress = completed_decode(&feeds, 1);
+                                let depth = e.has_depth_stage();
+                                if let Err(err) = depth
+                                    .then(|| {
+                                        gpu_depth_frames(&mut *e, &feeds, &mut slots, &mut toks)
+                                    })
+                                    .unwrap_or(Ok(()))
+                                {
+                                    note_fault(&mut tick_fault, &err);
+                                    fail_feeds(&mut slots, &feeds, &arena, &err);
+                                }
                                 let cfg_drawn = if cfg_dev {
                                     gpu_cfg_advance(&feeds, &mut slots, 1);
                                     true
@@ -4111,8 +4205,13 @@ fn run_one_tick(
                                 }
                                 for (&(i, _), &argmax_tok) in feeds.iter().zip(toks.iter()) {
                                     let slot_opt = &mut slots[i];
-                                    let was_dev = cfg_drawn
-                                        && slot_opt.as_ref().is_some_and(|s| s.cfg.is_some())
+                                    // A depth slot's token is the depth stage's cb0 draw (its frame).
+                                    let was_dev = depth
+                                        && slot_opt.as_ref().is_some_and(|s| {
+                                            s.speech.as_ref().is_some_and(|sp| sp.depth.is_some())
+                                        })
+                                        || cfg_drawn
+                                            && slot_opt.as_ref().is_some_and(|s| s.cfg.is_some())
                                         || dev_specs
                                             .as_ref()
                                             .map(|_| {
@@ -6660,7 +6759,7 @@ fn gpu_prefill_batched_pass(
             .iter()
             .flatten()
             .filter_map(|s| s.speech.as_deref())
-            .find(|sp| !sp.overlay_pos.is_empty())
+            .find(|sp| !sp.overlay.is_empty())
             .map_or(1, |sp| sp.overlay.len() / sp.overlay_pos.len());
         bytes as usize / 4 / hidden.max(1)
     });
@@ -7312,39 +7411,54 @@ fn gpu_prefill_advance(
             e.hold_session_prefix(slot_idx, ttl);
         }
     }
+    if let Some(sp) = slot.speech.as_deref_mut() {
+        if let Some(encode) = sp.encode.take() {
+            encode(sp, &mut slot.prompt_ids).map_err(crate::RuntimeError::Rejected)?;
+        }
+    }
+    if slot.pf_pos == 0 {
+        // Frame rows' embeddings come from their staged codes, not their ids: a cached prefix
+        // keyed by the ids would misplace them.
+        let keyed = slot
+            .speech
+            .as_deref()
+            .is_none_or(|sp| sp.frame_codes.is_empty());
+        e.set_prefix_attach(slot_idx, keyed);
+    }
     if let Some(sp) = slot.speech.as_deref() {
         // The pair prefills as one unit: the unconditional member to completion on the partner
         // first, its last-row logits stashed before the owner's prefill overwrites row 0.
         if let (0, Some(cfg), Some(run)) = (slot.pf_pos, sp.cfg.as_ref(), slot.cfg.as_mut()) {
             let partner = slot_idx + 1;
+            e.set_prefix_attach(partner, sp.frame_codes.is_empty());
+            let (ids, pos) = if cfg.uncond_ids.is_empty() {
+                (&slot.prompt_ids, &sp.overlay_pos)
+            } else {
+                (&cfg.uncond_ids, &cfg.uncond_overlay_pos)
+            };
             let mut c0 = 0;
             loop {
-                gpu_speech_prefill_inputs(
-                    e,
-                    partner,
-                    c0,
-                    &cfg.uncond_overlay,
-                    &sp.overlay_pos,
-                    sp.pos_base,
-                )?;
-                match e.prefill_chunk(partner, &slot.prompt_ids, usize::MAX)? {
+                gpu_speech_prefill_inputs(e, partner, c0, &cfg.uncond_overlay, pos, sp)?;
+                match e.prefill_chunk(partner, ids, usize::MAX)? {
                     PrefillStep::Progress(end) => c0 = end,
                     PrefillStep::Done(_) => break,
                 }
             }
             e.logits_row(0, &mut run.uncond)?;
+            if sp.depth.is_some_and(|d| d.cfg_scale.is_some()) {
+                let hidden = 2 * sp.overlay.len() / sp.overlay_pos.len().max(1);
+                run.uncond_hidden.resize(hidden, 0);
+                e.read_tensor_range(
+                    "act.hn",
+                    u64::from(e.prefill_terminal_row()) * hidden as u64,
+                    &mut run.uncond_hidden,
+                )?;
+            }
             if let Some(base) = sp.pos_base {
                 e.write_tensor_ordered("in.pos_base", (partner * 4) as u64, &base.to_le_bytes())?;
             }
         }
-        gpu_speech_prefill_inputs(
-            e,
-            slot_idx,
-            slot.pf_pos,
-            &sp.overlay,
-            &sp.overlay_pos,
-            sp.pos_base,
-        )?;
+        gpu_speech_prefill_inputs(e, slot_idx, slot.pf_pos, &sp.overlay, &sp.overlay_pos, sp)?;
     }
     let tok = if e.has_prefill() {
         let staged = slot.pf_pos == 0 && slot.prefix.is_some();
@@ -7411,6 +7525,34 @@ fn gpu_prefill_advance(
     if let Some(base) = slot.speech.as_ref().and_then(|s| s.pos_base) {
         e.write_tensor_ordered("in.pos_base", (slot_idx * 4) as u64, &base.to_le_bytes())?;
     }
+    if let Some(job) = slot.speech.as_ref().and_then(|s| s.depth) {
+        e.fish_reset_slot(slot_idx)?;
+        e.fish_logits_to_slot(slot_idx)?;
+        let cond_row = e.prefill_terminal_row();
+        // The pair's unconditional hidden goes back into `act.hn` beside the owner's.
+        let uncond_row = match slot.cfg.as_ref().filter(|_| job.cfg_scale.is_some()) {
+            Some(run) if !run.uncond_hidden.is_empty() => {
+                let row = u32::from(cond_row == 0);
+                e.write_tensor_ordered(
+                    "act.hn",
+                    u64::from(row) * run.uncond_hidden.len() as u64,
+                    &run.uncond_hidden,
+                )?;
+                Some(row)
+            }
+            Some(_) => {
+                return Err(crate::RuntimeError::Rejected(
+                    "depth CFG pair lost its unconditional hidden".into(),
+                ))
+            }
+            None => None,
+        };
+        let mut codes = Vec::new();
+        e.fish_depth_step(&[job.row(slot_idx, cond_row, 0, uncond_row)], &mut codes)?;
+        let (tok, frame) = job.token(&codes);
+        slot.frame = frame;
+        return Ok(Some(tok));
+    }
     if let Some(run) = slot.cfg.as_mut() {
         e.logits_row(0, &mut run.cond)?;
         return Ok(Some(cfg_draw(slot)));
@@ -7452,9 +7594,9 @@ pub fn check_speech_packet(e: &crate::exec::gpu::GpuEngine) -> Result<()> {
 }
 
 /// Stage a speech job's per-slot inputs for its next prefill chunk starting at prompt row `c0`:
-/// the overlay rows that chunk covers (compacted to overlay row 0) and a chunk-relative
-/// `in.encoder_overlay_index`. Rewritten before EVERY chunk: the overlay tensor is shared by all
-/// slots and another job may have prefilled in between.
+/// the overlay rows that chunk covers (compacted to overlay row 0), a chunk-relative
+/// `in.encoder_overlay_index` and the chunk's frame codes. Rewritten before EVERY chunk: these
+/// tensors are shared by all slots and another job may have prefilled in between.
 #[cfg(feature = "cuda")]
 fn gpu_speech_prefill_inputs(
     e: &mut crate::exec::gpu::GpuEngine,
@@ -7462,12 +7604,28 @@ fn gpu_speech_prefill_inputs(
     c0: usize,
     overlay: &[f32],
     overlay_pos: &[u32],
-    pos_base: Option<u32>,
+    sp: &SpeechJob,
 ) -> Result<()> {
     // A decode launch covering this row before the prompt is in must not find a stale base above
     // its reset position (`EmbedPosBf16` traps on pos < base); the real base lands at Done.
-    if c0 == 0 && pos_base.is_some() {
+    if c0 == 0 && sp.pos_base.is_some() {
         e.write_tensor_ordered("in.pos_base", (slot_idx * 4) as u64, &0u32.to_le_bytes())?;
+    }
+    if !sp.frame_codes.is_empty() {
+        let k = sp.frame_codes_per_row.max(1);
+        let rows = e
+            .tensor_bytes("in.frame_codes")
+            .ok_or_else(|| crate::RuntimeError::Rejected("packet has no in.frame_codes".into()))?
+            as usize
+            / 4
+            / k;
+        let window = rows.min(e.pf_max_rows().max(1));
+        let mut codes = vec![0u32; window * k];
+        let have = sp.frame_codes.len().saturating_sub(c0 * k).min(window * k);
+        if have > 0 {
+            codes[..have].copy_from_slice(&sp.frame_codes[c0 * k..c0 * k + have]);
+        }
+        e.write_tensor("in.frame_codes", 0, bytemuck::cast_slice(&codes))?;
     }
     if overlay_pos.is_empty() {
         return Ok(());
@@ -7485,7 +7643,13 @@ fn gpu_speech_prefill_inputs(
     // Every row a prefill launch may read, padded bucket rows included.
     let window = index_rows.min(e.pf_max_rows().max(1));
     let mut index = Vec::new();
-    let (lo, hi) = speech_overlay_index(overlay_pos, c0, window, &mut index);
+    // A frame-code prompt's other rows keep what `EmbedFrameBf16` wrote (reference frames).
+    let rest = if sp.frame_codes.is_empty() {
+        u32::MAX
+    } else {
+        OVERLAY_KEEP
+    };
+    let (lo, hi) = speech_overlay_index(overlay_pos, c0, window, rest, &mut index);
     if hi > lo {
         e.write_tensor(
             "in.encoder_overlay",
@@ -7496,19 +7660,25 @@ fn gpu_speech_prefill_inputs(
     e.write_tensor("in.encoder_overlay_index", 0, bytemuck::cast_slice(&index))
 }
 
+/// `EmbedOverlayBf16` index that leaves the row an earlier embed op wrote.
+#[cfg(any(feature = "cuda", test))]
+const OVERLAY_KEEP: u32 = 0xFFFF_FFFE;
+
 /// The chunk-relative overlay index for launch rows `[c0, c0 + window)`: the overlay rows
-/// `lo..hi` whose prompt positions fall there, renumbered from 0; every other row `u32::MAX`.
+/// `lo..hi` whose prompt positions fall there, renumbered from 0; every other row `rest`
+/// (`u32::MAX` = token-table row, [`OVERLAY_KEEP`] = the earlier embed op's row).
 #[cfg(any(feature = "cuda", test))]
 fn speech_overlay_index(
     pos: &[u32],
     c0: usize,
     window: usize,
+    rest: u32,
     index: &mut Vec<u32>,
 ) -> (usize, usize) {
     let lo = pos.partition_point(|&p| (p as usize) < c0);
     let hi = pos.partition_point(|&p| (p as usize) < c0.saturating_add(window));
     index.clear();
-    index.resize(window, u32::MAX);
+    index.resize(window, rest);
     for (k, &p) in pos[lo..hi].iter().enumerate() {
         index[p as usize - c0] = k as u32;
     }
@@ -7774,6 +7944,14 @@ fn gpu_finish_token(
     slot: &mut Slot,
     argmax_tok: u32,
 ) -> Result<u32> {
+    if slot
+        .speech
+        .as_ref()
+        .and_then(|s| s.depth.as_ref())
+        .is_some()
+    {
+        return Ok(argmax_tok);
+    }
     if let Some(run) = slot.cfg.as_mut() {
         e.logits_row(row + 1, &mut run.uncond)?;
         e.logits_row(row, &mut run.cond)?;
@@ -7923,6 +8101,62 @@ fn greedy_device_logprobs(
     Ok(Some(stats_logprobs(&out, k as usize, req.raw_logits)))
 }
 
+/// Depth-stage packets: sample every fed depth slot's frame after the backbone step (decode row
+/// = slot) and put its token in `toks`, its codes on the slot.
+#[cfg(feature = "cuda")]
+fn gpu_depth_frames(
+    e: &mut crate::exec::gpu::GpuEngine,
+    feeds: &[(usize, u32)],
+    slots: &mut [Option<Slot>],
+    toks: &mut [u32],
+) -> crate::Result<()> {
+    type Bufs = (
+        Vec<(usize, DepthJob)>,
+        Vec<crate::exec::gpu::FishRow>,
+        Vec<u32>,
+    );
+    thread_local! {
+        static BUFS: std::cell::RefCell<Bufs> = const {
+            std::cell::RefCell::new((Vec::new(), Vec::new(), Vec::new()))
+        };
+    }
+    BUFS.with_borrow_mut(|(rows, fish, codes)| {
+        rows.clear();
+        rows.extend(feeds.iter().enumerate().filter_map(|(k, &(i, _))| {
+            let s = slots[i].as_ref()?;
+            Some((k, s.speech.as_ref()?.depth?))
+        }));
+        if rows.is_empty() {
+            return Ok(());
+        }
+        fish.clear();
+        fish.extend(rows.iter().map(|&(k, job)| {
+            let i = feeds[k].0;
+            let uncond = job.cfg_scale.map(|_| i as u32 + 1);
+            job.row(i, i as u32, slots[i].as_ref().map_or(0, |s| s.step), uncond)
+        }));
+        codes.clear();
+        let t = crate::obs::host::on().then(Instant::now);
+        e.fish_depth_step(fish, codes)?;
+        if let Some(t) = t {
+            let width = fish
+                .iter()
+                .map(|r| r.slot + 1 + usize::from(r.cfg.is_some()))
+                .max();
+            crate::obs::host::depth_step(t.elapsed(), fish.len(), width.unwrap_or(0));
+        }
+        let n = codes.len() / rows.len();
+        for (r, &(k, job)) in rows.iter().enumerate() {
+            let (tok, frame) = job.token(&codes[r * n..(r + 1) * n]);
+            toks[k] = tok;
+            if let Some(slot) = slots[feeds[k].0].as_mut() {
+                slot.frame = frame;
+            }
+        }
+        Ok(())
+    })
+}
+
 /// Draw every fed CFG owner's token from ONE download of the step's logits rows (instead of two
 /// synchronous row reads per pair) into its `toks` entry. Returns whether any was drawn.
 #[cfg(feature = "cuda")]
@@ -7934,7 +8168,7 @@ fn gpu_cfg_draws(
 ) -> Result<bool> {
     if !feeds
         .iter()
-        .any(|&(i, _)| slots[i].as_ref().is_some_and(|s| s.cfg.is_some()))
+        .any(|&(i, _)| slots[i].as_ref().is_some_and(host_cfg))
     {
         return Ok(false);
     }
@@ -7959,9 +8193,7 @@ fn gpu_cfg_draws(
             .iter_mut()
             .enumerate()
             .filter_map(|(i, s)| {
-                let s = s
-                    .as_mut()
-                    .filter(|s| s.cfg.is_some() && at[i] != usize::MAX)?;
+                let s = s.as_mut().filter(|s| host_cfg(s) && at[i] != usize::MAX)?;
                 Some((i, s))
             })
             .collect();
@@ -7993,7 +8225,7 @@ fn gpu_stage_cfg(
     let mut rows = Vec::new();
     let mut draws = Vec::new();
     for &(i, _) in feeds {
-        let Some(slot) = slots[i].as_mut() else {
+        let Some(slot) = slots[i].as_mut().filter(|s| host_cfg(s)) else {
             continue;
         };
         let (Some(run), Some(cfg)) = (
@@ -8031,6 +8263,17 @@ fn gpu_stage_cfg(
 #[cfg(feature = "cuda")]
 fn gpu_cfg_device(e: &crate::exec::gpu::GpuEngine) -> bool {
     e.cfg_sampling() && crate::config::RuntimeConfig::get().nv.cfg_device
+}
+
+/// A CFG owner whose draws are the generic sampler's (not a depth-stage pair's).
+#[cfg(feature = "cuda")]
+fn host_cfg(s: &Slot) -> bool {
+    s.cfg.is_some()
+        && !s
+            .speech
+            .as_ref()
+            .and_then(|sp| sp.depth)
+            .is_some_and(|d| d.cfg_scale.is_some())
 }
 
 /// Advance every fed CFG owner's SplitMix past the `k` device draws it consumed.
@@ -8830,12 +9073,12 @@ fn handle_produced_token(
     };
     // A stop token's chunk carries only bytes released by the end of the stream.
     if !stop_token || !delta.is_empty() {
-        let (id, lp) = if stop_token {
-            (crate::serve::stream::TEXT_ONLY, None)
+        let (id, lp, frame) = if stop_token {
+            (crate::serve::stream::TEXT_ONLY, None, None)
         } else {
-            (token, slot.lp.take())
+            (token, slot.lp.take(), slot.frame.take())
         };
-        if send_or_hold(slot, (id, delta, lp)) {
+        if send_or_hold(slot, (id, delta, lp, frame)) {
             if let Some(taken) = slot_opt.take() {
                 release_kv(arena, taken.kv);
             }
@@ -8881,14 +9124,19 @@ fn handle_produced_token(
 /// Send one token chunk, or hold it and park the slot while the consumer is behind or earlier
 /// chunks still wait; one channel entry stays free for the terminal. True when the consumer is
 /// gone.
-fn send_or_hold(slot: &mut Slot, (id, text, logprobs): HeldToken) -> bool {
+fn send_or_hold(slot: &mut Slot, (id, text, logprobs, frame): HeldToken) -> bool {
     if slot.parked_at.is_none() && slot.respond.capacity() > 1 {
         return slot
             .respond
-            .try_send(StreamChunk::Token { id, text, logprobs })
+            .try_send(StreamChunk::Token {
+                id,
+                text,
+                logprobs,
+                frame,
+            })
             .is_err();
     }
-    slot.held.push((id, text, logprobs));
+    slot.held.push((id, text, logprobs, frame));
     slot.parked_at.get_or_insert_with(Instant::now);
     false
 }
@@ -8914,10 +9162,13 @@ fn flush_parked(slot_opt: &mut Option<Slot>, arena: &Option<SharedKvState>) -> b
         .capacity()
         .saturating_sub(1)
         .min(slot.held.len());
-    for (id, text, logprobs) in slot.held.drain(..room) {
-        let _ = slot
-            .respond
-            .try_send(StreamChunk::Token { id, text, logprobs });
+    for (id, text, logprobs, frame) in slot.held.drain(..room) {
+        let _ = slot.respond.try_send(StreamChunk::Token {
+            id,
+            text,
+            logprobs,
+            frame,
+        });
     }
     // PARK_TIMEOUT bounds a consumer that stopped reading, not one that reads slowly.
     if room > 0 && !slot.held.is_empty() {
@@ -9098,6 +9349,7 @@ pub(crate) fn scripted_mux(
                         id: 7,
                         text,
                         logprobs,
+                        frame: None,
                     })
                     .await
                     .is_err()
@@ -9150,14 +9402,32 @@ mod tests {
         // Audio rows at prompt positions 3..9 of a prompt chunked 4 rows at a time.
         let pos: Vec<u32> = (3..9).collect();
         let mut index = Vec::new();
-        assert_eq!(speech_overlay_index(&pos, 0, 4, &mut index), (0, 1));
+        assert_eq!(
+            speech_overlay_index(&pos, 0, 4, u32::MAX, &mut index),
+            (0, 1)
+        );
         assert_eq!(index, [u32::MAX, u32::MAX, u32::MAX, 0]);
-        assert_eq!(speech_overlay_index(&pos, 4, 4, &mut index), (1, 5));
+        assert_eq!(
+            speech_overlay_index(&pos, 4, 4, u32::MAX, &mut index),
+            (1, 5)
+        );
         assert_eq!(index, [0, 1, 2, 3]);
-        assert_eq!(speech_overlay_index(&pos, 8, 4, &mut index), (5, 6));
+        assert_eq!(
+            speech_overlay_index(&pos, 8, 4, u32::MAX, &mut index),
+            (5, 6)
+        );
         assert_eq!(index, [0, u32::MAX, u32::MAX, u32::MAX]);
-        assert_eq!(speech_overlay_index(&pos, 12, 4, &mut index), (6, 6));
+        assert_eq!(
+            speech_overlay_index(&pos, 12, 4, u32::MAX, &mut index),
+            (6, 6)
+        );
         assert!(index.iter().all(|&i| i == u32::MAX));
+        // A cloning prompt's reference frames keep their frame embedding.
+        assert_eq!(
+            speech_overlay_index(&pos, 8, 4, OVERLAY_KEEP, &mut index),
+            (5, 6)
+        );
+        assert_eq!(index, [0, OVERLAY_KEEP, OVERLAY_KEEP, OVERLAY_KEEP]);
     }
 
     #[cfg(feature = "cuda")]
@@ -10415,6 +10685,8 @@ mod tests {
                 },
                 history: Vec::new(),
                 seed: None,
+                uncond_ids: Vec::new(),
+                uncond_overlay_pos: Vec::new(),
             }),
             ..Default::default()
         }));
@@ -10479,6 +10751,7 @@ mod tests {
                 uncond: Vec::new(),
                 scratch: Vec::new(),
                 dev_seeded: false,
+                uncond_hidden: Vec::new(),
             }));
         }
         let slots = vec![owner, None];
@@ -10896,6 +11169,7 @@ mod tests {
                 session: None,
                 resume: 0,
                 lp: None,
+                frame: None,
                 prefix: None,
             }),
             rx,

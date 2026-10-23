@@ -536,7 +536,9 @@ fn validate(inst: &DevInst64, locs: &[Loc]) -> Result<usize> {
         }
         DevOp::LstmCellF32 => {
             let w = i[0] as usize;
-            let ok = (0..4).all(arena)
+            let ok = i[1] <= 1
+                && i[3] == 0
+                && (0..4).all(arena)
                 && none(4..8)
                 && [0, 1, 3].iter().all(|&slot| len(slot) >= w)
                 && len(2) >= 4 * w

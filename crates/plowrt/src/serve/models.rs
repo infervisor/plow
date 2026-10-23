@@ -49,10 +49,21 @@ fn card(state: &AppState, id: String, canonical: &str) -> ModelCard {
         parent: is_alias.then(|| canonical.to_string()),
         permission: Vec::new(),
         x_plow_sampling: (!state.sampling_honoured(canonical)).then_some("device_argmax"),
+        x_plow_speech: speech_card(state, canonical),
         id,
         object: "model",
         created: state.started(),
         owned_by: "plow",
+    }
+}
+
+fn speech_card(state: &AppState, canonical: &str) -> Option<serde_json::Value> {
+    #[cfg(feature = "cuda")]
+    return crate::tts::serving::speech_spec(state, canonical).map(|s| s.card());
+    #[cfg(not(feature = "cuda"))]
+    {
+        let _ = (state, canonical);
+        None
     }
 }
 
@@ -108,6 +119,7 @@ fn audio_card(state: &AppState, id: String) -> ModelCard {
         parent: None,
         permission: Vec::new(),
         x_plow_sampling: None,
+        x_plow_speech: None,
         id,
         object: "model",
         created: state.started(),
