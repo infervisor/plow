@@ -583,6 +583,7 @@ impl GpuEngine {
                                 .enable_block_store(
                                     std::sync::Arc::clone(&blocks)
                                         as std::sync::Arc<dyn crate::memory::vmm::SnapBlocks>,
+                                    true,
                                 );
                             serve.blocks = Some(blocks);
                         }
@@ -627,9 +628,8 @@ impl GpuEngine {
             return Ok(());
         };
         let restored = (|| {
-            if a.rows % kv.block_rows() != 0 {
-                kv.ensure_rows(b, a.rows + 1)?;
-            }
+            // The slot's own blocks hold the prefix: map them, then gather every row.
+            kv.ensure_rows(b, a.rows + 1)?;
             match a.blocks {
                 Some(handle) => self.blocks_gather(b, handle),
                 None => Err(RuntimeError::Rejected(

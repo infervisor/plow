@@ -1536,6 +1536,10 @@ struct Inner {
     next_snap_id: u64,
     /// The KV block store behind `SnapStore::Blocks` snapshots ([`VmmKv::enable_block_store`]).
     block_store: Option<Arc<dyn SnapBlocks>>,
+    /// The store holds every full-layer row of a boundary (its `Prefix` blocks): no whole
+    /// block is multi-mapped, a publish takes no block references and an attach maps nothing
+    /// (the engine gathers the rows into the slot's own blocks). Strict publish is moot.
+    block_prefix: bool,
     /// Last [`demote_expired`] sweep: at most one per [`SESSION_SWEEP`].
     session_sweep: Option<std::time::Instant>,
     /// [`VmmKv::enable_host_tier`]: `None` = evicted snapshots are freed.
@@ -1822,6 +1826,7 @@ impl VmmKv {
                 by_id: FxHashMap::default(),
                 next_snap_id: 0,
                 block_store: None,
+                block_prefix: false,
                 session_sweep: None,
                 host: None,
                 recent: std::collections::VecDeque::new(),
@@ -2649,8 +2654,11 @@ impl VmmKv {
         // hold before touching any, so a missing payload leaves the window as it was.
         let kvh = s.geo.kvh_full as usize;
         let pick = placed.len();
+        // Prefix mode: the slot keeps its own blocks (`ensure_rows` grows them, the engine
+        // gathers the rows); the radix references above are all the attach takes.
+        let block_prefix = inner.block_prefix;
         let mut prefix_ids: Vec<Vec<u32>> = Vec::with_capacity(pick);
-        for key in &placed {
+        for key in placed.iter().filter(|_| !block_prefix) {
             let Some(ids) = inner.node_blocks.get(key).cloned() else {
                 // Give back the restore this attach claimed, or its waiters never wake.
                 if let Some((slot, _)) = restore {
@@ -2687,7 +2695,7 @@ impl VmmKv {
         // Past the prefix, stale columns stay `Stale` for the reclaimer, exactly as
         // `retire_window` left them: unreachable, unmapped off-thread, claimable first by
         // `ensure_rows`. Only a live mapping there is dropped, as before.
-        for t in 0..inner.tracks.len() {
+        for t in (0..inner.tracks.len()).filter(|_| !block_prefix) {
             for h in 0..s.geo.kvh_full {
                 for k in 0..s.bph {
                     let slot = slot_index(s, seq, h, k);
@@ -2729,8 +2737,10 @@ impl VmmKv {
                 }
             }
         }
-        inner.seq_blocks[seq] = pick as u32;
-        s.frontier[seq].store(pick as u32 * s.block_rows, Ordering::Release);
+        if !block_prefix {
+            inner.seq_blocks[seq] = pick as u32;
+            s.frontier[seq].store(pick as u32 * s.block_rows, Ordering::Release);
+        }
         drop(inner);
 
         // Drive the driver lock-free. Unmaps precede maps (slot 0 is reused).
@@ -3283,8 +3293,11 @@ impl VmmKv {
 
     /// Attach the KV block store: boundaries published through [`Self::publish_blocks`] live
     /// there; the pool's own host tier stays off (the store has its own).
-    pub fn enable_block_store(&self, hook: Arc<dyn SnapBlocks>) {
-        self.shared.inner.lock().block_store = Some(hook);
+    /// `prefix`: the store holds every full-layer row (see `Inner::block_prefix`).
+    pub fn enable_block_store(&self, hook: Arc<dyn SnapBlocks>, prefix: bool) {
+        let mut inner = self.shared.inner.lock();
+        inner.block_store = Some(hook);
+        inner.block_prefix = prefix;
     }
 
     /// Free one boundary (the LRU policy's choice) so a store allocation can retry.
@@ -3450,7 +3463,7 @@ impl VmmKv {
     pub fn resolve_prefix_hazard(&self, seq: usize, tokens: &[u32], rows: u32) -> bool {
         let s = &self.shared;
         let mut inner = s.inner.lock();
-        if !inner.strict_publish || rows as usize > tokens.len() {
+        if !inner.strict_publish || inner.block_prefix || rows as usize > tokens.len() {
             return true;
         }
         let hashes = hash_blocks(&tokens[..rows as usize], s.block_rows);
@@ -4020,7 +4033,7 @@ fn publish_locked(
     // sequence's own live window for the whole matched range came from an attach to exactly
     // these blocks, or created them itself in an earlier chunk of this same publish — always
     // consistent; same-conversation growth across turns is exactly that case.)
-    if inner.strict_publish && m.blocks > inner.seqs[seq].held {
+    if inner.strict_publish && !inner.block_prefix && m.blocks > inner.seqs[seq].held {
         inner.cache.release(&hashes, m.blocks);
         if pfx_trace::on() {
             pfx_trace::emit(pfx_trace::Event::Refuse {
@@ -4084,7 +4097,9 @@ fn publish_locked(
     }
 
     let kvh = s.geo.kvh_full as usize;
-    for idx in m.blocks..n_pub {
+    // With the store holding every row, the radix nodes index boundaries only.
+    let share_blocks = if inner.block_prefix { 0 } else { n_pub };
+    for idx in m.blocks..share_blocks {
         let mut ids = Vec::with_capacity(inner.tracks.len() * kvh);
         for t in 0..inner.tracks.len() {
             for h in 0..kvh {
@@ -8262,6 +8277,48 @@ mod tests {
         assert!(ever_evicted > 0, "no pressure");
         assert_eq!(p.cached_rows(&b), 8, "shared end in use evicted under pressure");
         assert!(p.stats().cache_bytes <= 512);
+        policy::check_tree(&p.shared.inner.lock());
+    }
+
+    struct NoopBlocks;
+    impl SnapBlocks for NoopBlocks {
+        fn release(&self, _handle: u64) {}
+        fn spill(&self, _handle: u64) -> bool {
+            false
+        }
+        fn restore(&self, _handle: u64) -> Result<()> {
+            Ok(())
+        }
+        fn reap(&self) {}
+        fn pending_spill_bytes(&self) -> u64 {
+            0
+        }
+        fn shrink(&self, _bytes: u64) -> u64 {
+            0
+        }
+    }
+
+    /// Prefix mode: a publish takes no block references and an attach multi-maps nothing;
+    /// the boundary is found by its radix node and hands back the store handle.
+    #[test]
+    fn prefix_mode_publishes_and_attaches_without_multi_mapping() {
+        let ops = Arc::new(MockVmm::default());
+        let p = pool(ops.clone());
+        p.enable_block_store(Arc::new(NoopBlocks), true);
+        let a = prompt(17);
+        p.try_attach(0, &a).unwrap();
+        p.ensure_rows(0, 17).unwrap();
+        p.publish_blocks(0, &a, 16, Kind::PROMPT_END, || Ok((7, 100)))
+            .unwrap();
+        assert_eq!(p.stats().cache_blocks, 0, "no shared block references");
+        p.begin_seq(0);
+        let maps = ops.maps.load(Ordering::SeqCst);
+        let hit = p.try_attach(1, &a).unwrap().expect("hit");
+        assert_eq!((hit.rows, hit.blocks), (16, Some(7)));
+        assert_eq!(ops.maps.load(Ordering::SeqCst), maps, "nothing multi-mapped");
+        p.ensure_rows(1, 17).unwrap();
+        assert!(ops.maps.load(Ordering::SeqCst) > maps, "the slot grows its own blocks");
+        p.finish_attach(1);
         policy::check_tree(&p.shared.inner.lock());
     }
 

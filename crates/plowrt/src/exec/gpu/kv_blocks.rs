@@ -142,8 +142,8 @@ impl BlockServe {
             })
         };
         let window = class("window", window_row, ROWS_PER_BLOCK);
-        let tail = class("tail", tail_row, ROWS_PER_BLOCK);
-        let scale = class("scale", scale_row, block_rows);
+        let tail = class("prefix", tail_row, ROWS_PER_BLOCK);
+        let scale = None;
         let state = class("state", state_row, 1);
         if specs.is_empty() {
             return Err(RuntimeError::Rejected(
@@ -702,8 +702,8 @@ fn plan_blocks(classes: [bool; 4], block_rows: u32, p_a: u32, window: u32) -> Ve
         }
     }
     if classes[1] {
-        let r0 = p_a - p_a % block_rows;
-        for r in (r0..p_a).step_by(ROWS_PER_BLOCK as usize) {
+        // Every full-layer row of the boundary (the store is the only storage of them).
+        for r in (0..p_a).step_by(ROWS_PER_BLOCK as usize) {
             out.push((Class::Tail, r, key(r + ROWS_PER_BLOCK)));
         }
     }
@@ -724,30 +724,25 @@ mod tests {
     use super::*;
 
     #[test]
-    fn a_boundary_is_its_window_its_partial_block_and_its_whole_block_scales() {
-        let p = plan_blocks([true, true, true, false], 4096, 4096 + 96, 1024);
+    fn a_boundary_is_its_window_and_every_full_layer_row() {
+        let p = plan_blocks([true, true, false, false], 4096, 4096 + 96, 1024);
         let window: Vec<u32> = p.iter().filter(|x| x.0 == Class::Window).map(|x| x.1).collect();
         assert_eq!(window.len(), 32);
         assert_eq!((window[0], window[31]), (4096 + 96 - 1024, 4096 + 64));
-        let tail: Vec<u32> = p.iter().filter(|x| x.0 == Class::Tail).map(|x| x.1).collect();
-        assert_eq!(tail, vec![4096, 4128, 4160]);
-        let scale: Vec<(u32, usize)> = p
-            .iter()
-            .filter(|x| x.0 == Class::Scale)
-            .map(|x| (x.1, x.2))
-            .collect();
-        assert_eq!(scale, vec![(0, 127)], "one whole block, keyed at its last 32 rows");
+        let prefix: Vec<u32> = p.iter().filter(|x| x.0 == Class::Tail).map(|x| x.1).collect();
+        assert_eq!(prefix.len(), (4096 + 96) / 32);
+        assert_eq!((prefix[0], prefix[130]), (0, 4160));
         // The key index of a 32-row block is the chain entry ending at its last row.
         assert_eq!(p[0].2, (4096 + 96 - 1024 + 32) / 32 - 1);
+        assert_eq!(p.last().unwrap().2, (4096 + 96) / 32 - 1);
     }
 
     #[test]
     fn a_short_prompt_has_a_short_window_and_no_whole_blocks() {
-        let p = plan_blocks([true, true, true, false], 4096, 224, 1024);
+        let p = plan_blocks([true, true, false, false], 4096, 224, 1024);
         let window = p.iter().filter(|x| x.0 == Class::Window).count();
         let tail = p.iter().filter(|x| x.0 == Class::Tail).count();
         assert_eq!((window, tail), (7, 7));
-        assert!(!p.iter().any(|x| x.0 == Class::Scale));
         let p = plan_blocks([true, false, false, false], 4096, 224, 1024);
         assert_eq!(p.len(), 7);
     }
