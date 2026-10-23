@@ -4331,13 +4331,6 @@ impl GpuEngine {
             single_bound_decode || validate_decode_ladder(&blob)?
         };
         if recurrent.is_some() {
-            // The block store captures the state at the boundary (`State` class); the
-            // contiguous snapshots cannot.
-            if prefix_requested && !config.kv_store() {
-                return Err(RuntimeError::Rejected(
-                    "recurrent state needs PLOW_KV_STORE=1 for prefix caching".into(),
-                ));
-            }
             if !recurrent.as_ref().unwrap().tensors.is_empty()
                 && !blob.prefill_progs().is_empty()
                 && (blob

@@ -191,7 +191,7 @@ boundary, `retire_superseded`). The previous binary is the rollback.
 / left to recompute `tokens_{attached,lost}_{prompt_end,block,shared}_total`,
 `tokens_lost_miss_total`.
 
-### KV block store (`PLOW_KV_STORE`, default on, CUDA, `docs/arch/26-kv-block-store.md`)
+### KV block store (CUDA, always on, `docs/arch/26-kv-block-store.md`)
 
 A boundary is a set of content-addressed blocks instead of one contiguous
 snapshot: 32-row blocks of the sliding windows (and their fp8 ring scales), 32-row blocks of the
@@ -209,5 +209,5 @@ instead, under the same rule.
 `/metrics`: `plowrt_kv_store_*` (residency per tier, dedup hits, fills, reclaims, refusals,
 spills, restores, publishes, gathers, segments, launches). Recurrent models (Qwen3.8 GDN) get
 prefix caching only through the store: the prefill chunk is cut at the prompt-end boundary and
-the boundary published there, state included. `PLOW_KV_STORE=0` = the contiguous snapshot
-path (rollback only).
+the boundary published there, state included. The contiguous snapshot copies of
+`docs/arch/22-kv-cache.md` §7 are gone on CUDA: a packet the store refuses has no prefix cache.

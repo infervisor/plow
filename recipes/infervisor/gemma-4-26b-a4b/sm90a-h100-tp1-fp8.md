@@ -133,8 +133,6 @@ nix develop --command env \
   PLOW_VMM_LIVE_RINGS=1 \
   PLOW_VMM_PREFIX=1 \
   PLOW_VMM_RING_PARK=8 \
-  PLOW_VMM_SNAP_PITCHED=1 \
-  PLOW_VMM_SNAP_POOL=4 \
   PLOW_VMM_STRICT_PUBLISH=1 \
   ./target/release/plowrt serve --assets $ASSETS --port 8080
 ```

@@ -5,7 +5,7 @@ use std::sync::Arc;
 use crate::asset::devblob::DevBlob;
 use crate::config::RuntimeConfig;
 use crate::device::cuda::CudaBackend;
-use crate::exec::kv_layout::{kv_tensor_name, RingWindow};
+use crate::exec::kv_layout::kv_tensor_name;
 use crate::{Result, RuntimeError};
 
 use super::{recurrent_state_layout, GpuEngine};
@@ -42,12 +42,12 @@ pub(super) struct VmmServe {
     /// Empty when full-layer KV is bf16/fp16. Full-layer KV rides the VMM
     /// pool but its scales live in flat cudaMalloc tensors that slot reuse
     /// overwrites — so the whole scale PREFIX `[0..p_a)` rides the boundary
-    /// snapshot (appended after the rings — see `vmm_snap_copy`).
+    /// (the store's `Scale` class).
     pub(super) full_scale: Vec<(usize, usize)>,
     /// Sliding ring rows (`min(max_ctx, KV_RING)`), a power of two.
     pub(super) ring: u64,
     pub(super) snap_row_bytes: u64,
-    /// `PLOW_KV_STORE`: boundaries live in the block store (`kv_blocks.rs`).
+    /// Boundaries live in the block store (`kv_blocks.rs`); `None` = no prefix cache.
     pub(super) blocks: Option<std::sync::Arc<super::kv_blocks::BlockServe>>,
 }
 
@@ -548,34 +548,6 @@ impl GpuEngine {
                     if !full_scale.is_empty() && rt.vmm_strict_publish() {
                         kv.enable_strict_publish();
                     }
-                    let host_cap = rt.vmm_host_cache_bytes();
-                    if host_cap > 0 && !rt.kv_store() {
-                        // The largest snapshot a publish can produce (`vmm_snap_bytes` at
-                        // `max_ctx`): a full window, the fp8 full-layer scales over the whole
-                        // context and the partial block's rows.
-                        let g = kv.geometry();
-                        let full_scale_bytes = full_scale.len() as u64
-                            * 2
-                            * u64::from(g.kvh_full)
-                            * u64::from(g.max_ctx)
-                            * 4;
-                        let partial_bytes = g.full_layers.len() as u64
-                            * 2
-                            * u64::from(g.kvh_full)
-                            * u64::from(kv.block_rows() - 1)
-                            * u64::from(g.hd_full * g.elem);
-                        let slot_bytes =
-                            snap_row_bytes * u64::from(g.window) + full_scale_bytes + partial_bytes;
-                        match kv.enable_host_tier(host_cap, slot_bytes) {
-                            Ok(()) => tracing::info!(
-                                cap_mib = host_cap >> 20,
-                                slot_mib = slot_bytes >> 20,
-                                slots = host_cap / slot_bytes,
-                                "vmm prefix: host tier armed"
-                            ),
-                            Err(e) => tracing::warn!(error = %e, "vmm prefix: host tier off"),
-                        }
-                    }
                     kv
                 }),
                 slide,
@@ -585,7 +557,7 @@ impl GpuEngine {
                 snap_row_bytes,
                 blocks: None,
                 };
-                if rt.kv_store() && serve.prefix_kv().is_some() {
+                if serve.prefix_kv().is_some() {
                     // Host tier: what the host-reserve rule allows now, unless the knob names
                     // a size (cut to the same rule by the store's growth check).
                     let auto = crate::memory::vmm::host_tier_auto();
@@ -614,15 +586,10 @@ impl GpuEngine {
                                 );
                             serve.blocks = Some(blocks);
                         }
-                        Err(e) => tracing::warn!(error = %e, "kv store: off"),
+                        // The store is the boundary storage: without it nothing publishes
+                        // or attaches (the live pool still serves the slots).
+                        Err(e) => tracing::warn!(error = %e, "kv store: off, no prefix cache"),
                     }
-                }
-                // A recurrent model's boundary without its state is wrong on attach: no store,
-                // no prefix cache.
-                if !state_tensors.is_empty() && serve.blocks.is_none() && serve.prefix_kv().is_some() {
-                    return Err(RuntimeError::Rejected(
-                        "recurrent state needs the KV block store (PLOW_KV_STORE=1) for prefix caching".into(),
-                    ));
                 }
                 Ok(Some(serve))
             }
@@ -631,219 +598,6 @@ impl GpuEngine {
                 Ok(None)
             }
         }
-    }
-
-    /// D2D-copy the sliding rings' last `window` rows at boundary `p_a`
-    /// between slot `b`'s rings and a snapshot buffer (`to_snap` picks the
-    /// direction). Layout: `[slide layer][K,V][head][window row][hd]`, rows
-    /// ordered by absolute position `p_a-window..p_a`; each head is at most
-    /// two runs (ring wrap).
-    pub(super) fn vmm_slide_copy(&self, b: usize, p_a: u32, buf: u64, to_snap: bool) -> Result<()> {
-        let (v, kv) = self
-            .vmm_prefix()
-            .expect("vmm_slide_copy without prefix vmm");
-        if v.slide.is_empty() {
-            return Ok(());
-        }
-        let g = kv.geometry();
-        let span = RingWindow::new(p_a.into(), g.window.into(), v.ring);
-        let w = span.rows;
-        let hd_b = (g.hd_slide * g.elem_slide) as u64;
-        let mut off = buf;
-        for &(ik, iv, stride) in &v.slide {
-            for idx in [ik, iv] {
-                let base = self.devp[idx].base + b as u64 * stride;
-                for (dev, snap, rows) in [
-                    (base + span.start * hd_b, off, span.first),
-                    (base, off + span.first * hd_b, w - span.first),
-                ] {
-                    if rows == 0 {
-                        continue;
-                    }
-                    let ring = (dev, v.ring * hd_b);
-                    let snapshot = (snap, w * hd_b);
-                    let (dst, src) = if to_snap {
-                        (snapshot, ring)
-                    } else {
-                        (ring, snapshot)
-                    };
-                    self.be.memcpy_dtod_pitched_async(
-                        dst,
-                        src,
-                        rows * hd_b,
-                        g.kvh_slide,
-                        &self.stream,
-                    )?;
-                }
-                off += u64::from(g.kvh_slide) * w * hd_b;
-            }
-        }
-        Ok(())
-    }
-
-    /// fp8-KV boundary-snapshot regions past the rings. Region 2 (fp8 rings
-    /// only): the ring scales' last `window` rows, same wrap logic as the
-    /// rings at 4 B/row. Region 3 (fp8 full layers only): each full layer's
-    /// whole scale PREFIX `[0..p_a)` — full-layer scale tensors are flat
-    /// cudaMalloc `[batch][kvh][max_ctx]` f32 and slot reuse overwrites them,
-    /// so the shared prefix's scales can only survive in the snapshot.
-    pub(super) fn vmm_scale_copy(&self, b: usize, p_a: u32, buf: u64, to_snap: bool) -> Result<()> {
-        let (v, kv) = self
-            .vmm_prefix()
-            .expect("vmm_scale_copy without prefix vmm");
-        let g = kv.geometry();
-        let ring = v.ring;
-        let mut off = buf;
-        for &(sk, sv) in &v.slide_scale {
-            let span = RingWindow::new(p_a.into(), g.window.into(), ring);
-            let w = span.rows;
-            for idx in [sk, sv] {
-                let base = self.devp[idx].base + b as u64 * g.kvh_slide as u64 * ring * 4;
-                let heads = g.kvh_slide;
-                let (dev, snap) = ((base + span.start * 4, ring * 4), (off, w * 4));
-                self.vmm_copy_heads(dev, snap, span.first * 4, heads, to_snap)?;
-                let (dev, snap) = ((base, ring * 4), (off + span.first * 4, w * 4));
-                self.vmm_copy_heads(dev, snap, (w - span.first) * 4, heads, to_snap)?;
-                off += u64::from(heads) * w * 4;
-            }
-        }
-        let ctx = g.max_ctx as u64;
-        for &(sk, sv) in &v.full_scale {
-            for idx in [sk, sv] {
-                let base = self.devp[idx].base + b as u64 * g.kvh_full as u64 * ctx * 4;
-                let bytes = p_a as u64 * 4;
-                self.vmm_copy_heads((base, ctx * 4), (off, bytes), bytes, g.kvh_full, to_snap)?;
-                off += u64::from(g.kvh_full) * bytes;
-            }
-        }
-        Ok(())
-    }
-
-    /// Copy `bytes` per KV head between a slot's cache tensor (`dev` = first head, head pitch)
-    /// and a snapshot region (`snap`, same), in the `to_snap` direction: one pitched copy for all
-    /// heads under `PLOW_VMM_SNAP_PITCHED`, else one copy per head.
-    fn vmm_copy_heads(
-        &self,
-        dev: (u64, u64),
-        snap: (u64, u64),
-        bytes: u64,
-        heads: u32,
-        to_snap: bool,
-    ) -> Result<()> {
-        if bytes == 0 {
-            return Ok(());
-        }
-        let (dst, src) = if to_snap { (snap, dev) } else { (dev, snap) };
-        if RuntimeConfig::get().vmm_snap_pitched {
-            return self
-                .be
-                .memcpy_dtod_pitched_async(dst, src, bytes, heads, &self.stream);
-        }
-        for h in 0..u64::from(heads) {
-            self.be
-                .memcpy_dtod_async(dst.0 + h * dst.1, src.0 + h * src.1, bytes, &self.stream)?;
-        }
-        Ok(())
-    }
-
-    /// Bytes region 3 occupies for a boundary at `p_a` rows (0 unless the
-    /// full layers are fp8).
-    pub(super) fn vmm_full_scale_bytes(&self, p_a: u32) -> u64 {
-        let Some((v, kv)) = self.vmm_prefix() else {
-            return 0;
-        };
-        let g = kv.geometry();
-        v.full_scale.len() as u64 * 2 * g.kvh_full as u64 * p_a as u64 * 4
-    }
-
-    pub(super) fn vmm_snap_bytes(&self, rows: u32) -> u64 {
-        let (v, kv) = self.vmm_prefix().expect("prefix snapshot without VMM");
-        let g = kv.geometry();
-        let partial = u64::from(rows % kv.block_rows());
-        (v.snap_row_bytes * u64::from(g.window.min(rows))
-            + self.vmm_full_scale_bytes(rows)
-            + v.tensor_tracks.len() as u64
-                * u64::from(g.kvh_full)
-                * partial
-                * u64::from(g.hd_full * g.elem))
-        .max(4)
-    }
-
-    pub(super) fn vmm_partial_copy(
-        &self,
-        b: usize,
-        rows: u32,
-        mut buf: u64,
-        to_snap: bool,
-    ) -> Result<()> {
-        let (v, kv) = self.vmm_prefix().expect("partial copy without prefix vmm");
-        let g = kv.geometry();
-        let partial = rows % kv.block_rows();
-        if partial == 0 {
-            return Ok(());
-        }
-        let row_bytes = u64::from(g.hd_full * g.elem);
-        let bytes = u64::from(partial) * row_bytes;
-        let row0 = u64::from(rows - partial);
-        // One copy per head: the heads' rows live in separately mapped VMM blocks, and a pitched
-        // copy spanning the unmapped VA between them is rejected (CUDA_ERROR_INVALID_VALUE).
-        for &(index, _, _) in &v.tensor_tracks {
-            for h in 0..u64::from(g.kvh_full) {
-                let dev = self.devp[index].base
-                    + ((b as u64 * u64::from(g.kvh_full) + h) * u64::from(g.max_ctx) + row0)
-                        * row_bytes;
-                if to_snap {
-                    self.be.memcpy_dtod_async(buf, dev, bytes, &self.stream)?;
-                } else {
-                    self.be.memcpy_dtod_async(dev, buf, bytes, &self.stream)?;
-                }
-                buf += bytes;
-            }
-        }
-        Ok(())
-    }
-
-    /// Copy the whole boundary snapshot for slot `b` at boundary `p_a`:
-    /// rings, fp8 ring scales, fp8 full-layer scale prefixes, partial full-KV.
-    /// `to_snap` picks the direction (publish writes, attach restores).
-    pub(super) fn vmm_snap_copy(&self, b: usize, p_a: u32, buf: u64, to_snap: bool) -> Result<()> {
-        let t0 = RuntimeConfig::get()
-            .pf_packlog
-            .then(std::time::Instant::now);
-        let copied = (|| {
-            self.vmm_slide_copy(b, p_a, buf, to_snap)?;
-            let (v, kv) = self.vmm_prefix().expect("vmm_snap_copy without prefix vmm");
-            if !v.slide_scale.is_empty() || !v.full_scale.is_empty() {
-                let g = kv.geometry();
-                let rings = v.slide.len() as u64
-                    * 2
-                    * g.kvh_slide as u64
-                    * g.window.min(p_a) as u64
-                    * (g.hd_slide * g.elem_slide) as u64;
-                self.vmm_scale_copy(b, p_a, buf + rings, to_snap)?;
-            }
-            let partial = buf
-                + v.snap_row_bytes * u64::from(kv.geometry().window.min(p_a))
-                + self.vmm_full_scale_bytes(p_a);
-            self.vmm_partial_copy(b, p_a, partial, to_snap)
-        })();
-        let t1 = t0.map(|t| t.elapsed());
-        // Drain even a partially submitted copy before VMM remapping or snapshot release. Inside a
-        // launch window a whole restore is drained by the step instead (`deferred_attach`).
-        let completed = if self.window_open && !to_snap && copied.is_ok() {
-            Ok(())
-        } else {
-            self.be.stream_synchronize(&self.stream)
-        };
-        if let (Some(t0), Some(t1)) = (t0, t1) {
-            eprintln!(
-                "PACKLOG SNAP slot={b} to_snap={} rows={p_a} submit_us={} sync_us={}",
-                to_snap as u8,
-                t1.as_micros(),
-                (t0.elapsed() - t1).as_micros()
-            );
-        }
-        copied.and(completed)
     }
 
     /// Consult the prefix cache for slot `b`'s prompt and attach a published
@@ -876,17 +630,12 @@ impl GpuEngine {
             if a.rows % kv.block_rows() != 0 {
                 kv.ensure_rows(b, a.rows + 1)?;
             }
-            if let Some(handle) = a.blocks {
-                return self.blocks_gather(b, handle);
+            match a.blocks {
+                Some(handle) => self.blocks_gather(b, handle),
+                None => Err(RuntimeError::Rejected(
+                    "boundary without store blocks".into(),
+                )),
             }
-            let expected_snap_bytes = self.vmm_snap_bytes(a.rows);
-            if a.snap_bytes != expected_snap_bytes {
-                return Err(RuntimeError::Rejected(format!(
-                    "boundary snapshot layout drift: cached {} bytes, expected {expected_snap_bytes}",
-                    a.snap_bytes
-                )));
-            }
-            self.vmm_snap_copy(b, a.rows, a.snap_va, false)
         })();
         if let Err(error) = restored {
             kv.begin_seq(b);
@@ -1037,20 +786,16 @@ impl GpuEngine {
             );
             return false;
         }
-        let snap_bytes = self.vmm_snap_bytes(p_a);
-        let published = if v.blocks.is_some() {
-            kv.publish_blocks(b, toks, p_a, kind, || self.blocks_publish(b, p_a))
-        } else {
-            kv.publish_kind(b, toks, p_a, kind, snap_bytes, |dst| {
-                self.vmm_snap_copy(b, p_a, dst, true)
-            })
-        };
-        if let Err(e) = published {
+        if v.blocks.is_none() {
+            trace_refusal(b, p_a, Refusal::NotPublishable);
+            return false;
+        }
+        if let Err(e) = kv.publish_blocks(b, toks, p_a, kind, || self.blocks_publish(b, p_a)) {
             tracing::debug!(error = %e, slot = b, p_a, "vmm: publish_boundary skipped");
             trace_refusal(b, p_a, Refusal::Error);
             false
         } else {
-            tracing::debug!(slot = b, p_a, snap_bytes, "vmm: published successfully");
+            tracing::debug!(slot = b, p_a, "vmm: published successfully");
             true
         }
     }
@@ -1110,7 +855,7 @@ impl GpuEngine {
         // a whole-block checkpoint or chunk end inside the prompt only serves a request waiting
         // on this prefill (`inflight_prefix`), and a shared prefix end publishes through
         // `vmm_publish_shared`. Every other checkpoint is a private window copy
-        // (`vmm_snap_bytes`, ~100 MiB at Gemma-4 26B) whose trim evicts another conversation's
+        // (a whole window, ~100 MiB at Gemma-4 26B) whose trim evicts another conversation's
         // prompt end: published unconditionally, a 6K-token chat turn wrote three such copies
         // and the cache retained a prompt end for ~20 s against think times of minutes.
         let mut p = step;

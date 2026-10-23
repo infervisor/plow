@@ -535,7 +535,7 @@ impl ServeEngine {
         }
     }
 
-    /// The KV block store's counters (`PLOW_KV_STORE`), engine-lock-free; CUDA only.
+    /// The KV block store's counters, engine-lock-free; CUDA only.
     #[cfg(feature = "cuda")]
     pub fn kv_store_handle(&self) -> Option<std::sync::Arc<crate::exec::gpu::KvStoreHandle>> {
         match self {

@@ -661,9 +661,6 @@ pub struct CudaBackend {
     slab_pool: Mutex<Vec<(u64, u64)>>,
     /// Snapshot spill copies ([`CopyTier`]); `None` until the first spill.
     copy_tier: Mutex<Option<CopyTier>>,
-    /// `PLOW_VMM_SNAP_POOL`: freed prefix-snapshot buffers kept for reuse (free list) and the
-    /// allocated size of every live one; leftovers released in Drop.
-    snap_pool: Mutex<(Vec<(u64, u64)>, FxHashMap<u64, u64>)>,
     // Serialize driver mutations with metadata so rebinding cannot revive stale evidence.
     vmm_provenance: Mutex<super::provenance::VmmProvenance>,
     /// Set once, on the first fatal driver status ([`is_cuda_fatal`]): the
@@ -877,7 +874,6 @@ impl CudaBackend {
                 next_module: AtomicU64::new(1),
                 slab_pool: Mutex::new(Vec::new()),
                 copy_tier: Mutex::new(None),
-                snap_pool: Mutex::new((Vec::new(), FxHashMap::default())),
                 vmm_provenance: Mutex::new(super::provenance::VmmProvenance::default()),
                 poisoned,
             })
@@ -2073,21 +2069,6 @@ impl CudaBackend {
 /// The VMM driver surface as `crate::memory::vmm` consumes it. Thin, checked
 /// pass-throughs; every entry re-binds the primary context (threads vary —
 /// the pool's pre-mapper thread calls in from its own thread).
-/// `PLOW_VMM_SNAP_POOL` allocation class for prefix-snapshot buffers.
-const SNAP_POOL_CLASS: u64 = 4 << 20;
-
-impl CudaBackend {
-    /// Return every kept snapshot buffer (`PLOW_VMM_SNAP_POOL`) to the driver; whether any was.
-    fn snap_pool_drain(&self) -> bool {
-        let kept: Vec<(u64, u64)> = self.snap_pool.lock().0.drain(..).collect();
-        for &(va, _) in &kept {
-            // SAFETY: a kept buffer from cuMemAlloc, owned by the free list only.
-            unsafe { (self.api.cuMemFree_v2)(va) };
-        }
-        !kept.is_empty()
-    }
-}
-
 impl crate::memory::vmm::VmmOps for CudaBackend {
     fn allocation_provenance(
         &self,
@@ -2148,11 +2129,7 @@ impl crate::memory::vmm::VmmOps for CudaBackend {
         let mut provenance = self.vmm_provenance.lock();
         let mut h = 0u64;
         // SAFETY: out-pointer; bytes is a granularity multiple (pool contract).
-        let mut rc = unsafe { (self.api.cuMemCreate)(&mut h, bytes as usize, &prop, 0) };
-        if rc == 2 && self.snap_pool_drain() {
-            // SAFETY: as above.
-            rc = unsafe { (self.api.cuMemCreate)(&mut h, bytes as usize, &prop, 0) };
-        }
+        let rc = unsafe { (self.api.cuMemCreate)(&mut h, bytes as usize, &prop, 0) };
         self.check(rc, "cuMemCreate")?;
         provenance.created(h, bytes);
         Ok(h)
@@ -2239,43 +2216,10 @@ impl crate::memory::vmm::VmmOps for CudaBackend {
         let t0 = crate::config::RuntimeConfig::get()
             .pf_packlog
             .then(std::time::Instant::now);
-        let keep = crate::config::RuntimeConfig::get().vmm_snap_pool;
-        let mut bytes = bytes;
-        if keep > 0 {
-            // Snapshot sizes vary with the boundary's partial block; a size class lets a freed
-            // buffer serve the next boundary, and a cap keeps one from holding twice the need.
-            let need = bytes;
-            bytes = need.next_multiple_of(SNAP_POOL_CLASS);
-            let mut pool = self.snap_pool.lock();
-            let fit = pool
-                .0
-                .iter()
-                .enumerate()
-                .filter(|&(_, &(_, have))| have >= need && have <= need + need / 4)
-                .min_by_key(|&(_, &(_, have))| have)
-                .map(|(i, _)| i);
-            if let Some(i) = fit {
-                let (va, have) = pool.0.swap_remove(i);
-                pool.1.insert(va, have);
-                drop(pool);
-                self.vmm_provenance.lock().allocated(va, have);
-                if let Some(t0) = t0 {
-                    eprintln!(
-                        "PACKLOG SNAPALLOC bytes={have} pooled=1 us={}",
-                        t0.elapsed().as_micros()
-                    );
-                }
-                return Ok(va);
-            }
-        }
         let mut dptr: CUdeviceptr = 0;
-        // SAFETY: out-pointer to a device allocation (snapshot buffers).
-        let mut rc = unsafe { (self.api.cuMemAlloc_v2)(&mut dptr, bytes as usize) };
-        if rc == 2 && self.snap_pool_drain() {
-            // SAFETY: as above.
-            rc = unsafe { (self.api.cuMemAlloc_v2)(&mut dptr, bytes as usize) };
-        }
-        self.check(rc, "cuMemAlloc(vmm snapshot)")
+        // SAFETY: out-pointer to a device allocation (store chunks, tables).
+        let rc = unsafe { (self.api.cuMemAlloc_v2)(&mut dptr, bytes as usize) };
+        self.check(rc, "cuMemAlloc(vmm)")
             // CUDA_ERROR_OUT_OF_MEMORY is memory pressure, not a fault: the pool evicts
             // and retries on `Oom` only.
             .map_err(|e| match e.device_code() {
@@ -2283,9 +2227,6 @@ impl crate::memory::vmm::VmmOps for CudaBackend {
                 _ => e,
             })?;
         self.vmm_provenance.lock().allocated(dptr, bytes);
-        if keep > 0 {
-            self.snap_pool.lock().1.insert(dptr, bytes);
-        }
         if let Some(t0) = t0 {
             eprintln!(
                 "PACKLOG SNAPALLOC bytes={bytes} us={}",
@@ -2305,21 +2246,6 @@ impl crate::memory::vmm::VmmOps for CudaBackend {
             .then(std::time::Instant::now);
         let mut provenance = self.vmm_provenance.lock();
         provenance.freed(va);
-        let keep = crate::config::RuntimeConfig::get().vmm_snap_pool as usize;
-        // Off, `alloc` records nothing in the pool, so there is nothing to look up.
-        if keep > 0 {
-            // cuMemFree synchronizes the device; a kept buffer is reused by the next snapshot.
-            let mut pool = self.snap_pool.lock();
-            if let Some(bytes) = pool.1.remove(&va) {
-                if pool.0.len() < keep {
-                    pool.0.push((va, bytes));
-                    if let Some(t0) = t0 {
-                        eprintln!("PACKLOG SNAPFREE pooled=1 us={}", t0.elapsed().as_micros());
-                    }
-                    return;
-                }
-            }
-        }
         // SAFETY: va from VmmOps::alloc, freed exactly once (pool contract).
         let rc = unsafe {
             let _ = bind_context(&self.api, self.ctx, self.freer.context_id);
@@ -2327,9 +2253,9 @@ impl crate::memory::vmm::VmmOps for CudaBackend {
         };
         if rc != 0 {
             if self.is_poisoned() {
-                tracing::debug!(rc, va, "cuMemFree(vmm snapshot) failed (context poisoned)");
+                tracing::debug!(rc, va, "cuMemFree(vmm) failed (context poisoned)");
             } else {
-                tracing::warn!(rc, va, "cuMemFree(vmm snapshot) failed");
+                tracing::warn!(rc, va, "cuMemFree(vmm) failed");
             }
         }
         if let Some(t0) = t0 {
@@ -2553,9 +2479,6 @@ impl Drop for CudaBackend {
                         tracing::warn!(id, rc, "cuModuleUnload at backend drop");
                     }
                 }
-            }
-            for (va, _) in self.snap_pool.lock().0.drain(..) {
-                let _ = (self.api.cuMemFree_v2)(va);
             }
             for (h, bytes) in self.slab_pool.lock().drain(..) {
                 let rc = (self.api.cuMemRelease)(h);

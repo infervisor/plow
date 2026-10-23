@@ -621,24 +621,6 @@ pub struct RuntimeConfig {
     #[arg(long = "vmm-strict-publish", env = "PLOW_VMM_STRICT_PUBLISH", hide = true, default_value_t = true, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
     pub vmm_strict_publish: bool,
 
-    /// CUDA VMM prefix snapshots: copy the fp8 ring scales and full-layer scale prefixes as one
-    /// pitched copy per tensor (all KV heads) instead of one copy per head. Same bytes; a
-    /// Gemma-4 26B snapshot drops from ~10^3 copies to ~10^2.
-    #[arg(long = "vmm-snap-pitched", env = "PLOW_VMM_SNAP_PITCHED", hide = true, default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
-    pub vmm_snap_pitched: bool,
-
-    /// CUDA VMM prefix snapshots: keep up to N freed snapshot buffers for reuse instead of
-    /// `cuMemFree` (which synchronizes the device) and a fresh `cuMemAlloc` per publish
-    /// (~100 MiB each on Gemma-4 26B). 0 = off.
-    #[arg(
-        long = "vmm-snap-pool",
-        env = "PLOW_VMM_SNAP_POOL",
-        default_value_t = 0,
-        hide = true,
-        global = true
-    )]
-    pub vmm_snap_pool: u32,
-
     /// CUDA VMM prefix cache with live sliding rings: a finished request's ring units stay
     /// mapped in its slot (or as spares, trimmed to `PLOW_KV_POOL_MIB` once no slot is live)
     /// instead of `cuMemRelease`, so the next admission skips `cuMemCreate`/map (~6 ms per
@@ -895,15 +877,6 @@ pub struct RuntimeConfig {
     /// them on the pool thread and mapping fresh ones at the next admission. `0` is the rollback.
     #[arg(long = "vmm-stale-reserve", env = "PLOW_VMM_STALE_RESERVE", default_value_t = true, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
     pub vmm_stale_reserve: bool,
-
-    /// CUDA prefix cache: keep boundary snapshots in the content-addressed KV block store
-    /// (`docs/arch/26-kv-block-store.md`): 32-row blocks shared between the boundaries of a
-    /// conversation and between conversations on one system prompt, so a turn publishes only
-    /// its new rows; the host tier (`PLOW_VMM_HOST_CACHE_MIB`) then belongs to the store. `0` =
-    /// one contiguous snapshot copy per boundary: the rollback of the store's qualification,
-    /// gone once the snapshot path is retired.
-    #[arg(long = "kv-store", env = "PLOW_KV_STORE", default_value_t = true, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
-    pub kv_store: bool,
 
     /// CUDA VMM prefix cache: snapshot a sequence's boundary into the cache only once its
     /// leading 32 tokens were seen on another sequence, so unique-prompt workloads pay no
@@ -3025,13 +2998,6 @@ impl RuntimeConfig {
         )
     }
 
-    pub(crate) fn kv_store(&self) -> bool {
-        select_compat(
-            self.kv_store,
-            Self::env_bool("PLOW_KV_STORE"),
-            !Self::is_initialized(),
-        )
-    }
 
     pub(crate) fn vmm_publish_shared(&self) -> bool {
         select_compat(

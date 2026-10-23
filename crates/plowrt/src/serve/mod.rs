@@ -2372,7 +2372,7 @@ pub fn admin_app(state: Arc<AppState>) -> Router {
         .with_state(state)
 }
 
-/// `PLOW_KV_STORE`: the block store's residency and copy counters per model.
+/// The KV block store's residency and copy counters per model.
 #[cfg(feature = "cuda")]
 fn kv_store_metrics(state: &AppState, out: &mut String) {
     use std::fmt::Write;

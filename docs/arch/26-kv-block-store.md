@@ -1,6 +1,6 @@
 # 26 — Prefix cache retention and the KV block store
 
-**Status: design (2026-10-23), reviewed, retention simulated; Part A implemented (A1, A2); B1 and B3 implemented, `PLOW_KV_STORE` default on (exactness gate passed 2026-10-23, replay and Qwen gates below); B2 parked (no AMD box); B4 not started.**
+**Status: design (2026-10-23), reviewed, retention simulated; Part A implemented (A1, A2); B1 and B3 implemented and on by default (exactness gate passed 2026-10-23, replay and Qwen gates below); B2 parked (no AMD box); B4 on CUDA: the snapshot copy path, its pool and pitched knobs and the store switch are gone (the store is the only boundary storage); the VMM multi-map of whole full-layer blocks and the AMD snapshot path remain (§5).**
 Part A says what actually moves the production hit rate and is implementable on today's
 snapshot cache. Part B is the content-addressed block store that replaces the boundary
 snapshots of `docs/arch/22-kv-cache.md` §7–§9 and the AMD `SharedPrefix` with one substrate,
@@ -428,8 +428,7 @@ arena, second repetition):
 A memcpy loop costs ~2.5 µs per segment whatever its size; the kernel is launch-bound at
 ~0.1 ms. The store runs the kernel (PTX embedded); the loop is the fallback only.
 
-Not a knob: the store adds `PLOW_KV_STORE` as its rollback switch and nothing else; the reserve,
-chunk size and class set are derived.
+Not a knob: the store has no switch; the reserve, chunk size and class set are derived.
 
 Known limits of B1 (accepted until B4, each gated rather than assumed):
 * Dedup is keyed by tokens, as the radix tree's whole-block sharing already is; a 32-row block
@@ -555,10 +554,10 @@ MTP-on; final numbers come from `campaign.py report` in the strict format of
 | A1 | bounded snapshot host tier (today's mechanism, allocation after load, chunked); cap derived from host RAM, no new knob | 0(e), 3, 4, 6 |
 | A2 | session-end header in the serve API + demotion on header/abort/disconnect (A.2), always on, metrics `session_end_{header,abort}_total` | 4 with the end-signal ablation, 5 |
 | A3 | production deploy of A1+A2 on gpu04 (user go) and the same-hour comparison the Grafana endpoint allows | strict report |
-| B1 | `memory/kv_store.rs`, CUDA ops, `Prefix` + `Window` (+ scales), block state machine, gather/scatter kernels, publish/attach at today's trigger points, today's eviction order, behind `PLOW_KV_STORE` (off until its gates pass, then on; the switch exists only until B4 removes the old path); TP=1; tier and demotion carried over | 1, 2, 3, 4 device-only, 5 |
+| B1 | `memory/kv_store.rs`, CUDA ops, `Prefix` + `Window` (+ scales), block state machine, gather/scatter kernels, publish/attach at today's trigger points, today's eviction order, on by default once its gates passed (the switch went with B4's first step); TP=1; tier and demotion carried over | 1, 2, 3, 4 device-only, 5 |
 | B2 | AMD: `SharedPrefix` and the per-slot route on the store; HIP gather. Parked: the pool substrate (`SnapStore::Blocks`, `SnapBlocks`, `publish_blocks`) compiles under `hsa`; the engine-side gather needs a box | AMD rung + replay gates, when a box is available |
 | B3 | `State` class: the engine's `state.*` tensors captured at a chunk end aligned to the boundary (B.6a); GDN (Qwen3.8 27B) first, KDA (Kimi-K3) when its state tensors follow the same contract | 1 (state), 5 and replay on Qwen3.8 |
-| B4 | remove VMM multi-map, snapshot pool, strict publish, stale/park/recycle; rewrite `docs/arch/22` §7–9 | copy-amplification gate; all production recipes re-qualified |
+| B4 | done on CUDA: the contiguous snapshot copies, `PLOW_VMM_SNAP_{PITCHED,POOL}` and `PLOW_KV_STORE` removed, the store is unconditional. Remaining: a `Prefix` class for the whole full-layer blocks so VMM multi-map, strict publish and stale/park/recycle can go, and the AMD snapshot path (B2); rewrite `docs/arch/22` §7–9 | copy-amplification gate; all production recipes re-qualified |
 
 Metrics (Part B): `plowrt_kv_store_{blocks,bytes}{class,tier}`, `publish_{blocks,bytes,
 refused}_total`, `attach_{hits,misses,rows,wait}_total`, `attach_from_host_{total,bytes}`,
@@ -566,7 +565,7 @@ refused}_total`, `attach_{hits,misses,rows,wait}_total`, `attach_from_host_{tota
 semantics.
 
 Knobs: the work adds no permanent tuning knob. Behaviour that qualifies becomes the default;
-`PLOW_KV_STORE` is a rollback switch for the qualification window and goes with B4.
+the store's rollback switch existed only for its qualification window and is gone.
 
 ## 6. Open questions
 

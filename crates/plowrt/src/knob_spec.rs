@@ -63,13 +63,6 @@ const PUBLISH_SHARED_QUALIFIED: Status = Status::Qualified {
         "docs/flags-reference.md: `=0` is the rollback",
     ],
 };
-/// Boundary snapshots as content-addressed 32-row blocks (`docs/arch/26-kv-block-store.md`).
-const KV_STORE_QUALIFIED: Status = Status::Qualified {
-    evidence: &[
-        "kv-block-store 065a722c, Gemma-4 26B-A4B FP8 H100 Kit 2 packet, greedy multi-turn at 1000..12000 tokens incl. 4094/4095/4096/8191/8192 + siblings: 40 turns, 0 differing texts or top-3 logprobs vs PLOW_KV_STORE=0, 38 cached turns in both arms; store 41 publishes, 1320 new blocks, 1703 dedup hits, 0 fill failures",
-        "docs/flags-reference.md: `=0` is the rollback",
-    ],
-};
 /// Default-on with `X-Session-Id` only; production sends no header. Not qualified: the one
 /// session-header A/B lost to the legacy session pin.
 const SESSION_TTL_CANDIDATE: Status = Status::Candidate {
@@ -599,8 +592,6 @@ pub const RUNTIME: &[KnobSpec] = &[
     KnobSpec::new("rt.amd_mixed_pack", Some("PLOW_AMD_MIXED_PACK"), Layer::Runtime, Domain::Bool, ON, AMD_MIXED_PACK_DEFAULT),
     KnobSpec::new("rt.prefix_arm_end", Some("PLOW_PREFIX_ARM_END"), Layer::Runtime, Domain::Bool, OFF, DIAG),
     KnobSpec::new("rt.vmm_strict_publish", Some("PLOW_VMM_STRICT_PUBLISH"), Layer::Runtime, Domain::Bool, ON, DIAG),
-    KnobSpec::new("rt.vmm_snap_pitched", Some("PLOW_VMM_SNAP_PITCHED"), Layer::Runtime, Domain::Bool, OFF, DIAG),
-    KnobSpec::new("rt.vmm_snap_pool", Some("PLOW_VMM_SNAP_POOL"), Layer::Runtime, U32, Default::Static(Val::Nat(0)), DIAG),
     KnobSpec::new("rt.vmm_ring_recycle", Some("PLOW_VMM_RING_RECYCLE"), Layer::Runtime, Domain::Bool, OFF, DIAG),
     KnobSpec::new("rt.vmm_ring_park", Some("PLOW_VMM_RING_PARK"), Layer::Runtime, U32, Default::Static(Val::Nat(0)), DIAG),
     KnobSpec::new("rt.pf_admit_overlap", Some("PLOW_PF_ADMIT_OVERLAP"), Layer::Runtime, Domain::Bool, OFF, DIAG),
@@ -632,7 +623,6 @@ pub const RUNTIME: &[KnobSpec] = &[
     KnobSpec::new("rt.vmm_deferred_reclaim", Some("PLOW_VMM_DEFERRED_RECLAIM"), Layer::Runtime, Domain::Bool, ON, PROMOTED),
     KnobSpec::new("rt.vmm_stale_reserve", Some("PLOW_VMM_STALE_RESERVE"), Layer::Runtime, Domain::Bool, ON, STALE_RESERVE_QUALIFIED),
     KnobSpec::new("rt.vmm_publish_shared", Some("PLOW_VMM_PUBLISH_SHARED"), Layer::Runtime, Domain::Bool, ON, PUBLISH_SHARED_QUALIFIED),
-    KnobSpec::new("rt.kv_store", Some("PLOW_KV_STORE"), Layer::Runtime, Domain::Bool, ON, KV_STORE_QUALIFIED),
     KnobSpec::new("rt.prefix_inflight_wait", Some("PLOW_PREFIX_INFLIGHT_WAIT"), Layer::Runtime, Domain::Bool, ON, INFLIGHT_WAIT_QUALIFIED),
     KnobSpec::new("rt.prefix_session_ttl_s", Some("PLOW_PREFIX_SESSION_TTL_S"), Layer::Runtime, U32, Default::Static(Val::Nat(150)), SESSION_TTL_CANDIDATE),
     KnobSpec::new("rt.prefix_chunk_publish", Some("PLOW_PREFIX_CHUNK_PUBLISH"), Layer::Runtime, Domain::Bool, ON, CHUNK_PUBLISH_QUALIFIED),
