@@ -1,0 +1,87 @@
+# Fish Audio S2 Pro (fishaudio/s2-pro) on L4 (sm_89, 58 SMs, 24 GB), BF16: the H100 recipe's
+# slow AR + depth stage + modded-DAC codec.pkt, minus the Hopper-only knobs (split-bf16 wgmma codec,
+# dense tune, KV head-norm-rope fuse). Sized to share the GPU with the qwen3-asr L4 server: 8 decode
+# slots at 2048 ctx (144 KiB KV per token -> 2.25 GiB). Weights are under the Fish Audio research
+# license (non-commercial).
+#
+#   PYREF=<python with torch + safetensors> nix develop --command python3 scripts/campaign/campaign.py \
+#     build recipes/infervisor/fish-s2-pro/sm89-l4-tp1.toml --out <fresh dir>
+#
+# Gates: Whisper CER of served speech.
+
+schema = "plow.recipe.v1"
+namespace = "infervisor"
+name = "fish-s2-pro"
+label = "sm89-l4-tp1"
+plow_git = "9f16f1874f1eebe2231071cbf4f2d1874547448a"
+network = "qwen3"
+doc = "docs/runtime/tts.md"
+
+[target]
+vendor = "nvidia"
+isa = "sm_89"
+sku = "L4"
+units = 58
+num_gpus = 1
+parallel = "tp"
+
+[checkpoint]
+source = "hf:fishaudio/s2-pro"
+revision = "1de9996b6be38b745688de084d87a5633f714e4e"
+
+[cell]
+name = "fish-s2-pro-l4"
+hf_dir = "{out}/prep/slow"
+gpu = "l4"
+arch = "sm_89"
+n_cu = 58
+n_gpu = 1
+max_ctx = 2048
+
+[[prep]]
+name = "slow-checkpoint"
+script = "scripts/tts/fish_prep.py"
+python = "{env:PYREF}"
+args = ["{out}/prep/slow", "1de9996b6be38b745688de084d87a5633f714e4e"]
+
+[[prep]]
+name = "codec-export"
+script = "scripts/tts/fish_codec_export.py"
+python = "{env:PYREF}"
+args = ["{out}/prep/codec", "1de9996b6be38b745688de084d87a5633f714e4e"]
+
+[[prep]]
+name = "ref-encoder-export"
+script = "scripts/tts/fish_encoder_export.py"
+python = "{env:PYREF}"
+args = ["{out}/prep/codec/encoder", "1de9996b6be38b745688de084d87a5633f714e4e"]
+
+[emit]
+emit = "devblob+cubin"
+args = ["--served-name", "fish-s2-pro"]
+[emit.env]
+PLOW_TTS_PROFILE = "fish"
+PLOW_TTS_CODEC_DIR = "{out}/prep/codec"
+PLOW_VERIFY_BIN = "{repo}/lean-plow/.lake/build/bin/plow_verify"
+PLOW_MAX_CHUNK = "512"
+PLOW_PF_LADDER_APPEND = "64,256"
+PLOW_DECODE_BATCH_LADDER = "1,2,4,8"
+# Codec arena for at most 4 x 64 / 1 x 256 decode and 8 x 17 stream steps: 6.0 -> 1.5 GiB of
+# activations (the H100 set's 16 x 64 sizes it). Longer whole utterances decode in windows.
+PLOW_EMIT_FISH_CODEC_MAX_ROWS = "256"
+PLOW_NO_GLU_FUSE = "1"
+PLOW_NV_FA_FOLD = "1"
+
+[bench]
+kind = "speech"
+client = "scripts/tts/tts_bench.py"
+arms = ["--conc 1 --stream --wav --n 16 --prompt-set chatterbox", "--conc 1 --n 16 --prompt-set chatterbox --tag full_c1", "--conc 4 --stream --n 32 --prompt-set chatterbox", "--conc 8 --stream --n 32 --prompt-set chatterbox"]
+
+[gates]
+python = "{env:PYREF}"
+[gates.tts_cer]
+arms = ["--conc 1 --stream --wav --n 16 --prompt-set chatterbox", "--conc 8 --stream --wav --n 32 --prompt-set chatterbox"]
+cer_median_max = 0.05
+
+[serve]
+env = { PLOW_VMM_PREFIX = "1" }

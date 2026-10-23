@@ -344,6 +344,11 @@ pub struct EmitConfig {
     #[arg(long, env = "PLOW_EMIT_SNAC_SPLIT_BF16", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
     pub snac_split_bf16: bool,
 
+    /// Fish/Breeze codec: skip decode and stream-step capacities over this many rows (batch x
+    /// frames); the largest sets the activation arena (PLOW_EMIT_FISH_CODEC_MAX_ROWS).
+    #[arg(long, env = "PLOW_EMIT_FISH_CODEC_MAX_ROWS")]
+    pub fish_codec_max_rows: Option<u32>,
+
     /// Packed prefill for hd64/hd128 attention (the live-KV and packed contracts accept them).
     #[arg(long, env = "PLOW_EMIT_PACKED_PREFILL_SMALL_HD", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
     pub packed_prefill_small_hd: bool,
@@ -1944,6 +1949,7 @@ impl EmitConfig {
             packed_prefill_small_hd: env_bool("PLOW_EMIT_PACKED_PREFILL_SMALL_HD"),
             s3gen_attn_h16: env_bool("PLOW_EMIT_S3GEN_ATTN_H16"),
             snac_split_bf16: env_bool("PLOW_EMIT_SNAC_SPLIT_BF16"),
+            fish_codec_max_rows: env_u32("PLOW_EMIT_FISH_CODEC_MAX_ROWS"),
             nv_fa_mma_hd128: env_bool("PLOW_NV_FA_MMA_HD128"),
             nv_gemv_k8_b1: env_bool("PLOW_NV_GEMV_K8_B1"),
             nv_fa_rg_wide: env_bool("PLOW_NV_FA_RG_WIDE"),
