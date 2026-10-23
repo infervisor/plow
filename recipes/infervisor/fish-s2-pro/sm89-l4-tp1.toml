@@ -83,5 +83,9 @@ python = "{env:PYREF}"
 arms = ["--conc 1 --stream --wav --n 16 --prompt-set chatterbox", "--conc 8 --stream --wav --n 32 --prompt-set chatterbox"]
 cer_median_max = 0.05
 
+# Live KV: a slot's KV commits on admission (288 MiB at 2048 ctx) instead of 8 x 2048 reserved at
+# load, so the bundle shares the L4 with qwen3-asr (one plowrt, --co-sched rr): 20.2 of 22.5 GiB
+# after load, ASR WER unchanged co-served. BF16 decode is ~66 ms per 46.4 ms frame (c1 RTF ~1.46),
+# so real-time admission holds streaming at one request.
 [serve]
-env = { PLOW_VMM_PREFIX = "1" }
+env = { PLOW_VMM_LIVE = "1" }

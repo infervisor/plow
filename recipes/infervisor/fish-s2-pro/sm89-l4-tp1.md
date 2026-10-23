@@ -64,7 +64,7 @@ plowrt serve --model infervisor/fish-s2-pro:sm89-l4-tp1 --port 8080
 
 # Equivalently, from a locally built asset directory:
 nix develop --command env \
-  PLOW_VMM_PREFIX=1 \
+  PLOW_VMM_LIVE=1 \
   ./target/release/plowrt serve --assets $ASSETS --port 8080
 ```
 <!-- /plow:recipe:serve -->
