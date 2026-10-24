@@ -748,6 +748,13 @@ Fish codec arena is capped with `PLOW_EMIT_FISH_CODEC_MAX_ROWS=256` (7.5 -> 2.7 
 | Fish full c4: audio s/s | 2.07 | |
 | Fish CER (Whisper, n=44) | 0.000 | |
 
+Set `PLOW_PIN_RESIDENT=1` too: without it the manager evicts the idle model so the busy one's live
+KV can grow (Fish evicted under ASR load, then a 16 s reload on the next speech request); pinned,
+a stream that does not fit waits or gets 429. Mixed load (customer streaming ASR c2 + Fish stream
+c1 / full c4 / stream c4 bursts, 40 min): 0 evictions, 0 restarts, only the bursts' 429s; ASR WER
+unchanged (13.01% / 12.28%), ASR end of speech to final p95 2.2 s while TTS runs (p50 163 ms);
+Fish stream c1 RTF 1.5 while ASR runs (TTFA 140 ms).
+
 BF16 Fish decodes ~1 real-time stream on L4 (each frame reads the 8.5 GiB slow AR plus nine depth
 steps at 300 GB/s): real-time admission holds a second stream (`PLOW_TTS_ADMIT_WAIT_MS`, then
 429). Full requests batch. `PLOW_W8A16=1` emits on sm_89 (weights 8.5 -> 5.1 GiB) but its FP8
