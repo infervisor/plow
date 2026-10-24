@@ -294,6 +294,7 @@ driver_api! {
     cuEventQuery: fn(CUevent) -> CUresult,
     cuEventSynchronize: fn(CUevent) -> CUresult,
     cuEventElapsedTime: fn(*mut f32, CUevent, CUevent) -> CUresult,
+    cuStreamWaitEvent: fn(CUstream, CUevent, u32) -> CUresult,
     // T35: CUDA graphs — batch the ~480 per-chunk segment launches into ONE submit.
     // All present since CUDA 10; kernel nodes take the same CUDA_KERNEL_NODE_PARAMS
     // as cuLaunchKernel.
@@ -600,16 +601,26 @@ impl Drop for PinnedHost {
     }
 }
 
-/// The VMM host tier's copy stream and fences ([`crate::memory::vmm::VmmOps::copy_dtoh_async`]),
-/// created at the first spill. A fence is the raw handle of a recorded event; retired events
-/// are reused.
+/// The VMM host tier's copy streams and fences ([`crate::memory::vmm::VmmOps::copy_dtoh_async`]),
+/// created at the first copy. A fence is the raw handle of a recorded event; retired events
+/// are reused. Spills (D2H), restores (H2D) and compaction (D2D) each have a stream: the
+/// spill-ahead thread keeps hundreds of MB of D2H queued, and a restore or a compaction drain
+/// behind that backlog was the 150 ms shrink ceiling.
 struct CopyTier {
     stream: CudaStream,
+    htod: CudaStream,
+    dtod: CudaStream,
     events: FxHashMap<u64, CudaEvent>,
     spare: Vec<CudaEvent>,
     /// Fences of submitted copies whose completion could not be fenced or proven: every
     /// query and wait on them fails, so the pool quarantines both buffers.
     failed: rustc_hash::FxHashSet<u64>,
+}
+
+#[derive(Clone, Copy)]
+enum CopyDir {
+    Spill,
+    Restore,
 }
 
 /// `cuTensorMapEncodeTiled` (CUDA 12.0+): out map (128 B, 128-aligned), dtype, rank,
@@ -2388,51 +2399,24 @@ impl crate::memory::vmm::VmmOps for CudaBackend {
     fn copy_dtoh_async(&self, host_ptr: u64, va: u64, bytes: u64) -> Result<u64> {
         self.bind()?;
         let mut tier = self.copy_tier.lock();
-        let tier = match tier.as_mut() {
-            Some(t) => t,
-            None => tier.insert(CopyTier {
-                stream: self.stream_create()?,
-                events: FxHashMap::default(),
-                spare: Vec::new(),
-                failed: Default::default(),
-            }),
-        };
-        // The event first: once the copy is submitted every failure must still name it.
-        let event = match tier.spare.pop() {
-            Some(e) => e,
-            None => self.event_create(false)?,
-        };
+        let tier = self.copy_tier_mut(&mut tier)?;
         // SAFETY: `va` stays allocated until the fence retires (`memory/vmm.rs`,
         // `SnapStore::Spilling`); `host_ptr` is inside a pinned tier chunk of at least `bytes`.
-        if let Err(error) = self.check(
-            unsafe {
-                (self.api.cuMemcpyDtoHAsync_v2)(
-                    host_ptr as *mut c_void,
-                    va,
-                    bytes as usize,
-                    tier.stream.raw as CUstream,
-                )
-            },
-            "cuMemcpyDtoHAsync(vmm spill)",
-        ) {
-            tier.spare.push(event);
-            return Err(error);
-        }
-        let fence = event.raw as u64;
-        if let Err(error) = self.event_record(&event, &tier.stream) {
-            // Submitted but unfenced: a drained stream proves the copy done (the caller may
-            // free both sides); otherwise the fence reports failure and the pool quarantines.
-            if self.stream_synchronize(&tier.stream).is_ok() {
-                tier.spare.push(event);
-                return Err(error);
-            }
-            tracing::error!(error = %error, "vmm spill: copy submitted without a fence");
-            tier.events.insert(fence, event);
-            tier.failed.insert(fence);
-            return Ok(fence);
-        }
-        tier.events.insert(fence, event);
-        Ok(fence)
+        self.copy_fenced(tier, CopyDir::Spill, "cuMemcpyDtoHAsync(vmm spill)", |s| unsafe {
+            (self.api.cuMemcpyDtoHAsync_v2)(host_ptr as *mut c_void, va, bytes as usize, s)
+        })
+    }
+
+    fn copy_htod_async(&self, va: u64, host_ptr: u64, bytes: u64) -> Result<u64> {
+        self.bind()?;
+        let mut tier = self.copy_tier.lock();
+        let tier = self.copy_tier_mut(&mut tier)?;
+        // SAFETY: `va` is a live `bytes`-long device allocation nothing reads before the fence
+        // (`memory/kv_store.rs`, `Where::Restoring`); `host_ptr` is inside a pinned tier chunk of
+        // at least `bytes` that stays until the fence retires.
+        self.copy_fenced(tier, CopyDir::Restore, "cuMemcpyHtoDAsync(kv store restore)", |s| unsafe {
+            (self.api.cuMemcpyHtoDAsync_v2)(va, host_ptr as *const c_void, bytes as usize, s)
+        })
     }
 
     fn fence_done(&self, fence: u64) -> Result<bool> {
@@ -2488,15 +2472,7 @@ impl crate::memory::vmm::VmmOps for CudaBackend {
     fn copy_dtod_batch_sync(&self, copies: &[(u64, u64, u64)]) -> Result<()> {
         self.bind()?;
         let mut tier = self.copy_tier.lock();
-        let tier = match tier.as_mut() {
-            Some(t) => t,
-            None => tier.insert(CopyTier {
-                stream: self.stream_create()?,
-                events: FxHashMap::default(),
-                spare: Vec::new(),
-                failed: Default::default(),
-            }),
-        };
+        let tier = self.copy_tier_mut(&mut tier)?;
         let mut queued = Ok(());
         for &(dst, src, bytes) in copies {
             // SAFETY: both ranges are live `bytes`-long device allocations from `alloc` that no
@@ -2507,7 +2483,7 @@ impl crate::memory::vmm::VmmOps for CudaBackend {
                         dst,
                         src,
                         bytes as usize,
-                        tier.stream.raw as CUstream,
+                        tier.dtod.raw as CUstream,
                     )
                 },
                 "cuMemcpyDtoDAsync(kv store compaction)",
@@ -2519,10 +2495,85 @@ impl crate::memory::vmm::VmmOps for CudaBackend {
         // Drained on every exit: the caller hands the destination slots out again as soon as
         // this returns, including after a failed enqueue with earlier copies still in flight.
         let drained = self.check(
-            unsafe { (self.api.cuStreamSynchronize)(tier.stream.raw as CUstream) },
+            unsafe { (self.api.cuStreamSynchronize)(tier.dtod.raw as CUstream) },
             "cuStreamSynchronize(kv store compaction)",
         );
         queued.and(drained)
+    }
+}
+
+impl CudaBackend {
+    fn copy_tier_mut<'a>(&self, tier: &'a mut Option<CopyTier>) -> Result<&'a mut CopyTier> {
+        if tier.is_none() {
+            *tier = Some(CopyTier {
+                stream: self.stream_create()?,
+                htod: self.stream_create()?,
+                dtod: self.stream_create()?,
+                events: FxHashMap::default(),
+                spare: Vec::new(),
+                failed: Default::default(),
+            });
+        }
+        Ok(tier.as_mut().expect("set above"))
+    }
+
+    /// Submit one copy on the tier's `dir` stream and fence it; the fence is the recorded
+    /// event's handle.
+    fn copy_fenced(
+        &self,
+        tier: &mut CopyTier,
+        dir: CopyDir,
+        what: &str,
+        submit: impl FnOnce(CUstream) -> CUresult,
+    ) -> Result<u64> {
+        let stream = match dir {
+            CopyDir::Spill => &tier.stream,
+            CopyDir::Restore => &tier.htod,
+        };
+        // The event first: once the copy is submitted every failure must still name it.
+        let event = match tier.spare.pop() {
+            Some(e) => e,
+            None => self.event_create(false)?,
+        };
+        if let Err(error) = self.check(submit(stream.raw as CUstream), what) {
+            tier.spare.push(event);
+            return Err(error);
+        }
+        let fence = event.raw as u64;
+        if let Err(error) = self.event_record(&event, stream) {
+            // Submitted but unfenced: a drained stream proves the copy done (the caller may
+            // free both sides); otherwise the fence reports failure and the pool quarantines.
+            if self.stream_synchronize(stream).is_ok() {
+                tier.spare.push(event);
+                return Err(error);
+            }
+            tracing::error!(error = %error, what, "copy submitted without a fence");
+            tier.events.insert(fence, event);
+            tier.failed.insert(fence);
+            return Ok(fence);
+        }
+        tier.events.insert(fence, event);
+        Ok(fence)
+    }
+
+    /// Order `stream` after the copy behind `fence` without blocking the host; the fence stays
+    /// for [`VmmOps::fence_done`] to retire.
+    pub fn fence_wait_on(&self, fence: u64, stream: &CudaStream) -> Result<()> {
+        let mut tier = self.copy_tier.lock();
+        let Some(tier) = tier.as_mut() else {
+            return Err(RuntimeError::Rejected("vmm copy tier: no copy stream".into()));
+        };
+        if tier.failed.contains(&fence) {
+            return Err(RuntimeError::Device("vmm copy tier: unfenced copy".into()));
+        }
+        let Some(event) = tier.events.get(&fence) else {
+            return Err(RuntimeError::Device("vmm copy tier: unknown fence".into()));
+        };
+        // SAFETY: live stream and event handles.
+        self.check(
+            unsafe { (self.api.cuStreamWaitEvent)(stream.raw as CUstream, event.raw as CUevent, 0) },
+            "cuStreamWaitEvent(kv store restore)",
+        )
     }
 }
 

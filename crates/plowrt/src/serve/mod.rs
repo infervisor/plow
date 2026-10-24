@@ -2414,6 +2414,10 @@ fn kv_store_metrics(state: &AppState, out: &mut String) {
         ("shrink_max_us", "gauge", "Longest single shrink (pool lock held)."),
         ("publish_max_us", "gauge", "Longest single publish on the engine thread."),
         ("gather_max_us", "gauge", "Longest single gather on the engine thread."),
+        ("boundary_restores_total", "counter", "Host-resident boundaries whose restore was started (prefetch or attach)."),
+        ("restore_blocks_total", "counter", "Blocks those restores queued to the device."),
+        ("restore_us_total", "counter", "Microseconds queueing those restores."),
+        ("gather_fenced_blocks_total", "counter", "Gathered blocks whose restore the engine stream waited on."),
         ("published_blocks_total", "counter", "Blocks of published boundaries."),
         ("published_new_blocks_total", "counter", "Blocks a publish had to fill (the rest were shared)."),
         ("gathers_total", "counter", "Boundaries gathered into a slot."),
@@ -2470,7 +2474,11 @@ fn kv_store_metrics(state: &AppState, out: &mut String) {
              plowrt_kv_store_host_grow_max_us{{model=\"{slug}\"}} {}\n\
              plowrt_kv_store_shrink_max_us{{model=\"{slug}\"}} {}\n\
              plowrt_kv_store_publish_max_us{{model=\"{slug}\"}} {}\n\
-             plowrt_kv_store_gather_max_us{{model=\"{slug}\"}} {}\n",
+             plowrt_kv_store_gather_max_us{{model=\"{slug}\"}} {}\n\
+             plowrt_kv_store_boundary_restores_total{{model=\"{slug}\"}} {}\n\
+             plowrt_kv_store_restore_blocks_total{{model=\"{slug}\"}} {}\n\
+             plowrt_kv_store_restore_us_total{{model=\"{slug}\"}} {}\n\
+             plowrt_kv_store_gather_fenced_blocks_total{{model=\"{slug}\"}} {}\n",
             s.store.dedup_hits,
             s.store.fills,
             s.store.fill_failures,
@@ -2506,6 +2514,10 @@ fn kv_store_metrics(state: &AppState, out: &mut String) {
             s.store.shrink_max_us,
             s.publish_max_us,
             s.gather_max_us,
+            s.restores,
+            s.restore_blocks,
+            s.restore_us,
+            s.gather_fenced_blocks,
         );
     }
 }

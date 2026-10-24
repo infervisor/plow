@@ -87,6 +87,12 @@ pub struct BlockServeStats {
     /// The longest single publish and gather.
     pub publish_max_us: u64,
     pub gather_max_us: u64,
+    /// Boundary restores started ahead of an attach (prefetch or attach), the blocks they
+    /// queued and their time; gathered blocks whose copy the engine stream waited on.
+    pub restores: u64,
+    pub restore_blocks: u64,
+    pub restore_us: u64,
+    pub gather_fenced_blocks: u64,
 }
 
 pub struct BlockServe {
@@ -306,16 +312,28 @@ impl SnapBlocks for BlockServe {
         self.store.spill(&ids)
     }
 
-    /// With the copy kernel a gather reads host-resident blocks in place, so nothing moves
-    /// here; the memcpy fallback copies them back first.
+    /// With the copy kernel the host blocks start back to device slots on the copy stream
+    /// (a gather waits on the copies where they have not landed; a block no slot could be made
+    /// for stays on the host and is read in place); the memcpy fallback copies them back first.
     fn restore(&self, handle: u64) -> Result<()> {
-        if self.kernel.is_some() {
-            return Ok(());
-        }
         let ids: Vec<BlockId> = match self.handles.lock().get(&handle) {
             Some(h) => h.iter().map(|&(_, _, id)| id).collect(),
             None => return Err(RuntimeError::Rejected("kv store: unknown boundary".into())),
         };
+        if self.kernel.is_some() {
+            let t0 = std::time::Instant::now();
+            let mut queued = 0u64;
+            for id in ids {
+                if self.store.restore_async(id).is_ok() {
+                    queued += 1;
+                }
+            }
+            let mut st = self.stats.lock();
+            st.restores += 1;
+            st.restore_blocks += queued;
+            st.restore_us += t0.elapsed().as_micros() as u64;
+            return Ok(());
+        }
         for id in ids {
             self.store.ensure_device(id)?;
         }
@@ -473,13 +491,20 @@ impl GpuEngine {
             .ok_or_else(|| RuntimeError::Rejected("kv store: boundary vanished".into()))?;
         let ids: Vec<BlockId> = plan.iter().map(|&(_, _, id)| id).collect();
         bs.store.hold(&ids);
+        let mut fenced = 0u64;
         let copied = (|| {
             let mut segs = Vec::new();
             for &(class, row0, id) in &plan {
-                // The kernel reads a host-resident block in place (device-mapped tier); the
-                // memcpy fallback needs it on the device.
+                // The kernel reads a host-resident block in place (device-mapped tier) and a
+                // restoring one behind its copy fence; the memcpy fallback needs it on the
+                // device.
                 let va = if bs.kernel.is_some() {
-                    bs.store.gather_src(id)?.0
+                    let src = bs.store.gather_src(id)?;
+                    if let Some(fence) = src.fence {
+                        self.be.fence_wait_on(fence, &self.stream)?;
+                        fenced += 1;
+                    }
+                    src.va
                 } else {
                     bs.store.ensure_device(id)?
                 };
@@ -510,6 +535,7 @@ impl GpuEngine {
         st.gather_max_us = st.gather_max_us.max(us);
         st.gather_sync_us += sync_us;
         st.gathered_blocks += plan.len() as u64;
+        st.gather_fenced_blocks += fenced;
         Ok(())
     }
 

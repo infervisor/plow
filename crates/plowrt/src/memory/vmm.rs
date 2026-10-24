@@ -159,6 +159,12 @@ pub trait VmmOps: Send + Sync {
     fn copy_htod(&self, _va: u64, _host_ptr: u64, _bytes: u64) -> Result<()> {
         Err(RuntimeError::Rejected("no host tier".into()))
     }
+    /// Queue the restore of `bytes` from host tier memory into `va` on a stream of its own
+    /// (never behind the spill backlog); returns a fence as [`Self::copy_dtoh_async`] does.
+    /// Nothing reads `va` before the fence; the host bytes stay until it retires.
+    fn copy_htod_async(&self, _va: u64, _host_ptr: u64, _bytes: u64) -> Result<u64> {
+        Err(RuntimeError::Rejected("no host tier".into()))
+    }
     /// Device-to-device copies `(dst, src, bytes)`, all drained when it returns (the block
     /// store moves blocks between slabs under pressure; the engine stream may reuse a source
     /// slot right after). [`Self::copy_dtod_batch`] orders only on the legacy stream.
@@ -1311,7 +1317,9 @@ pub trait SnapBlocks: Send + Sync {
     fn release(&self, handle: u64);
     /// Move its blocks to the host tier; `false` = not possible now (tier full or off).
     fn spill(&self, handle: u64) -> bool;
-    /// Bring every block back to the device (synchronous copies).
+    /// Bring every block back to the device, or start it: a later gather waits on the copies
+    /// where they have not landed. Called at an attach and, ahead of it, by the arrival
+    /// prefetch ([`VmmKv::prefetch`]).
     fn restore(&self, handle: u64) -> Result<()>;
     /// Retire completed spills.
     fn reap(&self);
@@ -3334,6 +3342,8 @@ impl VmmKv {
         if self.spill_ahead.is_some() {
             return;
         }
+        // The store has a host tier: arrival prefetches restore its boundaries (`prefetch`).
+        self.shared.host_armed.store(true, Ordering::Release);
         let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let shared = Arc::clone(&self.shared);
         let flag = Arc::clone(&stop);
@@ -3746,11 +3756,13 @@ impl PrefixProbe {
 
     /// Queue the host → device restore of the boundary `prompt` would attach, so the attach
     /// finds it on the device (the copy overlaps the request's queueing). No-op without a host
-    /// tier, when the boundary is on the device already, or when the restore is queued.
+    /// tier, when the boundary is on the device already, or when the restore is queued. A
+    /// block-store boundary is restored through the store's hook with the lock released (it
+    /// queues the copies); an attach meanwhile waits on `host_cv`.
     pub fn prefetch(&self, prompt: &[u32], key: Option<&PrefixKey>) -> bool {
         let s = &self.0;
         let mut inner = s.inner.lock();
-        if inner.host.is_none() {
+        if inner.host.is_none() && inner.block_store.is_none() {
             return false;
         }
         let hashes = match key {
@@ -3779,13 +3791,56 @@ impl PrefixProbe {
             return false;
         };
         let snap = snap_mut(&mut inner, id).expect("found above");
-        let SnapStore::Host(slot) = snap.store else {
-            return false;
+        let bytes = snap.bytes;
+        let handle = match snap.store {
+            SnapStore::Host(slot) => {
+                snap.store = SnapStore::Restoring(slot);
+                snap.users += 1;
+                inner.host.as_mut().unwrap().prefetch.push_back(id);
+                inner.stats.host_prefetches += 1;
+                s.host_cv.notify_all();
+                return true;
+            }
+            SnapStore::Blocks {
+                handle,
+                state: BlockState::Host,
+            } => handle,
+            _ => return false,
         };
-        snap.store = SnapStore::Restoring(slot);
+        snap.store = SnapStore::Blocks {
+            handle,
+            state: BlockState::Restoring,
+        };
         snap.users += 1;
-        inner.host.as_mut().unwrap().prefetch.push_back(id);
         inner.stats.host_prefetches += 1;
+        let hook = inner.block_store.clone().expect("a block snapshot has a store");
+        drop(inner);
+        let restored = hook.restore(handle);
+        let mut inner = s.inner.lock();
+        let tick = inner.snapshot_tick;
+        let snap = snap_mut(&mut inner, id).expect("held");
+        snap.users -= 1;
+        match restored {
+            Ok(()) => {
+                snap.store = SnapStore::Blocks {
+                    handle,
+                    state: BlockState::Device,
+                };
+                snap.last_used = tick;
+                inner.stats.host_snapshots -= 1;
+                inner.stats.host_snapshot_bytes -= bytes;
+                inner.stats.snapshot_bytes += bytes;
+                inner.stats.cache_bytes += bytes;
+                inner.stats.snapshots_restored += 1;
+            }
+            Err(error) => {
+                tracing::warn!(error = %error, "kv store: prefetch restore failed");
+                snap.store = SnapStore::Blocks {
+                    handle,
+                    state: BlockState::Host,
+                };
+            }
+        }
         s.host_cv.notify_all();
         true
     }
@@ -8519,6 +8574,61 @@ mod tests {
         assert!(p.spill_ahead_one());
         assert!(!p.spill_ahead_one(), "nothing left on the device");
         assert_eq!(p.stats().host_snapshots, 2);
+        policy::check_tree(&p.shared.inner.lock());
+    }
+
+    /// An arrival prefetch of a host-resident block-store boundary restores it through the
+    /// store's hook (lock released) and marks it on the device; the attach then finds it there
+    /// and a second prefetch does nothing.
+    #[test]
+    fn prefetch_restores_a_host_block_boundary_through_the_store() {
+        #[derive(Default)]
+        struct RestoreBlocks {
+            restores: AtomicU64,
+        }
+        impl SnapBlocks for RestoreBlocks {
+            fn release(&self, _handle: u64) {}
+            fn spill(&self, _handle: u64) -> bool {
+                true
+            }
+            fn restore(&self, _handle: u64) -> Result<()> {
+                self.restores.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            }
+            fn reap(&self) {}
+            fn pending_spill_bytes(&self) -> u64 {
+                0
+            }
+            fn shrink(&self, _bytes: u64) -> u64 {
+                0
+            }
+        }
+        let ops = Arc::new(MockVmm::default());
+        let p = pool(ops.clone());
+        let hook = Arc::new(RestoreBlocks::default());
+        p.enable_block_store(hook.clone(), true);
+        let a = prompt(17);
+        p.try_attach(0, &a).unwrap();
+        p.ensure_rows(0, 17).unwrap();
+        p.publish_blocks(0, &a, 16, Kind::PROMPT_END, || Ok((7, 100)))
+            .unwrap();
+        p.begin_seq(0);
+        assert!(p.spill_ahead_one());
+        assert_eq!(p.stats().host_snapshots, 1);
+        let probe = p.prefix_probe().unwrap();
+        let key = probe.key(&a);
+        assert!(probe.prefetch(&a, Some(&key)));
+        assert_eq!(hook.restores.load(Ordering::SeqCst), 1);
+        let s = p.stats();
+        assert_eq!(
+            (s.host_prefetches, s.snapshots_restored, s.host_snapshots),
+            (1, 1, 0)
+        );
+        assert!(!probe.prefetch(&a, Some(&key)), "on the device already");
+        let hit = p.try_attach(1, &a).unwrap().expect("hit");
+        assert_eq!((hit.rows, hit.blocks), (16, Some(7)));
+        assert_eq!(hook.restores.load(Ordering::SeqCst), 1, "found on the device");
+        p.finish_attach(1);
         policy::check_tree(&p.shared.inner.lock());
     }
 

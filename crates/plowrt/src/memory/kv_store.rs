@@ -35,6 +35,8 @@ pub trait StoreOps: Send + Sync {
     fn fence_done(&self, fence: u64) -> Result<bool>;
     /// H2D, complete on return.
     fn copy_htod(&self, va: u64, host: u64, bytes: u64) -> Result<()>;
+    /// Queue an H2D copy; the fence retires when it completed.
+    fn copy_htod_async(&self, va: u64, host: u64, bytes: u64) -> Result<u64>;
     /// D2D copies `(dst, src, bytes)`, all complete on return.
     fn copy_dtod_batch(&self, copies: &[(u64, u64, u64)]) -> Result<()>;
     /// Free device bytes now; `None` where the backend cannot say.
@@ -62,6 +64,9 @@ impl<T: VmmOps + ?Sized> StoreOps for T {
     }
     fn copy_htod(&self, va: u64, host: u64, bytes: u64) -> Result<()> {
         VmmOps::copy_htod(self, va, host, bytes)
+    }
+    fn copy_htod_async(&self, va: u64, host: u64, bytes: u64) -> Result<u64> {
+        VmmOps::copy_htod_async(self, va, host, bytes)
     }
     fn copy_dtod_batch(&self, copies: &[(u64, u64, u64)]) -> Result<()> {
         VmmOps::copy_dtod_batch_sync(self, copies)
@@ -105,18 +110,39 @@ pub enum State {
     Failed,
 }
 
-/// Where a block's bytes are. `Spilling` keeps both slots until the fence retires.
+/// Where a block's bytes are. `Spilling` and `Restoring` keep both slots until the fence
+/// retires; a restoring block's device slot is complete only behind its fence.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Where {
     Device(u32),
     Spilling { dev: u32, host: u32, fence: u64 },
     Host(u32),
+    Restoring { dev: u32, host: u32, fence: u64 },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Location {
     Device(u64),
     Host,
+}
+
+/// Where a gather reads a block ([`KvStore::gather_src`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Src {
+    pub va: u64,
+    /// The host bytes in place (the tier is device-mapped).
+    pub from_host: bool,
+    /// The device bytes are complete only behind this copy fence: the reading stream waits on
+    /// it ([`StoreOps::copy_htod_async`]).
+    pub fence: Option<u64>,
+}
+
+/// A compaction in flight ([`KvStore::compaction_plan`]): `moves` are `(block, from, to)`
+/// with a transfer hold on each block and `to` taken from its slab.
+struct CompactionPlan {
+    class: usize,
+    moves: Vec<(BlockId, u32, u32)>,
+    copies: Vec<(u64, u64, u64)>,
 }
 
 struct Block {
@@ -380,6 +406,8 @@ struct Inner {
     spilling: VecDeque<(BlockId, u64)>,
     /// Bytes of those copies: device memory the pool may count as coming free.
     spilling_bytes: u64,
+    /// Blocks with an H2D copy in flight, oldest first ([`KvStore::restore_async`]).
+    restoring: VecDeque<BlockId>,
     /// Pinned chunks per class allocated ahead by [`KvStore::host_grow_step`] (a pinned
     /// allocation costs ~4 ms per 8 MiB; under the pool lock it was the host tier's TTFT tail).
     host_spare: Vec<Vec<u64>>,
@@ -454,6 +482,7 @@ impl KvStore {
                 host_reclaim: (0..n_classes).map(|_| VecDeque::new()).collect(),
                 spilling: VecDeque::new(),
                 spilling_bytes: 0,
+                restoring: VecDeque::new(),
                 host_spare: (0..n_classes).map(|_| Vec::new()).collect(),
                 tick: 0,
                 stats,
@@ -611,19 +640,18 @@ impl KvStore {
         let inner = self.inner.lock();
         let b = inner.blocks[id as usize].as_ref()?;
         Some(match b.place {
-            Where::Device(s) | Where::Spilling { dev: s, .. } => {
+            Where::Device(s) | Where::Spilling { dev: s, .. } | Where::Restoring { dev: s, .. } => {
                 Location::Device(inner.classes[b.class].device.va(s))
             }
             Where::Host(_) => Location::Host,
         })
     }
 
-    /// The block's device bytes, restoring it from the host tier when needed, and a use tick.
-    /// `Err` = no device slot could be made for the restore.
-    /// Where a gather reads the block: its device bytes, or its host bytes in place when it is
-    /// host-resident (`true`; the host tier is device-mapped). Nothing moves; a later publish
-    /// that meets the block refills it on the device. The caller holds the block meanwhile.
-    pub fn gather_src(&self, id: BlockId) -> Result<(u64, bool)> {
+    /// Where a gather reads the block: its device bytes (behind the restore fence while one is
+    /// in flight), or its host bytes in place when it is host-resident. Nothing moves; a later
+    /// publish that meets a host block refills it on the device. The caller holds the block
+    /// meanwhile.
+    pub fn gather_src(&self, id: BlockId) -> Result<Src> {
         let mut inner = self.inner.lock();
         inner.tick += 1;
         let tick = inner.tick;
@@ -633,14 +661,68 @@ impl KvStore {
         b.tick = tick;
         let (class, place) = (b.class, b.place);
         Ok(match place {
-            Where::Device(s) | Where::Spilling { dev: s, .. } => {
-                (inner.classes[class].device.va(s), false)
-            }
+            Where::Device(s) | Where::Spilling { dev: s, .. } => Src {
+                va: inner.classes[class].device.va(s),
+                from_host: false,
+                fence: None,
+            },
+            Where::Restoring { dev, fence, .. } => Src {
+                va: inner.classes[class].device.va(dev),
+                from_host: false,
+                fence: Some(fence),
+            },
             Where::Host(h) => {
                 inner.stats.host_reads += 1;
-                (inner.classes[class].host.va(h), true)
+                Src {
+                    va: inner.classes[class].host.va(h),
+                    from_host: true,
+                    fence: None,
+                }
             }
         })
+    }
+
+    /// Start bringing a host-resident block back to a device slot (H2D queued on the copy
+    /// stream; [`Self::reap`] commits it when the fence retires). A gather meanwhile reads the
+    /// device slot behind the fence ([`Self::gather_src`]). `Err` = no device slot could be
+    /// made: the block stays on the host and gathers read it in place.
+    pub fn restore_async(&self, id: BlockId) -> Result<()> {
+        let mut inner = self.inner.lock();
+        inner.tick += 1;
+        let tick = inner.tick;
+        let (class, place, state) = {
+            let b = inner.blocks[id as usize]
+                .as_mut()
+                .ok_or_else(|| RuntimeError::Rejected("kv store: no such block".into()))?;
+            b.tick = tick;
+            (b.class, b.place, b.state)
+        };
+        let Where::Host(h) = place else {
+            return Ok(());
+        };
+        if state != State::Ready {
+            return self.ensure_device_locked(&mut inner, id).map(|_| ());
+        }
+        let slot = self.device_slot(&mut inner, class)?;
+        let bytes = inner.classes[class].spec.block_bytes();
+        let va = inner.classes[class].device.va(slot);
+        let host = inner.classes[class].host.va(h);
+        let fence = match self.ops.copy_htod_async(va, host, bytes) {
+            Ok(f) => f,
+            Err(e) => {
+                inner.classes[class].device.put(slot);
+                return Err(e);
+            }
+        };
+        inner.classes[class].device.assign(slot, id);
+        let b = inner.blocks[id as usize].as_mut().expect("block");
+        b.place = Where::Restoring {
+            dev: slot,
+            host: h,
+            fence,
+        };
+        inner.restoring.push_back(id);
+        Ok(())
     }
 
     pub fn ensure_device(&self, id: BlockId) -> Result<u64> {
@@ -662,7 +744,9 @@ impl KvStore {
             (b.class, b.place, b.state)
         };
         match place {
-            Where::Device(s) | Where::Spilling { dev: s, .. } => Ok(inner.classes[class].device.va(s)),
+            Where::Device(s) | Where::Spilling { dev: s, .. } | Where::Restoring { dev: s, .. } => {
+                Ok(inner.classes[class].device.va(s))
+            }
             Where::Host(h) => {
                 let slot = self.device_slot(inner, class)?;
                 let bytes = inner.classes[class].spec.block_bytes();
@@ -741,7 +825,7 @@ impl KvStore {
                     break;
                 }
                 // In flight to the host: `reap` queues it on the host list when it lands.
-                Where::Spilling { .. } => requeue.push(id),
+                Where::Spilling { .. } | Where::Restoring { .. } => requeue.push(id),
                 Where::Host(_) => {}
             }
         }
@@ -778,11 +862,15 @@ impl KvStore {
                 st.device_blocks -= 1;
                 st.device_bytes -= bytes;
             }
-            // Its D2H copy may still read the device slot and write the host slot: neither is
-            // reused (the only such drop is teardown or a failed fence).
+            // Its copy may still read one slot and write the other: neither is reused (the
+            // only such drop is teardown or a failed fence).
             Where::Spilling { .. } => {
                 st.device_blocks -= 1;
                 st.device_bytes -= bytes;
+            }
+            Where::Restoring { .. } => {
+                st.host_blocks -= 1;
+                st.host_bytes -= bytes;
             }
             Where::Host(h) => {
                 c.host.put(h);
@@ -801,7 +889,7 @@ impl KvStore {
                 continue;
             };
             if b.dependents == 0 && b.holds == 0 && b.state != State::Filling {
-                if !matches!(b.place, Where::Spilling { .. }) {
+                if !matches!(b.place, Where::Spilling { .. } | Where::Restoring { .. }) {
                     self.drop_block(&mut inner, id);
                     inner.stats.evictions += 1;
                     n += 1;
@@ -828,8 +916,14 @@ impl KvStore {
                 continue;
             };
             let class = b.class;
-            let Where::Device(dev) = b.place else {
-                continue;
+            let dev = match b.place {
+                Where::Device(dev) => dev,
+                Where::Spilling { .. } | Where::Host(_) => continue,
+                // Coming back to the device: it stays.
+                Where::Restoring { .. } => {
+                    all = false;
+                    continue;
+                }
             };
             if b.state != State::Ready {
                 continue;
@@ -912,8 +1006,10 @@ impl KvStore {
     /// Retire completed spills in order: the device slot frees, the block is host-resident. A
     /// fence that cannot be queried is treated as retired only for a block that was dropped
     /// meanwhile; otherwise the block stays `Spilling` (both copies kept, never reused).
+    /// Completed restores retire the same way: the host slot frees, the block is on the device.
     pub fn reap(&self) {
         let mut inner = self.inner.lock();
+        self.reap_restores(&mut inner);
         let mut left = inner.spilling.len();
         while left > 0 {
             left -= 1;
@@ -968,29 +1064,114 @@ impl KvStore {
         }
     }
 
+    fn reap_restores(&self, inner: &mut Inner) {
+        let mut left = inner.restoring.len();
+        while left > 0 {
+            left -= 1;
+            let Some(id) = inner.restoring.pop_front() else {
+                return;
+            };
+            let (class, host, fence, holds) = match inner.blocks[id as usize].as_ref() {
+                Some(Block {
+                    class,
+                    place: Where::Restoring { host, fence, .. },
+                    holds,
+                    ..
+                }) => (*class, *host, *fence, *holds),
+                _ => continue,
+            };
+            match self.ops.fence_done(fence) {
+                Ok(true) => {}
+                Ok(false) => {
+                    inner.restoring.push_front(id);
+                    return;
+                }
+                Err(_) => {
+                    inner.stats.fill_failures += 1;
+                    continue;
+                }
+            }
+            // A gather may still read the host copy in place (it started before the restore)
+            // or wait on this fence: both slots stay until the hold drops.
+            if holds > 0 {
+                inner.restoring.push_back(id);
+                continue;
+            }
+            let bytes = inner.classes[class].spec.block_bytes();
+            inner.classes[class].host.put(host);
+            let b = inner.blocks[id as usize].as_mut().expect("block");
+            let Where::Restoring { dev, .. } = b.place else {
+                unreachable!("matched above")
+            };
+            b.place = Where::Device(dev);
+            if b.dependents == 0 {
+                inner.reclaim[class].push_back(id);
+            }
+            inner.stats.restores += 1;
+            let st = &mut inner.stats.classes[class];
+            st.host_blocks -= 1;
+            st.host_bytes -= bytes;
+            st.device_blocks += 1;
+            st.device_bytes += bytes;
+        }
+    }
+
     /// Give device memory back under pressure: release whole chunks whose remaining blocks are
     /// all reclaimable (zero-dependent, unheld, settled, on the device), the emptiest chunks
     /// first, until `bytes` are released; chunks that reclaims emptied go back too. Returns the
     /// bytes released to the device. The pool evicts a boundary when this returns 0: its blocks
     /// then become reclaimable and the chunks they sit in releasable.
     pub fn shrink(&self, bytes: u64) -> u64 {
-        let mut inner = self.inner.lock();
         let t0 = std::time::Instant::now();
         // One call releases at most `SHRINK_STEP_BYTES` so the lock is dropped between steps
         // (the pool's pressure loop calls again): a whole floor deficit in one call freed a
         // hundred chunks while the engine thread's gather waited 150 ms for the lock.
-        let released = self.shrink_locked(&mut inner, bytes.min(SHRINK_STEP_BYTES));
+        let want = bytes.min(SHRINK_STEP_BYTES);
+        let mut frees = Vec::new();
+        let mut inner = self.inner.lock();
+        let mut released = self.release_reclaimable_chunks(&mut inner, want, &mut frees);
+        let plan = if released < want {
+            self.compaction_plan(&mut inner)
+        } else {
+            None
+        };
+        // Driver work with the lock released: the chunk frees and the compaction drain, which
+        // a gather or a publish on the engine thread would otherwise wait behind.
+        drop(inner);
+        for va in frees.drain(..) {
+            self.ops.free(va);
+        }
+        let copied = match &plan {
+            Some(p) if !p.copies.is_empty() => self.ops.copy_dtod_batch(&p.copies),
+            _ => Ok(()),
+        };
+        let mut inner = self.inner.lock();
+        if let Some(plan) = plan {
+            released += self.compaction_commit(&mut inner, plan, copied, &mut frees);
+        }
         let us = t0.elapsed().as_micros() as u64;
         inner.stats.shrink_us += us;
         inner.stats.shrink_max_us = inner.stats.shrink_max_us.max(us);
         inner.stats.shrinks += 1;
+        drop(inner);
+        for va in frees {
+            self.ops.free(va);
+        }
         released
     }
 
-    fn shrink_locked(&self, inner: &mut Inner, bytes: u64) -> u64 {
+    /// Release whole chunks whose remaining blocks are all reclaimable (zero-dependent, unheld,
+    /// settled, on the device), the emptiest first, until `bytes`; the freed chunk addresses
+    /// go to `frees`. Every live chunk is checked before 0 is returned: the pool evicts a
+    /// boundary on 0.
+    fn release_reclaimable_chunks(
+        &self,
+        inner: &mut Inner,
+        bytes: u64,
+        frees: &mut Vec<u64>,
+    ) -> u64 {
         let mut released = 0u64;
         for ci in 0..inner.classes.len() {
-            // Every live chunk is checked before 0 is returned: the pool evicts a boundary on 0.
             for chunk in inner.classes[ci].device.release_candidates() {
                 if released >= bytes {
                     break;
@@ -1014,28 +1195,30 @@ impl KvStore {
                 }
                 released += inner.classes[ci]
                     .device
-                    .release_empty_chunks(|va| self.ops.free(va));
+                    .release_empty_chunks(|va| frees.push(va));
             }
         }
-        // Compaction: empty the emptiest chunk by dropping its reclaimable blocks and moving
-        // its live ones into holes elsewhere (one drained copy each), then release it. Holes
-        // are made first from the oldest blocks nothing references (the reclaim list), in
-        // other chunks. A chunk with a held, filling or spilling block, or more live blocks
-        // than holes can be made for, is left alone; the pool then evicts a boundary.
+        released
+    }
+
+    /// Compaction, planned: the emptiest chunk that can be emptied by dropping its reclaimable
+    /// blocks and moving its live ones into holes elsewhere. Holes are made first from the
+    /// oldest blocks nothing references (the reclaim list), in other chunks. The moving blocks
+    /// take a transfer hold and their destinations are taken now; the copies run with the
+    /// lock released and [`Self::compaction_commit`] lands them. A chunk with a held, filling,
+    /// failed-but-referenced or in-transfer block, or more live blocks than holes can be made
+    /// for, is left alone; the pool then evicts a boundary.
+    fn compaction_plan(&self, inner: &mut Inner) -> Option<CompactionPlan> {
         for ci in 0..inner.classes.len() {
-            if released >= bytes {
-                break;
-            }
             'chunks: for chunk in inner.classes[ci].device.release_candidates() {
-                if released >= bytes {
-                    break;
-                }
                 let ids = inner.classes[ci].device.occupants(chunk);
                 let mut live = 0u64;
                 for &id in &ids {
                     match inner.blocks[id as usize].as_ref() {
                         Some(b) if b.holds > 0 || b.state == State::Filling => continue 'chunks,
                         Some(b) if !matches!(b.place, Where::Device(_)) => continue 'chunks,
+                        // A refill may write it while the copy reads it.
+                        Some(b) if b.state == State::Failed && b.dependents > 0 => continue 'chunks,
                         Some(b) if b.dependents > 0 => live += 1,
                         _ => {}
                     }
@@ -1076,8 +1259,6 @@ impl KvStore {
                     }
                 }
                 let bytes_per = inner.classes[ci].spec.block_bytes();
-                // Every move of the chunk is queued, then drained once; the slots change
-                // owner only after the drain (a failed batch leaves the chunk as it was).
                 let mut moves: Vec<(BlockId, u32, u32)> = Vec::new();
                 let mut copies: Vec<(u64, u64, u64)> = Vec::new();
                 for id in ids {
@@ -1098,38 +1279,58 @@ impl KvStore {
                     let d = &inner.classes[ci].device;
                     copies.push((d.va(to), d.va(from), bytes_per));
                     moves.push((id, from, to));
+                    inner.blocks[id as usize].as_mut().expect("block").holds += 1;
                 }
-                let copied = if copies.is_empty() {
-                    Ok(())
-                } else {
-                    self.ops.copy_dtod_batch(&copies)
-                };
-                match copied {
-                    Ok(()) => {
-                        for &(id, from, to) in &moves {
-                            inner.classes[ci].device.assign(to, id);
-                            inner.classes[ci].device.put(from);
-                            inner.blocks[id as usize].as_mut().expect("block").place =
-                                Where::Device(to);
-                        }
-                        inner.stats.compactions += moves.len() as u64;
-                        inner.stats.compact_bytes += moves.len() as u64 * bytes_per;
-                    }
-                    Err(e) => {
-                        for &(_, _, to) in &moves {
-                            inner.classes[ci].device.put(to);
-                        }
-                        tracing::warn!(error = %e, "kv store: compaction copy failed");
-                        break 'chunks;
-                    }
-                }
-                released += inner.classes[ci]
-                    .device
-                    .release_empty_chunks(|va| self.ops.free(va));
+                return Some(CompactionPlan {
+                    class: ci,
+                    moves,
+                    copies,
+                });
             }
         }
+        None
+    }
+
+    /// Land a plan's moves after their copies drained. A block another transfer held meanwhile
+    /// (a gather reads its old slot on the engine stream) stays where it is and its destination
+    /// goes back; a failed batch leaves every block as it was. Returns the bytes the emptied
+    /// chunks release, their addresses in `frees`.
+    fn compaction_commit(
+        &self,
+        inner: &mut Inner,
+        plan: CompactionPlan,
+        copied: Result<()>,
+        frees: &mut Vec<u64>,
+    ) -> u64 {
+        let ci = plan.class;
+        let bytes_per = inner.classes[ci].spec.block_bytes();
+        let mut moved = 0u64;
+        for &(id, from, to) in &plan.moves {
+            let lands = copied.is_ok()
+                && matches!(
+                    inner.blocks[id as usize].as_ref(),
+                    Some(b) if b.holds == 1 && b.place == Where::Device(from)
+                );
+            if lands {
+                inner.classes[ci].device.assign(to, id);
+                inner.classes[ci].device.put(from);
+                inner.blocks[id as usize].as_mut().expect("block").place = Where::Device(to);
+                moved += 1;
+            } else {
+                inner.classes[ci].device.put(to);
+            }
+            if let Some(b) = inner.blocks[id as usize].as_mut() {
+                b.holds -= 1;
+            }
+        }
+        if let Err(e) = &copied {
+            tracing::warn!(error = %e, "kv store: compaction copy failed");
+        }
+        inner.stats.compactions += moved;
+        inner.stats.compact_bytes += moved * bytes_per;
+        let mut released = 0u64;
         for c in inner.classes.iter_mut() {
-            released += c.device.release_empty_chunks(|va| self.ops.free(va));
+            released += c.device.release_empty_chunks(|va| frees.push(va));
         }
         released
     }
@@ -1325,7 +1526,12 @@ mod tests {
         dev_alloc: AtomicU64,
         host_alloc: AtomicU64,
         htod: AtomicU64,
+        htod_async: AtomicU64,
         dtod: AtomicU64,
+        /// Every fence reads as unretired while set.
+        pending: std::sync::atomic::AtomicBool,
+        /// Runs inside `copy_dtod_batch` (the store lock must be free there).
+        on_dtod: parking_lot::Mutex<Option<Box<dyn Fn() + Send>>>,
     }
 
     impl MockOps {
@@ -1335,7 +1541,10 @@ mod tests {
                 dev_alloc: AtomicU64::new(0),
                 host_alloc: AtomicU64::new(0),
                 htod: AtomicU64::new(0),
+                htod_async: AtomicU64::new(0),
                 dtod: AtomicU64::new(0),
+                pending: std::sync::atomic::AtomicBool::new(false),
+                on_dtod: parking_lot::Mutex::new(None),
             })
         }
     }
@@ -1355,14 +1564,21 @@ mod tests {
             Ok(7)
         }
         fn fence_done(&self, _fence: u64) -> Result<bool> {
-            Ok(true)
+            Ok(!self.pending.load(Ordering::SeqCst))
         }
         fn copy_htod(&self, _va: u64, _host: u64, _bytes: u64) -> Result<()> {
             self.htod.fetch_add(1, Ordering::SeqCst);
             Ok(())
         }
+        fn copy_htod_async(&self, _va: u64, _host: u64, _bytes: u64) -> Result<u64> {
+            self.htod_async.fetch_add(1, Ordering::SeqCst);
+            Ok(9)
+        }
         fn copy_dtod_batch(&self, copies: &[(u64, u64, u64)]) -> Result<()> {
             self.dtod.fetch_add(copies.len() as u64, Ordering::SeqCst);
+            if let Some(f) = self.on_dtod.lock().as_ref() {
+                f();
+            }
             Ok(())
         }
         fn free_bytes(&self) -> Option<u64> {
@@ -1733,8 +1949,8 @@ mod tests {
         assert!(s.spill(&[a.id]));
         s.reap();
         s.hold(&[a.id]);
-        let (va, from_host) = s.gather_src(a.id).unwrap();
-        assert!(from_host);
+        let Src { va, from_host, fence } = s.gather_src(a.id).unwrap();
+        assert!(from_host && fence.is_none());
         assert_eq!(ops.htod.load(Ordering::SeqCst), 0, "nothing copied back");
         assert_eq!(s.location(a.id), Some(Location::Host), "the block stays on the host");
         assert_eq!(s.stats().host_reads, 1);
@@ -1748,6 +1964,115 @@ mod tests {
         assert!(!s.spill(&[b.id]), "the only host slot is held");
         s.unhold(&[a.id]);
         assert_ne!(va, 0);
+    }
+
+    /// A restore queues the copy and leaves both slots in place; a gather meanwhile reads the
+    /// device slot behind the fence; `reap` lands it once the fence retired and the hold
+    /// dropped. Nothing spills a restoring block.
+    #[test]
+    fn restore_async_queues_the_copy_and_a_gather_waits_on_its_fence() {
+        let (ops, s) = store(32, 64); // one device slot
+        let a = s.acquire(0, key(1)).unwrap();
+        s.seal(a.id);
+        s.release(&[a.id]);
+        assert!(s.spill(&[a.id]));
+        s.reap();
+        assert_eq!(s.location(a.id), Some(Location::Host));
+        ops.pending.store(true, Ordering::SeqCst);
+        s.restore_async(a.id).unwrap();
+        assert_eq!(
+            (ops.htod_async.load(Ordering::SeqCst), ops.htod.load(Ordering::SeqCst)),
+            (1, 0)
+        );
+        assert_eq!(s.location(a.id), Some(Location::Device(a.va)));
+        assert_eq!(s.stats().classes[0].host_blocks, 1, "the host slot stays until the fence");
+        assert!(!s.spill(&[a.id]), "a restoring block is coming to the device");
+        s.hold(&[a.id]);
+        let src = s.gather_src(a.id).unwrap();
+        assert_eq!(
+            src,
+            Src {
+                va: a.va,
+                from_host: false,
+                fence: Some(9)
+            }
+        );
+        assert_eq!(s.stats().host_reads, 0);
+        s.reap();
+        assert_eq!(s.stats().restores, 0, "fence not retired");
+        ops.pending.store(false, Ordering::SeqCst);
+        s.reap();
+        assert_eq!(s.stats().restores, 0, "held: the host copy may still be read in place");
+        s.unhold(&[a.id]);
+        s.reap();
+        let st = s.stats();
+        assert_eq!(
+            (st.restores, st.classes[0].host_blocks, st.classes[0].device_blocks),
+            (1, 0, 1)
+        );
+        assert_eq!(s.gather_src(a.id).unwrap().fence, None);
+        assert!(s.restore_async(a.id).is_ok(), "on the device: nothing to do");
+        assert_eq!(ops.htod_async.load(Ordering::SeqCst), 1);
+        // The restored block is reclaimable again (zero dependents): its slot goes next.
+        let b = s.acquire(0, key(2)).unwrap();
+        assert_eq!((b.fill, b.va, s.stats().reclaims), (true, a.va, 1));
+    }
+
+    #[test]
+    fn restore_async_without_a_device_slot_leaves_the_block_on_the_host() {
+        let (ops, s) = store(32, 64);
+        let a = s.acquire(0, key(1)).unwrap();
+        s.seal(a.id);
+        s.release(&[a.id]);
+        assert!(s.spill(&[a.id]));
+        s.reap();
+        let b = s.acquire(0, key(2)).unwrap(); // the only device slot, referenced
+        s.seal(b.id);
+        assert!(s.restore_async(a.id).is_err());
+        assert_eq!(ops.htod_async.load(Ordering::SeqCst), 0);
+        assert_eq!(s.location(a.id), Some(Location::Host));
+        assert!(s.gather_src(a.id).unwrap().from_host, "read in place");
+    }
+
+    /// The compaction copies run with the store lock released; a block a gather holds
+    /// meanwhile keeps its slot (the gather reads it on the engine stream) and the chunk is
+    /// not released this round.
+    #[test]
+    fn compaction_copies_with_the_lock_released_and_skips_a_block_held_meanwhile() {
+        let ops = MockOps::new();
+        let s = Arc::new(KvStore::new(
+            ops.clone(),
+            vec![ClassSpec {
+                name: "window",
+                row_bytes: 8,
+                rows_per_block: 4,
+            }],
+            64, // two blocks per chunk
+            2 * 64,
+            0,
+        ));
+        let ids: Vec<_> = (1..=4).map(|i| s.acquire(0, key(i)).unwrap().id).collect();
+        for &id in &ids {
+            s.seal(id);
+        }
+        s.release(&ids[1..3]);
+        // Both chunks are full (released blocks keep their slots): chunk 0 is planned first
+        // and block 1 is the one that moves.
+        let moving = ids[0];
+        let held = Arc::clone(&s);
+        *ops.on_dtod.lock() = Some(Box::new(move || held.hold(&[moving])));
+        let before = s.location(moving);
+        assert_eq!(s.shrink(64), 0, "the move was abandoned: nothing released");
+        assert_eq!(ops.dtod.load(Ordering::SeqCst), 1, "the copy ran (lock free)");
+        assert_eq!(s.location(moving), before, "block 1 stays in its slot");
+        assert_eq!(s.stats().compactions, 0);
+        *ops.on_dtod.lock() = None;
+        s.unhold(&[moving]);
+        assert_eq!(s.shrink(64), 64, "the next step compacts the two live blocks");
+        let st = s.stats();
+        assert_eq!((st.compactions, st.device_reserved_bytes), (1, 64));
+        assert!(!s.acquire(0, key(1)).unwrap().fill, "block 1 is still present");
+        assert!(!s.acquire(0, key(4)).unwrap().fill, "block 4 is still present");
     }
 
     #[test]
