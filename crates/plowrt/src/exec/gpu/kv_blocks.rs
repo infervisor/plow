@@ -190,8 +190,25 @@ impl BlockServe {
         ));
         let batch = g.batch as usize;
         // Pinned chunks are allocated ahead on their own thread (`host_grow_step`), never
-        // under the pool lock; the thread ends with the store.
+        // under the pool lock, and released device chunks are freed on another (a device free
+        // synchronises the context: behind the spill backlog that held the engine thread
+        // 150 ms per shrink); both threads end with the store.
         let grower_stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        {
+            store.defer_frees();
+            let store = Arc::clone(&store);
+            let stop = Arc::clone(&grower_stop);
+            std::thread::Builder::new()
+                .name("kv-store-free".into())
+                .spawn(move || {
+                    while !stop.load(Ordering::Relaxed) {
+                        if !store.free_step() {
+                            std::thread::sleep(std::time::Duration::from_millis(2));
+                        }
+                    }
+                })
+                .map_err(|e| RuntimeError::Rejected(format!("kv store: free worker: {e}")))?;
+        }
         if host_cap > 0 {
             let store = Arc::clone(&store);
             let stop = Arc::clone(&grower_stop);
@@ -324,7 +341,7 @@ impl SnapBlocks for BlockServe {
             let t0 = std::time::Instant::now();
             let mut queued = 0u64;
             for id in ids {
-                if self.store.restore_async(id).is_ok() {
+                if matches!(self.store.restore_async(id), Ok(true)) {
                     queued += 1;
                 }
             }

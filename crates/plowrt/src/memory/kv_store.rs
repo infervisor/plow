@@ -418,6 +418,13 @@ struct Inner {
 pub struct KvStore {
     ops: Arc<dyn StoreOps>,
     inner: parking_lot::Mutex<Inner>,
+    /// Chunks `shrink` released, as `(va, bytes)`, freed by [`Self::free_step`] on a worker once
+    /// [`Self::defer_frees`] was called: a device free synchronises the context, which behind
+    /// the spill backlog held the engine thread 150 ms per shrink. Until freed they count as
+    /// device memory coming free ([`Self::pending_spill_bytes`]).
+    frees: parking_lot::Mutex<Vec<(u64, u64)>>,
+    deferred: std::sync::atomic::AtomicBool,
+    pending_free_bytes: std::sync::atomic::AtomicU64,
 }
 
 /// What [`KvStore::acquire`] handed out.
@@ -487,6 +494,43 @@ impl KvStore {
                 tick: 0,
                 stats,
             }),
+            frees: parking_lot::Mutex::new(Vec::new()),
+            deferred: std::sync::atomic::AtomicBool::new(false),
+            pending_free_bytes: std::sync::atomic::AtomicU64::new(0),
+        }
+    }
+
+    /// From now on `shrink` queues released chunks for [`Self::free_step`] instead of freeing
+    /// them on the caller's thread.
+    pub fn defer_frees(&self) {
+        self.deferred.store(true, std::sync::atomic::Ordering::Release);
+    }
+
+    /// One step of the free worker: free every queued chunk. `false` = nothing queued.
+    pub fn free_step(&self) -> bool {
+        let queued = std::mem::take(&mut *self.frees.lock());
+        if queued.is_empty() {
+            return false;
+        }
+        for (va, bytes) in queued {
+            self.ops.free(va);
+            self.pending_free_bytes.fetch_sub(bytes, std::sync::atomic::Ordering::AcqRel);
+        }
+        true
+    }
+
+    fn free_chunks(&self, frees: &mut Vec<(u64, u64)>) {
+        if frees.is_empty() {
+            return;
+        }
+        if self.deferred.load(std::sync::atomic::Ordering::Acquire) {
+            let bytes: u64 = frees.iter().map(|&(_, b)| b).sum();
+            self.pending_free_bytes.fetch_add(bytes, std::sync::atomic::Ordering::AcqRel);
+            self.frees.lock().append(frees);
+        } else {
+            for (va, _) in frees.drain(..) {
+                self.ops.free(va);
+            }
         }
     }
 
@@ -685,8 +729,9 @@ impl KvStore {
     /// Start bringing a host-resident block back to a device slot (H2D queued on the copy
     /// stream; [`Self::reap`] commits it when the fence retires). A gather meanwhile reads the
     /// device slot behind the fence ([`Self::gather_src`]). `Err` = no device slot could be
-    /// made: the block stays on the host and gathers read it in place.
-    pub fn restore_async(&self, id: BlockId) -> Result<()> {
+    /// made: the block stays on the host and gathers read it in place. `Ok(true)` = a copy
+    /// was queued.
+    pub fn restore_async(&self, id: BlockId) -> Result<bool> {
         let mut inner = self.inner.lock();
         inner.tick += 1;
         let tick = inner.tick;
@@ -698,10 +743,10 @@ impl KvStore {
             (b.class, b.place, b.state)
         };
         let Where::Host(h) = place else {
-            return Ok(());
+            return Ok(false);
         };
         if state != State::Ready {
-            return self.ensure_device_locked(&mut inner, id).map(|_| ());
+            return self.ensure_device_locked(&mut inner, id).map(|_| false);
         }
         let slot = self.device_slot(&mut inner, class)?;
         let bytes = inner.classes[class].spec.block_bytes();
@@ -722,7 +767,7 @@ impl KvStore {
             fence,
         };
         inner.restoring.push_back(id);
-        Ok(())
+        Ok(true)
     }
 
     /// Whether any of `ids` still has its restore in flight (landed ones are retired first).
@@ -1155,9 +1200,7 @@ impl KvStore {
         // Driver work with the lock released: the chunk frees and the compaction drain, which
         // a gather or a publish on the engine thread would otherwise wait behind.
         drop(inner);
-        for va in frees.drain(..) {
-            self.ops.free(va);
-        }
+        self.free_chunks(&mut frees);
         let copied = match &plan {
             Some(p) if !p.copies.is_empty() => self.ops.copy_dtod_batch(&p.copies),
             _ => Ok(()),
@@ -1171,9 +1214,7 @@ impl KvStore {
         inner.stats.shrink_max_us = inner.stats.shrink_max_us.max(us);
         inner.stats.shrinks += 1;
         drop(inner);
-        for va in frees {
-            self.ops.free(va);
-        }
+        self.free_chunks(&mut frees);
         released
     }
 
@@ -1185,10 +1226,11 @@ impl KvStore {
         &self,
         inner: &mut Inner,
         bytes: u64,
-        frees: &mut Vec<u64>,
+        frees: &mut Vec<(u64, u64)>,
     ) -> u64 {
         let mut released = 0u64;
         for ci in 0..inner.classes.len() {
+            let chunk_bytes = inner.classes[ci].device.chunk_bytes();
             for chunk in inner.classes[ci].device.release_candidates() {
                 if released >= bytes {
                     break;
@@ -1212,7 +1254,7 @@ impl KvStore {
                 }
                 released += inner.classes[ci]
                     .device
-                    .release_empty_chunks(|va| frees.push(va));
+                    .release_empty_chunks(|va| frees.push((va, chunk_bytes)));
             }
         }
         released
@@ -1317,7 +1359,7 @@ impl KvStore {
         inner: &mut Inner,
         plan: CompactionPlan,
         copied: Result<()>,
-        frees: &mut Vec<u64>,
+        frees: &mut Vec<(u64, u64)>,
     ) -> u64 {
         let ci = plan.class;
         let bytes_per = inner.classes[ci].spec.block_bytes();
@@ -1347,7 +1389,10 @@ impl KvStore {
         inner.stats.compact_bytes += moved * bytes_per;
         let mut released = 0u64;
         for c in inner.classes.iter_mut() {
-            released += c.device.release_empty_chunks(|va| frees.push(va));
+            let chunk_bytes = c.device.chunk_bytes();
+            released += c
+                .device
+                .release_empty_chunks(|va| frees.push((va, chunk_bytes)));
         }
         released
     }
@@ -1439,8 +1484,9 @@ impl KvStore {
     }
 
     /// Bytes of D2H copies in flight: device memory the pool may count as coming free.
+    /// Device bytes coming free: spills in flight and released chunks the worker has not freed.
     pub fn pending_spill_bytes(&self) -> u64 {
-        self.inner.lock().spilling_bytes
+        self.inner.lock().spilling_bytes + self.pending_free_bytes.load(std::sync::atomic::Ordering::Acquire)
     }
 
     /// Device bytes the store leaves free (see `Inner::device_floor`).
@@ -1496,6 +1542,9 @@ impl KvStore {
 
 impl Drop for KvStore {
     fn drop(&mut self) {
+        for (va, _) in self.frees.get_mut().drain(..) {
+            self.ops.free(va);
+        }
         let inner = self.inner.get_mut();
         for c in &inner.classes {
             for &va in c.device.chunks.iter().filter(|&&va| va != 0) {
@@ -1541,6 +1590,7 @@ mod tests {
     struct MockOps {
         next: AtomicU64,
         dev_alloc: AtomicU64,
+        freed: AtomicU64,
         host_alloc: AtomicU64,
         htod: AtomicU64,
         htod_async: AtomicU64,
@@ -1558,6 +1608,7 @@ mod tests {
             Arc::new(MockOps {
                 next: AtomicU64::new(1 << 20),
                 dev_alloc: AtomicU64::new(0),
+                freed: AtomicU64::new(0),
                 host_alloc: AtomicU64::new(0),
                 htod: AtomicU64::new(0),
                 htod_async: AtomicU64::new(0),
@@ -1575,7 +1626,9 @@ mod tests {
             self.dev_alloc.fetch_add(bytes, Ordering::SeqCst);
             Ok(self.next.fetch_add(bytes + 4096, Ordering::SeqCst))
         }
-        fn free(&self, _va: u64) {}
+        fn free(&self, _va: u64) {
+            self.freed.fetch_add(1, Ordering::SeqCst);
+        }
         fn host_alloc(&self, bytes: u64) -> Result<u64> {
             self.host_alloc.fetch_add(bytes, Ordering::SeqCst);
             Ok(self.next.fetch_add(bytes + 4096, Ordering::SeqCst))
@@ -2008,7 +2061,7 @@ mod tests {
         s.reap();
         assert_eq!(s.location(a.id), Some(Location::Host));
         ops.pending.store(true, Ordering::SeqCst);
-        s.restore_async(a.id).unwrap();
+        assert!(s.restore_async(a.id).unwrap(), "queued");
         assert_eq!(
             (ops.htod_async.load(Ordering::SeqCst), ops.htod.load(Ordering::SeqCst)),
             (1, 0)
@@ -2042,7 +2095,7 @@ mod tests {
             (1, 0, 1)
         );
         assert_eq!(s.gather_src(a.id).unwrap().fence, None);
-        assert!(s.restore_async(a.id).is_ok(), "on the device: nothing to do");
+        assert_eq!(s.restore_async(a.id).unwrap(), false, "on the device: nothing to do");
         assert_eq!(ops.htod_async.load(Ordering::SeqCst), 1);
         // The restored block is reclaimable again (zero dependents): its slot goes next.
         let b = s.acquire(0, key(2)).unwrap();
@@ -2063,6 +2116,28 @@ mod tests {
         assert_eq!(ops.htod_async.load(Ordering::SeqCst), 0);
         assert_eq!(s.location(a.id), Some(Location::Host));
         assert!(s.gather_src(a.id).unwrap().from_host, "read in place");
+    }
+
+    /// With deferred frees a shrink releases the chunk to the pool's accounting at once but
+    /// the device free runs on the worker; until then the bytes count as coming free.
+    #[test]
+    fn deferred_frees_run_on_the_worker_and_count_as_coming_free() {
+        let (ops, s) = store(64, 0); // two chunks
+        let a = s.acquire(0, key(1)).unwrap();
+        let b = s.acquire(0, key(2)).unwrap();
+        s.seal(a.id);
+        s.seal(b.id);
+        s.release(&[a.id, b.id]);
+        s.defer_frees();
+        assert_eq!(s.shrink(32), 32);
+        assert_eq!(ops.freed.load(Ordering::SeqCst), 0, "not freed on the caller's thread");
+        assert_eq!(s.pending_spill_bytes(), 32);
+        assert!(s.free_step());
+        assert_eq!((ops.freed.load(Ordering::SeqCst), s.pending_spill_bytes()), (1, 0));
+        assert!(!s.free_step(), "nothing queued");
+        assert_eq!(s.shrink(32), 32, "the second chunk goes the same way");
+        drop(s);
+        assert_eq!(ops.freed.load(Ordering::SeqCst), 2, "a queued free is run at teardown");
     }
 
     /// The compaction copies run with the store lock released; a block a gather holds
