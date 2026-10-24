@@ -20,6 +20,9 @@ pub const SESSION_HEADER: HeaderName = HeaderName::from_static("x-session-id");
 pub const TURN_ID_HEADER: HeaderName = HeaderName::from_static("x-turn-id");
 pub const TURN_BUDGET_HEADER: HeaderName = HeaderName::from_static("x-turn-budget-ms");
 pub const PLAYBACK_HEADER: HeaderName = HeaderName::from_static("x-playback");
+/// `X-Session-End: 1` (or body `metadata.session_end`): this request is the session's last
+/// turn, so the prefix cache may let its boundary go first ([`RequestIds::session_end`]).
+pub const SESSION_END_HEADER: HeaderName = HeaderName::from_static("x-session-end");
 const TRACEPARENT_HEADER: HeaderName = HeaderName::from_static("traceparent");
 const MAX_ID_BYTES: usize = 128;
 /// OpenRouter's `session_id` limit.
@@ -98,6 +101,9 @@ pub struct RequestIds {
     pub turn_key: Option<crate::serve::turns::TurnKey>,
     /// Whose request this is for the mux's round-robin: the session, else the API key.
     pub tenant: Option<u64>,
+    /// The client's `X-Session-End` (or body `metadata.session_end`): this is the session's
+    /// last turn, so the prefix cache may let its boundary go first.
+    pub session_end: bool,
 }
 
 /// [`RequestIds::tenant`] of a session id or an API key; the two never collide.
@@ -120,6 +126,11 @@ fn budget_ms(value: &str) -> Option<u32> {
         .parse::<u32>()
         .ok()
         .filter(|&ms| (1..=600_000).contains(&ms))
+}
+
+/// A boolean request flag: `1`, `true`, `yes` (case-insensitive).
+fn flag_set(v: &str) -> bool {
+    matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes")
 }
 
 impl RequestIds {
@@ -161,6 +172,7 @@ impl RequestIds {
             playback: text(&PLAYBACK_HEADER).and_then(crate::serve::turns::Playback::parse),
             turn_key: None,
             tenant,
+            session_end: text(&SESSION_END_HEADER).is_some_and(flag_set),
         })
     }
 
@@ -196,6 +208,13 @@ impl RequestIds {
         if self.budget_ms.is_none() {
             self.budget_ms = meta("turn_budget_ms").as_deref().and_then(budget_ms);
         }
+        if !self.session_end {
+            self.session_end = match body.metadata.as_ref().and_then(|m| m.get("session_end")) {
+                Some(serde_json::Value::Bool(b)) => *b,
+                Some(serde_json::Value::String(s)) => flag_set(s),
+                _ => false,
+            };
+        }
         Ok(())
     }
 
@@ -216,6 +235,7 @@ impl RequestIds {
             playback: None,
             turn_key: None,
             tenant: None,
+            session_end: false,
         }
     }
 
@@ -1159,6 +1179,7 @@ mod tests {
     #[test]
     fn duplicate_request_ids_are_refused_only_while_in_flight_in_the_same_session() {
         let ids = |r: &str, s: Option<&str>| RequestIds {
+            session_end: false,
             request: r.into(),
             session: s.map(Into::into),
             ..RequestIds::generated()

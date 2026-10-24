@@ -1254,6 +1254,7 @@ async fn transcribe_upload(
         finals,
     );
     let ids = &RequestIds {
+        session_end: false,
         turn_key: run.key(),
         ..ids.clone()
     };
@@ -1860,6 +1861,7 @@ async fn stream(
     let request = |final_pass, turn_key: Option<crate::serve::turns::TurnKey>| AsrOpts {
         final_pass,
         ids: Some(RequestIds {
+            session_end: false,
             turn_key,
             ..ids.with_new_request()
         }),
@@ -2225,6 +2227,7 @@ async fn continuous(
     let opts = |final_pass, turn_key, windows, deltas| AsrOpts {
         final_pass,
         ids: Some(RequestIds {
+            session_end: false,
             turn_key,
             ..ids.with_new_request()
         }),

@@ -1064,6 +1064,7 @@ impl GuidedSpeech {
             arrived: std::time::Instant::now(),
             respond,
             opts: JobOpts {
+                session_end: false,
                 class,
                 raw_tokens: true,
                 session,

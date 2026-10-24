@@ -621,24 +621,6 @@ pub struct RuntimeConfig {
     #[arg(long = "vmm-strict-publish", env = "PLOW_VMM_STRICT_PUBLISH", hide = true, default_value_t = true, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
     pub vmm_strict_publish: bool,
 
-    /// CUDA VMM prefix snapshots: copy the fp8 ring scales and full-layer scale prefixes as one
-    /// pitched copy per tensor (all KV heads) instead of one copy per head. Same bytes; a
-    /// Gemma-4 26B snapshot drops from ~10^3 copies to ~10^2.
-    #[arg(long = "vmm-snap-pitched", env = "PLOW_VMM_SNAP_PITCHED", hide = true, default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
-    pub vmm_snap_pitched: bool,
-
-    /// CUDA VMM prefix snapshots: keep up to N freed snapshot buffers for reuse instead of
-    /// `cuMemFree` (which synchronizes the device) and a fresh `cuMemAlloc` per publish
-    /// (~100 MiB each on Gemma-4 26B). 0 = off.
-    #[arg(
-        long = "vmm-snap-pool",
-        env = "PLOW_VMM_SNAP_POOL",
-        default_value_t = 0,
-        hide = true,
-        global = true
-    )]
-    pub vmm_snap_pool: u32,
-
     /// CUDA VMM prefix cache with live sliding rings: a finished request's ring units stay
     /// mapped in its slot (or as spares, trimmed to `PLOW_KV_POOL_MIB` once no slot is live)
     /// instead of `cuMemRelease`, so the next admission skips `cuMemCreate`/map (~6 ms per
@@ -902,16 +884,12 @@ pub struct RuntimeConfig {
     #[arg(long = "vmm-publish-shared", env = "PLOW_VMM_PUBLISH_SHARED", default_value_t = true, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
     pub vmm_publish_shared: bool,
 
-    /// CUDA VMM prefix cache: pinned host memory (MiB) that evicted boundary snapshots spill
-    /// to instead of being freed (the second level of the cache's LRU), restored over PCIe when
-    /// a prompt attaches to one. `0` (the default) keeps snapshots device-only.
-    #[arg(
-        long = "vmm-host-cache-mib",
-        env = "PLOW_VMM_HOST_CACHE_MIB",
-        default_value_t = 0,
-        global = true
-    )]
-    pub vmm_host_cache_mib: u64,
+    /// Pinned host memory (MiB) for the prefix cache's host tier (the second level of its
+    /// LRU: evicted boundaries spill there and attach from there). Unset = sized by the
+    /// host-reserve rule (`MemAvailable` minus an eighth of RAM, at least 16 GiB); `0` = no
+    /// host tier.
+    #[arg(long = "vmm-host-cache-mib", env = "PLOW_VMM_HOST_CACHE_MIB", global = true)]
+    pub vmm_host_cache_mib: Option<u64>,
 
     /// CUDA VMM prefix cache: seconds a request with
     /// `X-Session-Id` keeps its newest boundary protected from LRU after its last use; then the
@@ -3016,6 +2994,7 @@ impl RuntimeConfig {
         )
     }
 
+
     pub(crate) fn vmm_publish_shared(&self) -> bool {
         select_compat(
             self.vmm_publish_shared,
@@ -3040,13 +3019,14 @@ impl RuntimeConfig {
         )
     }
 
-    pub(crate) fn vmm_host_cache_bytes(&self) -> u64 {
+    /// `None` = unset (the store sizes its host tier by the host-reserve rule); `Some(0)` = off.
+    pub(crate) fn vmm_host_cache_bytes(&self) -> Option<u64> {
         let mib = if Self::is_initialized() {
             self.vmm_host_cache_mib
         } else {
-            Self::env_parse("PLOW_VMM_HOST_CACHE_MIB").unwrap_or(self.vmm_host_cache_mib)
+            Self::env_parse("PLOW_VMM_HOST_CACHE_MIB").or(self.vmm_host_cache_mib)
         };
-        mib << 20
+        mib.map(|m| m << 20)
     }
 
     pub(crate) fn prefix_session_ttl(&self) -> std::time::Duration {

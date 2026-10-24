@@ -275,7 +275,9 @@ impl KvGeometry {
     /// The checkpoint's `config.json` (`text_config` or top level). `layer_types` splits full and
     /// sliding layers and then `sliding_window` is required; without it every
     /// `num_hidden_layers` layer is full attention. The trailing `num_kv_shared_layers` read an
-    /// earlier layer's cache and own none. `None` when the shape is not there.
+    /// earlier layer's cache and own none. `linear_attention` layers (Qwen3-Next style gated
+    /// DeltaNet) carry recurrent state instead of KV rows and own no cache rows here. `None` when
+    /// the shape is not there.
     pub fn from_config(checkpoint_dir: &Path) -> Option<Self> {
         let v = read_json(&checkpoint_dir.join("config.json"))?;
         let t = v.get("text_config").unwrap_or(&v);
@@ -287,6 +289,7 @@ impl KvGeometry {
                     match ty.as_str()? {
                         "full_attention" => full_layers.push(l as u32),
                         "sliding_attention" => slide_layers.push(l as u32),
+                        "linear_attention" => {}
                         _ => return None,
                     }
                 }
@@ -576,6 +579,25 @@ mod tests {
             ),
             (1, 512, 8, 256)
         );
+        std::fs::remove_dir_all(&d).unwrap();
+    }
+
+    #[test]
+    fn linear_attention_layers_own_no_kv_rows() {
+        let d = tmp("gdn");
+        std::fs::write(
+            d.join("config.json"),
+            r#"{"layer_types":["linear_attention","linear_attention","full_attention","linear_attention"],
+                "num_hidden_layers":4,"num_key_value_heads":4,"head_dim":256,
+                "linear_num_value_heads":48,"linear_key_head_dim":128}"#,
+        )
+        .unwrap();
+        let kv = KvGeometry::from_config(&d).unwrap();
+        assert_eq!((kv.full_layers, kv.slide_layers, kv.window), (vec![2], vec![], 0));
+        assert_eq!((kv.kv_heads_full, kv.head_dim_full), (4, 256));
+        std::fs::write(d.join("config.json"), r#"{"layer_types":["mamba"],"num_hidden_layers":1}"#)
+            .unwrap();
+        assert!(KvGeometry::from_config(&d).is_none());
         std::fs::remove_dir_all(&d).unwrap();
     }
 

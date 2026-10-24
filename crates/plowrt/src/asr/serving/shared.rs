@@ -475,6 +475,7 @@ impl SharedAsr {
             arrived,
             respond,
             opts: JobOpts {
+                session_end: false,
                 class: if opts.final_pass {
                     JobClass::Final
                 } else {

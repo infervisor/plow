@@ -77,6 +77,8 @@ fn check_dsa_decode_batch_arm(required: bool, arm: Option<u32>) -> Result<()> {
     Ok(())
 }
 
+mod kv_blocks;
+pub use kv_blocks::BlockServe as KvStoreHandle;
 mod prefix;
 use prefix::VmmServe;
 
@@ -2724,6 +2726,12 @@ pub struct GpuEngine {
     /// The slot's prompt rows are not determined by its ids (frame codes beside them): its first
     /// prefill chunk never attaches a cached prefix.
     prefix_attach_off: Vec<bool>,
+    /// The slot's request is its session's last turn (`X-Session-End`): the prefix cache drops
+    /// the session's boundary to the cold band at retire ([`Self::retire_slot`]).
+    session_end: Vec<bool>,
+    /// The slot's client disconnected before the response completed (the mux's
+    /// `disconnected`): demoted the same way (predictive: the boundary stays attachable).
+    disconnected: Vec<bool>,
     /// A launch's host window is open ([`Self::token_batch_step_window`]): snapshot restores skip
     /// their stream drain and their holds wait in `deferred_attach` for the step's own drain.
     window_open: bool,
@@ -4140,6 +4148,9 @@ impl GpuEngine {
                     config,
                     be.compute_capability(),
                     granularity,
+                    live_kv_manifest
+                        .as_ref()
+                        .map_or(Some(false), |m| m.full_rows_interleaved()),
                 )
             });
         let prefix_requested = config.nv_prefix_requested(prefix_layout.is_some());
@@ -4320,11 +4331,6 @@ impl GpuEngine {
             single_bound_decode || validate_decode_ladder(&blob)?
         };
         if recurrent.is_some() {
-            if prefix_requested {
-                return Err(RuntimeError::Rejected(
-                    "recurrent state does not support prefix caching".into(),
-                ));
-            }
             if !recurrent.as_ref().unwrap().tensors.is_empty()
                 && !blob.prefill_progs().is_empty()
                 && (blob
@@ -4595,7 +4601,13 @@ impl GpuEngine {
                     }
                     Self::vmm_live_bringup(&be, &blob, rings, live_kv_manifest.as_ref()).map(Some)
                 } else {
-                    Self::vmm_bringup(&be, &blob, prefix_layout, prefix_rings)
+                    Self::vmm_bringup(
+                        &be,
+                        &blob,
+                        prefix_layout,
+                        prefix_rings,
+                        recurrent.as_ref().map_or(&[][..], |r| r.tensors.as_slice()),
+                    )
                 }
             };
             if let Some(tm) = load_tim.as_mut() {
@@ -7227,6 +7239,7 @@ impl GpuEngine {
         // Prefix cache: evict on real device pressure (`cuMemGetInfo`), not the static budget.
         // The floor is 2% of the device, at most half of what is free after load; a card the
         // rings nearly fill (26B: 5 GiB) keeps an eighth of it instead.
+        let blocks = vmm.as_ref().and_then(|v| v.blocks.clone());
         if let Some(kv) = vmm
             .as_mut()
             .and_then(|v| v.kv.as_mut())
@@ -7236,12 +7249,22 @@ impl GpuEngine {
                 let config = crate::config::RuntimeConfig::get();
                 if let Some(floor) = config.vmm_cache_min_free_bytes(total, Some(free)) {
                     kv.enable_pressure_eviction(floor);
+                    let cache_cap = config.prefix_cache_cap_bytes(total);
                     tracing::info!(
                         floor_mib = floor >> 20,
                         free_mib = free >> 20,
-                        cache_cap_mib = config.prefix_cache_cap_bytes(total) >> 20,
+                        cache_cap_mib = cache_cap >> 20,
                         "vmm prefix cache: pressure eviction armed (static cap is the fallback)"
                     );
+                    // The store may reserve what the pool could have grown to; pressure
+                    // shrinks it below that when the rings grow.
+                    if let (0, Some(bs)) = (cache_cap, blocks.as_ref()) {
+                        bs.set_device_cap(free.saturating_sub(floor));
+                        // Slot growth beyond the block pool creates blocks from free memory:
+                        // the store stops a pool's worth above the floor so that does not
+                        // trip the OOM path on every new slot.
+                        bs.set_device_floor(floor + (config.kv_pool_mib() << 20));
+                    }
                 }
             }
         }
@@ -7382,6 +7405,8 @@ impl GpuEngine {
             seq_tokens: vec![Vec::new(); batch],
             staged_prefix: vec![None; batch],
             prefix_attach_off: vec![false; batch],
+            session_end: vec![false; batch],
+            disconnected: vec![false; batch],
             window_open: false,
             deferred_attach: Vec::new(),
             window_event: None,
@@ -7869,6 +7894,11 @@ impl GpuEngine {
         } else {
             return Some(budget);
         };
+        // The block store's slabs are cache the pool takes back on demand (`shrink` on the
+        // OOM path), so they count as held like the multi-mapped cache blocks did; left out,
+        // the budget collapsed to the floor once the store filled the device and admission
+        // queued every request (TTFT p50 68 ms -> 137 ms, p99 645 ms -> 3 s at rate 2.7).
+        let held = held + vmm.blocks.as_ref().map_or(0, |bs| bs.device_reserved_bytes());
         let Ok((free, total)) = self.be.mem_info() else {
             return Some(budget);
         };
@@ -8106,6 +8136,20 @@ impl GpuEngine {
         }
     }
 
+    /// Slot `b`'s request is its session's last turn (`X-Session-End`).
+    pub fn set_session_end(&mut self, b: usize, end: bool) {
+        if b < self.batch {
+            self.session_end[b] = end;
+        }
+    }
+
+    /// Slot `b`'s client disconnected before its response completed.
+    pub fn note_disconnect(&mut self, b: usize) {
+        if b < self.batch {
+            self.disconnected[b] = true;
+        }
+    }
+
     pub fn retire_slot(&mut self, b: usize, cache_output: bool) {
         self.staged_prefix[b] = None;
         self.prefix_attach_off[b] = false;
@@ -8117,6 +8161,8 @@ impl GpuEngine {
         }
         self.slot_generations[b] = self.slot_generations[b].wrapping_add(1);
         self.reset_packed_admission(b);
+        let session_end = std::mem::take(&mut self.session_end[b]);
+        let disconnected = std::mem::take(&mut self.disconnected[b]);
         if !self.vmm_active[b] {
             if let Some(rings) = self.vmm.as_mut().and_then(|v| v.rings.as_mut()) {
                 rings.release_idle(b);
@@ -8126,6 +8172,18 @@ impl GpuEngine {
         // The turn-end pass: restores or touches the prompt end (the next turn's attach point).
         if cache_output {
             self.vmm_publish(b, self.pos[b]);
+        }
+        // After the publish, so the signal demotes the boundary this turn just touched and the
+        // request cannot re-protect it.
+        let signal = if session_end {
+            Some(crate::memory::vmm::DemoteSignal::Header)
+        } else if disconnected {
+            Some(crate::memory::vmm::DemoteSignal::Abort)
+        } else {
+            None
+        };
+        if let (Some(signal), Some((_, kv))) = (signal, self.vmm_prefix()) {
+            kv.demote_session(b, signal);
         }
         self.trace_finish(b);
         self.pos[b] = 0;
@@ -11539,12 +11597,18 @@ impl GpuEngine {
         }
         let c0 = self.pos[b] as usize;
         debug_assert!(c0 < n, "prefill_chunk past the prompt end");
+        let cap = self.state_capture_cap(b, prompt, c0, cap);
 
         // The chunk launches against slot b's prebuilt tensor table (the
         // kernarg selects it) — the shared table is never touched, so decode
         // and other slots' sequences cannot observe a shifted table.
         let real = self.run_one_prefill_chunk(f_pf, b, prompt, c0, cap)?;
         self.pos[b] = (c0 + real) as u32;
+        if self.kv_blocks().is_some_and(|bs| bs.captures_state()) {
+            self.seq_tokens[b].clear();
+            self.seq_tokens[b].extend_from_slice(&prompt[..c0 + real]);
+            self.state_capture_publish(b, n);
+        }
 
         if c0 + real < n {
             return Ok(PrefillStep::Progress(c0 + real));
@@ -13550,6 +13614,7 @@ impl GpuEngine {
                 let end = r.c0 + r.len;
                 self.seq_tokens[r.slot].clear();
                 self.seq_tokens[r.slot].extend_from_slice(&r.prompt[..end]);
+                self.state_capture_publish(r.slot, r.prompt.len());
             }
             if self.vmm_prefix_enabled() && r.c0 + r.len + 1 >= r.prompt.len() {
                 self.vmm_publish(r.slot, r.prompt.len().saturating_sub(1) as u32);

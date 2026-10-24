@@ -159,6 +159,18 @@ pub trait VmmOps: Send + Sync {
     fn copy_htod(&self, _va: u64, _host_ptr: u64, _bytes: u64) -> Result<()> {
         Err(RuntimeError::Rejected("no host tier".into()))
     }
+    /// Queue the restore of `bytes` from host tier memory into `va` on a stream of its own
+    /// (never behind the spill backlog); returns a fence as [`Self::copy_dtoh_async`] does.
+    /// Nothing reads `va` before the fence; the host bytes stay until it retires.
+    fn copy_htod_async(&self, _va: u64, _host_ptr: u64, _bytes: u64) -> Result<u64> {
+        Err(RuntimeError::Rejected("no host tier".into()))
+    }
+    /// Device-to-device copies `(dst, src, bytes)`, all drained when it returns (the block
+    /// store moves blocks between slabs under pressure; the engine stream may reuse a source
+    /// slot right after). [`Self::copy_dtod_batch`] orders only on the legacy stream.
+    fn copy_dtod_batch_sync(&self, _copies: &[(u64, u64, u64)]) -> Result<()> {
+        Err(RuntimeError::Rejected("no device copy".into()))
+    }
 }
 
 /// Uniform full-KV allocation geometry. Prefix mode resolves checkpoint
@@ -906,6 +918,9 @@ pub struct Attach {
     /// Empty for every ordinary attach — the only caller that populates it is
     /// `try_attach_fine`.
     pub segments: Vec<(u64, u64)>,
+    /// The KV block store handle of the boundary ([`VmmKv::publish_blocks`]): the engine
+    /// gathers its blocks instead of copying `snap_va`.
+    pub blocks: Option<u64>,
 }
 
 /// Point-in-time pool counters (tests, metrics, the perf campaign).
@@ -971,12 +986,18 @@ pub struct VmmStats {
     pub host_evictions: u64,
     pub spill_fallbacks: u64,
     pub host_prefetches: u64,
+    /// Admissions held because the boundary's restore was still in flight.
+    pub restore_holds: u64,
     pub spill_fence_failures: u64,
     /// `X-Session-Id` retention (`PLOW_PREFIX_SESSION_TTL_S`, tree): boundaries inside their
     /// session TTL (gauge), and the expired ones demoted (suffix freed) with their bytes.
     pub sessions_protected: u64,
     pub session_demotions: u64,
     pub session_demoted_bytes: u64,
+    /// Session boundaries dropped to the cold LRU band on an end-of-session signal
+    /// ([`VmmKv::demote_session`]): the client's `X-Session-End`, or a disconnect.
+    pub session_end_header: u64,
+    pub session_end_abort: u64,
     /// Suffix eviction units (a boundary plus the blocks only it kept attachable) and the
     /// bytes they freed.
     pub eviction_units: u64,
@@ -1148,6 +1169,15 @@ enum Job {
     Sync(std::sync::mpsc::Sender<()>),
 }
 
+/// Why a session's boundary is demoted ([`VmmKv::demote_session`]).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum DemoteSignal {
+    /// The client said so (`X-Session-End`).
+    Header,
+    /// The client went away before the response completed: a prediction.
+    Abort,
+}
+
 /// What a boundary was published as (a bit set: a dedup ORs the publisher's kind in).
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 pub struct Kind(u8);
@@ -1179,9 +1209,25 @@ impl Snap {
         self.last_used < COLD_BAND
     }
 
+    /// Goes only once nothing unshielded is left: a session boundary inside its TTL, or a
+    /// shared end (system prompt) that has served more than one attach. Without the second
+    /// rule the shared ends are the only unprotected boundaries under load, so every first
+    /// turn missed its system prompt while the sessions themselves were kept.
+    fn shielded(&self, now: std::time::Instant) -> bool {
+        self.protect_until.is_some_and(|t| t > now)
+            || (self.kind.has(Kind::SHARED_END) && self.attaches >= 2 && !self.cold())
+    }
+
     /// Resident on the device and not being copied: the device LRU's candidates.
     fn on_device(&self) -> bool {
-        matches!(self.store, SnapStore::Device(_))
+        matches!(
+            self.store,
+            SnapStore::Device(_)
+                | SnapStore::Blocks {
+                    state: BlockState::Device,
+                    ..
+                }
+        )
     }
 
     fn device_va(&self) -> Option<u64> {
@@ -1252,6 +1298,41 @@ enum SnapStore {
     /// H2D in flight on the `vmm-host-tier` thread (a prefetch): `users` holds it, an attach
     /// waits on `host_cv` for the device buffer.
     Restoring(u32),
+    /// Held by the KV block store ([`SnapBlocks`], `handle` = the publisher's segment table):
+    /// the pool keeps the policy, the store keeps the bytes and their tier.
+    Blocks { handle: u64, state: BlockState },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BlockState {
+    Device,
+    Host,
+    /// An attach is restoring it (lock released); waiters sleep on `host_cv`.
+    Restoring,
+}
+
+/// The KV block store as the pool sees it: a snapshot is an opaque handle whose blocks the
+/// engine publishes and gathers (`exec/gpu/kv_blocks.rs`); the pool tells the store when a
+/// boundary dies, when the device LRU would spill it, and when an attach needs it back.
+pub trait SnapBlocks: Send + Sync {
+    /// The boundary is gone: drop its dependencies (blocks shared with others live on).
+    fn release(&self, handle: u64);
+    /// Move its blocks to the host tier; `false` = not possible now (tier full or off).
+    fn spill(&self, handle: u64) -> bool;
+    /// Bring every block back to the device, or start it: a later gather waits on the copies
+    /// where they have not landed. Called at an attach and, ahead of it, by the arrival
+    /// prefetch ([`VmmKv::prefetch`]).
+    fn restore(&self, handle: u64) -> Result<()>;
+    /// A restore of the boundary's blocks is still in flight.
+    fn restoring(&self, _handle: u64) -> bool {
+        false
+    }
+    /// Retire completed spills.
+    fn reap(&self);
+    /// Bytes of spills in flight (device memory coming free once they retire).
+    fn pending_spill_bytes(&self) -> u64;
+    /// Device pressure: drop released blocks and give empty slabs back; bytes released.
+    fn shrink(&self, bytes: u64) -> u64;
 }
 
 impl SnapStore {
@@ -1259,8 +1340,27 @@ impl SnapStore {
     fn device_va(self) -> Option<u64> {
         match self {
             SnapStore::Device(va) | SnapStore::Spilling { va, .. } => Some(va),
-            SnapStore::Host(_) | SnapStore::Restoring(_) => None,
+            SnapStore::Host(_) | SnapStore::Restoring(_) | SnapStore::Blocks { .. } => None,
         }
+    }
+
+    fn blocks(self) -> Option<u64> {
+        match self {
+            SnapStore::Blocks { handle, .. } => Some(handle),
+            _ => None,
+        }
+    }
+
+    /// Host-resident (either tier's host side).
+    fn on_host(self) -> bool {
+        matches!(
+            self,
+            SnapStore::Host(_)
+                | SnapStore::Blocks {
+                    state: BlockState::Host,
+                    ..
+                }
+        )
     }
 }
 
@@ -1448,6 +1548,12 @@ struct Inner {
     /// Snapshot id → the `published` key holding it.
     by_id: FxHashMap<u64, Option<(u32, u32)>>,
     next_snap_id: u64,
+    /// The KV block store behind `SnapStore::Blocks` snapshots ([`VmmKv::enable_block_store`]).
+    block_store: Option<Arc<dyn SnapBlocks>>,
+    /// The store holds every full-layer row of a boundary (its `Prefix` blocks): no whole
+    /// block is multi-mapped, a publish takes no block references and an attach maps nothing
+    /// (the engine gathers the rows into the slot's own blocks). Strict publish is moot.
+    block_prefix: bool,
     /// Last [`demote_expired`] sweep: at most one per [`SESSION_SWEEP`].
     session_sweep: Option<std::time::Instant>,
     /// [`VmmKv::enable_host_tier`]: `None` = evicted snapshots are freed.
@@ -1525,7 +1631,7 @@ fn trace_attach(
 }
 
 enum PublishLocked {
-    Done { unused_snapshot: Option<u64> },
+    Done { unused_snapshot: Option<SnapStore> },
     NeedSnapshot,
 }
 
@@ -1591,6 +1697,11 @@ pub struct VmmKv {
     )>,
     /// [`Self::enable_host_tier`]'s chunk allocator and prefetch thread.
     host_join: Option<std::thread::JoinHandle<()>>,
+    /// [`Self::spawn_spill_ahead`]: stop flag + join.
+    spill_ahead: Option<(
+        Arc<std::sync::atomic::AtomicBool>,
+        std::thread::JoinHandle<()>,
+    )>,
 }
 
 impl VmmKv {
@@ -1733,6 +1844,8 @@ impl VmmKv {
                 awaited: vec![None; batch],
                 by_id: FxHashMap::default(),
                 next_snap_id: 0,
+                block_store: None,
+                block_prefix: false,
                 session_sweep: None,
                 host: None,
                 recent: std::collections::VecDeque::new(),
@@ -1755,6 +1868,7 @@ impl VmmKv {
             premap_join: None,
             precreate: None,
             host_join: None,
+            spill_ahead: None,
         };
         {
             let mut inner = shared.inner.lock();
@@ -1930,8 +2044,27 @@ impl VmmKv {
     /// spills, a full tier drops its least recently used host snapshot. Every pinned chunk is
     /// allocated here, at bring-up (the first proves the backend has a host tier; a failed
     /// one caps the tier); the background thread only restores prefetches. Off by default.
+    ///
+    /// Pinned pages are host RAM nobody else can reclaim, so the cap is cut to `MemAvailable −
+    /// reserve_bytes` first: a 120 GB tier on a shared 249 GB box left two co-tenant compiler
+    /// runs nothing, and the kernel's OOM killer took the server (the largest RSS).
     pub fn enable_host_tier(&mut self, cap_bytes: u64, slot_bytes: u64) -> Result<()> {
         let s = &self.shared;
+        let cap_bytes = match host_mem_available() {
+            Some((avail, total)) if cap_bytes.saturating_add(host_reserve(total)) > avail => {
+                let reserve_bytes = host_reserve(total);
+                let allowed = avail.saturating_sub(reserve_bytes);
+                tracing::warn!(
+                    requested_mib = cap_bytes >> 20,
+                    available_mib = avail >> 20,
+                    reserve_mib = reserve_bytes >> 20,
+                    capped_mib = allowed >> 20,
+                    "vmm host tier: cap cut to leave the host its reserve"
+                );
+                allowed
+            }
+            _ => cap_bytes,
+        };
         let cap_slots = u32::try_from(cap_bytes / slot_bytes.max(1)).unwrap_or(u32::MAX);
         if slot_bytes == 0 || cap_slots == 0 {
             return Err(RuntimeError::Rejected(
@@ -2433,13 +2566,27 @@ impl VmmKv {
         while matches!(
             snap_ref(&inner, snap_id).expect("held").store,
             SnapStore::Restoring(_)
+                | SnapStore::Blocks {
+                    state: BlockState::Restoring,
+                    ..
+                }
         ) {
             s.host_cv.wait(&mut inner);
         }
         let snap = snap_mut(&mut inner, snap_id).expect("held");
         let mut restore = None;
+        let mut restore_blocks = None;
         match snap.store {
             SnapStore::Device(_) => {}
+            SnapStore::Blocks { handle, state } => {
+                if state == BlockState::Host {
+                    snap.store = SnapStore::Blocks {
+                        handle,
+                        state: BlockState::Restoring,
+                    };
+                    restore_blocks = Some(handle);
+                }
+            }
             // The attach beats the spill: keep the device copy, give the slot back.
             SnapStore::Spilling { va, slot, fence } => match s.ops.fence_wait(fence) {
                 Ok(()) => {
@@ -2475,6 +2622,7 @@ impl VmmKv {
         let parent = snap_ref(&inner, snap_id).expect("held").parent;
         let snap = snap_ref(&inner, snap_id).expect("held");
         let snap_va = snap.device_va().unwrap_or(0);
+        let blocks = snap.store.blocks();
         let lost = prompt.len() as u64 - u64::from(rows);
         let st = &mut inner.stats;
         let (hits, got, miss) = if kind.has(Kind::PROMPT_END) {
@@ -2504,7 +2652,9 @@ impl VmmKv {
             snap_va,
             snap_bytes,
             segments: Vec::new(),
+            blocks,
         };
+        let hook = inner.block_store.clone();
         // A continuation hit keeps the chain's ancestors (its system prompt end) warm.
         policy::refresh_ancestors(&mut inner, parent, tick);
 
@@ -2524,13 +2674,25 @@ impl VmmKv {
         // hold before touching any, so a missing payload leaves the window as it was.
         let kvh = s.geo.kvh_full as usize;
         let pick = placed.len();
+        // Prefix mode: the slot keeps its own blocks (`ensure_rows` grows them, the engine
+        // gathers the rows); the radix references above are all the attach takes.
+        let block_prefix = inner.block_prefix;
         let mut prefix_ids: Vec<Vec<u32>> = Vec::with_capacity(pick);
-        for key in &placed {
+        for key in placed.iter().filter(|_| !block_prefix) {
             let Some(ids) = inner.node_blocks.get(key).cloned() else {
                 // Give back the restore this attach claimed, or its waiters never wake.
                 if let Some((slot, _)) = restore {
                     if let Some(snap) = snap_mut(&mut inner, snap_id) {
                         snap.store = SnapStore::Host(slot);
+                    }
+                    s.host_cv.notify_all();
+                }
+                if let Some(handle) = restore_blocks {
+                    if let Some(snap) = snap_mut(&mut inner, snap_id) {
+                        snap.store = SnapStore::Blocks {
+                            handle,
+                            state: BlockState::Host,
+                        };
                     }
                     s.host_cv.notify_all();
                 }
@@ -2553,7 +2715,7 @@ impl VmmKv {
         // Past the prefix, stale columns stay `Stale` for the reclaimer, exactly as
         // `retire_window` left them: unreachable, unmapped off-thread, claimable first by
         // `ensure_rows`. Only a live mapping there is dropped, as before.
-        for t in 0..inner.tracks.len() {
+        for t in (0..inner.tracks.len()).filter(|_| !block_prefix) {
             for h in 0..s.geo.kvh_full {
                 for k in 0..s.bph {
                     let slot = slot_index(s, seq, h, k);
@@ -2595,8 +2757,10 @@ impl VmmKv {
                 }
             }
         }
-        inner.seq_blocks[seq] = pick as u32;
-        s.frontier[seq].store(pick as u32 * s.block_rows, Ordering::Release);
+        if !block_prefix {
+            inner.seq_blocks[seq] = pick as u32;
+            s.frontier[seq].store(pick as u32 * s.block_rows, Ordering::Release);
+        }
         drop(inner);
 
         // Drive the driver lock-free. Unmaps precede maps (slot 0 is reused).
@@ -2610,23 +2774,46 @@ impl VmmKv {
         // released like the maps below (`alloc_snapshot` evicts on OOM under the lock; this
         // snapshot's `users` keeps it out of the eviction). Failure is a miss: the window is
         // unwound before any of `maps` landed and the snapshot stays on the host.
-        if let Some((slot, host_ptr)) = restore {
-            match restore_snapshot(s, host_ptr, snap_bytes) {
+        let restored = match (restore, restore_blocks) {
+            (Some((_, host_ptr)), _) => Some(restore_snapshot(s, host_ptr, snap_bytes).map(Some)),
+            (None, Some(handle)) => Some(
+                hook.as_ref()
+                    .expect("a block snapshot has a store")
+                    .restore(handle)
+                    .map(|()| None),
+            ),
+            (None, None) => None,
+        };
+        if let Some(result) = restored {
+            match result {
                 Ok(va) => {
                     let mut inner = s.inner.lock();
                     let tick = inner.snapshot_tick;
                     let snap = snap_mut(&mut inner, snap_id).expect("held");
-                    debug_assert!(matches!(snap.store, SnapStore::Restoring(r) if r == slot));
-                    snap.store = SnapStore::Device(va);
+                    match (va, restore, snap.store) {
+                        (Some(va), Some((slot, _)), store) => {
+                            debug_assert!(matches!(store, SnapStore::Restoring(r) if r == slot));
+                            snap.store = SnapStore::Device(va);
+                            attach.snap_va = va;
+                        }
+                        (None, None, SnapStore::Blocks { handle, .. }) => {
+                            snap.store = SnapStore::Blocks {
+                                handle,
+                                state: BlockState::Device,
+                            };
+                        }
+                        _ => unreachable!("restore source and snapshot store agree"),
+                    }
                     snap.last_used = tick;
-                    inner.host.as_mut().unwrap().release_slot(slot);
+                    if let Some((slot, _)) = restore {
+                        inner.host.as_mut().unwrap().release_slot(slot);
+                    }
                     inner.stats.host_snapshots -= 1;
                     inner.stats.host_snapshot_bytes -= snap_bytes;
                     inner.stats.snapshot_bytes += snap_bytes;
                     inner.stats.cache_bytes += snap_bytes;
                     inner.stats.snapshots_restored += 1;
                     s.host_cv.notify_all();
-                    attach.snap_va = va;
                 }
                 Err(error) => {
                     tracing::warn!(error = %error, "vmm host tier: restore failed, attach is a miss");
@@ -2637,7 +2824,14 @@ impl VmmKv {
                     let tokens = std::mem::take(&mut inner.seqs[seq].tokens);
                     if let Some(snap) = snap_mut(&mut inner, snap_id) {
                         snap.pending -= 1;
-                        snap.store = SnapStore::Host(slot);
+                        snap.store = match (restore, snap.store) {
+                            (Some((slot, _)), _) => SnapStore::Host(slot),
+                            (None, SnapStore::Blocks { handle, .. }) => SnapStore::Blocks {
+                                handle,
+                                state: BlockState::Host,
+                            },
+                            (None, other) => other,
+                        };
                     }
                     s.host_cv.notify_all();
                     let orphans = unwind_attach(s, &mut inner, seq, pick, kvh, &unlanded);
@@ -2775,6 +2969,37 @@ impl VmmKv {
             return;
         }
         self.shared.inner.lock().awaited[seq] = None;
+    }
+
+    /// `seq`'s session ended (`signal`): its prompt-end boundary — the one it published or
+    /// attached — loses its session protection and drops to the cold LRU band, below every
+    /// boundary a live session may still return to, so pressure takes it first. Nothing is
+    /// freed here: the boundary stays hashed and attachable (a retry or a later turn of the
+    /// same session re-warms it on attach), so a wrong signal costs LRU position, not a
+    /// re-prefill. Called at retire, after the turn's own publish, so the request cannot
+    /// re-protect what it just demoted.
+    pub fn demote_session(&self, seq: usize, signal: DemoteSignal) {
+        if !self.prefix_reuse {
+            return;
+        }
+        let mut inner = self.shared.inner.lock();
+        inner.seqs[seq].session_ttl = None;
+        let Some(id) = inner.seqs[seq].ended.or(inner.seqs[seq].attached) else {
+            return;
+        };
+        inner.cold_tick += 1;
+        let cold = inner.cold_tick;
+        let Some(snap) = snap_mut(&mut inner, id).filter(|s| s.kind.has(Kind::PROMPT_END))
+        else {
+            return;
+        };
+        snap.protect_until = None;
+        snap.last_used = cold;
+        match signal {
+            DemoteSignal::Header => inner.stats.session_end_header += 1,
+            DemoteSignal::Abort => inner.stats.session_end_abort += 1,
+        }
+        tracing::debug!(seq, id, ?signal, "vmm prefix: session boundary demoted to cold");
     }
 
     /// A sequence still prefilling a prompt that shares whole blocks with `prompt`, when its
@@ -3067,13 +3292,13 @@ impl VmmKv {
                 rows,
                 kind,
                 snap_bytes,
-                Some(va),
+                Some(SnapStore::Device(va)),
                 cold,
             )
         };
         match result {
             Ok(PublishLocked::Done { unused_snapshot }) => {
-                if let Some(unused) = unused_snapshot {
+                if let Some(SnapStore::Device(unused)) = unused_snapshot {
                     s.ops.free(unused);
                 }
                 Ok(())
@@ -3081,6 +3306,153 @@ impl VmmKv {
             Ok(PublishLocked::NeedSnapshot) => unreachable!("snapshot was supplied"),
             Err(error) => {
                 s.ops.free(va);
+                Err(error)
+            }
+        }
+    }
+
+    /// Attach the KV block store: boundaries published through [`Self::publish_blocks`] live
+    /// there; the pool's own host tier stays off (the store has its own).
+    /// `prefix`: the store holds every full-layer row (see `Inner::block_prefix`).
+    pub fn enable_block_store(&self, hook: Arc<dyn SnapBlocks>, prefix: bool) {
+        let mut inner = self.shared.inner.lock();
+        inner.block_store = Some(hook);
+        inner.block_prefix = prefix;
+    }
+
+    /// Free one boundary (the LRU policy's choice) so a store allocation can retry.
+    pub fn reclaim_one(&self) -> bool {
+        let s = &self.shared;
+        let mut inner = s.inner.lock();
+        with_cause(&mut inner, None, Some(Trigger::Oom), |inner| {
+            evict_one(s, inner, false)
+        })
+    }
+
+    /// One step of the spill-ahead policy: the LRU device boundary moves to the block store's
+    /// host tier. `false` = no block store, or nothing it would take.
+    pub fn spill_ahead_one(&self) -> bool {
+        spill_ahead_step(&self.shared)
+    }
+
+    /// Spill-ahead thread for a block store with a host tier: while the store's device headroom
+    /// is under `headroom` bytes, the LRU boundary moves to the host, so a publish finds free
+    /// slots instead of spilling on the engine thread and re-spilling until one copy lands (the
+    /// 10 s replay paid 9 ms per publish that way, and the device tier drained to the host far
+    /// ahead of need). Completed spills are retired here as well.
+    pub fn spawn_spill_ahead(
+        &mut self,
+        store: Arc<crate::memory::kv_store::KvStore>,
+        headroom: u64,
+    ) {
+        if self.spill_ahead.is_some() {
+            return;
+        }
+        // The store has a host tier: arrival prefetches restore its boundaries (`prefetch`).
+        self.shared.host_armed.store(true, Ordering::Release);
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let shared = Arc::clone(&self.shared);
+        let flag = Arc::clone(&stop);
+        let spawned = std::thread::Builder::new()
+            .name("vmm-spill-ahead".into())
+            .spawn(move || {
+                while !flag.load(Ordering::Relaxed) {
+                    store.reap();
+                    let spilled =
+                        store.device_headroom_bytes() < headroom && spill_ahead_step(&shared);
+                    if !spilled {
+                        std::thread::sleep(std::time::Duration::from_millis(2));
+                    }
+                }
+            });
+        match spawned {
+            Ok(j) => self.spill_ahead = Some((stop, j)),
+            Err(e) => tracing::warn!(error = %e, "vmm: spill-ahead thread not started"),
+        }
+    }
+
+    /// [`Self::publish_kind`] with the boundary's bytes in the KV block store: `fill` runs with
+    /// the lock released and returns the store handle and the bytes the publish added to the
+    /// device (its new blocks; shared ones are charged to their first publisher). The handle is
+    /// released through [`SnapBlocks::release`] on every failure and when an identical boundary
+    /// already existed.
+    pub fn publish_blocks(
+        &self,
+        seq: usize,
+        tokens: &[u32],
+        rows: u32,
+        kind: Kind,
+        fill: impl FnOnce() -> Result<(u64, u64)>,
+    ) -> Result<()> {
+        if !self.prefix_reuse {
+            return Err(RuntimeError::Rejected(
+                "live KV allocation cannot publish prefixes".into(),
+            ));
+        }
+        let s = &self.shared;
+        if rows == 0 {
+            return Ok(());
+        }
+        let mut cold = false;
+        if self.shared_publish && rows % s.block_rows != 0 {
+            let mut inner = s.inner.lock();
+            if !note_lead(&mut inner, seq, tokens) {
+                if !kind.has(Kind::PROMPT_END) {
+                    inner.stats.publishes_skipped += 1;
+                    return Ok(());
+                }
+                cold = true;
+            }
+        }
+        let generation = s.generation[seq].load(Ordering::Acquire);
+        let hook = {
+            let mut inner = s.inner.lock();
+            if let PublishLocked::Done { unused_snapshot } =
+                publish_locked(s, &mut inner, seq, tokens, rows, kind, 1, None, cold)?
+            {
+                debug_assert!(unused_snapshot.is_none());
+                return Ok(());
+            }
+            inner
+                .block_store
+                .clone()
+                .ok_or_else(|| RuntimeError::Rejected("vmm: no KV block store".into()))?
+        };
+        let (handle, bytes) = fill()?;
+        let store = SnapStore::Blocks {
+            handle,
+            state: BlockState::Device,
+        };
+        if s.generation[seq].load(Ordering::Acquire) != generation {
+            hook.release(handle);
+            return Err(RuntimeError::Rejected(
+                "vmm: sequence changed during prefix publication".into(),
+            ));
+        }
+        let result = {
+            let mut inner = s.inner.lock();
+            publish_locked(
+                s,
+                &mut inner,
+                seq,
+                tokens,
+                rows,
+                kind,
+                bytes.max(1),
+                Some(store),
+                cold,
+            )
+        };
+        match result {
+            Ok(PublishLocked::Done { unused_snapshot }) => {
+                if let Some(SnapStore::Blocks { handle, .. }) = unused_snapshot {
+                    hook.release(handle);
+                }
+                Ok(())
+            }
+            Ok(PublishLocked::NeedSnapshot) => unreachable!("snapshot was supplied"),
+            Err(error) => {
+                hook.release(handle);
                 Err(error)
             }
         }
@@ -3153,7 +3525,7 @@ impl VmmKv {
     pub fn resolve_prefix_hazard(&self, seq: usize, tokens: &[u32], rows: u32) -> bool {
         let s = &self.shared;
         let mut inner = s.inner.lock();
-        if !inner.strict_publish || rows as usize > tokens.len() {
+        if !inner.strict_publish || inner.block_prefix || rows as usize > tokens.len() {
             return true;
         }
         let hashes = hash_blocks(&tokens[..rows as usize], s.block_rows);
@@ -3390,54 +3762,159 @@ impl PrefixProbe {
 
     /// Queue the host → device restore of the boundary `prompt` would attach, so the attach
     /// finds it on the device (the copy overlaps the request's queueing). No-op without a host
-    /// tier, when the boundary is on the device already, or when the restore is queued.
+    /// tier, when the boundary is on the device already, or when the restore is queued. A
+    /// block-store boundary is restored through the store's hook with the lock released (it
+    /// queues the copies); an attach meanwhile waits on `host_cv`.
     pub fn prefetch(&self, prompt: &[u32], key: Option<&PrefixKey>) -> bool {
         let s = &self.0;
         let mut inner = s.inner.lock();
-        if inner.host.is_none() {
+        if inner.host.is_none() && inner.block_store.is_none() {
             return false;
         }
-        let hashes = match key {
-            Some(k) if k.fits(s.block_rows, prompt) => k.hashes.clone(),
-            _ => hash_blocks(prompt, s.block_rows),
-        };
-        let aligned = &prompt[..hashes.len() * s.block_rows as usize];
-        let m = inner.cache.lookup(&hashes, aligned);
-        inner.cache.release(&hashes, m.blocks);
-        let mut chosen: Option<(u32, u64)> = None;
-        for blocks in 0..=m.blocks {
-            let node = blocks.checked_sub(1).map(|i| m.placed[i]);
-            let start = blocks * s.block_rows as usize;
-            if let Some(list) = inner.published.get(&node) {
-                for snap in list {
-                    if (snap.rows as usize) < prompt.len()
-                        && prompt.get(start..snap.rows as usize) == Some(snap.tail.as_slice())
-                        && chosen.is_none_or(|(rows, _)| snap.rows > rows)
-                    {
-                        chosen = Some((snap.rows, snap.id));
-                    }
-                }
-            }
-        }
-        let Some((_, id)) = chosen else {
+        let Some(id) = attach_target(s, &mut inner, prompt, key) else {
             return false;
         };
         let snap = snap_mut(&mut inner, id).expect("found above");
-        let SnapStore::Host(slot) = snap.store else {
-            return false;
+        let bytes = snap.bytes;
+        let handle = match snap.store {
+            SnapStore::Host(slot) => {
+                snap.store = SnapStore::Restoring(slot);
+                snap.users += 1;
+                inner.host.as_mut().unwrap().prefetch.push_back(id);
+                inner.stats.host_prefetches += 1;
+                s.host_cv.notify_all();
+                return true;
+            }
+            SnapStore::Blocks {
+                handle,
+                state: BlockState::Host,
+            } => handle,
+            // Blocks spilled with another boundary and shared by this one are host-resident
+            // under a boundary the pool holds on the device: the store restores those too.
+            SnapStore::Blocks {
+                handle,
+                state: BlockState::Device,
+            } => {
+                let hook = inner.block_store.clone().expect("a block snapshot has a store");
+                drop(inner);
+                let _ = hook.restore(handle);
+                return false;
+            }
+            _ => return false,
         };
-        snap.store = SnapStore::Restoring(slot);
+        snap.store = SnapStore::Blocks {
+            handle,
+            state: BlockState::Restoring,
+        };
         snap.users += 1;
-        inner.host.as_mut().unwrap().prefetch.push_back(id);
         inner.stats.host_prefetches += 1;
+        let hook = inner.block_store.clone().expect("a block snapshot has a store");
+        drop(inner);
+        let restored = hook.restore(handle);
+        let mut inner = s.inner.lock();
+        let tick = inner.snapshot_tick;
+        let snap = snap_mut(&mut inner, id).expect("held");
+        snap.users -= 1;
+        match restored {
+            Ok(()) => {
+                snap.store = SnapStore::Blocks {
+                    handle,
+                    state: BlockState::Device,
+                };
+                snap.last_used = tick;
+                inner.stats.host_snapshots -= 1;
+                inner.stats.host_snapshot_bytes -= bytes;
+                inner.stats.snapshot_bytes += bytes;
+                inner.stats.cache_bytes += bytes;
+                inner.stats.snapshots_restored += 1;
+            }
+            Err(error) => {
+                tracing::warn!(error = %error, "kv store: prefetch restore failed");
+                snap.store = SnapStore::Blocks {
+                    handle,
+                    state: BlockState::Host,
+                };
+            }
+        }
         s.host_cv.notify_all();
         true
+    }
+
+    /// The restore of the boundary `prompt` would attach is still in flight: the request is
+    /// better held a few milliseconds at admission than gathered behind the copy in the engine
+    /// stream, where every slot waits with it. Counted in `restore_holds`.
+    pub fn restore_pending(&self, prompt: &[u32], key: Option<&PrefixKey>) -> bool {
+        let s = &self.0;
+        let mut inner = s.inner.lock();
+        if inner.block_store.is_none() {
+            return false;
+        }
+        let Some(id) = attach_target(s, &mut inner, prompt, key) else {
+            return false;
+        };
+        let pending = match snap_ref(&inner, id).map(|x| x.store) {
+            Some(SnapStore::Blocks {
+                state: BlockState::Restoring,
+                ..
+            }) => true,
+            Some(SnapStore::Blocks {
+                handle,
+                state: BlockState::Device,
+            }) => {
+                let hook = inner.block_store.clone().expect("checked above");
+                drop(inner);
+                let pending = hook.restoring(handle);
+                if pending {
+                    s.inner.lock().stats.restore_holds += 1;
+                }
+                return pending;
+            }
+            _ => false,
+        };
+        if pending {
+            inner.stats.restore_holds += 1;
+        }
+        pending
     }
 
     pub fn key(&self, prompt: &[u32]) -> PrefixKey {
         PrefixKey::new(prompt, self.0.block_rows)
     }
+}
 
+/// The published boundary `prompt` would attach: the longest whose rows the prompt extends.
+fn attach_target(
+    s: &Shared,
+    inner: &mut Inner,
+    prompt: &[u32],
+    key: Option<&PrefixKey>,
+) -> Option<u64> {
+    let hashes = match key {
+        Some(k) if k.fits(s.block_rows, prompt) => k.hashes.clone(),
+        _ => hash_blocks(prompt, s.block_rows),
+    };
+    let aligned = &prompt[..hashes.len() * s.block_rows as usize];
+    let m = inner.cache.lookup(&hashes, aligned);
+    inner.cache.release(&hashes, m.blocks);
+    let mut chosen: Option<(u32, u64)> = None;
+    for blocks in 0..=m.blocks {
+        let node = blocks.checked_sub(1).map(|i| m.placed[i]);
+        let start = blocks * s.block_rows as usize;
+        if let Some(list) = inner.published.get(&node) {
+            for snap in list {
+                if (snap.rows as usize) < prompt.len()
+                    && prompt.get(start..snap.rows as usize) == Some(snap.tail.as_slice())
+                    && chosen.is_none_or(|(rows, _)| snap.rows > rows)
+                {
+                    chosen = Some((snap.rows, snap.id));
+                }
+            }
+        }
+    }
+    chosen.map(|(_, id)| id)
+}
+
+impl PrefixProbe {
     /// The cache generation: rows a probe returned stay right until it moves.
     pub fn generation(&self) -> u64 {
         self.0.cache_gen.load(Ordering::Acquire)
@@ -3677,7 +4154,7 @@ fn publish_locked(
     rows: u32,
     kind: Kind,
     snap_bytes: u64,
-    snapshot: Option<u64>,
+    snapshot: Option<SnapStore>,
     cold: bool,
 ) -> Result<PublishLocked> {
     if rows as usize > tokens.len()
@@ -3723,7 +4200,7 @@ fn publish_locked(
     // sequence's own live window for the whole matched range came from an attach to exactly
     // these blocks, or created them itself in an earlier chunk of this same publish — always
     // consistent; same-conversation growth across turns is exactly that case.)
-    if inner.strict_publish && m.blocks > inner.seqs[seq].held {
+    if inner.strict_publish && !inner.block_prefix && m.blocks > inner.seqs[seq].held {
         inner.cache.release(&hashes, m.blocks);
         if pfx_trace::on() {
             pfx_trace::emit(pfx_trace::Event::Refuse {
@@ -3787,7 +4264,9 @@ fn publish_locked(
     }
 
     let kvh = s.geo.kvh_full as usize;
-    for idx in m.blocks..n_pub {
+    // With the store holding every row, the radix nodes index boundaries only.
+    let share_blocks = if inner.block_prefix { 0 } else { n_pub };
+    for idx in m.blocks..share_blocks {
         let mut ids = Vec::with_capacity(inner.tracks.len() * kvh);
         for t in 0..inner.tracks.len() {
             for h in 0..kvh {
@@ -3851,7 +4330,7 @@ fn publish_locked(
         inner.stats.snapshots_touched += 1;
         (snap.id, snapshot)
     } else {
-        let va = snapshot.expect("preflight cannot commit a missing snapshot");
+        let store = snapshot.expect("preflight cannot commit a missing snapshot");
         let id = inner.next_snap_id;
         inner.next_snap_id += 1;
         inner.by_id.insert(id, bkey);
@@ -3869,7 +4348,7 @@ fn publish_locked(
         }
         inner.published.entry(bkey).or_default().push(Snap {
             id,
-            store: SnapStore::Device(va),
+            store,
             bytes: snap_bytes,
             rows,
             tail: tail.to_vec(),
@@ -4019,6 +4498,7 @@ fn try_attach_fine(inner: &mut Inner, seq: usize, prompt: &[u32]) -> Result<Opti
         snap_va: 0,
         snap_bytes,
         segments,
+        blocks: None,
     }))
 }
 
@@ -4064,6 +4544,10 @@ impl Drop for VmmKv {
             stop.store(true, Ordering::Release);
             let _ = j.join();
         }
+        if let Some((stop, j)) = self.spill_ahead.take() {
+            stop.store(true, Ordering::Release);
+            let _ = j.join();
+        }
         if let Some(j) = self.host_join.take() {
             {
                 // Under the worker's mutex: it checks the flag and parks on `host_cv` without
@@ -4098,6 +4582,11 @@ impl Drop for VmmKv {
                         Err(_) => leaked += 1,
                     },
                     SnapStore::Host(_) | SnapStore::Restoring(_) => {}
+                    SnapStore::Blocks { handle, .. } => {
+                        if let Some(hook) = &inner.block_store {
+                            hook.release(handle);
+                        }
+                    }
                 }
             }
         }
@@ -4296,7 +4785,17 @@ fn create_block(s: &Shared, inner: &mut Inner) -> Result<u32> {
                 if e.is_fatal() {
                     return Err(e);
                 }
-                if !steal_stale(s, inner) && !evict_one(s, inner, false) {
+                if steal_stale(s, inner) {
+                    continue;
+                }
+                // The block store gives memory back first: chunks its released blocks empty
+                // (compacting if needed). Evicting a boundary only feeds its reclaim list, so
+                // that comes last.
+                let shrunk = inner
+                    .block_store
+                    .as_ref()
+                    .map_or(0, |hook| hook.shrink(s.block_bytes));
+                if shrunk == 0 && !evict_one(s, inner, false) {
                     return Err(RuntimeError::Oom(format!("vmm kv block: {e}")));
                 }
             }
@@ -4399,6 +4898,9 @@ fn trim_cache_by(
     evict_one: impl Fn(&Shared, &mut Inner, bool) -> bool,
 ) {
     reap_spills(s, inner);
+    if let Some(hook) = &inner.block_store {
+        hook.reap();
+    }
     demote_expired(s, inner);
     let min_free = s.cache_min_free.load(Ordering::Relaxed);
     if min_free > 0 {
@@ -4413,10 +4915,34 @@ fn trim_cache_by(
             // them, or one floor flushes every prefix the thread has not caught up with.
             // (Pooled blocks are not free and not credited; the pool cap bounds them.)
             let queued = inner.release_queued;
-            while free + (inner.release_queued - queued) + pending_spill_bytes(inner) < min_free {
-                if !with_cause(inner, None, Some(Trigger::MinFree), |inner| {
-                    evict_one(s, inner, true)
-                }) {
+            loop {
+                // The store's spills in flight are credited too, and retired first so their
+                // device slots can go back: without either the loop evicted and spilled
+                // every boundary it had before one copy completed.
+                let store_pending = match &inner.block_store {
+                    Some(hook) => {
+                        hook.reap();
+                        hook.pending_spill_bytes()
+                    }
+                    None => 0,
+                };
+                if free + (inner.release_queued - queued) + pending_spill_bytes(inner) + store_pending
+                    >= min_free
+                {
+                    break;
+                }
+                // The block store gives memory back first: blocks of boundaries already evicted
+                // (its reclaim list) and the slabs they empty; evicting more boundaries only
+                // feeds that list.
+                let shrunk = inner
+                    .block_store
+                    .as_ref()
+                    .map_or(0, |hook| hook.shrink(min_free - free));
+                if shrunk == 0
+                    && !with_cause(inner, None, Some(Trigger::MinFree), |inner| {
+                        evict_one(s, inner, true)
+                    })
+                {
                     break;
                 }
                 free = s.ops.free_bytes().unwrap_or(u64::MAX);
@@ -4665,6 +5191,23 @@ fn free_snapshot(s: &Shared, inner: &mut Inner, snap: Snap) {
             }
         }
         SnapStore::Restoring(_) => unreachable!("a restoring snapshot is held"),
+        SnapStore::Blocks { handle, state } => {
+            match state {
+                BlockState::Host => {
+                    inner.stats.host_snapshots -= 1;
+                    inner.stats.host_snapshot_bytes -= snap.bytes;
+                    inner.stats.host_evictions += 1;
+                }
+                BlockState::Device => {
+                    inner.stats.snapshot_bytes -= snap.bytes;
+                    inner.stats.cache_bytes -= snap.bytes;
+                }
+                BlockState::Restoring => unreachable!("a restoring snapshot is held"),
+            }
+            if let Some(hook) = &inner.block_store {
+                hook.release(handle);
+            }
+        }
     }
 }
 
@@ -4722,6 +5265,31 @@ fn unwind_attach(
     s.frontier[seq].store(0, Ordering::Release);
     release_prefix_hold(s, inner, seq);
     orphans
+}
+
+/// `MemAvailable` of `/proc/meminfo` in bytes; `None` where it cannot be read.
+/// `(MemAvailable, MemTotal)` in bytes.
+pub(crate) fn host_mem_available() -> Option<(u64, u64)> {
+    let text = std::fs::read_to_string("/proc/meminfo").ok()?;
+    let field = |key: &str| -> Option<u64> {
+        let line = text.lines().find(|l| l.starts_with(key))?;
+        let kib: u64 = line.split_whitespace().nth(1)?.parse().ok()?;
+        Some(kib << 10)
+    };
+    Some((field("MemAvailable:")?, field("MemTotal:")?))
+}
+
+/// Host RAM the pinned tier leaves to the rest of the machine: an eighth of it, at least
+/// 16 GiB (pinned pages cannot be reclaimed; a co-tenant build must not OOM-kill the server).
+/// `host_tier_auto` is the tier the rule allows now: `MemAvailable` minus that reserve.
+pub(crate) fn host_tier_auto() -> Option<(u64, u64)> {
+    let (avail, total) = host_mem_available()?;
+    let reserve = host_reserve(total);
+    Some((avail.saturating_sub(reserve), reserve))
+}
+
+pub(crate) fn host_reserve(total: u64) -> u64 {
+    (total / 8).max(16 << 30)
 }
 
 /// A device buffer holding the snapshot at `host_ptr` (no lock held: `alloc_snapshot` takes it
@@ -4855,6 +5423,17 @@ fn complete_spill(s: &Shared, inner: &mut Inner, id: u64) {
 
 /// Block on the oldest spill and free its device buffer: the caller needs bytes now. A failed
 /// fence quarantines the entry instead (nothing freed) and the next one is tried.
+/// [`VmmKv::spill_ahead_one`] on the shared state (the spill-ahead thread holds no `VmmKv`).
+fn spill_ahead_step(s: &Shared) -> bool {
+    let mut inner = s.inner.lock();
+    if inner.block_store.is_none() {
+        return false;
+    }
+    with_cause(&mut inner, None, Some(Trigger::Ahead), |inner| {
+        policy::spill_lru(s, inner)
+    })
+}
+
 fn finish_oldest_spill(s: &Shared, inner: &mut Inner) -> bool {
     while let Some((id, _)) = inner.host.as_mut().and_then(|t| t.in_flight.pop_front()) {
         let Some(SnapStore::Spilling { fence, .. }) = snap_ref(inner, id).map(|snap| snap.store)
@@ -4933,12 +5512,10 @@ fn host_lru(inner: &Inner) -> Option<u64> {
         .values()
         .flatten()
         .filter(|snap| {
-            snap.users == 0
-                && matches!(snap.store, SnapStore::Host(_))
-                && !snap_awaited(&inner.awaited, snap)
+            snap.users == 0 && snap.store.on_host() && !snap_awaited(&inner.awaited, snap)
         })
-        // A session boundary inside its TTL goes last here too.
-        .min_by_key(|snap| (snap.protect_until.is_some_and(|t| t > now), snap.last_used))
+        // A shielded boundary goes last here too.
+        .min_by_key(|snap| (snap.shielded(now), snap.last_used))
         .map(|snap| snap.id)
 }
 
@@ -4946,6 +5523,9 @@ fn host_lru(inner: &Inner) -> Option<u64> {
 /// is finished instead (its device bytes come free now); a full tier first drops its LRU host
 /// snapshot. `false` = not handled: evict as before.
 fn spill_unit(s: &Shared, inner: &mut Inner, id: u64) -> bool {
+    if let Some(SnapStore::Blocks { handle, state }) = snap_ref(inner, id).map(|x| x.store) {
+        return state == BlockState::Device && spill_blocks(s, inner, id, handle);
+    }
     let Some(tier) = inner.host.as_ref() else {
         return false;
     };
@@ -4965,7 +5545,7 @@ fn spill_unit(s: &Shared, inner: &mut Inner, id: u64) -> bool {
     if tier.free.is_empty() {
         let now = std::time::Instant::now();
         let protected =
-            |id: u64| snap_ref(inner, id).is_some_and(|x| x.protect_until.is_some_and(|t| t > now));
+            |id: u64| snap_ref(inner, id).is_some_and(|x| x.shielded(now));
         match host_lru(inner) {
             // An unprotected victim never displaces a session boundary inside its TTL: it is
             // freed instead (the caller's fallback).
@@ -4991,6 +5571,53 @@ fn spill_unit(s: &Shared, inner: &mut Inner, id: u64) -> bool {
     }
     inner.stats.spill_fallbacks += 1;
     false
+}
+
+/// [`spill_unit`] for a block-store boundary: the store moves the blocks; a full store host
+/// tier first gives up the pool's LRU host boundary (same protection rules as the pool's tier).
+fn spill_blocks(s: &Shared, inner: &mut Inner, id: u64, handle: u64) -> bool {
+    let Some(hook) = inner.block_store.clone() else {
+        return false;
+    };
+    let mut spilled = hook.spill(handle);
+    if !spilled {
+        let now = std::time::Instant::now();
+        let protected =
+            |id: u64| snap_ref(inner, id).is_some_and(|x| x.shielded(now));
+        match host_lru(inner) {
+            Some(victim) if protected(victim) && !protected(id) => {}
+            Some(victim)
+                if snap_ref(inner, id).is_some_and(Snap::cold)
+                    && !snap_ref(inner, victim).is_some_and(Snap::cold) => {}
+            Some(victim) => {
+                policy::evict_unit(s, inner, victim);
+                spilled = hook.spill(handle);
+            }
+            None => {}
+        }
+    }
+    if !spilled {
+        inner.stats.spill_fallbacks += 1;
+        return false;
+    }
+    let Some(snap) = snap_mut(inner, id) else {
+        return false;
+    };
+    snap.store = SnapStore::Blocks {
+        handle,
+        state: BlockState::Host,
+    };
+    let bytes = snap.bytes;
+    inner.stats.snapshot_bytes -= bytes;
+    inner.stats.cache_bytes -= bytes;
+    inner.stats.host_snapshots += 1;
+    inner.stats.host_snapshot_bytes += bytes;
+    inner.stats.snapshots_spilled += 1;
+    if pfx_trace::on() {
+        let t = std::time::Instant::now();
+        pfx_trace::emit(pfx_trace::Event::Spill { t, id });
+    }
+    true
 }
 
 /// The published snapshot with this id.
@@ -5021,7 +5648,15 @@ fn snapshots_free(list: &[Snap], awaited: &[Option<Await>]) -> bool {
     list.iter().all(|snap| {
         snap.users == 0
             && !snap_awaited(awaited, snap)
-            && matches!(snap.store, SnapStore::Device(_) | SnapStore::Host(_))
+            && matches!(
+                snap.store,
+                SnapStore::Device(_)
+                    | SnapStore::Host(_)
+                    | SnapStore::Blocks {
+                        state: BlockState::Device | BlockState::Host,
+                        ..
+                    }
+            )
     })
 }
 
@@ -7797,6 +8432,285 @@ mod tests {
         p.begin_seq(0);
         assert_eq!(p.cached_rows(&b), 0, "idle chunk end outlived LRU pressure");
         assert!(p.stats().cache_bytes <= 512);
+        policy::check_tree(&p.shared.inner.lock());
+    }
+
+    /// A shared end that served two attaches is shielded like a session inside its TTL: idle
+    /// unique prompts push the pool past its cap, and it stays while any unshielded boundary
+    /// is left to evict.
+    #[test]
+    fn shared_end_in_use_outlives_unshielded_boundaries_under_pressure() {
+        let ops = Arc::new(MockVmm::default());
+        let p = pool_with_cap(ops, 512);
+        let a = prompt(17);
+        p.try_attach(0, &a).unwrap();
+        p.ensure_rows(0, 17).unwrap();
+        p.publish_kind(0, &a, 8, Kind::SHARED_END, 48, |_| Ok(()))
+            .unwrap();
+        p.begin_seq(0);
+        let mut b = a[..8].to_vec();
+        b.extend((0..9).map(|i| 900 + i));
+        for _ in 0..2 {
+            assert_eq!(p.try_attach(1, &b).unwrap().expect("shared end").rows, 8);
+            p.finish_attach(1);
+            p.begin_seq(1);
+        }
+        let mut ever_evicted = 0;
+        for first in 100..120u32 {
+            let mut u = prompt(17);
+            u[0] = first;
+            p.begin_seq(0);
+            p.try_attach(0, &u).unwrap();
+            p.ensure_rows(0, 17).unwrap();
+            p.publish_at(0, &u, 16, 48, |_| Ok(())).unwrap();
+            ever_evicted = p.stats().snapshots_evicted;
+        }
+        p.begin_seq(0);
+        assert!(ever_evicted > 0, "no pressure");
+        assert_eq!(p.cached_rows(&b), 8, "shared end in use evicted under pressure");
+        assert!(p.stats().cache_bytes <= 512);
+        policy::check_tree(&p.shared.inner.lock());
+    }
+
+    struct NoopBlocks;
+    impl SnapBlocks for NoopBlocks {
+        fn release(&self, _handle: u64) {}
+        fn spill(&self, _handle: u64) -> bool {
+            false
+        }
+        fn restore(&self, _handle: u64) -> Result<()> {
+            Ok(())
+        }
+        fn reap(&self) {}
+        fn pending_spill_bytes(&self) -> u64 {
+            0
+        }
+        fn shrink(&self, _bytes: u64) -> u64 {
+            0
+        }
+    }
+
+    /// Prefix mode: a publish takes no block references and an attach multi-maps nothing;
+    /// the boundary is found by its radix node and hands back the store handle.
+    #[test]
+    fn prefix_mode_publishes_and_attaches_without_multi_mapping() {
+        let ops = Arc::new(MockVmm::default());
+        let p = pool(ops.clone());
+        p.enable_block_store(Arc::new(NoopBlocks), true);
+        let a = prompt(17);
+        p.try_attach(0, &a).unwrap();
+        p.ensure_rows(0, 17).unwrap();
+        p.publish_blocks(0, &a, 16, Kind::PROMPT_END, || Ok((7, 100)))
+            .unwrap();
+        assert_eq!(p.stats().cache_blocks, 0, "no shared block references");
+        p.begin_seq(0);
+        let maps = ops.maps.load(Ordering::SeqCst);
+        let hit = p.try_attach(1, &a).unwrap().expect("hit");
+        assert_eq!((hit.rows, hit.blocks), (16, Some(7)));
+        assert_eq!(ops.maps.load(Ordering::SeqCst), maps, "nothing multi-mapped");
+        p.ensure_rows(1, 17).unwrap();
+        assert!(ops.maps.load(Ordering::SeqCst) > maps, "the slot grows its own blocks");
+        p.finish_attach(1);
+        policy::check_tree(&p.shared.inner.lock());
+    }
+
+    /// Counts shrink requests and grants each in full.
+    #[derive(Default)]
+    struct ShrinkBlocks {
+        shrinks: AtomicU64,
+    }
+    impl SnapBlocks for ShrinkBlocks {
+        fn release(&self, _handle: u64) {}
+        fn spill(&self, _handle: u64) -> bool {
+            false
+        }
+        fn restore(&self, _handle: u64) -> Result<()> {
+            Ok(())
+        }
+        fn reap(&self) {}
+        fn pending_spill_bytes(&self) -> u64 {
+            0
+        }
+        fn shrink(&self, bytes: u64) -> u64 {
+            self.shrinks.fetch_add(1, Ordering::SeqCst);
+            bytes
+        }
+    }
+
+    /// A slot block the driver cannot create asks the store for memory before any boundary
+    /// is evicted: evicting only feeds the store's reclaim list, which frees nothing.
+    #[test]
+    fn slot_growth_oom_shrinks_the_store_before_evicting_a_boundary() {
+        let ops = Arc::new(MockVmm::default());
+        let p = pool(ops.clone());
+        let hook = Arc::new(ShrinkBlocks::default());
+        p.enable_block_store(hook.clone(), true);
+        let a = prompt(17);
+        p.try_attach(0, &a).unwrap();
+        p.ensure_rows(0, 17).unwrap();
+        p.publish_blocks(0, &a, 16, Kind::PROMPT_END, || Ok((7, 100)))
+            .unwrap();
+        let hit = p.try_attach(1, &a).unwrap().expect("hit");
+        assert_eq!(hit.rows, 16);
+        ops.fail_creates.store(1, Ordering::SeqCst);
+        p.ensure_rows(1, 17).unwrap();
+        assert_eq!(hook.shrinks.load(Ordering::SeqCst), 1, "one shrink for the failed create");
+        let st = p.stats();
+        assert_eq!((st.snapshots_live, st.nodes_evicted), (1, 0), "nothing evicted");
+        p.finish_attach(1);
+        policy::check_tree(&p.shared.inner.lock());
+    }
+
+    /// Spills every boundary it is asked to.
+    struct SpillBlocks;
+    impl SnapBlocks for SpillBlocks {
+        fn release(&self, _handle: u64) {}
+        fn spill(&self, _handle: u64) -> bool {
+            true
+        }
+        fn restore(&self, _handle: u64) -> Result<()> {
+            Ok(())
+        }
+        fn reap(&self) {}
+        fn pending_spill_bytes(&self) -> u64 {
+            0
+        }
+        fn shrink(&self, _bytes: u64) -> u64 {
+            0
+        }
+    }
+
+    /// A host-resident store boundary occupies no device bytes: device pressure spills the
+    /// used device boundary instead of first evicting the cold host one (the pool's own tier
+    /// did that to free a host slot; the store's host cap is enforced at the spill).
+    #[test]
+    fn device_pressure_keeps_host_resident_store_boundaries() {
+        let ops = Arc::new(MockVmm::default());
+        let p = pool(ops.clone());
+        p.enable_block_store(Arc::new(SpillBlocks), true);
+        let a = prompt(17);
+        p.try_attach(0, &a).unwrap();
+        p.ensure_rows(0, 17).unwrap();
+        p.publish_blocks(0, &a, 16, Kind::PROMPT_END, || Ok((7, 100)))
+            .unwrap();
+        p.begin_seq(0);
+        assert!(p.reclaim_one(), "a (cold) spills");
+        assert_eq!(p.stats().host_snapshots, 1);
+        let b: Vec<u32> = (500..517).collect();
+        p.try_attach(0, &b).unwrap();
+        p.ensure_rows(0, 17).unwrap();
+        p.publish_blocks(0, &b, 16, Kind::PROMPT_END, || Ok((8, 100)))
+            .unwrap();
+        p.begin_seq(0);
+        let hit = p.try_attach(1, &b).unwrap().expect("hit");
+        assert_eq!(hit.rows, 16, "b is used once: no longer cold");
+        p.finish_attach(1);
+        p.begin_seq(1);
+        assert!(p.reclaim_one(), "b spills; the host boundary a stays");
+        let st = p.stats();
+        assert_eq!((st.host_snapshots, st.snapshots_live), (2, 2));
+        assert_eq!(p.cached_rows(&a), 16);
+        policy::check_tree(&p.shared.inner.lock());
+    }
+
+    /// Spill-ahead moves the LRU device boundary to the host before any allocation needs
+    /// the bytes; the boundary stays attachable; nothing on the device left = nothing spilled.
+    #[test]
+    fn spill_ahead_moves_the_lru_device_boundary_to_the_host() {
+        let ops = Arc::new(MockVmm::default());
+        let p = pool(ops.clone());
+        assert!(!p.spill_ahead_one(), "no block store");
+        p.enable_block_store(Arc::new(SpillBlocks), true);
+        let a = prompt(17);
+        p.try_attach(0, &a).unwrap();
+        p.ensure_rows(0, 17).unwrap();
+        p.publish_blocks(0, &a, 16, Kind::PROMPT_END, || Ok((7, 100)))
+            .unwrap();
+        p.begin_seq(0);
+        let b: Vec<u32> = (500..517).collect();
+        p.try_attach(0, &b).unwrap();
+        p.ensure_rows(0, 17).unwrap();
+        p.publish_blocks(0, &b, 16, Kind::PROMPT_END, || Ok((8, 100)))
+            .unwrap();
+        p.begin_seq(0);
+        assert!(p.spill_ahead_one());
+        let st = p.stats();
+        assert_eq!((st.host_snapshots, st.snapshots_live), (1, 2));
+        assert_eq!(p.cached_rows(&a), 16, "a (the LRU) is on the host, still attachable");
+        assert!(p.spill_ahead_one());
+        assert!(!p.spill_ahead_one(), "nothing left on the device");
+        assert_eq!(p.stats().host_snapshots, 2);
+        policy::check_tree(&p.shared.inner.lock());
+    }
+
+    /// An arrival prefetch of a host-resident block-store boundary restores it through the
+    /// store's hook (lock released) and marks it on the device; the attach then finds it there
+    /// and a second prefetch does nothing.
+    #[test]
+    fn prefetch_restores_a_host_block_boundary_through_the_store() {
+        #[derive(Default)]
+        struct RestoreBlocks {
+            restores: AtomicU64,
+            in_flight: std::sync::atomic::AtomicBool,
+        }
+        impl SnapBlocks for RestoreBlocks {
+            fn release(&self, _handle: u64) {}
+            fn spill(&self, _handle: u64) -> bool {
+                true
+            }
+            fn restore(&self, _handle: u64) -> Result<()> {
+                self.restores.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            }
+            fn restoring(&self, _handle: u64) -> bool {
+                self.in_flight.load(Ordering::SeqCst)
+            }
+            fn reap(&self) {}
+            fn pending_spill_bytes(&self) -> u64 {
+                0
+            }
+            fn shrink(&self, _bytes: u64) -> u64 {
+                0
+            }
+        }
+        let ops = Arc::new(MockVmm::default());
+        let p = pool(ops.clone());
+        let hook = Arc::new(RestoreBlocks::default());
+        p.enable_block_store(hook.clone(), true);
+        let a = prompt(17);
+        p.try_attach(0, &a).unwrap();
+        p.ensure_rows(0, 17).unwrap();
+        p.publish_blocks(0, &a, 16, Kind::PROMPT_END, || Ok((7, 100)))
+            .unwrap();
+        p.begin_seq(0);
+        assert!(p.spill_ahead_one());
+        assert_eq!(p.stats().host_snapshots, 1);
+        let probe = p.prefix_probe().unwrap();
+        let key = probe.key(&a);
+        assert!(probe.prefetch(&a, Some(&key)));
+        assert_eq!(hook.restores.load(Ordering::SeqCst), 1);
+        let s = p.stats();
+        assert_eq!(
+            (s.host_prefetches, s.snapshots_restored, s.host_snapshots),
+            (1, 1, 0)
+        );
+        assert!(!probe.prefetch(&a, Some(&key)), "on the device already");
+        assert_eq!(
+            hook.restores.load(Ordering::SeqCst),
+            2,
+            "a device boundary's shared host blocks are restored too"
+        );
+        // Admission holds the request while the store reports the restore in flight.
+        assert!(!probe.restore_pending(&a, Some(&key)));
+        hook.in_flight.store(true, Ordering::SeqCst);
+        assert!(probe.restore_pending(&a, Some(&key)));
+        assert!(!probe.restore_pending(&prompt(5), None), "a miss waits for nothing");
+        hook.in_flight.store(false, Ordering::SeqCst);
+        assert_eq!(p.stats().restore_holds, 1);
+        let hit = p.try_attach(1, &a).unwrap().expect("hit");
+        assert_eq!((hit.rows, hit.blocks), (16, Some(7)));
+        assert_eq!(hook.restores.load(Ordering::SeqCst), 2, "found on the device");
+        p.finish_attach(1);
         policy::check_tree(&p.shared.inner.lock());
     }
 

@@ -37,6 +37,7 @@ duplicate them and is now an index only.
 | [19](19-packet-extensions.md) | **Packet Extensions** | Adding prefill buckets, decode rungs, packed siblings and token-batch bodies to a packet that is already compiled, without re-emitting it |
 | [20](20-asr-pipelines.md) | **ASR Packet Pipelines** | Qwen causal and Nemotron RNNT compilation, runtime, batching and serving |
 | [22](22-kv-cache.md) | **KV Cache** | Head-major ring layout, chunk-sized rings, the write and read paths, fp8 KV, slots, the VMM allocator and the prefix cache |
+| [26](26-kv-block-store.md) | **Prefix Cache Retention and the KV Block Store (design)** | What moves the production hit rate (capacity tiers, session-end demotion; the retention simulation against vLLM 0.29) and the content-addressed row-class store that unifies NVIDIA/AMD/CPU and adds recurrent state |
 | [23](23-jit-rungs.md) | **JIT Rungs (future plan)** | Building a new decode rung or prefill bucket at runtime on prebuilt cubins: measured emit cost, what is packet-only, the pairing and verifier guardrails, the staged path from `plowc extend` to a hot-add |
 
 ---

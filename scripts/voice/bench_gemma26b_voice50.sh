@@ -37,8 +37,6 @@ export PLOW_TOKEN_BATCH=1
 export PLOW_VMM_LIVE_RINGS=1
 export PLOW_VMM_PREFIX=1
 export PLOW_VMM_RING_PARK=8
-export PLOW_VMM_SNAP_PITCHED=1
-export PLOW_VMM_SNAP_POOL=4
 export PLOW_VMM_STRICT_PUBLISH=1
 
 # Multi-tenant voice knobs

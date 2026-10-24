@@ -320,6 +320,18 @@ impl GpuEngine {
                 .filter(|(pending, phase)| pending.completes_prompt && **phase == Phase::Prefill)
                 .map(|(pending, _)| pending.slot as usize)
                 .collect();
+            // Prefill members with their prompt length: a recurrent model's chunk that ends at
+            // the prompt-end boundary publishes it right after the step (`state_capture_publish`).
+            let prefill_members: smallvec::SmallVec<[(usize, usize); 16]> = plan
+                .pending
+                .iter()
+                .zip(&plan.phases)
+                .filter(|(_, phase)| **phase == Phase::Prefill)
+                .filter_map(|(pending, _)| {
+                    let request = requests.iter().find(|r| r.id == pending.request)?;
+                    Some((pending.slot as usize, request.prompt_len as usize))
+                })
+                .collect();
             // A request waiting on this prompt's shared blocks attaches as soon as the chunk
             // that computed them lands, not after the owner's whole prompt.
             let chunk_ends: smallvec::SmallVec<[(usize, u32); 16]> = match RuntimeConfig::get()
@@ -507,6 +519,9 @@ impl GpuEngine {
                     let n = (self.pos[chunk.slot] as usize - chunk.c0).min(chunk.tokens.len());
                     self.seq_tokens[chunk.slot].extend_from_slice(&chunk.tokens[..n]);
                 }
+                for &(slot, prompt_len) in &prefill_members {
+                    self.state_capture_publish(slot, prompt_len);
+                }
                 for chunk in &chunks {
                     self.vmm_publish_shared(chunk.slot, chunk.c0 as u32);
                 }
@@ -576,7 +591,9 @@ impl GpuEngine {
         }
         self.be.stream_synchronize(&self.stream)?;
         let kv = self.vmm.as_ref().and_then(|v| v.kv.as_ref());
-        for b in self.deferred_attach.drain(..) {
+        let slots: Vec<usize> = self.deferred_attach.drain(..).collect();
+        for b in slots {
+            self.blocks_unhold(b);
             if let Some(kv) = kv {
                 kv.finish_attach(b);
             }

@@ -516,6 +516,15 @@ pub fn is_runtime_env(env: &str) -> bool {
         .any(|k| k.env == Some(env) && !matches!(k.status, Status::Removed))
 }
 
+/// Whether `env` names a retired knob: a packet built before its removal may still carry a
+/// default for it, which is ignored rather than refused.
+pub fn is_removed_env(env: &str) -> bool {
+    RUNTIME
+        .iter()
+        .chain(RAW_ENV)
+        .any(|k| k.env == Some(env) && matches!(k.status, Status::Removed))
+}
+
 #[rustfmt::skip]
 pub const RUNTIME: &[KnobSpec] = &[
     KnobSpec::new("rt.rt_checkpoint", Some("PLOW_CHECKPOINT"), Layer::Runtime, Domain::Str, UNSET, OPT_IN),
@@ -571,7 +580,7 @@ pub const RUNTIME: &[KnobSpec] = &[
     KnobSpec::new("rt.encode_split_min", Some("PLOW_ENCODE_SPLIT_MIN"), Layer::Runtime, U32, UNSET, ONE_WORD_ENCODE_QUALIFIED),
     KnobSpec::new("rt.vmm_cache_memory_utilization", Some("PLOW_VMM_CACHE_MEMORY_UTILIZATION"), Layer::Runtime, Domain::Str, Default::Static(Val::Str("0")), OPT_IN),
     KnobSpec::new("rt.vmm_cache_min_free_mib", Some("PLOW_VMM_CACHE_MIN_FREE_MIB"), Layer::Runtime, U32, UNSET, PRESSURE_EVICTION_DEFAULT),
-    KnobSpec::new("rt.vmm_host_cache_mib", Some("PLOW_VMM_HOST_CACHE_MIB"), Layer::Runtime, USIZE, Default::Static(Val::Nat(0)), OPT_IN),
+    KnobSpec::new("rt.vmm_host_cache_mib", Some("PLOW_VMM_HOST_CACHE_MIB"), Layer::Runtime, USIZE, UNSET, OPT_IN),
     KnobSpec::new("rt.kv_admit_headroom", Some("PLOW_KV_ADMIT_HEADROOM"), Layer::Runtime, Domain::Str, Default::Static(Val::Str("0.9")), KV_ADMIT_DEFAULT),
     KnobSpec::new("rt.kv_mem_util", Some("PLOW_KV_MEM_UTIL"), Layer::Runtime, Domain::Str, Default::Static(Val::Str("0")), OPT_IN),
     KnobSpec::new("rt.amd_prefix_fine_rows", Some("PLOW_AMD_PREFIX_FINE_ROWS"), Layer::Runtime, U32, UNSET, PREFIX_CACHE_CANDIDATE),
@@ -592,8 +601,6 @@ pub const RUNTIME: &[KnobSpec] = &[
     KnobSpec::new("rt.amd_mixed_pack", Some("PLOW_AMD_MIXED_PACK"), Layer::Runtime, Domain::Bool, ON, AMD_MIXED_PACK_DEFAULT),
     KnobSpec::new("rt.prefix_arm_end", Some("PLOW_PREFIX_ARM_END"), Layer::Runtime, Domain::Bool, OFF, DIAG),
     KnobSpec::new("rt.vmm_strict_publish", Some("PLOW_VMM_STRICT_PUBLISH"), Layer::Runtime, Domain::Bool, ON, DIAG),
-    KnobSpec::new("rt.vmm_snap_pitched", Some("PLOW_VMM_SNAP_PITCHED"), Layer::Runtime, Domain::Bool, OFF, DIAG),
-    KnobSpec::new("rt.vmm_snap_pool", Some("PLOW_VMM_SNAP_POOL"), Layer::Runtime, U32, Default::Static(Val::Nat(0)), DIAG),
     KnobSpec::new("rt.vmm_ring_recycle", Some("PLOW_VMM_RING_RECYCLE"), Layer::Runtime, Domain::Bool, OFF, DIAG),
     KnobSpec::new("rt.vmm_ring_park", Some("PLOW_VMM_RING_PARK"), Layer::Runtime, U32, Default::Static(Val::Nat(0)), DIAG),
     KnobSpec::new("rt.pf_admit_overlap", Some("PLOW_PF_ADMIT_OVERLAP"), Layer::Runtime, Domain::Bool, OFF, DIAG),
@@ -875,6 +882,9 @@ pub const RAW_ENV: &[KnobSpec] = &[
     KnobSpec::new("env.PLOW_PF_SPAN_POLICY", Some("PLOW_PF_SPAN_POLICY"), Layer::RawEnv, Domain::Str, UNSET, REMOVED),
     KnobSpec::new("env.PLOW_PIPE_PREFILL", Some("PLOW_PIPE_PREFILL"), Layer::RawEnv, Domain::Str, UNSET, REMOVED),
     KnobSpec::new("env.PLOW_PREFIX_CACHE_OUTPUT", Some("PLOW_PREFIX_CACHE_OUTPUT"), Layer::RawEnv, Domain::Str, UNSET, REMOVED),
+    KnobSpec::new("env.PLOW_KV_STORE", Some("PLOW_KV_STORE"), Layer::RawEnv, Domain::Str, UNSET, REMOVED),
+    KnobSpec::new("env.PLOW_VMM_SNAP_PITCHED", Some("PLOW_VMM_SNAP_PITCHED"), Layer::RawEnv, Domain::Str, UNSET, REMOVED),
+    KnobSpec::new("env.PLOW_VMM_SNAP_POOL", Some("PLOW_VMM_SNAP_POOL"), Layer::RawEnv, Domain::Str, UNSET, REMOVED),
     KnobSpec::new("env.PLOW_PREFIX_POLICY", Some("PLOW_PREFIX_POLICY"), Layer::RawEnv, Domain::Str, UNSET, REMOVED),
     KnobSpec::new("env.PLOW_PREFIX_RETIRE_ATTACHED", Some("PLOW_PREFIX_RETIRE_ATTACHED"), Layer::RawEnv, Domain::Str, UNSET, REMOVED),
     KnobSpec::new("env.PLOW_QUEUE_TTL_MS", Some("PLOW_QUEUE_TTL_MS"), Layer::RawEnv, Domain::Str, UNSET, REMOVED),

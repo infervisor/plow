@@ -294,6 +294,7 @@ alone is ~10.7k lines and emits the shipped GLM-5.3 TP8 programs.
 | In-place packet rewriting | 🔲 | Fine-grained dynamism |
 | Speculative decoding, MTP assistant drafter | 🔧 | CUDA; Gemma-4 12B/26B. AMD accept kernel untested |
 | Speculative decoding, DSpark block drafter | 🔲 | Paused; D1/D2 on branch `g12-dspark`, plan in [25-dspark-pending.md](25-dspark-pending.md) |
+| Prefix cache retention (host tier, session-end demotion) and KV block store | 🔲 | Design in [26-kv-block-store.md](26-kv-block-store.md); retention simulation done, nothing implemented |
 
 ---
 
