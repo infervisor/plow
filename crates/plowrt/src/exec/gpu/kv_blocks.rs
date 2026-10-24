@@ -340,6 +340,14 @@ impl SnapBlocks for BlockServe {
         Ok(())
     }
 
+    fn restoring(&self, handle: u64) -> bool {
+        let ids: Vec<BlockId> = match self.handles.lock().get(&handle) {
+            Some(h) => h.iter().map(|&(_, _, id)| id).collect(),
+            None => return false,
+        };
+        self.store.restoring_any(&ids)
+    }
+
     fn reap(&self) {
         self.store.reap();
     }

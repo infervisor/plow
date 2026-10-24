@@ -2517,6 +2517,10 @@ fn waited_ms(now: Instant, arrived: Instant) -> f64 {
     now.saturating_duration_since(arrived).as_secs_f64() * 1e3
 }
 
+/// How long a request waits at admission for its boundary's host restore (a 170 MB boundary
+/// lands in under 10 ms; a backlog of them is the bound).
+const RESTORE_HOLD_MS: f64 = 50.0;
+
 /// One pass over the wait queue: sweep what will never run, then seat what fits.
 ///
 /// Two fairness rules on top of the backfill:
@@ -2677,6 +2681,17 @@ fn drain_waiting_session(
         let Some((job, arrived)) = waiting.pop_front() else {
             break;
         };
+        // A boundary restore in flight (`PrefixProbe::prefetch`): the request waits for the
+        // copy here, not in the engine stream where every slot would wait with it. Bounded:
+        // past it the gather orders itself behind the fence.
+        if let Some(p) = prefix.filter(|p| p.host_tier()) {
+            if waited_ms(now, arrived) < RESTORE_HOLD_MS
+                && p.restore_pending(&job.prompt_ids, job.opts.prefix.as_ref())
+            {
+                still.push_back((job, arrived));
+                continue;
+            }
+        }
         let round = job.opts.round;
         match admit_session(
             slots,

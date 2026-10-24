@@ -725,6 +725,21 @@ impl KvStore {
         Ok(())
     }
 
+    /// Whether any of `ids` still has its restore in flight (landed ones are retired first).
+    pub fn restoring_any(&self, ids: &[BlockId]) -> bool {
+        let mut inner = self.inner.lock();
+        self.reap_restores(&mut inner);
+        ids.iter().any(|&id| {
+            matches!(
+                inner.blocks[id as usize].as_ref(),
+                Some(Block {
+                    place: Where::Restoring { .. },
+                    ..
+                })
+            )
+        })
+    }
+
     pub fn ensure_device(&self, id: BlockId) -> Result<u64> {
         let mut inner = self.inner.lock();
         inner.tick += 1;
@@ -2017,7 +2032,9 @@ mod tests {
             "the fence stays for the gather's stream wait while the block is held"
         );
         assert_eq!(s.gather_src(a.id).unwrap().fence, Some(fence));
+        assert!(s.restoring_any(&[a.id]), "held: still in flight for admission");
         s.unhold(&[a.id]);
+        assert!(!s.restoring_any(&[a.id]), "retired by the query itself");
         s.reap();
         let st = s.stats();
         assert_eq!(

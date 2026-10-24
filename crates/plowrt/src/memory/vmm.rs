@@ -986,6 +986,8 @@ pub struct VmmStats {
     pub host_evictions: u64,
     pub spill_fallbacks: u64,
     pub host_prefetches: u64,
+    /// Admissions held because the boundary's restore was still in flight.
+    pub restore_holds: u64,
     pub spill_fence_failures: u64,
     /// `X-Session-Id` retention (`PLOW_PREFIX_SESSION_TTL_S`, tree): boundaries inside their
     /// session TTL (gauge), and the expired ones demoted (suffix freed) with their bytes.
@@ -1321,6 +1323,10 @@ pub trait SnapBlocks: Send + Sync {
     /// where they have not landed. Called at an attach and, ahead of it, by the arrival
     /// prefetch ([`VmmKv::prefetch`]).
     fn restore(&self, handle: u64) -> Result<()>;
+    /// A restore of the boundary's blocks is still in flight.
+    fn restoring(&self, _handle: u64) -> bool {
+        false
+    }
     /// Retire completed spills.
     fn reap(&self);
     /// Bytes of spills in flight (device memory coming free once they retire).
@@ -3765,29 +3771,7 @@ impl PrefixProbe {
         if inner.host.is_none() && inner.block_store.is_none() {
             return false;
         }
-        let hashes = match key {
-            Some(k) if k.fits(s.block_rows, prompt) => k.hashes.clone(),
-            _ => hash_blocks(prompt, s.block_rows),
-        };
-        let aligned = &prompt[..hashes.len() * s.block_rows as usize];
-        let m = inner.cache.lookup(&hashes, aligned);
-        inner.cache.release(&hashes, m.blocks);
-        let mut chosen: Option<(u32, u64)> = None;
-        for blocks in 0..=m.blocks {
-            let node = blocks.checked_sub(1).map(|i| m.placed[i]);
-            let start = blocks * s.block_rows as usize;
-            if let Some(list) = inner.published.get(&node) {
-                for snap in list {
-                    if (snap.rows as usize) < prompt.len()
-                        && prompt.get(start..snap.rows as usize) == Some(snap.tail.as_slice())
-                        && chosen.is_none_or(|(rows, _)| snap.rows > rows)
-                    {
-                        chosen = Some((snap.rows, snap.id));
-                    }
-                }
-            }
-        }
-        let Some((_, id)) = chosen else {
+        let Some(id) = attach_target(s, &mut inner, prompt, key) else {
             return false;
         };
         let snap = snap_mut(&mut inner, id).expect("found above");
@@ -3805,6 +3789,17 @@ impl PrefixProbe {
                 handle,
                 state: BlockState::Host,
             } => handle,
+            // Blocks spilled with another boundary and shared by this one are host-resident
+            // under a boundary the pool holds on the device: the store restores those too.
+            SnapStore::Blocks {
+                handle,
+                state: BlockState::Device,
+            } => {
+                let hook = inner.block_store.clone().expect("a block snapshot has a store");
+                drop(inner);
+                let _ = hook.restore(handle);
+                return false;
+            }
             _ => return false,
         };
         snap.store = SnapStore::Blocks {
@@ -3845,10 +3840,81 @@ impl PrefixProbe {
         true
     }
 
+    /// The restore of the boundary `prompt` would attach is still in flight: the request is
+    /// better held a few milliseconds at admission than gathered behind the copy in the engine
+    /// stream, where every slot waits with it. Counted in `restore_holds`.
+    pub fn restore_pending(&self, prompt: &[u32], key: Option<&PrefixKey>) -> bool {
+        let s = &self.0;
+        let mut inner = s.inner.lock();
+        if inner.block_store.is_none() {
+            return false;
+        }
+        let Some(id) = attach_target(s, &mut inner, prompt, key) else {
+            return false;
+        };
+        let pending = match snap_ref(&inner, id).map(|x| x.store) {
+            Some(SnapStore::Blocks {
+                state: BlockState::Restoring,
+                ..
+            }) => true,
+            Some(SnapStore::Blocks {
+                handle,
+                state: BlockState::Device,
+            }) => {
+                let hook = inner.block_store.clone().expect("checked above");
+                drop(inner);
+                let pending = hook.restoring(handle);
+                if pending {
+                    s.inner.lock().stats.restore_holds += 1;
+                }
+                return pending;
+            }
+            _ => false,
+        };
+        if pending {
+            inner.stats.restore_holds += 1;
+        }
+        pending
+    }
+
     pub fn key(&self, prompt: &[u32]) -> PrefixKey {
         PrefixKey::new(prompt, self.0.block_rows)
     }
+}
 
+/// The published boundary `prompt` would attach: the longest whose rows the prompt extends.
+fn attach_target(
+    s: &Shared,
+    inner: &mut Inner,
+    prompt: &[u32],
+    key: Option<&PrefixKey>,
+) -> Option<u64> {
+    let hashes = match key {
+        Some(k) if k.fits(s.block_rows, prompt) => k.hashes.clone(),
+        _ => hash_blocks(prompt, s.block_rows),
+    };
+    let aligned = &prompt[..hashes.len() * s.block_rows as usize];
+    let m = inner.cache.lookup(&hashes, aligned);
+    inner.cache.release(&hashes, m.blocks);
+    let mut chosen: Option<(u32, u64)> = None;
+    for blocks in 0..=m.blocks {
+        let node = blocks.checked_sub(1).map(|i| m.placed[i]);
+        let start = blocks * s.block_rows as usize;
+        if let Some(list) = inner.published.get(&node) {
+            for snap in list {
+                if (snap.rows as usize) < prompt.len()
+                    && prompt.get(start..snap.rows as usize) == Some(snap.tail.as_slice())
+                    && chosen.is_none_or(|(rows, _)| snap.rows > rows)
+                {
+                    chosen = Some((snap.rows, snap.id));
+                }
+            }
+        }
+    }
+    chosen.map(|(_, id)| id)
+}
+
+impl PrefixProbe {
     /// The cache generation: rows a probe returned stay right until it moves.
     pub fn generation(&self) -> u64 {
         self.0.cache_gen.load(Ordering::Acquire)
@@ -8585,6 +8651,7 @@ mod tests {
         #[derive(Default)]
         struct RestoreBlocks {
             restores: AtomicU64,
+            in_flight: std::sync::atomic::AtomicBool,
         }
         impl SnapBlocks for RestoreBlocks {
             fn release(&self, _handle: u64) {}
@@ -8594,6 +8661,9 @@ mod tests {
             fn restore(&self, _handle: u64) -> Result<()> {
                 self.restores.fetch_add(1, Ordering::SeqCst);
                 Ok(())
+            }
+            fn restoring(&self, _handle: u64) -> bool {
+                self.in_flight.load(Ordering::SeqCst)
             }
             fn reap(&self) {}
             fn pending_spill_bytes(&self) -> u64 {
@@ -8625,9 +8695,21 @@ mod tests {
             (1, 1, 0)
         );
         assert!(!probe.prefetch(&a, Some(&key)), "on the device already");
+        assert_eq!(
+            hook.restores.load(Ordering::SeqCst),
+            2,
+            "a device boundary's shared host blocks are restored too"
+        );
+        // Admission holds the request while the store reports the restore in flight.
+        assert!(!probe.restore_pending(&a, Some(&key)));
+        hook.in_flight.store(true, Ordering::SeqCst);
+        assert!(probe.restore_pending(&a, Some(&key)));
+        assert!(!probe.restore_pending(&prompt(5), None), "a miss waits for nothing");
+        hook.in_flight.store(false, Ordering::SeqCst);
+        assert_eq!(p.stats().restore_holds, 1);
         let hit = p.try_attach(1, &a).unwrap().expect("hit");
         assert_eq!((hit.rows, hit.blocks), (16, Some(7)));
-        assert_eq!(hook.restores.load(Ordering::SeqCst), 1, "found on the device");
+        assert_eq!(hook.restores.load(Ordering::SeqCst), 2, "found on the device");
         p.finish_attach(1);
         policy::check_tree(&p.shared.inner.lock());
     }

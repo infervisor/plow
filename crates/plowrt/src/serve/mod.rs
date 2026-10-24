@@ -1964,6 +1964,11 @@ async fn metrics_handler(
             "Host to device restores queued by the admission probe ahead of the attach.",
         ),
         (
+            "restore_holds_total",
+            "counter",
+            "Admissions held because the boundary's restore was still in flight.",
+        ),
+        (
             "host_fence_failures_total",
             "counter",
             "Spill copies whose fence failed; both buffers quarantined.",
@@ -2047,6 +2052,7 @@ async fn metrics_handler(
              plowrt_prefix_host_evictions_total{{model=\"{slug}\"}} {}\n\
              plowrt_prefix_host_spill_fallbacks_total{{model=\"{slug}\"}} {}\n\
              plowrt_prefix_host_prefetches_total{{model=\"{slug}\"}} {}\n\
+             plowrt_prefix_restore_holds_total{{model=\"{slug}\"}} {}\n\
              plowrt_prefix_host_fence_failures_total{{model=\"{slug}\"}} {}\n\
              plowrt_prefix_sessions_protected{{model=\"{slug}\"}} {}\n\
              plowrt_prefix_session_demotions_total{{model=\"{slug}\"}} {}\n\
@@ -2097,6 +2103,7 @@ async fn metrics_handler(
             s.host_evictions,
             s.spill_fallbacks,
             s.host_prefetches,
+            s.restore_holds,
             s.spill_fence_failures,
             s.sessions_protected,
             s.session_demotions,
