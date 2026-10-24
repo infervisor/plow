@@ -1,6 +1,6 @@
 # 26 — Prefix cache retention and the KV block store
 
-**Status: design (2026-10-23), reviewed, retention simulated; Part A implemented (A1, A2); B1 and B3 implemented and on by default (exactness gate passed 2026-10-23, replay and Qwen gates below); B2 parked (no AMD box); B4 on CUDA: the snapshot copy path, its pool and pitched knobs and the store switch are gone and `Prefix` blocks hold every full-layer row, so nothing is multi-mapped (replay 7, 2026-10-23: without a host tier the store is above the snapshot path and vLLM 0.29 on hit rate, TTFT and TPOT at 10 s think and 2.3 points under vLLM's hit rate at 45 s think, capacity-bound; with the host tier (replay 10) 71.6 % at 45 s think with lower TTFT and TPOT than vLLM, at 10 s think the tier costs TPOT, B.6a); the AMD snapshot path remains (§5).**
+**Status: design (2026-10-23), reviewed, retention simulated; Part A implemented (A1, A2); B1 and B3 implemented and on by default (exactness gate passed 2026-10-23, replay and Qwen gates below); B2 parked (no AMD box); B4 on CUDA: the snapshot copy path, its pool and pitched knobs and the store switch are gone and `Prefix` blocks hold every full-layer row, so nothing is multi-mapped (replay 7, 2026-10-23: without a host tier the store is above the snapshot path and vLLM 0.29 on hit rate, TTFT and TPOT at 10 s think and 2.3 points under vLLM's hit rate at 45 s think, capacity-bound; with the host tier (replay 15, 2026-10-24) 71.7 % at 45 s think and 78.4 % at 20 s think with lower TTFT and TPOT than vLLM and than the store without the tier at 45 s; at 10 s think the tier still costs TPOT and tails, attributed to a per-tick cost under heavy spilling amplified by the speculation policy, B.6a); the AMD snapshot path remains (§5).**
 Part A says what actually moves the production hit rate and is implementable on today's
 snapshot cache. Part B is the content-addressed block store that replaces the boundary
 snapshots of `docs/arch/22-kv-cache.md` §7–§9 and the AMD `SharedPrefix` with one substrate,
@@ -451,16 +451,65 @@ causes, each attributed from its counters and fixed in turn, with the arm re-run
    unshielded first, and retires completed spills; the publish path's reclaim is the fallback.
    One `shrink` call also releases at most 128 MiB so the store lock is dropped between steps.
 
-Measured on the final build (replay 10, 2026-10-23): at 45 s think the store with the host tier
-hits 71.6 % (vLLM 60.6 %, ideal 73.9 %, the loss being session-end demotion) with TTFT 72/414 ms
-and TPOT 7.2/38.8 ms against vLLM's 147/569 and 13.5/53.0, goodput 100 %: above vLLM on every
-metric at production think times. At 10 s think it hits 79.6 % (no host 78.6 %) but costs TTFT
-69/786 ms and TPOT 17.0/79.8 ms against the no-host arm's 53/358 and 10.1/37.7: a host gather
-drains inside the engine stream (3.9 of 5.3 s of gather time), and the longest shrink stays at
-about 150 ms regardless of the bytes released (the compaction drain and the chunk release run
-under the store lock). Both are the next host-tier items; until then the strict comparison runs
-the store with `PLOW_VMM_HOST_CACHE_MIB=0`, and the tier is the right setting where the think
-time is long enough for the device alone to lose boundaries.
+Replay 10 (2026-10-23) then showed two more costs: a host gather drained inside the engine
+stream (3.9 of 5.3 s of gather time; with the copy kernel no boundary was ever restored, every
+host-resident block was read in place over PCIe), and the longest shrink stayed at about 150 ms
+whatever the bytes released. Fixed on 2026-10-24 (replays 11-15), each attributed from its
+counters:
+
+5. The arrival prefetch (`PrefixProbe::prefetch`, one pool lock per request in the mux) covers
+   store boundaries: the store queues one H2D per host block on a restore stream of its own
+   (`Where::Restoring`, both slots kept until `reap` sees the fence; `restores_total`,
+   `restore_blocks_total`) and a gather of a block still in flight orders the engine stream after
+   the fence (`cuStreamWaitEvent`, `gather_fenced_blocks_total`) instead of blocking the host. A
+   block no device slot can be made for stays on the host and is read in place as before. A held
+   block's fence is not queried until the hold drops: a query that reports done consumes it, and
+   the first build left gathered blocks `Restoring` for good (286 failed admissions in five
+   minutes).
+6. Compaction copies drain on a DtoD stream of their own, not behind the spill backlog, with the
+   store lock held only to plan (a transfer hold on each moving block, destinations taken) and to
+   commit (a block another transfer held meanwhile keeps its slot). Released chunks are freed on a
+   store worker thread: a device free synchronises the context, so each shrink on the engine
+   thread had waited for the spill stream's queued copies; until the free lands the bytes count as
+   coming free (`pending_spill_bytes`). Longest shrink 150 ms → 30 ms, shrink time 1.75 s → 0.24 s
+   per 10 s-think arm.
+7. At 10 s think a request is admitted within milliseconds of arriving, before its restore lands,
+   and a boundary the pool holds on the device shares blocks spilled with another boundary that
+   the pool never asked the store to restore (17k in-place host reads per arm). The prefetch now
+   also runs the store's restore for a device boundary, and admission holds a request up to 50 ms
+   while the store reports its boundary's restore in flight (`restore_holds_total`), so the copy is
+   paid by that request's queueing rather than by every slot in the batch. In-place host reads
+   fell to 2.4k and fence-ordered gathers to 0.9k per arm.
+8. Not the cause, measured and reverted: transparent huge pages for the pinned chunks (6.2 ms per
+   8 MiB against 4.3 ms, the kernel's direct compaction inside the populate, and the compaction
+   stalls reached every thread; TTFT p99 20 s in the last minute). Registration itself is not the
+   lever either: a 16 GB tier finishes growing within two minutes (2.4k chunks, 9 s of
+   registration in total) and degrades exactly like the auto tier.
+
+Measured on the final build (`120a2202`, replay 15): at 45 s think the store with the host tier
+hits 71.7 % (vLLM 60.6 %, no host 58.3 %, ideal 73.9 %) with TTFT 70/376 ms and TPOT 6.5/31.8 ms
+against the no-host arm's 87/401 and 6.3/34.6 and vLLM's 147/569 and 13.5/53.0, goodput 100 %:
+above both on every metric. At 20 s think it hits 78.4 % (no host 71.7 %, vLLM 72.6 %, ideal
+78.5 %) with TTFT 53/446 ms and TPOT 8.1/41.1 ms against vLLM's 100/489 and 12.2/42.1. At 10 s
+think the tier adds one point (79.7 % against 78.6 %) and still costs: TTFT 65/707 ms and TPOT
+16.5/89 ms against the no-host arm's 53/358 and 10.1/37.7 (TTFT p99 was 1070 ms and TPOT p99
+148 ms before items 6-7). The cost is steady state, not the tier's growth: a 15-minute arm holds
+81-83 % with TPOT p50 17-24 ms throughout. Its mechanism, from the per-tick histograms
+(`plowrt_tick_duration_seconds`) and the speculation counters: the tier's tick-time cost is small
+on average (decode ticks +3-6 %, prefill ticks +11 %) but has a tail the no-host arm lacks
+(about 100 decode ticks over 25 ms and 25 over 100 ms per arm against 8 and 0), and the longer
+turns raise the in-flight batch from 7 to 11-14 rows, where the speculation policy's gain falls
+under its margin (drafts fit in the same decode rung) and drafting stops on 20-30 % of decode
+ticks against 1 %: a second, self-sustaining equilibrium. With speculation off on both arms (the
+production setting) the tier's cost is a fifth of that at p50 (TPOT 19.9 against 16.7 ms) but the
+tails remain (TTFT p99 757 against 360 ms, TPOT p99 94 against 42 ms), so a per-tick cost under
+heavy spilling is still there; what it is needs a profiler trace of the engine thread under
+spilling (candidates: the spill-ahead thread's driver calls and 2 ms polling, copy-engine
+contention with the tick's own transfers, the remaining fence-ordered gathers). The strict
+comparison keeps `PLOW_VMM_HOST_CACHE_MIB=0` at its 10 s think; the tier is the right setting
+where the think time is long enough for the device alone to lose boundaries (production's is
+about 45 s). Known teardown message since the prefetch: `cuMemGetInfo` after the context is
+torn down logs "CUDA context poisoned" once at exit.
 
 Recurrent models (B3): the Qwen3.8 packet keeps head-interleaved rows in its full-attention
 caches (the LIVE manifest's `layout`), which the prefix geometry had mapped head-major, so the

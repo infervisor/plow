@@ -44,24 +44,29 @@ Ten-minute production-fidelity replays on gpu03, same stream per arm, sampled de
 | Think median | Arm | Hit rate | TTFT p50/p99 ms | TPOT p50/p99 ms | Goodput |
 |---|---|---:|---:|---:|---:|
 | 10 s, rate 2.7 | store, no host tier (`f7eba863`) | 78.6 % | 53 / 358 | 10.1 / 37.7 | 100 % |
+| 10 s, rate 2.7 | store + host tier (`120a2202`, auto, prefetch restores, admission hold) | 79.7 % | 65 / 707 | 16.5 / 89.2 | 99.5 % |
 | 10 s, rate 2.7 | snapshot path (`a803cf92`, store off) | 74.6 % | 66 / 551 | 13.9 / 46.6 | 100 % |
 | 10 s, rate 2.7 | vLLM 0.29 | 75.6 % | 119 / 592 | 16.9 / 61.6 | |
 | 20 s, rate 1.8 | store, no host tier (`f7eba863`) | 71.7 % | 58 / 317 | 6.0 / 29.5 | 100 % |
+| 20 s, rate 1.8 | store + host tier (`9d8fad4b`, auto) | 78.4 % | 53 / 446 | 8.1 / 41.1 | 100 % |
 | 20 s, rate 1.8 | snapshot path (`a803cf92`, store off) | 67.1 % | 63 / 408 | 6.8 / 33.8 | 100 % |
 | 20 s, rate 1.8 | vLLM 0.29 | 72.6 % | 100 / 489 | 12.2 / 42.1 | 99.6 % |
 | 45 s, rate 1.8 | store, no host tier (`f7eba863`) | 58.3 % | 87 / 401 | 6.3 / 34.6 | 100 % |
-| 45 s, rate 1.8 | store + host tier (`83b0e1c2`, auto 214 GB, session-end demotion) | 71.6 % | 72 / 414 | 7.2 / 38.8 | 100 % |
+| 45 s, rate 1.8 | store + host tier (`120a2202`, auto, session-end demotion) | 71.7 % | 70 / 376 | 6.5 / 31.8 | 100 % |
 | 45 s, rate 1.8 | snapshot path (`a803cf92`, store off) | 48.0 % | | | |
 | 45 s, rate 1.8 | vLLM 0.29 | 60.6 % | 147 / 569 | 13.5 / 53.0 | |
 
 Without a host tier the store is within the ideal's reach at 10 s think (ideal 78.9 %), 7 points
 under it at 20 s (ideal 78.5 %, vLLM 0.9 points ahead) and capacity-bound at 45 s think (the LRU drops boundaries at a
-median age of 45 s, the think-time median). With the host tier it holds 71.6 % against an ideal
-of 73.9 % (the rest is session-end demotion) at lower TTFT and TPOT than vLLM; at 10 s think the
-tier adds nothing to the hit rate (79.6 % vs 78.6 %) and costs TTFT 69/786 ms and TPOT 17.0/79.8
-ms (host gathers drain inside the engine stream), so the strict rows above run without it. The
-recipe keeps the tier at its default; the production setting depends on the deployment's think
-time.
+median age of 45 s, the think-time median). With the host tier it holds 71.7 % against an ideal
+of 73.9 % (the rest is session-end demotion) at 45 s think and 78.4 % at 20 s, with lower TTFT
+and TPOT than vLLM at both and than the store without the tier at 45 s; at 10 s think the tier
+adds one point (79.7 % vs 78.6 %) and costs TTFT 65/707 ms and TPOT 16.5/89 ms (a per-tick cost
+under heavy spilling, amplified by the speculation policy at the larger in-flight batch;
+`docs/arch/26-kv-block-store.md` B.6a), so the strict rows above run without it. The recipe
+keeps the tier at its default (auto); the production setting depends on the deployment's think
+time, and production's is about 45 s. Raw evidence for the tier rows:
+`/home/lava/scratch/kvstore-gates/{r27-15-auto,t20-12-auto,long15-auto-end}`.
 
 ## Strict tables
 
