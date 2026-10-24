@@ -1029,6 +1029,12 @@ impl KvStore {
                     continue;
                 }
             };
+            // A transfer still reads the device copy: keep it until the hold drops. Checked
+            // before the fence is queried, which consumes it.
+            if holds > 0 {
+                inner.spilling.push_back((id, queued));
+                continue;
+            }
             match self.ops.fence_done(fence) {
                 Ok(true) => {}
                 // Copies retire in order: the rest are still in flight.
@@ -1042,11 +1048,6 @@ impl KvStore {
                     inner.stats.fill_failures += 1;
                     continue;
                 }
-            }
-            // A transfer still reads the device copy: keep it until the hold drops.
-            if holds > 0 {
-                inner.spilling.push_back((id, queued));
-                continue;
             }
             inner.spilling_bytes -= queued;
             let bytes = inner.classes[class].spec.block_bytes();
@@ -1080,6 +1081,13 @@ impl KvStore {
                 }) => (*class, *host, *fence, *holds),
                 _ => continue,
             };
+            // A gather may still read the host copy in place (it started before the restore)
+            // or be about to order its stream on this fence: both slots stay and the fence is
+            // not queried (a query consumes it) until the hold drops.
+            if holds > 0 {
+                inner.restoring.push_back(id);
+                continue;
+            }
             match self.ops.fence_done(fence) {
                 Ok(true) => {}
                 Ok(false) => {
@@ -1090,12 +1098,6 @@ impl KvStore {
                     inner.stats.fill_failures += 1;
                     continue;
                 }
-            }
-            // A gather may still read the host copy in place (it started before the restore)
-            // or wait on this fence: both slots stay until the hold drops.
-            if holds > 0 {
-                inner.restoring.push_back(id);
-                continue;
             }
             let bytes = inner.classes[class].spec.block_bytes();
             inner.classes[class].host.put(host);
@@ -1530,6 +1532,8 @@ mod tests {
         dtod: AtomicU64,
         /// Every fence reads as unretired while set.
         pending: std::sync::atomic::AtomicBool,
+        next_fence: AtomicU64,
+        consumed: parking_lot::Mutex<std::collections::HashSet<u64>>,
         /// Runs inside `copy_dtod_batch` (the store lock must be free there).
         on_dtod: parking_lot::Mutex<Option<Box<dyn Fn() + Send>>>,
     }
@@ -1544,6 +1548,8 @@ mod tests {
                 htod_async: AtomicU64::new(0),
                 dtod: AtomicU64::new(0),
                 pending: std::sync::atomic::AtomicBool::new(false),
+                next_fence: AtomicU64::new(100),
+                consumed: parking_lot::Mutex::new(Default::default()),
                 on_dtod: parking_lot::Mutex::new(None),
             })
         }
@@ -1561,10 +1567,18 @@ mod tests {
         }
         fn host_free(&self, _ptr: u64, _bytes: u64) {}
         fn copy_dtoh_async(&self, _host: u64, _va: u64, _bytes: u64) -> Result<u64> {
-            Ok(7)
+            Ok(self.next_fence.fetch_add(1, Ordering::SeqCst))
         }
-        fn fence_done(&self, _fence: u64) -> Result<bool> {
-            Ok(!self.pending.load(Ordering::SeqCst))
+        /// Like the CUDA tier: a retired fence is consumed, a second query of it is an error.
+        fn fence_done(&self, fence: u64) -> Result<bool> {
+            if self.pending.load(Ordering::SeqCst) {
+                return Ok(false);
+            }
+            if self.consumed.lock().insert(fence) {
+                Ok(true)
+            } else {
+                Err(RuntimeError::Device("mock: unknown fence".into()))
+            }
         }
         fn copy_htod(&self, _va: u64, _host: u64, _bytes: u64) -> Result<()> {
             self.htod.fetch_add(1, Ordering::SeqCst);
@@ -1572,7 +1586,7 @@ mod tests {
         }
         fn copy_htod_async(&self, _va: u64, _host: u64, _bytes: u64) -> Result<u64> {
             self.htod_async.fetch_add(1, Ordering::SeqCst);
-            Ok(9)
+            Ok(self.next_fence.fetch_add(1, Ordering::SeqCst))
         }
         fn copy_dtod_batch(&self, copies: &[(u64, u64, u64)]) -> Result<()> {
             self.dtod.fetch_add(copies.len() as u64, Ordering::SeqCst);
@@ -1989,20 +2003,20 @@ mod tests {
         assert!(!s.spill(&[a.id]), "a restoring block is coming to the device");
         s.hold(&[a.id]);
         let src = s.gather_src(a.id).unwrap();
-        assert_eq!(
-            src,
-            Src {
-                va: a.va,
-                from_host: false,
-                fence: Some(9)
-            }
-        );
+        assert_eq!((src.va, src.from_host), (a.va, false));
+        let fence = src.fence.expect("restore in flight");
         assert_eq!(s.stats().host_reads, 0);
         s.reap();
         assert_eq!(s.stats().restores, 0, "fence not retired");
         ops.pending.store(false, Ordering::SeqCst);
         s.reap();
+        s.reap();
         assert_eq!(s.stats().restores, 0, "held: the host copy may still be read in place");
+        assert!(
+            !ops.consumed.lock().contains(&fence),
+            "the fence stays for the gather's stream wait while the block is held"
+        );
+        assert_eq!(s.gather_src(a.id).unwrap().fence, Some(fence));
         s.unhold(&[a.id]);
         s.reap();
         let st = s.stats();
