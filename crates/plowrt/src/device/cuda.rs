@@ -2323,24 +2323,63 @@ impl crate::memory::vmm::VmmOps for CudaBackend {
     /// faulting (page reclaim, zeroing) under the driver lock, and one 8 MiB chunk took up to
     /// 247 ms on a box whose page cache had to give way while every CUDA call of the engine
     /// thread waited behind it.
+    /// A chunk is a 2 MiB-aligned anonymous mapping populated with transparent huge pages
+    /// where the kernel grants them, registered after: `cuMemHostRegister` pins page by page
+    /// under the driver lock, and with 4 KiB pages an 8 MiB chunk took 4 ms there while the
+    /// engine thread's launches waited (the tier grows by tens of GB in its first minutes).
     fn host_tier_alloc(&self, bytes: u64) -> Result<u64> {
+        const HUGE: usize = 2 << 20;
         let len = bytes as usize;
+        let span = len + HUGE;
         // SAFETY: a fresh anonymous private mapping; MAP_FAILED is checked.
-        let p = unsafe {
+        let raw = unsafe {
             libc::mmap(
                 std::ptr::null_mut(),
-                len,
+                span,
                 libc::PROT_READ | libc::PROT_WRITE,
-                libc::MAP_PRIVATE | libc::MAP_ANONYMOUS | libc::MAP_POPULATE,
+                libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
                 -1,
                 0,
             )
         };
-        if p == libc::MAP_FAILED {
+        if raw == libc::MAP_FAILED {
             return Err(RuntimeError::Oom(format!(
                 "vmm host tier: mmap({bytes}): {}",
                 std::io::Error::last_os_error()
             )));
+        }
+        let base = (raw as usize + HUGE - 1) & !(HUGE - 1);
+        let p = base as *mut c_void;
+        // SAFETY: the slack on both sides of the aligned chunk is inside the mapping and is
+        // unmapped exactly once, so `host_tier_free` unmaps `[p, p + len)` alone.
+        unsafe {
+            if base > raw as usize {
+                libc::munmap(raw, base - raw as usize);
+            }
+            let end = raw as usize + span;
+            if end > base + len {
+                libc::munmap((base + len) as *mut c_void, end - (base + len));
+            }
+            // Best effort: without huge pages the chunk is still correct, only slower to pin.
+            libc::madvise(p, len, libc::MADV_HUGEPAGE);
+        }
+        // SAFETY: `p..p+len` is mapped read-write; populated here so the registration below
+        // pins resident pages (an older kernel without MADV_POPULATE_WRITE touches them).
+        let populated = unsafe { libc::madvise(p, len, libc::MADV_POPULATE_WRITE) };
+        if populated != 0 {
+            let err = std::io::Error::last_os_error();
+            if err.raw_os_error() == Some(libc::EINVAL) {
+                for off in (0..len).step_by(4096) {
+                    // SAFETY: inside the mapping.
+                    unsafe { std::ptr::write_volatile((base + off) as *mut u8, 0) };
+                }
+            } else {
+                // SAFETY: mapped above, unmapped once here.
+                unsafe { libc::munmap(p, len) };
+                return Err(RuntimeError::Oom(format!(
+                    "vmm host tier: populate({bytes}): {err}"
+                )));
+            }
         }
         // SAFETY: `p` is the `len`-byte mapping above; on every error path it is unmapped once.
         let registered = self.bind().and_then(|()| {
