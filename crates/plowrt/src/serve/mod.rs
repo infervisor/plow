@@ -15,6 +15,8 @@ pub mod dp;
 /// the seam that lets `serve` stop being CUDA-only.
 #[cfg(any(feature = "cuda", feature = "hsa", feature = "cpu"))]
 pub mod engine;
+#[cfg(test)]
+mod golden_tests;
 /// The CPU prefill-head pool: the twin packet and the cores reserved for it.
 // Allowed dead until the mux drives it.
 #[cfg(feature = "cpu")]
