@@ -12,7 +12,7 @@ schema = "plow.recipe.v1"
 namespace = "infervisor"
 name = "gemma-4-e4b"
 label = "sm90a-h100-tp1"
-plow_git = "1972fa37ac7a6f632cd5ece0b32fe37ab76eec75"
+plow_git = "687b6c845598fc66347019b7a82fe8b497a2626c"
 network = "gemma4"
 doc = "docs/runtime/gemma4-e4b-h100.md"
 tracker = "docs/runtime/h100-speech-recipes.md"
@@ -115,6 +115,13 @@ kind = "chat"
 # transformers. Measured at 820aa3ba: top1 0.9867 (371/376), KL mean 7.1e-4, max 1.6e-2.
 # 15925e5b + request cap 2048: top1 0.9845 (381/387), KL mean 7.4e-4, max 1.4e-2. One load in two
 # (shipped main bundle too) ends cmpl0 at 18 tokens: 0.9795 (334/341), load-to-load variance.
+# 2026-10-25 (plow_git above, KV block store + host tier armed): re-emit ab2afc639357 of this recipe
+# top1 0.9948, KL mean 7.5e-4, max 1.5e-2. The same packet failed on the runtime before that commit
+# (top1 0.9754, KL mean 0.0546, max 7.22; only the first generated token wrong): cuBLASLt decode from
+# 1 row leaves no native decode rung, so the kv-shared tail runs on the prefill-bucket path, which
+# uploaded the chain's request table but not the attention's; the sampled row attended over the
+# first prompt token alone. The shipped kit packet (cuBLASLt from 48 rows, no generated roles)
+# never took that path: its vendor attention object disables the tail route.
 [gates]
 python = "{env:PYREF}"
 [gates.llm_logit_parity]
