@@ -503,7 +503,8 @@ impl KvStore {
     /// From now on `shrink` queues released chunks for [`Self::free_step`] instead of freeing
     /// them on the caller's thread.
     pub fn defer_frees(&self) {
-        self.deferred.store(true, std::sync::atomic::Ordering::Release);
+        self.deferred
+            .store(true, std::sync::atomic::Ordering::Release);
     }
 
     /// One step of the free worker: free every queued chunk. `false` = nothing queued.
@@ -514,7 +515,8 @@ impl KvStore {
         }
         for (va, bytes) in queued {
             self.ops.free(va);
-            self.pending_free_bytes.fetch_sub(bytes, std::sync::atomic::Ordering::AcqRel);
+            self.pending_free_bytes
+                .fetch_sub(bytes, std::sync::atomic::Ordering::AcqRel);
         }
         true
     }
@@ -525,7 +527,8 @@ impl KvStore {
         }
         if self.deferred.load(std::sync::atomic::Ordering::Acquire) {
             let bytes: u64 = frees.iter().map(|&(_, b)| b).sum();
-            self.pending_free_bytes.fetch_add(bytes, std::sync::atomic::Ordering::AcqRel);
+            self.pending_free_bytes
+                .fetch_add(bytes, std::sync::atomic::Ordering::AcqRel);
             self.frees.lock().append(frees);
         } else {
             for (va, _) in frees.drain(..) {
@@ -552,12 +555,14 @@ impl KvStore {
             // of the publish's launch), never copied back: the host slot goes.
             // A held host block is being read in place (a gather in flight): it stays where it
             // is and the publish takes it as present.
-            let (refill, held_host) =
-                match inner.blocks[id as usize].as_ref().map(|b| (b.place, b.holds)) {
-                    Some((Where::Host(h), 0)) => (Some(h), None),
-                    Some((Where::Host(h), _)) => (None, Some(h)),
-                    _ => (None, None),
-                };
+            let (refill, held_host) = match inner.blocks[id as usize]
+                .as_ref()
+                .map(|b| (b.place, b.holds))
+            {
+                Some((Where::Host(h), 0)) => (Some(h), None),
+                Some((Where::Host(h), _)) => (None, Some(h)),
+                _ => (None, None),
+            };
             let va = match (refill, held_host) {
                 (None, Some(h)) => inner.classes[class].host.va(h),
                 (Some(h), _) => {
@@ -591,7 +596,11 @@ impl KvStore {
                 return Ok(Acquire { id, va, fill: true });
             }
             inner.stats.dedup_hits += 1;
-            return Ok(Acquire { id, va, fill: false });
+            return Ok(Acquire {
+                id,
+                va,
+                fill: false,
+            });
         }
         let slot = self.device_slot(&mut inner, class)?;
         let va = inner.classes[class].device.va(slot);
@@ -639,7 +648,9 @@ impl KvStore {
     }
 
     pub fn state(&self, id: BlockId) -> Option<State> {
-        self.inner.lock().blocks[id as usize].as_ref().map(|b| b.state)
+        self.inner.lock().blocks[id as usize]
+            .as_ref()
+            .map(|b| b.state)
     }
 
     /// Drop one dependency each; a block with none left goes to the reclaim list (its bytes
@@ -836,7 +847,11 @@ impl KvStore {
     /// reclaiming the oldest zero-dependent, unheld, settled block of the class.
     fn device_slot(&self, inner: &mut Inner, class: usize) -> Result<u32> {
         let ops = &self.ops;
-        let reserved: u64 = inner.classes.iter().map(|c| c.device.reserved_bytes()).sum();
+        let reserved: u64 = inner
+            .classes
+            .iter()
+            .map(|c| c.device.reserved_bytes())
+            .sum();
         let mut budget = inner.device_cap.saturating_sub(reserved);
         if budget > 0
             && !inner.classes[class].device.has_free()
@@ -845,7 +860,11 @@ impl KvStore {
         {
             let chunk = inner.classes[class].device.chunk_bytes();
             if let Some(free) = ops.free_bytes() {
-                if free < chunk.saturating_mul(DEVICE_FLOOR_EVERY).saturating_add(inner.device_floor) {
+                if free
+                    < chunk
+                        .saturating_mul(DEVICE_FLOOR_EVERY)
+                        .saturating_add(inner.device_floor)
+                {
                     budget = 0;
                 }
             }
@@ -1002,7 +1021,11 @@ impl KvStore {
             match self.ops.copy_dtoh_async(host, va, bytes) {
                 Ok(fence) => {
                     let b = inner.blocks[id as usize].as_mut().expect("block");
-                    b.place = Where::Spilling { dev, host: h, fence };
+                    b.place = Where::Spilling {
+                        dev,
+                        host: h,
+                        fence,
+                    };
                     inner.spilling.push_back((id, bytes));
                     inner.spilling_bytes += bytes;
                     inner.stats.spills += 1;
@@ -1021,7 +1044,11 @@ impl KvStore {
         // Spares are already paid for against the cap: only live chunks count here.
         let reserved: u64 = inner.classes.iter().map(|c| c.host.reserved_bytes()).sum();
         let budget = inner.host_cap.saturating_sub(reserved);
-        let Inner { classes, host_spare, .. } = inner;
+        let Inner {
+            classes,
+            host_spare,
+            ..
+        } = inner;
         let spare = &mut host_spare[class];
         // Growth takes a chunk the grower allocated ahead; none ready = no growth now, the
         // slot comes from a reclaim below or the block stays on the device.
@@ -1236,15 +1263,17 @@ impl KvStore {
                     break;
                 }
                 let ids = inner.classes[ci].device.occupants(chunk);
-                let reclaimable = ids.iter().all(|&id| match inner.blocks[id as usize].as_ref() {
-                    Some(b) => {
-                        b.dependents == 0
-                            && b.holds == 0
-                            && b.state != State::Filling
-                            && matches!(b.place, Where::Device(_))
-                    }
-                    None => true,
-                });
+                let reclaimable = ids
+                    .iter()
+                    .all(|&id| match inner.blocks[id as usize].as_ref() {
+                        Some(b) => {
+                            b.dependents == 0
+                                && b.holds == 0
+                                && b.state != State::Filling
+                                && matches!(b.place, Where::Device(_))
+                        }
+                        None => true,
+                    });
                 if !reclaimable {
                     continue;
                 }
@@ -1282,7 +1311,8 @@ impl KvStore {
                         _ => {}
                     }
                 }
-                let mut deficit = live.saturating_sub(inner.classes[ci].device.holes_outside(chunk));
+                let mut deficit =
+                    live.saturating_sub(inner.classes[ci].device.holes_outside(chunk));
                 if deficit > 0 {
                     let mut requeue = Vec::new();
                     while deficit > 0 {
@@ -1486,7 +1516,10 @@ impl KvStore {
     /// Bytes of D2H copies in flight: device memory the pool may count as coming free.
     /// Device bytes coming free: spills in flight and released chunks the worker has not freed.
     pub fn pending_spill_bytes(&self) -> u64 {
-        self.inner.lock().spilling_bytes + self.pending_free_bytes.load(std::sync::atomic::Ordering::Acquire)
+        self.inner.lock().spilling_bytes
+            + self
+                .pending_free_bytes
+                .load(std::sync::atomic::Ordering::Acquire)
     }
 
     /// Device bytes the store leaves free (see `Inner::device_floor`).
@@ -1502,7 +1535,11 @@ impl KvStore {
     pub fn stats(&self) -> StoreStats {
         let inner = self.inner.lock();
         let mut s = inner.stats.clone();
-        s.device_reserved_bytes = inner.classes.iter().map(|c| c.device.reserved_bytes()).sum();
+        s.device_reserved_bytes = inner
+            .classes
+            .iter()
+            .map(|c| c.device.reserved_bytes())
+            .sum();
         s
     }
 
@@ -1514,7 +1551,11 @@ impl KvStore {
     /// Device bytes the store's slabs occupy, used or not: what it took from free memory.
     pub fn device_reserved_bytes(&self) -> u64 {
         let inner = self.inner.lock();
-        inner.classes.iter().map(|c| c.device.reserved_bytes()).sum()
+        inner
+            .classes
+            .iter()
+            .map(|c| c.device.reserved_bytes())
+            .sum()
     }
 
     /// Device bytes acquires can take without a boundary being evicted: free slots of the
@@ -1527,7 +1568,11 @@ impl KvStore {
             let slot = class.spec.block_bytes();
             bytes += (class.device.free_slots + inner.reclaim[c].len() as u64) * slot;
         }
-        let reserved: u64 = inner.classes.iter().map(|c| c.device.reserved_bytes()).sum();
+        let reserved: u64 = inner
+            .classes
+            .iter()
+            .map(|c| c.device.reserved_bytes())
+            .sum();
         let growth = inner.device_cap.saturating_sub(reserved);
         let chunk = inner.classes.first().map_or(0, |c| c.device.chunk_bytes());
         let room = match self.ops.free_bytes() {
@@ -1566,7 +1611,11 @@ impl Drop for KvStore {
 /// Chained 64-bit hashes of `tokens` per `rows` rows: entry `i` covers `tokens[..(i+1)*rows]`,
 /// hashed with `H` from `seed`. The key's `chain` and `check` use two unrelated hash
 /// functions (`FxHasher` and SipHash), not two seeds of one.
-pub fn chain_hashes<H: std::hash::Hasher + Default>(tokens: &[u32], rows: u32, seed: u64) -> Vec<u64> {
+pub fn chain_hashes<H: std::hash::Hasher + Default>(
+    tokens: &[u32],
+    rows: u32,
+    seed: u64,
+) -> Vec<u64> {
     let rows = rows.max(1) as usize;
     let mut out = Vec::with_capacity(tokens.len() / rows);
     let mut prev = seed;
@@ -1789,7 +1838,10 @@ mod tests {
         let again = s.acquire(0, key(1)).unwrap();
         assert!(again.fill, "refilled on the device, not restored");
         assert_eq!(ops.htod.load(Ordering::SeqCst), 0);
-        assert_eq!((s.stats().refills, s.stats().classes[0].host_blocks), (1, 0));
+        assert_eq!(
+            (s.stats().refills, s.stats().classes[0].host_blocks),
+            (1, 0)
+        );
         assert_eq!(s.location(a.id), Some(Location::Device(again.va)));
         // A gather (`ensure_device`) is the restore.
         s.seal(again.id);
@@ -1808,7 +1860,10 @@ mod tests {
         let (ops, s) = store(32, 64);
         let a = s.acquire(0, key(1)).unwrap();
         s.seal(a.id);
-        assert!(s.spill(&[a.id]), "dependents do not pin a block to the device");
+        assert!(
+            s.spill(&[a.id]),
+            "dependents do not pin a block to the device"
+        );
         s.reap();
         assert_eq!(s.location(a.id), Some(Location::Host));
         let va = s.ensure_device(a.id).unwrap();
@@ -1853,7 +1908,11 @@ mod tests {
         assert_eq!(s.location(a.id), Some(Location::Host));
         assert!(s.spill(&[b.id]), "a's host slot is reclaimed, not refused");
         s.reap();
-        assert_eq!(s.location(a.id), None, "the oldest zero-dependent host block gave way");
+        assert_eq!(
+            s.location(a.id),
+            None,
+            "the oldest zero-dependent host block gave way"
+        );
         assert_eq!(s.location(b.id), Some(Location::Host));
         assert_eq!(s.stats().classes[0].host_blocks, 1);
         assert_eq!(ops.host_alloc.load(Ordering::SeqCst), 32, "no second chunk");
@@ -1867,9 +1926,17 @@ mod tests {
         s.seal(a.id);
         assert_eq!(s.device_headroom_bytes(), 3 * 32, "one block live");
         s.release(&[a.id]);
-        assert_eq!(s.device_headroom_bytes(), 4 * 32, "released: reclaimable again");
+        assert_eq!(
+            s.device_headroom_bytes(),
+            4 * 32,
+            "released: reclaimable again"
+        );
         s.set_device_cap(32);
-        assert_eq!(s.device_headroom_bytes(), 32, "no growth under the cap, one reclaimable");
+        assert_eq!(
+            s.device_headroom_bytes(),
+            32,
+            "no growth under the cap, one reclaimable"
+        );
     }
 
     #[test]
@@ -1895,7 +1962,11 @@ mod tests {
         assert!(s.spill(&[a.id]));
         s.hold(&[a.id]);
         s.reap();
-        assert_eq!(s.location(a.id), Some(Location::Device(a.va)), "held: not retired");
+        assert_eq!(
+            s.location(a.id),
+            Some(Location::Device(a.va)),
+            "held: not retired"
+        );
         assert!(s.acquire(0, key(2)).is_err(), "its device slot is not free");
         s.unhold(&[a.id]);
         s.reap();
@@ -1936,7 +2007,11 @@ mod tests {
         for &id in &ids {
             s.seal(id);
         }
-        assert_eq!(s.device_bytes(), 2 * 64, "chunk 0 = blocks 1,2; chunk 1 = blocks 3,4");
+        assert_eq!(
+            s.device_bytes(),
+            2 * 64,
+            "chunk 0 = blocks 1,2; chunk 1 = blocks 3,4"
+        );
         // A dead block in each chunk: compaction packs the two live ones into one chunk.
         s.release(&ids[1..3]);
         assert_eq!(s.shrink(64), 64);
@@ -1946,7 +2021,11 @@ mod tests {
         let e = s.acquire(0, key(5)).unwrap();
         assert!(e.fill);
         assert_eq!(s.device_bytes(), 64 + 32);
-        assert_eq!(s.shrink(64), 0, "every block is referenced: nothing to release");
+        assert_eq!(
+            s.shrink(64),
+            0,
+            "every block is referenced: nothing to release"
+        );
         // Block 4 dies: its slot takes block 5, the sparse chunk goes back.
         s.release(&ids[3..]);
         assert_eq!(s.shrink(64), 64);
@@ -1978,14 +2057,22 @@ mod tests {
             s.release(&[ids[2 * c + 1]]);
         }
         s.release(&[ids[78]]);
-        assert_eq!(s.shrink(64), 64, "the last chunk is the only releasable one");
+        assert_eq!(
+            s.shrink(64),
+            64,
+            "the last chunk is the only releasable one"
+        );
         assert_eq!(s.device_bytes(), 39 * 64);
         // Growth reuses the released chunk index: no new metadata.
         let before = s.inner.lock().classes[0].device.chunks.len();
         let n = s.acquire(0, key(100)).unwrap();
         assert!(n.fill);
         assert_eq!(s.inner.lock().classes[0].device.chunks.len(), before);
-        assert_eq!(s.device_bytes(), 40 * 64 - 32, "one slot of the regrown chunk is free");
+        assert_eq!(
+            s.device_bytes(),
+            40 * 64 - 32,
+            "one slot of the regrown chunk is free"
+        );
     }
 
     #[test]
@@ -2031,10 +2118,18 @@ mod tests {
         assert!(s.spill(&[a.id]));
         s.reap();
         s.hold(&[a.id]);
-        let Src { va, from_host, fence } = s.gather_src(a.id).unwrap();
+        let Src {
+            va,
+            from_host,
+            fence,
+        } = s.gather_src(a.id).unwrap();
         assert!(from_host && fence.is_none());
         assert_eq!(ops.htod.load(Ordering::SeqCst), 0, "nothing copied back");
-        assert_eq!(s.location(a.id), Some(Location::Host), "the block stays on the host");
+        assert_eq!(
+            s.location(a.id),
+            Some(Location::Host),
+            "the block stays on the host"
+        );
         assert_eq!(s.stats().host_reads, 1);
         // While the gather reads it, a publish meeting the block takes it as present and
         // a spill of another block cannot take its host slot.
@@ -2063,12 +2158,22 @@ mod tests {
         ops.pending.store(true, Ordering::SeqCst);
         assert!(s.restore_async(a.id).unwrap(), "queued");
         assert_eq!(
-            (ops.htod_async.load(Ordering::SeqCst), ops.htod.load(Ordering::SeqCst)),
+            (
+                ops.htod_async.load(Ordering::SeqCst),
+                ops.htod.load(Ordering::SeqCst)
+            ),
             (1, 0)
         );
         assert_eq!(s.location(a.id), Some(Location::Device(a.va)));
-        assert_eq!(s.stats().classes[0].host_blocks, 1, "the host slot stays until the fence");
-        assert!(!s.spill(&[a.id]), "a restoring block is coming to the device");
+        assert_eq!(
+            s.stats().classes[0].host_blocks,
+            1,
+            "the host slot stays until the fence"
+        );
+        assert!(
+            !s.spill(&[a.id]),
+            "a restoring block is coming to the device"
+        );
         s.hold(&[a.id]);
         let src = s.gather_src(a.id).unwrap();
         assert_eq!((src.va, src.from_host), (a.va, false));
@@ -2079,23 +2184,38 @@ mod tests {
         ops.pending.store(false, Ordering::SeqCst);
         s.reap();
         s.reap();
-        assert_eq!(s.stats().restores, 0, "held: the host copy may still be read in place");
+        assert_eq!(
+            s.stats().restores,
+            0,
+            "held: the host copy may still be read in place"
+        );
         assert!(
             !ops.consumed.lock().contains(&fence),
             "the fence stays for the gather's stream wait while the block is held"
         );
         assert_eq!(s.gather_src(a.id).unwrap().fence, Some(fence));
-        assert!(s.restoring_any(&[a.id]), "held: still in flight for admission");
+        assert!(
+            s.restoring_any(&[a.id]),
+            "held: still in flight for admission"
+        );
         s.unhold(&[a.id]);
         assert!(!s.restoring_any(&[a.id]), "retired by the query itself");
         s.reap();
         let st = s.stats();
         assert_eq!(
-            (st.restores, st.classes[0].host_blocks, st.classes[0].device_blocks),
+            (
+                st.restores,
+                st.classes[0].host_blocks,
+                st.classes[0].device_blocks
+            ),
             (1, 0, 1)
         );
         assert_eq!(s.gather_src(a.id).unwrap().fence, None);
-        assert_eq!(s.restore_async(a.id).unwrap(), false, "on the device: nothing to do");
+        assert_eq!(
+            s.restore_async(a.id).unwrap(),
+            false,
+            "on the device: nothing to do"
+        );
         assert_eq!(ops.htod_async.load(Ordering::SeqCst), 1);
         // The restored block is reclaimable again (zero dependents): its slot goes next.
         let b = s.acquire(0, key(2)).unwrap();
@@ -2130,14 +2250,25 @@ mod tests {
         s.release(&[a.id, b.id]);
         s.defer_frees();
         assert_eq!(s.shrink(32), 32);
-        assert_eq!(ops.freed.load(Ordering::SeqCst), 0, "not freed on the caller's thread");
+        assert_eq!(
+            ops.freed.load(Ordering::SeqCst),
+            0,
+            "not freed on the caller's thread"
+        );
         assert_eq!(s.pending_spill_bytes(), 32);
         assert!(s.free_step());
-        assert_eq!((ops.freed.load(Ordering::SeqCst), s.pending_spill_bytes()), (1, 0));
+        assert_eq!(
+            (ops.freed.load(Ordering::SeqCst), s.pending_spill_bytes()),
+            (1, 0)
+        );
         assert!(!s.free_step(), "nothing queued");
         assert_eq!(s.shrink(32), 32, "the second chunk goes the same way");
         drop(s);
-        assert_eq!(ops.freed.load(Ordering::SeqCst), 2, "a queued free is run at teardown");
+        assert_eq!(
+            ops.freed.load(Ordering::SeqCst),
+            2,
+            "a queued free is run at teardown"
+        );
     }
 
     /// The compaction copies run with the store lock released; a block a gather holds
@@ -2169,16 +2300,30 @@ mod tests {
         *ops.on_dtod.lock() = Some(Box::new(move || held.hold(&[moving])));
         let before = s.location(moving);
         assert_eq!(s.shrink(64), 0, "the move was abandoned: nothing released");
-        assert_eq!(ops.dtod.load(Ordering::SeqCst), 1, "the copy ran (lock free)");
+        assert_eq!(
+            ops.dtod.load(Ordering::SeqCst),
+            1,
+            "the copy ran (lock free)"
+        );
         assert_eq!(s.location(moving), before, "block 1 stays in its slot");
         assert_eq!(s.stats().compactions, 0);
         *ops.on_dtod.lock() = None;
         s.unhold(&[moving]);
-        assert_eq!(s.shrink(64), 64, "the next step compacts the two live blocks");
+        assert_eq!(
+            s.shrink(64),
+            64,
+            "the next step compacts the two live blocks"
+        );
         let st = s.stats();
         assert_eq!((st.compactions, st.device_reserved_bytes), (1, 64));
-        assert!(!s.acquire(0, key(1)).unwrap().fill, "block 1 is still present");
-        assert!(!s.acquire(0, key(4)).unwrap().fill, "block 4 is still present");
+        assert!(
+            !s.acquire(0, key(1)).unwrap().fill,
+            "block 1 is still present"
+        );
+        assert!(
+            !s.acquire(0, key(4)).unwrap().fill,
+            "block 4 is still present"
+        );
     }
 
     #[test]
@@ -2202,13 +2347,23 @@ mod tests {
             s.seal(id);
         }
         s.release(&ids[1..3]);
-        assert_eq!(s.shrink(64), 64, "block 4 moved into chunk 0's hole, chunk 1 released");
+        assert_eq!(
+            s.shrink(64),
+            64,
+            "block 4 moved into chunk 0's hole, chunk 1 released"
+        );
         assert_eq!(ops.dtod.load(Ordering::SeqCst), 1);
         let st = s.stats();
-        assert_eq!((st.compactions, st.compact_bytes, st.device_reserved_bytes), (1, 32, 64));
+        assert_eq!(
+            (st.compactions, st.compact_bytes, st.device_reserved_bytes),
+            (1, 32, 64)
+        );
         assert_eq!(s.device_bytes(), 64, "blocks 1 and 4 remain, packed");
         assert!(matches!(s.location(ids[3]), Some(Location::Device(_))));
-        assert!(!s.acquire(0, key(4)).unwrap().fill, "block 4 is still present");
+        assert!(
+            !s.acquire(0, key(4)).unwrap().fill,
+            "block 4 is still present"
+        );
         // A held block pins its chunk: nothing to release.
         s.hold(&[ids[0]]);
         s.release(&[ids[3]]);

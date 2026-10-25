@@ -303,7 +303,9 @@ impl GpuEngine {
                     .iter()
                     .any(|&l| find(&format!("kv.{l}.k_scale")).is_some())
                 {
-                    tracing::warn!("vmm off: head-interleaved fp8 full-layer scales are not laid out");
+                    tracing::warn!(
+                        "vmm off: head-interleaved fp8 full-layer scales are not laid out"
+                    );
                     return None;
                 }
                 geo.hd_full *= geo.kvh_full;
@@ -522,40 +524,40 @@ impl GpuEngine {
         ) {
             Ok(mut kv) => {
                 let mut serve = VmmServe {
-                rings,
-                tensor_tracks: blob
-                    .tensors
-                    .iter()
-                    .enumerate()
-                    .filter_map(|(id, tensor)| {
-                        let (layer, which) = kv_tensor_name(&tensor.name)?;
-                        kv.tensor_va(layer, which).map(|_| (id, layer, which))
-                    })
-                    .collect(),
-                cache_tensors: Vec::new(),
-                kv: Some({
-                    kv.enable_block_pool(crate::memory::vmm::kv_pool_cap());
-                    if rt.vmm_deferred_reclaim() {
-                        kv.enable_deferred_reclaim();
-                        if rt.vmm_stale_reserve() {
-                            kv.enable_stale_reserve();
+                    rings,
+                    tensor_tracks: blob
+                        .tensors
+                        .iter()
+                        .enumerate()
+                        .filter_map(|(id, tensor)| {
+                            let (layer, which) = kv_tensor_name(&tensor.name)?;
+                            kv.tensor_va(layer, which).map(|_| (id, layer, which))
+                        })
+                        .collect(),
+                    cache_tensors: Vec::new(),
+                    kv: Some({
+                        kv.enable_block_pool(crate::memory::vmm::kv_pool_cap());
+                        if rt.vmm_deferred_reclaim() {
+                            kv.enable_deferred_reclaim();
+                            if rt.vmm_stale_reserve() {
+                                kv.enable_stale_reserve();
+                            }
                         }
-                    }
-                    if rt.vmm_publish_shared() {
-                        kv.enable_shared_publish();
-                    }
-                    // FP8 full-layer scales snapshot over `[0, p_a)`, not just the tail.
-                    if !full_scale.is_empty() && rt.vmm_strict_publish() {
-                        kv.enable_strict_publish();
-                    }
-                    kv
-                }),
-                slide,
-                slide_scale,
-                full_scale,
-                ring,
-                snap_row_bytes,
-                blocks: None,
+                        if rt.vmm_publish_shared() {
+                            kv.enable_shared_publish();
+                        }
+                        // FP8 full-layer scales snapshot over `[0, p_a)`, not just the tail.
+                        if !full_scale.is_empty() && rt.vmm_strict_publish() {
+                            kv.enable_strict_publish();
+                        }
+                        kv
+                    }),
+                    slide,
+                    slide_scale,
+                    full_scale,
+                    ring,
+                    snap_row_bytes,
+                    blocks: None,
                 };
                 if serve.prefix_kv().is_some() {
                     // Host tier: what the host-reserve rule allows now, unless the knob names
@@ -568,7 +570,11 @@ impl GpuEngine {
                     match super::kv_blocks::BlockServe::new(
                         be,
                         &serve,
-                        if cache_cap > 0 { cache_cap } else { device_bytes / 4 },
+                        if cache_cap > 0 {
+                            cache_cap
+                        } else {
+                            device_bytes / 4
+                        },
                         host_cap,
                         state_tensors,
                     ) {
@@ -742,7 +748,12 @@ impl GpuEngine {
         Ok(self.pos[b] as usize)
     }
 
-    pub(super) fn publish_boundary(&self, b: usize, p_a: u32, kind: crate::memory::vmm::Kind) -> bool {
+    pub(super) fn publish_boundary(
+        &self,
+        b: usize,
+        p_a: u32,
+        kind: crate::memory::vmm::Kind,
+    ) -> bool {
         let Some((v, kv)) = self.vmm_prefix() else {
             return false;
         };

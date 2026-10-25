@@ -166,10 +166,13 @@ impl BlockServe {
         }
         // Every segment is a whole run of 32 (or `block_rows`) rows of one head: 16-byte
         // vectors need those runs 16-byte sized.
-        let vector_ok = [ROWS_PER_BLOCK as u64 * hd_slide, ROWS_PER_BLOCK as u64 * hd_full]
-            .iter()
-            .chain(state_tensors.iter().map(|(_, bytes)| bytes))
-            .all(|b| b % 16 == 0);
+        let vector_ok = [
+            ROWS_PER_BLOCK as u64 * hd_slide,
+            ROWS_PER_BLOCK as u64 * hd_full,
+        ]
+        .iter()
+        .chain(state_tensors.iter().map(|(_, bytes)| bytes))
+        .all(|b| b % 16 == 0);
         let kernel = if vector_ok {
             match Self::load_kernel(be) {
                 Ok(f) => Some(f),
@@ -427,8 +430,11 @@ impl GpuEngine {
         let bs = v.blocks.as_ref().expect("block publish without store");
         let toks = &self.seq_tokens[b][..p_a as usize];
         let chain = chain_hashes::<rustc_hash::FxHasher>(toks, ROWS_PER_BLOCK, SEED_CHAIN);
-        let check =
-            chain_hashes::<std::collections::hash_map::DefaultHasher>(toks, ROWS_PER_BLOCK, SEED_CHECK);
+        let check = chain_hashes::<std::collections::hash_map::DefaultHasher>(
+            toks,
+            ROWS_PER_BLOCK,
+            SEED_CHECK,
+        );
         let plan = bs.plan(p_a, kv.geometry().window);
         let mut handle: Handle = Vec::with_capacity(plan.len());
         let mut fills: Vec<BlockId> = Vec::new();
@@ -452,10 +458,11 @@ impl GpuEngine {
                 match bs.store.acquire(ci, key) {
                     Ok(a) => break a,
                     // Retired spills free device slots; else the pool gives up a boundary.
-                    Err(RuntimeError::Oom(_)) if {
-                        bs.store.reap();
-                        kv.reclaim_one()
-                    } =>
+                    Err(RuntimeError::Oom(_))
+                        if {
+                            bs.store.reap();
+                            kv.reclaim_one()
+                        } =>
                     {
                         continue
                     }
@@ -584,7 +591,9 @@ impl GpuEngine {
         to_block: bool,
         out: &mut Vec<Seg>,
     ) {
-        let (v, kv) = self.vmm_prefix().expect("block segments without prefix vmm");
+        let (v, kv) = self
+            .vmm_prefix()
+            .expect("block segments without prefix vmm");
         let g = kv.geometry();
         let mut off = va;
         let mut seg = |dev: u64, bytes: u64| {
@@ -666,7 +675,13 @@ impl GpuEngine {
     /// its state can be captured there (`State` blocks hold the state after the boundary's
     /// rows, nothing else). Returns the chunk cap to use; `cap` when no alignment applies
     /// (no state class, boundary passed, or fewer rows left to it than the smallest bucket).
-    pub(super) fn state_capture_cap(&self, b: usize, prompt: &[u32], c0: usize, cap: usize) -> usize {
+    pub(super) fn state_capture_cap(
+        &self,
+        b: usize,
+        prompt: &[u32],
+        c0: usize,
+        cap: usize,
+    ) -> usize {
         let cut = self.state_capture_cut(b, prompt.len(), c0);
         let smallest = self.prefill.first().map_or(usize::MAX, |p| p.t as usize);
         if cut < smallest {
@@ -730,7 +745,9 @@ impl GpuEngine {
             Some(t) if t.cap >= segs.len() => t,
             _ => {
                 let cap = segs.len().next_power_of_two().max(1024);
-                let host = self.be.host_alloc_pinned(cap * std::mem::size_of::<Seg>())?;
+                let host = self
+                    .be
+                    .host_alloc_pinned(cap * std::mem::size_of::<Seg>())?;
                 let dev = VmmOps::alloc(&*self.be, (cap * std::mem::size_of::<Seg>()) as u64)?;
                 if let Some(old) = tables[b].replace(Table { host, dev, cap }) {
                     VmmOps::free(&*self.be, old.dev);
@@ -746,7 +763,12 @@ impl GpuEngine {
                 bytes,
             );
         }
-        VmmOps::copy_htod(&*self.be, table.dev, table.host.as_ptr() as u64, bytes as u64)?;
+        VmmOps::copy_htod(
+            &*self.be,
+            table.dev,
+            table.host.as_ptr() as u64,
+            bytes as u64,
+        )?;
         let mut table_ptr = table.dev;
         let mut n = segs.len() as u32;
         let mut params = [
@@ -763,7 +785,12 @@ impl GpuEngine {
 /// The blocks of a boundary at `p_a` rows (a multiple of 32): `(class, first row, key index)`
 /// where key index `i` names the chained hash of `tokens[..(i + 1) * 32]`. `classes` =
 /// `[window, tail, scale]` present.
-fn plan_blocks(classes: [bool; 4], block_rows: u32, p_a: u32, window: u32) -> Vec<(Class, u32, usize)> {
+fn plan_blocks(
+    classes: [bool; 4],
+    block_rows: u32,
+    p_a: u32,
+    window: u32,
+) -> Vec<(Class, u32, usize)> {
     let key = |end: u32| (end / ROWS_PER_BLOCK - 1) as usize;
     let mut out = Vec::new();
     if classes[0] {
@@ -797,10 +824,18 @@ mod tests {
     #[test]
     fn a_boundary_is_its_window_and_every_full_layer_row() {
         let p = plan_blocks([true, true, false, false], 4096, 4096 + 96, 1024);
-        let window: Vec<u32> = p.iter().filter(|x| x.0 == Class::Window).map(|x| x.1).collect();
+        let window: Vec<u32> = p
+            .iter()
+            .filter(|x| x.0 == Class::Window)
+            .map(|x| x.1)
+            .collect();
         assert_eq!(window.len(), 32);
         assert_eq!((window[0], window[31]), (4096 + 96 - 1024, 4096 + 64));
-        let prefix: Vec<u32> = p.iter().filter(|x| x.0 == Class::Tail).map(|x| x.1).collect();
+        let prefix: Vec<u32> = p
+            .iter()
+            .filter(|x| x.0 == Class::Tail)
+            .map(|x| x.1)
+            .collect();
         assert_eq!(prefix.len(), (4096 + 96) / 32);
         assert_eq!((prefix[0], prefix[130]), (0, 4160));
         // The key index of a 32-row block is the chain entry ending at its last row.

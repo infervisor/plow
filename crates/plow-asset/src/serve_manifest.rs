@@ -593,10 +593,16 @@ mod tests {
         )
         .unwrap();
         let kv = KvGeometry::from_config(&d).unwrap();
-        assert_eq!((kv.full_layers, kv.slide_layers, kv.window), (vec![2], vec![], 0));
+        assert_eq!(
+            (kv.full_layers, kv.slide_layers, kv.window),
+            (vec![2], vec![], 0)
+        );
         assert_eq!((kv.kv_heads_full, kv.head_dim_full), (4, 256));
-        std::fs::write(d.join("config.json"), r#"{"layer_types":["mamba"],"num_hidden_layers":1}"#)
-            .unwrap();
+        std::fs::write(
+            d.join("config.json"),
+            r#"{"layer_types":["mamba"],"num_hidden_layers":1}"#,
+        )
+        .unwrap();
         assert!(KvGeometry::from_config(&d).is_none());
         std::fs::remove_dir_all(&d).unwrap();
     }

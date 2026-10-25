@@ -664,7 +664,6 @@ mod amd_serve {
             }
         }
 
-
         fn kv_row_bytes(&self) -> u64 {
             match self {
                 Self::One(e) => e.kv_row_bytes(),

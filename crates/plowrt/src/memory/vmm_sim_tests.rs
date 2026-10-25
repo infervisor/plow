@@ -1633,14 +1633,20 @@ fn cell_session_end_demotes_to_cold_first_victim() {
             .flatten()
             .find(|s| s.rows == end1 && s.kind.has(Kind::PROMPT_END))
             .expect("session 0's prompt end");
-        assert!(s1.cold() && s1.protect_until.is_none(), "cold and unprotected");
+        assert!(
+            s1.cold() && s1.protect_until.is_none(),
+            "cold and unprotected"
+        );
     }
     {
         let mut inner = r.kv().shared.inner.lock();
         assert!(evict_one(&r.kv().shared, &mut inner, false));
     }
     let rows: Vec<u32> = r.snaps().iter().map(|s| s.0).collect();
-    assert!(!rows.contains(&end1), "the ended session went first: {rows:?}");
+    assert!(
+        !rows.contains(&end1),
+        "the ended session went first: {rows:?}"
+    );
     assert!(rows.contains(&end2), "the live session stayed: {rows:?}");
     r.check();
 }
@@ -1663,7 +1669,10 @@ fn cell_session_end_retry_rewarms_the_boundary() {
         .flatten()
         .find(|s| s.rows == end2 && s.kind.has(Kind::PROMPT_END))
         .expect("the new prompt end");
-    assert!(!s2.cold() && s2.protect_until.is_some(), "warm and protected again");
+    assert!(
+        !s2.cold() && s2.protect_until.is_some(),
+        "warm and protected again"
+    );
 }
 
 /// An abort signal on a sequence that never attached or published is a no-op.

@@ -7898,7 +7898,11 @@ impl GpuEngine {
         // OOM path), so they count as held like the multi-mapped cache blocks did; left out,
         // the budget collapsed to the floor once the store filled the device and admission
         // queued every request (TTFT p50 68 ms -> 137 ms, p99 645 ms -> 3 s at rate 2.7).
-        let held = held + vmm.blocks.as_ref().map_or(0, |bs| bs.device_reserved_bytes());
+        let held = held
+            + vmm
+                .blocks
+                .as_ref()
+                .map_or(0, |bs| bs.device_reserved_bytes());
         let Ok((free, total)) = self.be.mem_info() else {
             return Some(budget);
         };

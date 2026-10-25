@@ -200,8 +200,7 @@ pub(super) fn evict_one_tree(s: &Shared, inner: &mut Inner, preserve_hot: bool) 
     let host_holds_device = inner.block_store.is_none();
     // A cold host boundary (published on a first sighting, never attached) ranks below every
     // used device boundary: it goes before the device victim is spilled or freed.
-    if host_holds_device && victim.is_some_and(|id| !snap_ref(inner, id).is_some_and(Snap::cold))
-    {
+    if host_holds_device && victim.is_some_and(|id| !snap_ref(inner, id).is_some_and(Snap::cold)) {
         if let Some(id) = host_lru(inner).filter(|&id| snap_ref(inner, id).is_some_and(Snap::cold))
         {
             with_cause(inner, Some(Mechanism::Cold), None, |inner| {

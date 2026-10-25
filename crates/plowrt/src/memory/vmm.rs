@@ -1300,7 +1300,10 @@ enum SnapStore {
     Restoring(u32),
     /// Held by the KV block store ([`SnapBlocks`], `handle` = the publisher's segment table):
     /// the pool keeps the policy, the store keeps the bytes and their tier.
-    Blocks { handle: u64, state: BlockState },
+    Blocks {
+        handle: u64,
+        state: BlockState,
+    },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -2989,8 +2992,7 @@ impl VmmKv {
         };
         inner.cold_tick += 1;
         let cold = inner.cold_tick;
-        let Some(snap) = snap_mut(&mut inner, id).filter(|s| s.kind.has(Kind::PROMPT_END))
-        else {
+        let Some(snap) = snap_mut(&mut inner, id).filter(|s| s.kind.has(Kind::PROMPT_END)) else {
             return;
         };
         snap.protect_until = None;
@@ -2999,7 +3001,12 @@ impl VmmKv {
             DemoteSignal::Header => inner.stats.session_end_header += 1,
             DemoteSignal::Abort => inner.stats.session_end_abort += 1,
         }
-        tracing::debug!(seq, id, ?signal, "vmm prefix: session boundary demoted to cold");
+        tracing::debug!(
+            seq,
+            id,
+            ?signal,
+            "vmm prefix: session boundary demoted to cold"
+        );
     }
 
     /// A sequence still prefilling a prompt that shares whole blocks with `prompt`, when its
@@ -3795,7 +3802,10 @@ impl PrefixProbe {
                 handle,
                 state: BlockState::Device,
             } => {
-                let hook = inner.block_store.clone().expect("a block snapshot has a store");
+                let hook = inner
+                    .block_store
+                    .clone()
+                    .expect("a block snapshot has a store");
                 drop(inner);
                 let _ = hook.restore(handle);
                 return false;
@@ -3808,7 +3818,10 @@ impl PrefixProbe {
         };
         snap.users += 1;
         inner.stats.host_prefetches += 1;
-        let hook = inner.block_store.clone().expect("a block snapshot has a store");
+        let hook = inner
+            .block_store
+            .clone()
+            .expect("a block snapshot has a store");
         drop(inner);
         let restored = hook.restore(handle);
         let mut inner = s.inner.lock();
@@ -4926,7 +4939,10 @@ fn trim_cache_by(
                     }
                     None => 0,
                 };
-                if free + (inner.release_queued - queued) + pending_spill_bytes(inner) + store_pending
+                if free
+                    + (inner.release_queued - queued)
+                    + pending_spill_bytes(inner)
+                    + store_pending
                     >= min_free
                 {
                     break;
@@ -5544,8 +5560,7 @@ fn spill_unit(s: &Shared, inner: &mut Inner, id: u64) -> bool {
     }
     if tier.free.is_empty() {
         let now = std::time::Instant::now();
-        let protected =
-            |id: u64| snap_ref(inner, id).is_some_and(|x| x.shielded(now));
+        let protected = |id: u64| snap_ref(inner, id).is_some_and(|x| x.shielded(now));
         match host_lru(inner) {
             // An unprotected victim never displaces a session boundary inside its TTL: it is
             // freed instead (the caller's fallback).
@@ -5582,8 +5597,7 @@ fn spill_blocks(s: &Shared, inner: &mut Inner, id: u64, handle: u64) -> bool {
     let mut spilled = hook.spill(handle);
     if !spilled {
         let now = std::time::Instant::now();
-        let protected =
-            |id: u64| snap_ref(inner, id).is_some_and(|x| x.shielded(now));
+        let protected = |id: u64| snap_ref(inner, id).is_some_and(|x| x.shielded(now));
         match host_lru(inner) {
             Some(victim) if protected(victim) && !protected(id) => {}
             Some(victim)
@@ -8467,7 +8481,11 @@ mod tests {
         }
         p.begin_seq(0);
         assert!(ever_evicted > 0, "no pressure");
-        assert_eq!(p.cached_rows(&b), 8, "shared end in use evicted under pressure");
+        assert_eq!(
+            p.cached_rows(&b),
+            8,
+            "shared end in use evicted under pressure"
+        );
         assert!(p.stats().cache_bytes <= 512);
         policy::check_tree(&p.shared.inner.lock());
     }
@@ -8507,9 +8525,16 @@ mod tests {
         let maps = ops.maps.load(Ordering::SeqCst);
         let hit = p.try_attach(1, &a).unwrap().expect("hit");
         assert_eq!((hit.rows, hit.blocks), (16, Some(7)));
-        assert_eq!(ops.maps.load(Ordering::SeqCst), maps, "nothing multi-mapped");
+        assert_eq!(
+            ops.maps.load(Ordering::SeqCst),
+            maps,
+            "nothing multi-mapped"
+        );
         p.ensure_rows(1, 17).unwrap();
-        assert!(ops.maps.load(Ordering::SeqCst) > maps, "the slot grows its own blocks");
+        assert!(
+            ops.maps.load(Ordering::SeqCst) > maps,
+            "the slot grows its own blocks"
+        );
         p.finish_attach(1);
         policy::check_tree(&p.shared.inner.lock());
     }
@@ -8554,9 +8579,17 @@ mod tests {
         assert_eq!(hit.rows, 16);
         ops.fail_creates.store(1, Ordering::SeqCst);
         p.ensure_rows(1, 17).unwrap();
-        assert_eq!(hook.shrinks.load(Ordering::SeqCst), 1, "one shrink for the failed create");
+        assert_eq!(
+            hook.shrinks.load(Ordering::SeqCst),
+            1,
+            "one shrink for the failed create"
+        );
         let st = p.stats();
-        assert_eq!((st.snapshots_live, st.nodes_evicted), (1, 0), "nothing evicted");
+        assert_eq!(
+            (st.snapshots_live, st.nodes_evicted),
+            (1, 0),
+            "nothing evicted"
+        );
         p.finish_attach(1);
         policy::check_tree(&p.shared.inner.lock());
     }
@@ -8636,7 +8669,11 @@ mod tests {
         assert!(p.spill_ahead_one());
         let st = p.stats();
         assert_eq!((st.host_snapshots, st.snapshots_live), (1, 2));
-        assert_eq!(p.cached_rows(&a), 16, "a (the LRU) is on the host, still attachable");
+        assert_eq!(
+            p.cached_rows(&a),
+            16,
+            "a (the LRU) is on the host, still attachable"
+        );
         assert!(p.spill_ahead_one());
         assert!(!p.spill_ahead_one(), "nothing left on the device");
         assert_eq!(p.stats().host_snapshots, 2);
@@ -8704,12 +8741,19 @@ mod tests {
         assert!(!probe.restore_pending(&a, Some(&key)));
         hook.in_flight.store(true, Ordering::SeqCst);
         assert!(probe.restore_pending(&a, Some(&key)));
-        assert!(!probe.restore_pending(&prompt(5), None), "a miss waits for nothing");
+        assert!(
+            !probe.restore_pending(&prompt(5), None),
+            "a miss waits for nothing"
+        );
         hook.in_flight.store(false, Ordering::SeqCst);
         assert_eq!(p.stats().restore_holds, 1);
         let hit = p.try_attach(1, &a).unwrap().expect("hit");
         assert_eq!((hit.rows, hit.blocks), (16, Some(7)));
-        assert_eq!(hook.restores.load(Ordering::SeqCst), 2, "found on the device");
+        assert_eq!(
+            hook.restores.load(Ordering::SeqCst),
+            2,
+            "found on the device"
+        );
         p.finish_attach(1);
         policy::check_tree(&p.shared.inner.lock());
     }

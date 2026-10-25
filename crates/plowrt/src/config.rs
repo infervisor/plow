@@ -888,7 +888,11 @@ pub struct RuntimeConfig {
     /// LRU: evicted boundaries spill there and attach from there). Unset = sized by the
     /// host-reserve rule (`MemAvailable` minus an eighth of RAM, at least 16 GiB); `0` = no
     /// host tier.
-    #[arg(long = "vmm-host-cache-mib", env = "PLOW_VMM_HOST_CACHE_MIB", global = true)]
+    #[arg(
+        long = "vmm-host-cache-mib",
+        env = "PLOW_VMM_HOST_CACHE_MIB",
+        global = true
+    )]
     pub vmm_host_cache_mib: Option<u64>,
 
     /// CUDA VMM prefix cache: seconds a request with
@@ -2993,7 +2997,6 @@ impl RuntimeConfig {
             !Self::is_initialized(),
         )
     }
-
 
     pub(crate) fn vmm_publish_shared(&self) -> bool {
         select_compat(

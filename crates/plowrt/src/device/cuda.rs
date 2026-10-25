@@ -2402,9 +2402,14 @@ impl crate::memory::vmm::VmmOps for CudaBackend {
         let tier = self.copy_tier_mut(&mut tier)?;
         // SAFETY: `va` stays allocated until the fence retires (`memory/vmm.rs`,
         // `SnapStore::Spilling`); `host_ptr` is inside a pinned tier chunk of at least `bytes`.
-        self.copy_fenced(tier, CopyDir::Spill, "cuMemcpyDtoHAsync(vmm spill)", |s| unsafe {
-            (self.api.cuMemcpyDtoHAsync_v2)(host_ptr as *mut c_void, va, bytes as usize, s)
-        })
+        self.copy_fenced(
+            tier,
+            CopyDir::Spill,
+            "cuMemcpyDtoHAsync(vmm spill)",
+            |s| unsafe {
+                (self.api.cuMemcpyDtoHAsync_v2)(host_ptr as *mut c_void, va, bytes as usize, s)
+            },
+        )
     }
 
     fn copy_htod_async(&self, va: u64, host_ptr: u64, bytes: u64) -> Result<u64> {
@@ -2414,9 +2419,14 @@ impl crate::memory::vmm::VmmOps for CudaBackend {
         // SAFETY: `va` is a live `bytes`-long device allocation nothing reads before the fence
         // (`memory/kv_store.rs`, `Where::Restoring`); `host_ptr` is inside a pinned tier chunk of
         // at least `bytes` that stays until the fence retires.
-        self.copy_fenced(tier, CopyDir::Restore, "cuMemcpyHtoDAsync(kv store restore)", |s| unsafe {
-            (self.api.cuMemcpyHtoDAsync_v2)(va, host_ptr as *const c_void, bytes as usize, s)
-        })
+        self.copy_fenced(
+            tier,
+            CopyDir::Restore,
+            "cuMemcpyHtoDAsync(kv store restore)",
+            |s| unsafe {
+                (self.api.cuMemcpyHtoDAsync_v2)(va, host_ptr as *const c_void, bytes as usize, s)
+            },
+        )
     }
 
     fn fence_done(&self, fence: u64) -> Result<bool> {
@@ -2561,7 +2571,9 @@ impl CudaBackend {
     pub fn fence_wait_on(&self, fence: u64, stream: &CudaStream) -> Result<()> {
         let mut tier = self.copy_tier.lock();
         let Some(tier) = tier.as_mut() else {
-            return Err(RuntimeError::Rejected("vmm copy tier: no copy stream".into()));
+            return Err(RuntimeError::Rejected(
+                "vmm copy tier: no copy stream".into(),
+            ));
         };
         if tier.failed.contains(&fence) {
             return Err(RuntimeError::Device("vmm copy tier: unfenced copy".into()));
@@ -2571,7 +2583,9 @@ impl CudaBackend {
         };
         // SAFETY: live stream and event handles.
         self.check(
-            unsafe { (self.api.cuStreamWaitEvent)(stream.raw as CUstream, event.raw as CUevent, 0) },
+            unsafe {
+                (self.api.cuStreamWaitEvent)(stream.raw as CUstream, event.raw as CUevent, 0)
+            },
             "cuStreamWaitEvent(kv store restore)",
         )
     }
