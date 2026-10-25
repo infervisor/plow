@@ -68,6 +68,29 @@ keeps the tier at its default (auto); the production setting depends on the depl
 time, and production's is about 45 s. Raw evidence for the tier rows:
 `/home/lava/scratch/kvstore-gates/{r27-15-auto,t20-12-auto,long15-auto-end}`.
 
+## Merge-prep checks on the other recipes (2026-10-25, branch `a3bf4162` vs main `9f16f187`; not strict rows)
+
+Every H100 recipe with a packet on this box ran its own `[gates]` on the branch binary. The LLM
+packets also ran the recipe `[bench]` on both binaries (random prompts, 32 per cell, 128 output
+tokens, input 128/1024/4096 at c1/c8/c32, same packet and cuBLASLt 13.4 on both arms, no
+contention; `campaign.py compare`, branch over main):
+
+| Recipe (packet) | Gate on the branch | Bench, branch / main |
+|---|---|---|
+| gemma-4-26b-a4b FP8 (Kit 2 `b86ec26e4262`, store + host tier auto) | strict rows above; smoke at 10 s think, rate 2.7: hit 79.8 %, TTFT 66/687 ms, TPOT 14.4/82.9 ms, no errors | TTFT 0.70–0.99x, TPOT 0.96–1.00x, tok/s 1.00–1.12x |
+| gemma-4-12b (`06da7686`, store + host tier auto) | FP32 c16 PASS: kl_trim 0.049 vs vLLM 0.065, top1_decisive 0.987 vs 0.982, over-0.1 111 vs 123, cont_frac 0.604 vs 0.574 | TTFT 0.36–0.99x, TPOT 0.98–1.00x, tok/s 1.00–1.07x |
+| gemma-4-e4b (`da55906d`, store + host tier auto) | logit parity PASS: top1 0.9948, kl_mean 7.6e-4 (limits 0.98, 2e-3) | not benched (chat-kind bench) |
+| qwen3.8-27b BF16 (`3fb7cefa`, prefix cache off per recipe) | not re-gated | 1.00x on every cell |
+| qwen3.8-27b FP8 TMA (`6c31b3e8`, prefix cache off per recipe) | c1 and c8 captures equal the 2026-10-20 qualifying run digit for digit; the recipe's own thresholds fail that packet on main too (arch/26 B3) | c1 1.00x; c8/c32 incomplete on both arms (single-slot decode) |
+| veena, orpheus, chatterbox, chatterbox-mtl (speech kit `6680acc8` bundles) | tts_cer PASS (Veena 0.011, Orpheus 0), s3gen_rel_l2 PASS | — |
+| qwen3-asr 1.7B / 0.6B (re-emitted with the branch compiler; the kit's packets carry speech contract 0) | asr_wer PASS 3.913 % / 4.435 % (the kit baseline figures) | — |
+| nemotron-3.5-asr | not run: the bundle is an ASR packet, the recipe gate expects a model packet | — |
+
+The non-prefix path costs the same to the digit (Qwen rows); the prefix-on recipes gain TTFT at
+c8/c32 because the boundary publish no longer copies on the engine thread. Raw evidence (gpu03
+scratch): `/opt/dlami/nvme/lava-tts/kvstore-scratch/{gates,bench,asr}`,
+`/home/lava/scratch/kvstore-gates/{e4b,g12,qwen-prod,r27-21-auto}`.
+
 ## Strict tables
 
 ## q1800.g
