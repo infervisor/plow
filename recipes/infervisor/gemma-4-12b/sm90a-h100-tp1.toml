@@ -18,6 +18,17 @@
 # with the Gemma 26B FP8 recipe, qualified there), step_bench B 1/16/64/128 x ctx 1K/4K/16K
 # digests and times unchanged against the 597c56d6 packet on one plowrt.
 # vLLM with BF16 KV (FLASH_ATTN) is still faster than this packet: same doc, Caveats.
+# 2026-10-25 (branch kv-block-store: the KV block store under the slots, host tier auto): the
+# plow_git below reproduces packet 06da7686 byte for byte from the re-keyed checkpoint; FP32 gate
+# c16 PASS on it (kl_mean 0.0952 vs vLLM 0.1277, kl_trim 0.0536 vs 0.0653, over-0.1 117 vs 123,
+# top1_decisive 0.9852 vs 0.9823, cont_frac 0.615, needle 1; kvstore-scratch/gemma-final-gates/g12-3).
+# Strict open-loop production mix (campaign.py report, --prod-fidelity, think lognormal 10 s,
+# 2 repeats, plowrt b779aa91 vs vLLM 0.29.0 fp8 KV at --max-model-len 16384) MATCHED + EQUIVALENT
+# and LOSES: 1.8 sessions/s total tok/s 0.98x, TTFT P99 798.6 -> 1224.9 ms (1.53x, spread flagged),
+# TPOT P99 55.97 -> 92.41 ms (1.65x); 2.7 sessions/s 0.95x / 1126 -> 2957 ms (2.62x) / 136.8 ->
+# 164.2 ms (1.20x), SLO met 54.3% vs 95.7% (TPOT P50 97.8 vs 32.0 ms, mean in-flight 51.6 vs 21.9).
+# The dense decode step at that in-flight count is the bottleneck; this packet is not competitive
+# with vLLM 0.29 on the production mix. Evidence: /opt/dlami/nvme/lava-tts/kvstore-scratch/strict-g12-23.
 #
 # Routes (per-rung evidence: docs/runtime/kernel-generators.md "Gemma-4 12B FP8 per-rung routes"):
 #   prefill projections   cuBLASLt FP8 OUTER_VEC where it wins (segment_roles::cublaslt_prefill_fp8),
@@ -37,7 +48,7 @@ namespace = "infervisor"
 name = "gemma-4-12b"
 label = "sm90a-h100-tp1"
 status = "validated"
-plow_git = "b44ca43f9e39982ce739ff14229f59ef4c99b58f"
+plow_git = "b403a5c1d57c82b15d3da01737a88e41765d9f24"
 network = "gemma4"
 
 [target]

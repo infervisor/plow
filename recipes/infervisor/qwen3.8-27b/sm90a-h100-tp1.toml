@@ -1,7 +1,7 @@
 # Qwen3.8-27B (qwen3_5 hybrid: 48 Gated DeltaNet + 16 GQA hd256 layers, 27B dense) BF16 on H100
 # SXM5: BF16 weights and KV, 16K context, decode ladder 1..48 slots, live-KV allocation, packed
-# prefill (concurrent prompts share one launch), prefix cache off (recurrent state). Production
-# recipe for this model/GPU/precision.
+# prefill (concurrent prompts share one launch), prefix cache on (the KV block store captures the
+# GDN state at the prompt-end boundary). Production recipe for this model/GPU/precision.
 #
 #   PYREF=/opt/pytorch/bin/python3 PLOW_CAMPAIGN_NO_NIX=1 (box without nix only) \
 #   python3 scripts/campaign/campaign.py build recipes/infervisor/qwen3.8-27b/sm90a-h100-tp1.toml --out <fresh dir>
@@ -94,7 +94,7 @@ namespace = "infervisor"
 name = "qwen3.8-27b"
 label = "sm90a-h100-tp1"
 status = "validated"
-plow_git = "b44ca43f9e39982ce739ff14229f59ef4c99b58f"
+plow_git = "b403a5c1d57c82b15d3da01737a88e41765d9f24"
 network = "qwen3.5"
 
 [target]
@@ -199,12 +199,26 @@ PLOW_EMIT_DECODE_CUBLASLT_MIN_ROWS = "16"
 PLOW_NV_GEMV_REM_SPLIT = "1"
 PLOW_NV_GEMV_K8_B1 = "1"
 
-# plowrt rejects prefix caching with recurrent (GDN) state; the hybrid would need a GDN-state
-# snapshot at the prefix boundary. PLOW_VMM_LIVE: KV reserved virtually at the ceiling, physical
-# commit per admitted slot and rows (flat KV is 1 GiB per slot at 16K).
+# PLOW_VMM_LIVE: KV reserved virtually at the ceiling, physical commit per admitted slot and rows
+# (flat KV is 1 GiB per slot at 16K). Under PLOW_VMM_LIVE the prefix cache is not auto-selected,
+# so PLOW_VMM_PREFIX names it explicitly. Prefix cache on (2026-10-25, branch kv-block-store,
+# plowrt bin24 on packet 5f934c703d2c re-emitted from the plow_git below): the KV block store
+# holds the 16 full-attention layers' rows and the 48 GDN layers' state (147 MiB per boundary)
+# captured at the prompt-end chunk cut, and an attach within the prefix path is exact (0 of 16
+# turns differing). FP32 gate PASS at c1/c8/c32 with the cache on (kl_trim 0.000436 / 0.000470 /
+# 0.000456 vs vLLM 0.000338-0.000356, top1_decisive 1 / 0.9988 / 1, cont_frac 0.878 / 0.853 /
+# 0.849, needle 1; kvstore-scratch/qwenbf16-gate24) and off (bin21, same packet). Agentic16k
+# closed loop (10 turns to 15600 tokens, 128-token replies, 2 repeats) on vs off: c8 hit 82%,
+# out tok/s 180.6 vs 110.7, TTFT p50/p99 483/2333 vs 1721/3081 ms, TPOT p50/p99 40.0/50.7 vs
+# 58.5/81.8 ms; c32 hit 8-10% (the store's device cap is 17 GiB beside 48 live slots against
+# ~1.1 GiB per 15K-token session; the run did not record whether the 214 GiB host tier absorbed
+# the overflow), TTFT 13750/37200 vs 14561/36581, TPOT 100.2/108.9 vs 96.8/98.9 ms (+3.5%),
+# tok/s 140.9 vs 138.9 (kvstore-scratch/qwenbf16-prefix-ab). The c32 retention is the open
+# item, not the cache itself.
 [serve.env]
 PLOW_VMM_LIVE = "1"
-PLOW_PREFIX_CACHE = "0"
+PLOW_PREFIX_CACHE = "1"
+PLOW_VMM_PREFIX = "1"
 # Prefill in 1024-row chunks with the decode rows riding each chunk (gdn_ride + rider attention):
 # the 4K / 15K serving grids (lc43 plow4k_k1 / plow15k_k1, build64) ran here; the chain's
 # pointwise segments of a chunk are light launches (PLOW_QWEN_LIGHT_OCC default 4) and the decode

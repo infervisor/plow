@@ -24,6 +24,22 @@
 # max_ctx 16384 / 131072 / 262144 (262144 costs 12% of the KV budget to flat FP8-KV scales and RoPE
 # tables); st4k / st15k / latency unchanged across max_ctx. Not run: the open-loop production mix.
 #
+# 2026-10-25 (branch kv-block-store): the KV block store is the only boundary storage, host tier
+# auto (this recipe's default). Strict open-loop production mix vs vLLM 0.29.0 fp8 KV (Kit 2 packet
+# b86ec26e4262, plowrt b779aa91, --prod-fidelity, think lognormal 10 s, 2 repeats) MATCHED +
+# EQUIVALENT: 1.8 sessions/s total tok/s 1.00x, TTFT P99 369.5 -> 384.2 ms (1.04x), TPOT P99
+# 32.60 -> 26.66 ms (0.82x, spread flagged); 2.7 sessions/s 1.00x / 485.2 -> 735.7 ms (1.52x;
+# Infervisor repeats 952.9 / 518.5 ms) / 57.89 -> 62.89 ms (1.09x). FP32 gate PASS (kl_trim 0.118
+# vs vLLM 0.1242, top1_decisive 0.9622, cont 0.5375, needle 1). With the tier off the same mix wins
+# every latency row (docs/bringup/results/gemma26b-h100-20261023/comparison.md); the tier costs
+# at 10 s think and wins at production's 45 s think (hit 71.7% vs 58.3%, lower TTFT and TPOT), so
+# it stays auto. Evidence: /opt/dlami/nvme/lava-tts/kvstore-scratch/strict-g26-tier23.
+# The re-emit from the plow_git below (packet faaebced1d4a) keeps Kit 2's `union`, `tuning` and
+# weights.json byte for byte; its manifest drops the removed snapshot knobs from the serve defaults
+# and excludes the new speech opcodes from every object. c16 FP32 gate PASS on it (kl_mean 0.2081
+# vs vLLM 0.202, kl_trim 0.1332 vs 0.1242, over-0.1 215 vs 206, top1_decisive 0.9582, cont_frac
+# 0.5389, needle 1; kvstore-scratch/gemma-final-gates/g26fp8-3).
+#
 # Routes: prefill projections cuBLASLt FP8 where the prefill roles pick it, native FP8 TMA GEMM
 # only at K % 128 == 0; grouped MoE prefill on cuBLASLt (moe_lt W8A8 chain, ABI 6 glue); decode
 # MoE >= 4 rows on cuBLASLt with the routed_fp8kv decode object; generated FP8-KV prefill attention
@@ -33,7 +49,7 @@ namespace = "infervisor"
 name = "gemma-4-26b-a4b"
 label = "sm90a-h100-tp1-fp8"
 status = "validated"
-plow_git = "9641938b65bd699335a6421c35bc95965c63052b"
+plow_git = "b403a5c1d57c82b15d3da01737a88e41765d9f24"
 network = "gemma4"
 
 [target]
