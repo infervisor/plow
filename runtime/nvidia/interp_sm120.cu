@@ -1030,6 +1030,9 @@ extern "C" __device__ __constant__ unsigned plow_fp8_kv_abi = 1;
 #else
 #define PLOW_NV_FP8_M1_ARENA 51456
 #endif
+/* Both XCACHE arenas hold the tiled W8A8 body's 3-stage 32 KiB ring (+1 KiB alignment), so the
+ * decode GEMM_FP8 arm serves rungs 2..=128 as one 128-row M tile (plow_fp8_decode_rows). */
+#define PGM90_FP8_DECODE_ROWS 128u
 #elif defined(PLOW_NV_HOPPER) && defined(PLOW_NV_FP8_M1) && PLOW_NV_FP8_M1 && PLOW_NV_FP8_M1_BK1024 && !PLOW_NV_PREFILL
 #define PLOW_NV_FP8_M1_ARENA 18688
 #elif defined(PLOW_NV_HOPPER) && defined(PLOW_NV_FP8_M1) && PLOW_NV_FP8_M1 && PLOW_NV_FP8_M1_BK512 && !PLOW_NV_PREFILL
@@ -1038,6 +1041,9 @@ extern "C" __device__ __constant__ unsigned plow_fp8_kv_abi = 1;
 #define PLOW_NV_FP8_M1_ARENA 4864
 #else
 #define PLOW_NV_FP8_M1_ARENA 0
+#endif
+#ifndef PGM90_FP8_DECODE_ROWS
+#define PGM90_FP8_DECODE_ROWS 1u
 #endif
 #ifndef PLOW_NV_ARENA_MIN_BYTES
 #define PLOW_NV_ARENA_MIN_BYTES 0
@@ -1169,6 +1175,14 @@ extern "C" __device__ unsigned PLOW_SYM(plow_gemm_splitk_abi) = 1;
 #endif
 #if PLOW_NV_EMBED_SMEM
 extern "C" __device__ unsigned PLOW_SYM(plow_arena_bytes) = PLOW_NV_ARENA_FLOATS * sizeof(float);
+#if GVMMA_RED_DYN
+/* The narrow claim (plow_arena_bytes_narrow, the smallest launch of this object) must back the
+ * relocated MMA reduction slots at every rung. */
+static_assert(PLOW_NV_ARENA_FLOATS0 * sizeof(float) >= GVMMA_RED_DYN_OFF * sizeof(float) + GVMMA_RED_DYN_BYTES,
+              "arena too small for the relocated GEMV MMA reduction slots");
+static_assert(2u * (((unsigned)RN_REG * PLOW_NV_THREADS + 15u) & ~15u) + 1024u <= GVMMA_RED_DYN_OFF * sizeof(float),
+              "fused-NRN staging overlaps the relocated GEMV MMA reduction slots");
+#endif
 #if defined(PLOW_NV_HOPPER) && (PLOW_MOE_DEC_GROUP || PLOW_NV_GW_ACTIVE) && !PLOW_NV_PREFILL
 /* The claim of a rung that never runs the grouped-MoE (or wide-GEMV) arm; the loader launches
  * those with it. */
@@ -2186,9 +2200,13 @@ __device__ __forceinline__ void plow_exec(const PlowDevInst* in, void* const* T,
         break;
 #endif
 #if defined(PLOW_NV_HOPPER) && defined(PLOW_NV_FP8_M1) && PLOW_NV_FP8_M1 && PLOW_NV_QUANT_FP8_VLLM
+/* Decode W8A8 rows this object accepts (plow_fp8_decode_rows): rung 1 runs the M1 arms;
+ * rungs 2..=PGM90_FP8_DECODE_ROWS run ONE 128-row M tile of the Hopper W8A8 wgmma GEMM (the
+ * prefill body without maps), which streams each weight N tile once exactly as M=1 does. That
+ * body needs the 256-thread two-warpgroup layout and its staging ring in the arena. */
 #if !PLOW_NV_FP8_LT_DECODE
     case PLOW_DOP_QUANT_FP8:
-        if (in->i[0] != 1) { __trap(); break; }
+        if (!in->i[0] || in->i[0] > PGM90_FP8_DECODE_ROWS) { __trap(); break; }
         d_quant_fp8((uint8_t*)TEN(0), (__nv_bfloat16*)TEN(1), (float*)TEN(2),
             in->i[0], in->i[1], slice, nblk);
         break;
@@ -2196,7 +2214,18 @@ __device__ __forceinline__ void plow_exec(const PlowDevInst* in, void* const* T,
     case PLOW_DOP_GEMM_FP8:
     case PLOW_DOP_GEMM_MED_FP8:
     case PLOW_DOP_GEMM_SMALL_FP8:
-        if (in->i[0] != 1) { __trap(); break; }
+        if (!in->i[0] || in->i[0] > PGM90_FP8_DECODE_ROWS) { __trap(); break; }
+#if PGM90_FP8_DECODE_ROWS > 1u
+        static_assert(PLOW_NV_THREADS == 256 && PLOW_NV_ARENA_FLOATS * sizeof(float) >=
+                          PGM90_STAGES * (PGM90_A8BUF + PGM90_B8BUF) + 1024u,
+                      "wide FP8 decode needs two warpgroups and the tiled W8A8 staging ring");
+        if (in->i[0] != 1) {
+            d_gemm_w8a8_sm90((__nv_bfloat16*)TEN(0), (const uint8_t*)TEN(1), (const uint8_t*)TEN(2),
+                (const float*)TEN(3), (const float*)TEN(4), in->i[0], in->i[1], in->i[2],
+                in->i[4], slice, nblk, (__nv_bfloat16*)arena);
+            break;
+        }
+#endif
 #if PLOW_NV_FP8_M1_TMA
         d_gemm_w8a8_m1_tma_sm90((__nv_bfloat16*)TEN(0), (const uint8_t*)TEN(1), (const uint8_t*)TEN(2),
             in->i[7] ? T[in->i[7]] : nullptr, (const float*)TEN(3), (const float*)TEN(4),
@@ -3417,7 +3446,7 @@ extern "C" __device__ unsigned plow_qwen_prefill_arm = 1;
 #else
 extern "C" __device__ unsigned plow_qwen_prefill_arm = 0;
 #endif
-#if PLOW_NV_QWEN_GDN && PLOW_NV_PREFILL && PLOW_NV_SCHED == 1 && !PLOW_NV_PLACE_DISPATCH && !PLOW_NV_GEMM_ONLY && !PLOW_NV_FA_ONLY && !PLOW_NV_SKELETON && defined(PLOW_NV_HOPPER) && PLOW_NV_TMA_GEMM && PLOW_NV_W8A8 && PLOW_NV_QUANT_FP8_VLLM && PLOW_NV_FP8_PF_SCALE_WFIRST && !PGM90_FP8_PROMOTE && PLOW_NV_PF_GEMV_HEAD && PLOW_NV_THREADS == 256 && !PGM90_UNI_BN256 && !PLOW_NV_SEG_GEMM
+#if PLOW_NV_QWEN_GDN && PLOW_NV_PREFILL && PLOW_NV_SCHED == 1 && !PLOW_NV_PLACE_DISPATCH && !PLOW_NV_GEMM_ONLY && !PLOW_NV_FA_ONLY && !PLOW_NV_SKELETON && defined(PLOW_NV_HOPPER) && PLOW_NV_TMA_GEMM && PLOW_NV_W8A8 && PLOW_NV_QUANT_FP8_VLLM && PLOW_NV_FP8_PF_SCALE_WFIRST && !PGM90_FP8_PROMOTE && (PLOW_NV_PF_GEMV_HEAD || !PLOW_PACKET_REQUIRES_PF_GEMV_HEAD) && PLOW_NV_THREADS == 256 && !PGM90_UNI_BN256 && !PLOW_NV_SEG_GEMM
 extern "C" __device__ unsigned plow_qwen_w8a8_prefill_arm = 1;
 #else
 extern "C" __device__ unsigned plow_qwen_w8a8_prefill_arm = 0;
@@ -3449,8 +3478,10 @@ extern "C" __device__ unsigned plow_cublaslt_decode_abi = 0;
 #endif
 #if defined(PLOW_NV_HOPPER) && defined(PLOW_NV_FP8_M1) && PLOW_NV_FP8_M1 && PLOW_NV_QUANT_FP8_VLLM && PLOW_NV_QWEN_GDN && !PLOW_NV_PREFILL && PLOW_NV_SCHED == 1 && !PLOW_NV_PLACE_DISPATCH && !PLOW_NV_GEMM_ONLY && !PLOW_NV_FA_ONLY && !PLOW_NV_SKELETON
 extern "C" __device__ unsigned plow_fp8_m1_arm = 1;
+extern "C" __device__ unsigned plow_fp8_decode_rows = PGM90_FP8_DECODE_ROWS;
 #else
 extern "C" __device__ unsigned plow_fp8_m1_arm = 0;
+extern "C" __device__ unsigned plow_fp8_decode_rows = 0;
 #endif
 #if PLOW_GEMV_PREFETCH && !PLOW_NV_PREFILL && PLOW_NV_GEMV_MMA
 /* Claim-ahead weight prefetch (op_gemv_mma.cuh): the walks the decode object runs for these

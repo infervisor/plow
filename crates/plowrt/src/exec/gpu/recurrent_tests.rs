@@ -200,17 +200,25 @@ fn fp8_role_rejects_mixed_missing_and_duplicate_work() {
 
 #[test]
 fn qwen_w8a8_decode_and_prefill_require_separate_capabilities() {
-    assert!(check_qwen_w8a8_capability(false, 1, Some(1)).is_ok());
-    assert!(check_qwen_w8a8_capability(false, 4, Some(1)).is_err());
+    assert!(check_qwen_w8a8_capability(false, 1, Some(1), None).is_ok());
+    assert!(check_qwen_w8a8_capability(false, 1, Some(1), Some(0)).is_ok());
+    assert!(check_qwen_w8a8_capability(false, 4, Some(1), None).is_err());
+    assert!(check_qwen_w8a8_capability(false, 4, Some(1), Some(1)).is_err());
+    for rows in [2, 4, 48, 128] {
+        assert!(check_qwen_w8a8_capability(false, rows, Some(1), Some(128)).is_ok());
+        assert!(check_qwen_w8a8_capability(false, rows, Some(0), Some(128)).is_err());
+    }
+    assert!(check_qwen_w8a8_capability(false, 129, Some(1), Some(128)).is_err());
+    assert!(check_qwen_w8a8_capability(false, 0, Some(1), Some(128)).is_err());
     for rows in [128, 1024, 4096, 8192] {
-        assert!(check_qwen_w8a8_capability(true, rows, Some(1)).is_ok());
-        assert!(check_qwen_w8a8_capability(true, rows, None).is_err());
-        assert!(check_qwen_w8a8_capability(true, rows, Some(0)).is_err());
+        assert!(check_qwen_w8a8_capability(true, rows, Some(1), None).is_ok());
+        assert!(check_qwen_w8a8_capability(true, rows, None, None).is_err());
+        assert!(check_qwen_w8a8_capability(true, rows, Some(0), None).is_err());
     }
     for rows in [1, 256, 16384] {
-        assert!(check_qwen_w8a8_capability(true, rows, Some(1)).is_err());
+        assert!(check_qwen_w8a8_capability(true, rows, Some(1), None).is_err());
     }
-    assert!(check_qwen_w8a8_capability(false, 1, None).is_err());
+    assert!(check_qwen_w8a8_capability(false, 1, None, None).is_err());
 }
 
 #[test]

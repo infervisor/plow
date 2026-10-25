@@ -263,12 +263,22 @@ fn validate_decode_ladder_impl(blob: &DevBlob, segmented: bool, routed: &[bool])
             match DevOp::from_u16(d.op) {
                 Some(DevOp::Nop) => {}
                 Some(
-                    DevOp::QuantFp8 | DevOp::GemmFp8 | DevOp::GemmMedFp8 | DevOp::GemmSmallFp8,
-                ) if routed.get(index).copied().unwrap_or(false) => {
+                    op @ (DevOp::QuantFp8
+                    | DevOp::GemmFp8
+                    | DevOp::GemmMedFp8
+                    | DevOp::GemmSmallFp8),
+                ) => {
                     if d.i[0] != g.t {
                         return Err(reject("FP8 instruction rows disagree with rung width"));
                     }
                     d.i[0] = 1;
+                    // Native W8A8 rungs (devgen qwen35.rs `proj`): only the single-row rung binds
+                    // its weight TMA map in i[7] (i[6] is the prefill input map); the per-rung
+                    // maps are a rung-local choice, not program shape.
+                    if op == DevOp::GemmFp8 && !routed.get(index).copied().unwrap_or(false) {
+                        d.i[6] = 0;
+                        d.i[7] = 0;
+                    }
                 }
                 Some(DevOp::Residual | DevOp::Glu | DevOp::SoftCap) => {
                     if d.i[0] == 0 || d.i[0] % g.t != 0 {

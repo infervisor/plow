@@ -141,6 +141,7 @@ const ATTR_MAX_SHARED_MEMORY_PER_BLOCK_OPTIN: i32 = 97;
 /// same copy degrades to fault-driven migration.
 const ATTR_PAGEABLE_USES_HOST_PAGE_TABLES: i32 = 100;
 // CUfunction_attribute.
+const FUNC_ATTR_SHARED_SIZE_BYTES: i32 = 1;
 const FUNC_ATTR_MAX_DYNAMIC_SHARED_SIZE_BYTES: i32 = 8;
 // cuMemHostAlloc flags.
 const MEMHOSTALLOC_PORTABLE: u32 = 1;
@@ -245,6 +246,7 @@ driver_api! {
     cuModuleGetFunction: fn(*mut CUfunction, CUmodule, *const c_char) -> CUresult,
     cuModuleGetGlobal_v2: fn(*mut CUdeviceptr, *mut usize, CUmodule, *const c_char) -> CUresult,
     cuFuncSetAttribute: fn(CUfunction, i32, i32) -> CUresult,
+    cuFuncGetAttribute: fn(*mut i32, i32, CUfunction) -> CUresult,
     cuOccupancyMaxActiveBlocksPerMultiprocessor:
         fn(*mut i32, CUfunction, i32, usize) -> CUresult,
     cuMemAlloc_v2: fn(*mut CUdeviceptr, usize) -> CUresult,
@@ -1289,9 +1291,24 @@ impl CudaBackend {
     /// Opt a kernel into > 48 KiB dynamic shared memory.
     pub fn set_max_dynamic_smem(&self, f: KernelFn, bytes: u32) -> Result<()> {
         self.bind()?;
-        if bytes > self.smem_optin {
+        // The opt-in limit bounds static + dynamic; the setter alone reports an opaque
+        // CUDA_ERROR_INVALID_VALUE when the kernel's static smem eats into it.
+        let mut fixed: i32 = 0;
+        // SAFETY: valid function handle; `fixed` outlives the call.
+        self.check(
+            unsafe {
+                (self.api.cuFuncGetAttribute)(
+                    &mut fixed,
+                    FUNC_ATTR_SHARED_SIZE_BYTES,
+                    f.0 as CUfunction,
+                )
+            },
+            "cuFuncGetAttribute(static smem)",
+        )?;
+        let fixed = fixed.max(0) as u32;
+        if u64::from(bytes) + u64::from(fixed) > u64::from(self.smem_optin) {
             return Err(RuntimeError::Device(format!(
-                "dynamic smem {bytes} B exceeds device opt-in limit {}",
+                "dynamic smem {bytes} B + static {fixed} B exceeds device opt-in limit {}",
                 self.smem_optin
             )));
         }

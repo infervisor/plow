@@ -328,7 +328,11 @@ impl Emitter<'_> {
                 dep
             } else {
                 self.quant_input = Some((src, k));
-                let blocks = if self.prefill { self.b.all() } else { vec![0] };
+                let blocks = if self.prefill || rows > 1 {
+                    self.b.all()
+                } else {
+                    vec![0]
+                };
                 self.b.emit(DevOp::QuantFp8, blocks, &[dep], |d| {
                     d.t[..3].copy_from_slice(&[xq, src, ascale]);
                     d.i[..2].copy_from_slice(&[rows, k]);
@@ -345,7 +349,7 @@ impl Emitter<'_> {
                 let g = GenTensor::tmap_e4m3(w, n, k, 128);
                 self.b
                     .tensor_gen(&format!("tmap.fp8.pf.w{w}"), g.byte_len(), g)
-            } else if emit_config::active().qwen_fp8_m1_tma {
+            } else if rows == 1 && emit_config::active().qwen_fp8_m1_tma {
                 let g = GenTensor::tmap_e4m3(w, n, k, 64);
                 self.b.tensor_gen(&format!("tmap.fp8.{w}"), g.byte_len(), g)
             } else {
@@ -918,11 +922,10 @@ fn ladder(
         !fp8 || buckets.is_empty()
             || (emit_config::active().w8a8
                 && emit_config::active().qwen_w8a8_prefill
-                && decode_slots == 1
                 && buckets
                     .iter()
                     .all(|rows| matches!(rows, 128 | 1024 | 4096 | 8192))),
-        "Qwen FP8 prefill requires explicit W8A8 prefill, B1 and buckets128/1024/4096/8192"
+        "Qwen FP8 prefill requires explicit W8A8 prefill and buckets 128/1024/4096/8192"
     );
     let mut tensors = None;
     let mut progs = Vec::new();
@@ -1037,12 +1040,11 @@ fn phase(
     assert!(
         !w8a8
             || (fp8
-                && decode_slots == 1
-                && ((!prefill && batch == 1)
+                && ((!prefill && batch <= W8A8_DECODE_ROWS)
                     || (prefill
                         && matches!(batch, 128 | 1024 | 4096 | 8192)
                         && emit_config::active().qwen_w8a8_prefill))),
-        "Qwen W8A8 requires B1 decode or explicit supported prefill buckets"
+        "Qwen W8A8 requires decode rungs within one GEMM M tile or explicit supported prefill buckets"
     );
     assert!(
         !decode_cublaslt || !fp8,
@@ -1316,6 +1318,9 @@ fn phase(
 
 /// Set once `run` below emits for an AMD target: the AMD tile inventory, an AMD manifest, and
 /// an AMD interpreter object in place of the paired CUDA one. This is the DECODE gate.
+/// Decode rungs the W8A8 decode arm serves: rung 1 on the M1 kernels, wider rungs as one M tile
+/// of the Hopper W8A8 GEMM (`plow_fp8_decode_rows` on the object).
+const W8A8_DECODE_ROWS: u32 = 128;
 const AMD_QWEN_EMIT: bool = false;
 
 /// Set once a HIP chunked Gated DeltaNet prefill kernel and its `plowrt` adapter exist.
@@ -3474,9 +3479,13 @@ mod tests {
         assert!(
             std::panic::catch_unwind(|| model_prefill(&c, 8192, 132, 0, &[256], 1, true)).is_err()
         );
-        assert!(
-            std::panic::catch_unwind(|| model_prefill(&c, 8192, 132, 0, &[128], 4, true)).is_err()
-        );
+        // A wider decode rung beside the W8A8 prefill buckets is a ladder, not a refusal.
+        let laddered = model_prefill(&c, 8192, 132, 0, &[128], 4, true);
+        assert_eq!(laddered.prog_t, vec![128, 4]);
+        assert!(laddered.progs[1]
+            .insts
+            .iter()
+            .any(|d| d.op == DevOp::GemmFp8 as u16 && d.i[0] == 4));
         unsafe { std::env::remove_var("PLOW_QWEN_W8A8_PREFILL") };
         {
             let mut config = emit_config::active().clone();
@@ -3602,7 +3611,26 @@ mod tests {
         ] {
             assert!(req.contains(&serde_json::json!(flag)));
         }
-        assert!(std::panic::catch_unwind(|| model(&c, 8192, 132, 0, true, 4)).is_err());
+        // Wider rungs quantize on every block and run the GEMM at M = rows without the M1 map.
+        let wide = model(&c, 8192, 132, 0, true, 4);
+        let g = &wide.progs[0];
+        let mut count = 0;
+        for (ix, d) in g.insts.iter().enumerate() {
+            if d.op != DevOp::GemmFp8 as u16 {
+                continue;
+            }
+            count += 1;
+            let q = &g.insts[ix - 1];
+            assert_eq!(q.op, DevOp::QuantFp8 as u16);
+            assert_eq!(&q.i[..2], &[4, d.i[2]]);
+            assert_eq!(q.blocks, 132);
+            assert_eq!(d.i[0], 4);
+            assert_eq!((d.i[6], d.i[7]), (0, 0));
+            assert_eq!(wide.tensors[d.t[1] as usize].bytes, 4 * u64::from(d.i[2]));
+            assert_eq!(wide.tensors[d.t[3] as usize].bytes, 16);
+        }
+        assert_eq!(count, 31);
+        assert!(std::panic::catch_unwind(|| model(&c, 8192, 132, 0, true, 129)).is_err());
         assert!(std::panic::catch_unwind(|| model(&c, 8192, 132, 0, false, 1)).is_err());
     }
     #[test]

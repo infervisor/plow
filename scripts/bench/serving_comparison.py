@@ -281,6 +281,21 @@ SUPPLEMENTARY = (("goodput_req_s", "goodput", "{:.3f} req/s"), ("slo_attainment"
                  ("tpot_p50_ms", "TPOT P50", "{:.2f} ms"), ("cached_fraction", "cached prompt tokens", "{:.1%}"))
 
 
+def tokenizer_key(path):
+    # The two arms name the same tokenizer by different paths (checkpoint vs hf dir); pair on
+    # every file that shapes the token stream (vocabulary, merges, added tokens, chat template),
+    # falling back to the path when no vocabulary is on this box.
+    names = ("tokenizer.json", "tokenizer_config.json", "tokenizer.model", "vocab.json",
+             "merges.txt", "added_tokens.json", "special_tokens_map.json", "chat_template.jinja")
+    present = [f for f in (Path(path) / n for n in names) if f.is_file()]
+    if not any(f.name in ("tokenizer.json", "tokenizer.model", "vocab.json") for f in present):
+        return path
+    h = hashlib.sha256()
+    for f in present:
+        h.update(f.name.encode() + b"\0" + f.read_bytes())
+    return "sha256:" + h.hexdigest()[:16]
+
+
 def prod_run(root, tag, errors):
     path = root / f"{tag}.json"
     d = json.loads(path.read_text())
@@ -307,6 +322,8 @@ def prod_run(root, tag, errors):
     plan = {k: v for k, v in c.items()
             if k not in ("url", "out", "model", "seed", "timeout", "est_e2e_s", "target_concurrency")}
     plan["slo"] = [o["slo_ttft_ms"], o["slo_tpot_ms"]]
+    if "tokenizer" in plan:
+        plan["tokenizer"] = tokenizer_key(plan["tokenizer"])
     io_key = io + " #" + hashlib.sha256(json.dumps(plan, sort_keys=True).encode()).hexdigest()[:16]
     return dict(io=io, io_key=io_key, traffic=traffic, total_tok_s=o["total_tok_s"],
                 ttft_p99_ms=o.get("ttft_p99_ms"), tpot_p99_ms=o.get("tpot_p99_ms"),

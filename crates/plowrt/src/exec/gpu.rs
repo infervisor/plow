@@ -2417,17 +2417,24 @@ fn qwen_ride_operands(
         .collect()
 }
 
-fn check_qwen_w8a8_capability(prefill: bool, rows: u32, capability: Option<u32>) -> Result<()> {
+/// `decode_rows` is the object's `plow_fp8_decode_rows` (decode only): rung 1 needs the M1 arm,
+/// wider rungs also that advertised ceiling.
+fn check_qwen_w8a8_capability(
+    prefill: bool,
+    rows: u32,
+    capability: Option<u32>,
+    decode_rows: Option<u32>,
+) -> Result<()> {
     let supported_rows = if prefill {
         matches!(rows, 128 | 1024 | 4096 | 8192)
     } else {
-        rows == 1
+        rows == 1 || (rows > 1 && decode_rows.is_some_and(|cap| rows <= cap))
     };
     if !supported_rows || capability != Some(1) {
         return Err(RuntimeError::Rejected(if prefill {
             "Qwen W8A8 prefill requires a supported bucket and paired native FP8 prefill interpreter".into()
         } else {
-            "Qwen W8A8 requires batch-1 decode and the paired native FP8 M1 interpreter".into()
+            "Qwen W8A8 decode requires the paired native FP8 M1 interpreter, wider rungs within its advertised decode rows".into()
         }));
     }
     Ok(())
@@ -4493,6 +4500,7 @@ impl GpuEngine {
                 false,
                 blob.decode_prog()?.t,
                 be.module_global_u32(&module, "plow_fp8_m1_arm")?,
+                be.module_global_u32(&module, "plow_fp8_decode_rows")?,
             )?;
         }
         if gemv_mm_cap == Some(0) {
@@ -10749,6 +10757,7 @@ impl GpuEngine {
                     true,
                     g.t,
                     be.module_global_u32(&module, "plow_qwen_w8a8_prefill_arm")?,
+                    None,
                 )?;
             }
             if (qwen_program || qwen_segments.iter().any(Option::is_some))

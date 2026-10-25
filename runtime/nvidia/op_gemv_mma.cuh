@@ -286,15 +286,47 @@ __device__ __forceinline__ void gvmma_store2(__nv_bfloat16* C, unsigned N, unsig
 }
 
 /* Split-K reduction slots: partial warps (part > 0) park their C fragments here, part 0 sums.
- * Sized for the widest tile; static so the arms need no arena hand-off. */
+ * Sized for the widest tile; static so the arms need no arena hand-off. The FP8 M1 XCACHE
+ * objects (dynamic arena >= 51456 floats, 201 KiB) cannot also afford the static slots (40 KiB
+ * for the ladder's MT instantiations pushed the interpreter past the H100 opt-in limit), so
+ * they park the slots in the dynamic arena instead: every extern __shared__ array aliases the
+ * dynamic base, so there is still no hand-off. The offset clears the fused-NRN activation
+ * staging (xs at arena offset 0, at most RN_REG * threads bf16 + its scratch), the only arena
+ * user live while an MMA walk runs; interp_sm120.cu checks the arena is large enough once its
+ * size is final. Objects without that arena keep the static slots, byte for byte. */
+#if defined(PLOW_NV_HOPPER) && defined(PLOW_NV_FP8_M1) && PLOW_NV_FP8_M1 && PLOW_NV_FP8_M1_XCACHE && !PLOW_NV_PREFILL \
+    && !PLOW_NV_GEMV512_ROLE
+#define GVMMA_RED_DYN 1
+#define GVMMA_RED_DYN_OFF 16384u
+#else
+#define GVMMA_RED_DYN 0
+#define GVMMA_RED_DYN_OFF 0u
+#endif
+#define GVMMA_MT_MAX ((GV_MM_MAX + 15) / 16 > 1 ? (GV_MM_MAX + 15) / 16 : 1)
 template <int MT>
 struct gvmma_red_t { float v[PLOW_NV_WARPS - 1][32][MT * 4]; };
 /* One slot set per MT, shared by the GEMV and GLU split-K walks. */
 template <int MT>
 __device__ __forceinline__ gvmma_red_t<MT>& gvmma_red() {
+#if GVMMA_RED_DYN
+    extern __shared__ __align__(16) float gvmma_dyn[];
+    return *reinterpret_cast<gvmma_red_t<MT>*>(gvmma_dyn + GVMMA_RED_DYN_OFF);
+#else
     __shared__ gvmma_red_t<MT> red;
     return red;
+#endif
 }
+#if GVMMA_RED_DYN
+/* The paired walk's two slot sets follow the single set. */
+template <int MT>
+__device__ __forceinline__ gvmma_red_t<MT>* gvmma_red2() {
+    extern __shared__ __align__(16) float gvmma_dyn[];
+    return reinterpret_cast<gvmma_red_t<MT>*>(gvmma_dyn + GVMMA_RED_DYN_OFF
+                                              + sizeof(gvmma_red_t<MT>) / sizeof(float));
+}
+/* Bytes the relocated slots claim past the offset: one set plus the pair's two. */
+#define GVMMA_RED_DYN_BYTES (3u * sizeof(gvmma_red_t<GVMMA_MT_MAX>))
+#endif
 
 template <bool BIAS, int MT>
 __device__ __forceinline__ void gvmma_store_tile(__nv_bfloat16* __restrict__ C, const float (&acc)[MT][4],
@@ -342,7 +374,11 @@ __device__ __forceinline__ void gemv_rows_mma(__nv_bfloat16* __restrict__ C,
         /* Narrow N: the pairs of this block split K over S warps each, as the unpaired split-K
          * below does per row block — taken only when S divides the k-steps, else that one runs. */
         if (per != 0u && gpow <= PLOW_NV_WARPS / 2u && (nkb % (PLOW_NV_WARPS / gpow)) == 0u) {
+#if GVMMA_RED_DYN
+            gvmma_red_t<MT>* const red2 = gvmma_red2<MT>();
+#else
             __shared__ gvmma_red_t<MT> red2[2];
+#endif
             const unsigned S = PLOW_NV_WARPS / gpow;
             const unsigned grp = warp / S, part = warp % S;
             const unsigned rb = r.rb0 + 2u * grp;

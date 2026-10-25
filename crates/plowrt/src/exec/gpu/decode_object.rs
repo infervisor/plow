@@ -442,6 +442,7 @@ pub(super) fn bind(
                     false,
                     program.t,
                     be.module_global_u32(&module, "plow_fp8_m1_arm")?,
+                    be.module_global_u32(&module, "plow_fp8_decode_rows")?,
                 )?;
             }
         }
