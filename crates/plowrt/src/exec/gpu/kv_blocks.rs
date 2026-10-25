@@ -348,10 +348,12 @@ impl SnapBlocks for BlockServe {
                     queued += 1;
                 }
             }
-            let mut st = self.stats.lock();
-            st.restores += 1;
-            st.restore_blocks += queued;
-            st.restore_us += t0.elapsed().as_micros() as u64;
+            if queued > 0 {
+                let mut st = self.stats.lock();
+                st.restores += 1;
+                st.restore_blocks += queued;
+                st.restore_us += t0.elapsed().as_micros() as u64;
+            }
             return Ok(());
         }
         for id in ids {

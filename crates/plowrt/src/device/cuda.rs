@@ -1068,6 +1068,16 @@ impl CudaBackend {
     /// every later dispatch is short-circuited by `bind`, not re-logged.
     fn mark_poisoned(&self, info: &DeviceErrorInfo) {
         if self.poisoned.set(info.clone()).is_ok() {
+            // DEINITIALIZED is process teardown reaching a background thread (spill-ahead,
+            // chunk frees) after `process::exit`, not a device fault.
+            if info.code == 4 {
+                tracing::info!(
+                    error_op = %info.operation,
+                    device = self.device_ordinal,
+                    "CUDA driver deinitialized — rejecting further work on this device"
+                );
+                return;
+            }
             tracing::error!(
                 error_op = %info.operation,
                 error_code = info.code,
