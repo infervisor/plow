@@ -888,10 +888,12 @@ impl KvStore {
         let mut requeue = Vec::new();
         let mut found = None;
         while let Some(id) = inner.reclaim[class].pop_front() {
+            // A dropped id is reused by the next block of any class: the stale entry is skipped
+            // (that block queues under its own class when released).
             let Some(b) = inner.blocks[id as usize].as_ref() else {
                 continue;
             };
-            if b.dependents > 0 {
+            if b.dependents > 0 || b.class != class {
                 continue;
             }
             if b.holds > 0 || b.state == State::Filling {
@@ -1061,14 +1063,14 @@ impl KvStore {
             return Some(s);
         }
         // The oldest zero-dependent host block of this class gives up its slot; stale entries
-        // (re-acquired, dropped, back on the device) are skipped, other classes' re-queued.
+        // (re-acquired, dropped, back on the device, the id reused by another class) are skipped.
         let mut requeue = Vec::new();
         let mut victim = None;
         while let Some(id) = inner.host_reclaim[class].pop_front() {
             let Some(b) = inner.blocks[id as usize].as_ref() else {
                 continue;
             };
-            if b.dependents > 0 || !matches!(b.place, Where::Host(_)) {
+            if b.dependents > 0 || b.class != class || !matches!(b.place, Where::Host(_)) {
                 continue;
             }
             if b.holds > 0 {
@@ -1322,7 +1324,7 @@ impl KvStore {
                         let Some(b) = inner.blocks[id as usize].as_ref() else {
                             continue;
                         };
-                        if b.dependents > 0 {
+                        if b.dependents > 0 || b.class != ci {
                             continue;
                         }
                         let Where::Device(slot) = b.place else {
@@ -1792,6 +1794,88 @@ mod tests {
         let again = s.acquire(0, key(1)).unwrap();
         assert!(!again.fill, "a survived on the reclaim list");
         assert_eq!(s.stats().reclaims, 1);
+    }
+
+    #[test]
+    fn reclaim_skips_an_id_another_class_reused() {
+        let spec = |name| ClassSpec {
+            name,
+            row_bytes: 8,
+            rows_per_block: 4,
+        };
+        let s = KvStore::new(
+            MockOps::new(),
+            vec![spec("window"), spec("state")],
+            32,
+            3 * 32,
+            0,
+        );
+        let a = s.acquire(0, key(1)).unwrap();
+        let c = s.acquire(0, key(2)).unwrap();
+        s.seal(a.id);
+        s.seal(c.id);
+        s.release(&[a.id]);
+        // a is dropped; its id is free and its queue entry in class 0 stale.
+        assert_eq!(s.evict(&[a.id]), 1);
+        let b = s.acquire(1, key(3)).unwrap();
+        assert_eq!(b.id, a.id, "the freed id is reused by the other class");
+        s.seal(b.id);
+        s.release(&[b.id]);
+        let d = s.acquire(0, key(4)).unwrap();
+        assert_eq!(d.va, a.va);
+        s.seal(d.id);
+        // Class 0 is full and its queue holds only the stale id: a refusal, never b's slot.
+        assert!(s.acquire(0, key(5)).is_err());
+        assert_eq!(s.stats().refusals, 1);
+        assert!(!s.acquire(1, key(3)).unwrap().fill, "b survived");
+        s.release(&[c.id]);
+        let e = s.acquire(0, key(5)).unwrap();
+        assert_eq!(e.va, c.va);
+        assert_eq!(s.stats().reclaims, 1);
+    }
+
+    #[test]
+    fn host_reclaim_skips_an_id_another_class_reused() {
+        let spec = |name| ClassSpec {
+            name,
+            row_bytes: 8,
+            rows_per_block: 4,
+        };
+        let s = KvStore::new(
+            MockOps::new(),
+            vec![spec("window"), spec("state")],
+            32,
+            3 * 32,
+            2 * 32,
+        );
+        while s.host_grow_step() {}
+        let park = |id: BlockId| {
+            s.seal(id);
+            s.release(&[id]);
+            assert!(s.spill(&[id]));
+            s.reap();
+            assert_eq!(s.location(id), Some(Location::Host));
+        };
+        let a = s.acquire(0, key(1)).unwrap();
+        park(a.id);
+        // a is dropped off the host: its id is free, its host-queue entry in class 0 stale.
+        assert_eq!(s.evict(&[a.id]), 1);
+        let b = s.acquire(1, key(2)).unwrap();
+        assert_eq!(b.id, a.id, "the freed id is reused by the other class");
+        park(b.id);
+        let c = s.acquire(0, key(3)).unwrap();
+        park(c.id);
+        // Class 0's host slab is full and both host chunks are taken: the stale entry must not
+        // give up b's slot; c, the class's own oldest, does.
+        let d = s.acquire(0, key(4)).unwrap();
+        s.seal(d.id);
+        s.release(&[d.id]);
+        assert!(s.spill(&[d.id]));
+        s.reap();
+        assert_eq!(s.location(d.id), Some(Location::Host));
+        assert_eq!(s.location(c.id), None);
+        assert_eq!(s.location(b.id), Some(Location::Host), "b survived");
+        assert_eq!(s.stats().classes[1].host_blocks, 1);
     }
 
     #[test]
