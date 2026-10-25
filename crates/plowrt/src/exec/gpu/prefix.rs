@@ -8,7 +8,7 @@ use crate::device::cuda::CudaBackend;
 use crate::exec::kv_layout::kv_tensor_name;
 use crate::{Result, RuntimeError};
 
-use super::{recurrent_state_layout, GpuEngine};
+use super::GpuEngine;
 
 pub(crate) struct VmmPrefixLayout {
     pub(crate) geo: crate::memory::vmm::VmmGeometry,
@@ -244,9 +244,14 @@ impl GpuEngine {
                 // cold prompts give identical logprobs (docs/runtime/gemma4-e4b-h100.md).
                 && matches!(g.window, 512 | 1024)
                 && !layout.slide.is_empty()
-                && recurrent_state_layout(&blob.tensors, g.batch as usize)
-                    .ok()?
-                    .is_none();
+                && !blob
+                    .sections
+                    .iter()
+                    .any(|s| s.name == plow_asset::recurrent_state::SECTION)
+                && !blob
+                    .tensors
+                    .iter()
+                    .any(|t| t.name.starts_with("state.") || t.name == "in.active");
             tracing::info!(
                 selected = qualified,
                 hd_full = g.hd_full,

@@ -21,7 +21,7 @@ pub mod logical_effects;
 
 /// The plowrt runtime contract a bundle emitted by this tree declares (`build.json`
 /// `runtime_requires.plowrt_contract`); plowrt refuses a bundle that declares a higher one.
-pub const RUNTIME_CONTRACT: u32 = 1;
+pub const RUNTIME_CONTRACT: u32 = 2;
 
 // --- Shared domain enums -----------------------------------------------------
 
@@ -707,6 +707,7 @@ pub mod fp8_m1_role;
 pub mod segment_roles;
 
 pub mod kv_shared_tail;
+pub mod object_requirements;
 pub mod packed_prefill;
 pub mod spec_draft;
 
@@ -715,6 +716,7 @@ pub mod kv_ring;
 pub mod media_geometry;
 pub mod multimodal;
 pub mod packet_pipeline;
+pub mod recurrent_state;
 pub mod serve_manifest;
 pub mod speech_contract;
 pub mod speech_fusion;

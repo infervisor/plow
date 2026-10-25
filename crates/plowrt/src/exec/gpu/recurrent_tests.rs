@@ -199,81 +199,83 @@ fn fp8_role_rejects_mixed_missing_and_duplicate_work() {
 }
 
 #[test]
-fn qwen_w8a8_decode_and_prefill_require_separate_capabilities() {
-    assert!(check_qwen_w8a8_capability(false, 1, Some(1), None).is_ok());
-    assert!(check_qwen_w8a8_capability(false, 1, Some(1), Some(0)).is_ok());
-    assert!(check_qwen_w8a8_capability(false, 4, Some(1), None).is_err());
-    assert!(check_qwen_w8a8_capability(false, 4, Some(1), Some(1)).is_err());
-    for rows in [2, 4, 48, 128] {
-        assert!(check_qwen_w8a8_capability(false, rows, Some(1), Some(128)).is_ok());
-        assert!(check_qwen_w8a8_capability(false, rows, Some(0), Some(128)).is_err());
-    }
-    assert!(check_qwen_w8a8_capability(false, 129, Some(1), Some(128)).is_err());
-    assert!(check_qwen_w8a8_capability(false, 0, Some(1), Some(128)).is_err());
-    for rows in [128, 1024, 4096, 8192] {
-        assert!(check_qwen_w8a8_capability(true, rows, Some(1), None).is_ok());
-        assert!(check_qwen_w8a8_capability(true, rows, None, None).is_err());
-        assert!(check_qwen_w8a8_capability(true, rows, Some(0), None).is_err());
-    }
-    for rows in [1, 256, 16384] {
-        assert!(check_qwen_w8a8_capability(true, rows, Some(1), None).is_err());
-    }
-    assert!(check_qwen_w8a8_capability(false, 1, None, None).is_err());
-}
-
-#[test]
-fn active_only_block_uses_lifecycle_without_fake_state() {
-    let tensors = [tensor("in.active", 4)];
-    let block = recurrent_state_layout_with_active(&tensors, 1, true)
+fn recurrent_state_comes_from_the_section() {
+    use plow_asset::recurrent_state::{Buffer, Manifest, VERSION};
+    let tensors = [
+        tensor("state.qwen.0.conv", 4 * 61440),
+        tensor("state.qwen.0.gdn", 4 * 3145728),
+        tensor("in.active", 16),
+        tensor("act.gdn.initstate", 4 * 3145728),
+        tensor("kv.0.k", 4096),
+    ];
+    let manifest = Manifest {
+        version: VERSION,
+        slots: 4,
+        buffers: vec![
+            Buffer {
+                tensor: 0,
+                slot_bytes: 61440,
+            },
+            Buffer {
+                tensor: 1,
+                slot_bytes: 3145728,
+            },
+        ],
+        active: 2,
+        prefill_initstate: Some(Buffer {
+            tensor: 3,
+            slot_bytes: 3145728,
+        }),
+        prefill_updates_state: true,
+    };
+    let state = recurrent_state_from(Some(&manifest), &tensors, 4)
         .unwrap()
         .unwrap();
-    assert_eq!(block.active, 0);
-    assert!(block.tensors.is_empty());
-    assert!(recurrent_state_layout(&tensors, 1).unwrap().is_some());
-    assert!(recurrent_state_layout_with_active(&[], 1, true).is_err());
-    assert!(recurrent_state_layout_with_active(&tensors, 4, true).is_err());
-}
-
-#[test]
-fn dense_models_need_no_recurrent_mask() {
-    assert!(recurrent_state_layout(&[tensor("kv.0.k", 4096)], 1)
+    assert_eq!(state.active, 2);
+    assert_eq!(state.tensors, [(0, 61440), (1, 3145728)]);
+    assert_eq!(state.initstate, Some((3, 3145728)));
+    assert!(state.prefill_updates_state);
+    // Sized for the packet's physical slots, nothing else.
+    assert!(recurrent_state_from(Some(&manifest), &tensors, 8).is_err());
+    // Every state-class tensor is declared; a partial declaration is refused.
+    let mut partial = manifest.clone();
+    partial.buffers.remove(0);
+    assert!(matches!(
+        recurrent_state_from(Some(&partial), &tensors, 4),
+        Err(RuntimeError::Rejected(message)) if message.contains("does not declare")
+    ));
+    // Undeclared state-class tensors or the active mask predate the contract.
+    assert!(recurrent_state_from(None, &tensors, 4).is_err());
+    assert!(recurrent_state_from(None, &[tensor("in.active", 16)], 4).is_err());
+    assert!(recurrent_state_from(None, &[tensor("kv.0.k", 4096)], 4)
         .unwrap()
         .is_none());
-}
-
-#[test]
-fn state_regions_preserve_physical_slots() {
-    let tensors = [
-        tensor("state.qwen.0.conv", 4 * 10240 * 3 * 2),
-        tensor("state.qwen.0.gdn", 4 * 48 * 128 * 128 * 4),
-        tensor("in.active", 16),
-    ];
-    let state = recurrent_state_layout(&tensors, 4).unwrap().unwrap();
-    assert_eq!(state.active, 2);
-    assert_eq!(state.tensors, [(0, 10240 * 3 * 2), (1, 48 * 128 * 128 * 4)]);
-    for &(index, stride) in &state.tensors {
-        for slot in 0..4 {
-            assert!((slot + 1) * stride <= tensors[index].bytes);
-        }
-        assert_eq!(4 * stride, tensors[index].bytes);
-    }
-}
-
-#[test]
-fn invalid_state_or_missing_mask_is_rejected() {
-    assert!(recurrent_state_layout(&[tensor("state.qwen.0.gdn", 64)], 4).is_err());
-    for (name, bytes) in [
-        ("state.other.0.gdn", 64),
-        ("state.qwen.0.unknown", 64),
-        ("state.qwen.0.gdn", 63),
-        ("state.qwen.0.gdn", 0),
-    ] {
-        assert!(
-            recurrent_state_layout(&[tensor(name, bytes), tensor("in.active", 16)], 4).is_err()
-        );
-    }
-    assert!(
-        recurrent_state_layout(&[tensor("state.qwen.0.gdn", 64), tensor("in.active", 4)], 4)
-            .is_err()
-    );
+    // The GDN prefill operand must be a declared buffer of the library's stride, section or not.
+    let mut scan = DevInst64::default();
+    scan.op = DevOp::QwenGdnPrefill as u16;
+    scan.t[6] = 1;
+    let program = DevProg {
+        t: 128,
+        role: packet::devbuild::ProgramRole::PrefillBucket { rows: 128 },
+        n_counter: 1,
+        insts: vec![scan],
+        stream: vec![],
+        stream_ofs: vec![],
+        stream_len: vec![],
+        waits: vec![],
+        succs: vec![],
+        gq_stream: vec![],
+        gq_seg_ofs: vec![0, 1],
+        l2_domains: 0,
+    };
+    let declared = recurrent_state_from(Some(&manifest), &tensors, 4)
+        .unwrap()
+        .unwrap();
+    assert!(check_gdn_state_operands(&[&program], Some(&declared)).is_ok());
+    assert!(check_gdn_state_operands(&[&program], None).is_err());
+    let mut other = program;
+    other.insts[0].t[6] = 0;
+    assert!(check_gdn_state_operands(&[&other], Some(&declared)).is_err());
+    other.insts[0].op = DevOp::Gemm as u16;
+    assert!(check_gdn_state_operands(&[&other], None).is_ok());
 }

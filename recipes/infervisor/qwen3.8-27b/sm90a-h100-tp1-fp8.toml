@@ -9,7 +9,7 @@
 # (the same-precision peer) rather than the BF16 captures the BF16 recipe uses.
 #
 # Decode ladder (2026-10-25, branch kv-block-store, packet f71e777dea4324ac on plowrt bin25 from
-# the plow_git below): the W8A8 decode arms take 1..128 rows (`plow_fp8_decode_rows`), the GEMV
+# the plow_git below): the W8A8 decode arms take 1..128 rows (`plow_w8a8_vllm_decode_rows`), the GEMV
 # tensor-core reduction slots moved into the dynamic arena so the 205840 B XCACHE arena fits
 # (static smem 40464 -> 1040 B), and the decode-ladder validator normalizes the native FP8 GEMM
 # rungs (before that fix the server silently ran every step on the 48-row rung: c1 TPOT 62.7 ms).

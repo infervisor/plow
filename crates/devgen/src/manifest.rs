@@ -1572,7 +1572,7 @@ fn backend_nvcc(f: &Map<String, Value>, t: &Map<String, Value>, s: &Shapes) -> V
         if on("qwen_gdn") {
             req.push("PLOW_NV_FP8_M1=1".into());
             req.push("PLOW_NV_QUANT_FP8_VLLM=1".into());
-            // `plow_qwen_w8a8_prefill_arm` is 1 only for the qualified prefill epilogue.
+            // `plow_w8a8_vllm_prefill_abi` is 1 only for the qualified prefill epilogue.
             if s.prefill_fp8_gemm {
                 req.push("PLOW_NV_FP8_PF_SCALE_WFIRST=1".into());
             }

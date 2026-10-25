@@ -1031,7 +1031,7 @@ extern "C" __device__ __constant__ unsigned plow_fp8_kv_abi = 1;
 #define PLOW_NV_FP8_M1_ARENA 51456
 #endif
 /* Both XCACHE arenas hold the tiled W8A8 body's 3-stage 32 KiB ring (+1 KiB alignment), so the
- * decode GEMM_FP8 arm serves rungs 2..=128 as one 128-row M tile (plow_fp8_decode_rows). */
+ * decode GEMM_FP8 arm serves rungs 2..=128 as one 128-row M tile (plow_w8a8_vllm_decode_rows). */
 #define PGM90_FP8_DECODE_ROWS 128u
 #elif defined(PLOW_NV_HOPPER) && defined(PLOW_NV_FP8_M1) && PLOW_NV_FP8_M1 && PLOW_NV_FP8_M1_BK1024 && !PLOW_NV_PREFILL
 #define PLOW_NV_FP8_M1_ARENA 18688
@@ -2200,7 +2200,7 @@ __device__ __forceinline__ void plow_exec(const PlowDevInst* in, void* const* T,
         break;
 #endif
 #if defined(PLOW_NV_HOPPER) && defined(PLOW_NV_FP8_M1) && PLOW_NV_FP8_M1 && PLOW_NV_QUANT_FP8_VLLM
-/* Decode W8A8 rows this object accepts (plow_fp8_decode_rows): rung 1 runs the M1 arms;
+/* Decode W8A8 rows this object accepts (plow_w8a8_vllm_decode_rows): rung 1 runs the M1 arms;
  * rungs 2..=PGM90_FP8_DECODE_ROWS run ONE 128-row M tile of the Hopper W8A8 wgmma GEMM (the
  * prefill body without maps), which streams each weight N tile once exactly as M=1 does. That
  * body needs the 256-thread two-warpgroup layout and its staging ring in the arena. */
@@ -3442,15 +3442,18 @@ extern "C" __device__ unsigned plow_dsa_decode_batch_arm = 1;
 extern "C" __device__ unsigned plow_gemv_sm90_cta512_abi = 1;
 #endif
 #if PLOW_NV_QWEN_GDN && PLOW_NV_PREFILL && PLOW_NV_SCHED == 1 && !PLOW_NV_PLACE_DISPATCH && !PLOW_NV_GEMM_ONLY && !PLOW_NV_FA_ONLY && !PLOW_NV_SKELETON
-extern "C" __device__ unsigned plow_qwen_prefill_arm = 1;
+extern "C" __device__ unsigned plow_gdn_prefill_abi = 1;
 #else
-extern "C" __device__ unsigned plow_qwen_prefill_arm = 0;
+extern "C" __device__ unsigned plow_gdn_prefill_abi = 0;
 #endif
 #if PLOW_NV_QWEN_GDN && PLOW_NV_PREFILL && PLOW_NV_SCHED == 1 && !PLOW_NV_PLACE_DISPATCH && !PLOW_NV_GEMM_ONLY && !PLOW_NV_FA_ONLY && !PLOW_NV_SKELETON && defined(PLOW_NV_HOPPER) && PLOW_NV_TMA_GEMM && PLOW_NV_W8A8 && PLOW_NV_QUANT_FP8_VLLM && PLOW_NV_FP8_PF_SCALE_WFIRST && !PGM90_FP8_PROMOTE && (PLOW_NV_PF_GEMV_HEAD || !PLOW_PACKET_REQUIRES_PF_GEMV_HEAD) && PLOW_NV_THREADS == 256 && !PGM90_UNI_BN256 && !PLOW_NV_SEG_GEMM
-extern "C" __device__ unsigned plow_qwen_w8a8_prefill_arm = 1;
+extern "C" __device__ unsigned plow_w8a8_vllm_prefill_abi = 1;
 #else
-extern "C" __device__ unsigned plow_qwen_w8a8_prefill_arm = 0;
+extern "C" __device__ unsigned plow_w8a8_vllm_prefill_abi = 0;
 #endif
+/* The W8A8 opcode arms (GEMM_FP8 family, QUANT_FP8, GEMM_GLU_FP8, the W8A8 MoE prefill arm) are
+ * compiled; a packet's object_requirements section names this for every module that runs them. */
+extern "C" __device__ unsigned plow_w8a8_arms = PLOW_NV_W8A8;
 #if defined(PLOW_NV_HOPPER) && PLOW_NV_PREFILL && PLOW_NV_SEGMENTS && PLOW_NV_SEG_GEMM && PLOW_NV_GEMM_ONLY && PLOW_NV_SEG_OCC1 && PLOW_NV_MINBLK == 1 && PLOW_NV_THREADS == 256 && PLOW_NV_SCHED == 1 && !PLOW_NV_PLACE_DISPATCH && !PLOW_NV_SKELETON && !PLOW_NV_FA_ONLY && !PLOW_NV_FATLITE && PLOW_NV_TMA_GEMM && PLOW_NV_W8A8 && PLOW_NV_QUANT_FP8_VLLM && PLOW_NV_FP8_PF_SCALE_WFIRST && !PGM90_FP8_PROMOTE && PGM90_TMA_STAGES == 3 && !PGM90_UNI_BN256 && !defined(PLOW_NV_SEG_WS) && !PLOW_NV_SEG_WS_ENTRY && !PLOW_NV_SEG_WS384 && !PLOW_NV_SEG_SMALL_BF16 && !PLOW_NV_SEG_M64N64 && !PLOW_NV_SEG_M64N128
 extern "C" __device__ unsigned plow_fp8_gemm_tma128_abi = 1;
 #else
@@ -3477,11 +3480,11 @@ extern "C" __device__ unsigned plow_cublaslt_decode_abi = 1;
 extern "C" __device__ unsigned plow_cublaslt_decode_abi = 0;
 #endif
 #if defined(PLOW_NV_HOPPER) && defined(PLOW_NV_FP8_M1) && PLOW_NV_FP8_M1 && PLOW_NV_QUANT_FP8_VLLM && PLOW_NV_QWEN_GDN && !PLOW_NV_PREFILL && PLOW_NV_SCHED == 1 && !PLOW_NV_PLACE_DISPATCH && !PLOW_NV_GEMM_ONLY && !PLOW_NV_FA_ONLY && !PLOW_NV_SKELETON
-extern "C" __device__ unsigned plow_fp8_m1_arm = 1;
-extern "C" __device__ unsigned plow_fp8_decode_rows = PGM90_FP8_DECODE_ROWS;
+extern "C" __device__ unsigned plow_w8a8_vllm_decode_abi = 1;
+extern "C" __device__ unsigned plow_w8a8_vllm_decode_rows = PGM90_FP8_DECODE_ROWS;
 #else
-extern "C" __device__ unsigned plow_fp8_m1_arm = 0;
-extern "C" __device__ unsigned plow_fp8_decode_rows = 0;
+extern "C" __device__ unsigned plow_w8a8_vllm_decode_abi = 0;
+extern "C" __device__ unsigned plow_w8a8_vllm_decode_rows = 0;
 #endif
 #if PLOW_GEMV_PREFETCH && !PLOW_NV_PREFILL && PLOW_NV_GEMV_MMA
 /* Claim-ahead weight prefetch (op_gemv_mma.cuh): the walks the decode object runs for these

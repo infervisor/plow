@@ -1319,8 +1319,8 @@ fn phase(
 /// Set once `run` below emits for an AMD target: the AMD tile inventory, an AMD manifest, and
 /// an AMD interpreter object in place of the paired CUDA one. This is the DECODE gate.
 /// Decode rungs the W8A8 decode arm serves: rung 1 on the M1 kernels, wider rungs as one M tile
-/// of the Hopper W8A8 GEMM (`plow_fp8_decode_rows` on the object).
-const W8A8_DECODE_ROWS: u32 = 128;
+/// of the Hopper W8A8 GEMM (`plow_w8a8_vllm_decode_rows` on the object).
+pub(crate) const W8A8_DECODE_ROWS: u32 = 128;
 const AMD_QWEN_EMIT: bool = false;
 
 /// Set once a HIP chunked Gated DeltaNet prefill kernel and its `plowrt` adapter exist.
@@ -1413,6 +1413,52 @@ fn refuse_unimplemented_target(arch: &str, gpu: &str) {
         "qwen3_5 cannot be emitted for {arch}. Missing capability:\n  - {}",
         gaps.join("\n  - ")
     );
+}
+
+/// The RECURRENT STATE section (`plow_asset::recurrent_state`): every `state.qwen.*` buffer,
+/// the active mask and the packed-prefill initstate scratch, slot-major over the decode slots.
+fn recurrent_state_section(m: &Model, slots: u32) -> packet::devbuild::SectionData {
+    use plow_asset::recurrent_state::{Buffer, Manifest, TensorFacts, SECTION, VERSION};
+    let buffer = |index: usize| {
+        let t = &m.tensors[index];
+        assert!(
+            t.bytes % u64::from(slots) == 0,
+            "{} is not slot-major",
+            t.name
+        );
+        Buffer {
+            tensor: u16::try_from(index).expect("tensor handle"),
+            slot_bytes: u32::try_from(t.bytes / u64::from(slots)).expect("slot bytes"),
+        }
+    };
+    let position = |name: &str| m.tensors.iter().position(|t| t.name == name);
+    let dec_lo = packet::devbuild::decode_rung_lo(&m.prog_t);
+    let manifest = Manifest {
+        version: VERSION,
+        slots,
+        buffers: (0..m.tensors.len())
+            .filter(|&i| m.tensors[i].name.starts_with("state.qwen."))
+            .map(buffer)
+            .collect(),
+        active: u16::try_from(position("in.active").expect("in.active")).expect("tensor handle"),
+        prefill_initstate: position("act.gdn.initstate").map(buffer),
+        prefill_updates_state: m.progs[..dec_lo]
+            .iter()
+            .all(|p| p.insts.iter().any(|i| i.op == DevOp::QwenGdnPrefill as u16)),
+    };
+    manifest
+        .validate(slots, |h| {
+            m.tensors.get(h as usize).map(|t| TensorFacts {
+                bytes: t.bytes,
+                initialized: t.init.is_some(),
+            })
+        })
+        .unwrap_or_else(|error| panic!("recurrent state: {error}"));
+    packet::devbuild::SectionData {
+        kind: packet::devbuild::SECT_METADATA,
+        name: SECTION.into(),
+        data: serde_json::to_vec(&manifest).expect("recurrent state"),
+    }
 }
 
 pub(super) fn run(
@@ -1616,6 +1662,9 @@ pub(super) fn run(
             data: serde_json::to_vec(&live).expect("serialize LIVE KV manifest"),
         });
     }
+    crate::object_requirements::append(&m, &mut sections)
+        .unwrap_or_else(|error| panic!("object requirements: {error}"));
+    sections.push(recurrent_state_section(&m, batch));
     let bytes = if let Some(layer) = c.block {
         use plow_asset::*;
         let full = c.layers[layer];

@@ -91,6 +91,7 @@ pub mod mm;
 pub mod modular;
 mod mtp;
 mod mxfp4_moe_role;
+mod object_requirements;
 pub mod pipeline;
 mod projection_rewrite;
 mod rewrite_lower;
@@ -11357,11 +11358,9 @@ fn emit_dense_gqa(
     }
     let lean = apply_verify_gate(&m, verify.as_ref());
     modular::update_section_with_lean(&mut sections, &lean);
-    let blob = if sections.is_empty() {
-        m.to_blob()
-    } else {
-        m.to_blob_v6(&sections)
-    };
+    object_requirements::append(&m, &mut sections)
+        .unwrap_or_else(|error| panic!("object requirements: {error}"));
+    let blob = m.to_blob_v6(&sections);
     // Coverage gate BEFORE the blob lands on disk: a wrong .pkt that exists will be
     // benchmarked by someone. PLOW_SKIP_COVERAGE=1 is the deliberate escape hatch for
     // partial/renamed checkpoints; it is loud because it re-arms the silent-wrong-model
