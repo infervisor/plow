@@ -441,6 +441,74 @@ the router withholds the last few bytes in case they begin the close marker; whe
 ended first those bytes were simply dropped, so streamed `reasoning_content` came back up to
 `len("</think>")-1` bytes shorter than what the model produced.
 
+### Thinking control
+
+On a model whose trace markers are special tokens (Gemma 4), a chat request may bound its trace
+and its reply. The mux commits every generated id through `serve::think::ThinkCtl`; it needs no
+logits, so it works on every backend.
+
+| Field | Meaning |
+|---|---|
+| `thinking_token_budget` | vLLM's name and meaning: tokens allowed inside each trace block, a hard cap. A block that reaches it gets `reasoning_end` committed in place of the model's next tokens. `0` renders the template's thinking-off prompt (no thinking beats a truncated trace at small budgets); `-1` / absent = no budget. Below `-1` is a 400. A positive budget on a model whose markers are not special tokens is a 400. |
+| `max_reply_tokens` | plow extension: tokens after the trace. Reaching it ends the request with `finish_reason: "length"` and `x_plow_finish_reason: "reply_cap"`. At least 1 and at most `max_tokens`. |
+| `reasoning_end` | plow extension: what ends a block over budget, a bridge sentence and then the close marker (`"…Replying now.<channel\|>"`); empty or absent = the marker alone. Must end with the marker (400 otherwise). A forced end the model already began is resumed, not repeated. |
+
+The budget applies only when thinking is on for the rendered prompt and re-arms per block: Gemma 4
+can open a second thought channel after its answer began, and that block gets its own budget (and
+is split into `reasoning`, not `content`). The final choice carries `x_plow_thinking: {"blocks",
+"forced", "grace_tokens"}`. The chained decode paths (CUDA pipelined lookahead and multi-step
+quantum, AMD multi-step, speculative verify) shorten their chain so a forced id only ever replaces
+the last token of one; a forced id drops that token's `logprobs` entry.
+
+**Per-model defaults** come from `--chat-defaults <file.json>` (`PLOW_CHAT_DEFAULTS`), keyed by
+served model name; a request field overrides its default:
+
+```json
+{"gemma26b-thinking": {
+  "max_tokens": 450,
+  "thinking_token_budget": 160,
+  "max_reply_tokens": 120,
+  "reasoning_end": "\nStop. Replying now, in the caller's language, one question only.<channel|>",
+  "thought_prefix": "<|channel>thought\nThe caller just said",
+  "newline_grace": 12,
+  "chat_template_kwargs": {"enable_thinking": true},
+  "reply_stop_blank_line": true,
+  "reply_guard": "voice",
+  "reply_guard_lines": {"wait": {"hi": "एक सेकंड, कृपया।"}, "goodbye": {"hi": "धन्यवाद, नमस्ते।"}}
+}}
+```
+
+`thought_prefix` (defaults only) is appended after the generation prompt when thinking is on and
+no call is forced; after a tool result, where the template already opened the channel, only its
+seed text is. Its tokens are prompt, not budget. `newline_grace` lets a block run up to that many
+tokens past its budget to finish its line before the forced end. An unknown key, an unknown model,
+a `thought_prefix` that does not start with the open marker or a budget the model cannot honour
+fails startup; each model logs one `chat defaults` line, and the marker ids once on first use.
+
+`reply_stop_blank_line` ends the request (`finish_reason: "stop"`) at a blank line after the reply
+has begun; a second paragraph of a spoken reply is narration. `"reply_guard": "voice"` moves
+planning lines out of `content` into `reasoning` on both response paths (`serve::reply_guard`):
+lines opening with `Wait`, `Hmm`, `Alternatively`, `The user/caller/prompt…`, `Let me`,
+`I should`, `*`/`(`/`[`, a short label and a colon (`Who is calling: …`), or a status line
+(`Tamil detected.`, `None.`). A line is held only until its prefix settles it, so a spoken line is
+released before its newline; lines in Devanagari, Bengali or Tamil script pass. A turn left with
+nothing to say (and no tool call) answers the `reply_guard_lines` line for the script of the
+caller's last message (`hi` by default), `goodbye` when a moved line talks of ending the call,
+else `wait`. `x_plow_thinking.guard_moved` reports a move. The rules are heuristics for voice
+traffic and are off unless configured.
+
+`"live_reasoning_end": true` lets a client end a running request's trace from outside, for a
+caller who barges in: `POST /v1/requests/{id}/reasoning_end` (the request's `X-Request-Id`,
+echoed on its response) answers 200 while the request is in flight under thinking control, else
+404 `request_not_found`. The forced `reasoning_end` follows within 16 tokens
+(`serve::think::LIVE_CHAIN`): such a request's device-chained decode (pipelined lookahead,
+multi-step quantum, speculative verify) is capped at that length so the forced ids never land
+inside a chain.
+
+GPU soundness gates for all of the above (byte-identical output across the chained decode paths
+under forcing, seeded reproducibility, no-budget TPOT): `scripts/bench/thinking_gates.sh`, run
+through `scripts/bench/gpuq.py`.
+
 ## 5. The catalogue, usage and metrics
 
 - **`GET /v1/models` stamped `created` with `now_secs()` per card**, so it changed on every
@@ -535,15 +603,9 @@ assistant turn.
   incremental per-token `arguments` streaming, DeepSeek's `<｜tool▁calls▁begin｜>` and DSML
   syntaxes (no DeepSeek checkpoint ships a template that renders `tools`), and Hermes-3's named
   `tool_use` template (the default template is picked).
-- **Only think-tag reasoning is parsed** (outside tool requests; a gpt-oss tool request parses
-  its harmony channels, §2b). `ReasoningMode` covers `<think>`/`</think>`, which is
-  how GLM, Qwen3 and DeepSeek-R1 frame a trace. gpt-oss's harmony channels are NOT parsed and
-  its trace still reaches `content`. A harmony arm was written and then removed rather than
-  shipped: the built-in `harmony_chat_prompt` pins the FINAL channel (reasoning off), so a mode
-  that assumes a trace is open from token zero would route the whole answer into
-  `reasoning_content` and return an empty `content` — the exact failure this section exists to
-  remove — and there is no gpt-oss checkpoint on this host to settle what the real template
-  renders. The mode enum is the seam: a verified harmony arm is a variant and a close marker.
+- **gpt-oss's harmony channels are split only by its tool parser** (§2b; also without `tools`).
+  `ReasoningMode` covers `<think>`/`</think>` (GLM, Qwen3, DeepSeek-R1) and a packet- or
+  template-declared pair (Gemma 4's `<|channel>thought` / `<channel|>`, §4 "Thinking control").
 - **`logprobs` is served on the CUDA engine only** (chat `logprobs`/`top_logprobs`, completions
   `logprobs` 0..=20, plus vLLM's `logprobs_mode` `raw_logprobs`|`raw_logits` per request and
   `return_tokens_as_token_ids`); other backends refuse it with 400. Values are the raw model
@@ -558,10 +620,9 @@ assistant turn.
   and a non-loopback bind logs a warning. Put a TLS-terminating proxy in front of a public bind.
   A blanket request timeout is deliberately absent for text, because one would cut legitimate
   long generations; transcriptions have one (`--asr-request-timeout-ms`, 120 s, 504).
-- **Reasoning traces spend `max_tokens`.** There is no separate budget for the trace, so a
-  reasoning model with a small cap can be truncated before its answer. `chat_template_kwargs`
-  now gives clients the same escape hatch they use against vLLM, but a real reasoning budget is
-  a scheduler feature, not an API one.
+- **Reasoning traces spend `max_tokens`.** `max_tokens` still counts trace and reply together;
+  `thinking_token_budget` and `max_reply_tokens` (§4 "Thinking control") bound each part, on
+  models whose markers are special tokens only.
 - **No per-model fairness.** Co-tenants on a device group take turns through
   `cosched::DeviceTurn` with no weight or priority.
 

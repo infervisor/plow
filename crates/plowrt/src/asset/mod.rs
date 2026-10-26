@@ -65,6 +65,9 @@ pub struct ModelBundle {
     /// Built on the first tool-calling request.
     special_text: std::sync::OnceLock<Arc<crate::serve::tools::SpecialText>>,
     reasoning_specials: std::sync::OnceLock<bool>,
+    think_markers: std::sync::OnceLock<
+        std::result::Result<Arc<crate::serve::think::ThinkMarkers>, String>,
+    >,
 }
 
 impl ModelBundle {
@@ -142,6 +145,7 @@ impl ModelBundle {
             serve,
             special_text: std::sync::OnceLock::new(),
             reasoning_specials: std::sync::OnceLock::new(),
+            think_markers: std::sync::OnceLock::new(),
         })
     }
 
@@ -163,6 +167,38 @@ impl ModelBundle {
                 s.any_in(open) || s.any_in(close)
             })
         })
+    }
+
+    /// The reasoning markers as token ids, for thinking control; why not when the model has none
+    /// or they are not special tokens. Built (and logged) on first use: it scans the vocabulary.
+    pub fn think_markers(
+        &self,
+    ) -> std::result::Result<Arc<crate::serve::think::ThinkMarkers>, String> {
+        self.think_markers
+            .get_or_init(|| {
+                let markers = self
+                    .reasoning
+                    .markers()
+                    .ok_or_else(|| "the model has no reasoning markers".to_string())?;
+                let m = crate::serve::think::ThinkMarkers::tokenize(
+                    self.tokenizer.as_ref(),
+                    self.special_text(),
+                    markers,
+                );
+                match &m {
+                    Ok(m) => tracing::info!(
+                        open = markers.0,
+                        open_id = m.open,
+                        close = markers.1,
+                        close_id = m.close,
+                        newline_ids = m.newline.len(),
+                        "thinking control: marker ids"
+                    ),
+                    Err(e) => tracing::warn!(error = %e, "thinking control unavailable"),
+                }
+                m.map(Arc::new)
+            })
+            .clone()
     }
 
     /// The checkpoint's serving config (sampling defaults + reasoning framing).

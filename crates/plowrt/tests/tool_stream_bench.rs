@@ -243,6 +243,7 @@ fn run(case: &Case, toks: &[String], strip: &Arc<SpecialText>, head: &FrameHead)
                     logprobs: None,
                     finish_reason: None,
                     x_plow_finish_reason: None,
+                    x_plow_thinking: None,
                 });
                 bytes += f.len();
             }

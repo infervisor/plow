@@ -20,12 +20,15 @@ pub struct ServingConfig {
     /// these; a request that omits it gets the checkpoint's value, NOT the
     /// process-wide default.
     pub default_sampling: SamplingParams,
+    /// The deployment's request defaults for this model (`--chat-defaults`), set once at startup.
+    pub chat: std::sync::OnceLock<ChatDefaults>,
 }
 
 impl Default for ServingConfig {
     fn default() -> Self {
         ServingConfig {
             default_sampling: SamplingParams::default(),
+            chat: std::sync::OnceLock::new(),
         }
     }
 }
@@ -61,6 +64,141 @@ impl ServingConfig {
     pub fn load(dir: &Path) -> Self {
         Self::from_defaults(plow_asset::serve_manifest::read_sampling(dir).as_ref())
     }
+}
+
+/// Per-model request defaults from `--chat-defaults` (`PLOW_CHAT_DEFAULTS`): a JSON object keyed
+/// by served model name, the model-default layer for request fields `generation_config.json` does
+/// not carry. A request field overrides its default.
+#[derive(Clone, Debug, Default, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ChatDefaults {
+    pub max_tokens: Option<u32>,
+    pub thinking_token_budget: Option<i64>,
+    pub max_reply_tokens: Option<u32>,
+    /// Committed in place of the model's tokens once a trace block's budget is spent (a bridge
+    /// sentence, then the close marker).
+    pub reasoning_end: Option<String>,
+    /// Appended after the generation prompt when thinking is on: the open marker and seed text.
+    pub thought_prefix: Option<String>,
+    /// Trace tokens allowed past the budget while waiting for a line end.
+    #[serde(default)]
+    pub newline_grace: u32,
+    /// Under the request's own.
+    pub chat_template_kwargs: Option<std::collections::BTreeMap<String, serde_json::Value>>,
+    /// Move planning lines out of the answer (`serve::reply_guard`).
+    pub reply_guard: Option<crate::serve::reply_guard::GuardMode>,
+    /// The guard's fallback lines for an answer left empty.
+    pub reply_guard_lines: Option<crate::serve::reply_guard::GuardLines>,
+    /// A blank line after the trace ends the request (`finish_reason: "stop"`): a second
+    /// paragraph of a voice reply is narration.
+    #[serde(default)]
+    pub reply_stop_blank_line: bool,
+    /// `POST /v1/requests/{id}/reasoning_end` may end a thinking request's trace while it runs
+    /// (a caller barged in). Caps that request's device-chained decode at
+    /// [`crate::serve::think::LIVE_CHAIN`] tokens.
+    #[serde(default)]
+    pub live_reasoning_end: bool,
+}
+
+/// Why a thinking-control value cannot apply to a model with these markers.
+pub fn check_thinking(
+    markers: Option<(&str, &str)>,
+    budget: Option<i64>,
+    reasoning_end: Option<&str>,
+) -> Result<(), (&'static str, String)> {
+    if budget.is_some_and(|b| b < -1) {
+        return Err((
+            "thinking_token_budget",
+            "`thinking_token_budget` must be -1 (off), 0 (thinking off) or a token count".into(),
+        ));
+    }
+    if let Some(end) = reasoning_end.filter(|e| !e.is_empty()) {
+        match markers {
+            Some((_, close)) if end.ends_with(close) => {}
+            _ => {
+                return Err((
+                    "reasoning_end",
+                    format!(
+                        "`reasoning_end` must end with the model's close marker {:?}",
+                        markers.map_or("", |m| m.1)
+                    ),
+                ))
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Read the defaults file once at startup and give each model its entry (`resolve` maps a served
+/// name or alias to the model's canonical name and bundle). An unknown key or model is an error,
+/// not a no-op.
+pub fn load_chat_defaults(
+    path: &Path,
+    resolve: impl Fn(&str) -> Option<(String, std::sync::Arc<crate::asset::ModelBundle>)>,
+) -> Result<(), String> {
+    let text = std::fs::read_to_string(path).map_err(|e| format!("{}: {e}", path.display()))?;
+    let file: std::collections::HashMap<String, ChatDefaults> =
+        serde_json::from_str(&text).map_err(|e| format!("{}: {e}", path.display()))?;
+    for (name, d) in file {
+        let (canonical, bundle) = resolve(&name)
+            .ok_or_else(|| format!("{}: no served model is named {name:?}", path.display()))?;
+        let markers = bundle.reasoning().markers();
+        let bad = |field: &str, why: String| format!("{}: {name}.{field}: {why}", path.display());
+        check_thinking(markers, d.thinking_token_budget, d.reasoning_end.as_deref())
+            .map_err(|(f, e)| bad(f, e))?;
+        if let Some(p) = &d.thought_prefix {
+            if !markers.is_some_and(|(open, _)| p.starts_with(open)) {
+                return Err(bad(
+                    "thought_prefix",
+                    format!(
+                        "must start with the open marker {:?}",
+                        markers.map_or("", |m| m.0)
+                    ),
+                ));
+            }
+        }
+        if d.reply_guard_lines.is_some() && d.reply_guard.is_none() {
+            return Err(bad("reply_guard_lines", "set without `reply_guard`".into()));
+        }
+        if d.reply_stop_blank_line {
+            bundle
+                .think_markers()
+                .map_err(|e| bad("reply_stop_blank_line", e))?;
+        }
+        if d.live_reasoning_end {
+            bundle
+                .think_markers()
+                .map_err(|e| bad("live_reasoning_end", e))?;
+        }
+        if d.max_reply_tokens == Some(0) {
+            return Err(bad("max_reply_tokens", "must be at least 1".into()));
+        }
+        if d.thinking_token_budget.is_some_and(|b| b > 0) || d.max_reply_tokens.is_some() {
+            bundle
+                .think_markers()
+                .map_err(|e| bad("thinking_token_budget", e))?;
+        }
+        tracing::info!(
+            model = %canonical,
+            max_tokens = ?d.max_tokens,
+            thinking_token_budget = ?d.thinking_token_budget,
+            max_reply_tokens = ?d.max_reply_tokens,
+            newline_grace = d.newline_grace,
+            reasoning_end = ?d.reasoning_end,
+            reply_guard = ?d.reply_guard,
+            reply_stop_blank_line = d.reply_stop_blank_line,
+            thought_prefix = ?d.thought_prefix,
+            chat_template_kwargs = ?d.chat_template_kwargs,
+            "chat defaults"
+        );
+        bundle.serving().chat.set(d).map_err(|_| {
+            format!(
+                "{}: {canonical} has defaults under two names",
+                path.display()
+            )
+        })?;
+    }
+    Ok(())
 }
 
 #[cfg(test)]

@@ -61,6 +61,8 @@ pub struct TokenUsage {
     /// Prompt tokens attached from the prefix cache (KV not recomputed).
     pub cached_tokens: usize,
     pub completion_tokens: usize,
+    /// Set when the request ran under thinking control.
+    pub think: Option<crate::serve::think::ThinkReport>,
 }
 
 /// OpenAI-compatible finish reason.
@@ -72,6 +74,8 @@ pub enum FinishReason {
     /// preemptive drain) — the stream carries everything generated so far and
     /// the client should retry for the remainder.
     Preempted,
+    /// The request's `max_reply_tokens` ended the reply after its trace.
+    ReplyCap,
 }
 
 impl FinishReason {
@@ -81,6 +85,7 @@ impl FinishReason {
             FinishReason::Stop => "stop",
             FinishReason::Length => "length",
             FinishReason::Preempted => "preempted",
+            FinishReason::ReplyCap => "reply_cap",
         }
     }
 
@@ -93,13 +98,13 @@ impl FinishReason {
     pub fn as_openai(self) -> &'static str {
         match self {
             FinishReason::Stop => "stop",
-            FinishReason::Length | FinishReason::Preempted => "length",
+            FinishReason::Length | FinishReason::Preempted | FinishReason::ReplyCap => "length",
         }
     }
 
     /// Whether the wire value hides a plow-specific cause worth reporting.
     pub fn is_vendor_specific(self) -> bool {
-        matches!(self, FinishReason::Preempted)
+        matches!(self, FinishReason::Preempted | FinishReason::ReplyCap)
     }
 }
 
@@ -274,6 +279,7 @@ mod tests {
                 logprobs: None,
                 finish_reason: None,
                 x_plow_finish_reason: None,
+                x_plow_thinking: None,
             };
             let full = ChatChunk {
                 id: "chatcmpl-9".into(),

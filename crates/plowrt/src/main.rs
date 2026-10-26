@@ -4605,6 +4605,15 @@ async fn serve(
         served_model_name,
     )
     .await?;
+    if let Some(path) = &plowrt::config::RuntimeConfig::get().chat_defaults {
+        plowrt::serve::config::load_chat_defaults(path, |name| {
+            let slug = state
+                .registry
+                .resolve(name)
+                .unwrap_or_else(|| name.to_string());
+            state.registry.get(&slug).ok().map(|b| (slug, b))
+        })?;
+    }
     #[cfg(feature = "cuda")]
     {
         let state = Arc::clone(&state);

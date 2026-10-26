@@ -1085,6 +1085,16 @@ impl Slot {
     fn plain_decode(&self) -> bool {
         self.speech.is_some()
     }
+
+    /// Tokens a chained decode path may produce for this row before the host must see one
+    /// ([`crate::serve::think::ThinkCtl::chain_left`]).
+    #[cfg_attr(not(any(feature = "cuda", feature = "hsa")), allow(dead_code))]
+    fn chain_left(&self) -> usize {
+        self.gen
+            .think
+            .as_ref()
+            .map_or(usize::MAX, |t| t.chain_left())
+    }
 }
 
 /// Buffers reused across ticks for one bucket. Reallocated only when the live
@@ -3038,6 +3048,11 @@ async fn preempt_slots(slots: &mut [Option<Slot>], arena: &Option<SharedKvState>
                 prompt_tokens: slot.prompt_ids.len(),
                 cached_tokens: slot.cached_tokens,
                 completion_tokens: slot.out_ids.len(),
+                think: slot
+                    .gen
+                    .think
+                    .as_deref()
+                    .map(crate::serve::think::ThinkCtl::report),
             },
         };
         // A dropped terminal is not a lost token — it is a 500 ("stream ended
@@ -3992,6 +4007,7 @@ fn run_one_tick(
                         let lookahead = feeds.iter().all(|&(i, _)| {
                             slots[i].as_ref().is_some_and(|s| {
                                 s.gen.max_tokens.max(1).saturating_sub(s.step) >= 2
+                                    && s.chain_left() >= 2
                             })
                         });
                         let mut done = std::mem::take(&mut obs.host.pipe_tokens);
@@ -4042,7 +4058,13 @@ fn run_one_tick(
                         let remaining = feeds
                             .iter()
                             .filter_map(|&(i, _)| slots[i].as_ref())
-                            .map(|slot| slot.gen.max_tokens.max(1).saturating_sub(slot.step))
+                            .map(|slot| {
+                                slot.gen
+                                    .max_tokens
+                                    .max(1)
+                                    .saturating_sub(slot.step)
+                                    .min(slot.chain_left())
+                            })
                             .min()
                             .unwrap_or(1);
                         let requested = multistep_requested(
@@ -5599,7 +5621,12 @@ fn run_one_tick(
             let remaining = feeds
                 .iter()
                 .filter_map(|&(i, _)| slots[i].as_ref())
-                .map(|slot| slot.gen.max_tokens.saturating_sub(slot.out_ids.len()))
+                .map(|slot| {
+                    slot.gen
+                        .max_tokens
+                        .saturating_sub(slot.out_ids.len())
+                        .min(slot.chain_left())
+                })
                 .min()
                 .unwrap_or(1);
             let requested = amd_multistep_requested(
@@ -8534,6 +8561,7 @@ fn gpu_spec_caps(
             .max_tokens
             .max(1)
             .saturating_sub(s.step)
+            .min(s.chain_left())
             .saturating_sub(1);
         let room = e.max_ctx().saturating_sub(e.slot_pos(i) + 1);
         let cap = if gpu_spec_drafts(&s.gen.params) && (!ready || e.spec_draft_ready(i)) {
@@ -8994,6 +9022,19 @@ fn handle_produced_token(
         telemetry.token(slot.cached_tokens);
     }
     crate::obs::tick::trace_token(slot.arrived, slot.step == 0);
+    let mut token = token;
+    let mut reply_capped = false;
+    if let Some(t) = slot.gen.think.as_mut() {
+        let c = t.commit(token);
+        if c.replaced {
+            // Sampled for the replaced id: neither its logprobs nor the device penalty
+            // history's count describe the output any more.
+            slot.lp = None;
+            slot.dev_pen_counted = usize::MAX;
+        }
+        token = c.token;
+        reply_capped = c.capped;
+    }
     slot.out_ids.push(token);
     slot.executed += exec;
     slot.step += 1;
@@ -9024,7 +9065,7 @@ fn handle_produced_token(
                 Some(ids) => ids.contains(&token),
                 None => token % 256 == u32::from(b'\n'),
             });
-    let stop_max = slot.step >= slot.gen.max_tokens.max(1);
+    let stop_max = slot.step >= slot.gen.max_tokens.max(1) || reply_capped;
     // A stop token's own text stays out of the decode; the stream's last token flushes bytes held
     // for a UTF-8 continuation that will now never come.
     let delta = if slot.raw_tokens {
@@ -9040,6 +9081,9 @@ fn handle_produced_token(
             slot.gen.keep_special_tokens,
         )
     };
+    if let Some(t) = slot.gen.think.as_mut() {
+        t.arm(&slot.out_ids, slot.read_offset < slot.out_ids.len());
+    }
 
     // OPENAI `stop` STRINGS. The request field was not parsed at all before, so
     // a client that relied on `stop` to end a step — every LangChain ReAct or
@@ -9052,6 +9096,17 @@ fn handle_produced_token(
     // Stop-string bookkeeping over the run of generated-but-unemitted bytes. Extracted so it
     // can be driven token by token in a test: both bugs it has carried lived in the SEQUENCING
     // of hold, release and cut, not in either helper, and nothing exercised that.
+    // `reply_stop_blank_line`: a blank line after the reply began ends the request there.
+    let mut delta = delta;
+    let stop_blank = !stop_token
+        && !below_min
+        && slot
+            .gen
+            .think
+            .as_mut()
+            .and_then(|t| t.blank_line(&delta))
+            .map(|cut| delta.truncate(cut))
+            .is_some();
     let (delta, stop_string) = if !slot.gen.ignore_eos && !below_min && !slot.gen.stop.is_empty() {
         apply_stop_strings(
             &mut slot.stop_tail,
@@ -9064,7 +9119,10 @@ fn handle_produced_token(
     };
     // Held bytes are text once the request ends without a stop-string match; dropping them
     // truncated the answer.
-    let delta = if (stop_token || stop_max) && !stop_string && !slot.stop_pending.is_empty() {
+    let delta = if (stop_token || stop_max || stop_blank)
+        && !stop_string
+        && !slot.stop_pending.is_empty()
+    {
         let mut d = delta;
         d.push_str(&std::mem::take(&mut slot.stop_pending));
         d
@@ -9088,8 +9146,11 @@ fn handle_produced_token(
     if slot.step == 1 && crate::obs::host::on() {
         crate::obs::host::first_token(slot.prompt_ids.len(), slot.arrived.elapsed());
     }
-    if stop_token || stop_max || stop_string {
-        let reason = if stop_max && !stop_token && !stop_string {
+    if stop_token || stop_max || stop_string || stop_blank {
+        let ended = stop_token || stop_string || stop_blank;
+        let reason = if reply_capped && !ended {
+            FinishReason::ReplyCap
+        } else if stop_max && !ended {
             FinishReason::Length
         } else {
             FinishReason::Stop
@@ -9110,6 +9171,11 @@ fn handle_produced_token(
                     prompt_tokens: slot.prompt_ids.len(),
                     cached_tokens: slot.cached_tokens,
                     completion_tokens: slot.out_ids.len(),
+                    think: slot
+                        .gen
+                        .think
+                        .as_deref()
+                        .map(crate::serve::think::ThinkCtl::report),
                 },
             })
             .is_err();
@@ -9190,6 +9256,11 @@ fn flush_parked(slot_opt: &mut Option<Slot>, arena: &Option<SharedKvState>) -> b
                 prompt_tokens: slot.prompt_ids.len(),
                 cached_tokens: slot.cached_tokens,
                 completion_tokens: slot.out_ids.len(),
+                think: slot
+                    .gen
+                    .think
+                    .as_deref()
+                    .map(crate::serve::think::ThinkCtl::report),
             },
         });
     } else if since.elapsed() > PARK_TIMEOUT {
@@ -9366,6 +9437,7 @@ pub(crate) fn scripted_mux(
                 prompt_tokens: job.prompt_ids.len(),
                 cached_tokens: 0,
                 completion_tokens: n,
+                think: None,
             };
             let _ = job
                 .respond
@@ -11121,7 +11193,6 @@ mod tests {
         assert_eq!(completed_decode(&[], 4), None);
     }
 
-    #[cfg(feature = "cuda")]
     fn prefill_test_bundle(name: &str) -> ModelBundle {
         let dir =
             std::env::temp_dir().join(format!("plowrt-prefill-{name}-{}", std::process::id()));
@@ -11134,6 +11205,119 @@ mod tests {
         let bundle = ModelBundle::load(&dir).unwrap();
         std::fs::remove_dir_all(dir).unwrap();
         bundle
+    }
+
+    /// Thinking control on committed ids: a spent budget commits the forced end in place of the
+    /// sampled tokens, and the reply cap ends the request as `ReplyCap` with the controller's report.
+    #[test]
+    fn thinking_control_forces_the_end_and_caps_the_reply() {
+        use crate::serve::think::{ThinkCtl, ThinkLimits, ThinkMarkers, ThinkReport};
+        let bundle = prefill_test_bundle("think");
+        let (mut slot, mut rx) = prefill_test_slot();
+        let s = slot.as_mut().unwrap();
+        s.gen.max_tokens = 64;
+        s.gen.think = Some(Box::new(ThinkCtl::new(
+            Arc::new(ThinkMarkers {
+                open: u32::from(b'{'),
+                close: u32::from(b'}'),
+                newline: vec![u32::from(b'\n')],
+            }),
+            ThinkLimits {
+                budget: Some(3),
+                reply_cap: Some(2),
+                forced_end: [b'O', b'K', b'}'].map(u32::from).into(),
+                grace: 0,
+                stop_blank_line: false,
+                live: None,
+            },
+            true,
+        )));
+        let mut tokens = 0;
+        for b in *b"abcdefXYZ" {
+            handle_produced_token(
+                &mut slot,
+                &None,
+                &bundle,
+                u32::from(b),
+                1,
+                &mut tokens,
+                Some(&[]),
+            );
+            if slot.is_none() {
+                break;
+            }
+        }
+        assert!(slot.is_none(), "the reply cap ended the request");
+        let (mut text, mut done) = (String::new(), None);
+        while let Ok(chunk) = rx.try_recv() {
+            match chunk {
+                StreamChunk::Token { text: t, .. } => text.push_str(&t),
+                StreamChunk::Done { reason, usage, .. } => done = Some((reason, usage)),
+                StreamChunk::Err(e) => panic!("{e}"),
+            }
+        }
+        assert_eq!(text, "abcOK}XY");
+        let (reason, usage) = done.unwrap();
+        assert!(matches!(reason, FinishReason::ReplyCap));
+        assert_eq!(usage.completion_tokens, 8);
+        assert_eq!(
+            usage.think,
+            Some(ThinkReport {
+                blocks: 1,
+                forced: 1,
+                grace_tokens: 0,
+                guard_moved: false
+            })
+        );
+    }
+
+    /// `reply_stop_blank_line`: a blank line after reply text ends the request there, as a stop.
+    #[test]
+    fn a_blank_line_in_the_reply_stops_the_request() {
+        use crate::serve::think::{ThinkCtl, ThinkLimits, ThinkMarkers};
+        let bundle = prefill_test_bundle("think-blank");
+        let (mut slot, mut rx) = prefill_test_slot();
+        let s = slot.as_mut().unwrap();
+        s.gen.max_tokens = 64;
+        s.gen.think = Some(Box::new(ThinkCtl::new(
+            Arc::new(ThinkMarkers {
+                open: u32::from(b'{'),
+                close: u32::from(b'}'),
+                newline: vec![u32::from(b'\n')],
+            }),
+            ThinkLimits {
+                forced_end: [u32::from(b'}')].into(),
+                stop_blank_line: true,
+                ..Default::default()
+            },
+            true,
+        )));
+        let mut tokens = 0;
+        for b in *b"a\n\nb}Hi.\n\nMore" {
+            handle_produced_token(
+                &mut slot,
+                &None,
+                &bundle,
+                u32::from(b),
+                1,
+                &mut tokens,
+                Some(&[]),
+            );
+            if slot.is_none() {
+                break;
+            }
+        }
+        assert!(slot.is_none());
+        let (mut text, mut reason) = (String::new(), None);
+        while let Ok(chunk) = rx.try_recv() {
+            match chunk {
+                StreamChunk::Token { text: t, .. } => text.push_str(&t),
+                StreamChunk::Done { reason: r, .. } => reason = Some(r),
+                StreamChunk::Err(e) => panic!("{e}"),
+            }
+        }
+        assert_eq!(text, "a\n\nb}Hi.\n");
+        assert!(matches!(reason, Some(FinishReason::Stop)));
     }
 
     fn prefill_test_slot() -> (Option<Slot>, crate::serve::stream::ChunkReceiver) {

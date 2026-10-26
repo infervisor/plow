@@ -983,6 +983,12 @@ pub struct RuntimeConfig {
     #[arg(long = "pfx-trace", env = "PLOW_PFX_TRACE", global = true)]
     pub pfx_trace: Option<std::path::PathBuf>,
 
+    /// Per-model chat request defaults: thinking budget, reply cap, forced end string, seeded
+    /// trace, `max_tokens`, template kwargs. A JSON object keyed by served model name
+    /// (`serve::config::ChatDefaults`); an unknown key is a startup error.
+    #[arg(long = "chat-defaults", env = "PLOW_CHAT_DEFAULTS", global = true)]
+    pub chat_defaults: Option<std::path::PathBuf>,
+
     /// Per-tick AMD serve breakdown: prefill launches, decode dispatch, host remainder
     /// (`PLOW_TICK_LOG=1`).
     #[arg(long = "tick-log", env = "PLOW_TICK_LOG", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]

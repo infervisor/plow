@@ -255,6 +255,18 @@ pub struct ChatRequest {
     /// split from `content` and counted in `reasoning_tokens`).
     #[serde(default)]
     pub include_reasoning: Option<bool>,
+    /// vLLM's thinking budget: tokens allowed in each trace block before the server forces its
+    /// end (`reasoning_end`). `0` renders thinking off; `-1` is no budget. A hard cap.
+    #[serde(default)]
+    pub thinking_token_budget: Option<i64>,
+    /// plow extension: tokens allowed after the trace. Reaching it ends the request with
+    /// `finish_reason: "length"` and `x_plow_finish_reason: "reply_cap"`.
+    #[serde(default)]
+    pub max_reply_tokens: Option<u32>,
+    /// plow extension: what ends a trace block over budget (a bridge sentence, then the close
+    /// marker; empty = the marker alone).
+    #[serde(default)]
+    pub reasoning_end: Option<String>,
 }
 
 impl ChatRequest {
@@ -824,6 +836,9 @@ pub struct Choice {
     /// OpenAI vocabulary — currently a preemption reported as `"length"`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub x_plow_finish_reason: Option<&'static str>,
+    /// Thinking control's account of the request (final choice only).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub x_plow_thinking: Option<crate::serve::think::ThinkReport>,
 }
 
 /// One streamed `chat.completion.chunk`.
@@ -853,6 +868,9 @@ pub struct ChunkChoice {
     /// model simply hitting `max_tokens`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub x_plow_finish_reason: Option<&'static str>,
+    /// Thinking control's account of the request (final choice only).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub x_plow_thinking: Option<crate::serve::think::ThinkReport>,
 }
 
 #[derive(Clone, Debug, Serialize)]

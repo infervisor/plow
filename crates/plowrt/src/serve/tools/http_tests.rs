@@ -72,6 +72,7 @@ struct Script {
 
 struct Harness {
     app: axum::Router,
+    bundle: Arc<crate::asset::ModelBundle>,
     script: Arc<Mutex<Script>>,
     _dir: TempDir,
 }
@@ -123,6 +124,7 @@ fn harness_for(fixture: &str) -> Harness {
         Arc::new(crate::exec::ExecutorSet::bringup(backend).unwrap()),
     ));
     state.scripted.write().push(slug.clone());
+    let model = Arc::clone(&bundle);
     let script = Arc::new(Mutex::new(Script::default()));
     let s = Arc::clone(&script);
     state.install_mux(
@@ -139,6 +141,7 @@ fn harness_for(fixture: &str) -> Harness {
     );
     Harness {
         app: app(state),
+        bundle: model,
         script,
         _dir: TempDir(dir),
     }
@@ -869,4 +872,235 @@ async fn a_call_head_cut_by_max_tokens_is_not_content() {
         v["choices"][0]["message"]["content"],
         "Checking.call:get_weather"
     );
+}
+
+/// Thinking-control request fields are validated, each refusal naming its field.
+#[tokio::test]
+async fn thinking_control_fields_are_validated() {
+    let h = harness_for("gemma4-12b");
+    h.reply(&["Four."]);
+    let on = json!({"enable_thinking": true});
+    for (body, field) in [
+        (
+            json!({"thinking_token_budget": -2}),
+            "thinking_token_budget",
+        ),
+        (json!({"reasoning_end": "Replying now."}), "reasoning_end"),
+        (json!({"max_reply_tokens": 0}), "max_reply_tokens"),
+        (
+            json!({"max_reply_tokens": 9, "max_tokens": 8}),
+            "max_reply_tokens",
+        ),
+    ] {
+        let mut body = body;
+        body["messages"] = user("2+2?");
+        body["chat_template_kwargs"] = on.clone();
+        let (code, v) = h.json(body).await;
+        assert_eq!(code, StatusCode::BAD_REQUEST, "{v}");
+        assert_eq!(v["error"]["param"], field, "{v}");
+    }
+    let (code, v) = h
+        .json(json!({"messages": user("2+2?"), "chat_template_kwargs": on,
+                     "thinking_token_budget": 16, "max_reply_tokens": 8,
+                     "reasoning_end": "Replying now.<channel|>"}))
+        .await;
+    assert_eq!(code, StatusCode::OK, "{v}");
+    // markers that are text, not special tokens, cannot be controlled by id
+    let h = harness_for("qwen3");
+    h.reply(&["Four."]);
+    let (code, v) = h
+        .json(json!({"messages": user("2+2?"), "thinking_token_budget": 16}))
+        .await;
+    assert_eq!(code, StatusCode::BAD_REQUEST, "{v}");
+    assert_eq!(v["error"]["param"], "thinking_token_budget", "{v}");
+}
+
+/// `thinking_token_budget: 0` renders the template's thinking-off prompt.
+#[tokio::test]
+async fn a_zero_budget_turns_thinking_off() {
+    let h = harness_for("gemma4-12b");
+    h.reply(&["Four."]);
+    let on = json!({"enable_thinking": true});
+    let (code, _) = h
+        .json(json!({"messages": user("2+2?"), "chat_template_kwargs": on}))
+        .await;
+    assert_eq!(code, StatusCode::OK);
+    assert!(
+        h.last_prompt().ends_with("<|turn>model\n"),
+        "{}",
+        h.last_prompt()
+    );
+    let (code, _) = h
+        .json(json!({"messages": user("2+2?"), "chat_template_kwargs": on, "thinking_token_budget": 0}))
+        .await;
+    assert_eq!(code, StatusCode::OK);
+    assert!(
+        h.last_prompt()
+            .ends_with("<|turn>model\n<|channel>thought\n<channel|>"),
+        "{}",
+        h.last_prompt()
+    );
+}
+
+/// Model defaults apply under the request's fields; `thought_prefix` seeds the trace when
+/// thinking is on (only its seed text after a tool result) and the split reads the seeded trace
+/// as reasoning, on both response paths.
+#[tokio::test]
+async fn chat_defaults_seed_the_trace_under_request_fields() {
+    let h = harness_for("gemma4-12b");
+    h.bundle
+        .serving()
+        .chat
+        .set(crate::serve::config::ChatDefaults {
+            max_tokens: Some(6),
+            thought_prefix: Some("<|channel>thought\nThe caller just said".into()),
+            chat_template_kwargs: Some(
+                [("enable_thinking".to_string(), json!(true))]
+                    .into_iter()
+                    .collect(),
+            ),
+            ..Default::default()
+        })
+        .unwrap();
+    let pieces = toks(" \"hi\".<channel|>Aap kaun?");
+    let pieces: Vec<&str> = pieces.iter().map(String::as_str).collect();
+    h.reply(&pieces);
+    let (code, v) = h
+        .json(json!({"messages": user("hi"), "max_tokens": 64}))
+        .await;
+    assert_eq!(code, StatusCode::OK, "{v}");
+    assert!(
+        h.last_prompt()
+            .ends_with("<|turn>model\n<|channel>thought\nThe caller just said"),
+        "{}",
+        h.last_prompt()
+    );
+    let m = &v["choices"][0]["message"];
+    assert_eq!(
+        (m["content"].as_str(), m["reasoning"].as_str()),
+        (Some("Aap kaun?"), Some("\"hi\"."))
+    );
+    let (frames, _) = h
+        .sse(json!({"messages": user("hi"), "max_tokens": 64}))
+        .await;
+    let (content, reasoning, _, _) = accumulate(&frames);
+    assert_eq!(
+        (content.as_str(), reasoning.as_str()),
+        ("Aap kaun?", "\"hi\".")
+    );
+    // the default `max_tokens` applies when the request names none
+    let (_, v) = h.json(json!({"messages": user("hi")})).await;
+    assert_eq!(v["choices"][0]["finish_reason"], "length");
+    // thinking off: no seed
+    h.reply(&["Hi."]);
+    let (_, _) = h
+        .json(json!({"messages": user("hi"), "chat_template_kwargs": {"enable_thinking": false}}))
+        .await;
+    assert!(
+        h.last_prompt().ends_with("<|channel>thought\n<channel|>"),
+        "{}",
+        h.last_prompt()
+    );
+    // after a tool result the template opened the channel: only the seed text follows
+    let convo = json!([
+        {"role": "user", "content": "Weather in Paris?"},
+        {"role": "assistant", "content": null, "tool_calls": [
+            {"id": "call_1", "type": "function", "function": {"name": "get_weather", "arguments": "{\"city\": \"Paris\"}"}}]},
+        {"role": "tool", "tool_call_id": "call_1", "content": "{\"temp\": 18}"}
+    ]);
+    h.reply(&["18.", "<channel|>", "It is 18."]);
+    let (code, v) = h.json(json!({"messages": convo, "tools": tools()})).await;
+    assert_eq!(code, StatusCode::OK, "{v}");
+    let p = h.last_prompt();
+    assert!(
+        p.ends_with("<|channel>thought\nThe caller just said") && !p.contains("thought\n\nThe"),
+        "{p}"
+    );
+    assert_eq!(v["choices"][0]["message"]["content"], "It is 18.");
+}
+
+/// The voice guard moves planning lines out of `content` identically on both paths, reports it
+/// in `x_plow_thinking`, answers an empty turn with the caller's fallback line, and counts both.
+#[tokio::test]
+async fn the_voice_guard_moves_planning_lines_on_both_paths() {
+    let h = harness_for("gemma4-12b");
+    h.bundle
+        .serving()
+        .chat
+        .set(crate::serve::config::ChatDefaults {
+            reply_guard: Some(crate::serve::reply_guard::GuardMode::Voice),
+            reply_guard_lines: Some(crate::serve::reply_guard::GuardLines {
+                wait: [("hi".to_string(), "एक सेकंड, कृपया।".to_string())].into(),
+                goodbye: Default::default(),
+            }),
+            ..Default::default()
+        })
+        .unwrap();
+    let on = json!({"enable_thinking": true});
+    let pieces =
+        toks("<|channel>thought\nplan<channel|>Wait, the prompt says ask once.\nAap kaun hain?");
+    let pieces: Vec<&str> = pieces.iter().map(String::as_str).collect();
+    h.reply(&pieces);
+    let body = json!({"messages": user("हेलो"), "chat_template_kwargs": on});
+    let (code, v) = h.json(body.clone()).await;
+    assert_eq!(code, StatusCode::OK, "{v}");
+    let c = &v["choices"][0];
+    assert_eq!(c["message"]["content"], "Aap kaun hain?");
+    assert_eq!(
+        c["message"]["reasoning"],
+        "plan\nWait, the prompt says ask once."
+    );
+    assert_eq!(c["x_plow_thinking"]["guard_moved"], true);
+    let (frames, _) = h.sse(body.clone()).await;
+    let (content, reasoning, _, _) = accumulate(&frames);
+    assert_eq!(
+        (content.as_str(), reasoning.as_str()),
+        ("Aap kaun hain?", "plan\nWait, the prompt says ask once.")
+    );
+    // nothing left to say: the caller's fallback line
+    let pieces = toks("<|channel>thought\nplan<channel|>None.\n");
+    let pieces: Vec<&str> = pieces.iter().map(String::as_str).collect();
+    h.reply(&pieces);
+    let (_, v) = h.json(body.clone()).await;
+    assert_eq!(v["choices"][0]["message"]["content"], "एक सेकंड, कृपया।");
+    let (frames, _) = h.sse(body).await;
+    assert_eq!(accumulate(&frames).0, "एक सेकंड, कृपया।");
+    let req = Request::get("/metrics").body(Body::empty()).unwrap();
+    let resp = h.app.clone().oneshot(req).await.unwrap();
+    let text = String::from_utf8(
+        resp.into_body()
+            .collect()
+            .await
+            .unwrap()
+            .to_bytes()
+            .to_vec(),
+    )
+    .unwrap();
+    let l = "{model_name=\"toolm\",engine=\"0\"}";
+    assert!(
+        text.contains(&format!("plowrt_reply_guard_moved_total{l} 4\n")),
+        "{text}"
+    );
+    assert!(text.contains(&format!("plowrt_reply_guard_answer_reasoning_total{l} 0\n")));
+    assert!(text.contains(
+        "plowrt_reply_guard_fallback_total{model_name=\"toolm\",engine=\"0\",kind=\"wait\"} 2\n"
+    ));
+}
+
+/// `POST /v1/requests/{id}/reasoning_end` reaches a registered live request and 404s otherwise.
+#[tokio::test]
+async fn live_reasoning_end_finds_only_requests_in_flight() {
+    let h = harness();
+    let flag = crate::serve::think::live_register(&std::sync::Arc::from("req-http-live"));
+    let (code, v) = h
+        .post_to("/v1/requests/req-http-live/reasoning_end", "")
+        .await;
+    assert_eq!(code, StatusCode::OK, "{v}");
+    assert!(flag.load(std::sync::atomic::Ordering::Relaxed));
+    drop(flag);
+    let (code, v) = h
+        .post_to("/v1/requests/req-http-live/reasoning_end", "")
+        .await;
+    assert_eq!(code, StatusCode::NOT_FOUND, "{v}");
+    assert_eq!(v["error"]["code"], "request_not_found");
 }
