@@ -47,6 +47,32 @@ pub fn compile(
 mod tests {
     use super::load;
 
+    /// Muse Spark's template wraps the assistant turn in `{% generation %}`; the multi-turn
+    /// render is the string `transformers` produces (`reasoning_effort='high'`, fixed date).
+    /// Set `MUSE_SPARK_CKPT` to the checkpoint directory to run it.
+    #[test]
+    fn the_real_muse_spark_template_renders_what_transformers_renders() {
+        let Some(dir) = std::env::var_os("MUSE_SPARK_CKPT").map(std::path::PathBuf::from) else {
+            eprintln!("skipped: MUSE_SPARK_CKPT not set");
+            return;
+        };
+        let t = load(&dir).expect("template compiles");
+        let msgs = vec![
+            serde_json::json!({"role": "user", "content": "one"}),
+            serde_json::json!({"role": "assistant", "content": "two"}),
+            serde_json::json!({"role": "user", "content": "three"}),
+        ];
+        let opts = super::RenderOpts {
+            reasoning_effort: Some("high".into()),
+            kwargs: [("current_date".to_string(), serde_json::json!("2026-10-16"))].into(),
+            ..Default::default()
+        };
+        assert_eq!(
+            t.render_with(&msgs, &opts).expect("renders"),
+            "<|begin_of_text|><|start|>system<|message|>You are a helpful AI assistant.\n\nKnowledge cutoff: 2026-01-04.\n\nCurrent date: 2026-10-16.\n\nReasoning strength: 256.\n\nUse the appropriate recipient for each message:\n\n- \"self\": private reasoning and tool planning.\n- \"commentary\": user-visible intermediate updates while the assistant will continue working, including messages sent to the user before or between tool calls.\n- \"user\": messages that end the assistant turn, such as a completed response or clarification question that waits for the user's reply; do not use for pre-tool updates or partial responses.\n\n# Valid recipients: \"self\", \"commentary\", \"user\".<|eot|><|start|>user<|message|>one<|eot|><|start|>assistant to=user<|message|>two<|eot|><|start|>user<|message|>three<|eot|><|start|>assistant"
+        );
+    }
+
     /// Render the REAL checkpoint template and compare against the string
     /// `transformers` produces for the same conversation. Skipped when the
     /// weights are not on this host, so it is a gate where it can be one and

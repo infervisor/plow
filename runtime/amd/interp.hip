@@ -334,6 +334,9 @@ extern "C" __device__ unsigned plow_dsa_prep_arm = 1;
 #include "op_qwen_gdn.h"
 #endif
 #include "op_moe.h"
+#if PLOW_QWEN_GDN
+#include "op_muse.h"
+#endif
 /* PLOW_MOE_PF_W8A8: the W8A8 block-FP8 arm of ops 85/86 (packet i[7] >= 2). A build axis the
  * packet's plow_config.h turns on, so an object built for any other packet is unchanged. */
 #ifndef PLOW_MOE_PF_W8A8
@@ -1260,7 +1263,9 @@ typedef union __align__(16) {
      * workgroup per CU (2 waves/SIMD) no matter what else shrank. */
     bf16  fa[FA_LDS_HALVES(512)];     /* flash K|V|P tiles          */
 #endif
-    float fd[FA_DEC_LDS_FLOATS(512, PLOW_FA_GF(512))]; /* flash decode; the op owns this size */
+    float fd[FA_DEC_LDS_FLOATS(512, PLOW_FA_GF(512)) > FA_DEC_LDS_FLOATS(64, PLOW_FA_GF(64))
+                 ? FA_DEC_LDS_FLOATS(512, PLOW_FA_GF(512))
+                 : FA_DEC_LDS_FLOATS(64, PLOW_FA_GF(64))]; /* flash decode; the op owns this size */
 /* PROBE GATE. `fmla` is the MLA latent-decode arena (GLM/DeepSeek/Kimi) and it sets the decode
  * union at 42,064 B once the flash-prefill `fa` is gated out -- above the 32,768 B that would
  * fit TWO workgroups per CU. A Gemma decode object never runs an MLA op. Gating it is NOT safe
@@ -1694,14 +1699,15 @@ extern "C" __device__ unsigned plow_flash_merge_hd_64 = 1;
 #endif
 
 __device__ __forceinline__ void exec_flash_merge(CInst in, CTens T, unsigned n_batch,
-                                                 unsigned slice, unsigned nblk) {
+                                                 unsigned slice, unsigned nblk,
+                                                 float* lds = nullptr) {
 #define TEN(k) (in->t[k] == PLOW_TENSOR_NONE ? nullptr : T[in->t[k]])
     /* t3 = OPTIONAL attention sinks: bf16[n_head] (GPT-OSS) or float[n_head] (DeepSeek-V4.1, i4=1 or D=512). */
     const void* const sinks = TEN(3);
     const bool sinks_f32 = (in->i[4] == 1u) || (in->i[3] == 512u);
 #define PLOW_AMD_FLASH_MERGE(DD)                                                                 \
     d_flash_merge<DD>((bf16*)TEN(0), (const float*)TEN(1), (const float*)TEN(2), n_batch,        \
-                      in->i[1], in->i[2], slice, nblk, sinks, in->i[6], sinks_f32)
+                      in->i[1], in->i[2], slice, nblk, sinks, in->i[6], sinks_f32, lds)
     if (in->i[3] == 128) PLOW_AMD_FLASH_MERGE(128);
     else if (in->i[3] == 256) PLOW_AMD_FLASH_MERGE(256);
     else if (in->i[3] == 512) PLOW_AMD_FLASH_MERGE(512);
@@ -1884,6 +1890,11 @@ __device__ __forceinline__ void exec_flash_decode(CInst in, CTens T,
                 (const bf16*)TEN(4), (const int*)TEN(5), n_batch_runtime, in->i[1], in->i[2],         \
                 in->i[3], in->i[4], in->fj[0].f, in->i[5], in->i[7], slice, nblk, lds,         \
                 (const int*)TEN(6));                                                            \
+        else if constexpr (DD == 64 && GG > 2)                                                  \
+            d_flash_decode_noinl<DD, GG>(                                                       \
+                (float*)TEN(0), (float*)TEN(1), (const bf16*)TEN(2), (const bf16*)TEN(3),       \
+                (const bf16*)TEN(4), (const int*)TEN(5), n_batch_runtime, in->i[1], in->i[2],   \
+                in->i[3], in->i[4], in->fj[0].f, in->i[5], in->i[7], slice, nblk, lds);         \
         else                                                                                    \
             d_flash_decode<DD, GG>(                                                             \
                 (float*)TEN(0), (float*)TEN(1), (const bf16*)TEN(2), (const bf16*)TEN(3),       \
@@ -5758,7 +5769,11 @@ __device__ static void plow_exec(CInst in_v, unsigned slice, CTens T_v, plow_sme
         /* split-KV prefill ALWAYS needs the merge, so it lives in this bucket too */
 #if !PLOW_MIXED_STEP && (!PLOW_DECODE_INVENTORY_PRUNE || PLOW_HAS_FLASH_MERGE)
         case PLOW_DOP_FLASH_MERGE:
-            exec_flash_merge(in, T, PLOW_RUNTIME_ROWS(in->i[0]), slice, nblk);
+            exec_flash_merge(in, T, PLOW_RUNTIME_ROWS(in->i[0]), slice, nblk,
+                             PLOW_FA_MERGE_LDS && (size_t)in->i[2] * (in->i[3] + 2u) * sizeof(float)
+                                                          <= sizeof(sm->raw)
+                                 ? (float*)sm->raw
+                                 : nullptr);
             break;
 #endif
 #endif
@@ -6101,10 +6116,28 @@ __device__ static void plow_exec(CInst in_v, unsigned slice, CTens T_v, plow_sme
             /* i6=n_group i7=topk_group (DeepSeek-V3 / Kimi K2 group-limited routing; 0 or 1
              * means flat top-k, which is every GLM/Qwen/Mixtral packet and is bit-identical
              * to before). */
+            /* f1 = logit scale applied before the score transform (Muse Spark's
+             * output_multiplier); 0 in every other packet, which the kernel reads as 1. */
+            /* i4 > 1: that many rows (one per workgroup), the table and logit rows advanced as
+             * op 83's token loop does (Muse Spark's batched decode rungs). */
+            if (in->i[4] > 1u) {
+                const unsigned ne = in->i[1], kk = in->i[2];
+                const bool f32l = (in->i[3] & 8u) != 0u;
+                for (unsigned r = slice; r < in->i[4]; r += nblk) {
+                    const bf16* lrow = f32l ? (const bf16*)((const float*)TEN(1) + (size_t)r * ne)
+                                            : (const bf16*)TEN(1) + (size_t)r * ne;
+                    d_moe_router_topk((unsigned char*)TEN(0) + (size_t)r * kk * 8, lrow,
+                                      (in->i[3] & 4u) ? (const float*)TEN(3) : nullptr, ne, kk,
+                                      in->i[3], in->fj[0].f, 0, 1, (float*)sm->raw, in->i[6],
+                                      in->i[7], nullptr, 0, in->fj[1].f);
+                    __syncthreads();
+                }
+                break;
+            }
             d_moe_router_topk((unsigned char*)TEN(0), (const bf16*)TEN(1),
                               (in->i[3] & 4u) ? (const float*)TEN(3) : nullptr, in->i[1], in->i[2],
                               in->i[3], in->fj[0].f, slice, nblk, (float*)sm->raw, in->i[6],
-                              in->i[7]);
+                              in->i[7], nullptr, 0, in->fj[1].f);
             break;
 #endif
 #if !PLOW_DECODE_INVENTORY_PRUNE || PLOW_HAS_MOE_EXPERT_GLU
@@ -6118,7 +6151,7 @@ __device__ static void plow_exec(CInst in_v, unsigned slice, CTens T_v, plow_sme
         case PLOW_DOP_MOE_EXPERT_DOWN:
             d_moe_expert_down((float*)TEN(0), (const bf16*)TEN(1), (const unsigned char*)TEN(2),
                               (const unsigned long long*)TEN(3), in->i[0], in->i[1], in->i[2],
-                              in->i[3], slice, nblk);
+                              in->i[3], slice, nblk, in->i[7]);
             break;
 #endif
         /* f0/f1 carry Kimi-K3's `situ` betas and are read ONLY when i5 == PLOW_MOE_ACT_SITU. They
@@ -6142,20 +6175,20 @@ __device__ static void plow_exec(CInst in_v, unsigned slice, CTens T_v, plow_sme
             break;
 #endif
 #if !PLOW_DECODE_INVENTORY_PRUNE || PLOW_HAS_MOE_GROUP_GLU_FP8_BLK
-        case PLOW_DOP_MOE_GROUP_GLU_FP8_BLK: /* grouped: t3=wtab t4=stab; i0=k i1=I_moe i2=H i3=n_exp i5=act i6=ENC */
+        case PLOW_DOP_MOE_GROUP_GLU_FP8_BLK: /* grouped: t3=wtab t4=stab; i0=k i1=I_moe i2=H i3=n_exp i4=k/row i5=act i6=ENC */
             d_moe_group_glu_fp8_blk((bf16*)TEN(0), (const bf16*)TEN(1), (const unsigned char*)TEN(2),
                                     (const unsigned long long*)TEN(3),
                                     (const unsigned long long*)TEN(4), in->i[0], in->i[1], in->i[2],
                                     in->i[3], in->i[5], slice, nblk, in->i[6], in->fj[0].f,
-                                    in->fj[1].f);
+                                    in->fj[1].f, in->i[4]);
             break;
 #endif
 #if !PLOW_DECODE_INVENTORY_PRUNE || PLOW_HAS_MOE_GROUP_DOWN_FP8_BLK
-        case PLOW_DOP_MOE_GROUP_DOWN_FP8_BLK: /* grouped: t3=wtab t4=stab; i0=k i1=H i2=I_moe i3=n_exp i6=ENC */
+        case PLOW_DOP_MOE_GROUP_DOWN_FP8_BLK: /* grouped: t3=wtab t4=stab; i0=k i1=H i2=I_moe i3=n_exp i6=ENC i7=bf16 y */
             d_moe_group_down_fp8_blk((float*)TEN(0), (const bf16*)TEN(1),
                                      (const unsigned char*)TEN(2), (const unsigned long long*)TEN(3),
                                      (const unsigned long long*)TEN(4), in->i[0], in->i[1], in->i[2],
-                                     in->i[3], slice, nblk, in->i[6]);
+                                     in->i[3], slice, nblk, in->i[6], in->i[7]);
             break;
 #endif
 #if !PLOW_DECODE_INVENTORY_PRUNE || PLOW_HAS_MOE_COMBINE
@@ -6310,7 +6343,11 @@ __device__ static void plow_exec(CInst in_v, unsigned slice, CTens T_v, plow_sme
                 break;
             }
 #endif
-            exec_flash_merge(in, T, PLOW_RUNTIME_ROWS(in->i[0]), slice, nblk);
+            exec_flash_merge(in, T, PLOW_RUNTIME_ROWS(in->i[0]), slice, nblk,
+                             PLOW_FA_MERGE_LDS && (size_t)in->i[2] * (in->i[3] + 2u) * sizeof(float)
+                                                          <= sizeof(sm->raw)
+                                 ? (float*)sm->raw
+                                 : nullptr);
             break;
 #endif
 #endif /* bucket */
@@ -6353,7 +6390,7 @@ __device__ static void plow_exec(CInst in_v, unsigned slice, CTens T_v, plow_sme
                                  /* tid2eid / token_ids are DSV4 hash routing (unread here);
                                   * i5 = the shared-expert fold's constant `k+1`th slot. */
                                  ,
-                                 nullptr, nullptr, in->i[5]
+                                 nullptr, nullptr, in->i[5], in->fj[1].f
             );
             break;
         case PLOW_DOP_MOE_ALIGN_PF:
@@ -6626,6 +6663,34 @@ __device__ static void plow_exec(CInst in_v, unsigned slice, CTens T_v, plow_sme
                                  (const bf16*)TEN(3), (const bf16*)TEN(4), (const bf16*)TEN(5),
                                  in->i[0], in->i[1], slice, nblk);
             break;
+        /* Muse Spark (op_muse.h): built with the Qwen arms, checked by the same marker. */
+        case PLOW_DOP_MUSE_RMSNORM:
+            /* t3/i3: band-major copy (i3 = band width, 0 = none). */
+            d_muse_rmsnorm((bf16*)TEN(0), (const bf16*)TEN(1), (const bf16*)TEN(2), in->i[0],
+                           in->i[1], in->i[2], in->fj[0].f, in->fj[1].f, slice, nblk,
+                           sm->part, in->i[3] ? (bf16*)TEN(3) : nullptr, in->i[3]);
+            break;
+        case PLOW_DOP_MUSE_RESIDUAL_GATE:
+            d_muse_residual_gate((bf16*)TEN(0), (const bf16*)TEN(1), (const bf16*)TEN(2),
+                                 (const bf16*)TEN(3), in->i[0], in->i[1], in->fj[0].f,
+                                 in->fj[1].f, slice, nblk);
+            break;
+        case PLOW_DOP_MUSE_MOE_COMBINE_NORM:
+            d_muse_moe_combine_norm((bf16*)TEN(0), (const float*)TEN(1),
+                                    (const unsigned char*)TEN(2), (const bf16*)TEN(3), in->i[0],
+                                    in->i[1], in->fj[0].f, slice, nblk, (float*)sm->raw, in->i[2],
+                                    in->i[3], in->i[4] ? (bf16*)TEN(4) : nullptr, in->i[4]);
+            break;
+#if !PLOW_BUCKET_PREFILL && (!PLOW_DECODE_INVENTORY_PRUNE || PLOW_HAS_MUSE_NORM_GATE_NORM)
+        case PLOW_DOP_MUSE_NORM_GATE_NORM:
+            d_muse_norm_gate_norm((bf16*)TEN(0), (bf16*)TEN(5), (const bf16*)TEN(1),
+                                  (const bf16*)TEN(2), (const bf16*)TEN(3), (const bf16*)TEN(4),
+                                  (const bf16*)TEN(6), in->i[0], in->i[1], in->i[2], in->i[3],
+                                  in->fj[0].f, in->fj[1].f, in->fj[2].f, __uint_as_float(in->i[5]),
+                                  __uint_as_float(in->i[6]), slice, nblk, sm->part,
+                                  in->i[4] ? (bf16*)TEN(7) : nullptr, in->i[4]);
+            break;
+#endif
 #endif
         case PLOW_DOP_ROPE_INVERSE_O:
             d_rope_inverse_o((bf16*)TEN(0), (const float*)TEN(1), (const float*)TEN(2),

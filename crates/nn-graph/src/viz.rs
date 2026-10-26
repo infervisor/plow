@@ -116,6 +116,7 @@ fn op_detail(op: &Op) -> serde_json::Value {
         Op::MatMul => json!({}),
         Op::RmsNorm { eps } => json!({ "eps": eps }),
         Op::RmsNormZeroCentered { eps } => json!({ "eps": eps }),
+        Op::RmsNormInputScaled { eps } => json!({ "eps": eps }),
         Op::LayerNorm { eps } => json!({ "eps": eps }),
         Op::Rope {
             dim,
@@ -177,6 +178,7 @@ fn op_detail(op: &Op) -> serde_json::Value {
             norm_topk,
             route_scale,
             correction_bias,
+            logit_scale,
         } => json!({
             "num_experts": num_experts,
             "top_k": top_k,
@@ -184,6 +186,7 @@ fn op_detail(op: &Op) -> serde_json::Value {
             "norm_topk": norm_topk,
             "route_scale": route_scale,
             "correction_bias": correction_bias,
+            "logit_scale": logit_scale,
             "group": group.map(|g| serde_json::json!({
                 "n_group": g.n_group,
                 "topk_group": g.topk_group,
@@ -194,11 +197,13 @@ fn op_detail(op: &Op) -> serde_json::Value {
             top_k,
             intermediate_size,
             block_fp8,
+            post_expert_norm,
         } => json!({
             "num_experts": num_experts,
             "top_k": top_k,
             "intermediate_size": intermediate_size,
             "block_fp8": block_fp8,
+            "post_expert_norm_eps": post_expert_norm,
         }),
         Op::DsaIndexer {
             num_heads,
@@ -252,6 +257,9 @@ fn op_detail(op: &Op) -> serde_json::Value {
             "beta": beta, "linear_beta": linear_beta,
         }),
         Op::BlockResidual { max_snapshots } => json!({ "max_snapshots": max_snapshots }),
+        Op::ResidualGate { temperature, eps } => json!({
+            "temperature": temperature, "eps": eps,
+        }),
     }
 }
 

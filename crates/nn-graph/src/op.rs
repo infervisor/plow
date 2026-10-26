@@ -72,6 +72,15 @@ pub enum Op {
     /// Inputs `[x, weight]`. Shape-preserving.
     RmsNormZeroCentered { eps: f32 },
 
+    /// Muse Spark's input-scaled RMSNorm: `norm(bf16(x * (1 + weight)))` — the
+    /// scale is applied (and rounded to bf16) BEFORE normalizing, so the output
+    /// has unit RMS. Inputs `[x, weight]`. Shape-preserving.
+    ///
+    /// Not [`Op::RmsNormZeroCentered`] with the operands reordered: that op
+    /// scales after normalizing, a plausible-looking expression of this one that
+    /// computes a different function.
+    RmsNormInputScaled { eps: f32 },
+
     /// LayerNorm over the last axis. Inputs `[x, weight, bias]`. Shape-preserving.
     LayerNorm { eps: f32 },
 
@@ -187,16 +196,24 @@ pub enum Op {
         norm_topk: bool,
         route_scale: f32,
         correction_bias: bool,
+        /// Multiplier on the router logits before scoring (Muse Spark's
+        /// `output_multiplier`); 1.0 everywhere else.
+        logit_scale: f32,
     },
 
     /// Data-dependent routed-expert SwiGLU dispatch and weighted combine.
     /// Inputs `[x, routes]`; the exhaustive checkpoint names live in
     /// `Graph::expert_bindings`, avoiding `3 * num_experts` compute nodes.
+    ///
+    /// `post_expert_norm` (Muse Spark) is the eps of an
+    /// [`Op::RmsNormInputScaled`] applied to every (token, expert) output
+    /// BEFORE the routing-weight multiply and the sum; its weight is input 2.
     MoeExperts {
         num_experts: u32,
         top_k: u32,
         intermediate_size: u32,
         block_fp8: bool,
+        post_expert_norm: Option<f32>,
     },
 
     /// GLM DSA indexer. Inputs are hidden state, normalized query latent,
@@ -324,6 +341,20 @@ pub enum Op {
     /// (measured 3.0e-3 at the block output against 8.1e-1 at the mix itself),
     /// so a graph that used `Add` here would look right and be wrong.
     BlockResidual { max_snapshots: u32 },
+
+    /// Muse Spark's gated residual. Inputs `[residual, h, gate]` with
+    /// `gate: [hidden]`:
+    ///
+    /// ```text
+    /// w     = gate / temperature
+    /// beta  = sigmoid(w)
+    /// alpha = sqrt(max(sigmoid(-w) * (1 + beta), eps))
+    /// out   = alpha * residual + beta * h
+    /// ```
+    ///
+    /// The IR has no clamp or sqrt, and `Add` is a plausible stand-in that
+    /// computes a different model, so this is one op.
+    ResidualGate { temperature: f32, eps: f32 },
 }
 
 /// DeepSeek `noaux_tc` group-limited expert routing.
@@ -370,6 +401,7 @@ impl Op {
             Op::MatMul => "matmul",
             Op::RmsNorm { .. } => "rmsnorm",
             Op::RmsNormZeroCentered { .. } => "rmsnorm_zero_centered",
+            Op::RmsNormInputScaled { .. } => "rmsnorm_input_scaled",
             Op::LayerNorm { .. } => "layernorm",
             Op::Rope { .. } => "rope",
             Op::Act(_) => "act",
@@ -397,6 +429,7 @@ impl Op {
             Op::LinearAttention { .. } => "linear_attention",
             Op::SituGlu { .. } => "situ_glu",
             Op::BlockResidual { .. } => "block_residual",
+            Op::ResidualGate { .. } => "residual_gate",
         }
     }
 }

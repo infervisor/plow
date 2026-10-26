@@ -354,6 +354,12 @@ enum Cmd {
         /// `scripts/glm52_logit_cmp.py` is the reader.
         #[arg(long)]
         dump_logits: Option<PathBuf>,
+        /// Teacher-forced prompt logits through the PREFILL programs (TP path, with
+        /// `--dump-logits`), as `logits_pf{p}` rows the decode-only walk also writes: `sweep`
+        /// prefills every prefix `ids[..=p]`; `N` prefills `ids[..N]` and walks the rest of the
+        /// prompt through decode over the KV that prefill wrote.
+        #[arg(long)]
+        teacher: Option<String>,
         /// TIER-2 PREFILL SWEEP: comma-separated prompt lengths, each timed
         /// `--prefill-reps` times on ONE loaded engine, reported as a median.
         ///
@@ -1253,6 +1259,7 @@ async fn async_main(
             active_batch,
             tp,
             dump_logits,
+            teacher,
             prefill_sweep,
             prefill_reps,
         } => {
@@ -1275,11 +1282,12 @@ async fn async_main(
                     batched,
                     active_batch,
                     dump_logits,
+                    teacher,
                     prefill_sweep,
                     prefill_reps,
                 )
-            } else if prefill_sweep.is_some() {
-                Err("--prefill-sweep is implemented on the TP path only (--tp N, N>1)".into())
+            } else if prefill_sweep.is_some() || teacher.is_some() {
+                Err("--prefill-sweep / --teacher are implemented on the TP path only (--tp N, N>1)".into())
             } else if active_batch.is_some() {
                 Err("--active-batch requires --tp N with N>1".into())
             } else {
@@ -1324,6 +1332,7 @@ async fn async_main(
                     None,
                     tp,
                     batched,
+                    None,
                     None,
                     None,
                     prefill_sweep,
@@ -2329,6 +2338,7 @@ fn amd_bench_tp(
     batched: bool,
     active_batch: Option<u32>,
     dump_logits: Option<PathBuf>,
+    teacher: Option<String>,
     prefill_sweep: Option<String>,
     prefill_reps: u32,
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -2639,8 +2649,38 @@ fn amd_bench_tp(
                 for (p, id) in ids.iter().enumerate() {
                     g.seed_ids(&[*id])?;
                     last = AmdTpGroup::agree(&g.decode_step(p as u32, p as u32 + 1)?)?;
+                    // Teacher-forced: every prompt position's logits row.
+                    if dump_logits.is_some() && p + 1 < ids.len() {
+                        dump(&g, &format!("pf{p:05}"))?;
+                    }
                 }
                 last
+            } else if let Some(spec) = teacher.as_deref() {
+                if dump_logits.is_none() {
+                    return Err("--teacher needs --dump-logits".into());
+                }
+                if spec == "sweep" {
+                    for p in 0..ids.len() - 1 {
+                        AmdTpGroup::agree(&g.prefill(&ids[..=p])?)?;
+                        dump(&g, &format!("pf{p:05}"))?;
+                    }
+                    AmdTpGroup::agree(&g.prefill(&ids)?)?
+                } else {
+                    let split: usize = spec.parse()?;
+                    if split == 0 || split >= ids.len() {
+                        return Err("--teacher N needs 0 < N < prompt length".into());
+                    }
+                    let mut last = AmdTpGroup::agree(&g.prefill(&ids[..split])?)?;
+                    dump(&g, &format!("pf{:05}", split - 1))?;
+                    for (p, id) in ids.iter().enumerate().skip(split) {
+                        g.seed_ids(&[*id])?;
+                        last = AmdTpGroup::agree(&g.decode_step(p as u32, p as u32 + 1)?)?;
+                        if p + 1 < ids.len() {
+                            dump(&g, &format!("pf{p:05}"))?;
+                        }
+                    }
+                    last
+                }
             } else {
                 AmdTpGroup::agree(&g.prefill(&ids)?)?
             };

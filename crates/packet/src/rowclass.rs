@@ -96,7 +96,7 @@ pub fn class_of(op: DevOp) -> RowClass {
         | ZeroF32 | CastF32Bf16 | MlaOutGate | KdaGatedNorm | QwenGatedNorm | QwenQGateSplit
         | QwenSigmoidGate | QwenRmsNorm | LayerNormF32 | ScaledAddF32 | GluF32 | EmbedF16F32
         | EmbedOverlayBf16 | EmbedPosBf16 | EmbedFrameBf16 | SampleFishBf16 | GemvF32Out
-        | SampleSmallF32 | LstmCellF32 | ReluF32 | BroadcastAddF32 | QuantFp8Block128 => {
+        | SampleSmallF32 | LstmCellF32 | ReluF32 | BroadcastAddF32 | QuantFp8Block128 | MuseRmsNorm | MuseResidualGate | MuseNormGateNorm => {
             RowClass::A
         }
         // `Embed` gathers rows of the EMBEDDING TABLE by token id — one id per row, no
@@ -157,7 +157,7 @@ pub fn class_of(op: DevOp) -> RowClass {
         | MoeCombine | MoeCombinePf | MoeGroupGluPf | MoeGroupDownPf | MoeExpertGluFp8Blk
         | MoeExpertDownFp8Blk | MoeGroupGluFp8Blk | MoeGroupDownFp8Blk | MoeGluMx | MoeDownMx
         | MoeGluMxPf | MoeDownMxPf | MoeAiterFp8Pf | MoeGluFp8Block128 | MoeQuantFp8Block128
-        | MoeDownFp8Block128 => RowClass::A,
+        | MoeDownFp8Block128 | MuseMoeCombineNorm => RowClass::A,
         MoeRouterGemma
         | MoeRouterGemmaScore
         | MoeRouterGemmaScoreFast

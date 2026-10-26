@@ -48,6 +48,8 @@ inductive Op
   | SnapNil
   | SnapCons   (snapshot rest : Op)
   | BlockResidual (prefixValue snapshots normWeight projWeight : Op) (maxSnapshots : Nat)
+  /-- Muse Spark gated residual: `alpha(gate) * residual + beta(gate) * h`. -/
+  | ResidualGate (residual h gate : Op) (temperature eps : Nat)
   /-- Attention op — schematic representation, keeps `q`, `k`, `v` as
       separate operands. -/
   | Attention  (q k v : Op)
@@ -68,6 +70,7 @@ inductive Op
   | SwiGLU                  (gate up : Op) (kind : String)
   | FusedResidualNorm       (a b w : Op) (eps : Nat)
   | FusedResidualZeroCenteredNorm (a b w : Op) (eps : Nat)
+  | FusedResidualGateZeroCenteredNorm (r h g : Op) (temperature gateEps : Nat) (w : Op) (eps : Nat)
   | FusedResidualLayerNorm  (a b w bias : Op) (eps : Nat)
   | FusedResidual3Norm      (x a b w : Op) (eps : Nat)
   /-- Sandwich seam: `RmsNorm(a + RmsNorm(b, w1), w2)`. -/
@@ -131,6 +134,8 @@ def expand : Op → Op
       Op.RmsNorm (Op.Ew "add" (expand a) (expand b)) (expand w) eps
   | Op.FusedResidualZeroCenteredNorm a b w eps =>
       Op.ZeroCenteredRmsNorm (Op.Ew "add" (expand a) (expand b)) (expand w) eps
+  | Op.FusedResidualGateZeroCenteredNorm r h g t ge w eps =>
+      Op.ZeroCenteredRmsNorm (Op.ResidualGate (expand r) (expand h) (expand g) t ge) (expand w) eps
   | Op.FusedResidualLayerNorm a b w bias eps =>
       Op.LayerNorm (Op.Ew "add" (expand a) (expand b)) (expand w) (expand bias) eps
   | Op.FusedResidual3Norm x a b w eps =>
@@ -230,6 +235,7 @@ def expand : Op → Op
   | Op.SnapCons snapshot rest => Op.SnapCons (expand snapshot) (expand rest)
   | Op.BlockResidual prefixValue snapshots nw pw maxSnapshots =>
       Op.BlockResidual (expand prefixValue) (expand snapshots) (expand nw) (expand pw) maxSnapshots
+  | Op.ResidualGate r h g t e => Op.ResidualGate (expand r) (expand h) (expand g) t e
   | Op.Var s => Op.Var s
 
 /-! ## Rewrite rule soundness — every rule reduces to `rfl` on `expand`. -/
@@ -284,6 +290,13 @@ theorem rule_residual_rmsnorm_fuse (a b w : Op) (eps : Nat) :
 theorem rule_residual_zero_centered_rmsnorm_fuse (a b w : Op) (eps : Nat) :
     expand (Op.FusedResidualZeroCenteredNorm a b w eps) =
       Op.ZeroCenteredRmsNorm (Op.Ew "add" (expand a) (expand b)) (expand w) eps := rfl
+
+/-- `residual-gate-zero-centered-rmsnorm-fuse` -/
+theorem rule_residual_gate_zero_centered_rmsnorm_fuse
+    (r h g w : Op) (t ge eps : Nat) :
+    expand (Op.FusedResidualGateZeroCenteredNorm r h g t ge w eps) =
+      Op.ZeroCenteredRmsNorm (Op.ResidualGate (expand r) (expand h) (expand g) t ge)
+        (expand w) eps := rfl
 
 /-- `residual-layernorm-fuse` -/
 theorem rule_residual_layernorm_fuse (a b w bias : Op) (eps : Nat) :
@@ -495,6 +508,7 @@ def soundRules : List String :=
    "gated-mlp-fuse",
    "residual-rmsnorm-fuse",
    "residual-zero-centered-rmsnorm-fuse",
+   "residual-gate-zero-centered-rmsnorm-fuse",
    "residual-layernorm-fuse",
    "residual3-rmsnorm-fuse",
    "norm-residual-rmsnorm-fuse",

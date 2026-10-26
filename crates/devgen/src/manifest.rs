@@ -1778,7 +1778,13 @@ fn backend_amd(
     // op's `rot_offset` expresses. The arm is behind `PLOW_QWEN_GDN` and an object without it
     // leaves `q`/`kv` unrotated -- every position attends as if it were position zero, which reads
     // as a long-context regression rather than as a missing kernel.
-    if has("QwenHeadNormRope") {
+    // Muse Spark's block ops are compiled with the same axis (`op_muse.h`).
+    if has("QwenHeadNormRope")
+        || has("MuseRmsNorm")
+        || has("MuseResidualGate")
+        || has("MuseMoeCombineNorm")
+        || has("MuseNormGateNorm")
+    {
         req.push("PLOW_QWEN_GDN=1".into());
     }
     if on("a4w4") {
@@ -3297,6 +3303,11 @@ pub fn config_header(manifest: &Value) -> String {
         if let Some(v) = t.get("gf256").and_then(Value::as_u64) {
             out.push_str(&format!(
                 "#ifndef PLOW_NV_FA_GF_HD256\n#define PLOW_NV_FA_GF_HD256 {v}\n#endif\n"
+            ));
+        }
+        if let Some(v) = t.get("gf64").and_then(Value::as_u64) {
+            out.push_str(&format!(
+                "#ifndef PLOW_FA_GF_64\n#define PLOW_FA_GF_64 {v}\n#endif\n"
             ));
         }
         if let Some(v) = t.get("gf_full").and_then(Value::as_u64) {

@@ -308,7 +308,7 @@ impl ChatTemplate {
         );
         // A template that will not COMPILE is a defect in the assets, and falling back silently
         // is how a wrong prompt ships: the caller decides, with the file named.
-        env.add_template_owned("chat", text.to_string())
+        env.add_template_owned("chat", neutral_generation_blocks(text))
             .map_err(|e| format!("{source}: {e}"))?;
         Ok(ChatTemplate {
             env,
@@ -422,6 +422,28 @@ impl ChatTemplate {
     }
 }
 
+/// `transformers`' `{% generation %}...{% endgeneration %}` (the assistant-token mask for
+/// training) renders its body unchanged; minijinja has no such statement, so each tag becomes an
+/// always-true `if` with the same whitespace control.
+fn neutral_generation_blocks(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(i) = rest.find("{%") {
+        let Some(j) = rest[i..].find("%}") else { break };
+        let tag = &rest[i..i + j + 2];
+        let inner = tag[2..tag.len() - 2].trim_matches(|c: char| c == '-' || c == '+');
+        out.push_str(&rest[..i]);
+        match inner.trim() {
+            "generation" => out.push_str(&tag.replacen("generation", "if true", 1)),
+            "endgeneration" => out.push_str(&tag.replacen("endgeneration", "endif", 1)),
+            _ => out.push_str(tag),
+        }
+        rest = &rest[i + j + 2..];
+    }
+    out.push_str(rest);
+    out
+}
+
 /// `transformers`' `continue_final_message`: cut the render right after the final message's
 /// text, so the model continues it instead of seeing its turn closed (most templates, Gemma 4's
 /// among them, close every turn whatever `add_generation_prompt` says).
@@ -448,4 +470,16 @@ fn continue_final(mut rendered: String, messages: &[serde_json::Value]) -> Resul
     };
     rendered.truncate(end);
     Ok(rendered)
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn generation_blocks_become_always_true_ifs() {
+        let t = "a{%- generation %}b{% endgeneration -%}c{% if x %}d{% endif %}";
+        assert_eq!(
+            super::neutral_generation_blocks(t),
+            "a{%- if true %}b{% endif -%}c{% if x %}d{% endif %}"
+        );
+    }
 }

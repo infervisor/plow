@@ -3445,6 +3445,14 @@ fn prefill_arm_detect_selects_the_right_variant() {
     a4w4[0].insts[2].i[MOE_PF_ENC_SLOT] = MOE_ENC_MXFP4;
     a4w4[0].insts[3].i[MOE_PF_ENC_SLOT] = MOE_ENC_MXFP4;
     assert_eq!(PrefillArm::detect(&a4w4), PrefillArm::MlaMoeA4w4);
+    // The same chain with dense attention (no MLA-family opcode) rides the plain object.
+    let mut dense_moe = vec![prog_with_ops(&[
+        DevOp::FlashPrefill,
+        DevOp::MoeGroupGluPf,
+        DevOp::MoeGroupDownPf,
+    ])];
+    dense_moe[0].insts[1].i[MOE_PF_ENC_SLOT] = MOE_ENC_MXFP4;
+    assert_eq!(PrefillArm::detect(&dense_moe), PrefillArm::None);
     assert_eq!(Variant::detect(&a4w4), Variant::Mxfp4);
     assert_eq!(
         object_name(

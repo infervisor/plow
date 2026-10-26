@@ -145,6 +145,10 @@ extern "C" __device__ unsigned plow_mla_p_bf16_1 = 1;
  * FA_FAST_RCP above: CDNA3 only, gfx950 stays bit-identical until someone with that hardware
  * re-runs its goldens and flips this to 1 there. */
 /* FA_MERGE_UNROLL4 is ARCH-DEFAULTED: op_attention_gfx942.h (1) / op_attention_gfx950.h (0). */
+/* [MERGE-LDS] opt-in: the serial merge reads an LDS copy staged in one load round. */
+#ifndef PLOW_FA_MERGE_LDS
+#define PLOW_FA_MERGE_LDS 0
+#endif
 
 /* LAZY RESCALE. The online-softmax rescale multiplies every O-accumulator element by
  * corr = exp(m_old - m_new) on EVERY KV tile — 16 exps + NDT*16 v_mul per lane per tile
@@ -1193,6 +1197,11 @@ __device__ void d_flash_prefill(float* __restrict__ Opart, float* __restrict__ m
  * The softmax is now GF-way. The per-head reductions run on DIFFERENT WAVES (wave g reduces head
  * g), so all GF of them happen concurrently and the tile still costs 3 barriers, not 3*GF.
  * ------------------------------------------------------------------------- */
+/* Defaulted here, not in dev_isa.h: interp.hip includes dev_isa.h before PLOW_CONFIG, and the
+ * packet header of a `PLOW_FA_GF_64` Muse emit carries the hd64 group. Default 2. */
+#ifndef PLOW_FA_GF_64
+#define PLOW_FA_GF_64 2
+#endif
 #define FA_DEC_LDS_FLOATS(D, GF) \
     ((GF) * FA_DEC_TILE * FA_DEC_GROUPS + 2 * PLOW_WAVES + (GF) * ((D) / 2) + \
      FA_DEC_GROUPS * FA_DEC_NG(D) * (D))
@@ -2018,6 +2027,18 @@ __device__ __noinline__ void d_flash_decode_slots(
         nullptr, nullptr, 0.0f, 0, nullptr, nullptr, decode_slot);
 }
 
+/* Out of line so a wide hd64 group's registers do not spill the rest of the decode interpreter
+ * (MI350X Muse block, GF=8: k/v GEMVs 12.7 -> 23.8 us inlined). */
+template <int D, int GF>
+__device__ __noinline__ void d_flash_decode_noinl(
+    float* Opart, float* mlpart, const bf16* Q, const bf16* K, const bf16* V,
+    const int* kv_len, unsigned n_batch, unsigned n_head, unsigned n_kv_head,
+    unsigned kv_stride, unsigned window, float scale, unsigned nsplit, unsigned kv_mask,
+    unsigned slice, unsigned nblk, float* lds) {
+    d_flash_decode<D, GF>(Opart, mlpart, Q, K, V, kv_len, n_batch, n_head, n_kv_head, kv_stride,
+                          window, scale, nsplit, kv_mask, slice, nblk, lds);
+}
+
 /* Combine the split partials: standard online-softmax merge.
  *
  * WORK DECOMPOSITION IS (batch, head, d-chunk), and the d-chunk axis is DERIVED FROM `nblk`, not
@@ -2099,7 +2120,7 @@ __device__ void d_flash_merge(bf16* __restrict__ O_, const float* __restrict__ O
                               const float* __restrict__ mlpart_, unsigned n_batch,
                               unsigned n_head, unsigned nsplit, unsigned slice, unsigned nblk,
                               const void* __restrict__ sinks_ = nullptr, unsigned flat = 0,
-                              bool sinks_f32 = false) {
+                              bool sinks_f32 = false, float* lds = nullptr) {
     /* All three came out of the tensor table, so all three were generic: the Opart reads were
      * flat_load_dword and the O writes flat_store_short. Nothing about the ACCESS was wrong --
      * they are coalesced -- they were just on the slow path. */
@@ -2147,9 +2168,52 @@ __device__ void d_flash_merge(bf16* __restrict__ O_, const float* __restrict__ O
         const unsigned d0 = dp * dchunk;
         const unsigned d1 = (d0 + dchunk < (unsigned)D) ? (d0 + dchunk) : (unsigned)D;
         const auto* ml = mlpart + (size_t)(b * n_head + h) * nsplit * 2;
+#if PLOW_FA_MERGE_LDS && !FA_MERGE_UNROLL4
+        /* [MERGE-LDS] Stage the item's (m, l) and Opart[., d0..d1) in ONE load round, then run
+         * the serial merge below on the LDS copy: same values, same expressions, same order, so
+         * bit-identical. The serial form is nsplit dependent global loads per element (~20 us at
+         * batch 1, nsplit 32, on 16 workgroups). `lds` is null when the item does not fit. */
+        const float* mlv = ml;
+        const float* ov = nullptr;
+        unsigned ostride = (unsigned)D, obase0 = 0u;
+        if (lds) {
+            const unsigned dn = d1 - d0;
+            const auto* og = Opart + (size_t)(b * n_head + h) * nsplit * (size_t)D;
+            const unsigned n = nsplit * dn;
+            float* const lo = lds + 2u * nsplit;
+            __syncthreads();
+            /* Loads first, stores after: through the generic `lds` the compiler cannot move a
+             * load above a store, so an interleaved copy is one round trip per element. */
+            const float m = threadIdx.x < 2u * nsplit ? ml[threadIdx.x] : 0.0f;
+            for (unsigned i0 = threadIdx.x; i0 < n; i0 += 4u * PLOW_THREADS) {
+                float v[4];
+#pragma unroll
+                for (unsigned u = 0; u < 4; u++) {
+                    const unsigned i = i0 + u * PLOW_THREADS;
+                    v[u] = i < n ? og[(size_t)(i / dn) * D + d0 + i % dn] : 0.0f;
+                }
+#pragma unroll
+                for (unsigned u = 0; u < 4; u++) {
+                    const unsigned i = i0 + u * PLOW_THREADS;
+                    if (i < n) lo[i] = v[u];
+                }
+            }
+            if (threadIdx.x < 2u * nsplit) lds[threadIdx.x] = m;
+            for (unsigned i = threadIdx.x + PLOW_THREADS; i < 2u * nsplit; i += PLOW_THREADS)
+                lds[i] = ml[i];
+            __syncthreads();
+            mlv = lds;
+            ov = lo;
+            ostride = dn;
+            obase0 = d0;
+        }
+#define PLOW_FA_MERGE_ML mlv
+#else
+#define PLOW_FA_MERGE_ML ml
+#endif
 
         float gm;
-        float gl = fa_merge_ml(ml, nsplit, gm);
+        float gl = fa_merge_ml(PLOW_FA_MERGE_ML, nsplit, gm);
         /* rescale stays exactly 1.0f without sinks, and 1.0f is an exact multiplicand, so the
          * no-sink arithmetic below is bit-for-bit the pre-sinks merge. */
         float rescale = 1.0f;
@@ -2186,6 +2250,15 @@ __device__ void d_flash_merge(bf16* __restrict__ O_, const float* __restrict__ O
 #if !FA_MERGE_UNROLL4
             /* The pre-UNROLL4 serial merge, kept bit-identical for CDNA4 (see FA_MERGE_UNROLL4). */
             float acc = 0.0f;
+#if PLOW_FA_MERGE_LDS
+            if (ov) {
+                for (unsigned s = 0; s < nsplit; s++) {
+                    if (mlv[s * 2] == FA_NEG_INF) continue;
+                    const float sc = FA_EXP(mlv[s * 2] - gm);
+                    acc += ov[(size_t)s * ostride + d - obase0] * sc;
+                }
+            } else
+#endif
             for (unsigned s = 0; s < nsplit; s++) {
                 if (ml[s * 2] == FA_NEG_INF) continue;
                 const float sc = FA_EXP(ml[s * 2] - gm);
@@ -2212,6 +2285,7 @@ __device__ void d_flash_merge(bf16* __restrict__ O_, const float* __restrict__ O
 #endif /* FA_MERGE_UNROLL4 */
             st_act1(&O[((size_t)b * n_head + h) * D + d], f2bf(acc * inv));
         }
+#undef PLOW_FA_MERGE_ML
     }
 }
 

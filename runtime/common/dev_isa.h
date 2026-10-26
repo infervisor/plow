@@ -464,7 +464,8 @@ enum {
      * Bit-identical output (same per-slot wave_dot_fp8_blk + slot layout). EP: a null weight base
      * (expert not owned by this rank) is skipped exactly like the eid>=n_exp sentinel. */
     PLOW_DOP_MOE_GROUP_GLU_FP8_BLK = 48, /* grouped expert gate/up: t0=fu[k,I] t1=x t2=tab t3=wtab
-                                          * t4=stab; i0=k i1=I_moe i2=H i3=n_exp i5=act */
+                                          * t4=stab; i0=k i1=I_moe i2=H i3=n_exp i5=act
+                                          * i4=k per x row (0 = one shared row) */
     PLOW_DOP_MOE_GROUP_DOWN_FP8_BLK = 49,/* grouped expert down:   t0=part[k,H] t1=fu t2=tab t3=wtab
                                           * t4=stab; i0=k i1=H i2=I_moe i3=n_exp */
 
@@ -499,7 +500,8 @@ enum {
      * groups, then top-k inside them. 0 or 1 means flat top-k, which is every GLM/Qwen/Mixtral
      * packet and is bit-identical to the pre-group behaviour. This was CLAIMED by the old
      * header and NOT IMPLEMENTED, which at 8 groups / top-4 silently selected a different
-     * expert set — fluent output, wrong model. */
+     * expert set — fluent output, wrong model.
+     * i4 > 1: that many logit/table rows, one workgroup each. f1 = logit scale (0 = 1). */
     PLOW_DOP_MOE_ROUTER_TOPK = 56,
 
     /* FUSED MLA merge + W_uv fold (d_mla_merge_fold) — replaces FLASH_MERGE<512> + O_UV_FOLD on the
@@ -677,7 +679,7 @@ enum {
     /* T-token router tail: block-per-token loop of MOE_ROUTER_TOPK, bit-identical per token.
      * The [T,n_exp] logit matrix is an ordinary GEMM (op 8), already in the prefill bucket.
      * t0=table([T*k]) t1=logit([T,n_exp] bf16) t3=bias  i1=n_exp i2=k i3=flags i4=T
-     * i6=n_group i7=topk_group  f0=route_scale */
+     * i6=n_group i7=topk_group  f0=route_scale f1=logit scale (0 = 1) */
     PLOW_DOP_MOE_ROUTER_TOPK_PF = 83,
     /* ALIGN/SORT, ONE workgroup: histogram T*k slots by expert, MPF_BM-padded prefix, scatter.
      * meta(i32): [0,n_exp) rowoff, [n_exp,2n_exp) cnt, [2n_exp,3n_exp+1) tile prefix.
@@ -1536,6 +1538,27 @@ enum {
     PLOW_DOP_LENGTH_AFFINE_U32 = 224,
     /* librosa trim(top_db, ref=max) of a 1-D signal per item; see DevOp::TrimSilenceF32. */
     PLOW_DOP_TRIM_SILENCE_F32 = 225,
+    /* Muse Spark (op_muse.h). Row RMSNorm: t0=out t1=x t2=w? i0=rows i1=dim i2=mode
+     * (0 x*r*w | 1 centered x*r*(1+w) | 2 input-scaled y=bf16(x*(1+w)), y*r(y)) f0=eps
+     * f1=output scale (0 = 1; the final norm carries the logit output_multiplier).
+     * t3/i3 = band-major copy bm[c/i3][row][c%i3] (i3 = 0: none). */
+    PLOW_DOP_MUSE_RMSNORM = 226,
+    /* out = bf16(alpha*res + beta*h), beta = sigmoid(g/T), alpha = sqrt(max(sigmoid(-g/T)*(1+beta),
+     * eps)). t0=out t1=res t2=h t3=g(bf16[n]) i0=n i1=rows f0=T f1=eps. */
+    PLOW_DOP_MUSE_RESIDUAL_GATE = 227,
+    /* out[h] = sum_j gate_j * norm_is(bf16(part[j][h] / gate_j)), the input-scaled post-expert
+     * norm before the weighted combine. t0=out(bf16[H]) t1=part(f32[k][H]) t2=table t3=w(bf16[H])
+     * i0=H i1=k i2=ybf f0=eps. i2=1 (TP): t1 is the reduced bf16 unweighted y[k][H]
+     * that MOE_GROUP_DOWN_FP8_BLK / MOE_EXPERT_DOWN write when their i7 = 1; i2=2: the reduced
+     * bf16 gate*y of MOE_GROUP_DOWN_PF's part16 scatter. i3 = rows (0 = 1; one workgroup per
+     * row), t4/i4 = band-major copy as MUSE_RMSNORM. */
+    PLOW_DOP_MUSE_MOE_COMBINE_NORM = 228,
+    /* Ops 226 -> 227 -> 226 fused (decode objects), one workgroup per row:
+     * out_n = norm2(out_res), out_res = gate_res(res, norm1(h), g).
+     * t0=out_res t1=h t2=w1? t3=res t4=g t5=out_n t6=w2? t7=band?
+     * i0=rows i1=dim i2=mode1 i3=mode2 i4=band width (0: none) i5=gate eps (f32 bits)
+     * i6=out_n scale (f32 bits, 0 = 1) f0=eps1 f1=eps2 j1=T (f32 bits). */
+    PLOW_DOP_MUSE_NORM_GATE_NORM = 229,
 
     PLOW_DOP__COUNT
 };
@@ -1961,7 +1984,8 @@ typedef struct {
 #ifndef PLOW_FA_GF_FULL
 #define PLOW_FA_GF_FULL 2
 #endif
-#define PLOW_FA_GF(HD) ((HD) == 512 ? PLOW_FA_GF_FULL : 2)
+/* hd64: PLOW_FA_GF_64 defaults in op_attention_common.h, after the packet header that carries it. */
+#define PLOW_FA_GF(HD) ((HD) == 512 ? PLOW_FA_GF_FULL : (HD) == 64 ? PLOW_FA_GF_64 : 2)
 
 /* SLIDING-WINDOW KV RING.
  *

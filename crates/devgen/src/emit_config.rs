@@ -441,6 +441,11 @@ pub struct EmitConfig {
     #[arg(long, env = "PLOW_FA_GF_FULL")]
     pub fa_gf_full: Option<u32>,
 
+    /// AMD flash-decode GQA fusion factor on Muse Spark hd64 layers (paired with the object's
+    /// `PLOW_FA_GF_64` through the packet header). Unset = 2.
+    #[arg(long, env = "PLOW_FA_GF_64")]
+    pub fa_gf_64: Option<u32>,
+
     /// Experimental full-attention decode GF with batch-aware balanced split counts.
     #[arg(long, env = "PLOW_ATTENTION_DECODE_BALANCE_GF")]
     pub attention_decode_balance_gf: Option<u32>,
@@ -594,6 +599,20 @@ pub struct EmitConfig {
     /// default; this is the sweep handle for a re-measurement.
     #[arg(long, env = "PLOW_MLA_NS")]
     pub mla_ns: Option<u32>,
+    /// Pin the Muse Spark flash-decode `nsplit`. Unset = the CU-filling default; the sweep handle
+    /// for the split-count screen.
+    #[arg(long, env = "PLOW_MUSE_DECODE_NS")]
+    pub muse_decode_ns: Option<u32>,
+    /// Muse Spark TP: `pre_expert_proj` / `post_expert_proj` row-parallel with one all-reduce
+    /// each (default) instead of replicated on every rank.
+    #[arg(long, env = "PLOW_MUSE_LATENT_TP", default_value_t = true, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
+    pub muse_latent_tp: bool,
+    /// Muse Spark one-row decode: q/k/v/gate projections as one `GemvQkvg` (LDS-bounded).
+    #[arg(long, env = "PLOW_MUSE_QKVG", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
+    pub muse_qkvg: bool,
+    /// Muse Spark one-row decode: each norm / residual gate / norm chain as one `MuseNormGateNorm`.
+    #[arg(long, env = "PLOW_MUSE_NGN", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
+    pub muse_ngn: bool,
     /// Items per gathered query pack in the V4.1 sparse prefill (1 = the un-split arm).
     #[arg(long, env = "PLOW_MLA_GATHER_SPLIT", default_value_t = 2)]
     pub mla_gather_split: u32,
@@ -1974,6 +1993,7 @@ impl EmitConfig {
             spec_kind: env_str("PLOW_SPEC_KIND"),
             moe_combine_blocks: env_u32("PLOW_MOE_COMBINE_BLOCKS"),
             fa_gf_full: env_u32("PLOW_FA_GF_FULL"),
+            fa_gf_64: env_u32("PLOW_FA_GF_64"),
             attention_decode_balance_gf: env_u32("PLOW_ATTENTION_DECODE_BALANCE_GF"),
             fa_gf_light512: env_u32("PLOW_FA_GF_LIGHT512"),
             fa_mmaqk: env_u32("PLOW_FA_MMAQK"),
@@ -2006,6 +2026,10 @@ impl EmitConfig {
             k3_full: env_bool_default_true("K3_FULL"),
             k3_fuse_a: env_bool("PLOW_K3_FUSE_A"),
             mla_ns: env_u32("PLOW_MLA_NS"),
+            muse_decode_ns: env_u32("PLOW_MUSE_DECODE_NS"),
+            muse_latent_tp: env_bool_default_true("PLOW_MUSE_LATENT_TP"),
+            muse_qkvg: env_bool("PLOW_MUSE_QKVG"),
+            muse_ngn: env_bool("PLOW_MUSE_NGN"),
             mla_gather_split: env_u32("PLOW_MLA_GATHER_SPLIT").unwrap_or(2),
             dsv41_xr_band: env_u32("PLOW_DSV41_XR_BAND").unwrap_or(1),
             dsv41_xr_band_cus: env_u32("PLOW_DSV41_XR_BAND_CUS"),

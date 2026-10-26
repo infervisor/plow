@@ -116,6 +116,7 @@ pub(crate) fn is_fused(op: &str) -> bool {
             | "FusedNormRopeScale"
             | "FusedResidualNorm"
             | "FusedResidualZeroCenteredNorm"
+            | "FusedResidualGateZeroCenteredNorm"
             | "FusedResidualLayerNorm"
             | "FusedResidual3Norm"
             | "FusedNormResidualNorm"
