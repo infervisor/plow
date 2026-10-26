@@ -264,6 +264,14 @@ const GLM_GLU_ROWS_DEFAULT: Default = Default::Production {
     otherwise: FALSE,
 };
 
+const GLM_HPACK_GATHER_DEFAULT: Default = Default::Production {
+    cases: &[DefaultCase {
+        when: GLM_GFX950,
+        value: Val::Nat(1),
+    }],
+    otherwise: Val::Unset,
+};
+
 /// `EmitConfig::glm_seq_par`: the default stands aside for the two-shot seams it replaces, and
 /// `glm_recipe_unset` records the resolved value either way.
 const GLM_SEQ_PAR_DEFAULT: Default = Default::Production {
@@ -1370,7 +1378,7 @@ pub const EMIT: &[KnobSpec] = &[
     KnobSpec::new("emit.glm53_mla_hpack_rows", Some("PLOW_GLM53_MLA_HPACK_ROWS"), Layer::Emit, U32, UNSET, OPT_IN),
     KnobSpec::new("emit.glm53_pf_hc_aiter", Some("PLOW_GLM53_PF_HC_AITER"), Layer::Emit, Domain::Bool, OFF, OPT_IN),
     KnobSpec::new("emit.glm53_mla_seg_kvw", Some("PLOW_GLM53_MLA_SEG_KVW"), Layer::Emit, Domain::Bool, OFF, OPT_IN),
-    KnobSpec::new("emit.glm53_mla_hpack_gather", Some("PLOW_GLM53_MLA_HPACK_GATHER"), Layer::Emit, U32, UNSET, OPT_IN),
+    KnobSpec::new("emit.glm53_mla_hpack_gather", Some("PLOW_GLM53_MLA_HPACK_GATHER"), Layer::Emit, U32, GLM_HPACK_GATHER_DEFAULT, OPT_IN),
     KnobSpec::new("emit.glm_hc_mix_split", Some("PLOW_GLM_HC_MIX_SPLIT"), Layer::Emit, U32, UNSET, OPT_IN),
     KnobSpec::new("emit.glm_hc_fuse_dec", Some("PLOW_GLM_HC_FUSE_DEC"), Layer::Emit, Domain::Bool, OFF, OPT_IN),
     KnobSpec::new("emit.glm_kda_proj_group", Some("PLOW_GLM_KDA_PROJ_GROUP"), Layer::Emit, Domain::Bool, OFF, OPT_IN),

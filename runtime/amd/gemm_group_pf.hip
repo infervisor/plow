@@ -25,7 +25,7 @@ extern "C" __global__ __launch_bounds__(PLOW_THREADS) void plow_gemm_group_pf_gf
     for (unsigned g = 0; g < PLOW_GG_GROUPS; g++) n += a.r.n[g];
     const unsigned tiles = ((a.t + GM_C8_BM - 1) / GM_C8_BM) * ((n + GM_C8_BN - 1) / GM_C8_BN);
     d_gemm_t<GM_C8_BM, GM_C8_BN, GM_C8_BK, GM_WM, GM_WN, false, GM_SWZ, GM_WGM, (GM_PP != 0), true,
-             false, false, false, false
+             false, false, false, false, false
 #if PLOW_GLM_FUSE_POST
              , false
 #endif

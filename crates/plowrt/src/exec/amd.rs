@@ -5091,7 +5091,9 @@ fn derive_packed_segment_families(prog: &DevProg) -> Result<Vec<u8>> {
             narrow_norm[e.seg as usize] = Some(inst.i[0]);
             continue;
         }
-        let next = if norm {
+        let pool_write = (op == DevOp::DsaPoolCompress as u16 && inst.i[6] == 1)
+            || (op == DevOp::DsaPoolStash as u16 && inst.i[4] == 1);
+        let next = if norm || pool_write {
             Some(5)
         } else if op == DevOp::FlashMlaPrefill as u16 || op == DevOp::FlashMlaPrefillFp8 as u16 {
             Some(6)
@@ -5319,11 +5321,13 @@ fn check_packed_dense_program(insts: &[DevInst64]) -> Result<()> {
 /// The class-C prefill selectors with no per-span form: they run on the primary interpreter,
 /// which reads every row's position from `kv_len[0]`, so a packed program may not carry them.
 fn packed_class_c_selector(d: &DevInst64) -> bool {
-    // The per-span pool writes (DsaPoolCompress `i[6] = 1`, DsaPoolStash `i[4] = 1`) read the
-    // span table, which only the packed family objects carry; they run in interpreter segments,
-    // whose object traps there. Until they move into a packed family, refuse the packed route.
+    // The per-span pool writes (DsaPoolCompress `i[6] = 1`, DsaPoolStash `i[4] = 1`) run in
+    // packed MLA norm family 5 with the span table, resolving rows per span:
+    if d.op == DevOp::DsaPoolCompress as u16 && d.i[6] == 1 {
+        return false;
+    }
     if d.op == DevOp::DsaPoolStash as u16 && d.i[4] == 1 {
-        return true;
+        return false;
     }
     matches!(
         DevOp::from_u16(d.op),
@@ -5333,6 +5337,7 @@ fn packed_class_c_selector(d: &DevInst64) -> bool {
                 | DevOp::IndexUnionPf
                 | DevOp::DsaPoolExpand
                 | DevOp::DsaPoolCompress
+                | DevOp::DsaPoolStash
                 | DevOp::FlashGatherPrefill
         )
     )
@@ -5345,6 +5350,8 @@ fn sparse_prefill_chain(prog: &DevProg) -> bool {
     prog.insts.iter().any(|d| {
         d.op == DevOp::IndexTpPf as u16
             || (d.op == DevOp::FlashMlaPrefillFp8 as u16 && sparse_fp8(d))
+            || (d.op == DevOp::DsaPoolCompress as u16 && d.i[6] != 1)
+            || (d.op == DevOp::DsaPoolStash as u16 && d.i[4] != 1)
     })
 }
 
@@ -5400,6 +5407,16 @@ fn packed_sparse_refusal(
             .map(|e| e.seg as usize)
     };
     for (ix, d) in prog.insts.iter().enumerate() {
+        if d.op == DevOp::DsaPoolCompress as u16 && d.i[6] != 1 {
+            return Some(format!(
+                "packed sparse prefill: DsaPoolCompress instruction {ix} carries non-span indexing"
+            ));
+        }
+        if d.op == DevOp::DsaPoolStash as u16 && d.i[4] != 1 {
+            return Some(format!(
+                "packed sparse prefill: DsaPoolStash instruction {ix} carries non-span indexing"
+            ));
+        }
         if d.op == DevOp::IndexTpPf as u16 {
             match index_tp_span_aware {
                 Some(true) => {}
