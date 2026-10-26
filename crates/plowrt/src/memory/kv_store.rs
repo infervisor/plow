@@ -1160,9 +1160,12 @@ impl KvStore {
         let Some(b) = e.block.take() else {
             return;
         };
-        e.gen = e.gen.wrapping_add(1);
         inner.index.remove(&(b.class, b.key));
-        inner.free_entries.push(id.index);
+        // An exhausted generation retires the entry: a wrap would make old ids valid again.
+        if let Some(gen) = e.gen.checked_add(1) {
+            e.gen = gen;
+            inner.free_entries.push(id.index);
+        }
         let bytes = inner.classes[b.class].spec.block_bytes();
         let c = &mut inner.classes[b.class];
         let st = &mut inner.stats.classes[b.class];
@@ -2183,6 +2186,24 @@ mod tests {
         );
         assert_eq!(s.stats().reclaims, 1);
         assert_eq!(s.state(a.id), None, "the stale id names nothing");
+    }
+
+    /// An entry whose generation is exhausted is never reused: an id from before the wrap
+    /// cannot name a later block.
+    #[test]
+    fn an_exhausted_generation_retires_its_entry() {
+        let (_, s) = store(2 * 32, 0);
+        let a = acquire_sealed(&s, 0, key(1));
+        s.inner.lock().blocks[a.id.index()].gen = u32::MAX;
+        let a = BlockId {
+            index: a.id.index,
+            gen: u32::MAX,
+        };
+        s.release(&[a]);
+        assert_eq!(s.evict(&[a]), 1);
+        let b = acquire_sealed(&s, 0, key(2));
+        assert_ne!(b.id.index, a.index, "the retired entry is not reused");
+        assert_eq!(s.state(a), None);
     }
 
     #[test]
