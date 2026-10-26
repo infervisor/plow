@@ -141,6 +141,34 @@ class ScoreTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 g.score(ref, cap)
 
+    def test_pooled_captures_score_their_union(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            ref = make_ref(tmp)
+            ok, dec = make_cap(ref, "p"), make_cap(ref, "p", flip_decisive=True)
+            s = g.score(ref, [ok, dec])
+            self.assertEqual((s["cases"], s["positions"], s["decisive"]), (4, 8, 6))
+            self.assertEqual(s["cont_decisive_frac"], 0.75)  # one flipped case of four, not of two
+            self.assertAlmostEqual(s["top1_decisive"], 5 / 6)
+            self.assertEqual(g.score(ref, [ok]), g.score(ref, ok))
+            foreign = dict(dec, ref_sha256="0" * 64)
+            with self.assertRaises(ValueError):
+                g.score(ref, [ok, foreign])
+            with self.assertRaises(ValueError):
+                g.score(ref, [])
+
+    def test_pooled_gate_replicates_the_peer(self):
+        # Nine exact positions and one far one: the trimmed mean and p95 of [cap, cap] differ from cap's,
+        # so a pooled candidate is only comparable with a peer pooled to the same size.
+        ref = dict(sha256="x", cases=[dict(id=str(i), kind="natural", prompt_ids=[1], cont=[5],
+                                           pos=[dict(top=dist((5, 0.9), (9, 0.1)), margin=2.2)]) for i in range(10)])
+        cap = dict(arm="p", ref_sha256="x", cases={str(i): dict(free=[5], free_text="", pos={
+            "0": dist((5, 0.9), (9, 0.1)) if i else dist((5, 0.5), (9, 0.5))}) for i in range(10)})
+        th = dict(g.DEFAULTS)
+        self.assertNotEqual(g.score_with(ref, [cap, cap], th)["kl_trim_mean"], g.score_with(ref, cap, th)["kl_trim_mean"])
+        sc, sp = g.gate_scores(ref, [cap, cap], cap, th)
+        self.assertEqual(sc, sp)
+        self.assertEqual(g.verdict(sc, sp, th), [])
+
     def test_missing_case_counts(self):
         with tempfile.TemporaryDirectory() as tmp:
             ref = make_ref(tmp)

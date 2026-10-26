@@ -1656,6 +1656,8 @@ def cmd_rung_sweep(a: argparse.Namespace) -> None:
 #                     (plow-c<N>.json) and must pass against the peer at the same concurrency —
 #                     `vllm_capture` is then a table { c1 = "...", c8 = "...", c32 = "..." } (a string
 #                     is one peer for every concurrency); with `vllm_hf` the lease captures vLLM at each.
+#                     `captures` = N (default 1) takes N plow captures per concurrency (plow.json,
+#                     plow-r2.json, ...) and scores their pooled union against the one peer capture.
 # Each may set `python` (default [gates].python, else python3), `args` (extra client args) and
 # `timeout_s`. Placeholders as in `build`, plus {assets}, {target} (cargo target dir) and {out}.
 # A table named <kind>_<suffix> (e.g. [gates.llm_fp32_ref_long], a second reference set) runs as
@@ -1705,7 +1707,9 @@ def gate_steps(key: str, g: dict, py: str, out: Path, assets: Path) -> tuple[lis
                     f"--port \"$PB_SERVER_PORT\" {vargs} > \"$PB_SERVER_LOG\" 2>&1 & PB_SERVER_PID=$!; "
                     f"trap pb_serve_stop EXIT; pb_serve_wait {int(g.get('vllm_ready_s', 900))} && "
                     + " && ".join(cap("vllm", c) for c in concs) + " )"]
-        return [cap("plow", c) for c in concs], down
+        n = fp32_captures(g)
+        plow = [cap(fp32_pool_name("plow", r), c) for c in concs for r in range(n)]
+        return plow, down
     if kind == "asr_wer":
         return ([f"{q(py)} {sc('scripts/asr/nvidia/served_bench.py')} --url \"http://127.0.0.1:$PB_SERVER_PORT\" "
                  f"--model \"$MODEL\" --manifest {q(g['manifest'])} --conc {q(str(g.get('conc', '1,16')))} {args} "
@@ -1784,6 +1788,20 @@ def fp32_capture_name(arm: str, c: int, concs: list[int]) -> str:
     return arm if len(concs) == 1 else f"{arm}-c{c}"
 
 
+def fp32_captures(g: dict) -> int:
+    """`captures` = N plow captures per concurrency, scored as one pooled sample (one case's free-run
+    flip then moves cont_decisive_frac by 1/(N * cases) instead of 1/cases)."""
+    n = g.get("captures", 1)
+    if not isinstance(n, int) or isinstance(n, bool) or n < 1:
+        die(f"[gates] captures must be a positive integer, got {n!r}")
+    return n
+
+
+def fp32_pool_name(arm: str, r: int) -> str:
+    """The first capture keeps its name (plow.json); repeats are plow-r2, plow-r3, ..."""
+    return arm if r == 0 else f"{arm}-r{r + 1}"
+
+
 def fp32_peer_path(g: dict, c: int, concs: list[int], d: Path) -> tuple[Path | None, str]:
     """(peer capture for concurrency c, note). The peer is the same-concurrency vLLM capture: a
     `vllm_capture` table lacking c{c} yields None (the gate fails; a c1 peer is a different,
@@ -1830,11 +1848,13 @@ def gate_score(key: str, g: dict, d: Path) -> dict:
     elif kind == "llm_fp32_ref":
         mod = fp32_ref_module()
         concs = fp32_concurrencies(g)
-        plan = [(c, d / f"{fp32_capture_name('plow', c, concs)}.json", *fp32_peer_path(g, c, concs, d)) for c in concs]
+        n = fp32_captures(g)
+        plan = [(c, [d / f"{fp32_capture_name(fp32_pool_name('plow', r), c, concs)}.json" for r in range(n)],
+                 *fp32_peer_path(g, c, concs, d)) for c in concs]
         no_peer = [note for _, _, peer, note in plan if peer is None]
         if no_peer:
             return {"pass": False, "why": no_peer}
-        absent = [str(p) for p in [Path(g["reference"]), *(p for _, cand, peer, _ in plan for p in (cand, peer))]
+        absent = [str(p) for p in [Path(g["reference"]), *(p for _, cands, peer, _ in plan for p in (*cands, peer))]
                   if not p.is_file()]
         if absent:
             return {"pass": False, "why": [f"missing {', '.join(sorted(set(absent)))} (see plow*.log / vllm*.log)"]}
@@ -1842,16 +1862,21 @@ def gate_score(key: str, g: dict, d: Path) -> dict:
         th = dict(mod.DEFAULTS, **{k: g[k] for k in mod.DEFAULTS if k in g})
         if "eos" in g:  # stop ids for a reference made before `reference` recorded them
             th["eos"] = [int(x) for x in g["eos"]]
-        metrics = ("kl_mean", "kl_trim_mean", "kl_p95", "kl_p99", "kl_over", "top1_decisive", "cont_frac", "needle_acc")
+        metrics = ("positions", "kl_mean", "kl_trim_mean", "kl_p95", "kl_p99", "kl_over", "kl_over_frac", "decisive",
+                   "top1_decisive", "cont_frac", "cont_decisive_frac", "cases", "needle_acc")
         table, by_c = {}, {}
-        for i, (c, cand_p, peer_p, note) in enumerate(plan):
-            caps = [json.loads(p.read_text()) for p in (cand_p, peer_p)]
-            cand, vllm = (mod.score_with(ref, cap, th) for cap in caps)
+        for i, (c, cand_ps, peer_p, note) in enumerate(plan):
+            cands = [json.loads(p.read_text()) for p in cand_ps]
+            peer_cap = json.loads(peer_p.read_text())
+            cand, vllm = mod.gate_scores(ref, cands, peer_cap, th)
             bad = mod.verdict(cand, vllm, th)
-            bad += fp32_capture_concurrency(caps[0], c, cand_p.name) + fp32_capture_concurrency(caps[1], c, peer_p.name)
+            for cp, p in zip(cands, cand_ps):
+                bad += fp32_capture_concurrency(cp, c, p.name)
+            bad += fp32_capture_concurrency(peer_cap, c, peer_p.name)
             why += [f"c{c}: {w}" for w in bad] if len(concs) > 1 else bad
             row = {m: cand.get(m) for m in metrics} | {"vllm_" + m: vllm.get(m) for m in metrics}
-            row.update({"pass": not bad, "why": bad, "peer": str(peer_p), **({"note": note} if note else {})})
+            row.update({"pass": not bad, "why": bad, "peer": str(peer_p), "captures": len(cands),
+                        **({"note": note} if note else {})})
             by_c[f"c{c}"] = row
             if i == 0:  # the headline metrics stay those of the first (lowest) concurrency
                 res.update({k: v for k, v in row.items() if k not in ("pass", "why", "peer", "note")})
