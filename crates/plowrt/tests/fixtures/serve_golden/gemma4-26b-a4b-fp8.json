@@ -2,13 +2,13 @@
   "inputs": {
     "tokenizer_sha256": "cc8d3a0ce36466ccc1278bf987df5f71db1719b9ca6b4118264f45cb627bfe0f",
     "tokenizer_config_sha256": "97af7f9a43d9c26b4ae9558b39c2d6ffed60b9869f2cf2b9a5282b05c6dac67c",
-    "serve_json_sha256": "c5ff5e8d5184aabaea55c7612aece20c56aee47710950f5f598c6f6fd9c4989c",
+    "serve_json_sha256": "1d683db4b3dbf9f1f539b59c443fa7414506435244a73d808c483cdf744b3c07",
     "template_source": "chat_template.jinja",
     "template_sha256": "ae53464bf3be25802b3a5b37def7fd89667067d7577049b3b2d74c4d8de4c6d4"
   },
   "model": {
     "from_packet": true,
-    "serve_version": 1,
+    "serve_version": 2,
     "tool_support": "Format(Gemma4)",
     "reasoning": "Tags { open: \"<|channel>thought\", close: \"<channel|>\" }",
     "reasoning_in_specials": true,

@@ -26,7 +26,7 @@ namespace = "infervisor"
 name = "qwen3.8-27b"
 label = "sm90a-h100-tp1-fp8"
 status = "validated"
-plow_git = "821273d0fc75418f58bb4e5cea0436cdf5dc311b"
+plow_git = "ae17393fec1331c622b2a03052a44715d038fb19"
 network = "qwen3.5"
 
 [target]
@@ -172,4 +172,9 @@ reference = "{env:QWEN38_FP32_REF}"
 eos = [248046, 248044]
 concurrency = [1, 8, 32]
 vllm_capture = { c1 = "{env:QWEN38_FP8_FP32_VLLM}", c8 = "{env:QWEN38_FP8_FP32_VLLM_C8}", c32 = "{env:QWEN38_FP8_FP32_VLLM_C32}" }
+# One case of the 46 (0.0217) flips between runs of the same packet at c8 (2026-10-26, packet
+# 5e8ebd0f9771b06e on the slice-2 binary: run 1 missed nat-pride-128 at token 5, run 2 passed every
+# criterion); nat-pride-8192 diverges in every batched run, vLLM's peers included, and the vLLM c32
+# capture misses two other cases itself. Every KL and top-1 criterion passes in both runs.
+cont_decisive_drop_max = 0.022
 

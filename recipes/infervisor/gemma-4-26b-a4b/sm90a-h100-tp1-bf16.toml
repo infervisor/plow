@@ -42,7 +42,7 @@ namespace = "infervisor"
 name = "gemma-4-26b-a4b"
 label = "sm90a-h100-tp1-bf16"
 status = "validated"
-plow_git = "b403a5c1d57c82b15d3da01737a88e41765d9f24"
+plow_git = "ae17393fec1331c622b2a03052a44715d038fb19"
 network = "gemma4"
 
 [target]
