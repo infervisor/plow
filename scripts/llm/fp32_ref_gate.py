@@ -13,6 +13,7 @@ set, and the candidate passes if it is within the peer's distance to FP32 plus a
                                                                    the other decoder layers from
                                                                    pinned host memory, e.g. 31B)
   capture   --url URL --ref ref.json --arm NAME --out cap.json     a served stack, teacher-forced
+            [--warm-turn]                                          (each case after its previous-turn prefix)
   score     --ref ref.json CAP...                                  metrics per capture
   gate      --ref ref.json --cand CAP... --peer CAP [thresholds]   verdict (exit 1 on fail); several CAPs pool
 
@@ -853,6 +854,13 @@ def teacher_force(complete, prompt, cont):
     return free, text, pos, requests, empty
 
 
+def warm_prefix(ids, turn=105):
+    """The prompt up to its last turn start (a previous turn's history), else its first 7/8: sent
+    before a case under `--warm-turn`, so the case attaches from the prefix cache like a next turn."""
+    starts = [i for i, x in enumerate(ids) if x == turn and i > 1]
+    return ids[:starts[-1] if starts else max(1, len(ids) * 7 // 8)]
+
+
 def cmd_capture(a):
     ref = load_ref(a.ref)
     url = a.url.rstrip("/")
@@ -872,6 +880,8 @@ def cmd_capture(a):
     def one(case):
         t = time.time()
         try:
+            if a.warm_turn:
+                complete(warm_prefix(case["prompt_ids"]), 1)
             free, text, pos, n, empty = teacher_force(complete, case["prompt_ids"], case["cont"])
             row = dict(free=free, free_text=text, pos={str(k): v for k, v in pos.items()}, requests=n, empty_replies=empty)
         except Exception as e:  # noqa: BLE001 - a failed case is scored as missing, not a crash
@@ -992,6 +1002,8 @@ def main():
     cp.add_argument("--arm", required=True)
     cp.add_argument("--concurrency", type=int, default=16)
     cp.add_argument("--out", required=True)
+    cp.add_argument("--warm-turn", action="store_true",
+                    help="first send each case's prompt up to its last turn start (multi-turn prefix-cache form)")
     cp.set_defaults(f=cmd_capture)
     sc = sp.add_parser("score")
     sc.add_argument("--ref", required=True)

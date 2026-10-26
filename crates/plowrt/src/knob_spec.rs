@@ -808,6 +808,8 @@ pub const RUNTIME: &[KnobSpec] = &[
     KnobSpec::new("rt.moe_w8a8_dec_fused", Some("PLOW_MOE_W8A8_DEC_FUSED"), Layer::Runtime, Domain::Bool, OFF, OPT_IN),
     KnobSpec::new("rt.dump_act", Some("PLOW_DUMP_ACT"), Layer::Runtime, Domain::Str, UNSET, OPT_IN),
     KnobSpec::new("rt.dump_kv", Some("PLOW_DUMP_KV"), Layer::Runtime, Domain::Str, UNSET, DIAG),
+    KnobSpec::new("rt.nv_dump_kv", Some("PLOW_NV_DUMP_KV"), Layer::Runtime, Domain::Str, UNSET, DIAG),
+    KnobSpec::new("rt.nv_dump_act", Some("PLOW_NV_DUMP_ACT"), Layer::Runtime, Domain::Str, UNSET, DIAG),
     KnobSpec::new("rt.numa_host_pools", Some("PLOW_AMD_NUMA_HOST_POOLS"), Layer::Runtime, Domain::Bool, UNSET, OPT_IN),
     KnobSpec::new("rt.kernarg_vram", Some("PLOW_AMD_KERNARG_VRAM"), Layer::Runtime, Domain::Bool, UNSET, OPT_IN),
     KnobSpec::new("rt.tail_signal", Some("PLOW_AMD_TAIL_SIGNAL"), Layer::Runtime, Domain::Bool, OFF, OPT_IN),

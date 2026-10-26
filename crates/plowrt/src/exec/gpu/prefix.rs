@@ -670,6 +670,7 @@ impl GpuEngine {
         // appended by prefill completion (full prompt) or per decode feed.
         self.seq_tokens[b].clear();
         self.seq_tokens[b].extend_from_slice(&prompt[..a.rows as usize]);
+        self.dump_slot_kv(b, "attach", a.rows);
         tracing::debug!(
             slot = b,
             rows = a.rows,
