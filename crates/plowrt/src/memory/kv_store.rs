@@ -178,12 +178,30 @@ struct Entry {
     block: Option<Block>,
 }
 
+/// A chunk of one tier's bytes the store owns. Move-only: the one call that frees it takes it
+/// by value, so a chunk is freed once and a released chunk cannot be read again.
+struct Chunk {
+    va: u64,
+    bytes: u64,
+}
+
+impl Chunk {
+    fn free_device(self, ops: &dyn StoreOps) {
+        ops.free(self.va);
+    }
+
+    fn free_host(self, ops: &dyn StoreOps) {
+        ops.host_free(self.va, self.bytes);
+    }
+}
+
 /// A slab of equal-size slots on one tier. Slabs of one tier share the tier's byte budget:
 /// a class grows a chunk only while the budget allows, and chunks never move between classes.
 struct Slab {
     slot_bytes: u64,
     chunk_slots: u32,
-    chunks: Vec<u64>,
+    /// `None` = released (the index stays, so slot arithmetic is unchanged).
+    chunks: Vec<Option<Chunk>>,
     /// Free slots per chunk.
     free: Vec<Vec<u32>>,
     /// Chunks with free slots as `(free slots, chunk)`: the fullest first, the emptiest last.
@@ -219,6 +237,9 @@ impl Slab {
 
     fn va(&self, slot: u32) -> u64 {
         self.chunks[(slot / self.chunk_slots) as usize]
+            .as_ref()
+            .expect("a handed-out slot's chunk is live")
+            .va
             + u64::from(slot % self.chunk_slots) * self.slot_bytes
     }
 
@@ -233,7 +254,11 @@ impl Slab {
     /// A free slot from the fullest chunk that has one, so that emptier chunks keep draining
     /// towards release; a new chunk when none is free and `budget` (bytes left on the tier)
     /// covers it.
-    fn take(&mut self, budget: u64, grow: impl FnOnce(u64) -> Result<u64>) -> Result<Option<u32>> {
+    fn take(
+        &mut self,
+        budget: u64,
+        grow: impl FnOnce(u64) -> Result<Chunk>,
+    ) -> Result<Option<u32>> {
         if let Some(&(n, c)) = self.by_free.iter().next() {
             self.by_free.remove(&(n, c));
             let s = self.free[c as usize].pop().expect("counted free slot");
@@ -247,14 +272,14 @@ impl Slab {
         if u64::from(n) * self.slot_bytes > budget {
             return Ok(None);
         }
-        let base = grow(u64::from(n) * self.slot_bytes)?;
+        let chunk = grow(u64::from(n) * self.slot_bytes)?;
         let c = match self.dead.pop() {
             Some(c) => {
-                self.chunks[c as usize] = base;
+                self.chunks[c as usize] = Some(chunk);
                 c
             }
             None => {
-                self.chunks.push(base);
+                self.chunks.push(Some(chunk));
                 self.free.push(Vec::new());
                 self.chunks.len() as u32 - 1
             }
@@ -311,8 +336,8 @@ impl Slab {
     }
 
     /// Release every chunk whose slots are all free (the chunk index stays, dead, so slot
-    /// arithmetic is unchanged). Returns the bytes released.
-    fn release_empty_chunks(&mut self, mut free: impl FnMut(u64)) -> u64 {
+    /// arithmetic is unchanged) to `free`. Returns the bytes released.
+    fn release_empty_chunks(&mut self, mut free: impl FnMut(Chunk)) -> u64 {
         let n = self.chunk_slots;
         let mut released = 0;
         while let Some(&(count, c)) = self.by_free.iter().next_back() {
@@ -322,8 +347,7 @@ impl Slab {
             self.by_free.remove(&(count, c));
             self.free[c as usize].clear();
             self.free_slots -= u64::from(n);
-            free(self.chunks[c as usize]);
-            self.chunks[c as usize] = 0;
+            free(self.chunks[c as usize].take().expect("counted live chunk"));
             self.dead.push(c);
             self.live_chunks -= 1;
             released += self.chunk_bytes();
@@ -336,7 +360,7 @@ impl Slab {
         let mut out: Vec<u32> = self.by_free.iter().rev().map(|&(_, c)| c).collect();
         out.extend(
             (0..self.chunks.len() as u32)
-                .filter(|&c| self.chunks[c as usize] != 0 && self.free[c as usize].is_empty()),
+                .filter(|&c| self.chunks[c as usize].is_some() && self.free[c as usize].is_empty()),
         );
         out
     }
@@ -435,7 +459,7 @@ struct Inner {
     restoring: VecDeque<BlockId>,
     /// Pinned chunks per class allocated ahead by [`KvStore::host_grow_step`] (a pinned
     /// allocation costs ~4 ms per 8 MiB; under the pool lock it was the host tier's TTFT tail).
-    host_spare: Vec<Vec<u64>>,
+    host_spare: Vec<Vec<Chunk>>,
     tick: u64,
     stats: StoreStats,
 }
@@ -464,11 +488,11 @@ impl Inner {
 pub struct KvStore {
     ops: Arc<dyn StoreOps>,
     inner: parking_lot::Mutex<Inner>,
-    /// Chunks `shrink` released, as `(va, bytes)`, freed by [`Self::free_step`] on a worker once
+    /// Chunks `shrink` released, freed by [`Self::free_step`] on a worker once
     /// [`Self::defer_frees`] was called: a device free synchronises the context, which behind
     /// the spill backlog held the engine thread 150 ms per shrink. Until freed they count as
     /// device memory coming free ([`Self::pending_spill_bytes`]).
-    frees: parking_lot::Mutex<Vec<(u64, u64)>>,
+    frees: parking_lot::Mutex<Vec<Chunk>>,
     deferred: std::sync::atomic::AtomicBool,
     pending_free_bytes: std::sync::atomic::AtomicU64,
 }
@@ -629,26 +653,28 @@ impl KvStore {
         if queued.is_empty() {
             return false;
         }
-        for (va, bytes) in queued {
-            self.ops.free(va);
+        // The bytes count as pending until each free completed, not until it was taken.
+        for chunk in queued {
+            let bytes = chunk.bytes;
+            chunk.free_device(&*self.ops);
             self.pending_free_bytes
                 .fetch_sub(bytes, std::sync::atomic::Ordering::AcqRel);
         }
         true
     }
 
-    fn free_chunks(&self, frees: &mut Vec<(u64, u64)>) {
+    fn free_chunks(&self, frees: &mut Vec<Chunk>) {
         if frees.is_empty() {
             return;
         }
         if self.deferred.load(std::sync::atomic::Ordering::Acquire) {
-            let bytes: u64 = frees.iter().map(|&(_, b)| b).sum();
+            let bytes: u64 = frees.iter().map(|c| c.bytes).sum();
             self.pending_free_bytes
                 .fetch_add(bytes, std::sync::atomic::Ordering::AcqRel);
             self.frees.lock().append(frees);
         } else {
-            for (va, _) in frees.drain(..) {
-                self.ops.free(va);
+            for chunk in frees.drain(..) {
+                chunk.free_device(&*self.ops);
             }
         }
     }
@@ -1019,7 +1045,7 @@ impl KvStore {
             let t = std::time::Instant::now();
             let r = ops.alloc(bytes);
             grow_us = Some(t.elapsed().as_micros() as u64);
-            r
+            r.map(|va| Chunk { va, bytes })
         });
         if let Some(us) = grow_us {
             inner.stats.device_grows += 1;
@@ -1416,11 +1442,10 @@ impl KvStore {
         &self,
         inner: &mut Inner,
         bytes: u64,
-        frees: &mut Vec<(u64, u64)>,
+        frees: &mut Vec<Chunk>,
     ) -> u64 {
         let mut released = 0u64;
         for ci in 0..inner.classes.len() {
-            let chunk_bytes = inner.classes[ci].device.chunk_bytes();
             for chunk in inner.classes[ci].device.release_candidates() {
                 if released >= bytes {
                     break;
@@ -1444,7 +1469,7 @@ impl KvStore {
                 }
                 released += inner.classes[ci]
                     .device
-                    .release_empty_chunks(|va| frees.push((va, chunk_bytes)));
+                    .release_empty_chunks(|c| frees.push(c));
             }
         }
         released
@@ -1550,7 +1575,7 @@ impl KvStore {
         inner: &mut Inner,
         plan: CompactionPlan,
         copied: Result<()>,
-        frees: &mut Vec<(u64, u64)>,
+        frees: &mut Vec<Chunk>,
     ) -> u64 {
         let ci = plan.class;
         let bytes_per = inner.classes[ci].spec.block_bytes();
@@ -1580,10 +1605,7 @@ impl KvStore {
         inner.stats.compact_bytes += moved * bytes_per;
         let mut released = 0u64;
         for c in inner.classes.iter_mut() {
-            let chunk_bytes = c.device.chunk_bytes();
-            released += c
-                .device
-                .release_empty_chunks(|va| frees.push((va, chunk_bytes)));
+            released += c.device.release_empty_chunks(|c| frees.push(c));
         }
         released
     }
@@ -1657,8 +1679,8 @@ impl KvStore {
         inner.stats.host_grow_us += us;
         inner.stats.host_grow_max_us = inner.stats.host_grow_max_us.max(us);
         match ptr {
-            Ok(ptr) => {
-                inner.host_spare[class].push(ptr);
+            Ok(va) => {
+                inner.host_spare[class].push(Chunk { va, bytes: chunk });
                 true
             }
             Err(e) => {
@@ -1750,23 +1772,24 @@ impl KvStore {
 
 impl Drop for KvStore {
     fn drop(&mut self) {
-        for (va, _) in self.frees.get_mut().drain(..) {
-            self.ops.free(va);
+        let KvStore {
+            ops, inner, frees, ..
+        } = self;
+        let ops: &dyn StoreOps = &**ops;
+        for chunk in frees.get_mut().drain(..) {
+            chunk.free_device(ops);
         }
-        let inner = self.inner.get_mut();
-        for c in &inner.classes {
-            for &va in c.device.chunks.iter().filter(|&&va| va != 0) {
-                self.ops.free(va);
+        let inner = inner.get_mut();
+        for c in &mut inner.classes {
+            for chunk in c.device.chunks.drain(..).flatten() {
+                chunk.free_device(ops);
             }
-            let chunk = c.host.chunk_bytes();
-            for &ptr in &c.host.chunks {
-                self.ops.host_free(ptr, chunk);
+            for chunk in c.host.chunks.drain(..).flatten() {
+                chunk.free_host(ops);
             }
         }
-        for (c, spare) in inner.classes.iter().zip(&inner.host_spare) {
-            for &ptr in spare {
-                self.ops.host_free(ptr, c.host.chunk_bytes());
-            }
+        for chunk in inner.host_spare.drain(..).flatten() {
+            chunk.free_host(ops);
         }
     }
 }
