@@ -109,8 +109,8 @@ set) are byte-identical on every re-emitted packet; only the serve.json digest a
 changed. Gates on the slice binary: qwen3.8-27b BF16 (`b9c47d9830b79ac6`, prefix on) c1/c8/c32
 kl_trim 0.000454/0.000473/0.000461, top1_decisive 1/1/1; qwen3.8-27b FP8 (`5e8ebd0f9771b06e`)
 c1/c8/c32 kl_trim 0.01004/0.01073/0.01166 vs vLLM 0.01466/0.01529/0.01791,
-top1_decisive 0.9963/0.9951/0.9939 (second run; the first missed cont_decisive on one c8 case, now
-the recipe margin); gemma-4-12b (`cec0e7d5599192a6`) c16 kl_trim 0.04725, top1_decisive 0.9862
+top1_decisive 0.9963/0.9951/0.9939 (second run; the first missed cont_decisive on one c8 case at the
+default 0.0 margin, a gate-policy decision left open); gemma-4-12b (`cec0e7d5599192a6`) c16 kl_trim 0.04725, top1_decisive 0.9862
 (vLLM 0.06527 / 0.9823); gemma-4-26b-a4b FP8 (`caf6c4a47ba62a50`) c16 kl_trim 0.117, top1_decisive
 0.9632; gemma-4-26b-a4b BF16 (`f72d0330f9d8fd2c`) c16 kl_trim 0.05077, top1_decisive 0.9818;
 gemma-4-e4b (`046539c8a8a75efa`) logit parity top1 0.9948, kl_max 0.0154 (slice-1 digits). Raw
