@@ -204,10 +204,6 @@ impl Slab {
         u64::from(self.live_chunks) * self.chunk_bytes()
     }
 
-    fn has_free(&self) -> bool {
-        self.free_slots > 0
-    }
-
     fn used_bytes(&self) -> u64 {
         self.reserved_bytes() - self.free_slots * self.slot_bytes
     }
@@ -390,6 +386,12 @@ struct Inner {
     /// shrinks the store when the slots need memory; without this check the store grew right
     /// back to its cap and the two thrashed (58k chunk allocations, 66 GB compacted in 10 min).
     device_floor: u64,
+    /// Until when growth waits behind the class reclaim lists: set by a `shrink` that released
+    /// bytes. The floor check alone left a 51 MiB band between the store's growth and the
+    /// pool's trim, so every ring the pool retired was re-taken within seconds and handed back
+    /// at the next prompt burst (16k chunk frees per 300 s; a `cuMemFree` may synchronise the
+    /// context, and seconds with a free burst had decode ticks stretched 20 -> 75 ms).
+    grow_hold_until: Option<std::time::Instant>,
     host_cap: u64,
     /// Host RAM the tier leaves to the rest of the machine; growth stops (the cap freezes at
     /// what is reserved) once `MemAvailable` would fall under it. 0 = unchecked.
@@ -443,6 +445,10 @@ const HOST_FLOOR_EVERY: u64 = 16;
 const DEVICE_FLOOR_EVERY: u64 = 8;
 /// Most bytes one `shrink` call releases (lock hold bound; the caller loops).
 const SHRINK_STEP_BYTES: u64 = 128 << 20;
+/// How long after a pressure shrink the store reclaims its own LRU before growing again
+/// (`Inner::grow_hold_until`); the pool's prompt bursts last seconds, its think-time period
+/// is tens of seconds.
+const GROW_HOLD: std::time::Duration = std::time::Duration::from_secs(10);
 /// Pinned bytes per class the host grower keeps allocated ahead (at least one chunk): a burst
 /// of evictions spills several boundaries before the grower refills, a spill with no spare
 /// ready is refused and the boundary dropped instead.
@@ -480,6 +486,7 @@ impl KvStore {
                 classes,
                 device_cap,
                 device_floor: 0,
+                grow_hold_until: None,
                 host_cap,
                 host_reserve: 0,
                 blocks: Vec::new(),
@@ -844,9 +851,24 @@ impl KvStore {
     }
 
     /// A free device slot for `class`: from the free list, by growing the slab, or by
-    /// reclaiming the oldest zero-dependent, unheld, settled block of the class.
+    /// reclaiming the oldest zero-dependent, unheld, settled block of the class. Under a
+    /// growth hold (`Inner::grow_hold_until`) the reclaim goes before the growth.
     fn device_slot(&self, inner: &mut Inner, class: usize) -> Result<u32> {
         let ops = &self.ops;
+        if let Some(s) = inner.classes[class]
+            .device
+            .take(0, |_| Err(RuntimeError::Oom("kv store: no growth".into())))?
+        {
+            return Ok(s);
+        }
+        let hold = inner
+            .grow_hold_until
+            .is_some_and(|t| std::time::Instant::now() < t);
+        if hold {
+            if let Some(s) = self.reclaim_slot(inner, class) {
+                return Ok(s);
+            }
+        }
         let reserved: u64 = inner
             .classes
             .iter()
@@ -854,7 +876,6 @@ impl KvStore {
             .sum();
         let mut budget = inner.device_cap.saturating_sub(reserved);
         if budget > 0
-            && !inner.classes[class].device.has_free()
             && inner.device_floor > 0
             && inner.stats.device_grows % DEVICE_FLOOR_EVERY == 0
         {
@@ -883,6 +904,16 @@ impl KvStore {
         if let Some(s) = taken? {
             return Ok(s);
         }
+        if let Some(s) = (!hold).then(|| self.reclaim_slot(inner, class)).flatten() {
+            return Ok(s);
+        }
+        inner.stats.refusals += 1;
+        Err(RuntimeError::Oom("kv store: class slab full".into()))
+    }
+
+    /// The slot of the oldest reclaimable block of `class`, dropped for it; `None` = nothing
+    /// to reclaim.
+    fn reclaim_slot(&self, inner: &mut Inner, class: usize) -> Option<u32> {
         // Reclaim in release order; stale entries (re-acquired, dropped, wrong tier) are
         // skipped and re-queued where they still matter.
         let mut requeue = Vec::new();
@@ -913,18 +944,17 @@ impl KvStore {
         for id in requeue.into_iter().rev() {
             inner.reclaim[class].push_front(id);
         }
-        let Some(id) = found else {
-            inner.stats.refusals += 1;
-            return Err(RuntimeError::Oom("kv store: class slab full".into()));
-        };
+        let id = found?;
         // `drop_block` returns the victim's slot to its chunk; the take may prefer another
         // hole of the class (the fullest chunk's).
         self.drop_block(inner, id);
         inner.stats.reclaims += 1;
         let taken = inner.classes[class]
             .device
-            .take(0, |_| Err(RuntimeError::Oom("kv store: no growth".into())))?;
-        Ok(taken.expect("the reclaimed slot is free"))
+            .take(0, |_| Err(RuntimeError::Oom("kv store: no growth".into())))
+            .ok()
+            .flatten();
+        Some(taken.expect("the reclaimed slot is free"))
     }
 
     /// Forget a block entirely (its slots go back to their slabs).
@@ -1237,6 +1267,9 @@ impl KvStore {
         let mut inner = self.inner.lock();
         if let Some(plan) = plan {
             released += self.compaction_commit(&mut inner, plan, copied, &mut frees);
+        }
+        if released > 0 {
+            inner.grow_hold_until = Some(std::time::Instant::now() + GROW_HOLD);
         }
         let us = t0.elapsed().as_micros() as u64;
         inner.stats.shrink_us += us;
@@ -1575,6 +1608,12 @@ impl KvStore {
             .iter()
             .map(|c| c.device.reserved_bytes())
             .sum();
+        if inner
+            .grow_hold_until
+            .is_some_and(|t| std::time::Instant::now() < t)
+        {
+            return bytes;
+        }
         let growth = inner.device_cap.saturating_sub(reserved);
         let chunk = inner.classes.first().map_or(0, |c| c.device.chunk_bytes());
         let room = match self.ops.free_bytes() {
@@ -2074,6 +2113,114 @@ mod tests {
     }
 
     #[test]
+    fn a_pressure_shrink_holds_growth_behind_the_reclaim_list() {
+        let (ops, s) = store(8 * 32, 0); // chunk = 32 B = one block, cap eight
+        let ids: Vec<_> = (1..=4).map(|i| s.acquire(0, key(i)).unwrap().id).collect();
+        for &id in &ids {
+            s.seal(id);
+        }
+        s.release(&ids[..2]);
+        assert_eq!(s.shrink(32), 32, "one empty chunk went back");
+        let allocs = ops.dev_alloc.load(Ordering::SeqCst);
+        // Under the hold the other released block's slot goes first: no growth.
+        let e = s.acquire(0, key(5)).unwrap();
+        assert!(e.fill);
+        assert_eq!(ops.dev_alloc.load(Ordering::SeqCst), allocs, "reclaimed");
+        assert_eq!(s.stats().reclaims, 1);
+        // Nothing left to reclaim: growth is the last resort even under the hold.
+        s.seal(e.id);
+        assert!(s.acquire(0, key(6)).unwrap().fill);
+        assert_eq!(ops.dev_alloc.load(Ordering::SeqCst), allocs + 32, "grown");
+        // The hold hides the growth room under the cap, not the slots in hand.
+        s.release(&[e.id]);
+        let held = s.device_headroom_bytes();
+        assert!(held >= 32, "the released block counts");
+        let past = std::time::Instant::now() - std::time::Duration::from_secs(1);
+        s.inner.lock().grow_hold_until = Some(past);
+        assert_eq!(s.device_headroom_bytes() - held, 8 * 32 - 4 * 32);
+        // Past the deadline a reclaimable block stays and the slab grows under the cap.
+        assert!(s.acquire(0, key(7)).unwrap().fill);
+        assert_eq!(ops.dev_alloc.load(Ordering::SeqCst), allocs + 64, "grown");
+        assert!(!s.acquire(0, key(5)).unwrap().fill, "block 5 survived");
+    }
+
+    #[test]
+    fn a_shrink_that_released_nothing_starts_no_hold() {
+        let (ops, s) = store(8 * 32, 0);
+        let a = s.acquire(0, key(1)).unwrap();
+        let b = s.acquire(0, key(2)).unwrap();
+        s.seal(a.id);
+        s.seal(b.id);
+        assert_eq!(s.shrink(32), 0, "every block is referenced");
+        assert!(s.inner.lock().grow_hold_until.is_none());
+        s.release(&[a.id]);
+        let allocs = ops.dev_alloc.load(Ordering::SeqCst);
+        assert!(s.acquire(0, key(3)).unwrap().fill);
+        assert_eq!(ops.dev_alloc.load(Ordering::SeqCst), allocs + 32, "grown");
+        assert!(!s.acquire(0, key(1)).unwrap().fill, "block 1 survived");
+    }
+
+    #[test]
+    fn a_releasing_shrink_refreshes_the_hold_and_an_empty_one_keeps_it() {
+        let (_, s) = store(8 * 32, 0);
+        let ids: Vec<_> = (1..=4).map(|i| s.acquire(0, key(i)).unwrap().id).collect();
+        for &id in &ids {
+            s.seal(id);
+        }
+        s.release(&ids[..2]);
+        let past = std::time::Instant::now() - std::time::Duration::from_secs(1);
+        assert_eq!(s.shrink(32), 32);
+        assert!(s.inner.lock().grow_hold_until.is_some_and(|t| t > past));
+        s.inner.lock().grow_hold_until = Some(past);
+        assert_eq!(s.shrink(32), 32, "the other released block's chunk");
+        assert!(
+            s.inner.lock().grow_hold_until.is_some_and(|t| t > past),
+            "refreshed"
+        );
+        s.inner.lock().grow_hold_until = Some(past);
+        assert_eq!(s.shrink(32), 0, "nothing left to release");
+        assert_eq!(s.inner.lock().grow_hold_until, Some(past), "kept");
+    }
+
+    #[test]
+    fn a_free_slot_goes_before_the_reclaim_list_under_the_hold() {
+        let ops = MockOps::new();
+        let s = KvStore::new(
+            ops.clone(),
+            vec![ClassSpec {
+                name: "window",
+                row_bytes: 8,
+                rows_per_block: 4,
+            }],
+            64, // two blocks per chunk
+            4 * 64,
+            0,
+        );
+        let ids: Vec<_> = (1..=4).map(|i| s.acquire(0, key(i)).unwrap().id).collect();
+        for &id in &ids {
+            s.seal(id);
+        }
+        s.release(&ids[..2]);
+        assert_eq!(s.shrink(64), 64, "chunk 0 went back: the hold is on");
+        // Nothing reclaimable (1 and 2 are gone): the slab grows, one slot of it free.
+        let allocs = ops.dev_alloc.load(Ordering::SeqCst);
+        let e = s.acquire(0, key(5)).unwrap();
+        assert!(e.fill);
+        assert_eq!(ops.dev_alloc.load(Ordering::SeqCst), allocs + 64);
+        s.seal(e.id);
+        s.release(&ids[2..3]);
+        // The free slot wins over the reclaimable block 3.
+        assert!(s.acquire(0, key(6)).unwrap().fill);
+        assert_eq!(
+            ops.dev_alloc.load(Ordering::SeqCst),
+            allocs + 64,
+            "no growth"
+        );
+        assert_eq!(s.stats().reclaims, 0);
+        assert!(!s.acquire(0, key(3)).unwrap().fill, "block 3 survived");
+    }
+
+    #[test]
     fn allocation_fills_the_fullest_chunk_and_shrink_releases_whole_chunks() {
         let ops = MockOps::new();
         let s = KvStore::new(
@@ -2148,6 +2295,7 @@ mod tests {
         );
         assert_eq!(s.device_bytes(), 39 * 64);
         // Growth reuses the released chunk index: no new metadata.
+        s.inner.lock().grow_hold_until = None;
         let before = s.inner.lock().classes[0].device.chunks.len();
         let n = s.acquire(0, key(100)).unwrap();
         assert!(n.fill);
