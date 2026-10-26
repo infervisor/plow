@@ -90,6 +90,16 @@ spread over 10 %. The strict report keys the open-loop plan on a tokenizer diges
 path before, which rendered the 12B run NOT MATCHED), and `llm_grid.sh` records provenance for a
 single-flag server argument again.
 
+Packet-ABI slice 1 (2026-10-25, plowrt `821273d0`, runtime contract 2): the Qwen and Gemma packets
+re-emitted with the `object_requirements` / `recurrent_state` sections keep their pairing hashes and
+pass the same gates on the slice binary: qwen3.8-27b BF16 (`47a070e371094922`, prefix on)
+c1/c8/c32 kl_trim 0.000454/0.000463/0.000456, top1_decisive 1/1/1; qwen3.8-27b FP8
+(`f5e93bb3224745bb`) c1/c8/c32 kl_trim 0.01004/0.01059/0.01041 vs vLLM 0.01466/0.01529/0.01791,
+top1_decisive 0.9963 at every concurrency; gemma-4-12b (`86bed84b8474e56a`) c16 digits identical to
+the row above; gemma-4-26b-a4b FP8 (`16b834960cced7ae`) c16 kl_mean 0.1969, kl_trim 0.1174,
+top1_decisive 0.9622. The E4B and 26B BF16 packets (no section) still load; the previous 12B packet
+is refused with "re-emit it with the current compiler". Raw evidence: `kvstore-scratch/abi-gates`.
+
 ## Merge-prep checks on the other recipes (2026-10-25, branch `a3bf4162` vs main `9f16f187`; not strict rows)
 
 Every H100 recipe with a packet on this box ran its own `[gates]` on the branch binary. The LLM
