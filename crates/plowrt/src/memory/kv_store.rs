@@ -101,16 +101,21 @@ pub struct BlockKey {
     pub check: u64,
 }
 
-/// Index into the store's block table; distinct from slot, chunk and class indices and from
-/// the pool's `u64` boundary handles.
+/// A block's identity: its index in the store's block table and the entry's generation when
+/// the block was created. The generation moves on when the block is dropped, so an id kept
+/// past that (a reclaim-queue entry, a hold, a boundary) names nothing: the next block in the
+/// entry has a new id. Distinct from slot, chunk and class indices and from the pool's `u64`
+/// boundary handles.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-#[repr(transparent)]
-pub struct BlockId(u32);
+pub struct BlockId {
+    index: u32,
+    gen: u32,
+}
 
 impl BlockId {
     #[inline]
     fn index(self) -> usize {
-        self.0 as usize
+        self.index as usize
     }
 }
 
@@ -165,6 +170,12 @@ struct Block {
     holds: u32,
     /// Monotonic use tick for the reclaim order.
     tick: u64,
+}
+
+/// One block-table entry: the generation its current or next block carries.
+struct Entry {
+    gen: u32,
+    block: Option<Block>,
 }
 
 /// A slab of equal-size slots on one tier. Slabs of one tier share the tier's byte budget:
@@ -407,8 +418,9 @@ struct Inner {
     /// Host RAM the tier leaves to the rest of the machine; growth stops (the cap freezes at
     /// what is reserved) once `MemAvailable` would fall under it. 0 = unchecked.
     host_reserve: u64,
-    blocks: Vec<Option<Block>>,
-    free_ids: Vec<BlockId>,
+    blocks: Vec<Entry>,
+    /// Table entries with no block, reused by the next acquire.
+    free_entries: Vec<u32>,
     index: FxHashMap<(usize, BlockKey), BlockId>,
     /// Zero-dependent device blocks per class in release order (oldest first); an entry may be
     /// stale (the block was re-acquired, dropped or spilled), checked when popped.
@@ -426,6 +438,27 @@ struct Inner {
     host_spare: Vec<Vec<u64>>,
     tick: u64,
     stats: StoreStats,
+}
+
+impl Inner {
+    /// The block `id` names; `None` once it was dropped, whatever its entry holds now.
+    #[inline]
+    fn block(&self, id: BlockId) -> Option<&Block> {
+        let e = &self.blocks[id.index()];
+        if e.gen != id.gen {
+            return None;
+        }
+        e.block.as_ref()
+    }
+
+    #[inline]
+    fn block_mut(&mut self, id: BlockId) -> Option<&mut Block> {
+        let e = &mut self.blocks[id.index()];
+        if e.gen != id.gen {
+            return None;
+        }
+        e.block.as_mut()
+    }
 }
 
 pub struct KvStore {
@@ -566,7 +599,7 @@ impl KvStore {
                 host_cap,
                 host_reserve: 0,
                 blocks: Vec::new(),
-                free_ids: Vec::new(),
+                free_entries: Vec::new(),
                 index: FxHashMap::default(),
                 reclaim: (0..n_classes).map(|_| VecDeque::new()).collect(),
                 host_reclaim: (0..n_classes).map(|_| VecDeque::new()).collect(),
@@ -653,10 +686,7 @@ impl KvStore {
             // of the publish's launch), never copied back: the host slot goes.
             // A held host block is being read in place (a gather in flight): it stays where it
             // is and the publish takes it as present.
-            let (refill, held_host) = match inner.blocks[id.index()]
-                .as_ref()
-                .map(|b| (b.place, b.holds))
-            {
+            let (refill, held_host) = match inner.block(id).map(|b| (b.place, b.holds)) {
                 Some((Where::Host(h), 0)) => (Some(h), None),
                 Some((Where::Host(h), _)) => (None, Some(h)),
                 _ => (None, None),
@@ -673,14 +703,14 @@ impl KvStore {
                     st.host_bytes -= bytes;
                     st.device_blocks += 1;
                     st.device_bytes += bytes;
-                    let b = inner.blocks[id.index()].as_mut().expect("indexed block");
+                    let b = inner.block_mut(id).expect("indexed block");
                     b.place = Where::Device(slot);
                     b.state = State::Filling;
                     inner.classes[class].device.va(slot)
                 }
                 (None, None) => self.ensure_device_locked(&mut inner, id)?,
             };
-            let b = inner.blocks[id.index()].as_mut().expect("indexed block");
+            let b = inner.block_mut(id).expect("indexed block");
             b.dependents += 1;
             b.tick = tick;
             if b.state == State::Filling && refill.is_some() {
@@ -698,14 +728,19 @@ impl KvStore {
         }
         let slot = self.device_slot(&mut inner, class)?;
         let va = inner.classes[class].device.va(slot);
-        let id = match inner.free_ids.pop() {
-            Some(id) => id,
+        let index = match inner.free_entries.pop() {
+            Some(index) => index,
             None => {
-                inner.blocks.push(None);
-                BlockId((inner.blocks.len() - 1) as u32)
+                inner.blocks.push(Entry {
+                    gen: 0,
+                    block: None,
+                });
+                (inner.blocks.len() - 1) as u32
             }
         };
-        inner.blocks[id.index()] = Some(Block {
+        let e = &mut inner.blocks[index as usize];
+        let id = BlockId { index, gen: e.gen };
+        e.block = Some(Block {
             class,
             key,
             state: State::Filling,
@@ -724,7 +759,7 @@ impl KvStore {
 
     fn seal_id(&self, id: BlockId) {
         let mut inner = self.inner.lock();
-        if let Some(b) = inner.blocks[id.index()].as_mut() {
+        if let Some(b) = inner.block_mut(id) {
             if b.state == State::Filling {
                 b.state = State::Ready;
             }
@@ -733,16 +768,14 @@ impl KvStore {
 
     fn fail_id(&self, id: BlockId) {
         let mut inner = self.inner.lock();
-        if let Some(b) = inner.blocks[id.index()].as_mut() {
+        if let Some(b) = inner.block_mut(id) {
             b.state = State::Failed;
         }
         inner.stats.fill_failures += 1;
     }
 
     pub fn state(&self, id: BlockId) -> Option<State> {
-        self.inner.lock().blocks[id.index()]
-            .as_ref()
-            .map(|b| b.state)
+        self.inner.lock().block(id).map(|b| b.state)
     }
 
     /// Drop one dependency each; a block with none left goes to the reclaim list (its bytes
@@ -750,7 +783,7 @@ impl KvStore {
     pub fn release(&self, ids: &[BlockId]) {
         let mut inner = self.inner.lock();
         for &id in ids {
-            let Some(b) = inner.blocks[id.index()].as_mut() else {
+            let Some(b) = inner.block_mut(id) else {
                 continue;
             };
             b.dependents = b.dependents.saturating_sub(1);
@@ -769,7 +802,7 @@ impl KvStore {
         {
             let mut inner = self.inner.lock();
             for &id in &ids {
-                if let Some(b) = inner.blocks[id.index()].as_mut() {
+                if let Some(b) = inner.block_mut(id) {
                     b.holds += 1;
                 }
             }
@@ -783,7 +816,7 @@ impl KvStore {
     fn unhold(&self, ids: &[BlockId]) {
         let mut inner = self.inner.lock();
         for &id in ids {
-            if let Some(b) = inner.blocks[id.index()].as_mut() {
+            if let Some(b) = inner.block_mut(id) {
                 b.holds = b.holds.saturating_sub(1);
             }
         }
@@ -791,7 +824,7 @@ impl KvStore {
 
     pub fn location(&self, id: BlockId) -> Option<Location> {
         let inner = self.inner.lock();
-        let b = inner.blocks[id.index()].as_ref()?;
+        let b = inner.block(id)?;
         Some(match b.place {
             Where::Device(s) | Where::Spilling { dev: s, .. } | Where::Restoring { dev: s, .. } => {
                 Location::Device(inner.classes[b.class].device.va(s))
@@ -808,8 +841,8 @@ impl KvStore {
         let mut inner = self.inner.lock();
         inner.tick += 1;
         let tick = inner.tick;
-        let b = inner.blocks[id.index()]
-            .as_mut()
+        let b = inner
+            .block_mut(id)
             .ok_or_else(|| RuntimeError::Rejected("kv store: no such block".into()))?;
         b.tick = tick;
         let (class, place) = (b.class, b.place);
@@ -845,8 +878,8 @@ impl KvStore {
         inner.tick += 1;
         let tick = inner.tick;
         let (class, place, state) = {
-            let b = inner.blocks[id.index()]
-                .as_mut()
+            let b = inner
+                .block_mut(id)
                 .ok_or_else(|| RuntimeError::Rejected("kv store: no such block".into()))?;
             b.tick = tick;
             (b.class, b.place, b.state)
@@ -869,7 +902,7 @@ impl KvStore {
             }
         };
         inner.classes[class].device.assign(slot, id);
-        let b = inner.blocks[id.index()].as_mut().expect("block");
+        let b = inner.block_mut(id).expect("block");
         b.place = Where::Restoring {
             dev: slot,
             host: h,
@@ -885,7 +918,7 @@ impl KvStore {
         self.reap_restores(&mut inner);
         ids.iter().any(|&id| {
             matches!(
-                inner.blocks[id.index()].as_ref(),
+                inner.block(id),
                 Some(Block {
                     place: Where::Restoring { .. },
                     ..
@@ -899,7 +932,7 @@ impl KvStore {
         inner.tick += 1;
         let tick = inner.tick;
         let va = self.ensure_device_locked(&mut inner, id)?;
-        if let Some(b) = inner.blocks[id.index()].as_mut() {
+        if let Some(b) = inner.block_mut(id) {
             b.tick = tick;
         }
         Ok(va)
@@ -907,8 +940,8 @@ impl KvStore {
 
     fn ensure_device_locked(&self, inner: &mut Inner, id: BlockId) -> Result<u64> {
         let (class, place, state) = {
-            let b = inner.blocks[id.index()]
-                .as_ref()
+            let b = inner
+                .block(id)
                 .ok_or_else(|| RuntimeError::Rejected("kv store: no such block".into()))?;
             (b.class, b.place, b.state)
         };
@@ -929,7 +962,7 @@ impl KvStore {
                 }
                 inner.classes[class].device.assign(slot, id);
                 inner.classes[class].host.put(h);
-                let b = inner.blocks[id.index()].as_mut().expect("block");
+                let b = inner.block_mut(id).expect("block");
                 b.place = Where::Device(slot);
                 inner.stats.restores += 1;
                 inner.stats.classes[class].host_blocks -= 1;
@@ -1010,12 +1043,10 @@ impl KvStore {
         let mut requeue = Vec::new();
         let mut found = None;
         while let Some(id) = inner.reclaim[class].pop_front() {
-            // A dropped id is reused by the next block of any class: the stale entry is skipped
-            // (that block queues under its own class when released).
-            let Some(b) = inner.blocks[id.index()].as_ref() else {
+            let Some(b) = inner.block(id) else {
                 continue;
             };
-            if b.dependents > 0 || b.class != class {
+            if b.dependents > 0 {
                 continue;
             }
             if b.holds > 0 || b.state == State::Filling {
@@ -1048,13 +1079,19 @@ impl KvStore {
         Some(taken.expect("the reclaimed slot is free"))
     }
 
-    /// Forget a block entirely (its slots go back to their slabs).
+    /// Forget a block entirely (its slots go back to their slabs); every copy of its id is
+    /// stale from here on.
     fn drop_block(&self, inner: &mut Inner, id: BlockId) {
-        let Some(b) = inner.blocks[id.index()].take() else {
+        let e = &mut inner.blocks[id.index()];
+        if e.gen != id.gen {
+            return;
+        }
+        let Some(b) = e.block.take() else {
             return;
         };
+        e.gen = e.gen.wrapping_add(1);
         inner.index.remove(&(b.class, b.key));
-        inner.free_ids.push(id);
+        inner.free_entries.push(id.index);
         let bytes = inner.classes[b.class].spec.block_bytes();
         let c = &mut inner.classes[b.class];
         let st = &mut inner.stats.classes[b.class];
@@ -1087,7 +1124,7 @@ impl KvStore {
         let mut inner = self.inner.lock();
         let mut n = 0;
         for &id in ids {
-            let Some(b) = inner.blocks[id.index()].as_ref() else {
+            let Some(b) = inner.block(id) else {
                 continue;
             };
             if b.dependents == 0 && b.holds == 0 && b.state != State::Filling {
@@ -1114,7 +1151,7 @@ impl KvStore {
         let t0 = std::time::Instant::now();
         let mut all = true;
         for &id in ids {
-            let Some(b) = inner.blocks[id.index()].as_ref() else {
+            let Some(b) = inner.block(id) else {
                 continue;
             };
             let class = b.class;
@@ -1143,7 +1180,7 @@ impl KvStore {
             let host = inner.classes[class].host.va(h);
             match self.ops.copy_dtoh_async(host, va, bytes) {
                 Ok(fence) => {
-                    let b = inner.blocks[id.index()].as_mut().expect("block");
+                    let b = inner.block_mut(id).expect("block");
                     b.place = Where::Spilling {
                         dev,
                         host: h,
@@ -1184,14 +1221,14 @@ impl KvStore {
             return Some(s);
         }
         // The oldest zero-dependent host block of this class gives up its slot; stale entries
-        // (re-acquired, dropped, back on the device, the id reused by another class) are skipped.
+        // (re-acquired, dropped, back on the device) are skipped.
         let mut requeue = Vec::new();
         let mut victim = None;
         while let Some(id) = inner.host_reclaim[class].pop_front() {
-            let Some(b) = inner.blocks[id.index()].as_ref() else {
+            let Some(b) = inner.block(id) else {
                 continue;
             };
-            if b.dependents > 0 || b.class != class || !matches!(b.place, Where::Host(_)) {
+            if b.dependents > 0 || !matches!(b.place, Where::Host(_)) {
                 continue;
             }
             if b.holds > 0 {
@@ -1226,14 +1263,14 @@ impl KvStore {
             let Some((id, queued)) = inner.spilling.pop_front() else {
                 return;
             };
-            let (class, dev, host, fence, holds) = match inner.blocks[id.index()].as_ref() {
+            let (class, dev, host, fence, holds) = match inner.block(id) {
                 Some(Block {
                     class,
                     place: Where::Spilling { dev, host, fence },
                     holds,
                     ..
                 }) => (*class, *dev, *host, *fence, *holds),
-                // Dropped or restored meanwhile: nothing to reap.
+                // Dropped meanwhile (the id is stale): nothing to reap.
                 _ => {
                     inner.spilling_bytes -= queued;
                     continue;
@@ -1262,7 +1299,7 @@ impl KvStore {
             inner.spilling_bytes -= queued;
             let bytes = inner.classes[class].spec.block_bytes();
             inner.classes[class].device.put(dev);
-            let b = inner.blocks[id.index()].as_mut().expect("block");
+            let b = inner.block_mut(id).expect("block");
             b.place = Where::Host(host);
             if b.dependents == 0 {
                 inner.host_reclaim[class].push_back(id);
@@ -1282,7 +1319,7 @@ impl KvStore {
             let Some(id) = inner.restoring.pop_front() else {
                 return;
             };
-            let (class, host, fence, holds) = match inner.blocks[id.index()].as_ref() {
+            let (class, host, fence, holds) = match inner.block(id) {
                 Some(Block {
                     class,
                     place: Where::Restoring { host, fence, .. },
@@ -1311,7 +1348,7 @@ impl KvStore {
             }
             let bytes = inner.classes[class].spec.block_bytes();
             inner.classes[class].host.put(host);
-            let b = inner.blocks[id.index()].as_mut().expect("block");
+            let b = inner.block_mut(id).expect("block");
             let Where::Restoring { dev, .. } = b.place else {
                 unreachable!("matched above")
             };
@@ -1389,17 +1426,15 @@ impl KvStore {
                     break;
                 }
                 let ids = inner.classes[ci].device.occupants(chunk);
-                let reclaimable = ids
-                    .iter()
-                    .all(|&id| match inner.blocks[id.index()].as_ref() {
-                        Some(b) => {
-                            b.dependents == 0
-                                && b.holds == 0
-                                && b.state != State::Filling
-                                && matches!(b.place, Where::Device(_))
-                        }
-                        None => true,
-                    });
+                let reclaimable = ids.iter().all(|&id| match inner.block(id) {
+                    Some(b) => {
+                        b.dependents == 0
+                            && b.holds == 0
+                            && b.state != State::Filling
+                            && matches!(b.place, Where::Device(_))
+                    }
+                    None => true,
+                });
                 if !reclaimable {
                     continue;
                 }
@@ -1428,7 +1463,7 @@ impl KvStore {
                 let ids = inner.classes[ci].device.occupants(chunk);
                 let mut live = 0u64;
                 for &id in &ids {
-                    match inner.blocks[id.index()].as_ref() {
+                    match inner.block(id) {
                         Some(b) if b.holds > 0 || b.state == State::Filling => continue 'chunks,
                         Some(b) if !matches!(b.place, Where::Device(_)) => continue 'chunks,
                         // A refill may write it while the copy reads it.
@@ -1445,10 +1480,10 @@ impl KvStore {
                         let Some(id) = inner.reclaim[ci].pop_front() else {
                             break;
                         };
-                        let Some(b) = inner.blocks[id.index()].as_ref() else {
+                        let Some(b) = inner.block(id) else {
                             continue;
                         };
-                        if b.dependents > 0 || b.class != ci {
+                        if b.dependents > 0 {
                             continue;
                         }
                         let Where::Device(slot) = b.place else {
@@ -1477,7 +1512,7 @@ impl KvStore {
                 let mut moves: Vec<(BlockId, u32, u32)> = Vec::new();
                 let mut copies: Vec<(u64, u64, u64)> = Vec::new();
                 for id in ids {
-                    let Some(b) = inner.blocks[id.index()].as_ref() else {
+                    let Some(b) = inner.block(id) else {
                         continue;
                     };
                     if b.dependents == 0 {
@@ -1494,7 +1529,7 @@ impl KvStore {
                     let d = &inner.classes[ci].device;
                     copies.push((d.va(to), d.va(from), bytes_per));
                     moves.push((id, from, to));
-                    inner.blocks[id.index()].as_mut().expect("block").holds += 1;
+                    inner.block_mut(id).expect("block").holds += 1;
                 }
                 return Some(CompactionPlan {
                     class: ci,
@@ -1523,18 +1558,18 @@ impl KvStore {
         for &(id, from, to) in &plan.moves {
             let lands = copied.is_ok()
                 && matches!(
-                    inner.blocks[id.index()].as_ref(),
+                    inner.block(id),
                     Some(b) if b.holds == 1 && b.place == Where::Device(from)
                 );
             if lands {
                 inner.classes[ci].device.assign(to, id);
                 inner.classes[ci].device.put(from);
-                inner.blocks[id.index()].as_mut().expect("block").place = Where::Device(to);
+                inner.block_mut(id).expect("block").place = Where::Device(to);
                 moved += 1;
             } else {
                 inner.classes[ci].device.put(to);
             }
-            if let Some(b) = inner.blocks[id.index()].as_mut() {
+            if let Some(b) = inner.block_mut(id) {
                 b.holds -= 1;
             }
         }
@@ -1968,7 +2003,11 @@ mod tests {
         // a is dropped; its id is free and its queue entry in class 0 stale.
         assert_eq!(s.evict(&[a.id]), 1);
         let mut b = s.acquire(1, key(3)).unwrap();
-        assert_eq!(b.id, a.id, "the freed id is reused by the other class");
+        assert_eq!(
+            b.id.index, a.id.index,
+            "the freed entry is reused by the other class"
+        );
+        assert_ne!(b.id, a.id, "under a new generation");
         seal(&mut b);
         s.release(&[b.id]);
         let mut d = s.acquire(0, key(4)).unwrap();
@@ -2012,7 +2051,11 @@ mod tests {
         // a is dropped off the host: its id is free, its host-queue entry in class 0 stale.
         assert_eq!(s.evict(&[a.id]), 1);
         let mut b = s.acquire(1, key(2)).unwrap();
-        assert_eq!(b.id, a.id, "the freed id is reused by the other class");
+        assert_eq!(
+            b.id.index, a.id.index,
+            "the freed entry is reused by the other class"
+        );
+        assert_ne!(b.id, a.id, "under a new generation");
         park(&mut b);
         let mut c = s.acquire(0, key(3)).unwrap();
         park(&mut c);
@@ -2027,6 +2070,35 @@ mod tests {
         assert_eq!(s.location(c.id), None);
         assert_eq!(s.location(b.id), Some(Location::Host), "b survived");
         assert_eq!(s.stats().classes[1].host_blocks, 1);
+    }
+
+    /// Release A then B; A is evicted and its table entry reused by C in the same class; C is
+    /// released. A's stale queue entry must not reclaim C ahead of B (release order).
+    #[test]
+    fn a_stale_reclaim_entry_does_not_take_its_entrys_new_block_before_an_older_release() {
+        let (_, s) = store(2 * 32, 0);
+        let a = acquire_sealed(&s, 0, key(1));
+        let b = acquire_sealed(&s, 0, key(2));
+        s.release(&[a.id]);
+        s.release(&[b.id]);
+        assert_eq!(s.evict(&[a.id]), 1);
+        let c = acquire_sealed(&s, 0, key(3));
+        assert_eq!(
+            (c.id.index, c.va),
+            (a.id.index, a.va),
+            "a's entry and slot, reused in the same class"
+        );
+        assert_ne!(c.id, a.id);
+        s.release(&[c.id]);
+        // The queue is [a (stale), b, c]: b, the oldest release, gives up its slot.
+        let d = acquire_sealed(&s, 0, key(4));
+        assert_eq!(d.va, b.va, "release order: b before c");
+        assert!(
+            s.acquire(0, key(3)).unwrap().fill.is_none(),
+            "c survived its predecessor's queue entry"
+        );
+        assert_eq!(s.stats().reclaims, 1);
+        assert_eq!(s.state(a.id), None, "the stale id names nothing");
     }
 
     #[test]
