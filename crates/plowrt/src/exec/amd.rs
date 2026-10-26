@@ -6487,7 +6487,14 @@ fn gather_expert_entry<'a>(
     }
     let mut fault_ns = 0u64;
     if do_prefault && !fp8_spelling {
-        if let Some(s) = touched(ckpt, name, crate::asset::shard::shard_of(name), *want, shard_rank, shard_n) {
+        if let Some(s) = touched(
+            ckpt,
+            name,
+            crate::asset::shard::shard_of(name),
+            *want,
+            shard_rank,
+            shard_n,
+        ) {
             fault_ns = prefault_ns(s);
         }
     }
@@ -12300,7 +12307,9 @@ impl AmdEngine {
                 if !packet::names::is_checkpoint_weight(&td.name) || td.name.starts_with("fp8/") {
                     continue;
                 }
-                if let Some(s) = weight_span(c, &td.name, shards.axis(&td.name), td.bytes, rank, n_gpu) {
+                if let Some(s) =
+                    weight_span(c, &td.name, shards.axis(&td.name), td.bytes, rank, n_gpu)
+                {
                     pool.push(s);
                 }
                 n += 1;
@@ -12381,7 +12390,14 @@ impl AmdEngine {
         // `is_checkpoint_weight` gate, same `fp8/` -> `fp8_ckpt` routing, same two-spelling
         // lookup, and the same exemption for the derived `_res_score.weight` (in no
         // checkpoint by design — `fold_res_score`).
-        preflight_weights(&blob, &shards, ckpt.as_deref(), fp8_ckpt.as_ref(), rank, n_gpu)?;
+        preflight_weights(
+            &blob,
+            &shards,
+            ckpt.as_deref(),
+            fp8_ckpt.as_ref(),
+            rank,
+            n_gpu,
+        )?;
 
         let t_slab = Instant::now();
         let weight_slab = if slab_bytes == 0 || !crate::asset::checkpoint::weight_slab_enabled() {
@@ -12709,7 +12725,9 @@ impl AmdEngine {
                         // (`stripped`), so an fp8 twin shards exactly like its bf16
                         // counterpart instead of falling through as replicated.
                         if do_prefault {
-                            if let Some(s) = touched(c, stripped, shards.axis(stripped), td.bytes, rank, n_gpu) {
+                            if let Some(s) =
+                                touched(c, stripped, shards.axis(stripped), td.bytes, rank, n_gpu)
+                            {
                                 prefault(s, &prof);
                             }
                         }

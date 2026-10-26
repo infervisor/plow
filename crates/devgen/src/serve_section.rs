@@ -61,8 +61,12 @@ pub(crate) fn section(
 /// [`section`] for the full-model emitters outside the dense path, with the emit config's
 /// `PLOW_EMIT_SERVE_DEFAULTS`; a checkpoint the manifest cannot be built from fails the emit.
 pub(crate) fn section_for(dir: &Path) -> SectionData {
-    section(dir, crate::emit_config::active().serve_defaults.as_deref(), &[])
-        .unwrap_or_else(|error| panic!("serve manifest: {error}"))
+    section(
+        dir,
+        crate::emit_config::active().serve_defaults.as_deref(),
+        &[],
+    )
+    .unwrap_or_else(|error| panic!("serve manifest: {error}"))
 }
 
 #[cfg(test)]

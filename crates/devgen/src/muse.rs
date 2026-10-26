@@ -90,7 +90,11 @@ impl MuseCfg {
             v[k].as_array()
                 .unwrap_or_else(|| panic!("muse_spark: missing {k}"))
                 .iter()
-                .map(|s| s.as_str().expect("muse_spark: non-string entry").to_string())
+                .map(|s| {
+                    s.as_str()
+                        .expect("muse_spark: non-string entry")
+                        .to_string()
+                })
                 .collect()
         };
         let layers = u("num_hidden_layers");
@@ -101,7 +105,10 @@ impl MuseCfg {
             .as_array()
             .expect("muse_spark: missing layer_rope_theta")
             .iter()
-            .map(|t| t.as_f64().expect("muse_spark: non-numeric layer_rope_theta"))
+            .map(|t| {
+                t.as_f64()
+                    .expect("muse_spark: non-numeric layer_rope_theta")
+            })
             .collect();
         for (k, len) in [
             ("layer_types", types.len()),
@@ -122,7 +129,11 @@ impl MuseCfg {
             "muse_spark: a layer_rope_theta differs from rope_parameters.rope_theta; the \
              reference applies the global theta to every RoPE layer"
         );
-        assert_eq!(v["hidden_act"].as_str(), Some("silu"), "muse_spark: silu only");
+        assert_eq!(
+            v["hidden_act"].as_str(),
+            Some("silu"),
+            "muse_spark: silu only"
+        );
         assert_eq!(
             v["num_shared_experts"].as_u64().unwrap_or(0),
             0,
@@ -153,7 +164,8 @@ impl MuseCfg {
         let mxfp4_experts = (0..n)
             .map(|l| {
                 quant.is_some()
-                    && !exclude.contains(&format!("{PREFIX}layers.{l}.mlp.experts.0.gate_proj").as_str())
+                    && !exclude
+                        .contains(&format!("{PREFIX}layers.{l}.mlp.experts.0.gate_proj").as_str())
             })
             .collect();
         Self {
@@ -227,7 +239,12 @@ impl Tp {
         self.n > 1
     }
     fn local(&self, w: u32) -> u32 {
-        assert_eq!(w % self.n, 0, "muse_spark: --num-gpus {} must divide {w}", self.n);
+        assert_eq!(
+            w % self.n,
+            0,
+            "muse_spark: --num-gpus {} must divide {w}",
+            self.n
+        );
         w / self.n
     }
     /// The peer slot the next row-parallel producer writes.
@@ -431,7 +448,17 @@ impl Emitter<'_> {
         let slot = self.tp.next as u32 * self.tp.slot_b;
         self.tp.next ^= 1;
         let (n, cus, decode) = (self.tp.n, self.tp.xr_cus.clone(), !self.prefill);
-        crate::emit_xreduce(&mut self.b, &mut self.tp.xgate, decode, &cus, dep, out, elems, n, slot)
+        crate::emit_xreduce(
+            &mut self.b,
+            &mut self.tp.xgate,
+            decode,
+            &cus,
+            dep,
+            out,
+            elems,
+            n,
+            slot,
+        )
     }
     /// Weightless per-head RMSNorm over `t` rows, optionally NeoX-rotated, optionally written
     /// into the KV cache at `pos[row]` (`cache`; prefill rows share the slot the host rebased
@@ -516,13 +543,28 @@ impl Emitter<'_> {
         let g_attn = self.w(&format!("{p}post_attention_residual_gate.gate"), h64 * BF16);
         let w_ff = self.w(&format!("{p}pre_feedforward_layernorm.weight"), h64 * BF16);
         let w_post = self.w(&format!("{p}post_feedforward_layernorm.weight"), h64 * BF16);
-        let g_ff = self.w(&format!("{p}post_feedforward_residual_gate.gate"), h64 * BF16);
+        let g_ff = self.w(
+            &format!("{p}post_feedforward_residual_gate.gate"),
+            h64 * BF16,
+        );
         let wr = self.w(&format!("{p}mlp.gate.weight"), e as u64 * h64 * F32);
-        let wr_bias = self.w(&format!("{p}mlp.gate.e_score_correction_bias"), e as u64 * F32);
-        let w_pre = self.w(&format!("{p}mlp.pre_expert_proj.weight"), m64 * pre_k as u64 * BF16);
+        let wr_bias = self.w(
+            &format!("{p}mlp.gate.e_score_correction_bias"),
+            e as u64 * F32,
+        );
+        let w_pre = self.w(
+            &format!("{p}mlp.pre_expert_proj.weight"),
+            m64 * pre_k as u64 * BF16,
+        );
         let w_pre_n = self.w(&format!("{p}mlp.pre_expert_norm.weight"), m64 * BF16);
-        let w_pen = self.w(&format!("{p}mlp.experts.post_expert_norm.weight"), m64 * BF16);
-        let w_postp = self.w(&format!("{p}mlp.post_expert_proj.weight"), h64 * post_k as u64 * BF16);
+        let w_pen = self.w(
+            &format!("{p}mlp.experts.post_expert_norm.weight"),
+            m64 * BF16,
+        );
+        let w_postp = self.w(
+            &format!("{p}mlp.post_expert_proj.weight"),
+            h64 * post_k as u64 * BF16,
+        );
         let ewt = self.w(&format!("moe.{p}mlp.expert_weight_table"), e as u64 * 3 * 8);
         let est = self.w(&format!("moe.{p}mlp.expert_scale_table"), e as u64 * 3 * 8);
         let slots = self.b.tensor_bytes(self.kvlen) / F32;
@@ -563,14 +605,18 @@ impl Emitter<'_> {
         let scale = c.qk_scale / (hd as f32).sqrt();
         let d_fa = if self.prefill {
             // n_kv / q_pos0 (i1 / i4) are the chunk's, patched by the host (`rebase_chunk_rows`).
-            self.b
-                .emit(DevOp::FlashPrefill, self.b.all(), &[d_qn, d_kn, d_vn], |d| {
+            self.b.emit(
+                DevOp::FlashPrefill,
+                self.b.all(),
+                &[d_qn, d_kn, d_vn],
+                |d| {
                     d.t[..5].copy_from_slice(&[opart, mlpart, q, kc, vc]);
                     d.i.copy_from_slice(&[t, t, nh, nkv, 0, window, hd, ns]);
                     d.f[0] = scale;
                     d.j[0] = ctx;
                     d.j[1] = KV_MASK_NONE;
-                })
+                },
+            )
         } else {
             self.b
                 .emit(DevOp::FlashDecode, self.b.all(), &[d_qn, d_kn, d_vn], |d| {
@@ -579,10 +625,12 @@ impl Emitter<'_> {
                     d.f[0] = scale;
                 })
         };
-        let d_fm = self.b.emit(DevOp::FlashMerge, self.cus(t * nh), &[d_fa], |d| {
-            d.t[..3].copy_from_slice(&[attn, opart, mlpart]);
-            d.i[..4].copy_from_slice(&[t, nh, ns, hd]);
-        });
+        let d_fm = self
+            .b
+            .emit(DevOp::FlashMerge, self.cus(t * nh), &[d_fa], |d| {
+                d.t[..3].copy_from_slice(&[attn, opart, mlpart]);
+                d.i[..4].copy_from_slice(&[t, nh, ns, hd]);
+            });
         let d_on = self.head_norm(at, attn, nh, false, false, true, d_fm);
         let d_gate = self.b.emit(
             DevOp::QwenSigmoidGate,
@@ -602,8 +650,18 @@ impl Emitter<'_> {
         };
         let band = (latent && t > 1).then(|| (hn2_bm, pre_k));
         let d_hn2 = if ngn {
-            let n1 = NormSpec { w: TENSOR_NONE, mode: NORM_PLAIN, eps: c.post_eps, oscale: 0.0 };
-            let n2 = NormSpec { w: w_ff, mode: NORM_CENTERED, eps: c.eps, oscale: 0.0 };
+            let n1 = NormSpec {
+                w: TENSOR_NONE,
+                mode: NORM_PLAIN,
+                eps: c.post_eps,
+                oscale: 0.0,
+            };
+            let n2 = NormSpec {
+                w: w_ff,
+                mode: NORM_CENTERED,
+                eps: c.eps,
+                oscale: 0.0,
+            };
             self.norm_gate_norm(xmid, o, n1, src, g_attn, hn2, n2, &[d_o], band)
         } else {
             let d_pn = self.norm(on, o, TENSOR_NONE, h, NORM_PLAIN, c.post_eps, &[d_o], None);
@@ -662,7 +720,11 @@ impl Emitter<'_> {
             (true, true) => 2,
         };
         // Quark `exclude`d layers keep bf16 experts: same grouped ops, bf16 encoding.
-        let enc = if c.mxfp4_experts[l] { MOE_ENC_MXFP4 } else { MOE_ENC_BF16 };
+        let enc = if c.mxfp4_experts[l] {
+            MOE_ENC_MXFP4
+        } else {
+            MOE_ENC_BF16
+        };
         let d_dn = if self.prefill {
             let d_al = self.b.emit(DevOp::MoeAlignPf, vec![0], &[d_rt], |d| {
                 d.t[..5].copy_from_slice(&[meta, tab, row_token, row_partidx, row_gate]);
@@ -731,7 +793,11 @@ impl Emitter<'_> {
             (d_dn, part)
         };
         let post_eps = c.post_eps;
-        let cmb_cus = if t > 1 { self.rows() } else { self.cus(m.div_ceil(512)) };
+        let cmb_cus = if t > 1 {
+            self.rows()
+        } else {
+            self.cus(m.div_ceil(512))
+        };
         let ylat_band_out = latent && t > 1;
         let d_cmb = self
             .b
@@ -757,10 +823,24 @@ impl Emitter<'_> {
             self.proj(y, ylat, w_postp, h, m, d_cmb)
         };
         if let Some(nx) = next.filter(|_| ngn) {
-            let n1 = NormSpec { w: w_post, mode: NORM_INPUT_SCALED, eps: c.post_eps, oscale: 0.0 };
+            let n1 = NormSpec {
+                w: w_post,
+                mode: NORM_INPUT_SCALED,
+                eps: c.post_eps,
+                oscale: 0.0,
+            };
             return self.norm_gate_norm(dst, y, n1, xmid, g_ff, nx.out, nx.n, &[d_y], None);
         }
-        let d_yn = self.norm(yn, y, w_post, h, NORM_INPUT_SCALED, c.post_eps, &[d_y], None);
+        let d_yn = self.norm(
+            yn,
+            y,
+            w_post,
+            h,
+            NORM_INPUT_SCALED,
+            c.post_eps,
+            &[d_y],
+            None,
+        );
         self.residual_gate(dst, xmid, yn, g_ff, &[d_yn])
     }
 
@@ -912,7 +992,11 @@ fn program(
                 a.ylat_bm = b.tensor("act.ylat_bm", tr * m64 * BF16);
                 (a.hn2_bm, a.ylat_bm)
             };
-            let tag = if t == 1 { "band1".to_string() } else { format!("bandr{t}") };
+            let tag = if t == 1 {
+                "band1".to_string()
+            } else {
+                format!("bandr{t}")
+            };
             let mut view = |base: u32, n: u32| {
                 let name = format!("{}@{tag}", b.tensor_name(base));
                 b.tensor(&name, tr * n as u64 * BF16)
@@ -960,7 +1044,10 @@ fn program(
     };
     let mut dep = None;
     if let Some(e) = &ends {
-        let table = em.w(&format!("{PREFIX}embed_tokens.weight"), c.vocab as u64 * h64 * BF16);
+        let table = em.w(
+            &format!("{PREFIX}embed_tokens.weight"),
+            c.vocab as u64 * h64 * BF16,
+        );
         let d_emb = em.b.emit(DevOp::Embed, em.b.all(), &[], |d| {
             d.t[..3].copy_from_slice(&[e.emb, table, e.ids]);
             d.i[0] = t;
@@ -978,11 +1065,27 @@ fn program(
         let next = if !ngn {
             None
         } else if l < last {
-            let w = em.w(&format!("{PREFIX}layers.{}.input_layernorm.weight", l + 1), h64 * BF16);
-            Some(NextNorm { out: em.a.hn, n: NormSpec { w, mode: NORM_CENTERED, eps: c.eps, oscale: 0.0 } })
+            let w = em.w(
+                &format!("{PREFIX}layers.{}.input_layernorm.weight", l + 1),
+                h64 * BF16,
+            );
+            Some(NextNorm {
+                out: em.a.hn,
+                n: NormSpec {
+                    w,
+                    mode: NORM_CENTERED,
+                    eps: c.eps,
+                    oscale: 0.0,
+                },
+            })
         } else if full {
             let w = em.w(&format!("{PREFIX}norm.weight"), h64 * BF16);
-            let n = NormSpec { w, mode: NORM_PLAIN, eps: c.eps, oscale: c.output_multiplier };
+            let n = NormSpec {
+                w,
+                mode: NORM_PLAIN,
+                eps: c.eps,
+                oscale: c.output_multiplier,
+            };
             Some(NextNorm { out: em.a.hn, n })
         } else {
             None
@@ -1024,11 +1127,12 @@ fn program(
             d.f[0] = cap;
         });
         let nb = if lm_rows > 1 { lm_rows } else { 0 };
-        let d_am = em.b.emit(DevOp::Argmax, (0..AMAX_BLOCKS).collect(), &[d_cap], |d| {
-            d.t[..2].copy_from_slice(&[e.amax, e.logits]);
-            d.i[0] = vocab;
-            d.i[1] = nb;
-        });
+        let d_am =
+            em.b.emit(DevOp::Argmax, (0..AMAX_BLOCKS).collect(), &[d_cap], |d| {
+                d.t[..2].copy_from_slice(&[e.amax, e.logits]);
+                d.i[0] = vocab;
+                d.i[1] = nb;
+            });
         dep = Some(em.b.emit(DevOp::ArgmaxFin, vec![0], &[d_am], |d| {
             d.t[..2].copy_from_slice(&[e.ids, e.amax]);
             d.i[0] = AMAX_BLOCKS;
@@ -1057,7 +1161,12 @@ fn model(
     buckets: &[u32],
     rungs: &[u32],
 ) -> Model {
-    let widest = buckets.iter().chain(rungs).copied().max().expect("a program");
+    let widest = buckets
+        .iter()
+        .chain(rungs)
+        .copied()
+        .max()
+        .expect("a program");
     // Slot bytes: the widest partial (the k expert outputs) of the widest program, and a whole
     // number of the recovered `hidden` (the host sizes the peer region as max_tokens * hidden * 2).
     let shape = Shape {
@@ -1071,7 +1180,11 @@ fn model(
     };
     let mut tensors = None;
     let (mut progs, mut prog_t, mut gen) = (Vec::new(), Vec::new(), Vec::new());
-    for (t, prefill) in buckets.iter().map(|&t| (t, true)).chain(rungs.iter().map(|&t| (t, false))) {
+    for (t, prefill) in buckets
+        .iter()
+        .map(|&t| (t, true))
+        .chain(rungs.iter().map(|&t| (t, false)))
+    {
         let ph = program(c, &shape, t, prefill, tensors.take());
         tensors = Some(ph.tensors);
         gen = ph.gen;
@@ -1164,7 +1277,16 @@ pub(super) fn run(
         "muse_spark: decode rungs {rungs:?} overlap the prefill buckets {buckets:?}"
     );
     let _guard = EmitAmdGuard::set(true);
-    let mut m = model(&c, ctx, n_cu, tp, layers.clone(), block.is_none(), &buckets, &rungs);
+    let mut m = model(
+        &c,
+        ctx,
+        n_cu,
+        tp,
+        layers.clone(),
+        block.is_none(),
+        &buckets,
+        &rungs,
+    );
     if !gpu.is_empty() {
         m.target = packet::devbuild::gpu_fingerprint(gpu);
     }
@@ -1225,13 +1347,19 @@ fn latent_shards_section(m: &Model) -> packet::devbuild::SectionData {
         .tensors
         .iter()
         .map(|t| t.name.clone())
-        .filter(|n| n.ends_with("mlp.pre_expert_proj.weight") || n.ends_with("mlp.post_expert_proj.weight"))
+        .filter(|n| {
+            n.ends_with("mlp.pre_expert_proj.weight") || n.ends_with("mlp.post_expert_proj.weight")
+        })
         .collect();
     packet::devbuild::SectionData {
         kind: packet::devbuild::SECT_METADATA,
         name: SECTION.into(),
-        data: serde_json::to_vec(&WeightShards { version: VERSION, row, column: Vec::new() })
-            .expect("weight shards json"),
+        data: serde_json::to_vec(&WeightShards {
+            version: VERSION,
+            row,
+            column: Vec::new(),
+        })
+        .expect("weight shards json"),
     }
 }
 
@@ -1366,12 +1494,23 @@ mod tests {
         assert_eq!(c.rope, vec![true, false, true, true]);
         assert_eq!(c.mxfp4_experts, vec![false, true, true, true]);
         assert_eq!((c.heads, c.kv_heads, c.hd, c.window), (8, 2, 64, 128));
-        assert_eq!((fa_gf(8, 2), decode_ns(1, 8, 2, 256), decode_ns(8, 8, 2, 256)), (2, 64, 8));
+        assert_eq!(
+            (
+                fa_gf(8, 2),
+                decode_ns(1, 8, 2, 256),
+                decode_ns(8, 8, 2, 256)
+            ),
+            (2, 64, 8)
+        );
         assert!(c.check_m1_layer(0).is_ok() && c.check_m1_layer(1).is_ok());
     }
 
     fn ops(m: &Model, op: DevOp) -> Vec<&packet::dev::DevInst> {
-        m.progs[0].insts.iter().filter(|i| i.op == op as u16).collect()
+        m.progs[0]
+            .insts
+            .iter()
+            .filter(|i| i.op == op as u16)
+            .collect()
     }
 
     #[test]
@@ -1381,15 +1520,25 @@ mod tests {
         let fa = ops(&full, DevOp::FlashDecode);
         assert_eq!(fa.len(), 1);
         assert_eq!(fa[0].i[4], 0, "full layer: no window");
-        assert!((fa[0].f[0] - c.qk_scale / 8.0).abs() < 1e-6, "q scale folded");
+        assert!(
+            (fa[0].f[0] - c.qk_scale / 8.0).abs() < 1e-6,
+            "q scale folded"
+        );
         let hnr = ops(&full, DevOp::QwenHeadNormRope);
         assert_eq!(hnr.len(), 4, "q, k, v cache writes and the output norm");
-        assert!(hnr.iter().all(|i| i.i[2] == 0 && i.t[2] == TENSOR_NONE), "NoPE, weightless");
+        assert!(
+            hnr.iter().all(|i| i.i[2] == 0 && i.t[2] == TENSOR_NONE),
+            "NoPE, weightless"
+        );
 
         let slide = decode_program(&c, 512, 256, 1, 2..3, false);
         assert_eq!(ops(&slide, DevOp::FlashDecode)[0].i[4], 128);
         let hnr = ops(&slide, DevOp::QwenHeadNormRope);
-        assert_eq!(hnr.iter().filter(|i| i.i[2] == 64).count(), 2, "q and k rotated");
+        assert_eq!(
+            hnr.iter().filter(|i| i.i[2] == 64).count(),
+            2,
+            "q and k rotated"
+        );
     }
 
     #[test]
@@ -1402,14 +1551,23 @@ mod tests {
         assert!((rt[0].f[1] - c.output_multiplier).abs() < 1e-7);
         assert_eq!(ops(&m, DevOp::GemvF32).len(), 1);
         let glu = ops(&m, DevOp::MoeGroupGluFp8Blk);
-        assert_eq!((glu[0].i[1], glu[0].i[2], glu[0].i[6]), (128, 128, MOE_ENC_MXFP4));
+        assert_eq!(
+            (glu[0].i[1], glu[0].i[2], glu[0].i[6]),
+            (128, 128, MOE_ENC_MXFP4)
+        );
         let cmb = ops(&m, DevOp::MuseMoeCombineNorm);
         assert_eq!((cmb[0].i[0], cmb[0].i[1]), (128, 4));
         let norms = ops(&m, DevOp::MuseRmsNorm);
         let modes: Vec<u32> = norms.iter().map(|i| i.i[2]).collect();
         assert_eq!(
             modes,
-            vec![NORM_CENTERED, NORM_PLAIN, NORM_CENTERED, NORM_CENTERED, NORM_INPUT_SCALED]
+            vec![
+                NORM_CENTERED,
+                NORM_PLAIN,
+                NORM_CENTERED,
+                NORM_CENTERED,
+                NORM_INPUT_SCALED
+            ]
         );
         assert_eq!(ops(&m, DevOp::MuseResidualGate).len(), 2);
         let names: Vec<&str> = m.tensors.iter().map(|t| t.name.as_str()).collect();
@@ -1422,8 +1580,15 @@ mod tests {
         let c = MuseCfg::parse(&config());
         let m = decode_program(&c, 512, 256, 1, 1..3, false);
         let x = m.tensors.iter().position(|t| t.name == "act.x").unwrap() as u32;
-        let xnext = m.tensors.iter().position(|t| t.name == "act.xnext").unwrap() as u32;
-        let outs: Vec<u32> = ops(&m, DevOp::MuseResidualGate).iter().map(|i| i.t[0]).collect();
+        let xnext = m
+            .tensors
+            .iter()
+            .position(|t| t.name == "act.xnext")
+            .unwrap() as u32;
+        let outs: Vec<u32> = ops(&m, DevOp::MuseResidualGate)
+            .iter()
+            .map(|i| i.t[0])
+            .collect();
         assert_eq!(outs.len(), 4);
         assert_eq!(outs[1], x);
         assert_eq!(outs[3], xnext);
@@ -1451,19 +1616,41 @@ mod tests {
         assert_eq!(size(&format!("{p}self_attn.q_proj.weight")), 256 * 256 * 2);
         assert_eq!(size(&format!("{p}self_attn.k_proj.weight")), 64 * 256 * 2);
         assert_eq!(size(&format!("{p}self_attn.o_proj.weight")), 256 * 256 * 2);
-        assert_eq!(size(&format!("{p}mlp.pre_expert_proj.weight")), 128 * 128 * 2);
-        assert_eq!(size(&format!("{p}mlp.gate.weight")), 16 * 256 * 4, "router replicated");
+        assert_eq!(
+            size(&format!("{p}mlp.pre_expert_proj.weight")),
+            128 * 128 * 2
+        );
+        assert_eq!(
+            size(&format!("{p}mlp.gate.weight")),
+            16 * 256 * 4,
+            "router replicated"
+        );
         let fa = ops(&m, DevOp::FlashDecode);
-        assert_eq!((fa[0].i[1], fa[0].i[2]), (4, 1), "4 q heads / 1 kv head per rank");
+        assert_eq!(
+            (fa[0].i[1], fa[0].i[2]),
+            (4, 1),
+            "4 q heads / 1 kv head per rank"
+        );
         let xr: Vec<u32> = ops(&m, DevOp::XReduce).iter().map(|i| i.i[0]).collect();
         assert_eq!(xr, vec![256, 128, 4 * 128, 256, 256, 128, 4 * 128, 256]);
         let slots: Vec<u32> = ops(&m, DevOp::XReduce).iter().map(|i| i.i[2]).collect();
         let sb = 4 * 128 * 2;
-        assert_eq!(slots, vec![0, sb, 0, sb, 0, sb, 0, sb], "slots strictly alternate");
-        assert!(ops(&m, DevOp::MuseMoeCombineNorm).iter().all(|i| i.i[2] == 1));
-        assert!(ops(&m, DevOp::MoeGroupDownFp8Blk).iter().all(|i| i.i[7] == 1));
+        assert_eq!(
+            slots,
+            vec![0, sb, 0, sb, 0, sb, 0, sb],
+            "slots strictly alternate"
+        );
+        assert!(ops(&m, DevOp::MuseMoeCombineNorm)
+            .iter()
+            .all(|i| i.i[2] == 1));
+        assert!(ops(&m, DevOp::MoeGroupDownFp8Blk)
+            .iter()
+            .all(|i| i.i[7] == 1));
         let downs = ops(&m, DevOp::MoeGroupDownFp8Blk);
-        assert_eq!(downs.iter().map(|i| i.i[6]).collect::<Vec<_>>(), vec![MOE_ENC_BF16, MOE_ENC_MXFP4]);
+        assert_eq!(
+            downs.iter().map(|i| i.i[6]).collect::<Vec<_>>(),
+            vec![MOE_ENC_BF16, MOE_ENC_MXFP4]
+        );
         assert!(downs.iter().all(|i| i.i[2] == 64));
     }
 
@@ -1476,19 +1663,40 @@ mod tests {
         let id = |n: &str| m.tensors.iter().position(|t| t.name == n).unwrap() as u32;
         assert_eq!(ins[0].op, DevOp::Embed as u16);
         assert_eq!((ins[0].t[2], ins[0].f[0]), (id("in.ids"), 1.0));
-        assert_eq!((ins[1].op, ins[1].t[2], ins[1].i[2]), (DevOp::MuseRmsNorm as u16, TENSOR_NONE, NORM_PLAIN));
+        assert_eq!(
+            (ins[1].op, ins[1].t[2], ins[1].i[2]),
+            (DevOp::MuseRmsNorm as u16, TENSOR_NONE, NORM_PLAIN)
+        );
         let n = ins.len();
         let ops: Vec<u16> = ins[n - 5..].iter().map(|i| i.op).collect();
-        let want = [DevOp::MuseRmsNorm, DevOp::Gemv, DevOp::SoftCap, DevOp::Argmax, DevOp::ArgmaxFin];
+        let want = [
+            DevOp::MuseRmsNorm,
+            DevOp::Gemv,
+            DevOp::SoftCap,
+            DevOp::Argmax,
+            DevOp::ArgmaxFin,
+        ];
         assert_eq!(ops, want.map(|o| o as u16));
-        assert_eq!(ins[n - 5].f[1], c.output_multiplier, "multiplier rides the final norm");
+        assert_eq!(
+            ins[n - 5].f[1],
+            c.output_multiplier,
+            "multiplier rides the final norm"
+        );
         assert_eq!((ins[n - 3].i[0], ins[n - 3].f[0]), (1000, 20.0));
         assert_eq!(ins[n - 1].t[0], id("in.ids"));
-        assert_eq!(size("lm_head.weight"), 1000 * 256 * 2, "head replicated at TP");
+        assert_eq!(
+            size("lm_head.weight"),
+            1000 * 256 * 2,
+            "head replicated at TP"
+        );
     }
 
     fn prog_ops(m: &Model, p: usize, op: DevOp) -> Vec<&packet::dev::DevInst> {
-        m.progs[p].insts.iter().filter(|i| i.op == op as u16).collect()
+        m.progs[p]
+            .insts
+            .iter()
+            .filter(|i| i.op == op as u16)
+            .collect()
     }
 
     #[test]
@@ -1498,23 +1706,44 @@ mod tests {
         assert_eq!(m.prog_t, vec![128, 1]);
         let fa = prog_ops(&m, 0, DevOp::FlashPrefill);
         assert_eq!(fa.len(), 2);
-        assert_eq!((fa[0].i[0], fa[0].i[1], fa[0].i[5], fa[0].j[0]), (128, 128, 0, 512));
+        assert_eq!(
+            (fa[0].i[0], fa[0].i[1], fa[0].i[5], fa[0].j[0]),
+            (128, 128, 0, 512)
+        );
         assert_eq!(fa[1].i[5], 128, "sliding layer windowed");
-        assert!(prog_ops(&m, 0, DevOp::QwenHeadNormRope).iter().all(|i| i.i[3] == 128));
+        assert!(prog_ops(&m, 0, DevOp::QwenHeadNormRope)
+            .iter()
+            .all(|i| i.i[3] == 128));
         let kv = prog_ops(&m, 0, DevOp::QwenHeadNormRope);
-        assert_eq!(kv.iter().filter(|i| i.i[6] == 1).count(), 4, "k/v cache writes per layer");
+        assert_eq!(
+            kv.iter().filter(|i| i.i[6] == 1).count(),
+            4,
+            "k/v cache writes per layer"
+        );
         let rt = prog_ops(&m, 0, DevOp::MoeRouterTopkPf);
         assert_eq!((rt[0].i[4], rt[0].i[3]), (128, ROUTER_FLAGS));
         assert!((rt[0].f[1] - c.output_multiplier).abs() < 1e-7);
         assert_eq!(prog_ops(&m, 0, DevOp::MoeAlignPf)[0].i[..3], [128, 16, 4]);
         let glu = prog_ops(&m, 0, DevOp::MoeGroupGluPf);
-        assert_eq!((glu[0].i[3], glu[0].t[7] != TENSOR_NONE), (MOE_ENC_MXFP4, true));
+        assert_eq!(
+            (glu[0].i[3], glu[0].t[7] != TENSOR_NONE),
+            (MOE_ENC_MXFP4, true)
+        );
         let dn = prog_ops(&m, 0, DevOp::MoeGroupDownPf);
         assert_eq!((dn[0].i[0], dn[0].i[1], dn[0].i[7]), (128, 128, 0));
-        assert!(prog_ops(&m, 0, DevOp::MuseMoeCombineNorm).iter().all(|i| i.i[3] == 128));
-        assert!(prog_ops(&m, 0, DevOp::Gemv).is_empty(), "prefill projections are tiled GEMMs");
+        assert!(prog_ops(&m, 0, DevOp::MuseMoeCombineNorm)
+            .iter()
+            .all(|i| i.i[3] == 128));
+        assert!(
+            prog_ops(&m, 0, DevOp::Gemv).is_empty(),
+            "prefill projections are tiled GEMMs"
+        );
         let size = |n: &str| m.tensors.iter().find(|t| t.name == n).unwrap().bytes;
-        assert_eq!(size("act.x"), 128 * 256 * 2, "one table at the widest program");
+        assert_eq!(
+            size("act.x"),
+            128 * 256 * 2,
+            "one table at the widest program"
+        );
         assert_eq!(size("kv.1.k"), 64 * 2 * 512 * 2);
     }
 
@@ -1542,15 +1771,32 @@ mod tests {
         assert_eq!(prog_ops(&m, 0, DevOp::XReduce).len(), 0);
         let xr = prog_ops(&m, 0, DevOp::XReduceTwoShot);
         assert!(!xr.is_empty());
-        assert!(prog_ops(&m, 0, DevOp::MoeGroupDownPf).iter().all(|i| i.i[7] == 1));
-        assert!(prog_ops(&m, 0, DevOp::MuseMoeCombineNorm).iter().all(|i| i.i[2] == 2));
+        assert!(prog_ops(&m, 0, DevOp::MoeGroupDownPf)
+            .iter()
+            .all(|i| i.i[7] == 1));
+        assert!(prog_ops(&m, 0, DevOp::MuseMoeCombineNorm)
+            .iter()
+            .all(|i| i.i[2] == 2));
         let names: Vec<&str> = m.tensors.iter().map(|t| t.name.as_str()).collect();
         assert!(names.contains(&"act.xn2_bm@bandr128") && names.contains(&"act.xn2@band1"));
         let norm = prog_ops(&m, 0, DevOp::MuseRmsNorm);
-        assert_eq!(norm.iter().filter(|i| i.i[3] == 128).count(), 2, "band-major pre-MoE norms");
+        assert_eq!(
+            norm.iter().filter(|i| i.i[3] == 128).count(),
+            2,
+            "band-major pre-MoE norms"
+        );
         let lm = prog_ops(&m, 0, DevOp::Gemv);
-        assert_eq!((lm.len(), lm[0].i[0], lm[0].i[4]), (1, 1, 127), "last row scored");
-        let slot = m.tensors.iter().find(|t| t.name == "act.og_tp").unwrap().bytes;
+        assert_eq!(
+            (lm.len(), lm[0].i[0], lm[0].i[4]),
+            (1, 1, 127),
+            "last row scored"
+        );
+        let slot = m
+            .tensors
+            .iter()
+            .find(|t| t.name == "act.og_tp")
+            .unwrap()
+            .bytes;
         assert_eq!(slot, 128 * 4 * 128 * 2);
     }
 
@@ -1565,14 +1811,24 @@ mod tests {
         assert_eq!((rt[0].i[4], rt[0].f[1]), (8, c.output_multiplier));
         let glu = prog_ops(&m, 2, DevOp::MoeGroupGluFp8Blk);
         assert_eq!((glu[0].i[0], glu[0].i[4]), (32, 4));
-        assert!(prog_ops(&m, 2, DevOp::MoeGroupDownFp8Blk).iter().all(|i| i.i[0] == 32));
+        assert!(prog_ops(&m, 2, DevOp::MoeGroupDownFp8Blk)
+            .iter()
+            .all(|i| i.i[0] == 32));
         let cmb = prog_ops(&m, 2, DevOp::MuseMoeCombineNorm);
-        assert!(cmb.iter().all(|i| i.i[3] == 8 && i.i[4] == 64 && i.i[2] == 1));
-        assert!(prog_ops(&m, 2, DevOp::Gemv).is_empty(), "rows > 1 run GemmSmall");
+        assert!(cmb
+            .iter()
+            .all(|i| i.i[3] == 8 && i.i[4] == 64 && i.i[2] == 1));
+        assert!(
+            prog_ops(&m, 2, DevOp::Gemv).is_empty(),
+            "rows > 1 run GemmSmall"
+        );
         assert_eq!(prog_ops(&m, 2, DevOp::Argmax)[0].i[1], 8);
         let size = |n: &str| m.tensors.iter().find(|t| t.name == n).unwrap().bytes;
         assert_eq!(size("in.kvlen"), 8 * 4);
         assert_eq!(size("kv.0.k"), 8 * 64 * 512 * 2, "one cache per slot");
-        assert!(prog_ops(&m, 1, DevOp::Gemv).len() > 1, "the B1 rung keeps the GEMV");
+        assert!(
+            prog_ops(&m, 1, DevOp::Gemv).len() > 1,
+            "the B1 rung keeps the GEMV"
+        );
     }
 }

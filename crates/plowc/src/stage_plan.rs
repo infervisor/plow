@@ -190,9 +190,14 @@ fn unit(kind: UnitKind, layer: Option<u32>) -> Unit {
 }
 
 /// Units of a Gemma-4 text decoder (`config.json` with or without `text_config`), from checkpoint shapes.
-pub fn gemma4_units(shapes: &HashMap<String, Vec<i64>>, config: &Value) -> Result<Vec<Unit>, String> {
+pub fn gemma4_units(
+    shapes: &HashMap<String, Vec<i64>>,
+    config: &Value,
+) -> Result<Vec<Unit>, String> {
     let tc = config.get("text_config").unwrap_or(config);
-    let n_layers = tc["num_hidden_layers"].as_u64().ok_or("config: num_hidden_layers")? as u32;
+    let n_layers = tc["num_hidden_layers"]
+        .as_u64()
+        .ok_or("config: num_hidden_layers")? as u32;
     let shared = tc["num_kv_shared_layers"].as_u64().unwrap_or(0) as u32;
     let window = tc["sliding_window"].as_u64();
     let top_k = tc["top_k_experts"].as_u64().unwrap_or(0);
@@ -233,24 +238,42 @@ pub fn gemma4_units(shapes: &HashMap<String, Vec<i64>>, config: &Value) -> Resul
                 .ok_or_else(|| format!("layer {l}: no KV source layer"))?
         };
         let mut attn = 0;
-        for s in ["self_attn.q_proj.weight", "self_attn.o_proj.weight", "self_attn.q_norm.weight", "input_layernorm.weight", "post_attention_layernorm.weight"] {
+        for s in [
+            "self_attn.q_proj.weight",
+            "self_attn.o_proj.weight",
+            "self_attn.q_norm.weight",
+            "input_layernorm.weight",
+            "post_attention_layernorm.weight",
+        ] {
             attn += numel(shapes, &w(s))?;
         }
         let mut kvw = 0;
         if own_kv {
             // attention_k_eq_v layers have no v_proj (V is the K projection)
-            for s in ["self_attn.k_proj.weight", "self_attn.v_proj.weight", "self_attn.k_norm.weight"] {
+            for s in [
+                "self_attn.k_proj.weight",
+                "self_attn.v_proj.weight",
+                "self_attn.k_norm.weight",
+            ] {
                 kvw += numel(shapes, &w(s)).unwrap_or(0);
             }
         }
         let head_dim = dim(shapes, &w("self_attn.q_norm.weight"), 0)?;
-        let kv_rows = dim(shapes, &t(&format!("layers.{src}.self_attn.k_proj.weight")), 0)?;
+        let kv_rows = dim(
+            shapes,
+            &t(&format!("layers.{src}.self_attn.k_proj.weight")),
+            0,
+        )?;
         let q_rows = dim(shapes, &w("self_attn.q_proj.weight"), 0)?;
         u.push(Unit {
             fixed_bytes: (attn + kvw) * BF16,
             exchanges: 4,
             kv_row_bytes: 2 * kv_rows * BF16,
-            window: if types.get(l as usize) == Some(&"sliding_attention") { window } else { None },
+            window: if types.get(l as usize) == Some(&"sliding_attention") {
+                window
+            } else {
+                None
+            },
             kv_source: (!own_kv).then_some(src),
             // q (FP32), attention output (BF16), o (FP32)
             act_fixed: hidden * 4,
@@ -264,7 +287,9 @@ pub fn gemma4_units(shapes: &HashMap<String, Vec<i64>>, config: &Value) -> Resul
         u.push(Unit {
             rows: inter,
             row_bytes: 3 * hidden * BF16,
-            fixed_bytes: (numel(shapes, &w("pre_feedforward_layernorm.weight"))? + numel(shapes, &w("post_feedforward_layernorm.weight"))?) * BF16,
+            fixed_bytes: (numel(shapes, &w("pre_feedforward_layernorm.weight"))?
+                + numel(shapes, &w("post_feedforward_layernorm.weight"))?)
+                * BF16,
             exchanges: 2,
             // gelu(gate) * up (BF16) per intermediate row, down output (FP32)
             act_fixed: hidden * 4,
@@ -273,7 +298,11 @@ pub fn gemma4_units(shapes: &HashMap<String, Vec<i64>>, config: &Value) -> Resul
         });
         if shapes.contains_key(&w("per_layer_input_gate.weight")) {
             let mut b = 0;
-            for s in ["per_layer_input_gate.weight", "per_layer_projection.weight", "post_per_layer_input_norm.weight"] {
+            for s in [
+                "per_layer_input_gate.weight",
+                "per_layer_projection.weight",
+                "post_per_layer_input_norm.weight",
+            ] {
                 b += numel(shapes, &w(s))?;
             }
             u.push(Unit {
@@ -285,16 +314,31 @@ pub fn gemma4_units(shapes: &HashMap<String, Vec<i64>>, config: &Value) -> Resul
         }
         if shapes.contains_key(&w("experts.gate_up_proj")) {
             let mut b = 0;
-            for s in ["router.proj.weight", "router.scale", "router.per_expert_scale", "pre_feedforward_layernorm_2.weight", "post_feedforward_layernorm_1.weight", "post_feedforward_layernorm_2.weight"] {
+            for s in [
+                "router.proj.weight",
+                "router.scale",
+                "router.per_expert_scale",
+                "pre_feedforward_layernorm_2.weight",
+                "post_feedforward_layernorm_1.weight",
+                "post_feedforward_layernorm_2.weight",
+            ] {
                 b += numel(shapes, &w(s))?;
             }
             // router scores (FP32) on the head group; the experts get x and the routing with the dispatch hop
-            u.push(Unit { fixed_bytes: b * BF16, exchanges: 1, act_fixed: dim(shapes, &w("router.proj.weight"), 0)? * 4, ..unit(UnitKind::Router, Some(l)) });
+            u.push(Unit {
+                fixed_bytes: b * BF16,
+                exchanges: 1,
+                act_fixed: dim(shapes, &w("router.proj.weight"), 0)? * 4,
+                ..unit(UnitKind::Router, Some(l))
+            });
             let n = dim(shapes, &w("experts.gate_up_proj"), 0)?;
             let e_inter = dim(shapes, &w("experts.down_proj"), 2)?;
             u.push(Unit {
                 rows: n,
-                row_bytes: (numel(shapes, &w("experts.gate_up_proj"))? + numel(shapes, &w("experts.down_proj"))?) / n * BF16,
+                row_bytes: (numel(shapes, &w("experts.gate_up_proj"))?
+                    + numel(shapes, &w("experts.down_proj"))?)
+                    / n
+                    * BF16,
                 exchanges: 2,
                 // per (token, expert) pair every core gathers gelu(gate) * up (BF16); the weighted sum goes to the
                 // sending core only
@@ -336,7 +380,15 @@ fn label(p: &Piece) -> String {
 
 fn whole(units: &[Unit], i: usize) -> Piece {
     let u = &units[i];
-    Piece { unit: i, kind: u.kind, layer: u.layer, row0: 0, row1: u.rows, of_rows: u.rows, bytes: u.bytes() }
+    Piece {
+        unit: i,
+        kind: u.kind,
+        layer: u.layer,
+        row0: 0,
+        row1: u.rows,
+        of_rows: u.rows,
+        bytes: u.bytes(),
+    }
 }
 
 /// Per-socket load of a stage, before the time model.
@@ -355,14 +407,33 @@ fn pred(l: &Load, b: &Budget, c: &Cost) -> (u64, Pred) {
     let attn_us = l.kv as f64 / (c.kv_gbps * 1e3);
     let act_us = b.batch.saturating_sub(1) as f64 * l.act as f64 / (c.act_gbps * 1e3);
     let allreduce_us = l.allreduces as f64 * c.allreduce_us;
-    (bpc, Pred { gemv_us, sync_us, attn_us, act_us, allreduce_us, total_us: gemv_us + sync_us + attn_us + act_us + allreduce_us })
+    (
+        bpc,
+        Pred {
+            gemv_us,
+            sync_us,
+            attn_us,
+            act_us,
+            allreduce_us,
+            total_us: gemv_us + sync_us + attn_us + act_us + allreduce_us,
+        },
+    )
 }
 
 fn kv_rows(u: &Unit, b: &Budget) -> u64 {
     u.window.map_or(b.ctx, |w| w.min(b.ctx))
 }
 
-fn make(index: usize, label: String, pieces: Vec<Piece>, sockets: u32, l: Load, replicas: Vec<u32>, b: &Budget, c: &Cost) -> Stage {
+fn make(
+    index: usize,
+    label: String,
+    pieces: Vec<Piece>,
+    sockets: u32,
+    l: Load,
+    replicas: Vec<u32>,
+    b: &Budget,
+    c: &Cost,
+) -> Stage {
     let (bpc, p) = pred(&l, b, c);
     Stage {
         index,
@@ -382,41 +453,71 @@ fn make(index: usize, label: String, pieces: Vec<Piece>, sockets: u32, l: Load, 
 
 /// One socket holding whole units and row pieces.
 fn finish(index: usize, pieces: Vec<Piece>, units: &[Unit], b: &Budget, c: &Cost) -> Stage {
-    let mut l = Load { bytes: 0, exchanges: 0, allreduces: 0, kv: 0, act: 0 };
+    let mut l = Load {
+        bytes: 0,
+        exchanges: 0,
+        allreduces: 0,
+        kv: 0,
+        act: 0,
+    };
     let mut replicas = Vec::new();
     for p in &pieces {
         let u = &units[p.unit];
         l.bytes += p.bytes;
         l.exchanges += u.exchanges;
-        l.act += u.act_fixed + u.act_split + u.act_per_row * (if u.rows == 0 { 0 } else { p.row1 - p.row0 });
+        l.act += u.act_fixed
+            + u.act_split
+            + u.act_per_row * (if u.rows == 0 { 0 } else { p.row1 - p.row0 });
         l.kv += u.kv_row_bytes * kv_rows(u, b) * b.batch as u64;
         if let Some(s) = u.kv_source {
-            if !pieces.iter().any(|q| units[q.unit].kind == UnitKind::Attn && units[q.unit].layer == Some(s)) && !replicas.contains(&s) {
+            if !pieces
+                .iter()
+                .any(|q| units[q.unit].kind == UnitKind::Attn && units[q.unit].layer == Some(s))
+                && !replicas.contains(&s)
+            {
                 replicas.push(s);
             }
         }
     }
     let first = pieces.first().map(label).unwrap_or_default();
     let last = pieces.last().map(label).unwrap_or_default();
-    let name = if pieces.len() > 1 { format!("{first} .. {last}") } else { first };
+    let name = if pieces.len() > 1 {
+        format!("{first} .. {last}")
+    } else {
+        first
+    };
     make(index, name, pieces, 1, l, replicas, b, c)
 }
 
 /// Per-socket load of dense units `idx` split S ways: whole q heads with their KV heads (one replicated head per
 /// socket when S exceeds the KV heads), FFN rows / S; norms, router and the per-layer-input block on every socket.
 fn tp_load(units: &[Unit], idx: &[usize], s: u64, b: &Budget) -> Option<Load> {
-    let mut l = Load { bytes: 0, exchanges: 0, allreduces: if s > 1 { 2 } else { 0 }, kv: 0, act: 0 };
+    let mut l = Load {
+        bytes: 0,
+        exchanges: 0,
+        allreduces: if s > 1 { 2 } else { 0 },
+        kv: 0,
+        act: 0,
+    };
     for &i in idx {
         let u = &units[i];
         l.exchanges += u.exchanges;
         l.act += u.act_fixed;
         match u.kind {
             UnitKind::Attn => {
-                if u.heads % s != 0 || (u.kv_heads > 0 && u.kv_heads % s != 0 && s % u.kv_heads != 0) {
+                if u.heads % s != 0
+                    || (u.kv_heads > 0 && u.kv_heads % s != 0 && s % u.kv_heads != 0)
+                {
                     return None;
                 }
                 let kvh = if u.kv_heads >= s { u.kv_heads / s } else { 1 };
-                let kv_frac = |x: u64| if u.kv_heads == 0 { 0 } else { x * kvh / u.kv_heads };
+                let kv_frac = |x: u64| {
+                    if u.kv_heads == 0 {
+                        0
+                    } else {
+                        x * kvh / u.kv_heads
+                    }
+                };
                 l.bytes += (u.fixed_bytes - u.kv_weight_bytes) / s + kv_frac(u.kv_weight_bytes);
                 l.kv += kv_frac(u.kv_row_bytes) * kv_rows(u, b) * b.batch as u64;
                 l.act += u.act_split / s;
@@ -447,7 +548,13 @@ struct Packer<'a> {
 impl Packer<'_> {
     fn flush(&mut self) {
         if !self.open.is_empty() {
-            let s = finish(self.stages.len(), std::mem::take(&mut self.open), self.units, self.b, self.c);
+            let s = finish(
+                self.stages.len(),
+                std::mem::take(&mut self.open),
+                self.units,
+                self.b,
+                self.c,
+            );
             self.stages.push(s);
         }
         self.used = 0;
@@ -461,7 +568,10 @@ impl Packer<'_> {
         if u.rows == 0 {
             let need = u.bytes();
             if need > cap {
-                return Err(format!("{:?} layer {:?}: {need} B does not fit one stage ({cap} B)", u.kind, u.layer));
+                return Err(format!(
+                    "{:?} layer {:?}: {need} B does not fit one stage ({cap} B)",
+                    u.kind, u.layer
+                ));
             }
             if self.used + need > cap {
                 self.flush();
@@ -475,16 +585,31 @@ impl Packer<'_> {
             let fixed = if r0 == 0 { u.fixed_bytes } else { 0 };
             let left = cap.saturating_sub(self.used + fixed);
             let fit = (left / u.row_bytes).min(u.rows - r0);
-            let fit = if fit < u.rows - r0 { fit / b.min_rows_per_core * b.min_rows_per_core } else { fit };
+            let fit = if fit < u.rows - r0 {
+                fit / b.min_rows_per_core * b.min_rows_per_core
+            } else {
+                fit
+            };
             if fit < min_rows.min(u.rows - r0) {
                 if self.open.is_empty() {
-                    return Err(format!("{:?}: a stage holds fewer than {min_rows} rows", u.kind));
+                    return Err(format!(
+                        "{:?}: a stage holds fewer than {min_rows} rows",
+                        u.kind
+                    ));
                 }
                 self.flush();
                 continue;
             }
             let bytes = fixed + fit * u.row_bytes;
-            self.open.push(Piece { unit: i, kind: u.kind, layer: u.layer, row0: r0, row1: r0 + fit, of_rows: u.rows, bytes });
+            self.open.push(Piece {
+                unit: i,
+                kind: u.kind,
+                layer: u.layer,
+                row0: r0,
+                row1: r0 + fit,
+                of_rows: u.rows,
+                bytes,
+            });
             self.used += bytes;
             r0 += fit;
         }
@@ -492,7 +617,16 @@ impl Packer<'_> {
     }
 
     fn push(&mut self, label: String, pieces: Vec<Piece>, sockets: u32, l: Load) {
-        let s = make(self.stages.len(), label, pieces, sockets, l, Vec::new(), self.b, self.c);
+        let s = make(
+            self.stages.len(),
+            label,
+            pieces,
+            sockets,
+            l,
+            Vec::new(),
+            self.b,
+            self.c,
+        );
         self.stages.push(s);
     }
 
@@ -500,15 +634,40 @@ impl Packer<'_> {
     /// (MoE) the expert group.
     fn tp_layer(&mut self, layer: u32, idx: &[usize]) -> Result<(), String> {
         self.flush();
-        let dense: Vec<usize> = idx.iter().copied().filter(|&i| self.units[i].kind != UnitKind::Experts).collect();
-        let heads = dense.iter().map(|&i| self.units[i].heads).max().unwrap_or(1).max(1);
+        let dense: Vec<usize> = idx
+            .iter()
+            .copied()
+            .filter(|&i| self.units[i].kind != UnitKind::Experts)
+            .collect();
+        let heads = dense
+            .iter()
+            .map(|&i| self.units[i].heads)
+            .max()
+            .unwrap_or(1)
+            .max(1);
         let (s, l) = (1..=heads)
-            .find_map(|s| tp_load(self.units, &dense, s, self.b).filter(|l| l.bytes <= self.cap).map(|l| (s, l)))
-            .ok_or_else(|| format!("layer {layer}: no tensor-parallel degree fits {} B per socket", self.cap))?;
+            .find_map(|s| {
+                tp_load(self.units, &dense, s, self.b)
+                    .filter(|l| l.bytes <= self.cap)
+                    .map(|l| (s, l))
+            })
+            .ok_or_else(|| {
+                format!(
+                    "layer {layer}: no tensor-parallel degree fits {} B per socket",
+                    self.cap
+                )
+            })?;
         let pieces = dense.iter().map(|&i| whole(self.units, i)).collect();
-        let name = if s > 1 { format!("L{layer} tp{s}") } else { format!("L{layer}") };
+        let name = if s > 1 {
+            format!("L{layer} tp{s}")
+        } else {
+            format!("L{layer}")
+        };
         self.push(name, pieces, s as u32, l);
-        if let Some(&e) = idx.iter().find(|&&i| self.units[i].kind == UnitKind::Experts) {
+        if let Some(&e) = idx
+            .iter()
+            .find(|&&i| self.units[i].kind == UnitKind::Experts)
+        {
             self.experts(layer, e)?;
         }
         Ok(())
@@ -520,7 +679,10 @@ impl Packer<'_> {
         let (u, b) = (&self.units[i], self.b);
         let per = self.cap / u.row_bytes;
         if per == 0 {
-            return Err(format!("layer {layer}: one expert ({} B) does not fit a socket", u.row_bytes));
+            return Err(format!(
+                "layer {layer}: one expert ({} B) does not fit a socket",
+                u.row_bytes
+            ));
         }
         let sockets = u.rows.div_ceil(per);
         let held = u.rows as f64 / sockets as f64;
@@ -535,7 +697,12 @@ impl Packer<'_> {
             act: u.act_fixed + (picks / b.batch.max(1) as f64 * u.act_per_row as f64) as u64,
         };
         let pieces = vec![whole(self.units, i)];
-        self.push(format!("L{layer}.experts x{sockets} ({held:.1} per socket, {active:.1} active)"), pieces, sockets as u32, l);
+        self.push(
+            format!("L{layer}.experts x{sockets} ({held:.1} per socket, {active:.1} active)"),
+            pieces,
+            sockets as u32,
+            l,
+        );
         Ok(())
     }
 
@@ -551,12 +718,29 @@ impl Packer<'_> {
             act: u.act_fixed,
         };
         let pieces = vec![whole(self.units, i)];
-        self.push(if sockets > 1 { format!("head x{sockets}") } else { "head".into() }, pieces, sockets as u32, l);
+        self.push(
+            if sockets > 1 {
+                format!("head x{sockets}")
+            } else {
+                "head".into()
+            },
+            pieces,
+            sockets as u32,
+            l,
+        );
     }
 }
 
 pub fn plan(units: &[Unit], b: &Budget, c: &Cost) -> Result<(Vec<Stage>, Summary), String> {
-    let mut pk = Packer { units, b, c, cap: b.cores as u64 * b.l2_weight_bytes_per_core, stages: Vec::new(), open: Vec::new(), used: 0 };
+    let mut pk = Packer {
+        units,
+        b,
+        c,
+        cap: b.cores as u64 * b.l2_weight_bytes_per_core,
+        stages: Vec::new(),
+        open: Vec::new(),
+        used: 0,
+    };
     let mut i = 0;
     while i < units.len() {
         let u = &units[i];
@@ -570,7 +754,9 @@ pub fn plan(units: &[Unit], b: &Budget, c: &Cost) -> Result<(Vec<Stage>, Summary
             i += 1;
             continue;
         };
-        let j = (i..units.len()).find(|&j| units[j].layer != Some(layer)).unwrap_or(units.len());
+        let j = (i..units.len())
+            .find(|&j| units[j].layer != Some(layer))
+            .unwrap_or(units.len());
         let idx: Vec<usize> = (i..j).collect();
         let moe = idx.iter().any(|&k| units[k].kind == UnitKind::Experts);
         let bytes: u64 = idx.iter().map(|&k| units[k].bytes()).sum();
@@ -587,9 +773,14 @@ pub fn plan(units: &[Unit], b: &Budget, c: &Cost) -> Result<(Vec<Stage>, Summary
     }
     pk.flush();
     let stages = pk.stages;
-    let layers = units.iter().filter_map(|u| u.layer).max().map_or(0, |l| l + 1);
+    let layers = units
+        .iter()
+        .filter_map(|u| u.layer)
+        .max()
+        .map_or(0, |l| l + 1);
     let bottleneck = stages.iter().map(|s| s.pred.total_us).fold(0.0, f64::max);
-    let lat = stages.iter().map(|s| s.pred.total_us).sum::<f64>() + c.hop_us * stages.len().saturating_sub(1) as f64;
+    let lat = stages.iter().map(|s| s.pred.total_us).sum::<f64>()
+        + c.hop_us * stages.len().saturating_sub(1) as f64;
     let summary = Summary {
         stages: stages.len(),
         sockets: stages.iter().map(|s| s.sockets).sum(),
@@ -599,7 +790,11 @@ pub fn plan(units: &[Unit], b: &Budget, c: &Cost) -> Result<(Vec<Stage>, Summary
         bottleneck_us: bottleneck,
         token_latency_us: lat,
         // one microbatch of `batch` sequences per stage keeps every stage busy
-        pipeline_tokens_per_s: if bottleneck > 0.0 { b.batch as f64 * 1e6 / (bottleneck + c.hop_us) } else { 0.0 },
+        pipeline_tokens_per_s: if bottleneck > 0.0 {
+            b.batch as f64 * 1e6 / (bottleneck + c.hop_us)
+        } else {
+            0.0
+        },
         sequences_in_flight: b.batch as u64 * stages.len() as u64,
     };
     Ok((stages, summary))
@@ -624,19 +819,44 @@ mod tests {
     use super::*;
 
     fn u(kind: UnitKind, layer: u32, rows: u64, row_bytes: u64, fixed: u64) -> Unit {
-        Unit { rows, row_bytes, fixed_bytes: fixed, exchanges: 2, ..unit(kind, Some(layer)) }
+        Unit {
+            rows,
+            row_bytes,
+            fixed_bytes: fixed,
+            exchanges: 2,
+            ..unit(kind, Some(layer))
+        }
     }
 
     fn attn(layer: u32, fixed: u64, heads: u64, kv_heads: u64, kv_weight: u64) -> Unit {
-        Unit { heads, kv_heads, kv_weight_bytes: kv_weight, ..u(UnitKind::Attn, layer, 0, 0, fixed) }
+        Unit {
+            heads,
+            kv_heads,
+            kv_weight_bytes: kv_weight,
+            ..u(UnitKind::Attn, layer, 0, 0, fixed)
+        }
     }
 
     fn cost() -> Cost {
-        Cost { gemv_gbps_per_core: 1.0, exchange_us: 1.0, kv_gbps: 1.0, act_gbps: 1.0, hop_us: 0.0, allreduce_us: 1.0 }
+        Cost {
+            gemv_gbps_per_core: 1.0,
+            exchange_us: 1.0,
+            kv_gbps: 1.0,
+            act_gbps: 1.0,
+            hop_us: 0.0,
+            allreduce_us: 1.0,
+        }
     }
 
     fn budget(cores: u32, per_core: u64, min_rows: u64, split: Split) -> Budget {
-        Budget { cores, l2_weight_bytes_per_core: per_core, batch: 1, ctx: 1, min_rows_per_core: min_rows, split }
+        Budget {
+            cores,
+            l2_weight_bytes_per_core: per_core,
+            batch: 1,
+            ctx: 1,
+            min_rows_per_core: min_rows,
+            split,
+        }
     }
 
     #[test]
@@ -655,7 +875,10 @@ mod tests {
         assert_eq!(s[1].pieces[1].kind, UnitKind::Attn);
         assert_eq!(s[2].pieces[0].layer, Some(2));
         assert!(s.iter().all(|s| s.bytes <= 100));
-        assert_eq!(s.iter().map(|s| s.bytes).sum::<u64>(), units.iter().map(Unit::bytes).sum::<u64>());
+        assert_eq!(
+            s.iter().map(|s| s.bytes).sum::<u64>(),
+            units.iter().map(Unit::bytes).sum::<u64>()
+        );
         assert_eq!(sum.layers, 3);
     }
 
@@ -693,11 +916,19 @@ mod tests {
         // 1 core x 100 B: attn 50 B + ffn 16 rows x 1 B fit; 8 experts x 30 B -> 3 per socket, 3 sockets; head 250 B -> 3
         let mut e = u(UnitKind::Experts, 0, 8, 30, 0);
         e.top_k = 2;
-        let units = vec![attn(0, 50, 2, 1, 10), u(UnitKind::Ffn, 0, 16, 1, 0), e, u(UnitKind::Head, 0, 250, 1, 0)];
+        let units = vec![
+            attn(0, 50, 2, 1, 10),
+            u(UnitKind::Ffn, 0, 16, 1, 0),
+            e,
+            u(UnitKind::Head, 0, 250, 1, 0),
+        ];
         let mut units = units;
         units[3].layer = None;
         let (s, sum) = plan(&units, &budget(1, 100, 1, Split::Tp), &cost()).unwrap();
-        assert_eq!(s.iter().map(|s| s.sockets).collect::<Vec<_>>(), vec![1, 3, 3]);
+        assert_eq!(
+            s.iter().map(|s| s.sockets).collect::<Vec<_>>(),
+            vec![1, 3, 3]
+        );
         assert_eq!(sum.sockets, 7);
         assert!(plan(&units, &budget(1, 100, 1, Split::Pipe), &cost()).is_err());
     }

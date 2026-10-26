@@ -323,7 +323,8 @@ pub fn combine_tables(
     g: u32,
 ) -> (Vec<u32>, Vec<(u32, u32)>, u32) {
     use std::collections::HashMap;
-    let succ = |e: &StreamEnt| &succs[e.succ_ofs as usize..e.succ_ofs as usize + e.succ_len as usize];
+    let succ =
+        |e: &StreamEnt| &succs[e.succ_ofs as usize..e.succ_ofs as usize + e.succ_len as usize];
     let entries = || {
         (0..stream_ofs.len()).flat_map(move |cu| {
             let o = stream_ofs[cu] as usize;

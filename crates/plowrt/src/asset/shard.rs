@@ -295,11 +295,7 @@ pub fn slice_for_as<'a>(
     }
 
     // tp==1 binds everything whole, which is byte-identical to the pre-TP path.
-    let shard = if tp > 1 {
-        axis
-    } else {
-        Shard::Replicated
-    };
+    let shard = if tp > 1 { axis } else { Shard::Replicated };
 
     // A row-parallel SCALE is replicated. An fp8 per-output-channel scale is
     // `[out]` — 1-D — and row-parallel splits the INPUT axis, which such a
@@ -533,7 +529,10 @@ mod tests {
         assert!(blob_with(serde_json::json!({"version": 2, "row": [name]})).is_err());
         let raw = model.to_blob_v6(&[]);
         let blob = crate::asset::devblob::DevBlob::parse(&raw).unwrap();
-        assert_eq!(DeclaredShards::from_blob(&blob, &raw).unwrap().axis(name), Shard::Replicated);
+        assert_eq!(
+            DeclaredShards::from_blob(&blob, &raw).unwrap().axis(name),
+            Shard::Replicated
+        );
     }
 
     #[test]
@@ -544,10 +543,13 @@ mod tests {
         let full: Vec<u8> = (0..(k * n * 2) as u8).collect();
         let quarter = (full.len() / 4) as u64;
         assert!(slice_for(name, &full, &[n, k], quarter, 1, 4).is_err());
-        let whole = slice_for_as(name, Shard::Row, &full, &[n, k], full.len() as u64, 3, 4).unwrap();
+        let whole =
+            slice_for_as(name, Shard::Row, &full, &[n, k], full.len() as u64, 3, 4).unwrap();
         assert_eq!(&*whole, &full[..]);
         let r1 = slice_for_as(name, Shard::Row, &full, &[n, k], quarter, 1, 4).unwrap();
-        let want: Vec<u8> = (0..n).flat_map(|row| full[row * 16 + 4..row * 16 + 8].to_vec()).collect();
+        let want: Vec<u8> = (0..n)
+            .flat_map(|row| full[row * 16 + 4..row * 16 + 8].to_vec())
+            .collect();
         assert_eq!(&*r1, &want[..]);
     }
 

@@ -14408,8 +14408,11 @@ impl GpuEngine {
                         };
                         for h in 0..u64::from(kvh) {
                             let mut buf = vec![0u8; take as usize];
-                            self.be
-                                .download(&self.devp[i], b as u64 * slot + h * head, &mut buf)?;
+                            self.be.download(
+                                &self.devp[i],
+                                b as u64 * slot + h * head,
+                                &mut buf,
+                            )?;
                             index.push(serde_json::json!({
                                 "name": name, "head": h, "offset": data.len(), "bytes": take,
                                 "head_bytes": head, "full": full,
@@ -14478,7 +14481,11 @@ impl GpuEngine {
                 .iter()
                 .position(|sites| sites.iter().any(|&(i, _)| i == pc))
             else {
-                tracing::warn!(pc, bucket = bi, "PLOW_NV_DUMP_ACT: no segment holds this pc");
+                tracing::warn!(
+                    pc,
+                    bucket = bi,
+                    "PLOW_NV_DUMP_ACT: no segment holds this pc"
+                );
                 continue;
             };
             self.be
@@ -14490,8 +14497,15 @@ impl GpuEngine {
             let mut data = Vec::new();
             let mut index = Vec::new();
             for name in [
-                "act.x", "act.hn", "act.q", "act.at", "act.og", "act.dg", "act.moe.h1",
-                "act.moe.xn2", "act.moe.comb",
+                "act.x",
+                "act.hn",
+                "act.q",
+                "act.at",
+                "act.og",
+                "act.dg",
+                "act.moe.h1",
+                "act.moe.xn2",
+                "act.moe.comb",
             ] {
                 let Some(i) = self.handle_of(name) else {
                     continue;

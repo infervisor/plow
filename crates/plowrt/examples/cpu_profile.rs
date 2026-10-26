@@ -80,12 +80,19 @@ fn main() {
         // PROF_DUMP=<path>: every packet as CSV (inst, op, slice, worker, t0_ns, t1_ns, t2_ns = after the successor bumps, i0, i1, i2).
         if let Ok(p) = std::env::var("PROF_DUMP") {
             use std::io::Write;
-            let mut f = std::io::BufWriter::new(std::fs::File::create(format!("{p}.{}", title.replace(' ', "_"))).unwrap());
+            let mut f = std::io::BufWriter::new(
+                std::fs::File::create(format!("{p}.{}", title.replace(' ', "_"))).unwrap(),
+            );
             writeln!(f, "inst,op,slice,worker,t0_ns,t1_ns,t2_ns,i0,i1,i2").unwrap();
             for e in evs {
                 let d = &insts[e.inst as usize];
                 let op = DevOp::from_u16(d.op).map(|o| o.c_name()).unwrap_or("?");
-                writeln!(f, "{},{op},{},{},{},{},{},{},{},{}", e.inst, e.slice, e.worker, e.t0_ns, e.t1_ns, e.t2_ns, d.i[0], d.i[1], d.i[2]).unwrap();
+                writeln!(
+                    f,
+                    "{},{op},{},{},{},{},{},{},{},{}",
+                    e.inst, e.slice, e.worker, e.t0_ns, e.t1_ns, e.t2_ns, d.i[0], d.i[1], d.i[2]
+                )
+                .unwrap();
             }
         }
         let traced_ms = (t_max.saturating_sub(t_min)) as f64 / 1e6;
@@ -218,18 +225,30 @@ fn main() {
     if let Ok(list) = std::env::var("PROF_WAITS") {
         let p = eng.model().decode_prog();
         for want in list.split(',').filter_map(|s| s.parse::<u32>().ok()) {
-            let op = DevOp::from_u16(p.insts[want as usize].op).map(|o| o.c_name()).unwrap_or("?");
+            let op = DevOp::from_u16(p.insts[want as usize].op)
+                .map(|o| o.c_name())
+                .unwrap_or("?");
             for e in p.stream.iter().filter(|e| e.inst == want && e.slice < 2) {
                 let ew = &p.waits[e.wait_ofs as usize..e.wait_ofs as usize + e.wait_len as usize];
-                println!("inst {want} {op} slice {} flags {:#x} waits {:?}", e.slice, e.flags, ew.iter().map(|w| (w.id, w.threshold)).collect::<Vec<_>>());
+                println!(
+                    "inst {want} {op} slice {} flags {:#x} waits {:?}",
+                    e.slice,
+                    e.flags,
+                    ew.iter().map(|w| (w.id, w.threshold)).collect::<Vec<_>>()
+                );
                 for w in ew {
                     let mut by: BTreeMap<u32, usize> = BTreeMap::new();
                     for f in p.stream.iter() {
-                        if p.succs[f.succ_ofs as usize..f.succ_ofs as usize + f.succ_len as usize].contains(&w.id) {
+                        if p.succs[f.succ_ofs as usize..f.succ_ofs as usize + f.succ_len as usize]
+                            .contains(&w.id)
+                        {
                             *by.entry(f.inst).or_default() += 1;
                         }
                     }
-                    println!("  counter {} thr {} bumped by inst:entries {:?}", w.id, w.threshold, by);
+                    println!(
+                        "  counter {} thr {} bumped by inst:entries {:?}",
+                        w.id, w.threshold, by
+                    );
                 }
             }
         }

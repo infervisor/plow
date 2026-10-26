@@ -366,15 +366,24 @@ fn lower_programs(
     let mut positions = Vec::new();
     for &(batch, frames) in decode {
         let program = prefix.model.progs.len();
-        let (p, pos) =
-            program_for(prefix, cfg, batch, frames, codes, &lengths, None, splits)?;
+        let (p, pos) = program_for(prefix, cfg, batch, frames, codes, &lengths, None, splits)?;
         prefix = p;
         positions.push((pos, batch, frames));
         roles.insert(format!("decode.b{batch}.f{frames}"), program as u32);
     }
     for &(batch, frames) in steps {
         let program = prefix.model.progs.len();
-        prefix = program_for(prefix, cfg, batch, frames, codes, &lengths, Some(steps), splits)?.0;
+        prefix = program_for(
+            prefix,
+            cfg,
+            batch,
+            frames,
+            codes,
+            &lengths,
+            Some(steps),
+            splits,
+        )?
+        .0;
         roles.insert(format!("step.b{batch}.f{frames}"), program as u32);
     }
     prefix.output = output;
@@ -558,11 +567,7 @@ struct StreamIo {
 /// `lengths.{k}.rows_per_frame`.
 fn step_inputs(scales: usize, steps: &[(u32, u32)]) -> Vec<(String, String, u32)> {
     let b = steps.iter().map(|&(b, _)| b).max().unwrap_or(1);
-    let rows = steps
-        .iter()
-        .map(|&(b, n)| b * n)
-        .max()
-        .unwrap_or(1);
+    let rows = steps.iter().map(|&(b, n)| b * n).max().unwrap_or(1);
     let mut v: Vec<(String, String, u32)> = [("slot", b), ("pos", b), ("rope_pos", rows)]
         .into_iter()
         .map(|(r, e)| (format!("stream.{r}"), format!("in.codec.stream.{r}"), e))

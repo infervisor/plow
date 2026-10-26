@@ -314,7 +314,10 @@ fn combining_tree_orders_dependencies() {
             2,
             2,
         );
-        assert!(comb.iter().any(|&(_, share)| share >= 2), "no counter was combined");
+        assert!(
+            comb.iter().any(|&(_, share)| share >= 2),
+            "no counter was combined"
+        );
         prog.comb_ofs = comb_ofs;
         prog.comb = comb;
         prog.n_cells = n_cells;
@@ -328,7 +331,11 @@ fn combining_tree_orders_dependencies() {
                 run_once(&p, &prog, &ctr, 0, &rec);
                 assert_eq!(rec.count.load(Ordering::Relaxed), total_slices(&ops));
             }
-            assert_eq!(rec.violations.load(Ordering::Relaxed), 0, "threads={threads}");
+            assert_eq!(
+                rec.violations.load(Ordering::Relaxed),
+                0,
+                "threads={threads}"
+            );
         }
     }
 }

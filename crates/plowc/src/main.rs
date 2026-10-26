@@ -3057,20 +3057,36 @@ fn run_stage_plan(p: &StagePlanCli, cli: &Cli) -> Result<(), Box<dyn std::error:
     use plowc::stage_plan::{driver_l2_lock_bytes, gemma4_units, plan, Budget, Cost, Split};
     let dir = cli.hf_dir.as_deref().ok_or("stage-plan needs --hf-dir")?;
     let l2 = if p.l2_weight_kib == "auto" {
-        driver_l2_lock_bytes().ok_or("--l2-weight-kib auto: no /sys/class/misc/pseudo_lock/caps; pass KiB")?
+        driver_l2_lock_bytes()
+            .ok_or("--l2-weight-kib auto: no /sys/class/misc/pseudo_lock/caps; pass KiB")?
     } else {
         p.l2_weight_kib.parse::<u64>()? << 10
     };
     let shapes = plowc::hf_config::safetensor_shapes(dir)?;
-    let config: serde_json::Value = serde_json::from_slice(&std::fs::read(dir.join("config.json"))?)?;
+    let config: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(dir.join("config.json"))?)?;
     let units = gemma4_units(&shapes, &config)?;
     let split = match p.split.as_str() {
         "tp" => Split::Tp,
         "pipe" => Split::Pipe,
         x => return Err(format!("--split {x}: tp or pipe").into()),
     };
-    let b = Budget { cores: p.cores, l2_weight_bytes_per_core: l2, batch: p.batch, ctx: p.ctx, min_rows_per_core: p.min_rows_per_core, split };
-    let c = Cost { gemv_gbps_per_core: p.gemv_gbps, exchange_us: p.exchange_us, kv_gbps: p.kv_gbps, act_gbps: p.act_gbps, hop_us: p.hop_us, allreduce_us: p.allreduce_us };
+    let b = Budget {
+        cores: p.cores,
+        l2_weight_bytes_per_core: l2,
+        batch: p.batch,
+        ctx: p.ctx,
+        min_rows_per_core: p.min_rows_per_core,
+        split,
+    };
+    let c = Cost {
+        gemv_gbps_per_core: p.gemv_gbps,
+        exchange_us: p.exchange_us,
+        kv_gbps: p.kv_gbps,
+        act_gbps: p.act_gbps,
+        hop_us: p.hop_us,
+        allreduce_us: p.allreduce_us,
+    };
     let (stages, summary) = plan(&units, &b, &c)?;
     for s in &stages {
         println!(

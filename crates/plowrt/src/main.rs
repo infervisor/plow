@@ -1287,7 +1287,10 @@ async fn async_main(
                     prefill_reps,
                 )
             } else if prefill_sweep.is_some() || teacher.is_some() {
-                Err("--prefill-sweep / --teacher are implemented on the TP path only (--tp N, N>1)".into())
+                Err(
+                    "--prefill-sweep / --teacher are implemented on the TP path only (--tp N, N>1)"
+                        .into(),
+                )
             } else if active_batch.is_some() {
                 Err("--active-batch requires --tp N with N>1".into())
             } else {

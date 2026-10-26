@@ -220,7 +220,10 @@ pub fn synthesize_full(json: &str, name: String) -> Result<HfSynthesis, String> 
     if v["model_type"].as_str() == Some("qwen3_5") {
         return synth_qwen35(&v, name);
     }
-    if matches!(v["model_type"].as_str(), Some("muse_spark" | "muse_spark_text")) {
+    if matches!(
+        v["model_type"].as_str(),
+        Some("muse_spark" | "muse_spark_text")
+    ) {
         return Err(format!(
             "unsupported model_type {:?}: Muse Spark (latent MoE, NoPE GQA, residual gates) has \
              no --hf-dir synthesis; it is not a Gemma-4 nested checkpoint",
@@ -1680,7 +1683,9 @@ pub fn validate_against_checkpoint(
 /// Read the tensor name → shape map from every `*.safetensors` file directly
 /// in `dir` (like `bin/gemma4.rs::shard_files`, we enumerate what is actually
 /// there rather than trusting an index file).
-pub fn safetensor_shapes(dir: &Path) -> Result<std::collections::HashMap<String, Vec<i64>>, String> {
+pub fn safetensor_shapes(
+    dir: &Path,
+) -> Result<std::collections::HashMap<String, Vec<i64>>, String> {
     let mut out = std::collections::HashMap::new();
     let rd = std::fs::read_dir(dir).map_err(|e| format!("read_dir {}: {e}", dir.display()))?;
     let mut files: Vec<_> = rd
