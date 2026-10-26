@@ -18,7 +18,9 @@
 use super::prefix::VmmServe;
 use super::GpuEngine;
 use crate::device::cuda::{CudaBackend, KernelFn, PinnedHost};
-use crate::memory::kv_store::{chain_hashes, BlockId, ClassSpec, KvStore, StoreStats};
+use crate::memory::kv_store::{
+    chain_hashes, BlockId, ClassSpec, FillToken, Hold, KvStore, StoreStats,
+};
 use crate::memory::vmm::{SnapBlocks, VmmOps};
 use crate::{Result, RuntimeError};
 use parking_lot::Mutex;
@@ -112,9 +114,19 @@ pub struct BlockServe {
     tables: Mutex<Vec<Option<Table>>>,
     /// Transfer holds a launch-window gather keeps until the step's own drain
     /// ([`GpuEngine::flush_deferred_attach`]).
-    held: Mutex<Vec<Vec<BlockId>>>,
+    held: Mutex<Vec<Vec<Hold>>>,
     stats: Mutex<BlockServeStats>,
-    grower_stop: Arc<std::sync::atomic::AtomicBool>,
+    _grower_stop: WorkerStop,
+}
+
+/// Stops the store's worker threads when dropped: with the `BlockServe`, or on a failed
+/// construction after a worker was already started.
+struct WorkerStop(Arc<std::sync::atomic::AtomicBool>);
+
+impl Drop for WorkerStop {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::Relaxed);
+    }
 }
 
 impl BlockServe {
@@ -196,11 +208,11 @@ impl BlockServe {
         // under the pool lock, and released device chunks are freed on another (a device free
         // synchronises the context: behind the spill backlog that held the engine thread
         // 150 ms per shrink); both threads end with the store.
-        let grower_stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let grower_stop = WorkerStop(Arc::new(std::sync::atomic::AtomicBool::new(false)));
         {
             store.defer_frees();
             let store = Arc::clone(&store);
-            let stop = Arc::clone(&grower_stop);
+            let stop = Arc::clone(&grower_stop.0);
             std::thread::Builder::new()
                 .name("kv-store-free".into())
                 .spawn(move || {
@@ -214,7 +226,7 @@ impl BlockServe {
         }
         if host_cap > 0 {
             let store = Arc::clone(&store);
-            let stop = Arc::clone(&grower_stop);
+            let stop = Arc::clone(&grower_stop.0);
             std::thread::Builder::new()
                 .name("kv-store-host-grower".into())
                 .spawn(move || {
@@ -249,8 +261,8 @@ impl BlockServe {
             next_handle: AtomicU64::new(1),
             kernel,
             tables: Mutex::new((0..batch).map(|_| None).collect()),
-            held: Mutex::new(vec![Vec::new(); batch]),
-            grower_stop,
+            held: Mutex::new((0..batch).map(|_| Vec::new()).collect()),
+            _grower_stop: grower_stop,
             stats: Mutex::new(BlockServeStats::default()),
         }))
     }
@@ -269,10 +281,9 @@ impl BlockServe {
     }
 
     fn unhold_slot(&self, b: usize) {
-        let ids = std::mem::take(&mut self.held.lock()[b]);
-        if !ids.is_empty() {
-            self.store.unhold(&ids);
-        }
+        // Taken out first: the guards' drop takes the store lock, not the stash lock.
+        let holds = std::mem::take(&mut self.held.lock()[b]);
+        drop(holds);
     }
 
     /// The blocks a boundary at `p_a` rows is made of, with the chained key index of each.
@@ -309,7 +320,13 @@ impl BlockServe {
 
 impl Drop for BlockServe {
     fn drop(&mut self) {
-        self.grower_stop.store(true, Ordering::Relaxed);
+        // Workers stop before the tables go (the field's own drop would run after).
+        self._grower_stop.0.store(true, Ordering::Relaxed);
+        // Holds a failed drain left behind stay with the store: their copies' completion is
+        // unproven.
+        for hold in self.held.get_mut().drain(..).flatten() {
+            hold.abandon();
+        }
         for t in self.tables.get_mut().iter_mut().flatten() {
             VmmOps::free(&*self.be, t.dev);
         }
@@ -439,13 +456,12 @@ impl GpuEngine {
         );
         let plan = bs.plan(p_a, kv.geometry().window);
         let mut handle: Handle = Vec::with_capacity(plan.len());
-        let mut fills: Vec<BlockId> = Vec::new();
+        let mut fills: Vec<FillToken> = Vec::new();
         let mut segs: Vec<Seg> = Vec::new();
         let mut new_bytes = 0u64;
-        let abort = |handle: &Handle, fills: &[BlockId]| {
-            for &id in fills {
-                bs.store.fail(id);
-            }
+        // The dropped tokens fail their blocks; the dependencies go after.
+        let abort = |handle: &Handle, fills: Vec<FillToken>| {
+            drop(fills);
             let ids: Vec<BlockId> = handle.iter().map(|&(_, _, id)| id).collect();
             bs.store.release(&ids);
         };
@@ -469,14 +485,14 @@ impl GpuEngine {
                         continue
                     }
                     Err(e) => {
-                        abort(&handle, &fills);
+                        abort(&handle, fills);
                         return Err(e);
                     }
                 }
             };
             handle.push((class, row0, acquired.id));
-            if acquired.fill {
-                fills.push(acquired.id);
+            if let Some(token) = acquired.fill {
+                fills.push(token);
                 new_bytes += bs.store.class_spec(ci).block_bytes();
                 self.block_segments(b, class, row0, acquired.va, true, &mut segs);
             }
@@ -489,19 +505,20 @@ impl GpuEngine {
             let drained = self.be.stream_synchronize(&self.stream);
             sync_us = ts.elapsed().as_micros() as u64;
             if let Err(e) = copied.and(drained) {
-                abort(&handle, &fills);
+                abort(&handle, fills);
                 return Err(e);
             }
         }
-        for &id in &fills {
-            bs.store.seal(id);
+        let new_blocks = fills.len() as u64;
+        for token in fills {
+            token.seal();
         }
         let id = bs.next_handle.fetch_add(1, Ordering::Relaxed);
         {
             let mut st = bs.stats.lock();
             st.publishes += 1;
             st.published_blocks += handle.len() as u64;
-            st.published_new_blocks += fills.len() as u64;
+            st.published_new_blocks += new_blocks;
             let us = t0.elapsed().as_micros() as u64;
             st.publish_us += us;
             st.publish_max_us = st.publish_max_us.max(us);
@@ -524,7 +541,7 @@ impl GpuEngine {
             .cloned()
             .ok_or_else(|| RuntimeError::Rejected("kv store: boundary vanished".into()))?;
         let ids: Vec<BlockId> = plan.iter().map(|&(_, _, id)| id).collect();
-        bs.store.hold(&ids);
+        let hold = bs.store.hold(ids);
         let mut fenced = 0u64;
         let copied = (|| {
             let mut segs = Vec::new();
@@ -558,8 +575,8 @@ impl GpuEngine {
             r
         };
         match copied {
-            Ok(()) if self.window_open => bs.held.lock()[b].extend_from_slice(&ids),
-            _ => bs.store.unhold(&ids),
+            Ok(()) if self.window_open => bs.held.lock()[b].push(hold),
+            _ => drop(hold),
         }
         copied?;
         let mut st = bs.stats.lock();

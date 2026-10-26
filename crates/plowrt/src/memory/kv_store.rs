@@ -101,7 +101,18 @@ pub struct BlockKey {
     pub check: u64,
 }
 
-pub type BlockId = u32;
+/// Index into the store's block table; distinct from slot, chunk and class indices and from
+/// the pool's `u64` boundary handles.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[repr(transparent)]
+pub struct BlockId(u32);
+
+impl BlockId {
+    #[inline]
+    fn index(self) -> usize {
+        self.0 as usize
+    }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum State {
@@ -428,13 +439,78 @@ pub struct KvStore {
 }
 
 /// What [`KvStore::acquire`] handed out.
-#[derive(Clone, Copy, Debug)]
-pub struct Acquire {
+pub struct Acquired<'s> {
     pub id: BlockId,
-    /// The device bytes to fill (`fill`) or read.
+    /// The device bytes to fill or read.
     pub va: u64,
-    /// The caller must scatter the rows and then [`KvStore::seal`] or [`KvStore::fail`].
-    pub fill: bool,
+    /// `Some` = the block is `Filling` and this caller scatters its rows.
+    pub fill: Option<FillToken<'s>>,
+}
+
+/// A block this caller must fill: scatter the rows, then [`Self::seal`]. A token dropped
+/// unsealed (an early return, a failed copy) fails the block, exactly as [`Self::fail`]; a
+/// token dropped by an unwind leaves it `Filling` (its slot stays pinned: a copy submitted
+/// before the panic may still write it).
+#[must_use = "an unsealed fill fails its block"]
+pub struct FillToken<'s> {
+    store: &'s KvStore,
+    id: BlockId,
+    done: bool,
+}
+
+impl FillToken<'_> {
+    pub fn id(&self) -> BlockId {
+        self.id
+    }
+
+    /// The fill completed: the block may be read.
+    pub fn seal(mut self) {
+        self.done = true;
+        self.store.seal_id(self.id);
+    }
+
+    /// The fill did not complete: never serve these bytes; the next acquire refills.
+    pub fn fail(mut self) {
+        self.done = true;
+        self.store.fail_id(self.id);
+    }
+}
+
+impl Drop for FillToken<'_> {
+    fn drop(&mut self) {
+        if !self.done && !std::thread::panicking() {
+            self.store.fail_id(self.id);
+        }
+    }
+}
+
+/// Transfer holds on a set of blocks ([`KvStore::hold`]): their bytes stay in place until the
+/// guard drops. Dropped by an unwind the holds stay (a copy submitted before the panic may
+/// still read the blocks).
+#[must_use = "dropping the guard releases the holds"]
+pub struct Hold {
+    store: Arc<KvStore>,
+    ids: Vec<BlockId>,
+}
+
+impl Hold {
+    pub fn ids(&self) -> &[BlockId] {
+        &self.ids
+    }
+
+    /// Keep the holds: the blocks are left pinned (teardown, where their copies' completion
+    /// is unproven).
+    pub fn abandon(mut self) {
+        self.ids.clear();
+    }
+}
+
+impl Drop for Hold {
+    fn drop(&mut self) {
+        if !std::thread::panicking() {
+            self.store.unhold(&self.ids);
+        }
+    }
 }
 
 /// Host chunks allocated between two `MemAvailable` reads of the host-reserve check.
@@ -542,11 +618,26 @@ impl KvStore {
     }
 
     /// Take a dependency on the block `(class, key)`, creating it when absent. A present
-    /// `Ready`/`Filling` block is returned as is (`fill == false`); an absent or `Failed` one
-    /// comes back `Filling` with `fill == true`. A host-resident block is restored first.
+    /// `Ready`/`Filling` block is returned as is (no fill token); an absent or `Failed` one
+    /// comes back `Filling` with a token. A host-resident block is restored first.
     /// `Err` = no device slot could be made (the caller evicts a boundary and retries, or
     /// refuses the publish).
-    pub fn acquire(&self, class: usize, key: BlockKey) -> Result<Acquire> {
+    pub fn acquire(&self, class: usize, key: BlockKey) -> Result<Acquired<'_>> {
+        // The token is built with the lock released: its drop takes the lock.
+        let (id, va, fill) = self.acquire_locked(class, key)?;
+        Ok(Acquired {
+            id,
+            va,
+            // `then`, not `then_some`: an eagerly built token would fail a dedup hit on drop.
+            fill: fill.then(|| FillToken {
+                store: self,
+                id,
+                done: false,
+            }),
+        })
+    }
+
+    fn acquire_locked(&self, class: usize, key: BlockKey) -> Result<(BlockId, u64, bool)> {
         let mut inner = self.inner.lock();
         inner.tick += 1;
         let tick = inner.tick;
@@ -555,7 +646,7 @@ impl KvStore {
             // of the publish's launch), never copied back: the host slot goes.
             // A held host block is being read in place (a gather in flight): it stays where it
             // is and the publish takes it as present.
-            let (refill, held_host) = match inner.blocks[id as usize]
+            let (refill, held_host) = match inner.blocks[id.index()]
                 .as_ref()
                 .map(|b| (b.place, b.holds))
             {
@@ -575,32 +666,28 @@ impl KvStore {
                     st.host_bytes -= bytes;
                     st.device_blocks += 1;
                     st.device_bytes += bytes;
-                    let b = inner.blocks[id as usize].as_mut().expect("indexed block");
+                    let b = inner.blocks[id.index()].as_mut().expect("indexed block");
                     b.place = Where::Device(slot);
                     b.state = State::Filling;
                     inner.classes[class].device.va(slot)
                 }
                 (None, None) => self.ensure_device_locked(&mut inner, id)?,
             };
-            let b = inner.blocks[id as usize].as_mut().expect("indexed block");
+            let b = inner.blocks[id.index()].as_mut().expect("indexed block");
             b.dependents += 1;
             b.tick = tick;
             if b.state == State::Filling && refill.is_some() {
                 inner.stats.fills += 1;
                 inner.stats.refills += 1;
-                return Ok(Acquire { id, va, fill: true });
+                return Ok((id, va, true));
             }
             if b.state == State::Failed {
                 b.state = State::Filling;
                 inner.stats.fills += 1;
-                return Ok(Acquire { id, va, fill: true });
+                return Ok((id, va, true));
             }
             inner.stats.dedup_hits += 1;
-            return Ok(Acquire {
-                id,
-                va,
-                fill: false,
-            });
+            return Ok((id, va, false));
         }
         let slot = self.device_slot(&mut inner, class)?;
         let va = inner.classes[class].device.va(slot);
@@ -608,10 +695,10 @@ impl KvStore {
             Some(id) => id,
             None => {
                 inner.blocks.push(None);
-                (inner.blocks.len() - 1) as BlockId
+                BlockId((inner.blocks.len() - 1) as u32)
             }
         };
-        inner.blocks[id as usize] = Some(Block {
+        inner.blocks[id.index()] = Some(Block {
             class,
             key,
             state: State::Filling,
@@ -625,30 +712,28 @@ impl KvStore {
         inner.stats.fills += 1;
         inner.stats.classes[class].device_blocks += 1;
         inner.stats.classes[class].device_bytes += inner.classes[class].spec.block_bytes();
-        Ok(Acquire { id, va, fill: true })
+        Ok((id, va, true))
     }
 
-    /// The fill completed: the block may be read.
-    pub fn seal(&self, id: BlockId) {
+    fn seal_id(&self, id: BlockId) {
         let mut inner = self.inner.lock();
-        if let Some(b) = inner.blocks[id as usize].as_mut() {
+        if let Some(b) = inner.blocks[id.index()].as_mut() {
             if b.state == State::Filling {
                 b.state = State::Ready;
             }
         }
     }
 
-    /// The fill did not complete: never serve these bytes; the next acquire refills.
-    pub fn fail(&self, id: BlockId) {
+    fn fail_id(&self, id: BlockId) {
         let mut inner = self.inner.lock();
-        if let Some(b) = inner.blocks[id as usize].as_mut() {
+        if let Some(b) = inner.blocks[id.index()].as_mut() {
             b.state = State::Failed;
         }
         inner.stats.fill_failures += 1;
     }
 
     pub fn state(&self, id: BlockId) -> Option<State> {
-        self.inner.lock().blocks[id as usize]
+        self.inner.lock().blocks[id.index()]
             .as_ref()
             .map(|b| b.state)
     }
@@ -658,7 +743,7 @@ impl KvStore {
     pub fn release(&self, ids: &[BlockId]) {
         let mut inner = self.inner.lock();
         for &id in ids {
-            let Some(b) = inner.blocks[id as usize].as_mut() else {
+            let Some(b) = inner.blocks[id.index()].as_mut() else {
                 continue;
             };
             b.dependents = b.dependents.saturating_sub(1);
@@ -672,20 +757,26 @@ impl KvStore {
         }
     }
 
-    /// A transfer is reading the block: keep its bytes in place until [`Self::unhold`].
-    pub fn hold(&self, ids: &[BlockId]) {
-        let mut inner = self.inner.lock();
-        for &id in ids {
-            if let Some(b) = inner.blocks[id as usize].as_mut() {
-                b.holds += 1;
+    /// A transfer is reading the blocks: keep their bytes in place while the guard lives.
+    pub fn hold(self: &Arc<Self>, ids: Vec<BlockId>) -> Hold {
+        {
+            let mut inner = self.inner.lock();
+            for &id in &ids {
+                if let Some(b) = inner.blocks[id.index()].as_mut() {
+                    b.holds += 1;
+                }
             }
+        }
+        Hold {
+            store: Arc::clone(self),
+            ids,
         }
     }
 
-    pub fn unhold(&self, ids: &[BlockId]) {
+    fn unhold(&self, ids: &[BlockId]) {
         let mut inner = self.inner.lock();
         for &id in ids {
-            if let Some(b) = inner.blocks[id as usize].as_mut() {
+            if let Some(b) = inner.blocks[id.index()].as_mut() {
                 b.holds = b.holds.saturating_sub(1);
             }
         }
@@ -693,7 +784,7 @@ impl KvStore {
 
     pub fn location(&self, id: BlockId) -> Option<Location> {
         let inner = self.inner.lock();
-        let b = inner.blocks[id as usize].as_ref()?;
+        let b = inner.blocks[id.index()].as_ref()?;
         Some(match b.place {
             Where::Device(s) | Where::Spilling { dev: s, .. } | Where::Restoring { dev: s, .. } => {
                 Location::Device(inner.classes[b.class].device.va(s))
@@ -710,7 +801,7 @@ impl KvStore {
         let mut inner = self.inner.lock();
         inner.tick += 1;
         let tick = inner.tick;
-        let b = inner.blocks[id as usize]
+        let b = inner.blocks[id.index()]
             .as_mut()
             .ok_or_else(|| RuntimeError::Rejected("kv store: no such block".into()))?;
         b.tick = tick;
@@ -747,7 +838,7 @@ impl KvStore {
         inner.tick += 1;
         let tick = inner.tick;
         let (class, place, state) = {
-            let b = inner.blocks[id as usize]
+            let b = inner.blocks[id.index()]
                 .as_mut()
                 .ok_or_else(|| RuntimeError::Rejected("kv store: no such block".into()))?;
             b.tick = tick;
@@ -771,7 +862,7 @@ impl KvStore {
             }
         };
         inner.classes[class].device.assign(slot, id);
-        let b = inner.blocks[id as usize].as_mut().expect("block");
+        let b = inner.blocks[id.index()].as_mut().expect("block");
         b.place = Where::Restoring {
             dev: slot,
             host: h,
@@ -787,7 +878,7 @@ impl KvStore {
         self.reap_restores(&mut inner);
         ids.iter().any(|&id| {
             matches!(
-                inner.blocks[id as usize].as_ref(),
+                inner.blocks[id.index()].as_ref(),
                 Some(Block {
                     place: Where::Restoring { .. },
                     ..
@@ -801,7 +892,7 @@ impl KvStore {
         inner.tick += 1;
         let tick = inner.tick;
         let va = self.ensure_device_locked(&mut inner, id)?;
-        if let Some(b) = inner.blocks[id as usize].as_mut() {
+        if let Some(b) = inner.blocks[id.index()].as_mut() {
             b.tick = tick;
         }
         Ok(va)
@@ -809,7 +900,7 @@ impl KvStore {
 
     fn ensure_device_locked(&self, inner: &mut Inner, id: BlockId) -> Result<u64> {
         let (class, place, state) = {
-            let b = inner.blocks[id as usize]
+            let b = inner.blocks[id.index()]
                 .as_ref()
                 .ok_or_else(|| RuntimeError::Rejected("kv store: no such block".into()))?;
             (b.class, b.place, b.state)
@@ -831,7 +922,7 @@ impl KvStore {
                 }
                 inner.classes[class].device.assign(slot, id);
                 inner.classes[class].host.put(h);
-                let b = inner.blocks[id as usize].as_mut().expect("block");
+                let b = inner.blocks[id.index()].as_mut().expect("block");
                 b.place = Where::Device(slot);
                 inner.stats.restores += 1;
                 inner.stats.classes[class].host_blocks -= 1;
@@ -890,7 +981,7 @@ impl KvStore {
         while let Some(id) = inner.reclaim[class].pop_front() {
             // A dropped id is reused by the next block of any class: the stale entry is skipped
             // (that block queues under its own class when released).
-            let Some(b) = inner.blocks[id as usize].as_ref() else {
+            let Some(b) = inner.blocks[id.index()].as_ref() else {
                 continue;
             };
             if b.dependents > 0 || b.class != class {
@@ -929,7 +1020,7 @@ impl KvStore {
 
     /// Forget a block entirely (its slots go back to their slabs).
     fn drop_block(&self, inner: &mut Inner, id: BlockId) {
-        let Some(b) = inner.blocks[id as usize].take() else {
+        let Some(b) = inner.blocks[id.index()].take() else {
             return;
         };
         inner.index.remove(&(b.class, b.key));
@@ -966,7 +1057,7 @@ impl KvStore {
         let mut inner = self.inner.lock();
         let mut n = 0;
         for &id in ids {
-            let Some(b) = inner.blocks[id as usize].as_ref() else {
+            let Some(b) = inner.blocks[id.index()].as_ref() else {
                 continue;
             };
             if b.dependents == 0 && b.holds == 0 && b.state != State::Filling {
@@ -993,7 +1084,7 @@ impl KvStore {
         let t0 = std::time::Instant::now();
         let mut all = true;
         for &id in ids {
-            let Some(b) = inner.blocks[id as usize].as_ref() else {
+            let Some(b) = inner.blocks[id.index()].as_ref() else {
                 continue;
             };
             let class = b.class;
@@ -1022,7 +1113,7 @@ impl KvStore {
             let host = inner.classes[class].host.va(h);
             match self.ops.copy_dtoh_async(host, va, bytes) {
                 Ok(fence) => {
-                    let b = inner.blocks[id as usize].as_mut().expect("block");
+                    let b = inner.blocks[id.index()].as_mut().expect("block");
                     b.place = Where::Spilling {
                         dev,
                         host: h,
@@ -1067,7 +1158,7 @@ impl KvStore {
         let mut requeue = Vec::new();
         let mut victim = None;
         while let Some(id) = inner.host_reclaim[class].pop_front() {
-            let Some(b) = inner.blocks[id as usize].as_ref() else {
+            let Some(b) = inner.blocks[id.index()].as_ref() else {
                 continue;
             };
             if b.dependents > 0 || b.class != class || !matches!(b.place, Where::Host(_)) {
@@ -1105,7 +1196,7 @@ impl KvStore {
             let Some((id, queued)) = inner.spilling.pop_front() else {
                 return;
             };
-            let (class, dev, host, fence, holds) = match inner.blocks[id as usize].as_ref() {
+            let (class, dev, host, fence, holds) = match inner.blocks[id.index()].as_ref() {
                 Some(Block {
                     class,
                     place: Where::Spilling { dev, host, fence },
@@ -1141,7 +1232,7 @@ impl KvStore {
             inner.spilling_bytes -= queued;
             let bytes = inner.classes[class].spec.block_bytes();
             inner.classes[class].device.put(dev);
-            let b = inner.blocks[id as usize].as_mut().expect("block");
+            let b = inner.blocks[id.index()].as_mut().expect("block");
             b.place = Where::Host(host);
             if b.dependents == 0 {
                 inner.host_reclaim[class].push_back(id);
@@ -1161,7 +1252,7 @@ impl KvStore {
             let Some(id) = inner.restoring.pop_front() else {
                 return;
             };
-            let (class, host, fence, holds) = match inner.blocks[id as usize].as_ref() {
+            let (class, host, fence, holds) = match inner.blocks[id.index()].as_ref() {
                 Some(Block {
                     class,
                     place: Where::Restoring { host, fence, .. },
@@ -1190,7 +1281,7 @@ impl KvStore {
             }
             let bytes = inner.classes[class].spec.block_bytes();
             inner.classes[class].host.put(host);
-            let b = inner.blocks[id as usize].as_mut().expect("block");
+            let b = inner.blocks[id.index()].as_mut().expect("block");
             let Where::Restoring { dev, .. } = b.place else {
                 unreachable!("matched above")
             };
@@ -1267,7 +1358,7 @@ impl KvStore {
                 let ids = inner.classes[ci].device.occupants(chunk);
                 let reclaimable = ids
                     .iter()
-                    .all(|&id| match inner.blocks[id as usize].as_ref() {
+                    .all(|&id| match inner.blocks[id.index()].as_ref() {
                         Some(b) => {
                             b.dependents == 0
                                 && b.holds == 0
@@ -1304,7 +1395,7 @@ impl KvStore {
                 let ids = inner.classes[ci].device.occupants(chunk);
                 let mut live = 0u64;
                 for &id in &ids {
-                    match inner.blocks[id as usize].as_ref() {
+                    match inner.blocks[id.index()].as_ref() {
                         Some(b) if b.holds > 0 || b.state == State::Filling => continue 'chunks,
                         Some(b) if !matches!(b.place, Where::Device(_)) => continue 'chunks,
                         // A refill may write it while the copy reads it.
@@ -1321,7 +1412,7 @@ impl KvStore {
                         let Some(id) = inner.reclaim[ci].pop_front() else {
                             break;
                         };
-                        let Some(b) = inner.blocks[id as usize].as_ref() else {
+                        let Some(b) = inner.blocks[id.index()].as_ref() else {
                             continue;
                         };
                         if b.dependents > 0 || b.class != ci {
@@ -1353,7 +1444,7 @@ impl KvStore {
                 let mut moves: Vec<(BlockId, u32, u32)> = Vec::new();
                 let mut copies: Vec<(u64, u64, u64)> = Vec::new();
                 for id in ids {
-                    let Some(b) = inner.blocks[id as usize].as_ref() else {
+                    let Some(b) = inner.blocks[id.index()].as_ref() else {
                         continue;
                     };
                     if b.dependents == 0 {
@@ -1370,7 +1461,7 @@ impl KvStore {
                     let d = &inner.classes[ci].device;
                     copies.push((d.va(to), d.va(from), bytes_per));
                     moves.push((id, from, to));
-                    inner.blocks[id as usize].as_mut().expect("block").holds += 1;
+                    inner.blocks[id.index()].as_mut().expect("block").holds += 1;
                 }
                 return Some(CompactionPlan {
                     class: ci,
@@ -1399,18 +1490,18 @@ impl KvStore {
         for &(id, from, to) in &plan.moves {
             let lands = copied.is_ok()
                 && matches!(
-                    inner.blocks[id as usize].as_ref(),
+                    inner.blocks[id.index()].as_ref(),
                     Some(b) if b.holds == 1 && b.place == Where::Device(from)
                 );
             if lands {
                 inner.classes[ci].device.assign(to, id);
                 inner.classes[ci].device.put(from);
-                inner.blocks[id as usize].as_mut().expect("block").place = Where::Device(to);
+                inner.blocks[id.index()].as_mut().expect("block").place = Where::Device(to);
                 moved += 1;
             } else {
                 inner.classes[ci].device.put(to);
             }
-            if let Some(b) = inner.blocks[id as usize].as_mut() {
+            if let Some(b) = inner.blocks[id.index()].as_mut() {
                 b.holds -= 1;
             }
         }
@@ -1719,7 +1810,7 @@ mod tests {
         }
     }
 
-    fn store(device_cap: u64, host_cap: u64) -> (Arc<MockOps>, KvStore) {
+    fn store(device_cap: u64, host_cap: u64) -> (Arc<MockOps>, Arc<KvStore>) {
         let ops = MockOps::new();
         let s = KvStore::new(
             ops.clone(),
@@ -1733,7 +1824,17 @@ mod tests {
             host_cap,
         );
         while s.host_grow_step() {}
-        (ops, s)
+        (ops, Arc::new(s))
+    }
+
+    fn seal(a: &mut Acquired<'_>) {
+        a.fill.take().expect("a fill").seal();
+    }
+
+    fn acquire_sealed(s: &KvStore, class: usize, key: BlockKey) -> Acquired<'_> {
+        let mut a = s.acquire(class, key).unwrap();
+        seal(&mut a);
+        a
     }
 
     fn key(i: u64) -> BlockKey {
@@ -1747,15 +1848,29 @@ mod tests {
     #[test]
     fn same_key_is_one_block_with_two_dependents() {
         let (_, s) = store(1024, 0);
-        let a = s.acquire(0, key(1)).unwrap();
-        assert!(a.fill);
-        s.seal(a.id);
+        let mut a = s.acquire(0, key(1)).unwrap();
+        assert!(a.fill.is_some());
+        seal(&mut a);
         let b = s.acquire(0, key(1)).unwrap();
-        assert!(!b.fill);
+        assert!(b.fill.is_none());
         assert_eq!(a.id, b.id);
         assert_eq!(a.va, b.va);
         assert_eq!(s.stats().dedup_hits, 1);
         assert_eq!(s.stats().classes[0].device_blocks, 1);
+        // A dedup hit neither fails nor re-fills the block.
+        drop(b);
+        assert_eq!(s.state(a.id), Some(State::Ready));
+        assert_eq!(s.stats().fill_failures, 0);
+        let c = s.acquire(0, key(2)).unwrap();
+        let d = s.acquire(0, key(2)).unwrap();
+        assert!(c.fill.is_some() && d.fill.is_none());
+        drop(d);
+        assert_eq!(
+            s.state(c.id),
+            Some(State::Filling),
+            "still the first's fill"
+        );
+        assert_eq!(s.stats().fill_failures, 0);
     }
 
     #[test]
@@ -1772,16 +1887,16 @@ mod tests {
                 },
             )
             .unwrap();
-        assert!(b.fill && a.id != b.id);
+        assert!(b.fill.is_some() && a.id != b.id);
     }
 
     #[test]
     fn reclaim_reuses_released_blocks_oldest_first_when_full() {
         let (_, s) = store(2 * 32, 0); // two 32-byte blocks
-        let a = s.acquire(0, key(1)).unwrap();
-        let b = s.acquire(0, key(2)).unwrap();
-        s.seal(a.id);
-        s.seal(b.id);
+        let mut a = s.acquire(0, key(1)).unwrap();
+        let mut b = s.acquire(0, key(2)).unwrap();
+        seal(&mut a);
+        seal(&mut b);
         assert!(s.acquire(0, key(3)).is_err(), "full, nothing released");
         assert_eq!(s.stats().refusals, 1);
         s.release(&[b.id]);
@@ -1789,10 +1904,10 @@ mod tests {
         // Both released: b first, so b's slot goes first; a is still present (a demoted
         // boundary can still hit).
         let c = s.acquire(0, key(3)).unwrap();
-        assert!(c.fill);
+        assert!(c.fill.is_some());
         assert_eq!(c.va, b.va);
         let again = s.acquire(0, key(1)).unwrap();
-        assert!(!again.fill, "a survived on the reclaim list");
+        assert!(again.fill.is_none(), "a survived on the reclaim list");
         assert_eq!(s.stats().reclaims, 1);
     }
 
@@ -1810,24 +1925,24 @@ mod tests {
             3 * 32,
             0,
         );
-        let a = s.acquire(0, key(1)).unwrap();
-        let c = s.acquire(0, key(2)).unwrap();
-        s.seal(a.id);
-        s.seal(c.id);
+        let mut a = s.acquire(0, key(1)).unwrap();
+        let mut c = s.acquire(0, key(2)).unwrap();
+        seal(&mut a);
+        seal(&mut c);
         s.release(&[a.id]);
         // a is dropped; its id is free and its queue entry in class 0 stale.
         assert_eq!(s.evict(&[a.id]), 1);
-        let b = s.acquire(1, key(3)).unwrap();
+        let mut b = s.acquire(1, key(3)).unwrap();
         assert_eq!(b.id, a.id, "the freed id is reused by the other class");
-        s.seal(b.id);
+        seal(&mut b);
         s.release(&[b.id]);
-        let d = s.acquire(0, key(4)).unwrap();
+        let mut d = s.acquire(0, key(4)).unwrap();
         assert_eq!(d.va, a.va);
-        s.seal(d.id);
+        seal(&mut d);
         // Class 0 is full and its queue holds only the stale id: a refusal, never b's slot.
         assert!(s.acquire(0, key(5)).is_err());
         assert_eq!(s.stats().refusals, 1);
-        assert!(!s.acquire(1, key(3)).unwrap().fill, "b survived");
+        assert!(s.acquire(1, key(3)).unwrap().fill.is_none(), "b survived");
         s.release(&[c.id]);
         let e = s.acquire(0, key(5)).unwrap();
         assert_eq!(e.va, c.va);
@@ -1849,26 +1964,27 @@ mod tests {
             2 * 32,
         );
         while s.host_grow_step() {}
-        let park = |id: BlockId| {
-            s.seal(id);
+        let park = |a: &mut Acquired<'_>| {
+            let id = a.id;
+            seal(a);
             s.release(&[id]);
             assert!(s.spill(&[id]));
             s.reap();
             assert_eq!(s.location(id), Some(Location::Host));
         };
-        let a = s.acquire(0, key(1)).unwrap();
-        park(a.id);
+        let mut a = s.acquire(0, key(1)).unwrap();
+        park(&mut a);
         // a is dropped off the host: its id is free, its host-queue entry in class 0 stale.
         assert_eq!(s.evict(&[a.id]), 1);
-        let b = s.acquire(1, key(2)).unwrap();
+        let mut b = s.acquire(1, key(2)).unwrap();
         assert_eq!(b.id, a.id, "the freed id is reused by the other class");
-        park(b.id);
-        let c = s.acquire(0, key(3)).unwrap();
-        park(c.id);
+        park(&mut b);
+        let mut c = s.acquire(0, key(3)).unwrap();
+        park(&mut c);
         // Class 0's host slab is full and both host chunks are taken: the stale entry must not
         // give up b's slot; c, the class's own oldest, does.
-        let d = s.acquire(0, key(4)).unwrap();
-        s.seal(d.id);
+        let mut d = s.acquire(0, key(4)).unwrap();
+        seal(&mut d);
         s.release(&[d.id]);
         assert!(s.spill(&[d.id]));
         s.reap();
@@ -1881,46 +1997,46 @@ mod tests {
     #[test]
     fn held_or_filling_blocks_are_not_reclaimed() {
         let (_, s) = store(32, 0);
-        let a = s.acquire(0, key(1)).unwrap();
+        let mut a = s.acquire(0, key(1)).unwrap();
         s.release(&[a.id]);
-        s.hold(&[a.id]);
+        let hold = s.hold(vec![a.id]);
         assert!(s.acquire(0, key(2)).is_err(), "held");
-        s.unhold(&[a.id]);
+        drop(hold);
         assert!(s.acquire(0, key(2)).is_err(), "still filling");
-        s.seal(a.id);
+        seal(&mut a);
         assert!(s.acquire(0, key(2)).is_ok());
     }
 
     #[test]
     fn failed_block_is_refilled_not_served() {
         let (_, s) = store(1024, 0);
-        let a = s.acquire(0, key(1)).unwrap();
-        s.fail(a.id);
+        let mut a = s.acquire(0, key(1)).unwrap();
+        a.fill.take().expect("a fill").fail();
         assert_eq!(s.state(a.id), Some(State::Failed));
         let b = s.acquire(0, key(1)).unwrap();
-        assert!(b.fill && b.id == a.id);
+        assert!(b.fill.is_some() && b.id == a.id);
         assert_eq!(s.state(a.id), Some(State::Filling));
     }
 
     #[test]
     fn spill_then_restore_round_trips_through_the_host_tier() {
         let (ops, s) = store(32, 64);
-        let a = s.acquire(0, key(1)).unwrap();
-        s.seal(a.id);
+        let mut a = s.acquire(0, key(1)).unwrap();
+        seal(&mut a);
         s.release(&[a.id]);
         assert!(s.spill(&[a.id]));
         s.reap();
         assert_eq!(s.location(a.id), Some(Location::Host));
         assert_eq!(s.stats().classes[0].host_blocks, 1);
         // The device slot is free again for another block.
-        let b = s.acquire(0, key(2)).unwrap();
-        assert!(b.fill);
-        s.seal(b.id);
+        let mut b = s.acquire(0, key(2)).unwrap();
+        assert!(b.fill.is_some());
+        seal(&mut b);
         s.release(&[b.id]);
         // A publish that meets the host block refills it from its own rows (b's slot is
         // reclaimed); nothing is copied back and the host slot goes.
-        let again = s.acquire(0, key(1)).unwrap();
-        assert!(again.fill, "refilled on the device, not restored");
+        let mut again = s.acquire(0, key(1)).unwrap();
+        assert!(again.fill.is_some(), "refilled on the device, not restored");
         assert_eq!(ops.htod.load(Ordering::SeqCst), 0);
         assert_eq!(
             (s.stats().refills, s.stats().classes[0].host_blocks),
@@ -1928,7 +2044,7 @@ mod tests {
         );
         assert_eq!(s.location(a.id), Some(Location::Device(again.va)));
         // A gather (`ensure_device`) is the restore.
-        s.seal(again.id);
+        seal(&mut again);
         s.release(&[a.id]);
         assert!(s.spill(&[a.id]));
         s.reap();
@@ -1942,8 +2058,8 @@ mod tests {
     #[test]
     fn a_live_block_spills_and_restores_on_the_next_use() {
         let (ops, s) = store(32, 64);
-        let a = s.acquire(0, key(1)).unwrap();
-        s.seal(a.id);
+        let mut a = s.acquire(0, key(1)).unwrap();
+        seal(&mut a);
         assert!(
             s.spill(&[a.id]),
             "dependents do not pin a block to the device"
@@ -1953,15 +2069,15 @@ mod tests {
         let va = s.ensure_device(a.id).unwrap();
         assert_eq!(s.location(a.id), Some(Location::Device(va)));
         assert_eq!(ops.htod.load(Ordering::SeqCst), 1);
-        s.hold(&[a.id]);
+        let _hold = s.hold(vec![a.id]);
         assert!(!s.spill(&[a.id]), "a held block stays");
     }
 
     #[test]
     fn host_tier_off_refuses_every_spill() {
         let (_, s) = store(32, 0);
-        let a = s.acquire(0, key(1)).unwrap();
-        s.seal(a.id);
+        let mut a = s.acquire(0, key(1)).unwrap();
+        seal(&mut a);
         assert!(!s.spill(&[a.id]));
         assert_eq!(s.location(a.id), Some(Location::Device(a.va)));
     }
@@ -1982,10 +2098,10 @@ mod tests {
             2 * 32,
         );
         assert!(s.host_grow_step());
-        let a = s.acquire(0, key(1)).unwrap();
-        let b = s.acquire(0, key(2)).unwrap();
-        s.seal(a.id);
-        s.seal(b.id);
+        let mut a = s.acquire(0, key(1)).unwrap();
+        let mut b = s.acquire(0, key(2)).unwrap();
+        seal(&mut a);
+        seal(&mut b);
         s.release(&[a.id, b.id]);
         assert!(s.spill(&[a.id]));
         s.reap();
@@ -2006,8 +2122,8 @@ mod tests {
     fn device_headroom_counts_growth_free_slots_and_reclaimable_blocks() {
         let (_, s) = store(4 * 32, 0); // chunk = 32 B = one block
         assert_eq!(s.device_headroom_bytes(), 4 * 32, "all growth");
-        let a = s.acquire(0, key(1)).unwrap();
-        s.seal(a.id);
+        let mut a = s.acquire(0, key(1)).unwrap();
+        seal(&mut a);
         assert_eq!(s.device_headroom_bytes(), 3 * 32, "one block live");
         s.release(&[a.id]);
         assert_eq!(
@@ -2026,10 +2142,10 @@ mod tests {
     #[test]
     fn a_reclaimed_slot_is_handed_out_once() {
         let (_, s) = store(2 * 32, 0);
-        let a = s.acquire(0, key(1)).unwrap();
-        let b = s.acquire(0, key(2)).unwrap();
-        s.seal(a.id);
-        s.seal(b.id);
+        let mut a = s.acquire(0, key(1)).unwrap();
+        let mut b = s.acquire(0, key(2)).unwrap();
+        seal(&mut a);
+        seal(&mut b);
         s.release(&[a.id, b.id]);
         let c = s.acquire(0, key(3)).unwrap();
         let d = s.acquire(0, key(4)).unwrap();
@@ -2040,11 +2156,11 @@ mod tests {
     #[test]
     fn a_held_spilling_block_keeps_its_device_copy_until_unheld() {
         let (_, s) = store(32, 64);
-        let a = s.acquire(0, key(1)).unwrap();
-        s.seal(a.id);
+        let mut a = s.acquire(0, key(1)).unwrap();
+        seal(&mut a);
         s.release(&[a.id]);
         assert!(s.spill(&[a.id]));
-        s.hold(&[a.id]);
+        let hold = s.hold(vec![a.id]);
         s.reap();
         assert_eq!(
             s.location(a.id),
@@ -2052,7 +2168,7 @@ mod tests {
             "held: not retired"
         );
         assert!(s.acquire(0, key(2)).is_err(), "its device slot is not free");
-        s.unhold(&[a.id]);
+        drop(hold);
         s.reap();
         assert_eq!(s.location(a.id), Some(Location::Host));
         assert!(s.acquire(0, key(2)).is_ok());
@@ -2061,16 +2177,16 @@ mod tests {
     #[test]
     fn shrink_drops_reclaimable_blocks_and_releases_empty_chunks() {
         let (_, s) = store(4 * 32, 0); // chunk = 32 B = one block
-        let ids: Vec<_> = (1..=4).map(|i| s.acquire(0, key(i)).unwrap().id).collect();
-        for &id in &ids {
-            s.seal(id);
-        }
+        let ids: Vec<_> = (1..=4).map(|i| acquire_sealed(&s, 0, key(i)).id).collect();
         s.release(&ids[..2]);
         assert_eq!(s.device_bytes(), 4 * 32);
         let released = s.shrink(64);
         assert_eq!(released, 64, "two empty chunks went back");
         assert_eq!(s.device_bytes(), 2 * 32);
-        assert!(s.acquire(0, key(1)).unwrap().fill, "dropped, refilled");
+        assert!(
+            s.acquire(0, key(1)).unwrap().fill.is_some(),
+            "dropped, refilled"
+        );
     }
 
     #[test]
@@ -2087,10 +2203,7 @@ mod tests {
             2 * 64,
             0,
         );
-        let ids: Vec<_> = (1..=4).map(|i| s.acquire(0, key(i)).unwrap().id).collect();
-        for &id in &ids {
-            s.seal(id);
-        }
+        let ids: Vec<_> = (1..=4).map(|i| acquire_sealed(&s, 0, key(i)).id).collect();
         assert_eq!(
             s.device_bytes(),
             2 * 64,
@@ -2103,7 +2216,7 @@ mod tests {
         assert_eq!(ops.dtod.load(Ordering::SeqCst), 1);
         // Under the cap a new block grows a chunk again (one slot of it free).
         let e = s.acquire(0, key(5)).unwrap();
-        assert!(e.fill);
+        assert!(e.fill.is_some());
         assert_eq!(s.device_bytes(), 64 + 32);
         assert_eq!(
             s.shrink(64),
@@ -2114,7 +2227,10 @@ mod tests {
         s.release(&ids[3..]);
         assert_eq!(s.shrink(64), 64);
         assert_eq!(s.device_bytes(), 64, "blocks 1 and 5, packed");
-        assert!(s.acquire(0, key(4)).unwrap().fill, "block 4 was dropped");
+        assert!(
+            s.acquire(0, key(4)).unwrap().fill.is_some(),
+            "block 4 was dropped"
+        );
     }
 
     #[test]
@@ -2133,10 +2249,7 @@ mod tests {
         );
         // 40 chunks, each holding one referenced block and one reclaimable one, except the
         // last, whose two blocks are both reclaimable.
-        let ids: Vec<_> = (1..=80).map(|i| s.acquire(0, key(i)).unwrap().id).collect();
-        for &id in &ids {
-            s.seal(id);
-        }
+        let ids: Vec<_> = (1..=80).map(|i| acquire_sealed(&s, 0, key(i)).id).collect();
         for c in 0..40 {
             s.release(&[ids[2 * c + 1]]);
         }
@@ -2150,7 +2263,7 @@ mod tests {
         // Growth reuses the released chunk index: no new metadata.
         let before = s.inner.lock().classes[0].device.chunks.len();
         let n = s.acquire(0, key(100)).unwrap();
-        assert!(n.fill);
+        assert!(n.fill.is_some());
         assert_eq!(s.inner.lock().classes[0].device.chunks.len(), before);
         assert_eq!(
             s.device_bytes(),
@@ -2173,18 +2286,18 @@ mod tests {
         // Device: one block per class; host: one slot per class (chunk = 32 B = one block).
         let s = KvStore::new(ops.clone(), classes, 32, 2 * 32, 2 * 32);
         while s.host_grow_step() {}
-        let a = s.acquire(0, key(1)).unwrap();
-        let t = s.acquire(1, key(2)).unwrap();
-        s.seal(a.id);
-        s.seal(t.id);
+        let mut a = s.acquire(0, key(1)).unwrap();
+        let mut t = s.acquire(1, key(2)).unwrap();
+        seal(&mut a);
+        seal(&mut t);
         s.release(&[a.id, t.id]);
         assert!(s.spill(&[a.id, t.id]));
         s.reap();
         assert_eq!(s.location(a.id), Some(Location::Host));
         // A second window block spills: the host is full for its class, the window block on
         // the host is the victim, the tail block stays.
-        let a2 = s.acquire(0, key(3)).unwrap();
-        s.seal(a2.id);
+        let mut a2 = s.acquire(0, key(3)).unwrap();
+        seal(&mut a2);
         s.release(&[a2.id]);
         assert!(s.spill(&[a2.id]));
         s.reap();
@@ -2196,12 +2309,12 @@ mod tests {
     #[test]
     fn a_gather_reads_a_host_block_in_place() {
         let (ops, s) = store(32, 32); // one device slot, one host slot
-        let a = s.acquire(0, key(1)).unwrap();
-        s.seal(a.id);
+        let mut a = s.acquire(0, key(1)).unwrap();
+        seal(&mut a);
         s.release(&[a.id]);
         assert!(s.spill(&[a.id]));
         s.reap();
-        s.hold(&[a.id]);
+        let hold = s.hold(vec![a.id]);
         let Src {
             va,
             from_host,
@@ -2218,12 +2331,12 @@ mod tests {
         // While the gather reads it, a publish meeting the block takes it as present and
         // a spill of another block cannot take its host slot.
         let again = s.acquire(0, key(1)).unwrap();
-        assert!(!again.fill, "held on the host: not refilled");
-        let b = s.acquire(0, key(2)).unwrap();
-        s.seal(b.id);
+        assert!(again.fill.is_none(), "held on the host: not refilled");
+        let mut b = s.acquire(0, key(2)).unwrap();
+        seal(&mut b);
         s.release(&[b.id]);
         assert!(!s.spill(&[b.id]), "the only host slot is held");
-        s.unhold(&[a.id]);
+        drop(hold);
         assert_ne!(va, 0);
     }
 
@@ -2233,8 +2346,8 @@ mod tests {
     #[test]
     fn restore_async_queues_the_copy_and_a_gather_waits_on_its_fence() {
         let (ops, s) = store(32, 64); // one device slot
-        let a = s.acquire(0, key(1)).unwrap();
-        s.seal(a.id);
+        let mut a = s.acquire(0, key(1)).unwrap();
+        seal(&mut a);
         s.release(&[a.id]);
         assert!(s.spill(&[a.id]));
         s.reap();
@@ -2258,7 +2371,7 @@ mod tests {
             !s.spill(&[a.id]),
             "a restoring block is coming to the device"
         );
-        s.hold(&[a.id]);
+        let hold = s.hold(vec![a.id]);
         let src = s.gather_src(a.id).unwrap();
         assert_eq!((src.va, src.from_host), (a.va, false));
         let fence = src.fence.expect("restore in flight");
@@ -2282,7 +2395,7 @@ mod tests {
             s.restoring_any(&[a.id]),
             "held: still in flight for admission"
         );
-        s.unhold(&[a.id]);
+        drop(hold);
         assert!(!s.restoring_any(&[a.id]), "retired by the query itself");
         s.reap();
         let st = s.stats();
@@ -2303,19 +2416,22 @@ mod tests {
         assert_eq!(ops.htod_async.load(Ordering::SeqCst), 1);
         // The restored block is reclaimable again (zero dependents): its slot goes next.
         let b = s.acquire(0, key(2)).unwrap();
-        assert_eq!((b.fill, b.va, s.stats().reclaims), (true, a.va, 1));
+        assert_eq!(
+            (b.fill.is_some(), b.va, s.stats().reclaims),
+            (true, a.va, 1)
+        );
     }
 
     #[test]
     fn restore_async_without_a_device_slot_leaves_the_block_on_the_host() {
         let (ops, s) = store(32, 64);
-        let a = s.acquire(0, key(1)).unwrap();
-        s.seal(a.id);
+        let mut a = s.acquire(0, key(1)).unwrap();
+        seal(&mut a);
         s.release(&[a.id]);
         assert!(s.spill(&[a.id]));
         s.reap();
-        let b = s.acquire(0, key(2)).unwrap(); // the only device slot, referenced
-        s.seal(b.id);
+        let mut b = s.acquire(0, key(2)).unwrap(); // the only device slot, referenced
+        seal(&mut b);
         assert!(s.restore_async(a.id).is_err());
         assert_eq!(ops.htod_async.load(Ordering::SeqCst), 0);
         assert_eq!(s.location(a.id), Some(Location::Host));
@@ -2327,10 +2443,10 @@ mod tests {
     #[test]
     fn deferred_frees_run_on_the_worker_and_count_as_coming_free() {
         let (ops, s) = store(64, 0); // two chunks
-        let a = s.acquire(0, key(1)).unwrap();
-        let b = s.acquire(0, key(2)).unwrap();
-        s.seal(a.id);
-        s.seal(b.id);
+        let mut a = s.acquire(0, key(1)).unwrap();
+        let mut b = s.acquire(0, key(2)).unwrap();
+        seal(&mut a);
+        seal(&mut b);
         s.release(&[a.id, b.id]);
         s.defer_frees();
         assert_eq!(s.shrink(32), 32);
@@ -2347,6 +2463,8 @@ mod tests {
         );
         assert!(!s.free_step(), "nothing queued");
         assert_eq!(s.shrink(32), 32, "the second chunk goes the same way");
+        drop(a);
+        drop(b);
         drop(s);
         assert_eq!(
             ops.freed.load(Ordering::SeqCst),
@@ -2372,16 +2490,17 @@ mod tests {
             2 * 64,
             0,
         ));
-        let ids: Vec<_> = (1..=4).map(|i| s.acquire(0, key(i)).unwrap().id).collect();
-        for &id in &ids {
-            s.seal(id);
-        }
+        let ids: Vec<_> = (1..=4).map(|i| acquire_sealed(&s, 0, key(i)).id).collect();
         s.release(&ids[1..3]);
         // Both chunks are full (released blocks keep their slots): chunk 0 is planned first
         // and block 1 is the one that moves.
         let moving = ids[0];
         let held = Arc::clone(&s);
-        *ops.on_dtod.lock() = Some(Box::new(move || held.hold(&[moving])));
+        let stash: Arc<parking_lot::Mutex<Option<Hold>>> = Arc::new(parking_lot::Mutex::new(None));
+        let stashed = Arc::clone(&stash);
+        *ops.on_dtod.lock() = Some(Box::new(move || {
+            *stashed.lock() = Some(held.hold(vec![moving]));
+        }));
         let before = s.location(moving);
         assert_eq!(s.shrink(64), 0, "the move was abandoned: nothing released");
         assert_eq!(
@@ -2392,7 +2511,8 @@ mod tests {
         assert_eq!(s.location(moving), before, "block 1 stays in its slot");
         assert_eq!(s.stats().compactions, 0);
         *ops.on_dtod.lock() = None;
-        s.unhold(&[moving]);
+        let hold = stash.lock().take();
+        drop(hold);
         assert_eq!(
             s.shrink(64),
             64,
@@ -2401,11 +2521,11 @@ mod tests {
         let st = s.stats();
         assert_eq!((st.compactions, st.device_reserved_bytes), (1, 64));
         assert!(
-            !s.acquire(0, key(1)).unwrap().fill,
+            s.acquire(0, key(1)).unwrap().fill.is_none(),
             "block 1 is still present"
         );
         assert!(
-            !s.acquire(0, key(4)).unwrap().fill,
+            s.acquire(0, key(4)).unwrap().fill.is_none(),
             "block 4 is still present"
         );
     }
@@ -2413,7 +2533,7 @@ mod tests {
     #[test]
     fn shrink_compacts_a_sparse_chunk_into_holes_elsewhere() {
         let ops = MockOps::new();
-        let s = KvStore::new(
+        let s = Arc::new(KvStore::new(
             ops.clone(),
             vec![ClassSpec {
                 name: "window",
@@ -2423,13 +2543,10 @@ mod tests {
             64, // two blocks per chunk
             2 * 64,
             0,
-        );
+        ));
         // Chunk 0 = blocks 1, 2; chunk 1 = blocks 3, 4. Blocks 2 and 3 die: a hole in each
         // chunk, none releasable as is.
-        let ids: Vec<_> = (1..=4).map(|i| s.acquire(0, key(i)).unwrap().id).collect();
-        for &id in &ids {
-            s.seal(id);
-        }
+        let ids: Vec<_> = (1..=4).map(|i| acquire_sealed(&s, 0, key(i)).id).collect();
         s.release(&ids[1..3]);
         assert_eq!(
             s.shrink(64),
@@ -2445,27 +2562,110 @@ mod tests {
         assert_eq!(s.device_bytes(), 64, "blocks 1 and 4 remain, packed");
         assert!(matches!(s.location(ids[3]), Some(Location::Device(_))));
         assert!(
-            !s.acquire(0, key(4)).unwrap().fill,
+            s.acquire(0, key(4)).unwrap().fill.is_none(),
             "block 4 is still present"
         );
         // A held block pins its chunk: nothing to release.
-        s.hold(&[ids[0]]);
+        let hold = s.hold(vec![ids[0]]);
         s.release(&[ids[3]]);
         assert_eq!(s.shrink(64), 0);
-        s.unhold(&[ids[0]]);
+        drop(hold);
+    }
+
+    /// A fill token dropped unsealed (an early return, a failed copy) fails its block: the slot
+    /// is not pinned and the next publish of the key refills it. A sealed token's drop changes
+    /// nothing.
+    #[test]
+    fn a_fill_dropped_unsealed_fails_its_block_and_the_next_acquire_refills() {
+        let (_, s) = store(32, 0);
+        let a = s.acquire(0, key(1)).unwrap();
+        let id = a.id;
+        assert_eq!(s.state(id), Some(State::Filling));
+        drop(a);
+        assert_eq!(s.state(id), Some(State::Failed));
+        assert_eq!(s.stats().fill_failures, 1);
+        let mut again = s.acquire(0, key(1)).unwrap();
+        assert!(
+            again.fill.is_some() && again.id == id,
+            "refilled, not served"
+        );
+        seal(&mut again);
+        drop(again);
+        assert_eq!(s.state(id), Some(State::Ready));
+        assert_eq!(s.stats().fill_failures, 1);
+    }
+
+    /// An unwind leaves a fill `Filling` and its slot pinned: a copy submitted before the
+    /// panic may still write it.
+    #[test]
+    fn a_fill_dropped_by_an_unwind_stays_filling() {
+        let (_, s) = store(32, 0);
+        let id = std::cell::Cell::new(None);
+        let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let a = s.acquire(0, key(1)).unwrap();
+            id.set(Some(a.id));
+            // No dependent either: only the `Filling` state pins the slot below.
+            s.release(&[a.id]);
+            panic!("mid-publish");
+        }));
+        assert!(r.is_err());
+        let id = id.get().expect("acquired");
+        assert_eq!(s.state(id), Some(State::Filling));
+        assert_eq!(s.stats().fill_failures, 0);
+        assert!(s.acquire(0, key(2)).is_err(), "the slot stays pinned");
+    }
+
+    /// An unwind leaves a gather's holds in place: a copy submitted before the panic may
+    /// still read the blocks. `abandon` keeps them on purpose (teardown).
+    #[test]
+    fn holds_dropped_by_an_unwind_or_abandoned_stay() {
+        let (_, s) = store(32, 0);
+        let mut a = s.acquire(0, key(1)).unwrap();
+        seal(&mut a);
+        s.release(&[a.id]);
+        let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _hold = s.hold(vec![a.id]);
+            panic!("mid-gather");
+        }));
+        assert!(r.is_err());
+        assert!(s.acquire(0, key(2)).is_err(), "still held");
+        s.unhold(&[a.id]);
+        s.hold(vec![a.id]).abandon();
+        assert!(s.acquire(0, key(2)).is_err(), "still held");
+        s.unhold(&[a.id]);
+        assert!(s.acquire(0, key(2)).is_ok());
+    }
+
+    /// A hold guard dropped on an error path (`?`, early return) unpins its blocks.
+    #[test]
+    fn a_hold_guard_dropped_on_an_error_path_unpins_the_block() {
+        let (_, s) = store(32, 0);
+        let mut a = s.acquire(0, key(1)).unwrap();
+        seal(&mut a);
+        s.release(&[a.id]);
+        let gather = |fail: bool| -> Result<()> {
+            let _hold = s.hold(vec![a.id]);
+            assert!(s.acquire(0, key(2)).is_err(), "held");
+            if fail {
+                return Err(RuntimeError::Rejected("drain failed".into()));
+            }
+            Ok(())
+        };
+        assert!(gather(true).is_err());
+        assert!(s.acquire(0, key(2)).is_ok(), "the hold went with the guard");
     }
 
     #[test]
     fn evict_frees_only_unreferenced_settled_blocks() {
         let (_, s) = store(1024, 0);
-        let a = s.acquire(0, key(1)).unwrap();
-        let b = s.acquire(0, key(2)).unwrap();
-        s.seal(a.id);
-        s.seal(b.id);
+        let mut a = s.acquire(0, key(1)).unwrap();
+        let mut b = s.acquire(0, key(2)).unwrap();
+        seal(&mut a);
+        seal(&mut b);
         s.release(&[b.id]);
         assert_eq!(s.evict(&[a.id, b.id]), 1);
         assert_eq!(s.stats().classes[0].device_blocks, 1);
-        assert!(s.acquire(0, key(1)).map(|x| !x.fill).unwrap());
+        assert!(s.acquire(0, key(1)).map(|x| x.fill.is_none()).unwrap());
     }
 
     #[test]
