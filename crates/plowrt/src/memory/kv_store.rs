@@ -397,8 +397,8 @@ struct Inner {
     /// shrinks the store when the slots need memory; without this check the store grew right
     /// back to its cap and the two thrashed (58k chunk allocations, 66 GB compacted in 10 min).
     device_floor: u64,
-    /// Until when growth waits behind the class reclaim lists: set by a `shrink` that released
-    /// bytes. The floor check alone left a 51 MiB band between the store's growth and the
+    /// Until when `device_slot` takes the class reclaim list before growing: set by a `shrink`
+    /// that released bytes. The floor check alone left a 51 MiB band between the store's growth and the
     /// pool's trim, so every ring the pool retired was re-taken within seconds and handed back
     /// at the next prompt burst (16k chunk frees per 300 s; a `cuMemFree` may synchronise the
     /// context, and seconds with a free burst had decode ticks stretched 20 -> 75 ms).
@@ -1699,12 +1699,8 @@ impl KvStore {
             .iter()
             .map(|c| c.device.reserved_bytes())
             .sum();
-        if inner
-            .grow_hold_until
-            .is_some_and(|t| std::time::Instant::now() < t)
-        {
-            return bytes;
-        }
+        // The growth hold is not subtracted: the spill-ahead thread would otherwise drain the
+        // device tier for ten seconds after every shrink (2x the spills, 10x the restores).
         let growth = inner.device_cap.saturating_sub(reserved);
         let chunk = inner.classes.first().map_or(0, |c| c.device.chunk_bytes());
         let room = match self.ops.free_bytes() {
@@ -2242,13 +2238,11 @@ mod tests {
         // Nothing left to reclaim: growth is the last resort even under the hold.
         acquire_sealed(&s, 0, key(6));
         assert_eq!(ops.dev_alloc.load(Ordering::SeqCst), allocs + 32, "grown");
-        // The hold hides the growth room under the cap, not the slots in hand.
+        // The headroom report keeps the growth room through the hold (spill-ahead stays calm).
         s.release(&[e.id]);
-        let held = s.device_headroom_bytes();
-        assert!(held >= 32, "the released block counts");
+        assert_eq!(s.device_headroom_bytes(), 32 + 8 * 32 - 4 * 32);
         let past = std::time::Instant::now() - std::time::Duration::from_secs(1);
         s.inner.lock().grow_hold_until = Some(past);
-        assert_eq!(s.device_headroom_bytes() - held, 8 * 32 - 4 * 32);
         // Past the deadline a reclaimable block stays and the slab grows under the cap.
         acquire_sealed(&s, 0, key(7));
         assert_eq!(ops.dev_alloc.load(Ordering::SeqCst), allocs + 64, "grown");
