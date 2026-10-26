@@ -29,6 +29,19 @@
 # 164.2 ms (1.20x), SLO met 54.3% vs 95.7% (TPOT P50 97.8 vs 32.0 ms, mean in-flight 51.6 vs 21.9).
 # The dense decode step at that in-flight count is the bottleneck; this packet is not competitive
 # with vLLM 0.29 on the production mix. Evidence: /opt/dlami/nvme/lava-tts/kvstore-scratch/strict-g12-23.
+# 2026-10-26 (plowrt 2dabbe2b, same packet, kvstore-scratch/fix-g12-*, steps-g12-lt2, prof-g12):
+# the loss is the decode step, not scheduling or the KV store. Four serve-env variants (no
+# interleave + ITL budget 60 / 120 ms, no live rings, widest launches) all collapse at 2.7/s
+# (goodput 27-75%) and trade p50 for P99 at 1.8/s; the store reserve changes nothing (480 chunk
+# frees per cell). The decode step is one persistent interpreter kernel per tick (nsys): B=1
+# 8.56 ms against a 3.8 ms weight-read floor, +0.2-0.3 ms per row (B=16 11.8 / 13.5 / 19.7 ms at
+# ctx 1K / 4K / 16K, B=32 15.6 / 19.2 / 31.9), and every prefill launch pays it again for its
+# riders (256 rows + 18 riders 31 ms, 2048 rows + 29 riders 93 ms). cuBLASLt projections from
+# 2 rows (the E4B choice) lose here: B=8 15.4 vs 9.8 ms, B=16 16.7 vs 11.8, equal from 32 up
+# (token digests identical), so PLOW_EMIT_DECODE_CUBLASLT_MIN_ROWS stays 128. Closing the gap is
+# decode-interpreter kernel work (small-M tensor-core projections, fusion / barrier removal,
+# long-context attention); the serve env below is kept and the loss stands until a kernel change
+# qualifies per rung. Diagnosis: docs/bringup/results/gemma12b-fp8-20260930/comparison.md.
 #
 # Routes (per-rung evidence: docs/runtime/kernel-generators.md "Gemma-4 12B FP8 per-rung routes"):
 #   prefill projections   cuBLASLt FP8 OUTER_VEC where it wins (segment_roles::cublaslt_prefill_fp8),

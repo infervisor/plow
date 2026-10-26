@@ -334,3 +334,58 @@ During the run, plowrt was found to omit a stop token from completions logprobs 
 - Captures in `best/gate/llm_fp32_ref/`: plow `3d79bd08…`, vllm `74a7a572…`.
 - Gate recipe: `best/recipe.toml`.
 
+
+## 2026-10-26: production-mix loss on kv-block-store is the decode step
+
+Same packet (06da7686 device bytes, abi2 re-emit), plowrt 2dabbe2b, vLLM 0.29.0 arm of the
+production pass (`--kv-cache-dtype fp8 --max-model-len 16384 --max-num-seqs 256`), open-loop
+sessions, 300 s cells, two repeats, `campaign.py report` MATCHED + EQUIVALENT on every variant.
+Raw grids: `kvstore-scratch/fix-g12-<name>`, rung grid `steps-g12-lt2`, profile `prof-g12`.
+
+Serve-env variants (Infervisor / Baseline ratios, TTFT P99 and TPOT P99; 2.7/s r2 goodput =
+share of requests meeting TTFT <= 2 s and TPOT <= 100 ms, vLLM 94%):
+
+| variant (on top of the recipe `[serve.env]`) | 1.8/s | 2.7/s | 2.7/s r2 goodput |
+|---|---|---|---|
+| recipe env + `PLOW_KV_POOL_MIB=2048` (`res2g`) | 1.16x / 1.82x | 3.52x / 1.28x | 28% |
+| + interleave 0, ITL budget 60 ms, decode pipeline, admit overlap, live rings, strict publish (`sched26`) | 1.78x / 1.83x | 3.82x / 1.71x | 63% |
+| same without live rings / strict publish (`sched26norings`) | 1.52x / 1.64x | 1.97x / 1.78x | 30% |
+| interleave 0, ITL budget 0, pipeline, overlap (`wide`) | 1.17x / 2.09x | 1.64x / 1.62x | 27% |
+| interleave 0, ITL budget 120 ms (`itl120`, 3 cells: last lost to a host OOM) | 872-1125 / 103-132 ms | r1 1702 / 168 ms | r1 72% |
+
+Total tok/s is 0.94-0.98x in every cell (open loop: the same work), so the loss is per-request
+latency: mean in-flight 16-20 vs vLLM 8 at 1.8/s, 39-74 vs 17-27 at 2.7/s, and the queue
+collapses. The KV store is not involved (480 chunk frees per cell; the 26B churn fix is a no-op
+here).
+
+Packlog of the `res2g` run: decode-only ticks p50 by rows 1-7 9.7 ms, 8-15 14.6, 16-23 21.4,
+24-31 29.0, 32-39 31.5, 64+ 47 (128 rung); prefill launches carry the decode rows as riders and
+pay the same cost again: 256 rows + 18 riders 31 ms (5.2k tok/s), 512 + 20 38 ms, 1024 + 24
+53 ms, 2048 + 29 93 ms (21.4k tok/s), 4096 + 17 147 ms (26k tok/s). Prefill ticks 743 s vs
+decode ticks 406 s over the four cells.
+
+step_bench decode step (greedy, 48 steps, `--spread`, two passes agree within 0.1%), ms:
+
+| B | ctx 1K | ctx 4K | ctx 16K | with cuBLASLt projections from 2 rows (1K / 4K / 16K) |
+|---|---|---|---|---|
+| 1 | 8.56 | 8.67 | 8.86 | 8.55 / - / 8.85 (native rung either way) |
+| 8 | 9.78 | - | 13.85 | 15.36 / - / 19.26 |
+| 16 | 11.82 | 13.53 | 19.66 | 16.67 / 18.26 / 24.38 |
+| 32 | 15.61 | 19.17 | 31.90 | 16.46 / 19.74 / 32.53 (digests identical) |
+| 128 | 26.88 | - | 91.23 | same route |
+
+nsys of step_bench (B=1 and B=16, ctx 4K): the decode step is exactly one `interp_sm90a`
+kernel per tick (8.62 and 13.48 ms), no other kernels and no launch gaps. The 4.7 ms above the
+3.8 ms weight-read floor at B=1 and the 0.2-0.3 ms per extra row are inside the persistent
+interpreter program (serial small ops between grid barriers, CUDA-core GEMV scaling with rows);
+the library route is flat at 15-17 ms from 8 to 32 rows (graph-captured ~200 ops), so it only
+breaks even at 32 rows and the recipe's 128-row threshold stands.
+
+Decision: keep the recipe `[serve.env]` (no variant qualifies) and record the loss. Closing it
+needs decode-interpreter kernel work with per-rung gates (B 1/8/16/32/64/128 x ctx 1K/8K/16K,
+mixed prefill + rider launches, FP32-reference logits at c1/c8/c16/c32, then the production
+replay): small-M tensor-core projections inside the interpreter first, then fusion / barrier
+removal, then long-context attention (32 rows x 15K extra ctx costs 16 ms against a ~9 ms
+incremental floor). A realistic target for the first two is B=16 11-14 ms and B=32 16-20 ms at
+8K (today ~15.6 / 23.4 interpolated), which should stabilise the 2.7/s cell but is not by itself
+a demonstrated win over vLLM 0.29.
