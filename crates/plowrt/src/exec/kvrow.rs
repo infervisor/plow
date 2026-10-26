@@ -279,7 +279,6 @@ pub(crate) const PREFILL_ROW_FIELDS: &[(DevOp, RowField)] = &[
     // next packet that does emit them from silently paying full width.
     (DevOp::GemmC5Fp8, RowField::Rows(0)),
     (DevOp::GemmSplitK, RowField::Rows(0)),
-    (DevOp::GemmFp8Mx, RowField::Rows(0)),
     (DevOp::PerLayerInput, RowField::Rows(0)),
     (DevOp::GluStrided, RowField::Rows(0)),
     (DevOp::FlashMlaPrefill, RowField::Rows(4)),
