@@ -256,6 +256,12 @@ impl ReplyGuard {
         }
     }
 
+    /// Nothing has been said so far and no call was made: [`Self::finish`] would answer the
+    /// fallback line.
+    pub fn silent(&self, calls: bool) -> bool {
+        !self.spoke && !calls && self.line.trim().is_empty()
+    }
+
     /// End of the answer. `calls`: the turn made tool calls (no fallback then). Returns the
     /// fallback line's kind when the turn had nothing to say and a line was configured.
     pub fn finish(&mut self, calls: bool, r: &mut String, c: &mut String) -> Option<Fallback> {

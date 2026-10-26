@@ -614,7 +614,8 @@ async fn chat_completions_with(
     let asked = think_budget.filter(|&b| b > 0);
     let stop_blank = defaults.is_some_and(|d| d.reply_stop_blank_line);
     let live = thinking && defaults.is_some_and(|d| d.live_reasoning_end);
-    if asked.is_some() || reply_cap.is_some() || stop_blank || live {
+    let steer = thinking && defaults.is_some_and(|d| d.steers());
+    if asked.is_some() || reply_cap.is_some() || stop_blank || live || steer {
         let field = if asked.is_some() {
             "thinking_token_budget"
         } else {
@@ -652,7 +653,7 @@ async fn chat_completions_with(
         };
         let budget = asked.filter(|_| thinking);
         // Thinking off for this request leaves a budget nothing to bound.
-        if budget.is_some() || reply_cap.is_some() || stop_blank || live {
+        if budget.is_some() || reply_cap.is_some() || stop_blank || live || steer {
             let end = req
                 .reasoning_end
                 .as_deref()
@@ -671,6 +672,14 @@ async fn chat_completions_with(
                     grace: defaults.map_or(0, |d| d.newline_grace),
                     stop_blank_line: stop_blank,
                     live: live.then(|| crate::serve::think::live_register(&ids.request)),
+                    spec_forced: defaults.is_some_and(|d| d.spec_forced_end),
+                    // Validated at startup: every steering text is one token.
+                    bias: match defaults.filter(|_| steer) {
+                        Some(d) => d
+                            .bias(bundle.tokenizer().as_ref(), &gen.params.logit_bias)
+                            .unwrap_or_default(),
+                        None => Default::default(),
+                    },
                 },
                 reasoning_open,
             )));
@@ -746,6 +755,28 @@ async fn chat_completions_with(
             report,
         )
     });
+    let regen = defaults
+        .filter(|d| d.reply_regenerate && d.reply_guard.is_some() && mm_contract.is_none())
+        .and_then(|_| {
+            let close = reasoning_mode.close_marker()?;
+            let mut gen = crate::serve::GenParams {
+                max_tokens: reply_cap.map_or(gen.max_tokens, |c| c as usize),
+                params: gen.params.clone(),
+                stop: gen.stop.clone(),
+                seed: gen.seed,
+                stop_token_ids: gen.stop_token_ids.clone(),
+                keep_special_tokens: true,
+                ..Default::default()
+            };
+            gen.params.logprobs = None;
+            Some(Regen {
+                mux: mux.clone(),
+                bundle: Arc::clone(&bundle),
+                prompt: prompt.clone(),
+                close,
+                gen,
+            })
+        });
     let job = crate::serve::mux::Job {
         prompt_ids,
         gen,
@@ -836,6 +867,7 @@ async fn chat_completions_with(
             lp_fmt,
             tool_stream,
             guard,
+            regen,
             run,
             tally,
         );
@@ -854,6 +886,7 @@ async fn chat_completions_with(
             lp_fmt,
             tool_stream,
             guard,
+            regen,
             run,
             tally,
         )
@@ -1209,6 +1242,7 @@ async fn buffer_and_reply(
     lp_fmt: Option<crate::serve::logprobs::TokenText>,
     mut tools: Option<crate::serve::tools::stream::ToolStream>,
     mut guard: Option<crate::serve::reply_guard::ReplyGuard>,
+    regen: Option<Regen>,
     mut run: crate::serve::turns::StageRun,
     mut tally: crate::obs::serving::ReasoningTally,
 ) -> Response {
@@ -1342,6 +1376,18 @@ async fn buffer_and_reply(
             g.note_reasoning();
         }
         g.push(&answer, &mut reasoning_buf, &mut answer_buf);
+        if g.silent(!calls.is_empty()) {
+            if let Some((more, n)) = match &regen {
+                Some(r) => r.reply(&text).await,
+                None => None,
+            } {
+                g.push(&more, &mut reasoning_buf, &mut answer_buf);
+                if let Some(u) = usage.as_mut() {
+                    u.completion_tokens += n as u64;
+                    u.total_tokens += n as u64;
+                }
+            }
+        }
         let fallback = g.finish(!calls.is_empty(), &mut reasoning_buf, &mut answer_buf);
         tally.guarded(g, fallback);
     }
@@ -1401,6 +1447,63 @@ async fn buffer_and_reply(
     .into_response();
     run.stamp(&mut response);
     response
+}
+
+/// 7.9: one more generation for a guarded turn left with nothing to say: the prompt, the turn's
+/// trace up to its first close (the close appended when it never closed), and a reply capped at
+/// `max_reply_tokens`.
+struct Regen {
+    mux: crate::serve::mux::ModelMux,
+    bundle: Arc<crate::asset::ModelBundle>,
+    prompt: String,
+    close: &'static str,
+    gen: crate::serve::GenParams,
+}
+
+impl Regen {
+    /// The new reply's answer text and its token count; `None` when the dispatcher refused it.
+    async fn reply(&self, generated: &str) -> Option<(String, usize)> {
+        let mut prompt = self.prompt.clone();
+        match generated.find(self.close) {
+            Some(i) => prompt.push_str(&generated[..i + self.close.len()]),
+            None => {
+                prompt.push_str(generated);
+                prompt.push_str(self.close);
+            }
+        }
+        let (tx, mut rx) = stream_mod::channel();
+        let job = crate::serve::mux::Job {
+            prompt_ids: self.bundle.tokenizer().encode(&prompt),
+            gen: self.gen.clone(),
+            arrived: std::time::Instant::now(),
+            respond: tx,
+            opts: Default::default(),
+        };
+        self.mux.submit_wait(job).await.ok()?;
+        let mut text = String::new();
+        let mut n = 0;
+        while let Some(chunk) = rx.recv().await {
+            match chunk {
+                StreamChunk::Token { text: t, .. } => {
+                    text.push_str(&t);
+                    n += 1;
+                }
+                StreamChunk::Done { .. } => break,
+                StreamChunk::Err(_) => return None,
+            }
+        }
+        // The reply may open another trace: split it off, then drop the remaining framing.
+        let mut split =
+            crate::serve::reasoning::ReasoningSplit::new(self.bundle.reasoning(), false);
+        if self.bundle.reasoning_in_specials() {
+            split.allow_reentry();
+        }
+        let (_, mut answer) = (String::new(), String::new());
+        let mut trace = String::new();
+        split.push_into(&text, &mut trace, &mut answer);
+        split.finish_into(&mut trace, &mut answer);
+        Some((self.bundle.special_text().strip(&answer), n))
+    }
 }
 
 /// One response step through the reply guard; `r` / `c` hold the step's reasoning and content.
@@ -1500,6 +1603,7 @@ fn sse_response(
     lp_fmt: Option<crate::serve::logprobs::TokenText>,
     tools: Option<crate::serve::tools::stream::ToolStream>,
     guard: Option<crate::serve::reply_guard::ReplyGuard>,
+    regen: Option<Regen>,
     run: crate::serve::turns::StageRun,
     tally: crate::obs::serving::ReasoningTally,
 ) -> Response {
@@ -1531,6 +1635,9 @@ fn sse_response(
         /// The guard's reasoning and content for the current step.
         gr: String,
         gc: String,
+        regen: Option<Regen>,
+        /// The generation's text, kept only for `regen`.
+        raw: String,
     }
     let body = stream::unfold(
         SseState {
@@ -1551,6 +1658,8 @@ fn sse_response(
             guard,
             gr: String::new(),
             gc: String::new(),
+            regen,
+            raw: String::new(),
         },
         move |mut st| {
             async move {
@@ -1609,6 +1718,9 @@ fn sse_response(
                                 crate::obs::host::first_frame(n_prompt, t_arrive.elapsed());
                             }
                         }
+                        if st.regen.is_some() {
+                            st.raw.push_str(&text);
+                        }
                         let frame = match st.tools.as_mut() {
                             Some(ts) => {
                                 let step = ts.push(&text);
@@ -1660,15 +1772,19 @@ fn sse_response(
                         };
                         (frame, false)
                     }
-                    StreamChunk::Done { reason, usage, .. } if st.tools.is_some() => {
+                    StreamChunk::Done {
+                        reason, mut usage, ..
+                    } if st.tools.is_some() => {
                         let ts = st.tools.as_mut().expect("checked");
-                        let s = ts.finish(!matches!(reason, stream_mod::FinishReason::Stop));
-                        let s = match st.guard.as_mut() {
-                            Some(g) => guard_step(g, s, &mut st.gr, &mut st.gc),
-                            None => s,
+                        let tail = {
+                            let s = ts.finish(!matches!(reason, stream_mod::FinishReason::Stop));
+                            let s = match st.guard.as_mut() {
+                                Some(g) => guard_step(g, s, &mut st.gr, &mut st.gc),
+                                None => s,
+                            };
+                            (!s.is_empty(st.include_reasoning))
+                                .then(|| s.frame(&st.head, None, None, st.include_reasoning, None))
                         };
-                        let tail = (!s.is_empty(st.include_reasoning))
-                            .then(|| s.frame(&st.head, None, None, st.include_reasoning, None));
                         if let Some(e) = ts.error() {
                             tracing::warn!(model = %st.model, error = %e, "chat: tool call failed validation");
                             st.done = true;
@@ -1683,6 +1799,15 @@ fn sse_response(
                         let mut frames: Vec<Bytes> = tail.into_iter().collect();
                         if let Some(g) = st.guard.as_mut() {
                             let (mut r, mut c) = (String::new(), String::new());
+                            if g.silent(ts.calls() > 0) {
+                                if let Some((more, n)) = match &st.regen {
+                                    Some(re) => re.reply(&st.raw).await,
+                                    None => None,
+                                } {
+                                    g.push(&more, &mut r, &mut c);
+                                    usage.completion_tokens += n;
+                                }
+                            }
                             let fallback = g.finish(ts.calls() > 0, &mut r, &mut c);
                             st.tally.guarded(g, fallback);
                             if !c.is_empty() || (st.include_reasoning && !r.is_empty()) {
@@ -1743,7 +1868,9 @@ fn sse_response(
                         st.queued.extend(frames);
                         (first, true)
                     }
-                    StreamChunk::Done { reason, usage, .. } => {
+                    StreamChunk::Done {
+                        reason, mut usage, ..
+                    } => {
                         // FLUSH. Whatever the splitter still holds belongs to
                         // this generation; abandoning it truncated the streamed
                         // `reasoning_content` against the buffered path.
@@ -1752,6 +1879,15 @@ fn sse_response(
                         if let Some(g) = st.guard.as_mut() {
                             let (r, c) = guard_owned(g, flushed_r, flushed_c);
                             let (mut r, mut c) = (r.unwrap_or_default(), c.unwrap_or_default());
+                            if g.silent(false) {
+                                if let Some((more, n)) = match &st.regen {
+                                    Some(re) => re.reply(&st.raw).await,
+                                    None => None,
+                                } {
+                                    g.push(&more, &mut r, &mut c);
+                                    usage.completion_tokens += n;
+                                }
+                            }
                             let fallback = g.finish(false, &mut r, &mut c);
                             st.tally.guarded(g, fallback);
                             flushed_r = (!r.is_empty()).then_some(r);

@@ -98,6 +98,67 @@ pub struct ChatDefaults {
     /// [`crate::serve::think::LIVE_CHAIN`] tokens.
     #[serde(default)]
     pub live_reasoning_end: bool,
+    /// Host-logit steering (CUDA engine; `serve::think::ThinkBias`). Biases by token text on the
+    /// first two reply tokens, each text a single token.
+    #[serde(default)]
+    pub reply_first_bias: std::collections::BTreeMap<String, f32>,
+    /// −100 on the open marker while replying.
+    #[serde(default)]
+    pub ban_reopen: bool,
+    /// A rising bias on the close marker at line ends over a block's last `tokens` budget tokens.
+    pub close_ramp: Option<CloseRamp>,
+    /// Close a block at a line end when the close marker's logit ranks below this.
+    pub early_exit_rank: Option<u32>,
+    /// With `reply_guard`: a turn left with nothing to say is generated once more from its own
+    /// trace, closed, before the fallback line is used.
+    #[serde(default)]
+    pub reply_regenerate: bool,
+    /// With `PLOW_SPEC`: a forced `reasoning_end` rides speculative verifies as the row's
+    /// drafts, several forced ids per tick instead of one.
+    #[serde(default)]
+    pub spec_forced_end: bool,
+}
+
+#[derive(Clone, Copy, Debug, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CloseRamp {
+    pub tokens: u32,
+    pub bias: f32,
+}
+
+impl ChatDefaults {
+    /// Any host-logit steering rule is set.
+    pub fn steers(&self) -> bool {
+        !self.reply_first_bias.is_empty()
+            || self.ban_reopen
+            || self.close_ramp.is_some()
+            || self.early_exit_rank.is_some()
+    }
+
+    /// The steering rules over the request's own `logit_bias`; `None` if a text is not one token.
+    pub fn bias(
+        &self,
+        tok: &dyn crate::text::tokenizer::Tokenize,
+        base: &[(u32, f32)],
+    ) -> Result<crate::serve::think::ThinkBias, String> {
+        let reply_first = self
+            .reply_first_bias
+            .iter()
+            .map(
+                |(text, &b)| match tok.encode_with_special_tokens(text, false)[..] {
+                    [id] => Ok((id, b)),
+                    ref ids => Err(format!("{text:?} is not a single token ({ids:?})")),
+                },
+            )
+            .collect::<Result<_, _>>()?;
+        Ok(crate::serve::think::ThinkBias {
+            base: base.to_vec(),
+            reply_first,
+            ban_reopen: self.ban_reopen,
+            close_ramp: self.close_ramp.map(|r| (r.tokens, r.bias)),
+            early_exit_rank: self.early_exit_rank,
+        })
+    }
 }
 
 /// Why a thinking-control value cannot apply to a model with these markers.
@@ -157,6 +218,9 @@ pub fn load_chat_defaults(
                 ));
             }
         }
+        if d.reply_regenerate && d.reply_guard.is_none() {
+            return Err(bad("reply_regenerate", "set without `reply_guard`".into()));
+        }
         if d.reply_guard_lines.is_some() && d.reply_guard.is_none() {
             return Err(bad("reply_guard_lines", "set without `reply_guard`".into()));
         }
@@ -164,6 +228,27 @@ pub fn load_chat_defaults(
             bundle
                 .think_markers()
                 .map_err(|e| bad("reply_stop_blank_line", e))?;
+        }
+        if d.steers() {
+            if !cfg!(feature = "cuda") {
+                return Err(bad(
+                    "reply_first_bias",
+                    "host-logit steering needs the CUDA engine (other engines never hand the \
+                     host a logit row)"
+                        .into(),
+                ));
+            }
+            bundle
+                .think_markers()
+                .map_err(|e| bad("reply_first_bias", e))?;
+            d.bias(bundle.tokenizer().as_ref(), &[])
+                .map_err(|e| bad("reply_first_bias", e))?;
+            if d.close_ramp.is_some() && d.thinking_token_budget.is_none_or(|b| b <= 0) {
+                return Err(bad(
+                    "close_ramp",
+                    "needs a `thinking_token_budget` to ramp toward".into(),
+                ));
+            }
         }
         if d.live_reasoning_end {
             bundle

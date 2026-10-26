@@ -1088,6 +1088,12 @@ impl Slot {
 
     /// Tokens a chained decode path may produce for this row before the host must see one
     /// ([`crate::serve::think::ThinkCtl::chain_left`]).
+    /// [`crate::serve::think::ThinkCtl::forced_ahead`].
+    #[cfg_attr(not(feature = "cuda"), allow(dead_code))]
+    fn forced_drafts(&self) -> Option<&[u32]> {
+        self.gen.think.as_ref().and_then(|t| t.forced_ahead())
+    }
+
     #[cfg_attr(not(any(feature = "cuda", feature = "hsa")), allow(dead_code))]
     fn chain_left(&self) -> usize {
         self.gen
@@ -8005,7 +8011,20 @@ fn gpu_finish_token(
             || p.frequency_penalty != 0.0
             || !p.logit_bias.is_empty();
         // Greedy logprobs rows keep the device argmax (same bf16 row, same lowest-id tie-break).
-        let tok = if p.is_greedy() && !adjusted {
+        // `early_exit_rank`: at a trace line end, close when the marker ranks high enough. This
+        // runs on a plain host-fed step only, so the choice is the sampled token, not a replacement.
+        let close_now = slot
+            .gen
+            .think
+            .as_ref()
+            .and_then(|t| t.probe_close())
+            .filter(|&(c, r)| {
+                let at = logits[c as usize];
+                (logits.iter().filter(|&&x| x > at).count() as u32) < r
+            });
+        let tok = if let Some((close, _)) = close_now {
+            close
+        } else if p.is_greedy() && !adjusted {
             argmax_tok
         } else {
             let raw = (stats.is_some() && adjusted).then(|| logits.clone());
@@ -8556,6 +8575,13 @@ fn gpu_spec_caps(
             caps.push(0);
             continue;
         };
+        let room = e.max_ctx().saturating_sub(e.slot_pos(i) + 1);
+        // A forcing row drafts its forced ids (`spec_forced_end`); they need no drafter state.
+        if let Some(f) = s.forced_drafts().filter(|_| gpu_spec_drafts(&s.gen.params)) {
+            let left = s.gen.max_tokens.max(1).saturating_sub(s.step + 1);
+            caps.push((kmax as usize).min(f.len()).min(left).min(room) as u32);
+            continue;
+        }
         let left = s
             .gen
             .max_tokens
@@ -8563,7 +8589,6 @@ fn gpu_spec_caps(
             .saturating_sub(s.step)
             .min(s.chain_left())
             .saturating_sub(1);
-        let room = e.max_ctx().saturating_sub(e.slot_pos(i) + 1);
         let cap = if gpu_spec_drafts(&s.gen.params) && (!ready || e.spec_draft_ready(i)) {
             let kmax = if gpu_spec_draftable(&s.gen.params) {
                 kmax
@@ -8681,15 +8706,26 @@ fn gpu_spec_tick(
             gpu_spec_drafts(&s.gen.params).then(|| gpu_spec_draw(e, s))
         })
         .collect();
+    let mut fixed = Vec::new();
     let rows: Vec<SpecRow> = feeds
         .iter()
         .zip(&ks)
         .zip(&draws)
-        .map(|((&(slot, token), &k), d)| SpecRow {
-            slot,
-            token,
-            k,
-            draw: d.unwrap_or(crate::exec::gpu::spec::SpecDraw::Argmax),
+        .map(|((&(slot, token), &k), d)| {
+            let forced = slots[slot]
+                .as_ref()
+                .and_then(Slot::forced_drafts)
+                .filter(|f| k > 0 && d.is_some() && f.len() >= k as usize);
+            if let Some(f) = forced {
+                fixed.extend_from_slice(&f[..k as usize]);
+            }
+            SpecRow {
+                slot,
+                token,
+                k,
+                draw: d.unwrap_or(crate::exec::gpu::spec::SpecDraw::Argmax),
+                fixed: forced.is_some(),
+            }
         })
         .collect();
     let mut out = SpecTick::default();
@@ -8699,7 +8735,7 @@ fn gpu_spec_tick(
         prior: Vec::new(),
         host_draws: None,
     };
-    if let Err(err) = e.spec_tick(&rows, stop, Some(&mut sampler), &mut out) {
+    if let Err(err) = e.spec_tick(&rows, &fixed, stop, Some(&mut sampler), &mut out) {
         // A refusal that committed nothing leaves every slot as it was: the plain path serves the tick.
         if matches!(err, crate::RuntimeError::Rejected(_)) && out.committed == 0 {
             tracing::warn!(error = %err, "spec tick refused; plain step");
@@ -8819,6 +8855,14 @@ fn gpu_spec_riders(
     }
     let dev = e.dev_sample_enabled();
     for (&(i, _), cap) in feeds.iter().zip(caps.iter_mut()) {
+        // Riders draft with the device drafter; a forcing row's drafts must be its forced ids.
+        if slots[i]
+            .as_ref()
+            .is_some_and(|s| s.forced_drafts().is_some())
+        {
+            *cap = 0;
+            continue;
+        }
         let device = slots[i].as_ref().is_some_and(|s| {
             s.gen.params.logprobs.is_none()
                 && (gpu_spec_draftable(&s.gen.params) || (dev && dev_row_spec(s, false).is_some()))
@@ -9083,6 +9127,10 @@ fn handle_produced_token(
     };
     if let Some(t) = slot.gen.think.as_mut() {
         t.arm(&slot.out_ids, slot.read_offset < slot.out_ids.len());
+        // Steering rides the next sample's `logit_bias`; a biased step samples on the host.
+        if t.steering() {
+            t.next_bias(&mut slot.gen.params.logit_bias);
+        }
     }
 
     // OPENAI `stop` STRINGS. The request field was not parsed at all before, so
@@ -11229,6 +11277,8 @@ mod tests {
                 grace: 0,
                 stop_blank_line: false,
                 live: None,
+                bias: Default::default(),
+                spec_forced: false,
             },
             true,
         )));
@@ -11269,6 +11319,49 @@ mod tests {
                 guard_moved: false
             })
         );
+    }
+
+    /// Steering lands in the slot's `logit_bias` for the next sample, over the request's own.
+    #[test]
+    fn steering_sets_the_next_samples_logit_bias() {
+        use crate::serve::think::{ThinkBias, ThinkCtl, ThinkLimits, ThinkMarkers};
+        let bundle = prefill_test_bundle("think-steer");
+        let (mut slot, _rx) = prefill_test_slot();
+        let s = slot.as_mut().unwrap();
+        s.gen.max_tokens = 64;
+        s.gen.params.logit_bias = vec![(42, 1.0)];
+        s.gen.think = Some(Box::new(ThinkCtl::new(
+            Arc::new(ThinkMarkers {
+                open: u32::from(b'{'),
+                close: u32::from(b'}'),
+                newline: vec![u32::from(b'\n')],
+            }),
+            ThinkLimits {
+                forced_end: [u32::from(b'}')].into(),
+                bias: ThinkBias {
+                    base: vec![(42, 1.0)],
+                    ban_reopen: true,
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+            true,
+        )));
+        let mut tokens = 0;
+        for b in *b"a}" {
+            handle_produced_token(
+                &mut slot,
+                &None,
+                &bundle,
+                u32::from(b),
+                1,
+                &mut tokens,
+                Some(&[]),
+            );
+        }
+        let bias = &slot.as_ref().unwrap().gen.params.logit_bias;
+        assert_eq!(bias, &[(42, 1.0), (u32::from(b'{'), -100.0)]);
+        assert!(slot.as_ref().unwrap().gen.params.needs_host_logits());
     }
 
     /// `reply_stop_blank_line`: a blank line after reply text ends the request there, as a stop.

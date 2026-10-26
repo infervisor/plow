@@ -68,6 +68,8 @@ fn tokenizer_json() -> Value {
 struct Script {
     prompts: Vec<String>,
     reply: Vec<String>,
+    /// Replies for the next jobs, before `reply`.
+    queue: std::collections::VecDeque<Vec<String>>,
 }
 
 struct Harness {
@@ -136,7 +138,7 @@ fn harness_for(fixture: &str) -> Harness {
                 .decode_append(&job.prompt_ids, true, &mut text);
             let mut s = s.lock().unwrap();
             s.prompts.push(text);
-            s.reply.clone()
+            s.queue.pop_front().unwrap_or_else(|| s.reply.clone())
         }),
     );
     Harness {
@@ -1103,4 +1105,60 @@ async fn live_reasoning_end_finds_only_requests_in_flight() {
         .await;
     assert_eq!(code, StatusCode::NOT_FOUND, "{v}");
     assert_eq!(v["error"]["code"], "request_not_found");
+}
+
+/// `reply_regenerate`: a guarded turn left silent is generated once more from its own trace,
+/// closed, and that reply is the answer; the fallback line only when it is silent too.
+#[tokio::test]
+async fn a_silent_guarded_turn_is_regenerated_from_its_trace() {
+    let h = harness_for("gemma4-12b");
+    h.bundle
+        .serving()
+        .chat
+        .set(crate::serve::config::ChatDefaults {
+            reply_guard: Some(crate::serve::reply_guard::GuardMode::Voice),
+            reply_regenerate: true,
+            reply_guard_lines: Some(crate::serve::reply_guard::GuardLines {
+                wait: [("hi".to_string(), "एक सेकंड।".to_string())].into(),
+                goodbye: Default::default(),
+            }),
+            chat_template_kwargs: Some(
+                [("enable_thinking".to_string(), json!(true))]
+                    .into_iter()
+                    .collect(),
+            ),
+            ..Default::default()
+        })
+        .unwrap();
+    let silent: Vec<String> = toks("<|channel>thought\nplan<channel|>None.\n");
+    let retry = toks("Aap kaun hain?");
+    for stream in [false, true] {
+        {
+            let mut s = h.script.lock().unwrap();
+            s.queue = [silent.clone(), retry.clone()].into();
+        }
+        let body = json!({"messages": user("hi")});
+        let content = if stream {
+            accumulate(&h.sse(body).await.0).0
+        } else {
+            h.json(body).await.1["choices"][0]["message"]["content"]
+                .as_str()
+                .unwrap()
+                .to_string()
+        };
+        assert_eq!(content, "Aap kaun hain?", "stream {stream}");
+        assert!(
+            h.last_prompt()
+                .ends_with("<|turn>model\n<|channel>thought\nplan<channel|>"),
+            "{}",
+            h.last_prompt()
+        );
+    }
+    // silent again: the fallback line
+    {
+        let mut s = h.script.lock().unwrap();
+        s.queue = [silent.clone(), toks("None.")].into();
+    }
+    let (_, v) = h.json(json!({"messages": user("hi")})).await;
+    assert_eq!(v["choices"][0]["message"]["content"], "एक सेकंड।");
 }

@@ -505,9 +505,31 @@ echoed on its response) answers 200 while the request is in flight under thinkin
 multi-step quantum, speculative verify) is capped at that length so the forced ids never land
 inside a chain.
 
+`"reply_regenerate": true` (with the guard): a turn left with nothing to say is generated once
+more from its own trace (up to its first close, the close appended if it never closed), its reply
+capped at `max_reply_tokens`, before the fallback line is used; the extra tokens count in `usage`.
+
+`"spec_forced_end": true` (with `PLOW_SPEC`): while a block's end is forced, a speculative tick
+verifies the remaining forced ids as the row's drafts instead of decoding them one per step. The
+target's accepted drafts are the forced ids themselves and only the span's last token is replaced,
+so every committed id is the one the verify consumed.
+
+Host-logit steering (CUDA engine only; each biased step samples on the host and leaves the device
+fast paths, startup refuses the keys elsewhere), each opt-in and an experiment to be kept only on
+a measured improvement:
+
+| Key | Effect |
+|---|---|
+| `reply_first_bias` | `{"<token text>": bias}` on the first two reply tokens, each text a single token (e.g. `{"*": -10, "Wait": -10}`) |
+| `ban_reopen` | −100 on the open marker while replying (a re-opened block is already handled; this removes it) |
+| `close_ramp` | `{"tokens": K, "bias": B}`: at line ends over a block's last K budget tokens, a bias on the close marker rising to B (needs a budget) |
+| `early_exit_rank` | at a line end inside a trace, close the block when the close marker's logit ranks below N; such a request's trace decodes one host-fed token per step |
+
 GPU soundness gates for all of the above (byte-identical output across the chained decode paths
 under forcing, seeded reproducibility, no-budget TPOT): `scripts/bench/thinking_gates.sh`, run
-through `scripts/bench/gpuq.py`.
+through `scripts/bench/gpuq.py`. The stress comparison (strict and judged leaks, `finish=length`,
+longest reply, p50/p90 first answer, forced %, answer-reasoning %, per endpoint and request
+variant, e.g. bridge wordings): `scripts/bench/thinking_stress.py`.
 
 ## 5. The catalogue, usage and metrics
 

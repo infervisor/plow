@@ -91,6 +91,32 @@ impl ThinkMarkers {
     }
 }
 
+/// Host-logit steering (CUDA). A step that carries a bias samples on the host, so it leaves the
+/// device fast paths for that step; each rule is opt-in per model.
+#[derive(Clone, Debug, Default)]
+pub struct ThinkBias {
+    /// The request's own `logit_bias`, kept under the steering entries.
+    pub base: Vec<(u32, f32)>,
+    /// Added to these ids for the first two reply tokens (no reply opening with `*`, `Wait`, …).
+    pub reply_first: Vec<(u32, f32)>,
+    /// −100 on the open marker while replying.
+    pub ban_reopen: bool,
+    /// `(k, max)`: at line ends over a block's last `k` budget tokens, a bias on the close marker
+    /// rising to `max`.
+    pub close_ramp: Option<(u32, f32)>,
+    /// At line ends inside a trace, close the block when the close marker's logit ranks below this.
+    pub early_exit_rank: Option<u32>,
+}
+
+impl ThinkBias {
+    fn on(&self) -> bool {
+        !self.reply_first.is_empty()
+            || self.ban_reopen
+            || self.close_ramp.is_some()
+            || self.early_exit_rank.is_some()
+    }
+}
+
 /// What a request asks of the controller (request > model default).
 #[derive(Clone, Debug, Default)]
 pub struct ThinkLimits {
@@ -106,6 +132,9 @@ pub struct ThinkLimits {
     pub stop_blank_line: bool,
     /// Set from outside ([`live_end`]): end the current trace block within [`LIVE_CHAIN`] tokens.
     pub live: Option<Arc<AtomicBool>>,
+    pub bias: ThinkBias,
+    /// While forcing, a speculative tick verifies the forced ids as the row's drafts.
+    pub spec_forced: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -160,6 +189,8 @@ pub struct ThinkCtl {
     reply_nl: bool,
     /// The current block ends at this trace count (a live `reasoning_end`).
     cut: Option<u32>,
+    /// The last committed trace token ended a line.
+    line_end: bool,
 }
 
 impl ThinkCtl {
@@ -184,6 +215,7 @@ impl ThinkCtl {
             reply_spoke: false,
             reply_nl: false,
             cut: None,
+            line_end: false,
         }
     }
 
@@ -203,6 +235,7 @@ impl ThinkCtl {
             capped: false,
         };
         self.framing = true;
+        self.line_end = false;
         if let Some(i) = self.forcing {
             c.token = self.lim.forced_end[i];
             c.replaced = c.token != sampled;
@@ -226,6 +259,7 @@ impl ThinkCtl {
             Phase::Trace if sampled == self.m.close => self.phase = Phase::Reply,
             Phase::Trace => {
                 self.trace_n += 1;
+                self.line_end = self.m.ends_line(sampled);
                 if self
                     .lim
                     .live
@@ -247,6 +281,61 @@ impl ThinkCtl {
             }
         }
         c
+    }
+
+    /// With `spec_forced`, the forced ids still to commit, next first: a speculative tick drafts
+    /// them. Each accepted draft commits as itself and the span's last token is replaced as
+    /// usual, so every committed id equals the input the verify consumed.
+    pub fn forced_ahead(&self) -> Option<&[u32]> {
+        let i = self.forcing.filter(|_| self.lim.spec_forced)?;
+        Some(&self.lim.forced_end[i..])
+    }
+
+    /// Whether [`Self::next_bias`] has anything to say.
+    pub fn steering(&self) -> bool {
+        self.lim.bias.on()
+    }
+
+    /// The `logit_bias` for the next token: the request's own, then the steering rules that hold.
+    pub fn next_bias(&self, out: &mut Vec<(u32, f32)>) {
+        let b = &self.lim.bias;
+        out.clear();
+        out.extend_from_slice(&b.base);
+        if self.forcing.is_some() {
+            return;
+        }
+        match self.phase {
+            Phase::Reply => {
+                if self.reply_n < 2 {
+                    out.extend_from_slice(&b.reply_first);
+                }
+                if b.ban_reopen {
+                    out.push((self.m.open, -100.0));
+                }
+            }
+            Phase::Trace if self.line_end => {
+                if let (Some((k, max)), Some(budget)) = (b.close_ramp, self.lim.budget) {
+                    let start = budget.saturating_sub(k);
+                    if self.trace_n >= start && k > 0 {
+                        let step = (self.trace_n - start + 1).min(k);
+                        out.push((self.m.close, max * step as f32 / k as f32));
+                    }
+                }
+                if b.early_exit_rank.is_some() && !out.iter().any(|&(t, _)| t == self.m.close) {
+                    // A zero bias: the step samples on the host, where `probe_close` reads the row.
+                    out.push((self.m.close, 0.0));
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// `(close id, rank)` when this step should close the block if the close marker's logit ranks
+    /// below `rank` (a line end inside a trace, `early_exit_rank` set). The host sampler asks.
+    pub fn probe_close(&self) -> Option<(u32, u32)> {
+        let r = self.lim.bias.early_exit_rank?;
+        (self.phase == Phase::Trace && self.line_end && self.forcing.is_none())
+            .then_some((self.m.close, r))
     }
 
     /// With `stop_blank_line`: the committed reply token's text; the byte offset in it where a
@@ -289,7 +378,11 @@ impl ThinkCtl {
     /// How many tokens a chained path may produce before the host must see one: a replacement
     /// can only land on the last of them. `usize::MAX` when nothing can be replaced.
     pub fn chain_left(&self) -> usize {
-        if self.forcing.is_some() || self.due {
+        // `early_exit_rank` may close at any line end of a trace: every trace token is host-fed.
+        if self.forcing.is_some()
+            || self.due
+            || (self.phase == Phase::Trace && self.lim.bias.early_exit_rank.is_some())
+        {
             return 1;
         }
         let n = match (self.lim.budget, self.phase) {
@@ -352,6 +445,8 @@ mod tests {
                 grace,
                 stop_blank_line: false,
                 live: None,
+                bias: ThinkBias::default(),
+                spec_forced: false,
             },
             opened,
         )
@@ -474,6 +569,83 @@ mod tests {
         assert_eq!(t.forced, 1);
         drop(t);
         assert!(!live_end("req-live-1"), "gone with its controller");
+    }
+
+    #[test]
+    fn steering_biases_follow_the_phase() {
+        let mut t = ctl(Some(6), None, &[CLOSE], 0, true);
+        t.lim.bias = ThinkBias {
+            base: vec![(42, 1.0)],
+            reply_first: vec![(50, -10.0)],
+            ban_reopen: true,
+            close_ramp: Some((2, 6.0)),
+            early_exit_rank: Some(3),
+        };
+        let mut b = Vec::new();
+        let step = |t: &mut ThinkCtl, s: u32, b: &mut Vec<(u32, f32)>| {
+            t.commit(s);
+            t.next_bias(b);
+            b.clone()
+        };
+        assert_eq!(
+            step(&mut t, 1, &mut b),
+            [(42, 1.0)],
+            "mid-line: the request's own"
+        );
+        assert_eq!(
+            step(&mut t, NL, &mut b),
+            [(42, 1.0), (CLOSE, 0.0)],
+            "a line end probes"
+        );
+        assert_eq!(t.probe_close(), Some((CLOSE, 3)));
+        assert_eq!(step(&mut t, 1, &mut b), [(42, 1.0)]);
+        assert_eq!(t.probe_close(), None);
+        assert_eq!(
+            step(&mut t, NL, &mut b),
+            [(42, 1.0), (CLOSE, 3.0)],
+            "the ramp starts"
+        );
+        assert_eq!(step(&mut t, NL, &mut b), [(42, 1.0), (CLOSE, 6.0)]);
+        t.commit(CLOSE);
+        t.next_bias(&mut b);
+        assert_eq!(
+            b,
+            [(42, 1.0), (50, -10.0), (OPEN, -100.0)],
+            "first reply tokens"
+        );
+        assert_eq!(t.probe_close(), None);
+        step(&mut t, 5, &mut b);
+        assert_eq!(step(&mut t, 6, &mut b), [(42, 1.0), (OPEN, -100.0)]);
+        assert!(t.steering());
+        assert!(!ctl(Some(4), None, &[CLOSE], 0, true).steering());
+        let mut t = ctl(Some(64), None, &[CLOSE], 0, true);
+        t.lim.bias.early_exit_rank = Some(1);
+        assert_eq!(
+            t.chain_left(),
+            1,
+            "an early exit can land on any trace token"
+        );
+    }
+
+    /// The verify's span for a forcing row: `[pending, forced ids…]`. Whatever the target accepts
+    /// commits as the forced ids; the correction token is replaced by the next forced id.
+    #[test]
+    fn forced_ids_drafted_through_a_verify_commit_as_forced() {
+        let forced = [7, 8, 9, CLOSE];
+        let mut t = ctl(Some(1), None, &forced, 0, true);
+        t.lim.spec_forced = true;
+        t.commit(1);
+        t.arm(&[1], false);
+        assert_eq!(t.forced_ahead(), Some(&forced[..]));
+        // the target accepts 7 and 8, then wants 5 where 9 was drafted
+        let emitted = [7, 8, 5];
+        let committed: Vec<u32> = emitted.iter().map(|&s| t.commit(s).token).collect();
+        assert_eq!(committed, [7, 8, 9]);
+        assert_eq!(t.forced_ahead(), Some(&[CLOSE][..]));
+        // all accepted, the bonus is the model's first reply token
+        assert_eq!(t.commit(CLOSE).token, CLOSE);
+        assert_eq!(t.forced_ahead(), None);
+        assert_eq!(t.commit(42).token, 42);
     }
 
     #[test]
