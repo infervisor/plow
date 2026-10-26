@@ -380,12 +380,12 @@ impl ServeManifest {
 }
 
 /// The tokenizer's `added_tokens` (`asset_dir`, its `checkpoint/`, then `checkpoint_dir`: the
-/// order the server loads `tokenizer.json` in, so the builder the compiler names is the one the
-/// server's own probe would have found in that vocabulary). The version-2 builder contract is
-/// bounded by this file: a marker is "one token" when it is an added token. A marker that the
-/// base vocabulary happens to encode as one id without being an added token names no builder
-/// here, and a checkpoint without `tokenizer.json` (served by the byte-fallback tokenizer, which
-/// the GPU engines refuse) has none.
+/// order the server loads `tokenizer.json` in, so compiler and server read the same file). The
+/// version-2 builder contract is bounded by this file: a marker is "one token" when it is an
+/// added token. A marker that the base vocabulary happens to encode as one id without being an
+/// added token names no builder here, and a checkpoint without `tokenizer.json` (served by the
+/// byte-fallback tokenizer, which the GPU engines refuse) has none. Agreement with the server's
+/// own encode probe is verified by the serve goldens on the production vocabularies.
 pub fn added_tokens(asset_dir: &Path, checkpoint_dir: &Path) -> Vec<String> {
     [
         asset_dir.join("tokenizer.json"),

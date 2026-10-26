@@ -187,8 +187,9 @@ fn a_declared_harmony_syntax_gets_its_parser_without_a_tool_request() {
     assert!(!with("none", "none-plain"));
 }
 
-/// Drive a generation through the response path a declared bundle gets: the tool stream when
-/// `response_stream` builds one, else the plain reasoning split, as `buffer_and_reply` does.
+/// Drive a generation through the response path a declared bundle gets, one push per piece as
+/// the chat handler pushes deltas: the tool stream when `response_stream` builds one, else the
+/// incremental reasoning split.
 fn respond(b: &ModelBundle, prompt: &str, pieces: &[&str]) -> (String, String) {
     let mode = b.reasoning();
     let opens = mode.prompt_opens(prompt);
@@ -207,8 +208,14 @@ fn respond(b: &ModelBundle, prompt: &str, pieces: &[&str]) -> (String, String) {
             (r, c)
         }
         None => {
-            let (r, c) = crate::serve::reasoning::split(mode, opens, &pieces.concat());
-            (r.unwrap_or_default(), c)
+            // The streaming handler's path: one `ReasoningSplit` fed per generation delta.
+            let mut split = crate::serve::reasoning::ReasoningSplit::new(mode, opens);
+            let (mut r, mut c) = (String::new(), String::new());
+            for p in pieces {
+                split.push_into(p, &mut r, &mut c);
+            }
+            split.finish_into(&mut r, &mut c);
+            (r, c)
         }
     }
 }
@@ -242,7 +249,8 @@ fn declared_syntaxes_drive_the_response_split() {
     );
     std::fs::remove_dir_all(dir).unwrap();
 
-    // `<think>` declared and left open by the template (Qwen): the close splits the trace.
+    // `<think>` declared and left open by the template (Qwen): the close, split across two
+    // pushes, ends the trace.
     let dir = bundle(
         "respond-think",
         &v2(ChatSpec {
@@ -261,12 +269,12 @@ fn declared_syntaxes_drive_the_response_split() {
     let prompt = chat_prompt(Some(&b), &user("q"), &RenderOpts::default()).unwrap();
     assert!(b.reasoning().prompt_opens(&prompt));
     assert_eq!(
-        respond(&b, &prompt, &["weighing it", " up</think>Four."]),
+        respond(&b, &prompt, &["weighing it up</thi", "nk>Four."]),
         ("weighing it up".into(), "Four.".into())
     );
     std::fs::remove_dir_all(dir).unwrap();
 
-    // A declared trace channel (Gemma 4's), opened by the template.
+    // A declared trace channel (Gemma 4's), opened by the template; the close split across pushes.
     let dir = bundle(
         "respond-channel",
         &v2(ChatSpec {
@@ -288,7 +296,6 @@ fn declared_syntaxes_drive_the_response_split() {
         respond(&b, &prompt, &["plan<chan", "nel|>Answer"]),
         ("plan".into(), "Answer".into())
     );
-    // The same declaration with `none`: nothing is split.
     std::fs::remove_dir_all(dir).unwrap();
 }
 
