@@ -13,7 +13,7 @@ schema = "plow.recipe.v1"
 namespace = "infervisor"
 name = "chatterbox"
 label = "sm90a-h100-tp1"
-plow_git = "1972fa37ac7a6f632cd5ece0b32fe37ab76eec75"
+plow_git = "9f16f1874f1eebe2231071cbf4f2d1874547448a"
 network = "llama"
 doc = "docs/runtime/tts.md"
 tracker = "docs/runtime/h100-speech-recipes.md"
@@ -51,7 +51,16 @@ env = { PYTHONPATH = "" }
 name = "s3gen-export"
 script = "scripts/tts/s3gen_export.py"
 python = "{env:CBX_PY}"
-args = ["{out}/prep/s3gen"]
+# Request-time cloning: 8 voice slots (prompts up to 250 tokens = 10 s), 3 prompt K/V caches
+# (~2.3 GB each) for cloned stream windows; the voice encoder (voice_cond.pkt) beside it.
+args = ["{out}/prep/s3gen", "--clone-slots", "8", "--prompt-max", "250", "--cache-slots", "3"]
+env = { PYTHONPATH = "" }
+
+[[prep]]
+name = "voice-cond-export"
+script = "scripts/tts/chatterbox_voice_export.py"
+python = "{env:CBX_PY}"
+args = ["{out}/prep/s3gen/voice"]
 env = { PYTHONPATH = "" }
 
 [emit]
