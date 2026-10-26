@@ -63,10 +63,72 @@ struct Seg {
 /// A boundary's blocks: `(class, first row, block)` in the order the segments are built.
 type Handle = Vec<(Class, u32, BlockId)>;
 
+/// The dependencies a publish took on its boundary's blocks while the publish is in flight:
+/// released when dropped (an early return, a failed copy), kept once [`Self::into_handle`]
+/// records the boundary. Dropped by an unwind the dependencies stay (a copy submitted before
+/// the panic may still write the blocks). Declared before the fill tokens of the same publish,
+/// so a drop fails the blocks first and releases them after.
+#[must_use = "dropping the set releases the dependencies"]
+struct Deps<'s> {
+    store: &'s KvStore,
+    handle: Handle,
+}
+
+impl<'s> Deps<'s> {
+    fn new(store: &'s KvStore, cap: usize) -> Self {
+        Deps {
+            store,
+            handle: Vec::with_capacity(cap),
+        }
+    }
+
+    fn push(&mut self, class: Class, row0: u32, id: BlockId) {
+        self.handle.push((class, row0, id));
+    }
+
+    /// The boundary is recorded: its handle owns the dependencies from here on.
+    fn into_handle(self) -> Handle {
+        let mut this = std::mem::ManuallyDrop::new(self);
+        std::mem::take(&mut this.handle)
+    }
+}
+
+impl Drop for Deps<'_> {
+    fn drop(&mut self) {
+        if !self.handle.is_empty() && !std::thread::panicking() {
+            let ids: Vec<BlockId> = self.handle.iter().map(|&(_, _, id)| id).collect();
+            self.store.release(&ids);
+        }
+    }
+}
+
 struct Table {
     host: PinnedHost,
-    dev: u64,
+    dev: TableDev,
     cap: usize,
+}
+
+/// A table's device half, allocated and freed through the pool's `VmmOps` (its `Oom` mapping
+/// and provenance record, which `Backend::alloc` lacks); freed once, when dropped.
+struct TableDev {
+    be: Arc<CudaBackend>,
+    va: u64,
+}
+
+impl TableDev {
+    fn alloc(be: &Arc<CudaBackend>, bytes: u64) -> Result<Self> {
+        let va = VmmOps::alloc(&**be, bytes)?;
+        Ok(TableDev {
+            be: Arc::clone(be),
+            va,
+        })
+    }
+}
+
+impl Drop for TableDev {
+    fn drop(&mut self) {
+        VmmOps::free(&*self.be, self.va);
+    }
 }
 
 #[derive(Clone, Debug, Default)]
@@ -98,7 +160,6 @@ pub struct BlockServeStats {
 }
 
 pub struct BlockServe {
-    be: Arc<CudaBackend>,
     store: Arc<KvStore>,
     /// Store class index per row class (`None` = the packet has no such rows).
     window: Option<usize>,
@@ -249,7 +310,6 @@ impl BlockServe {
             "kv store: armed"
         );
         Ok(Arc::new(BlockServe {
-            be: Arc::clone(be),
             store,
             window,
             tail,
@@ -326,9 +386,6 @@ impl Drop for BlockServe {
         // unproven.
         for hold in self.held.get_mut().drain(..).flatten() {
             hold.abandon();
-        }
-        for t in self.tables.get_mut().iter_mut().flatten() {
-            VmmOps::free(&*self.be, t.dev);
         }
     }
 }
@@ -455,16 +512,11 @@ impl GpuEngine {
             SEED_CHECK,
         );
         let plan = bs.plan(p_a, kv.geometry().window);
-        let mut handle: Handle = Vec::with_capacity(plan.len());
+        // On an error return `fills` drops first (the blocks fail), `deps` after (released).
+        let mut deps = Deps::new(&bs.store, plan.len());
         let mut fills: Vec<FillToken> = Vec::new();
         let mut segs: Vec<Seg> = Vec::new();
         let mut new_bytes = 0u64;
-        // The dropped tokens fail their blocks; the dependencies go after.
-        let abort = |handle: &Handle, fills: Vec<FillToken>| {
-            drop(fills);
-            let ids: Vec<BlockId> = handle.iter().map(|&(_, _, id)| id).collect();
-            bs.store.release(&ids);
-        };
         for (class, row0, key_index) in plan {
             let ci = bs.class_index(class);
             let key = crate::memory::kv_store::BlockKey {
@@ -484,13 +536,10 @@ impl GpuEngine {
                     {
                         continue
                     }
-                    Err(e) => {
-                        abort(&handle, fills);
-                        return Err(e);
-                    }
+                    Err(e) => return Err(e),
                 }
             };
-            handle.push((class, row0, acquired.id));
+            deps.push(class, row0, acquired.id);
             if let Some(token) = acquired.fill {
                 fills.push(token);
                 new_bytes += bs.store.class_spec(ci).block_bytes();
@@ -504,15 +553,13 @@ impl GpuEngine {
             let ts = std::time::Instant::now();
             let drained = self.be.stream_synchronize(&self.stream);
             sync_us = ts.elapsed().as_micros() as u64;
-            if let Err(e) = copied.and(drained) {
-                abort(&handle, fills);
-                return Err(e);
-            }
+            copied.and(drained)?;
         }
         let new_blocks = fills.len() as u64;
         for token in fills {
             token.seal();
         }
+        let handle = deps.into_handle();
         let id = bs.next_handle.fetch_add(1, Ordering::Relaxed);
         {
             let mut st = bs.stats.lock();
@@ -767,10 +814,8 @@ impl GpuEngine {
                 let host = self
                     .be
                     .host_alloc_pinned(cap * std::mem::size_of::<Seg>())?;
-                let dev = VmmOps::alloc(&*self.be, (cap * std::mem::size_of::<Seg>()) as u64)?;
-                if let Some(old) = tables[b].replace(Table { host, dev, cap }) {
-                    VmmOps::free(&*self.be, old.dev);
-                }
+                let dev = TableDev::alloc(&self.be, (cap * std::mem::size_of::<Seg>()) as u64)?;
+                tables[b] = Some(Table { host, dev, cap });
                 tables[b].as_mut().expect("just set")
             }
         };
@@ -784,11 +829,11 @@ impl GpuEngine {
         }
         VmmOps::copy_htod(
             &*self.be,
-            table.dev,
+            table.dev.va,
             table.host.as_ptr() as u64,
             bytes as u64,
         )?;
-        let mut table_ptr = table.dev;
+        let mut table_ptr = table.dev.va;
         let mut n = segs.len() as u32;
         let mut params = [
             &mut table_ptr as *mut u64 as *mut c_void,
@@ -901,5 +946,97 @@ mod tests {
     #[test]
     fn segment_layout_is_repr_c_24_bytes() {
         assert_eq!(std::mem::size_of::<Seg>(), 24);
+    }
+
+    /// Device slots only: enough for the dependency set.
+    struct SlotOps(AtomicU64);
+
+    impl crate::memory::kv_store::StoreOps for SlotOps {
+        fn alloc(&self, bytes: u64) -> Result<u64> {
+            Ok(self.0.fetch_add(bytes, Ordering::SeqCst))
+        }
+        fn free(&self, _va: u64) {}
+        fn host_alloc(&self, _bytes: u64) -> Result<u64> {
+            unreachable!("no host tier")
+        }
+        fn host_free(&self, _ptr: u64, _bytes: u64) {}
+        fn copy_dtoh_async(&self, _host: u64, _va: u64, _bytes: u64) -> Result<u64> {
+            unreachable!("no host tier")
+        }
+        fn fence_done(&self, _fence: u64) -> Result<bool> {
+            unreachable!("no copies")
+        }
+        fn copy_htod(&self, _va: u64, _host: u64, _bytes: u64) -> Result<()> {
+            unreachable!("no host tier")
+        }
+        fn copy_htod_async(&self, _va: u64, _host: u64, _bytes: u64) -> Result<u64> {
+            unreachable!("no host tier")
+        }
+        fn copy_dtod_batch(&self, _copies: &[(u64, u64, u64)]) -> Result<()> {
+            unreachable!("no compaction")
+        }
+        fn free_bytes(&self) -> Option<u64> {
+            None
+        }
+    }
+
+    fn two_block_store() -> KvStore {
+        KvStore::new(
+            Arc::new(SlotOps(AtomicU64::new(1 << 20))),
+            vec![ClassSpec {
+                name: "window",
+                row_bytes: 8,
+                rows_per_block: 4,
+            }],
+            32,
+            2 * 32,
+            0,
+        )
+    }
+
+    fn key(i: u64) -> crate::memory::kv_store::BlockKey {
+        crate::memory::kv_store::BlockKey {
+            namespace: 0,
+            chain: i,
+            check: i,
+        }
+    }
+
+    /// A dependency set dropped before the boundary is recorded releases its blocks (the slot
+    /// is reclaimable); `into_handle` keeps them for the boundary.
+    #[test]
+    fn deps_release_on_drop_and_into_handle_keeps_them() {
+        let s = two_block_store();
+        let a = {
+            let mut deps = Deps::new(&s, 1);
+            let a = s.acquire(0, key(1)).unwrap();
+            a.fill.expect("new block").seal();
+            deps.push(Class::Window, 0, a.id);
+            a.id
+        };
+        s.acquire(0, key(2))
+            .unwrap()
+            .fill
+            .expect("new block")
+            .seal();
+        assert!(s.acquire(0, key(3)).is_ok(), "a's slot was reclaimable");
+        assert_eq!(s.state(a), None, "a was released and reclaimed");
+
+        let s = two_block_store();
+        let mut deps = Deps::new(&s, 1);
+        let a = s.acquire(0, key(1)).unwrap();
+        a.fill.expect("new block").seal();
+        deps.push(Class::Window, 0, a.id);
+        let handle = deps.into_handle();
+        assert_eq!(handle.len(), 1);
+        s.acquire(0, key(2))
+            .unwrap()
+            .fill
+            .expect("new block")
+            .seal();
+        assert!(s.acquire(0, key(3)).is_err(), "both blocks referenced");
+        let ids: Vec<BlockId> = handle.iter().map(|&(_, _, id)| id).collect();
+        s.release(&ids);
+        assert!(s.acquire(0, key(3)).is_ok());
     }
 }
