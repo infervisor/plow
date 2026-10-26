@@ -116,6 +116,35 @@ default 0.0 margin, a gate-policy decision left open); gemma-4-12b (`cec0e7d5599
 gemma-4-e4b (`046539c8a8a75efa`) logit parity top1 0.9948, kl_max 0.0154 (slice-1 digits). Raw
 evidence: `kvstore-scratch/abi2-gates`, packet comparisons `kvstore-scratch/abi2-evidence.md`.
 
+Strict serving reports on the slice-2 binary (2026-10-26, bin31 = `ae17393f`; the later commits
+touch tests and recipes only): the plowrt arm of each production-pass strict grid rerun on the
+re-emitted version-2 packet, reported with `campaign.py report` against the production-pass vLLM
+0.29 arm (same grid, same box). gemma-4-26b-a4b FP8 (`caf6c4a47ba62a50`, host tier auto, prod mix,
+two runs): MATCHED + EQUIVALENT; 1.8/s tok/s 1.00x / 1.00x, TTFT P99 1.54x* / 0.96x*, TPOT P99
+1.27x* / 1.32x*; 2.7/s tok/s 1.00x / 1.00x, TTFT P99 2.75x* / 1.05x*, TPOT P99 2.13x* / 1.0x* (the
+production-pass run on bin23 read 1.04x / 0.82x at 1.8/s). Both bin31 runs carry the same ~1.3 s
+stall 250 s into the second 1.8/s cell (TTFT max 1292 ms, TPOT max 130 ms, then 35 decodes released
+at once) that the bin23 run lacks; the server log is silent through it (admission-rung churn only,
+no store, graph or Lt event). Runtime commits between the binaries on that path: the Qwen FP8
+decode ladder (`b403a5c1`, GEMV MMA slots in the arena) and the reclaim-queue class check
+(`be6929de`). With the host tier off (`PLOW_VMM_HOST_CACHE_MIB=0`, same packet, same binary, same
+grid) the stall is gone and the rows beat the baseline: MATCHED + EQUIVALENT, 1.8/s tok/s 1.00x,
+TTFT P99 0.66x, TPOT P99 0.55x; 2.7/s 1.00x / 0.71x* / 0.64x* (`strict-abi2-g26fp8-notier`). The
+host-tier path on bin31 is therefore the open item: whether the recipe keeps tier auto (chosen for
+the hit rate on real think-time traffic) and what changed in that path since bin23 are decisions
+and work left open here. The Kit 2 packet cannot serve as the bin31 control (refused: W8A8 arms
+without `object_requirements`). gemma-4-12b (`cec0e7d5599192a6`, prod mix, fp8 KV both arms,
+plow provenance recorded against the served FP8 checkpoint as in the production pass): MATCHED +
+EQUIVALENT and loses as before: 1.8/s tok/s 0.98x, TTFT P99 1.12x*, TPOT P99 1.71x; 2.7/s 0.95x /
+2.88x* / 1.21x*. qwen3.8-27b FP8 (`5e8ebd0f9771b06e`, ISL 1000 / OSL 128): greedy cells reproduce
+the production-pass digits exactly (c1 0.51x tok/s, TTFT P99 2.54x, TPOT P99 1.90x; c8 0.22x /
+5.31x / 5.14x), NOT MATCHED on model version by construction as recorded above; the sampled cells read the same
+(s1 0.51x / 2.82x / 1.89x, s8 0.22x / 5.35x / 5.09x, s32 0.23x / 5.27x / 4.72x), i.e. no change on
+the slice binary for the known Qwen FP8 serving gap.
+Not re-run: qwen3.8-27b BF16 (no vLLM arm; the prefix A/B above is plow vs plow), 26B BF16 and
+E4B (no strict grid in the production pass either). Raw evidence:
+`kvstore-scratch/strict-abi2-{g26fp8,g26fp8-r2,g26fp8-notier,g12,qwenfp8,qwenfp8-full}`.
+
 ## Merge-prep checks on the other recipes (2026-10-25, branch `a3bf4162` vs main `9f16f187`; not strict rows)
 
 Every H100 recipe with a packet on this box ran its own `[gates]` on the branch binary. The LLM
