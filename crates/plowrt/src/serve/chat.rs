@@ -1596,7 +1596,7 @@ mod tests {
             eprintln!("skipped: no Gemma-4 checkpoint on this host");
             return;
         }
-        let t = crate::serve::template::ChatTemplate::load(dir).expect("template compiles");
+        let t = crate::serve::template::load(dir).expect("template compiles");
         for convo in [
             vec![("system", "You are helpful."), ("user", "Hi there")],
             vec![("user", "one"), ("assistant", "two"), ("user", "three")],

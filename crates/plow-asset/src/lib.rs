@@ -16,6 +16,7 @@
 use serde::{Deserialize, Serialize};
 
 pub mod certificates;
+pub mod chat;
 pub mod gemm_policy;
 pub mod logical_effects;
 

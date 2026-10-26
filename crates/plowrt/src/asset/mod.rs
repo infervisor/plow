@@ -90,7 +90,7 @@ impl ModelBundle {
         let chat_template = if serve.from_packet {
             serve.manifest.chat.as_ref().and_then(|c| {
                 let text = c.template.clone()?;
-                crate::serve::template::ChatTemplate::compile(
+                crate::serve::template::compile(
                     text,
                     c.source
                         .clone()
@@ -100,8 +100,7 @@ impl ModelBundle {
                 )
             })
         } else {
-            crate::serve::template::ChatTemplate::load(&dir)
-                .or_else(|| crate::serve::template::ChatTemplate::load(&checkpoint))
+            crate::serve::template::load(&dir).or_else(|| crate::serve::template::load(&checkpoint))
         };
         let serving =
             crate::serve::config::ServingConfig::from_defaults(serve.manifest.sampling.as_ref());

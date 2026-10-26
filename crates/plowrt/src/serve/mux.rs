@@ -12132,7 +12132,7 @@ mod host_bench {
             // The chat path's extra step: the checkpoint template over one user turn.
             if let Some(t) = std::env::var("HOSTBENCH_ASSETS")
                 .ok()
-                .and_then(|d| crate::serve::template::ChatTemplate::load(std::path::Path::new(&d)))
+                .and_then(|d| crate::serve::template::load(std::path::Path::new(&d)))
             {
                 let msgs = vec![serde_json::json!({"role": "user", "content": prompts[0]})];
                 let render: Vec<f64> = (0..20)

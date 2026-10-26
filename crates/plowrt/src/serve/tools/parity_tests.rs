@@ -13,7 +13,7 @@ use serde_json::Value;
 use super::request::{render, RenderError};
 use super::{ToolFormat, ToolSupport};
 use crate::serve::openai::ChatRequest;
-use crate::serve::template::{ChatTemplate, RenderOpts};
+use crate::serve::template::RenderOpts;
 
 fn fixtures() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/toolcall")
@@ -54,7 +54,8 @@ fn every_family_renders_tool_conversations_like_transformers() {
     let mut id_checked = 0;
     for dir in families {
         let family = dir.file_name().unwrap().to_str().unwrap().to_string();
-        let t = ChatTemplate::load(&dir).unwrap_or_else(|| panic!("{family}: template compiles"));
+        let t = crate::serve::template::load(&dir)
+            .unwrap_or_else(|| panic!("{family}: template compiles"));
         assert_eq!(t.tools, expected_support(&family), "{family}: tool support");
         let fx: Value =
             serde_json::from_slice(&std::fs::read(dir.join("cases.json")).unwrap()).unwrap();
