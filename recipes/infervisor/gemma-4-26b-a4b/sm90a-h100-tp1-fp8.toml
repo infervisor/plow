@@ -49,7 +49,7 @@ namespace = "infervisor"
 name = "gemma-4-26b-a4b"
 label = "sm90a-h100-tp1-fp8"
 status = "validated"
-plow_git = "ae17393fec1331c622b2a03052a44715d038fb19"
+plow_git = "2dabbe2b3f82129d4f905707080b0d2061d768f1"
 network = "gemma4"
 
 [target]
@@ -209,6 +209,14 @@ PLOW_VMM_RING_PARK = "8"
 PLOW_PF_ADMIT_OVERLAP = "1"
 PLOW_PF_ITL_FORCE = "0"
 PLOW_VMM_STRICT_PUBLISH = "1"
+# KV physical-block pool cap, also the band the block store leaves free above the pool's pressure floor. At the
+# 512 MiB default the store grew into every ring the pool retired and the pool shrank it back at the next prompt
+# burst: 15.5k chunk frees per 300 s cell of the production mix with the host tier on, each free a context-wide
+# driver call behind which decode ticks stretched 20 -> 75 ms (TTFT/TPOT P99 1.11x/1.10x and 0.98x/0.98x vs vLLM
+# 0.29 at 1.8/2.7 sessions/s with the 10 s growth hold alone). 2 GiB (2026-10-26, bin34 = 2dabbe2b, prod mix, tier
+# auto, fix-g26-band2g): 2958 frees, MATCHED + EQUIVALENT, tok/s 1.00x, TTFT/TPOT P99 0.99x/0.82x and 0.92x/0.76x;
+# 4 GiB: 452 frees, 0.90x/0.86x and 1.43x*/0.67x (one 961 ms cell, spread 78%), not taken.
+PLOW_KV_POOL_MIB = "2048"
 
 # Speculative decoding drafter (Gemma-4 assistant MTP, 4 layers over target layers 28/29 KV): emit = true builds span
 # verify (decode objects plus their `_rs` row-slot twins) and the draft programs into the packet, draft_fp8 = "all" binds

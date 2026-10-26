@@ -145,6 +145,32 @@ Not re-run: qwen3.8-27b BF16 (no vLLM arm; the prefix A/B above is plow vs plow)
 E4B (no strict grid in the production pass either). Raw evidence:
 `kvstore-scratch/strict-abi2-{g26fp8,g26fp8-r2,g26fp8-notier,g12,qwenfp8,qwenfp8-full}`.
 
+Host-tier tail resolved (2026-10-26, bin34 = `2dabbe2b`: the 10 s growth hold `0091a6a0` +
+`2dabbe2b`, merged with the typed-ownership store `86f2cd0c`). The "stall" was not an engine
+pause: the engine ticked every 10-50 ms through it. It was queueing in a ~95%-busy engine whose
+decode ticks stretched 20 -> 75 ms in the seconds where the store's free worker issued bursts of
+125-134 `cuMemFree` (a context-wide driver call): the store grew its device chunks into every ring
+the live pool retired and the pool shrank it back at the next prompt burst, 15.5k frees + 20k
+allocs per 300 s cell with the tier on, half that with it off (per-second `/metrics` samples +
+`PACKLOG`; `kvstore-scratch/fix_g26_run.sh`, `free_burst_corr.py`). Every clean commit since
+`b779aa91` shows it; only the dirty production-pass binary did not. Tier-on prod grid vs the
+production-pass vLLM 0.29 arm, all MATCHED + EQUIVALENT, tok/s 1.00x: growth hold alone 1.8/s
+TTFT/TPOT P99 1.11x*/1.10x*, 2.7/s 0.98x*/0.98x* (10.2k frees); hold + `PLOW_KV_POOL_MIB=2048`
+(the pool's reserve, which is also the band the store leaves free above the pool's pressure
+floor): 1.8/s 0.99x*/0.82x*, 2.7/s 0.92x/0.76x* (2958 frees, `fix-g26-band2g`); 4096: 0.90x/0.86x
+and 1.43x*/0.67x* (452 frees, one 961 ms cell); reserve 2048 on the pre-hold binary `ae17393f`:
+0.89x*/0.81x*, 0.91x/0.80x* (3111 frees), so the reserve is the lever and the hold only matters
+without it. The 26B FP8 recipe sets `PLOW_KV_POOL_MIB = "2048"` in `[serve.env]`; tier auto
+stays. c16 FP32 gates on bin34: 26B FP8 PASS (kl_trim 0.1234, top1 0.9612), 12B PASS (0.0568 /
+0.9843), 26B BF16 PASS, Qwen BF16 c1/c8/c32 PASS (kl_trim 0.000454 / 0.000463 / 0.000419), E4B logit parity PASS (top1
+0.9948, kl_max 0.0154), Qwen FP8 c1/c8/c32 PASS on the second run (0.01004 / 0.01073 / 0.01028;
+the first run's c8 was the known cont_decisive re-roll, 0.9565 < 0.9783, as on `ae17393f`), serve
+goldens check mode 2 passed. The six recipes pin plow_git `2dabbe2b`.
+gemma-4-12b on the same binary and reserve (`fix-g12-res2g`, prod mix, provenance re-recorded):
+480 frees and no change, MATCHED + EQUIVALENT, 1.8/s tok/s 0.97x, TTFT P99 1.16x*, TPOT P99
+1.82x; 2.7/s 0.94x / 3.52x* / 1.28x* (goodput 28% in the second 2.7/s cell): the 12B loss is not
+the store's churn (it runs without live rings) and stays the open production item.
+
 ## Merge-prep checks on the other recipes (2026-10-25, branch `a3bf4162` vs main `9f16f187`; not strict rows)
 
 Every H100 recipe with a packet on this box ran its own `[gates]` on the branch binary. The LLM
