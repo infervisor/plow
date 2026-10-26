@@ -424,6 +424,12 @@ pub struct EmitConfig {
     #[arg(long, env = "PLOW_SPEC_SHARD_SHA256")]
     pub spec_shard_sha256: Option<String>,
 
+    /// Drafter family for PLOW_EMIT_SPEC: `gemma4_assistant` (unset, the MTP draft programs) or
+    /// `gemma4_dspark` (the DSpark block drafter's context tail in every target program and its
+    /// own KV layers; `model-dspark.safetensors`).
+    #[arg(long, env = "PLOW_SPEC_KIND", value_parser = clap::builder::PossibleValuesParser::new(["gemma4_assistant", "gemma4_dspark"]))]
+    pub spec_kind: Option<String>,
+
     /// Blocks for the one-row MoE combine (arms the all-block combine; 0/1 = today's single CTA).
     #[arg(long, env = "PLOW_MOE_COMBINE_BLOCKS")]
     pub moe_combine_blocks: Option<u32>,
@@ -1965,6 +1971,7 @@ impl EmitConfig {
             spec_kmax: env_u32("PLOW_SPEC_KMAX"),
             spec_rows: env_str("PLOW_SPEC_ROWS"),
             spec_shard_sha256: env_str("PLOW_SPEC_SHARD_SHA256"),
+            spec_kind: env_str("PLOW_SPEC_KIND"),
             moe_combine_blocks: env_u32("PLOW_MOE_COMBINE_BLOCKS"),
             fa_gf_full: env_u32("PLOW_FA_GF_FULL"),
             attention_decode_balance_gf: env_u32("PLOW_ATTENTION_DECODE_BALANCE_GF"),

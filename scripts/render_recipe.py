@@ -51,7 +51,7 @@ def block_prepare(r: dict) -> str:
     if prep:
         out.append(f"# [spec] drafter {r['spec']['kind']} @ {r['spec']['draft_revision']}: re-key it beside the target shards")
         out += [f"nix develop --command {c}" for c in prep]
-        out.append(f"# produces: $CKPT/{spec_env.SHARD} (sha256 {r['spec']['shard_sha256']})")
+        out.append(f"# produces: $CKPT/{spec_env.shard(r)} (sha256 {r['spec']['shard_sha256']})")
         out.append("")
     for s in steps:
         shell = s.get("shell", "nix develop")

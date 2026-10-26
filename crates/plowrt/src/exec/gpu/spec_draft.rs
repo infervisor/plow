@@ -1,8 +1,10 @@
 //! Packet draft programs for speculative decode (`plow_asset::spec_draft`).
 //!
-//! The packet owns the drafter: the runtime stages each sequence's input token, the verify row
-//! holding the hidden that produced it, its committed length and slot, launches the packet's
-//! `(rows, k)` program on the decode interpreter and reads back `k` tokens per sequence.
+//! The packet owns the drafter: the runtime stages each sequence's input token and its
+//! committed length and slot (a chain drafter also the verify row holding the hidden that
+//! produced the token; a block drafter the block's ids, positions and store slots), launches
+//! the packet's `(rows, k)` program on the decode interpreter and reads back `k` tokens per
+//! sequence.
 
 use std::path::Path;
 
@@ -56,14 +58,15 @@ fn split_sites(insts: &[packet::dev::DevInst64]) -> Result<(Vec<(usize, bool)>, 
 pub(super) struct SpecDraft {
     manifest: Manifest,
     programs: Vec<Loaded>,
-    /// `[kmax + 1 tokens, hidden_row, position, kv_len, slot][rows]` i32 staging.
+    /// Chain: `[kmax + 1 tokens, hidden_row, position, kv_len, slot][rows]` i32 staging.
+    /// Block: `[kmax + 1 tokens][rows]` then `[ids, position, kv_len, slot, store][size * rows]`.
     stage: PinnedHost,
     rows: usize,
     selected: Option<(u32, usize, usize)>,
-    /// Per slot, the hidden row its pending token came from, saved at the verify that produced
-    /// it, and the `(generation, position)` it is valid for.
+    /// Chain drafters: per slot, the hidden row its pending token came from, saved at the
+    /// verify that produced it, and the `(generation, position)` it is valid for.
     hidden_bytes: u64,
-    hidden_snap: DeviceMem,
+    hidden_snap: Option<DeviceMem>,
     hidden_at: Vec<Option<(u32, u32)>>,
     /// Slots whose snapshot a launch is rewriting, keyed when it commits.
     staged_saves: Vec<usize>,
@@ -146,46 +149,70 @@ impl SpecDraft {
             .validate(section.programs.len(), e.devp.len())
             .map_err(reject)?;
         let t = &manifest.tensors;
-        let mut inputs: Vec<u16> = t.tokens.clone();
-        inputs.extend([t.hidden_row, t.position, t.kv_len, t.slot]);
-        let mut distinct = inputs.clone();
+        let rows = manifest.programs.iter().map(|p| p.rows).max().unwrap_or(0) as usize;
+        // (input tensor, i32 entries it must hold)
+        let mut inputs: Vec<(u16, usize)> = t.tokens.iter().map(|&h| (h, rows)).collect();
+        let mut hidden_bytes = 0;
+        match (&manifest.block, t.hidden_row, t.hidden) {
+            (Some(b), None, None) => {
+                let n = b.size as usize * rows;
+                inputs.extend([t.position, t.kv_len, t.slot, b.ids, b.store_slot].map(|h| (h, n)));
+                if manifest.kmax > b.size {
+                    return Err(reject("kmax exceeds the block"));
+                }
+            }
+            (None, Some(hidden_row), Some(hidden)) => {
+                inputs.extend([hidden_row, t.position, t.kv_len, t.slot].map(|h| (h, rows)));
+                if inputs.iter().any(|&(h, _)| h == hidden) {
+                    return Err(reject("aliased draft input tensors"));
+                }
+                for p in &manifest.programs {
+                    let prog = &section.programs[p.index as usize];
+                    // Step 0 gathers `rows` hidden rows (of `i1` elements) out of `hidden_rows`.
+                    let gather_ok = prog.insts.iter().any(|d| {
+                        d.op == packet::dev::DevOp::RowGather as u16
+                            && d.t[1] == hidden
+                            && d.t[2] == hidden_row
+                            && d.i[0] == p.rows
+                            && d.i[2] == t.hidden_rows
+                            && e.devp[usize::from(hidden)].len
+                                >= u64::from(t.hidden_rows) * u64::from(d.i[1]) * 2
+                    });
+                    if !gather_ok {
+                        return Err(reject(format!("program {} geometry", p.index)));
+                    }
+                }
+                let mut width = None;
+                for p in &section.programs {
+                    for d in &p.insts {
+                        if d.op == packet::dev::DevOp::RowGather as u16 && d.t[1] == hidden {
+                            let b = u64::from(d.i[1]) * 2;
+                            if *width.get_or_insert(b) != b {
+                                return Err(reject(
+                                    "draft programs gather different hidden widths",
+                                ));
+                            }
+                        }
+                    }
+                }
+                hidden_bytes = width.ok_or_else(|| reject("no hidden gather"))?;
+            }
+            _ => return Err(reject("drafter is neither a chain nor a block drafter")),
+        }
+        let mut distinct: Vec<u16> = inputs.iter().map(|&(h, _)| h).collect();
         distinct.sort_unstable();
         distinct.dedup();
-        if distinct.len() != inputs.len() || inputs.contains(&t.hidden) {
+        if distinct.len() != inputs.len() {
             return Err(reject("aliased draft input tensors"));
         }
         for p in &manifest.programs {
-            let prog = &section.programs[p.index as usize];
-            // Step 0 gathers `rows` hidden rows (of `i1` elements) out of `hidden_rows`.
-            let gather_ok = prog.insts.iter().any(|d| {
-                d.op == packet::dev::DevOp::RowGather as u16
-                    && d.t[1] == t.hidden
-                    && d.t[2] == t.hidden_row
-                    && d.i[0] == p.rows
-                    && d.i[2] == t.hidden_rows
-                    && e.devp[usize::from(t.hidden)].len
-                        >= u64::from(t.hidden_rows) * u64::from(d.i[1]) * 2
-            });
-            if prog.rows != p.rows || !gather_ok {
+            if section.programs[p.index as usize].rows != p.rows {
                 return Err(reject(format!("program {} geometry", p.index)));
             }
         }
-        let mut hidden_bytes = None;
-        for p in &section.programs {
-            for d in &p.insts {
-                if d.op == packet::dev::DevOp::RowGather as u16 && d.t[1] == t.hidden {
-                    let b = u64::from(d.i[1]) * 2;
-                    if *hidden_bytes.get_or_insert(b) != b {
-                        return Err(reject("draft programs gather different hidden widths"));
-                    }
-                }
-            }
-        }
-        let hidden_bytes = hidden_bytes.ok_or_else(|| reject("no hidden gather"))?;
-        let rows = manifest.programs.iter().map(|p| p.rows).max().unwrap_or(0) as usize;
-        for &h in &inputs {
-            if e.devp[usize::from(h)].len < rows as u64 * 4 {
-                return Err(reject(format!("tensor {h} holds fewer than {rows} rows")));
+        for &(h, n) in &inputs {
+            if e.devp[usize::from(h)].len < n as u64 * 4 {
+                return Err(reject(format!("tensor {h} holds fewer than {n} entries")));
             }
         }
         let programs = section
@@ -206,8 +233,11 @@ impl SpecDraft {
                 })
             })
             .collect::<Result<Vec<_>>>()?;
-        let stage =
-            e.be.host_alloc_pinned((manifest.kmax as usize + 5) * rows * 4)?;
+        let words = match &manifest.block {
+            Some(b) => manifest.kmax as usize + 1 + 5 * b.size as usize,
+            None => manifest.kmax as usize + 5,
+        };
+        let stage = e.be.host_alloc_pinned(words * rows * 4)?;
         tracing::info!(
             programs = programs.len(),
             baked_splits = ?programs.iter().map(|p| p.baked).collect::<std::collections::BTreeSet<_>>(),
@@ -223,7 +253,9 @@ impl SpecDraft {
             rows,
             selected: None,
             hidden_bytes,
-            hidden_snap: e.be.alloc(0, hidden_bytes * e.batch as u64)?,
+            hidden_snap: (hidden_bytes != 0)
+                .then(|| e.be.alloc(0, hidden_bytes * e.batch as u64))
+                .transpose()?,
             hidden_at: vec![None; e.batch],
             staged_saves: Vec::with_capacity(e.batch),
         })
@@ -274,6 +306,11 @@ impl GpuEngine {
             .spec_draft
             .as_mut()
             .ok_or_else(|| reject("not enabled"))?;
+        if d.manifest.block.is_some() {
+            return Err(reject(
+                "a block drafter stages through spec_draft_stage_block",
+            ));
+        }
         let p = *d
             .manifest
             .select(rows.len(), k)
@@ -302,7 +339,7 @@ impl GpuEngine {
         let bytes = d.stage.as_slice();
         for (i, h) in [
             (0, t.tokens[0]),
-            (kmax + 1, t.hidden_row),
+            (kmax + 1, t.hidden_row.expect("chain drafter")),
             (kmax + 2, t.position),
             (kmax + 3, t.kv_len),
             (kmax + 4, t.slot),
@@ -338,6 +375,123 @@ impl GpuEngine {
             prog.cur = want;
         }
         d.selected = Some((k, p.index as usize, rows.len()));
+        Ok(())
+    }
+
+    /// Block drafters: stage `(slot, pending token)` per sequence and select the `(rows, k)`
+    /// program. Sequence `r`'s block rows `r * size + i` sit at positions `c + i` (`c` = its
+    /// committed rows) with ids `[token, mask x (size - 1)]` and attend `c + size` rows; padding
+    /// rows of a wider program attend the last sequence's KV and store nothing. The drafter
+    /// layers' pages are mapped through `c + size` first.
+    pub fn spec_draft_stage_block(&mut self, rows: &[(usize, u32)], k: u32) -> Result<()> {
+        if rows.is_empty() {
+            return Err(reject("no rows"));
+        }
+        self.be.stream_synchronize(&self.stream)?;
+        let vocab = self.vocab() as u32;
+        let (batch, max_ctx) = (self.batch, self.max_ctx as u32);
+        let pos: Vec<u32> = rows
+            .iter()
+            .map(|&(s, _)| self.pos.get(s).copied().unwrap_or(0))
+            .collect();
+        let d = self
+            .spec_draft
+            .as_mut()
+            .ok_or_else(|| reject("not enabled"))?;
+        let block = d
+            .manifest
+            .block
+            .clone()
+            .ok_or_else(|| reject("not a block drafter"))?;
+        let size = block.size;
+        let p = *d
+            .manifest
+            .select(rows.len(), k)
+            .ok_or_else(|| reject(format!("no program for {} rows at k {k}", rows.len())))?;
+        for (i, (&(slot, token), &c)) in rows.iter().zip(&pos).enumerate() {
+            if slot >= batch
+                || token >= vocab
+                || c == 0
+                || c + size > max_ctx
+                || rows[..i].iter().any(|&(s, _)| s == slot)
+            {
+                return Err(reject(format!(
+                    "block row slot {slot} token {token} pos {c} (max_ctx {max_ctx})"
+                )));
+            }
+        }
+        let n = d.rows;
+        let nb = size as usize * n;
+        let kmax = d.manifest.kmax as usize;
+        let words: &mut [i32] = bytemuck::cast_slice_mut(d.stage.as_mut_slice());
+        let base = (kmax + 1) * n;
+        for r in 0..p.rows as usize {
+            let live = r < rows.len();
+            let (slot, token) = rows[r.min(rows.len() - 1)];
+            let c = pos[r.min(rows.len() - 1)] as i32;
+            words[r] = token as i32;
+            for i in 0..size as usize {
+                let row = r * size as usize + i;
+                words[base + row] = if i == 0 {
+                    token as i32
+                } else {
+                    block.mask_token as i32
+                };
+                words[base + nb + row] = c + i as i32;
+                words[base + 2 * nb + row] = c + size as i32;
+                words[base + 3 * nb + row] = slot as i32;
+                words[base + 4 * nb + row] = if live { slot as i32 } else { -1 };
+            }
+        }
+        let t = d.manifest.tensors.clone();
+        let used = p.rows as usize;
+        let bytes = d.stage.as_slice();
+        // SAFETY: the pinned stage is rewritten only after the next stage's synchronize.
+        unsafe {
+            self.be.memcpy_htod_async(
+                self.devp[usize::from(t.tokens[0])].base,
+                &bytes[..used * 4],
+                &self.stream,
+            )?;
+            for (j, h) in [block.ids, t.position, t.kv_len, t.slot, block.store_slot]
+                .into_iter()
+                .enumerate()
+            {
+                let at = (base + j * nb) * 4;
+                self.be.memcpy_htod_async(
+                    self.devp[usize::from(h)].base,
+                    &bytes[at..at + used * size as usize * 4],
+                    &self.stream,
+                )?;
+            }
+        }
+        let kv_max = pos.iter().copied().max().unwrap_or(1) + size;
+        let prog = &mut d.programs[p.index as usize];
+        let want = crate::exec::kvrow::nv_dense_live_nsplit(prog.baked, kv_max);
+        if want != prog.cur && !prog.sites.is_empty() {
+            for &(i, merge) in &prog.sites {
+                if merge {
+                    prog.insts[i].i[2] = want;
+                } else {
+                    prog.insts[i].i[5] = want;
+                }
+            }
+            // SAFETY: the image lives in `prog`; the next stage synchronizes before touching it.
+            unsafe {
+                self.be.memcpy_htod_async(
+                    prog.arg.insts,
+                    super::pod_bytes(&prog.insts),
+                    &self.stream,
+                )?;
+            }
+            prog.cur = want;
+        }
+        d.selected = Some((k, p.index as usize, rows.len()));
+        if let Some(v) = &self.vmm {
+            for (&(slot, _), &c) in rows.iter().zip(&pos) {
+                v.ensure_rows(slot, c + size)?;
+            }
+        }
         Ok(())
     }
 
@@ -379,6 +533,28 @@ impl GpuEngine {
     ) -> Result<()> {
         drafted.clear();
         out.clear();
+        if let Some(size) = self
+            .spec_draft
+            .as_ref()
+            .and_then(|d| d.manifest.block.as_ref())
+            .map(|b| b.size)
+        {
+            let mut stage = Vec::with_capacity(rows.len());
+            for &(slot, token) in rows {
+                let c = self.pos[slot];
+                let ok = c > 0 && c + size.max(k + 1) <= self.max_ctx as u32;
+                if ok {
+                    stage.push((slot, token));
+                }
+                drafted.push(ok);
+            }
+            if stage.is_empty() || k == 0 {
+                drafted.fill(false);
+                return Ok(());
+            }
+            self.spec_draft_stage_block(&stage, k)?;
+            return self.spec_draft_run(out);
+        }
         let mut stage = Vec::with_capacity(rows.len());
         for &(slot, token) in rows {
             let ok = self.spec_draft_ready(slot) && self.pos[slot] + k < self.max_ctx as u32;
@@ -416,6 +592,10 @@ impl GpuEngine {
     /// produced it; any later step or slot reuse moves the position or generation past it).
     pub fn spec_draft_ready(&self, b: usize) -> bool {
         self.spec_draft.as_ref().is_some_and(|d| {
+            if d.manifest.block.is_some() {
+                // Every target launch writes the drafter context of the rows it commits.
+                return self.pos.get(b).is_some_and(|&p| p > 0);
+            }
             d.hidden_at.get(b).copied().flatten() == Some((self.slot_generations[b], self.pos[b]))
         })
     }
@@ -423,16 +603,19 @@ impl GpuEngine {
     /// Copy verify row `row`'s hidden aside for slot `b`, valid once `b` sits at `pos`. On the
     /// stream right after the verify, before any launch can overwrite the row.
     pub(super) fn spec_hidden_save(&mut self, b: usize, row: u32, pos: u32) -> Result<()> {
-        let Some(d) = self.spec_draft.as_mut() else {
+        let Some((d, h, snap)) = self.spec_draft.as_mut().and_then(|d| {
+            let h = d.manifest.tensors.hidden?;
+            let snap = d.hidden_snap.as_ref()?.base;
+            Some((d, h, snap))
+        }) else {
             return Ok(());
         };
-        let h = d.manifest.tensors.hidden;
         if row >= d.manifest.tensors.hidden_rows {
             return Err(reject(format!("hidden row {row}")));
         }
         let n = d.hidden_bytes;
         self.be.memcpy_dtod_async(
-            d.hidden_snap.base + b as u64 * n,
+            snap + b as u64 * n,
             self.devp[usize::from(h)].base + u64::from(row) * n,
             n,
             &self.stream,
@@ -449,7 +632,11 @@ impl GpuEngine {
         feeds: &[(usize, u32)],
         advance: u32,
     ) -> Result<()> {
-        let Some(d) = self.spec_draft.as_mut() else {
+        let Some((d, h, snap)) = self.spec_draft.as_mut().and_then(|d| {
+            let h = d.manifest.tensors.hidden?;
+            let snap = d.hidden_snap.as_ref()?.base;
+            Some((d, h, snap))
+        }) else {
             return Ok(());
         };
         let (Some(lo), Some(hi)) = (
@@ -464,8 +651,8 @@ impl GpuEngine {
         d.hidden_at[lo..=hi].fill(None);
         let n = d.hidden_bytes;
         self.be.memcpy_dtod_async(
-            d.hidden_snap.base + lo as u64 * n,
-            self.devp[usize::from(d.manifest.tensors.hidden)].base + lo as u64 * n,
+            snap + lo as u64 * n,
+            self.devp[usize::from(h)].base + lo as u64 * n,
             (hi - lo + 1) as u64 * n,
             &self.stream,
         )?;
@@ -483,10 +670,14 @@ impl GpuEngine {
         row_bytes: u64,
         rows: impl Iterator<Item = (usize, u32)>,
     ) -> Result<()> {
-        let Some(d) = self
+        let Some((d, snap)) = self
             .spec_draft
             .as_mut()
             .filter(|d| d.hidden_bytes == row_bytes)
+            .and_then(|d| {
+                let snap = d.hidden_snap.as_ref()?.base;
+                Some((d, snap))
+            })
         else {
             return Ok(());
         };
@@ -497,7 +688,7 @@ impl GpuEngine {
             }
             d.hidden_at[b] = None;
             self.be.memcpy_dtod_async(
-                d.hidden_snap.base + b as u64 * n,
+                snap + b as u64 * n,
                 src + u64::from(row) * n,
                 n,
                 &self.stream,
@@ -539,14 +730,23 @@ impl GpuEngine {
             )));
         }
         let d = self.spec_draft.as_ref().expect("ready");
-        let h = d.manifest.tensors.hidden;
+        let (Some(h), Some(snap)) = (d.manifest.tensors.hidden, d.hidden_snap.as_ref()) else {
+            return Ok(());
+        };
         let n = d.hidden_bytes;
         self.be.memcpy_dtod_async(
             self.devp[usize::from(h)].base + u64::from(row) * n,
-            d.hidden_snap.base + b as u64 * n,
+            snap.base + b as u64 * n,
             n,
             &self.stream,
         )
+    }
+
+    /// Whether the loaded drafter is a block drafter (`spec_draft_stage_block`).
+    pub fn spec_draft_is_block(&self) -> bool {
+        self.spec_draft
+            .as_ref()
+            .is_some_and(|d| d.manifest.block.is_some())
     }
 
     /// `(deepest k, draft program row counts)` of the loaded drafter.

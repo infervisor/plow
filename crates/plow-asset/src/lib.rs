@@ -710,6 +710,7 @@ pub mod segment_roles;
 pub mod kv_shared_tail;
 pub mod object_requirements;
 pub mod packed_prefill;
+pub mod spec_context;
 pub mod spec_draft;
 
 pub mod fish_depth;

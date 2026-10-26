@@ -598,6 +598,8 @@ fn apply_program(model: &mut Model, index: usize, head: bool) -> Result<Vec<u8>,
         let selected = (inst.op == DevOp::Gemv as u16 || fp8) && {
             let name = &model.tensors[inst.t[2] as usize].name;
             name.contains(".layers.")
+                // The DSpark context tail's per-tap projections (dspark.rs) share the rung's M.
+                || name.contains("dspark.fc.")
                 || (head
                     && (name.ends_with("lm_head.weight")
                         || name.ends_with("embed_tokens.weight")

@@ -18,7 +18,7 @@ use crate::config::Cfg;
 use crate::Tn;
 
 /// Deepest draft program (`PLOW_SPEC_KMAX`, default 7; the verify span holds at most 15).
-fn kmax() -> u32 {
+pub(crate) fn kmax() -> u32 {
     let k = crate::emit_config::active().spec_kmax.unwrap_or(7);
     if !(1..=15).contains(&k) {
         refuse(format!("PLOW_SPEC_KMAX={k}: 1..=15"));
@@ -27,7 +27,7 @@ fn kmax() -> u32 {
 }
 
 /// Draft program row counts (`PLOW_SPEC_ROWS`, default 1,2,4,8,16), ascending.
-fn rows_list() -> Vec<u32> {
+pub(crate) fn rows_list() -> Vec<u32> {
     let Some(spec) = crate::emit_config::active().spec_rows.clone() else {
         return vec![1, 2, 4, 8, 16];
     };
@@ -60,16 +60,16 @@ pub(crate) struct DraftCfg {
     layer_scalar: Vec<f32>,
 }
 
-fn refuse(what: String) -> ! {
+pub(crate) fn refuse(what: String) -> ! {
     panic!("PLOW_EMIT_SPEC: {what}")
 }
 
-fn sha256_file(path: &Path) -> String {
+pub(crate) fn sha256_file(path: &Path) -> String {
     let bytes = std::fs::read(path).unwrap_or_else(|e| refuse(format!("{}: {e}", path.display())));
     plow_asset::knob::sha256_hex(&bytes)
 }
 
-fn draft_dir() -> std::path::PathBuf {
+pub(crate) fn draft_dir() -> std::path::PathBuf {
     crate::emit_config::active()
         .spec_draft_dir
         .clone()
@@ -78,7 +78,7 @@ fn draft_dir() -> std::path::PathBuf {
 }
 
 /// The tensor entries and the `__metadata__` object of a safetensors file.
-fn safetensors_header(path: &Path) -> (serde_json::Map<String, Value>, Value) {
+pub(crate) fn safetensors_header(path: &Path) -> (serde_json::Map<String, Value>, Value) {
     use std::io::Read;
     let mut f =
         std::fs::File::open(path).unwrap_or_else(|e| refuse(format!("{}: {e}", path.display())));
@@ -475,7 +475,7 @@ fn sites(c: &Cfg, n: &Tn, d: &DraftCfg, target: &Program) -> Sites {
 
 /// The draft's token ids must mean what the target's do: identical vocab, and every draft added
 /// token present in the target under the same id (the target may add more, e.g. media tokens).
-fn check_tokenizer(draft: &Path, target: &Path) {
+pub(crate) fn check_tokenizer(draft: &Path, target: &Path) {
     let read = |p: &Path| -> Value {
         serde_json::from_slice(
             &std::fs::read(p).unwrap_or_else(|e| refuse(format!("{}: {e}", p.display()))),
@@ -495,7 +495,7 @@ fn check_tokenizer(draft: &Path, target: &Path) {
 }
 
 /// Operands only: `emit` owns the opcode, slice count and dependency fields.
-fn args(i: &mut DevInst, src: &DevInst) {
+pub(crate) fn args(i: &mut DevInst, src: &DevInst) {
     i.t = src.t;
     i.i = src.i;
     i.f = src.f;
@@ -818,13 +818,14 @@ pub(crate) fn sections(
         programs: table,
         tensors: spec_draft::DraftTensors {
             tokens: t.tokens.iter().map(|&h| h16(h)).collect(),
-            hidden_row: h16(t.hidden_row),
+            hidden_row: Some(h16(t.hidden_row)),
             position: h16(t.position),
             kv_len: h16(t.kv_len),
             slot: h16(t.slot),
-            hidden: h16(n.hn),
+            hidden: Some(h16(n.hn)),
             hidden_rows: n.rowslot_rows,
         },
+        block: None,
         shard: SHARD.into(),
         shard_sha256,
     };

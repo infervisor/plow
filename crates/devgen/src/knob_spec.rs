@@ -1228,6 +1228,7 @@ pub const EMIT: &[KnobSpec] = &[
     KnobSpec::new("emit.spec_kmax", Some("PLOW_SPEC_KMAX"), Layer::Emit, U32, UNSET, OPT_IN),
     KnobSpec::new("emit.spec_rows", Some("PLOW_SPEC_ROWS"), Layer::Emit, Domain::Str, UNSET, OPT_IN),
     KnobSpec::new("emit.spec_shard_sha256", Some("PLOW_SPEC_SHARD_SHA256"), Layer::Emit, Domain::Str, UNSET, OPT_IN),
+    KnobSpec::new("emit.spec_kind", Some("PLOW_SPEC_KIND"), Layer::Emit, Domain::Str, UNSET, OPT_IN),
     KnobSpec::new("emit.moe_combine_blocks", Some("PLOW_MOE_COMBINE_BLOCKS"), Layer::Emit, U32, UNSET, OPT_IN),
     KnobSpec::new("emit.fa_gf_full", Some("PLOW_FA_GF_FULL"), Layer::Emit, U32, UNSET, OPT_IN),
     KnobSpec::new("emit.attention_decode_balance_gf", Some("PLOW_ATTENTION_DECODE_BALANCE_GF"), Layer::Emit, U32, GEMMA4_BALANCE_GF_DEFAULT, GEMMA4_RECIPE_QUALIFIED),
