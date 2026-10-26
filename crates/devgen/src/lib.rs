@@ -11466,7 +11466,13 @@ fn emit_dense_gqa(
             .and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok())
             .is_some_and(|v| v["model_type"] == "fish_dac" || v["model_type"] == "qwen3_tts_12hz");
         let (model, section) = if fish {
-            fish_codec::lower_fish_dac(dir, n_cu, m.target, ecfg.snac_split_bf16)
+            fish_codec::lower_fish_dac(
+                dir,
+                n_cu,
+                m.target,
+                ecfg.snac_split_bf16,
+                ecfg.fish_codec_max_rows,
+            )
         } else {
             codec::lower_snac(dir, n_cu, m.target, sites, ecfg.snac_split_bf16)
         }

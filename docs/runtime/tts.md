@@ -16,6 +16,7 @@ are the same steps by hand):
 | Chatterbox | `recipes/infervisor/chatterbox/sm90a-h100-tp1.toml` |
 | Chatterbox Multilingual V3 | `recipes/infervisor/chatterbox-mtl/sm90a-h100-tp1.toml` |
 | Fish S2 Pro (non-commercial weights) | `recipes/infervisor/fish-s2-pro/sm90a-h100-tp1.toml` |
+| Fish S2 Pro on L4, beside Qwen3-ASR | `recipes/infervisor/fish-s2-pro/sm89-l4-tp1.toml` |
 | Breeze TTS 2 (non-commercial weights) | `recipes/infervisor/breeze-tts-2/sm90a-h100-tp1.toml` |
 | Qwen3-ASR | `recipes/infervisor/qwen3-asr/sm90a-h100-tp1.toml` |
 
@@ -729,6 +730,35 @@ saturated: persistent cooperative kernels take the whole device, so models alter
 solo-normalized shares sum to ~1.0 (`free`) and ~1.3 (`rr`). Use `rr` when co-serving speech.
 Tried and reverted (no gain): single-step ticks while a co-tenant waits, and holding the turn for
 a whole encoder/codec/vocoder sequence (worse: a 166 ms S3Gen render then blocks everyone).
+
+### L4: Qwen3-ASR + Silero VAD + Fish S2 Pro
+
+One `plowrt serve --assets <qwen3-asr> --assets <fish-s2-pro> --asr-vad-packet <vad.pkt>
+--co-sched rr` with `PLOW_VMM_LIVE=1` (the Fish L4 bundle's serve default; set it in the
+environment so the ASR bundle takes it too). Live KV commits a slot on admission (224 MiB ASR,
+288 MiB Fish at 2048 ctx) instead of `max_ctx` x slots at load: 20.2 of 22.5 GiB after load. The
+Fish codec arena is capped with `PLOW_EMIT_FISH_CODEC_MAX_ROWS=256` (7.5 -> 2.7 GiB). L4,
+2026-10-23, at 0ea345db:
+
+| | co-served | ASR alone |
+|---|---|---|
+| customer batch WER, README flags / prompt | 10.36% / 9.58% | 10.40% / 9.58% |
+| customer streaming WER, end of speech to final p50 / p95 | 12.98%, 128 / 344 ms | 13.01%, 125 / 340 ms |
+| Fish stream c1: TTFA, median RTF | 137 ms, 0.80 | |
+| Fish full c4: audio s/s | 2.07 | |
+| Fish CER (Whisper, n=44) | 0.000 | |
+
+Set `PLOW_PIN_RESIDENT=1` too: without it the manager evicts the idle model so the busy one's live
+KV can grow (Fish evicted under ASR load, then a 16 s reload on the next speech request); pinned,
+a stream that does not fit waits or gets 429. Mixed load (customer streaming ASR c2 + Fish stream
+c1 / full c4 / stream c4 bursts, 40 min): 0 evictions, 0 restarts, only the bursts' 429s; ASR WER
+unchanged (13.01% / 12.28%), ASR end of speech to final p95 2.2 s while TTS runs (p50 163 ms);
+Fish stream c1 RTF 1.5 while ASR runs (TTFA 140 ms).
+
+BF16 Fish decodes ~1 real-time stream on L4 (each frame reads the 8.5 GiB slow AR plus nine depth
+steps at 300 GB/s): real-time admission holds a second stream (`PLOW_TTS_ADMIT_WAIT_MS`, then
+429). Full requests batch. `PLOW_W8A16=1` emits on sm_89 (weights 8.5 -> 5.1 GiB) but its FP8
+decode faults there (the GemvFp8 arms are sm_120).
 
 ### Voice agent co-serve
 

@@ -186,7 +186,9 @@ pub fn lower_fish_dac(
     n_cu: u32,
     target: u32,
     split_bf16: bool,
+    max_rows: Option<u32>,
 ) -> Result<(packet::devbuild::Model, packet::devbuild::SectionData), String> {
+    let (decode, steps) = capped(max_rows)?;
     let cfg = Cfg::parse(
         &serde_json::from_slice(
             &std::fs::read(dir.join("config.json"))
@@ -203,7 +205,7 @@ pub fn lower_fish_dac(
         seed,
         bmax,
         max_rows,
-    } = lower_programs(&cfg, n_cu, target, splits.as_ref(), STEP_CAPACITIES)?;
+    } = lower_programs(&cfg, n_cu, target, splits.as_ref(), &decode, &steps)?;
     let scales = cfg.scales();
     let reader = crate::checkpoint::TensorReader::open(dir)?;
     for (h, tensor) in prefix.model.tensors.iter_mut().enumerate() {
@@ -262,9 +264,29 @@ pub fn lower_fish_dac(
         tensor.init = Some(bytes);
     }
     let section = section(
-        &prefix, &cfg, roles, bmax, max_rows, &lengths, &scales, seed,
+        &prefix, &cfg, roles, bmax, max_rows, &lengths, &scales, seed, &steps,
     )?;
     Ok((prefix.model, section))
+}
+
+/// [`CAPACITIES`] and [`STEP_CAPACITIES`] without the shapes over `max_rows` (batch x frames),
+/// which size the activation arena. The smallest decode frame count sets the stream chunk, so it
+/// has to survive.
+fn capped(max_rows: Option<u32>) -> Result<(Vec<(u32, u32)>, Vec<(u32, u32)>), String> {
+    let keep = |caps: &[(u32, u32)]| -> Vec<(u32, u32)> {
+        caps.iter()
+            .copied()
+            .filter(|&(b, f)| max_rows.is_none_or(|m| b * f <= m))
+            .collect()
+    };
+    let (decode, steps) = (keep(CAPACITIES), keep(STEP_CAPACITIES));
+    let min_frames = |caps: &[(u32, u32)]| caps.iter().map(|&(_, f)| f).min();
+    if min_frames(&decode) != min_frames(CAPACITIES) || steps.is_empty() {
+        return Err(format!(
+            "codec max rows {max_rows:?} drops the stream chunk capacity"
+        ));
+    }
+    Ok((decode, steps))
 }
 
 struct Lowered {
@@ -285,12 +307,13 @@ fn lower_programs(
     n_cu: u32,
     target: u32,
     splits: Splits<'_>,
+    decode: &[(u32, u32)],
     steps: &[(u32, u32)],
 ) -> Result<Lowered, String> {
     let fc = cfg.sizes.len() as u32;
     let scales = cfg.scales();
-    let bmax = CAPACITIES.iter().map(|&(b, _)| b).max().unwrap_or(1);
-    let max_rows = CAPACITIES.iter().map(|&(b, f)| b * f).max().unwrap_or(1);
+    let bmax = decode.iter().map(|&(b, _)| b).max().unwrap_or(1);
+    let max_rows = decode.iter().map(|&(b, f)| b * f).max().unwrap_or(1);
     let mut builder = packet::devbuild::Builder::new(n_cu);
     builder.set_tensor_dedup(true);
     let codes = builder.tensor("in.codec.codes", u64::from(max_rows * fc) * 4);
@@ -341,16 +364,17 @@ fn lower_programs(
     };
     let mut roles = BTreeMap::new();
     let mut positions = Vec::new();
-    for &(batch, frames) in CAPACITIES {
+    for &(batch, frames) in decode {
         let program = prefix.model.progs.len();
-        let (p, pos) = program_for(prefix, cfg, batch, frames, codes, &lengths, false, splits)?;
+        let (p, pos) =
+            program_for(prefix, cfg, batch, frames, codes, &lengths, None, splits)?;
         prefix = p;
         positions.push((pos, batch, frames));
         roles.insert(format!("decode.b{batch}.f{frames}"), program as u32);
     }
     for &(batch, frames) in steps {
         let program = prefix.model.progs.len();
-        prefix = program_for(prefix, cfg, batch, frames, codes, &lengths, true, splits)?.0;
+        prefix = program_for(prefix, cfg, batch, frames, codes, &lengths, Some(steps), splits)?.0;
         roles.insert(format!("step.b{batch}.f{frames}"), program as u32);
     }
     prefix.output = output;
@@ -532,9 +556,9 @@ struct StreamIo {
 
 /// The step programs' input tensors (role, name, elements); `stream.n.{k}` = new frames times
 /// `lengths.{k}.rows_per_frame`.
-fn step_inputs(scales: usize) -> Vec<(String, String, u32)> {
-    let b = STEP_CAPACITIES.iter().map(|&(b, _)| b).max().unwrap_or(1);
-    let rows = STEP_CAPACITIES
+fn step_inputs(scales: usize, steps: &[(u32, u32)]) -> Vec<(String, String, u32)> {
+    let b = steps.iter().map(|&(b, _)| b).max().unwrap_or(1);
+    let rows = steps
         .iter()
         .map(|&(b, n)| b * n)
         .max()
@@ -605,15 +629,16 @@ fn program_for(
     frames: u32,
     codes: u32,
     lengths: &[u32],
-    step: bool,
+    steps: Option<&[(u32, u32)]>,
     splits: Splits<'_>,
 ) -> Result<(PacketPrefix, u32), String> {
     let fc = cfg.sizes.len() as u32;
     let n = batch * frames;
     let dim = cfg.dim;
     let mut p = prefix.program();
-    let io = step.then(|| {
-        let h: Vec<u32> = step_inputs(lengths.len())
+    let step = steps.is_some();
+    let io = steps.map(|steps| {
+        let h: Vec<u32> = step_inputs(lengths.len(), steps)
             .iter()
             .map(|(_, name, e)| p.declare(name, u64::from(*e) * 4))
             .collect();
@@ -1198,6 +1223,7 @@ fn section(
     lengths: &[u32],
     scales: &[u32],
     seed: u32,
+    steps: &[(u32, u32)],
 ) -> Result<packet::devbuild::SectionData, String> {
     use plow_asset::packet_pipeline::{
         PacketPipeline, PacketPipelines, PipelineDType, PipelineTensor, SECTION, VERSION,
@@ -1245,14 +1271,10 @@ fn section(
         ("stream.slots".into(), u64::from(STREAM_SLOTS)),
         (
             "stream.step_frames".into(),
-            STEP_CAPACITIES
-                .iter()
-                .map(|&(_, n)| u64::from(n))
-                .max()
-                .unwrap_or(1),
+            steps.iter().map(|&(_, n)| u64::from(n)).max().unwrap_or(1),
         ),
     ]);
-    for (role, name, elements) in step_inputs(lengths.len()) {
+    for (role, name, elements) in step_inputs(lengths.len(), steps) {
         tensors.insert(
             role,
             PipelineTensor {
@@ -1411,7 +1433,7 @@ mod tests {
     }
 
     fn check_step(cfg: &Cfg, splits: Splits<'_>) {
-        let low = lower_programs(cfg, 132, 90, splits, STEP_CAPACITIES).unwrap();
+        let low = lower_programs(cfg, 132, 90, splits, CAPACITIES, STEP_CAPACITIES).unwrap();
         let model = &low.prefix.model;
         let name = |h: u32| model.tensors[h as usize].name.as_str();
         for &(b, f) in CAPACITIES {
@@ -1484,6 +1506,7 @@ mod tests {
             &low.lengths,
             &scales,
             low.seed,
+            STEP_CAPACITIES,
         )
         .unwrap();
         let meta: serde_json::Value = serde_json::from_slice(&meta.data).unwrap();
@@ -1509,13 +1532,30 @@ mod tests {
     }
 
     #[test]
+    fn max_rows_caps_both_capacity_sets() {
+        assert_eq!(
+            capped(None).unwrap(),
+            (CAPACITIES.to_vec(), STEP_CAPACITIES.to_vec())
+        );
+        let (decode, steps) = capped(Some(256)).unwrap();
+        assert_eq!(decode, [(1, 64), (2, 64), (4, 64), (1, 256)]);
+        assert_eq!(steps, [(1, 1), (1, 4), (1, 17), (4, 17), (8, 17)]);
+        assert!(capped(Some(32)).is_err());
+        let low = lower_programs(&fish(), 58, 89, None, &decode, &steps).unwrap();
+        assert_eq!((low.bmax, low.max_rows), (4, 256));
+        assert!(!low.roles.contains_key("decode.b16.f64"));
+        assert!(!low.roles.contains_key("step.b16.f17"));
+    }
+
+    #[test]
     fn step_programs_leave_decode_unchanged() {
         for cfg in [fish(), breeze()] {
             for split in [false, true] {
                 let s = |on: bool| on.then(|| std::cell::RefCell::new(BTreeMap::new()));
                 let (sa, sb) = (s(split), s(split));
-                let a = lower_programs(&cfg, 132, 90, sa.as_ref(), &[]).unwrap();
-                let b = lower_programs(&cfg, 132, 90, sb.as_ref(), STEP_CAPACITIES).unwrap();
+                let a = lower_programs(&cfg, 132, 90, sa.as_ref(), CAPACITIES, &[]).unwrap();
+                let b = lower_programs(&cfg, 132, 90, sb.as_ref(), CAPACITIES, STEP_CAPACITIES)
+                    .unwrap();
                 assert_eq!(sa, sb, "same weight layouts");
                 let (ma, mb) = (&a.prefix.model, &b.prefix.model);
                 assert_eq!(mb.progs.len(), ma.progs.len() + STEP_CAPACITIES.len());
