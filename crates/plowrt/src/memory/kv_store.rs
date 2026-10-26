@@ -1881,6 +1881,8 @@ mod tests {
         consumed: parking_lot::Mutex<std::collections::HashSet<u64>>,
         /// Runs inside `copy_dtod_batch` (the store lock must be free there).
         on_dtod: parking_lot::Mutex<Option<Box<dyn Fn() + Send>>>,
+        /// Block contents per address, moved by the copies (the model test).
+        mem: parking_lot::Mutex<std::collections::HashMap<u64, u64>>,
     }
 
     impl MockOps {
@@ -1897,7 +1899,15 @@ mod tests {
                 next_fence: AtomicU64::new(100),
                 consumed: parking_lot::Mutex::new(Default::default()),
                 on_dtod: parking_lot::Mutex::new(None),
+                mem: parking_lot::Mutex::new(Default::default()),
             })
+        }
+
+        fn mv(&self, dst: u64, src: u64) {
+            let mut m = self.mem.lock();
+            if let Some(v) = m.get(&src).copied() {
+                m.insert(dst, v);
+            }
         }
     }
 
@@ -1914,7 +1924,8 @@ mod tests {
             Ok(self.next.fetch_add(bytes + 4096, Ordering::SeqCst))
         }
         fn host_free(&self, _ptr: u64, _bytes: u64) {}
-        fn copy_dtoh_async(&self, _host: u64, _va: u64, _bytes: u64) -> Result<u64> {
+        fn copy_dtoh_async(&self, host: u64, va: u64, _bytes: u64) -> Result<u64> {
+            self.mv(host, va);
             Ok(self.next_fence.fetch_add(1, Ordering::SeqCst))
         }
         /// Like the CUDA tier: a retired fence is consumed, a second query of it is an error.
@@ -1928,15 +1939,20 @@ mod tests {
                 Err(RuntimeError::Device("mock: unknown fence".into()))
             }
         }
-        fn copy_htod(&self, _va: u64, _host: u64, _bytes: u64) -> Result<()> {
+        fn copy_htod(&self, va: u64, host: u64, _bytes: u64) -> Result<()> {
+            self.mv(va, host);
             self.htod.fetch_add(1, Ordering::SeqCst);
             Ok(())
         }
-        fn copy_htod_async(&self, _va: u64, _host: u64, _bytes: u64) -> Result<u64> {
+        fn copy_htod_async(&self, va: u64, host: u64, _bytes: u64) -> Result<u64> {
+            self.mv(va, host);
             self.htod_async.fetch_add(1, Ordering::SeqCst);
             Ok(self.next_fence.fetch_add(1, Ordering::SeqCst))
         }
         fn copy_dtod_batch(&self, copies: &[(u64, u64, u64)]) -> Result<()> {
+            for &(dst, src, _) in copies {
+                self.mv(dst, src);
+            }
             self.dtod.fetch_add(copies.len() as u64, Ordering::SeqCst);
             if let Some(f) = self.on_dtod.lock().as_ref() {
                 f();
@@ -2942,6 +2958,154 @@ mod tests {
         assert_eq!(s.evict(&[a.id, b.id]), 1);
         assert_eq!(s.stats().classes[0].device_blocks, 1);
         assert!(s.acquire(0, key(1)).map(|x| x.fill.is_none()).unwrap());
+    }
+
+    /// Random publishes, releases, gathers, spills, restores, evictions and shrinks over two
+    /// classes with the host tier on; every block's bytes are tracked per address through the
+    /// copies, and a gather must always read the bytes its key was filled with.
+    #[test]
+    fn model_every_gather_reads_its_own_key() {
+        let spec = |name| ClassSpec {
+            name,
+            row_bytes: 8,
+            rows_per_block: 4,
+        };
+        for seed in 1..=24u64 {
+            let ops = MockOps::new();
+            let s = Arc::new(KvStore::new(
+                ops.clone(),
+                vec![spec("window"), spec("tail")],
+                64, // two blocks per chunk
+                6 * 64,
+                4 * 64,
+            ));
+            while s.host_grow_step() {}
+            let mut rng = seed.wrapping_mul(0x9e37_79b9_7f4a_7c15) | 1;
+            let mut next = move |n: u64| {
+                rng ^= rng << 13;
+                rng ^= rng >> 7;
+                rng ^= rng << 17;
+                rng % n
+            };
+            let tag = |class: usize, k: u64| (class as u64 + 1) * 1000 + k;
+            // Dependencies held: (class, key, id).
+            let mut deps: Vec<(usize, u64, BlockId)> = Vec::new();
+            // Every id ever seen with its class and key (gathers try present ones).
+            let mut seen: Vec<(usize, u64, BlockId)> = Vec::new();
+            let mut holds: Vec<Hold> = Vec::new();
+            for step in 0..600 {
+                match next(10) {
+                    0..=3 => {
+                        let class = next(2) as usize;
+                        let k = next(10);
+                        let Ok(a) = s.acquire(class, key(k)) else {
+                            // Full: give the class a boundary back.
+                            if let Some(i) = (0..deps.len()).find(|&i| deps[i].0 == class) {
+                                let (_, _, id) = deps.swap_remove(i);
+                                s.release(&[id]);
+                            }
+                            continue;
+                        };
+                        if let Some(fill) = a.fill {
+                            ops.mem.lock().insert(a.va, tag(class, k));
+                            if next(8) == 0 {
+                                fill.fail();
+                            } else {
+                                fill.seal();
+                            }
+                        } else if s.state(a.id) == Some(State::Ready) {
+                            let _h = s.hold(vec![a.id]);
+                            let src = s.gather_src(a.id).unwrap();
+                            assert_eq!(
+                                ops.mem.lock().get(&src.va).copied(),
+                                Some(tag(class, k)),
+                                "seed {seed} step {step}: dedup hit of class {class} key {k} reads other bytes"
+                            );
+                        }
+                        deps.push((class, k, a.id));
+                        seen.push((class, k, a.id));
+                    }
+                    4 => {
+                        if !deps.is_empty() {
+                            let (_, _, id) = deps.swap_remove(next(deps.len() as u64) as usize);
+                            s.release(&[id]);
+                        }
+                    }
+                    5 => {
+                        if !seen.is_empty() {
+                            let (class, k, id) = seen[next(seen.len() as u64) as usize];
+                            if s.state(id) == Some(State::Ready) {
+                                let h = s.hold(vec![id]);
+                                let src = s.gather_src(id).unwrap();
+                                assert_eq!(
+                                    ops.mem.lock().get(&src.va).copied(),
+                                    Some(tag(class, k)),
+                                    "seed {seed} step {step}: gather of class {class} key {k} reads other bytes"
+                                );
+                                if next(3) == 0 {
+                                    holds.push(h);
+                                }
+                            }
+                        }
+                    }
+                    6 => {
+                        let ids: Vec<BlockId> = seen
+                            .iter()
+                            .filter(|_| next(2) == 0)
+                            .map(|&(_, _, id)| id)
+                            .collect();
+                        s.spill(&ids);
+                    }
+                    7 => {
+                        ops.pending.store(next(3) == 0, Ordering::SeqCst);
+                        s.reap();
+                        ops.pending.store(false, Ordering::SeqCst);
+                        if !seen.is_empty() {
+                            let (_, _, id) = seen[next(seen.len() as u64) as usize];
+                            let _ = s.restore_async(id);
+                        }
+                    }
+                    8 => {
+                        holds.clear();
+                        let ids: Vec<BlockId> = seen
+                            .iter()
+                            .filter(|_| next(2) == 0)
+                            .map(|&(_, _, id)| id)
+                            .collect();
+                        s.evict(&ids);
+                    }
+                    _ => {
+                        s.shrink(64 * (1 + next(3)));
+                    }
+                }
+                // Live blocks never alias on either tier.
+                let mut places: Vec<(bool, u64)> = Vec::new();
+                for &(_, _, id) in &seen {
+                    let Some(loc) = s.location(id) else { continue };
+                    let va = match loc {
+                        Location::Device(va) => va,
+                        Location::Host => {
+                            let _h = s.hold(vec![id]);
+                            s.gather_src(id).unwrap().va
+                        }
+                    };
+                    places.push((matches!(loc, Location::Host), va));
+                }
+                places.sort_unstable();
+                places.dedup();
+                let n = seen
+                    .iter()
+                    .filter(|&&(_, _, id)| s.location(id).is_some())
+                    .map(|&(c, k, _)| (c, k))
+                    .collect::<std::collections::HashSet<_>>()
+                    .len();
+                assert_eq!(
+                    places.len(),
+                    n,
+                    "seed {seed} step {step}: two live blocks share an address"
+                );
+            }
+        }
     }
 
     #[test]
