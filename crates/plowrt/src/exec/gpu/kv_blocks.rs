@@ -104,8 +104,31 @@ impl Drop for Deps<'_> {
 
 struct Table {
     host: PinnedHost,
-    dev: u64,
+    dev: TableDev,
     cap: usize,
+}
+
+/// A table's device half, allocated and freed through the pool's `VmmOps` (its `Oom` mapping
+/// and provenance record, which `Backend::alloc` lacks); freed once, when dropped.
+struct TableDev {
+    be: Arc<CudaBackend>,
+    va: u64,
+}
+
+impl TableDev {
+    fn alloc(be: &Arc<CudaBackend>, bytes: u64) -> Result<Self> {
+        let va = VmmOps::alloc(&**be, bytes)?;
+        Ok(TableDev {
+            be: Arc::clone(be),
+            va,
+        })
+    }
+}
+
+impl Drop for TableDev {
+    fn drop(&mut self) {
+        VmmOps::free(&*self.be, self.va);
+    }
 }
 
 #[derive(Clone, Debug, Default)]
@@ -137,7 +160,6 @@ pub struct BlockServeStats {
 }
 
 pub struct BlockServe {
-    be: Arc<CudaBackend>,
     store: Arc<KvStore>,
     /// Store class index per row class (`None` = the packet has no such rows).
     window: Option<usize>,
@@ -288,7 +310,6 @@ impl BlockServe {
             "kv store: armed"
         );
         Ok(Arc::new(BlockServe {
-            be: Arc::clone(be),
             store,
             window,
             tail,
@@ -365,9 +386,6 @@ impl Drop for BlockServe {
         // unproven.
         for hold in self.held.get_mut().drain(..).flatten() {
             hold.abandon();
-        }
-        for t in self.tables.get_mut().iter_mut().flatten() {
-            VmmOps::free(&*self.be, t.dev);
         }
     }
 }
@@ -796,10 +814,8 @@ impl GpuEngine {
                 let host = self
                     .be
                     .host_alloc_pinned(cap * std::mem::size_of::<Seg>())?;
-                let dev = VmmOps::alloc(&*self.be, (cap * std::mem::size_of::<Seg>()) as u64)?;
-                if let Some(old) = tables[b].replace(Table { host, dev, cap }) {
-                    VmmOps::free(&*self.be, old.dev);
-                }
+                let dev = TableDev::alloc(&self.be, (cap * std::mem::size_of::<Seg>()) as u64)?;
+                tables[b] = Some(Table { host, dev, cap });
                 tables[b].as_mut().expect("just set")
             }
         };
@@ -813,11 +829,11 @@ impl GpuEngine {
         }
         VmmOps::copy_htod(
             &*self.be,
-            table.dev,
+            table.dev.va,
             table.host.as_ptr() as u64,
             bytes as u64,
         )?;
-        let mut table_ptr = table.dev;
+        let mut table_ptr = table.dev.va;
         let mut n = segs.len() as u32;
         let mut params = [
             &mut table_ptr as *mut u64 as *mut c_void,
