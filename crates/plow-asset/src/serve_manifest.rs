@@ -12,7 +12,13 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 pub const SECTION: &str = "serve.json";
-pub const VERSION: u32 = 1;
+/// The version `plowc` emits. Version 2 DECLARES what the model answers in ([`ResponseSpec`]) and
+/// which built-in builder a template-less checkpoint gets; the server reads nothing from the
+/// template text or the vocabulary for it. Version 1 (and a legacy packet without the section)
+/// left those to the server's own probes.
+pub const VERSION: u32 = 2;
+/// The version [`ServeManifest::from_checkpoint`] synthesizes for a legacy packet.
+pub const LEGACY_VERSION: u32 = 1;
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -54,9 +60,93 @@ pub struct ChatSpec {
     pub bos_token: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub eos_token: Option<String>,
-    /// Markers framing a reasoning trace in the generation; absent: no trace is split out.
+    /// Version 1: markers framing a reasoning trace in the generation; absent: the server reads
+    /// the template for them. Version 2 declares them in `response` instead.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reasoning: Option<ReasoningTags>,
+    /// Version 2: what the model answers in. Required when the manifest has a `chat` section.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub response: Option<ResponseSpec>,
+}
+
+/// What a version-2 packet's model answers in, fixed at emit from the template and the
+/// vocabulary. Explicit `none` states, so an emitter that forgot a field fails validation
+/// instead of being read as "no tools" or "no trace".
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ResponseSpec {
+    /// `"none"` (the template never renders `tools`), `"unparsed"` (it does, in a syntax the
+    /// server has no parser for) or the syntax's id (`ToolFormat::name`).
+    pub tools: String,
+    pub reasoning: ReasoningDecl,
+}
+
+/// Whether, and how, the model frames a reasoning trace in its generation.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum ReasoningDecl {
+    None,
+    Tags { open: String, close: String },
+}
+
+impl ReasoningDecl {
+    pub fn markers(&self) -> Option<(&str, &str)> {
+        match self {
+            ReasoningDecl::None => None,
+            ReasoningDecl::Tags { open, close } => Some((open, close)),
+        }
+    }
+}
+
+impl ResponseSpec {
+    pub const TOOLS_NONE: &'static str = "none";
+    pub const TOOLS_UNPARSED: &'static str = "unparsed";
+
+    /// The declared tool support, when the id is one this build knows.
+    pub fn tool_support(&self) -> Option<crate::chat::ToolSupport> {
+        use crate::chat::{ToolFormat, ToolSupport};
+        Some(match self.tools.as_str() {
+            Self::TOOLS_NONE => ToolSupport::None,
+            Self::TOOLS_UNPARSED => ToolSupport::Unparsed,
+            id => ToolSupport::Format(ToolFormat::from_name(id)?),
+        })
+    }
+
+    fn from_template(t: &crate::chat::ChatTemplate, think_tokens: bool) -> Self {
+        use crate::chat::ToolSupport;
+        let tools = match t.tools {
+            ToolSupport::None => Self::TOOLS_NONE.to_string(),
+            ToolSupport::Unparsed => Self::TOOLS_UNPARSED.to_string(),
+            ToolSupport::Format(f) => f.name().to_string(),
+        };
+        ResponseSpec {
+            tools,
+            reasoning: reasoning_decl(t.reasoning, think_tokens),
+        }
+    }
+}
+
+/// The version-1 server's precedence, now fixed at emit: `<think>` when the tokenizer's added
+/// tokens have the pair (the version-1 manifest declared it, and a declaration beat the template);
+/// else a trace channel of the template's own (Gemma 4); else none. A template that mentions
+/// `<think>` without the tokens is a trace the model only ever closes.
+fn reasoning_decl(template: Option<(&str, &str)>, think_tokens: bool) -> ReasoningDecl {
+    let think = ReasoningTags::think();
+    if think_tokens {
+        return ReasoningDecl::Tags {
+            open: think.open,
+            close: think.close,
+        };
+    }
+    match template {
+        Some((open, close)) if (open, close) != (think.open.as_str(), think.close.as_str()) => {
+            ReasoningDecl::Tags {
+                open: open.into(),
+                close: close.into(),
+            }
+        }
+        _ => ReasoningDecl::None,
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -129,7 +219,85 @@ impl ServeManifest {
                 m.version
             ));
         }
+        m.validate()?;
         Ok(m)
+    }
+
+    /// Whether the packet declares its serving choices (version 2) rather than leaving them to
+    /// the server's probes.
+    pub fn declares_response(&self) -> bool {
+        self.version >= 2
+    }
+
+    /// The version's invariants: version 1 carries no version-2 fields; version 2 declares the
+    /// response protocol with known ids, names a template that compiles or a known built-in
+    /// builder, and no version-1 reasoning field.
+    fn validate(&self) -> Result<(), String> {
+        let bad = |what: String| Err(format!("{SECTION} version {}: {what}", self.version));
+        let Some(chat) = &self.chat else {
+            return Ok(());
+        };
+        if !self.declares_response() {
+            if chat.response.is_some() {
+                return bad("`chat.response` is a version-2 field".into());
+            }
+            return Ok(());
+        }
+        if chat.reasoning.is_some() {
+            return bad(
+                "`chat.reasoning` is a version-1 field; declare `chat.response.reasoning`".into(),
+            );
+        }
+        let Some(response) = &chat.response else {
+            return bad("`chat.response` is required".into());
+        };
+        if response.tool_support().is_none() {
+            return bad(format!(
+                "`chat.response.tools` {:?} is not a tool syntax this build parses",
+                response.tools
+            ));
+        }
+        if let ReasoningDecl::Tags { open, close } = &response.reasoning {
+            if open.is_empty() || close.is_empty() {
+                return bad("`chat.response.reasoning` tags must be non-empty".into());
+            }
+        }
+        if let Some(id) = &chat.builtin {
+            if !crate::chat::BUILTIN_IDS.contains(&id.as_str()) {
+                return bad(format!(
+                    "`chat.builtin` {id:?} is not a built-in builder this build has"
+                ));
+            }
+        }
+        match &chat.template {
+            Some(text) => {
+                crate::chat::ChatTemplate::check(
+                    text,
+                    chat.source.clone().unwrap_or_else(|| SECTION.into()),
+                    chat.bos_token.clone(),
+                    chat.eos_token.clone(),
+                )
+                .map_err(|e| {
+                    format!(
+                        "{SECTION} version {}: chat template does not compile: {e}",
+                        self.version
+                    )
+                })?;
+            }
+            None if chat.builtin.is_none() => {
+                return bad("`chat` names neither a template nor a built-in builder".into());
+            }
+            // The built-in builders render no tools, so a packet served by one cannot declare a
+            // tool syntax the request planner would never see.
+            None if response.tools != ResponseSpec::TOOLS_NONE => {
+                return bad(format!(
+                    "`chat.response.tools` {:?} with a built-in builder and no template",
+                    response.tools
+                ));
+            }
+            None => {}
+        }
+        Ok(())
     }
 
     pub fn to_json(&self) -> Vec<u8> {
@@ -149,13 +317,14 @@ impl ServeManifest {
                 builtin: None,
                 bos_token: t.bos_token,
                 eos_token: t.eos_token,
+                response: None,
             });
         let mut stop_token_ids = read_eos_ids(checkpoint_dir);
         stop_token_ids.extend(chat_stop_ids(checkpoint_dir, &stop_token_ids));
         stop_token_ids.sort_unstable();
         stop_token_ids.dedup();
         ServeManifest {
-            version: VERSION,
+            version: LEGACY_VERSION,
             chat,
             stop_token_ids,
             sampling: read_sampling(asset_dir).or_else(|| read_sampling(checkpoint_dir)),
@@ -164,11 +333,60 @@ impl ServeManifest {
             weights: Vec::new(),
         }
     }
+
+    /// The manifest `plowc` emits (version [`VERSION`]): [`Self::from_checkpoint`]'s reads, with
+    /// the response protocol declared from the template (compiled here, so one that does not
+    /// compile fails the emit) and the vocabulary, and the built-in builder named for a
+    /// checkpoint that ships no template. A checkpoint with neither a template nor a vocabulary
+    /// naming a builder serves no chat route (`chat: None`): the version-1 server fell back to
+    /// Gemma's builder for it, logging that the model almost certainly does not use that format,
+    /// and a deliberately wrong prompt is not a chat route. Still no serve defaults and no weight
+    /// pins.
+    pub fn emit(asset_dir: &Path, checkpoint_dir: &Path) -> Result<Self, String> {
+        let mut m = Self::from_checkpoint(asset_dir, checkpoint_dir);
+        m.version = VERSION;
+        let think = think_tags_in(asset_dir, checkpoint_dir);
+        m.chat = match m.chat.take() {
+            Some(mut chat) => {
+                let text = chat
+                    .template
+                    .clone()
+                    .expect("from_checkpoint fills the template");
+                let t = crate::chat::ChatTemplate::compile(
+                    text,
+                    chat.source.clone().unwrap_or_else(|| SECTION.into()),
+                    chat.bos_token.clone(),
+                    chat.eos_token.clone(),
+                )?;
+                chat.reasoning = None;
+                chat.response = Some(ResponseSpec::from_template(&t, think));
+                Some(chat)
+            }
+            None => {
+                let one = |marker: &str| added_token_in(asset_dir, checkpoint_dir, marker);
+                crate::chat::builtin_for(one).map(|builtin| ChatSpec {
+                    builtin: Some(builtin.into()),
+                    response: Some(ResponseSpec {
+                        tools: ResponseSpec::TOOLS_NONE.into(),
+                        reasoning: reasoning_decl(None, think),
+                    }),
+                    ..Default::default()
+                })
+            }
+        };
+        m.validate()?;
+        Ok(m)
+    }
 }
 
-/// Whether the tokenizer declares `<think>` and `</think>` as added tokens: the checkpoint frames
-/// reasoning with them (Qwen3, GLM, DeepSeek-R1).
-fn think_tags_in(asset_dir: &Path, checkpoint_dir: &Path) -> bool {
+/// The tokenizer's `added_tokens` (`asset_dir`, its `checkpoint/`, then `checkpoint_dir`: the
+/// order the server loads `tokenizer.json` in, so the builder the compiler names is the one the
+/// server's own probe would have found in that vocabulary). The version-2 builder contract is
+/// bounded by this file: a marker is "one token" when it is an added token. A marker that the
+/// base vocabulary happens to encode as one id without being an added token names no builder
+/// here, and a checkpoint without `tokenizer.json` (served by the byte-fallback tokenizer, which
+/// the GPU engines refuse) has none.
+pub fn added_tokens(asset_dir: &Path, checkpoint_dir: &Path) -> Vec<String> {
     [
         asset_dir.join("tokenizer.json"),
         asset_dir.join("checkpoint").join("tokenizer.json"),
@@ -178,15 +396,31 @@ fn think_tags_in(asset_dir: &Path, checkpoint_dir: &Path) -> bool {
     .find_map(|p| std::fs::read(p).ok())
     .and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok())
     .and_then(|v| {
-        let added = v.get("added_tokens")?.as_array()?;
-        let has = |t: &str| {
-            added
+        Some(
+            v.get("added_tokens")?
+                .as_array()?
                 .iter()
-                .any(|e| e.get("content").and_then(|c| c.as_str()) == Some(t))
-        };
-        Some(has("<think>") && has("</think>"))
+                .filter_map(|e| e.get("content")?.as_str().map(str::to_string))
+                .collect(),
+        )
     })
-    .unwrap_or(false)
+    .unwrap_or_default()
+}
+
+/// Whether `marker` is one added token of the tokenizer: the server's "one id in its own vocab"
+/// probe, as the tokenizer files state it.
+fn added_token_in(asset_dir: &Path, checkpoint_dir: &Path, marker: &str) -> bool {
+    added_tokens(asset_dir, checkpoint_dir)
+        .iter()
+        .any(|t| t == marker)
+}
+
+/// Whether the tokenizer declares `<think>` and `</think>` as added tokens: the checkpoint frames
+/// reasoning with them (Qwen3, GLM, DeepSeek-R1).
+fn think_tags_in(asset_dir: &Path, checkpoint_dir: &Path) -> bool {
+    let added = added_tokens(asset_dir, checkpoint_dir);
+    let has = |t: &str| added.iter().any(|a| a == t);
+    has("<think>") && has("</think>")
 }
 
 fn read_json(p: &Path) -> Option<serde_json::Value> {
@@ -503,7 +737,7 @@ mod tests {
     #[test]
     fn round_trips_and_refuses_newer_versions() {
         let m = ServeManifest {
-            version: VERSION,
+            version: LEGACY_VERSION,
             chat: Some(ChatSpec {
                 template: Some("{{ x }}".into()),
                 reasoning: Some(ReasoningTags::think()),
@@ -533,8 +767,221 @@ mod tests {
             ServeManifest::parse(br#"{"version":1}"#).unwrap().chat,
             None
         );
-        assert!(ServeManifest::parse(br#"{"version":2}"#).is_err());
+        assert!(ServeManifest::parse(br#"{"version":3}"#).is_err());
         assert!(ServeManifest::parse(br#"{"version":1,"later":true}"#).is_err());
+    }
+
+    fn v2(chat: serde_json::Value) -> Result<ServeManifest, String> {
+        ServeManifest::parse(
+            serde_json::json!({"version": 2, "chat": chat})
+                .to_string()
+                .as_bytes(),
+        )
+    }
+
+    #[test]
+    fn version_2_declares_the_response_or_is_refused() {
+        let ok = v2(serde_json::json!({
+            "template": "{{ messages[0].content }}",
+            "response": {"tools": "hermes", "reasoning": {"kind": "tags", "open": "<think>", "close": "</think>"}}
+        }))
+        .unwrap();
+        assert!(ok.declares_response());
+        let response = ok.chat.as_ref().unwrap().response.as_ref().unwrap();
+        assert_eq!(
+            response.tool_support(),
+            Some(crate::chat::ToolSupport::Format(
+                crate::chat::ToolFormat::Hermes
+            ))
+        );
+        assert_eq!(response.reasoning.markers(), Some(("<think>", "</think>")));
+        assert_eq!(ServeManifest::parse(&ok.to_json()).unwrap(), ok);
+        // No `chat` at all is a completions-only packet, on either version.
+        assert!(ServeManifest::parse(br#"{"version":2}"#)
+            .unwrap()
+            .chat
+            .is_none());
+        let builtin = v2(serde_json::json!({
+            "builtin": "k3", "response": {"tools": "none", "reasoning": {"kind": "none"}}
+        }))
+        .unwrap();
+        assert_eq!(builtin.chat.unwrap().builtin.as_deref(), Some("k3"));
+
+        let refused = |chat: serde_json::Value, what: &str| {
+            let err = v2(chat).expect_err(what);
+            assert!(err.contains(what), "{err}");
+        };
+        refused(
+            serde_json::json!({"template": "{{ x }}"}),
+            "`chat.response` is required",
+        );
+        refused(
+            serde_json::json!({"template": "{{ x }}", "reasoning": {"open": "<think>", "close": "</think>"},
+                "response": {"tools": "none", "reasoning": {"kind": "none"}}}),
+            "version-1 field",
+        );
+        refused(
+            serde_json::json!({"template": "{{ x }}", "response": {"tools": "xml2", "reasoning": {"kind": "none"}}}),
+            "not a tool syntax",
+        );
+        refused(
+            serde_json::json!({"template": "{{ x }}", "response": {"tools": "none",
+                "reasoning": {"kind": "tags", "open": "", "close": "</think>"}}}),
+            "must be non-empty",
+        );
+        refused(
+            serde_json::json!({"template": "{{ x }}", "response": {"tools": "none", "reasoning": {"kind": "other"}}}),
+            "serve.json",
+        );
+        refused(
+            serde_json::json!({"builtin": "mistral", "response": {"tools": "none", "reasoning": {"kind": "none"}}}),
+            "not a built-in builder",
+        );
+        refused(
+            serde_json::json!({"builtin": "harmony", "response": {"tools": "harmony", "reasoning": {"kind": "none"}}}),
+            "with a built-in builder and no template",
+        );
+        refused(
+            serde_json::json!({"response": {"tools": "none", "reasoning": {"kind": "none"}}}),
+            "neither a template nor a built-in builder",
+        );
+        refused(
+            serde_json::json!({"template": "{% if %}", "response": {"tools": "none", "reasoning": {"kind": "none"}}}),
+            "does not compile",
+        );
+        // Version 1 never carries the declaration.
+        let err = ServeManifest::parse(
+            br#"{"version":1,"chat":{"template":"x","response":{"tools":"none","reasoning":{"kind":"none"}}}}"#,
+        )
+        .unwrap_err();
+        assert!(err.contains("version-2 field"), "{err}");
+    }
+
+    #[test]
+    fn emit_declares_from_the_template_and_the_vocabulary() {
+        let d = tmp("emit");
+        std::fs::write(
+            d.join("chat_template.jinja"),
+            "{% for m in messages %}{{ m.content }}{% endfor %}{% if tools %}<tool_call>{{ tools | tojson }}{% endif %}<think>",
+        )
+        .unwrap();
+        std::fs::write(d.join("generation_config.json"), r#"{"eos_token_id":1}"#).unwrap();
+        // No tokenizer: the template's `<think>` alone does not declare a trace.
+        let m = ServeManifest::emit(&d, &d).unwrap();
+        assert_eq!(m.version, VERSION);
+        let chat = m.chat.as_ref().unwrap();
+        assert_eq!(chat.reasoning, None);
+        let response = chat.response.as_ref().unwrap();
+        assert_eq!(response.tools, "hermes");
+        assert_eq!(response.reasoning, ReasoningDecl::None);
+        assert_eq!(ServeManifest::parse(&m.to_json()).unwrap(), m);
+        // The tokenizer's `<think>` tokens do.
+        std::fs::write(
+            d.join("tokenizer.json"),
+            r#"{"added_tokens":[{"content":"<think>"},{"content":"</think>"},{"content":"<|end_of_msg|>"}]}"#,
+        )
+        .unwrap();
+        let m = ServeManifest::emit(&d, &d).unwrap();
+        let response = m.chat.unwrap().response.unwrap();
+        assert_eq!(response.reasoning.markers(), Some(("<think>", "</think>")));
+        // The tokenizer's `<think>` tokens win over a template's own channel (the version-1
+        // manifest declared `<think>` from the tokens, and a declaration beat the template);
+        // without the tokens the channel is declared.
+        std::fs::write(
+            d.join("chat_template.jinja"),
+            "{{ messages[0].content }}<|channel>thought
+<channel|>",
+        )
+        .unwrap();
+        let m = ServeManifest::emit(&d, &d).unwrap();
+        let response = m.chat.unwrap().response.unwrap();
+        assert_eq!(response.tools, "none");
+        assert_eq!(response.reasoning.markers(), Some(("<think>", "</think>")));
+        std::fs::write(
+            d.join("tokenizer.json"),
+            r#"{"added_tokens":[{"content":"<|end_of_msg|>"}]}"#,
+        )
+        .unwrap();
+        let m = ServeManifest::emit(&d, &d).unwrap();
+        let response = m.chat.unwrap().response.unwrap();
+        assert_eq!(
+            response.reasoning.markers(),
+            Some(("<|channel>thought", "<channel|>"))
+        );
+        // No template: the vocabulary names the builder (K3 here, whose `<think>` tokens were
+        // removed above, so no trace is declared and no tool syntax).
+        std::fs::remove_file(d.join("chat_template.jinja")).unwrap();
+        let m = ServeManifest::emit(&d, &d).unwrap();
+        let chat = m.chat.unwrap();
+        assert_eq!(chat.builtin.as_deref(), Some("k3"));
+        assert_eq!(chat.template, None);
+        let response = chat.response.unwrap();
+        assert_eq!(response.tools, "none");
+        assert_eq!(response.reasoning, ReasoningDecl::None);
+        // Neither: no chat route. (The version-1 server served Gemma's format here, with an error
+        // log; a wrong prompt is not a chat route.)
+        std::fs::write(d.join("tokenizer.json"), r#"{"added_tokens":[]}"#).unwrap();
+        let m = ServeManifest::emit(&d, &d).unwrap();
+        assert_eq!(m.chat, None);
+        assert_eq!(ServeManifest::parse(&m.to_json()).unwrap(), m);
+        // A template that does not compile fails the emit, never falls back.
+        std::fs::write(d.join("chat_template.jinja"), "{% if %}").unwrap();
+        assert!(ServeManifest::emit(&d, &d).is_err());
+        std::fs::remove_dir_all(&d).unwrap();
+    }
+
+    #[test]
+    fn the_asset_tokenizer_names_the_builder_before_the_checkpoints() {
+        // The server loads the asset directory's tokenizer first; the compiler reads the same file
+        // first, so a checkpoint whose vocabulary says otherwise does not change the builder.
+        let d = tmp("builder-precedence");
+        std::fs::create_dir_all(d.join("checkpoint")).unwrap();
+        let other = tmp("builder-precedence-ckpt");
+        std::fs::write(d.join("generation_config.json"), r#"{"eos_token_id":1}"#).unwrap();
+        std::fs::write(
+            other.join("tokenizer.json"),
+            r#"{"added_tokens":[{"content":"<|end_of_msg|>"}]}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            ServeManifest::emit(&d, &other)
+                .unwrap()
+                .chat
+                .unwrap()
+                .builtin
+                .as_deref(),
+            Some("k3")
+        );
+        std::fs::write(
+            d.join("checkpoint/tokenizer.json"),
+            r#"{"added_tokens":[{"content":"<|assistant|>"}]}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            ServeManifest::emit(&d, &other)
+                .unwrap()
+                .chat
+                .unwrap()
+                .builtin
+                .as_deref(),
+            Some("glm")
+        );
+        std::fs::write(
+            d.join("tokenizer.json"),
+            r#"{"added_tokens":[{"content":"<|turn>"}]}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            ServeManifest::emit(&d, &other)
+                .unwrap()
+                .chat
+                .unwrap()
+                .builtin
+                .as_deref(),
+            Some("gemma")
+        );
+        std::fs::remove_dir_all(&d).unwrap();
+        std::fs::remove_dir_all(&other).unwrap();
     }
 
     #[test]

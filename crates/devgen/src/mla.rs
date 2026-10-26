@@ -1978,7 +1978,7 @@ pub(crate) fn glm53_emit_full(
         m.bake_gen();
     }
     let lean = crate::apply_verify_gate(&m, verify);
-    std::fs::write(out, m.to_blob()).unwrap();
+    std::fs::write(out, m.to_blob_v6(&[crate::serve_section::section_for(dir)])).unwrap();
     eprintln!("glm53-FULL: 45 layers (34 KDA + 11 sparse MLA), ctx={ctx}, tp={tp} -> {out}");
     write_mla_manifest(&m, out, target, enc, c.quark_mixed, &lean);
 }
@@ -14354,7 +14354,7 @@ fn glm_emit_full(
     }
     // Gate BEFORE the bytes land: a rejected program must never exist on disk.
     let lean = crate::apply_verify_gate(&m, verify);
-    std::fs::write(out, m.to_blob()).unwrap();
+    std::fs::write(out, m.to_blob_v6(&[crate::serve_section::section_for(dir)])).unwrap();
     eprintln!(
         "glm52-FULL: {} layers (0-{}) hidden={} experts={}/top{} vocab={} {} -> {out}\n  \
          {n_ops} ops, decode M=1, ctx={ctx}, tp={tp}",
@@ -14672,7 +14672,7 @@ pub(crate) fn glm_main(
     // acceptable only because there is also nothing here to over-claim — a
     // consumer that finds no manifest cannot read a verification status off it.
     let _lean = crate::apply_verify_gate(&m, verify);
-    std::fs::write(out, m.to_blob()).unwrap();
+    std::fs::write(out, m.to_blob_v6(&[crate::serve_section::section_for(dir)])).unwrap();
     eprintln!(
         "glm52: GlmMoeDsa {} layers hidden={} heads={} kv_lora={} q_lora={} qk={}+{} v={} \
          experts={}/top{} moe_inter={} scale={:.4}",

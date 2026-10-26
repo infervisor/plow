@@ -434,6 +434,27 @@ A cold and a cached prefill split the prompt differently, so their bf16 rounding
 ≤ `tie_margin`, default 0.25). The served load test (`scripts/mm/load.py`: concurrency, cancel,
 slab exhaustion, slab leaks) is a separate run.
 
+### Serve goldens (prompt bytes and token ids of the production packets)
+
+`crates/plowrt/tests/fixtures/serve_golden/<packet>.json` freezes, per production asset
+directory, what the chat handler decides for a fixed set of conversations: rendered prompt bytes,
+token ids, tool syntax and forced-call opener, reasoning split state, the template's thinking
+switch, the stop set, and the digests of the inputs those decisions come from (tokenizer,
+tokenizer config, `serve.json`, template). A re-emit must reproduce them byte for byte or it needs
+GPU re-qualification. CPU only; needs the asset directories:
+
+```
+PLOW_SERVE_GOLDEN="qwen38-27b-bf16=<assets>,qwen38-27b-fp8=<assets>,gemma4-12b=<assets>,\
+gemma4-26b-a4b-fp8=<assets>,gemma4-26b-a4b-bf16=<assets>,gemma4-e4b=<assets>" \
+  cargo test -p plowrt --features cuda,hsa --lib golden_tests
+```
+
+A check run must name every checked-in golden. `PLOW_SERVE_GOLDEN_RECORD=1` re-records (review
+the fixture diff: a changed case is a changed prompt). To compare a re-emitted packet with its
+predecessor, record it under another name and diff the two files case by case; the device bytes
+and the other sections are compared with `scripts/packet_sections.py` (section-aware; the
+generated-kernel digests in `segment_roles.json` are not reproducible across nvcc runs).
+
 ---
 
 ## 6. Measurement hazards

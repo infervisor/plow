@@ -1665,6 +1665,9 @@ pub(super) fn run(
     crate::object_requirements::append(&m, &mut sections)
         .unwrap_or_else(|error| panic!("object requirements: {error}"));
     sections.push(recurrent_state_section(&m, batch));
+    if c.block.is_none() {
+        sections.push(crate::serve_section::section_for(dir));
+    }
     let bytes = if let Some(layer) = c.block {
         use plow_asset::*;
         let full = c.layers[layer];

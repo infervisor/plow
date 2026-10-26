@@ -8,7 +8,7 @@ use packet::devbuild::{SectionData, SECT_METADATA};
 use plow_asset::serve_manifest::{self, ServeManifest};
 
 pub(crate) fn manifest(dir: &Path, serve_defaults: Option<&str>) -> Result<ServeManifest, String> {
-    let mut m = ServeManifest::from_checkpoint(dir, dir);
+    let mut m = ServeManifest::emit(dir, dir)?;
     // The template's file name, not the emitting host's path.
     if let Some(chat) = m.chat.as_mut() {
         chat.source = chat
@@ -42,6 +42,13 @@ pub(crate) fn section(dir: &Path, serve_defaults: Option<&str>) -> Result<Sectio
     })
 }
 
+/// [`section`] for the full-model emitters outside the dense path, with the emit config's
+/// `PLOW_EMIT_SERVE_DEFAULTS`; a checkpoint the manifest cannot be built from fails the emit.
+pub(crate) fn section_for(dir: &Path) -> SectionData {
+    section(dir, crate::emit_config::active().serve_defaults.as_deref())
+        .unwrap_or_else(|error| panic!("serve manifest: {error}"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -51,7 +58,14 @@ mod tests {
         let d = std::env::temp_dir().join(format!("devgen-serve-section-{}", std::process::id()));
         std::fs::create_dir_all(&d).unwrap();
         std::fs::write(d.join("generation_config.json"), r#"{"eos_token_id":1}"#).unwrap();
+        // No template and no vocabulary: no chat route, completions only.
+        assert_eq!(manifest(&d, None).unwrap().chat, None);
+        std::fs::write(d.join("chat_template.jinja"), "{{ messages[0].content }}").unwrap();
         let m = manifest(&d, Some("PLOW_PF_INTERLEAVE=2048, PLOW_MULTISTEP=0")).unwrap();
+        assert_eq!(m.version, serve_manifest::VERSION);
+        let chat = m.chat.as_ref().unwrap();
+        assert_eq!(chat.source.as_deref(), Some("chat_template.jinja"));
+        assert_eq!(chat.response.as_ref().unwrap().tools, "none");
         assert_eq!(m.serve_defaults["PLOW_PF_INTERLEAVE"], "2048");
         assert_eq!(m.serve_defaults["PLOW_MULTISTEP"], "0");
         assert_eq!(m.stop_token_ids, [1]);

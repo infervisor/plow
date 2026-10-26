@@ -775,6 +775,7 @@ pub(crate) fn dp_unavailable(model: &str) -> Response {
 ///
 /// Unknown family → Gemma's format, the previous behavior.
 /// Why a chat conversation has no prompt.
+#[derive(Debug)]
 pub(crate) enum PromptError {
     /// The template REFUSED this conversation (HF templates call `raise_exception` for shapes
     /// they cannot render, e.g. an out-of-order role sequence); a 400, never another prompt.
@@ -801,9 +802,10 @@ pub(crate) fn chat_prompt(
         });
     }
     Ok(match bundle.map(|b| b.serve()) {
-        // A packet that names a built-in builder gets exactly it. One that carries neither
-        // a usable template nor a builder (checkpoints without a template, e.g. Kimi-K3)
-        // keeps the vocabulary-probed builders it was served with before serve.json.
+        // A packet that names a built-in builder gets exactly it. A version-1 packet that
+        // carries neither a usable template nor a builder (checkpoints without a template, e.g.
+        // Kimi-K3) keeps the vocabulary-probed builders it was served with before serve.json; a
+        // version-2 packet declared its builder at emit, so nothing is probed for it.
         Some(serve) if serve.from_packet => {
             match serve
                 .manifest
@@ -814,6 +816,11 @@ pub(crate) fn chat_prompt(
                 Some(id) => builtin_chat_prompt(id, messages).ok_or_else(|| {
                     PromptError::NoTemplate(format!("unknown built-in chat format {id:?}"))
                 })?,
+                None if serve.manifest.declares_response() => {
+                    return Err(PromptError::NoTemplate(
+                        "the packet declares no chat template and no built-in chat format".into(),
+                    ))
+                }
                 None => gpu_chat_prompt(bundle, messages),
             }
         }

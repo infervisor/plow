@@ -1,6 +1,7 @@
 {
   "inputs": {
     "tokenizer_sha256": "cc8d3a0ce36466ccc1278bf987df5f71db1719b9ca6b4118264f45cb627bfe0f",
+    "tokenizer_config_sha256": "9f4fec4b1dc6ecddf8f4a92e9caea5971c0e67d81309f3f9066a2bee8c362633",
     "serve_json_sha256": "1accb97e1f28496d886927c8248121d861ba70cfdfaaf53ad2e0aa5e672e1448",
     "template_source": "chat_template.jinja",
     "template_sha256": "ae53464bf3be25802b3a5b37def7fd89667067d7577049b3b2d74c4d8de4c6d4"
@@ -22,6 +23,7 @@
     "thinking_default": false,
     "thinking_off": false,
     "builtin": null,
+    "builtin_probe": "gemma",
     "bos_token": "<bos>",
     "eos_token": "<eos>",
     "stop_token_ids": [

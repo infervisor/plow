@@ -233,16 +233,33 @@ fn inputs(dir: &Path, bundle: &ModelBundle) -> Value {
     json!({
         "tokenizer_sha256": file_sha256(&dir.join("tokenizer.json"))
             .or_else(|| file_sha256(&checkpoint.join("tokenizer.json"))),
+        "tokenizer_config_sha256": file_sha256(&dir.join("tokenizer_config.json"))
+            .or_else(|| file_sha256(&checkpoint.join("tokenizer_config.json"))),
         "serve_json_sha256": serve_section,
         "template_source": template.map(|t| portable(&t.source)),
         "template_sha256": template_text.map(|t| sha256_hex(t.as_bytes())),
     })
 }
 
-fn model_facts(bundle: &ModelBundle) -> Value {
+fn model_facts(dir: &Path, bundle: &ModelBundle) -> Value {
     let serve = bundle.serve();
     let template = bundle.chat_template();
     let chat = serve.manifest.chat.as_ref();
+    // The builder the server's tokenizer probe names, and the one the compiler reads off the
+    // tokenizer file's added tokens: the emit-time shortcut must agree with the runtime predicate
+    // on every production vocabulary.
+    let tok = bundle.tokenizer();
+    let by_tokenizer =
+        plow_asset::chat::builtin_for(|m| !tok.is_byte_fallback() && tok.encode(m).len() == 1);
+    let added =
+        plow_asset::serve_manifest::added_tokens(dir, &crate::asset::serve::checkpoint_dir(dir));
+    let by_added = plow_asset::chat::builtin_for(|m| added.iter().any(|t| t == m));
+    assert_eq!(
+        by_tokenizer,
+        by_added,
+        "{}: the added-token builder probe disagrees with the tokenizer probe",
+        dir.display()
+    );
     let mut stop_ids = serve.manifest.stop_token_ids.clone();
     stop_ids.sort_unstable();
     stop_ids.dedup();
@@ -262,6 +279,7 @@ fn model_facts(bundle: &ModelBundle) -> Value {
         "thinking_default": template.map(|t| t.thinking_requested(&empty)),
         "thinking_off": template.map(|t| t.thinking_requested(&off)),
         "builtin": chat.and_then(|c| c.builtin.clone()),
+        "builtin_probe": by_tokenizer,
         "bos_token": chat.and_then(|c| c.bos_token.clone()),
         "eos_token": chat.and_then(|c| c.eos_token.clone()),
         "stop_token_ids": stop_ids,
@@ -277,7 +295,7 @@ fn snapshot(dir: &Path) -> Value {
         .collect();
     json!({
         "inputs": inputs(dir, &bundle),
-        "model": model_facts(&bundle),
+        "model": model_facts(dir, &bundle),
         "cases": cases,
     })
 }
@@ -305,6 +323,23 @@ fn production_packets_match_their_serve_goldens() {
         return;
     }
     let record = std::env::var_os(RECORD).is_some();
+    if !record {
+        // A check run names the whole production set: a golden nobody replays is no gate.
+        let mut fixtures: Vec<String> = std::fs::read_dir(fixtures())
+            .expect("fixtures")
+            .filter_map(|e| {
+                let p = e.unwrap().path();
+                let n = p.file_name()?.to_str()?.to_string();
+                n.strip_suffix(".json")
+                    .filter(|s| !s.ends_with(".actual"))
+                    .map(str::to_string)
+            })
+            .collect();
+        fixtures.sort();
+        let mut named: Vec<String> = assets.iter().map(|(n, _)| n.clone()).collect();
+        named.sort();
+        assert_eq!(named, fixtures, "{ENV} must name every checked-in golden");
+    }
     let mut failures = Vec::new();
     for (name, dir) in assets {
         let got = snapshot(&dir);

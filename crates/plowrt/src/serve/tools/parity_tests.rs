@@ -13,7 +13,7 @@ use serde_json::Value;
 use super::request::{render, RenderError};
 use super::{ToolFormat, ToolSupport};
 use crate::serve::openai::ChatRequest;
-use crate::serve::template::RenderOpts;
+use crate::serve::template::{ChatTemplate, RenderOpts};
 
 fn fixtures() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/toolcall")
@@ -107,3 +107,134 @@ fn every_family_renders_tool_conversations_like_transformers() {
     }
     eprintln!("token ids compared for {id_checked} renders");
 }
+
+/// What the compiler declares for a family (version-2 `serve.json`), serialized, parsed back and
+/// compiled from the declaration alone, decides tools, openers and reasoning exactly as the
+/// version-1 server's probes did for the same template.
+#[test]
+fn emitted_declarations_reload_to_the_probed_decisions() {
+    use crate::serve::reasoning::ReasoningMode;
+    use plow_asset::serve_manifest::ServeManifest;
+    let mut families: Vec<_> = std::fs::read_dir(fixtures())
+        .expect("fixtures")
+        .map(|e| e.unwrap().path())
+        .collect();
+    families.sort();
+    for dir in families {
+        let family = dir.file_name().unwrap().to_str().unwrap().to_string();
+        let probed = crate::serve::template::load(&dir)
+            .unwrap_or_else(|| panic!("{family}: template compiles"));
+        let emitted = ServeManifest::emit(&dir, &dir).unwrap_or_else(|e| panic!("{family}: {e}"));
+        let reloaded = ServeManifest::parse(&emitted.to_json()).unwrap();
+        assert_eq!(reloaded, emitted, "{family}: serialize/parse");
+        let chat = reloaded.chat.as_ref().unwrap();
+        let response = chat.response.as_ref().unwrap();
+        let declared = ChatTemplate::compile_declared(
+            chat.template.clone().unwrap(),
+            "declared".into(),
+            chat.bos_token.clone(),
+            chat.eos_token.clone(),
+            response.tool_support().unwrap(),
+            ReasoningMode::declared(&response.reasoning).markers(),
+        )
+        .unwrap();
+        assert_eq!(declared.tools, probed.tools, "{family}: tool support");
+        assert_eq!(
+            declared.tools,
+            expected_support(&family),
+            "{family}: expectation"
+        );
+        // Request planning from the reloaded declaration: tool requests are accepted or refused
+        // as before, with the same forced-call opener bytes.
+        for choice in [
+            serde_json::json!("auto"),
+            serde_json::json!("required"),
+            serde_json::json!({"type": "function", "function": {"name": "get_weather"}}),
+        ] {
+            let body = serde_json::json!({"model": "m", "messages": [{"role": "user", "content": "Weather in Oslo?"}],
+                "tools": [WEATHER_TOOL.clone()], "tool_choice": choice});
+            let req: ChatRequest = serde_json::from_value(body).unwrap();
+            let (want, got) = (
+                super::request::plan(&req, Some(probed.tools)),
+                super::request::plan(&req, Some(declared.tools)),
+            );
+            match (want, got) {
+                (Ok(want), Ok(got)) => {
+                    assert_eq!(
+                        want.template_tools, got.template_tools,
+                        "{family}: template tools"
+                    );
+                    let opener =
+                        |p: &super::request::Plan| p.parse.as_ref().and_then(|s| s.opener());
+                    assert_eq!(opener(&want), opener(&got), "{family}/{choice}: opener");
+                    if choice != "auto" {
+                        assert!(
+                            opener(&got).is_some_and(|o| !o.is_empty()),
+                            "{family}/{choice}"
+                        );
+                    }
+                }
+                (Err(want), Err(got)) => assert_eq!(want.code, got.code, "{family}/{choice}"),
+                (want, got) => panic!("{family}/{choice}: probed {want:?} vs declared {got:?}"),
+            }
+        }
+        // Every fixture conversation renders the same bytes through the declared template.
+        let fx: Value =
+            serde_json::from_slice(&std::fs::read(dir.join("cases.json")).unwrap()).unwrap();
+        for case in fx["cases"].as_array().unwrap() {
+            let mut body = case["request"].clone();
+            body["model"] = "m".into();
+            let req: ChatRequest = serde_json::from_value(body).unwrap();
+            let opts = RenderOpts {
+                tools: req.tools.clone(),
+                ..Default::default()
+            };
+            let (a, b) = (
+                render(&probed, &req.messages, &opts),
+                render(&declared, &req.messages, &opts),
+            );
+            assert_eq!(a.is_ok(), b.is_ok(), "{family}/{}", case["name"]);
+            if let (Ok(a), Ok(b)) = (a, b) {
+                assert_eq!(a, b, "{family}/{}: rendered bytes", case["name"]);
+            }
+        }
+        // The version-1 server's precedence for the same template and files.
+        let v1 = crate::asset::serve::ServeInfo {
+            manifest: ServeManifest::from_checkpoint(&dir, &dir),
+            multimodal: None,
+            from_packet: true,
+        };
+        assert_eq!(
+            ReasoningMode::declared(&response.reasoning),
+            ReasoningMode::resolve(&v1, probed.reasoning),
+            "{family}: reasoning"
+        );
+        assert_eq!(
+            declared.thinking_knob, probed.thinking_knob,
+            "{family}: thinking knob"
+        );
+        // The decision for families a legacy (manifest-less) packet forced `<think>` splitting on:
+        // harmony frames its trace in channels its parser reads, and Kimi-K2 writes none the
+        // template shows; neither declares markers (their fixtures carry no tokenizer file, so
+        // the `<think>` tokens a real K3 vocabulary has are not in play here).
+        if family == "gpt-oss" {
+            assert_eq!(response.tools, "harmony");
+            assert_eq!(
+                response.reasoning,
+                plow_asset::serve_manifest::ReasoningDecl::None
+            );
+        }
+        if family == "kimi-k2" {
+            assert_eq!(
+                response.reasoning,
+                plow_asset::serve_manifest::ReasoningDecl::None
+            );
+        }
+    }
+}
+
+static WEATHER_TOOL: std::sync::LazyLock<Value> = std::sync::LazyLock::new(|| {
+    serde_json::json!({"type": "function", "function": {"name": "get_weather",
+        "description": "Current weather for a city.",
+        "parameters": {"type": "object", "properties": {"city": {"type": "string"}}, "required": ["city"]}}})
+});

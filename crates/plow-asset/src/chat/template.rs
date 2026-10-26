@@ -107,6 +107,16 @@ impl ChatTemplate {
         Ok(Arc::new(t))
     }
 
+    /// Whether a template compiles, with nothing read from it and nothing kept.
+    pub fn check(
+        text: &str,
+        source: String,
+        bos_token: Option<String>,
+        eos_token: Option<String>,
+    ) -> Result<(), String> {
+        Self::compile_bare(text, source, bos_token, eos_token).map(|_| ())
+    }
+
     fn compile_bare(
         text: &str,
         source: String,
