@@ -42,8 +42,10 @@
 #
 # Routes: prefill projections cuBLASLt FP8 where the prefill roles pick it, native FP8 TMA GEMM
 # only at K % 128 == 0; grouped MoE prefill on cuBLASLt (moe_lt W8A8 chain, ABI 6 glue); decode
-# MoE >= 4 rows on cuBLASLt with the routed_fp8kv decode object; generated FP8-KV prefill attention
-# (hd256 sliding, hd512 global) from 128 rows.
+# MoE experts native (MoeExpertGluGemmaFp8/DownGemmaFp8) on every rung: this packet declares no
+# MOE_DECODE_CUBLASLT segment (an earlier line here said "decode MoE >= 4 rows on cuBLASLt"; that
+# is the BF16 recipe's route); decode dense projections native on rungs 1..32, cuBLASLt from 64;
+# generated FP8-KV prefill attention (hd256 sliding, hd512 global) from 128 rows.
 schema = "plow.recipe.v1"
 namespace = "infervisor"
 name = "gemma-4-26b-a4b"
@@ -96,7 +98,17 @@ PLOW_ATTENTION_DECODE_BALANCE_GF = "4"
 PLOW_FA_MMAQK = "3"
 PLOW_DECODE_BATCH_LADDER = "1,2,4,8,16,32,64,128"
 PLOW_EMIT_DECODE_CUBLASLT = "1"
-PLOW_EMIT_DECODE_CUBLASLT_MIN_ROWS = "32"
+# Decode rung 32 on the native FP8 GEMV, cuBLASLt from 64 (2026-10-26 route sweep, step_bench 48 steps
+# --spread, 2 passes ABAB, plowrt 6a4b75bc, packet 62f32036d4cc vs caf6c4a47ba6): B32 ctx 1K/8K/16K
+# 13.40/14.91/17.01 -> 11.55/13.50/15.34 ms (-14/-9/-10%; the B32 floor is 8.4 ms at 1K), --same 4K
+# 11.69 -> 10.09 ms; B16/B64/B128 and every prefill rung unchanged (digests identical). Measured and
+# not taken: cuBLASLt from 8 (B8/B16 6.63/8.63 -> 9.17/10.54 ms) and native at 64 (B64 18.82 ->
+# 46.00 ms). FP32 gates on the variant packet: c16 PASS (kl_mean 0.2118 vs vLLM 0.202, kl_trim
+# 0.1406 vs 0.1242, kl_p95 0.805 vs 0.892, over 211 vs 206, top1_decisive 0.9602, cont_frac 0.538,
+# needle 1); long c4 PASS (kl_mean 0.1511 vs 0.165, kl_trim 0.0991 vs 0.1011, top1_decisive 0.9555,
+# cont_frac 0.408 vs 0.343, needle 1). Evidence: /opt/dlami/nvme/lava-tts/route-sweep (B/g26fp8-lt64,
+# B/g26fp8-lt8, B/g26fp8-lt128, gates/g26fp8-lt64, gates/g26fp8-long).
+PLOW_EMIT_DECODE_CUBLASLT_MIN_ROWS = "64"
 PLOW_EMIT_DECODE_CUBLASLT_HEAD = "1"
 PLOW_EMIT_PREFILL_CUBLASLT = "1"
 PLOW_PF_LADDER_APPEND = "256,1088,1152,2112,4160,4224"
