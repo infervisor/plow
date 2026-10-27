@@ -2592,8 +2592,8 @@ __device__ __forceinline__ void plow_exec(const PlowDevInst* in, void* const* T,
                    in->i[2], in->i[5], slice, nblk, (__nv_bfloat16*)arena);
         break;
 
-#if PLOW_NV_GEMMA
-    /* ---- fp8 (w8a16) weight-only DECODE GEMV family (Gemma gate) ----
+#if PLOW_NV_GEMMA || PLOW_NV_W8A16
+    /* ---- fp8 (w8a16) weight-only DECODE GEMV family (Gemma, or a W8A16 hd<=128 object) ----
      * FFMA dequant-on-load, per-output-channel scale in the epilogue.
      * Weight is e4m3 (uint8), so TEN(2)/TEN(5) are cast to uint8*; the scale(s) are f32.
      * GEMV_FP8   t0=C t1=x t2=W(fp8) t5=w_scale(f32[N])  i0=M i1=N i2=K i4=a_row0.
@@ -2628,7 +2628,9 @@ __device__ __forceinline__ void plow_exec(const PlowDevInst* in, void* const* T,
                        (__nv_bfloat16*)arena);
         break;
 #endif
+#endif
 
+#if PLOW_NV_GEMMA
     /* ---- block-fp8 (128x128 block-scaled) DENSE FFN, GLM/Kimi/DeepSeek (P1.5) ----
      * op_moe.cuh d_dense_glu_fp8_blk / d_gemv_fp8_blk (warp-per-output, block-scale dot).
      * DENSE_GLU_FP8_BLK t0=fu t1=x t2=Wg t5=Wu t3=Sg t4=Su  i0=N(inter) i1=K(hidden) i5=act.

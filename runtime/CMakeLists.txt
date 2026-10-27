@@ -18,6 +18,8 @@ option(PLOW_CUDA "Build the CUDA (Hopper/Blackwell) kernel backend" OFF)
 # objects, so a w8a8 pkt traces/runs consistently. OFF keeps the w8a16 dequant
 # path.
 option(PLOW_NV_W8A8 "Build the gemma interp objects with the true w8a8 fp8 mma path" OFF)
+# Weight-only fp8 decode GEMV/GLU arms in an hd<=128 (non-Gemma) object: a W8A16 Qwen-shaped packet.
+option(PLOW_NV_W8A16 "Build the w8a16 fp8 decode GEMV arms into non-Gemma interp objects" OFF)
 # rtx-19 E3: fp8 (e4m3) KV cache. Compiles the HEADNORM_ROPE_FP8 /
 # FLASH_DECODE_FP8 arms into every gemma object so the shared dispatch is
 # consistent decode/prefill/seg. OFF => bf16 KV, byte-identical to HEAD.
@@ -582,6 +584,9 @@ if(PLOW_SM120_CUBIN OR PLOW_SM90A_CUBIN OR PLOW_SM89_CUBIN)
     endif()
     if(PLOW_NV_W8A8)
         list(APPEND _cubin_base -DPLOW_NV_W8A8=1)
+    endif()
+    if(PLOW_NV_W8A16)
+        list(APPEND _cubin_base -DPLOW_NV_W8A16=1)
     endif()
     # The generated header rides the BASE, so a specialised build cannot reach one
     # object and miss its sibling — the same property the axes below give the flags.

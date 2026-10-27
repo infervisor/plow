@@ -866,6 +866,12 @@ fn features(union: &BTreeSet<Arm>) -> Map<String, Value> {
     );
     // w8a8 is the per-row ACTIVATION quant: `QuantFp8` exists only on that path.
     f.insert("w8a8".into(), json!(has("QuantFp8")));
+    // Weight-only fp8 decode GEMVs (W8A16): their arms are Gemma-built, so an hd<=128 packet
+    // must ask for them.
+    f.insert(
+        "fp8_gemv".into(),
+        json!(has("GemvFp8") || has("GemvGluFp8")),
+    );
     f.insert("w8a8_block128".into(), json!(has("QuantFp8Block128")));
     f.insert(
         "qwen_gdn".into(),
@@ -1564,6 +1570,8 @@ fn backend_nvcc(f: &Map<String, Value>, t: &Map<String, Value>, s: &Shapes) -> V
     }
     if s.hd.iter().any(|&h| h > 128) {
         req.push("PLOW_NV_GEMMA=1".to_string());
+    } else if on("fp8_gemv") {
+        req.push("PLOW_NV_W8A16=1".to_string());
     }
     if on("qwen_gdn") {
         req.push("PLOW_NV_QWEN_GDN=1".into());

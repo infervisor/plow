@@ -744,7 +744,7 @@ Fish codec arena is capped with `PLOW_EMIT_FISH_CODEC_MAX_ROWS=256` (7.5 -> 2.7 
 |---|---|---|
 | customer batch WER, README flags / prompt | 10.36% / 9.58% | 10.40% / 9.58% |
 | customer streaming WER, end of speech to final p50 / p95 | 12.98%, 128 / 344 ms | 13.01%, 125 / 340 ms |
-| Fish stream c1: TTFA, median RTF | 137 ms, 0.80 | |
+| Fish stream c1: TTFA, median RTF | 137 ms, 1.46 | |
 | Fish full c4: audio s/s | 2.07 | |
 | Fish CER (Whisper, n=44) | 0.000 | |
 
@@ -753,12 +753,33 @@ KV can grow (Fish evicted under ASR load, then a 16 s reload on the next speech 
 a stream that does not fit waits or gets 429. Mixed load (customer streaming ASR c2 + Fish stream
 c1 / full c4 / stream c4 bursts, 40 min): 0 evictions, 0 restarts, only the bursts' 429s; ASR WER
 unchanged (13.01% / 12.28%), ASR end of speech to final p95 2.2 s while TTS runs (p50 163 ms);
-Fish stream c1 RTF 1.5 while ASR runs (TTFA 140 ms).
+Fish stream c1 RTF 1.5 while ASR runs, 1.46 alone (TTFA 140 ms). The 0.80 first recorded here
+was `tts_bench.py` writing 44.1 kHz PCM at its 24 kHz fallback while the card was unbound.
 
-BF16 Fish decodes ~1 real-time stream on L4 (each frame reads the 8.5 GiB slow AR plus nine depth
-steps at 300 GB/s): real-time admission holds a second stream (`PLOW_TTS_ADMIT_WAIT_MS`, then
-429). Full requests batch. `PLOW_W8A16=1` emits on sm_89 (weights 8.5 -> 5.1 GiB) but its FP8
-decode faults there (the GemvFp8 arms are sm_120).
+BF16 Fish decodes below real time on L4 (each frame reads the 7.3 GB slow AR plus ten 4-layer
+depth passes, ~15 GB at 300 GB/s): real-time admission holds a second stream
+(`PLOW_TTS_ADMIT_WAIT_MS`, then 429). Full requests batch. W8A16 slow AR (`PLOW_W8A16=1`, e4m3
+per-channel twins from `perf-data/tools/quantize_fp8.py <slow> <twin> model.`, merged into one
+checkpoint the emit reads) runs on sm_89: the packet now requires `PLOW_NV_W8A16`, which builds the
+GemvFp8 / GemvGluFp8 arms into the hd128 object (they were inside the Gemma-only arms and trapped).
+
+### L4: every TTS bundle alone (2026-10-27, a9efb9a0 + W8A16)
+
+`recipes/infervisor/<model>/sm89-l4-tp1.toml`, one model per `plowrt serve`, `tts_bench.py`
+(sample rate from the card), Whisper turbo CER on CPU:
+
+| model | stream c1 RTF / TTFA | full c1 RTF | stream c4 | CER (n) | GPU after load |
+|---|---|---|---|---|---|
+| Chatterbox | 0.27 / 274 ms | 0.22 | 7.45 audio s/s, 0 refused | 0.000 (32) | 18.7 GB |
+| Chatterbox MTL | 0.29 / 274 ms | 0.24 | 8.04 audio s/s, 0 refused | 0.026 (32; per language <= 0.148) | 18.7 GB |
+| Fish S2 Pro BF16 | 1.46 / 138 ms | 1.48 | 0.73 audio s/s, 11/16 refused | 0.000 (21) | 14.0 GB |
+| Fish S2 Pro W8A16 | 1.15 / 124 ms | 1.16 | 1.29 audio s/s, 7/16 refused | 0.000 (25) | 12.8 GB |
+| Orpheus | 2.21 / 1.9 s | 2.21 | 13/16 refused | 0.000 (19) | 16.3 GB |
+| Veena | 2.21 / 1.9 s | 2.21 | 13/16 refused | 0.032 (19) | 16.3 GB |
+
+Orpheus and Veena (Llama-3.2-3B, ~83 SNAC tokens per audio second) are weight-bandwidth bound
+below real time in BF16. Breeze TTS 2 does not emit for sm_89: its T5Gemma2 text encoder needs
+Gemma 3 norm-offset objects (sm_90a) and the fused one-split bf16-KV encoder prefill.
 
 ### Voice agent co-serve
 
