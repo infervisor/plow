@@ -4658,8 +4658,11 @@ extern "C" __global__ void __launch_bounds__(PLOW_NV_THREADS, 2)
         in->i[5], in->i[7], blockIdx.x, nblk, arena, in->fj[1].u,
         (const float*)a.op[0].t[6], (const float*)a.op[0].t[7]);
 }
+/* With PLOW_NV_FA_RG8S the body stages rows in a ring past the flash claim. */
 extern "C" __device__ unsigned PLOW_SYM(plow_light_fp8_flash256_smem) =
-    FA_DEC_SMEM_FLOATS(256, 2) * sizeof(float);
+    (FA_RG8S_SMEM_FLOATS(256) > (unsigned)FA_DEC_SMEM_FLOATS(256, 2) ? FA_RG8S_SMEM_FLOATS(256)
+                                                                     : (unsigned)FA_DEC_SMEM_FLOATS(256, 2)) *
+    sizeof(float);
 #endif
 extern "C" __device__ unsigned PLOW_SYM(plow_light_attn_hd) = 256;
 extern "C" __device__ unsigned PLOW_SYM(plow_light_attn_hd2) = 512;
