@@ -1522,6 +1522,10 @@ pub(super) struct RoutedDecode {
 }
 
 impl RoutedDecode {
+    pub(super) fn module(&self) -> &Module {
+        &self._module
+    }
+
     const DROPPED: [DevOp; 2] = [DevOp::MoeExpertGluNormGemma, DevOp::MoeExpertDownGemma];
 
     /// `None` when the packet ships no routed object (`_routed_fp8kv` under FP8 KV). One whose
