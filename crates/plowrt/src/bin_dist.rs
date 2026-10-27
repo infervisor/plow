@@ -110,6 +110,7 @@ pub fn cmd_pull(model: &str, c: plow_asset::dist::Constraints, dry_run: bool) ->
     );
 
     let st = store()?;
+    let _lock = st.lock()?;
     let plan = resolved.plan(&st)?;
     if dry_run {
         println!("would transfer: {plan}");
@@ -148,6 +149,7 @@ pub fn cmd_load(
     }
 
     let st = store()?;
+    let _lock = st.lock()?;
     let (dir, t) = pull::pull(&st, &*f, &resolved)?;
     println!("transferred: {t}");
 
@@ -287,6 +289,7 @@ fn check_newer(
 
 pub fn cmd_upgrade(model: Option<&str>, all: bool, dry_run: bool) -> Result<(), Err> {
     let st = store()?;
+    let _lock = st.lock()?;
     let targets: Vec<String> = match (model, all) {
         (Some(m), false) => vec![parse(m)?.pin_key()],
         (None, true) => st.pins().into_iter().map(|(k, _)| k).collect(),
@@ -845,7 +848,22 @@ pub fn cmd_push<'a>(
         objects: objects_dir,
         checkpoint: checkpoint_dir,
     };
-    let out = dist::push::push(&*sink, args.bundle, args.objset, &src, key.as_ref(), opts)?;
+    let trust = trust()?;
+    if key.is_some() && trust.is_empty() && !opts.dry_run {
+        println!(
+            "warning: PLOW_TRUSTED_KEYS is not set: the rows of the index already published \
+             are carried into the signed index unverified"
+        );
+    }
+    let out = dist::push::push(
+        &*sink,
+        args.bundle,
+        args.objset,
+        &src,
+        key.as_ref(),
+        &trust,
+        opts,
+    )?;
     if out.unchanged {
         println!(
             "already published: {} is this build at {}",
@@ -907,6 +925,7 @@ pub fn cmd_keygen(name: &str, out: &std::path::Path) -> Result<(), Err> {
 pub fn cmd_rollback(model: &str) -> Result<(), Err> {
     let r = parse(model)?;
     let st = store()?;
+    let _lock = st.lock()?;
     let (from, to) = st.rollback(&r.pin_key())?;
     println!("{r}: {from} → {to}");
     if let Some(p) = st.list().into_iter().find(|p| p.variant_id == to) {
@@ -919,6 +938,7 @@ pub fn cmd_rollback(model: &str) -> Result<(), Err> {
 /// bundle references.
 pub fn cmd_gc() -> Result<(), Err> {
     let st = store()?;
+    let _lock = st.lock()?;
     let pruned = st.prune()?;
     let (n, freed) = st.gc()?;
     println!(
@@ -931,6 +951,7 @@ pub fn cmd_gc() -> Result<(), Err> {
 pub fn cmd_prepare(model: &str, checkpoint: Option<PathBuf>) -> Result<(), Err> {
     let r = parse(model)?;
     let st = store()?;
+    let _lock = st.lock()?;
     let dir = resolve_local(model)?;
     let bundle_json = dir.join("bundle.json");
     let bundle: plow_asset::dist::Bundle = serde_json::from_slice(&std::fs::read(&bundle_json)?)
@@ -951,6 +972,7 @@ pub fn cmd_prepare(model: &str, checkpoint: Option<PathBuf>) -> Result<(), Err> 
 pub fn cmd_rm(model: &str, gc: bool) -> Result<(), Err> {
     let r = parse(model)?;
     let st = store()?;
+    let _lock = st.lock()?;
     let Some(variant_id) = st.pinned(&r.pin_key()) else {
         return Err(format!("{r} is not pinned").into());
     };

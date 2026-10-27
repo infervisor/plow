@@ -70,6 +70,7 @@ fn amd() -> Identity {
         checkpoint_layout: "native-mxfp4".into(),
         checkpoint_shards: 96,
         checkpoint_bytes: 1590000000000,
+        required: Vec::new(),
         recipe: "recipes/infervisor/kimi-k3/gfx942-mi325x-tp8-32k-fp8kv-mxfp4.toml".into(),
     }
 }
@@ -236,6 +237,7 @@ fn veena() -> Identity {
         checkpoint_layout: "hf-safetensors".into(),
         checkpoint_shards: 1,
         checkpoint_bytes: 0,
+        required: Vec::new(),
         recipe: "recipes/infervisor/veena/sm90a-h100-tp1.toml".into(),
     }
 }

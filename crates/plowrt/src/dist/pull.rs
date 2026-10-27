@@ -150,7 +150,7 @@ pub fn index_trusted(
 ) -> Result<ModelIndex> {
     let raw = require(f, &r.index_path())?;
     if !trust.is_empty() {
-        let sig = f.get(&r.signature_path())?;
+        let sig = f.get(&r.signature_path(super::Digest::of(&raw).as_str()))?;
         let sig = sig.as_deref().map(String::from_utf8_lossy);
         super::sign::verify(&raw, sig.as_deref().map(str::trim), trust)
             .map_err(|e| RuntimeError::Dist(format!("{}: {e}", r.index_path())))?;

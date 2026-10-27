@@ -25,7 +25,7 @@ use plow_asset::dist::{
     Build, Bundle, Delta, Measured, ModelIndex, ObjSet, Status, Variant, INDEX_SCHEMA,
 };
 
-use super::sign::{SecretKey, INDEX_SIGNATURE};
+use super::sign::{SecretKey, Trust};
 use super::sink::{Cond, Put, Sink};
 use super::Digest;
 use crate::{Result, RuntimeError};
@@ -246,25 +246,91 @@ fn put_file(
     sink.put(key, &mut f, len, content_type, cond)
 }
 
-fn put_bytes(sink: &dyn Sink, key: &str, bytes: &[u8], cond: Cond) -> Result<Put> {
-    sink.put(
-        key,
-        &mut &bytes[..],
-        bytes.len() as u64,
-        "application/json",
-        cond,
-    )
+fn put_bytes(
+    sink: &dyn Sink,
+    key: &str,
+    bytes: &[u8],
+    content_type: &str,
+    cond: Cond,
+) -> Result<Put> {
+    sink.put(key, &mut &bytes[..], bytes.len() as u64, content_type, cond)
+}
+
+/// Where the signature over one version of the index lives: keyed by the
+/// version's digest, written before the index (see `push`).
+fn signature_key(model_dir: &str, index_bytes: &[u8]) -> String {
+    format!("{model_dir}/sigs/{}.sig", Digest::of(index_bytes).as_str())
+}
+
+/// The catalog row for this model, present and current. Names only, so a
+/// lost race is retried without touching the index; a row already right is
+/// left alone, which is what makes a re-run after a failed push a repair.
+fn ensure_catalog(
+    sink: &dyn Sink,
+    bundle: &Bundle,
+    hf: &str,
+    description: Option<&str>,
+) -> Result<()> {
+    for _ in 0..4 {
+        let (mut catalog, cond) = match sink.get("catalog.json")? {
+            Some((raw, etag)) => (parse::<Catalog>("catalog.json", &raw)?, Cond::IfMatch(etag)),
+            None => (Catalog::default(), Cond::IfNoneMatchAny),
+        };
+        let mine = |m: &CatalogEntry| m.namespace == bundle.namespace && m.name == bundle.name;
+        let existing = catalog.models.iter().find(|m| mine(m)).cloned();
+        let entry = CatalogEntry {
+            namespace: bundle.namespace.clone(),
+            name: bundle.name.clone(),
+            hf: hf.to_string(),
+            description: description
+                .map(str::to_string)
+                .or_else(|| existing.as_ref().and_then(|m| m.description.clone())),
+        };
+        if existing.as_ref() == Some(&entry) {
+            return Ok(());
+        }
+        catalog.models.retain(|m| !mine(m));
+        catalog.models.push(entry);
+        catalog
+            .models
+            .sort_by(|a, b| (&a.namespace, &a.name).cmp(&(&b.namespace, &b.name)));
+        if let Put::Stored(_) = put_bytes(
+            sink,
+            "catalog.json",
+            &canonical(&catalog)?,
+            "application/json",
+            cond,
+        )? {
+            return Ok(());
+        }
+    }
+    Err(dist(format!(
+        "{}: catalog.json kept changing under this push; the generation is published, run \
+         the push again to list it",
+        sink.describe()
+    )))
 }
 
 /// Publish `bundle` (the manifests `generate` produced, not yet numbered)
 /// into `sink`. `key` signs the index; without one the index is published
-/// unsigned, which a client with trusted keys refuses.
+/// unsigned, which a client with trusted keys refuses. `trust` is applied to
+/// the index already there: its rows are carried into the new, signed index,
+/// so they are believed on the same terms a client applies — with no trusted
+/// keys, on none.
+///
+/// Order of writes: blobs, objset, bundle manifest, signature, index,
+/// catalog. Everything before the index is content-addressed or create-only,
+/// so a push that dies anywhere leaves the previous generation servable and
+/// the next run finishes the job: an identical manifest left behind is
+/// adopted, a missing signature or catalog row behind a published index is
+/// written on the re-run that would otherwise report "unchanged".
 pub fn push(
     sink: &dyn Sink,
     mut bundle: Bundle,
     objset: Option<(ObjSet, Vec<u8>)>,
     src: &Sources<'_>,
     key: Option<&SecretKey>,
+    trust: &Trust,
     opts: &Options<'_>,
 ) -> Result<Outcome> {
     if opts.status == Some(Status::Validated) && opts.tok_s.is_none() {
@@ -297,13 +363,22 @@ pub fn push(
     // fresh read. Blobs and objsets are content-addressed, so a second attempt
     // finds them present and uploads nothing twice.
     for attempt in 0..4 {
-        let index: Option<(ModelIndex, String)> = match sink.get(&index_key)? {
-            Some((raw, etag)) => Some((parse(&index_key, &raw)?, etag)),
+        let index: Option<(ModelIndex, String, Vec<u8>)> = match sink.get(&index_key)? {
+            Some((raw, etag)) => {
+                if !trust.is_empty() {
+                    let sig = sink
+                        .get(&signature_key(&model_dir, &raw))?
+                        .map(|(b, _)| String::from_utf8_lossy(&b).trim().to_string());
+                    super::sign::verify(&raw, sig.as_deref(), trust)
+                        .map_err(|e| dist(format!("{index_key}: {e}")))?;
+                }
+                Some((parse(&index_key, &raw)?, etag, raw))
+            }
             None => None,
         };
         let newest = index
             .iter()
-            .flat_map(|(i, _)| &i.variants)
+            .flat_map(|(i, _, _)| &i.variants)
             .filter(|v| v.label == bundle.label)
             .max_by_key(|v| v.generation)
             .cloned();
@@ -327,8 +402,25 @@ pub fn push(
                         .as_ref()
                         .is_some_and(|m| m.concurrency == Some(c))
                 });
-            let hf_kept = index.as_ref().is_some_and(|(i, _)| i.hf == hf);
+            let hf_kept = index.as_ref().is_some_and(|(i, _, _)| i.hf == hf);
             if same_build(&published, &bundle) && status_kept && measure_kept && hf_kept {
+                // Published; finish what a push that died after the index
+                // may have left undone.
+                if let Some((_, _, raw)) = index.as_ref() {
+                    if let Some(k) = key {
+                        let sig_key = signature_key(&model_dir, raw);
+                        if sink.head(&sig_key)?.is_none() {
+                            put_bytes(
+                                sink,
+                                &sig_key,
+                                k.sign(raw).to_string().as_bytes(),
+                                "text/plain",
+                                Cond::None,
+                            )?;
+                        }
+                    }
+                }
+                ensure_catalog(sink, &bundle, &hf, opts.description)?;
                 return Ok(Outcome {
                     reference: format!(
                         "{}/{}:{}@g{}",
@@ -394,13 +486,12 @@ pub fn push(
             }
             m
         };
-        let reference = format!(
-            "{}/{}:{}@g{}",
-            bundle.namespace, bundle.name, bundle.label, bundle.generation
-        );
         if opts.dry_run {
             return Ok(Outcome {
-                reference,
+                reference: format!(
+                    "{}/{}:{}@g{}",
+                    bundle.namespace, bundle.name, bundle.label, bundle.generation
+                ),
                 generation: bundle.generation,
                 variant_id: bundle.variant_id.clone(),
                 uploaded_blobs: missing.len(),
@@ -441,32 +532,79 @@ pub fn push(
         let _ = std::fs::remove_dir_all(&staging);
         let (uploaded_blobs, uploaded_bytes) = uploaded?;
 
-        // 2. The objset manifest, under its content-derived id.
+        // 2. The objset manifest, under its content-derived id. The id covers
+        // the objects, not the script or env, so a name already taken must
+        // hold these bytes: the bundle names their digest.
         if let (Some(os), Some(b)) = (bundle.objset.as_ref(), objset_bytes.as_ref()) {
-            put_bytes(
-                sink,
-                &format!("v1/objsets/{}.json", os.objset_id),
-                b,
-                Cond::IfNoneMatchAny,
-            )?;
-        }
-
-        // 3. The bundle manifest: immutable, so create-only. A refusal means
-        // this generation number was taken since the index was read.
-        let manifest_rel = format!("manifests/{}@g{}", bundle.label, bundle.generation);
-        let bundle_bytes = canonical(&bundle)?;
-        match put_bytes(
-            sink,
-            &format!("{model_dir}/{manifest_rel}"),
-            &bundle_bytes,
-            Cond::IfNoneMatchAny,
-        )? {
-            Put::Stored(_) => {}
-            Put::PreconditionFailed => {
-                tracing::warn!(attempt, "{reference} was published meanwhile; renumbering");
-                continue;
+            let key = format!("v1/objsets/{}.json", os.objset_id);
+            if let Put::PreconditionFailed =
+                put_bytes(sink, &key, b, "application/json", Cond::IfNoneMatchAny)?
+            {
+                let existing = sink.get(&key)?.map(|(b, _)| b);
+                if existing.as_deref() != Some(&b[..]) {
+                    return Err(dist(format!(
+                        "{}: {key} already holds an objset manifest with different bytes; the \
+                         id covers the objects only, so a build that shares them but differs \
+                         in script or env collides with it and its bundle would name a digest \
+                         the registry does not serve",
+                        sink.describe()
+                    )));
+                }
             }
         }
+        // A rung override names another objset by digest; the index must not
+        // expose a bundle whose dependencies the registry lacks.
+        for l in bundle.objset.iter().flat_map(|o| &o.lowrung) {
+            let key = format!("v1/objsets/{}.json", l.objset_id);
+            if sink.head(&key)?.is_none() {
+                return Err(dist(format!(
+                    "{}: rung override {} names {key}, which is not published; a rung's \
+                     objset is published before the bundle that depends on it",
+                    sink.describe(),
+                    l.max
+                )));
+            }
+        }
+
+        // 3. The bundle manifest: immutable, so create-only. A name already
+        // taken holds either this very build — left by a push that died
+        // before its index write, and adopted — or someone else's generation,
+        // which is skipped, never overwritten.
+        let first = bundle.generation;
+        let (manifest_rel, bundle_bytes) = loop {
+            let manifest_rel = format!("manifests/{}@g{}", bundle.label, bundle.generation);
+            let key = format!("{model_dir}/{manifest_rel}");
+            let bundle_bytes = canonical(&bundle)?;
+            match put_bytes(
+                sink,
+                &key,
+                &bundle_bytes,
+                "application/json",
+                Cond::IfNoneMatchAny,
+            )? {
+                Put::Stored(_) => break (manifest_rel, bundle_bytes),
+                Put::PreconditionFailed => {
+                    let existing = sink.get(&key)?.map(|(b, _)| b);
+                    if existing.as_deref() == Some(&bundle_bytes[..]) {
+                        tracing::info!("{key} already holds this build; adopting it");
+                        break (manifest_rel, bundle_bytes);
+                    }
+                    if bundle.generation - first >= 64 {
+                        return Err(dist(format!(
+                            "{}: {key} and the 63 names before it are taken by other builds",
+                            sink.describe()
+                        )));
+                    }
+                    tracing::warn!(attempt, "{key} is taken by another build; renumbering");
+                    bundle.generation += 1;
+                    bundle.variant_id = variant_id(&bundle);
+                }
+            }
+        };
+        let reference = format!(
+            "{}/{}:{}@g{}",
+            bundle.namespace, bundle.name, bundle.label, bundle.generation
+        );
 
         // 4. The index, replaced only if it is still the one read above.
         let row = Variant {
@@ -502,14 +640,14 @@ pub fn push(
         };
         let mut variants: Vec<Variant> = index
             .iter()
-            .flat_map(|(i, _)| i.variants.iter().cloned())
+            .flat_map(|(i, _, _)| i.variants.iter().cloned())
             .filter(|v| !(v.label == row.label && v.generation == row.generation))
             .collect();
         variants.push(row);
         variants.sort_by(|a, b| (&a.label, a.generation).cmp(&(&b.label, b.generation)));
         let mut aliases: Vec<String> = index
             .iter()
-            .flat_map(|(i, _)| i.aliases.iter().cloned())
+            .flat_map(|(i, _, _)| i.aliases.iter().cloned())
             .chain(opts.aliases.iter().cloned())
             .collect();
         aliases.sort();
@@ -532,11 +670,27 @@ pub fn push(
         new_index.validate().map_err(dist)?;
         let index_bytes = canonical(&new_index)?;
         super::manifest::no_build_host_paths(&index_bytes, "index.json")?;
+        // 4. The signature, keyed by the index's digest, BEFORE the index: a
+        // reader fetches the signature of the bytes it read, so no reader
+        // ever sees this index unsigned, and two publishers' signatures
+        // cannot land on each other's index. An orphan signature (index write
+        // lost) is inert.
+        if let Some(k) = key {
+            put_bytes(
+                sink,
+                &signature_key(&model_dir, &index_bytes),
+                k.sign(&index_bytes).to_string().as_bytes(),
+                "text/plain",
+                Cond::None,
+            )?;
+        }
+
+        // 5. The index, replaced only if it is still the one read above.
         let cond = match &index {
-            Some((_, etag)) => Cond::IfMatch(etag.clone()),
+            Some((_, etag, _)) => Cond::IfMatch(etag.clone()),
             None => Cond::IfNoneMatchAny,
         };
-        match put_bytes(sink, &index_key, &index_bytes, cond)? {
+        match put_bytes(sink, &index_key, &index_bytes, "application/json", cond)? {
             Put::Stored(_) => {}
             Put::PreconditionFailed => {
                 tracing::warn!(attempt, "{index_key} changed meanwhile; re-reading");
@@ -544,38 +698,8 @@ pub fn push(
             }
         }
 
-        // 5. The signature, then the catalog (names only, so a lost race on it
-        // is retried without touching the index).
-        if let Some(k) = key {
-            let sig = k.sign(&index_bytes).to_string();
-            put_bytes(
-                sink,
-                &format!("{model_dir}/{INDEX_SIGNATURE}"),
-                sig.as_bytes(),
-                Cond::None,
-            )?;
-        }
-        for _ in 0..4 {
-            let (mut catalog, cond) = match sink.get("catalog.json")? {
-                Some((raw, etag)) => (parse::<Catalog>("catalog.json", &raw)?, Cond::IfMatch(etag)),
-                None => (Catalog::default(), Cond::IfNoneMatchAny),
-            };
-            catalog
-                .models
-                .retain(|m| !(m.namespace == bundle.namespace && m.name == bundle.name));
-            catalog.models.push(CatalogEntry {
-                namespace: bundle.namespace.clone(),
-                name: bundle.name.clone(),
-                hf: hf.clone(),
-                description: opts.description.map(str::to_string),
-            });
-            catalog
-                .models
-                .sort_by(|a, b| (&a.namespace, &a.name).cmp(&(&b.namespace, &b.name)));
-            if let Put::Stored(_) = put_bytes(sink, "catalog.json", &canonical(&catalog)?, cond)? {
-                break;
-            }
-        }
+        // 6. The catalog.
+        ensure_catalog(sink, &bundle, &hf, opts.description)?;
 
         return Ok(Outcome {
             reference,

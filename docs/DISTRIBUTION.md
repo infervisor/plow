@@ -59,7 +59,7 @@ Remote:
 
 ```
 v1/<namespace>/<name>/index.json                # this model's variants
-v1/<namespace>/<name>/index.json.sig            # ed25519 over index.json
+v1/<namespace>/<name>/sigs/<sha256>.sig         # ed25519 over that version of index.json
 v1/<namespace>/<name>/manifests/<label>@g<n>    # one variant → bundle.json
 v1/objsets/<objset-id>.json
 v1/blobs/sha256/<hex>[.zst]                     # shared by everything
@@ -250,22 +250,38 @@ these files, objset, status and measurement, so a re-run is a no-op. It then
 uploads only the blobs the bucket lacks (a `HEAD` per digest; an objects-only
 change moves the objects and nothing else) and records what the generation
 supersedes and what changed (`packet`, `objset`, `both`). Publication order
-is the safety property — **blobs, then manifests, then the index, then its
-signature, then the catalog** — so an interrupted push leaves the previous
+is the safety property — **blobs, then manifests, then the signature, then
+the index, then the catalog** — so an interrupted push leaves the previous
 generation completely servable, and a generation is never reused. Every
 immutable object is written with `If-None-Match: *` and the index and catalog
 with `If-Match: <etag>`, so a generation someone else published meanwhile is
 refused by the bucket, not overwritten; `push` re-reads the index and tries
-the next number, up to four times.
+the next number, up to four times. A manifest name already taken is adopted
+when it holds this very build (a push that died before its index write) and
+skipped when it holds another's. A push that died after the index is finished
+by the next run of the same build: it writes the missing signature and catalog
+row instead of reporting "unchanged". An objset name already holding other
+bytes, or a rung override whose objset is not published, is refused before the
+bundle is written. A bundle is also refused when the recipe says the model
+serves with a file the build did not produce (`codec.pkt` for a `[checkpoint]
+codec`, `cublaslt_algos.jsonl` for `PLOW_LT_RUNG_ALGOS`).
 
 **Signing.** `plowrt keygen --name <key-name> --out <file>` makes an ed25519
 key; its public half is printed as `<key-name>:<base64>`. `push --key-file`
-(or `PLOW_SIGNING_KEY`) writes `index.json.sig` beside each index. A client
+(or `PLOW_SIGNING_KEY`) writes the signature under `sigs/<sha256 of the
+index>.sig`, before the index itself: a reader fetches the signature of
+exactly the bytes it read, so no reader sees an index without its signature
+and two publishers' signatures cannot land on each other's index. A client
 with `PLOW_TRUSTED_KEYS=<name>:<base64>[,…]` refuses an index that is
 unsigned, signed by another key, or changed after signing; the index names
 every manifest by digest and each manifest its blobs, so this one signature
 covers the whole pull. A client with no trusted keys checks nothing, as
-before. Without a key, `push` to a bucket warns and publishes unsigned.
+before. `push` applies the same `PLOW_TRUSTED_KEYS` to the index already in
+the bucket, whose rows it carries into the new, signed index; with none set it
+warns that they are carried unverified, which is the bootstrap for a registry
+published before signing existed. Without a key, `push` to a bucket warns and
+publishes unsigned. A `file://` registry enforces the same conditional writes
+under `<dir>/.lock`.
 
 `plowrt publish` (the registry's staged-upload API, `PLOW_PUBLISH_KEY`) is
 the transition path, kept until every model has been re-published with

@@ -246,6 +246,8 @@ struct RecipeTarget {
 struct RecipeCheckpoint {
     source: Option<String>,
     revision: Option<String>,
+    /// A speech model's codec, lowered to its own `codec.pkt`.
+    codec: Option<String>,
     layout: Option<String>,
     shards: Option<u32>,
     bytes: Option<u64>,
@@ -301,6 +303,12 @@ pub struct Identity {
     pub script: String,
     /// `[objects] env` — the env the build script was driven with.
     pub objects_env: BTreeMap<String, String>,
+    /// Files the recipe says the build serves with, which the bundle must
+    /// therefore carry: `codec.pkt` for a `[checkpoint] codec`,
+    /// `cublaslt_algos.jsonl` for a timed `PLOW_LT_RUNG_ALGOS`. A published
+    /// generation is immutable, so a missing one is refused at pack time
+    /// rather than found by the first client that loads it.
+    pub required: Vec<String>,
     /// `[serve] env` — the settings this variant was validated with.
     pub runtime_env: BTreeMap<String, String>,
     pub checkpoint_source: String,
@@ -457,6 +465,18 @@ pub fn read_recipe(path: &Path, over: Overrides<'_>) -> Result<Identity> {
         }
     }
 
+    let mut required = Vec::new();
+    if c.codec.is_some() {
+        required.push("codec.pkt".to_string());
+    }
+    if r.serve
+        .env
+        .get("PLOW_LT_RUNG_ALGOS")
+        .is_some_and(|v| matches!(v.as_str(), "1" | "true"))
+    {
+        required.push("cublaslt_algos.jsonl".to_string());
+    }
+
     let objects = r.objects.unwrap_or_default();
     Ok(Identity {
         namespace: r.namespace.unwrap_or_else(|| "infervisor".into()),
@@ -480,6 +500,7 @@ pub fn read_recipe(path: &Path, over: Overrides<'_>) -> Result<Identity> {
             .script
             .unwrap_or_else(|| path.to_string_lossy().into_owned()),
         objects_env: objects.env,
+        required,
         runtime_env: r.serve.env,
         checkpoint_source,
         checkpoint_revision: c.revision.unwrap_or_default(),
@@ -922,6 +943,15 @@ pub fn build_bundle(
                     unclaimed.push(name);
                 }
             }
+        }
+    }
+    for need in &id.required {
+        if !files.iter().any(|f| f.name == *need) {
+            return Err(bad(format!(
+                "{}: no {need}, which the recipe says this model serves with; the build is \
+                 incomplete, and a published generation is immutable",
+                assets.display()
+            )));
         }
     }
     if !unclaimed.is_empty() {

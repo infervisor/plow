@@ -342,10 +342,40 @@ impl Store {
             path: p.clone(),
             source,
         })?;
-        std::fs::write(&p, bytes).map_err(|source| RuntimeError::Io {
-            path: p.clone(),
-            source,
-        })
+        write_replace(&p, &bytes)
+    }
+
+    /// The store's write lock: `<root>/.lock`, exclusive, released on drop.
+    ///
+    /// A command that materializes, pins, rolls back or collects takes it for
+    /// its whole run, so `gc` never sees a bundle in the gap between its
+    /// materialization and its pin and `rollback` never races an `upgrade`.
+    /// Readers (`ls`, `show`, `serve`) do not take it. Not reentrant: one
+    /// lock per command, not per store call.
+    pub fn lock(&self) -> Result<StoreLock> {
+        let p = self.root.join(".lock");
+        let f = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&p)
+            .map_err(|source| RuntimeError::Io {
+                path: p.clone(),
+                source,
+            })?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::io::AsRawFd;
+            // SAFETY: `flock` on a file descriptor this process owns.
+            if unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_EX) } != 0 {
+                return Err(RuntimeError::Io {
+                    path: p,
+                    source: std::io::Error::last_os_error(),
+                });
+            }
+        }
+        Ok(StoreLock(f))
     }
 
     pub fn pinned(&self, reference: &str) -> Option<String> {
@@ -403,10 +433,7 @@ impl Store {
             path: p.clone(),
             source,
         })?;
-        std::fs::write(&p, bytes).map_err(|source| RuntimeError::Io {
-            path: p.clone(),
-            source,
-        })?;
+        write_replace(&p, &bytes)?;
         Ok((current, to))
     }
 
@@ -589,6 +616,12 @@ impl Store {
                     continue;
                 };
                 if !pinned_models.contains(&model) {
+                    continue;
+                }
+                // The lock a caller holds ([`Store::lock`]) keeps a pin from
+                // moving under this walk; the re-read is the cheap guard for
+                // a caller that did not take it.
+                if self.roots().contains(&id) {
                     continue;
                 }
                 std::fs::remove_dir_all(bundle.path()).map_err(|source| RuntimeError::Io {
@@ -777,6 +810,22 @@ fn is_safe_relative(name: &str) -> bool {
         && std::path::Path::new(name)
             .components()
             .all(|c| matches!(c, Component::Normal(_)))
+}
+
+/// Held for a command's lifetime; see [`Store::lock`].
+pub struct StoreLock(#[allow(dead_code)] std::fs::File);
+
+/// Replace `p` atomically: a pin is never left empty or half-written.
+fn write_replace(p: &Path, bytes: &[u8]) -> Result<()> {
+    let tmp = p.with_extension(format!("tmp{}", std::process::id()));
+    std::fs::write(&tmp, bytes).map_err(|source| RuntimeError::Io {
+        path: tmp.clone(),
+        source,
+    })?;
+    std::fs::rename(&tmp, p).map_err(|source| RuntimeError::Io {
+        path: p.to_path_buf(),
+        source,
+    })
 }
 
 #[cfg(test)]

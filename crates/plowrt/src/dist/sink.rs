@@ -55,9 +55,20 @@ fn dist(msg: String) -> RuntimeError {
 
 /// A registry in a directory: an air-gapped mirror, or a test. The entity
 /// tag is the content's sha256.
+///
+/// A directory has no conditional write, so one is built: every writer
+/// stages under a name only it uses, then takes `<root>/.lock` for the
+/// condition check and the commit together. Create-only commits are a
+/// `hard_link`, which the filesystem refuses if the name exists, so even a
+/// writer that skipped the lock cannot overwrite an immutable object.
 pub struct FileSink {
     root: std::path::PathBuf,
 }
+
+/// Held across a condition check and its commit; see [`FileSink`].
+struct DirLock(#[allow(dead_code)] std::fs::File);
+
+static STAGE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 impl FileSink {
     pub fn new(root: impl Into<std::path::PathBuf>) -> Self {
@@ -70,11 +81,58 @@ impl FileSink {
         }
         Ok(self.root.join(key))
     }
+
+    fn io(path: &std::path::Path, source: std::io::Error) -> RuntimeError {
+        RuntimeError::Io {
+            path: path.to_path_buf(),
+            source,
+        }
+    }
+
+    fn lock(&self) -> Result<DirLock> {
+        std::fs::create_dir_all(&self.root).map_err(|e| Self::io(&self.root, e))?;
+        let p = self.root.join(".lock");
+        let f = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&p)
+            .map_err(|e| Self::io(&p, e))?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::io::AsRawFd;
+            // SAFETY: `flock` on a descriptor this process owns.
+            if unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_EX) } != 0 {
+                return Err(Self::io(&p, std::io::Error::last_os_error()));
+            }
+        }
+        Ok(DirLock(f))
+    }
+
+    /// The sha256 of a file, streamed; `None` when it is absent.
+    fn etag_of(p: &std::path::Path) -> Result<Option<String>> {
+        let mut f = match std::fs::File::open(p) {
+            Ok(f) => f,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => return Err(Self::io(p, e)),
+        };
+        let mut h = <sha2::Sha256 as sha2::Digest>::new();
+        let mut buf = vec![0u8; 1 << 20];
+        loop {
+            let k = f.read(&mut buf).map_err(|e| Self::io(p, e))?;
+            if k == 0 {
+                break;
+            }
+            sha2::Digest::update(&mut h, &buf[..k]);
+        }
+        Ok(Some(format!("{:x}", sha2::Digest::finalize(h))))
+    }
 }
 
 impl Sink for FileSink {
     fn head(&self, key: &str) -> Result<Option<String>> {
-        Ok(self.get(key)?.map(|(_, etag)| etag))
+        Self::etag_of(&self.path(key)?)
     }
 
     fn get(&self, key: &str) -> Result<Option<(Vec<u8>, String)>> {
@@ -98,34 +156,21 @@ impl Sink for FileSink {
         cond: Cond,
     ) -> Result<Put> {
         let p = self.path(key)?;
-        match &cond {
-            Cond::None => {}
-            Cond::IfNoneMatchAny => {
-                if p.exists() {
-                    return Ok(Put::PreconditionFailed);
-                }
-            }
-            Cond::IfMatch(etag) => match self.head(key)? {
-                Some(current) if current == *etag => {}
-                _ => return Ok(Put::PreconditionFailed),
-            },
-        }
-        if let Some(parent) = p.parent() {
-            std::fs::create_dir_all(parent).map_err(|source| RuntimeError::Io {
-                path: parent.to_path_buf(),
-                source,
-            })?;
-        }
-        let staged = p.with_extension(format!(
-            "{}.part",
-            p.extension()
-                .map(|e| e.to_string_lossy().into_owned())
-                .unwrap_or_default()
+        let parent = p.parent().unwrap_or(&self.root);
+        std::fs::create_dir_all(parent).map_err(|e| Self::io(parent, e))?;
+        let staged = parent.join(format!(
+            ".{}.{}-{}.part",
+            p.file_name()
+                .map(|n| n.to_string_lossy())
+                .unwrap_or_default(),
+            std::process::id(),
+            STAGE.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
         ));
-        let mut f = std::fs::File::create(&staged).map_err(|source| RuntimeError::Io {
-            path: staged.clone(),
-            source,
-        })?;
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&staged)
+            .map_err(|e| Self::io(&staged, e))?;
         let mut h = <sha2::Sha256 as sha2::Digest>::new();
         let mut buf = vec![0u8; 1 << 20];
         loop {
@@ -136,14 +181,31 @@ impl Sink for FileSink {
                 break;
             }
             sha2::Digest::update(&mut h, &buf[..k]);
-            std::io::Write::write_all(&mut f, &buf[..k]).map_err(|source| RuntimeError::Io {
-                path: staged.clone(),
-                source,
-            })?;
+            std::io::Write::write_all(&mut f, &buf[..k]).map_err(|e| Self::io(&staged, e))?;
         }
         drop(f);
-        std::fs::rename(&staged, &p).map_err(|source| RuntimeError::Io { path: p, source })?;
-        Ok(Put::Stored(format!("{:x}", sha2::Digest::finalize(h))))
+        let etag = format!("{:x}", sha2::Digest::finalize(h));
+
+        let _lock = self.lock()?;
+        let committed = match &cond {
+            Cond::None => std::fs::rename(&staged, &p).map(|()| true),
+            Cond::IfNoneMatchAny => match std::fs::hard_link(&staged, &p) {
+                Ok(()) => Ok(true),
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Ok(false),
+                Err(e) => Err(e),
+            },
+            Cond::IfMatch(expected) => match Self::etag_of(&p)? {
+                Some(current) if current == *expected => {
+                    std::fs::rename(&staged, &p).map(|()| true)
+                }
+                _ => Ok(false),
+            },
+        };
+        let _ = std::fs::remove_file(&staged);
+        match committed.map_err(|e| Self::io(&p, e))? {
+            true => Ok(Put::Stored(etag)),
+            false => Ok(Put::PreconditionFailed),
+        }
     }
 
     fn describe(&self) -> String {
@@ -625,6 +687,66 @@ mod tests {
             Put::Stored(_)
         ));
         assert_eq!(s.get("v1/x").unwrap().unwrap().0, b"two");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn concurrent_writers_see_their_conditions_enforced() {
+        let root = tmp("race");
+        let s = std::sync::Arc::new(FileSink::new(&root));
+        // Eight create-only writers of one key: exactly one lands, intact.
+        let stored: Vec<Option<String>> = std::thread::scope(|sc| {
+            (0..8u8)
+                .map(|i| {
+                    let s = std::sync::Arc::clone(&s);
+                    sc.spawn(move || {
+                        let body = vec![i; 300_000];
+                        match put(&*s, "v1/one", &body, Cond::IfNoneMatchAny) {
+                            Put::Stored(tag) => Some(tag),
+                            Put::PreconditionFailed => None,
+                        }
+                    })
+                })
+                .collect::<Vec<_>>()
+                .into_iter()
+                .map(|h| h.join().unwrap())
+                .collect()
+        });
+        let winners: Vec<&String> = stored.iter().flatten().collect();
+        assert_eq!(winners.len(), 1, "{stored:?}");
+        let (bytes, tag) = s.get("v1/one").unwrap().unwrap();
+        assert_eq!(&tag, winners[0]);
+        assert_eq!(bytes.len(), 300_000);
+        assert!(
+            bytes.iter().all(|b| *b == bytes[0]),
+            "no interleaved staging"
+        );
+        assert!(
+            std::fs::read_dir(root.join("v1")).unwrap().count() == 1,
+            "no staging file left behind"
+        );
+
+        // Eight updaters that all read the same tag: exactly one replaces it.
+        put(&*s, "v1/idx", b"v0", Cond::None);
+        let tag0 = s.head("v1/idx").unwrap().unwrap();
+        let replaced = std::thread::scope(|sc| {
+            (0..8u8)
+                .map(|i| {
+                    let (s, tag0) = (std::sync::Arc::clone(&s), tag0.clone());
+                    sc.spawn(move || {
+                        matches!(
+                            put(&*s, "v1/idx", &[b'v', b'1', i], Cond::IfMatch(tag0)),
+                            Put::Stored(_)
+                        )
+                    })
+                })
+                .collect::<Vec<_>>()
+                .into_iter()
+                .map(|h| h.join().unwrap())
+                .filter(|won| *won)
+                .count()
+        });
+        assert_eq!(replaced, 1);
         let _ = std::fs::remove_dir_all(root);
     }
 

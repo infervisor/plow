@@ -7,7 +7,7 @@
 //! `index.json` covers the whole chain of custody.
 //!
 //! The scheme is Nix's: ed25519, a key named `<name>:<base64>`, a signature
-//! `<name>:<base64>` published beside the index as `index.json.sig`. A client
+//! `<name>:<base64>` published under `sigs/<index sha256>.sig`. A client
 //! configured with trusted keys (`PLOW_TRUSTED_KEYS`) refuses an index that is
 //! unsigned or signed by a key it does not trust; a client with none configured
 //! verifies nothing, which is how a `file://` mirror and a test work.
@@ -16,9 +16,6 @@
 //! nothing and so verifies nothing.
 
 use crate::{Result, RuntimeError};
-
-/// The signature file published beside a model's `index.json`.
-pub const INDEX_SIGNATURE: &str = "index.json.sig";
 
 fn dist(msg: String) -> RuntimeError {
     RuntimeError::Dist(msg)
@@ -40,14 +37,23 @@ impl Trust {
         Trust(Vec::new())
     }
 
-    /// `PLOW_TRUSTED_KEYS`: comma-separated `<name>:<base64>` entries.
+    /// `PLOW_TRUSTED_KEYS`: comma-separated `<name>:<base64>` entries. Set
+    /// but naming no key is refused: it reads as "verify" and would verify
+    /// nothing.
     pub fn parse(list: &str) -> Result<Self> {
-        list.split(',')
+        let keys = list
+            .split(',')
             .map(str::trim)
             .filter(|s| !s.is_empty())
             .map(PublicKey::parse)
-            .collect::<Result<Vec<_>>>()
-            .map(Trust)
+            .collect::<Result<Vec<_>>>()?;
+        if keys.is_empty() {
+            return Err(dist(
+                "PLOW_TRUSTED_KEYS is set but names no key (<name>:<base64>, comma-separated)"
+                    .into(),
+            ));
+        }
+        Ok(Trust(keys))
     }
 
     pub fn is_empty(&self) -> bool {
@@ -59,7 +65,7 @@ fn split_named(s: &str, what: &str) -> Result<(String, Vec<u8>)> {
     let (name, b64) = s
         .trim()
         .split_once(':')
-        .ok_or_else(|| dist(format!("{what}: expected <name>:<base64>, got {s:?}")))?;
+        .ok_or_else(|| dist(format!("{what}: expected <name>:<base64>")))?;
     if name.is_empty() || name.contains(char::is_whitespace) {
         return Err(dist(format!("{what}: {name:?} is not a key name")));
     }
