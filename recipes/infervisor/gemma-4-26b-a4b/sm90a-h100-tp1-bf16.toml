@@ -37,12 +37,20 @@
 # prefill (the FlashPrefill fallback ~16%).
 # Slot count: BF16 weights 47 GiB; a staged slot keeps a 2048-row sliding ring = 400 MiB (25 layers x
 # 8 KV heads x 256 x K+V x 2 B), so 32 slots = 12.5 GiB of rings + VMM full-attention KV.
+# 2026-10-27 (branch bf16-decode, plow_git below, clean emit packet f72d0330f9d8fd2c, plowrt
+# ecb90f0d1): the decode interpreter emits RAW_NARROW, INST_PRELOAD, ROUTER_V8/V9 and TOPK_V4.
+# step_bench @8K B1/8/16/32 5.64 / 9.37 / 11.45 / 15.89 -> 5.39 / 9.12 / 11.26 / 15.88 ms, token
+# digests identical, ctx 4094/4095/8191 sweep clean. FP32 gate PASS (kl_mean 0.1071 vs vLLM
+# 0.1005, kl_trim 0.0539 vs 0.0496, top1_decisive 0.9798, cont_frac 0.637; bf16-decode/gates1).
+# Production mix vs vLLM 0.29 (1.8 req/s): SLO met 88.2% -> 88.5% vs vLLM 100%, TPOT p50 49.5 ->
+# 37.6 ms vs 15.1; still behind: prefill ticks (mean 78 ms) block decode, the decode step itself
+# is within 1.0-1.2x of vLLM (bf16-decode/prod/report-g26bf16).
 schema = "plow.recipe.v1"
 namespace = "infervisor"
 name = "gemma-4-26b-a4b"
 label = "sm90a-h100-tp1-bf16"
 status = "validated"
-plow_git = "2dabbe2b3f82129d4f905707080b0d2061d768f1"
+plow_git = "ecb90f0d1c999c2d6838eb58d84c5e52ff1c5098"
 network = "gemma4"
 
 [target]
