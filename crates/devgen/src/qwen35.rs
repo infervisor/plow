@@ -64,7 +64,7 @@ fn segment_roles(m: &Model) -> Option<packet::devbuild::SectionData> {
         let p = &m.progs[index];
         let mut roles = vec![plow_asset::segment_roles::INTERPRETER; p.gq_seg_ofs.len() - 1];
         for (ix, inst) in p.insts.iter().enumerate() {
-            if inst.op != DevOp::Gemv as u16
+            if !(inst.op == DevOp::Gemv as u16 || inst.op == DevOp::GemmFp8 as u16)
                 || !m.tensors[inst.t[2] as usize].name.contains(".layers.")
             {
                 continue;
@@ -328,7 +328,11 @@ impl Emitter<'_> {
                 dep
             } else {
                 self.quant_input = Some((src, k));
-                let blocks = if self.prefill { self.b.all() } else { vec![0] };
+                let blocks = if self.prefill || rows > 1 {
+                    self.b.all()
+                } else {
+                    vec![0]
+                };
                 self.b.emit(DevOp::QuantFp8, blocks, &[dep], |d| {
                     d.t[..3].copy_from_slice(&[xq, src, ascale]);
                     d.i[..2].copy_from_slice(&[rows, k]);
@@ -345,7 +349,7 @@ impl Emitter<'_> {
                 let g = GenTensor::tmap_e4m3(w, n, k, 128);
                 self.b
                     .tensor_gen(&format!("tmap.fp8.pf.w{w}"), g.byte_len(), g)
-            } else if emit_config::active().qwen_fp8_m1_tma {
+            } else if rows == 1 && emit_config::active().qwen_fp8_m1_tma && !self.decode_cublaslt {
                 let g = GenTensor::tmap_e4m3(w, n, k, 64);
                 self.b.tensor_gen(&format!("tmap.fp8.{w}"), g.byte_len(), g)
             } else {
@@ -357,8 +361,9 @@ impl Emitter<'_> {
                 d.i[6] = input_map;
                 d.i[7] = weight_map;
             });
-            if self.prefill
-                && (emit_config::active().fp8_pf_isolate || emit_config::active().fp8_pf_gemm_role)
+            if (self.prefill
+                && (emit_config::active().fp8_pf_isolate || emit_config::active().fp8_pf_gemm_role))
+                || (!self.prefill && self.decode_cublaslt)
             {
                 self.b.isolate(done);
             }
@@ -918,11 +923,10 @@ fn ladder(
         !fp8 || buckets.is_empty()
             || (emit_config::active().w8a8
                 && emit_config::active().qwen_w8a8_prefill
-                && decode_slots == 1
                 && buckets
                     .iter()
                     .all(|rows| matches!(rows, 128 | 1024 | 4096 | 8192))),
-        "Qwen FP8 prefill requires explicit W8A8 prefill, B1 and buckets128/1024/4096/8192"
+        "Qwen FP8 prefill requires explicit W8A8 prefill and buckets 128/1024/4096/8192"
     );
     let mut tensors = None;
     let mut progs = Vec::new();
@@ -1037,16 +1041,11 @@ fn phase(
     assert!(
         !w8a8
             || (fp8
-                && decode_slots == 1
-                && ((!prefill && batch == 1)
+                && ((!prefill && batch <= W8A8_DECODE_ROWS)
                     || (prefill
                         && matches!(batch, 128 | 1024 | 4096 | 8192)
                         && emit_config::active().qwen_w8a8_prefill))),
-        "Qwen W8A8 requires B1 decode or explicit supported prefill buckets"
-    );
-    assert!(
-        !decode_cublaslt || !fp8,
-        "Qwen decode Lt requires BF16 projections"
+        "Qwen W8A8 requires decode rungs within one GEMM M tile or explicit supported prefill buckets"
     );
     let fuse_decode = !prefill
         && emit_config::active().qwen_fold_norm
@@ -1316,6 +1315,9 @@ fn phase(
 
 /// Set once `run` below emits for an AMD target: the AMD tile inventory, an AMD manifest, and
 /// an AMD interpreter object in place of the paired CUDA one. This is the DECODE gate.
+/// Decode rungs the W8A8 decode arm serves: rung 1 on the M1 kernels, wider rungs as one M tile
+/// of the Hopper W8A8 GEMM (`plow_w8a8_vllm_decode_rows` on the object).
+pub(crate) const W8A8_DECODE_ROWS: u32 = 128;
 const AMD_QWEN_EMIT: bool = false;
 
 /// Set once a HIP chunked Gated DeltaNet prefill kernel and its `plowrt` adapter exist.
@@ -1408,6 +1410,52 @@ fn refuse_unimplemented_target(arch: &str, gpu: &str) {
         "qwen3_5 cannot be emitted for {arch}. Missing capability:\n  - {}",
         gaps.join("\n  - ")
     );
+}
+
+/// The RECURRENT STATE section (`plow_asset::recurrent_state`): every `state.qwen.*` buffer,
+/// the active mask and the packed-prefill initstate scratch, slot-major over the decode slots.
+fn recurrent_state_section(m: &Model, slots: u32) -> packet::devbuild::SectionData {
+    use plow_asset::recurrent_state::{Buffer, Manifest, TensorFacts, SECTION, VERSION};
+    let buffer = |index: usize| {
+        let t = &m.tensors[index];
+        assert!(
+            t.bytes % u64::from(slots) == 0,
+            "{} is not slot-major",
+            t.name
+        );
+        Buffer {
+            tensor: u16::try_from(index).expect("tensor handle"),
+            slot_bytes: u32::try_from(t.bytes / u64::from(slots)).expect("slot bytes"),
+        }
+    };
+    let position = |name: &str| m.tensors.iter().position(|t| t.name == name);
+    let dec_lo = packet::devbuild::decode_rung_lo(&m.prog_t);
+    let manifest = Manifest {
+        version: VERSION,
+        slots,
+        buffers: (0..m.tensors.len())
+            .filter(|&i| m.tensors[i].name.starts_with("state.qwen."))
+            .map(buffer)
+            .collect(),
+        active: u16::try_from(position("in.active").expect("in.active")).expect("tensor handle"),
+        prefill_initstate: position("act.gdn.initstate").map(buffer),
+        prefill_updates_state: m.progs[..dec_lo]
+            .iter()
+            .all(|p| p.insts.iter().any(|i| i.op == DevOp::QwenGdnPrefill as u16)),
+    };
+    manifest
+        .validate(slots, |h| {
+            m.tensors.get(h as usize).map(|t| TensorFacts {
+                bytes: t.bytes,
+                initialized: t.init.is_some(),
+            })
+        })
+        .unwrap_or_else(|error| panic!("recurrent state: {error}"));
+    packet::devbuild::SectionData {
+        kind: packet::devbuild::SECT_METADATA,
+        name: SECTION.into(),
+        data: serde_json::to_vec(&manifest).expect("recurrent state"),
+    }
 }
 
 pub(super) fn run(
@@ -1610,6 +1658,12 @@ pub(super) fn run(
             name: plow_asset::live_kv::SECTION.into(),
             data: serde_json::to_vec(&live).expect("serialize LIVE KV manifest"),
         });
+    }
+    crate::object_requirements::append(&m, &mut sections)
+        .unwrap_or_else(|error| panic!("object requirements: {error}"));
+    sections.push(recurrent_state_section(&m, batch));
+    if c.block.is_none() {
+        sections.push(crate::serve_section::section_for(dir));
     }
     let bytes = if let Some(layer) = c.block {
         use plow_asset::*;
@@ -3342,6 +3396,63 @@ mod tests {
     }
 
     #[test]
+    fn w8a8_decode_cublaslt_isolates_every_body_matmul() {
+        let _env = crate::test_env::env_guard();
+        let _target = EmitAmdGuard::set(false);
+        struct Restore(emit_config::EmitConfig);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                emit_config::install(self.0.clone());
+            }
+        }
+        let restore = Restore(emit_config::active().clone());
+        let c = Config::parse(&fixture());
+        for batch in [1, 16] {
+            let mut cfg = restore.0.clone();
+            cfg.fp8 = true;
+            cfg.w8a8 = true;
+            cfg.qwen_w8a8_prefill = true;
+            cfg.qwen_fp8_m1_tma = true;
+            cfg.qwen_share_quant = true;
+            cfg.decode_cublaslt = false;
+            emit_config::install(cfg.clone());
+            let plain = model_prefill(&c, 8192, 132, 0, &[128], batch, true);
+            cfg.decode_cublaslt = true;
+            emit_config::install(cfg);
+            let routed = model_prefill(&c, 8192, 132, 0, &[128], batch, true);
+            let roles = plow_asset::segment_roles::SegmentRoles::from_bytes(
+                &segment_roles(&routed).unwrap().data,
+            )
+            .unwrap();
+            let decode = &roles.programs.last().unwrap().roles;
+            let (a, b) = (&plain.progs[1], &routed.progs[1]);
+            assert_eq!(a.insts.len(), b.insts.len());
+            assert!(a
+                .insts
+                .iter()
+                .zip(&b.insts)
+                .all(|(x, y)| (x.t, x.i[..6].to_vec()) == (y.t, y.i[..6].to_vec())));
+            let mut count = 0;
+            for (ix, d) in b.insts.iter().enumerate() {
+                let seg = b.stream.iter().find(|e| e.inst == ix as u32).unwrap().seg as usize;
+                let alone = b
+                    .stream
+                    .iter()
+                    .all(|e| (e.inst == ix as u32) == (e.seg as usize == seg));
+                if d.op == DevOp::GemmFp8 as u16 {
+                    count += 1;
+                    assert!(alone);
+                    assert_eq!(decode[seg], plow_asset::segment_roles::CUBLASLT);
+                    assert_eq!((d.i[0], d.i[6], d.i[7]), (batch, 0, 0));
+                } else {
+                    assert_ne!(decode[seg], plow_asset::segment_roles::CUBLASLT);
+                }
+            }
+            assert_eq!(count, 31);
+        }
+    }
+
+    #[test]
     fn w8a8_prefill_preserves_precision_maps_and_quant_dependencies() {
         let _env = crate::test_env::env_guard();
         let _target = EmitAmdGuard::set(false);
@@ -3474,9 +3585,13 @@ mod tests {
         assert!(
             std::panic::catch_unwind(|| model_prefill(&c, 8192, 132, 0, &[256], 1, true)).is_err()
         );
-        assert!(
-            std::panic::catch_unwind(|| model_prefill(&c, 8192, 132, 0, &[128], 4, true)).is_err()
-        );
+        // A wider decode rung beside the W8A8 prefill buckets is a ladder, not a refusal.
+        let laddered = model_prefill(&c, 8192, 132, 0, &[128], 4, true);
+        assert_eq!(laddered.prog_t, vec![128, 4]);
+        assert!(laddered.progs[1]
+            .insts
+            .iter()
+            .any(|d| d.op == DevOp::GemmFp8 as u16 && d.i[0] == 4));
         unsafe { std::env::remove_var("PLOW_QWEN_W8A8_PREFILL") };
         {
             let mut config = emit_config::active().clone();
@@ -3602,7 +3717,26 @@ mod tests {
         ] {
             assert!(req.contains(&serde_json::json!(flag)));
         }
-        assert!(std::panic::catch_unwind(|| model(&c, 8192, 132, 0, true, 4)).is_err());
+        // Wider rungs quantize on every block and run the GEMM at M = rows without the M1 map.
+        let wide = model(&c, 8192, 132, 0, true, 4);
+        let g = &wide.progs[0];
+        let mut count = 0;
+        for (ix, d) in g.insts.iter().enumerate() {
+            if d.op != DevOp::GemmFp8 as u16 {
+                continue;
+            }
+            count += 1;
+            let q = &g.insts[ix - 1];
+            assert_eq!(q.op, DevOp::QuantFp8 as u16);
+            assert_eq!(&q.i[..2], &[4, d.i[2]]);
+            assert_eq!(q.blocks, 132);
+            assert_eq!(d.i[0], 4);
+            assert_eq!((d.i[6], d.i[7]), (0, 0));
+            assert_eq!(wide.tensors[d.t[1] as usize].bytes, 4 * u64::from(d.i[2]));
+            assert_eq!(wide.tensors[d.t[3] as usize].bytes, 16);
+        }
+        assert_eq!(count, 31);
+        assert!(std::panic::catch_unwind(|| model(&c, 8192, 132, 0, true, 129)).is_err());
         assert!(std::panic::catch_unwind(|| model(&c, 8192, 132, 0, false, 1)).is_err());
     }
     #[test]

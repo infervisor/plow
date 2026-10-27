@@ -24,16 +24,34 @@
 # max_ctx 16384 / 131072 / 262144 (262144 costs 12% of the KV budget to flat FP8-KV scales and RoPE
 # tables); st4k / st15k / latency unchanged across max_ctx. Not run: the open-loop production mix.
 #
+# 2026-10-25 (branch kv-block-store): the KV block store is the only boundary storage, host tier
+# auto (this recipe's default). Strict open-loop production mix vs vLLM 0.29.0 fp8 KV (Kit 2 packet
+# b86ec26e4262, plowrt b779aa91, --prod-fidelity, think lognormal 10 s, 2 repeats) MATCHED +
+# EQUIVALENT: 1.8 sessions/s total tok/s 1.00x, TTFT P99 369.5 -> 384.2 ms (1.04x), TPOT P99
+# 32.60 -> 26.66 ms (0.82x, spread flagged); 2.7 sessions/s 1.00x / 485.2 -> 735.7 ms (1.52x;
+# Infervisor repeats 952.9 / 518.5 ms) / 57.89 -> 62.89 ms (1.09x). FP32 gate PASS (kl_trim 0.118
+# vs vLLM 0.1242, top1_decisive 0.9622, cont 0.5375, needle 1). With the tier off the same mix wins
+# every latency row (docs/bringup/results/gemma26b-h100-20261023/comparison.md); the tier costs
+# at 10 s think and wins at production's 45 s think (hit 71.7% vs 58.3%, lower TTFT and TPOT), so
+# it stays auto. Evidence: /opt/dlami/nvme/lava-tts/kvstore-scratch/strict-g26-tier23.
+# The re-emit from the plow_git below (packet faaebced1d4a) keeps Kit 2's `union`, `tuning` and
+# weights.json byte for byte; its manifest drops the removed snapshot knobs from the serve defaults
+# and excludes the new speech opcodes from every object. c16 FP32 gate PASS on it (kl_mean 0.2081
+# vs vLLM 0.202, kl_trim 0.1332 vs 0.1242, over-0.1 215 vs 206, top1_decisive 0.9582, cont_frac
+# 0.5389, needle 1; kvstore-scratch/gemma-final-gates/g26fp8-3).
+#
 # Routes: prefill projections cuBLASLt FP8 where the prefill roles pick it, native FP8 TMA GEMM
 # only at K % 128 == 0; grouped MoE prefill on cuBLASLt (moe_lt W8A8 chain, ABI 6 glue); decode
-# MoE >= 4 rows on cuBLASLt with the routed_fp8kv decode object; generated FP8-KV prefill attention
-# (hd256 sliding, hd512 global) from 128 rows.
+# MoE experts native (MoeExpertGluGemmaFp8/DownGemmaFp8) on every rung: this packet declares no
+# MOE_DECODE_CUBLASLT segment (an earlier line here said "decode MoE >= 4 rows on cuBLASLt"; that
+# is the BF16 recipe's route); decode dense projections native on rungs 1..16, cuBLASLt from 32;
+# generated FP8-KV prefill attention (hd256 sliding, hd512 global) from 128 rows.
 schema = "plow.recipe.v1"
 namespace = "infervisor"
 name = "gemma-4-26b-a4b"
 label = "sm90a-h100-tp1-fp8"
 status = "validated"
-plow_git = "9641938b65bd699335a6421c35bc95965c63052b"
+plow_git = "2dabbe2b3f82129d4f905707080b0d2061d768f1"
 network = "gemma4"
 
 [target]
@@ -80,6 +98,26 @@ PLOW_ATTENTION_DECODE_BALANCE_GF = "4"
 PLOW_FA_MMAQK = "3"
 PLOW_DECODE_BATCH_LADDER = "1,2,4,8,16,32,64,128"
 PLOW_EMIT_DECODE_CUBLASLT = "1"
+# HELD CANDIDATE, not applied: decode rung 32 on the native FP8 GEMV, cuBLASLt from 64 (2026-10-26 route
+# sweep, step_bench 48 steps
+# --spread, 2 passes ABAB, plowrt 6a4b75bc, packet 62f32036d4cc vs caf6c4a47ba6): B32 ctx 1K/8K/16K
+# 13.40/14.91/17.01 -> 11.55/13.50/15.34 ms (-14/-9/-10%), --same 4K
+# 11.69 -> 10.09 ms; B16/B64/B128 and every prefill rung unchanged (digests identical). Measured and
+# not taken: cuBLASLt from 8 (B8/B16 6.63/8.63 -> 9.17/10.54 ms) and native at 64 (B64 18.82 ->
+# 46.00 ms). FP32 gates on the variant packet: c16 PASS (kl_mean 0.2118 vs vLLM 0.202, kl_trim
+# 0.1406 vs 0.1242, kl_p95 0.805 vs 0.892, over 211 vs 206, top1_decisive 0.9602, cont_frac 0.538,
+# needle 1); long c4 PASS (kl_mean 0.1511 vs 0.165, kl_trim 0.0991 vs 0.1011, top1_decisive 0.9555,
+# cont_frac 0.408 vs 0.343, needle 1). c16 never fills rung 32, so both packets were also gated at c32
+# against a vLLM 0.28 c32 peer captured with the c16 peer's serve flags (peer kl_trim 0.128, kl_p95
+# 0.864, top1_decisive 0.9652, cont_decisive 0.870; its c16 recapture reproduces the c16 peer), three
+# runs per arm: control caf6c4a47ba6 kl_trim 0.1434/0.1465/0.1518, kl_p95 0.882/0.905/1.138,
+# top1_decisive 0.9592/0.9622/0.9572, cont_decisive 0.783/0.804/0.804 (0 of 3 PASS); variant kl_trim
+# 0.1502/0.1442/0.1422, kl_p95 0.997/0.972/0.920, top1_decisive 0.9532/0.9582/0.9572, cont_decisive
+# 0.783/0.826/0.783 (1 of 3 PASS). Every KL and top-1 criterion passes on all variant runs; the c32
+# failures are cont_decisive (one case = 0.0217 under this recipe's c16-calibrated 0.045 margin) and
+# hit the production packet too: no clear regression vs production, but no c32 PASS either. Held until a
+# c32 gate policy (margin or baseline-relative acceptance) is decided. Evidence: /opt/dlami/nvme/lava-tts/route-sweep (B/g26fp8-lt64,
+# B/g26fp8-lt8, B/g26fp8-lt128, gates/g26fp8-lt64, gates/g26fp8-long, gates/g26fp8-c32, gates/g26fp8-c32r, peer32).
 PLOW_EMIT_DECODE_CUBLASLT_MIN_ROWS = "32"
 PLOW_EMIT_DECODE_CUBLASLT_HEAD = "1"
 PLOW_EMIT_PREFILL_CUBLASLT = "1"
@@ -191,10 +229,16 @@ PLOW_PF_ITL_BUDGET_MS = "60"
 PLOW_DECODE_PIPELINE = "1"
 PLOW_VMM_RING_PARK = "8"
 PLOW_PF_ADMIT_OVERLAP = "1"
-PLOW_VMM_SNAP_PITCHED = "1"
-PLOW_VMM_SNAP_POOL = "4"
 PLOW_PF_ITL_FORCE = "0"
 PLOW_VMM_STRICT_PUBLISH = "1"
+# KV physical-block pool cap, also the band the block store leaves free above the pool's pressure floor. At the
+# 512 MiB default the store grew into every ring the pool retired and the pool shrank it back at the next prompt
+# burst: 15.5k chunk frees per 300 s cell of the production mix with the host tier on, each free a context-wide
+# driver call behind which decode ticks stretched 20 -> 75 ms (TTFT/TPOT P99 1.11x/1.10x and 0.98x/0.98x vs vLLM
+# 0.29 at 1.8/2.7 sessions/s with the 10 s growth hold alone). 2 GiB (2026-10-26, bin34 = 2dabbe2b, prod mix, tier
+# auto, fix-g26-band2g): 2958 frees, MATCHED + EQUIVALENT, tok/s 1.00x, TTFT/TPOT P99 0.99x/0.82x and 0.92x/0.76x;
+# 4 GiB: 452 frees, 0.90x/0.86x and 1.43x*/0.67x (one 961 ms cell, spread 78%), not taken.
+PLOW_KV_POOL_MIB = "2048"
 
 # Speculative decoding drafter (Gemma-4 assistant MTP, 4 layers over target layers 28/29 KV): emit = true builds span
 # verify (decode objects plus their `_rs` row-slot twins) and the draft programs into the packet, draft_fp8 = "all" binds

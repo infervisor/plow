@@ -2966,7 +2966,7 @@ fn raw_mla_v2_route_is_dense_bf16_pure_and_machine_filling() {
 
 #[test]
 fn packed_operator_families_require_pure_segments() {
-    let pure = segmented_prog(
+    let mut pure = segmented_prog(
         &[
             DevOp::RmsNorm,
             DevOp::HeadNormRope,
@@ -2979,6 +2979,7 @@ fn packed_operator_families_require_pure_segments() {
         ],
         &[0, 0, 1, 2, 2, 2, 2, 2],
     );
+    pure.insts[2].t[7] = packet::dev::TENSOR_NONE16;
     assert_eq!(derive_packed_segment_families(&pure).unwrap(), [5, 6, 7]);
     let routes: Vec<_> = derive_packed_segment_families(&pure)
         .unwrap()
@@ -3444,6 +3445,14 @@ fn prefill_arm_detect_selects_the_right_variant() {
     a4w4[0].insts[2].i[MOE_PF_ENC_SLOT] = MOE_ENC_MXFP4;
     a4w4[0].insts[3].i[MOE_PF_ENC_SLOT] = MOE_ENC_MXFP4;
     assert_eq!(PrefillArm::detect(&a4w4), PrefillArm::MlaMoeA4w4);
+    // The same chain with dense attention (no MLA-family opcode) rides the plain object.
+    let mut dense_moe = vec![prog_with_ops(&[
+        DevOp::FlashPrefill,
+        DevOp::MoeGroupGluPf,
+        DevOp::MoeGroupDownPf,
+    ])];
+    dense_moe[0].insts[1].i[MOE_PF_ENC_SLOT] = MOE_ENC_MXFP4;
+    assert_eq!(PrefillArm::detect(&dense_moe), PrefillArm::None);
     assert_eq!(Variant::detect(&a4w4), Variant::Mxfp4);
     assert_eq!(
         object_name(

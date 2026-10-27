@@ -1104,6 +1104,65 @@ __device__ __forceinline__ unsigned char e8m0_for_amax(float amax) {
     return (unsigned char)e;
 }
 
+/* AMD Quark dynamic MXFP4 activation quant, scale_calculation_mode "even" + round_method
+ * "half_even" (quark/torch/quantization/utils.py even_round; hw_emulation/csrc/mxfp4/
+ * fake_kernels.cuh qdq_mxfp4_kernel), what a Quark checkpoint's input_tensors declare:
+ *   byte = max(E(bits(amax) + 2^21) - 2, 0): amax moves up a binade at mantissa >= 1.75, so
+ *   amax/scale is in [3.5, 7) and [6, 7) saturates; amax < 2^-125 (an all-zero block) -> 0.
+ *   codes: half-even onto e2m1, saturating at 6, sign from the sign bit.
+ * Exact for finite amax < 1.75 * 2^127. runtime/tests/mx_act_even_gfx950_test.hip. */
+__device__ __forceinline__ unsigned char mx_even_e8m0(float amax) {
+    const int E = (int)((__builtin_bit_cast(unsigned, amax) + 0x200000u) >> 23);
+    return (unsigned char)(E > 2 ? E - 2 : 0);
+}
+/* 2^(127-b) for b <= 253; b = 0 must give 2^127, not rcp(+0) = inf. */
+__device__ __forceinline__ float mx_even_inv(unsigned char b) {
+    return __builtin_bit_cast(float, (254u - b) << 23);
+}
+__device__ __forceinline__ unsigned mx_even_fp4(float v) {
+    const float a = fabsf(v);
+    const unsigned n = (unsigned)(a > 0.25f) + (unsigned)(a >= 0.75f) + (unsigned)(a > 1.25f) +
+                       (unsigned)(a >= 1.75f) + (unsigned)(a > 2.5f) + (unsigned)(a >= 3.5f) +
+                       (unsigned)(a > 5.0f);
+    return ((__builtin_bit_cast(unsigned, v) >> 28) & 8u) | n;
+}
+/* One MX block of bf16 replaced by its Quark-even quantize-dequantize (exact in bf16): the
+ * decode GEMVs' A4W4 numerics (PLOW_MOE_DEC_A4) without an fp4 activation operand. */
+__device__ __forceinline__ void mx_even_fq32(bf16v8& x0, bf16v8& x1, bf16v8& x2, bf16v8& x3) {
+    bf16v8* x[4] = {&x0, &x1, &x2, &x3};
+    float amax = 0.0f;
+#pragma unroll
+    for (int i = 0; i < 4; i++)
+#pragma unroll
+        for (int j = 0; j < 8; j++) amax = fmaxf(amax, fabsf(bf2f((*x[i])[j])));
+    const unsigned char sb = mx_even_e8m0(amax);
+    const float inv = mx_even_inv(sb), s = __builtin_bit_cast(float, (unsigned)sb << 23);
+#pragma unroll
+    for (int i = 0; i < 4; i++)
+#pragma unroll
+        for (int j = 0; j < 8; j++) {
+            const unsigned c = mx_even_fp4(bf2f((*x[i])[j]) * inv), n = c & 7u;
+            const unsigned m =
+                n < 2u ? (n ? 126u << 23 : 0u) : ((126u + (n >> 1)) << 23) | ((n & 1u) << 22);
+            (*x[i])[j] = f2bf(__builtin_bit_cast(float, m | ((c & 8u) << 28)) * (sb ? s : 0x1p-127f));
+        }
+}
+
+/* The A4W4 MoE prefill's ACTIVATION quantizer (op_moe.h staging + GLU bridge): the pair above by
+ * default, the Quark rule under PLOW_MX_ACT_EVEN=1. */
+#ifndef PLOW_MX_ACT_EVEN
+#define PLOW_MX_ACT_EVEN 0
+#endif
+#if PLOW_MX_ACT_EVEN
+__device__ __forceinline__ unsigned char mx_act_e8m0(float amax) { return mx_even_e8m0(amax); }
+__device__ __forceinline__ float mx_act_inv(unsigned char b) { return mx_even_inv(b); }
+__device__ __forceinline__ unsigned mx_act_fp4(float v) { return mx_even_fp4(v); }
+#else
+__device__ __forceinline__ unsigned char mx_act_e8m0(float amax) { return e8m0_for_amax(amax); }
+__device__ __forceinline__ float mx_act_inv(unsigned char b) { return e8m0_inv_f32(b); }
+__device__ __forceinline__ unsigned mx_act_fp4(float v) { return quant_fp4(v); }
+#endif
+
 /* ---------------------------------------------------------------------------
  * FP8 (OCP e4m3) KV-CACHE loads/stores — the decode flash-attention path.
  *

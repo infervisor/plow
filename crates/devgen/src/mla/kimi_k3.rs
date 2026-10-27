@@ -967,7 +967,8 @@ pub(crate) fn k3_emit_full(
     }
     // Gate BEFORE the bytes land: a rejected program must never exist on disk.
     let lean = crate::apply_verify_gate(&m, verify);
-    std::fs::write(out, m.to_blob()).expect("write k3 devblob");
+    std::fs::write(out, m.to_blob_v6(&[crate::serve_section::section_for(dir)]))
+        .expect("write k3 devblob");
     eprintln!(
         "kimi_k3: emitted {} layers ({} KDA, {} MLA), tp={tp}, {} tensors, {} decode \
          instructions -> {out}\n  prefill buckets {pf:?} ({} programs incl. decode), ctx={ctx}",

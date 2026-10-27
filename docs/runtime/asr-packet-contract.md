@@ -109,7 +109,8 @@ API limits and session policy are the server's, not a model's: uploads 0.5-30 s 
 packet declaring other limits is refused), 8-48 kHz input resampled to 16 kHz, the energy
 endpointer used without a VAD packet (20 ms frames, 12 dB over the noise floor), turn timing
 (100 ms onset, 200 ms context, overlong cuts at the quietest frame), Realtime defaults
-(OpenAI's `server_vad` 0.5 / 300 / 500 ms), partial-transcript cadence and local agreement.
+(`server_vad` threshold 0.5, prefix padding 300 ms, silence 300 ms; OpenAI's silence default is
+500 ms), partial-transcript cadence and local agreement.
 
 ## Upgrading contract-0 packets
 
@@ -131,8 +132,9 @@ in its `MANIFEST.json`.
 A packet bound to compiler check receipts (`lean-checks.json` / `<stem>.lean-checks.json`: the
 receipt pins the packet image's sha256) cannot be rewritten: plowrt would refuse the receipt.
 `asr_packet_upgrade` refuses such a packet; re-emit the bundle from its recipe instead. This
-applies to the plowc-emitted audio-LM bundles (Qwen3-ASR `model.pkt`); the VAD and RNNT packets
-carry no receipts.
+applies to the plowc-emitted audio-LM bundles (Qwen3-ASR `model.pkt`) and, since a2dcdfc9, to a
+Silero packet emitted with a usable `plow_verify` (`silero_vad.lean-checks.json`: logical tensor
+effects per program): re-run `scripts/asr/silero_vad_build.sh`. RNNT packets carry no receipts.
 
 ## Validation (H100, 2026-10-09)
 

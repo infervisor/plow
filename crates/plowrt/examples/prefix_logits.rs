@@ -30,7 +30,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     fs::create_dir(&out)?;
     let tokenizer = plowrt::text::tokenizer::load_tokenizer(&assets);
     let template =
-        plowrt::serve::template::ChatTemplate::load(&assets).ok_or("chat template required")?;
+        plowrt::serve::template::ChatTemplate::load(&assets)?.ok_or("chat template required")?;
     let be = Arc::new(plowrt::device::cuda::CudaBackend::new(0)?);
     for (index, case) in cases.iter().enumerate() {
         let rendered = template.render(case["messages"].as_array().ok_or("messages required")?)?;

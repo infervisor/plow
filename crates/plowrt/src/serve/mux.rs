@@ -259,6 +259,8 @@ pub struct JobOpts {
     /// Whose request this is ([`crate::serve::session::RequestIds::tenant`]): within a class, queued
     /// tenants are seated round-robin ([`Fair`]); `None` is a tenant of its own.
     pub tenant: Option<u64>,
+    /// The client's `X-Session-End`: the session's last turn ([`crate::serve::session::RequestIds::session_end`]).
+    pub session_end: bool,
     /// [`Fair`]'s start round, set when the job is first ordered in the queue (0: not yet).
     pub(crate) round: u64,
     /// Prefix rows the cache would attach, and the cache generation they were read at.
@@ -1050,6 +1052,8 @@ struct Slot {
     parked_at: Option<Instant>,
     /// A session request's retention seat; dropped with the slot, it retires the rows.
     session: Option<Seat>,
+    /// The session's last turn (`X-Session-End`): its prefix boundary is demoted at retire.
+    session_end: bool,
     /// Retained cache rows this sequence starts from (the engine keeps them at `begin_slot`).
     #[cfg_attr(not(feature = "cuda"), allow(dead_code))]
     resume: usize,
@@ -2513,6 +2517,10 @@ fn waited_ms(now: Instant, arrived: Instant) -> f64 {
     now.saturating_duration_since(arrived).as_secs_f64() * 1e3
 }
 
+/// How long a request waits at admission for its boundary's host restore (a 170 MB boundary
+/// lands in under 10 ms; a backlog of them is the bound).
+const RESTORE_HOLD_MS: f64 = 50.0;
+
 /// One pass over the wait queue: sweep what will never run, then seat what fits.
 ///
 /// Two fairness rules on top of the backfill:
@@ -2673,6 +2681,17 @@ fn drain_waiting_session(
         let Some((job, arrived)) = waiting.pop_front() else {
             break;
         };
+        // A boundary restore in flight (`PrefixProbe::prefetch`): the request waits for the
+        // copy here, not in the engine stream where every slot would wait with it. Bounded:
+        // past it the gather orders itself behind the fence.
+        if let Some(p) = prefix.filter(|p| p.host_tier()) {
+            if waited_ms(now, arrived) < RESTORE_HOLD_MS
+                && p.restore_pending(&job.prompt_ids, job.opts.prefix.as_ref())
+            {
+                still.push_back((job, arrived));
+                continue;
+            }
+        }
         let round = job.opts.round;
         match admit_session(
             slots,
@@ -2927,6 +2946,7 @@ fn admit_session(
     let resume = resume.filter(|r| r.slot == idx).map_or(0, |r| r.rows);
     let speech = job.opts.speech.is_some();
     slots[idx] = Some(Slot {
+        session_end: job.opts.session_end,
         session: retention.seat(job.opts.session, idx, pair, speech, resume, metrics),
         resume,
         telemetry,
@@ -3457,7 +3477,8 @@ fn run_one_tick(
                             let mut take = available
                                 .min(remaining)
                                 .min(pf_chunk_rows())
-                                .min(e.pf_request_max_rows());
+                                .min(e.pf_request_max_rows())
+                                .min(e.state_capture_cut(i, request.prompt_ids.len(), start));
                             if request.mm.as_deref().is_some_and(|j| j.spans()) {
                                 take = plow_asset::multimodal::span_safe_rows(
                                     &request.prompt_ids,
@@ -4286,6 +4307,9 @@ fn run_one_tick(
             })();
             for (slot, request) in result.0.iter().enumerate().take(e.batch()) {
                 if request.is_none() && slot_free(&result.0, slot) {
+                    if disconnected[slot] {
+                        e.note_disconnect(slot);
+                    }
                     e.retire_slot(slot, result.5.is_none() && !disconnected[slot]);
                 }
             }
@@ -6524,6 +6548,7 @@ struct WindowAdmit {
     total: usize,
     prefix: Option<crate::memory::vmm::PrefixKey>,
     pin: Option<std::time::Duration>,
+    session_end: bool,
     /// `None` until attempted.
     outcome: Option<Result<Option<usize>>>,
 }
@@ -6590,6 +6615,9 @@ fn admit_window(
         let admitted = e.admit_packed_slot(job.slot, &job.prompt, job.total);
         if let (Ok(Some(_)), Some(ttl)) = (&admitted, job.pin) {
             e.hold_session_prefix(job.slot, ttl);
+        }
+        if matches!(admitted, Ok(Some(_))) {
+            e.set_session_end(job.slot, job.session_end);
         }
         job.outcome = Some(admitted);
     }
@@ -6841,6 +6869,7 @@ fn gpu_prefill_batched_pass(
                         total,
                         prefix: request.prefix.take(),
                         pin: request.session.as_ref().and_then(|s| s.pin_ttl()),
+                        session_end: request.session_end,
                         outcome: None,
                     });
                     continue;
@@ -6866,6 +6895,9 @@ fn gpu_prefill_batched_pass(
                         .filter(|_| fresh)
                     {
                         e.hold_session_prefix(row, ttl);
+                    }
+                    if fresh {
+                        e.set_session_end(row, request.session_end);
                     }
                     if fresh
                         && request
@@ -6926,7 +6958,9 @@ fn gpu_prefill_batched_pass(
                 if !e.packed_slot_ready(i) || s.step != 0 || n == 0 || pf_pos + withheld >= n {
                     return None;
                 }
-                let publish = e.pf_publish_cap(i, pf_pos);
+                let publish = e
+                    .pf_publish_cap(i, pf_pos)
+                    .min(e.state_capture_cut(i, n, pf_pos));
                 let mut remaining = e
                     .pf_plan_slice(n - withheld - pf_pos, chunk_cap)
                     .min(publish);
@@ -7410,6 +7444,7 @@ fn gpu_prefill_advance(
         if let Some(ttl) = slot.session.as_ref().and_then(|s| s.pin_ttl()) {
             e.hold_session_prefix(slot_idx, ttl);
         }
+        e.set_session_end(slot_idx, slot.session_end);
     }
     if let Some(sp) = slot.speech.as_deref_mut() {
         if let Some(encode) = sp.encode.take() {
@@ -11140,6 +11175,7 @@ mod tests {
         let (respond, rx) = crate::serve::stream::channel();
         (
             Some(Slot {
+                session_end: false,
                 telemetry: None,
                 prompt_ids: vec![1, 2, 3],
                 out_ids: Vec::new(),
@@ -12096,7 +12132,7 @@ mod host_bench {
             // The chat path's extra step: the checkpoint template over one user turn.
             if let Some(t) = std::env::var("HOSTBENCH_ASSETS")
                 .ok()
-                .and_then(|d| crate::serve::template::ChatTemplate::load(std::path::Path::new(&d)))
+                .and_then(|d| crate::serve::template::load(std::path::Path::new(&d)))
             {
                 let msgs = vec![serde_json::json!({"role": "user", "content": prompts[0]})];
                 let render: Vec<f64> = (0..20)

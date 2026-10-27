@@ -106,6 +106,12 @@
 (rewrite (ZeroCenteredRmsNorm (Ew "add" ?a ?b) ?w ?eps)
          (FusedResidualZeroCenteredNorm ?a ?b ?w ?eps))
 
+; Muse Spark's block boundary: its gated residual in place of the add, then the next
+; zero-centered pre-norm.
+; rule: residual-gate-zero-centered-rmsnorm-fuse
+(rewrite (ZeroCenteredRmsNorm (ResidualGate ?r ?h ?g ?t ?ge) ?w ?eps)
+         (FusedResidualGateZeroCenteredNorm ?r ?h ?g ?t ?ge ?w ?eps))
+
 ; residual-layernorm-fuse: same for LayerNorm (DiT, SigLIP).
 ; rule: residual-layernorm-fuse
 (rewrite (LayerNorm (Ew "add" ?a ?b) ?w ?bias ?eps)

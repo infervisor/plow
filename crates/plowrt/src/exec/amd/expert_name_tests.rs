@@ -12,6 +12,7 @@ impl Fake {
         std::fs::create_dir_all(&dir).unwrap();
         let width = |dt: &str| match dt {
             "F32" => 4,
+            "BF16" => 2,
             "U8" | "F8_E4M3" => 1,
             other => panic!("test helper has no width for {other}"),
         };
@@ -75,7 +76,7 @@ fn block_fp8_resolves_to_exactly_the_names_it_always_did() {
     }
     let f = Fake::new("blockfp8", &refs(&t));
     let c = f.open();
-    let en = resolve_expert_names(&c, "model.layers.3.mlp.").unwrap();
+    let en = resolve_expert_names(&c, "model.layers.3.mlp.", false).unwrap();
     assert_eq!(en.ns, "model.layers.3.mlp.experts.");
     assert_eq!(en.proj, ["gate_proj", "up_proj", "down_proj"]);
     assert_eq!(en.payload, ".weight");
@@ -114,7 +115,7 @@ fn mxfp4_under_the_standard_projection_names_resolves_on_the_scale_alone() {
     }
     let f = Fake::new("mxstd", &refs(&t));
     let c = f.open();
-    let en = resolve_expert_names(&c, "m.layers.3.mlp.").unwrap();
+    let en = resolve_expert_names(&c, "m.layers.3.mlp.", false).unwrap();
     assert_eq!(en.proj, ["gate_proj", "up_proj", "down_proj"]);
     assert_eq!(en.payload, ".weight");
     assert_eq!(en.scale, ".weight_scale");
@@ -142,7 +143,7 @@ fn mixtral_mxfp4_resolves_namespace_projections_and_payload_together() {
     let c = f.open();
     // The K3 emitter declares `moe.{lp}expert_weight_table` (devgen/k3.rs),
     // so this is the prefix the loader is actually handed.
-    let en = resolve_expert_names(&c, "moe.language_model.model.layers.1.").unwrap();
+    let en = resolve_expert_names(&c, "moe.language_model.model.layers.1.", false).unwrap();
     assert_eq!(en.ns, P.trim_end_matches("0."));
     assert_eq!(en.proj, ["w1", "w3", "w2"], "slot order is gate, up, DOWN");
     assert_eq!(en.payload, ".weight_packed");
@@ -169,7 +170,7 @@ fn a_scale_that_covers_the_wrong_k_is_refused_and_named() {
     ];
     let f = Fake::new("badk", &refs(&t));
     let c = f.open();
-    let en = resolve_expert_names(&c, "m.layers.0.mlp.").unwrap();
+    let en = resolve_expert_names(&c, "m.layers.0.mlp.", false).unwrap();
     let e = check_expert_geometry(&c, &en).unwrap_err().to_string();
     assert!(e.contains("gate_proj.weight_scale"), "{e}");
     assert!(e.contains("K disagrees"), "{e}");
@@ -192,7 +193,7 @@ fn a_block_fp8_grid_of_the_wrong_shape_is_refused() {
             .collect();
         let f = Fake::new(&format!("grid{tag}"), &refs(&t));
         let c = f.open();
-        let en = resolve_expert_names(&c, "m.layers.0.mlp.").unwrap();
+        let en = resolve_expert_names(&c, "m.layers.0.mlp.", false).unwrap();
         assert_eq!(check_expert_geometry(&c, &en).is_ok(), ok, "{tag}");
     }
 }
@@ -207,7 +208,7 @@ fn a_payload_without_any_scale_names_both_spellings() {
         vec![64, 48],
     )];
     let f = Fake::new("noscale", &refs(&t));
-    let e = resolve_expert_names(&f.open(), "m.layers.0.mlp.")
+    let e = resolve_expert_names(&f.open(), "m.layers.0.mlp.", false)
         .unwrap_err()
         .to_string();
     assert!(e.contains("MISSING EXPERT SCALE"), "{e}");
@@ -225,7 +226,7 @@ fn no_experts_at_all_reports_every_name_it_probed() {
     let t: Vec<(String, &str, Vec<usize>)> =
         vec![("m.layers.0.mlp.gate.weight".into(), "U8", vec![8, 8])];
     let f = Fake::new("noexp", &refs(&t));
-    let e = resolve_expert_names(&f.open(), "m.layers.0.mlp.")
+    let e = resolve_expert_names(&f.open(), "m.layers.0.mlp.", false)
         .unwrap_err()
         .to_string();
     assert!(e.contains("MISSING EXPERT WEIGHT"), "{e}");
@@ -234,4 +235,41 @@ fn no_experts_at_all_reports_every_name_it_probed() {
         e.contains("block_sparse_moe.experts.0.w1.weight_packed"),
         "{e}"
     );
+}
+
+/// A table the packet declares bf16 binds payloads only, and is refused when the checkpoint
+/// carries a scale twin or is not two bytes per element.
+#[test]
+fn a_declared_bf16_expert_binds_without_scales_and_rejects_quantized_bytes() {
+    const P: &str = "m.layers.0.mlp.experts.0.";
+    let bf: Vec<(String, &str, Vec<usize>)> = ["gate_proj", "up_proj", "down_proj"]
+        .iter()
+        .map(|p| (format!("{P}{p}.weight"), "BF16", vec![64, 32]))
+        .collect();
+    let f = Fake::new("bf16", &refs(&bf));
+    let c = f.open();
+    let en = resolve_expert_names(&c, "m.layers.0.mlp.", true).unwrap();
+    assert!(en.bf16());
+    check_expert_geometry(&c, &en).unwrap();
+    let e = resolve_expert_names(&c, "m.layers.0.mlp.", false)
+        .unwrap_err()
+        .to_string();
+    assert!(e.contains("MISSING EXPERT SCALE"), "{e}");
+
+    let mx: Vec<(String, &str, Vec<usize>)> = vec![
+        (format!("{P}gate_proj.weight"), "U8", vec![64, 16]),
+        (format!("{P}gate_proj.weight_scale"), "U8", vec![64, 1]),
+    ];
+    let f = Fake::new("bf16mx", &refs(&mx));
+    let e = resolve_expert_names(&f.open(), "m.layers.0.mlp.", true)
+        .unwrap_err()
+        .to_string();
+    assert!(e.contains("EXPERT ENCODING MISMATCH"), "{e}");
+    let u8w: Vec<(String, &str, Vec<usize>)> =
+        vec![(format!("{P}gate_proj.weight"), "U8", vec![64, 16])];
+    let f = Fake::new("bf16u8", &refs(&u8w));
+    let e = resolve_expert_names(&f.open(), "m.layers.0.mlp.", true)
+        .unwrap_err()
+        .to_string();
+    assert!(e.contains("two bytes per element"), "{e}");
 }

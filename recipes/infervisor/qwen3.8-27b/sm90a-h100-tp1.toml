@@ -1,7 +1,7 @@
 # Qwen3.8-27B (qwen3_5 hybrid: 48 Gated DeltaNet + 16 GQA hd256 layers, 27B dense) BF16 on H100
 # SXM5: BF16 weights and KV, 16K context, decode ladder 1..48 slots, live-KV allocation, packed
-# prefill (concurrent prompts share one launch), prefix cache off (recurrent state). Production
-# recipe for this model/GPU/precision.
+# prefill (concurrent prompts share one launch), prefix cache on (the KV block store captures the
+# GDN state at the prompt-end boundary). Production recipe for this model/GPU/precision.
 #
 #   PYREF=/opt/pytorch/bin/python3 PLOW_CAMPAIGN_NO_NIX=1 (box without nix only) \
 #   python3 scripts/campaign/campaign.py build recipes/infervisor/qwen3.8-27b/sm90a-h100-tp1.toml --out <fresh dir>
@@ -63,6 +63,9 @@
 #                         plain object; B32 40.3 ms on the walk vs 41.5 on the wide arm)
 #   decode B 48           weights streamed once on the wgmma wide arm (manifest gw_min_rows = 32:
 #                         B32 46.3 -> 41.5 ms before the walk took it; from 16 rows B16 lost 1 ms)
+#   decode B 4..48        (since 2026-10-27) projections as cuBLASLt segments, which supersedes the
+#                         native walks above for these rungs; B1/B2 keep the fused walks
+#                         (PLOW_EMIT_DECODE_CUBLASLT_MIN_ROWS below)
 #   decode GDN step       batched 8-row body with the tile's state rows staged by cp.async
 #                         (PLOW_NV_GDN_STEP_VROWS8 / _SMEM): B8/16/32/48 31.5/38.7/58.1/66.8 ->
 #                         28.9/33.4/47.4/49.8 ms over the one-row body
@@ -94,7 +97,7 @@ namespace = "infervisor"
 name = "qwen3.8-27b"
 label = "sm90a-h100-tp1"
 status = "validated"
-plow_git = "b44ca43f9e39982ce739ff14229f59ef4c99b58f"
+plow_git = "8b811e455ffed12486742718128efc439bc090ba"
 network = "qwen3.5"
 
 [target]
@@ -178,8 +181,9 @@ PLOW_QWEN_FUSE_MLP = "1"
 # Row-group FlashDecode body for the hd256 decode attention (routes above, build48).
 PLOW_NV_FA_RG_WIDE = "1"
 PLOW_NV_FA_RG_U = "8"
-# Decode GDN step as a standalone occupancy launch on rungs >= 16 (build88).
-PLOW_QWEN_GDN_ISOLATE = "16"
+# Decode GDN step as a standalone occupancy launch on rungs >= 4 (build88 took 16; 4 since the
+# cuBLASLt projections start there: plowrt needs one role layout across the routed rungs).
+PLOW_QWEN_GDN_ISOLATE = "4"
 # Decode projections on rungs >= 16 as cuBLASLt segments (496 per rung; fuse_ab / fuse_mlp / fold
 # off there, the generated attention and GDN step routes beside them; plowrt merges the route
 # tables, runs the rung's pointwise windows as light launches (PLOW_QWEN_LIGHT_DECODE) and
@@ -191,20 +195,41 @@ PLOW_QWEN_GDN_ISOLATE = "16"
 # 15K 79.8/81.7/82.8 -> 81.0/82.8/83.9. build106 (light windows + conv arm + pinned capture, ab107):
 # B16/32/48 26.37/29.90/31.22 ms, digests unchanged; grid106 4K tok/s 240.0/290.9/302.3 (TPOT p99
 # c16 59.9, c64 99.1), 15K 81.4/83.2/84.0.
+# From 4 rows (2026-10-27 route sweep, step_bench 2 passes ABAB on plowrt 69215b1e, packet 3157ca560892
+# vs the abi2 packet b9c47d9830b7; GDN_ISOLATE 4 with it): B4/B8 ctx 1K 24.74/26.32 -> 22.97/23.81 ms,
+# 16K 26.03/29.18 -> 24.20/26.65 ms, B8 x 8K 27.69 -> 25.17 (-7..-10%); B1/B2/B16/B32 unchanged
+# with identical digests; from 1 row B1/B2 22.19/23.16 -> 22.94/23.47 ms (not taken). --same 8 x 4K
+# 8/8. FP32 gate c1/c8/c32 PASS: kl_trim 0.000461/0.000450/0.000415 vs vLLM 0.000338/0.000346/
+# 0.000356, top1_decisive 0.9988/0.9988/1, cont_frac 0.862/0.874/0.883 vs 0.861/0.866/0.870, needle 1.
+# Evidence: /opt/dlami/nvme/lava-tts/route-sweep (C/qwen, gates/qwenbf16-lt4i).
 PLOW_EMIT_DECODE_CUBLASLT = "1"
-PLOW_EMIT_DECODE_CUBLASLT_MIN_ROWS = "16"
+PLOW_EMIT_DECODE_CUBLASLT_MIN_ROWS = "4"
 # Remainder split-K in the mma row-block walks; rungs 1..4 take the K8 tensor-core walk too
 # (ab94: B1/2/4/8/16 23.90/25.02/26.60/27.48/30.92 -> 22.32/23.47/25.14/26.88/29.68 ms, digests
 # identical through B32; grid94 4K c16 tok/s 226.3 -> 229.1).
 PLOW_NV_GEMV_REM_SPLIT = "1"
 PLOW_NV_GEMV_K8_B1 = "1"
 
-# plowrt rejects prefix caching with recurrent (GDN) state; the hybrid would need a GDN-state
-# snapshot at the prefix boundary. PLOW_VMM_LIVE: KV reserved virtually at the ceiling, physical
-# commit per admitted slot and rows (flat KV is 1 GiB per slot at 16K).
+# PLOW_VMM_LIVE: KV reserved virtually at the ceiling, physical commit per admitted slot and rows
+# (flat KV is 1 GiB per slot at 16K). Under PLOW_VMM_LIVE the prefix cache is not auto-selected,
+# so PLOW_VMM_PREFIX names it explicitly. Prefix cache on (2026-10-25, branch kv-block-store,
+# plowrt bin24 on packet 5f934c703d2c re-emitted from the plow_git below): the KV block store
+# holds the 16 full-attention layers' rows and the 48 GDN layers' state (147 MiB per boundary)
+# captured at the prompt-end chunk cut, and an attach within the prefix path is exact (0 of 16
+# turns differing). FP32 gate PASS at c1/c8/c32 with the cache on (kl_trim 0.000436 / 0.000470 /
+# 0.000456 vs vLLM 0.000338-0.000356, top1_decisive 1 / 0.9988 / 1, cont_frac 0.878 / 0.853 /
+# 0.849, needle 1; kvstore-scratch/qwenbf16-gate24) and off (bin21, same packet). Agentic16k
+# closed loop (10 turns to 15600 tokens, 128-token replies, 2 repeats) on vs off: c8 hit 82%,
+# out tok/s 180.6 vs 110.7, TTFT p50/p99 483/2333 vs 1721/3081 ms, TPOT p50/p99 40.0/50.7 vs
+# 58.5/81.8 ms; c32 hit 8-10% (the store's device cap is 17 GiB beside 48 live slots against
+# ~1.1 GiB per 15K-token session; the run did not record whether the 214 GiB host tier absorbed
+# the overflow), TTFT 13750/37200 vs 14561/36581, TPOT 100.2/108.9 vs 96.8/98.9 ms (+3.5%),
+# tok/s 140.9 vs 138.9 (kvstore-scratch/qwenbf16-prefix-ab). The c32 retention is the open
+# item, not the cache itself.
 [serve.env]
 PLOW_VMM_LIVE = "1"
-PLOW_PREFIX_CACHE = "0"
+PLOW_PREFIX_CACHE = "1"
+PLOW_VMM_PREFIX = "1"
 # Prefill in 1024-row chunks with the decode rows riding each chunk (gdn_ride + rider attention):
 # the 4K / 15K serving grids (lc43 plow4k_k1 / plow15k_k1, build64) ran here; the chain's
 # pointwise segments of a chunk are light launches (PLOW_QWEN_LIGHT_OCC default 4) and the decode

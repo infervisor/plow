@@ -270,6 +270,7 @@ async fn speech_on_guided(
             .collect();
     // Later segments resume no session: the first one's ticket carries the voice prefix.
     let later_ids = RequestIds {
+        session_end: false,
         session: None,
         ..ids.clone()
     };
@@ -829,6 +830,7 @@ async fn speech_with(
         true,
     );
     let ids = &RequestIds {
+        session_end: false,
         turn_key: run.key(),
         ..ids.clone()
     };
@@ -961,6 +963,7 @@ async fn speech_with(
     };
     let (tx, rx) = stream_mod::channel();
     let opts = crate::serve::mux::JobOpts {
+        session_end: false,
         class,
         raw_tokens: true,
         speech,
@@ -1546,6 +1549,7 @@ impl Later {
         let speech = self.maker.speech(&s)?;
         let (tx, rx) = stream_mod::channel();
         let opts = crate::serve::mux::JobOpts {
+            session_end: false,
             class: self.class,
             raw_tokens: true,
             speech,

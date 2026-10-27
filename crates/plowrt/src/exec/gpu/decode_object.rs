@@ -396,6 +396,7 @@ pub(super) fn bind(
     main_function: KernelFn,
     profile: &InterpreterProfile,
     want_sm: u32,
+    requirements: Option<&plow_asset::object_requirements::Manifest>,
 ) -> Result<BTreeMap<u32, Arc<BoundDecodeObject>>> {
     let main_id = metadata.programs.last().expect("validated coverage").object;
     let mut loaded = BTreeMap::new();
@@ -435,15 +436,13 @@ pub(super) fn bind(
             None
         };
         check_program_coverage(metadata, blob, id, coverage, splitk)?;
-        for binding in metadata.programs.iter().filter(|p| p.object == id) {
-            let program = &blob.progs[binding.index];
-            if program.insts.iter().any(|d| d.op == DevOp::GemmFp8 as u16) {
-                check_qwen_w8a8_capability(
-                    false,
-                    program.t,
-                    be.module_global_u32(&module, "plow_fp8_m1_arm")?,
-                )?;
-            }
+        if let Some(requirements) = requirements {
+            super::check_object_requirements(
+                be,
+                &module,
+                requirements.object(id),
+                &format!("decode object {id}"),
+            )?;
         }
         let requires_dsa_batch = metadata
             .programs

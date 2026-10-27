@@ -506,7 +506,8 @@ pub enum DevOp {
     /// the gate-scaled partial `part[slot]`. On the skip path it zeroes `part[slot]` so the
     /// combine sums a deterministic zero.
     /// `t0=part(out,[k,H]) t1=fu t2=routing_table t3=expert_weight_table` ·
-    /// `i0=slot i1=H(N) i2=I_moe(K) i3=n_exp`.
+    /// `i0=slot i1=H(N) i2=I_moe(K) i3=n_exp i7=ybf` (`ybf = 1`: unweighted bf16 `[k,H]` partial,
+    /// as [`DevOp::MoeGroupDownFp8Blk`]).
     MoeExpertDown = 42,
     /// MoE combine (`moe-ep-kernels.md §3b`) — the deterministic gather-combine. Waits on
     /// all `k` expert-down slots + the shared expert, then
@@ -562,14 +563,16 @@ pub enum DevOp {
     /// `wave_dot_fp8_blk`, same slot layout); the win is per-op overhead (one counter edge + one
     /// interp dispatch instead of `k`). Sentinel/EP-non-local (null base) slots leave `fu` unwritten.
     /// `t0=fu[k,I_moe] t1=x t2=routing_table t3=expert_weight_table t4=expert_scale_table` ·
-    /// `i0=k i1=I_moe i2=H i3=n_exp i5=act i6=enc` · `f0=situ_beta f1=situ_linear_beta`, exactly
-    /// as [`DevOp::MoeExpertGluFp8Blk`].
+    /// `i0=k i1=I_moe i2=H i3=n_exp i4=k_per_row? i5=act i6=enc` · `f0=situ_beta
+    /// f1=situ_linear_beta`, exactly as [`DevOp::MoeExpertGluFp8Blk`]. `k_per_row` (0 = all slots
+    /// read the one `x` row): slot `s` reads row `s / k_per_row` (batched decode rows).
     MoeGroupGluFp8Blk = 48,
     /// GROUPED block-fp8 expert down — ONE packet loops all `k` slots that
     /// [`DevOp::MoeExpertDownFp8Blk`] did one-per-packet. Bit-identical gate-scaled `part`; sentinel /
     /// EP-non-local slots zero the partial so the fixed-slot combine sums a deterministic zero.
     /// `t0=part[k,H] t1=fu t2=routing_table t3=expert_weight_table t4=expert_scale_table` ·
-    /// `i0=k i1=H i2=I_moe i3=n_exp`.
+    /// `i0=k i1=H i2=I_moe i3=n_exp i6=enc i7=ybf`. `ybf = 1` (Muse Spark TP, MXFP4 only) writes
+    /// the UNWEIGHTED down output as a bf16 `[k,H]` partial for a cross-rank reduce.
     MoeGroupDownFp8Blk = 49,
 
     // ===== DeepSeek MLA (Multi-head Latent Attention) — flash READ path. =====
@@ -642,7 +645,9 @@ pub enum DevOp {
     /// dot); this cheap 1-CU op does the score transform (sigmoid|softmax) + `e_score_correction_bias`
     /// on SELECTION only + group-limited top-k with lowest-id tie-break + norm_topk + route_scale over
     /// the precomputed logits. Byte-for-byte the selection logic of [`DevOp::MoeRouter`], minus the GEMV.
-    /// `t0=table t1=logit(bf16[n_exp]) t3=bias(f32[n_exp] or 0)` · `i1=n_exp i2=k i3=flags` · `f0=route_scale`.
+    /// `t0=table t1=logit(bf16[n_exp]) t3=bias(f32[n_exp] or 0)` · `i1=n_exp i2=k i3=flags
+    /// i4=rows?` · `f0=route_scale f1=logit_scale?` (scales the logit before the transform; 0 = 1).
+    /// `rows > 1`: that many logit/table rows, one workgroup each (0 = one row on one CU).
     MoeRouterTopk = 56,
 
     /// FUSED MLA merge + W_uv fold (`d_mla_merge_fold`) — replaces the [`DevOp::FlashMerge`] +
@@ -856,7 +861,8 @@ pub enum DevOp {
     /// bit-identical PER TOKEN to the decode router by construction. The `[T,n_exp]` logit matrix is
     /// an ordinary [`DevOp::Gemm`], already in the prefill bucket; only this tail was missing.
     /// `t0=table[T*k] t1=logit(bf16[T,n_exp]) t2=atom_acc? t3=bias` ·
-    /// `i0=atom_h i1=n_exp i2=k i3=flags i4=T i5=shared_tail` · `f0=route_scale`.
+    /// `i0=atom_h i1=n_exp i2=k i3=flags i4=T i5=shared_tail` · `f0=route_scale
+    /// f1=logit_scale?` (as [`DevOp::MoeRouterTopk`]).
     ///
     /// `i5` is PLOW_GLM_MOE_SHARED_FOLD: 1 makes the table `[T*(k+1)]`, each token's last slot the
     /// constant `{expert n_exp, gate 1.0}` — the shared expert routed as one more expert. The
@@ -2496,6 +2502,35 @@ pub enum DevOp {
     /// `t0=out(f32[items][cap]) t1=pcm(f32[items][cap]) t2=len_in(u32[items])
     /// t3=len_out(u32[items])` · `i0=items i1=cap i2=frame i3=hop` · `f0=top_db`.
     TrimSilenceF32 = 225,
+    /// Muse Spark row RMSNorm (`op_muse.h` `d_muse_rmsnorm`), one workgroup per row.
+    /// `t0=out(bf16[rows][dim]) t1=x(bf16) t2=w(bf16[dim])? t3=band_out?` · `i0=rows i1=dim
+    /// i2=mode i3=band_cols?` · `f0=eps f1=oscale` (0 = 1: the final norm carries the logit
+    /// `output_multiplier`). `band_cols` (0 = none) also writes the band-major copy
+    /// `band_out[c / band_cols][row][c % band_cols]` (the TP latent projections' input bands).
+    /// `mode` 0: `x*r*w` (`w` absent = weightless); 1 CENTERED: `x*r*(1+w)`;
+    /// 2 INPUT_SCALED: `y = bf16(x*(1+w))`, `y*r(y)`. Every product is rounded to bf16 where the
+    /// reference rounds it.
+    MuseRmsNorm = 226,
+    /// Muse Spark gated residual, `out = bf16(alpha*res + beta*h)` with
+    /// `beta = sigmoid(g/T)` and `alpha = sqrt(max(sigmoid(-g/T)*(1+beta), eps))` computed in f32
+    /// from the bf16 gate parameter. `t0=out t1=res t2=h t3=g(bf16[n])` · `i0=n i1=rows` ·
+    /// `f0=T f1=eps`. `out` may alias `res`.
+    MuseResidualGate = 227,
+    /// Muse Spark expert combine with the per-(token, expert) input-scaled post-expert norm.
+    /// `part` is the grouped down projection's `gate * y`; per slot this recovers
+    /// `y = bf16(part/gate)`, applies the input-scaled RMSNorm, and sums `gate * norm(y)` in f32.
+    /// `t0=out(bf16[rows][H]) t1=part(f32[rows][k][H]) t2=table t3=w(bf16[H]) t4=band_out?` ·
+    /// `i0=H i1=k i2=ybf i3=rows? i4=band_cols?` · `f0=eps`. `ybf` (TP): `part` is the reduced
+    /// bf16 `[rows][k][H]`, 1 = unweighted `y`, 2 = `gate * y`. `rows` (0 = 1): one workgroup per
+    /// row; `band_cols` as [`DevOp::MuseRmsNorm`].
+    MuseMoeCombineNorm = 228,
+    /// Muse Spark [`DevOp::MuseRmsNorm`] -> [`DevOp::MuseResidualGate`] -> [`DevOp::MuseRmsNorm`]
+    /// in one packet, one workgroup per row, bit-identical to the chain.
+    /// `t0=out_res t1=h t2=w1? t3=res t4=g t5=out_n t6=w2? t7=band_out?` ·
+    /// `i0=rows i1=dim i2=mode1 i3=mode2 i4=band_cols? i5=gate_eps i6=oscale` · `f0=eps1 f1=eps2`
+    /// · `j1=T`. `gate_eps`, `oscale` (0 = 1) and `T` are f32 bit patterns; `out_res` may alias
+    /// `res`.
+    MuseNormGateNorm = 229,
 }
 
 /// [`DevOp::FlashPrefillFp8`]'s split count (`i7` low half).
@@ -2789,6 +2824,10 @@ impl DevOp {
         DevOp::ReduceRowsF32,
         DevOp::LengthAffineU32,
         DevOp::TrimSilenceF32,
+        DevOp::MuseRmsNorm,
+        DevOp::MuseResidualGate,
+        DevOp::MuseMoeCombineNorm,
+        DevOp::MuseNormGateNorm,
     ];
 
     /// Recover the opcode from its wire discriminant, or `None` for a value no
@@ -3035,6 +3074,10 @@ impl DevOp {
             DevOp::ReduceRowsF32 => "PLOW_DOP_REDUCE_ROWS_F32",
             DevOp::LengthAffineU32 => "PLOW_DOP_LENGTH_AFFINE_U32",
             DevOp::TrimSilenceF32 => "PLOW_DOP_TRIM_SILENCE_F32",
+            DevOp::MuseRmsNorm => "PLOW_DOP_MUSE_RMSNORM",
+            DevOp::MuseResidualGate => "PLOW_DOP_MUSE_RESIDUAL_GATE",
+            DevOp::MuseMoeCombineNorm => "PLOW_DOP_MUSE_MOE_COMBINE_NORM",
+            DevOp::MuseNormGateNorm => "PLOW_DOP_MUSE_NORM_GATE_NORM",
         }
     }
 
@@ -3102,7 +3145,8 @@ impl DevOp {
     /// 223 -> 225 for `ReduceRowsF32 = 223`, `LengthAffineU32 = 224` (voice-conditioning
     /// front-ends).
     /// 225 -> 226 for `TrimSilenceF32 = 225` (reference-audio silence trim).
-    pub const COUNT: u16 = 226;
+    /// 226 -> 230 for `MuseRmsNorm = 226` .. `MuseNormGateNorm = 229` (Muse Spark).
+    pub const COUNT: u16 = 230;
 
     /// The `(M, N, K, quant)` a decode-GEMV opcode carries, or `None` if this is not one.
     ///

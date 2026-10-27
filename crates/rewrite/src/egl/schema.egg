@@ -56,6 +56,12 @@
       ; norm_topk, route_scale. Scoring is sigmoid by definition.
   (MoeExperts Expr Expr i64 i64 i64 i64)
       ; x, routes, num_experts, top_k, intermediate_size, block_fp8
+  (MoeRouterSigmoidBias Expr Expr Expr i64 i64 i64 f64 f64)
+      ; x, weight, correction_bias, num_experts, top_k, norm_topk, route_scale,
+      ; logit_scale: flat sigmoid(logit_scale * x·Wᵀ), the bias steering selection only.
+  (MoeExpertsPostNorm Expr Expr Expr i64 i64 i64 i64 f64)
+      ; x, routes, post_normw, num_experts, top_k, intermediate_size, block_fp8, eps:
+      ; every (token, expert) output InputScaledRmsNorm-ed before the weighted combine.
   (DsaIndexer Expr Expr Expr Expr Expr Expr Expr String)
       ; hidden, q_resid, wq_b, wk, k_norm_w, k_norm_b, weights_proj, config-token
   (DsaAttention Expr Expr Expr Expr String)
@@ -79,6 +85,11 @@
   (BlockResidual Expr Expr Expr Expr i64)  ; prefix, snapshots, norm_weight, proj_weight, max_snapshots
   (SnapCons Expr Expr)                ; snapshot, rest
   (SnapNil)                           ; end of the snapshot chain
+
+  ; --- Muse Spark ---
+  (InputScaledRmsNorm Expr Expr f64)  ; x, offset-from-one weight, eps: norm(x * (1 + w))
+  ; alpha(gate) * residual + beta(gate) * h; not an add, so no residual rule matches it.
+  (ResidualGate Expr Expr Expr f64 f64) ; residual, h, gate, temperature, eps
 
   ; --- 1-D convolution (audio codecs, vocoders) ---
   ; Conv1d and ConvTranspose1d are one term: the config token says which, with the stride,
@@ -114,6 +125,8 @@
   ; Residual-add + Norm fusion (fires at every block boundary in LLMs).
   (FusedResidualNorm Expr Expr Expr f64)             ; a, b, normw, eps  (add(a,b) then RMSNorm)
   (FusedResidualZeroCenteredNorm Expr Expr Expr f64) ; add(a,b) then zero-centered RMSNorm
+  (FusedResidualGateZeroCenteredNorm Expr Expr Expr f64 f64 Expr f64)
+      ; residual, h, gate, temperature, gate_eps, normw, eps  (Muse ResidualGate then ZC RMSNorm)
   (FusedResidualLayerNorm Expr Expr Expr Expr f64)   ; a, b, normw, normb, eps
   ; The MoE block boundary: the expert combine (routed + shared) added to the residual stream
   ; and normed — add(x, add(a, b)) then RMSNorm. The inner add is a distinct materialization

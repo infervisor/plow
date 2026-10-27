@@ -516,7 +516,8 @@ fn op_kind(g: &Graph, id: NodeId, node: &Node) -> Result<OpKind, BridgeError> {
             norm_topk,
             route_scale,
             correction_bias,
-        } => {
+            logit_scale,
+        } if *logit_scale == 1.0 => {
             let group = group.unwrap_or(nn_graph::op::MoeGroups {
                 n_group: 1,
                 topk_group: 1,
@@ -540,6 +541,7 @@ fn op_kind(g: &Graph, id: NodeId, node: &Node) -> Result<OpKind, BridgeError> {
             top_k,
             intermediate_size,
             block_fp8,
+            post_expert_norm: None,
         } => model(
             ModelOpKind::MoeExperts,
             2,

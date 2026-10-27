@@ -236,12 +236,12 @@ impl GlmCfg {
     /// PLOW_GLM_DSA=0 forces the dense path even at long ctx (the apples-to-apples decode baseline).
     fn dsa(&self, ctx: u32) -> bool {
         const CROSSOVER: u32 = 65536; // measured full-model TP4 dense/gather crossover (~69k, rounded)
-        let crossover = if emit_config::active().glm_dsa.as_deref() == Some("crossover")
-            || emit_config::active().glm_dsa.as_deref() == Some("65536")
-        {
-            CROSSOVER
-        } else {
-            self.index_topk
+        let crossover = match emit_config::active().glm_dsa.as_deref() {
+            Some("1") | Some("topk") => self.index_topk,
+            Some("crossover") | Some("65536") => CROSSOVER,
+            Some(v) if v.parse::<u32>().is_ok() => v.parse::<u32>().unwrap(),
+            _ if emit_config::active().glm_mla_bf16_ps => self.index_topk,
+            _ => CROSSOVER,
         };
         let on = self.has_dsa
             && ctx > crossover
@@ -1978,7 +1978,7 @@ pub(crate) fn glm53_emit_full(
         m.bake_gen();
     }
     let lean = crate::apply_verify_gate(&m, verify);
-    std::fs::write(out, m.to_blob()).unwrap();
+    std::fs::write(out, m.to_blob_v6(&[crate::serve_section::section_for(dir)])).unwrap();
     eprintln!("glm53-FULL: 45 layers (34 KDA + 11 sparse MLA), ctx={ctx}, tp={tp} -> {out}");
     write_mla_manifest(&m, out, target, enc, c.quark_mixed, &lean);
 }
@@ -6760,7 +6760,8 @@ fn emit_glm_mla_ex(
         && if sparse {
             emit_config::active()
                 .glm53_mla_hpack_gather
-                .is_some_and(|min| rows >= min)
+                .or(emit_config::active().glm53_mla_hpack_rows)
+                .is_some_and(|min| rows >= min.max(2))
         } else {
             emit_config::active()
                 .glm53_mla_hpack_rows
@@ -8862,7 +8863,7 @@ fn emit_glm_dsa_prefill_select(
             d.i[4] = 1;
             d.i[5] = 1;
             d.f[0] = c.eps;
-            d.j[1] = KV_MASK_NONE;
+            d.j[1] = 0;
         });
         let c_gs = b.emit(
             pick_tile(t, di, h, n_cu, kernelcaps::QuantScheme::None),
@@ -14354,7 +14355,7 @@ fn glm_emit_full(
     }
     // Gate BEFORE the bytes land: a rejected program must never exist on disk.
     let lean = crate::apply_verify_gate(&m, verify);
-    std::fs::write(out, m.to_blob()).unwrap();
+    std::fs::write(out, m.to_blob_v6(&[crate::serve_section::section_for(dir)])).unwrap();
     eprintln!(
         "glm52-FULL: {} layers (0-{}) hidden={} experts={}/top{} vocab={} {} -> {out}\n  \
          {n_ops} ops, decode M=1, ctx={ctx}, tp={tp}",
@@ -14672,7 +14673,7 @@ pub(crate) fn glm_main(
     // acceptable only because there is also nothing here to over-claim — a
     // consumer that finds no manifest cannot read a verification status off it.
     let _lean = crate::apply_verify_gate(&m, verify);
-    std::fs::write(out, m.to_blob()).unwrap();
+    std::fs::write(out, m.to_blob_v6(&[crate::serve_section::section_for(dir)])).unwrap();
     eprintln!(
         "glm52: GlmMoeDsa {} layers hidden={} heads={} kv_lora={} q_lora={} qk={}+{} v={} \
          experts={}/top{} moe_inter={} scale={:.4}",

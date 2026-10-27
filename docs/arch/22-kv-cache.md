@@ -18,8 +18,8 @@
 | **Layout** | Head-major, batch-major: `[slot][kv_head][ring_row][head_dim]` | The *reader* decides. Decode walks one head at a time, so a head's rows must be contiguous |
 | **Addressing** | A power-of-two **ring** per layer, indexed `row & kv_mask` | A windowed layer never needs more than `window + chunk` live rows |
 | **Write** | The per-head norm+RoPE op stores straight into the cache | The cache write is not a copy, it *is* the norm's store |
-| **Allocation** | Global layers on CUDA VMM, sliding layers on flat device memory | Only whole blocks of a non-wrapping cache can be multi-mapped and shared |
-| **Reuse** | Radix-matched shared blocks for global layers, copied snapshots for everything else | A wrapping ring cannot be shared by mapping; it can only be copied |
+| **Allocation** | Global layers on CUDA VMM, sliding layers on flat device memory | A slot's full-layer tracks grow by the row; a wrapping ring has no stable block identity |
+| **Reuse** | Radix-matched boundaries whose rows live in a content-addressed block store, gathered into the slot | Sharing by copy keeps the kernel's flat addressing and the slot's memory private; the store holds a prefix once |
 
 ---
 
@@ -323,7 +323,7 @@ the stage are `-1`) and span table (`plan_stage`, the request's rows
 `[k*S, (k+1)*S)` with `kvlen` at the stage end), so each write wraps at most one
 stage onto history no later query reads; the ring's contents after the launch
 equal those of sequential stage-sized launches, which is what decode, riders and
-prefix snapshots read. The runtime binds stages by position
+prefix publishes read. The runtime binds stages by position
 (`packed_prefill::stage_map`; `Manifest::validate` proves the interleaving and
 segment order) and uploads every stage's tables with the launch's. Full-attention
 layers are unstaged. Riders write in stage 0 and attend after its attention;
@@ -337,27 +337,28 @@ ring sized for the whole request chunk.
 ## 7. Slots, and who owns the memory
 
 A **slot** is one of the `B` sequence lanes the compiled decode batch provides
-(`crates/plowrt/src/exec/gpu.rs:5443`). Admission happens in the serve mux,
+(`crates/plowrt/src/exec/gpu.rs`). Admission happens in the serve mux,
 which places a job in the first idle slot inside the current decode rung and
 charges a KV row budget across all live slots; when the budget is full "the job
 stays queued, says nothing, costs no slot. This is the whole backpressure
-mechanism" (`crates/plowrt/src/serve/mux.rs:1364`).
+mechanism" (`crates/plowrt/src/serve/mux.rs`).
 
 Recycling a slot does **not** clear its cache. `in.kvlen` bounds what attention
-reads, so rewinding `pos[b]` to zero makes the old rows unreachable
-(`gpu.rs:5477`).
+reads, so rewinding `pos[b]` to zero makes the old rows unreachable.
 
-The allocator is split by layer type, and this split is the reason the prefix
-cache looks the way it does:
+The allocator is split by layer type:
 
 - **Global layers are CUDA VMM-backed.** One contiguous virtual reservation per
   `(layer, K|V)` spans the whole batch-major tensor, so the tensor table keeps
-  one base and the flash addressing is untouched (`memory/vmm.rs:14-24`).
+  one base and the flash addressing is untouched (`memory/vmm.rs`).
   Physical blocks — `PLOW_VMM_BLOCK_MIB`, default 2 MiB — are mapped under a
   slot's frontier as it grows (`ensure_rows`), with a `vmm-premap` thread
   mapping the next block column once decode is within an eighth of a block of
-  it and `ensure_rows` acting as the correctness backstop.
-- **Sliding layers stay on flat device allocations** (`vmm.rs:1155`: "full
+  it and `ensure_rows` acting as the correctness backstop. Every block under a
+  slot's window is **private to that slot**: nothing is multi-mapped, so a slot
+  may overwrite any of its rows at any time, and recycling a slot hands its
+  blocks to the next occupant unchanged.
+- **Sliding layers stay on flat device allocations** (`vmm.rs`: "full
   layers VMM-backed, sliding on cudaMalloc"), because a wrapping ring has no
   stable block identity to map.
 
@@ -367,16 +368,19 @@ flowchart TD
         S0[slot 0 window]
         S1[slot 1 window]
     end
-    subgraph Physical blocks
-        B1[block: shared prefix]
-        B2[slot 0 private tail]
-        B3[slot 1 private tail]
+    subgraph Physical blocks, one owner each
+        B2[slot 0 blocks]
+        B3[slot 1 blocks]
     end
-    S0 --> B1
-    S1 --> B1
+    subgraph KV block store slabs
+        P[prefix blocks]
+        W[window blocks]
+        T[state blobs]
+    end
     S0 --> B2
     S1 --> B3
-    NOTE[same handle mapped twice, driver refcounts it]
+    P -. gather on attach .-> S0
+    P -. gather on attach .-> S1
 ```
 
 Two pools smooth the driver cost. The **block pool**
@@ -386,98 +390,111 @@ request after load skips the commit. **Deferred reclaim**
 (`PLOW_VMM_DEFERRED_RECLAIM`, default on) keeps block column 0 mapped when it is
 private and hands the rest to a background thread, because "nothing about that
 work has to happen before the next occupant starts EXCEPT block column 0:
-prefill writes row 0 at once, and an idle decode row parks at `pos = 0`"
-(`vmm.rs:2660`). Waiting for an in-flight copy-out uses a condvar rather than
-sleep polling.
+prefill writes row 0 at once, and an idle decode row parks at `pos = 0`".
+Waiting for an in-flight copy-out uses a condvar rather than sleep polling.
 
 ---
 
 ## 8. Prefix cache
 
 The cache answers one question: can a new prompt start from another sequence's
-already-computed KV? What is shareable differs per layer type, which is why the
-answer has two halves.
+already-computed KV? The answer has two halves — an index that says *which*
+rows, and a store that *holds* them — and neither touches the slot memory of
+[§7](#7-slots-and-who-owns-the-memory). The store itself is
+[26 — KV block store](26-kv-block-store.md); this section is the view from the
+cache.
 
-**Matching.** Token ids are hashed per block with a chained block hash and
+**Matching.** Token ids are hashed per 32-row block with a chained block hash and
 matched in a radix tree; every hash match is then verified against the node's
 stored tokens, so a collision ends the match rather than serving the wrong KV
-(`crates/plowrt/src/memory/prefix.rs:182`).
+(`crates/plowrt/src/memory/prefix.rs`). The tree indexes **boundaries**: a
+published row count `p` of one sequence, quantised to 32 rows, with a kind
+(`PROMPT_END`, `SHARED_END`, `CHECKPOINT`).
 
-**Global layers share by mapping.** The prefix's whole blocks are the *same
-physical handles*, mapped into each sharing sequence's virtual window
-(`vmm.rs:6`). Held once in HBM, read by everyone.
+**Every cached row lives in the block store.** A boundary's rows are split into
+row classes, each `[tensor][row][hd]` in 32-row blocks on a per-class slab
+(`exec/gpu/kv_blocks.rs`, `memory/kv_store.rs`):
 
-**Everything else is copied at a boundary.** A published boundary `p_a` is
-quantised to 32 tokens, and the snapshot holds four things
-(`exec/gpu/prefix.rs:513`): the sliding rings' last `window` rows, the fp8 ring
-scales, the fp8 global-scale prefix, and the sub-block tail of the global KV
-that no whole block covers.
+| class | rows kept | holds |
+|---|---|---|
+| `Prefix` | every row `[0, p)` | the full-attention layers' K and V, with their fp8 scales |
+| `Window(w)` | the last `w` rows before `p` | the sliding rings' K and V, with the ring scales |
+| `State` | one blob captured at row `p` | recurrent state (GDN), when the packet exposes a capture op |
 
-The sliding rings are the expensive part, and the wrap is why:
+Blocks are content-addressed by the chained token hash, immutable once their
+copy's event has fired, and shared: two boundaries of one conversation, or two
+conversations on one system prompt, reference the same `Prefix` blocks, so a
+turn publishes only the rows the store does not already hold.
 
-```mermaid
-flowchart LR
-    subgraph Ring with wrapped window
-        A[run 2: rows from ring start]
-        MID[older rows, not part of window]
-        B[run 1: rows to ring end]
-    end
-    B --> SNAP[snapshot, ordered by absolute position]
-    A --> SNAP
-```
+**Publish.** At a boundary the engine checks the rings still hold it
+(`rows - p <= ring - window`, otherwise the window has wrapped past and the
+boundary is refused, never copied late), then scatters the missing blocks of
+each class with one launch per class on the engine stream and commits the
+boundary only once every copy is submitted. A same-session boundary replaces the
+previous one (retire-on-publish). For a recurrent model the state is captured at
+the chunk end that coincides with `p` — the packed prefill paths cut a chunk at
+the boundary for it — and a packet without a capture op gets no attach at all.
 
-A window that wraps is two contiguous runs, so the snapshot costs **up to two
-pitched device copies per tensor per layer**, i.e. `2 × 2 × n_sliding` — up to
-160 copies on Gemma-4-12B (`prefix.rs:373-409`); an unwrapped window needs only
-one, and the zero-row slice is now skipped. A boundary is only publishable
-while the rings still hold it: `rows - p_a <= ring - window`, otherwise the
-window has wrapped past and is unrecoverable (`prefix.rs:633`).
-
-**What must stay private.** Partial blocks, so later prefill never writes into a
-shared block; block column 0 of a recycled slot, since overwriting it "would
-corrupt every sharer"; and the global fp8 scales, which live in flat tensors
-that slot reuse overwrites.
+**Attach.** For a prompt, pick the deepest boundary `p ≤ match` whose blocks
+are all ready; `ensure_rows(p)` maps the slot's own blocks; then one gather per
+class copies the rows into the slot: `Prefix` rows into the full-layer tracks,
+`Window` rows into ring positions `r & mask`, the `State` blob into the slot's
+state buffers. Blocks that were spilled to the host tier come in as H2D copies
+on the same stream. The slot's first launch waits on the gather's event, and
+the last prompt token is always recomputed.
 
 ```mermaid
 sequenceDiagram
     participant A as Sequence A
-    participant C as Prefix cache
+    participant S as Block store
     participant B as Sequence B
-    A->>C: publish at boundary p_a
-    Note over C: whole blocks refcounted, snapshot copied
-    B->>C: lookup prompt, verify tokens
-    C-->>B: map shared blocks, restore snapshot
+    A->>S: publish at boundary p_a
+    Note over S: new 32-row blocks scattered, shared ones referenced
+    B->>S: lookup prompt, verify tokens
+    S-->>B: gather Prefix, Window, State into B's private slot
     Note over B: recompute at least the last token
 ```
 
-**Publishing is not free, so it is gated.** Every prefill completion and slot
-recycle used to publish a snapshot regardless of whether anything could ever
-reuse it, paying the copies and an allocation on workloads with a zero hit rate.
+**Why copy rather than map.** The VMM granule is 2 MiB — thousands of rows of
+one head — while a boundary is 32-row aligned, so mapping could only ever share
+whole granules and everything below them (the partial block, the rings, the
+scales) had to be copied anyway. Mapping also made a shared block writable by
+every sharer, which forced a strict-publish check on every scale write. With
+the store, the sharing unit is the 32-row block, slot memory is private, and a
+cached prefix exists once in the store plus once per live slot that uses it.
+The price is the gather: about 0.3 ms D2D for a 5.7K-token prefix on 26B FP8,
+a few milliseconds from the host tier.
+
+**Publishing is gated.** Every prefill completion and slot recycle used to
+publish regardless of whether anything could ever reuse it.
 `PLOW_VMM_PUBLISH_SHARED` (default on) records each sequence's leading 32 tokens
-and publishes only once that lead has been seen on another sequence
-(`vmm.rs:1994`). Unique-prompt benchmarks now pay nothing; a shared prefix costs
-one extra miss on its first sighting. The boundary tree still
-publishes an unseen lead's prompt end, at the cold end of the LRU: otherwise the first
-conversation with a new system prompt missed its whole turn 2. Eviction takes cold boundaries
-before any other, and an attach makes one ordinary. The cost: a unique-prompt workload pays one
-window copy per request again (no copy below the prompt end).
+and publishes a shared end only once that lead has been seen on another
+sequence; a sequence's own prompt end is always published, at the cold end of
+the LRU until something attaches to it, so the first conversation with a new
+system prompt does not miss its whole turn 2.
 
 **Enablement is an allowlist, not a probe.** With `PLOW_VMM_PREFIX` unset the
-runtime enables VMM prefix reuse only on Hopper, only without TP, packed-CUDA
-prefill, live rings or mixed-step sections, and only for the exact geometry it
-was qualified on: BF16 KV, `hd_full` 512, `hd_slide` 256, window 1024 — that is,
-Gemma-4 hybrid (`exec/gpu/prefix.rs:106-146`). `PLOW_PREFIX_CACHE=0` is the
-master switch and disables every side effect.
+runtime enables prefix reuse only on the geometry it was qualified on (Hopper,
+no TP, the Gemma-4 hybrid KV shape; `exec/gpu/prefix.rs`
+`select_vmm_prefix_layout`). `PLOW_PREFIX_CACHE=0` is the master switch and
+disables every side effect; with the cache on, the store is unconditional.
 
-Eviction runs a soft cap — `PLOW_VMM_CACHE_MIB`, else 5% of device memory —
-dropping output-only boundaries first, then zero-reference leaf nodes, then
-snapshots by least-recent use. A session boundary its next turn already
-attached is spent (that turn runs now) and goes before the idle ones. A
-session's prompt-end boundary stops 8 rows short of the prompt end: the next
-turn re-renders the last prompt rows (Gemma 4 drops the generation prompt's
-empty thought channel, 4 tokens), so a boundary inside them never attached —
-about one turn in eight. `memory/vmm_sim_tests.rs` replays agentic traces
-against the real pool on a byte-accounting driver.
+**Eviction and the two tiers.** The device slabs run under a soft cap —
+`PLOW_VMM_CACHE_MIB`, else 5% of device memory — and a free-memory floor
+(`PLOW_VMM_CACHE_MIN_FREE_MIB`, default 4%): under pressure the store releases
+whole slab chunks back to the slot pool, compacting live blocks first. Victims
+are taken in order: blocks no boundary needs any more; boundaries demoted by a
+session end, abort, disconnect or TTL (`PLOW_PREFIX_SESSION_TTL_S`); then the
+least-recently used live boundary. A session boundary inside its TTL and a
+shared end that has served two attaches are **shielded**: victims only once
+nothing else is left. A victim block spills to the pinned host tier when one is
+armed — on by default, sized by what the host can spare (`MemAvailable` minus
+an eighth of RAM, at least 16 GiB; `PLOW_VMM_HOST_CACHE_MIB` names a size, `0`
+turns it off) — and is reclaimed otherwise. A session's prompt-end boundary
+stops 8 rows short of the prompt end: the next turn re-renders the last prompt
+rows (Gemma 4 drops the generation prompt's empty thought channel, 4 tokens), so
+a boundary inside them never attached. `memory/vmm_sim_tests.rs` replays agentic
+traces against the real pool on a byte-accounting driver.
 
 ---
 
@@ -496,19 +513,20 @@ pointing two block tables at one physical block and copying on write.
 
 **Plow resolves it in hardware, underneath the kernel.** Each slot gets one
 contiguous *virtual* range per layer and side; physical blocks are mapped into
-it as the sequence grows, and sharing a prefix maps the same physical handle
-into two sequences' ranges. The kernel is handed a flat base and a stride and
-never learns the memory is discontiguous — the MMU translates.
+it as the sequence grows. The kernel is handed a flat base and a stride and
+never learns the memory is discontiguous — the MMU translates. Sharing is a
+separate mechanism: cached rows live in the block store and are gathered into
+the slot's private range on attach.
 
 | | vLLM PagedAttention | Plow |
 |---|---|---|
 | Indirection lives in | the kernel, a block-table lookup per block | the MMU, ordinary page tables |
 | The kernel sees | a gather over block pointers | flat base plus stride, `row & kv_mask` |
-| Block granularity | about 16 tokens | the VMM granule: 2 MiB, i.e. 4096 rows of one head at `hd` 256 bf16 |
-| Sharing unit | a block, copy-on-write | a physical handle, multi-mapped |
+| Growth granularity | about 16 tokens | the VMM granule: 2 MiB, i.e. 4096 rows of one head at `hd` 256 bf16 |
+| Sharing unit | a block, copy-on-write | a 32-row store block, gathered into the slot |
 | Windowed layers | still blocks, still `ctx`-many | not paged at all; a ring of `window + chunk` rows |
 | Growth cost | a free-list pop | a driver map call, hidden by pool and premap |
-| Fragmentation | none by construction | none inside a reservation |
+| Fragmentation | none by construction | none inside a reservation; fixed block size per class in the store |
 
 **What Plow's side buys.** The kernel reads dead-sequential memory with no block
 table in registers and no per-block branch — that is what makes a 512-thread
@@ -518,18 +536,17 @@ ring is *addressed* modulo its size, 40 of 48 layers never allocate beyond
 `window + chunk` rows however long the context grows. That is the 20 GiB in
 [§6](#6-what-it-costs).
 
-**What it costs.** The sharing granularity is the VMM granule rather than 16
-tokens — roughly 250x coarser. A prefix is therefore only shareable *by mapping*
-when it is block-aligned, and everything below that granularity (the partial
-block, the sliding rings, the fp8 scales) has to be **copied** into a snapshot
-instead. That is the whole of [§8](#8-prefix-cache), and it is the price of
-keeping the kernel simple. Driver calls on the admission path are the second
-cost, paid down by the block pool, the premap thread and deferred reclaim.
+**What it costs.** A hit is a copy, not a pointer swap: one gather per class
+into the slot, and a cached prefix occupies HBM once in the store and once per
+live slot that attached it. That is the price of keeping the kernel flat and the
+slot private, and [§8](#8-prefix-cache) is what it buys. Driver calls on the
+admission path are the second cost, paid down by the block pool, the premap
+thread and deferred reclaim.
 
 One measured note, offered as a result rather than an argument: Plow has tried
 the other side. Re-packing this cache token-major, or vLLM-style paged, is
 recorded as a **measured null** on these shapes
-(`crates/devgen/src/lib.rs:2378`) — the kernel-side gather did not pay for
+(`crates/devgen/src/lib.rs`) — the kernel-side gather did not pay for
 itself once the layout was head-major. That is a finding about this model family
 and these kernels, not a general claim about PagedAttention, which solves a
 harder allocation problem than Plow's fixed slot count poses.
@@ -599,13 +616,15 @@ latent cache, not to this dense head-major cache.
 | `PLOW_PREFIX_CACHE` | on | Master switch for all prefix reuse |
 | `PLOW_VMM_PREFIX` | unset = auto | Force VMM prefix reuse on or off, bypassing the allowlist |
 | `PLOW_VMM_PUBLISH_SHARED` | on | Publish only leads seen on a second sequence |
-| `PLOW_VMM_BLOCK_MIB` | 2 | Physical block size, the prefix match granularity |
+| `PLOW_VMM_BLOCK_MIB` | 2 | Physical block size of a slot's full-layer tracks |
 | `PLOW_KV_POOL_MIB` | 512 | Block pool cap; 0 disables |
 | `PLOW_VMM_DEFERRED_RECLAIM` | on | Background unmapping, keeping column 0 mapped |
 | `PLOW_VMM_STALE_RESERVE` | on | CUDA: the reclaimer keeps a retired window's private blocks mapped for the slot's next occupant, within the `PLOW_KV_POOL_MIB` cap; a failed create unmaps one before an OOM |
 | `PLOW_VMM_CACHE_MEMORY_UTILIZATION` | 0.05 | Prefix cache soft cap as a fraction of device memory (4 GiB on an 80 GiB H100) |
 | `PLOW_VMM_CACHE_MIB` | unset | Explicit soft cap in MiB; overrides the fraction above. `0` = OOM-driven eviction only |
 | `PLOW_VMM_CACHE_MIN_FREE_MIB` | unset = 4% of device | Keep cached prefixes until free device memory would drop below this; `0` rolls back to the byte budget as the only trim trigger |
+| `PLOW_VMM_HOST_CACHE_MIB` | unset = host-reserve rule | Pinned host tier of the block store; `0` = device only |
+| `PLOW_PREFIX_SESSION_TTL_S` | 150 | Idle time after which a session's boundary is demoted |
 | `PLOW_VMM_LIVE_RINGS` | off | Grow packet KV with the live frontier; disables prefix auto-selection |
 
 Benchmarks that compare against an engine with prefix caching disabled must set

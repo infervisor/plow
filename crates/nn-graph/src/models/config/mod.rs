@@ -16,6 +16,7 @@ mod glm5_next;
 mod kimi;
 mod kimi_k3;
 mod llama;
+mod muse_spark;
 mod qwen3;
 mod qwen3_5;
 mod qwen_image_dit;
@@ -43,6 +44,10 @@ pub use glm5_next::{
 pub use kimi::KimiConfig;
 pub use kimi_k3::{K3Layer, KimiK3Config, KimiK3TextConfig, LinearAttnConfig};
 pub use llama::LlamaConfig;
+pub use muse_spark::{
+    MuseSparkConfig, MuseSparkQuantizationConfig, MuseSparkRopeParameters, MUSE_SPARK_MXFP4_GROUP,
+    MUSE_SPARK_RESIDUAL_GATE_EPS,
+};
 pub use qwen3::Qwen3Config;
 pub use qwen3_5::Qwen35Config;
 pub use qwen_image_dit::QwenImageDitConfig;
@@ -77,6 +82,10 @@ pub enum ModelConfig {
     /// Kimi K3 (Moonshot): hybrid MLA/KDA + AttnRes block residual + latent MoE.
     KimiK3(KimiK3Config),
     Llama(LlamaConfig),
+    /// Muse Spark (Meta): sliding/NoPE-full GQA with output gating, gated
+    /// residuals, pooled 256-expert MoE. TEXT tower only (vLLM
+    /// `--language-model-only`); vision/audio towers are not modeled.
+    MuseSpark(MuseSparkConfig),
     /// Qwen3 / Qwen2.5: GQA + SwiGLU (dense).
     Qwen3(Qwen3Config),
     /// Qwen3.5/Qwen3.8 hybrid full-attention + gated-delta text decoder.
@@ -213,6 +222,15 @@ impl ModelConfig {
             "deepseek_v4" => parse_deepseek_v4(v),
             "deepseek_v41" => parse_deepseek_v41(sub_config(&v, "text_config")),
             "deepseek_v41_text" => parse_deepseek_v41(v),
+            "muse_spark" => {
+                let omitted = ["vision_config", "audio_config"]
+                    .into_iter()
+                    .filter(|k| v.get(*k).is_some_and(|c| !c.is_null()))
+                    .map(String::from)
+                    .collect();
+                parse_muse_spark(sub_config(&v, "text_config"), omitted)
+            }
+            "muse_spark_text" => parse_muse_spark(v, Vec::new()),
             "muse_glimmer" | "muse_glimmer_text" | "muse_glimmer_vision" => {
                 Err(ConfigError::Unsupported(
                     "muse_glimmer (Muse Glimmer text uses alternating sliding/NoPE attention, \
@@ -302,6 +320,24 @@ fn parse_deepseek_v41(v: serde_json::Value) -> Result<ModelConfig, ConfigError> 
     Ok(ModelConfig::DeepSeekV41(cfg))
 }
 
+fn parse_muse_spark(
+    v: serde_json::Value,
+    omitted_towers: Vec<String>,
+) -> Result<ModelConfig, ConfigError> {
+    if let Some(q) = v.get("quantization_config").filter(|q| !q.is_null()) {
+        let method = q.get("quant_method").and_then(serde_json::Value::as_str);
+        if method != Some("quark") {
+            return Err(ConfigError::Unsupported(format!(
+                "muse_spark (text tower only; vision/audio not modeled): quantization                  method {method:?} is not modeled; only AMD Quark MXFP4"
+            )));
+        }
+    }
+    let mut cfg: MuseSparkConfig = serde_json::from_value(v)?;
+    cfg.validate()?;
+    cfg.omitted_towers = omitted_towers;
+    Ok(ModelConfig::MuseSpark(cfg))
+}
+
 fn parse_glm5_next(v: serde_json::Value) -> Result<ModelConfig, ConfigError> {
     let cfg: Glm5NextConfig = serde_json::from_value(v)?;
     cfg.validate()?;
@@ -370,6 +406,7 @@ fn model_type(v: &serde_json::Value) -> Option<String> {
         a if a.starts_with("Qwen3_5") => "qwen3_5",
         a if a.starts_with("Qwen3") => "qwen3",
         a if a.starts_with("Qwen2.5") => "qwen2_5",
+        a if a.starts_with("MuseSpark") => "muse_spark",
         a if a.starts_with("Siglip") => "siglip",
         a if a.starts_with("Qwen2_5_VL") => "qwen2_5_vl",
         a if a.starts_with("Qwen2VL") => "qwen2_vl",

@@ -630,7 +630,7 @@ plowrt serve --bind 0.0.0.0 --port 8000 \
 `scripts/serve_test/smoke.sh` runs the same command line in a clean environment and smokes every
 advertised endpoint.
 
-The L4 recipes compile `max_ctx` 1024 (KV 3.5 GiB at 32 slots) and cap packed encoder buckets at
+The L4 recipes compile `max_ctx` 2048 (KV 3.5 GiB at 16 slots, decode ladder 1..16) and cap packed encoder buckets at
 64 chunks (`PLOW_ASR_PACKED_MAX_CHUNKS`; the 192-chunk default holds ~5.7 GB of encoder
 activations). With both, all three models share one 23 GiB L4: 18.5 GiB loaded, 18.7 GiB peak.
 

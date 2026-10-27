@@ -15,6 +15,8 @@ pub mod dp;
 /// the seam that lets `serve` stop being CUDA-only.
 #[cfg(any(feature = "cuda", feature = "hsa", feature = "cpu"))]
 pub mod engine;
+#[cfg(test)]
+mod golden_tests;
 /// The CPU prefill-head pool: the twin packet and the cores reserved for it.
 // Allowed dead until the mux drives it.
 #[cfg(feature = "cpu")]
@@ -526,6 +528,8 @@ pub struct AppState {
     /// prefix sharing up) — a scrape must never queue behind a tick.
     #[cfg(any(feature = "cuda", feature = "hsa"))]
     vmm_stats: RwLock<FxHashMap<String, crate::memory::vmm::VmmStatsHandle>>,
+    #[cfg(feature = "cuda")]
+    kv_store: RwLock<FxHashMap<String, std::sync::Arc<crate::exec::gpu::KvStoreHandle>>>,
     /// Per-instance multimodal runtime (encoders on the instance's device, slab mirroring its
     /// engine's table): installed and removed with the engine.
     mm: RwLock<FxHashMap<String, Arc<mm::MmModel>>>,
@@ -634,6 +638,8 @@ impl AppState {
             gpu: RwLock::new(FxHashMap::default()),
             #[cfg(any(feature = "cuda", feature = "hsa"))]
             vmm_stats: RwLock::new(FxHashMap::default()),
+            #[cfg(feature = "cuda")]
+            kv_store: RwLock::new(FxHashMap::default()),
             mm: RwLock::new(FxHashMap::default()),
             #[cfg(feature = "cuda")]
             managers: std::sync::OnceLock::new(),
@@ -800,6 +806,10 @@ impl AppState {
         #[cfg(any(feature = "cuda", feature = "hsa"))]
         if let Some(h) = engine.vmm_stats_handle() {
             self.vmm_stats.write().insert(slug.clone(), h);
+        }
+        #[cfg(feature = "cuda")]
+        if let Some(h) = engine.kv_store_handle() {
+            self.kv_store.write().insert(slug.clone(), h);
         }
         self.max_ctx.write().insert(slug.clone(), engine.max_ctx());
         self.sampling_honoured
@@ -1956,6 +1966,11 @@ async fn metrics_handler(
             "Host to device restores queued by the admission probe ahead of the attach.",
         ),
         (
+            "restore_holds_total",
+            "counter",
+            "Admissions held because the boundary's restore was still in flight.",
+        ),
+        (
             "host_fence_failures_total",
             "counter",
             "Spill copies whose fence failed; both buffers quarantined.",
@@ -1974,6 +1989,16 @@ async fn metrics_handler(
             "session_demoted_bytes_total",
             "counter",
             "Bytes freed by session demotions.",
+        ),
+        (
+            "session_end_header_total",
+            "counter",
+            "Session boundaries dropped to the cold LRU band on the client's X-Session-End.",
+        ),
+        (
+            "session_end_abort_total",
+            "counter",
+            "Session boundaries dropped to the cold LRU band on a client disconnect before the response completed.",
         ),
     ] {
         crate::obs::serving::family(&mut out, &format!("plowrt_prefix_{name}"), kind, help);
@@ -2029,10 +2054,13 @@ async fn metrics_handler(
              plowrt_prefix_host_evictions_total{{model=\"{slug}\"}} {}\n\
              plowrt_prefix_host_spill_fallbacks_total{{model=\"{slug}\"}} {}\n\
              plowrt_prefix_host_prefetches_total{{model=\"{slug}\"}} {}\n\
+             plowrt_prefix_restore_holds_total{{model=\"{slug}\"}} {}\n\
              plowrt_prefix_host_fence_failures_total{{model=\"{slug}\"}} {}\n\
              plowrt_prefix_sessions_protected{{model=\"{slug}\"}} {}\n\
              plowrt_prefix_session_demotions_total{{model=\"{slug}\"}} {}\n\
-             plowrt_prefix_session_demoted_bytes_total{{model=\"{slug}\"}} {}\n",
+             plowrt_prefix_session_demoted_bytes_total{{model=\"{slug}\"}} {}\n\
+             plowrt_prefix_session_end_header_total{{model=\"{slug}\"}} {}\n\
+             plowrt_prefix_session_end_abort_total{{model=\"{slug}\"}} {}\n",
             s.attach_hits,
             s.attach_misses,
             s.tokens_queried,
@@ -2077,12 +2105,17 @@ async fn metrics_handler(
             s.host_evictions,
             s.spill_fallbacks,
             s.host_prefetches,
+            s.restore_holds,
             s.spill_fence_failures,
             s.sessions_protected,
             s.session_demotions,
             s.session_demoted_bytes,
+            s.session_end_header,
+            s.session_end_abort,
         );
     }
+    #[cfg(feature = "cuda")]
+    kv_store_metrics(&state, &mut out);
     (
         [("content-type", "text/plain; version=0.0.4; charset=utf-8")],
         out,
@@ -2346,4 +2379,154 @@ pub fn admin_app(state: Arc<AppState>) -> Router {
         .route("/v1/models/status", get(admin::status))
         .route("/v1/models/available", get(admin::available))
         .with_state(state)
+}
+
+/// The KV block store's residency and copy counters per model.
+#[cfg(feature = "cuda")]
+fn kv_store_metrics(state: &AppState, out: &mut String) {
+    use std::fmt::Write;
+    let stores = state.kv_store.read();
+    if stores.is_empty() {
+        return;
+    }
+    for (name, kind, help) in [
+        ("device_bytes", "gauge", "Block store bytes resident on the device."),
+        ("host_bytes", "gauge", "Block store bytes resident on the pinned host tier."),
+        ("device_blocks", "gauge", "Blocks resident on the device."),
+        ("host_blocks", "gauge", "Blocks resident on the host tier."),
+        ("dedup_hits_total", "counter", "Block acquisitions that found the block present (no copy)."),
+        ("fills_total", "counter", "Blocks filled by a publish."),
+        ("fill_failures_total", "counter", "Fills that did not complete (block refilled next time)."),
+        ("reclaims_total", "counter", "Released blocks reused for new ones."),
+        ("refills_total", "counter", "Publishes that found their block on the host and refilled it on the device."),
+        ("refusals_total", "counter", "Acquisitions refused for lack of device space (a boundary is evicted and the publish retried)."),
+        ("spills_total", "counter", "Blocks moved to the host tier."),
+        ("restores_total", "counter", "Blocks copied back from the host tier (memcpy fallback)."),
+        ("host_reads_total", "counter", "Blocks a gather read from the host tier in place."),
+        ("evictions_total", "counter", "Blocks dropped from a tier."),
+        ("compactions_total", "counter", "Live blocks moved so that a chunk could be released."),
+        ("compact_bytes_total", "counter", "Bytes those moves copied."),
+        ("device_reserved_bytes", "gauge", "Device bytes reserved in chunks (used plus holes)."),
+        ("device_grows_total", "counter", "Device chunk allocations."),
+        ("device_grow_us_total", "counter", "Microseconds in device chunk allocations (pool lock held)."),
+        ("host_grows_total", "counter", "Host tier chunk allocations."),
+        ("host_grow_us_total", "counter", "Microseconds in host tier chunk allocations (pool lock held)."),
+        ("spill_us_total", "counter", "Microseconds in spills (pool lock held)."),
+        ("shrink_us_total", "counter", "Microseconds in shrinks and compaction (pool lock held)."),
+        ("shrinks_total", "counter", "Shrink calls (one per pressure-loop iteration)."),
+        ("publishes_total", "counter", "Boundaries published into the store."),
+        ("publish_us_total", "counter", "Engine-thread microseconds in publishes."),
+        ("publish_sync_us_total", "counter", "Of which draining the stream."),
+        ("gather_us_total", "counter", "Engine-thread microseconds in gathers."),
+        ("gather_sync_us_total", "counter", "Of which draining the stream."),
+        ("host_grow_max_us", "gauge", "Longest single host tier chunk allocation."),
+        ("shrink_max_us", "gauge", "Longest single shrink (pool lock held)."),
+        ("publish_max_us", "gauge", "Longest single publish on the engine thread."),
+        ("gather_max_us", "gauge", "Longest single gather on the engine thread."),
+        ("boundary_restores_total", "counter", "Host-resident boundaries whose restore was started (prefetch or attach)."),
+        ("restore_blocks_total", "counter", "Blocks those restores queued to the device."),
+        ("restore_us_total", "counter", "Microseconds queueing those restores."),
+        ("gather_fenced_blocks_total", "counter", "Gathered blocks whose restore the engine stream waited on."),
+        ("published_blocks_total", "counter", "Blocks of published boundaries."),
+        ("published_new_blocks_total", "counter", "Blocks a publish had to fill (the rest were shared)."),
+        ("gathers_total", "counter", "Boundaries gathered into a slot."),
+        ("segments_total", "counter", "Copy segments issued."),
+        ("launches_total", "counter", "Segment-copy kernel launches."),
+        ("memcpy_segments_total", "counter", "Segments copied by the memcpy fallback."),
+    ] {
+        crate::obs::serving::family(out, &format!("plowrt_kv_store_{name}"), kind, help);
+    }
+    for (slug, h) in stores.iter() {
+        let s = h.stats();
+        let slug = crate::obs::serving::escape_label(slug);
+        let device_bytes: u64 = s.store.classes.iter().map(|c| c.device_bytes).sum();
+        let host_bytes: u64 = s.store.classes.iter().map(|c| c.host_bytes).sum();
+        let device_blocks: u64 = s.store.classes.iter().map(|c| c.device_blocks).sum();
+        let host_blocks: u64 = s.store.classes.iter().map(|c| c.host_blocks).sum();
+        let _ = write!(
+            out,
+            "plowrt_kv_store_device_bytes{{model=\"{slug}\"}} {device_bytes}\n\
+             plowrt_kv_store_host_bytes{{model=\"{slug}\"}} {host_bytes}\n\
+             plowrt_kv_store_device_blocks{{model=\"{slug}\"}} {device_blocks}\n\
+             plowrt_kv_store_host_blocks{{model=\"{slug}\"}} {host_blocks}\n\
+             plowrt_kv_store_dedup_hits_total{{model=\"{slug}\"}} {}\n\
+             plowrt_kv_store_fills_total{{model=\"{slug}\"}} {}\n\
+             plowrt_kv_store_fill_failures_total{{model=\"{slug}\"}} {}\n\
+             plowrt_kv_store_reclaims_total{{model=\"{slug}\"}} {}\n\
+             plowrt_kv_store_refills_total{{model=\"{slug}\"}} {}\n\
+             plowrt_kv_store_refusals_total{{model=\"{slug}\"}} {}\n\
+             plowrt_kv_store_spills_total{{model=\"{slug}\"}} {}\n\
+             plowrt_kv_store_restores_total{{model=\"{slug}\"}} {}\n\
+             plowrt_kv_store_host_reads_total{{model=\"{slug}\"}} {}\n\
+             plowrt_kv_store_evictions_total{{model=\"{slug}\"}} {}\n\
+             plowrt_kv_store_compactions_total{{model=\"{slug}\"}} {}\n\
+             plowrt_kv_store_compact_bytes_total{{model=\"{slug}\"}} {}\n\
+             plowrt_kv_store_device_reserved_bytes{{model=\"{slug}\"}} {}\n\
+             plowrt_kv_store_device_grows_total{{model=\"{slug}\"}} {}\n\
+             plowrt_kv_store_device_grow_us_total{{model=\"{slug}\"}} {}\n\
+             plowrt_kv_store_host_grows_total{{model=\"{slug}\"}} {}\n\
+             plowrt_kv_store_host_grow_us_total{{model=\"{slug}\"}} {}\n\
+             plowrt_kv_store_spill_us_total{{model=\"{slug}\"}} {}\n\
+             plowrt_kv_store_shrink_us_total{{model=\"{slug}\"}} {}\n\
+             plowrt_kv_store_shrinks_total{{model=\"{slug}\"}} {}\n\
+             plowrt_kv_store_publishes_total{{model=\"{slug}\"}} {}\n\
+             plowrt_kv_store_published_blocks_total{{model=\"{slug}\"}} {}\n\
+             plowrt_kv_store_published_new_blocks_total{{model=\"{slug}\"}} {}\n\
+             plowrt_kv_store_gathers_total{{model=\"{slug}\"}} {}\n\
+             plowrt_kv_store_segments_total{{model=\"{slug}\"}} {}\n\
+             plowrt_kv_store_launches_total{{model=\"{slug}\"}} {}\n\
+             plowrt_kv_store_memcpy_segments_total{{model=\"{slug}\"}} {}\n\
+             plowrt_kv_store_publish_us_total{{model=\"{slug}\"}} {}\n\
+             plowrt_kv_store_publish_sync_us_total{{model=\"{slug}\"}} {}\n\
+             plowrt_kv_store_gather_us_total{{model=\"{slug}\"}} {}\n\
+             plowrt_kv_store_gather_sync_us_total{{model=\"{slug}\"}} {}\n\
+             plowrt_kv_store_host_grow_max_us{{model=\"{slug}\"}} {}\n\
+             plowrt_kv_store_shrink_max_us{{model=\"{slug}\"}} {}\n\
+             plowrt_kv_store_publish_max_us{{model=\"{slug}\"}} {}\n\
+             plowrt_kv_store_gather_max_us{{model=\"{slug}\"}} {}\n\
+             plowrt_kv_store_boundary_restores_total{{model=\"{slug}\"}} {}\n\
+             plowrt_kv_store_restore_blocks_total{{model=\"{slug}\"}} {}\n\
+             plowrt_kv_store_restore_us_total{{model=\"{slug}\"}} {}\n\
+             plowrt_kv_store_gather_fenced_blocks_total{{model=\"{slug}\"}} {}\n",
+            s.store.dedup_hits,
+            s.store.fills,
+            s.store.fill_failures,
+            s.store.reclaims,
+            s.store.refills,
+            s.store.refusals,
+            s.store.spills,
+            s.store.restores,
+            s.store.host_reads,
+            s.store.evictions,
+            s.store.compactions,
+            s.store.compact_bytes,
+            s.store.device_reserved_bytes,
+            s.store.device_grows,
+            s.store.device_grow_us,
+            s.store.host_grows,
+            s.store.host_grow_us,
+            s.store.spill_us,
+            s.store.shrink_us,
+            s.store.shrinks,
+            s.publishes,
+            s.published_blocks,
+            s.published_new_blocks,
+            s.gathers,
+            s.segments,
+            s.launches,
+            s.memcpy_segments,
+            s.publish_us,
+            s.publish_sync_us,
+            s.gather_us,
+            s.gather_sync_us,
+            s.store.host_grow_max_us,
+            s.store.shrink_max_us,
+            s.publish_max_us,
+            s.gather_max_us,
+            s.restores,
+            s.restore_blocks,
+            s.restore_us,
+            s.gather_fenced_blocks,
+        );
+    }
 }

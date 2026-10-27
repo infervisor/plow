@@ -145,7 +145,7 @@ def metrics_snapshot(url):
     return dict(zip(KEYS, metric_values(txt)))
 
 
-async def one_turn(http, args, sid, history, system, user, max_tokens=None):
+async def one_turn(http, args, sid, history, system, user, max_tokens=None, end=False):
     import aiohttp
     max_tokens = max_tokens or args.max_tokens
     if args.api == "chat":
@@ -169,6 +169,8 @@ async def one_turn(http, args, sid, history, system, user, max_tokens=None):
     headers = {"Content-Type": "application/json"}
     if args.session_header:
         headers["X-Session-Id"] = sid
+        if end and args.session_end:
+            headers["X-Session-End"] = "1"
     t0 = time.perf_counter()
     ttft, text, usage, header_cached = None, [], None, None
     async with http.post(args.url + path, json=body, headers=headers,
@@ -361,7 +363,7 @@ async def run_open(args, systems, plan, users):
             live["inflight"] += 1
             try:
                 row, reply = await one_turn(http, args, f"{tag}-{s}", history, systems[sess["app"]],
-                                            users[s][k], turn["max_tokens"])
+                                            users[s][k], turn["max_tokens"], end=k + 1 == len(sess["turns"]))
                 row["error"] = None
             except Exception as e:  # noqa: BLE001 - recorded, the session stops
                 row, reply = dict(ttft_ms=None, tpot_ms=None, e2e_ms=None, prompt_tokens=0, completion_tokens=0,
@@ -461,6 +463,8 @@ def main(argv=None):
     ap.add_argument("--think-ms", type=float, default=0)
     ap.add_argument("--timeout", type=float, default=3600)
     ap.add_argument("--no-session-header", dest="session_header", action="store_false")
+    ap.add_argument("--session-end", action="store_true",
+                    help="open loop: send X-Session-End: 1 on a session's last planned turn (plowrt demotes its boundary)")
     ap.add_argument("--out", required=True)
     o = ap.add_argument_group("open loop (--open-loop): Poisson session arrivals, sampled turns/think/lengths")
     o.add_argument("--open-loop", action="store_true")
@@ -489,13 +493,15 @@ def main(argv=None):
     o.add_argument("--prod-fidelity", action="store_true",
                    help="shape the open-loop mix like the G26 production capture (2026-10-14): ~2K shared "
                         "system prompt, ~3.6K first message, ~100-token later turns, 5 turns mean, prompts "
-                        "under 8K, 10 s median think; overrides those shape args")
+                        "under 8K, 10 s median think; sets those shape args unless given explicitly")
     o.add_argument("--max-model-len", type=int, default=16384)
     o.add_argument("--template-margin", type=int, default=512, help="tokens held back for the chat template")
     o.add_argument("--slo-ttft-ms", type=float, default=2000)
     o.add_argument("--slo-tpot-ms", type=float, default=100)
     args = ap.parse_args(argv)
     if args.prod_fidelity:
+        # Flags given explicitly on the command line win over the production shape.
+        given = {a.split("=", 1)[0] for a in (sys.argv[1:] if argv is None else argv)}
         # Production (plowrt metrics, 10.9K requests): prompt mean 5680 tokens, 99.5% <= 8192; computed
         # rows bimodal, 64% <= 512 (continuations) and 33% in 2K-8K (first turns, misses); 46 output
         # tokens. vLLM there caches 82%: its LRU keeps a session's prefix only for pool / (req/s x
@@ -504,7 +510,8 @@ def main(argv=None):
         for k, v in dict(apps=4, system_median=2000, system_sigma=0.3, first_median=3600, first_sigma=0.35,
                          tool_median=100, tool_sigma=0.8, turns_mean=5, out_median=46, out_sigma=0.6,
                          max_model_len=8192, think_median_s=10.0, think_sigma=0.8, think_max_s=120.0).items():
-            setattr(args, k, v)
+            if "--" + k.replace("_", "-") not in given:
+                setattr(args, k, v)
     if not args.open_loop and not args.sessions:
         ap.error("--sessions is required without --open-loop")
     args.url = args.url.rstrip("/")

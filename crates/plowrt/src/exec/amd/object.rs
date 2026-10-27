@@ -155,8 +155,7 @@ pub enum PrefillArm {
     Mla,
     /// The `Mla` arms AND the grouped-MoE prefill ops (83-87). Supersedes
     /// [`PrefillArm::Mla`] — a whole-layer GLM/Kimi/DeepSeek prefill packet
-    /// needs both, and `scripts/build_gfx950.sh`'s `PLOW_MOE_PREFILL=1` always
-    /// turns MLA on with it (there is no moe-without-mla object).
+    /// needs both. A MoE prefill without MLA opcodes takes [`PrefillArm::None`].
     MlaMoe,
     /// MLA and grouped A4W4 experts with MXFP4 projection kernels in one object.
     MlaMoeA4w4,
@@ -217,9 +216,11 @@ impl PrefillArm {
         let mut moe = false;
         let mut a4w4 = false;
         let mut k3 = false;
+        let mut mla_family = false;
         for p in progs {
             for i in &p.insts {
                 let op = i.op;
+                mla_family |= MLA_FAMILY_OPS.iter().any(|&o| o as u16 == op);
                 if op == DevOp::FlashMlaPrefill as u16
                     || op == DevOp::FlashGatherPrefill as u16
                     || op == DevOp::MlaMergeFold as u16
@@ -262,10 +263,13 @@ impl PrefillArm {
                 }
             }
         }
-        match (k3, moe, a4w4, mla) {
-            (true, true, true, _) => PrefillArm::K3MoeA4w4,
-            (true, true, false, _) => PrefillArm::K3Moe,
-            (true, false, _, _) => PrefillArm::K3,
+        // A grouped-MoE prefill with no MLA-family or K3 opcode needs only the MoE prefill arms
+        // (`packet_prefill_arm_requirements`), which no `_mla*` object is named for: it rides
+        // the plain prefill object, and `check_prefill_object` refuses one built without them.
+        match (k3, moe && mla_family, a4w4, mla) {
+            (true, _, true, _) if moe => PrefillArm::K3MoeA4w4,
+            (true, _, false, _) if moe => PrefillArm::K3Moe,
+            (true, _, _, _) => PrefillArm::K3,
             (false, true, true, _) => PrefillArm::MlaMoeA4w4,
             (false, true, false, _) => PrefillArm::MlaMoe,
             (false, false, _, true) => PrefillArm::Mla,
@@ -273,6 +277,18 @@ impl PrefillArm {
         }
     }
 }
+
+/// Attention opcodes of the MLA family, prefill or decode.
+const MLA_FAMILY_OPS: &[DevOp] = &[
+    DevOp::FlashMlaPrefill,
+    DevOp::FlashMlaPrefillFp8,
+    DevOp::FlashGatherPrefill,
+    DevOp::MlaMergeFold,
+    DevOp::FlashMlaDecode,
+    DevOp::FlashMlaDecodeFp8,
+    DevOp::FlashGatherDecode,
+    DevOp::OUvFold,
+];
 
 /// The code-object filename for a (phase, variant, prefill-arm, scheduler).
 ///
@@ -2049,6 +2065,10 @@ pub(super) const QWEN_GDN_ARM_OPS: &[DevOp] = &[
     DevOp::QwenGdnConvPrefill,
     DevOp::QwenGdnQkvPrep,
     DevOp::QwenGdnGatePrep,
+    DevOp::MuseRmsNorm,
+    DevOp::MuseResidualGate,
+    DevOp::MuseMoeCombineNorm,
+    DevOp::MuseNormGateNorm,
 ];
 
 /// The first Qwen GDN opcode in these programs, or `None` if the packet needs no Qwen arm.

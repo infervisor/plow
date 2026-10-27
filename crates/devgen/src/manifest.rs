@@ -1393,10 +1393,20 @@ fn tuning(s: &Shapes, arch: &str) -> Map<String, Value> {
     if s.full_kv_heads == 1 && s.gqa > 0 {
         // The template is instantiated at 1|2|4|8; 16 (the whole Gemma-4-12B group, one K/V
         // stream for all 16 heads) only when the emit asks for it, on the wide-reduction arm.
+        // An emit that names the group (PLOW_ATTENTION_DECODE_BALANCE_GF or PLOW_FA_GF_FULL) gets
+        // the object it sized the full-layer nsplit for (`fa_gf_full`); the FP8-KV row-group
+        // decode body takes GF <= 4.
         let gf = next_pow2(s.gqa).min(8);
         let gf = if s.gqa % gf == 0 { gf } else { 1 };
-        let gf = if crate::emit_config::active().fa_gf_full == Some(16) && s.gqa == 16 {
-            16
+        let cfg = crate::emit_config::active();
+        let gf = if cfg.attention_decode_balance_gf.is_some() || cfg.fa_gf_full.is_some() {
+            let v = crate::fa_gf_full();
+            assert!(
+                s.gqa % v == 0,
+                "full-layer decode GF {v} must divide the GQA group {}",
+                s.gqa
+            );
+            v
         } else {
             gf
         };
@@ -1572,7 +1582,7 @@ fn backend_nvcc(f: &Map<String, Value>, t: &Map<String, Value>, s: &Shapes) -> V
         if on("qwen_gdn") {
             req.push("PLOW_NV_FP8_M1=1".into());
             req.push("PLOW_NV_QUANT_FP8_VLLM=1".into());
-            // `plow_qwen_w8a8_prefill_arm` is 1 only for the qualified prefill epilogue.
+            // `plow_w8a8_vllm_prefill_abi` is 1 only for the qualified prefill epilogue.
             if s.prefill_fp8_gemm {
                 req.push("PLOW_NV_FP8_PF_SCALE_WFIRST=1".into());
             }
@@ -1778,7 +1788,13 @@ fn backend_amd(
     // op's `rot_offset` expresses. The arm is behind `PLOW_QWEN_GDN` and an object without it
     // leaves `q`/`kv` unrotated -- every position attends as if it were position zero, which reads
     // as a long-context regression rather than as a missing kernel.
-    if has("QwenHeadNormRope") {
+    // Muse Spark's block ops are compiled with the same axis (`op_muse.h`).
+    if has("QwenHeadNormRope")
+        || has("MuseRmsNorm")
+        || has("MuseResidualGate")
+        || has("MuseMoeCombineNorm")
+        || has("MuseNormGateNorm")
+    {
         req.push("PLOW_QWEN_GDN=1".into());
     }
     if on("a4w4") {
@@ -3297,6 +3313,11 @@ pub fn config_header(manifest: &Value) -> String {
         if let Some(v) = t.get("gf256").and_then(Value::as_u64) {
             out.push_str(&format!(
                 "#ifndef PLOW_NV_FA_GF_HD256\n#define PLOW_NV_FA_GF_HD256 {v}\n#endif\n"
+            ));
+        }
+        if let Some(v) = t.get("gf64").and_then(Value::as_u64) {
+            out.push_str(&format!(
+                "#ifndef PLOW_FA_GF_64\n#define PLOW_FA_GF_64 {v}\n#endif\n"
             ));
         }
         if let Some(v) = t.get("gf_full").and_then(Value::as_u64) {

@@ -57,6 +57,7 @@ plowrt serve --model infervisor/gemma-4-e2b:xeon6-amx-bf16 --port 8080
 
 # Equivalently, from a locally built asset directory:
 nix develop --command env \
+  PLOW_CPU_COMBINE=16 \
   PLOW_CPU_WEIGHT_AFFINE=1 \
   ./target/release/plowrt serve --assets $ASSETS --port 8080
 ```

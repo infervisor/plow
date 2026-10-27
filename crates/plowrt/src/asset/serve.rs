@@ -372,6 +372,14 @@ pub fn asset_env_defaults(
             if let Some(bytes) = read_section(&pkt)? {
                 let m = ServeManifest::parse(&bytes).map_err(RuntimeError::Device)?;
                 for (key, value) in &m.serve_defaults {
+                    if crate::knob_spec::is_removed_env(key) {
+                        tracing::warn!(
+                            knob = key.as_str(),
+                            packet = %pkt.display(),
+                            "packet serve default names a removed knob; ignored"
+                        );
+                        continue;
+                    }
                     if !crate::knob_spec::is_runtime_env(key) {
                         return Err(RuntimeError::Rejected(format!(
                             "{}: serve default {key} is not a registered plowrt runtime knob",
@@ -791,10 +799,18 @@ mod tests {
         assert!(!keys.iter().any(|(k, _)| *k == "PLOW_MULTISTEP"));
 
         m.serve_defaults
+            .insert("PLOW_VMM_SNAP_PITCHED".into(), "1".into());
+        let retired = bundle("defaults-retired", Some(&m));
+        let got = asset_env_defaults(&[retired.clone()], |_| None).unwrap();
+        assert!(got.iter().any(|(k, _, _)| k == "PLOW_PF_INTERLEAVE"));
+        assert!(!got.iter().any(|(k, _, _)| k == "PLOW_VMM_SNAP_PITCHED"));
+
+        m.serve_defaults
             .insert("PLOW_NOT_A_KNOB".into(), "1".into());
         let bad = bundle("defaults-bad", Some(&m));
         assert!(asset_env_defaults(&[bad.clone()], |_| None).is_err());
         std::fs::remove_dir_all(dir).unwrap();
+        std::fs::remove_dir_all(retired).unwrap();
         std::fs::remove_dir_all(bad).unwrap();
     }
 }

@@ -632,7 +632,7 @@ impl AudioLmPrompt {
                 "ASR audio marker does not tokenize to the packet's audio token".into(),
             ));
         }
-        let template = ChatTemplate::load(checkpoint).ok_or_else(|| {
+        let template = crate::serve::template::load(checkpoint).ok_or_else(|| {
             RuntimeError::Rejected("ASR requires the checkpoint chat template".into())
         })?;
         Ok(Self {

@@ -1,15 +1,18 @@
 """A recipe's `[spec]` table: the speculative-decode drafter its packet carries.
 
     [spec]
-    kind = "gemma4_assistant"            # drafter family (the packet's spec.json `family`)
+    kind = "gemma4_assistant"            # drafter family: gemma4_assistant (MTP) | gemma4_dspark
     draft_dir = "{env:G26_MTP_ASSISTANT}" # HF drafter dir (config, tokenizer, weights)
     draft_revision = "<hub revision>"
-    shard_sha256 = "<64 hex>"            # the re-keyed model-mtp.safetensors beside the target shards
+    shard_sha256 = "<64 hex>"            # the re-keyed drafter shard beside the target shards
     k_max = 7
     rows = [1, 2, 4, 8, 16]
     draft_fp8 = "all"                    # optional: FP8 draft weights (head|all, model-mtp-fp8.safetensors)
     emit = false                         # build the draft programs and span verify into the packet
     serve = false                        # PLOW_SPEC=1 in the packet's serve defaults (needs emit)
+
+`gemma4_dspark` (DSpark block drafter) is emit-only so far: its packet carries the context tail in
+every target program and the drafter's KV layers, not yet a draft program, so `serve` stays false.
 
 The table is the one place these are stated: `campaign.py build` derives the emit knobs and the
 serve default from it, `render_recipe.py` renders them and the re-key command, and
@@ -20,8 +23,13 @@ from __future__ import annotations
 
 import re
 
-KINDS = {"gemma4_assistant": "scripts/gemma4_mtp_rekey.py"}
-SHARD = "model-mtp.safetensors"
+# kind -> (re-key script, re-keyed shard, FP8 twin script)
+KINDS = {
+    "gemma4_assistant": ("scripts/gemma4_mtp_rekey.py", "model-mtp.safetensors", "scripts/gemma4_mtp_fp8.py"),
+    "gemma4_dspark": ("scripts/gemma4_dspark_rekey.py", "model-dspark.safetensors", "scripts/gemma4_dspark_fp8.py"),
+}
+DEFAULT_KIND = "gemma4_assistant"
+EMIT_ONLY = {"gemma4_dspark"}
 EMIT_KNOBS = (
     "PLOW_EMIT_SPAN_VERIFY",
     "PLOW_EMIT_SPEC",
@@ -30,6 +38,7 @@ EMIT_KNOBS = (
     "PLOW_SPEC_ROWS",
     "PLOW_SPEC_SHARD_SHA256",
     "PLOW_SPEC_DRAFT_FP8",
+    "PLOW_SPEC_KIND",
 )
 FIELDS = {"kind", "draft_dir", "draft_revision", "shard_sha256", "k_max", "rows", "emit", "serve"}
 OPTIONAL = {"draft_fp8"}
@@ -76,6 +85,8 @@ def errors(recipe: dict) -> list[str]:
             out.append(f"[spec] {f} must be true or false")
     if s.get("serve") is True and s.get("emit") is not True:
         out.append("[spec] serve = true needs emit = true")
+    if s.get("serve") is True and s.get("kind") in EMIT_ONLY:
+        out.append(f"[spec] kind {s.get('kind')} has no draft program yet: serve must be false")
     stated = set((recipe.get("emit") or {}).get("env") or {}) & set(EMIT_KNOBS)
     if stated:
         out.append(f"[spec] owns {sorted(stated)}: remove them from [emit.env]")
@@ -97,6 +108,7 @@ def emit_env(recipe: dict) -> dict[str, str]:
         "PLOW_SPEC_ROWS": ",".join(str(r) for r in s["rows"]),
         "PLOW_SPEC_SHARD_SHA256": str(s["shard_sha256"]),
         **({"PLOW_SPEC_DRAFT_FP8": str(s["draft_fp8"])} if "draft_fp8" in s else {}),
+        **({"PLOW_SPEC_KIND": str(s["kind"])} if s["kind"] != DEFAULT_KIND else {}),
     }
 
 
@@ -105,13 +117,20 @@ def serve_env(recipe: dict) -> dict[str, str]:
     return {"PLOW_SPEC": "1"} if s and s.get("serve") is True else {}
 
 
+def shard(recipe: dict) -> str | None:
+    s = table(recipe)
+    return KINDS[s["kind"]][1] if s and s.get("kind") in KINDS else None
+
+
 def prepare_commands(recipe: dict) -> list[str]:
-    """The drafter's checkpoint preparation: the re-key, then the FP8 twins when `draft_fp8` is set."""
+    """The drafter's checkpoint preparation: the re-key, then the FP8 twins when `draft_fp8` is set
+    (always for gemma4_dspark: its context tail follows the target's FP8 projection route)."""
     cmd = rekey_command(recipe)
     if cmd is None:
         return []
-    if "draft_fp8" in recipe["spec"]:
-        return [cmd, 'python3 scripts/gemma4_mtp_fp8.py "$CKPT"']
+    s = recipe["spec"]
+    if "draft_fp8" in s or s["kind"] == "gemma4_dspark":
+        return [cmd, f'python3 {KINDS[s["kind"]][2]} "$CKPT"']
     return [cmd]
 
 
@@ -120,7 +139,7 @@ def rekey_command(recipe: dict) -> str | None:
     if not s or s.get("kind") not in KINDS:
         return None
     draft = re.sub(r"\{env:([A-Za-z_][A-Za-z0-9_]*)\}", r'"$\1"', str(s["draft_dir"]))
-    return f"python3 {KINDS[s['kind']]} {draft} \"$CKPT\""
+    return f"python3 {KINDS[s['kind']][0]} {draft} \"$CKPT\""
 
 
 def self_test() -> None:
@@ -152,6 +171,16 @@ def self_test() -> None:
     assert len(prepare_commands(fp8)) == 2 and len(prepare_commands(good)) == 1
     assert errors({"spec": dict(good["spec"], draft_fp8="int4")})
     assert rekey_command(good) == 'python3 scripts/gemma4_mtp_rekey.py "$D" "$CKPT"', rekey_command(good)
+    assert "PLOW_SPEC_KIND" not in emit_env(good) and shard(good) == "model-mtp.safetensors"
+    ds = {"spec": dict(good["spec"], kind="gemma4_dspark")}
+    assert errors(ds) == [] and emit_env(ds)["PLOW_SPEC_KIND"] == "gemma4_dspark"
+    assert shard(ds) == "model-dspark.safetensors"
+    assert prepare_commands(ds) == [
+        'python3 scripts/gemma4_dspark_rekey.py "$D" "$CKPT"',
+        'python3 scripts/gemma4_dspark_fp8.py "$CKPT"',
+    ]
+    assert errors({"spec": dict(ds["spec"], serve=True)})
+    assert errors({**ds, "emit": {"env": {"PLOW_SPEC_KIND": "gemma4_dspark"}}})
 
 
 if __name__ == "__main__":

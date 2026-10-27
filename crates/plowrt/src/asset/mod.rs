@@ -25,6 +25,8 @@ mod bucket;
 // The prefetcher/slab helpers are GPU upload machinery; a cpu-only build binds directly.
 #[cfg_attr(not(any(feature = "cuda", feature = "hsa")), allow(dead_code))]
 pub mod checkpoint;
+#[cfg(test)]
+mod declared_tests;
 pub mod serve;
 #[cfg(any(feature = "cuda", feature = "hsa", feature = "cpu"))]
 pub use checkpoint::Checkpoint;
@@ -88,20 +90,27 @@ impl ModelBundle {
         let tokenizer = load_tokenizer_with(&dir, &checkpoint);
         let serve = Arc::new(serve::resolve(&dir, &checkpoint)?);
         let chat_template = if serve.from_packet {
-            serve.manifest.chat.as_ref().and_then(|c| {
-                let text = c.template.clone()?;
-                crate::serve::template::ChatTemplate::compile(
-                    text,
-                    c.source
-                        .clone()
-                        .unwrap_or_else(|| "model.pkt serve.json".into()),
-                    c.bos_token.clone(),
-                    c.eos_token.clone(),
-                )
-            })
+            match serve.manifest.chat.as_ref() {
+                Some(c) if serve.manifest.declares_response() => {
+                    // Version 2: the packet declares the tool syntax and the trace markers;
+                    // nothing is read from the template text, and one that does not compile
+                    // refuses the load rather than falling back to a builder.
+                    declared_template(c, &dir)?
+                }
+                Some(c) => c.template.clone().and_then(|text| {
+                    crate::serve::template::compile(
+                        text,
+                        c.source
+                            .clone()
+                            .unwrap_or_else(|| "model.pkt serve.json".into()),
+                        c.bos_token.clone(),
+                        c.eos_token.clone(),
+                    )
+                }),
+                None => None,
+            }
         } else {
-            crate::serve::template::ChatTemplate::load(&dir)
-                .or_else(|| crate::serve::template::ChatTemplate::load(&checkpoint))
+            crate::serve::template::load(&dir).or_else(|| crate::serve::template::load(&checkpoint))
         };
         let serving =
             crate::serve::config::ServingConfig::from_defaults(serve.manifest.sampling.as_ref());
@@ -219,6 +228,48 @@ impl ModelBundle {
 }
 
 /// Read + deserialize a JSON artifact, attributing errors to its path.
+/// A version-2 packet's chat template, compiled with what the packet declares (the manifest was
+/// validated at parse, so the ids are known and the template compiled once already).
+fn declared_template(
+    c: &plow_asset::serve_manifest::ChatSpec,
+    dir: &Path,
+) -> Result<Option<Arc<crate::serve::template::ChatTemplate>>> {
+    let Some(text) = c.template.clone() else {
+        return Ok(None);
+    };
+    let response = c.response.as_ref().ok_or_else(|| {
+        RuntimeError::Device(format!(
+            "{}: serve.json declares no response",
+            dir.display()
+        ))
+    })?;
+    let tools = response.tool_support().ok_or_else(|| {
+        RuntimeError::Device(format!(
+            "{}: serve.json declares tool syntax {:?}, which this build does not parse",
+            dir.display(),
+            response.tools
+        ))
+    })?;
+    let reasoning = crate::serve::reasoning::ReasoningMode::declared(&response.reasoning).markers();
+    crate::serve::template::ChatTemplate::compile_declared(
+        text,
+        c.source
+            .clone()
+            .unwrap_or_else(|| "model.pkt serve.json".into()),
+        c.bos_token.clone(),
+        c.eos_token.clone(),
+        tools,
+        reasoning,
+    )
+    .map(Some)
+    .map_err(|e| {
+        RuntimeError::Device(format!(
+            "{}: chat template does not compile: {e}",
+            dir.display()
+        ))
+    })
+}
+
 pub(crate) fn read_json<T: serde::de::DeserializeOwned>(path: &Path) -> Result<T> {
     let bytes = fs::read(path).map_err(|source| RuntimeError::Io {
         path: path.to_path_buf(),

@@ -18,6 +18,61 @@
 # with the Gemma 26B FP8 recipe, qualified there), step_bench B 1/16/64/128 x ctx 1K/4K/16K
 # digests and times unchanged against the 597c56d6 packet on one plowrt.
 # vLLM with BF16 KV (FLASH_ATTN) is still faster than this packet: same doc, Caveats.
+# 2026-10-25 (branch kv-block-store: the KV block store under the slots, host tier auto): the
+# plow_git below reproduces packet 06da7686 byte for byte from the re-keyed checkpoint; FP32 gate
+# c16 PASS on it (kl_mean 0.0952 vs vLLM 0.1277, kl_trim 0.0536 vs 0.0653, over-0.1 117 vs 123,
+# top1_decisive 0.9852 vs 0.9823, cont_frac 0.615, needle 1; kvstore-scratch/gemma-final-gates/g12-3).
+# Strict open-loop production mix (campaign.py report, --prod-fidelity, think lognormal 10 s,
+# 2 repeats, plowrt b779aa91 vs vLLM 0.29.0 fp8 KV at --max-model-len 16384) MATCHED + EQUIVALENT
+# and LOSES: 1.8 sessions/s total tok/s 0.98x, TTFT P99 798.6 -> 1224.9 ms (1.53x, spread flagged),
+# TPOT P99 55.97 -> 92.41 ms (1.65x); 2.7 sessions/s 0.95x / 1126 -> 2957 ms (2.62x) / 136.8 ->
+# 164.2 ms (1.20x), SLO met 54.3% vs 95.7% (TPOT P50 97.8 vs 32.0 ms, mean in-flight 51.6 vs 21.9).
+# The dense decode step at that in-flight count is the bottleneck; this packet is not competitive
+# with vLLM 0.29 on the production mix. Evidence: /opt/dlami/nvme/lava-tts/kvstore-scratch/strict-g12-23.
+# 2026-10-26 (plowrt 2dabbe2b, same packet, kvstore-scratch/fix-g12-*, steps-g12-lt2, prof-g12):
+# the loss is the decode step, not scheduling or the KV store. Four serve-env variants (no
+# interleave + ITL budget 60 / 120 ms, no live rings, widest launches) all collapse at 2.7/s
+# (goodput 27-75%) and trade p50 for P99 at 1.8/s; the store reserve changes nothing (480 chunk
+# frees per cell). The decode step is one persistent interpreter kernel per tick (nsys): B=1
+# 8.56 ms against a 3.8 ms weight-read floor, +0.2-0.3 ms per row (B=16 11.8 / 13.5 / 19.7 ms at
+# ctx 1K / 4K / 16K, B=32 15.6 / 19.2 / 31.9), and every prefill launch pays it again for its
+# riders (256 rows + 18 riders 31 ms, 2048 rows + 29 riders 93 ms). cuBLASLt projections from
+# 2 rows (the E4B choice) lose here: B=8 15.4 vs 9.8 ms, B=16 16.7 vs 11.8, equal from 32 up
+# (token digests identical), so PLOW_EMIT_DECODE_CUBLASLT_MIN_ROWS stays 128. Closing the gap is
+# decode-interpreter kernel work (small-M tensor-core projections, fusion / barrier removal,
+# long-context attention); the serve env below is kept and the loss stands until a kernel change
+# qualifies per rung. Diagnosis: docs/bringup/results/gemma12b-fp8-20260930/comparison.md.
+# 2026-10-27 (plow_git 98347bfa, packet 01c02ceb2e53, decode object interp_sm90a_fp8kv 8110b0b6):
+# the decode attention was the step's largest item (B=32 ctx 8K: hd512 9.7 ms + hd256 4.2 of 23.9
+# traced, the generic per-thread-row FP8 body). Now: hd256 on the FP8 row-group body with its
+# staged ring (RG8=2, RG8S), hd512 on a tensor-core item over the whole 16-head group
+# (PLOW_NV_FA_TC16, bf16 hi/lo P), full-layer nsplit sized for that group (BALANCE_GF 16,
+# NS_FULL_ABS 132; the manifest now gives the object the group the split was sized for), plus
+# RAW_NARROW / INST_PRELOAD. step_bench (2 ABAB passes, digests stable per arm) ms, previous packet
+# -> this one: B1 ctx 1K 8.55 -> 7.30, B8 8K 11.93 -> 8.20, B16 8K 15.77 -> 9.91, B32 8K 23.50 ->
+# 12.86, B32 16K 31.89 -> 14.01, B64 16K 51.94 -> 23.79, B128 16K 91.29 -> 28.14 (17 -> 55% of the
+# weight+KV floor); every rung faster, --same slot agreement full, VMM edge lengths and mixed
+# prefill + rider launches run. FP32-reference gate c16 PASS (kl_trim 0.0560 vs vLLM 0.0653,
+# top1_decisive 0.984 vs 0.982, cont_decisive 0.913 = vLLM); c1 equal to the previous packet.
+# Production mix vs vLLM 0.29 (campaign.py report MATCHED + EQUIVALENT, 2 reps): 1.8/s tok/s
+# 0.99x, TTFT P99 1.21x, TPOT P99 1.21x; 2.7/s 0.99x / 2.02x / 1.01x, SLO met 87.7% vs 95.7%
+# (was 54.3%). Still behind vLLM: mixed prefill+rider ticks are 60-67% of the 2.7/s wall and small
+# prefill buckets run at 22-30 ms (128-512 rows). Evidence: /opt/dlami/nvme/lava-tts/g12-decode.
+# 2026-10-27 (plow_git 843300f8, packet a0464475f8ab, decode objects unchanged): packed prefill.
+# A 128-row launch was 13.1 ms against a 3.9 ms weight floor, 3.0 ms of it the interpreter's
+# norm/quant segments (31 us each, one CTA per SM). Now the light norm pair carries the FP8 quant
+# (QNORM_FUSE), the FP8-KV segment object carries the light rope route (ROPE_PF) and the norm pair
+# runs one block per row up to 1152 rows (PLOW_PF_NORM_ROW_BLOCKS; 2048 neutral, 4096 +0.6 ms).
+# step_bench packed prefill, 2 ABAB passes, prefix 0 / 4096, riders 0/1/8/18/29; no-rider ms: 128
+# rows 13.0 -> 10.0 / 18.1 -> 15.0, 512 19.8 -> 16.3 / 23.9 -> 20.3, 1024 33.1 -> 29.0, 2048 + 4K
+# 76.0 -> 68.9, 4096 + 4K 158.1 -> 144.2; every cell 7-23% faster. Riders' top1 vs a decode step
+# (random-token rows): 29 riders 19-21 -> 21-26 agree, 8 riders 4-6 -> 1-3. FP32-reference gate
+# c16 PASS 3 of 4 runs (cont_decisive 41 / 43 / 41 / 40 of 46, floor 42/46 - 0.022 = 41/46; the
+# miss is one case, accepted as run-to-run spread with kl_trim 0.045-0.048 vs 0.056 before, vLLM
+# 0.065). Production
+# mix vs vLLM 0.29 (MATCHED + EQUIVALENT): 1.8/s tok/s 0.99x, TTFT P99 1.24x, TPOT P99 0.99x; 2.7/s
+# 0.99x / 1.25x / 0.82x, goodput 9.005 vs 8.902 req/s, SLO met 97.2% vs 95.7% (was 87.7%). A ladder
+# without the rider spill rungs (1088/1152/2112/4160/4224) lost at 2.7/s (SLO met 89.7-97.1%).
 #
 # Routes (per-rung evidence: docs/runtime/kernel-generators.md "Gemma-4 12B FP8 per-rung routes"):
 #   prefill projections   cuBLASLt FP8 OUTER_VEC where it wins (segment_roles::cublaslt_prefill_fp8),
@@ -37,7 +92,7 @@ namespace = "infervisor"
 name = "gemma-4-12b"
 label = "sm90a-h100-tp1"
 status = "validated"
-plow_git = "b44ca43f9e39982ce739ff14229f59ef4c99b58f"
+plow_git = "843300f8624cde2d253bdbb7872b34fbe5d818de"
 network = "gemma4"
 
 [target]
@@ -71,7 +126,10 @@ args = ["--segmented"]
 PLOW_GLU_QUANT_FUSE = "1"
 # Decode B=128 attention: light FP8 attention, 16-byte K loads, direct V conversion. The light
 # module then carries the segmented hd256 FlashDecode grid (plowrt cublaslt.rs fp8_flash256).
-NVCC_APPEND_FLAGS = "-DPLOW_NV_GLU_QUANT_CACHE=1 -DPLOW_NV_GLU_QUANT_WPR=1 -DPLOW_NV_LIGHT_FP8_ATTN=1 -DPLOW_FP8_LD16=1 -DPLOW_FP8_FAST=1"
+# Decode attention below 128 (2026-10-27): hd256 FP8 row-group body + staged ring, hd512 TC16 item.
+# Prefill (2026-10-27): ROPE_PF gives the packed-prefill FP8-KV segment object (built here, not by
+# [objects]) the light rope route; QNORM_FUSE folds the quant into the light norm pair.
+NVCC_APPEND_FLAGS = "-DPLOW_NV_GLU_QUANT_CACHE=1 -DPLOW_NV_GLU_QUANT_WPR=1 -DPLOW_NV_LIGHT_FP8_ATTN=1 -DPLOW_FP8_LD16=1 -DPLOW_FP8_FAST=1 -DPLOW_NV_FA_RG8=2 -DPLOW_NV_FA_RG8S=1 -DPLOW_NV_RAW_NARROW=1 -DPLOW_NV_INST_PRELOAD=1 -DPLOW_NV_FA_TC16=1 -DPLOW_NV_ROPE_PF=1"
 PLOW_FP8 = "1"
 PLOW_W8A8 = "1"
 PLOW_FP8_KV = "1"
@@ -87,8 +145,10 @@ PLOW_MAX_CHUNK = "4096"
 PLOW_MAX_REQUEST_CHUNK = "4096"
 PLOW_SLIDING_NS_CAP = "1"
 PLOW_SLIDING_NS_GRID = "1"
-PLOW_ATTENTION_DECODE_BALANCE_GF = "4"
-PLOW_NS_FULL_ABS = "66"
+# Full-layer decode group = the whole GQA group of 16 (TC16); nsplit 132 / B. GF 4 + RG8: B32 8K
+# 15.99 ms, GF 16 + TC16: 12.86.
+PLOW_ATTENTION_DECODE_BALANCE_GF = "16"
+PLOW_NS_FULL_ABS = "132"
 PLOW_FA_MMAQK = "3"
 PLOW_DECODE_BATCH_LADDER = "1,2,4,8,16,32,128"
 PLOW_EMIT_DECODE_CUBLASLT = "1"
@@ -97,6 +157,7 @@ PLOW_EMIT_DECODE_CUBLASLT_HEAD = "1"
 PLOW_EMIT_PREFILL_CUBLASLT = "1"
 PLOW_PF_LADDER_APPEND = "256,1088,1152,2112,4160,4224"
 PLOW_FUSE_ARGMAX = "1"
+PLOW_QNORM_FUSE = "1"
 
 [objects]
 script = "scripts/build_sm90a_gemma4_segments.sh"
@@ -128,6 +189,7 @@ PLOW_VMM_LIVE_RINGS = "0"
 PLOW_MULTISTEP = "0"
 PLOW_DECODE_MAX_RUNG = "128"
 PLOW_TOKEN_BATCH = "1"
+PLOW_PF_NORM_ROW_BLOCKS = "1152"
 
 [bench]
 backend = "openai"

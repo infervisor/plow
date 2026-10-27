@@ -60,6 +60,10 @@ impl GpuEngine {
     pub fn spec_serve_enable(&mut self, assets: &Path) -> Result<SpecLimits> {
         let ring_k = self.spec_enable(assets)?;
         self.spec_draft_enable(assets)?;
+        if self.spec_draft_is_block() {
+            self.spec_draft = None;
+            return Err(reject("block drafters (DSpark) are not served yet"));
+        }
         let limits = self.spec_serving().ok_or_else(|| reject("not armed"))?;
         if ring_k < limits.kmax as usize {
             tracing::info!(ring_k, "speculative depth capped by the sliding rings");

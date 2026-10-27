@@ -91,6 +91,7 @@ def main():
     ap.add_argument("--prompt-set", choices=["veena", "chatterbox", "chatterbox-mtl"], default="veena")
     ap.add_argument("--voice", default=None, help="override every prompt's voice")
     ap.add_argument("--ref-audio", default=None, help="clone every request's voice from this wav (a comma list: cycled)")
+    ap.add_argument("--ref-text", default=None, help="transcripts of --ref-audio ('|' list, same order; Fish / Breeze)")
     ap.add_argument("--session", default=None, help="X-Session-Id prefix (one session per client thread)")
     args = ap.parse_args()
     global SESSION, PROMPT_SET, SR
@@ -104,8 +105,11 @@ def main():
     refs = []
     if args.ref_audio:
         import base64
-        refs = [base64.b64encode(open(f, "rb").read()).decode() for f in args.ref_audio.split(",")]
-    per = lambda i: dict(extra, ref_audio=refs[i % len(refs)]) if refs else extra
+        refs = [{"ref_audio": base64.b64encode(open(f, "rb").read()).decode()} for f in args.ref_audio.split(",")]
+        if args.ref_text:
+            for r, t in zip(refs, args.ref_text.split("|"), strict=True):
+                r["ref_text"] = t
+    per = lambda i: dict(extra, **refs[i % len(refs)]) if refs else extra
     prompts = VEENA_PROMPTS if args.prompt_set == "veena" else [("default", t) for t in CBX_TEXTS]
     if args.prompt_set == "chatterbox-mtl":
         prompts = [("default", t) for _, t in MTL_PROMPTS]

@@ -13,6 +13,11 @@
 # report MATCHED + EQUIVALENT vs vLLM 0.28 BF16: wins agentic c32/c64/c128 1.57x / 1.32x / 1.03x;
 # loses 4K c32/c128 0.88x / 0.77x, 15K 0.87x / 0.86x, latency c1/c4 0.94x / 0.93x.
 # docs/bringup/results/gemma26b-h100-20261007/comparison.md.
+# 2026-10-25 (branch kv-block-store, plow_git below): the branch compiler reproduces packet
+# 475cb17f9986 byte for byte; FP32 gate c16 PASS on it with the KV block store and host tier auto
+# (kl_mean 0.0899 vs vLLM 0.1005, kl_trim 0.0462 vs 0.0496, kl_p99 1.77 vs 2.25, top1_decisive
+# 0.9838 vs 0.9778, cont_frac 0.662, needle 1; kvstore-scratch/gemma-final-gates/g26bf16-2).
+# The served comparison was not re-run on the branch.
 # Known limitations, stated plainly:
 # - Slower than vLLM on fixed-length 4K / 15K serving and at latency c1/c4: per-token decode (B=32 4K
 #   step 14.8 ms vs vLLM ~12) and 32 slots (2048-row sliding rings, 400 MiB each; 40 slots measured
@@ -37,7 +42,7 @@ namespace = "infervisor"
 name = "gemma-4-26b-a4b"
 label = "sm90a-h100-tp1-bf16"
 status = "validated"
-plow_git = "800970648b1a3ac7e8acb6535924dd0af2dfa734"
+plow_git = "2dabbe2b3f82129d4f905707080b0d2061d768f1"
 network = "gemma4"
 
 [target]

@@ -65,6 +65,8 @@ def unfold (head : String) (args : List Term) : Term :=
   | "FusedNormRopeScale", [x,w,e,d,t,s] => .node "Scale" [.node "Rope" [rms x w e,d,t],s]
   | "FusedResidualNorm", [a,b,w,e] => rms (ew "add" a b) w e
   | "FusedResidualZeroCenteredNorm", [a,b,w,e] => .node "ZeroCenteredRmsNorm" [ew "add" a b,w,e]
+  | "FusedResidualGateZeroCenteredNorm", [r,h,g,t,ge,w,e] =>
+      .node "ZeroCenteredRmsNorm" [.node "ResidualGate" [r,h,g,t,ge],w,e]
   | "FusedResidualLayerNorm", [a,b,w,bias,e] => .node "LayerNorm" [ew "add" a b,w,bias,e]
   | "FusedResidual3Norm", [x,a,b,w,e] => rms (ew "add" x (ew "add" a b)) w e
   | "FusedNormResidualNorm", [a,b,w1,e1,w2,e2] => rms (ew "add" a (rms b w1 e1)) w2 e2
