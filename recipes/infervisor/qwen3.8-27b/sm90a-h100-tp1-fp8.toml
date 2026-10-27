@@ -28,7 +28,7 @@
 #   prefill   PLOW_EMIT_PREFILL_CUBLASLT (devgen + segment_roles policy now admit the Qwen3.8 W8A8
 #             shapes): one request of 128/1024/4096/8192 rows 90.0/320.5/1232/2540 -> 36.5/78.5/277/559 ms
 #             (4x1024 packed 1281 -> 315 ms); 4096 rows at 39% of the FP8 compute floor (was 9%);
-#             first-token digests identical
+#             single-request first-token digests identical (packed 4x1024: differs, FP32 gate below)
 #   decode    PLOW_EMIT_DECODE_CUBLASLT from 2 rows (QuantFp8 stays in the interpreter window, the GEMM is
 #             isolated per projection), PLOW_QWEN_GDN_ISOLATE 2 (plowrt needs one role layout across the
 #             routed rungs): ctx 1K B2/4/8/16/32/48 48.12/48.72/59.42/62.04/64.95/68.41 -> 29.99/29.25/

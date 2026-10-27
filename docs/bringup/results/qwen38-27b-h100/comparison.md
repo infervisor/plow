@@ -95,7 +95,7 @@ FP8 result: devgen and the segment_roles policy now route the W8A8 projections t
 (commits 8b811e45, f2f7fabb: prefill admitted at the packet's 128/1024/4096/8192 buckets only), and
 the recipe takes prefill on cuBLASLt plus decode from 2 rows (commit a3ee2457). Each route was also
 measured alone (attribution tables): prefill alone gives the whole prefill gain with identical
-first-token digests, decode alone the whole decode gain. Prefill 2.5-4.5x faster (4096 rows 1232 ->
+single-request first-token digests (the packed 4 x 1024 digest differs), decode alone the whole decode gain. Prefill 2.5-4.5x faster (4096 rows 1232 ->
 277 ms, 9% -> 39% of the FP8 floor), decode B2..B48 38-49% faster; B1 stays on the native M1 TMA
 GEMV. FP32 gate (packet 2af45e892b75, plowrt 69215b1e) c1/c8/c32 PASS: kl_trim 0.0110/0.0099/0.0102
 vs vLLM hub-FP8 0.0147/0.0153/0.0179, top1_decisive 0.9939/0.9951/0.9951, cont_frac

@@ -100,14 +100,18 @@ PLOW_DECODE_BATCH_LADDER = "1,2,4,8,16,32,64,128"
 PLOW_EMIT_DECODE_CUBLASLT = "1"
 # Decode rung 32 on the native FP8 GEMV, cuBLASLt from 64 (2026-10-26 route sweep, step_bench 48 steps
 # --spread, 2 passes ABAB, plowrt 6a4b75bc, packet 62f32036d4cc vs caf6c4a47ba6): B32 ctx 1K/8K/16K
-# 13.40/14.91/17.01 -> 11.55/13.50/15.34 ms (-14/-9/-10%; the B32 floor is 8.4 ms at 1K), --same 4K
+# 13.40/14.91/17.01 -> 11.55/13.50/15.34 ms (-14/-9/-10%), --same 4K
 # 11.69 -> 10.09 ms; B16/B64/B128 and every prefill rung unchanged (digests identical). Measured and
 # not taken: cuBLASLt from 8 (B8/B16 6.63/8.63 -> 9.17/10.54 ms) and native at 64 (B64 18.82 ->
 # 46.00 ms). FP32 gates on the variant packet: c16 PASS (kl_mean 0.2118 vs vLLM 0.202, kl_trim
 # 0.1406 vs 0.1242, kl_p95 0.805 vs 0.892, over 211 vs 206, top1_decisive 0.9602, cont_frac 0.538,
 # needle 1); long c4 PASS (kl_mean 0.1511 vs 0.165, kl_trim 0.0991 vs 0.1011, top1_decisive 0.9555,
-# cont_frac 0.408 vs 0.343, needle 1). Evidence: /opt/dlami/nvme/lava-tts/route-sweep (B/g26fp8-lt64,
-# B/g26fp8-lt8, B/g26fp8-lt128, gates/g26fp8-lt64, gates/g26fp8-long).
+# cont_frac 0.408 vs 0.343, needle 1). c16 never fills rung 32, so both packets were also captured at
+# c32 (rung 32 in the serve log) and scored with this recipe's thresholds against the c16 peer (no c32
+# peer exists; the gate itself marks that pairing FAIL): control caf6c4a47ba6 PASS (kl_trim 0.1434,
+# kl_p95 0.882, top1_decisive 0.9592, cont_frac 0.516), variant PASS (0.1502, 0.997, 0.9532, 0.512;
+# limits 0.157, 1.117, 0.9512), one run each, inside the c16 run-to-run spread above. Evidence: /opt/dlami/nvme/lava-tts/route-sweep (B/g26fp8-lt64,
+# B/g26fp8-lt8, B/g26fp8-lt128, gates/g26fp8-lt64, gates/g26fp8-long, gates/g26fp8-c32).
 PLOW_EMIT_DECODE_CUBLASLT_MIN_ROWS = "64"
 PLOW_EMIT_DECODE_CUBLASLT_HEAD = "1"
 PLOW_EMIT_PREFILL_CUBLASLT = "1"
