@@ -111,7 +111,7 @@ The rule that keeps this correct: a **specialised** object stamps the packet it
 belongs to (`plow_packet_hash_{lo,hi}`) and pairs only with it; a **general**
 object — every arm compiled — carries no stamp and pairs with any packet. So a
 same-packet objset swap is legal only when the new objset is general or its stamp
-still matches. `pack_bundle.py` refuses to publish a mismatch, which turns a
+still matches. `plowrt pack` refuses to publish a mismatch, which turns a
 refusal deep in the loader into an obvious one at publish time.
 
 ## Selection
@@ -146,8 +146,10 @@ Apple's Metal shaders are compiled on the serving machine from the packet, so
 an Apple bundle (`target.vendor = "apple"`, `isa = "metal3"`) ships **no
 objset**: the bundle's files are the whole build, `build.objset_id` is empty,
 and there is no pairing hash. `plowrt target --json` on such a machine prints
-the exact `target` a publisher copies into `pack_bundle.py --target-json`;
-`publish_dist.py` and `plowrt pack` take no objset for it. Selection is
+the exact `target` a publisher records in the recipe's `[target]` — including
+`mem_bytes`, which a unified-memory part must state because `hwspec` records the
+smallest shipping configuration of each chip rather than this machine's memory;
+`plowrt pack` takes no objset for it. Selection is
 unchanged: the Metal device reports `apple`/`metal3`, the SKU hwspec names,
 its core count and the memory Metal will let it use.
 
@@ -175,64 +177,57 @@ The exception is a checkpoint with no Hugging Face repository to fetch from
 file as `files: [{name, sha256, bytes}]`, published under `v1/blobs/sha256/`
 like a bundle file, and `revision` is a free version label. `pull` fetches those
 blobs with the bundle and links them into `snapshots/dist+<ns>--<name>@<rev>-<hash>/`,
-which `load` prepares without `--fetch-weights`. `pack_bundle.py
---checkpoint-dir <dir> --revision <label>` writes such a manifest (instead of
-`--hf`), and `plowrt pack --checkpoint-dir <dir>` zips the files as
-`checkpoint/<name>`.
+which `load` prepares without `--fetch-weights`. A recipe whose
+`[checkpoint] source = "dist"` names the snapshot in `revision`, and
+`plowrt pack --checkpoint-dir <dir>` both writes such a manifest and zips the
+files as `checkpoint/<name>`.
 
 ## Producing a release
 
-Producers use nix; the HTTPS store is generated from its outputs. Nothing on a
-serving host runs nix, and a published manifest that references `/nix/store` is
-refused at pack time — an exported bundle must be portable.
+Producers use nix; the HTTPS store is generated from its outputs by `plowrt`
+and the registry, never by a script. Nothing on a serving host runs nix, and a
+published manifest that references `/nix/store` is refused at pack time — an
+exported bundle must be portable.
 
 **Runtime binaries** (`<semver>+<git12>`, the semver saying what changed and the
 commit saying which source produced the bytes):
 
 ```
 nix build .#plowrt-release --no-link --print-out-paths
-scripts/release_runtime.py --release <path> --store ./dist
 ```
 
 The tarball is deterministic (sorted, fixed mtime, no gzip timestamp) and its
-sha256 is computed at build time. A build from a modified checkout carries
-`-dirty` and is refused unless `--allow-dirty`, because it names a commit it does
-not correspond to.
+sha256 is computed at build time; the registry records both, with
+`release.json`, under `v1/runtime/<version>/<triple>/` and in
+`v1/runtime/index.json`. A build from a modified checkout carries `-dirty`
+and must not be published, because it names a commit it does not correspond
+to.
 
 **Model assets**, which advance independently — a new generation needs no new
-binary:
+binary — are packed and published by `plowrt` alone. `plowrt pack` builds both
+manifests from the recipe and archives the build; `plowrt publish` packs the
+same way and sends the archive to a registry with a publish API (inferos runs
+one), so anyone with a key the registry accepts can submit a build:
 
 ```
-scripts/release_dist.py --recipe recipes/infervisor/kimi-k3/<label>.toml --dry-run
-scripts/release_dist.py --recipe … --commit <full-sha> --publish --store ./dist
-```
-
-Five stages, each refusing rather than degrading: resolve the source to a full
-commit exactly once (a branch name is not provenance); refuse a compiler whose
-source commit disagrees with the recipe, even when its version string matches;
-validate the target, the pairing, and — for a `validated` claim — a measurement;
-report the generation and what it supersedes; then publish under a per-model
-lock, re-reading the index inside it so a concurrent release cannot reuse a
-generation.
-
-Publication order is the safety property: **blobs, then manifests, then the
-index**. An interrupted publish leaves the previous generation completely
-servable.
-
-**To a registry with a publish API** (inferos runs one), `plowrt publish`
-packs the build exactly as `plowrt pack` does and uploads the archive with an
-API key, so anyone with a key the registry accepts can submit a build:
-
-```
-PLOW_PUBLISH_KEY=… plowrt publish --bundle bundle.json --assets <dir> \
-  [--objset objset.json --objects <dir>] [--checkpoint-dir <dir> --hf <org>/<repo>] \
+PLOW_PUBLISH_KEY=… plowrt publish --recipe recipes/…/<label>.toml --assets <dir> \
+  [--objects <dir>] [--checkpoint-dir <dir> --hf <org>/<repo>] \
   --to https://<registry>
 ```
 
-Like `publish_dist.py`, it numbers the build against the live index: the
-next generation of its label, or nothing at all when the newest generation
-already carries exactly these files and objset, so a re-run is a no-op. The
-archive goes through the registry's staged upload (`POST
+Both manifests are built from the recipe, which is the only way to produce
+them: there is no flag that can disagree with what the recipe declares. The
+recipe's `plow_git` is the provenance a published build records; `--plow-git`
+exists only to reproduce a manifest whose recipe has since moved. A
+`validated` status needs `--tok-s`. `plowrt pack --manifests <dir>` writes
+the two JSON files without the archive, for inspecting them.
+
+`publish` numbers the build against the live index: the next generation of
+its label, or nothing at all when the newest generation already carries
+exactly these files and objset, so a re-run is a no-op. Publication order is
+the safety property — **blobs, then manifests, then the index** — so an
+interrupted publish leaves the previous generation completely servable, and
+a generation is never reused. The archive goes through the registry's staged upload (`POST
 <to>/api/v1/admin/registry/uploads`, `PUT` the zip to the returned URL, then
 `POST …/uploads/<id>/publish`), so a large build goes straight to the bucket
 past the API's request limit. The registry checks every file against its

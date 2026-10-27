@@ -90,6 +90,11 @@ zstd = { version = "0.13", optional = true }
 # `plowrt pack`: zips a built bundle+objset+files into one upload for a
 # registry's publish API. Publish-side tooling only, same reasoning as ureq.
 zip = { version = "2", default-features = false, features = ["deflate"], optional = true }
+# `pack --recipe` / `publish --recipe`: a recipe is the only place a variant's
+# identity is written down (namespace, name, label, target, checkpoint,
+# plow_git), so the manifest generator reads it rather than taking ~20 flags.
+# Read-only — `parse`, not `display`: nothing here writes a recipe back.
+toml = { version = "1", default-features = false, features = ["parse", "serde", "std"], optional = true }
 # Runtime `dlopen` of the driver libs (see `device::cuda`/`device::hsa`): the
 # static binary carries no link-time GPU dependency, and NVIDIA + AMD libs can be
 # loaded side-by-side in one process (distinct `cu*` / `hsa_*` symbol namespaces).
@@ -135,7 +140,7 @@ hub = ["hf-tokenizer", "dep:safetensors", "dep:hf-hub"]
 # `hf-hub` joins it because `load` also resolves the checkpoint, which the
 # distribution never carries — weights always come from HuggingFace or a local
 # directory.
-dist = ["dep:ureq", "dep:zstd", "dep:zip", "dep:hf-hub", "hf-tokenizer"]
+dist = ["dep:ureq", "dep:zstd", "dep:zip", "dep:toml", "dep:hf-hub", "hf-tokenizer"]
 # CUDA driver-API backend. The driver lib is `dlopen`ed at runtime (no link-time
 # `-lcuda`), so the binary stays static except for libcuda. Pulls safetensors:
 # a GPU serve is meaningless without real checkpoint weights (`exec::gpu`) —

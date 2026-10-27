@@ -324,30 +324,71 @@ pub fn cmd_upgrade(model: Option<&str>, all: bool, dry_run: bool) -> Result<(), 
     Ok(())
 }
 
+/// What `pack` and `publish` build the two manifests from: the recipe that
+/// declares the variant, plus the facts about one build that a recipe cannot
+/// fix. Shared by both so they cannot drift on how a variant is identified.
+#[cfg(feature = "dist")]
+pub struct Recipe<'a> {
+    pub path: &'a std::path::Path,
+    pub over: plowrt::dist::manifest::Overrides<'a>,
+    pub args: plowrt::dist::manifest::BundleArgs<'a>,
+}
+
 /// Package a built variant into one `.zip`: `bundle.json`, `objset.json`,
 /// and every file they reference, under `assets/` and `objects/`
 /// respectively so a bundle file and an objset object can never collide on
-/// name — and a `dist` checkpoint's files under `checkpoint/`. Does not build
-/// the manifests — `pack_bundle.py`/`pack_objset.py` still do that; this only
-/// packages what they already produced.
+/// name — and a `dist` checkpoint's files under `checkpoint/`.
+///
+/// `manifests` writes just the two JSON files, for a caller that validates or
+/// publishes them separately from the archive.
 #[cfg(feature = "dist")]
-pub fn cmd_pack(
-    bundle_path: &std::path::Path,
-    objset_path: Option<&std::path::Path>,
+pub fn cmd_pack<'a>(
+    recipe: Recipe<'a>,
     assets: &std::path::Path,
     objects: Option<&std::path::Path>,
-    checkpoint_dir: Option<&std::path::Path>,
+    checkpoint_dir: Option<&'a std::path::Path>,
+    out: Option<&std::path::Path>,
+    manifests: Option<&std::path::Path>,
+) -> Result<(), Err> {
+    if out.is_none() && manifests.is_none() {
+        return Err("give --out (the archive), --manifests (the two JSON files), or both".into());
+    }
+    // Every argument is checked before anything is created or truncated.
+    let args = pack_args(recipe, assets, objects, checkpoint_dir)?;
+    if let Some(dir) = manifests {
+        std::fs::create_dir_all(dir)?;
+        std::fs::write(dir.join("bundle.json"), &args.bundle_bytes)?;
+        if let Some((_, bytes)) = &args.objset {
+            std::fs::write(dir.join("objset.json"), bytes)?;
+        }
+    }
+    match out {
+        Some(out) => write_zip(&args, assets, objects, out),
+        None => Ok(()),
+    }
+}
+
+/// Write the archive. Separate from [`cmd_pack`] because `publish` packs a
+/// bundle it has renumbered in memory, and staging that to a file only to read
+/// it back is a round trip that can disagree with itself.
+#[cfg(feature = "dist")]
+fn write_zip(
+    args: &PackArgs<'_>,
+    assets: &std::path::Path,
+    objects: Option<&std::path::Path>,
     out: &std::path::Path,
 ) -> Result<(), Err> {
-    // Every argument is checked before --out is created or truncated.
     let PackArgs {
         bundle_bytes,
         bundle,
         objset,
         checkpoint_in,
-    } = pack_args(bundle_path, objset_path, objects, checkpoint_dir)?;
+    } = args;
     let objects_in = match (&objset, objects) {
         (Some((objset, _)), Some(dir)) => objset.objects.iter().map(|o| (o, dir)).collect(),
+        // A recipe's objects live in the asset directory unless the recipe's
+        // build script put them elsewhere, exactly as `generate` reads them.
+        (Some((objset, _)), None) => objset.objects.iter().map(|o| (o, assets)).collect(),
         _ => Vec::new(),
     };
 
@@ -357,7 +398,7 @@ pub fn cmd_pack(
         .compression_method(zip::CompressionMethod::Deflated);
 
     zip.start_file("bundle.json", options)?;
-    zip.write_all(&bundle_bytes)?;
+    zip.write_all(bundle_bytes)?;
     let mut total_bytes: u64 = bundle_bytes.len() as u64;
     let mut total_files: usize = 1;
     if let Some((_, objset_bytes)) = &objset {
@@ -471,43 +512,32 @@ struct PackArgs<'a> {
 /// published".
 #[cfg(feature = "dist")]
 fn pack_args<'a>(
-    bundle_path: &std::path::Path,
-    objset_path: Option<&std::path::Path>,
+    recipe: Recipe<'a>,
+    assets: &std::path::Path,
     objects: Option<&std::path::Path>,
     checkpoint_dir: Option<&'a std::path::Path>,
 ) -> Result<PackArgs<'a>, Err> {
-    use plow_asset::dist::{Bundle, ObjSet};
-
-    let bundle_bytes = std::fs::read(bundle_path)?;
-    let bundle: Bundle = serde_json::from_slice(&bundle_bytes)
-        .map_err(|e| format!("{}: {e}", bundle_path.display()))?;
-    bundle
-        .validate()
-        .map_err(|e| format!("{}: {e}", bundle_path.display()))?;
-
-    // A bundle that names an objset must ship it; a runtime-compiled one
-    // (no objset in the bundle) must not be handed one.
-    let objset = match (&bundle.objset, objset_path) {
-        (Some(_), None) => return Err("the bundle names an objset: pass --objset".into()),
-        (None, Some(p)) => {
-            return Err(format!("{}: the bundle has no objset to pair it with", p.display()).into())
-        }
-        (None, None) => None,
-        (Some(_), Some(objset_path)) => {
-            let objset_bytes = std::fs::read(objset_path)?;
-            let objset: ObjSet = serde_json::from_slice(&objset_bytes)
-                .map_err(|e| format!("{}: {e}", objset_path.display()))?;
-            objset
-                .validate()
-                .map_err(|e| format!("{}: {e}", objset_path.display()))?;
-            objset
-                .pairs_with(bundle.pairing_hash.as_deref())
-                .map_err(|e| format!("{}: {e}", objset_path.display()))?;
-            Some((objset, objset_bytes))
-        }
-    };
-    if objset.is_some() && objects.is_none() {
-        return Err("the objset's objects need --objects".into());
+    let Recipe {
+        path,
+        over,
+        mut args,
+    } = recipe;
+    // A `dist` checkpoint's `files[]` is enumerated from this directory, so the
+    // generator needs it and not only the zip writer. Hardcoding `None` here
+    // left no way at all to pack a carried checkpoint from a recipe: the bundle
+    // came out with an empty `files[]` and the refusal blamed the caller.
+    args.checkpoint_dir = checkpoint_dir;
+    let g = plowrt::dist::manifest::generate(path, assets, objects, over, &args)?;
+    let (bundle_bytes, bundle, objset) = (g.bundle_bytes, g.bundle, g.objset);
+    let where_ = path.display();
+    // Generated, but gated exactly as a hand-written manifest was: the
+    // generator is not trusted to have produced a publishable manifest.
+    bundle.validate().map_err(|e| format!("{where_}: {e}"))?;
+    if let Some((objset, _)) = &objset {
+        objset.validate().map_err(|e| format!("{where_}: {e}"))?;
+        objset
+            .pairs_with(bundle.pairing_hash.as_deref())
+            .map_err(|e| format!("{where_}: {e}"))?;
     }
     let checkpoint_in = checkpoint_arg(&bundle, checkpoint_dir)?;
     Ok(PackArgs {
@@ -550,12 +580,11 @@ pub struct PublishTo<'a> {
 /// staged upload: ask for an upload target, `PUT` the zip there, publish it.
 /// The target is a presigned bucket URL when the registry has one, so a large
 /// archive never passes the API's request limit.
-pub fn cmd_publish(
-    bundle_path: &std::path::Path,
-    objset_path: Option<&std::path::Path>,
+pub fn cmd_publish<'a>(
+    recipe: Recipe<'a>,
     assets: &std::path::Path,
     objects: Option<&std::path::Path>,
-    checkpoint_dir: Option<&std::path::Path>,
+    checkpoint_dir: Option<&'a std::path::Path>,
     to: &PublishTo,
 ) -> Result<(), Err> {
     // The registry's index would hold a variant clients refuse to read.
@@ -564,48 +593,40 @@ pub fn cmd_publish(
     }
     // Every argument is checked before the registry is asked anything: a
     // wrong one must fail, not read as "already published".
-    let local = pack_args(bundle_path, objset_path, objects, checkpoint_dir)?.bundle;
-    if local.checkpoint.source == "dist" && to.hf.is_none() {
+    let mut args = pack_args(recipe, assets, objects, checkpoint_dir)?;
+    if args.bundle.checkpoint.source == "dist" && to.hf.is_none() {
         return Err(
             "the bundle's checkpoint is `dist`: pass --hf <org>/<repo> for the index".into(),
         );
     }
     let dir = private_temp_dir()?;
     let sent = (|| {
-        let Some(bundle) = next_generation(bundle_path, to)? else {
+        let Some(bundle) = next_generation(args.bundle.clone(), to)? else {
             return Ok(());
         };
-        let bundle_out = dir.join("bundle.json");
-        std::fs::write(&bundle_out, serde_json::to_vec_pretty(&bundle)?)?;
+        // The archive carries the bundle as the registry will store it.
+        args.bundle_bytes = serde_json::to_vec_pretty(&bundle)?;
+        args.bundle = bundle;
         let zip_path = dir.join("bundle.zip");
-        cmd_pack(
-            &bundle_out,
-            objset_path,
-            assets,
-            objects,
-            checkpoint_dir,
-            &zip_path,
-        )?;
-        upload(&zip_path, to, &bundle)
+        write_zip(&args, assets, objects, &zip_path)?;
+        upload(&zip_path, to, &args.bundle)
     })();
     let _ = std::fs::remove_dir_all(&dir);
     sent
 }
 
-/// The bundle as the registry's next generation of its label, as
-/// `publish_dist.py` numbers one; `None` when the newest generation is already
+/// The bundle as the registry's next generation of its label; `None` when
+/// the newest generation is already
 /// this build at the status and measurement asked for (a re-run publishes
 /// nothing). A new status or measurement for the same build is a new
 /// generation, since a published one is immutable.
 #[cfg(feature = "dist")]
 fn next_generation(
-    bundle_path: &std::path::Path,
+    mut bundle: plow_asset::dist::Bundle,
     to: &PublishTo,
 ) -> Result<Option<plow_asset::dist::Bundle>, Err> {
     let registry = to.url;
     use plow_asset::dist::{Bundle, ModelIndex};
-    let mut bundle: Bundle = serde_json::from_slice(&std::fs::read(bundle_path)?)
-        .map_err(|e| format!("{}: {e}", bundle_path.display()))?;
     let f = dist::fetch::transport(registry)?;
     let model_dir = format!("v1/{}/{}", bundle.namespace, bundle.name);
     let index: Option<ModelIndex> = f
@@ -674,8 +695,9 @@ fn same_build(published: &plow_asset::dist::Bundle, local: &plow_asset::dist::Bu
     p == *local
 }
 
-/// `publish_dist.py`'s `variant_id`: 12 hex of the sha256 over the full key,
-/// the build included, so two generations of one label never collide.
+/// `variant_id` as the retired Python publisher formed it, which published
+/// generations are keyed by: 12 hex of the sha256 over the full key, the
+/// build included, so two generations of one label never collide.
 #[cfg(feature = "dist")]
 fn variant_id(b: &plow_asset::dist::Bundle) -> String {
     let parts = [
@@ -879,8 +901,8 @@ pub fn resolve_local(model: &str) -> Result<PathBuf, Err> {
 #[cfg(all(test, feature = "dist"))]
 mod tests {
     #[test]
-    fn variant_id_is_publish_dists() {
-        // `publish_dist.py`'s `variant_id(bundle, 1)` for this bundle.
+    fn variant_id_matches_published() {
+        // The retired Python publisher's `variant_id(bundle, 1)` for this bundle.
         let b: plow_asset::dist::Bundle = serde_json::from_value(serde_json::json!({
             "schema": "plow.dist.bundle.v1", "namespace": "infervisor", "name": "smollm2-360m",
             "label": "metal3-apple-m4-pro-tp1-0k", "generation": 1, "variant_id": "",
@@ -895,29 +917,66 @@ mod tests {
     }
 
     /// `publish` against a registry that is not there: what fails must be
-    /// the argument, never the registry (nor "already published").
-    fn publish_refuses(checkpoint: serde_json::Value, ckpt_dir: bool, hf: Option<&str>) -> String {
+    /// the argument, never the registry (nor "already published"). The
+    /// recipe and asset directory are the smallest `generate` accepts.
+    fn publish_refuses(source: &str, ckpt_dir: bool, hf: Option<&str>) -> String {
         let dir = std::env::temp_dir().join(format!(
-            "plowrt-publish-args-{}-{}",
+            "plowrt-publish-args-{}-{}{}",
             std::process::id(),
-            checkpoint["source"]
-                .as_str()
-                .unwrap()
-                .replace([':', '/'], "_")
-                + &ckpt_dir.to_string()
+            source.replace([':', '/'], "_"),
+            ckpt_dir
         ));
-        std::fs::create_dir_all(&dir).unwrap();
-        let bundle = dir.join("bundle.json");
-        std::fs::write(&bundle, serde_json::to_vec(&serde_json::json!({
-            "schema": "plow.dist.bundle.v1", "namespace": "infervisor", "name": "m",
-            "label": "l", "generation": 0, "variant_id": "", "plow_git": "abc", "network": "m",
-            "target": {"vendor": "apple", "isa": "metal3", "sku": "Apple M4 Pro", "units": 16, "mem_bytes": 1},
-            "parallel": {"mode": "tp", "n": 1}, "max_ctx": 2048,
-            "files": [{"name": "model.pkt", "role": "packet", "bytes": 1, "sha256": "0".repeat(64)},
-                      {"name": "t", "role": "tokenizer", "bytes": 1, "sha256": "0".repeat(64)}],
-            "tokenizer": {"file": "t", "generator": "plow", "sha256": "0".repeat(64), "source": "derived", "verified": false},
-            "checkpoint": checkpoint
-        })).unwrap()).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+        let assets = dir.join("assets");
+        std::fs::create_dir_all(&assets).unwrap();
+        for (file, body) in [
+            ("model.pkt", "PLOWDEV"),
+            ("plow_config.h", "#define X 1"),
+            ("weights.json", r#"{"network":"m"}"#),
+            (
+                "build.json",
+                r#"{"pairing":{"hash":"0x541009da5f9890c1"},
+                    "features":{"fp8_kv":false,"mxfp4_weights":false,"w8a8":false}}"#,
+            ),
+        ] {
+            std::fs::write(assets.join(file), body).unwrap();
+        }
+        let recipe = dir.join("r.toml");
+        std::fs::write(
+            &recipe,
+            format!(
+                r#"
+schema = "plow.recipe.v1"
+namespace = "infervisor"
+name = "m"
+label = "l"
+plow_git = "1972fa37ac7a6f632cd5ece0b32fe37ab76eec75"
+network = "m"
+
+[target]
+vendor = "apple"
+isa = "m4"
+sku = "M4 Max"
+units = 132
+mem_bytes = 85899345920
+num_gpus = 1
+parallel = "tp"
+toolchain = "cuda-13.4+gcc-13"
+
+[checkpoint]
+source = "{source}"
+revision = "8b770f9e69e6b35ef320d4cd70a99a4ab6dd022f"
+shards = 1
+
+[cell]
+max_ctx = 2048
+"#
+            ),
+        )
+        .unwrap();
+        let ckpt = dir.join("ckpt");
+        std::fs::create_dir_all(&ckpt).unwrap();
+        std::fs::write(ckpt.join("model-00001.safetensors"), b"shard").unwrap();
         let to = super::PublishTo {
             url: "http://127.0.0.1:9",
             api_key: "k",
@@ -927,29 +986,33 @@ mod tests {
             tok_s: None,
             concurrency: None,
         };
-        let ckpt = ckpt_dir.then_some(dir.as_path());
-        let err = super::cmd_publish(&bundle, None, &dir, None, ckpt, &to).unwrap_err();
+        let r = super::Recipe {
+            path: &recipe,
+            over: Default::default(),
+            args: Default::default(),
+        };
+        let err = super::cmd_publish(r, &assets, None, ckpt_dir.then_some(ckpt.as_path()), &to)
+            .unwrap_err();
         std::fs::remove_dir_all(&dir).ok();
         err.to_string()
     }
 
     #[test]
     fn publish_checks_its_arguments_before_the_registry() {
-        let hf = serde_json::json!({"source": "hf:o/m", "revision": "main", "shards": 0, "layout": "x", "bytes": 0});
-        let dist = serde_json::json!({"source": "dist", "revision": "v1", "shards": 1, "layout": "hf-safetensors", "bytes": 1,
-            "files": [{"name": "model.safetensors", "bytes": 1, "sha256": "0".repeat(64)}]});
-        let e = publish_refuses(hf, true, None);
+        // A `dist` checkpoint travels as blobs, and the index needs `--hf`
+        // to name the model it is.
+        let e = publish_refuses("dist", true, None);
+        assert!(e.contains("pass --hf"), "dist bundle without --hf: {e}");
+        // `--checkpoint-dir` is what makes a checkpoint travel, whatever the
+        // recipe says its source is.
+        let e = publish_refuses("hf:o/m", true, None);
+        assert!(e.contains("pass --hf"), "hf recipe + --checkpoint-dir: {e}");
+        // A `dist` checkpoint with nothing to carry is not publishable.
+        let e = publish_refuses("dist", false, Some("o/m"));
         assert!(
-            e.contains("lists no files"),
-            "hf bundle + --checkpoint-dir: {e}"
-        );
-        let e = publish_refuses(dist.clone(), false, Some("o/m"));
-        assert!(
-            e.contains("pass --checkpoint-dir"),
+            e.contains("lists the files it carries"),
             "dist bundle without its checkpoint: {e}"
         );
-        let e = publish_refuses(dist, true, None);
-        assert!(e.contains("pass --hf"), "dist bundle without --hf: {e}");
     }
 
     #[test]

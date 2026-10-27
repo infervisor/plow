@@ -34,7 +34,7 @@ pub trait Fetch: Send + Sync {
 
 /// A registry served straight out of a directory.
 ///
-/// Also the shape of an air-gapped mirror: `publish_dist.py` writes exactly this
+/// Also the shape of an air-gapped mirror: a registry serves exactly this
 /// tree, so an `rsync` of it is a complete registry.
 pub struct FileFetch {
     root: std::path::PathBuf,

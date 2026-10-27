@@ -12,6 +12,10 @@
 //! `exec/gpu.rs`'s pairing check already refuses on principle.
 
 pub mod fetch;
+/// Build the manifests a registry publish needs, from a recipe and a built
+/// directory. Publish-side only, like `pack` itself: `serve` never calls it.
+#[cfg(feature = "dist")]
+pub mod manifest;
 pub mod prepare;
 pub mod pull;
 pub mod reference;

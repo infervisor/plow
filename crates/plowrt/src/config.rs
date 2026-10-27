@@ -2709,6 +2709,16 @@ impl RuntimeConfig {
         )
     }
 
+    /// `PLOW_READELF`: the `readelf` the manifest generator reads an object's
+    /// `.symtab` with (`plowrt pack --recipe`). A publish-side tool setting,
+    /// not a serve knob, so it has no flag here. `nix develop` exports it
+    /// pointing at the toolchain's `llvm-readelf`, which is what
+    /// `scripts/build_gfx942.sh` itself requires; without it the generator
+    /// falls back to `llvm-readelf` then `readelf` on PATH.
+    pub fn readelf_env() -> Option<String> {
+        Self::env_nonempty("PLOW_READELF")
+    }
+
     /// `PLOW_THROUGHPUT_K`: the decode quantum under the throughput objective (default 8); a
     /// packet's `serve.json` can carry the model's measured value.
     pub(crate) fn throughput_k() -> Option<u32> {

@@ -492,8 +492,8 @@
           #
           # A runtime release is a tarball per platform triple, named
           # `<semver>+<git12>`, plus the sha256 a client verifies it against.
-          # `scripts/release_runtime.py` turns these into `v1/runtime/index.json`
-          # and the blobs a `plowrt` client reads.
+          # A registry records these in `v1/runtime/index.json`, which a `plowrt`
+          # client reads.
           #
           # `dist` is in every feature set: the released binary is exactly the
           # one that can `pull`. `serve` still performs no network I/O — that is
@@ -573,7 +573,7 @@
               # lean-plow/lean-toolchain on first `lake` invocation.
               pkgs.elan
               # Asset publishing: blobs are stored compressed and keyed on the
-              # UNCOMPRESSED digest (scripts/publish_dist.py). Producer-side
+              # UNCOMPRESSED digest. Producer-side
               # only — a serving host decompresses with the `zstd` crate linked
               # into plowrt under the `dist` feature, and needs neither this nor
               # nix.

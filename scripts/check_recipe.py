@@ -25,7 +25,7 @@ import subprocess
 import sys
 from pathlib import Path
 
-import plow_dist as pd
+import recipe_common as rc
 
 REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO / "scripts" / "campaign"))
@@ -33,7 +33,7 @@ import rung_env  # noqa: E402
 import spec_env  # noqa: E402
 
 
-class Invalid(pd.Fail):
+class Invalid(rc.Fail):
     pass
 
 
@@ -253,7 +253,7 @@ def check_artifacts(recipe: dict, roots: list[Path]) -> list[str]:
         if found is None:
             notes.append(f"artifacts: {name} is recorded but not present in any given directory")
             continue
-        got = pd.sha256_file(found)
+        got = rc.sha256_file(found)
         need(
             got == want,
             f"artifacts: {name} hashes to {got}, recipe records {want}",
@@ -288,12 +288,12 @@ def check_provenance(recipe: dict, strict: bool, verified: bool = False) -> list
 
 
 def check(recipe_path: Path, bundle: Path | None, objects: Path | None, strict: bool) -> list[str]:
-    recipe = pd.load_toml(recipe_path)
+    recipe = rc.load_toml(recipe_path)
     notes: list[str] = []
 
-    # The status/measured/refusal rules live in plow_dist so the publisher and
+    # The status/measured/refusal rules live in recipe_common so the renderer and
     # this checker cannot disagree about what may be called `validated`.
-    pd.recipe_invariants(recipe)
+    rc.recipe_invariants(recipe)
     if recipe.get("status", "emits") == "refused":
         return check_provenance(recipe, strict)
 
@@ -303,13 +303,13 @@ def check(recipe_path: Path, bundle: Path | None, objects: Path | None, strict: 
     need(not spec_errors, "; ".join(spec_errors))
 
     if bundle:
-        bj = pd.load_json(bundle / "build.json") if (bundle / "build.json").exists() else {}
-        wj = pd.load_json(bundle / "weights.json") if (bundle / "weights.json").exists() else {}
+        bj = rc.load_json(bundle / "build.json") if (bundle / "build.json").exists() else {}
+        wj = rc.load_json(bundle / "weights.json") if (bundle / "weights.json").exists() else {}
         check_target(recipe, bj, wj)
         notes += check_emit(recipe, bj)
     if objects:
         dp = objects / "build_defines.json"
-        notes += check_objects(recipe, pd.load_json(dp) if dp.exists() else {})
+        notes += check_objects(recipe, rc.load_json(dp) if dp.exists() else {})
 
     roots = [p for p in (bundle, objects) if p]
     artifact_notes = check_artifacts(recipe, roots) if roots else []
@@ -331,7 +331,7 @@ def run() -> None:
         print("check_recipe selftest: PASS")
         return
     if not args.recipe:
-        pd.die("give at least one recipe")
+        rc.die("give at least one recipe")
 
     failed = 0
     for rp in args.recipe:
@@ -348,11 +348,11 @@ def run() -> None:
                 print(f"  note: {n}")
                 if args.strict and not n.startswith("info:"):
                     failed += 1
-        except pd.Fail as e:
+        except rc.Fail as e:
             print(f"{p}: FAIL\n  {e}")
             failed += 1
     if failed:
-        pd.die(f"{failed} problem(s)")
+        rc.die(f"{failed} problem(s)")
 
 
 def self_test() -> None:
@@ -390,7 +390,7 @@ def self_test() -> None:
         )
         (objects / "i.elf").write_bytes(b"an object")
 
-        head = pd.git_commit(REPO)
+        head = rc.git_commit(REPO)
         good = {
             "schema": "plow.recipe.v1",
             "namespace": "infervisor",
@@ -403,7 +403,7 @@ def self_test() -> None:
             # `PLOW_K3_DECODE_GROUPED` reaches the object as -DPLOW_MOE_PF_A4W4 (INDIRECT).
             "objects": {"env": {"PLOW_GEMV_MM": "16", "PLOW_K3_DECODE_GROUPED": "1"}},
             "measured": {"tok_s": 131.162},
-            "artifacts": {"i.elf": pd.sha256_file(objects / "i.elf")},
+            "artifacts": {"i.elf": rc.sha256_file(objects / "i.elf")},
         }
 
         def write(doc) -> Path:
@@ -425,7 +425,7 @@ def self_test() -> None:
         try:
             check(write(bad), bundle, objects, strict=False)
             raise AssertionError("accepted a contradicted emit knob")
-        except pd.Fail as e:
+        except rc.Fail as e:
             assert "contradictory PLOW_FP8_KV" in str(e), e
 
         # Explicit rungs with PLOW_DECODE_TIERS unset would be overwritten by the
@@ -451,7 +451,7 @@ def self_test() -> None:
         try:
             check(write(bad), bundle, objects, strict=False)
             raise AssertionError("accepted an unknown emit knob")
-        except pd.Fail as e:
+        except rc.Fail as e:
             assert "no such knob" in str(e)
 
         # [spec]: derived knobs must match the build record; a malformed table fails.
@@ -464,13 +464,13 @@ def self_test() -> None:
         try:
             check(write(spec), bundle, objects, strict=False)
             raise AssertionError("accepted [spec] knobs the build did not record")
-        except pd.Fail as e:
+        except rc.Fail as e:
             assert "no such knob" in str(e) or "no PLOW_SPEC_DRAFT_DIR" in str(e), e
         spec["spec"]["k_max"] = 99
         try:
             check(write(spec), bundle, objects, strict=False)
             raise AssertionError("accepted k_max 99")
-        except pd.Fail as e:
+        except rc.Fail as e:
             assert "k_max" in str(e), e
 
         # Target disagreements.
@@ -480,7 +480,7 @@ def self_test() -> None:
             try:
                 check(write(bad), bundle, objects, strict=False)
                 raise AssertionError(f"accepted target {field}={value}")
-            except pd.Fail:
+            except rc.Fail:
                 pass
 
         # A recorded digest that does not match the file.
@@ -489,7 +489,7 @@ def self_test() -> None:
         try:
             check(write(bad), bundle, objects, strict=False)
             raise AssertionError("accepted a wrong artifact digest")
-        except pd.Fail as e:
+        except rc.Fail as e:
             assert "hashes to" in str(e)
 
         # validated without a measurement.
@@ -498,7 +498,7 @@ def self_test() -> None:
         try:
             check(write(bad), bundle, objects, strict=False)
             raise AssertionError("accepted validated with no measurement")
-        except pd.Fail as e:
+        except rc.Fail as e:
             assert "must carry `[measured] tok_s`" in str(e)
 
         # Per-rung overrides: stated in [emit.rung_env], replayed as PLOW_EMIT_RUNG_ENV, resolved
@@ -537,7 +537,7 @@ def self_test() -> None:
             try:
                 check(write(bad), rb, None, strict=False)
                 raise AssertionError(f"accepted a bad rung override ({why})")
-            except pd.Fail as e:
+            except rc.Fail as e:
                 assert why in str(e), e
         # The build resolved the value from the packet, not the rung.
         stale = json.loads(json.dumps(rung_build))
@@ -546,7 +546,7 @@ def self_test() -> None:
         try:
             check(write(rung), rb, None, strict=False)
             raise AssertionError("accepted a rung override the build did not apply")
-        except pd.Fail as e:
+        except rc.Fail as e:
             assert "resolved" in str(e), e
 
         # A refused recipe states what blocks it and carries no build.
@@ -566,7 +566,7 @@ def self_test() -> None:
         try:
             check(write(bad), None, None, strict=False)
             raise AssertionError("accepted a refused recipe with no reason")
-        except pd.Fail:
+        except rc.Fail:
             pass
 
 
@@ -605,7 +605,7 @@ def to_toml(doc: dict) -> str:
     return "\n".join(out) + "\n"
 
 
-main = pd.main_guard(run)
+main = rc.main_guard(run)
 
 if __name__ == "__main__":
     raise SystemExit(main())
