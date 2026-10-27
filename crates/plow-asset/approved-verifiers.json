@@ -49,6 +49,13 @@
       "toolchain": "leanprover/lean4:v4.15.0",
       "commit": "403ff874",
       "note": "codec_lm cloning end frame optional (Fish S2 Pro reference prompts); user-approved 2026-10-22"
+    },
+    {
+      "sha256": "0d190b896a01bbd279d4cd9f18452e5c718fb803f13892ffa5814711d9d2b464",
+      "lean_sources_sha256": "7bdfd640c1cbff7447faf79b0aefb0310b2407665e8eb49be3a17aa98b015332",
+      "toolchain": "leanprover/lean4:v4.15.0",
+      "commit": "kv-block-store",
+      "note": "consolidated kv-block-store lean sources (PR #108); signs the Gemma-4 12B FP8 decode packet; user-approved 2026-10-27"
     }
   ]
 }
