@@ -18,6 +18,14 @@
 # (kl_mean 0.0899 vs vLLM 0.1005, kl_trim 0.0462 vs 0.0496, kl_p99 1.77 vs 2.25, top1_decisive
 # 0.9838 vs 0.9778, cont_frac 0.662, needle 1; kvstore-scratch/gemma-final-gates/g26bf16-2).
 # The served comparison was not re-run on the branch.
+# 2026-10-27 vs vLLM 0.29 (plowrt bb9f389fd, packet f72d0330f9d8, campaign.py report MATCHED +
+# EQUIVALENT; docs/bringup/results/gemma26b-h100-bf16-20261027): NOT production ready. Prod mix 1.8
+# sessions/s: tok/s 0.96x, TTFT/TPOT P99 13.3x/2.5x, goodput 88 vs 100 %; 2.7 refused (plowrt failed
+# requests, vLLM 97-100 % goodput); 1000/128 c1/c8/c32 tok/s 0.90x/0.79x/0.62x. Step-bound (decode
+# 14-21 ms vs vLLM 8-13 ms, 128-row prefill launch ~29 ms). Best serve tune: the FP8 recipe's serving
+# set (VMM_PREFIX, LIVE_RINGS, RING_PARK 8, ADMIT_OVERLAP, DECODE_PIPELINE, ITL budget 60, FORCE 0,
+# STRICT_PUBLISH, KV_POOL_MIB 2048) gave 1.8 TTFT P99 5.6 -> 3.7 s and goodput 88 -> 96 % on one repeat.
+# Not promoted: single repeat, not gated, still a loss.
 # Known limitations, stated plainly:
 # - Slower than vLLM on fixed-length 4K / 15K serving and at latency c1/c4: per-token decode (B=32 4K
 #   step 14.8 ms vs vLLM ~12) and 32 slots (2048-row sliding rings, 400 MiB each; 40 slots measured

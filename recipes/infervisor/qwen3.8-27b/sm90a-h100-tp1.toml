@@ -92,6 +92,12 @@
 #                         still gated; untested against the robust verdict)
 # Ladder tops at 48: the 64-slot recurrent state (151 MB per slot) left the planner 0.5 GiB short on
 # the 80 GB part.
+# 2026-10-27 vs vLLM 0.29 (plowrt bb9f389fd, packet 3157ca560892, campaign.py report MATCHED +
+# EQUIVALENT; docs/bringup/results/qwen38-27b-h100/comparison.md): NOT production ready. 1000/128
+# c1/c8/c32 tok/s 0.91x/0.88x/0.80x, TPOT P99 1.12x/1.41x/1.60x (c32 was 0.96x/1.25x vs vLLM 0.28 on
+# 2026-10-13 with the prefix cache off); prod mix (1.8 sessions/s overloads vLLM too) at 0.45: tok/s
+# 0.95x, TTFT/TPOT P99 3.9x/1.8x, SLO met 63 vs 99 %; 0.7 overloads plowrt. Decode ~25 ms at 4 rows,
+# 1024-row prefill chunk 89 ms, and prefix hit 52 -> 13 % under load (vLLM 63-69 %). Serve tunes not run.
 schema = "plow.recipe.v1"
 namespace = "infervisor"
 name = "qwen3.8-27b"
