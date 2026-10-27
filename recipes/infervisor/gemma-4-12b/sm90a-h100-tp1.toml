@@ -42,6 +42,22 @@
 # decode-interpreter kernel work (small-M tensor-core projections, fusion / barrier removal,
 # long-context attention); the serve env below is kept and the loss stands until a kernel change
 # qualifies per rung. Diagnosis: docs/bringup/results/gemma12b-fp8-20260930/comparison.md.
+# 2026-10-27 (plow_git 98347bfa, packet 01c02ceb2e53, decode object interp_sm90a_fp8kv 8110b0b6):
+# the decode attention was the step's largest item (B=32 ctx 8K: hd512 9.7 ms + hd256 4.2 of 23.9
+# traced, the generic per-thread-row FP8 body). Now: hd256 on the FP8 row-group body with its
+# staged ring (RG8=2, RG8S), hd512 on a tensor-core item over the whole 16-head group
+# (PLOW_NV_FA_TC16, bf16 hi/lo P), full-layer nsplit sized for that group (BALANCE_GF 16,
+# NS_FULL_ABS 132; the manifest now gives the object the group the split was sized for), plus
+# RAW_NARROW / INST_PRELOAD. step_bench (2 ABAB passes, digests stable per arm) ms, previous packet
+# -> this one: B1 ctx 1K 8.55 -> 7.30, B8 8K 11.93 -> 8.20, B16 8K 15.77 -> 9.91, B32 8K 23.50 ->
+# 12.86, B32 16K 31.89 -> 14.01, B64 16K 51.94 -> 23.79, B128 16K 91.29 -> 28.14 (17 -> 55% of the
+# weight+KV floor); every rung faster, --same slot agreement full, VMM edge lengths and mixed
+# prefill + rider launches run. FP32-reference gate c16 PASS (kl_trim 0.0560 vs vLLM 0.0653,
+# top1_decisive 0.984 vs 0.982, cont_decisive 0.913 = vLLM); c1 equal to the previous packet.
+# Production mix vs vLLM 0.29 (campaign.py report MATCHED + EQUIVALENT, 2 reps): 1.8/s tok/s
+# 0.99x, TTFT P99 1.21x, TPOT P99 1.21x; 2.7/s 0.99x / 2.02x / 1.01x, SLO met 87.7% vs 95.7%
+# (was 54.3%). Still behind vLLM: mixed prefill+rider ticks are 60-67% of the 2.7/s wall and small
+# prefill buckets run at 22-30 ms (128-512 rows). Evidence: /opt/dlami/nvme/lava-tts/g12-decode.
 #
 # Routes (per-rung evidence: docs/runtime/kernel-generators.md "Gemma-4 12B FP8 per-rung routes"):
 #   prefill projections   cuBLASLt FP8 OUTER_VEC where it wins (segment_roles::cublaslt_prefill_fp8),
@@ -61,7 +77,7 @@ namespace = "infervisor"
 name = "gemma-4-12b"
 label = "sm90a-h100-tp1"
 status = "validated"
-plow_git = "2dabbe2b3f82129d4f905707080b0d2061d768f1"
+plow_git = "98347bfaca76c68d787a4bcfe3f164b3823e8b7f"
 network = "gemma4"
 
 [target]
@@ -95,7 +111,8 @@ args = ["--segmented"]
 PLOW_GLU_QUANT_FUSE = "1"
 # Decode B=128 attention: light FP8 attention, 16-byte K loads, direct V conversion. The light
 # module then carries the segmented hd256 FlashDecode grid (plowrt cublaslt.rs fp8_flash256).
-NVCC_APPEND_FLAGS = "-DPLOW_NV_GLU_QUANT_CACHE=1 -DPLOW_NV_GLU_QUANT_WPR=1 -DPLOW_NV_LIGHT_FP8_ATTN=1 -DPLOW_FP8_LD16=1 -DPLOW_FP8_FAST=1"
+# Decode attention below 128 (2026-10-27): hd256 FP8 row-group body + staged ring, hd512 TC16 item.
+NVCC_APPEND_FLAGS = "-DPLOW_NV_GLU_QUANT_CACHE=1 -DPLOW_NV_GLU_QUANT_WPR=1 -DPLOW_NV_LIGHT_FP8_ATTN=1 -DPLOW_FP8_LD16=1 -DPLOW_FP8_FAST=1 -DPLOW_NV_FA_RG8=2 -DPLOW_NV_FA_RG8S=1 -DPLOW_NV_RAW_NARROW=1 -DPLOW_NV_INST_PRELOAD=1 -DPLOW_NV_FA_TC16=1"
 PLOW_FP8 = "1"
 PLOW_W8A8 = "1"
 PLOW_FP8_KV = "1"
@@ -111,8 +128,10 @@ PLOW_MAX_CHUNK = "4096"
 PLOW_MAX_REQUEST_CHUNK = "4096"
 PLOW_SLIDING_NS_CAP = "1"
 PLOW_SLIDING_NS_GRID = "1"
-PLOW_ATTENTION_DECODE_BALANCE_GF = "4"
-PLOW_NS_FULL_ABS = "66"
+# Full-layer decode group = the whole GQA group of 16 (TC16); nsplit 132 / B. GF 4 + RG8: B32 8K
+# 15.99 ms, GF 16 + TC16: 12.86.
+PLOW_ATTENTION_DECODE_BALANCE_GF = "16"
+PLOW_NS_FULL_ABS = "132"
 PLOW_FA_MMAQK = "3"
 PLOW_DECODE_BATCH_LADDER = "1,2,4,8,16,32,128"
 PLOW_EMIT_DECODE_CUBLASLT = "1"
