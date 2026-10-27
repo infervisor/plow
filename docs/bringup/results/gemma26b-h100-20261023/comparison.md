@@ -309,10 +309,18 @@ FP8 result: rung 32 moves to the native FP8 GEMV (recipe `PLOW_EMIT_DECODE_CUBLA
 64, commit a707a0b0): B32 -10..-14% at ctx 1K/8K/16K, every other rung and prefill unchanged. FP32
 gates on that packet (62f32036d4cc): c16 PASS (kl_mean 0.2118 vs vLLM 0.202, kl_trim 0.1406 vs
 0.1242, top1_decisive 0.9602, needle 1), long c4 PASS (kl_mean 0.1511 vs 0.165, kl_trim 0.0991 vs
-0.1011, top1_decisive 0.9555, needle 1). c16 never fills rung 32, so control and variant were also
-captured at c32 and scored with the recipe thresholds against the c16 peer (no c32 peer; the gate
-marks the pairing FAIL): control PASS (kl_trim 0.1434, kl_p95 0.882, top1_decisive 0.9592), variant
-PASS (0.1502, 0.997, 0.9532; limits 0.157, 1.117, 0.9512), one run each. Kept: cuBLASLt from 64 (native 64 is 2.0-2.4x slower),
+0.1011, top1_decisive 0.9555, needle 1). c16 never fills rung 32, so both packets were also gated
+at c32 against a vLLM 0.28 c32 peer (same serve flags as the c16 peer; peer kl_trim 0.128, kl_p95
+0.864, top1_decisive 0.9652, cont_decisive 0.870), three runs per arm:
+
+| arm | kl_trim_mean | kl_p95 | top1_decisive | cont_decisive_frac | gate |
+|---|---|---|---|---|---|
+| control caf6c4a47ba6 | 0.1434 / 0.1465 / 0.1518 | 0.882 / 0.905 / 1.138 | 0.9592 / 0.9622 / 0.9572 | 0.783 / 0.804 / 0.804 | 0 of 3 PASS |
+| rung 32 native 62f32036d4cc | 0.1502 / 0.1442 / 0.1422 | 0.997 / 0.972 / 0.920 | 0.9532 / 0.9582 / 0.9572 | 0.783 / 0.826 / 0.783 | 1 of 3 PASS |
+
+The c32 failures are cont_decisive (one case = 0.0217 against the c16-calibrated 0.045 margin) on
+both arms, plus one control kl_p95; the variant holds parity with production. A c32 margin is an
+open gate-policy decision. Kept: cuBLASLt from 64 (native 64 is 2.0-2.4x slower),
 cuBLASLt prefill and MoE prefill (native MoE prefill +34..+58%), fused qkv. The FP8 packet has no
 MoE decode library route (its experts are native on every rung). Whole-packet effect: decode steps
 with 17-32 rows in flight (the c16-c32 serving range) are 1.4-1.9 ms faster; nothing else moves.
