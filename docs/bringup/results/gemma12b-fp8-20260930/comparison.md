@@ -459,6 +459,71 @@ weight-read floor. Next: small-bucket prefill and rider cost; on the decode side
 (B=1: 5.3 of 7.6 ms traced at ~60% of HBM bandwidth, GEMV depth 2 -> 4 -> 8 = 9.26 / 7.30 / 7.22
 ms) and hd256 attention at long context (B=32 8K 2.6 ms vs 1.6 floor).
 
+## 2026-10-27: packed prefill norm and rope routes
+
+Recipe plow_git 843300f8, packet a0464475f8ab (decode objects identical to 01c02ceb2e53), plowrt
+843300f86 (binary c6380a1e). Raw: `/opt/dlami/nvme/lava-tts/g12-decode` (`pf/pgate1.out`,
+`gates/pf2-c16{,b,c,d}`, `grid-pf2/report2`, `grid-pf3`).
+
+Attribution (nsys, previous packet): a fresh 128-row launch is 13.1 ms against a 3.9 ms weight
+floor = projections 7.3 (cuBLASLt FP8 ~13 us per call minimum, one heuristic candidate),
+interpreter norm/quant segments 3.0 (2 x 31 us x 48 layers, one CTA per SM), flash 1.05, quants
+0.54, HNR 0.85. A 6144-token cached prefix adds 6.4 ms (hd512 574 us and hd256 72 us per layer).
+2048 rows + 4K prefix = 76 ms: cuBLASLt 26.9, native GEMM 9.1, hd512 14.4, interpreter segments
+13.6, hd256 6.2, GLU quant 4.4. Riders spilling a launch into the next bucket (1024 + 29 in 1088,
+1152 + 29, 2048 + 29 in 2112) cost 4-16 ms over the same rows trimmed to fit.
+
+Change: the light NormResidual + RmsNorm pair carries the FP8 quant (`PLOW_QNORM_FUSE`), the
+packed-prefill FP8-KV segment object (built by the emit) carries the light rope route
+(`-DPLOW_NV_ROPE_PF=1` in `[emit.env]`), and the norm pair runs one block per row up to 1152 rows
+(object ABI 2, `PLOW_PF_NORM_ROW_BLOCKS`, default 0 = the previous rows / 8 grid). Objects: norm
+pair REG 112, rope REG 79, STACK 0; segment interpreter unchanged (REG 255, STACK 872).
+
+step_bench packed prefill, two ABAB passes, previous packet vs this one, % floor = max(weight
+read, FLOPs at 1979 TF) over measured, riders' top-1 vs a decode step of the same rows:
+
+| rows x prefix x riders | previous ms | new ms | change | % floor (prev / new) | rider top1 (prev / new) |
+|---|---|---|---|---|---|
+| 128 x 0 x 0 | 13.04 | 10.05 | -22.9% | 30 / 38 | |
+| 128 x 0 x 29 | 18.51 | 15.03 | -18.8% | 21 / 26 | 21/29 / 25/29 |
+| 128 x 4096 x 0 | 18.06 | 15.03 | -16.8% | 21 / 26 | |
+| 128 x 4096 x 29 | 23.38 | 19.86 | -15.1% | 16 / 19 | 21/29 / 25/29 |
+| 256 x 0 x 0 | 14.77 | 11.34 | -23.2% | 26 / 34 | |
+| 256 x 4096 x 18 | 26.69 | 23.11 | -13.4% | 14 / 17 | 13/18 / 15/18 |
+| 512 x 0 x 0 | 19.78 | 16.25 | -17.8% | 31 / 38 | |
+| 512 x 4096 x 29 | 39.34 | 35.38 | -10.1% | 18 / 20 | 21/29 / 25/29 |
+| 1024 x 4096 x 8 | 50.16 | 45.35 | -9.6% | 26 / 29 | 6/8 / 3/8 |
+| 1152 x 4096 x 0 | 52.06 | 46.71 | -10.3% | 29 / 32 | |
+| 2048 x 4096 x 0 | 76.02 | 68.91 | -9.3% | 35 / 38 | |
+| 2048 x 4096 x 29 | 85.91 | 78.60 | -8.5% | 31 / 34 | 20/29 / 26/29 |
+| 2112 x 4096 x 29 | 137.00 | 122.89 | -10.3% | 20 / 23 | 19/29 / 21/29 |
+| 4096 x 4096 x 29 | 165.98 | 154.68 | -6.8% | 33 / 35 | 19/29 / 21/29 |
+
+All 90 cells (rows 128..4096 incl. 1088/1152/2112 x prefix 0/4096 x riders 0/1/8/18/29) are
+6.8-23.2% faster; rider-vs-step agreement and max KL stay in the previous packet's range (riders
+are random-token rows; 29 riders agree 19-21 before, 21-26 now; 8 riders 4-6 before, 1-3 now). Digests change (reduction
+order). Decode rungs unchanged (byte-identical decode objects).
+
+FP32-reference gate c16, four runs: PASS / PASS / PASS / FAIL by one case (cont_decisive 41, 43,
+41, 40 of 46 against the 41 floor = vLLM 42 - 0.022); kl_trim 0.045-0.048 (previous 0.056, vLLM
+0.065), kl_p99 1.79-2.01 (2.59, vLLM 3.19), top1_decisive 0.985-0.987 (0.984), needle 1.
+
+Production mix, `campaign.py report` (`grid-pf2/report2`, gate `pf2-c16b`), MATCHED + EQUIVALENT:
+
+| Metric | 1.8/s Baseline | 1.8/s Infervisor | 2.7/s Baseline | 2.7/s Infervisor |
+|---|---|---|---|---|
+| Total throughput | 42,238 tok/s | 41,978 tok/s (0.99x) | 55,471 tok/s * | 55,121 tok/s (0.99x) * |
+| TTFT P99 | 798.6 ms * | 992.2 ms (1.24x) * | 1,126.4 ms * | 1,410.0 ms (1.25x) * |
+| TPOT P99 | 55.97 ms | 55.31 ms (0.99x) * | 136.75 ms * | 111.53 ms (0.82x) |
+| SLO met (supplementary) | 100.0% | 100.0% | 95.7% | 97.2% (was 87.7%) |
+
+Goodput at 2.7/s 9.005 vs 8.902 req/s. TTFT P99 still 1.24-1.25x (spread 14-44% over two
+repeats). A ladder without the rider spill rungs (1088/1152/2112/4160/4224, riders always trimmed
+into the bucket) lost at 2.7/s: SLO met 97.1% / 89.7%, TTFT P99 1681 / 2615 ms per repeat.
+Next: the hd512 prefill attention under a cached prefix (KV split for small query counts), the
+FP8 projections (~13 us cuBLASLt minimum per call; algorithm search or q|k|v and gate|up
+concatenation).
+
 ## 2026-10-27: native vs cuBLASLt route sweep (Gemma-4 12B FP8)
 
 Protocol: `step_bench` on one H100, decode 48 steps `--spread`, prefill `--packed-prefill --pf-reps 3`

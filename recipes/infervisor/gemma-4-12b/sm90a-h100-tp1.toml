@@ -58,6 +58,19 @@
 # 0.99x, TTFT P99 1.21x, TPOT P99 1.21x; 2.7/s 0.99x / 2.02x / 1.01x, SLO met 87.7% vs 95.7%
 # (was 54.3%). Still behind vLLM: mixed prefill+rider ticks are 60-67% of the 2.7/s wall and small
 # prefill buckets run at 22-30 ms (128-512 rows). Evidence: /opt/dlami/nvme/lava-tts/g12-decode.
+# 2026-10-27 (plow_git 843300f8, packet a0464475f8ab, decode objects unchanged): packed prefill.
+# A 128-row launch was 13.1 ms against a 3.9 ms weight floor, 3.0 ms of it the interpreter's
+# norm/quant segments (31 us each, one CTA per SM). Now the light norm pair carries the FP8 quant
+# (QNORM_FUSE), the FP8-KV segment object carries the light rope route (ROPE_PF) and the norm pair
+# runs one block per row up to 1152 rows (PLOW_PF_NORM_ROW_BLOCKS; 2048 neutral, 4096 +0.6 ms).
+# step_bench packed prefill, 2 ABAB passes, prefix 0 / 4096, riders 0/1/8/18/29, ms: 128 rows
+# 13.0 -> 10.0 / 18.1 -> 15.0, 512 19.8 -> 16.3 / 23.9 -> 20.3, 1024 33.1 -> 29.0, 2048 + 4K
+# 76.0 -> 68.9, 4096 + 4K 158.1 -> 144.2; every rung 7-23% faster, riders' top1 vs a decode step
+# in the previous packet's range. FP32-reference gate c16 PASS 3 of 4 runs (cont_decisive 41 / 43 /
+# 41 / 40 of 46 against a 41 floor; kl_trim 0.045-0.048 vs 0.056 before, vLLM 0.065). Production
+# mix vs vLLM 0.29 (MATCHED + EQUIVALENT): 1.8/s tok/s 0.99x, TTFT P99 1.24x, TPOT P99 0.99x; 2.7/s
+# 0.99x / 1.25x / 0.82x, goodput 9.005 vs 8.902 req/s, SLO met 97.2% vs 95.7% (was 87.7%). A ladder
+# without the rider spill rungs (1088/1152/2112/4160/4224) lost at 2.7/s (SLO met 89.7-97.1%).
 #
 # Routes (per-rung evidence: docs/runtime/kernel-generators.md "Gemma-4 12B FP8 per-rung routes"):
 #   prefill projections   cuBLASLt FP8 OUTER_VEC where it wins (segment_roles::cublaslt_prefill_fp8),
@@ -77,7 +90,7 @@ namespace = "infervisor"
 name = "gemma-4-12b"
 label = "sm90a-h100-tp1"
 status = "validated"
-plow_git = "98347bfaca76c68d787a4bcfe3f164b3823e8b7f"
+plow_git = "843300f8624cde2d253bdbb7872b34fbe5d818de"
 network = "gemma4"
 
 [target]
@@ -112,7 +125,9 @@ PLOW_GLU_QUANT_FUSE = "1"
 # Decode B=128 attention: light FP8 attention, 16-byte K loads, direct V conversion. The light
 # module then carries the segmented hd256 FlashDecode grid (plowrt cublaslt.rs fp8_flash256).
 # Decode attention below 128 (2026-10-27): hd256 FP8 row-group body + staged ring, hd512 TC16 item.
-NVCC_APPEND_FLAGS = "-DPLOW_NV_GLU_QUANT_CACHE=1 -DPLOW_NV_GLU_QUANT_WPR=1 -DPLOW_NV_LIGHT_FP8_ATTN=1 -DPLOW_FP8_LD16=1 -DPLOW_FP8_FAST=1 -DPLOW_NV_FA_RG8=2 -DPLOW_NV_FA_RG8S=1 -DPLOW_NV_RAW_NARROW=1 -DPLOW_NV_INST_PRELOAD=1 -DPLOW_NV_FA_TC16=1"
+# Prefill (2026-10-27): ROPE_PF gives the packed-prefill FP8-KV segment object (built here, not by
+# [objects]) the light rope route; QNORM_FUSE folds the quant into the light norm pair.
+NVCC_APPEND_FLAGS = "-DPLOW_NV_GLU_QUANT_CACHE=1 -DPLOW_NV_GLU_QUANT_WPR=1 -DPLOW_NV_LIGHT_FP8_ATTN=1 -DPLOW_FP8_LD16=1 -DPLOW_FP8_FAST=1 -DPLOW_NV_FA_RG8=2 -DPLOW_NV_FA_RG8S=1 -DPLOW_NV_RAW_NARROW=1 -DPLOW_NV_INST_PRELOAD=1 -DPLOW_NV_FA_TC16=1 -DPLOW_NV_ROPE_PF=1"
 PLOW_FP8 = "1"
 PLOW_W8A8 = "1"
 PLOW_FP8_KV = "1"
@@ -140,6 +155,7 @@ PLOW_EMIT_DECODE_CUBLASLT_HEAD = "1"
 PLOW_EMIT_PREFILL_CUBLASLT = "1"
 PLOW_PF_LADDER_APPEND = "256,1088,1152,2112,4160,4224"
 PLOW_FUSE_ARGMAX = "1"
+PLOW_QNORM_FUSE = "1"
 
 [objects]
 script = "scripts/build_sm90a_gemma4_segments.sh"
@@ -171,6 +187,7 @@ PLOW_VMM_LIVE_RINGS = "0"
 PLOW_MULTISTEP = "0"
 PLOW_DECODE_MAX_RUNG = "128"
 PLOW_TOKEN_BATCH = "1"
+PLOW_PF_NORM_ROW_BLOCKS = "1152"
 
 [bench]
 backend = "openai"
