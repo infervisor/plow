@@ -1393,10 +1393,20 @@ fn tuning(s: &Shapes, arch: &str) -> Map<String, Value> {
     if s.full_kv_heads == 1 && s.gqa > 0 {
         // The template is instantiated at 1|2|4|8; 16 (the whole Gemma-4-12B group, one K/V
         // stream for all 16 heads) only when the emit asks for it, on the wide-reduction arm.
+        // An emit that names the group (PLOW_ATTENTION_DECODE_BALANCE_GF or PLOW_FA_GF_FULL) gets
+        // the object it sized the full-layer nsplit for (`fa_gf_full`); the FP8-KV row-group
+        // decode body takes GF <= 4.
         let gf = next_pow2(s.gqa).min(8);
         let gf = if s.gqa % gf == 0 { gf } else { 1 };
-        let gf = if crate::emit_config::active().fa_gf_full == Some(16) && s.gqa == 16 {
-            16
+        let cfg = crate::emit_config::active();
+        let gf = if cfg.attention_decode_balance_gf.is_some() || cfg.fa_gf_full.is_some() {
+            let v = crate::fa_gf_full();
+            assert!(
+                s.gqa % v == 0,
+                "full-layer decode GF {v} must divide the GQA group {}",
+                s.gqa
+            );
+            v
         } else {
             gf
         };
