@@ -33,7 +33,8 @@ trap pb_serve_stop EXIT
 BUDGET=${BUDGET:-32}
 END=${REASONING_END:-$'\nStop. Replying now, in the caller\'s language, one question only.<channel|>'}
 
-# name|env overrides, base first.
+# name|env overrides, base first. THINKING_GATE_ARMS replaces them, `;`-separated (a packet
+# without a drafter has no speculative arm).
 ARMS=(
     "base|PLOW_DECODE_PIPELINE=1 PLOW_SPEC=1 PLOW_MULTISTEP=0"
     "nopipe|PLOW_DECODE_PIPELINE=0 PLOW_SPEC=1 PLOW_MULTISTEP=0"
@@ -41,6 +42,9 @@ ARMS=(
     "multistep|PLOW_DECODE_PIPELINE=0 PLOW_SPEC=0 PLOW_MULTISTEP=8"
     "plain|PLOW_DECODE_PIPELINE=0 PLOW_SPEC=0 PLOW_MULTISTEP=0"
 )
+if [ -n "${THINKING_GATE_ARMS:-}" ]; then
+    IFS=';' read -r -a ARMS <<< "$THINKING_GATE_ARMS"
+fi
 
 serve_arm() { # <name> [VAR=value ...] — the arm's environment reaches only its server
     local name=$1 kv port
@@ -51,10 +55,10 @@ serve_arm() { # <name> [VAR=value ...] — the arm's environment reaches only it
     pb_serve_wait 1800
 }
 
-requests() { # <name> <model> — every gate's requests against the running arm
-    python3 - "$PB_SERVER_PORT" "$2" "$BUDGET" "$END" "$out/$1.json" "$1" <<'PYEOF'
+requests() { # <name> <model> <first: 1|0> — every gate's requests against the running arm
+    python3 - "$PB_SERVER_PORT" "$2" "$BUDGET" "$END" "$out/$1.json" "$3" <<'PYEOF'
 import json, sys, urllib.request
-port, model, budget, end, dst, arm = sys.argv[1], sys.argv[2], int(sys.argv[3]), sys.argv[4], sys.argv[5], sys.argv[6]
+port, model, budget, end, dst, first = sys.argv[1], sys.argv[2], int(sys.argv[3]), sys.argv[4], sys.argv[5], sys.argv[6] == "1"
 prompts = [
     "Hello, who is this?",
     "मेरा पार्सल कब आएगा?",
@@ -75,7 +79,7 @@ for i, p in enumerate(prompts):
     budget_body = {"messages": m, "temperature": 0, "thinking_token_budget": budget, "reasoning_end": end}
     res[f"f1.{i}"] = ask(budget_body)
     res[f"f2.{i}"] = ask({**budget_body, "presence_penalty": 0.5, "repetition_penalty": 1.1})
-    if arm == "base":
+    if first:
         res[f"f1.nobudget.{i}"] = ask({"messages": m, "temperature": 0})
         seeded = {"messages": m, "temperature": 1.0, "seed": 7, "thinking_token_budget": budget, "reasoning_end": end}
         res[f"f4.{i}.a"] = ask(seeded)
@@ -91,11 +95,13 @@ model=$(pb_model_id)
 pb_serve_stop
 printf '{"%s": {"newline_grace": 4}}\n' "$model" > "$out/chat-defaults.json"
 
+first=1
 for arm in "${ARMS[@]}"; do
     name=${arm%%|*}
     # shellcheck disable=SC2086
     serve_arm "$name" ${arm#*|} "PLOW_CHAT_DEFAULTS=$out/chat-defaults.json" || exit 1
-    requests "$name" "$model"
+    requests "$name" "$model" "$first"
+    first=0
     pb_serve_stop
 done
 

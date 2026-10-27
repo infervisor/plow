@@ -443,13 +443,13 @@ ended first those bytes were simply dropped, so streamed `reasoning_content` cam
 
 ### Thinking control
 
-On a model whose trace markers are special tokens (Gemma 4), a chat request may bound its trace
+On a model whose trace markers are single tokens (Qwen3's `<think>`) or special-token-led (Gemma 4), a chat request may bound its trace
 and its reply. The mux commits every generated id through `serve::think::ThinkCtl`; it needs no
 logits, so it works on every backend.
 
 | Field | Meaning |
 |---|---|
-| `thinking_token_budget` | vLLM's name and meaning: tokens allowed inside each trace block, a hard cap. A block that reaches it gets `reasoning_end` committed in place of the model's next tokens. `0` renders the template's thinking-off prompt (no thinking beats a truncated trace at small budgets); `-1` / absent = no budget. Below `-1` is a 400. A positive budget on a model whose markers are not special tokens is a 400. |
+| `thinking_token_budget` | vLLM's name and meaning: tokens allowed inside each trace block, a hard cap. A block that reaches it gets `reasoning_end` committed in place of the model's next tokens. `0` renders the template's thinking-off prompt (no thinking beats a truncated trace at small budgets); `-1` / absent = no budget. Below `-1` is a 400. A positive budget on a model whose open marker is neither one token nor led by a special token, or whose close marker is not one token, is a 400. |
 | `max_reply_tokens` | plow extension: tokens after the trace. Reaching it ends the request with `finish_reason: "length"` and `x_plow_finish_reason: "reply_cap"`. At least 1 and at most `max_tokens`. |
 | `reasoning_end` | plow extension: what ends a block over budget, a bridge sentence and then the close marker (`"…Replying now.<channel\|>"`); empty or absent = the marker alone. Must end with the marker (400 otherwise). A forced end the model already began is resumed, not repeated. |
 
@@ -523,7 +523,17 @@ a measured improvement:
 | `reply_first_bias` | `{"<token text>": bias}` on the first two reply tokens, each text a single token (e.g. `{"*": -10, "Wait": -10}`) |
 | `ban_reopen` | −100 on the open marker while replying (a re-opened block is already handled; this removes it) |
 | `close_ramp` | `{"tokens": K, "bias": B}`: at line ends over a block's last K budget tokens, a bias on the close marker rising to B (needs a budget) |
-| `early_exit_rank` | at a line end inside a trace, close the block when the close marker's logit ranks below N; such a request's trace decodes one host-fed token per step |
+| `early_exit_rank` | at a line end inside a trace, close the block when the close marker's logit ranks below N |
+
+A rule's bias is set once the host has seen the token that triggers it (a line end, a close), so
+inside each rule's window — the ramp's last K budget tokens, the whole trace with
+`early_exit_rank` or `reply_first_bias`, the first two reply tokens — the request decodes one
+host-fed token per step: a device-chained step would have taken the next token by its own argmax
+before the bias existed. Measured on Qwen3-0.6B (RTX 4050, sm_89, 10 voice turns, greedy, budget
+64): `reply_first_bias {"Hello": -100}` changed the one reply that opened with it; `close_ramp`
+48/100 let 2 of 10 blocks close before the budget (mean trace 77 → 72 tokens), 48/20 none;
+`early_exit_rank` 20 never fired on this model (its close marker ranks low until the trace is
+done).
 
 GPU soundness gates for all of the above (byte-identical output across the chained decode paths
 under forcing, seeded reproducibility, no-budget TPOT): `scripts/bench/thinking_gates.sh`, run

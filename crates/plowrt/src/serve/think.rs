@@ -51,8 +51,8 @@ pub struct ThinkMarkers {
 }
 
 impl ThinkMarkers {
-    /// `open` must begin with a special token and `close` must be exactly one: a marker spread
-    /// over ordinary tokens cannot be told from prose by id.
+    /// `open` must be one token or begin with a special token, and `close` must be one token: a
+    /// marker spread over ordinary tokens cannot be told from prose by id.
     pub fn tokenize(
         tok: &dyn crate::text::tokenizer::Tokenize,
         specials: &crate::serve::tools::SpecialText,
@@ -65,9 +65,11 @@ impl ThinkMarkers {
         let (Some(&open_id), Some(text)) = (o.first(), first) else {
             return Err(format!("the open marker {open:?} encodes to no tokens"));
         };
-        if !specials.any_in(&text) || !open.starts_with(text.as_str()) {
+        // One token (Qwen3's `<think>`, an added token), or a special token then a label
+        // (Gemma 4's `<|channel>` + `thought`).
+        if o.len() != 1 && (!specials.any_in(&text) || !open.starts_with(text.as_str())) {
             return Err(format!(
-                "the open marker {open:?} does not start with a special token ({o:?})"
+                "the open marker {open:?} is neither one token nor led by a special token ({o:?})"
             ));
         }
         let [close_id] = c[..] else {
@@ -378,11 +380,7 @@ impl ThinkCtl {
     /// How many tokens a chained path may produce before the host must see one: a replacement
     /// can only land on the last of them. `usize::MAX` when nothing can be replaced.
     pub fn chain_left(&self) -> usize {
-        // `early_exit_rank` may close at any line end of a trace: every trace token is host-fed.
-        if self.forcing.is_some()
-            || self.due
-            || (self.phase == Phase::Trace && self.lim.bias.early_exit_rank.is_some())
-        {
+        if self.forcing.is_some() || self.due || self.steer_window() {
             return 1;
         }
         let n = match (self.lim.budget, self.phase) {
@@ -398,6 +396,26 @@ impl ThinkCtl {
             n.min(LIVE_CHAIN as usize)
         } else {
             n
+        }
+    }
+
+    /// A steering bias may apply to the next token, set only once the host has seen this one (a
+    /// line end, a close): the device must not have computed that token by its own argmax already.
+    fn steer_window(&self) -> bool {
+        let b = &self.lim.bias;
+        match self.phase {
+            // `early_exit_rank` and the first reply tokens follow any line end or close.
+            Phase::Deciding | Phase::Trace
+                if b.early_exit_rank.is_some() || !b.reply_first.is_empty() =>
+            {
+                true
+            }
+            Phase::Trace => b
+                .close_ramp
+                .zip(self.lim.budget)
+                .is_some_and(|((k, _), budget)| self.trace_n + 1 >= budget.saturating_sub(k)),
+            Phase::Reply => self.reply_n < 2 && !b.reply_first.is_empty(),
+            Phase::Deciding => false,
         }
     }
 
@@ -625,6 +643,21 @@ mod tests {
             1,
             "an early exit can land on any trace token"
         );
+        // the ramp window and the first reply tokens are host-fed; outside them chains run
+        let mut t = ctl(Some(10), None, &[CLOSE], 0, true);
+        t.lim.bias.close_ramp = Some((4, 5.0));
+        assert_eq!(t.chain_left(), 11);
+        for _ in 0..5 {
+            t.commit(1);
+        }
+        assert_eq!(t.chain_left(), 1, "trace_n 5: the ramp starts at 6");
+        let mut t = ctl(Some(10), None, &[CLOSE], 0, true);
+        t.lim.bias.reply_first = vec![(50, -5.0)];
+        assert_eq!(t.chain_left(), 1, "a close could come next");
+        t.commit(CLOSE);
+        t.commit(5);
+        t.commit(6);
+        assert_eq!(t.chain_left(), 12, "past the first two reply tokens");
     }
 
     /// The verify's span for a forcing row: `[pending, forced ids…]`. Whatever the target accepts
