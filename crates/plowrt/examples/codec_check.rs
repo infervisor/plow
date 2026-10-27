@@ -44,6 +44,40 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     for j in jobs {
         out.extend(j.await??);
     }
+    // CODEC_STREAM_STEP=N: decode the first item again through the stateful stream steps (one
+    // frame, then N-frame steps), written to OUT.f32.stream for comparison with the whole decode.
+    if let Some(step) = std::env::var("CODEC_STREAM_STEP")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+    {
+        let fc = codec.frame_codes;
+        let mut slot = codec.acquire_slot().ok_or("codec has no stream slot")?;
+        let mut pcm = Vec::new();
+        let mut f = 0;
+        let t = std::time::Instant::now();
+        while f < frames {
+            let n = if f == 0 { 1 } else { step.min(frames - f) };
+            pcm.extend(
+                codec
+                    .step(
+                        &mut slot,
+                        codes[f * fc..(f + n) * fc].to_vec(),
+                        n,
+                        plowrt::tts::codec::Urgency::Stream,
+                    )
+                    .await?,
+            );
+            f += n;
+        }
+        eprintln!(
+            "stream decode {frames} frames in {:.3} ms",
+            t.elapsed().as_secs_f64() * 1e3
+        );
+        std::fs::write(
+            format!("{}.stream", args[5]),
+            bytemuck::cast_slice(&pcm),
+        )?;
+    }
     let t = std::time::Instant::now();
     for _ in 0..20 {
         codec
