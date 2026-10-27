@@ -7,11 +7,15 @@ fn main() {
     let msgs_json = std::env::args().nth(2).expect("messages json");
     let msgs: Vec<serde_json::Value> = serde_json::from_str(&msgs_json).expect("messages");
     match ChatTemplate::load(std::path::Path::new(&dir)) {
-        None => println!(
+        Ok(None) => println!(
             "{}",
             serde_json::json!({"source": null, "out": null, "err": "NO TEMPLATE"})
         ),
-        Some(t) => match t.render(&msgs) {
+        Err(e) => println!(
+            "{}",
+            serde_json::json!({"source": null, "out": null, "err": e})
+        ),
+        Ok(Some(t)) => match t.render(&msgs) {
             Ok(out) => println!(
                 "{}",
                 serde_json::json!({"source": t.source, "out": out, "err": null})
