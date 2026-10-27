@@ -5734,6 +5734,7 @@ impl GpuEngine {
                     && qwen_light_grid >= blob.decode_progs().iter().map(|g| g.t).max().unwrap_or(0)
             });
         let qwen_light_conv = light_functions.as_ref().is_some_and(|f| f.prefill_conv);
+        let qwen_light_norm = light_functions.as_ref().and_then(|f| f.qwen_norm);
         let main_qwen_light = match qwen_light_pf {
             Some(_) if !cublaslt_segments.is_empty() => {
                 cublaslt::qwen_decode_light_segments(g, &main_folds, qwen_light_conv, |seg| {
@@ -5924,6 +5925,7 @@ impl GpuEngine {
                 &mut cublaslt_decode,
                 &be,
                 function,
+                qwen_light_norm,
                 kernarg,
                 g,
                 &main_qwen_light,
@@ -6176,6 +6178,7 @@ impl GpuEngine {
                                 &mut routes,
                                 &be,
                                 function,
+                                qwen_light_norm,
                                 rung.kernarg,
                                 g,
                                 &qwen_light,
@@ -14738,12 +14741,27 @@ impl GpuEngine {
     /// reports only launches after this call (drop prefill/warmup). No-op on
     /// a normal cubin.
     pub fn trace_reset(&self) -> Result<()> {
-        self.be.module_global_zero(&self.module, "g_tr_n", 4)?;
-        self.be
-            .module_global_zero(&self.module, "g_tl_cnt", 160 * 4)?;
-        self.be
-            .module_global_zero(&self.module, "g_tl_ph", 160 * 3 * 8)?;
+        for m in self.decode_trace_modules() {
+            self.be.module_global_zero(m, "g_tr_n", 4)?;
+            self.be.module_global_zero(m, "g_tl_cnt", 160 * 4)?;
+            self.be.module_global_zero(m, "g_tl_ph", 160 * 3 * 8)?;
+        }
         Ok(())
+    }
+
+    /// The main decode object, then the routed and wide-rung objects a rung may launch instead.
+    fn decode_trace_modules(&self) -> Vec<&Module> {
+        let mut v: Vec<&Module> = vec![&self.module];
+        if let Some(r) = &self._routed_object {
+            v.push(r.module());
+        }
+        v.extend(
+            self.gemv_wide_modules
+                .iter()
+                .flatten()
+                .map(|gw| gw.module()),
+        );
+        v
     }
 
     /// [`Self::trace_summary`] against the PREFILL module (`-DPLOW_NV_TRACE=1`
@@ -14778,7 +14796,18 @@ impl GpuEngine {
     /// the absolute total (clock64 in the recording thread over-reports). See
     /// the trace header in interp_sm120.cu.
     pub fn trace_summary(&self) -> Result<Option<String>> {
-        self.trace_summary_of(&self.module)
+        let mut out: Option<String> = None;
+        for (i, m) in self.decode_trace_modules().into_iter().enumerate() {
+            if let Some(s) = self.trace_summary_of(m)? {
+                let s = if i == 0 {
+                    s
+                } else {
+                    format!("\n  [decode object {i}] {s}")
+                };
+                out.get_or_insert_with(String::new).push_str(&s);
+            }
+        }
+        Ok(out)
     }
 
     fn trace_summary_of(&self, module: &Module) -> Result<Option<String>> {

@@ -4210,6 +4210,20 @@ extern "C" __global__ void PLOW_LIGHT_PF_BOUNDS PLOW_SYM(plow_sm120_light_pf)(Pl
 }
 #if PLOW_NV_QWEN_GDN
 extern "C" __device__ unsigned PLOW_SYM(plow_light_pf_qwen_conv) = 1;
+/* A routed decode rung's QwenRmsNorm on its own entry, one block per row: the register-resident
+ * row walk (d_qwen_rmsnorm<true, true>) spilled under light_pf's two-blocks-per-SM cap. */
+extern "C" __global__ void __launch_bounds__(PLOW_NV_THREADS)
+    PLOW_SYM(plow_sm120_light_qnorm)(PlowProgram prog, unsigned inst) {
+    __shared__ float part[32];
+    const PlowDevInst* in = prog.insts + inst;
+    void* const* T = prog.tensors;
+#define LIGHT_TEN(k) (in->t[k] == PLOW_TENSOR_NONE ? nullptr : T[in->t[k]])
+    if (in->op != PLOW_DOP_QWEN_RMSNORM) __trap();
+    d_qwen_rmsnorm<true, true>((__nv_bfloat16*)LIGHT_TEN(0), (const __nv_bfloat16*)LIGHT_TEN(1),
+        (const __nv_bfloat16*)LIGHT_TEN(2), (const int*)LIGHT_TEN(3), in->i[0], in->i[1],
+        in->fj[0].f, in->fj[1].f, blockIdx.x, gridDim.x, part, (const __nv_bfloat16*)LIGHT_TEN(4));
+#undef LIGHT_TEN
+}
 #endif
 #if PLOW_NV_GEMMA
 extern "C" __device__ unsigned PLOW_SYM(plow_light_gemma) = 1;

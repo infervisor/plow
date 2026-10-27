@@ -27,6 +27,7 @@
 #define plow_sm120_light_head plow_sm89_light_head
 #define plow_sm120_light_flash plow_sm89_light_flash
 #define plow_sm120_light_pf plow_sm89_light_pf
+#define plow_sm120_light_qnorm plow_sm89_light_qnorm
 #define plow_sm120_rider_flash256 plow_sm89_rider_flash256
 #define plow_sm120_rider_flash512 plow_sm89_rider_flash512
 #define plow_sm120_rider_merge plow_sm89_rider_merge
