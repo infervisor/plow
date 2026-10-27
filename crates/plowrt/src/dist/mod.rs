@@ -16,6 +16,11 @@ pub mod fetch;
 /// directory. Publish-side only, like `pack` itself: `serve` never calls it.
 #[cfg(feature = "dist")]
 pub mod manifest;
+/// NAR serialisation and the store path name a tree's hash yields: the
+/// identity a published bundle will go by (`docs/arch/27`). Publish-side,
+/// like `manifest`.
+#[cfg(feature = "dist")]
+pub mod nar;
 pub mod prepare;
 pub mod pull;
 pub mod reference;
