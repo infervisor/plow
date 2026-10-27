@@ -84,6 +84,9 @@ PLOW_GEMMA_MOE_ROUTER_EXACT = "0"
 PLOW_EMIT_DECODE_CUBLASLT = "1"
 PLOW_EMIT_DECODE_CUBLASLT_MIN_ROWS = "16"
 PLOW_EMIT_DECODE_CUBLASLT_HEAD = "1"
+# Interpreter object flags the FP8 recipe already carries (packed narrow bodies, instruction
+# preload, router V8/V9, top-k V4): token digests unchanged, step -0.1..-0.27 ms at B1..32.
+NVCC_APPEND_FLAGS = "-DPLOW_NV_RAW_NARROW=1 -DPLOW_NV_INST_PRELOAD=1 -DPLOW_NV_ROUTER_V8=1 -DPLOW_NV_TOPK_V4=1 -DPLOW_NV_ROUTER_V9=1"
 
 [objects]
 script = "scripts/build_sm90a_gemma4_segments.sh"

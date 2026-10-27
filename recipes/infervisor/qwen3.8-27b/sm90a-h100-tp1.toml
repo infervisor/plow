@@ -209,6 +209,9 @@ PLOW_EMIT_DECODE_CUBLASLT_MIN_ROWS = "4"
 # identical through B32; grid94 4K c16 tok/s 226.3 -> 229.1).
 PLOW_NV_GEMV_REM_SPLIT = "1"
 PLOW_NV_GEMV_K8_B1 = "1"
+# Packed narrow bodies and instruction preload in the interpreter objects: token digests
+# unchanged, B1 -0.2 ms.
+NVCC_APPEND_FLAGS = "-DPLOW_NV_RAW_NARROW=1 -DPLOW_NV_INST_PRELOAD=1"
 
 # PLOW_VMM_LIVE: KV reserved virtually at the ceiling, physical commit per admitted slot and rows
 # (flat KV is 1 GiB per slot at 16K). Under PLOW_VMM_LIVE the prefix cache is not auto-selected,
