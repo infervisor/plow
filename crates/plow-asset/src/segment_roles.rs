@@ -297,9 +297,11 @@ pub fn cublaslt_prefill_fp8(profile: &str, m: u32, n: u32, k: u32) -> bool {
         && (CUBLASLT_PREFILL_GEMMA4_SHAPES.contains(&(n, k))
             || CUBLASLT_PREFILL_GEMMA4_26B_SHAPES.contains(&(n, k))
             || CUBLASLT_PREFILL_GEMMA4_31B_SHAPES.contains(&(n, k))
-            // Qwen3.8 W8A8: the whole packed prefill 4.1-4.5x faster than the native W8A8 GEMM at
-            // 1024-8192 rows (H100 route sweep 2026-10-26: 4096 rows 1232 -> 277 ms).
-            || CUBLASLT_PREFILL_QWEN3_8_27B_SHAPES.contains(&(n, k)))
+            // Qwen3.8 W8A8, only at its measured buckets: the packed prefill 2.5-4.5x faster than
+            // the native W8A8 GEMM at 128-8192 rows (H100 route sweep 2026-10-26: 4096 rows
+            // 1232 -> 277 ms).
+            || CUBLASLT_PREFILL_QWEN3_8_27B_SHAPES.contains(&(n, k))
+                && [128, 1024, 4096, 8192].contains(&m))
         && !((n, k) == (3840, 15360) && m >= 2048)
         // 31B down_proj: the native ws384 FP8 body measured 7-15% faster at 512 and >= 2048 rows
         // (route matrix, H100 2026-10-09: 0.122 vs 0.136 ms at 512, 1.336 vs 1.573 at 8192).
@@ -859,6 +861,11 @@ mod tests {
             for (n, k) in super::CUBLASLT_PREFILL_QWEN3_8_27B_SHAPES {
                 assert!(super::cublaslt_prefill_fp8("sm90a", m, n, k));
                 assert!(!super::cublaslt_prefill_fp8("sm120", m, n, k));
+            }
+        }
+        for m in [64, 256, 512, 1088, 2048, 4160] {
+            for (n, k) in super::CUBLASLT_PREFILL_QWEN3_8_27B_SHAPES {
+                assert!(!super::cublaslt_prefill_fp8("sm90a", m, n, k));
             }
         }
     }
