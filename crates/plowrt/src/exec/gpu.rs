@@ -10729,8 +10729,8 @@ impl GpuEngine {
                 } else {
                     None
                 };
-                let norm_rms_abi = be
-                    .module_global_u32(&m1, &format!("plow_norm_rms_pf_abi{seg_global_suffix}"))?;
+                let norm_rms_abi =
+                    be.module_global_u32(&m1, &format!("plow_norm_rms_pf_abi{seg_global_suffix}"))?;
                 let norm_rms_pf = if matches!(norm_rms_abi, Some(1 | 2)) {
                     Some(be.get_function(&m1, &format!("plow_norm_rms_pf{seg_global_suffix}"))?)
                 } else {

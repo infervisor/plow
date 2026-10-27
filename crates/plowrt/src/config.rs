@@ -1642,7 +1642,12 @@ pub struct NvidiaRuntimeConfig {
     /// Prefill light NormResidual+RmsNorm launches of at most this many rows run one block per
     /// row when the segment object supports it (`plow_norm_rms_pf` ABI 2); larger launches keep
     /// one warp per row. 0 = always warp per row.
-    #[arg(long = "pf-norm-row-blocks", env = "PLOW_PF_NORM_ROW_BLOCKS", default_value_t = 0, global = true)]
+    #[arg(
+        long = "pf-norm-row-blocks",
+        env = "PLOW_PF_NORM_ROW_BLOCKS",
+        default_value_t = 0,
+        global = true
+    )]
     pub pf_norm_row_blocks: u32,
 
     /// `<cubin sha256>:<host library sha256>` of `cutlass_fp8_decode_sm90.cubin` and its Params
