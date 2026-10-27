@@ -337,20 +337,25 @@ During the run, plowrt was found to omit a stop token from completions logprobs 
 
 ## 2026-10-27: native vs cuBLASLt route sweep (Gemma-4 12B FP8)
 
-Protocol: `step_bench` on one H100 (plowrt bin34 6a4b75bc for current packets and emit-time
-variants without code changes; plowrt 69215b1e = commit 8b811e45 for the Qwen arms), decode 48 steps
-`--spread`, prefill `--packed-prefill --pf-reps 3` (best timed rep), two passes ABAB, current arm =
-the abi2 packet of the recipe at 21ab0d7d, alternative = the same recipe with one route knob changed
-(emit knob: re-emitted with the same plowc; runtime knob: same packet). ms = mean of the two passes
-(passes agree within 1%). % floor = calibrated floor / measured: decode bytes (weights streamed once,
-MoE experts touched at top-8 of 128, KV rows) / 3.35 TB/s; prefill max(FLOP / peak, bytes / 3.35
-TB/s), peak 1979 TF/s FP8, 990 BF16 (MoE floors approximate). digest = TOK_STREAM fnv of the run.
-Raw: /opt/dlami/nvme/lava-tts/route-sweep (A/, B/, C/, logs/, gates/).
+Protocol: `step_bench` on one H100, decode 48 steps `--spread`, prefill `--packed-prefill --pf-reps 3`
+(best timed rep), two passes ABAB (passes agree within 1%), ms = mean of the passes. Current arm =
+the abi2 packet of the recipe at 21ab0d7d. Alternative = either the same packet with one runtime
+knob set, or a re-emit of the recipe with the emit knobs named in the table title changed (Qwen:
+the decode threshold moves together with `PLOW_QWEN_GDN_ISOLATE`, which plowrt requires; the FP8
+arms also need the devgen/policy commit 8b811e45, emitted with plowc built from it). Both arms of a
+table run on the same plowrt (named in the title where it is not bin34 6a4b75bc). % floor = floor /
+measured, floor = decode bytes (weights streamed once + KV rows) / 3.35 TB/s, prefill max(FLOP /
+peak, bytes / 3.35 TB/s) with peak 1979 TF/s FP8, 990 BF16; not reported for the MoE packets, whose
+routed expert bytes the model cannot bound. digest = TOK_STREAM fnv of the run (`equal` = both
+passes of both arms). `--same` slot agreement held on every arm (8/8 .. 64/64). Not measured: the
+4160/4224 rungs (they only occur with decode riders, which step_bench does not build) and, for the
+native prefill arms, the 1152 and 8192 rungs. Raw: /opt/dlami/nvme/lava-tts/route-sweep (A/, B/, C/,
+D/, logs/, gates/).
 
-Result: no change. Every switchable 12B route already runs the faster arm: cuBLASLt prefill
-projections beat the native FP8 GEMM at every rung (+5..+32% slower native), the fused qkv matmul
-and the compact terminal on cuBLASLt are equal or faster. Decode below rung 128 stays native: the
-2026-10-26 measurement above (cuBLASLt from 2 rows loses at B8/B16) was not repeated.
+Result: no change. cuBLASLt prefill projections beat the native FP8 GEMM at every measured rung
+(native +7..+31%); the fused qkv matmul on rung 128 and the compact terminal on cuBLASLt are equal
+or faster. Decode below rung 128 stays native per the 2026-10-26 measurement above (cuBLASLt from
+2 rows loses at B8/B16), not repeated here.
 
 
 **12B prefill projections: native FP8 GEMM instead of cuBLASLt (emit PLOW_EMIT_PREFILL_CUBLASLT=0)** (g12-base vs g12-pfnative)

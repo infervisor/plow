@@ -81,21 +81,26 @@ plow-vs-baseline claim. Raw: `res/serve1/`, gates `gate/n-*/`, rungs `res/rungs2
 
 ## 2026-10-27: native vs cuBLASLt route sweep (E4B)
 
-Protocol: `step_bench` on one H100 (plowrt bin34 6a4b75bc for current packets and emit-time
-variants without code changes; plowrt 69215b1e = commit 8b811e45 for the Qwen arms), decode 48 steps
-`--spread`, prefill `--packed-prefill --pf-reps 3` (best timed rep), two passes ABAB, current arm =
-the abi2 packet of the recipe at 21ab0d7d, alternative = the same recipe with one route knob changed
-(emit knob: re-emitted with the same plowc; runtime knob: same packet). ms = mean of the two passes
-(passes agree within 1%). % floor = calibrated floor / measured: decode bytes (weights streamed once,
-MoE experts touched at top-8 of 128, KV rows) / 3.35 TB/s; prefill max(FLOP / peak, bytes / 3.35
-TB/s), peak 1979 TF/s FP8, 990 BF16 (MoE floors approximate). digest = TOK_STREAM fnv of the run.
-Raw: /opt/dlami/nvme/lava-tts/route-sweep (A/, B/, C/, logs/, gates/).
+Protocol: `step_bench` on one H100, decode 48 steps `--spread`, prefill `--packed-prefill --pf-reps 3`
+(best timed rep), two passes ABAB (passes agree within 1%), ms = mean of the passes. Current arm =
+the abi2 packet of the recipe at 21ab0d7d. Alternative = either the same packet with one runtime
+knob set, or a re-emit of the recipe with the emit knobs named in the table title changed (Qwen:
+the decode threshold moves together with `PLOW_QWEN_GDN_ISOLATE`, which plowrt requires; the FP8
+arms also need the devgen/policy commit 8b811e45, emitted with plowc built from it). Both arms of a
+table run on the same plowrt (named in the title where it is not bin34 6a4b75bc). % floor = floor /
+measured, floor = decode bytes (weights streamed once + KV rows) / 3.35 TB/s, prefill max(FLOP /
+peak, bytes / 3.35 TB/s) with peak 1979 TF/s FP8, 990 BF16; not reported for the MoE packets, whose
+routed expert bytes the model cannot bound. digest = TOK_STREAM fnv of the run (`equal` = both
+passes of both arms). `--same` slot agreement held on every arm (8/8 .. 64/64). Not measured: the
+4160/4224 rungs (they only occur with decode riders, which step_bench does not build) and, for the
+native prefill arms, the 1152 and 8192 rungs. Raw: /opt/dlami/nvme/lava-tts/route-sweep (A/, B/, C/,
+D/, logs/, gates/).
 
 Result: no change. E4B already runs every projection on cuBLASLt (decode from 1 row, prefill on
 every bucket, head + PLE projection). The fused qkv matmul is 0.11-0.14 ms per step faster than
-separate projections; the cuBLASLt terminal 0.2-0.3 ms per prefill faster. The native prefill arm
-(`PLOW_EMIT_PREFILL_CUBLASLT=0`) cannot be served: every cell of that packet faults with
-CUDA_ERROR_LAUNCH_FAILED (an unused path; recorded, not fixed).
+separate projections; the cuBLASLt terminal 0.2-0.3 ms per prefill faster. Open defect: the native
+prefill arm (`PLOW_EMIT_PREFILL_CUBLASLT=0`) faults with CUDA_ERROR_LAUNCH_FAILED on every cell
+(its first launch), so that comparison does not exist; recorded, not fixed.
 
 
 **E4B PLOW_DECODE_LT_QKV=0** (e4b-base vs e4b-ltqkv0)

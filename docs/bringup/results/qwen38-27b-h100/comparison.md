@@ -76,32 +76,41 @@ lines), `grid43full/` (previous packet). Log: `plans/qwen38-27b-h100.md`.
 
 ## 2026-10-27: native vs cuBLASLt route sweep (Qwen3.8-27B BF16 and FP8)
 
-Protocol: `step_bench` on one H100 (plowrt bin34 6a4b75bc for current packets and emit-time
-variants without code changes; plowrt 69215b1e = commit 8b811e45 for the Qwen arms), decode 48 steps
-`--spread`, prefill `--packed-prefill --pf-reps 3` (best timed rep), two passes ABAB, current arm =
-the abi2 packet of the recipe at 21ab0d7d, alternative = the same recipe with one route knob changed
-(emit knob: re-emitted with the same plowc; runtime knob: same packet). ms = mean of the two passes
-(passes agree within 1%). % floor = calibrated floor / measured: decode bytes (weights streamed once,
-MoE experts touched at top-8 of 128, KV rows) / 3.35 TB/s; prefill max(FLOP / peak, bytes / 3.35
-TB/s), peak 1979 TF/s FP8, 990 BF16 (MoE floors approximate). digest = TOK_STREAM fnv of the run.
-Raw: /opt/dlami/nvme/lava-tts/route-sweep (A/, B/, C/, logs/, gates/).
+Protocol: `step_bench` on one H100, decode 48 steps `--spread`, prefill `--packed-prefill --pf-reps 3`
+(best timed rep), two passes ABAB (passes agree within 1%), ms = mean of the passes. Current arm =
+the abi2 packet of the recipe at 21ab0d7d. Alternative = either the same packet with one runtime
+knob set, or a re-emit of the recipe with the emit knobs named in the table title changed (Qwen:
+the decode threshold moves together with `PLOW_QWEN_GDN_ISOLATE`, which plowrt requires; the FP8
+arms also need the devgen/policy commit 8b811e45, emitted with plowc built from it). Both arms of a
+table run on the same plowrt (named in the title where it is not bin34 6a4b75bc). % floor = floor /
+measured, floor = decode bytes (weights streamed once + KV rows) / 3.35 TB/s, prefill max(FLOP /
+peak, bytes / 3.35 TB/s) with peak 1979 TF/s FP8, 990 BF16; not reported for the MoE packets, whose
+routed expert bytes the model cannot bound. digest = TOK_STREAM fnv of the run (`equal` = both
+passes of both arms). `--same` slot agreement held on every arm (8/8 .. 64/64). Not measured: the
+4160/4224 rungs (they only occur with decode riders, which step_bench does not build) and, for the
+native prefill arms, the 1152 and 8192 rungs. Raw: /opt/dlami/nvme/lava-tts/route-sweep (A/, B/, C/,
+D/, logs/, gates/).
 
-FP8 result: devgen + the segment_roles policy now route the W8A8 projections to cuBLASLt FP8
-(commit 8b811e45), and the recipe takes prefill on cuBLASLt plus decode from 2 rows (commit a3ee2457):
-prefill 4.1-4.5x faster (4096 rows 1232 -> 277 ms, 9% -> 39% of the FP8 floor, first-token digests
-identical), decode B2..B48 38-49% faster; B1 stays on the native M1 TMA GEMV. FP32 gate (packet
-2af45e892b75, plowrt 69215b1e) c1/c8/c32 PASS: kl_trim 0.0110/0.0099/0.0102 vs vLLM hub-FP8
-0.0147/0.0153/0.0179, top1_decisive 0.9939/0.9951/0.9951, cont_frac 0.731/0.765/0.736, needle 1.
+FP8 result: devgen and the segment_roles policy now route the W8A8 projections to cuBLASLt FP8
+(commits 8b811e45, f2f7fabb: prefill admitted at the packet's 128/1024/4096/8192 buckets only), and
+the recipe takes prefill on cuBLASLt plus decode from 2 rows (commit a3ee2457). Each route was also
+measured alone (attribution tables): prefill alone gives the whole prefill gain with identical
+first-token digests, decode alone the whole decode gain. Prefill 2.5-4.5x faster (4096 rows 1232 ->
+277 ms, 9% -> 39% of the FP8 floor), decode B2..B48 38-49% faster; B1 stays on the native M1 TMA
+GEMV. FP32 gate (packet 2af45e892b75, plowrt 69215b1e) c1/c8/c32 PASS: kl_trim 0.0110/0.0099/0.0102
+vs vLLM hub-FP8 0.0147/0.0153/0.0179, top1_decisive 0.9939/0.9951/0.9951, cont_frac
+0.731/0.765/0.736, needle 1. The packet needs a plowrt carrying this policy.
 
 BF16 result: decode cuBLASLt from 4 rows with the GDN step isolated from 4 (commit 9d6cc389): B4/B8
--7..-10%, B1/B2/B16+ unchanged with identical digests; from 1 row loses at B1/B2. FP32 gate (packet
-3157ca560892) c1/c8/c32 PASS: kl_trim 0.000461/0.000450/0.000415 vs vLLM 0.000338/0.000346/0.000356,
-top1_decisive 0.9988/0.9988/1, cont_frac 0.862/0.874/0.883, needle 1. Native prefill is 3-3.7x
-slower; the fused qkv matmul and the cuBLASLt terminal stay. At 32-48 slots x 16K context (48 x 8K)
-the BF16 packet runs out of KV memory in step_bench (capacity, not a route).
+-7..-10%, B1/B2/B16+ unchanged with identical digests. The GDN isolation alone (cuBLASLt still from
+16) is neutral (+0.1..+0.9%), so the gain is the library route. From 1 row loses at B1/B2. FP32 gate
+(packet 3157ca560892) c1/c8/c32 PASS: kl_trim 0.000461/0.000450/0.000415 vs vLLM
+0.000338/0.000346/0.000356, top1_decisive 0.9988/0.9988/1, cont_frac 0.862/0.874/0.883, needle 1.
+Native prefill is 2.9-3.7x slower; the fused qkv matmul and the cuBLASLt terminal stay. At 32-48
+slots x 16K (48 x 8K) step_bench runs out of KV memory on this packet (capacity, not a route).
 
 
-**Qwen3.8 FP8 cuBLASLt prefill + decode from 2 rows (GDN isolate 2) -- PROMOTED** (qwenfp8-base vs qwenfp8-fin2)
+**Qwen3.8 FP8 cuBLASLt prefill + decode from 2 rows (GDN isolate 2) -- PROMOTED (plowrt 69215b1e both arms)** (qwenfp8-base vs qwenfp8-fin2)
 
 | phase | rows x ctx | qwenfp8-base ms | qwenfp8-fin2 ms | change | % floor (cur / alt) | digest |
 |---|---|---|---|---|---|---|
@@ -118,7 +127,44 @@ the BF16 packet runs out of KV memory in step_bench (capacity, not a route).
 | prefill | 1 x 1024 | 320.53 | 78.49 | -75.5% | 8 / 34 | equal |
 | prefill | 1 x 4096 | 1232.44 | 277.16 | -77.5% | 9 / 39 | equal |
 
-**Qwen3.8 FP8 same, decode from 1 row** (qwenfp8-base vs qwenfp8-fin1)
+**Qwen3.8 FP8 attribution: cuBLASLt prefill only (plowrt 69215b1e both arms)** (qwenfp8-base vs qwenfp8-pflt)
+
+| phase | rows x ctx | qwenfp8-base ms | qwenfp8-pflt ms | change | % floor (cur / alt) | digest |
+|---|---|---|---|---|---|---|
+| decode | B1 x 1024 | 23.49 | 23.49 | -0.0% | 35 / 35 | equal |
+| prefill | 1 x 128 | 90.01 | 36.53 | -59.4% | 9 / 22 | equal |
+| prefill | 1 x 1024 | 319.65 | 78.55 | -75.4% | 8 / 34 | equal |
+| prefill | 1 x 4096 | 1233.71 | 277.03 | -77.5% | 9 / 39 | equal |
+| prefill | 1 x 8192 | 2540.45 | 559.12 | -78.0% | 8 / 38 | equal |
+| prefill | 4 x 1024 | 1281.47 | 315.23 | -75.4% | 8 / 34 | differs |
+
+**Qwen3.8 FP8 attribution: cuBLASLt decode from 16 only (plowrt bin34 both arms)** (qwenfp8-base vs qwenfp8-lt16)
+
+| phase | rows x ctx | qwenfp8-base ms | qwenfp8-lt16 ms | change | % floor (cur / alt) | digest |
+|---|---|---|---|---|---|---|
+| decode | B1 x 1024 | 23.50 | 23.35 | -0.7% | 35 / 35 | equal |
+| decode | B8 x 1024 | 59.46 | 59.78 | +0.5% | 15 / 14 | equal |
+| decode | B16 x 1024 | 62.08 | 31.41 | -49.4% | 15 / 29 | differs |
+| decode | B16 x 16000 | 67.60 | 36.97 | -45.3% | 20 / 37 | differs |
+| decode | B32 x 1024 | 64.97 | 32.99 | -49.2% | 16 / 31 | differs |
+| decode | B32 x 16000 | 74.82 | 42.92 | -42.6% | 26 / 46 | differs |
+| decode | B48 x 1024 | 68.44 | 35.24 | -48.5% | 16 / 32 | differs |
+| prefill | 1 x 1024 | 320.48 | 314.01 | -2.0% | 8 / 9 | equal |
+| prefill | 1 x 4096 | 1231.21 | 1236.12 | +0.4% | 9 / 9 | equal |
+
+**Qwen3.8 FP8 attribution: cuBLASLt decode from 2 + GDN isolate 2 only (plowrt bin34 both arms)** (qwenfp8-base vs qwenfp8-lt2i)
+
+| phase | rows x ctx | qwenfp8-base ms | qwenfp8-lt2i ms | change | % floor (cur / alt) | digest |
+|---|---|---|---|---|---|---|
+| decode | B1 x 1024 | 23.50 | 23.37 | -0.6% | 35 / 35 | equal |
+| decode | B2 x 1024 | 48.12 | 29.99 | -37.7% | 17 / 28 | differs |
+| decode | B4 x 1024 | 48.73 | 29.23 | -40.0% | 17 / 29 | differs |
+| decode | B8 x 1024 | 59.44 | 30.61 | -48.5% | 15 / 28 | differs |
+| decode | B8 x 16000 | 62.31 | 33.41 | -46.4% | 18 / 33 | differs |
+| decode | B16 x 1024 | 62.10 | 31.42 | -49.4% | 15 / 29 | differs |
+| decode | B32 x 1024 | 64.95 | 32.96 | -49.3% | 16 / 31 | differs |
+
+**Qwen3.8 FP8 cuBLASLt prefill + decode from 1 row (GDN isolate 1)** (qwenfp8-base vs qwenfp8-fin1)
 
 | phase | rows x ctx | qwenfp8-base ms | qwenfp8-fin1 ms | change | % floor (cur / alt) | digest |
 |---|---|---|---|---|---|---|
@@ -152,9 +198,17 @@ the BF16 packet runs out of KV memory in step_bench (capacity, not a route).
 | decode | B2 x 16000 | 24.31 | 24.28 | -0.1% | 67 / 67 | equal |
 | decode | B4 x 1024 | 24.74 | 22.97 | -7.1% | 64 / 69 | differs |
 | decode | B4 x 16000 | 26.03 | 24.20 | -7.0% | 65 / 70 | equal |
-| decode | B8 x 1024 | 26.32 | 23.81 | -9.6% | 61 / 67 | differs |
+| decode | B8 x 1024 | 26.32 | 23.81 | -9.5% | 61 / 67 | differs |
 | decode | B8 x 16000 | 29.18 | 26.65 | -8.7% | 63 / 69 | differs |
 | decode | B16 x 1024 | 24.99 | 25.00 | +0.0% | 66 / 66 | equal |
+
+**Qwen3.8 BF16 attribution: GDN isolate 4 alone, cuBLASLt still from 16** (qwenbf16-base vs qwenbf16-iso4)
+
+| phase | rows x ctx | qwenbf16-base ms | qwenbf16-iso4 ms | change | % floor (cur / alt) | digest |
+|---|---|---|---|---|---|---|
+| decode | B4 x 1024 | 24.74 | 24.97 | +0.9% | 64 / 63 | equal |
+| decode | B8 x 1024 | 26.32 | 26.36 | +0.1% | 61 / 61 | equal |
+| decode | B8 x 16000 | 29.18 | 29.21 | +0.1% | 63 / 63 | equal |
 
 **Qwen3.8 BF16 cuBLASLt decode from 1 row (GDN isolate 1)** (qwenbf16-base vs qwenbf16-lt1i)
 
