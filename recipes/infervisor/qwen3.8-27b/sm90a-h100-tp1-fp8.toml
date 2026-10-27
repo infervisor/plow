@@ -20,13 +20,32 @@
 # (kvstore-scratch/qwenfp8-ladder3b-run/gate). Against the BF16 captures the same run fails c1/c8
 # on the continuation criteria (the BF16 stack sits at cont_frac 0.86), which is why the peer
 # changed.
+#
+# Routes (2026-10-27 route sweep, H100, step_bench 2 passes ABAB on plowrt 69215b1e = the route-sweep
+# tree, packet 2af45e892b75 vs the abi2 packet 5e8ebd0f9771; evidence /opt/dlami/nvme/lava-tts/route-sweep,
+# C/qwen, B/qwenfp8-*, gates/qwenfp8-fin2): every W8A8 projection now runs as a cuBLASLt FP8 matmul
+# (per-row activation x per-channel weight scales, OUTER_VEC) except on the 1-row decode rung.
+#   prefill   PLOW_EMIT_PREFILL_CUBLASLT (devgen + segment_roles policy now admit the Qwen3.8 W8A8
+#             shapes): one request of 128/1024/4096/8192 rows 90.0/320.5/1232/2540 -> 36.5/78.5/277/559 ms
+#             (4x1024 packed 1281 -> 315 ms); 4096 rows at 39% of the FP8 compute floor (was 9%);
+#             single-request first-token digests identical (packed 4x1024: differs, FP32 gate below)
+#   decode    PLOW_EMIT_DECODE_CUBLASLT from 2 rows (QuantFp8 stays in the interpreter window, the GEMM is
+#             isolated per projection), PLOW_QWEN_GDN_ISOLATE 2 (plowrt needs one role layout across the
+#             routed rungs): ctx 1K B2/4/8/16/32/48 48.12/48.72/59.42/62.04/64.95/68.41 -> 29.99/29.25/
+#             30.59/31.39/32.96/35.27 ms, B8/B32 x 16K 62.21/74.83 -> 33.41/42.93 ms. B1 stays on the native
+#             M1 TMA GEMV (23.35 ms; cuBLASLt from 1 row 29.12 ms). --same 8 x 4K 8/8 slots agree.
+# FP32 gate PASS at c1/c8/c32 against the vLLM 0.29 hub-FP8 peers: kl_trim 0.0110/0.0099/0.0102 vs
+# 0.0147/0.0153/0.0179, kl_p95 0.082/0.074/0.071 vs 0.102/0.112/0.130, top1_decisive 0.9939/0.9951/0.9951
+# vs 0.9939/0.9915/0.9902, cont_frac 0.731/0.765/0.736 vs 0.721/0.723/0.696, needles 1. The packet needs a
+# plowrt with this segment_roles policy (older plowrt rejects its FP8 prefill segments). The serving
+# comparison below predates these routes and has not been re-run.
 
 schema = "plow.recipe.v1"
 namespace = "infervisor"
 name = "qwen3.8-27b"
 label = "sm90a-h100-tp1-fp8"
 status = "validated"
-plow_git = "2dabbe2b3f82129d4f905707080b0d2061d768f1"
+plow_git = "8b811e455ffed12486742718128efc439bc090ba"
 network = "qwen3.5"
 
 [target]
@@ -92,17 +111,18 @@ PLOW_QWEN_FP8_M1_TMA = "1"
 PLOW_QWEN_SHARE_QUANT = "1"
 PLOW_QWEN_PREFILL = "128,1024,4096,8192"
 # Rungs 1..48 on the W8A8 decode objects; the single-row rung keeps the 64-wide M1 TMA map, the
-# wider rungs quantize on every block and run the 128-row M tile of d_gemm_w8a8_sm90.
+# wider rungs quantize on every block and run their projections as cuBLASLt FP8 matmuls (header).
 PLOW_DECODE_BATCH = "4"
 PLOW_DECODE_BATCH_LADDER = "1,2,4,8,16,32,48"
-PLOW_EMIT_PREFILL_CUBLASLT = "0"
-PLOW_EMIT_DECODE_CUBLASLT = "0"
+PLOW_EMIT_PREFILL_CUBLASLT = "1"
+PLOW_EMIT_DECODE_CUBLASLT = "1"
+PLOW_EMIT_DECODE_CUBLASLT_MIN_ROWS = "2"
 PLOW_EMIT_GEN_KERNELS = "attn_pf_hd256_causal_ilv,attn_dec_hd256_gqa6_ilv"
 PLOW_QWEN_KV_INTERLEAVE = "1"
 PLOW_EMIT_PACKED_PREFILL = "1"
 PLOW_NV_FA_RG_WIDE = "1"
 PLOW_NV_FA_RG_U = "8"
-PLOW_QWEN_GDN_ISOLATE = "16"
+PLOW_QWEN_GDN_ISOLATE = "2"
 PLOW_NV_GEMV_REM_SPLIT = "1"
 PLOW_NV_GEMV_K8_B1 = "1"
 
@@ -111,8 +131,6 @@ PLOW_VMM_LIVE = "1"
 PLOW_PREFIX_CACHE = "0"
 PLOW_PF_INTERLEAVE = "0"
 PLOW_MAX_QUEUED_REQUESTS = "128"
-[capabilities]
-cublaslt_prefill = "Qwen FP8 prefill uses native W8A8 GEMM rather than cuBLASLt"
 
 [bench]
 backend = "openai"

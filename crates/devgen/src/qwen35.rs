@@ -64,7 +64,7 @@ fn segment_roles(m: &Model) -> Option<packet::devbuild::SectionData> {
         let p = &m.progs[index];
         let mut roles = vec![plow_asset::segment_roles::INTERPRETER; p.gq_seg_ofs.len() - 1];
         for (ix, inst) in p.insts.iter().enumerate() {
-            if inst.op != DevOp::Gemv as u16
+            if !(inst.op == DevOp::Gemv as u16 || inst.op == DevOp::GemmFp8 as u16)
                 || !m.tensors[inst.t[2] as usize].name.contains(".layers.")
             {
                 continue;
@@ -349,7 +349,7 @@ impl Emitter<'_> {
                 let g = GenTensor::tmap_e4m3(w, n, k, 128);
                 self.b
                     .tensor_gen(&format!("tmap.fp8.pf.w{w}"), g.byte_len(), g)
-            } else if rows == 1 && emit_config::active().qwen_fp8_m1_tma {
+            } else if rows == 1 && emit_config::active().qwen_fp8_m1_tma && !self.decode_cublaslt {
                 let g = GenTensor::tmap_e4m3(w, n, k, 64);
                 self.b.tensor_gen(&format!("tmap.fp8.{w}"), g.byte_len(), g)
             } else {
@@ -361,8 +361,9 @@ impl Emitter<'_> {
                 d.i[6] = input_map;
                 d.i[7] = weight_map;
             });
-            if self.prefill
-                && (emit_config::active().fp8_pf_isolate || emit_config::active().fp8_pf_gemm_role)
+            if (self.prefill
+                && (emit_config::active().fp8_pf_isolate || emit_config::active().fp8_pf_gemm_role))
+                || (!self.prefill && self.decode_cublaslt)
             {
                 self.b.isolate(done);
             }
@@ -1045,10 +1046,6 @@ fn phase(
                         && matches!(batch, 128 | 1024 | 4096 | 8192)
                         && emit_config::active().qwen_w8a8_prefill))),
         "Qwen W8A8 requires decode rungs within one GEMM M tile or explicit supported prefill buckets"
-    );
-    assert!(
-        !decode_cublaslt || !fp8,
-        "Qwen decode Lt requires BF16 projections"
     );
     let fuse_decode = !prefill
         && emit_config::active().qwen_fold_norm
@@ -3396,6 +3393,63 @@ mod tests {
             }
         }
         emit_config::install(original);
+    }
+
+    #[test]
+    fn w8a8_decode_cublaslt_isolates_every_body_matmul() {
+        let _env = crate::test_env::env_guard();
+        let _target = EmitAmdGuard::set(false);
+        struct Restore(emit_config::EmitConfig);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                emit_config::install(self.0.clone());
+            }
+        }
+        let restore = Restore(emit_config::active().clone());
+        let c = Config::parse(&fixture());
+        for batch in [1, 16] {
+            let mut cfg = restore.0.clone();
+            cfg.fp8 = true;
+            cfg.w8a8 = true;
+            cfg.qwen_w8a8_prefill = true;
+            cfg.qwen_fp8_m1_tma = true;
+            cfg.qwen_share_quant = true;
+            cfg.decode_cublaslt = false;
+            emit_config::install(cfg.clone());
+            let plain = model_prefill(&c, 8192, 132, 0, &[128], batch, true);
+            cfg.decode_cublaslt = true;
+            emit_config::install(cfg);
+            let routed = model_prefill(&c, 8192, 132, 0, &[128], batch, true);
+            let roles = plow_asset::segment_roles::SegmentRoles::from_bytes(
+                &segment_roles(&routed).unwrap().data,
+            )
+            .unwrap();
+            let decode = &roles.programs.last().unwrap().roles;
+            let (a, b) = (&plain.progs[1], &routed.progs[1]);
+            assert_eq!(a.insts.len(), b.insts.len());
+            assert!(a
+                .insts
+                .iter()
+                .zip(&b.insts)
+                .all(|(x, y)| (x.t, x.i[..6].to_vec()) == (y.t, y.i[..6].to_vec())));
+            let mut count = 0;
+            for (ix, d) in b.insts.iter().enumerate() {
+                let seg = b.stream.iter().find(|e| e.inst == ix as u32).unwrap().seg as usize;
+                let alone = b
+                    .stream
+                    .iter()
+                    .all(|e| (e.inst == ix as u32) == (e.seg as usize == seg));
+                if d.op == DevOp::GemmFp8 as u16 {
+                    count += 1;
+                    assert!(alone);
+                    assert_eq!(decode[seg], plow_asset::segment_roles::CUBLASLT);
+                    assert_eq!((d.i[0], d.i[6], d.i[7]), (batch, 0, 0));
+                } else {
+                    assert_ne!(decode[seg], plow_asset::segment_roles::CUBLASLT);
+                }
+            }
+            assert_eq!(count, 31);
+        }
     }
 
     #[test]

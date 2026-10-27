@@ -9254,9 +9254,10 @@ pub fn run_verified(args: EmitArgs, verify: Option<VerifyHook>) {
                     && arch == "sm_89")
                 && tp == 1
                 && (!emit_config::active().any_fp8_weights()
-                    || (model_type.starts_with("gemma4") && emit_config::active().w8a8))
+                    || ((model_type.starts_with("gemma4") || model_type == "qwen3_5")
+                        && emit_config::active().w8a8))
                 && !emit_config::active().mxfp4,
-            "cuBLASLt prefill emission requires Gemma 4 W8A8 or supported BF16 on single-GPU SM90 (Qwen3-ASR and Llama BF16 also on SM89)"
+            "cuBLASLt prefill emission requires Gemma 4 / Qwen3.5 W8A8 or supported BF16 on single-GPU SM90 (Qwen3-ASR and Llama BF16 also on SM89)"
         );
     }
     if emit_config::active().gemma4_sm90_gemm_glu_role {

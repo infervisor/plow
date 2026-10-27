@@ -389,3 +389,54 @@ removal, then long-context attention (32 rows x 15K extra ctx costs 16 ms agains
 incremental floor). A realistic target for the first two is B=16 11-14 ms and B=32 16-20 ms at
 8K (today ~15.6 / 23.4 interpolated), which should stabilise the 2.7/s cell but is not by itself
 a demonstrated win over vLLM 0.29.
+## 2026-10-27: native vs cuBLASLt route sweep (Gemma-4 12B FP8)
+
+Protocol: `step_bench` on one H100, decode 48 steps `--spread`, prefill `--packed-prefill --pf-reps 3`
+(best timed rep), two passes ABAB (passes agree within 1%), ms = mean of the passes. Current arm =
+the abi2 packet of the recipe at 21ab0d7d. Alternative = either the same packet with one runtime
+knob set, or a re-emit of the recipe with the emit knobs named in the table title changed (Qwen:
+the decode threshold moves together with `PLOW_QWEN_GDN_ISOLATE`, which plowrt requires; the FP8
+arms also need the devgen/policy commit 8b811e45, emitted with plowc built from it). Both arms of a
+table run on the same plowrt (named in the title where it is not bin34 6a4b75bc). % floor = floor /
+measured, floor = decode bytes (weights streamed once + KV rows) / 3.35 TB/s, prefill max(FLOP /
+peak, bytes / 3.35 TB/s) with peak 1979 TF/s FP8, 990 BF16; not reported for the MoE packets, whose
+routed expert bytes the model cannot bound. digest = TOK_STREAM fnv of the run (`equal` = both
+passes of both arms). `--same` slot agreement held on every arm (8/8 .. 64/64). Not measured: the
+4160/4224 rungs (they only occur with decode riders, which step_bench does not build) and, for the
+native prefill arms, the 1152 and 8192 rungs. Raw: /opt/dlami/nvme/lava-tts/route-sweep (A/, B/, C/,
+D/, logs/, gates/).
+
+Result: no change. cuBLASLt prefill projections beat the native FP8 GEMM at every measured rung
+(native +7..+31%); the fused qkv matmul on rung 128 and the compact terminal on cuBLASLt are equal
+or faster. Decode below rung 128 stays native per the 2026-10-26 measurement above (cuBLASLt from
+2 rows loses at B8/B16), not repeated here.
+
+
+**12B prefill projections: native FP8 GEMM instead of cuBLASLt (emit PLOW_EMIT_PREFILL_CUBLASLT=0)** (g12-base vs g12-pfnative)
+
+| phase | rows x ctx | g12-base ms | g12-pfnative ms | change | % floor (cur / alt) | digest |
+|---|---|---|---|---|---|---|
+| decode | B1 x 1024 | 8.57 | 8.57 | +0.1% | 46 / 46 | differs |
+| prefill | 1 x 128 | 13.90 | 18.21 | +31.0% | 28 / 21 | equal |
+| prefill | 1 x 256 | 15.40 | 20.23 | +31.3% | 25 / 19 | equal |
+| prefill | 1 x 512 | 20.36 | 25.73 | +26.4% | 30 / 24 | differs |
+| prefill | 1 x 1024 | 33.65 | 38.48 | +14.4% | 37 / 32 | equal |
+| prefill | 1 x 1088 | 46.02 | 52.28 | +13.6% | 28 / 25 | equal |
+| prefill | 1 x 2048 | 65.39 | 72.56 | +11.0% | 38 / 34 | equal |
+| prefill | 1 x 2112 | 74.49 | 80.21 | +7.7% | 34 / 32 | equal |
+| prefill | 1 x 4096 | 136.01 | 148.17 | +8.9% | 36 / 33 | equal |
+| prefill | 2 x 4096 | 267.09 | 286.70 | +7.3% | 37 / 34 | differs |
+
+**12B rung 128: PLOW_DECODE_LT_QKV=0** (g12-base vs g12-ltqkv0)
+
+| phase | rows x ctx | g12-base ms | g12-ltqkv0 ms | change | % floor (cur / alt) | digest |
+|---|---|---|---|---|---|---|
+| decode | B128 x 1024 | 27.03 | 26.97 | -0.2% | 39 / 39 | equal |
+| decode | B128 x 16000 | 91.51 | 91.45 | -0.1% | 14 / 14 | equal |
+
+**12B compact terminal off cuBLASLt: PLOW_TERMINAL_LT=0** (g12-base vs g12-termlt0)
+
+| phase | rows x ctx | g12-base ms | g12-termlt0 ms | change | % floor (cur / alt) | digest |
+|---|---|---|---|---|---|---|
+| prefill | 1 x 1024 | 33.69 | 34.03 | +1.0% | 37 / 36 | equal |
+| prefill | 1 x 4096 | 136.13 | 136.54 | +0.3% | 36 / 36 | equal |
