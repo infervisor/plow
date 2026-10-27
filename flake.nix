@@ -60,6 +60,8 @@
         # needs its hash spelled out even though plowc/plowrt never compile it.
         outputHashes = {
           "inference-benchmarker-1.1.0" = "sha256-Tr/urmjuYQXH50kxCn05DOLfv4JTYv+mjsBv5EhQXAE=";
+          # `plowrt push`'s bucket client (crates/plowrt/Cargo.toml).
+          "object_store-0.13.2" = "sha256-uhCGCPU4dBOO/wbZLAM88pRvK/bIICmFvwkwFivXDuk=";
         };
       };
 

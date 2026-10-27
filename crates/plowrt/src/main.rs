@@ -820,7 +820,11 @@ enum Cmd {
     /// racing publisher is refused rather than overwritten. The bucket is
     /// the registry `load` reads; no service sits in between. A re-run of a
     /// build that is already the newest generation writes nothing.
-    /// Bucket credentials: `PLOW_R2_ACCESS_KEY_ID`, `PLOW_R2_SECRET_ACCESS_KEY`.
+    ///
+    /// R2 is the default: account and bucket from the URL or
+    /// `CLOUDFLARE_ACCOUNT_ID` / `CLOUDFLARE_R2_BUCKET`, writes with
+    /// `CLOUDFLARE_API_TOKEN` (REST API) or `CLOUDFLARE_R2_ACCESS_KEY_ID` +
+    /// `CLOUDFLARE_R2_SECRET_ACCESS_KEY` (S3 endpoint).
     #[cfg(feature = "dist")]
     Push {
         #[command(flatten)]
@@ -834,8 +838,8 @@ enum Cmd {
         /// Directory a `dist` checkpoint's `files[]` live in, as for `pack`.
         #[arg(long)]
         checkpoint_dir: Option<PathBuf>,
-        /// `r2://<account-id>/<bucket>`, `s3://<host>/<bucket>` or `file:///dir`.
-        #[arg(long)]
+        /// `r2://[<account-id>/]<bucket>`, `s3://<bucket>` or `file:///dir`.
+        #[arg(long, default_value = "r2://")]
         to: String,
         /// The ed25519 key file (`plowrt keygen`) the index is signed with;
         /// `PLOW_SIGNING_KEY` when omitted. Without one the index is unsigned.

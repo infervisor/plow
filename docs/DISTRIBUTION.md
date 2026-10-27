@@ -220,16 +220,24 @@ binary — are published by `plowrt` alone, straight into the bucket a client
 reads. There is no service between the producer and the store:
 
 ```
-PLOW_R2_ACCESS_KEY_ID=… PLOW_R2_SECRET_ACCESS_KEY=… \
+CLOUDFLARE_ACCOUNT_ID=… CLOUDFLARE_R2_BUCKET=… CLOUDFLARE_API_TOKEN=… \
 plowrt push --recipe recipes/…/<label>.toml --assets <dir> \
   [--objects <dir>] [--checkpoint-dir <dir> --hf <org>/<repo>] \
   [--status validated --tok-s <n> --concurrency <c>] [--dry-run] \
-  --key-file <secret> --to r2://<account-id>/<bucket>
+  --key-file <secret> [--to r2://<account-id>/<bucket>]
 ```
 
-`--to` is `r2://<account>/<bucket>`, `s3://<host>/<bucket>` or `file:///dir`;
-the directory form writes the same tree, which is how a release is inspected
-or mirrored by hand. Both manifests are built from the recipe, which is the
+Cloudflare R2 is the default destination: `--to` is `r2://` (account and
+bucket from `CLOUDFLARE_ACCOUNT_ID` and `CLOUDFLARE_R2_BUCKET`),
+`r2://<bucket>` or `r2://<account-id>/<bucket>`. Writes go through
+Cloudflare's REST API with `CLOUDFLARE_API_TOKEN`, or through R2's S3
+endpoint with `CLOUDFLARE_R2_ACCESS_KEY_ID` + `CLOUDFLARE_R2_SECRET_ACCESS_KEY`
+when no API token is set. `s3://<bucket>` is any S3 bucket from the `AWS_*`
+environment (`AWS_ENDPOINT` for another S3-compatible service).
+`file:///dir` writes the same tree, which is how a release is inspected or
+mirrored by hand. The client is our fork of Apache `object_store`
+(`storyvis/object-store`, pinned by revision); it is pure Rust, so `plowrt`
+links nothing new. Both manifests are built from the recipe, which is the
 only way to produce them: there is no flag that can disagree with what the
 recipe declares. The recipe's `plow_git` is the provenance a published build
 records; `--plow-git` exists only to reproduce a manifest whose recipe has

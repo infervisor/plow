@@ -828,15 +828,7 @@ pub fn cmd_push<'a>(
 ) -> Result<(), Err> {
     // Every argument is checked before the registry is asked anything.
     let args = pack_args(recipe, assets, objects, checkpoint_dir)?;
-    let (ak, sk, region) = RuntimeConfig::push_env();
-    let creds = match (ak, sk) {
-        (Some(access_key), Some(secret_key)) => Some(dist::sink::Credentials {
-            access_key,
-            secret_key,
-        }),
-        _ => None,
-    };
-    let sink = dist::sink::sink(to, creds, region.as_deref())?;
+    let sink = dist::sink::sink(to)?;
     let key = match key_file {
         Some(p) => Some(dist::sign::SecretKey::read(p)?),
         None => None,

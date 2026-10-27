@@ -87,6 +87,11 @@ hf-hub = { workspace = true, optional = true }
 # I/O, and CI asserts no HTTP/TLS crate is present in the serve-only feature set.
 ureq = { workspace = true, features = ["gzip"], optional = true }
 zstd = { version = "0.14", optional = true }
+# `plowrt push`: the bucket client. Our fork of Apache `object_store` adds a
+# Cloudflare R2 store over the REST API (API-token writes); R2's S3 endpoint
+# and any S3 bucket come with it. Pure Rust (rustls, ring) so the binary
+# stays static; publish-side only, same reasoning as ureq.
+object_store = { git = "https://github.com/storyvis/object-store", rev = "4f3e9336cd9eb1f29a72b0dfb25dc9ef8a6ac75a", default-features = false, features = ["cloudflare"], optional = true }
 # `plowrt push` signs a model index and `pull` verifies it (Nix's scheme: ed25519,
 # `<name>:<base64>`). Publish/fetch side only: `serve` verifies nothing.
 ed25519-dalek = { version = "2", default-features = false, features = ["std"], optional = true }
@@ -143,7 +148,7 @@ hub = ["hf-tokenizer", "dep:safetensors", "dep:hf-hub"]
 # `hf-hub` joins it because `load` also resolves the checkpoint, which the
 # distribution never carries — weights always come from HuggingFace or a local
 # directory.
-dist = ["dep:ureq", "dep:zstd", "dep:zip", "dep:toml", "dep:hf-hub", "dep:ed25519-dalek", "hf-tokenizer"]
+dist = ["dep:ureq", "dep:zstd", "dep:zip", "dep:toml", "dep:hf-hub", "dep:ed25519-dalek", "dep:object_store", "hf-tokenizer"]
 # CUDA driver-API backend. The driver lib is `dlopen`ed at runtime (no link-time
 # `-lcuda`), so the binary stays static except for libcuda. Pulls safetensors:
 # a GPU serve is meaningless without real checkpoint weights (`exec::gpu`) —

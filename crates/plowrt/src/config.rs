@@ -2709,18 +2709,6 @@ impl RuntimeConfig {
         )
     }
 
-    /// `PLOW_R2_ACCESS_KEY_ID` and `PLOW_R2_SECRET_ACCESS_KEY`: the bucket
-    /// token `plowrt push` writes with. `PLOW_S3_REGION` names the region for
-    /// an `s3://` destination (`auto` otherwise, which is what R2 wants).
-    /// Publish-side only, like `publish_env`.
-    pub fn push_env() -> (Option<String>, Option<String>, Option<String>) {
-        (
-            Self::env_nonempty("PLOW_R2_ACCESS_KEY_ID"),
-            Self::env_nonempty("PLOW_R2_SECRET_ACCESS_KEY"),
-            Self::env_nonempty("PLOW_S3_REGION"),
-        )
-    }
-
     /// `PLOW_SIGNING_KEY`: the file holding the ed25519 key `push` signs a
     /// model index with. `PLOW_TRUSTED_KEYS`: the comma-separated public keys
     /// (`<name>:<base64>`) a `load`/`pull`/`upgrade` accepts an index from;
