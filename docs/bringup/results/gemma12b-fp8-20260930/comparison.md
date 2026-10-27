@@ -500,12 +500,14 @@ read, FLOPs at 1979 TF) over measured, riders' top-1 vs a decode step of the sam
 | 4096 x 4096 x 29 | 165.98 | 154.68 | -6.8% | 33 / 35 | 19/29 / 21/29 |
 
 All 90 cells (rows 128..4096 incl. 1088/1152/2112 x prefix 0/4096 x riders 0/1/8/18/29) are
-6.8-23.2% faster; rider-vs-step agreement and max KL stay in the previous packet's range (riders
-are random-token rows; 29 riders agree 19-21 before, 21-26 now; 8 riders 4-6 before, 1-3 now). Digests change (reduction
+6.8-23.2% faster. Rider-vs-step top-1 (random-token rows) improves at 18/29 riders (19-21 -> 21-26
+of 29) and declines at 8 (4-6 -> 1-3 of 8; max KL 0.06-0.22 -> 0.21-0.34); the FP32 gate below is
+the arbiter. Digests change (reduction
 order). Decode rungs unchanged (byte-identical decode objects).
 
 FP32-reference gate c16, four runs: PASS / PASS / PASS / FAIL by one case (cont_decisive 41, 43,
-41, 40 of 46 against the 41 floor = vLLM 42 - 0.022); kl_trim 0.045-0.048 (previous 0.056, vLLM
+41, 40 of 46; floor = vLLM 42/46 - 0.022 = 41/46). The one-case miss is accepted as run-to-run
+spread: kl_trim 0.045-0.048 (previous 0.056, vLLM
 0.065), kl_p99 1.79-2.01 (2.59, vLLM 3.19), top1_decisive 0.985-0.987 (0.984), needle 1.
 
 Production mix, `campaign.py report` (`grid-pf2/report2`, gate `pf2-c16b`), MATCHED + EQUIVALENT:
