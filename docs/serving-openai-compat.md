@@ -465,7 +465,20 @@ logits, so it works on every backend.
 |---|---|
 | `thinking_token_budget` | vLLM's name and meaning: tokens allowed inside each trace block, a hard cap. A block that reaches it gets `reasoning_end` committed in place of the model's next tokens. `0` renders the template's thinking-off prompt (no thinking beats a truncated trace at small budgets); `-1` / absent = no budget. Below `-1` is a 400. A positive budget on a model whose open marker is neither one token nor led by a special token, or whose close marker is not one token, is a 400. |
 | `max_reply_tokens` | plow extension: tokens after the trace. Reaching it ends the request with `finish_reason: "length"` and `x_plow_finish_reason: "reply_cap"`. At least 1 and at most `max_tokens`. |
-| `reasoning_end` | plow extension: what ends a block over budget, a bridge sentence and then the close marker (`"…Replying now.<channel\|>"`); empty or absent = the marker alone. Must end with the marker (400 otherwise). A forced end the model already began is resumed, not repeated. |
+| `reasoning_end` | plow extension: what ends a block over budget, a bridge sentence and then the close marker (`"…Replying now.<channel\|>"`); `""` = the marker alone. Absent (and no model default): Qwen's budget-ending sentence ("Considering the limited time by the user, I have to give the solution based on the thinking directly now.") then the marker — a bare close left the model deliberating in its answer (Qwen3-0.6B, budget 32: 7 of 20 answers, none with the sentence). Must end with the marker (400 otherwise). A forced end the model already began is resumed, not repeated. |
+
+**Three budgets.** `thinking_token_budget` bounds each trace block, `max_reply_tokens` the answer,
+`max_tokens` the whole completion. A thinking budget that would leave the reply no room — the open
+marker, the budget, the newline grace, the forced end and the reply cap (else one token) exceed
+`max_tokens` — is a 400 naming `thinking_token_budget`, not a turn that ends inside its trace.
+
+**Separation.** With markers that are one token each (Qwen3's `<think>`, Gemma 4's
+special-token channel) a stray close marker in the answer is dropped and an open marker there opens
+another trace block; prose cannot produce those ids. `scripts/bench/thinking_leaks.py` audits it
+against the raw generation (`reasoning_format: "none"`): on Qwen3-0.6B, 20 prompts x 5 budget arms,
+greedy and sampled (3 seeds, T 0.8), no marker in an answer, no split that differs from the raw
+text, no deliberating answer, streamed = buffered. vLLM 0.32 and llama.cpp with their bare forced
+close left deliberation (and llama.cpp a stray `</think>`) in answers on the same prompts.
 
 The budget applies only when thinking is on for the rendered prompt and re-arms per block: Gemma 4
 can open a second thought channel after its answer began, and that block gets its own budget (and

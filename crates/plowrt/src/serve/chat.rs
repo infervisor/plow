@@ -571,11 +571,17 @@ async fn chat_completions_with(
     } else {
         reasoning_mode
     };
+    // Markers that are one token each (Qwen3's `<think>`, Gemma 4's special-led channel) cannot
+    // come from prose: an open marker after the answer began opens another trace block, and a
+    // stray close marker is framing, not answer text.
+    let reenter = split_mode != crate::serve::reasoning::ReasoningMode::None
+        && bundle.think_markers().is_ok();
     let tool_stream = response_stream(
         &tool_plan,
         tool_support,
         split_mode,
         reasoning_open,
+        reenter,
         &bundle,
         req.stream,
         opener.as_deref(),
@@ -678,15 +684,45 @@ async fn chat_completions_with(
                 .reasoning_budget_message
                 .as_ref()
                 .map(|m| format!("{m}{}", reasoning_mode.close_marker().unwrap_or_default()));
+            // Unset everywhere: a bridge sentence before the close marker. A bare close leaves the
+            // model mid-thought and it carries on deliberating in the answer (Qwen3-0.6B, 20
+            // prompts, budget 32: 7 answers vs none with the bridge). `reasoning_end: ""` is the
+            // bare marker.
+            let default_end = format!(
+                "{}{}",
+                crate::serve::think::DEFAULT_BRIDGE,
+                reasoning_mode.close_marker().unwrap_or_default()
+            );
             let end = req
                 .reasoning_end
                 .as_deref()
                 .or(message_end.as_deref())
                 .or(defaults.and_then(|d| d.reasoning_end.as_deref()))
-                .unwrap_or("");
+                .unwrap_or(&default_end);
             let mut forced_end = bundle.tokenizer().encode_with_special_tokens(end, false);
             if forced_end.last() != Some(&markers.close) {
                 forced_end.push(markers.close);
+            }
+            // The trace and the reply share `max_tokens`: a budget that leaves the reply no room
+            // would end every turn inside its trace (`finish_reason: length`, no answer). Room
+            // counted for the first block: its open marker and label (2), the budget, the newline
+            // grace, the forced end, then the reply (its cap, else one token).
+            if let Some(b) = budget {
+                let grace = defaults.map_or(0, |d| d.newline_grace) as usize;
+                let reply = reply_cap.map_or(1, |c| c as usize);
+                let need = 2 + b as usize + grace + forced_end.len() + reply;
+                if need > gen.max_tokens {
+                    return refuse(
+                        format!(
+                            "`thinking_token_budget` ({b}) + newline grace ({grace}) + the forced end \
+                             ({} tokens) + the reply ({reply}) need {need} tokens, more than \
+                             `max_tokens` ({}): the answer would never be reached",
+                            forced_end.len(),
+                            gen.max_tokens
+                        ),
+                        "thinking_token_budget",
+                    );
+                }
             }
             gen.think = Some(Box::new(crate::serve::think::ThinkCtl::new(
                 markers,
@@ -888,6 +924,7 @@ async fn chat_completions_with(
             created,
             split_mode,
             reasoning_open,
+            reenter,
             include_reasoning,
             lp_fmt,
             tool_stream,
@@ -907,6 +944,7 @@ async fn chat_completions_with(
             created,
             split_mode,
             reasoning_open,
+            reenter,
             include_reasoning,
             lp_fmt,
             tool_stream,
@@ -949,6 +987,7 @@ fn response_stream(
     support: Option<crate::serve::tools::ToolSupport>,
     mode: crate::serve::reasoning::ReasoningMode,
     reasoning_open: bool,
+    reenter: bool,
     bundle: &crate::asset::ModelBundle,
     stream: bool,
     opener: Option<&str>,
@@ -968,6 +1007,9 @@ fn response_stream(
         bundle.special_text().clone(),
         stream,
     );
+    if reenter {
+        ts.split.allow_reentry();
+    }
     if let Some(o) = opener {
         ts.prime(o);
     }
@@ -1263,6 +1305,7 @@ async fn buffer_and_reply(
     created: u64,
     reasoning_mode: crate::serve::reasoning::ReasoningMode,
     reasoning_open: bool,
+    reenter: bool,
     include_reasoning: bool,
     lp_fmt: Option<crate::serve::logprobs::TokenText>,
     mut tools: Option<crate::serve::tools::stream::ToolStream>,
@@ -1278,6 +1321,9 @@ async fn buffer_and_reply(
     // same order — so the two cannot disagree, and `trace_tokens` is a real
     // token count rather than a count of calls.
     let mut split = crate::serve::reasoning::ReasoningSplit::new(reasoning_mode, reasoning_open);
+    if reenter {
+        split.allow_reentry();
+    }
     let (mut reasoning_buf, mut answer_buf) = (String::new(), String::new());
     // Tokens that fell inside the trace, for `completion_tokens_details`.
     // Counted from CHUNKS (one per generated token) rather than derived from
@@ -1626,6 +1672,7 @@ fn sse_response(
     created: u64,
     reasoning_mode: crate::serve::reasoning::ReasoningMode,
     reasoning_open: bool,
+    reenter: bool,
     include_reasoning: bool,
     lp_fmt: Option<crate::serve::logprobs::TokenText>,
     tools: Option<crate::serve::tools::stream::ToolStream>,
@@ -1674,7 +1721,14 @@ fn sse_response(
             tools,
             include_reasoning,
             role_pending: true,
-            split: crate::serve::reasoning::ReasoningSplit::new(reasoning_mode, reasoning_open),
+            split: {
+                let mut split =
+                    crate::serve::reasoning::ReasoningSplit::new(reasoning_mode, reasoning_open);
+                if reenter {
+                    split.allow_reentry();
+                }
+                split
+            },
             pending: std::collections::VecDeque::new(),
             run,
             head: stream_mod::FrameHead::new(&request_id, "chat.completion.chunk", created, &model),

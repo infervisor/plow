@@ -638,6 +638,28 @@ mod tests {
         assert!(!ReasoningMode::ThinkTag.prompt_opens("what is <think>?<|assistant|>"));
     }
 
+    /// Single-token `<think>` markers (Qwen3): a stray close in the answer is framing, and a block
+    /// the model opens again after answering is trace; byte-by-byte agrees with whole.
+    #[test]
+    fn reentrant_think_tags_absorb_stray_closes_and_reopen() {
+        let text = "a</think>Ans</think> more<think>x</think>end";
+        let run = |pieces: &[&str]| {
+            let mut s = ReasoningSplit::new(ReasoningMode::ThinkTag, true);
+            s.allow_reentry();
+            let (mut r, mut c) = (String::new(), String::new());
+            for p in pieces {
+                s.push_into(p, &mut r, &mut c);
+            }
+            s.finish_into(&mut r, &mut c);
+            (r, c)
+        };
+        let whole = run(&[text]);
+        assert_eq!(whole, ("a\nx".to_string(), "Ans moreend".to_string()));
+        let bytes: Vec<String> = text.chars().map(String::from).collect();
+        let bytes: Vec<&str> = bytes.iter().map(String::as_str).collect();
+        assert_eq!(run(&bytes), whole);
+    }
+
     #[test]
     fn packet_declared_markers_split_the_trace() {
         let mode = ReasoningMode::Tags {

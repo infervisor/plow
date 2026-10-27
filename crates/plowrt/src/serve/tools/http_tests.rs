@@ -1230,3 +1230,40 @@ async fn responses_carry_the_fields_openai_vllm_and_llamacpp_clients_read() {
         );
     }
 }
+
+/// The thinking budget, the reply cap and `max_tokens` are separate budgets; a thinking budget
+/// that leaves the reply no room inside `max_tokens` is refused rather than ending every turn
+/// inside its trace.
+#[tokio::test]
+async fn a_thinking_budget_must_leave_room_for_the_reply() {
+    let h = harness_for("gemma4-12b");
+    h.reply(&["Four."]);
+    let on = json!({"enable_thinking": true});
+    let ask = |extra: Value| {
+        let mut b = json!({"messages": user("2+2?"), "chat_template_kwargs": on});
+        b.as_object_mut()
+            .unwrap()
+            .extend(extra.as_object().unwrap().clone());
+        b
+    };
+    for extra in [
+        json!({"thinking_token_budget": 300, "max_tokens": 128}),
+        json!({"thinking_token_budget": 100, "max_tokens": 128, "max_reply_tokens": 60}),
+    ] {
+        let (code, v) = h.json(ask(extra.clone())).await;
+        assert_eq!(code, StatusCode::BAD_REQUEST, "{extra}: {v}");
+        assert_eq!(v["error"]["param"], "thinking_token_budget");
+        assert!(v["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("max_tokens"));
+    }
+    // `reasoning_end: ""`: the bare marker (this fixture's tokenizer spells the default bridge byte by byte)
+    for extra in [
+        json!({"thinking_token_budget": 64, "max_tokens": 128, "reasoning_end": ""}),
+        json!({"thinking_token_budget": 32, "max_tokens": 128, "max_reply_tokens": 60, "reasoning_end": ""}),
+    ] {
+        let (code, v) = h.json(ask(extra.clone())).await;
+        assert_eq!(code, StatusCode::OK, "{extra}: {v}");
+    }
+}

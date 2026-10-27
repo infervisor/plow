@@ -40,6 +40,12 @@ pub fn live_end(request: &str) -> bool {
     }
 }
 
+/// What a forced end commits before the close marker when nothing names one: Qwen's documented
+/// budget-ending sentence. It turns the model from deliberating to answering; a bare close does not.
+pub const DEFAULT_BRIDGE: &str =
+    "\n\nConsidering the limited time by the user, I have to give the \
+     solution based on the thinking directly now.\n";
+
 /// A model's trace markers as token ids. Built once per model.
 #[derive(Debug)]
 pub struct ThinkMarkers {
