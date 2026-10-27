@@ -389,6 +389,76 @@ removal, then long-context attention (32 rows x 15K extra ctx costs 16 ms agains
 incremental floor). A realistic target for the first two is B=16 11-14 ms and B=32 16-20 ms at
 8K (today ~15.6 / 23.4 interpolated), which should stabilise the 2.7/s cell but is not by itself
 a demonstrated win over vLLM 0.29.
+## 2026-10-27: decode attention rework (TC16 hd512, row-group hd256)
+
+Recipe plow_git 98347bfa, packet 01c02ceb2e53 (decode object `interp_sm90a_fp8kv` 8110b0b6),
+plowrt e8023cf97 (binary 78f6d0bb, unchanged by the later commits). Raw:
+`/opt/dlami/nvme/lava-tts/g12-decode` (`gate-m3/`, `ride-m3/`, `gates/m3-c16`, `grid-m3/`).
+
+Attribution first (TRACE=2 all-block timeline, critical path, previous packet): B=32 ctx 8K
+23.9 ms traced = hd512 FlashDecode 9.7 + hd256 4.2 + GLU 3.1 + other projections 4.4 + head 1.0
++ merge 0.8 + norms 0.7; B=1 ctx 1K 8.9 = projections 5.8 + head 0.7 + attention 1.3 + merge/HNR
+0.5 + norms 0.6. Barriers and signals were 0.6-0.8 ms at every rung. The attention used the
+generic per-thread-row FP8 body (80-95 us per 256-row tile regardless of live rows), and the
+packet sized the full-layer split for GF 4 while the object ran GF 8.
+
+Change: hd256 on the FP8 row-group body with its staged ring (`PLOW_NV_FA_RG8=2`,
+`PLOW_NV_FA_RG8S`); hd512 on a tensor-core item over the whole 16-head group
+(`PLOW_NV_FA_TC16`: QK and P.V on mma.sync bf16, P as bf16 hi + lo, exact bf16 V); the manifest
+gives the object the group the split was sized for (`BALANCE_GF 16`, `NS_FULL_ABS 132`);
+`RAW_NARROW` and `INST_PRELOAD`. The light hd256 FP8 kernel now claims the RG8S ring (it faulted
+on every library-routed rung, B 33..128, before).
+
+step_bench, 48 steps `--spread`, two ABAB passes (agree within 0.3%), previous packet vs this one,
+% floor = (weights + KV) / 3.35 TB/s over measured; digests stable within each arm:
+
+| B x ctx | previous ms | new ms | change | % floor (prev / new) |
+|---|---|---|---|---|
+| 1 x 1024 | 8.553 | 7.295 | -14.7% | 46 / 54 |
+| 1 x 16000 | 8.865 | 7.356 | -17.0% | 44 / 54 |
+| 8 x 1024 | 9.780 | 7.920 | -19.0% | 44 / 54 |
+| 8 x 8192 | 11.934 | 8.198 | -31.3% | 37 / 54 |
+| 8 x 16000 | 13.846 | 8.480 | -38.8% | 33 / 54 |
+| 16 x 1024 | 11.823 | 9.361 | -20.8% | 40 / 50 |
+| 16 x 8192 | 15.774 | 9.909 | -37.2% | 32 / 50 |
+| 16 x 16000 | 19.660 | 10.485 | -46.7% | 27 / 51 |
+| 32 x 1024 | 15.611 | 11.764 | -24.6% | 36 / 47 |
+| 32 x 8192 | 23.504 | 12.858 | -45.3% | 26 / 48 |
+| 32 x 16000 | 31.892 | 14.011 | -56.1% | 21 / 48 |
+| 64 x 8192 | 35.247 | 19.756 | -43.9% | 24 / 43 |
+| 64 x 16000 | 51.939 | 23.788 | -54.2% | 19 / 40 |
+| 128 x 1024 | 26.931 | 19.328 | -28.2% | 40 / 55 |
+| 128 x 16000 | 91.294 | 28.142 | -69.2% | 17 / 55 |
+| 7 / 9 x 8192 | 11.730 / 15.091 | 8.149 / 9.697 | -31% / -36% | |
+| 15 / 17 x 8192 | 15.644 / 22.312 | 9.873 / 12.625 | -37% / -43% | |
+| 31 / 33 x 8192 | 23.393 / 32.950 | 12.841 / 17.779 | -45% / -46% | |
+
+`--same` slot agreement full (4/16/32/128 rows); VMM edge lengths 4094/4095/8191 at B 1/4/16 run;
+mixed prefill + rider launches (256..4096 rows x ctx 4096/12000 x 1..29 riders) 0.1-12.9 ms
+faster, rider-vs-step top-1 agreement comparable to the previous packet. Object: REG 255, STACK
+240 (was 256), LOCAL 0. Numerics, one layer against FP64: merged attention output before bf16
+rounding rel L2 mean 2.3e-6 for the f16 hi/lo prototype vs 1.4e-7 for the generic body; after
+bf16 rounding ~1.6e-3 for all, the shipped bf16 hi/lo P identical to the prototype there. FP32-reference gate: c16 PASS (kl_trim_mean 0.0560 vs vLLM 0.0653, top1_decisive 0.984
+vs 0.982, cont_decisive 0.913 vs 0.913, needle 1); c1 equal to the previous packet (kl_trim
+0.0503 vs 0.0471, top1_decisive 0.988 vs 0.986, cont_decisive 0.9565 both; the c1 cell has no
+same-concurrency vLLM peer).
+
+Production mix, `campaign.py report` (vLLM arm of the 2026-10-25 production pass), MATCHED +
+EQUIVALENT:
+
+| Metric | 1.8/s Baseline | 1.8/s Infervisor | 2.7/s Baseline | 2.7/s Infervisor |
+|---|---|---|---|---|
+| Total throughput | 42,238 tok/s | 41,912 tok/s (0.99x) | 55,471 tok/s * | 54,684 tok/s (0.99x) * |
+| TTFT P99 | 798.6 ms * | 963.7 ms (1.21x) * | 1,126.4 ms * | 2,271.7 ms (2.02x) * |
+| TPOT P99 | 55.97 ms | 67.81 ms (1.21x) | 136.75 ms * | 137.65 ms (1.01x) |
+| SLO met (supplementary) | 100.0% | 100.0% | 95.7% | 87.7% (was 54.3%) |
+
+Still a loss at both rates. Packlog at 2.7/s: mixed prefill + rider ticks are 60-67% of the wall,
+decode-only ticks 25-32%; prefill launches of 128-512 rows take 22-30 ms against a ~4 ms
+weight-read floor. Next: small-bucket prefill and rider cost; on the decode side the projections
+(B=1: 5.3 of 7.6 ms traced at ~60% of HBM bandwidth, GEMV depth 2 -> 4 -> 8 = 9.26 / 7.30 / 7.22
+ms) and hd256 attention at long context (B=32 8K 2.6 ms vs 1.6 floor).
+
 ## 2026-10-27: native vs cuBLASLt route sweep (Gemma-4 12B FP8)
 
 Protocol: `step_bench` on one H100, decode 48 steps `--spread`, prefill `--packed-prefill --pf-reps 3`

@@ -1007,17 +1007,25 @@ pub(super) fn prefill_rope_route(
     route
 }
 
-/// The NormResidual+RmsNorm pair at one warp per row (`PLOW_NV_WARPS` = 8 rows per block).
+/// The NormResidual+RmsNorm pair at one warp per row (`PLOW_NV_WARPS` = 8 rows per block), or,
+/// with `row_grid` (object ABI 2) and at most `PLOW_PF_NORM_ROW_BLOCKS` rows, one block per row.
 pub(super) fn prefill_norm_rms_route(
     be: &Arc<CudaBackend>,
     function: KernelFn,
     kernarg: DevProgram,
     g: &DevProg,
     insts: &[usize],
+    row_grid: bool,
 ) -> LightRoute {
+    let max_rows = crate::config::RuntimeConfig::get().nv.pf_norm_row_blocks;
     let mut route = prefill_light_route(be, function, kernarg, g, &insts[..1]);
     for launch in &mut route.launches {
-        launch.blocks = g.insts[launch.instruction as usize].i[0].div_ceil(8);
+        let rows = g.insts[launch.instruction as usize].i[0];
+        launch.blocks = if row_grid && rows <= max_rows {
+            rows
+        } else {
+            rows.div_ceil(8)
+        };
     }
     route
 }

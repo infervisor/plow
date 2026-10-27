@@ -4658,8 +4658,11 @@ extern "C" __global__ void __launch_bounds__(PLOW_NV_THREADS, 2)
         in->i[5], in->i[7], blockIdx.x, nblk, arena, in->fj[1].u,
         (const float*)a.op[0].t[6], (const float*)a.op[0].t[7]);
 }
+/* With PLOW_NV_FA_RG8S the body stages rows in a ring past the flash claim. */
 extern "C" __device__ unsigned PLOW_SYM(plow_light_fp8_flash256_smem) =
-    FA_DEC_SMEM_FLOATS(256, 2) * sizeof(float);
+    (FA_RG8S_SMEM_FLOATS(256) > (unsigned)FA_DEC_SMEM_FLOATS(256, 2) ? FA_RG8S_SMEM_FLOATS(256)
+                                                                     : (unsigned)FA_DEC_SMEM_FLOATS(256, 2)) *
+    sizeof(float);
 #endif
 extern "C" __device__ unsigned PLOW_SYM(plow_light_attn_hd) = 256;
 extern "C" __device__ unsigned PLOW_SYM(plow_light_attn_hd2) = 512;
@@ -5001,8 +5004,11 @@ extern "C" __global__ void __launch_bounds__(256) PLOW_SYM(plow_rope_pf)(PlowPro
 /* A prefill NormResidual and the RmsNorm reading its output (instruction inst + 1) as one launch
  * of any grid: both bodies take rows {blockIdx.x + k * gridDim.x}, so the block that wrote a row
  * normalizes it, and each row's arithmetic is the interpreter's. The interpreter runs them on its
- * one CTA per SM, ~31 latency-bound rows per block at 4096 rows. */
-extern "C" __device__ unsigned PLOW_SYM(plow_norm_rms_pf_abi) = 1;
+ * one CTA per SM, ~31 latency-bound rows per block at 4096 rows.
+ * ABI 2: a grid that covers the rows runs the RmsNorm one block per row (the walk below the T17
+ * threshold) instead of one warp per row, which left 7 of 8 warps idle there; a smaller grid keeps
+ * the interpreter's warp-per-row order. */
+extern "C" __device__ unsigned PLOW_SYM(plow_norm_rms_pf_abi) = 2;
 extern "C" __global__ void __launch_bounds__(256, 2) PLOW_SYM(plow_norm_rms_pf)(PlowProgram prog,
                                                                             unsigned inst) {
     __shared__ float part[32];
@@ -5016,7 +5022,8 @@ extern "C" __global__ void __launch_bounds__(256, 2) PLOW_SYM(plow_norm_rms_pf)(
     __syncthreads();
     d_rmsnorm((__nv_bfloat16*)NRP_TEN(rn, 0), (const __nv_bfloat16*)NRP_TEN(rn, 1),
               (const __nv_bfloat16*)NRP_TEN(rn, 2), rn->i[0], rn->i[1], rn->fj[0].f, rn->i[2], blockIdx.x,
-              gridDim.x, part, (uint8_t*)NRP_TEN(rn, 3), (float*)NRP_TEN(rn, 4));
+              gridDim.x, part, (uint8_t*)NRP_TEN(rn, 3), (float*)NRP_TEN(rn, 4),
+              gridDim.x >= rn->i[0] ? 0u : PLOW_NV_T17_MIN_ROWS);
 #undef NRP_TEN
 }
 #endif

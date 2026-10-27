@@ -1973,6 +1973,8 @@ struct SegPf {
     glu_quant_any_width: bool,
     quant_cached: Option<KernelFn>,
     norm_rms_pf: Option<KernelFn>,
+    /// `plow_norm_rms_pf` ABI 2: a grid covering the rows runs the RmsNorm one block per row.
+    norm_rms_row_grid: bool,
     rope_pf: Option<KernelFn>,
     smem_flash: u32,
     grid_flash: u32,
@@ -10727,10 +10729,9 @@ impl GpuEngine {
                 } else {
                     None
                 };
-                let norm_rms_pf = if be
-                    .module_global_u32(&m1, &format!("plow_norm_rms_pf_abi{seg_global_suffix}"))?
-                    == Some(1)
-                {
+                let norm_rms_abi = be
+                    .module_global_u32(&m1, &format!("plow_norm_rms_pf_abi{seg_global_suffix}"))?;
+                let norm_rms_pf = if matches!(norm_rms_abi, Some(1 | 2)) {
                     Some(be.get_function(&m1, &format!("plow_norm_rms_pf{seg_global_suffix}"))?)
                 } else {
                     None
@@ -10749,6 +10750,7 @@ impl GpuEngine {
                     glu_quant_any_width: glu_quant_abi == Some(2),
                     quant_cached,
                     norm_rms_pf,
+                    norm_rms_row_grid: norm_rms_abi == Some(2),
                     rope_pf,
                     masked_padding,
                     f_flash: f1,
@@ -11482,7 +11484,12 @@ impl GpuEngine {
                         light_routes.resize_with(seg + 1, || None);
                     }
                     light_routes[*seg] = Some(cublaslt::prefill_norm_rms_route(
-                        be, function, kernarg, g, insts,
+                        be,
+                        function,
+                        kernarg,
+                        g,
+                        insts,
+                        seg_pf.as_ref().is_some_and(|sp| sp.norm_rms_row_grid),
                     ));
                 }
                 if !norm_rms_segments.is_empty() {

@@ -448,6 +448,9 @@ Decode, ms per step (B=64 runs on the 128 rung once the ladder drops 64):
   route matrix).
 - Prefill attention: generated FP8-KV hd256 + hd512 on every rung ≥ 128; runner-up the
   interpreter FP8 arms (above).
+- Decode attention below the 128 rung (2026-10-27): hd256 FP8 row-group body with the staged
+  ring, hd512 tensor-core item over the 16-head group (TC16); per-rung table in the 12B
+  comparison.md "decode attention rework".
 - Decode: light FP8 attention (16-byte loads, direct V, segmented FlashDecode grid), cuBLASLt
   head at B=128, ladder without 64 (its TC64 GEMV was 3-7x slower than the 128 rung).
 
