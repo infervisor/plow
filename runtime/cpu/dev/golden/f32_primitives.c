@@ -1,6 +1,8 @@
 #include "golden.h"
 #include <stdint.h>
+#include <math.h>
 #include <stdlib.h>
+#include <string.h>
 
 static float f16_to_f32(uint16_t h) {
     const uint32_t sign = (uint32_t)(h >> 15) << 31;
@@ -538,14 +540,73 @@ G_K(g_sample_fish_bf16) {
 
 /* GemvF32Out (220): fp32 rows, sequential fma over k (the device sums lane partials, so results
  * agree to fp32 rounding, not bit for bit). */
+/* IEEE binary16 -> f32, exact (subnormals and specials included). */
+static float g_h2f(uint16_t h) {
+    const uint32_t s = (uint32_t)(h & 0x8000u) << 16, e = (h >> 10) & 0x1fu, m = h & 0x3ffu;
+    uint32_t bits;
+    if (e == 0x1fu) {
+        bits = s | 0x7f800000u | (m << 13);
+    } else if (e) {
+        bits = s | ((e + 112u) << 23) | (m << 13);
+    } else if (m) {
+        float v = (float)m * (1.0f / 16777216.0f); /* m * 2^-24 */
+        return (h & 0x8000u) ? -v : v;
+    } else {
+        bits = s;
+    }
+    float f;
+    memcpy(&f, &bits, sizeof f);
+    return f;
+}
+
 G_K(g_gemv_f32_out) {
     (void)ctx;
     float* c = PLOW_CPU_TEN(in, T, 0);
     const plow_bf16* x = PLOW_CPU_TEN(in, T, 1);
     const plow_bf16* w = PLOW_CPU_TEN(in, T, 2);
-    const uint32_t m_rows = in->i[0], n_out = in->i[1], k_in = in->i[2];
+    const uint32_t m_rows = in->i[0], n_out = in->i[1], k_in = in->i[2], flags = in->i[7];
     uint32_t lo, hi;
     g_range(n_out, slice, nblk, &lo, &hi);
+    if (flags) {
+        /* Modes (dev.rs): f32 x, f16 W, bias, residual (may alias c), activation. */
+        const float* xf = (const float*)x;
+        const uint16_t* wh = (const uint16_t*)w;
+        const float* bias = (flags & 4u) ? (const float*)PLOW_CPU_TEN(in, T, 3) : NULL;
+        const float* res = (flags & 8u) ? (const float*)PLOW_CPU_TEN(in, T, 4) : NULL;
+        const float* gamma = (flags & 256u) ? (const float*)PLOW_CPU_TEN(in, T, 5) : NULL;
+        const float* beta = (flags & 256u) ? (const float*)PLOW_CPU_TEN(in, T, 6) : NULL;
+        const uint32_t act = (flags >> 4) & 15u;
+        for (uint32_t m = 0; m < m_rows; m++) {
+            /* LayerNorm prologue (f32 x): the row's two-pass mean / variance. */
+            float mean = 0.f, rstd = 1.f;
+            if (gamma) {
+                float s = 0.f, v = 0.f;
+                for (uint32_t k = 0; k < k_in; k++) s += xf[(size_t)m * k_in + k];
+                mean = s / (float)k_in;
+                for (uint32_t k = 0; k < k_in; k++) {
+                    const float d = xf[(size_t)m * k_in + k] - mean;
+                    v = fmaf(d, d, v);
+                }
+                rstd = 1.0f / sqrtf(v / (float)k_in + in->fj[0].f);
+            }
+            for (uint32_t n = lo; n < hi; n++) {
+                float acc = 0.f;
+                for (uint32_t k = 0; k < k_in; k++) {
+                    const size_t xi = (size_t)m * k_in + k, wi = (size_t)n * k_in + k;
+                    float a = (flags & 1u) ? xf[xi] : plow_bf2f(x[xi]);
+                    if (gamma) a = fmaf((a - mean) * rstd, gamma[k], beta[k]);
+                    const float b = (flags & 2u) ? g_h2f(wh[wi]) : plow_bf2f(w[wi]);
+                    acc = fmaf(a, b, acc);
+                }
+                const size_t o = (size_t)m * n_out + n;
+                if (bias) acc += bias[n];
+                if (res) acc += res[o];
+                if (act == 1u) acc = 0.5f * acc * (1.f + erff(acc * 0.70710678118654752f));
+                c[o] = acc;
+            }
+        }
+        return;
+    }
     for (uint32_t m = 0; m < m_rows; m++)
         for (uint32_t n = lo; n < hi; n++) {
             float acc = 0.f;

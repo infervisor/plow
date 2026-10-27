@@ -20,7 +20,6 @@ use crate::codec::p_handle;
 use crate::pipeline::{
     Activation, AttentionF32Stage, BinaryF32Stage, BinaryOp, Conv1dF32Stage, CopyColsF32Stage,
     GatherRowsF32Stage, LayerNormRowsF32Stage, PacketPrefix, PadMode, StageProgram, TensorRef,
-    UnaryF32Stage,
 };
 
 pub const PACKET: &str = "depth.pkt";
@@ -186,10 +185,37 @@ pub fn lower_maya2_depth(
     Ok((prefix.model, section))
 }
 
+/// Projections over at most this many rows stream their weights through `GemvF32Out` (f32 x, f16 W);
+/// the tiled Conv1dF32 wastes most of its tile on fewer rows (132 us per 6 MB projection at B=1).
+const GEMV_ROWS: u32 = 256;
+/// The GEMV's LayerNorm prologue normalises a staged row of at most this many columns.
+const GEMV_LN_K: u32 = 1024;
+
+/// What a projection adds after the matmul: `act(acc + bias + residual)`.
+#[derive(Clone, Copy)]
+struct Epilogue<'a> {
+    bias: Option<&'a str>,
+    residual: Option<u32>,
+    gelu: bool,
+    /// LayerNorm (`{ln}.weight`, `{ln}.bias`, eps) of each x row before the matmul: fused into
+    /// the GEMV's staged rows, a separate pass before the conv.
+    ln: Option<(&'a str, f32)>,
+}
+
+impl Epilogue<'_> {
+    const NONE: Epilogue<'static> = Epilogue {
+        bias: None,
+        residual: None,
+        gelu: false,
+        ln: None,
+    };
+}
+
 /// An op chain inside one program: each op depends on the previous.
 struct Chain {
     p: StageProgram,
     last: Option<u32>,
+    n_cu: u32,
 }
 
 impl Chain {
@@ -214,6 +240,55 @@ impl Chain {
         w: &str,
         b: Option<&str>,
     ) -> Result<u32, String> {
+        self.dense_ep(x, out, rows, k, n, w, Epilogue { bias: b, ..Epilogue::NONE })
+    }
+
+    /// `act(x @ w^T + bias + residual)`: GEMV-shaped (weight streaming) up to [`GEMV_ROWS`] rows,
+    /// the tiled conv above.
+    #[allow(clippy::too_many_arguments)]
+    fn dense_ep(
+        &mut self,
+        x: u32,
+        out: &str,
+        rows: u32,
+        k: u32,
+        n: u32,
+        w: &str,
+        mut ep: Epilogue<'_>,
+    ) -> Result<u32, String> {
+        let mut x = x;
+        if rows <= GEMV_ROWS && (ep.ln.is_none() || k <= GEMV_LN_K) {
+            let deps = self.deps();
+            let o = p_handle(&self.p, out);
+            let wh = self.p.declare(w, u64::from(n) * u64::from(k) * 2);
+            let bh = ep.bias.map(|b| self.p.declare(b, u64::from(n) * 4));
+            let ln = ep.ln.map(|(name, eps)| {
+                let mut wd = |s: &str| self.p.declare(&format!("{name}.{s}"), u64::from(k) * 4);
+                (wd("weight"), wd("bias"), eps)
+            });
+            let flags = 1 | 2 | if bh.is_some() { 4 } else { 0 } | if ep.residual.is_some() { 8 } else { 0 }
+                | if ep.gelu { 1 << 4 } else { 0 }
+                | if ln.is_some() { 1 << 8 } else { 0 };
+            let none = packet::dev::TENSOR_NONE;
+            let e = self.p.raw(DevOp::GemvF32Out, u64::from(self.n_cu.min(n / 8).max(1)), &deps, o, |i| {
+                i.t[..7].copy_from_slice(&[
+                    o,
+                    x,
+                    wh,
+                    bh.unwrap_or(none),
+                    ep.residual.unwrap_or(none),
+                    ln.map_or(none, |l| l.0),
+                    ln.map_or(none, |l| l.1),
+                ]);
+                i.i[..3].copy_from_slice(&[rows, n, k]);
+                i.i[7] = flags;
+                i.f[0] = ln.map_or(0.0, |l| l.2);
+            })?;
+            return Ok(self.done(e));
+        }
+        if let Some((name, eps)) = ep.ln.take() {
+            x = self.layer_norm(x, "act.depth.h1", rows, k, name, eps)?;
+        }
         let deps = self.deps();
         let e = self.p.conv1d_f32(
             x,
@@ -222,9 +297,9 @@ impl Chain {
             Conv1dF32Stage {
                 output: TensorRef::Named(out),
                 weight: TensorRef::Named(w),
-                bias: b.map(TensorRef::Named),
+                bias: ep.bias.map(TensorRef::Named),
                 alpha: None,
-                residual: None,
+                residual: ep.residual,
                 lengths: None,
                 batch: 1,
                 in_rows: rows,
@@ -238,7 +313,11 @@ impl Chain {
                 pad_after: 0,
                 pad_mode: PadMode::Zero,
                 input_activation: Activation::None,
-                output_activation: Activation::None,
+                output_activation: if ep.gelu {
+                    Activation::GeluErf
+                } else {
+                    Activation::None
+                },
                 slope: 0.0,
                 weight_f16: true,
                 split_bf16: false,
@@ -336,9 +415,11 @@ impl Chain {
 
 fn program_for(prefix: PacketPrefix, geo: &Geo, batch: u32) -> Result<PacketPrefix, String> {
     let (dim, qkv_w, np) = (geo.dim, 3 * geo.dim, geo.positions());
+    let n_cu = prefix.model.n_cu;
     let mut c = Chain {
         p: prefix.program(),
         last: None,
+        n_cu,
     };
     let h = p_handle(&c.p, "in.depth.h");
     let x = p_handle(&c.p, "act.depth.x");
@@ -389,8 +470,12 @@ fn program_for(prefix: PacketPrefix, geo: &Geo, batch: u32) -> Result<PacketPref
         for l in 0..geo.layers {
             let w = |s: &str| format!("w.maya2.depth.groups.{g}.{l}.{s}");
             let cache = format!("act.depth.cache.{l}");
-            let h1 = c.layer_norm(x, "act.depth.h1", rows, dim, &w("n1"), geo.eps)?;
-            let qkv = c.dense(h1, "act.depth.qkv", rows, dim, qkv_w, &w("qkv.weight"), None)?;
+            let n1 = w("n1");
+            let pre = Epilogue {
+                ln: Some((&n1, geo.eps)),
+                ..Epilogue::NONE
+            };
+            let qkv = c.dense_ep(x, "act.depth.qkv", rows, dim, qkv_w, &w("qkv.weight"), pre)?;
             let (k, kv_rows, key_lengths) = if full {
                 if keep {
                     c.copy(
@@ -460,31 +545,25 @@ fn program_for(prefix: PacketPrefix, geo: &Geo, batch: u32) -> Result<PacketPref
                 },
             )?;
             let at = c.done(e);
-            let o = c.dense(at, "act.depth.h1", rows, dim, dim, &w("o.weight"), None)?;
-            c.add(x, o, rows, dim, dim)?;
-            let h2 = c.layer_norm(x, "act.depth.h1", rows, dim, &w("n2"), geo.eps)?;
-            let f = c.dense(h2, "act.depth.f", rows, dim, geo.inter, &w("f1.weight"), None)?;
-            let deps = c.deps();
-            let e = c.p.unary_f32(
-                f,
-                &deps,
-                UnaryF32Stage {
-                    output: TensorRef::Handle(f),
-                    param: None,
-                    rows,
-                    width: geo.inter,
-                    stride: 0,
-                    col0: 0,
-                    kind: Activation::GeluErf,
-                    p0: 0.0,
-                    p1: 0.0,
-                },
-            )?;
-            c.done(e);
-            let f2 = c.dense(f, "act.depth.h1", rows, geo.inter, dim, &w("f2.weight"), None)?;
-            c.add(x, f2, rows, dim, dim)?;
-            let cross = c.p.declare(&format!("w.maya2.depth.cross.{l}"), u64::from(dim) * 4);
-            c.add(x, cross, rows, dim, 0)?;
+            // x += o(attn); x += f2(gelu(f1(LN(x)))) + cross_l (the one-token cross-attention).
+            let res = Epilogue {
+                residual: Some(x),
+                ..Epilogue::NONE
+            };
+            c.dense_ep(at, "act.depth.x", rows, dim, dim, &w("o.weight"), res)?;
+            let n2 = w("n2");
+            let gelu = Epilogue {
+                gelu: true,
+                ln: Some((&n2, geo.eps)),
+                ..Epilogue::NONE
+            };
+            let f = c.dense_ep(x, "act.depth.f", rows, dim, geo.inter, &w("f1.weight"), gelu)?;
+            let cross = format!("w.maya2.depth.cross.{l}");
+            let out = Epilogue {
+                bias: Some(&cross),
+                ..res
+            };
+            c.dense_ep(f, "act.depth.x", rows, geo.inter, dim, &w("f2.weight"), out)?;
         }
         let last = if p > 1 {
             c.copy(
@@ -506,15 +585,18 @@ fn program_for(prefix: PacketPrefix, geo: &Geo, batch: u32) -> Result<PacketPref
         } else {
             x
         };
-        let yn = c.layer_norm(last, "act.depth.yn", batch, dim, "w.maya2.depth.norm", geo.eps)?;
-        let logits = c.dense(
-            yn,
+        let final_norm = Epilogue {
+            ln: Some(("w.maya2.depth.norm", geo.eps)),
+            ..Epilogue::NONE
+        };
+        let logits = c.dense_ep(
+            last,
             "act.depth.logits",
             batch,
             dim,
             geo.codes,
             &format!("w.maya2.depth.heads.{}.weight", level - 1),
-            None,
+            final_norm,
         )?;
         c.copy(
             logits,

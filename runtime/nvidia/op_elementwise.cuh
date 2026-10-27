@@ -284,6 +284,192 @@ static __device__ void d_gemv_f32out(float* __restrict__ C, const __nv_bfloat16*
     }
 }
 
+/* GemvF32Out modes (i7 != 0; Maya 2's depth projections): bit 0 x is f32, bit 1 W is f16, bit 2 adds
+ * an f32 bias t3[N], bit 3 adds an f32 residual t4[M][N] (may alias C: each element is read then
+ * written by the one lane that owns it), bits 4-7 the activation applied last (1 = GELU erf). */
+template <bool XF, bool WH>
+static __device__ void gemv_f32out_mode(float* C, const void* xv, const void* Wv, const float* bias,
+                                        const float* res, unsigned act, unsigned M, unsigned N, unsigned K,
+                                        unsigned slice, unsigned nblk) {
+    const unsigned lane = threadIdx.x & PLOW_NV_LANE_MASK;
+    const unsigned warp = threadIdx.x >> PLOW_NV_WARP_SHIFT;
+    const unsigned per = (N + nblk - 1) / nblk;
+    const unsigned n0 = slice * per;
+    const unsigned n1 = min(n0 + per, N);
+    for (unsigned n = n0 + warp; n < n1; n += PLOW_NV_WARPS) {
+        for (unsigned m0 = 0; m0 < M; m0 += 8) {
+            float acc[8];
+#pragma unroll
+            for (int m = 0; m < 8; m++) acc[m] = 0.f;
+            for (unsigned k = lane * 8u; k < K; k += 32u * 8u) {
+                float w[8];
+                const uint4 raw = *(const uint4*)((const unsigned short*)Wv + (size_t)n * K + k);
+                const unsigned short* h = (const unsigned short*)&raw;
+#pragma unroll
+                for (int e = 0; e < 8; e++)
+                    w[e] = WH ? __half2float(__ushort_as_half(h[e])) : __uint_as_float((unsigned)h[e] << 16);
+#pragma unroll
+                for (int m = 0; m < 8; m++) {
+                    if (m0 + m >= M) break;
+                    float xs[8];
+                    if (XF) {
+                        const float4* xp = (const float4*)((const float*)xv + (size_t)(m0 + m) * K + k);
+                        const float4 a = xp[0], b = xp[1];
+                        xs[0] = a.x; xs[1] = a.y; xs[2] = a.z; xs[3] = a.w;
+                        xs[4] = b.x; xs[5] = b.y; xs[6] = b.z; xs[7] = b.w;
+                    } else {
+                        const uint4 xr = *(const uint4*)((const unsigned short*)xv + (size_t)(m0 + m) * K + k);
+                        const unsigned short* xh = (const unsigned short*)&xr;
+#pragma unroll
+                        for (int e = 0; e < 8; e++) xs[e] = __uint_as_float((unsigned)xh[e] << 16);
+                    }
+#pragma unroll
+                    for (int e = 0; e < 8; e++) acc[m] = __fmaf_rn(xs[e], w[e], acc[m]);
+                }
+            }
+#pragma unroll
+            for (int m = 0; m < 8; m++) {
+                const float t = warp_sum32(acc[m]);
+                if (lane == 0 && m0 + m < M) {
+                    const size_t o = (size_t)(m0 + m) * N + n;
+                    float v = t;
+                    if (bias) v = __fadd_rn(v, bias[n]);
+                    if (res) v = __fadd_rn(v, res[o]);
+                    if (act == 1u) v = 0.5f * v * (1.f + erff(v * 0.70710678118654752f));
+                    C[o] = v;
+                }
+            }
+        }
+    }
+}
+
+/* f32 x, f16 W (modes 3): each block stages 8 rows x GEMV_KT columns of x in shared memory once and
+ * every warp reuses them for up to GEMV_CPW columns (x read from L2 once per block, not once per
+ * column). With the LayerNorm prologue (bit 8, K <= GEMV_KT) the staged rows are normalised first:
+ * fp32 two-pass mean / variance, `(x - mean) * rsqrt(var + eps) * gamma + beta`.
+ * Arena: 8 * GEMV_KT + 16 floats. */
+#define GEMV_KT 1024u
+#define GEMV_CPW 8u
+static __device__ void gemv_f32x_f16w_staged(float* C, const float* __restrict__ x, const unsigned short* __restrict__ W,
+                                             const float* bias, const float* res, const float* gamma,
+                                             const float* beta, float eps, unsigned act, unsigned M, unsigned N,
+                                             unsigned K, unsigned slice, unsigned nblk, float* arena) {
+    const unsigned lane = threadIdx.x & PLOW_NV_LANE_MASK;
+    const unsigned warp = threadIdx.x >> PLOW_NV_WARP_SHIFT;
+    const unsigned per = (N + nblk - 1) / nblk;
+    const unsigned n0 = slice * per;
+    const unsigned n1 = min(n0 + per, N);
+    float* xs = arena;
+    float* st = arena + 8u * GEMV_KT;
+    for (unsigned cb = n0; cb < n1; cb += PLOW_NV_WARPS * GEMV_CPW) {
+        for (unsigned m0 = 0; m0 < M; m0 += 8) {
+            const unsigned mr = min(8u, M - m0);
+            float acc[GEMV_CPW][8];
+#pragma unroll
+            for (unsigned j = 0; j < GEMV_CPW; j++)
+#pragma unroll
+                for (int m = 0; m < 8; m++) acc[j][m] = 0.f;
+            for (unsigned kt = 0; kt < K; kt += GEMV_KT) {
+                const unsigned kw = min(GEMV_KT, K - kt);
+                __syncthreads();
+                for (unsigned i = threadIdx.x; i < 8u * kw; i += PLOW_NV_THREADS) {
+                    const unsigned m = i / kw, k = i % kw;
+                    xs[m * GEMV_KT + k] = m < mr ? x[(size_t)(m0 + m) * K + kt + k] : 0.f;
+                }
+                __syncthreads();
+                if (gamma) {
+                    for (unsigned m = warp; m < mr; m += PLOW_NV_WARPS) {
+                        float s = 0.f;
+                        for (unsigned k = lane; k < kw; k += 32u) s += xs[m * GEMV_KT + k];
+                        const float mean = warp_sum32(s) / (float)kw;
+                        float v = 0.f;
+                        for (unsigned k = lane; k < kw; k += 32u) {
+                            const float d = xs[m * GEMV_KT + k] - mean;
+                            v = __fmaf_rn(d, d, v);
+                        }
+                        const float var = warp_sum32(v) / (float)kw;
+                        if (lane == 0) {
+                            st[2 * m] = mean;
+                            st[2 * m + 1] = rsqrtf(var + eps);
+                        }
+                    }
+                    __syncthreads();
+                    for (unsigned i = threadIdx.x; i < mr * kw; i += PLOW_NV_THREADS) {
+                        const unsigned m = i / kw, k = i % kw;
+                        float* p = xs + m * GEMV_KT + k;
+                        *p = __fmaf_rn((*p - st[2 * m]) * st[2 * m + 1], gamma[k], beta[k]);
+                    }
+                    __syncthreads();
+                }
+                for (unsigned k = lane * 8u; k < kw; k += 32u * 8u) {
+                    /* Every column's 16 B first (GEMV_CPW loads in flight per lane), then the FMAs. */
+                    uint4 wr[GEMV_CPW];
+#pragma unroll
+                    for (unsigned j = 0; j < GEMV_CPW; j++) {
+                        const unsigned n = cb + warp + j * PLOW_NV_WARPS;
+                        wr[j] = n < n1 ? *(const uint4*)(W + (size_t)n * K + kt + k) : make_uint4(0u, 0u, 0u, 0u);
+                    }
+#pragma unroll
+                    for (int m = 0; m < 8; m++) {
+                        if ((unsigned)m >= mr) break;
+                        const float4* xp = (const float4*)(xs + m * GEMV_KT + k);
+                        const float4 a = xp[0], b = xp[1];
+#pragma unroll
+                        for (unsigned j = 0; j < GEMV_CPW; j++) {
+                            const __half2* h = (const __half2*)&wr[j];
+                            const float2 w0 = __half22float2(h[0]), w1 = __half22float2(h[1]);
+                            const float2 w2 = __half22float2(h[2]), w3 = __half22float2(h[3]);
+                            float t = acc[j][m];
+                            t = __fmaf_rn(a.x, w0.x, t); t = __fmaf_rn(a.y, w0.y, t);
+                            t = __fmaf_rn(a.z, w1.x, t); t = __fmaf_rn(a.w, w1.y, t);
+                            t = __fmaf_rn(b.x, w2.x, t); t = __fmaf_rn(b.y, w2.y, t);
+                            t = __fmaf_rn(b.z, w3.x, t); t = __fmaf_rn(b.w, w3.y, t);
+                            acc[j][m] = t;
+                        }
+                    }
+                }
+            }
+#pragma unroll
+            for (unsigned j = 0; j < GEMV_CPW; j++) {
+                const unsigned n = cb + warp + j * PLOW_NV_WARPS;
+#pragma unroll
+                for (int m = 0; m < 8; m++) {
+                    const float t = warp_sum32(acc[j][m]);
+                    if (lane == 0 && n < n1 && (unsigned)m < mr) {
+                        const size_t o = (size_t)(m0 + m) * N + n;
+                        float v = t;
+                        if (bias) v = __fadd_rn(v, bias[n]);
+                        if (res) v = __fadd_rn(v, res[o]);
+                        if (act == 1u) v = 0.5f * v * (1.f + erff(v * 0.70710678118654752f));
+                        C[o] = v;
+                    }
+                }
+            }
+        }
+    }
+}
+
+static __device__ void d_gemv_f32out_mode(float* C, const void* x, const void* W, const float* bias,
+                                          const float* res, const float* gamma, const float* beta, float eps,
+                                          unsigned flags, unsigned M, unsigned N, unsigned K, unsigned slice,
+                                          unsigned nblk, float* arena) {
+    const unsigned act = (flags >> 4) & 15u;
+    bias = (flags & 4u) ? bias : nullptr;
+    res = (flags & 8u) ? res : nullptr;
+    if ((flags & 3u) == 3u) {
+        if ((flags & 256u) && K > GEMV_KT) { __trap(); return; }
+        gemv_f32x_f16w_staged(C, (const float*)x, (const unsigned short*)W, bias, res,
+                              (flags & 256u) ? gamma : nullptr, beta, eps, act, M, N, K, slice, nblk, arena);
+        return;
+    }
+    switch (flags & 3u) {
+    case 0: gemv_f32out_mode<false, false>(C, x, W, bias, res, act, M, N, K, slice, nblk); break;
+    case 1: gemv_f32out_mode<true, false>(C, x, W, bias, res, act, M, N, K, slice, nblk); break;
+    case 2: gemv_f32out_mode<false, true>(C, x, W, bias, res, act, M, N, K, slice, nblk); break;
+    default: gemv_f32out_mode<true, true>(C, x, W, bias, res, act, M, N, K, slice, nblk); break;
+    }
+}
+
 /* SampleSmallF32 (op 221): one block per row of f32 logits; see dev.rs. Arena: PLOW_NV_WARPS u64 +
  * PLOW_NV_WARPS f32 reduction slots, 64 selected classes and values, then the row (f32). */
 static __device__ __forceinline__ unsigned long long f32_key(float f, unsigned i) {
