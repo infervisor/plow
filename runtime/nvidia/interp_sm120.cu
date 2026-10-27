@@ -5004,8 +5004,11 @@ extern "C" __global__ void __launch_bounds__(256) PLOW_SYM(plow_rope_pf)(PlowPro
 /* A prefill NormResidual and the RmsNorm reading its output (instruction inst + 1) as one launch
  * of any grid: both bodies take rows {blockIdx.x + k * gridDim.x}, so the block that wrote a row
  * normalizes it, and each row's arithmetic is the interpreter's. The interpreter runs them on its
- * one CTA per SM, ~31 latency-bound rows per block at 4096 rows. */
-extern "C" __device__ unsigned PLOW_SYM(plow_norm_rms_pf_abi) = 1;
+ * one CTA per SM, ~31 latency-bound rows per block at 4096 rows.
+ * ABI 2: a grid that covers the rows runs the RmsNorm one block per row (the walk below the T17
+ * threshold) instead of one warp per row, which left 7 of 8 warps idle there; a smaller grid keeps
+ * the interpreter's warp-per-row order. */
+extern "C" __device__ unsigned PLOW_SYM(plow_norm_rms_pf_abi) = 2;
 extern "C" __global__ void __launch_bounds__(256, 2) PLOW_SYM(plow_norm_rms_pf)(PlowProgram prog,
                                                                             unsigned inst) {
     __shared__ float part[32];
@@ -5019,7 +5022,8 @@ extern "C" __global__ void __launch_bounds__(256, 2) PLOW_SYM(plow_norm_rms_pf)(
     __syncthreads();
     d_rmsnorm((__nv_bfloat16*)NRP_TEN(rn, 0), (const __nv_bfloat16*)NRP_TEN(rn, 1),
               (const __nv_bfloat16*)NRP_TEN(rn, 2), rn->i[0], rn->i[1], rn->fj[0].f, rn->i[2], blockIdx.x,
-              gridDim.x, part, (uint8_t*)NRP_TEN(rn, 3), (float*)NRP_TEN(rn, 4));
+              gridDim.x, part, (uint8_t*)NRP_TEN(rn, 3), (float*)NRP_TEN(rn, 4),
+              gridDim.x >= rn->i[0] ? 0u : PLOW_NV_T17_MIN_ROWS);
 #undef NRP_TEN
 }
 #endif

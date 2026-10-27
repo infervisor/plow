@@ -125,6 +125,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut prefill_logits_dir = None::<std::path::PathBuf>;
     let mut ride: Option<(usize, Vec<usize>)> = None;
     let mut ride_dump = None::<std::path::PathBuf>;
+    let mut ride_prefix = 0usize;
     let (mut dump_names, mut dump_dir) = (None::<String>, None::<String>);
     let mut spec = SpecArgs::default();
     let mut prompt_file = None::<String>;
@@ -201,6 +202,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 ride = Some((rows, widths));
             }
             "--ride-dump" => ride_dump = Some(args.next().ok_or("--ride-dump dir")?.into()),
+            "--ride-prefix" => ride_prefix = args.next().ok_or("--ride-prefix N")?.parse()?,
             other => return Err(format!("unknown argument {other}").into()),
         }
     }
@@ -413,6 +415,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             steps,
             *rows,
             widths,
+            ride_prefix,
             ride_dump.as_deref(),
         );
     }
@@ -642,6 +645,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 /// `W` rows. Every arm rewinds the slots first, so context and inputs are fixed; arms interleave
 /// per iteration. The riders' logits are compared in process with the standalone step's;
 /// `--ride-dump DIR` also writes both (bf16, `W x vocab`) for cross-run comparison.
+/// `--ride-prefix N`: the prefill slots first hold N prompt tokens (a cached prefix), and every
+/// arm rewinds them to N, so the launch's rows attend to N + their own rows.
 #[cfg(feature = "cuda")]
 fn ride_bench(
     e: &mut plowrt::exec::gpu::GpuEngine,
@@ -650,6 +655,7 @@ fn ride_bench(
     iters: usize,
     rows: usize,
     widths: &[usize],
+    prefix: usize,
     dump: Option<&std::path::Path>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     use plow_asset::token_batch::{Phase, Request, Selection};
@@ -673,8 +679,33 @@ fn ride_bench(
     let prompt: Vec<u32> = (0..2 * chunk as u32)
         .map(|i| 1000 + (i * 7919) % 50000)
         .collect();
+    let head: Vec<u32> = (0..prefix as u32)
+        .map(|i| 2000 + (i * 6007) % 50000)
+        .collect();
     for i in 0..fills.len() {
-        e.begin_slot(first + i, prompt.len() + 1)?;
+        e.begin_slot(first + i, prefix + prompt.len() + 1)?;
+    }
+    if prefix > 0 {
+        let generations: Vec<u32> = (0..fills.len())
+            .map(|i| e.slot_generation(first + i).expect("slot"))
+            .collect();
+        let mut out = Vec::new();
+        for c0 in (0..prefix).step_by(chunk) {
+            let part = &head[c0..(c0 + chunk).min(prefix)];
+            let reqs: Vec<Request<'_>> = (0..fills.len())
+                .map(|i| Request {
+                    id: (first + i) as u32,
+                    slot: (first + i) as u32,
+                    state_slot: (first + i) as u32,
+                    generation: generations[i],
+                    phase: Phase::Prefill,
+                    tokens: part,
+                    prompt_len: (prefix + prompt.len()) as u32,
+                    selection: Selection::default(),
+                })
+                .collect();
+            e.token_batch_step(&reqs, &mut out)?;
+        }
     }
     // A recurrent chain rewinds through the state snapshot taken at the rewind position: the
     // decode slots at ctx, the prefill slots fresh at 0.
@@ -692,7 +723,7 @@ fn ride_bench(
             e.rewind_slot(b, ctx)?;
         }
         for i in 0..fills.len() {
-            e.rewind_slot(first + i, 0)?;
+            e.rewind_slot(first + i, prefix)?;
         }
         Ok(())
     };
@@ -709,7 +740,7 @@ fn ride_bench(
             tokens,
             prompt_len: match phase {
                 Phase::Decode | Phase::Verify => ctx as u32,
-                Phase::Prefill => prompt.len() as u32,
+                Phase::Prefill => (prefix + prompt.len()) as u32,
             },
             selection: Selection::default(),
         };
@@ -810,7 +841,7 @@ fn ride_bench(
         }
         let (p, r, s) = (median(&mut pure), median(&mut ride), median(&mut step));
         println!(
-            "RIDE rows={rows} w={w} ctx={ctx} n={iters} pure_ms={p:.3} ride_ms={r:.3} step_ms={s:.3} per_rider_ms={:.4} saved_ms={:.3}",
+            "RIDE rows={rows} w={w} ctx={ctx} prefix={prefix} n={iters} pure_ms={p:.3} ride_ms={r:.3} step_ms={s:.3} per_rider_ms={:.4} saved_ms={:.3}",
             (r - p) / w as f64,
             p + s - r
         );

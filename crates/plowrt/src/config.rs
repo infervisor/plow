@@ -1639,6 +1639,12 @@ pub struct NvidiaRuntimeConfig {
     )]
     pub lt_fp8_fast_accum_max_k: Option<u32>,
 
+    /// Prefill light NormResidual+RmsNorm launches of at most this many rows run one block per
+    /// row when the segment object supports it (`plow_norm_rms_pf` ABI 2); larger launches keep
+    /// one warp per row. 0 = always warp per row.
+    #[arg(long = "pf-norm-row-blocks", env = "PLOW_PF_NORM_ROW_BLOCKS", default_value_t = 0, global = true)]
+    pub pf_norm_row_blocks: u32,
+
     /// `<cubin sha256>:<host library sha256>` of `cutlass_fp8_decode_sm90.cubin` and its Params
     /// marshaller `libplow_cutlass_fp8_decode_sm90.so` in `--pf-seg-dir`: routed FP8 W8A8 decode
     /// projections with M <= 128 run those CUTLASS swap-AB kernels instead of cuBLASLt (no ~13 us
