@@ -2707,6 +2707,13 @@ mod tests {
         }
         g.insts[2].t = [packet::dev::TENSOR_NONE16; 8];
         assert!(glu_output_unread(&g, 0) && glu_output_unread(&g, 1));
+        // A GLU quant naming it beyond its output slot, or missing gate or up, reads it.
+        for (slot, value) in [(3, 7), (5, 7), (4, packet::dev::TENSOR_NONE16)] {
+            let keep = g.insts[1].t[slot];
+            g.insts[1].t[slot] = value;
+            assert!(!glu_output_unread(&g, 0), "slot {slot}");
+            g.insts[1].t[slot] = keep;
+        }
         // A plain quant reading it (t[1] = source, no gate/up) is a reader.
         g.insts[2].op = DevOp::QuantFp8 as u16;
         g.insts[2].t[1] = 7;
