@@ -914,13 +914,23 @@ pub(super) fn prefill_glu_quant_route(
     route
 }
 
+/// Every layer's GLU quant writes the same activation, so another GLU quant naming it in its
+/// output slot (and nowhere else) is a writer, not a reader.
 fn glu_output_unread(g: &DevProg, inst: usize) -> bool {
     let output = g.insts[inst].t[1];
-    output != packet::dev::TENSOR_NONE16
+    let none = packet::dev::TENSOR_NONE16;
+    let glu_writer = |d: &packet::dev::DevInst64| {
+        d.op == DevOp::QuantFp8 as u16
+            && d.t[1] == output
+            && d.t[3] != none
+            && d.t[4] != none
+            && d.t.iter().filter(|&&t| t == output).count() == 1
+    };
+    output != none
         && g.insts
             .iter()
             .enumerate()
-            .all(|(i, d)| i == inst || !d.t.contains(&output))
+            .all(|(i, d)| i == inst || glu_writer(d) || !d.t.contains(&output))
 }
 
 /// Segments that are exactly a prefill NormResidual and the RmsNorm reading its output (the next
@@ -2686,6 +2696,26 @@ mod tests {
             },
             tensors,
         )
+    }
+
+    #[test]
+    fn glu_output_shared_by_layer_writers_is_unread() {
+        let (mut g, _) = fixture(128);
+        for i in [0, 1] {
+            g.insts[i].op = DevOp::QuantFp8 as u16;
+            g.insts[i].t[..5].copy_from_slice(&[10 + i as u16, 7, 20 + i as u16, 3, 4]);
+        }
+        g.insts[2].t = [packet::dev::TENSOR_NONE16; 8];
+        assert!(glu_output_unread(&g, 0) && glu_output_unread(&g, 1));
+        // A plain quant reading it (t[1] = source, no gate/up) is a reader.
+        g.insts[2].op = DevOp::QuantFp8 as u16;
+        g.insts[2].t[1] = 7;
+        assert!(!glu_output_unread(&g, 0));
+        // So is any other op naming it.
+        g.insts[2].op = DevOp::Glu as u16;
+        g.insts[2].t[1] = packet::dev::TENSOR_NONE16;
+        g.insts[2].t[0] = 7;
+        assert!(!glu_output_unread(&g, 0));
     }
 
     #[test]
