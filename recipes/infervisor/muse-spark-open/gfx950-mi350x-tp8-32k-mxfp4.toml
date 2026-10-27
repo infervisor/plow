@@ -8,6 +8,9 @@
 # walk top1_decisive 0.996, mean |dlogprob| 0.058; prefill buckets 1.0 / 0.071 (gates >= 0.95,
 # <= 0.1). Per-block prefill vs the W4A16 oracle is rel_l2 0.04-0.07 (A4W4 activation quant and
 # router near-ties; kernels match an A4W4 oracle fed device inputs at 0.012).
+# The measurements above were taken at plow_git below (branch muse-spark-s1s2). Consolidation into
+# kv-block-store (2026-10-26) renumbered the Muse ops to 226..229 to clear the speech ops at 218..225:
+# packets emitted at that commit do not load on later plowrt; re-emit and re-qualify before serving.
 
 schema = "plow.recipe.v1"
 namespace = "infervisor"
@@ -15,6 +18,7 @@ name = "muse-spark-open"
 label = "gfx950-mi350x-tp8-32k-mxfp4"
 network = "muse-spark-open"
 status = "emits"
+plow_git = "569377358663f5a3425cfaa5f875b65f95ccf065"
 
 [target]
 vendor = "amd"
