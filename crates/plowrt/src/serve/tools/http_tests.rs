@@ -1162,3 +1162,71 @@ async fn a_silent_guarded_turn_is_regenerated_from_its_trace() {
     let (_, v) = h.json(json!({"messages": user("hi")})).await;
     assert_eq!(v["choices"][0]["message"]["content"], "एक सेकंड।");
 }
+
+/// The response carries what OpenAI, vLLM and llama.cpp clients each read: the trace under
+/// `reasoning` and `reasoning_content`, `system_fingerprint` on the body and every chunk, `logprobs`
+/// and `refusal` as `null`; llama.cpp's request names are accepted.
+#[tokio::test]
+async fn responses_carry_the_fields_openai_vllm_and_llamacpp_clients_read() {
+    let h = harness_for("qwen3");
+    let pieces = toks("<think>plan</think>Four.");
+    let pieces: Vec<&str> = pieces.iter().map(String::as_str).collect();
+    h.reply(&pieces);
+    let (code, v) = h.json(json!({"messages": user("2+2?")})).await;
+    assert_eq!(code, StatusCode::OK, "{v}");
+    let c = &v["choices"][0];
+    assert_eq!(
+        (
+            c["message"]["reasoning"].as_str(),
+            c["message"]["reasoning_content"].as_str()
+        ),
+        (Some("plan"), Some("plan"))
+    );
+    assert_eq!(c["message"]["content"], "Four.");
+    assert!(c["message"]["refusal"].is_null() && c["message"].get("refusal").is_some());
+    assert!(c["logprobs"].is_null() && c.get("logprobs").is_some());
+    assert_eq!(
+        v["system_fingerprint"],
+        crate::serve::openai::SYSTEM_FINGERPRINT
+    );
+    let (frames, _) = h.sse(json!({"messages": user("2+2?")})).await;
+    assert!(frames
+        .iter()
+        .all(|f| f["system_fingerprint"] == crate::serve::openai::SYSTEM_FINGERPRINT));
+    let both: String = frames
+        .iter()
+        .filter_map(|f| f["choices"][0]["delta"]["reasoning_content"].as_str())
+        .collect();
+    let (_, reasoning, _, _) = accumulate(&frames);
+    assert_eq!((reasoning.as_str(), both.as_str()), ("plan", "plan"));
+    // include_reasoning: false drops both names
+    let (_, v) = h
+        .json(json!({"messages": user("2+2?"), "include_reasoning": false}))
+        .await;
+    let m = &v["choices"][0]["message"];
+    assert!(m.get("reasoning").is_none() && m.get("reasoning_content").is_none());
+    // llama.cpp: the trace left in `content`
+    let (_, v) = h
+        .json(json!({"messages": user("2+2?"), "reasoning_format": "none"}))
+        .await;
+    assert_eq!(
+        v["choices"][0]["message"]["content"],
+        "<think>plan</think>Four."
+    );
+    let (code, v) = h
+        .json(json!({"messages": user("2+2?"), "reasoning_format": "deepseek-legacy"}))
+        .await;
+    assert_eq!(
+        (code, v["error"]["param"].as_str()),
+        (StatusCode::BAD_REQUEST, Some("reasoning_format"))
+    );
+    // llama.cpp's budget names are `thinking_token_budget`
+    for name in ["reasoning_budget_tokens", "thinking_budget_tokens"] {
+        let (code, v) = h.json(json!({"messages": user("2+2?"), name: -2})).await;
+        assert_eq!(
+            (code, v["error"]["param"].as_str()),
+            (StatusCode::BAD_REQUEST, Some("thinking_token_budget")),
+            "{name}"
+        );
+    }
+}

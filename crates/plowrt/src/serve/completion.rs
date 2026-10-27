@@ -563,6 +563,7 @@ async fn buffer_and_reply(
         object: "text_completion",
         created,
         model,
+        system_fingerprint: crate::serve::openai::SYSTEM_FINGERPRINT,
         choices: vec![CompletionChoice {
             index: 0,
             text,
@@ -705,6 +706,7 @@ fn sse_response(
                     object: "text_completion",
                     created,
                     model: st.model.clone(),
+                    system_fingerprint: crate::serve::openai::SYSTEM_FINGERPRINT,
                     choices: Vec::new(),
                     usage: Some(usage),
                     token_ids: None,
@@ -774,6 +776,7 @@ mod tests {
             object: "text_completion",
             created: 0,
             model: "model".into(),
+            system_fingerprint: crate::serve::openai::SYSTEM_FINGERPRINT,
             choices: vec![CompletionChoice {
                 index: 0,
                 text: "x".into(),

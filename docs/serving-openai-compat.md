@@ -104,8 +104,22 @@ emitter exists. Likewise `kimi_k25` — the two Kimi-K2.5 checkpoints on this ho
 **Reasoning is split from the answer.** With thinking left open the raw generation is
 `<trace></think><answer>`, and `</think>` is `special: false` in GLM's added tokens, so
 `skip_special_tokens` does NOT remove it. `content` now carries the answer alone and the trace
-goes to `reasoning` (vLLM 0.28's name; a turn with only a trace answers `content: null`), on both
-the buffered and the streamed path. History accepts `reasoning` or `reasoning_content`.
+goes to `reasoning` (vLLM's name) and, the same text, to `reasoning_content` (llama.cpp's, SGLang's
+and DeepSeek's, and vLLM's before its rename), so a client written for any of them finds it; a
+turn with only a trace answers `content: null`, on both the buffered and the streamed path.
+History accepts `reasoning` or `reasoning_content`.
+
+**Wire shape against OpenAI, vLLM 0.32 and llama.cpp.** Checked by diffing the three servers' raw
+JSON for one request on Qwen3-0.6B and parsing plow's with the `openai` SDK's own types (every
+response and chunk validates as `ChatCompletion` / `ChatCompletionChunk`). Every body and chunk
+carries `system_fingerprint` (`fp_plowrt_<version>`); `choices[].logprobs` and
+`message.refusal` are `null` when unset rather than absent, as OpenAI sends them. llama.cpp's
+request names are accepted: `reasoning_budget_tokens` / `thinking_budget_tokens` as
+`thinking_token_budget`, `reasoning_budget_message` as the text before the close marker
+(`reasoning_end` without it), and `reasoning_format` — `"none"` leaves the trace, tags included,
+in `content`; `"auto"` / `"deepseek"` split it; anything else is a 400. Not carried: vLLM's
+engine-internal fields (`stop_reason`, `token_ids`, `prompt_token_ids`, `kv_transfer_params`) and
+llama.cpp's `timings`; plow's own extensions stay `x_plow_*`.
 
 **The asset bundle must carry the tokenizer-side files.** It used to symlink `tokenizer.json`
 alone, so the template was unreachable, the Qwen2 pre-tokenizer fix-up could never fire, and

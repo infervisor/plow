@@ -12421,6 +12421,7 @@ mod host_bench {
                 object: "text_completion",
                 created: 1_789_920_673,
                 model: model.clone(),
+                system_fingerprint: crate::serve::openai::SYSTEM_FINGERPRINT,
                 choices: vec![CompletionChoice {
                     index: 0,
                     text: if i % 2 == 0 {

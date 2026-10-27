@@ -119,7 +119,6 @@ impl Serialize for Deltas<'_> {
 struct ChoiceFrame<'a> {
     index: u32,
     delta: DeltaFrame<'a>,
-    #[serde(skip_serializing_if = "Option::is_none")]
     logprobs: Option<&'a crate::serve::logprobs::ChatLogprobs>,
     finish_reason: Option<&'static str>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -132,8 +131,8 @@ struct DeltaFrame<'a> {
     role: Option<&'static str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     content: Option<&'a str>,
-    #[serde(rename = "reasoning", skip_serializing_if = "Option::is_none")]
-    reasoning_content: Option<&'a str>,
+    #[serde(flatten)]
+    reasoning_content: crate::serve::openai::Reasoning<&'a str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     tool_calls: Option<Deltas<'a>>,
 }
@@ -161,7 +160,9 @@ impl Step<'_> {
             delta: DeltaFrame {
                 role,
                 content: self.content,
-                reasoning_content: self.reasoning.filter(|_| reasoning),
+                reasoning_content: crate::serve::openai::Reasoning(
+                    self.reasoning.filter(|_| reasoning),
+                ),
                 tool_calls: self.tool_calls,
             },
             logprobs,

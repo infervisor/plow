@@ -185,6 +185,8 @@ impl FrameHead {
         head.extend_from_slice(created.to_string().as_bytes());
         head.extend_from_slice(b",\"model\":");
         let _ = serde_json::to_writer(&mut head, model);
+        head.extend_from_slice(b",\"system_fingerprint\":");
+        let _ = serde_json::to_writer(&mut head, crate::serve::openai::SYSTEM_FINGERPRINT);
         head.extend_from_slice(b",\"choices\":[");
         FrameHead(head)
     }
@@ -262,6 +264,7 @@ mod tests {
                 object: "text_completion",
                 created: 1_789_920_673,
                 model: "gemma\n4".into(),
+                system_fingerprint: crate::serve::openai::SYSTEM_FINGERPRINT,
                 choices: vec![choice.clone()],
                 usage: None,
                 token_ids: None,
@@ -273,7 +276,7 @@ mod tests {
                 delta: Delta {
                     role: Some("assistant"),
                     content: Some(text.clone()),
-                    reasoning_content: None,
+                    reasoning_content: crate::serve::openai::Reasoning(None),
                     tool_calls: None,
                 },
                 logprobs: None,
@@ -286,6 +289,7 @@ mod tests {
                 object: "chat.completion.chunk",
                 created: 7,
                 model: "m".into(),
+                system_fingerprint: crate::serve::openai::SYSTEM_FINGERPRINT,
                 choices: vec![c.clone()],
                 usage: None,
             };

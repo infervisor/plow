@@ -261,6 +261,19 @@ async fn chat_completions_with(
             Some(e.field.into()),
         );
     }
+    if req
+        .reasoning_format
+        .as_deref()
+        .is_some_and(|f| !matches!(f, "none" | "auto" | "deepseek"))
+    {
+        return crate::serve::api_error(
+            axum::http::StatusCode::BAD_REQUEST,
+            "`reasoning_format` must be \"none\" (the trace stays in `content`), \"auto\" or \"deepseek\"",
+            "invalid_request_error",
+            Some("invalid_value"),
+            Some("reasoning_format".into()),
+        );
+    }
     if let Err((field, message)) = crate::serve::config::check_thinking(
         defaults_of.as_deref().and_then(|b| b.reasoning().markers()),
         req.thinking_token_budget,
@@ -552,10 +565,16 @@ async fn chat_completions_with(
         }
         prompt.push_str(o);
     }
+    // llama.cpp's `reasoning_format: "none"`: the trace is not split out of `content`.
+    let split_mode = if req.reasoning_format.as_deref() == Some("none") {
+        crate::serve::reasoning::ReasoningMode::None
+    } else {
+        reasoning_mode
+    };
     let tool_stream = response_stream(
         &tool_plan,
         tool_support,
-        reasoning_mode,
+        split_mode,
         reasoning_open,
         &bundle,
         req.stream,
@@ -654,9 +673,15 @@ async fn chat_completions_with(
         let budget = asked.filter(|_| thinking);
         // Thinking off for this request leaves a budget nothing to bound.
         if budget.is_some() || reply_cap.is_some() || stop_blank || live || steer {
+            // llama.cpp's `reasoning_budget_message` is the bridge without the close marker.
+            let message_end = req
+                .reasoning_budget_message
+                .as_ref()
+                .map(|m| format!("{m}{}", reasoning_mode.close_marker().unwrap_or_default()));
             let end = req
                 .reasoning_end
                 .as_deref()
+                .or(message_end.as_deref())
                 .or(defaults.and_then(|d| d.reasoning_end.as_deref()))
                 .unwrap_or("");
             let mut forced_end = bundle.tokenizer().encode_with_special_tokens(end, false);
@@ -861,7 +886,7 @@ async fn chat_completions_with(
             t_arrive,
             n_prompt,
             created,
-            reasoning_mode,
+            split_mode,
             reasoning_open,
             include_reasoning,
             lp_fmt,
@@ -880,7 +905,7 @@ async fn chat_completions_with(
             requested_model,
             rx,
             created,
-            reasoning_mode,
+            split_mode,
             reasoning_open,
             include_reasoning,
             lp_fmt,
@@ -1421,12 +1446,14 @@ async fn buffer_and_reply(
         object: "chat.completion",
         created,
         model,
+        system_fingerprint: crate::serve::openai::SYSTEM_FINGERPRINT,
         choices: vec![Choice {
             index: 0,
             message: ResponseMessage {
                 role: "assistant",
                 content: answer,
-                reasoning_content: reasoning,
+                refusal: None,
+                reasoning_content: crate::serve::openai::Reasoning(reasoning),
                 tool_calls: (!calls.is_empty()).then_some(calls),
             },
             logprobs: lp_fmt.map(|_| crate::serve::logprobs::ChatLogprobs {
@@ -1759,8 +1786,9 @@ fn sse_response(
                                     delta: Delta {
                                         role,
                                         content,
-                                        reasoning_content: reasoning
-                                            .filter(|_| st.include_reasoning),
+                                        reasoning_content: crate::serve::openai::Reasoning(
+                                            reasoning.filter(|_| st.include_reasoning),
+                                        ),
                                         tool_calls: None,
                                     },
                                     logprobs,
@@ -1816,8 +1844,9 @@ fn sse_response(
                                     delta: Delta {
                                         role: None,
                                         content: (!c.is_empty()).then_some(c),
-                                        reasoning_content:
+                                        reasoning_content: crate::serve::openai::Reasoning(
                                             (st.include_reasoning && !r.is_empty()).then_some(r),
+                                        ),
                                         tool_calls: None,
                                     },
                                     logprobs: None,
@@ -1833,12 +1862,13 @@ fn sse_response(
                             object: "chat.completion.chunk",
                             created,
                             model: st.model.clone(),
+                            system_fingerprint: crate::serve::openai::SYSTEM_FINGERPRINT,
                             choices: vec![ChunkChoice {
                                 index: 0,
                                 delta: Delta {
                                     role: None,
                                     content: None,
-                                    reasoning_content: None,
+                                    reasoning_content: crate::serve::openai::Reasoning(None),
                                     tool_calls: None,
                                 },
                                 logprobs: None,
@@ -1898,7 +1928,9 @@ fn sse_response(
                             delta: Delta {
                                 role: None,
                                 content: flushed_c,
-                                reasoning_content: flushed_r.filter(|_| st.include_reasoning),
+                                reasoning_content: crate::serve::openai::Reasoning(
+                                    flushed_r.filter(|_| st.include_reasoning),
+                                ),
                                 tool_calls: None,
                             },
                             logprobs: None,
@@ -1920,6 +1952,7 @@ fn sse_response(
                                 object: "chat.completion.chunk",
                                 created,
                                 model: st.model.clone(),
+                                system_fingerprint: crate::serve::openai::SYSTEM_FINGERPRINT,
                                 choices: Vec::new(),
                                 usage: Some({
                                     let mut u: Usage = usage.into();
