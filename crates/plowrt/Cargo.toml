@@ -246,6 +246,14 @@ name = "codec_compile"
 path = "examples/codec_compile.rs"
 
 [[example]]
+name = "maya2_depth_compile"
+path = "examples/maya2_depth_compile.rs"
+
+[[example]]
+name = "packet_ops"
+path = "examples/packet_ops.rs"
+
+[[example]]
 name = "packet_run"
 path = "examples/packet_run.rs"
 

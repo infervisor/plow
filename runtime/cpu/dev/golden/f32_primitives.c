@@ -401,11 +401,43 @@ G_K(g_embed_frame_bf16) {
     const plow_bf16* cb = PLOW_CPU_TEN(in, T, 3);
     const uint32_t* codes = PLOW_CPU_TEN(in, T, 4);
     const uint32_t rows = in->i[0], width = in->i[1], vocab = in->i[2], K = in->i[3];
-    const uint32_t cb_size = in->i[4], frame_lo = in->i[5], frame_rows = in->i[6];
+    const uint32_t cb_size = in->i[4], frame_lo = in->i[5], frame_rows = in->i[6], mode = in->i[7];
     const float div = in->fj[0].f;
     const uint64_t count64 = (uint64_t)rows * width;
     if (!rows || !width || !vocab || count64 > UINT32_MAX) return;
     uint32_t lo, hi;
+    if (mode & 2u) {
+        /* RMS-normalised frame rows (Maya 2): one row per slice unit, the row's mean square first. */
+        const float* nw = PLOW_CPU_TEN(in, T, 5);
+        const float eps = in->fj[1].f;
+        g_range(rows, slice, nblk, &lo, &hi);
+        for (uint32_t row = lo; row < hi; row++) {
+            const uint32_t tok = tokens[row];
+            if (tok >= vocab) return;
+            plow_bf16* o = out + (size_t)row * width;
+            if (tok - frame_lo >= frame_rows) {
+                for (uint32_t i = 0; i < width; i++) o[i] = table[(size_t)tok * width + i];
+                continue;
+            }
+            float ss = 0.f;
+            for (uint32_t i = 0; i < width; i++) {
+                float s = 0.f;
+                for (uint32_t k = 0; k < K; k++) {
+                    const uint32_t code = codes[(size_t)row * K + k];
+                    if (code >= cb_size) return;
+                    s += plow_bf2f(cb[((size_t)k * cb_size + code) * width + i]);
+                }
+                const float sb = plow_bf2f(plow_f2bf(s));
+                const float t = (mode & 1u) ? sb : plow_bf2f(plow_f2bf(plow_bf2f(table[(size_t)tok * width + i]) + sb));
+                o[i] = plow_f2bf(t / div);
+                const float y = plow_bf2f(o[i]);
+                ss += y * y;
+            }
+            const float inv = 1.0f / sqrtf(ss / (float)width + eps);
+            for (uint32_t i = 0; i < width; i++) o[i] = plow_f2bf(plow_bf2f(o[i]) * inv * nw[i]);
+        }
+        return;
+    }
     g_range((uint32_t)count64, slice, nblk, &lo, &hi);
     for (uint32_t index = lo; index < hi; index++) {
         const uint32_t row = index / width, column = index % width, tok = tokens[row];
@@ -421,7 +453,8 @@ G_K(g_embed_frame_bf16) {
             if (code >= cb_size) return;
             s += plow_bf2f(cb[((size_t)k * cb_size + code) * width + column]);
         }
-        const float t = plow_bf2f(plow_f2bf(plow_bf2f(a) + plow_bf2f(plow_f2bf(s))));
+        const float sb = plow_bf2f(plow_f2bf(s));
+        const float t = (mode & 1u) ? sb : plow_bf2f(plow_f2bf(plow_bf2f(a) + sb));
         out[index] = plow_f2bf(t / div);
     }
 }

@@ -117,12 +117,15 @@ static __device__ void d_embed_pos(__nv_bfloat16* __restrict__ out, const __nv_b
     }
 }
 
-/* EmbedFrameBf16 (op 218): a frame token adds its K codebook rows (bf16 sum), then / div; see dev.rs. */
+/* EmbedFrameBf16 (op 218): a frame token adds its K codebook rows (bf16 sum), then / div; mode bit 0
+ * drops the token row, bit 1 RMS-normalises the frame row (fp32 weight `nw`, eps); see dev.rs.
+ * Arena (bit 1): PLOW_NV_WARPS f32 reduction slots. */
 static __device__ void d_embed_frame(__nv_bfloat16* __restrict__ out, const __nv_bfloat16* __restrict__ table,
                                      const unsigned* __restrict__ tokens, const __nv_bfloat16* __restrict__ cb,
-                                     const unsigned* __restrict__ codes, unsigned rows, unsigned width,
-                                     unsigned vocab, unsigned K, unsigned cb_size, unsigned frame_lo,
-                                     unsigned frame_rows, float div, unsigned slice, unsigned nblk) {
+                                     const unsigned* __restrict__ codes, const float* __restrict__ nw,
+                                     unsigned rows, unsigned width, unsigned vocab, unsigned K,
+                                     unsigned cb_size, unsigned frame_lo, unsigned frame_rows, unsigned mode,
+                                     float div, float eps, unsigned slice, unsigned nblk, float* arena) {
     for (unsigned r = slice; r < rows; r += nblk) {
         const unsigned tok = tokens[r];
         if (tok >= vocab) { __trap(); return; }
@@ -135,14 +138,23 @@ static __device__ void d_embed_frame(__nv_bfloat16* __restrict__ out, const __nv
         const unsigned* c = codes + (size_t)r * K;
         for (unsigned k = 0; k < K; k++)
             if (c[k] >= cb_size) { __trap(); return; }
+        float ss = 0.f;
         for (unsigned i = threadIdx.x; i < width; i += PLOW_NV_THREADS) {
             float s = 0.f;
             for (unsigned k = 0; k < K; k++)
                 s += __bfloat162float(cb[((size_t)k * cb_size + c[k]) * width + i]);
-            const float t = __bfloat162float(__float2bfloat16_rn(
-                __bfloat162float(a[i]) + __bfloat162float(__float2bfloat16_rn(s))));
+            const float sb = __bfloat162float(__float2bfloat16_rn(s));
+            const float t = (mode & 1u) ? sb
+                                        : __bfloat162float(__float2bfloat16_rn(__bfloat162float(a[i]) + sb));
             o[i] = __float2bfloat16_rn(__fdiv_rn(t, div));
+            const float y = __bfloat162float(o[i]);
+            ss = __fmaf_rn(y, y, ss);
         }
+        if (!(mode & 2u)) continue;
+        const float inv = rsqrtf(__fadd_rn(__fdiv_rn(block_sum(ss, arena), (float)width), eps));
+        for (unsigned i = threadIdx.x; i < width; i += PLOW_NV_THREADS)
+            o[i] = __float2bfloat16_rn(__fmul_rn(__fmul_rn(__bfloat162float(o[i]), inv), nw[i]));
+        __syncthreads();
     }
 }
 

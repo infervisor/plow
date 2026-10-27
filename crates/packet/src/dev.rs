@@ -2430,9 +2430,12 @@ pub enum DevOp {
     /// row r is a frame row when `frame_lo <= tokens[r] < frame_lo + frame_rows`, then
     /// `out[r] = bf16(bf16(table[tokens[r]] + bf16(sum_k cb_table[k*cb_size + codes[r*K + k]])) / div)`
     /// (torch's bf16 order: the codebook sum rounds once), else `out[r] = table[tokens[r]]`.
+    /// `i7` mode bits (Maya 2 feedback): bit 0 drops the token row (`bf16(bf16(sum) / div)`); bit 1
+    /// then RMS-normalises each frame row, `bf16(y * rsqrt(mean(y^2) + f1) * nw)` over the bf16 `y`,
+    /// fp32 math and weight `t5=nw(f32[width])`, one rounding (torch `nn.RMSNorm` on a bf16 input).
     /// `t0=out(bf16[rows,width]) t1=table(bf16[vocab,width]) t2=tokens(u32[rows])
-    /// t3=cb_table(bf16[K*cb_size,width]) t4=codes(u32[rows,K])` ·
-    /// `i0=rows i1=width i2=vocab i3=K i4=cb_size i5=frame_lo i6=frame_rows` · `f0=div`.
+    /// t3=cb_table(bf16[K*cb_size,width]) t4=codes(u32[rows,K]) t5=nw?` ·
+    /// `i0=rows i1=width i2=vocab i3=K i4=cb_size i5=frame_lo i6=frame_rows i7=mode` · `f0=div f1=eps`.
     /// A token >= vocab or a frame code >= cb_size traps.
     EmbedFrameBf16 = 218,
     /// Fish S2 sampling of a bf16 logit row (one block per row): the top `min(top_k[r], 64)`

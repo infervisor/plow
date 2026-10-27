@@ -2129,8 +2129,10 @@ __device__ __forceinline__ void plow_exec(const PlowDevInst* in, void* const* T,
         break;
     case PLOW_DOP_EMBED_FRAME_BF16:
         d_embed_frame((__nv_bfloat16*)TEN(0), (const __nv_bfloat16*)TEN(1), (const unsigned*)TEN(2),
-                      (const __nv_bfloat16*)TEN(3), (const unsigned*)TEN(4), in->i[0], in->i[1], in->i[2],
-                      in->i[3], in->i[4], in->i[5], in->i[6], in->fj[0].f, slice, nblk);
+                      (const __nv_bfloat16*)TEN(3), (const unsigned*)TEN(4),
+                      (in->i[7] & 2u) ? (const float*)TEN(5) : nullptr, in->i[0], in->i[1], in->i[2],
+                      in->i[3], in->i[4], in->i[5], in->i[6], in->i[7], in->fj[0].f, in->fj[1].f, slice, nblk,
+                      arena);
         break;
 
     /* Terminal row selection for the unified token batch. One arm serves BOTH NVIDIA images:

@@ -12,7 +12,7 @@ The backbone is Qwen3-1.7B (HF half-split RoPE, no permutation), so the director
   maya2.codebook_embed.weight    <- audio_in.table.weight [32*2048][2048] (frame feedback: sum / sqrt(32),
                                     then RMSNorm eps FLT_EPSILON with maya2.frame_norm.weight)
   maya2.frame_norm.weight        <- audio_in.norm.weight (fp32)
-Depth (DepthV2, fp16 as the official engine serves it; folds in fp32):
+Depth (DepthV2, matrices fp16 as the official engine serves it, vectors fp32; folds in fp32):
   maya2.depth.in_proj.weight     [1024][2048]       backbone hidden -> depth width
   maya2.depth.pos0               [1024]             level_emb[0]
   maya2.depth.emb.weight         [31*2048][1024]    code_up(code_lo[k*2048 + c]) + level_emb[k + 1]
@@ -87,7 +87,8 @@ def main():
     d["maya2.depth.norm.bias"] = f32("depth.norm.bias")
     for j in range(LEVELS):
         d[f"maya2.depth.heads.{j}.weight"] = f32(f"depth.heads.{j}.weight")
-    out.update({k: v.to(torch.float16).contiguous() for k, v in d.items()})
+    # Matrices fp16 (the engine's depth dtype); vectors stay fp32 (norms, cross constants, pos0).
+    out.update({k: (v.to(torch.float16) if v.dim() == 2 else v).contiguous() for k, v in d.items()})
     save_file(out, f"{args.out}/model.safetensors")
 
     qwen = dict(

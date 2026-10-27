@@ -86,6 +86,7 @@ mod dspark;
 pub mod fish_codec;
 mod fish_depth;
 pub mod fish_encoder;
+pub mod maya2_depth;
 mod gemv_decode_role;
 pub mod manifest;
 pub mod mimi_encoder;
@@ -1925,6 +1926,8 @@ struct Tn {
     frame_codes: u32,
     frame_dcodes: u32,
     frame_cb: u32,
+    // Maya 2: the frame row's fp32 RMSNorm weight (TENSOR_NONE: none).
+    frame_norm: u32,
     // Chatterbox T3 decode: per-slot speech start and the learned speech-position table.
     pos_base: u32,
     speech_pos: u32,
@@ -2323,6 +2326,10 @@ fn declare(
                 &f.table,
                 u64::from(f.codebooks * f.cb_size) * u64::from(c.hidden) * BF16,
             ),
+            None => TENSOR_NONE,
+        },
+        frame_norm: match c.frame.as_ref().and_then(|f| f.norm.as_ref()) {
+            Some((w, _)) => b.tensor(w, u64::from(c.hidden) * 4),
             None => TENSOR_NONE,
         },
         pos_base: if c.speech_pos_rows > 0 {
@@ -4371,9 +4378,25 @@ fn emit_phase(
             } else {
                 n.frame_codes
             };
-            d.t[..5].copy_from_slice(&[n.x, n.emb, n.ids, n.frame_cb, codes]);
-            d.i[..7].copy_from_slice(&[t, c.hidden, c.vocab, f.codebooks, f.cb_size, f.lo, f.rows]);
+            // Maya 2: every decode row is a frame (token row dropped), no prefill row is.
+            let (lo, frame_rows, mode) = match (f.decode_only, decode) {
+                (false, _) => (f.lo, f.rows, 0),
+                (true, false) => (0, 0, 0),
+                (true, true) => (0, c.vocab, 1 | if f.norm.is_some() { 2 } else { 0 }),
+            };
+            d.t[..6].copy_from_slice(&[n.x, n.emb, n.ids, n.frame_cb, codes, n.frame_norm]);
+            d.i[..8].copy_from_slice(&[
+                t,
+                c.hidden,
+                c.vocab,
+                f.codebooks,
+                f.cb_size,
+                lo,
+                frame_rows,
+                mode,
+            ]);
             d.f[0] = f.div;
+            d.f[1] = f.norm.as_ref().map_or(0.0, |&(_, eps)| eps);
         })
     };
     // Block mode: no token embedding — `act.x` is uploaded by the harness (the
@@ -11687,7 +11710,7 @@ fn emit_dense_gqa(
         let fish = std::fs::read(dir.join("config.json"))
             .ok()
             .and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok())
-            .is_some_and(|v| v["model_type"] == "fish_dac" || v["model_type"] == "qwen3_tts_12hz");
+            .is_some_and(|v| matches!(v["model_type"].as_str(), Some("fish_dac" | "qwen3_tts_12hz" | "mimi_dac")));
         let (model, section) = if fish {
             fish_codec::lower_fish_dac(
                 dir,
