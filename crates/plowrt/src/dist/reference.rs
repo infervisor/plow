@@ -30,6 +30,16 @@ impl Reference {
         format!("v1/{}/{}/index.json", self.namespace, self.name)
     }
 
+    /// Path of the index's signature, published beside it by `plowrt push`.
+    pub fn signature_path(&self) -> String {
+        format!(
+            "v1/{}/{}/{}",
+            self.namespace,
+            self.name,
+            super::sign::INDEX_SIGNATURE
+        )
+    }
+
     /// Path of one variant's manifest.
     pub fn manifest_path(&self, label: &str, generation: u32) -> String {
         format!(

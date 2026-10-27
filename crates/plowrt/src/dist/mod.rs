@@ -18,7 +18,13 @@ pub mod fetch;
 pub mod manifest;
 pub mod prepare;
 pub mod pull;
+/// `plowrt push`: write a built variant straight into a registry bucket or
+/// directory. Publish-side only, like `manifest`.
+#[cfg(feature = "dist")]
+pub mod push;
 pub mod reference;
+pub mod sign;
+pub mod sink;
 pub mod store;
 pub mod weights;
 

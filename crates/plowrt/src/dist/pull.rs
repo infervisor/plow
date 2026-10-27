@@ -134,9 +134,27 @@ fn require(f: &dyn Fetch, path: &str) -> Result<Vec<u8>> {
         .ok_or_else(|| RuntimeError::Dist(format!("{}: {path} is not published", f.describe())))
 }
 
-/// Fetch a model's variant index.
+/// Fetch a model's variant index, verifying nothing: a `file://` mirror, or
+/// a test. See [`index_trusted`].
 pub fn index(f: &dyn Fetch, r: &Reference) -> Result<ModelIndex> {
+    index_trusted(f, r, &super::sign::Trust::none())
+}
+
+/// Fetch a model's variant index and, when any key is trusted, require its
+/// published signature to verify. The index names every manifest by digest
+/// and each manifest its blobs, so this one check covers the whole pull.
+pub fn index_trusted(
+    f: &dyn Fetch,
+    r: &Reference,
+    trust: &super::sign::Trust,
+) -> Result<ModelIndex> {
     let raw = require(f, &r.index_path())?;
+    if !trust.is_empty() {
+        let sig = f.get(&r.signature_path())?;
+        let sig = sig.as_deref().map(String::from_utf8_lossy);
+        super::sign::verify(&raw, sig.as_deref().map(str::trim), trust)
+            .map_err(|e| RuntimeError::Dist(format!("{}: {e}", r.index_path())))?;
+    }
     let idx: ModelIndex = parse_json("index.json", &raw)?;
     idx.validate().map_err(RuntimeError::Dist)?;
     Ok(idx)
@@ -152,7 +170,18 @@ pub fn resolve(
     live: &LiveTarget,
     extra: Constraints,
 ) -> Result<Resolved> {
-    let idx = index(f, r)?;
+    resolve_trusted(f, r, live, extra, &super::sign::Trust::none())
+}
+
+/// [`resolve`] with the index verified against `trust` ([`index_trusted`]).
+pub fn resolve_trusted(
+    f: &dyn Fetch,
+    r: &Reference,
+    live: &LiveTarget,
+    extra: Constraints,
+    trust: &super::sign::Trust,
+) -> Result<Resolved> {
+    let idx = index_trusted(f, r, trust)?;
     let variant = super::select_variant(&idx, r, live, extra)
         .map_err(RuntimeError::Dist)?
         .clone();

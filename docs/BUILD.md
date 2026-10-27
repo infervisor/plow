@@ -27,7 +27,7 @@ commit, triple and feature set. The version is `<semver>+<git12>`, derived from
 modified checkout carries `-dirty` and must not be published, because it names
 a commit it does not correspond to.
 
-A registry records those binaries under `v1/runtime/`; `plowrt publish`
+A registry records those binaries under `v1/runtime/`; `plowrt push`
 releases model assets, which advance on their own cadence. Full contract: [`DISTRIBUTION.md`](DISTRIBUTION.md).
 
 ## One binary for CPU and GPU

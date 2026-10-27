@@ -194,7 +194,7 @@ fn short_id(parts: &[&str]) -> String {
 /// A published manifest must not reference the build host: it is consumed on
 /// machines with no nix and no `/nix/store`, where a leaked path resolves to
 /// nothing.
-fn no_build_host_paths(bytes: &[u8], where_: &str) -> Result<()> {
+pub(crate) fn no_build_host_paths(bytes: &[u8], where_: &str) -> Result<()> {
     let blob = String::from_utf8_lossy(bytes);
     for bad_path in ["/nix/store/", "/home/", "/root/"] {
         if blob.contains(bad_path) {
@@ -215,6 +215,9 @@ struct Recipe {
     name: Option<String>,
     label: Option<String>,
     plow_git: Option<String>,
+    /// `refused` names a point `plowc` cannot emit; it never packs, so its
+    /// checkpoint is not held to the pinning rule.
+    status: Option<String>,
     #[serde(default)]
     target: RecipeTarget,
     #[serde(default)]
@@ -419,6 +422,40 @@ pub fn read_recipe(path: &Path, over: Overrides<'_>) -> Result<Identity> {
     let checkpoint_source = c
         .source
         .ok_or_else(|| bad(at("[checkpoint] has no `source`")))?;
+    // A bundle names the bytes it was validated against. A Hugging Face
+    // repository is referenced by commit, never by a branch that can move, and
+    // the farm links the snapshot of exactly that commit into the bundle.
+    if checkpoint_source != plow_asset::dist::DIST_SOURCE && r.status.as_deref() != Some("refused")
+    {
+        let repo = checkpoint_source.strip_prefix("hf:").ok_or_else(|| {
+            bad(at(&format!(
+                "[checkpoint] source {checkpoint_source:?} is not `hf:<org>/<repo>` or `dist`; a \
+                 Hugging Face checkpoint is written `hf:<org>/<repo>` with `revision` set to its \
+                 commit"
+            )))
+        })?;
+        if repo.split('/').count() != 2 || repo.contains("..") {
+            return Err(bad(at(&format!(
+                "[checkpoint] source {checkpoint_source:?}: expected `hf:<org>/<repo>`"
+            ))));
+        }
+        match c.revision.as_deref() {
+            Some(rev) if super::weights::is_commit(rev) => {}
+            Some(rev) => {
+                return Err(bad(at(&format!(
+                    "[checkpoint] revision {rev:?} is not a 40-hex commit. A branch can move after \
+                     the build and hand a client other weights; pin the commit the build used \
+                     (the `snapshots/<commit>` directory name in the HF cache)"
+                ))))
+            }
+            None => {
+                return Err(bad(at(
+                    "[checkpoint] has no `revision`: a Hugging Face checkpoint is pinned to the \
+                     40-hex commit the build used",
+                )))
+            }
+        }
+    }
 
     let objects = r.objects.unwrap_or_default();
     Ok(Identity {

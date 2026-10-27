@@ -720,6 +720,17 @@ enum Cmd {
         gc: bool,
     },
 
+    /// Move a pin back to the generation it served before the current one.
+    /// The bundle must still be in the store (`gc` keeps the last two).
+    Rollback {
+        /// The model to act on, as for `load`.
+        model: String,
+    },
+
+    /// Collect the bundles no pin can serve or roll back to, then the blobs
+    /// nothing references. `upgrade` never frees space by itself.
+    Gc,
+
     /// Package a built variant into one `.zip`, ready to upload to a
     /// registry's publish API.
     ///
@@ -753,10 +764,13 @@ enum Cmd {
         manifests: Option<PathBuf>,
     },
 
-    /// Publish a built bundle to a registry with an API key: number it as its
-    /// label's next generation from the registry's index, package it exactly
-    /// as `pack` does, and send it through the registry's staged upload
-    /// (`<to>/api/v1/admin/registry/uploads`). When the newest generation is
+    /// Publish through a registry's staged-upload API. Transition path only,
+    /// kept until every model is re-published with `push`, which writes the
+    /// bucket directly; new publications use `push`.
+    ///
+    /// Numbers the build as its label's next generation from the registry's
+    /// index, packages it exactly as `pack` does, and sends it through
+    /// `<to>/api/v1/admin/registry/uploads`. When the newest generation is
     /// already this build, nothing is sent.
     #[cfg(feature = "dist")]
     Publish {
@@ -795,6 +809,72 @@ enum Cmd {
         /// The concurrency `--tok-s` was measured at.
         #[arg(long)]
         concurrency: Option<u32>,
+    },
+
+    /// Publish a built variant straight into a registry bucket or directory:
+    ///
+    ///   plowrt push --recipe <recipe.toml> --assets <dir> --to r2://<account>/<bucket>
+    ///
+    /// Writes blobs, the objset and bundle manifests, the model index, its
+    /// signature and the catalog, in that order, each write conditional so a
+    /// racing publisher is refused rather than overwritten. The bucket is
+    /// the registry `load` reads; no service sits in between. A re-run of a
+    /// build that is already the newest generation writes nothing.
+    /// Bucket credentials: `PLOW_R2_ACCESS_KEY_ID`, `PLOW_R2_SECRET_ACCESS_KEY`.
+    #[cfg(feature = "dist")]
+    Push {
+        #[command(flatten)]
+        producer: ProducerArgs,
+        /// Directory `bundle.json`'s `files[]` live in.
+        #[arg(long)]
+        assets: PathBuf,
+        /// Directory `objset.json`'s `objects[]` live in; defaults to `--assets`.
+        #[arg(long)]
+        objects: Option<PathBuf>,
+        /// Directory a `dist` checkpoint's `files[]` live in, as for `pack`.
+        #[arg(long)]
+        checkpoint_dir: Option<PathBuf>,
+        /// `r2://<account-id>/<bucket>`, `s3://<host>/<bucket>` or `file:///dir`.
+        #[arg(long)]
+        to: String,
+        /// The ed25519 key file (`plowrt keygen`) the index is signed with;
+        /// `PLOW_SIGNING_KEY` when omitted. Without one the index is unsigned.
+        #[arg(long)]
+        key_file: Option<PathBuf>,
+        /// Status to publish at (default `emits`).
+        #[arg(long, value_parser = ["emits", "validated"])]
+        status: Option<String>,
+        /// One line describing the model, for the catalog.
+        #[arg(long)]
+        description: Option<String>,
+        /// `<org>/<repo>` on Hugging Face, the model's identity in the index.
+        /// Required for a `dist` checkpoint, which names none itself.
+        #[arg(long)]
+        hf: Option<String>,
+        /// Measured decode throughput; required for `--status validated`.
+        #[arg(long)]
+        tok_s: Option<f64>,
+        /// The concurrency `--tok-s` was measured at.
+        #[arg(long)]
+        concurrency: Option<u32>,
+        /// Another name the model answers to in the index; repeatable.
+        #[arg(long = "alias")]
+        aliases: Vec<String>,
+        /// Report what would be written, and write nothing.
+        #[arg(long, default_value_t = false)]
+        dry_run: bool,
+    },
+
+    /// Generate the ed25519 key `push` signs model indexes with. Prints the
+    /// public half, which clients put in `PLOW_TRUSTED_KEYS`.
+    #[cfg(feature = "dist")]
+    Keygen {
+        /// The key's name, as it appears in signatures (`infervisor-1`).
+        #[arg(long)]
+        name: String,
+        /// Where the secret key is written (mode 0600; never overwritten).
+        #[arg(long)]
+        out: PathBuf,
     },
 }
 
@@ -1267,6 +1347,8 @@ async fn async_main(
             dist_cmd::report(dist_cmd::cmd_prepare(&model, checkpoint))
         }
         Cmd::Rm { model, gc } => dist_cmd::report(dist_cmd::cmd_rm(&model, gc)),
+        Cmd::Rollback { model } => dist_cmd::report(dist_cmd::cmd_rollback(&model)),
+        Cmd::Gc => dist_cmd::report(dist_cmd::cmd_gc()),
         #[cfg(feature = "dist")]
         Cmd::Pack {
             producer,
@@ -1320,6 +1402,52 @@ async fn async_main(
                 },
             )
         })()),
+        #[cfg(feature = "dist")]
+        Cmd::Push {
+            producer,
+            assets,
+            objects,
+            checkpoint_dir,
+            to,
+            key_file,
+            status,
+            description,
+            hf,
+            tok_s,
+            concurrency,
+            aliases,
+            dry_run,
+        } => dist_cmd::report((|| {
+            let key_file = key_file.or_else(|| {
+                plowrt::config::RuntimeConfig::signing_env()
+                    .0
+                    .map(PathBuf::from)
+            });
+            let status = match status.as_deref() {
+                Some("validated") => Some(plow_asset::dist::Status::Validated),
+                Some(_) => Some(plow_asset::dist::Status::Emits),
+                None => None,
+            };
+            dist_cmd::cmd_push(
+                producer.manifests()?,
+                &assets,
+                objects.as_deref(),
+                checkpoint_dir.as_deref(),
+                &to,
+                key_file.as_deref(),
+                &plowrt::dist::push::Options {
+                    status,
+                    description: description.as_deref(),
+                    hf: hf.as_deref(),
+                    tok_s,
+                    concurrency,
+                    aliases,
+                    dry_run,
+                },
+            )
+        })()),
+        #[cfg(feature = "dist")]
+        Cmd::Keygen { name, out } => dist_cmd::report(dist_cmd::cmd_keygen(&name, &out)),
         #[cfg(feature = "hsa")]
         Cmd::AmdBench {
             blob,

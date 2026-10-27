@@ -87,6 +87,9 @@ hf-hub = { workspace = true, optional = true }
 # I/O, and CI asserts no HTTP/TLS crate is present in the serve-only feature set.
 ureq = { workspace = true, features = ["gzip"], optional = true }
 zstd = { version = "0.14", optional = true }
+# `plowrt push` signs a model index and `pull` verifies it (Nix's scheme: ed25519,
+# `<name>:<base64>`). Publish/fetch side only: `serve` verifies nothing.
+ed25519-dalek = { version = "2", default-features = false, features = ["std"], optional = true }
 # `plowrt pack`: zips a built bundle+objset+files into one upload for a
 # registry's publish API. Publish-side tooling only, same reasoning as ureq.
 zip = { version = "9", default-features = false, features = ["deflate"], optional = true }
@@ -140,7 +143,7 @@ hub = ["hf-tokenizer", "dep:safetensors", "dep:hf-hub"]
 # `hf-hub` joins it because `load` also resolves the checkpoint, which the
 # distribution never carries — weights always come from HuggingFace or a local
 # directory.
-dist = ["dep:ureq", "dep:zstd", "dep:zip", "dep:toml", "dep:hf-hub", "hf-tokenizer"]
+dist = ["dep:ureq", "dep:zstd", "dep:zip", "dep:toml", "dep:hf-hub", "dep:ed25519-dalek", "hf-tokenizer"]
 # CUDA driver-API backend. The driver lib is `dlopen`ed at runtime (no link-time
 # `-lcuda`), so the binary stays static except for libcuda. Pulls safetensors:
 # a GPU serve is meaningless without real checkpoint weights (`exec::gpu`) —

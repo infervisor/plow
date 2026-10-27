@@ -116,6 +116,24 @@ def recipe_invariants(recipe: dict) -> None:
     if len(git) != 40:
         die(f"`plow_git` must be a full 40-hex commit, got {git!r}")
 
+    # A bundle names the bytes it was validated against: a Hugging Face
+    # checkpoint is `hf:<org>/<repo>` at a 40-hex commit, never a branch.
+    # The same rule `plowrt pack` applies; a source that is neither `hf:`
+    # nor `dist` (`local:`, `pip:`) was never packable and is left to it.
+    ckpt = recipe.get("checkpoint") or {}
+    source = ckpt.get("source")
+    if source and source != "dist":
+        bare = ":" not in source and source.count("/") == 1
+        if bare:
+            die(f"[checkpoint] source {source!r}: write it as `hf:{source}` and pin `revision`")
+        if source.startswith("hf:"):
+            rev = ckpt.get("revision") or ""
+            if not re.fullmatch(r"[0-9a-f]{40}", rev):
+                die(
+                    f"[checkpoint] revision {rev!r} is not the 40-hex commit of {source}: a branch "
+                    "can move after the build and hand a client other weights"
+                )
+
 
 def main_guard(fn):
     """Run `fn`, turning a refusal into a clean message and exit 1."""

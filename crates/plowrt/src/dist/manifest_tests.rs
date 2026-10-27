@@ -1219,6 +1219,10 @@ fn every_recipe_in_the_tree_is_readable() {
         .filter_map(|p| match read_recipe(p, over) {
             Ok(_) => None,
             Err(e) if e.to_string().contains("declares `max_ctx`") => None,
+            // A checkpoint that is neither a Hugging Face repository nor
+            // carried by the distribution (`local:`, `pip:`, a re-keyed
+            // local file set) was never packable; the rule only names it now.
+            Err(e) if e.to_string().contains("is not `hf:<org>/<repo>` or `dist`") => None,
             Err(e) => Some(format!(
                 "{}: {e}",
                 p.strip_prefix(&root).unwrap_or(p).display()

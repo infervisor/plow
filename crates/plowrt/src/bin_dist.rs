@@ -97,7 +97,7 @@ pub fn cmd_pull(model: &str, c: plow_asset::dist::Constraints, dry_run: bool) ->
     let f = dist::transport(&r.registry)?;
     let live = live();
     print_live(&live);
-    let resolved = pull::resolve(&*f, &r, &live, c)?;
+    let resolved = pull::resolve_trusted(&*f, &r, &live, c, &trust()?)?;
     let v = &resolved.variant;
     println!(
         "selected {}@g{} ({:?}), {} on {} x {}",
@@ -132,7 +132,7 @@ pub fn cmd_load(
     let f = dist::transport(&r.registry)?;
     let live = live();
     print_live(&live);
-    let resolved = pull::resolve(&*f, &r, &live, c)?;
+    let resolved = pull::resolve_trusted(&*f, &r, &live, c, &trust()?)?;
     let v = &resolved.variant;
     println!(
         "selected {}@g{} ({:?}) — {} on {} x {}",
@@ -205,7 +205,7 @@ pub fn cmd_show(model: &str) -> Result<(), Err> {
     let live = live();
     print_live(&live);
 
-    let idx = pull::index(&*f, &r)?;
+    let idx = pull::index_trusted(&*f, &r, &trust()?)?;
     println!(
         "{}/{}  hf:{} @{}",
         idx.namespace, idx.name, idx.hf, idx.revision
@@ -273,7 +273,7 @@ fn check_newer(
 ) -> Result<Option<(String, u32, u64)>, Err> {
     let r = parse(reference)?;
     let f = dist::transport(&r.registry)?;
-    let resolved = pull::resolve(&*f, &r, live, Default::default())?;
+    let resolved = pull::resolve_trusted(&*f, &r, live, Default::default(), &trust()?)?;
     if resolved.variant.variant_id == pinned {
         return Ok(None);
     }
@@ -300,7 +300,7 @@ pub fn cmd_upgrade(model: Option<&str>, all: bool, dry_run: bool) -> Result<(), 
     for pin in targets {
         let r = parse(&pin)?;
         let f = dist::transport(&r.registry)?;
-        let resolved = pull::resolve(&*f, &r, &live, Default::default())?;
+        let resolved = pull::resolve_trusted(&*f, &r, &live, Default::default(), &trust()?)?;
         let pinned = st.pinned(&pin);
         if pinned.as_deref() == Some(resolved.variant.variant_id.as_str()) {
             println!("{pin}: current at g{}", resolved.variant.generation);
@@ -681,44 +681,8 @@ fn next_generation(
     Ok(Some(bundle))
 }
 
-/// Whether two manifests describe the same build: equal in everything but
-/// what publishing assigns (the generation, the variant id, and the objset
-/// manifest's digest, which the registry records as it stores it).
 #[cfg(feature = "dist")]
-fn same_build(published: &plow_asset::dist::Bundle, local: &plow_asset::dist::Bundle) -> bool {
-    let mut p = published.clone();
-    p.generation = local.generation;
-    p.variant_id = local.variant_id.clone();
-    if let (Some(po), Some(lo)) = (p.objset.as_mut(), local.objset.as_ref()) {
-        po.sha256 = lo.sha256.clone();
-    }
-    p == *local
-}
-
-/// `variant_id` as the retired Python publisher formed it, which published
-/// generations are keyed by: 12 hex of the sha256 over the full key, the
-/// build included, so two generations of one label never collide.
-#[cfg(feature = "dist")]
-fn variant_id(b: &plow_asset::dist::Bundle) -> String {
-    let parts = [
-        b.namespace.clone(),
-        b.name.clone(),
-        b.label.clone(),
-        b.generation.to_string(),
-        b.target.isa.clone(),
-        b.target.sku.clone(),
-        b.target.units.to_string(),
-        format!("{}{}", b.parallel.mode, b.parallel.n),
-        b.max_ctx.to_string(),
-        b.plow_git.clone(),
-        b.objset
-            .as_ref()
-            .map(|o| o.objset_id.clone())
-            .unwrap_or_default(),
-    ];
-    let digest = dist::Digest::of(parts.join("\x1f").as_bytes());
-    digest.as_str()[..12].to_string()
-}
+use plowrt::dist::push::{same_build, variant_id};
 
 /// A new directory only this user can enter. `create_dir` refuses a path
 /// that exists, symlink or not, so nothing another user planted is written
@@ -840,6 +804,138 @@ fn upload(
     }
 }
 
+/// The keys this machine accepts a model index from: `PLOW_TRUSTED_KEYS`.
+fn trust() -> Result<dist::sign::Trust, Err> {
+    match RuntimeConfig::signing_env().1 {
+        Some(list) => Ok(dist::sign::Trust::parse(&list)?),
+        None => Ok(dist::sign::Trust::none()),
+    }
+}
+
+/// Write a built variant straight into a registry: blobs, manifests, index,
+/// signature, catalog, each write conditional so a racing publisher is
+/// refused rather than overwritten.
+#[cfg(feature = "dist")]
+#[allow(clippy::too_many_arguments)]
+pub fn cmd_push<'a>(
+    recipe: Recipe<'a>,
+    assets: &std::path::Path,
+    objects: Option<&std::path::Path>,
+    checkpoint_dir: Option<&'a std::path::Path>,
+    to: &str,
+    key_file: Option<&std::path::Path>,
+    opts: &dist::push::Options<'_>,
+) -> Result<(), Err> {
+    // Every argument is checked before the registry is asked anything.
+    let args = pack_args(recipe, assets, objects, checkpoint_dir)?;
+    let (ak, sk, region) = RuntimeConfig::push_env();
+    let creds = match (ak, sk) {
+        (Some(access_key), Some(secret_key)) => Some(dist::sink::Credentials {
+            access_key,
+            secret_key,
+        }),
+        _ => None,
+    };
+    let sink = dist::sink::sink(to, creds, region.as_deref())?;
+    let key = match key_file {
+        Some(p) => Some(dist::sign::SecretKey::read(p)?),
+        None => None,
+    };
+    if key.is_none() && !opts.dry_run && !to.starts_with("file://") && !to.starts_with('/') {
+        println!(
+            "warning: no signing key (--key-file or PLOW_SIGNING_KEY): the index goes up \
+             unsigned, and a client with PLOW_TRUSTED_KEYS set will refuse it"
+        );
+    }
+    let objects_dir = objects.unwrap_or(assets);
+    let src = dist::push::Sources {
+        assets,
+        objects: objects_dir,
+        checkpoint: checkpoint_dir,
+    };
+    let out = dist::push::push(&*sink, args.bundle, args.objset, &src, key.as_ref(), opts)?;
+    if out.unchanged {
+        println!(
+            "already published: {} is this build at {}",
+            out.reference,
+            sink.describe()
+        );
+        return Ok(());
+    }
+    if opts.dry_run {
+        println!(
+            "would publish {} to {}: {} blob(s), {} to upload{}",
+            out.reference,
+            sink.describe(),
+            out.uploaded_blobs,
+            pull::human(out.uploaded_bytes),
+            match (&out.supersedes, out.delta) {
+                (Some(s), Some(d)) => format!(", supersedes {s} ({d:?})"),
+                _ => String::new(),
+            }
+        );
+        return Ok(());
+    }
+    println!(
+        "published {} ({}) to {}: {} blob(s) uploaded, {}{}",
+        out.reference,
+        out.variant_id,
+        sink.describe(),
+        out.uploaded_blobs,
+        pull::human(out.uploaded_bytes),
+        match (&out.supersedes, out.delta) {
+            (Some(s), Some(d)) => format!(", supersedes {s} ({d:?})"),
+            _ => String::new(),
+        }
+    );
+    Ok(())
+}
+
+/// Generate a signing key. The secret goes to `out` (mode 0600); the public
+/// half is printed, which is what every client's `PLOW_TRUSTED_KEYS` takes.
+#[cfg(feature = "dist")]
+pub fn cmd_keygen(name: &str, out: &std::path::Path) -> Result<(), Err> {
+    if out.exists() {
+        return Err(format!("{}: exists; a key is never overwritten", out.display()).into());
+    }
+    let key = dist::sign::SecretKey::generate(name)?;
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create_new(true);
+    #[cfg(unix)]
+    std::os::unix::fs::OpenOptionsExt::mode(&mut opts, 0o600);
+    let mut f = opts.open(out)?;
+    f.write_all(key.to_file_contents().as_bytes())?;
+    println!("secret key: {}", out.display());
+    println!("public key: {}", key.public());
+    println!("clients trust it with: PLOW_TRUSTED_KEYS={}", key.public());
+    Ok(())
+}
+
+/// Move a pin back to the generation it served before the current one.
+pub fn cmd_rollback(model: &str) -> Result<(), Err> {
+    let r = parse(model)?;
+    let st = store()?;
+    let (from, to) = st.rollback(&r.pin_key())?;
+    println!("{r}: {from} → {to}");
+    if let Some(p) = st.list().into_iter().find(|p| p.variant_id == to) {
+        println!("now serving {}", p.reference);
+    }
+    Ok(())
+}
+
+/// Collect the bundles no pin can serve or roll back to, and the blobs no
+/// bundle references.
+pub fn cmd_gc() -> Result<(), Err> {
+    let st = store()?;
+    let pruned = st.prune()?;
+    let (n, freed) = st.gc()?;
+    println!(
+        "removed {pruned} superseded generation(s); collected {n} blob(s), {} reclaimed",
+        pull::human(freed)
+    );
+    Ok(())
+}
+
 pub fn cmd_prepare(model: &str, checkpoint: Option<PathBuf>) -> Result<(), Err> {
     let r = parse(model)?;
     let st = store()?;
@@ -902,7 +998,7 @@ pub fn resolve_local(model: &str) -> Result<PathBuf, Err> {
 mod tests {
     #[test]
     fn variant_id_matches_published() {
-        // The retired Python publisher's `variant_id(bundle, 1)` for this bundle.
+        // `variant_id(bundle, 1)` as every published generation is keyed.
         let b: plow_asset::dist::Bundle = serde_json::from_value(serde_json::json!({
             "schema": "plow.dist.bundle.v1", "namespace": "infervisor", "name": "smollm2-360m",
             "label": "metal3-apple-m4-pro-tp1-0k", "generation": 1, "variant_id": "",
@@ -913,7 +1009,7 @@ mod tests {
             "checkpoint": {"source": "hf:HuggingFaceTB/SmolLM2-360M-Instruct", "revision": "main", "shards": 0, "layout": "hf-safetensors", "bytes": 0}
         }))
         .unwrap();
-        assert_eq!(super::variant_id(&b), "b49b5c9cf598");
+        assert_eq!(plowrt::dist::push::variant_id(&b), "b49b5c9cf598");
     }
 
     /// `publish` against a registry that is not there: what fails must be
