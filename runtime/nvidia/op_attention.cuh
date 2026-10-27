@@ -2050,10 +2050,10 @@ __device__ __forceinline__ void fa_decode_d64_item(float* __restrict__ op, float
  *    chunk lane t, step s covers dims 16t+4s..+3 in BOTH operands, so every K load is 16 B and
  *    the dot is the true dot (sum order differs from the CUDA-core bodies).
  *  - softmax: the warps agree on the tile max through smem (log2 domain, as every item); each
- *    warp keeps its rows' f32 sum of p for the denominator and writes a = p * v_scale * 2^PSH to
- *    smem as f16 (PLOW_NV_FA_TC16_PV 2: an f16 hi/lo pair, two mmas per step).
- *  - P.V: warp w owns output dims 64w..64w+63, mma m16n8k16 f16 with A = P (ldmatrix) and B = V
- *    rows e4m3 -> f16 (exact). Column g of n-tile j is dim 64w + 8g + j, so a lane loads 8
+ *    warp keeps its rows' f32 sum of p for the denominator and writes a = p * v_scale to smem as
+ *    bf16 (PLOW_NV_FA_TC16_PV 2: a bf16 hi/lo pair, two mmas per step; bf16 keeps f32's range).
+ *  - P.V: warp w owns output dims 64w..64w+63, mma m16n8k16 bf16 with A = P (ldmatrix) and B = V
+ *    rows e4m3 -> bf16 (exact). Column g of n-tile j is dim 64w + 8g + j, so a lane loads 8
  *    contiguous bytes per row and pairs rows with byte permutes; accumulator column n of n-tile j
  *    is dim 64w + 8n + j.
  * Rows past hi re-read row hi - 1 (never past kv_len) and weigh 0. Output: Opart (unnormalized)
@@ -2067,17 +2067,10 @@ __device__ __forceinline__ void fa_decode_d64_item(float* __restrict__ op, float
 #define FA_TC16_TAKES(D, GF, FP8KV, SZKV) (PLOW_NV_FA_TC16 && (FP8KV) && !(SZKV) && (D) == 512 && (GF) == 16)
 #define FA_TC16_TR 128u
 #define FA_TC16_QS 520u /* bf16 per smem Q row */
-#define FA_TC16_PS 136u /* f16 per smem P row */
-/* P carries p * v_scale * 2^PSH: f16 keeps its normal range for the small v scales (amax / 448)
- * and overflows only past v_scale 64; the Opart write takes the factor back out (exact). */
-#define FA_TC16_PSH 10
+#define FA_TC16_PS 136u /* bf16 per smem P row */
 #define FA_TC16_SMEM_FLOATS                                                                      \
     (16u * FA_TC16_QS / 2u + 2u * 16u * FA_TC16_PS / 2u + 2u * 16u * PLOW_NV_WARPS)
 #if PLOW_NV_FA_TC16
-__device__ __forceinline__ unsigned fa_e4m3x2_f16x2(unsigned two) {
-    const __half2_raw h = __nv_cvt_fp8x2_to_halfraw2((__nv_fp8x2_storage_t)(two & 0xffffu), __NV_E4M3);
-    return (unsigned)h.x | ((unsigned)h.y << 16);
-}
 __device__ __forceinline__ unsigned fa_e4m3x2_bf16x2(unsigned two) {
     const __half2_raw h = __nv_cvt_fp8x2_to_halfraw2((__nv_fp8x2_storage_t)(two & 0xffffu), __NV_E4M3);
     const float2 f = __half22float2(*reinterpret_cast<const __half2*>(&h));
@@ -2091,14 +2084,7 @@ __device__ __forceinline__ void fa_mma_bf16_acc(float (&d)[4], unsigned a0, unsi
                  : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3])
                  : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1));
 }
-__device__ __forceinline__ void fa_mma_f16_acc(float (&d)[4], const unsigned (&a)[4], unsigned b0,
-                                               unsigned b1) {
-    asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 "
-                 "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
-                 : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3])
-                 : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1));
-}
-template <bool SLOTMAP>
+template <bool SLOTMAP, int CLONE>
 __device__ void fa_decode_tc16(float* __restrict__ Opart, float* __restrict__ mlpart,
                                const __nv_bfloat16* __restrict__ Q, const unsigned char* __restrict__ K,
                                const unsigned char* __restrict__ V, const int* __restrict__ kv_len,
@@ -2116,7 +2102,8 @@ __device__ void fa_decode_tc16(float* __restrict__ Opart, float* __restrict__ ml
     float* wl = wmax + 16u * PLOW_NV_WARPS;
     const unsigned gqa = n_head / n_kv_head, n_grp = n_head / 16u;
     const unsigned n_work = n_batch * n_grp * nsplit;
-    const float qscale = FA_SCALE(scale), psc = (float)(1u << FA_TC16_PSH);
+    const float qscale = FA_SCALE(scale);
+    if (blockDim.x != PLOW_NV_THREADS) __trap();
     for (unsigned w = slice; w < n_work; w += nblk) {
         const unsigned sp = w % nsplit, hg = (w / nsplit) % n_grp, b = w / (nsplit * n_grp);
         unsigned slot = b;
@@ -2242,11 +2229,11 @@ __device__ void fa_decode_tc16(float* __restrict__ Opart, float* __restrict__ ml
                     for (int e = 0; e < 2; e++) {
                         const float p = FA_EXP(s[j][2 * hh + e] - (hh ? mr1 : mr0));
                         l_run[hh] += p;
-                        a2[e] = p * vs[j][e] * psc;
+                        a2[e] = p * vs[j][e];
                     }
-                    const __half2 hv = __floats2half2_rn(a2[0], a2[1]);
-                    const float2 hf = __half22float2(hv);
-                    const __half2 lv = __floats2half2_rn(a2[0] - hf.x, a2[1] - hf.y);
+                    const __nv_bfloat162 hv = __floats2bfloat162_rn(a2[0], a2[1]);
+                    const float2 hf = __bfloat1622float2(hv);
+                    const __nv_bfloat162 lv = __floats2bfloat162_rn(a2[0] - hf.x, a2[1] - hf.y);
                     hw[hh] = *reinterpret_cast<const unsigned*>(&hv);
                     lw[hh] = *reinterpret_cast<const unsigned*>(&lv);
                 }
@@ -2283,18 +2270,18 @@ __device__ void fa_decode_tc16(float* __restrict__ Opart, float* __restrict__ ml
                 unsigned wv[4][4];
 #pragma unroll
                 for (int q = 0; q < 4; q++) {
-                    wv[q][0] = fa_e4m3x2_f16x2(vr[q].x);
-                    wv[q][1] = fa_e4m3x2_f16x2(vr[q].x >> 16);
-                    wv[q][2] = fa_e4m3x2_f16x2(vr[q].y);
-                    wv[q][3] = fa_e4m3x2_f16x2(vr[q].y >> 16);
+                    wv[q][0] = fa_e4m3x2_bf16x2(vr[q].x);
+                    wv[q][1] = fa_e4m3x2_bf16x2(vr[q].x >> 16);
+                    wv[q][2] = fa_e4m3x2_bf16x2(vr[q].y);
+                    wv[q][3] = fa_e4m3x2_bf16x2(vr[q].y >> 16);
                 }
 #pragma unroll
                 for (int j = 0; j < 8; j++) {
                     const unsigned sel = (j & 1) ? 0x7632u : 0x5410u;
                     const unsigned b0 = __byte_perm(wv[0][j >> 1], wv[1][j >> 1], sel);
                     const unsigned b1 = __byte_perm(wv[2][j >> 1], wv[3][j >> 1], sel);
-                    fa_mma_f16_acc(o[j], ah, b0, b1);
-                    if (PLOW_NV_FA_TC16_PV == 2) fa_mma_f16_acc(o[j], al, b0, b1);
+                    fa_mma_bf16_acc(o[j], ah[0], ah[1], ah[2], ah[3], b0, b1);
+                    if (PLOW_NV_FA_TC16_PV == 2) fa_mma_bf16_acc(o[j], al[0], al[1], al[2], al[3], b0, b1);
                 }
             }
         }
@@ -2308,19 +2295,14 @@ __device__ void fa_decode_tc16(float* __restrict__ Opart, float* __restrict__ ml
             wl[warp * 16u + g + 8u] = l_run[1];
         }
         __syncthreads();
-        const float osc = 1.0f / psc;
 #pragma unroll
         for (int hh = 0; hh < 2; hh++) {
             const size_t row = ((size_t)b * n_head + h0 + g + 8u * hh) * nsplit + sp;
             float* op = Opart + row * D + 64u * warp + 16u * t;
-            *(float4*)op = make_float4(o[0][2 * hh] * osc, o[1][2 * hh] * osc, o[2][2 * hh] * osc,
-                                       o[3][2 * hh] * osc);
-            *(float4*)(op + 4) = make_float4(o[4][2 * hh] * osc, o[5][2 * hh] * osc,
-                                             o[6][2 * hh] * osc, o[7][2 * hh] * osc);
-            *(float4*)(op + 8) = make_float4(o[0][2 * hh + 1] * osc, o[1][2 * hh + 1] * osc,
-                                             o[2][2 * hh + 1] * osc, o[3][2 * hh + 1] * osc);
-            *(float4*)(op + 12) = make_float4(o[4][2 * hh + 1] * osc, o[5][2 * hh + 1] * osc,
-                                              o[6][2 * hh + 1] * osc, o[7][2 * hh + 1] * osc);
+            *(float4*)op = make_float4(o[0][2 * hh], o[1][2 * hh], o[2][2 * hh], o[3][2 * hh]);
+            *(float4*)(op + 4) = make_float4(o[4][2 * hh], o[5][2 * hh], o[6][2 * hh], o[7][2 * hh]);
+            *(float4*)(op + 8) = make_float4(o[0][2 * hh + 1], o[1][2 * hh + 1], o[2][2 * hh + 1], o[3][2 * hh + 1]);
+            *(float4*)(op + 12) = make_float4(o[4][2 * hh + 1], o[5][2 * hh + 1], o[6][2 * hh + 1], o[7][2 * hh + 1]);
             if (warp == 0 && t == 0) {
                 float L = 0.0f;
 #pragma unroll
@@ -3133,9 +3115,9 @@ __device__ void d_flash_decode(float* __restrict__ Opart, float* __restrict__ ml
                       "TC16 decode item outgrows the hd512 GF16 flash claim");
         (void)merge_ctr;
         if (out) __trap(); /* no merge fold on this item */
-        fa_decode_tc16<SLOTMAP>(Opart, mlpart, Q, (const unsigned char*)K, (const unsigned char*)V,
-                                kv_len, n_batch, n_head, n_kv_head, kv_stride, window, scale, nsplit,
-                                kv_mask, slice, nblk, lds, kv_cap, k_scale, v_scale, decode_slot);
+        fa_decode_tc16<SLOTMAP, CLONE>(Opart, mlpart, Q, (const unsigned char*)K, (const unsigned char*)V,
+                                       kv_len, n_batch, n_head, n_kv_head, kv_stride, window, scale, nsplit,
+                                       kv_mask, slice, nblk, lds, kv_cap, k_scale, v_scale, decode_slot);
         return;
     } else
 #endif
