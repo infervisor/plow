@@ -1267,3 +1267,77 @@ async fn a_thinking_budget_must_leave_room_for_the_reply() {
         assert_eq!(code, StatusCode::OK, "{extra}: {v}");
     }
 }
+
+/// Server-wide defaults from vLLM / llama.cpp flag names reach every model, a model's file entry
+/// wins over them, `--reasoning-parser` is checked against the template, and `--chat-template`
+/// replaces the packet's template.
+#[tokio::test]
+async fn engine_flags_install_as_defaults_under_the_file_and_the_request() {
+    use crate::serve::config::{
+        install_chat_defaults, ChatDefaults, GenerationDefaults, ServerReasoning,
+    };
+    let h = harness_for("qwen3");
+    let models = vec![("toolm".to_string(), Arc::clone(&h.bundle))];
+    let resolve = |n: &str| (n == "toolm").then(|| ("toolm".to_string(), Arc::clone(&h.bundle)));
+    // a parser that splits on other markers is refused; qwen3's and an unlisted one are not
+    let gemma = ServerReasoning {
+        parser: Some("gemma4".into()),
+        ..Default::default()
+    };
+    let err = install_chat_defaults(&gemma, None, &models, resolve).unwrap_err();
+    assert!(
+        err.contains("<|channel>") && err.contains("<think>"),
+        "{err}"
+    );
+    let start = ServerReasoning {
+        start_str: Some("[THINK]".into()),
+        ..Default::default()
+    };
+    assert!(install_chat_defaults(&start, None, &models, resolve).is_err());
+    let server = ServerReasoning {
+        parser: Some("qwen3".into()),
+        defaults: ChatDefaults {
+            reasoning_format: Some("none".into()),
+            include_reasoning: Some(true),
+            generation: Some(GenerationDefaults {
+                max_new_tokens: Some(3),
+                ..Default::default()
+            }),
+            ..Default::default()
+        },
+        chat_template: Some("{% for m in messages %}<<{{ m.content }}>>{% endfor %}".into()),
+        ..Default::default()
+    };
+    let dir = std::env::temp_dir().join(format!("plowrt-engine-flags-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let file = dir.join("defaults.json");
+    std::fs::write(&file, r#"{"toolm": {"reasoning_format": "auto"}}"#).unwrap();
+    install_chat_defaults(&server, Some(&file), &models, resolve).unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+    let pieces = toks("<think>plan</think>Four.");
+    let pieces: Vec<&str> = pieces.iter().map(String::as_str).collect();
+    h.reply(&pieces);
+    let (code, v) = h.json(json!({"messages": user("2+2?")})).await;
+    assert_eq!(code, StatusCode::OK, "{v}");
+    assert_eq!(h.last_prompt(), "<<2+2?>>", "--chat-template");
+    let c = &v["choices"][0];
+    // the file's `auto` beat the server's `none`: the trace is split
+    assert_eq!(
+        (
+            c["message"]["reasoning"].as_str(),
+            c["message"]["content"].as_str()
+        ),
+        (Some("plan"), Some("Four."))
+    );
+    // max_new_tokens 3 is the default max_tokens (the scripted reply is longer)
+    assert_eq!(c["finish_reason"], "length");
+    // the request still overrides both
+    let (_, v) = h
+        .json(json!({"messages": user("2+2?"), "max_tokens": 64, "reasoning_format": "none"}))
+        .await;
+    assert_eq!(v["choices"][0]["finish_reason"], "stop");
+    assert_eq!(
+        v["choices"][0]["message"]["content"],
+        "<think>plan</think>Four."
+    );
+}

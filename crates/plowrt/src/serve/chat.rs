@@ -98,7 +98,10 @@ async fn chat_completions_with(
     let defaults_of = state.registry.get(&req.model).ok();
     let defaults = defaults_of.as_deref().and_then(|b| b.serving().chat.get());
     if let Some(d) = defaults {
-        req.max_tokens = req.max_tokens.or(d.max_tokens);
+        req.max_tokens = req
+            .max_tokens
+            .or(d.max_tokens)
+            .or(d.generation.and_then(|g| g.max_new_tokens));
         if let Some(kw) = &d.chat_template_kwargs {
             let k = req
                 .chat_template_kwargs
@@ -107,6 +110,16 @@ async fn chat_completions_with(
                 k.entry(key.clone()).or_insert_with(|| v.clone());
             }
         }
+        req.reasoning_effort = req.reasoning_effort.take().or(d.reasoning_effort.clone());
+        req.reasoning_format = req.reasoning_format.take().or(d.reasoning_format.clone());
+        req.include_reasoning = req.include_reasoning.or(d.include_reasoning);
+        req.reasoning_budget_message = req
+            .reasoning_budget_message
+            .take()
+            .or(d.reasoning_budget_message.clone());
+        // A default `reasoning_effort` maps to the template switch the way the request's does,
+        // under the request's own kwargs.
+        req.normalize();
     }
     let think_budget = req
         .thinking_token_budget
@@ -411,7 +424,7 @@ async fn chat_completions_with(
         params: state
             .registry
             .get(&req.model)
-            .map(|b| b.serving().default_sampling.clone())
+            .map(|b| crate::serve::config::base_sampling(&b))
             .unwrap_or_default(),
         ..Default::default()
     };

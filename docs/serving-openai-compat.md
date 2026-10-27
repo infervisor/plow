@@ -562,6 +562,28 @@ before the bias existed. Measured on Qwen3-0.6B (RTX 4050, sm_89, 10 voice turns
 `early_exit_rank` 20 never fired on this model (its close marker ranks low until the trace is
 done).
 
+**Engine flags: moving from vLLM, SGLang or llama.cpp.** The server takes those engines'
+reasoning and generation flags under their own names, so their command line keeps its meaning
+here. They set server-wide defaults: a model's `--chat-defaults` entry goes on top, a request's
+own field on top of that (and every request field can be defaulted at either level).
+
+| Engine flag | plow |
+|---|---|
+| vLLM / SGLang `--reasoning-parser NAME` | checked against the model's template (wrong marker family = startup error); the template's markers split the trace |
+| vLLM `--reasoning-config '{"reasoning_start_str", "reasoning_end_str"}'` | start must be the model's open marker; end = the default forced end (`reasoning_end`) |
+| vLLM `--default-chat-template-kwargs`, llama.cpp `--chat-template-kwargs` | default `chat_template_kwargs` |
+| vLLM `--generation-config auto\|vllm\|DIR`, `--override-generation-config` | sampling defaults; `max_new_tokens` = default `max_tokens` |
+| vLLM / SGLang `--chat-template` | template override (file or text) |
+| vLLM < 0.10 `--enable-reasoning` | accepted, no effect |
+| llama.cpp `--reasoning-budget`, `--reasoning-budget-message` | default `thinking_token_budget`, bridge text |
+| llama.cpp `--reasoning-format`, `--reasoning on\|off\|auto`, `--reasoning-effort` | default `reasoning_format`, `enable_thinking`, `reasoning_effort` |
+| plow `--reasoning-end`, `--max-reply-tokens`, `--thinking-token-budget` | default forced end, reply cap, budget |
+
+Per request, vLLM's `thinking_token_budget` / `include_reasoning` / `chat_template_kwargs`,
+llama.cpp's `reasoning_budget_tokens` / `reasoning_budget_message` / `reasoning_format` and
+OpenAI's `reasoning_effort` / `max_completion_tokens` are all read. Startup logs one
+`chat defaults` line per model with the effective values and where they came from.
+
 GPU soundness gates for all of the above (byte-identical output across the chained decode paths
 under forcing, seeded reproducibility, no-budget TPOT): `scripts/bench/thinking_gates.sh`, run
 through `scripts/bench/gpuq.py`. The stress comparison (strict and judged leaks, `finish=length`,

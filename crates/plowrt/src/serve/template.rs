@@ -71,6 +71,11 @@ impl ChatTemplate {
         Self::compile(t.text, t.source, t.bos_token, t.eos_token)
     }
 
+    /// Another template text for the same model (vLLM `--chat-template`), with this one's specials.
+    pub fn recompile(&self, text: String, source: String) -> Option<Arc<ChatTemplate>> {
+        Self::compile(text, source, self.bos_token.clone(), self.eos_token.clone())
+    }
+
     /// Compile a template carried by the packet (or found beside the weights).
     pub fn compile(
         text: String,

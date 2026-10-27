@@ -221,15 +221,20 @@ async fn completions_with(
     crate::obs::ttft::reset();
 
     // Model defaults first, request on top — same resolution order as chat.
+    let bundle_of = state.registry.get(&req.model).ok();
     let mut gen = crate::serve::GenParams {
-        params: state
-            .registry
-            .get(&req.model)
-            .map(|b| b.serving().default_sampling.clone())
+        params: bundle_of
+            .as_deref()
+            .map(crate::serve::config::base_sampling)
             .unwrap_or_default(),
         ..Default::default()
     };
-    if let Some(m) = req.max_tokens {
+    // vLLM's `max_new_tokens` generation default applies to completions too.
+    let default_max = bundle_of
+        .as_deref()
+        .and_then(|b| b.serving().chat.get())
+        .and_then(|d| d.max_tokens.or(d.generation.and_then(|g| g.max_new_tokens)));
+    if let Some(m) = req.max_tokens.or(default_max) {
         gen.max_tokens = m as usize;
     }
     req.sampling.apply(&mut gen.params);
@@ -347,7 +352,7 @@ async fn completions_with(
         );
     }
     let n_prompt = prompt_ids.len();
-    if req.max_tokens.is_none() {
+    if req.max_tokens.is_none() && default_max.is_none() {
         gen.max_tokens = crate::serve::default_max_tokens(
             COMPLETIONS_DEFAULT_MAX_TOKENS.max(gen.min_tokens),
             state.max_ctx(&req.model),
