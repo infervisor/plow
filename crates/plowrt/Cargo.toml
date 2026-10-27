@@ -78,7 +78,11 @@ rand = "0.9"
 
 # Optional: real tokenizer + checkpoint reader. Off by default so the skeleton
 # builds fast and offline; a byte-fallback tokenizer stands in when absent.
-tokenizers = { version = "0.23", optional = true }
+# Without the defaults: `esaxx_fast` is C++ (the Unigram *trainer*'s suffix
+# array, never used to load or encode) and was the binary's only libstdc++
+# link; `progressbar` is training-only too. `onig` keeps the regex engine
+# the checked-in tokenizers were validated with.
+tokenizers = { version = "0.23", default-features = false, features = ["onig"], optional = true }
 rayon = { version = "1", optional = true }
 safetensors = { version = "0.4", optional = true }
 hf-hub = { workspace = true, optional = true }
@@ -90,8 +94,9 @@ zstd = { version = "0.14", optional = true }
 # `plowrt push`: the bucket client. Our fork of Apache `object_store` adds a
 # Cloudflare R2 store over the REST API (API-token writes); R2's S3 endpoint
 # and any S3 bucket come with it. Pure Rust (rustls, ring) so the binary
-# stays static; publish-side only, same reasoning as ureq.
-object_store = { git = "https://github.com/storyvis/object-store", rev = "4f3e9336cd9eb1f29a72b0dfb25dc9ef8a6ac75a", default-features = false, features = ["cloudflare"], optional = true }
+# stays static; publish-side only, same reasoning as ureq. `rev` is the tip of
+# the fork's `r2` branch; move it when that branch moves.
+object_store = { git = "https://github.com/storyvis/object-store", rev = "63f1eaef4e789cc6c3f97d2893d27aea57bf4984", default-features = false, features = ["cloudflare"], optional = true }
 # `plowrt push` signs a model index and `pull` verifies it (Nix's scheme: ed25519,
 # `<name>:<base64>`). Publish/fetch side only: `serve` verifies nothing.
 ed25519-dalek = { version = "2", default-features = false, features = ["std"], optional = true }

@@ -61,7 +61,7 @@
         outputHashes = {
           "inference-benchmarker-1.1.0" = "sha256-Tr/urmjuYQXH50kxCn05DOLfv4JTYv+mjsBv5EhQXAE=";
           # `plowrt push`'s bucket client (crates/plowrt/Cargo.toml).
-          "object_store-0.13.2" = "sha256-uhCGCPU4dBOO/wbZLAM88pRvK/bIICmFvwkwFivXDuk=";
+          "object_store-0.14.2" = "sha256-mT3o58v/2cYCx7LEQ5QiP1pOP/TLxZ+cpNLEiVXA5dw=";
         };
       };
 
