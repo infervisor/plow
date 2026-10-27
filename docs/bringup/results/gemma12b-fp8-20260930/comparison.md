@@ -526,6 +526,69 @@ Next: the hd512 prefill attention under a cached prefix (KV split for small quer
 FP8 projections (~13 us cuBLASLt minimum per call; algorithm search or q|k|v and gate|up
 concatenation).
 
+## 2026-10-27: prefill TTFT tail, phase 3 (attention, projections, serve env)
+
+plowrt efd10cbe0 (GLU change 687d8ec73), packet a0464475f8ab unchanged. Raw:
+`/opt/dlami/nvme/lava-tts/g12-decode` (`pf/p30*`, `pf/fa1.out`, `hd512/`, `gemm/`, `grid-{il4k,il1k,t0ao,d5fa}`,
+`gates/{fa-c16,fa-c16b,fat0-a,d5-c16}`).
+
+Where the tail comes from (2.7/s, `grid-pf2`): prefill launches hold ~60% of the wall; by bucket, 2048
+and 2112 launches are 66% of prefill launch time (mean 76-81 ms), 128-512 launches 19%. TTFT by
+uncached prompt tokens against vLLM on the same sessions: 4K-token first turns p50 417-482 vs
+329-340 ms, p99 1.65-1.73 vs 1.34-1.36 s; short cached turns p50 176-192 vs 138-196 ms. Prefix
+attach at admission (KV block store gather): p50 1.4 ms, p90 16 ms, p99 126 ms.
+
+One 2048-row launch behind a 4096-token prefix (69 ms, nsys): per sliding layer gate 200 + up 201 +
+native down 191 us (61-63% of FP8 dense peak), GLU quant 93, q/k/v 52/27/25, o 51, norms 64,
+rope 62, hd256 flash 160 (two staged 1024-row halves); per global layer the hd512 flash is 1852
+us (186 TF/s), 14.8 ms = 21% of the launch. At 128 rows + 4K prefix the flash is 336 us (hd512)
+and 72 us (hd256) per layer, 5.6 of 15.3 ms: 32 resp. 16 work items on 132 SMs.
+
+- hd512 attention: a warp-specialized wgmma kernel (producer converting e4m3 tiles, two consumer
+  warpgroups splitting the score tile by N and O by D, fp16 rounding points of the generated
+  kernel) was correct (rel-L2 1.7e-3, equal to the current kernel) but slower: 2048 rows + 4K
+  prefix 2885 vs 1799 us, 239 TF/s with the conversion removed. The generated kernel already
+  runs that layout (m64n16k16 QK per warpgroup, PV from shared memory); at head_dim 512 the
+  per-tile QK chain and the K/V conversion bound it. Not shipped. A faster global layer needs a
+  different structure (FP8 QK with a quantized Q, or a dequantized KV pass shared by the 16 query
+  heads); small query counts need a KV split, which needs partial-output scratch the role ABI
+  lacks.
+- FP8 projections: the same shapes through a row-wise scaled FP8 GEMM library path measure within
+  5% of the current routes (2048 rows: gate/up 192 vs 200 us, down 187 vs 191, q 60 vs 52); the
+  ~13 us per-call floor at 128 rows matters only to the 19% small-launch share. Fast accumulation
+  (`PLOW_LT_FP8_FAST_ACCUM_MAX_K=8192`, the 26B setting) cuts 512-4096-row launches 4-9%, but the
+  FP32-reference gate c16 passed 1 of 3 runs (cont_decisive 42, 38, 39 of 46 against 41; kl_trim
+  0.053-0.061 vs 0.045-0.048 without; one run with the terminal lm_head off cuBLASLt): not taken.
+- GLU quant: every layer's fused GLU quant writes the same bf16 activation, so the no-store twin
+  was never chosen; with the check fixed, 512-4096-row launches are 1.2-2.2% faster, outputs
+  unchanged (rider-vs-step agreement and KL identical on every rung).
+  FP32-reference gate c16 on this binary: cont_decisive 40 of 46 (FAIL by one case) with kl_trim
+  0.04778, identical to the first canonical run; the canonical packet now passes 3 of 5 runs
+  (40, 41, 43, 41, 40 against the 41 floor, vLLM 42; earlier packets 42-43).
+
+| rows x prefix | base ms | GLU fix | fast accum | both |
+|---|---|---|---|---|
+| 128 x 0 | 10.03 | -0.6% | -0.5% | -1.5% |
+| 512 x 4096 | 20.39 | -1.7% | -4.2% | -5.7% |
+| 1024 x 4096 | 34.77 | -1.8% | -7.2% | -8.5% |
+| 2048 x 4096 | 68.52 | -1.4% | -5.7% | -7.6% |
+| 4096 x 4096 | 144.27 | -0.6% | -7.9% | -8.8% |
+
+Serve env on the production mix (campaign.py report vs the same vLLM arm):
+
+| Variant | 1.8/s TTFT P99 | 2.7/s TTFT P99 | 2.7/s SLO met |
+|---|---|---|---|
+| canonical (interleave 2048) | 1.24x | 1.25x | 97.2% |
+| interleave 4096 | 1.15x | 1.74x | 96.3 / 88.1% |
+| interleave 1024 | 928 / 1394 ms | 3.2 s (rep 2 lost: server killed) | 92.3% |
+| host tier off, admit overlap, pool 2 GiB | 2.3 / 5.6 s | 7.9 / 22 s | 26.9 / 6.3% (cached 37-46%) |
+| GLU fix + fast accum (3 reps) | 0.87x | 1.24x (reps 1-3: 1372 / 1419 / 1286 ms) | 98.7 / 95.7 / 96.8% |
+
+The host tier is needed for the hit rate (device store ~14 GB); unbounded it pinned 216 GB of a
+249 GB host before the interleave-1024 server died without a log line, so the tier needs a cap on
+a shared box. Remaining gap at 2.7/s: TTFT P99 ~1.2x, from 4K-token first turns queueing behind
+2048-row launches whose global-layer attention is 21% of their time.
+
 ## 2026-10-27: native vs cuBLASLt route sweep (Gemma-4 12B FP8)
 
 Protocol: `step_bench` on one H100, decode 48 steps `--spread`, prefill `--packed-prefill --pf-reps 3`
