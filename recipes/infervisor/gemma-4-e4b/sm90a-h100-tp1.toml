@@ -7,6 +7,12 @@
 #
 # Gates: scripts/llm/gemma_logit_parity.py (served logprobs vs HF transformers bf16);
 # bench: scripts/llm/gemma_voice_bench.sh (plowbench conventions, vLLM reference same client).
+#
+# 2026-10-27 vs vLLM 0.29 (plowrt bb9f389fd, packet 046539c8a8a7; docs/bringup/results/
+# gemma4-e4b-h100-20261027): campaign.py report MATCHED + EQUIVALENT, 1000/128 c1/c8/c32 tok/s
+# 1.01x/1.03x/1.11x, TTFT P99 1.51x*/0.70x/0.74x, TPOT P99 1.01x/1.02x/0.93x, peak memory 0.64-0.70x.
+# Voice sweep: TTFT P50 2-7x lower c1..c128, session later-turn TTFT P50 16.5 vs 45.6 ms (64 calls);
+# c200 TTFT P50 1359 vs 974 ms (ladder tops at 128 rows). FP32-reference gate added (below).
 
 schema = "plow.recipe.v1"
 namespace = "infervisor"
@@ -128,3 +134,18 @@ python = "{env:PYREF}"
 hf_dir = "{hf:google/gemma-4-E4B-it@ee0ef6023621cff504d758262d4e04895a5af4a2}"
 top1_min = 0.98
 kl_mean_max = 2e-3
+# FP32 reference (scripts/llm/fp32_ref_gate.py reference): the 27 cases of the 46-case Gemma prompt
+# set (fp32gate/prompts.json) whose prompt + max_new fits max_ctx 8192; ref sha256 a26cc565fc45...
+# vLLM 0.29 is captured as the peer in the gate's lease at every concurrency. 2026-10-27 on packet
+# 046539c8a8a7 (plowrt bb9f389fd): PASS c1/c8/c32, kl_trim 0.00040/0.00041/0.00043 vs vLLM
+# 0.00059/0.00058/0.00057, top1_decisive 1.0, continuation 0.825/0.811/0.854 vs 0.781/0.744/0.803.
+# needle_min 0: E4B opens every 16-token needle answer with reasoning, and the FP32 reference
+# scores 0/9 itself; needle_drop_max still binds.
+[gates.llm_fp32_ref]
+reference = "{env:E4B_FP32_REF}"
+concurrency = [1, 8, 32]
+vllm_hf = "{hf:google/gemma-4-E4B-it@ee0ef6023621cff504d758262d4e04895a5af4a2}"
+vllm_python = "{env:VLLM_PYTHON}"
+vllm_args = "--served-model-name gemma-4-e4b --max-model-len 8192 --gpu-memory-utilization 0.85 --max-num-seqs 256 --limit-mm-per-prompt '{\"image\":0,\"audio\":0}'"
+timeout_s = 3600
+needle_min = 0.0
