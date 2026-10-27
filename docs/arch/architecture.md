@@ -38,6 +38,7 @@ duplicate them and is now an index only.
 | [20](20-asr-pipelines.md) | **ASR Packet Pipelines** | Qwen causal and Nemotron RNNT compilation, runtime, batching and serving |
 | [22](22-kv-cache.md) | **KV Cache** | Head-major ring layout, chunk-sized rings, the write and read paths, fp8 KV, slots, the VMM allocator and the prefix cache |
 | [26](26-kv-block-store.md) | **Prefix Cache Retention and the KV Block Store (design)** | What moves the production hit rate (capacity tiers, session-end demotion; the retention simulation against vLLM 0.29) and the content-addressed row-class store that unifies NVIDIA/AMD/CPU and adds recurrent state |
+| [27](27-content-addressed-distribution.md) | **Content-Addressed Distribution (design)** | Bundles as NAR-hashed store paths with a Hugging Face commit reference as a symlink, an S3-compatible bucket laid out as a binary cache, profiles/generations with pin, rollback and gc, and the phased replacement of `pack`/`publish` |
 | [23](23-jit-rungs.md) | **JIT Rungs (future plan)** | Building a new decode rung or prefill bucket at runtime on prebuilt cubins: measured emit cost, what is packet-only, the pairing and verifier guardrails, the staged path from `plowc extend` to a hot-add |
 
 ---
