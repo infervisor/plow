@@ -287,3 +287,180 @@ Comparison: **MATCHED**; quality: **EQUIVALENT**
 | TPOT P99 | 80.67 ms | 48.02 ms (0.60x) |
 
 Spread over 2 repeats, (max - min) / mean, Baseline / Infervisor: Peak GPU memory 0.0% / 0.1%; Total throughput 0.9% / 2.2%; Throughput / GPU 0.9% / 2.2%; TTFT P99 1.2% / 8.0%; TPOT P99 1.2% / 3.1%.
+
+## 2026-10-27: native vs cuBLASLt route sweep (Gemma-4 26B-A4B FP8 and BF16)
+
+Protocol: `step_bench` on one H100 (plowrt bin34 6a4b75bc for current packets and emit-time
+variants without code changes; plowrt 69215b1e = commit 8b811e45 for the Qwen arms), decode 48 steps
+`--spread`, prefill `--packed-prefill --pf-reps 3` (best timed rep), two passes ABAB, current arm =
+the abi2 packet of the recipe at 21ab0d7d, alternative = the same recipe with one route knob changed
+(emit knob: re-emitted with the same plowc; runtime knob: same packet). ms = mean of the two passes
+(passes agree within 1%). % floor = calibrated floor / measured: decode bytes (weights streamed once,
+MoE experts touched at top-8 of 128, KV rows) / 3.35 TB/s; prefill max(FLOP / peak, bytes / 3.35
+TB/s), peak 1979 TF/s FP8, 990 BF16 (MoE floors approximate). digest = TOK_STREAM fnv of the run.
+Raw: /opt/dlami/nvme/lava-tts/route-sweep (A/, B/, C/, logs/, gates/).
+
+FP8 result: rung 32 moves to the native FP8 GEMV (recipe `PLOW_EMIT_DECODE_CUBLASLT_MIN_ROWS` 32 ->
+64, commit a707a0b0): B32 -10..-14% at ctx 1K/8K/16K, every other rung and prefill unchanged. FP32
+gates on that packet (62f32036d4cc): c16 PASS (kl_mean 0.2118 vs vLLM 0.202, kl_trim 0.1406 vs
+0.1242, top1_decisive 0.9602, needle 1), long c4 PASS (kl_mean 0.1511 vs 0.165, kl_trim 0.0991 vs
+0.1011, top1_decisive 0.9555, needle 1). Kept: cuBLASLt from 64 (native 64 is 2.2-2.4x slower),
+cuBLASLt prefill and MoE prefill, fused qkv. The FP8 packet has no MoE decode library route (the
+experts are native on every rung). Whole-packet effect: decode steps with 17-32 rows in flight
+(the c16-c32 serving range) are 1.4-1.9 ms faster; nothing else moves.
+
+BF16 result: no change. cuBLASLt at rung 8 loses to the native rung (+0.6..+1%) and native rung 16
+loses to cuBLASLt (+0.2..+5%), the
+native MoE decode is 3.1-4.8 ms slower per step at every rung (PLOW_MOE_DEC_LT=0 is refused at
+runtime on this packet, so it was measured as an emit variant), and native prefill, native MoE
+prefill, the interpreter attention instead of the cuBLASLt attention route and the interpreter
+terminal are all slower or equal.
+
+
+**26B FP8 rung 32 native (PLOW_EMIT_DECODE_CUBLASLT_MIN_ROWS 32 -> 64) -- PROMOTED** (g26fp8-base vs g26fp8-lt64)
+
+| phase | rows x ctx | g26fp8-base ms | g26fp8-lt64 ms | change | % floor (cur / alt) | digest |
+|---|---|---|---|---|---|---|
+| decode | B16 x 1024 | 8.58 | 8.58 | +0.1% | 71 / 71 | equal |
+| decode | B32 x 1024 | 13.40 | 11.55 | -13.8% | 63 / 73 | differs |
+| decode | B32 x 8192 | 14.91 | 13.50 | -9.4% | 59 / 65 | differs |
+| decode | B32 x 16000 | 17.01 | 15.34 | -9.9% | 54 / 60 | differs |
+| decode | B64 x 1024 | 18.82 | 18.85 | +0.2% | 54 / 54 | equal |
+
+**26B FP8 cuBLASLt from 8 rows** (g26fp8-base vs g26fp8-lt8)
+
+| phase | rows x ctx | g26fp8-base ms | g26fp8-lt8 ms | change | % floor (cur / alt) | digest |
+|---|---|---|---|---|---|---|
+| decode | B4 x 1024 | 5.68 | 5.69 | +0.2% | 50 / 50 | equal |
+| decode | B8 x 1024 | 6.63 | 9.17 | +38.3% | 63 / 46 | differs |
+| decode | B8 x 16000 | 7.64 | 10.21 | +33.6% | 57 / 43 | differs |
+| decode | B16 x 1024 | 8.63 | 10.54 | +22.2% | 71 / 58 | differs |
+| decode | B16 x 8192 | 9.22 | 11.42 | +23.8% | 68 / 55 | differs |
+| decode | B16 x 16000 | 10.25 | 12.50 | +21.9% | 63 / 52 | differs |
+| decode | B32 x 1024 | 13.38 | 13.39 | +0.1% | 63 / 63 | equal |
+
+**26B FP8 cuBLASLt only at 128 (rung 64 native)** (g26fp8-base vs g26fp8-lt128)
+
+| phase | rows x ctx | g26fp8-base ms | g26fp8-lt128 ms | change | % floor (cur / alt) | digest |
+|---|---|---|---|---|---|---|
+| decode | B32 x 1024 | 13.37 | 11.54 | -13.7% | 63 / 73 | differs |
+| decode | B64 x 1024 | 18.82 | 46.00 | +144.4% | 54 / 22 | differs |
+| decode | B64 x 8192 | 22.07 | 49.06 | +122.3% | 49 / 22 | differs |
+| decode | B64 x 16000 | 26.02 | 53.24 | +104.6% | 45 / 22 | differs |
+| decode | B128 x 1024 | 29.72 | 29.73 | +0.0% | 42 / 42 | equal |
+| decode | B128 x 16000 | 44.17 | 44.18 | +0.0% | 35 / 35 | equal |
+
+**26B FP8 native prefill projections** (g26fp8-base vs g26fp8-pfnative)
+
+| phase | rows x ctx | g26fp8-base ms | g26fp8-pfnative ms | change | % floor (cur / alt) | digest |
+|---|---|---|---|---|---|---|
+| decode | B1 x 1024 | 4.32 | 4.32 | -0.1% | 38 / 38 | differs |
+| prefill | 1 x 128 | 14.21 | 15.14 | +6.6% | 58 / 54 | differs |
+| prefill | 1 x 256 | 15.68 | 16.76 | +6.9% | 52 / 49 | equal |
+| prefill | 1 x 512 | 19.26 | 20.52 | +6.6% | 43 / 40 | equal |
+| prefill | 1 x 1024 | 25.45 | 28.46 | +11.8% | 32 / 29 | equal |
+| prefill | 1 x 1088 | 30.38 | 32.60 | +7.3% | 27 / 25 | equal |
+| prefill | 1 x 2048 | 40.98 | 45.97 | +12.2% | 27 / 24 | equal |
+| prefill | 1 x 2112 | 45.32 | 49.78 | +9.8% | 25 / 23 | equal |
+| prefill | 1 x 4096 | 76.20 | 85.49 | +12.2% | 29 / 26 | equal |
+| prefill | 2 x 4096 | 141.39 | 159.45 | +12.8% | 31 / 28 | differs |
+
+**26B FP8 MoE prefill experts native: PLOW_MOE_PF_LT=0** (g26fp8-base vs g26fp8-moepf0)
+
+| phase | rows x ctx | g26fp8-base ms | g26fp8-moepf0 ms | change | % floor (cur / alt) | digest |
+|---|---|---|---|---|---|---|
+| prefill | 1 x 128 | 14.42 | 19.31 | +33.9% | 57 / 43 | differs |
+| prefill | 1 x 1024 | 25.51 | 40.23 | +57.7% | 32 / 20 | equal |
+| prefill | 1 x 4096 | 76.27 | 112.30 | +47.2% | 29 / 20 | equal |
+
+**26B FP8 PLOW_DECODE_LT_QKV=0** (g26fp8-base vs g26fp8-ltqkv0)
+
+| phase | rows x ctx | g26fp8-base ms | g26fp8-ltqkv0 ms | change | % floor (cur / alt) | digest |
+|---|---|---|---|---|---|---|
+| decode | B32 x 1024 | 13.37 | 13.38 | +0.0% | 63 / 63 | equal |
+| decode | B32 x 16000 | 16.99 | 17.00 | +0.0% | 54 / 54 | equal |
+| decode | B64 x 1024 | 18.85 | 18.84 | -0.1% | 54 / 54 | equal |
+| decode | B64 x 16000 | 26.17 | 26.12 | -0.2% | 45 / 45 | equal |
+| decode | B128 x 1024 | 29.86 | 29.79 | -0.2% | 42 / 42 | equal |
+| decode | B128 x 16000 | 44.24 | 44.27 | +0.1% | 35 / 35 | equal |
+
+**26B BF16 cuBLASLt from 8 rows** (g26bf16-base vs g26bf16-lt8)
+
+| phase | rows x ctx | g26bf16-base ms | g26bf16-lt8 ms | change | % floor (cur / alt) | digest |
+|---|---|---|---|---|---|---|
+| decode | B4 x 1024 | 7.68 | 7.61 | -0.9% | 67 / 67 | equal |
+| decode | B8 x 1024 | 8.86 | 8.92 | +0.7% | 88 / 87 | differs |
+| decode | B8 x 8192 | 9.35 | 9.38 | +0.3% | 85 / 85 | differs |
+| decode | B8 x 16000 | 10.51 | 10.62 | +1.1% | 78 / 77 | differs |
+| decode | B16 x 1024 | 10.67 | 10.69 | +0.1% | 109 / 108 | equal |
+
+**26B BF16 cuBLASLt from 32 rows (rung 16 native)** (g26bf16-base vs g26bf16-lt32)
+
+| phase | rows x ctx | g26bf16-base ms | g26bf16-lt32 ms | change | % floor (cur / alt) | digest |
+|---|---|---|---|---|---|---|
+| decode | B8 x 1024 | 8.86 | 8.91 | +0.6% | 88 / 87 | equal |
+| decode | B16 x 1024 | 10.70 | 11.26 | +5.2% | 108 / 103 | differs |
+| decode | B16 x 8192 | 11.93 | 12.12 | +1.6% | 100 / 99 | equal |
+| decode | B16 x 16000 | 13.63 | 13.89 | +1.9% | 90 / 89 | differs |
+| decode | B32 x 1024 | 13.73 | 13.71 | -0.2% | 115 / 115 | equal |
+
+**26B BF16 MoE decode experts native (emit PLOW_EMIT_MOE_DEC_LT=0)** (g26bf16-base vs g26bf16-moedecnat)
+
+| phase | rows x ctx | g26bf16-base ms | g26bf16-moedecnat ms | change | % floor (cur / alt) | digest |
+|---|---|---|---|---|---|---|
+| decode | B4 x 1024 | 7.58 | 10.98 | +44.8% | 68 / 47 | differs |
+| decode | B4 x 16000 | 8.55 | 11.74 | +37.3% | 62 / 45 | equal |
+| decode | B8 x 1024 | 8.85 | 11.96 | +35.2% | 88 / 65 | differs |
+| decode | B8 x 16000 | 10.51 | 13.63 | +29.7% | 78 / 60 | differs |
+| decode | B16 x 1024 | 10.64 | 13.83 | +30.0% | 109 / 84 | differs |
+| decode | B16 x 16000 | 13.55 | 17.09 | +26.1% | 91 / 72 | differs |
+| decode | B32 x 1024 | 13.63 | 17.26 | +26.7% | 116 / 91 | differs |
+| decode | B32 x 16000 | 18.76 | 22.74 | +21.2% | 92 / 76 | differs |
+
+**26B BF16 native prefill projections** (g26bf16-base vs g26bf16-pfnative)
+
+| phase | rows x ctx | g26bf16-base ms | g26bf16-pfnative ms | change | % floor (cur / alt) | digest |
+|---|---|---|---|---|---|---|
+| decode | B1 x 1024 | 5.56 | 5.58 | +0.2% | 48 / 48 | equal |
+| prefill | 1 x 128 | 14.72 | 17.73 | +20.4% | 105 / 87 | equal |
+| prefill | 1 x 256 | 16.04 | 20.25 | +26.2% | 96 / 76 | equal |
+| prefill | 1 x 512 | 21.67 | 24.78 | +14.4% | 71 / 62 | equal |
+| prefill | 1 x 1024 | 27.88 | 30.93 | +10.9% | 55 / 50 | equal |
+| prefill | 1 x 1088 | 31.45 | 34.55 | +9.9% | 49 / 45 | equal |
+| prefill | 1 x 2048 | 42.14 | 46.18 | +9.6% | 43 / 39 | equal |
+| prefill | 1 x 2112 | 49.22 | 49.12 | -0.2% | 38 / 38 | equal |
+| prefill | 1 x 4096 | 78.28 | 82.01 | +4.8% | 46 / 44 | equal |
+| prefill | 2 x 4096 | 140.74 | 150.29 | +6.8% | 51 / 48 | equal |
+
+**26B BF16 MoE prefill experts native: PLOW_MOE_PF_LT=0** (g26bf16-base vs g26bf16-moepf0)
+
+| phase | rows x ctx | g26bf16-base ms | g26bf16-moepf0 ms | change | % floor (cur / alt) | digest |
+|---|---|---|---|---|---|---|
+| prefill | 1 x 128 | 14.49 | 16.43 | +13.3% | 106 / 94 | equal |
+| prefill | 1 x 1024 | 28.20 | 36.89 | +30.8% | 55 / 42 | equal |
+| prefill | 1 x 4096 | 77.71 | 109.09 | +40.4% | 47 / 33 | equal |
+
+**26B BF16 prefill attention off the cuBLASLt route: PLOW_PF_ATTN_GEMM=0** (g26bf16-base vs g26bf16-pfattngemm0)
+
+| phase | rows x ctx | g26bf16-base ms | g26bf16-pfattngemm0 ms | change | % floor (cur / alt) | digest |
+|---|---|---|---|---|---|---|
+| prefill | 1 x 128 | 14.49 | 15.02 | +3.6% | 106 / 102 | equal |
+| prefill | 1 x 1024 | 28.20 | 28.23 | +0.1% | 55 / 55 | equal |
+| prefill | 1 x 4096 | 77.71 | 80.12 | +3.1% | 47 / 45 | equal |
+
+**26B BF16 PLOW_TERMINAL_LT=0** (g26bf16-base vs g26bf16-termlt0)
+
+| phase | rows x ctx | g26bf16-base ms | g26bf16-termlt0 ms | change | % floor (cur / alt) | digest |
+|---|---|---|---|---|---|---|
+| prefill | 1 x 128 | 14.49 | 15.67 | +8.1% | 106 / 98 | equal |
+| prefill | 1 x 1024 | 28.20 | 28.55 | +1.3% | 55 / 54 | equal |
+| prefill | 1 x 4096 | 77.71 | 78.47 | +1.0% | 47 / 46 | equal |
+
+**26B BF16 PLOW_DECODE_LT_QKV=0** (g26bf16-base vs g26bf16-ltqkv0)
+
+| phase | rows x ctx | g26bf16-base ms | g26bf16-ltqkv0 ms | change | % floor (cur / alt) | digest |
+|---|---|---|---|---|---|---|
+| decode | B16 x 1024 | 10.70 | 10.65 | -0.5% | 108 / 109 | equal |
+| decode | B16 x 16000 | 13.61 | 13.58 | -0.3% | 90 / 91 | equal |
+| decode | B32 x 1024 | 13.68 | 13.72 | +0.2% | 115 / 115 | equal |
+| decode | B32 x 16000 | 18.79 | 18.75 | -0.2% | 92 / 92 | equal |
