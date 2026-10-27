@@ -2094,6 +2094,7 @@ __device__ void fa_decode_tc16(float* __restrict__ Opart, float* __restrict__ ml
                                const float* __restrict__ k_scale, const float* __restrict__ v_scale,
                                const int* __restrict__ decode_slot) {
     constexpr unsigned D = 512, NCH = D / 64, QS = FA_TC16_QS, PS = FA_TC16_PS;
+    static_assert(PLOW_NV_THREADS == 256 && PLOW_NV_WARPS == 8, "TC16: 8 warps x 16 rows per tile, 64 dims per warp");
     const unsigned tid = threadIdx.x, lane = tid & 31u, warp = tid >> 5, g = lane >> 2, t = lane & 3u;
     __nv_bfloat16* qs = (__nv_bfloat16*)lds;
     unsigned short* ph = (unsigned short*)(lds + 16u * QS / 2u);
