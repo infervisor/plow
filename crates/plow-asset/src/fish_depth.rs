@@ -79,6 +79,10 @@ pub struct Manifest {
     /// Maya 2: the depth levels' fixed (temperature as f32 bits, top-k).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub depth_sampling: Option<[u32; 2]>,
+    /// Maya 2: each depth layer's per-slot memory constant, f32 `[slots][hidden]`, written when a
+    /// request binds (the null memory's, or its speaker's).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub slot_memory: Vec<u16>,
     pub tensors: Tensors,
 }
 

@@ -26,6 +26,11 @@ Depth (DepthV2, matrices fp16 as the official engine serves it, vectors fp32; fo
   maya2.depth.cross.{l}          [1024]             o_l(v_l(null_mem)): the one-token cross-attention
                                                     (named/plain voices), added after layer l's FFN
   maya2.depth.norm.{weight,bias} / maya2.depth.heads.{0..30}.weight [2048][1024]
+Host-side speaker tables (fp32, OUT_DIR/speaker/model.safetensors, read by plowrt for cloned voices):
+  anchor.fc{1,2}.{weight,bias}   the speaker anchor MLP (192 -> 512 -> 2048, GELU erf)
+  audio_row                      embed_tokens[<|audio|>] before the null anchor is baked in
+  memory.{l}                     [1024][192] o_l @ v_l @ spk_proj_ecapa: the depth memory constant of an
+                                 ECAPA embedding e is memory.{l} @ e (f16-rounded, as the engine's C)
 """
 import argparse, glob, json, math, os, shutil
 
@@ -73,6 +78,11 @@ def main():
                  f32("speaker_anchor.fc2.weight"), f32("speaker_anchor.fc2.bias"))
     emb = out["model.embed_tokens.weight"].clone()
     assert emb.shape[0] == AEOS_ROW
+    spk = {
+        "anchor.fc1.weight": f32("speaker_anchor.fc1.weight"), "anchor.fc1.bias": f32("speaker_anchor.fc1.bias"),
+        "anchor.fc2.weight": f32("speaker_anchor.fc2.weight"), "anchor.fc2.bias": f32("speaker_anchor.fc2.bias"),
+        "audio_row": emb[AUDIO].float(),
+    }
     emb[AUDIO] = (emb[AUDIO].float() + a).to(torch.bfloat16)
     # nn.RMSNorm(eps=None): fp32, eps FLT_EPSILON, fp32 weight multiply, one rounding.
     x = f32("audio_in.aeos_in").reshape(-1)
@@ -99,9 +109,12 @@ def main():
                 d[f"maya2.{p}.{s}"] = f32(f"{p}.{s}")
     mem = f32("depth.null_mem").reshape(-1)
     dim = mem.shape[0]
+    proj = f32("depth.spk_proj_ecapa.weight")
     for l in range(LAYERS):
-        v = F.linear(mem, f32(f"depth.cross.{l}.kv.weight"))[dim:]
-        d[f"maya2.depth.cross.{l}"] = F.linear(v, f32(f"depth.cross.{l}.o.weight"))
+        kv, o = f32(f"depth.cross.{l}.kv.weight"), f32(f"depth.cross.{l}.o.weight")
+        v = F.linear(mem, kv)[dim:]
+        d[f"maya2.depth.cross.{l}"] = F.linear(v, o)
+        spk[f"memory.{l}"] = (o.double() @ kv[dim:].double() @ proj.double()).float()
     d["maya2.depth.norm.weight"] = f32("depth.norm.weight")
     d["maya2.depth.norm.bias"] = f32("depth.norm.bias")
     for j in range(LEVELS):
@@ -109,6 +122,8 @@ def main():
     # Matrices fp16 (the engine's depth dtype); vectors stay fp32 (norms, cross constants, pos0).
     out.update({k: (v.to(torch.float16) if v.dim() == 2 else v).contiguous() for k, v in d.items()})
     save_file(out, f"{args.out}/model.safetensors")
+    os.makedirs(f"{args.out}/speaker", exist_ok=True)
+    save_file({k: v.contiguous() for k, v in spk.items()}, f"{args.out}/speaker/model.safetensors")
 
     qwen = dict(
         architectures=["Qwen3ForCausalLM"], model_type="qwen3", hidden_size=bb["hidden_size"],
@@ -119,7 +134,7 @@ def main():
         tie_word_embeddings=False, torch_dtype="bfloat16", bos_token_id=None, eos_token_id=None,
         plow_head_rows=CODES + 1,
         maya2=dict(
-            audio_token=AUDIO, aeos_token=AEOS_ROW, frame_token_lo=FRAME_LO, lang_tokens={l: 194504 + i for i, l in enumerate(
+            audio_token=AUDIO, aeos_token=AEOS_ROW, frame_token_lo=FRAME_LO, overlay_rows=2, lang_tokens={l: 194504 + i for i, l in enumerate(
                 ["as", "bn", "en", "gu", "hi", "kn", "ml", "mr", "or", "pa", "ta", "te"])},
             stop_class=CODES, codebooks=32, codebook_size=CODES, frame_scale=1.0 / math.sqrt(32),
             frame_norm_eps=float(torch.finfo(torch.float32).eps), sample_rate=24000, frame_rate=12.5,

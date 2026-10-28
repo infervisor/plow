@@ -576,6 +576,7 @@ G_K(g_gemv_f32_out) {
         const float* gamma = (flags & 256u) ? (const float*)PLOW_CPU_TEN(in, T, 5) : NULL;
         const float* beta = (flags & 256u) ? (const float*)PLOW_CPU_TEN(in, T, 6) : NULL;
         const uint32_t act = (flags >> 4) & 15u;
+        const uint32_t bgroup = (flags & 512u) ? in->i[3] : 0u;
         for (uint32_t m = 0; m < m_rows; m++) {
             /* LayerNorm prologue (f32 x): the row's two-pass mean / variance. */
             float mean = 0.f, rstd = 1.f;
@@ -599,7 +600,7 @@ G_K(g_gemv_f32_out) {
                     acc = fmaf(a, b, acc);
                 }
                 const size_t o = (size_t)m * n_out + n;
-                if (bias) acc += bias[n];
+                if (bias) acc += bias[(bgroup ? m / bgroup * n_out : 0u) + n];
                 if (res) acc += res[o];
                 if (act == 1u) acc = 0.5f * acc * (1.f + erff(acc * 0.70710678118654752f));
                 c[o] = acc;

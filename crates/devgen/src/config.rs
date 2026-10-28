@@ -751,7 +751,8 @@ fn cfg_llama_qwen(v: &Value, arch: Arch) -> Cfg {
         k_eq_v: false,
         tied: v["tie_word_embeddings"].as_bool().unwrap_or(false),
         prefix: "model.".to_string(),
-        encoder_overlay_rows: 0,
+        // Maya 2: host rows at its `<|audio|>` sentinels (a cloned speaker's anchor).
+        encoder_overlay_rows: v["maya2"]["overlay_rows"].as_u64().unwrap_or(0) as u32,
         mm_slab_rows: 0,
         mm_pad: 0,
         mm_spans: false,

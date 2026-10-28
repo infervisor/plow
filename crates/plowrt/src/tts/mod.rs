@@ -27,6 +27,8 @@ pub mod text_encoder;
 pub mod voice_cond;
 
 pub mod maya2;
+pub mod ecapa;
+pub mod maya2_text;
 pub(crate) mod stretch;
 
 use std::path::Path;
@@ -334,6 +336,8 @@ impl SpeechContract {
             instructions: self.instructions.is_some(),
             voice_cloning: self.clone.is_some(),
             clone_transcript: true,
+            clone_audio_only: self.maya2.is_some(),
+            text_normalization: self.maya2.is_some(),
         };
         spec.narrow_voices(&crate::config::RuntimeConfig::get().tts_voices);
         spec

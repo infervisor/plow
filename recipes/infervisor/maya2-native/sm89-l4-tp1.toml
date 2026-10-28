@@ -56,6 +56,13 @@ script = "scripts/tts/mimi_encoder_export.py"
 python = "{env:PYREF}"
 args = ["{out}/prep/codec/encoder", "89091b3e466eb6a9d11e537bf26b144f194978f7", "kyutai/mimi"]
 
+# Cloned speakers (`spk` / `icl_spk`): speechbrain ECAPA-TDNN, run on the host (crates/plowrt/src/tts/ecapa.rs).
+[[prep]]
+name = "ecapa-export"
+script = "scripts/tts/ecapa_export.py"
+python = "{env:PYREF}"
+args = ["{out}/prep/lm/ecapa"]
+
 [emit]
 emit = "devblob+cubin"
 args = ["--served-name", "maya2-native"]

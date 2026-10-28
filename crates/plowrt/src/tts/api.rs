@@ -45,6 +45,11 @@ pub struct SpeechSpec {
     pub voice_cloning: bool,
     /// Cloning also takes the reference's transcript `ref_text` (required); unset, it is refused.
     pub clone_transcript: bool,
+    /// Cloning from `ref_audio` alone is also accepted (`ref_text` optional).
+    pub clone_audio_only: bool,
+    /// The input is normalised for speech (numbers, dates, currency, ...); `normalize: false`
+    /// turns it off per request. Unset, `normalize` is refused.
+    pub text_normalization: bool,
 }
 
 /// The request's sampling, the spec's defaults filled in.
@@ -191,6 +196,12 @@ impl SpeechSpec {
                 "voice",
             ));
         }
+        if req.normalize.is_some() && !self.text_normalization {
+            return Err(invalid(
+                "this model does not normalise text; omit `normalize`",
+                "normalize",
+            ));
+        }
         if req.instructions.is_some() && !self.instructions {
             return Err(invalid(
                 "this model takes no `instructions`; omit it",
@@ -223,7 +234,9 @@ impl SpeechSpec {
                     "ref_text",
                 ));
             }
-            if req.ref_audio.is_none() || (self.clone_transcript && req.ref_text.is_none()) {
+            if req.ref_audio.is_none()
+                || (self.clone_transcript && !self.clone_audio_only && req.ref_text.is_none())
+            {
                 return Err(invalid(
                     "voice cloning needs both `ref_audio` and its transcript `ref_text`",
                     if req.ref_audio.is_none() {
@@ -331,6 +344,8 @@ impl SpeechSpec {
             "instructions": self.instructions,
             "voice_cloning": self.voice_cloning,
             "clone_transcript": self.voice_cloning && self.clone_transcript,
+            "clone_audio_only": self.voice_cloning && self.clone_audio_only,
+            "text_normalization": self.text_normalization,
             "defaults": {
                 "temperature": self.temperature,
                 "top_p": self.top_p,
@@ -379,6 +394,8 @@ mod tests {
             instructions: false,
             voice_cloning: false,
             clone_transcript: true,
+            clone_audio_only: false,
+            text_normalization: false,
         }
     }
 

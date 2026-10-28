@@ -566,6 +566,8 @@ pub struct SpeechJob {
     /// members; empty = no frame rows. Past its end every row's codes are zero.
     pub frame_codes: Vec<u32>,
     pub frame_codes_per_row: usize,
+    /// Maya 2: a cloned speaker's depth memory, `[layers][hidden]` (`None`: the null speaker's).
+    pub maya2_memory: Option<std::sync::Arc<[f32]>>,
 }
 
 pub type SpeechEncode =
@@ -7566,7 +7568,8 @@ fn gpu_prefill_advance(
     if let Some(job) = slot.speech.as_ref().and_then(|s| s.depth) {
         e.fish_reset_slot(slot_idx)?;
         if let Some(plan) = job.maya2 {
-            e.maya2_bind(slot_idx, plan)?;
+            let memory = slot.speech.as_ref().and_then(|s| s.maya2_memory.clone());
+            e.maya2_bind(slot_idx, plan, memory.as_deref())?;
         }
         e.fish_logits_to_slot(slot_idx)?;
         let cond_row = e.prefill_terminal_row();
@@ -7668,7 +7671,20 @@ fn gpu_speech_prefill_inputs(
         }
         e.write_tensor("in.frame_codes", 0, bytemuck::cast_slice(&codes))?;
     }
+    // A frame-code prompt's other rows keep what `EmbedFrameBf16` wrote (reference frames).
+    let rest = if sp.frame_codes.is_empty() {
+        u32::MAX
+    } else {
+        OVERLAY_KEEP
+    };
     if overlay_pos.is_empty() {
+        // Overlays are optional on some packets (Maya 2's cloned anchors): the index is shared,
+        // so a job without one clears what the last overlay job left.
+        if let Some(bytes) = e.tensor_bytes("in.encoder_overlay_index") {
+            let window = (bytes as usize / 4).min(e.pf_max_rows().max(1));
+            let index = vec![rest; window];
+            e.write_tensor("in.encoder_overlay_index", 0, bytemuck::cast_slice(&index))?;
+        }
         return Ok(());
     }
     if !e.has_prefill() {
@@ -7684,12 +7700,6 @@ fn gpu_speech_prefill_inputs(
     // Every row a prefill launch may read, padded bucket rows included.
     let window = index_rows.min(e.pf_max_rows().max(1));
     let mut index = Vec::new();
-    // A frame-code prompt's other rows keep what `EmbedFrameBf16` wrote (reference frames).
-    let rest = if sp.frame_codes.is_empty() {
-        u32::MAX
-    } else {
-        OVERLAY_KEEP
-    };
     let (lo, hi) = speech_overlay_index(overlay_pos, c0, window, rest, &mut index);
     if hi > lo {
         e.write_tensor(

@@ -39,6 +39,8 @@ struct Maya2 {
     /// The depth programs run FP32 speech ops: they launch on the bundle's speech object, over the
     /// engine's own tensor table.
     speech: SpeechFn,
+    /// The null speaker's depth memory, `[layers][hidden]` (named, plain and `icl` voices).
+    null_memory: Vec<f32>,
 }
 
 struct SpeechFn {
@@ -126,6 +128,27 @@ pub struct FishInfo {
     pub semantic_tokens: u32,
     pub stop_class: u32,
     pub pair_cfg: bool,
+}
+
+/// The packet's null depth memory (`maya2.depth.cross.{l}`, sized like a slot row of `slot_memory`).
+fn null_memory(e: &GpuEngine, m: &Manifest) -> Result<Vec<f32>> {
+    let mut out = Vec::new();
+    for (l, &h) in m.slot_memory.iter().enumerate() {
+        let w = e
+            .handle_of(&format!("maya2.depth.cross.{l}"))
+            .ok_or_else(|| reject(format!("maya2.depth.cross.{l} missing")))?;
+        let mem = &e.devp[w];
+        if e.devp[usize::from(h)].len < mem.len * e.batch as u64 {
+            return Err(reject("slot memory smaller than its slots"));
+        }
+        let mut b = vec![0u8; mem.len as usize];
+        e.be.download(mem, 0, &mut b)?;
+        out.extend(b.chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])));
+    }
+    if out.is_empty() {
+        return Err(reject("maya2 depth stage without slot memory"));
+    }
+    Ok(out)
 }
 
 /// cb0 head rows: the codebook and the stop class.
@@ -223,6 +246,7 @@ impl FishDepth {
                 scratch: Vec::new(),
                 depth: (f32::from_bits(t), k),
                 speech: SpeechFn::load(e, assets, &section.programs)?,
+                null_memory: null_memory(e, &manifest)?,
             }),
             _ => None,
         };
@@ -274,18 +298,38 @@ impl GpuEngine {
             .memset_d8_async(h.base + (slot * w) as u64, 0, w, &self.stream)
     }
 
-    /// Start a Maya 2 piece on `slot` under `plan` (after [`Self::fish_reset_slot`]).
-    pub fn maya2_bind(&mut self, slot: usize, plan: crate::tts::maya2::Plan) -> Result<()> {
-        let m = self
-            .fish
+    /// Start a Maya 2 piece on `slot` under `plan` (after [`Self::fish_reset_slot`]), with its
+    /// speaker's depth memory (`[layers][hidden]`; `None`: the null speaker's).
+    pub fn maya2_bind(
+        &mut self,
+        slot: usize,
+        plan: crate::tts::maya2::Plan,
+        memory: Option<&[f32]>,
+    ) -> Result<()> {
+        let d = self.fish.as_mut().ok_or_else(|| reject("not enabled"))?;
+        let m = d
+            .maya2
             .as_mut()
-            .and_then(|d| d.maya2.as_mut())
             .ok_or_else(|| reject("not a maya2 depth stage"))?;
         let s = m
             .slots
             .get_mut(slot)
             .ok_or_else(|| reject("slot out of range"))?;
         *s = Some(crate::tts::maya2::Slot::new(plan));
+        let mem = memory.unwrap_or(&m.null_memory);
+        let layers = d.manifest.slot_memory.len();
+        if mem.len() != m.null_memory.len() {
+            return Err(reject("speaker memory width disagrees with the packet"));
+        }
+        let width = mem.len() / layers;
+        for (l, &h) in d.manifest.slot_memory.iter().enumerate() {
+            let row: &[u8] = bytemuck::cast_slice(&mem[l * width..(l + 1) * width]);
+            self.be.upload(
+                &self.devp[usize::from(h)],
+                (slot * row.len()) as u64,
+                row,
+            )?;
+        }
         Ok(())
     }
 

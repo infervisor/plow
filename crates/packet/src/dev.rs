@@ -2458,9 +2458,9 @@ pub enum DevOp {
     /// `W` is f16, bit 2 adds `bias(f32[N])`, bit 3 adds `residual(f32[M,N])` (may alias `C`), bits
     /// 4-7 the activation applied last (1 = GELU erf): `C = act(x W^T + bias + residual)`; bit 8 (f32
     /// x, f16 W, K <= 1024) LayerNorms each x row first, `(x - mean) * rsqrt(var + eps) * gamma +
-    /// beta`, fp32 two-pass statistics.
+    /// beta`, fp32 two-pass statistics; bit 9 reads `bias(f32[M / i3, N])`, one row per `i3` rows.
     /// `t0=C(f32[M,N]) t1=x(bf16[M,K]) t2=W(bf16[N,K]) t3=bias? t4=residual? t5=gamma? t6=beta?` ·
-    /// `i0=M i1=N i2=K i7=flags` · `f0=eps` (K % 8 == 0).
+    /// `i0=M i1=N i2=K i3=bias_group i7=flags` · `f0=eps` (K % 8 == 0).
     GemvF32Out = 220,
     /// Small-vocabulary sampling of an f32 logit row (one block per row; Breeze TTS): with a
     /// `bitmap`, classes whose bit is set take the HF repetition penalty (`l > 0 ? l / pen : l *

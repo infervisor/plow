@@ -526,6 +526,124 @@ impl Slot {
     }
 }
 
+/// A cloned speaker's conditioning (`spk` / `icl_spk` modes) from its ECAPA embedding: the anchor
+/// added at each `<|audio|>` sentinel, and the depth stage's per-layer memory constants. Tables from
+/// `checkpoint/speaker/model.safetensors` (`scripts/tts/maya2_prep.py`).
+pub struct Speaker {
+    fc1: (Vec<f32>, Vec<f32>),
+    fc2: (Vec<f32>, Vec<f32>),
+    audio_row: Vec<f32>,
+    memory: Vec<Vec<f32>>,
+}
+
+/// ECAPA embedding width.
+pub const ECAPA_DIM: usize = 192;
+
+fn round_bf16(x: f32) -> f32 {
+    let b = x.to_bits();
+    f32::from_bits((b + 0x7fff + ((b >> 16) & 1)) & 0xffff_0000)
+}
+
+/// f32 -> IEEE binary16 -> f32, round to nearest even (normal range; the memory constants are O(1)).
+fn round_f16(x: f32) -> f32 {
+    let b = x.to_bits();
+    let e = ((b >> 23) & 0xff) as i32 - 127;
+    if !(-14..=15).contains(&e) {
+        return x;
+    }
+    let drop = 13;
+    let half = 1u32 << (drop - 1);
+    let r = b + half - 1 + ((b >> drop) & 1);
+    f32::from_bits(r & !((1u32 << drop) - 1))
+}
+
+fn matvec(w: &[f32], x: &[f32], b: Option<&[f32]>) -> Vec<f32> {
+    let k = x.len();
+    w.chunks_exact(k)
+        .enumerate()
+        .map(|(n, row)| row.iter().zip(x).map(|(a, b)| a * b).sum::<f32>() + b.map_or(0.0, |b| b[n]))
+        .collect()
+}
+
+fn gelu(x: f32) -> f32 {
+    0.5 * x * (1.0 + libm_erf(x / std::f32::consts::SQRT_2))
+}
+
+/// erf through Numerical Recipes' `erfcc` Chebyshev fit in f64 (|error| < 1.2e-7).
+fn libm_erf(x: f32) -> f32 {
+    let x = f64::from(x);
+    let t = 1.0 / (1.0 + 0.5 * x.abs());
+    let y = 1.0
+        - t * (-x * x - 1.265_512_23
+            + t * (1.000_023_68
+                + t * (0.374_091_96
+                    + t * (0.096_784_18
+                        + t * (-0.186_288_06
+                            + t * (0.278_868_07
+                                + t * (-1.135_203_98
+                                    + t * (1.488_515_87 + t * (-0.822_152_23 + t * 0.170_872_77)))))))))
+            .exp();
+    (if x >= 0.0 { y } else { -y }) as f32
+}
+
+impl Speaker {
+    #[cfg(feature = "cuda")]
+    pub fn load(dir: &std::path::Path) -> Result<Self, String> {
+        let path = dir.join("model.safetensors");
+        let bytes = std::fs::read(&path).map_err(|e| format!("{}: {e}", path.display()))?;
+        let st = safetensors::SafeTensors::deserialize(&bytes)
+            .map_err(|e| format!("{}: {e}", path.display()))?;
+        let get = |name: &str| -> Result<Vec<f32>, String> {
+            let t = st.tensor(name).map_err(|e| format!("{}: {name}: {e}", path.display()))?;
+            if t.dtype() != safetensors::Dtype::F32 {
+                return Err(format!("{}: {name} is not f32", path.display()));
+            }
+            Ok(t.data()
+                .chunks_exact(4)
+                .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                .collect())
+        };
+        let mut memory = Vec::new();
+        while let Ok(m) = get(&format!("memory.{}", memory.len())) {
+            memory.push(m);
+        }
+        let s = Speaker {
+            fc1: (get("anchor.fc1.weight")?, get("anchor.fc1.bias")?),
+            fc2: (get("anchor.fc2.weight")?, get("anchor.fc2.bias")?),
+            audio_row: get("audio_row")?,
+            memory,
+        };
+        let h = s.audio_row.len();
+        if s.memory.is_empty()
+            || s.fc1.0.len() != s.fc1.1.len() * ECAPA_DIM
+            || s.fc2.0.len() != s.fc1.1.len() * h
+            || s.fc2.1.len() != h
+            || s.memory.iter().any(|m| m.len() % ECAPA_DIM != 0)
+        {
+            return Err(format!("{}: speaker table shapes disagree", path.display()));
+        }
+        Ok(s)
+    }
+
+    /// The `<|audio|>` sentinel's input row for this speaker: `bf16(embed + MLP(e))`.
+    pub fn anchor_row(&self, e: &[f32; ECAPA_DIM]) -> Vec<f32> {
+        let h1: Vec<f32> = matvec(&self.fc1.0, e, Some(&self.fc1.1)).into_iter().map(gelu).collect();
+        let a = matvec(&self.fc2.0, &h1, Some(&self.fc2.1));
+        a.iter()
+            .zip(&self.audio_row)
+            .map(|(a, r)| round_bf16(r + a))
+            .collect()
+    }
+
+    /// The depth memory constant of every layer, `[layers][hidden]` (f16-rounded, as the engine's).
+    pub fn memory(&self, e: &[f32; ECAPA_DIM]) -> Vec<f32> {
+        self.memory
+            .iter()
+            .flat_map(|m| matvec(m, e, None).into_iter().map(round_f16))
+            .collect()
+    }
+}
+
 fn softmax(l: &[f32]) -> Vec<f32> {
     let m = l.iter().copied().fold(f32::NEG_INFINITY, f32::max);
     let e: Vec<f32> = l.iter().map(|&v| (v - m).exp()).collect();
@@ -548,6 +666,17 @@ mod tests {
             "duration_prior":{"en":[2.87006,0.01,0.04601,0.40336,0.06541]}}"#,
         )
         .unwrap()
+    }
+
+    #[test]
+    fn rounding_and_gelu_match_torch() {
+        assert_eq!(round_f16(1.0 + 1.0 / 4096.0), 1.0);
+        assert_eq!(round_f16(1.0 + 3.0 / 4096.0), 1.0 + 1.0 / 1024.0);
+        assert_eq!(round_bf16(1.0 + 1.0 / 512.0), 1.0);
+        // torch.nn.functional.gelu(torch.tensor([1.0, -0.5, 3.0]))
+        for (x, y) in [(1.0f32, 0.841_344_7f32), (-0.5, -0.154_268_57), (3.0, 2.995_950_4)] {
+            assert!((gelu(x) - y).abs() < 1e-6, "{x}: {} vs {y}", gelu(x));
+        }
     }
 
     #[test]

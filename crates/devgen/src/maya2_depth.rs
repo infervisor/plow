@@ -185,6 +185,8 @@ struct Epilogue<'a> {
     ln: Option<(&'a str, f32)>,
     /// x is bf16 (the LM's gathered final hidden), not f32.
     x_bf16: bool,
+    /// The bias has a row per this many rows (per stream: the slot's depth memory); 0 broadcasts.
+    bias_group: u32,
 }
 
 impl Epilogue<'_> {
@@ -194,6 +196,7 @@ impl Epilogue<'_> {
         gelu: false,
         ln: None,
         x_bf16: false,
+        bias_group: 0,
     };
 }
 
@@ -275,7 +278,8 @@ impl Chain {
             });
             let flags = u32::from(!ep.x_bf16) | 2 | if bh.is_some() { 4 } else { 0 } | if ep.residual.is_some() { 8 } else { 0 }
                 | if ep.gelu { 1 << 4 } else { 0 }
-                | if ln.is_some() { 1 << 8 } else { 0 };
+                | if ln.is_some() { 1 << 8 } else { 0 }
+                | if ep.bias_group > 0 { 1 << 9 } else { 0 };
             let none = packet::dev::TENSOR_NONE;
             let e = self.p.raw(DevOp::GemvF32Out, u64::from(self.n_cu.min(n / 8).max(1)), &deps, o, |i| {
                 i.t[..7].copy_from_slice(&[
@@ -287,12 +291,13 @@ impl Chain {
                     ln.map_or(none, |l| l.0),
                     ln.map_or(none, |l| l.1),
                 ]);
-                i.i[..3].copy_from_slice(&[rows, n, k]);
+                i.i[..4].copy_from_slice(&[rows, n, k, ep.bias_group]);
                 i.i[7] = flags;
                 i.f[0] = ln.map_or(0.0, |l| l.2);
             })?;
             return Ok(self.done(e));
         }
+        assert!(ep.bias_group == 0, "per-stream bias needs the GEMV path");
         if let Some((name, eps)) = ep.ln.take() {
             x = self.layer_norm(x, "act.depth.h1", rows, k, name, eps)?;
         }
@@ -603,9 +608,14 @@ fn program_for(prefix: PacketPrefix, geo: &Geo, batch: u32, io: &Io) -> Result<P
                 ..Epilogue::NONE
             };
             let f = c.dense_ep(x, "act.depth.f", rows, dim, geo.inter, &w("f1.weight"), gelu)?;
-            let cross = format!("{wp}.cross.{l}");
+            // Inside an LM packet each slot has its own depth memory (the speaker's, or the null one).
+            let (cross, bias_group) = match io {
+                Io::Standalone => (format!("{wp}.cross.{l}"), 0),
+                Io::Lm { .. } => (format!("in.depth.cross.{l}"), p),
+            };
             let out = Epilogue {
                 bias: Some(&cross),
+                bias_group,
                 ..res
             };
             c.dense_ep(f, "act.depth.x", rows, geo.inter, dim, &w("f2.weight"), out)?;
@@ -820,6 +830,11 @@ pub(crate) fn lm_sections(
     b.adopt_tensors(std::mem::take(&mut m.tensors));
     declare_io(&mut b, &geo, bmax);
     b.tensor("in.depth.hrow", u64::from(bmax) * 4);
+    for l in 0..geo.layers {
+        b.tensor(&format!("in.depth.cross.{l}"), u64::from(bmax * geo.dim) * 4);
+        // The null speaker's memory: the runtime copies it into a slot's row at bind.
+        b.tensor(&format!("maya2.depth.cross.{l}"), u64::from(geo.dim) * 4);
+    }
     let mut prefix = PacketPrefix {
         model: packet::devbuild::Model {
             n_cu: m.n_cu,
@@ -861,6 +876,9 @@ pub(crate) fn lm_sections(
         sampler: manifest::Sampler::Maya2,
         pair_cfg: false,
         depth_sampling: Some([d.temperature.to_bits(), d.top_k]),
+        slot_memory: (0..geo.layers)
+            .map(|l| handle(&format!("in.depth.cross.{l}")))
+            .collect(),
         tensors: manifest::Tensors {
             params: handle("in.depth.params"),
             top_k: ctl,

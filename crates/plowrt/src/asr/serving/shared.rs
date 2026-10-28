@@ -495,6 +495,7 @@ impl SharedAsr {
                     encode: None,
                     frame_codes: Vec::new(),
                     frame_codes_per_row: 0,
+                    maya2_memory: None,
                 })),
                 prefix: None,
                 tenant: None,

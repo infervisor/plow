@@ -559,6 +559,7 @@ pub(crate) fn sections(
         },
         pair_cfg: t.d.breeze,
         depth_sampling: None,
+        slot_memory: Vec::new(),
         tensors: manifest::Tensors {
             params: h(t.params),
             top_k: h(t.top_k),

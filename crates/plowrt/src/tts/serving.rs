@@ -76,6 +76,9 @@ pub struct SpeechRequest {
     pub ref_audio: Option<String>,
     #[serde(default)]
     pub ref_text: Option<String>,
+    /// Models that normalise text (card `text_normalization`): `false` speaks the input as given.
+    #[serde(default)]
+    pub normalize: Option<bool>,
     /// Same seed, text and settings: the same audio. Unseeded requests sample anew.
     #[serde(default)]
     pub seed: Option<u64>,
@@ -549,6 +552,66 @@ pub struct SpeechModel {
     ref_encoder: Option<Arc<super::ref_encoder::RefEncoder>>,
     realtime: Arc<super::realtime::RealTime>,
     spec: OnceLock<SpeechSpec>,
+    /// Maya 2's cloned-speaker conditioning (`spk` / `icl_spk`), when the bundle carries it.
+    speaker: Option<Arc<Maya2Speaker>>,
+}
+
+/// ECAPA and the speaker tables of a Maya 2 bundle (`checkpoint/ecapa`, `checkpoint/speaker`).
+struct Maya2Speaker {
+    ecapa: super::ecapa::Ecapa,
+    tables: super::maya2::Speaker,
+    /// Conditionings by reference audio (base64 hash): a voice reused across requests embeds once.
+    cache: parking_lot::Mutex<std::collections::HashMap<u64, Arc<SpeakerCond>>>,
+}
+
+/// One cloned speaker's anchor row and depth memory.
+struct SpeakerCond {
+    anchor: Vec<f32>,
+    memory: Arc<[f32]>,
+}
+
+impl Maya2Speaker {
+    const CACHE: usize = 64;
+
+    fn load(assets: &Path) -> Option<Self> {
+        let ck = assets.join("checkpoint");
+        let (e, t) = (ck.join("ecapa"), ck.join("speaker"));
+        if !e.is_dir() || !t.is_dir() {
+            return None;
+        }
+        let load = || -> Result<Self, String> {
+            Ok(Maya2Speaker {
+                ecapa: super::ecapa::Ecapa::load(&e).map_err(|x| x.to_string())?,
+                tables: super::maya2::Speaker::load(&t)?,
+                cache: Default::default(),
+            })
+        };
+        load()
+            .inspect_err(|e| tracing::warn!(error = %e, "tts: maya2 speaker conditioning unavailable"))
+            .ok()
+    }
+
+    /// The conditioning of `pcm` (24 kHz), keyed by its request encoding `key`.
+    fn cond(&self, key: &str, pcm: &[f32]) -> Result<Arc<SpeakerCond>, String> {
+        use std::hash::{Hash, Hasher};
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        key.hash(&mut h);
+        let k = h.finish();
+        if let Some(c) = self.cache.lock().get(&k) {
+            return Ok(Arc::clone(c));
+        }
+        let e = self.ecapa.embed(pcm)?;
+        let c = Arc::new(SpeakerCond {
+            anchor: self.tables.anchor_row(&e),
+            memory: self.tables.memory(&e).into(),
+        });
+        let mut cache = self.cache.lock();
+        if cache.len() >= Self::CACHE {
+            cache.clear();
+        }
+        cache.insert(k, Arc::clone(&c));
+        Ok(c)
+    }
 }
 
 impl SpeechModel {
@@ -616,6 +679,11 @@ pub fn speech_model(
                 contract.frame_samples as f64 / f64::from(contract.sample_rate),
                 contract.tokens_per_frame(),
             );
+            let speaker = contract
+                .maya2
+                .as_ref()
+                .and_then(|_| Maya2Speaker::load(assets))
+                .map(Arc::new);
             Some(Arc::new(SpeechModel {
                 contract,
                 codec,
@@ -623,6 +691,7 @@ pub fn speech_model(
                 ref_encoder,
                 realtime,
                 spec: OnceLock::new(),
+                speaker,
             }))
         }
     };
@@ -946,11 +1015,40 @@ async fn speech_with(
             .as_ref()
             .map(|_| super::maya2::detect_lang(&req.input).to_owned())
     });
+    // Maya 2 clones with the reference's ECAPA speaker (`icl_spk` with a transcript, `spk` without);
+    // a bundle without the speaker tables clones by `icl` alone and needs the transcript.
+    let speaker = match (&c.maya2, &req.ref_audio, &model.speaker, &model.ref_encoder) {
+        (Some(_), Some(audio), Some(sp), Some(enc)) => {
+            let pcm = match reference_pcm(audio, c.sample_rate, enc.max_samples()) {
+                Ok(p) => p,
+                Err((msg, param)) => return bad(msg, param),
+            };
+            match tokio::task::block_in_place(|| sp.cond(audio, &pcm)) {
+                Ok(cond) => Some(cond),
+                Err(e) => return bad(format!("reference audio: {e}"), "ref_audio"),
+            }
+        }
+        (Some(_), Some(_), None, _) if req.ref_text.is_none() => {
+            return bad(
+                "this bundle clones only with the reference's transcript; give `ref_text`",
+                "ref_text",
+            )
+        }
+        _ => None,
+    };
+    // Maya 2 speaks numbers, dates, currency, ... as its server does: normalised in the language.
+    let input = match (&c.maya2, &language) {
+        (Some(_), Some(lang)) if req.normalize != Some(false) => {
+            super::maya2_text::normalise_text(&req.input, lang)
+        }
+        _ => req.input.clone(),
+    };
     let maker = SegmentMaker {
         tok: Arc::clone(tok),
         contract: c.clone(),
         voice: voice.clone(),
         language,
+        speaker,
         instructions: req
             .instructions
             .as_deref()
@@ -968,7 +1066,7 @@ async fn speech_with(
         seed: checked.seed,
     };
     let mut segs: Vec<Segment> = Vec::new();
-    for t in super::segments(&req.input, c.segment_chars()) {
+    for t in super::segments(&input, c.segment_chars()) {
         if !maker.make_fitting(t, &mut segs) {
             return bad(
                 "`instructions` leave no room for text in the text encoder's prompt",
@@ -1313,6 +1411,8 @@ struct SegmentMaker {
     voice: String,
     /// The template's `{language}`.
     language: Option<String>,
+    /// Maya 2: the cloned speaker's conditioning.
+    speaker: Option<Arc<SpeakerCond>>,
     instructions: Option<String>,
     encoder: Option<Arc<super::text_encoder::TextEncoder>>,
     reference: Option<Arc<RefClip>>,
@@ -1338,8 +1438,9 @@ impl SegmentMaker {
         };
         let ids = |instructions: Option<&str>| {
             let mut ids = lead.clone();
-            let mut prompt = match (&self.reference, &c.maya2) {
-                (Some(_), Some(_)) => {
+            let cloned = self.reference.is_some() || self.speaker.is_some();
+            let mut prompt = match (cloned, &c.maya2) {
+                (true, Some(_)) => {
                     c.prompt_text(MAYA2_CLONE_VOICE, self.language.as_deref(), instructions, text)
                 }
                 _ => c.prompt_text(&self.voice, self.language.as_deref(), instructions, text),
@@ -1474,7 +1575,19 @@ impl SegmentMaker {
                 .chain(head as u32..(head + ids.len()) as u32)
                 .collect()
         };
-        let overlay_pos = s.enc_ids.as_deref().map_or(Vec::new(), rows);
+        let mut overlay_pos = s.enc_ids.as_deref().map_or(Vec::new(), rows);
+        // Maya 2's cloned speaker: its anchor row at the reference's and the text's `<|audio|>`
+        // sentinels (each the last row of its prompt span).
+        let mut overlay = Vec::new();
+        if let (Some(sp), Some(_)) = (&self.speaker, &c.maya2) {
+            if let Some(r) = &s.reference {
+                overlay_pos.push(r.ids.len() as u32 - 1);
+            }
+            overlay_pos.push(s.prompt_ids.len() as u32 - 1);
+            for _ in &overlay_pos {
+                overlay.extend_from_slice(&sp.anchor);
+            }
+        }
         let cfg = s.uncond_ids.as_ref().map(|ids| crate::serve::mux::CfgJob {
             uncond_overlay: Vec::new(),
             params: crate::text::sample::CfgParams {
@@ -1549,7 +1662,7 @@ impl SegmentMaker {
             let greedy = self.temperature <= 0.0;
             Ok(Some(Box::new(crate::serve::mux::SpeechJob {
                 cfg,
-                overlay: Vec::new(),
+                overlay,
                 overlay_pos,
                 encode,
                 frame_codes: Vec::new(),
@@ -1578,6 +1691,7 @@ impl SegmentMaker {
                     stop_token: c.stops[0],
                     maya2: c.maya2.as_ref().map(|_| self.maya2_plan(&s.text, s.k)),
                 }),
+                maya2_memory: self.speaker.as_ref().map(|sp| Arc::clone(&sp.memory)),
                 ..Default::default()
             })))
         }

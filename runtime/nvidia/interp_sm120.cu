@@ -2123,7 +2123,7 @@ __device__ __forceinline__ void plow_exec(const PlowDevInst* in, void* const* T,
                                (in->i[7] & 8u) ? (const float*)TEN(4) : nullptr,
                                (in->i[7] & 256u) ? (const float*)TEN(5) : nullptr,
                                (in->i[7] & 256u) ? (const float*)TEN(6) : nullptr, in->fj[0].f, in->i[7],
-                               in->i[0], in->i[1], in->i[2], slice, nblk, arena);
+                               in->i[3], in->i[0], in->i[1], in->i[2], slice, nblk, arena);
         else
             d_gemv_f32out((float*)TEN(0), (const __nv_bfloat16*)TEN(1), (const __nv_bfloat16*)TEN(2), in->i[0],
                           in->i[1], in->i[2], slice, nblk);
