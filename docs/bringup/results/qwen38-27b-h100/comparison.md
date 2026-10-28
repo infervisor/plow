@@ -298,3 +298,40 @@ and prefill step gap belongs to the BF16 decode kernel work. Recipe-level varian
 (`PLOW_PF_INTERLEAVE=0`, plus ITL budget 60 / decode pipeline / admission overlap,
 `PLOW_VMM_HOST_CACHE_MIB=0`, `PLOW_LT_RUNG_ALGOS=true`, prefix-off attribution grid) but were
 withdrawn before running, to give the GPU to that work. The recipe is unchanged.
+
+## 2026-10-28: prefix-cache retention fixes vs vLLM 0.29 (production mix at parity)
+
+**Result: production mix at parity with vLLM 0.29 at 0.45 sessions/s (SLO met 99.3 % on both, goodput
+1.683 req/s on both). No qualified win: the cells are ties or spread-flagged.** `campaign.py report`
+MATCHED + EQUIVALENT on every cell; rows in [comparison.csv](comparison.csv) under `campaign_source`
+`q38-20261028-prefix-bf16`.
+
+- Infervisor: plowrt `87e820a40` (branch `qwen-prefix`), packet `cb2ea611523da092` (unchanged), the
+  recipe's `[serve.env]` plus `PLOW_VMM_HOST_CACHE_MIB=63488` (host tier capped at 62 GiB, the size
+  the planned default of `min(MemAvailable - reserve, MemTotal / 4)` gives on this box).
+- Baseline: the vLLM 0.29 arms of the 2026-10-27 section (same seeds, same client).
+- Quality: FP32-reference gate c1/c8/c32 PASS on this binary with the same host cap (c1 kl_trim
+  0.00047 vs vLLM 0.00034, top1_decisive 0.9988, continuation 0.871; c8 / c32 continuation 0.915 /
+  0.861, top1_decisive 1 / 1, needles 1).
+- What changed in plowrt: a recurrent model's GDN state is also captured at the shared-prefix end
+  (system prompt) and at whole-block checkpoints a request waits on; a publish refused for want of a
+  device slot waits for spills that already landed instead of spilling every device boundary and
+  then dropping host-resident ones; spills are paced at 256 MiB in flight so the copy engine stays
+  free for the engine's readbacks; a refill of a host block that fails goes back to its host bytes.
+  Prefix hit at 0.45: 52 % -> 78 % (vLLM 63-69 %).
+
+| Cell | Total throughput | TTFT P99 | TPOT P99 | Peak memory |
+|---|---:|---:|---:|---:|
+| prod mix, 0.45 sessions/s | 1.00x | 1.27x * | 1.03x * | 1.06x |
+| prod mix, 0.7 sessions/s | 1.02x * | 1.58x * | 0.64x | 1.04x |
+| 1000/128 c1 greedy | 0.92x | 0.92x * | 1.11x | 1.00x * |
+| 1000/128 c8 greedy | 0.96x | 1.15x | 1.20x | 1.04x |
+| 1000/128 c32 greedy | 0.96x | 1.22x | 1.19x | 1.06x |
+
+`*` = repeat spread > 10% (FLAGGED; direction only). Before (2026-10-27 recipe binary `ecb90f0d1`,
+same packet): 0.45 throughput 0.95x, TTFT P99 4.55x, TPOT P99 1.84x, SLO met 69.7 %; 0.7 0.83x /
+5.82x / 0.59x; c32 0.80x. Supplementary at 0.45, vLLM / Infervisor: TTFT P50 264 / 371 ms, TPOT P50
+26.7 / 27.2 ms, in-flight 3.3 / 3.6. At 0.7 both stacks overload on one repeat (SLO met 54.4 % /
+55.6 %, goodput 1.05 / 1.10 req/s, TPOT P50 125 / 67 ms). The c1/c8/c32 gaps are the decode step,
+not the cache (prefix-off control at c32: 708 out tok/s vs 682 with the cache on).
+Raw evidence: `/opt/dlami/nvme/lava-tts/qwen-prefix/l18/{prod,grid,report-prod,report-grid}`.
