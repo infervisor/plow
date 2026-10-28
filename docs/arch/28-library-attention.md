@@ -84,21 +84,34 @@ runtime-side, host-launched between the CUDA-graph pieces of a prefill launch, p
 * Selection today: the two files beside the packet. Per-rung selection by the emitter follows once
   the per-rung gate says which rungs win.
 
-### In-model prefill (12B FP8, one 16000-token prompt, step_bench packed prefill, 3 reps)
+### In-model prefill (one 16000-token prompt, step_bench packed prefill, 2 x 3 reps ABAB)
 
-| chunk | native | hd512 library route | delta |
-|---|---|---|---|
-| 2048 | 0.607 s | 0.540 s | -11% (chunk at prefix 14K: 94 -> 78 ms) |
-| 1024 | 0.634 s | 0.564 s | -11% (prefix 14K: 48 -> 40 ms) |
-| 512 | 0.760 s | 0.664 s | -13% (prefix 14K: 28 -> 24 ms; 128-row tail 25 -> 16 ms) |
+| chunk | 12B native | 12B library | delta | 26B native | 26B library | delta |
+|---|---|---|---|---|---|---|
+| 2048 | 0.608 s | 0.540 s | -11% | 0.419 s | 0.373 s | -11% |
+| 1024 | 0.634 s | 0.564 s | -11% | 0.505 s | 0.463 s | -8% |
+| 512 | 0.759 s | 0.668 s | -12% | 0.739 s | 0.678 s | -8% |
+| 128 | 2.381 s | 1.802 s | -24% | 2.325 s | 1.995 s | -14% |
 
 First chunks (no prefix) are equal; the gain grows with cached prefix, as the kernel table
-predicts. Cost: 10x the prefill seg graphs (480 vs 48; warm-up 0.64 s vs 0.25 s), a 128 MiB
+predicts. Both arms are run-to-run bit-identical; last-position KL native vs library is
+1.4e-4..7.5e-4 (12B) and 2.4e-3..3.0e-2 (26B), top-1 unchanged. Cost: 10x the prefill seg graphs (480 vs 48; warm-up 0.64 s vs 0.25 s), a 128 MiB
 split workspace and 2 x 64 MiB per KV head of bf16 page pool.
+
+### FP32 gate, c16 screen (recipe env, production packets, one run each)
+
+| | kl_trim | kl_p95 | top1_decisive | cont_decisive | needles | verdict |
+|---|---|---|---|---|---|---|
+| 12B library route | 0.0517 | 0.277 | 0.9852 | 0.891 | 1.0 | PASS |
+| 12B vLLM 0.29 peer | 0.0653 | 0.367 | 0.9823 | 0.913 | 1.0 | |
+| 26B library route | 0.1381 | 1.085 | 0.9672 | 0.848 | 1.0 | PASS |
+| 26B vLLM 0.29 peer | 0.1242 | 0.892 | 0.9662 | 0.804 | 1.0 | |
+
+The 26B run sits inside the recipe's measured native spread (kl_trim 0.124-0.153, p95 0.91-1.08).
 
 ## 4. Open
 
-* FP32 gate for the hd512 route (12B, 26B FP8); 26B and chunk-128 in-model numbers.
+* FP32 gate at c1/c8/c32 and a production-mix screen for the hd512 route.
 * FA4 hd256 local (sliding) exports the same way (AOT compile verified); FA3 C++ would need a
   separate build. Measure FA4 hd256 before choosing.
 * Qwen: FA3 decode/prefill wins of 5-11% at kernel level need an FA3 C++ AOT library and a route
