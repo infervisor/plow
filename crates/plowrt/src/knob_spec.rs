@@ -542,7 +542,6 @@ pub const RUNTIME: &[KnobSpec] = &[
     KnobSpec::new("rt.bf16_m4", Some("PLOW_METAL_BF16_M4"), Layer::Runtime, Domain::Bool, OFF, OPT_IN),
     KnobSpec::new("rt.bf16_m8", Some("PLOW_METAL_BF16_M8"), Layer::Runtime, Domain::Bool, OFF, OPT_IN),
     KnobSpec::new("rt.affine_q4_dir", Some("PLOW_AFFINE_Q4_DIR"), Layer::Runtime, Domain::Str, UNSET, OPT_IN),
-    KnobSpec::new("rt.token_batch", Some("PLOW_TOKEN_BATCH"), Layer::Runtime, Domain::Bool, ON, DIAG),
     KnobSpec::new("rt.prefix_cache", Some("PLOW_PREFIX_CACHE"), Layer::Runtime, Domain::Bool, ON, PROMOTED),
     KnobSpec::new("rt.tts_first_lookahead", Some("PLOW_TTS_FIRST_LOOKAHEAD"), Layer::Runtime, USIZE, Default::Static(Val::Nat(1)), OPT_IN),
     KnobSpec::new("rt.tts_stream_first_frames", Some("PLOW_TTS_STREAM_FIRST_FRAMES"), Layer::Runtime, USIZE, Default::Static(Val::Nat(1)), OPT_IN),
@@ -895,6 +894,7 @@ pub const RAW_ENV: &[KnobSpec] = &[
     KnobSpec::new("env.PLOW_RIDE_FIXED", Some("PLOW_RIDE_FIXED"), Layer::RawEnv, Domain::Str, UNSET, REMOVED),
     KnobSpec::new("env.PLOW_RUNG_FAST_PROBE", Some("PLOW_RUNG_FAST_PROBE"), Layer::RawEnv, Domain::Str, UNSET, REMOVED),
     KnobSpec::new("env.PLOW_SERVE_POLICY", Some("PLOW_SERVE_POLICY"), Layer::RawEnv, Domain::Str, UNSET, REMOVED),
+    KnobSpec::new("env.PLOW_TOKEN_BATCH", Some("PLOW_TOKEN_BATCH"), Layer::RawEnv, Domain::Str, UNSET, REMOVED),
     KnobSpec::new("env.PLOW_TOKEN_BATCH_SOLO", Some("PLOW_TOKEN_BATCH_SOLO"), Layer::RawEnv, Domain::Str, UNSET, REMOVED),
     KnobSpec::new("env.PLOW_PUBLISH_URL", Some("PLOW_PUBLISH_URL"), Layer::RawEnv, Domain::Str, UNSET, OPT_IN),
     KnobSpec::new("env.PLOW_PUBLISH_KEY", Some("PLOW_PUBLISH_KEY"), Layer::RawEnv, Domain::Str, UNSET, OPT_IN),
@@ -1050,6 +1050,12 @@ mod tests {
     /// measured with; migrate it to `PLOW_OBJECTIVE` (or an expert override) instead.
     #[test]
     fn recipes_and_launchers_set_no_removed_knob() {
+        // Removed runtime knobs whose name lives on as an object build define (devgen
+        // `def.PLOW_TOKEN_BATCH`), set by the gfx942 object build and its baseline.
+        const DEFINE_TWINS: &[&str] = &["PLOW_TOKEN_BATCH"];
+        let builds_objects = |p: &std::path::Path| {
+            p.ends_with("build_gfx942.sh") || p.ends_with("obj_baseline_gfx942.json")
+        };
         let removed: Vec<&str> = RAW_ENV
             .iter()
             .filter(|k| k.status == Status::Removed)
@@ -1066,6 +1072,7 @@ mod tests {
                 text.lines()
                     .flat_map(plow_tokens)
                     .filter(|t| removed.contains(t))
+                    .filter(|t| !(DEFINE_TWINS.contains(t) && builds_objects(path)))
                     .map(move |t| format!("{}: {t}", path.display()))
             })
             .collect();

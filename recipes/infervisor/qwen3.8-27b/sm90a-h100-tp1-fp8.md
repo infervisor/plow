@@ -77,8 +77,9 @@ plowrt serve --model infervisor/qwen3.8-27b:sm90a-h100-tp1-fp8 --port 8080
 nix develop --command env \
   PLOW_MAX_QUEUED_REQUESTS=128 \
   PLOW_PF_INTERLEAVE=0 \
-  PLOW_PREFIX_CACHE=0 \
+  PLOW_PREFIX_CACHE=1 \
   PLOW_VMM_LIVE=1 \
+  PLOW_VMM_PREFIX=1 \
   ./target/release/plowrt serve --assets $ASSETS --port 8080
 ```
 <!-- /plow:recipe:serve -->
