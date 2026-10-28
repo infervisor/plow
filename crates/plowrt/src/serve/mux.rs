@@ -7244,7 +7244,10 @@ fn gpu_prefill_batched_pass(
                         .iter()
                         .map(|&(slot, token)| (slot as usize, token)),
                 );
-            } else if stepped && e.token_batch_refused_before_launch() {
+            } else if stepped
+                && e.token_batch_refused_before_launch()
+                && matches!(result, Err(crate::RuntimeError::Rejected(_)))
+            {
                 refused = true;
             }
             result

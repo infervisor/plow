@@ -200,11 +200,11 @@ impl GpuEngine {
         mut window: Option<&mut dyn FnMut(&mut GpuEngine)>,
     ) -> Result<()> {
         output.clear();
+        self.tb_launched = false;
         let mut state = self.token_batch.take().ok_or_else(|| {
             RuntimeError::Rejected("CUDA unified token-batch capability unavailable".into())
         })?;
         let mut body_enqueued = false;
-        self.tb_launched = false;
         let verdicts_before = self.tb_verdicts.len();
         // Multimodal soft-token rows (bit 31): the prefill buckets this batch runs replace them
         // from the slab (MmRowsBf16).
@@ -582,8 +582,9 @@ impl GpuEngine {
         result.and(flushed)
     }
 
-    /// Whether the last token batch failed before its first device launch, so every slot it
-    /// named is exactly as it was and its rows may run another way.
+    /// Whether the last token batch stopped before its first device launch: no kernel touched
+    /// a slot's KV or recurrent state and no frontier moved. Only a host refusal
+    /// (`RuntimeError::Rejected`) from such a step may run its rows another way.
     pub fn token_batch_refused_before_launch(&self) -> bool {
         !self.tb_launched
     }
