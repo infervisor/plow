@@ -14,6 +14,7 @@ import os
 import pathlib
 import subprocess
 import sys
+import sysconfig
 
 REPO = pathlib.Path(__file__).resolve().parent.parent
 
@@ -26,6 +27,11 @@ def main() -> int:
     obj = out / "fa4"
     obj.mkdir(parents=True, exist_ok=True)
     env = dict(os.environ, CUTE_DSL_ARCH="sm_90a")
+    # The CuTe DSL wheel keeps its Python package under nvidia_cutlass_dsl/dsl_packages.
+    dsl = pathlib.Path(sysconfig.get_paths()["purelib"]) / "nvidia_cutlass_dsl" / "dsl_packages"
+    if dsl.is_dir():
+        sys.path.insert(0, str(dsl))
+        env["PYTHONPATH"] = os.pathsep.join(filter(None, [str(dsl), env.get("PYTHONPATH")]))
     for kvh in ("1", "2", "combine"):
         subprocess.run([sys.executable, str(REPO / "scripts/export_fa4_hd512_sm90.py"), str(obj), kvh],
                        check=True, env=env)

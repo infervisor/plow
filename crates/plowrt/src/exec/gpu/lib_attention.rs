@@ -5,9 +5,8 @@
 //!
 //! FP8 KV (one f32 scale per (position, KV head) row) has no library form, so per routed site
 //! `kv_dequant_sm90.cubin` first gathers every request's rows `[0, kv_len)` into the pool
-//! (`[kv head][page][64][512]`, the request's pages consecutive); BF16 KV is gathered the same
-//! way (the scale-free arm of the kernel would read the slot directly, a later step). The pool
-//! never reads a slot row at or past kv_len (live KV may leave it unmapped).
+//! (`[kv head][page][64][512]`, the request's pages consecutive). Only FP8 KV sites are routed.
+//! The gather never reads a slot row at or past kv_len (live KV may leave it unmapped).
 //!
 //! One table upload per launch (`begin_launch`): cu_seqlens_q, kv lengths, the page table and the
 //! gather list; every routed site of the launch reuses it.
@@ -202,10 +201,15 @@ struct Launch {
 impl Launch {
     /// vLLM's FA4 split rule (`num_splits_heuristic`): fill the SMs with (64-row query tile,
     /// head) blocks, never more splits than 64-row KV blocks, none at <= 4 KV blocks; capped by
-    /// the workspace.
+    /// the workspace. The export packs GQA only at 2 KV heads; at 1 every query head is its own
+    /// block row.
     fn splits(&self, kv_heads: u32, workspace: u64) -> u32 {
         let n_blocks = self.max_kv.div_ceil(PAGE);
-        let m_blocks = self.requests * kv_heads * (self.max_q * (HEADS / kv_heads)).div_ceil(64);
+        let m_blocks = if kv_heads == 2 {
+            self.requests * kv_heads * (self.max_q * (HEADS / kv_heads)).div_ceil(64)
+        } else {
+            self.requests * HEADS * self.max_q.div_ceil(64)
+        };
         if n_blocks <= 4 || m_blocks == 0 {
             return 1;
         }

@@ -306,7 +306,8 @@ class Fa4Lib:
     def splits(H, KVH, nreq, max_q, max_kv, rows, ws_bytes):
         """plowrt lib_attention.rs Launch::splits (vLLM's num_splits_heuristic)."""
         n = -(-max_kv // 64)
-        m = nreq * KVH * (-(-(max_q * (H // KVH)) // 64))
+        # GQA packed only at 2 KV heads (export_fa4_hd512_sm90.py).
+        m = nreq * KVH * (-(-(max_q * (H // KVH)) // 64)) if KVH == 2 else nreq * H * (-(-max_q // 64))
         if n <= 4 or m == 0:
             return 1
         s = max(1, min(132 // m, 128, n))
