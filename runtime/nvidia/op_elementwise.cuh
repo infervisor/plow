@@ -345,12 +345,12 @@ static __device__ void gemv_f32out_mode(float* C, const void* xv, const void* Wv
 }
 
 /* f32 x, f16 W (modes 3): each block stages 8 rows x GEMV_KT columns of x in shared memory once and
- * every warp reuses them for up to GEMV_CPW columns (x read from L2 once per block, not once per
+ * every warp reuses them for up to CPW columns (x read from L2 once per block, not once per
  * column). With the LayerNorm prologue (bit 8, K <= GEMV_KT) the staged rows are normalised first:
  * fp32 two-pass mean / variance, `(x - mean) * rsqrt(var + eps) * gamma + beta`.
  * Arena: 8 * GEMV_KT + 16 floats. */
 #define GEMV_KT 1024u
-#define GEMV_CPW 8u
+template <unsigned CPW>
 static __device__ void gemv_f32x_f16w_staged(float* C, const float* __restrict__ x, const unsigned short* __restrict__ W,
                                              const float* bias, unsigned bgroup, const float* res, const float* gamma,
                                              const float* beta, float eps, unsigned act, unsigned M, unsigned N,
@@ -362,12 +362,12 @@ static __device__ void gemv_f32x_f16w_staged(float* C, const float* __restrict__
     const unsigned n1 = min(n0 + per, N);
     float* xs = arena;
     float* st = arena + 8u * GEMV_KT;
-    for (unsigned cb = n0; cb < n1; cb += PLOW_NV_WARPS * GEMV_CPW) {
+    for (unsigned cb = n0; cb < n1; cb += PLOW_NV_WARPS * CPW) {
         for (unsigned m0 = 0; m0 < M; m0 += 8) {
             const unsigned mr = min(8u, M - m0);
-            float acc[GEMV_CPW][8];
+            float acc[CPW][8];
 #pragma unroll
-            for (unsigned j = 0; j < GEMV_CPW; j++)
+            for (unsigned j = 0; j < CPW; j++)
 #pragma unroll
                 for (int m = 0; m < 8; m++) acc[j][m] = 0.f;
             for (unsigned kt = 0; kt < K; kt += GEMV_KT) {
@@ -402,21 +402,28 @@ static __device__ void gemv_f32x_f16w_staged(float* C, const float* __restrict__
                     }
                     __syncthreads();
                 }
-                for (unsigned k = lane * 8u; k < kw; k += 32u * 8u) {
-                    /* Every column's 16 B first (GEMV_CPW loads in flight per lane), then the FMAs. */
-                    uint4 wr[GEMV_CPW];
+                /* Every column's 16 B of the next k step are in flight while this step's FMAs run. */
+                uint4 wn[CPW];
+                const auto load = [&](uint4* w, unsigned k) {
 #pragma unroll
-                    for (unsigned j = 0; j < GEMV_CPW; j++) {
+                    for (unsigned j = 0; j < CPW; j++) {
                         const unsigned n = cb + warp + j * PLOW_NV_WARPS;
-                        wr[j] = n < n1 ? *(const uint4*)(W + (size_t)n * K + kt + k) : make_uint4(0u, 0u, 0u, 0u);
+                        w[j] = n < n1 && k < kw ? *(const uint4*)(W + (size_t)n * K + kt + k) : make_uint4(0u, 0u, 0u, 0u);
                     }
+                };
+                load(wn, lane * 8u);
+                for (unsigned k = lane * 8u; k < kw; k += 32u * 8u) {
+                    uint4 wr[CPW];
+#pragma unroll
+                    for (unsigned j = 0; j < CPW; j++) wr[j] = wn[j];
+                    load(wn, k + 32u * 8u);
 #pragma unroll
                     for (int m = 0; m < 8; m++) {
                         if ((unsigned)m >= mr) break;
                         const float4* xp = (const float4*)(xs + m * GEMV_KT + k);
                         const float4 a = xp[0], b = xp[1];
 #pragma unroll
-                        for (unsigned j = 0; j < GEMV_CPW; j++) {
+                        for (unsigned j = 0; j < CPW; j++) {
                             const __half2* h = (const __half2*)&wr[j];
                             const float2 w0 = __half22float2(h[0]), w1 = __half22float2(h[1]);
                             const float2 w2 = __half22float2(h[2]), w3 = __half22float2(h[3]);
@@ -431,12 +438,13 @@ static __device__ void gemv_f32x_f16w_staged(float* C, const float* __restrict__
                 }
             }
 #pragma unroll
-            for (unsigned j = 0; j < GEMV_CPW; j++) {
+            for (unsigned j = 0; j < CPW; j++) {
                 const unsigned n = cb + warp + j * PLOW_NV_WARPS;
 #pragma unroll
                 for (int m = 0; m < 8; m++) {
+                    if ((unsigned)m >= mr) break;
                     const float t = warp_sum32(acc[j][m]);
-                    if (lane == 0 && n < n1 && (unsigned)m < mr) {
+                    if (lane == 0 && n < n1) {
                         const size_t o = (size_t)(m0 + m) * N + n;
                         float v = t;
                         if (bias) v = __fadd_rn(v, bias[(bgroup ? (m0 + m) / bgroup * N : 0u) + n]);
@@ -444,6 +452,150 @@ static __device__ void gemv_f32x_f16w_staged(float* C, const float* __restrict__
                         if (act == 1u) v = 0.5f * v * (1.f + erff(v * 0.70710678118654752f));
                         C[o] = v;
                     }
+                }
+            }
+        }
+    }
+}
+
+
+/* Tensor-core GemvF32Out (modes 3 | bit 10; the depth stage's multi-row passes): C^T = W x^T with
+ * mma.m16n8k16 (f16 x f16 -> f32). x is rounded to f16 after the LayerNorm prologue, as the
+ * reference serves its depth stage in fp16. A warp owns 16 output columns (W rows) over up to 64
+ * x rows (8 n8 tiles), so W streams once per 64 rows; warps of a block that would idle split K and
+ * reduce through shared memory. Inside each 64-wide K block, lane t of a quad reads the contiguous
+ * halves [16t, 16t + 16) of its W and x rows: logical k (2t + e, 2t + 8 + e) of k16 step s is
+ * physical 16t + 4s + (e, 2 + e), one bijection for A and B, so the sum is unchanged.
+ * K % 64 == 0. Arena: 64 x MMA_KT halves of x, 128 floats of row statistics, 8 x 32 x 32 floats
+ * of split-K partials. */
+#define MMA_KT 256u
+#define MMA_ROWS 64u
+static __device__ __forceinline__ void mma_16816(float* d, const unsigned* a, unsigned b0, unsigned b1) {
+    asm volatile(
+        "mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, "
+        "{%0,%1,%2,%3};\n"
+        : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3])
+        : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1));
+}
+static __device__ void gemv_f16w_mma(float* C, const float* __restrict__ x, const unsigned short* __restrict__ W,
+                                     const float* bias, unsigned bgroup, const float* res, const float* gamma,
+                                     const float* beta, float eps, unsigned act, unsigned M, unsigned N, unsigned K,
+                                     unsigned slice, unsigned nblk, float* arena) {
+    const unsigned lane = threadIdx.x & PLOW_NV_LANE_MASK;
+    const unsigned warp = threadIdx.x >> PLOW_NV_WARP_SHIFT;
+    const unsigned g = lane >> 2, t = lane & 3u;
+    const unsigned ntiles = (N + 15u) / 16u;
+    const unsigned per = (ntiles + nblk - 1) / nblk;
+    const unsigned t0 = slice * per;
+    const unsigned tiles = t0 < ntiles ? min(per, ntiles - t0) : 0u;
+    if (!tiles) return;
+    unsigned ks = max(1u, PLOW_NV_WARPS / tiles);
+    ks = min(ks, K / 64u);
+    const unsigned my_tile = warp / ks, my_ks = warp % ks;
+    const bool active = my_tile < tiles;
+    __half* xs = (__half*)arena;
+    float* st = arena + MMA_ROWS * MMA_KT / 2u;
+    float* red = st + 2u * MMA_ROWS;
+    const unsigned na = (t0 + my_tile) * 16u + g, nb = na + 8u;
+    for (unsigned mc = 0; mc < M; mc += MMA_ROWS) {
+        const unsigned mr = min(MMA_ROWS, M - mc), nt8 = (mr + 7u) / 8u;
+        __syncthreads();
+        if (gamma) {
+            for (unsigned r = warp; r < mr; r += PLOW_NV_WARPS) {
+                const float* xr = x + (size_t)(mc + r) * K;
+                float s = 0.f;
+                for (unsigned k = lane; k < K; k += 32u) s += xr[k];
+                const float mean = warp_sum32(s) / (float)K;
+                float v = 0.f;
+                for (unsigned k = lane; k < K; k += 32u) {
+                    const float d = xr[k] - mean;
+                    v = __fmaf_rn(d, d, v);
+                }
+                const float var = warp_sum32(v) / (float)K;
+                if (lane == 0) {
+                    st[2 * r] = mean;
+                    st[2 * r + 1] = rsqrtf(var + eps);
+                }
+            }
+        }
+        float acc[MMA_ROWS / 8u][4];
+#pragma unroll
+        for (unsigned j = 0; j < MMA_ROWS / 8u; j++) acc[j][0] = acc[j][1] = acc[j][2] = acc[j][3] = 0.f;
+        for (unsigned kt = 0; kt < K; kt += MMA_KT) {
+            const unsigned kw = min(MMA_KT, K - kt);
+            __syncthreads();
+            for (unsigned i = threadIdx.x; i < nt8 * 8u * kw; i += PLOW_NV_THREADS) {
+                const unsigned r = i / kw, k = i % kw;
+                float v = 0.f;
+                if (r < mr) {
+                    v = x[(size_t)(mc + r) * K + kt + k];
+                    if (gamma) v = __fmaf_rn((v - st[2 * r]) * st[2 * r + 1], gamma[kt + k], beta[kt + k]);
+                }
+                xs[r * MMA_KT + k] = __float2half_rn(v);
+            }
+            __syncthreads();
+            if (!active) continue;
+            for (unsigned kb = my_ks; kb < kw / 64u; kb += ks) {
+                const unsigned k0 = kt + kb * 64u + 16u * t;
+                uint4 wa[2], wb[2];
+                if (na < N) {
+                    wa[0] = *(const uint4*)(W + (size_t)na * K + k0);
+                    wa[1] = *(const uint4*)(W + (size_t)na * K + k0 + 8u);
+                } else {
+                    wa[0] = wa[1] = make_uint4(0u, 0u, 0u, 0u);
+                }
+                if (nb < N) {
+                    wb[0] = *(const uint4*)(W + (size_t)nb * K + k0);
+                    wb[1] = *(const uint4*)(W + (size_t)nb * K + k0 + 8u);
+                } else {
+                    wb[0] = wb[1] = make_uint4(0u, 0u, 0u, 0u);
+                }
+                const unsigned* pa = (const unsigned*)wa;
+                const unsigned* pb = (const unsigned*)wb;
+#pragma unroll
+                for (unsigned s = 0; s < 4u; s++) {
+                    const unsigned a[4] = {pa[2 * s], pb[2 * s], pa[2 * s + 1], pb[2 * s + 1]};
+#pragma unroll
+                    for (unsigned j = 0; j < MMA_ROWS / 8u; j++) {
+                        if (j >= nt8) break;
+                        const unsigned* xr =
+                            (const unsigned*)(xs + (j * 8u + g) * MMA_KT + kb * 64u + 16u * t + 4u * s);
+                        mma_16816(acc[j], a, xr[0], xr[1]);
+                    }
+                }
+            }
+        }
+        if (ks > 1u) {
+            __syncthreads();
+            if (active && my_ks) {
+#pragma unroll
+                for (unsigned j = 0; j < MMA_ROWS / 8u; j++)
+#pragma unroll
+                    for (unsigned c = 0; c < 4u; c++) red[(warp * 32u + lane) * 32u + j * 4u + c] = acc[j][c];
+            }
+            __syncthreads();
+            if (active && !my_ks) {
+                for (unsigned q = 1; q < ks; q++)
+#pragma unroll
+                    for (unsigned j = 0; j < MMA_ROWS / 8u; j++)
+#pragma unroll
+                        for (unsigned c = 0; c < 4u; c++) acc[j][c] += red[((warp + q) * 32u + lane) * 32u + j * 4u + c];
+            }
+        }
+        if (active && !my_ks) {
+#pragma unroll
+            for (unsigned j = 0; j < MMA_ROWS / 8u; j++) {
+                if (j >= nt8) break;
+#pragma unroll
+                for (unsigned c = 0; c < 4u; c++) {
+                    const unsigned m = j * 8u + 2u * t + (c & 1u), n = (c < 2u) ? na : nb;
+                    if (m >= mr || n >= N) continue;
+                    const size_t o = (size_t)(mc + m) * N + n;
+                    float v = acc[j][c];
+                    if (bias) v = __fadd_rn(v, bias[(bgroup ? (mc + m) / bgroup * N : 0u) + n]);
+                    if (res) v = __fadd_rn(v, res[o]);
+                    if (act == 1u) v = 0.5f * v * (1.f + erff(v * 0.70710678118654752f));
+                    C[o] = v;
                 }
             }
         }
@@ -459,10 +611,30 @@ static __device__ void d_gemv_f32out_mode(float* C, const void* x, const void* W
     if ((flags & 512u) && !bgroup) { __trap(); return; }
     bias = (flags & 4u) ? bias : nullptr;
     res = (flags & 8u) ? res : nullptr;
+    if ((flags & 3u) == 3u && (flags & 1024u)) {
+        if (K % 64u) { __trap(); return; }
+        gemv_f16w_mma(C, (const float*)x, (const unsigned short*)W, bias, bgroup, res,
+                      (flags & 256u) ? gamma : nullptr, beta, eps, act, M, N, K, slice, nblk, arena);
+        return;
+    }
     if ((flags & 3u) == 3u) {
         if ((flags & 256u) && K > GEMV_KT) { __trap(); return; }
-        gemv_f32x_f16w_staged(C, (const float*)x, (const unsigned short*)W, bias, bgroup, res,
-                              (flags & 256u) ? gamma : nullptr, beta, eps, act, M, N, K, slice, nblk, arena);
+        /* The fewest columns per warp that still give every warp of the block its share: a
+         * narrow projection (N / blocks <= 8 per warp) keeps all warps streaming W. */
+        const unsigned per = (N + nblk - 1) / nblk, need = (per + PLOW_NV_WARPS - 1) / PLOW_NV_WARPS;
+        const float* g = (flags & 256u) ? gamma : nullptr;
+        if (need <= 1)
+            gemv_f32x_f16w_staged<1>(C, (const float*)x, (const unsigned short*)W, bias, bgroup, res, g, beta, eps,
+                                     act, M, N, K, slice, nblk, arena);
+        else if (need <= 2)
+            gemv_f32x_f16w_staged<2>(C, (const float*)x, (const unsigned short*)W, bias, bgroup, res, g, beta, eps,
+                                     act, M, N, K, slice, nblk, arena);
+        else if (need <= 4)
+            gemv_f32x_f16w_staged<4>(C, (const float*)x, (const unsigned short*)W, bias, bgroup, res, g, beta, eps,
+                                     act, M, N, K, slice, nblk, arena);
+        else
+            gemv_f32x_f16w_staged<8>(C, (const float*)x, (const unsigned short*)W, bias, bgroup, res, g, beta, eps,
+                                     act, M, N, K, slice, nblk, arena);
         return;
     }
     switch (flags & 3u) {

@@ -559,6 +559,27 @@ static float g_h2f(uint16_t h) {
     return f;
 }
 
+/* f32 -> IEEE binary16, round to nearest even (subnormals, overflow to inf; NaN kept quiet). */
+static uint16_t g_f2h(float f) {
+    uint32_t x;
+    memcpy(&x, &f, sizeof x);
+    const uint32_t sign = (x >> 16) & 0x8000u, abs = x & 0x7fffffffu;
+    if (abs >= 0x7f800000u) return (uint16_t)(sign | 0x7c00u | (abs > 0x7f800000u ? 0x200u : 0u));
+    if (abs >= 0x477ff000u) return (uint16_t)(sign | 0x7c00u); /* rounds past 65504 */
+    if (abs < 0x38800000u) { /* f16 subnormal (or zero): value / 2^-24, rounded */
+        if (abs < 0x33000000u) return (uint16_t)sign;
+        const uint32_t m = (abs & 0x7fffffu) | 0x800000u, shift = 126u - (abs >> 23);
+        uint32_t h = m >> shift;
+        const uint32_t rem = m & ((1u << shift) - 1u), half = 1u << (shift - 1u);
+        if (rem > half || (rem == half && (h & 1u))) h++;
+        return (uint16_t)(sign | h);
+    }
+    uint32_t h = ((abs - 0x38000000u) >> 13);
+    const uint32_t rem = abs & 0x1fffu;
+    if (rem > 0x1000u || (rem == 0x1000u && (h & 1u))) h++;
+    return (uint16_t)(sign | h);
+}
+
 G_K(g_gemv_f32_out) {
     (void)ctx;
     float* c = PLOW_CPU_TEN(in, T, 0);
@@ -596,6 +617,7 @@ G_K(g_gemv_f32_out) {
                     const size_t xi = (size_t)m * k_in + k, wi = (size_t)n * k_in + k;
                     float a = (flags & 1u) ? xf[xi] : plow_bf2f(x[xi]);
                     if (gamma) a = fmaf((a - mean) * rstd, gamma[k], beta[k]);
+                    if (flags & 1024u) a = g_h2f(g_f2h(a));
                     const float b = (flags & 2u) ? g_h2f(wh[wi]) : plow_bf2f(w[wi]);
                     acc = fmaf(a, b, acc);
                 }

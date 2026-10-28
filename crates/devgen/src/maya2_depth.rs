@@ -173,6 +173,9 @@ pub fn lower_maya2_depth(
 const GEMV_ROWS: u32 = 256;
 /// The GEMV's LayerNorm prologue normalises a staged row of at most this many columns.
 const GEMV_LN_K: u32 = 1024;
+/// Projections over at least this many rows run on tensor cores (`GemvF32Out` bit 10: f16 x, W
+/// streamed once per 64 rows); the f32-x GEMV re-streams W every 8 rows.
+const MMA_ROWS: u32 = 1;
 
 /// What a projection adds after the matmul: `act(acc + bias + residual)`.
 #[derive(Clone, Copy)]
@@ -279,7 +282,8 @@ impl Chain {
             let flags = u32::from(!ep.x_bf16) | 2 | if bh.is_some() { 4 } else { 0 } | if ep.residual.is_some() { 8 } else { 0 }
                 | if ep.gelu { 1 << 4 } else { 0 }
                 | if ln.is_some() { 1 << 8 } else { 0 }
-                | if ep.bias_group > 0 { 1 << 9 } else { 0 };
+                | if ep.bias_group > 0 { 1 << 9 } else { 0 }
+                | if !ep.x_bf16 && rows >= MMA_ROWS && k % 64 == 0 { 1 << 10 } else { 0 };
             let none = packet::dev::TENSOR_NONE;
             let e = self.p.raw(DevOp::GemvF32Out, u64::from(self.n_cu.min(n / 8).max(1)), &deps, o, |i| {
                 i.t[..7].copy_from_slice(&[

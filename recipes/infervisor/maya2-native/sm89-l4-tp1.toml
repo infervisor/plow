@@ -1,7 +1,11 @@
-# Maya 2 Native (maya-research/maya2-native) on L4 (sm_89, 58 SMs, 24 GB): Qwen3-1.7B backbone (bf16,
-# restricted cb0 head of 2049 rows), DepthV2 as the packet's depth stage (fp16 weights, fp32
-# activations, host cb0 controller), Mimi decoder codec.pkt (fp32, 24 kHz). 8 decode slots at
-# 2048 ctx. Apache-2.0.
+# Maya 2 Native (maya-research/maya2-native) on L4 (sm_89, 58 SMs, 24 GB): Qwen3-1.7B backbone (W8A16:
+# per-channel e4m3 projections, bf16 activations; restricted cb0 head of 2049 rows), DepthV2 as the
+# packet's depth stage (fp16 weights, f16 tensor-core projections with fp32 residuals, host cb0
+# controller), Mimi decoder codec.pkt (fp32, 24 kHz). 8 decode slots at 2048 ctx. Apache-2.0.
+#
+# L4 stream bench (tts_bench chatterbox set, voice Siddhant): c1 2.61 audio s/s RTF 0.384 TTFA 69 ms,
+# c4 6.36 audio s/s, c8 8.36 audio s/s RTF 0.91; Whisper CER 0.000 (n=32); 6.4 GB. Official maya3.server
+# on the same L4: c1 RTF 0.374 TTFA 36 ms, c4 9.06 audio s/s, c16 27.1.
 #
 #   PYREF=<python with torch + safetensors> MAYA3_SRC=<maya3 checkout> nix develop --command \
 #     python3 scripts/campaign/campaign.py build recipes/infervisor/maya2-native/sm89-l4-tp1.toml --out <fresh dir>
@@ -30,7 +34,7 @@ revision = "7cce38065147840d68011e18d25f4d68462e402f"
 
 [cell]
 name = "maya2-native-l4"
-hf_dir = "{out}/prep/lm"
+hf_dir = "{out}/prep/lm-w8"
 gpu = "l4"
 arch = "sm_89"
 n_cu = 58
@@ -63,10 +67,18 @@ script = "scripts/tts/ecapa_export.py"
 python = "{env:PYREF}"
 args = ["{out}/prep/lm/ecapa"]
 
+# W8A16: the backbone's projections replaced by their e4m3 twins (side tables linked).
+[[prep]]
+name = "fp8-rekey"
+script = "perf-data/tools/quantize_fp8.py"
+python = "{env:PYREF}"
+args = ["{out}/prep/lm", "{out}/prep/lm-w8", "model.", "--rekey"]
+
 [emit]
 emit = "devblob+cubin"
 args = ["--served-name", "maya2-native"]
 [emit.env]
+PLOW_W8A16 = "1"
 PLOW_TTS_PROFILE = "maya2"
 PLOW_TTS_CODEC_DIR = "{out}/prep/codec"
 PLOW_VERIFY_BIN = "{repo}/lean-plow/.lake/build/bin/plow_verify"
