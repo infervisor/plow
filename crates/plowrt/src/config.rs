@@ -2709,6 +2709,27 @@ impl RuntimeConfig {
         )
     }
 
+    /// `PLOW_SIGNING_KEY`: the file holding the ed25519 key `push` signs a
+    /// model index with. `PLOW_TRUSTED_KEYS`: the comma-separated public keys
+    /// (`<name>:<base64>`) a `load`/`pull`/`upgrade` accepts an index from;
+    /// with any set, an unsigned or foreign-signed index is refused.
+    pub fn signing_env() -> (Option<String>, Option<String>) {
+        (
+            Self::env_nonempty("PLOW_SIGNING_KEY"),
+            Self::env_nonempty("PLOW_TRUSTED_KEYS"),
+        )
+    }
+
+    /// `PLOW_READELF`: the `readelf` the manifest generator reads an object's
+    /// `.symtab` with (`plowrt pack --recipe`). A publish-side tool setting,
+    /// not a serve knob, so it has no flag here. `nix develop` exports it
+    /// pointing at the toolchain's `llvm-readelf`, which is what
+    /// `scripts/build_gfx942.sh` itself requires; without it the generator
+    /// falls back to `llvm-readelf` then `readelf` on PATH.
+    pub fn readelf_env() -> Option<String> {
+        Self::env_nonempty("PLOW_READELF")
+    }
+
     /// `PLOW_THROUGHPUT_K`: the decode quantum under the throughput objective (default 8); a
     /// packet's `serve.json` can carry the model's measured value.
     pub(crate) fn throughput_k() -> Option<u32> {

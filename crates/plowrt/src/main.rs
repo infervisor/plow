@@ -720,50 +720,67 @@ enum Cmd {
         gc: bool,
     },
 
-    /// Package a built bundle + objset + their files into one `.zip`, ready
-    /// to upload to a registry's publish API. Does not build the manifests —
-    /// those still come from `pack_bundle.py`/`pack_objset.py`.
+    /// Move a pin back to the generation it served before the current one.
+    /// The bundle must still be in the store (`gc` keeps the last two).
+    Rollback {
+        /// The model to act on, as for `load`.
+        model: String,
+    },
+
+    /// Collect the bundles no pin can serve or roll back to, then the blobs
+    /// nothing references. `upgrade` never frees space by itself.
+    Gc,
+
+    /// Package a built variant into one `.zip`, ready to upload to a
+    /// registry's publish API.
+    ///
+    ///   plowrt pack --assets <dir> --recipe <recipe.toml> --out <zip>
+    ///
+    /// builds both manifests from the recipe and the directory the build left
+    /// behind. `--manifests <dir>` writes just the two JSON files, for a
+    /// caller that validates or publishes them separately from the archive.
     #[cfg(feature = "dist")]
     Pack {
-        /// Bundle manifest, as written by `pack_bundle.py`.
-        #[arg(long)]
-        bundle: PathBuf,
-        /// Objset manifest, as written by `pack_objset.py`. Omitted for a
-        /// runtime-compiled target (Apple), whose bundle names none.
-        #[arg(long)]
-        objset: Option<PathBuf>,
+        #[command(flatten)]
+        producer: ProducerArgs,
         /// Directory `bundle.json`'s `files[]` live in.
         #[arg(long)]
         assets: PathBuf,
-        /// Directory `objset.json`'s `objects[]` live in.
+        /// Directory `objset.json`'s `objects[]` live in. With `--recipe`,
+        /// defaults to `--assets`: a recipe with no `[objects]` step emits its
+        /// cubins straight in beside `model.pkt`.
         #[arg(long)]
         objects: Option<PathBuf>,
         /// Directory a `dist` checkpoint's `files[]` live in. Required exactly
         /// when the bundle carries its checkpoint.
         #[arg(long)]
         checkpoint_dir: Option<PathBuf>,
-        /// Output archive path.
+        /// Output archive path. Omitted, only `--manifests` is written.
+        #[arg(long, required_unless_present = "manifests")]
+        out: Option<PathBuf>,
+        /// Write `bundle.json` and `objset.json` into this directory, with or
+        /// without `--out`, for inspecting them without the archive.
         #[arg(long)]
-        out: PathBuf,
+        manifests: Option<PathBuf>,
     },
 
-    /// Publish a built bundle to a registry with an API key: number it as its
-    /// label's next generation from the registry's index, package it exactly
-    /// as `pack` does, and send it through the registry's staged upload
-    /// (`<to>/api/v1/admin/registry/uploads`). When the newest generation is
+    /// Publish through a registry's staged-upload API. Transition path only,
+    /// kept until every model is re-published with `push`, which writes the
+    /// bucket directly; new publications use `push`.
+    ///
+    /// Numbers the build as its label's next generation from the registry's
+    /// index, packages it exactly as `pack` does, and sends it through
+    /// `<to>/api/v1/admin/registry/uploads`. When the newest generation is
     /// already this build, nothing is sent.
     #[cfg(feature = "dist")]
     Publish {
-        /// Bundle manifest, as written by `pack_bundle.py`.
-        #[arg(long)]
-        bundle: PathBuf,
-        /// Objset manifest; omitted for a runtime-compiled target (Apple).
-        #[arg(long)]
-        objset: Option<PathBuf>,
+        #[command(flatten)]
+        producer: ProducerArgs,
         /// Directory `bundle.json`'s `files[]` live in.
         #[arg(long)]
         assets: PathBuf,
-        /// Directory `objset.json`'s `objects[]` live in.
+        /// Directory `objset.json`'s `objects[]` live in. With `--recipe`,
+        /// defaults to `--assets`.
         #[arg(long)]
         objects: Option<PathBuf>,
         /// Directory a `dist` checkpoint's `files[]` live in, as for `pack`.
@@ -793,6 +810,149 @@ enum Cmd {
         #[arg(long)]
         concurrency: Option<u32>,
     },
+
+    /// Publish a built variant straight into a registry bucket or directory:
+    ///
+    ///   plowrt push --recipe <recipe.toml> --assets <dir> --to r2://<account>/<bucket>
+    ///
+    /// Writes blobs, the objset and bundle manifests, the model index, its
+    /// signature and the catalog, in that order, each write conditional so a
+    /// racing publisher is refused rather than overwritten. The bucket is
+    /// the registry `load` reads; no service sits in between. A re-run of a
+    /// build that is already the newest generation writes nothing.
+    ///
+    /// R2 is the default: account and bucket from the URL or
+    /// `CLOUDFLARE_ACCOUNT_ID` / `CLOUDFLARE_R2_BUCKET`, writes with
+    /// `CLOUDFLARE_API_TOKEN` (REST API) or `CLOUDFLARE_R2_ACCESS_KEY_ID` +
+    /// `CLOUDFLARE_R2_SECRET_ACCESS_KEY` (S3 endpoint).
+    #[cfg(feature = "dist")]
+    Push {
+        #[command(flatten)]
+        producer: ProducerArgs,
+        /// Directory `bundle.json`'s `files[]` live in.
+        #[arg(long)]
+        assets: PathBuf,
+        /// Directory `objset.json`'s `objects[]` live in; defaults to `--assets`.
+        #[arg(long)]
+        objects: Option<PathBuf>,
+        /// Directory a `dist` checkpoint's `files[]` live in, as for `pack`.
+        #[arg(long)]
+        checkpoint_dir: Option<PathBuf>,
+        /// `r2://[<account-id>/]<bucket>`, `s3://<bucket>` or `file:///dir`.
+        #[arg(long, default_value = "r2://")]
+        to: String,
+        /// The ed25519 key file (`plowrt keygen`) the index is signed with;
+        /// `PLOW_SIGNING_KEY` when omitted. Without one the index is unsigned.
+        #[arg(long)]
+        key_file: Option<PathBuf>,
+        /// Status to publish at (default `emits`).
+        #[arg(long, value_parser = ["emits", "validated"])]
+        status: Option<String>,
+        /// One line describing the model, for the catalog.
+        #[arg(long)]
+        description: Option<String>,
+        /// `<org>/<repo>` on Hugging Face, the model's identity in the index.
+        /// Required for a `dist` checkpoint, which names none itself.
+        #[arg(long)]
+        hf: Option<String>,
+        /// Measured decode throughput; required for `--status validated`.
+        #[arg(long)]
+        tok_s: Option<f64>,
+        /// The concurrency `--tok-s` was measured at.
+        #[arg(long)]
+        concurrency: Option<u32>,
+        /// Another name the model answers to in the index; repeatable.
+        #[arg(long = "alias")]
+        aliases: Vec<String>,
+        /// Report what would be written, and write nothing.
+        #[arg(long, default_value_t = false)]
+        dry_run: bool,
+    },
+
+    /// Generate the ed25519 key `push` signs model indexes with. Prints the
+    /// public half, which clients put in `PLOW_TRUSTED_KEYS`.
+    #[cfg(feature = "dist")]
+    Keygen {
+        /// The key's name, as it appears in signatures (`infervisor-1`).
+        #[arg(long)]
+        name: String,
+        /// Where the secret key is written (mode 0600; never overwritten).
+        #[arg(long)]
+        out: PathBuf,
+    },
+}
+
+/// How the two manifests are produced, shared by `pack` and `publish` so the
+/// two cannot drift on how a variant is identified.
+#[cfg(feature = "dist")]
+#[derive(clap::Args, Debug, Clone)]
+pub struct ProducerArgs {
+    /// The recipe that declares this variant: namespace, name, label, target,
+    /// checkpoint, `plow_git` and the validated `[serve] env`. Both manifests
+    /// are built from it and the directory the build left behind.
+    #[arg(long)]
+    recipe: PathBuf,
+    /// The commit that built these bytes, when the recipe pins a different
+    /// one. For REPRODUCING a manifest, not for publishing a new variant:
+    /// the recipe's pin is the provenance a published build records.
+    #[arg(long)]
+    plow_git: Option<String>,
+    /// The compiler the objects were built with, for a recipe whose `[target]`
+    /// does not record one.
+    #[arg(long)]
+    toolchain: Option<String>,
+    /// Ship a plow-GENERATED `tokenizer.json` and name the script that made it.
+    /// Omitted, the tokenizer is the checkpoint's own file, which the
+    /// distribution does not carry.
+    #[arg(long)]
+    tokenizer_generator: Option<String>,
+    /// Record the generated tokenizer as verified against the checkpoint.
+    #[arg(long, requires = "tokenizer_generator")]
+    tokenizer_verified: bool,
+    /// `<max>:<objset.json>` — a narrow-rung decode override, repeatable.
+    #[arg(long)]
+    lowrung: Vec<String>,
+}
+
+#[cfg(feature = "dist")]
+impl ProducerArgs {
+    /// `<max>:<objset.json>`, parsed before anything is read.
+    fn rungs(&self) -> Result<Vec<(u32, PathBuf)>, String> {
+        self.lowrung
+            .iter()
+            .map(|spec| {
+                let (max, path) = spec.split_once(':').ok_or_else(|| {
+                    format!("--lowrung expects <max>:<objset.json>, got {spec:?}")
+                })?;
+                let max: u32 = max
+                    .parse()
+                    .map_err(|_| format!("--lowrung: {max:?} is not a rung width"))?;
+                Ok((max, PathBuf::from(path)))
+            })
+            .collect()
+    }
+
+    fn manifests(&self) -> Result<dist_cmd::Recipe<'_>, String> {
+        use plowrt::dist::manifest::{BundleArgs, Overrides, Tokenizer};
+        Ok(dist_cmd::Recipe {
+            path: &self.recipe,
+            over: Overrides {
+                plow_git: self.plow_git.as_deref(),
+                toolchain: self.toolchain.as_deref(),
+            },
+            args: BundleArgs {
+                tokenizer: match &self.tokenizer_generator {
+                    Some(generator) => Tokenizer::Derived {
+                        generator: generator.clone(),
+                        verified: self.tokenizer_verified,
+                    },
+                    None => Tokenizer::Checkpoint,
+                },
+                lowrung: self.rungs()?,
+                checkpoint_dir: None,
+            },
+        })
+    }
 }
 
 /// Narrowing shared by `pull` and `load`. Everything not constrained here is
@@ -1191,26 +1351,29 @@ async fn async_main(
             dist_cmd::report(dist_cmd::cmd_prepare(&model, checkpoint))
         }
         Cmd::Rm { model, gc } => dist_cmd::report(dist_cmd::cmd_rm(&model, gc)),
+        Cmd::Rollback { model } => dist_cmd::report(dist_cmd::cmd_rollback(&model)),
+        Cmd::Gc => dist_cmd::report(dist_cmd::cmd_gc()),
         #[cfg(feature = "dist")]
         Cmd::Pack {
-            bundle,
-            objset,
+            producer,
             assets,
             objects,
             checkpoint_dir,
             out,
-        } => dist_cmd::report(dist_cmd::cmd_pack(
-            &bundle,
-            objset.as_deref(),
-            &assets,
-            objects.as_deref(),
-            checkpoint_dir.as_deref(),
-            &out,
-        )),
+            manifests,
+        } => dist_cmd::report((|| {
+            dist_cmd::cmd_pack(
+                producer.manifests()?,
+                &assets,
+                objects.as_deref(),
+                checkpoint_dir.as_deref(),
+                out.as_deref(),
+                manifests.as_deref(),
+            )
+        })()),
         #[cfg(feature = "dist")]
         Cmd::Publish {
-            bundle,
-            objset,
+            producer,
             assets,
             objects,
             checkpoint_dir,
@@ -1228,8 +1391,7 @@ async fn async_main(
                 .or(env_key)
                 .ok_or("set PLOW_PUBLISH_KEY (or --key) to an API key allowed to publish")?;
             dist_cmd::cmd_publish(
-                &bundle,
-                objset.as_deref(),
+                producer.manifests()?,
                 &assets,
                 objects.as_deref(),
                 checkpoint_dir.as_deref(),
@@ -1244,6 +1406,52 @@ async fn async_main(
                 },
             )
         })()),
+        #[cfg(feature = "dist")]
+        Cmd::Push {
+            producer,
+            assets,
+            objects,
+            checkpoint_dir,
+            to,
+            key_file,
+            status,
+            description,
+            hf,
+            tok_s,
+            concurrency,
+            aliases,
+            dry_run,
+        } => dist_cmd::report((|| {
+            let key_file = key_file.or_else(|| {
+                plowrt::config::RuntimeConfig::signing_env()
+                    .0
+                    .map(PathBuf::from)
+            });
+            let status = match status.as_deref() {
+                Some("validated") => Some(plow_asset::dist::Status::Validated),
+                Some(_) => Some(plow_asset::dist::Status::Emits),
+                None => None,
+            };
+            dist_cmd::cmd_push(
+                producer.manifests()?,
+                &assets,
+                objects.as_deref(),
+                checkpoint_dir.as_deref(),
+                &to,
+                key_file.as_deref(),
+                &plowrt::dist::push::Options {
+                    status,
+                    description: description.as_deref(),
+                    hf: hf.as_deref(),
+                    tok_s,
+                    concurrency,
+                    aliases,
+                    dry_run,
+                },
+            )
+        })()),
+        #[cfg(feature = "dist")]
+        Cmd::Keygen { name, out } => dist_cmd::report(dist_cmd::cmd_keygen(&name, &out)),
         #[cfg(feature = "hsa")]
         Cmd::AmdBench {
             blob,
