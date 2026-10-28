@@ -5,8 +5,8 @@
 use plow_asset::fish_depth::{Manifest, Sampler};
 
 use crate::asset::devblob::DevBlob;
-use crate::device::cuda::PinnedHost;
-use crate::device::{Backend, DeviceMem};
+use crate::device::cuda::{KernelFn, PinnedHost};
+use crate::device::{Backend, DeviceMem, Module};
 use crate::{Result, RuntimeError};
 
 use super::{DevProgram, GpuEngine, BLOCK};
@@ -22,9 +22,79 @@ pub(super) struct FishDepth {
     manifest: Manifest,
     programs: Vec<Loaded>,
     /// Staging for the widest program: seed u64 (first, so aligned), params `[rows][4]` f32, then
-    /// top_k, step, hidden_row u32, then the read-back codes `[rows][codebooks]`.
+    /// top_k, step, hidden_row u32 (Maya 2: `[rows][2]` control, hidden_row, cb0), then the
+    /// read-back codes `[rows][codebooks]`.
     stage: PinnedHost,
     rows: usize,
+    maya2: Option<Maya2>,
+}
+
+/// Maya 2's host cb0 controller: per-slot state, and the widest program's read-back cb0 logits.
+struct Maya2 {
+    slots: Vec<Option<crate::tts::maya2::Slot>>,
+    logits: PinnedHost,
+    scratch: Vec<f32>,
+    /// The depth levels' (temperature, top-k).
+    depth: (f32, u32),
+    /// The depth programs run FP32 speech ops: they launch on the bundle's speech object, over the
+    /// engine's own tensor table.
+    speech: SpeechFn,
+}
+
+struct SpeechFn {
+    _module: Module,
+    f: KernelFn,
+    smem: u32,
+}
+
+impl SpeechFn {
+    /// The speech object beside the packet, checked to carry every speech op of `programs`.
+    fn load(
+        e: &GpuEngine,
+        assets: &std::path::Path,
+        programs: &[plow_asset::aux_program::Program],
+    ) -> Result<Self> {
+        let (file, symbol) = super::packet_exec::speech_object(e.be.compute_capability());
+        let path = assets.join(file);
+        let image = std::fs::read(&path).map_err(|source| RuntimeError::Io {
+            path: path.clone(),
+            source,
+        })?;
+        let module = e.be.module_load(&image)?;
+        let f = e.be.get_function(&module, symbol)?;
+        let need = programs
+            .iter()
+            .flat_map(|p| p.insts.iter())
+            .map(|i| u32::from(i.op))
+            .filter(|op| (163..=204).contains(op))
+            .fold(0u64, |m, op| m | 1 << (op - 163));
+        if let (Some(lo), Some(hi)) = (
+            e.be.module_global_u32(&module, "plow_speech_ops_lo_speech")?,
+            e.be.module_global_u32(&module, "plow_speech_ops_hi_speech")?,
+        ) {
+            let missing =
+                super::packet_exec::missing_speech_ops(need, u64::from(hi) << 32 | u64::from(lo));
+            if !missing.is_empty() {
+                return Err(reject(format!(
+                    "{} lacks speech ops {missing:?}",
+                    path.display()
+                )));
+            }
+        }
+        let smem = e
+            .be
+            .module_global_u32(&module, "plow_arena_bytes_speech")?
+            .unwrap_or(49152);
+        e.be.set_max_dynamic_smem(f, smem)?;
+        if e.be.occupancy_blocks_per_sm(f, BLOCK, smem as usize)? * e.be.sm_count() < e.grid {
+            return Err(reject("speech object cannot hold the cooperative grid"));
+        }
+        Ok(SpeechFn {
+            _module: module,
+            f,
+            smem,
+        })
+    }
 }
 
 /// One row of a depth launch: the slot whose frame it samples and its sampling state.
@@ -58,6 +128,9 @@ pub struct FishInfo {
     pub pair_cfg: bool,
 }
 
+/// cb0 head rows: the codebook and the stop class.
+const STOP_ROWS: usize = crate::tts::maya2::STOP + 1;
+
 fn reject(e: impl std::fmt::Display) -> RuntimeError {
     RuntimeError::Rejected(format!("fish depth: {e}"))
 }
@@ -68,6 +141,7 @@ impl FishDepth {
         e: &GpuEngine,
         blob: &DevBlob,
         raw: &[u8],
+        assets: &std::path::Path,
     ) -> Result<Option<Self>> {
         let Some(meta) = blob.reserved_metadata(raw, plow_asset::fish_depth::SECTION)? else {
             return Ok(None);
@@ -76,10 +150,15 @@ impl FishDepth {
         let bytes = blob
             .reserved_metadata(raw, plow_asset::fish_depth::PROGRAMS_SECTION)?
             .ok_or_else(|| reject("depth programs section missing"))?;
-        Self::load(e, manifest, bytes).map(Some)
+        Self::load(e, manifest, bytes, assets).map(Some)
     }
 
-    fn load(e: &GpuEngine, manifest: Manifest, bytes: &[u8]) -> Result<Self> {
+    fn load(
+        e: &GpuEngine,
+        manifest: Manifest,
+        bytes: &[u8],
+        assets: &std::path::Path,
+    ) -> Result<Self> {
         let section =
             plow_asset::aux_program::parse(bytes, e.grid, e.devp.len()).map_err(reject)?;
         manifest
@@ -89,7 +168,21 @@ impl FishDepth {
         let t = &manifest.tensors;
         let k = manifest.codebooks as usize;
         let need = |h: u16, bytes: usize| e.devp[usize::from(h)].len >= bytes as u64;
-        if rows > e.batch
+        let maya2 = manifest.sampler == Sampler::Maya2;
+        if maya2
+            && (rows > e.batch
+                || !need(t.params, rows * 16)
+                || !need(t.seed, rows * 8)
+                || !need(t.top_k, rows * 8)
+                || !need(t.history, rows * 4)
+                || !need(t.hidden_row, rows * 4)
+                || !need(t.frame_codes, e.batch * k * 4)
+                || e.vocab() <= crate::tts::maya2::STOP
+                || manifest.depth_sampling.is_none())
+        {
+            return Err(reject("maya2 tensor sizes disagree with the program widths"));
+        }
+        if !maya2 && (rows > e.batch
             || !need(t.params, rows * 16)
             || !need(t.seed, rows * 8)
             || !need(t.history, e.batch * manifest.ras_window as usize * 4)
@@ -102,7 +195,7 @@ impl FishDepth {
                     4
                 },
             )
-            || [t.step, t.hidden_row].iter().any(|&h| !need(h, rows * 4))
+            || [t.step, t.hidden_row].iter().any(|&h| !need(h, rows * 4)))
         {
             return Err(reject("tensor sizes disagree with the program widths"));
         }
@@ -122,7 +215,17 @@ impl FishDepth {
             })
             .collect::<Result<Vec<_>>>()?;
         let stage =
-            e.be.host_alloc_pinned(rows * (16 + 12 + 8) + e.batch * k * 4)?;
+            e.be.host_alloc_pinned(rows * (16 + 16 + 8) + e.batch * k * 4)?;
+        let maya2 = match (maya2, manifest.depth_sampling) {
+            (true, Some([t, k])) => Some(Maya2 {
+                slots: vec![None; e.batch],
+                logits: e.be.host_alloc_pinned(rows * e.vocab() * 2)?,
+                scratch: Vec::new(),
+                depth: (f32::from_bits(t), k),
+                speech: SpeechFn::load(e, assets, &section.programs)?,
+            }),
+            _ => None,
+        };
         tracing::info!(
             programs = programs.len(),
             rows,
@@ -134,6 +237,7 @@ impl FishDepth {
             programs,
             stage,
             rows,
+            maya2,
         })
     }
 }
@@ -161,10 +265,28 @@ impl GpuEngine {
         if slot >= self.batch {
             return Err(reject("slot out of range"));
         }
+        if d.maya2.is_some() {
+            return Ok(());
+        }
         let w = d.manifest.ras_window as usize * 4;
         let h = &self.devp[usize::from(d.manifest.tensors.history)];
         self.be
             .memset_d8_async(h.base + (slot * w) as u64, 0, w, &self.stream)
+    }
+
+    /// Start a Maya 2 piece on `slot` under `plan` (after [`Self::fish_reset_slot`]).
+    pub fn maya2_bind(&mut self, slot: usize, plan: crate::tts::maya2::Plan) -> Result<()> {
+        let m = self
+            .fish
+            .as_mut()
+            .and_then(|d| d.maya2.as_mut())
+            .ok_or_else(|| reject("not a maya2 depth stage"))?;
+        let s = m
+            .slots
+            .get_mut(slot)
+            .ok_or_else(|| reject("slot out of range"))?;
+        *s = Some(crate::tts::maya2::Slot::new(plan));
+        Ok(())
     }
 
     /// A prompt's first frame samples from prefill's logits (row 0): move them to `slot`'s row.
@@ -185,7 +307,11 @@ impl GpuEngine {
     /// (`codebooks` per row, column 0 the backbone class) to `out`.
     pub fn fish_depth_step(&mut self, rows: &[FishRow], out: &mut Vec<u32>) -> Result<()> {
         let mut d = self.fish.take().ok_or_else(|| reject("not enabled"))?;
-        let r = self.fish_launch(&mut d, rows, out);
+        let r = if d.maya2.is_some() {
+            self.maya2_launch(&mut d, rows, out)
+        } else {
+            self.fish_launch(&mut d, rows, out)
+        };
         self.fish = Some(d);
         r
     }
@@ -333,6 +459,130 @@ impl GpuEngine {
             bytemuck::cast_slice(&d.stage.as_slice()[codes_at..codes_at + n * k * 4]);
         for row in rows {
             out.extend_from_slice(&codes[row.slot * k..row.slot * k + k]);
+        }
+        Ok(())
+    }
+
+    /// Maya 2: cb0 for each row from the host controller over the backbone's logits, then the
+    /// depth program samples codebooks `1..` from the row's hidden and cb0. A stopping row yields
+    /// `[stop_class, 0, ..]`.
+    fn maya2_launch(
+        &mut self,
+        d: &mut FishDepth,
+        rows: &[FishRow],
+        out: &mut Vec<u32>,
+    ) -> Result<()> {
+        use crate::tts::maya2::Tick;
+        let width = rows.iter().map(|r| r.slot + 1).max().unwrap_or(0);
+        let p = d
+            .programs
+            .iter()
+            .filter(|p| p.rows as usize >= width)
+            .min_by_key(|p| p.rows)
+            .ok_or_else(|| reject(format!("no program covers slot {}", width.saturating_sub(1))))?;
+        let n = p.rows as usize;
+        let k = d.manifest.codebooks as usize;
+        let vocab = self.vocab();
+        let m = d.maya2.as_mut().unwrap();
+        if rows.iter().any(|r| m.slots.get(r.slot).is_none_or(Option::is_none)) {
+            return Err(reject("maya2 row on an unbound slot"));
+        }
+        let l = &self.devp[self.t_logits];
+        // SAFETY: the pinned buffer is read only after this call's synchronize.
+        unsafe {
+            self.be.memcpy_dtoh_async(
+                &mut m.logits.as_mut_slice()[..n * vocab * 2],
+                l.base,
+                &self.stream,
+            )?;
+        }
+        self.be.stream_synchronize(&self.stream)?;
+        let logits: &[u16] = bytemuck::cast_slice(&m.logits.as_slice()[..n * vocab * 2]);
+        let mut stops = Vec::with_capacity(rows.len());
+        let (seeds, params, ctl, hrow, cb0): (u64, usize, usize, usize, usize) =
+            (0, d.rows * 8, d.rows * 24, d.rows * 32, d.rows * 36);
+        let _ = seeds;
+        {
+            let s = d.stage.as_mut_slice();
+            for r in 0..n {
+                let last = m.slots[r].as_ref().map_or(0, |s| s.last);
+                s[ctl + r * 8..ctl + r * 8 + 8].fill(0);
+                s[hrow + r * 4..hrow + r * 4 + 4].copy_from_slice(&(r as u32).to_le_bytes());
+                s[cb0 + r * 4..cb0 + r * 4 + 4].copy_from_slice(&last.to_le_bytes());
+                s[r * 8..r * 8 + 8].fill(0);
+                for (j, v) in [m.depth.0, 1.0, 1.0, 1.0].iter().enumerate() {
+                    let at = params + r * 16 + j * 4;
+                    s[at..at + 4].copy_from_slice(&v.to_le_bytes());
+                }
+            }
+            for row in rows {
+                let r = row.slot;
+                let slot = m.slots[r].as_mut().unwrap();
+                let tick = slot.tick(&logits[r * vocab..r * vocab + STOP_ROWS], &mut m.scratch);
+                stops.push(tick == Tick::Stop);
+                let code = match tick {
+                    Tick::Code(c) => c,
+                    Tick::Stop => slot.last,
+                };
+                s[ctl + r * 8..ctl + r * 8 + 4].copy_from_slice(&m.depth.1.to_le_bytes());
+                s[ctl + r * 8 + 4..ctl + r * 8 + 8].copy_from_slice(&row.step.to_le_bytes());
+                s[hrow + r * 4..hrow + r * 4 + 4].copy_from_slice(&row.hidden_row.to_le_bytes());
+                s[cb0 + r * 4..cb0 + r * 4 + 4].copy_from_slice(&code.to_le_bytes());
+                s[r * 8..r * 8 + 8].copy_from_slice(&row.seed.to_le_bytes());
+            }
+        }
+        let t = d.manifest.tensors.clone();
+        let bytes = d.stage.as_slice();
+        for (h, at, len) in [
+            (t.seed, 0, n * 8),
+            (t.params, params, n * 16),
+            (t.top_k, ctl, n * 8),
+            (t.hidden_row, hrow, n * 4),
+            (t.history, cb0, n * 4),
+        ] {
+            // SAFETY: the pinned stage is rewritten only after this call's synchronize.
+            unsafe {
+                self.be.memcpy_htod_async(
+                    self.devp[usize::from(h)].base,
+                    &bytes[at..at + len],
+                    &self.stream,
+                )?;
+            }
+        }
+        self.be
+            .memset_d8_async(p.arg.counters, 0, p.counter_bytes, &self.stream)?;
+        let mut arg = p.arg;
+        let mut args = [&mut arg as *mut DevProgram as *mut std::ffi::c_void];
+        self.be.launch_cooperative(
+            m.speech.f,
+            self.grid,
+            BLOCK,
+            m.speech.smem,
+            &mut args,
+            Some(&self.stream),
+        )?;
+        let codes_at = d.rows * 40;
+        // SAFETY: as the uploads.
+        unsafe {
+            self.be.memcpy_dtoh_async(
+                &mut d.stage.as_mut_slice()[codes_at..codes_at + n * k * 4],
+                self.devp[usize::from(t.frame_codes)].base,
+                &self.stream,
+            )?;
+        }
+        self.be.stream_synchronize(&self.stream)?;
+        let codes: &[u32] =
+            bytemuck::cast_slice(&d.stage.as_slice()[codes_at..codes_at + n * k * 4]);
+        for (row, &stop) in rows.iter().zip(&stops) {
+            let slot = m.slots[row.slot].as_mut().unwrap();
+            if stop {
+                out.push(d.manifest.stop_class);
+                out.extend(std::iter::repeat_n(0, k - 1));
+            } else {
+                let c = &codes[row.slot * k..row.slot * k + k];
+                slot.emitted(c[0]);
+                out.extend_from_slice(c);
+            }
         }
         Ok(())
     }

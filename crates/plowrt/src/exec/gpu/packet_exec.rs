@@ -16,7 +16,7 @@ use crate::exec::packet_runtime::{check_copy, check_transfer, PacketRuntime, Pac
 use crate::{Result, RuntimeError};
 
 /// The speech object and its entry symbol for a compute capability.
-fn speech_object(cc: (u32, u32)) -> (&'static str, &'static str) {
+pub(super) fn speech_object(cc: (u32, u32)) -> (&'static str, &'static str) {
     match cc {
         (8, 9) => (
             "interp_sm89_speech.cubin",
@@ -50,7 +50,7 @@ fn speech_ops(blob: &DevBlob) -> u64 {
         .fold(0, |mask, op| mask | 1 << (op - SPEECH_OP0))
 }
 
-fn missing_speech_ops(required: u64, compiled: u64) -> Vec<u32> {
+pub(super) fn missing_speech_ops(required: u64, compiled: u64) -> Vec<u32> {
     let missing = required & !compiled;
     (0..64)
         .filter(|b| missing >> b & 1 != 0)

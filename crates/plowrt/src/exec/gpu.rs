@@ -7613,7 +7613,7 @@ impl GpuEngine {
         engine.mm_spans = engine.handle_of("act.mm_span").is_some();
         engine.encoder = engine.handle_of("act.enc_out").is_some();
         engine.packed_terminal = packed_terminal::PackedTerminal::load(&engine)?;
-        engine.fish = fish_depth::FishDepth::load_if_present(&engine, &blob, &raw)?;
+        engine.fish = fish_depth::FishDepth::load_if_present(&engine, &blob, &raw, assets_dir)?;
         engine.shared_tail =
             shared_tail::SharedTail::load(&engine, &blob, kv_shared_tail_metadata.as_ref())?;
         engine.token_batch = token_batch::CudaTokenBatch::load(&engine);

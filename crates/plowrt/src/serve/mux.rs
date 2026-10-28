@@ -589,6 +589,9 @@ pub struct DepthJob {
     pub semantic_base: u32,
     pub stop_class: u32,
     pub stop_token: u32,
+    /// Maya 2: the host cb0 controller's plan for this piece (the backbone class is drawn on the
+    /// host; the fields above sample nothing).
+    pub maya2: Option<crate::tts::maya2::Plan>,
 }
 
 impl DepthJob {
@@ -7562,6 +7565,9 @@ fn gpu_prefill_advance(
     }
     if let Some(job) = slot.speech.as_ref().and_then(|s| s.depth) {
         e.fish_reset_slot(slot_idx)?;
+        if let Some(plan) = job.maya2 {
+            e.maya2_bind(slot_idx, plan)?;
+        }
         e.fish_logits_to_slot(slot_idx)?;
         let cond_row = e.prefill_terminal_row();
         // The pair's unconditional hidden goes back into `act.hn` beside the owner's.

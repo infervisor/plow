@@ -3107,7 +3107,12 @@ fn declare(
             edns: ex4[3],
         });
     }
-    if c.frame.as_ref().is_some_and(|f| f.depth.is_some()) {
+    if c
+        .frame
+        .as_ref()
+        .and_then(|f| f.depth.as_ref())
+        .is_some_and(|d| d.maya2.is_none())
+    {
         t.fish = Some(fish_depth::declare(b, c, dbatch));
     }
     if dspark::enabled() {
@@ -4378,11 +4383,13 @@ fn emit_phase(
             } else {
                 n.frame_codes
             };
-            // Maya 2: every decode row is a frame (token row dropped), no prefill row is.
+            // Maya 2: every decode row is a frame (token row dropped); prefill frame rows are the
+            // reference's, marked by their token.
+            let norm = if f.norm.is_some() { 2 } else { 0 };
             let (lo, frame_rows, mode) = match (f.decode_only, decode) {
                 (false, _) => (f.lo, f.rows, 0),
-                (true, false) => (0, 0, 0),
-                (true, true) => (0, c.vocab, 1 | if f.norm.is_some() { 2 } else { 0 }),
+                (true, false) => (f.lo, f.rows, 1 | norm),
+                (true, true) => (0, c.vocab, 1 | norm),
             };
             d.t[..6].copy_from_slice(&[n.x, n.emb, n.ids, n.frame_cb, codes, n.frame_norm]);
             d.i[..8].copy_from_slice(&[
@@ -11145,7 +11152,7 @@ fn emit_dense_gqa(
     } else if let Some(name) = ecfg.tts_profile.as_deref().filter(|_| !block_mode) {
         let profile = tts::profile(name).unwrap_or_else(|e| panic!("{e}"));
         assert!(
-            profile.depth == emitter.tn.fish.is_some(),
+            profile.depth == c.frame.as_ref().is_some_and(|f| f.depth.is_some()),
             "tts profile {name}: a depth-stage profile needs a frame-embedding checkpoint, and back"
         );
         sections.push(
@@ -11174,6 +11181,7 @@ fn emit_dense_gqa(
                 },
                 profile,
                 c.vocab,
+                &dir,
             )
             .unwrap_or_else(|error| panic!("speech packet pipeline: {error}")),
         );
@@ -11334,6 +11342,20 @@ fn emit_dense_gqa(
     }
     if let Some(t) = &emitter.tn.fish {
         sections.extend(fish_depth::sections(&c, &emitter.tn, t, &m, &rungs));
+    }
+    // Speech ops of auxiliary programs (not in `m.progs`), for the speech object's arm mask.
+    let mut aux_speech_ops = 0u64;
+    if c
+        .frame
+        .as_ref()
+        .and_then(|f| f.depth.as_ref())
+        .is_some_and(|d| d.maya2.is_some())
+    {
+        let n = &emitter.tn;
+        let (depth, ops) =
+            maya2_depth::lm_sections(&mut m, &c, n.hn, n.frame_dcodes, n.frame_codes, &rungs);
+        sections.extend(depth);
+        aux_speech_ops |= ops;
     }
     if let Some(t) = &emitter.tn.mtp {
         sections.extend(mtp::sections(&dir, &c, &emitter.tn, t, &m, &rung_progs));
@@ -11704,7 +11726,7 @@ fn emit_dense_gqa(
                 (encoder.prefix.model, section)
             });
     std::fs::write(&out, blob).unwrap();
-    let mut speech_ops = 0u64;
+    let mut speech_ops = aux_speech_ops;
     if let Some(dir) = ecfg.tts_codec.as_deref().filter(|_| !block_mode) {
         let sites = whole_graph_audio_sites().0;
         let fish = std::fs::read(dir.join("config.json"))

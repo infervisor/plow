@@ -940,10 +940,17 @@ async fn speech_with(
     };
     // Past the cap the reference budget clips the audio: a longer input is spoken in order as
     // sentence-sized segments, each with its full budget.
+    // Maya 2 guesses an unnamed language from the text's script.
+    let language = checked.language.clone().or_else(|| {
+        c.maya2
+            .as_ref()
+            .map(|_| super::maya2::detect_lang(&req.input).to_owned())
+    });
     let maker = SegmentMaker {
         tok: Arc::clone(tok),
         contract: c.clone(),
         voice: voice.clone(),
+        language,
         instructions: req
             .instructions
             .as_deref()
@@ -1209,7 +1216,13 @@ fn ref_clip(
     };
     let tok = model.encoder.as_ref().map_or(tok, |e| &e.tok);
     let mut ids = clone.head.clone();
-    ids.extend(tok.encode_with_special_tokens(&c.prompt_text(voice, None, text.trim()), false));
+    // Maya 2 (`icl`): the transcript in its own language, no speaker name.
+    let lang = c.maya2.as_ref().map(|_| super::maya2::detect_lang(text));
+    let voice = if c.maya2.is_some() { MAYA2_CLONE_VOICE } else { voice };
+    ids.extend(tok.encode_with_special_tokens(
+        &c.prompt_text(voice, lang, None, text.trim()),
+        false,
+    ));
     ids.extend_from_slice(&clone.mid);
     if model.encoder.as_ref().is_some_and(|e| ids.len() > e.rows()) {
         return Err((
@@ -1219,6 +1232,7 @@ fn ref_clip(
     }
     Ok(RefClip {
         ids,
+        lang: lang.map(str::to_owned),
         frames: pcm.len().div_ceil(enc.frame_samples),
         eos: clone.eos_code,
         pcm,
@@ -1242,10 +1256,17 @@ struct Segment {
     reference: Option<Arc<RefClip>>,
     gen: crate::serve::GenParams,
     chars: usize,
+    /// Index of the segment in its request.
+    k: usize,
 }
+
+/// The voice a Maya 2 clone renders as: the plain prompt (`icl` names no speaker).
+const MAYA2_CLONE_VOICE: &str = "plain";
 
 /// A request's voice-cloning reference.
 struct RefClip {
+    /// Maya 2: the transcript's language; a text in the same language repeats no language tag.
+    lang: Option<String>,
     /// The transcript's prompt segment (encoder ids with a text encoder, else token ids): the
     /// contract's clone head, the transcript, its mid.
     ids: Vec<u32>,
@@ -1290,6 +1311,8 @@ struct SegmentMaker {
     tok: Arc<dyn crate::text::tokenizer::Tokenize>,
     contract: SpeechContract,
     voice: String,
+    /// The template's `{language}`.
+    language: Option<String>,
     instructions: Option<String>,
     encoder: Option<Arc<super::text_encoder::TextEncoder>>,
     reference: Option<Arc<RefClip>>,
@@ -1315,10 +1338,18 @@ impl SegmentMaker {
         };
         let ids = |instructions: Option<&str>| {
             let mut ids = lead.clone();
-            ids.extend(tok.encode_with_special_tokens(
-                &c.prompt_text(&self.voice, instructions, text),
-                false,
-            ));
+            let mut prompt = match (&self.reference, &c.maya2) {
+                (Some(_), Some(_)) => {
+                    c.prompt_text(MAYA2_CLONE_VOICE, self.language.as_deref(), instructions, text)
+                }
+                _ => c.prompt_text(&self.voice, self.language.as_deref(), instructions, text),
+            };
+            if let (Some(r), Some(l)) = (&self.reference, &self.language) {
+                if r.lang.as_ref() == Some(l) {
+                    prompt = prompt.replacen(&format!("<|lang:{l}|>"), "", 1);
+                }
+            }
+            ids.extend(tok.encode_with_special_tokens(&prompt, false));
             ids.extend_from_slice(&c.suffix);
             ids
         };
@@ -1342,10 +1373,13 @@ impl SegmentMaker {
             prompt_ids = head;
         }
         let mut gen = crate::serve::GenParams::default();
-        gen.max_tokens = self
-            .max_tokens
-            .unwrap_or_else(|| c.max_new_tokens(text))
-            .min(c.max_new_tokens_cap);
+        gen.max_tokens = match &c.maya2 {
+            Some(_) => self.maya2_plan(text, k).cap as usize,
+            None => self
+                .max_tokens
+                .unwrap_or_else(|| c.max_new_tokens(text))
+                .min(c.max_new_tokens_cap),
+        };
         gen.params.temperature = self.temperature;
         gen.params.top_p = self.top_p;
         gen.params.repetition_penalty = self.repetition_penalty;
@@ -1365,11 +1399,34 @@ impl SegmentMaker {
             reference: self.reference.clone(),
             gen,
             chars: text.chars().count(),
+            k,
         }
     }
 }
 
 impl SegmentMaker {
+    /// Maya 2's controller plan for segment `k`: the request's cb0 sampling over the packet's
+    /// defaults, and the piece's frame budget and loop-guard windows.
+    fn maya2_plan(&self, text: &str, k: usize) -> super::maya2::Plan {
+        let c = &self.contract;
+        let ctl = c.maya2.as_ref().expect("maya2 contract");
+        let mut cb0 = ctl.cb0;
+        // `engine.py` clamps the temperature to [0.05, 2].
+        cb0.temperature = self.temperature.clamp(0.05, 2.0);
+        cb0.top_p = self.top_p;
+        cb0.presence_penalty = self.repetition_penalty;
+        if self.top_k > 0 {
+            cb0.top_k = self.top_k as u32;
+        }
+        ctl.plan(
+            text,
+            self.language.as_deref().unwrap_or("en"),
+            self.max_tokens,
+            cb0,
+            self.seed.wrapping_mul(1_000_003).wrapping_add(k as u64 * 7919),
+        )
+    }
+
     /// Append `text`'s segments: a text-encoder prompt is one launch, so a segment whose prompt
     /// exceeds the encoder is halved (at whitespace when it can) until each fits. `false` when a
     /// single character does not fit.
@@ -1519,6 +1576,7 @@ impl SegmentMaker {
                     semantic_base: c.audio_token_base,
                     stop_class: c.codebook,
                     stop_token: c.stops[0],
+                    maya2: c.maya2.as_ref().map(|_| self.maya2_plan(&s.text, s.k)),
                 }),
                 ..Default::default()
             })))

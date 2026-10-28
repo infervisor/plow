@@ -537,6 +537,69 @@ pub(crate) fn sections(
         .iter()
         .map(|&rows| program(c, n, t, &model.tensors, model.n_cu, rows, hidden_rows))
         .collect();
+    let bytes = encode(model.n_cu, model.tensors.len(), &programs, rungs);
+    let f = c.frame.as_ref().unwrap();
+    let h = |x: u32| u16::try_from(x).unwrap_or_else(|_| panic!("fish depth: handle {x}"));
+    let m = manifest::Manifest {
+        version: manifest::VERSION,
+        rows: rungs.to_vec(),
+        codebooks: f.codebooks,
+        semantic_base: f.lo,
+        semantic_tokens: f.rows,
+        stop_class: t.classes - 1,
+        ras_window: if t.d.breeze {
+            bitmap_words(t.classes)
+        } else {
+            RAS_WINDOW
+        },
+        sampler: if t.d.breeze {
+            manifest::Sampler::Breeze
+        } else {
+            manifest::Sampler::Fish
+        },
+        pair_cfg: t.d.breeze,
+        depth_sampling: None,
+        tensors: manifest::Tensors {
+            params: h(t.params),
+            top_k: h(t.top_k),
+            seed: h(t.seed),
+            step: h(t.step),
+            history: h(t.hist),
+            hidden_row: h(t.hrow),
+            frame_codes: h(n.frame_dcodes),
+            prompt_codes: h(n.frame_codes),
+            force: (t.force != TENSOR_NONE).then(|| h(t.force)),
+        },
+    };
+    eprintln!("  fish depth: {} programs (rows {rungs:?})", programs.len());
+    manifest_sections(&m, programs.len(), model.tensors.len(), bytes)
+}
+
+/// The two packet sections of a depth stage: its manifest and its programs.
+pub(crate) fn manifest_sections(
+    m: &manifest::Manifest,
+    programs: usize,
+    tensors: usize,
+    bytes: Vec<u8>,
+) -> Vec<SectionData> {
+    m.validate(programs, tensors)
+        .unwrap_or_else(|e| panic!("{e}"));
+    vec![
+        SectionData {
+            kind: SECT_METADATA,
+            name: manifest::SECTION.into(),
+            data: serde_json::to_vec(m).expect("fish_depth.json"),
+        },
+        SectionData {
+            kind: SECT_METADATA,
+            name: manifest::PROGRAMS_SECTION.into(),
+            data: bytes,
+        },
+    ]
+}
+
+/// Programs of `rows[k]` rows as an [`plow_asset::aux_program`] section (decode-rung roles).
+pub(crate) fn encode(n_cu: u32, tensors: usize, programs: &[Program], rungs: &[u32]) -> Vec<u8> {
     let packed: Vec<Vec<_>> = programs
         .iter()
         .map(|p| p.insts.iter().map(|d| d.pack()).collect())
@@ -560,53 +623,6 @@ pub(crate) fn sections(
             l2_domains: p.l2_domains,
         })
         .collect();
-    let bytes = plow_asset::aux_program::encode(model.n_cu, model.tensors.len(), &views)
-        .unwrap_or_else(|e| panic!("fish depth programs: {e}"));
-    let f = c.frame.as_ref().unwrap();
-    let h = |x: u32| u16::try_from(x).unwrap_or_else(|_| panic!("fish depth: handle {x}"));
-    let m = manifest::Manifest {
-        version: manifest::VERSION,
-        rows: rungs.to_vec(),
-        codebooks: f.codebooks,
-        semantic_base: f.lo,
-        semantic_tokens: f.rows,
-        stop_class: t.classes - 1,
-        ras_window: if t.d.breeze {
-            bitmap_words(t.classes)
-        } else {
-            RAS_WINDOW
-        },
-        sampler: if t.d.breeze {
-            manifest::Sampler::Breeze
-        } else {
-            manifest::Sampler::Fish
-        },
-        pair_cfg: t.d.breeze,
-        tensors: manifest::Tensors {
-            params: h(t.params),
-            top_k: h(t.top_k),
-            seed: h(t.seed),
-            step: h(t.step),
-            history: h(t.hist),
-            hidden_row: h(t.hrow),
-            frame_codes: h(n.frame_dcodes),
-            prompt_codes: h(n.frame_codes),
-            force: (t.force != TENSOR_NONE).then(|| h(t.force)),
-        },
-    };
-    m.validate(programs.len(), model.tensors.len())
-        .unwrap_or_else(|e| panic!("{e}"));
-    eprintln!("  fish depth: {} programs (rows {rungs:?})", programs.len());
-    vec![
-        SectionData {
-            kind: SECT_METADATA,
-            name: manifest::SECTION.into(),
-            data: serde_json::to_vec(&m).expect("fish_depth.json"),
-        },
-        SectionData {
-            kind: SECT_METADATA,
-            name: manifest::PROGRAMS_SECTION.into(),
-            data: bytes,
-        },
-    ]
+    plow_asset::aux_program::encode(n_cu, tensors, &views)
+        .unwrap_or_else(|e| panic!("depth programs: {e}"))
 }

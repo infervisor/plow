@@ -189,8 +189,9 @@ pub(crate) struct FrameEmbed {
     pub(crate) rows: u32,
     pub(crate) div: f32,
     pub(crate) depth: Option<FishDepth>,
-    /// Maya 2: every decode row is a frame row with no token row (`EmbedFrameBf16` mode bit 0) and
-    /// prefill rows never are; `norm` = (fp32 weight, eps) RMS-normalises it (mode bit 1).
+    /// Maya 2: every decode row is a frame row with no token row (`EmbedFrameBf16` mode bit 0), as
+    /// is a prefill row whose token is in `lo..lo + rows` (a cloning reference's frames); `norm` =
+    /// (fp32 weight, eps) RMS-normalises it (mode bit 1).
     pub(crate) decode_only: bool,
     pub(crate) norm: Option<(String, f32)>,
 }
@@ -203,6 +204,9 @@ pub(crate) struct Maya2Depth {
     pub(crate) levels: u32,
     pub(crate) groups: u32,
     pub(crate) group_of_level: Vec<u32>,
+    /// The depth sampler's engine-wide temperature and top-k (`maya2.sampling`).
+    pub(crate) temperature: f32,
+    pub(crate) top_k: u32,
 }
 
 /// Fish S2's per-frame depth transformer (`fish.depth.*`): `positions` steps over a fresh KV,
@@ -822,8 +826,8 @@ fn maya2_frame(f: &Value) -> FrameEmbed {
         table: "maya2.codebook_embed.weight".into(),
         codebooks: g("codebooks"),
         cb_size: g("codebook_size"),
-        lo: 0,
-        rows: 0,
+        lo: g("frame_token_lo"),
+        rows: g("codebook_size"),
         div: (1.0 / f["frame_scale"].as_f64().expect("maya2.frame_scale")) as f32,
         depth: Some(FishDepth {
             layers: u("layers"),
@@ -841,6 +845,12 @@ fn maya2_frame(f: &Value) -> FrameEmbed {
                 levels,
                 groups: u("groups"),
                 group_of_level,
+                temperature: f["sampling"]["depth_temperature"]
+                    .as_f64()
+                    .expect("maya2.sampling.depth_temperature") as f32,
+                top_k: f["sampling"]["depth_top_k"]
+                    .as_u64()
+                    .expect("maya2.sampling.depth_top_k") as u32,
             }),
         }),
         decode_only: true,

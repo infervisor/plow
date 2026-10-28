@@ -28,7 +28,7 @@ pub const PIPELINE: &str = "maya2.depth";
 /// Streams per launch.
 pub const CAPACITIES: &[u32] = &[1, 2, 4, 8, 16];
 
-struct Geo {
+pub(crate) struct Geo {
     hidden_in: u32,
     dim: u32,
     heads: u32,
@@ -42,6 +42,25 @@ struct Geo {
 }
 
 impl Geo {
+    /// An LM packet's DepthV2 (config `maya2` section, read into [`crate::config::FrameEmbed`]).
+    pub(crate) fn of(c: &crate::config::Cfg) -> Self {
+        let f = c.frame.as_ref().expect("maya2 frame embedding");
+        let d = f.depth.as_ref().expect("maya2 depth");
+        let m = d.maya2.as_ref().expect("maya2 depth");
+        Geo {
+            hidden_in: c.hidden,
+            dim: d.hidden,
+            heads: d.heads,
+            head_dim: d.head_dim,
+            inter: d.inter,
+            layers: d.layers,
+            levels: m.levels,
+            codes: f.cb_size,
+            eps: d.eps,
+            group_of_level: m.group_of_level.clone(),
+        }
+    }
+
     fn parse(v: &serde_json::Value) -> Result<Self, String> {
         let m = &v["maya2"];
         let d = &m["depth"];
@@ -96,53 +115,17 @@ pub fn lower_maya2_depth(
         .map_err(|e| format!("maya2 depth config: {e}"))?,
     )?;
     let bmax = CAPACITIES.iter().copied().max().unwrap_or(1);
-    let (b64, d, np) = (u64::from(bmax), u64::from(geo.dim), u64::from(geo.positions()));
+    let b64 = u64::from(bmax);
     let cb = u64::from(geo.levels + 1);
     let mut builder = packet::devbuild::Builder::new(n_cu);
     builder.set_tensor_dedup(true);
     let h = builder.tensor("in.depth.h", b64 * u64::from(geo.hidden_in) * 4);
-    for k in 0..geo.positions() {
-        builder.tensor(&format!("act.depth.eidx.{k}"), b64 * 4);
-    }
-    builder.tensor_init(
-        "in.depth.force",
-        vec![0xFF; (b64 * cb * 4) as usize],
-    );
-    builder.tensor("in.depth.params", b64 * 4 * 4);
-    builder.tensor("in.depth.ctl", b64 * 2 * 4);
-    builder.tensor("in.depth.seed", b64 * 8);
+    declare_io(&mut builder, &geo, bmax);
     let codes = builder.tensor("out.depth.codes", b64 * cb * 4);
     builder.tensor(
         "out.depth.logits",
         b64 * u64::from(geo.levels * geo.codes) * 4,
     );
-    for (name, width) in [
-        ("act.depth.p0", d),
-        ("act.depth.y", d),
-        ("act.depth.yn", d),
-        ("act.depth.logits", u64::from(geo.codes)),
-    ] {
-        builder.tensor(name, b64 * width * 4);
-    }
-    let qkv_w = 3 * d;
-    for (name, width) in [
-        ("act.depth.x", d),
-        ("act.depth.h1", d),
-        ("act.depth.at", d),
-        ("act.depth.qkv", qkv_w),
-        ("act.depth.f", u64::from(geo.inter)),
-    ] {
-        builder.tensor(name, b64 * np * width * 4);
-    }
-    for l in 0..geo.layers {
-        builder.tensor(&format!("act.depth.cache.{l}"), b64 * np * qkv_w * 4);
-    }
-    for level in 1..=geo.levels {
-        builder.tensor_init(
-            &format!("c.depth.len.{level}"),
-            (0..bmax).flat_map(|_| (level + 1).to_le_bytes()).collect(),
-        );
-    }
     let model = packet::devbuild::Model {
         n_cu,
         target,
@@ -162,7 +145,7 @@ pub fn lower_maya2_depth(
     let mut roles = BTreeMap::new();
     for &batch in CAPACITIES {
         let program = prefix.model.progs.len();
-        prefix = program_for(prefix, &geo, batch)?;
+        prefix = program_for(prefix, &geo, batch, &Io::Standalone)?;
         roles.insert(format!("depth.b{batch}.0"), program as u32);
     }
     prefix.output = codes;
@@ -200,6 +183,8 @@ struct Epilogue<'a> {
     /// LayerNorm (`{ln}.weight`, `{ln}.bias`, eps) of each x row before the matmul: fused into
     /// the GEMV's staged rows, a separate pass before the conv.
     ln: Option<(&'a str, f32)>,
+    /// x is bf16 (the LM's gathered final hidden), not f32.
+    x_bf16: bool,
 }
 
 impl Epilogue<'_> {
@@ -208,6 +193,7 @@ impl Epilogue<'_> {
         residual: None,
         gelu: false,
         ln: None,
+        x_bf16: false,
     };
 }
 
@@ -216,6 +202,27 @@ struct Chain {
     p: StageProgram,
     last: Option<u32>,
     n_cu: u32,
+    /// Weight-name prefix.
+    w: &'static str,
+}
+
+/// Where a depth program reads `h` and writes its codes.
+pub(crate) enum Io {
+    /// `in.depth.h` f32 rows in, `out.depth.codes` and every level's logits out (the gates).
+    Standalone,
+    /// Inside an LM packet: row `r` gathers its bf16 final-norm hidden from `hn` (of `hidden_rows`
+    /// rows) at `in.depth.hrow[r]`, takes the host-sampled cb0 from `act.depth.eidx.0`, and writes
+    /// all codes (cb0 in column 0) to `codes[r]` (the next decode step's frame input).
+    Lm { hn: u32, hidden_rows: u32, codes: u32 },
+}
+
+impl Io {
+    fn weights(&self) -> &'static str {
+        match self {
+            Io::Standalone => "w.maya2.depth",
+            Io::Lm { .. } => "maya2.depth",
+        }
+    }
 }
 
 impl Chain {
@@ -257,7 +264,7 @@ impl Chain {
         mut ep: Epilogue<'_>,
     ) -> Result<u32, String> {
         let mut x = x;
-        if rows <= GEMV_ROWS && (ep.ln.is_none() || k <= GEMV_LN_K) {
+        if ep.x_bf16 || (rows <= GEMV_ROWS && (ep.ln.is_none() || k <= GEMV_LN_K)) {
             let deps = self.deps();
             let o = p_handle(&self.p, out);
             let wh = self.p.declare(w, u64::from(n) * u64::from(k) * 2);
@@ -266,7 +273,7 @@ impl Chain {
                 let mut wd = |s: &str| self.p.declare(&format!("{name}.{s}"), u64::from(k) * 4);
                 (wd("weight"), wd("bias"), eps)
             });
-            let flags = 1 | 2 | if bh.is_some() { 4 } else { 0 } | if ep.residual.is_some() { 8 } else { 0 }
+            let flags = u32::from(!ep.x_bf16) | 2 | if bh.is_some() { 4 } else { 0 } | if ep.residual.is_some() { 8 } else { 0 }
                 | if ep.gelu { 1 << 4 } else { 0 }
                 | if ln.is_some() { 1 << 8 } else { 0 };
             let none = packet::dev::TENSOR_NONE;
@@ -393,7 +400,7 @@ impl Chain {
             &deps,
             GatherRowsF32Stage {
                 output: TensorRef::Named(out),
-                table: TensorRef::Named("w.maya2.depth.emb.weight"),
+                table: TensorRef::Named(&format!("{}.emb.weight", self.w)),
                 table_rows: vocab,
                 index: Some(index),
                 rows,
@@ -413,25 +420,63 @@ impl Chain {
     }
 }
 
-fn program_for(prefix: PacketPrefix, geo: &Geo, batch: u32) -> Result<PacketPrefix, String> {
+fn program_for(prefix: PacketPrefix, geo: &Geo, batch: u32, io: &Io) -> Result<PacketPrefix, String> {
     let (dim, qkv_w, np) = (geo.dim, 3 * geo.dim, geo.positions());
     let n_cu = prefix.model.n_cu;
+    let wp = io.weights();
     let mut c = Chain {
         p: prefix.program(),
         last: None,
         n_cu,
+        w: wp,
     };
-    let h = p_handle(&c.p, "in.depth.h");
     let x = p_handle(&c.p, "act.depth.x");
-    let codes = p_handle(&c.p, "out.depth.codes");
-    let p0 = c.dense(
+    let (h, codes, x_bf16) = match *io {
+        Io::Standalone => (p_handle(&c.p, "in.depth.h"), p_handle(&c.p, "out.depth.codes"), false),
+        Io::Lm { hn, hidden_rows, codes } => {
+            let hx = c.p.declare("act.depth.hx", u64::from(batch * geo.hidden_in) * 2);
+            let hrow = p_handle(&c.p, "in.depth.hrow");
+            let e = c.p.raw(DevOp::RowGather, u64::from(batch.min(n_cu)), &[], hx, |i| {
+                i.t[..3].copy_from_slice(&[hx, hn, hrow]);
+                i.i[..3].copy_from_slice(&[batch, geo.hidden_in, hidden_rows]);
+            })?;
+            c.done(e);
+            let cb0 = p_handle(&c.p, "act.depth.eidx.0");
+            let deps = c.deps();
+            let e = c.p.copy_cols_f32(
+                cb0,
+                &deps,
+                CopyColsF32Stage {
+                    output: TensorRef::Handle(codes),
+                    items: batch,
+                    rows: 1,
+                    cols: 1,
+                    in_item_stride: 1,
+                    in_stride: 1,
+                    in_offset: 0,
+                    out_item_stride: geo.levels + 1,
+                    out_stride: geo.levels + 1,
+                    out_offset: 0,
+                },
+                None,
+            )?;
+            c.done(e);
+            (hx, codes, true)
+        }
+    };
+    let pos0 = format!("{wp}.pos0");
+    let p0 = c.dense_ep(
         h,
         "act.depth.p0",
         batch,
         geo.hidden_in,
         dim,
-        "w.maya2.depth.in_proj.weight",
-        Some("w.maya2.depth.pos0"),
+        &format!("{wp}.in_proj.weight"),
+        Epilogue {
+            bias: Some(&pos0),
+            x_bf16,
+            ..Epilogue::NONE
+        },
     )?;
     let emb_rows = geo.levels * geo.codes;
     for level in 1..=geo.levels {
@@ -468,7 +513,7 @@ fn program_for(prefix: PacketPrefix, geo: &Geo, batch: u32) -> Result<PacketPref
             c.gather(idx, "act.depth.x", batch, dim, emb_rows, dim, 0)?;
         }
         for l in 0..geo.layers {
-            let w = |s: &str| format!("w.maya2.depth.groups.{g}.{l}.{s}");
+            let w = |s: &str| format!("{wp}.groups.{g}.{l}.{s}");
             let cache = format!("act.depth.cache.{l}");
             let n1 = w("n1");
             let pre = Epilogue {
@@ -558,7 +603,7 @@ fn program_for(prefix: PacketPrefix, geo: &Geo, batch: u32) -> Result<PacketPref
                 ..Epilogue::NONE
             };
             let f = c.dense_ep(x, "act.depth.f", rows, dim, geo.inter, &w("f1.weight"), gelu)?;
-            let cross = format!("w.maya2.depth.cross.{l}");
+            let cross = format!("{wp}.cross.{l}");
             let out = Epilogue {
                 bias: Some(&cross),
                 ..res
@@ -585,8 +630,9 @@ fn program_for(prefix: PacketPrefix, geo: &Geo, batch: u32) -> Result<PacketPref
         } else {
             x
         };
+        let norm = format!("{wp}.norm");
         let final_norm = Epilogue {
-            ln: Some(("w.maya2.depth.norm", geo.eps)),
+            ln: Some((&norm, geo.eps)),
             ..Epilogue::NONE
         };
         let logits = c.dense_ep(
@@ -595,10 +641,11 @@ fn program_for(prefix: PacketPrefix, geo: &Geo, batch: u32) -> Result<PacketPref
             batch,
             dim,
             geo.codes,
-            &format!("w.maya2.depth.heads.{}.weight", level - 1),
+            &format!("{wp}.heads.{}.weight", level - 1),
             final_norm,
         )?;
-        c.copy(
+        if matches!(io, Io::Standalone) {
+            c.copy(
             logits,
             "out.depth.logits",
             CopyColsF32Stage {
@@ -614,6 +661,7 @@ fn program_for(prefix: PacketPrefix, geo: &Geo, batch: u32) -> Result<PacketPref
                 out_offset: (level - 1) * geo.codes,
             },
         )?;
+        }
         let handles = [
             "in.depth.params",
             "in.depth.ctl",
@@ -705,4 +753,130 @@ fn section(
         name: SECTION.into(),
         data: serde_json::to_vec(&metadata).map_err(|e| e.to_string())?,
     })
+}
+
+/// Host-staged per-row tensors and scratch of the depth programs, sized for `bmax` rows.
+fn declare_io(b: &mut packet::devbuild::Builder, geo: &Geo, bmax: u32) {
+    let (b64, d, np) = (u64::from(bmax), u64::from(geo.dim), u64::from(geo.positions()));
+    let cb = u64::from(geo.levels + 1);
+    for k in 0..geo.positions() {
+        b.tensor(&format!("act.depth.eidx.{k}"), b64 * 4);
+    }
+    b.tensor_init("in.depth.force", vec![0xFF; (b64 * cb * 4) as usize]);
+    b.tensor("in.depth.params", b64 * 4 * 4);
+    b.tensor("in.depth.ctl", b64 * 2 * 4);
+    b.tensor("in.depth.seed", b64 * 8);
+    for (name, width) in [
+        ("act.depth.p0", d),
+        ("act.depth.y", d),
+        ("act.depth.yn", d),
+        ("act.depth.logits", u64::from(geo.codes)),
+    ] {
+        b.tensor(name, b64 * width * 4);
+    }
+    let qkv_w = 3 * d;
+    for (name, width) in [
+        ("act.depth.x", d),
+        ("act.depth.h1", d),
+        ("act.depth.at", d),
+        ("act.depth.qkv", qkv_w),
+        ("act.depth.f", u64::from(geo.inter)),
+    ] {
+        b.tensor(name, b64 * np * width * 4);
+    }
+    for l in 0..geo.layers {
+        b.tensor(&format!("act.depth.cache.{l}"), b64 * np * qkv_w * 4);
+    }
+    for level in 1..=geo.levels {
+        b.tensor_init(
+            &format!("c.depth.len.{level}"),
+            (0..bmax).flat_map(|_| (level + 1).to_le_bytes()).collect(),
+        );
+    }
+}
+
+/// DepthV2 as an LM packet's depth stage: one program per decode rung (row `r` = slot `r`), appended
+/// to `m`'s tensors, as the `fish_depth` sections of [`plow_asset::fish_depth::Sampler::Maya2`].
+pub(crate) fn lm_sections(
+    m: &mut packet::devbuild::Model,
+    c: &crate::config::Cfg,
+    hn: u32,
+    codes: u32,
+    prompt_codes: u32,
+    rungs: &[u32],
+) -> (Vec<packet::devbuild::SectionData>, u64) {
+    use plow_asset::fish_depth as manifest;
+    let geo = Geo::of(c);
+    let d = c
+        .frame
+        .as_ref()
+        .and_then(|f| f.depth.as_ref())
+        .and_then(|d| d.maya2.as_ref())
+        .unwrap();
+    let bmax = rungs.iter().copied().max().expect("decode rungs");
+    let hidden_rows = (m.tensors[hn as usize].bytes / (u64::from(c.hidden) * 2)) as u32;
+    let mut b = packet::devbuild::Builder::new(m.n_cu);
+    b.set_tensor_dedup(true);
+    b.adopt_tensors(std::mem::take(&mut m.tensors));
+    declare_io(&mut b, &geo, bmax);
+    b.tensor("in.depth.hrow", u64::from(bmax) * 4);
+    let mut prefix = PacketPrefix {
+        model: packet::devbuild::Model {
+            n_cu: m.n_cu,
+            target: m.target,
+            tensors: b.tensors(),
+            progs: Vec::new(),
+            kv_row_insts: Vec::new(),
+            prog_t: Vec::new(),
+            gen: Vec::new(),
+        },
+        programs: Vec::new(),
+        input: hn,
+        output: codes,
+        input_shape: Vec::new(),
+    };
+    let io = Io::Lm {
+        hn,
+        hidden_rows,
+        codes,
+    };
+    for &rows in rungs {
+        prefix =
+            program_for(prefix, &geo, rows, &io).unwrap_or_else(|e| panic!("maya2 depth: {e}"));
+    }
+    m.tensors = std::mem::take(&mut prefix.model.tensors);
+    let handle = |name: &str| {
+        let h = m.tensors.iter().position(|t| t.name == name).expect(name);
+        u16::try_from(h).expect("maya2 depth: tensor handle")
+    };
+    let ctl = handle("in.depth.ctl");
+    let man = manifest::Manifest {
+        version: manifest::VERSION,
+        rows: rungs.to_vec(),
+        codebooks: geo.levels + 1,
+        semantic_base: c.frame.as_ref().unwrap().lo,
+        semantic_tokens: geo.codes,
+        stop_class: geo.codes,
+        ras_window: 0,
+        sampler: manifest::Sampler::Maya2,
+        pair_cfg: false,
+        depth_sampling: Some([d.temperature.to_bits(), d.top_k]),
+        tensors: manifest::Tensors {
+            params: handle("in.depth.params"),
+            top_k: ctl,
+            seed: handle("in.depth.seed"),
+            step: ctl,
+            history: handle("act.depth.eidx.0"),
+            hidden_row: handle("in.depth.hrow"),
+            frame_codes: u16::try_from(codes).unwrap(),
+            prompt_codes: u16::try_from(prompt_codes).unwrap(),
+            force: Some(handle("in.depth.force")),
+        },
+    };
+    let bytes = crate::fish_depth::encode(m.n_cu, m.tensors.len(), &prefix.model.progs, rungs);
+    eprintln!("  maya2 depth: {} programs (rows {rungs:?})", rungs.len());
+    (
+        crate::fish_depth::manifest_sections(&man, rungs.len(), m.tensors.len(), bytes),
+        crate::manifest::speech_ops(&prefix.model),
+    )
 }
