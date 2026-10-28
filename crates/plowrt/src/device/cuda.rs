@@ -143,6 +143,10 @@ const ATTR_PAGEABLE_USES_HOST_PAGE_TABLES: i32 = 100;
 // CUfunction_attribute.
 const FUNC_ATTR_SHARED_SIZE_BYTES: i32 = 1;
 const FUNC_ATTR_MAX_DYNAMIC_SHARED_SIZE_BYTES: i32 = 8;
+/// `plow_small_copy` (shares the block store's embedded PTX).
+const SMALL_COPY_PTX: &str = include_str!("../../../../runtime/nvidia/kv_segcopy.ptx");
+/// Largest engine copy `plow_small_copy` takes instead of a cuMemcpy.
+const SMALL_COPY_MAX: usize = 16 << 10;
 // cuMemHostAlloc flags.
 const MEMHOSTALLOC_PORTABLE: u32 = 1;
 // cuMemHostRegister flags.
@@ -439,6 +443,10 @@ struct CudaFreer {
     /// (which all fail with the same sticky status) report at debug, not one
     /// warn per allocation — a poisoned engine teardown frees hundreds.
     poisoned: Arc<std::sync::OnceLock<DeviceErrorInfo>>,
+    /// Live [`PinnedHost`] allocations, start -> len: the ranges small copies may reach
+    /// through the UVA mapping (`plow_small_copy`). Holds only `host_alloc_pinned`'s
+    /// portable, not write-combined, allocations, whose host pointer is the device pointer.
+    pinned: Mutex<std::collections::BTreeMap<usize, usize>>,
 }
 
 // SAFETY: as CudaBackend — driver calls are thread-safe, handles are
@@ -584,6 +592,7 @@ impl PinnedHost {
 
 impl Drop for PinnedHost {
     fn drop(&mut self) {
+        self.keep.pinned.lock().remove(&(self.ptr as usize));
         // SAFETY: ptr from cuMemHostAlloc, freed exactly once.
         let rc = unsafe {
             let _ = bind_context(&self.keep.api, self.keep.ctx, self.keep.context_id);
@@ -679,6 +688,9 @@ pub struct CudaBackend {
     slab_pool: Mutex<Vec<(u64, u64)>>,
     /// Snapshot spill copies ([`CopyTier`]); `None` until the first spill.
     copy_tier: Mutex<Option<CopyTier>>,
+    /// `plow_small_copy`: engine copies up to [`SMALL_COPY_MAX`] bytes between device and pinned
+    /// host memory run on the SMs, never queued behind bulk copies on a copy engine.
+    small_copy: Option<KernelFn>,
     // Serialize driver mutations with metadata so rebinding cannot revive stale evidence.
     vmm_provenance: Mutex<super::provenance::VmmProvenance>,
     /// Set once, on the first fatal driver status ([`is_cuda_fatal`]): the
@@ -871,8 +883,9 @@ impl CudaBackend {
                 ctx: ctx as usize,
                 dev,
                 poisoned: Arc::clone(&poisoned),
+                pinned: Mutex::new(std::collections::BTreeMap::new()),
             });
-            Ok(CudaBackend {
+            let mut be = CudaBackend {
                 api,
                 tmap_encode,
                 ctx: ctx as usize,
@@ -894,8 +907,78 @@ impl CudaBackend {
                 copy_tier: Mutex::new(None),
                 vmm_provenance: Mutex::new(super::provenance::VmmProvenance::default()),
                 poisoned,
-            })
+                small_copy: None,
+            };
+            be.small_copy = be.load_small_copy();
+            Ok(be)
         }
+    }
+
+    /// `plow_small_copy` from the embedded PTX; `None` (cuMemcpy for every copy) where the
+    /// driver cannot JIT it.
+    fn load_small_copy(&self) -> Option<KernelFn> {
+        let mut image = SMALL_COPY_PTX.as_bytes().to_vec();
+        image.push(0);
+        let loaded = Backend::module_load(self, &image)
+            .and_then(|m| self.get_function(&m, "plow_small_copy"));
+        match loaded {
+            Ok(f) => Some(f),
+            Err(error) => {
+                tracing::debug!(%error, "small-copy kernel unavailable; engine copies stay on cuMemcpy");
+                None
+            }
+        }
+    }
+
+    /// The small-copy kernel for a copy of `bytes` between `dev` and the host range at `host`,
+    /// when every condition holds: small, 4-byte aligned, host side inside a live pinned
+    /// allocation.
+    fn small_copy_for(&self, host: usize, dev: u64, bytes: usize, max: usize) -> Option<KernelFn> {
+        let f = self.small_copy?;
+        if bytes == 0 || bytes > max || (bytes | host | dev as usize) % 4 != 0 {
+            return None;
+        }
+        let pinned = self.freer.pinned.lock();
+        let (&start, &len) = pinned.range(..=host).next_back()?;
+        (host + bytes <= start + len).then_some(f)
+    }
+
+    fn launch_small_copy(
+        &self,
+        f: KernelFn,
+        src: u64,
+        dst: u64,
+        bytes: usize,
+        stream: &CudaStream,
+    ) -> Result<()> {
+        let (mut src, mut dst, mut words) = (src, dst, (bytes / 4) as u32);
+        let grid = words.div_ceil(128).min(2 * self.sm_count);
+        let mut params = [
+            &mut src as *mut u64 as *mut c_void,
+            &mut dst as *mut u64 as *mut c_void,
+            &mut words as *mut u32 as *mut c_void,
+        ];
+        self.launch_kernel(f, grid, 128, 0, &mut params, Some(stream))
+    }
+
+    /// H2D of up to 1 GiB from a live pinned allocation on the SMs, off the copy engines (bulk
+    /// restores queue there); `false` = not eligible, nothing enqueued.
+    ///
+    /// # Safety
+    /// As [`Self::memcpy_htod_async`]: `src` stays valid and unchanged until the stream
+    /// reaches the copy's end.
+    pub unsafe fn pinned_htod_on_sms(
+        &self,
+        dptr: u64,
+        src: &[u8],
+        stream: &CudaStream,
+    ) -> Result<bool> {
+        self.bind()?;
+        let Some(f) = self.small_copy_for(src.as_ptr() as usize, dptr, src.len(), 1 << 30) else {
+            return Ok(false);
+        };
+        self.launch_small_copy(f, src.as_ptr() as u64, dptr, src.len(), stream)?;
+        Ok(true)
     }
 
     /// Encode the `tma_ws_gemm_bf16.cu` tensor-map recipe over a device tensor: rank-2
@@ -1808,6 +1891,10 @@ impl CudaBackend {
         stream: &CudaStream,
     ) -> Result<()> {
         self.bind()?;
+        if let Some(f) = self.small_copy_for(src.as_ptr() as usize, dptr, src.len(), SMALL_COPY_MAX)
+        {
+            return self.launch_small_copy(f, src.as_ptr() as u64, dptr, src.len(), stream);
+        }
         self.check(
             // SAFETY: caller upholds the lifetime/range contract above.
             unsafe {
@@ -1834,6 +1921,11 @@ impl CudaBackend {
         stream: &CudaStream,
     ) -> Result<()> {
         self.bind()?;
+        if let Some(f) =
+            self.small_copy_for(dst.as_mut_ptr() as usize, dptr, dst.len(), SMALL_COPY_MAX)
+        {
+            return self.launch_small_copy(f, dptr, dst.as_mut_ptr() as u64, dst.len(), stream);
+        }
         self.check(
             // SAFETY: caller upholds the lifetime/range contract above.
             unsafe {
@@ -1993,6 +2085,7 @@ impl CudaBackend {
     /// scarce OS resource, not just process memory).
     pub fn host_alloc_pinned(&self, bytes: usize) -> Result<PinnedHost> {
         let ptr = self.host_alloc(bytes)?;
+        self.freer.pinned.lock().insert(ptr as usize, bytes);
         Ok(PinnedHost {
             ptr,
             len: bytes,
