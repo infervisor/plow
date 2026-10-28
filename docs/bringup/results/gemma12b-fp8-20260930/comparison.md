@@ -640,3 +640,55 @@ or faster. Decode below rung 128 stays native per the 2026-10-26 measurement abo
 |---|---|---|---|---|---|---|
 | prefill | 1 x 1024 | 33.69 | 34.03 | +1.0% | 37 / 36 | equal |
 | prefill | 1 x 4096 | 136.13 | 136.54 | +0.3% | 36 / 36 | equal |
+
+## 2026-10-28: host KV tier cap
+
+Unset `PLOW_VMM_HOST_CACHE_MIB` sized the pinned host tier to `MemAvailable` less the reserve
+(`max(MemTotal/8, 16 GiB)`). On the 248 GiB lab host the server's RSS grew to 203-205 GiB within
+eight minutes of the 2.7/s replay and the tier froze with 31 GB available. Pinned pages are never
+reclaimed, so the earlier interleave-1024 grid lost its server at 16:23:56 with no log line,
+two minutes after a co-tenant `interp_sm90a` compile (22-38 GB per compiler process) started.
+The reserve covers plowrt's own non-tier memory and the OS. It leaves a co-tenant nothing.
+
+Production replay, plowrt c0d9e0d5, packet a0464475f8ab, 2 reps per rate, vLLM 0.29 baseline as
+before. Prefix token hit per cell (1.8 r1 / 2.7 r1 / 1.8 r2 / 2.7 r2):
+
+| host tier | peak RSS | token hit % | 1.8/s TTFT P99 | 2.7/s TTFT P99 | 2.7/s SLO met (r1 / r2) |
+|---|---|---|---|---|---|
+| unset (old default) | 203.5 GiB | 78.3 / 76.8 / 79.6 / 77.6 | 0.93x | 3.00x | 93.3 / 93.4% |
+| 128 GiB | 129.7 GiB | 78.3 / 76.8 / 79.6 / 77.6 | 0.98x | 1.93x | 99.3 / 88.8% |
+| 64 GiB | 65.6 GiB | 78.3 / 76.8 / 79.6 / 77.6 | 0.92x | 1.34x | 98.2 / 94.3% |
+| 32 GiB | 33.6 GiB | 78.0 / 75.8 / 79.3 / 74.1 | 1.34x | 1.30x | 99.5 / 89.1% |
+| unset, new default (MemTotal/4) | 64.0 GiB | 78.3 / 76.9 / 79.6 / 77.7 | 1.32x | 1.80x | 94.9 / 95.7% |
+
+- 64 GiB is the smallest measured cap within 1 pt of the unset hit rate (max -0.2 pt); 32 GiB
+  loses 3.5 pt in the second 2.7/s rep. The recipe sets `PLOW_VMM_HOST_CACHE_MIB = "65536"`.
+- TTFT P99 at 2.7/s spreads 1.3-5.3 s between reps of the same arm. The unset tier's 5.3 s rep
+  is the one in which the tier grew to 205 GiB.
+- plowrt default: the unset tier is now also bounded by `MemTotal/4` (`host_tier_default`), which
+  is 62 GiB on this host. In that run a co-tenant took host `MemAvailable` down to 44 GiB and
+  the server kept running. The reserve and the growth-time floor check are unchanged.
+  On a multi-GPU host each server still takes its own quarter.
+
+Evidence: `/opt/dlami/nvme/lava-tts/g12-decode/grid-{hmem1k,uncap,cap128,cap64,cap32,auto6}`
+(`mem.tsv` = 5 s RSS / MemAvailable samples).
+
+26B check of the new default (2026-10-28, plowrt e4ba03a09 = this change on prod-next, recipe serve
+env, `--prod-fidelity`, 2 reps per rate). The default tier peaked at 64 GiB RSS in every arm.
+
+| model, think | tier | token hit % (1.8 r1 / 2.7 r1 / 1.8 r2 / 2.7 r2) | TTFT P99 ms | TPOT P99 ms | goodput |
+|---|---|---|---|---|---|
+| 26B FP8 (caf6c4a47ba6), 10 s | default (62 GiB) | 78.4 / 77.1 / 79.8 / 78.2 | 321 / 460 / 272 / 516 | 25.9 / 38.4 / 22.3 / 54.2 | 100% all |
+| 26B FP8, 10 s | 128 GiB | 78.4 / 77.1 / 79.8 / 78.1 | 343 / 1002 / 310 / 478 | 26.3 / 95.3 / 26.9 / 54.9 | 99.2-100% |
+| 26B FP8, 10 s | 200 GiB (old default; 202 GiB RSS, 33 GiB left) | 78.4 / 77.1 / 79.7 / 78.1 | 340 / 453 / 1711 / 886 | 25.2 / 41.8 / 180.4 / 47.3 | 96.7-100% |
+| 26B FP8, 45 s | default | 69.6 / 67.9 / 68.9 / 68.4 | 446 / 506 / 332 / 500 | 20.8 / 34.9 / 20.1 / 45.9 | 100% all |
+| 26B FP8, 45 s | 200 GiB | 69.6 / 67.9 / 68.9 / 68.3 | 364 / 463 / 293 / 530 | 19.8 / 34.9 / 22.8 / 45.9 | 100% all |
+| 26B BF16 (f72d0330f9d8), 10 s, 1.8/s x4 | default | 77.7 / 78.8 / 77.8 / 78.9 | 4042 / 4493 / 5008 / 3793 | 107 / 118 / 107 / 101 | 92.2-95.8% |
+| 26B BF16, 10 s, 1.8/s x4 | 128 GiB | 77.9 / 78.8 / 78.0 / 78.6 | 2891 / 3451 / 2789 / 5193 | 120 / 108 / 120 / 113 | 89.4-95.7% |
+
+- The hit rate is equal within 0.1 pt in every comparison, including the 45 s think mix. The larger
+  tiers only add P99 outliers in the reps where they grow past 100 GiB.
+- 26B BF16 TTFT P99 is lower with 128 GiB in 3 of 4 reps, but TPOT P99 moves the other way.
+  The rank-sum p is about 0.34, and this step-bound recipe swings 3-13 s run to run. No cap set.
+
+Evidence: `/opt/dlami/nvme/lava-tts/g12-decode/g26/{fp8,bf16}-*`.
