@@ -226,6 +226,8 @@ mod remote {
     /// Bodies above this go up in parts of this size, so a checkpoint shard
     /// never sits in memory whole. R2 wants every part but the last equal.
     const PART: usize = 64 << 20;
+    /// Blobs up to this size go through the REST API as a single PUT.
+    const REST_SINGLE_PUT: usize = 2 << 30;
 
     /// The CLI runs `push` on its multi-thread runtime, which a nested
     /// `block_on` must step out of; a test calls in with no runtime at all.
@@ -263,8 +265,6 @@ mod remote {
                 part: PART,
             })
         }
-
-        #[cfg(test)]
         fn with_part_size(mut self, part: usize) -> Self {
             self.part = part;
             self
@@ -455,14 +455,21 @@ mod remote {
         let bucket = bucket.ok_or_else(|| {
             dist("no R2 bucket: r2://<account-id>/<bucket> or CLOUDFLARE_R2_BUCKET".into())
         })?;
-        let store: Arc<dyn ObjectStore> = if env("CLOUDFLARE_API_TOKEN")
+        let rest = env("CLOUDFLARE_API_TOKEN")
             .or_else(|| env("CF_API_TOKEN"))
-            .is_some()
-        {
+            .is_some();
+        let store: Arc<dyn ObjectStore> = if rest {
             Arc::new(
                 object_store::cloudflare::CloudflareR2Builder::from_env()
                     .with_account_id(&account)
                     .with_bucket_name(&bucket)
+                    // One PUT carries a whole blob (no multipart, below);
+                    // the client's 30 s default request timeout is far too
+                    // short for a 300 MiB packet on a home uplink.
+                    .with_client_options(
+                        object_store::ClientOptions::new()
+                            .with_timeout(std::time::Duration::from_secs(2 * 3600)),
+                    )
                     .build()
                     .map_err(|e| dist(format!("r2://{account}/{bucket}: {e}")))?,
             )
@@ -489,7 +496,16 @@ mod remote {
                     .map_err(|e| dist(format!("r2://{account}/{bucket}: {e}")))?,
             )
         };
-        Ok(Box::new(StoreSink::new(store)?))
+        let sink = StoreSink::new(store)?;
+        // The REST object API has no multipart route (`?uploads` answers
+        // "no route matches"), so through it a blob is one PUT; a ~300 MiB
+        // packet uploads that way in about a minute. The S3 endpoint keeps
+        // the default part size and multipart for anything larger.
+        Ok(Box::new(if rest {
+            sink.with_part_size(REST_SINGLE_PUT)
+        } else {
+            sink
+        }))
     }
 
     /// `s3://<bucket>`, with the standard `AWS_*` environment (region,
