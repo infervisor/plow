@@ -857,11 +857,14 @@ impl KvStore {
         let Some(b) = inner.block_mut(id) else {
             return;
         };
-        let (class, place) = (b.class, b.place);
+        let (class, place, idle) = (b.class, b.place, b.dependents == 0);
         match (refill, place) {
             (Some(h), Where::Device(slot)) => {
                 b.place = Where::Host(h);
                 b.state = State::Ready;
+                if idle {
+                    inner.host_reclaim[class].push_back(id);
+                }
                 let bytes = inner.classes[class].spec.block_bytes();
                 inner.classes[class].device.put(slot);
                 let st = &mut inner.stats.classes[class];
