@@ -6958,9 +6958,9 @@ fn gpu_prefill_batched_pass(
                 if !e.packed_slot_ready(i) || s.step != 0 || n == 0 || pf_pos + withheld >= n {
                     return None;
                 }
-                let publish = e
-                    .pf_publish_cap(i, pf_pos)
-                    .min(e.state_capture_cut(i, &s.prompt_ids, pf_pos));
+                let publish =
+                    e.pf_publish_cap(i, pf_pos)
+                        .min(e.state_capture_cut(i, &s.prompt_ids, pf_pos));
                 let mut remaining = e
                     .pf_plan_slice(n - withheld - pf_pos, chunk_cap)
                     .min(publish);

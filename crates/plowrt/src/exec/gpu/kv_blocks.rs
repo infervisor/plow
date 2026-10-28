@@ -539,14 +539,11 @@ impl GpuEngine {
                     // spills are queued already (past the deadline the publish is refused rather
                     // than queueing a burst on the copy engine the engine's readbacks share).
                     Err(RuntimeError::Oom(_))
-                        if bs
-                            .store
-                            .reap_wait(spill_deadline.saturating_duration_since(
-                                std::time::Instant::now(),
-                            ))
-                            || (bs.store.pending_spill_bytes()
-                                < crate::memory::vmm::SPILL_AHEAD_INFLIGHT_BYTES
-                                && kv.reclaim_one()) =>
+                        if bs.store.reap_wait(
+                            spill_deadline.saturating_duration_since(std::time::Instant::now()),
+                        ) || (bs.store.pending_spill_bytes()
+                            < crate::memory::vmm::SPILL_AHEAD_INFLIGHT_BYTES
+                            && kv.reclaim_one()) =>
                     {
                         continue
                     }
