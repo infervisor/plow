@@ -2876,6 +2876,9 @@ pub struct GpuEngine {
     span_launch: bool,
     /// Verdicts of token-batch verify spans not yet taken by the scheduler.
     tb_verdicts: Vec<(usize, u32, crate::orch::speculative::SpecVerdict)>,
+    /// The current token batch reached its first device launch: a failure before it left every
+    /// slot's KV, recurrent state and frontier untouched.
+    tb_launched: bool,
     /// Per slot, one past the highest KV row any launch wrote (verify writes past `pos`).
     kv_hw: Vec<u32>,
     /// Bench-only launch overrides ([`Self::set_debug_min_rung`], [`Self::set_debug_nsplit_kvlen`]).
@@ -7608,6 +7611,7 @@ impl GpuEngine {
             row_slot_twin,
             span_launch: false,
             tb_verdicts: Vec::new(),
+            tb_launched: false,
             kv_hw: vec![0; batch],
             debug_min_rows: 0,
             debug_nsplit_kvlen: None,
@@ -14134,6 +14138,7 @@ impl GpuEngine {
             self.qwen_pack
                 .extend(reqs.iter().map(|r| (r.slot, r.tokens.len() as u32)));
         }
+        self.tb_launched = true;
         // One async fill re-arms the bucket's counters AND its tail GQ cursor.
         let launched = (|| -> Result<()> {
             self.be

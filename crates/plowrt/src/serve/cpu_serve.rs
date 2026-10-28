@@ -813,6 +813,11 @@ impl SeqEngine for CpuServe {
         Ok(())
     }
 
+    /// `token_batch_step` points `lp_row` at each sampled row.
+    fn token_batch_logprobs(&self) -> bool {
+        true
+    }
+
     fn take_packed_tokens(&mut self) -> Vec<(usize, u32)> {
         std::mem::take(&mut self.packed_tokens)
     }
