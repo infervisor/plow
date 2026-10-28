@@ -502,6 +502,9 @@ struct Inner {
     spilling_bytes: u64,
     /// Blocks with an H2D copy in flight, oldest first ([`KvStore::restore_async`]).
     restoring: VecDeque<BlockId>,
+    /// Host slots of blocks being refilled on the device, kept until the fill seals: a failed
+    /// refill goes back to its host bytes, which other boundaries still depend on.
+    refilling: FxHashMap<BlockId, Slot<Host>>,
     /// Pinned chunks per class allocated ahead by [`KvStore::host_grow_step`] (a pinned
     /// allocation costs ~4 ms per 8 MiB; under the pool lock it was the host tier's TTFT tail).
     host_spare: Vec<Vec<Chunk<Host>>>,
@@ -675,6 +678,7 @@ impl KvStore {
                 spilling: VecDeque::new(),
                 spilling_bytes: 0,
                 restoring: VecDeque::new(),
+                refilling: FxHashMap::default(),
                 host_spare: (0..n_classes).map(|_| Vec::new()).collect(),
                 tick: 0,
                 stats,
@@ -754,7 +758,8 @@ impl KvStore {
         let tick = inner.tick;
         if let Some(&id) = inner.index.get(&(class, key)) {
             // A host-resident block is refilled from the rows being published (one more segment
-            // of the publish's launch), never copied back: the host slot goes.
+            // of the publish's launch), never copied back: the host slot goes once the fill
+            // seals.
             // A held host block is being read in place (a gather in flight): it stays where it
             // is and the publish takes it as present.
             let (refill, held_host) = match inner.block(id).map(|b| (b.place, b.holds)) {
@@ -768,7 +773,7 @@ impl KvStore {
                     let slot = self.device_slot(&mut inner, class)?;
                     let bytes = inner.classes[class].spec.block_bytes();
                     inner.classes[class].device.assign(slot, id);
-                    inner.classes[class].host.put(h);
+                    inner.refilling.insert(id, h);
                     let st = &mut inner.stats.classes[class];
                     st.host_blocks -= 1;
                     st.host_bytes -= bytes;
@@ -835,14 +840,41 @@ impl KvStore {
                 b.state = State::Ready;
             }
         }
+        if let Some(h) = inner.refilling.remove(&id) {
+            let class = inner.block(id).map(|b| b.class);
+            if let Some(class) = class {
+                inner.classes[class].host.put(h);
+            }
+        }
     }
 
+    /// A failed refill is back on the host, `Ready`: its host bytes never stopped being valid
+    /// and its other dependents keep reading them. Any other failed block is `Failed`.
     fn fail_id(&self, id: BlockId) {
         let mut inner = self.inner.lock();
-        if let Some(b) = inner.block_mut(id) {
-            b.state = State::Failed;
-        }
         inner.stats.fill_failures += 1;
+        let refill = inner.refilling.remove(&id);
+        let Some(b) = inner.block_mut(id) else {
+            return;
+        };
+        let (class, place, idle) = (b.class, b.place, b.dependents == 0);
+        match (refill, place) {
+            (Some(h), Where::Device(slot)) => {
+                b.place = Where::Host(h);
+                b.state = State::Ready;
+                if idle {
+                    inner.host_reclaim[class].push_back(id);
+                }
+                let bytes = inner.classes[class].spec.block_bytes();
+                inner.classes[class].device.put(slot);
+                let st = &mut inner.stats.classes[class];
+                st.device_blocks -= 1;
+                st.device_bytes -= bytes;
+                st.host_blocks += 1;
+                st.host_bytes += bytes;
+            }
+            _ => b.state = State::Failed,
+        }
     }
 
     pub fn state(&self, id: BlockId) -> Option<State> {
@@ -1166,6 +1198,9 @@ impl KvStore {
             e.gen = gen;
             inner.free_entries.push(id.index);
         }
+        if let Some(h) = inner.refilling.remove(&id) {
+            inner.classes[b.class].host.put(h);
+        }
         let bytes = inner.classes[b.class].spec.block_bytes();
         let c = &mut inner.classes[b.class];
         let st = &mut inner.stats.classes[b.class];
@@ -1383,6 +1418,29 @@ impl KvStore {
             st.device_bytes -= bytes;
             st.host_blocks += 1;
             st.host_bytes += bytes;
+        }
+    }
+
+    /// Retire landed spills, waiting up to `limit` for one while any is queued: `true` = spilled
+    /// bytes retired (their device slots are free). A publish refused for want of a device slot calls
+    /// this before asking the pool for another victim: each victim's spill lands
+    /// asynchronously, and without the wait the retry loop spilled every device boundary in
+    /// turn and then took host-resident ones.
+    pub fn reap_wait(&self, limit: std::time::Duration) -> bool {
+        let t0 = std::time::Instant::now();
+        loop {
+            let before = self.inner.lock().spilling_bytes;
+            if before == 0 {
+                return false;
+            }
+            self.reap();
+            if self.inner.lock().spilling_bytes < before {
+                return true;
+            }
+            if t0.elapsed() >= limit {
+                return false;
+            }
+            std::thread::sleep(std::time::Duration::from_micros(200));
         }
     }
 
@@ -2230,6 +2288,41 @@ mod tests {
         assert_eq!(s.state(a.id), Some(State::Filling));
     }
 
+    /// A boundary still depends on a host block a publish refills: the refill's failure must
+    /// leave those bytes servable (they were read as garbage from the fresh device slot).
+    #[test]
+    fn a_failed_refill_goes_back_to_its_host_bytes() {
+        let (_ops, s) = store(32, 64);
+        let mut a = s.acquire(0, key(1)).unwrap();
+        seal(&mut a);
+        assert!(s.spill(&[a.id]));
+        s.reap();
+        assert_eq!(s.location(a.id), Some(Location::Host));
+        let host_va = s.gather_src(a.id).unwrap().va;
+        let again = s.acquire(0, key(1)).unwrap();
+        assert!(again.fill.is_some(), "refilled on the device");
+        drop(again.fill);
+        s.release(&[a.id]);
+        assert_eq!(s.location(a.id), Some(Location::Host));
+        assert_eq!(s.state(a.id), Some(State::Ready));
+        let src = s.gather_src(a.id).unwrap();
+        assert!(src.from_host);
+        assert_eq!(src.va, host_va);
+        assert_eq!(
+            (
+                s.stats().classes[0].host_blocks,
+                s.stats().classes[0].device_blocks
+            ),
+            (1, 0)
+        );
+        // A sealed refill lets the host slot go.
+        let mut third = s.acquire(0, key(1)).unwrap();
+        seal(&mut third);
+        assert!(matches!(s.location(a.id), Some(Location::Device(_))));
+        assert_eq!(s.stats().classes[0].host_blocks, 0);
+        assert!(s.inner.lock().refilling.is_empty());
+    }
+
     #[test]
     fn spill_then_restore_round_trips_through_the_host_tier() {
         let (ops, s) = store(32, 64);
@@ -2283,6 +2376,29 @@ mod tests {
         assert_eq!(ops.htod.load(Ordering::SeqCst), 1);
         let _hold = s.hold(vec![a.id]);
         assert!(!s.spill(&[a.id]), "a held block stays");
+    }
+
+    #[test]
+    fn reap_wait_frees_the_slot_of_a_landed_spill_and_gives_up_on_a_stuck_one() {
+        let (ops, s) = store(32, 64);
+        let mut a = s.acquire(0, key(1)).unwrap();
+        seal(&mut a);
+        s.release(&[a.id]);
+        assert!(!s.reap_wait(std::time::Duration::ZERO), "nothing queued");
+        assert!(s.spill(&[a.id]));
+        ops.pending.store(true, Ordering::SeqCst);
+        assert!(
+            s.acquire(0, key(2)).is_err(),
+            "the spilling block keeps its slot"
+        );
+        assert!(
+            !s.reap_wait(std::time::Duration::from_millis(2)),
+            "still in flight"
+        );
+        ops.pending.store(false, Ordering::SeqCst);
+        assert!(s.reap_wait(std::time::Duration::from_millis(2)));
+        assert_eq!(s.location(a.id), Some(Location::Host));
+        assert!(s.acquire(0, key(2)).is_ok());
     }
 
     #[test]

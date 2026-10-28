@@ -233,17 +233,22 @@ pub(super) fn evict_one_tree(s: &Shared, inner: &mut Inner, preserve_hot: bool) 
         evict_unit(s, inner, id);
         return true;
     }
-    // Whole LRU radix leaves, never through a held, awaited or in-flight boundary.
+    // Whole LRU radix leaves, never through a held, awaited or in-flight boundary. Under the
+    // block store a leaf's boundaries hold no device bytes once they are on the host: dropping
+    // them frees nothing here (device pressure used to empty the host tier this way, one leaf per
+    // retry of a refused publish).
     let Inner {
         cache,
         published,
         awaited,
+        block_store,
         ..
     } = &mut *inner;
+    let device_only = block_store.is_some();
     let Some(key) = cache.evict_lru_where(|key| {
-        published
-            .get(&Some(key))
-            .is_none_or(|list| snapshots_free(list, awaited))
+        published.get(&Some(key)).is_none_or(|list| {
+            snapshots_free(list, awaited) && (!device_only || list.iter().all(Snap::on_device))
+        })
     }) else {
         return false;
     };
