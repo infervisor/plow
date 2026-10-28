@@ -127,9 +127,14 @@ async fn chat_completions_with(
     if think_budget == Some(0) {
         // Truncated thinking does worse than none at small budgets, so a zero budget renders the
         // template's thinking-off prompt rather than forcing the close at once.
+        let knob = defaults_of
+            .as_deref()
+            .and_then(|b| b.chat_template())
+            .and_then(|t| t.thinking_knob)
+            .map_or("enable_thinking", |(knob, _)| knob);
         req.chat_template_kwargs
             .get_or_insert_with(Default::default)
-            .insert("enable_thinking".into(), false.into());
+            .insert(knob.into(), false.into());
     }
 
     // S1 multi-model: a request for a managed, non-resident model triggers
@@ -987,7 +992,23 @@ pub(crate) fn response_stream(
         spec.as_ref(),
         mode,
         reasoning_open,
-        bundle.special_text().clone(),
+        if mode == crate::serve::reasoning::ReasoningMode::None {
+            let markers = bundle.reasoning().markers();
+            Arc::new(crate::serve::tools::SpecialText::new(
+                bundle
+                    .tokenizer()
+                    .special_tokens()
+                    .into_iter()
+                    .filter(|s| {
+                        !markers.is_some_and(|(open, close)| {
+                            open.contains(s.as_str()) || close.contains(s.as_str())
+                        })
+                    })
+                    .collect(),
+            ))
+        } else {
+            bundle.special_text().clone()
+        },
         stream,
     );
     if reenter {

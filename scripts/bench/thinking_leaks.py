@@ -139,6 +139,7 @@ def audit(a):
             r = {"arm": arm, "prompt": i, "seed": seed, "status": code, "checks": {}}
             if code != 200:
                 r["error"] = v
+                fails += 1
                 rows.append(r)
                 continue
             c = v["choices"][0]
@@ -162,6 +163,11 @@ def audit(a):
                 if usage["completion_tokens"] - rt > extra["max_reply_tokens"] + 1:
                     ck["answer_over_reply_cap"] = usage["completion_tokens"] - rt
             code_s, frames = post(a.url, {**base, "stream": True})
+            if code_s != 200:
+                ck["stream_error"] = {"status": code_s, "error": frames}
+                frames = []
+            elif any("error" in f for f in frames):
+                ck["stream_error"] = [f["error"] for f in frames if "error" in f]
             s_content = "".join(ch["delta"].get("content") or "" for f in frames for ch in f.get("choices", []))
             s_trace = "".join(ch["delta"].get("reasoning") or ch["delta"].get("reasoning_content") or ""
                               for f in frames for ch in f.get("choices", []))
@@ -190,6 +196,8 @@ def audit(a):
     no_room = {"status": code, "finish": v["choices"][0]["finish_reason"] if code == 200 else None,
                "content": (v["choices"][0]["message"].get("content") if code == 200 else None),
                "error": v.get("error", {}).get("message") if code != 200 else None}
+    if not rows:
+        fails += 1
     return rows, fails, no_room
 
 
@@ -252,7 +260,8 @@ def main():
         for r in rows:
             f.write(json.dumps(r, ensure_ascii=False) + "\n")
     text = report(a.name, rows, fails, no_room)
-    open(os.path.join(a.out, a.name + ".md"), "w").write(text)
+    with open(os.path.join(a.out, a.name + ".md"), "w") as f:
+        f.write(text)
     print(text)
     return 1 if fails else 0
 

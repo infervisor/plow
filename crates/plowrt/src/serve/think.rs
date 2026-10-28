@@ -52,6 +52,7 @@ pub struct ThinkMarkers {
     /// The special token that opens a trace block (Gemma 4's `<|channel>`; a label may follow).
     pub open: u32,
     pub close: u32,
+    pub channel_label: Option<String>,
     /// Ids whose text ends a line, sorted: forcing waits for one during the newline grace.
     pub newline: Vec<u32>,
 }
@@ -90,6 +91,9 @@ impl ThinkMarkers {
         Ok(ThinkMarkers {
             open: open_id,
             close: close_id,
+            channel_label: (o.len() > 1)
+                .then(|| open[text.len()..].to_string())
+                .filter(|label| !label.is_empty() && label.bytes().all(|b| b.is_ascii_alphabetic())),
             newline,
         })
     }
@@ -199,6 +203,8 @@ pub struct ThinkCtl {
     cut: Option<u32>,
     /// The last committed trace token ended a line.
     line_end: bool,
+    /// Alphabetic label bytes consumed and whether they still match the trace's label.
+    channel: Option<(usize, bool)>,
 }
 
 impl ThinkCtl {
@@ -224,6 +230,7 @@ impl ThinkCtl {
             reply_nl: false,
             cut: None,
             line_end: false,
+            channel: None,
         }
     }
 
@@ -235,8 +242,12 @@ impl ThinkCtl {
         self.blocks += 1;
     }
 
-    /// The id to commit for `sampled`. Called before the token is appended to the output.
-    pub fn commit(&mut self, sampled: u32) -> Commit {
+    pub fn needs_channel_text(&self) -> bool {
+        self.channel.is_some()
+    }
+
+    /// `text` is the sampled token decoded with specials kept, needed only during a channel label.
+    pub fn commit(&mut self, sampled: u32, text: &str) -> Commit {
         let mut c = Commit {
             token: sampled,
             replaced: false,
@@ -254,6 +265,36 @@ impl ThinkCtl {
                 self.phase = Phase::Reply;
             }
             return c;
+        }
+        if let Some(label) = self.m.channel_label.as_deref() {
+            if sampled == self.m.open {
+                self.channel = Some((0, true));
+                return c;
+            }
+            if sampled == self.m.close {
+                self.channel = None;
+            } else if let Some((mut n, mut matches)) = self.channel {
+                let letters = text.bytes().take_while(u8::is_ascii_alphabetic).count();
+                matches &= label.get(n..n.saturating_add(letters)) == Some(&text[..letters]);
+                n = n.saturating_add(letters);
+                if letters == text.len() {
+                    self.channel = Some((n, matches));
+                    return c;
+                }
+                self.channel = None;
+                if matches && n == label.len() {
+                    if self.phase != Phase::Trace {
+                        self.open_block();
+                    }
+                } else {
+                    self.phase = Phase::Reply;
+                    self.due = false;
+                    self.cut = None;
+                }
+                if &text[letters..] == "\n" {
+                    return c;
+                }
+            }
         }
         match self.phase {
             Phase::Deciding | Phase::Reply if sampled == self.m.open => self.open_block(),
@@ -370,7 +411,12 @@ impl ThinkCtl {
     /// block is due and `utf8_pending` (the last token left an incomplete codepoint) is false. A
     /// forced sequence the model already began is resumed, not repeated.
     pub fn arm(&mut self, out_ids: &[u32], utf8_pending: bool) {
-        if !self.due || utf8_pending || self.phase != Phase::Trace || self.forcing.is_some() {
+        if !self.due
+            || utf8_pending
+            || self.phase != Phase::Trace
+            || self.forcing.is_some()
+            || self.channel.is_some()
+        {
             return;
         }
         self.due = false;
@@ -386,10 +432,10 @@ impl ThinkCtl {
     /// How many tokens a chained path may produce before the host must see one: a replacement
     /// can only land on the last of them. `usize::MAX` when nothing can be replaced.
     pub fn chain_left(&self) -> usize {
-        if self.forcing.is_some() || self.due || self.steer_window() {
+        if self.forcing.is_some() || self.due || self.channel.is_some() || self.steer_window() {
             return 1;
         }
-        let n = match (self.lim.budget, self.phase) {
+        let mut n = match (self.lim.budget, self.phase) {
             (None, _) if self.cut.is_none() => usize::MAX,
             (b, Phase::Trace) => {
                 let end = b.unwrap_or(u32::MAX).min(self.cut.unwrap_or(u32::MAX)) as usize;
@@ -398,6 +444,15 @@ impl ThinkCtl {
             // The open marker, the block's budget, then the first forced id.
             (b, Phase::Deciding | Phase::Reply) => b.map_or(usize::MAX, |b| b as usize + 2),
         };
+        if let Some(((k, _), budget)) = self.lim.bias.close_ramp.zip(self.lim.budget) {
+            if k > 0 {
+                let left = budget.saturating_sub(k).saturating_sub(self.trace_n) as usize;
+                n = n.min(match self.phase {
+                    Phase::Trace => left.max(1),
+                    Phase::Deciding | Phase::Reply => budget.saturating_sub(k) as usize + 1,
+                });
+            }
+        }
         if self.lim.live.is_some() {
             n.min(LIVE_CHAIN as usize)
         } else {
@@ -412,7 +467,7 @@ impl ThinkCtl {
         match self.phase {
             // `early_exit_rank` and the first reply tokens follow any line end or close.
             Phase::Deciding | Phase::Trace
-                if b.early_exit_rank.is_some() || !b.reply_first.is_empty() =>
+                if b.early_exit_rank.is_some() || !b.reply_first.is_empty() || b.ban_reopen =>
             {
                 true
             }
@@ -444,6 +499,78 @@ impl ThinkCtl {
 mod tests {
     use super::*;
 
+    #[test]
+    fn channel_switches_end_the_trace_and_cap_the_reply() {
+        for label in ["response", "final", "thoughtful"] {
+            let mut t = ctl(Some(2), Some(2), &[CLOSE], 0, true);
+            Arc::get_mut(&mut t.m).unwrap().channel_label = Some("thought".into());
+            let mut out = vec![1];
+            t.commit(1, "plan");
+            t.commit(OPEN, "");
+            for ch in label.chars() {
+                let text = ch.to_string();
+                t.commit(200 + ch as u32, &text);
+                out.push(200 + ch as u32);
+                t.arm(&out, false);
+                assert_eq!(t.forced, 0);
+            }
+            t.commit(NL, "\n");
+            assert!(t.replying(), "{label}");
+            assert!(!t.commit(2, "Hi").capped);
+            assert!(t.commit(3, "there").capped);
+            assert_eq!(t.forced, 0);
+            assert_eq!(t.blocks, 1);
+        }
+    }
+
+    #[test]
+    fn channel_labels_open_only_thought_blocks() {
+        let mut t = ctl(Some(4), None, &[CLOSE], 0, false);
+        Arc::get_mut(&mut t.m).unwrap().channel_label = Some("thought".into());
+        t.commit(OPEN, "");
+        t.commit(1, "th");
+        t.commit(2, "ought");
+        t.commit(NL, "\n");
+        assert_eq!(t.blocks, 1);
+        assert!(!t.replying());
+        t.commit(OPEN, "");
+        t.commit(3, "thought\n");
+        assert_eq!(
+            t.blocks, 1,
+            "a repeated thought label does not reset the trace"
+        );
+        t.commit(CLOSE, "");
+        t.commit(OPEN, "");
+        t.commit(3, "thought\n");
+        assert_eq!(t.blocks, 2);
+        t.commit(OPEN, "");
+        t.commit(4, "response\nHello");
+        assert!(t.replying());
+        assert_eq!(t.reply_n, 1);
+    }
+
+    #[test]
+    fn chained_decode_stops_before_steering_can_change_the_next_sample() {
+        let mut t = ctl(Some(10), None, &[CLOSE], 0, true);
+        t.lim.bias.close_ramp = Some((4, 5.0));
+        let n = t.chain_left();
+        assert_eq!(n, 6);
+        for i in 0..n {
+            t.commit(if i + 1 == n { NL } else { 1 }, "");
+        }
+        assert_eq!(t.chain_left(), 1);
+        let mut bias = Vec::new();
+        t.next_bias(&mut bias);
+        assert!(!bias.is_empty());
+        let mut t = ctl(None, None, &[CLOSE], 0, true);
+        t.lim.bias.ban_reopen = true;
+        assert_eq!(
+            t.chain_left(),
+            1,
+            "a close can enable ban_reopen on any token"
+        );
+    }
+
     const OPEN: u32 = 100;
     const CLOSE: u32 = 101;
     const NL: u32 = 10;
@@ -458,6 +585,7 @@ mod tests {
         let m = Arc::new(ThinkMarkers {
             open: OPEN,
             close: CLOSE,
+            channel_label: None,
             newline: vec![NL],
         });
         ThinkCtl::new(
@@ -481,7 +609,7 @@ mod tests {
     fn run(t: &mut ThinkCtl, sampled: &[u32]) -> (Vec<u32>, bool) {
         let mut out = Vec::new();
         for &s in sampled {
-            let c = t.commit(s);
+            let c = t.commit(s, "");
             out.push(c.token);
             if c.capped {
                 return (out, true);
@@ -528,17 +656,17 @@ mod tests {
     #[test]
     fn a_sampled_id_equal_to_the_forced_one_is_not_a_replacement() {
         let mut t = ctl(Some(1), None, &[7, CLOSE], 0, true);
-        t.commit(1);
+        t.commit(1, "");
         t.arm(&[1], false);
         assert_eq!(
-            t.commit(7),
+            t.commit(7, ""),
             Commit {
                 token: 7,
                 replaced: false,
                 capped: false
             }
         );
-        assert!(t.commit(9).replaced);
+        assert!(t.commit(9, "").replaced);
     }
 
     #[test]
@@ -560,15 +688,15 @@ mod tests {
     fn a_blank_line_after_reply_text_ends_the_reply() {
         let mut t = ctl(None, None, &[CLOSE], 0, true);
         t.lim.stop_blank_line = true;
-        t.commit(1);
+        t.commit(1, "");
         assert_eq!(t.blank_line("plan\n\n"), None, "trace text");
-        t.commit(CLOSE);
+        t.commit(CLOSE, "");
         assert_eq!(t.blank_line("\n\n"), None, "the close marker's own text");
-        t.commit(2);
+        t.commit(2, "");
         assert_eq!(t.blank_line("\n \n"), None, "before any reply text");
-        t.commit(3);
+        t.commit(3, "");
         assert_eq!(t.blank_line("Theek hai.\n"), None);
-        t.commit(4);
+        t.commit(4, "");
         assert_eq!(t.blank_line(" \nAap"), Some(1));
     }
 
@@ -607,7 +735,7 @@ mod tests {
         };
         let mut b = Vec::new();
         let step = |t: &mut ThinkCtl, s: u32, b: &mut Vec<(u32, f32)>| {
-            t.commit(s);
+            t.commit(s, "");
             t.next_bias(b);
             b.clone()
         };
@@ -630,7 +758,7 @@ mod tests {
             "the ramp starts"
         );
         assert_eq!(step(&mut t, NL, &mut b), [(42, 1.0), (CLOSE, 6.0)]);
-        t.commit(CLOSE);
+        t.commit(CLOSE, "");
         t.next_bias(&mut b);
         assert_eq!(
             b,
@@ -652,17 +780,17 @@ mod tests {
         // the ramp window and the first reply tokens are host-fed; outside them chains run
         let mut t = ctl(Some(10), None, &[CLOSE], 0, true);
         t.lim.bias.close_ramp = Some((4, 5.0));
-        assert_eq!(t.chain_left(), 11);
+        assert_eq!(t.chain_left(), 6);
         for _ in 0..5 {
-            t.commit(1);
+            t.commit(1, "");
         }
         assert_eq!(t.chain_left(), 1, "trace_n 5: the ramp starts at 6");
         let mut t = ctl(Some(10), None, &[CLOSE], 0, true);
         t.lim.bias.reply_first = vec![(50, -5.0)];
         assert_eq!(t.chain_left(), 1, "a close could come next");
-        t.commit(CLOSE);
-        t.commit(5);
-        t.commit(6);
+        t.commit(CLOSE, "");
+        t.commit(5, "");
+        t.commit(6, "");
         assert_eq!(t.chain_left(), 12, "past the first two reply tokens");
     }
 
@@ -673,18 +801,18 @@ mod tests {
         let forced = [7, 8, 9, CLOSE];
         let mut t = ctl(Some(1), None, &forced, 0, true);
         t.lim.spec_forced = true;
-        t.commit(1);
+        t.commit(1, "");
         t.arm(&[1], false);
         assert_eq!(t.forced_ahead(), Some(&forced[..]));
         // the target accepts 7 and 8, then wants 5 where 9 was drafted
         let emitted = [7, 8, 5];
-        let committed: Vec<u32> = emitted.iter().map(|&s| t.commit(s).token).collect();
+        let committed: Vec<u32> = emitted.iter().map(|&s| t.commit(s, "").token).collect();
         assert_eq!(committed, [7, 8, 9]);
         assert_eq!(t.forced_ahead(), Some(&[CLOSE][..]));
         // all accepted, the bonus is the model's first reply token
-        assert_eq!(t.commit(CLOSE).token, CLOSE);
+        assert_eq!(t.commit(CLOSE, "").token, CLOSE);
         assert_eq!(t.forced_ahead(), None);
-        assert_eq!(t.commit(42).token, 42);
+        assert_eq!(t.commit(42, "").token, 42);
     }
 
     #[test]
@@ -701,15 +829,15 @@ mod tests {
     #[test]
     fn forcing_waits_for_a_complete_codepoint() {
         let mut t = ctl(Some(1), None, &[CLOSE], 0, true);
-        t.commit(1);
+        t.commit(1, "");
         t.arm(&[1], true);
         assert_eq!(
-            t.commit(2).token,
+            t.commit(2, "").token,
             2,
             "the codepoint's next byte is the model's"
         );
         t.arm(&[1, 2], false);
-        assert_eq!(t.commit(3).token, CLOSE);
+        assert_eq!(t.commit(3, "").token, CLOSE);
     }
 
     /// Chained paths fix a quantum of `chain_left()` tokens at its start; every replacement must
@@ -749,7 +877,7 @@ mod tests {
                 if rnd(16) == 0 {
                     live.store(true, Relaxed);
                 }
-                let c = t.commit(s);
+                let c = t.commit(s, "");
                 assert!(!c.replaced || left == 1, "replacement inside a quantum");
                 left -= 1;
                 out.push(c.token);

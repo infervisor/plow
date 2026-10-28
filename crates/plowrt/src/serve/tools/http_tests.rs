@@ -849,6 +849,7 @@ async fn request_fields_are_read_as_vllm_reads_them() {
 
 /// `max_tokens` landing inside a call's head (before its name is complete) used to return the
 /// head's syntax as the answer (`content: "call:get_weather"`); it is call framing, not text.
+#[cfg(feature = "hf-tokenizer")]
 #[tokio::test]
 async fn a_call_head_cut_by_max_tokens_is_not_content() {
     let h = harness();
@@ -877,6 +878,7 @@ async fn a_call_head_cut_by_max_tokens_is_not_content() {
 }
 
 /// Thinking-control request fields are validated, each refusal naming its field.
+#[cfg(feature = "hf-tokenizer")]
 #[tokio::test]
 async fn thinking_control_fields_are_validated() {
     let h = harness_for("gemma4-12b");
@@ -942,6 +944,75 @@ async fn a_zero_budget_turns_thinking_off() {
         "{}",
         h.last_prompt()
     );
+}
+
+#[tokio::test]
+async fn a_zero_budget_uses_deepseeks_thinking_switch() {
+    let h = harness_for("deepseek-v3.1");
+    h.reply(&["Four."]);
+    let (code, v) = h
+        .json(json!({
+            "messages": user("2+2?"),
+            "chat_template_kwargs": {"thinking": true},
+            "thinking_token_budget": 0
+        }))
+        .await;
+    assert_eq!(code, StatusCode::OK, "{v}");
+    assert!(h.last_prompt().ends_with("</think>"), "{}", h.last_prompt());
+}
+
+#[cfg(feature = "hf-tokenizer")]
+#[tokio::test]
+async fn raw_gemma_reasoning_preserves_markers_on_both_paths() {
+    let h = harness_for("gemma4-12b");
+    let raw = "<|channel>thought\nplan<channel|>Four.";
+    let pieces = toks(raw);
+    let pieces: Vec<&str> = pieces.iter().map(String::as_str).collect();
+    h.reply(&pieces);
+    let body = json!({
+        "messages": user("2+2?"),
+        "chat_template_kwargs": {"enable_thinking": true},
+        "reasoning_format": "none"
+    });
+    let (code, v) = h.json(body.clone()).await;
+    assert_eq!(code, StatusCode::OK, "{v}");
+    assert_eq!(v["choices"][0]["message"]["content"], raw);
+    assert!(v["choices"][0]["message"].get("reasoning").is_none());
+    let (frames, done) = h.sse(body).await;
+    assert!(done);
+    let (content, reasoning, _, _) = accumulate(&frames);
+    assert_eq!(content, raw);
+    assert!(reasoning.is_empty());
+}
+
+#[cfg(feature = "hf-tokenizer")]
+#[tokio::test]
+async fn gemma_control_counts_reply_tokens_after_a_channel_switch() {
+    use crate::serve::think::{ThinkCtl, ThinkLimits};
+    let h = harness_for("gemma4-12b");
+    let markers = h.bundle.think_markers().unwrap();
+    let mut t = ThinkCtl::new(
+        markers.clone(),
+        ThinkLimits {
+            reply_cap: Some(2),
+            forced_end: vec![markers.close].into(),
+            ..Default::default()
+        },
+        true,
+    );
+    for id in h
+        .bundle
+        .tokenizer()
+        .encode_with_special_tokens("plan<|channel>response\n", false)
+    {
+        let text = t
+            .needs_channel_text()
+            .then(|| h.bundle.tokenizer().decode_keep_special(&[id]));
+        t.commit(id, text.as_deref().unwrap_or(""));
+    }
+    assert!(t.replying());
+    assert!(!t.commit(u32::from(b'H'), "").capped);
+    assert!(t.commit(u32::from(b'i'), "").capped);
 }
 
 /// Model defaults apply under the request's fields; `thought_prefix` seeds the trace when
@@ -1234,6 +1305,7 @@ async fn responses_carry_the_fields_openai_vllm_and_llamacpp_clients_read() {
 /// The thinking budget, the reply cap and `max_tokens` are separate budgets; a thinking budget
 /// that leaves the reply no room inside `max_tokens` is refused rather than ending every turn
 /// inside its trace.
+#[cfg(feature = "hf-tokenizer")]
 #[tokio::test]
 async fn a_thinking_budget_must_leave_room_for_the_reply() {
     let h = harness_for("gemma4-12b");
@@ -1342,6 +1414,7 @@ async fn engine_flags_install_as_defaults_under_the_file_and_the_request() {
     );
 }
 
+#[cfg(feature = "hf-tokenizer")]
 fn harness_for_real_checkpoint(ckpt: &std::path::Path) -> Harness {
     static SEQ: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
     let n = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -1373,8 +1446,7 @@ fn harness_for_real_checkpoint(ckpt: &std::path::Path) -> Harness {
         r#"{"network":"toolm","gpu":"cpu","num_gpus":1,"parallel":"none","weight_shared":false,"buckets":[]}"#,
     )
     .unwrap();
-    let backend: Arc<dyn crate::device::Backend> =
-        Arc::new(crate::device::cpu::CpuBackend::new(1));
+    let backend: Arc<dyn crate::device::Backend> = Arc::new(crate::device::cpu::CpuBackend::new(1));
     let registry = crate::orch::Registry::new();
     let slug = registry.load(&dir, None).unwrap();
     let bundle = registry.get(&slug).unwrap();
@@ -1408,6 +1480,7 @@ fn harness_for_real_checkpoint(ckpt: &std::path::Path) -> Harness {
 
 /// Real Gemma-4-E2B checkpoint end-to-end on this host: template, real 32MB tokenizer,
 /// thought channel separation (<|channel>thought ... <channel|>), tool calls, and thinking controls.
+#[cfg(feature = "hf-tokenizer")]
 #[tokio::test]
 async fn gemma_4_e2b_real_checkpoint_end_to_end() {
     let e2b = std::path::Path::new("/Users/lava/models/gemma-4-E2B-it");

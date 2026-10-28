@@ -9104,7 +9104,10 @@ fn handle_produced_token(
     let mut token = token;
     let mut reply_capped = false;
     if let Some(t) = slot.gen.think.as_mut() {
-        let c = t.commit(token);
+        let text = t
+            .needs_channel_text()
+            .then(|| bundle.tokenizer().decode_keep_special(&[token]));
+        let c = t.commit(token, text.as_deref().unwrap_or(""));
         if c.replaced {
             // Sampled for the replaced id: neither its logprobs nor the device penalty
             // history's count describe the output any more.
@@ -11303,6 +11306,7 @@ mod tests {
             Arc::new(ThinkMarkers {
                 open: u32::from(b'{'),
                 close: u32::from(b'}'),
+                channel_label: None,
                 newline: vec![u32::from(b'\n')],
             }),
             ThinkLimits {
@@ -11356,6 +11360,61 @@ mod tests {
         );
     }
 
+    #[test]
+    fn a_channel_switch_ends_the_budget_and_starts_the_reply_cap() {
+        use crate::serve::think::{ThinkCtl, ThinkLimits, ThinkMarkers};
+        let bundle = prefill_test_bundle("think-channel");
+        let (mut slot, mut rx) = prefill_test_slot();
+        let s = slot.as_mut().unwrap();
+        s.gen.max_tokens = 64;
+        s.gen.think = Some(Box::new(ThinkCtl::new(
+            Arc::new(ThinkMarkers {
+                open: u32::from(b'{'),
+                close: u32::from(b'}'),
+                channel_label: Some("thought".into()),
+                newline: vec![u32::from(b'\n')],
+            }),
+            ThinkLimits {
+                budget: Some(2),
+                reply_cap: Some(2),
+                forced_end: [b'X', b'}'].map(u32::from).into(),
+                ..Default::default()
+            },
+            true,
+        )));
+        let mut tokens = 0;
+        for &b in b"a{response\nHiMore" {
+            handle_produced_token(
+                &mut slot,
+                &None,
+                &bundle,
+                u32::from(b),
+                1,
+                &mut tokens,
+                Some(&[]),
+            );
+            if slot.is_none() {
+                break;
+            }
+        }
+        assert!(slot.is_none());
+        let mut text = String::new();
+        let mut done = false;
+        while let Ok(chunk) = rx.try_recv() {
+            match chunk {
+                StreamChunk::Token { text: t, .. } => text.push_str(&t),
+                StreamChunk::Done { reason, usage, .. } => {
+                    assert!(matches!(reason, FinishReason::ReplyCap));
+                    assert_eq!(usage.think.unwrap().forced, 0);
+                    done = true;
+                }
+                StreamChunk::Err(e) => panic!("{e}"),
+            }
+        }
+        assert_eq!(text, "a{response\nHi");
+        assert!(done);
+    }
+
     /// Steering lands in the slot's `logit_bias` for the next sample, over the request's own.
     #[test]
     fn steering_sets_the_next_samples_logit_bias() {
@@ -11369,6 +11428,7 @@ mod tests {
             Arc::new(ThinkMarkers {
                 open: u32::from(b'{'),
                 close: u32::from(b'}'),
+                channel_label: None,
                 newline: vec![u32::from(b'\n')],
             }),
             ThinkLimits {
@@ -11411,6 +11471,7 @@ mod tests {
             Arc::new(ThinkMarkers {
                 open: u32::from(b'{'),
                 close: u32::from(b'}'),
+                channel_label: None,
                 newline: vec![u32::from(b'\n')],
             }),
             ThinkLimits {
