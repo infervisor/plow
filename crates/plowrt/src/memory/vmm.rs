@@ -1391,9 +1391,9 @@ struct HostTier {
     quarantined: u32,
 }
 
-/// Spill-ahead copies in flight before the thread waits for them to land (one boundary may
-/// exceed it).
-const SPILL_AHEAD_INFLIGHT_BYTES: u64 = 256 << 20;
+/// Spill copies in flight before a new boundary spill waits for them to land (the boundary that
+/// crosses it is queued whole).
+pub const SPILL_AHEAD_INFLIGHT_BYTES: u64 = 256 << 20;
 /// One pinned allocation per chunk of host tier slots.
 const HOST_CHUNK_BYTES: u64 = 1 << 30;
 /// Spills whose device buffer is still held; at the cap the oldest is waited for.
