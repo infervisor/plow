@@ -53,6 +53,13 @@
 # Production mix vs vLLM 0.29 (1.8 req/s): SLO met 88.2% -> 88.5% vs vLLM 100%, TPOT p50 49.5 ->
 # 37.6 ms vs 15.1; still behind: prefill ticks (mean 78 ms) block decode, the decode step itself
 # is within 1.0-1.2x of vLLM (bf16-decode/prod/report-g26bf16).
+# 2026-10-28 (branch bf16-decode, plowrt d18e6a707 = 96fc72699 small copies on the SMs +
+# 8708f9852 segment tables staged on the SMs, same packet f72d0330f9d8, serve env below): FP32 gate
+# PASS (kl_trim 0.0404 vs vLLM 0.0496, top1_decisive 0.9838, bf16-decode/gates2). Strict production
+# mix vs vLLM 0.29, MATCHED + EQUIVALENT (bf16-decode/prod/report-g26bf16-bfO): 1.8 sessions/s tok/s
+# 0.99x, SLO met 99.8% vs 100%, TTFT/TPOT P99 2.89x / 1.49x; 2.7 sessions/s tok/s 0.98x, SLO met
+# 84.6% vs 98.4% (repeat 2 overloads: admissions held by the KV budget at ~21 of 32 slots), TTFT /
+# TPOT P99 19.1x / 0.66x.
 schema = "plow.recipe.v1"
 namespace = "infervisor"
 name = "gemma-4-26b-a4b"
@@ -129,11 +136,24 @@ PLOW_PREFIX_CACHE = "1"
 # at 4K c16/c32, TTFT p99 +9..16% and FP8 agentic c128 -11% tok/s (p99 3.6x): narrow 4096 launches
 # cost ~8% more per row (2026-10-08 auto-vs-pin A/B, docs/bringup/results/gemma26b-h100-20261009).
 PLOW_PF_INTERLEAVE = "0"
-PLOW_VMM_LIVE_RINGS = "0"
+# Sliding rings mapped per admitted slot: the block store's device cap 12.8 -> 27.6 GiB.
+PLOW_VMM_LIVE_RINGS = "1"
 PLOW_MULTISTEP = "0"
 PLOW_DECODE_MAX_RUNG = "32"
 PLOW_PF_ATTN_GEMM_MIN_ROWS = "128"
 PLOW_PF_ATTN_GEMM_S32 = "1"
+# The FP8 recipe's serving set (its comments carry the per-knob evidence). On this packet,
+# production mix 2026-10-28 (bf16-decode/prod, 1 repeat each): goodput 1.8 / 2.7 req/s
+# 95.3 / 68.4% -> 98.1 / 86.2% with these knobs on plowrt 96fc72699.
+PLOW_VMM_PREFIX = "1"
+PLOW_LT_RUNG_ALGOS = "true"
+PLOW_PF_ITL_BUDGET_MS = "60"
+PLOW_PF_ITL_FORCE = "0"
+PLOW_DECODE_PIPELINE = "1"
+PLOW_VMM_RING_PARK = "8"
+PLOW_PF_ADMIT_OVERLAP = "1"
+PLOW_VMM_STRICT_PUBLISH = "1"
+PLOW_KV_POOL_MIB = "2048"
 
 [bench]
 backend = "openai"

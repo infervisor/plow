@@ -8032,16 +8032,23 @@ impl GpuEngine {
         };
         // `held` is read before the device query: a block the pre-mapper maps between the two
         // reads then counts in neither (free already shrank, held not yet grown), never in both.
-        let (held, floor) = if let Some(kv) = vmm.kv.as_ref() {
-            (kv.mapped_bytes(), kv.block_bytes())
-        } else if let Some(rings) = vmm.rings.as_ref() {
+        // A hybrid packet holds both: block-pool KV for its full layers and live sliding rings.
+        // Rings left out of `held` were charged twice, once as used device memory and again per
+        // request (`request_bytes`): 26B BF16 admitted ~21 of 32 slots under overload.
+        let rings_held = vmm.rings.as_ref().map(|rings| {
             let slot = rings.slot_charge();
             (
                 rings.stats().mapped_slots as u64 * slot + rings.spare_bytes(),
                 slot,
             )
-        } else {
-            return Some(budget);
+        });
+        let (held, floor) = match (vmm.kv.as_ref(), rings_held) {
+            (Some(kv), rings) => (
+                kv.mapped_bytes() + rings.map_or(0, |(bytes, _)| bytes),
+                kv.block_bytes(),
+            ),
+            (None, Some(rings)) => rings,
+            (None, None) => return Some(budget),
         };
         // The block store's slabs are cache the pool takes back on demand (`shrink` on the
         // OOM path), so they count as held like the multi-mapped cache blocks did; left out,
