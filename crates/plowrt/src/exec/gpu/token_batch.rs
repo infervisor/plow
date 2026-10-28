@@ -204,6 +204,7 @@ impl GpuEngine {
             RuntimeError::Rejected("CUDA unified token-batch capability unavailable".into())
         })?;
         let mut body_enqueued = false;
+        self.tb_launched = false;
         let verdicts_before = self.tb_verdicts.len();
         // Multimodal soft-token rows (bit 31): the prefill buckets this batch runs replace them
         // from the slab (MmRowsBf16).
@@ -211,6 +212,13 @@ impl GpuEngine {
             .handle_of(plow_asset::multimodal::TABLE_TENSOR)
             .is_some();
         let result = (|| {
+            // A verify span's rejected drafts roll back by frontier only: a recurrent state the
+            // scan advanced past them cannot be taken back (`spec_enable` refuses such packets).
+            if self.recurrent.is_some() && requests.iter().any(|r| r.phase == Phase::Verify) {
+                return Err(RuntimeError::Rejected(
+                    "CUDA token batch cannot verify on a recurrent chain".into(),
+                ));
+            }
             if requests.iter().any(|request| {
                 request.state_slot != request.slot
                     || request.selection != Selection::default()
@@ -574,6 +582,12 @@ impl GpuEngine {
         result.and(flushed)
     }
 
+    /// Whether the last token batch failed before its first device launch, so every slot it
+    /// named is exactly as it was and its rows may run another way.
+    pub fn token_batch_refused_before_launch(&self) -> bool {
+        !self.tb_launched
+    }
+
     /// Inside a launch window: whether the launch is still running on the device.
     pub(crate) fn launch_in_flight(&self) -> bool {
         self.window_open
@@ -821,6 +835,7 @@ mod tests {
         e.begin_slot(slot, 257).unwrap();
         let before = e.pos.clone();
         assert!(e.token_batch_step(&[stale], &mut output).is_err());
+        assert!(e.token_batch_refused_before_launch());
         assert!(output.is_empty());
         assert_eq!(e.pos, before);
         let duplicate = request(&e, 123, slot, Phase::Prefill, &token, 1);

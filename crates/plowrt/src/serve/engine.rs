@@ -306,6 +306,10 @@ pub trait SeqEngine {
     fn token_batch_member_fits_body(&self, _slot: usize, _rows: u32) -> bool {
         true
     }
+    /// Whether [`Self::logits_row`] serves the tokens a token batch sampled (OpenAI logprobs).
+    fn token_batch_logprobs(&self) -> bool {
+        false
+    }
     /// Run one token batch. `output` receives `(slot, id)` per leading row — the `feeds` in
     /// order, then the members whose prompt completes in this step — the same delivery shape
     /// the CUDA route's `token_batch_step` produces, so one mux arm reads both.
