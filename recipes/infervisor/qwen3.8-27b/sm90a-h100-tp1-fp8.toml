@@ -195,4 +195,8 @@ vllm_capture = { c1 = "{env:QWEN38_FP8_FP32_VLLM}", c8 = "{env:QWEN38_FP8_FP32_V
 # and top-1 criterion passing in both; nat-pride-8192 diverges in every batched run, vLLM's peers
 # included. The qualified result is the passing run at the default margin; whether this recipe
 # carries the BF16 recipe's 0.022 margin is an open gate-policy decision.
+# 2026-10-28: the perf-for-accuracy rule (docs/bringup/agent-tools.md "Gate relaxation for
+# significant perf gains") does not apply: the flip is on a re-emit with no kernel or route change
+# (c8 cont_decisive 44/45/44/45/44/45 of 46 over six runs vs the peer's 45), so there is no gain to
+# trade, and the current packet passes c1/c8/c32 at the default margin. Thresholds unchanged.
 
