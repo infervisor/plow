@@ -3594,6 +3594,9 @@ __device__ __forceinline__ void plow_gemv_l2pf(const PlowDevInst* in, void* cons
 #ifndef PLOW_NV_SEG_OCC1
 #define PLOW_NV_SEG_OCC1 0
 #endif
+#if !PLOW_NV_ENTRY_TRACE /* the trace stamps entry before the wait */
+PLOW_PDL_KERNEL(PLOW_SYM(interp_sm120))
+#endif
 #if PLOW_NV_SEG_WS384
 /* T31: 384-thread ws object — entry cap 160 (the 128-acc consumer path needs >=154; the
  * runtime pool after the entry split is 128x32 + 256x224 = 61440 <= 64K). */
@@ -3633,7 +3636,7 @@ __global__ __launch_bounds__(PLOW_NV_THREADS, PLOW_NV_MINBLK) void PLOW_SYM(inte
 #define PLOW_ET(k) do {} while (0)
 #endif
     PLOW_ET(0);
-    plow_pdl_wait();
+    plow_pdl_entry();
     PLOW_ET(1);
 #if PLOW_NV_SKELETON
 #ifndef PLOW_NV_SKEL_PAD
@@ -3949,8 +3952,10 @@ struct PlowLightSpan {
     PlowLightOp op[4];
 };
 #if PLOW_NV_GEMMA && PLOW_NV_W8A8 && PLOW_NV_THREADS == 256
+PLOW_PDL_KERNEL(PLOW_SYM(plow_sm120_light_norm_quant))
 extern "C" __global__ void __launch_bounds__(PLOW_NV_THREADS)
     PLOW_SYM(plow_sm120_light_norm_quant)(const __grid_constant__ PlowLightSpan a) {
+    plow_pdl_entry();
     __shared__ float part[32];
     const PlowLightOp& n = a.op[0];
     const PlowLightOp& q = a.op[1];
@@ -4042,15 +4047,19 @@ extern "C" __global__ void __launch_bounds__(PLOW_NV_THREADS)
     }
 }
 #endif
+PLOW_PDL_KERNEL(PLOW_SYM(plow_sm120_light))
 extern "C" __global__ void __launch_bounds__(PLOW_NV_THREADS)
     PLOW_SYM(plow_sm120_light)(const __grid_constant__ PlowLightOp a) {
+    plow_pdl_entry();
     __shared__ float part[32];
     const PlowDevInst* in = &a.d;
     const unsigned slice = blockIdx.x, nblk = gridDim.x;
 #define LIGHT_TEN(k) (a.t[k])
 #else
+PLOW_PDL_KERNEL(PLOW_SYM(plow_sm120_light))
 extern "C" __global__ void __launch_bounds__(PLOW_NV_THREADS) PLOW_SYM(plow_sm120_light)(PlowProgram prog,
                                                                                     unsigned inst) {
+    plow_pdl_entry();
     __shared__ float part[32];
     const PlowDevInst* in = prog.insts + inst;
     void* const* T = prog.tensors;
@@ -4125,8 +4134,10 @@ extern "C" __global__ void __launch_bounds__(PLOW_NV_THREADS) PLOW_SYM(plow_sm12
 #define PLOW_LIGHT_PF_BOUNDS __launch_bounds__(PLOW_NV_THREADS)
 #define PLOW_LIGHT_PF_MINBLOCKS 1
 #endif
+PLOW_PDL_KERNEL(PLOW_SYM(plow_sm120_light_pf))
 extern "C" __global__ void PLOW_LIGHT_PF_BOUNDS PLOW_SYM(plow_sm120_light_pf)(PlowProgram prog,
                                                                               unsigned inst) {
+    plow_pdl_entry();
     __shared__ float part[32];
     const PlowDevInst* in = prog.insts + inst;
     void* const* T = prog.tensors;
@@ -4212,8 +4223,10 @@ extern "C" __global__ void PLOW_LIGHT_PF_BOUNDS PLOW_SYM(plow_sm120_light_pf)(Pl
 extern "C" __device__ unsigned PLOW_SYM(plow_light_pf_qwen_conv) = 1;
 /* A routed decode rung's QwenRmsNorm on its own entry, one block per row: the register-resident
  * row walk (d_qwen_rmsnorm<true, true>) spilled under light_pf's two-blocks-per-SM cap. */
+PLOW_PDL_KERNEL(PLOW_SYM(plow_sm120_light_qnorm))
 extern "C" __global__ void __launch_bounds__(PLOW_NV_THREADS)
     PLOW_SYM(plow_sm120_light_qnorm)(PlowProgram prog, unsigned inst) {
+    plow_pdl_entry();
     __shared__ float part[32];
     const PlowDevInst* in = prog.insts + inst;
     void* const* T = prog.tensors;
@@ -4229,8 +4242,10 @@ extern "C" __global__ void __launch_bounds__(PLOW_NV_THREADS)
 extern "C" __device__ unsigned PLOW_SYM(plow_light_gemma) = 1;
 /* The logits tail (SoftCap, Argmax, ArgmaxFin): its own kernel, so the light kernel's code for
  * the per-layer ops stays as it was (these cases in it slowed NormResidual/GluStrided ~2 us). */
+PLOW_PDL_KERNEL(PLOW_SYM(plow_sm120_light_tail))
 extern "C" __global__ void __launch_bounds__(PLOW_NV_THREADS)
     PLOW_SYM(plow_sm120_light_tail)(const __grid_constant__ PlowLightOp a) {
+    plow_pdl_entry();
     __shared__ unsigned long long part[PLOW_NV_WARPS];
     const PlowDevInst* in = &a.d;
     const unsigned slice = blockIdx.x, nblk = gridDim.x;
@@ -4253,8 +4268,10 @@ extern "C" __global__ void __launch_bounds__(PLOW_NV_THREADS)
  * chunk's packed maximum in part[b * P + c], P = the Argmax instruction's part stride; the other
  * parts of the row are zeroed. The same values and keys as the two instructions, so ArgmaxFin
  * picks the same token. */
+PLOW_PDL_KERNEL(PLOW_SYM(plow_sm120_light_capmax))
 extern "C" __global__ void __launch_bounds__(PLOW_NV_THREADS)
     PLOW_SYM(plow_sm120_light_capmax)(const __grid_constant__ PlowLightSpan a) {
+    plow_pdl_entry();
     __shared__ unsigned long long lds[PLOW_NV_WARPS];
     const PlowDevInst* sc = &a.op[0].d;
     const PlowDevInst* am = &a.op[1].d;
@@ -4305,9 +4322,11 @@ struct PlowLightX {
  * FlashDecode) as its own kernels: `count` independent instructions from `inst` on, block `b`
  * running slice `b` of each. Only these two bodies are compiled in, so the flash row-group loop
  * keeps its registers (the interpreter entry is at the 255-register cap and spills). */
+PLOW_PDL_KERNEL(PLOW_SYM(plow_sm120_light_attn))
 extern "C" __global__ void __launch_bounds__(PLOW_NV_THREADS, 1)
     PLOW_SYM(plow_sm120_light_attn)(PlowProgram prog, unsigned inst, unsigned count,
                                     PlowLightX xs) {
+    plow_pdl_entry();
     extern __shared__ float arena[];
     void* const* T = prog.tensors;
     for (unsigned i = inst; i < inst + count; i++) {
@@ -4369,8 +4388,10 @@ extern "C" __device__ unsigned PLOW_SYM(plow_light_attn_hd) = PLOW_NV_FA_HD;
  * on the streamed body, bit-identical to the row-group one (d_flash_decode_stream). `hnr[0..3]`
  * = the q, k, v HeadNormRope instructions it folds in (~0u: none, Q is already roped); their x
  * may be a fused q|k|v row (`xs`, as in light_attn). */
+PLOW_PDL_KERNEL(PLOW_SYM(plow_sm120_light_flash))
 extern "C" __global__ void __launch_bounds__(FA_ST_THREADS, 1)
     PLOW_SYM(plow_sm120_light_flash)(PlowProgram prog, unsigned inst, uint4 hnr, PlowLightX xs) {
+    plow_pdl_entry();
     extern __shared__ __align__(128) unsigned char st_arena[];
     void* const* T = prog.tensors;
 #define LIGHT_TEN(in, k) ((in)->t[k] == PLOW_TENSOR_NONE ? nullptr : T[(in)->t[k]])
@@ -4414,12 +4435,14 @@ extern "C" __device__ unsigned PLOW_SYM(plow_light_flash_smem) = FA_ST_SMEM_BYTE
  * `ids` non-null: also the greedy argmax the packet's Argmax/ArgmaxFin pair would compute (same
  * packed keys, so the same token): each block folds its chunk into best[row], and the row's last
  * block writes ids[row] and re-zeroes best/ctr for the next launch. */
+PLOW_PDL_KERNEL(PLOW_SYM(plow_sm120_light_head))
 extern "C" __global__ void __launch_bounds__(PLOW_NV_THREADS)
     PLOW_SYM(plow_sm120_light_head)(__nv_bfloat16* __restrict__ C, const __nv_bfloat16* __restrict__ x,
                                     const __nv_bfloat16* __restrict__ W,
                                     const __nv_bfloat16* __restrict__ src, unsigned N, unsigned K,
                                     unsigned n0, int* __restrict__ ids,
                                     unsigned long long* __restrict__ best, unsigned* __restrict__ ctr) {
+    plow_pdl_entry();
     __shared__ unsigned long long lds[PLOW_NV_WARPS];
     /* C's rows are only 2-byte aligned (odd N): 16-byte loads from src, restaged through smem
      * so each store instruction writes 64 contiguous bytes. */
@@ -4645,19 +4668,25 @@ __device__ __forceinline__ void light_attn_gemma(const PlowLightSpan& a, float* 
 #undef LIGHT_TEN
     }
 }
+PLOW_PDL_KERNEL(PLOW_SYM(plow_sm120_light_attn))
 extern "C" __global__ void __launch_bounds__(PLOW_NV_THREADS, 1)
     PLOW_SYM(plow_sm120_light_attn)(const __grid_constant__ PlowLightSpan a) {
+    plow_pdl_entry();
     extern __shared__ float arena[];
     light_attn_gemma<true>(a, arena);
 }
+PLOW_PDL_KERNEL(PLOW_SYM(plow_sm120_light_attn_s))
 extern "C" __global__ void __launch_bounds__(PLOW_NV_THREADS, 2)
     PLOW_SYM(plow_sm120_light_attn_s)(const __grid_constant__ PlowLightSpan a) {
+    plow_pdl_entry();
     extern __shared__ float arena[];
     light_attn_gemma<false>(a, arena);
 }
 #if PLOW_NV_LIGHT_FP8_ATTN && PLOW_FP8_KV
+PLOW_PDL_KERNEL(PLOW_SYM(plow_sm120_light_fp8_flash256))
 extern "C" __global__ void __launch_bounds__(PLOW_NV_THREADS, 2)
     PLOW_SYM(plow_sm120_light_fp8_flash256)(const __grid_constant__ PlowLightSpan a) {
+    plow_pdl_entry();
     const PlowDevInst* in = &a.op[0].d;
     if (a.count != 1 || a.fused || in->op != PLOW_DOP_FLASH_DECODE_FP8 || in->i[6] != 256)
         __trap();
@@ -4720,21 +4749,27 @@ __device__ __forceinline__ unsigned rider_nsplit(const PlowRiderAttn& a) {
         a.opart, a.mlpart, a.q, (const __nv_bfloat16*)a.k, (const __nv_bfloat16*)a.v, a.kv_len, \
         rider_rows(a), a.n_head, a.n_kv_head, a.kv_stride, a.window, a.scale, rider_nsplit(a),  \
         a.kv_mask, blockIdx.x, gridDim.x, arena, 0u, a.k_scale, a.v_scale, a.slot)
+PLOW_PDL_KERNEL(PLOW_SYM(plow_sm120_rider_flash256))
 extern "C" __global__ void __launch_bounds__(PLOW_NV_THREADS, 2)
     PLOW_SYM(plow_sm120_rider_flash256)(const __grid_constant__ PlowRiderAttn a) {
+    plow_pdl_entry();
     extern __shared__ float arena[];
     if (a.hd != 256u || (a.n_head / a.n_kv_head) % 2u) __trap();
     PLOW_RIDER_FLASH(256, 2);
 }
+PLOW_PDL_KERNEL(PLOW_SYM(plow_sm120_rider_flash512))
 extern "C" __global__ void __launch_bounds__(PLOW_NV_THREADS, 1)
     PLOW_SYM(plow_sm120_rider_flash512)(const __grid_constant__ PlowRiderAttn a) {
+    plow_pdl_entry();
     extern __shared__ float arena[];
     if (a.hd != 512u || (a.n_head / a.n_kv_head) % PLOW_NV_FA_GF_FULL) __trap();
     PLOW_RIDER_FLASH(512, PLOW_NV_FA_GF_FULL);
 }
 #undef PLOW_RIDER_FLASH
+PLOW_PDL_KERNEL(PLOW_SYM(plow_sm120_rider_merge))
 extern "C" __global__ void __launch_bounds__(PLOW_NV_THREADS)
     PLOW_SYM(plow_sm120_rider_merge)(const __grid_constant__ PlowRiderAttn a) {
+    plow_pdl_entry();
     const unsigned rows = rider_rows(a), nsplit = rider_nsplit(a);
     if (a.hd == 256u)
         d_flash_merge<256>(a.out, a.opart, a.mlpart, rows, a.n_head, nsplit, blockIdx.x, gridDim.x);
@@ -4765,8 +4800,10 @@ struct PlowStateCopy {
     const int* table;
     unsigned n, units, to_scratch, tstride, tslot, pad;
 };
+PLOW_PDL_KERNEL(PLOW_SYM(plow_sm120_state_copy))
 extern "C" __global__ void __launch_bounds__(PLOW_NV_THREADS)
     PLOW_SYM(plow_sm120_state_copy)(const __grid_constant__ PlowStateCopy a) {
+    plow_pdl_entry();
     const unsigned i = blockIdx.y;
     if (i >= a.n) return;
     const int slot = a.table[(size_t)a.tstride * i + a.tslot];
@@ -4804,8 +4841,10 @@ struct PlowGdnRide {
      * QwenGdnStep segment (table null: row b is slot b). */
     const int* active;
 };
+PLOW_PDL_KERNEL(PLOW_SYM(plow_sm120_gdn_ride))
 extern "C" __global__ void __launch_bounds__(PLOW_NV_THREADS)
     PLOW_SYM(plow_sm120_gdn_ride)(const __grid_constant__ PlowGdnRide a) {
+    plow_pdl_entry();
     extern __shared__ float arena[];
     d_qwen_gdn_step<true>(a.out, a.qkv, a.a, a.b, a.alog, a.dt_bias, a.state, a.active, a.hk, a.hv,
         a.kdim, a.vdim, a.n, a.scale, a.eps, a.alog_f32, blockIdx.x, gridDim.x, arena,
@@ -4915,8 +4954,10 @@ extern "C" int PLOW_SYM(plow_sm120_launch)(PlowProgram* prog, int grid, cudaStre
 #if defined(PLOW_NV_GLU_QUANT_CACHE) && PLOW_NV_GLU_QUANT_CACHE && PLOW_NV_PREFILL && PLOW_NV_SEGMENTS && PLOW_NV_THREADS == 256
 /* ABI 2: any 8-aligned width <= 16384 (i[1]); ABI 1 objects hardcode width 15360. */
 extern "C" __device__ unsigned PLOW_SYM(plow_glu_quant_cache_abi) = 2;
+PLOW_PDL_KERNEL(PLOW_SYM(plow_glu_quant_cached))
 extern "C" __global__ void __launch_bounds__(256, 2) PLOW_SYM(plow_glu_quant_cached)(PlowProgram prog,
                                                                                  unsigned inst) {
+    plow_pdl_entry();
     __shared__ float part[8];
     const PlowDevInst* in = prog.insts + inst;
     void* const* t = prog.tensors;
@@ -4932,8 +4973,10 @@ extern "C" __global__ void __launch_bounds__(256, 2) PLOW_SYM(plow_glu_quant_cac
 }
 /* The same rows without the bf16 GLU store, for an instruction whose output tensor nothing reads. */
 extern "C" __device__ unsigned PLOW_SYM(plow_glu_quant_cache_q_abi) = 2;
+PLOW_PDL_KERNEL(PLOW_SYM(plow_glu_quant_cached_q))
 extern "C" __global__ void __launch_bounds__(256, 2) PLOW_SYM(plow_glu_quant_cached_q)(PlowProgram prog,
                                                                                    unsigned inst) {
+    plow_pdl_entry();
     __shared__ float part[8];
     const PlowDevInst* in = prog.insts + inst;
     void* const* t = prog.tensors;
@@ -4953,8 +4996,10 @@ extern "C" __global__ void __launch_bounds__(256, 2) PLOW_SYM(plow_glu_quant_cac
 /* A plain QuantFp8 (no GLU) of a 4096- or 8192-wide row per CTA (any grid). */
 #if PLOW_NV_W8A8
 extern "C" __device__ unsigned PLOW_SYM(plow_quant_cached_abi) = 1;
+PLOW_PDL_KERNEL(PLOW_SYM(plow_quant_cached))
 extern "C" __global__ void __launch_bounds__(256, 2) PLOW_SYM(plow_quant_cached)(PlowProgram prog,
                                                                              unsigned inst) {
+    plow_pdl_entry();
     __shared__ float part[8];
     const PlowDevInst* in = prog.insts + inst;
     void* const* t = prog.tensors;
@@ -4974,8 +5019,10 @@ extern "C" __global__ void __launch_bounds__(256, 2) PLOW_SYM(plow_quant_cached)
  * the interpreter's. The fat object runs them on one CTA per SM. */
 #if defined(PLOW_NV_ROPE_PF) && PLOW_NV_ROPE_PF && !PLOW_MIXED_STEP
 extern "C" __device__ unsigned PLOW_SYM(plow_rope_pf_abi) = 1;
+PLOW_PDL_KERNEL(PLOW_SYM(plow_rope_pf))
 extern "C" __global__ void __launch_bounds__(256) PLOW_SYM(plow_rope_pf)(PlowProgram prog,
                                                                          unsigned inst) {
+    plow_pdl_entry();
     void* const* t = prog.tensors;
     const PlowDevInst* in = prog.insts + inst;
     const unsigned slice = blockIdx.x, nblk = gridDim.x;
@@ -5023,8 +5070,10 @@ extern "C" __global__ void __launch_bounds__(256) PLOW_SYM(plow_rope_pf)(PlowPro
  * threshold) instead of one warp per row, which left 7 of 8 warps idle there; a smaller grid keeps
  * the interpreter's warp-per-row order. */
 extern "C" __device__ unsigned PLOW_SYM(plow_norm_rms_pf_abi) = 2;
+PLOW_PDL_KERNEL(PLOW_SYM(plow_norm_rms_pf))
 extern "C" __global__ void __launch_bounds__(256, 2) PLOW_SYM(plow_norm_rms_pf)(PlowProgram prog,
                                                                             unsigned inst) {
+    plow_pdl_entry();
     __shared__ float part[32];
     void* const* t = prog.tensors;
 #define NRP_TEN(d, k) ((d)->t[k] == PLOW_TENSOR_NONE ? nullptr : t[(d)->t[k]])

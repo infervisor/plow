@@ -86,7 +86,7 @@ impl CutlassFp8 {
         let module = be.module_load(&image)?;
         let lib = Self {
             be: Arc::clone(be),
-            functions: [KernelFn(0); CONFIGS],
+            functions: [KernelFn(0, false); CONFIGS],
             params_bytes: [0; CONFIGS],
             module,
             prepare,

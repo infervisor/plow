@@ -87,6 +87,14 @@ const CHUNK_PUBLISH_QUALIFIED: Status = Status::Qualified {
 const STALE_RESERVE_QUALIFIED: Status = Status::Qualified {
     evidence: &["docs/runtime/throughput-audit.md §6: E4B H100 unique-prompt T4 A/B, admission ensure_rows p50 1154 -> 1 us, c64 3405/3010 -> 3482/3482 tok/s, g32 TTFT 100/142 -> 56/56 ms, nsys c64 GPU idle 5.0 -> 3.0%; sessions 64 calls later TTFT 39.8 -> 34.1 ms, cached 0.87 unchanged"],
 };
+/// Inert on objects without `plow_pdl_entry__<kernel>` markers (runtime/nvidia/pdl.cuh).
+const PDL_CANDIDATE: Status = Status::Candidate {
+    evidence: &[
+        "2026-10-28 H100 step_bench, same cubins, pinned cuBLASLt algorithms, PLOW_PDL=0 vs 1: digests identical on Qwen3.8 BF16 B1-B32 (ctx 1024/4094/4095/8191), Gemma-4 26B FP8 B1-B64, 26B BF16 B8/B32, 12B B1-B32; decode step within +-0.2% (Qwen B32 26.0 vs 26.0 ms, 26B FP8 B32 13.39 vs 13.38 ms): no qualified gain",
+        "a marked kernel waits for its prerequisite grids before any memory access (scripts/bench/pdl_audit.py checks the SASS at campaign build)",
+    ],
+};
+
 const PROMOTED: Status = Status::Qualified {
     evidence: &["docs/flags-reference.md: a promoted default; `=false` is the rollback"],
 };
@@ -676,6 +684,7 @@ pub const RUNTIME: &[KnobSpec] = &[
     KnobSpec::new("rt.lt_fp8_fast_accum_max_k", Some("PLOW_LT_FP8_FAST_ACCUM_MAX_K"), Layer::Runtime, U32, UNSET, OPT_IN),
     KnobSpec::new("rt.pf_norm_row_blocks", Some("PLOW_PF_NORM_ROW_BLOCKS"), Layer::Runtime, U32, Default::Static(Val::Nat(0)), OPT_IN),
     KnobSpec::new("rt.cutlass_fp8_decode", Some("PLOW_CUTLASS_FP8_DECODE"), Layer::Runtime, Domain::Str, UNSET, OPT_IN).with(C_CUTLASS_FP8_DECODE),
+    KnobSpec::new("rt.pdl", Some("PLOW_PDL"), Layer::Runtime, Domain::Bool, OFF, PDL_CANDIDATE),
     KnobSpec::new("rt.decode_light", Some("PLOW_DECODE_LIGHT"), Layer::Runtime, Domain::Bool, ON, PROMOTED),
     KnobSpec::new("rt.decode_light_flash", Some("PLOW_DECODE_LIGHT_FLASH"), Layer::Runtime, Domain::Bool, ON, PROMOTED),
     KnobSpec::new("rt.tb_split_attn", Some("PLOW_TB_SPLIT_ATTN"), Layer::Runtime, Domain::Bool, ON, PROMOTED),

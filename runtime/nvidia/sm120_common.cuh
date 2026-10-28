@@ -24,6 +24,8 @@
 #define PLOW_NV_LANE_MASK 31u
 #define PLOW_NV_WARP_SHIFT 5u
 
+#include "pdl.cuh"
+
 /* Programmatic dependent launch (host: CudaBackend::launch_cooperative_pdl). A kernel launched
  * with programmatic stream serialization may start while its predecessor drains; this blocks
  * until the predecessor has completed and flushed. Call it before the first read of anything

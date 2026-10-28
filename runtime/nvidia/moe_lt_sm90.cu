@@ -124,8 +124,10 @@ __device__ void moe_lt_norm_row(__nv_bfloat16* out, const __nv_bfloat16* row,
 }
 
 /* Decode route, ABI 2 objects' chain: xn2[r] = norm(x[r]). One block per row (grid = rows). */
+PLOW_PDL_KERNEL(plow_moe_lt_norm)
 extern "C" __global__ void plow_moe_lt_norm(__nv_bfloat16* xn2, const __nv_bfloat16* x,
                                             const __nv_bfloat16* gamma, unsigned H, float eps) {
+    plow_pdl_entry();
     moe_lt_norm_row(xn2 + (size_t)blockIdx.x * H, x + (size_t)blockIdx.x * H, gamma, H, eps);
 }
 
@@ -145,21 +147,25 @@ __device__ void moe_lt_setup_tables(int* rows, unsigned long long* ptrs, const i
     }
 }
 
+PLOW_PDL_KERNEL(plow_moe_lt_setup)
 extern "C" __global__ void plow_moe_lt_setup(int* rows, unsigned long long* ptrs, const int* meta,
                                              unsigned long long xs, unsigned long long gu,
                                              unsigned long long fu, unsigned long long dn,
                                              unsigned n_exp, unsigned H, unsigned I) {
+    plow_pdl_entry();
     if (blockIdx.x == 0) moe_lt_setup_tables(rows, ptrs, meta, xs, gu, fu, dn, n_exp, H, I);
 }
 
 /* Decode route, ABI 3: setup + norm + gather in one launch. Block b normalizes live rows b,
  * b+nblk, ... straight from x[row_token[r]] with the norm's own partition, so xs is
  * bit-identical to the three-kernel chain and xn2 is never written. */
+PLOW_PDL_KERNEL(plow_moe_lt_norm_gather)
 extern "C" __global__ void plow_moe_lt_norm_gather(
     __nv_bfloat16* xs, const __nv_bfloat16* x, const __nv_bfloat16* gamma,
     const unsigned* row_token, int* rows, unsigned long long* ptrs, const int* meta,
     unsigned long long gu, unsigned long long fu, unsigned long long dn, unsigned n_exp,
     unsigned H, unsigned I, float eps, unsigned nblk) {
+    plow_pdl_entry();
     if (blockIdx.x == 0)
         moe_lt_setup_tables(rows, ptrs, meta, (unsigned long long)xs, gu, fu, dn, n_exp, H, I);
     __shared__ unsigned pre[PLOW_NV_THREADS + 1u];
@@ -171,9 +177,11 @@ extern "C" __global__ void plow_moe_lt_norm_gather(
 }
 
 /* xs[r] = xn2[row_token[r]] for every live gathered row. H % 8 == 0. */
+PLOW_PDL_KERNEL(plow_moe_lt_gather)
 extern "C" __global__ void plow_moe_lt_gather(__nv_bfloat16* xs, const __nv_bfloat16* xn2,
                                               const unsigned* row_token, const int* meta,
                                               unsigned n_exp, unsigned H, unsigned nblk) {
+    plow_pdl_entry();
     __shared__ unsigned pre[PLOW_NV_THREADS + 1u];
     const unsigned live = moe_lt_live_prefix(pre, meta, n_exp);
     for (MoeLtCursor k(blockIdx.x, nblk, H / 8u); k.row < live; k.next()) {
@@ -183,9 +191,11 @@ extern "C" __global__ void plow_moe_lt_gather(__nv_bfloat16* xs, const __nv_bflo
 }
 
 /* fu[r] = act(gu[r][0..I)) * gu[r][I..2I) for every live gathered row. I % 8 == 0. */
+PLOW_PDL_KERNEL(plow_moe_lt_glu)
 extern "C" __global__ void plow_moe_lt_glu(__nv_bfloat16* fu, const __nv_bfloat16* gu,
                                            const int* meta, unsigned n_exp, unsigned I,
                                            unsigned act, unsigned nblk) {
+    plow_pdl_entry();
     __shared__ unsigned pre[PLOW_NV_THREADS + 1u];
     const unsigned live = moe_lt_live_prefix(pre, meta, n_exp);
     for (MoeLtCursor k(blockIdx.x, nblk, I / 8u); k.row < live; k.next()) {
@@ -209,11 +219,13 @@ extern "C" __global__ void plow_moe_lt_glu(__nv_bfloat16* fu, const __nv_bfloat1
  * scatter stores it, the combine is op70's k = 8 body (slot order, float4 partition, warp sums
  * folded by thread 0), and the NRN is the interpreter's d_norm_residual_norm.
  * k == 8, H % 8 == 0 and H <= 12 * 256 are checked on the host. */
+PLOW_PDL_KERNEL(plow_moe_lt_combine_nrn)
 extern "C" __global__ void plow_moe_lt_combine_nrn(
     __nv_bfloat16* hn, __nv_bfloat16* x, __nv_bfloat16* comb, const __nv_bfloat16* dn,
     const unsigned* row_partidx, const float* row_gate, const int* meta,
     const __nv_bfloat16* h1, const __nv_bfloat16* g_pf2, const __nv_bfloat16* g_po,
     const __nv_bfloat16* gn, unsigned n_exp, unsigned H, float eps_comb, float eps, float scale) {
+    plow_pdl_entry();
     constexpr unsigned K = 8u;
     __shared__ unsigned pre[PLOW_NV_THREADS + 1u];
     __shared__ unsigned slot_row[K];
@@ -282,10 +294,12 @@ extern "C" __global__ void plow_moe_lt_combine_nrn(
 }
 
 /* part[row_partidx[r]] = f32(dn[r]) * row_gate[r] for every live gathered row. H % 8 == 0. */
+PLOW_PDL_KERNEL(plow_moe_lt_scatter)
 extern "C" __global__ void plow_moe_lt_scatter(float* part, const __nv_bfloat16* dn,
                                                const unsigned* row_partidx, const float* row_gate,
                                                const int* meta, unsigned n_exp, unsigned H,
                                                unsigned nblk) {
+    plow_pdl_entry();
     __shared__ unsigned pre[PLOW_NV_THREADS + 1u];
     const unsigned live = moe_lt_live_prefix(pre, meta, n_exp);
     for (MoeLtCursor k(blockIdx.x, nblk, H / 8u); k.row < live; k.next()) {
@@ -304,11 +318,13 @@ extern "C" __global__ void plow_moe_lt_scatter(float* part, const __nv_bfloat16*
 
 /* Prefill route, ABI 5: gather as plow_moe_lt_gather, plus inv[row_partidx[r]] = r for every
  * live row, the (token, slot) -> gathered row map plow_moe_lt_combine_pf reads. */
+PLOW_PDL_KERNEL(plow_moe_lt_gather_inv)
 extern "C" __global__ void plow_moe_lt_gather_inv(__nv_bfloat16* xs, unsigned* inv,
                                                   const __nv_bfloat16* xn2,
                                                   const unsigned* row_token,
                                                   const unsigned* row_partidx, const int* meta,
                                                   unsigned n_exp, unsigned H, unsigned nblk) {
+    plow_pdl_entry();
     __shared__ unsigned pre[PLOW_NV_THREADS + 1u];
     const unsigned live = moe_lt_live_prefix(pre, meta, n_exp);
     for (MoeLtCursor k(blockIdx.x, nblk, H / 8u); k.row < live; k.next()) {
@@ -325,10 +341,12 @@ extern "C" __global__ void plow_moe_lt_gather_inv(__nv_bfloat16* xs, unsigned* i
  * partition and warp-sum fold. k == 8, H % 8 == 0 and H <= 12 * 256 are checked on the host.
  * Rows are clamped to the capacity: a token the align never placed reads a stale row, as op77
  * reads a stale part row. */
+PLOW_PDL_KERNEL(plow_moe_lt_combine_pf)
 extern "C" __global__ void plow_moe_lt_combine_pf(
     __nv_bfloat16* out, const __nv_bfloat16* dn, const unsigned* inv, const float* row_gate,
     const __nv_bfloat16* h1, const __nv_bfloat16* gamma, unsigned H, unsigned T, unsigned cap,
     float eps) {
+    plow_pdl_entry();
     constexpr unsigned K = 8u;
     __shared__ float red[PLOW_NV_THREADS / 32u];
     const unsigned tid = threadIdx.x, lane = tid & 31u, warp = tid >> 5;
@@ -411,10 +429,12 @@ __device__ __forceinline__ unsigned moe_lt_row_expert(const int* meta, unsigned 
 }
 
 /* plow_moe_lt_setup with e4m3 xs and fu rows: ptrs = [xs8 | gu | fu8 | dn] x E. */
+PLOW_PDL_KERNEL(plow_moe_lt_setup8)
 extern "C" __global__ void plow_moe_lt_setup8(int* rows, unsigned long long* ptrs, const int* meta,
                                               unsigned long long xs, unsigned long long gu,
                                               unsigned long long fu, unsigned long long dn,
                                               unsigned n_exp, unsigned H, unsigned I) {
+    plow_pdl_entry();
     for (unsigned e = threadIdx.x; e < n_exp; e += blockDim.x) {
         const unsigned long long off = (unsigned long long)(unsigned)meta[e];
         rows[e] = meta[n_exp + e];
@@ -426,10 +446,12 @@ extern "C" __global__ void plow_moe_lt_setup8(int* rows, unsigned long long* ptr
 }
 
 /* xs8[r] = xq[row_token[r]] (e4m3 rows, H bytes) and inv[row_partidx[r]] = r. H % 16 == 0. */
+PLOW_PDL_KERNEL(plow_moe_lt_gather8_inv)
 extern "C" __global__ void plow_moe_lt_gather8_inv(uint8_t* xs8, unsigned* inv, const uint8_t* xq,
                                                    const unsigned* row_token,
                                                    const unsigned* row_partidx, const int* meta,
                                                    unsigned n_exp, unsigned H, unsigned nblk) {
+    plow_pdl_entry();
     __shared__ unsigned pre[PLOW_NV_THREADS + 1u];
     const unsigned live = moe_lt_live_prefix(pre, meta, n_exp);
     for (MoeLtCursor k(blockIdx.x, nblk, H / 16u); k.row < live; k.next()) {
@@ -464,11 +486,13 @@ __device__ __forceinline__ unsigned short moe_lt_quant_pair(float lo, float hi, 
 /* Warp per live row: f = bf16(act(g * as * sg) * (u * as * su)) from the unscaled gate|up row,
  * then QuantFp8 of the row (moe_lt_quant_scale / moe_lt_quant_pair). I % 8 == 0,
  * I <= 96 * 8. */
+PLOW_PDL_KERNEL(plow_moe_lt_glu8)
 extern "C" __global__ void plow_moe_lt_glu8(uint8_t* fu8, float* fs, const __nv_bfloat16* gu,
                                             const float* ascale, const unsigned long long* est,
                                             const unsigned* row_token, const int* meta,
                                             unsigned n_exp, unsigned I, unsigned act,
                                             unsigned nblk) {
+    plow_pdl_entry();
     constexpr unsigned C = 3u; /* chunks of 8 per lane */
     __shared__ unsigned pre[PLOW_NV_THREADS + 1u];
     const unsigned live = moe_lt_live_prefix(pre, meta, n_exp);
@@ -526,10 +550,12 @@ extern "C" __global__ void plow_moe_lt_glu8(uint8_t* fu8, float* fs, const __nv_
 
 /* plow_moe_lt_combine_pf on the unscaled down rows: each slot's product is (gate * fs[row]) *
  * dsc[h] * dn, the W8A8 down epilogue's part value, then the same sum, norm and residual. */
+PLOW_PDL_KERNEL(plow_moe_lt_combine_pf8)
 extern "C" __global__ void plow_moe_lt_combine_pf8(
     __nv_bfloat16* out, const __nv_bfloat16* dn, const unsigned* inv, const float* row_gate,
     const float* fs, const unsigned long long* est, const int* meta, const __nv_bfloat16* h1,
     const __nv_bfloat16* gamma, unsigned n_exp, unsigned H, unsigned T, unsigned cap, float eps) {
+    plow_pdl_entry();
     constexpr unsigned K = 8u;
     __shared__ float red[PLOW_NV_THREADS / 32u];
     const unsigned tid = threadIdx.x, lane = tid & 31u, warp = tid >> 5;
@@ -607,10 +633,12 @@ extern "C" __global__ void plow_moe_lt_combine_pf8(
  *                d_moe_align_gemma_pf_multi): every block histograms all slots and scatters its
  *                own slot range, so any grid gives the same tables up to the row order inside an
  *                expert, which the grouped GEMMs and the combine do not depend on. */
+PLOW_PDL_KERNEL(plow_moe_lt_route_pre)
 extern "C" __global__ void __launch_bounds__(256) plow_moe_lt_route_pre(
     __nv_bfloat16* xn2, uint8_t* xq, float* ascale, const __nv_bfloat16* x,
     const __nv_bfloat16* gamma, float norm_eps, __nv_bfloat16* h2, const __nv_bfloat16* rscale,
     float root, float rt_eps, unsigned rows, unsigned H) {
+    plow_pdl_entry();
     __shared__ float part[32];
 #if defined(PLOW_NV_QUANT_FP8_VLLM) && PLOW_NV_QUANT_FP8_VLLM
     /* d_rmsnorm's fused quant is the reciprocal form; the separate QuantFp8 the interpreter runs
@@ -651,9 +679,11 @@ extern "C" __global__ void __launch_bounds__(256) plow_moe_lt_route_pre(
 
 #define MOE_LT_MAX_EXP 256u
 /* Warp per row. table[row][slot] = {u32 expert, f32 gate}. n_exp <= 256, k <= 32. */
+PLOW_PDL_KERNEL(plow_moe_lt_route_topk)
 extern "C" __global__ void __launch_bounds__(256) plow_moe_lt_route_topk(
     unsigned char* table, const float* logits, const __nv_bfloat16* pes, unsigned rows,
     unsigned n_exp, unsigned k) {
+    plow_pdl_entry();
     __shared__ float sc_all[PLOW_NV_THREADS / 32u][MOE_LT_MAX_EXP];
     const unsigned lane = threadIdx.x & 31u, warp = threadIdx.x >> 5;
     float* sc = sc_all[warp];
@@ -706,9 +736,11 @@ extern "C" __global__ void __launch_bounds__(256) plow_moe_lt_route_topk(
 /* op_moe.cuh d_moe_align_gemma_pf_multi with slice = blockIdx.x, nblk = gridDim.x and the tile
  * height `bm` (the interpreter's PGM_BM: 128 on the W8A8 twins). meta = [rowoff | cnt | tile
  * prefix] (i32), pad rows PLOW_EXPERT_UNUSED / gate 0. n_exp <= 256. */
+PLOW_PDL_KERNEL(plow_moe_lt_route_align)
 extern "C" __global__ void __launch_bounds__(256) plow_moe_lt_route_align(
     int* meta, const unsigned char* table, unsigned* row_token, unsigned* row_partidx,
     float* row_gate, unsigned T, unsigned n_exp, unsigned k, unsigned bm) {
+    plow_pdl_entry();
     constexpr unsigned U = 8u;
     const unsigned tid = threadIdx.x, nth = blockDim.x, slice = blockIdx.x, nblk = gridDim.x;
     __shared__ unsigned cnt[MOE_LT_MAX_EXP];

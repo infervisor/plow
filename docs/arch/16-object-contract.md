@@ -235,3 +235,44 @@ says so rather than passing silently.
   derives the required set from the object's own axes (`hd=64` is `#if !PLOW_FP8_KV`) rather
   than from the blob. Making the AMD interpreter consume the packet's head-dim capability the
   way the NVIDIA one does would let the two halves agree; that is the follow-up.
+
+## Programmatic dependent launch markers (2026-10-28)
+
+A kernel that may be launched as a programmatic dependent (PDL: its blocks can become resident
+while the stream predecessor still runs) declares it with a marker global,
+`plow_pdl_entry__<kernel>` = 1 (`PLOW_PDL_KERNEL`, `runtime/nvidia/pdl.cuh`), emitted only by
+`sm_90` device compiles. Its first statement is `plow_pdl_entry()`: `griddepcontrol.wait` (every
+prerequisite grid complete and flushed) then `griddepcontrol.launch_dependents`. No global read
+or write precedes the wait, so ordering is the same as a plain launch and outputs are
+bit-identical. A C++ entry is marked by its identifier (`interp_sm90a`, not the mangled name).
+
+- **Object side.** `scripts/bench/pdl_audit.py` disassembles every marked kernel and requires an
+  unpredicated `ACQBULK` with only register, predicate, special-register, constant-bank and ALU
+  instructions before it; a marker without its kernel fails. `campaign.py build` runs it on every
+  NVIDIA build and fails the build on a violation (`<out>/pdl-audit.txt`).
+- **Marked.** Every light, rider, state-copy, GDN-ride and prefill helper kernel of the
+  interpreter objects, the interpreter entry itself (not in `PLOW_NV_ENTRY_TRACE` builds, which
+  stamp entry before the wait), and the MoE cuBLASLt glue kernels (`moe_lt_sm90.cu`). Not marked:
+  generated attention objects, the sampler, CUTLASS FP8 decode, and every library kernel.
+- **Runtime side.** `get_function` reads the marker from the module image (host only, so it is
+  safe under capture). With `PLOW_PDL=1`, a marked kernel captured into a graph whose current
+  tail is only marked kernels launches with `CU_LAUNCH_ATTRIBUTE_PROGRAMMATIC_STREAM_SERIALIZATION`
+  (plus `COOPERATIVE` for interpreter segments). After a library kernel, a memset or anything
+  unmarked, and outside capture, the launch stays plain.
+
+Why only after marked kernels: a programmatic edge from a kernel that triggers only at exit is
+slower than a full edge. Launching every marked kernel with the attribute doubled the
+cuBLASLt-to-light boundary gap on Qwen3.8 BF16 B32 (108 -> 202 us per step, nsys) and made the
+step 0.2-0.5% slower; cuBLASLt itself only creates programmatic edges between its split-K GEMM
+and reduce kernels (32 per Qwen step), and its GEMMs are never launched as dependents of ours.
+
+Measured ceiling (nsys, decode graph, kernel-to-kernel idle per step): Qwen3.8 BF16 B4 / B32
+363 / 356 us of 21.96 / 26.09 ms (849 nodes, 0.43 us per boundary); Gemma-4 26B FP8 B32 154 us
+of 13.41 ms; 26B BF16 B32 320 us of 13.97 ms; E4B B8 / B32 283 / 228 us of 6.03 / 6.70 ms;
+12B decode is one interpreter kernel. The part PDL can reach (boundaries into a marked kernel)
+is about 40% of that; light-to-cuBLASLt boundaries are the largest share and stay full edges.
+Result with the policy above, same cubins, pinned cuBLASLt algorithms: digests identical on
+every rung (including ctx 4094/4095/8191) and step time within run-to-run noise (Qwen B32 26.01
+vs 26.01 ms, 26B FP8 B32 13.39 vs 13.38 ms). `PLOW_PDL` therefore stays off. Larger savings
+need the kernels' pre-wait prologue to do real work (loading weights that no predecessor
+writes) or the library GEMMs to be launched as dependents.

@@ -1661,6 +1661,13 @@ pub struct NvidiaRuntimeConfig {
     )]
     pub cutlass_fp8_decode: Option<String>,
 
+    /// sm_90+: a kernel whose object marks it `plow_pdl_entry__<kernel>`, captured into a graph
+    /// right after marked kernels only, is a programmatic dependent launch (its blocks may become
+    /// resident while the predecessor drains; it waits for it before touching memory).
+    /// Bit-identical but not faster on the 2026-10-28 H100 packets, so off by default.
+    #[arg(long = "pdl", env = "PLOW_PDL", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
+    pub pdl: bool,
+
     /// A routed decode rung's one-instruction AddNorm / Glu segments run as ordinary launches
     /// of the decode object's light kernel instead of interpreter windows.
     #[arg(long = "decode-light", env = "PLOW_DECODE_LIGHT", default_value_t = true, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]

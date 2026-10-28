@@ -182,6 +182,9 @@ struct CUlaunchAttribute {
     value: [u8; 64],
 }
 
+const CU_LAUNCH_ATTRIBUTE_COOPERATIVE: i32 = 2;
+const CU_LAUNCH_ATTRIBUTE_PROGRAMMATIC_STREAM_SERIALIZATION: i32 = 6;
+
 /// `CUlaunchConfig` (cuda.h).
 #[repr(C)]
 struct CUlaunchConfig {
@@ -311,6 +314,7 @@ driver_api! {
     cuGraphGetNodes: fn(CUgraph, *mut CUgraphNode, *mut usize) -> CUresult,
     cuGraphNodeGetType: fn(CUgraphNode, *mut i32) -> CUresult,
     cuGraphKernelNodeGetParams_v2: fn(CUgraphNode, *mut CudaKernelNodeParams) -> CUresult,
+    cuStreamGetCaptureInfo_v3: fn(CUstream, *mut i32, *mut u64, *mut CUgraph, *mut *const CUgraphNode, *mut *const u64, *mut usize) -> CUresult,
     cuGraphNodeGetDependencies_v2: fn(CUgraphNode, *mut CUgraphNode, *mut u64, *mut usize) -> CUresult,
     cuGraphNodeGetDependentNodes_v2: fn(CUgraphNode, *mut CUgraphNode, *mut u64, *mut usize) -> CUresult,
     cuGraphAddDependencies_v2: fn(CUgraph, *const CUgraphNode, *const CUgraphNode, *const u64, usize) -> CUresult,
@@ -414,14 +418,33 @@ pub struct GraphExec {
 unsafe impl Send for GraphExec {}
 unsafe impl Sync for GraphExec {}
 
-/// A loaded-kernel handle (a `CUfunction`, valid for the module's lifetime).
+/// A loaded-kernel handle (a `CUfunction`, valid for the module's lifetime) and whether every
+/// launch of it is a programmatic dependent launch: its object marks it
+/// `plow_pdl_entry__<kernel>` (runtime/nvidia/pdl.cuh), so it waits for its prerequisite grids
+/// before touching memory.
 #[derive(Clone, Copy, PartialEq, Eq)]
-pub struct KernelFn(usize);
+pub struct KernelFn(usize, bool);
 
-#[cfg(test)]
+/// The identifier of an Itanium-mangled free function (`_Z12interp_sm90a11PlowProgram` ->
+/// `interp_sm90a`); other names unchanged.
+fn unmangled(name: &str) -> &str {
+    let Some(rest) = name.strip_prefix("_Z") else {
+        return name;
+    };
+    let digits = rest.bytes().take_while(u8::is_ascii_digit).count();
+    match rest[..digits].parse::<usize>() {
+        Ok(n) if n > 0 && rest.len() >= digits + n => &rest[digits..digits + n],
+        _ => name,
+    }
+}
+
+/// Prefix of the device global that marks a kernel as entering through `plow_pdl_entry()`.
+pub const PDL_ENTRY_MARKER: &str = "plow_pdl_entry__";
+
 impl KernelFn {
+    #[cfg(test)]
     pub(crate) const fn null() -> Self {
-        Self(0)
+        Self(0, false)
     }
 }
 
@@ -672,6 +695,9 @@ pub struct CudaBackend {
     /// any real cubin exists — the engine loads its module explicitly).
     modules: Mutex<FxHashMap<u64, usize>>,
     module_images: Mutex<FxHashMap<u64, Vec<u8>>>,
+    /// Marked PDL function handles ([`CudaBackend::get_function`]) -> their module id; dropped
+    /// at unload, since a later module may reuse a handle value.
+    pdl_funcs: Mutex<FxHashMap<usize, u64>>,
     next_module: AtomicU64,
     /// Physical slab chunks kept across loads (`PLOW_SLAB_KEEP=1`,
     /// `VmmOps::pool_put`/`pool_take`). Device-local by construction (one
@@ -889,6 +915,7 @@ impl CudaBackend {
                 pci_bdf,
                 modules: Mutex::new(FxHashMap::default()),
                 module_images: Mutex::new(FxHashMap::default()),
+                pdl_funcs: Mutex::new(FxHashMap::default()),
                 next_module: AtomicU64::new(1),
                 slab_pool: Mutex::new(Vec::new()),
                 copy_tier: Mutex::new(None),
@@ -1147,7 +1174,93 @@ impl CudaBackend {
             unsafe { (self.api.cuModuleGetFunction)(&mut f, raw as CUmodule, cname.as_ptr()) },
             &format!("cuModuleGetFunction({name})"),
         )?;
-        Ok(KernelFn(f as usize))
+        let pdl = crate::config::RuntimeConfig::get().nv.pdl
+            && self.compute_capability.0 >= 9
+            && self.pdl_marked(module.id, raw, name)?;
+        if pdl {
+            self.pdl_funcs.lock().insert(f as usize, module.id);
+        }
+        Ok(KernelFn(f as usize, pdl))
+    }
+
+    /// Whether this launch of `f` is a programmatic dependent launch: `f` is marked, and
+    /// `stream` is capturing a graph whose current tail is only marked kernels. Those trigger
+    /// at entry; a programmatic edge from a kernel that triggers only at exit (a library
+    /// kernel) is slower than a full edge, and a non-kernel node cannot be a primary.
+    /// Uncaptured launches stay plain.
+    fn pdl_launch(&self, f: KernelFn, stream: Option<&CudaStream>) -> Result<bool> {
+        let Some(stream) = stream.filter(|_| f.1 && CAPTURING.get() != 0) else {
+            return Ok(false);
+        };
+        const ACTIVE: i32 = 1;
+        let (mut status, mut id, mut graph) = (0i32, 0u64, std::ptr::null_mut());
+        let (mut deps, mut data, mut n): (*const CUgraphNode, *const u64, usize) =
+            (std::ptr::null(), std::ptr::null(), 0);
+        // SAFETY: valid stream; the driver owns the returned arrays until the next capture call.
+        self.check(
+            unsafe {
+                (self.api.cuStreamGetCaptureInfo_v3)(
+                    stream.raw as CUstream,
+                    &mut status,
+                    &mut id,
+                    &mut graph,
+                    &mut deps,
+                    &mut data,
+                    &mut n,
+                )
+            },
+            "cuStreamGetCaptureInfo",
+        )?;
+        if status != ACTIVE || n == 0 || deps.is_null() {
+            return Ok(false);
+        }
+        // SAFETY: `deps` holds `n` live nodes of the capturing graph.
+        let deps = unsafe { std::slice::from_raw_parts(deps, n) };
+        let marked = self.pdl_funcs.lock();
+        for &node in deps {
+            let mut kind = -1;
+            self.check(
+                unsafe { (self.api.cuGraphNodeGetType)(node, &mut kind) },
+                "cuGraphNodeGetType",
+            )?;
+            if kind != 0 {
+                return Ok(false);
+            }
+            // SAFETY: a kernel node of the capturing graph; params is a valid out struct.
+            let mut params: CudaKernelNodeParams = unsafe { std::mem::zeroed() };
+            self.check(
+                unsafe { (self.api.cuGraphKernelNodeGetParams_v2)(node, &mut params) },
+                "cuGraphKernelNodeGetParams",
+            )?;
+            if !marked.contains_key(&(params.func as usize)) {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+
+    /// `plow_pdl_entry__<name>` is a 4-byte global holding 1 in the module's image. Host-side
+    /// only (no device copy), so it is safe while a stream is capturing.
+    fn pdl_marked(&self, id: u64, raw: usize, name: &str) -> Result<bool> {
+        const CUDA_ERROR_NOT_FOUND: CUresult = 500;
+        let marker = format!("{PDL_ENTRY_MARKER}{}", unmangled(name));
+        let cname = std::ffi::CString::new(marker.as_str())
+            .map_err(|_| RuntimeError::Device("global name contains NUL".into()))?;
+        let (mut ptr, mut bytes): (CUdeviceptr, usize) = (0, 0);
+        // SAFETY: live module handle; outputs are valid locals.
+        let rc = unsafe {
+            (self.api.cuModuleGetGlobal_v2)(&mut ptr, &mut bytes, raw as CUmodule, cname.as_ptr())
+        };
+        if rc == CUDA_ERROR_NOT_FOUND {
+            return Ok(false);
+        }
+        self.check(rc, &format!("cuModuleGetGlobal({marker})"))?;
+        let value = self
+            .module_images
+            .lock()
+            .get(&id)
+            .and_then(|image| plow_asset::cubin::global_u32(image, &marker));
+        Ok(bytes == 4 && value == Some(1))
     }
 
     /// Read a `u32` module-scope global (`__constant__`/`__device__`) by
@@ -1361,6 +1474,9 @@ impl CudaBackend {
         params: &mut [*mut c_void],
         stream: Option<&CudaStream>,
     ) -> Result<()> {
+        if self.pdl_launch(f, stream)? {
+            return self.launch_cooperative_pdl(f, grid, block, smem_bytes, params, stream);
+        }
         self.bind()?;
         // SAFETY: function/param pointers valid for the duration of the call —
         // the driver copies kernel arguments out before returning.
@@ -1383,12 +1499,9 @@ impl CudaBackend {
         )
     }
 
-    /// [`Self::launch_cooperative`] with programmatic stream serialization when `pdl`: the
-    /// kernel may start while its stream predecessor drains, so it MUST execute
-    /// `griddepcontrol.wait` (`plow_pdl_wait()` in sm120_common.cuh) before reading anything the
-    /// predecessor writes, and its object exports [`PDL_WAIT_MARKER`] (see
-    /// [`Self::function_waits_on_pdl`]). Captured into a graph it becomes a programmatic edge.
-    pub fn launch_cooperative_pdl(
+    /// [`Self::launch_cooperative`] with programmatic stream serialization; only
+    /// [`Self::launch_cooperative`] calls it, after [`Self::pdl_launch`] accepted the launch.
+    fn launch_cooperative_pdl(
         &self,
         f: KernelFn,
         grid: u32,
@@ -1396,14 +1509,9 @@ impl CudaBackend {
         smem_bytes: u32,
         params: &mut [*mut c_void],
         stream: Option<&CudaStream>,
-        pdl: bool,
     ) -> Result<()> {
-        if !pdl {
-            return self.launch_cooperative(f, grid, block, smem_bytes, params, stream);
-        }
         self.bind()?;
-        // CU_LAUNCH_ATTRIBUTE_COOPERATIVE = 2, _PROGRAMMATIC_STREAM_SERIALIZATION = 5; both
-        // values are an int at offset 0.
+        // Both attribute values are an int at offset 0.
         let attr = |id: i32| {
             let mut value = [0u8; 64];
             value[..4].copy_from_slice(&1i32.to_ne_bytes());
@@ -1413,7 +1521,10 @@ impl CudaBackend {
                 value,
             }
         };
-        let mut attrs = [attr(2), attr(5)];
+        let mut attrs = [
+            attr(CU_LAUNCH_ATTRIBUTE_COOPERATIVE),
+            attr(CU_LAUNCH_ATTRIBUTE_PROGRAMMATIC_STREAM_SERIALIZATION),
+        ];
         let config = CUlaunchConfig {
             grid: [grid, 1, 1],
             block: [block, 1, 1],
@@ -1481,6 +1592,34 @@ impl CudaBackend {
         stream: Option<&CudaStream>,
     ) -> Result<()> {
         self.bind()?;
+        if self.pdl_launch(f, stream)? {
+            let mut value = [0u8; 64];
+            value[..4].copy_from_slice(&1i32.to_ne_bytes());
+            let mut attrs = [CUlaunchAttribute {
+                id: CU_LAUNCH_ATTRIBUTE_PROGRAMMATIC_STREAM_SERIALIZATION,
+                pad: [0; 4],
+                value,
+            }];
+            let config = CUlaunchConfig {
+                grid,
+                block: [block, 1, 1],
+                shared_mem_bytes: smem_bytes,
+                stream: stream.map_or(std::ptr::null_mut(), |s| s.raw as CUstream),
+                attrs: attrs.as_mut_ptr(),
+                num_attrs: 1,
+            };
+            return self.check(
+                unsafe {
+                    (self.api.cuLaunchKernelEx)(
+                        &config,
+                        f.0 as CUfunction,
+                        params.as_mut_ptr(),
+                        std::ptr::null_mut(),
+                    )
+                },
+                "cuLaunchKernelEx",
+            );
+        }
         // SAFETY: param pointers valid for the call; the driver copies kernel
         // arguments out before returning.
         self.check(
@@ -2062,6 +2201,7 @@ impl CudaBackend {
             return Ok(()); // already unloaded
         };
         self.module_images.lock().remove(&module.id);
+        self.pdl_funcs.lock().retain(|_, m| *m != module.id);
         self.bind()?;
         // SAFETY: handle came from cuModuleLoadData and was removed from the
         // map above, so it is unloaded exactly once.
@@ -2784,6 +2924,15 @@ impl Backend for CudaBackend {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn pdl_marker_names_the_unmangled_identifier() {
+        use super::unmangled;
+        assert_eq!(unmangled("_Z12interp_sm90a11PlowProgram"), "interp_sm90a");
+        assert_eq!(unmangled("plow_sm90a_light"), "plow_sm90a_light");
+        assert_eq!(unmangled("_Z99x"), "_Z99x");
+        assert_eq!(unmangled("_Zfoo"), "_Zfoo");
+    }
+
     /// A capture holds only its own device's exclusion; the same device shares one.
     #[test]
     fn capture_exclusion_is_per_device() {

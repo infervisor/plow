@@ -756,6 +756,7 @@ def cmd_build(a: argparse.Namespace) -> None:
     lean_qualify(assets, out / "lean-qualification.json", strict=False)
     if not nvidia:
         return
+    pdl_audit(assets, out / "pdl-audit.txt")
     # plowc packetized the tune store's rows for the bundle's cuBLASLt shapes. With the GPU on
     # this box, probe the shapes no row serves (leased) and record the final table.
     missing = rec["cublaslt"]["missing"]
@@ -816,6 +817,18 @@ def store_cell(r: dict) -> str:
     if not sku:
         die("recipe has no [target].sku; pass --store-cell")
     return re.sub(r"[^a-z0-9]+", "-", sku.lower()).strip("-")
+
+
+def pdl_audit(assets: Path, report: Path) -> None:
+    """plowrt launches a kernel marked `plow_pdl_entry__<kernel>` as a programmatic dependent; the
+    build fails unless every marked kernel waits before touching memory (scripts/bench/pdl_audit.py)."""
+    cuobjdump = shutil.which("cuobjdump") or str(Path(os.environ.get("CUDA_PATH", "/usr/local/cuda")) / "bin/cuobjdump")
+    r = subprocess.run([sys.executable, str(REPO / "scripts/bench/pdl_audit.py"), str(assets)],
+                       env={**os.environ, "CUOBJDUMP": cuobjdump}, capture_output=True, text=True)
+    report.write_text(r.stdout + r.stderr)
+    print((r.stdout.strip().splitlines() or [r.stderr.strip()])[-1], file=sys.stderr)
+    if r.returncode:
+        raise SystemExit(f"PDL audit failed: {report}")
 
 
 def lean_qualify(assets: Path, report: Path, strict: bool) -> bool:
