@@ -1,6 +1,6 @@
-# Fish Audio S2 Pro (fishaudio/s2-pro) on L4 (sm_89, 58 SMs, 24 GB), BF16: the H100 recipe's
-# slow AR + depth stage + modded-DAC codec.pkt, minus the Hopper-only knobs (split-bf16 wgmma codec,
-# dense tune, KV head-norm-rope fuse). Sized to share the GPU with the qwen3-asr L4 server: 8 decode
+# Fish Audio S2 Pro (fishaudio/s2-pro) on L4 (sm_89, 58 SMs, 24 GB), W8A16 (per-channel e4m3 slow AR
+# and depth-layer projections, bf16 activations): the H100 recipe's slow AR + depth stage + modded-DAC
+# codec.pkt, minus the Hopper-only knobs (split-bf16 wgmma codec, dense tune, KV head-norm-rope fuse). Sized to share the GPU with the qwen3-asr L4 server: 8 decode
 # slots at 2048 ctx (144 KiB KV per token -> 2.25 GiB). Weights are under the Fish Audio research
 # license (non-commercial).
 #
@@ -31,7 +31,7 @@ revision = "1de9996b6be38b745688de084d87a5633f714e4e"
 
 [cell]
 name = "fish-s2-pro-l4"
-hf_dir = "{out}/prep/slow"
+hf_dir = "{out}/prep/slow-w8"
 gpu = "l4"
 arch = "sm_89"
 n_cu = 58
@@ -56,10 +56,18 @@ script = "scripts/tts/fish_encoder_export.py"
 python = "{env:PYREF}"
 args = ["{out}/prep/codec/encoder", "1de9996b6be38b745688de084d87a5633f714e4e"]
 
+# W8A16: every slow-AR and depth-layer projection replaced by its e4m3 twin.
+[[prep]]
+name = "fp8-rekey"
+script = "perf-data/tools/quantize_fp8.py"
+python = "{env:PYREF}"
+args = ["{out}/prep/slow", "{out}/prep/slow-w8", "model.", "--rekey"]
+
 [emit]
 emit = "devblob+cubin"
 args = ["--served-name", "fish-s2-pro"]
 [emit.env]
+PLOW_W8A16 = "1"
 PLOW_TTS_PROFILE = "fish"
 PLOW_TTS_CODEC_DIR = "{out}/prep/codec"
 PLOW_VERIFY_BIN = "{repo}/lean-plow/.lake/build/bin/plow_verify"
@@ -85,7 +93,8 @@ cer_median_max = 0.05
 
 # Live KV: a slot's KV commits on admission (288 MiB at 2048 ctx) instead of 8 x 2048 reserved at
 # load, so the bundle shares the L4 with qwen3-asr (one plowrt, --co-sched rr): 20.2 of 22.5 GiB
-# after load, ASR WER unchanged co-served. BF16 decode is ~66 ms per 46.4 ms frame (c1 RTF ~1.46),
-# so real-time admission holds streaming at one request.
+# after load, ASR WER unchanged co-served. Alone on L4 (tts_bench chatterbox set): stream c1 RTF 0.83
+# TTFA 121 ms, full c1 RTF 0.85, stream c4 2.01 audio s/s (2/16 held by real-time admission), CER
+# 0.000 (n=24), 10.1 GB (BF16 was stream c1 RTF 1.46, 14.0 GB; W8A16 slow AR alone 1.15).
 [serve]
 env = { PLOW_VMM_LIVE = "1" }

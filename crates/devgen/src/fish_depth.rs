@@ -39,6 +39,9 @@ fn bitmap_words(classes: u32) -> u32 {
 }
 
 struct LayerW {
+    /// W8A16 (Fish): the projections' e4m3 twins and per-output-channel f32 scales replace the
+    /// bf16 matrices below, which are then not declared.
+    fp8: Option<LayerW8>,
     in_ln: u32,
     q: u32,
     k: u32,
@@ -48,6 +51,16 @@ struct LayerW {
     gate: u32,
     up: u32,
     down: u32,
+}
+
+struct LayerW8 {
+    q: (u32, u32),
+    k: (u32, u32),
+    v: (u32, u32),
+    o: (u32, u32),
+    gate: (u32, u32),
+    up: (u32, u32),
+    down: (u32, u32),
 }
 
 pub(crate) struct Tensors {
@@ -148,6 +161,8 @@ pub(crate) fn declare(b: &mut Builder, c: &Cfg, dbatch: u32) -> Tensors {
         (TENSOR_NONE, TENSOR_NONE)
     };
     let opt = |b: &mut Builder, s: &str, n: u64| if d.breeze { a(b, s, n) } else { TENSOR_NONE };
+    // W8A16 (`--w8a16`): the depth layers' projections stream e4m3, as the backbone's do.
+    let fp8 = !d.breeze && crate::emit_config::active().w8a16;
     Tensors {
         classes,
         xin: opt(b, "xin", r * u64::from(c.hidden) * BF16),
@@ -239,16 +254,32 @@ pub(crate) fn declare(b: &mut Builder, c: &Cfg, dbatch: u32) -> Tensors {
             .map(|l| {
                 let p = format!("layers.{l}.");
                 let i = u64::from(d.inter);
+                let mat = |b: &mut Builder, s: &str, n: u64| if fp8 { TENSOR_NONE } else { w(b, s, n) };
                 LayerW {
+                    fp8: fp8.then(|| {
+                        let mut t8 = |s: &str, out: u64, k: u64| {
+                            let name = format!("fp8/{pre}.{p}{s}.weight");
+                            (b.tensor(&name, out * k), b.tensor(&format!("{name}_scale"), out * F32))
+                        };
+                        LayerW8 {
+                            q: t8("self_attn.q_proj", qd, h),
+                            k: t8("self_attn.k_proj", kd, h),
+                            v: t8("self_attn.v_proj", kd, h),
+                            o: t8("self_attn.o_proj", h, qd),
+                            gate: t8("mlp.gate_proj", i, h),
+                            up: t8("mlp.up_proj", i, h),
+                            down: t8("mlp.down_proj", h, i),
+                        }
+                    }),
                     in_ln: w(b, &format!("{p}input_layernorm.weight"), h),
-                    q: w(b, &format!("{p}self_attn.q_proj.weight"), qd * h),
-                    k: w(b, &format!("{p}self_attn.k_proj.weight"), kd * h),
-                    v: w(b, &format!("{p}self_attn.v_proj.weight"), kd * h),
-                    o: w(b, &format!("{p}self_attn.o_proj.weight"), h * qd),
+                    q: mat(b, &format!("{p}self_attn.q_proj.weight"), qd * h),
+                    k: mat(b, &format!("{p}self_attn.k_proj.weight"), kd * h),
+                    v: mat(b, &format!("{p}self_attn.v_proj.weight"), kd * h),
+                    o: mat(b, &format!("{p}self_attn.o_proj.weight"), h * qd),
                     post_ln: w(b, &format!("{p}post_attention_layernorm.weight"), h),
-                    gate: w(b, &format!("{p}mlp.gate_proj.weight"), i * h),
-                    up: w(b, &format!("{p}mlp.up_proj.weight"), i * h),
-                    down: w(b, &format!("{p}mlp.down_proj.weight"), h * i),
+                    gate: mat(b, &format!("{p}mlp.gate_proj.weight"), i * h),
+                    up: mat(b, &format!("{p}mlp.up_proj.weight"), i * h),
+                    down: mat(b, &format!("{p}mlp.down_proj.weight"), h * i),
                 }
             })
             .collect(),
@@ -312,6 +343,23 @@ fn program(
             i.t[0] = out;
             i.t[1] = x;
             i.t[2] = w;
+            i.i[0] = rows;
+            i.i[1] = nout;
+            i.i[2] = kin;
+        })
+    };
+    let gemv8 = |b: &mut Builder,
+                 dep: &[u32],
+                 out: u32,
+                 x: u32,
+                 (w8, sc): (u32, u32),
+                 nout: u32,
+                 kin: u32| {
+        b.emit(DevOp::GemvFp8, all.clone(), dep, |i| {
+            i.t[0] = out;
+            i.t[1] = x;
+            i.t[2] = w8;
+            i.t[5] = sc;
             i.i[0] = rows;
             i.i[1] = nout;
             i.i[2] = kin;
@@ -400,10 +448,20 @@ fn program(
             i.f[0] = d.eps;
         });
         for (l, w) in t.layers.iter().enumerate() {
-            let c_qkv = b.emit(DevOp::GemvQkv, all.clone(), &[dep], |i| {
-                i.t[..7].copy_from_slice(&[t.qg, t.xn, w.q, t.kg, w.k, t.vg, w.v]);
-                i.i[..5].copy_from_slice(&[rows, qd, d.hidden, kd, kd]);
-            });
+            let c_qkv = match &w.fp8 {
+                // Three GemvFp8, not GemvQkvFp8: the decode object carries the arms its packet's
+                // programs use, and a W8A16 backbone issues q / k / v as GemvFp8.
+                Some(w8) => {
+                    let q = gemv8(&mut b, &[dep], t.qg, t.xn, w8.q, qd, d.hidden);
+                    let k = gemv8(&mut b, &[dep], t.kg, t.xn, w8.k, kd, d.hidden);
+                    let v = gemv8(&mut b, &[dep], t.vg, t.xn, w8.v, kd, d.hidden);
+                    b.emit(DevOp::Nop, vec![0], &[q, k, v], |_| {})
+                }
+                None => b.emit(DevOp::GemvQkv, all.clone(), &[dep], |i| {
+                    i.t[..7].copy_from_slice(&[t.qg, t.xn, w.q, t.kg, w.k, t.vg, w.v]);
+                    i.i[..5].copy_from_slice(&[rows, qd, d.hidden, kd, kd]);
+                }),
+            };
             let hnr = |b: &mut Builder, out: u32, x: u32, heads: u32, rope: bool, kv: bool| {
                 b.emit(
                     DevOp::HeadNormRope,
@@ -467,14 +525,30 @@ fn program(
                 i.t[..3].copy_from_slice(&[t.at, t.opart, t.mlpart]);
                 i.i[..4].copy_from_slice(&[rows, d.heads, 1, d.head_dim]);
             });
-            let c_o = gemv(&mut b, &[c_mg], t.og, t.at, w.o, d.hidden, qd);
+            let c_o = match &w.fp8 {
+                Some(w8) => gemv8(&mut b, &[c_mg], t.og, t.at, w8.o, d.hidden, qd),
+                None => gemv(&mut b, &[c_mg], t.og, t.at, w.o, d.hidden, qd),
+            };
             let c_r1 = b.emit(DevOp::AddNorm, rset.clone(), &[c_o], |i| {
                 i.t[..5].copy_from_slice(&[t.xn, t.x, t.x, t.og, w.post_ln]);
                 i.i[0] = rows;
                 i.i[1] = d.hidden;
                 i.f[0] = d.eps;
             });
-            let c_gu = b.emit(DevOp::GemvGlu, all.clone(), &[c_r1], |i| {
+            let c_gu = match &w.fp8 {
+                Some(w8) => b.emit(DevOp::GemvGluFp8, all.clone(), &[c_r1], |i| {
+                    i.t[0] = t.fu;
+                    i.t[1] = t.xn;
+                    i.t[2] = w8.gate.0;
+                    i.t[5] = w8.up.0;
+                    i.t[3] = w8.gate.1;
+                    i.t[4] = w8.up.1;
+                    i.i[0] = rows;
+                    i.i[1] = d.inter;
+                    i.i[2] = d.hidden;
+                    i.i[5] = 1;
+                }),
+                None => b.emit(DevOp::GemvGlu, all.clone(), &[c_r1], |i| {
                 i.t[0] = t.fu;
                 i.t[1] = t.xn;
                 i.t[2] = w.gate;
@@ -483,8 +557,12 @@ fn program(
                 i.i[1] = d.inter;
                 i.i[2] = d.hidden;
                 i.i[5] = 1;
-            });
-            let c_d = gemv(&mut b, &[c_gu], t.dg, t.fu, w.down, d.hidden, d.inter);
+                }),
+            };
+            let c_d = match &w.fp8 {
+                Some(w8) => gemv8(&mut b, &[c_gu], t.dg, t.fu, w8.down, d.hidden, d.inter),
+                None => gemv(&mut b, &[c_gu], t.dg, t.fu, w.down, d.hidden, d.inter),
+            };
             let next = t.layers.get(l + 1).map_or(t.norm, |n| n.in_ln);
             dep = b.emit(DevOp::AddNorm, rset.clone(), &[c_d], |i| {
                 i.t[..5].copy_from_slice(&[t.xn, t.x, t.x, t.dg, next]);
