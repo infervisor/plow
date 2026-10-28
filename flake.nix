@@ -504,7 +504,7 @@
               plow-interp-sm120a
             ];
           };
-        }
+        })
         // {
           # --- release assets --------------------------------------------------
           #
@@ -516,22 +516,25 @@
           # `dist` is in every feature set: the released binary is exactly the
           # one that can `pull`. `serve` still performs no network I/O — that is
           # a property of the code path, not of the build, and CI asserts it.
+          #
+          # Every system has one: a Mac publishes its own `aarch64-apple-darwin`
+          # release (CPU + dist; the GPU features are Linux-only), which is what
+          # `install.sh` fetches there.
           plowrt-release = mkRelease {
             features = lib.optionals isLinux [ "cuda" "hsa" ] ++ [ "cpu" "dist" ];
           };
-
+        }
+        // lib.optionalAttrs (system == "x86_64-linux") {
           # A fully static, CPU-only runtime. `docs/BUILD.md` already establishes
           # why this cannot be the default: a `crt-static` binary cannot `dlopen`,
           # so a static GPU build makes the GPU path dead code. It exists for
           # hosts where a glibc floor is the problem and no GPU is the answer.
-          plowrt-release-static = lib.optionalAttrs (system == "x86_64-linux") (
-            mkRelease {
-              features = [ "dist" ];
-              target = "x86_64-unknown-linux-musl";
-              rustPlatform = pkgs.pkgsStatic.rustPlatform;
-              suffix = "-static";
-            }
-          );
+          plowrt-release-static = mkRelease {
+            features = [ "dist" ];
+            target = "x86_64-unknown-linux-musl";
+            rustPlatform = pkgs.pkgsStatic.rustPlatform;
+            suffix = "-static";
+          };
 
           # Cross-built from x86_64-linux; tests can't run on the build host.
           plowrt-aarch64 = pkgs.pkgsCross.aarch64-multiplatform.rustPlatform.buildRustPackage {
@@ -543,7 +546,7 @@
             doCheck = false;
             postInstall = "mv $out/bin/plowrt $out/bin/plowrt-aarch64";
           };
-        }));
+        });
 
       apps = forAll (system: {
         default = {
