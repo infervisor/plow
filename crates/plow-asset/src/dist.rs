@@ -431,8 +431,14 @@ fn assess_one<'a>(v: &'a Variant, live: &LiveTarget, c: &Constraints) -> Assessm
         }
         // Mirrors the late check at `exec/amd.rs`: equal, or an exact multiple
         // under oversubscription. `stream_ofs`/`stream_len` are `[n_cu]` tables
-        // indexed by workgroup, so anything else silently drops streams.
+        // indexed by workgroup, so anything else silently drops streams. A
+        // runtime-compiled target (Apple) is the exception: its shaders are
+        // built on the machine and the packet's `n_cu` streams simply leave
+        // the extra cores idle, so a build for a smaller part of the same
+        // family runs on a larger one (an M4 Pro build on an M4 Max) at some
+        // cost in throughput, never the other way round.
         let units_ok = v.target.units == live.units
+            || (runtime_compiled(&v.target.vendor) && live.units > v.target.units)
             || (c.oversub
                 && live.units != 0
                 && v.target.units > live.units
@@ -442,6 +448,14 @@ fn assess_one<'a>(v: &'a Variant, live: &LiveTarget, c: &Constraints) -> Assessm
                 want: v.target.units,
                 live: live.units,
             });
+        }
+        if runtime_compiled(&v.target.vendor) && live.units > v.target.units {
+            warns.push(format!(
+                "built for {} GPU cores, this has {}: runs with {} idle",
+                v.target.units,
+                live.units,
+                live.units - v.target.units
+            ));
         }
         if !IMPLEMENTED_MODES.contains(&v.parallel.mode.as_str()) {
             return Some(Reject::ParallelMode {
@@ -525,15 +539,25 @@ pub fn assess<'a>(
 }
 
 /// Rank key, best first. Generation leads: a newer generation of one label is
-/// the same model on the same hardware, only built better.
-fn rank(v: &Variant, live: &LiveTarget) -> (u32, Status, bool, u32, i64) {
+/// the same model on the same hardware, only built better. Among builds for
+/// different parts of one family (possible on a runtime-compiled target), the
+/// one built for the nearest core count leaves the fewest cores idle.
+fn rank(v: &Variant, live: &LiveTarget) -> (u32, Status, bool, i64, u32, i64) {
     let exact_sku = live.sku.as_deref() == Some(v.target.sku.as_str());
+    let units_gap = -(i64::from(live.units) - i64::from(v.target.units)).abs();
     let tok_s = v
         .measured
         .as_ref()
         .map(|m| (m.tok_s * 1000.0) as i64)
         .unwrap_or(0);
-    (v.generation, v.status, exact_sku, v.parallel.n, tok_s)
+    (
+        v.generation,
+        v.status,
+        exact_sku,
+        units_gap,
+        v.parallel.n,
+        tok_s,
+    )
 }
 
 /// Pick the best variant for this machine, or explain why none fits.

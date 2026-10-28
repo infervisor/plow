@@ -932,3 +932,118 @@ fn variant_status_and_supersedes_invariants() {
     v.parallel.n = 0;
     assert!(v.validate().is_err());
 }
+
+fn apple(sku: &str, cores: u32, mem: u64) -> Target {
+    Target {
+        vendor: "apple".into(),
+        isa: "metal3".into(),
+        sku: sku.into(),
+        units: cores,
+        mem_bytes: mem,
+    }
+}
+
+fn apple_live(sku: &str, cores: u32, mem: u64) -> LiveTarget {
+    LiveTarget {
+        vendor: "apple".into(),
+        isa: "metal3".into(),
+        sku: Some(sku.into()),
+        units: cores,
+        mem_bytes: mem,
+        gpus: 1,
+        toolchain: None,
+    }
+}
+
+#[test]
+fn an_apple_build_runs_on_a_larger_chip_of_its_family_never_a_smaller_one() {
+    let gib = 1u64 << 30;
+    let pro = variant(
+        "metal3-apple-m4-pro-tp1-2k",
+        1,
+        apple("Apple M4 Pro", 16, 24 * gib),
+        "tp",
+        1,
+    );
+    // On an M4 Max: selected, with a warning about the idle cores.
+    let table = assess(
+        std::slice::from_ref(&pro),
+        &apple_live("Apple M4 Max", 32, 36 * gib),
+        &Constraints::default(),
+    );
+    assert!(table[0].ok(), "{:?}", table[0].reject);
+    assert!(
+        table[0].warns.iter().any(|w| w.contains("16 idle")),
+        "{:?}",
+        table[0].warns
+    );
+    // On a base M4 (10 cores): refused, naming both counts.
+    let table = assess(
+        std::slice::from_ref(&pro),
+        &apple_live("Apple M4", 10, 16 * gib),
+        &Constraints::default(),
+    );
+    assert_eq!(table[0].reject, Some(Reject::Units { want: 16, live: 10 }));
+    // An NVIDIA part with more SMs than the build is still refused: the grid is baked in.
+    let h100 = variant(
+        "sm90a-h100-tp1",
+        1,
+        target("sm_90a", "H100 SXM5", 132, 80 * gib),
+        "tp",
+        1,
+    );
+    let table = assess(
+        std::slice::from_ref(&h100),
+        &live("sm_90a", "RTX 6000 Pro Blackwell", 188, 96 * gib, 1),
+        &Constraints::default(),
+    );
+    assert_eq!(
+        table[0].reject,
+        Some(Reject::Units {
+            want: 132,
+            live: 188
+        })
+    );
+}
+
+#[test]
+fn on_a_larger_chip_the_nearest_build_wins() {
+    let gib = 1u64 << 30;
+    let base = variant(
+        "metal3-apple-m4-tp1-2k",
+        1,
+        apple("Apple M4", 10, 16 * gib),
+        "tp",
+        1,
+    );
+    let pro = variant(
+        "metal3-apple-m4-pro-tp1-2k",
+        1,
+        apple("Apple M4 Pro", 16, 24 * gib),
+        "tp",
+        1,
+    );
+    let max_ = variant(
+        "metal3-apple-m4-max-tp1-2k",
+        1,
+        apple("Apple M4 Max", 32, 36 * gib),
+        "tp",
+        1,
+    );
+    let vs = vec![base, pro, max_];
+    let pick = select(
+        &vs,
+        &apple_live("Apple M4 Max", 32, 36 * gib),
+        &Constraints::default(),
+    )
+    .unwrap();
+    assert_eq!(pick.label, "metal3-apple-m4-max-tp1-2k");
+    // An M4 Max with no build of its own takes the Pro build, not the base one.
+    let pick = select(
+        &vs[..2],
+        &apple_live("Apple M4 Max", 32, 36 * gib),
+        &Constraints::default(),
+    )
+    .unwrap();
+    assert_eq!(pick.label, "metal3-apple-m4-pro-tp1-2k");
+}
