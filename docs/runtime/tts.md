@@ -180,9 +180,11 @@ With the recipe flags, the gate CER median is 0.005 (n=80). The step_bench diges
 veena40_1 at B=1/32/64/128, and E4B's are unchanged at B=1/64/128. In-model at B=128 ctx 384,
 o_proj on cuBLASLt takes 14.5 us per layer, against 9.3-10 us in torch.
 
-Voices are the checkpoint's speaker tags (`kavya`, `agastya`, `maitri`, `vinaya`).
-Defaults: temperature 0.4, top_p 0.9, no repetition penalty (device sampling; a
-penalty switches that request to host sampling).
+The checkpoint trains four speakers (`kavya`, `agastya`, `maitri`, `vinaya`), but the
+profile names no `voices`, so the card advertises all 11 `<spk_*>` tokens the tokenizer
+carries; the other seven are untrained vocabulary entries that synthesize in an arbitrary
+voice. Narrow the card with `--tts-voice`. Defaults: temperature 0.4, top_p 0.9, no
+repetition penalty (device sampling; a penalty switches that request to host sampling).
 
 ## Chatterbox
 
@@ -624,18 +626,21 @@ request takes two slots, so the 128-slot rung serves 64 Chatterbox requests; the
 `tts::api::SpeechSpec` from its packet (voices, languages and default, sample rate, sampling
 defaults, `max_tokens` cap, and which optional controls it takes); every request is checked against
 it in one order with one set of messages, then runs on the model's engine (`tts::serving`).
-`GET /v1/models` shows the spec as the card's `x_plow_speech`.
+`GET /v1/models` shows the spec as the card's `x_plow_speech`. `--tts-voice`
+(`PLOW_TTS_VOICES`, comma-separated) narrows a card to the voices one deployment serves, and
+every other voice is refused as unknown; a model sharing no voice with the list keeps its own.
 
 | Field | Every model |
 |---|---|
 | `model`, `input`, `voice` | required; `input` at most 4096 characters, spoken as sentence segments; `voice` one of the card's `voices` |
-| `response_format` | `wav` (default) or `pcm` (s16le mono at the card's `sample_rate`) |
+| `response_format` | `wav` (default) or `pcm` (s16le mono at the reply's sample rate) |
+| `sample_rate` | Hz the reply is resampled to, 8000..=48000; default the card's `sample_rate`. The model always synthesizes at its own rate (Veena's SNAC decoder is 24 kHz); this resamples on the way out, so 8 kHz telephony audio costs no quality beyond the band limit |
 | `stream` | chunked audio; the 200 and its headers go out with the first audio, so an error before any audio is a proper status and `server-timing` carries time to first audio |
 | `language` | one of the card's `languages` (default `default_language`); a model without languages rejects it |
 | `temperature`, `top_p` | honoured on every model (defaults: the card's `defaults`) |
 | `max_tokens` | the model's audio tokens per segment, 1..card `max_tokens` |
 | `seed` | same seed, text and settings at the same concurrency: same speech tokens (batched decode is not bitwise batch-invariant); whole and stream replies share those tokens, but the windowed stream codec differs from a whole decode (~2% rel-L2 on Veena); the stateful codecs (Fish S2, Breeze) match it to ~1e-5 rel-L2 (fp32 summation order, so not bitwise); SNAC codecs also draw their noise from the seed, so greedy (`temperature` 0) replies there share tokens but not PCM across seeds; unseeded requests sample anew |
-| `speed` | 1.0 only |
+| `speed` | 0.5..=2.0 (default 1.0): the reply is time-stretched by waveform-similarity overlap-add, which leaves the pitch where it was. 1.0 is a bypass, bit-identical to no `speed` at all. A stretched reply ends with a half-frame (15 ms) fade, the last frame having no successor to overlap |
 | `top_k`, `repetition_penalty`, `cfg_weight`, `instructions`, `ref_audio` + `ref_text` | optional controls: taken where the card declares them (`defaults.top_k`, `defaults.repetition_penalty`, `defaults.cfg_weight`, `instructions`, `voice_cloning`), else 400 naming the field; a sampler with a bounded top-k (`limits.top_k_max`, Fish S2) takes `top_k` in 1..that bound and cannot turn it off |
 | `ref_audio` + `ref_text` | voice cloning (Breeze, Fish S2): base64 or `data:` URL audio (wav, mp3, flac, ogg) of at most 20.48 s (Breeze) / 23.78 s (Fish) and its exact transcript; the reference encoder (`ref_encoder.pkt`) runs once per request on the engine thread before the first prefill chunk, and every segment's prompt opens with the contract's clone layout: transcript, reference frames, then an end frame (Breeze) or the system turn's close (Fish). The Fish encoder is FP32 and matches the official server's codes exactly (9.3 s clip: 200/200 frames, 105 ms on H100); the request never takes a session (its frame rows are placeholders until encoded) |
 

@@ -235,6 +235,18 @@ pub struct RuntimeConfig {
     )]
     pub tts_admit_wait_ms: u64,
 
+    /// Voices a speech model serves, narrowing the model's own list: any other voice is refused
+    /// and the model card advertises only these. A deployment's choice; comma-separated. A model
+    /// sharing no voice with the list keeps its own, so one list names the voices of one model
+    /// among several. Unset = every voice the model has.
+    #[arg(
+        long = "tts-voice",
+        env = "PLOW_TTS_VOICES",
+        value_delimiter = ',',
+        global = true
+    )]
+    pub tts_voices: Vec<String>,
+
     /// Share of a streaming ASR session's time its partial transcripts may keep the model busy:
     /// after a partial that took `t`, the session's appends answer the previous partial's text
     /// until `t * (1 / duty - 1)` has passed. Idle, partials take far less than the 1 s append

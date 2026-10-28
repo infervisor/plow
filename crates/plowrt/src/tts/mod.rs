@@ -26,6 +26,8 @@ pub mod text_encoder;
 #[cfg(feature = "cuda")]
 pub mod voice_cond;
 
+pub(crate) mod stretch;
+
 use std::path::Path;
 
 use plow_asset::packet_pipeline::PacketPipeline;
@@ -251,7 +253,7 @@ impl SpeechContract {
         };
         voices.sort_unstable();
         voices.dedup();
-        api::SpeechSpec {
+        let mut spec = api::SpeechSpec {
             voices,
             languages: Vec::new(),
             default_language: None,
@@ -269,7 +271,9 @@ impl SpeechContract {
             instructions: self.instructions.is_some(),
             voice_cloning: self.clone.is_some(),
             clone_transcript: true,
-        }
+        };
+        spec.narrow_voices(&crate::config::RuntimeConfig::get().tts_voices);
+        spec
     }
 
     /// Classifier-free guidance in the depth stage, contrasting with the prompt without its
@@ -643,6 +647,87 @@ pub(crate) fn wav_header(sample_rate: u32, data_bytes: u32) -> Vec<u8> {
     h.extend_from_slice(b"data");
     h.extend_from_slice(&data_bytes.to_le_bytes());
     h
+}
+
+/// A speech reply's output stage: the model's PCM at its own rate, written as s16le mono at the
+/// reply's. Fed in pieces, so one instance serves a whole stream — the resampler is the ASR
+/// frontend's, whose polyphase output does not depend on where the piece boundaries fall.
+pub(crate) struct OutPcm {
+    wav: bool,
+    rate: u32,
+    speed: f32,
+    /// `None` at the model's own speed; stretching runs before resampling, at the model's rate.
+    stretch: Option<stretch::Stretch>,
+    /// `None` when the reply is served at the model's own rate.
+    resampler: Option<crate::asr::frontend::Resampler>,
+}
+
+impl OutPcm {
+    pub fn new(from: u32, to: u32, speed: f32, wav: bool) -> std::result::Result<Self, String> {
+        let stretch = (speed != 1.0)
+            .then(|| stretch::Stretch::new(from, speed))
+            .transpose()?;
+        let resampler = (from != to)
+            .then(|| crate::asr::frontend::Resampler::to(from, to))
+            .transpose()?;
+        Ok(Self {
+            wav,
+            rate: to,
+            speed,
+            stretch,
+            resampler,
+        })
+    }
+
+    pub fn rate(&self) -> u32 {
+        self.rate
+    }
+
+    /// How much faster the reply plays than the model synthesized it: one model-rate sample buys
+    /// `1 / (rate * speed)` seconds of playback.
+    pub fn speed(&self) -> f32 {
+        self.speed
+    }
+
+    pub fn content_type(&self) -> &'static str {
+        if self.wav {
+            "audio/wav"
+        } else {
+            "audio/pcm"
+        }
+    }
+
+    /// The WAV header for `data_bytes` of audio; `None` on a raw `pcm` reply.
+    pub fn header(&self, data_bytes: u32) -> Option<Vec<u8>> {
+        self.wav.then(|| wav_header(self.rate, data_bytes))
+    }
+
+    pub fn push(&mut self, pcm: &[f32], out: &mut Vec<u8>) {
+        let stretched = self.stretch.as_mut().map(|s| s.push(pcm));
+        let pcm = stretched.as_deref().unwrap_or(pcm);
+        match &mut self.resampler {
+            Some(r) => pcm16(&r.push(pcm), out),
+            None => pcm16(pcm, out),
+        }
+    }
+
+    /// The stretch's last frame and the resampler's tail, neither of which a `push` could
+    /// complete: dropping them would clip the end of every stretched or resampled reply.
+    pub fn finish(&mut self, out: &mut Vec<u8>) {
+        let tail = self
+            .stretch
+            .as_mut()
+            .map(|s| s.finish())
+            .unwrap_or_default();
+        match &mut self.resampler {
+            Some(r) => {
+                let mut v = r.push(&tail);
+                v.extend(r.finish());
+                pcm16(&v, out);
+            }
+            None => pcm16(&tail, out),
+        }
+    }
 }
 
 #[cfg(test)]

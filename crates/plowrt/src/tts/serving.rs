@@ -28,7 +28,7 @@ use serde::Deserialize;
 use super::api::{Checked, SpeechSpec};
 use super::codec::{Codec, Urgency};
 use super::realtime::Ticket;
-use super::{pcm16, wav_header, SpeechContract};
+use super::SpeechContract;
 use crate::serve::session::{InFlight, RequestIds};
 use crate::serve::stream::{self as stream_mod, StreamChunk};
 use crate::serve::AppState;
@@ -41,10 +41,15 @@ pub struct SpeechRequest {
     pub input: String,
     /// One of the model's voices (its `/v1/models` card: `x_plow_speech.voices`).
     pub voice: String,
-    /// `wav` (default) or `pcm` (raw s16le mono at the pipeline sample rate).
+    /// `wav` (default) or `pcm` (raw s16le mono at the reply's sample rate).
     #[serde(default)]
     pub response_format: Option<String>,
-    /// OpenAI `speed`; only 1.0 is supported.
+    /// Hz the reply is resampled to, within `MIN_OUT_RATE..=MAX_OUT_RATE`; default: the model's
+    /// own rate (its card's `x_plow_speech.sample_rate`).
+    #[serde(default)]
+    pub sample_rate: Option<u32>,
+    /// OpenAI `speed`, within `MIN_SPEED..=MAX_SPEED`: the reply is time-stretched without
+    /// moving its pitch. 1.0 (default) leaves the audio untouched.
     #[serde(default)]
     pub speed: Option<f32>,
     #[serde(default)]
@@ -273,6 +278,15 @@ async fn speech_on_guided(
         session: None,
         ..ids.clone()
     };
+    let mut out_pcm = match super::OutPcm::new(
+        w.sample_rate,
+        checked.sample_rate,
+        checked.speed,
+        checked.wav,
+    ) {
+        Ok(o) => o,
+        Err(e) => return server_error(e),
+    };
     if req.stream {
         let first = match w.synthesize_stream(
             &mux,
@@ -291,11 +305,11 @@ async fn speech_on_guided(
         run.admitted(cache.and_then(|o| o.at));
         let (out_tx, out_rx) = tokio::sync::mpsc::channel(64);
         let (head_tx, head_rx) = tokio::sync::oneshot::channel();
-        let wav = checked.wav.then(|| wav_header(w.sample_rate, u32::MAX));
+        let header = out_pcm.header(u32::MAX);
         tokio::spawn(guided_stream_task(
-            w, mux, voice, segs, checked, later_ids, first, out_tx, head_tx, t_arrive, run,
+            w, mux, voice, segs, checked, out_pcm, later_ids, first, out_tx, head_tx, t_arrive, run,
         ));
-        return stream_response(out_rx, head_rx, wav, in_flight, cache).await;
+        return stream_response(out_rx, head_rx, header, in_flight, cache).await;
     }
     let (mut pcm, mut joiner) = (Vec::new(), super::Joins::new(w.sample_rate));
     let (mut tokens, mut t3_ms, mut s3gen_ms) = (0, 0.0, 0.0);
@@ -332,7 +346,7 @@ async fn speech_on_guided(
     run.first();
     run.done();
     let total = t_arrive.elapsed().as_secs_f64();
-    let audio_s = pcm.len() as f64 / f64::from(w.sample_rate);
+    let audio_s = pcm.len() as f64 / f64::from(w.sample_rate) / f64::from(checked.speed);
     tracing::info!(
         tokens,
         segments = segs.len(),
@@ -343,7 +357,7 @@ async fn speech_on_guided(
         rtf = total / audio_s,
         "tts: chatterbox speech"
     );
-    let mut response = whole_response(checked.wav, w.sample_rate, &pcm, t3_ms);
+    let mut response = whole_response(&mut out_pcm, &pcm, t3_ms);
     run.stamp(&mut response);
     if let Some(cache) = cache {
         cache.stamp(&mut response);
@@ -360,6 +374,7 @@ async fn guided_stream_task(
     voice: super::guided_speech::Voice,
     segs: Vec<String>,
     checked: Checked,
+    mut out_pcm: super::OutPcm,
     later_ids: RequestIds,
     mut ev: tokio::sync::mpsc::UnboundedReceiver<super::guided_speech::StreamEvent>,
     out: tokio::sync::mpsc::Sender<Result<Vec<u8>, std::io::Error>>,
@@ -368,7 +383,10 @@ async fn guided_stream_task(
     mut run: crate::serve::turns::StageRun,
 ) {
     use super::guided_speech::StreamEvent;
-    let sr = f64::from(w.sample_rate);
+    // The playback rate, not the model's: `speed` changes how much playback time each sample
+    // buys, which is what the lead, the realtime projection and the delivered-audio metrics all
+    // measure. At speed 1.0 this is the model's rate.
+    let sr = f64::from(w.sample_rate) * f64::from(out_pcm.speed());
     let mut head = Some(head);
     let mut joiner = super::Joins::new(w.sample_rate);
     // Samples sent and when the first went out (the client's playback clock).
@@ -416,7 +434,7 @@ async fn guided_stream_task(
                     playing.get_or_insert_with(Instant::now);
                     sent += fresh.len();
                     let mut bytes = Vec::with_capacity(fresh.len() * 2);
-                    pcm16(&fresh, &mut bytes);
+                    out_pcm.push(&fresh, &mut bytes);
                     if out.send(Ok(bytes)).await.is_err() {
                         return; // client gone: dropping `ev` frees the request's pair
                     }
@@ -435,6 +453,11 @@ async fn guided_stream_task(
                 }
             }
         }
+    }
+    let mut tail = Vec::new();
+    out_pcm.finish(&mut tail);
+    if !tail.is_empty() && out.send(Ok(tail)).await.is_err() {
+        return;
     }
     run.done();
     let total = t_arrive.elapsed().as_secs_f64();
@@ -491,27 +514,27 @@ async fn stream_response(
 }
 
 /// A whole reply: the audio and the same headers on every model.
-fn whole_response(wav: bool, sample_rate: u32, pcm: &[f32], lm_ms: f64) -> Response {
-    let mut out = if wav {
-        wav_header(sample_rate, (pcm.len() * 2) as u32)
-    } else {
-        Vec::new()
-    };
-    pcm16(pcm, &mut out);
-    let content_type = if wav { "audio/wav" } else { "audio/pcm" };
+fn whole_response(out: &mut super::OutPcm, pcm: &[f32], lm_ms: f64) -> Response {
+    let mut body = Vec::new();
+    out.push(pcm, &mut body);
+    out.finish(&mut body);
+    let audio_s = (body.len() / 2) as f64 / f64::from(out.rate());
+    let content_type = out.content_type();
+    let mut bytes = out.header(body.len() as u32).unwrap_or_default();
+    bytes.extend_from_slice(&body);
     (
         [
             (header::CONTENT_TYPE, content_type.to_string()),
             (
                 HeaderName::from_static("x-plow-audio-seconds"),
-                format!("{:.3}", pcm.len() as f64 / f64::from(sample_rate)),
+                format!("{audio_s:.3}"),
             ),
             (
                 HeaderName::from_static("x-plow-lm-ms"),
                 format!("{lm_ms:.1}"),
             ),
         ],
-        out,
+        bytes,
     )
         .into_response()
 }
@@ -895,7 +918,15 @@ async fn speech_with(
         );
     }
     let voice = req.voice.clone();
-    let wav = checked.wav;
+    let mut out_pcm = match super::OutPcm::new(
+        c.sample_rate,
+        checked.sample_rate,
+        checked.speed,
+        checked.wav,
+    ) {
+        Ok(o) => o,
+        Err(e) => return server_error(e),
+    };
     let reference = match (&req.ref_audio, &req.ref_text, &model.ref_encoder) {
         (Some(audio), Some(text), Some(enc)) => {
             match ref_clip(&model, tok, &voice, enc, audio, text) {
@@ -1018,12 +1049,13 @@ async fn speech_with(
         let (head_tx, head_rx) = tokio::sync::oneshot::channel();
         let cache = crate::serve::session::CacheOutcome::received(report_rx.take()).await;
         run.admitted(cache.and_then(|o| o.at));
-        let header = wav.then(|| wav_header(c.sample_rate, u32::MAX));
+        let header = out_pcm.header(u32::MAX);
         tokio::spawn(stream_task(
             Arc::clone(&model),
             rx,
             later,
             ticket,
+            out_pcm,
             out_tx,
             head_tx,
             seed,
@@ -1103,7 +1135,7 @@ async fn speech_with(
     if frames == 0 {
         return server_error("model produced no audio frames");
     }
-    let audio_s = pcm.len() as f64 / f64::from(c.sample_rate);
+    let audio_s = pcm.len() as f64 / f64::from(c.sample_rate) / f64::from(checked.speed);
     let total = t_arrive.elapsed().as_secs_f64();
     tracing::info!(
         tokens = n_tokens,
@@ -1120,7 +1152,7 @@ async fn speech_with(
     run.admitted(cache.and_then(|o| o.at));
     run.first();
     run.done();
-    let mut response = whole_response(wav, c.sample_rate, &pcm, t_lm.as_secs_f64() * 1e3);
+    let mut response = whole_response(&mut out_pcm, &pcm, t_lm.as_secs_f64() * 1e3);
     run.stamp(&mut response);
     if let Some(cache) = cache {
         cache.stamp(&mut response);
@@ -1752,6 +1784,7 @@ async fn stream_task(
     rx: stream_mod::ChunkReceiver,
     mut later: Later,
     ticket: Arc<Ticket>,
+    mut out_pcm: super::OutPcm,
     out: tokio::sync::mpsc::Sender<Result<Vec<u8>, std::io::Error>>,
     head: tokio::sync::oneshot::Sender<axum::http::HeaderMap>,
     seed: u64,
@@ -1761,7 +1794,8 @@ async fn stream_task(
     use std::sync::atomic::Ordering::SeqCst;
     let mut head = Some(head);
     let c = model.contract.clone();
-    let sr = f64::from(c.sample_rate);
+    // Playback, not model, rate: see `guided_stream_task`.
+    let sr = f64::from(c.sample_rate) * f64::from(out_pcm.speed());
     let (fc, fs) = (c.frame_codes, c.frame_samples);
     let n_segs = later.segs.len();
     let (ftx, mut frx) = tokio::sync::mpsc::unbounded_channel::<SegMsg>();
@@ -2031,7 +2065,7 @@ async fn stream_task(
                     emitted = upto;
                     if !fresh.is_empty() {
                         let mut bytes = Vec::new();
-                        pcm16(fresh, &mut bytes);
+                        out_pcm.push(fresh, &mut bytes);
                         if first.is_none() {
                             ticket.first_audio();
                         }
@@ -2067,6 +2101,11 @@ async fn stream_task(
             }
             judged = true;
         }
+    }
+    let mut tail = Vec::new();
+    out_pcm.finish(&mut tail);
+    if !tail.is_empty() && out.send(Ok(tail)).await.is_err() {
+        return;
     }
     run.done();
     tracing::info!(
