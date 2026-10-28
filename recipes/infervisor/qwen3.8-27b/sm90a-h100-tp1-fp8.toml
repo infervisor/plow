@@ -39,6 +39,17 @@
 # vs 0.9939/0.9915/0.9902, cont_frac 0.731/0.765/0.736 vs 0.721/0.723/0.696, needles 1. The packet needs a
 # plowrt with this segment_roles policy (older plowrt rejects its FP8 prefill segments). The serving
 # comparison below predates these routes and has not been re-run.
+#
+# Prefix cache on (2026-10-28, plowrt 01685b29c from prod-next, same packet 2af45e892b75, [serve.env]
+# below, cuBLASLt 13.4; evidence /opt/dlami/nvme/lava-tts/qwenfp8-prefix). FP32 gate vs the vLLM 0.29
+# hub-FP8 peers, one run: c1 PASS (kl_trim 0.0108 vs 0.0147, kl_p95 0.069 vs 0.102, top1_decisive
+# 0.9976 vs 0.9939, cont_frac 0.716 vs 0.721, cont_decisive 46/46 vs 45/46, needles 1); c32 PASS (0.0109
+# vs 0.0179, 0.078 vs 0.130, 0.9927 vs 0.9902, 0.716 vs 0.696, 45/46 vs 43/46); c8 FAIL on
+# cont_decisive only, 44/46 vs the peer's 45/46 (kl_trim 0.0104 vs 0.0153, kl_p95 0.068 vs 0.112,
+# top1_decisive 0.9951 vs 0.9915, cont_frac 0.720 vs 0.723). The extra case is nat-pride-128 (FP32
+# margin 1.02 nat at the divergence), the swing case of the [gates.llm_fp32_ref] note; the
+# perf-for-accuracy rule does not apply (no prefix-off prod-mix arm to measure a gain against, one
+# run), so thresholds are unchanged and this run is not a qualified pass.
 
 schema = "plow.recipe.v1"
 namespace = "infervisor"
@@ -165,6 +176,15 @@ gate_prompt = "<|im_start|>user\nWhat is the capital of France? Answer in one sh
 # model with better latency. Open items, in order: the B>=2 W8A8 decode rungs (the 128-row M
 # tile of d_gemm_w8a8_sm90 against 8-32 live rows), then the W8A8 prefill buckets.
 # Evidence: /opt/dlami/nvme/lava-tts/kvstore-scratch/qwenfp8-ladder3b-run.
+#
+# Prefix cache on, production mix (2026-10-28, plowrt 01685b29c, packet 2af45e892b75, llm_grid.sh
+# --prod, 0.45 sessions/s, 2 repeats, --prod-fidelity; qwenfp8-prefix/prod): no vLLM FP8 prod-mix arm
+# exists, and the numbers above are prefix-off single-turn, not prod mix. campaign.py report against
+# vLLM 0.29 serving the BF16 checkpoint on the same seeds (NOT MATCHED on model/precision, NOT
+# EQUIVALENT from the c8 gate miss; qwenfp8-prefix/report-vs-bf16vllm): tok/s 9769 vs 9874 (0.99x),
+# TTFT P99 1496 vs 1304 ms (1.15x), TPOT P99 81.2 vs 77.3 ms (1.05x; both P99s spread-flagged),
+# TTFT/TPOT P50 376/37.5 vs 264/26.7 ms, SLO met 99.3 vs 99.3 %, goodput 1.667 vs 1.683 req/s, prefix
+# token hit 76.4 % (78.0/74.7) vs 65.8 %, peak memory 77.8 vs 73.7 GiB.
 [measured]
 tok_s = 339
 p50_tpot_ms = 23.6
