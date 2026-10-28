@@ -2483,8 +2483,14 @@ enum PackedAdmission {
     /// Another slot is prefilling this prompt's shared prefix; admit once its checkpoint is
     /// published (`vmm_inflight_prefix`), or after [`INFLIGHT_WAIT_LIMIT`] regardless.
     WaitingPrefix(std::time::Instant),
+    /// The prompt's boundary is still coming back from the host tier; admit once its blocks are
+    /// on the device, or after [`RESTORE_WAIT_LIMIT`] regardless (the gather then waits on the
+    /// copy in the engine stream, stalling every other row).
+    WaitingRestore(std::time::Instant),
     Ready,
 }
+
+const RESTORE_WAIT_LIMIT: std::time::Duration = std::time::Duration::from_millis(250);
 
 /// A packed admission that ran out of device memory retries after this long.
 const KV_MEMORY_RETRY: std::time::Duration = std::time::Duration::from_millis(100);
@@ -8481,8 +8487,11 @@ impl GpuEngine {
         // for its whole-block checkpoint (one attach + the tail) instead of recomputing the
         // shared rows beside it; bounded, and released when the owner publishes or retires.
         if self.vmm_prefix_enabled() && crate::config::RuntimeConfig::get().prefix_inflight_wait() {
+            // One deadline for both waits: alternating them must not restart either.
             let since = match self.packed_admission[b] {
-                PackedAdmission::WaitingPrefix(since) => since,
+                PackedAdmission::WaitingPrefix(since) | PackedAdmission::WaitingRestore(since) => {
+                    since
+                }
                 _ => std::time::Instant::now(),
             };
             if since.elapsed() < INFLIGHT_WAIT_LIMIT {
@@ -8499,6 +8508,23 @@ impl GpuEngine {
                     self.packed_admission[b] = PackedAdmission::WaitingPrefix(since);
                     return Ok(None);
                 }
+            }
+        }
+        if self.vmm_prefix_enabled() && self.pos[b] == 0 && !self.prefix_attach_off[b] {
+            let since = match self.packed_admission[b] {
+                PackedAdmission::WaitingPrefix(since) | PackedAdmission::WaitingRestore(since) => {
+                    since
+                }
+                _ => std::time::Instant::now(),
+            };
+            let restoring = since.elapsed() < RESTORE_WAIT_LIMIT
+                && self
+                    .vmm_prefix()
+                    .and_then(|(_, kv)| kv.attach_handle(prompt, self.staged_prefix[b].as_ref()))
+                    .is_some_and(|handle| self.blocks_restoring(handle));
+            if restoring {
+                self.packed_admission[b] = PackedAdmission::WaitingRestore(since);
+                return Ok(None);
             }
         }
         let host_t = pf_packlog_on().then(std::time::Instant::now);

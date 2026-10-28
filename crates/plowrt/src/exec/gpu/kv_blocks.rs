@@ -866,6 +866,18 @@ impl GpuEngine {
         Ok(())
     }
 
+    /// Whether the boundary `handle` names still has blocks restoring from the host tier.
+    pub(super) fn blocks_restoring(&self, handle: u64) -> bool {
+        let Some(bs) = self.kv_blocks() else {
+            return false;
+        };
+        let Some(plan) = bs.handles.lock().get(&handle).cloned() else {
+            return false;
+        };
+        let ids: Vec<BlockId> = plan.iter().map(|&(_, _, id)| id).collect();
+        bs.store.restoring_any(&ids)
+    }
+
     pub(super) fn blocks_unhold(&self, b: usize) {
         if let Some(bs) = self.kv_blocks() {
             bs.unhold_slot(b);

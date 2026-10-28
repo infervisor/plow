@@ -2502,6 +2502,17 @@ impl VmmKv {
         self.try_attach_keyed(seq, prompt, None)
     }
 
+    /// The block-store handle `prompt` would attach, when its boundary lives in the store.
+    pub fn attach_handle(&self, prompt: &[u32], key: Option<&PrefixKey>) -> Option<u64> {
+        let s = &self.shared;
+        let mut inner = s.inner.lock();
+        let id = attach_target(s, &mut inner, prompt, key)?;
+        match snap_ref(&inner, id)?.store {
+            SnapStore::Blocks { handle, .. } => Some(handle),
+            _ => None,
+        }
+    }
+
     /// [`Self::try_attach`] with the prompt's block hashes already computed (by the DP router);
     /// a key for another block size or prompt is ignored and the prompt hashed here.
     pub fn try_attach_keyed(
