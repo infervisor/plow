@@ -107,6 +107,16 @@
 # 2026-10-13 with the prefix cache off); prod mix (1.8 sessions/s overloads vLLM too) at 0.45: tok/s
 # 0.95x, TTFT/TPOT P99 3.9x/1.8x, SLO met 63 vs 99 %; 0.7 overloads plowrt. Decode ~25 ms at 4 rows,
 # 1024-row prefill chunk 89 ms, and prefix hit 52 -> 13 % under load (vLLM 63-69 %). Serve tunes not run.
+# 2026-10-28 (branch qwen-prefix, plowrt 87e820a40, same packet cb2ea611523da092; serve env below
+# plus PLOW_VMM_HOST_CACHE_MIB=63488, the 62 GiB pinned host tier the planned MemTotal/4 default
+# gives on this 249 GB box): prefix retention fixed in plowrt (GDN state captured at the shared
+# system-prompt end and at awaited checkpoints, no host-tier wipe under device pressure, spills paced
+# at 256 MiB in flight, failed refills keep their host bytes). Prod mix at 0.45 vs vLLM 0.29: tok/s
+# 1.00x, TTFT/TPOT P99 1.27x/1.03x (both spread-flagged), SLO met 99.3 vs 99.3 %, prefix hit 78 %
+# (was 52 %; vLLM 63-69 %); 0.7: 1.02x, 1.58x/0.64x, SLO 55.6 vs 54.4 % (both overload one repeat).
+# c1/c8/c32 0.92x/0.96x/0.96x (c32 was 0.80x; prefix-off control 708 vs 682 out tok/s), the rest is
+# the decode step. FP32 gate c1/c8/c32 PASS on this binary with the host cap (qwen-prefix/gates/bin8);
+# FP32-gate stress (c1, c8, 4 x c32 on one server) at most 1 position over 0.1 nat per capture.
 schema = "plow.recipe.v1"
 namespace = "infervisor"
 name = "qwen3.8-27b"
