@@ -1391,6 +1391,9 @@ struct HostTier {
     quarantined: u32,
 }
 
+/// Spill-ahead copies in flight before the thread waits for them to land (one boundary may
+/// exceed it).
+const SPILL_AHEAD_INFLIGHT_BYTES: u64 = 256 << 20;
 /// One pinned allocation per chunk of host tier slots.
 const HOST_CHUNK_BYTES: u64 = 1 << 30;
 /// Spills whose device buffer is still held; at the cap the oldest is waited for.
@@ -3378,8 +3381,14 @@ impl VmmKv {
             .spawn(move || {
                 while !flag.load(Ordering::Relaxed) {
                     store.reap();
-                    let spilled =
-                        store.device_headroom_bytes() < headroom && spill_ahead_step(&shared);
+                    // Spills in flight count as headroom already, and few are queued at once:
+                    // the copies share the device-to-host copy engine with the engine's own
+                    // readbacks, which waited behind GiB-sized spill bursts (ticks of 0.3-0.9 s
+                    // at c32 on Qwen3.8 BF16, 147 MiB state blocks).
+                    let pending = store.pending_spill_bytes();
+                    let spilled = pending < SPILL_AHEAD_INFLIGHT_BYTES
+                        && store.device_headroom_bytes() + pending < headroom
+                        && spill_ahead_step(&shared);
                     if !spilled {
                         std::thread::sleep(std::time::Duration::from_millis(2));
                     }
