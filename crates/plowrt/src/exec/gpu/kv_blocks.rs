@@ -827,9 +827,10 @@ impl GpuEngine {
             self.run_blocks(&descs, false)
         })();
         // Inside a launch window a successful gather is drained by the step
-        // (`flush_deferred_attach` drops the holds); every other outcome drains here.
+        // (`flush_deferred_attach` drops the holds); outside one the holds retire behind an
+        // event (consumers read the slot in stream order); a failure drains here.
         let mut sync_us = 0u64;
-        let copied = if copied.is_ok() && self.window_open {
+        let copied = if copied.is_ok() {
             copied
         } else {
             let ts = std::time::Instant::now();
@@ -850,7 +851,8 @@ impl GpuEngine {
         }
         match copied {
             Ok(()) if self.window_open => bs.held.lock()[b].push(hold),
-            _ => drop(hold),
+            Ok(()) => self.blocks_release_after(hold),
+            Err(_) => drop(hold),
         }
         copied?;
         let mut st = bs.stats.lock();
