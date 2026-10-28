@@ -69,7 +69,8 @@
 # (random-token rows): 29 riders 19-21 -> 21-26 agree, 8 riders 4-6 -> 1-3. FP32-reference gate
 # c16 PASS 3 of 4 runs (cont_decisive 41 / 43 / 41 / 40 of 46, floor 42/46 - 0.022 = 41/46; the
 # miss is one case, accepted as run-to-run spread with kl_trim 0.045-0.048 vs 0.056 before, vLLM
-# 0.065). Production
+# 0.065); 2026-10-28 the margin became the perf-for-accuracy rule's (peer - 2 cases, [gates]),
+# under which 5 of 5 runs pass. Production
 # mix vs vLLM 0.29 (MATCHED + EQUIVALENT): 1.8/s tok/s 0.99x, TTFT P99 1.24x, TPOT P99 0.99x; 2.7/s
 # 0.99x / 1.25x / 0.82x, goodput 9.005 vs 8.902 req/s, SLO met 97.2% vs 95.7% (was 87.7%). A ladder
 # without the rider spill rungs (1088/1152/2112/4160/4224) lost at 2.7/s (SLO met 89.7-97.1%).
@@ -241,7 +242,17 @@ vllm_capture = "{env:GEMMA12B_FP32_VLLM}"
 # free-run flips 41-43 cases of 46 against the peer's 42, a different case set each run (one case
 # = 0.0217), while kl_mean 0.08 vs 0.13, over-0.1 116 vs 123 and top1_decisive 0.984 vs 0.982 beat
 # the vLLM capture every run.
-cont_decisive_drop_max = 0.022
+# Perf-for-accuracy relaxation (2026-10-28, docs/bringup/agent-tools.md "Gate relaxation for
+# significant perf gains"): 0.022 -> 0.044 = the peer minus 2 cases (40 of 46). Gain: packet
+# a0464475f8ab (pf2) packed prefill 7-23% faster on every rung (header, 2026-10-27). c16 runs of
+# that packet vs this peer (kl_trim <= 0.0718, kl_p95 <= 0.404, top1_decisive >= 0.9773,
+# cont_decisive >= 40, needle >= 1): kl_trim 0.0478 / 0.0473 / 0.0453 / 0.0471 / 0.0478, kl_p95
+# 0.315 / 0.287 / 0.317 / 0.292 / 0.315, top1_decisive 0.9843 / 0.9852 / 0.9872 / 0.9852 / 0.9843,
+# cont_decisive 40 / 41 / 43 / 41 / 40, needle 1: 5 of 5 within the rule (vLLM 0.0653 / 0.367 /
+# 0.9823 / 42 / 1; its second capture 0.0573 / 0.298 / 0.9882 / 42 / 1). The peer is vLLM 0.28;
+# no 0.29 FP32 capture exists for this model. Evidence: /opt/dlami/nvme/lava-tts/g12-decode/gates
+# (pf2-c16, pf2-c16b..d, d5-c16).
+cont_decisive_drop_max = 0.044
 
 [reference]
 csv = "perf-data/campaign/gemma4-12b.h100.reference-vllm028-fp8.csv"

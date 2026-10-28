@@ -141,6 +141,10 @@ kl_mean_max = 2e-3
 # 0.00059/0.00058/0.00057, top1_decisive 1.0, continuation 0.825/0.811/0.854 vs 0.781/0.744/0.803.
 # needle_min 0: E4B opens every 16-token needle answer with reasoning, and the FP32 reference
 # scores 0/9 itself; needle_drop_max still binds.
+# 2026-10-28: consistent with the perf-for-accuracy rule (docs/bringup/agent-tools.md "Gate
+# relaxation for significant perf gains"): needle_min 0 is a reference limit, not a relaxation; the
+# rule's needle >= vLLM is needle_drop_max 0 (both arms 0/9 at c1/c8/c32 here), and no other
+# threshold is relaxed.
 [gates.llm_fp32_ref]
 reference = "{env:E4B_FP32_REF}"
 concurrency = [1, 8, 32]
