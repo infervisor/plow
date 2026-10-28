@@ -8,6 +8,13 @@
 //!
 //! `LiveTarget` is a plain description of a probed machine so this crate needs
 //! no `hwspec` dependency; `plowrt` fills it from a `HardwareFingerprint`.
+//!
+//! The wire structs are LENIENT readers: a field this build does not know is
+//! ignored, never refused. A registry is read by every `plowrt` ever
+//! released, and a field added for a newer client must not make an older
+//! client refuse the whole index — which is what `deny_unknown_fields` did
+//! until 0.1.3. Strictness belongs to the `validate()` methods below and to
+//! the publisher, which writes only what this schema names.
 
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -46,7 +53,6 @@ pub enum Delta {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct Target {
     pub vendor: String,
     pub isa: String,
@@ -65,7 +71,6 @@ pub fn runtime_compiled(vendor: &str) -> bool {
 /// How work is spread across GPUs. An object, not a string, so a composite
 /// (`tp4pp2`) is expressible the day `plowc` stops refusing `--parallel pp`.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct Parallel {
     pub mode: String,
     pub n: u32,
@@ -78,7 +83,6 @@ impl Parallel {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct Build {
     pub plow_git: String,
     pub plowc: String,
@@ -93,7 +97,6 @@ pub struct Build {
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct Measured {
     pub tok_s: f64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -103,7 +106,6 @@ pub struct Measured {
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct Variant {
     pub variant_id: String,
     pub label: String,
@@ -134,7 +136,6 @@ pub struct Variant {
 
 /// `v1/<namespace>/<name>/index.json`.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct ModelIndex {
     pub schema: String,
     pub namespace: String,
@@ -151,7 +152,6 @@ pub struct ModelIndex {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct CheckpointRef {
     pub shards: u32,
     pub layout: String,
@@ -173,7 +173,6 @@ pub enum Provenance {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct FileRef {
     pub role: String,
     pub name: String,
@@ -182,7 +181,6 @@ pub struct FileRef {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct TokenizerRef {
     pub source: Provenance,
     pub file: String,
@@ -198,7 +196,6 @@ pub struct TokenizerRef {
 
 /// `v1/<ns>/<name>/manifests/<label>@g<n>` — one variant's manifest.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct Bundle {
     pub schema: String,
     pub namespace: String,
@@ -230,7 +227,6 @@ pub struct Bundle {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct BundleCheckpoint {
     /// `hf:<org>/<repo>`, fetched from Hugging Face; or [`DIST_SOURCE`], carried
     /// by the distribution itself as `files`.
@@ -252,7 +248,6 @@ pub const DIST_SOURCE: &str = "dist";
 /// One checkpoint file, published under `v1/blobs/sha256/<hex>` like a bundle
 /// file. `name` is its path in the snapshot, so it may nest.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct CheckpointFile {
     pub name: String,
     pub sha256: String,
@@ -260,7 +255,6 @@ pub struct CheckpointFile {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct BundleObjset {
     pub objset_id: String,
     pub manifest: String,
@@ -272,7 +266,6 @@ pub struct BundleObjset {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct LowRung {
     pub max: u32,
     pub objset_id: String,
@@ -286,7 +279,6 @@ pub struct LowRung {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct ObjSetObject {
     pub name: String,
     pub sha256: String,
@@ -301,7 +293,6 @@ pub struct ObjSetObject {
 
 /// `v1/objsets/<vendor>/<isa>/<sku>/<objset-id>.json`.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct ObjSet {
     pub schema: String,
     pub objset_id: String,

@@ -747,18 +747,21 @@ fn bundle_rejects_structural_damage() {
 }
 
 #[test]
-fn unknown_fields_are_rejected_across_every_schema() {
+fn unknown_fields_are_ignored_across_every_schema() {
+    // A field added for a newer client must not make this build refuse the
+    // whole document: a registry is read by every plowrt ever released.
     let mut raw = serde_json::to_value(bundle()).unwrap();
     raw["surprise"] = serde_json::json!(1);
-    assert!(serde_json::from_value::<Bundle>(raw).is_err());
+    assert_eq!(serde_json::from_value::<Bundle>(raw).unwrap(), bundle());
 
     let mut raw = serde_json::to_value(objset()).unwrap();
     raw["objects"][0]["surprise"] = serde_json::json!(1);
-    assert!(serde_json::from_value::<ObjSet>(raw).is_err());
+    assert_eq!(serde_json::from_value::<ObjSet>(raw).unwrap(), objset());
 
     let mut raw = serde_json::to_value(index()).unwrap();
     raw["variants"][0]["surprise"] = serde_json::json!(1);
-    assert!(serde_json::from_value::<ModelIndex>(raw).is_err());
+    raw["variants"][0]["target"]["surprise"] = serde_json::json!({"nested": true});
+    assert_eq!(serde_json::from_value::<ModelIndex>(raw).unwrap(), index());
 }
 
 #[test]
