@@ -742,9 +742,12 @@ a whole encoder/codec/vocoder sequence (worse: a 166 ms S3Gen render then blocks
 Pin the cuBLASLt prefill algorithms in production (`PLOW_LT_ALGOS=<table>`, written once with
 `PLOW_LT_ALGOS_WRITE=<table>` on the serving GPU). Timed at every start, near-tied candidates win by
 noise: across 30 starts on one L4, qwen3-asr's 512-row k/v pair picked algorithm 0 seven times and
-2 twenty-three times (and three other prefill shapes flip too), and the customer streaming eval
-moved 30 of 466 turns between 12.22% and 12.85% WER with nothing else changed. A pinned table gives
-the same transcripts after every restart.
+2 twenty-three times, and three other prefill shapes flip too. Two such pick sets differ on 9 of 466
+turns of the customer streaming eval; a pinned table gives the same transcripts after every restart.
+
+Compare ASR runs only under the service's own environment: `/etc/plow-asr.env` sets
+`PLOW_ASR_AUTO_LANGUAGES=English,Spanish`, and without it the same binary moves 30 of 466 turns
+(12.22% -> 12.85% WER on that eval).
 
 One `plowrt serve --assets <qwen3-asr> --assets <fish-s2-pro> --asr-vad-packet <vad.pkt>
 --co-sched rr` with `PLOW_VMM_LIVE=1` (the Fish L4 bundle's serve default; set it in the
