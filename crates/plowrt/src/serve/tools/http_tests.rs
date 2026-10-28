@@ -1341,3 +1341,236 @@ async fn engine_flags_install_as_defaults_under_the_file_and_the_request() {
         "<think>plan</think>Four."
     );
 }
+
+fn harness_for_real_checkpoint(ckpt: &std::path::Path) -> Harness {
+    static SEQ: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    let n = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let dir = std::env::temp_dir().join(format!("plowrt-tool-real-{}-{n}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    if ckpt.join("chat_template.jinja").exists() {
+        std::fs::copy(
+            ckpt.join("chat_template.jinja"),
+            dir.join("chat_template.jinja"),
+        )
+        .unwrap();
+    }
+    if ckpt.join("tokenizer_config.json").exists() {
+        std::fs::copy(
+            ckpt.join("tokenizer_config.json"),
+            dir.join("tokenizer_config.json"),
+        )
+        .unwrap();
+    }
+    if ckpt.join("tokenizer.json").exists() {
+        #[cfg(unix)]
+        let _ = std::os::unix::fs::symlink(ckpt.join("tokenizer.json"), dir.join("tokenizer.json"));
+        #[cfg(not(unix))]
+        let _ = std::fs::copy(ckpt.join("tokenizer.json"), dir.join("tokenizer.json"));
+    }
+    std::fs::write(
+        dir.join("weights.json"),
+        r#"{"network":"toolm","gpu":"cpu","num_gpus":1,"parallel":"none","weight_shared":false,"buckets":[]}"#,
+    )
+    .unwrap();
+    let backend: Arc<dyn crate::device::Backend> =
+        Arc::new(crate::device::cpu::CpuBackend::new(1));
+    let registry = crate::orch::Registry::new();
+    let slug = registry.load(&dir, None).unwrap();
+    let bundle = registry.get(&slug).unwrap();
+    let state = Arc::new(AppState::new(
+        registry,
+        Arc::new(crate::exec::ExecutorSet::bringup(backend).unwrap()),
+    ));
+    state.scripted.write().push(slug.clone());
+    let model = Arc::clone(&bundle);
+    let script = Arc::new(Mutex::new(Script::default()));
+    let s = Arc::clone(&script);
+    state.install_mux(
+        slug,
+        crate::serve::mux::scripted_mux(move |job| {
+            let mut text = String::new();
+            bundle
+                .tokenizer()
+                .decode_append(&job.prompt_ids, true, &mut text);
+            let mut s = s.lock().unwrap();
+            s.prompts.push(text);
+            s.queue.pop_front().unwrap_or_else(|| s.reply.clone())
+        }),
+    );
+    Harness {
+        app: app(state),
+        bundle: model,
+        script,
+        _dir: TempDir(dir),
+    }
+}
+
+/// Real Gemma-4-E2B checkpoint end-to-end on this host: template, real 32MB tokenizer,
+/// thought channel separation (<|channel>thought ... <channel|>), tool calls, and thinking controls.
+#[tokio::test]
+async fn gemma_4_e2b_real_checkpoint_end_to_end() {
+    let e2b = std::path::Path::new("/Users/lava/models/gemma-4-E2B-it");
+    if !e2b.join("chat_template.jinja").exists() || !e2b.join("tokenizer.json").exists() {
+        eprintln!("skipped: /Users/lava/models/gemma-4-E2B-it not present on this host");
+        return;
+    }
+
+    let h = harness_for_real_checkpoint(e2b);
+
+    // 1. Non-streaming with thought channel
+    h.reply(&[
+        "<|channel>thought\nThinking step-by-step for Gemma 4 E2B.<channel|>",
+        "The answer is 42.",
+    ]);
+    let (code, v) = h
+        .json(json!({"messages": user("What is the meaning of life?")}))
+        .await;
+    assert_eq!(code, StatusCode::OK, "{v}");
+    let c = &v["choices"][0];
+    assert_eq!(c["finish_reason"], "stop");
+    assert_eq!(
+        c["message"]["reasoning_content"].as_str(),
+        Some("Thinking step-by-step for Gemma 4 E2B.")
+    );
+    assert_eq!(c["message"]["content"].as_str(), Some("The answer is 42."));
+
+    // 2. Streaming SSE with thought channel
+    h.reply(&[
+        "<|channel>thought\nStreamed reasoning chunk.<channel|>",
+        "Streamed answer.",
+    ]);
+    let (frames, done) = h
+        .sse(json!({"messages": user("What is the meaning of life?")}))
+        .await;
+    assert!(done, "SSE stream completed with [DONE]");
+    let (content, reasoning, calls, finish) = accumulate(&frames);
+    assert_eq!(reasoning, "Streamed reasoning chunk.");
+    assert_eq!(content, "Streamed answer.");
+    assert_eq!(finish.as_deref(), Some("stop"));
+    assert_eq!(calls.len(), 0);
+
+    // 3. Tool calling alongside thought channel in Gemma-4 format
+    h.reply(&[
+        "<|channel>thought\nLooking up Oslo weather.<channel|>",
+        "<|tool_call>call:get_weather{city:<|\"|>Oslo<|\"|>,days:3}<tool_call|>",
+    ]);
+    let (code, v) = h
+        .json(json!({"messages": user("Weather in Oslo?"), "tools": tools()}))
+        .await;
+    assert_eq!(code, StatusCode::OK, "{v}");
+    let msg = &v["choices"][0]["message"];
+    assert_eq!(
+        msg["reasoning_content"].as_str(),
+        Some("Looking up Oslo weather.")
+    );
+    let tool_calls = msg["tool_calls"].as_array().expect("tool_calls");
+    assert_eq!(tool_calls.len(), 1);
+    assert_eq!(tool_calls[0]["function"]["name"], "get_weather");
+    assert!(tool_calls[0]["function"]["arguments"]
+        .as_str()
+        .unwrap()
+        .contains("Oslo"));
+
+    // 4. Thinking control fields on real E2B
+    let (code, v) = h
+        .json(json!({
+            "messages": user("hello"),
+            "thinking_token_budget": 32,
+            "max_reply_tokens": 16,
+            "reasoning_end": "Done thinking.<channel|>"
+        }))
+        .await;
+    assert_eq!(code, StatusCode::OK, "{v}");
+}
+
+/// Reasoning trace separation and thinking control across DeepSeek, GLM, Qwen, and Kimi families.
+#[tokio::test]
+async fn reasoning_stack_across_model_families() {
+    // A. DeepSeek-R1: <think> ... </think> separation
+    let h_ds = harness_for("deepseek-r1-tools");
+    h_ds.reply(&[
+        "<think>",
+        "DeepSeek reasoning trace.",
+        "</think>",
+        "DeepSeek final answer.",
+    ]);
+    let (code, v) = h_ds
+        .json(json!({"messages": user("Solve this problem")}))
+        .await;
+    assert_eq!(code, StatusCode::OK, "{v}");
+    let msg = &v["choices"][0]["message"];
+    assert_eq!(
+        msg["reasoning_content"].as_str(),
+        Some("DeepSeek reasoning trace.")
+    );
+    assert_eq!(msg["content"].as_str(), Some("DeepSeek final answer."));
+
+    // DeepSeek SSE streaming separation
+    let (frames, done) = h_ds
+        .sse(json!({"messages": user("Solve this problem")}))
+        .await;
+    assert!(done);
+    let (content, reasoning, _, finish) = accumulate(&frames);
+    assert_eq!(reasoning, "DeepSeek reasoning trace.");
+    assert_eq!(content, "DeepSeek final answer.");
+    assert_eq!(finish.as_deref(), Some("stop"));
+
+    // B. GLM-5.3: prompt already ends with <think>, so generation continues the trace
+    let h_glm = harness_for("glm5.3");
+    h_glm.reply(&[
+        "GLM-5.3 deliberation.",
+        "</think>",
+        "GLM-5.3 response.",
+    ]);
+    let (code, v) = h_glm
+        .json(json!({
+            "messages": user("Hello"),
+            "chat_template_kwargs": {"enable_thinking": true}
+        }))
+        .await;
+    assert_eq!(code, StatusCode::OK, "{v}");
+    let msg = &v["choices"][0]["message"];
+    assert_eq!(
+        msg["reasoning_content"].as_str(),
+        Some("GLM-5.3 deliberation.")
+    );
+    assert_eq!(msg["content"].as_str(), Some("GLM-5.3 response."));
+
+    // C. Qwen3: enable_thinking switch and <think> separation
+    let h_qwen = harness_for("qwen3");
+    h_qwen.reply(&[
+        "<think>",
+        "Qwen3 planning.",
+        "</think>",
+        "Qwen3 answer.",
+    ]);
+    let (code, v) = h_qwen
+        .json(json!({
+            "messages": user("Explain quantum computing"),
+            "chat_template_kwargs": {"enable_thinking": true}
+        }))
+        .await;
+    assert_eq!(code, StatusCode::OK, "{v}");
+    let msg = &v["choices"][0]["message"];
+    assert_eq!(msg["reasoning_content"].as_str(), Some("Qwen3 planning."));
+    assert_eq!(msg["content"].as_str(), Some("Qwen3 answer."));
+
+    // D. Kimi-K2: tool calls
+    let h_kimi = harness_for("kimi-k2");
+    h_kimi.reply(&[
+        "<|tool_calls_section_begin|><|tool_call_begin|>functions.get_weather:0<|tool_call_argument_begin|>{\"city\": \"Tokyo\"}<|tool_call_end|><|tool_calls_section_end|>",
+    ]);
+    let (code, v) = h_kimi
+        .json(json!({"messages": user("Weather in Tokyo?"), "tools": tools()}))
+        .await;
+    assert_eq!(code, StatusCode::OK, "{v}");
+    let msg = &v["choices"][0]["message"];
+    let calls = msg["tool_calls"].as_array().expect("kimi tool_calls");
+    assert_eq!(calls.len(), 1);
+    assert_eq!(calls[0]["function"]["name"], "get_weather");
+    assert!(calls[0]["function"]["arguments"]
+        .as_str()
+        .unwrap()
+        .contains("Tokyo"));
+}
