@@ -947,7 +947,7 @@ impl GuidedSpeech {
         };
         let mut languages: Vec<String> = tables.languages().map(str::to_owned).collect();
         languages.sort_unstable();
-        let spec = SpeechSpec {
+        let mut spec = SpeechSpec {
             voices,
             languages,
             default_language: tables.language(None)?,
@@ -963,6 +963,7 @@ impl GuidedSpeech {
             voice_cloning: voice_cond.is_some(),
             clone_transcript: false,
         };
+        spec.narrow_voices(&crate::config::RuntimeConfig::get().tts_voices);
         Ok(GuidedSpeech {
             c,
             tables,

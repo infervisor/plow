@@ -8,10 +8,15 @@
 //! never silently dropped.
 
 use super::serving::SpeechRequest;
+use super::stretch::{MAX_SPEED, MIN_SPEED};
 use super::MAX_INPUT_CHARS;
 
 /// Response formats every speech model serves.
 pub const FORMATS: [&str; 2] = ["wav", "pcm"];
+
+/// Rates a reply may be resampled to, the range the resampler covers.
+pub const MIN_OUT_RATE: u32 = crate::asr::frontend::MIN_INPUT_RATE;
+pub const MAX_OUT_RATE: u32 = crate::asr::frontend::MAX_INPUT_RATE;
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct SpeechSpec {
@@ -59,6 +64,10 @@ pub struct Sampling {
 #[derive(Clone, Debug, PartialEq)]
 pub struct Checked {
     pub wav: bool,
+    /// The reply's sample rate: the request's, else the model's own.
+    pub sample_rate: u32,
+    /// The reply's speed; 1.0 leaves the audio unstretched.
+    pub speed: f32,
     pub language: Option<String>,
     pub sampling: Sampling,
     /// The request's seed, or a fresh one: an unseeded request samples anew every time.
@@ -79,8 +88,34 @@ fn invalid(message: impl Into<String>, param: &'static str) -> Invalid {
 }
 
 impl SpeechSpec {
-    /// `req` against this model, first failing field first: format, input, speed, language,
-    /// voice, instructions, reference, sampling, cfg_weight, max_tokens.
+    /// Keeps only the voices `allowed` names (`--tts-voice`), so a deployment serves a subset of
+    /// what the model has. A name the model lacks is warned about; no name matching leaves the
+    /// list alone, which is how one flat list narrows one model of several without emptying the
+    /// others. Empty `allowed` keeps the model's own list.
+    pub fn narrow_voices(&mut self, allowed: &[String]) {
+        let allowed: Vec<&str> = allowed
+            .iter()
+            .map(|v| v.trim())
+            .filter(|v| !v.is_empty())
+            .collect();
+        if allowed.is_empty() {
+            return;
+        }
+        let mine = |v: &str| self.voices.iter().any(|m| m == v);
+        if !allowed.iter().copied().any(mine) {
+            return;
+        }
+        for v in allowed.iter().copied().filter(|v| !mine(v)) {
+            tracing::warn!(
+                voice = v,
+                "tts: --tts-voice names a voice this model does not have"
+            );
+        }
+        self.voices.retain(|v| allowed.contains(&v.as_str()));
+    }
+
+    /// `req` against this model, first failing field first: format, sample rate, input, speed,
+    /// language, voice, instructions, reference, sampling, cfg_weight, max_tokens.
     pub fn check(&self, req: &SpeechRequest) -> Result<Checked, Invalid> {
         let wav = match req.response_format.as_deref().unwrap_or("wav") {
             "wav" => true,
@@ -95,6 +130,16 @@ impl SpeechSpec {
                 ))
             }
         };
+        let sample_rate = match req.sample_rate {
+            None => self.sample_rate,
+            Some(r) if (MIN_OUT_RATE..=MAX_OUT_RATE).contains(&r) => r,
+            Some(r) => {
+                return Err(invalid(
+                    format!("sample_rate {r} is outside {MIN_OUT_RATE}..={MAX_OUT_RATE} Hz"),
+                    "sample_rate",
+                ))
+            }
+        };
         if req.input.trim().is_empty() {
             return Err(invalid("`input` is empty", "input"));
         }
@@ -105,9 +150,16 @@ impl SpeechSpec {
                 "input",
             ));
         }
-        if req.speed.is_some_and(|s| s != 1.0) {
-            return Err(invalid("only speed 1.0 is supported", "speed"));
-        }
+        let speed = match req.speed {
+            None => 1.0,
+            Some(s) if (MIN_SPEED..=MAX_SPEED).contains(&s) => s,
+            Some(s) => {
+                return Err(invalid(
+                    format!("speed {s} is outside {MIN_SPEED}..={MAX_SPEED}"),
+                    "speed",
+                ))
+            }
+        };
         let language = match req.language.as_deref().map(str::to_lowercase) {
             None => self.default_language.clone(),
             Some(l) if self.languages.is_empty() => {
@@ -244,6 +296,8 @@ impl SpeechSpec {
         }
         Ok(Checked {
             wav,
+            sample_rate,
+            speed,
             language,
             sampling: Sampling {
                 temperature: req.temperature.unwrap_or(self.temperature),
@@ -401,12 +455,13 @@ mod tests {
     fn the_first_failing_field_is_reported() {
         let s = spec(&[]);
         let all_bad = serde_json::json!({
-            "response_format": "mp3", "input": " ", "speed": 2.0, "language": "en",
-            "voice": "z", "instructions": "calm", "ref_text": "hi", "temperature": 9.0,
-            "cfg_weight": 0.5, "max_tokens": 0
+            "response_format": "mp3", "sample_rate": 100, "input": " ", "speed": 3.0,
+            "language": "en", "voice": "z", "instructions": "calm", "ref_text": "hi",
+            "temperature": 9.0, "cfg_weight": 0.5, "max_tokens": 0
         });
         let order = [
             "response_format",
+            "sample_rate",
             "input",
             "speed",
             "language",
@@ -423,14 +478,15 @@ mod tests {
             assert_eq!(e.param, *field);
             let fix = match i {
                 0 => ("response_format", serde_json::json!("wav")),
-                1 => ("input", serde_json::json!("hello")),
-                2 => ("speed", serde_json::json!(1.0)),
-                3 => ("language", serde_json::Value::Null),
-                4 => ("voice", serde_json::json!("b")),
-                5 => ("instructions", serde_json::Value::Null),
-                6 => ("ref_text", serde_json::Value::Null),
-                7 => ("temperature", serde_json::json!(0.5)),
-                8 => ("cfg_weight", serde_json::Value::Null),
+                1 => ("sample_rate", serde_json::Value::Null),
+                2 => ("input", serde_json::json!("hello")),
+                3 => ("speed", serde_json::json!(1.0)),
+                4 => ("language", serde_json::Value::Null),
+                5 => ("voice", serde_json::json!("b")),
+                6 => ("instructions", serde_json::Value::Null),
+                7 => ("ref_text", serde_json::Value::Null),
+                8 => ("temperature", serde_json::json!(0.5)),
+                9 => ("cfg_weight", serde_json::Value::Null),
                 _ => ("max_tokens", serde_json::json!(5)),
             };
             r[fix.0] = fix.1;
@@ -537,5 +593,75 @@ mod tests {
         assert!(s
             .check(&req(serde_json::json!({"max_tokens": 1000})))
             .is_ok());
+    }
+
+    #[test]
+    fn a_reply_takes_the_requested_sample_rate() {
+        let s = spec(&[]);
+        assert_eq!(
+            s.check(&req(serde_json::json!({}))).unwrap().sample_rate,
+            24000
+        );
+        assert_eq!(
+            s.check(&req(serde_json::json!({"sample_rate": 8000})))
+                .unwrap()
+                .sample_rate,
+            8000
+        );
+        for bad in [MIN_OUT_RATE - 1, MAX_OUT_RATE + 1] {
+            assert_eq!(
+                s.check(&req(serde_json::json!({"sample_rate": bad})))
+                    .unwrap_err()
+                    .param,
+                "sample_rate"
+            );
+        }
+    }
+
+    #[test]
+    fn a_reply_takes_the_requested_speed() {
+        let s = spec(&[]);
+        assert_eq!(s.check(&req(serde_json::json!({}))).unwrap().speed, 1.0);
+        for ok in [MIN_SPEED, 0.9, MAX_SPEED] {
+            assert_eq!(
+                s.check(&req(serde_json::json!({"speed": ok})))
+                    .unwrap()
+                    .speed,
+                ok
+            );
+        }
+        for bad in [MIN_SPEED - 0.01, MAX_SPEED + 0.01] {
+            assert_eq!(
+                s.check(&req(serde_json::json!({"speed": bad})))
+                    .unwrap_err()
+                    .param,
+                "speed"
+            );
+        }
+    }
+
+    #[test]
+    fn a_deployment_narrows_the_voices_a_model_serves() {
+        let mut s = spec(&[]);
+        s.narrow_voices(&[]);
+        assert_eq!(s.voices, ["a", "b"]);
+
+        let mut s = spec(&[]);
+        s.narrow_voices(&["b".into(), "  ".into()]);
+        assert_eq!(s.voices, ["b"]);
+        assert_eq!(
+            s.check(&req(serde_json::json!({"voice": "a"})))
+                .unwrap_err()
+                .param,
+            "voice"
+        );
+
+        let mut s = spec(&[]);
+        s.narrow_voices(&["a".into(), "absent".into()]);
+        assert_eq!(s.voices, ["a"]);
+
+        let mut s = spec(&[]);
+        s.narrow_voices(&["another-model".into()]);
+        assert_eq!(s.voices, ["a", "b"]);
     }
 }
