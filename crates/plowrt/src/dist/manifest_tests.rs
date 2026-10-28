@@ -1239,3 +1239,17 @@ fn every_recipe_in_the_tree_is_readable() {
         refused.join("\n")
     );
 }
+
+#[test]
+fn a_sidecar_packet_and_its_receipts_are_bundled_by_suffix() {
+    assert_eq!(super::classify("model.pkt"), Some("packet"));
+    assert_eq!(super::classify("codec.pkt"), Some("codec_packet"));
+    assert_eq!(super::classify("encoder.pkt"), Some("sidecar_packet"));
+    assert_eq!(super::classify("s3gen.pkt"), Some("sidecar_packet"));
+    assert_eq!(
+        super::classify("encoder.lean-checks.json"),
+        Some("sidecar_checks")
+    );
+    assert_eq!(super::classify("lean-checks.json"), Some("packet_checks"));
+    assert_eq!(super::classify("notes.txt"), None);
+}

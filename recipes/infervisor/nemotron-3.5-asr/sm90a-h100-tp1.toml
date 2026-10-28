@@ -23,6 +23,7 @@ doc = "docs/runtime/asr.md"
 vendor = "nvidia"
 isa = "sm_90a"
 sku = "H100 SXM5"
+toolchain = "cuda-12.9-nix"
 units = 132
 num_gpus = 1
 parallel = "tp"

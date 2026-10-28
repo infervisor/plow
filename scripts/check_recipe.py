@@ -101,6 +101,11 @@ def check_rung_env(over: dict, build_json: dict, observed: dict) -> None:
                 )
 
 
+# Emit env keys that locate a tool on the build host rather than shape the
+# packet; a recipe states them for the build command, the checker ignores them.
+MACHINE_PATH_KNOBS = ("PLOW_VERIFY_BIN",)
+
+
 def check_emit(recipe: dict, build_json: dict) -> list[str]:
     """`[emit].env` against `build.json`'s own knob record."""
     rungs = recipe_rung_env(recipe)
@@ -123,6 +128,12 @@ def check_emit(recipe: dict, build_json: dict) -> list[str]:
         observed = {k: v for k, v in observed.items() if k != "PLOW_SPEC_DRAFT_DIR"}
         derived.pop("PLOW_SPEC_DRAFT_DIR")
     requested = {**derived, **((recipe.get("emit") or {}).get("env") or {})}
+    # Machine paths are not decisions: `PLOW_VERIFY_BIN` names where the Lean
+    # verifier lives on the build host and the knob record never carries it
+    # (the receipts beside the packet are what prove the verification ran).
+    for machine in MACHINE_PATH_KNOBS:
+        requested.pop(machine, None)
+        observed.pop(machine, None)
     exact_map(requested, observed, "emit")
     check_rung_env(rungs, build_json, observed)
 

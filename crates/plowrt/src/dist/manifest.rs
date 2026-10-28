@@ -1088,6 +1088,14 @@ fn classify(name: &str) -> Option<&'static str> {
     if name.ends_with(".lean-checks.json") {
         return Some("sidecar_checks");
     }
+    // The sidecar packets themselves: `encoder.pkt` (an ASR frontend),
+    // `s3gen.pkt`, ... — loaded by the packet runtimes beside `model.pkt`
+    // by their own names. `model.pkt` and `codec.pkt` matched the table
+    // above; anything else ending in `.pkt` is a sidecar, and dropping it
+    // publishes an ASR bundle that transcribes nothing.
+    if name.ends_with(".pkt") {
+        return Some("sidecar_packet");
+    }
     None
 }
 
