@@ -1456,6 +1456,14 @@ prefix history (it does, `prefill_batched` inner), penalized or non-greedy verif
 rows never draft; device draws per verify row reproduce plain decode's), unawaited intermediate
 checkpoints not published (by design: only an awaited checkpoint or a prompt end publishes).
 
+Verification of the fixes: plowrt unit tests (1400 CUDA-feature, 325 CPU-feature serve and
+token-batch, resolver and tail tests), compile checks for `hsa`, `cpu` and `cuda,hsa`;
+`step_bench --ride` dumps of the fixed binary are bit-identical to the base binary's on 26B
+FP8 (widths 1/8/29, ride and step); on Qwen BF16 both binaries differ only through cuBLASLt's
+load-time algorithm choice (the base binary's two runs agree with each other, and the selected
+algorithm indices differ between the runs that differ). The mixed-traffic serve on the fixed
+binary matches the base binary's (no errors besides one over-context request, no refusals).
+
 ## 3. Open
 
 * E4B's tail launches give up split riders; a rider site before the tail boundary would keep
