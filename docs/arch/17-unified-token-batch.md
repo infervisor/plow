@@ -11,9 +11,8 @@ now code and tests. Where the two disagree, the disagreement is called out here.
 
 ## Contents
 
-Runtime selection defaults on (`PLOW_TOKEN_BATCH`, `RuntimeConfig::token_batch`, default
-**true**). `--token-batch=false` or `PLOW_TOKEN_BATCH=0` disables it; explicit `--fusion` takes
-precedence. There are **two** executors, with two different gates:
+Runtime selection is always on wherever the backend, model and object support it; explicit
+`--fusion` takes precedence. There are **two** executors, with two different gates:
 
 * **AMD (gfx942 dense GQA)** — a dense program with direct BF16 KV, matching object markers,
   multiple slots, and an attention epilogue compatible with the packet: fused output for
@@ -58,6 +57,8 @@ their cross-references were the only thing tying them.
 * **Part III** — the row-identity classification of the device ISA (taken at 154 opcodes; it is
   now 184), and what it says about
   runtime fusion v1.
+* **Part IV** — the 2026-10-28 continuous-batching audit: coverage per model class, what falls
+  back and why, and the bugs found.
 
 Each part keeps its own section numbering, so a reference like "Part II §4" resolves.
 
@@ -1358,3 +1359,114 @@ beat v1 at concurrency 1 — where v1 can only lose.
   yet check a blob's *declared* classes against its actual ones (§4.2). That
   check is the natural next step once the table moves into `packet` and `devgen`
   stamps it.
+
+---
+
+# Part IV: Continuous batching audit, 2026-10-28
+
+What packs into one launch per tick today, per model class, what falls back and why, and the
+bugs a code audit, two independent reviews and targeted GPU repros found (branch
+`unified-batch`). Probes: `step_bench --ride` (rider logits against a decode step, split
+attention on/off, `--ride-salt`) and a mixed-traffic serve (64 requests per run: shared-prefix
+suffixes, cancellations before the first token and mid-decode, logprobs, stop strings, sampled
+rows; a cold run then a warm-cache run per server).
+
+## 1. Coverage matrix (H100 unless noted)
+
+"Packs" = prefill chunks and decode rows in one launch. "Suffix" = a prefix-cache hit packs
+only the uncached suffix (span `kv_row0 > 0`, frontier from the engine). "Riders" = decode rows
+attend through the split-KV rider kernels instead of one-row prefill-attention requests.
+
+| class (packet) | packs | suffix | riders | separate steps, and why |
+|---|---|---|---|---|
+| dense GQA, FP8 KV (Gemma-4 12B) | yes | yes | yes (split, FP8) | decode-only ticks use the decode object; a launch rides only while `sched::ride` measures it cheaper than a step (always under the ITL budget) |
+| sliding + full layers, KV-shared tail (Gemma-4 E4B, BF16 KV) | yes | yes | split riders only when the tail is not used; with the tail (sampled rows fit it) decode rows are one-row prefill-attention requests | the body/tail split has no rider sites (`pf_seg_prefix`) |
+| MoE (Gemma-4 26B-A4B FP8 / BF16) | yes | yes | yes | as dense; MoE activation scales are per row (`ascale[M]`) and the gathered-row capacity is a buffer bound, so no row's routing or scale depends on another request |
+| recurrent GDN hybrid (Qwen3.8 BF16 / FP8) | yes, when the packet declares the packed scan's init-state scratch | yes (state restored at a captured boundary; chunks cut at `state_capture_cut`) | yes: decode rows are one-row continuing requests stepped by the GDN ride kernel, attention through the riders | verify spans refused (state cannot rewind) |
+| MLA / DSA (GLM-5.3, DeepSeek; AMD) | no token batch (class C/D opcodes, Part III); mixed v1 or separate steps | n/a | n/a | compile-checked only (no AMD box) |
+| spec decode (MTP verify spans) | yes, opt-in (`PLOW_SPEC=1`, `PLOW_SPEC_RIDE=k`): drafts fill the bucket's padding | n/a | plain riders only | one blocked row (seeded sampled, CFG, plain-decode) stops drafting for the launch; with a KV-shared tail the drafter hidden is not saved, so that slot cannot draft next tick (perf only); DSpark block drafters are not served |
+| multimodal soft tokens | yes (`ROW_ID_BIT` rows from the slab) | yes | yes | a media span is never cut; a launch holding one runs without the ITL budget |
+| ASR (`in.encoder_overlay`), codec-LM TTS with a position base (`in.pos_base`), CFG pairs, depth stages, hd128 attention (Veena, Orpheus) | no: packed prefill, then a separate decode step | yes | no | the batch embeds decode rows through the prefill program (no overlay / position base), partner rows have no slot entry, depth stages sample in serial prefill's tail, and hd128 has no rider kernel (one-row requests measured 27.1 vs 33.8 audio s/s) |
+| CPU (Xeon) | yes, through the AMD/CPU arm: batch-invariant packed buckets | yes | n/a | a pack needs two prefill members (AMD measurement); one prompt plus decode rows runs as two steps — unmeasured on Xeon |
+
+There is no runtime switch to turn the token batch off: without it, packed prefill is disabled
+under the always-on prefix cache, FP8-KV packets refuse to load ("FP8-KV segmented prefill
+requires a compiled packed request contract"), and BF16 packets prefill one request per launch.
+
+## 2. Findings
+
+Fixed (commits `eec6b69e6`, `2487263dd`):
+
+1. **A refusal failed every packed request and rider.** Any error from the CUDA step,
+   including a host refusal decided before any kernel ran, failed the whole launch (up to the
+   engine batch). Now a `Rejected` error with no device launch yet (`tb_launched`, set right
+   before the bucket's counter reset) re-runs the tick's prompts without riders and leaves the
+   riders to the decode step, as the AMD arm already did. Staging-upload or drain failures keep
+   the fan-out. No reachable trigger was found in normal traffic; it bounds the blast radius of
+   a host/engine disagreement.
+2. **KV-shared tail with FP8 KV attended the wrong slot (latent).** The decode-rung tail remaps
+   `FlashDecode`'s slot map (t6) but `FlashDecodeFp8` takes it from `in.rowslot` (fj[2]); tail
+   row r read slot r's cache. Such a tail is no longer built. No production packet has FP8 KV
+   with a shared tail (E4B is BF16 KV and builds no decode tail).
+3. **CFG pairs in the unified batch (latent).** Partner rows have no slot entry (dropped from
+   the requests) and the uncond logits are read at row + 1 (another request's row). Speech CFG
+   packets carry `in.pos_base`, which disarms the batch; any other CFG packet now takes the
+   ordinary path.
+4. **Fan-out owner arithmetic.** `if slots[i].is_some() { i } else { i - 1 }` underflowed at
+   slot 0 and failed an unrelated neighbour for an empty row; `pack_owner` names only a CFG owner.
+5. **AMD token batch dropped requested logprobs** (`lp_row = usize::MAX` for every sampled
+   token). The arm now yields while a live request wants logprobs, unless the engine declares
+   `token_batch_logprobs` (CPU does).
+6. **Verify spans on a recurrent chain** would commit a shortened frontier over a fully advanced
+   scan state; refused in the engine (`spec_enable` already refuses such packets).
+
+Measured, not bugs:
+
+* **No cross-row leakage.** Rider logits are bit-identical when every other row of the launch
+  changes (`--ride-salt`), on 12B FP8, 26B FP8 and Qwen BF16, widths 1/8/29.
+* **The Qwen BF16 ~220 ms rider cost is a bench artifact of the rung ladder**, not of event
+  synchronization: `--ride 1024` puts 1024 prompt rows plus the riders in one launch, and the
+  Qwen ladder has no rung between 1024 and 4096 (1025 rows run the 4096 bucket, 304 ms, flat in
+  the rider count). Serving trims the prompt so prompt + riders fit the rung
+  (`trim_for_riders`): in the mixed-traffic serve, 1024-row launches with riders averaged
+  95.8 ms against 114 ms without. With 992 prompt rows (no spill) one rider costs 3.1 ms and 29
+  cost 0.31 ms each; riding saves 22-24 ms against a separate 27-32 ms step. The same spill
+  explains the 12B "1 rider = 10 ms" at 1024 rows (1025 runs the 1088 rung): at 992 rows the
+  12B, 26B FP8 and 26B BF16 per-rider costs are 1.29 / 1.24 / 2.17 ms at one rider and
+  0.14 / 0.17 / 0.24 ms at 28-29.
+* **26B FP8 rider-vs-step agreement is FP8 quantization, not a bug.** Rider and step logits
+  differ by KL mean 0.10 (max 1.8) at 29 riders on real-text contexts, against 0.016 on 12B
+  and 3e-4 on Qwen BF16; split vs one-row prefill attention differ by as much, while the salt
+  check is exact. Against the 26B BF16 packet's decode step on the same inputs (rows whose
+  input token agrees), the FP8 riders are no further from BF16 than the FP8 step is: KL 0.65 vs
+  0.82 (28 riders), 0.85 vs 1.02 (8), top-1 agreement 14 vs 15 of 21. The BF16 packet's own
+  riders differ from its step by KL 0.07-0.14: MoE routing amplifies reduction-order
+  differences. The 12B "8-rider agreement drop" in its recipe was measured on `--spread`
+  random-token rows; on text contexts 8 riders agree 8/8 (KL 0.003) and 29 agree 28/29.
+* Greedy outputs of a cold run and a warm-cache run of the same requests diverge early on the
+  FP8-KV packets (12B: 33 of 41 differ, many in the first characters; 26B FP8: 37 of 42) and
+  late on BF16-KV packets (Qwen 14 of 41, E4B 7 of 41): a cached prefix is attended from FP8 KV,
+  while a cold chunk's rows attend each other at prefill precision. The texts stay coherent; no
+  request failed, no fault was logged, every logprobs array was valid, and cancellations before
+  the first token and mid-decode left no stuck slot.
+
+Rejected review claims (checked against the code): non-unified packed prefill not updating the
+prefix history (it does, `prefill_batched` inner), penalized or non-greedy verify rows (penalized
+rows never draft; device draws per verify row reproduce plain decode's), unawaited intermediate
+checkpoints not published (by design: only an awaited checkpoint or a prompt end publishes).
+
+Verification of the fixes: plowrt unit tests (1400 CUDA-feature, 325 CPU-feature serve and
+token-batch, resolver and tail tests), compile checks for `hsa`, `cpu` and `cuda,hsa`;
+`step_bench --ride` dumps of the fixed binary are bit-identical to the base binary's on 26B
+FP8 (widths 1/8/29, ride and step); on Qwen BF16 both binaries differ only through cuBLASLt's
+load-time algorithm choice (the base binary's two runs agree with each other, and the selected
+algorithm indices differ between the runs that differ). The mixed-traffic serve on the fixed
+binary matches the base binary's (no errors besides one over-context request, no refusals).
+
+## 3. Open
+
+* E4B's tail launches give up split riders; a rider site before the tail boundary would keep
+  them.
+* CPU: one prompt plus decode rows never packs (the two-member policy was measured on AMD).
+* `PLOW_TOKEN_BATCH` only selected a degraded or failing configuration under the always-on
+  prefix cache; it is removed.

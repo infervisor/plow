@@ -416,6 +416,22 @@ records the checkpoint's `eos_token_id` in the reference's meta; a reference mad
 
 Unit tests: `cd scripts/llm && python3 -m unittest test_fp32_ref_gate`.
 
+**Gate relaxation for significant perf gains (2026-10-28, user decision).** A change may miss a
+recipe's `llm_fp32_ref` thresholds only if both hold:
+
+1. The gain is significant: ≥ 5% on an affected serving rung's step time (step_bench at the rung's
+   actual shape), or ≥ 3% on a production-mix metric (goodput, TTFT P99 or TPOT P99, `campaign.py
+   report`).
+2. Accuracy stays at the vLLM peer's level on the same gate and concurrency: `kl_trim_mean` and
+   `kl_p95` ≤ 1.10 × vLLM's; `top1_decisive` ≥ vLLM's − 0.005; `cont_decisive` ≥ vLLM's − 2 cases
+   (of the gate's cases); `needle_acc` ≥ vLLM's; in ≥ 2 of 3 runs of the same arm (packet, plowrt,
+   serve env). A run of a different arm (another knob set) does not count toward the three.
+
+The recipe then carries only the threshold the rule allows (e.g. `cont_decisive_drop_max` = 2 cases
+/ cases), and its `[gates]` block and header record the measured gain, the per-run numbers vs vLLM
+and the date. A change that misses the rule keeps the recipe's thresholds. Re-score existing
+captures with `--score-only` before running new ones.
+
 **Media (images, audio) are gated by `mm_parity`** (`campaign.py gate`, experimental recipes
 `scripts/campaign/recipes/gemma4-e4b.h100.multimodal.toml` and `gemma4-12b.h100.fp8-multimodal.toml`).
 One lease runs:

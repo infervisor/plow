@@ -118,6 +118,14 @@ PLOW_EMIT_DECODE_CUBLASLT = "1"
 # hit the production packet too: no clear regression vs production, but no c32 PASS either. Held until a
 # c32 gate policy (margin or baseline-relative acceptance) is decided. Evidence: /opt/dlami/nvme/lava-tts/route-sweep (B/g26fp8-lt64,
 # B/g26fp8-lt8, B/g26fp8-lt128, gates/g26fp8-lt64, gates/g26fp8-long, gates/g26fp8-c32, gates/g26fp8-c32r, peer32).
+# 2026-10-28, perf-for-accuracy rule (docs/bringup/agent-tools.md "Gate relaxation for significant
+# perf gains") at c32 vs the c32 peer: gain qualifies (rung 32 -9..-14%), accuracy does not. Bounds
+# kl_trim <= 0.1408, kl_p95 <= 0.950, top1_decisive >= 0.9602, cont_decisive >= 38 of 46, needle 1;
+# variant runs kl_trim 0.1502/0.1442/0.1422 (0 of 3), kl_p95 0.997/0.972/0.920 (1), top1_decisive
+# 0.9532/0.9582/0.9572 (0), cont_decisive 36/38/36 (1): no run within every bound -> NOT applied,
+# thresholds unchanged. The production control misses the same bounds (kl_trim 0.1434/0.1465/0.1518,
+# top1 0.9592/0.9622/0.9572, cont 36/37/37: 0 of 3), so at c32 this rule cannot separate the route
+# from the base packet; a baseline-relative c32 criterion stays a user decision.
 PLOW_EMIT_DECODE_CUBLASLT_MIN_ROWS = "32"
 PLOW_EMIT_DECODE_CUBLASLT_HEAD = "1"
 PLOW_EMIT_PREFILL_CUBLASLT = "1"
@@ -210,7 +218,6 @@ PLOW_PF_INTERLEAVE = "0"
 PLOW_VMM_LIVE_RINGS = "1"
 PLOW_MULTISTEP = "0"
 PLOW_DECODE_MAX_RUNG = "128"
-PLOW_TOKEN_BATCH = "1"
 PLOW_LT_FP8_FAST_ACCUM_MAX_K = "8192"
 # Compact prefill terminal lm_head on the interpreter, not cuBLASLt (the rows=[128] terminal plan takes its own
 # algorithm). 2026-10-16 g26-attr3 on the 9641938b plowrt, c16 FP32 gate, all five serve knobs, 6 runs per arm vs
