@@ -87,8 +87,6 @@ PLOW_VMM_LIVE = "1"
 # Prefix reuse (VMM prefix pool). Recurrent networks: plowrt refuses it; waive it below.
 PLOW_PREFIX_CACHE = "1"
 PLOW_VMM_PREFIX = "1"
-# Decode rows ride prefill launches (token batch): packed prefill + compact terminal on the packet.
-PLOW_TOKEN_BATCH = "1"
 
 # Routes the packet does not carry, with the measured reason (see the header). Empty means the
 # doctor requires every route on.

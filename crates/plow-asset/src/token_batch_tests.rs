@@ -800,3 +800,140 @@ fn verify_spans_follow_prefill_and_sample_every_row() {
     )
     .is_err());
 }
+
+/// Randomized mixes of decode rows, prefill chunks (fresh, suffix after a cached prefix,
+/// intermediate, final, final of one row) and verify spans, in shuffled caller order over sparse
+/// slots: every row, position, sample row and owner is where the serving side reads it. The mux
+/// treats sample row `k` of the rows before the first verify span as the k-th delivered id
+/// (decode rows in caller order, then completing prompts in caller order); verify rows follow.
+#[test]
+fn random_mixed_batches_keep_every_row_and_sample_where_serving_reads_it() {
+    let mut x = 0x2545_f491_4f6c_dd1du64;
+    let mut rnd = |n: u32| {
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        (x % u64::from(n.max(1))) as u32
+    };
+    for _ in 0..2000 {
+        let slots = 4 + rnd(28);
+        let mut frontiers = vec![0u32; slots as usize];
+        let generations: Vec<u32> = (0..slots).map(|s| s * 3 + 1).collect();
+        let mut free: Vec<u32> = (0..slots).collect();
+        let mut owned: Vec<(u32, Phase, Vec<u32>, u32)> = Vec::new();
+        for _ in 0..1 + rnd(10) {
+            if free.is_empty() {
+                break;
+            }
+            let slot = free.swap_remove(rnd(free.len() as u32) as usize);
+            let (phase, len, start, prompt_len) = match rnd(5) {
+                0 | 1 => {
+                    let prompt = 1 + rnd(300);
+                    (Phase::Decode, 1, prompt + rnd(50), prompt)
+                }
+                2 => {
+                    let prompt = 1 + rnd(300);
+                    (Phase::Verify, 2 + rnd(6), prompt + rnd(50), prompt)
+                }
+                _ => {
+                    // A suffix after a cached prefix starts on a 32-row block; any other start
+                    // is a later chunk of the same prompt.
+                    let prompt = 1 + rnd(600);
+                    let start = if rnd(2) == 0 {
+                        rnd(prompt) / 32 * 32
+                    } else {
+                        rnd(prompt)
+                    };
+                    let len = 1 + rnd(prompt - start);
+                    (Phase::Prefill, len, start, prompt)
+                }
+            };
+            frontiers[slot as usize] = start;
+            let tokens = (0..len).map(|_| rnd(1000)).collect();
+            owned.push((slot, phase, tokens, prompt_len));
+        }
+        let requests: Vec<Request<'_>> = owned
+            .iter()
+            .map(|(slot, phase, tokens, prompt_len)| Request {
+                id: 1000 + slot,
+                slot: *slot,
+                state_slot: *slot,
+                generation: generations[*slot as usize],
+                phase: *phase,
+                tokens,
+                prompt_len: *prompt_len,
+                selection: Selection::default(),
+            })
+            .collect();
+        let rows: u32 = requests.iter().map(|r| r.tokens.len() as u32).sum();
+        let capacity = rows + rnd(64);
+        let plan = plan(&requests, &frontiers, &generations, capacity, 8192, 3).unwrap();
+        let order: Vec<&Request<'_>> = [Phase::Decode, Phase::Prefill, Phase::Verify]
+            .iter()
+            .flat_map(|&p| requests.iter().filter(move |r| r.phase == p))
+            .collect();
+        let (mut row, mut samples) = (0u32, Vec::new());
+        for (k, r) in order.iter().enumerate() {
+            let start = frontiers[r.slot as usize];
+            let n = r.tokens.len() as u32;
+            let span = plan.spans[k];
+            assert_eq!(
+                (span.row0, span.n_rows, span.slot, span.kv_row0),
+                (row, n, r.slot, start)
+            );
+            assert_eq!(span.flags & PREFILL_SPAN_RESET_STATE != 0, start == 0);
+            assert_eq!(&plan.input_ids[row as usize..(row + n) as usize], r.tokens);
+            assert!((0..n).all(|j| plan.positions[(row + j) as usize] == start + j));
+            let sampled: Vec<u32> = match r.phase {
+                Phase::Decode => vec![row],
+                Phase::Prefill if start + n == r.prompt_len => vec![row + n - 1],
+                Phase::Prefill => vec![],
+                Phase::Verify => (row..row + n).collect(),
+            };
+            let pending = plan.pending[k];
+            assert_eq!(
+                pending.sample_index,
+                (!sampled.is_empty()).then_some(samples.len() as u32)
+            );
+            assert_eq!(
+                (pending.expected_frontier, pending.new_frontier),
+                (start, start + n)
+            );
+            samples.extend(sampled.into_iter().map(|row| (row, r.id)));
+            row += n;
+        }
+        assert_eq!(plan.real_rows, row);
+        assert!(plan.active[row as usize..capacity as usize]
+            .iter()
+            .all(|&a| a == 0));
+        assert_eq!(
+            plan.sample_input_rows,
+            samples.iter().map(|s| s.0).collect::<Vec<_>>()
+        );
+        assert_eq!(
+            plan.sample_owners
+                .iter()
+                .map(|o| o.request)
+                .collect::<Vec<_>>(),
+            samples.iter().map(|s| s.1).collect::<Vec<_>>()
+        );
+        // The rows the mux delivers by index: decode rows, then completing prompts, each in
+        // caller order, and only then verify rows.
+        let plain: Vec<u32> = requests
+            .iter()
+            .filter(|r| r.phase == Phase::Decode)
+            .chain(requests.iter().filter(|r| {
+                r.phase == Phase::Prefill
+                    && frontiers[r.slot as usize] + r.tokens.len() as u32 == r.prompt_len
+            }))
+            .map(|r| r.id)
+            .collect();
+        assert_eq!(
+            plan.sample_owners[..plain.len()]
+                .iter()
+                .map(|o| o.request)
+                .collect::<Vec<_>>(),
+            plain
+        );
+    }
+}
