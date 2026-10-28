@@ -158,8 +158,9 @@ pub(super) fn evict_one_tree(s: &Shared, inner: &mut Inner, preserve_hot: bool) 
     }
     let awaited = inner.awaited.clone();
     // One LRU key; the newest boundary goes when it is the last candidate (the request that
-    // published it is held by its lease, not by its snapshot). A session boundary inside its
-    // TTL goes only once nothing unprotected is left, the host tier's entries included.
+    // published it is held by its lease, not by its snapshot). A shielded boundary (session
+    // inside its TTL, shared end in use) goes only once nothing unshielded is left, the host
+    // tier's entries included.
     // The soft-cap trim (`preserve_hot`) keeps the most recently used boundary while a live
     // request maps its blocks (production's MRU exemption, without its tier); allocation OOM
     // may take it.
@@ -184,7 +185,7 @@ pub(super) fn evict_one_tree(s: &Shared, inner: &mut Inner, preserve_hot: bool) 
             .flatten()
             .filter(|snap| snap.users == 0 && snap.on_device() && !snap_awaited(&awaited, snap))
             .filter(|snap| Some(snap.id) != hot)
-            .filter(|snap| snap.protect_until.is_some_and(|t| t > now) == protected)
+            .filter(|snap| snap.shielded(now) == protected)
             .min_by_key(|snap| snap.last_used)
             .map(|snap| snap.id)
     };
@@ -194,9 +195,12 @@ pub(super) fn evict_one_tree(s: &Shared, inner: &mut Inner, preserve_hot: bool) 
     if evict_dead_leaf(s, inner) {
         return true;
     }
+    // A block-store boundary on the host occupies no device bytes: device pressure never
+    // evicts one (the store's host cap is enforced when a spill needs a host slot).
+    let host_holds_device = inner.block_store.is_none();
     // A cold host boundary (published on a first sighting, never attached) ranks below every
     // used device boundary: it goes before the device victim is spilled or freed.
-    if victim.is_some_and(|id| !snap_ref(inner, id).is_some_and(Snap::cold)) {
+    if host_holds_device && victim.is_some_and(|id| !snap_ref(inner, id).is_some_and(Snap::cold)) {
         if let Some(id) = host_lru(inner).filter(|&id| snap_ref(inner, id).is_some_and(Snap::cold))
         {
             with_cause(inner, Some(Mechanism::Cold), None, |inner| {
@@ -216,9 +220,11 @@ pub(super) fn evict_one_tree(s: &Shared, inner: &mut Inner, preserve_hot: bool) 
     }
     // Every unprotected device boundary is held or awaited: the device bytes a host-resident
     // boundary still occupies (its blocks) are the next level of the same LRU.
-    if let Some(id) = host_lru(inner) {
-        evict_unit(s, inner, id);
-        return true;
+    if host_holds_device {
+        if let Some(id) = host_lru(inner) {
+            evict_unit(s, inner, id);
+            return true;
+        }
     }
     if let Some(id) = protected {
         if spill_unit(s, inner, id) {
@@ -274,6 +280,27 @@ pub(super) fn evict_unit(s: &Shared, inner: &mut Inner, id: u64) {
         blocks,
         "vmm prefix eviction unit"
     );
+}
+
+/// Spill one device boundary to the host tier ahead of need (the block store's spill-ahead
+/// thread): the LRU unheld, unawaited one, unshielded before shielded; a boundary the tier
+/// refuses (held in the store, no host slot) is skipped for the next, a few deep. `false` =
+/// nothing spilled.
+pub(super) fn spill_lru(s: &Shared, inner: &mut Inner) -> bool {
+    let now = std::time::Instant::now();
+    let awaited = inner.awaited.clone();
+    let mut candidates: Vec<(bool, u64, u64)> = inner
+        .published
+        .values()
+        .flatten()
+        .filter(|snap| snap.users == 0 && snap.on_device() && !snap_awaited(&awaited, snap))
+        .map(|snap| (snap.shielded(now), snap.last_used, snap.id))
+        .collect();
+    candidates.sort_unstable();
+    candidates
+        .iter()
+        .take(8)
+        .any(|&(_, _, id)| spill_unit(s, inner, id))
 }
 
 /// Test hook: the boundary tree's structural invariants over every published snapshot.

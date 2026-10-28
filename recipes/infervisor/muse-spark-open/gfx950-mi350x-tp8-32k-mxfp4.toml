@@ -1,0 +1,90 @@
+# Muse Spark Open (816B-A42B, Quark MXFP4 routed experts, 62 layers: 46 sliding-2048 RoPE + 16 full
+# NoPE, latent 8192->4096 MoE, 256x8 experts) on 8x MI350X. DRAFT, derived from
+# glm-5.3-flash/gfx950-mi350x-tp8-fp8.toml. The emitter is `crates/devgen/src/muse.rs`; the plan is
+# plans/muse-spark-full-emit.md.
+#
+# Status `emits`: prefill buckets 128/512/1024/2048/8192 (FlashPrefill hd64, grouped MoE prefill
+# A4W4) and decode rungs 1/8/32. Teacher-forced vs vLLM ROCm (TP8, W4A4 AITER, 4 prompts): decode
+# walk top1_decisive 0.996, mean |dlogprob| 0.058; prefill buckets 1.0 / 0.071 (gates >= 0.95,
+# <= 0.1). Per-block prefill vs the W4A16 oracle is rel_l2 0.04-0.07 (A4W4 activation quant and
+# router near-ties; kernels match an A4W4 oracle fed device inputs at 0.012).
+# The measurements above were taken at plow_git below (branch muse-spark-s1s2). Consolidation into
+# kv-block-store (2026-10-26) renumbered the Muse ops to 226..229 to clear the speech ops at 218..225:
+# packets emitted at that commit do not load on later plowrt; re-emit and re-qualify before serving.
+
+schema = "plow.recipe.v1"
+namespace = "infervisor"
+name = "muse-spark-open"
+label = "gfx950-mi350x-tp8-32k-mxfp4"
+network = "muse-spark-open"
+status = "emits"
+plow_git = "569377358663f5a3425cfaa5f875b65f95ccf065"
+
+[target]
+vendor = "amd"
+isa = "gfx950"
+sku = "MI350X"
+units = 256
+num_gpus = 8
+parallel = "tp"
+max_ctx = 32768
+toolchain = "rocm-7.14.1-nix"
+
+# Routed experts stay Quark MXFP4 (e8m0 per-32): decode W4A16, prefill A4W4 (no grouped W4A16
+# prefill kernel on gfx950) with the checkpoint's declared activation quant, Quark "even" scale +
+# half-even codes (build_gfx950.sh sets PLOW_MX_ACT_EVEN=1 for Muse prefill objects; AITER's RCEIL
+# differs on ~23% of blocks). Opt-in PLOW_MUSE_DEC_A4W4=1 builds A4W4-numerics decode objects.
+# Layers 0 and 61 are Quark `exclude`d and keep bf16 experts on the same grouped ops (enc 0).
+# Everything else is bf16.
+[checkpoint]
+source = "local:Muse-Spark-Open-816B-A42B-Quark-MXFP4"
+layout = "hf"
+
+[tokenizer]
+source = "checkpoint"
+
+# `PLOW_XR_TAG_SLOT = "90112"`: the decode tag slot must hold the k*moe_hidden = 32768-element
+# expert reduce (the default 20480 B slot fails the tagged one-shot contract); serve carries the same.
+# `PLOW_FA_MERGE_LDS` / `PLOW_MUSE_CMB_ILP` (decode objects, bit-identical): the flash merge
+# stages its splits in LDS; the one-row combine-norm reads its routing table once.
+[objects]
+script = "scripts/build_gfx950.sh"
+env = { PLOW_XR_TAG_SLOT = "90112", PLOW_FA_MERGE_LDS = "1", PLOW_MUSE_CMB_ILP = "1" }
+
+# `PLOW_MUSE_LATENT_TP` (default 1): pre/post_expert_proj row-parallel. TP8 block 1: 524/526 us
+# vs 531/533 us replicated, same numerics, 6.9 GB/rank less weight.
+# Ladder 1,8,32: rungs 8/32 match the B=1 run of each slot (per-row rel_l2 <= 6.7e-3, same routing).
+# Rung 1 only, bit-identical logits on 440 decode-walk positions: `PLOW_MUSE_QKVG` (one GemvQkvg
+# for q/k/v/gate) and `PLOW_MUSE_NGN` (norm -> residual gate -> norm as one MuseNormGateNorm).
+# With the two object knobs: plowrt bench c1 TPOT 18.26 -> 16.32 ms; c8/c32 unchanged.
+[emit]
+env = { PLOW_DECODE_BATCH_LADDER = "1,8,32", PLOW_MUSE_QKVG = "1", PLOW_MUSE_NGN = "1" }
+args = [
+  "--emit", "devblob",
+  "--arch", "gfx950",
+  "--gpu", "MI350X",
+  "--num-gpus", "8",
+  "--parallel", "tp",
+  "--max-ctx", "32768",
+  "--n-cu", "256",
+]
+
+# `PLOW_DECODE_MIN_RUNG = "1"`: a lone row runs rung 1, not the TP default floor 8. Same job: TP8
+# block 1 534/536 us vs 782/786 us; serve c1 38.4 vs 22.4 tok/s, c8/c32 unchanged (65.9/64.8).
+[serve]
+env = { PLOW_XR_TAG_SLOT = "90112", PLOW_DECODE_MIN_RUNG = "1" }
+
+# Routes this packet does not carry. The first two are NOT measured removals: muse.rs does not
+# emit them yet (plans/muse-spark-full-emit.md). The rest are CUDA artifacts.
+[capabilities]
+packed_prefill = "not emitted yet: MoE align, combine-norm and FlashPrefill consumers are single-span; one prompt per prefill launch"
+token_batch = "not emitted yet: depends on packed_prefill"
+live_kv = "CUDA consumer (exec/gpu*); gfx950 KV is flat per slot (31.7 KB/token/rank at TP8, 1.04 GB per 32k slot)"
+segment_roles = "CUDA cuBLASLt / generated role launches; not built for gfx950"
+generated_kernels = "CUDA gen_*.cubin role objects; not built for gfx950"
+device_sampler = "CUDA sample_*.cubin; gfx950 samples greedy on device (Argmax/ArgmaxFin), others on the host"
+cublaslt_prefill = "CUDA cuBLASLt prefill; not applicable to gfx950"
+
+[[gates]]
+name = "smoke"
+cmd = "scripts/serve_test/smoke.sh"

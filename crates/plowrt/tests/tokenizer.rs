@@ -153,7 +153,6 @@ fn qwen2_vocab_merges_preserve_added_token_ids_and_flags() {
 
 #[test]
 fn loads_json_chat_template_with_jinja_precedence() {
-    use plowrt::serve::template::ChatTemplate;
     let dir = tmpdir("json_template");
     std::fs::write(
         dir.join("chat_template.json"),
@@ -161,11 +160,14 @@ fn loads_json_chat_template_with_jinja_precedence() {
     )
     .unwrap();
     let messages = [serde_json::json!({"role":"system","content":"audio context"})];
-    let template = ChatTemplate::load(&dir).unwrap();
+    let template = plowrt::serve::template::load(&dir).unwrap();
     assert_eq!(template.render(&messages).unwrap(), "audio context");
     std::fs::write(dir.join("chat_template.jinja"), "standalone").unwrap();
     assert_eq!(
-        ChatTemplate::load(&dir).unwrap().render(&messages).unwrap(),
+        plowrt::serve::template::load(&dir)
+            .unwrap()
+            .render(&messages)
+            .unwrap(),
         "standalone"
     );
     std::fs::remove_dir_all(dir).unwrap();

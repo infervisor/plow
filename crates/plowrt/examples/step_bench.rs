@@ -34,6 +34,58 @@ fn record_inputs(histories: &mut [Vec<u32>], last: &[u32], outputs: &[u32], step
     }
 }
 
+/// Write `--dump-tensors` entries and a manifest (`meta` plus the tensor table) into `dir`.
+#[cfg(feature = "cuda")]
+fn write_dumps(
+    e: &plowrt::exec::gpu::GpuEngine,
+    names: &str,
+    dir: &std::path::Path,
+    mut meta: serde_json::Value,
+) -> Result<(), Box<dyn std::error::Error>> {
+    std::fs::create_dir_all(dir)?;
+    let mut rows = Vec::new();
+    for (index, spec) in names.split(',').map(str::trim).enumerate() {
+        let (name, offset, bytes) = dump_range(e, spec)?;
+        let mut raw = vec![0u8; usize::try_from(bytes)?];
+        e.read_tensor_range(name, offset, &mut raw)?;
+        let file = format!("tensor-{index:03}.bin");
+        std::fs::write(dir.join(&file), raw)?;
+        rows.push(
+            serde_json::json!({"name": name, "offset": offset, "bytes": bytes, "file": file}),
+        );
+    }
+    meta["tensors"] = rows.into();
+    std::fs::write(dir.join("manifest.json"), serde_json::to_vec_pretty(&meta)?)?;
+    println!("  wrote raw tensor dumps to {}", dir.display());
+    Ok(())
+}
+
+/// A `--dump-tensors` entry: `name` (the whole tensor) or `name@OFFSET:BYTES` (one byte range,
+/// e.g. one slot of a KV cache).
+#[cfg(feature = "cuda")]
+fn dump_range<'a>(
+    e: &plowrt::exec::gpu::GpuEngine,
+    spec: &'a str,
+) -> Result<(&'a str, u64, u64), Box<dyn std::error::Error>> {
+    let (name, range) = spec
+        .split_once('@')
+        .map_or((spec, None), |(n, r)| (n, Some(r)));
+    let total = e
+        .tensor_bytes(name)
+        .ok_or_else(|| format!("unknown dump tensor {name:?}"))?;
+    let Some(range) = range else {
+        return Ok((name, 0, total));
+    };
+    let (offset, bytes) = range
+        .split_once(':')
+        .ok_or("--dump-tensors name@OFFSET:BYTES")?;
+    let (offset, bytes): (u64, u64) = (offset.parse()?, bytes.parse()?);
+    if offset.checked_add(bytes).is_none_or(|end| end > total) {
+        return Err(format!("{spec}: range outside the {total}-byte tensor").into());
+    }
+    Ok((name, offset, bytes))
+}
+
 #[cfg(not(feature = "cuda"))]
 fn main() {
     eprintln!("step_bench requires --features cuda");
@@ -73,6 +125,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut prefill_logits_dir = None::<std::path::PathBuf>;
     let mut ride: Option<(usize, Vec<usize>)> = None;
     let mut ride_dump = None::<std::path::PathBuf>;
+    let mut ride_prefix = 0usize;
     let (mut dump_names, mut dump_dir) = (None::<String>, None::<String>);
     let mut spec = SpecArgs::default();
     let mut prompt_file = None::<String>;
@@ -149,6 +202,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 ride = Some((rows, widths));
             }
             "--ride-dump" => ride_dump = Some(args.next().ok_or("--ride-dump dir")?.into()),
+            "--ride-prefix" => ride_prefix = args.next().ok_or("--ride-prefix N")?.parse()?,
             other => return Err(format!("unknown argument {other}").into()),
         }
     }
@@ -361,6 +415,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             steps,
             *rows,
             widths,
+            ride_prefix,
             ride_dump.as_deref(),
         );
     }
@@ -391,7 +446,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     if let Some(mode) = spec.mode.clone() {
         let prompts: Vec<Vec<u32>> = (0..slots).map(prompt_for).collect();
-        return spec_bench(
+        let verdict = spec_bench(
             &mut e,
             &assets,
             &spec,
@@ -401,6 +456,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             ctx + warmup,
             steps,
         );
+        if let Some((names, dir)) = &dumps {
+            let pos: Vec<usize> = (0..slots).map(|b| e.slot_pos(b)).collect();
+            write_dumps(
+                &e,
+                names,
+                std::path::Path::new(dir),
+                serde_json::json!({"scope": "raw allocations after the spec run", "mode": mode,
+                                   "slots": slots, "ctx": ctx, "steps": steps, "warmup": warmup,
+                                   "slot_pos": pos}),
+            )?;
+        }
+        return verdict;
     }
     if let Some((lo, hi, step)) = seg_sweep {
         let base_pos: Vec<usize> = (0..slots).map(|_| ctx + warmup).collect();
@@ -547,21 +614,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     if let Some((names, dir)) = dumps {
-        std::fs::create_dir_all(&dir)?;
-        let mut rows = Vec::new();
-        for (index, name) in names.split(',').map(str::trim).enumerate() {
-            let bytes = e
-                .tensor_bytes(name)
-                .ok_or_else(|| format!("unknown dump tensor {name:?}"))?;
-            let mut raw = vec![0u8; usize::try_from(bytes)?];
-            e.read_tensor(name, &mut raw)?;
-            let file = format!("tensor-{index:03}.bin");
-            std::fs::write(dir.join(&file), raw)?;
-            rows.push(serde_json::json!({"name": name, "bytes": bytes, "file": file}));
-        }
-        std::fs::write(
-            dir.join("manifest.json"),
-            serde_json::to_vec_pretty(&serde_json::json!({
+        write_dumps(
+            &e,
+            &names,
+            std::path::Path::new(&dir),
+            serde_json::json!({
                 "scope": if partial { "raw allocations after partial decode; outputs may be stale" }
                     else if steps == 0 { "raw complete allocations after prefill" }
                     else { "raw complete allocations after the last decode step" },
@@ -570,10 +627,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 "packed_prefill": packed_prefill,
                 "token_histories": histories,
                 "sampled_token_ids": if !partial { Some(last) } else { None },
-                "tensors": rows,
-            }))?,
+            }),
         )?;
-        println!("  wrote raw tensor dumps to {}", dir.display());
     }
 
     // Stage-7 profile: with a -DPLOW_NV_TRACE=1 decode cubin, dump block 0's
@@ -590,6 +645,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 /// `W` rows. Every arm rewinds the slots first, so context and inputs are fixed; arms interleave
 /// per iteration. The riders' logits are compared in process with the standalone step's;
 /// `--ride-dump DIR` also writes both (bf16, `W x vocab`) for cross-run comparison.
+/// `--ride-prefix N`: the prefill slots first hold N prompt tokens (a cached prefix), and every
+/// arm rewinds them to N, so the launch's rows attend to N + their own rows.
 #[cfg(feature = "cuda")]
 fn ride_bench(
     e: &mut plowrt::exec::gpu::GpuEngine,
@@ -598,6 +655,7 @@ fn ride_bench(
     iters: usize,
     rows: usize,
     widths: &[usize],
+    prefix: usize,
     dump: Option<&std::path::Path>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     use plow_asset::token_batch::{Phase, Request, Selection};
@@ -621,8 +679,33 @@ fn ride_bench(
     let prompt: Vec<u32> = (0..2 * chunk as u32)
         .map(|i| 1000 + (i * 7919) % 50000)
         .collect();
+    let head: Vec<u32> = (0..prefix as u32)
+        .map(|i| 2000 + (i * 6007) % 50000)
+        .collect();
     for i in 0..fills.len() {
-        e.begin_slot(first + i, prompt.len() + 1)?;
+        e.begin_slot(first + i, prefix + prompt.len() + 1)?;
+    }
+    if prefix > 0 {
+        let generations: Vec<u32> = (0..fills.len())
+            .map(|i| e.slot_generation(first + i).expect("slot"))
+            .collect();
+        let mut out = Vec::new();
+        for c0 in (0..prefix).step_by(chunk) {
+            let part = &head[c0..(c0 + chunk).min(prefix)];
+            let reqs: Vec<Request<'_>> = (0..fills.len())
+                .map(|i| Request {
+                    id: (first + i) as u32,
+                    slot: (first + i) as u32,
+                    state_slot: (first + i) as u32,
+                    generation: generations[i],
+                    phase: Phase::Prefill,
+                    tokens: part,
+                    prompt_len: (prefix + prompt.len()) as u32,
+                    selection: Selection::default(),
+                })
+                .collect();
+            e.token_batch_step(&reqs, &mut out)?;
+        }
     }
     // A recurrent chain rewinds through the state snapshot taken at the rewind position: the
     // decode slots at ctx, the prefill slots fresh at 0.
@@ -640,7 +723,7 @@ fn ride_bench(
             e.rewind_slot(b, ctx)?;
         }
         for i in 0..fills.len() {
-            e.rewind_slot(first + i, 0)?;
+            e.rewind_slot(first + i, prefix)?;
         }
         Ok(())
     };
@@ -657,7 +740,7 @@ fn ride_bench(
             tokens,
             prompt_len: match phase {
                 Phase::Decode | Phase::Verify => ctx as u32,
-                Phase::Prefill => prompt.len() as u32,
+                Phase::Prefill => (prefix + prompt.len()) as u32,
             },
             selection: Selection::default(),
         };
@@ -758,7 +841,7 @@ fn ride_bench(
         }
         let (p, r, s) = (median(&mut pure), median(&mut ride), median(&mut step));
         println!(
-            "RIDE rows={rows} w={w} ctx={ctx} n={iters} pure_ms={p:.3} ride_ms={r:.3} step_ms={s:.3} per_rider_ms={:.4} saved_ms={:.3}",
+            "RIDE rows={rows} w={w} ctx={ctx} prefix={prefix} n={iters} pure_ms={p:.3} ride_ms={r:.3} step_ms={s:.3} per_rider_ms={:.4} saved_ms={:.3}",
             (r - p) / w as f64,
             p + s - r
         );
@@ -858,9 +941,18 @@ fn draft_bench(
         .enumerate()
         .map(|(b, &t)| (b, t, b as u32))
         .collect();
+    let block = e.spec_draft_is_block();
+    let stage = |e: &mut plowrt::exec::gpu::GpuEngine, k: u32| {
+        if block {
+            let rows: Vec<(usize, u32)> = rows.iter().map(|&(b, t, _)| (b, t)).collect();
+            e.spec_draft_stage_block(&rows, k)
+        } else {
+            e.spec_draft_stage(&rows, k)
+        }
+    };
     let mut drafts = Vec::new();
     for k in 1..=kmax {
-        e.spec_draft_stage(&rows, k)?;
+        stage(e, k)?;
         for _ in 0..3 {
             e.spec_draft_launch()?;
         }
@@ -882,7 +974,7 @@ fn draft_bench(
     // `STEP_BENCH_DRAFT_TRACE=1` with a -DPLOW_NV_TRACE object: block 0's per-op profile of one
     // k = kmax draft launch (PLOW_TRACE_RAW gets the ordered packets).
     if std::env::var_os("STEP_BENCH_DRAFT_TRACE").is_some() {
-        e.spec_draft_stage(&rows, kmax)?;
+        stage(e, kmax)?;
         e.trace_reset()?;
         e.spec_draft_launch()?;
         e.spec_draft_sync()?;
@@ -938,15 +1030,37 @@ fn draft_dump(
         e.read_tensor_range(name, off, &mut v).map(|_| v)
     };
     let mut toks = Vec::new();
+    let block = e.spec_draft_is_block();
     for &(b, token, hrow) in rows {
         let pos = e.slot_pos(b);
-        e.spec_draft_stage(&[(b, token, hrow)], 7)?;
-        e.spec_draft_run(&mut toks)?;
-        let drafts7 = toks.clone();
-        e.spec_draft_stage(&[(b, token, hrow)], 1)?;
-        e.spec_draft_run(&mut toks)?;
         let d = dir.join(format!("slot{b}"));
         std::fs::create_dir_all(&d)?;
+        if block {
+            // The block's raw logits (one sequence: rows 0..7) after a k = 7 draft.
+            e.spec_draft_stage_block(&[(b, token)], 7)?;
+            e.spec_draft_run(&mut toks)?;
+            let vocab = e.vocab();
+            std::fs::write(
+                d.join("act.dspark.d.logits.bin"),
+                read(e, "act.dspark.d.logits", 0, 7 * vocab * 2)?,
+            )?;
+        } else {
+            e.spec_draft_stage(&[(b, token, hrow)], 7)?;
+            e.spec_draft_run(&mut toks)?;
+        }
+        let drafts7 = toks.clone();
+        if block {
+            dump_kv(e, &d, b, pos, slots, &read)?;
+            std::fs::write(
+                d.join("meta.json"),
+                serde_json::to_vec_pretty(&serde_json::json!({
+                    "slot": b, "token": token, "pos": pos, "drafts7": drafts7,
+                }))?,
+            )?;
+            continue;
+        }
+        e.spec_draft_stage(&[(b, token, hrow)], 1)?;
+        e.spec_draft_run(&mut toks)?;
         let hidden = e.tensor_bytes("act.mtp.h").ok_or("no act.mtp.h")? as usize / 16;
         std::fs::write(
             d.join("act.hn.bin"),
@@ -959,51 +1073,7 @@ fn draft_dump(
             let row = e.tensor_bytes(&name).ok_or("missing")? as usize / 16;
             std::fs::write(d.join(format!("{name}.bin")), read(e, &name, 0, row)?)?;
         }
-        // Sliding ring whole; full layer only the committed rows per head (the rest is unmapped).
-        // `STEP_BENCH_DRAFT_DUMP_KV=<sliding layer>,<full layer>:<kv heads>:<head dim>` (default:
-        // the 26B-A4B assistant's 28 and 29:2:512; the 12B assistant is 46,47:1:512).
-        let spec =
-            std::env::var("STEP_BENCH_DRAFT_DUMP_KV").unwrap_or_else(|_| "28,29:2:512".into());
-        let kv_layers = spec
-            .split(',')
-            .map(|f| {
-                let bad = || {
-                    format!(
-                        "STEP_BENCH_DRAFT_DUMP_KV: {f:?} is not <layer> or <layer>:<heads>:<dim>"
-                    )
-                };
-                let v = f
-                    .split(':')
-                    .map(|x| x.parse::<usize>().map_err(|_| bad()))
-                    .collect::<Result<Vec<_>, _>>()?;
-                match v[..] {
-                    [l] => Ok((l, 0, 0)),
-                    [l, h, d] if h > 0 && d > 0 => Ok((l, h, d)),
-                    _ => Err(bad()),
-                }
-            })
-            .collect::<Result<Vec<_>, String>>()?;
-        for &(l, kvh, row_bytes) in &kv_layers {
-            for (t, elt) in [("k", 1), ("v", 1), ("k_scale", 4), ("v_scale", 4)] {
-                let name = format!("kv.{l}.{t}");
-                let per = e.tensor_bytes(&name).ok_or("missing kv")? as usize / slots;
-                let bytes = if kvh == 0 {
-                    read(e, &name, (b * per) as u64, per)?
-                } else {
-                    let (head, row) = (per / kvh, if elt == 1 { row_bytes } else { 4 });
-                    if per % kvh != 0 || pos * row > head {
-                        let m = format!("{name}: {kvh} x {pos} rows x {row} B exceed {per} B/slot");
-                        return Err(m.into());
-                    }
-                    let mut v = Vec::new();
-                    for h in 0..kvh {
-                        v.extend(read(e, &name, (b * per + h * head) as u64, pos * row)?);
-                    }
-                    v
-                };
-                std::fs::write(d.join(format!("{name}.bin")), bytes)?;
-            }
-        }
+        dump_kv(e, &d, b, pos, slots, &read)?;
         std::fs::write(
             d.join("meta.json"),
             serde_json::to_vec_pretty(&serde_json::json!({
@@ -1011,6 +1081,61 @@ fn draft_dump(
                 "draft1": toks[0], "drafts7": drafts7,
             }))?,
         )?;
+    }
+    Ok(())
+}
+
+/// `STEP_BENCH_DRAFT_DUMP_KV` layers of slot `b` (rows `[0, pos)` of full layers) into `d`.
+#[cfg(feature = "cuda")]
+fn dump_kv(
+    e: &plowrt::exec::gpu::GpuEngine,
+    d: &std::path::Path,
+    b: usize,
+    pos: usize,
+    slots: usize,
+    read: &dyn Fn(&plowrt::exec::gpu::GpuEngine, &str, u64, usize) -> plowrt::Result<Vec<u8>>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    // Sliding ring whole; full layer only the committed rows per head (the rest is unmapped).
+    // `STEP_BENCH_DRAFT_DUMP_KV=<sliding layer>,<full layer>:<kv heads>:<head dim>` (default:
+    // the 26B-A4B assistant's 28 and 29:2:512; the 12B assistant is 46,47:1:512).
+    let spec = std::env::var("STEP_BENCH_DRAFT_DUMP_KV").unwrap_or_else(|_| "28,29:2:512".into());
+    let kv_layers = spec
+        .split(',')
+        .map(|f| {
+            let bad = || {
+                format!("STEP_BENCH_DRAFT_DUMP_KV: {f:?} is not <layer> or <layer>:<heads>:<dim>")
+            };
+            let v = f
+                .split(':')
+                .map(|x| x.parse::<usize>().map_err(|_| bad()))
+                .collect::<Result<Vec<_>, _>>()?;
+            match v[..] {
+                [l] => Ok((l, 0, 0)),
+                [l, h, d] if h > 0 && d > 0 => Ok((l, h, d)),
+                _ => Err(bad()),
+            }
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+    for &(l, kvh, row_bytes) in &kv_layers {
+        for (t, elt) in [("k", 1), ("v", 1), ("k_scale", 4), ("v_scale", 4)] {
+            let name = format!("kv.{l}.{t}");
+            let per = e.tensor_bytes(&name).ok_or("missing kv")? as usize / slots;
+            let bytes = if kvh == 0 {
+                read(e, &name, (b * per) as u64, per)?
+            } else {
+                let (head, row) = (per / kvh, if elt == 1 { row_bytes } else { 4 });
+                if per % kvh != 0 || pos * row > head {
+                    let m = format!("{name}: {kvh} x {pos} rows x {row} B exceed {per} B/slot");
+                    return Err(m.into());
+                }
+                let mut v = Vec::new();
+                for h in 0..kvh {
+                    v.extend(read(e, &name, (b * per + h * head) as u64, pos * row)?);
+                }
+                v
+            };
+            std::fs::write(d.join(format!("{name}.bin")), bytes)?;
+        }
     }
     Ok(())
 }
@@ -1148,13 +1273,19 @@ fn spec_bench(
     let mut mtp = Vec::new();
     let mut draft_ms = 0f64;
     let (mut host_rows, mut host_spans, mut host_mismatch) = (0usize, 0usize, 0usize);
-    if mode == "mtp" {
+    if mode == "mtp" || mode == "dspark" {
         e.spec_draft_enable(assets)?;
     }
     while out.iter().any(|o| o.len() < steps) {
         let live: Vec<usize> = (0..slots).filter(|&b| out[b].len() < steps).collect();
-        let drafting = mode == "mtp" && live.iter().all(|&b| hrow[b].is_some());
-        if drafting {
+        let drafting = mode == "dspark" || mode == "mtp" && live.iter().all(|&b| hrow[b].is_some());
+        if mode == "dspark" {
+            let rows: Vec<(usize, u32)> = live.iter().map(|&b| (b, pending[b])).collect();
+            let t = Instant::now();
+            e.spec_draft_stage_block(&rows, a.k as u32)?;
+            e.spec_draft_run(&mut mtp)?;
+            draft_ms += t.elapsed().as_secs_f64() * 1e3;
+        } else if drafting {
             let rows: Vec<(usize, u32, u32)> = live
                 .iter()
                 .map(|&b| (b, pending[b], hrow[b].unwrap()))
@@ -1168,7 +1299,7 @@ fn spec_bench(
             let i = out[b].len();
             let k = a.k.min(steps - i - 1);
             match mode {
-                "mtp" => {
+                "mtp" | "dspark" => {
                     draft.clear();
                     if drafting {
                         draft.extend_from_slice(&mtp[li * a.k..li * a.k + k]);

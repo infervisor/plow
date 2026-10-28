@@ -2043,22 +2043,295 @@ __device__ __forceinline__ void fa_decode_d64_item(float* __restrict__ op, float
     }
 }
 
+/* FP8-KV hd512 decode on the tensor cores (PLOW_NV_FA_TC16). One work item carries all 16 query
+ * heads of its KV head, so each K/V row crosses HBM once. Per 128-row tile:
+ *  - scores: warp w takes rows 16w..16w+15, mma m16n8k16 bf16 with A = the item's 16 Q rows
+ *    (smem) and B = K rows e4m3 -> bf16 (exact) loaded straight from global. Inside a 64-wide
+ *    chunk lane t, step s covers dims 16t+4s..+3 in BOTH operands, so every K load is 16 B and
+ *    the dot is the true dot (sum order differs from the CUDA-core bodies).
+ *  - softmax: the warps agree on the tile max through smem (log2 domain, as every item); each
+ *    warp keeps its rows' f32 sum of p for the denominator and writes a = p * v_scale to smem as
+ *    bf16 (PLOW_NV_FA_TC16_PV 2: a bf16 hi/lo pair, two mmas per step; bf16 keeps f32's range).
+ *  - P.V: warp w owns output dims 64w..64w+63, mma m16n8k16 bf16 with A = P (ldmatrix) and B = V
+ *    rows e4m3 -> bf16 (exact). Column g of n-tile j is dim 64w + 8g + j, so a lane loads 8
+ *    contiguous bytes per row and pairs rows with byte permutes; accumulator column n of n-tile j
+ *    is dim 64w + 8n + j.
+ * Rows past hi re-read row hi - 1 (never past kv_len) and weigh 0. Output: Opart (unnormalized)
+ * and mlpart (m, l) for FLASH_MERGE, as the other items. */
+#ifndef PLOW_NV_FA_TC16
+#define PLOW_NV_FA_TC16 0
+#endif
+#ifndef PLOW_NV_FA_TC16_PV
+#define PLOW_NV_FA_TC16_PV 2
+#endif
+#define FA_TC16_TAKES(D, GF, FP8KV, SZKV) (PLOW_NV_FA_TC16 && (FP8KV) && !(SZKV) && (D) == 512 && (GF) == 16)
+#define FA_TC16_TR 128u
+#define FA_TC16_QS 520u /* bf16 per smem Q row */
+#define FA_TC16_PS 136u /* bf16 per smem P row */
+#define FA_TC16_SMEM_FLOATS                                                                      \
+    (16u * FA_TC16_QS / 2u + 2u * 16u * FA_TC16_PS / 2u + 2u * 16u * PLOW_NV_WARPS)
+#if PLOW_NV_FA_TC16
+__device__ __forceinline__ unsigned fa_e4m3x2_bf16x2(unsigned two) {
+    const __half2_raw h = __nv_cvt_fp8x2_to_halfraw2((__nv_fp8x2_storage_t)(two & 0xffffu), __NV_E4M3);
+    const float2 f = __half22float2(*reinterpret_cast<const __half2*>(&h));
+    const __nv_bfloat162 b = __floats2bfloat162_rn(f.x, f.y);
+    return *reinterpret_cast<const unsigned*>(&b);
+}
+__device__ __forceinline__ void fa_mma_bf16_acc(float (&d)[4], unsigned a0, unsigned a1, unsigned a2,
+                                                unsigned a3, unsigned b0, unsigned b1) {
+    asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 "
+                 "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
+                 : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3])
+                 : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1));
+}
+template <bool SLOTMAP, int CLONE>
+__device__ void fa_decode_tc16(float* __restrict__ Opart, float* __restrict__ mlpart,
+                               const __nv_bfloat16* __restrict__ Q, const unsigned char* __restrict__ K,
+                               const unsigned char* __restrict__ V, const int* __restrict__ kv_len,
+                               unsigned n_batch, unsigned n_head, unsigned n_kv_head, unsigned kv_stride,
+                               unsigned window, float scale, unsigned nsplit, unsigned kv_mask,
+                               unsigned slice, unsigned nblk, float* lds, unsigned kv_cap,
+                               const float* __restrict__ k_scale, const float* __restrict__ v_scale,
+                               const int* __restrict__ decode_slot) {
+    constexpr unsigned D = 512, NCH = D / 64, QS = FA_TC16_QS, PS = FA_TC16_PS;
+    static_assert(PLOW_NV_THREADS == 256 && PLOW_NV_WARPS == 8, "TC16: 8 warps x 16 rows per tile, 64 dims per warp");
+    const unsigned tid = threadIdx.x, lane = tid & 31u, warp = tid >> 5, g = lane >> 2, t = lane & 3u;
+    __nv_bfloat16* qs = (__nv_bfloat16*)lds;
+    unsigned short* ph = (unsigned short*)(lds + 16u * QS / 2u);
+    unsigned short* pl = ph + 16u * PS;
+    float* wmax = (float*)(pl + 16u * PS);
+    float* wl = wmax + 16u * PLOW_NV_WARPS;
+    const unsigned gqa = n_head / n_kv_head, n_grp = n_head / 16u;
+    const unsigned n_work = n_batch * n_grp * nsplit;
+    const float qscale = FA_SCALE(scale);
+    if (blockDim.x != PLOW_NV_THREADS) __trap();
+    for (unsigned w = slice; w < n_work; w += nblk) {
+        const unsigned sp = w % nsplit, hg = (w / nsplit) % n_grp, b = w / (nsplit * n_grp);
+        unsigned slot = b;
+        if constexpr (SLOTMAP) {
+            const int physical = decode_slot[b];
+            if (physical < 0) __trap();
+            slot = (unsigned)physical;
+        }
+#if PLOW_NV_ROW_SLOT
+        else if (decode_slot) {
+            slot = (unsigned)decode_slot[b] & 0x7FFFFFFFu;
+        }
+#endif
+        const unsigned h0 = hg * 16u, hkv = h0 / gqa;
+        const unsigned len = (unsigned)kv_len[b];
+        const unsigned first = (window && len > window) ? (len - window) : 0u;
+        const unsigned per = (len - first + nsplit - 1) / nsplit;
+        const unsigned lo = first + sp * per;
+        const unsigned hi = (lo + per < len) ? (lo + per) : len;
+#if PLOW_NV_KVBOUNDS
+        if (kv_cap && (((size_t)slot * n_kv_head + hkv) * kv_stride + (kv_stride - 1)) >= kv_cap)
+            __trap();
+#else
+        (void)kv_cap;
+#endif
+        const size_t kvo = ((size_t)slot * n_kv_head + hkv) * (size_t)kv_stride;
+        const unsigned char* kb = K + kvo * D;
+        const unsigned char* vb = V + kvo * D;
+        const float* ksc = k_scale + kvo;
+        const float* vsc = v_scale + kvo;
+        __syncthreads(); /* the previous item's (or op's) readers of the arena are done */
+        for (unsigned i = tid; i < 16u * D / 8u; i += PLOW_NV_THREADS) {
+            const unsigned h = i / (D / 8u), c = (i % (D / 8u)) * 8u;
+            *(uint4*)(qs + h * QS + c) = *(const uint4*)(Q + ((size_t)b * n_head + h0 + h) * D + c);
+        }
+        __syncthreads();
+        float m_run[2] = {FA_NEG_INF, FA_NEG_INF}, l_run[2] = {0.0f, 0.0f};
+        float o[8][4];
+#pragma unroll
+        for (int j = 0; j < 8; j++)
+#pragma unroll
+            for (int e = 0; e < 4; e++) o[j][e] = 0.0f;
+        for (unsigned t0 = lo; t0 < hi; t0 += FA_TC16_TR) {
+            /* Scores: s[j] = rows r0 + 8j + 2t + {0,1} for heads g (e 0,1) and g + 8 (e 2,3). */
+            const unsigned r0 = t0 + 16u * warp;
+            float s[2][4] = {};
+            if (r0 < hi) {
+                const unsigned char* k0p = kb + (size_t)(min(r0 + g, hi - 1u) & kv_mask) * D + 16u * t;
+                const unsigned char* k1p = kb + (size_t)(min(r0 + 8u + g, hi - 1u) & kv_mask) * D + 16u * t;
+#pragma unroll
+                for (unsigned c0 = 0; c0 < NCH; c0 += 4) {
+                    uint4 k0[4], k1[4];
+#pragma unroll
+                    for (unsigned u = 0; u < 4; u++) {
+                        k0[u] = __ldcs((const uint4*)(k0p + (c0 + u) * 64u));
+                        k1[u] = __ldcs((const uint4*)(k1p + (c0 + u) * 64u));
+                    }
+#pragma unroll
+                    for (unsigned u = 0; u < 4; u++) {
+                        const __nv_bfloat16* qa = qs + g * QS + (c0 + u) * 64u + 16u * t;
+                        const uint4 qa0 = *(const uint4*)qa, qa1 = *(const uint4*)(qa + 8);
+                        const uint4 qb0 = *(const uint4*)(qa + 8u * QS), qb1 = *(const uint4*)(qa + 8u * QS + 8);
+                        const unsigned A[8] = {qa0.x, qa0.y, qa0.z, qa0.w, qa1.x, qa1.y, qa1.z, qa1.w};
+                        const unsigned B8[8] = {qb0.x, qb0.y, qb0.z, qb0.w, qb1.x, qb1.y, qb1.z, qb1.w};
+                        const unsigned* w0 = (const unsigned*)&k0[u];
+                        const unsigned* w1 = (const unsigned*)&k1[u];
+#pragma unroll
+                        for (unsigned st = 0; st < 4; st++) {
+                            fa_mma_bf16_acc(s[0], A[2 * st], B8[2 * st], A[2 * st + 1], B8[2 * st + 1],
+                                            fa_e4m3x2_bf16x2(w0[st]), fa_e4m3x2_bf16x2(w0[st] >> 16));
+                            fa_mma_bf16_acc(s[1], A[2 * st], B8[2 * st], A[2 * st + 1], B8[2 * st + 1],
+                                            fa_e4m3x2_bf16x2(w1[st]), fa_e4m3x2_bf16x2(w1[st] >> 16));
+                        }
+                    }
+                }
+            }
+            float vs[2][2];
+#pragma unroll
+            for (int j = 0; j < 2; j++)
+#pragma unroll
+                for (int e = 0; e < 2; e++) {
+                    const unsigned row = r0 + 8u * j + 2u * t + e;
+                    const unsigned rr = min(row, hi - 1u) & kv_mask;
+                    const float ks = ksc[rr];
+                    vs[j][e] = vsc[rr];
+                    const bool live = row < hi;
+                    s[j][e] = live ? s[j][e] * qscale * ks : FA_NEG_INF;
+                    s[j][e + 2] = live ? s[j][e + 2] * qscale * ks : FA_NEG_INF;
+                }
+            float mx0 = fmaxf(fmaxf(s[0][0], s[0][1]), fmaxf(s[1][0], s[1][1]));
+            float mx1 = fmaxf(fmaxf(s[0][2], s[0][3]), fmaxf(s[1][2], s[1][3]));
+#pragma unroll
+            for (unsigned sh = 1; sh <= 2; sh <<= 1) {
+                mx0 = fmaxf(mx0, __shfl_xor_sync(0xffffffffu, mx0, sh, 32));
+                mx1 = fmaxf(mx1, __shfl_xor_sync(0xffffffffu, mx1, sh, 32));
+            }
+            if (t == 0) {
+                wmax[warp * 16u + g] = mx0;
+                wmax[warp * 16u + g + 8u] = mx1;
+            }
+            __syncthreads(); /* wmax published; the previous tile's P.V readers of ph / pl are done */
+            float tm0 = FA_NEG_INF, tm1 = FA_NEG_INF;
+#pragma unroll
+            for (unsigned i = 0; i < PLOW_NV_WARPS; i++) {
+                tm0 = fmaxf(tm0, wmax[i * 16u + g]);
+                tm1 = fmaxf(tm1, wmax[i * 16u + g + 8u]);
+            }
+            const float mn0 = fmaxf(m_run[0], tm0), mn1 = fmaxf(m_run[1], tm1);
+            /* No live row yet: shift by 0 so dead rows weigh ex2(NEG_INF) = 0. */
+            const float mr0 = mn0 > FA_NEG_INF ? mn0 : 0.0f, mr1 = mn1 > FA_NEG_INF ? mn1 : 0.0f;
+            const float cr0 = FA_EXP(m_run[0] - mr0), cr1 = FA_EXP(m_run[1] - mr1);
+            m_run[0] = mn0;
+            m_run[1] = mn1;
+            l_run[0] *= cr0;
+            l_run[1] *= cr1;
+#pragma unroll
+            for (int j = 0; j < 2; j++) {
+                unsigned hw[2], lw[2];
+#pragma unroll
+                for (int hh = 0; hh < 2; hh++) {
+                    float a2[2];
+#pragma unroll
+                    for (int e = 0; e < 2; e++) {
+                        const float p = FA_EXP(s[j][2 * hh + e] - (hh ? mr1 : mr0));
+                        l_run[hh] += p;
+                        a2[e] = p * vs[j][e];
+                    }
+                    const __nv_bfloat162 hv = __floats2bfloat162_rn(a2[0], a2[1]);
+                    const float2 hf = __bfloat1622float2(hv);
+                    const __nv_bfloat162 lv = __floats2bfloat162_rn(a2[0] - hf.x, a2[1] - hf.y);
+                    hw[hh] = *reinterpret_cast<const unsigned*>(&hv);
+                    lw[hh] = *reinterpret_cast<const unsigned*>(&lv);
+                }
+                const unsigned n = 16u * warp + 8u * j + 2u * t;
+                *(unsigned*)(ph + g * PS + n) = hw[0];
+                *(unsigned*)(ph + (g + 8u) * PS + n) = hw[1];
+                if (PLOW_NV_FA_TC16_PV == 2) {
+                    *(unsigned*)(pl + g * PS + n) = lw[0];
+                    *(unsigned*)(pl + (g + 8u) * PS + n) = lw[1];
+                }
+            }
+            __syncthreads(); /* P published */
+#pragma unroll
+            for (int j = 0; j < 8; j++) {
+                o[j][0] *= cr0;
+                o[j][1] *= cr0;
+                o[j][2] *= cr1;
+                o[j][3] *= cr1;
+            }
+            const unsigned live = hi - t0 < FA_TC16_TR ? hi - t0 : FA_TC16_TR;
+            const unsigned char* vcol = vb + 64u * warp + 8u * g;
+            for (unsigned kk = 0; kk < (live + 15u) / 16u; kk++) {
+                const unsigned rb = t0 + 16u * kk + 2u * t;
+                uint2 vr[4];
+#pragma unroll
+                for (int q = 0; q < 4; q++) {
+                    const unsigned row = rb + (unsigned)(q & 1) + 8u * (unsigned)(q >> 1);
+                    vr[q] = __ldcs((const uint2*)(vcol + (size_t)(min(row, hi - 1u) & kv_mask) * D));
+                }
+                unsigned ah[4], al[4];
+                fa_ldmatrix_x4(ah, ph + (lane & 15u) * PS + 16u * kk + (lane >> 4) * 8u);
+                if (PLOW_NV_FA_TC16_PV == 2)
+                    fa_ldmatrix_x4(al, pl + (lane & 15u) * PS + 16u * kk + (lane >> 4) * 8u);
+                unsigned wv[4][4];
+#pragma unroll
+                for (int q = 0; q < 4; q++) {
+                    wv[q][0] = fa_e4m3x2_bf16x2(vr[q].x);
+                    wv[q][1] = fa_e4m3x2_bf16x2(vr[q].x >> 16);
+                    wv[q][2] = fa_e4m3x2_bf16x2(vr[q].y);
+                    wv[q][3] = fa_e4m3x2_bf16x2(vr[q].y >> 16);
+                }
+#pragma unroll
+                for (int j = 0; j < 8; j++) {
+                    const unsigned sel = (j & 1) ? 0x7632u : 0x5410u;
+                    const unsigned b0 = __byte_perm(wv[0][j >> 1], wv[1][j >> 1], sel);
+                    const unsigned b1 = __byte_perm(wv[2][j >> 1], wv[3][j >> 1], sel);
+                    fa_mma_bf16_acc(o[j], ah[0], ah[1], ah[2], ah[3], b0, b1);
+                    if (PLOW_NV_FA_TC16_PV == 2) fa_mma_bf16_acc(o[j], al[0], al[1], al[2], al[3], b0, b1);
+                }
+            }
+        }
+#pragma unroll
+        for (unsigned sh = 1; sh <= 2; sh <<= 1) {
+            l_run[0] += __shfl_xor_sync(0xffffffffu, l_run[0], sh, 32);
+            l_run[1] += __shfl_xor_sync(0xffffffffu, l_run[1], sh, 32);
+        }
+        if (t == 0) {
+            wl[warp * 16u + g] = l_run[0];
+            wl[warp * 16u + g + 8u] = l_run[1];
+        }
+        __syncthreads();
+#pragma unroll
+        for (int hh = 0; hh < 2; hh++) {
+            const size_t row = ((size_t)b * n_head + h0 + g + 8u * hh) * nsplit + sp;
+            float* op = Opart + row * D + 64u * warp + 16u * t;
+            *(float4*)op = make_float4(o[0][2 * hh], o[1][2 * hh], o[2][2 * hh], o[3][2 * hh]);
+            *(float4*)(op + 4) = make_float4(o[4][2 * hh], o[5][2 * hh], o[6][2 * hh], o[7][2 * hh]);
+            *(float4*)(op + 8) = make_float4(o[0][2 * hh + 1], o[1][2 * hh + 1], o[2][2 * hh + 1], o[3][2 * hh + 1]);
+            *(float4*)(op + 12) = make_float4(o[4][2 * hh + 1], o[5][2 * hh + 1], o[6][2 * hh + 1], o[7][2 * hh + 1]);
+            if (warp == 0 && t == 0) {
+                float L = 0.0f;
+#pragma unroll
+                for (unsigned i = 0; i < PLOW_NV_WARPS; i++) L += wl[i * 16u + g + 8u * hh];
+                mlpart[row * 2] = m_run[hh];
+                mlpart[row * 2 + 1] = L;
+            }
+        }
+    }
+}
+#endif
+
 /* CLONE != 0: a separate instantiation for a second caller (a light kernel), so the
  * interpreter's copy keeps its single-caller inlining and registers. */
-template <int D, int GF, bool FP8KV = false, bool SZKV = false, bool SLOTMAP = false, int CLONE = 0>
-__device__ void d_flash_decode(float* __restrict__ Opart, float* __restrict__ mlpart,
-                               const __nv_bfloat16* __restrict__ Q,
-                               const __nv_bfloat16* __restrict__ K,
-                               const __nv_bfloat16* __restrict__ V,
-                               const int* __restrict__ kv_len, unsigned n_batch, unsigned n_head,
-                               unsigned n_kv_head, unsigned kv_stride, unsigned window,
-                               float scale, unsigned nsplit, unsigned kv_mask, unsigned slice,
-                               unsigned nblk, float* lds, unsigned kv_cap = 0,
-                               const float* __restrict__ k_scale = nullptr,
-                               const float* __restrict__ v_scale = nullptr,
-                               const int* __restrict__ decode_slot = nullptr,
-                               __nv_bfloat16* __restrict__ out = nullptr,
-                               unsigned* __restrict__ merge_ctr = nullptr) {
+template <int D, int GF, bool FP8KV, bool SZKV, bool SLOTMAP, int CLONE>
+__device__ __forceinline__ void d_flash_decode_body(float* __restrict__ Opart, float* __restrict__ mlpart,
+                                    const __nv_bfloat16* __restrict__ Q,
+                                    const __nv_bfloat16* __restrict__ K,
+                                    const __nv_bfloat16* __restrict__ V,
+                                    const int* __restrict__ kv_len, unsigned n_batch, unsigned n_head,
+                                    unsigned n_kv_head, unsigned kv_stride, unsigned window,
+                                    float scale, unsigned nsplit, unsigned kv_mask, unsigned slice,
+                                    unsigned nblk, float* lds, unsigned kv_cap,
+                                    const float* __restrict__ k_scale,
+                                    const float* __restrict__ v_scale,
+                                    const int* __restrict__ decode_slot,
+                                    __nv_bfloat16* __restrict__ out,
+                                    unsigned* __restrict__ merge_ctr) {
     constexpr bool RG = PLOW_NV_FA_RG && (D == 128 || (PLOW_NV_FA_RG_WIDE && (D == 256 || D == 512))) &&
                         GF >= 2 && GF <= 4 && !FP8KV && !SZKV;
     if constexpr (!RG) {
@@ -2819,6 +3092,40 @@ __device__ void d_flash_decode(float* __restrict__ Opart, float* __restrict__ ml
             }
         }
         }
+    }
+}
+
+template <int D, int GF, bool FP8KV = false, bool SZKV = false, bool SLOTMAP = false, int CLONE = 0>
+__device__ void d_flash_decode(float* __restrict__ Opart, float* __restrict__ mlpart,
+                                               const __nv_bfloat16* __restrict__ Q,
+                                               const __nv_bfloat16* __restrict__ K,
+                                               const __nv_bfloat16* __restrict__ V,
+                                               const int* __restrict__ kv_len, unsigned n_batch,
+                                               unsigned n_head, unsigned n_kv_head, unsigned kv_stride,
+                                               unsigned window, float scale, unsigned nsplit,
+                                               unsigned kv_mask, unsigned slice, unsigned nblk,
+                                               float* lds, unsigned kv_cap = 0,
+                                               const float* __restrict__ k_scale = nullptr,
+                                               const float* __restrict__ v_scale = nullptr,
+                                               const int* __restrict__ decode_slot = nullptr,
+                                               __nv_bfloat16* __restrict__ out = nullptr,
+                                               unsigned* __restrict__ merge_ctr = nullptr) {
+#if PLOW_NV_FA_TC16
+    if constexpr (FA_TC16_TAKES(D, GF, FP8KV, SZKV)) {
+        static_assert(FA_TC16_SMEM_FLOATS <= (unsigned)FA_DEC_SMEM_FLOATS(512, 16),
+                      "TC16 decode item outgrows the hd512 GF16 flash claim");
+        (void)merge_ctr;
+        if (out) __trap(); /* no merge fold on this item */
+        fa_decode_tc16<SLOTMAP, CLONE>(Opart, mlpart, Q, (const unsigned char*)K, (const unsigned char*)V,
+                                       kv_len, n_batch, n_head, n_kv_head, kv_stride, window, scale, nsplit,
+                                       kv_mask, slice, nblk, lds, kv_cap, k_scale, v_scale, decode_slot);
+        return;
+    } else
+#endif
+    {
+        d_flash_decode_body<D, GF, FP8KV, SZKV, SLOTMAP, CLONE>(
+            Opart, mlpart, Q, K, V, kv_len, n_batch, n_head, n_kv_head, kv_stride, window, scale,
+            nsplit, kv_mask, slice, nblk, lds, kv_cap, k_scale, v_scale, decode_slot, out, merge_ctr);
     }
 }
 

@@ -535,6 +535,16 @@ impl ServeEngine {
         }
     }
 
+    /// The KV block store's counters, engine-lock-free; CUDA only.
+    #[cfg(feature = "cuda")]
+    pub fn kv_store_handle(&self) -> Option<std::sync::Arc<crate::exec::gpu::KvStoreHandle>> {
+        match self {
+            ServeEngine::Cuda(e) => e.kv_store_handle(),
+            #[allow(unreachable_patterns)]
+            _ => None,
+        }
+    }
+
     /// The prefix cache's read-only attach probe, for cache-aware admission order.
     #[cfg(any(feature = "cuda", feature = "hsa"))]
     pub fn vmm_prefix_probe(&self) -> Option<crate::memory::vmm::PrefixProbe> {

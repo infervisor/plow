@@ -16,5 +16,7 @@ test-util = []
 [dependencies]
 sha2 = "0.10"
 serde = { version = "1", features = ["derive"] }
-serde_json = "1"
+serde_json = { version = "1", features = ["preserve_order"] }
 packet = { path = "../packet" }
+minijinja = { version = "2", default-features = false, features = ["builtins", "loop_controls", "macros", "multi_template", "adjacent_loop_items", "preserve_order", "serde"] }
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }

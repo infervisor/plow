@@ -2,8 +2,8 @@
 
 This file holds only qualified wins and their evidence. Every matched serving row is in
 [comparison.csv](comparison.csv) (one block per model, `campaign.py report` output with `model` and
-`status` columns prepended). Status: E2B, E4B, 12B, 26B-A4B final (plowrt 59a36e3d); 31B pending
-its vLLM baseline.
+`status` columns prepended). Status: E2B, E4B final (plowrt 53581658, `PLOW_CPU_COMBINE=16`); 12B,
+26B-A4B final (plowrt 59a36e3d); 31B pending its vLLM baseline.
 
 ## Setup
 
@@ -26,19 +26,23 @@ better; TTFT, TPOT and peak memory lower is better. `*` = repeat spread > 10% (d
 
 | Model | FP32 gate kl_mean (plow / vLLM) | Cell | Total throughput | TTFT P99 | TPOT P99 | Peak memory |
 |---|---|---|---:|---:|---:|---:|
-| E2B | 0.0004 / 0.0005 PASS | c1 | 3.24x | 0.53x * | 0.29x | 0.27x * |
-| | | c8 | 2.03x | 0.78x | 0.48x | 0.29x * |
-| | | c32 | 1.36x | 0.82x | 0.73x | 0.34x * |
-| E4B | 0.0007 / 0.0014 PASS | c1 | 3.25x | 0.54x * | 0.29x | 0.35x * |
-| | | c8 | 2.22x | 0.78x * | 0.43x | 0.37x * |
-| | | c32 | 1.50x | 0.85x | 0.66x | 0.43x |
+| E2B | 0.0004 / 0.0005 PASS | c1 | 3.67x | 0.52x * | 0.25x | 0.27x * |
+| | | c8 | 2.17x | 0.75x | 0.45x | 0.29x * |
+| | | c32 | 1.46x | 0.81x | 0.68x | 0.34x * |
+| E4B | 0.0007 / 0.0014 PASS | c1 | 3.52x | 0.51x * | 0.27x | 0.35x * |
+| | | c8 | 2.37x | 0.77x * | 0.40x | 0.37x * |
+| | | c32 | 1.55x | 0.84x | 0.64x | 0.43x |
 | 12B | 0.0125 / 0.0215 PASS | c1 | 3.31x | 0.68x * | 0.28x | 0.53x * |
 | | | c8 | 2.28x | 0.74x * | 0.44x | 0.55x * |
 | | | c32 | 2.08x | 0.78x * | 0.49x | 0.63x |
 | 26B-A4B | 0.1014 / 0.0893 PASS | c1 | 5.78x | 0.36x * | 0.16x | 0.72x * |
 | | | c8 | 3.62x | 0.57x * | 0.28x | 0.73x * |
 | | | c32 | 2.42x | 0.67x * | 0.41x | 0.77x |
-Infervisor wins every row. Against the b6924229 reports, burst TTFT P99 at c32 improved from 0.87x / 0.91x / 0.77x
+Infervisor wins every row. E2B and E4B are the plowrt 53581658 reports with the recipes'
+`PLOW_CPU_COMBINE=16` (combining-tree completion counters, `docs/runtime/cpu.md`). Same packets and vLLM arms as the
+59a36e3d reports, FP32 gate re-captured with this binary. Against 59a36e3d: throughput 3.24 / 2.03 / 1.36x to
+3.67 / 2.17 / 1.46x (E2B c1 / c8 / c32) and 3.25 / 2.22 / 1.50x to 3.52 / 2.37 / 1.55x (E4B); TPOT P99 0.29 / 0.48 /
+0.73x to 0.25 / 0.45 / 0.68x (E2B) and 0.29 / 0.43 / 0.66x to 0.27 / 0.40 / 0.64x (E4B). Against the b6924229 reports, burst TTFT P99 at c32 improved from 0.87x / 0.91x / 0.77x
 to 0.82x / 0.85x / 0.67x (E2B / E4B / 26B-A4B); this binary adds the CPU token batch and, for 26B, TMUL attention.
 26B-A4B's gate (0.1014, limit 0.1116) is the split-P recipe; its earlier
 AVX-512-attention gate was 0.0950. Burst TTFT P99 at c8/c32 (all prompts arriving at once) is bound by
@@ -161,7 +165,9 @@ Read this as supplementary, not as a replacement for the 600 s cell:
 ## Evidence (campaign scratch)
 
 - Strict reports: `/tmp/g4c/final/<model>/report-vllm/` (comparison.md/.csv/.json), arms in
-  `/tmp/g4c/final/<model>/{plow,vllm}`, FP32 gates in `/tmp/g4c/final/<model>/gate/gates.json`.
+  `/tmp/g4c/final/<model>/{plow,vllm}`, FP32 gates in `/tmp/g4c/final/<model>/gate/gates.json`. E2B, E4B with
+  `PLOW_CPU_COMBINE=16`: `report-vllm.comb`, `plow.comb`, `gate.comb` (`/tmp/g4c/l2r/final_comb.sh`); their
+  59a36e3d reports stay in `report-vllm`.
 - Open loop: `/tmp/g4c/final/<model>/prod-{plow,vllm}`, table `/tmp/g4c/final/prod_table.share.md`.
 - 16K agentic: `/tmp/g4c/final16k/<model>/prod-{plow-final,vllm}`, tables `/tmp/g4c/table16k_doc.py`
   (this file) and `/tmp/g4c/table16k.py`, same-request P99 `/tmp/g4c/matched.py`.

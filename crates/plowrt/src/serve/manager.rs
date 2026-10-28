@@ -247,6 +247,9 @@ impl BlobPlan {
                     config,
                     capability,
                     granularity,
+                    manifest
+                        .as_ref()
+                        .map_or(Some(false), |m| m.full_rows_interleaved()),
                 )
             });
             let prefix_requested = config.nv_prefix_requested(prefix_layout.is_some());

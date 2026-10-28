@@ -59,8 +59,12 @@ impl SharedTail {
         };
         let config = RuntimeConfig::get();
         let programs = blob.prefill_progs();
+        // A staged packed launch binds per-stage span tables the tail does not rebuild.
         if !config.nv.pf_shared_tail
             || e.packed_prefill.is_none()
+            || e.packed_prefill
+                .as_ref()
+                .is_some_and(|p| p.stage_rows.is_some())
             || e.pf_batch.is_none()
             || e.packed_terminal.is_none()
             || e.attention_gemm.is_some()
@@ -503,6 +507,13 @@ impl GpuEngine {
                 )?;
                 self.be.memcpy_htod_async(
                     pb.d_req.base,
+                    bytemuck::cast_slice(&tail.table),
+                    &self.stream,
+                )?;
+                // The flash sites attend the attention table (`h_req_attn`), not the chain's;
+                // without this the tail's rows attend as the body's first request.
+                self.be.memcpy_htod_async(
+                    pb.d_req_attn.base,
                     bytemuck::cast_slice(&tail.table),
                     &self.stream,
                 )?;

@@ -331,47 +331,16 @@ async fn chat_completions_with(
     let mut prompt = crate::obs::ttft::timed(&crate::obs::ttft::TEMPLATE, || {
         if state.chat_templated(&req.model) {
             let tok = state.registry.get(&req.model).ok();
-            // THE CHECKPOINT'S OWN TEMPLATE FIRST. The built-in per-family
-            // builders are the fallback for checkpoints that ship none — they
-            // are an approximation of a file the weights already carry, and
-            // every divergence between the two is a wrong prompt.
-            if let Some(t) = tok.as_deref().and_then(|b| b.chat_template()) {
-                use crate::serve::tools::request::{render, RenderError};
-                match render(t, &req.messages, &render_opts) {
-                    Ok(p) => return p,
-                    // The template REFUSED this conversation (HF templates call
-                    // `raise_exception` for shapes they cannot render, e.g. an
-                    // out-of-order role sequence). Surface it as a 400 rather than
-                    // silently rendering something else.
-                    Err(RenderError::Template(e)) => {
-                        template_error = Some(e);
-                        return String::new();
+            match chat_prompt(tok.as_deref(), &req.messages, &render_opts) {
+                Ok(p) => p,
+                Err(e) => {
+                    match e {
+                        PromptError::Template(e) => template_error = Some(e),
+                        PromptError::Request(r) => request_error = Some(r),
+                        PromptError::NoTemplate(e) => no_template = Some(e),
                     }
-                    Err(RenderError::Request(r)) => {
-                        request_error = Some(r);
-                        return String::new();
-                    }
+                    String::new()
                 }
-            }
-            match tok.as_deref().map(|b| b.serve()) {
-                // A packet that names a built-in builder gets exactly it. One that carries neither
-                // a usable template nor a builder (checkpoints without a template, e.g. Kimi-K3)
-                // keeps the vocabulary-probed builders it was served with before serve.json.
-                Some(serve) if serve.from_packet => {
-                    match serve
-                        .manifest
-                        .chat
-                        .as_ref()
-                        .and_then(|c| c.builtin.as_deref())
-                    {
-                        Some(id) => builtin_chat_prompt(id, &req.messages).unwrap_or_else(|| {
-                            no_template = Some(format!("unknown built-in chat format {id:?}"));
-                            String::new()
-                        }),
-                        None => gpu_chat_prompt(tok.as_deref(), &req.messages),
-                    }
-                }
-                _ => gpu_chat_prompt(tok.as_deref(), &req.messages),
             }
         } else {
             let mut prompt = String::new();
@@ -861,6 +830,7 @@ async fn chat_completions_with(
             turn: run.key(),
             continuing: run.continuing(),
             tenant: ids.tenant,
+            session_end: ids.session_end,
             prefix: prefix.take(),
             mm: mm_job,
             ..Default::default()
@@ -995,7 +965,7 @@ pub async fn reasoning_end(axum::extract::Path(id): axum::extract::Path<String>)
 /// The response-side state machine when the plain reasoning split is not enough: the request
 /// declares tools, the format frames every answer (harmony), or the reasoning markers are special
 /// tokens (Gemma 4's thought channel) and must be decoded to be seen.
-fn response_stream(
+pub(crate) fn response_stream(
     plan: &crate::serve::tools::request::Plan,
     support: Option<crate::serve::tools::ToolSupport>,
     mode: crate::serve::reasoning::ReasoningMode,
@@ -1082,6 +1052,60 @@ pub(crate) fn dp_unavailable(model: &str) -> Response {
 /// which another checkpoint's tokenizer spells out as literal text.
 ///
 /// Unknown family → Gemma's format, the previous behavior.
+/// Why a chat conversation has no prompt.
+#[derive(Debug)]
+pub(crate) enum PromptError {
+    /// The template REFUSED this conversation (HF templates call `raise_exception` for shapes
+    /// they cannot render, e.g. an out-of-order role sequence); a 400, never another prompt.
+    Template(String),
+    Request(crate::serve::tools::request::Refusal),
+    /// The packet names a built-in builder this server does not have.
+    NoTemplate(String),
+}
+
+/// The prompt a templated (GPU-served) model gets for `messages`: THE CHECKPOINT'S OWN TEMPLATE
+/// FIRST. The built-in per-family builders are the fallback for checkpoints that ship none — they
+/// are an approximation of a file the weights already carry, and every divergence between the two
+/// is a wrong prompt. The one place this choice is made; the serve golden test replays it.
+pub(crate) fn chat_prompt(
+    bundle: Option<&crate::asset::ModelBundle>,
+    messages: &[Message],
+    render_opts: &crate::serve::template::RenderOpts,
+) -> Result<String, PromptError> {
+    if let Some(t) = bundle.and_then(|b| b.chat_template()) {
+        use crate::serve::tools::request::{render, RenderError};
+        return render(t, messages, render_opts).map_err(|e| match e {
+            RenderError::Template(e) => PromptError::Template(e),
+            RenderError::Request(r) => PromptError::Request(r),
+        });
+    }
+    Ok(match bundle.map(|b| b.serve()) {
+        // A packet that names a built-in builder gets exactly it. A version-1 packet that
+        // carries neither a usable template nor a builder (checkpoints without a template, e.g.
+        // Kimi-K3) keeps the vocabulary-probed builders it was served with before serve.json; a
+        // version-2 packet declared its builder at emit, so nothing is probed for it.
+        Some(serve) if serve.from_packet => {
+            match serve
+                .manifest
+                .chat
+                .as_ref()
+                .and_then(|c| c.builtin.as_deref())
+            {
+                Some(id) => builtin_chat_prompt(id, messages).ok_or_else(|| {
+                    PromptError::NoTemplate(format!("unknown built-in chat format {id:?}"))
+                })?,
+                None if serve.manifest.declares_response() => {
+                    return Err(PromptError::NoTemplate(
+                        "the packet declares no chat template and no built-in chat format".into(),
+                    ))
+                }
+                None => gpu_chat_prompt(bundle, messages),
+            }
+        }
+        _ => gpu_chat_prompt(bundle, messages),
+    })
+}
+
 /// The built-in prompt builder a packet names (`serve.json` `chat.builtin`), for checkpoints that
 /// ship no template.
 fn builtin_chat_prompt(id: &str, messages: &[Message]) -> Option<String> {
@@ -2117,7 +2141,7 @@ mod tests {
             eprintln!("skipped: no Gemma-4 checkpoint on this host");
             return;
         }
-        let t = crate::serve::template::ChatTemplate::load(dir).expect("template compiles");
+        let t = crate::serve::template::load(dir).expect("template compiles");
         for convo in [
             vec![("system", "You are helpful."), ("user", "Hi there")],
             vec![("user", "one"), ("assistant", "two"), ("user", "three")],

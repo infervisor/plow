@@ -33,6 +33,25 @@ class CampaignBuildTests(unittest.TestCase):
         self.assertEqual(keep, {"PLOW_PF_INTERLEAVE": "2048"})
         self.assertEqual(sorted(skipped), ["LD_LIBRARY_PATH", "PLOW_LIBCUDA"])
 
+    def test_a_compiler_older_than_its_sources_is_named(self):
+        import os
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source, spaced = root / "lib.rs", root / "a dir/mod.rs"
+            spaced.parent.mkdir()
+            compiler = root / "plowc"
+            for path in (source, spaced, compiler):
+                path.write_text("x")
+            (root / "plowc.d").write_text(f"{compiler}: {source} {str(spaced).replace(' ', chr(92) + ' ')}\n\n{source}:\n")
+            os.utime(compiler, (2_000, 2_000))
+            for path in (source, spaced):
+                os.utime(path, (1_000, 1_000))
+            self.assertIsNone(campaign.newer_source(compiler))
+            os.utime(spaced, (3_000, 3_000))
+            self.assertEqual(campaign.newer_source(compiler), str(spaced))
+            (root / "plowc.d").unlink()
+            self.assertIsNone(campaign.newer_source(compiler))
+
     def test_role_rebuild_preserves_overrides_and_copies_final_objects(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

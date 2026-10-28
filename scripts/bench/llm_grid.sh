@@ -94,7 +94,7 @@ if [ "$SIDE" = plow ]; then server_args=${SERVE_ARGS:-}
 elif [ "$SIDE" = llamacpp ]; then server_args="${LLAMA_ARGS:-}"
 else server_args="${VLLM_GPU_ARGS:+$VLLM_GPU_ARGS }--max-num-seqs 256 ${VLLM_ARGS:-}"; fi
 python3 "$HERE/scripts/bench/serving_comparison.py" record "$RES" --side "$SIDE" --hf "$HF" --reps "$REPS" \
-    --server-args "$server_args" --sampled "$SAMPLED" --pyref "$PYREF" --assets "${ASSETS:-}" \
+    --server-args="$server_args" --sampled="$SAMPLED" --pyref "$PYREF" --assets "${ASSETS:-}" \
     --plowrt "${PLOWRT:-}" --repo "$HERE" ${GGUF:+--gguf "$GGUF"} ${LLAMA_IMAGE:+--llama-image "$LLAMA_IMAGE"}
 memory_sampler_pid=
 memory_start() { # tag

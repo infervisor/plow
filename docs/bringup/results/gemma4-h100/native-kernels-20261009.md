@@ -78,3 +78,46 @@ plow-vs-baseline claim. Raw: `res/serve1/`, gates `gate/n-*/`, rungs `res/rungs2
 * Customer H100 baseline (kit3 bundle, before the host was withdrawn): B=1/8/32/48/64/96/128
   5.58/6.02/8.35/6.83/7.13/8.79/9.17 ms; at B=128 attention is 3.4 ms of the 9.2 ms step
   (sliding 59 us/layer, full 203 us/layer), launch gaps 0.57 ms over 489 launches.
+
+## 2026-10-27: native vs cuBLASLt route sweep (E4B)
+
+Protocol: `step_bench` on one H100, decode 48 steps `--spread`, prefill `--packed-prefill --pf-reps 3`
+(best timed rep), two passes ABAB (passes agree within 1%), ms = mean of the passes. Current arm =
+the abi2 packet of the recipe at 21ab0d7d. Alternative = either the same packet with one runtime
+knob set, or a re-emit of the recipe with the emit knobs named in the table title changed (Qwen:
+the decode threshold moves together with `PLOW_QWEN_GDN_ISOLATE`, which plowrt requires; the FP8
+arms also need the devgen/policy commit 8b811e45, emitted with plowc built from it). Both arms of a
+table run on the same plowrt (named in the title where it is not bin34 6a4b75bc). % floor = floor /
+measured, floor = decode bytes (weights streamed once + KV rows) / 3.35 TB/s, prefill max(FLOP /
+peak, bytes / 3.35 TB/s) with peak 1979 TF/s FP8, 990 BF16; not reported for the MoE packets, whose
+routed expert bytes the model cannot bound. digest = TOK_STREAM fnv of the run (`equal` = both
+passes of both arms). `--same` slot agreement held on every arm (8/8 .. 64/64). Not measured: the
+4160/4224 rungs (they only occur with decode riders, which step_bench does not build) and, for the
+native prefill arms, the 1152 and 8192 rungs. Raw: /opt/dlami/nvme/lava-tts/route-sweep (A/, B/, C/,
+D/, logs/, gates/).
+
+Result: no change. E4B already runs every projection on cuBLASLt (decode from 1 row, prefill on
+every bucket, head + PLE projection). The fused qkv matmul is 0.11-0.14 ms per step faster than
+separate projections; the cuBLASLt terminal 0.2-0.3 ms per prefill faster. Open defect: the native
+prefill arm (`PLOW_EMIT_PREFILL_CUBLASLT=0`) faults with CUDA_ERROR_LAUNCH_FAILED on every cell
+(its first launch), so that comparison does not exist; recorded, not fixed.
+
+
+**E4B PLOW_DECODE_LT_QKV=0** (e4b-base vs e4b-ltqkv0)
+
+| phase | rows x ctx | e4b-base ms | e4b-ltqkv0 ms | change | % floor (cur / alt) | digest |
+|---|---|---|---|---|---|---|
+| decode | B8 x 1024 | 5.97 | 6.08 | +1.8% | 52 / 51 | equal |
+| decode | B8 x 4096 | 6.22 | 6.33 | +1.8% | 52 / 51 | equal |
+| decode | B64 x 1024 | 7.25 | 7.38 | +1.8% | 52 / 51 | equal |
+| decode | B64 x 4096 | 9.21 | 9.35 | +1.6% | 50 / 49 | equal |
+| decode | B128 x 1024 | 9.35 | 9.49 | +1.4% | 49 / 48 | equal |
+| decode | B128 x 4096 | 13.25 | 13.36 | +0.8% | 47 / 47 | equal |
+
+**E4B PLOW_TERMINAL_LT=0** (e4b-base vs e4b-termlt0)
+
+| phase | rows x ctx | e4b-base ms | e4b-termlt0 ms | change | % floor (cur / alt) | digest |
+|---|---|---|---|---|---|---|
+| prefill | 1 x 64 | 7.79 | 8.00 | +2.7% | 39 / 38 | equal |
+| prefill | 1 x 256 | 9.44 | 9.65 | +2.2% | 32 / 31 | equal |
+| prefill | 1 x 1024 | 17.46 | 17.79 | +1.9% | 55 / 53 | equal |

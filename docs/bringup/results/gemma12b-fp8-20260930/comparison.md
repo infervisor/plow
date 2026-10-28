@@ -334,3 +334,246 @@ During the run, plowrt was found to omit a stop token from completions logprobs 
 - Captures in `best/gate/llm_fp32_ref/`: plow `3d79bd08…`, vllm `74a7a572…`.
 - Gate recipe: `best/recipe.toml`.
 
+
+## 2026-10-26: production-mix loss on kv-block-store is the decode step
+
+Same packet (06da7686 device bytes, abi2 re-emit), plowrt 2dabbe2b, vLLM 0.29.0 arm of the
+production pass (`--kv-cache-dtype fp8 --max-model-len 16384 --max-num-seqs 256`), open-loop
+sessions, 300 s cells, two repeats, `campaign.py report` MATCHED + EQUIVALENT on every variant.
+Raw grids: `kvstore-scratch/fix-g12-<name>`, rung grid `steps-g12-lt2`, profile `prof-g12`.
+
+Serve-env variants (Infervisor / Baseline ratios, TTFT P99 and TPOT P99; 2.7/s r2 goodput =
+share of requests meeting TTFT <= 2 s and TPOT <= 100 ms, vLLM 94%):
+
+| variant (on top of the recipe `[serve.env]`) | 1.8/s | 2.7/s | 2.7/s r2 goodput |
+|---|---|---|---|
+| recipe env + `PLOW_KV_POOL_MIB=2048` (`res2g`) | 1.16x / 1.82x | 3.52x / 1.28x | 28% |
+| + interleave 0, ITL budget 60 ms, decode pipeline, admit overlap, live rings, strict publish (`sched26`) | 1.78x / 1.83x | 3.82x / 1.71x | 63% |
+| same without live rings / strict publish (`sched26norings`) | 1.52x / 1.64x | 1.97x / 1.78x | 30% |
+| interleave 0, ITL budget 0, pipeline, overlap (`wide`) | 1.17x / 2.09x | 1.64x / 1.62x | 27% |
+| interleave 0, ITL budget 120 ms (`itl120`, 3 cells: last lost to a host OOM) | 872-1125 / 103-132 ms | r1 1702 / 168 ms | r1 72% |
+
+Total tok/s is 0.94-0.98x in every cell (open loop: the same work), so the loss is per-request
+latency: mean in-flight 16-20 vs vLLM 8 at 1.8/s, 39-74 vs 17-27 at 2.7/s, and the queue
+collapses. The KV store is not involved (480 chunk frees per cell; the 26B churn fix is a no-op
+here).
+
+Packlog of the `res2g` run: decode-only ticks p50 by rows 1-7 9.7 ms, 8-15 14.6, 16-23 21.4,
+24-31 29.0, 32-39 31.5, 64+ 47 (128 rung); prefill launches carry the decode rows as riders and
+pay the same cost again: 256 rows + 18 riders 31 ms (5.2k tok/s), 512 + 20 38 ms, 1024 + 24
+53 ms, 2048 + 29 93 ms (21.4k tok/s), 4096 + 17 147 ms (26k tok/s). Prefill ticks 743 s vs
+decode ticks 406 s over the four cells.
+
+step_bench decode step (greedy, 48 steps, `--spread`, two passes agree within 0.1%), ms:
+
+| B | ctx 1K | ctx 4K | ctx 16K | with cuBLASLt projections from 2 rows (1K / 4K / 16K) |
+|---|---|---|---|---|
+| 1 | 8.56 | 8.67 | 8.86 | 8.55 / - / 8.85 (native rung either way) |
+| 8 | 9.78 | - | 13.85 | 15.36 / - / 19.26 |
+| 16 | 11.82 | 13.53 | 19.66 | 16.67 / 18.26 / 24.38 |
+| 32 | 15.61 | 19.17 | 31.90 | 16.46 / 19.74 / 32.53 (digests identical) |
+| 128 | 26.88 | - | 91.23 | same route |
+
+nsys of step_bench (B=1 and B=16, ctx 4K): the decode step is exactly one `interp_sm90a`
+kernel per tick (8.62 and 13.48 ms), no other kernels and no launch gaps. The 4.7 ms above the
+3.8 ms weight-read floor at B=1 and the 0.2-0.3 ms per extra row are inside the persistent
+interpreter program (serial small ops between grid barriers, CUDA-core GEMV scaling with rows);
+the library route is flat at 15-17 ms from 8 to 32 rows (graph-captured ~200 ops), so it only
+breaks even at 32 rows and the recipe's 128-row threshold stands.
+
+Decision: keep the recipe `[serve.env]` (no variant qualifies) and record the loss. Closing it
+needs decode-interpreter kernel work with per-rung gates (B 1/8/16/32/64/128 x ctx 1K/8K/16K,
+mixed prefill + rider launches, FP32-reference logits at c1/c8/c16/c32, then the production
+replay): small-M tensor-core projections inside the interpreter first, then fusion / barrier
+removal, then long-context attention (32 rows x 15K extra ctx costs 16 ms against a ~9 ms
+incremental floor). A realistic target for the first two is B=16 11-14 ms and B=32 16-20 ms at
+8K (today ~15.6 / 23.4 interpolated), which should stabilise the 2.7/s cell but is not by itself
+a demonstrated win over vLLM 0.29.
+## 2026-10-27: decode attention rework (TC16 hd512, row-group hd256)
+
+Recipe plow_git 98347bfa, packet 01c02ceb2e53 (decode object `interp_sm90a_fp8kv` 8110b0b6),
+plowrt e8023cf97 (binary 78f6d0bb, unchanged by the later commits). Raw:
+`/opt/dlami/nvme/lava-tts/g12-decode` (`gate-m3/`, `ride-m3/`, `gates/m3-c16`, `grid-m3/`).
+
+Attribution first (TRACE=2 all-block timeline, critical path, previous packet): B=32 ctx 8K
+23.9 ms traced = hd512 FlashDecode 9.7 + hd256 4.2 + GLU 3.1 + other projections 4.4 + head 1.0
++ merge 0.8 + norms 0.7; B=1 ctx 1K 8.9 = projections 5.8 + head 0.7 + attention 1.3 + merge/HNR
+0.5 + norms 0.6. Barriers and signals were 0.6-0.8 ms at every rung. The attention used the
+generic per-thread-row FP8 body (80-95 us per 256-row tile regardless of live rows), and the
+packet sized the full-layer split for GF 4 while the object ran GF 8.
+
+Change: hd256 on the FP8 row-group body with its staged ring (`PLOW_NV_FA_RG8=2`,
+`PLOW_NV_FA_RG8S`); hd512 on a tensor-core item over the whole 16-head group
+(`PLOW_NV_FA_TC16`: QK and P.V on mma.sync bf16, P as bf16 hi + lo, exact bf16 V); the manifest
+gives the object the group the split was sized for (`BALANCE_GF 16`, `NS_FULL_ABS 132`);
+`RAW_NARROW` and `INST_PRELOAD`. The light hd256 FP8 kernel now claims the RG8S ring (it faulted
+on every library-routed rung, B 33..128, before).
+
+step_bench, 48 steps `--spread`, two ABAB passes (agree within 0.3%), previous packet vs this one,
+% floor = (weights + KV) / 3.35 TB/s over measured; digests stable within each arm:
+
+| B x ctx | previous ms | new ms | change | % floor (prev / new) |
+|---|---|---|---|---|
+| 1 x 1024 | 8.553 | 7.295 | -14.7% | 46 / 54 |
+| 1 x 16000 | 8.865 | 7.356 | -17.0% | 44 / 54 |
+| 8 x 1024 | 9.780 | 7.920 | -19.0% | 44 / 54 |
+| 8 x 8192 | 11.934 | 8.198 | -31.3% | 37 / 54 |
+| 8 x 16000 | 13.846 | 8.480 | -38.8% | 33 / 54 |
+| 16 x 1024 | 11.823 | 9.361 | -20.8% | 40 / 50 |
+| 16 x 8192 | 15.774 | 9.909 | -37.2% | 32 / 50 |
+| 16 x 16000 | 19.660 | 10.485 | -46.7% | 27 / 51 |
+| 32 x 1024 | 15.611 | 11.764 | -24.6% | 36 / 47 |
+| 32 x 8192 | 23.504 | 12.858 | -45.3% | 26 / 48 |
+| 32 x 16000 | 31.892 | 14.011 | -56.1% | 21 / 48 |
+| 64 x 8192 | 35.247 | 19.756 | -43.9% | 24 / 43 |
+| 64 x 16000 | 51.939 | 23.788 | -54.2% | 19 / 40 |
+| 128 x 1024 | 26.931 | 19.328 | -28.2% | 40 / 55 |
+| 128 x 16000 | 91.294 | 28.142 | -69.2% | 17 / 55 |
+| 7 / 9 x 8192 | 11.730 / 15.091 | 8.149 / 9.697 | -31% / -36% | |
+| 15 / 17 x 8192 | 15.644 / 22.312 | 9.873 / 12.625 | -37% / -43% | |
+| 31 / 33 x 8192 | 23.393 / 32.950 | 12.841 / 17.779 | -45% / -46% | |
+
+`--same` slot agreement full (4/16/32/128 rows); VMM edge lengths 4094/4095/8191 at B 1/4/16 run;
+mixed prefill + rider launches (256..4096 rows x ctx 4096/12000 x 1..29 riders) 0.1-12.9 ms
+faster, rider-vs-step top-1 agreement comparable to the previous packet. Object: REG 255, STACK
+240 (was 256), LOCAL 0. Numerics, one layer against FP64: merged attention output before bf16
+rounding rel L2 mean 2.3e-6 for the f16 hi/lo prototype vs 1.4e-7 for the generic body; after
+bf16 rounding ~1.6e-3 for all, the shipped bf16 hi/lo P identical to the prototype there. FP32-reference gate: c16 PASS (kl_trim_mean 0.0560 vs vLLM 0.0653, top1_decisive 0.984
+vs 0.982, cont_decisive 0.913 vs 0.913, needle 1); c1 equal to the previous packet (kl_trim
+0.0503 vs 0.0471, top1_decisive 0.988 vs 0.986, cont_decisive 0.9565 both; the c1 cell has no
+same-concurrency vLLM peer).
+
+Production mix, `campaign.py report` (vLLM arm of the 2026-10-25 production pass), MATCHED +
+EQUIVALENT:
+
+| Metric | 1.8/s Baseline | 1.8/s Infervisor | 2.7/s Baseline | 2.7/s Infervisor |
+|---|---|---|---|---|
+| Total throughput | 42,238 tok/s | 41,912 tok/s (0.99x) | 55,471 tok/s * | 54,684 tok/s (0.99x) * |
+| TTFT P99 | 798.6 ms * | 963.7 ms (1.21x) * | 1,126.4 ms * | 2,271.7 ms (2.02x) * |
+| TPOT P99 | 55.97 ms | 67.81 ms (1.21x) | 136.75 ms * | 137.65 ms (1.01x) |
+| SLO met (supplementary) | 100.0% | 100.0% | 95.7% | 87.7% (was 54.3%) |
+
+Still a loss at both rates. Packlog at 2.7/s: mixed prefill + rider ticks are 60-67% of the wall,
+decode-only ticks 25-32%; prefill launches of 128-512 rows take 22-30 ms against a ~4 ms
+weight-read floor. Next: small-bucket prefill and rider cost; on the decode side the projections
+(B=1: 5.3 of 7.6 ms traced at ~60% of HBM bandwidth, GEMV depth 2 -> 4 -> 8 = 9.26 / 7.30 / 7.22
+ms) and hd256 attention at long context (B=32 8K 2.6 ms vs 1.6 floor).
+
+## 2026-10-27: packed prefill norm and rope routes
+
+Recipe plow_git 843300f8, packet a0464475f8ab (decode objects identical to 01c02ceb2e53), plowrt
+843300f86 (binary c6380a1e). Raw: `/opt/dlami/nvme/lava-tts/g12-decode` (`pf/pgate1.out`,
+`gates/pf2-c16{,b,c,d}`, `grid-pf2/report2`, `grid-pf3`).
+
+Attribution (nsys, previous packet): a fresh 128-row launch is 13.1 ms against a 3.9 ms weight
+floor = projections 7.3 (cuBLASLt FP8 ~13 us per call minimum, one heuristic candidate),
+interpreter norm/quant segments 3.0 (2 x 31 us x 48 layers, one CTA per SM), flash 1.05, quants
+0.54, HNR 0.85. A 6144-token cached prefix adds 6.4 ms (hd512 574 us and hd256 72 us per layer).
+2048 rows + 4K prefix = 76 ms: cuBLASLt 26.9, native GEMM 9.1, hd512 14.4, interpreter segments
+13.6, hd256 6.2, GLU quant 4.4. Riders spilling a launch into the next bucket (1024 + 29 in 1088,
+1152 + 29, 2048 + 29 in 2112) cost 4-16 ms over the same rows trimmed to fit.
+
+Change: the light NormResidual + RmsNorm pair carries the FP8 quant (`PLOW_QNORM_FUSE`), the
+packed-prefill FP8-KV segment object (built by the emit) carries the light rope route
+(`-DPLOW_NV_ROPE_PF=1` in `[emit.env]`), and the norm pair runs one block per row up to 1152 rows
+(object ABI 2, `PLOW_PF_NORM_ROW_BLOCKS`, default 0 = the previous rows / 8 grid). Objects: norm
+pair REG 112, rope REG 79, STACK 0; segment interpreter unchanged (REG 255, STACK 872).
+
+step_bench packed prefill, two ABAB passes, previous packet vs this one, % floor = max(weight
+read, FLOPs at 1979 TF) over measured, riders' top-1 vs a decode step of the same rows:
+
+| rows x prefix x riders | previous ms | new ms | change | % floor (prev / new) | rider top1 (prev / new) |
+|---|---|---|---|---|---|
+| 128 x 0 x 0 | 13.04 | 10.05 | -22.9% | 30 / 38 | |
+| 128 x 0 x 29 | 18.51 | 15.03 | -18.8% | 21 / 26 | 21/29 / 25/29 |
+| 128 x 4096 x 0 | 18.06 | 15.03 | -16.8% | 21 / 26 | |
+| 128 x 4096 x 29 | 23.38 | 19.86 | -15.1% | 16 / 19 | 21/29 / 25/29 |
+| 256 x 0 x 0 | 14.77 | 11.34 | -23.2% | 26 / 34 | |
+| 256 x 4096 x 18 | 26.69 | 23.11 | -13.4% | 14 / 17 | 13/18 / 15/18 |
+| 512 x 0 x 0 | 19.78 | 16.25 | -17.8% | 31 / 38 | |
+| 512 x 4096 x 29 | 39.34 | 35.38 | -10.1% | 18 / 20 | 21/29 / 25/29 |
+| 1024 x 4096 x 8 | 50.16 | 45.35 | -9.6% | 26 / 29 | 6/8 / 3/8 |
+| 1152 x 4096 x 0 | 52.06 | 46.71 | -10.3% | 29 / 32 | |
+| 2048 x 4096 x 0 | 76.02 | 68.91 | -9.3% | 35 / 38 | |
+| 2048 x 4096 x 29 | 85.91 | 78.60 | -8.5% | 31 / 34 | 20/29 / 26/29 |
+| 2112 x 4096 x 29 | 137.00 | 122.89 | -10.3% | 20 / 23 | 19/29 / 21/29 |
+| 4096 x 4096 x 29 | 165.98 | 154.68 | -6.8% | 33 / 35 | 19/29 / 21/29 |
+
+All 90 cells (rows 128..4096 incl. 1088/1152/2112 x prefix 0/4096 x riders 0/1/8/18/29) are
+6.8-23.2% faster. Rider-vs-step top-1 (random-token rows) improves at 18/29 riders (19-21 -> 21-26
+of 29) and declines at 8 (4-6 -> 1-3 of 8; max KL 0.06-0.22 -> 0.21-0.34); the FP32 gate below is
+the arbiter. Digests change (reduction
+order). Decode rungs unchanged (byte-identical decode objects).
+
+FP32-reference gate c16, four runs: PASS / PASS / PASS / FAIL by one case (cont_decisive 41, 43,
+41, 40 of 46; floor = vLLM 42/46 - 0.022 = 41/46). The one-case miss is accepted as run-to-run
+spread: kl_trim 0.045-0.048 (previous 0.056, vLLM
+0.065), kl_p99 1.79-2.01 (2.59, vLLM 3.19), top1_decisive 0.985-0.987 (0.984), needle 1.
+
+Production mix, `campaign.py report` (`grid-pf2/report2`, gate `pf2-c16b`), MATCHED + EQUIVALENT:
+
+| Metric | 1.8/s Baseline | 1.8/s Infervisor | 2.7/s Baseline | 2.7/s Infervisor |
+|---|---|---|---|---|
+| Total throughput | 42,238 tok/s | 41,978 tok/s (0.99x) | 55,471 tok/s * | 55,121 tok/s (0.99x) * |
+| TTFT P99 | 798.6 ms * | 992.2 ms (1.24x) * | 1,126.4 ms * | 1,410.0 ms (1.25x) * |
+| TPOT P99 | 55.97 ms | 55.31 ms (0.99x) * | 136.75 ms * | 111.53 ms (0.82x) |
+| SLO met (supplementary) | 100.0% | 100.0% | 95.7% | 97.2% (was 87.7%) |
+
+Goodput at 2.7/s 9.005 vs 8.902 req/s. TTFT P99 still 1.24-1.25x (spread 14-44% over two
+repeats). A ladder without the rider spill rungs (1088/1152/2112/4160/4224, riders always trimmed
+into the bucket) lost at 2.7/s: SLO met 97.1% / 89.7%, TTFT P99 1681 / 2615 ms per repeat.
+Next: the hd512 prefill attention under a cached prefix (KV split for small query counts), the
+FP8 projections (~13 us cuBLASLt minimum per call; algorithm search or q|k|v and gate|up
+concatenation).
+
+## 2026-10-27: native vs cuBLASLt route sweep (Gemma-4 12B FP8)
+
+Protocol: `step_bench` on one H100, decode 48 steps `--spread`, prefill `--packed-prefill --pf-reps 3`
+(best timed rep), two passes ABAB (passes agree within 1%), ms = mean of the passes. Current arm =
+the abi2 packet of the recipe at 21ab0d7d. Alternative = either the same packet with one runtime
+knob set, or a re-emit of the recipe with the emit knobs named in the table title changed (Qwen:
+the decode threshold moves together with `PLOW_QWEN_GDN_ISOLATE`, which plowrt requires; the FP8
+arms also need the devgen/policy commit 8b811e45, emitted with plowc built from it). Both arms of a
+table run on the same plowrt (named in the title where it is not bin34 6a4b75bc). % floor = floor /
+measured, floor = decode bytes (weights streamed once + KV rows) / 3.35 TB/s, prefill max(FLOP /
+peak, bytes / 3.35 TB/s) with peak 1979 TF/s FP8, 990 BF16; not reported for the MoE packets, whose
+routed expert bytes the model cannot bound. digest = TOK_STREAM fnv of the run (`equal` = both
+passes of both arms). `--same` slot agreement held on every arm (8/8 .. 64/64). Not measured: the
+4160/4224 rungs (they only occur with decode riders, which step_bench does not build) and, for the
+native prefill arms, the 1152 and 8192 rungs. Raw: /opt/dlami/nvme/lava-tts/route-sweep (A/, B/, C/,
+D/, logs/, gates/).
+
+Result: no change. cuBLASLt prefill projections beat the native FP8 GEMM at every measured rung
+(native +7..+31%); the fused qkv matmul on rung 128 and the compact terminal on cuBLASLt are equal
+or faster. Decode below rung 128 stays native per the 2026-10-26 measurement above (cuBLASLt from
+2 rows loses at B8/B16), not repeated here.
+
+
+**12B prefill projections: native FP8 GEMM instead of cuBLASLt (emit PLOW_EMIT_PREFILL_CUBLASLT=0)** (g12-base vs g12-pfnative)
+
+| phase | rows x ctx | g12-base ms | g12-pfnative ms | change | % floor (cur / alt) | digest |
+|---|---|---|---|---|---|---|
+| decode | B1 x 1024 | 8.57 | 8.57 | +0.1% | 46 / 46 | differs |
+| prefill | 1 x 128 | 13.90 | 18.21 | +31.0% | 28 / 21 | equal |
+| prefill | 1 x 256 | 15.40 | 20.23 | +31.3% | 25 / 19 | equal |
+| prefill | 1 x 512 | 20.36 | 25.73 | +26.4% | 30 / 24 | differs |
+| prefill | 1 x 1024 | 33.65 | 38.48 | +14.4% | 37 / 32 | equal |
+| prefill | 1 x 1088 | 46.02 | 52.28 | +13.6% | 28 / 25 | equal |
+| prefill | 1 x 2048 | 65.39 | 72.56 | +11.0% | 38 / 34 | equal |
+| prefill | 1 x 2112 | 74.49 | 80.21 | +7.7% | 34 / 32 | equal |
+| prefill | 1 x 4096 | 136.01 | 148.17 | +8.9% | 36 / 33 | equal |
+| prefill | 2 x 4096 | 267.09 | 286.70 | +7.3% | 37 / 34 | differs |
+
+**12B rung 128: PLOW_DECODE_LT_QKV=0** (g12-base vs g12-ltqkv0)
+
+| phase | rows x ctx | g12-base ms | g12-ltqkv0 ms | change | % floor (cur / alt) | digest |
+|---|---|---|---|---|---|---|
+| decode | B128 x 1024 | 27.03 | 26.97 | -0.2% | 39 / 39 | equal |
+| decode | B128 x 16000 | 91.51 | 91.45 | -0.1% | 14 / 14 | equal |
+
+**12B compact terminal off cuBLASLt: PLOW_TERMINAL_LT=0** (g12-base vs g12-termlt0)
+
+| phase | rows x ctx | g12-base ms | g12-termlt0 ms | change | % floor (cur / alt) | digest |
+|---|---|---|---|---|---|---|
+| prefill | 1 x 1024 | 33.69 | 34.03 | +1.0% | 37 / 36 | equal |
+| prefill | 1 x 4096 | 136.13 | 136.54 | +0.3% | 36 / 36 | equal |

@@ -12,9 +12,13 @@ use crate::exec::packet_runtime::{
 
 pub const PACKET: &str = "ref_encoder.pkt";
 const DRIVER: &str = "codec.encode.v1";
+/// Recent clips' codes, by exact PCM: a repeated reference skips the launch.
+const CACHE: usize = 16;
 
 pub struct RefEncoder {
     runtime: Mutex<Box<dyn PacketRuntime>>,
+    /// (pcm, codes), least recently used first.
+    cache: Mutex<Vec<(Vec<f32>, Vec<u32>)>>,
     /// (frames, program), ascending.
     capacities: Vec<(usize, usize)>,
     pcm: PacketTensor,
@@ -51,6 +55,7 @@ impl RefEncoder {
             frame_codes: param("codec.frame_codes")? as usize,
             capacities,
             runtime: Mutex::new(runtime),
+            cache: Mutex::new(Vec::new()),
         })
     }
 
@@ -63,6 +68,15 @@ impl RefEncoder {
 
     /// `[ceil(n / frame_samples)][frame_codes]` codes of `pcm` (mono, at `sample_rate`).
     pub fn encode(&self, pcm: &[f32]) -> Result<Vec<u32>, String> {
+        {
+            let mut cache = self.cache.lock();
+            if let Some(i) = cache.iter().position(|(clip, _)| clip.as_slice() == pcm) {
+                let hit = cache.remove(i);
+                let codes = hit.1.clone();
+                cache.push(hit);
+                return Ok(codes);
+            }
+        }
         let frames = pcm.len().div_ceil(self.frame_samples);
         let &(cap, program) = self
             .capacities
@@ -85,6 +99,12 @@ impl RefEncoder {
         rt.run(program).map_err(e)?;
         rt.read_tensor_at(self.codes, 0, bytemuck::cast_slice_mut(&mut codes))
             .map_err(e)?;
+        drop(rt);
+        let mut cache = self.cache.lock();
+        if cache.len() == CACHE {
+            cache.remove(0);
+        }
+        cache.push((pcm.to_vec(), codes.clone()));
         Ok(codes)
     }
 }

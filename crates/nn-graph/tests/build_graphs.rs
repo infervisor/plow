@@ -1626,3 +1626,239 @@ fn s3gen_encoder_estimator_and_vocoder_shapes() {
     let attention = g.count_ops(|op| matches!(op, nn_graph::Op::Attention { .. }));
     assert_eq!(attention, 10 + 14 * 4);
 }
+
+/// IlyasMoutawwakil/tiny-random-Muse-Spark-NVFP4 `text_config`, unquantized,
+/// with stub vision/audio towers.
+fn muse_spark_json(extra: &str) -> String {
+    format!(
+        r#"{{
+        "architectures": ["MuseSparkForConditionalGeneration"],
+        "model_type": "muse_spark",
+        "dtype": "bfloat16",
+        "vision_config": {{"hidden_size": 64}},
+        "audio_config": {{"hidden_size": 64}},
+        "text_config": {{
+            "model_type": "muse_spark_text",
+            "attention_bias": false,
+            "final_logit_softcapping": 20.0,
+            "head_dim": 32,
+            "hidden_act": "silu",
+            "hidden_size": 128,
+            "intermediate_size": 256,
+            "layer_rope_theta": [10000.0, 0],
+            "layer_types": ["sliding_attention", "full_attention"],
+            "mlp_layer_types": ["sparse", "dense"],
+            "moe_hidden_size": 128,
+            "moe_intermediate_size": 128,
+            "num_attention_heads": 4,
+            "num_experts_per_tok": 2,
+            "num_hidden_layers": 2,
+            "num_key_value_heads": 2,
+            "num_local_experts": 4,
+            "output_multiplier": 0.1767766952966369,
+            "post_norm_eps": 1e-08,
+            "qk_scale_factor": 5.4730064863875,
+            "residual_gate_temperature": 0.3,
+            "rms_norm_eps": 1e-05,
+            "rope_parameters": {{"rope_theta": 10000.0, "rope_type": "default"}},
+            "routed_scaling_factor": 1.0,
+            "sliding_window": 2048,
+            "tie_word_embeddings": false,
+            "vocab_size": 256
+        }}{extra}
+    }}"#
+    )
+}
+
+#[test]
+fn muse_spark_text_tower_ops_and_manifest() {
+    use nn_graph::{ActKind, MoeScoring, Op};
+    let g = build_from_config_json(&muse_spark_json("")).expect("build muse_spark");
+    assert_fully_inferred(&g);
+    assert_eq!(output_shape_str(&g), "[B, S, 256]");
+
+    let attn = |window: Option<u32>| {
+        g.count_ops(|o| matches!(o, Op::Attention { num_heads: 4, num_kv_heads: 2, head_dim: 32, sliding_window, .. } if *sliding_window == window))
+    };
+    assert_eq!((attn(Some(2048)), attn(None)), (1, 1));
+    // q and k of the sliding layer only; the full layer is NoPE.
+    assert_eq!(
+        g.count_ops(|o| matches!(
+            o,
+            Op::Rope {
+                dim: 32,
+                interleave: false,
+                ..
+            }
+        )),
+        2
+    );
+    assert_eq!(g.count_ops(|o| matches!(o, Op::ResidualGate { .. })), 4);
+    assert_eq!(
+        g.count_ops(|o| matches!(o, Op::RmsNormInputScaled { .. })),
+        2
+    );
+    assert_eq!(
+        g.count_ops(|o| matches!(o, Op::RmsNormZeroCentered { .. })),
+        5
+    );
+    // embed norm + per layer (q, k, o, post-attn).
+    assert_eq!(
+        g.count_ops(|o| matches!(o, Op::RmsNorm { .. })),
+        1 + 2 * 4 + 1
+    );
+    assert_eq!(
+        g.count_ops(|o| matches!(
+            o,
+            Op::MoeRouter {
+                num_experts: 4,
+                top_k: 2,
+                group: None,
+                scoring: MoeScoring::Sigmoid,
+                norm_topk: true,
+                correction_bias: true,
+                logit_scale,
+                ..
+            } if *logit_scale == 0.176_776_695_296_636_9_f64 as f32
+        )),
+        1
+    );
+    assert_eq!(
+        g.count_ops(|o| matches!(
+            o,
+            Op::MoeExperts {
+                intermediate_size: 128,
+                post_expert_norm: Some(eps),
+                ..
+            } if *eps == 1e-8
+        )),
+        1
+    );
+    assert_eq!(g.count_ops(|o| matches!(o, Op::Act(ActKind::Tanh))), 1);
+    assert_eq!(g.expert_bindings.len(), 1);
+    assert_eq!(g.expert_bindings[0].routed_experts.len(), 4);
+    assert!(g.expert_bindings[0].routed_experts[3].gate.scale.is_none());
+
+    let manifest = g.checkpoint_manifest();
+    let find = |name: &str| {
+        manifest
+            .iter()
+            .find(|w| w.name == name)
+            .unwrap_or_else(|| panic!("missing {name}"))
+    };
+    let shape = |name: &str| find(name).shape.unwrap().display_with(&g.syms);
+    let p = "model.language_model.layers";
+    assert_eq!(
+        shape(&format!("{p}.0.self_attn.gate_proj.weight")),
+        "[128, 128]"
+    );
+    assert_eq!(
+        shape(&format!("{p}.0.self_attn.k_proj.weight")),
+        "[64, 128]"
+    );
+    assert_eq!(
+        shape(&format!("{p}.0.mlp.experts.3.down_proj.weight")),
+        "[128, 128]"
+    );
+    assert_eq!(
+        shape(&format!("{p}.0.mlp.experts.post_expert_norm.weight")),
+        "[128]"
+    );
+    assert_eq!(
+        shape(&format!("{p}.0.post_attention_residual_gate.gate")),
+        "[128]"
+    );
+    assert_eq!(shape(&format!("{p}.1.mlp.up_proj.weight")), "[256, 128]");
+    assert_eq!(
+        find(&format!("{p}.0.mlp.gate.weight")).dtype,
+        nn_graph::DType::F32
+    );
+    assert_eq!(
+        find(&format!("{p}.0.mlp.gate.e_score_correction_bias")).dtype,
+        nn_graph::DType::F32
+    );
+    find("lm_head.weight");
+    find("model.language_model.norm.weight");
+    assert!(manifest
+        .iter()
+        .all(|w| w.name.starts_with("model.language_model.") || w.name == "lm_head.weight"));
+    // Per layer 3 norms + 2 gates + 5 attention linears; the MoE layer adds router
+    // weight/bias, pre/post proj, 2 norms and 12 experts; the dense layer adds 3.
+    assert_eq!(manifest.len(), 10 * 2 + (6 + 12) + 3 + 3);
+}
+
+#[test]
+fn muse_spark_is_text_only_and_says_so() {
+    let cfg = nn_graph::models::ModelConfig::from_json(&muse_spark_json("")).unwrap();
+    let nn_graph::models::ModelConfig::MuseSpark(cfg) = cfg else {
+        panic!("muse_spark must route to MuseSpark");
+    };
+    assert_eq!(cfg.omitted_towers, ["vision_config", "audio_config"]);
+    let g =
+        build_text_generation_from_config_json_at(&muse_spark_json(""), &ShapeBucket::default())
+            .expect("text-generation build");
+    assert_eq!(output_shape_str(&g), "[B, S, 256]");
+}
+
+#[test]
+fn muse_spark_rejects_missing_geometry_and_unmodeled_quant() {
+    let missing = muse_spark_json("").replace(r#""head_dim": 32,"#, "");
+    let err = build_from_config_json(&missing).expect_err("missing head_dim must not build");
+    assert!(err.to_string().contains("head_dim"), "{err}");
+
+    let nvfp4 = muse_spark_json(r#", "quantization_config": {"activation_format": "nvfp4"}"#);
+    let err = build_from_config_json(&nvfp4).expect_err("nvfp4 is not modeled");
+    assert!(err.to_string().contains("only AMD Quark MXFP4"), "{err}");
+
+    let theta = muse_spark_json("").replace("[10000.0, 0]", "[20000.0, 0]");
+    let err = build_from_config_json(&theta).expect_err("per-layer theta is not the reference");
+    assert!(err.to_string().contains("layer_rope_theta"), "{err}");
+}
+
+#[test]
+fn muse_spark_quark_mxfp4_experts_bind_scales() {
+    let p = "model.language_model.layers";
+    let mut exclude = vec![
+        "lm_head".to_string(),
+        format!("{p}.1.mlp.gate_proj"),
+        format!("{p}.1.mlp.up_proj"),
+        format!("{p}.1.mlp.down_proj"),
+    ];
+    for l in 0..2 {
+        for m in ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj"] {
+            exclude.push(format!("{p}.{l}.self_attn.{m}"));
+        }
+    }
+    for m in ["gate", "pre_expert_proj", "post_expert_proj"] {
+        exclude.push(format!("{p}.0.mlp.{m}"));
+    }
+    let quant = serde_json::json!({
+        "quant_method": "quark",
+        "global_quant_config": {"weight": {
+            "dtype": "fp4", "qscheme": "per_group", "group_size": 32, "scale_format": "e8m0"
+        }},
+        "exclude": exclude,
+        "layer_quant_config": {},
+        "layer_type_quant_config": {}
+    });
+    let json = muse_spark_json(&format!(r#", "quantization_config": {quant}"#));
+    let g = build_from_config_json(&json).expect("quark mxfp4 build");
+    let e = &g.expert_bindings[0].routed_experts[1].down;
+    assert_eq!(
+        e.scale.as_deref(),
+        Some("model.language_model.layers.0.mlp.experts.1.down_proj.weight_scale")
+    );
+    let w = g
+        .checkpoint_manifest()
+        .into_iter()
+        .find(|w| w.name == e.weight)
+        .unwrap();
+    assert_eq!(w.dtype, nn_graph::DType::F4);
+
+    let attn_quantized = json.replace(r#""model.language_model.layers.0.self_attn.q_proj","#, "");
+    let err = build_from_config_json(&attn_quantized).expect_err("MXFP4 attention is not modeled");
+    assert!(
+        err.to_string().contains("self_attn.q_proj is MXFP4"),
+        "{err}"
+    );
+}

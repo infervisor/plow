@@ -392,7 +392,7 @@ impl ToolStream {
         }
         self.ws.clear();
         let strict = spec.tool(&name).is_some_and(|t| t.strict);
-        let id = id.unwrap_or_else(|| spec.format.call_id());
+        let id = id.unwrap_or_else(|| super::call_id(spec.format));
         self.calls.push(Call {
             id,
             name,

@@ -1014,6 +1014,9 @@ pub(super) fn run(
         sections.push(modular::modular_pipeline_section(&manifest));
     }
     modular::update_section_with_lean(&mut sections, &lean);
+    if block.is_none() {
+        sections.push(crate::serve_section::section_for(dir));
+    }
     let bytes = if sections.is_empty() {
         m.to_blob()
     } else {

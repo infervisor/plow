@@ -44,12 +44,14 @@ impl ReasoningMode {
         if !serve.from_packet {
             return ReasoningMode::ThinkTag;
         }
-        match serve
-            .manifest
-            .chat
-            .as_ref()
-            .and_then(|c| c.reasoning.as_ref())
-        {
+        let chat = serve.manifest.chat.as_ref();
+        if serve.manifest.declares_response() {
+            // Version 2: the declaration is the whole answer (validated present with `chat`).
+            return chat
+                .and_then(|c| c.response.as_ref())
+                .map_or(ReasoningMode::None, |r| Self::declared(&r.reasoning));
+        }
+        match chat.and_then(|c| c.reasoning.as_ref()) {
             None => ReasoningMode::None,
             Some(t) if t.open == OPEN && t.close == CLOSE => ReasoningMode::ThinkTag,
             Some(t) if !t.open.is_empty() && !t.close.is_empty() => ReasoningMode::Tags {
@@ -57,6 +59,18 @@ impl ReasoningMode {
                 close: Box::leak(t.close.clone().into_boxed_str()),
             },
             Some(_) => ReasoningMode::None,
+        }
+    }
+
+    /// A version-2 packet's declaration (leaked once per loaded model).
+    pub fn declared(decl: &plow_asset::serve_manifest::ReasoningDecl) -> Self {
+        match decl.markers() {
+            None => ReasoningMode::None,
+            Some((open, close)) if (open, close) == (OPEN, CLOSE) => ReasoningMode::ThinkTag,
+            Some((open, close)) => ReasoningMode::Tags {
+                open: Box::leak(open.to_string().into_boxed_str()),
+                close: Box::leak(close.to_string().into_boxed_str()),
+            },
         }
     }
 
@@ -101,11 +115,12 @@ impl ReasoningMode {
         template: Option<(&'static str, &'static str)>,
     ) -> Self {
         let declared = serve.from_packet
-            && serve
-                .manifest
-                .chat
-                .as_ref()
-                .is_some_and(|c| c.reasoning.is_some());
+            && (serve.manifest.declares_response()
+                || serve
+                    .manifest
+                    .chat
+                    .as_ref()
+                    .is_some_and(|c| c.reasoning.is_some()));
         match template {
             // `<think>` stays the packet's call: its emit reads the tokenizer for it.
             Some((open, close)) if !declared && (open, close) != (OPEN, CLOSE) => {

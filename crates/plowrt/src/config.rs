@@ -621,24 +621,6 @@ pub struct RuntimeConfig {
     #[arg(long = "vmm-strict-publish", env = "PLOW_VMM_STRICT_PUBLISH", hide = true, default_value_t = true, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
     pub vmm_strict_publish: bool,
 
-    /// CUDA VMM prefix snapshots: copy the fp8 ring scales and full-layer scale prefixes as one
-    /// pitched copy per tensor (all KV heads) instead of one copy per head. Same bytes; a
-    /// Gemma-4 26B snapshot drops from ~10^3 copies to ~10^2.
-    #[arg(long = "vmm-snap-pitched", env = "PLOW_VMM_SNAP_PITCHED", hide = true, default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
-    pub vmm_snap_pitched: bool,
-
-    /// CUDA VMM prefix snapshots: keep up to N freed snapshot buffers for reuse instead of
-    /// `cuMemFree` (which synchronizes the device) and a fresh `cuMemAlloc` per publish
-    /// (~100 MiB each on Gemma-4 26B). 0 = off.
-    #[arg(
-        long = "vmm-snap-pool",
-        env = "PLOW_VMM_SNAP_POOL",
-        default_value_t = 0,
-        hide = true,
-        global = true
-    )]
-    pub vmm_snap_pool: u32,
-
     /// CUDA VMM prefix cache with live sliding rings: a finished request's ring units stay
     /// mapped in its slot (or as spares, trimmed to `PLOW_KV_POOL_MIB` once no slot is live)
     /// instead of `cuMemRelease`, so the next admission skips `cuMemCreate`/map (~6 ms per
@@ -902,16 +884,16 @@ pub struct RuntimeConfig {
     #[arg(long = "vmm-publish-shared", env = "PLOW_VMM_PUBLISH_SHARED", default_value_t = true, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
     pub vmm_publish_shared: bool,
 
-    /// CUDA VMM prefix cache: pinned host memory (MiB) that evicted boundary snapshots spill
-    /// to instead of being freed (the second level of the cache's LRU), restored over PCIe when
-    /// a prompt attaches to one. `0` (the default) keeps snapshots device-only.
+    /// Pinned host memory (MiB) for the prefix cache's host tier (the second level of its
+    /// LRU: evicted boundaries spill there and attach from there). Unset = sized by the
+    /// host-reserve rule (`MemAvailable` minus an eighth of RAM, at least 16 GiB); `0` = no
+    /// host tier.
     #[arg(
         long = "vmm-host-cache-mib",
         env = "PLOW_VMM_HOST_CACHE_MIB",
-        default_value_t = 0,
         global = true
     )]
-    pub vmm_host_cache_mib: u64,
+    pub vmm_host_cache_mib: Option<u64>,
 
     /// CUDA VMM prefix cache: seconds a request with
     /// `X-Session-Id` keeps its newest boundary protected from LRU after its last use; then the
@@ -1343,6 +1325,18 @@ pub struct CpuRuntimeConfig {
     )]
     pub spin_us: u32,
 
+    /// Combining-tree completion counters: a counter bumped by at least 2x this many static
+    /// executors gets one sub-counter per group of this many executors on the same node; the
+    /// group's last arrival adds the group's share to the real counter. 0 = off (every producer
+    /// slice bumps the shared counter directly, so up to n_cu atomics contend on one line).
+    #[arg(
+        long = "cpu-combine",
+        env = "PLOW_CPU_COMBINE",
+        default_value_t = 0,
+        global = true
+    )]
+    pub combine: u32,
+
     /// Largest prefill chunk (rows) one tick may run while other slots decode. 0 = whole prompt.
     /// Measured NEGATIVE at concurrency >= 4 (chunks prefill slower than whole prompts and the
     /// threads are throughput-bound, not stall-bound), so it stays off by default.
@@ -1698,6 +1692,28 @@ pub struct NvidiaRuntimeConfig {
     #[arg(long = "pf-trace-log", env = "PLOW_PF_TRACE_LOG", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
     pub pf_trace_log: bool,
 
+    /// Diagnostic: directory to write a slot's KV into after a prefix attach and at retire
+    /// (`GpuEngine::dump_slot_kv`). Unset = none.
+    #[arg(
+        long = "nv-dump-kv",
+        env = "PLOW_NV_DUMP_KV",
+        hide = true,
+        global = true
+    )]
+    pub nv_dump_kv: Option<std::path::PathBuf>,
+
+    /// Diagnostic, with `PLOW_NV_DUMP_KV`: `<prompt_len>:<pc>[,<pc>...]`. A packed prefill launch
+    /// carrying a request of that prompt length first runs the segment chain up to the segment
+    /// holding each prefill instruction `pc` and dumps that request's activation rows, then runs
+    /// the whole chain as usual (`GpuEngine::dump_prefill_acts`).
+    #[arg(
+        long = "nv-dump-act",
+        env = "PLOW_NV_DUMP_ACT",
+        hide = true,
+        global = true
+    )]
+    pub nv_dump_act: Option<String>,
+
     /// Diagnostic: name why a decode rung failed ladder normalization (widest-rung fallback).
     #[arg(long = "ladder-debug", env = "PLOW_LADDER_DEBUG", hide = true, default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
     pub ladder_debug: bool,
@@ -1738,6 +1754,17 @@ pub struct NvidiaRuntimeConfig {
         global = true
     )]
     pub lt_fp8_fast_accum_max_k: Option<u32>,
+
+    /// Prefill light NormResidual+RmsNorm launches of at most this many rows run one block per
+    /// row when the segment object supports it (`plow_norm_rms_pf` ABI 2); larger launches keep
+    /// one warp per row. 0 = always warp per row.
+    #[arg(
+        long = "pf-norm-row-blocks",
+        env = "PLOW_PF_NORM_ROW_BLOCKS",
+        default_value_t = 0,
+        global = true
+    )]
+    pub pf_norm_row_blocks: u32,
 
     /// `<cubin sha256>:<host library sha256>` of `cutlass_fp8_decode_sm90.cubin` and its Params
     /// marshaller `libplow_cutlass_fp8_decode_sm90.so` in `--pf-seg-dir`: routed FP8 W8A8 decode
@@ -3156,13 +3183,14 @@ impl RuntimeConfig {
         )
     }
 
-    pub(crate) fn vmm_host_cache_bytes(&self) -> u64 {
+    /// `None` = unset (the store sizes its host tier by the host-reserve rule); `Some(0)` = off.
+    pub(crate) fn vmm_host_cache_bytes(&self) -> Option<u64> {
         let mib = if Self::is_initialized() {
             self.vmm_host_cache_mib
         } else {
-            Self::env_parse("PLOW_VMM_HOST_CACHE_MIB").unwrap_or(self.vmm_host_cache_mib)
+            Self::env_parse("PLOW_VMM_HOST_CACHE_MIB").or(self.vmm_host_cache_mib)
         };
-        mib << 20
+        mib.map(|m| m << 20)
     }
 
     pub(crate) fn prefix_session_ttl(&self) -> std::time::Duration {

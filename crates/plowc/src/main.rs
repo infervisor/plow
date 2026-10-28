@@ -495,6 +495,59 @@ enum Cmd {
     ///
     /// A runtime knob (`rt.*`) emits once and compares the route of `--workload`.
     KnobScope(KnobScopeCli),
+
+    /// Weight-stationary pipeline stage plan for a CPU socket cluster: pack the decoder's BF16 weights into
+    /// stages of `--cores x --l2-weight-kib` (whole layers, several layers or row slices of one), with the
+    /// calibrated per-stage time. Writes the plan JSON and prints one line per stage.
+    ///
+    /// ```text
+    /// plowc --hf-dir <ckpt> stage-plan --cores 90 --batch 16 --ctx 16384 --out stage_plan.json
+    /// ```
+    StagePlan(StagePlanCli),
+}
+
+#[derive(Args, Debug)]
+struct StagePlanCli {
+    /// Worker cores per socket (the stage's row-partition width).
+    #[arg(long, default_value_t = 90)]
+    cores: u32,
+    /// L2 bytes per core for resident weights, in KiB; `auto` = the pseudo-lock driver's lockable L2.
+    #[arg(long, default_value = "auto")]
+    l2_weight_kib: String,
+    /// Sequences per decode step (GEMV batch rows).
+    #[arg(long, default_value_t = 1)]
+    batch: u32,
+    /// Context tokens per sequence (KV bytes per step).
+    #[arg(long, default_value_t = 2048)]
+    ctx: u64,
+    /// Smallest split piece, rows per core (AMX tile = 16).
+    #[arg(long, default_value_t = 16)]
+    min_rows_per_core: u64,
+    /// L2-resident GEMV rate per core, GB/s (P2: 60-70 at batch 1).
+    #[arg(long, default_value_t = 65.0)]
+    gemv_gbps: f64,
+    /// One all-core exchange (barrier + broadcast), us (P3: ~31 us per 8-exchange layer).
+    #[arg(long, default_value_t = 3.9)]
+    exchange_us: f64,
+    /// KV stream rate per socket, GB/s (P4: 500-626 from DRAM, ~680 from L3).
+    #[arg(long, default_value_t = 600.0)]
+    kv_gbps: f64,
+    /// Per-core all-gather rate for each batch row past the first, GB/s (P5: E2B L0 B 1 -> 16 adds ~11 us per row
+    /// for 37 KiB of activations per row).
+    #[arg(long, default_value_t = 3.4)]
+    act_gbps: f64,
+    /// Socket-to-socket activation hop, us (assumed; not measured on one socket).
+    #[arg(long, default_value_t = 5.0)]
+    hop_us: f64,
+    /// All-reduce of a hidden-size partial across a tensor-parallel group, us (assumed: two hops).
+    #[arg(long, default_value_t = 10.0)]
+    allreduce_us: f64,
+    /// Layers that do not fit one socket: `tp` = tensor-parallel socket group (MoE: head + expert groups), `pipe` =
+    /// FFN cut across consecutive stages.
+    #[arg(long, default_value = "tp")]
+    split: String,
+    #[arg(long, default_value = "stage_plan.json")]
+    out: PathBuf,
 }
 
 /// `plowc tune <action>`.
@@ -968,6 +1021,16 @@ fn main() -> ExitCode {
             }
             Err(e) => {
                 error!(error = %e, "knob-scope failed");
+                ExitCode::FAILURE
+            }
+        };
+    }
+
+    if let Some(Cmd::StagePlan(p)) = &cli.cmd {
+        return match run_stage_plan(p, &cli) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(e) => {
+                error!(error = %e, "stage-plan failed");
                 ExitCode::FAILURE
             }
         };
@@ -2990,6 +3053,68 @@ fn urldecode(s: &str) -> String {
 /// Sources, in priority order: `--hf-dir`, `--model` (HF hub), `--net`.
 /// In serve mode the page's model form hits `GET /graph?model=…&batch=…&seq=…`
 /// and the server rebuilds — any model, any B/S binding, without restarting.
+fn run_stage_plan(p: &StagePlanCli, cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
+    use plowc::stage_plan::{driver_l2_lock_bytes, gemma4_units, plan, Budget, Cost, Split};
+    let dir = cli.hf_dir.as_deref().ok_or("stage-plan needs --hf-dir")?;
+    let l2 = if p.l2_weight_kib == "auto" {
+        driver_l2_lock_bytes()
+            .ok_or("--l2-weight-kib auto: no /sys/class/misc/pseudo_lock/caps; pass KiB")?
+    } else {
+        p.l2_weight_kib.parse::<u64>()? << 10
+    };
+    let shapes = plowc::hf_config::safetensor_shapes(dir)?;
+    let config: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(dir.join("config.json"))?)?;
+    let units = gemma4_units(&shapes, &config)?;
+    let split = match p.split.as_str() {
+        "tp" => Split::Tp,
+        "pipe" => Split::Pipe,
+        x => return Err(format!("--split {x}: tp or pipe").into()),
+    };
+    let b = Budget {
+        cores: p.cores,
+        l2_weight_bytes_per_core: l2,
+        batch: p.batch,
+        ctx: p.ctx,
+        min_rows_per_core: p.min_rows_per_core,
+        split,
+    };
+    let c = Cost {
+        gemv_gbps_per_core: p.gemv_gbps,
+        exchange_us: p.exchange_us,
+        kv_gbps: p.kv_gbps,
+        act_gbps: p.act_gbps,
+        hop_us: p.hop_us,
+        allreduce_us: p.allreduce_us,
+    };
+    let (stages, summary) = plan(&units, &b, &c)?;
+    for s in &stages {
+        println!(
+            "stage {:3} x{:<3} {:7.1} MiB {:5.0} KiB/core fill {:.2} exch {:2} KV {:7.1} MiB  {:6.1} us (gemv {:5.1} sync {:5.1} attn {:6.1} act {:5.1} allreduce {:4.1})  {}",
+            s.index, s.sockets, s.bytes as f64 / 1048576.0, s.bytes_per_core as f64 / 1024.0, s.fill, s.exchanges,
+            s.kv_bytes_per_step as f64 / 1048576.0, s.pred.total_us, s.pred.gemv_us, s.pred.sync_us, s.pred.attn_us, s.pred.act_us,
+            s.pred.allreduce_us, s.label
+        );
+    }
+    println!(
+        "{} stages on {} sockets for {} layers ({:.2} layers/stage), bottleneck {:.1} us, token latency {:.0} us, {:.0} tok/s at {} sequences in flight",
+        summary.stages, summary.sockets, summary.layers, summary.layers_per_stage, summary.bottleneck_us, summary.token_latency_us,
+        summary.pipeline_tokens_per_s, summary.sequences_in_flight
+    );
+    let j = serde_json::json!({
+        "schema": "plow.stage_plan.v1",
+        "hf_dir": dir,
+        "budget": {"cores": p.cores, "l2_weight_bytes_per_core": l2, "batch": p.batch, "ctx": p.ctx, "min_rows_per_core": p.min_rows_per_core, "split": split},
+        "cost": c,
+        "units": units,
+        "stages": stages,
+        "summary": summary,
+    });
+    std::fs::write(&p.out, serde_json::to_string_pretty(&j)?)?;
+    info!(out = %p.out.display(), "stage plan written");
+    Ok(())
+}
+
 fn run_viz(v: &VizCli, cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
     let source = if let Some(ref dir) = cli.hf_dir {
         dir.to_string_lossy().into_owned()

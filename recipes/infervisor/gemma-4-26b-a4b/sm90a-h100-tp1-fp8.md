@@ -117,6 +117,7 @@ plowrt serve --model infervisor/gemma-4-26b-a4b:sm90a-h100-tp1-fp8 --port 8080
 nix develop --command env \
   PLOW_DECODE_MAX_RUNG=128 \
   PLOW_DECODE_PIPELINE=1 \
+  PLOW_KV_POOL_MIB=2048 \
   PLOW_LT_FP8_FAST_ACCUM_MAX_K=8192 \
   PLOW_LT_RUNG_ALGOS=true \
   PLOW_MULTISTEP=0 \
@@ -133,8 +134,6 @@ nix develop --command env \
   PLOW_VMM_LIVE_RINGS=1 \
   PLOW_VMM_PREFIX=1 \
   PLOW_VMM_RING_PARK=8 \
-  PLOW_VMM_SNAP_PITCHED=1 \
-  PLOW_VMM_SNAP_POOL=4 \
   PLOW_VMM_STRICT_PUBLISH=1 \
   ./target/release/plowrt serve --assets $ASSETS --port 8080
 ```

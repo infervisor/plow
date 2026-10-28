@@ -16,6 +16,7 @@ are the same steps by hand):
 | Chatterbox | `recipes/infervisor/chatterbox/sm90a-h100-tp1.toml` |
 | Chatterbox Multilingual V3 | `recipes/infervisor/chatterbox-mtl/sm90a-h100-tp1.toml` |
 | Fish S2 Pro (non-commercial weights) | `recipes/infervisor/fish-s2-pro/sm90a-h100-tp1.toml` |
+| Fish S2 Pro on L4, beside Qwen3-ASR | `recipes/infervisor/fish-s2-pro/sm89-l4-tp1.toml` |
 | Breeze TTS 2 (non-commercial weights) | `recipes/infervisor/breeze-tts-2/sm90a-h100-tp1.toml` |
 | Qwen3-ASR | `recipes/infervisor/qwen3-asr/sm90a-h100-tp1.toml` |
 
@@ -637,7 +638,7 @@ it in one order with one set of messages, then runs on the model's engine (`tts:
 | `seed` | same seed, text and settings at the same concurrency: same speech tokens (batched decode is not bitwise batch-invariant); whole and stream replies share those tokens, but the windowed stream codec differs from a whole decode (~2% rel-L2 on Veena); the stateful codecs (Fish S2, Breeze) match it to ~1e-5 rel-L2 (fp32 summation order, so not bitwise); SNAC codecs also draw their noise from the seed, so greedy (`temperature` 0) replies there share tokens but not PCM across seeds; unseeded requests sample anew |
 | `speed` | 1.0 only |
 | `top_k`, `repetition_penalty`, `cfg_weight`, `instructions`, `ref_audio` + `ref_text` | optional controls: taken where the card declares them (`defaults.top_k`, `defaults.repetition_penalty`, `defaults.cfg_weight`, `instructions`, `voice_cloning`), else 400 naming the field; a sampler with a bounded top-k (`limits.top_k_max`, Fish S2) takes `top_k` in 1..that bound and cannot turn it off |
-| `ref_audio` + `ref_text` | voice cloning (Breeze, Fish S2): base64 or `data:` URL audio (wav, mp3, flac, ogg) of at most 20.48 s (Breeze) / 23.78 s (Fish) and its exact transcript; the reference encoder (`ref_encoder.pkt`) runs once per request on the engine thread before the first prefill chunk, and every segment's prompt opens with the contract's clone layout: transcript, reference frames, then an end frame (Breeze) or the system turn's close (Fish). The Fish encoder is FP32 and matches the official server's codes exactly (9.3 s clip: 200/200 frames, 105 ms on H100); the request never takes a session (its frame rows are placeholders until encoded) |
+| `ref_audio` + `ref_text` | voice cloning (Breeze, Fish S2): base64 or `data:` URL audio (wav, mp3, flac, ogg) of at most 20.48 s (Breeze) / 23.78 s (Fish) and its exact transcript; the reference encoder (`ref_encoder.pkt`) runs once per request on the engine thread before the first prefill chunk (the codes of the 16 most recent clips are kept by exact PCM, so a repeated clip skips the launch), and every segment's prompt opens with the contract's clone layout: transcript, reference frames, then an end frame (Breeze) or the system turn's close (Fish). The Fish encoder is FP32 and matches the official server's codes exactly (9.3 s clip: 200/200 frames, 105 ms on H100); the request never takes a session (its frame rows are placeholders until encoded) |
 
 A schema error (unknown field, wrong type) is 400 `invalid_json`; every 429 carries `Retry-After`.
 A whole reply carries `x-plow-audio-seconds` and `x-plow-lm-ms`. `cfg_weight` is
@@ -729,6 +730,35 @@ saturated: persistent cooperative kernels take the whole device, so models alter
 solo-normalized shares sum to ~1.0 (`free`) and ~1.3 (`rr`). Use `rr` when co-serving speech.
 Tried and reverted (no gain): single-step ticks while a co-tenant waits, and holding the turn for
 a whole encoder/codec/vocoder sequence (worse: a 166 ms S3Gen render then blocks everyone).
+
+### L4: Qwen3-ASR + Silero VAD + Fish S2 Pro
+
+One `plowrt serve --assets <qwen3-asr> --assets <fish-s2-pro> --asr-vad-packet <vad.pkt>
+--co-sched rr` with `PLOW_VMM_LIVE=1` (the Fish L4 bundle's serve default; set it in the
+environment so the ASR bundle takes it too). Live KV commits a slot on admission (224 MiB ASR,
+288 MiB Fish at 2048 ctx) instead of `max_ctx` x slots at load: 20.2 of 22.5 GiB after load. The
+Fish codec arena is capped with `PLOW_EMIT_FISH_CODEC_MAX_ROWS=256` (7.5 -> 2.7 GiB). L4,
+2026-10-23, at 0ea345db:
+
+| | co-served | ASR alone |
+|---|---|---|
+| customer batch WER, README flags / prompt | 10.36% / 9.58% | 10.40% / 9.58% |
+| customer streaming WER, end of speech to final p50 / p95 | 12.98%, 128 / 344 ms | 13.01%, 125 / 340 ms |
+| Fish stream c1: TTFA, median RTF | 137 ms, 0.80 | |
+| Fish full c4: audio s/s | 2.07 | |
+| Fish CER (Whisper, n=44) | 0.000 | |
+
+Set `PLOW_PIN_RESIDENT=1` too: without it the manager evicts the idle model so the busy one's live
+KV can grow (Fish evicted under ASR load, then a 16 s reload on the next speech request); pinned,
+a stream that does not fit waits or gets 429. Mixed load (customer streaming ASR c2 + Fish stream
+c1 / full c4 / stream c4 bursts, 40 min): 0 evictions, 0 restarts, only the bursts' 429s; ASR WER
+unchanged (13.01% / 12.28%), ASR end of speech to final p95 2.2 s while TTS runs (p50 163 ms);
+Fish stream c1 RTF 1.5 while ASR runs (TTFA 140 ms).
+
+BF16 Fish decodes ~1 real-time stream on L4 (each frame reads the 8.5 GiB slow AR plus nine depth
+steps at 300 GB/s): real-time admission holds a second stream (`PLOW_TTS_ADMIT_WAIT_MS`, then
+429). Full requests batch. `PLOW_W8A16=1` emits on sm_89 (weights 8.5 -> 5.1 GiB) but its FP8
+decode faults there (the GemvFp8 arms are sm_120).
 
 ### Voice agent co-serve
 

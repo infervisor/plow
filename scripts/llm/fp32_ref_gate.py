@@ -13,8 +13,9 @@ set, and the candidate passes if it is within the peer's distance to FP32 plus a
                                                                    the other decoder layers from
                                                                    pinned host memory, e.g. 31B)
   capture   --url URL --ref ref.json --arm NAME --out cap.json     a served stack, teacher-forced
+            [--warm-turn]                                          (each case after its previous-turn prefix)
   score     --ref ref.json CAP...                                  metrics per capture
-  gate      --ref ref.json --cand CAP --peer CAP [thresholds]      verdict (exit 1 on fail)
+  gate      --ref ref.json --cand CAP... --peer CAP [thresholds]   verdict (exit 1 on fail); several CAPs pool
 
 Capture is teacher-forced on the FP32 continuation through the public completions API: each
 request is greedy with top-20 logprobs from prompt + reference[:k]; every position up to and
@@ -118,19 +119,24 @@ def scored_len(cont, eos):
 
 def score(ref, cap, tie_margin=DEFAULTS["tie_margin"], kl_trim_frac=DEFAULTS["kl_trim_frac"],
           kl_over_at=DEFAULTS["kl_over_at"], eos=None):
-    """Metrics of one capture against the FP32 reference, overall and per prompt kind.
+    """Metrics of one capture (or the pooled union of a list of captures of one arm) against the FP32
+    reference, overall and per prompt kind.
 
     The scored positions are the reference's teacher-forced positions through its first stop token
     (`eos`, else the reference's meta, else EOS), the same set for every arm; a position the capture
-    lacks counts as missing (and fails the gate), never as a smaller sample.
+    lacks counts as missing (and fails the gate), never as a smaller sample. A pooled list scores
+    every case once per capture, so its fractions move in finer steps than one capture's.
     """
-    if cap.get("ref_sha256") != ref["sha256"]:
-        raise ValueError(f"capture {cap.get('arm')} was taken against another reference")
+    caps = cap if isinstance(cap, list) else [cap]
+    if not caps:
+        raise ValueError("no capture to score")
+    for c in caps:
+        if c.get("ref_sha256") != ref["sha256"]:
+            raise ValueError(f"capture {c.get('arm')} was taken against another reference")
     eos = set(eos if eos is not None else ref.get("meta", {}).get("eos", EOS))
     groups = {}
     missing = 0
-    for case in ref["cases"]:
-        c = cap["cases"].get(case["id"])
+    for case, c in ((case, cp["cases"].get(case["id"])) for cp in caps for case in ref["cases"]):
         g = groups.setdefault(case["kind"], dict(kl=[], dec=0, dec_ok=0, cont=[], cont_dec=[], full=0, n=0, needle=[]))
         g["n"] += 1
         L = scored_len(case["cont"], eos)
@@ -853,6 +859,13 @@ def teacher_force(complete, prompt, cont):
     return free, text, pos, requests, empty
 
 
+def warm_prefix(ids, turn=105):
+    """The prompt up to its last turn start (a previous turn's history), else its first 7/8: sent
+    before a case under `--warm-turn`, so the case attaches from the prefix cache like a next turn."""
+    starts = [i for i, x in enumerate(ids) if x == turn and i > 1]
+    return ids[:starts[-1] if starts else max(1, len(ids) * 7 // 8)]
+
+
 def cmd_capture(a):
     ref = load_ref(a.ref)
     url = a.url.rstrip("/")
@@ -872,6 +885,8 @@ def cmd_capture(a):
     def one(case):
         t = time.time()
         try:
+            if a.warm_turn:
+                complete(warm_prefix(case["prompt_ids"]), 1)
             free, text, pos, n, empty = teacher_force(complete, case["prompt_ids"], case["cont"])
             row = dict(free=free, free_text=text, pos={str(k): v for k, v in pos.items()}, requests=n, empty_replies=empty)
         except Exception as e:  # noqa: BLE001 - a failed case is scored as missing, not a crash
@@ -920,6 +935,14 @@ def score_with(ref, cap, th):
     return score(ref, cap, th["tie_margin"], th["kl_trim_frac"], th["kl_over_at"], th.get("eos"))
 
 
+def gate_scores(ref, cands, peer, th):
+    """(candidate, peer) metrics for a gate on one or more pooled candidate captures. The single peer
+    capture is replicated to the candidate's capture count: the trimmed mean and the percentiles
+    depend on the sample size, so an unreplicated peer would fail an identical pooled distribution."""
+    cands = cands if isinstance(cands, list) else [cands]
+    return score_with(ref, cands, th), score_with(ref, [peer] * len(cands), th)
+
+
 def cmd_score(a):
     ref = load_ref(a.ref)
     th = dict(DEFAULTS, **thresholds(a))
@@ -933,11 +956,12 @@ def cmd_score(a):
 def cmd_gate(a):
     ref = load_ref(a.ref)
     th = dict(DEFAULTS, **thresholds(a))
-    cand, peer = (json.loads(Path(p).read_text()) for p in (a.cand, a.peer))
-    sc, sp = score_with(ref, cand, th), score_with(ref, peer, th)
+    cands = [json.loads(Path(p).read_text()) for p in a.cand]
+    cand, peer = cands[0], json.loads(Path(a.peer).read_text())
+    sc, sp = gate_scores(ref, cands, peer, th)
     why = verdict(sc, sp, th)
     rec = {"pass": not why, "why": why, "thresholds": th, "ref_sha256": ref["sha256"],
-           "candidate": dict(arm=cand["arm"], **sc), "peer": dict(arm=peer["arm"], **sp)}
+           "candidate": dict(arm=cand["arm"], captures=len(cands), **sc), "peer": dict(arm=peer["arm"], **sp)}
     if a.out:
         Path(a.out).write_text(json.dumps(rec, indent=1) + "\n")
     print(table({cand["arm"]: sc, peer["arm"]: sp}))
@@ -983,6 +1007,8 @@ def main():
     cp.add_argument("--arm", required=True)
     cp.add_argument("--concurrency", type=int, default=16)
     cp.add_argument("--out", required=True)
+    cp.add_argument("--warm-turn", action="store_true",
+                    help="first send each case's prompt up to its last turn start (multi-turn prefix-cache form)")
     cp.set_defaults(f=cmd_capture)
     sc = sp.add_parser("score")
     sc.add_argument("--ref", required=True)
@@ -993,7 +1019,7 @@ def main():
     sc.set_defaults(f=cmd_score)
     ga = sp.add_parser("gate")
     ga.add_argument("--ref", required=True)
-    ga.add_argument("--cand", required=True)
+    ga.add_argument("--cand", required=True, nargs="+", help="one capture, or several of one arm scored pooled")
     ga.add_argument("--peer", required=True)
     ga.add_argument("--out")
     for k in DEFAULTS:
