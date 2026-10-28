@@ -2777,6 +2777,8 @@ pub struct GpuEngine {
     disconnected: Vec<bool>,
     /// Serve-manifest KV geometry, kept only under `PLOW_NV_DUMP_KV` ([`Self::dump_slot_kv`]).
     dump_kv_geo: Option<plow_asset::serve_manifest::KvGeometry>,
+    /// The serve manifest's KV geometry ([`Self::kv_pages_init`]).
+    kv_geo: Option<plow_asset::serve_manifest::KvGeometry>,
     /// A launch's host window is open ([`Self::token_batch_step_window`]): snapshot restores skip
     /// their stream drain and their holds wait in `deferred_attach` for the step's own drain.
     window_open: bool,
@@ -7554,6 +7556,7 @@ impl GpuEngine {
                 .nv_dump_kv
                 .as_ref()
                 .and(serve.manifest.kv.clone()),
+            kv_geo: serve.manifest.kv.clone(),
             window_open: false,
             deferred_attach: Vec::new(),
             window_event: None,
@@ -8133,6 +8136,7 @@ impl GpuEngine {
             )));
         }
         self.reset_packed_admission(b);
+        self.state_drop(b);
         // A retirement deferred behind a step that then failed (queue cleared) must not fire
         // against the request seated here now.
         if let Some(p) = self.pipe.as_mut() {
@@ -8183,6 +8187,63 @@ impl GpuEngine {
             );
         }
         Ok(())
+    }
+
+    /// Bench-only (the paging gate, docs/arch/27 P0): fill the decode object's page tables
+    /// (`plow_kv_pages_init`, objects built with `PLOW_NV_KV_PAGED`) for every slot, `mode` 0 =
+    /// identity (the flat layout), 1 = reversed pages, 2 = slots interleaved. `Ok(false)` = the
+    /// object has no page tables.
+    pub fn kv_pages_init(&self, mode: u32) -> Result<bool> {
+        let Ok(f) = self.be.get_function(&self.module, "plow_kv_pages_init") else {
+            return Ok(false);
+        };
+        let geo = self
+            .kv_geo
+            .as_ref()
+            .ok_or_else(|| RuntimeError::Rejected("kv pages: no KV geometry".into()))?;
+        // Rows per slot of a layer's cache: its bytes over (slots x heads x row bytes).
+        let rows = |layer: u32, kvh: u32, hd: u32| -> Option<u32> {
+            let k = self.tensor_bytes(&format!("kv.{layer}.k"))?;
+            let elem = if self.handle_of(&format!("kv.{layer}.k_scale")).is_some() {
+                1
+            } else {
+                2
+            };
+            Some((k / (self.batch as u64 * u64::from(kvh) * u64::from(hd) * elem)) as u32)
+        };
+        for (which, layers, kvh, hd) in [
+            (0u32, &geo.full_layers, geo.kv_heads_full, geo.head_dim_full),
+            (
+                1u32,
+                &geo.slide_layers,
+                geo.kv_heads_slide,
+                geo.head_dim_slide,
+            ),
+        ] {
+            let Some(stride) = layers.first().and_then(|&l| rows(l, kvh, hd)) else {
+                continue;
+            };
+            let (mut which, mut n, mut pages, mut kvh, mut stride, mut mode) =
+                (which, self.batch as u32, stride / 32, kvh, stride, mode);
+            if u64::from(n) * u64::from(pages) > 1 << 17 {
+                return Err(RuntimeError::Rejected(format!(
+                    "kv pages: {n} slots x {pages} pages exceed the object's table"
+                )));
+            }
+            tracing::info!(which, n, pages, kvh, stride, mode, "kv pages: table filled");
+            let mut params = [
+                &mut which as *mut u32 as *mut std::ffi::c_void,
+                &mut n as *mut u32 as *mut std::ffi::c_void,
+                &mut pages as *mut u32 as *mut std::ffi::c_void,
+                &mut kvh as *mut u32 as *mut std::ffi::c_void,
+                &mut stride as *mut u32 as *mut std::ffi::c_void,
+                &mut mode as *mut u32 as *mut std::ffi::c_void,
+            ];
+            self.be
+                .launch_kernel(f, 256, 256, 0, &mut params, Some(&self.stream))?;
+        }
+        self.be.stream_synchronize(&self.stream)?;
+        Ok(true)
     }
 
     /// Bench-only: move slot `b` back to position `len` (at most its current one), keeping the
@@ -12920,7 +12981,11 @@ impl GpuEngine {
                 "GDN prefill state operand is not a declared recurrent buffer of the library's slot stride".into(),
             ));
         }
-        let state = &self.devp[t[6] as usize];
+        let state_index = t[6] as usize;
+        if qwen_pack.is_empty() {
+            self.state_materialize(b, Some(state_index))?;
+        }
+        let state = &self.devp[state_index];
         if qwen_pack.is_empty() {
             let native = self
                 .qwen_prefill
@@ -12959,6 +13024,9 @@ impl GpuEngine {
             0
         };
         if ride > 0 {
+            for &(slot, _) in &qwen_pack[..ride] {
+                self.state_materialize(slot, Some(state_index))?;
+            }
             self.packed_gdn_ride(t, ride_ops.expect("checked"), state, &qwen_pack[..ride])?;
             if synchronize {
                 self.be.stream_synchronize(&self.stream).map_err(|e| {
@@ -12981,7 +13049,27 @@ impl GpuEngine {
                 "packed Qwen prefill exceeds the GDN state scratch".into(),
             ));
         }
-        self.packed_state_copy(init, state, scan, ride, true)?;
+        // An attached request whose state stayed in its block reads it from there (the attach
+        // copied none of it into the slot).
+        let sources: smallvec::SmallVec<[Option<u64>; 16]> = scan
+            .iter()
+            .map(|&(slot, _)| self.state_source(slot, state_index))
+            .collect();
+        if sources.iter().any(Option::is_some) {
+            let srcs: smallvec::SmallVec<[u64; 16]> = scan
+                .iter()
+                .zip(&sources)
+                .map(|(&(slot, _), src)| src.unwrap_or(state.base + slot as u64 * STRIDE))
+                .collect();
+            self.state_init_gather(&srcs)?;
+            for (&(slot, _), src) in scan.iter().zip(&sources) {
+                if src.is_some() {
+                    self.state_consumed(slot, state_index);
+                }
+            }
+        } else {
+            self.packed_state_copy(init, state, scan, ride, true)?;
+        }
         if synchronize {
             self.be.stream_synchronize(&self.stream).map_err(|e| {
                 tracing::warn!(error = %e, "packed GDN gather failed");
