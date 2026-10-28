@@ -302,7 +302,9 @@ serves with a file the build did not produce (`codec.pkt` for a `[checkpoint]
 codec`, `cublaslt_algos.jsonl` for `PLOW_LT_RUNG_ALGOS`).
 
 **Signing.** `plowrt keygen --name <key-name> --out <file>` makes an ed25519
-key; its public half is printed as `<key-name>:<base64>`. `push --key-file`
+key; its public half is printed as `<key-name>:<base64>`. The public registry
+at `pdist.infervisor.ai` is signed with
+`infervisor-2026:ESz+iXQToovy4GhRUgTHoUKUwMumUA/ls/4tAaEjL3M=`. `push --key-file`
 (or `PLOW_SIGNING_KEY`) writes the signature under `sigs/<sha256 of the
 index>.sig`, before the index itself: a reader fetches the signature of
 exactly the bytes it read, so no reader sees an index without its signature
