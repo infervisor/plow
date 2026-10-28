@@ -5297,11 +5297,18 @@ pub(crate) fn host_mem_available() -> Option<(u64, u64)> {
 
 /// Host RAM the pinned tier leaves to the rest of the machine: an eighth of it, at least
 /// 16 GiB (pinned pages cannot be reclaimed; a co-tenant build must not OOM-kill the server).
-/// `host_tier_auto` is the tier the rule allows now: `MemAvailable` minus that reserve.
+/// `host_tier_auto` returns `(default tier capacity, host reserve)`; see [`host_tier_default`].
 pub(crate) fn host_tier_auto() -> Option<(u64, u64)> {
     let (avail, total) = host_mem_available()?;
-    let reserve = host_reserve(total);
-    Some((avail.saturating_sub(reserve), reserve))
+    Some((host_tier_default(avail, total), host_reserve(total)))
+}
+
+/// The unconfigured tier: `MemAvailable` less the reserve, and at most a quarter of the host.
+/// The tier never gives pages back, so filling the host to the reserve left a co-tenant
+/// compile (22-38 GB per process) nothing and the OOM killer took the server; the 12B prefix
+/// hit rate moved at most 0.2 pt between 64 GiB and 205 GiB on a 248 GiB host.
+pub(crate) fn host_tier_default(avail: u64, total: u64) -> u64 {
+    avail.saturating_sub(host_reserve(total)).min(total / 4)
 }
 
 pub(crate) fn host_reserve(total: u64) -> u64 {
@@ -6657,6 +6664,19 @@ pub fn hash_blocks(prompt: &[u32], block_rows: u32) -> Vec<BlockHash> {
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicI64, AtomicU64};
+
+    #[test]
+    fn host_tier_default_respects_cap_and_reserve() {
+        const GIB: u64 = 1 << 30;
+        // 248 GiB host, idle: a quarter, not everything above the 31 GiB reserve.
+        assert_eq!(host_tier_default(240 * GIB, 248 * GIB), 62 * GIB);
+        // Busy host: the reserve still binds below the quarter.
+        assert_eq!(host_tier_default(60 * GIB, 248 * GIB), 29 * GIB);
+        // Small host: the 16 GiB reserve floor.
+        assert_eq!(host_tier_default(30 * GIB, 32 * GIB), 8 * GIB);
+        assert_eq!(host_tier_default(20 * GIB, 32 * GIB), 4 * GIB);
+        assert_eq!(host_tier_default(10 * GIB, 32 * GIB), 0);
+    }
 
     fn live_blob() -> crate::asset::devblob::DevBlob {
         use crate::asset::devblob::{DevBlob, DevProg, DevTensor};
