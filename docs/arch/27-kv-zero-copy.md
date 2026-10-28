@@ -411,6 +411,40 @@ names:
 * Object capability symbol `plow_kv_paged_abi = 1`; a packet or object without it serves through
   the flat layout and the block store's copies, unchanged.
 
+### 6.5 P0 result (2026-10-28): paging gate FAILS, track 2 stops
+
+Measured on the 12B FP8 packet (`interp_sm90a_fp8kv` with its recipe flags, RG8/RG8S hd256
+sliding and TC16 hd512 decode bodies), H100, `step_bench` 64 steps after 8 warm-up, ABAB rounds.
+Arms are the same object built three ways: `flat`; `pg32` (`PLOW_NV_KV_PAGED=32`: row =
+`table[slot][r/32] + r%32`, head-major inside the page, page id loaded per row from an L1-resident
+module table); `pg32r` (`PLOW_NV_KV_PAGED_REG=1`: the item's page ids, up to 64, loaded with the
+query into registers and broadcast by warp shuffle). With an identity table both paged arms give
+token-stream digests identical to `flat` at every rung and round (an address-only change). Shuffled tables
+(`step_bench --kv-pages 1|2`) were not measured: the identity table already fails the gate.
+
+| rung | flat ms/step | pg32 | pg32r |
+|---|---|---|---|
+| B1 × 8K | 7.341 (spread 0.08 %) | 7.485 (+1.97 %) | 7.516 (+2.39 %) |
+| B8 × 1K | 7.931 | 8.184 (+3.19 %) | 8.225 (+3.71 %) |
+| B32 × 8K | 12.865 | 13.266 (+3.12 %) | — |
+| B32 × 1K | 11.769 | 12.114 (+2.93 %) | — |
+
+B1, B8: three ABAB rounds; B32: two. Round-to-round spread ≤ 0.35 % in every arm (flat ≤ 0.1 %), an
+order of magnitude below the deltas. B1 × 16K did not run (prompt + steps exceed the compiled
+16,384 context); it was not needed for the verdict.
+
+Resources (`ptxas`): the persistent interpreter stays at 255 registers with no local memory
+(spills 0), stack 240 → 256 bytes, shared 40,592 bytes unchanged; the standalone rider bodies move
+148 → 158 / 142 registers (`rider_flash512`, pg32 / pg32r), 104 → 106 / 128 (`rider_flash256`),
+103 → 104 / 128 (`light_fp8_flash256`).
+
+Both first rungs exceed the kill threshold (≈ 0.2 %) by 10–18×, and loading page ids up front
+is slower than the per-row lookup, so the cost is not the table load latency but the extra
+address arithmetic and register pressure in the 255-register persistent body. Per the §6.3 rule
+the writers, prefill stager and BF16 variants were not built: track 2 (P2/P3) stops, and the
+flat pipeline (F1) is the KV design. Re-opening it needs a decode body with register headroom
+(a non-persistent attention kernel), not a different page size.
+
 ## 7. Validation
 
 0. **F1.** Kernels untouched: `step_bench` digests identical to the base packet; replay
