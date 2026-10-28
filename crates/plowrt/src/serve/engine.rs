@@ -1857,7 +1857,7 @@ mod amd_serve {
                 "AMD prefix cache selection"
             );
             let token_batch_tp = match &ranks {
-                Ranks::Tp(g) if crate::config::RuntimeConfig::get().token_batch && has_prefill => {
+                Ranks::Tp(g) if has_prefill => {
                     let bodies = g.token_batch_bodies();
                     let any_body = g.rank(0).has_token_batch_bodies();
                     let band = bodies.first().map(|b| b.2);

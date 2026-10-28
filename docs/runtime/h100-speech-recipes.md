@@ -81,7 +81,7 @@ deadline`; `scripts/voice/call_sim.py` + `slo_table.py` report per-call SLOs.
 To serve **50 concurrent calls** on a single NVIDIA H100 80GB SXM5 co-serving
 `Qwen3-ASR (1.7B)` + `Gemma-4-26B-A4B-it FP8` + `Chatterbox-MTL (T3 + S3Gen v3)`:
 
-1. **Continuous Cross-Model Batching**: `PLOW_TOKEN_BATCH=1` unifies execution batches across models.
+1. **Continuous Cross-Model Batching**: the unified token batch (always on) unifies execution batches across models.
 2. **Vocoder Stream Batch Capping**: `PLOW_TTS_TURN_BATCH=16` caps vocoder launches to 16 parallel streams, bounding render hold time to $\le 440\text{ ms}$ and eliminating tail latency spikes on LLM TTFT and ASR final.
 3. **Speculative Decoding**: `PLOW_SPEC=1` with Gemma-4 assistant MTP drafter (`k_max=7`, `rows=16`) reduces LLM decode turns by ~40%.
 4. **Deadline Co-Scheduling**: `--co-sched deadline` schedules `Urgency::Final` turns with immediate priority over background batches.

@@ -824,8 +824,8 @@ segments and packed BF16-KV GEMM segments without W8A8. This removes the
 `perf-data` readiness report, which is kept out of source control. Rebuild with
 `PLOW_EXTRA_DEFINES="-DPLOW_NV_SEG_OCC1=0"` to restore that cap. This build
 default does not by itself enable packed serving; the CUDA unified token-batch
-executor is selected at runtime by `PLOW_TOKEN_BATCH` (default on) when the
-packet carries packed-prefill metadata.
+executor is always selected at runtime when the packet carries packed-prefill
+metadata.
 
 | flag | default | effect |
 |---|---|---|
@@ -1068,7 +1068,7 @@ per-request cap after 2 s with no request waiting and KV under 75% (`plowrt_pref
 Expert overrides (hidden from `--help`, documented in the table below): `PLOW_MULTISTEP`,
 `PLOW_PF_INTERLEAVE`, `PLOW_PF_CHUNK`, `PLOW_PF_DEFER_DECODE`, `PLOW_DECODE_MAX_RUNG`,
 `PLOW_DECODE_MIN_RUNG`, `PLOW_CO_SCHED`, `PLOW_CFG_DEVICE`, `PLOW_TTS_TURN_BATCH`,
-`PLOW_ASR_PARTIAL_DUTY`. Diagnostic rollbacks of capabilities: `PLOW_TOKEN_BATCH`,
+`PLOW_ASR_PARTIAL_DUTY`. Diagnostic rollbacks of capabilities:
 `PLOW_DECODE_PIPELINE`, `PLOW_PF_SHARED_TAIL`, `PLOW_PF_SEGMENT_GATES`, `PLOW_RAGGED_CHUNK`,
 `PLOW_AMD_RAGGED_SEAMS`, `PLOW_PACKED_PREFILL_ROUTE`.
 
@@ -1086,6 +1086,7 @@ Removed (a set value is ignored with a startup warning; recipes and scripts may 
 | `PLOW_PF_COVER`, `PLOW_PF_CHUNK_COST` | the cost-aware DP cover at 512 rows per launch |
 | `PLOW_RIDE_FIXED`, `PLOW_PF_NO_CHUNK`, `PLOW_PF_NO_INTERLEAVE`, `PLOW_PF_SPAN_POLICY` | `sched::ride`, chunked and interleaved prefill, greedy spans |
 | `PLOW_PIPE_PREFILL`, `PLOW_CFG_MULTISTEP`, `PLOW_TOKEN_BATCH_SOLO`, `PLOW_CO_SCHED_QUANTUM` | removed with their code paths (never faster; the first faulted) |
+| `PLOW_TOKEN_BATCH`, `--token-batch` | removed: the unified token batch is always selected wherever the backend, model and object support it (`--fusion` takes precedence); `=0` was not a working configuration under the always-on prefix cache |
 | `PLOW_PREFIX_POLICY`, `PLOW_PREFIX_CACHE_OUTPUT`, `PLOW_PREFIX_RETIRE_ATTACHED` | the boundary tree, always on for CUDA (`docs/runtime/prefix-cache.md`); the previous binary is the rollback |
 
 | var | default | effect |
@@ -1120,7 +1121,6 @@ Removed (a set value is ignored with a startup warning; recipes and scripts may 
 | `PLOW_AMD_PREFIX_FINE_ROWS=N` | unset | Share AMD prefix content below the 2 MiB VMM block floor in N-row chunks instead of leaving it a private copy. N must divide every cache group's block size. **CUDA** VMM prefix cache: the step of the intermediate checkpoints a publish records below the boundary; unset publishes one at every whole-block boundary (2048 rows at hd512 BF16 — a block-aligned boundary has no tail, so any prompt sharing those blocks attaches to it). Each checkpoint is a sliding-window snapshot (window x `snap_row_bytes`, 320 MiB on Gemma-4-12B), so a finer step multiplies that. |
 | `PLOW_VMM_KV=0/1` | on | **AMD** — VMM-backed KV on ROCr (`hsa_amd_vmem_*`): reserve VA for `max_ctx`, map physical at each sequence's frontier; warns and falls back to the flat carve if the platform can't support it. Reached only when the shared-prefix pool is absent (`vmm_bringup` runs iff `shared_prefix.is_none()`), so with the prefix cache on — the default — this changes nothing; it makes the fallback path grow with context the same way. `=0` is the rollback. |
 | `PLOW_PREFIX_CACHE=0/1` | on | Prefix reuse on compatible AMD and NVIDIA assets: the VMM prefix pool on Hopper, slot-local prompt snapshots on AMD (single-GPU and TP). `0` disables both. Default-on since 3ca64e93; the isolated A/B against `0` on H100 and MI300X is still owed. |
-| `PLOW_TOKEN_BATCH=0/1` | on | **Diagnostic rollback.** The unified token-batch executor (decode and prefill rows in one packed launch) is selected wherever the backend, model and object support it; unsupported configurations use ordinary execution and `--fusion` takes precedence. `=0` is the rollback. |
 | `PLOW_TB_SPLIT_ATTN=0/1` | on | **CUDA sm_90a** token batch: decode rows riding a packed prefill launch attend through split-KV flash decode (`plow_<arch>_rider_*` in the decode object) instead of as one-row requests of the prefill FlashAttention (`docs/arch/17-unified-token-batch.md`). Arms only with a decode object that carries the rider kernels. `=0` is the rollback. |
 | `PLOW_GEN_DECODE_STEP=N` / `--gen-decode-step` | 4 | **CUDA sm_90a** decode rungs from N rows run each declared FlashDecode + FlashMerge pair as one launch of the packet's generated flash-decode object (`gen_sm90a_attn_dec_*.cubin`, `PLOW_EMIT_GEN_KERNELS` at emit); narrower rungs keep the interpreter pair. Qwen3.8-27B H100: the object wins from four rows (B4/8 × 4K 26.9/28.2 → 26.5/27.4 ms, B32 −4.5 ms), at one or two rows the interpreter is as fast. `=0` never routes. |
 | `PLOW_QWEN_LIGHT_OCC=N` / `--qwen-light-occ` | 4 | **CUDA sm_90a** the Qwen3.5 chain's pointwise prefill segments (norms, conv, gates, GLU) of a packed chunk run as light launches of the decode object's `plow_<arch>_light_pf` entry at N blocks per SM instead of interpreter windows (light table 11.6 → 9.9 ms per 1024-row chunk on build77). `=0` keeps the interpreter windows. |

@@ -56,8 +56,7 @@ pub(super) struct CudaTokenBatch {
 
 impl CudaTokenBatch {
     pub(super) fn load(e: &GpuEngine) -> Option<Self> {
-        (RuntimeConfig::get().token_batch
-            && !RuntimeConfig::get().fusion
+        (!RuntimeConfig::get().fusion
             && e.be.compute_capability() == (9, 0)
             && e.packed_prefill.is_some()
             && e.has_packed_terminal()

@@ -189,7 +189,6 @@ PLOW_PF_INTERLEAVE = "2048"
 PLOW_VMM_LIVE_RINGS = "0"
 PLOW_MULTISTEP = "0"
 PLOW_DECODE_MAX_RUNG = "128"
-PLOW_TOKEN_BATCH = "1"
 PLOW_PF_NORM_ROW_BLOCKS = "1152"
 # Host KV tier cap (2026-10-28, plowrt c0d9e0d5 + packet a0464475f8ab, 2.7/s production replay,
 # 2 reps). Unset, the tier pinned 205 GiB of a 248 GiB host and froze at the 31 GB reserve; a

@@ -146,7 +146,6 @@ PLOW_PF_INTERLEAVE = "0"
 PLOW_VMM_LIVE_RINGS = "0"           # 1 costs 12-50% single-turn tok/s at 15K c32 with BF16 KV
 PLOW_MULTISTEP = "0"
 PLOW_DECODE_MAX_RUNG = "64"
-PLOW_TOKEN_BATCH = "1"
 # Prefill FP8 Lt GEMMs with K <= 8192 (all but down) use fast accumulation: step_bench 1x4096
 # 118.5 -> 109.4 ms, 1x15000 538 -> 492; served 4K c32 out tok/s +4.2% (2026-10-05).
 PLOW_LT_FP8_FAST_ACCUM_MAX_K = "8192"

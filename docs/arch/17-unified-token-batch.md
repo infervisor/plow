@@ -11,9 +11,8 @@ now code and tests. Where the two disagree, the disagreement is called out here.
 
 ## Contents
 
-Runtime selection defaults on (`PLOW_TOKEN_BATCH`, `RuntimeConfig::token_batch`, default
-**true**). `--token-batch=false` or `PLOW_TOKEN_BATCH=0` disables it; explicit `--fusion` takes
-precedence. There are **two** executors, with two different gates:
+Runtime selection is always on wherever the backend, model and object support it; explicit
+`--fusion` takes precedence. There are **two** executors, with two different gates:
 
 * **AMD (gfx942 dense GQA)** — a dense program with direct BF16 KV, matching object markers,
   multiple slots, and an attention epilogue compatible with the packet: fused output for
@@ -1390,9 +1389,9 @@ attend through the split-KV rider kernels instead of one-row prefill-attention r
 | ASR (`in.encoder_overlay`), codec-LM TTS with a position base (`in.pos_base`), CFG pairs, depth stages, hd128 attention (Veena, Orpheus) | no: packed prefill, then a separate decode step | yes | no | the batch embeds decode rows through the prefill program (no overlay / position base), partner rows have no slot entry, depth stages sample in serial prefill's tail, and hd128 has no rider kernel (one-row requests measured 27.1 vs 33.8 audio s/s) |
 | CPU (Xeon) | yes, through the AMD/CPU arm: batch-invariant packed buckets | yes | n/a | a pack needs two prefill members (AMD measurement); one prompt plus decode rows runs as two steps — unmeasured on Xeon |
 
-`PLOW_TOKEN_BATCH=0` is not a working configuration with the prefix cache on (always on): packed
-prefill is then disabled, FP8-KV packets refuse to load ("FP8-KV segmented prefill requires a
-compiled packed request contract"), and BF16 packets prefill one request per launch.
+There is no runtime switch to turn the token batch off: without it, packed prefill is disabled
+under the always-on prefix cache, FP8-KV packets refuse to load ("FP8-KV segmented prefill
+requires a compiled packed request contract"), and BF16 packets prefill one request per launch.
 
 ## 2. Findings
 
@@ -1469,5 +1468,5 @@ binary matches the base binary's (no errors besides one over-context request, no
 * E4B's tail launches give up split riders; a rider site before the tail boundary would keep
   them.
 * CPU: one prompt plus decode rows never packs (the two-member policy was measured on AMD).
-* `PLOW_TOKEN_BATCH` only selects a degraded or failing configuration under the always-on
-  prefix cache.
+* `PLOW_TOKEN_BATCH` only selected a degraded or failing configuration under the always-on
+  prefix cache; it is removed.
