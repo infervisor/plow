@@ -579,6 +579,21 @@
           isGpuHost = system == "x86_64-linux";
         in
         {
+          # Hosted CI needs the pinned host tools, not the multi-GB GPU SDKs.
+          ci = pkgs.mkShell {
+            name = "plow-ci";
+            packages = [
+              pkgs.cargo
+              pkgs.rustc
+              pkgs.rustfmt
+              pkgs.cmake
+              pkgs.python3
+              pkgs.bash
+              pkgs.git
+              pkgs.actionlint
+            ];
+          };
+
           default = pkgs.mkShell {
             name = "plow-dev";
             packages = [
