@@ -869,6 +869,32 @@ enum Cmd {
         dry_run: bool,
     },
 
+    /// Publish released `plowrt` binaries (`nix build .#plowrt-release`
+    /// outputs) into a registry: `v1/runtime/<version>/<triple>/`, the
+    /// runtime index, the `latest` pointer, and optionally `install.sh`.
+    ///
+    /// Each `--release` directory holds the tarball, its `.sha256` and
+    /// `release.json`; all must name one version. A version already
+    /// published with other bytes is refused, never rewritten.
+    #[cfg(feature = "dist")]
+    PushRuntime {
+        /// A release output directory; repeatable, one per platform triple.
+        #[arg(long = "release", required = true)]
+        releases: Vec<PathBuf>,
+        /// `r2://[<account-id>/]<bucket>`, `s3://<bucket>` or `file:///dir`.
+        #[arg(long, default_value = "r2://")]
+        to: String,
+        /// Record the release without moving `latest` to it.
+        #[arg(long, default_value_t = false)]
+        keep_latest: bool,
+        /// Publish this file as `install.sh` at the registry root.
+        #[arg(long)]
+        install_script: Option<PathBuf>,
+        /// Report what would be written, and write nothing.
+        #[arg(long, default_value_t = false)]
+        dry_run: bool,
+    },
+
     /// Generate the ed25519 key `push` signs model indexes with. Prints the
     /// public half, which clients put in `PLOW_TRUSTED_KEYS`.
     #[cfg(feature = "dist")]
@@ -1450,6 +1476,22 @@ async fn async_main(
                 },
             )
         })()),
+        #[cfg(feature = "dist")]
+        Cmd::PushRuntime {
+            releases,
+            to,
+            keep_latest,
+            install_script,
+            dry_run,
+        } => dist_cmd::report(dist_cmd::cmd_push_runtime(
+            &releases,
+            &to,
+            &plowrt::dist::runtime::Options {
+                keep_latest,
+                install_script,
+                dry_run,
+            },
+        )),
         #[cfg(feature = "dist")]
         Cmd::Keygen { name, out } => dist_cmd::report(dist_cmd::cmd_keygen(&name, &out)),
         #[cfg(feature = "hsa")]

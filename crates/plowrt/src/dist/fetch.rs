@@ -352,8 +352,8 @@ mod tests {
     #[test]
     fn a_bare_host_becomes_https() {
         assert_eq!(
-            transport("dist.infervisor.ai").unwrap().describe(),
-            "https://dist.infervisor.ai"
+            transport("pdist.infervisor.ai").unwrap().describe(),
+            "https://pdist.infervisor.ai"
         );
         assert_eq!(
             transport("https://mirror.internal").unwrap().describe(),
@@ -366,7 +366,7 @@ mod tests {
     fn without_the_dist_feature_a_network_registry_names_the_build() {
         // Matched rather than `unwrap_err`, which would need `Debug` on
         // `Box<dyn Fetch>` — a bound the trait has no reason to carry.
-        let err = match transport("dist.infervisor.ai") {
+        let err = match transport("pdist.infervisor.ai") {
             Ok(_) => panic!("a build with no HTTP client reached a network registry"),
             Err(e) => e.to_string(),
         };

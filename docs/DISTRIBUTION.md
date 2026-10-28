@@ -209,15 +209,50 @@ nix build .#plowrt-release --no-link --print-out-paths
 ```
 
 The tarball is deterministic (sorted, fixed mtime, no gzip timestamp) and its
-sha256 is computed at build time; the registry records both, with
-`release.json`, under `v1/runtime/<version>/<triple>/` and in
-`v1/runtime/index.json`. A build from a modified checkout carries `-dirty`
-and must not be published, because it names a commit it does not correspond
-to.
+sha256 is computed at build time. A dynamic Linux release is re-pointed at
+the host's loader (`/lib64/ld-linux-x86-64.so.2`) with its nix rpath removed
+inside the build, so the digest is of the bytes a host runs; it needs glibc
+2.38 or newer. A build from a modified checkout carries `-dirty` and is
+refused at publish, because it names a commit it does not correspond to.
+
+```
+plowrt push-runtime --release <nix output dir> [--release <another triple's>] \
+  [--install-script scripts/install.sh] [--keep-latest] [--dry-run] [--to r2://…]
+```
+
+records each output under `v1/runtime/<version>/<triple>/` (the tarball,
+its `.sha256`, `release.json`; create-only, so a version is never
+republished with other bytes), rewrites `v1/runtime/index.json` (every
+release and triple, newest first, for a models page) and `v1/runtime/latest`
+(the version string alone), and publishes `scripts/install.sh` at the
+registry root when asked. The same credentials and conditional writes as
+`push`. A client installs with:
+
+```
+curl -fsSL https://pdist.infervisor.ai/install.sh | sh     # PLOWRT_VERSION=… pins
+```
+
+which reads `latest`, then that version's `release.json` for the machine's
+triple, verifies the tarball against its `.sha256`, and installs `plowrt`
+into `/usr/local/bin` or `~/.local/bin` (`PLOWRT_INSTALL_DIR` overrides).
 
 **Model assets**, which advance independently — a new generation needs no new
 binary — are published by `plowrt` alone, straight into the bucket a client
-reads. There is no service between the producer and the store:
+reads. There is no service between the producer and the store, and no
+wrapper script: the sequence is the recipe's build, its check, then `push`.
+
+```
+python3 scripts/campaign/campaign.py build recipes/<ns>/<name>/<label>.toml --out $OUT
+scripts/check_recipe.py recipes/<ns>/<name>/<label>.toml --bundle $OUT/assets --objects $OUT/objects --strict
+plowrt push --recipe recipes/<ns>/<name>/<label>.toml --assets $OUT/assets --objects $OUT/objects --dry-run
+plowrt push --recipe … --assets … --objects …           # same, for real
+plowrt show <name>                                       # from any machine: the generation is live
+```
+
+A measurement is not a condition of publishing: a build goes up as `emits`
+and is re-pushed as `validated` with `--tok-s` when it has been gated and
+measured. The registry carries what plow produced and nothing else; a
+checkpoint is always a Hugging Face reference, pinned to a commit.
 
 ```
 CLOUDFLARE_ACCOUNT_ID=… CLOUDFLARE_R2_BUCKET=… CLOUDFLARE_API_TOKEN=… \

@@ -1147,3 +1147,33 @@ max_ctx = 2048
         );
     }
 }
+
+/// `plowrt push-runtime`: see [`dist::runtime`].
+pub fn cmd_push_runtime(
+    releases: &[std::path::PathBuf],
+    to: &str,
+    opts: &dist::runtime::Options,
+) -> Result<(), Err> {
+    // Every directory is read and checked before the registry is touched.
+    let dirs = releases
+        .iter()
+        .map(|d| dist::runtime::ReleaseDir::read(d))
+        .collect::<Result<Vec<_>, _>>()?;
+    let sink = dist::sink::sink(to)?;
+    let out = dist::runtime::push_runtime(&*sink, &dirs, opts)?;
+    let verb = if opts.dry_run { "would publish" } else { "published" };
+    for (triple, bytes) in &out.uploaded {
+        println!("{verb} plowrt {} {triple} ({} MiB)", out.version, bytes >> 20);
+    }
+    for triple in &out.adopted {
+        println!("already published: plowrt {} {triple}", out.version);
+    }
+    if !out.latest.is_empty() {
+        println!("latest: {}", out.latest);
+    }
+    if out.install_script {
+        println!("{verb} install.sh");
+    }
+    println!("registry: {}", sink.describe());
+    Ok(())
+}

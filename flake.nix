@@ -254,10 +254,26 @@
                 doCheck = false;
               };
               name = "plowrt-${releaseVersion}-${triple}${suffix}";
-            in
-            pkgs.runCommand name { nativeBuildInputs = [ pkgs.gnutar pkgs.gzip pkgs.coreutils ]; } ''
+            # A dynamic Linux release is re-pointed at the host's loader and
+            # loses its nix rpath: as built, the ELF interpreter is a
+            # /nix/store glibc that exists on no serving host (v0.1.1 shipped
+            # that way and ran nowhere). The digest below is of the patched
+            # bytes, which are the bytes the registry serves. Needs glibc
+            # >= 2.38 on the host; the static (musl) release needs nothing.
+            interp =
+              {
+                "x86_64-unknown-linux-gnu" = "/lib64/ld-linux-x86-64.so.2";
+                "aarch64-unknown-linux-gnu" = "/lib/ld-linux-aarch64.so.1";
+              }
+              .${triple} or null;
+          in
+            pkgs.runCommand name { nativeBuildInputs = [ pkgs.gnutar pkgs.gzip pkgs.coreutils ] ++ lib.optional (interp != null) pkgs.patchelf; } ''
               mkdir -p $out "$TMPDIR/${name}"
               cp ${bin}/bin/plowrt "$TMPDIR/${name}/plowrt"
+              chmod u+w "$TMPDIR/${name}/plowrt"
+              ${lib.optionalString (interp != null) ''
+                patchelf --set-interpreter ${interp} --remove-rpath "$TMPDIR/${name}/plowrt"
+              ''}
               # Deterministic: a fixed mtime, sorted entries, owner stripped, and
               # no gzip timestamp, so rebuilding the same commit reproduces the
               # same digest and the store dedups it.
