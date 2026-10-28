@@ -34,8 +34,7 @@ const CHUNK_BYTES: u64 = 8 << 20;
 /// Device headroom the spill-ahead thread keeps for publishes when a host tier is armed
 /// (`VmmKv::spawn_spill_ahead`): about a second of boundaries at the production rate.
 pub const SPILL_AHEAD_BYTES: u64 = 2 << 30;
-/// Longest a publish waits for a queued spill to free a device slot (a 147 MiB state block
-/// lands in ~6 ms at the measured ~25 GB/s).
+/// Longest a publish waits in all for queued spills to free device slots.
 const SPILL_WAIT: std::time::Duration = std::time::Duration::from_millis(50);
 const SEED_CHAIN: u64 = 0x9e37_79b9_7f4a_7c15;
 const SEED_CHECK: u64 = 0xc2b2_ae3d_27d4_eb4f;
@@ -519,6 +518,7 @@ impl GpuEngine {
             SEED_CHECK,
         );
         let plan = bs.plan(p_a, kv.geometry().window);
+        let spill_deadline = t0 + SPILL_WAIT;
         // On an error return `fills` drops first (the blocks fail), `deps` after (released).
         let mut deps = Deps::new(&bs.store, plan.len());
         let mut fills: Vec<FillToken> = Vec::new();
@@ -534,13 +534,15 @@ impl GpuEngine {
             let acquired = loop {
                 match bs.store.acquire(ci, key) {
                     Ok(a) => break a,
-                    // Retired spills free device slots (a queued one is waited for); else
-                    // the pool gives up a boundary.
+                    // Retired spills free device slots (queued ones are waited for, up to one
+                    // deadline per publish); else the pool gives up a boundary.
                     Err(RuntimeError::Oom(_))
-                        if {
-                            bs.store.reap();
-                            bs.store.reap_wait(SPILL_WAIT) || kv.reclaim_one()
-                        } =>
+                        if bs
+                            .store
+                            .reap_wait(spill_deadline.saturating_duration_since(
+                                std::time::Instant::now(),
+                            ))
+                            || kv.reclaim_one() =>
                     {
                         continue
                     }
@@ -769,20 +771,18 @@ impl GpuEngine {
     /// slot, prompt-end boundary passed). Packed chunks take `min` with it so the chunk ends
     /// exactly at the boundary and [`Self::state_capture_publish`] can capture there.
     pub fn state_capture_cut(&self, b: usize, prompt: &[u32], c0: usize) -> usize {
-        self.state_capture_stop(b, prompt, prompt.len(), c0)
+        self.state_capture_stop(b, prompt, c0)
             .map_or(usize::MAX, |(rows, _)| rows as usize - c0)
     }
 
     /// The next row past `c0` where slot `b`'s recurrent state must be captured, the only rows
     /// another request can attach to: a whole-block checkpoint a request waits on
     /// (`VmmKv::inflight_prefix`), the shared-prefix end (`VmmKv::share_rows`: a system prompt
-    /// another prompt also sent), then the prompt-end boundary. `tokens` covers the prompt at
-    /// least up to the rows checked.
+    /// another prompt also sent), then the prompt-end boundary.
     fn state_capture_stop(
         &self,
         b: usize,
-        tokens: &[u32],
-        prompt_len: usize,
+        prompt: &[u32],
         c0: usize,
     ) -> Option<(u32, crate::memory::vmm::Kind)> {
         use crate::memory::vmm::Kind;
@@ -790,7 +790,7 @@ impl GpuEngine {
         if self.prefix_attach_off[b] {
             return None;
         }
-        let p_a = super::prefix::prompt_end_boundary(prompt_len as u32);
+        let p_a = super::prefix::prompt_end_boundary(prompt.len() as u32);
         if c0 >= p_a as usize {
             return None;
         }
@@ -805,7 +805,7 @@ impl GpuEngine {
         let br = kv.block_rows();
         let mut p = (c0 as u32 / br + 1) * br;
         while p < stop.0 {
-            if kv.checkpoint_awaited(tokens, p) {
+            if kv.checkpoint_awaited(prompt, p) {
                 stop = (p, Kind::CHECKPOINT);
                 break;
             }
@@ -818,22 +818,31 @@ impl GpuEngine {
     /// ([`Self::state_capture_stop`]): publish it now, while the state tensors hold the state at
     /// that row. The slot's row history must already cover the chunk.
     pub(super) fn state_capture_publish(&mut self, b: usize, prompt_len: usize) {
+        use crate::memory::vmm::Kind;
+        if !self.kv_blocks().is_some_and(|bs| bs.captures_state()) || self.prefix_attach_off[b] {
+            return;
+        }
         let pos = self.pos[b];
-        let Some(c0) = (pos as usize).checked_sub(1) else {
+        let Some((_, kv)) = self.vmm_prefix() else {
             return;
         };
-        if self.seq_tokens[b].len() < pos as usize {
+        if pos == 0 || self.seq_tokens[b].len() < pos as usize {
             return;
         }
-        let Some((rows, kind)) = self.state_capture_stop(b, &self.seq_tokens[b], prompt_len, c0)
-        else {
+        let p_a = super::prefix::prompt_end_boundary(prompt_len as u32);
+        let kind = if pos == p_a {
+            Kind::PROMPT_END
+        } else if pos > p_a {
+            return;
+        } else if pos == kv.share_rows(b) {
+            Kind::SHARED_END
+        } else if pos % kv.block_rows() == 0 && kv.checkpoint_awaited(&self.seq_tokens[b], pos) {
+            Kind::CHECKPOINT
+        } else {
             return;
         };
-        if rows != pos {
-            return;
-        }
-        self.seq_tokens[b].truncate(rows as usize);
-        self.publish_boundary(b, rows, kind);
+        self.seq_tokens[b].truncate(pos as usize);
+        self.publish_boundary(b, pos, kind);
     }
 
     /// Run a segment table on the engine stream: one kernel launch over slot `b`'s table

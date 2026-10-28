@@ -1386,8 +1386,8 @@ impl KvStore {
         }
     }
 
-    /// Wait up to `limit` for the oldest queued spill to land and retire it: `true` = a spill
-    /// retired (its device slot is free). A publish refused for want of a device slot calls
+    /// Retire landed spills, waiting up to `limit` for one while any is queued: `true` = spilled
+    /// bytes retired (their device slots are free). A publish refused for want of a device slot calls
     /// this before asking the pool for another victim: each victim's spill lands
     /// asynchronously, and without the wait the retry loop spilled every device boundary in
     /// turn and then took host-resident ones.
