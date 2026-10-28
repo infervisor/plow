@@ -305,7 +305,13 @@ pub fn push_runtime(sink: &dyn Sink, dirs: &[ReleaseDir], opts: &Options) -> Res
                     path: d.tarball.clone(),
                     source: e,
                 })?;
-                match sink.put(&tar_key, &mut f, d.bytes, "application/gzip", Cond::IfNoneMatchAny)? {
+                match sink.put(
+                    &tar_key,
+                    &mut f,
+                    d.bytes,
+                    "application/gzip",
+                    Cond::IfNoneMatchAny,
+                )? {
                     Put::Stored(_) => true,
                     Put::PreconditionFailed => false,
                 }
@@ -414,7 +420,13 @@ pub fn push_runtime(sink: &dyn Sink, dirs: &[ReleaseDir], opts: &Options) -> Res
                 script.display()
             )));
         }
-        put_bytes(sink, INSTALL_SCRIPT, &bytes, "text/x-shellscript", Cond::None)?;
+        put_bytes(
+            sink,
+            INSTALL_SCRIPT,
+            &bytes,
+            "text/x-shellscript",
+            Cond::None,
+        )?;
         out.install_script = true;
     }
     Ok(out)
@@ -475,7 +487,11 @@ mod tests {
         let file = format!("plowrt-{version}-{triple}.tar.gz");
         std::fs::write(dir.join(&file), body).unwrap();
         let (sha, _) = sha256_file(&dir.join(&file)).unwrap();
-        std::fs::write(dir.join(format!("{file}.sha256")), format!("{sha}  {file}\n")).unwrap();
+        std::fs::write(
+            dir.join(format!("{file}.sha256")),
+            format!("{sha}  {file}\n"),
+        )
+        .unwrap();
         let (semver, commit) = version.split_once('+').unwrap();
         std::fs::write(
             dir.join("release.json"),
@@ -501,15 +517,24 @@ mod tests {
     fn a_release_is_recorded_and_a_rerun_adopts_it() {
         let root = tmp("rerun");
         let sink = FileSink::new(root.join("reg"));
-        let x86 = release(&root, "0.1.3+abcdef123456", "x86_64-unknown-linux-gnu", b"x86 bytes");
+        let x86 = release(
+            &root,
+            "0.1.3+abcdef123456",
+            "x86_64-unknown-linux-gnu",
+            b"x86 bytes",
+        );
         let out = push_runtime(&sink, &[x86], &Options::default()).unwrap();
-        assert_eq!(out.uploaded, vec![("x86_64-unknown-linux-gnu".to_string(), 9)]);
+        assert_eq!(
+            out.uploaded,
+            vec![("x86_64-unknown-linux-gnu".to_string(), 9)]
+        );
         assert_eq!(out.latest, "0.1.3+abcdef123456");
         assert_eq!(
             String::from_utf8(read(&sink, RUNTIME_LATEST).unwrap()).unwrap(),
             "0.1.3+abcdef123456\n"
         );
-        let index: RuntimeIndex = serde_json::from_slice(&read(&sink, RUNTIME_INDEX).unwrap()).unwrap();
+        let index: RuntimeIndex =
+            serde_json::from_slice(&read(&sink, RUNTIME_INDEX).unwrap()).unwrap();
         assert_eq!(index.releases.len(), 1);
         let asset = &index.releases[0].triples["x86_64-unknown-linux-gnu"];
         assert_eq!(
@@ -519,7 +544,12 @@ mod tests {
         assert!(read(&sink, &asset.file).is_some());
         assert!(index.releases[0].released.is_some());
 
-        let again = release(&root, "0.1.3+abcdef123456", "x86_64-unknown-linux-gnu", b"x86 bytes");
+        let again = release(
+            &root,
+            "0.1.3+abcdef123456",
+            "x86_64-unknown-linux-gnu",
+            b"x86 bytes",
+        );
         let out = push_runtime(&sink, &[again], &Options::default()).unwrap();
         assert!(out.uploaded.is_empty());
         assert_eq!(out.adopted, vec!["x86_64-unknown-linux-gnu".to_string()]);
@@ -530,10 +560,22 @@ mod tests {
     fn other_bytes_under_a_published_version_are_refused() {
         let root = tmp("refuse");
         let sink = FileSink::new(root.join("reg"));
-        let a = release(&root, "0.1.3+abcdef123456", "x86_64-unknown-linux-gnu", b"first");
+        let a = release(
+            &root,
+            "0.1.3+abcdef123456",
+            "x86_64-unknown-linux-gnu",
+            b"first",
+        );
         push_runtime(&sink, &[a], &Options::default()).unwrap();
-        let b = release(&root.join("b"), "0.1.3+abcdef123456", "x86_64-unknown-linux-gnu", b"second");
-        let err = push_runtime(&sink, &[b], &Options::default()).unwrap_err().to_string();
+        let b = release(
+            &root.join("b"),
+            "0.1.3+abcdef123456",
+            "x86_64-unknown-linux-gnu",
+            b"second",
+        );
+        let err = push_runtime(&sink, &[b], &Options::default())
+            .unwrap_err()
+            .to_string();
         assert!(err.contains("never rewritten"), "{err}");
         let _ = std::fs::remove_dir_all(root);
     }
@@ -542,11 +584,21 @@ mod tests {
     fn triples_join_one_row_and_keep_latest_leaves_the_pointer() {
         let root = tmp("triples");
         let sink = FileSink::new(root.join("reg"));
-        let x86 = release(&root, "0.1.3+abcdef123456", "x86_64-unknown-linux-gnu", b"x86");
+        let x86 = release(
+            &root,
+            "0.1.3+abcdef123456",
+            "x86_64-unknown-linux-gnu",
+            b"x86",
+        );
         push_runtime(&sink, &[x86], &Options::default()).unwrap();
         let mac = release(&root, "0.1.3+abcdef123456", "aarch64-apple-darwin", b"mac");
         push_runtime(&sink, &[mac], &Options::default()).unwrap();
-        let old = release(&root, "0.1.2+000000000000", "x86_64-unknown-linux-gnu", b"old");
+        let old = release(
+            &root,
+            "0.1.2+000000000000",
+            "x86_64-unknown-linux-gnu",
+            b"old",
+        );
         let out = push_runtime(
             &sink,
             &[old],
@@ -557,10 +609,15 @@ mod tests {
         )
         .unwrap();
         assert_eq!(out.latest, "0.1.3+abcdef123456");
-        let index: RuntimeIndex = serde_json::from_slice(&read(&sink, RUNTIME_INDEX).unwrap()).unwrap();
+        let index: RuntimeIndex =
+            serde_json::from_slice(&read(&sink, RUNTIME_INDEX).unwrap()).unwrap();
         assert_eq!(index.releases.len(), 2);
         assert_eq!(index.releases[0].version, "0.1.2+000000000000");
-        let newest = index.releases.iter().find(|r| r.version == "0.1.3+abcdef123456").unwrap();
+        let newest = index
+            .releases
+            .iter()
+            .find(|r| r.version == "0.1.3+abcdef123456")
+            .unwrap();
         assert_eq!(newest.triples.len(), 2);
         assert_eq!(index.latest, "0.1.3+abcdef123456");
         let _ = std::fs::remove_dir_all(root);
@@ -572,7 +629,11 @@ mod tests {
         let dir = root.join("rel");
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("plowrt.tar.gz"), b"x").unwrap();
-        std::fs::write(dir.join("plowrt.tar.gz.sha256"), "deadbeef  plowrt.tar.gz\n").unwrap();
+        std::fs::write(
+            dir.join("plowrt.tar.gz.sha256"),
+            "deadbeef  plowrt.tar.gz\n",
+        )
+        .unwrap();
         std::fs::write(
             dir.join("release.json"),
             r#"{"version":"0.1.3+abc-dirty","semver":"0.1.3","commit":"abc-dirty","triple":"x86_64-unknown-linux-gnu","file":"plowrt.tar.gz"}"#,
@@ -594,7 +655,12 @@ mod tests {
     fn install_script_lands_at_the_root_and_must_be_sh() {
         let root = tmp("install");
         let sink = FileSink::new(root.join("reg"));
-        let rel = release(&root, "0.1.3+abcdef123456", "x86_64-unknown-linux-gnu", b"x");
+        let rel = release(
+            &root,
+            "0.1.3+abcdef123456",
+            "x86_64-unknown-linux-gnu",
+            b"x",
+        );
         let script = root.join("install.sh");
         std::fs::write(&script, "#!/bin/sh\necho hi\n").unwrap();
         let out = push_runtime(
@@ -607,9 +673,17 @@ mod tests {
         )
         .unwrap();
         assert!(out.install_script);
-        assert_eq!(read(&sink, INSTALL_SCRIPT).unwrap(), b"#!/bin/sh\necho hi\n");
+        assert_eq!(
+            read(&sink, INSTALL_SCRIPT).unwrap(),
+            b"#!/bin/sh\necho hi\n"
+        );
         std::fs::write(&script, "#!/bin/bash\n").unwrap();
-        let rel = release(&root, "0.1.3+abcdef123456", "x86_64-unknown-linux-gnu", b"x");
+        let rel = release(
+            &root,
+            "0.1.3+abcdef123456",
+            "x86_64-unknown-linux-gnu",
+            b"x",
+        );
         let err = push_runtime(
             &sink,
             &[rel],
