@@ -761,6 +761,7 @@ fn ride_bench(
             .collect::<Vec<Request<'_>>>()
     };
     let feeds: Vec<(usize, u32)> = last.iter().copied().enumerate().collect();
+    println!("RIDE_INPUTS ids={:?}", &last[..wmax]);
     let (mut output, mut toks, mut logits) = (Vec::new(), Vec::new(), Vec::new());
     let median = |v: &mut Vec<f64>| {
         v.sort_by(f64::total_cmp);
