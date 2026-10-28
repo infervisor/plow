@@ -672,3 +672,23 @@ before. Prefix token hit per cell (1.8 r1 / 2.7 r1 / 1.8 r2 / 2.7 r2):
 
 Evidence: `/opt/dlami/nvme/lava-tts/g12-decode/grid-{hmem1k,uncap,cap128,cap64,cap32,auto6}`
 (`mem.tsv` = 5 s RSS / MemAvailable samples).
+
+26B check of the new default (2026-10-28, plowrt e4ba03a09 = this change on prod-next, recipe serve
+env, `--prod-fidelity`, 2 reps per rate). The default tier peaked at 64 GiB RSS in every arm.
+
+| model, think | tier | token hit % (1.8 r1 / 2.7 r1 / 1.8 r2 / 2.7 r2) | TTFT P99 ms | TPOT P99 ms | goodput |
+|---|---|---|---|---|---|
+| 26B FP8 (caf6c4a47ba6), 10 s | default (62 GiB) | 78.4 / 77.1 / 79.8 / 78.2 | 321 / 460 / 272 / 516 | 25.9 / 38.4 / 22.3 / 54.2 | 100% all |
+| 26B FP8, 10 s | 128 GiB | 78.4 / 77.1 / 79.8 / 78.1 | 343 / 1002 / 310 / 478 | 26.3 / 95.3 / 26.9 / 54.9 | 99.2-100% |
+| 26B FP8, 10 s | 200 GiB (old default; 202 GiB RSS, 33 GiB left) | 78.4 / 77.1 / 79.7 / 78.1 | 340 / 453 / 1711 / 886 | 25.2 / 41.8 / 180.4 / 47.3 | 96.7-100% |
+| 26B FP8, 45 s | default | 69.6 / 67.9 / 68.9 / 68.4 | 446 / 506 / 332 / 500 | 20.8 / 34.9 / 20.1 / 45.9 | 100% all |
+| 26B FP8, 45 s | 200 GiB | 69.6 / 67.9 / 68.9 / 68.3 | 364 / 463 / 293 / 530 | 19.8 / 34.9 / 22.8 / 45.9 | 100% all |
+| 26B BF16 (f72d0330f9d8), 10 s, 1.8/s x4 | default | 77.7 / 78.8 / 77.8 / 78.9 | 4042 / 4493 / 5008 / 3793 | 107 / 118 / 107 / 101 | 92.2-95.8% |
+| 26B BF16, 10 s, 1.8/s x4 | 128 GiB | 77.9 / 78.8 / 78.0 / 78.6 | 2891 / 3451 / 2789 / 5193 | 120 / 108 / 120 / 113 | 89.4-95.7% |
+
+- The hit rate is equal within 0.1 pt in every comparison, including the 45 s think mix. The larger
+  tiers only add P99 outliers in the reps where they grow past 100 GiB.
+- 26B BF16 TTFT P99 is lower with 128 GiB in 3 of 4 reps, but TPOT P99 moves the other way.
+  The rank-sum p is about 0.34, and this step-bound recipe swings 3-13 s run to run. No cap set.
+
+Evidence: `/opt/dlami/nvme/lava-tts/g12-decode/g26/{fp8,bf16}-*`.
