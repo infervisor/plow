@@ -2,10 +2,11 @@
 """Build <out>/libplow_fa4_hd512.so, the host-side FlashAttention-4 hd512 prefill attention
 (Gemma-4 global layers) plowrt can load beside a packet. CPU only:
 
-  1. scripts/export_fa4_hd512_sm90.py <out>/fa4 {1,2}  (CuTe DSL -> fa4_hd512_h16kv{1,2}.{h,o};
+  1. scripts/export_fa4_hd512_sm90.py <out>/fa4 {1,2,combine}  (CuTe DSL ->
+     fa4_hd512_h16kv{1,2}{,_split}.{h,o} and fa4_hd512_combine.{h,o};
      needs an interpreter with vLLM 0.29's vllm_flash_attn + cutlass DSL 4.6, e.g. /opt/pytorch
      with PYTHONPATH=<site-packages>/nvidia_cutlass_dsl/dsl_packages)
-  2. nvcc -shared runtime/nvidia/fa4_hd512.cpp + both objects -> <out>/libplow_fa4_hd512.so
+  2. nvcc -shared runtime/nvidia/fa4_hd512.cpp + the objects -> <out>/libplow_fa4_hd512.so
 
 Same toolchain and static-link rules as build_sm90a_qwen_gdn.py.
 """
@@ -25,7 +26,7 @@ def main() -> int:
     obj = out / "fa4"
     obj.mkdir(parents=True, exist_ok=True)
     env = dict(os.environ, CUTE_DSL_ARCH="sm_90a")
-    for kvh in ("1", "2"):
+    for kvh in ("1", "2", "combine"):
         subprocess.run([sys.executable, str(REPO / "scripts/export_fa4_hd512_sm90.py"), str(obj), kvh],
                        check=True, env=env)
     nvcc = os.environ.get("PLOW_NVCC", "/usr/local/cuda/bin/nvcc")
@@ -38,8 +39,8 @@ def main() -> int:
     cmd = [nvcc, "-shared", "-Xcompiler", "-fPIC", "-std=c++17", "-O2", "-cudart", "static",
            "-Xcompiler", "-static-libstdc++", "-Xcompiler", "-static-libgcc", "-Wno-deprecated-gpu-targets",
            "-I", str(obj), "-o", str(out / "libplow_fa4_hd512.so"),
-           str(REPO / "runtime/nvidia/fa4_hd512.cpp"), str(obj / "fa4_hd512_h16kv1.o"),
-           str(obj / "fa4_hd512_h16kv2.o"), str(archive), "-lcuda"]
+           str(REPO / "runtime/nvidia/fa4_hd512.cpp"),
+           *sorted(str(p) for p in obj.glob("fa4_hd512_*.o")), str(archive), "-lcuda"]
     print(" ".join(cmd), flush=True)
     subprocess.run(cmd, check=True)
     return 0

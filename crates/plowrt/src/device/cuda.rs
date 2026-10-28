@@ -497,6 +497,13 @@ pub struct CudaStream {
 unsafe impl Send for CudaStream {}
 unsafe impl Sync for CudaStream {}
 
+impl CudaStream {
+    /// The driver handle, for host libraries launching on this stream.
+    pub(crate) fn raw(&self) -> usize {
+        self.raw
+    }
+}
+
 impl Drop for CudaStream {
     fn drop(&mut self) {
         // SAFETY: handle from cuStreamCreate, destroyed exactly once.
@@ -1095,7 +1102,7 @@ impl CudaBackend {
     /// On a poisoned context this short-circuits with the recorded fault
     /// BEFORE calling the driver — every public entry point crosses here, so
     /// this is what stops a dead context from flooding the log.
-    fn bind(&self) -> Result<()> {
+    pub(crate) fn bind(&self) -> Result<()> {
         if let Some(info) = self.poisoned.get() {
             return Err(RuntimeError::DeviceFault { info: info.clone() });
         }
