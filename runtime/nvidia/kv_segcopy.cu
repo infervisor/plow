@@ -22,5 +22,6 @@ extern "C" __global__ void plow_kv_segcopy(const plow_kv_seg* __restrict__ table
 // waits behind every bulk copy queued on the same copy engine (the host tier's spills).
 extern "C" __global__ void plow_small_copy(const uint32_t* __restrict__ src, uint32_t* __restrict__ dst,
                                            unsigned words) {
-    for (unsigned i = threadIdx.x; i < words; i += blockDim.x) dst[i] = src[i];
+    for (unsigned i = blockIdx.x * blockDim.x + threadIdx.x; i < words; i += gridDim.x * blockDim.x)
+        dst[i] = src[i];
 }

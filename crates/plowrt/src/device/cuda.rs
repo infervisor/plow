@@ -933,9 +933,9 @@ impl CudaBackend {
     /// The small-copy kernel for a copy of `bytes` between `dev` and the host range at `host`,
     /// when every condition holds: small, 4-byte aligned, host side inside a live pinned
     /// allocation.
-    fn small_copy_for(&self, host: usize, dev: u64, bytes: usize) -> Option<KernelFn> {
+    fn small_copy_for(&self, host: usize, dev: u64, bytes: usize, max: usize) -> Option<KernelFn> {
         let f = self.small_copy?;
-        if bytes == 0 || bytes > SMALL_COPY_MAX || (bytes | host | dev as usize) % 4 != 0 {
+        if bytes == 0 || bytes > max || (bytes | host | dev as usize) % 4 != 0 {
             return None;
         }
         let pinned = self.freer.pinned.lock();
@@ -952,12 +952,33 @@ impl CudaBackend {
         stream: &CudaStream,
     ) -> Result<()> {
         let (mut src, mut dst, mut words) = (src, dst, (bytes / 4) as u32);
+        let grid = words.div_ceil(128).min(2 * self.sm_count);
         let mut params = [
             &mut src as *mut u64 as *mut c_void,
             &mut dst as *mut u64 as *mut c_void,
             &mut words as *mut u32 as *mut c_void,
         ];
-        self.launch_kernel(f, 1, 128, 0, &mut params, Some(stream))
+        self.launch_kernel(f, grid, 128, 0, &mut params, Some(stream))
+    }
+
+    /// H2D of up to 1 GiB from a live pinned allocation on the SMs, off the copy engines (bulk
+    /// restores queue there); `false` = not eligible, nothing enqueued.
+    ///
+    /// # Safety
+    /// As [`Self::memcpy_htod_async`]: `src` stays valid and unchanged until the stream
+    /// reaches the copy's end.
+    pub unsafe fn pinned_htod_on_sms(
+        &self,
+        dptr: u64,
+        src: &[u8],
+        stream: &CudaStream,
+    ) -> Result<bool> {
+        self.bind()?;
+        let Some(f) = self.small_copy_for(src.as_ptr() as usize, dptr, src.len(), 1 << 30) else {
+            return Ok(false);
+        };
+        self.launch_small_copy(f, src.as_ptr() as u64, dptr, src.len(), stream)?;
+        Ok(true)
     }
 
     /// Encode the `tma_ws_gemm_bf16.cu` tensor-map recipe over a device tensor: rank-2
@@ -1870,7 +1891,8 @@ impl CudaBackend {
         stream: &CudaStream,
     ) -> Result<()> {
         self.bind()?;
-        if let Some(f) = self.small_copy_for(src.as_ptr() as usize, dptr, src.len()) {
+        if let Some(f) = self.small_copy_for(src.as_ptr() as usize, dptr, src.len(), SMALL_COPY_MAX)
+        {
             return self.launch_small_copy(f, src.as_ptr() as u64, dptr, src.len(), stream);
         }
         self.check(
@@ -1899,7 +1921,9 @@ impl CudaBackend {
         stream: &CudaStream,
     ) -> Result<()> {
         self.bind()?;
-        if let Some(f) = self.small_copy_for(dst.as_mut_ptr() as usize, dptr, dst.len()) {
+        if let Some(f) =
+            self.small_copy_for(dst.as_mut_ptr() as usize, dptr, dst.len(), SMALL_COPY_MAX)
+        {
             return self.launch_small_copy(f, dptr, dst.as_mut_ptr() as u64, dst.len(), stream);
         }
         self.check(

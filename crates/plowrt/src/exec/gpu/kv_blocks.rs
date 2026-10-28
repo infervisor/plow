@@ -17,7 +17,7 @@
 
 use super::prefix::VmmServe;
 use super::GpuEngine;
-use crate::device::cuda::{CudaBackend, KernelFn, PinnedHost};
+use crate::device::cuda::{CudaBackend, CudaEvent, KernelFn, PinnedHost};
 use crate::memory::kv_store::{
     chain_hashes, BlockId, ClassSpec, FillToken, Hold, KvStore, StoreStats,
 };
@@ -104,9 +104,13 @@ impl Drop for Deps<'_> {
     }
 }
 
+/// A slot's segment table: built in `host`, staged into `dev` on the SMs (a copy-engine H2D
+/// queued behind the host tier's restores and held the engine thread, 18 ms per attach on the
+/// 26B production mix). `read` retires once the last launch reading `host` or `dev` has run.
 struct Table {
     host: PinnedHost,
     dev: TableDev,
+    read: CudaEvent,
     cap: usize,
 }
 
@@ -867,15 +871,25 @@ impl GpuEngine {
         let table = match tables[b].as_mut() {
             Some(t) if t.cap >= segs.len() => t,
             _ => {
+                if let Some(old) = tables[b].as_ref() {
+                    self.be.event_synchronize(&old.read)?;
+                }
                 let cap = segs.len().next_power_of_two().max(1024);
                 let host = self
                     .be
                     .host_alloc_pinned(cap * std::mem::size_of::<Seg>())?;
                 let dev = TableDev::alloc(&self.be, (cap * std::mem::size_of::<Seg>()) as u64)?;
-                tables[b] = Some(Table { host, dev, cap });
+                let read = self.be.event_create(false)?;
+                tables[b] = Some(Table {
+                    host,
+                    dev,
+                    read,
+                    cap,
+                });
                 tables[b].as_mut().expect("just set")
             }
         };
+        self.be.event_synchronize(&table.read)?;
         // SAFETY: `Seg` is plain `repr(C)` data and the pinned buffer holds `cap >= len` of it.
         unsafe {
             std::ptr::copy_nonoverlapping(
@@ -884,20 +898,38 @@ impl GpuEngine {
                 bytes,
             );
         }
-        VmmOps::copy_htod(
-            &*self.be,
-            table.dev.va,
-            table.host.as_ptr() as u64,
-            bytes as u64,
-        )?;
+        // SAFETY: `host` is rewritten or freed only after `read`, recorded behind this table's
+        // launches, retires.
+        let staged = unsafe {
+            self.be.pinned_htod_on_sms(
+                table.dev.va,
+                &table.host.as_slice()[..bytes],
+                &self.stream,
+            )?
+        };
+        if !staged {
+            VmmOps::copy_htod(
+                &*self.be,
+                table.dev.va,
+                table.host.as_ptr() as u64,
+                bytes as u64,
+            )?;
+        }
         let mut table_ptr = table.dev.va;
         let mut n = segs.len() as u32;
         let mut params = [
             &mut table_ptr as *mut u64 as *mut c_void,
             &mut n as *mut u32 as *mut c_void,
         ];
-        self.be
-            .launch_kernel(f, n, SEGCOPY_BLOCK, 0, &mut params, Some(&self.stream))?;
+        let launched = self
+            .be
+            .launch_kernel(f, n, SEGCOPY_BLOCK, 0, &mut params, Some(&self.stream))
+            .and_then(|()| self.be.event_record(&table.read, &self.stream));
+        if launched.is_err() {
+            // `read` does not cover the staging just queued: drain it before the buffer is reused.
+            let _ = self.be.stream_synchronize(&self.stream);
+        }
+        launched?;
         bs.stats.lock().launches += 1;
         Ok(())
     }
