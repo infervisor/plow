@@ -4856,6 +4856,28 @@ async fn serve(
         served_model_name,
     )
     .await?;
+    {
+        let rt = plowrt::config::RuntimeConfig::get();
+        let server = plowrt::serve::config::ServerReasoning::from_runtime(rt)?;
+        let models: Vec<_> = state
+            .registry
+            .slugs()
+            .into_iter()
+            .filter_map(|s| state.registry.get(&s).ok().map(|b| (s, b)))
+            .collect();
+        plowrt::serve::config::install_chat_defaults(
+            &server,
+            rt.chat_defaults.as_deref(),
+            &models,
+            |name| {
+                let slug = state
+                    .registry
+                    .resolve(name)
+                    .unwrap_or_else(|| name.to_string());
+                state.registry.get(&slug).ok().map(|b| (slug, b))
+            },
+        )?;
+    }
     #[cfg(feature = "cuda")]
     {
         let state = Arc::clone(&state);

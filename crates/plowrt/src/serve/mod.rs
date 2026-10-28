@@ -35,11 +35,13 @@ pub mod policy;
 #[cfg(feature = "cpu")]
 pub mod portable;
 pub mod reasoning;
+pub mod reply_guard;
 pub mod session;
 #[cfg(all(test, any(feature = "hsa", feature = "cpu")))]
 mod step_lowering_tests;
 pub mod stream;
 pub mod template;
+pub mod think;
 pub mod tokenize;
 pub mod tools;
 pub mod turns;
@@ -92,6 +94,8 @@ pub struct GenParams {
     /// Stream text with special tokens kept: tool-call markers are special tokens in most
     /// vocabularies, and the chat handler parses them before stripping the rest.
     pub keep_special_tokens: bool,
+    /// Thinking budget / reply cap; the mux commits every token through it.
+    pub think: Option<Box<crate::serve::think::ThinkCtl>>,
 }
 
 /// The generation budget of a request that named none: the default, capped to the context the
@@ -163,6 +167,7 @@ impl Default for GenParams {
             min_tokens: 0,
             stop_token_ids: Vec::new(),
             keep_special_tokens: false,
+            think: None,
         }
     }
 }
@@ -1364,6 +1369,7 @@ pub fn app(state: Arc<AppState>) -> Router {
     let router = router.route("/v1/audio/speech", post(crate::tts::serving::speech));
     let router = router
         .route("/v1/chat/completions", post(chat::chat_completions))
+        .route("/v1/requests/:id/reasoning_end", post(chat::reasoning_end))
         .route("/v1/completions", post(completion::completions))
         .route("/tokenize", post(tokenize::tokenize))
         .route("/detokenize", post(tokenize::detokenize))

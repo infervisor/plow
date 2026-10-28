@@ -237,12 +237,13 @@ fn run(case: &Case, toks: &[String], strip: &Arc<SpecialText>, head: &FrameHead)
                     delta: Delta {
                         role: None,
                         content: c,
-                        reasoning_content: r,
+                        reasoning_content: plowrt::serve::openai::Reasoning(r),
                         tool_calls: None,
                     },
                     logprobs: None,
                     finish_reason: None,
                     x_plow_finish_reason: None,
+                    x_plow_thinking: None,
                 });
                 bytes += f.len();
             }

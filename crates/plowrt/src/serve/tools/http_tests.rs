@@ -68,10 +68,13 @@ fn tokenizer_json() -> Value {
 struct Script {
     prompts: Vec<String>,
     reply: Vec<String>,
+    /// Replies for the next jobs, before `reply`.
+    queue: std::collections::VecDeque<Vec<String>>,
 }
 
 struct Harness {
     app: axum::Router,
+    bundle: Arc<crate::asset::ModelBundle>,
     script: Arc<Mutex<Script>>,
     _dir: TempDir,
 }
@@ -123,6 +126,7 @@ fn harness_for(fixture: &str) -> Harness {
         Arc::new(crate::exec::ExecutorSet::bringup(backend).unwrap()),
     ));
     state.scripted.write().push(slug.clone());
+    let model = Arc::clone(&bundle);
     let script = Arc::new(Mutex::new(Script::default()));
     let s = Arc::clone(&script);
     state.install_mux(
@@ -134,11 +138,12 @@ fn harness_for(fixture: &str) -> Harness {
                 .decode_append(&job.prompt_ids, true, &mut text);
             let mut s = s.lock().unwrap();
             s.prompts.push(text);
-            s.reply.clone()
+            s.queue.pop_front().unwrap_or_else(|| s.reply.clone())
         }),
     );
     Harness {
         app: app(state),
+        bundle: model,
         script,
         _dir: TempDir(dir),
     }
@@ -844,6 +849,7 @@ async fn request_fields_are_read_as_vllm_reads_them() {
 
 /// `max_tokens` landing inside a call's head (before its name is complete) used to return the
 /// head's syntax as the answer (`content: "call:get_weather"`); it is call framing, not text.
+#[cfg(feature = "hf-tokenizer")]
 #[tokio::test]
 async fn a_call_head_cut_by_max_tokens_is_not_content() {
     let h = harness();
@@ -869,4 +875,775 @@ async fn a_call_head_cut_by_max_tokens_is_not_content() {
         v["choices"][0]["message"]["content"],
         "Checking.call:get_weather"
     );
+}
+
+/// Thinking-control request fields are validated, each refusal naming its field.
+#[cfg(feature = "hf-tokenizer")]
+#[tokio::test]
+async fn thinking_control_fields_are_validated() {
+    let h = harness_for("gemma4-12b");
+    h.reply(&["Four."]);
+    let on = json!({"enable_thinking": true});
+    for (body, field) in [
+        (
+            json!({"thinking_token_budget": -2}),
+            "thinking_token_budget",
+        ),
+        (json!({"reasoning_end": "Replying now."}), "reasoning_end"),
+        (json!({"max_reply_tokens": 0}), "max_reply_tokens"),
+        (
+            json!({"max_reply_tokens": 9, "max_tokens": 8}),
+            "max_reply_tokens",
+        ),
+    ] {
+        let mut body = body;
+        body["messages"] = user("2+2?");
+        body["chat_template_kwargs"] = on.clone();
+        let (code, v) = h.json(body).await;
+        assert_eq!(code, StatusCode::BAD_REQUEST, "{v}");
+        assert_eq!(v["error"]["param"], field, "{v}");
+    }
+    let (code, v) = h
+        .json(json!({"messages": user("2+2?"), "chat_template_kwargs": on,
+                     "thinking_token_budget": 16, "max_reply_tokens": 8,
+                     "reasoning_end": "Replying now.<channel|>"}))
+        .await;
+    assert_eq!(code, StatusCode::OK, "{v}");
+    // markers that are text, not special tokens, cannot be controlled by id
+    let h = harness_for("qwen3");
+    h.reply(&["Four."]);
+    let (code, v) = h
+        .json(json!({"messages": user("2+2?"), "thinking_token_budget": 16}))
+        .await;
+    assert_eq!(code, StatusCode::BAD_REQUEST, "{v}");
+    assert_eq!(v["error"]["param"], "thinking_token_budget", "{v}");
+}
+
+/// `thinking_token_budget: 0` renders the template's thinking-off prompt.
+#[tokio::test]
+async fn a_zero_budget_turns_thinking_off() {
+    let h = harness_for("gemma4-12b");
+    h.reply(&["Four."]);
+    let on = json!({"enable_thinking": true});
+    let (code, _) = h
+        .json(json!({"messages": user("2+2?"), "chat_template_kwargs": on}))
+        .await;
+    assert_eq!(code, StatusCode::OK);
+    assert!(
+        h.last_prompt().ends_with("<|turn>model\n"),
+        "{}",
+        h.last_prompt()
+    );
+    let (code, _) = h
+        .json(json!({"messages": user("2+2?"), "chat_template_kwargs": on, "thinking_token_budget": 0}))
+        .await;
+    assert_eq!(code, StatusCode::OK);
+    assert!(
+        h.last_prompt()
+            .ends_with("<|turn>model\n<|channel>thought\n<channel|>"),
+        "{}",
+        h.last_prompt()
+    );
+}
+
+#[tokio::test]
+async fn a_zero_budget_uses_deepseeks_thinking_switch() {
+    let h = harness_for("deepseek-v3.1");
+    h.reply(&["Four."]);
+    let (code, v) = h
+        .json(json!({
+            "messages": user("2+2?"),
+            "chat_template_kwargs": {"thinking": true},
+            "thinking_token_budget": 0
+        }))
+        .await;
+    assert_eq!(code, StatusCode::OK, "{v}");
+    assert!(h.last_prompt().ends_with("</think>"), "{}", h.last_prompt());
+}
+
+#[cfg(feature = "hf-tokenizer")]
+#[tokio::test]
+async fn raw_gemma_reasoning_preserves_markers_on_both_paths() {
+    let h = harness_for("gemma4-12b");
+    let raw = "<|channel>thought\nplan<channel|>Four.";
+    let pieces = toks(raw);
+    let pieces: Vec<&str> = pieces.iter().map(String::as_str).collect();
+    h.reply(&pieces);
+    let body = json!({
+        "messages": user("2+2?"),
+        "chat_template_kwargs": {"enable_thinking": true},
+        "reasoning_format": "none"
+    });
+    let (code, v) = h.json(body.clone()).await;
+    assert_eq!(code, StatusCode::OK, "{v}");
+    assert_eq!(v["choices"][0]["message"]["content"], raw);
+    assert!(v["choices"][0]["message"].get("reasoning").is_none());
+    let (frames, done) = h.sse(body).await;
+    assert!(done);
+    let (content, reasoning, _, _) = accumulate(&frames);
+    assert_eq!(content, raw);
+    assert!(reasoning.is_empty());
+}
+
+#[cfg(feature = "hf-tokenizer")]
+#[tokio::test]
+async fn gemma_control_counts_reply_tokens_after_a_channel_switch() {
+    use crate::serve::think::{ThinkCtl, ThinkLimits};
+    let h = harness_for("gemma4-12b");
+    let markers = h.bundle.think_markers().unwrap();
+    let mut t = ThinkCtl::new(
+        markers.clone(),
+        ThinkLimits {
+            reply_cap: Some(2),
+            forced_end: vec![markers.close].into(),
+            ..Default::default()
+        },
+        true,
+    );
+    for id in h
+        .bundle
+        .tokenizer()
+        .encode_with_special_tokens("plan<|channel>response\n", false)
+    {
+        let text = t
+            .needs_channel_text()
+            .then(|| h.bundle.tokenizer().decode_keep_special(&[id]));
+        t.commit(id, text.as_deref().unwrap_or(""));
+    }
+    assert!(t.replying());
+    assert!(!t.commit(u32::from(b'H'), "").capped);
+    assert!(t.commit(u32::from(b'i'), "").capped);
+}
+
+/// Model defaults apply under the request's fields; `thought_prefix` seeds the trace when
+/// thinking is on (only its seed text after a tool result) and the split reads the seeded trace
+/// as reasoning, on both response paths.
+#[tokio::test]
+async fn chat_defaults_seed_the_trace_under_request_fields() {
+    let h = harness_for("gemma4-12b");
+    h.bundle
+        .serving()
+        .chat
+        .set(crate::serve::config::ChatDefaults {
+            max_tokens: Some(6),
+            thought_prefix: Some("<|channel>thought\nThe caller just said".into()),
+            chat_template_kwargs: Some(
+                [("enable_thinking".to_string(), json!(true))]
+                    .into_iter()
+                    .collect(),
+            ),
+            ..Default::default()
+        })
+        .unwrap();
+    let pieces = toks(" \"hi\".<channel|>Aap kaun?");
+    let pieces: Vec<&str> = pieces.iter().map(String::as_str).collect();
+    h.reply(&pieces);
+    let (code, v) = h
+        .json(json!({"messages": user("hi"), "max_tokens": 64}))
+        .await;
+    assert_eq!(code, StatusCode::OK, "{v}");
+    assert!(
+        h.last_prompt()
+            .ends_with("<|turn>model\n<|channel>thought\nThe caller just said"),
+        "{}",
+        h.last_prompt()
+    );
+    let m = &v["choices"][0]["message"];
+    assert_eq!(
+        (m["content"].as_str(), m["reasoning"].as_str()),
+        (Some("Aap kaun?"), Some("\"hi\"."))
+    );
+    let (frames, _) = h
+        .sse(json!({"messages": user("hi"), "max_tokens": 64}))
+        .await;
+    let (content, reasoning, _, _) = accumulate(&frames);
+    assert_eq!(
+        (content.as_str(), reasoning.as_str()),
+        ("Aap kaun?", "\"hi\".")
+    );
+    // the default `max_tokens` applies when the request names none
+    let (_, v) = h.json(json!({"messages": user("hi")})).await;
+    assert_eq!(v["choices"][0]["finish_reason"], "length");
+    // thinking off: no seed
+    h.reply(&["Hi."]);
+    let (_, _) = h
+        .json(json!({"messages": user("hi"), "chat_template_kwargs": {"enable_thinking": false}}))
+        .await;
+    assert!(
+        h.last_prompt().ends_with("<|channel>thought\n<channel|>"),
+        "{}",
+        h.last_prompt()
+    );
+    // after a tool result the template opened the channel: only the seed text follows
+    let convo = json!([
+        {"role": "user", "content": "Weather in Paris?"},
+        {"role": "assistant", "content": null, "tool_calls": [
+            {"id": "call_1", "type": "function", "function": {"name": "get_weather", "arguments": "{\"city\": \"Paris\"}"}}]},
+        {"role": "tool", "tool_call_id": "call_1", "content": "{\"temp\": 18}"}
+    ]);
+    h.reply(&["18.", "<channel|>", "It is 18."]);
+    let (code, v) = h.json(json!({"messages": convo, "tools": tools()})).await;
+    assert_eq!(code, StatusCode::OK, "{v}");
+    let p = h.last_prompt();
+    assert!(
+        p.ends_with("<|channel>thought\nThe caller just said") && !p.contains("thought\n\nThe"),
+        "{p}"
+    );
+    assert_eq!(v["choices"][0]["message"]["content"], "It is 18.");
+}
+
+/// The voice guard moves planning lines out of `content` identically on both paths, reports it
+/// in `x_plow_thinking`, answers an empty turn with the caller's fallback line, and counts both.
+#[tokio::test]
+async fn the_voice_guard_moves_planning_lines_on_both_paths() {
+    let h = harness_for("gemma4-12b");
+    h.bundle
+        .serving()
+        .chat
+        .set(crate::serve::config::ChatDefaults {
+            reply_guard: Some(crate::serve::reply_guard::GuardMode::Voice),
+            reply_guard_lines: Some(crate::serve::reply_guard::GuardLines {
+                wait: [("hi".to_string(), "एक सेकंड, कृपया।".to_string())].into(),
+                goodbye: Default::default(),
+            }),
+            ..Default::default()
+        })
+        .unwrap();
+    let on = json!({"enable_thinking": true});
+    let pieces =
+        toks("<|channel>thought\nplan<channel|>Wait, the prompt says ask once.\nAap kaun hain?");
+    let pieces: Vec<&str> = pieces.iter().map(String::as_str).collect();
+    h.reply(&pieces);
+    let body = json!({"messages": user("हेलो"), "chat_template_kwargs": on});
+    let (code, v) = h.json(body.clone()).await;
+    assert_eq!(code, StatusCode::OK, "{v}");
+    let c = &v["choices"][0];
+    assert_eq!(c["message"]["content"], "Aap kaun hain?");
+    assert_eq!(
+        c["message"]["reasoning"],
+        "plan\nWait, the prompt says ask once."
+    );
+    assert_eq!(c["x_plow_thinking"]["guard_moved"], true);
+    let (frames, _) = h.sse(body.clone()).await;
+    let (content, reasoning, _, _) = accumulate(&frames);
+    assert_eq!(
+        (content.as_str(), reasoning.as_str()),
+        ("Aap kaun hain?", "plan\nWait, the prompt says ask once.")
+    );
+    // nothing left to say: the caller's fallback line
+    let pieces = toks("<|channel>thought\nplan<channel|>None.\n");
+    let pieces: Vec<&str> = pieces.iter().map(String::as_str).collect();
+    h.reply(&pieces);
+    let (_, v) = h.json(body.clone()).await;
+    assert_eq!(v["choices"][0]["message"]["content"], "एक सेकंड, कृपया।");
+    let (frames, _) = h.sse(body).await;
+    assert_eq!(accumulate(&frames).0, "एक सेकंड, कृपया।");
+    let req = Request::get("/metrics").body(Body::empty()).unwrap();
+    let resp = h.app.clone().oneshot(req).await.unwrap();
+    let text = String::from_utf8(
+        resp.into_body()
+            .collect()
+            .await
+            .unwrap()
+            .to_bytes()
+            .to_vec(),
+    )
+    .unwrap();
+    let l = "{model_name=\"toolm\",engine=\"0\"}";
+    assert!(
+        text.contains(&format!("plowrt_reply_guard_moved_total{l} 4\n")),
+        "{text}"
+    );
+    assert!(text.contains(&format!("plowrt_reply_guard_answer_reasoning_total{l} 0\n")));
+    assert!(text.contains(
+        "plowrt_reply_guard_fallback_total{model_name=\"toolm\",engine=\"0\",kind=\"wait\"} 2\n"
+    ));
+}
+
+/// `POST /v1/requests/{id}/reasoning_end` reaches a registered live request and 404s otherwise.
+#[tokio::test]
+async fn live_reasoning_end_finds_only_requests_in_flight() {
+    let h = harness();
+    let flag = crate::serve::think::live_register(&std::sync::Arc::from("req-http-live"));
+    let (code, v) = h
+        .post_to("/v1/requests/req-http-live/reasoning_end", "")
+        .await;
+    assert_eq!(code, StatusCode::OK, "{v}");
+    assert!(flag.load(std::sync::atomic::Ordering::Relaxed));
+    drop(flag);
+    let (code, v) = h
+        .post_to("/v1/requests/req-http-live/reasoning_end", "")
+        .await;
+    assert_eq!(code, StatusCode::NOT_FOUND, "{v}");
+    assert_eq!(v["error"]["code"], "request_not_found");
+}
+
+/// `reply_regenerate`: a guarded turn left silent is generated once more from its own trace,
+/// closed, and that reply is the answer; the fallback line only when it is silent too.
+#[tokio::test]
+async fn a_silent_guarded_turn_is_regenerated_from_its_trace() {
+    let h = harness_for("gemma4-12b");
+    h.bundle
+        .serving()
+        .chat
+        .set(crate::serve::config::ChatDefaults {
+            reply_guard: Some(crate::serve::reply_guard::GuardMode::Voice),
+            reply_regenerate: true,
+            reply_guard_lines: Some(crate::serve::reply_guard::GuardLines {
+                wait: [("hi".to_string(), "एक सेकंड।".to_string())].into(),
+                goodbye: Default::default(),
+            }),
+            chat_template_kwargs: Some(
+                [("enable_thinking".to_string(), json!(true))]
+                    .into_iter()
+                    .collect(),
+            ),
+            ..Default::default()
+        })
+        .unwrap();
+    let silent: Vec<String> = toks("<|channel>thought\nplan<channel|>None.\n");
+    let retry = toks("Aap kaun hain?");
+    for stream in [false, true] {
+        {
+            let mut s = h.script.lock().unwrap();
+            s.queue = [silent.clone(), retry.clone()].into();
+        }
+        let body = json!({"messages": user("hi")});
+        let content = if stream {
+            accumulate(&h.sse(body).await.0).0
+        } else {
+            h.json(body).await.1["choices"][0]["message"]["content"]
+                .as_str()
+                .unwrap()
+                .to_string()
+        };
+        assert_eq!(content, "Aap kaun hain?", "stream {stream}");
+        assert!(
+            h.last_prompt()
+                .ends_with("<|turn>model\n<|channel>thought\nplan<channel|>"),
+            "{}",
+            h.last_prompt()
+        );
+    }
+    // silent again: the fallback line
+    {
+        let mut s = h.script.lock().unwrap();
+        s.queue = [silent.clone(), toks("None.")].into();
+    }
+    let (_, v) = h.json(json!({"messages": user("hi")})).await;
+    assert_eq!(v["choices"][0]["message"]["content"], "एक सेकंड।");
+}
+
+/// The response carries what OpenAI, vLLM and llama.cpp clients each read: the trace under
+/// `reasoning` and `reasoning_content`, `system_fingerprint` on the body and every chunk, `logprobs`
+/// and `refusal` as `null`; llama.cpp's request names are accepted.
+#[tokio::test]
+async fn responses_carry_the_fields_openai_vllm_and_llamacpp_clients_read() {
+    let h = harness_for("qwen3");
+    let pieces = toks("<think>plan</think>Four.");
+    let pieces: Vec<&str> = pieces.iter().map(String::as_str).collect();
+    h.reply(&pieces);
+    let (code, v) = h.json(json!({"messages": user("2+2?")})).await;
+    assert_eq!(code, StatusCode::OK, "{v}");
+    let c = &v["choices"][0];
+    assert_eq!(
+        (
+            c["message"]["reasoning"].as_str(),
+            c["message"]["reasoning_content"].as_str()
+        ),
+        (Some("plan"), Some("plan"))
+    );
+    assert_eq!(c["message"]["content"], "Four.");
+    assert!(c["message"]["refusal"].is_null() && c["message"].get("refusal").is_some());
+    assert!(c["logprobs"].is_null() && c.get("logprobs").is_some());
+    assert_eq!(
+        v["system_fingerprint"],
+        crate::serve::openai::SYSTEM_FINGERPRINT
+    );
+    let (frames, _) = h.sse(json!({"messages": user("2+2?")})).await;
+    assert!(frames
+        .iter()
+        .all(|f| f["system_fingerprint"] == crate::serve::openai::SYSTEM_FINGERPRINT));
+    let both: String = frames
+        .iter()
+        .filter_map(|f| f["choices"][0]["delta"]["reasoning_content"].as_str())
+        .collect();
+    let (_, reasoning, _, _) = accumulate(&frames);
+    assert_eq!((reasoning.as_str(), both.as_str()), ("plan", "plan"));
+    // include_reasoning: false drops both names
+    let (_, v) = h
+        .json(json!({"messages": user("2+2?"), "include_reasoning": false}))
+        .await;
+    let m = &v["choices"][0]["message"];
+    assert!(m.get("reasoning").is_none() && m.get("reasoning_content").is_none());
+    // llama.cpp: the trace left in `content`
+    let (_, v) = h
+        .json(json!({"messages": user("2+2?"), "reasoning_format": "none"}))
+        .await;
+    assert_eq!(
+        v["choices"][0]["message"]["content"],
+        "<think>plan</think>Four."
+    );
+    let (code, v) = h
+        .json(json!({"messages": user("2+2?"), "reasoning_format": "deepseek-legacy"}))
+        .await;
+    assert_eq!(
+        (code, v["error"]["param"].as_str()),
+        (StatusCode::BAD_REQUEST, Some("reasoning_format"))
+    );
+    // llama.cpp's budget names are `thinking_token_budget`
+    for name in ["reasoning_budget_tokens", "thinking_budget_tokens"] {
+        let (code, v) = h.json(json!({"messages": user("2+2?"), name: -2})).await;
+        assert_eq!(
+            (code, v["error"]["param"].as_str()),
+            (StatusCode::BAD_REQUEST, Some("thinking_token_budget")),
+            "{name}"
+        );
+    }
+}
+
+/// The thinking budget, the reply cap and `max_tokens` are separate budgets; a thinking budget
+/// that leaves the reply no room inside `max_tokens` is refused rather than ending every turn
+/// inside its trace.
+#[cfg(feature = "hf-tokenizer")]
+#[tokio::test]
+async fn a_thinking_budget_must_leave_room_for_the_reply() {
+    let h = harness_for("gemma4-12b");
+    h.reply(&["Four."]);
+    let on = json!({"enable_thinking": true});
+    let ask = |extra: Value| {
+        let mut b = json!({"messages": user("2+2?"), "chat_template_kwargs": on});
+        b.as_object_mut()
+            .unwrap()
+            .extend(extra.as_object().unwrap().clone());
+        b
+    };
+    for extra in [
+        json!({"thinking_token_budget": 300, "max_tokens": 128}),
+        json!({"thinking_token_budget": 100, "max_tokens": 128, "max_reply_tokens": 60}),
+    ] {
+        let (code, v) = h.json(ask(extra.clone())).await;
+        assert_eq!(code, StatusCode::BAD_REQUEST, "{extra}: {v}");
+        assert_eq!(v["error"]["param"], "thinking_token_budget");
+        assert!(v["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("max_tokens"));
+    }
+    // `reasoning_end: ""`: the bare marker (this fixture's tokenizer spells the default bridge byte by byte)
+    for extra in [
+        json!({"thinking_token_budget": 64, "max_tokens": 128, "reasoning_end": ""}),
+        json!({"thinking_token_budget": 32, "max_tokens": 128, "max_reply_tokens": 60, "reasoning_end": ""}),
+    ] {
+        let (code, v) = h.json(ask(extra.clone())).await;
+        assert_eq!(code, StatusCode::OK, "{extra}: {v}");
+    }
+}
+
+/// Server-wide defaults from vLLM / llama.cpp flag names reach every model, a model's file entry
+/// wins over them, `--reasoning-parser` is checked against the template, and `--chat-template`
+/// replaces the packet's template.
+#[tokio::test]
+async fn engine_flags_install_as_defaults_under_the_file_and_the_request() {
+    use crate::serve::config::{
+        install_chat_defaults, ChatDefaults, GenerationDefaults, ServerReasoning,
+    };
+    let h = harness_for("qwen3");
+    let models = vec![("toolm".to_string(), Arc::clone(&h.bundle))];
+    let resolve = |n: &str| (n == "toolm").then(|| ("toolm".to_string(), Arc::clone(&h.bundle)));
+    // a parser that splits on other markers is refused; qwen3's and an unlisted one are not
+    let gemma = ServerReasoning {
+        parser: Some("gemma4".into()),
+        ..Default::default()
+    };
+    let err = install_chat_defaults(&gemma, None, &models, resolve).unwrap_err();
+    assert!(
+        err.contains("<|channel>") && err.contains("<think>"),
+        "{err}"
+    );
+    let start = ServerReasoning {
+        start_str: Some("[THINK]".into()),
+        ..Default::default()
+    };
+    assert!(install_chat_defaults(&start, None, &models, resolve).is_err());
+    let server = ServerReasoning {
+        parser: Some("qwen3".into()),
+        defaults: ChatDefaults {
+            reasoning_format: Some("none".into()),
+            include_reasoning: Some(true),
+            generation: Some(GenerationDefaults {
+                max_new_tokens: Some(3),
+                ..Default::default()
+            }),
+            ..Default::default()
+        },
+        chat_template: Some("{% for m in messages %}<<{{ m.content }}>>{% endfor %}".into()),
+        ..Default::default()
+    };
+    let dir = std::env::temp_dir().join(format!("plowrt-engine-flags-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let file = dir.join("defaults.json");
+    std::fs::write(&file, r#"{"toolm": {"reasoning_format": "auto"}}"#).unwrap();
+    install_chat_defaults(&server, Some(&file), &models, resolve).unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+    let pieces = toks("<think>plan</think>Four.");
+    let pieces: Vec<&str> = pieces.iter().map(String::as_str).collect();
+    h.reply(&pieces);
+    let (code, v) = h.json(json!({"messages": user("2+2?")})).await;
+    assert_eq!(code, StatusCode::OK, "{v}");
+    assert_eq!(h.last_prompt(), "<<2+2?>>", "--chat-template");
+    let c = &v["choices"][0];
+    // the file's `auto` beat the server's `none`: the trace is split
+    assert_eq!(
+        (
+            c["message"]["reasoning"].as_str(),
+            c["message"]["content"].as_str()
+        ),
+        (Some("plan"), Some("Four."))
+    );
+    // max_new_tokens 3 is the default max_tokens (the scripted reply is longer)
+    assert_eq!(c["finish_reason"], "length");
+    // the request still overrides both
+    let (_, v) = h
+        .json(json!({"messages": user("2+2?"), "max_tokens": 64, "reasoning_format": "none"}))
+        .await;
+    assert_eq!(v["choices"][0]["finish_reason"], "stop");
+    assert_eq!(
+        v["choices"][0]["message"]["content"],
+        "<think>plan</think>Four."
+    );
+}
+
+#[cfg(feature = "hf-tokenizer")]
+fn harness_for_real_checkpoint(ckpt: &std::path::Path) -> Harness {
+    static SEQ: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    let n = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let dir = std::env::temp_dir().join(format!("plowrt-tool-real-{}-{n}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    if ckpt.join("chat_template.jinja").exists() {
+        std::fs::copy(
+            ckpt.join("chat_template.jinja"),
+            dir.join("chat_template.jinja"),
+        )
+        .unwrap();
+    }
+    if ckpt.join("tokenizer_config.json").exists() {
+        std::fs::copy(
+            ckpt.join("tokenizer_config.json"),
+            dir.join("tokenizer_config.json"),
+        )
+        .unwrap();
+    }
+    if ckpt.join("tokenizer.json").exists() {
+        #[cfg(unix)]
+        let _ = std::os::unix::fs::symlink(ckpt.join("tokenizer.json"), dir.join("tokenizer.json"));
+        #[cfg(not(unix))]
+        let _ = std::fs::copy(ckpt.join("tokenizer.json"), dir.join("tokenizer.json"));
+    }
+    std::fs::write(
+        dir.join("weights.json"),
+        r#"{"network":"toolm","gpu":"cpu","num_gpus":1,"parallel":"none","weight_shared":false,"buckets":[]}"#,
+    )
+    .unwrap();
+    let backend: Arc<dyn crate::device::Backend> = Arc::new(crate::device::cpu::CpuBackend::new(1));
+    let registry = crate::orch::Registry::new();
+    let slug = registry.load(&dir, None).unwrap();
+    let bundle = registry.get(&slug).unwrap();
+    let state = Arc::new(AppState::new(
+        registry,
+        Arc::new(crate::exec::ExecutorSet::bringup(backend).unwrap()),
+    ));
+    state.scripted.write().push(slug.clone());
+    let model = Arc::clone(&bundle);
+    let script = Arc::new(Mutex::new(Script::default()));
+    let s = Arc::clone(&script);
+    state.install_mux(
+        slug,
+        crate::serve::mux::scripted_mux(move |job| {
+            let mut text = String::new();
+            bundle
+                .tokenizer()
+                .decode_append(&job.prompt_ids, true, &mut text);
+            let mut s = s.lock().unwrap();
+            s.prompts.push(text);
+            s.queue.pop_front().unwrap_or_else(|| s.reply.clone())
+        }),
+    );
+    Harness {
+        app: app(state),
+        bundle: model,
+        script,
+        _dir: TempDir(dir),
+    }
+}
+
+/// Real Gemma-4-E2B checkpoint end-to-end on this host: template, real 32MB tokenizer,
+/// thought channel separation (<|channel>thought ... <channel|>), tool calls, and thinking controls.
+#[cfg(feature = "hf-tokenizer")]
+#[tokio::test]
+async fn gemma_4_e2b_real_checkpoint_end_to_end() {
+    let e2b = std::path::Path::new("/Users/lava/models/gemma-4-E2B-it");
+    if !e2b.join("chat_template.jinja").exists() || !e2b.join("tokenizer.json").exists() {
+        eprintln!("skipped: /Users/lava/models/gemma-4-E2B-it not present on this host");
+        return;
+    }
+
+    let h = harness_for_real_checkpoint(e2b);
+
+    // 1. Non-streaming with thought channel
+    h.reply(&[
+        "<|channel>thought\nThinking step-by-step for Gemma 4 E2B.<channel|>",
+        "The answer is 42.",
+    ]);
+    let (code, v) = h
+        .json(json!({"messages": user("What is the meaning of life?")}))
+        .await;
+    assert_eq!(code, StatusCode::OK, "{v}");
+    let c = &v["choices"][0];
+    assert_eq!(c["finish_reason"], "stop");
+    assert_eq!(
+        c["message"]["reasoning_content"].as_str(),
+        Some("Thinking step-by-step for Gemma 4 E2B.")
+    );
+    assert_eq!(c["message"]["content"].as_str(), Some("The answer is 42."));
+
+    // 2. Streaming SSE with thought channel
+    h.reply(&[
+        "<|channel>thought\nStreamed reasoning chunk.<channel|>",
+        "Streamed answer.",
+    ]);
+    let (frames, done) = h
+        .sse(json!({"messages": user("What is the meaning of life?")}))
+        .await;
+    assert!(done, "SSE stream completed with [DONE]");
+    let (content, reasoning, calls, finish) = accumulate(&frames);
+    assert_eq!(reasoning, "Streamed reasoning chunk.");
+    assert_eq!(content, "Streamed answer.");
+    assert_eq!(finish.as_deref(), Some("stop"));
+    assert_eq!(calls.len(), 0);
+
+    // 3. Tool calling alongside thought channel in Gemma-4 format
+    h.reply(&[
+        "<|channel>thought\nLooking up Oslo weather.<channel|>",
+        "<|tool_call>call:get_weather{city:<|\"|>Oslo<|\"|>,days:3}<tool_call|>",
+    ]);
+    let (code, v) = h
+        .json(json!({"messages": user("Weather in Oslo?"), "tools": tools()}))
+        .await;
+    assert_eq!(code, StatusCode::OK, "{v}");
+    let msg = &v["choices"][0]["message"];
+    assert_eq!(
+        msg["reasoning_content"].as_str(),
+        Some("Looking up Oslo weather.")
+    );
+    let tool_calls = msg["tool_calls"].as_array().expect("tool_calls");
+    assert_eq!(tool_calls.len(), 1);
+    assert_eq!(tool_calls[0]["function"]["name"], "get_weather");
+    assert!(tool_calls[0]["function"]["arguments"]
+        .as_str()
+        .unwrap()
+        .contains("Oslo"));
+
+    // 4. Thinking control fields on real E2B
+    let (code, v) = h
+        .json(json!({
+            "messages": user("hello"),
+            "thinking_token_budget": 32,
+            "max_reply_tokens": 16,
+            "reasoning_end": "Done thinking.<channel|>"
+        }))
+        .await;
+    assert_eq!(code, StatusCode::OK, "{v}");
+}
+
+/// Reasoning trace separation and thinking control across DeepSeek, GLM, Qwen, and Kimi families.
+#[tokio::test]
+async fn reasoning_stack_across_model_families() {
+    // A. DeepSeek-R1: <think> ... </think> separation
+    let h_ds = harness_for("deepseek-r1-tools");
+    h_ds.reply(&[
+        "<think>",
+        "DeepSeek reasoning trace.",
+        "</think>",
+        "DeepSeek final answer.",
+    ]);
+    let (code, v) = h_ds
+        .json(json!({"messages": user("Solve this problem")}))
+        .await;
+    assert_eq!(code, StatusCode::OK, "{v}");
+    let msg = &v["choices"][0]["message"];
+    assert_eq!(
+        msg["reasoning_content"].as_str(),
+        Some("DeepSeek reasoning trace.")
+    );
+    assert_eq!(msg["content"].as_str(), Some("DeepSeek final answer."));
+
+    // DeepSeek SSE streaming separation
+    let (frames, done) = h_ds
+        .sse(json!({"messages": user("Solve this problem")}))
+        .await;
+    assert!(done);
+    let (content, reasoning, _, finish) = accumulate(&frames);
+    assert_eq!(reasoning, "DeepSeek reasoning trace.");
+    assert_eq!(content, "DeepSeek final answer.");
+    assert_eq!(finish.as_deref(), Some("stop"));
+
+    // B. GLM-5.3: prompt already ends with <think>, so generation continues the trace
+    let h_glm = harness_for("glm5.3");
+    h_glm.reply(&[
+        "GLM-5.3 deliberation.",
+        "</think>",
+        "GLM-5.3 response.",
+    ]);
+    let (code, v) = h_glm
+        .json(json!({
+            "messages": user("Hello"),
+            "chat_template_kwargs": {"enable_thinking": true}
+        }))
+        .await;
+    assert_eq!(code, StatusCode::OK, "{v}");
+    let msg = &v["choices"][0]["message"];
+    assert_eq!(
+        msg["reasoning_content"].as_str(),
+        Some("GLM-5.3 deliberation.")
+    );
+    assert_eq!(msg["content"].as_str(), Some("GLM-5.3 response."));
+
+    // C. Qwen3: enable_thinking switch and <think> separation
+    let h_qwen = harness_for("qwen3");
+    h_qwen.reply(&[
+        "<think>",
+        "Qwen3 planning.",
+        "</think>",
+        "Qwen3 answer.",
+    ]);
+    let (code, v) = h_qwen
+        .json(json!({
+            "messages": user("Explain quantum computing"),
+            "chat_template_kwargs": {"enable_thinking": true}
+        }))
+        .await;
+    assert_eq!(code, StatusCode::OK, "{v}");
+    let msg = &v["choices"][0]["message"];
+    assert_eq!(msg["reasoning_content"].as_str(), Some("Qwen3 planning."));
+    assert_eq!(msg["content"].as_str(), Some("Qwen3 answer."));
+
+    // D. Kimi-K2: tool calls
+    let h_kimi = harness_for("kimi-k2");
+    h_kimi.reply(&[
+        "<|tool_calls_section_begin|><|tool_call_begin|>functions.get_weather:0<|tool_call_argument_begin|>{\"city\": \"Tokyo\"}<|tool_call_end|><|tool_calls_section_end|>",
+    ]);
+    let (code, v) = h_kimi
+        .json(json!({"messages": user("Weather in Tokyo?"), "tools": tools()}))
+        .await;
+    assert_eq!(code, StatusCode::OK, "{v}");
+    let msg = &v["choices"][0]["message"];
+    let calls = msg["tool_calls"].as_array().expect("kimi tool_calls");
+    assert_eq!(calls.len(), 1);
+    assert_eq!(calls[0]["function"]["name"], "get_weather");
+    assert!(calls[0]["function"]["arguments"]
+        .as_str()
+        .unwrap()
+        .contains("Tokyo"));
 }
