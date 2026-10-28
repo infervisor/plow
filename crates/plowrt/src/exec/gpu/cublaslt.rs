@@ -376,6 +376,8 @@ pub(super) struct LightFunctions {
     pub(super) prefill: Option<KernelFn>,
     /// `plow_light_pf_qwen_conv`: `light_pf` also runs the Qwen decode conv step.
     pub(super) prefill_conv: bool,
+    /// `plow_<arch>_light_qnorm`: a routed decode rung's QwenRmsNorm, register-resident rows.
+    pub(super) qwen_norm: Option<KernelFn>,
 }
 
 /// `FA_ST_THREADS`: eight row-group warps and the producer warp.
@@ -439,6 +441,10 @@ pub(super) fn light_functions(
         .get_function(module, &format!("plow_{arch}_light_pf"))
         .ok()
         .filter(|_| crate::config::RuntimeConfig::get().nv.prefill_light);
+    let qwen_norm = prefill.and_then(|_| {
+        be.get_function(module, &format!("plow_{arch}_light_qnorm"))
+            .ok()
+    });
     let prefill_conv = prefill.is_some()
         && be
             .module_global_u32(module, "plow_light_pf_qwen_conv")?
@@ -477,6 +483,7 @@ pub(super) fn light_functions(
         flash,
         prefill,
         prefill_conv,
+        qwen_norm,
     }))
 }
 
@@ -853,10 +860,12 @@ pub(super) fn qwen_light_instructions(light: &[(usize, Vec<usize>)]) -> Vec<(usi
         .collect()
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(super) fn add_qwen_light_routes(
     routes: &mut Vec<Option<LibraryRoute>>,
     be: &Arc<CudaBackend>,
     function: KernelFn,
+    norm: Option<KernelFn>,
     kernarg: DevProgram,
     g: &DevProg,
     light: &[(usize, Vec<usize>)],
@@ -866,9 +875,23 @@ pub(super) fn add_qwen_light_routes(
         if routes.len() <= *seg {
             routes.resize_with(seg + 1, || None);
         }
-        routes[*seg] = Some(LibraryRoute::Light(qwen_light_route(
-            be, function, kernarg, g, insts, grid,
-        )));
+        let mut route = qwen_light_route(be, function, kernarg, g, insts, grid);
+        if let Some(norm) = norm {
+            for launch in &mut route.launches {
+                let d = &g.insts[launch.instruction as usize];
+                // One block per row (i1 = rows): the body takes the block-per-row walk at any
+                // grid >= rows, and the 528-block light grid paid four waves of empty blocks.
+                // i0 = width; the register-resident walk covers 32 elements per thread.
+                if d.op == DevOp::QwenRmsNorm as u16
+                    && (1..=grid).contains(&d.i[1])
+                    && d.i[0] <= 32 * BLOCK
+                {
+                    launch.function = norm;
+                    launch.blocks = d.i[1];
+                }
+            }
+        }
+        routes[*seg] = Some(LibraryRoute::Light(route));
     }
 }
 
