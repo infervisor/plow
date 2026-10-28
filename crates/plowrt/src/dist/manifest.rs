@@ -410,16 +410,18 @@ pub fn read_recipe(path: &Path, over: Overrides<'_>) -> Result<Identity> {
         None => derived.to_string(),
     };
 
-    let toolchain = over
-        .toolchain
-        .map(str::to_string)
-        .or(t.toolchain)
-        .ok_or_else(|| {
-            bad(at(
+    // A runtime-compiled target (Apple) ships no objset, so nothing records a
+    // compiler: the shaders are built on the serving machine.
+    let toolchain = match over.toolchain.map(str::to_string).or(t.toolchain) {
+        Some(v) => v,
+        None if runtime_compiled(&vendor) => String::new(),
+        None => {
+            return Err(bad(at(
                 "[target] has no `toolchain`: the objset records the compiler its objects were \
                  built with, and the recipe checker verifies it",
-            ))
-        })?;
+            )))
+        }
+    };
 
     let max_ctx = t
         .max_ctx
