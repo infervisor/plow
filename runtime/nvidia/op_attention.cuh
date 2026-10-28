@@ -1035,11 +1035,41 @@ extern "C" __global__ void plow_kv_pages_init(unsigned which, unsigned n_slots, 
         t[i] = ps * kvh * stride + pj * (unsigned)PLOW_NV_KV_PAGED;
     }
 }
-#define FA_KVROW(r) ((size_t)pg[(r) / (unsigned)PLOW_NV_KV_PAGED] + ((r) % (unsigned)PLOW_NV_KV_PAGED))
+#ifndef PLOW_NV_KV_PAGED_REG
+#define PLOW_NV_KV_PAGED_REG 0
+#endif
+#if PLOW_NV_KV_PAGED_REG
+/* The item's page ids are loaded with its query: lane l holds the ids of the item's pages l and
+ * l + 32 (pid0, pid1), and a row reads its page's id from the owning lane (warp-uniform calls). */
+__device__ __forceinline__ unsigned fa_pg_row(unsigned rl, unsigned pid0, unsigned pid1, unsigned plo, bool wide) {
+    const unsigned q = rl / (unsigned)PLOW_NV_KV_PAGED - plo;
+    unsigned id = __shfl_sync(0xffffffffu, pid0, q & 31u);
+    if (wide) {
+        const unsigned id1 = __shfl_sync(0xffffffffu, pid1, q & 31u);
+        id = q < 32u ? id : id1;
+    }
+    return id;
+}
+#define FA_KVROWL(rl) ((size_t)fa_pg_row((rl), pid0, pid1, plo, pwide) + ((rl) % (unsigned)PLOW_NV_KV_PAGED))
+#define FA_PG_PARAM , unsigned pid0, unsigned pid1, unsigned plo, bool pwide
+#define FA_PG_ARG , pid0, pid1, plo, pwide
+/* The ids of pages plo + lane and plo + 32 + lane of the item [lo, hi) (clamped to its last page;
+ * ring pages wrap under kv_mask). Items longer than 64 pages are not covered by the gate. */
+#define FA_PG_LOAD(pg, lo, hi, kv_mask)                                                              \
+    const unsigned plo = (lo) / (unsigned)PLOW_NV_KV_PAGED;                                         \
+    const unsigned plast = (hi) > (lo) ? ((hi) - 1u) / (unsigned)PLOW_NV_KV_PAGED : plo;            \
+    if (plast - plo >= 64u) __trap();                                                               \
+    const bool pwide = plast - plo >= 32u;                                                          \
+    const unsigned pid0 = (pg)[((min(plo + (threadIdx.x & 31u), plast) * (unsigned)PLOW_NV_KV_PAGED) & (kv_mask)) / (unsigned)PLOW_NV_KV_PAGED]; \
+    const unsigned pid1 = pwide ? (pg)[((min(plo + 32u + (threadIdx.x & 31u), plast) * (unsigned)PLOW_NV_KV_PAGED) & (kv_mask)) / (unsigned)PLOW_NV_KV_PAGED] : 0u;
+#else
+#define FA_KVROWL(rl) ((size_t)pg[((rl) & kv_mask) / (unsigned)PLOW_NV_KV_PAGED] + ((rl) % (unsigned)PLOW_NV_KV_PAGED))
 #define FA_PG_PARAM , const unsigned* __restrict__ pg
 #define FA_PG_ARG , pg
+#define FA_PG_LOAD(pg, lo, hi, kv_mask)
+#endif
 #else
-#define FA_KVROW(r) ((size_t)(r))
+#define FA_KVROWL(rl) ((size_t)((rl) & kv_mask))
 #define FA_PG_PARAM
 #define FA_PG_ARG
 #endif
@@ -1100,13 +1130,15 @@ __device__ __forceinline__ void fa_decode_rg8_item(
 #pragma unroll
             for (unsigned i = 0; i < 2u * KB / 512u; i++) {
                 const unsigned q = (i * 32u + lane) % (KB / 16u), u = q / (D / 16u), col = q % (D / 16u);
-                const unsigned r = min(r0 + NGRP * u, hi - 1u) & kv_mask;
+                const unsigned rl = min(r0 + NGRP * u, hi - 1u);
                 fa_rg8s_cp16(dst + (i * 512u >= KB ? KB : 0u) + u * D + col * 16u,
-                             (i * 512u >= KB ? vb8 : kb8) + FA_KVROW(r) * D + col * 16u);
+                             (i * 512u >= KB ? vb8 : kb8) + FA_KVROWL(rl) * D + col * 16u);
             }
-            if (lane < 2u * U) {
-                const unsigned u = lane % U, r = min(r0 + NGRP * u, hi - 1u) & kv_mask;
-                fa_rg8s_cp4(dst + 2u * KB + lane * 4u, (lane < (unsigned)U ? ksc : vsc) + FA_KVROW(r));
+            {
+                /* Every lane forms its scale row (paged ids come from a full-warp shuffle). */
+                const unsigned u = lane % U;
+                const size_t row = FA_KVROWL(min(r0 + NGRP * u, hi - 1u));
+                if (lane < 2u * U) fa_rg8s_cp4(dst + 2u * KB + lane * 4u, (lane < (unsigned)U ? ksc : vsc) + row);
             }
         }
         fa_cp_commit();
@@ -1157,15 +1189,15 @@ __device__ __forceinline__ void fa_decode_rg8_item(
 #else
 #pragma unroll
         for (int u = 0; u < U; u++) {
-            const unsigned r = min(r0 + NGRP * (unsigned)u, hi - 1u) & kv_mask;
+            const size_t rr = FA_KVROWL(min(r0 + NGRP * (unsigned)u, hi - 1u));
 #pragma unroll
             for (int c = 0; c < (int)NCH; c++) {
-                const size_t off = FA_KVROW(r) * D + c * 256u + lane * 8u;
+                const size_t off = rr * D + c * 256u + lane * 8u;
                 k8[u][c] = *(const uint2*)(kb8 + off);
                 v8[u][c] = *(const uint2*)(vb8 + off);
             }
-            ks[u] = ksc[FA_KVROW(r)];
-            vs[u] = vsc[FA_KVROW(r)];
+            ks[u] = ksc[rr];
+            vs[u] = vsc[rr];
         }
 #endif
         float sc[GF][U];
@@ -2171,6 +2203,7 @@ __device__ void fa_decode_tc16(float* __restrict__ Opart, float* __restrict__ ml
 #if PLOW_NV_KV_PAGED
         const size_t kvo = (size_t)hkv * kv_stride;
         const unsigned* pg = (window ? plow_kv_pages_w : plow_kv_pages_f) + (size_t)slot * (kv_stride / (unsigned)PLOW_NV_KV_PAGED);
+        FA_PG_LOAD(pg, lo, hi, kv_mask)
 #else
         const size_t kvo = ((size_t)slot * n_kv_head + hkv) * (size_t)kv_stride;
 #endif
@@ -2195,8 +2228,8 @@ __device__ void fa_decode_tc16(float* __restrict__ Opart, float* __restrict__ ml
             const unsigned r0 = t0 + 16u * warp;
             float s[2][4] = {};
             if (r0 < hi) {
-                const unsigned char* k0p = kb + FA_KVROW(min(r0 + g, hi - 1u) & kv_mask) * D + 16u * t;
-                const unsigned char* k1p = kb + FA_KVROW(min(r0 + 8u + g, hi - 1u) & kv_mask) * D + 16u * t;
+                const unsigned char* k0p = kb + FA_KVROWL(min(r0 + g, hi - 1u)) * D + 16u * t;
+                const unsigned char* k1p = kb + FA_KVROWL(min(r0 + 8u + g, hi - 1u)) * D + 16u * t;
 #pragma unroll
                 for (unsigned c0 = 0; c0 < NCH; c0 += 4) {
                     uint4 k0[4], k1[4];
@@ -2230,9 +2263,9 @@ __device__ void fa_decode_tc16(float* __restrict__ Opart, float* __restrict__ ml
 #pragma unroll
                 for (int e = 0; e < 2; e++) {
                     const unsigned row = r0 + 8u * j + 2u * t + e;
-                    const unsigned rr = min(row, hi - 1u) & kv_mask;
-                    const float ks = ksc[FA_KVROW(rr)];
-                    vs[j][e] = vsc[FA_KVROW(rr)];
+                    const size_t rr = FA_KVROWL(min(row, hi - 1u));
+                    const float ks = ksc[rr];
+                    vs[j][e] = vsc[rr];
                     const bool live = row < hi;
                     s[j][e] = live ? s[j][e] * qscale * ks : FA_NEG_INF;
                     s[j][e + 2] = live ? s[j][e + 2] * qscale * ks : FA_NEG_INF;
@@ -2305,7 +2338,7 @@ __device__ void fa_decode_tc16(float* __restrict__ Opart, float* __restrict__ ml
 #pragma unroll
                 for (int q = 0; q < 4; q++) {
                     const unsigned row = rb + (unsigned)(q & 1) + 8u * (unsigned)(q >> 1);
-                    vr[q] = __ldcs((const uint2*)(vcol + FA_KVROW(min(row, hi - 1u) & kv_mask) * D));
+                    vr[q] = __ldcs((const uint2*)(vcol + FA_KVROWL(min(row, hi - 1u)) * D));
                 }
                 unsigned ah[4], al[4];
                 fa_ldmatrix_x4(ah, ph + (lane & 15u) * PS + 16u * kk + (lane >> 4) * 8u);
@@ -2522,6 +2555,7 @@ __device__ __forceinline__ void d_flash_decode_body(float* __restrict__ Opart, f
         /* Paged: the bases carry the head only; FA_KVROW adds the page's row base. */
         const size_t kv_row0 = (size_t)hkv * kv_stride;
         const unsigned* pg = (window ? plow_kv_pages_w : plow_kv_pages_f) + (size_t)slot * (kv_stride / (unsigned)PLOW_NV_KV_PAGED);
+        FA_PG_LOAD(pg, lo, hi, kv_mask)
 #else
         const size_t kv_row0 = (kv_batch * n_kv_head + hkv) * (size_t)kv_stride;
 #endif
