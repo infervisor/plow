@@ -1336,6 +1336,11 @@ pub trait SnapBlocks: Send + Sync {
     fn pending_spill_bytes(&self) -> u64;
     /// Device pressure: drop released blocks and give empty slabs back; bytes released.
     fn shrink(&self, bytes: u64) -> u64;
+    /// Boundaries carry recurrent state: one is publishable only while its slot's prefill stands
+    /// exactly at it.
+    fn captures_state(&self) -> bool {
+        false
+    }
 }
 
 impl SnapStore {
@@ -3061,6 +3066,10 @@ impl VmmKv {
             }
         }
         inner.cache.release(&hashes, m.blocks);
+        let state = inner
+            .block_store
+            .as_ref()
+            .is_some_and(|h| h.captures_state());
         let mut best: Option<(usize, u32, bool)> = None;
         for (owner, other) in inner.seqs.iter().enumerate() {
             if owner == seq || !inner.prefilling[owner] {
@@ -3079,7 +3088,11 @@ impl VmmKv {
                 .prompt_rows
                 .saturating_sub(lookback as usize)
                 .div_ceil(br);
-            let block_rows = if shared >= reachable {
+            // A recurrent model's owner captures a checkpoint only at a chunk end it has not
+            // passed yet (`state_capture_cut`).
+            let block_rows = if shared >= reachable
+                && !(state && shared * br <= frontier.get(owner).copied().unwrap_or(0) as usize)
+            {
                 (shared * br) as u32
             } else {
                 0
@@ -8643,6 +8656,32 @@ mod tests {
         let st = p.stats();
         assert_eq!((st.host_snapshots, st.snapshots_live), (2, 2));
         assert_eq!(p.cached_rows(&a), 16);
+        policy::check_tree(&p.shared.inner.lock());
+    }
+
+    /// With every store boundary on the host, device pressure has nothing to take: the radix
+    /// leaf fallback must not drop host-resident boundaries (it freed no device bytes and emptied
+    /// the host tier, one leaf per retry of a refused publish).
+    #[test]
+    fn reclaim_never_drops_host_resident_store_boundaries() {
+        let ops = Arc::new(MockVmm::default());
+        let p = pool(ops.clone());
+        p.enable_block_store(Arc::new(SpillBlocks), true);
+        for (i, base) in [0u32, 500].into_iter().enumerate() {
+            let t: Vec<u32> = (base..base + 17).collect();
+            p.try_attach(0, &t).unwrap();
+            p.ensure_rows(0, 17).unwrap();
+            p.publish_blocks(0, &t, 16, Kind::PROMPT_END, || Ok((7 + i as u64, 100)))
+                .unwrap();
+            p.begin_seq(0);
+        }
+        assert!(p.reclaim_one());
+        assert!(p.reclaim_one());
+        assert_eq!(p.stats().host_snapshots, 2);
+        assert!(!p.reclaim_one(), "nothing on the device");
+        let st = p.stats();
+        assert_eq!((st.snapshots_live, st.nodes_evicted), (2, 0));
+        assert_eq!(p.cached_rows(&(500..517).collect::<Vec<u32>>()), 16);
         policy::check_tree(&p.shared.inner.lock());
     }
 

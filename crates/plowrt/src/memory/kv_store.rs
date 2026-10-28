@@ -1386,6 +1386,29 @@ impl KvStore {
         }
     }
 
+    /// Wait up to `limit` for the oldest queued spill to land and retire it: `true` = a spill
+    /// retired (its device slot is free). A publish refused for want of a device slot calls
+    /// this before asking the pool for another victim: each victim's spill lands
+    /// asynchronously, and without the wait the retry loop spilled every device boundary in
+    /// turn and then took host-resident ones.
+    pub fn reap_wait(&self, limit: std::time::Duration) -> bool {
+        let t0 = std::time::Instant::now();
+        loop {
+            let before = self.inner.lock().spilling_bytes;
+            if before == 0 {
+                return false;
+            }
+            self.reap();
+            if self.inner.lock().spilling_bytes < before {
+                return true;
+            }
+            if t0.elapsed() >= limit {
+                return false;
+            }
+            std::thread::sleep(std::time::Duration::from_micros(200));
+        }
+    }
+
     fn reap_restores(&self, inner: &mut Inner) {
         let mut left = inner.restoring.len();
         while left > 0 {
@@ -2283,6 +2306,23 @@ mod tests {
         assert_eq!(ops.htod.load(Ordering::SeqCst), 1);
         let _hold = s.hold(vec![a.id]);
         assert!(!s.spill(&[a.id]), "a held block stays");
+    }
+
+    #[test]
+    fn reap_wait_frees_the_slot_of_a_landed_spill_and_gives_up_on_a_stuck_one() {
+        let (ops, s) = store(32, 64);
+        let mut a = s.acquire(0, key(1)).unwrap();
+        seal(&mut a);
+        s.release(&[a.id]);
+        assert!(!s.reap_wait(std::time::Duration::ZERO), "nothing queued");
+        assert!(s.spill(&[a.id]));
+        ops.pending.store(true, Ordering::SeqCst);
+        assert!(s.acquire(0, key(2)).is_err(), "the spilling block keeps its slot");
+        assert!(!s.reap_wait(std::time::Duration::from_millis(2)), "still in flight");
+        ops.pending.store(false, Ordering::SeqCst);
+        assert!(s.reap_wait(std::time::Duration::from_millis(2)));
+        assert_eq!(s.location(a.id), Some(Location::Host));
+        assert!(s.acquire(0, key(2)).is_ok());
     }
 
     #[test]
