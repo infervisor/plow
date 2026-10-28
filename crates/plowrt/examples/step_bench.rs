@@ -127,6 +127,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut ride_dump = None::<std::path::PathBuf>;
     let mut ride_prefix = 0usize;
     let mut kv_pages: Option<u32> = None;
+    let mut ride_salt = 0u32;
     let (mut dump_names, mut dump_dir) = (None::<String>, None::<String>);
     let mut spec = SpecArgs::default();
     let mut prompt_file = None::<String>;
@@ -207,6 +208,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             // Objects built with PLOW_NV_KV_PAGED (docs/arch/27 P0): fill their page tables
             // (0 identity, 1 reversed, 2 interleaved) before the prompts are prefilled.
             "--kv-pages" => kv_pages = Some(args.next().ok_or("--kv-pages MODE")?.parse()?),
+            "--ride-salt" => ride_salt = args.next().ok_or("--ride-salt N")?.parse()?,
             other => return Err(format!("unknown argument {other}").into()),
         }
     }
@@ -426,6 +428,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             *rows,
             widths,
             ride_prefix,
+            ride_salt,
             ride_dump.as_deref(),
         );
     }
@@ -657,6 +660,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 /// `--ride-dump DIR` also writes both (bf16, `W x vocab`) for cross-run comparison.
 /// `--ride-prefix N`: the prefill slots first hold N prompt tokens (a cached prefix), and every
 /// arm rewinds them to N, so the launch's rows attend to N + their own rows.
+/// `--ride-salt S`: other prefill token ids (a rider's logits must not depend on its launch's
+/// other rows; compare `--ride-dump`s across salts).
 #[cfg(feature = "cuda")]
 fn ride_bench(
     e: &mut plowrt::exec::gpu::GpuEngine,
@@ -666,6 +671,7 @@ fn ride_bench(
     rows: usize,
     widths: &[usize],
     prefix: usize,
+    salt: u32,
     dump: Option<&std::path::Path>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     use plow_asset::token_batch::{Phase, Request, Selection};
@@ -687,7 +693,7 @@ fn ride_bench(
         );
     }
     let prompt: Vec<u32> = (0..2 * chunk as u32)
-        .map(|i| 1000 + (i * 7919) % 50000)
+        .map(|i| 1000 + (i * 7919).wrapping_add(salt.wrapping_mul(104_729)) % 50000)
         .collect();
     let head: Vec<u32> = (0..prefix as u32)
         .map(|i| 2000 + (i * 6007) % 50000)
@@ -765,6 +771,7 @@ fn ride_bench(
             .collect::<Vec<Request<'_>>>()
     };
     let feeds: Vec<(usize, u32)> = last.iter().copied().enumerate().collect();
+    println!("RIDE_INPUTS ids={:?}", &last[..wmax]);
     let (mut output, mut toks, mut logits) = (Vec::new(), Vec::new(), Vec::new());
     let median = |v: &mut Vec<f64>| {
         v.sort_by(f64::total_cmp);

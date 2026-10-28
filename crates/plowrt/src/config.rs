@@ -190,12 +190,6 @@ pub struct RuntimeConfig {
     #[arg(long = "fusion", env = "PLOW_FUSION", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
     pub fusion: bool,
 
-    /// Select unified token batching when the backend, model and object support it.
-    /// Unsupported configurations use ordinary execution; --fusion takes precedence.
-    /// Disable with --token-batch=false or PLOW_TOKEN_BATCH=0.
-    #[arg(long = "token-batch", env = "PLOW_TOKEN_BATCH", hide = true, default_value_t = true, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
-    pub token_batch: bool,
-
     /// Prefix reuse on compatible AMD and NVIDIA assets.
     #[arg(long = "prefix-cache", env = "PLOW_PREFIX_CACHE", default_value_t = true, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
     pub prefix_cache: bool,
@@ -3267,29 +3261,6 @@ mod tests {
     }
 
     #[test]
-    fn token_batch_defaults_on_with_explicit_rollback() {
-        use clap::{Args, FromArgMatches};
-        let command = super::RuntimeConfig::augment_args(clap::Command::new("test"));
-        let arg = command
-            .get_arguments()
-            .find(|arg| arg.get_id() == "token_batch")
-            .unwrap();
-        assert_eq!(arg.get_default_values(), ["true"]);
-        for (flag, enabled) in [("--token-batch", true), ("--token-batch=false", false)] {
-            let matches = command
-                .clone()
-                .try_get_matches_from(["test", flag])
-                .unwrap();
-            assert_eq!(
-                super::RuntimeConfig::from_arg_matches(&matches)
-                    .unwrap()
-                    .token_batch,
-                enabled
-            );
-        }
-    }
-
-    #[test]
     fn fusion_is_an_opt_in_runtime_flag() {
         use clap::{Args, FromArgMatches};
         let command = super::RuntimeConfig::augment_args(clap::Command::new("test"));
@@ -3406,24 +3377,22 @@ mod tests {
     }
 
     #[test]
-    fn shared_prefix_and_token_batch_defaults_allow_independent_rollback() {
+    fn shared_prefix_defaults_on_with_rollback() {
         use clap::{Args, FromArgMatches};
         let command = super::RuntimeConfig::augment_args(clap::Command::new("test"));
-        for field in ["prefix_cache", "token_batch"] {
-            assert_eq!(
-                command
-                    .get_arguments()
-                    .find(|arg| arg.get_id() == field)
-                    .unwrap()
-                    .get_default_values(),
-                ["true"]
-            );
-        }
+        assert_eq!(
+            command
+                .get_arguments()
+                .find(|arg| arg.get_id() == "prefix_cache")
+                .unwrap()
+                .get_default_values(),
+            ["true"]
+        );
         let defaults = super::RuntimeConfig::from_arg_matches(
             &command.clone().try_get_matches_from(["test"]).unwrap(),
         )
         .unwrap();
-        assert!(defaults.prefix_cache && defaults.token_batch);
+        assert!(defaults.prefix_cache);
         assert!(!defaults.fusion && !defaults.pf_defer_decode);
         assert!(!defaults.pf_rotate());
         assert_eq!(defaults.objective, crate::serve::policy::Objective::Auto);
@@ -3448,7 +3417,6 @@ mod tests {
             .unwrap();
         let config = super::RuntimeConfig::from_arg_matches(&matches).unwrap();
         assert!(!config.prefix_cache);
-        assert!(config.token_batch);
         assert_eq!(config.vmm_cache_mib, Some(512));
         // Explicit MiB wins over the percentage, whatever the device size.
         assert_eq!(config.prefix_cache_cap_bytes(192 << 30), 512 << 20);
