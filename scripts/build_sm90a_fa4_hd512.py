@@ -4,7 +4,7 @@
 
   1. scripts/export_fa4_hd512_sm90.py <out>/fa4 {1,2,combine}  (CuTe DSL ->
      fa4_hd512_h16kv{1,2}{,_split}.{h,o} and fa4_hd512_combine.{h,o};
-     needs an interpreter with vLLM 0.29's vllm_flash_attn + cutlass DSL 4.6, e.g. /opt/pytorch
+     needs an interpreter with vLLM's vllm_flash_attn (0.28.0 built) + cutlass DSL 4.6, e.g. /opt/pytorch
      with PYTHONPATH=<site-packages>/nvidia_cutlass_dsl/dsl_packages)
   2. nvcc -shared runtime/nvidia/fa4_hd512.cpp + the objects -> <out>/libplow_fa4_hd512.so
 

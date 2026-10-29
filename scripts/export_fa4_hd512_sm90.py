@@ -1,4 +1,4 @@
-"""AOT-export FlashAttention-4's SM90 forward (vLLM 0.29 vllm_flash_attn CuTe DSL) for Gemma-4
+"""AOT-export FlashAttention-4's SM90 forward (vLLM 0.28 vllm_flash_attn CuTe DSL) for Gemma-4
 global layers without accessing a GPU: head dim 512, bf16, causal, varlen Q, paged K/V of 64 rows
 (= the hd512 tile_n, so the TMA paged path), 16 query heads over KVH KV heads (GQA packing at 2
 KV heads as vLLM runs it; the 16-way pack crashes the DSL compiler), symbolic KV head stride (the

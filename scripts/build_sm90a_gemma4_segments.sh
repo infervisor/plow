@@ -393,7 +393,7 @@ if [ "${PLOW_BUILD_CUTLASS_FP8_DECODE:-0}" = 1 ]; then
 fi
 # Library hd512 prefill attention (plowrt exec/gpu/lib_attention.rs): FlashAttention-4's SM90
 # forward AOT-exported into libplow_fa4_hd512.so plus the FP8 KV page-gather cubin. The export needs
-# a Python with vLLM 0.29's vllm_flash_attn and the CuTe DSL (PLOW_FA4_PY, default PYREF).
+# a Python with vLLM's vllm_flash_attn (0.28.0 built) and the CuTe DSL (PLOW_FA4_PY, default PYREF).
 if [ "${PLOW_BUILD_FA4_HD512:-0}" = 1 ]; then
   "${gemma_nvenv[@]}" "$gemma_nvcc" -std=c++17 -arch=sm_90a -O3 -cubin -Xptxas=-v \
     -o "$gemma_out/kv_dequant_sm90.cubin" runtime/nvidia/kv_dequant_sm90.cu
