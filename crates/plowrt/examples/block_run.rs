@@ -332,7 +332,7 @@ mod cuda {
             );
         }
         // Prefix fill chunk: the widest launch the packet takes.
-        let fill = e.pf_max_rows().max(1);
+        let fill = e.pf_request_max_rows().max(1);
         let mut rows = Vec::new();
         for &q in &query_rows {
             for &prior in &priors {
@@ -340,7 +340,9 @@ mod cuda {
                 // Two spare tokens keep every timed chunk short of its prompt end, so no
                 // iteration publishes a prefix snapshot.
                 let need = (prior + q + 2).max(rider_ctx + 3);
-                if need + 1 > e.max_ctx() || (packed && requests * q + riders > e.pf_max_rows()) {
+                if need + 1 > e.max_ctx()
+                    || (packed && (requests * q + riders > e.pf_max_rows() || q > fill))
+                {
                     eprintln!(
                         "skip rows={q} prior={prior}: exceeds max_ctx {} or packed rows {}",
                         e.max_ctx(),
@@ -368,21 +370,8 @@ mod cuda {
                 let total: usize = lens.iter().sum();
                 let mut ms = Vec::with_capacity(iters);
                 if packed {
-                    for (slot, (p, &start)) in prompts.iter().zip(&starts).enumerate() {
-                        e.begin_slot(slot, p.len() + 1)?;
-                        let mut c0 = 0;
-                        while c0 < start {
-                            let len = (start - c0).min(fill);
-                            e.upload_activation("act.x", &synth(len, hidden))?;
-                            e.prefill_batched(&[PfBatchReq {
-                                slot,
-                                prompt: p,
-                                c0,
-                                len,
-                            }])?;
-                            c0 += len;
-                        }
-                    }
+                    // A packed request must start at its slot's frontier, so every pass refills
+                    // the prefixes (untimed) before the timed launch.
                     let reqs: Vec<PfBatchReq> = (0..prompts.len())
                         .map(|slot| PfBatchReq {
                             slot,
@@ -393,6 +382,21 @@ mod cuda {
                         .collect();
                     let x = synth(total, hidden);
                     for pass in 0..warmup + iters {
+                        for (slot, (p, &start)) in prompts.iter().zip(&starts).enumerate() {
+                            e.begin_slot(slot, p.len() + 1)?;
+                            let mut c0 = 0;
+                            while c0 < start {
+                                let len = (start - c0).min(fill);
+                                e.upload_activation("act.x", &synth(len, hidden))?;
+                                e.prefill_batched(&[PfBatchReq {
+                                    slot,
+                                    prompt: p,
+                                    c0,
+                                    len,
+                                }])?;
+                                c0 += len;
+                            }
+                        }
                         e.upload_activation("act.x", &x)?;
                         let t0 = Instant::now();
                         e.prefill_batched(&reqs)?;

@@ -54,9 +54,9 @@ a perf campaign (extend the harness as its own change):
   input, timing only). The KV-shared tail route is in the block when the range contains the first
   shared layer and ends at the last layer; its prefill floor still prices the tail layers at every
   row of the program, not the tail's few rows.
-* Not yet run on a GPU: `prefill-bench`, the `sweep.json` provenance, the multi-layer / B > 1
-  Qwen3.8 and KV-shared blocks and `nv-block-ab` were validated on CPU (emit, disassembly, floors,
-  scorer tests) only; the first calibration lease confirms them.
+* A prefill point's floor prices the bucket program the launch ran, padding rows included: when
+  the request rows are well below the bucket (2048 rows in a 4096 bucket), % of floor overstates
+  efficiency; read it beside the next-smaller bucket's floor.
 * The prefill floor of a packed point charges attention per request at a shared prefix; requests
   with different prefixes in one launch are not modelled.
 * Block times are host-observed synchronous step/launch times: a few microseconds of launch
