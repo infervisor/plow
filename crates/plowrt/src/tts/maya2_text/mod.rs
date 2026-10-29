@@ -343,7 +343,10 @@ mod tests {
             )
             .into()
         });
-        let data = std::fs::read_to_string(&path).expect("corpus");
+        let Ok(data) = std::fs::read_to_string(&path) else {
+            eprintln!("skip maya2 text parity: no cases at {path} (run scripts/tts/maya2_text_cases.py)");
+            return;
+        };
         let mut per: std::collections::BTreeMap<String, (usize, usize)> = Default::default();
         let mut bad = Vec::new();
         let t0 = std::time::Instant::now();
