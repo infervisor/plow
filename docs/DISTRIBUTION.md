@@ -139,10 +139,13 @@ infervisor/kimi-k3  hf:moonshotai/Kimi-K3 @…
   gfx942-mi300x-tp4-18k@g1  emits        4 GPU  ctx 18432   RUNS
 ```
 
-Ranking: **generation first** — a newer generation of one label is the same model
-on the same hardware, only built better — then `validated` over `emits`, then an
-exact SKU match, then GPU count, then measured throughput. A tie is an error, not
-a coin flip.
+Ranking: within one label only its **newest** servable generation competes — a
+newer generation of a label is the same build, only built better. Across labels,
+**hardware fit first** (the build for the nearest core count, then an exact SKU
+match: on Apple a build for another core count runs serially, so a native M4 Max
+build beats a newer generation of an M4 Pro build on a Max), then `validated`
+over `emits`, then GPU count, then measured throughput. Generation numbers are
+never compared across labels. A tie is an error, not a coin flip.
 
 Two probe details worth knowing. On AMD the agent name *is* the ISA key
 (`HSA_AGENT_INFO_NAME` returns `gfx942`, the same string spliced into the kernel
@@ -232,7 +235,8 @@ records each output under `v1/runtime/<version>/<triple>/` (the tarball,
 its `.sha256`, `release.json`; create-only, so a version is never
 republished with other bytes), rewrites `v1/runtime/index.json` (every
 release and triple, newest first, for a models page) and `v1/runtime/latest`
-(the version string alone), and publishes `scripts/install.sh` at the
+(the version string alone, always copied from the index's `latest` after the
+index write, so two racing publishers cannot leave it behind the index), and publishes `scripts/install.sh` at the
 registry root when asked. The same credentials and conditional writes as
 `push`. A client installs with:
 
@@ -309,8 +313,12 @@ when it holds this very build (a push that died before its index write) and
 skipped when it holds another's. A push that died after the index is finished
 by the next run of the same build: it writes the missing signature and catalog
 row instead of reporting "unchanged". An objset name already holding other
-bytes, or a rung override whose objset is not published, is refused before the
-bundle is written. A bundle is also refused when the recipe says the model
+bytes, or a rung override whose objset is not published or whose recorded
+digest is not that of the served bytes, is refused before the bundle is
+written. Readers ignore fields they do not know, so an older client reads what
+a newer publisher wrote; a publisher does not: an index, catalog or runtime
+index carrying a field this `plowrt` does not know is refused (naming the
+field) rather than rewritten without it. A bundle is also refused when the recipe says the model
 serves with a file the build did not produce (`codec.pkt` for a `[checkpoint]
 codec`, `cublaslt_algos.jsonl` for `PLOW_LT_RUNG_ALGOS`).
 
@@ -325,8 +333,9 @@ and two publishers' signatures cannot land on each other's index. A client
 refuses an index that is unsigned, signed by another key, or changed after
 signing; the index names every manifest by digest and each manifest its
 blobs, so this one signature covers the whole pull. Which keys: the public
-registry is verified with the built-in publisher key above, with nothing to
-configure; `PLOW_TRUSTED_KEYS=<name>:<base64>[,…]` replaces that list for
+registry (the host `pdist.infervisor.ai`, or a push to the `pdist` R2 bucket:
+`r2://…/pdist`, or `r2://` with `CLOUDFLARE_R2_BUCKET=pdist`) is verified with
+the built-in publisher key above, with nothing to configure; `PLOW_TRUSTED_KEYS=<name>:<base64>[,…]` replaces that list for
 any registry (set but empty is an error, not "verify nothing"); any other
 registry — a `file://` mirror, a private bucket — is checked only when
 `PLOW_TRUSTED_KEYS` names its keys. `push` applies the same `PLOW_TRUSTED_KEYS` to the index already in
