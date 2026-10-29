@@ -72,17 +72,19 @@ PLOW_TTS_CODEC_DIR = "{out}/prep/codec"
 PLOW_VERIFY_BIN = "{repo}/lean-plow/.lake/build/bin/plow_verify"
 PLOW_MAX_CHUNK = "512"
 PLOW_PF_LADDER_APPEND = "64,256"
-PLOW_DECODE_BATCH_LADDER = "1,2,4,8,16,32,48,64,96,128"
-PLOW_EMIT_FISH_CODEC_MAX_ROWS = "256"
-PLOW_EMIT_PREFILL_CUBLASLT = "1"
-PLOW_EMIT_DECODE_CUBLASLT = "1"
-PLOW_EMIT_DECODE_CUBLASLT_MIN_ROWS = "32"
-PLOW_EMIT_DECODE_CUBLASLT_HEAD = "1"
+PLOW_DECODE_BATCH_LADDER = "1,2,4,8,16,32,48,64,96,128,160,192,224,256"
+PLOW_EMIT_FISH_CODEC_MAX_ROWS = "4352"
 PLOW_NO_GLU_FUSE = "1"
 PLOW_FUSE_KV_HNR = "1"
 PLOW_EMIT_PACKED_PREFILL_SMALL_HD = "1"
 PLOW_NV_DENSE_TUNE = "1"
 PLOW_NV_FA_FOLD = "1"
+
+[capabilities]
+masked_padding = "Maya2 speech-LM prompts are short (<512) and padded directly into packed prefill launches"
+segment_roles = "Maya2 Qwen3-1.7B backbone uses native SM90 CUTLASS/CUDA kernels; cuBLASLt dense decode is incompatible with cb0 2049 head"
+generated_kernels = "Native CUTLASS/SM90a attention and GEMV kernels built into interp_sm90a.cubin"
+cublaslt_prefill = "Maya2 uses native SM90 CUTLASS projection kernels for prompt prefill"
 
 [bench]
 kind = "speech"
@@ -97,4 +99,4 @@ cer_median_max = 0.05
 
 [serve]
 extra_args = "--decode-pipeline"
-env = { PLOW_VMM_LIVE = "1", PLOW_VMM_PREFIX = "1", PLOW_LT_RUNG_ALGOS = "true", PLOW_DECODE_PIPELINE = "1" }
+env = { PLOW_VMM_LIVE = "1", PLOW_VMM_PREFIX = "1", PLOW_LT_RUNG_ALGOS = "true", PLOW_DECODE_PIPELINE = "1", PLOW_MAX_HOLD_MS = "0", PLOW_TTS_REALTIME = "0", PLOW_PF_SEG_GRAPH = "0", PLOW_PF_INTERLEAVE = "0" }

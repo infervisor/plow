@@ -3818,7 +3818,7 @@ pub fn xargmax_value_lines(n_batch: u32) -> Option<u32> {
 /// Widest decode rung any emit may declare. Individual operator families may impose a
 /// narrower bound (for example Gemma MoE's 32-row per-CTA scratch), while walking AMD GEMV
 /// objects handle widths above their 16-row compile-time bucket.
-pub const DECODE_RUNG_MAX: u32 = 128;
+pub const DECODE_RUNG_MAX: u32 = 256;
 
 /// [`BlobProgHeader::t`] bit marking a prefill program as a packed-dispatch-only
 /// topology. The low bits remain the compiled row count, preserving the fixed
@@ -7389,7 +7389,7 @@ mod v6_tests {
         let prefill = [
             1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192,
         ];
-        let decode = [1, 2, 4, 8, 16, 32, 64, 128];
+        let decode = [1, 2, 4, 8, 16, 32, 64, 128, 256];
         for n in 1..=decode.len() {
             let widths: Vec<_> = prefill.iter().chain(&decode[..n]).copied().collect();
             assert_eq!(decode_rung_lo(&widths), prefill.len());

@@ -414,17 +414,37 @@ impl Slot {
         }
         let k = (c.top_k as usize).clamp(1, n);
         if k < n {
-            let mut s = l.clone();
-            s.select_nth_unstable_by(k - 1, |a, b| b.total_cmp(a));
-            let kth = s[k - 1];
-            for v in l.iter_mut() {
-                if *v < kth {
-                    *v = f32::NEG_INFINITY;
+            if n <= STOP + 1 {
+                let mut s = [0.0f32; STOP + 1];
+                s[..n].copy_from_slice(l);
+                s[..n].select_nth_unstable_by(k - 1, |a, b| b.total_cmp(a));
+                let kth = s[k - 1];
+                for v in l.iter_mut() {
+                    if *v < kth {
+                        *v = f32::NEG_INFINITY;
+                    }
+                }
+            } else {
+                let mut s = l.clone();
+                s.select_nth_unstable_by(k - 1, |a, b| b.total_cmp(a));
+                let kth = s[k - 1];
+                for v in l.iter_mut() {
+                    if *v < kth {
+                        *v = f32::NEG_INFINITY;
+                    }
                 }
             }
         }
         if c.top_p < 1.0 {
-            let p = softmax(l);
+            let mut p_stack = [0.0f32; STOP + 1];
+            let mut p_heap = Vec::new();
+            let p: &mut [f32] = if n <= p_stack.len() {
+                &mut p_stack[..n]
+            } else {
+                p_heap.resize(n, 0.0);
+                &mut p_heap[..]
+            };
+            softmax_into(l, p);
             let mut order: Vec<usize> = (0..n).filter(|&i| p[i] > 0.0).collect();
             order.sort_by(|&a, &b| p[b].total_cmp(&p[a]));
             let mut cum = 0.0f32;
@@ -435,7 +455,15 @@ impl Slot {
                 cum += p[i];
             }
         }
-        let mut p = softmax(l);
+        let mut p_stack = [0.0f32; STOP + 1];
+        let mut p_heap = Vec::new();
+        let p: &mut [f32] = if n <= p_stack.len() {
+            &mut p_stack[..n]
+        } else {
+            p_heap.resize(n, 0.0);
+            &mut p_heap[..]
+        };
+        softmax_into(l, p);
         let pa = p[STOP];
         let am = (0..n).fold(0, |b, i| if p[i] > p[b] { i } else { b });
         let can = self.ticks >= self.plan.min_frames;
@@ -644,11 +672,24 @@ impl Speaker {
     }
 }
 
-fn softmax(l: &[f32]) -> Vec<f32> {
+fn softmax_into(l: &[f32], out: &mut [f32]) {
     let m = l.iter().copied().fold(f32::NEG_INFINITY, f32::max);
-    let e: Vec<f32> = l.iter().map(|&v| (v - m).exp()).collect();
-    let s: f32 = e.iter().sum();
-    e.into_iter().map(|v| v / s).collect()
+    let mut sum = 0.0f32;
+    for (dst, &src) in out.iter_mut().zip(l) {
+        let v = (src - m).exp();
+        *dst = v;
+        sum += v;
+    }
+    let inv = if sum > 0.0 { 1.0 / sum } else { 0.0 };
+    for dst in out.iter_mut() {
+        *dst *= inv;
+    }
+}
+
+fn softmax(l: &[f32]) -> Vec<f32> {
+    let mut out = vec![0.0f32; l.len()];
+    softmax_into(l, &mut out);
+    out
 }
 
 #[cfg(test)]

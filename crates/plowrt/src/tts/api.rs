@@ -73,6 +73,7 @@ pub struct Checked {
     pub sample_rate: u32,
     /// The reply's speed; 1.0 leaves the audio unstretched.
     pub speed: f32,
+    pub voice: String,
     pub language: Option<String>,
     pub sampling: Sampling,
     /// The request's seed, or a fresh one: an unseeded request samples anew every time.
@@ -186,7 +187,12 @@ impl SpeechSpec {
                 ))
             }
         };
-        if !self.voices.contains(&req.voice) {
+        let voice = if (req.voice == "default" || req.voice.is_empty()) && !self.voices.contains(&req.voice) {
+            self.voices.first().cloned().unwrap_or_else(|| req.voice.clone())
+        } else {
+            req.voice.clone()
+        };
+        if !self.voices.contains(&voice) {
             return Err(invalid(
                 format!(
                     "unknown voice {:?}; voices: {}",
@@ -311,6 +317,7 @@ impl SpeechSpec {
             wav,
             sample_rate,
             speed,
+            voice,
             language,
             sampling: Sampling {
                 temperature: req.temperature.unwrap_or(self.temperature),

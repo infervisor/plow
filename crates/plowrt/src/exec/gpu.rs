@@ -7669,7 +7669,7 @@ impl GpuEngine {
             && !config.nv.pf_seg_time
             && !config.nv.pf_seg_fatonly
         {
-            let warmup_slots = engine.batch.min(4);
+            let warmup_slots = engine.batch;
             let t_warmup = std::time::Instant::now();
             // Routed buckets (attention-GEMM segments) are warmed too: the route only fires
             // for a slice >= pf_attn_gemm_min_rows, so a pack of short slices in a >= 1024-row

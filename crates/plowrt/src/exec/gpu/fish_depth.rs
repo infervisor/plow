@@ -559,15 +559,73 @@ impl GpuEngine {
                     s[at..at + 4].copy_from_slice(&v.to_le_bytes());
                 }
             }
-            for row in rows {
+
+            thread_local! {
+                static MAYA2_SCRATCH: std::cell::RefCell<Vec<f32>> = const { std::cell::RefCell::new(Vec::new()) };
+            }
+
+            let tick_code: Vec<(Tick, u32)> = if rows.len() > 1 {
+                let mut active_indices = vec![usize::MAX; m.slots.len()];
+                for (idx, row) in rows.iter().enumerate() {
+                    active_indices[row.slot] = idx;
+                }
+                #[cfg(feature = "hf-tokenizer")]
+                {
+                    use rayon::prelude::*;
+                    let by_slot: Vec<Option<(Tick, u32)>> = m.slots
+                        .par_iter_mut()
+                        .enumerate()
+                        .map(|(r, slot_opt)| {
+                            let row_idx = active_indices[r];
+                            if row_idx == usize::MAX {
+                                return None;
+                            }
+                            let slot = slot_opt.as_mut().unwrap();
+                            let tick = MAYA2_SCRATCH.with_borrow_mut(|scratch| {
+                                slot.tick(&logits[r * vocab..r * vocab + STOP_ROWS], scratch)
+                            });
+                            let code = match tick {
+                                Tick::Code(c) => c,
+                                Tick::Stop => slot.last,
+                            };
+                            Some((tick, code))
+                        })
+                        .collect();
+                    rows.iter().map(|row| by_slot[row.slot].unwrap()).collect()
+                }
+                #[cfg(not(feature = "hf-tokenizer"))]
+                {
+                    rows.iter()
+                        .map(|row| {
+                            let r = row.slot;
+                            let slot = m.slots[r].as_mut().unwrap();
+                            let tick = slot.tick(&logits[r * vocab..r * vocab + STOP_ROWS], &mut m.scratch);
+                            let code = match tick {
+                                Tick::Code(c) => c,
+                                Tick::Stop => slot.last,
+                            };
+                            (tick, code)
+                        })
+                        .collect()
+                }
+            } else {
+                rows.iter()
+                    .map(|row| {
+                        let r = row.slot;
+                        let slot = m.slots[r].as_mut().unwrap();
+                        let tick = slot.tick(&logits[r * vocab..r * vocab + STOP_ROWS], &mut m.scratch);
+                        let code = match tick {
+                            Tick::Code(c) => c,
+                            Tick::Stop => slot.last,
+                        };
+                        (tick, code)
+                    })
+                    .collect()
+            };
+
+            for (row, (tick, code)) in rows.iter().zip(tick_code) {
                 let r = row.slot;
-                let slot = m.slots[r].as_mut().unwrap();
-                let tick = slot.tick(&logits[r * vocab..r * vocab + STOP_ROWS], &mut m.scratch);
                 stops.push(tick == Tick::Stop);
-                let code = match tick {
-                    Tick::Code(c) => c,
-                    Tick::Stop => slot.last,
-                };
                 s[ctl + r * 8..ctl + r * 8 + 4].copy_from_slice(&m.depth.1.to_le_bytes());
                 s[ctl + r * 8 + 4..ctl + r * 8 + 8].copy_from_slice(&row.step.to_le_bytes());
                 s[hrow + r * 4..hrow + r * 4 + 4].copy_from_slice(&row.hidden_row.to_le_bytes());

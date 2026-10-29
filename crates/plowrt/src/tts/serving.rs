@@ -18,10 +18,12 @@ use std::sync::{Arc, OnceLock};
 use std::time::Instant;
 
 use axum::body::Body;
+use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::State;
 use axum::http::{header, HeaderName, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::Json;
+use futures::StreamExt;
 use parking_lot::Mutex;
 use serde::Deserialize;
 
@@ -254,7 +256,7 @@ async fn speech_on_guided(
 ) -> Response {
     let lang = checked.language.clone();
     let voice = match (&req.ref_audio, w.clone_input()) {
-        (None, _) => super::guided_speech::Voice::Named(req.voice.clone()),
+        (None, _) => super::guided_speech::Voice::Named(checked.voice.clone()),
         (Some(audio), Some((rate, max))) => {
             let pcm = match reference_pcm(audio, rate, max) {
                 Ok(p) => p,
@@ -804,6 +806,131 @@ pub async fn speech(
     response
 }
 
+/// WebSocket streaming speech endpoint: accepts requests on `/v1/audio/speech` (GET upgrade)
+/// or `/v1/tts/stream`.
+pub async fn ws_speech(
+    State(state): State<Arc<AppState>>,
+    headers: axum::http::HeaderMap,
+    ws: WebSocketUpgrade,
+) -> Response {
+    let ids = match RequestIds::from_headers(&headers) {
+        Ok(ids) => ids,
+        Err(e) => return bad(e, "x-session-id"),
+    };
+    if let Some(r) = crate::serve::overload::gate(&ids) {
+        return r;
+    }
+    ws.max_message_size(1024 * 1024)
+        .max_frame_size(1024 * 1024)
+        .on_upgrade(move |socket| async move {
+            ws_speech_session(state, socket, ids).await;
+        })
+}
+
+async fn ws_speech_session(
+    state: Arc<AppState>,
+    mut socket: WebSocket,
+    mut ids: RequestIds,
+) {
+    while let Some(msg) = socket.recv().await {
+        let text = match msg {
+            Ok(Message::Text(t)) => t,
+            Ok(Message::Ping(p)) => {
+                let _ = socket.send(Message::Pong(p)).await;
+                continue;
+            }
+            Ok(Message::Close(_)) | Err(_) => break,
+            _ => continue,
+        };
+        let mut req: SpeechRequest = match serde_json::from_str(&text) {
+            Ok(r) => r,
+            Err(e) => {
+                let _ = socket
+                    .send(Message::Text(
+                        serde_json::json!({
+                            "error": {
+                                "message": e.to_string(),
+                                "type": "invalid_request_error"
+                            }
+                        })
+                        .to_string(),
+                    ))
+                    .await;
+                continue;
+            }
+        };
+        req.stream = true;
+        if let Err(e) = ids.apply_body(&req.route()) {
+            let _ = socket
+                .send(Message::Text(
+                    serde_json::json!({
+                        "error": {
+                            "message": e,
+                            "type": "invalid_request_error"
+                        }
+                    })
+                    .to_string(),
+                ))
+                .await;
+            continue;
+        }
+        let (report, mut report_rx) = ids.report();
+        let mut response = speech_with(
+            Arc::clone(&state),
+            Ok(Json(req)),
+            &ids,
+            report,
+            &mut report_rx,
+        )
+        .await;
+        ids.stamp(&mut response);
+
+        if !response.status().is_success() {
+            let bytes = match axum::body::to_bytes(response.into_body(), 64 * 1024).await {
+                Ok(b) => String::from_utf8_lossy(&b).into_owned(),
+                Err(e) => format!(r#"{{"error":{{"message":"{e}"}}}}"#),
+            };
+            let _ = socket.send(Message::Text(bytes)).await;
+            continue;
+        }
+
+        let mut stream = response.into_body().into_data_stream();
+        let mut sent_any = false;
+        loop {
+            tokio::select! {
+                chunk = stream.next() => {
+                    match chunk {
+                        Some(Ok(c)) if !c.is_empty() => {
+                            sent_any = true;
+                            if socket.send(Message::Binary(c.to_vec())).await.is_err() {
+                                break;
+                            }
+                        }
+                        Some(Ok(_)) => {}
+                        _ => break,
+                    }
+                }
+                msg = socket.recv() => {
+                    match msg {
+                        Some(Ok(Message::Ping(p))) => {
+                            let _ = socket.send(Message::Pong(p)).await;
+                        }
+                        Some(Ok(Message::Close(_))) | None => break,
+                        _ => {}
+                    }
+                }
+            }
+        }
+        if sent_any {
+            let _ = socket
+                .send(Message::Text(
+                    serde_json::json!({"done": true}).to_string(),
+                ))
+                .await;
+        }
+    }
+}
+
 async fn speech_with(
     state: Arc<AppState>,
     req: Result<Json<SpeechRequest>, axum::extract::rejection::JsonRejection>,
@@ -988,7 +1115,7 @@ async fn speech_with(
             "cfg_weight",
         );
     }
-    let voice = req.voice.clone();
+    let voice = checked.voice.clone();
     let mut out_pcm = match super::OutPcm::new(
         c.sample_rate,
         checked.sample_rate,

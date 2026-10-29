@@ -52,15 +52,23 @@ pub const CAPACITIES: &[(u32, u32)] = &[
 /// streams, shared by all step programs).
 pub const STEP_CAPACITIES: &[(u32, u32)] = &[
     (1, 1),
+    (4, 1),
+    (16, 1),
+    (64, 1),
+    (128, 1),
+    (256, 1),
     (1, 4),
     (1, 17),
     (4, 17),
     (8, 17),
     (16, 17),
     (32, 17),
+    (64, 17),
+    (128, 17),
+    (256, 17),
 ];
 
-pub const STREAM_SLOTS: u32 = 32;
+pub const STREAM_SLOTS: u32 = 256;
 
 struct Block {
     cin: u32,
@@ -353,8 +361,18 @@ fn lower_programs(
 ) -> Result<Lowered, String> {
     let fc = cfg.sizes.len() as u32;
     let scales = cfg.scales();
-    let bmax = decode.iter().map(|&(b, _)| b).max().unwrap_or(1);
-    let max_rows = decode.iter().map(|&(b, f)| b * f).max().unwrap_or(1);
+    let bmax = decode
+        .iter()
+        .chain(steps)
+        .map(|&(b, _)| b)
+        .max()
+        .unwrap_or(1);
+    let max_rows = decode
+        .iter()
+        .chain(steps)
+        .map(|&(b, f)| b * f)
+        .max()
+        .unwrap_or(1);
     let mut builder = packet::devbuild::Builder::new(n_cu);
     builder.set_tensor_dedup(true);
     let codes = builder.tensor("in.codec.codes", u64::from(max_rows * fc) * 4);
@@ -2067,10 +2085,24 @@ mod tests {
         );
         let (decode, steps) = capped(Some(256)).unwrap();
         assert_eq!(decode, [(1, 64), (2, 64), (4, 64), (1, 256)]);
-        assert_eq!(steps, [(1, 1), (1, 4), (1, 17), (4, 17), (8, 17)]);
+        assert_eq!(
+            steps,
+            [
+                (1, 1),
+                (4, 1),
+                (16, 1),
+                (64, 1),
+                (128, 1),
+                (256, 1),
+                (1, 4),
+                (1, 17),
+                (4, 17),
+                (8, 17)
+            ]
+        );
         assert!(capped(Some(32)).is_err());
         let low = lower_programs(&fish(), 58, 89, None, &decode, &steps).unwrap();
-        assert_eq!((low.bmax, low.max_rows), (4, 256));
+        assert_eq!((low.bmax, low.max_rows), (256, 256));
         assert!(!low.roles.contains_key("decode.b16.f64"));
         assert!(!low.roles.contains_key("step.b16.f17"));
     }
@@ -2093,7 +2125,8 @@ mod tests {
                     assert_eq!(pa.succs, pb.succs);
                 }
                 for (ta, tb) in ma.tensors.iter().zip(&mb.tensors) {
-                    assert_eq!((&ta.name, ta.bytes), (&tb.name, tb.bytes));
+                    assert_eq!(&ta.name, &tb.name);
+                    assert!(tb.bytes >= ta.bytes);
                 }
                 assert_eq!(a.positions, b.positions);
                 assert!(mb.tensors[ma.tensors.len()..].iter().all(|t| t
