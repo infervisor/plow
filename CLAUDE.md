@@ -11,6 +11,11 @@ Read `docs/bringup/agent-tools.md` before writing any benchmark, probe, or serve
 `scripts/` has 400+ scripts; most campaigns still wrote a throwaway probe and re-hit the same
 environment failures on leased GPUs.
 
+* HARD RULE: perf candidates are screened on a single block vs its calibrated roofline before any
+  whole-network run; reports start with the block-vs-roofline table (agent-tools.md "HARD RULE").
+* Standing team rules (prefix cache on, one binary, packet contract, static runtime, vLLM-peer
+  judging, GPU budget, `prod-next` only, kernel reviews): agent-tools.md "Working rules".
+
 * Everything runs inside `nix develop`. `ROCM_PATH` unset means you are outside it. A hand-built
   box without nix sets `PLOW_CAMPAIGN_NO_NIX=1` instead of faking `ROCM_PATH`.
 * Not from nix, pass explicitly: vLLM client `/app/plow/build-gemma31/vllm-python` (built from

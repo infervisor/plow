@@ -6,6 +6,18 @@
 > isolation is an order of magnitude cheaper than debugging it inside a 90-layer
 > serve loop.
 
+> **HARD RULE (perf campaigns).** Every kernel, fusion, route or knob candidate
+> is screened on a single block (one layer, or the smallest span containing each
+> layer kind it touches) at the served shape, precision, flags, rung width and
+> context, against a calibrated bandwidth/compute roofline for that block.
+> Whole-network `step_bench`, FP32 gates and prod-mix grids run only for a
+> candidate that already wins here. A campaign report starts with the
+> block-vs-roofline table (block time, roofline floor, % of floor, delta vs
+> current). The harness per backend and its known gaps (FP8 floors, GDN/MLA
+> kinds, MoE router inputs, packed prefill with riders, library attention
+> routes) are listed in [agent-tools.md](agent-tools.md) "HARD RULE"; a
+> candidate that hits a gap says so in its report.
+
 **Precondition:** Stages 1–4 complete — the model's config is understood, its
 weights load, and the emitter produces a full-model `model.pkt` without aborting.
 The [`target.md`](target.md) block is filled in and every command below is
@@ -261,8 +273,12 @@ op is localized, not merely detected. It runs twice: bf16 routed experts first
 
 Once the block is correct, measure it. The metric is per-step **decode** us and
 per-pass **prefill** ms, both over a batch × context (B × T) grid, timed with
-device events (pure GPU time). Numerics are irrelevant to the *timing* — the
-per-step kernel time is data-independent — so a bench needs no correct weights.
+device events (pure GPU time). For a dense block numerics are irrelevant to the
+*timing* — the per-step kernel time is data-independent — so a bench needs no
+correct weights. A MoE block is the exception: the router picks the experts a
+step reads, and `block_run bench` feeds synthetic `act.x`, so its expert union
+is not real traffic's. Price the expert union explicitly (`block_roofline.py`)
+and confirm MoE levers with `step_bench` at the rung.
 
 ### Gemma path (model-shaped block, `block_run bench`)
 
@@ -350,6 +366,15 @@ python3 scripts/block_op_bench.py <block-config>.json --phases decode,prefill --
 For plow's own per-op breakdown on `$VENDOR = nvidia`, build the device object
 with `-DPLOW_NV_TRACE=1` and read `trace_reset` / `trace_summary` in `block_run`.
 
+The block roofline on `$VENDOR = nvidia` is
+`scripts/campaign/block_roofline.py <hf_dir> --gpu "$GPU" --kind sliding|full
+--plow sweep.json [--vllm layer.json]`: per component (projections, MLP,
+router, expert union, attention/KV) floor, plow's `block_run` time, % of roof and
+the vLLM-layer ratio. It prices 2-byte weights/KV from registry ceilings; for an
+FP8 block or a calibrated ceiling take per-op floors from
+`scripts/bench/op_roof.py <block disasm> --bw ... --tflops ... --fp8-tflops ...`.
+On `$VENDOR = amd` use `campaign.py block-roofline` (`scripts/campaign/README.md`).
+
 ---
 
 ## Success criteria
@@ -408,8 +433,8 @@ The block passes Stage 5 and gates into Stage 6 when **all** hold:
 * **A few-instances-per-block op lands in noise.** A block has only ~4–5 MoE
   layers, so ablating `MoeRouterTopk` or `MoeCombine` on a block sweep is inside
   timer noise (one measured campaign: base 3.184, router-ablated 3.152,
-  combine-ablated 3.230 ms/token — one spread apart). Those need the full
-  network. The spread is per-target; re-establish it on `$GPU` before calling an
+  combine-ablated 3.230 ms/token — one spread apart). Those need a span with
+  more instances or `step_bench` at the affected rung, not a serving grid. The spread is per-target; re-establish it on `$GPU` before calling an
   ablation null.
 
 * **A tune knob measured on an isolated kernel can invert in the megakernel.**
@@ -460,6 +485,7 @@ The block passes Stage 5 and gates into Stage 6 when **all** hold:
 | `scripts/block_e2e.sh` | end-to-end compile → plow bench → reference bench → diff (see caveats) |
 | `scripts/block_baseline.py`, `scripts/block_layer_bench.py`, `scripts/block_op_bench.py` | reference-side single-block harnesses |
 | `scripts/block_compare.py` | join plow `sweep.json` vs reference `sweep.json` |
+| `scripts/campaign/block_roofline.py` | NVIDIA per-block roofline (sliding/full kinds, MoE expert union) joined with `block_run` / vLLM-layer sweeps |
 | `scripts/build_glm52_block.sh`, `scripts/k3_block_sweep.sh`, `scripts/glm52_block_sweep_gfx942.sh` | family-specific build / sweep |
 | `runtime/tests/*_block_*_test.c` + `runtime/tests/*_oracle.py` | C oracle correctness harnesses |
 | `perf-data/block-baseline-harness.md`, `perf-data/block-decode-baseline-26b.md` | recorded methodology + reference numbers |
