@@ -1744,6 +1744,9 @@ pub(super) fn run(
         m.to_blob()
     };
     std::fs::write(out, bytes).expect("write Qwen blob");
+    if !arch.is_empty() {
+        crate::write_lean_receipts(out, &lean);
+    }
     let mut man = man;
     man["runtime_requires"] = crate::dense_cublaslt::runtime_requires(&m, &sections);
     manifest::write_config_header(&out.with_file_name("plow_config.h"), &man)
