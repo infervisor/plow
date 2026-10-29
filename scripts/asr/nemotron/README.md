@@ -68,26 +68,13 @@ improves mean item WER and throughput; the official runtime remains ahead by
 0.0335 percentage points on corpus WER. Local evidence is recorded in
 `plans/asr-coval-stt-v3-nemotron-tight-trailing6-score.json`.
 
-## In-process Plow adapter
+## In-process adapter (removed)
 
-Build the optional adapter and run the model inside the Plow process:
-
-```sh
-nix develop -c cargo build -p plowrt --release --features nemo-asr \
-  --example asr_nemotron
-nix develop -c target/release/examples/asr_nemotron \
-  plans/asr-eval-assets/nemotron-3.5/nemo-speech/lib/libnemo_speech_asr_c.1.dylib \
-  plans/asr-eval-assets/nemotron-3.5/model.gguf \
-  plans/asr-eval-assets/dev-clean-100/652-129742-0016.wav 0 5
-```
-
-Use `cpu` instead of `0` for CPU execution. The Rust adapter implements Plow's
-backend-neutral `Transcriber` interface and dynamically loads NVIDIA's stable C ABI.
-It validates GGUF structure plus `general.architecture=asr` and
-`asr.head_type=rnnt` before loading that library.
-The runtime library provides its own kernels; this is in-process Plow integration,
-not native packet execution. The same adapter can load a compatible Linux CUDA or
-CPU library without Metal types in shared code.
+The `nemo-asr` feature and its `asr_nemotron` / `asr_nemotron_dataset` examples, which
+dlopened NeMo-Speech's C ABI library inside plowrt, were removed (2026-10-29): plowrt loads
+no library besides the CUDA driver, cuBLASLt and the HSA runtime, and every kernel ships as a
+packet object. `reference.py` still runs the official release as a separate process, as the
+external correctness control.
 
 The native bring-up keeps the published Q8_0 blocks in GGUF and exposes a
 backend-neutral scalar matvec oracle. Inspect the Q8 inventory or verify one

@@ -54,7 +54,12 @@ carries the caveat that makes it honest.
 
 If any is missing, **stop and report**. Do not run a campaign on a recipe that
 has not gated out of Stage 6, and do not quote a comparator ratio you cannot
-produce in the same session.
+produce in the same session or from a captured vLLM peer whose recorded
+provenance matches (reuse it; never recapture a vLLM arm for a screen). The
+comparator is the same-concurrency vLLM peer, never plowrt's own production
+packet. Candidates reach this stage only after winning at single-block level
+(`docs/bringup/agent-tools.md` "HARD RULE"); the report opens with that
+block-vs-roofline table.
 
 ## Fix the campaign plan first — everything is measured against it
 
