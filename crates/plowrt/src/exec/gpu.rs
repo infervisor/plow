@@ -8229,63 +8229,6 @@ impl GpuEngine {
         Ok(())
     }
 
-    /// Bench-only (the paging gate, docs/arch/27 P0): fill the decode object's page tables
-    /// (`plow_kv_pages_init`, objects built with `PLOW_NV_KV_PAGED`) for every slot, `mode` 0 =
-    /// identity (the flat layout), 1 = reversed pages, 2 = slots interleaved. `Ok(false)` = the
-    /// object has no page tables.
-    pub fn kv_pages_init(&self, mode: u32) -> Result<bool> {
-        let Ok(f) = self.be.get_function(&self.module, "plow_kv_pages_init") else {
-            return Ok(false);
-        };
-        let geo = self
-            .kv_geo
-            .as_ref()
-            .ok_or_else(|| RuntimeError::Rejected("kv pages: no KV geometry".into()))?;
-        // Rows per slot of a layer's cache: its bytes over (slots x heads x row bytes).
-        let rows = |layer: u32, kvh: u32, hd: u32| -> Option<u32> {
-            let k = self.tensor_bytes(&format!("kv.{layer}.k"))?;
-            let elem = if self.handle_of(&format!("kv.{layer}.k_scale")).is_some() {
-                1
-            } else {
-                2
-            };
-            Some((k / (self.batch as u64 * u64::from(kvh) * u64::from(hd) * elem)) as u32)
-        };
-        for (which, layers, kvh, hd) in [
-            (0u32, &geo.full_layers, geo.kv_heads_full, geo.head_dim_full),
-            (
-                1u32,
-                &geo.slide_layers,
-                geo.kv_heads_slide,
-                geo.head_dim_slide,
-            ),
-        ] {
-            let Some(stride) = layers.first().and_then(|&l| rows(l, kvh, hd)) else {
-                continue;
-            };
-            let (mut which, mut n, mut pages, mut kvh, mut stride, mut mode) =
-                (which, self.batch as u32, stride / 32, kvh, stride, mode);
-            if u64::from(n) * u64::from(pages) > 1 << 17 {
-                return Err(RuntimeError::Rejected(format!(
-                    "kv pages: {n} slots x {pages} pages exceed the object's table"
-                )));
-            }
-            tracing::info!(which, n, pages, kvh, stride, mode, "kv pages: table filled");
-            let mut params = [
-                &mut which as *mut u32 as *mut std::ffi::c_void,
-                &mut n as *mut u32 as *mut std::ffi::c_void,
-                &mut pages as *mut u32 as *mut std::ffi::c_void,
-                &mut kvh as *mut u32 as *mut std::ffi::c_void,
-                &mut stride as *mut u32 as *mut std::ffi::c_void,
-                &mut mode as *mut u32 as *mut std::ffi::c_void,
-            ];
-            self.be
-                .launch_kernel(f, 256, 256, 0, &mut params, Some(&self.stream))?;
-        }
-        self.be.stream_synchronize(&self.stream)?;
-        Ok(true)
-    }
-
     /// Bench-only: move slot `b` back to position `len` (at most its current one), keeping the
     /// cache rows below it, so repeated timed steps read the same kv length.
     pub fn rewind_slot(&mut self, b: usize, len: usize) -> Result<()> {

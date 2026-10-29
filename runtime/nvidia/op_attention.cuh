@@ -1005,44 +1005,6 @@ __device__ __forceinline__ void fa_decode_rg_item(
 #ifndef PLOW_NV_FA_RG8
 #define PLOW_NV_FA_RG8 0
 #endif
-/* Paged KV decode reads (PLOW_NV_KV_PAGED = page rows, 32; the zero-copy KV paging gate,
- * docs/arch/27 P0, never a serving route). A sequence's rows are a table of row bases, one per
- * page: row r (after the ring mask) of slot s, head h lives at row
- * table[s][r / P] + r % P + h * kv_stride of the tensor, so the identity table
- * table[s][j] = s * kvh * kv_stride + j * P is today's flat layout byte for byte. Sliding
- * layers (window != 0) read plow_kv_pages_w, full layers plow_kv_pages_f; both are filled by
- * plow_kv_pages_init. The FP8 row-group (RG8, RG8S) and TC16 decode items read through it. */
-#ifndef PLOW_NV_KV_PAGED
-#define PLOW_NV_KV_PAGED 0
-#endif
-#if PLOW_NV_KV_PAGED
-#define PGKV_MAX (1u << 17)
-extern "C" __device__ unsigned plow_kv_pages_w[PGKV_MAX];
-extern "C" __device__ unsigned plow_kv_pages_f[PGKV_MAX];
-__device__ unsigned plow_kv_pages_w[PGKV_MAX];
-__device__ unsigned plow_kv_pages_f[PGKV_MAX];
-/* which 0 = full, 1 = sliding; mode 0 identity, 1 = every slot's pages in reverse order, 2 = the
- * slots' pages interleaved (page j of slot s at s + j * n_slots in a pool of the same size). */
-extern "C" __global__ void plow_kv_pages_init(unsigned which, unsigned n_slots, unsigned pages,
-                                              unsigned kvh, unsigned stride, unsigned mode) {
-    unsigned* t = which ? plow_kv_pages_w : plow_kv_pages_f;
-    for (unsigned i = blockIdx.x * blockDim.x + threadIdx.x; i < n_slots * pages && i < PGKV_MAX;
-         i += gridDim.x * blockDim.x) {
-        const unsigned s = i / pages, j = i % pages;
-        unsigned ps = s, pj = j;
-        if (mode == 1) pj = pages - 1u - j;
-        if (mode == 2) { const unsigned q = s + j * n_slots; ps = q / pages; pj = q % pages; }
-        t[i] = ps * kvh * stride + pj * (unsigned)PLOW_NV_KV_PAGED;
-    }
-}
-#define FA_KVROW(r) ((size_t)pg[(r) / (unsigned)PLOW_NV_KV_PAGED] + ((r) % (unsigned)PLOW_NV_KV_PAGED))
-#define FA_PG_PARAM , const unsigned* __restrict__ pg
-#define FA_PG_ARG , pg
-#else
-#define FA_KVROW(r) ((size_t)(r))
-#define FA_PG_PARAM
-#define FA_PG_ARG
-#endif
 /* Rows each warp has in flight: hd512 (U) and hd256 (U256). Measured H100, G26 shapes: hd512 U4, hd256 U8. */
 #ifndef PLOW_NV_FA_RG8_U
 #define PLOW_NV_FA_RG8_U 4
@@ -1082,7 +1044,7 @@ __device__ __forceinline__ void fa_decode_rg8_item(
     const unsigned char* __restrict__ kb8, const unsigned char* __restrict__ vb8,
     const float* __restrict__ ksc, const float* __restrict__ vsc, unsigned b, unsigned n_head,
     unsigned h0, unsigned nsplit, unsigned sp, unsigned lo, unsigned hi, unsigned kv_mask,
-    float scale, float* lds FA_PG_PARAM) {
+    float scale, float* lds) {
     static_assert(D == 256 || D == 512, "FP8 row-group decode: hd256 / hd512");
     constexpr unsigned NCH = D / 256, NGRP = PLOW_NV_WARPS;
     constexpr int U = FA_RG8_U(D), E = 8 * NCH;
@@ -1102,11 +1064,11 @@ __device__ __forceinline__ void fa_decode_rg8_item(
                 const unsigned q = (i * 32u + lane) % (KB / 16u), u = q / (D / 16u), col = q % (D / 16u);
                 const unsigned r = min(r0 + NGRP * u, hi - 1u) & kv_mask;
                 fa_rg8s_cp16(dst + (i * 512u >= KB ? KB : 0u) + u * D + col * 16u,
-                             (i * 512u >= KB ? vb8 : kb8) + FA_KVROW(r) * D + col * 16u);
+                             (i * 512u >= KB ? vb8 : kb8) + (size_t)r * D + col * 16u);
             }
             if (lane < 2u * U) {
                 const unsigned u = lane % U, r = min(r0 + NGRP * u, hi - 1u) & kv_mask;
-                fa_rg8s_cp4(dst + 2u * KB + lane * 4u, (lane < (unsigned)U ? ksc : vsc) + FA_KVROW(r));
+                fa_rg8s_cp4(dst + 2u * KB + lane * 4u, (lane < (unsigned)U ? ksc : vsc) + r);
             }
         }
         fa_cp_commit();
@@ -1160,12 +1122,12 @@ __device__ __forceinline__ void fa_decode_rg8_item(
             const unsigned r = min(r0 + NGRP * (unsigned)u, hi - 1u) & kv_mask;
 #pragma unroll
             for (int c = 0; c < (int)NCH; c++) {
-                const size_t off = FA_KVROW(r) * D + c * 256u + lane * 8u;
+                const size_t off = (size_t)r * D + c * 256u + lane * 8u;
                 k8[u][c] = *(const uint2*)(kb8 + off);
                 v8[u][c] = *(const uint2*)(vb8 + off);
             }
-            ks[u] = ksc[FA_KVROW(r)];
-            vs[u] = vsc[FA_KVROW(r)];
+            ks[u] = ksc[r];
+            vs[u] = vsc[r];
         }
 #endif
         float sc[GF][U];
@@ -2168,12 +2130,7 @@ __device__ void fa_decode_tc16(float* __restrict__ Opart, float* __restrict__ ml
 #else
         (void)kv_cap;
 #endif
-#if PLOW_NV_KV_PAGED
-        const size_t kvo = (size_t)hkv * kv_stride;
-        const unsigned* pg = (window ? plow_kv_pages_w : plow_kv_pages_f) + (size_t)slot * (kv_stride / (unsigned)PLOW_NV_KV_PAGED);
-#else
         const size_t kvo = ((size_t)slot * n_kv_head + hkv) * (size_t)kv_stride;
-#endif
         const unsigned char* kb = K + kvo * D;
         const unsigned char* vb = V + kvo * D;
         const float* ksc = k_scale + kvo;
@@ -2195,8 +2152,8 @@ __device__ void fa_decode_tc16(float* __restrict__ Opart, float* __restrict__ ml
             const unsigned r0 = t0 + 16u * warp;
             float s[2][4] = {};
             if (r0 < hi) {
-                const unsigned char* k0p = kb + FA_KVROW(min(r0 + g, hi - 1u) & kv_mask) * D + 16u * t;
-                const unsigned char* k1p = kb + FA_KVROW(min(r0 + 8u + g, hi - 1u) & kv_mask) * D + 16u * t;
+                const unsigned char* k0p = kb + (size_t)(min(r0 + g, hi - 1u) & kv_mask) * D + 16u * t;
+                const unsigned char* k1p = kb + (size_t)(min(r0 + 8u + g, hi - 1u) & kv_mask) * D + 16u * t;
 #pragma unroll
                 for (unsigned c0 = 0; c0 < NCH; c0 += 4) {
                     uint4 k0[4], k1[4];
@@ -2231,8 +2188,8 @@ __device__ void fa_decode_tc16(float* __restrict__ Opart, float* __restrict__ ml
                 for (int e = 0; e < 2; e++) {
                     const unsigned row = r0 + 8u * j + 2u * t + e;
                     const unsigned rr = min(row, hi - 1u) & kv_mask;
-                    const float ks = ksc[FA_KVROW(rr)];
-                    vs[j][e] = vsc[FA_KVROW(rr)];
+                    const float ks = ksc[rr];
+                    vs[j][e] = vsc[rr];
                     const bool live = row < hi;
                     s[j][e] = live ? s[j][e] * qscale * ks : FA_NEG_INF;
                     s[j][e + 2] = live ? s[j][e + 2] * qscale * ks : FA_NEG_INF;
@@ -2305,7 +2262,7 @@ __device__ void fa_decode_tc16(float* __restrict__ Opart, float* __restrict__ ml
 #pragma unroll
                 for (int q = 0; q < 4; q++) {
                     const unsigned row = rb + (unsigned)(q & 1) + 8u * (unsigned)(q >> 1);
-                    vr[q] = __ldcs((const uint2*)(vcol + FA_KVROW(min(row, hi - 1u) & kv_mask) * D));
+                    vr[q] = __ldcs((const uint2*)(vcol + (size_t)(min(row, hi - 1u) & kv_mask) * D));
                 }
                 unsigned ah[4], al[4];
                 fa_ldmatrix_x4(ah, ph + (lane & 15u) * PS + 16u * kk + (lane >> 4) * 8u);
@@ -2518,23 +2475,16 @@ __device__ __forceinline__ void d_flash_decode_body(float* __restrict__ Opart, f
          * unused on the bf16 instantiation (FP8KV=false compiles them out). */
         /* SZKV: rows are FA_SZ_ROWB(D)-byte blobs, not D elems — same head-major ring indexing. */
         constexpr size_t RB = SZKV ? (size_t)FA_SZ_ROWB(D) : (size_t)D;
-#if PLOW_NV_KV_PAGED
-        /* Paged: the bases carry the head only; FA_KVROW adds the page's row base. */
-        const size_t kv_row0 = (size_t)hkv * kv_stride;
-        const unsigned* pg = (window ? plow_kv_pages_w : plow_kv_pages_f) + (size_t)slot * (kv_stride / (unsigned)PLOW_NV_KV_PAGED);
-#else
-        const size_t kv_row0 = (kv_batch * n_kv_head + hkv) * (size_t)kv_stride;
-#endif
-        const unsigned char* kb8 = (const unsigned char*)K + kv_row0 * RB;
-        const unsigned char* vb8 = (const unsigned char*)V + kv_row0 * RB;
+        const unsigned char* kb8 = (const unsigned char*)K + (kv_batch * n_kv_head + hkv) * (size_t)kv_stride * RB;
+        const unsigned char* vb8 = (const unsigned char*)V + (kv_batch * n_kv_head + hkv) * (size_t)kv_stride * RB;
         /* Offset the scale slice only on the FP8KV arm — k_scale/v_scale are null on the bf16
          * instantiation, so forming null+offset (even unused) is UB. if constexpr keeps ksc/vsc
          * in scope for the FP8KV code below with zero runtime cost. */
         const float* ksc = nullptr;
         const float* vsc = nullptr;
         if constexpr (FP8KV) {
-            ksc = k_scale + kv_row0;
-            vsc = v_scale + kv_row0;
+            ksc = k_scale + (kv_batch * n_kv_head + hkv) * (size_t)kv_stride;
+            vsc = v_scale + (kv_batch * n_kv_head + hkv) * (size_t)kv_stride;
         }
 
 #if PLOW_NV_FA_RG8
@@ -2542,13 +2492,9 @@ __device__ __forceinline__ void d_flash_decode_body(float* __restrict__ Opart, f
         if constexpr (FP8KV && !SZKV && (D == 512 || (D == 256 && PLOW_NV_FA_RG8 >= 2)) && GF >= 2 && GF <= 4 &&
                       PLOW_NV_WARPS * (D + 2u) <= (unsigned)FA_DEC_SMEM_FLOATS(D, GF)) {
             fa_decode_rg8_item<D, GF>(Opart, mlpart, Q, kb8, vb8, ksc, vsc, b, n_head, h0, nsplit, sp,
-                                      lo, hi, kv_mask, scale, lds FA_PG_ARG);
+                                      lo, hi, kv_mask, scale, lds);
             continue;
         }
-#endif
-#if PLOW_NV_KV_PAGED
-        /* The paged gate covers the row-group FP8 items only (the bases above carry no slot). */
-        if constexpr (FP8KV) __trap();
 #endif
         __syncthreads(); /* previous item's osm reads must finish before qsm is rewritten */
 #if !(PLOW_NV_FA_WPR && PLOW_NV_FA_QGLOB)

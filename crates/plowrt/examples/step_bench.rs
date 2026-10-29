@@ -126,7 +126,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut ride: Option<(usize, Vec<usize>)> = None;
     let mut ride_dump = None::<std::path::PathBuf>;
     let mut ride_prefix = 0usize;
-    let mut kv_pages: Option<u32> = None;
     let mut ride_salt = 0u32;
     let (mut dump_names, mut dump_dir) = (None::<String>, None::<String>);
     let mut spec = SpecArgs::default();
@@ -205,9 +204,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
             "--ride-dump" => ride_dump = Some(args.next().ok_or("--ride-dump dir")?.into()),
             "--ride-prefix" => ride_prefix = args.next().ok_or("--ride-prefix N")?.parse()?,
-            // Objects built with PLOW_NV_KV_PAGED (docs/arch/27 P0): fill their page tables
-            // (0 identity, 1 reversed, 2 interleaved) before the prompts are prefilled.
-            "--kv-pages" => kv_pages = Some(args.next().ok_or("--kv-pages MODE")?.parse()?),
             "--ride-salt" => ride_salt = args.next().ok_or("--ride-salt N")?.parse()?,
             other => return Err(format!("unknown argument {other}").into()),
         }
@@ -238,12 +234,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .unwrap_or_else(|_| assets.join("checkpoint"));
     let be = Arc::new(plowrt::device::cuda::CudaBackend::new(0)?);
     let mut e = plowrt::exec::gpu::GpuEngine::load(be, &assets, &ckpt)?;
-    if let Some(mode) = kv_pages {
-        if !e.kv_pages_init(mode)? {
-            return Err("--kv-pages: the decode object has no page tables".into());
-        }
-        println!("  kv pages: mode {mode}");
-    }
     let slots = want_slots.min(e.batch());
     if prefill_logits_dir.is_some() && !e.has_prefill() {
         return Err("prefill logit capture requires GPU prefill".into());
