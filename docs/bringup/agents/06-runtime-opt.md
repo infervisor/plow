@@ -203,10 +203,12 @@ Highest value first; keep only what helps *your* target:
    Sequential drain is therefore required. Phase-local scratch/tensor tables,
    KV rebasing, staging and trace ownership are prerequisites to overlap, along
    with a physical-range disjointness proof and concurrent parity tests.
-4. **Prefix cache** if traffic shares prefixes: `--vmm-prefix` (nvidia;
-   `--vmm-block-mib` is the real knob — 64 MiB won at long ctx on the measured
-   part) or `--prefix-cache` (amd, recurrent families).
-   **Always report the hit rate** — a low-hit cache is a net loss.
+4. **Prefix cache** is always on, VMM prefix included (`--vmm-prefix` on
+   nvidia, `--vmm-block-mib` is the real knob — 64 MiB won at long ctx on the
+   measured part; `--prefix-cache` on amd, recurrent families). Never disable it
+   as a tuning lever: a prefix-cache cost (low-hit snapshot/insert overhead) is a
+   plowrt bug to fix in this campaign. **Always report the hit rate**, and bench
+   against a reference with its prefix cache on too.
 5. **TP** if one `$GPU` cannot hold the model / hit the budget; `$PARALLEL` must
    be `tp`. Check peer visibility with `plowrt devices --tp $NGPU`, then gate
    performance and rank agreement with `plowrt bench` on the TP assets. The
