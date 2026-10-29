@@ -850,7 +850,10 @@ static __device__ __forceinline__ unsigned qwen_conv4_tile_rows(unsigned rows, u
     for (unsigned k = 1;; k++) {
         unsigned vt = (unsigned)((row_items + k * resident - 1) / (k * resident));
         vt = (vt + DEPTH - 1) / DEPTH * DEPTH;
-        if (vt < DEPTH) vt = DEPTH;
+        /* A tile past the first reads its three taps at rows t0-3..t0-1 of the chunk: t0 >= 3,
+         * else t0-3 wraps (unsigned) far outside the input. */
+        constexpr unsigned MIN_VT = (3u + DEPTH - 1u) / DEPTH * DEPTH;
+        if (vt < MIN_VT) vt = MIN_VT;
         if (vt <= 64) return vt;
     }
 }

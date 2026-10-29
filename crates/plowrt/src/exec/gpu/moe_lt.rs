@@ -108,6 +108,15 @@ const TAIL_MAX_HIDDEN: u32 = 12 * GLUE_THREADS;
 /// which bounds a decode rung's gathered-row extent by `rows * k + experts * ALIGN_PAD`.
 const ALIGN_PAD: u64 = 128;
 
+/// Experts the glue kernels' shared prefix table (`moe_lt_live_prefix`, `pre[257]`) holds.
+const MAX_EXPERTS: u32 = 256;
+
+/// The align writes each expert's rows padded to a tile: the gathered tables and scratch see up
+/// to `rows * k + experts * (ALIGN_PAD - 1)` rows, whatever the routing.
+fn align_fits(rows: u64, k: u32, experts: u32, capacity: u64) -> bool {
+    experts <= MAX_EXPERTS && capacity >= rows * u64::from(k) + u64::from(experts) * (ALIGN_PAD - 1)
+}
+
 /// `(segment, instruction)` pairs a set of routes executes, for `cublaslt::ordered_waits_for`.
 pub(super) fn instructions(segments: &[Option<MoeLtSegment>]) -> Vec<(usize, usize)> {
     segments
@@ -228,6 +237,7 @@ pub(super) fn segments(
             || g.i[5] > 1
             || capacity == 0
             || capacity > u64::from(u32::MAX)
+            || !align_fits(u64::from(program.t), align.i[2], experts, capacity)
             || bytes(g.t[2]) != u64::from(experts) * 16
             || bytes(g.t[3]) < (3 * u64::from(experts) + 1) * 4
             || [g.t[4], d.t[4], d.t[5]]
@@ -331,6 +341,7 @@ fn w8a8_segment(
         && g.i[5] <= 1
         && capacity > 0
         && capacity <= u64::from(u32::MAX)
+        && align_fits(tokens, TAIL_TOP_K, experts, capacity)
         && bytes(g.t[2]) == u64::from(experts) * 16
         && bytes(g.t[6]) == u64::from(experts) * 16
         && bytes(g.t[3]) >= (3 * u64::from(experts) + 1) * 4
@@ -503,6 +514,7 @@ pub(super) fn decode_segments(
             || hidden % 8 != 0
             || capacity == 0
             || capacity > u64::from(u32::MAX)
+            || !align_fits(u64::from(rows), k, experts, capacity)
             || bytes(g.t[3]) != u64::from(experts) * 16
             || bytes(g.t[6]) < (3 * u64::from(experts) + 1) * 4
             || [g.t[7], d.t[6], d.t[7]]
