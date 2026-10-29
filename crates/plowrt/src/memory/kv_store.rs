@@ -42,6 +42,10 @@ pub trait StoreOps: Send + Sync {
     fn copy_dtod_batch(&self, copies: &[(u64, u64, u64)]) -> Result<()>;
     /// Free device bytes now; `None` where the backend cannot say.
     fn free_bytes(&self) -> Option<u64>;
+    /// Every queued copy has completed (`VmmOps::quiesce`).
+    fn quiesce(&self) -> Result<()> {
+        Ok(())
+    }
 }
 
 impl<T: VmmOps + ?Sized> StoreOps for T {
@@ -74,6 +78,9 @@ impl<T: VmmOps + ?Sized> StoreOps for T {
     }
     fn free_bytes(&self) -> Option<u64> {
         VmmOps::free_bytes(self)
+    }
+    fn quiesce(&self) -> Result<()> {
+        VmmOps::quiesce(self)
     }
 }
 
@@ -1976,6 +1983,12 @@ impl Drop for KvStore {
             ops, inner, frees, ..
         } = self;
         let ops: &dyn StoreOps = &**ops;
+        // A spill or restore queued after the engine's last sync (the spill-ahead and restore
+        // threads run until the pool drops) may still be copying: free nothing under it.
+        if let Err(e) = ops.quiesce() {
+            tracing::warn!(error = %e, "kv store: copies unproven at drop, chunks leaked");
+            return;
+        }
         for chunk in frees.get_mut().drain(..) {
             chunk.free(ops);
         }

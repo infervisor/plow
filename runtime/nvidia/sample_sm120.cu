@@ -551,6 +551,9 @@ extern "C" __global__ void plow_sample(
         if (p == 0xFFFFFFFFu) {
             /* rng01 rounded to the mass edge: fall back to the highest-weight kept token. */
             for (unsigned i = 0; i < V; i++) if (e[i] >= floor) { p = i; break; }
+            /* No kept token (NaN weights fail every compare): a valid id, never -1, which the
+             * host would read as out of vocab and the logprob rows as a logits row index. */
+            if (p == 0xFFFFFFFFu) p = 0;
         }
         out_ids[b] = (int)p;
     }
@@ -836,7 +839,8 @@ extern "C" __global__ void plow_logprob_stats_rows(
     const unsigned* __restrict__ req, const int* __restrict__ ids, unsigned V,
     unsigned out_stride) {
     const unsigned* q = req + 3u * blockIdx.x;
-    const unsigned tok = ids ? (unsigned)ids[q[0]] : q[1];
+    const unsigned t = ids ? (unsigned)ids[q[0]] : q[1];
+    const unsigned tok = t < V ? t : 0u;
     lp_stats_row(logits, out + (size_t)blockIdx.x * out_stride, q[0], tok, V, q[2]);
 }
 
