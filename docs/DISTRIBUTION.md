@@ -236,7 +236,9 @@ its `.sha256`, `release.json`; create-only, so a version is never
 republished with other bytes), rewrites `v1/runtime/index.json` (every
 release and triple, newest first, for a models page) and `v1/runtime/latest`
 (the version string alone, always copied from the index's `latest` after the
-index write, so two racing publishers cannot leave it behind the index), and publishes `scripts/install.sh` at the
+index write; each publisher re-reads the index after its own pointer write and
+corrects a write that landed late, so racing publishers, rollbacks included,
+cannot leave it behind the index), and publishes `scripts/install.sh` at the
 registry root when asked. The same credentials and conditional writes as
 `push`. A client installs with:
 
