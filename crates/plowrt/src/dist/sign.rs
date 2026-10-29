@@ -28,6 +28,21 @@ pub struct PublicKey {
     pub bytes: [u8; 32],
 }
 
+/// The key the public registry at `pdist.infervisor.ai` is signed with. A
+/// client trusts it there by default; `PLOW_TRUSTED_KEYS` replaces it.
+pub const PUBLISHER_KEY: &str = "infervisor-2026:ESz+iXQToovy4GhRUgTHoUKUwMumUA/ls/4tAaEjL3M=";
+
+/// Whether `registry` (a `--registry` value, a reference's registry, or a
+/// push destination) is the public registry: its host, or an `r2://`
+/// destination, which is where it is published from.
+pub fn is_public_registry(registry: &str) -> bool {
+    let host = registry
+        .trim_start_matches("https://")
+        .trim_start_matches("http://")
+        .trim_end_matches('/');
+    host == super::reference::DEFAULT_REGISTRY || registry.starts_with("r2://")
+}
+
 /// The keys a client accepts an index from.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Trust(pub Vec<PublicKey>);
@@ -35,6 +50,25 @@ pub struct Trust(pub Vec<PublicKey>);
 impl Trust {
     pub fn none() -> Self {
         Trust(Vec::new())
+    }
+
+    /// The publisher key of the public registry.
+    pub fn publisher() -> Self {
+        Trust(vec![PublicKey::parse(PUBLISHER_KEY).expect("a valid built-in key")])
+    }
+
+    /// What to verify `registry` with: `PLOW_TRUSTED_KEYS` (`env`) when set,
+    /// for any registry; otherwise the built-in publisher key for the public
+    /// registry and nothing for any other (a `file://` mirror, a test, a
+    /// private bucket). So a client never silently accepts an unsigned or
+    /// re-signed index from the public registry, and a mirror still works
+    /// without configuration.
+    pub fn for_registry(env: Option<&str>, registry: &str) -> Result<Self> {
+        match env {
+            Some(list) => Self::parse(list),
+            None if is_public_registry(registry) => Ok(Self::publisher()),
+            None => Ok(Self::none()),
+        }
     }
 
     /// `PLOW_TRUSTED_KEYS`: comma-separated `<name>:<base64>` entries. Set
@@ -266,5 +300,40 @@ mod tests {
         assert_eq!(trust.0.len(), 2);
         assert!(SecretKey::generate("has space").is_err());
         assert!(PublicKey::parse("nocolon").is_err());
+    }
+}
+
+#[cfg(test)]
+mod trust_tests {
+    use super::*;
+
+    #[test]
+    fn the_public_registry_is_verified_by_default_and_a_mirror_is_not() {
+        let t = Trust::for_registry(None, "pdist.infervisor.ai").unwrap();
+        assert_eq!(t.0.len(), 1);
+        assert_eq!(t.0[0].name, "infervisor-2026");
+        assert_eq!(Trust::for_registry(None, "https://pdist.infervisor.ai/").unwrap(), t);
+        assert_eq!(Trust::for_registry(None, "r2://").unwrap(), t);
+        assert_eq!(Trust::for_registry(None, "r2://acct/pdist").unwrap(), t);
+        assert!(Trust::for_registry(None, "file:///mirror").unwrap().is_empty());
+        assert!(Trust::for_registry(None, "beta-api.infervisor.ai").unwrap().is_empty());
+        assert!(Trust::for_registry(None, "s3://bucket").unwrap().is_empty());
+    }
+
+    #[test]
+    fn an_explicit_key_list_replaces_the_built_in_one_everywhere() {
+        let k = SecretKey::generate("mine").unwrap().public().to_string();
+        let t = Trust::for_registry(Some(&k), "pdist.infervisor.ai").unwrap();
+        assert_eq!(t.0.len(), 1);
+        assert_eq!(t.0[0].name, "mine");
+        let t = Trust::for_registry(Some(&k), "file:///mirror").unwrap();
+        assert_eq!(t.0[0].name, "mine");
+        // Set but empty is a configuration error, not "verify nothing".
+        assert!(Trust::for_registry(Some(" , "), "pdist.infervisor.ai").is_err());
+    }
+
+    #[test]
+    fn the_built_in_key_is_the_one_the_docs_name() {
+        assert_eq!(Trust::publisher().0[0].to_string(), PUBLISHER_KEY);
     }
 }

@@ -320,11 +320,14 @@ at `pdist.infervisor.ai` is signed with
 index>.sig`, before the index itself: a reader fetches the signature of
 exactly the bytes it read, so no reader sees an index without its signature
 and two publishers' signatures cannot land on each other's index. A client
-with `PLOW_TRUSTED_KEYS=<name>:<base64>[,…]` refuses an index that is
-unsigned, signed by another key, or changed after signing; the index names
-every manifest by digest and each manifest its blobs, so this one signature
-covers the whole pull. A client with no trusted keys checks nothing, as
-before. `push` applies the same `PLOW_TRUSTED_KEYS` to the index already in
+refuses an index that is unsigned, signed by another key, or changed after
+signing; the index names every manifest by digest and each manifest its
+blobs, so this one signature covers the whole pull. Which keys: the public
+registry is verified with the built-in publisher key above, with nothing to
+configure; `PLOW_TRUSTED_KEYS=<name>:<base64>[,…]` replaces that list for
+any registry (set but empty is an error, not "verify nothing"); any other
+registry — a `file://` mirror, a private bucket — is checked only when
+`PLOW_TRUSTED_KEYS` names its keys. `push` applies the same `PLOW_TRUSTED_KEYS` to the index already in
 the bucket, whose rows it carries into the new, signed index; with none set it
 warns that they are carried unverified, which is the bootstrap for a registry
 published before signing existed. Without a key, `push` to a bucket warns and

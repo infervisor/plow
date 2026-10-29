@@ -228,6 +228,9 @@ mod remote {
     const PART: usize = 64 << 20;
     /// Blobs up to this size go through the REST API as a single PUT.
     const REST_SINGLE_PUT: usize = 2 << 30;
+    /// What Cloudflare's REST object API takes in one PUT (413 beyond it);
+    /// it has no multipart route, so a larger blob needs the S3 keys.
+    const REST_MAX_OBJECT: u64 = 300 << 20;
 
     /// The CLI runs `push` on its multi-thread runtime, which a nested
     /// `block_on` must step out of; a test calls in with no runtime at all.
@@ -244,6 +247,8 @@ mod remote {
         driver: Driver,
         name: String,
         part: usize,
+        /// The largest object the destination accepts, when it has a cap.
+        max_object: Option<u64>,
     }
 
     impl StoreSink {
@@ -263,10 +268,15 @@ mod remote {
                 driver,
                 name,
                 part: PART,
+                max_object: None,
             })
         }
         fn with_part_size(mut self, part: usize) -> Self {
             self.part = part;
+            self
+        }
+        fn with_max_object(mut self, max: u64) -> Self {
+            self.max_object = Some(max);
             self
         }
 
@@ -415,6 +425,18 @@ mod remote {
             cond: Cond,
         ) -> Result<Put> {
             let k = self.key(key)?;
+            if let Some(max) = self.max_object {
+                if len > max {
+                    return Err(dist(format!(
+                        "{}/{key}: {len} bytes is above the {max} bytes Cloudflare's REST object \
+                         API takes in one PUT, and it has no multipart upload. Publish with the \
+                         S3 keys instead (CLOUDFLARE_R2_ACCESS_KEY_ID + \
+                         CLOUDFLARE_R2_SECRET_ACCESS_KEY, unset CLOUDFLARE_API_TOKEN), which \
+                         upload in parts; blobs already uploaded are kept and skipped on the re-run",
+                        self.name
+                    )));
+                }
+            }
             if len > self.part as u64 {
                 self.put_parts(key, &k, body, content_type, cond)
             } else {
@@ -503,6 +525,7 @@ mod remote {
         // the default part size and multipart for anything larger.
         Ok(Box::new(if rest {
             sink.with_part_size(REST_SINGLE_PUT)
+                .with_max_object(REST_MAX_OBJECT)
         } else {
             sink
         }))
@@ -564,6 +587,27 @@ mod remote {
             assert_eq!(s.get("v1/x").unwrap().unwrap().0, b"two");
             let e = s.head("../x").unwrap_err().to_string();
             assert!(e.contains("not a relative key"), "{e}");
+        }
+
+        #[test]
+        fn a_destination_with_an_object_cap_refuses_a_larger_body_before_sending_it() {
+            let s = memory(PART).with_max_object(10);
+            assert!(matches!(
+                put(&s, "v1/fits", &[7u8; 10], Cond::IfNoneMatchAny),
+                Put::Stored(_)
+            ));
+            let e = s
+                .put(
+                    "v1/big",
+                    &mut &[7u8; 11][..],
+                    11,
+                    "application/octet-stream",
+                    Cond::IfNoneMatchAny,
+                )
+                .unwrap_err()
+                .to_string();
+            assert!(e.contains("S3 keys") && e.contains("11 bytes"), "{e}");
+            assert!(s.head("v1/big").unwrap().is_none(), "nothing was sent");
         }
 
         #[test]
