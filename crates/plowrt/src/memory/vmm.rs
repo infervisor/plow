@@ -102,6 +102,12 @@ pub trait VmmOps: Send + Sync {
         None
     }
 
+    /// Block until every copy this backend queued on any stream has completed (teardown, before
+    /// the memory those copies touch is freed). Default: copies are complete on return.
+    fn quiesce(&self) -> Result<()> {
+        Ok(())
+    }
+
     /// Take every pooled physical chunk `(handle, bytes)` a previous
     /// [`VmmSlab`] kept via [`Self::pool_put`]. Re-mapping a pooled chunk is
     /// ~free (map+set_access, µs-class) where creating one pays the driver's

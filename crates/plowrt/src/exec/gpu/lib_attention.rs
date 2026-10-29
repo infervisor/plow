@@ -476,6 +476,8 @@ impl LibAttention {
             (GATHER_OFF, GATHER_OFF + u64::from(pages) * 12),
             (PT_OFF, PT_OFF + pt_bytes),
         ];
+        self.be
+            .poison_table(self.table.base, self.table.len, stream)?;
         let upload = || -> Result<()> {
             for (start, end) in regions {
                 // SAFETY: the pinned staging stays untouched until `done` (recorded below) fires.

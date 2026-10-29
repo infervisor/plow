@@ -2018,6 +2018,17 @@ impl CudaBackend {
         )
     }
 
+    /// `poison-tables` builds: fill a per-launch device table with 0xFF before the launch writes
+    /// its entries, so entries it leaves stale read as out-of-range ids. A no-op otherwise.
+    pub fn poison_table(&self, dptr: u64, n: u64, stream: &CudaStream) -> Result<()> {
+        #[cfg(feature = "poison-tables")]
+        if n > 0 {
+            return self.memset_d8_async(dptr, 0xFF, n as usize, stream);
+        }
+        let _ = (dptr, n, stream);
+        Ok(())
+    }
+
     /// A CUDA event. `timing = true` supports [`Self::event_elapsed_ms`]
     /// (device-timeline instrumentation); `false` records cheaper (sync-only).
     pub fn event_create(&self, timing: bool) -> Result<CudaEvent> {
@@ -2381,6 +2392,10 @@ impl crate::memory::vmm::VmmOps for CudaBackend {
 
     fn free_bytes(&self) -> Option<u64> {
         self.mem_info().ok().map(|(free, _)| free)
+    }
+
+    fn quiesce(&self) -> Result<()> {
+        self.synchronize()
     }
 
     fn free(&self, va: u64) {
