@@ -85,6 +85,13 @@ flowchart LR
 
 **Implementation:** `Soc::partition_n` (in [`crates/costmodel/src/unit.rs`](../../crates/costmodel/src/unit.rs)) splits a GEMM along N into per-unit `Region`s, each sized ∝ its unit's throughput `weight` and rounded to that unit's MMA-N granularity; the tile-graph builder ([`crates/rewrite/src/tilegraph.rs`](../../crates/rewrite/src/tilegraph.rs)) emits a `Compute::Join` that concatenates the per-region slices on unit 0. A single-unit `Soc` degenerates to one region covering all of N (today's single-GPU path).
 
+**Deviation from implementation:** the above is the schedule path. Shipping TP packets take the
+devblob path (`plowc --emit devblob --num-gpus N`, which also rejects non-`Tp` strategies): devgen
+emits one program per rank with the collectives as inline entries of each rank's interpreter
+stream, gated by cross-GPU counters in peer-mapped VRAM; the host resets every rank's counters
+and dispatches every rank once per token (`crates/plowrt/src/exec/tp.rs`, `exec/amd_tp.rs`).
+Decode context parallelism is [21](21-decode-context-parallelism.md).
+
 ### Pipeline Parallelism (PP)
 
 ```mermaid
@@ -234,6 +241,10 @@ KV cache uses **page-table indirection** (design §10.6):
 - Layout within a page is the same across prefill and decode
 - Only the page count (and thus address-map entries) varies per request
 - `Growable` entries in the memory map accommodate dynamic page allocation
+
+**Deviation from implementation:** this is design only. The KV cache is not paged: each layer is
+a head-major per-slot ring backed by VMM per-slot commit, and a paged layout measured as a null
+(see [06](06-runtime.md#kv-cache), [22](22-kv-cache.md), [27 §6.5](27-kv-zero-copy.md)).
 
 ---
 
