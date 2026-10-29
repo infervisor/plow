@@ -77,7 +77,7 @@ def parse(text):
                 if cache:
                     p[f"{slot.lower()}_cache"] = cache.group(1)
         w = WEIGHT.search(head)
-        name = re.sub(r"layers\.\d+\.", "", w.group(1)).replace("model.language_model.", "").replace("model.", "") if w else ""
+        name = re.sub(r"layers\.\d+\.", "", w.group(1)).replace("model.language_model.", "").replace("model.", "") if w and not w.group(1).startswith("act.") else ""
         cur[2].append((int(m.group(1)), m.group(2), name, p))
     for _, rows, insts in progs:
         cache_shapes = {}
@@ -99,6 +99,8 @@ def cost(op, p, rows, ctx, wb, kvb):
     """(bytes, flops) of one instruction, or None when the op is not priced."""
     g = p.get
     m = g("M", rows)
+    if op == "Nop":  # dependency anchor (a block packet's entry)
+        return 0, 0
     if op in ("Gemm", "Gemv", "GemmMed", "GemmSmall", "GemmWide"):
         n, k = g("N"), g("K")
         return wb * n * k + 2 * m * k + 2 * m * n, 2 * m * n * k
@@ -194,15 +196,96 @@ def cost(op, p, rows, ctx, wb, kvb):
     if op == "QwenGdnPrefill":  # chunked delta rule: state in/out, q/k/v/o rows, ~6 HV K V per token
         hv, k, v, t = g("HV"), g("K"), g("V"), g("T", rows)
         return 8 * hv * k * v + 2 * t * (2 * g("HK") * k + 2 * hv * v), 6 * t * hv * k * v
-    return None
+    return moe_cost(op, p, rows, wb)
 
 
-def price(prog, ctx, wb, kvb, bw, tflops, fp8_tflops=None, prefill_past=None):
-    """Per instruction: key, bytes, flops, floor ms, bound."""
+GEMMA_MOE_EXPERT = {"MoeExpertGluGemma", "MoeExpertGluNormGemma", "MoeExpertGluGemmaFp8",
+                    "MoeExpertDownGemma", "MoeExpertDownGemmaFp8",
+                    "MoeGroupGluGemmaPf", "MoeGroupGluGemmaPfW8a8",
+                    "MoeGroupDownGemmaPf", "MoeGroupDownGemmaPfW8a8"}
+
+
+def moe_cost(op, p, rows, wb):
+    """Gemma-4 MoE (NVIDIA). Expert weights are charged for `experts` touched experts (`price`
+    injects it from the router-table or uniform-routing model); FP8/W8A8 experts carry one-byte
+    weights plus an FP32 scale per output row. The partial sums are FP32 (`act.moe.part`)."""
+    g = p.get
+    if op in ("MoeRouterGemmaScoreFast", "MoeRouterGemmaPf"):
+        t, h, n = (g("T", rows) if op == "MoeRouterGemmaPf" else rows), g("H"), g("n_exp")
+        out = t * g("k") * 8 if op == "MoeRouterGemmaPf" else t * n * 4
+        return 2 * n * h + 4 * h + 2 * t * h + out, 2 * t * n * h
+    if op == "MoeRouterGemmaTopk":
+        return rows * (4 * g("n_exp") + 8 * g("k")) + 2 * g("n_exp"), 0
+    if op == "MoeAlignGemmaPf":
+        return 20 * g("T", rows) * g("k") + 12 * g("n_exp"), 0
+    if op in ("MoeCombineNormGemma", "MoeCombineNormGemmaPf"):
+        t = g("T", rows) if op == "MoeCombineNormGemmaPf" else rows
+        return t * g("H") * (4 * g("k") + 4) + 2 * g("H"), 0
+    if op not in GEMMA_MOE_EXPERT:
+        return None
+    t, k, h = g("T", rows), g("k"), g("H")
+    i = g("I_moe") if g("I_moe") is not None else g("I")
+    if None in (t, k, h, i, g("experts")):
+        raise ValueError(f"{op}: expert shape needs T, k, H, I and the touched-expert count")
+    quantized = op.endswith(("Fp8", "W8a8"))
+    elem = 1 if quantized else wb
+    glu = "Glu" in op
+    n_out, k_in = (2 * i, h) if glu else (h, i)
+    weight = g("experts") * (n_out * k_in * elem + (4 * n_out if quantized else 0))
+    act_in = t * k * k_in if "W8a8" in op else 2 * t * (h if glu and "Group" not in op else k * k_in)
+    act_out = t * k * (2 * i if glu else 4 * h)
+    return weight + act_in + act_out, 2 * t * k * n_out * k_in
+
+
+def uniform_union(experts, topk, rows):
+    """Expected experts touched by `rows` independent uniformly routed rows."""
+    return experts * (1.0 - (1.0 - topk / experts) ** rows)
+
+
+class RouterTable:
+    """A captured `act.moe.table` ({u32 expert, f32 gate} x k per row, real traffic): the
+    touched-expert count of `rows` rows is the mean over evenly spaced row samples."""
+
+    def __init__(self, raw, topk):
+        import struct
+        if not raw or len(raw) % (8 * topk):
+            raise ValueError("router table must hold whole rows of k {u32 id, f32 gate} entries")
+        self.topk = topk
+        self.rows = []
+        for r in range(len(raw) // (8 * topk)):
+            ids = [struct.unpack_from("<I", raw, (r * topk + c) * 8)[0] for c in range(topk)]
+            if len(set(ids)) != topk:
+                raise ValueError(f"router table row {r} repeats an expert")
+            self.rows.append(frozenset(ids))
+
+    def union(self, experts, topk, rows):
+        if topk != self.topk or any(e >= experts for r in self.rows for e in r):
+            raise ValueError("router table does not match the packet's expert count / top-k")
+        n = len(self.rows)
+        if rows >= n:
+            return float(len(frozenset().union(*self.rows)))
+        stride = n // rows
+        samples = [frozenset().union(*(self.rows[(o + j * stride) % n] for j in range(rows)))
+                   for o in range(min(stride, 16))]
+        return sum(map(len, samples)) / len(samples)
+
+
+def price(prog, ctx, wb, kvb, bw, tflops, fp8_tflops=None, prefill_past=None, router=None):
+    """Per instruction: key, bytes, flops, floor ms, bound. `router` (a RouterTable) replaces
+    uniform routing when charging touched experts."""
     out = {}
+    routed = None  # (T, k, n_exp) of the program's latest router
     for idx, op, name, p in prog[2]:
         if prog[0] == "prefill" and op in ("FlashPrefill", "FlashPrefillFp8") and prefill_past is not None:
             p = dict(p, q_pos0=prefill_past, n_kv=prefill_past + p["n_q"])
+        if op in ("MoeRouterGemmaPf", "MoeAlignGemmaPf", "MoeRouterGemmaTopk"):
+            routed = (p.get("T", prog[1]), p["k"], p["n_exp"])
+        if op in GEMMA_MOE_EXPERT:
+            if routed is None or routed[2] != p["n_exp"]:
+                raise ValueError(f"{op} at #{idx} has no preceding router of its expert count")
+            t, k, n = routed
+            touched = (router.union if router else uniform_union)(n, k, t)
+            p = dict(p, T=t, k=k, experts=touched)
         c = cost(op, p, prog[1], ctx, wb, kvb)
         if c is None:
             out[idx] = (f"{op}", None, None, 0.0, "unpriced")
@@ -214,6 +297,36 @@ def price(prog, ctx, wb, kvb, bw, tflops, fp8_tflops=None, prefill_past=None):
         key = f"{op}:{name}" if name else op
         out[idx] = (key, c[0], c[1], max(mem, mat), "matrix" if mat > mem else "hbm")
     return out
+
+
+def ceilings(a, hw):
+    """(GB/s, BF16 TFLOP/s, FP8 TFLOP/s, provenance). A ceilings file from
+    calibrate_ceilings.py is measured on the box; the registry is a datasheet hypothesis."""
+    if getattr(a, "ceilings", None):
+        with open(a.ceilings) as f:
+            cal = json.load(f)
+        missing = [k for k in ("bw_gbps", "bf16_tflops", "fp8_tflops") if not cal.get(k)]
+        if missing:
+            raise ValueError(f"{a.ceilings}: missing {', '.join(missing)}")
+        bw, tf, f8 = cal["bw_gbps"], cal["bf16_tflops"], cal["fp8_tflops"]
+        source = f"calibrated {cal.get('device', '?')} {cal.get('date', '')}".strip()
+    else:
+        bw, tf, f8 = hw.bandwidth_for_bound_gbps, hw.bf16_tflops_dense, hw.fp8_tflops_dense
+        source = f"registry {hw.name}, NOT calibrated"
+    if a.bw or a.tflops or a.fp8_tflops:
+        source += " + explicit overrides"
+    return a.bw or bw, a.tflops or tf, a.fp8_tflops or f8, source
+
+
+def load_router(path, progs):
+    if not path:
+        return None
+    ks = {p["k"] for _, _, insts in progs for _, op, _, p in insts
+          if op in ("MoeRouterGemmaPf", "MoeRouterGemmaTopk")}
+    if len(ks) != 1:
+        raise ValueError("--router-table needs a packet with one MoE top-k")
+    with open(path, "rb") as f:
+        return RouterTable(f.read(), int(ks.pop()))
 
 
 def require_priced(prog, priced):
@@ -418,6 +531,10 @@ def main():
     ap.add_argument("--bw", type=float, help="GB/s (default: the --gpu registry)")
     ap.add_argument("--tflops", type=float, help="dense BF16 matrix TFLOP/s")
     ap.add_argument("--fp8-tflops", type=float, help="dense FP8 matrix TFLOP/s for W8A8 GEMMs")
+    ap.add_argument("--ceilings", help="calibrated ceilings JSON (scripts/bench/calibrate_ceilings.py); "
+                    "--bw/--tflops/--fp8-tflops override its fields")
+    ap.add_argument("--router-table", help="captured act.moe.table (scripts/bench/router_table.py); "
+                    "default: uniform routing")
     ap.add_argument("--wbytes", type=float, default=2.0)
     ap.add_argument("--kvbytes", type=float, default=2.0)
     ap.add_argument("--top", type=int, default=15)
@@ -435,12 +552,13 @@ def main():
     if a.ctx is None:
         ap.error("--ctx is required for theoretical roofline analysis")
     hw = lookup_gpu(a.gpu)
-    bw, tf = a.bw or hw.bandwidth_for_bound_gbps, a.tflops or hw.bf16_tflops_dense
-    fp8_tf = a.fp8_tflops or hw.fp8_tflops_dense
+    bw, tf, fp8_tf, source = ceilings(a, hw)
     progs = parse(open(a.disasm).read())
+    router = load_router(a.router_table, progs)
     if not progs:
         sys.exit(f"{a.disasm}: no programs (expected `plowrt disasm` output)")
-    print(f"# Op roofline: {os.path.basename(a.disasm)}, ctx {a.ctx}, {hw.name} {bw:.0f} GB/s, {tf:.0f} BF16 / {fp8_tf:.0f} FP8 TFLOP/s\n")
+    print(f"# Op roofline: {os.path.basename(a.disasm)}, ctx {a.ctx}, {bw:.0f} GB/s, {tf:.0f} BF16 / "
+          f"{fp8_tf:.0f} FP8 TFLOP/s ({source})\n")
     if a.prefill_past is not None:
         print(f"Prefill scenario: one contiguous chunk after {a.prefill_past} prefix tokens; "
               "not a packed mixture of requests.\n")
@@ -453,7 +571,7 @@ def main():
         prog = find("decode", int(b))
         if prog is None:
             sys.exit(f"no decode program T={b} in {a.disasm}")
-        pr = price(prog, a.ctx, a.wbytes, a.kvbytes, bw, tf, fp8_tf, a.prefill_past)
+        pr = price(prog, a.ctx, a.wbytes, a.kvbytes, bw, tf, fp8_tf, a.prefill_past, router)
         require_priced(prog, pr)
         skel, delta, full = sweep_deltas(path)
         if delta.keys() != pr.keys():
@@ -482,7 +600,7 @@ def main():
         prog = find("prefill", a.segtime_rows)
         if prog is None:
             sys.exit(f"no prefill program T={a.segtime_rows} in {a.disasm}")
-        pr = price(prog, a.ctx, a.wbytes, a.kvbytes, bw, tf, fp8_tf, a.prefill_past)
+        pr = price(prog, a.ctx, a.wbytes, a.kvbytes, bw, tf, fp8_tf, a.prefill_past, router)
         require_priced(prog, pr)
         rows, chunks = collections.OrderedDict(), 0
         with open(a.segtime, errors="replace") as source:
@@ -521,7 +639,7 @@ def main():
         print("| program | rows | floor ms | floor ms/row | top op (floor) |")
         print("|---|---:|---:|---:|---|")
         for prog in progs:
-            pr = price(prog, a.ctx, a.wbytes, a.kvbytes, bw, tf, fp8_tf, a.prefill_past)
+            pr = price(prog, a.ctx, a.wbytes, a.kvbytes, bw, tf, fp8_tf, a.prefill_past, router)
             require_priced(prog, pr)
             by = collections.Counter()
             for key, _, _, fm, _ in pr.values():

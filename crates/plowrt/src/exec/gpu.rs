@@ -14813,6 +14813,9 @@ impl GpuEngine {
                 "act.moe.h1",
                 "act.moe.xn2",
                 "act.moe.comb",
+                // {u32 expert, f32 gate} x top-k per row: real routing for block rooflines
+                // (scripts/bench/router_table.py).
+                "act.moe.table",
             ] {
                 let Some(i) = self.handle_of(name) else {
                     continue;
@@ -14839,6 +14842,12 @@ impl GpuEngine {
         }
         self.be
             .memset_d8_async(ctr_base, 0, ctr_bytes, &self.stream)
+    }
+
+    /// Library prefill attention launches since load: (served by the library, fell back to the
+    /// native role). `None` when the packet declares no library route.
+    pub fn library_attention_launches(&self) -> Option<(u64, u64)> {
+        self.lib_attention.as_ref().map(|lib| lib.launch_counts())
     }
 
     /// Read a named tensor as raw bytes for diagnostics.

@@ -317,6 +317,32 @@ def cmd_block_ab(a: argparse.Namespace) -> None:
     print(f"queued {record['job']}; results: {out}")
 
 
+def cmd_nv_block_ab(a: argparse.Namespace) -> None:
+    import nv_block_ab
+
+    env = dict(kv.split("=", 1) for kv in (a.env or []))
+    out = nv_block_ab.prepare(a.control, a.treatment, a.block_run, a.plowrt, a.out, a.verb, a.args, env, a.note)
+    score = [sys.executable, str(REPO / "scripts/campaign/nv_block_ab.py"), "score", str(out)]
+    for flag, value in (("--ceilings", a.ceilings), ("--router-table", a.router_table)):
+        if value:
+            score += [flag, str(Path(value).resolve())]
+    with open(out / "run.sh", "a") as f:
+        f.write(shlex.join(score) + "\n")
+    record = json.loads((out / "record.json").read_text())
+    record.update(scorer_sha256=sha(REPO / "scripts/campaign/nv_block_ab.py"), score_command=score)
+    if a.dry_run:
+        (out / "record.json").write_text(json.dumps(record, indent=2) + "\n")
+        print(f"wrote {out / 'run.sh'} (not submitted)")
+        return
+    command = [sys.executable, str(REPO / "scripts/bench/gpuq.py"), "--root", a.queue, "submit",
+               "nv-block-ab", "1", "bash", str(REPO / "scripts/bench/quietx.sh"),
+               str(Path(a.quiet_lock).resolve()), "bash", str(out / "run.sh")]
+    submitted = subprocess.run(command, check=True, capture_output=True, text=True)
+    record.update(job=submitted.stdout.strip(), queue=a.queue)
+    (out / "record.json").write_text(json.dumps(record, indent=2) + "\n")
+    print(f"queued {record['job']}; results: {out}/comparison.md")
+
+
 def git(*args: str, raw: bool = False) -> str:
     output = subprocess.run(["git", *args], cwd=REPO, capture_output=True, text=True).stdout
     return output if raw else output.strip()
@@ -570,7 +596,9 @@ def cmd_build(a: argparse.Namespace) -> None:
     if errs := spec_env.errors(r):
         die("; ".join(errs))
     cell, emit = r["cell"], dict(r["emit"])
-    emit["env"] = {**spec_env.emit_env(r), **emit.get("env", {})}
+    block = getattr(a, "block", None)
+    # A block packet has no token entry or lm_head, so it carries no speculative drafter.
+    emit["env"] = {**({} if block else spec_env.emit_env(r)), **emit.get("env", {})}
     if getattr(a, "hf_dir", None):
         cell["hf_dir"] = a.hf_dir
     out = Path(a.out).resolve()
@@ -615,6 +643,9 @@ def cmd_build(a: argparse.Namespace) -> None:
     ]
     if "max_ctx" in cell and cell["max_ctx"]:
         base_args.extend(["--max-ctx", str(cell["max_ctx"])])
+    if block:
+        # A single-block packet with the recipe's own emit env, objects and routes.
+        base_args.extend(["--block", block])
     common = env_with(os.environ, emit.get("env", {}))
     serve_defaults, skipped = packet_serve_defaults(r, out)
     if skipped:
@@ -738,6 +769,7 @@ def cmd_build(a: argparse.Namespace) -> None:
             "sub_emit_env": sub_env or None,
         },
         "cell": cell,
+        "block": block,
         "overrides": overrides,
         "rung_overrides": list(getattr(a, "rung_env", None) or []),
         "object_overrides": object_overrides,
@@ -753,6 +785,9 @@ def cmd_build(a: argparse.Namespace) -> None:
     rec["cublaslt"] = lt_record(r, assets) if nvidia else None
     (out / "build-record.json").write_text(json.dumps(rec, indent=1))
     print(f"built {assets}\nrecord {out / 'build-record.json'}", file=sys.stderr)
+    if block:
+        # A block packet is not a serving bundle: no Lean bundle qualification, no serve probe.
+        return
     lean_qualify(assets, out / "lean-qualification.json", strict=False)
     if not nvidia:
         return
@@ -2147,7 +2182,25 @@ def main() -> None:
     b.add_argument("--plowrt", help="plowrt the probe serves with (default [serve].plowrt, else target/release/plowrt)")
     b.add_argument("--store-cell", help="tune-store SKU cell for the probe (default: [target].sku folded, e.g. h100-sxm5)")
     b.add_argument("--hf-dir", help="checkpoint snapshot on this host, replacing [cell].hf_dir; recorded")
+    b.add_argument("--block", metavar="L[..R]", help="emit only layers [L, R) as a block packet (block_run), "
+                   "same emit env/objects/routes as the recipe; recorded")
     b.set_defaults(f=cmd_build)
+    nb = sp.add_parser("nv-block-ab", help="NVIDIA four-arm single-block A/B in one queued lease (block_run)")
+    nb.add_argument("--control", required=True, help="production block assets (campaign.py build --block)")
+    nb.add_argument("--treatment", required=True, help="candidate block assets")
+    nb.add_argument("--verb", choices=["bench", "prefill-bench"], default="bench")
+    nb.add_argument("--args", required=True, help='block_run arguments, e.g. "--batch 1,8 --ctx 4096 --iters 200"')
+    nb.add_argument("--env", action="append", metavar="K=V", help="exported for every arm; recorded")
+    nb.add_argument("--block-run", default=str(Path(os.environ.get("CARGO_TARGET_DIR", REPO / "target")) / "release/examples/block_run"))
+    nb.add_argument("--plowrt", default=str(Path(os.environ.get("CARGO_TARGET_DIR", REPO / "target")) / "release/plowrt"),
+                    help="plowrt used for the treatment packet's disassembly (floor)")
+    nb.add_argument("--ceilings", help="calibrate_ceilings.py output (else registry, marked NOT calibrated)")
+    nb.add_argument("--router-table", help="router_table.py output for MoE blocks")
+    nb.add_argument("--out", required=True); nb.add_argument("--note", required=True)
+    nb.add_argument("--queue", default="/tmp/plow-gpuq")
+    nb.add_argument("--quiet-lock", default="/tmp/plow-campaign-quiet.lock")
+    nb.add_argument("--dry-run", action="store_true", help="freeze and write run.sh, do not submit")
+    nb.set_defaults(f=cmd_nv_block_ab)
     q = sp.add_parser("qualify", help="Lean receipt/media qualification of a bundle (plowrt qualify)")
     q.add_argument("--assets", required=True); q.add_argument("--out", help="report (default <assets>/../lean-qualification.json)")
     q.add_argument("--strict", action="store_true", help="exit non-zero unless every packet qualifies")

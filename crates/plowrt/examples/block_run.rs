@@ -11,6 +11,9 @@
 //!   block_run <asset-dir> mixed-check --rows 128 --decode 1
 //!   block_run <asset-dir> packed-check [--requests 16 --query-rows 128 --kv-base 4096]
 //!                                      [--dump-dir dir] [--dump-tensors name,name]
+//!   block_run <asset-dir> prefill-bench --query-rows 512,2048 --prior 0,4096,16384
+//!                                      [--requests N] [--riders D --rider-ctx C]
+//!                                      [--iters 20] [--warmup 3] [--out-dir dir]
 //!
 //! `check` feeds a hidden-state into `act.x` (an .npy or a seeded synthetic),
 //! launches one prefill bucket, reads `act.x` back, and prints shape / min /
@@ -23,6 +26,16 @@
 //! isolated block has no upstream, so `act.x` is not refreshed between decode
 //! steps — the tokens are meaningless, but the per-step KERNEL time (the sweep
 //! metric) is data-independent, which is the point.
+//!
+//! `prefill-bench` times one prefill launch per point: `--requests` chunks of `--query-rows`
+//! rows, each after `--prior` rows of its own prefix (prefilled untimed first), plus `--riders`
+//! one-row decode requests at `--rider-ctx` riding the same packed launch. Rows land in
+//! `sweep.json` as `{"phase": "prefill", ...}` for `scripts/campaign/block_roofline.py`. Without
+//! a packed-prefill contract only one request without riders is timed (the serial chunk path).
+//!
+//! Every `sweep.json` carries `provenance`: packet and binary sha256, device, the block
+//! descriptor, the packet's static route inventory and the library-attention launch counts
+//! (served vs native fallback), so a block number states which routes it measured.
 //!
 //! Cloned from `examples/step_bench.rs`; env `PLOW_CHECKPOINT` overrides the
 //! default `<asset>/checkpoint`, `PLOW_STEP_TIME=1` adds the engine's host-op
@@ -154,11 +167,11 @@ mod cuda {
         let mut args = std::env::args().skip(1);
         let asset = PathBuf::from(
             args.next()
-                .ok_or("usage: block_run <asset-dir> <check|bench|mixed-check> [flags]")?,
+                .ok_or("usage: block_run <asset-dir> <check|bench|prefill-bench|mixed-check|packed-check> [flags]")?,
         );
         let verb = args
             .next()
-            .ok_or("usage: block_run <asset-dir> <check|bench|mixed-check> [flags]")?;
+            .ok_or("usage: block_run <asset-dir> <check|bench|prefill-bench|mixed-check|packed-check> [flags]")?;
         let rest: Vec<String> = args.collect();
         let flag = |name: &str| -> Option<String> {
             rest.iter()
@@ -179,6 +192,7 @@ mod cuda {
             .map(PathBuf::from)
             .unwrap_or_else(|_| asset.join("checkpoint"));
         let be = Arc::new(plowrt::device::cuda::CudaBackend::new(0)?);
+        let device = be.device_name().to_string();
         let mut e = plowrt::exec::gpu::GpuEngine::load(be, &asset, &ckpt)?;
         println!(
             "block L{} arch={} hidden={hidden} engine batch={} max_ctx={} prefill={}",
@@ -198,20 +212,247 @@ mod cuda {
 
         match verb.as_str() {
             "check" => check(&mut e, hidden, &out_name, &flag),
-            "bench" => {
-                // `bench` prefills every slot, so it still needs the _pf object.
+            "bench" | "prefill-bench" => {
+                // Both prefill slots, so they need the _pf object.
                 if !e.has_prefill() {
-                    return Err(
-                        "block_run bench needs the prefill (_pf) object — set PLOW_NV_CUBIN_PF"
-                            .into(),
-                    );
+                    return Err(format!(
+                        "block_run {verb} needs the prefill (_pf) object — set PLOW_NV_CUBIN_PF"
+                    )
+                    .into());
                 }
-                bench(&mut e, hidden, &flag)
+                let rows = if verb == "bench" {
+                    bench(&mut e, hidden, &flag)?
+                } else {
+                    prefill_bench(&mut e, hidden, &flag)?
+                };
+                let out_dir = flag("--out-dir")
+                    .map(PathBuf::from)
+                    .unwrap_or_else(|| PathBuf::from("/dev/shm/block-asset/bench"));
+                std::fs::create_dir_all(&out_dir)?;
+                let out = out_dir.join("sweep.json");
+                let doc = serde_json::json!({
+                    "sweep": rows,
+                    "provenance": provenance(&e, &asset, &desc, &device)?,
+                });
+                std::fs::write(&out, serde_json::to_vec_pretty(&doc)?)?;
+                println!("wrote {}", out.display());
+                if let Some(profile) = e.trace_summary()? {
+                    println!("{profile}");
+                }
+                Ok(())
             }
             "mixed-check" => mixed_check(&mut e, &desc, hidden, &out_name, &flag),
             "packed-check" => packed_check(&mut e, &desc, hidden, &out_name, &flag),
-            other => Err(format!("unknown verb {other:?} (check|bench|mixed-check)").into()),
+            other => Err(format!(
+                "unknown verb {other:?} (check|bench|prefill-bench|mixed-check|packed-check)"
+            )
+            .into()),
         }
+    }
+
+    fn sha256_file(path: &Path) -> Result<String, Box<dyn std::error::Error>> {
+        use sha2::Digest;
+        let digest = sha2::Sha256::digest(std::fs::read(path)?);
+        Ok(digest.iter().map(|b| format!("{b:02x}")).collect())
+    }
+
+    /// What a block number measured: packet, binary, device, descriptor, declared routes and
+    /// the library-attention launches that actually ran.
+    fn provenance(
+        e: &plowrt::exec::gpu::GpuEngine,
+        asset: &Path,
+        desc: &plow_asset::BlockDescriptor,
+        device: &str,
+    ) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
+        let pkt = asset.join("model.pkt");
+        let raw = std::fs::read(&pkt)?;
+        let blob = plowrt::asset::devblob::DevBlob::parse_l2(&raw, true)?;
+        let routes = plowrt::inventory::inventory(&blob, &raw, Some(asset))?;
+        let exe = std::env::current_exe()?;
+        let env: serde_json::Map<String, serde_json::Value> = std::env::vars()
+            .filter(|(k, _)| k.starts_with("PLOW_"))
+            .map(|(k, v)| (k, serde_json::Value::String(v)))
+            .collect();
+        Ok(serde_json::json!({
+            "asset": asset.display().to_string(),
+            "packet_sha256": sha256_file(&pkt)?,
+            "binary": exe.display().to_string(),
+            "binary_sha256": sha256_file(&exe)?,
+            "device": device,
+            "block": desc,
+            "routes": routes,
+            "library_attention": e.library_attention_launches().map(|(served, fallback)| {
+                serde_json::json!({"served": served, "native_fallback": fallback})
+            }),
+            "env": env,
+        }))
+    }
+
+    fn median_p95(mut v: Vec<f64>) -> (f64, f64) {
+        v.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        (
+            v[v.len() / 2],
+            v[((v.len() as f64 * 0.95) as usize).min(v.len() - 1)],
+        )
+    }
+
+    /// One prefill launch per point after an untimed prefix (see the module docs).
+    fn prefill_bench(
+        e: &mut plowrt::exec::gpu::GpuEngine,
+        hidden: usize,
+        flag: &dyn Fn(&str) -> Option<String>,
+    ) -> Result<Vec<serde_json::Value>, Box<dyn std::error::Error>> {
+        use plowrt::exec::gpu::{PfBatchReq, PrefillStep};
+        let num = |name: &str, default: usize| -> Result<usize, Box<dyn std::error::Error>> {
+            Ok(flag(name)
+                .map(|s| s.parse())
+                .transpose()?
+                .unwrap_or(default))
+        };
+        let query_rows = flag("--query-rows").map_or_else(|| vec![128], |s| parse_list(&s));
+        let priors = flag("--prior").map_or_else(|| vec![0], |s| parse_list(&s));
+        let requests = num("--requests", 1)?;
+        let riders = num("--riders", 0)?;
+        let iters = num("--iters", 20)?.max(1);
+        let warmup = num("--warmup", 3)?;
+        let rider_ctx_flag = flag("--rider-ctx")
+            .map(|s| s.parse::<usize>())
+            .transpose()?;
+        let packed = e.pf_batch_enabled();
+        if requests == 0 || requests + riders > e.batch() {
+            return Err(format!(
+                "prefill-bench needs 1 <= requests and requests + riders <= {} slots",
+                e.batch()
+            )
+            .into());
+        }
+        if !packed && (requests != 1 || riders != 0) {
+            return Err(
+                "packet has no packed-prefill contract: only --requests 1 without riders".into(),
+            );
+        }
+        // Prefix fill chunk: the widest launch the packet takes.
+        let fill = e.pf_max_rows().max(1);
+        let mut rows = Vec::new();
+        for &q in &query_rows {
+            for &prior in &priors {
+                let rider_ctx = rider_ctx_flag.unwrap_or(prior.max(1));
+                // Two spare tokens keep every timed chunk short of its prompt end, so no
+                // iteration publishes a prefix snapshot.
+                let need = (prior + q + 2).max(rider_ctx + 3);
+                if need + 1 > e.max_ctx() || (packed && requests * q + riders > e.pf_max_rows()) {
+                    eprintln!(
+                        "skip rows={q} prior={prior}: exceeds max_ctx {} or packed rows {}",
+                        e.max_ctx(),
+                        e.pf_max_rows()
+                    );
+                    continue;
+                }
+                let prompt = |seed: usize, len: usize| -> Vec<u32> {
+                    (0..len)
+                        .map(|i| 100 + ((i * 17 + seed * 101) % 1000) as u32)
+                        .collect()
+                };
+                let prompts: Vec<Vec<u32>> = (0..requests)
+                    .map(|r| prompt(r, prior + q + 2))
+                    .chain((0..riders).map(|r| prompt(requests + r, rider_ctx + 3)))
+                    .collect();
+                let starts: Vec<usize> = (0..requests)
+                    .map(|_| prior)
+                    .chain((0..riders).map(|_| rider_ctx))
+                    .collect();
+                let lens: Vec<usize> = (0..requests)
+                    .map(|_| q)
+                    .chain((0..riders).map(|_| 1))
+                    .collect();
+                let total: usize = lens.iter().sum();
+                let mut ms = Vec::with_capacity(iters);
+                if packed {
+                    for (slot, (p, &start)) in prompts.iter().zip(&starts).enumerate() {
+                        e.begin_slot(slot, p.len() + 1)?;
+                        let mut c0 = 0;
+                        while c0 < start {
+                            let len = (start - c0).min(fill);
+                            e.upload_activation("act.x", &synth(len, hidden))?;
+                            e.prefill_batched(&[PfBatchReq {
+                                slot,
+                                prompt: p,
+                                c0,
+                                len,
+                            }])?;
+                            c0 += len;
+                        }
+                    }
+                    let reqs: Vec<PfBatchReq> = (0..prompts.len())
+                        .map(|slot| PfBatchReq {
+                            slot,
+                            prompt: &prompts[slot],
+                            c0: starts[slot],
+                            len: lens[slot],
+                        })
+                        .collect();
+                    let x = synth(total, hidden);
+                    for pass in 0..warmup + iters {
+                        e.upload_activation("act.x", &x)?;
+                        let t0 = Instant::now();
+                        e.prefill_batched(&reqs)?;
+                        if pass >= warmup {
+                            ms.push(t0.elapsed().as_secs_f64() * 1e3);
+                        }
+                    }
+                } else {
+                    // Serial chunk path: the timed chunk needs the prefix replayed each pass.
+                    let p = &prompts[0];
+                    for pass in 0..warmup + iters {
+                        e.begin_slot(0, p.len() + 1)?;
+                        if prior > 0 {
+                            e.upload_activation("act.x", &synth(prior.min(fill), hidden))?;
+                            while !matches!(
+                                e.prefill_chunk(0, &p[..prior], fill)?,
+                                PrefillStep::Done(_)
+                            ) {}
+                        }
+                        e.upload_activation("act.x", &synth(q, hidden))?;
+                        let t0 = Instant::now();
+                        let mut launches = 0;
+                        while !matches!(
+                            e.prefill_chunk(0, &p[..prior + q], q)?,
+                            PrefillStep::Done(_)
+                        ) {
+                            launches += 1;
+                        }
+                        if launches > 0 {
+                            return Err(format!(
+                                "rows={q} after prior={prior} took more than one launch"
+                            )
+                            .into());
+                        }
+                        if pass >= warmup {
+                            ms.push(t0.elapsed().as_secs_f64() * 1e3);
+                        }
+                    }
+                }
+                let (median, p95) = median_p95(ms);
+                println!(
+                    "  prefill {requests}x{q} rows prior={prior} riders={riders}@{rider_ctx}: \
+                     median={median:.3} ms p95={p95:.3} ms ({} path)",
+                    if packed { "packed" } else { "serial" }
+                );
+                rows.push(serde_json::json!({
+                    "phase": "prefill",
+                    "requests": requests,
+                    "query_rows": q,
+                    "prior": prior,
+                    "riders": riders,
+                    "rider_ctx": rider_ctx,
+                    "packed": packed,
+                    "ms_median": median,
+                    "ms_p95": p95,
+                    "iters": iters,
+                }));
+            }
+        }
+        Ok(rows)
     }
 
     fn packed_check(
@@ -834,7 +1075,7 @@ mod cuda {
         e: &mut plowrt::exec::gpu::GpuEngine,
         hidden: usize,
         flag: &dyn Fn(&str) -> Option<String>,
-    ) -> Result<(), Box<dyn std::error::Error>> {
+    ) -> Result<Vec<serde_json::Value>, Box<dyn std::error::Error>> {
         let batches = flag("--batch")
             .map(|s| parse_list(&s))
             .unwrap_or_else(|| vec![1, 2, 4, 8]);
@@ -961,19 +1202,6 @@ mod cuda {
             }
         }
 
-        let out_dir = flag("--out-dir")
-            .map(PathBuf::from)
-            .unwrap_or_else(|| PathBuf::from("/dev/shm/block-asset/bench"));
-        std::fs::create_dir_all(&out_dir)?;
-        let out = out_dir.join("sweep.json");
-        std::fs::write(
-            &out,
-            serde_json::to_vec_pretty(&serde_json::json!({ "sweep": rows }))?,
-        )?;
-        println!("wrote {}", out.display());
-        if let Some(profile) = e.trace_summary()? {
-            println!("{profile}");
-        }
-        Ok(())
+        Ok(rows)
     }
 }

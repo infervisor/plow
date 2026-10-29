@@ -61,7 +61,7 @@ PLOW_QWEN_FUSE_MLP = "1"
 # (flat KV is 1 GiB per slot at 16K).
 [serve.env]
 PLOW_VMM_LIVE = "1"
-PLOW_PREFIX_CACHE = "0"
+# Prefix cache stays on (policy: never disabled in a recipe; match the vLLM peer with its prefix caching on).
 
 [bench]
 backend = "openai"

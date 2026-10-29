@@ -125,7 +125,8 @@ struct Config {
     layers: Vec<bool>,
     prefix: String,
     tied: bool,
-    block: Option<usize>,
+    /// `--block l[..r]`: the half-open layer range a block packet keeps.
+    block: Option<std::ops::Range<usize>>,
 }
 
 impl Config {
@@ -1110,7 +1111,10 @@ fn phase(
         })
     };
     for (layer, &full) in c.layers.iter().enumerate() {
-        if c.block.is_some_and(|selected| selected != layer) {
+        if c.block
+            .as_ref()
+            .is_some_and(|range| !range.contains(&layer))
+        {
             continue;
         }
         let p = format!("{}layers.{layer}", c.prefix);
@@ -1486,14 +1490,7 @@ pub(super) fn run(
             .expect("Qwen config JSON");
     let mut c = Config::parse(&root);
     if let Some(spec) = block {
-        let selected = crate::block::parse_block(spec, c.layers.len());
-        assert_eq!(
-            selected.len(),
-            1,
-            "Qwen --block currently selects one layer"
-        );
-        assert_eq!(batch, 1, "Qwen --block currently requires B1");
-        c.block = Some(selected.start);
+        c.block = Some(crate::block::parse_block(spec, c.layers.len()));
     }
     let target = packet::devbuild::gpu_fingerprint(gpu);
     let _target = EmitAmdGuard::set(false);
@@ -1534,7 +1531,7 @@ pub(super) fn run(
                 }
             })
             .collect::<Vec<_>>(),
-        c.block.map(|layer| layer..layer + 1),
+        c.block.clone(),
         &[],
         &[],
         &[],
@@ -1671,17 +1668,21 @@ pub(super) fn run(
     if c.block.is_none() {
         sections.push(crate::serve_section::section_for(dir));
     }
-    let bytes = if let Some(layer) = c.block {
+    let bytes = if let Some(range) = c.block.clone() {
         use plow_asset::*;
-        let full = c.layers[layer];
+        let mixer = |layer: usize| if c.layers[layer] { "full_attn" } else { "gdn" };
+        // Dims describe the first full-attention layer (the KV the harness snapshots), else the
+        // first GDN layer.
+        let first = range.clone().find(|&l| c.layers[l]).unwrap_or(range.start);
+        let full = c.layers[first];
         let desc = BlockDescriptor {
             model: dir.to_string_lossy().into_owned(),
             arch: "qwen3_5".into(),
-            layer: layer as u32,
-            kind: vec![
-                if full { "full_attn" } else { "gdn" }.into(),
-                "dense_ffn".into(),
-            ],
+            layer: range.start as u32,
+            kind: range
+                .clone()
+                .flat_map(|l| [mixer(l).to_string(), "dense_ffn".to_string()])
+                .collect(),
             hidden: c.hidden as i64,
             dtype: if fp8 { "fp8" } else { "bf16" }.into(),
             dims: BlockDims {
@@ -1701,25 +1702,32 @@ pub(super) fn run(
                 shape: vec![Dim::Symbolic("T".into()), Dim::Fixed(c.hidden as i64)],
                 dtype: "bf16".into(),
             }],
-            carried_state: vec![CarriedState {
-                role: if full { "kv" } else { "recurrent" }.into(),
-                tensors: if full {
-                    vec![format!("kv.{layer}.k"), format!("kv.{layer}.v")]
-                } else {
-                    vec![
-                        format!("state.qwen.{layer}.conv"),
-                        format!("state.qwen.{layer}.gdn"),
-                    ]
-                },
-                layout: if full { "head_major" } else { "slot_major" }.into(),
-            }],
+            carried_state: range
+                .clone()
+                .map(|layer| {
+                    let full = c.layers[layer];
+                    CarriedState {
+                        role: if full { "kv" } else { "recurrent" }.into(),
+                        tensors: if full {
+                            vec![format!("kv.{layer}.k"), format!("kv.{layer}.v")]
+                        } else {
+                            vec![
+                                format!("state.qwen.{layer}.conv"),
+                                format!("state.qwen.{layer}.gdn"),
+                            ]
+                        },
+                        layout: if full { "head_major" } else { "slot_major" }.into(),
+                    }
+                })
+                .collect(),
             weights: BlockWeights {
                 mode: "symlink".into(),
                 ckpt: dir.to_string_lossy().into_owned(),
-                prefix: format!("{}layers.{layer}.", c.prefix),
+                prefix: format!("{}layers.{}.", c.prefix, range.start),
             },
             programs: BlockPrograms {
-                prefill_buckets: m.prog_t[..m.prog_t.len() - 1]
+                // prog_t lists the prefill buckets, then one program per decode rung.
+                prefill_buckets: m.prog_t[..m.prog_t.len() - rungs.len()]
                     .iter()
                     .map(|&x| x as i64)
                     .collect(),
@@ -3349,7 +3357,7 @@ mod tests {
             emit_config::install(cfg);
             for layer in [0, 3] {
                 let mut c = Config::parse(&fixture());
-                c.block = Some(layer);
+                c.block = Some(layer..layer + 1);
                 let m = model_prefill(&c, 8192, 132, 0, &[128], 1, fp8);
                 assert_eq!(m.prog_t, [128, 1]);
                 for g in &m.progs {
@@ -3399,6 +3407,45 @@ mod tests {
             }
         }
         emit_config::install(original);
+    }
+
+    #[test]
+    fn block_ranges_keep_every_layer_kind_at_every_decode_rung() {
+        let _env = crate::test_env::env_guard();
+        let _target = EmitAmdGuard::set(false);
+        let mut c = Config::parse(&fixture());
+        c.block = Some(2..4);
+        let m = ladder(&c, 8192, 132, 0, false, &[128], &[1, 8, 48]);
+        assert_eq!(m.prog_t, [128, 1, 8, 48]);
+        for g in &m.progs {
+            assert!(g.insts.iter().all(|d| !matches!(
+                DevOp::from_u16(d.op),
+                Some(DevOp::Embed | DevOp::Argmax | DevOp::ArgmaxFin)
+            )));
+            check_operand_dependencies(g);
+        }
+        for t in m.tensors.iter().filter(|t| t.name.contains(".layers.")) {
+            assert!(
+                t.name.contains(".layers.2.") || t.name.contains(".layers.3."),
+                "{}",
+                t.name
+            );
+        }
+        let count = |prefix: &str| {
+            m.tensors
+                .iter()
+                .filter(|t| t.name.starts_with(prefix))
+                .count()
+        };
+        assert_eq!(
+            (
+                count("state.qwen.2."),
+                count("state.qwen."),
+                count("kv.3."),
+                count("kv.")
+            ),
+            (2, 2, 2, 2)
+        );
     }
 
     #[test]
