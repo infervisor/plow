@@ -1090,6 +1090,7 @@ Removed (a set value is ignored with a startup warning; recipes and scripts may 
 | `PLOW_PREFIX_POLICY`, `PLOW_PREFIX_CACHE_OUTPUT`, `PLOW_PREFIX_RETIRE_ATTACHED` | the boundary tree, always on for CUDA (`docs/runtime/prefix-cache.md`); the previous binary is the rollback |
 | `PLOW_KV_STORE`, `PLOW_VMM_SNAP_POOL`, `PLOW_VMM_SNAP_PITCHED` | the KV block store (`docs/arch/26-kv-block-store.md`) is the only CUDA boundary storage; the contiguous snapshot copy path, its pool and its pitched layout were deleted (2026-10-23) |
 | `PLOW_AMD_DECODE_GEMM_OVERLAP`, `--amd-decode-gemm-overlap` | never merged (branch `decode-latency`): AMD decode native GEMMs without the AQL barrier bit measured +1.5 ms/step (+14 %, 7-layer TP8, 14 runs) |
+| `PLOW_CUTLASS_FP8_DECODE`, `--cutlass-fp8-decode` | never qualified on a production packet; dlopened a host marshaller (`libplow_cutlass_fp8_decode_sm90.so`) beside its cubin. Small-M FP8 decode projections run on cuBLASLt (removed 2026-10-29) |
 
 | var | default | effect |
 |---|---|---|

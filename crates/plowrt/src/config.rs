@@ -1629,8 +1629,7 @@ pub struct NvidiaRuntimeConfig {
     /// `CUBLASLT_MATMUL_DESC_FAST_ACCUM` (wgmma accumulation without periodic FP32 promotion, as
     /// vLLM's CUTLASS FP8 kernels). Unset = off. H100 standalone at M=4096: q 102 -> 88 us,
     /// gate 374 -> 331 us; down (K 15360) unchanged with 2x the rel-L2, hence the K bound.
-    /// cuBLASLt decode rungs keep promoted accumulation (no measured gain at B=64); the CUTLASS
-    /// decode route (`--cutlass-fp8-decode`) applies the same K bound.
+    /// cuBLASLt decode rungs keep promoted accumulation (no measured gain at B=64).
     #[arg(
         long = "lt-fp8-fast-accum-max-k",
         env = "PLOW_LT_FP8_FAST_ACCUM_MAX_K",
@@ -1648,17 +1647,6 @@ pub struct NvidiaRuntimeConfig {
         global = true
     )]
     pub pf_norm_row_blocks: u32,
-
-    /// `<cubin sha256>:<host library sha256>` of `cutlass_fp8_decode_sm90.cubin` and its Params
-    /// marshaller `libplow_cutlass_fp8_decode_sm90.so` in `--pf-seg-dir`: routed FP8 W8A8 decode
-    /// projections with M <= 128 run those CUTLASS swap-AB kernels instead of cuBLASLt (no ~13 us
-    /// small-M floor). Other bytes are rejected. Unset = cuBLASLt.
-    #[arg(
-        long = "cutlass-fp8-decode",
-        env = "PLOW_CUTLASS_FP8_DECODE",
-        global = true
-    )]
-    pub cutlass_fp8_decode: Option<String>,
 
     /// A routed decode rung's one-instruction AddNorm / Glu segments run as ordinary launches
     /// of the decode object's light kernel instead of interpreter windows.

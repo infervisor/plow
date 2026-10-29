@@ -738,9 +738,7 @@ ops. Segment roles: `FP8_PREFILL_GEMM` (1), `W8A8_PREFILL_GEMM_GLU_GEMMA4` (13, 
 `PLOW_EMIT_DECODE_CUBLASLT`.
 Kernels and objects: interpreter `op_gemm_sm90.cuh` in `interp_sm90a.cubin`; fused GLU role
 `interp_sm90a_pfgemm_glu_w8a8_gemma4.cubin` (rows 4096-8192, N 15360, K 3840; globals checked by
-`crates/devgen/src/gemma4_w8a8_gemm_glu_role.rs`); small-M CUTLASS decode
-(`runtime/nvidia/cutlass_fp8_decode_sm90.cu`, per-token x per-channel scales, cubin + host .so
-from one build); cuBLASLt with the outer-vector scale mode (`crates/plowrt/src/device/cuda/lt.rs`,
+`crates/devgen/src/gemma4_w8a8_gemm_glu_role.rs`); cuBLASLt with the outer-vector scale mode (`crates/plowrt/src/device/cuda/lt.rs`,
 eligibility `segment_roles::cublaslt_prefill_fp8`, needs cuBLASLt >= 12.9 = `CUBLASLT_FP8_MIN`);
 grouped MoE matmuls in cuBLASLt (`crates/devgen/src/dense_cublaslt.rs`, glue
 `runtime/nvidia/moe_lt_sm90.cu`, >= 13.4 = `CUBLASLT_GROUPED_MIN`). AMD gfx950 wide-K MFMA

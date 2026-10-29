@@ -39,7 +39,6 @@ use rustc_hash::FxHashMap;
 use crate::device::{Backend, DeviceMem, ExecutorClass, ExecutorTarget, LaunchCfg, Module};
 use crate::{DeviceErrorInfo, Result, RuntimeError};
 
-pub(crate) mod cutlass_fp8;
 pub(crate) mod lt;
 pub use lt::library as cublaslt_library;
 pub(crate) mod qwen_gdn;
