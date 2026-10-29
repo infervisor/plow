@@ -405,6 +405,11 @@ def cmd_hd512(a):
                  for s in range(n)]
         # --kscale: Gemma-4 12B's global k_norm weight (0.0605) shrinks K; Q grows to keep the
         # logits, so the run probes the pool element type's range, not the score distribution.
+        # --qscale: sharper softmax (Gemma-4 runs scale 1.0 on normed q/k: logits std ~ sqrt(D)),
+        # many probabilities near or below fp16's normal range.
+        if a.qscale != 1.0:
+            for c in cases:
+                c.q.copy_((c.q.float() * a.qscale).to(c.q.dtype))
         if a.kscale != 1.0 and fp8:
             for c in cases:
                 c.ks.mul_(a.kscale)
@@ -770,6 +775,7 @@ def main():
     h.add_argument("--page", type=int, default=64)
     h.add_argument("--dqcubin", default="/opt/dlami/nvme/lava-tts/lib-attn/kv_dequant_sm90_v2.cubin")
     h.add_argument("--kscale", type=float, default=1.0)
+    h.add_argument("--qscale", type=float, default=1.0)
     h.add_argument("--fa4lib16", default="/opt/dlami/nvme/lava-tts/lib-attn/fa4f16/libplow_fa4_hd512.so")
     h.add_argument("--fa4lib", default="/opt/dlami/nvme/lava-tts/lib-attn/fa4bf16b/libplow_fa4_hd512.so")
     h.add_argument("--json")
