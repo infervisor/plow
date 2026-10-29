@@ -537,6 +537,20 @@ mod tests {
                 be.download(&bufs[i].0, 0, &mut out)?;
                 std::fs::write(dir.join(format!("{name}.out{i}")), &out).unwrap();
             }
+            // Same inputs again: the route must reproduce itself.
+            for i in [3, 6, 7] {
+                let inp = std::fs::read(dir.join(format!("{name}.in{i}"))).unwrap();
+                be.upload(&bufs[i].0, 0, &inp)?;
+            }
+            run(&mut g)?;
+            be.synchronize()?;
+            for i in [3, 6, 7] {
+                let mut out = vec![0u8; bufs[i].1];
+                be.download(&bufs[i].0, 0, &mut out)?;
+                let first = std::fs::read(dir.join(format!("{name}.out{i}"))).unwrap();
+                let diff = out.iter().zip(&first).filter(|(a, b)| a != b).count();
+                println!("GDN_AOT_REPEAT {name} out{i} differ={diff}");
+            }
             let start = std::time::Instant::now();
             for _ in 0..20 {
                 run(&mut g)?;
