@@ -7461,6 +7461,13 @@ impl GpuEngine {
                 store_cap_mib = room >> 20,
                 "vmm prefix: live ring park bounded by the block store"
             );
+        } else if let Some(rings) = vmm.as_ref().and_then(|v| v.rings.as_ref()) {
+            tracing::info!(
+                park_slots = rings.slots(),
+                slots = rings.slots(),
+                park_mib = (rings.slots() as u64 * rings.slot_charge()) >> 20,
+                "vmm prefix: live ring park unbounded (no pressure-sized block store)"
+            );
         }
         if let Some(v) = vmm.as_ref() {
             prefix::trace_init(v);
