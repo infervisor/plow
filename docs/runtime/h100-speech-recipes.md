@@ -13,9 +13,9 @@ accuracy gates (`[gates]`). Build and gate from a clean checkout; nothing else i
 | `gemma-4-e4b` | google/gemma-4-E4B-it `ee0ef602` | per-rung Lt algos |
 
 Scheduling is the runtime's default `auto` objective (`docs/flags-reference.md`, "Serving
-objective"): adaptive multistep and the lookahead-1 decode pipeline are derived, not set. A
-runtime older than the objective (the `plow_git` pin is the compiler commit that emitted the
-assets) needs `PLOW_MULTISTEP_ADAPTIVE=true PLOW_DECODE_PIPELINE=true` for Veena and E4B.
+objective"): adaptive multistep and the lookahead-1 decode pipeline are derived, not set
+(`PLOW_MULTISTEP_ADAPTIVE` is removed; `PLOW_DECODE_PIPELINE` is a diagnostic override). The
+`plow_git` pin is the compiler commit that emitted the assets, not a runtime pin.
 
 ## Prerequisites (once per box)
 
