@@ -30,6 +30,8 @@ const PAGE: u32 = 64;
 const L2_BUDGET: u32 = 52_428_800;
 /// The varlen O store map offsets its base by this many rows (a virtual batch dimension).
 const O_ROWS_SHIFT: u64 = 1 << 30;
+/// A tensor map's global address field: 57 bits, 16-byte aligned.
+const TMAP_ADDRESS_MASK: u64 = 0x01ff_ffff_ffff_fff0;
 const COMBINE_TILE_M: u32 = 8;
 const COMBINE_K_BLOCK: u32 = 128;
 // cuda.h enums.
@@ -323,7 +325,12 @@ fn forward(be: &CudaBackend, g: Geometry, p: &Prepared, c: &Call) -> Result<Laun
                 SWIZZLE_128B,
                 L2_PROMOTION_128B,
                 0,
-            )?;
+            )
+            .map_err(|e| {
+                RuntimeError::Rejected(format!(
+                    "FA4 tensor map base {base:#x} dims {dims:?} strides {strides:?} boxes {boxes:?}: {e}"
+                ))
+            })?;
             upstream_tmap_flags(&mut m, elem, dims, strides);
             Ok::<_, RuntimeError>(m)
         };
@@ -362,22 +369,27 @@ fn forward(be: &CudaBackend, g: Geometry, p: &Prepared, c: &Call) -> Result<Laun
         tail = if split {
             at + 3
         } else {
-            let o_base = c.o.wrapping_sub(O_ROWS_SHIFT * row_bytes);
-            let o = if pack {
+            // The varlen O view starts 2^30 rows before `o` (upstream's domain offset). Below
+            // 2^44 that base wraps, which the driver refuses but the hardware's 57-bit address
+            // arithmetic accepts, as upstream encodes it: encode at `o`, then store the wrapped
+            // base.
+            let o_base = c.o.wrapping_sub(O_ROWS_SHIFT * row_bytes) & TMAP_ADDRESS_MASK;
+            let mut o = if pack {
                 tmap(
-                    o_base,
+                    c.o,
                     &[d64, h64, O_ROWS_SHIFT, (1 << 31) - 1],
                     &[d64 * elem, row_bytes, row_bytes],
                     &[64, qhpk, 64 / qhpk, 1],
                 )?
             } else {
                 tmap(
-                    o_base,
+                    c.o,
                     &[d64, O_ROWS_SHIFT, h64, (1 << 31) - 1],
                     &[row_bytes, d64 * elem, row_bytes],
                     &[64, 64, 1, 1],
                 )?
             };
+            o[..8].copy_from_slice(&o_base.to_le_bytes());
             l.tmap(at + 3, &o);
             at + 4
         };
