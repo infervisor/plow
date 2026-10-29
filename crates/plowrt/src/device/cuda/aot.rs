@@ -352,7 +352,12 @@ impl Launch {
                 let cap = &hex
                     .get(2 * b..2 * b + 2)
                     .ok_or(format!("parameter {i}: short capture"))?;
+                // A masked byte must be one the stub declares padding: a manifest cannot mask
+                // a byte the kernel reads.
                 if *cap == ".." {
+                    if !(self.padding[i][b] && !self.written[i][b]) {
+                        return Err(format!("parameter {i} byte {b}: masked, not padding"));
+                    }
                     continue;
                 }
                 let want =
