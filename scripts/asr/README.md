@@ -246,7 +246,7 @@ set `PLOW_METAL_QKV_DOT4=1` to match the ASR decoder tuning: the trace tool load
 the generic Metal engine. Compare the saved `decode-logits.bf16` bytes as well as
 timings. The differential Metal probe is `runtime/apple/probe/decode_heads.m`.
 Rust validation examples live in `crates/plowrt/examples/asr/`; Cargo example names
-include `asr_check`, `asr_dataset`, `asr_batch_dataset`, `asr_nemotron_dataset`,
+include `asr_check`, `asr_dataset`, `asr_batch_dataset`,
 `asr_stream` and `asr_decoder_trace`.
 Runtime code lives in `crates/plowrt/src/asr/`; Metal execution is in
 `crates/plowrt/src/exec/apple/asr.rs` and `runtime/apple/asr.metal`.
@@ -311,18 +311,12 @@ nix develop -c sh -c 'exec "$@" > /path/native.jsonl' sh \
   models/Qwen3-ASR-1.7B plow-out/qwen3-asr-1.7b-b4/model.pkt \
   /path/dev-clean-100/manifest.jsonl
 
-nix develop -c sh -c 'exec "$@" > /path/nemotron.jsonl' sh \
-  cargo run --release -p plowrt --features nemo-asr \
-  --example asr_nemotron_dataset -- \
-  /path/libnemo_speech.dylib /path/nemotron-model \
-  /path/dev-clean-100/manifest.jsonl 0 en-US
-
 nix develop -c sh -c 'exec "$@" > /path/mlx.jsonl' sh \
   "$MLX_PYTHON" scripts/asr/mlx_dataset.py \
   models/Qwen3-ASR-1.7B /path/dev-clean-100/manifest.jsonl
 
 nix develop -c "$REFERENCE_PYTHON" scripts/asr/score.py \
-  /path/dev-clean-100/manifest.jsonl /path/native.jsonl /path/nemotron.jsonl \
+  /path/dev-clean-100/manifest.jsonl /path/native.jsonl \
   /path/mlx.jsonl \
   --out /path/report.json
 ```
