@@ -352,21 +352,37 @@ pub fn inventory(blob: &DevBlob, raw: &[u8], assets: Option<&Path>) -> crate::Re
             item("device_sampler", State::On, sampler.join(", "))
         });
         let build = std::fs::read_to_string(assets.join("build.json")).ok();
-        out.push(match &build {
-            Some(text) if text.contains("\"PLOW_EMIT_PREFILL_CUBLASLT\": \"1\"") => item(
-                "cublaslt_prefill",
-                State::On,
-                "PLOW_EMIT_PREFILL_CUBLASLT=1 in the emit replay",
-            ),
-            Some(_) => item(
+        out.push(match build.as_deref().map(prefill_cublaslt_emitted) {
+            Some(Some(source)) => item("cublaslt_prefill", State::On, source),
+            Some(None) => item(
                 "cublaslt_prefill",
                 State::Off,
-                "emit replay has no PLOW_EMIT_PREFILL_CUBLASLT=1: projections on the interpreter GEMM",
+                "emit.prefill_cublaslt resolved off: projections on the interpreter GEMM",
             ),
-            None => item("cublaslt_prefill", State::NotApplicable, "no build.json next to the packet"),
+            None => item(
+                "cublaslt_prefill",
+                State::NotApplicable,
+                "no build.json next to the packet",
+            ),
         });
     }
     Ok(out)
+}
+
+/// Whether the emit routed the dense prefill projections to cuBLASLt, and from where: the resolved
+/// knob table records a production default (Gemma-4 BF16 on sm_90a TP1 turns it on without an env
+/// var), the replay only what the environment set.
+fn prefill_cublaslt_emitted(build: &str) -> Option<&'static str> {
+    let v: serde_json::Value = serde_json::from_str(build).ok()?;
+    match v.pointer("/knobs/values/emit.prefill_cublaslt") {
+        Some(serde_json::Value::Bool(true)) => {
+            Some("emit.prefill_cublaslt resolved on in build.json")
+        }
+        Some(_) => None,
+        None => build
+            .contains("\"PLOW_EMIT_PREFILL_CUBLASLT\": \"1\"")
+            .then_some("PLOW_EMIT_PREFILL_CUBLASLT=1 in the emit replay"),
+    }
 }
 
 pub fn text(items: &[Item]) -> String {
@@ -386,4 +402,31 @@ pub fn text(items: &[Item]) -> String {
         ));
     }
     s
+}
+
+#[cfg(test)]
+mod prefill_cublaslt_tests {
+    use super::prefill_cublaslt_emitted;
+
+    #[test]
+    fn resolved_production_default_counts_as_on() {
+        let build =
+            r#"{"knobs":{"values":{"emit.prefill_cublaslt":true}},"emit_config":{"replay":{}}}"#;
+        assert!(prefill_cublaslt_emitted(build).is_some());
+    }
+
+    #[test]
+    fn resolved_off_wins_over_the_replay() {
+        let build = r#"{"knobs":{"values":{"emit.prefill_cublaslt":false}},"emit_config":{"replay":{"PLOW_EMIT_PREFILL_CUBLASLT": "1"}}}"#;
+        assert!(prefill_cublaslt_emitted(build).is_none());
+    }
+
+    #[test]
+    fn an_old_build_without_the_knob_table_reads_the_replay() {
+        assert!(prefill_cublaslt_emitted(
+            r#"{"emit_config":{"replay":{"PLOW_EMIT_PREFILL_CUBLASLT": "1"}}}"#
+        )
+        .is_some());
+        assert!(prefill_cublaslt_emitted(r#"{"emit_config":{"replay":{}}}"#).is_none());
+    }
 }
