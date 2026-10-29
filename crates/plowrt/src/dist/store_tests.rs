@@ -177,9 +177,11 @@ fn pins_are_recorded_listed_and_removed() {
     assert_eq!(s.pinned("pdist.infervisor.ai/infervisor/kimi-k3"), None);
     s.pin("pdist.infervisor.ai/infervisor/kimi-k3", "variant-a")
         .unwrap();
-    s.pin("pdist.infervisor.ai/acme/other", "variant-b").unwrap();
+    s.pin("pdist.infervisor.ai/acme/other", "variant-b")
+        .unwrap();
     assert_eq!(
-        s.pinned("pdist.infervisor.ai/infervisor/kimi-k3").as_deref(),
+        s.pinned("pdist.infervisor.ai/infervisor/kimi-k3")
+            .as_deref(),
         Some("variant-a")
     );
     assert_eq!(
@@ -199,7 +201,8 @@ fn pins_are_recorded_listed_and_removed() {
     s.pin("pdist.infervisor.ai/infervisor/kimi-k3", "variant-c")
         .unwrap();
     assert_eq!(
-        s.pinned("pdist.infervisor.ai/infervisor/kimi-k3").as_deref(),
+        s.pinned("pdist.infervisor.ai/infervisor/kimi-k3")
+            .as_deref(),
         Some("variant-c")
     );
     s.unpin("pdist.infervisor.ai/infervisor/kimi-k3").unwrap();

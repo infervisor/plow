@@ -93,7 +93,9 @@ impl ThinkMarkers {
             close: close_id,
             channel_label: (o.len() > 1)
                 .then(|| open[text.len()..].to_string())
-                .filter(|label| !label.is_empty() && label.bytes().all(|b| b.is_ascii_alphabetic())),
+                .filter(|label| {
+                    !label.is_empty() && label.bytes().all(|b| b.is_ascii_alphabetic())
+                }),
             newline,
         })
     }

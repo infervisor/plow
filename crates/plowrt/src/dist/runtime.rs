@@ -635,10 +635,18 @@ mod tests {
         index["releases"][0]["yanked"] = serde_json::json!("cve-2026-1");
         let (_, etag) = sink.get(RUNTIME_INDEX).unwrap().unwrap();
         let bytes = serde_json::to_vec(&index).unwrap();
-        sink.put(RUNTIME_INDEX, &mut &bytes[..], bytes.len() as u64, "application/json", Cond::IfMatch(etag))
-            .unwrap();
+        sink.put(
+            RUNTIME_INDEX,
+            &mut &bytes[..],
+            bytes.len() as u64,
+            "application/json",
+            Cond::IfMatch(etag),
+        )
+        .unwrap();
         let b = release(&root.join("b"), "0.1.4+bbbbbbbbbbbb", triple, b"b");
-        let e = push_runtime(&sink, &[b], &Options::default()).unwrap_err().to_string();
+        let e = push_runtime(&sink, &[b], &Options::default())
+            .unwrap_err()
+            .to_string();
         assert!(e.contains("releases[0].yanked"), "{e}");
         let _ = std::fs::remove_dir_all(root);
     }

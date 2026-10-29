@@ -1034,7 +1034,10 @@ fn an_apple_build_runs_on_any_chip_of_its_family_with_a_warning_off_its_own() {
     // On the Pro, its own label's newest generation.
     let on_pro = apple_live("Apple M4 Pro", 16, 24 * gib);
     let picked = select(&vs, &on_pro, &Constraints::default()).unwrap();
-    assert_eq!((picked.label.as_str(), picked.generation), ("metal3-apple-m4-pro-tp1-2k", 2));
+    assert_eq!(
+        (picked.label.as_str(), picked.generation),
+        ("metal3-apple-m4-pro-tp1-2k", 2)
+    );
     // An NVIDIA part with more SMs than the build is still refused: the grid is baked in.
     let h100 = variant(
         "sm90a-h100-tp1",

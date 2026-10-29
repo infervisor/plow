@@ -702,12 +702,16 @@ fn a_listed_row_omits_the_field_and_an_old_catalog_reads_as_listed() {
     let f = Fixture::new("listed-default");
     f.push(None, &Options::default());
     let row = &catalog_of(&f)["models"][0];
-    assert!(row.get("listed").is_none(), "listed is the default and not written: {row}");
+    assert!(
+        row.get("listed").is_none(),
+        "listed is the default and not written: {row}"
+    );
     let c = super::catalog(&f.sink()).unwrap();
     assert!(c.models[0].listed);
 
     // A catalog written before the field existed.
-    let old = br#"{"models":[{"namespace":"infervisor","name":"veena","hf":"maya-research/Veena"}]}"#;
+    let old =
+        br#"{"models":[{"namespace":"infervisor","name":"veena","hf":"maya-research/Veena"}]}"#;
     let parsed: super::Catalog = serde_json::from_slice(old).unwrap();
     assert!(parsed.models[0].listed);
 }
@@ -754,10 +758,19 @@ fn catalog_list_and_unlist_write_only_the_row() {
     let sig = f.sig_key();
 
     let sink = f.sink();
-    assert_eq!(set_listed(&sink, "infervisor", "veena", false).unwrap(), Listing::Changed);
+    assert_eq!(
+        set_listed(&sink, "infervisor", "veena", false).unwrap(),
+        Listing::Changed
+    );
     assert_eq!(catalog_of(&f)["models"][0]["listed"], false);
-    assert_eq!(set_listed(&sink, "infervisor", "veena", false).unwrap(), Listing::Unchanged);
-    assert_eq!(set_listed(&sink, "infervisor", "veena", true).unwrap(), Listing::Changed);
+    assert_eq!(
+        set_listed(&sink, "infervisor", "veena", false).unwrap(),
+        Listing::Unchanged
+    );
+    assert_eq!(
+        set_listed(&sink, "infervisor", "veena", true).unwrap(),
+        Listing::Changed
+    );
     assert!(catalog_of(&f)["models"][0].get("listed").is_none());
 
     // Nothing under v1/ moved: the signed index is byte-identical and its
@@ -799,7 +812,11 @@ fn a_document_with_a_field_this_publisher_does_not_know_is_not_rewritten() {
     let index_key = "v1/infervisor/veena/index.json";
     let mut index: serde_json::Value = serde_json::from_slice(&f.read(index_key)).unwrap();
     index["variants"][0]["placement_hint"] = serde_json::json!("numa0");
-    std::fs::write(f.registry.join(index_key), serde_json::to_vec(&index).unwrap()).unwrap();
+    std::fs::write(
+        f.registry.join(index_key),
+        serde_json::to_vec(&index).unwrap(),
+    )
+    .unwrap();
     std::fs::write(f.assets.join("interp_sm90a.cubin"), b"ELF-cubin-v2").unwrap();
     let src = Sources {
         assets: &f.assets,
@@ -807,15 +824,27 @@ fn a_document_with_a_field_this_publisher_does_not_know_is_not_rewritten() {
         checkpoint: None,
     };
     let g = f.generated();
-    let e = push(&f.sink(), g.bundle, g.objset, &src, None, &Trust::none(), &Options::default())
-        .unwrap_err()
-        .to_string();
+    let e = push(
+        &f.sink(),
+        g.bundle,
+        g.objset,
+        &src,
+        None,
+        &Trust::none(),
+        &Options::default(),
+    )
+    .unwrap_err()
+    .to_string();
     assert!(e.contains("variants[0].placement_hint"), "{e}");
 
     // Values the writer itself omits as defaults are not "unknown".
-    let was = serde_json::json!({"models": [{"name": "a", "listed": true, "aliases": [], "x": null}]});
+    let was =
+        serde_json::json!({"models": [{"name": "a", "listed": true, "aliases": [], "x": null}]});
     let now = serde_json::json!({"models": [{"name": "a"}]});
     assert_eq!(super::dropped(&was, &now, ""), None);
     let was = serde_json::json!({"models": [{"name": "a", "pinned": true}]});
-    assert_eq!(super::dropped(&was, &now, "").as_deref(), Some("models[0].pinned"));
+    assert_eq!(
+        super::dropped(&was, &now, "").as_deref(),
+        Some("models[0].pinned")
+    );
 }

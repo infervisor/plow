@@ -277,7 +277,11 @@ mod remote {
                 Err(ureq::Error::Status(404, _)) => Ok(None),
                 Err(ureq::Error::Status(code, r)) => Err(dist(format!(
                     "GET {url}: HTTP {code}: {}",
-                    r.into_string().unwrap_or_default().chars().take(300).collect::<String>()
+                    r.into_string()
+                        .unwrap_or_default()
+                        .chars()
+                        .take(300)
+                        .collect::<String>()
                 ))),
                 Err(e) => Err(dist(format!("GET {url}: {e}"))),
             }

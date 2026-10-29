@@ -275,7 +275,8 @@ fn check_newer(
 ) -> Result<Option<(String, u32, u64)>, Err> {
     let r = parse(reference)?;
     let f = dist::transport(&r.registry)?;
-    let resolved = pull::resolve_trusted(&*f, &r, live, Default::default(), &trust_for(&r.registry)?)?;
+    let resolved =
+        pull::resolve_trusted(&*f, &r, live, Default::default(), &trust_for(&r.registry)?)?;
     if resolved.variant.variant_id == pinned {
         return Ok(None);
     }
@@ -303,7 +304,8 @@ pub fn cmd_upgrade(model: Option<&str>, all: bool, dry_run: bool) -> Result<(), 
     for pin in targets {
         let r = parse(&pin)?;
         let f = dist::transport(&r.registry)?;
-        let resolved = pull::resolve_trusted(&*f, &r, &live, Default::default(), &trust_for(&r.registry)?)?;
+        let resolved =
+            pull::resolve_trusted(&*f, &r, &live, Default::default(), &trust_for(&r.registry)?)?;
         let pinned = st.pinned(&pin);
         if pinned.as_deref() == Some(resolved.variant.variant_id.as_str()) {
             println!("{pin}: current at g{}", resolved.variant.generation);
@@ -1188,10 +1190,20 @@ pub fn cmd_catalog_set(to: &str, model: &str, listed: bool) -> Result<(), Err> {
     let verb = if listed { "listed" } else { "unlisted" };
     match dist::push::set_listed(&*sink, &r.namespace, &r.name, listed)? {
         dist::push::Listing::Changed => {
-            println!("{}/{}: now {verb} at {}", r.namespace, r.name, sink.describe())
+            println!(
+                "{}/{}: now {verb} at {}",
+                r.namespace,
+                r.name,
+                sink.describe()
+            )
         }
         dist::push::Listing::Unchanged => {
-            println!("{}/{}: already {verb} at {}", r.namespace, r.name, sink.describe())
+            println!(
+                "{}/{}: already {verb} at {}",
+                r.namespace,
+                r.name,
+                sink.describe()
+            )
         }
     }
     Ok(())
@@ -1211,9 +1223,17 @@ pub fn cmd_push_runtime(
         .collect::<Result<Vec<_>, _>>()?;
     let sink = dist::sink::sink(to)?;
     let out = dist::runtime::push_runtime(&*sink, &dirs, opts)?;
-    let verb = if opts.dry_run { "would publish" } else { "published" };
+    let verb = if opts.dry_run {
+        "would publish"
+    } else {
+        "published"
+    };
     for (triple, bytes) in &out.uploaded {
-        println!("{verb} plowrt {} {triple} ({} MiB)", out.version, bytes >> 20);
+        println!(
+            "{verb} plowrt {} {triple} ({} MiB)",
+            out.version,
+            bytes >> 20
+        );
     }
     for triple in &out.adopted {
         println!("already published: plowrt {} {triple}", out.version);

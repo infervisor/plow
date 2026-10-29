@@ -579,7 +579,10 @@ mod apple_cores_tests {
     fn the_core_count_is_read_from_system_profiler_json() {
         let json = r#"{"SPDisplaysDataType":[{"_name":"Apple M4 Pro","sppci_bus":"spdisplays_builtin","sppci_cores":"16","sppci_model":"Apple M4 Pro"}]}"#;
         assert_eq!(parse_apple_gpu_cores(json), Some(16));
-        assert_eq!(parse_apple_gpu_cores(r#"{"SPDisplaysDataType":[{"_name":"x"}]}"#), None);
+        assert_eq!(
+            parse_apple_gpu_cores(r#"{"SPDisplaysDataType":[{"_name":"x"}]}"#),
+            None
+        );
         assert_eq!(parse_apple_gpu_cores("not json"), None);
     }
 }

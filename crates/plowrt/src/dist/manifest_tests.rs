@@ -1035,7 +1035,14 @@ fn a_runtime_compiled_recipe_needs_no_toolchain() {
         .replace("toolchain = \"cuda-13.4+gcc-13\"\n", "");
     assert!(!recipe.contains("toolchain"), "{recipe}");
     let p = write_recipe(&tmp("apple-no-toolchain"), &recipe);
-    let g = generate(&p, &assets, None, Overrides::default(), &BundleArgs::default()).unwrap();
+    let g = generate(
+        &p,
+        &assets,
+        None,
+        Overrides::default(),
+        &BundleArgs::default(),
+    )
+    .unwrap();
     assert!(g.objset.is_none());
 }
 

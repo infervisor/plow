@@ -41,12 +41,19 @@ pub const PUBLIC_BUCKET: &str = "pdist";
 /// destination names none). Any other bucket is a private registry and
 /// verifies with nothing unless `PLOW_TRUSTED_KEYS` says otherwise.
 pub fn is_public_registry(registry: &str) -> bool {
-    public_registry(registry, std::env::var("CLOUDFLARE_R2_BUCKET").ok().as_deref())
+    public_registry(
+        registry,
+        std::env::var("CLOUDFLARE_R2_BUCKET").ok().as_deref(),
+    )
 }
 
 fn public_registry(registry: &str, env_bucket: Option<&str>) -> bool {
     if let Some(rest) = registry.strip_prefix("r2://") {
-        let bucket = rest.split('/').filter(|p| !p.is_empty()).last().or(env_bucket);
+        let bucket = rest
+            .split('/')
+            .filter(|p| !p.is_empty())
+            .last()
+            .or(env_bucket);
         return bucket == Some(PUBLIC_BUCKET);
     }
     let host = registry
@@ -67,7 +74,9 @@ impl Trust {
 
     /// The publisher key of the public registry.
     pub fn publisher() -> Self {
-        Trust(vec![PublicKey::parse(PUBLISHER_KEY).expect("a valid built-in key")])
+        Trust(vec![
+            PublicKey::parse(PUBLISHER_KEY).expect("a valid built-in key")
+        ])
     }
 
     /// What to verify `registry` with: `PLOW_TRUSTED_KEYS` (`env`) when set,
@@ -325,11 +334,18 @@ mod trust_tests {
         let t = Trust::for_registry(None, "pdist.infervisor.ai").unwrap();
         assert_eq!(t.0.len(), 1);
         assert_eq!(t.0[0].name, "infervisor-2026");
-        assert_eq!(Trust::for_registry(None, "https://pdist.infervisor.ai/").unwrap(), t);
+        assert_eq!(
+            Trust::for_registry(None, "https://pdist.infervisor.ai/").unwrap(),
+            t
+        );
         assert_eq!(Trust::for_registry(None, "r2://acct/pdist").unwrap(), t);
         assert_eq!(Trust::for_registry(None, "r2://pdist").unwrap(), t);
-        assert!(Trust::for_registry(None, "file:///mirror").unwrap().is_empty());
-        assert!(Trust::for_registry(None, "beta-api.infervisor.ai").unwrap().is_empty());
+        assert!(Trust::for_registry(None, "file:///mirror")
+            .unwrap()
+            .is_empty());
+        assert!(Trust::for_registry(None, "beta-api.infervisor.ai")
+            .unwrap()
+            .is_empty());
         assert!(Trust::for_registry(None, "s3://bucket").unwrap().is_empty());
     }
 

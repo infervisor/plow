@@ -127,7 +127,10 @@ pub fn catalog(sink: &dyn Sink) -> Result<Catalog> {
 pub fn set_listed(sink: &dyn Sink, namespace: &str, name: &str, listed: bool) -> Result<Listing> {
     for _ in 0..4 {
         let (mut catalog, cond) = match sink.get("catalog.json")? {
-            Some((raw, etag)) => (parse_to_rewrite::<Catalog>("catalog.json", &raw)?, Cond::IfMatch(etag)),
+            Some((raw, etag)) => (
+                parse_to_rewrite::<Catalog>("catalog.json", &raw)?,
+                Cond::IfMatch(etag),
+            ),
             None => (Catalog::default(), Cond::IfNoneMatchAny),
         };
         let Some(row) = catalog
@@ -263,8 +266,8 @@ where
 {
     let typed: T = parse(what, bytes)?;
     let whole: serde_json::Value = parse(what, bytes)?;
-    let again = serde_json::to_value(&typed)
-        .map_err(|e| dist(format!("{what}: serialize: {e}")))?;
+    let again =
+        serde_json::to_value(&typed).map_err(|e| dist(format!("{what}: serialize: {e}")))?;
     match dropped(&whole, &again, "") {
         Some(field) => Err(dist(format!(
             "{what}: carries `{field}`, which this plowrt does not know and would drop on \
@@ -278,7 +281,13 @@ where
 /// writer omits as a default (null, empty, a `listed: true`) loses nothing.
 fn dropped(was: &serde_json::Value, now: &serde_json::Value, at: &str) -> Option<String> {
     use serde_json::Value;
-    let path = |k: &str| if at.is_empty() { k.to_string() } else { format!("{at}.{k}") };
+    let path = |k: &str| {
+        if at.is_empty() {
+            k.to_string()
+        } else {
+            format!("{at}.{k}")
+        }
+    };
     match (was, now) {
         (Value::Object(a), Value::Object(b)) => a.iter().find_map(|(k, x)| match b.get(k) {
             Some(y) => dropped(x, y, &path(k)),
@@ -398,7 +407,10 @@ fn ensure_catalog(
 ) -> Result<()> {
     for _ in 0..4 {
         let (mut catalog, cond) = match sink.get("catalog.json")? {
-            Some((raw, etag)) => (parse_to_rewrite::<Catalog>("catalog.json", &raw)?, Cond::IfMatch(etag)),
+            Some((raw, etag)) => (
+                parse_to_rewrite::<Catalog>("catalog.json", &raw)?,
+                Cond::IfMatch(etag),
+            ),
             None => (Catalog::default(), Cond::IfNoneMatchAny),
         };
         let mine = |m: &CatalogEntry| m.namespace == bundle.namespace && m.name == bundle.name;
