@@ -296,3 +296,27 @@ fn a_refused_snapshot_leaves_the_farm_as_it_was() {
         .count();
     assert_eq!(shards, 3, "a refused rebuild removed the working shards");
 }
+
+#[test]
+fn a_qwen2_checkpoint_without_tokenizer_json_links_vocab_and_merges() {
+    let store = tmp("store-qwen2");
+    let snap = snapshot(
+        "snap-qwen2",
+        2,
+        &["vocab.json", "merges.txt", "tokenizer_config.json"],
+    );
+    let bdir = tmp("bundle-qwen2");
+    std::fs::write(bdir.join("model.pkt"), b"PLOWDEV").unwrap();
+
+    let b = bundle(from_checkpoint(), vec![packet_file()]);
+    let farm = build(&store, &b, &bdir, &snap).expect("a vocab/merges checkpoint prepares");
+    for f in ["vocab.json", "merges.txt", "tokenizer_config.json"] {
+        assert!(farm.dir.join(f).is_file(), "farm lacks {f}");
+        assert!(bdir.join(f).is_file(), "bundle lacks {f}");
+    }
+    assert!(!bdir.join("tokenizer.json").exists());
+
+    for p in [store, snap, bdir] {
+        let _ = std::fs::remove_dir_all(p);
+    }
+}

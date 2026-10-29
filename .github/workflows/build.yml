@@ -6,6 +6,9 @@ on:
   push:
     branches: [main]
 
+permissions:
+  contents: read
+
 concurrency:
   group: build-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: true
@@ -19,8 +22,14 @@ jobs:
       github.event_name == 'push' ||
       github.event.pull_request.head.repo.full_name == github.repository
     runs-on: [self-hosted, linux]
+    timeout-minutes: 90
+    defaults:
+      run:
+        shell: nix develop .#ci --command bash -euo pipefail {0}
     steps:
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
       - name: Reject stale perf tool paths
         run: |
           old_path='perf-data/'"harness/"
@@ -33,13 +42,8 @@ jobs:
           python3 perf-data/tools/fusion_ladder_run.py --self-test
       - name: Check bench/serve parity validator
         run: python3 perf-data/tools/check_bench_serve_parity.py --self-test
-      - name: Check distribution producers
+      - name: Check recipe tools
         run: |
-          python3 scripts/pack_objset.py --self-test
-          python3 scripts/pack_bundle.py --self-test
-          python3 scripts/publish_dist.py --self-test
-          python3 scripts/release_runtime.py --self-test
-          python3 scripts/release_dist.py --self-test
           python3 scripts/check_recipe.py --self-test
           python3 scripts/render_recipe.py --self-test
       - name: Check recipes describe their builds
@@ -60,13 +64,12 @@ jobs:
       - name: Build default package
         run: nix build
       - name: Test workspace
-        run: nix develop --command cargo test --workspace
+        run: nix develop --command cargo test --locked --workspace
       # The engine unit tests under exec/{amd,gpu} are feature-gated, so the
-      # default-feature workspace run never compiles them and the hosted job
-      # only `cargo check`s them. They are host-side (device cases are
-      # #[ignore]d) and run without a GPU.
+      # default-feature workspace run never compiles them. They are host-side
+      # (device cases are #[ignore]d) and run without a GPU.
       - name: Test engine host paths (cuda,hsa)
-        run: "nix develop --command cargo test -p plowrt --features cuda,hsa --lib exec::"
+        run: "nix develop --command cargo test --locked -p plowrt --features cuda,hsa --lib exec::"
       # Required lean-correctness lane (CPU only): build the pinned plow_verify, audit every
       # endpoint's acceptance theorems for sorry/unapproved axioms, check the binary against
       # lean-plow/approved-verifiers.json, and run the explicit list of ignored CPU-verifier tests
@@ -90,12 +93,42 @@ jobs:
           BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.before }}
         run: nix develop --command scripts/perf_gate_ci.sh "$BASE_SHA"
 
-  # Hosted, sandboxed: safe for fork PRs. CPU paths only, no GPU toolchain.
-  check:
-    if: github.event_name == 'pull_request'
-    runs-on: ubuntu-latest
+  fmt:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: cachix/install-nix-action@v31
+      - name: Validate workflows
+        run: nix develop .#ci --command actionlint
+      - name: Format
+        run: nix develop .#ci --command cargo fmt --all --check
+
+  # Hosted, sandboxed: safe for fork PRs. No GPU toolchain or driver required.
+  hosted-check:
+    name: hosted-check (${{ matrix.runner }})
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [ubuntu-24.04, macos-15]
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
+    defaults:
+      run:
+        shell: nix develop .#ci --command bash -euo pipefail {0}
+    env:
+      CARGO_TERM_COLOR: always
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: cachix/install-nix-action@v31
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: hosted-${{ matrix.runner }}-${{ hashFiles('flake.lock', 'flake.nix') }}
+          save-if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
       - name: Reject stale perf tool paths
         run: |
           old_path='perf-data/'"harness/"
@@ -108,28 +141,20 @@ jobs:
           python3 perf-data/tools/fusion_ladder_run.py --self-test
       - name: Check bench/serve parity validator
         run: python3 perf-data/tools/check_bench_serve_parity.py --self-test
-      - name: Check distribution producers
+      - name: Check recipe tools
         run: |
-          python3 scripts/pack_objset.py --self-test
-          python3 scripts/pack_bundle.py --self-test
-          python3 scripts/publish_dist.py --self-test
-          python3 scripts/release_runtime.py --self-test
-          python3 scripts/release_dist.py --self-test
           python3 scripts/check_recipe.py --self-test
           python3 scripts/render_recipe.py --self-test
       - name: Check recipes describe their builds
         run: |
           python3 scripts/check_recipe.py recipes/*/*/*.toml
           python3 scripts/render_recipe.py recipes/*/*/*.toml --check
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: rustfmt
-      - name: Format
-        run: cargo fmt --all --check
       - name: Type-check
-        run: cargo check --workspace --all-targets
+        run: cargo check --locked --workspace --all-targets
+      - name: Test workspace
+        run: cargo test --locked --workspace
       - name: CPU runtime
-        run: cargo test -p plowrt --no-default-features --features cpu
+        run: cargo test --locked -p plowrt --no-default-features --features cpu
       # `serve` performs no network I/O, and that is the property the whole
       # producer/consumer split rests on: the CLI fetches, in a separate
       # process, and the serving binary needs no egress. A dependency edge is
@@ -141,10 +166,10 @@ jobs:
       - name: Distribution
         # Quoted: a plain scalar ending in `::` is a YAML mapping indicator, and
         # GitHub then refuses the whole workflow before any job starts.
-        run: "cargo test -p plowrt --no-default-features --features cpu,dist --lib dist::"
+        run: "cargo test --locked -p plowrt --no-default-features --features cpu,dist --lib dist::"
       - name: serve is offline
         run: |
-          tree=$(cargo tree -p plowrt --no-default-features --features cuda,hsa,cpu -e normal)
+          tree=$(cargo tree --locked -p plowrt --no-default-features --features cuda,hsa,cpu -e normal)
           for crate in ureq rustls hyper-tls native-tls reqwest openssl; do
             if grep -qE "^[^a-z]*${crate} v" <<<"$tree"; then
               echo "FAIL: ${crate} is reachable from a serve-only plowrt build"
@@ -161,9 +186,33 @@ jobs:
       # tried the documented build. Neither driver is linked (both are
       # `dlopen`ed), so this needs no CUDA or ROCm on the runner.
       - name: GPU backends type-check (README quickstart feature set)
-        run: cargo check -p plowrt --all-targets --features cuda,hsa
+        if: runner.os == 'Linux'
+        run: cargo check --locked -p plowrt --all-targets --features cuda,hsa
+      - name: Test engine host paths (cuda,hsa)
+        if: runner.os == 'Linux'
+        run: "cargo test --locked -p plowrt --features cuda,hsa --lib exec::"
+      - name: Apple backends type-check
+        if: runner.os == 'macOS'
+        run: cargo check --locked -p plowrt --all-targets --features metal,ane
       - name: CPU kernel oracles
         run: |
           cmake -S runtime -B build-cpu -DCMAKE_BUILD_TYPE=Release
           cmake --build build-cpu --parallel 2
-          ctest --test-dir build-cpu -R cpu_dev --output-on-failure --parallel 2
+          ctest --test-dir build-cpu --output-on-failure --no-tests=error --parallel 2
+
+  # Keep a stable required-check name across matrix changes.
+  check:
+    if: always()
+    needs: [fmt, hosted-check, nix-build]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Require all applicable checks
+        env:
+          FMT_RESULT: ${{ needs.fmt.result }}
+          HOSTED_RESULT: ${{ needs.hosted-check.result }}
+          SELF_HOSTED_RESULT: ${{ needs.nix-build.result }}
+        run: |
+          test "$FMT_RESULT" = success
+          test "$HOSTED_RESULT" = success
+          test "$SELF_HOSTED_RESULT" = success || test "$SELF_HOSTED_RESULT" = skipped

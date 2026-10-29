@@ -25,12 +25,15 @@ pub struct SpecLimits {
 
 /// One row of a speculative tick: `k = 0` decodes the pending token plainly inside the verify.
 /// `draw` picks the row's tokens (a non-argmax row with `k = 0` is one plain sampled step).
+/// `fixed`: the row's `k` drafts come from the caller (`spec_tick`'s `fixed`, in row order), not
+/// the drafter.
 #[derive(Clone, Copy, Debug)]
 pub struct SpecRow {
     pub slot: usize,
     pub token: u32,
     pub k: u32,
     pub draw: SpecDraw,
+    pub fixed: bool,
 }
 
 /// A tick's outcome, per row in request order: the verdict and the verify row of its pending
@@ -87,10 +90,12 @@ impl GpuEngine {
     /// Draft `k` tokens for every row with `k > 0` (each needs [`Self::spec_draft_ready`]),
     /// verify every row's span in one launch, commit each verdict and save the hidden each new
     /// pending token came from. A failure before the verify leaves every slot as it was.
-    /// `sampler` serves the rows that do not take the argmax (span index = row index).
+    /// `sampler` serves the rows that do not take the argmax (span index = row index). `fixed`
+    /// holds the drafts of the `fixed` rows, `k` each, in row order.
     pub fn spec_tick(
         &mut self,
         rows: &[SpecRow],
+        fixed: &[u32],
         stop: &[u32],
         sampler: Option<&mut dyn SpecSampler>,
         out: &mut SpecTick,
@@ -100,9 +105,23 @@ impl GpuEngine {
         if self.pipe_busy() {
             return Err(reject("decode pipeline in flight"));
         }
-        let k_draft = rows.iter().map(|r| r.k).max().unwrap_or(0);
+        if fixed.len()
+            != rows
+                .iter()
+                .filter(|r| r.fixed)
+                .map(|r| r.k as usize)
+                .sum::<usize>()
+        {
+            return Err(reject("fixed drafts do not match the fixed rows"));
+        }
+        let k_draft = rows
+            .iter()
+            .filter(|r| !r.fixed)
+            .map(|r| r.k)
+            .max()
+            .unwrap_or(0);
         out.stage.clear();
-        for r in rows.iter().filter(|r| r.k > 0) {
+        for r in rows.iter().filter(|r| r.k > 0 && !r.fixed) {
             let row = out.stage.len() as u32;
             out.stage.push((r.slot, r.token, row));
         }
@@ -124,10 +143,13 @@ impl GpuEngine {
             out.draft_ms = t.elapsed().as_secs_f64() * 1e3;
         }
         out.tokens.clear();
-        let mut d = 0usize;
+        let (mut d, mut f) = (0usize, 0usize);
         for r in rows {
             out.tokens.push(r.token);
-            if r.k > 0 {
+            if r.fixed {
+                out.tokens.extend_from_slice(&fixed[f..f + r.k as usize]);
+                f += r.k as usize;
+            } else if r.k > 0 {
                 let base = d * k_draft as usize;
                 out.tokens
                     .extend_from_slice(&out.drafts[base..base + r.k as usize]);

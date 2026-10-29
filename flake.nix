@@ -60,6 +60,8 @@
         # needs its hash spelled out even though plowc/plowrt never compile it.
         outputHashes = {
           "inference-benchmarker-1.1.0" = "sha256-Tr/urmjuYQXH50kxCn05DOLfv4JTYv+mjsBv5EhQXAE=";
+          # `plowrt push`'s bucket client (crates/plowrt/Cargo.toml).
+          "object_store-0.14.2" = "sha256-mT3o58v/2cYCx7LEQ5QiP1pOP/TLxZ+cpNLEiVXA5dw=";
         };
       };
 
@@ -211,6 +213,7 @@
           pkgs = pkgsFor system;
           lib = pkgs.lib;
           isLinux = pkgs.stdenv.isLinux;
+          isDarwin = pkgs.stdenv.isDarwin;
           # The GPU toolchains only exist here: the ROCm SDK tarball is a
           # linux-x86_64 binary distribution.
           isGpuHost = system == "x86_64-linux";
@@ -252,10 +255,26 @@
                 doCheck = false;
               };
               name = "plowrt-${releaseVersion}-${triple}${suffix}";
-            in
-            pkgs.runCommand name { nativeBuildInputs = [ pkgs.gnutar pkgs.gzip pkgs.coreutils ]; } ''
+            # A dynamic Linux release is re-pointed at the host's loader and
+            # loses its nix rpath: as built, the ELF interpreter is a
+            # /nix/store glibc that exists on no serving host (v0.1.1 shipped
+            # that way and ran nowhere). The digest below is of the patched
+            # bytes, which are the bytes the registry serves. Needs glibc
+            # >= 2.38 on the host; the static (musl) release needs nothing.
+            interp =
+              {
+                "x86_64-unknown-linux-gnu" = "/lib64/ld-linux-x86-64.so.2";
+                "aarch64-unknown-linux-gnu" = "/lib/ld-linux-aarch64.so.1";
+              }
+              .${triple} or null;
+          in
+            pkgs.runCommand name { nativeBuildInputs = [ pkgs.gnutar pkgs.gzip pkgs.coreutils ] ++ lib.optional (interp != null) pkgs.patchelf; } ''
               mkdir -p $out "$TMPDIR/${name}"
               cp ${bin}/bin/plowrt "$TMPDIR/${name}/plowrt"
+              chmod u+w "$TMPDIR/${name}/plowrt"
+              ${lib.optionalString (interp != null) ''
+                patchelf --set-interpreter ${interp} --remove-rpath "$TMPDIR/${name}/plowrt"
+              ''}
               # Deterministic: a fixed mtime, sorted entries, owner stripped, and
               # no gzip timestamp, so rebuilding the same commit reproduces the
               # same digest and the store dedups it.
@@ -486,34 +505,38 @@
               plow-interp-sm120a
             ];
           };
-        }
+        })
         // {
           # --- release assets --------------------------------------------------
           #
           # A runtime release is a tarball per platform triple, named
           # `<semver>+<git12>`, plus the sha256 a client verifies it against.
-          # `scripts/release_runtime.py` turns these into `v1/runtime/index.json`
-          # and the blobs a `plowrt` client reads.
+          # A registry records these in `v1/runtime/index.json`, which a `plowrt`
+          # client reads.
           #
           # `dist` is in every feature set: the released binary is exactly the
           # one that can `pull`. `serve` still performs no network I/O — that is
           # a property of the code path, not of the build, and CI asserts it.
+          #
+          # Every system has one: a Mac publishes its own `aarch64-apple-darwin`
+          # release (CPU + dist; the GPU features are Linux-only), which is what
+          # `install.sh` fetches there.
           plowrt-release = mkRelease {
-            features = lib.optionals isLinux [ "cuda" "hsa" ] ++ [ "cpu" "dist" ];
+            features = lib.optionals isLinux [ "cuda" "hsa" ]
+              ++ lib.optionals isDarwin [ "metal" ] ++ [ "cpu" "dist" ];
           };
-
+        }
+        // lib.optionalAttrs (system == "x86_64-linux") {
           # A fully static, CPU-only runtime. `docs/BUILD.md` already establishes
           # why this cannot be the default: a `crt-static` binary cannot `dlopen`,
           # so a static GPU build makes the GPU path dead code. It exists for
           # hosts where a glibc floor is the problem and no GPU is the answer.
-          plowrt-release-static = lib.optionalAttrs (system == "x86_64-linux") (
-            mkRelease {
-              features = [ "dist" ];
-              target = "x86_64-unknown-linux-musl";
-              rustPlatform = pkgs.pkgsStatic.rustPlatform;
-              suffix = "-static";
-            }
-          );
+          plowrt-release-static = mkRelease {
+            features = [ "dist" ];
+            target = "x86_64-unknown-linux-musl";
+            rustPlatform = pkgs.pkgsStatic.rustPlatform;
+            suffix = "-static";
+          };
 
           # Cross-built from x86_64-linux; tests can't run on the build host.
           plowrt-aarch64 = pkgs.pkgsCross.aarch64-multiplatform.rustPlatform.buildRustPackage {
@@ -525,7 +548,7 @@
             doCheck = false;
             postInstall = "mv $out/bin/plowrt $out/bin/plowrt-aarch64";
           };
-        }));
+        });
 
       apps = forAll (system: {
         default = {
@@ -558,6 +581,21 @@
           isGpuHost = system == "x86_64-linux";
         in
         {
+          # Hosted CI needs the pinned host tools, not the multi-GB GPU SDKs.
+          ci = pkgs.mkShell {
+            name = "plow-ci";
+            packages = [
+              pkgs.cargo
+              pkgs.rustc
+              pkgs.rustfmt
+              pkgs.cmake
+              pkgs.python3
+              pkgs.bash
+              pkgs.git
+              pkgs.actionlint
+            ];
+          };
+
           default = pkgs.mkShell {
             name = "plow-dev";
             packages = [
@@ -573,7 +611,7 @@
               # lean-plow/lean-toolchain on first `lake` invocation.
               pkgs.elan
               # Asset publishing: blobs are stored compressed and keyed on the
-              # UNCOMPRESSED digest (scripts/publish_dist.py). Producer-side
+              # UNCOMPRESSED digest. Producer-side
               # only — a serving host decompresses with the `zstd` crate linked
               # into plowrt under the `dist` feature, and needs neither this nor
               # nix.

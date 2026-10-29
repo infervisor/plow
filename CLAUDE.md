@@ -5,31 +5,75 @@
 * Plans/research live in `plans/` (gitignored).
 * Read relevant plan before work. Update only when decisions change.
 
-## Tools & Environment
+## Repository layout (strict)
 
-Read `docs/bringup/agent-tools.md` before writing any benchmark, probe, or serve script.
-`scripts/` has 400+ scripts; most campaigns still wrote a throwaway probe and re-hit the same
-environment failures on leased GPUs.
+Put code where its kind already lives. Never create a new top-level directory, a new
+`scripts/` subdirectory, or a parallel copy of an existing tool. Ask when nothing fits.
+
+* `crates/` — the Rust workspace. `plowc` (compile/emit), `plowrt` (runtime, serve, dist),
+  `plow-asset` (packet, manifest and recipe schemas), `devgen`, `hwspec`, `tunedb`, `costmodel`,
+  `kernelcaps`, `packet`, `schedule`, `rewrite`, `nn-graph`, `lean_verify`. Runtime, compiler,
+  packing and publishing behaviour lives in the crate that owns it, never in a script.
+* `runtime/` — C/C++/CUDA/HIP kernel sources and CMake: `nvidia/`, `amd/`, `apple/`, `cpu/`,
+  `common/`, `tests/`, `ubench/`, `bench/`. `include/packet.h` is the packet ABI.
+* `scripts/` — operator tooling, one reusable capability per file, in its subdirectory:
+  `bench/` (plowbench, doctor, gpuq, serving comparison, replays), `campaign/` (campaign.py,
+  rung/roofline/evidence tools, experimental recipes under `campaign/recipes/`), `asr/`, `tts/`,
+  `voice/`, `llm/`, `mm/` (per-modality gates and prep), `gen_kernels/`, `serve_test/`,
+  `twoengine/`, `tests/`. Recipe tools are `check_recipe.py`, `render_recipe.py` and their
+  shared `recipe_common.py`. A `test_<name>.py` sits beside `<name>`. No one-off probes,
+  captures, dumps or throwaway drivers: those are scratch outside the repo.
+* `recipes/infervisor/<model>/<label>.toml` + `.md` — the one canonical production recipe per
+  model/GPU/precision. Experimental recipes stay in `scripts/campaign/recipes/`.
+* `perf-data/` — serving-level evidence: `campaign/` CSVs, `tools/` (gpulease, bringup gates,
+  quantizers, result validators), `packets/`, `probes/`, `block-configs/`.
+  `perf-certs/` — checkpoint P certificates. `tuning/` — kernel-level measurement records keyed
+  by hardware fingerprint, written only by a tuning run.
+* `docs/` — `BUILD.md`, `DISTRIBUTION.md`, `arch/` (design; no tool, agent or model-vendor
+  names), `bringup/` (`agent-tools.md` and campaign logs), `runtime/`, `schemas/`, `amd/`.
+* `lean-plow/` — Lean 4 verification. `tools/` — the `bench` crate and `bench-api`.
+  `assets/`, `media/` — images only.
+* Raw logs, JSON, captures, generated reports and temporary CSVs go to campaign scratch outside
+  the repo, never under `docs/`, `scripts/`, `perf-data/` or `recipes/`.
+
+## Nix environment
+
+* Every build, emit, serve, bench and test runs inside `nix develop`
+  (`nix develop --command <cmd>`). The flake pins ROCm, CUDA, the Rust toolchain and Lean.
+  `ROCM_PATH` unset means you are outside it: stop and re-enter, do not work around it.
+* Never fake `ROCM_PATH`, hardcode a `/nix/store` path, or add a toolchain or Python dependency
+  outside `flake.nix`. A hand-built box without nix sets `PLOW_CAMPAIGN_NO_NIX=1`; that is the
+  only sanctioned exception.
+* A published manifest, recipe, doc or script never references a build-host path.
+
+## Tools: reuse, never recreate
+
+Read `docs/bringup/agent-tools.md` and `scripts/campaign/README.md` before writing any
+benchmark, probe, gate or serve script. `scripts/` holds hundreds of scripts because campaigns
+kept writing throwaway probes and re-hitting the same environment failures on leased GPUs.
 
 * HARD RULE: perf candidates are screened on a single block vs its calibrated roofline before any
   whole-network run; reports start with the block-vs-roofline table (agent-tools.md "HARD RULE").
 * Standing team rules (prefix cache on, one binary, packet contract, static runtime, vLLM-peer
   judging, GPU budget, `prod-next` only, kernel reviews): agent-tools.md "Working rules".
-
-* Everything runs inside `nix develop`. `ROCM_PATH` unset means you are outside it. A hand-built
-  box without nix sets `PLOW_CAMPAIGN_NO_NIX=1` instead of faking `ROCM_PATH`.
+* If a tool does the job, use it. If it almost does, extend it in place and keep the extension.
+  A new script is justified only for a capability no existing tool can express; it goes in the
+  matching subdirectory, `source`s `scripts/bench/plowbench.sh` for port choice, readiness poll,
+  bench invocation and result parsing, and ships with its self-test.
+* Never re-implement: GPU queueing (`scripts/bench/gpuq.py submit`, every GPU process, never a
+  raw lease), leasing (`perf-data/tools/gpulease`, not on PATH), environment checks
+  (`scripts/bench/plowbench-doctor.sh <assets> <objdir>`, CPU only, before any lease), serving
+  bench/parsing (`plowbench.sh`), campaign build/bench/compare/ledger
+  (`scripts/campaign/campaign.py`), recipe validation (`check_recipe.py`), manifest packing
+  and publishing (`plowrt pack|publish --recipe`), quantization (`perf-data/tools/quantize_*`).
+* Shared Python helpers live beside their callers as a module (`recipe_common.py`,
+  `campaign/rung_env.py`); the same helper copied into two scripts is a bug.
 * Not from nix, pass explicitly: vLLM client `/app/plow/build-gemma31/vllm-python` (built from
   source; `plowbench.sh` reads `PB_VLLM`), its ROCm lib `/opt/rocm/core-7.14/lib`
-  (`PB_VLLM_ROCM_LIB`, exported as `VLLM_ROCM_LIB`), and `gpulease` (`perf-data/tools/gpulease`
-  in the checkout, not on PATH). The `/app/...` paths are one lab box's layout.
-* Before leasing a GPU: `nix develop --command scripts/bench/plowbench-doctor.sh <assets> <objdir>`.
-  CPU only. It checks the shell, hazardous `PLOW_*` leftovers, binaries, packet hash, the object
-  set (including the vendor `.co` kernels `build_gfx942.sh` does not emit), the queue, and disk.
+  (`PB_VLLM_ROCM_LIB`, exported as `VLLM_ROCM_LIB`). The `/app/...` paths are one lab box's
+  layout.
 * GLM-5.3 driver: `scripts/glm53_mi300x.sh emit|serve|bench|vllm|smoke|stop`. The `serve` and
   `vllm` subcommands are the two halves of a comparison — same client, two base URLs.
-* New probes `source scripts/bench/plowbench.sh` instead of re-implementing port choice, the
-  readiness poll, the bench invocation, or result parsing.
-* Every GPU process goes through the queue (`scripts/bench/gpuq.py submit`), never a raw lease.
 * Final plow-vs-baseline performance comparisons: only `campaign.py report` output, in the strict
   12-row format of `docs/bringup/agent-tools.md` "Final performance report (strict)".
 

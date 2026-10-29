@@ -388,10 +388,13 @@ PYEOF
 
 # pb_serve_start <plowrt> <assets> <objdir> <port> <logfile> [timeout-s]
 # Foreground timeout forwards signals only to this server, never its process group.
+# PB_SERVE_ARGS: extra `serve` arguments, word-split (e.g. "--bind 127.0.0.1").
 pb_serve_start() {
     local rt="$1" assets="$2" objdir="$3" port="$4" log="$5" tmo="${6:-5400}"
+    local -a extra
+    read -r -a extra <<< "${PB_SERVE_ARGS:-}"
     PLOW_HSACO="$objdir" timeout --foreground --kill-after=10s -s TERM "$tmo" \
-        "$rt" serve --assets "$assets" --port "$port" > "$log" 2>&1 &
+        "$rt" serve --assets "$assets" --port "$port" "${extra[@]}" > "$log" 2>&1 &
     PB_SERVER_PID=$!
     PB_SERVER_PORT=$port
     PB_SERVER_LOG=$log

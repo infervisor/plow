@@ -324,6 +324,19 @@ pub struct ServingMetrics {
     pub thinking_requests: AtomicU64,
     pub reasoning_tokens: AtomicU64,
     pub request_reasoning_tokens: Histogram,
+    /// Thinking control (`serve::think`): trace blocks, blocks ended by forcing, requests the
+    /// reply cap ended, grace tokens spent per controlled request, and the time to the first
+    /// reply byte of a thinking request (what a voice caller waits for).
+    pub thinking_blocks: AtomicU64,
+    pub thinking_forced: AtomicU64,
+    pub reply_capped: AtomicU64,
+    pub thinking_grace_tokens: Histogram,
+    pub first_reply: Histogram,
+    /// Voice reply guard (`serve::reply_guard`): responses with a moved planning line, fallback
+    /// lines by kind (`wait`, `goodbye`), and answers whose first word marks reasoning.
+    pub guard_moved: AtomicU64,
+    pub guard_fallback: [AtomicU64; 2],
+    pub guard_answer_reasoning: AtomicU64,
     pub spec: SpecMetrics,
 }
 
@@ -415,27 +428,63 @@ pub struct ReasoningTally {
     pub metrics: Arc<Metrics>,
     /// The rendered prompt has reasoning on (counted at admission).
     pub thinking: bool,
+    /// Request arrival, until the first reply byte is recorded.
+    arrived: Option<Instant>,
 }
 
 impl ReasoningTally {
     /// Counts the admitted request when `thinking`.
-    pub fn admitted(metrics: Arc<Metrics>, thinking: bool) -> Self {
+    pub fn admitted(metrics: Arc<Metrics>, thinking: bool, arrived: Instant) -> Self {
         if thinking {
             metrics.serving.thinking_requests.fetch_add(1, Relaxed);
         }
-        Self { metrics, thinking }
+        Self {
+            metrics,
+            thinking,
+            arrived: thinking.then_some(arrived),
+        }
+    }
+
+    /// A guarded response's outcome.
+    pub fn guarded(
+        &self,
+        g: &crate::serve::reply_guard::ReplyGuard,
+        fallback: Option<crate::serve::reply_guard::Fallback>,
+    ) {
+        let m = &self.metrics.serving;
+        if g.moved {
+            m.guard_moved.fetch_add(1, Relaxed);
+        }
+        if g.answer_reasoning {
+            m.guard_answer_reasoning.fetch_add(1, Relaxed);
+        }
+        if let Some(f) = fallback {
+            m.guard_fallback[f as usize].fetch_add(1, Relaxed);
+        }
+    }
+
+    /// The response's first answer text after its trace; recorded once, for thinking requests.
+    pub fn reply_started(&mut self) {
+        if let Some(t) = self.arrived.take() {
+            self.metrics.serving.first_reply.duration(t.elapsed());
+        }
     }
 
     /// `trace_tokens`: the splitter's count, the same number `reasoning_tokens` reports in
     /// `usage`. Requests that neither asked for reasoning nor produced a trace stay out of the
-    /// histogram.
-    pub fn finished(&self, trace_tokens: u64) {
+    /// histogram. `think`: the thinking controller's report, when the request had one.
+    pub fn finished(&self, trace_tokens: u64, think: Option<crate::serve::think::ThinkReport>) {
         let m = &self.metrics.serving;
         if trace_tokens > 0 {
             m.reasoning_tokens.fetch_add(trace_tokens, Relaxed);
         }
         if self.thinking || trace_tokens > 0 {
             m.request_reasoning_tokens.tokens(trace_tokens as usize);
+        }
+        if let Some(t) = think {
+            m.thinking_blocks.fetch_add(u64::from(t.blocks), Relaxed);
+            m.thinking_forced.fetch_add(u64::from(t.forced), Relaxed);
+            m.thinking_grace_tokens.tokens(t.grace_tokens as usize);
         }
     }
 }
@@ -556,6 +605,24 @@ impl ServingMetrics {
             |m: &Metrics, _| m.serving.reasoning_tokens.load(Relaxed)
         );
         scalar!(
+            "plowrt_thinking_blocks_total",
+            "counter",
+            "Reasoning-trace blocks of chat requests under thinking control (a block re-opened after the answer began counts again).",
+            |m: &Metrics, _| m.serving.thinking_blocks.load(Relaxed)
+        );
+        scalar!(
+            "plowrt_thinking_budget_forced_total",
+            "counter",
+            "Trace blocks whose `thinking_token_budget` ran out and whose end the server forced.",
+            |m: &Metrics, _| m.serving.thinking_forced.load(Relaxed)
+        );
+        scalar!(
+            "plowrt_reply_capped_total",
+            "counter",
+            "Chat requests ended by `max_reply_tokens` (finish_reason length, x_plow_finish_reason reply_cap).",
+            |m: &Metrics, _| m.serving.reply_capped.load(Relaxed)
+        );
+        scalar!(
             "plowrt_requests_preempted_total",
             "counter",
             "Requests terminated by model residency preemption.",
@@ -642,6 +709,33 @@ impl ServingMetrics {
             "Judged requests meeting every configured target (goodput).",
             |m: &Metrics, _| m.serving.slo_met.load(Relaxed)
         );
+        scalar!(
+            "plowrt_reply_guard_moved_total",
+            "counter",
+            "Guarded chat responses that had a planning line moved from content to reasoning.",
+            |m: &Metrics, _| m.serving.guard_moved.load(Relaxed)
+        );
+        scalar!(
+            "plowrt_reply_guard_answer_reasoning_total",
+            "counter",
+            "Guarded chat responses whose answer starts with Wait/Alternatively/Hmm/Actually, moved or not.",
+            |m: &Metrics, _| m.serving.guard_answer_reasoning.load(Relaxed)
+        );
+        family(
+            out,
+            "plowrt_reply_guard_fallback_total",
+            "counter",
+            "Guarded chat responses left with nothing to say and answered with a fallback line, by kind.",
+        );
+        for ((_, m, _), labels) in models.iter().zip(&labels) {
+            for (i, kind) in ["wait", "goodbye"].iter().enumerate() {
+                let _ = writeln!(
+                    out,
+                    "plowrt_reply_guard_fallback_total{{{labels},kind=\"{kind}\"}} {}",
+                    m.serving.guard_fallback[i].load(Relaxed)
+                );
+            }
+        }
         family(
             out,
             "vllm:request_success_total",
@@ -823,6 +917,20 @@ impl ServingMetrics {
             TOKENS,
             1.0,
             "Reasoning-trace tokens per finished chat request that had reasoning on or produced a trace."
+        );
+        hist!(
+            "plowrt_thinking_grace_tokens",
+            thinking_grace_tokens,
+            TOKENS,
+            1.0,
+            "Trace tokens past the budget spent waiting for a line end, per request under thinking control."
+        );
+        hist!(
+            "plowrt_first_reply_token_seconds",
+            first_reply,
+            LATENCY,
+            1e6,
+            "Arrival through the first answer text after the trace, per thinking chat request."
         );
         hist!(
             "vllm:request_prompt_tokens",
@@ -1064,7 +1172,14 @@ impl RequestMetrics {
             m.preempted.fetch_add(1, Relaxed);
             return;
         }
-        m.success[usize::from(matches!(reason, FinishReason::Length))].fetch_add(1, Relaxed);
+        if matches!(reason, FinishReason::ReplyCap) {
+            m.reply_capped.fetch_add(1, Relaxed);
+        }
+        m.success[usize::from(matches!(
+            reason,
+            FinishReason::Length | FinishReason::ReplyCap
+        ))]
+        .fetch_add(1, Relaxed);
         let now = Instant::now();
         m.e2e.duration(now.saturating_duration_since(self.arrived));
         m.inference
@@ -1175,6 +1290,45 @@ mod tests {
         assert_eq!(m.serving.aborted_before_first.load(Relaxed), 1);
         assert_eq!(m.serving.preempted.load(Relaxed), 1);
         assert_eq!(m.serving.success[0].load(Relaxed), 0);
+    }
+
+    /// Each thinking-control family moves once per request: the controller's report at finish,
+    /// the first reply byte once, the reply cap through the request's finish reason.
+    #[test]
+    fn thinking_control_metrics_count_once_per_request() {
+        let m = Arc::new(Metrics::default());
+        let now = Instant::now();
+        let mut t = ReasoningTally::admitted(m.clone(), true, now);
+        t.reply_started();
+        t.reply_started();
+        t.finished(
+            12,
+            Some(crate::serve::think::ThinkReport {
+                blocks: 2,
+                forced: 1,
+                grace_tokens: 3,
+                guard_moved: false,
+            }),
+        );
+        ReasoningTally::admitted(m.clone(), false, now).reply_started();
+        let mut r = RequestMetrics::new(m.clone(), now, now, 10, 16);
+        r.token(0);
+        r.finish(FinishReason::ReplyCap, 1);
+        drop(r);
+        let mut out = String::new();
+        ServingMetrics::write(&mut out, &[("g".into(), m, true)]);
+        let l = "{model_name=\"g\",engine=\"0\"}";
+        for line in [
+            format!("plowrt_thinking_blocks_total{l} 2\n"),
+            format!("plowrt_thinking_budget_forced_total{l} 1\n"),
+            format!("plowrt_reply_capped_total{l} 1\n"),
+            format!("plowrt_thinking_grace_tokens_count{l} 1\n"),
+            format!("plowrt_thinking_grace_tokens_sum{l} 3\n"),
+            format!("plowrt_first_reply_token_seconds_count{l} 1\n"),
+            format!("vllm:request_success_total{{model_name=\"g\",engine=\"0\",finished_reason=\"length\"}} 1\n"),
+        ] {
+            assert!(out.contains(&line), "missing {line}");
+        }
     }
 
     #[test]

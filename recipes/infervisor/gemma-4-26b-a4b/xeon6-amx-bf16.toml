@@ -38,7 +38,8 @@ max_ctx = 2048
 toolchain = "nix"
 
 [checkpoint]
-source = "google/gemma-4-26B-A4B-it"
+source = "hf:google/gemma-4-26B-A4B-it"
+revision = "4d7ae4984b7db7de8f8457170b3f1a419ee76d52"
 layout = "hf-bf16"
 
 [cell]

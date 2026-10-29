@@ -31,6 +31,7 @@ toolchain = "rocm-7.14.0-nix"
 
 [checkpoint]
 source = "hf:moonshotai/Kimi-K3"
+revision = "9f62e4e9fffbd0a83ddd60e1c209d828994b3569"
 shards = 96
 layout = "native-mxfp4"
 
