@@ -267,8 +267,9 @@ compact terminal (the first token from the prefill launch; needs the generic or 
 tail), segment roles, token batch, generated kernels, device sampler, Lt prefill. The doctor
 (`scripts/bench/capability_check.py`) fails on an `OFF` unless the recipe beside the assets waives
 it in `[capabilities]` (`name = "measured reason"`) or `PB_CAPABILITY_WAIVERS=name,...` does. A
-recurrent network's prefix cache row prints `n/a` (the inventory predates the GDN state capture;
-the Qwen3.8 BF16 recipe serves with the cache on), and its token batch is `ON` only when the packet
+recurrent network's prefix cache is `ON` when the packet's `recurrent_state` section declares its
+state buffers (the block store captures them at a boundary; CUDA does not auto-select it, so the
+recipe sets `PLOW_VMM_PREFIX=1`), and its token batch is `ON` only when the packet
 carries the packed scan's init-state scratch (`act.gdn.initstate`), otherwise `OFF`. The Qwen3.8 campaign ran
 some forty builds before packed prefill was turned on; this check exists so the next model starts there.
 

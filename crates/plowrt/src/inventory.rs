@@ -123,11 +123,32 @@ pub fn inventory(blob: &DevBlob, raw: &[u8], assets: Option<&Path>) -> crate::Re
             State::On,
             format!("{} per-layer state tensors", recurrent.len()),
         ));
-        out.push(item(
-            "prefix_cache",
-            State::NotApplicable,
-            "recurrent state: plowrt refuses prefix reuse without a state snapshot at the boundary",
-        ));
+        // The block store's State class captures every declared buffer at a boundary
+        // (`exec/gpu/kv_blocks.rs`); a `state.` tensor the section does not declare is refused at
+        // load (`plow_asset::recurrent_state`).
+        let declared = blob
+            .reserved_metadata(raw, plow_asset::recurrent_state::SECTION)?
+            .map(|bytes| {
+                serde_json::from_slice::<plow_asset::recurrent_state::Manifest>(bytes)
+                    .map(|m| m.buffers.len())
+            })
+            .transpose()
+            .map_err(|e| crate::RuntimeError::Rejected(format!("recurrent_state: {e}")))?;
+        out.push(match declared {
+            Some(n) if n > 0 => item(
+                "prefix_cache",
+                State::On,
+                format!(
+                    "recurrent state captured at boundaries ({n} declared buffers); CUDA does not \
+                     auto-select it: serve with PLOW_VMM_PREFIX=1"
+                ),
+            ),
+            _ => item(
+                "prefix_cache",
+                State::Off,
+                "state.* tensors without declared recurrent_state buffers: the packet is refused",
+            ),
+        });
     }
 
     let live = blob.reserved_metadata(raw, plow_asset::live_kv::SECTION)?;
