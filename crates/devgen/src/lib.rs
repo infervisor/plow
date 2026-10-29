@@ -55,6 +55,7 @@ mod block;
 mod gemma4_gemm_glu_role;
 mod gemma4_w8a8_gemm_glu_role;
 mod gen_kernels;
+mod library_attention;
 mod serve_section;
 mod w8a16_prefill_role;
 use block::{parse_block, write_block_descriptor};
@@ -11527,6 +11528,13 @@ fn emit_dense_gqa(
         )
         .unwrap_or_else(|error| panic!("Gemma-4 W8A8 GemmGlu object: {error}"));
         eprintln!("  Gemma-4 W8A8 GemmGlu: {selected} lean segments");
+    }
+    // Last: the declared library segments keep whatever native role the passes above chose.
+    let selected =
+        library_attention::apply_output_object(&m, &mut sections, std::path::Path::new(&out))
+            .unwrap_or_else(|error| panic!("library attention: {error}"));
+    if selected > 0 {
+        eprintln!("  library prefill attention: {selected} segments");
     }
     if let Some(live_position) = sections
         .iter()

@@ -23,13 +23,20 @@ struct PlowFa4Handle {
     plow_fa4_hd512_combine_Kernel_Module_t combine{};
 };
 
-extern "C" unsigned plow_fa4_abi() { return 2; }
+// ABI 3: the KV adapters (runtime/nvidia/kv_dequant_sm90.cu: plow_fa4_kv_gather,
+// plow_fa4_kv_zero_tail, plow_fa4_convert) are linked in.
+extern "C" unsigned plow_fa4_abi() { return 3; }
 
 #ifndef PLOW_FA4_DTYPE
 #define PLOW_FA4_DTYPE 0
 #endif
 // Element type of q / k / v / out the exported entries were compiled for: 0 bf16, 1 fp16.
 extern "C" unsigned plow_fa4_dtype() { return PLOW_FA4_DTYPE; }
+#define PLOW_FA4_STR2(x) #x
+#define PLOW_FA4_STR(x) PLOW_FA4_STR2(x)
+// The emitter reads the ABI and dtype from this marker without loading the library.
+extern "C" __attribute__((used, visibility("default"))) const char plow_fa4_caps[] =
+    "plow_fa4_caps:abi=3:dtype=" PLOW_FA4_STR(PLOW_FA4_DTYPE);
 
 #define PLOW_FA4_MODULES(X) X(h16kv1) X(h16kv1_split) X(h16kv2) X(h16kv2_split) X(combine)
 
@@ -147,4 +154,15 @@ extern "C" int plow_fa4_hd512_run(PlowFa4Handle* h, unsigned heads, unsigned kv_
 #undef PLOW_FA4_SPLIT
 #undef PLOW_FA4_WHOLE
 #undef PLOW_FA4_TENSORS
+}
+
+// The geometry-generic entry name of plow_fa4 ABI 3 (the library's caps marker names the geometry).
+extern "C" int plow_fa4_run(PlowFa4Handle* h, unsigned heads, unsigned kv_heads, void* q, void* k,
+                            void* v, void* out, int total_q, int nreq, void* cu_q, void* used_k,
+                            void* page_table, int max_pages, int num_pages, int64_t head_stride,
+                            float scale, int splits, void* workspace, uint64_t workspace_bytes,
+                            void* stream) {
+    return plow_fa4_hd512_run(h, heads, kv_heads, q, k, v, out, total_q, nreq, cu_q, used_k,
+                              page_table, max_pages, num_pages, head_stride, scale, splits,
+                              workspace, workspace_bytes, stream);
 }
