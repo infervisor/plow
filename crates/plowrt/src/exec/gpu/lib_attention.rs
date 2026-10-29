@@ -29,6 +29,8 @@ use std::ffi::c_void;
 
 use plow_asset::segment_roles::{LibraryAbi, LibraryKvLayout};
 
+/// Cadence of the served / fallback count line (also logged at unload).
+const STATS_EVERY: std::time::Duration = std::time::Duration::from_secs(60);
 const PAGE: u32 = 64;
 /// Pool rows per KV head: one launch's summed kv lengths, page-rounded. A launch past it runs the
 /// native role.
@@ -270,6 +272,7 @@ pub(super) struct LibAttention {
     max_kv_heads: u32,
     routed: u64,
     fallbacks: u64,
+    stats_at: std::time::Instant,
 }
 
 #[derive(Clone, Copy)]
@@ -431,6 +434,7 @@ impl LibAttention {
             max_kv_heads,
             routed: 0,
             fallbacks: 0,
+            stats_at: std::time::Instant::now(),
         })
     }
 
@@ -439,7 +443,16 @@ impl LibAttention {
         (self.routed, self.fallbacks)
     }
 
+    fn log_counts(&self) {
+        tracing::info!(
+            served = self.routed,
+            fallback = self.fallbacks,
+            "library prefill attention launches"
+        );
+    }
+
     pub(super) fn unload(mut self) -> Result<()> {
+        self.log_counts();
         self.fa4.unload(&self.be)?;
         match self.adapters.module.take() {
             Some(m) => self.be.module_unload(&m),
@@ -457,6 +470,10 @@ impl LibAttention {
         stream: &CudaStream,
     ) -> Result<bool> {
         let routed = self.plan(requests, rows, stream)?;
+        if self.stats_at.elapsed() >= STATS_EVERY {
+            self.stats_at = std::time::Instant::now();
+            self.log_counts();
+        }
         if routed {
             self.routed += 1;
         } else {
