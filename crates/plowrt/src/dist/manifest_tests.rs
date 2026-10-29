@@ -1014,6 +1014,14 @@ fn a_target_that_ships_objects_needs_them_somewhere() {
     assert!(e.contains("no *.elf, *.cubin or *.co found"), "{e}");
 }
 
+/// The GDN prefill library is loaded from beside the packet, so it travels
+/// in the bundle under its own role; any other `.so` is still unclaimed.
+#[test]
+fn the_gdn_prefill_library_has_a_role_and_other_shared_objects_do_not() {
+    assert_eq!(classify("libplow_gdn_prefill.so"), Some("host_library"));
+    assert_eq!(classify("libsomething.so"), None);
+}
+
 /// Nothing records a compiler for a runtime-compiled target, so its recipe
 /// may omit `toolchain`; a CUDA recipe without one is still refused (see
 /// `a_recipe_missing_an_identity_field_is_refused_by_name`).

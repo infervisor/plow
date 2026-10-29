@@ -61,6 +61,11 @@ const ROLES: &[(&str, &str)] = &[
     // packet whose receipts are absent, so a bundle that drops them can never
     // be verified strictly for as long as it exists.
     ("lean-checks.json", "packet_checks"),
+    // The host-side GDN prefill library a Qwen3.5-family packet's prefill
+    // loads from beside it (`exec/gpu.rs`, `NativeGdn::load`): built per
+    // target by `scripts/build_sm90a_qwen_gdn.py`, so it is part of the
+    // build, not an object, and a bundle without it cannot prefill.
+    ("libplow_gdn_prefill.so", "host_library"),
 ];
 
 /// Suffixes that belong to the objset, not the bundle: exactly the three globs
