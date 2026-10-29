@@ -977,6 +977,122 @@ pub struct RuntimeConfig {
     #[arg(long = "pfx-trace", env = "PLOW_PFX_TRACE", global = true)]
     pub pfx_trace: Option<std::path::PathBuf>,
 
+    /// Per-model chat request defaults: thinking budget, reply cap, forced end string, seeded
+    /// trace, `max_tokens`, template kwargs. A JSON object keyed by served model name
+    /// (`serve::config::ChatDefaults`); an unknown key is a startup error.
+    #[arg(long = "chat-defaults", env = "PLOW_CHAT_DEFAULTS", global = true)]
+    pub chat_defaults: Option<std::path::PathBuf>,
+
+    // REASONING AND GENERATION DEFAULTS UNDER OTHER ENGINES' FLAG NAMES, so a vLLM, SGLang or
+    // llama.cpp command line serves the same behavior here. Every model gets them; its
+    // `--chat-defaults` entry goes on top, a request's own field on top of that.
+    /// vLLM / SGLang `--reasoning-parser`: checked against the model's template (the trace is
+    /// always split by the template's own markers).
+    #[arg(
+        long = "reasoning-parser",
+        env = "PLOW_REASONING_PARSER",
+        global = true
+    )]
+    pub reasoning_parser: Option<String>,
+
+    /// vLLM `--reasoning-config` JSON: `reasoning_parser`, `reasoning_start_str`,
+    /// `reasoning_end_str` (the forced end, a bridge phrase allowed before the close marker).
+    #[arg(
+        long = "reasoning-config",
+        env = "PLOW_REASONING_CONFIG",
+        global = true
+    )]
+    pub reasoning_config: Option<String>,
+
+    /// vLLM `--default-chat-template-kwargs` / llama.cpp `--chat-template-kwargs` JSON, under a
+    /// request's own `chat_template_kwargs`.
+    #[arg(
+        long = "default-chat-template-kwargs",
+        visible_alias = "chat-template-kwargs",
+        env = "PLOW_DEFAULT_CHAT_TEMPLATE_KWARGS",
+        global = true
+    )]
+    pub default_chat_template_kwargs: Option<String>,
+
+    /// vLLM `--generation-config`: `auto` (the checkpoint's sampling defaults), `vllm` (none of
+    /// them), or a directory holding a `generation_config.json`.
+    #[arg(
+        long = "generation-config",
+        env = "PLOW_GENERATION_CONFIG",
+        global = true
+    )]
+    pub generation_config: Option<String>,
+
+    /// vLLM `--override-generation-config` JSON: temperature, top_p, top_k, min_p,
+    /// repetition/presence/frequency penalties, max_new_tokens (a default max_tokens).
+    #[arg(
+        long = "override-generation-config",
+        env = "PLOW_OVERRIDE_GENERATION_CONFIG",
+        global = true
+    )]
+    pub override_generation_config: Option<String>,
+
+    /// vLLM / SGLang `--chat-template`: a template file, or the template text, for every model.
+    #[arg(long = "chat-template", env = "PLOW_CHAT_TEMPLATE", global = true)]
+    pub chat_template: Option<String>,
+
+    /// vLLM < 0.10 `--enable-reasoning`: accepted; reasoning is always split here.
+    #[arg(long = "enable-reasoning", env = "PLOW_ENABLE_REASONING", value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", default_value_t = false, global = true)]
+    pub enable_reasoning: bool,
+
+    /// llama.cpp `--reasoning-budget` (vLLM's request `thinking_token_budget`): the default
+    /// thinking budget; -1 none, 0 thinking off.
+    #[arg(
+        long = "reasoning-budget",
+        visible_alias = "thinking-token-budget",
+        env = "PLOW_REASONING_BUDGET",
+        allow_hyphen_values = true,
+        global = true
+    )]
+    pub reasoning_budget: Option<i64>,
+
+    /// llama.cpp `--reasoning-budget-message`: text committed before the close marker when the
+    /// budget ends a trace.
+    #[arg(
+        long = "reasoning-budget-message",
+        env = "PLOW_REASONING_BUDGET_MESSAGE",
+        global = true
+    )]
+    pub reasoning_budget_message: Option<String>,
+
+    /// The whole forced end (bridge + close marker); vLLM's `reasoning_end_str`.
+    #[arg(long = "reasoning-end", env = "PLOW_REASONING_END", global = true)]
+    pub reasoning_end: Option<String>,
+
+    /// llama.cpp `--reasoning-format`: `none` keeps the trace in `content`; `auto` / `deepseek`
+    /// split it.
+    #[arg(
+        long = "reasoning-format",
+        env = "PLOW_REASONING_FORMAT",
+        global = true
+    )]
+    pub reasoning_format: Option<String>,
+
+    /// llama.cpp `--reasoning on|off|auto`: the template's thinking switch by default.
+    #[arg(long = "reasoning", env = "PLOW_REASONING", global = true)]
+    pub reasoning: Option<String>,
+
+    /// llama.cpp `--reasoning-effort` (OpenAI `reasoning_effort`): the default effort.
+    #[arg(
+        long = "reasoning-effort",
+        env = "PLOW_REASONING_EFFORT",
+        global = true
+    )]
+    pub reasoning_effort: Option<String>,
+
+    /// The default `max_reply_tokens`: the answer's own cap, apart from the trace's budget.
+    #[arg(
+        long = "max-reply-tokens",
+        env = "PLOW_MAX_REPLY_TOKENS",
+        global = true
+    )]
+    pub max_reply_tokens: Option<u32>,
+
     /// Per-tick AMD serve breakdown: prefill launches, decode dispatch, host remainder
     /// (`PLOW_TICK_LOG=1`).
     #[arg(long = "tick-log", env = "PLOW_TICK_LOG", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
@@ -2719,6 +2835,27 @@ impl RuntimeConfig {
             Self::env_nonempty("PLOW_PUBLISH_URL"),
             Self::env_nonempty("PLOW_PUBLISH_KEY"),
         )
+    }
+
+    /// `PLOW_SIGNING_KEY`: the file holding the ed25519 key `push` signs a
+    /// model index with. `PLOW_TRUSTED_KEYS`: the comma-separated public keys
+    /// (`<name>:<base64>`) a `load`/`pull`/`upgrade` accepts an index from;
+    /// with any set, an unsigned or foreign-signed index is refused.
+    pub fn signing_env() -> (Option<String>, Option<String>) {
+        (
+            Self::env_nonempty("PLOW_SIGNING_KEY"),
+            Self::env_nonempty("PLOW_TRUSTED_KEYS"),
+        )
+    }
+
+    /// `PLOW_READELF`: the `readelf` the manifest generator reads an object's
+    /// `.symtab` with (`plowrt pack --recipe`). A publish-side tool setting,
+    /// not a serve knob, so it has no flag here. `nix develop` exports it
+    /// pointing at the toolchain's `llvm-readelf`, which is what
+    /// `scripts/build_gfx942.sh` itself requires; without it the generator
+    /// falls back to `llvm-readelf` then `readelf` on PATH.
+    pub fn readelf_env() -> Option<String> {
+        Self::env_nonempty("PLOW_READELF")
     }
 
     /// `PLOW_THROUGHPUT_K`: the decode quantum under the throughput objective (default 8); a

@@ -6,13 +6,13 @@ license.workspace = true
 description = "Rust client for the plow_verify Lean 4 CLI (per-instance verification against the universal lemmas in lean-plow/)."
 
 [dependencies]
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
+serde.workspace = true
+serde_json.workspace = true
 thiserror.workspace = true
-sha2 = "0.10"
+sha2.workspace = true
 
 [target.'cfg(target_os = "linux")'.dependencies]
-libc = "0.2"
+libc.workspace = true
 
 [dev-dependencies]
 packet = { workspace = true }

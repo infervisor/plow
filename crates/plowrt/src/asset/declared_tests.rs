@@ -175,6 +175,7 @@ fn a_declared_harmony_syntax_gets_its_parser_without_a_tool_request() {
             support,
             ReasoningMode::None,
             false,
+            false,
             &b,
             false,
             None,
@@ -194,7 +195,8 @@ fn respond(b: &ModelBundle, prompt: &str, pieces: &[&str]) -> (String, String) {
     let mode = b.reasoning();
     let opens = mode.prompt_opens(prompt);
     let support = b.chat_template().map(|t| t.tools);
-    match response_stream(&Plan::default(), support, mode, opens, b, true, None) {
+    let reenter = mode != ReasoningMode::None && b.think_markers().is_ok();
+    match response_stream(&Plan::default(), support, mode, opens, reenter, b, true, None) {
         Some(mut ts) => {
             let (mut r, mut c) = (String::new(), String::new());
             let mut take = |st: crate::serve::tools::stream::Step| {

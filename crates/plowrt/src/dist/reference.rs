@@ -30,6 +30,17 @@ impl Reference {
         format!("v1/{}/{}/index.json", self.namespace, self.name)
     }
 
+    /// Path of the signature over one version of the index, keyed by that
+    /// version's digest: a reader asks for the signature of exactly the bytes
+    /// it read, so an index is never seen without its own signature and two
+    /// publishers' signatures cannot cross.
+    pub fn signature_path(&self, index_digest: &str) -> String {
+        format!(
+            "v1/{}/{}/sigs/{index_digest}.sig",
+            self.namespace, self.name
+        )
+    }
+
     /// Path of one variant's manifest.
     pub fn manifest_path(&self, label: &str, generation: u32) -> String {
         format!(

@@ -29,7 +29,7 @@ import shlex
 import sys
 from pathlib import Path
 
-import plow_dist as pd
+import recipe_common as rc
 
 sys.path.insert(0, str(Path(__file__).resolve().parent / "campaign"))
 import rung_env  # noqa: E402
@@ -244,12 +244,12 @@ def run() -> None:
         print("render_recipe selftest: PASS")
         return
     if not args.recipe:
-        pd.die("give at least one recipe")
+        rc.die("give at least one recipe")
 
     stale = 0
     for rp in args.recipe:
         p = Path(rp)
-        recipe = pd.load_toml(p)
+        recipe = rc.load_toml(p)
         doc = Path(args.doc) if args.doc else default_doc(p)
         before = doc.read_text() if doc.exists() else scaffold(recipe)
         after = render(before, recipe)
@@ -261,12 +261,12 @@ def run() -> None:
             stale += 1
             continue
         if args.write:
-            pd.write_atomic(doc, after.encode())
+            rc.write_atomic(doc, after.encode())
             print(f"{doc}: written")
         else:
             print(after)
     if stale:
-        pd.die(f"{stale} document(s) out of date")
+        rc.die(f"{stale} document(s) out of date")
 
 
 def self_test() -> None:
@@ -352,7 +352,7 @@ def self_test() -> None:
     assert "no preparation step" in out
 
 
-main = pd.main_guard(run)
+main = rc.main_guard(run)
 
 if __name__ == "__main__":
     raise SystemExit(main())

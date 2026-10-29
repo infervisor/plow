@@ -94,6 +94,48 @@ async fn chat_completions_with(
     if let Some(canonical) = state.registry.resolve(&req.model) {
         req.model = canonical;
     }
+    // Per-model request defaults (`--chat-defaults`), under the request's own fields.
+    let defaults_of = state.registry.get(&req.model).ok();
+    let defaults = defaults_of.as_deref().and_then(|b| b.serving().chat.get());
+    if let Some(d) = defaults {
+        req.max_tokens = req
+            .max_tokens
+            .or(d.max_tokens)
+            .or(d.generation.and_then(|g| g.max_new_tokens));
+        if let Some(kw) = &d.chat_template_kwargs {
+            let k = req
+                .chat_template_kwargs
+                .get_or_insert_with(Default::default);
+            for (key, v) in kw {
+                k.entry(key.clone()).or_insert_with(|| v.clone());
+            }
+        }
+        req.reasoning_effort = req.reasoning_effort.take().or(d.reasoning_effort.clone());
+        req.reasoning_format = req.reasoning_format.take().or(d.reasoning_format.clone());
+        req.include_reasoning = req.include_reasoning.or(d.include_reasoning);
+        req.reasoning_budget_message = req
+            .reasoning_budget_message
+            .take()
+            .or(d.reasoning_budget_message.clone());
+        // A default `reasoning_effort` maps to the template switch the way the request's does,
+        // under the request's own kwargs.
+        req.normalize();
+    }
+    let think_budget = req
+        .thinking_token_budget
+        .or(defaults.and_then(|d| d.thinking_token_budget));
+    if think_budget == Some(0) {
+        // Truncated thinking does worse than none at small budgets, so a zero budget renders the
+        // template's thinking-off prompt rather than forcing the close at once.
+        let knob = defaults_of
+            .as_deref()
+            .and_then(|b| b.chat_template())
+            .and_then(|t| t.thinking_knob)
+            .map_or("enable_thinking", |(knob, _)| knob);
+        req.chat_template_kwargs
+            .get_or_insert_with(Default::default)
+            .insert(knob.into(), false.into());
+    }
 
     // S1 multi-model: a request for a managed, non-resident model triggers
     // the switch HERE (evict LRU + load), before the prompt is built — so the
@@ -237,6 +279,39 @@ async fn chat_completions_with(
             Some(e.field.into()),
         );
     }
+    if req
+        .reasoning_format
+        .as_deref()
+        .is_some_and(|f| !matches!(f, "none" | "auto" | "deepseek"))
+    {
+        return crate::serve::api_error(
+            axum::http::StatusCode::BAD_REQUEST,
+            "`reasoning_format` must be \"none\" (the trace stays in `content`), \"auto\" or \"deepseek\"",
+            "invalid_request_error",
+            Some("invalid_value"),
+            Some("reasoning_format".into()),
+        );
+    }
+    if let Err((field, message)) = crate::serve::config::check_thinking(
+        defaults_of.as_deref().and_then(|b| b.reasoning().markers()),
+        req.thinking_token_budget,
+        req.reasoning_end.as_deref(),
+    )
+    .and_then(|()| match req.max_reply_tokens {
+        Some(0) => Err((
+            "max_reply_tokens",
+            "`max_reply_tokens` must be at least 1".into(),
+        )),
+        _ => Ok(()),
+    }) {
+        return crate::serve::api_error(
+            axum::http::StatusCode::BAD_REQUEST,
+            message,
+            "invalid_request_error",
+            Some("invalid_value"),
+            Some(field.into()),
+        );
+    }
 
     // §TTFT: the clock the breakdown is measured against starts HERE, at the
     // first line of the handler that has the request body — everything before
@@ -323,7 +398,7 @@ async fn chat_completions_with(
         params: state
             .registry
             .get(&req.model)
-            .map(|b| b.serving().default_sampling.clone())
+            .map(|b| crate::serve::config::base_sampling(&b))
             .unwrap_or_default(),
         ..Default::default()
     };
@@ -453,6 +528,23 @@ async fn chat_completions_with(
     // A forced `tool_choice` writes the call's opener for the model, so the generation starts
     // inside the call (after closing a trace the prompt left open), and is validated at the end.
     let opener = tool_plan.parse.as_ref().and_then(|s| s.opener());
+    // A seeded trace: plow writes the trace's opening itself, so the split knows it is open.
+    // After a tool result the template already opened it and only the seed text is added.
+    if let (true, None, Some(prefix), Some((open, _))) = (
+        thinking,
+        &opener,
+        defaults.and_then(|d| d.thought_prefix.as_deref()),
+        reasoning_mode.markers(),
+    ) {
+        if reasoning_open {
+            let ws = prompt[prompt.trim_end().len()..].to_string();
+            let seed = &prefix[open.len()..];
+            prompt.push_str(seed.strip_prefix(ws.as_str()).unwrap_or(seed));
+        } else {
+            prompt.push_str(prefix);
+            reasoning_open = true;
+        }
+    }
     if let Some(o) = &opener {
         if reasoning_open {
             prompt.push_str(reasoning_mode.close_marker().unwrap_or_default());
@@ -460,11 +552,23 @@ async fn chat_completions_with(
         }
         prompt.push_str(o);
     }
+    // llama.cpp's `reasoning_format: "none"`: the trace is not split out of `content`.
+    let split_mode = if req.reasoning_format.as_deref() == Some("none") {
+        crate::serve::reasoning::ReasoningMode::None
+    } else {
+        reasoning_mode
+    };
+    // Markers that are one token each (Qwen3's `<think>`, Gemma 4's special-led channel) cannot
+    // come from prose: an open marker after the answer began opens another trace block, and a
+    // stray close marker is framing, not answer text.
+    let reenter = split_mode != crate::serve::reasoning::ReasoningMode::None
+        && bundle.think_markers().is_ok();
     let tool_stream = response_stream(
         &tool_plan,
         tool_support,
-        reasoning_mode,
+        split_mode,
         reasoning_open,
+        reenter,
         &bundle,
         req.stream,
         opener.as_deref(),
@@ -513,6 +617,121 @@ async fn chat_completions_with(
         crate::serve::context_overflow(state.max_ctx(&req.model), n_prompt, gen.max_tokens)
     {
         return crate::serve::api_error_for(&e);
+    }
+    // THINKING CONTROL: a budget per trace block (thinking on only) and a cap on the reply. The
+    // mux forces `reasoning_end` once a block's budget is spent.
+    let reply_cap = req
+        .max_reply_tokens
+        .or(defaults.and_then(|d| d.max_reply_tokens));
+    let asked = think_budget.filter(|&b| b > 0);
+    let stop_blank = defaults.is_some_and(|d| d.reply_stop_blank_line);
+    let live = thinking && defaults.is_some_and(|d| d.live_reasoning_end);
+    let steer = thinking && defaults.is_some_and(|d| d.steers());
+    if asked.is_some() || reply_cap.is_some() || stop_blank || live || steer {
+        let field = if asked.is_some() {
+            "thinking_token_budget"
+        } else {
+            "max_reply_tokens"
+        };
+        let refuse = |message: String, field: &str| {
+            crate::serve::api_error(
+                axum::http::StatusCode::BAD_REQUEST,
+                message,
+                "invalid_request_error",
+                Some("invalid_value"),
+                Some(field.into()),
+            )
+        };
+        if req
+            .max_reply_tokens
+            .is_some_and(|c| c as usize > gen.max_tokens)
+        {
+            return refuse(
+                format!(
+                    "`max_reply_tokens` exceeds `max_tokens` ({})",
+                    gen.max_tokens
+                ),
+                "max_reply_tokens",
+            );
+        }
+        let markers = match bundle.think_markers() {
+            Ok(m) => m,
+            Err(e) => {
+                return refuse(
+                    format!("`{field}` is not available for this model: {e}"),
+                    field,
+                )
+            }
+        };
+        let budget = asked.filter(|_| thinking);
+        // Thinking off for this request leaves a budget nothing to bound.
+        if budget.is_some() || reply_cap.is_some() || stop_blank || live || steer {
+            // llama.cpp's `reasoning_budget_message` is the bridge without the close marker.
+            let message_end = req
+                .reasoning_budget_message
+                .as_ref()
+                .map(|m| format!("{m}{}", reasoning_mode.close_marker().unwrap_or_default()));
+            // Unset everywhere: a bridge sentence before the close marker. A bare close leaves the
+            // model mid-thought and it carries on deliberating in the answer (Qwen3-0.6B, 20
+            // prompts, budget 32: 7 answers vs none with the bridge). `reasoning_end: ""` is the
+            // bare marker.
+            let default_end = format!(
+                "{}{}",
+                crate::serve::think::DEFAULT_BRIDGE,
+                reasoning_mode.close_marker().unwrap_or_default()
+            );
+            let end = req
+                .reasoning_end
+                .as_deref()
+                .or(message_end.as_deref())
+                .or(defaults.and_then(|d| d.reasoning_end.as_deref()))
+                .unwrap_or(&default_end);
+            let mut forced_end = bundle.tokenizer().encode_with_special_tokens(end, false);
+            if forced_end.last() != Some(&markers.close) {
+                forced_end.push(markers.close);
+            }
+            // The trace and the reply share `max_tokens`: a budget that leaves the reply no room
+            // would end every turn inside its trace (`finish_reason: length`, no answer). Room
+            // counted for the first block: its open marker and label (2), the budget, the newline
+            // grace, the forced end, then the reply (its cap, else one token).
+            if let Some(b) = budget {
+                let grace = defaults.map_or(0, |d| d.newline_grace) as usize;
+                let reply = reply_cap.map_or(1, |c| c as usize);
+                let need = 2 + b as usize + grace + forced_end.len() + reply;
+                if need > gen.max_tokens {
+                    return refuse(
+                        format!(
+                            "`thinking_token_budget` ({b}) + newline grace ({grace}) + the forced end \
+                             ({} tokens) + the reply ({reply}) need {need} tokens, more than \
+                             `max_tokens` ({}): the answer would never be reached",
+                            forced_end.len(),
+                            gen.max_tokens
+                        ),
+                        "thinking_token_budget",
+                    );
+                }
+            }
+            gen.think = Some(Box::new(crate::serve::think::ThinkCtl::new(
+                markers,
+                crate::serve::think::ThinkLimits {
+                    budget: budget.map(|b| b.min(i64::from(u32::MAX)) as u32),
+                    reply_cap,
+                    forced_end: forced_end.into(),
+                    grace: defaults.map_or(0, |d| d.newline_grace),
+                    stop_blank_line: stop_blank,
+                    live: live.then(|| crate::serve::think::live_register(&ids.request)),
+                    spec_forced: defaults.is_some_and(|d| d.spec_forced_end),
+                    // Validated at startup: every steering text is one token.
+                    bias: match defaults.filter(|_| steer) {
+                        Some(d) => d
+                            .bias(bundle.tokenizer().as_ref(), &gen.params.logit_bias)
+                            .unwrap_or_default(),
+                        None => Default::default(),
+                    },
+                },
+                reasoning_open,
+            )));
+        }
     }
     let lp_fmt = gen
         .params
@@ -584,6 +803,28 @@ async fn chat_completions_with(
             report,
         )
     });
+    let regen = defaults
+        .filter(|d| d.reply_regenerate && d.reply_guard.is_some() && mm_contract.is_none())
+        .and_then(|_| {
+            let close = reasoning_mode.close_marker()?;
+            let mut gen = crate::serve::GenParams {
+                max_tokens: reply_cap.map_or(gen.max_tokens, |c| c as usize),
+                params: gen.params.clone(),
+                stop: gen.stop.clone(),
+                seed: gen.seed,
+                stop_token_ids: gen.stop_token_ids.clone(),
+                keep_special_tokens: true,
+                ..Default::default()
+            };
+            gen.params.logprobs = None;
+            Some(Regen {
+                mux: mux.clone(),
+                bundle: Arc::clone(&bundle),
+                prompt: prompt.clone(),
+                close,
+                gen,
+            })
+        });
     let job = crate::serve::mux::Job {
         prompt_ids,
         gen,
@@ -638,7 +879,21 @@ async fn chat_completions_with(
         };
     }
 
-    let tally = crate::obs::serving::ReasoningTally::admitted(state.model_metrics(key), thinking);
+    let guard = defaults.filter(|d| d.reply_guard.is_some()).map(|d| {
+        let caller = req
+            .messages
+            .iter()
+            .rev()
+            .find(|m| m.role == "user")
+            .map(|m| m.text())
+            .unwrap_or_default();
+        crate::serve::reply_guard::ReplyGuard::new(
+            d.reply_guard_lines.as_ref(),
+            crate::serve::reply_guard::caller_script(&caller),
+        )
+    });
+    let tally =
+        crate::obs::serving::ReasoningTally::admitted(state.model_metrics(key), thinking, t_arrive);
     let request_id = request_id();
     // Stamped ONCE and repeated on every chunk of a stream, as OpenAI does.
     let created = now_secs();
@@ -655,11 +910,14 @@ async fn chat_completions_with(
             t_arrive,
             n_prompt,
             created,
-            reasoning_mode,
+            split_mode,
             reasoning_open,
+            reenter,
             include_reasoning,
             lp_fmt,
             tool_stream,
+            guard,
+            regen,
             run,
             tally,
         );
@@ -672,11 +930,14 @@ async fn chat_completions_with(
             requested_model,
             rx,
             created,
-            reasoning_mode,
+            split_mode,
             reasoning_open,
+            reenter,
             include_reasoning,
             lp_fmt,
             tool_stream,
+            guard,
+            regen,
             run,
             tally,
         )
@@ -688,6 +949,24 @@ async fn chat_completions_with(
     response
 }
 
+/// `POST /v1/requests/{id}/reasoning_end`: end the trace of the in-flight request `id` (its
+/// `X-Request-Id`) now, as when a voice caller barges in. Served for models whose
+/// `--chat-defaults` set `live_reasoning_end`; the forced `reasoning_end` follows within
+/// [`crate::serve::think::LIVE_CHAIN`] tokens.
+pub async fn reasoning_end(axum::extract::Path(id): axum::extract::Path<String>) -> Response {
+    if crate::serve::think::live_end(&id) {
+        Json(serde_json::json!({"id": id, "reasoning_end": true})).into_response()
+    } else {
+        crate::serve::api_error(
+            axum::http::StatusCode::NOT_FOUND,
+            format!("no request {id} with live reasoning control is in flight"),
+            "invalid_request_error",
+            Some("request_not_found"),
+            None,
+        )
+    }
+}
+
 /// The response-side state machine when the plain reasoning split is not enough: the request
 /// declares tools, the format frames every answer (harmony), or the reasoning markers are special
 /// tokens (Gemma 4's thought channel) and must be decoded to be seen.
@@ -696,6 +975,7 @@ pub(crate) fn response_stream(
     support: Option<crate::serve::tools::ToolSupport>,
     mode: crate::serve::reasoning::ReasoningMode,
     reasoning_open: bool,
+    reenter: bool,
     bundle: &crate::asset::ModelBundle,
     stream: bool,
     opener: Option<&str>,
@@ -712,9 +992,28 @@ pub(crate) fn response_stream(
         spec.as_ref(),
         mode,
         reasoning_open,
-        bundle.special_text().clone(),
+        if mode == crate::serve::reasoning::ReasoningMode::None {
+            let markers = bundle.reasoning().markers();
+            Arc::new(crate::serve::tools::SpecialText::new(
+                bundle
+                    .tokenizer()
+                    .special_tokens()
+                    .into_iter()
+                    .filter(|s| {
+                        !markers.is_some_and(|(open, close)| {
+                            open.contains(s.as_str()) || close.contains(s.as_str())
+                        })
+                    })
+                    .collect(),
+            ))
+        } else {
+            bundle.special_text().clone()
+        },
         stream,
     );
+    if reenter {
+        ts.split.allow_reentry();
+    }
     if let Some(o) = opener {
         ts.prime(o);
     }
@@ -1064,11 +1363,14 @@ async fn buffer_and_reply(
     created: u64,
     reasoning_mode: crate::serve::reasoning::ReasoningMode,
     reasoning_open: bool,
+    reenter: bool,
     include_reasoning: bool,
     lp_fmt: Option<crate::serve::logprobs::TokenText>,
     mut tools: Option<crate::serve::tools::stream::ToolStream>,
+    mut guard: Option<crate::serve::reply_guard::ReplyGuard>,
+    regen: Option<Regen>,
     mut run: crate::serve::turns::StageRun,
-    tally: crate::obs::serving::ReasoningTally,
+    mut tally: crate::obs::serving::ReasoningTally,
 ) -> Response {
     let mut calls: Vec<crate::serve::openai::ToolCall> = Vec::new();
     let mut text = String::new();
@@ -1077,6 +1379,9 @@ async fn buffer_and_reply(
     // same order — so the two cannot disagree, and `trace_tokens` is a real
     // token count rather than a count of calls.
     let mut split = crate::serve::reasoning::ReasoningSplit::new(reasoning_mode, reasoning_open);
+    if reenter {
+        split.allow_reentry();
+    }
     let (mut reasoning_buf, mut answer_buf) = (String::new(), String::new());
     // Tokens that fell inside the trace, for `completion_tokens_details`.
     // Counted from CHUNKS (one per generated token) rather than derived from
@@ -1090,6 +1395,7 @@ async fn buffer_and_reply(
     // benchmark client, which counts it as a successful request.
     let mut finish: Option<stream_mod::FinishReason> = None;
     let mut usage: Option<Usage> = None;
+    let mut think = None;
     while let Some(chunk) = rx.recv().await {
         match chunk {
             StreamChunk::Token {
@@ -1107,6 +1413,9 @@ async fn buffer_and_reply(
                     Some(ts) => {
                         let st = ts.push(&delta);
                         reasoning_buf.push_str(st.reasoning.unwrap_or_default());
+                        if st.content.is_some_and(|c| !c.trim().is_empty()) {
+                            tally.reply_started();
+                        }
                         answer_buf.push_str(st.content.unwrap_or_default());
                         if let Some(e) = ts.error() {
                             return (
@@ -1119,6 +1428,9 @@ async fn buffer_and_reply(
                     None => {
                         let (r, c) = split.push(&delta);
                         reasoning_buf.push_str(&r.unwrap_or_default());
+                        if c.as_deref().is_some_and(|c| !c.trim().is_empty()) {
+                            tally.reply_started();
+                        }
                         answer_buf.push_str(&c.unwrap_or_default());
                     }
                 }
@@ -1127,6 +1439,7 @@ async fn buffer_and_reply(
                 reason, usage: u, ..
             } => {
                 finish = Some(reason);
+                think = u.think;
                 usage = Some(u.into());
                 break;
             }
@@ -1184,6 +1497,30 @@ async fn buffer_and_reply(
             answer_buf.push_str(&c.unwrap_or_default());
         }
     }
+    // The guard reads the answer by its lines alone, so one pass over the whole of it is what
+    // the streamed path produces piece by piece.
+    if let Some(g) = guard.as_mut() {
+        let answer = std::mem::take(&mut answer_buf);
+        if !reasoning_buf.trim().is_empty() {
+            g.note_reasoning();
+        }
+        g.push(&answer, &mut reasoning_buf, &mut answer_buf);
+        if g.silent(!calls.is_empty()) {
+            if let Some((more, n)) = match &regen {
+                Some(r) => r.reply(&text).await,
+                None => None,
+            } {
+                g.push(&more, &mut reasoning_buf, &mut answer_buf);
+                if let Some(u) = usage.as_mut() {
+                    u.completion_tokens += n as u64;
+                    u.total_tokens += n as u64;
+                }
+            }
+        }
+        let fallback = g.finish(!calls.is_empty(), &mut reasoning_buf, &mut answer_buf);
+        tally.guarded(g, fallback);
+    }
+    let think = guarded_report(think, guard.as_ref());
     let reasoning = {
         let t = reasoning_buf.trim();
         (include_reasoning && !t.is_empty()).then(|| t.to_string())
@@ -1194,7 +1531,7 @@ async fn buffer_and_reply(
     // A turn that is only calls, or only a trace, answers `content: null`, as vLLM does.
     let answer = ((calls.is_empty() && trace_tokens == 0) || !answer_buf.trim().is_empty())
         .then_some(answer_buf);
-    tally.finished(trace_tokens);
+    tally.finished(trace_tokens, think);
     if trace_tokens > 0 {
         if let Some(u) = usage.as_mut() {
             u.completion_tokens_details = Some(CompletionTokensDetails {
@@ -1213,12 +1550,14 @@ async fn buffer_and_reply(
         object: "chat.completion",
         created,
         model,
+        system_fingerprint: crate::serve::openai::SYSTEM_FINGERPRINT,
         choices: vec![Choice {
             index: 0,
             message: ResponseMessage {
                 role: "assistant",
                 content: answer,
-                reasoning_content: reasoning,
+                refusal: None,
+                reasoning_content: crate::serve::openai::Reasoning(reasoning),
                 tool_calls: (!calls.is_empty()).then_some(calls),
             },
             logprobs: lp_fmt.map(|_| crate::serve::logprobs::ChatLogprobs {
@@ -1232,12 +1571,125 @@ async fn buffer_and_reply(
             // rides along in `x_plow_finish_reason`.
             finish_reason: Some(finish_reason),
             x_plow_finish_reason: finish.is_vendor_specific().then(|| finish.as_str()),
+            x_plow_thinking: think,
         }],
         usage,
     })
     .into_response();
     run.stamp(&mut response);
     response
+}
+
+/// 7.9: one more generation for a guarded turn left with nothing to say: the prompt, the turn's
+/// trace up to its first close (the close appended when it never closed), and a reply capped at
+/// `max_reply_tokens`.
+struct Regen {
+    mux: crate::serve::mux::ModelMux,
+    bundle: Arc<crate::asset::ModelBundle>,
+    prompt: String,
+    close: &'static str,
+    gen: crate::serve::GenParams,
+}
+
+impl Regen {
+    /// The new reply's answer text and its token count; `None` when the dispatcher refused it.
+    async fn reply(&self, generated: &str) -> Option<(String, usize)> {
+        let mut prompt = self.prompt.clone();
+        match generated.find(self.close) {
+            Some(i) => prompt.push_str(&generated[..i + self.close.len()]),
+            None => {
+                prompt.push_str(generated);
+                prompt.push_str(self.close);
+            }
+        }
+        let (tx, mut rx) = stream_mod::channel();
+        let job = crate::serve::mux::Job {
+            prompt_ids: self.bundle.tokenizer().encode(&prompt),
+            gen: self.gen.clone(),
+            arrived: std::time::Instant::now(),
+            respond: tx,
+            opts: Default::default(),
+        };
+        self.mux.submit_wait(job).await.ok()?;
+        let mut text = String::new();
+        let mut n = 0;
+        while let Some(chunk) = rx.recv().await {
+            match chunk {
+                StreamChunk::Token { text: t, .. } => {
+                    text.push_str(&t);
+                    n += 1;
+                }
+                StreamChunk::Done { .. } => break,
+                StreamChunk::Err(_) => return None,
+            }
+        }
+        // The reply may open another trace: split it off, then drop the remaining framing.
+        let mut split =
+            crate::serve::reasoning::ReasoningSplit::new(self.bundle.reasoning(), false);
+        if self.bundle.reasoning_in_specials() {
+            split.allow_reentry();
+        }
+        let (_, mut answer) = (String::new(), String::new());
+        let mut trace = String::new();
+        split.push_into(&text, &mut trace, &mut answer);
+        split.finish_into(&mut trace, &mut answer);
+        Some((self.bundle.special_text().strip(&answer), n))
+    }
+}
+
+/// One response step through the reply guard; `r` / `c` hold the step's reasoning and content.
+fn guard_step<'a>(
+    g: &mut crate::serve::reply_guard::ReplyGuard,
+    s: crate::serve::tools::stream::Step<'a>,
+    r: &'a mut String,
+    c: &'a mut String,
+) -> crate::serve::tools::stream::Step<'a> {
+    r.clear();
+    c.clear();
+    if let Some(x) = s.reasoning {
+        r.push_str(x);
+        g.note_reasoning();
+    }
+    if let Some(x) = s.content {
+        g.push(x, r, c);
+    }
+    let (r, c): (&'a String, &'a String) = (r, c);
+    crate::serve::tools::stream::Step {
+        reasoning: (!r.is_empty()).then_some(r.as_str()),
+        content: (!c.is_empty()).then_some(c.as_str()),
+        tool_calls: s.tool_calls,
+    }
+}
+
+/// [`guard_step`] over the plain split's owned pieces.
+fn guard_owned(
+    g: &mut crate::serve::reply_guard::ReplyGuard,
+    reasoning: Option<String>,
+    content: Option<String>,
+) -> (Option<String>, Option<String>) {
+    let mut r = reasoning.unwrap_or_default();
+    if !r.is_empty() {
+        g.note_reasoning();
+    }
+    let mut c = String::new();
+    if let Some(x) = content {
+        g.push(&x, &mut r, &mut c);
+    }
+    ((!r.is_empty()).then_some(r), (!c.is_empty()).then_some(c))
+}
+
+/// `x_plow_thinking` with the guard's outcome folded in.
+fn guarded_report(
+    think: Option<crate::serve::think::ThinkReport>,
+    guard: Option<&crate::serve::reply_guard::ReplyGuard>,
+) -> Option<crate::serve::think::ThinkReport> {
+    match guard {
+        Some(g) => Some(crate::serve::think::ThinkReport {
+            guard_moved: g.moved,
+            ..think.unwrap_or_default()
+        }),
+        None => think,
+    }
 }
 
 /// An error object in its own SSE frame; the stream then ends without `[DONE]`.
@@ -1278,9 +1730,12 @@ fn sse_response(
     created: u64,
     reasoning_mode: crate::serve::reasoning::ReasoningMode,
     reasoning_open: bool,
+    reenter: bool,
     include_reasoning: bool,
     lp_fmt: Option<crate::serve::logprobs::TokenText>,
     tools: Option<crate::serve::tools::stream::ToolStream>,
+    guard: Option<crate::serve::reply_guard::ReplyGuard>,
+    regen: Option<Regen>,
     run: crate::serve::turns::StageRun,
     tally: crate::obs::serving::ReasoningTally,
 ) -> Response {
@@ -1308,6 +1763,13 @@ fn sse_response(
         model: String,
         lp_fmt: Option<crate::serve::logprobs::TokenText>,
         tally: crate::obs::serving::ReasoningTally,
+        guard: Option<crate::serve::reply_guard::ReplyGuard>,
+        /// The guard's reasoning and content for the current step.
+        gr: String,
+        gc: String,
+        regen: Option<Regen>,
+        /// The generation's text, kept only for `regen`.
+        raw: String,
     }
     let body = stream::unfold(
         SseState {
@@ -1317,7 +1779,14 @@ fn sse_response(
             tools,
             include_reasoning,
             role_pending: true,
-            split: crate::serve::reasoning::ReasoningSplit::new(reasoning_mode, reasoning_open),
+            split: {
+                let mut split =
+                    crate::serve::reasoning::ReasoningSplit::new(reasoning_mode, reasoning_open);
+                if reenter {
+                    split.allow_reentry();
+                }
+                split
+            },
             pending: std::collections::VecDeque::new(),
             run,
             head: stream_mod::FrameHead::new(&request_id, "chat.completion.chunk", created, &model),
@@ -1325,6 +1794,11 @@ fn sse_response(
             model,
             lp_fmt,
             tally,
+            guard,
+            gr: String::new(),
+            gc: String::new(),
+            regen,
+            raw: String::new(),
         },
         move |mut st| {
             async move {
@@ -1383,9 +1857,20 @@ fn sse_response(
                                 crate::obs::host::first_frame(n_prompt, t_arrive.elapsed());
                             }
                         }
+                        if st.regen.is_some() {
+                            st.raw.push_str(&text);
+                        }
                         let frame = match st.tools.as_mut() {
                             Some(ts) => {
-                                let f = ts.push(&text).frame(
+                                let step = ts.push(&text);
+                                let step = match st.guard.as_mut() {
+                                    Some(g) => guard_step(g, step, &mut st.gr, &mut st.gc),
+                                    None => step,
+                                };
+                                if step.content.is_some_and(|c| !c.trim().is_empty()) {
+                                    st.tally.reply_started();
+                                }
+                                let f = step.frame(
                                     &st.head,
                                     role,
                                     logprobs.as_ref(),
@@ -1401,28 +1886,45 @@ fn sse_response(
                             }
                             None => {
                                 let (reasoning, content) = st.split.push(&text);
+                                let (reasoning, content) = match st.guard.as_mut() {
+                                    Some(g) => guard_owned(g, reasoning, content),
+                                    None => (reasoning, content),
+                                };
+                                if content.as_deref().is_some_and(|c| !c.trim().is_empty()) {
+                                    st.tally.reply_started();
+                                }
                                 st.head.frame(&ChunkChoice {
                                     index: 0,
                                     delta: Delta {
                                         role,
                                         content,
-                                        reasoning_content: reasoning
-                                            .filter(|_| st.include_reasoning),
+                                        reasoning_content: crate::serve::openai::Reasoning(
+                                            reasoning.filter(|_| st.include_reasoning),
+                                        ),
                                         tool_calls: None,
                                     },
                                     logprobs,
                                     finish_reason: None,
                                     x_plow_finish_reason: None,
+                                    x_plow_thinking: None,
                                 })
                             }
                         };
                         (frame, false)
                     }
-                    StreamChunk::Done { reason, usage, .. } if st.tools.is_some() => {
+                    StreamChunk::Done {
+                        reason, mut usage, ..
+                    } if st.tools.is_some() => {
                         let ts = st.tools.as_mut().expect("checked");
-                        let s = ts.finish(!matches!(reason, stream_mod::FinishReason::Stop));
-                        let tail = (!s.is_empty(st.include_reasoning))
-                            .then(|| s.frame(&st.head, None, None, st.include_reasoning, None));
+                        let tail = {
+                            let s = ts.finish(!matches!(reason, stream_mod::FinishReason::Stop));
+                            let s = match st.guard.as_mut() {
+                                Some(g) => guard_step(g, s, &mut st.gr, &mut st.gc),
+                                None => s,
+                            };
+                            (!s.is_empty(st.include_reasoning))
+                                .then(|| s.frame(&st.head, None, None, st.include_reasoning, None))
+                        };
                         if let Some(e) = ts.error() {
                             tracing::warn!(model = %st.model, error = %e, "chat: tool call failed validation");
                             st.done = true;
@@ -1433,19 +1935,52 @@ fn sse_response(
                             r => r.as_openai(),
                         };
                         let trace_tokens = ts.split.trace_tokens;
-                        st.tally.finished(trace_tokens);
+                        st.tally.finished(trace_tokens, usage.think);
                         let mut frames: Vec<Bytes> = tail.into_iter().collect();
+                        if let Some(g) = st.guard.as_mut() {
+                            let (mut r, mut c) = (String::new(), String::new());
+                            if g.silent(ts.calls() > 0) {
+                                if let Some((more, n)) = match &st.regen {
+                                    Some(re) => re.reply(&st.raw).await,
+                                    None => None,
+                                } {
+                                    g.push(&more, &mut r, &mut c);
+                                    usage.completion_tokens += n;
+                                }
+                            }
+                            let fallback = g.finish(ts.calls() > 0, &mut r, &mut c);
+                            st.tally.guarded(g, fallback);
+                            if !c.is_empty() || (st.include_reasoning && !r.is_empty()) {
+                                frames.push(st.head.frame(&ChunkChoice {
+                                    index: 0,
+                                    delta: Delta {
+                                        role: None,
+                                        content: (!c.is_empty()).then_some(c),
+                                        reasoning_content: crate::serve::openai::Reasoning(
+                                            (st.include_reasoning && !r.is_empty()).then_some(r),
+                                        ),
+                                        tool_calls: None,
+                                    },
+                                    logprobs: None,
+                                    finish_reason: None,
+                                    x_plow_finish_reason: None,
+                                    x_plow_thinking: None,
+                                }));
+                            }
+                        }
+                        let think = guarded_report(usage.think, st.guard.as_ref());
                         let mut last = ChatChunk {
                             id: st.request_id.clone(),
                             object: "chat.completion.chunk",
                             created,
                             model: st.model.clone(),
+                            system_fingerprint: crate::serve::openai::SYSTEM_FINGERPRINT,
                             choices: vec![ChunkChoice {
                                 index: 0,
                                 delta: Delta {
                                     role: None,
                                     content: None,
-                                    reasoning_content: None,
+                                    reasoning_content: crate::serve::openai::Reasoning(None),
                                     tool_calls: None,
                                 },
                                 logprobs: None,
@@ -1453,6 +1988,7 @@ fn sse_response(
                                 x_plow_finish_reason: reason
                                     .is_vendor_specific()
                                     .then(|| reason.as_str()),
+                                x_plow_thinking: think,
                             }],
                             usage: None,
                         };
@@ -1474,18 +2010,39 @@ fn sse_response(
                         st.queued.extend(frames);
                         (first, true)
                     }
-                    StreamChunk::Done { reason, usage, .. } => {
+                    StreamChunk::Done {
+                        reason, mut usage, ..
+                    } => {
                         // FLUSH. Whatever the splitter still holds belongs to
                         // this generation; abandoning it truncated the streamed
                         // `reasoning_content` against the buffered path.
-                        let (flushed_r, flushed_c) = st.split.finish();
-                        st.tally.finished(st.split.trace_tokens);
+                        let (mut flushed_r, mut flushed_c) = st.split.finish();
+                        st.tally.finished(st.split.trace_tokens, usage.think);
+                        if let Some(g) = st.guard.as_mut() {
+                            let (r, c) = guard_owned(g, flushed_r, flushed_c);
+                            let (mut r, mut c) = (r.unwrap_or_default(), c.unwrap_or_default());
+                            if g.silent(false) {
+                                if let Some((more, n)) = match &st.regen {
+                                    Some(re) => re.reply(&st.raw).await,
+                                    None => None,
+                                } {
+                                    g.push(&more, &mut r, &mut c);
+                                    usage.completion_tokens += n;
+                                }
+                            }
+                            let fallback = g.finish(false, &mut r, &mut c);
+                            st.tally.guarded(g, fallback);
+                            flushed_r = (!r.is_empty()).then_some(r);
+                            flushed_c = (!c.is_empty()).then_some(c);
+                        }
                         let ch = ChunkChoice {
                             index: 0,
                             delta: Delta {
                                 role: None,
                                 content: flushed_c,
-                                reasoning_content: flushed_r.filter(|_| st.include_reasoning),
+                                reasoning_content: crate::serve::openai::Reasoning(
+                                    flushed_r.filter(|_| st.include_reasoning),
+                                ),
                                 tool_calls: None,
                             },
                             logprobs: None,
@@ -1497,6 +2054,7 @@ fn sse_response(
                             x_plow_finish_reason: reason
                                 .is_vendor_specific()
                                 .then(|| reason.as_str()),
+                            x_plow_thinking: guarded_report(usage.think, st.guard.as_ref()),
                         };
                         if include_usage {
                             // OpenAI stream-usage shape: a separate chunk with
@@ -1506,6 +2064,7 @@ fn sse_response(
                                 object: "chat.completion.chunk",
                                 created,
                                 model: st.model.clone(),
+                                system_fingerprint: crate::serve::openai::SYSTEM_FINGERPRINT,
                                 choices: Vec::new(),
                                 usage: Some({
                                     let mut u: Usage = usage.into();

@@ -25,12 +25,12 @@ path = "src/bin/tinygemma.rs"
 required-features = ["legacy-gemma-bins"]
 
 [dependencies]
-clap = { version = "4", features = ["derive", "env"] }
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
-thiserror = { workspace = true }
-tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+clap.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
 # `hub` lets `--model <hf-id>` resolve a config over the network (was the
 # `frontend` crate, now nn-graph's `hub` module).
 nn-graph = { workspace = true, features = ["hub"] }

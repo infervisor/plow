@@ -67,6 +67,11 @@ pub struct ModelBundle {
     /// Built on the first tool-calling request.
     special_text: std::sync::OnceLock<Arc<crate::serve::tools::SpecialText>>,
     reasoning_specials: std::sync::OnceLock<bool>,
+    think_markers: std::sync::OnceLock<
+        std::result::Result<Arc<crate::serve::think::ThinkMarkers>, String>,
+    >,
+    /// vLLM `--chat-template`, set once at startup; replaces the packet's template.
+    template_override: std::sync::OnceLock<Arc<crate::serve::template::ChatTemplate>>,
 }
 
 impl ModelBundle {
@@ -151,6 +156,8 @@ impl ModelBundle {
             serve,
             special_text: std::sync::OnceLock::new(),
             reasoning_specials: std::sync::OnceLock::new(),
+            think_markers: std::sync::OnceLock::new(),
+            template_override: std::sync::OnceLock::new(),
         })
     }
 
@@ -172,6 +179,38 @@ impl ModelBundle {
                 s.any_in(open) || s.any_in(close)
             })
         })
+    }
+
+    /// The reasoning markers as token ids, for thinking control; why not when the model has none
+    /// or they are not special tokens. Built (and logged) on first use: it scans the vocabulary.
+    pub fn think_markers(
+        &self,
+    ) -> std::result::Result<Arc<crate::serve::think::ThinkMarkers>, String> {
+        self.think_markers
+            .get_or_init(|| {
+                let markers = self
+                    .reasoning
+                    .markers()
+                    .ok_or_else(|| "the model has no reasoning markers".to_string())?;
+                let m = crate::serve::think::ThinkMarkers::tokenize(
+                    self.tokenizer.as_ref(),
+                    self.special_text(),
+                    markers,
+                );
+                match &m {
+                    Ok(m) => tracing::info!(
+                        open = markers.0,
+                        open_id = m.open,
+                        close = markers.1,
+                        close_id = m.close,
+                        newline_ids = m.newline.len(),
+                        "thinking control: marker ids"
+                    ),
+                    Err(e) => tracing::warn!(error = %e, "thinking control unavailable"),
+                }
+                m.map(Arc::new)
+            })
+            .clone()
     }
 
     /// The checkpoint's serving config (sampling defaults + reasoning framing).
@@ -209,7 +248,33 @@ impl ModelBundle {
 
     /// The checkpoint's compiled chat template, when it ships one.
     pub fn chat_template(&self) -> Option<&Arc<crate::serve::template::ChatTemplate>> {
-        self.chat_template.as_ref()
+        self.template_override.get().or(self.chat_template.as_ref())
+    }
+
+    /// vLLM `--chat-template`: `t` is a file or the template text. The reasoning framing stays the
+    /// one resolved at load; a template whose markers differ is refused.
+    pub fn override_chat_template(&self, t: &str) -> std::result::Result<(), String> {
+        let (text, source) = match std::fs::read_to_string(t) {
+            Ok(text) => (text, t.to_string()),
+            Err(_) if t.contains("{%") || t.contains("{{") => (t.to_string(), "--chat-template".into()),
+            Err(e) => return Err(format!("{t}: {e}")),
+        };
+        let compiled = match &self.chat_template {
+            Some(base) => base.recompile(text, source),
+            None => crate::serve::template::ChatTemplate::compile(text, source, None, None),
+        }
+        .map_err(|e| format!("the template does not compile: {e}"))?;
+        if let (Some(m), Some(own)) = (compiled.reasoning, self.reasoning.markers()) {
+            if m != own {
+                return Err(format!(
+                    "it frames the trace with {}…{}, the model's packet with {}…{}",
+                    m.0, m.1, own.0, own.1
+                ));
+            }
+        }
+        tracing::info!(source = %compiled.source, "chat template overridden");
+        let _ = self.template_override.set(compiled);
+        Ok(())
     }
 
     /// Look up the compiled bucket serving `(phase, batch, seq)`.

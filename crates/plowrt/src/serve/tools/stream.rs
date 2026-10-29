@@ -119,7 +119,6 @@ impl Serialize for Deltas<'_> {
 struct ChoiceFrame<'a> {
     index: u32,
     delta: DeltaFrame<'a>,
-    #[serde(skip_serializing_if = "Option::is_none")]
     logprobs: Option<&'a crate::serve::logprobs::ChatLogprobs>,
     finish_reason: Option<&'static str>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -132,8 +131,8 @@ struct DeltaFrame<'a> {
     role: Option<&'static str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     content: Option<&'a str>,
-    #[serde(rename = "reasoning", skip_serializing_if = "Option::is_none")]
-    reasoning_content: Option<&'a str>,
+    #[serde(flatten)]
+    reasoning_content: crate::serve::openai::Reasoning<&'a str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     tool_calls: Option<Deltas<'a>>,
 }
@@ -161,7 +160,9 @@ impl Step<'_> {
             delta: DeltaFrame {
                 role,
                 content: self.content,
-                reasoning_content: self.reasoning.filter(|_| reasoning),
+                reasoning_content: crate::serve::openai::Reasoning(
+                    self.reasoning.filter(|_| reasoning),
+                ),
                 tool_calls: self.tool_calls,
             },
             logprobs,
@@ -197,8 +198,15 @@ impl ToolStream {
         strip: Arc<SpecialText>,
         stream: bool,
     ) -> Self {
+        let mut split = ReasoningSplit::new(mode, prompt_opens);
+        if mode
+            .markers()
+            .is_some_and(|(open, close)| strip.any_in(open) || strip.any_in(close))
+        {
+            split.allow_reentry();
+        }
         ToolStream {
-            split: ReasoningSplit::new(mode, prompt_opens),
+            split,
             parser: spec.map(parse::parser),
             spec: spec.cloned(),
             strip,
@@ -1072,6 +1080,187 @@ mod tests {
         let st = s.finish(false);
         c.push_str(st.content.unwrap_or_default());
         assert_eq!((r.trim(), c.as_str()), ("hm", "Four."));
+    }
+
+    const GEMMA: ReasoningMode = ReasoningMode::Tags {
+        open: "<|channel>thought",
+        close: "<channel|>",
+    };
+
+    fn gemma(reasoning: &str, content: Option<&str>) -> Got {
+        Got {
+            reasoning: reasoning.into(),
+            content: content.map(String::from),
+            calls: vec![],
+        }
+    }
+
+    /// Group A: Gemma 4's trace shapes, whole and in 1/3/7-byte pieces.
+    #[test]
+    fn gemma4_trace_blocks_reenter_and_close() {
+        let g = |opens, text: &str, want: Got| check(ToolFormat::Gemma4, GEMMA, opens, text, &want);
+        let p = "<|channel>thought\nplan<channel|>";
+        g(
+            false,
+            &format!("{p}Aap kaun?"),
+            gemma("plan", Some("Aap kaun?")),
+        );
+        // a second block after the answer began is trace again
+        g(
+            false,
+            &format!("{p}Theek hai.<|channel>thought\nI will ask again.<channel|>Aap kaun hain?"),
+            gemma("plan\nI will ask again.", Some("Theek hai.Aap kaun hain?")),
+        );
+        // repeated empty blocks
+        g(
+            false,
+            "<|channel>thought\n<channel|><|channel>thought\n<channel|>\n<|channel>thought\n<channel|>আচ্ছা, আপনি কে বলছেন?",
+            gemma("", Some("আচ্ছা, আপনি কে বলছেন?")),
+        );
+        // a trace the prompt seeded
+        g(
+            true,
+            " \"Hello\".\nNone yet.<channel|>Aap kaun?",
+            gemma("\"Hello\".\nNone yet.", Some("Aap kaun?")),
+        );
+        // stray closers are framing
+        g(
+            false,
+            &format!("{p}<channel|>Aap kaun hain?"),
+            gemma("plan", Some("Aap kaun hain?")),
+        );
+        g(
+            false,
+            &format!("{p}Aap kaun hain?<channel|>"),
+            gemma("plan", Some("Aap kaun hain?")),
+        );
+        // cut inside the first trace: no answer
+        g(
+            false,
+            "<|channel>thought\nI will ask",
+            gemma("I will ask", None),
+        );
+        // cut inside a second block: the block is trace
+        g(
+            false,
+            &format!("{p}Theek hai.<|channel>thought\nI will"),
+            gemma("plan\nI will", Some("Theek hai.")),
+        );
+        // the forced end string lands in the trace
+        g(
+            true,
+            "plan\nStop. Before replying: one question only. Replying now.<channel|>Aap kaun?",
+            gemma(
+                "plan\nStop. Before replying: one question only. Replying now.",
+                Some("Aap kaun?"),
+            ),
+        );
+        // text before the opener stays answer; the block after it is trace
+        g(
+            false,
+            "alt<|channel>thought\nplan<channel|>reply",
+            gemma("plan", Some("altreply")),
+        );
+        // another channel label ends the trace
+        g(
+            false,
+            "<|channel>thought\nplan<|channel>response\nAap kaun?",
+            gemma("plan", Some("Aap kaun?")),
+        );
+        g(true, "plan<|channel>final\nAap", gemma("plan", Some("Aap")));
+        // the trace's own label inside the trace is not an end
+        g(
+            true,
+            "plan<|channel>thought more<channel|>Aap",
+            gemma("planthought more", Some("Aap")),
+        );
+        // a call after a re-entered block
+        check(
+            ToolFormat::Gemma4,
+            GEMMA,
+            false,
+            &format!("{p}<|channel>thought\nx<channel|><|tool_call>call:search{{q:<|\"|>x<|\"|>}}<tool_call|>"),
+            &Got {
+                reasoning: "plan\nx".into(),
+                content: None,
+                calls: vec![("search".into(), json!({"q": "x"}))],
+            },
+        );
+    }
+
+    /// `<think>` is text, not a special token: prose after the trace that mentions it stays answer.
+    #[test]
+    fn text_markers_do_not_reenter() {
+        check(
+            ToolFormat::Hermes,
+            ReasoningMode::ThinkTag,
+            false,
+            "<think>a</think>The <think> tag opens a trace.",
+            &gemma("a", Some("The <think> tag opens a trace.")),
+        );
+    }
+
+    #[test]
+    fn every_trace_block_counts_its_tokens() {
+        let mut s = ToolStream::new(None, GEMMA, false, specials(), true);
+        for t in [
+            "<|channel>",
+            "thought",
+            "\n",
+            "plan",
+            "<channel|>",
+            "Theek",
+            "<|channel>",
+            "thought",
+            "\n",
+            "x",
+            "<channel|>",
+            "Aap",
+        ] {
+            s.push(t);
+        }
+        s.finish(false);
+        assert_eq!(s.split.trace_tokens, 10);
+        assert_eq!(s.split.blocks(), 2);
+    }
+
+    #[test]
+    fn any_split_of_a_gemma4_trace_parses_the_same() {
+        const PIECES: &[&str] = &[
+            "<|channel>thought",
+            "<|channel>",
+            "thought",
+            "response",
+            "<channel|>",
+            "<|tool_call>call:search{q:<|\"|>x<|\"|>}<tool_call|>",
+            "\n",
+            " ",
+            "plan",
+            "Aap",
+            "é日",
+            "<",
+            "<|",
+        ];
+        let mut x = 0x9E37_79B9_7F4A_7C15u64;
+        let mut rnd = |n: usize| {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            (x % n as u64) as usize
+        };
+        for _ in 0..600 {
+            let n = 1 + rnd(16);
+            let text: String = (0..n).map(|_| PIECES[rnd(PIECES.len())]).collect();
+            let opens = rnd(2) == 0;
+            let whole = run_with(ToolFormat::Gemma4, GEMMA, opens, &[&text]);
+            for k in [1, 2, 5] {
+                assert_eq!(
+                    run_with(ToolFormat::Gemma4, GEMMA, opens, &chunks(&text, k)),
+                    whole,
+                    "chunks of {k}: {text:?}"
+                );
+            }
+        }
     }
 
     #[test]

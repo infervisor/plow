@@ -59,6 +59,7 @@ Remote:
 
 ```
 v1/<namespace>/<name>/index.json                # this model's variants
+v1/<namespace>/<name>/sigs/<sha256>.sig         # ed25519 over that version of index.json
 v1/<namespace>/<name>/manifests/<label>@g<n>    # one variant → bundle.json
 v1/objsets/<objset-id>.json
 v1/blobs/sha256/<hex>[.zst]                     # shared by everything
@@ -70,7 +71,7 @@ Local (`$PLOW_HOME`, default `~/.plow`):
 
 ```
 blobs/sha256/<hex>          content-addressed
-refs/<digest>.json          {ref, variant} for one pin
+refs/<digest>.json          {ref, variant, previous[]} for one pin
 bundles/<variant_id>/       hard links into blobs/ — what --assets receives
 checkpoints/<org>--<repo>@<rev>/   the farm: links to the snapshot + derived shard
 snapshots/<org>--<repo>@<rev>/     a snapshot `load --fetch-weights` downloaded
@@ -95,6 +96,17 @@ checkpoint); `prepared` means the checkpoint farm is linked in, so `dir` serves
 as is. A pin pulled before the manifest was recorded is skipped with a warning
 until `plowrt load` re-materializes it.
 
+### Generations on a host
+
+A pin is a profile: `upgrade` moves it to the new generation and records the
+one it left in `previous` (the last two). The old bundle stays in the store,
+so `plowrt rollback <model>` is a pointer move, offline and instant, and a
+second `rollback` moves forward again. `upgrade` never frees space;
+`plowrt gc` removes the superseded generations of pinned models (never a
+bundle of a model nothing pins) and then the blobs no bundle references. A
+generation `gc` has taken cannot be rolled back to; `rollback` says so and
+leaves the pin alone.
+
 ## Why content addressing
 
 A generation that changes only the code objects shares its packet, manifests and
@@ -111,7 +123,7 @@ The rule that keeps this correct: a **specialised** object stamps the packet it
 belongs to (`plow_packet_hash_{lo,hi}`) and pairs only with it; a **general**
 object — every arm compiled — carries no stamp and pairs with any packet. So a
 same-packet objset swap is legal only when the new objset is general or its stamp
-still matches. `pack_bundle.py` refuses to publish a mismatch, which turns a
+still matches. `plowrt pack` refuses to publish a mismatch, which turns a
 refusal deep in the loader into an obvious one at publish time.
 
 ## Selection
@@ -146,8 +158,10 @@ Apple's Metal shaders are compiled on the serving machine from the packet, so
 an Apple bundle (`target.vendor = "apple"`, `isa = "metal3"`) ships **no
 objset**: the bundle's files are the whole build, `build.objset_id` is empty,
 and there is no pairing hash. `plowrt target --json` on such a machine prints
-the exact `target` a publisher copies into `pack_bundle.py --target-json`;
-`publish_dist.py` and `plowrt pack` take no objset for it. Selection is
+the exact `target` a publisher records in the recipe's `[target]` — including
+`mem_bytes`, which a unified-memory part must state because `hwspec` records the
+smallest shipping configuration of each chip rather than this machine's memory;
+`plowrt pack` takes no objset for it. Selection is
 unchanged: the Metal device reports `apple`/`metal3`, the SKU hwspec names,
 its core count and the memory Metal will let it use.
 
@@ -175,69 +189,103 @@ The exception is a checkpoint with no Hugging Face repository to fetch from
 file as `files: [{name, sha256, bytes}]`, published under `v1/blobs/sha256/`
 like a bundle file, and `revision` is a free version label. `pull` fetches those
 blobs with the bundle and links them into `snapshots/dist+<ns>--<name>@<rev>-<hash>/`,
-which `load` prepares without `--fetch-weights`. `pack_bundle.py
---checkpoint-dir <dir> --revision <label>` writes such a manifest (instead of
-`--hf`), and `plowrt pack --checkpoint-dir <dir>` zips the files as
-`checkpoint/<name>`.
+which `load` prepares without `--fetch-weights`. A recipe whose
+`[checkpoint] source = "dist"` names the snapshot in `revision`, and
+`plowrt pack --checkpoint-dir <dir>` both writes such a manifest and zips the
+files as `checkpoint/<name>`.
 
 ## Producing a release
 
-Producers use nix; the HTTPS store is generated from its outputs. Nothing on a
-serving host runs nix, and a published manifest that references `/nix/store` is
-refused at pack time — an exported bundle must be portable.
+Producers use nix; the HTTPS store is generated from its outputs by `plowrt`
+and the registry, never by a script. Nothing on a serving host runs nix, and a
+published manifest that references `/nix/store` is refused at pack time — an
+exported bundle must be portable.
 
 **Runtime binaries** (`<semver>+<git12>`, the semver saying what changed and the
 commit saying which source produced the bytes):
 
 ```
 nix build .#plowrt-release --no-link --print-out-paths
-scripts/release_runtime.py --release <path> --store ./dist
 ```
 
 The tarball is deterministic (sorted, fixed mtime, no gzip timestamp) and its
-sha256 is computed at build time. A build from a modified checkout carries
-`-dirty` and is refused unless `--allow-dirty`, because it names a commit it does
-not correspond to.
+sha256 is computed at build time; the registry records both, with
+`release.json`, under `v1/runtime/<version>/<triple>/` and in
+`v1/runtime/index.json`. A build from a modified checkout carries `-dirty`
+and must not be published, because it names a commit it does not correspond
+to.
 
 **Model assets**, which advance independently — a new generation needs no new
-binary:
+binary — are published by `plowrt` alone, straight into the bucket a client
+reads. There is no service between the producer and the store:
 
 ```
-scripts/release_dist.py --recipe recipes/infervisor/kimi-k3/<label>.toml --dry-run
-scripts/release_dist.py --recipe … --commit <full-sha> --publish --store ./dist
+CLOUDFLARE_ACCOUNT_ID=… CLOUDFLARE_R2_BUCKET=… CLOUDFLARE_API_TOKEN=… \
+plowrt push --recipe recipes/…/<label>.toml --assets <dir> \
+  [--objects <dir>] [--checkpoint-dir <dir> --hf <org>/<repo>] \
+  [--status validated --tok-s <n> --concurrency <c>] [--dry-run] \
+  --key-file <secret> [--to r2://<account-id>/<bucket>]
 ```
 
-Five stages, each refusing rather than degrading: resolve the source to a full
-commit exactly once (a branch name is not provenance); refuse a compiler whose
-source commit disagrees with the recipe, even when its version string matches;
-validate the target, the pairing, and — for a `validated` claim — a measurement;
-report the generation and what it supersedes; then publish under a per-model
-lock, re-reading the index inside it so a concurrent release cannot reuse a
-generation.
+Cloudflare R2 is the default destination: `--to` is `r2://` (account and
+bucket from `CLOUDFLARE_ACCOUNT_ID` and `CLOUDFLARE_R2_BUCKET`),
+`r2://<bucket>` or `r2://<account-id>/<bucket>`. Writes go through
+Cloudflare's REST API with `CLOUDFLARE_API_TOKEN`, or through R2's S3
+endpoint with `CLOUDFLARE_R2_ACCESS_KEY_ID` + `CLOUDFLARE_R2_SECRET_ACCESS_KEY`
+when no API token is set. `s3://<bucket>` is any S3 bucket from the `AWS_*`
+environment (`AWS_ENDPOINT` for another S3-compatible service).
+`file:///dir` writes the same tree, which is how a release is inspected or
+mirrored by hand. The client is our fork of Apache `object_store`
+(`storyvis/object-store`, pinned by revision); it is pure Rust, so `plowrt`
+links nothing new. Both manifests are built from the recipe, which is the
+only way to produce them: there is no flag that can disagree with what the
+recipe declares. The recipe's `plow_git` is the provenance a published build
+records; `--plow-git` exists only to reproduce a manifest whose recipe has
+since moved. A `validated` status needs `--tok-s`. `plowrt pack --manifests
+<dir>` writes the two JSON files without uploading, for inspecting them.
 
-Publication order is the safety property: **blobs, then manifests, then the
-index**. An interrupted publish leaves the previous generation completely
-servable.
+`push` numbers the build against the live index: the next generation of its
+label, or nothing at all when the newest generation already carries exactly
+these files, objset, status and measurement, so a re-run is a no-op. It then
+uploads only the blobs the bucket lacks (a `HEAD` per digest; an objects-only
+change moves the objects and nothing else) and records what the generation
+supersedes and what changed (`packet`, `objset`, `both`). Publication order
+is the safety property — **blobs, then manifests, then the signature, then
+the index, then the catalog** — so an interrupted push leaves the previous
+generation completely servable, and a generation is never reused. Every
+immutable object is written with `If-None-Match: *` and the index and catalog
+with `If-Match: <etag>`, so a generation someone else published meanwhile is
+refused by the bucket, not overwritten; `push` re-reads the index and tries
+the next number, up to four times. A manifest name already taken is adopted
+when it holds this very build (a push that died before its index write) and
+skipped when it holds another's. A push that died after the index is finished
+by the next run of the same build: it writes the missing signature and catalog
+row instead of reporting "unchanged". An objset name already holding other
+bytes, or a rung override whose objset is not published, is refused before the
+bundle is written. A bundle is also refused when the recipe says the model
+serves with a file the build did not produce (`codec.pkt` for a `[checkpoint]
+codec`, `cublaslt_algos.jsonl` for `PLOW_LT_RUNG_ALGOS`).
 
-**To a registry with a publish API** (inferos runs one), `plowrt publish`
-packs the build exactly as `plowrt pack` does and uploads the archive with an
-API key, so anyone with a key the registry accepts can submit a build:
+**Signing.** `plowrt keygen --name <key-name> --out <file>` makes an ed25519
+key; its public half is printed as `<key-name>:<base64>`. `push --key-file`
+(or `PLOW_SIGNING_KEY`) writes the signature under `sigs/<sha256 of the
+index>.sig`, before the index itself: a reader fetches the signature of
+exactly the bytes it read, so no reader sees an index without its signature
+and two publishers' signatures cannot land on each other's index. A client
+with `PLOW_TRUSTED_KEYS=<name>:<base64>[,…]` refuses an index that is
+unsigned, signed by another key, or changed after signing; the index names
+every manifest by digest and each manifest its blobs, so this one signature
+covers the whole pull. A client with no trusted keys checks nothing, as
+before. `push` applies the same `PLOW_TRUSTED_KEYS` to the index already in
+the bucket, whose rows it carries into the new, signed index; with none set it
+warns that they are carried unverified, which is the bootstrap for a registry
+published before signing existed. Without a key, `push` to a bucket warns and
+publishes unsigned. A `file://` registry enforces the same conditional writes
+under `<dir>/.lock`.
 
-```
-PLOW_PUBLISH_KEY=… plowrt publish --bundle bundle.json --assets <dir> \
-  [--objset objset.json --objects <dir>] [--checkpoint-dir <dir> --hf <org>/<repo>] \
-  --to https://<registry>
-```
-
-Like `publish_dist.py`, it numbers the build against the live index: the
-next generation of its label, or nothing at all when the newest generation
-already carries exactly these files and objset, so a re-run is a no-op. The
-archive goes through the registry's staged upload (`POST
-<to>/api/v1/admin/registry/uploads`, `PUT` the zip to the returned URL, then
-`POST …/uploads/<id>/publish`), so a large build goes straight to the bucket
-past the API's request limit. The registry checks every file against its
-digest; a generation someone else published meanwhile is refused (409) and
-the command says to run again.
+`plowrt publish` (the registry's staged-upload API, `PLOW_PUBLISH_KEY`) is
+the transition path, kept until every model has been re-published with
+`push`; new publications use `push`.
 
 ## Recipes
 
@@ -261,6 +309,13 @@ resolves the `-D` set without compiling, so the check takes seconds.
 it). A `refused` recipe is publishable and appears in `show`, but is never
 selectable — which is how "can plow serve this?" becomes answerable from the
 catalog instead of from a 2,700-line investigation log.
+
+A Hugging Face checkpoint is `source = "hf:<org>/<repo>"` with `revision` the
+40-hex commit the build used, never a branch: a branch moves after the build
+and hands a client other weights. `plowrt pack`, `push` and
+`scripts/check_recipe.py` all refuse a recipe without it (a `refused` recipe
+is exempt; it never packs). The published index carries that commit, and
+`prepare` links exactly that snapshot into the bundle's checkpoint farm.
 
 ## Host requirements the distribution cannot supply
 

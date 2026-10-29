@@ -36,9 +36,9 @@ models = ["dep:serde", "dep:serde_json"]
 hub = ["models", "dep:hf-hub", "dep:ureq"]
 
 [dependencies]
-smallvec = { version = "1", features = ["union"] }
+smallvec.workspace = true
 thiserror = { workspace = true }
-serde = { version = "1", features = ["derive"], optional = true }
-serde_json = { version = "1", optional = true }
+serde = { workspace = true, optional = true }
+serde_json = { workspace = true, optional = true }
 hf-hub = { workspace = true, optional = true }
-ureq = { version = "2", default-features = false, features = ["tls"], optional = true }
+ureq = { workspace = true, optional = true }

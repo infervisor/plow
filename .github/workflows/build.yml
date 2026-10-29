@@ -33,13 +33,8 @@ jobs:
           python3 perf-data/tools/fusion_ladder_run.py --self-test
       - name: Check bench/serve parity validator
         run: python3 perf-data/tools/check_bench_serve_parity.py --self-test
-      - name: Check distribution producers
+      - name: Check recipe tools
         run: |
-          python3 scripts/pack_objset.py --self-test
-          python3 scripts/pack_bundle.py --self-test
-          python3 scripts/publish_dist.py --self-test
-          python3 scripts/release_runtime.py --self-test
-          python3 scripts/release_dist.py --self-test
           python3 scripts/check_recipe.py --self-test
           python3 scripts/render_recipe.py --self-test
       - name: Check recipes describe their builds
@@ -108,13 +103,8 @@ jobs:
           python3 perf-data/tools/fusion_ladder_run.py --self-test
       - name: Check bench/serve parity validator
         run: python3 perf-data/tools/check_bench_serve_parity.py --self-test
-      - name: Check distribution producers
+      - name: Check recipe tools
         run: |
-          python3 scripts/pack_objset.py --self-test
-          python3 scripts/pack_bundle.py --self-test
-          python3 scripts/publish_dist.py --self-test
-          python3 scripts/release_runtime.py --self-test
-          python3 scripts/release_dist.py --self-test
           python3 scripts/check_recipe.py --self-test
           python3 scripts/render_recipe.py --self-test
       - name: Check recipes describe their builds
