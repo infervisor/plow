@@ -114,10 +114,17 @@ def capture(exe, sizes, args, fill):
 
 
 def exemplar(exe, sizes, args):
-    a, b = capture(exe, sizes, args, 0x00), capture(exe, sizes, args, 0xff)
-    assert {k: a[k] for k in a if k != "params"} == {k: b[k] for k in b if k != "params"}
-    a["params"] = ["".join(x[i:i + 2] if x[i:i + 2] == y[i:i + 2] else ".." for i in range(0, len(x), 2))
-                   for x, y in zip(a["params"], b["params"])]
+    """A launch with never-written bytes masked: a byte is kept iff every capture agrees. The
+    captures run in separate processes (ASLR moves the stack residue a host frame leaves in
+    padding) over differently filled stacks; residue that survives every run is the same in
+    every build, so the container stays byte-reproducible."""
+    runs = [capture(exe, sizes, args, fill) for fill in (0x00, 0xff, 0x5a, 0xa5, 0x00, 0xff)]
+    a = runs[0]
+    for r in runs[1:]:
+        assert {k: a[k] for k in a if k != "params"} == {k: r[k] for k in r if k != "params"}
+    a["params"] = ["".join(x[i:i + 2] if all(r["params"][j][i:i + 2] == x[i:i + 2] for r in runs) else ".."
+                           for i in range(0, len(x), 2))
+                   for j, x in enumerate(a["params"])]
     a["args"] = list(args)
     return a
 
