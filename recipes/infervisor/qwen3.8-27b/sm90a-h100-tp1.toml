@@ -55,7 +55,7 @@
 #                         1.409 -> 1.364 s, bit-identical to the cp.async staging (swap78); 15K
 #                         c16/32/64 tok/s +2.2-2.6%, 4K +0.5-1.9%. The TileLang hd256 body (K5,
 #                         tlpf) ran 25-32% slower than this hand role at every class
-#   prefill GDN scan      host-side FlashInfer CuTe DSL kernel (libplow_gdn_prefill.so); prompts pad
+#   prefill GDN scan      FlashInfer CuTe DSL kernel (plow_gdn_prefill.aot cubin); prompts pad
 #                         to the bucket like every model (plowrt 851bbc8d: 1000-token TTFT 2853 -> 131 ms)
 #   packed prefill        concurrent prompts share one bucket launch (masked padding, slot -1 pads;
 #                         per-request state gathered into the init scratch, one varlen GDN scan over
@@ -151,8 +151,9 @@ n_cu = 132
 max_ctx = 16384
 precision = "bf16"
 
-# GDN prefill runs host-side from <assets>/libplow_gdn_prefill.so (exec/gpu.rs NativeGdn); the
-# FlashInfer CuTe DSL export needs the vLLM python (flashinfer 0.6.16 + cutlass 4.6.2).
+# GDN prefill: <assets>/plow_gdn_prefill.aot, the FlashInfer CuTe DSL kernel as a cubin plowrt
+# launches itself (device/cuda/qwen_gdn.rs); the export needs the vLLM python (flashinfer 0.6.16 +
+# cutlass 4.6.2).
 [[prep]]
 name = "gdn-prefill-lib"
 script = "scripts/build_sm90a_qwen_gdn.py"

@@ -1371,8 +1371,8 @@ pub(crate) fn qwen_amd_missing_arms() -> Vec<&'static str> {
 ///      `PLOW_QWEN_PREFILL` is unset, and how Kimi-K3 spent its whole AMD bring-up — carries
 ///      `QwenGdnStep` instead and needs nothing from this gap. So (3) does NOT block (2). It is
 ///      also not an interpreter arm on EITHER backend: sm_90a dispatches it host-side into a
-///      generated CuTe kernel (`runtime/nvidia/gdn_prefill.cpp`, `plow_gdn_run`) from
-///      `crates/plowrt/src/exec/gpu.rs`, so AMD needs a chunked HIP body AND an adapter.
+///      generated CuTe kernel (packet cubin `plow_gdn_prefill.aot`, launched by
+///      `crates/plowrt/src/device/cuda/qwen_gdn.rs`), so AMD needs a chunked HIP body AND an adapter.
 fn refuse_unimplemented_target(arch: &str, gpu: &str) {
     if !target_is_amd(arch, gpu) {
         return;
@@ -1399,8 +1399,8 @@ fn refuse_unimplemented_target(arch: &str, gpu: &str) {
         gaps.push(
             "`qwen35_gdn_prefill_amd`: PREFILL additionally needs \
              `PLOW_DOP_QWEN_GDN_PREFILL`, a HOST-side chunked Gated DeltaNet dispatch rather than \
-             an interpreter arm — sm_90a calls the generated CuTe kernel in \
-             runtime/nvidia/gdn_prefill.cpp via `plow_gdn_run`, and there is no HIP equivalent or \
+             an interpreter arm — sm_90a launches the generated CuTe kernel \
+             (packet cubin plow_gdn_prefill.aot), and there is no HIP equivalent or \
              AMD adapter. Decode does not emit this op and is not blocked on it"
                 .to_string(),
         );

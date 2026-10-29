@@ -2363,7 +2363,6 @@ pub const OBJECT_DEFINES: &[KnobSpec] = &[
     KnobSpec::new("def.PLOW_NV_ROPE_PF", None, Layer::ObjectDefine, Domain::Bool, OFF, OPT_IN),
     KnobSpec::new("def.PLOW_GEN_FP8_KV", None, Layer::ObjectDefine, Domain::Bool, OFF, OPT_IN),
     KnobSpec::new("def.PLOW_GEN_KV_ILV", None, Layer::ObjectDefine, Domain::Bool, OFF, OPT_IN),
-    KnobSpec::new("def.PLOW_CUTLASS_HOST", None, Layer::ObjectDefine, Domain::Bool, OFF, OPT_IN),
     KnobSpec::new("def.PLOW_FA4_DTYPE", None, Layer::ObjectDefine, Domain::Str, UNSET, OPT_IN),
     KnobSpec::new("def.PLOW_FA4_HOST", None, Layer::ObjectDefine, Domain::Bool, UNSET, OPT_IN),
     KnobSpec::new("def.PLOW_FA4_H", None, Layer::ObjectDefine, Domain::Str, UNSET, OPT_IN),

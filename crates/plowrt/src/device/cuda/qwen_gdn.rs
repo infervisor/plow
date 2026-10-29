@@ -1,9 +1,10 @@
+use super::aot::{Exemplar, Image, Kernel, Launch};
 use super::{CudaBackend, CudaStream};
 use crate::{
     device::{Backend, DeviceMem},
     Result, RuntimeError,
 };
-use std::{ffi::c_void, path::Path, sync::Arc};
+use std::{path::Path, sync::Arc};
 
 const MAX_TOKENS: usize = 8192;
 const MAP_BYTES: u64 = 16896;
@@ -13,48 +14,205 @@ pub(crate) const STATE_BYTES: u64 = 48 * 128 * 128 * 4;
 pub(crate) const CORE_ROW_BYTES: u64 = 12288;
 /// Packed sequences one launch takes (cu_seqlens entries - 1).
 pub(crate) const MAX_SEQS: usize = 64;
-type Create = unsafe extern "C" fn(i32, *mut *mut c_void) -> i32;
-type Destroy = unsafe extern "C" fn(*mut c_void) -> i32;
-type Run = unsafe extern "C" fn(
-    *mut c_void,
-    *mut c_void,
-    *mut c_void,
-    *mut c_void,
-    *mut c_void,
-    *mut c_void,
-    *mut c_void,
-    *mut c_void,
-    *mut c_void,
-    *mut c_void,
-    *mut c_void,
-    i32,
-    *mut c_void,
-) -> i32;
-type RunVarlen = unsafe extern "C" fn(
-    *mut c_void,
-    *mut c_void,
-    *mut c_void,
-    *mut c_void,
-    *mut c_void,
-    *mut c_void,
-    *mut c_void,
-    *mut c_void,
-    *mut c_void,
-    *mut c_void,
-    *mut c_void,
-    i32,
-    i32,
-    *mut c_void,
-) -> i32;
+/// The packet object (`scripts/build_sm90a_qwen_gdn.py`) and the host stub this file implements.
+pub(crate) const OBJECT: &str = "plow_gdn_prefill.aot";
+const ENTRY: &str = "gdn_prefill";
+const HOST_STUB: &str = "gdn_sm90_prefill";
+const HOST_STUB_VERSION: u32 = 1;
+const ABI: &str = "plow_gdn_prefill:v1:hk=16:hv=48:d=128:dtype=bf16:state=f32_vk";
+const UPSTREAM: [(&str, &str); 3] = [
+    (
+        "delta_rule_sm90_sha256",
+        "c72398f8f6e57ed2d708d364dd0299ce414e75a27d044ac83c6278c0954290a4",
+    ),
+    ("flashinfer", "0.6.16.post3"),
+    ("nvidia_cutlass_dsl", "4.6.2"),
+];
+/// cuda.h enums the export's tensor maps use.
+/// Bytes per parameter the export's host code defines (the builder's `DEFINED`): an exemplar
+/// masking any of them is refused, so the check cannot be weakened by the manifest.
+const DEFINED: [usize; 22] = [
+    12, 12, 64, 4, 64, 4, 64, 4, 64, 4, 12, 12, 8, 12, 4, 4, 4, 4, 4, 4, 4, 4,
+];
+/// Flag-word bits the export's own tensor-map encoder sets and `cuTensorMapEncodeTiled` (driver
+/// 595) leaves clear: byte 8 bit 1, byte 10 bit 5. Every map carries them so its first 64 bytes
+/// equal the export's (the descriptor the .so route ran). Below one 64-row box the export takes
+/// byte 10 bit 5 from uninitialized stack.
+const EXPORT_FLAG_BITS: [(usize, u8); 2] = [(8, 0x02), (10, 0x20)];
+const BFLOAT16: u32 = 9;
+const SWIZZLE_32B: u32 = 1;
+const SWIZZLE_128B: u32 = 3;
+const L2_PROMOTION_128B: u32 = 2;
+
+/// Device addresses of one launch, in the export's argument order.
+#[derive(Clone, Copy)]
+struct Operands {
+    q: u64,
+    k: u64,
+    v: u64,
+    o: u64,
+    alpha: u64,
+    beta: u64,
+    state: u64,
+    initial: u64,
+    maps: u64,
+    offsets: u64,
+}
+
+/// The export's host code for `FullyFusedDeltaRuleSm90` (cute_dsl_plow_gdn_sm90_wrapper):
+/// Q/K `[tokens][16][128]` and V/O `[tokens][48][128]` bf16 tensor maps, `nseq * 48` CTAs.
+fn build(be: &CudaBackend, l: &mut Launch, tokens: u64, nseq: u64, p: &Operands) -> Result<()> {
+    build_with(
+        &|base, heads, row, box0, swizzle| {
+            let mut m = be.encode_tmap_tiled(
+                BFLOAT16,
+                base,
+                &[128, tokens, heads],
+                &[row, 256],
+                &[box0, 64, 1],
+                &[1, 1, 1],
+                0,
+                swizzle,
+                L2_PROMOTION_128B,
+                0,
+            )?;
+            for (b, bits) in EXPORT_FLAG_BITS {
+                m[b] |= bits;
+            }
+            Ok(m)
+        },
+        l,
+        tokens,
+        nseq,
+        p,
+    )
+}
+
+type MapFn<'a> = &'a dyn Fn(u64, u64, u64, u32, u32) -> Result<[u8; 128]>;
+
+/// `build` with the tensor-map encoder `(base, heads, row bytes, box dim 0, swizzle)` supplied.
+fn build_with(map: MapFn, l: &mut Launch, tokens: u64, nseq: u64, p: &Operands) -> Result<()> {
+    let gate = (tokens * 48) as u32;
+    let state = (nseq * 48 * 128 * 128) as u32;
+    let ptr_len = |l: &mut Launch, i: usize, ptr: u64, n: u32| {
+        l.u64(i, 0, ptr);
+        l.u32(i, 8, n);
+        l.u32(i, 12, 0);
+    };
+    ptr_len(l, 0, p.alpha, gate);
+    ptr_len(l, 1, p.beta, gate);
+    l.tmap(2, &map(p.q, 16, 4096, 64, SWIZZLE_128B)?);
+    l.u64(3, 0, tokens);
+    l.tmap(4, &map(p.k, 16, 4096, 64, SWIZZLE_128B)?);
+    l.u64(5, 0, tokens);
+    l.tmap(6, &map(p.v, 48, 12288, 64, SWIZZLE_128B)?);
+    l.u64(7, 0, tokens);
+    l.tmap(8, &map(p.o, 48, 12288, 16, SWIZZLE_32B)?);
+    l.u64(9, 0, tokens);
+    ptr_len(l, 10, p.state, state);
+    ptr_len(l, 11, p.initial, state);
+    l.u64(12, 0, p.maps);
+    ptr_len(l, 13, p.offsets, (nseq + 1) as u32);
+    // 128^-0.5 rounded to f32, the export's `scale` literal.
+    l.u32(14, 0, 0x3db5_04f3);
+    for (i, v) in [
+        (15, 16),
+        (16, 16),
+        (17, 48),
+        (18, 48),
+        (19, nseq as u32),
+        (20, 1),
+        (21, 0),
+    ] {
+        l.u32(i, 0, v);
+    }
+    l.grid = [(nseq * 48) as u32, 1, 1];
+    l.block = [512, 1, 1];
+    l.smem = 185728;
+    Ok(())
+}
+
+fn rejected(why: String) -> RuntimeError {
+    RuntimeError::Rejected(format!("GDN prefill object: {why}"))
+}
+
+/// Loads the kernel and proves the host stub: manifest identity, then every exemplar rebuilt.
+fn load_kernel(be: &CudaBackend, path: &Path) -> Result<Kernel> {
+    let bytes = std::fs::read(path).map_err(|e| {
+        rejected(format!(
+            "{}: {e} (packets from before the cubin route carry libplow_gdn_prefill.so; re-emit)",
+            path.display()
+        ))
+    })?;
+    let image = Image::parse(bytes)?;
+    let m = &image.manifest;
+    let upstream: Vec<(&str, &str)> = m
+        .upstream
+        .iter()
+        .map(|(k, v)| (k.as_str(), v.as_str()))
+        .collect();
+    if m.host_stub != HOST_STUB
+        || m.host_stub_version != HOST_STUB_VERSION
+        || m.abi != ABI
+        || upstream != UPSTREAM
+    {
+        return Err(rejected(format!(
+            "built for host stub {} v{} abi {} upstream {upstream:?}; this plowrt implements \
+             {HOST_STUB} v{HOST_STUB_VERSION} abi {ABI} upstream {UPSTREAM:?}",
+            m.host_stub, m.host_stub_version, m.abi
+        )));
+    }
+    let entry = image.entry(ENTRY)?;
+    let kernel = Kernel::load(be, &image, entry)?;
+    for x in &entry.exemplars {
+        let (tokens, nseq, p) = exemplar_operands(x)?;
+        if x.params.len() != DEFINED.len()
+            || x.params
+                .iter()
+                .zip(DEFINED)
+                .any(|(h, d)| h.get(..2 * d).is_none_or(|h| h.contains("..")))
+        {
+            return Err(rejected(format!(
+                "exemplar tokens={tokens} nseq={nseq} masks a defined parameter byte"
+            )));
+        }
+        let mut l = Launch::new(&kernel.layout);
+        build(be, &mut l, tokens, nseq, &p)?;
+        l.matches(x)
+            .map_err(|e| rejected(format!("exemplar tokens={tokens} nseq={nseq}: {e}")))?;
+    }
+    Ok(kernel)
+}
+
+fn exemplar_operands(x: &Exemplar) -> Result<(u64, u64, Operands)> {
+    let &[tokens, nseq, q, k, v, o, alpha, beta, state, initial, maps, offsets] = x.args.as_slice()
+    else {
+        return Err(rejected(format!("exemplar args {:?}", x.args)));
+    };
+    let a = |v: i64| v as u64;
+    Ok((
+        a(tokens),
+        a(nseq),
+        Operands {
+            q: a(q),
+            k: a(k),
+            v: a(v),
+            o: a(o),
+            alpha: a(alpha),
+            beta: a(beta),
+            state: a(state),
+            initial: a(initial),
+            maps: a(maps),
+            offsets: a(offsets),
+        },
+    ))
+}
 
 pub(crate) struct NativeGdn {
-    _library: libloading::Library,
-    handle: usize,
-    destroy: Destroy,
-    run: Run,
-    /// `plow_gdn_run_varlen`: libraries built before the packed chain lack it.
-    run_varlen: Option<RunVarlen>,
+    kernel: Kernel,
+    launch: Launch,
     maps: DeviceMem,
+    /// `{0, tokens}` cu_seqlens per single-sequence token count.
     offsets: DeviceMem,
     /// cu_seqlens of the current packed launch (device, MAX_SEQS + 1 i64) and its host image,
     /// which the async upload reads until the caller's stream synchronize.
@@ -64,34 +222,11 @@ pub(crate) struct NativeGdn {
     backend: Arc<CudaBackend>,
 }
 
-fn check(rc: i32, operation: &str) -> Result<()> {
-    if rc == 0 {
-        Ok(())
-    } else if rc == -1001 {
-        Err(RuntimeError::Device("native GDN library already has a live handle; one engine per loaded library is supported".into()))
-    } else {
-        Err(RuntimeError::Device(format!(
-            "{operation}: native GDN status {rc}"
-        )))
-    }
-}
-
 impl NativeGdn {
     pub(crate) fn load(backend: Arc<CudaBackend>, path: &Path) -> Result<Self> {
         backend.bind()?;
-        // The configured library implements the fixed native GDN ABI.
-        let library = unsafe { libloading::Library::new(path) }.map_err(|e| {
-            RuntimeError::Device(format!("load native GDN {}: {e}", path.display()))
-        })?;
-        let create = *unsafe { library.get::<Create>(b"plow_gdn_create\0") }
-            .map_err(|e| RuntimeError::Device(format!("resolve plow_gdn_create: {e}")))?;
-        let destroy = *unsafe { library.get::<Destroy>(b"plow_gdn_destroy\0") }
-            .map_err(|e| RuntimeError::Device(format!("resolve plow_gdn_destroy: {e}")))?;
-        let run = *unsafe { library.get::<Run>(b"plow_gdn_run\0") }
-            .map_err(|e| RuntimeError::Device(format!("resolve plow_gdn_run: {e}")))?;
-        let run_varlen = unsafe { library.get::<RunVarlen>(b"plow_gdn_run_varlen\0") }
-            .ok()
-            .map(|f| *f);
+        let kernel = load_kernel(&backend, path)?;
+        let launch = Launch::new(&kernel.layout);
         let cu = backend.alloc(backend.device_ordinal, ((MAX_SEQS + 1) * 8) as u64)?;
         let maps = backend.alloc(backend.device_ordinal, MAP_BYTES)?;
         if maps.base % 128 != 0 {
@@ -106,22 +241,9 @@ impl NativeGdn {
             pairs.extend_from_slice(&(tokens as i64).to_le_bytes());
         }
         backend.memcpy_htod(offsets.base, &pairs)?;
-        let mut handle = std::ptr::null_mut();
-        check(
-            unsafe { create(backend.device_ordinal as i32, &mut handle) },
-            "plow_gdn_create",
-        )?;
-        if handle.is_null() {
-            return Err(RuntimeError::Device(
-                "native GDN returned a null handle".into(),
-            ));
-        }
         Ok(Self {
-            _library: library,
-            handle: handle as usize,
-            destroy,
-            run,
-            run_varlen,
+            kernel,
+            launch,
             maps,
             offsets,
             cu,
@@ -131,8 +253,45 @@ impl NativeGdn {
         })
     }
 
-    /// Enqueues BF16 Q/K/V/output, F32 alpha/beta, and F32 V-first states.
-    /// The native wrapper copies output state back to initial state on this stream.
+    fn enqueue(
+        &mut self,
+        tensors: &[&DeviceMem; 8],
+        tokens: usize,
+        nseq: usize,
+        offsets: u64,
+        stream: &CudaStream,
+    ) -> Result<()> {
+        if stream.keep.ctx != self.backend.ctx || self.stream.is_some_and(|s| s != stream.raw) {
+            return Err(RuntimeError::Device(
+                "native GDN requires one stream in its selected context".into(),
+            ));
+        }
+        self.backend.bind()?;
+        self.stream = Some(stream.raw);
+        let p = Operands {
+            q: tensors[0].base,
+            k: tensors[1].base,
+            v: tensors[2].base,
+            o: tensors[3].base,
+            alpha: tensors[4].base,
+            beta: tensors[5].base,
+            state: tensors[6].base,
+            initial: tensors[7].base,
+            maps: self.maps.base,
+            offsets,
+        };
+        build(
+            &self.backend,
+            &mut self.launch,
+            tokens as u64,
+            nseq as u64,
+            &p,
+        )?;
+        self.kernel.launch(&self.backend, &mut self.launch, stream)
+    }
+
+    /// Enqueues BF16 Q/K/V/output, F32 alpha/beta, and F32 V-first states, then copies the
+    /// output state back to the initial state on this stream.
     ///
     /// # Safety
     /// Views must remain live in this context with the stated layouts until stream
@@ -145,36 +304,10 @@ impl NativeGdn {
         stream: &CudaStream,
     ) -> Result<()> {
         validate(&tensors, tokens)?;
-        if stream.keep.ctx != self.backend.ctx || self.stream.is_some_and(|s| s != stream.raw) {
-            return Err(RuntimeError::Device(
-                "native GDN requires one stream in its selected context".into(),
-            ));
-        }
-        self.backend.bind()?;
-        self.stream = Some(stream.raw);
-        let p = tensors.map(|t| t.base as *mut c_void);
         let offsets = self.offsets.base + ((tokens - 1) * 16) as u64;
-        // Bounds and aliases are checked above; caller owns async lifetimes.
-        check(
-            unsafe {
-                (self.run)(
-                    self.handle as *mut c_void,
-                    p[0],
-                    p[1],
-                    p[2],
-                    p[3],
-                    p[4],
-                    p[5],
-                    p[6],
-                    p[7],
-                    self.maps.base as *mut c_void,
-                    offsets as *mut c_void,
-                    tokens as i32,
-                    stream.raw as *mut c_void,
-                )
-            },
-            "plow_gdn_run",
-        )
+        self.enqueue(&tensors, tokens, 1, offsets, stream)?;
+        self.backend
+            .memcpy_dtod_async(tensors[7].base, tensors[6].base, STATE_BYTES, stream)
     }
 }
 
@@ -231,10 +364,6 @@ fn validate_n(tensors: &[&DeviceMem; 8], tokens: usize, nseq: usize) -> Result<(
 }
 
 impl NativeGdn {
-    pub(crate) fn varlen(&self) -> bool {
-        self.run_varlen.is_some()
-    }
-
     /// `lens.len()` packed sequences, rows contiguous in `lens` order; `tensors[6]` / `[7]` are
     /// `lens.len()` contiguous final / initial state slots (the caller gathers and scatters the
     /// per-slot states; nothing is copied back here).
@@ -248,9 +377,6 @@ impl NativeGdn {
         lens: &[u32],
         stream: &CudaStream,
     ) -> Result<()> {
-        let run = self.run_varlen.ok_or_else(|| {
-            RuntimeError::Device("native GDN library lacks plow_gdn_run_varlen".into())
-        })?;
         if lens.iter().any(|&l| l == 0) {
             return Err(RuntimeError::Device(
                 "native GDN packed sequence of 0 rows".into(),
@@ -264,7 +390,6 @@ impl NativeGdn {
             ));
         }
         self.backend.bind()?;
-        self.stream = Some(stream.raw);
         self.cu_host.clear();
         self.cu_host.push(0);
         let mut end = 0i64;
@@ -280,40 +405,16 @@ impl NativeGdn {
                 stream,
             )?;
         }
-        let p = tensors.map(|t| t.base as *mut c_void);
-        check(
-            unsafe {
-                run(
-                    self.handle as *mut c_void,
-                    p[0],
-                    p[1],
-                    p[2],
-                    p[3],
-                    p[4],
-                    p[5],
-                    p[6],
-                    p[7],
-                    self.maps.base as *mut c_void,
-                    self.cu.base as *mut c_void,
-                    tokens as i32,
-                    lens.len() as i32,
-                    stream.raw as *mut c_void,
-                )
-            },
-            "plow_gdn_run_varlen",
-        )
+        let cu = self.cu.base;
+        self.enqueue(&tensors, tokens, lens.len(), cu, stream)
     }
 }
 
 impl Drop for NativeGdn {
     fn drop(&mut self) {
+        // Destruction is cold; retire queued work before the module unloads.
         if self.backend.bind().is_ok() {
-            // Destruction is cold; retire queued work before unloading code.
             let _ = self.backend.synchronize();
-            let rc = unsafe { (self.destroy)(self.handle as *mut c_void) };
-            if rc != 0 {
-                tracing::debug!(rc, "plow_gdn_destroy failed");
-            }
         }
     }
 }
@@ -324,6 +425,146 @@ mod tests {
 
     fn tensors() -> [DeviceMem; 8] {
         std::array::from_fn(|i| DeviceMem::view((i as u64 + 1) << 30, 128 << 20))
+    }
+
+    /// CPU: the stub rebuilds every exemplar's non-tensor-map bytes and config (tensor maps are
+    /// taken from the capture; `layer_dump` on a GPU checks the driver's encoding at load).
+    #[test]
+    #[ignore = "GDN_AOT_DIR=<dir holding plow_gdn_prefill.aot>"]
+    fn stub_rebuilds_exemplar_scalars() {
+        let dir = std::path::PathBuf::from(std::env::var("GDN_AOT_DIR").expect("GDN_AOT_DIR"));
+        let image = Image::parse(std::fs::read(dir.join(OBJECT)).unwrap()).unwrap();
+        let e = image.entry(ENTRY).unwrap();
+        let layout: Vec<(usize, usize)> = e
+            .params
+            .iter()
+            .map(|&[o, s]| (o as usize, s as usize))
+            .collect();
+        assert_eq!(e.exemplars.len(), 3);
+        for x in &e.exemplars {
+            let (tokens, nseq, p) = exemplar_operands(x).unwrap();
+            let captured = |i: usize| -> [u8; 128] {
+                std::array::from_fn(|b| {
+                    u8::from_str_radix(&x.params[i][2 * b..2 * b + 2], 16).unwrap_or(0)
+                })
+            };
+            let map = |base: u64, _: u64, _: u64, _: u32, _: u32| {
+                let i = [p.q, p.k, p.v, p.o]
+                    .iter()
+                    .position(|&b| b == base)
+                    .unwrap();
+                Ok(captured(2 + 2 * i))
+            };
+            let mut l = Launch::new(&layout);
+            build_with(&map, &mut l, tokens, nseq, &p).unwrap();
+            l.matches(x).unwrap();
+        }
+    }
+
+    /// Writes each case's inputs (`<case>.in<i>`) and outputs (`<case>.out<i>`: o, final state,
+    /// initial state after the launch) under `GDN_AOT_DIR` for a byte comparison against another
+    /// route, and prints the mean launch time over 20 back-to-back launches.
+    #[test]
+    #[ignore = "requires a leased SM90 GPU; GDN_AOT_DIR=<dir holding plow_gdn_prefill.aot>"]
+    fn layer_dump() -> Result<()> {
+        let dir = std::path::PathBuf::from(std::env::var("GDN_AOT_DIR").expect("GDN_AOT_DIR"));
+        let be = Arc::new(CudaBackend::new(0)?);
+        let mut g = NativeGdn::load(be.clone(), &dir.join(OBJECT))?;
+        let stream = be.stream_create()?;
+        let mut seed = 0x9e37_79b9_7f4a_7c15u64;
+        let mut next = move |lo: f32, hi: f32| {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            lo + (hi - lo) * ((seed >> 40) as f32 / (1u64 << 24) as f32)
+        };
+        let cases: [(&str, &[u32]); 4] = [
+            ("t8192", &[8192]),
+            ("t1000", &[1000]),
+            ("t1", &[1]),
+            ("var4", &[300, 1, 700, 2048]),
+        ];
+        for (name, lens) in cases {
+            let t: usize = lens.iter().map(|&l| l as usize).sum();
+            let n = lens.len();
+            let elems = [
+                t * 2048,
+                t * 2048,
+                t * 6144,
+                t * 6144,
+                t * 48,
+                t * 48,
+                n * 48 * 128 * 128,
+                n * 48 * 128 * 128,
+            ];
+            let mut bufs = Vec::new();
+            for (i, &e) in elems.iter().enumerate() {
+                let bytes: Vec<u8> = match i {
+                    0 | 1 => (0..e)
+                        .flat_map(|_| ((next(-0.15, 0.15).to_bits() >> 16) as u16).to_le_bytes())
+                        .collect(),
+                    2 => (0..e)
+                        .flat_map(|_| ((next(-1.0, 1.0).to_bits() >> 16) as u16).to_le_bytes())
+                        .collect(),
+                    3 | 6 => vec![0u8; e * if i == 3 { 2 } else { 4 }],
+                    4 => (0..e).flat_map(|_| next(0.9, 1.0).to_le_bytes()).collect(),
+                    5 => (0..e).flat_map(|_| next(0.0, 1.0).to_le_bytes()).collect(),
+                    _ => (0..e)
+                        .flat_map(|_| next(-0.01, 0.01).to_le_bytes())
+                        .collect(),
+                };
+                std::fs::write(dir.join(format!("{name}.in{i}")), &bytes).unwrap();
+                let m = be.alloc(0, bytes.len() as u64)?;
+                be.upload(&m, 0, &bytes)?;
+                bufs.push((m, bytes.len()));
+            }
+            let views: [DeviceMem; 8] =
+                std::array::from_fn(|i| DeviceMem::view(bufs[i].0.base, bufs[i].0.len));
+            let run = |g: &mut NativeGdn| -> Result<()> {
+                // SAFETY: the views outlive the synchronize below; one stream.
+                unsafe {
+                    if n == 1 {
+                        g.launch(views.each_ref(), t, &stream)
+                    } else {
+                        g.launch_varlen(views.each_ref(), lens, &stream)
+                    }
+                }
+            };
+            run(&mut g)?;
+            be.synchronize()?;
+            for i in [3, 6, 7] {
+                let mut out = vec![0u8; bufs[i].1];
+                be.download(&bufs[i].0, 0, &mut out)?;
+                std::fs::write(dir.join(format!("{name}.out{i}")), &out).unwrap();
+            }
+            // Same inputs again: the route must reproduce itself.
+            for i in [3, 6, 7] {
+                let inp = std::fs::read(dir.join(format!("{name}.in{i}"))).unwrap();
+                be.upload(&bufs[i].0, 0, &inp)?;
+            }
+            run(&mut g)?;
+            be.synchronize()?;
+            for i in [3, 6, 7] {
+                let mut out = vec![0u8; bufs[i].1];
+                be.download(&bufs[i].0, 0, &mut out)?;
+                let first = std::fs::read(dir.join(format!("{name}.out{i}"))).unwrap();
+                let diff = out.iter().zip(&first).filter(|(a, b)| a != b).count();
+                println!("GDN_AOT_REPEAT {name} out{i} differ={diff}");
+            }
+            let start = std::time::Instant::now();
+            for _ in 0..20 {
+                run(&mut g)?;
+                if n > 1 {
+                    be.synchronize()?;
+                }
+            }
+            be.synchronize()?;
+            println!(
+                "GDN_AOT {name} tokens={t} nseq={n} us_per_launch={:.1}",
+                start.elapsed().as_secs_f64() * 1e6 / 20.0
+            );
+        }
+        Ok(())
     }
 
     #[test]

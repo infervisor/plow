@@ -15,8 +15,9 @@ plan files.
 - Toolchain precedent: Qwen3.5 GDN prefill on sm_90a is already a generated kernel.
   - Generator: FlashInfer CuTe-DSL `_FullyFusedDeltaRuleSm90`, compiled AOT with
     `cute.compile(...).export_to_c` (`scripts/export_gdn_prefill_sm90.py`).
-  - Runtime: wrapped in `runtime/nvidia/gdn_prefill.cpp` and loaded as `libplow_gdn_prefill.so`
-    (`exec/gpu.rs`, `device/cuda/qwen_gdn.rs`). No Python at runtime.
+  - Runtime: the export's cubin ships in the packet as `plow_gdn_prefill.aot`
+    (`scripts/build_sm90a_qwen_gdn.py`); plowrt's host stub (`device/cuda/qwen_gdn.rs`) encodes
+    the tensor maps and launches it. No host library, no Python at runtime.
 
 ## Summary
 
@@ -545,7 +546,7 @@ The recipe takes `PLOW_MAX_REQUEST_CHUNK = "4096"` and `PLOW_BUILD_FP8KV_GEMM = 
 - Use a CuTe-DSL persistent FP8 GEMM with a scale + GeGLU epilogue, or call cuBLASLt fp8 directly.
 - Expected: GEMMs 1.3-1.7x faster. Re-measure on the current schema first.
 
-**Alternate for an AMD window:** Triton GDN prefill behind an adapter shaped like `plow_gdn_run`.
+**Alternate for an AMD window:** Triton GDN prefill behind an adapter shaped like `NativeGdn::launch_varlen`.
 
 The probe scripts are local, not committed, in `/opt/dlami/nvme/lava-tts/gen-survey/`:
 - `pf512.py`, `pfgen.py`: prefill attention.
