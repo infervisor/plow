@@ -11179,13 +11179,33 @@ impl GpuEngine {
                     "PLOW_PF_ATTN_LIBRARY=0: declared native roles run"
                 );
                 Vec::new()
-            } else if seg_mode
-                && seg_class.len() > 1
-                && qwen_segments.is_empty()
-                && packet_kv_layout(&blob) == plow_asset::live_kv::LAYOUT_HEAD_MAJOR
+            } else if let Some(abi) = declared_roles
+                .and_then(|(_, objects)| {
+                    objects.get(&plow_asset::segment_roles::LIBRARY_PREFILL_ATTENTION)
+                })
+                .and_then(|o| plow_asset::segment_roles::LibraryAbi::parse(&o.abi))
+                .filter(|abi| {
+                    // The Qwen chain launches segment by segment (or graph pieces cut at the
+                    // library segments); other prefill needs the segmented path.
+                    (!qwen_segments.is_empty() || (seg_mode && seg_class.len() > 1))
+                        && packet_kv_layout(&blob)
+                            == match abi.layout {
+                                plow_asset::segment_roles::LibraryKvLayout::HeadMajor => {
+                                    plow_asset::live_kv::LAYOUT_HEAD_MAJOR
+                                }
+                                plow_asset::segment_roles::LibraryKvLayout::RowInterleaved => {
+                                    plow_asset::live_kv::LAYOUT_ROW_INTERLEAVED
+                                }
+                            }
+                })
             {
-                let mut sites =
-                    lib_attention::sites(g, &blob.tensors, devp, blob.decode_prog()?.t as usize);
+                let mut sites = lib_attention::sites(
+                    g,
+                    &blob.tensors,
+                    devp,
+                    blob.decode_prog()?.t as usize,
+                    &abi,
+                );
                 for (seg, site) in sites.iter_mut().enumerate() {
                     if !declared_library.contains(&(seg as u32)) {
                         *site = None;
@@ -11209,8 +11229,8 @@ impl GpuEngine {
                 sites
             } else {
                 return Err(RuntimeError::Rejected(format!(
-                    "program {program_index}: declared library attention needs segmented \
-                     head-major prefill (PLOW_PF_ATTN_LIBRARY=0 runs the native roles)"
+                    "program {program_index}: declared library attention needs segmented prefill \
+                     over the library's KV layout (PLOW_PF_ATTN_LIBRARY=0 runs the native roles)"
                 )));
             };
             // Lone norm / residual / GLU segments of the Lt-routed buckets: light launches.
@@ -12925,6 +12945,12 @@ impl GpuEngine {
             .enumerate()
             .filter_map(|(seg, external)| external.is_some().then_some(seg))
             .collect();
+        // A library segment is a piece of its own: routed, it launches instead of its graph.
+        for (seg, site) in bucket.lib_attention_segments.iter().enumerate() {
+            if site.is_some() {
+                cuts.extend([seg, seg + 1]);
+            }
+        }
         if let Some(riders) = &self.riders {
             cuts.extend(riders.pieces(bi, n).into_iter().map(|(_, end)| end));
         }
@@ -13285,6 +13311,18 @@ impl GpuEngine {
             // 5 = host GDN kernel + its (Nop) interpreter segment, 4 = fat interpreter segment.
             let rt = crate::config::RuntimeConfig::get();
             let seg_time = rt.nv.pf_seg_time;
+            self.lib_attention_routed = false;
+            if self.prefill[bi]
+                .lib_attention_segments
+                .iter()
+                .any(Option::is_some)
+            {
+                if let Some(lib) = self.lib_attention.as_mut() {
+                    self.lib_attention_routed =
+                        lib.begin_launch(&self.attention_requests, tc as u32, &self.stream)?;
+                }
+            }
+            let lib_routed = self.lib_attention_routed;
             // Packed chunks replay the chain as graph pieces between the per-tick launches
             // (`PLOW_QWEN_PF_GRAPH`); the per-segment loop below serves the unpacked chunks and
             // the timing / synchronizing diagnostics.
@@ -13312,6 +13350,15 @@ impl GpuEngine {
                             qwen_ride,
                             synchronize,
                         )?;
+                    }
+                    if lib_routed {
+                        if let Some(Some(site)) =
+                            self.prefill[bi].lib_attention_segments.get(start)
+                        {
+                            let lib = self.lib_attention.as_ref().expect("routed");
+                            lib.run_site(site, &self.stream)?;
+                            continue;
+                        }
                     }
                     self.ensure_qwen_seg_graph(bi, &arg, f_pf, start..end)?;
                     let key = (bi, arg.tensors as u64, start, end | Self::QWEN_GRAPH_BIT);
@@ -13360,6 +13407,14 @@ impl GpuEngine {
                     route.run(&self.stream)?;
                     done(self, &mut evs)?;
                     continue;
+                }
+                if lib_routed {
+                    if let Some(Some(site)) = self.prefill[bi].lib_attention_segments.get(seg) {
+                        let lib = self.lib_attention.as_ref().expect("routed");
+                        lib.run_site(site, &self.stream)?;
+                        done(self, &mut evs)?;
+                        continue;
+                    }
                 }
                 if let Some(Some(route)) = self.prefill[bi].light_segments.get(seg) {
                     route.run_with(&self.stream, arg.tensors)?;

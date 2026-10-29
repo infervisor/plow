@@ -6,37 +6,57 @@
 use packet::dev::{DevOp, TENSOR_NONE};
 use packet::devbuild::Model;
 use plow_asset::segment_roles::{
-    ProgramRoles, SegmentObject, SegmentRoles, LIBRARY_FA4_HD512_BF16_ABI,
-    LIBRARY_FA4_HD512_F16_ABI, LIBRARY_PREFILL_ATTENTION, SECTION,
+    LibraryAbi, LibraryKvLayout, ProgramRoles, SegmentObject, SegmentRoles,
+    LIBRARY_FA4_HD512_BF16_ABI, LIBRARY_FA4_HD512_F16_ABI, LIBRARY_PREFILL_ATTENTION, SECTION,
 };
 use std::path::Path;
 
-pub(crate) const FILE: &str = "libplow_fa4_hd512.so";
-/// `plow_fa4_caps` in runtime/nvidia/fa4_hd512.cpp, followed by the dtype digit.
+/// Library objects the emitter looks for in the out dir, in order (at most one may be present).
+pub(crate) const FILES: [&str; 2] = ["libplow_fa4_hd512.so", "libplow_fa4_hd256.so"];
+/// `plow_fa4_caps` in runtime/nvidia/fa4_hd*.cpp: the dtype digit, then (hd256 and later)
+/// `:hd=..:heads=..:kv_heads=..:layout=..`; the bare form is the hd512 library.
 const CAPS: &[u8] = b"plow_fa4_caps:abi=3:dtype=";
 
 /// The library's ABI string, from the capability marker it embeds.
-fn library_abi(image: &[u8]) -> Result<&'static str, String> {
+fn library_abi(image: &[u8]) -> Result<String, String> {
     let at = image
         .windows(CAPS.len())
         .position(|w| w == CAPS)
-        .ok_or_else(|| format!("{FILE} carries no plow_fa4 ABI 3 capability marker"))?;
-    match image.get(at + CAPS.len()) {
-        Some(b'0') => Ok(LIBRARY_FA4_HD512_BF16_ABI),
-        Some(b'1') => Ok(LIBRARY_FA4_HD512_F16_ABI),
-        _ => Err(format!("{FILE}: unknown plow_fa4 dtype")),
-    }
+        .ok_or("library carries no plow_fa4 ABI 3 capability marker")?;
+    let rest = &image[at + CAPS.len()..];
+    let end = rest.iter().position(|&b| b == 0).ok_or("unterminated caps")?;
+    let caps = std::str::from_utf8(&rest[..end]).map_err(|_| "caps not UTF-8")?;
+    let (dtype, geometry) = caps.split_once(':').unwrap_or((caps, ""));
+    let dtype = match dtype {
+        "0" => "bf16",
+        "1" => "f16",
+        _ => return Err(format!("unknown plow_fa4 dtype {dtype}")),
+    };
+    let abi = if geometry.is_empty() {
+        if dtype == "f16" {
+            LIBRARY_FA4_HD512_F16_ABI.to_string()
+        } else {
+            LIBRARY_FA4_HD512_BF16_ABI.to_string()
+        }
+    } else {
+        format!("lib_flash_prefill_v1:fa4:{geometry}:dtype={dtype}")
+    };
+    LibraryAbi::parse(&abi)
+        .map(|_| abi.clone())
+        .ok_or_else(|| format!("library capability {abi:?} unsupported"))
 }
 
-/// The runtime's site contract (plowrt `lib_attention::sites`): causal global hd512, 16 query
-/// heads over 1 or 2 KV heads, a linear head-major cache, fused output, no split.
-fn is_site(op: &packet::dev::DevInst) -> bool {
+/// The runtime's site contract (plowrt `lib_attention::sites`): causal global attention of the
+/// library's geometry on a linear cache, fused output, no split. FP8 KV only through the hd512
+/// head-major gather.
+fn is_site(op: &packet::dev::DevInst, abi: &LibraryAbi) -> bool {
     let fp8 = op.op == DevOp::FlashPrefillFp8 as u16;
-    (fp8 || op.op == DevOp::FlashPrefill as u16)
-        && op.i[2] == 16
-        && matches!(op.i[3], 1 | 2)
+    (op.op == DevOp::FlashPrefill as u16
+        || (fp8 && abi.head_dim == 512 && abi.layout == LibraryKvLayout::HeadMajor))
+        && op.i[2] == abi.heads
+        && abi.kv_heads.contains(&op.i[3])
         && op.i[5] == 0
-        && op.i[6] == 512
+        && op.i[6] == abi.head_dim
         && packet::dev::flash_nsplit(op.i[7]) == 1
         && op.j[0] > 0
         && op.j[0] % 64 == 0
@@ -45,9 +65,11 @@ fn is_site(op: &packet::dev::DevInst) -> bool {
         && (!fp8 || op.t[6..8].iter().all(|&t| t != TENSOR_NONE))
 }
 
-fn is_hd512_flash(op: &packet::dev::DevInst) -> bool {
+/// Attention the library's geometry claims: every such site of a requested rung is served.
+fn is_claimed(op: &packet::dev::DevInst, abi: &LibraryAbi) -> bool {
     (op.op == DevOp::FlashPrefill as u16 || op.op == DevOp::FlashPrefillFp8 as u16)
-        && op.i[6] == 512
+        && op.i[6] == abi.head_dim
+        && op.i[5] == 0
 }
 
 /// Declares the route on every prefill program whose rung enables it. Returns the segment count.
@@ -67,9 +89,20 @@ pub(crate) fn apply_output_object(
         return Ok(0);
     }
     let directory = output.parent().unwrap_or_else(|| Path::new("."));
-    let path = directory.join(FILE);
+    let present: Vec<&str> = FILES
+        .into_iter()
+        .filter(|f| directory.join(f).exists())
+        .collect();
+    let [file] = present[..] else {
+        return Err(format!(
+            "PLOW_EMIT_ATTN_LIBRARY needs exactly one of {FILES:?} in {}",
+            directory.display()
+        ));
+    };
+    let path = directory.join(file);
     let image = std::fs::read(&path).map_err(|e| format!("{}: {e}", path.display()))?;
-    let abi = library_abi(&image)?;
+    let abi_string = library_abi(&image).map_err(|e| format!("{}: {e}", path.display()))?;
+    let abi = LibraryAbi::parse(&abi_string).expect("checked");
     let position = sections
         .iter()
         .position(|section| section.name == SECTION)
@@ -92,22 +125,23 @@ pub(crate) fn apply_output_object(
                     .stream
                     .iter()
                     .all(|e| (e.inst as usize == first) == (e.seg as usize == segment))
-                && is_site(&program.insts[first])
+                && is_site(&program.insts[first], &abi)
             {
                 library.push(segment as u32);
             }
         }
-        let hd512 = program.insts.iter().filter(|op| is_hd512_flash(op)).count();
-        if hd512 == 0 {
+        let claimed = program.insts.iter().filter(|op| is_claimed(op, &abi)).count();
+        if claimed == 0 {
             continue;
         }
-        // Every hd512 site of a requested rung is served, or the request is refused.
-        if library.len() != hd512 {
+        // Every claimed site of a requested rung is served, or the request is refused.
+        if library.len() != claimed {
             return Err(format!(
-                "prefill program {index} (rows {}): {} of {hd512} hd512 attention sites are lone \
-                 library-compatible segments",
+                "prefill program {index} (rows {}): {} of {claimed} hd{} global attention sites \
+                 are lone library-compatible segments",
                 model.prog_t[index],
-                library.len()
+                library.len(),
+                abi.head_dim
             ));
         }
         let record = match metadata.programs.iter_mut().find(|p| p.index == index) {
@@ -128,13 +162,16 @@ pub(crate) fn apply_output_object(
         record.library = library;
     }
     if total == 0 {
-        return Err("PLOW_EMIT_ATTN_LIBRARY: no requested rung has hd512 attention".into());
+        return Err(format!(
+            "PLOW_EMIT_ATTN_LIBRARY: no requested rung has hd{} global attention",
+            abi.head_dim
+        ));
     }
     metadata.objects.insert(
         LIBRARY_PREFILL_ATTENTION,
         SegmentObject {
-            abi: abi.into(),
-            file: FILE.into(),
+            abi: abi_string,
+            file: file.into(),
             sha256: Some(plow_asset::decode_objects::image_sha256(&image)),
             promote_k512: None,
             attention: None,
@@ -154,9 +191,14 @@ mod tests {
         let mut image = b"\x7fELF....".to_vec();
         image.extend_from_slice(b"plow_fa4_caps:abi=3:dtype=1\0");
         assert_eq!(
-            super::library_abi(&image),
+            super::library_abi(&image).as_deref(),
             Ok(super::LIBRARY_FA4_HD512_F16_ABI)
         );
-        assert!(super::library_abi(b"plow_fa4_caps:abi=2:dtype=0").is_err());
+        assert!(super::library_abi(b"plow_fa4_caps:abi=2:dtype=0\0").is_err());
+        assert_eq!(
+            super::library_abi(b"..plow_fa4_caps:abi=3:dtype=0:hd=256:heads=24:kv_heads=4:layout=ilv\0")
+                .as_deref(),
+            Ok("lib_flash_prefill_v1:fa4:hd=256:heads=24:kv_heads=4:layout=ilv:dtype=bf16")
+        );
     }
 }

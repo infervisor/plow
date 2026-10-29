@@ -38,9 +38,100 @@ pub const MAX_ROLE: u8 = GENERATED_LAST;
 /// in [`ProgramRoles::library`]; each is a lone `FlashPrefill(Fp8)` instruction.
 pub const LIBRARY_PREFILL_ATTENTION: u8 = 26;
 /// FlashAttention-4 SM90 hd512 forward (`libplow_fa4_hd512.so`, plow_fa4 C ABI 3) over bf16 or
-/// fp16 pages; the suffix is the library's element type (`plow_fa4_dtype`).
+/// fp16 pages; the suffix is the library's element type (`plow_fa4_dtype`). Shorthand for
+/// [`LibraryAbi`] hd 512, 16 heads over 1 or 2 KV heads, head-major.
 pub const LIBRARY_FA4_HD512_BF16_ABI: &str = "lib_flash_prefill_v1:fa4_hd512:bf16";
 pub const LIBRARY_FA4_HD512_F16_ABI: &str = "lib_flash_prefill_v1:fa4_hd512:f16";
+const LIBRARY_ABI_PREFIX: &str = "lib_flash_prefill_v1:fa4:";
+
+/// KV cache layout a library reads in place or through its gather pool.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LibraryKvLayout {
+    /// `[slot][kv head][ctx][hd]`.
+    HeadMajor,
+    /// `[slot][ctx][kv head][hd]`.
+    RowInterleaved,
+}
+
+/// What a library attention object computes: causal global attention of `heads` query heads
+/// over any of `kv_heads` KV heads at `head_dim`, on a `layout` cache, in `f16` or bf16.
+/// `lib_flash_prefill_v1:fa4:hd=256:heads=24:kv_heads=4:layout=ilv:dtype=bf16`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LibraryAbi {
+    pub head_dim: u32,
+    pub heads: u32,
+    pub kv_heads: Vec<u32>,
+    pub layout: LibraryKvLayout,
+    pub f16: bool,
+}
+
+impl LibraryAbi {
+    pub fn parse(abi: &str) -> Option<Self> {
+        let hd512 = |f16| LibraryAbi {
+            head_dim: 512,
+            heads: 16,
+            kv_heads: vec![1, 2],
+            layout: LibraryKvLayout::HeadMajor,
+            f16,
+        };
+        match abi {
+            LIBRARY_FA4_HD512_BF16_ABI => return Some(hd512(false)),
+            LIBRARY_FA4_HD512_F16_ABI => return Some(hd512(true)),
+            _ => {}
+        }
+        let fields: BTreeMap<&str, &str> = abi
+            .strip_prefix(LIBRARY_ABI_PREFIX)?
+            .split(':')
+            .map(|kv| kv.split_once('='))
+            .collect::<Option<_>>()?;
+        let num = |k: &str| fields.get(k)?.parse::<u32>().ok().filter(|&v| v > 0);
+        let kv_heads: Vec<u32> = fields
+            .get("kv_heads")?
+            .split(',')
+            .map(|v| v.parse::<u32>().ok().filter(|&v| v > 0))
+            .collect::<Option<_>>()?;
+        let out = LibraryAbi {
+            head_dim: num("hd")?,
+            heads: num("heads")?,
+            layout: match *fields.get("layout")? {
+                "head_major" => LibraryKvLayout::HeadMajor,
+                "ilv" => LibraryKvLayout::RowInterleaved,
+                _ => return None,
+            },
+            f16: match *fields.get("dtype")? {
+                "bf16" => false,
+                "f16" => true,
+                _ => return None,
+            },
+            kv_heads,
+        };
+        (fields.len() == 5
+            && matches!(out.head_dim, 64 | 128 | 256 | 512)
+            && !out.kv_heads.is_empty()
+            && out.kv_heads.windows(2).all(|w| w[0] < w[1])
+            && out.kv_heads.iter().all(|&k| out.heads % k == 0)
+            && out.format() == abi)
+            .then_some(out)
+    }
+
+    pub fn format(&self) -> String {
+        format!(
+            "{LIBRARY_ABI_PREFIX}hd={}:heads={}:kv_heads={}:layout={}:dtype={}",
+            self.head_dim,
+            self.heads,
+            self.kv_heads
+                .iter()
+                .map(u32::to_string)
+                .collect::<Vec<_>>()
+                .join(","),
+            match self.layout {
+                LibraryKvLayout::HeadMajor => "head_major",
+                LibraryKvLayout::RowInterleaved => "ilv",
+            },
+            if self.f16 { "f16" } else { "bf16" }
+        )
+    }
+}
 
 pub fn is_generated(role: u8) -> bool {
     (GENERATED_FIRST..=GENERATED_LAST).contains(&role)
@@ -628,10 +719,7 @@ fn validate_library(object: &SegmentObject) -> Result<(), String> {
                 .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
     });
     if !valid_hash
-        || !matches!(
-            object.abi.as_str(),
-            LIBRARY_FA4_HD512_BF16_ABI | LIBRARY_FA4_HD512_F16_ABI
-        )
+        || LibraryAbi::parse(&object.abi).is_none()
         || object.file.is_empty()
         || std::path::Path::new(&object.file)
             .components()
@@ -909,6 +997,20 @@ mod tests {
         assert!(parse(LIBRARY_FA4_HD512_BF16_ABI, r#","library":[3]"#).is_err());
         assert!(parse(LIBRARY_FA4_HD512_BF16_ABI, r#","library":[2,1]"#).is_err());
         assert!(parse("lib_flash_prefill_v1:fa4_hd512:fp8", r#","library":[1]"#).is_err());
+        let qwen = "lib_flash_prefill_v1:fa4:hd=256:heads=24:kv_heads=4:layout=ilv:dtype=bf16";
+        assert!(parse(qwen, r#","library":[1]"#).is_ok());
+        assert_eq!(LibraryAbi::parse(qwen).map(|a| a.format()).as_deref(), Some(qwen));
+        assert_eq!(
+            LibraryAbi::parse(LIBRARY_FA4_HD512_BF16_ABI).map(|a| a.kv_heads),
+            Some(vec![1, 2])
+        );
+        for bad in [
+            "lib_flash_prefill_v1:fa4:hd=256:heads=24:kv_heads=5:layout=ilv:dtype=bf16",
+            "lib_flash_prefill_v1:fa4:hd=256:heads=24:kv_heads=4:layout=ilv:dtype=bf16:x=1",
+            "lib_flash_prefill_v1:fa4:heads=24:hd=256:kv_heads=4:layout=ilv:dtype=bf16",
+        ] {
+            assert!(LibraryAbi::parse(bad).is_none(), "{bad}");
+        }
     }
 
     #[test]

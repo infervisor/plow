@@ -155,3 +155,14 @@ extern "C" int plow_fa4_hd512_run(PlowFa4Handle* h, unsigned heads, unsigned kv_
 #undef PLOW_FA4_WHOLE
 #undef PLOW_FA4_TENSORS
 }
+
+// The geometry-generic entry name of plow_fa4 ABI 3 (the library's caps marker names the geometry).
+extern "C" int plow_fa4_run(PlowFa4Handle* h, unsigned heads, unsigned kv_heads, void* q, void* k,
+                            void* v, void* out, int total_q, int nreq, void* cu_q, void* used_k,
+                            void* page_table, int max_pages, int num_pages, int64_t head_stride,
+                            float scale, int splits, void* workspace, uint64_t workspace_bytes,
+                            void* stream) {
+    return plow_fa4_hd512_run(h, heads, kv_heads, q, k, v, out, total_q, nreq, cu_q, used_k,
+                              page_table, max_pages, num_pages, head_stride, scale, splits,
+                              workspace, workspace_bytes, stream);
+}
