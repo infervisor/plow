@@ -66,6 +66,8 @@ type Run = unsafe extern "C" fn(
     *mut c_void, // stream
 ) -> i32;
 const WORKSPACE_BYTES: u64 = 128 << 20;
+/// Split-KV upper bound (the exported combine's log_max_splits 7).
+const MAX_SPLITS: u32 = 128;
 const SMS: u32 = 132;
 
 /// One routed `FlashPrefill(Fp8)` site. Addresses are the slot-0 tensor bases.
@@ -253,7 +255,7 @@ impl Launch {
         if n_blocks <= 4 || m_blocks == 0 {
             return 1;
         }
-        let mut splits = (SMS / m_blocks).min(128).min(n_blocks).max(1);
+        let mut splits = (SMS / m_blocks).min(MAX_SPLITS).min(n_blocks).max(1);
         while splits > 1 && u64::from(splits) * u64::from(self.rows) * split_row_bytes > workspace {
             splits -= 1;
         }
@@ -560,7 +562,14 @@ impl LibAttention {
             width = width.max(n);
             pages += n;
         }
-        if (self.direct.is_none() && pages > POOL_PAGES)
+        // The TMA paged path (KV tile = one 64-row page) indexes the table unguarded: an empty
+        // split's producer still loads V at its first block, split_idx x per-split blocks, which
+        // can reach n + splits - 2 for a request of n pages (the non-TMA path checks rows against
+        // kv_len). Every row carries MAX_SPLITS columns past the widest request, filled with the
+        // request's own last page.
+        let width = width + MAX_SPLITS;
+        // `>=`: a full gather list would reach PT_OFF and overwrite the word before row 0.
+        if (self.direct.is_none() && pages >= POOL_PAGES)
             || u64::from(width) * requests.len() as u64
                 > u64::from(POOL_PAGES) * MAX_REQUESTS as u64
         {
@@ -584,23 +593,35 @@ impl LibAttention {
         }
         let mut gather = Vec::with_capacity(pages as usize * 3);
         let mut table = vec![0i32; width as usize * requests.len()];
+        let mut lead = 0i32;
         for (r, &[_, _, slot_id, kvlen]) in requests.iter().enumerate() {
+            let row = &mut table[r * width as usize..(r + 1) * width as usize];
+            let n = kvlen.div_ceil(PAGE) as usize;
             if let Some(d) = self.direct {
                 // The slot's own pages; the gather list carries (slot, kvlen) for the tail zeroing.
                 let first = slot_id * d.pages(&self.abi).0;
-                for j in 0..kvlen.div_ceil(PAGE) {
-                    table[r * width as usize + j as usize] = (first + j) as i32;
+                for (j, e) in row[..n].iter_mut().enumerate() {
+                    *e = (first + j as u32) as i32;
                 }
                 gather.extend([slot_id as i32, kvlen as i32, 0]);
-                continue;
+            } else {
+                for (j, e) in row[..n].iter_mut().enumerate() {
+                    *e = (gather.len() / 3) as i32;
+                    let j = j as u32;
+                    gather.extend([
+                        slot_id as i32,
+                        (j * PAGE) as i32,
+                        (kvlen - j * PAGE).min(PAGE) as i32,
+                    ]);
+                }
             }
-            for j in 0..kvlen.div_ceil(PAGE) {
-                table[r * width as usize + j as usize] = (gather.len() / 3) as i32;
-                gather.extend([
-                    slot_id as i32,
-                    (j * PAGE) as i32,
-                    (kvlen - j * PAGE).min(PAGE) as i32,
-                ]);
+            // Entries past the request's pages repeat its last page: a page id the kernel reads
+            // there (masked by kv_len) stays inside this request's mapped rows.
+            let last = row[n - 1];
+            row[n..].fill(last);
+            // n_block_max == 0 makes the first load read entry -1 (the word before row 0).
+            if r == 0 {
+                lead = row[0];
             }
         }
         let lens: Vec<i32> = requests.iter().map(|r| r[3] as i32).collect();
@@ -613,6 +634,7 @@ impl LibAttention {
             staging.pending = false;
         }
         let host = staging.host.as_mut_slice();
+        host[PT_OFF as usize - 4..PT_OFF as usize].copy_from_slice(&lead.to_le_bytes());
         for (off, values) in [
             (CU_OFF, &cu),
             (LEN_OFF, &lens),
@@ -628,7 +650,7 @@ impl LibAttention {
             (CU_OFF, CU_OFF + cu.len() as u64 * 4),
             (LEN_OFF, LEN_OFF + lens.len() as u64 * 4),
             (GATHER_OFF, GATHER_OFF + gather.len() as u64 * 4),
-            (PT_OFF, PT_OFF + pt_bytes),
+            (PT_OFF - 4, PT_OFF + pt_bytes),
         ];
         let upload = || -> Result<()> {
             for (start, end) in regions {
