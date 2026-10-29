@@ -11,6 +11,144 @@ new script only for a reusable capability the existing tools cannot express.
 
 ---
 
+## HARD RULE: perf work iterates on a single block, against that block's roofline
+
+Every kernel, fusion, route or knob candidate is screened on **one block**: one layer (or the
+smallest layer span containing each layer kind the candidate touches) at the served shape,
+precision, emit/compile flags, rung width and context, compared with a **calibrated**
+bandwidth/compute roofline for that block. Whole-network `step_bench`, FP32 gates and prod-mix
+grids run only for a candidate that already wins at block level; `step_bench` at the affected
+rungs then confirms, it does not screen. Full-network iterations cost hours of queue per point, and
+most candidates refuted in the 2026-10 campaigns (DeepGEMM, PDL, hot-expert split, glue fusion,
+prefill router) could have been killed at block level.
+
+A campaign report (agent result, PR text, `comparison.md`) **starts with the block-vs-roofline
+table**, one row per affected block × rung (decode B or prefill rows) × context:
+
+| block (layer kind, rung, ctx) | block time | roofline floor | % of floor | delta vs current |
+|---|---|---|---|---|
+
+% of floor = floor / measured time. Delta vs current = candidate minus the production packet's
+same block at the same point, measured in the same lease. Name the ceilings behind the floor and
+whether they were measured on this GPU; a datasheet floor is a hypothesis ("Per-rung gate" below).
+
+Harness (read [05-single-block-sweep.md](05-single-block-sweep.md) and the scripts it names):
+
+| step | NVIDIA | AMD |
+|---|---|---|
+| emit one block | `plowc --emit devblob --block <l>[..<r>]` with the production recipe's emit env (Gemma-4 dense/MoE: model-shaped asset; Qwen3.8: one layer, B1) | same; MLA families emit `act.x`-in/out only |
+| time | `block_run <asset> bench --batch .. --ctx ..` (decode B×T + prefill pass, `--pf-cap` for launch width; `sweep.json`); grids and finalists: `scripts/tune_decode_sweep.sh --block L --block-bucket N --block-run <bin>` | `campaign.py block-bench`, `block-ab` (four frozen arms, one lease); truncated-model `PLOW_LAYERS=N` sweeps |
+| floor | `scripts/campaign/block_roofline.py <hf_dir> --kind sliding\|full --plow sweep.json [--vllm layer.json]`; calibrated per-op floors: `scripts/bench/op_roof.py <block disasm> --bw/--tflops/--fp8-tflops` | `campaign.py block-roofline` (recipe `[roofline]` ceilings, `--router-table`) |
+| reference block | `scripts/block_layer_bench.py` (vLLM's own decoder layer, same row schema) + `scripts/block_compare.py` | `runtime/tests/*_block_*_test.c` oracles |
+| block parity | `block_run packed-check` / `mixed-check` (packed / mixed vs serial on the block) | `amd-block --dump`, C oracle harnesses |
+
+Known gaps in the single-block harness. List the ones a candidate hits in its report; do not write
+new harness code inside a perf campaign (extend the harness as its own change):
+
+* `block_roofline.py` prices 2-byte weights and KV (`eb = 2`): no FP8 weight/KV floor. Its ceilings
+  come from the `roofline.py` registry with no `--bw`/`--tflops` override, so they are not
+  calibrated; take calibrated per-op floors from `op_roof.py` on the block's disassembly.
+* `block_roofline.py` layer kinds are `sliding|full`: no GDN/recurrent (Qwen3.8 linear attention),
+  MLA or DSA layers. `block_layer_bench.py` runs only the Gemma family.
+* Prefill is timed and priced from an empty prefix: no prior-context chunk sweep and no packed
+  prefill with riders (`packed-check` / `mixed-check` are parity checks with one coarse timing).
+* MoE: `block_run bench` drives synthetic `act.x`, so router choices and the expert union a step
+  reads are not those of real traffic; MoE block time is not data-independent. NVIDIA has no
+  equivalent of AMD's captured `--router-table`.
+* Library attention routes and segmented cuBLASLt routes: a block emitted with the recipe's flags
+  should carry them, but no recorded block run validates that; confirm the route in the block log
+  before trusting the number. `op_roof.py` needs `--nsys` for library-routed decode.
+* No frozen four-arm NVIDIA block A/B (AMD `block-ab`): run ctl/treat/ctl2/treat2 in one lease and
+  score per §7. No delta-vs-current column in any tool: difference two sweeps from one lease.
+* Qwen3.8 `--block` is one layer at B1: decode rungs B > 1 cannot be block-screened.
+* Prefill bucket policy, prefill dispatch/classing and host-gap knobs are invisible at block level
+  ([05](05-single-block-sweep.md) "What tier 2 cannot score"): they go to `step_bench` per rung,
+  still before any grid.
+
+## Working rules (every agent)
+
+Product invariants:
+
+* Prefix cache always on, VMM prefix included (§9 "Runtime environment").
+* Packets always carry the 8192-row prefill rung; launch width is plowrt `auto`'s job, never a
+  dropped rung or a per-recipe width knob.
+* One plowrt binary and one runtime library set (one cuBLASLt) serve every bundle. An asset's
+  requirement is declared in the packet and met by the standard runtime; never a per-model plowrt
+  build or runtime dir. Validate every bundle on the candidate binary before shipping.
+* Packet contract, not plowrt: model knowledge (front-ends, loop kinds, prompt/parse/tool rules,
+  state layouts, capability checks) is emitted by devgen/plowc into packet metadata, `serve.json`
+  and object symbols, documented in `docs/runtime/*-packet-contract.md`. plowrt executes generic
+  ops, validates the contract version and fails closed. Reject model-name branches in plowrt.
+* Static runtime: plowrt links libc/libm/libgcc_s and dlopens only vendor libraries (libcuda,
+  cuBLASLt, libhsa-runtime64). Third-party kernels (FA4/FA3/FlashInfer, ...) ship as packet cubins
+  launched by plowrt's own host stub (`cuTensorMapEncodeTiled`, `cuLaunchKernelEx`), their param
+  layout versioned in the packet ABI and refused on mismatch. Never add a dlopen of a non-vendor
+  library; today's (FA4 `.so` in `exec/gpu/lib_attention.rs`, `device/cuda/cutlass_fp8.rs`,
+  `device/cuda/qwen_gdn.rs`, `asr/nemotron/external.rs`) are debt being removed, not precedent.
+* No default-off knob ships; every `PLOW_*` is registered with passing knob tests (§9 "Builds").
+* Customer hosts get only assets + plowrt + launcher (deploy script / systemd unit). Evals, perf
+  clients and venvs run from our box through `ssh -L`.
+
+Judging:
+
+* Judge every candidate against the same-concurrency vLLM peer, never against plowrt's own
+  production packet as the baseline. No accepted losses vs vLLM: a remaining loss gets a new perf
+  lever, not a waiver or a "known loss" label. Threshold misses only under §5 "Gate relaxation".
+* Attention kernels are chosen per rung by measurement (library or native); the packet declares
+  the choice, plowrt stays generic.
+
+GPU budget (write it into every GPU agent's prompt):
+
+* Screen first: single block (HARD RULE), then `step_bench` at the affected rungs plus one c16
+  FP32 gate (c8 for Qwen3.8) in one lease. c1/c8/c32 gates and the full prod mix (2 rates × 2-3
+  reps) only for a promotion candidate (§5 "Screen, then promote", §9 "Measurement").
+* One lease script per decision (one server start per packet); at most one queued lease per agent;
+  never recapture a vLLM arm, reuse shared plowrt base arms; merge blockers' jobs go first.
+* Traces and profiles run on the lab box (gpu03) under `gpulease` with `--max-hold`. A production
+  (gpu04) swap needs an explicit user go each time; gpu04's vLLM is a Slurm deployment owned by the
+  cluster orchestrator, and a hand-started server there gets no traffic.
+
+Branches, review, verification:
+
+* All changes consolidate onto `prod-next` through the coordinator. Agents cut short branches from
+  the latest `origin/prod-next`, rebase before promotion leases and report their tip; the
+  coordinator merges (checks: `check_recipe`, `render --check`, fmt, `cargo check`, the docs/arch
+  tool-name grep). Never push `main` or `prod-next`, never merge into other agents' branches, never
+  force-push; `prod-next` → `main` only on the user's go.
+* Every kernel implemented or adapted gets a design consult before coding (shapes and precision
+  per rung, tiling, smem/register budget, sync, source library, gating, roofline sanity) and a diff
+  review once it passes local rung gates (bounds, tail rows, KV past `kv_len`, races, alignment,
+  FP8 scaling/accumulation, resources, ABI/route gating). BLOCKING findings are fixed before the
+  rung gate or the recipe; findings and dispositions are listed per kernel in the report (saved as
+  `<scratch>/codex/<kernel>-design.md`, `-review.md`; pipe diff and sources on stdin, the sandbox
+  shell can fail). Significant landed change sets also get a review of the merge-base diff from a
+  clean detached worktree.
+* Lean: contract changes keep their Lean verification (write and run it, never bypass it).
+  Approving a new verifier hash in `lean-plow/approved-verifiers.json` is the user's call, per hash.
+
+Docs:
+
+* `docs/arch` never names a tool or assistant (grep `codex|claude` before committing); model names
+  are fine as examples. Chapters are organised by technique (sliding window, MLA, recurrent state,
+  MoE routing, KV-shared tails, ...), not by model.
+* Backend parity: a technique landing on one backend gets the other backend's gap recorded in
+  `docs/arch/29` §8, and new work keeps the packet contract reusable by the other backend.
+
+Agent-session hazards:
+
+* `EnterWorktree` in a coordinating session isolates the whole session: running subagents get
+  every Bash call refused. Edit other worktrees by absolute path and run git from script files.
+  `Agent` `isolation: worktree` fails here (`.claude` is a symlink): `git worktree add` instead.
+* A hook refuses git inside loops, `$(...)` with variables or `cd X && ...` chains in worktree
+  sessions: put multi-step git in a script file.
+* `pkill -f` / `pgrep -f` self-match: §"Lease hygiene". `CARGO_TARGET_DIR` after a box env file:
+  §"Shared worktree".
+* `compute-sanitizer` under `gpulease`: the lease log shows the sanitized process as
+  `foreign-during` and the run ends rc 76. That is expected for a sanitizer run (take no timing
+  from it). Run it with `--report-api-errors no`.
+
+---
+
 ## 0. Environment contract
 
 **Everything runs inside `nix develop`.** The flake is self-contained and pins ROCm 7.14 (TheRock)
@@ -58,6 +196,8 @@ the persistent queue runner removes inherited `PLOW_*` values before starting ea
 Order of operations. Each step has a tool; do not write a probe for it. Complete the per-rung
 gate before the full-model accuracy and serving stages, then repeat that gate for affected rungs
 after a kernel change. Existing serving evidence can prioritize work but cannot replace the gate.
+In the optimisation loop (steps 7-9) a candidate is screened on a single block first (HARD RULE at
+the top); steps 3-6 run only for a block-level winner.
 
 | # | step | tool |
 |---|---|---|
@@ -430,7 +570,9 @@ records the checkpoint's `eos_token_id` in the reference's meta; a reference mad
 Unit tests: `cd scripts/llm && python3 -m unittest test_fp32_ref_gate`.
 
 **Screen, then promote.** Judge every arm against the vLLM capture taken at the **same
-concurrency** (the gate refuses without one). Screening a candidate = one c16 gate (c8 for a model
+concurrency** (the gate refuses without one), never against plowrt's own production packet. A
+candidate reaches any gate only after it wins at block level (HARD RULE at the top). Screening a
+candidate = one c16 gate (c8 for a model
 whose recipe gates at 1/8/32, e.g. Qwen3.8) plus step_bench at the affected rungs, in one lease;
 c1/c8/c32 and the full production mix run only for a promotion candidate. An **arm** is the same
 packet + plowrt + serve env: a run with another knob set, binary or packet is a different arm.
@@ -583,6 +725,11 @@ Each rule cost at least one campaign a day of misattributed results.
 * `interp_sm90a.cubin` is not byte/SASS-reproducible across nvcc runs for some configs: prove a
   "no-op for other packets" claim with `cuobjdump --dump-resource-usage`, a re-gate and step_bench
   token digests, not a cubin diff.
+* A standalone CUDA-runtime `.cu` probe compiled inside `nix develop` aborts at runtime init
+  ("stack smashing detected"): compile it in the plain shell, queue only the run. nvcc compiles
+  that include `cuda_fp16.hpp` (TileLang, `build_catalog.py`) fail inside the nix shell because its
+  ROCm `nv/target` shadows CUDA's: run them under `env -i` with `NVCC_PREPEND_FLAGS` (as
+  `build_sm90a_cubin.sh` does) or in `nix develop .#tilelang`.
 * No default-off knob ships: a knob is default on (qualified) or removed. Every new `PLOW_*` env
   read, emit knob or `#if PLOW_*` define is registered in `crates/plowrt/src/knob_spec.rs` or
   `crates/devgen/src/knob_spec.rs`, and `cargo test -p plowrt --features cuda,hsa --lib knob` +
@@ -611,8 +758,10 @@ Each rule cost at least one campaign a day of misattributed results.
 * The prefix cache is always on (`PLOW_PREFIX_CACHE`, `PLOW_VMM_PREFIX`); `=0` is an attribution
   A/B, never a recipe or release setting. A prefix-cache cost is a plowrt bug to fix.
 * Packets declare the attention route per rung (native role vs library objects in the packet, e.g.
-  `PLOW_BUILD_FA4_HD512` puts `libplow_fa4_hd512.so` + `kv_dequant_sm90.cubin` in it); plowrt runs
-  what the packet declares. A route change is a re-emit and a re-gate, never a serve knob.
+  `PLOW_BUILD_FA4_HD512` puts the FA4 forward + `kv_dequant_sm90.cubin` in it); plowrt runs what the
+  packet declares. A route change is a re-emit and a re-gate, never a serve knob. The FA4 forward
+  is still a `libplow_fa4_*.so` today; it is being replaced by packet cubins (static runtime rule,
+  "Working rules"), so no new library route ships as a `.so`.
 
 **KV reads and device faults**
 
@@ -620,11 +769,16 @@ Each rule cost at least one campaign a day of misattributed results.
   commit blocks): a kernel must never load a KV row at or past `kv_len`, masked or not. Run
   `scripts/bench/step_boundary.sh` (ctx 4094/4095/4096/8191/8192, `CUDA_LAUNCH_BLOCKING=1`) on every
   new KV-reading arm before any serving run.
-* A library attention route's page table must be fully rewritten (or its unused entries poisoned)
-  every launch: stale entries point at pages of retired slots that are unmapped asynchronously, and
-  a loader over-index then faults rarely instead of deterministically.
-* Diagnose a CUDA 700 with the kernel log (`sudo -n journalctl -k`, from a session that may read
-  it): the NVRM Xid line gives the engine (GRAPHICS = an SM kernel, CE = a copy), the access type
+* A library attention route's page table must cover every entry the library's loader reads, not
+  only the request's `n` pages: FA4's SM90 producer reads up to `n + splits - 2` entries of a row
+  (and entry -1 when `n_block_max == 0`). Each row carries `MAX_SPLITS` padding columns of the
+  request's own last page and the word before row 0 its first page. Stale entries point at pages of
+  retired slots that are unmapped asynchronously, so an over-index faults rarely (CUDA 700 in the
+  prod mix). Verify a new route with a poison table (entries past the row encoded as unmapped
+  pages), which faults deterministically at 1-3-row tail chunks. A launch outside the library's
+  envelope runs the native role.
+* Diagnose a CUDA 700 with the kernel log (`sudo -n journalctl -k`; it works from the coordinating
+  session, agent sessions cannot read it, so ask the coordinator): the NVRM Xid 31 line gives the engine (GRAPHICS = an SM kernel, CE = a copy), the access type
   (READ/WRITE) and the faulting VA; decode the VA against the serve log's KV pool window and track
   bases to name slot, head and row. Diagnostic error wrappers must pass `DeviceFault` through.
 
