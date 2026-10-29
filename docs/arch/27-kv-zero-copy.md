@@ -445,6 +445,19 @@ the writers, prefill stager and BF16 variants were not built: track 2 (P2/P3) st
 flat pipeline (F1) is the KV design. Re-opening it needs a decode body with register headroom
 (a non-persistent attention kernel), not a different page size.
 
+### 6.6 F1 result (2026-10-29)
+
+Production-mix replays, F1 against its base in one lease (2 reps, one rate per model; strict
+reports against the vLLM 0.29 arms). Store time on the engine thread, as a share of tick time:
+12B FP8 with the 64 GiB host tier 13.0 → 0.53 % (gather 8.9 ms → 63 µs), 26B FP8 3.06 → 1.37 %
+(gather 715 → 58 µs; publish drain 89 µs → 0), Qwen3.8 BF16 4.35 → 1.50 % (gather 7.1 ms → 86 µs).
+The 12B gain reaches the tail: TTFT P99 1.02x → 0.73x vLLM, TPOT P99 0.74x → 0.50x, both reps.
+26B and Qwen3.8 P99s move within their rep-to-rep spread. Attached-prefix outputs are
+bit-identical to the copy path with the matmul algorithms pinned (Qwen3.8 BF16 and 26B FP8,
+40 of 40 cached turns); FP32 gates pass. The largest single cost had been the stream drain of
+a gather outside a launch window, not the copy itself. Evidence:
+`/opt/dlami/nvme/lava-tts/kv-f1p0/` (`rep/`, `gates/`, `l2/`).
+
 ## 7. Validation
 
 0. **F1.** Kernels untouched: `step_bench` digests identical to the base packet; replay
