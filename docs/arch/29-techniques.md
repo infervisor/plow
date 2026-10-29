@@ -498,8 +498,8 @@ Packet ABI: opcodes are `PLOW_DOP_QWEN_*` (136-146); devgen derives the list by 
 Kernels and objects:
 - CUDA decode: `runtime/nvidia/op_qwen_gdn.cuh` inside the paired interpreter object; the
   manifest requires `PLOW_NV_QWEN_GDN=1`.
-- CUDA prefill: `runtime/nvidia/gdn_prefill.cpp` (`plow_gdn_run`), a generated CuTe DSL chunked
-  kernel shipped as `libplow_gdn_prefill.so` beside the packet and loaded by `exec/gpu.rs`.
+- CUDA prefill: a generated CuTe DSL chunked kernel shipped as a packet cubin
+  (`plow_gdn_prefill.aot`) and launched by plowrt's host stub (`device/cuda/qwen_gdn.rs`).
 - AMD: all ten interpreter arms in `runtime/amd/op_qwen_gdn.h`, oracle-checked. However, the
   devgen emitter is NVIDIA-shaped and no HIP prefill exists, so `refuse_unimplemented_target`
   refuses AMD emits by name.
@@ -1043,7 +1043,7 @@ fastconformer RNNT, fish-s2.
 - **GDN on sm_120**:
   - The arms compile under `PLOW_NV_QWEN_GDN=1`, which the manifest requires (`manifest.rs:1569`).
   - The emitter builds the manifest for sm_90a only (`qwen35.rs:1360`, "NVIDIA-shaped").
-  - The prefill scan is `libplow_gdn_prefill.so`, a CuTe export for SM90 (`scripts/export_gdn_prefill_sm90.py`), launched host-side from `exec/gpu.rs:7249`. sm_120 needs its own export or the interpreter `QwenGdnConvPrefill` path.
+  - The prefill scan is `plow_gdn_prefill.aot`, a CuTe export for SM90 (`scripts/export_gdn_prefill_sm90.py`) carried as a cubin and launched by `device/cuda/qwen_gdn.rs`. sm_120 needs its own export or the interpreter `QwenGdnConvPrefill` path.
 - **GDN on gfx942**:
   - The ten arms exist (`op_qwen_gdn.h`), but only gfx950 builds set `PLOW_QWEN_GDN=1` (`build_gfx950.sh:271,438`).
   - devgen refuses AMD (`qwen35.rs:1376`, `AMD_QWEN_EMIT = false`, `AMD_GDN_PREFILL = false`): it needs an AMD emitter path, a chunked HIP prefill body plus its adapter, and the arms in a gfx942 build.

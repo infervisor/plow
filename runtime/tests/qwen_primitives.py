@@ -3,7 +3,6 @@ import argparse, ctypes as C, json
 p=argparse.ArgumentParser()
 p.add_argument("--run-gpu", action="store_true")
 p.add_argument("--library", required=True)
-p.add_argument("--gdn-library")
 p.add_argument("--gdn-step-library", help="benchmark-only recurrent candidate; exact native state/output gate before timing")
 p.add_argument("--gdn-timing-only", action="store_true", help="native recurrent step vs reachable vLLM FLA packed decode, batches1/4/16")
 p.add_argument("--attention-only", action="store_true", help="native attention vs installed serving FA3/FA4; excludes projections/cache writes")
@@ -671,41 +670,6 @@ actual=out[0,:,pos.long(),:].transpose(0,1)
 check("prefill single slot KV rows",actual,ref.bfloat16())
 assert not torch.count_nonzero(out[:,:,:128]).item()
 assert not torch.count_nonzero(out[:,:,256:]).item()
-
-if args.gdn_library:
-    from flashinfer.gdn_prefill import chunk_gated_delta_rule
-    gdn=C.CDLL(args.gdn_library)
-    gdn.plow_gdn_create.argtypes=[C.c_int,C.POINTER(C.c_void_p)]
-    gdn.plow_gdn_create.restype=C.c_int
-    gdn.plow_gdn_destroy.argtypes=[C.c_void_p]
-    gdn.plow_gdn_destroy.restype=C.c_int
-    gdn.plow_gdn_run.argtypes=[C.c_void_p]*11+[C.c_int,C.c_void_p]
-    gdn.plow_gdn_run.restype=C.c_int
-    handle=C.c_void_p()
-    assert gdn.plow_gdn_create(0,C.byref(handle))==0
-    second=C.c_void_p()
-    assert gdn.plow_gdn_create(0,C.byref(second))==-1001 and not second.value
-    try:
-        initial=torch.randn(1,48,128,128,device="cuda")*.01
-        final=torch.empty_like(initial)
-        output=torch.empty_like(v)
-        maps=torch.empty(16896,device="cuda",dtype=torch.uint8)
-        offsets=torch.tensor([0,128],device="cuda",dtype=torch.int64)
-        for continuation in range(2):
-            refout,refstate=chunk_gated_delta_rule(q,k,v,g=alpha,beta=beta,
-                initial_state=initial.clone(),output_final_state=True,cu_seqlens=offsets,use_cp=False)
-            rc=gdn.plow_gdn_run(handle,*[t.data_ptr() for t in
-                (q,k,v,output,alpha,beta,final,initial,maps,offsets)],128,torch.cuda.current_stream().cuda_stream)
-            assert rc==0,rc
-            check("managed GDN output",output,refout,0,0)
-            check("managed GDN state",final,refstate,0,0)
-            check("managed GDN persistent copy",initial,final,0,0)
-    finally:
-        torch.cuda.synchronize()
-        assert gdn.plow_gdn_destroy(handle)==0
-    handle=C.c_void_p()
-    assert gdn.plow_gdn_create(0,C.byref(handle))==0
-    assert gdn.plow_gdn_destroy(handle)==0
 
 print(json.dumps(results,indent=2))
 print("PASS",len(results),"primitive comparisons")

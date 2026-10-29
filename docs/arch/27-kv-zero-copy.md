@@ -301,8 +301,8 @@ production plan; "risk" is kernel step-time risk.
   attach at `p mod P ≠ 0` clones the partially filled shared page before the first write: at most
   `P − 32` rows (26B: 10 MB window + 1 MB rows at `P = 128`), against 165 MB today.
 * **`State` out of place.** The packed GDN prefill already reads per-sequence initial states from
-  a contiguous staging buffer the engine gathers into on every launch (`gdn_prefill.cpp:54-82`,
-  `qwen_gdn.rs:239`); an attached sequence's first chunk gathers from the store checkpoint
+  a contiguous staging buffer the engine gathers into on every launch (`qwen_gdn.rs`
+  `launch_varlen`); an attached sequence's first chunk gathers from the store checkpoint
   instead of the slot. The attach copy disappears with no kernel change; the decode step
   (`op_qwen_gdn.cuh:167-186`, in place, already slot-indirected) is unchanged. Speculative
   rollback keeps restoring from the checkpoint, as B3 does.

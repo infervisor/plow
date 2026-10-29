@@ -1167,8 +1167,7 @@ impl GpuEngine {
             return;
         };
         bs.state_defer.get_or_init(|| {
-            let packs = self.qwen_prefill.as_ref().is_some_and(|g| g.varlen())
-                && self.recurrent_initstate.is_some();
+            let packs = self.qwen_prefill.is_some() && self.recurrent_initstate.is_some();
             if !packs || bs.state.is_none() {
                 return Vec::new();
             }

@@ -17,8 +17,9 @@ n_cu = 132
 max_ctx = 16384
 precision = "bf16"
 
-# GDN prefill runs host-side from <assets>/libplow_gdn_prefill.so (exec/gpu.rs NativeGdn); the
-# FlashInfer CuTe DSL export needs the vLLM python (flashinfer 0.6.16 + cutlass 4.6.2).
+# GDN prefill: <assets>/plow_gdn_prefill.aot, the FlashInfer CuTe DSL kernel as a cubin plowrt
+# launches itself (device/cuda/qwen_gdn.rs); the export needs the vLLM python (flashinfer 0.6.16 +
+# cutlass 4.6.2).
 [[prep]]
 name = "gdn-prefill-lib"
 script = "scripts/build_sm90a_qwen_gdn.py"
