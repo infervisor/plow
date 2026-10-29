@@ -164,3 +164,68 @@ goodput 9.41 vs 9.39 req/s. The c1 gate is unchanged (deterministic): cont 41/46
   separate build. Measure FA4 hd256 before choosing.
 * Qwen: FA3 decode/prefill wins of 5-11% at kernel level need an FA3 C++ AOT library and a route
   in `gen_decode.rs`; at 16 attention layers this is ~1-3% of a step.
+
+## 5. 2026-10-29: packet-declared per-rung selection
+
+The file-presence selection of section 3 is gone. The packet declares the route; plowrt runs what
+the packet declares and nothing else.
+
+* Packet: object id 26 `LIBRARY_PREFILL_ATTENTION` (sha256 + ABI string) and, per prefill program,
+  `ProgramRoles.library`: the segments the library serves. Each keeps its native role, which is the
+  declared fallback. A decode program cannot declare one. Older plowrt rejects such a packet.
+* ABI string: `lib_flash_prefill_v1:fa4:hd=<D>:heads=<H>:kv_heads=<K>[,<K>]:layout=<hm|ilv>:dtype=<bf16|f16>`
+  (`plow_asset::LibraryAbi`). The library states its own geometry in the `plow_fa4_caps` marker; the
+  emitter reads it without loading the library and plowrt checks it against the declaration at load.
+* Emitter: `PLOW_EMIT_ATTN_LIBRARY` is a per-rung knob (`emit.attn_library`). The pass
+  (`devgen/src/library_attention.rs`) runs last in both the Gemma and the Qwen pipelines and claims
+  every causal global flash-prefill site of the library's head dim on the selected rungs (all or an
+  error per program).
+* Runtime: `PLOW_PF_ATTN_LIBRARY=0` runs the declared native roles (A/B, rollback). A launch outside
+  the library envelope runs the native role, decided before anything is enqueued; fallbacks are
+  counted.
+* Direct mode (BF16 KV): the library reads the KV pages in place, with no gather and no copy.
+  Head-major (Gemma hd512): page id = slot x (kv_heads x stride / 64) + j, head stride = stride x 512,
+  rows [kv_len, roundup64) zero-filled. That is safe because a VMM block (pow2 >= 2 MiB, >= 2048 rows)
+  is a multiple of the 64-row page. Row-interleaved (Qwen hd256): page id = slot x stride / 64 + j,
+  head stride 256, no fill (the non-TMA paged path predicates rows at seqused_k).
+* hd256 export (`scripts/export_fa4_hd256_sm90.py`, `build_sm90a_fa4_hd256.py OUT H KVH`): vLLM's own
+  SM90 hd256 causal configuration (128 x 80 tiles, two stages, 384 threads, P in registers, intra-WG
+  overlap, non-TMA paged KV) plus the hd256 combine; split rule tile_m 128 / tile_n 80.
+
+### Qwen3.8-27B BF16 (hd256, 24 heads over 4 KV heads, row-interleaved)
+
+One 16000-token prompt, chunk 4096/1024/512/128: 1.403/1.517/1.784/4.325 -> 1.386/1.491/1.757/3.996 s
+(-1.2/-1.7/-1.5/-7.6%). ctx 4094/4095/8191, 8 x 2048 and 16 x 1000 are ties with no faults. The FP32
+gate passes c1/c8/c32, with c1 kl_trim 0.000456 vs native 0.000448. Production mix at 0.45/s:
+TTFT P99 1728 -> 1504 ms and TPOT P99 81.3 -> 75.7 ms, ahead in both repeats. Adopted on every
+prefill rung.
+
+At kernel level the library wins most at 128 rows with a long past (0.25-0.34x native) and
+gives 0.88-0.97x from 512 rows up. Decode stays native. FA4/FA3 decode at B1 with ctx 4-16K runs at
+0.35-0.57x native because the native split count is capped at 8. From B8 up it runs at 0.90-1.00x.
+A decode route needs the FlashDecode + FlashMerge pair bound in `gen_decode.rs`, with device-side
+metadata for graph capture.
+
+### Gemma-4 26B BF16 (hd512, head-major, direct)
+
+One 16000-token prompt, chunk 4096/2048/1024/512/128: 0.404/0.438/0.553/0.857/2.600 ->
+0.345/0.381/0.490/0.821/2.273 s (-15/-13/-12/-4/-13%). The boundary sweep is 5-9% faster and
+8 x 2048 is 3.5% faster.
+
+The library is as accurate as native at the site. The last global layer was recomputed in FP32
+from each arm's own q and cached K/V (read from the cache addresses):
+
+| | c4096 | c1024 |
+|---|---|---|
+| library rel-L2 | 1.684e-3 | 1.678e-3 |
+| native rel-L2 | 1.684e-3 | 1.677e-3 |
+| library vs native output | 4.5% | 4.7% |
+
+The library-vs-native output difference matches the drift of its inputs, which accumulates over
+the earlier layers. So it is a rounding re-roll, not a wrong read or a dtype conversion; bf16 mode
+converts neither Q nor O.
+
+The library's own split count depends on the batch composition, so its logits move between
+concurrent runs where native's do not. That is the spread seen in the c16 continuation metric:
+0.870-0.891 vs native 0.935 in three runs. At c1, which is deterministic, the library continues
+better than native (0.913 vs 0.891).
