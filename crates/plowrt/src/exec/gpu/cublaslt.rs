@@ -368,6 +368,8 @@ pub(super) struct LightFunctions {
     /// `plow_<arch>_light_attn_s`: the hd256 attention alone, two blocks per SM.
     attn_s: Option<KernelFn>,
     fp8_flash256: Option<(KernelFn, u32)>,
+    /// `plow_<arch>_light_router`, its arena and `plow_light_router_ops` (the opcodes it runs).
+    router: Option<(KernelFn, u32, u32)>,
     /// `plow_<arch>_light_head` (unaligned lm_head tail).
     pub(super) head: Option<KernelFn>,
     /// `plow_<arch>_light_flash` (streamed hd128 FlashDecode) and its smem.
@@ -461,6 +463,19 @@ pub(super) fn light_functions(
     } else {
         None
     };
+    let router = match (
+        be.module_global_u32(module, "plow_light_router_smem")?,
+        be.module_global_u32(module, "plow_light_router_ops")?,
+    ) {
+        (Some(smem), Some(ops))
+            if abi == Some(2) && crate::config::RuntimeConfig::get().nv.decode_light_router =>
+        {
+            let f = be.get_function(module, &format!("plow_{arch}_light_router"))?;
+            be.set_max_dynamic_smem(f, smem)?;
+            Some((f, smem, ops))
+        }
+        _ => None,
+    };
     let attn_s = match be.get_function(module, &format!("plow_{arch}_light_attn_s")) {
         Ok(f) if crate::config::RuntimeConfig::get().nv.decode_light_attn_s => {
             be.set_max_dynamic_smem(f, ATTN_S_SMEM)?;
@@ -479,12 +494,30 @@ pub(super) fn light_functions(
         attn,
         attn_s,
         fp8_flash256,
+        router,
         head,
         flash,
         prefill,
         prefill_conv,
         qwen_norm,
     }))
+}
+
+impl LightFunctions {
+    /// `Some(scoped)` when `plow_<arch>_light_router` runs `d` (`scoped`: a router-window opcode
+    /// that makes a segment a router window; RmsNorm and QuantFp8 only ride along).
+    fn router_op(&self, d: &packet::dev::DevInst64) -> Option<bool> {
+        let (_, _, ops) = self.router?;
+        let (bit, scoped) = match DevOp::from_u16(d.op)? {
+            DevOp::RmsNorm => (1, false),
+            DevOp::MoeRouterGemmaScoreFast => (2, true),
+            DevOp::MoeRouterGemmaTopk => (4, true),
+            DevOp::MoeAlignGemmaPf => (8, true),
+            DevOp::QuantFp8 => (16, false),
+            _ => return None,
+        };
+        (ops & bit != 0).then_some(scoped)
+    }
 }
 
 fn fp8_attention_tail(d: &packet::dev::DevInst64) -> bool {
@@ -609,6 +642,19 @@ pub(super) fn light_segments(
                 {
                     return Some((seg, vec![(inst, 0)]));
                 }
+            }
+            if functions.gemma
+                && insts.iter().any(|&i| {
+                    functions
+                        .router_op(&g.insts[i])
+                        .is_some_and(|scoped| scoped)
+                })
+                && insts.iter().all(|&i| {
+                    op(i) == Some(DevOp::NormResidualNorm)
+                        || functions.router_op(&g.insts[i]).is_some()
+                })
+            {
+                return Some((seg, insts.iter().map(|&i| (i, 0)).collect()));
             }
             let attn_hd = |hd: u32| functions.attn.is_some_and(|(_, _, hds)| hds.contains(&hd));
             let attn = functions.attn.is_some()
@@ -1249,6 +1295,20 @@ pub(super) fn add_light_routes(
     folds: &[ArgmaxFold],
     devp: &[DeviceMem],
 ) {
+    if functions.router.is_some() {
+        let router_segments = light
+            .iter()
+            .filter(|(_, levels)| {
+                levels.iter().any(|&(inst, n)| {
+                    n == 0
+                        && functions
+                            .router_op(&g.insts[inst])
+                            .is_some_and(|scoped| scoped)
+                })
+            })
+            .count();
+        tracing::info!(router_segments, "decode router windows as light launches");
+    }
     if functions.fp8_attn {
         let attention_segments = light
             .iter()
@@ -1370,22 +1430,33 @@ pub(super) fn add_light_routes(
                             smem,
                             direct,
                         },
-                        _ => LightLaunch {
-                            function: match (functions.tail, DevOp::from_u16(g.insts[inst].op)) {
+                        _ => {
+                            let (function, smem) = match (
+                                functions.tail,
+                                DevOp::from_u16(g.insts[inst].op),
+                                functions.router.filter(|_| {
+                                    n == 0 && functions.router_op(&g.insts[inst]).is_some()
+                                }),
+                            ) {
                                 (
                                     Some(tail),
                                     Some(DevOp::SoftCap | DevOp::Argmax | DevOp::ArgmaxFin),
-                                ) => tail,
-                                _ => functions.single,
-                            },
-                            xs,
-                            kind: LightKind::Single,
-                            instruction: inst as u32,
-                            blocks,
-                            block: BLOCK,
-                            smem: 0,
-                            direct,
-                        },
+                                    _,
+                                ) => (tail, 0),
+                                (_, _, Some((router, smem, _))) => (router, smem),
+                                _ => (functions.single, 0),
+                            };
+                            LightLaunch {
+                                function,
+                                xs,
+                                kind: LightKind::Single,
+                                instruction: inst as u32,
+                                blocks,
+                                block: BLOCK,
+                                smem,
+                                direct,
+                            }
+                        }
                     }
                 })
                 .collect::<Vec<LightLaunch>>(),

@@ -1666,6 +1666,12 @@ pub struct NvidiaRuntimeConfig {
     #[arg(long = "decode-light-flash", env = "PLOW_DECODE_LIGHT_FLASH", default_value_t = true, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
     pub decode_light_flash: bool,
 
+    /// A segmented decode rung's router window (RmsNorm, NormResidualNorm, router score and
+    /// top-k, align, QuantFp8) runs one light launch per instruction (`plow_<arch>_light_router`)
+    /// instead of an interpreter launch. Same bodies and slices: bit-identical.
+    #[arg(long = "decode-light-router", env = "PLOW_DECODE_LIGHT_ROUTER", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
+    pub decode_light_router: bool,
+
     /// Unified token batch (sm_90a): decode rows riding a packed prefill launch attend through
     /// split-KV flash decode (`plow_<arch>_rider_*` in the decode object) instead of as one-row
     /// requests of the prefill FlashAttention. Arms only when the decode object carries the

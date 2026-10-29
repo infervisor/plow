@@ -677,6 +677,7 @@ pub const RUNTIME: &[KnobSpec] = &[
     KnobSpec::new("rt.cutlass_fp8_decode", Some("PLOW_CUTLASS_FP8_DECODE"), Layer::Runtime, Domain::Str, UNSET, OPT_IN).with(C_CUTLASS_FP8_DECODE),
     KnobSpec::new("rt.decode_light", Some("PLOW_DECODE_LIGHT"), Layer::Runtime, Domain::Bool, ON, PROMOTED),
     KnobSpec::new("rt.decode_light_flash", Some("PLOW_DECODE_LIGHT_FLASH"), Layer::Runtime, Domain::Bool, ON, PROMOTED),
+    KnobSpec::new("rt.decode_light_router", Some("PLOW_DECODE_LIGHT_ROUTER"), Layer::Runtime, Domain::Bool, OFF, OPT_IN),
     KnobSpec::new("rt.tb_split_attn", Some("PLOW_TB_SPLIT_ATTN"), Layer::Runtime, Domain::Bool, ON, PROMOTED),
     KnobSpec::new("rt.tb_gen_decode", Some("PLOW_TB_GEN_DECODE"), Layer::Runtime, Domain::Bool, ON, PROMOTED),
     KnobSpec::new("rt.gen_decode_step", Some("PLOW_GEN_DECODE_STEP"), Layer::Runtime, U32, Default::Static(Val::Nat(4)), GEN_DECODE_STEP_DEFAULT),
