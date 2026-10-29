@@ -13,9 +13,9 @@
 # recipes/infervisor/<model>/<cell>.toml keeps the waivers and their reasons.
 #
 # What a packet can lack and why that is allowed (the only accepted waiver reasons):
-#   prefix_cache      none: a recurrent (GDN) packet serves it too, its state captured at the
-#                     boundary through the KV block store (recipes/infervisor/qwen3.8-27b); the
-#                     inventory still prints n/a for any packet with state.* tensors
+#   prefix_cache      none: a recurrent (GDN) packet serves it too, its declared recurrent_state
+#                     buffers captured at the boundary by the KV block store
+#                     (recipes/infervisor/qwen3.8-27b; CUDA needs PLOW_VMM_PREFIX=1 for it)
 #   token_batch       no packed prefill or no compact terminal on the packet (decode rows ride the
 #                     packed launch; a recurrent chain also needs the packed scan's init-state scratch)
 #   decode_ladder     a model whose decode is bound by one rung at every width (show the step grid)

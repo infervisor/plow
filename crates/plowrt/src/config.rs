@@ -879,9 +879,9 @@ pub struct RuntimeConfig {
     pub vmm_publish_shared: bool,
 
     /// Pinned host memory (MiB) for the prefix cache's host tier (the second level of its
-    /// LRU: evicted boundaries spill there and attach from there). Unset = sized by the
-    /// host-reserve rule (`MemAvailable` minus an eighth of RAM, at least 16 GiB); `0` = no
-    /// host tier.
+    /// LRU: evicted boundaries spill there and attach from there). Unset = sized by
+    /// `memory::vmm::host_tier_default`: `MemAvailable` minus the host reserve (an eighth of RAM,
+    /// at least 16 GiB), capped at a quarter of RAM; `0` = no host tier.
     #[arg(
         long = "vmm-host-cache-mib",
         env = "PLOW_VMM_HOST_CACHE_MIB",
