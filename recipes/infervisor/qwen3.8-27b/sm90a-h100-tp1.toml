@@ -179,6 +179,23 @@ args = ["build", "{out}/assets", "--entries", "attn_dec_hd256_gqa6_ilv"]
 TILELANG_DISABLE_CACHE = "1"
 TVM_FFI_DISABLE_TORCH_C_DLPACK = "1"
 
+# Full-attention (hd256, 24 heads over 4 KV heads) prefill on every prefill rung through the library
+# route (plowrt exec/gpu/lib_attention.rs, docs/arch/28): FlashAttention-4's SM90 forward exported
+# AOT into <assets>/libplow_fa4_hd256.so, reading the row-interleaved BF16 KV in place (no adapter,
+# no copy); the generated role stays the declared fallback (PLOW_PF_ATTN_LIBRARY=0 runs it).
+# Qualified 2026-10-29 on lib-attn2 (plowrt a50a58555, packet 48cf345c9314): one 16000-token
+# prompt, packed prefill chunk 4096/1024/512/128 1.403/1.517/1.784/4.325 -> 1.386/1.491/1.757/
+# 3.996 s (-1.2/-1.7/-1.5/-7.6%), ctx 4094/4095/8191 sweep clean. FP32 gate PASS c1/c8/c32 (c1
+# kl_trim 0.000456 vs native 0.000448, p95 0.0026, top1_decisive 0.9988, cont_decisive 1).
+# Production mix 0.45/s, 2 reps, vs vLLM 0.29: TTFT P99 1728 -> 1504 ms, TPOT P99 81.3 -> 75.7 ms,
+# SLO met 99.3 -> 99.9% (spread > 10%; better in both reps). Evidence:
+# docs/bringup/results/qwen38-27b-h100/comparison.md.
+[[prep]]
+name = "fa4-hd256-lib"
+script = "scripts/build_sm90a_fa4_hd256.py"
+python = "{env:PYREF}"
+args = ["{out}/assets", "24", "4"]
+
 [emit]
 emit = "devblob+cubin"
 args = []
@@ -188,6 +205,7 @@ PLOW_DECODE_BATCH = "4"
 PLOW_DECODE_BATCH_LADDER = "1,2,4,8,16,32,48"
 PLOW_EMIT_PREFILL_CUBLASLT = "1"
 PLOW_EMIT_GEN_KERNELS = "attn_pf_hd256_causal_ilv,attn_dec_hd256_gqa6_ilv"
+PLOW_EMIT_ATTN_LIBRARY = "1"
 # Row-interleaved full-attention KV ([slot][ctx][kvh][hd]): the live-KV allocator charges
 # 1024-row blocks instead of a 4096-row block per head (4.2K-row slot 512 -> 320 MiB). build97:
 # step_bench digests identical to build96 at 20 (B, ctx) cells incl. the VMM boundaries; grid97

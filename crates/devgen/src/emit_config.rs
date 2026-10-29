@@ -83,7 +83,9 @@ pub struct EmitConfig {
     #[arg(long, env = "PLOW_W8A16", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
     pub w8a16: bool,
 
-    /// MXFP4 (A4W4) encoding — both operands are 4-bit with E8M0 microscales.
+    /// MXFP4 weights with E8M0 microscales. Dense projections (ops 91-93) keep bf16 activations
+    /// (w4a16); only the grouped MoE A4W4 kernels (gfx950, `moe_glu_a4w4_kw.h`) also take fp4
+    /// activations.
     #[arg(long, env = "PLOW_MXFP4", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
     pub mxfp4: bool,
 
@@ -1668,6 +1670,11 @@ pub struct EmitConfig {
     #[arg(long, env = "PLOW_NO_GLU_FUSE", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
     pub no_glu_fuse: bool,
 
+    /// Serve this rung's lone global hd512 `FlashPrefill(Fp8)` segments with the library route
+    /// (`libplow_fa4_hd512.so` in the out dir; `library_attention.rs`). Per rung.
+    #[arg(long, env = "PLOW_EMIT_ATTN_LIBRARY", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
+    pub attn_library: bool,
+
     /// Emit TMA descriptors for GEMM operands (sm_90a+).
     #[arg(long, env = "PLOW_TMA_GEMM", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
     pub tma_gemm: bool,
@@ -2252,6 +2259,7 @@ impl EmitConfig {
             moe_stage1_body: env_bool("PLOW_MOE_STAGE1_BODY"),
             moe_stage2_body: env_bool("PLOW_MOE_STAGE2_BODY"),
             no_glu_fuse: env_bool("PLOW_NO_GLU_FUSE"),
+            attn_library: env_bool("PLOW_EMIT_ATTN_LIBRARY"),
             tma_gemm: env_bool("PLOW_TMA_GEMM"),
             gemma4_sm90_gemm_glu_role: env_bool("PLOW_GEMMA4_SM90_GEMM_GLU_ROLE"),
             gemma4_sm90_w8a8_gemm_glu_role: env_bool("PLOW_GEMMA4_SM90_W8A8_GEMM_GLU_ROLE"),

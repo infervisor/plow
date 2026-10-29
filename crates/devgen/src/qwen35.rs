@@ -1574,6 +1574,12 @@ pub(super) fn run(
         )
         .unwrap_or_else(|error| panic!("generated kernels: {error}"));
     }
+    // PLOW_EMIT_ATTN_LIBRARY: the declared library segments keep the roles chosen above.
+    let selected = crate::library_attention::apply_output_object(&m, &mut sections, Path::new(out))
+        .unwrap_or_else(|error| panic!("library attention: {error}"));
+    if selected > 0 {
+        eprintln!("  library prefill attention: {selected} segments");
+    }
     let lean = apply_verify_gate(&m, verify);
     let man = manifest::build(&m, arch, &lean);
     crate::report_dispatch_audit(&man);

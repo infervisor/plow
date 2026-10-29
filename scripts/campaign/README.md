@@ -13,6 +13,15 @@ python3 scripts/campaign/campaign.py ledger  /nvme/run/<id>/c1/results.csv --cel
 
 ## The method
 
+0. **HARD RULE: screen on a single block first.** A kernel/fusion/route/knob candidate is
+   measured on one block at the served shape, precision, flags, rung width and context against a
+   calibrated roofline for that block (`docs/bringup/05-single-block-sweep.md`; NVIDIA
+   `block_run bench` + `block_roofline.py`, AMD `block-roofline` / `block-bench` / `block-ab`
+   below). Whole-network `step_bench` (`rung-sweep`), `gate` and serving grids run only for a
+   block-level winner, and the campaign report starts with the block-vs-roofline table (block
+   time, roofline floor, % of floor, delta vs current). Harness gaps:
+   `docs/bringup/agent-tools.md` "HARD RULE". The baseline of every comparison is the
+   same-concurrency vLLM peer, never plowrt's own production packet.
 1. **Fix the cell first.** A cell is `(model revision, weight/KV dtype, GPU SKU,
    TP, prompt/output shape, concurrency, cache policy, client protocol)`. The
    reference engine runs the same client binary with the same flags on the same
@@ -280,10 +289,13 @@ campaign.py rung-sweep ... --stage verify      # mixed packet; per-rung program 
   flash segment" warning is an AMD relaunch concern.
 - Packed prefill is default-on only for BF16 Hopper packets; W8A8 needs
   `PLOW_EMIT_PACKED_PREFILL=1` explicitly or the roles have no metadata.
-- **Prefix cache.** plowrt serves with the prefix cache ON by default; vLLM-bench's random
-  prompts share long prefixes, so cells silently become cache-hit suffixes (a 128-token
-  request ran as a 39-row token batch after a 96-row hit). The vLLM references ran with
-  prefix caching disabled: every vLLM-matched recipe sets `PLOW_PREFIX_CACHE=0`.
+- **Prefix cache.** plowrt serves with the prefix cache ON, and it stays on in every recipe and
+  release (`PLOW_PREFIX_CACHE=0` / `PLOW_VMM_PREFIX=0` only as an attribution arm). vLLM-bench's
+  random prompts share long prefixes, so cells silently become cache-hit suffixes (a 128-token
+  request ran as a 39-row token batch after a 96-row hit). Match the arms with unique prompts per
+  cell and repeat (`llm_grid.sh`; `waterfall.py` fails a reference hit rate > 5%) and the
+  reference's prefix cache on, not by disabling plow's cache. Older trial recipes that set
+  `PLOW_PREFIX_CACHE=0` predate this rule; do not copy them.
 - A W8A8 packet loads `fp8/…` twins from any safetensors in `checkpoint/`;
   compose a directory (BF16 shards + `fp8-model.safetensors`) and point
   `checkpoint_dir` at it.

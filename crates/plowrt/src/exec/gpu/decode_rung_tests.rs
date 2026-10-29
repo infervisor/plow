@@ -162,6 +162,7 @@ fn cublaslt_fixture() -> (DevBlob, SegmentRoles) {
                     plow_asset::segment_roles::INTERPRETER,
                     plow_asset::segment_roles::CUBLASLT,
                 ],
+                library: Vec::new(),
             })
             .collect(),
     };

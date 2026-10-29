@@ -923,3 +923,205 @@ subsampling (`asr_subsampling.rs`), VAD (`vad.rs`), codec LMs and audio codecs (
 `crates/plow-asset/src`. Their ops, ABI and state are documented per pipeline in
 docs/arch/20-asr-pipelines.md and docs/arch/24-tts-pipelines.md (and docs/runtime/asr.md,
 tts.md, asr-packet-contract.md).
+
+## 8. Backend parity
+
+Checked against the code (prod-next 29f5f4f02 + b43fcdc5b), not the docs. Techniques move both
+ways between backends; this section says which backend serves each technique today and what the
+others need.
+
+Cell values:
+- **served**: devgen emits it for the target AND that backend dispatches it in a full-model
+  serving path (interpreter `case PLOW_DOP_*`, objects, runtime). "No recipe" = the arm is
+  compiled but no production recipe qualifies it there.
+- **emitted-not-served**: devgen emits it (or only a `--block` extraction), but the backend does
+  not serve it end to end (arm compiled out, no case, refused at load).
+- **missing**: neither.
+
+Build facts behind the NVIDIA columns:
+- `interp_sm90a.cu` and `interp_sm89.cu` `#include "interp_sm120.cu"`. All three CUDA
+  interpreters share one source and differ only in defines.
+- `interp_sm120.cu` defaults `PLOW_NV_MLA`, `PLOW_NV_DSA` and `PLOW_NV_MAMBA` to 1.
+- The sm_90a and sm_89 objects force all three to 0 to save cubin size and stack: `_nv_var_sm90a`
+  / `_nv_var_sm89` in `runtime/CMakeLists.txt`, and `GEMMA_GATE` in `scripts/build_sm90a_cubin.sh`.
+  A gated-out opcode traps, so on sm_90a/sm_89 those arms are compiled out, not unwritten.
+- The CUDA runtime (`exec/gpu`) is one path for every `sm_` target.
+
+Notes on "served" for sm_89: the CUDA runtime (`exec/gpu`) is one path for every `sm_` target, so
+runtime features follow the interpreter arms; sm_89 recipes cover Gemma-4 E4B, Llama TTS, Qwen3 ASR,
+fastconformer RNNT, fish-s2.
+
+### Attention, latent/sparse/memory, recurrent
+
+| Technique | sm_90a | sm_120 | gfx942 | CPU |
+|---|---|---|---|---|
+| Causal GQA flash + split-KV merge + FP8 KV | served | served (sm_89 too) | served | served (golden/AVX-512) |
+| Sliding window / hybrid layouts | served | served | served | served |
+| KV-shared tail | served | served (same CUDA engine) | missing | missing |
+| Attention sinks / logit softcap | served | served | served | served |
+| Library attention route (FA4 hd512) | served | missing (SM90 export only) | missing | n/a |
+| MLA | emitted-not-served (arms gated out) | emitted-not-served (decode ops only) | served (also gfx950) | missing |
+| DSA lightning indexer | emitted-not-served (arms gated out) | emitted-not-served (decode index only) | served (also gfx950) | missing |
+| Compressed KV (CSA) | missing | missing | emitted-not-served (op 213 only) | missing |
+| Engram | missing | missing | emitted-not-served (kernel, no case) | missing |
+| Hyper-connections (mHC) | missing | missing | served (PLOW_K3 objects) | missing |
+| AttnRes | missing | missing | served (K3 objects) | missing (golden arm, no emit) |
+| Recurrent state contract | served (block store State) | n/a (no recurrent emit for sm_120) | served (slot snapshot) | missing |
+| Conv history | served (GDN ops) | missing (no GDN emit) | served (KDA conv) | missing |
+| Gated DeltaNet | served | missing (arms compile, no emit) | missing (arms gfx950, emit refused) | missing |
+| KDA | missing | missing | served | missing |
+| Mamba-2 | missing (arm gated out) | emitted-not-served (block only) | missing | missing |
+
+### MoE, precision, drafting, media
+
+| Technique | sm_90a | sm_120 | gfx942 | CPU |
+|---|---|---|---|---|
+| MoE routing, Gemma-style (softmax top-k, router score/topk split) | served (26B recipes) | served, no recipe | served (`PLOW_MOE_GEMMA` arms) | served (26B `amx` recipe) |
+| MoE routing, sigmoid + bias + group-limited (GLM/DeepSeek/Kimi) | missing (prefill topk only) | missing | served (GLM-5.3, Kimi-K3 recipes) | missing (prefill topk only) |
+| MoE experts, Gemma GLU/down/combine (+ cuBLASLt grouped route) | served (26B recipes; `moe_lt.rs`) | served, no recipe (Lt route sm_90a) | served | served |
+| MoE experts, generic GLU/down, grouped prefill, FP8-block experts | missing | missing | served | missing |
+| MoE experts, MXFP4 (GPT-OSS ops 150-153) | emitted-not-served (no recipe) | emitted-not-served (no recipe) | missing (refused) | dispatch only (no recipe) |
+| Expert parallelism | missing | missing | emitted-not-served (opt-in) | missing |
+| Muse gated residual / norms | missing | missing | missing (gfx950 only) | missing |
+| W8A16 (FP8 weights, bf16 acts) | served (26B/31B FP8) | served (sm_89 FP8 recipes not verified) | served (GLM-5.3 FP8) | dispatch only (no recipe) |
+| W8A8 (FP8 weights + acts) | served (`PLOW_NV_W8A8` arms) | served, no recipe | served | dispatch partial (no recipe) |
+| Block-scaled FP8 128x128 (ops 107 + blk GEMV/GLU) | emitted-not-served (decode only) | same as sm_90a | served | missing |
+| Block-scaled FP8 32x32 ue8m0 (op 216) | missing | missing | missing (gfx950 only) | missing |
+| MXFP4 dense projections (ops 91-93 family) | emitted-not-served (decode GEMV only) | same | served (Kimi-K3 recipe) | dispatch only (no recipe) |
+| FP8 KV cache | served | served (sm_89 recipes) | served | dispatch only (no recipe) |
+| Library GEMM routes (cuBLASLt / hipBLASLt) | served (segment roles) | served, no recipe (Lt is CUDA-generic) | served (`amd_gemm_lt.rs`) | n/a |
+| MTP chain drafter + verify | served (`exec/gpu/spec*.rs`) | served, no recipe | missing | missing |
+| DSpark block drafter | emitted-not-served (refused) | emitted-not-served | missing | missing |
+| Multimodal soft tokens (ops 206-210) | served (trial recipes only, `mm_parity` gate) | served, no recipe | missing (refused) | missing (refused) |
+| Encoder overlay rows (ASR audio, TTS conditioning) | served (ASR/TTS recipes) | served (sm_89 ASR/TTS recipes) | missing | missing |
+| Speech front-ends (conformer, RNNT, codec LM, f32 speech ops) | served | served (sm_89 recipes) | missing | missing (4 of 7 f32 ops) |
+
+### What each missing cell needs
+
+- **KV-shared tail on gfx942**: needs a port of the runtime gather (`crates/plowrt/src/exec/gpu/shared_tail.rs` `shared_tail_enqueue`/`shared_tail_rows`) into `exec/amd.rs`, reading the same `kv_shared_tail` section (`crates/plow-asset/src/kv_shared_tail.rs`). No new device op: it reuses the flash ops over the source layer's cache.
+- **KV-shared tail on CPU**: the same gather in `serve/cpu_serve.rs`'s prefill path. Not verified whether any CPU emit carries the section.
+- **Library attention on sm_120**: needs an FA4 export for SM120 (`scripts/build_sm90a_fa4_hd512.py` targets the SM90 forward only) and a `kv_dequant` cubin built for sm_120 (`runtime/nvidia/kv_dequant_sm90.cu`). The host route `exec/gpu/lib_attention.rs` is arch-neutral apart from its object names.
+- **Library attention on gfx942**: needs a ROCm library with the plow_fa4 C ABI (abi 2: create, run, dtype, destroy; `lib_attention.rs:283-330`), e.g. a CK or aiter FMHA export, plus a HIP port of the FP8 page gather. The host route must also move into `exec/amd.rs`: one table upload per launch, consumer waits rewritten to stream order (`ordered_waits_for`), and the fallback to the native role.
+- **MLA on sm_90a**:
+  - Decode: rebuild the sm_90a object with `-DPLOW_NV_MLA=1`. That brings in ops 50, 54 and 57 (`op_mla.cuh`). Their tuning (`d_flash_mla_decode<512,64,8>`) is sm_120's; sm_90a has no wgmma latent kernel.
+  - Prefill (none exists on any CUDA arch): op 51 `FlashMlaPrefill`, op 52 `OUvFold`, and the FP8 latent ops 109/110. The templates are AMD `exec_flash_mla_prefill` (`interp.hip:2485`), `mla_fold_pf_mfma.h`, `mla_bmm_fp8_pf.h`, or the materialized path (ops 126/127, `mla_materialize_pack.hip`).
+  - ABI: `live_kv` `Cache` (`crates/plow-asset/src/live_kv.rs:19`) describes K/V *pairs* of one shape. MLA needs a latent cache kind: `ckv` (kv_lora_rank wide, heads=1), `krot` (rope width) and optional fp8 `scale`. `serve.json` `KvGeometry` (`serve_manifest.rs:186`) needs the latent and rope widths.
+  - Block store: `exec/gpu/kv_blocks.rs` `Class {Window, Tail, Scale, State}` sizes rows from `KvGeometry` heads x hd. It would need per-tensor row bytes for `ckv`/`krot` (Tail-like, 32-row prefix blocks) and a Scale entry for the fp8 latent.
+  - Runtime: the CUDA engine has no MLA row patching. `exec/kvrow.rs` MLA rows and `mla_live_nsplit` are consumed only by `exec/amd.rs`; `exec/gpu` would need the same write-row/nsplit handling.
+- **MLA on sm_120**:
+  - Missing ops: 51/52 (prefill and fold), 109/110 (FP8 latent) and 106 `MlaOutGate` (K3); same templates as above.
+  - Missing in devgen: an NVIDIA target path. The MLA prefill emitter always emits op 51 (`mla.rs:9443,9600,10457`), and no NVIDIA opcode-coverage gate exists (`check_gfx950_opcode_coverage` runs only for AMD), so a CUDA MLA packet would trap at the first prefill.
+  - The KV/runtime gaps are the same as for sm_90a.
+- **MLA on CPU**: needs golden C bodies for ops 50/51/52/57 (none in `runtime/cpu/dev/golden`). The template is the Rust oracle `runtime/tests/mla_ref.rs`.
+- **DSA on sm_90a**: rebuild with `-DPLOW_NV_DSA=1` for decode `IndexScore`/`IndexSelect` and `FlashGatherDecode` (54, needs MLA=1 too). Plus everything listed under sm_120.
+- **DSA on sm_120**:
+  - Prefill indexer ops are missing: `IndexScorePf`, `IndexSelectPf`, `IndexUnionPf` (AMD `interp.hip:5645-5742`) and `FlashGatherPrefill` 55. Templates: `op_attention_common.h` (`d_index_*`, the gather instantiation of the MLA prefill).
+  - K3 pooled-indexer ops are missing: `IndexScoreKpool`, `DsaPoolCompress/Expand/Stash`, `DsaQQuant` (AMD, `PLOW_K3`).
+  - KV: an index-key cache `kv.L.kidx` (per-row index head dim) needs a block-store row class or per-tensor Tail rows. The K3 pooled cache (one row per `ratio` tokens) needs a pooled class whose block boundary is in pool rows, not token rows.
+  - `ctx_bound.rs` already knows `IndexScore*` for context bounds.
+- **DSA on CPU**: golden bodies for the index and gather ops; none exist.
+- **CSA on all backends**:
+  - AMD: `op_compress.h` kernels exist and are included by `interp.hip:328`, but only op 213 `RopeInverseO` has a case (`interp.hip:6695`). Ops 212 `CompressPool` and 217 `CompressRopeQuant` need `case` arms and `GFX950_DISPATCHED` entries.
+  - devgen: the `deepseek_v41` full emit refuses (`lib.rs:9533`); only `--block` plans emit.
+  - KV: a compressed cache written on the `kv_source` layers and read by every layer; a new row class, since its rows are per compressed block.
+  - NVIDIA/CPU: no kernels; port from `op_compress.h`.
+- **Engram on all backends**:
+  - AMD: `op_engram.h` (ops 214/215) is not even included by `interp.hip`, so it needs the include, the case arms and `GFX950_DISPATCHED`.
+  - Host side: the hashed n-gram ids (tokenizer-derived map and lookback cache, per `dsv41_refusal`) have no runtime path in `exec/amd.rs` or `exec/gpu`.
+  - No KV class; the lookback is per-request host state.
+  - NVIDIA/CPU: port both ops from `op_engram.h`.
+- **Hyper-connections on sm_90a/sm_120**:
+  - Needs ops 128/129 with their modes, ported from `runtime/amd/op_hyperconn.h` (Sinkhorn mix, `hc_mix_decode.hip` decode fold) and the `PLOW_GLM_HC_POST_FOLD` variant (op 135 with 129 folded).
+  - The residual stream is `hc_mult` x hidden, so every row-op width in the CUDA arms must accept the widened stream.
+  - `kvrow.rs:305-309` patches `T` for both ops on AMD only, so the CUDA packed-prefill metadata needs the same row field. No KV/state class.
+- **Hyper-connections on CPU**: golden bodies for 128/129; none.
+- **AttnRes on sm_90a/sm_120**:
+  - Needs op 104 from `runtime/amd/op_k3.h`. The CPU golden arm (`runtime/cpu/dev/golden/control.c:83`, AVX-512 `gemv.c:371`) is a second, exact template.
+  - The block-residual ring (`blkres`) is excluded from the KV contract, so a prefix attach or chunk split must not span a block boundary without carrying it. The CUDA token-batch/packed-prefill path would need the same carry rule as AMD (not verified in detail).
+- **AttnRes on CPU**: the dispatch exists but no CPU emit targets K3. It needs the K3 emitter (`k3.rs`, AMD-shaped) to allow a CPU target.
+- **Recurrent state contract on CPU**: needs the `recurrent_state` buffers wired into `serve/cpu_serve.rs` (zero on admit, active mask), plus golden bodies for the GDN/KDA ops. None are registered in `runtime/cpu`.
+- **Conv history on sm_120**: follows GDN below.
+- **Conv history on CPU**: needs golden conv-state bodies (ops 136/143).
+- **GDN on sm_120**:
+  - The arms compile under `PLOW_NV_QWEN_GDN=1`, which the manifest requires (`manifest.rs:1569`).
+  - The emitter builds the manifest for sm_90a only (`qwen35.rs:1360`, "NVIDIA-shaped").
+  - The prefill scan is `libplow_gdn_prefill.so`, a CuTe export for SM90 (`scripts/export_gdn_prefill_sm90.py`), launched host-side from `exec/gpu.rs:7249`. sm_120 needs its own export or the interpreter `QwenGdnConvPrefill` path.
+- **GDN on gfx942**:
+  - The ten arms exist (`op_qwen_gdn.h`), but only gfx950 builds set `PLOW_QWEN_GDN=1` (`build_gfx950.sh:271,438`).
+  - devgen refuses AMD (`qwen35.rs:1376`, `AMD_QWEN_EMIT = false`, `AMD_GDN_PREFILL = false`): it needs an AMD emitter path, a chunked HIP prefill body plus its adapter, and the arms in a gfx942 build.
+  - The recipe `recipes/infervisor/qwen3.5-gdn/gfx942-mi300x-tp1.toml` is `status = "refused"`.
+- **GDN on CPU**: golden bodies for the GDN ops.
+- **KDA on sm_90a/sm_120**:
+  - Needs the decode ops (`KdaConv`, `KdaGate`, `KdaStateStep`, `KdaGatedNorm`) and the four chunked-prefill ops, ported from `runtime/amd` (`PLOW_K3`, `PLOW_KDA_CHUNK`).
+  - State: KDA keeps its state in `kv.*` tensors on AMD. On CUDA that state would have to be declared in `recurrent_state` so the block store's State class captures it.
+  - `kda.rs` is AMD-shaped (gfx950 checks at `kda.rs:689`).
+- **KDA on CPU**: golden bodies; none.
+- **Mamba-2 on sm_90a**: needs a rebuild with `-DPLOW_NV_MAMBA=1` (`op_mamba.cuh`, op 90). On every backend it also needs a full-model Nemotron emit, since `lib.rs:9624` refuses all but `--block`, plus state declared in `recurrent_state`.
+- **Mamba-2 on gfx942/CPU**: no kernel. Port `op_mamba.cuh`.
+- **Sigmoid/bias/group MoE routing on sm_90a/sm_120**: decode `MoeRouterTopk` (op 56) and `MoeRouter`
+  (op 40) arms in `interp_sm120.cu` (only `MOE_ROUTER_TOPK_PF` exists, under `PLOW_NV_MOE_COMMON`);
+  template `runtime/amd/op_moe.h` router; the GLM/DeepSeek emitters (`mla.rs`) are AMD-gated
+  (`emit_is_amd()` sites), so devgen also needs an NVIDIA target path.
+- **Sigmoid/bias/group MoE routing on CPU**: decode router entries in `runtime/cpu/dev/*` tables (only
+  the `_PF` top-k, align and combine are there).
+- **Generic MoE experts on sm_90a/sm_120**: `MoeExpertGlu`/`MoeExpertDown` (decode), `MoeGroupGluPf`/
+  `MoeGroupDownPf` (prefill) and the `_FP8_BLK` twins; the Gemma grouped route (`moe_lt.rs`,
+  `runtime/nvidia/moe_lt_sm90.cu`) is the template for a cuBLASLt grouped version; AMD
+  `op_moe.h` / `moe_glu_a4w4_kw.h` for the native one.
+- **Generic MoE experts on CPU**: expert GLU/down entries in the CPU tables (Gemma ones exist).
+- **MXFP4 MoE (ops 150-153) on sm_90a/sm_120**: arms exist (`interp_sm120.cu:2878`,
+  `interp_sm90a_mxfp4_moe.cu`) and devgen emits for non-AMD (`gptoss.rs`), but there is no production
+  recipe or gate; needs a qualified GPT-OSS recipe and the FP32 gate. (Not verified end to end.)
+- **MXFP4 MoE on gfx942**: AMD has no 150-153 arms; `check_gfx950_opcode_coverage`
+  (`lib.rs:10201`) refuses the emit; AMD serves MXFP4 experts through its own grouped ops with
+  the weight encoding in `i3` instead, so the GPT-OSS emitter would need to lower to those.
+- **MXFP4 MoE on CPU**: CPU tables have 150-153; needs a recipe/gate.
+- **Expert parallelism on NVIDIA/CPU**: an all-to-all collective arm (`XAllToAllHeads`, AMD-only,
+  `interp.hip:7602`, gated by `PLOW_HAS_XALLTOALL_HEADS`) and multi-GPU MoE dispatch in
+  `exec/tp.rs`; AMD itself is opt-in (`emit.moe_prefill_ep`, `emit.glm_ep`, both OFF/OptIn).
+- **Muse gates**: arms exist only under `PLOW_QWEN_GDN` in `interp.hip` and serve on gfx950
+  (`muse-spark-open` recipe); gfx942 needs the coverage gate lifted after a gfx942 gate run; NVIDIA
+  and CPU need the four ops (226-229) ported from the AMD arms.
+- **W8A16 / W8A8 on CPU**: tables carry `GEMV_FP8`, `GEMV_QKV_FP8`, `GEMM_*_FP8` (golden/avx512/neon
+  `fp8.c`) but no FP8 CPU recipe; needs a CPU FP8 recipe and gate. W8A8 `GEMM_FP8`/`QUANT_FP8` CPU
+  entries not verified.
+- **Block FP8 128x128 on sm_90a/sm_120**: decode GEMV/dense-GLU arms exist (`GEMV_FP8_BLK`,
+  `DENSE_GLU_FP8_BLK` under `PLOW_NV_GEMMA`); missing the prefill `GemmFp8Blk` (op 107) and the MoE
+  `_FP8_BLK` expert ops; template AMD `d_gemm_t<...>` in `op_gemm_common.h`, or a cuBLASLt
+  block-scaled route (13.x block scales, not verified).
+- **Block FP8 32x32 (op 216)**: only `interp.hip` under `PLOW_DSV41_BLKFP8` (gfx950); every other
+  backend needs the `d_gemm_fp8_mx` instantiation; the DeepSeek-V4.1 emit is refused everywhere
+  except the block path (`dsv41_refusal`).
+- **MXFP4 dense on sm_90a/sm_120**: decode `GemvMxfp4` exists (`PLOW_NV_MXFP4_PROJ`); missing
+  `GemvGluMxfp4`, `GemvQkvMxfp4` and every prefill `Gemm*Mxfp4` arm; template `d_gemm_mxfp4` (AMD).
+- **FP8 KV on CPU**: `FLASH_*_FP8` tables exist; needs a CPU FP8-KV recipe and gate.
+- **MTP + verify on AMD/CPU**: the speculative serve path is `exec/gpu/spec.rs`, `spec_serve.rs`,
+  `spec_draft.rs` only; AMD needs a draft-program launch, verify rows in the packed launch and
+  KV rollback in `exec/amd.rs`; CPU the same in `exec/cpu/engine.rs`.
+- **DSpark on every backend**: `spec_serve.rs:65` rejects block drafters; needs the block-draft
+  verify loop and the drafter-context tail consumer (`spec.context.json`) in the serve path.
+- **Multimodal on AMD/CPU**: ops 206-210 arms (`RMSNORM_F32`, `ROPE_AXIAL_F32`, `CHUNK_ATTENTION_F32`,
+  `MM_ROWS_BF16`, `MM_SPAN_EXTENT`) and the `Embed` pad immediate; `mm::check_target`
+  (`crates/devgen/src/mm.rs:32`) refuses non-`sm_` targets.
+- **Encoder overlay / speech on AMD**: the f32 speech ops (`op_speech_f32.cuh`: 7 ops) and
+  `in.encoder_overlay` handling (`exec/gpu/token_batch.rs`, `ctx_bound.rs`) have no AMD arms.
+- **Speech on CPU**: CPU has `LENGTH_AFFINE_U32`, `REDUCE_ROWS_F32`, `STREAM_TAIL_F32`,
+  `TRIM_SILENCE_F32`; missing `CHUNK_ATTENTION_F32`, `RMSNORM_F32`, `ROPE_AXIAL_F32`.
+
+### NVIDIA → AMD candidates
+
+Runtime features that exist on CUDA and are absent or partial on AMD (`exec/amd*`).
+
+| Feature | CUDA (prod-next) | AMD (exec/amd*) | What AMD would need |
+|---|---|---|---|
+| KV block store row classes (Window / Tail / Scale / State, content-addressed blocks, device + host slabs) | `memory/kv_store.rs`, `exec/gpu/kv_blocks.rs`; the only CUDA boundary storage | not used: `kv_store` users are `exec/gpu*`, `serve/*`, `memory/vmm.rs` only; AMD keeps `SharedPrefix` (`exec/amd/shared_prefix.rs`): VMM-shared full blocks + slot snapshots, roles `ckv`/`krot`/`kidx`/`scale` | a `SnapBlocks` implementation over HSA memory (`enable_block_store` in `memory/vmm.rs` is backend-generic), row-class extraction for AMD layouts (latent `ckv`/`krot` as Tail, index keys, recurrent `state.*` as State), gather/scatter kernels (template `runtime/nvidia/kv_*`), and the boundary tree wired in `exec/amd/prefix.rs` |
+| F1 copy path (per-block gather/publish descriptors in launch params, event-sealed publish, host restores ahead of admission, state attach in the first chunk gather) | `kv_blocks.rs` `blocks_publish`/`blocks_gather`/`blocks_seal_after`/`state_init_gather`; merge e75dc6c75, 054022109 | none (depends on the block store) | the block store first; then HSA signals in place of CUDA events for the seal, and gather descriptors in the AMD launch kernargs |
+| Library attention route (FA4 hd512 via `lib_attention.rs`, one table upload per launch; `attention_gemm.rs`) | sm_90a, FP8 KV hd512 prefill; selected by the objects the packet carries (`PLOW_BUILD_FA4_HD512`) | AMD has vendor routes of its own kind: pinned AITER `.co` MLA decode and fmoe kernels, `amd_moe_aiter.rs`, `amd_sparse_mla.rs`; no library flash prefill for dense GQA | an AMD library flash prefill (e.g. a CK/AITER FA export) with the same packet-declared object selection and table upload; the adapter pattern of `kv_dequant_sm90.cu` for FP8 KV |
+| Per-rung route selection (`[emit.rung_env]`, `segment_roles` per bucket) | devgen per-rung knobs (`.per_rung`, `PLOW_NO_GLU_FUSE`), CUDA segment roles | devgen side is target-generic; AMD object selection per bucket via `plow_config.h` `PLOW_HAS_*` (`interp.hip:144`) | not verified whether AMD loaders honor per-rung segment roles; needs a mixed-rung AMD emit test |
+| Unified token batch: decode riders in packed prefill | `exec/gpu/token_batch.rs`, `riders.rs` | `exec/amd/token_batch.rs`: load-time gate for dense-GQA phase 2; KDA riders (`PLOW_AMD_RIDER_KDA`, `exec/amd.rs:2940`) | rider arms for MLA/DSA and GDN chains (AMD serves those models); the dense-GQA phase-2 pair is gated, not served by a recipe |
+| Split-KV riders (`PLOW_TB_SPLIT_ATTN`, `plow_<arch>_rider_*`) | sm_90a decode objects | none | rider split-KV flash kernels in the AMD decode object (template `rider_flash512/256` in the sm_90a decode object) |
+| Spec ride (`PLOW_SPEC_RIDE`, drafts riding the prefill launch) | `exec/gpu/spec*.rs` | none (no spec decode on AMD) | spec decode on AMD first |
+| Packed admission, in-flight prefix wait (`PLOW_PREFIX_INFLIGHT_WAIT`), chunk publish | `exec/gpu/prefix.rs`, CUDA packed prefill | none found in `exec/amd*` | the block store's in-flight publish; AMD packed admission in `exec/amd/packed.rs` |
+| Stage fusion: decode router windows as light launches (`plow_<arch>_light_router`) | `exec/gpu/cublaslt.rs` (light router), `interp_sm120.cu:4119`; merge 1a1f1e06f | none (`light_router` absent from `runtime/amd`, `exec/amd*`) | an AMD light-launch kernel for the router window opcodes (`plow_light_router_ops` set) and host launch between hipBLASLt GEMMs in `amd_gemm_lt.rs` |
+| Prefix-cache host tier | block store host slab, `host_tier_default` | present: `shared_prefix.rs:464-494` arms an AMD host tier from `vmm_host_cache_bytes()` (snapshot host tier, `0`/unset = off) | align the default (CUDA auto-sizes; AMD off unless set) after the block store lands |
+| Live KV (frontier-committed KV, `PLOW_VMM_LIVE`) | `live_kv` section, 4096-row commit blocks | present: `SharedPrefix::ensure_rows` (`shared_prefix.rs:528`) and `PLOW_VMM_KV` (VMM KV on ROCr) | parity exists in substance; the packet `live_kv` section is CUDA-read (not verified on AMD) |

@@ -4,7 +4,7 @@
 // (runtime/amd/op_attention.h: d_flash_mla_decode + d_o_uv_fold). It implements the
 // ABSORBED formulation — the exact math the kernel runs — in f32, reading the same
 // bf16-rounded inputs the device consumes, so kernel and reference share float
-// associativity down to bf16 tolerance (sparse-attn-design.md §2.6).
+// associativity down to bf16 tolerance.
 //
 // MLA recap. The KV cache stores a low-rank latent per token, head-SHARED:
 //     C_kv[t]   in R^DK   (kv_lora_rank, DeepSeek 512)

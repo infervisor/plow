@@ -335,3 +335,34 @@ same packet): 0.45 throughput 0.95x, TTFT P99 4.55x, TPOT P99 1.84x, SLO met 69.
 55.6 %, goodput 1.05 / 1.10 req/s, TPOT P50 125 / 67 ms). The c1/c8/c32 gaps are the decode step,
 not the cache (prefix-off control at c32: 708 out tok/s vs 682 with the cache on).
 Raw evidence: `/opt/dlami/nvme/lava-tts/qwen-prefix/l18/{prod,grid,report-prod,report-grid}`.
+
+## 2026-10-29: full-attention prefill through the FA4 library route (BF16)
+
+**Result: qualified per-rung win, adopted on every prefill rung.** The library route lowers prefill
+time on every rung (128 rows -7.6 %) and improves production-mix TTFT / TPOT P99 against native in both
+repeats; the FP32 gate passes c1/c8/c32. `campaign.py report` MATCHED + EQUIVALENT on every cell; rows
+in [comparison.csv](comparison.csv) under `campaign_source` `q38-20261029-libattn-bf16`.
+
+- Infervisor: plowrt `a50a58555` (branch `lib-attn2`, prod-next 949e3fdb9 merged), packet
+  `48cf345c9314` (the recipe with `fa4-hd256-lib` and `PLOW_EMIT_ATTN_LIBRARY=1`): the 16 hd256
+  layers' prefill attention runs FlashAttention-4's SM90 forward from `libplow_fa4_hd256.so`
+  directly on the row-interleaved BF16 KV. Native arm = same binary and packet with
+  `PLOW_PF_ATTN_LIBRARY=0` (the generated role). Recipe serve env, host tier as on 2026-10-28.
+- Baseline: the vLLM 0.29 arms of the 2026-10-27 section (same seeds, same client).
+- Prefill, one 16000-token prompt (step_bench packed prefill), chunk 4096/1024/512/128:
+  1.403/1.517/1.784/4.325 -> 1.386/1.491/1.757/3.996 s. ctx 4094/4095/8191, 8 x 2048 and
+  16 x 1000: ties, no faults.
+- FP32 gate vs same-concurrency vLLM 0.28 peers, PASS c1/c8/c32: kl_trim 0.000456 / 0.000483 /
+  0.000448 (native 0.000448 / 0.000460 / 0.000483), top1_decisive 0.9988, cont_decisive 1 / 0.978 /
+  0.978 (native identical).
+
+| Cell (vs vLLM 0.29) | arm | Total throughput | TTFT P99 | TPOT P99 | SLO met |
+|---|---|---:|---:|---:|---:|
+| prod mix, 0.45 sessions/s | native | 1.00x | 1.33x * | 1.05x * | 99.3 % |
+| prod mix, 0.45 sessions/s | library | 1.00x | 1.15x * | 0.98x * | 99.9 % |
+| prod mix, 0.7 sessions/s | native | 1.00x * | 1.83x * | 0.49x | 51.3 % |
+| prod mix, 0.7 sessions/s | library | 1.01x * | 1.84x * | 0.48x | 52.2 % |
+
+`*` = repeat spread > 10% (FLAGGED; direction only). At 0.45 the library is ahead in each repeat
+(TTFT P99 1265 / 1744 vs 1559 / 1897 ms). 0.7 overloads both stacks on one repeat (vLLM SLO 54.4 %).
+Raw evidence: `/opt/dlami/nvme/lava-tts/lib-attn/decl/{qsb,qgate-lib,qgate-nat,qprod-lib,qprod-nat}`.

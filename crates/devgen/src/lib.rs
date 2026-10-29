@@ -55,6 +55,7 @@ mod block;
 mod gemma4_gemm_glu_role;
 mod gemma4_w8a8_gemm_glu_role;
 mod gen_kernels;
+mod library_attention;
 mod serve_section;
 mod w8a16_prefill_role;
 use block::{parse_block, write_block_descriptor};
@@ -9961,9 +9962,10 @@ fn dsv41_refusal(dir: &std::path::Path) -> String {
     }
 
     out.push_str(
-        " The runtime side is most of the way there -- mHC, the DSA indexer, the MXFP4 experts, \
-         the clamped SwiGLU, the CSA2 kernels (ops 212/213) and Engram (ops 214/215) all dispatch \
-         today. What the EMITTER still needs:",
+        " The runtime side is partly there -- mHC, the DSA indexer, the MXFP4 experts, the \
+         clamped SwiGLU and the CSA2 output de-rotation (op 213) dispatch today; the CSA2 \
+         compressor (ops 212/217) and Engram (ops 214/215) exist only as kernels \
+         (op_compress.h, op_engram.h) with no interpreter case yet. What the EMITTER still needs:",
     );
     for (i, gap) in mla::dsv41_gaps(&cfg).iter().enumerate() {
         out.push_str(&format!(" ({}) {gap};", i + 1));
@@ -11526,6 +11528,13 @@ fn emit_dense_gqa(
         )
         .unwrap_or_else(|error| panic!("Gemma-4 W8A8 GemmGlu object: {error}"));
         eprintln!("  Gemma-4 W8A8 GemmGlu: {selected} lean segments");
+    }
+    // Last: the declared library segments keep whatever native role the passes above chose.
+    let selected =
+        library_attention::apply_output_object(&m, &mut sections, std::path::Path::new(&out))
+            .unwrap_or_else(|error| panic!("library attention: {error}"));
+    if selected > 0 {
+        eprintln!("  library prefill attention: {selected} segments");
     }
     if let Some(live_position) = sections
         .iter()
