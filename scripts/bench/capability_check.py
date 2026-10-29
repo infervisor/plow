@@ -67,19 +67,24 @@ def main(argv: list[str]) -> int:
         return 2
     plowrt, assets = Path(argv[1]), Path(argv[2])
     extra = argv[argv.index("--waive") + 1] if "--waive" in argv else os.environ.get("PB_CAPABILITY_WAIVERS", "")
+    want = requested_routes(assets)
+    # Without a readable inventory a requested route cannot be shown declared: that fails.
+    unread = "FAIL" if want else "WARN"
     r = subprocess.run([str(plowrt), "inventory", str(assets), "--format", "json"], capture_output=True, text=True)
     if r.returncode != 0 or not r.stdout.strip():
         err = (r.stderr.strip().splitlines() or ["no output"])[-1][:160]
-        print(f"WARN\tplowrt inventory failed ({err}) — plowrt predates the subcommand, or the packet is not a devblob")
-        return 0
+        print(f"{unread}\tplowrt inventory failed ({err}) — plowrt predates the subcommand, or the packet is not a devblob")
+        return 1 if want else 0
     try:
         items = json.loads(r.stdout)
     except ValueError as e:
-        print(f"WARN\tplowrt inventory: malformed JSON ({e})")
-        return 0
+        print(f"{unread}\tplowrt inventory: malformed JSON ({e})")
+        return 1 if want else 0
     w = waivers(assets, extra)
-    want = requested_routes(assets)
     fails = 0
+    for name in sorted(set(want) - {it["name"] for it in items}):
+        fails += 1
+        print(f"FAIL\t{name}: the recipe requests it ({want[name]}) but the inventory has no such item")
     for it in items:
         name, state, detail = it["name"], it["state"], it["detail"]
         if name in want and state != "on":

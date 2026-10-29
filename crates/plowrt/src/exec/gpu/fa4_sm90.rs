@@ -424,7 +424,6 @@ fn forward(be: &CudaBackend, g: Geometry, p: &Prepared, c: &Call) -> Result<Laun
     Ok(l)
 }
 
-/// cutlass `FastDivmod`: divisor, multiplier, then the two shifts as bytes.
 /// The upstream host code encodes its tensor maps itself, not through the driver, and sets two
 /// flags the driver's encoder leaves clear: byte 8 bit 1 always, and byte 10 bit 5 when the last
 /// element's byte offset is at least 128 KiB. Reproducing them keeps the descriptors byte-equal
@@ -442,6 +441,7 @@ fn upstream_tmap_flags(m: &mut [u8; 128], elem: u64, dims: &[u64], strides: &[u6
     }
 }
 
+/// cutlass `FastDivmod`: divisor, multiplier, then the two shifts as bytes.
 fn divmod(l: &mut Launch, index: usize, d: u32) {
     let log2 = 32 - (d - 1).leading_zeros().min(32);
     let multiplier = ((1u64 << 32) * ((1u64 << log2) - u64::from(d)) / u64::from(d) + 1) as u32;
