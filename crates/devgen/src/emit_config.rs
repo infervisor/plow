@@ -83,7 +83,9 @@ pub struct EmitConfig {
     #[arg(long, env = "PLOW_W8A16", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
     pub w8a16: bool,
 
-    /// MXFP4 (A4W4) encoding — both operands are 4-bit with E8M0 microscales.
+    /// MXFP4 weights with E8M0 microscales. Dense projections (ops 91-93) keep bf16 activations
+    /// (w4a16); only the grouped MoE A4W4 kernels (gfx950, `moe_glu_a4w4_kw.h`) also take fp4
+    /// activations.
     #[arg(long, env = "PLOW_MXFP4", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
     pub mxfp4: bool,
 
