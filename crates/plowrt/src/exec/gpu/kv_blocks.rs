@@ -878,6 +878,26 @@ impl GpuEngine {
         bs.store.restoring_any(&ids)
     }
 
+    /// A slot's rings and tracks are about to be released or unmapped (`begin_seq` retires its
+    /// VMM pages on the host, outside stream order): the store copies still queued against them
+    /// (a deferred publish scatter, a gather's held sources) complete first.
+    pub(super) fn blocks_quiesce(&self) -> Result<()> {
+        let Some(bs) = self.kv_blocks() else {
+            return Ok(());
+        };
+        self.blocks_reap_seals();
+        let ts = std::time::Instant::now();
+        // Seals are recorded in engine-stream order: the newest covers every earlier copy, and
+        // not the steps queued after it.
+        let r = match bs.seals.lock().last() {
+            Some(p) => self.be.event_synchronize(&p.done),
+            None => return Ok(()),
+        };
+        bs.stats.lock().publish_sync_us += ts.elapsed().as_micros() as u64;
+        self.blocks_reap_seals();
+        r
+    }
+
     pub(super) fn blocks_unhold(&self, b: usize) {
         if let Some(bs) = self.kv_blocks() {
             bs.unhold_slot(b);
