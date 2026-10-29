@@ -467,9 +467,7 @@ pub(super) fn light_functions(
         be.module_global_u32(module, "plow_light_router_smem")?,
         be.module_global_u32(module, "plow_light_router_ops")?,
     ) {
-        (Some(smem), Some(ops))
-            if abi == Some(2) && crate::config::RuntimeConfig::get().nv.decode_light_router =>
-        {
+        (Some(smem), Some(ops)) if abi == Some(2) => {
             let f = be.get_function(module, &format!("plow_{arch}_light_router"))?;
             be.set_max_dynamic_smem(f, smem)?;
             Some((f, smem, ops))
