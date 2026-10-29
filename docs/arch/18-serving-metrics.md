@@ -129,6 +129,14 @@ latencies consequently have different boundaries.
 | `plowrt_requests_thinking_total` | Counter | Admitted chat requests whose rendered prompt has reasoning on |
 | `plowrt_reasoning_tokens_total` | Counter | Generated tokens attributed to the reasoning trace |
 | `plowrt_request_reasoning_tokens` | Histogram | Trace tokens per finished chat request that had reasoning on or produced a trace |
+| `plowrt_thinking_blocks_total` | Counter | Trace blocks of chat requests under thinking control (`thinking_token_budget` / `max_reply_tokens`) |
+| `plowrt_thinking_budget_forced_total` | Counter | Trace blocks whose budget ran out and whose end was forced |
+| `plowrt_reply_capped_total` | Counter | Chat requests ended by `max_reply_tokens` |
+| `plowrt_thinking_grace_tokens` | Histogram | Trace tokens past the budget spent waiting for a line end, per controlled request |
+| `plowrt_first_reply_token_seconds` | Histogram | Arrival to the first answer text after the trace, per thinking chat request |
+| `plowrt_reply_guard_moved_total` | Counter | Guarded responses (`reply_guard: "voice"`) with a planning line moved to reasoning |
+| `plowrt_reply_guard_fallback_total{kind=wait\|goodbye}` | Counter | Guarded responses left empty and answered with a fallback line |
+| `plowrt_reply_guard_answer_reasoning_total` | Counter | Guarded responses whose answer starts with Wait/Alternatively/Hmm/Actually, moved or not |
 | `plowrt_spec_ticks_total` | Counter | Decode ticks that ran at least one draft (`PLOW_SPEC`) |
 | `plowrt_spec_skipped_ticks_total{reason=...}` | Counter | Decode ticks of a speculating engine that carried no draft, by first blocker |
 | `plowrt_spec_eligible_rows_total` | Counter | Decode rows that could draft, summed over decode ticks |

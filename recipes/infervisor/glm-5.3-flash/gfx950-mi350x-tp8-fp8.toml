@@ -39,6 +39,7 @@ toolchain = "rocm-7.14.1-nix"
 # block-FP8 e4m3 [128,128] from the snapshot (`quantization_config` at the root of config.json).
 [checkpoint]
 source = "hf:zai-org/GLM-5.3-Flash"
+revision = "46a050bec13002ad29ee795c16e61cf4fa3c4a9c"
 shards = 62
 layout = "plow-glm53-flash"
 

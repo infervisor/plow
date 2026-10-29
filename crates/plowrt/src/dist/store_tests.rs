@@ -174,38 +174,41 @@ fn materializing_a_missing_blob_names_the_fix() {
 #[test]
 fn pins_are_recorded_listed_and_removed() {
     let (s, root) = store("pins");
-    assert_eq!(s.pinned("dist.infervisor.ai/infervisor/kimi-k3"), None);
-    s.pin("dist.infervisor.ai/infervisor/kimi-k3", "variant-a")
+    assert_eq!(s.pinned("pdist.infervisor.ai/infervisor/kimi-k3"), None);
+    s.pin("pdist.infervisor.ai/infervisor/kimi-k3", "variant-a")
         .unwrap();
-    s.pin("dist.infervisor.ai/acme/other", "variant-b").unwrap();
+    s.pin("pdist.infervisor.ai/acme/other", "variant-b")
+        .unwrap();
     assert_eq!(
-        s.pinned("dist.infervisor.ai/infervisor/kimi-k3").as_deref(),
+        s.pinned("pdist.infervisor.ai/infervisor/kimi-k3")
+            .as_deref(),
         Some("variant-a")
     );
     assert_eq!(
         s.pins(),
         vec![
             (
-                "dist.infervisor.ai/acme/other".to_string(),
+                "pdist.infervisor.ai/acme/other".to_string(),
                 "variant-b".to_string()
             ),
             (
-                "dist.infervisor.ai/infervisor/kimi-k3".to_string(),
+                "pdist.infervisor.ai/infervisor/kimi-k3".to_string(),
                 "variant-a".to_string()
             ),
         ]
     );
     // Re-pinning moves it; that is what `upgrade` does.
-    s.pin("dist.infervisor.ai/infervisor/kimi-k3", "variant-c")
+    s.pin("pdist.infervisor.ai/infervisor/kimi-k3", "variant-c")
         .unwrap();
     assert_eq!(
-        s.pinned("dist.infervisor.ai/infervisor/kimi-k3").as_deref(),
+        s.pinned("pdist.infervisor.ai/infervisor/kimi-k3")
+            .as_deref(),
         Some("variant-c")
     );
-    s.unpin("dist.infervisor.ai/infervisor/kimi-k3").unwrap();
-    assert_eq!(s.pinned("dist.infervisor.ai/infervisor/kimi-k3"), None);
+    s.unpin("pdist.infervisor.ai/infervisor/kimi-k3").unwrap();
+    assert_eq!(s.pinned("pdist.infervisor.ai/infervisor/kimi-k3"), None);
     // Unpinning what is not pinned is not an error.
-    assert!(s.unpin("dist.infervisor.ai/infervisor/kimi-k3").is_ok());
+    assert!(s.unpin("pdist.infervisor.ai/infervisor/kimi-k3").is_ok());
     let _ = std::fs::remove_dir_all(root);
 }
 

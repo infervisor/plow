@@ -255,6 +255,31 @@ pub struct ChatRequest {
     /// split from `content` and counted in `reasoning_tokens`).
     #[serde(default)]
     pub include_reasoning: Option<bool>,
+    /// vLLM's thinking budget: tokens allowed in each trace block before the server forces its
+    /// end (`reasoning_end`). `0` renders thinking off; `-1` is no budget. A hard cap.
+    #[serde(default)]
+    pub thinking_token_budget: Option<i64>,
+    /// plow extension: tokens allowed after the trace. Reaching it ends the request with
+    /// `finish_reason: "length"` and `x_plow_finish_reason: "reply_cap"`.
+    #[serde(default)]
+    pub max_reply_tokens: Option<u32>,
+    /// plow extension: what ends a trace block over budget (a bridge sentence, then the close
+    /// marker; empty = the marker alone).
+    #[serde(default)]
+    pub reasoning_end: Option<String>,
+    /// llama.cpp's names for `thinking_token_budget`.
+    #[serde(default)]
+    pub reasoning_budget_tokens: Option<i64>,
+    #[serde(default)]
+    pub thinking_budget_tokens: Option<i64>,
+    /// llama.cpp: text committed before the close marker when the budget ends a trace
+    /// (`reasoning_end` without the marker).
+    #[serde(default)]
+    pub reasoning_budget_message: Option<String>,
+    /// llama.cpp: `"none"` leaves the trace, tags included, in `content`; `"auto"` and
+    /// `"deepseek"` split it out as usual.
+    #[serde(default)]
+    pub reasoning_format: Option<String>,
 }
 
 impl ChatRequest {
@@ -265,6 +290,10 @@ impl ChatRequest {
         if let Some(m) = self.max_completion_tokens.take() {
             self.max_tokens = Some(m);
         }
+        self.thinking_token_budget = self
+            .thinking_token_budget
+            .or(self.reasoning_budget_tokens)
+            .or(self.thinking_budget_tokens);
         if let Some(effort) = &self.reasoning_effort {
             self.chat_template_kwargs
                 .get_or_insert_with(BTreeMap::new)
@@ -429,15 +458,36 @@ pub struct Message {
     pub name: Option<String>,
 }
 
+/// `system_fingerprint` of every chat and completion response (OpenAI: the backend configuration).
+pub const SYSTEM_FINGERPRINT: &str = concat!("fp_plowrt_", env!("CARGO_PKG_VERSION"));
+
+/// A trace under both names clients read it by: `reasoning` (vLLM) and `reasoning_content`
+/// (llama.cpp, SGLang, DeepSeek, and vLLM before its rename). Flattened into a message or delta;
+/// absent when there is none.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Reasoning<T>(pub Option<T>);
+
+impl<T: Serialize> Serialize for Reasoning<T> {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeMap;
+        let mut m = s.serialize_map(None)?;
+        if let Some(r) = &self.0 {
+            m.serialize_entry("reasoning", r)?;
+            m.serialize_entry("reasoning_content", r)?;
+        }
+        m.end()
+    }
+}
+
 /// The assistant message of a non-streamed response. `content` is `null` (not absent) when the
-/// turn is only tool calls, as OpenAI returns it.
+/// turn is only tool calls, as OpenAI returns it; so is `refusal`, which this server never sets.
 #[derive(Clone, Debug, Serialize)]
 pub struct ResponseMessage {
     pub role: &'static str,
     pub content: Option<String>,
-    /// vLLM's field name for the trace.
-    #[serde(rename = "reasoning", skip_serializing_if = "Option::is_none")]
-    pub reasoning_content: Option<String>,
+    pub refusal: Option<String>,
+    #[serde(flatten)]
+    pub reasoning_content: Reasoning<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tool_calls: Option<Vec<ToolCall>>,
 }
@@ -588,6 +638,25 @@ pub struct InputAudio {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_trace_serializes_under_both_names() {
+        let d = Delta {
+            role: None,
+            content: None,
+            reasoning_content: Reasoning(Some("hm".into())),
+            tool_calls: None,
+        };
+        assert_eq!(
+            serde_json::to_value(&d).unwrap(),
+            serde_json::json!({"reasoning": "hm", "reasoning_content": "hm"})
+        );
+        let none = Delta {
+            reasoning_content: Reasoning(None),
+            ..d
+        };
+        assert_eq!(serde_json::to_value(&none).unwrap(), serde_json::json!({}));
+    }
 
     #[test]
     fn stop_sets_and_zero_budget_are_bounded() {
@@ -768,6 +837,7 @@ pub struct ChatResponse {
     /// and lenient ones surface an undefined value.
     pub created: u64,
     pub model: String,
+    pub system_fingerprint: &'static str,
     pub choices: Vec<Choice>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub usage: Option<Usage>,
@@ -817,13 +887,15 @@ impl From<crate::serve::stream::TokenUsage> for Usage {
 pub struct Choice {
     pub index: u32,
     pub message: ResponseMessage,
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub logprobs: Option<crate::serve::logprobs::ChatLogprobs>,
     pub finish_reason: Option<&'static str>,
     /// Present only when the wire `finish_reason` had to be widened to fit the
     /// OpenAI vocabulary — currently a preemption reported as `"length"`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub x_plow_finish_reason: Option<&'static str>,
+    /// Thinking control's account of the request (final choice only).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub x_plow_thinking: Option<crate::serve::think::ThinkReport>,
 }
 
 /// One streamed `chat.completion.chunk`.
@@ -834,6 +906,7 @@ pub struct ChatChunk {
     /// Stamped once per request and repeated on every chunk of that stream.
     pub created: u64,
     pub model: String,
+    pub system_fingerprint: &'static str,
     pub choices: Vec<ChunkChoice>,
     /// Set on the final frame only (OpenAI stream-usage shape).
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -844,7 +917,6 @@ pub struct ChatChunk {
 pub struct ChunkChoice {
     pub index: u32,
     pub delta: Delta,
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub logprobs: Option<crate::serve::logprobs::ChatLogprobs>,
     pub finish_reason: Option<&'static str>,
     /// Same widening note as [`Choice::x_plow_finish_reason`]. The streamed
@@ -853,6 +925,9 @@ pub struct ChunkChoice {
     /// model simply hitting `max_tokens`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub x_plow_finish_reason: Option<&'static str>,
+    /// Thinking control's account of the request (final choice only).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub x_plow_thinking: Option<crate::serve::think::ThinkReport>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -861,9 +936,9 @@ pub struct Delta {
     pub role: Option<&'static str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub content: Option<String>,
-    /// Streamed thinking trace, before the answer starts; vLLM's field name.
-    #[serde(rename = "reasoning", skip_serializing_if = "Option::is_none")]
-    pub reasoning_content: Option<String>,
+    /// Streamed thinking trace, before the answer starts.
+    #[serde(flatten)]
+    pub reasoning_content: Reasoning<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tool_calls: Option<Vec<ToolCallDelta>>,
 }
@@ -874,6 +949,7 @@ pub struct CompletionResponse {
     pub object: &'static str,
     pub created: u64,
     pub model: String,
+    pub system_fingerprint: &'static str,
     pub choices: Vec<CompletionChoice>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub usage: Option<Usage>,

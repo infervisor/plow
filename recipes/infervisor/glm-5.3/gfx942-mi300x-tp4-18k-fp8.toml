@@ -26,8 +26,12 @@ toolchain = "rocm-7.14.0-nix"
 # `derived.q_absorb`/`v_absorb`/`kv_a_latent` and bf16 `q_a_proj`/`o_proj`/
 # `shared_experts`, which only the prep writes. A raw-HF checkpoint either
 # refuses on a shard-size mismatch or, with folds armed, faults the GPU at load.
+# The FP8 release is the base repository (`GLM-5.3-FP8` is its lab nickname;
+# `zai-org/GLM-5.3-BF16` is the other precision). The same commit the MI350X
+# campaign recipe and the `/opt/models/GLM-5.3-full-aca966e4` prep dirs use.
 [checkpoint]
-source = "hf:zai-org/GLM-5.3-FP8"
+source = "hf:zai-org/GLM-5.3"
+revision = "aca966e4e02791568aa6a4ced368624b3d897f42"
 shards = 79
 layout = "plow-glm-lite"
 

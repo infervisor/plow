@@ -22,12 +22,12 @@ path = "src/lib.rs"
 # family needs a hand-written Rust prompt builder, and a family that matches no
 # builder is served another model's markers as literal text. `loop_controls` is
 # required, not optional: GLM's template uses `{% break %}`.
-minijinja = { version = "2", default-features = false, features = ["builtins", "loop_controls", "macros", "multi_template", "adjacent_loop_items", "preserve_order", "serde"] }
+minijinja.workspace = true
 # `strftime_now`, which HF chat templates call to stamp the current date into
 # the system prompt. gpt-oss calls it unguarded (its render fails without it),
 # and Llama-3.2 and Muse-Glimmer degrade to a stale or missing date. Already in
 # the workspace lock via egglog with the same features, so it adds no build.
-chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+chrono.workspace = true
 plow-asset = { workspace = true }
 # Checkpoint S at `plowrt knob-scope` (serde and thiserror only).
 lean_verify = { workspace = true }
@@ -35,9 +35,9 @@ packet = { workspace = true }
 hwspec = { workspace = true }
 costmodel = { workspace = true }
 
-serde = { version = "1", features = ["derive"] }
-serde_json = { version = "1", features = ["preserve_order"] }
-thiserror = { workspace = true }
+serde.workspace = true
+serde_json = { workspace = true, features = ["preserve_order"] }
+thiserror.workspace = true
 memmap2 = "0.9"
 bytemuck = { version = "1", features = ["derive"] }
 # Performance-first: lock-free structures + fast maps/vecs for hot paths, and a
@@ -46,17 +46,17 @@ bytemuck = { version = "1", features = ["derive"] }
 crossbeam-utils = "0.8"
 parking_lot = "0.12"
 rustc-hash = "2"
-smallvec = { version = "1", features = ["union"] }
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "signal", "net"] }
+smallvec.workspace = true
+tokio = { workspace = true, features = ["signal", "net"] }
 axum = { version = "0.7", features = ["multipart", "ws"] }
 # Direct hyper access is used to serve the same axum router over a Unix domain
 # socket alongside the TCP listener (axum 0.7's `serve` only takes TcpListener).
 hyper = { version = "1", features = ["http1", "http2", "server"] }
 hyper-util = { version = "0.1", features = ["tokio", "service", "server-auto"] }
-tower = { version = "0.5", features = ["util"] }
-tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-clap = { version = "4", features = ["derive", "env"] }
+tower.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+clap.workspace = true
 futures = "0.3"
 # OpenAI Realtime transcription events carry base64 audio (already in the lockfile).
 base64 = "0.22"
@@ -67,7 +67,7 @@ image = { version = "0.25", default-features = false, features = ["png", "jpeg",
 # Chat audio parts in the compressed formats OpenAI clients send (mp3, flac, ogg/vorbis); pure Rust.
 symphonia = { version = "0.5", default-features = false, features = ["mp3", "flac", "ogg", "vorbis"] }
 # Content hashes of multimodal inputs: soft-token row ids, so prefix-cache keys tell media apart.
-sha2 = "0.10"
+sha2.workspace = true
 # Ids the server mints (request, session, turn; `serve::session`): sortable 64-bit, tagged; W3C
 # traceparent parsing and span ids. Not `monotonic`: minted session ids must not be guessable.
 svid = { version = "0.6.0", default-features = false, features = ["bits-high-rand"] }
@@ -78,18 +78,39 @@ rand = "0.9"
 
 # Optional: real tokenizer + checkpoint reader. Off by default so the skeleton
 # builds fast and offline; a byte-fallback tokenizer stands in when absent.
-tokenizers = { version = "0.23", optional = true }
+# Without the defaults: `esaxx_fast` is C++ (the Unigram *trainer*'s suffix
+# array, never used to load or encode) and was the binary's only libstdc++
+# link; `progressbar` is training-only too. `onig` keeps the regex engine
+# the checked-in tokenizers were validated with.
+tokenizers = { version = "0.23", default-features = false, features = ["onig"], optional = true }
 rayon = { version = "1", optional = true }
 safetensors = { version = "0.4", optional = true }
 hf-hub = { workspace = true, optional = true }
 # Asset distribution (`dist` feature): an HTTP client for the registry and zstd
 # for the transport codec. Deliberately optional — `serve` performs no network
 # I/O, and CI asserts no HTTP/TLS crate is present in the serve-only feature set.
-ureq = { version = "2", default-features = false, features = ["tls", "gzip"], optional = true }
-zstd = { version = "0.13", optional = true }
+ureq = { workspace = true, features = ["gzip"], optional = true }
+zstd = { version = "0.14", optional = true }
+# `plowrt push`: the bucket client. Our fork of Apache `object_store` adds a
+# Cloudflare R2 store over the REST API (API-token writes); R2's S3 endpoint
+# and any S3 bucket come with it. Pure Rust (rustls, ring) so the binary
+# stays static; publish-side only, same reasoning as ureq. `rev` is the tip of
+# the fork's `r2` branch; move it when that branch moves.
+object_store = { git = "https://github.com/storyvis/object-store", rev = "63f1eaef4e789cc6c3f97d2893d27aea57bf4984", default-features = false, features = ["cloudflare"], optional = true }
+# `plowrt push` signs a model index and `pull` verifies it (Nix's scheme: ed25519,
+# `<name>:<base64>`). Publish/fetch side only: `serve` verifies nothing.
+ed25519-dalek = { version = "2", default-features = false, features = ["std"], optional = true }
+# `plowrt push` refuses to rewrite a registry document carrying a field it
+# does not know: the exact set of fields a typed parse skipped.
+serde_ignored = { version = "0.1", optional = true }
 # `plowrt pack`: zips a built bundle+objset+files into one upload for a
 # registry's publish API. Publish-side tooling only, same reasoning as ureq.
-zip = { version = "2", default-features = false, features = ["deflate"], optional = true }
+zip = { version = "9", default-features = false, features = ["deflate"], optional = true }
+# `pack --recipe` / `publish --recipe`: a recipe is the only place a variant's
+# identity is written down (namespace, name, label, target, checkpoint,
+# plow_git), so the manifest generator reads it rather than taking ~20 flags.
+# Read-only — `parse`, not `display`: nothing here writes a recipe back.
+toml = { version = "1", default-features = false, features = ["parse", "serde", "std"], optional = true }
 # Runtime `dlopen` of the driver libs (see `device::cuda`/`device::hsa`): the
 # static binary carries no link-time GPU dependency, and NVIDIA + AMD libs can be
 # loaded side-by-side in one process (distinct `cu*` / `hsa_*` symbol namespaces).
@@ -97,7 +118,7 @@ libloading = { version = "0.8", optional = true }
 gguf-rs-lib = { version = "0.3", optional = true }
 # CPU engine: thread affinity / mbind for the persistent worker pool
 # (`exec::cpu`). Optional because only the `cpu` feature links the kernel lib.
-libc = "0.2"
+libc.workspace = true
 
 # Metal GPU backend (`exec::apple`): objc2 bindings to Metal/Foundation. Frameworks are part of
 # the OS, so they are linked, not dlopen'd. macOS only.
@@ -135,7 +156,7 @@ hub = ["hf-tokenizer", "dep:safetensors", "dep:hf-hub"]
 # `hf-hub` joins it because `load` also resolves the checkpoint, which the
 # distribution never carries — weights always come from HuggingFace or a local
 # directory.
-dist = ["dep:ureq", "dep:zstd", "dep:zip", "dep:hf-hub", "hf-tokenizer"]
+dist = ["dep:ureq", "dep:serde_ignored", "dep:zstd", "dep:zip", "dep:toml", "dep:hf-hub", "dep:ed25519-dalek", "dep:object_store", "hf-tokenizer"]
 # CUDA driver-API backend. The driver lib is `dlopen`ed at runtime (no link-time
 # `-lcuda`), so the binary stays static except for libcuda. Pulls safetensors:
 # a GPU serve is meaningless without real checkpoint weights (`exec::gpu`) —
@@ -168,8 +189,8 @@ plow-asset = { workspace = true, features = ["test-util"] }
 # `devgen` depends on packet/costmodel/kernelcaps/tunedb/hwspec/plow-asset, never
 # on `plowrt`.
 devgen = { workspace = true }
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time"] }
-tower = { version = "0.5", features = ["util"] }
+tokio.workspace = true
+tower.workspace = true
 http-body-util = "0.1"
 
 # The upload-path microbenchmarks are CUDA-only (`#![cfg(feature = "cuda")]`);

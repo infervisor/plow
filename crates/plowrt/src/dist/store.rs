@@ -3,7 +3,7 @@
 //! ```text
 //! ~/.plow/
 //!   blobs/sha256/<hex>                                   every file, content-addressed
-//!   refs/<digest>.json                                   {ref, variant} for one pin
+//!   refs/<digest>.json                                   {ref, variant, previous[]} for one pin
 //!   bundles/<variant_id>/                                links into blobs/ — what --assets gets
 //! ```
 //!
@@ -57,6 +57,9 @@ impl std::fmt::Display for Digest {
 /// `gc` reads this instead of re-hashing the bundle.
 const BUNDLE_BLOBS: &str = ".plow-blobs";
 
+/// How many superseded generations a pin remembers for `rollback`.
+pub const HISTORY: usize = 2;
+
 pub use plow_asset::dist::BUNDLE_MANIFEST;
 
 /// One pin, as `plowrt ls --json` prints it.
@@ -70,6 +73,10 @@ pub struct Pinned {
     pub label: String,
     pub generation: u32,
     pub variant_id: String,
+    /// Generations this pin served before, newest first: what `rollback`
+    /// returns to, while their bundles are still in the store.
+    #[serde(default)]
+    pub previous: Vec<String>,
     /// Every blob the bundle links, files and objects.
     pub bytes: u64,
     /// The materialized bundle: what `serve --assets` and `/v1/models/load` take.
@@ -310,27 +317,135 @@ impl Store {
 
     /// Record which variant a reference currently resolves to.
     ///
-    /// A pin is written by `load` and moved only by `upgrade`: a served model
-    /// must not drift under a running server because a catalog refreshed.
+    /// A pin is written by `load` and moved only by `upgrade` or `rollback`: a
+    /// served model must not drift under a running server because a catalog
+    /// refreshed. The generation it moves away from is kept in `previous`
+    /// (newest first, [`HISTORY`] deep), and its bundle stays in the store
+    /// until `gc`, so an upgrade that serves worse is one `rollback` away.
     pub fn pin(&self, reference: &str, variant_id: &str) -> Result<()> {
         let p = self.pin_file(reference);
-        let body = serde_json::json!({ "ref": reference, "variant": variant_id });
+        let mut previous = self.history(reference);
+        if let Some(current) = self.pinned(reference) {
+            if current != variant_id {
+                previous.retain(|v| v != &current && v != variant_id);
+                previous.insert(0, current);
+                previous.truncate(HISTORY);
+            }
+        } else {
+            previous.retain(|v| v != variant_id);
+        }
+        let body =
+            serde_json::json!({ "ref": reference, "variant": variant_id, "previous": previous });
         // Not `unwrap_or_default`: an empty pin file is an unparseable pin, and
         // silently writing one would lose the record rather than report it.
         let bytes = serde_json::to_vec(&body).map_err(|source| RuntimeError::Json {
             path: p.clone(),
             source,
         })?;
-        std::fs::write(&p, bytes).map_err(|source| RuntimeError::Io {
-            path: p.clone(),
-            source,
-        })
+        write_replace(&p, &bytes)
+    }
+
+    /// The store's write lock: `<root>/.lock`, exclusive, released on drop.
+    ///
+    /// A command that materializes, pins, rolls back or collects takes it for
+    /// its whole run, so `gc` never sees a bundle in the gap between its
+    /// materialization and its pin and `rollback` never races an `upgrade`.
+    /// Readers (`ls`, `show`, `serve`) do not take it. Not reentrant: one
+    /// lock per command, not per store call.
+    pub fn lock(&self) -> Result<StoreLock> {
+        let p = self.root.join(".lock");
+        let f = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&p)
+            .map_err(|source| RuntimeError::Io {
+                path: p.clone(),
+                source,
+            })?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::io::AsRawFd;
+            // SAFETY: `flock` on a file descriptor this process owns.
+            if unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_EX) } != 0 {
+                return Err(RuntimeError::Io {
+                    path: p,
+                    source: std::io::Error::last_os_error(),
+                });
+            }
+        }
+        Ok(StoreLock(f))
     }
 
     pub fn pinned(&self, reference: &str) -> Option<String> {
         let raw = std::fs::read(self.pin_file(reference)).ok()?;
         let v: serde_json::Value = serde_json::from_slice(&raw).ok()?;
         v.get("variant")?.as_str().map(str::to_string)
+    }
+
+    /// The generations a pin served before the current one, newest first.
+    pub fn history(&self, reference: &str) -> Vec<String> {
+        let Ok(raw) = std::fs::read(self.pin_file(reference)) else {
+            return Vec::new();
+        };
+        let Ok(v) = serde_json::from_slice::<serde_json::Value>(&raw) else {
+            return Vec::new();
+        };
+        v.get("previous")
+            .and_then(|p| p.as_array())
+            .map(|a| {
+                a.iter()
+                    .filter_map(|x| x.as_str().map(str::to_string))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// Move a pin back to the generation it served before the current one.
+    /// Returns `(from, to)`. Refused when there is no previous generation or
+    /// its bundle is no longer in the store (`gc` took it).
+    pub fn rollback(&self, reference: &str) -> Result<(String, String)> {
+        let current = self
+            .pinned(reference)
+            .ok_or_else(|| RuntimeError::Dist(format!("{reference} is not pinned")))?;
+        let mut previous = self.history(reference);
+        let Some(to) = previous.first().cloned() else {
+            return Err(RuntimeError::Dist(format!(
+                "{reference} has no previous generation to roll back to"
+            )));
+        };
+        if !self.root.join("bundles").join(&to).is_dir() {
+            return Err(RuntimeError::Dist(format!(
+                "{reference}: the previous generation {to} is no longer in the store (collected \
+                 by `gc`); `plowrt load {reference}:<label>@g<n>` fetches a generation explicitly"
+            )));
+        }
+        // Rolling back is itself a move: the generation left becomes the
+        // one `rollback` would return to next, so two rollbacks toggle.
+        previous.remove(0);
+        previous.retain(|v| v != &current);
+        previous.insert(0, current.clone());
+        previous.truncate(HISTORY);
+        let p = self.pin_file(reference);
+        let body = serde_json::json!({ "ref": reference, "variant": to, "previous": previous });
+        let bytes = serde_json::to_vec(&body).map_err(|source| RuntimeError::Json {
+            path: p.clone(),
+            source,
+        })?;
+        write_replace(&p, &bytes)?;
+        Ok((current, to))
+    }
+
+    /// Every variant some pin can still serve or roll back to: the roots
+    /// `gc` keeps bundle directories for.
+    pub fn roots(&self) -> std::collections::BTreeSet<String> {
+        let mut roots = std::collections::BTreeSet::new();
+        for (reference, current) in self.pins() {
+            roots.insert(current);
+            roots.extend(self.history(&reference));
+        }
+        roots
     }
 
     pub fn unpin(&self, reference: &str) -> Result<()> {
@@ -398,7 +513,10 @@ impl Store {
         let mut out = Vec::new();
         for (reference, variant_id) in self.pins() {
             match self.pinned_bundle(&variant_id) {
-                Ok(p) => out.push(p),
+                Ok(mut p) => {
+                    p.previous = self.history(&reference);
+                    out.push(p)
+                }
                 Err(e) => tracing::warn!(%reference, %variant_id, "skipped: {e}"),
             }
         }
@@ -429,6 +547,7 @@ impl Store {
             label: b.label,
             generation: b.generation,
             variant_id: variant_id.to_string(),
+            previous: Vec::new(),
             dir,
         })
     }
@@ -467,14 +586,62 @@ impl Store {
             .sum()
     }
 
+    /// Remove the superseded generations of every pinned model: bundles whose
+    /// manifest names a model some pin serves, that no pin's current or
+    /// `previous` generation is. `upgrade` leaves the generation it moved
+    /// away from in place for `rollback`; this is what finally takes it.
+    /// A bundle of a model nothing pins (a hand-placed or test bundle) is
+    /// left alone. Returns how many bundles were removed; `gc` then frees
+    /// their blobs.
+    pub fn prune(&self) -> Result<usize> {
+        let roots = self.roots();
+        let model_of = |dir: &Path| -> Option<(String, String)> {
+            let b: plow_asset::dist::Bundle =
+                serde_json::from_slice(&std::fs::read(dir.join(BUNDLE_MANIFEST)).ok()?).ok()?;
+            Some((b.namespace, b.name))
+        };
+        let pinned_models: std::collections::BTreeSet<(String, String)> = self
+            .pins()
+            .iter()
+            .filter_map(|(_, id)| model_of(&self.root.join("bundles").join(id)))
+            .collect();
+        let mut removed = 0;
+        if let Ok(rd) = std::fs::read_dir(self.root.join("bundles")) {
+            for bundle in rd.flatten().filter(|b| b.path().is_dir()) {
+                let id = bundle.file_name().to_string_lossy().into_owned();
+                if roots.contains(&id) {
+                    continue;
+                }
+                let Some(model) = model_of(&bundle.path()) else {
+                    continue;
+                };
+                if !pinned_models.contains(&model) {
+                    continue;
+                }
+                // The lock a caller holds ([`Store::lock`]) keeps a pin from
+                // moving under this walk; the re-read is the cheap guard for
+                // a caller that did not take it.
+                if self.roots().contains(&id) {
+                    continue;
+                }
+                std::fs::remove_dir_all(bundle.path()).map_err(|source| RuntimeError::Io {
+                    path: bundle.path(),
+                    source,
+                })?;
+                removed += 1;
+            }
+        }
+        Ok(removed)
+    }
+
     /// Remove blobs no live bundle directory references.
     ///
     /// Reachability is computed from the materialized bundles rather than from
     /// manifests, so a blob stays exactly as long as something can still open
     /// it. Returns the number of blobs removed and the bytes reclaimed.
     pub fn gc(&self) -> Result<(usize, u64)> {
-        let mut live = std::collections::BTreeSet::new();
         let bundles = self.root.join("bundles");
+        let mut live = std::collections::BTreeSet::new();
         if let Ok(rd) = std::fs::read_dir(&bundles) {
             for bundle in rd.flatten() {
                 if !bundle.path().is_dir() {
@@ -645,6 +812,26 @@ fn is_safe_relative(name: &str) -> bool {
             .all(|c| matches!(c, Component::Normal(_)))
 }
 
+/// Held for a command's lifetime; see [`Store::lock`].
+pub struct StoreLock(#[allow(dead_code)] std::fs::File);
+
+/// Replace `p` atomically: a pin is never left empty or half-written.
+fn write_replace(p: &Path, bytes: &[u8]) -> Result<()> {
+    let tmp = p.with_extension(format!("tmp{}", std::process::id()));
+    std::fs::write(&tmp, bytes).map_err(|source| RuntimeError::Io {
+        path: tmp.clone(),
+        source,
+    })?;
+    std::fs::rename(&tmp, p).map_err(|source| RuntimeError::Io {
+        path: p.to_path_buf(),
+        source,
+    })
+}
+
 #[cfg(test)]
 #[path = "store_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "store_history_tests.rs"]
+mod history_tests;

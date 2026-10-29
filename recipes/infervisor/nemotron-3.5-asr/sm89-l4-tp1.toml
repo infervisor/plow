@@ -29,6 +29,7 @@ parallel = "tp"
 
 [checkpoint]
 source = "hf:nvidia/nemotron-3.5-asr-streaming-0.6b"
+revision = "ea30d66debe3740a08b573244286791d423d6b3e"
 file = "nemotron-3.5-asr-streaming-0.6b.q8_0.gguf"
 
 [build]

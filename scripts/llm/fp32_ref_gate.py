@@ -568,10 +568,12 @@ def scaled_tensors(files, device="cuda"):
     with contextlib.ExitStack() as stack:
         shards = [stack.enter_context(safe_open(str(p), "pt", device=device)) for p in files]
         where = {k: f for f in shards for k in f.keys()}
+        # A text-only checkpoint (dense Qwen3) has no `language_model` tower: its LM is `model.`.
+        tower = "model.language_model." if any(k.startswith("model.language_model.") for k in where) else "model."
         for f in shards:
             for k in sorted(f.keys()):
                 # The text tower, plus an untied output head (Qwen3.5: top-level lm_head.weight).
-                if not (k.startswith("model.language_model.") or k == "lm_head.weight") or k.endswith(("weight_scale", "weight_scale_inv")):
+                if not (k.startswith(tower) or k == "lm_head.weight") or k.endswith(("weight_scale", "weight_scale_inv")):
                     continue
                 # Experts: <...>.experts.gate_up_proj + ".weight_scale"; dense: <...>.weight + "_scale";
                 # block FP8: <...>.weight + "_scale_inv".
@@ -647,7 +649,8 @@ def load_fp32(hf, device="cuda", compact=None, headroom_gib=40.0):
     from transformers import AutoConfig
     from transformers.modeling_utils import AttentionInterface
     AttentionInterface.register("sdpa", fp32_attention)
-    cfg = AutoConfig.from_pretrained(hf).text_config
+    base = AutoConfig.from_pretrained(hf)
+    cfg = getattr(base, "text_config", base)  # a text-only checkpoint (Qwen3) has no tower
     moe = bool(getattr(cfg, "enable_moe_block", False))
     glm = cfg.model_type == "glm5_next_text"
     if glm:  # GLM-5.3-Flash: 34 KDA + 11 sparse-MLA layers, 288 block-FP8 experts per MoE layer
@@ -663,6 +666,8 @@ def load_fp32(hf, device="cuda", compact=None, headroom_gib=40.0):
         model_class = modeling_gemma4.Gemma4ForCausalLM
     elif cfg.model_type in ("qwen3_5", "qwen3_5_text"):  # Qwen3.5/3.8 hybrid GDN + GQA; text tower of the VL wrapper
         from transformers.models.qwen3_5.modeling_qwen3_5 import Qwen3_5ForCausalLM as model_class
+    elif cfg.model_type == "qwen3":  # dense Qwen3
+        from transformers.models.qwen3.modeling_qwen3 import Qwen3ForCausalLM as model_class
     else:
         from transformers.models.gemma4_unified.modeling_gemma4_unified import Gemma4UnifiedForCausalLM as model_class
     cfg._attn_implementation = "sdpa"
@@ -755,9 +760,9 @@ def cmd_reference(a):
     # materialize a q x kv mask per layer type, 64 GiB at 262144 tokens.
     no_masks = {t: None for t in set(getattr(model.config, "layer_types", None) or ["full_attention"])}
     eos_cfg = model.config.eos_token_id
-    eos = set(eos_cfg if isinstance(eos_cfg, list) else [eos_cfg] if eos_cfg is not None else []) | {tok.eos_token_id} - {None}
+    stop = set(eos_cfg if isinstance(eos_cfg, list) else [eos_cfg] if eos_cfg is not None else []) | {tok.eos_token_id} - {None}
     if model.config.model_type.startswith("gemma"):  # EOS holds Gemma-4 ids; they are ordinary tokens elsewhere ('"', 'S' in GLM)
-        eos |= set(EOS)
+        stop |= set(EOS)
     cases = []
     t0 = time.time()
     with torch.no_grad():
@@ -775,7 +780,7 @@ def cmd_reference(a):
                 if not cont:
                     t_prefill, t_decode = time.time() - t_case, time.time()
                 cont.append(t)
-                if t in eos or len(cont) == c["max_new"]:
+                if t in stop or len(cont) == c["max_new"]:
                     break
                 out = model(input_ids=torch.tensor([[t]], device=dev), past_key_values=out.past_key_values,
                             attention_mask=masks, use_cache=True)
