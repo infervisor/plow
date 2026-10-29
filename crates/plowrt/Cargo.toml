@@ -172,6 +172,10 @@ cuda = ["dep:libloading", "dep:safetensors", "hf-tokenizer"]
 # side, 2026-07-19). The features stay symmetric so an AMD serve cannot inherit
 # a failure mode the NVIDIA one was fixed for.
 hsa = ["dep:libloading", "dep:safetensors", "hf-tokenizer"]
+# Memory-safety test builds: every partially written per-launch device table (packed request and
+# slot maps, rider tables, the library attention table) is filled with 0xFF before its upload, so
+# a kernel that reads an entry this launch did not write gets an out-of-range id and faults.
+poison-tables = ["cuda"]
 # Generic GGUF asset reader; it is independent of the execution backend.
 gguf = ["dep:gguf-rs-lib"]
 
