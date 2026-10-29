@@ -392,13 +392,11 @@ if [ "${PLOW_BUILD_CUTLASS_FP8_DECODE:-0}" = 1 ]; then
     -lcuda -o "$gemma_out/libplow_cutlass_fp8_decode_sm90.so" "$gemma_cutlass_src"
 fi
 # Library hd512 prefill attention (plowrt exec/gpu/lib_attention.rs): FlashAttention-4's SM90
-# forward AOT-exported into libplow_fa4_hd512.so plus the FP8 KV page-gather cubin. The export needs
+# forward AOT-exported into libplow_fa4_hd512.so with its KV adapters linked in. The export needs
 # a Python with vLLM's vllm_flash_attn (0.28.0 built) and the CuTe DSL (PLOW_FA4_PY, default PYREF).
 # PLOW_BUILD_FA4_HD512=1 builds the bf16 page-pool variant, =f16 the fp16 one.
 if [ "${PLOW_BUILD_FA4_HD512:-0}" = 1 ] || [ "${PLOW_BUILD_FA4_HD512:-0}" = f16 ]; then
   gemma_fa4_dtype=(); [ "$PLOW_BUILD_FA4_HD512" = f16 ] && gemma_fa4_dtype=(f16)
-  "${gemma_nvenv[@]}" "$gemma_nvcc" -std=c++17 -arch=sm_90a -O3 -cubin -Xptxas=-v \
-    -o "$gemma_out/kv_dequant_sm90.cubin" runtime/nvidia/kv_dequant_sm90.cu
   PLOW_NVCC="$gemma_nvcc" "${PLOW_FA4_PY:-${PYREF:-python3}}" scripts/build_sm90a_fa4_hd512.py "$gemma_out" \
     "${gemma_fa4_dtype[@]}"
   rm -rf "$gemma_out/fa4"

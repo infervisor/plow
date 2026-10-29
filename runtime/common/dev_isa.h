@@ -470,21 +470,20 @@ enum {
                                           * t4=stab; i0=k i1=H i2=I_moe i3=n_exp */
 
     /* DeepSeek MLA (Multi-head Latent Attention) — the flash READ path only.  [DEEPSEEK-MLA]
-     * Opcodes reserved at 50+ to avoid collision with the in-flight fp8-merge (30+) and MoE
-     * (40+) work (sparse-attn-design.md §4 renumbered into that free band). The WRITE path
+     * Opcodes at 50+ to avoid collision with the fp8-merge (30+) and MoE (40+) bands
+     * (design: docs/arch/29-techniques.md, MLA and DSA sections). The WRITE path
      * reuses existing ops: GEMV/GEMM for the c_kv/k_rope down-projections, HEADNORM_ROPE
      * (n_kv_head=1, hd=qk_rope_dim) for the shared rope key, RMSNORM on the latent.
      *
      * These are the two new device inner loops + the epilogue fold; validated STANDALONE via
      * test_kernels.hip (mla_flash_decode_512 / mla_o_uv_fold_512) against the Rust oracle
-     * (runtime/tests/mla_ref.rs). Interpreter dispatch wiring (interp.hip switch + dev.rs +
-     * devbuild) is deferred to the emitter-integration phase, after glm-prototype lands the
-     * shared MoE core. FLASH_MLA_MERGE reuses the existing FLASH_MERGE at D=kv_lora_rank=512
+     * (runtime/tests/mla_ref.rs). Dispatched in interp.hip (AMD, ops 50-55 and 57); ops 50, 54
+     * and 57 also in interp_sm120.cu. No sm_90a arm. FLASH_MLA_MERGE reuses the existing FLASH_MERGE at D=kv_lora_rank=512
      * (no new opcode needed — the merge is dimension-generic). */
     PLOW_DOP_FLASH_MLA_DECODE = 50,  /* q_abs.c_kv + q_rope.k_rope; PV on the latent (D=DK) */
-    PLOW_DOP_FLASH_MLA_PREFILL = 51, /* MFMA twin (not yet built)                            */
+    PLOW_DOP_FLASH_MLA_PREFILL = 51, /* latent prefill (AMD exec_flash_mla_prefill)          */
     PLOW_DOP_O_UV_FOLD = 52,         /* per-head W_uv fold: latent accumulator -> v_head_dim */
-    /* Sparse top-k DSA (sparse-attn-design.md §3) — reserved, not yet built. */
+    /* Sparse top-k DSA. AMD bodies for 53-55; 54 is emitted, 53 and 55 have no emit site. */
     PLOW_DOP_ATTN_SELECT = 53,          /* on-device top-k KV selection -> idx table */
     PLOW_DOP_FLASH_GATHER_DECODE = 54,  /* gathered flash (base = dense or MLA)       */
     PLOW_DOP_FLASH_GATHER_PREFILL = 55,

@@ -9,7 +9,8 @@ same name (plow_fa4_dtype reports it). CPU only:
      fa4_hd512_h16kv{1,2}{,_split}.{h,o} and fa4_hd512_combine.{h,o};
      needs an interpreter with vLLM's vllm_flash_attn (0.28.0 built) + cutlass DSL 4.6, e.g. /opt/pytorch
      with PYTHONPATH=<site-packages>/nvidia_cutlass_dsl/dsl_packages)
-  2. nvcc -shared runtime/nvidia/fa4_hd512.cpp + the objects -> <out>/libplow_fa4_hd512.so
+  2. nvcc -shared runtime/nvidia/fa4_hd512.cpp + runtime/nvidia/kv_dequant_sm90.cu (the KV
+     adapters, PLOW_FA4_HOST) + the objects -> <out>/libplow_fa4_hd512.so
 
 Same toolchain and static-link rules as build_sm90a_qwen_gdn.py.
 """
@@ -46,13 +47,22 @@ def main() -> int:
     archive = dsl_root / cu / "lib" / "libcuda_dialect_runtime_static.a"
     if not archive.is_file():
         raise SystemExit(f"CuTe DSL host runtime archive missing: {archive}")
+    adapters = obj / "kv_adapters.o"
+    subprocess.run([nvcc, "-c", "-Xcompiler", "-fPIC", "-std=c++17", "-O3", "-arch=sm_90a", "-DPLOW_FA4_HOST",
+                    "-o", str(adapters), str(REPO / "runtime/nvidia/kv_dequant_sm90.cu")], check=True)
     cmd = [nvcc, "-shared", "-Xcompiler", "-fPIC", "-std=c++17", "-O2", "-cudart", "static",
            "-Xcompiler", "-static-libstdc++", "-Xcompiler", "-static-libgcc", "-Wno-deprecated-gpu-targets",
            f"-DPLOW_FA4_DTYPE={1 if dtype else 0}", "-I", str(obj), "-o", str(out / "libplow_fa4_hd512.so"),
            str(REPO / "runtime/nvidia/fa4_hd512.cpp"),
-           *sorted(str(p) for p in obj.glob("fa4_hd512_*.o")), str(archive), "-lcuda"]
+           str(adapters), *sorted(str(p) for p in obj.glob("fa4_hd512_*.o")), str(archive), "-lcuda"]
     print(" ".join(cmd), flush=True)
     subprocess.run(cmd, check=True)
+    # plowrt dlopens it with nothing else loaded: only libc symbols may stay unresolved.
+    undefined = subprocess.run(["nm", "-D", "--undefined-only", str(out / "libplow_fa4_hd512.so")],
+                               capture_output=True, text=True, check=True).stdout.splitlines()
+    unresolved = [l.split()[-1] for l in undefined if l.split()[0] == "U" and "@GLIBC" not in l]
+    if unresolved:
+        raise SystemExit(f"libplow_fa4_hd512.so leaves {unresolved} unresolved")
     return 0
 
 
