@@ -30,7 +30,9 @@ HOST_STUB = "gdn_sm90_prefill"
 HOST_STUB_VERSION = 1
 ABI = "plow_gdn_prefill:v1:hk=16:hv=48:d=128:dtype=bf16:state=f32_vk"
 # (tokens, nseq) exemplar launches; the addresses are distinct, 128-aligned and never dereferenced.
-EXEMPLARS = [(1, 1), (301, 3), (8192, 64)]
+# No tokens < 64 (one TMA box): there the export's own tensor-map encoder leaves bit 21 of the Q/K/V
+# flag word to uninitialized stack (it varies with the capture's compiler and environment).
+EXEMPLARS = [(64, 1), (301, 3), (8192, 64)]
 ADDRS = [(0x7f - i) << 40 for i in range(10)]
 # Bytes per parameter the export's host code defines: {ptr, i32 extent} tensors 12, tensor maps 64,
 # i64 shapes it writes as i32 4. The rest is stack garbage the capture cannot always mask (the same
