@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -42,6 +43,17 @@ def need(cond: bool, msg: str) -> None:
         raise Invalid(msg)
 
 
+def same_value(requested: object, observed: object) -> bool:
+    """A `{out}`, `{repo}` or `{hf:…}` placeholder names a path on the build
+    host, which the knob record holds expanded: match on the part the recipe
+    spells after it."""
+    want, got = str(requested), str(observed)
+    if want == got:
+        return True
+    m = re.match(r"\{(out|repo|hf:[^}]+)\}(.*)", want)
+    return bool(m) and got.endswith(m.group(2))
+
+
 def exact_map(requested: dict, observed: dict, surface: str) -> None:
     """Every requested knob must be observed with the same value.
 
@@ -52,7 +64,7 @@ def exact_map(requested: dict, observed: dict, surface: str) -> None:
     for knob, value in requested.items():
         need(knob in observed, f"{surface}: recipe requests {knob} but the build recorded no such knob")
         need(
-            str(observed[knob]) == str(value),
+            same_value(value, observed[knob]),
             f"{surface}: contradictory {knob} — recipe says {value!r}, build recorded "
             f"{observed[knob]!r}",
         )
