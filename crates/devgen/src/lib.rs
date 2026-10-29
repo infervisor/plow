@@ -11533,7 +11533,7 @@ fn emit_dense_gqa(
         library_attention::apply_output_object(&m, &mut sections, std::path::Path::new(&out))
             .unwrap_or_else(|error| panic!("library attention: {error}"));
     if selected > 0 {
-        eprintln!("  library hd512 prefill attention: {selected} segments");
+        eprintln!("  library prefill attention: {selected} segments");
     }
     if let Some(live_position) = sections
         .iter()
