@@ -458,6 +458,14 @@ bit-identical to the copy path with the matmul algorithms pinned (Qwen3.8 BF16 a
 a gather outside a launch window, not the copy itself. Evidence:
 `/opt/dlami/nvme/lava-tts/kv-f1p0/` (`rep/`, `gates/`, `l2/`).
 
+One place keeps a wait. A finished slot's rings go back and its full-layer pages are retired on
+the host, outside stream order; with the publish scatter no longer drained, that retirement could
+overtake the copy still reading the slot (26B BF16 at 2.7 sessions/s faulted on every request).
+`begin_slot` now waits on the newest seal event before releasing the slot: it covers every
+earlier store copy and not the decode steps queued after it. Measured on 12B FP8 at 2.7/s:
+175 µs per finished sequence, store share of tick 0.53 → 0.67 %, TTFT/TPOT P99 unchanged within
+rep noise; 26B BF16 and FP8 FP32 gates pass, 26B BF16 2.7/s × 2 clean.
+
 ## 7. Validation
 
 0. **F1.** Kernels untouched: `step_bench` digests identical to the base packet; replay
