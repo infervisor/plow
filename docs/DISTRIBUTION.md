@@ -64,7 +64,7 @@ v1/<namespace>/<name>/manifests/<label>@g<n>    # one variant → bundle.json
 v1/objsets/<objset-id>.json
 v1/blobs/sha256/<hex>[.zst]                     # shared by everything
 v1/runtime/index.json                           # released binaries, per triple
-catalog.json                                    # model names only
+catalog.json                                    # model names only (+ listed)
 ```
 
 Local (`$PLOW_HOME`, default `~/.plow`):
@@ -161,9 +161,17 @@ and there is no pairing hash. `plowrt target --json` on such a machine prints
 the exact `target` a publisher records in the recipe's `[target]` — including
 `mem_bytes`, which a unified-memory part must state because `hwspec` records the
 smallest shipping configuration of each chip rather than this machine's memory;
-`plowrt pack` takes no objset for it. Selection is
-unchanged: the Metal device reports `apple`/`metal3`, the SKU hwspec names,
-its core count and the memory Metal will let it use.
+`plowrt pack` takes no objset for it, and its recipe needs no `toolchain`.
+The Metal device reports `apple`/`metal3`, its name as the SKU, its core
+count (from hwspec, or from `system_profiler` for a chip hwspec does not
+list yet) and the memory Metal will let it use. An Apple build is selected
+on **any** chip of the family: off the core count it was built for, the
+engine dispatches the packet serially instead of as `n_cu` streams, which
+is correct at some cost in throughput, so an M4 Pro build runs on an M4
+Max, a base M4 or an M5. The SKU and the core gap only rank it below a
+closer build; the memory check still applies. NVIDIA and AMD builds need
+the exact SM/CU count (their grids are baked into the objects), so an H100
+build runs on an H200 but not on a part with more SMs.
 
 ## Serving is offline
 
@@ -322,6 +330,29 @@ warns that they are carried unverified, which is the bootstrap for a registry
 published before signing existed. Without a key, `push` to a bucket warns and
 publishes unsigned. A `file://` registry enforces the same conditional writes
 under `<dir>/.lock`.
+
+**Listing.** The catalog is for listings — the site, inferos, `plowrt
+catalog show`; `load` never reads it, a bare name resolves straight to
+`v1/<namespace>/<name>/index.json`. So which models the public sees is a
+catalog property, decided by whoever holds the bucket's write key and by
+nothing else: a row carries `"listed": false` to leave a published model out
+of listings while it still loads by name (absent means listed, so older
+catalogs and readers agree). `push --unlisted` publishes that way; a later
+push keeps the row as it is; `plowrt catalog unlist|list <model>` flips it
+with one `If-Match` write on `catalog.json` and nothing under `v1/`, so the
+signed index is untouched. A name never published is refused, not reserved.
+To withdraw one build, re-push its recipe as `status = "refused"` with a
+reason: `load` skips it and pinned `@g<n>` pulls still work. Retracting a
+whole model (deleting `v1/<namespace>/<name>/` and its row) is a by-hand
+operation; blobs are shared across models and are never deleted with it.
+
+The catalog is one object and is written on every push and listing change,
+each under `If-Match`, so publishers serialise on it and a lost race is
+re-read and retried (four times). At a hundred bytes a row that is tens of
+kilobytes for hundreds of models, read by listings only. It is not signed:
+a reader trusts it as far as it trusts the bucket's writers, and everything
+that matters to a `load` — the index, every manifest, every blob — is
+signed or content-addressed.
 
 `plowrt publish` (the registry's staged-upload API, `PLOW_PUBLISH_KEY`) is
 the transition path, kept until every model has been re-published with

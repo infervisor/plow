@@ -1014,6 +1014,23 @@ fn a_target_that_ships_objects_needs_them_somewhere() {
     assert!(e.contains("no *.elf, *.cubin or *.co found"), "{e}");
 }
 
+/// Nothing records a compiler for a runtime-compiled target, so its recipe
+/// may omit `toolchain`; a CUDA recipe without one is still refused (see
+/// `a_recipe_missing_an_identity_field_is_refused_by_name`).
+#[test]
+fn a_runtime_compiled_recipe_needs_no_toolchain() {
+    let assets = speech_assets("apple-no-toolchain");
+    let recipe = MINIMAL
+        .replace("vendor = \"nvidia\"", "vendor = \"apple\"")
+        .replace("isa = \"sm_90a\"", "isa = \"m4\"")
+        .replace("sku = \"H100 SXM5\"", "sku = \"M4 Max\"")
+        .replace("toolchain = \"cuda-13.4+gcc-13\"\n", "");
+    assert!(!recipe.contains("toolchain"), "{recipe}");
+    let p = write_recipe(&tmp("apple-no-toolchain"), &recipe);
+    let g = generate(&p, &assets, None, Overrides::default(), &BundleArgs::default()).unwrap();
+    assert!(g.objset.is_none());
+}
+
 /// Apple's Metal shaders compile on the serving machine from the packet, so its
 /// bundle carries no objset and must not be handed an object directory.
 #[test]

@@ -1148,6 +1148,54 @@ max_ctx = 2048
     }
 }
 
+/// `plowrt catalog show`: every row of the registry's catalog.
+#[cfg(feature = "dist")]
+pub fn cmd_catalog_show(to: &str) -> Result<(), Err> {
+    let sink = dist::sink::sink(to)?;
+    let catalog = dist::push::catalog(&*sink)?;
+    if catalog.models.is_empty() {
+        println!("{}: no models published", sink.describe());
+        return Ok(());
+    }
+    for m in &catalog.models {
+        println!(
+            "{}/{:<28} {:<9} {}{}",
+            m.namespace,
+            m.name,
+            if m.listed { "listed" } else { "unlisted" },
+            m.hf,
+            m.description
+                .as_deref()
+                .map(|d| format!("  — {d}"))
+                .unwrap_or_default()
+        );
+    }
+    Ok(())
+}
+
+/// `plowrt catalog list|unlist <model>`: one write on the catalog row.
+#[cfg(feature = "dist")]
+pub fn cmd_catalog_set(to: &str, model: &str, listed: bool) -> Result<(), Err> {
+    let r = parse(model)?;
+    if r.label.is_some() || r.generation.is_some() {
+        return Err(format!(
+            "{model}: listing is per model; give `[<namespace>/]<name>` without a label or generation"
+        )
+        .into());
+    }
+    let sink = dist::sink::sink(to)?;
+    let verb = if listed { "listed" } else { "unlisted" };
+    match dist::push::set_listed(&*sink, &r.namespace, &r.name, listed)? {
+        dist::push::Listing::Changed => {
+            println!("{}/{}: now {verb} at {}", r.namespace, r.name, sink.describe())
+        }
+        dist::push::Listing::Unchanged => {
+            println!("{}/{}: already {verb} at {}", r.namespace, r.name, sink.describe())
+        }
+    }
+    Ok(())
+}
+
 /// `plowrt push-runtime`: see [`dist::runtime`].
 pub fn cmd_push_runtime(
     releases: &[std::path::PathBuf],

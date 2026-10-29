@@ -433,12 +433,15 @@ fn assess_one<'a>(v: &'a Variant, live: &LiveTarget, c: &Constraints) -> Assessm
         // under oversubscription. `stream_ofs`/`stream_len` are `[n_cu]` tables
         // indexed by workgroup, so anything else silently drops streams. A
         // runtime-compiled target (Apple) is the exception: its shaders are
-        // built on the machine and the packet's `n_cu` streams simply leave
-        // the extra cores idle, so a build for a smaller part of the same
-        // family runs on a larger one (an M4 Pro build on an M4 Max) at some
-        // cost in throughput, never the other way round.
-        let units_ok = v.target.units == live.units
-            || (runtime_compiled(&v.target.vendor) && live.units > v.target.units)
+        // built on the machine, and when the core count is not the packet's
+        // the Metal engine dispatches the packet serially instead of as
+        // `n_cu` streams (`exec/apple`), which is correct on any chip of the
+        // family at some cost in throughput. So a build for one M-series part
+        // runs on every other (an M4 Pro build on an M4 Max, or on an M5);
+        // the SKU and the core gap only rank it below a closer build.
+        let runtime = runtime_compiled(&v.target.vendor);
+        let units_ok = runtime
+            || v.target.units == live.units
             || (c.oversub
                 && live.units != 0
                 && v.target.units > live.units
@@ -449,12 +452,10 @@ fn assess_one<'a>(v: &'a Variant, live: &LiveTarget, c: &Constraints) -> Assessm
                 live: live.units,
             });
         }
-        if runtime_compiled(&v.target.vendor) && live.units > v.target.units {
+        if runtime && live.units != v.target.units {
             warns.push(format!(
-                "built for {} GPU cores, this has {}: runs with {} idle",
-                v.target.units,
-                live.units,
-                live.units - v.target.units
+                "built for {} GPU cores, this has {}: serial dispatch, slower than a build for this chip",
+                v.target.units, live.units
             ));
         }
         if !IMPLEMENTED_MODES.contains(&v.parallel.mode.as_str()) {

@@ -439,6 +439,11 @@ def self_test() -> None:
         p = write(good)
         notes = check(p, bundle, objects, strict=False)
         assert not any("contradictory" in n for n in notes), notes
+        # A build-host path placeholder matches the path the record expanded it to.
+        assert same_value("{out}/prep/s3gen", "/nvme/build/chatterbox-h100/prep/s3gen")
+        assert same_value("{hf:ResembleAI/chatterbox}/t3", "/hf/hub/models--x/snapshots/abc/t3")
+        assert not same_value("{out}/prep/s3gen", "/nvme/build/other/prep/codec")
+        assert not same_value("1", "0")
         # PLOW_MXFP4 was replayed but not stated: reported, not fatal.
         assert any("PLOW_MXFP4" in n for n in notes), notes
 

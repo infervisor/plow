@@ -597,6 +597,44 @@ impl HardwareFingerprint {
         })
     }
 
+    /// [`Self::from_live`] for a device that also reports its name. An Apple
+    /// part the registry does not list yet (a newer M-series chip) is still
+    /// described: its per-core resources are those of the listed Apple part
+    /// with the nearest core count — one Metal core family, so they match —
+    /// and the SKU is the live name, never a neighbour's. Other vendors keep
+    /// the strict rule: their kernels are compiled for an exact part.
+    pub fn from_live_named(
+        arch: &str,
+        units: u32,
+        mem_bytes: u64,
+        driver: Option<String>,
+        name: &str,
+    ) -> Option<Self> {
+        if let Some(fp) = Self::from_live(arch, units, mem_bytes, driver.clone()) {
+            return Some(fp);
+        }
+        let isa = IsaLevel::from_arch_flag(arch)?;
+        if isa.vendor() != Vendor::Apple || units == 0 {
+            return None;
+        }
+        let template = crate::registry::ALL
+            .iter()
+            .copied()
+            .filter(|s| IsaLevel::from_spec(s) == Some(isa))
+            .min_by_key(|s| s.sm_count.abs_diff(units))?;
+        Some(HardwareFingerprint {
+            isa,
+            sku: name.to_string(),
+            units,
+            shared_mem_bytes: template.sm.shared_mem.0,
+            regs_32bit: template.sm.regs_32bit,
+            mem_bytes,
+            driver,
+            toolchain: None,
+            clock_policy: None,
+        })
+    }
+
     pub fn caps(&self) -> IsaCaps {
         self.isa.caps()
     }
@@ -908,5 +946,21 @@ mod tests {
         // An unrecognised part is None, never a plausible neighbour.
         assert!(HardwareFingerprint::from_live("gfx942", 999, 256 << 30, None).is_none());
         assert!(HardwareFingerprint::from_live("gfx1100", 304, 256 << 30, None).is_none());
+    }
+
+    #[test]
+    fn an_apple_chip_the_registry_lacks_is_described_from_its_family_under_its_own_name() {
+        // Listed: exactly as before.
+        let fp = HardwareFingerprint::from_live_named("metal3", 16, 24 << 30, None, "Apple M4 Pro").unwrap();
+        assert_eq!(fp.sku, "Apple M4 Pro");
+        // Not listed (an M5 Pro with 20 cores): the live name and core count,
+        // per-core resources from the nearest listed part of the family.
+        let fp = HardwareFingerprint::from_live_named("metal3", 20, 32 << 30, None, "Apple M5 Pro").unwrap();
+        assert_eq!((fp.sku.as_str(), fp.units, fp.mem_bytes), ("Apple M5 Pro", 20, 32 << 30));
+        let m4pro = HardwareFingerprint::from_live_named("metal3", 16, 24 << 30, None, "Apple M4 Pro").unwrap();
+        assert_eq!(fp.shared_mem_bytes, m4pro.shared_mem_bytes);
+        // Only Apple, and only with a real core count.
+        assert!(HardwareFingerprint::from_live_named("metal3", 0, 32 << 30, None, "Apple M5").is_none());
+        assert!(HardwareFingerprint::from_live_named("gfx942", 999, 256 << 30, None, "MI300X").is_none());
     }
 }

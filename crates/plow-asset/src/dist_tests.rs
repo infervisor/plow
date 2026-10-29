@@ -956,7 +956,7 @@ fn apple_live(sku: &str, cores: u32, mem: u64) -> LiveTarget {
 }
 
 #[test]
-fn an_apple_build_runs_on_a_larger_chip_of_its_family_never_a_smaller_one() {
+fn an_apple_build_runs_on_any_chip_of_its_family_with_a_warning_off_its_own() {
     let gib = 1u64 << 30;
     let pro = variant(
         "metal3-apple-m4-pro-tp1-2k",
@@ -973,17 +973,44 @@ fn an_apple_build_runs_on_a_larger_chip_of_its_family_never_a_smaller_one() {
     );
     assert!(table[0].ok(), "{:?}", table[0].reject);
     assert!(
-        table[0].warns.iter().any(|w| w.contains("16 idle")),
+        table[0].warns.iter().any(|w| w.contains("serial dispatch")),
         "{:?}",
         table[0].warns
     );
-    // On a base M4 (10 cores): refused, naming both counts.
+    // On a base M4 (10 cores, 16 GiB): the core count is no bar either, and
+    // the memory check still applies to a different SKU: 24 GiB of
+    // recommended working set was built for, 16 GiB is here.
     let table = assess(
         std::slice::from_ref(&pro),
         &apple_live("Apple M4", 10, 16 * gib),
         &Constraints::default(),
     );
-    assert_eq!(table[0].reject, Some(Reject::Units { want: 16, live: 10 }));
+    assert!(
+        matches!(table[0].reject, Some(Reject::Mem { .. })),
+        "{:?}",
+        table[0].reject
+    );
+    let table = assess(
+        std::slice::from_ref(&pro),
+        &apple_live("Apple M4", 10, 24 * gib),
+        &Constraints::default(),
+    );
+    assert!(table[0].ok(), "{:?}", table[0].reject);
+    // A newer family: an M5 Pro with the same core count runs it, and is
+    // only ranked by its SKU and core gap.
+    let table = assess(
+        std::slice::from_ref(&pro),
+        &apple_live("Apple M5 Pro", 20, 32 * gib),
+        &Constraints::default(),
+    );
+    assert!(table[0].ok(), "{:?}", table[0].reject);
+    // On its own chip: no warning at all.
+    let table = assess(
+        std::slice::from_ref(&pro),
+        &apple_live("Apple M4 Pro", 16, 24 * gib),
+        &Constraints::default(),
+    );
+    assert!(table[0].ok() && table[0].warns.is_empty(), "{:?}", table[0]);
     // An NVIDIA part with more SMs than the build is still refused: the grid is baked in.
     let h100 = variant(
         "sm90a-h100-tp1",

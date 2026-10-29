@@ -104,12 +104,29 @@ impl Backend for CpuBackend {
     fn fingerprint(&self) -> Option<hwspec::isa::HardwareFingerprint> {
         use objc2_metal::{MTLCreateSystemDefaultDevice, MTLDevice};
         let device = MTLCreateSystemDefaultDevice()?;
-        let spec = hwspec::registry::lookup(&device.name().to_string())?;
-        hwspec::isa::HardwareFingerprint::from_live(
+        let name = device.name().to_string();
+        // A chip hwspec lists gives its core count; a newer one (an M5 the
+        // registry predates) is asked the system, so a build for an older
+        // chip of the family can still be selected and run (serially).
+        let cores = match hwspec::registry::lookup(&name) {
+            Some(spec) => spec.sm_count,
+            None => match apple_gpu_cores() {
+                Some(n) => {
+                    tracing::warn!(gpu = %name, cores = n, "GPU not in hwspec: core count from system_profiler");
+                    n
+                }
+                None => {
+                    tracing::warn!(gpu = %name, "GPU not in hwspec and system_profiler gave no core count: no GPU fingerprint");
+                    return None;
+                }
+            },
+        };
+        hwspec::isa::HardwareFingerprint::from_live_named(
             "metal3",
-            spec.sm_count,
+            cores,
             device.recommendedMaxWorkingSetSize(),
             None,
+            &name,
         )
     }
 
@@ -531,4 +548,38 @@ fn execute(inst: &Inst) {
 #[inline]
 fn resource_tag(r: ResourceKind) -> u8 {
     r as u8
+}
+
+/// The GPU core count of this Mac from `system_profiler SPDisplaysDataType
+/// -json` (`sppci_cores`, a decimal string), for a chip hwspec does not list.
+#[cfg(all(target_os = "macos", feature = "metal"))]
+fn apple_gpu_cores() -> Option<u32> {
+    let out = std::process::Command::new("system_profiler")
+        .args(["SPDisplaysDataType", "-json"])
+        .output()
+        .ok()?;
+    parse_apple_gpu_cores(&String::from_utf8_lossy(&out.stdout))
+}
+
+/// `sppci_cores` of the first display entry that has one.
+#[cfg(any(all(target_os = "macos", feature = "metal"), test))]
+fn parse_apple_gpu_cores(json: &str) -> Option<u32> {
+    let v: serde_json::Value = serde_json::from_str(json).ok()?;
+    v.get("SPDisplaysDataType")?
+        .as_array()?
+        .iter()
+        .find_map(|d| d.get("sppci_cores")?.as_str()?.trim().parse().ok())
+}
+
+#[cfg(test)]
+mod apple_cores_tests {
+    use super::parse_apple_gpu_cores;
+
+    #[test]
+    fn the_core_count_is_read_from_system_profiler_json() {
+        let json = r#"{"SPDisplaysDataType":[{"_name":"Apple M4 Pro","sppci_bus":"spdisplays_builtin","sppci_cores":"16","sppci_model":"Apple M4 Pro"}]}"#;
+        assert_eq!(parse_apple_gpu_cores(json), Some(16));
+        assert_eq!(parse_apple_gpu_cores(r#"{"SPDisplaysDataType":[{"_name":"x"}]}"#), None);
+        assert_eq!(parse_apple_gpu_cores("not json"), None);
+    }
 }

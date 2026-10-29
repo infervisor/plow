@@ -640,3 +640,101 @@ fn a_recipe_that_names_a_codec_needs_the_codec_packet() {
     let g = f.generated();
     assert!(g.bundle.files.iter().any(|x| x.role == "codec_packet"));
 }
+
+// --- listing ----------------------------------------------------------------
+
+fn catalog_of(f: &Fixture) -> serde_json::Value {
+    serde_json::from_slice(&f.read("catalog.json")).unwrap()
+}
+
+#[test]
+fn a_listed_row_omits_the_field_and_an_old_catalog_reads_as_listed() {
+    let f = Fixture::new("listed-default");
+    f.push(None, &Options::default());
+    let row = &catalog_of(&f)["models"][0];
+    assert!(row.get("listed").is_none(), "listed is the default and not written: {row}");
+    let c = super::catalog(&f.sink()).unwrap();
+    assert!(c.models[0].listed);
+
+    // A catalog written before the field existed.
+    let old = br#"{"models":[{"namespace":"infervisor","name":"veena","hf":"maya-research/Veena"}]}"#;
+    let parsed: super::Catalog = serde_json::from_slice(old).unwrap();
+    assert!(parsed.models[0].listed);
+}
+
+#[test]
+fn an_unlisted_push_stays_unlisted_until_relisted() {
+    let f = Fixture::new("unlisted");
+    let out = f.push(
+        None,
+        &Options {
+            listed: Some(false),
+            ..Default::default()
+        },
+    );
+    assert_eq!(out.generation, 1);
+    assert_eq!(catalog_of(&f)["models"][0]["listed"], false);
+    // Published all the same: a client resolves it by name.
+    f.resolve(&Trust::none()).unwrap();
+
+    // A later push without the flag (a new generation here) keeps the row.
+    std::fs::write(f.assets.join("interp_sm90a.cubin"), b"ELF-cubin-v2").unwrap();
+    let g2 = f.push(None, &Options::default());
+    assert_eq!(g2.generation, 2);
+    assert_eq!(catalog_of(&f)["models"][0]["listed"], false);
+
+    // And an explicit relist on push, or `catalog list`, lifts it.
+    f.push(
+        None,
+        &Options {
+            listed: Some(true),
+            ..Default::default()
+        },
+    );
+    assert!(catalog_of(&f)["models"][0].get("listed").is_none());
+}
+
+#[test]
+fn catalog_list_and_unlist_write_only_the_row() {
+    use super::{set_listed, Listing};
+    let f = Fixture::new("catalog-set");
+    let key = SecretKey::generate("k").unwrap();
+    f.push(Some(&key), &Options::default());
+    let index_before = f.read("v1/infervisor/veena/index.json");
+    let sig = f.sig_key();
+
+    let sink = f.sink();
+    assert_eq!(set_listed(&sink, "infervisor", "veena", false).unwrap(), Listing::Changed);
+    assert_eq!(catalog_of(&f)["models"][0]["listed"], false);
+    assert_eq!(set_listed(&sink, "infervisor", "veena", false).unwrap(), Listing::Unchanged);
+    assert_eq!(set_listed(&sink, "infervisor", "veena", true).unwrap(), Listing::Changed);
+    assert!(catalog_of(&f)["models"][0].get("listed").is_none());
+
+    // Nothing under v1/ moved: the signed index is byte-identical and its
+    // signature still verifies.
+    assert_eq!(f.read("v1/infervisor/veena/index.json"), index_before);
+    assert!(f.has(&sig));
+    f.resolve(&Trust(vec![key.public()])).unwrap();
+
+    // A name that was never published is refused, not reserved.
+    let e = set_listed(&sink, "infervisor", "nope", false)
+        .unwrap_err()
+        .to_string();
+    assert!(e.contains("nothing published"), "{e}");
+    assert_eq!(catalog_of(&f)["models"].as_array().unwrap().len(), 1);
+}
+
+#[test]
+fn unlisting_survives_the_catalog_being_rewritten_by_a_push() {
+    // A second model's push rewrites catalog.json; the first model's row,
+    // unlisted, is carried as is.
+    use super::set_listed;
+    let f = Fixture::new("catalog-carry");
+    f.push(None, &Options::default());
+    set_listed(&f.sink(), "infervisor", "veena", false).unwrap();
+    // Same build pushed again: the catalog row is "present and current"
+    // only if `listed` is part of what is compared.
+    let again = f.push(None, &Options::default());
+    assert!(again.unchanged);
+    assert_eq!(catalog_of(&f)["models"][0]["listed"], false);
+}

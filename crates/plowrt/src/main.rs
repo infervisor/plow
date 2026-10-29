@@ -864,9 +864,26 @@ enum Cmd {
         /// Another name the model answers to in the index; repeatable.
         #[arg(long = "alias")]
         aliases: Vec<String>,
+        /// Publish unlisted: `load <name>` works, listings (the site,
+        /// `catalog show`) leave the model out. A later push without this
+        /// flag keeps the row unlisted; `catalog list` relists it.
+        #[arg(long, default_value_t = false)]
+        unlisted: bool,
         /// Report what would be written, and write nothing.
         #[arg(long, default_value_t = false)]
         dry_run: bool,
+    },
+
+    /// The registry's catalog: which published models listings show.
+    /// Listing never touches `v1/`: an unlisted model stays published and
+    /// loads by name.
+    #[cfg(feature = "dist")]
+    Catalog {
+        #[command(subcommand)]
+        action: CatalogAction,
+        /// `r2://[<account-id>/]<bucket>`, `s3://<bucket>` or `file:///dir`.
+        #[arg(long, default_value = "r2://", global = true)]
+        to: String,
     },
 
     /// Publish released `plowrt` binaries (`nix build .#plowrt-release`
@@ -905,6 +922,23 @@ enum Cmd {
         /// Where the secret key is written (mode 0600; never overwritten).
         #[arg(long)]
         out: PathBuf,
+    },
+}
+
+#[cfg(feature = "dist")]
+#[derive(Subcommand)]
+enum CatalogAction {
+    /// Every row, listed or not.
+    Show,
+    /// Show the model in listings again.
+    List {
+        /// `[<namespace>/]<name>`.
+        model: String,
+    },
+    /// Leave the model out of listings; it stays published.
+    Unlist {
+        /// `[<namespace>/]<name>`.
+        model: String,
     },
 }
 
@@ -1446,6 +1480,7 @@ async fn async_main(
             tok_s,
             concurrency,
             aliases,
+            unlisted,
             dry_run,
         } => dist_cmd::report((|| {
             let key_file = key_file.or_else(|| {
@@ -1472,10 +1507,17 @@ async fn async_main(
                     tok_s,
                     concurrency,
                     aliases,
+                    listed: if unlisted { Some(false) } else { None },
                     dry_run,
                 },
             )
         })()),
+        #[cfg(feature = "dist")]
+        Cmd::Catalog { action, to } => dist_cmd::report(match action {
+            CatalogAction::Show => dist_cmd::cmd_catalog_show(&to),
+            CatalogAction::List { model } => dist_cmd::cmd_catalog_set(&to, &model, true),
+            CatalogAction::Unlist { model } => dist_cmd::cmd_catalog_set(&to, &model, false),
+        }),
         #[cfg(feature = "dist")]
         Cmd::PushRuntime {
             releases,
