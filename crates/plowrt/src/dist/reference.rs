@@ -9,7 +9,7 @@
 
 use std::fmt;
 
-pub const DEFAULT_REGISTRY: &str = "dist.infervisor.ai";
+pub const DEFAULT_REGISTRY: &str = "pdist.infervisor.ai";
 pub const DEFAULT_NAMESPACE: &str = "infervisor";
 
 /// A parsed reference. `label` and `generation` are absent for the common case
@@ -28,6 +28,17 @@ impl Reference {
     /// registry root.
     pub fn index_path(&self) -> String {
         format!("v1/{}/{}/index.json", self.namespace, self.name)
+    }
+
+    /// Path of the signature over one version of the index, keyed by that
+    /// version's digest: a reader asks for the signature of exactly the bytes
+    /// it read, so an index is never seen without its own signature and two
+    /// publishers' signatures cannot cross.
+    pub fn signature_path(&self, index_digest: &str) -> String {
+        format!(
+            "v1/{}/{}/sigs/{index_digest}.sig",
+            self.namespace, self.name
+        )
     }
 
     /// Path of one variant's manifest.
@@ -232,16 +243,16 @@ mod tests {
     #[test]
     fn round_trips_through_display() {
         for s in [
-            "dist.infervisor.ai/infervisor/kimi-k3",
-            "dist.infervisor.ai/acme/x:label",
-            "dist.infervisor.ai/infervisor/kimi-k3:label@g7",
+            "pdist.infervisor.ai/infervisor/kimi-k3",
+            "pdist.infervisor.ai/acme/x:label",
+            "pdist.infervisor.ai/infervisor/kimi-k3:label@g7",
         ] {
             assert_eq!(parse(s).unwrap().to_string(), s);
         }
         // The short forms expand rather than round-trip verbatim.
         assert_eq!(
             parse("kimi-k3").unwrap().to_string(),
-            "dist.infervisor.ai/infervisor/kimi-k3"
+            "pdist.infervisor.ai/infervisor/kimi-k3"
         );
     }
 

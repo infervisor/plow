@@ -179,8 +179,20 @@ pub fn build(
         }
         Provenance::Checkpoint => {
             let src = snapshot.join(&tok.file);
-            if !src.is_file() {
-                return Err(RuntimeError::Dist(format!(
+            // A Qwen2-family checkpoint (Qwen3-ASR among them) ships no
+            // `tokenizer.json`, only `vocab.json` + `merges.txt` with the class
+            // in `tokenizer_config.json`; the runtime builds the tokenizer from
+            // those (`HfTokenizer::from_qwen2_files`), so the farm and the
+            // bundle carry the pair instead of refusing the checkpoint.
+            let qwen2 = ["vocab.json", "merges.txt", "tokenizer_config.json"];
+            if !src.is_file() && qwen2.iter().all(|f| snapshot.join(f).is_file()) {
+                for f in &qwen2[..2] {
+                    link(&snapshot.join(f), &dir.join(f))?;
+                    link(&snapshot.join(f), &bundle_dir.join(f))?;
+                }
+            } else {
+                if !src.is_file() {
+                    return Err(RuntimeError::Dist(format!(
                     "{}: {} declares its tokenizer comes from the checkpoint, but {} has none. \
                      A checkpoint that ships only `tiktoken.model` needs a generated \
                      tokenizer.json — that is what `scripts/kimi_k3_tokenizer.py` produces, and \
@@ -189,11 +201,12 @@ pub fn build(
                     bundle.name,
                     snapshot.display()
                 )));
+                }
+                link(&src, &dir.join(&tok.file))?;
+                // The runtime reads the tokenizer from the ASSETS dir, so the
+                // bundle needs it too.
+                link(&src, &bundle_dir.join(&tok.file))?;
             }
-            link(&src, &dir.join(&tok.file))?;
-            // The runtime reads the tokenizer from the ASSETS dir, so the
-            // bundle needs it too.
-            link(&src, &bundle_dir.join(&tok.file))?;
         }
     }
     for f in SIDECAR_FILES {

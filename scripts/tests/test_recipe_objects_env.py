@@ -20,7 +20,7 @@ import tempfile
 import unittest
 
 ROOT = pathlib.Path(__file__).resolve().parents[2]
-# `check_recipe.py` imports its sibling `plow_dist` bare, as the CLI does.
+# `check_recipe.py` imports its sibling `recipe_common` bare, as the CLI does.
 sys.path.insert(0, str(ROOT / "scripts"))
 
 
@@ -48,20 +48,20 @@ def _defines_for(env: dict, out: pathlib.Path) -> dict:
     )
     if r.returncode != 0:
         raise AssertionError(f"build_gfx942.sh refused env {env}:\n{r.stdout}\n{r.stderr}")
-    pd = _load("plow_dist")
-    return pd.load_json(out / "build_defines.json")
+    rc = _load("recipe_common")
+    return rc.load_json(out / "build_defines.json")
 
 
 @unittest.skipUnless(os.environ.get("IN_NIX_SHELL"), "build_gfx942.sh needs the nix toolchain")
 class RecipeObjectsEnvTests(unittest.TestCase):
     def test_every_gfx942_recipe_env_produces_the_defines_it_claims(self):
-        pd = _load("plow_dist")
+        rc = _load("recipe_common")
         check_recipe = _load("check_recipe")
         recipes = sorted(ROOT.glob("recipes/*/*/*.toml"))
         self.assertTrue(recipes, "no recipes found")
         checked = 0
         for path in recipes:
-            recipe = pd.load_toml(path)
+            recipe = rc.load_toml(path)
             obj = recipe.get("objects") or {}
             if obj.get("script") != "scripts/build_gfx942.sh":
                 continue

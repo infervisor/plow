@@ -179,6 +179,7 @@ fn replay(bundle: &ModelBundle, body: &Value) -> Value {
         tool_support,
         reasoning_mode,
         reasoning_open,
+        reasoning_mode != ReasoningMode::None && bundle.think_markers().is_ok(),
         bundle,
         false,
         opener.as_deref(),

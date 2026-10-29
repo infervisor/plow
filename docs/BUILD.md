@@ -24,12 +24,14 @@ network fetch, no flake input.
 a deterministic tarball, its sha256, and a `release.json` recording version,
 commit, triple and feature set. The version is `<semver>+<git12>`, derived from
 `[workspace.package]` rather than written out per derivation. A build from a
-modified checkout carries `-dirty` and the publisher refuses it, because it names
+modified checkout carries `-dirty` and must not be published, because it names
 a commit it does not correspond to.
 
-`scripts/release_runtime.py` publishes those binaries;
-`scripts/release_dist.py` releases model assets, which advance on their own
-cadence. Full contract: [`DISTRIBUTION.md`](DISTRIBUTION.md).
+A dynamic Linux release is patched to the host's loader inside the build (glibc
+2.38 or newer on the host). `plowrt push-runtime --release <output dir>` records
+the binaries under `v1/runtime/` and publishes `scripts/install.sh`; `plowrt
+push` releases model assets, which advance on their own cadence. Full contract:
+[`DISTRIBUTION.md`](DISTRIBUTION.md).
 
 ## One binary for CPU and GPU
 
