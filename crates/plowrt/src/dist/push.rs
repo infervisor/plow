@@ -127,7 +127,7 @@ pub fn catalog(sink: &dyn Sink) -> Result<Catalog> {
 pub fn set_listed(sink: &dyn Sink, namespace: &str, name: &str, listed: bool) -> Result<Listing> {
     for _ in 0..4 {
         let (mut catalog, cond) = match sink.get("catalog.json")? {
-            Some((raw, etag)) => (parse::<Catalog>("catalog.json", &raw)?, Cond::IfMatch(etag)),
+            Some((raw, etag)) => (parse_to_rewrite::<Catalog>("catalog.json", &raw)?, Cond::IfMatch(etag)),
             None => (Catalog::default(), Cond::IfNoneMatchAny),
         };
         let Some(row) = catalog
@@ -252,6 +252,56 @@ fn parse<T: serde::de::DeserializeOwned>(what: &str, bytes: &[u8]) -> Result<T> 
         .map_err(|e| dist(format!("{what}: not valid JSON for this schema: {e}")))
 }
 
+/// Parse a document this publisher is about to rewrite (an index, the
+/// catalog, the runtime index). Readers are lenient, so a client a version
+/// behind still reads what a newer publisher wrote. A writer must not be: it
+/// would write the document back without the fields it does not know. Such a
+/// field is refused by name instead.
+pub(crate) fn parse_to_rewrite<T>(what: &str, bytes: &[u8]) -> Result<T>
+where
+    T: serde::Serialize + serde::de::DeserializeOwned,
+{
+    let typed: T = parse(what, bytes)?;
+    let whole: serde_json::Value = parse(what, bytes)?;
+    let again = serde_json::to_value(&typed)
+        .map_err(|e| dist(format!("{what}: serialize: {e}")))?;
+    match dropped(&whole, &again, "") {
+        Some(field) => Err(dist(format!(
+            "{what}: carries `{field}`, which this plowrt does not know and would drop on \
+             rewrite; publish with the plowrt that wrote it, or a newer one"
+        ))),
+        None => Ok(typed),
+    }
+}
+
+/// The first field of `was` that `now` lost, as a path. Losing a value the
+/// writer omits as a default (null, empty, a `listed: true`) loses nothing.
+fn dropped(was: &serde_json::Value, now: &serde_json::Value, at: &str) -> Option<String> {
+    use serde_json::Value;
+    let path = |k: &str| if at.is_empty() { k.to_string() } else { format!("{at}.{k}") };
+    match (was, now) {
+        (Value::Object(a), Value::Object(b)) => a.iter().find_map(|(k, x)| match b.get(k) {
+            Some(y) => dropped(x, y, &path(k)),
+            None => {
+                let default = match x {
+                    Value::Null => true,
+                    Value::Array(v) => v.is_empty(),
+                    Value::Object(m) => m.is_empty(),
+                    Value::Bool(true) => k == "listed",
+                    _ => false,
+                };
+                (!default).then(|| path(k))
+            }
+        }),
+        (Value::Array(a), Value::Array(b)) => a
+            .iter()
+            .zip(b)
+            .enumerate()
+            .find_map(|(i, (x, y))| dropped(x, y, &format!("{at}[{i}]"))),
+        _ => None,
+    }
+}
+
 /// Compress for transport: the published blob is `.zst` when that is smaller,
 /// plain otherwise. Safetensors barely compress, so a large file gets the fast
 /// level; everything else the thorough one. Staged in `dir`, hashed as it is
@@ -348,7 +398,7 @@ fn ensure_catalog(
 ) -> Result<()> {
     for _ in 0..4 {
         let (mut catalog, cond) = match sink.get("catalog.json")? {
-            Some((raw, etag)) => (parse::<Catalog>("catalog.json", &raw)?, Cond::IfMatch(etag)),
+            Some((raw, etag)) => (parse_to_rewrite::<Catalog>("catalog.json", &raw)?, Cond::IfMatch(etag)),
             None => (Catalog::default(), Cond::IfNoneMatchAny),
         };
         let mine = |m: &CatalogEntry| m.namespace == bundle.namespace && m.name == bundle.name;
@@ -448,7 +498,7 @@ pub fn push(
                     super::sign::verify(&raw, sig.as_deref(), trust)
                         .map_err(|e| dist(format!("{index_key}: {e}")))?;
                 }
-                Some((parse(&index_key, &raw)?, etag, raw))
+                Some((parse_to_rewrite(&index_key, &raw)?, etag, raw))
             }
             None => None,
         };
@@ -632,12 +682,23 @@ pub fn push(
         // expose a bundle whose dependencies the registry lacks.
         for l in bundle.objset.iter().flat_map(|o| &o.lowrung) {
             let key = format!("v1/objsets/{}.json", l.objset_id);
-            if sink.head(&key)?.is_none() {
+            let Some((published, _)) = sink.get(&key)? else {
                 return Err(dist(format!(
                     "{}: rung override {} names {key}, which is not published; a rung's \
                      objset is published before the bundle that depends on it",
                     sink.describe(),
                     l.max
+                )));
+            };
+            // A client checks the rung against the bytes served, so the
+            // bundle must name their digest, not that of a local copy.
+            let got = Digest::of(&published);
+            if got.as_str() != l.sha256 {
+                return Err(dist(format!(
+                    "{}: rung override {} records {} for {key}, the registry serves {got}",
+                    sink.describe(),
+                    l.max,
+                    l.sha256
                 )));
             }
         }

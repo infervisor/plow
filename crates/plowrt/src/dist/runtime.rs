@@ -325,11 +325,10 @@ pub fn push_runtime(sink: &dyn Sink, dirs: &[ReleaseDir], opts: &Options) -> Res
     }
 
     // 2. The index, replaced only if still the one read.
-    let mut published_latest = String::new();
     for attempt in 0..4 {
         let (mut index, cond) = match sink.get(RUNTIME_INDEX)? {
             Some((raw, etag)) => (
-                parse::<RuntimeIndex>(RUNTIME_INDEX, &raw)?,
+                super::push::parse_to_rewrite::<RuntimeIndex>(RUNTIME_INDEX, &raw)?,
                 Cond::IfMatch(etag),
             ),
             None => (RuntimeIndex::default(), Cond::IfNoneMatchAny),
@@ -366,7 +365,6 @@ pub fn push_runtime(sink: &dyn Sink, dirs: &[ReleaseDir], opts: &Options) -> Res
         if !opts.keep_latest || index.latest.is_empty() {
             index.latest = version.clone();
         }
-        published_latest = index.latest.clone();
         let bytes = serde_json::to_vec_pretty(&index)
             .map_err(|e| dist(format!("{RUNTIME_INDEX}: serialize: {e}")))?;
         match put_bytes(sink, RUNTIME_INDEX, &bytes, "application/json", cond)? {
@@ -380,33 +378,8 @@ pub fn push_runtime(sink: &dyn Sink, dirs: &[ReleaseDir], opts: &Options) -> Res
             }
         }
     }
-    out.latest = published_latest.clone();
-
     // 3. The pointer install.sh reads: the version string, nothing to parse.
-    let cond = match sink.get(RUNTIME_LATEST)? {
-        Some((raw, etag)) => {
-            if String::from_utf8_lossy(&raw).trim() == published_latest {
-                Cond::None
-            } else {
-                Cond::IfMatch(etag)
-            }
-        }
-        None => Cond::IfNoneMatchAny,
-    };
-    if cond != Cond::None {
-        if let Put::PreconditionFailed = put_bytes(
-            sink,
-            RUNTIME_LATEST,
-            format!("{published_latest}\n").as_bytes(),
-            "text/plain",
-            cond,
-        )? {
-            return Err(dist(format!(
-                "{RUNTIME_LATEST} changed under this push; the index is published, run it \
-                 again to move the pointer"
-            )));
-        }
-    }
+    out.latest = sync_latest(sink)?;
 
     // 4. The installer. Not versioned: it reads `latest`.
     if let Some(script) = &opts.install_script {
@@ -430,6 +403,38 @@ pub fn push_runtime(sink: &dyn Sink, dirs: &[ReleaseDir], opts: &Options) -> Res
         out.install_script = true;
     }
     Ok(out)
+}
+
+/// Copy the index's `latest` into the plain-text pointer. The index is the
+/// one record of promotion; the pointer is derived from it, never from what
+/// this push meant to write. A publisher that stalls between its index write
+/// and here would otherwise put back a version another publisher has since
+/// replaced. The pointer's tag is read before the index, so a write that
+/// succeeds carries a value at least as new as the pointer it replaces, and
+/// every publisher syncs after its own index write: the last one leaves the
+/// two agreeing.
+fn sync_latest(sink: &dyn Sink) -> Result<String> {
+    for _ in 0..8 {
+        let pointer = sink.get(RUNTIME_LATEST)?;
+        let latest = match sink.get(RUNTIME_INDEX)? {
+            Some((raw, _)) => parse::<RuntimeIndex>(RUNTIME_INDEX, &raw)?.latest,
+            None => return Err(dist(format!("{RUNTIME_INDEX} is missing"))),
+        };
+        let cond = match pointer {
+            Some((raw, _)) if String::from_utf8_lossy(&raw).trim() == latest => return Ok(latest),
+            Some((_, etag)) => Cond::IfMatch(etag),
+            None => Cond::IfNoneMatchAny,
+        };
+        let body = format!("{latest}\n");
+        match put_bytes(sink, RUNTIME_LATEST, body.as_bytes(), "text/plain", cond)? {
+            Put::Stored(_) => return Ok(latest),
+            Put::PreconditionFailed => continue,
+        }
+    }
+    Err(dist(format!(
+        "{RUNTIME_LATEST} kept changing under this push; the index is published, run it again \
+         to move the pointer"
+    )))
 }
 
 /// The current UTC time as RFC 3339 seconds, with no date crate: the civil
@@ -467,6 +472,7 @@ fn rfc3339(secs: u64) -> String {
 mod tests {
     use super::*;
     use crate::dist::sink::FileSink;
+    use std::io::Read;
 
     fn tmp(name: &str) -> PathBuf {
         let d = std::env::temp_dir().join(format!(
@@ -553,6 +559,87 @@ mod tests {
         let out = push_runtime(&sink, &[again], &Options::default()).unwrap();
         assert!(out.uploaded.is_empty());
         assert_eq!(out.adopted, vec!["x86_64-unknown-linux-gnu".to_string()]);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// Two publishers race: A writes the index, stalls; B promotes a newer
+    /// version (index and pointer); A resumes. The pointer must stay on B's
+    /// version, which the index names, not go back to A's.
+    #[test]
+    fn a_stalled_publisher_never_moves_latest_behind_the_index() {
+        struct Racing<'a> {
+            inner: &'a FileSink,
+            other: std::sync::Mutex<Option<Box<dyn FnOnce() + Send + 'a>>>,
+        }
+        impl Sink for Racing<'_> {
+            fn head(&self, key: &str) -> Result<Option<String>> {
+                self.inner.head(key)
+            }
+            fn get(&self, key: &str) -> Result<Option<(Vec<u8>, String)>> {
+                if key == RUNTIME_LATEST {
+                    if let Some(b) = self.other.lock().unwrap().take() {
+                        b();
+                    }
+                }
+                self.inner.get(key)
+            }
+            fn put(
+                &self,
+                key: &str,
+                body: &mut dyn Read,
+                len: u64,
+                ct: &str,
+                cond: Cond,
+            ) -> Result<Put> {
+                self.inner.put(key, body, len, ct, cond)
+            }
+            fn describe(&self) -> String {
+                self.inner.describe()
+            }
+        }
+
+        let root = tmp("race");
+        let sink = FileSink::new(root.join("reg"));
+        let triple = "x86_64-unknown-linux-gnu";
+        let a = release(&root.join("a"), "0.1.3+aaaaaaaaaaaa", triple, b"a");
+        let b = release(&root.join("b"), "0.1.4+bbbbbbbbbbbb", triple, b"b");
+        let racing = Racing {
+            inner: &sink,
+            other: std::sync::Mutex::new(Some(Box::new(|| {
+                push_runtime(&sink, &[b], &Options::default()).unwrap();
+            }))),
+        };
+        let out = push_runtime(&racing, &[a], &Options::default()).unwrap();
+        let index: RuntimeIndex =
+            serde_json::from_slice(&read(&sink, RUNTIME_INDEX).unwrap()).unwrap();
+        assert_eq!(index.latest, "0.1.4+bbbbbbbbbbbb");
+        assert_eq!(
+            String::from_utf8(read(&sink, RUNTIME_LATEST).unwrap()).unwrap(),
+            "0.1.4+bbbbbbbbbbbb\n"
+        );
+        assert_eq!(out.latest, "0.1.4+bbbbbbbbbbbb");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// An index a newer publisher wrote, with a field this one does not
+    /// know, is refused rather than rewritten without it.
+    #[test]
+    fn an_index_with_a_field_this_publisher_does_not_know_is_not_rewritten() {
+        let root = tmp("newer");
+        let sink = FileSink::new(root.join("reg"));
+        let triple = "x86_64-unknown-linux-gnu";
+        let a = release(&root.join("a"), "0.1.3+aaaaaaaaaaaa", triple, b"a");
+        push_runtime(&sink, &[a], &Options::default()).unwrap();
+        let mut index: serde_json::Value =
+            serde_json::from_slice(&read(&sink, RUNTIME_INDEX).unwrap()).unwrap();
+        index["releases"][0]["yanked"] = serde_json::json!("cve-2026-1");
+        let (_, etag) = sink.get(RUNTIME_INDEX).unwrap().unwrap();
+        let bytes = serde_json::to_vec(&index).unwrap();
+        sink.put(RUNTIME_INDEX, &mut &bytes[..], bytes.len() as u64, "application/json", Cond::IfMatch(etag))
+            .unwrap();
+        let b = release(&root.join("b"), "0.1.4+bbbbbbbbbbbb", triple, b"b");
+        let e = push_runtime(&sink, &[b], &Options::default()).unwrap_err().to_string();
+        assert!(e.contains("releases[0].yanked"), "{e}");
         let _ = std::fs::remove_dir_all(root);
     }
 

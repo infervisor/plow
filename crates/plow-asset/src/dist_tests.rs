@@ -1011,6 +1011,30 @@ fn an_apple_build_runs_on_any_chip_of_its_family_with_a_warning_off_its_own() {
         &Constraints::default(),
     );
     assert!(table[0].ok() && table[0].warns.is_empty(), "{:?}", table[0]);
+    // A native build beats a newer generation of another chip's build:
+    // generations count builds of one label, and the Pro build would run
+    // serially on a Max.
+    let mut pro_g2 = pro.clone();
+    pro_g2.generation = 2;
+    pro_g2.variant_id = "pro-g2".into();
+    pro_g2.manifest = "manifests/metal3-apple-m4-pro-tp1-2k@g2".into();
+    let mut max = variant(
+        "metal3-apple-m4-max-tp1-2k",
+        1,
+        apple("Apple M4 Max", 32, 36 * gib),
+        "tp",
+        1,
+    );
+    max.status = Status::Emits;
+    max.measured = None;
+    let vs = vec![pro.clone(), pro_g2.clone(), max];
+    let on_max = apple_live("Apple M4 Max", 32, 36 * gib);
+    let picked = select(&vs, &on_max, &Constraints::default()).unwrap();
+    assert_eq!(picked.label, "metal3-apple-m4-max-tp1-2k");
+    // On the Pro, its own label's newest generation.
+    let on_pro = apple_live("Apple M4 Pro", 16, 24 * gib);
+    let picked = select(&vs, &on_pro, &Constraints::default()).unwrap();
+    assert_eq!((picked.label.as_str(), picked.generation), ("metal3-apple-m4-pro-tp1-2k", 2));
     // An NVIDIA part with more SMs than the build is still refused: the grid is baked in.
     let h100 = variant(
         "sm90a-h100-tp1",

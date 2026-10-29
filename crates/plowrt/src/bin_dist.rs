@@ -1198,6 +1198,7 @@ pub fn cmd_catalog_set(to: &str, model: &str, listed: bool) -> Result<(), Err> {
 }
 
 /// `plowrt push-runtime`: see [`dist::runtime`].
+#[cfg(feature = "dist")]
 pub fn cmd_push_runtime(
     releases: &[std::path::PathBuf],
     to: &str,

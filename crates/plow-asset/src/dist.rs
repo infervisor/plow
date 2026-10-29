@@ -539,11 +539,12 @@ pub fn assess<'a>(
     variants.iter().map(|v| assess_one(v, live, c)).collect()
 }
 
-/// Rank key, best first. Generation leads: a newer generation of one label is
-/// the same model on the same hardware, only built better. Among builds for
-/// different parts of one family (possible on a runtime-compiled target), the
-/// one built for the nearest core count leaves the fewest cores idle.
-fn rank(v: &Variant, live: &LiveTarget) -> (u32, Status, bool, i64, u32, i64) {
+/// Rank key across labels, best first. Hardware fit leads: on a
+/// runtime-compiled target a build for another core count runs serially, so
+/// the build for the nearest core count (this exact SKU on a tie) beats any
+/// status or speed. Generations are not compared here: they count builds of
+/// one label, and [`select`] keeps only each label's newest.
+fn rank(v: &Variant, live: &LiveTarget) -> (i64, bool, Status, u32, i64) {
     let exact_sku = live.sku.as_deref() == Some(v.target.sku.as_str());
     let units_gap = -(i64::from(live.units) - i64::from(v.target.units)).abs();
     let tok_s = v
@@ -551,14 +552,7 @@ fn rank(v: &Variant, live: &LiveTarget) -> (u32, Status, bool, i64, u32, i64) {
         .as_ref()
         .map(|m| (m.tok_s * 1000.0) as i64)
         .unwrap_or(0);
-    (
-        v.generation,
-        v.status,
-        exact_sku,
-        units_gap,
-        v.parallel.n,
-        tok_s,
-    )
+    (units_gap, exact_sku, v.status, v.parallel.n, tok_s)
 }
 
 /// Pick the best variant for this machine, or explain why none fits.
@@ -576,14 +570,23 @@ pub fn select<'a>(
     if ok.is_empty() {
         return Err(explain(&table, live));
     }
+    // Within a label the newest servable generation is the same build, only
+    // built better; older ones are out of the running.
+    let mut newest: BTreeMap<&str, u32> = BTreeMap::new();
+    for a in &ok {
+        let g = newest.entry(a.variant.label.as_str()).or_default();
+        *g = (*g).max(a.variant.generation);
+    }
+    ok.retain(|a| newest[a.variant.label.as_str()] == a.variant.generation);
     ok.sort_by_key(|a| std::cmp::Reverse(rank(a.variant, live)));
     if ok.len() > 1 && rank(ok[0].variant, live) == rank(ok[1].variant, live) {
         return Err(format!(
-            "ambiguous: {} and {} rank identically (generation {}, status {:?}, {} GPUs). \
+            "ambiguous: {}@g{} and {}@g{} rank identically (status {:?}, {} GPUs). \
              Name one explicitly with `:<label>@g<n>`.",
             ok[0].variant.label,
-            ok[1].variant.label,
             ok[0].variant.generation,
+            ok[1].variant.label,
+            ok[1].variant.generation,
             ok[0].variant.status,
             ok[0].variant.parallel.n
         ));

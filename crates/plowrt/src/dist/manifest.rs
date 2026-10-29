@@ -1216,10 +1216,15 @@ fn build_lowrung(specs: &[(u32, PathBuf)]) -> Result<Vec<LowRung>> {
             serde_json::from_slice(&raw).map_err(|e| bad(format!("{}: {e}", path.display())))?;
         rung.validate()
             .map_err(|e| bad(format!("{}: {e}", path.display())))?;
+        // The digest covers the manifest as written, every field included:
+        // the typed parse drops fields this plowrt does not know, and a hash
+        // of that would not match the bytes the registry serves.
+        let whole: serde_json::Value =
+            serde_json::from_slice(&raw).map_err(|e| bad(format!("{}: {e}", path.display())))?;
         out.push(LowRung {
             max: *max,
             objset_id: rung.objset_id.clone(),
-            sha256: sha256_bytes(&canonical_json(&rung)?),
+            sha256: sha256_bytes(&canonical_json(&whole)?),
         });
     }
     out.sort_by_key(|r| r.max);

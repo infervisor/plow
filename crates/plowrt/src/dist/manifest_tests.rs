@@ -1184,6 +1184,25 @@ fn rung_overrides_are_pinned_by_digest_and_sorted() {
         assert_eq!(r.sha256, sha256_bytes(&canonical_json(rung).unwrap()));
     }
 
+    // A field this plowrt does not know is part of the bytes a client
+    // verifies, so it is part of the digest.
+    let (max, p, rung) = &paths[0];
+    let mut whole = serde_json::to_value(rung).unwrap();
+    whole["from_a_newer_packer"] = serde_json::json!(true);
+    let extended = canonical_json(&whole).unwrap();
+    std::fs::write(p, &extended).unwrap();
+    let b = build_bundle(
+        &assets,
+        &veena(),
+        Some(&objset),
+        &BundleArgs {
+            lowrung: vec![(*max, p.clone())],
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    assert_eq!(b.objset.unwrap().lowrung[0].sha256, sha256_bytes(&extended));
+
     // A duplicate width is a mistake, not a last-writer-wins override.
     let e = build_bundle(
         &assets,

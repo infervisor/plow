@@ -610,21 +610,24 @@ impl HardwareFingerprint {
         driver: Option<String>,
         name: &str,
     ) -> Option<Self> {
-        if let Some(fp) = Self::from_live(arch, units, mem_bytes, driver.clone()) {
-            return Some(fp);
-        }
         let isa = IsaLevel::from_arch_flag(arch)?;
-        if isa.vendor() != Vendor::Apple || units == 0 {
+        if isa.vendor() != Vendor::Apple {
+            return Self::from_live(arch, units, mem_bytes, driver);
+        }
+        if units == 0 {
             return None;
         }
+        // The live name is the identity. A core count two chips share (a
+        // 10-core M4 and a 10-core M5) says nothing about which one this is,
+        // so it only picks the resource template when the name is unlisted.
         let template = crate::registry::ALL
             .iter()
             .copied()
             .filter(|s| IsaLevel::from_spec(s) == Some(isa))
-            .min_by_key(|s| s.sm_count.abs_diff(units))?;
+            .min_by_key(|s| (s.name != name, s.sm_count.abs_diff(units)))?;
         Some(HardwareFingerprint {
             isa,
-            sku: name.to_string(),
+            sku: if name.trim().is_empty() { template.name } else { name }.to_string(),
             units,
             shared_mem_bytes: template.sm.shared_mem.0,
             regs_32bit: template.sm.regs_32bit,
@@ -959,6 +962,12 @@ mod tests {
         assert_eq!((fp.sku.as_str(), fp.units, fp.mem_bytes), ("Apple M5 Pro", 20, 32 << 30));
         let m4pro = HardwareFingerprint::from_live_named("metal3", 16, 24 << 30, None, "Apple M4 Pro").unwrap();
         assert_eq!(fp.shared_mem_bytes, m4pro.shared_mem_bytes);
+        // A core count a listed chip shares does not borrow its identity:
+        // a 10-core M5 is an M5, not the 10-core M4 the registry lists.
+        let m4 = HardwareFingerprint::from_live_named("metal3", 10, 16 << 30, None, "Apple M4").unwrap();
+        assert_eq!(m4.sku, "Apple M4");
+        let m5 = HardwareFingerprint::from_live_named("metal3", 10, 16 << 30, None, "Apple M5").unwrap();
+        assert_eq!((m5.sku.as_str(), m5.units), ("Apple M5", 10));
         // Only Apple, and only with a real core count.
         assert!(HardwareFingerprint::from_live_named("metal3", 0, 32 << 30, None, "Apple M5").is_none());
         assert!(HardwareFingerprint::from_live_named("gfx942", 999, 256 << 30, None, "MI300X").is_none());

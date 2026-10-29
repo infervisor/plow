@@ -32,15 +32,28 @@ pub struct PublicKey {
 /// client trusts it there by default; `PLOW_TRUSTED_KEYS` replaces it.
 pub const PUBLISHER_KEY: &str = "infervisor-2026:ESz+iXQToovy4GhRUgTHoUKUwMumUA/ls/4tAaEjL3M=";
 
+/// The R2 bucket the public registry is served from.
+pub const PUBLIC_BUCKET: &str = "pdist";
+
 /// Whether `registry` (a `--registry` value, a reference's registry, or a
 /// push destination) is the public registry: its host, or an `r2://`
-/// destination, which is where it is published from.
+/// destination naming its bucket (`CLOUDFLARE_R2_BUCKET` when the
+/// destination names none). Any other bucket is a private registry and
+/// verifies with nothing unless `PLOW_TRUSTED_KEYS` says otherwise.
 pub fn is_public_registry(registry: &str) -> bool {
+    public_registry(registry, std::env::var("CLOUDFLARE_R2_BUCKET").ok().as_deref())
+}
+
+fn public_registry(registry: &str, env_bucket: Option<&str>) -> bool {
+    if let Some(rest) = registry.strip_prefix("r2://") {
+        let bucket = rest.split('/').filter(|p| !p.is_empty()).last().or(env_bucket);
+        return bucket == Some(PUBLIC_BUCKET);
+    }
     let host = registry
         .trim_start_matches("https://")
         .trim_start_matches("http://")
         .trim_end_matches('/');
-    host == super::reference::DEFAULT_REGISTRY || registry.starts_with("r2://")
+    host == super::reference::DEFAULT_REGISTRY
 }
 
 /// The keys a client accepts an index from.
@@ -313,14 +326,31 @@ mod trust_tests {
         assert_eq!(t.0.len(), 1);
         assert_eq!(t.0[0].name, "infervisor-2026");
         assert_eq!(Trust::for_registry(None, "https://pdist.infervisor.ai/").unwrap(), t);
-        assert_eq!(Trust::for_registry(None, "r2://").unwrap(), t);
         assert_eq!(Trust::for_registry(None, "r2://acct/pdist").unwrap(), t);
+        assert_eq!(Trust::for_registry(None, "r2://pdist").unwrap(), t);
         assert!(Trust::for_registry(None, "file:///mirror").unwrap().is_empty());
         assert!(Trust::for_registry(None, "beta-api.infervisor.ai").unwrap().is_empty());
         assert!(Trust::for_registry(None, "s3://bucket").unwrap().is_empty());
     }
 
+    /// Only the public bucket inherits the publisher key: a private R2
+    /// registry is unsigned, and treating it as public would accept its
+    /// first push and refuse every later one (its index carries no
+    /// publisher signature).
     #[test]
+    fn only_the_public_bucket_is_the_public_registry() {
+        assert!(public_registry("r2://acct/pdist", None));
+        assert!(public_registry("r2://pdist", Some("other")));
+        assert!(public_registry("r2://", Some("pdist")));
+        assert!(!public_registry("r2://", None));
+        assert!(!public_registry("r2://", Some("private")));
+        assert!(!public_registry("r2://acct/private", Some("pdist")));
+        assert!(!public_registry("r2://private", None));
+        assert!(!public_registry("s3://pdist", None));
+    }
+
+    #[test]
+    #[cfg(feature = "dist")]
     fn an_explicit_key_list_replaces_the_built_in_one_everywhere() {
         let k = SecretKey::generate("mine").unwrap().public().to_string();
         let t = Trust::for_registry(Some(&k), "pdist.infervisor.ai").unwrap();
