@@ -39,6 +39,7 @@ use rustc_hash::FxHashMap;
 use crate::device::{Backend, DeviceMem, ExecutorClass, ExecutorTarget, LaunchCfg, Module};
 use crate::{DeviceErrorInfo, Result, RuntimeError};
 
+pub(crate) mod aot;
 pub(crate) mod lt;
 pub use lt::library as cublaslt_library;
 pub(crate) mod qwen_gdn;
@@ -658,10 +659,14 @@ type TmapEncodeFn = unsafe extern "C" fn(
     u32,
 ) -> CUresult;
 
+/// `cuFuncGetParamInfo` (CUDA 12.4+): kernel parameter `index`'s byte offset and size.
+type ParamInfoFn = unsafe extern "C" fn(CUfunction, usize, *mut usize, *mut usize) -> CUresult;
+
 pub struct CudaBackend {
     api: Arc<Api>,
     /// See the resolve site in [`CudaBackend::open`] — `None` on pre-12.0 drivers.
     tmap_encode: Option<TmapEncodeFn>,
+    param_info: Option<ParamInfoFn>,
     /// Primary context, retained once; re-bound per call (threads vary).
     ctx: usize,
     /// Handed to every owned `DeviceMem`; its Drop releases the primary ctx.
@@ -787,6 +792,12 @@ impl CudaBackend {
                 .ok()
                 .map(|s| *s)
         };
+        // SAFETY: signature transcribed from cuda.h (CUDA 12.4+); optional like the encoder.
+        let param_info: Option<ParamInfoFn> = unsafe {
+            lib.get::<ParamInfoFn>(b"cuFuncGetParamInfo\0")
+                .ok()
+                .map(|s| *s)
+        };
         let api = Api::resolve(lib)?;
 
         let check = |rc: CUresult, what: &str| -> Result<()> {
@@ -894,6 +905,7 @@ impl CudaBackend {
             let mut be = CudaBackend {
                 api,
                 tmap_encode,
+                param_info,
                 ctx: ctx as usize,
                 freer,
                 capture_exclusion: capture_exclusion(dev),
@@ -1010,6 +1022,145 @@ impl CudaBackend {
         box_rows: u32,
     ) -> Result<[u8; 128]> {
         self.encode_tmap(base, rows, k, box_rows, true)
+    }
+
+    /// Any tiled tensor map (`cuTensorMapEncodeTiled`): `dims` / `boxes` / `elem_strides` of one
+    /// rank, `strides` (bytes) of rank - 1; enum arguments as in cuda.h.
+    #[allow(clippy::too_many_arguments)]
+    pub fn encode_tmap_tiled(
+        &self,
+        dtype: u32,
+        base: u64,
+        dims: &[u64],
+        strides: &[u64],
+        boxes: &[u32],
+        elem_strides: &[u32],
+        interleave: u32,
+        swizzle: u32,
+        l2_promotion: u32,
+        oob_fill: u32,
+    ) -> Result<[u8; 128]> {
+        let f = self.tmap_encode.ok_or_else(|| {
+            RuntimeError::Device("cuTensorMapEncodeTiled unresolved (driver < CUDA 12.0)".into())
+        })?;
+        let rank = dims.len();
+        if !(1..=5).contains(&rank)
+            || strides.len() + 1 != rank
+            || boxes.len() != rank
+            || elem_strides.len() != rank
+        {
+            return Err(RuntimeError::Rejected(format!(
+                "tensor map rank {rank}: {} strides, {} boxes, {} element strides",
+                strides.len(),
+                boxes.len(),
+                elem_strides.len()
+            )));
+        }
+        #[repr(C, align(128))]
+        struct Buf([u8; 128]);
+        let mut m = Buf([0u8; 128]);
+        self.check(
+            unsafe { bind_context(&self.api, self.ctx, self.freer.context_id) },
+            "cuCtxSetCurrent",
+        )?;
+        // SAFETY: driver call; the arrays hold `rank` (strides rank - 1) entries and outlive it;
+        // out is 128 B and 128-aligned.
+        let rc = unsafe {
+            f(
+                &mut m as *mut Buf as *mut c_void,
+                dtype,
+                rank as u32,
+                base as *mut c_void,
+                dims.as_ptr(),
+                strides.as_ptr(),
+                boxes.as_ptr(),
+                elem_strides.as_ptr(),
+                interleave,
+                swizzle,
+                l2_promotion,
+                oob_fill,
+            )
+        };
+        self.check(rc, "cuTensorMapEncodeTiled")?;
+        Ok(m.0)
+    }
+
+    /// `f`'s kernel parameters as `(offset, size)` bytes, in order (`cuFuncGetParamInfo`);
+    /// `None` on a driver without it (< CUDA 12.4).
+    pub fn param_layout(&self, f: KernelFn) -> Result<Option<Vec<(usize, usize)>>> {
+        let Some(info) = self.param_info else {
+            return Ok(None);
+        };
+        self.bind()?;
+        let mut out = Vec::new();
+        loop {
+            let (mut offset, mut size) = (0usize, 0usize);
+            // SAFETY: live function handle; outputs are locals. Past the last parameter the
+            // driver returns CUDA_ERROR_INVALID_VALUE.
+            let rc = unsafe { info(f.0 as CUfunction, out.len(), &mut offset, &mut size) };
+            if rc != 0 {
+                return Ok(Some(out));
+            }
+            out.push((offset, size));
+        }
+    }
+
+    /// `cuFuncSetAttribute(f, attribute, value)` (CUfunction_attribute ids).
+    pub fn set_function_attribute(&self, f: KernelFn, attribute: i32, value: i32) -> Result<()> {
+        self.bind()?;
+        // SAFETY: valid function handle.
+        self.check(
+            unsafe { (self.api.cuFuncSetAttribute)(f.0 as CUfunction, attribute, value) },
+            "cuFuncSetAttribute",
+        )
+    }
+
+    /// `cuLaunchKernelEx` with a 3-D grid and block and int-valued launch attributes
+    /// `(CUlaunchAttributeID, value)`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn launch_ex(
+        &self,
+        f: KernelFn,
+        grid: [u32; 3],
+        block: [u32; 3],
+        smem_bytes: u32,
+        attributes: &[(i32, i32)],
+        params: &mut [*mut c_void],
+        stream: &CudaStream,
+    ) -> Result<()> {
+        self.bind()?;
+        let mut attrs: smallvec::SmallVec<[CUlaunchAttribute; 4]> = attributes
+            .iter()
+            .map(|&(id, v)| {
+                let mut value = [0u8; 64];
+                value[..4].copy_from_slice(&v.to_ne_bytes());
+                CUlaunchAttribute {
+                    id,
+                    pad: [0; 4],
+                    value,
+                }
+            })
+            .collect();
+        let config = CUlaunchConfig {
+            grid,
+            block,
+            shared_mem_bytes: smem_bytes,
+            stream: stream.raw as CUstream,
+            attrs: attrs.as_mut_ptr(),
+            num_attrs: attrs.len() as u32,
+        };
+        // SAFETY: config, attrs and params live for the call; the driver copies arguments out.
+        self.check(
+            unsafe {
+                (self.api.cuLaunchKernelEx)(
+                    &config,
+                    f.0 as CUfunction,
+                    params.as_mut_ptr(),
+                    std::ptr::null_mut(),
+                )
+            },
+            "cuLaunchKernelEx",
+        )
     }
 
     /// Rank-3 bf16 map over a `[n_kv_head][ring_rows][hd]` KV cache tensor: globalDim
