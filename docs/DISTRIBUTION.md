@@ -283,7 +283,9 @@ environment (`AWS_ENDPOINT` for another S3-compatible service).
 `file:///dir` writes the same tree, which is how a release is inspected or
 mirrored by hand. The client is our fork of Apache `object_store`
 (`storyvis/object-store`, pinned by revision); it is pure Rust, so `plowrt`
-links nothing new. Both manifests are built from the recipe, which is the
+links nothing new. Through the REST API a read (the index, the catalog) is
+a plain HTTP GET by `plowrt` itself: that API sends a small body chunked,
+with no Content-Length, which the store client's header parsing refuses. Both manifests are built from the recipe, which is the
 only way to produce them: there is no flag that can disagree with what the
 recipe declares. The recipe's `plow_git` is the provenance a published build
 records; `--plow-git` exists only to reproduce a manifest whose recipe has

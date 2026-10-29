@@ -249,6 +249,58 @@ mod remote {
         part: usize,
         /// The largest object the destination accepts, when it has a cap.
         max_object: Option<u64>,
+        /// Reads done with a plain HTTP GET instead of the store client:
+        /// Cloudflare's REST object API sends a small body chunked, with no
+        /// Content-Length, which `object_store`'s header parsing refuses.
+        rest_read: Option<RestRead>,
+    }
+
+    /// The REST object API's object URL prefix and bearer token.
+    struct RestRead {
+        base: String,
+        token: String,
+    }
+
+    impl RestRead {
+        /// GET `key`; `None` when absent. The API has no HEAD route (405),
+        /// so an existence check is a GET whose body is dropped unread.
+        fn fetch(&self, key: &str) -> Result<Option<ureq::Response>> {
+            let url = format!("{}{key}", self.base);
+            let resp = ureq::AgentBuilder::new()
+                .timeout(std::time::Duration::from_secs(120))
+                .build()
+                .get(&url)
+                .set("Authorization", &format!("Bearer {}", self.token))
+                .call();
+            match resp {
+                Ok(r) => Ok(Some(r)),
+                Err(ureq::Error::Status(404, _)) => Ok(None),
+                Err(ureq::Error::Status(code, r)) => Err(dist(format!(
+                    "GET {url}: HTTP {code}: {}",
+                    r.into_string().unwrap_or_default().chars().take(300).collect::<String>()
+                ))),
+                Err(e) => Err(dist(format!("GET {url}: {e}"))),
+            }
+        }
+
+        fn head(&self, key: &str) -> Result<Option<String>> {
+            Ok(self
+                .fetch(key)?
+                .map(|r| r.header("etag").unwrap_or_default().to_string()))
+        }
+
+        fn get(&self, key: &str) -> Result<Option<(Vec<u8>, String)>> {
+            let Some(r) = self.fetch(key)? else {
+                return Ok(None);
+            };
+            let etag = r.header("etag").unwrap_or_default().to_string();
+            let mut body = Vec::new();
+            r.into_reader()
+                .take(1 << 30)
+                .read_to_end(&mut body)
+                .map_err(|e| dist(format!("{}{key}: {e}", self.base)))?;
+            Ok(Some((body, etag)))
+        }
     }
 
     impl StoreSink {
@@ -269,6 +321,7 @@ mod remote {
                 name,
                 part: PART,
                 max_object: None,
+                rest_read: None,
             })
         }
         fn with_part_size(mut self, part: usize) -> Self {
@@ -277,6 +330,10 @@ mod remote {
         }
         fn with_max_object(mut self, max: u64) -> Self {
             self.max_object = Some(max);
+            self
+        }
+        fn with_rest_read(mut self, base: String, token: String) -> Self {
+            self.rest_read = Some(RestRead { base, token });
             self
         }
 
@@ -395,6 +452,9 @@ mod remote {
     impl Sink for StoreSink {
         fn head(&self, key: &str) -> Result<Option<String>> {
             let k = self.key(key)?;
+            if let Some(rest) = &self.rest_read {
+                return rest.head(k.as_ref());
+            }
             match self.block_on(self.store.head(&k)) {
                 Ok(m) => Ok(Some(m.e_tag.unwrap_or_default())),
                 Err(object_store::Error::NotFound { .. }) => Ok(None),
@@ -404,6 +464,9 @@ mod remote {
 
         fn get(&self, key: &str) -> Result<Option<(Vec<u8>, String)>> {
             let k = self.key(key)?;
+            if let Some(rest) = &self.rest_read {
+                return rest.get(k.as_ref());
+            }
             let got = self.block_on(async {
                 let r = self.store.get(&k).await?;
                 let etag = r.meta.e_tag.clone().unwrap_or_default();
@@ -477,9 +540,8 @@ mod remote {
         let bucket = bucket.ok_or_else(|| {
             dist("no R2 bucket: r2://<account-id>/<bucket> or CLOUDFLARE_R2_BUCKET".into())
         })?;
-        let rest = env("CLOUDFLARE_API_TOKEN")
-            .or_else(|| env("CF_API_TOKEN"))
-            .is_some();
+        let token = env("CLOUDFLARE_API_TOKEN").or_else(|| env("CF_API_TOKEN"));
+        let rest = token.is_some();
         let store: Arc<dyn ObjectStore> = if rest {
             Arc::new(
                 object_store::cloudflare::CloudflareR2Builder::from_env()
@@ -523,11 +585,17 @@ mod remote {
         // "no route matches"), so through it a blob is one PUT; a ~300 MiB
         // packet uploads that way in about a minute. The S3 endpoint keeps
         // the default part size and multipart for anything larger.
-        Ok(Box::new(if rest {
-            sink.with_part_size(REST_SINGLE_PUT)
+        Ok(Box::new(match token {
+            Some(token) => sink
+                .with_part_size(REST_SINGLE_PUT)
                 .with_max_object(REST_MAX_OBJECT)
-        } else {
-            sink
+                .with_rest_read(
+                    format!(
+                        "https://api.cloudflare.com/client/v4/accounts/{account}/r2/buckets/{bucket}/objects/"
+                    ),
+                    token,
+                ),
+            None => sink,
         }))
     }
 
