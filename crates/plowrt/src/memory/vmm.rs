@@ -484,6 +484,19 @@ impl VmmRings {
         self.bounded = true;
     }
 
+    /// Slots the rings serve.
+    pub fn slots(&self) -> usize {
+        self.mapped.len()
+    }
+
+    /// Set the bounded park's cap, releasing what it holds above it.
+    pub fn set_park_cap(&mut self, cap_bytes: u64) {
+        if self.bounded {
+            self.spare_cap = cap_bytes;
+            self.trim_spare();
+        }
+    }
+
     /// Released units kept for reuse ([`Self::enable_handle_recycling`]), parked ones included.
     pub fn spare_bytes(&self) -> u64 {
         let parked = self.parked.iter().filter(|&&p| p).count() as u64;

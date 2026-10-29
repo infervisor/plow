@@ -622,19 +622,6 @@ pub struct RuntimeConfig {
     #[arg(long = "vmm-ring-recycle", env = "PLOW_VMM_RING_RECYCLE", hide = true, default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
     pub vmm_ring_recycle: bool,
 
-    /// CUDA VMM prefix live rings: keep up to N released slots' sliding-ring units mapped in
-    /// place (parked) instead of returning them to the driver. Readmitting a parked slot costs no
-    /// driver call (otherwise unmap + cuMemCreate + map + set_access per unit, ~8 ms a request on
-    /// Gemma-4 26B); held memory is bounded by N slots. 0 = off.
-    #[arg(
-        long = "vmm-ring-park",
-        env = "PLOW_VMM_RING_PARK",
-        default_value_t = 0,
-        hide = true,
-        global = true
-    )]
-    pub vmm_ring_park: u32,
-
     /// CUDA unified token batch: admit (begin_slot + prefix attach) requests the next launch
     /// takes while the current prefill launch runs on the device, instead of before it, whenever
     /// the launch is already full of admitted rows. Admission then costs no GPU time.
