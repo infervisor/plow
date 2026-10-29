@@ -23,13 +23,20 @@ struct PlowFa4Handle {
     plow_fa4_hd512_combine_Kernel_Module_t combine{};
 };
 
-extern "C" unsigned plow_fa4_abi() { return 2; }
+// ABI 3: the KV adapters (runtime/nvidia/kv_dequant_sm90.cu: plow_fa4_kv_gather,
+// plow_fa4_kv_zero_tail, plow_fa4_convert) are linked in.
+extern "C" unsigned plow_fa4_abi() { return 3; }
 
 #ifndef PLOW_FA4_DTYPE
 #define PLOW_FA4_DTYPE 0
 #endif
 // Element type of q / k / v / out the exported entries were compiled for: 0 bf16, 1 fp16.
 extern "C" unsigned plow_fa4_dtype() { return PLOW_FA4_DTYPE; }
+#define PLOW_FA4_STR2(x) #x
+#define PLOW_FA4_STR(x) PLOW_FA4_STR2(x)
+// The emitter reads the ABI and dtype from this marker without loading the library.
+extern "C" __attribute__((used, visibility("default"))) const char plow_fa4_caps[] =
+    "plow_fa4_caps:abi=3:dtype=" PLOW_FA4_STR(PLOW_FA4_DTYPE);
 
 #define PLOW_FA4_MODULES(X) X(h16kv1) X(h16kv1_split) X(h16kv2) X(h16kv2_split) X(combine)
 

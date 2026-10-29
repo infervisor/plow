@@ -950,6 +950,14 @@ impl SegmentRoleValidation for SegmentRoles {
                     .copied()
                     .filter(|&role| plow_asset::segment_roles::requires_object(role)),
             );
+            if !p.library.is_empty() {
+                if decode {
+                    return Err(RuntimeError::Rejected(
+                        "library attention declared on a decode rung".into(),
+                    ));
+                }
+                used.insert(plow_asset::segment_roles::LIBRARY_PREFILL_ATTENTION);
+            }
         }
         // A generated decode object is launched by the runtime alone (riders), so it may be
         // declared without a program use; every other object needs one.
@@ -6750,23 +6758,47 @@ impl GpuEngine {
             }
             None
         };
-        let lib_attention = match lib_attention::LibAttention::paths(assets_dir) {
-            Some((library, object))
+        let lib_attention = match segment_roles.as_ref().and_then(|r| {
+            r.objects
+                .get(&plow_asset::segment_roles::LIBRARY_PREFILL_ATTENTION)
+        }) {
+            Some(object)
                 if prefill
                     .iter()
                     .any(|b| b.lib_attention_segments.iter().any(Option::is_some)) =>
             {
-                let max_kv_heads = prefill
-                    .iter()
-                    .flat_map(|b| b.lib_attention_segments.iter().flatten())
-                    .map(|site| site.kv_heads())
-                    .max()
-                    .unwrap_or(1);
+                let sites = || {
+                    prefill
+                        .iter()
+                        .flat_map(|b| b.lib_attention_segments.iter().flatten())
+                };
+                let max_kv_heads = sites().map(|site| site.kv_heads()).max().unwrap_or(1);
+                // A BF16 cache is read in place: every routed site shares one geometry.
+                let direct = match sites()
+                    .map(|site| site.direct_geometry())
+                    .collect::<std::collections::BTreeSet<_>>()
+                {
+                    g if g.len() == 1 => {
+                        g.into_iter().next().flatten().map(|(kv_heads, kv_stride)| {
+                            lib_attention::Direct {
+                                kv_heads,
+                                kv_stride,
+                                slots: batch as u32,
+                            }
+                        })
+                    }
+                    _ => {
+                        return Err(RuntimeError::Rejected(
+                            "library attention: routed sites mix KV types or geometries".into(),
+                        ))
+                    }
+                };
                 Some(lib_attention::LibAttention::load(
                     &be,
-                    &library,
-                    &object,
+                    assets_dir,
+                    object,
                     max_kv_heads,
+                    direct,
                 )?)
             }
             _ => None,
@@ -6775,7 +6807,12 @@ impl GpuEngine {
         let mut packet_roles: [Option<PacketRole>; plow_asset::segment_roles::MAX_ROLE as usize] =
             std::array::from_fn(|_| None);
         for (&id, object) in segment_roles.iter().flat_map(|r| &r.objects) {
-            if id == plow_asset::segment_roles::NATIVE_DECODE_TC {
+            // The library route loads its own object (`lib_attention`).
+            if matches!(
+                id,
+                plow_asset::segment_roles::NATIVE_DECODE_TC
+                    | plow_asset::segment_roles::LIBRARY_PREFILL_ATTENTION
+            ) {
                 continue;
             }
             if id == plow_asset::segment_roles::FP8_M1 {
@@ -10905,7 +10942,6 @@ impl GpuEngine {
         // The decode route's owner when it has one (same stream; see its load).
         let mut moe_lt = moe_lt_shared;
         let attention_route = attention_gemm::object(assets_dir).is_some();
-        let lib_route = lib_attention::LibAttention::paths(assets_dir).is_some();
         for g in blob.prefill_progs() {
             // Wave-class segmented programs are legal exactly when the SegPf pair is
             // loaded: segments launch per class in order. Otherwise the coarse
@@ -11114,7 +11150,7 @@ impl GpuEngine {
             };
             let moe_instructions = moe_lt::instructions(&moe_segments);
             // Only buckets that run the per-segment launch loop: the route replaces a launch.
-            let attention_gemm_segments = if attention_route
+            let mut attention_gemm_segments = if attention_route
                 && g.t >= config.nv.pf_attn_gemm_min_rows
                 && seg_mode
                 && seg_class.len() > 1
@@ -11133,23 +11169,49 @@ impl GpuEngine {
             } else {
                 Vec::new()
             };
-            // The library route replaces the hd512 sites' native role (generated or not).
-            let lib_attention_segments = if lib_route
-                && seg_mode
+            // The packet's declared library segments; their native role stays the fallback.
+            let declared_library = declared_roles.map_or(&[][..], |(p, _)| &p.library[..]);
+            let lib_attention_segments = if declared_library.is_empty() {
+                Vec::new()
+            } else if !config.nv.pf_attn_library {
+                tracing::info!(
+                    program_index,
+                    "PLOW_PF_ATTN_LIBRARY=0: declared native roles run"
+                );
+                Vec::new()
+            } else if seg_mode
                 && seg_class.len() > 1
                 && qwen_segments.is_empty()
                 && packet_kv_layout(&blob) == plow_asset::live_kv::LAYOUT_HEAD_MAJOR
             {
                 let mut sites =
                     lib_attention::sites(g, &blob.tensors, devp, blob.decode_prog()?.t as usize);
-                for (site, gemm) in sites.iter_mut().zip(&attention_gemm_segments) {
-                    if gemm.is_some() {
+                for (seg, site) in sites.iter_mut().enumerate() {
+                    if !declared_library.contains(&(seg as u32)) {
                         *site = None;
+                    }
+                }
+                if let Some(seg) = declared_library
+                    .iter()
+                    .find(|&&seg| sites.get(seg as usize).is_none_or(Option::is_none))
+                {
+                    return Err(RuntimeError::Rejected(format!(
+                        "program {program_index}: declared library attention segment {seg} is \
+                         not a library site"
+                    )));
+                }
+                // The packet's selection wins over the runtime attention-GEMM knob.
+                for (gemm, site) in attention_gemm_segments.iter_mut().zip(&sites) {
+                    if site.is_some() {
+                        *gemm = None;
                     }
                 }
                 sites
             } else {
-                Vec::new()
+                return Err(RuntimeError::Rejected(format!(
+                    "program {program_index}: declared library attention needs segmented \
+                     head-major prefill (PLOW_PF_ATTN_LIBRARY=0 runs the native roles)"
+                )));
             };
             // Lone norm / residual / GLU segments of the Lt-routed buckets: light launches.
             let light_segments = match light_pf {
@@ -15351,6 +15413,7 @@ fn partial_prefill_roles_keep_bundled_segment_pair_eligible() {
                     plow_asset::segment_roles::INTERPRETER,
                     plow_asset::segment_roles::PREFILL_ATTENTION_HD512_WG32,
                 ],
+                library: Vec::new(),
             })
             .collect(),
     };

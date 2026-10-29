@@ -33,6 +33,15 @@ pub const GENERATED_FIRST: u8 = 18;
 pub const GENERATED_LAST: u8 = 25;
 pub const MAX_ROLE: u8 = GENERATED_LAST;
 
+/// Object ID of a host-launched library attention route (not a segment role: segments keep their
+/// native role, which is the declared fallback). A program lists the segments the library serves
+/// in [`ProgramRoles::library`]; each is a lone `FlashPrefill(Fp8)` instruction.
+pub const LIBRARY_PREFILL_ATTENTION: u8 = 26;
+/// FlashAttention-4 SM90 hd512 forward (`libplow_fa4_hd512.so`, plow_fa4 C ABI 3) over bf16 or
+/// fp16 pages; the suffix is the library's element type (`plow_fa4_dtype`).
+pub const LIBRARY_FA4_HD512_BF16_ABI: &str = "lib_flash_prefill_v1:fa4_hd512:bf16";
+pub const LIBRARY_FA4_HD512_F16_ABI: &str = "lib_flash_prefill_v1:fa4_hd512:f16";
+
 pub fn is_generated(role: u8) -> bool {
     (GENERATED_FIRST..=GENERATED_LAST).contains(&role)
 }
@@ -572,6 +581,10 @@ fn valid_decode_plan(plan: &[[u32; 5]]) -> bool {
 pub struct ProgramRoles {
     pub index: usize,
     pub roles: Vec<u8>,
+    /// Segments [`LIBRARY_PREFILL_ATTENTION`] serves, ascending; their `roles` entry is the
+    /// fallback for launches outside the library's envelope.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub library: Vec<u32>,
 }
 
 fn validate_generated(object: &SegmentObject) -> Result<(), String> {
@@ -604,6 +617,31 @@ fn validate_generated(object: &SegmentObject) -> Result<(), String> {
             })
     {
         return Err("invalid generated packet segment object".into());
+    }
+    Ok(())
+}
+
+fn validate_library(object: &SegmentObject) -> Result<(), String> {
+    let valid_hash = object.sha256.as_deref().is_some_and(|s| {
+        s.len() == 64
+            && s.bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+    });
+    if !valid_hash
+        || !matches!(
+            object.abi.as_str(),
+            LIBRARY_FA4_HD512_BF16_ABI | LIBRARY_FA4_HD512_F16_ABI
+        )
+        || object.file.is_empty()
+        || std::path::Path::new(&object.file)
+            .components()
+            .any(|c| !matches!(c, std::path::Component::Normal(_)))
+        || object.promote_k512.is_some()
+        || object.attention.is_some()
+        || object.gemm.is_some()
+        || object.decode_plan.is_some()
+    {
+        return Err("invalid library attention packet object".into());
     }
     Ok(())
 }
@@ -642,11 +680,18 @@ impl SegmentRoles {
     pub fn validate_schema(&self) -> Result<(), String> {
         if self.version != 1
             || self.programs.is_empty()
-            || self.objects.keys().any(|&id| !requires_object(id))
+            || self
+                .objects
+                .keys()
+                .any(|&id| !requires_object(id) && id != LIBRARY_PREFILL_ATTENTION)
         {
             return Err("unsupported packet segment roles".into());
         }
         for (&id, object) in &self.objects {
+            if id == LIBRARY_PREFILL_ATTENTION {
+                validate_library(object)?;
+                continue;
+            }
             if is_generated(id) {
                 validate_generated(object)?;
                 continue;
@@ -804,8 +849,23 @@ impl SegmentRoles {
                 || program.roles.is_empty()
                 || program.roles.iter().any(|&r| r > MAX_ROLE)
                 || (program.roles.contains(&CUBLASLT) && program.roles.contains(&NATIVE_DECODE_TC))
+                || !program.library.windows(2).all(|w| w[0] < w[1])
+                || program.library.iter().any(|&seg| {
+                    program.roles.get(seg as usize).is_none_or(|&role| {
+                        !(matches!(
+                            role,
+                            INTERPRETER
+                                | PREFILL_ATTENTION
+                                | PREFILL_ATTENTION_HD512_WG32
+                                | PREFILL_ATTENTION_HD512_PX4_BQ64
+                        ) || is_generated(role))
+                    })
+                })
             {
                 return Err("invalid packet segment program".into());
+            }
+            if !program.library.is_empty() {
+                used.insert(LIBRARY_PREFILL_ATTENTION);
             }
             used.extend(
                 program
@@ -831,6 +891,26 @@ impl SegmentRoles {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn library_attention_is_declared_per_program_over_a_native_fallback() {
+        let doc = |abi: &str, library: &str| {
+            format!(
+                r#"{{"version":1,"objects":{{"26":{{"abi":"{abi}","file":"libplow_fa4_hd512.so","sha256":"{}"}}}},
+                "programs":[{{"index":0,"roles":[0,0,0]{library}}}]}}"#,
+                "a".repeat(64)
+            )
+        };
+        let parse =
+            |abi: &str, library: &str| SegmentRoles::from_bytes(doc(abi, library).as_bytes());
+        assert!(parse(LIBRARY_FA4_HD512_BF16_ABI, r#","library":[1]"#).is_ok());
+        assert!(parse(LIBRARY_FA4_HD512_F16_ABI, r#","library":[0,2]"#).is_ok());
+        // Declared but unused, out of range, unordered, unknown ABI.
+        assert!(parse(LIBRARY_FA4_HD512_BF16_ABI, "").is_err());
+        assert!(parse(LIBRARY_FA4_HD512_BF16_ABI, r#","library":[3]"#).is_err());
+        assert!(parse(LIBRARY_FA4_HD512_BF16_ABI, r#","library":[2,1]"#).is_err());
+        assert!(parse("lib_flash_prefill_v1:fa4_hd512:fp8", r#","library":[1]"#).is_err());
+    }
+
     #[test]
     fn fp8_padded_rungs_keep_native_losses_and_near_ties() {
         for m in [64, 1088, 1152, 2112, 2176, 4160, 4224] {
