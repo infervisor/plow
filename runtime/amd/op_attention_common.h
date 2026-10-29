@@ -2369,7 +2369,7 @@ __device__ void d_flash_merge(bf16* __restrict__ O_, const float* __restrict__ O
 #define PLOW_GLM_GF8_ARM 0
 #endif
 
-/* GATHER (sparse top-k / DSA compose, sparse-attn-design.md §3.5): when GATHER, the O(ctx)
+/* GATHER (sparse top-k / DSA compose): when GATHER, the O(ctx)
  * walk runs over the top_k SELECTED positions instead of the dense [lo,hi) range — the latent
  * row for slot t is idx[b*top_k + t] (the on-device index table, the attention twin of the MoE
  * routing_table). Everything else — the absorbed score, online softmax, split, merge — is
@@ -5251,7 +5251,7 @@ __device__ void d_flash_mla_decode_hp8_async(float* __restrict__ Opart, float* _
 #endif
 
 /* ATTN_SELECT — on-device top-k KV selection (DeepSeek DSA).            [DEEPSEEK-MLA]
- * sparse-attn-design.md §3.2. The attention twin of the MoE router: scores the indexer
+ * The attention twin of the MoE router: scores the indexer
  * query against every KV position's index key, keeps the top_k positions per batch, and
  * writes the idx table d_flash_mla_decode<...,GATHER=true> reads (idx[b*top_k + t]).
  *

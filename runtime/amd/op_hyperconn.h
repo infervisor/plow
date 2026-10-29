@@ -1,4 +1,4 @@
-/* op_hyperconn.h — GLM-5.3-Flash's hyper-connections (mHC), ops 121/122.
+/* op_hyperconn.h — GLM-5.3-Flash's hyper-connections (mHC), ops 128/129 (PLOW_DOP_HYPER_CONN_PRE/POST).
  *
  * Ported from vLLM's real reference math (`vllm.model_executor.kernels.mhc.torch::
  * mhc_pre_torch`/`mhc_post_torch` in the vendor image), not derived from prose. Verified
@@ -150,7 +150,7 @@ __device__ __forceinline__ void hc_sinkhorn4_reg(const float* __restrict__ mrow,
 }
 #endif
 
-/* op 121 — hyper-connections pre-block. See the file header for the shape of the whole
+/* op 128 — hyper-connections pre-block. See the file header for the shape of the whole
  * thing; this computes `(post_mix, comb_mix, layer_input)` from `mixes` (an ordinary
  * Gemv/Gemm's output — the projection itself is NOT this op's job) and `residual`.
  *
@@ -180,7 +180,7 @@ __device__ void d_hyperconn_pre(float* __restrict__ post_mix, float* __restrict_
      * the end of a head `mixes` row, so the flag skips the whole lane-0 block and leaves
      * post_mix/comb_mix untouched (the emitter passes TENSOR_NONE for both).
      *
-     * NOT op 122 mode 2. Mode 2's arithmetic mean is the right function for V4's OTHER n -> 1
+     * NOT op 129 mode 2. Mode 2's arithmetic mean is the right function for V4's OTHER n -> 1
      * contraction -- the plain `h.mean(dim=2)` DSpark target taps at model.py:920 -- and the
      * WRONG one here; the tower exit is gated and learned. Both survive.  [DSV4-MHC] */
     const unsigned n3 = head_only ? n : (2 * n + n * n);
@@ -458,7 +458,7 @@ __device__ void d_hyperconn_pre_rows(float* __restrict__ post_mix, float* __rest
 }
 #endif
 
-/* One 8-channel step of op 122's n = 4 vector path: output stream j at channels d..d+7. Shared
+/* One 8-channel step of op 129's n = 4 vector path: output stream j at channels d..d+7. Shared
  * with d_gemv_f32_wg_hcpost so the fold computes the residual with this exact code. */
 __device__ __forceinline__ bf16v8 hc_post4_8(const float* c, const float* p, unsigned j,
                                             const bf16v8* r, const bf16v8 xv) {
@@ -477,7 +477,7 @@ __device__ __forceinline__ bf16v8 hc_post4_8(const float* c, const float* p, uns
 #ifndef PLOW_HC_POST_ROWS
 #define PLOW_HC_POST_ROWS 1
 #endif
-/* op 122 — hyper-connections post-block, paired with op 121.
+/* op 129 — hyper-connections post-block, paired with op 128.
  * `new_residual[j][d] = sum_i comb_mix[i][j] * residual[i][d]  +  post_mix[j] * x_out[d]`
  * — an n x n combine (n=4) plus a broadcast multiply-add. Fully parallel over `d` with no
  * reduction and no LDS/sync needed: every input each thread reads is either per-token
@@ -579,7 +579,7 @@ __device__ void d_hyperconn_post(bf16* __restrict__ new_residual, const bf16* __
     }
 }
 
-/* PLOW_GLM_HC_POST_FOLD: op 135 (GemvF32, the mHC mix) with op 122 (mode 0, n = 4) folded in.
+/* PLOW_GLM_HC_POST_FOLD: op 135 (GemvF32, the mHC mix) with op 129 (mode 0, n = 4) folded in.
  * x = new_residual is not read but formed per step from the HyperConnPost operands with
  * hc_post4_8, and the workgroups of column 0 store it for the later readers. The dot product
  * is d_gemv_f32_wg's (workgroup per output, per-step terms added in step order, contraction off),
