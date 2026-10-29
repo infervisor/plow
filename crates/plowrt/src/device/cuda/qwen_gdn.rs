@@ -29,6 +29,11 @@ const UPSTREAM: [(&str, &str); 3] = [
     ("nvidia_cutlass_dsl", "4.6.2"),
 ];
 /// cuda.h enums the export's tensor maps use.
+/// Bytes per parameter the export's host code defines (the builder's `DEFINED`): an exemplar
+/// masking any of them is refused, so the check cannot be weakened by the manifest.
+const DEFINED: [usize; 22] = [
+    12, 12, 64, 4, 64, 4, 64, 4, 64, 4, 12, 12, 8, 12, 4, 4, 4, 4, 4, 4, 4, 4,
+];
 const BFLOAT16: u32 = 9;
 const SWIZZLE_32B: u32 = 1;
 const SWIZZLE_128B: u32 = 3;
@@ -152,6 +157,16 @@ fn load_kernel(be: &CudaBackend, path: &Path) -> Result<Kernel> {
     let kernel = Kernel::load(be, &image, entry)?;
     for x in &entry.exemplars {
         let (tokens, nseq, p) = exemplar_operands(x)?;
+        if x.params.len() != DEFINED.len()
+            || x.params
+                .iter()
+                .zip(DEFINED)
+                .any(|(h, d)| h.get(..2 * d).is_none_or(|h| h.contains("..")))
+        {
+            return Err(rejected(format!(
+                "exemplar tokens={tokens} nseq={nseq} masks a defined parameter byte"
+            )));
+        }
         let mut l = Launch::new(&kernel.layout);
         build(be, &mut l, tokens, nseq, &p)?;
         l.matches(x)

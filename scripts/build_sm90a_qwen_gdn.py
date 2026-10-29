@@ -37,26 +37,70 @@ ADDRS = [(0x7f - i) << 40 for i in range(10)]
 # in both fills); `unread()` proves the kernel never loads it.
 DEFINED = [12, 12, 64, 4, 64, 4, 64, 4, 64, 4, 12, 12, 8, 12] + [4] * 8
 TMAPS = {2, 4, 6, 8}
-# sm_90 kernel parameters start at this constant-bank offset.
+# sm_90: kernel parameters start at c[0x0][PARAM_BASE]; c[0x0][PARAM_ADDR] holds their generic address.
 PARAM_BASE = 0x210
+PARAM_ADDR = 0x198
+
+
+class Unproven(Exception):
+    pass
+
+
+def width(op):
+    if ".128" in op:
+        return 16
+    if ".64" in op:
+        return 8
+    if ".U8" in op or ".S8" in op:
+        return 1
+    if ".U16" in op or ".S16" in op:
+        return 2
+    return 4
 
 
 def unread(cubin_path, layout):
-    """Asserts no masked scalar byte lies in an 8-byte window the kernel loads from c[0x0]."""
+    """Proves the kernel never reads a masked scalar byte. Every c[0x0] operand must be an
+    immediate, its access width covers no masked byte, and each load of the generic parameter base
+    (c[0x0][PARAM_ADDR]) is used only to form a tensor-map parameter's address."""
     sass = subprocess.run([os.environ.get("PLOW_CUOBJDUMP", "cuobjdump"), "-sass", str(cubin_path)],
                           capture_output=True, text=True, check=True).stdout
-    loads = {int(x, 16) for x in re.findall(r"c\[0x0\]\[(0x[0-9a-f]+)\]", sass)}
-    assert loads, "no constant-bank loads in the SASS"
-    for i, ((off, size), d) in enumerate(zip(layout, DEFINED)):
-        if i in TMAPS:
-            continue
-        for b in range(d, size):
-            at = PARAM_BASE + off + b
-            hit = [a for a in loads if a <= at < a + 8]
-            assert not hit, f"parameter {i} byte {b} (c[0x0][{at:#x}]) is loaded by the kernel"
+    lines = [re.sub(r"/\*[0-9a-f]+\*/|;.*", "", l).strip() for l in sass.splitlines()]
+    lines = [l for l in lines if l]
+    masked = {PARAM_BASE + off + b for i, ((off, size), d) in enumerate(zip(layout, DEFINED))
+              if i not in TMAPS for b in range(d, size)}
+    tmap_offsets = {layout[i][0] for i in TMAPS}
+    reads = 0
+    for n, l in enumerate(lines):
+        for idx in re.findall(r"c\[0x0\]\[([^]]*)\]", l):
+            if not re.fullmatch(r"0x[0-9a-f]+", idx):
+                raise Unproven(f"register-indexed parameter read: {l}")
+            at, op = int(idx, 16), l.split()[1] if l.startswith("@") else l.split()[0]
+            reads += 1
+            if masked & set(range(at, at + width(op))):
+                raise Unproven(f"masked parameter byte read: {l}")
+            if at == PARAM_ADDR:
+                dst = re.match(r"(?:@\S+\s+)?ULDC\.64\s+UR(\d+),", l)
+                if not dst:
+                    raise Unproven(f"parameter base not loaded into a uniform pair: {l}")
+                lo, hi = f"UR{dst.group(1)}", f"UR{int(dst.group(1)) + 1}"
+                for u in lines[n + 1:]:
+                    ops = [t.strip() for t in u.split(None, 1)[-1].split(",")] if " " in u else []
+                    srcs, dsts = ops[1:], ops[:1]
+                    if any(t in (lo, hi) for t in srcs):
+                        m = re.fullmatch(rf"UIADD3 (UR\d+), UP\d, {lo}, (0x[0-9a-f]+), URZ", u)
+                        x = re.fullmatch(rf"UIADD3\.X UR\d+, URZ, {hi}, URZ, !?UP\d, !UPT", u)
+                        if not (m and int(m.group(2), 16) in tmap_offsets) and not x:
+                            raise Unproven(f"parameter base used beyond tensor-map addressing: {u}")
+                    if lo in dsts or hi in dsts:
+                        break
+    if not reads:
+        raise Unproven("no parameter reads found in the SASS")
 
 
 def mask(case):
+    for i, (h, d) in enumerate(zip(case["params"], DEFINED)):
+        if ".." in h[:2 * d]:
+            raise Unproven(f"parameter {i}: a defined byte differs between captures")
     case["params"] = [h[:2 * d] + ".." * (len(h) // 2 - d) for h, d in zip(case["params"], DEFINED)]
     return case
 
@@ -89,7 +133,8 @@ def main() -> int:
     path = work / "gdn_sm90.cubin"
     path.write_bytes(cubin)
     layout = aot.kparams(path)
-    assert len(layout) == len(DEFINED), layout
+    if len(layout) != len(DEFINED):
+        raise Unproven(f"layout {layout}")
     unread(path, layout)
     exe = work / "cap_gdn"
     cuda_inc = os.environ.get("PLOW_CUDA_INCLUDE", "/usr/local/cuda/include")
