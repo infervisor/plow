@@ -238,3 +238,71 @@ The library's own split count depends on the batch composition, so its logits mo
 concurrent runs where native's do not. That is the spread seen in the c16 continuation metric:
 0.870-0.891 vs native 0.935 in three runs. At c1, which is deterministic, the library continues
 better than native (0.913 vs 0.891).
+
+## 6. 2026-10-29: the library as packet cubins, no host library
+
+The runtime loads no host library for attention. The only dynamically loaded code is the GPU
+driver and cuBLASLt. The FA4 forward and combine kernels ship as cubins inside the packet object,
+and plowrt launches them itself.
+
+* Object: `plow_fa4_hd512.aot` / `plow_fa4_hd256.aot` (`scripts/fa4_aot/build.py`), a container:
+  `PLOWAOT1`, a u32 manifest length, a JSON manifest, then the blobs. The manifest names the
+  upstream (vLLM 0.28.0, the sha256 of its `vllm_flash_attn/cute` sources, CUTLASS DSL 4.6.2), the
+  host stub it was recorded against (`fa4_sm90_fwd` v1) and the ABI string
+  (`lib_flash_prefill_v2:fa4:...`). Each entry (whole, split, combine per KV-head count, and the
+  `kv_adapters` cubin) carries its symbol, its parameter layout and its sha256.
+* Cubins: extracted from the AOT export's embedded fatbin. They are byte-identical to the cubins
+  the former host library loaded.
+* Launch record: the export's own host code is linked against capture stubs and run on three
+  exemplar shapes (split, long-context decode-like, whole). The record keeps grid, block, dynamic
+  shared memory, launch and function attributes, and the parameter bytes. Bytes the host code
+  never writes are masked: six captures in separate processes over differently filled stacks.
+  The container is byte-reproducible.
+* Runtime (`crates/plowrt/src/device/cuda/aot.rs`, `exec/gpu/fa4_sm90.rs`): `cuModuleLoadData`,
+  `cuTensorMapEncodeTiled`, `cuLaunchKernelEx`. At load the driver's parameter layout
+  (`cuFuncGetParamInfo`) must equal the recorded one. The stub rebuilds every exemplar and the
+  object is refused on any difference: config, any built byte, the defined 64 bytes of each tensor
+  map, or a masked byte the stub does not declare padding. A cubin whose host logic differs from
+  the stub never runs.
+* Removed: the host libraries and their build scripts, the `plow_fa4_caps` marker, the v1 ABI
+  shorthand, the library's object-build host knobs.
+* Two upstream details the runtime reproduces. (1) The upstream host code encodes tensor maps
+  itself and sets two flags the driver encoder leaves clear: byte 8 bit 1 always, and byte 10
+  bit 5 when the last element's byte offset is at least 128 KiB. (2) The varlen O view's base,
+  2^30 rows before `o`, wraps below 2^44, and upstream stores it masked to the 57-bit address
+  field. The driver refuses that base, so plowrt encodes at `o` and stores the wrapped base. The
+  exemplar check refused the first runtime build until (1) was in place.
+* Load and audit: `library prefill attention (FA4) loaded` at load; a
+  `library prefill attention launches` line (served, fallback) every 60 s and at unload. The
+  inventory item `library_prefill_attention` reports declared segments vs candidate sites. The
+  doctor fails a packet whose recipe sets `PLOW_EMIT_ATTN_LIBRARY` but which declares no route.
+
+### Proof: host library vs packet cubins
+
+Same recipes, one emit per route; the cubin arm runs the host-library packet's objects with the
+cubin route's packet and object (the two packets differ only in section 26). Declared segments:
+12B 96, 26B FP8 60, Qwen3.8 BF16 80. Every run served all launches, 0 fallbacks.
+
+Per block (one attention site: KV adapter, conversions, forward, combine), single-kernel timing
+with clocks unlocked, last chunk, median over its sites. Roofline = max(FLOP / 989 TFLOPS,
+bytes / 3.35 TB/s) per kernel:
+
+| block | rows / past | host library | packet cubins | roofline | floor / measured |
+|---|---|---|---|---|---|
+| 12B hd512 FP8 (f16 pool) | 128 / 4096 | 98.2 us | 97.4 us | 30.9 us | 0.32 |
+| 12B hd512 FP8 (f16 pool) | 4096 / 0 | 885.7 us | 886.4 us | 402.0 us | 0.45 |
+| 26B hd512 FP8 (bf16 pool) | 128 / 4096 | 87.2 us | 87.8 us | 31.1 us | 0.35 |
+| 26B hd512 FP8 (bf16 pool) | 4096 / 0 | 756.1 us | 760.3 us | 285.5 us | 0.38 |
+| Qwen3.8 hd256 BF16 (direct) | 128 / 4096 | 41.6 us | 41.6 us | 18.4 us | 0.44 |
+| Qwen3.8 hd256 BF16 (direct) | 4096 / 0 | 322.2 us | 322.5 us | 208.5 us | 0.65 |
+
+The forward kernel dominates: 26-27% of its floor at 128 rows with split-KV (4-5 splits), 37%
+at 4096 causal rows for hd512, 65% for hd256. The 12B f16 pool adds three 43 us conversions at
+4096 rows, each at 93% of its bandwidth floor. Gemma's hd256 sliding layers run the native role
+in both routes.
+
+Bit identity: the last library site's output (`act.at`) is byte-equal in all six cases. So are
+the last-position logits of a 16000-token prompt at chunks 128/1024/4096 (two repeats each) and
+of ctx 4094/4095/8191, for all three models. Whole-prompt times agree within run-to-run noise.
+Greedy 32-token decode streams after ctx 4094/4095/8191 (FNV digest of the tokens) are equal per
+model as well.

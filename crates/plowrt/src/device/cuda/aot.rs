@@ -83,7 +83,10 @@ impl Image {
             return Err(bad(&format!("container format {}", manifest.format)));
         }
         for e in &manifest.entries {
-            let end = e.offset.checked_add(e.bytes).map(|end| base as u64 + end);
+            let end = e
+                .offset
+                .checked_add(e.bytes)
+                .and_then(|end| end.checked_add(base as u64));
             if end.is_none_or(|end| end > bytes.len() as u64) {
                 return Err(bad(&format!("entry {} past the end", e.name)));
             }
@@ -123,7 +126,7 @@ impl Image {
 /// One loaded kernel with its parameter layout and the launch attributes its exemplars carry.
 pub(crate) struct Kernel {
     pub(crate) f: KernelFn,
-    _module: Module,
+    pub(crate) module: Module,
     pub(crate) layout: Vec<(usize, usize)>,
     pub(crate) attrs: Vec<(i32, i32)>,
 }
@@ -139,13 +142,17 @@ impl Kernel {
             .iter()
             .map(|&[o, s]| (o as usize, s as usize))
             .collect();
-        if let Some(driver) = be.param_layout(f)? {
-            if driver != layout {
-                return Err(RuntimeError::Rejected(format!(
-                    "AOT kernel {}: driver parameter layout {driver:?} != recorded {layout:?}",
-                    e.name
-                )));
-            }
+        let driver = be.param_layout(f)?.ok_or_else(|| {
+            RuntimeError::Rejected(format!(
+                "AOT kernel {}: the driver cannot report parameter layouts (needs CUDA 12.4+)",
+                e.name
+            ))
+        })?;
+        if driver != layout {
+            return Err(RuntimeError::Rejected(format!(
+                "AOT kernel {}: driver parameter layout {driver:?} != recorded {layout:?}",
+                e.name
+            )));
         }
         let first = e.exemplars.first().ok_or_else(|| {
             RuntimeError::Rejected(format!("AOT kernel {}: no exemplar launch", e.name))
@@ -164,7 +171,7 @@ impl Kernel {
         }
         Ok(Kernel {
             f,
-            _module: module,
+            module,
             layout,
             attrs: first.attrs.iter().map(|&[a, v]| (a, v)).collect(),
         })
@@ -195,15 +202,22 @@ impl Kernel {
     }
 }
 
-/// One launch's configuration and parameter bytes (128-aligned, so tensor maps stay aligned).
+#[derive(Clone, Copy)]
+#[repr(C, align(128))]
+struct Block([u8; 128]);
+
+/// One launch's configuration and parameter bytes (the buffer is 128-aligned, so a tensor map at
+/// a 64-aligned parameter offset is 64-aligned).
 pub(crate) struct Launch {
     pub(crate) grid: [u32; 3],
     pub(crate) block: [u32; 3],
     pub(crate) smem: u32,
-    params: Vec<[u8; 128]>,
+    params: Vec<Block>,
     layout: Vec<(usize, usize)>,
-    /// Bytes each parameter's builder wrote (exemplar checks compare only those).
+    /// Bytes each parameter's builder wrote, and bytes it declared padding (never read by the
+    /// kernel; a capture may hold stack residue there).
     written: Vec<Vec<bool>>,
+    padding: Vec<Vec<bool>>,
     /// Parameters holding a tensor map.
     tmaps: Vec<bool>,
 }
@@ -215,15 +229,16 @@ impl Launch {
             grid: [0; 3],
             block: [0; 3],
             smem: 0,
-            params: vec![[0u8; 128]; total.div_ceil(128)],
+            params: vec![Block([0u8; 128]); total.div_ceil(128)],
             layout: layout.to_vec(),
             written: layout.iter().map(|&(_, s)| vec![false; s]).collect(),
+            padding: layout.iter().map(|&(_, s)| vec![false; s]).collect(),
             tmaps: vec![false; layout.len()],
         }
     }
 
     fn bytes(&mut self) -> &mut [u8] {
-        // SAFETY: [[u8; 128]] is contiguous plain bytes.
+        // SAFETY: [Block] is contiguous plain bytes (no padding: size 128, align 128).
         unsafe {
             std::slice::from_raw_parts_mut(
                 self.params.as_mut_ptr() as *mut u8,
@@ -250,6 +265,56 @@ impl Launch {
 
     pub(crate) fn u64(&mut self, index: usize, at: usize, v: u64) {
         self.put(index, at, &v.to_le_bytes());
+    }
+
+    /// Declares bytes `[at, at + len)` of parameter `index` padding.
+    pub(crate) fn pad(&mut self, index: usize, at: usize, len: usize) {
+        self.padding[index][at..at + len].fill(true);
+    }
+
+    /// A memref parameter: pointer, i32 dynamic extents, then (8-aligned) i64 dynamic strides;
+    /// every other byte is padding.
+    pub(crate) fn memref(&mut self, index: usize, ptr: u64, shapes: &[u32], strides: &[u64]) {
+        self.u64(index, 0, ptr);
+        self.extents(index, 8, shapes, strides);
+    }
+
+    /// A memref parameter whose dynamic strides are i32.
+    pub(crate) fn memref32(&mut self, index: usize, ptr: u64, shapes: &[u32], strides: &[u32]) {
+        self.u64(index, 0, ptr);
+        let mut all = shapes.to_vec();
+        all.extend_from_slice(strides);
+        self.extents(index, 8, &all, &[]);
+    }
+
+    /// A coordinate tensor parameter: i32 dynamic extents, no pointer.
+    pub(crate) fn coords(&mut self, index: usize, shapes: &[u32]) {
+        self.extents(index, 0, shapes, &[]);
+    }
+
+    /// Writes the extents; the parameter's remaining bytes must be its 8-byte alignment tail
+    /// (anything longer is a field this builder does not know: a layout change).
+    fn extents(&mut self, index: usize, at: usize, shapes: &[u32], strides: &[u64]) {
+        let mut o = at;
+        for &v in shapes {
+            self.u32(index, o, v);
+            o += 4;
+        }
+        if !strides.is_empty() {
+            let aligned = o.next_multiple_of(8);
+            self.pad(index, o, aligned - o);
+            o = aligned;
+        }
+        for &v in strides {
+            self.u64(index, o, v);
+            o += 8;
+        }
+        let size = self.layout[index].1;
+        assert!(
+            size >= o && size - o < 8,
+            "parameter {index}: {size} bytes, the builder knows {o}"
+        );
+        self.pad(index, o, size - o);
     }
 
     pub(crate) fn tmap(&mut self, index: usize, map: &[u8; 128]) {
@@ -287,11 +352,19 @@ impl Launch {
                 let cap = &hex
                     .get(2 * b..2 * b + 2)
                     .ok_or(format!("parameter {i}: short capture"))?;
+                // A masked byte must be one the stub declares padding: a manifest cannot mask
+                // a byte the kernel reads.
                 if *cap == ".." {
+                    if !(self.padding[i][b] && !self.written[i][b]) {
+                        return Err(format!("parameter {i} byte {b}: masked, not padding"));
+                    }
                     continue;
                 }
                 let want =
                     u8::from_str_radix(cap, 16).map_err(|e| format!("parameter {i}: {e}"))?;
+                if self.padding[i][b] && !self.written[i][b] {
+                    continue;
+                }
                 if !self.written[i][b] {
                     return Err(format!(
                         "parameter {i} byte {b}: captured {want:#04x}, not built"

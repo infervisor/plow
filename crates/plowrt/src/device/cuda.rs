@@ -1096,11 +1096,12 @@ impl CudaBackend {
         loop {
             let (mut offset, mut size) = (0usize, 0usize);
             // SAFETY: live function handle; outputs are locals. Past the last parameter the
-            // driver returns CUDA_ERROR_INVALID_VALUE.
+            // driver returns CUDA_ERROR_INVALID_VALUE; any other failure is an error.
             let rc = unsafe { info(f.0 as CUfunction, out.len(), &mut offset, &mut size) };
-            if rc != 0 {
+            if rc == 1 {
                 return Ok(Some(out));
             }
+            self.check(rc, "cuFuncGetParamInfo")?;
             out.push((offset, size));
         }
     }

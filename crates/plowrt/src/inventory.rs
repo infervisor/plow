@@ -306,6 +306,49 @@ pub fn inventory(blob: &DevBlob, raw: &[u8], assets: Option<&Path>) -> crate::Re
         },
     );
 
+    // Library prefill attention: the packet declares it (object 26 + per-program segments); the
+    // doctor fails a recipe that requests it (PLOW_EMIT_ATTN_LIBRARY) on a packet without it.
+    let candidates = blob
+        .progs
+        .iter()
+        .filter(|p| matches!(p.role, ProgramRole::PrefillBucket { .. }))
+        .flat_map(|p| p.insts.iter())
+        .filter(|d| {
+            (d.op == DevOp::FlashPrefill as u16
+                || (d.op == DevOp::FlashPrefillFp8 as u16 && d.i[6] == 512))
+                && matches!(d.i[6], 256 | 512)
+                && d.i[5] == 0
+                && d.fj[2] == u32::MAX
+        })
+        .count();
+    let declared = blob
+        .reserved_metadata(raw, plow_asset::segment_roles::SECTION)?
+        .and_then(|b| serde_json::from_slice::<serde_json::Value>(b).ok())
+        .and_then(|v| {
+            let abi = v["objects"]
+                .get(plow_asset::segment_roles::LIBRARY_PREFILL_ATTENTION.to_string())?["abi"]
+                .as_str()?
+                .to_string();
+            let segments: usize = v["programs"]
+                .as_array()?
+                .iter()
+                .map(|p| p["library"].as_array().map_or(0, Vec::len))
+                .sum();
+            Some((abi, segments))
+        });
+    out.push(match declared {
+        Some((abi, segments)) if segments > 0 => item(
+            "library_prefill_attention",
+            State::On,
+            format!("{segments} segments declared ({abi}); {candidates} candidate sites"),
+        ),
+        _ => item(
+            "library_prefill_attention",
+            State::NotApplicable,
+            format!("not declared; {candidates} candidate sites (PLOW_EMIT_ATTN_LIBRARY)"),
+        ),
+    });
+
     // CUDA arms the unified token batch from the packed-prefill contract and the compact terminal
     // (`exec/gpu/token_batch.rs`); a recurrent chain needs its packed scan's init-state scratch.
     let token_batch = blob.reserved_metadata(raw, plow_asset::token_batch::SECTION)?;

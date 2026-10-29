@@ -183,7 +183,8 @@ TVM_FFI_DISABLE_TORCH_C_DLPACK = "1"
 
 # Full-attention (hd256, 24 heads over 4 KV heads) prefill on every prefill rung through the library
 # route (plowrt exec/gpu/lib_attention.rs, docs/arch/28): FlashAttention-4's SM90 forward exported
-# AOT into <assets>/libplow_fa4_hd256.so, reading the row-interleaved BF16 KV in place (no adapter,
+# AOT as cubins into <assets>/plow_fa4_hd256.aot (plowrt launches them; scripts/fa4_aot/build.py),
+# reading the row-interleaved BF16 KV in place (no adapter,
 # no copy); the generated role stays the declared fallback (PLOW_PF_ATTN_LIBRARY=0 runs it).
 # Qualified 2026-10-29 on lib-attn2 (plowrt a50a58555, packet 48cf345c9314): one 16000-token
 # prompt, packed prefill chunk 4096/1024/512/128 1.403/1.517/1.784/4.325 -> 1.386/1.491/1.757/
@@ -194,9 +195,9 @@ TVM_FFI_DISABLE_TORCH_C_DLPACK = "1"
 # docs/bringup/results/qwen38-27b-h100/comparison.md.
 [[prep]]
 name = "fa4-hd256-lib"
-script = "scripts/build_sm90a_fa4_hd256.py"
+script = "scripts/fa4_aot/build.py"
 python = "{env:PYREF}"
-args = ["{out}/assets", "24", "4"]
+args = ["{out}/assets", "hd256", "24", "4"]
 
 [emit]
 emit = "devblob+cubin"
