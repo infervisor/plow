@@ -1,7 +1,10 @@
 # 28 — Library attention kernels inside plowrt
 
-**Status: experiment (2026-10-28). Kernel-level head-to-head done; one library route
-(hd512 prefill) implemented and under in-model measurement; nothing adopted by a recipe yet.**
+**Status (2026-10-29): the hd512 prefill route (§3) is adopted by two production recipes:
+Gemma-4 12B FP8 with the fp16 page pool (`PLOW_BUILD_FA4_HD512 = "f16"`) and 26B-A4B FP8 with the
+bf16 pool (`= "1"`), both qualified 2026-10-29 (FP32 gate at c1/c8/c32 against same-concurrency
+peers, production-mix replay; evidence in the recipe headers). A Qwen3.8 hd256 FA4 route exists
+only on branch `lib-attn2`, not in prod-next (§4).**
 
 The question: where plowrt's native attention loses to what vLLM and SGLang run, can plowrt run
 the library kernel itself, per rung, without changing the KV layout, the packet contract or the
@@ -81,8 +84,12 @@ runtime-side, host-launched between the CUDA-graph pieces of a prefill launch, p
   site of the launch reuses it. A launch past the pool or 256 requests, or a windowed body, keeps
   the native role. Library launches do not signal the packet's counters: their consumers' waits
   are rewritten to stream order at load (`ordered_waits_for`), which also covers the fallback.
-* Selection today: the two files beside the packet. Per-rung selection by the emitter follows once
-  the per-rung gate says which rungs win.
+* Selection: the packet carries the choice. The recipe's object-build knob
+  `PLOW_BUILD_FA4_HD512` (`1` = bf16 pool, `f16` = fp16 pool; `scripts/build_sm90a_gemma4_segments.sh`)
+  puts `libplow_fa4_hd512.so` and `kv_dequant_sm90.cubin` into the packet's objects directory, and
+  plowrt routes every FP8 hd512 `FlashPrefill` segment through the library when both files are
+  there (`lib_attention.rs` `LIBRARY` / `DEQUANT_OBJECT`), otherwise runs the native role. There is
+  no runtime knob. Per-rung selection by the emitter is not built.
 
 ### In-model prefill (one 16000-token prompt, step_bench packed prefill, 2 x 3 reps ABAB)
 
@@ -155,12 +162,14 @@ the same re-roll repeats at c1/c8/c32.
 On prod-next b36fcf18c (KV store copy fixes), same binary and packet, 2.7/s, 2 reps: native TTFT
 P99 826.7 ms (0.73x vLLM), TPOT P99 71.1 ms; fp16 route 697.2 ms (0.62x, -15.7%), 62.7 ms (-11.9%),
 goodput 9.41 vs 9.39 req/s. The c1 gate is unchanged (deterministic): cont 41/46 against a limit of
-41, so the route passes with no margin and 12B keeps the native role.
+41, a pass with no margin; it also meets the gate-relaxation rule at c1 (kl_trim ≤ 1.10x peer,
+top1 ≥ peer − 0.005, cont ≥ peer − 2), and the 12B recipe adopted the fp16 route on 2026-10-29.
 
 ## 4. Open
 
-* FP32 gate at c1/c8/c32 and a production-mix screen for the hd512 route.
-* FA4 hd256 local (sliding) exports the same way (AOT compile verified); FA3 C++ would need a
-  separate build. Measure FA4 hd256 before choosing.
+* Done: FP32 gate at c1/c8/c32 and production-mix replays for the hd512 route (§3; both recipes).
+* FA4 hd256: a Qwen3.8 BF16 full-attention prefill route through an FA4 hd256 library is on branch
+  `lib-attn2` (with a geometry check against the packet's declaration), not merged into prod-next.
+  Gemma hd256 sliding layers stay native; FA3 C++ would need a separate build.
 * Qwen: FA3 decode/prefill wins of 5-11% at kernel level need an FA3 C++ AOT library and a route
   in `gen_decode.rs`; at 16 attention layers this is ~1-3% of a step.

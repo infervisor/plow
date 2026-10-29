@@ -393,8 +393,9 @@ Concretely, against the object it replaces:
 | Row `0` | must be a decode row — the resolver **traps** if `spans[0].row0 == 0` | spans cover exactly `[0, M)`; pure prefill and pure decode are both legal |
 
 The axis is `PLOW_TOKEN_BATCH`. The build-time `-DPLOW_TOKEN_BATCH=1` define is set on the
-`interp_tokbatch` object row; the **runtime** knob of the same name defaults **on**
-(`RuntimeConfig::token_batch`). Every shipped object is unchanged; see §6.
+`interp_tokbatch` object row. The runtime knob of the same name (and `--token-batch`) was
+removed: the token batch is always selected where the backend, packet and objects support it
+(§3 Open). Every shipped object is unchanged; see §6.
 
 ---
 

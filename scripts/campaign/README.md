@@ -258,6 +258,10 @@ campaign.py rung-sweep ... --stage verify      # mixed packet; per-rung program 
 
 ## Known protocol traps (each cost a run once)
 
+- `build` runs the prebuilt `$CARGO_TARGET_DIR/release/plowc` and never rebuilds it: run
+  `cargo build --release -p plowc` after any devgen/plowc change, set `CARGO_TARGET_DIR` after
+  sourcing a box env file, and rebuild into a fresh `--out` after a killed build
+  (`docs/bringup/agent-tools.md` §9).
 - plowrt names a model by checkpoint slug, not the HF repo id (`model_id`).
 - plowrt `/v1/completions` adds no BOS; Gemma degenerates without it. Use a
   chat-formatted `gate_prompt` with explicit special tokens.

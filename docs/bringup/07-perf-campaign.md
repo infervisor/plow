@@ -3,7 +3,7 @@
 > Turn a serving recipe into a **defensible, reproducible number**. Measure
 > latency and throughput versus concurrency and context on the whole served
 > model, behind a correctness battery, and consolidate the decision into
-> `perf-data/SUMMARY.md`. This is the final stage: its output is a reviewed
+> the campaign's `docs/bringup/results/<campaign>/comparison.md`. This is the final stage: its output is a reviewed
 > campaign result, not another tuning round.
 
 **Precondition:** Stage 6 complete — the model serves at its target concurrency
@@ -18,7 +18,7 @@ filled in and is part of the campaign header: a campaign is a statement about
 **Gate out (bringup complete):** the correctness battery passes (token-identity
 gate + at least one accuracy number), the performance targets are met and
 measured — same-session, uncontended, concurrency- and context-swept — and the
-campaign is consolidated in `perf-data/SUMMARY.md`. Raw files, logs, and
+campaign is consolidated in the campaign's `docs/bringup/results/<campaign>/comparison.md`. Raw files, logs, and
 commands remain in `$RESULTS` on campaign storage. When this gate passes, the
 model is brought up.
 
@@ -342,7 +342,7 @@ been recorded wrongly before:
 Write raw JSON/JSONL, logs, command manifests, binaries, and intermediate
 reducers to `$RESULTS` on campaign NVMe. Disposable screens may use `/dev/shm`.
 Do not make the repository an append-only raw-results store. After review,
-update `perf-data/SUMMARY.md` and retain only compact CSV inputs that directly
+update the campaign's `docs/bringup/results/<campaign>/comparison.md` and retain only compact CSV inputs that directly
 support its decisions. Every retained row names the external campaign location
 or the last Git commit containing its complete artifact set.
 
@@ -390,7 +390,7 @@ The model completes bringup when **all** hold:
    same-session number.
 4. **Swept, not single-point.** A concurrency ladder and a context ladder, not
    one cell.
-5. **Consolidated.** `perf-data/SUMMARY.md` contains the header, honesty banner,
+5. **Consolidated.** The campaign's `docs/bringup/results/<campaign>/comparison.md` contains the header, honesty banner,
    decision tables, per-model limiter, open-work list, and pointers to external
    raw evidence. Any retained CSV directly supports one of those entries.
 6. **The target is on the record.** The write-up names `$GPU`, `$ISA`, `$NCU`,
@@ -496,7 +496,7 @@ The unified campaign driver in `scripts/campaign/campaign.py` orchestrates the c
 |---|---|
 | `scripts/bench/plowbench-doctor.sh` | pre-flight environment & artifact verification (target-aware sm_90a/120/89 vs gfx942/950) |
 | `scripts/bench/plowbench.sh` | canonical bench library: port allocation, server lifecycle, arch detection, artifact checks |
-| `scripts/campaign/campaign.py` | unified campaign driver: `build`, `serve`, `bench`, `probe`, `cert`, `compare`, `roofline`, `loop`, `sweep`, `ledger` |
+| `scripts/campaign/campaign.py` | unified campaign driver: `build`, `qualify`, `serve`, `bench`, `probe`, `gate`, `report`, `rung-sweep`, `cert`, `compare`, `roofline`, `loop`, `sweep`, `ledger`, `block-*` (`--help`) |
 | `scripts/campaign/roofline.py` | roofline analysis, memory bandwidth/compute ceilings, and bottleneck diagnostics |
 | `crates/costmodel/src/roofline.rs` | in-tree Rust cost model roofline analysis module |
 | `perf-data/tools/gpulease` | advisory lease + contention audit (rc=76 = contended) |
@@ -508,7 +508,7 @@ The unified campaign driver in `scripts/campaign/campaign.py` orchestrates the c
 | `perf-data/consolidate_b2_ib.py`, `b2-ib/{slo_capacity,summarize}.py` | raw report JSON → `b2-concurrency-*.json`, max-users-under-SLO |
 | `scripts/bench_gsm8k.sh` | whole-stack accuracy battery (GSM8K 8-shot greedy) |
 | `$RESULTS` | external raw JSON/JSONL, logs, command manifests, and binary evidence |
-| `perf-data/SUMMARY.md` | consolidated decisions, current gaps, retained CSV inventory, and method changes |
+| `docs/bringup/results/<campaign>/comparison.md` + `comparison.csv` | qualified wins and matched serving rows (`perf-data/SUMMARY.md` was deleted in 3fdd322b); a final plow-vs-baseline table comes only from `campaign.py report` (`agent-tools.md`, "Final performance report (strict)") |
 
 Architecture reading: `docs/arch/06-runtime.md` (execution model),
 `docs/arch/11-tuning-coverage.md` and `docs/arch/12-using-the-tuner.md` (what the

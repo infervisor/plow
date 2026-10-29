@@ -1,6 +1,6 @@
 # 08 — Formal Verification
 
-> Every compiled schedule can optionally pass through a Lean 4 verifier that checks seven correctness properties (checkpoints A–G). Failures reject the compilation — proving correctness once at compile time rather than testing every possible runtime interleaving.
+> Every compiled schedule can optionally pass through a Lean 4 verifier that checks seven schedule properties (checkpoints A–G); the same verifier also answers the knob, scope, perf, measured-policy and layout checkpoints (K, S, P, R, L), of which K runs on every devblob emit. Failures reject the compilation — proving correctness once at compile time rather than testing every possible runtime interleaving.
 
 ---
 
@@ -46,7 +46,7 @@ flowchart TD
 
 ## The Checkpoints
 
-Seven checkpoints (A–G) are dispatched by `runCheckpoint` in [`lean-plow/Main.lean`](../../lean-plow/Main.lean); each handler lives in [`Plow.CLI.Checkpoints`](../../lean-plow/Plow/CLI/Checkpoints.lean). The `checkpoint` field of the JSON request selects one. Beyond accept/reject checkpoints, the same CLI answers performance *queries* (`counter_granularity`, `lower_bound`) dispatched by `runQuery`.
+Checkpoints A–G, K, S, P, R and L are dispatched by `runCheckpoint` in [`lean-plow/Main.lean`](../../lean-plow/Main.lean) through the table in [`Plow.CLI.Dispatch`](../../lean-plow/Plow/CLI/Dispatch.lean); each handler lives in [`Plow.CLI.Checkpoints`](../../lean-plow/Plow/CLI/Checkpoints.lean). The `checkpoint` field of the JSON request selects one. Beyond accept/reject checkpoints, the same CLI answers performance *queries* (`counter_granularity`, `lower_bound`) dispatched by `runQuery`.
 
 The checkpoint IDs correspond to compile-pipeline stages: A Rewrite, B Assemble, C Collapse/Relax, D Schedule, E Emit, F Memory. G is a later addition (staged-LDS fit) that has no stage of its own — it re-checks an emit-time obligation.
 
@@ -152,6 +152,23 @@ theorem happensBefore_acyclic {tg : TaskGraph} (p : CounterProtocol tg)
 **What it proves:** `Plow.LdsFit.fits_of_check_ok` — an accepted list contains no instance whose staged demand exceeds the arena. The always-staged family (`gemv_qkv_rows` / `gemv_glu_rows` in `op_gemm.h`) reads `x` only through LDS, so choosing the fused opcode is a promise that `rows·K + scratch` halves fit. Emitting past the fit reads garbage `x` and answers fluently-but-wrong; this checkpoint re-checks the emitter's fusion gate so a path that forgets it is rejected at emit.
 
 **Payload:** the arena size (halves, supplied from `hwspec` by the Rust caller) plus one `StagedOp` record per staged instance (`op`, `idx`, `rows`, `k`, `scratch`). Rejection names the first violating instance. (This is the machine-checked half of the same host/device duplication defect class described in [14 — AMD Arch Divergence §5](14-amd-arch-divergence.md).)
+
+### Checkpoints K, S, P, R, L
+
+These are not schedule stages; their Rust wrappers are `checkpoints/{knobs,scope,perf,policy}.rs`.
+
+* **K — knob consistency** (`Plow.Knobs`): the knob registry plus the resolved sources and the
+  emitter's recorded values; every registered constraint is checked. Runs on every
+  `plowc --emit devblob` by default (needs `PLOW_VERIFY_BIN` or `plow_verify`, else the emit
+  fails); `--no-knob-verify` marks the packet a bring-up artifact.
+* **S — knob scope** (`plowrt knob-scope`): a base and a variant packet compared program by
+  program against a knob's declared scope.
+* **P — performance certificate** (`scripts/perf_cert.py`, CI): a default flip decided from
+  ledger measurements.
+* **R — measured policy** (`Plow.MeasuredPolicy`): a measured per-domain choice is the
+  qualified minimum-cost candidate.
+* **L — layout mapping** (`Plow.MlaLayout`): a packet's padded MLA layout sites address the same
+  elements as the direct layout.
 
 ---
 
@@ -280,7 +297,7 @@ lean-plow/
 
 ### Decision: Opt-In Verification (not mandatory)
 
-**Chosen:** Lean verification is controlled by `Options::lean_verify`, and the whole client is gated behind the `lean-verify` cargo feature. Default: off. When a caller runs the gate by default, only `VerifyError::is_binary_unusable` (no runnable `plow_verify` here) is downgraded to a warning; every rejection is a hard failure.
+**Chosen:** schedule verification (A–G) is controlled by `Options::lean_verify`, and the whole client is gated behind the `lean-verify` cargo feature. Default: off on the schedule path. The devblob emit (every shipping GPU packet) runs three Lean checks by default: checkpoint K (`--no-knob-verify` skips it and marks the packet a bring-up artifact; no runnable `plow_verify` fails the emit), a checkpoint-D ordering certificate (`--lean-verify-devblob`, a missing binary is a recorded skip, a rejection aborts) and the read-only performance oracle (`--lean-oracle-devblob`). When a caller runs the gate by default, only `VerifyError::is_binary_unusable` (no runnable `plow_verify` here) is downgraded to a warning; every rejection is a hard failure.
 
 **Rationale:**
 - Lean toolchain is not universally installed (requires `elan` + `lake build`)

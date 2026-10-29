@@ -369,7 +369,7 @@ is byte-identical when L2 placement is off.
 `PLOW_L2_PLACE` is a `plowc` env var and is **on by default on gfx942 and
 gfx950**; `PLOW_L2_PLACE=0` opts out (`crates/plowc/src/main.rs`, `l2_default`).
 Other architectures stay explicit opt-in. Do not confuse it with the distinct
-`PLOW_L2_PLACE_DISPATCH` (runtime, off) or `PLOW_L2_PLACE_PREFILL` (emit, on).
+`PLOW_L2_PLACE_DISPATCH` (an interpreter object `-D` define, set per object by `scripts/build_gfx942.sh`) or `PLOW_L2_PLACE_PREFILL` (emit, on).
 
 ### Soundness (the segmentation theorem)
 

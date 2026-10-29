@@ -80,10 +80,13 @@ choice is argued from the reader rather than the writer
 (`crates/devgen/src/lib.rs:2393`): the per-slot stride is `kv_head * ring * hd`,
 and at one slot the tensor is byte-identical to the single-sequence cache.
 
-**Measured null:** re-packing these bytes another way — token-major, or
-vLLM-style paging — moved nothing (`crates/devgen/src/lib.rs:2378`: "a
-byte-repack (token-major, or vLLM-style paging) is a measured null here"). The
-layout is settled; do not re-litigate it without a new measurement.
+**Measured:** the old "a byte-repack (token-major, or vLLM-style paging) is a
+measured null here" note (`crates/devgen/src/lib.rs`) predates the repository
+and has no surviving evidence (doc 27 §4.6). The evidence that does exist: the
+P0 paging gate of 2026-10-28 (a page table read inside the persistent decode
+body, identity table, digests equal) made every serving rung 2–3.7 % slower and
+its code was reverted (doc 27 §6.5). The flat layout stays; re-opening it needs a
+new measurement.
 
 ---
 
@@ -479,18 +482,23 @@ no TP, the Gemma-4 hybrid KV shape; `exec/gpu/prefix.rs`
 `select_vmm_prefix_layout`). `PLOW_PREFIX_CACHE=0` is the master switch and
 disables every side effect; with the cache on, the store is unconditional.
 
-**Eviction and the two tiers.** The device slabs run under a soft cap —
-`PLOW_VMM_CACHE_MIB`, else 5% of device memory — and a free-memory floor
-(`PLOW_VMM_CACHE_MIN_FREE_MIB`, default 4%): under pressure the store releases
+**Eviction and the two tiers.** The device slabs run under a free-memory floor
+(`PLOW_VMM_CACHE_MIN_FREE_MIB`, default 4% of the device) and, only when one is
+named, a static soft cap (`PLOW_VMM_CACHE_MIB`, or
+`PLOW_VMM_CACHE_MEMORY_UTILIZATION` as a fraction; default none, the cache grows
+into free memory as vLLM's does): under pressure the store releases
 whole slab chunks back to the slot pool, compacting live blocks first. Victims
 are taken in order: blocks no boundary needs any more; boundaries demoted by a
 session end, abort, disconnect or TTL (`PLOW_PREFIX_SESSION_TTL_S`); then the
 least-recently used live boundary. A session boundary inside its TTL and a
 shared end that has served two attaches are **shielded**: victims only once
 nothing else is left. A victim block spills to the pinned host tier when one is
-armed — on by default, sized by what the host can spare (`MemAvailable` minus
-an eighth of RAM, at least 16 GiB; `PLOW_VMM_HOST_CACHE_MIB` names a size, `0`
-turns it off) — and is reclaimed otherwise. A session's prompt-end boundary
+armed — on by default, sized by what the host can spare: `MemAvailable` minus a
+reserve of `max(MemTotal / 8, 16 GiB)`, capped at `MemTotal / 4`
+(`memory/vmm.rs` `host_tier_default`, cap since 2026-10-28; a serving plowrt
+pins that much host RAM, so nothing memory-hungry runs beside it);
+`PLOW_VMM_HOST_CACHE_MIB` names a size (the 12B recipe: 64 GiB), `0` turns it
+off — and is reclaimed otherwise. A session's prompt-end boundary
 stops 8 rows short of the prompt end: the next turn re-renders the last prompt
 rows (Gemma 4 drops the generation prompt's empty thought channel, 4 tokens), so
 a boundary inside them never attached. `memory/vmm_sim_tests.rs` replays agentic
@@ -544,22 +552,23 @@ admission path are the second cost, paid down by the block pool, the premap
 thread and deferred reclaim.
 
 One measured note, offered as a result rather than an argument: Plow has tried
-the other side. Re-packing this cache token-major, or vLLM-style paged, is
-recorded as a **measured null** on these shapes
-(`crates/devgen/src/lib.rs`) — the kernel-side gather did not pay for
-itself once the layout was head-major. That is a finding about this model family
-and these kernels, not a general claim about PagedAttention, which solves a
-harder allocation problem than Plow's fixed slot count poses.
+the other side. A page table inside the persistent decode body (32-row pages,
+head-major inside the page) cost 2–3.7 % per decode step with an identity table
+(doc 27 §6.5, 2026-10-28; reverted) — the extra address arithmetic and register
+pressure in a 255-register body, not the table load. That is a finding about
+these kernels, not a general claim about PagedAttention, which solves a harder
+allocation problem than Plow's fixed slot count poses.
 
 ---
 
 ## 10. Packed prefill and prefix reuse
 
 A packed launch writes several slots' KV rows in one kernel, so **every row must
-be mapped before the launch**. Only the unified token-batch route or an explicit
-`PLOW_PF_BATCH=1` plans that admission from the packed metadata, reserving the
+be mapped before the launch**. The unified token-batch route (always on; the
+`PLOW_PF_BATCH` opt-in that once stood beside it was removed on 2026-10-03,
+`29963a917`) plans that admission from the packed metadata, reserving the
 admitted slot's rows plus row zero of every other slot
-(`admit_packed_slot`, `gpu.rs:5564`). The admitted rows are the true bound of what the
+(`admit_packed_slot`, `gpu.rs`). The admitted rows are the true bound of what the
 sequence's launches can write (`admission_rows`): `max(prompt + max_tokens + quantum, prompt +
 pad bucket)`, capped at `max_ctx`, where the quantum is one decode step group (a multistep
 launch or the lookahead step runs past the last kept token) and the pad-bucket term applies only
@@ -567,19 +576,18 @@ on packets whose padding is unmasked. It replaced a flat
 `max(block_rows, widest bucket)` margin (4224 rows on the 12B ladder packets), which held
 two to three idle blocks per sequence away from the prefix cache.
 
-The decision is (`gpu.rs:3434-3439`):
+The decision is (`gpu.rs`, "VMM prefix cache selection"):
 
 ```rust
-let prefix_requested = config.nv_vmm_prefix() == Some(true) || prefix_layout.is_some();
-let unified_packed   = config.token_batch && !config.fusion
+let prefix_requested = config.nv_prefix_requested(prefix_layout.is_some());
+let unified_packed   = !config.fusion
                     && prefix_layout.is_some() && packed_prefill_metadata.is_some();
-let packed_prefix    = prefix_requested && (config.pf_batch_cuda() || unified_packed);
+let packed_prefix    = prefix_requested && unified_packed;
 ```
 
-If prefix reuse is on without one of those routes, packed prefill is dropped,
-not silently degraded, and the log says which knobs would restore it. With the
-shipped defaults — token batching on, fusion off — packed prefill and prefix
-reuse coexist.
+If prefix reuse is on without that route (fusion on, or no packed metadata),
+packed prefill is dropped, not silently degraded, and the log says so. With the
+shipped defaults — fusion off — packed prefill and prefix reuse coexist.
 
 Padding interacts here too. A packed bucket's pad rows are charged to one
 request's KV positions unless masked padding is compiled in
@@ -620,16 +628,17 @@ latent cache, not to this dense head-major cache.
 | `PLOW_KV_POOL_MIB` | 512 | Block pool cap; 0 disables |
 | `PLOW_VMM_DEFERRED_RECLAIM` | on | Background unmapping, keeping column 0 mapped |
 | `PLOW_VMM_STALE_RESERVE` | on | CUDA: the reclaimer keeps a retired window's private blocks mapped for the slot's next occupant, within the `PLOW_KV_POOL_MIB` cap; a failed create unmaps one before an OOM |
-| `PLOW_VMM_CACHE_MEMORY_UTILIZATION` | 0.05 | Prefix cache soft cap as a fraction of device memory (4 GiB on an 80 GiB H100) |
+| `PLOW_VMM_CACHE_MEMORY_UTILIZATION` | 0 (no static cap) | Optional prefix cache soft cap as a fraction of device memory; by default the cache grows into free memory down to the pressure floor |
 | `PLOW_VMM_CACHE_MIB` | unset | Explicit soft cap in MiB; overrides the fraction above. `0` = OOM-driven eviction only |
 | `PLOW_VMM_CACHE_MIN_FREE_MIB` | unset = 4% of device | Keep cached prefixes until free device memory would drop below this; `0` rolls back to the byte budget as the only trim trigger |
-| `PLOW_VMM_HOST_CACHE_MIB` | unset = host-reserve rule | Pinned host tier of the block store; `0` = device only |
+| `PLOW_VMM_HOST_CACHE_MIB` | unset = `min(MemAvailable − max(MemTotal/8, 16 GiB), MemTotal/4)` | Pinned host tier of the block store; `0` = device only |
 | `PLOW_PREFIX_SESSION_TTL_S` | 150 | Idle time after which a session's boundary is demoted |
 | `PLOW_VMM_LIVE_RINGS` | off | Grow packet KV with the live frontier; disables prefix auto-selection |
 
-Benchmarks that compare against an engine with prefix caching disabled must set
-`PLOW_PREFIX_CACHE=0`, or random prompts sharing a short lead will silently
-become cache hits.
+Production and every recipe keep the prefix cache on; a matched comparison
+keeps prefix caching on in the reference engine too and draws unique prompts
+per cell, or random prompts sharing a short lead silently become cache hits on
+one side only.
 
 ---
 
@@ -643,4 +652,10 @@ paged repack of this cache is a measured null. The live design is the head-major
 ring in this chapter.
 
 Two further things that do not exist, despite appearing in older notes: there is
-no separate KV append or copy op, and `PLOW_KV_KEEP_MIB` is not a knob.
+no separate KV append or copy op, and no KV-keep size knob.
+
+Retired: the CUDA boundary-snapshot path (contiguous snapshot copies plus
+whole-block VMM multi-mapping, its `PLOW_KV_STORE` switch and snapshot pool
+knobs) was removed on 2026-10-23 (`063c35bd5`, merged with PR #108,
+`a9efb9a04`); the block store of §8 and doc 26 is the only boundary storage on
+CUDA. AMD keeps its `SharedPrefix` snapshot path (doc 26 B2).

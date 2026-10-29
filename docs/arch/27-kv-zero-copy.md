@@ -1,12 +1,15 @@
 # 27 — Zero-copy KV: shared pages for live and cached rows
 
-**Status: design (2026-10-28), measured inputs, not implemented.** Builds on the KV block store
+**Status (2026-10-29): F1 implemented and merged (§6.6, `e75dc6c75`, slot-end wait
+`054022109`); the P0 paging gate failed and its code was reverted (`b36fcf18c`, `297a2c975`,
+§6.5), so track 2 (P2–P4) stopped. §6.1–6.4 record the paging design as evaluated before P0;
+none of it is in the tree. Originally: design (2026-10-28), measured inputs.** Builds on the KV block store
 of `docs/arch/26-kv-block-store.md` (B.6a as implemented). Question: how to remove the copy a
 prefix hit pays today and the second copy of every cached row a live slot holds, for every model
 class plowrt serves (dense, sliding-window hybrids, MoE, recurrent hybrids, MLA) and every
 backend (CUDA, HIP, CPU, later TP), without making a kernel step slower. Two families were
 evaluated: (A) designs that keep today's flat per-slot addressing in the kernels, and (B)
-kernel-native software pages. **Recommendation.** The design that scales is B — live and
+kernel-native software pages. **Recommendation (before P0; superseded by §6.5).** The design that scales is B — live and
 cached rows share one pool of fixed-size pages (page = today's 32-row store block), the kernels
 read through a per-sequence page table whose ids are resident before a work item starts, and the
 store becomes an index over those pages. No family-A option scales: slot parking reaches 1–22 %
@@ -278,7 +281,7 @@ production plan; "risk" is kernel step-time risk.
 | A5 hide copies | restore ahead of admission, paced spills, layer-wise host loads | none (moves them off the critical path) | none | interference §4.3 | all | all | small–medium |
 | **B1 shared pages** | live and cached rows in one page pool; kernels read through a page table, page ids resident before a work item starts; `Window` = ring of pages with tail clone; `State` = out-of-place first update | all device-hit row copies; host hits load into pages that become shared | every duplicate; live ring shrinks to window + chunk pages | §4.4 + per-rung gates | all classes, MLA natively | CUDA, HIP, CPU, TP (same page ids per rank) | large |
 
-## 6. Recommended design
+## 6. Recommended design (paging part not adopted: P0 failed, §6.5)
 
 ### 6.1 Shape
 
@@ -415,7 +418,8 @@ names:
 
 Measured on the 12B FP8 packet (`interp_sm90a_fp8kv` with its recipe flags, RG8/RG8S hd256
 sliding and TC16 hd512 decode bodies), H100, `step_bench` 64 steps after 8 warm-up, ABAB rounds.
-Arms are the same object built three ways: `flat`; `pg32` (`PLOW_NV_KV_PAGED=32`: row =
+Arms are the same object built three ways (experiment defines, reverted 2026-10-29, not in the
+tree): `flat`; `pg32` (`PLOW_NV_KV_PAGED=32`: row =
 `table[slot][r/32] + r%32`, head-major inside the page, page id loaded per row from an L1-resident
 module table); `pg32r` (`PLOW_NV_KV_PAGED_REG=1`: the item's page ids, up to 64, loaded with the
 query into registers and broadcast by warp shuffle). With an identity table both paged arms give
@@ -468,6 +472,8 @@ rep noise; 26B BF16 and FP8 FP32 gates pass, 26B BF16 2.7/s × 2 clean.
 
 ## 7. Validation
 
+Item 0 is F1's and passed (§6.6). Items 1–3 were the paged track's; it stopped at P0 (§6.5).
+
 0. **F1.** Kernels untouched: `step_bench` digests identical to the base packet; replay
    engine-thread time per gather/publish and TTFT p50/p99 against today's build, same stream; the
    host-tier arms at 10 s think (where doc 26 B.6a measured the tier's tail cost).
@@ -489,6 +495,8 @@ rep noise; 26B BF16 and FP8 FP32 gates pass, 26B BF16 2.7/s × 2 clean.
    per class, TTFT/TPOT p50/p99 and goodput.
 
 ## 8. Open questions
+
+Questions 1–3 concern the paged track and are moot while it stays stopped (§6.5).
 
 1. `P` per class: the P0 measurement decides; 32 makes a page a store block and removes the tail
    clone, 128 suits the TMA box and the decode tile.

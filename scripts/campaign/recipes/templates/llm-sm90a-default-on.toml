@@ -13,7 +13,9 @@
 # recipes/infervisor/<model>/<cell>.toml keeps the waivers and their reasons.
 #
 # What a packet can lack and why that is allowed (the only accepted waiver reasons):
-#   prefix_cache      recurrent state (GDN/Mamba) without a boundary snapshot (plowrt refuses it)
+#   prefix_cache      none: a recurrent (GDN) packet serves it too, its state captured at the
+#                     boundary through the KV block store (recipes/infervisor/qwen3.8-27b); the
+#                     inventory still prints n/a for any packet with state.* tensors
 #   token_batch       no packed prefill or no compact terminal on the packet (decode rows ride the
 #                     packed launch; a recurrent chain also needs the packed scan's init-state scratch)
 #   decode_ladder     a model whose decode is bound by one rung at every width (show the step grid)
@@ -84,7 +86,7 @@ PLOW_FUSE_ARGMAX = "1"
 [serve.env]
 # Live KV: KV reserved virtually at the ceiling, committed per slot as the frontier grows.
 PLOW_VMM_LIVE = "1"
-# Prefix reuse (VMM prefix pool). Recurrent networks: plowrt refuses it; waive it below.
+# Prefix reuse (VMM prefix pool, KV block store). Always on, recurrent networks included.
 PLOW_PREFIX_CACHE = "1"
 PLOW_VMM_PREFIX = "1"
 
