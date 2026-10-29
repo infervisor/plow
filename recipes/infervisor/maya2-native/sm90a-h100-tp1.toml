@@ -1,0 +1,100 @@
+# Maya 2 Native (maya-research/maya2-native) on H100 (sm_90a, 132 SMs, 80 GB): Qwen3-1.7B backbone
+# (BF16, restricted cb0 head of 2049 rows), DepthV2 as the packet's depth stage (fp16 weights,
+# tensor-core projections on mma.m16n8k16 with fp32 residuals, host cb0 controller), Mimi decoder
+# codec.pkt (fp32, 24 kHz). High concurrency decode ladder 1..128 at 2048 ctx. Apache-2.0.
+#
+#   PYREF=<python with torch + safetensors> nix develop --command \
+#     python3 scripts/campaign/campaign.py build recipes/infervisor/maya2-native/sm90a-h100-tp1.toml --out <fresh dir>
+#
+# Gates: Whisper CER of served speech.
+
+schema = "plow.recipe.v1"
+namespace = "infervisor"
+name = "maya2-native"
+label = "sm90a-h100-tp1"
+plow_git = "81b75a754edbb1691218521bc1e3e7f9ebcf3bdf"
+network = "qwen3"
+doc = "docs/runtime/tts.md"
+
+[target]
+vendor = "nvidia"
+isa = "sm_90a"
+sku = "H100 SXM5"
+units = 132
+num_gpus = 1
+parallel = "tp"
+
+[checkpoint]
+source = "hf:maya-research/maya2-native"
+revision = "7cce38065147840d68011e18d25f4d68462e402f"
+
+[cell]
+name = "maya2-native-h100"
+hf_dir = "{out}/prep/lm"
+gpu = "h100"
+arch = "sm_90a"
+n_cu = 132
+n_gpu = 1
+max_ctx = 2048
+
+[[prep]]
+name = "lm-checkpoint"
+script = "scripts/tts/maya2_prep.py"
+python = "{env:PYREF}"
+args = ["{out}/prep/lm", "7cce38065147840d68011e18d25f4d68462e402f"]
+
+[[prep]]
+name = "codec-export"
+script = "scripts/tts/mimi_decoder_export.py"
+python = "{env:PYREF}"
+args = ["{out}/prep/codec", "kyutai/mimi", "89091b3e466eb6a9d11e537bf26b144f194978f7"]
+
+# Voice cloning (`icl`): the reference clip's 32 Mimi codes per frame.
+[[prep]]
+name = "ref-encoder-export"
+script = "scripts/tts/mimi_encoder_export.py"
+python = "{env:PYREF}"
+args = ["{out}/prep/codec/encoder", "89091b3e466eb6a9d11e537bf26b144f194978f7", "kyutai/mimi"]
+
+# Cloned speakers (`spk` / `icl_spk`): speechbrain ECAPA-TDNN, run on the host (crates/plowrt/src/tts/ecapa.rs).
+[[prep]]
+name = "ecapa-export"
+script = "scripts/tts/ecapa_export.py"
+python = "{env:PYREF}"
+args = ["{out}/prep/lm/ecapa"]
+
+[emit]
+emit = "devblob+cubin"
+args = ["--served-name", "maya2-native"]
+[emit.env]
+PLOW_TTS_PROFILE = "maya2"
+PLOW_TTS_CODEC_DIR = "{out}/prep/codec"
+PLOW_VERIFY_BIN = "{repo}/lean-plow/.lake/build/bin/plow_verify"
+PLOW_MAX_CHUNK = "512"
+PLOW_PF_LADDER_APPEND = "64,256"
+PLOW_DECODE_BATCH_LADDER = "1,2,4,8,16,32,48,64,96,128"
+PLOW_EMIT_FISH_CODEC_MAX_ROWS = "256"
+PLOW_EMIT_PREFILL_CUBLASLT = "1"
+PLOW_EMIT_DECODE_CUBLASLT = "1"
+PLOW_EMIT_DECODE_CUBLASLT_MIN_ROWS = "32"
+PLOW_EMIT_DECODE_CUBLASLT_HEAD = "1"
+PLOW_NO_GLU_FUSE = "1"
+PLOW_FUSE_KV_HNR = "1"
+PLOW_EMIT_PACKED_PREFILL_SMALL_HD = "1"
+PLOW_NV_DENSE_TUNE = "1"
+PLOW_NV_FA_FOLD = "1"
+
+[bench]
+kind = "speech"
+client = "scripts/tts/tts_bench.py"
+arms = ["--conc 1 --stream --wav --n 16 --prompt-set chatterbox", "--conc 1 --n 16 --prompt-set chatterbox --tag full_c1", "--conc 8 --stream --n 32 --prompt-set chatterbox", "--conc 32 --stream --n 64 --prompt-set chatterbox", "--conc 64 --stream --n 128 --prompt-set chatterbox"]
+
+[gates]
+python = "{env:PYREF}"
+[gates.tts_cer]
+arms = ["--conc 1 --stream --wav --n 16 --prompt-set chatterbox", "--conc 8 --stream --wav --n 32 --prompt-set chatterbox"]
+cer_median_max = 0.05
+
+[serve]
+extra_args = "--decode-pipeline"
+env = { PLOW_VMM_LIVE = "1", PLOW_VMM_PREFIX = "1", PLOW_LT_RUNG_ALGOS = "true", PLOW_DECODE_PIPELINE = "1" }

@@ -93,13 +93,13 @@ PLOW_EMIT_SNAC_SPLIT_BF16 = "1"
 # multistep, and a one-frame (7-code) quantum at low load. --lt-rung-algos times cuBLASLt
 # algorithms per rung (step_bench B=32..64 -3..-5%, digests equal).
 [serve]
-# Env, not flags, so every launcher (campaign serve/gate, plowbench.sh probes) applies it.
-env = { PLOW_VMM_PREFIX = "1", PLOW_LT_RUNG_ALGOS = "true" }
+extra_args = "--decode-pipeline"
+env = { PLOW_VMM_PREFIX = "1", PLOW_LT_RUNG_ALGOS = "true", PLOW_DECODE_PIPELINE = "1" }
 
 [bench]
 kind = "speech"
 client = "scripts/tts/tts_bench.py"
-arms = ["--conc 1 --stream --wav --n 16 --prompt-set chatterbox --voice tara", "--conc 1 --n 16 --prompt-set chatterbox --voice tara", "--conc 8 --stream --n 32 --prompt-set chatterbox --voice tara", "--conc 32 --stream --n 64 --prompt-set chatterbox --voice tara"]
+arms = ["--conc 1 --stream --wav --n 16 --prompt-set chatterbox --voice tara", "--conc 1 --n 16 --prompt-set chatterbox --voice tara", "--conc 8 --stream --n 32 --prompt-set chatterbox --voice tara", "--conc 32 --stream --n 64 --prompt-set chatterbox --voice tara", "--conc 64 --stream --n 128 --prompt-set chatterbox --voice tara", "--conc 128 --stream --n 256 --prompt-set chatterbox --voice tara"]
 reference = "scripts/tts/vllm_speech_probe.sh"
 
 # `campaign.py gate <recipe> --assets <dir> --out <dir>`: Whisper CER of served speech (python with

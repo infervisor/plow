@@ -64,6 +64,7 @@ PLOW_EMIT_PREFILL_CUBLASLT = "1"
 # (nativek/res/asrserve, built at fd0fe175).
 PLOW_EMIT_DECODE_CUBLASLT = "1"
 PLOW_EMIT_DECODE_CUBLASLT_MIN_ROWS = "32"
+PLOW_EMIT_DECODE_CUBLASLT_HEAD = "1"
 PLOW_NO_GLU_FUSE = "1"
 # One-row decode rung on the gemv_k8 walk: step_bench ctx 128 B=1 2.105 -> 2.005 ms, B=2/4 -50 us.
 PLOW_NV_GEMV_K8_B1 = "1"
@@ -89,6 +90,7 @@ manifest = "{env:ASR_MANIFEST}"
 conc = "1,16"
 wer_max = 0.045
 
-# VMM-backed KV prefix cache on every request path (sessions, shared system prompts, replays).
-[serve.env]
-PLOW_VMM_PREFIX = "1"
+# Served flags: lookahead-1 decode pipeline, pinned cuBLASLt algorithms, VMM prefix cache.
+[serve]
+extra_args = "--decode-pipeline"
+env = { PLOW_VMM_PREFIX = "1", PLOW_LT_RUNG_ALGOS = "true", PLOW_DECODE_PIPELINE = "1" }

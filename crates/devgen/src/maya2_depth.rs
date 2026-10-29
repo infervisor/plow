@@ -270,7 +270,7 @@ impl Chain {
         mut ep: Epilogue<'_>,
     ) -> Result<u32, String> {
         let mut x = x;
-        if ep.x_bf16 || (rows <= GEMV_ROWS && (ep.ln.is_none() || k <= GEMV_LN_K)) {
+        if ep.x_bf16 || ep.bias_group > 0 || (rows <= GEMV_ROWS && (ep.ln.is_none() || k <= GEMV_LN_K)) {
             let deps = self.deps();
             let o = p_handle(&self.p, out);
             let wh = self.p.declare(w, u64::from(n) * u64::from(k) * 2);

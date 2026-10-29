@@ -37,8 +37,14 @@ DILATIONS = [1, 2, 3, 4, 1]
 
 
 def default_ckpt():
-    hits = sorted(glob.glob(os.path.expanduser(
-        "~/.cache/huggingface/hub/models--speechbrain--spkrec-ecapa-voxceleb/snapshots/*/embedding_model.ckpt")))
+    hub = os.environ.get("HF_HUB_CACHE") or os.path.join(
+        os.environ.get("HF_HOME", os.path.expanduser("~/.cache/huggingface")), "hub"
+    )
+    hits = sorted(glob.glob(os.path.join(
+        hub, "models--speechbrain--spkrec-ecapa-voxceleb/snapshots/*/embedding_model.ckpt"
+    ))) or sorted(glob.glob(os.path.expanduser(
+        "~/.cache/huggingface/hub/models--speechbrain--spkrec-ecapa-voxceleb/snapshots/*/embedding_model.ckpt"
+    )))
     return hits[0] if hits else None
 
 

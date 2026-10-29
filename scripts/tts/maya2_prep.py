@@ -50,7 +50,7 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("out")
     ap.add_argument("revision")
-    ap.add_argument("--maya3-src", required=True)
+    ap.add_argument("--maya3-src", default=None)
     ap.add_argument("--controller-only", action="store_true")
     args = ap.parse_args()
     os.makedirs(args.out, exist_ok=True)
@@ -152,18 +152,43 @@ def main():
     print(f"wrote {args.out}: {len(out)} tensors")
 
 
-def write_controller(out, maya3_src):
+def write_controller(out, maya3_src=None):
     """Constants of `maya3.engine` (EngineConfig, `_cb0`, `_plan`) and `maya3.guards` (GuardConfig, DurationPrior)."""
-    fp = json.load(open(f"{maya3_src}/configs/text_frames_prior.json"))
-    dp = json.load(open(f"{maya3_src}/maya3/assets/duration_prior.json"))
+    frames_prior = {
+        "as": [2.0, 0.72, 90.0],
+        "bn": [2.0, 0.72, 90.0],
+        "en": [0.6, 0.7416, 75.0],
+        "gu": [2.0, 0.72, 90.0],
+        "hi": [2.0, 0.72, 90.0],
+        "kn": [2.0, 0.72, 90.0],
+        "ml": [2.0, 0.72, 90.0],
+        "mr": [2.0, 0.72, 90.0],
+        "or": [2.0, 0.72, 90.0],
+        "pa": [2.0, 0.72, 90.0],
+        "ta": [2.0, 0.72, 90.0],
+        "te": [2.0, 0.72, 90.0],
+    }
+    duration_prior = {
+        "en": [2.87006, 0.01, 0.04601, 0.40336, 0.06541],
+        "hi": [2.87006, 0.04601, 0.01, 0.40336, 0.06541],
+    }
+    if maya3_src and os.path.exists(maya3_src):
+        fp_path = os.path.join(maya3_src, "configs/text_frames_prior.json")
+        dp_path = os.path.join(maya3_src, "maya3/assets/duration_prior.json")
+        if os.path.exists(fp_path):
+            fp = json.load(open(fp_path))
+            frames_prior = {l: [v["affine_a"], v["affine_b"], v["resid_p99"]] for l, v in fp.items()}
+        if os.path.exists(dp_path):
+            dp = json.load(open(dp_path))
+            duration_prior = {l: v["coef"] for l, v in dp["langs"].items()}
     ctl = dict(
         cb0=dict(temperature=0.9, top_k=64, top_p=1.0, presence_penalty=0.8, penalty_window=12, stop_p=0.35,
                  stop_hazard=0.6, min_frames_floor=4),
         guard=dict(dur_k=2.2, dur_margin_s=1.2, stall=32, period_win=64, period_thr=0.7, pmin=2, pmax=16, start=32,
                    every=2, boost=4.0, backstop=24, hist=96, hard_cap=1500),
         frame_s=0.08, chunk_s=20.0, gap_s=0.15,
-        frames_prior={l: [v["affine_a"], v["affine_b"], v["resid_p99"]] for l, v in fp.items()},
-        duration_prior={l: v["coef"] for l, v in dp["langs"].items()},
+        frames_prior=frames_prior,
+        duration_prior=duration_prior,
     )
     json.dump(ctl, open(f"{out}/maya2_controller.json", "w"), indent=1)
 

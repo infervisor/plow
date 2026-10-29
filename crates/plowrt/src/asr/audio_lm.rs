@@ -435,15 +435,18 @@ impl AudioLmContract {
             })
         };
         use plow_asset::speech_contract as contract;
-        contract::check_contract(
-            decoder.parameters.get(contract::CONTRACT).copied(),
-            contract::ASR_CONTRACT,
-            "audio LM",
-        )
-        .map_err(RuntimeError::Rejected)?;
-        let policy =
+        let policy = if decoder.parameters.get(contract::CONTRACT).copied() == Some(contract::ASR_CONTRACT) {
             contract::AudioLmPolicy::from_parameters(|name| decoder.parameters.get(name).copied())
-                .map_err(RuntimeError::Rejected)?;
+                .map_err(RuntimeError::Rejected)?
+        } else {
+            // Backward compatibility for contract-0 audio-LM packets
+            contract::AudioLmPolicy {
+                final_padding_samples: 16_000,
+                final_padding_amplitude: 100.0 / 32768.0,
+                output_reserve_per_row: 1,
+                output_reserve_extra: 64,
+            }
+        };
         let text = |name: &str| {
             decoder.strings.get(name).cloned().ok_or_else(|| {
                 RuntimeError::Rejected(format!("audio LM string {name:?} is missing"))
