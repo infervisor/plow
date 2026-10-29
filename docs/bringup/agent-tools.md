@@ -36,31 +36,32 @@ Harness (read [05-single-block-sweep.md](05-single-block-sweep.md) and the scrip
 
 | step | NVIDIA | AMD |
 |---|---|---|
-| emit one block | `plowc --emit devblob --block <l>[..<r>]` with the production recipe's emit env (Gemma-4 dense/MoE: model-shaped asset; Qwen3.8: one layer, B1) | same; MLA families emit `act.x`-in/out only |
-| time | `block_run <asset> bench --batch .. --ctx ..` (decode B×T + prefill pass, `--pf-cap` for launch width; `sweep.json`); grids and finalists: `scripts/tune_decode_sweep.sh --block L --block-bucket N --block-run <bin>` | `campaign.py block-bench`, `block-ab` (four frozen arms, one lease); truncated-model `PLOW_LAYERS=N` sweeps |
-| floor | `scripts/campaign/block_roofline.py <hf_dir> --kind sliding\|full --plow sweep.json [--vllm layer.json]`; calibrated per-op floors: `scripts/bench/op_roof.py <block disasm> --bw/--tflops/--fp8-tflops` | `campaign.py block-roofline` (recipe `[roofline]` ceilings, `--router-table`) |
-| reference block | `scripts/block_layer_bench.py` (vLLM's own decoder layer, same row schema) + `scripts/block_compare.py` | `runtime/tests/*_block_*_test.c` oracles |
+| emit one block | `campaign.py build <production recipe> --block L[..R] --out <fresh>`: the recipe's emit env, objects, library-attention and cuBLASLt routes, `block.json` in the assets (Gemma-4 dense/MoE/KV-shared, Qwen3.8 GDN+full at every decode rung) | `plowc --emit devblob --block`; MLA families emit `act.x`-in/out only |
+| time | `block_run <asset> bench --batch .. --ctx ..` (decode rung B at live context); `block_run <asset> prefill-bench --query-rows .. --prior 0,..,16384 [--requests N --riders D --rider-ctx C]` (one packed launch after a prefix, riders on the same launch); `sweep.json` records packet/binary sha256, device, declared routes and library-attention launches served vs native fallback | `campaign.py block-bench`; truncated-model `PLOW_LAYERS=N` sweeps |
+| ceilings | `scripts/bench/calibrate_ceilings.py --out ceilings.json` (one short lease per box: HBM read, BF16/FP8 GEMM peaks) | recipe `[roofline]` ceilings |
+| floor + report table | `scripts/campaign/block_roofline.py <block assets> --ceilings ceilings.json --plow sweep.json --current <production sweep.json> [--router-table t.bin]`: per-instruction floor from the block's own packet (`op_roof.py`), prints the table above | `campaign.py block-roofline` (`--router-table`) |
+| A/B | `campaign.py nv-block-ab --control <prod block> --treatment <candidate block> --verb bench\|prefill-bench --args ".." --ceilings ..`: four frozen arms in one lease, `comparison.md` = the table + per-point verdict (§7 spread rule) | `campaign.py block-ab` |
+| real MoE routing | serve the full packet with `PLOW_NV_DUMP_KV=<dir> PLOW_NV_DUMP_ACT=<len>:<pc>`, then `scripts/bench/router_table.py <dump>.json --out t.bin` | AMD capture `rank0.act.tab.bin` |
+| reference block | `scripts/block_layer_bench.py` (vLLM's own decoder layer; joined with `--vllm`) + `scripts/block_compare.py` | `runtime/tests/*_block_*_test.c` oracles |
 | block parity | `block_run packed-check` / `mixed-check` (packed / mixed vs serial on the block) | `amd-block --dump`, C oracle harnesses |
 
-Known gaps in the single-block harness. List the ones a candidate hits in its report; do not write
-new harness code inside a perf campaign (extend the harness as its own change):
+Remaining gaps. List the ones a candidate hits in its report; do not write new harness code inside
+a perf campaign (extend the harness as its own change):
 
-* `block_roofline.py` prices 2-byte weights and KV (`eb = 2`): no FP8 weight/KV floor. Its ceilings
-  come from the `roofline.py` registry with no `--bw`/`--tflops` override, so they are not
-  calibrated; take calibrated per-op floors from `op_roof.py` on the block's disassembly.
-* `block_roofline.py` layer kinds are `sliding|full`: no GDN/recurrent (Qwen3.8 linear attention),
-  MLA or DSA layers. `block_layer_bench.py` runs only the Gemma family.
-* Prefill is timed and priced from an empty prefix: no prior-context chunk sweep and no packed
-  prefill with riders (`packed-check` / `mixed-check` are parity checks with one coarse timing).
-* MoE: `block_run bench` drives synthetic `act.x`, so router choices and the expert union a step
-  reads are not those of real traffic; MoE block time is not data-independent. NVIDIA has no
-  equivalent of AMD's captured `--router-table`.
-* Library attention routes and segmented cuBLASLt routes: a block emitted with the recipe's flags
-  should carry them, but no recorded block run validates that; confirm the route in the block log
-  before trusting the number. `op_roof.py` needs `--nsys` for library-routed decode.
-* No frozen four-arm NVIDIA block A/B (AMD `block-ab`): run ctl/treat/ctl2/treat2 in one lease and
-  score per §7. No delta-vs-current column in any tool: difference two sweeps from one lease.
-* Qwen3.8 `--block` is one layer at B1: decode rungs B > 1 cannot be block-screened.
+* MLA / DSA blocks on NVIDIA (no NVIDIA port yet). `block_layer_bench.py` runs only the Gemma family.
+* A KV-shared block must start at or before its source layers (the emitter refuses otherwise;
+  E4B: `--block 22..42`), and the per-layer-input prologue is not in a block (`act.ple` is an
+  input, timing only). The KV-shared tail route is in the block when the range contains the first
+  shared layer and ends at the last layer; its prefill floor still prices the tail layers at every
+  row of the program, not the tail's few rows.
+* A prefill point's floor prices the bucket program the launch ran, padding rows included: when
+  the request rows are well below the bucket (2048 rows in a 4096 bucket), % of floor overstates
+  efficiency; read it beside the next-smaller bucket's floor.
+* The prefill floor of a packed point charges attention per request at a shared prefix; requests
+  with different prefixes in one launch are not modelled.
+* Block times are host-observed synchronous step/launch times: a few microseconds of launch
+  overhead sit above the device floor at small rungs; per-op device time still needs
+  `-DPLOW_NV_TRACE=1` or `op_roof.py --nsys`.
 * Prefill bucket policy, prefill dispatch/classing and host-gap knobs are invisible at block level
   ([05](05-single-block-sweep.md) "What tier 2 cannot score"): they go to `step_bench` per rung,
   still before any grid.

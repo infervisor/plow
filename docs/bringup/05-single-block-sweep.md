@@ -13,10 +13,9 @@
 > Whole-network `step_bench`, FP32 gates and prod-mix grids run only for a
 > candidate that already wins here. A campaign report starts with the
 > block-vs-roofline table (block time, roofline floor, % of floor, delta vs
-> current). The harness per backend and its known gaps (FP8 floors, GDN/MLA
-> kinds, MoE router inputs, packed prefill with riders, library attention
-> routes) are listed in [agent-tools.md](agent-tools.md) "HARD RULE"; a
-> candidate that hits a gap says so in its report.
+> current). The harness per backend and its remaining gaps are listed in
+> [agent-tools.md](agent-tools.md) "HARD RULE"; a candidate that hits a gap
+> says so in its report.
 
 **Precondition:** Stages 1–4 complete — the model's config is understood, its
 weights load, and the emitter produces a full-model `model.pkt` without aborting.
@@ -277,19 +276,25 @@ device events (pure GPU time). For a dense block numerics are irrelevant to the
 *timing* — the per-step kernel time is data-independent — so a bench needs no
 correct weights. A MoE block is the exception: the router picks the experts a
 step reads, and `block_run bench` feeds synthetic `act.x`, so its expert union
-is not real traffic's. Price the expert union explicitly (`block_roofline.py`)
-and confirm MoE levers with `step_bench` at the rung.
+is not real traffic's. Price the expert union from a recorded router table
+(`scripts/bench/router_table.py` from a `PLOW_NV_DUMP_ACT` dump of the full
+packet, then `block_roofline.py --router-table`) and confirm MoE levers with
+`step_bench` at the rung.
 
 ### Gemma path (model-shaped block, `block_run bench`)
 
 ```bash
-# emit one Gemma-4 block:
-plowc --emit devblob --block 0 --arch $ISA --gpu "$GPU" --n-cu $NCU \
-  --max-ctx $MAXCTX --hf-dir /path/to/gemma-hf-dir --out <asset>/
+# emit one block with the production recipe's env, objects and routes
+# (Gemma-4 dense/MoE/KV-shared, Qwen3.8 GDN + full attention; any L..R range):
+python3 scripts/campaign/campaign.py build recipes/infervisor/<model>/<cell>.toml \
+  --block 4..6 --out <fresh dir>          # block asset = <fresh dir>/assets
 
-# bench decode B×T and prefill:
+# decode rung B at live context T:
 ./target/release/examples/block_run <asset> bench \
   --batch 1,4 --ctx 128,1024,4096 --iters 100 --warmup 20 --prefill-iters 10
+# one prefill launch after a prefix (prior), optionally packed with riders:
+./target/release/examples/block_run <asset> prefill-bench \
+  --query-rows 512,2048 --prior 0,4096,16384 [--requests 4 --riders 16 --rider-ctx 4096]
 ```
 
 `block_run bench` prefills B slots to T rows, times N decode steps per (B,T), and
@@ -367,13 +372,17 @@ For plow's own per-op breakdown on `$VENDOR = nvidia`, build the device object
 with `-DPLOW_NV_TRACE=1` and read `trace_reset` / `trace_summary` in `block_run`.
 
 The block roofline on `$VENDOR = nvidia` is
-`scripts/campaign/block_roofline.py <hf_dir> --gpu "$GPU" --kind sliding|full
---plow sweep.json [--vllm layer.json]`: per component (projections, MLP,
-router, expert union, attention/KV) floor, plow's `block_run` time, % of roof and
-the vLLM-layer ratio. It prices 2-byte weights/KV from registry ceilings; for an
-FP8 block or a calibrated ceiling take per-op floors from
-`scripts/bench/op_roof.py <block disasm> --bw ... --tflops ... --fp8-tflops ...`.
-On `$VENDOR = amd` use `campaign.py block-roofline` (`scripts/campaign/README.md`).
+`scripts/campaign/block_roofline.py <block asset> --ceilings ceilings.json
+--plow sweep.json --current <production block sweep.json> [--router-table t.bin]
+[--vllm layer.json]`. It prices the block's own packet instruction by
+instruction (`scripts/bench/op_roof.py`: BF16, FP8/W8A8 weights with scales,
+FP8 KV with scales, GDN state, MoE expert union) and prints the HARD RULE table
+(block time, roofline floor, % of floor, delta vs current). The ceilings come
+from `scripts/bench/calibrate_ceilings.py` run once per box in a short lease;
+without them the registry is used and the output says NOT calibrated.
+`campaign.py nv-block-ab` runs control/treatment/control/treatment in one lease
+and writes the same table with a per-point verdict. On `$VENDOR = amd` use
+`campaign.py block-roofline` (`scripts/campaign/README.md`).
 
 ---
 
@@ -480,12 +489,15 @@ The block passes Stage 5 and gates into Stage 6 when **all** hold:
 | `plowrt amd-block` (`crates/plowrt/src/main.rs::amd_block`) | act.x-in / act.x-out A/B numerics runner |
 | `plowrt disasm` (`crates/plowrt/src/main.rs::disasm_cmd`, `crates/plowrt/src/disasm.rs`) | static blob inspection |
 | `plowrt simulate` (`crates/plowrt/src/main.rs`) | CPU sim, `--math dry|golden` |
-| `examples/block_run` (`crates/plowrt/examples/block_run.rs`) | Gemma-path block `check` + `bench` |
+| `examples/block_run` (`crates/plowrt/examples/block_run.rs`) | NVIDIA block `check`, `bench` (decode), `prefill-bench` (prefix / packed / riders), `packed-check`, `mixed-check`; `sweep.json` provenance (packet, binary, device, routes) |
 | `scripts/block_sim.sh` | compile → CPU sim one block |
 | `scripts/block_e2e.sh` | end-to-end compile → plow bench → reference bench → diff (see caveats) |
 | `scripts/block_baseline.py`, `scripts/block_layer_bench.py`, `scripts/block_op_bench.py` | reference-side single-block harnesses |
 | `scripts/block_compare.py` | join plow `sweep.json` vs reference `sweep.json` |
-| `scripts/campaign/block_roofline.py` | NVIDIA per-block roofline (sliding/full kinds, MoE expert union) joined with `block_run` / vLLM-layer sweeps |
+| `scripts/campaign/block_roofline.py`, `scripts/bench/op_roof.py` | NVIDIA block floor from the block packet, the HARD RULE table |
+| `scripts/bench/calibrate_ceilings.py` | measured HBM / BF16 / FP8 ceilings for the floor |
+| `scripts/bench/router_table.py` | recorded MoE routing (`act.moe.table`) from a `PLOW_NV_DUMP_ACT` dump |
+| `campaign.py build --block`, `campaign.py nv-block-ab` (`scripts/campaign/nv_block_ab.py`) | recipe-exact block emit; frozen four-arm NVIDIA block A/B |
 | `scripts/build_glm52_block.sh`, `scripts/k3_block_sweep.sh`, `scripts/glm52_block_sweep_gfx942.sh` | family-specific build / sweep |
 | `runtime/tests/*_block_*_test.c` + `runtime/tests/*_oracle.py` | C oracle correctness harnesses |
 | `perf-data/block-baseline-harness.md`, `perf-data/block-decode-baseline-26b.md` | recorded methodology + reference numbers |

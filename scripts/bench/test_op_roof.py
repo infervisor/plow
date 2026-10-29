@@ -312,5 +312,77 @@ class SegmentLaunchTests(unittest.TestCase):
                 op_roof.nsys_segments({"programs": [program]}, 0, path, correlations=[18])
 
 
+class MoeCostTests(unittest.TestCase):
+    DECODE = ("===== program T=4 =====\n"
+              "#12 MoeRouterGemmaScoreFast b=16 score<-act.moe.router_score resid<-act.x proj<-r.w scale<-r.s | H=2816 n_exp=128 root=0.01 eps=0.000001\n"
+              "#13 MoeRouterGemmaTopk b=1 table<-act.moe.table score<-act.moe.router_score per_expert_scale<-r.p | n_exp=128 k=8\n"
+              "#18 MoeExpertGluGemmaFp8 b=132 fu<-act.moe.mfu x<-act.moe.xn2 table<-act.moe.table ewt<-moe.ewt.0 est<-moe.est.0 | k=8 I=704 H=2816 n_exp=128\n"
+              "#19 MoeExpertDownGemmaFp8 b=132 part<-act.moe.part fu<-act.moe.mfu table<-act.moe.table ewt<-moe.ewt.0 est<-moe.est.0 | k=8 H=2816 I=704 n_exp=128\n"
+              "#20 MoeCombineNormGemma b=1 out<-act.moe.comb part<-act.moe.part resid<-act.moe.h1 gamma<-g | H=2816 k=8 eps=0.000001\n")
+
+    def test_decode_experts_charge_the_uniform_union_of_the_rung(self):
+        prog = op_roof.parse(self.DECODE)[0]
+        priced = op_roof.price(prog, 128, 2, 2, 3000, 989, 1979)
+        union = op_roof.uniform_union(128, 8, 4)
+        glu = union * (2 * 704 * 2816 + 4 * 2 * 704) + 2 * 4 * 2816 + 4 * 8 * 2 * 704
+        self.assertAlmostEqual(priced[18][1], glu)
+        self.assertEqual(priced[18][0], "MoeExpertGluGemmaFp8")
+        self.assertTrue(all(entry[4] != "unpriced" for entry in priced.values()))
+
+    def test_router_table_replaces_uniform_routing(self):
+        import struct
+        rows = [list(range(8))] * 4  # every row routes to the same experts
+        raw = b"".join(struct.pack("<If", e, 0.125) for row in rows for e in row)
+        table = op_roof.RouterTable(raw, 8)
+        self.assertEqual(table.union(128, 8, 4), 8)
+        prog = op_roof.parse(self.DECODE)[0]
+        priced = op_roof.price(prog, 128, 2, 2, 3000, 989, 1979, router=table)
+        self.assertAlmostEqual(priced[19][1], 8 * (2816 * 704 + 4 * 2816) + 2 * 4 * 8 * 704 + 4 * 8 * 4 * 2816)
+
+    def test_router_table_rejects_duplicate_or_foreign_experts(self):
+        import struct
+        with self.assertRaisesRegex(ValueError, "repeats"):
+            op_roof.RouterTable(struct.pack("<If", 3, 0.5) * 2, 2)
+        table = op_roof.RouterTable(struct.pack("<IfIf", 0, 0.5, 200, 0.5), 2)
+        with self.assertRaisesRegex(ValueError, "does not match"):
+            table.union(128, 2, 1)
+
+    def test_expert_without_router_is_refused(self):
+        prog = ("decode", 1, [(0, "MoeExpertDownGemma", "", {"k": 8, "H": 2816, "I_moe": 704, "n_exp": 128})])
+        with self.assertRaisesRegex(ValueError, "no preceding router"):
+            op_roof.price(prog, 128, 2, 2, 3000, 989)
+
+
+class CeilingTests(unittest.TestCase):
+    def test_calibrated_file_wins_over_registry_and_overrides_win_over_both(self):
+        import argparse
+        hw = op_roof.lookup_gpu("h100")
+        with tempfile.TemporaryDirectory() as root:
+            path = Path(root) / "c.json"
+            path.write_text(json.dumps({"bw_gbps": 2900, "bf16_tflops": 700, "fp8_tflops": 1300,
+                                        "device": "NVIDIA H100", "date": "2026-10-29"}))
+            args = argparse.Namespace(ceilings=str(path), bw=None, tflops=650, fp8_tflops=None)
+            bw, tf, f8, source = op_roof.ceilings(args, hw)
+        self.assertEqual((bw, tf, f8), (2900, 650, 1300))
+        self.assertIn("calibrated", source)
+        args = argparse.Namespace(ceilings=None, bw=None, tflops=None, fp8_tflops=None)
+        self.assertIn("NOT calibrated", op_roof.ceilings(args, hw)[3])
+
+
+class RouterDumpTests(unittest.TestCase):
+    def test_extract_takes_the_request_rows_of_the_table(self):
+        import struct
+        import router_table
+        rows = [[0, 1], [2, 3], [4, 5]]
+        table = b"".join(struct.pack("<If", e, 0.5) for r in rows for e in r)
+        meta = {"rows": 2, "row0": 1, "prompt_len": 2, "pc": 9, "c0": 0,
+                "tensors": [{"name": "act.x", "offset": 0, "row_bytes": 4, "rows": 2},
+                            {"name": "act.moe.table", "offset": 12, "row_bytes": 16, "rows": 2}]}
+        out, topk, n = router_table.extract(meta, b"\0" * 12 + table)
+        self.assertEqual((topk, n, out), (2, 2, table[16:]))
+        with self.assertRaisesRegex(ValueError, "no act.moe.table"):
+            router_table.extract(dict(meta, tensors=meta["tensors"][:1]), b"")
+
+
 if __name__ == "__main__":
     unittest.main()
