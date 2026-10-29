@@ -571,8 +571,8 @@ class DecodeLib:
         self.cu_q = torch.arange(c.B + 1, dtype=torch.int32, device="cuda")
         self.max_k = max(lens)
 
-    def fa3(self, sched):
-        fi = fa(3)
+    def fa3(self, sched, version=3):
+        fi = fa(version)
         c = self.c
         meta = None
         self.plan_us = 0.0
@@ -593,7 +593,7 @@ class DecodeLib:
             fi.flash_attn_varlen_func(c.q, self.kp, self.vp, 1, self.cu_q, self.max_k,
                                       seqused_k=c.lens, causal=True, window_size=win,
                                       softmax_scale=1.0, block_table=self.bt, out=c.o,
-                                      scheduler_metadata=meta, fa_version=3)
+                                      scheduler_metadata=meta, fa_version=version)
         return run
 
     def flashinfer(self, tc):
@@ -645,6 +645,8 @@ def cmd_decode(a):
                     fns = [x.fa3(False) for x in arms]
                 elif lib == "fa3s":
                     fns = [x.fa3(True) for x in arms]
+                elif lib == "fa4":
+                    fns = [x.fa3(False, version=4) for x in arms]
                 elif lib == "fi":
                     fns = [x.flashinfer(False) for x in arms]
                 else:
