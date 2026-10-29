@@ -326,7 +326,7 @@ class Fa4Lib:
             raise RuntimeError(f"plow_fa4_hd512_run rc={rc}")
 
 
-_fa4_lib = None
+_fa4_libs = {}
 
 
 class PagePool:
@@ -334,7 +334,7 @@ class PagePool:
     kv_len) into a bf16 pool [kvh][pages][64][hd] (a page table over consecutive pool pages),
     then libplow_fa4_hd512.so reads the pool."""
 
-    def __init__(self, drv, cubin, reqs, k8, ks, v8, vs, kvh, stride, hd=512):
+    def __init__(self, drv, cubin, reqs, k8, ks, v8, vs, kvh, stride, hd=512, f16=False):
         torch = drv.torch
         self.drv = drv
         mod, self.fn = ctypes.c_void_p(), ctypes.c_void_p()
@@ -355,7 +355,8 @@ class PagePool:
                                device="cuda")
         self.pages = torch.tensor(pages, dtype=torch.int32, device="cuda")
         self.n = n
-        self.ko = torch.empty(kvh, n, 64, hd, dtype=torch.bfloat16, device="cuda")
+        self.ko = torch.empty(kvh, n, 64, hd, dtype=torch.float16 if f16 else torch.bfloat16,
+                              device="cuda")
         self.vo = torch.empty_like(self.ko)
         self.kvh, self.stride = kvh, stride
         self.kp = self.ko.permute(1, 2, 0, 3)  # (pages, 64, kvh, hd), head stride n*64*hd
@@ -363,7 +364,7 @@ class PagePool:
         self.args = bc.pack_args([("p", k8.data_ptr()), ("p", ks.data_ptr()), ("p", v8.data_ptr()),
                                   ("p", vs.data_ptr()), ("p", self.ko.data_ptr()),
                                   ("p", self.vo.data_ptr()), ("p", self.pages.data_ptr()),
-                                  ("u", n), ("u", kvh), ("u", stride), ("u", n)])
+                                  ("u", n), ("u", kvh), ("u", stride), ("u", n), ("u", int(f16))])
 
     def adapt(self):
         buf = ctypes.create_string_buffer(self.args, len(self.args))
@@ -375,10 +376,9 @@ class PagePool:
 
 
 def fa4_lib(path):
-    global _fa4_lib
-    if _fa4_lib is None:
-        _fa4_lib = Fa4Lib(path)
-    return _fa4_lib
+    if path not in _fa4_libs:
+        _fa4_libs[path] = Fa4Lib(path)
+    return _fa4_libs[path]
 
 
 def cmd_hd512(a):
@@ -403,6 +403,13 @@ def cmd_hd512(a):
         n = max(2, min(6, math.ceil(160e6 / per)))
         cases = [bc.Case(drv, H, KVH, D, rows, stride, 1, [(0, rows, 0, kvlen)], seed=s, fp8=fp8)
                  for s in range(n)]
+        # --kscale: Gemma-4 12B's global k_norm weight (0.0605) shrinks K; Q grows to keep the
+        # logits, so the run probes the pool element type's range, not the score distribution.
+        if a.kscale != 1.0 and fp8:
+            for c in cases:
+                c.ks.mul_(a.kscale)
+                c.k.mul_(a.kscale)
+                c.q.copy_((c.q.float() / a.kscale).to(c.q.dtype))
         fl = 4 * H * D * sum(past + r + 1 for r in range(rows))
         key = f"hd{D}_h{H}kv{KVH}_rows{rows}_past{past}"
         res = {"floor_us": round(fl / PEAK / 1e6, 1)}
@@ -443,19 +450,28 @@ def cmd_hd512(a):
                         if half:
                             q16.copy_(c.q)
                     adapts.append(adapt)
-                    if lib == "fa4rt":
-                        aot = fa4_lib(a.fa4lib)
+                    if lib in ("fa4rt", "fa4rt16"):
+                        f16 = lib == "fa4rt16"
+                        aot = fa4_lib(a.fa4lib16 if f16 else a.fa4lib)
+                        assert aot.lib.plow_fa4_dtype() == int(f16)
                         pool = PagePool(drv, a.dqcubin, [(0, kvlen)], c.k8, c.ks, c.v8, c.vs,
-                                        KVH, stride)
+                                        KVH, stride, f16=f16)
                         adapts[-1] = pool.adapt
+                        q16 = torch.empty_like(c.q, dtype=torch.float16) if f16 else c.q
+                        o16 = torch.empty_like(c.o, dtype=torch.float16) if f16 else c.o
 
                         ns = Fa4Lib.splits(H, KVH, 1, rows, kvlen, rows, aot.ws.numel())
-                        res.setdefault("fa4rt_splits", ns)
+                        res.setdefault(lib + "_splits", ns)
 
-                        def run(c=c, pool=pool, cu_q=cu_q, used=used, ns=ns):
+                        def run(c=c, pool=pool, cu_q=cu_q, used=used, ns=ns, q16=q16, o16=o16,
+                                f16=f16):
                             pool.adapt()
-                            aot.run(H, KVH, c.q, pool.kp, pool.vp, c.o, rows, cu_q, used,
+                            if f16:
+                                q16.copy_(c.q)
+                            aot.run(H, KVH, q16, pool.kp, pool.vp, o16, rows, cu_q, used,
                                     pool.bt, pool.kp.stride(2), splits=ns)
+                            if f16:
+                                c.o.copy_(o16)
                     elif lib.startswith("fa4aot"):
                         aot = fa4_lib(a.fa4lib)
                         head_stride = kp.stride(2)
@@ -752,8 +768,10 @@ def main():
     h.add_argument("--classes", nargs="+", required=True)
     h.add_argument("--libs", type=libs_arg, default=["fa4", "fi2"])
     h.add_argument("--page", type=int, default=64)
-    h.add_argument("--dqcubin", default="/opt/dlami/nvme/lava-tts/lib-attn/kv_dequant_sm90.cubin")
-    h.add_argument("--fa4lib", default="/opt/dlami/nvme/lava-tts/lib-attn/fa4lib2/libplow_fa4_hd512.so")
+    h.add_argument("--dqcubin", default="/opt/dlami/nvme/lava-tts/lib-attn/kv_dequant_sm90_v2.cubin")
+    h.add_argument("--kscale", type=float, default=1.0)
+    h.add_argument("--fa4lib16", default="/opt/dlami/nvme/lava-tts/lib-attn/fa4f16/libplow_fa4_hd512.so")
+    h.add_argument("--fa4lib", default="/opt/dlami/nvme/lava-tts/lib-attn/fa4bf16b/libplow_fa4_hd512.so")
     h.add_argument("--json")
     d = sub.add_parser("decode")
     d.add_argument("cubin")

@@ -127,6 +127,21 @@ FP32 gate at c1/c8/c32 against same-concurrency vLLM peers (captured with the c1
   capture is deterministic and native passes it at 44/46, so the 4 free-run divergences are the
   library route's: the bf16 page pool rounds each dequantized row (kernel rel-L2 2x native).
 
+### 12B with an fp16 page pool (bin4, `PLOW_BUILD_FA4_HD512=f16`)
+
+The fp16 library variant reads an fp16 pool; Q and O request rows are converted in place around
+the call. Kernel level (runtime pieces, splits on): rel-L2 1.72-1.75e-3 = native (1.67-1.95e-3),
+bf16 pool 3.3-3.4e-3, also with K scaled by the 12B global k_norm weight (0.0605); time +10-14%
+over the bf16 pool at long prefix. In-model, 16000-token prompt: chunk 2048/1024/512/128 0.549/
+0.572/0.677/1.813 s vs native 0.608/0.633/0.758/2.375 (-10/-10/-11/-24%).
+
+FP32 gate vs the same peers: c1 PASS kl_trim 0.0678 (peer 0.0631, native 0.0496) top1 0.9764
+(0.9803, native 0.9872) cont 41/46 (43, native 44; limit 41); c8 PASS 0.0680 (0.0678) cont 40 (42);
+c32 PASS 0.0618 (0.0710) cont 39 (41). Natural-text KL sits above native and the bf16 pool at every
+concurrency (c1 trimmed 0.152 vs 0.114 / 0.123), unexplained: the kernel-level error is native's.
+Production mix 2.7/s, 2 reps: TTFT P99 1133.2 ms (1.01x vLLM; native 1338.5, 1.19x), TPOT P99
+97.7 ms (native 105.4), goodput 9.13 req/s (native 9.05), report MATCHED + EQUIVALENT.
+
 ## 4. Open
 
 * FP32 gate at c1/c8/c32 and a production-mix screen for the hd512 route.
