@@ -312,7 +312,7 @@ fn forward(be: &CudaBackend, g: Geometry, p: &Prepared, c: &Call) -> Result<Laun
         l.memref32(base + 2, c.page_table, &[c.requests, c.width], &[c.width]);
         let dtype = if g.f16 { TMAP_F16 } else { TMAP_BF16 };
         let tmap = |base: u64, dims: &[u64], strides: &[u64], boxes: &[u32]| {
-            be.encode_tmap_tiled(
+            let mut m = be.encode_tmap_tiled(
                 dtype,
                 base,
                 dims,
@@ -323,7 +323,9 @@ fn forward(be: &CudaBackend, g: Geometry, p: &Prepared, c: &Call) -> Result<Laun
                 SWIZZLE_128B,
                 L2_PROMOTION_128B,
                 0,
-            )
+            )?;
+            upstream_tmap_flags(&mut m, elem, dims, strides);
+            Ok::<_, RuntimeError>(m)
         };
         let (d64, h64, t64) = (u64::from(d), u64::from(h), u64::from(t));
         let q = if pack {
@@ -411,6 +413,23 @@ fn forward(be: &CudaBackend, g: Geometry, p: &Prepared, c: &Call) -> Result<Laun
 }
 
 /// cutlass `FastDivmod`: divisor, multiplier, then the two shifts as bytes.
+/// The upstream host code encodes its tensor maps itself, not through the driver, and sets two
+/// flags the driver's encoder leaves clear: byte 8 bit 1 always, and byte 10 bit 5 when the last
+/// element's byte offset is at least 128 KiB. Reproducing them keeps the descriptors byte-equal
+/// to the upstream route's; the exemplar check covers both cases of the second.
+fn upstream_tmap_flags(m: &mut [u8; 128], elem: u64, dims: &[u64], strides: &[u64]) {
+    m[8] |= 0x02;
+    let last = (dims[0] - 1) * elem
+        + dims[1..]
+            .iter()
+            .zip(strides)
+            .map(|(&n, &s)| (n - 1) * s)
+            .sum::<u64>();
+    if last >= 0x2_0000 {
+        m[10] |= 0x20;
+    }
+}
+
 fn divmod(l: &mut Launch, index: usize, d: u32) {
     let log2 = 32 - (d - 1).leading_zeros().min(32);
     let multiplier = ((1u64 << 32) * ((1u64 << log2) - u64::from(d)) / u64::from(d) + 1) as u32;
