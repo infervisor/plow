@@ -407,19 +407,25 @@ pub fn push_runtime(sink: &dyn Sink, dirs: &[ReleaseDir], opts: &Options) -> Res
 
 /// Copy the index's `latest` into the plain-text pointer. The index is the
 /// one record of promotion; the pointer is derived from it, never from what
-/// this push meant to write. A publisher that stalls between its index write
-/// and here would otherwise put back a version another publisher has since
-/// replaced. The pointer's tag is read before the index, so a write that
-/// succeeds carries a value at least as new as the pointer it replaces, and
-/// every publisher syncs after its own index write: the last one leaves the
-/// two agreeing.
+/// this push meant to write.
+///
+/// A pointer write can still land late: its tag is the content's hash, so a
+/// publisher that read pointer A, then stalled while another moved the
+/// pointer A→B→A, still matches and writes its stale value. Two objects have
+/// no shared transaction, so each publisher checks after its own write: it
+/// re-reads the index, and if `latest` moved, goes round again. A publisher
+/// therefore returns only once the pointer it last saw agrees with the index,
+/// and a late write is put right by the publisher that made it.
 fn sync_latest(sink: &dyn Sink) -> Result<String> {
+    let index_latest = || -> Result<String> {
+        match sink.get(RUNTIME_INDEX)? {
+            Some((raw, _)) => Ok(parse::<RuntimeIndex>(RUNTIME_INDEX, &raw)?.latest),
+            None => Err(dist(format!("{RUNTIME_INDEX} is missing"))),
+        }
+    };
     for _ in 0..8 {
         let pointer = sink.get(RUNTIME_LATEST)?;
-        let latest = match sink.get(RUNTIME_INDEX)? {
-            Some((raw, _)) => parse::<RuntimeIndex>(RUNTIME_INDEX, &raw)?.latest,
-            None => return Err(dist(format!("{RUNTIME_INDEX} is missing"))),
-        };
+        let latest = index_latest()?;
         let cond = match pointer {
             Some((raw, _)) if String::from_utf8_lossy(&raw).trim() == latest => return Ok(latest),
             Some((_, etag)) => Cond::IfMatch(etag),
@@ -427,8 +433,8 @@ fn sync_latest(sink: &dyn Sink) -> Result<String> {
         };
         let body = format!("{latest}\n");
         match put_bytes(sink, RUNTIME_LATEST, body.as_bytes(), "text/plain", cond)? {
-            Put::Stored(_) => return Ok(latest),
-            Put::PreconditionFailed => continue,
+            Put::Stored(_) if index_latest()? == latest => return Ok(latest),
+            Put::Stored(_) | Put::PreconditionFailed => continue,
         }
     }
     Err(dist(format!(
@@ -562,67 +568,127 @@ mod tests {
         let _ = std::fs::remove_dir_all(root);
     }
 
-    /// Two publishers race: A writes the index, stalls; B promotes a newer
-    /// version (index and pointer); A resumes. The pointer must stay on B's
-    /// version, which the index names, not go back to A's.
+    /// When another publisher runs, relative to this one's pointer step.
+    #[derive(Clone, Copy, PartialEq)]
+    enum At {
+        /// Before this publisher reads the pointer.
+        ReadPointer,
+        /// After it has read pointer and index, before its write lands.
+        WritePointer,
+    }
+
+    /// A sink that runs another publisher once, at `at`, against the same
+    /// registry: a stall at exactly that point.
+    struct Racing<'a> {
+        inner: &'a FileSink,
+        at: At,
+        other: std::sync::Mutex<Option<Box<dyn FnOnce() + Send + 'a>>>,
+    }
+
+    impl Racing<'_> {
+        fn interleave(&self, key: &str, at: At) {
+            if key == RUNTIME_LATEST && self.at == at {
+                if let Some(other) = self.other.lock().unwrap().take() {
+                    other();
+                }
+            }
+        }
+    }
+
+    impl Sink for Racing<'_> {
+        fn head(&self, key: &str) -> Result<Option<String>> {
+            self.inner.head(key)
+        }
+        fn get(&self, key: &str) -> Result<Option<(Vec<u8>, String)>> {
+            self.interleave(key, At::ReadPointer);
+            self.inner.get(key)
+        }
+        fn put(
+            &self,
+            key: &str,
+            body: &mut dyn Read,
+            len: u64,
+            ct: &str,
+            cond: Cond,
+        ) -> Result<Put> {
+            self.interleave(key, At::WritePointer);
+            self.inner.put(key, body, len, ct, cond)
+        }
+        fn describe(&self) -> String {
+            self.inner.describe()
+        }
+    }
+
+    const TRIPLE: &str = "x86_64-unknown-linux-gnu";
+    const A: &str = "0.1.3+aaaaaaaaaaaa";
+    const B: &str = "0.1.4+bbbbbbbbbbbb";
+
+    /// Index `latest`, pointer, and what each agrees on.
+    fn promoted(sink: &FileSink) -> (String, String) {
+        let index: RuntimeIndex =
+            serde_json::from_slice(&read(sink, RUNTIME_INDEX).unwrap()).unwrap();
+        let pointer = String::from_utf8(read(sink, RUNTIME_LATEST).unwrap()).unwrap();
+        (index.latest, pointer.trim().to_string())
+    }
+
+    /// Publisher A writes the index and stalls; B promotes a newer version
+    /// (index and pointer); A resumes. The pointer stays on B's version,
+    /// which the index names, and does not go back to A's.
     #[test]
     fn a_stalled_publisher_never_moves_latest_behind_the_index() {
-        struct Racing<'a> {
-            inner: &'a FileSink,
-            other: std::sync::Mutex<Option<Box<dyn FnOnce() + Send + 'a>>>,
-        }
-        impl Sink for Racing<'_> {
-            fn head(&self, key: &str) -> Result<Option<String>> {
-                self.inner.head(key)
-            }
-            fn get(&self, key: &str) -> Result<Option<(Vec<u8>, String)>> {
-                if key == RUNTIME_LATEST {
-                    if let Some(b) = self.other.lock().unwrap().take() {
-                        b();
-                    }
-                }
-                self.inner.get(key)
-            }
-            fn put(
-                &self,
-                key: &str,
-                body: &mut dyn Read,
-                len: u64,
-                ct: &str,
-                cond: Cond,
-            ) -> Result<Put> {
-                self.inner.put(key, body, len, ct, cond)
-            }
-            fn describe(&self) -> String {
-                self.inner.describe()
-            }
-        }
-
         let root = tmp("race");
         let sink = FileSink::new(root.join("reg"));
-        let triple = "x86_64-unknown-linux-gnu";
-        let a = release(&root.join("a"), "0.1.3+aaaaaaaaaaaa", triple, b"a");
-        let b = release(&root.join("b"), "0.1.4+bbbbbbbbbbbb", triple, b"b");
+        let a = release(&root.join("a"), A, TRIPLE, b"a");
+        let b = release(&root.join("b"), B, TRIPLE, b"b");
         let racing = Racing {
             inner: &sink,
+            at: At::ReadPointer,
             other: std::sync::Mutex::new(Some(Box::new(|| {
                 push_runtime(&sink, &[b], &Options::default()).unwrap();
             }))),
         };
         let out = push_runtime(&racing, &[a], &Options::default()).unwrap();
-        let index: RuntimeIndex =
-            serde_json::from_slice(&read(&sink, RUNTIME_INDEX).unwrap()).unwrap();
-        assert_eq!(index.latest, "0.1.4+bbbbbbbbbbbb");
-        assert_eq!(
-            String::from_utf8(read(&sink, RUNTIME_LATEST).unwrap()).unwrap(),
-            "0.1.4+bbbbbbbbbbbb\n"
-        );
-        assert_eq!(out.latest, "0.1.4+bbbbbbbbbbbb");
+        assert_eq!(promoted(&sink), (B.into(), B.into()));
+        assert_eq!(out.latest, B);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// A rollback during a promotion. The pointer is at A. B reads pointer A
+    /// and index B, then stalls before writing. Another publisher promotes A
+    /// again: the index says A, the pointer already says A, so it writes
+    /// nothing. B's write still matches the pointer's tag and lands. B must
+    /// see that the index moved and put the pointer back on A.
+    #[test]
+    fn a_late_pointer_write_after_a_rollback_is_put_right() {
+        let root = tmp("rollback");
+        let sink = FileSink::new(root.join("reg"));
+        push_runtime(
+            &sink,
+            &[release(&root.join("a"), A, TRIPLE, b"a")],
+            &Options::default(),
+        )
+        .unwrap();
+        assert_eq!(promoted(&sink), (A.into(), A.into()));
+        let again = release(&root.join("a2"), A, TRIPLE, b"a");
+        let b = release(&root.join("b"), B, TRIPLE, b"b");
+        let racing = Racing {
+            inner: &sink,
+            at: At::WritePointer,
+            other: std::sync::Mutex::new(Some(Box::new(|| {
+                let out = push_runtime(&sink, &[again], &Options::default()).unwrap();
+                assert_eq!(out.latest, A);
+                assert_eq!(promoted(&sink), (A.into(), A.into()));
+            }))),
+        };
+        let out = push_runtime(&racing, &[b], &Options::default()).unwrap();
+        assert_eq!(promoted(&sink), (A.into(), A.into()));
+        assert_eq!(out.latest, A);
         let _ = std::fs::remove_dir_all(root);
     }
 
     /// An index a newer publisher wrote, with a field this one does not
-    /// know, is refused rather than rewritten without it.
+    /// know, is refused rather than rewritten without it, even when the
+    /// field's value is empty.
     #[test]
     fn an_index_with_a_field_this_publisher_does_not_know_is_not_rewritten() {
         let root = tmp("newer");
@@ -632,7 +698,7 @@ mod tests {
         push_runtime(&sink, &[a], &Options::default()).unwrap();
         let mut index: serde_json::Value =
             serde_json::from_slice(&read(&sink, RUNTIME_INDEX).unwrap()).unwrap();
-        index["releases"][0]["yanked"] = serde_json::json!("cve-2026-1");
+        index["future_field"] = serde_json::json!([]);
         let (_, etag) = sink.get(RUNTIME_INDEX).unwrap().unwrap();
         let bytes = serde_json::to_vec(&index).unwrap();
         sink.put(
@@ -647,7 +713,27 @@ mod tests {
         let e = push_runtime(&sink, &[b], &Options::default())
             .unwrap_err()
             .to_string();
-        assert!(e.contains("releases[0].yanked"), "{e}");
+        assert!(e.contains("future_field"), "{e}");
+        // Nested, too.
+        let mut index: serde_json::Value =
+            serde_json::from_slice(&read(&sink, RUNTIME_INDEX).unwrap()).unwrap();
+        index.as_object_mut().unwrap().remove("future_field");
+        index["releases"][0]["yanked"] = serde_json::json!(null);
+        let (_, etag) = sink.get(RUNTIME_INDEX).unwrap().unwrap();
+        let bytes = serde_json::to_vec(&index).unwrap();
+        sink.put(
+            RUNTIME_INDEX,
+            &mut &bytes[..],
+            bytes.len() as u64,
+            "application/json",
+            Cond::IfMatch(etag),
+        )
+        .unwrap();
+        let b = release(&root.join("b2"), "0.1.4+bbbbbbbbbbbb", triple, b"b");
+        let e = push_runtime(&sink, &[b], &Options::default())
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("yanked"), "{e}");
         let _ = std::fs::remove_dir_all(root);
     }
 

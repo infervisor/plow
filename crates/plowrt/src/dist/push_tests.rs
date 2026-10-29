@@ -835,16 +835,21 @@ fn a_document_with_a_field_this_publisher_does_not_know_is_not_rewritten() {
     )
     .unwrap_err()
     .to_string();
-    assert!(e.contains("variants[0].placement_hint"), "{e}");
+    assert!(e.contains("placement_hint"), "{e}");
 
-    // Values the writer itself omits as defaults are not "unknown".
-    let was =
-        serde_json::json!({"models": [{"name": "a", "listed": true, "aliases": [], "x": null}]});
-    let now = serde_json::json!({"models": [{"name": "a"}]});
-    assert_eq!(super::dropped(&was, &now, ""), None);
-    let was = serde_json::json!({"models": [{"name": "a", "pinned": true}]});
-    assert_eq!(
-        super::dropped(&was, &now, "").as_deref(),
-        Some("models[0].pinned")
-    );
+    // A known field at its default (the writer omits `listed: true`) is fine.
+    let row = r#"{"namespace":"infervisor","name":"a","hf":"o/a","description":"","listed":true"#;
+    let doc = |extra: &str| format!(r#"{{"models":[{row}{extra}}}]}}"#);
+    super::parse_to_rewrite::<super::Catalog>("catalog.json", doc("").as_bytes()).unwrap();
+    // An unknown field is refused whatever its value: an empty list or a
+    // null may mean something to the schema that wrote it.
+    for value in ["[]", "null", "{}", "true"] {
+        let e = super::parse_to_rewrite::<super::Catalog>(
+            "catalog.json",
+            doc(&format!(r#","future_field":{value}"#)).as_bytes(),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(e.contains("future_field"), "{value}: {e}");
+    }
 }

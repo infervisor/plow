@@ -262,52 +262,20 @@ fn parse<T: serde::de::DeserializeOwned>(what: &str, bytes: &[u8]) -> Result<T> 
 /// field is refused by name instead.
 pub(crate) fn parse_to_rewrite<T>(what: &str, bytes: &[u8]) -> Result<T>
 where
-    T: serde::Serialize + serde::de::DeserializeOwned,
+    T: serde::de::DeserializeOwned,
 {
-    let typed: T = parse(what, bytes)?;
-    let whole: serde_json::Value = parse(what, bytes)?;
-    let again =
-        serde_json::to_value(&typed).map_err(|e| dist(format!("{what}: serialize: {e}")))?;
-    match dropped(&whole, &again, "") {
+    // Whatever the value: an unknown `[]` or `null` may mean something to the
+    // schema that wrote it, so only the type's own fields may be omitted.
+    let mut unknown = Vec::new();
+    let mut de = serde_json::Deserializer::from_slice(bytes);
+    let typed: T = serde_ignored::deserialize(&mut de, |path| unknown.push(path.to_string()))
+        .map_err(|e| dist(format!("{what}: not valid JSON for this schema: {e}")))?;
+    match unknown.first() {
         Some(field) => Err(dist(format!(
             "{what}: carries `{field}`, which this plowrt does not know and would drop on \
              rewrite; publish with the plowrt that wrote it, or a newer one"
         ))),
         None => Ok(typed),
-    }
-}
-
-/// The first field of `was` that `now` lost, as a path. Losing a value the
-/// writer omits as a default (null, empty, a `listed: true`) loses nothing.
-fn dropped(was: &serde_json::Value, now: &serde_json::Value, at: &str) -> Option<String> {
-    use serde_json::Value;
-    let path = |k: &str| {
-        if at.is_empty() {
-            k.to_string()
-        } else {
-            format!("{at}.{k}")
-        }
-    };
-    match (was, now) {
-        (Value::Object(a), Value::Object(b)) => a.iter().find_map(|(k, x)| match b.get(k) {
-            Some(y) => dropped(x, y, &path(k)),
-            None => {
-                let default = match x {
-                    Value::Null => true,
-                    Value::Array(v) => v.is_empty(),
-                    Value::Object(m) => m.is_empty(),
-                    Value::Bool(true) => k == "listed",
-                    _ => false,
-                };
-                (!default).then(|| path(k))
-            }
-        }),
-        (Value::Array(a), Value::Array(b)) => a
-            .iter()
-            .zip(b)
-            .enumerate()
-            .find_map(|(i, (x, y))| dropped(x, y, &format!("{at}[{i}]"))),
-        _ => None,
     }
 }
 
