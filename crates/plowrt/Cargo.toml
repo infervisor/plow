@@ -153,9 +153,6 @@ cuda = ["dep:libloading", "dep:safetensors", "hf-tokenizer"]
 hsa = ["dep:libloading", "dep:safetensors", "hf-tokenizer"]
 # Generic GGUF asset reader; it is independent of the execution backend.
 gguf = ["dep:gguf-rs-lib"]
-# In-process adapter for NVIDIA NeMo-Speech's stable ASR C ABI. The selected
-# runtime library supplies its own CPU/CUDA/Metal kernels at deployment time.
-nemo-asr = ["dep:libloading", "gguf"]
 
 [lints.rust]
 # `#[derive(svid::Svid)]` expands svid's own optional features as `cfg(feature = ...)` here.
@@ -264,16 +261,6 @@ path = "examples/asr/matrix_sweep.rs"
 [[example]]
 name = "asr_slot_check"
 path = "examples/asr/slot_check.rs"
-
-[[example]]
-name = "asr_nemotron"
-path = "examples/asr/nemotron.rs"
-required-features = ["nemo-asr"]
-
-[[example]]
-name = "asr_nemotron_dataset"
-path = "examples/asr/nemotron_dataset.rs"
-required-features = ["nemo-asr"]
 
 [[example]]
 name = "asr_qwen_conv_packet"
