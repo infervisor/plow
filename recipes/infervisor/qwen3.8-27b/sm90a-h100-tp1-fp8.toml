@@ -220,4 +220,8 @@ vllm_capture = { c1 = "{env:QWEN38_FP8_FP32_VLLM}", c8 = "{env:QWEN38_FP8_FP32_V
 # significant perf gains") does not apply: the flip is on a re-emit with no kernel or route change
 # (c8 cont_decisive 44/45/44/45/44/45 of 46 over six runs vs the peer's 45), so there is no gain to
 # trade, and the current packet passes c1/c8/c32 at the default margin. Thresholds unchanged.
+# 2026-10-29 (user decision): one case of the 46 (0.022, the BF16 recipe's margin) for the
+# nat-pride-128 swing at c8. With it the prefix-on run (prod-next 01685b29c, packet 2af45e892b75,
+# c8 44/46 vs peer 45/46) passes; every KL and top-1 criterion beats the vLLM 0.29 peer.
+cont_decisive_drop_max = 0.022
 

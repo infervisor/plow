@@ -31,6 +31,7 @@ const STAGING: usize = 4;
 type Create = unsafe extern "C" fn(i32, *mut *mut c_void) -> i32;
 type Destroy = unsafe extern "C" fn(*mut c_void) -> i32;
 type Abi = unsafe extern "C" fn() -> u32;
+type Dtype = unsafe extern "C" fn() -> u32;
 type Run = unsafe extern "C" fn(
     *mut c_void, // handle
     u32,         // heads
@@ -175,8 +176,9 @@ struct DequantArgs {
     kv_heads: u32,
     kv_stride: u32,
     pool_pages: u32,
+    f16: u32,
 }
-const _: () = assert!(std::mem::size_of::<DequantArgs>() == 72);
+const _: () = assert!(std::mem::size_of::<DequantArgs>() == 80);
 
 struct Staging {
     host: PinnedHost,
@@ -196,6 +198,8 @@ struct Launch {
     max_kv: u32,
     /// Output rows past the last request: zeroed once per site.
     tail: (u64, u64),
+    /// First request row (riders, if any, precede it).
+    head: u64,
 }
 
 impl Launch {
@@ -230,6 +234,10 @@ pub(super) struct LibAttention {
     run: Run,
     module: Module,
     dequant: KernelFn,
+    convert_fn: KernelFn,
+    /// The library's element type is fp16 (`plow_fa4_dtype` 1): the pool is fp16 and Q / O are
+    /// converted in place around each call.
+    f16: bool,
     pool_k: DeviceMem,
     pool_v: DeviceMem,
     /// Device table: cu_q [MAX_REQUESTS + 1] | kv_len [MAX_REQUESTS] | gather [POOL_PAGES][3] |
@@ -309,16 +317,31 @@ impl LibAttention {
                 library.display()
             )));
         }
+        // SAFETY: symbol type matches; a library without it is bf16.
+        let f16 = match unsafe { lib.get::<Dtype>(b"plow_fa4_dtype\0") } {
+            Ok(dtype) => match unsafe { (*dtype)() } {
+                0 => false,
+                1 => true,
+                d => {
+                    return Err(RuntimeError::Rejected(format!(
+                        "{}: plow_fa4_dtype {d} unknown",
+                        library.display()
+                    )))
+                }
+            },
+            Err(_) => false,
+        };
         let image = std::fs::read(object)
             .map_err(|e| RuntimeError::Rejected(format!("{}: {e}", object.display())))?;
         let module = be.module_load(&image)?;
-        if be.module_global_u32(&module, "plow_kv_dequant_abi")? != Some(1) {
+        if be.module_global_u32(&module, "plow_kv_dequant_abi")? != Some(2) {
             return Err(RuntimeError::Rejected(format!(
-                "{}: plow_kv_dequant ABI 1 expected",
+                "{}: plow_kv_dequant ABI 2 expected",
                 object.display()
             )));
         }
         let dequant = be.get_function(&module, "plow_kv_dequant_pages")?;
+        let convert = be.get_function(&module, "plow_cvt_rows")?;
         let pool_bytes = u64::from(max_kv_heads) * u64::from(POOL_ROWS) * u64::from(HEAD_DIM) * 2;
         let pool_k = be.alloc(0, pool_bytes)?;
         let pool_v = be.alloc(0, pool_bytes)?;
@@ -344,6 +367,7 @@ impl LibAttention {
         tracing::info!(
             library = %library.display(),
             pool_mib = (2 * pool_bytes) >> 20,
+            pool = if f16 { "fp16" } else { "bf16" },
             "library hd512 prefill attention (FA4) loaded"
         );
         Ok(Self {
@@ -354,6 +378,8 @@ impl LibAttention {
             run,
             module,
             dequant,
+            convert_fn: convert,
+            f16,
             pool_k,
             pool_v,
             table,
@@ -478,6 +504,7 @@ impl LibAttention {
             max_q: requests.iter().map(|r| r[1]).max().unwrap_or(1),
             max_kv: requests.iter().map(|r| r[3]).max().unwrap_or(1),
             tail: (u64::from(last[0] + last[1]), u64::from(rows)),
+            head: u64::from(requests[0][0]),
         });
         Ok(true)
     }
@@ -504,6 +531,7 @@ impl LibAttention {
             kv_heads: site.kv_heads,
             kv_stride: site.kv_stride,
             pool_pages: POOL_PAGES,
+            f16: u32::from(self.f16),
         };
         let handle = self
             .handle
@@ -528,6 +556,12 @@ impl LibAttention {
             )?;
         }
         let splits = l.splits(site.kv_heads, self.workspace.len);
+        // The request rows of Q and O, [head, tail.0): bf16 -> fp16 for an fp16 library.
+        let rows_q = (site.q + l.head * row_bytes, (t0 - l.head) * row_bytes);
+        let rows_o = (site.output + l.head * row_bytes, (t0 - l.head) * row_bytes);
+        if self.f16 {
+            self.convert(rows_q, true, stream)?;
+        }
         // SAFETY: every pointer is a live device buffer sized above; the stream is ours.
         check(
             unsafe {
@@ -555,6 +589,40 @@ impl LibAttention {
                 )
             },
             "plow_fa4_hd512_run",
+        )?;
+        if self.f16 {
+            self.convert(rows_o, false, stream)?;
+            self.convert(rows_q, false, stream)?;
+        }
+        Ok(())
+    }
+
+    /// In-place bf16 <-> fp16 of `(address, bytes)` (16 B multiple).
+    fn convert(
+        &self,
+        (address, bytes): (u64, u64),
+        to_f16: bool,
+        stream: &CudaStream,
+    ) -> Result<()> {
+        let mut p = address;
+        let mut n8 = bytes / 16;
+        let mut to = u32::from(to_f16);
+        if n8 == 0 {
+            return Ok(());
+        }
+        let mut params = [
+            &mut p as *mut u64 as *mut c_void,
+            &mut n8 as *mut u64 as *mut c_void,
+            &mut to as *mut u32 as *mut c_void,
+        ];
+        let blocks = n8.div_ceil(256).min(u64::from(SMS) * 8) as u32;
+        self.be.launch_kernel_grid(
+            self.convert_fn,
+            [blocks, 1, 1],
+            256,
+            0,
+            &mut params,
+            Some(stream),
         )
     }
 }

@@ -25,6 +25,12 @@ struct PlowFa4Handle {
 
 extern "C" unsigned plow_fa4_abi() { return 2; }
 
+#ifndef PLOW_FA4_DTYPE
+#define PLOW_FA4_DTYPE 0
+#endif
+// Element type of q / k / v / out the exported entries were compiled for: 0 bf16, 1 fp16.
+extern "C" unsigned plow_fa4_dtype() { return PLOW_FA4_DTYPE; }
+
 #define PLOW_FA4_MODULES(X) X(h16kv1) X(h16kv1_split) X(h16kv2) X(h16kv2_split) X(combine)
 
 static void unload_all(PlowFa4Handle* h) {

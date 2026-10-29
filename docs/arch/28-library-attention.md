@@ -127,6 +127,36 @@ FP32 gate at c1/c8/c32 against same-concurrency vLLM peers (captured with the c1
   capture is deterministic and native passes it at 44/46, so the 4 free-run divergences are the
   library route's: the bf16 page pool rounds each dequantized row (kernel rel-L2 2x native).
 
+### 12B with an fp16 page pool (bin4, `PLOW_BUILD_FA4_HD512=f16`)
+
+The fp16 library variant reads an fp16 pool; Q and O request rows are converted in place around
+the call. Kernel level (runtime pieces, splits on): rel-L2 1.72-1.75e-3 = native (1.67-1.95e-3),
+bf16 pool 3.3-3.4e-3, also with K scaled by the 12B global k_norm weight (0.0605); time +10-14%
+over the bf16 pool at long prefix. In-model, 16000-token prompt: chunk 2048/1024/512/128 0.549/
+0.572/0.677/1.813 s vs native 0.608/0.633/0.758/2.375 (-10/-10/-11/-24%).
+
+FP32 gate vs the same peers: c1 PASS kl_trim 0.0678 (peer 0.0631, native 0.0496) top1 0.9764
+(0.9803, native 0.9872) cont 41/46 (43, native 44; limit 41); c8 PASS 0.0680 (0.0678) cont 40 (42);
+c32 PASS 0.0618 (0.0710) cont 39 (41). Natural-text KL sits above native and the bf16 pool at every
+concurrency (c1 trimmed 0.152 vs 0.114 / 0.123), unexplained: the kernel-level error is native's.
+Production mix 2.7/s, 2 reps: TTFT P99 1133.2 ms (1.01x vLLM; native 1338.5, 1.19x), TPOT P99
+97.7 ms (native 105.4), goodput 9.13 req/s (native 9.05), report MATCHED + EQUIVALENT.
+
+The natural-text gap is not a numerical defect of the route. Per-site dumps of every hd512 call of
+the 15872-token natural case (Q before and after, FP8 K/V rows and scales, O) against an FP32
+attention over the same inputs: fp16 pool rel-L2 1.69-1.73e-3 on all 56 sites (native kernel
+1.7e-3), bf16 pool 1.7-4.5e-3; the Q round trip changes only subnormal elements (|q| < 8e-6, error
+< 3e-8). A sharper softmax (logits x4..x22.6) keeps the fp16 pool at 1.8-2.2e-3 while the bf16
+pool degrades to 0.7-2.0e-2. Per case, natural KL moves both ways against native (fp16 better on 9
+of 20 cases, worse on 11; e.g. docs-128 0.484 vs 0.018, code-8192 0.210 vs 0.580): a different,
+equally accurate rounding re-rolls the knife-edge positions, and the route is batch-invariant, so
+the same re-roll repeats at c1/c8/c32.
+
+On prod-next b36fcf18c (KV store copy fixes), same binary and packet, 2.7/s, 2 reps: native TTFT
+P99 826.7 ms (0.73x vLLM), TPOT P99 71.1 ms; fp16 route 697.2 ms (0.62x, -15.7%), 62.7 ms (-11.9%),
+goodput 9.41 vs 9.39 req/s. The c1 gate is unchanged (deterministic): cont 41/46 against a limit of
+41, so the route passes with no margin and 12B keeps the native role.
+
 ## 4. Open
 
 * FP32 gate at c1/c8/c32 and a production-mix screen for the hd512 route.

@@ -173,6 +173,22 @@ PLOW_BUILD_PFATTN_HD256_BKV32 = "0"
 PLOW_BUILD_PFATTN_HD256_GQA2_BKV32 = "0"
 PLOW_BUILD_PFATTN_HD512_PX4_BQ64 = "0"
 PLOW_BUILD_GEN_KERNELS = "attn_pf_hd256_sliding_fp8kv,attn_pf_hd512_fp8kv"
+# Global (hd512) prefill attention through the library route with an fp16 page pool (plowrt
+# exec/gpu/lib_attention.rs, docs/arch/28): FlashAttention-4's SM90 forward exported AOT over fp16
+# into objects/libplow_fa4_hd512.so plus the FP8 KV page gather objects/kv_dequant_sm90.cubin (both
+# byte-reproducible; the export needs PYREF with vLLM's vllm_flash_attn and the CuTe DSL).
+# Qualified 2026-10-29 on lib-attn over prod-next b36fcf18c (bin6 aef05632), packet a0464475f8ab:
+# 16000-token prompt, packed prefill chunk 2048/1024/512/128 0.608/0.633/0.758/2.375 -> 0.549/0.572/
+# 0.677/1.813 s. Prod-fidelity replay 2.7/s, 2 reps, same binary: TTFT P99 826.7 -> 697.2 ms (0.62x
+# vLLM 0.29), TPOT P99 71.1 -> 62.7 ms, goodput 9.39 -> 9.41 req/s, SLO 100%. FP32 gate vs same-
+# concurrency vLLM 0.28 peers, thresholds unchanged: c1 PASS kl_trim 0.0678 (peer 0.0631) top1 0.9764
+# (0.9803) cont 41/46 (43; limit 41: at the limit, c1 deterministic; native 44); c8 PASS 0.0680
+# (0.0678) cont 40 (42); c32 PASS 0.0707 (0.0710) cont 39 (41). Relax-for-perf rule also met at c1
+# (kl_trim <= 1.10x peer, top1 >= peer - 0.005, cont >= peer - 2). Per-site dumps of a 15872-token
+# natural case: route O vs FP32 attention rel-L2 1.69-1.73e-3 on all 56 sites (native 1.7e-3); the
+# natural-text KL shift vs native is a rounding re-roll (per case 9 better / 11 worse of 20). The
+# bf16 pool fails c1 (cont 40). Evidence: docs/bringup/results/gemma12b-fp8-20260930/comparison.md.
+PLOW_BUILD_FA4_HD512 = "f16"
 
 [emit_roles.env]
 PLOW_GEMMA4_SM90_W8A8_GEMM_GLU_ROLE = "0"

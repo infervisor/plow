@@ -1,6 +1,9 @@
 #!/usr/bin/env python3
 """Build <out>/libplow_fa4_hd512.so, the host-side FlashAttention-4 hd512 prefill attention
-(Gemma-4 global layers) plowrt can load beside a packet. CPU only:
+(Gemma-4 global layers) plowrt can load beside a packet; `f16` builds the fp16 variant under the
+same name (plow_fa4_dtype reports it). CPU only:
+
+  build_sm90a_fa4_hd512.py OUT_DIR [f16]
 
   1. scripts/export_fa4_hd512_sm90.py <out>/fa4 {1,2,combine}  (CuTe DSL ->
      fa4_hd512_h16kv{1,2}{,_split}.{h,o} and fa4_hd512_combine.{h,o};
@@ -20,9 +23,10 @@ REPO = pathlib.Path(__file__).resolve().parent.parent
 
 
 def main() -> int:
-    if len(sys.argv) != 2:
+    if len(sys.argv) not in (2, 3) or sys.argv[2:] not in ([], ["f16"]):
         print(__doc__, file=sys.stderr)
         return 2
+    dtype = sys.argv[2:]
     out = pathlib.Path(sys.argv[1])
     obj = out / "fa4"
     obj.mkdir(parents=True, exist_ok=True)
@@ -33,7 +37,7 @@ def main() -> int:
         sys.path.insert(0, str(dsl))
         env["PYTHONPATH"] = os.pathsep.join(filter(None, [str(dsl), env.get("PYTHONPATH")]))
     for kvh in ("1", "2", "combine"):
-        subprocess.run([sys.executable, str(REPO / "scripts/export_fa4_hd512_sm90.py"), str(obj), kvh],
+        subprocess.run([sys.executable, str(REPO / "scripts/export_fa4_hd512_sm90.py"), str(obj), kvh, *dtype],
                        check=True, env=env)
     nvcc = os.environ.get("PLOW_NVCC", "/usr/local/cuda/bin/nvcc")
     import cutlass
@@ -44,7 +48,7 @@ def main() -> int:
         raise SystemExit(f"CuTe DSL host runtime archive missing: {archive}")
     cmd = [nvcc, "-shared", "-Xcompiler", "-fPIC", "-std=c++17", "-O2", "-cudart", "static",
            "-Xcompiler", "-static-libstdc++", "-Xcompiler", "-static-libgcc", "-Wno-deprecated-gpu-targets",
-           "-I", str(obj), "-o", str(out / "libplow_fa4_hd512.so"),
+           f"-DPLOW_FA4_DTYPE={1 if dtype else 0}", "-I", str(obj), "-o", str(out / "libplow_fa4_hd512.so"),
            str(REPO / "runtime/nvidia/fa4_hd512.cpp"),
            *sorted(str(p) for p in obj.glob("fa4_hd512_*.o")), str(archive), "-lcuda"]
     print(" ".join(cmd), flush=True)

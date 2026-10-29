@@ -5,8 +5,11 @@ KV heads as vLLM runs it; the 16-way pack crashes the DSL compiler), symbolic KV
 page pool's per-head extent). Config = vLLM's own SM90 hd512 choice (tile 64x64, one stage, 384
 threads, P from smem).
 
-  export_fa4_hd512_sm90.py OUT_DIR KVH       -> fa4_hd512_h16kv<KVH>{,_split}.{h,o}
-  export_fa4_hd512_sm90.py OUT_DIR combine   -> fa4_hd512_combine.{h,o}
+  export_fa4_hd512_sm90.py OUT_DIR KVH [f16]     -> fa4_hd512_h16kv<KVH>{,_split}.{h,o}
+  export_fa4_hd512_sm90.py OUT_DIR combine [f16] -> fa4_hd512_combine.{h,o}
+
+`f16` exports the same entries over fp16 Q/K/V/O (the fp16 page pool) under the same names; the
+wrapper built from them reports the element type (plow_fa4_dtype).
 
 `_split` writes f32 partials [splits][total_q][16][512] and LSE [splits][16][total_q] (split
 count = the partial tensor's first extent); the combine entry (vLLM's combine kernel at hd512:
@@ -32,7 +35,8 @@ out = pathlib.Path(sys.argv[1])
 out.mkdir(parents=True, exist_ok=True)
 H, D, PAGE = 16, 512, 64
 S = cute.sym_int
-bf, f32, i32 = cutlass.BFloat16, cutlass.Float32, cutlass.Int32
+f32, i32 = cutlass.Float32, cutlass.Int32
+bf = cutlass.Float16 if sys.argv[3:] == ["f16"] else cutlass.BFloat16
 
 
 def export(compiled, name):
