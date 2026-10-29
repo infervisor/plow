@@ -221,7 +221,15 @@ Pitfalls this playbook exists for:
   reference's decode-only phase), not TPOT across different batch compositions.
 * **Shared worktree.** Never checkout/stash/reset it; its copies can be stale vs HEAD (the doctor
   warns). Work in `git worktree add --detach <dir> HEAD`, own `CARGO_TARGET_DIR`, deliver patches.
-* **Lease hygiene.** `gpulease` serves waiters FIFO (`gpulease --status` lists the queue) and
+  Set `CARGO_TARGET_DIR` **after** sourcing a box env file: a hand-built env (e.g. the lab's
+  `g26main/env.sh`) exports a shared target dir, and a build into it silently replaces other
+  campaigns' `plowc`/`plowrt`/`step_bench` with a newer mtime that defeats every staleness check.
+* **Lease hygiene.** One lease per decision (one server start per packet), at most one queued
+  waiter per agent: never stack duplicate waiters for the same job. A lease command that is a
+  script must be executable (`chmod +x`; otherwise rc 126 after the wait). `GPU_LEASE_TIMEOUT`
+  (default 1800 s) bounds the wait for the cards. Never `pkill -f`/`pgrep -f` a pattern that occurs
+  in your own command line or in the kill script's file name (it kills your own shell, exit 144):
+  write the kill logic to a neutrally named script file and kill by pid. `gpulease` serves waiters FIFO (`gpulease --status` lists the queue) and
   runs the command in its own process group: the whole job tree stops when the command exits or
   the lease is killed, so kill the `gpulease` process, not its children. A run that holds cards
   past `GPU_LEASE_MAX_HOLD` (default 7200 s) while someone waits is stopped with rc 124
@@ -245,7 +253,9 @@ Every argument is optional and has an env fallback: `PB_ASSETS`, `PLOW_HSACO`, `
 
 CPU only; leases nothing. Exit 0 = safe to lease, 1 = something will fail after the weights load,
 2 = warnings only. It checks, in order: the nix shell (plus `python3`, `curl`); hazardous `PLOW_*`
-overrides left in the environment; the binaries (plowrt, the vLLM client, `plowc`); the packet hash
+overrides left in the environment; the binaries (plowrt, the cuBLASLt it will bind — beside the
+binary in `<bin>/../lib` or `<bin>`, else the loader's `libcublasLt.so.13` — against the packet's
+`build.json` `runtime_requires.cublaslt`, the vLLM client, `plowc`); the packet hash
 and the object set; `gpulease` and the queue runner; scratch space (warn at 85% full, fail at
 95%); harness/recipe files vs HEAD; and the capability inventory. Run it first. Each check exists
 because its absence cost a leased run.
@@ -257,7 +267,10 @@ compact terminal (the first token from the prefill launch; needs the generic or 
 tail), segment roles, token batch, generated kernels, device sampler, Lt prefill. The doctor
 (`scripts/bench/capability_check.py`) fails on an `OFF` unless the recipe beside the assets waives
 it in `[capabilities]` (`name = "measured reason"`) or `PB_CAPABILITY_WAIVERS=name,...` does. A
-recurrent network's prefix cache and token batch are `n/a`, not `OFF`. The Qwen3.8 campaign ran
+recurrent network's prefix cache is `ON` when the packet's `recurrent_state` section declares its
+state buffers (the block store captures them at a boundary; CUDA does not auto-select it, so the
+recipe sets `PLOW_VMM_PREFIX=1`), and its token batch is `ON` only when the packet
+carries the packed scan's init-state scratch (`act.gdn.initstate`), otherwise `OFF`. The Qwen3.8 campaign ran
 some forty builds before packed prefill was turned on; this check exists so the next model starts there.
 
 **It is arch-aware, not AMD-only.** `pb_detect_arch` resolves gfx942/gfx950/sm_90a/sm_120/sm_89
@@ -416,6 +429,15 @@ records the checkpoint's `eos_token_id` in the reference's meta; a reference mad
 
 Unit tests: `cd scripts/llm && python3 -m unittest test_fp32_ref_gate`.
 
+**Screen, then promote.** Judge every arm against the vLLM capture taken at the **same
+concurrency** (the gate refuses without one). Screening a candidate = one c16 gate (c8 for a model
+whose recipe gates at 1/8/32, e.g. Qwen3.8) plus step_bench at the affected rungs, in one lease;
+c1/c8/c32 and the full production mix run only for a promotion candidate. An **arm** is the same
+packet + plowrt + serve env: a run with another knob set, binary or packet is a different arm.
+`kl_p99` is knife-edge (one co-batching flip moves it; reported, not gated): compare
+`kl_trim_mean`/`kl_p95`, and re-run a miss by < 0.01 on `cont_frac` at c32 before touching kernels.
+A c1 failure on a short chat case: first check what is scored past the reference's stop token.
+
 **Gate relaxation for significant perf gains (2026-10-28, user decision).** A change may miss a
 recipe's `llm_fp32_ref` thresholds only if both hold:
 
@@ -484,14 +506,14 @@ These change what is measured and are easy to leave set from a previous probe. `
 |---|---|
 | `PLOW_PREFILL_SEG_TIMING=1` | **disables segment-major** and forces an all-rank drain per segment — about 3.7x inflation. Its totals are attribution shares, never latency. One rung-width experiment was scored and written up before anyone noticed only one arm had it. |
 | `PLOW_TUNEDB` | selects measured GEMM tiles. Measured tiles are **slower** at every rung (5-8 ms); the store must not reach a shipping packet. |
-| `PLOW_DECODE_MIN_RUNG` | picks the decode program. Default 8 is the measured optimum (41.19 ms vs 50.55 at rung 1, re-measured 2026-09-15). |
+| `PLOW_DECODE_MIN_RUNG` | picks the narrowest decode program. TP engines default to 8 (GLM-5.3 TP8 41.4 vs 51.9 ms at rung 1); single-GPU engines leave it unset. |
 | `PLOW_OBJECTIVE` | pins `latency` or `throughput` scheduling (decode quantum, prefill packing, queue TTL, rung fast probe). Recipes and production leave it at the default `auto`, which switches per tick. |
 | `PLOW_HSACO_LOWRUNG` | swaps a different object tier for narrow rungs. |
 | `PLOW_GLM_ROWBAND`, `PLOW_TICK_LOG` | fine, but both arms of an A/B must agree on them. |
 
 Two more that are not env vars:
 
-* **`target/release/plowrt` is shared.** A concurrent `cargo build -p plowrt` with no features
+* **`target/release/plowrt` (or any shared `CARGO_TARGET_DIR`) is shared.** A concurrent `cargo build -p plowrt` with no features
   replaces it mid-run, and it does not fail — it serves from the CPU reference interpreter, i.e.
   fluent garbage, ready in 2 s instead of a 12 s weight upload. Copy the binary before any run you
   will publish a number from.
@@ -535,3 +557,81 @@ before submitting into a cold queue.
 
 Never kill another lease holder, never kill by session or process group, and never read another
 process's `/proc` environ.
+
+---
+
+## 9. Campaign rules (lessons from the 2026-10 campaigns)
+
+Each rule cost at least one campaign a day of misattributed results.
+
+**Builds and binaries**
+
+* `campaign.py build` runs `$CARGO_TARGET_DIR/release/plowc` (else `target/`) as found: it never
+  runs cargo, and refuses only a plowc older than a source in its cargo dep-info. After any
+  devgen/plowc change run `cargo build --release -p plowc` (same `CARGO_TARGET_DIR`) first. Never
+  rebuild plowc while an emit runs from it. The runtime `.cu` sources are compiled at emit time from
+  the worktree, so kernel edits need no plowc rebuild.
+* A killed `campaign.py build` leaves cmake's `make` and its nvcc children writing cubins stamped
+  with the old packet hash into `<out>/assets` (load then fails "packet/interpreter MISMATCH").
+  After a kill: check `pgrep -af "make|cmake|cicc|ptxas"`, then build into a **fresh** out dir.
+* `PLOW_EXTRA_DEFINES` in the environment of an emit does nothing: object defines come from the
+  manifest (`requires`/`recommends`/tuning). An object variant must be a manifest tuning key.
+* `cargo build -p plowrt --example step_bench` builds only the example; the serving binary stays
+  stale. Build `--bin plowrt --example step_bench`. Before a gate or cell, confirm the binary carries
+  the change (sha256 / mtime, or `grep -c '<new log string>' plowrt`). Gate digits identical to 4
+  places across "two builds" mean the same binary or packet ran, not a neutral change.
+* `interp_sm90a.cubin` is not byte/SASS-reproducible across nvcc runs for some configs: prove a
+  "no-op for other packets" claim with `cuobjdump --dump-resource-usage`, a re-gate and step_bench
+  token digests, not a cubin diff.
+* No default-off knob ships: a knob is default on (qualified) or removed. Every new `PLOW_*` env
+  read, emit knob or `#if PLOW_*` define is registered in `crates/plowrt/src/knob_spec.rs` or
+  `crates/devgen/src/knob_spec.rs`, and `cargo test -p plowrt --features cuda,hsa --lib knob` +
+  `cargo test -p devgen --lib knob` pass (they also refuse a removed knob set in `recipes/` or
+  `scripts/`, and an unregistered name in `docs/flags-reference.md`).
+
+**Runtime environment**
+
+* plowrt binds the first loadable cuBLASLt: `<bin>/../lib`, `<bin>`, then the loader's
+  `libcublasLt.so.13`. Packets that declare `runtime_requires.cublaslt = "13.4"` (Gemma-4 26B,
+  grouped-Lt MoE routes) refuse older at load, a few seconds into the lease. On the lab box the
+  loader's `.so.13` is `/opt/pytorch/cuda/lib` (13.1), so a bare `plowrt` under the CUDA 12.9 env
+  fails: ship `lib/libcublasLt.so.13` (13.4) beside the binary as the deploy kits do, or put a 13.4
+  lib dir first on `LD_LIBRARY_PATH`. The doctor checks this ([3]).
+* cuBLASLt's load-time algorithm choice is timing-based and re-rolls per server start, prefill
+  shapes included, so two starts of one build can differ in c1 numerics. For a digest or numerics
+  A/B pin the algorithms: `campaign.py probe` (or `build` without `--no-probe`) writes
+  `<assets>/cublaslt_algos.jsonl`, and plowrt serves with it as `PLOW_LT_ALGOS` whenever it sits in
+  the assets dir (`asset::serve::asset_env_defaults`). A packet without the table (`--no-probe`, or a
+  probe that died, e.g. on the cuBLASLt version above) re-rolls on every start. Diff the serve logs' `algorithm selected`
+  lines before blaming a build.
+* A serving plowrt with the host tier on auto pins host RAM down to the reserve (default tier
+  = `min(MemAvailable − max(total/8, 16 GiB), total/4)`, `memory::vmm::host_tier_default`; the 12B
+  recipe sets `PLOW_VMM_HOST_CACHE_MIB` 64 GiB). An `interp_sm90a` compile takes 22–38 GB per nvcc:
+  never start an emit or a large cargo build beside a serving grid; chain it after.
+* The prefix cache is always on (`PLOW_PREFIX_CACHE`, `PLOW_VMM_PREFIX`); `=0` is an attribution
+  A/B, never a recipe or release setting. A prefix-cache cost is a plowrt bug to fix.
+* Packets declare the attention route per rung (native role vs library objects in the packet, e.g.
+  `PLOW_BUILD_FA4_HD512` puts `libplow_fa4_hd512.so` + `kv_dequant_sm90.cubin` in it); plowrt runs
+  what the packet declares. A route change is a re-emit and a re-gate, never a serve knob.
+
+**KV reads and device faults**
+
+* Under live KV (`PLOW_VMM_LIVE`) only rows `[0, kv_len)` of a slot are guaranteed mapped (4096-row
+  commit blocks): a kernel must never load a KV row at or past `kv_len`, masked or not. Run
+  `scripts/bench/step_boundary.sh` (ctx 4094/4095/4096/8191/8192, `CUDA_LAUNCH_BLOCKING=1`) on every
+  new KV-reading arm before any serving run.
+* A library attention route's page table must be fully rewritten (or its unused entries poisoned)
+  every launch: stale entries point at pages of retired slots that are unmapped asynchronously, and
+  a loader over-index then faults rarely instead of deterministically.
+* Diagnose a CUDA 700 with the kernel log (`sudo -n journalctl -k`, from a session that may read
+  it): the NVRM Xid line gives the engine (GRAPHICS = an SM kernel, CE = a copy), the access type
+  (READ/WRITE) and the faulting VA; decode the VA against the serve log's KV pool window and track
+  bases to name slot, head and row. Diagnostic error wrappers must pass `DeviceFault` through.
+
+**Measurement**
+
+* Production-mix screen = 1 rate x 2 reps (`PROD_RATES=<rate> llm_grid.sh ... --prod`, default
+  `REPS=2`), reported with `campaign.py report --cells q<1000*rate>.g`. `REPS=1` cannot be reported
+  (the report requires >= 2 repeats per cell); the full 2 rates x 2-3 reps is for promotion only.
+* Reuse captured vLLM peers and shared plowrt base arms; never recapture a vLLM arm for a screen.
+

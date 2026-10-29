@@ -96,8 +96,8 @@ silently return a null instead of an answer:
 * **Prefill dispatch/classing knobs** — per-object block size, segment classing,
   segment graphs. The block harness drives the decode/single-segment path, so on
   `$VENDOR = nvidia` the segmented prefill stack is only exercised at tier 4.
-* **Prefill bucket policy** (`PLOW_PF_COVER`, `PLOW_PF_CHUNK_COST`,
-  `PLOW_PF_LADDER_APPEND`) — needs *varied prompt lengths* to have any effect at
+* **Prefill bucket policy** (`PLOW_PF_LADDER_APPEND`; `PLOW_PF_COVER` and
+  `PLOW_PF_CHUNK_COST` were removed) — needs *varied prompt lengths* to have any effect at
   all, which means a client, i.e. tier 4.
 * **Host-gap knobs** (`PLOW_DEV_SAMPLE`, `PLOW_MULTISTEP`, `--slo-ms`) — their
   effect is *between* kernels. No single-engine harness at any tier below 4 can

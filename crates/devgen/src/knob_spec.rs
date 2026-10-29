@@ -1675,6 +1675,8 @@ pub const RAW_ENV: &[KnobSpec] = &[
     KnobSpec::new("env.PLOW_TR_QUIET", Some("PLOW_TR_QUIET"), Layer::RawEnv, Domain::Str, UNSET, DIAG),
     KnobSpec::new("env.PLOW_TUNE_DUMP", Some("PLOW_TUNE_DUMP"), Layer::RawEnv, Domain::Str, UNSET, DIAG),
     KnobSpec::new("env.PLOW_UNISEG", Some("PLOW_UNISEG"), Layer::RawEnv, Domain::Str, UNSET, OPT_IN),
+    KnobSpec::new("env.PLOW_VERIFY_BIN", Some("PLOW_VERIFY_BIN"), Layer::RawEnv, Domain::Str, UNSET, DIAG),
+    KnobSpec::new("env.PLOW_VERIFY_DUMP", Some("PLOW_VERIFY_DUMP"), Layer::RawEnv, Domain::Str, UNSET, DIAG),
     KnobSpec::new("env.PLOW_W4A16", Some("PLOW_W4A16"), Layer::RawEnv, Domain::Str, UNSET, REMOVED),
     KnobSpec::new("env.PLOW_XR_NOSIG", Some("PLOW_XR_NOSIG"), Layer::RawEnv, Domain::Str, UNSET, OPT_IN),
     KnobSpec::new("env.PLOW_XR_SCHED_AG_U", Some("PLOW_XR_SCHED_AG_U"), Layer::RawEnv, Domain::Str, UNSET, OPT_IN),
@@ -2856,6 +2858,7 @@ mod tests {
             "crates/packet/src",
             "crates/plowc/src",
             "crates/kernelcaps/src",
+            "crates/lean_verify/src",
         ] {
             files(&root().join(d), Some("rs"), &mut sources);
         }

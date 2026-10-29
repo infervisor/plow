@@ -187,11 +187,11 @@ Highest value first; keep only what helps *your* target:
    Stage 5 (`PLOW_DECODE_BATCH`).
 3. **Prefill chunking / interleave** only if the TTFT-under-load tail is the
    problem (`--pf-interleave`, `--pf-chunk`; both vendors). Measure —
-   finer often loses throughput; and re-fit `--pf-chunk-cost` on `$GPU`, its
-   default is another part's launch cost. AMD TP selects from its compiled
+   finer often loses throughput (the chunk cost model is fixed: `--pf-chunk-cost`
+   was removed). AMD TP selects from its compiled
    ladder, re-splits a pending chunk when decode lowers the cap, and keeps
-   recurrent requests isolated; `PLOW_PF_BATCH=1` is fair rotation, not
-   co-packing. Its ragged-tail chunk (`PLOW_RAGGED_CHUNK`) is on by default.
+   recurrent requests isolated; isolated admission rotates across slots
+   under `PLOW_PF_CHUNK` (`PLOW_PF_BATCH` was removed), which is not co-packing. Its ragged-tail chunk (`PLOW_RAGGED_CHUNK`) is on by default.
    To implement AMD co-packing, extend the packet ABI with per-request row range,
    slot, KV base/length and recurrent reset metadata; form a token-budgeted ragged
    batch from compatible compiled rungs; execute with parked-row masks and per-slot
