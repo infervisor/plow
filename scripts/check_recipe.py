@@ -21,11 +21,12 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import subprocess
 import sys
 from pathlib import Path
 
-import plow_dist as pd
+import recipe_common as rc
 
 REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO / "scripts" / "campaign"))
@@ -33,13 +34,24 @@ import rung_env  # noqa: E402
 import spec_env  # noqa: E402
 
 
-class Invalid(pd.Fail):
+class Invalid(rc.Fail):
     pass
 
 
 def need(cond: bool, msg: str) -> None:
     if not cond:
         raise Invalid(msg)
+
+
+def same_value(requested: object, observed: object) -> bool:
+    """A `{out}`, `{repo}` or `{hf:…}` placeholder names a path on the build
+    host, which the knob record holds expanded: match on the part the recipe
+    spells after it."""
+    want, got = str(requested), str(observed)
+    if want == got:
+        return True
+    m = re.match(r"\{(out|repo|hf:[^}]+)\}(.*)", want)
+    return bool(m) and got.endswith(m.group(2))
 
 
 def exact_map(requested: dict, observed: dict, surface: str) -> None:
@@ -52,7 +64,7 @@ def exact_map(requested: dict, observed: dict, surface: str) -> None:
     for knob, value in requested.items():
         need(knob in observed, f"{surface}: recipe requests {knob} but the build recorded no such knob")
         need(
-            str(observed[knob]) == str(value),
+            same_value(value, observed[knob]),
             f"{surface}: contradictory {knob} — recipe says {value!r}, build recorded "
             f"{observed[knob]!r}",
         )
@@ -101,8 +113,38 @@ def check_rung_env(over: dict, build_json: dict, observed: dict) -> None:
                 )
 
 
-def check_emit(recipe: dict, build_json: dict) -> list[str]:
-    """`[emit].env` against `build.json`'s own knob record."""
+# Emit env keys that locate a tool on the build host rather than shape the
+# packet; a recipe states them for the build command, the checker ignores them.
+MACHINE_PATH_KNOBS = ("PLOW_VERIFY_BIN",)
+# nvcc's own environment: `[emit.env]` may state it (the -D set the emitted
+# kernels are compiled with). plowc's knob record does not carry it; the
+# campaign records the environment it ran plowc with in `build-record.json`
+# under `compilation.emit_env`, which is what it is checked against.
+TOOLCHAIN_ENV_KNOBS = ("NVCC_APPEND_FLAGS", "NVCC_PREPEND_FLAGS")
+
+
+def check_toolchain_env(requested: dict, record: dict | None) -> list[str]:
+    """The nvcc environment `[emit.env]` states, against the campaign's build
+    record: verified when the record is there, reported when it is not."""
+    notes = []
+    recorded = ((record or {}).get("compilation") or {}).get("emit_env")
+    for knob in TOOLCHAIN_ENV_KNOBS:
+        if knob not in requested:
+            continue
+        if recorded is None:
+            notes.append(f"emit: {knob} is not in the knob record and no build-record.json is beside the bundle — unverified")
+            continue
+        need(knob in recorded, f"emit: recipe requests {knob} but the build ran plowc with no such variable")
+        need(
+            str(recorded[knob]) == str(requested[knob]),
+            f"emit: contradictory {knob} — recipe says {requested[knob]!r}, build recorded {recorded[knob]!r}",
+        )
+    return notes
+
+
+def check_emit(recipe: dict, build_json: dict, record: dict | None = None) -> list[str]:
+    """`[emit].env` against `build.json`'s own knob record (and the nvcc
+    environment against the campaign's build record)."""
     rungs = recipe_rung_env(recipe)
     ec = build_json.get("emit_config")
     need(ec or not rungs, "emit: the recipe states [emit.rung_env] but build.json has no `emit_config` to verify it")
@@ -123,13 +165,23 @@ def check_emit(recipe: dict, build_json: dict) -> list[str]:
         observed = {k: v for k, v in observed.items() if k != "PLOW_SPEC_DRAFT_DIR"}
         derived.pop("PLOW_SPEC_DRAFT_DIR")
     requested = {**derived, **((recipe.get("emit") or {}).get("env") or {})}
+    # Machine paths are not decisions: `PLOW_VERIFY_BIN` names where the Lean
+    # verifier lives on the build host and the knob record never carries it
+    # (the receipts beside the packet are what prove the verification ran).
+    for machine in MACHINE_PATH_KNOBS:
+        requested.pop(machine, None)
+        observed.pop(machine, None)
+    notes_tool = check_toolchain_env(requested, record)
+    for knob in TOOLCHAIN_ENV_KNOBS:
+        requested.pop(knob, None)
+        observed.pop(knob, None)
     exact_map(requested, observed, "emit")
     check_rung_env(rungs, build_json, observed)
 
     # The other direction, as a report rather than a refusal: a knob the build
     # replayed but the recipe does not mention is a reproduction gap.
     missing = sorted(set(observed) - set(requested) - {rung_env.ENV})
-    return [f"emit: build replayed {k}={observed[k]!r}, recipe does not state it" for k in missing]
+    return notes_tool + [f"emit: build replayed {k}={observed[k]!r}, recipe does not state it" for k in missing]
 
 
 # Knobs whose effect lands under another define. `build_gfx942.sh` turns
@@ -253,7 +305,7 @@ def check_artifacts(recipe: dict, roots: list[Path]) -> list[str]:
         if found is None:
             notes.append(f"artifacts: {name} is recorded but not present in any given directory")
             continue
-        got = pd.sha256_file(found)
+        got = rc.sha256_file(found)
         need(
             got == want,
             f"artifacts: {name} hashes to {got}, recipe records {want}",
@@ -288,12 +340,12 @@ def check_provenance(recipe: dict, strict: bool, verified: bool = False) -> list
 
 
 def check(recipe_path: Path, bundle: Path | None, objects: Path | None, strict: bool) -> list[str]:
-    recipe = pd.load_toml(recipe_path)
+    recipe = rc.load_toml(recipe_path)
     notes: list[str] = []
 
-    # The status/measured/refusal rules live in plow_dist so the publisher and
+    # The status/measured/refusal rules live in recipe_common so the renderer and
     # this checker cannot disagree about what may be called `validated`.
-    pd.recipe_invariants(recipe)
+    rc.recipe_invariants(recipe)
     if recipe.get("status", "emits") == "refused":
         return check_provenance(recipe, strict)
 
@@ -303,13 +355,15 @@ def check(recipe_path: Path, bundle: Path | None, objects: Path | None, strict: 
     need(not spec_errors, "; ".join(spec_errors))
 
     if bundle:
-        bj = pd.load_json(bundle / "build.json") if (bundle / "build.json").exists() else {}
-        wj = pd.load_json(bundle / "weights.json") if (bundle / "weights.json").exists() else {}
+        bj = rc.load_json(bundle / "build.json") if (bundle / "build.json").exists() else {}
+        wj = rc.load_json(bundle / "weights.json") if (bundle / "weights.json").exists() else {}
+        rec_path = bundle.parent / "build-record.json"
+        rec = rc.load_json(rec_path) if rec_path.exists() else None
         check_target(recipe, bj, wj)
-        notes += check_emit(recipe, bj)
+        notes += check_emit(recipe, bj, rec)
     if objects:
         dp = objects / "build_defines.json"
-        notes += check_objects(recipe, pd.load_json(dp) if dp.exists() else {})
+        notes += check_objects(recipe, rc.load_json(dp) if dp.exists() else {})
 
     roots = [p for p in (bundle, objects) if p]
     artifact_notes = check_artifacts(recipe, roots) if roots else []
@@ -331,7 +385,7 @@ def run() -> None:
         print("check_recipe selftest: PASS")
         return
     if not args.recipe:
-        pd.die("give at least one recipe")
+        rc.die("give at least one recipe")
 
     failed = 0
     for rp in args.recipe:
@@ -348,11 +402,11 @@ def run() -> None:
                 print(f"  note: {n}")
                 if args.strict and not n.startswith("info:"):
                     failed += 1
-        except pd.Fail as e:
+        except rc.Fail as e:
             print(f"{p}: FAIL\n  {e}")
             failed += 1
     if failed:
-        pd.die(f"{failed} problem(s)")
+        rc.die(f"{failed} problem(s)")
 
 
 def self_test() -> None:
@@ -390,7 +444,7 @@ def self_test() -> None:
         )
         (objects / "i.elf").write_bytes(b"an object")
 
-        head = pd.git_commit(REPO)
+        head = rc.git_commit(REPO)
         good = {
             "schema": "plow.recipe.v1",
             "namespace": "infervisor",
@@ -403,7 +457,7 @@ def self_test() -> None:
             # `PLOW_K3_DECODE_GROUPED` reaches the object as -DPLOW_MOE_PF_A4W4 (INDIRECT).
             "objects": {"env": {"PLOW_GEMV_MM": "16", "PLOW_K3_DECODE_GROUPED": "1"}},
             "measured": {"tok_s": 131.162},
-            "artifacts": {"i.elf": pd.sha256_file(objects / "i.elf")},
+            "artifacts": {"i.elf": rc.sha256_file(objects / "i.elf")},
         }
 
         def write(doc) -> Path:
@@ -416,6 +470,11 @@ def self_test() -> None:
         p = write(good)
         notes = check(p, bundle, objects, strict=False)
         assert not any("contradictory" in n for n in notes), notes
+        # A build-host path placeholder matches the path the record expanded it to.
+        assert same_value("{out}/prep/s3gen", "/nvme/build/chatterbox-h100/prep/s3gen")
+        assert same_value("{hf:ResembleAI/chatterbox}/t3", "/hf/hub/models--x/snapshots/abc/t3")
+        assert not same_value("{out}/prep/s3gen", "/nvme/build/other/prep/codec")
+        assert not same_value("1", "0")
         # PLOW_MXFP4 was replayed but not stated: reported, not fatal.
         assert any("PLOW_MXFP4" in n for n in notes), notes
 
@@ -425,7 +484,7 @@ def self_test() -> None:
         try:
             check(write(bad), bundle, objects, strict=False)
             raise AssertionError("accepted a contradicted emit knob")
-        except pd.Fail as e:
+        except rc.Fail as e:
             assert "contradictory PLOW_FP8_KV" in str(e), e
 
         # Explicit rungs with PLOW_DECODE_TIERS unset would be overwritten by the
@@ -451,7 +510,7 @@ def self_test() -> None:
         try:
             check(write(bad), bundle, objects, strict=False)
             raise AssertionError("accepted an unknown emit knob")
-        except pd.Fail as e:
+        except rc.Fail as e:
             assert "no such knob" in str(e)
 
         # [spec]: derived knobs must match the build record; a malformed table fails.
@@ -464,13 +523,13 @@ def self_test() -> None:
         try:
             check(write(spec), bundle, objects, strict=False)
             raise AssertionError("accepted [spec] knobs the build did not record")
-        except pd.Fail as e:
+        except rc.Fail as e:
             assert "no such knob" in str(e) or "no PLOW_SPEC_DRAFT_DIR" in str(e), e
         spec["spec"]["k_max"] = 99
         try:
             check(write(spec), bundle, objects, strict=False)
             raise AssertionError("accepted k_max 99")
-        except pd.Fail as e:
+        except rc.Fail as e:
             assert "k_max" in str(e), e
 
         # Target disagreements.
@@ -480,7 +539,7 @@ def self_test() -> None:
             try:
                 check(write(bad), bundle, objects, strict=False)
                 raise AssertionError(f"accepted target {field}={value}")
-            except pd.Fail:
+            except rc.Fail:
                 pass
 
         # A recorded digest that does not match the file.
@@ -489,7 +548,7 @@ def self_test() -> None:
         try:
             check(write(bad), bundle, objects, strict=False)
             raise AssertionError("accepted a wrong artifact digest")
-        except pd.Fail as e:
+        except rc.Fail as e:
             assert "hashes to" in str(e)
 
         # validated without a measurement.
@@ -498,7 +557,7 @@ def self_test() -> None:
         try:
             check(write(bad), bundle, objects, strict=False)
             raise AssertionError("accepted validated with no measurement")
-        except pd.Fail as e:
+        except rc.Fail as e:
             assert "must carry `[measured] tok_s`" in str(e)
 
         # Per-rung overrides: stated in [emit.rung_env], replayed as PLOW_EMIT_RUNG_ENV, resolved
@@ -537,7 +596,7 @@ def self_test() -> None:
             try:
                 check(write(bad), rb, None, strict=False)
                 raise AssertionError(f"accepted a bad rung override ({why})")
-            except pd.Fail as e:
+            except rc.Fail as e:
                 assert why in str(e), e
         # The build resolved the value from the packet, not the rung.
         stale = json.loads(json.dumps(rung_build))
@@ -546,7 +605,7 @@ def self_test() -> None:
         try:
             check(write(rung), rb, None, strict=False)
             raise AssertionError("accepted a rung override the build did not apply")
-        except pd.Fail as e:
+        except rc.Fail as e:
             assert "resolved" in str(e), e
 
         # A refused recipe states what blocks it and carries no build.
@@ -566,7 +625,7 @@ def self_test() -> None:
         try:
             check(write(bad), None, None, strict=False)
             raise AssertionError("accepted a refused recipe with no reason")
-        except pd.Fail:
+        except rc.Fail:
             pass
 
 
@@ -605,7 +664,7 @@ def to_toml(doc: dict) -> str:
     return "\n".join(out) + "\n"
 
 
-main = pd.main_guard(run)
+main = rc.main_guard(run)
 
 if __name__ == "__main__":
     raise SystemExit(main())

@@ -48,3 +48,29 @@ fn packet_moe_prefill_segments_load() {
     eprintln!("{path}: {routed} MoE prefill segments routed, {prologues} with the router prologue");
     assert!(routed > 0);
 }
+
+/// `PLOW_TEST_BLOB=<model.pkt>`: the widest decode program's `MOE_DECODE_CUBLASLT` segments pass
+/// the route's load-time checks (expert count, padded align capacity) — CPU only.
+#[test]
+#[ignore = "set PLOW_TEST_BLOB"]
+fn packet_moe_decode_segments_load() {
+    let path = std::env::var("PLOW_TEST_BLOB").unwrap();
+    let raw = std::fs::read(&path).unwrap();
+    let blob = DevBlob::parse(&raw).unwrap();
+    let roles = segment_role_metadata(&blob, &raw)
+        .unwrap()
+        .expect("segment roles");
+    let g = blob.progs.last().expect("decode program");
+    let decode_roles = roles
+        .program(blob.progs.len() - 1)
+        .map(|p| p.roles.clone())
+        .unwrap_or_default();
+    if !decode_roles.contains(&plow_asset::segment_roles::MOE_DECODE_CUBLASLT) {
+        eprintln!("{path}: no MoE decode segments declared");
+        return;
+    }
+    let segments = moe_lt::decode_segments(g, &blob.tensors, &decode_roles).unwrap();
+    let routed = segments.iter().flatten().count();
+    eprintln!("{path}: {routed} MoE decode segments routed");
+    assert!(routed > 0);
+}

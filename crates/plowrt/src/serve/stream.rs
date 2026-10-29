@@ -61,6 +61,8 @@ pub struct TokenUsage {
     /// Prompt tokens attached from the prefix cache (KV not recomputed).
     pub cached_tokens: usize,
     pub completion_tokens: usize,
+    /// Set when the request ran under thinking control.
+    pub think: Option<crate::serve::think::ThinkReport>,
 }
 
 /// OpenAI-compatible finish reason.
@@ -72,6 +74,8 @@ pub enum FinishReason {
     /// preemptive drain) — the stream carries everything generated so far and
     /// the client should retry for the remainder.
     Preempted,
+    /// The request's `max_reply_tokens` ended the reply after its trace.
+    ReplyCap,
 }
 
 impl FinishReason {
@@ -81,6 +85,7 @@ impl FinishReason {
             FinishReason::Stop => "stop",
             FinishReason::Length => "length",
             FinishReason::Preempted => "preempted",
+            FinishReason::ReplyCap => "reply_cap",
         }
     }
 
@@ -93,13 +98,13 @@ impl FinishReason {
     pub fn as_openai(self) -> &'static str {
         match self {
             FinishReason::Stop => "stop",
-            FinishReason::Length | FinishReason::Preempted => "length",
+            FinishReason::Length | FinishReason::Preempted | FinishReason::ReplyCap => "length",
         }
     }
 
     /// Whether the wire value hides a plow-specific cause worth reporting.
     pub fn is_vendor_specific(self) -> bool {
-        matches!(self, FinishReason::Preempted)
+        matches!(self, FinishReason::Preempted | FinishReason::ReplyCap)
     }
 }
 
@@ -180,6 +185,8 @@ impl FrameHead {
         head.extend_from_slice(created.to_string().as_bytes());
         head.extend_from_slice(b",\"model\":");
         let _ = serde_json::to_writer(&mut head, model);
+        head.extend_from_slice(b",\"system_fingerprint\":");
+        let _ = serde_json::to_writer(&mut head, crate::serve::openai::SYSTEM_FINGERPRINT);
         head.extend_from_slice(b",\"choices\":[");
         FrameHead(head)
     }
@@ -257,6 +264,7 @@ mod tests {
                 object: "text_completion",
                 created: 1_789_920_673,
                 model: "gemma\n4".into(),
+                system_fingerprint: crate::serve::openai::SYSTEM_FINGERPRINT,
                 choices: vec![choice.clone()],
                 usage: None,
                 token_ids: None,
@@ -268,18 +276,20 @@ mod tests {
                 delta: Delta {
                     role: Some("assistant"),
                     content: Some(text.clone()),
-                    reasoning_content: None,
+                    reasoning_content: crate::serve::openai::Reasoning(None),
                     tool_calls: None,
                 },
                 logprobs: None,
                 finish_reason: None,
                 x_plow_finish_reason: None,
+                x_plow_thinking: None,
             };
             let full = ChatChunk {
                 id: "chatcmpl-9".into(),
                 object: "chat.completion.chunk",
                 created: 7,
                 model: "m".into(),
+                system_fingerprint: crate::serve::openai::SYSTEM_FINGERPRINT,
                 choices: vec![c.clone()],
                 usage: None,
             };

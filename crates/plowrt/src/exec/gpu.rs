@@ -5330,6 +5330,19 @@ impl GpuEngine {
                 devp[map].base % 128 == 0,
                 "tensormap tensor not 128 B aligned"
             );
+            // TMA zero-fills only outside the map's extent: an extent past the target buffer
+            // reads whatever lies after it.
+            let element = if g.kind == packet::rope::GEN_TMAP_E4M3 {
+                1
+            } else {
+                2
+            };
+            if u64::from(g.ctx) * u64::from(g.hd) * element > devp[tgt].len {
+                return Err(RuntimeError::Rejected(format!(
+                    "GEN_TMAP tensor {}: a {} x {} map exceeds its {}-byte target",
+                    g.tensor, g.ctx, g.hd, devp[tgt].len
+                )));
+            }
             let bytes = if g.kind == packet::rope::GEN_TMAP_E4M3 {
                 be.encode_tmap_e4m3(devp[tgt].base, g.ctx, g.hd, g.scale)?
             } else {
@@ -7453,6 +7466,7 @@ impl GpuEngine {
         // The floor is 2% of the device, at most half of what is free after load; a card the
         // rings nearly fill (26B: 5 GiB) keeps an eighth of it instead.
         let blocks = vmm.as_ref().and_then(|v| v.blocks.clone());
+        let mut store_room = None;
         if let Some(kv) = vmm
             .as_mut()
             .and_then(|v| v.kv.as_mut())
@@ -7473,6 +7487,7 @@ impl GpuEngine {
                     // shrinks it below that when the rings grow.
                     if let (0, Some(bs)) = (cache_cap, blocks.as_ref()) {
                         bs.set_device_cap(free.saturating_sub(floor));
+                        store_room = Some(free.saturating_sub(floor));
                         // Slot growth beyond the block pool creates blocks from free memory:
                         // the store stops a pool's worth above the floor so that does not
                         // trip the OOM path on every new slot.
@@ -7480,6 +7495,29 @@ impl GpuEngine {
                     }
                 }
             }
+        }
+        // Parked ring units come out of the free memory the store grows into: they may hold at
+        // most half of its device tier, so a wide batch parks fewer slots than it serves instead
+        // of starving the store.
+        if let (Some(room), Some(rings)) = (store_room, vmm.as_mut().and_then(|v| v.rings.as_mut()))
+        {
+            let charge = rings.slot_charge().max(1);
+            let slots = (room / 2 / charge).min(rings.slots() as u64);
+            rings.set_park_cap(slots * charge);
+            tracing::info!(
+                park_slots = slots,
+                slots = rings.slots(),
+                park_mib = (slots * charge) >> 20,
+                store_cap_mib = room >> 20,
+                "vmm prefix: live ring park bounded by the block store"
+            );
+        } else if let Some(rings) = vmm.as_ref().and_then(|v| v.rings.as_ref()) {
+            tracing::info!(
+                park_slots = rings.slots(),
+                slots = rings.slots(),
+                park_mib = (rings.slots() as u64 * rings.slot_charge()) >> 20,
+                "vmm prefix: live ring park unbounded (no pressure-sized block store)"
+            );
         }
         if let Some(v) = vmm.as_ref() {
             prefix::trace_init(v);
@@ -8393,6 +8431,14 @@ impl GpuEngine {
             }
             p.queue.forget(b);
         }
+        // The unmaps below are host-side, outside stream order. A step that returned an error
+        // can leave kernels queued that still write this slot (an unfed row writes its KV at
+        // `pos`); a launch window's work never touches a slot it retires.
+        if !self.window_open {
+            if let Err(e) = self.be.stream_synchronize(&self.stream) {
+                tracing::warn!(slot = b, error = %e, "retire: stream drain failed");
+            }
+        }
         if self.pos[b] > 0 {
             self.dump_slot_kv(b, "retire", self.pos[b]);
         }
@@ -8595,7 +8641,7 @@ impl GpuEngine {
                 }
                 self.retire_slot(b, false);
                 let oom = matches!(error, RuntimeError::Oom(_)) || error.device_code() == Some(2);
-                // Parked live rings (`PLOW_VMM_RING_PARK`) hold device memory no request owns; when
+                // Parked live rings hold device memory no request owns; when
                 // releasing them freed memory, the request waits and retries even with no other
                 // request live.
                 let mut reclaimed = false;
@@ -9932,6 +9978,9 @@ impl GpuEngine {
                 grid = self.grid,
                 "decode pipeline: step failed"
             );
+            // The newer queued step may still run (a non-sticky failure): the queue empties, and
+            // with it the deferred retirements unmap, only once the stream is idle.
+            let _ = self.be.stream_synchronize(&self.stream);
             self.pipe.as_mut().expect("pipe").queue.clear();
             return Err(e);
         }
@@ -9943,6 +9992,8 @@ impl GpuEngine {
             let b = row.slot;
             let token = ids[if step.compact { j } else { b }] as u32;
             if token as usize >= vocab {
+                // As above: the newer queued step still writes every launch row's KV.
+                let _ = self.be.stream_synchronize(&self.stream);
                 pipe.queue.clear();
                 return Err(RuntimeError::Device(
                     "decode pipeline: step produced an invalid token".into(),
@@ -12093,18 +12144,26 @@ impl GpuEngine {
         let rem = n - c0;
         let sz = std::mem::size_of::<DevInst64>();
 
-        let bi = self.pick_prefill_bucket(rem, cap);
-        let (bi, real) = self.span_safe_chunk(bi, prompt, c0, rem, cap)?;
+        // Every bucket row writes its KV at row c0 + t, pad rows included; past the compiled
+        // context that row is the next head's window (or past the slot's reservation).
+        let room = if self.encoder {
+            usize::MAX
+        } else {
+            self.max_ctx - c0
+        };
+        let bi = self.pick_prefill_bucket(rem, cap.min(room));
+        let (bi, real) = self.span_safe_chunk(bi, prompt, c0, rem, cap.min(room))?;
         let tc = self.prefill[bi].t as usize;
+        if tc > room {
+            return Err(RuntimeError::ContextLength(format!(
+                "prefill chunk at {c0}: no bucket fits the {room} rows left of the compiled context {}",
+                self.max_ctx
+            )));
+        }
 
         // VMM: the bucket writes all tc rows (pad rows write garbage past
         // `real`) — map the chunk's full row span before launching.
         if let Some(v) = &mut self.vmm {
-            if v.prefix_kv().is_none() && c0 + tc > self.max_ctx {
-                return Err(RuntimeError::Rejected(
-                    "live KV prefill padding exceeds the reserved context".into(),
-                ));
-            }
             if let Some(rings) = &mut v.rings {
                 rings.ensure_slot(b)?;
             }
@@ -14310,6 +14369,21 @@ impl GpuEngine {
                     reqs[..riding].iter().map(|r| (r.slot, (r.c0 + 1) as u32)),
                     &self.stream,
                 )?;
+            }
+            for m in [&pb.d_slot, &pb.d_req, &pb.d_req_attn] {
+                self.be.poison_table(m.base, m.len, &self.stream)?;
+            }
+            if let Some(pack) = self
+                .packed_prefill
+                .as_ref()
+                .filter(|_| request_plan.is_some())
+            {
+                for stage in &pack.stages {
+                    for t in [stage.slot as usize, stage.request as usize] {
+                        self.be
+                            .poison_table(self.devp[t].base, self.devp[t].len, &self.stream)?;
+                    }
+                }
             }
             // SAFETY: pf_ids, pf_pos live on self past the stream_synchronize;
             // pb's Vec allocations are put back into self.pf_batch below before

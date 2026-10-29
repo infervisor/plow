@@ -56,7 +56,8 @@ max_ctx = 16384
 toolchain = "cuda-12.9"
 
 [checkpoint]
-source = "RedHatAI/gemma-4-31B-it-FP8-dynamic@d4ab4f579dd3516f97d8a6a4c98d0653480bad15"
+source = "hf:RedHatAI/gemma-4-31B-it-FP8-dynamic"
+revision = "d4ab4f579dd3516f97d8a6a4c98d0653480bad15"
 layout = "plow-fp8-hub-rekey"
 
 [cell]

@@ -12,9 +12,22 @@
 //! `exec/gpu.rs`'s pairing check already refuses on principle.
 
 pub mod fetch;
+/// Build the manifests a registry publish needs, from a recipe and a built
+/// directory. Publish-side only, like `pack` itself: `serve` never calls it.
+#[cfg(feature = "dist")]
+pub mod manifest;
 pub mod prepare;
 pub mod pull;
+/// `plowrt push`: write a built variant straight into a registry bucket or
+/// directory. Publish-side only, like `manifest`.
+#[cfg(feature = "dist")]
+pub mod push;
 pub mod reference;
+/// `plowrt push-runtime`: record released binaries in a registry. Publish-side only.
+#[cfg(feature = "dist")]
+pub mod runtime;
+pub mod sign;
+pub mod sink;
 pub mod store;
 pub mod weights;
 

@@ -24,10 +24,12 @@ sku = "H100 SXM5"
 units = 132
 num_gpus = 1
 parallel = "tp"
+toolchain = "cuda-13.4+gcc-13"
 
 [checkpoint]
 source = "hf:maya-research/Veena"
 revision = "8b770f9e69e6b35ef320d4cd70a99a4ab6dd022f"
+shards = 1
 codec = "hf:hubertsiuzdak/snac_24khz"
 codec_revision = "d73ad176a12188fcf4f360ba3bf2c2fbbe8f58ec"
 

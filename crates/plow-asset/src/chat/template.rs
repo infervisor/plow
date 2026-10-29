@@ -75,6 +75,11 @@ impl ChatTemplate {
         Self::compile(t.text, t.source, t.bos_token, t.eos_token).map(Some)
     }
 
+    /// Another template text for the same model (vLLM `--chat-template`), with this one's specials.
+    pub fn recompile(&self, text: String, source: String) -> Result<Arc<ChatTemplate>, String> {
+        Self::compile(text, source, self.bos_token.clone(), self.eos_token.clone())
+    }
+
     /// Compile a template and read what its model answers in from the text: the tool-call
     /// syntax (a probe render with one tool), the reasoning markers, the thinking switch.
     pub fn compile(

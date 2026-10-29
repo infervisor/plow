@@ -102,6 +102,12 @@ pub trait VmmOps: Send + Sync {
         None
     }
 
+    /// Block until every copy this backend queued on any stream has completed (teardown, before
+    /// the memory those copies touch is freed). Default: copies are complete on return.
+    fn quiesce(&self) -> Result<()> {
+        Ok(())
+    }
+
     /// Take every pooled physical chunk `(handle, bytes)` a previous
     /// [`VmmSlab`] kept via [`Self::pool_put`]. Re-mapping a pooled chunk is
     /// ~free (map+set_access, µs-class) where creating one pays the driver's
@@ -482,6 +488,19 @@ impl VmmRings {
     pub fn enable_bounded_park(&mut self, cap_bytes: u64) {
         self.enable_handle_recycling(cap_bytes);
         self.bounded = true;
+    }
+
+    /// Slots the rings serve.
+    pub fn slots(&self) -> usize {
+        self.mapped.len()
+    }
+
+    /// Set the bounded park's cap, releasing what it holds above it.
+    pub fn set_park_cap(&mut self, cap_bytes: u64) {
+        if self.bounded {
+            self.spare_cap = cap_bytes;
+            self.trim_spare();
+        }
     }
 
     /// Released units kept for reuse ([`Self::enable_handle_recycling`]), parked ones included.

@@ -27,6 +27,7 @@ parallel = "tp"
 
 [checkpoint]
 source = "hf:canopylabs/orpheus-3b-0.1-ft"
+revision = "4206a56e5a68cf6cf96900a8a78acd3370c02eb6"
 codec = "hf:hubertsiuzdak/snac_24khz"
 codec_revision = "d73ad176a12188fcf4f360ba3bf2c2fbbe8f58ec"
 

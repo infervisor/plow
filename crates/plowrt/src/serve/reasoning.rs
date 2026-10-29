@@ -150,14 +150,23 @@ pub struct ReasoningSplit {
     close: &'static str,
     /// Bytes generated but not yet attributed to one side or the other.
     hold: String,
-    /// Tokens seen while inside the trace, for `reasoning_tokens`.
+    /// Tokens seen while inside a trace, for `reasoning_tokens`.
     pub trace_tokens: u64,
     /// Whether a non-empty reasoning piece has gone out yet.
     started_reasoning: bool,
+    /// The next reasoning piece starts a trace block: its leading whitespace is framing.
+    new_block: bool,
     /// Whether this generation ever had a trace, and whether the first piece of
     /// answer after it has gone out.
     had_trace: bool,
     started_answer: bool,
+    /// See [`Self::allow_reentry`].
+    reenter: bool,
+    /// The open marker as channel token + label (`<|channel>` + `thought`), when re-entrant.
+    chan: Option<(&'static str, &'static str)>,
+    blocks: u32,
+    /// Answer tokens whose bytes are held as a possible open marker: trace tokens if it is one.
+    held: u64,
 }
 
 impl ReasoningSplit {
@@ -177,9 +186,27 @@ impl ReasoningSplit {
             hold: String::new(),
             trace_tokens: 0,
             started_reasoning: false,
+            new_block: true,
             had_trace: state == State::Open,
             started_answer: false,
+            reenter: false,
+            chan: None,
+            blocks: u32::from(state == State::Open),
+            held: 0,
         }
+    }
+
+    /// The markers are special tokens (Gemma 4), which prose cannot produce: an open marker after
+    /// the answer began opens another trace block, a stray close marker is framing, and the
+    /// channel token followed by a label other than the trace's own (`<|channel>response`) ends
+    /// the trace. Text markers keep the one-trace rule, since an answer may mention `<think>`.
+    pub fn allow_reentry(&mut self) {
+        self.reenter = true;
+        self.chan = self
+            .open
+            .find('>')
+            .map(|i| self.open.split_at(i + 1))
+            .filter(|(_, l)| !l.is_empty() && l.bytes().all(|b| b.is_ascii_alphabetic()));
     }
 
     /// Whether the next byte fed belongs to the trace, for token accounting.
@@ -187,23 +214,32 @@ impl ReasoningSplit {
         self.state != State::Answer
     }
 
+    /// Trace blocks opened so far (the prompt's own counts).
+    pub fn blocks(&self) -> u32 {
+        self.blocks
+    }
+
     /// Emit a piece of trace into `dst`; whether it carried any.
     ///
-    /// Whitespace is trimmed only at the OUTER boundaries of the trace — the
-    /// start of the first piece and the end of the last. Trimming each piece
+    /// Whitespace is trimmed only at the OUTER boundaries of a trace block — the
+    /// start of its first piece and the end of its last. Trimming each piece
     /// as it went out ate the space BETWEEN two pieces: a trace ending
     /// `"...should be"` + `" four."` came back as `"...should befour."`, a
     /// silent corruption of the model's own words that only shows up when the
-    /// close marker lands in its own token.
+    /// close marker lands in its own token. Blocks after the first are joined by a newline.
     fn emit_reasoning(&mut self, piece: &str, dst: &mut String) -> bool {
-        let piece = if self.started_reasoning {
-            piece
-        } else {
+        let piece = if self.new_block {
             piece.trim_start()
+        } else {
+            piece
         };
         if piece.is_empty() {
             return false;
         }
+        if self.new_block && self.started_reasoning {
+            dst.push('\n');
+        }
+        self.new_block = false;
         self.started_reasoning = true;
         dst.push_str(piece);
         true
@@ -230,6 +266,60 @@ impl ReasoningSplit {
         true
     }
 
+    fn open_block(&mut self) {
+        self.state = State::Open;
+        self.had_trace = true;
+        self.new_block = true;
+        self.blocks += 1;
+    }
+
+    /// `<|channel>` + a label other than the trace's own, in `s`: `Ok((at, len))` ends the trace
+    /// there (label and one newline are framing); `Err(at)`: a label is still being written.
+    fn channel_switch(&self, s: &str) -> Option<Result<(usize, usize), usize>> {
+        let (chan, label) = self.chan?;
+        let mut from = 0;
+        while let Some(j) = s[from..].find(chan).map(|j| from + j) {
+            let after = &s[j + chan.len()..];
+            let n = after.bytes().take_while(u8::is_ascii_alphabetic).count();
+            if n == after.len() {
+                return Some(Err(j));
+            }
+            if &after[..n] != label {
+                let nl = usize::from(after[n..].starts_with('\n'));
+                return Some(Ok((j, chan.len() + n + nl)));
+            }
+            from = j + chan.len();
+        }
+        None
+    }
+
+    /// Where the trace in `s` ends, and how many framing bytes the end takes.
+    fn trace_end(&self, s: &str) -> Option<(usize, usize)> {
+        let close = s.find(self.close).map(|i| (i, self.close.len()));
+        match self.channel_switch(s) {
+            Some(Ok(sw)) if close.is_none_or(|c| sw.0 < c.0) => Some(sw),
+            _ => close,
+        }
+    }
+
+    /// How much of an unterminated trace piece can go out: all but what could still begin an end,
+    /// and the whitespace before it (the block's end trims it).
+    fn trace_cut(&self, s: &str) -> usize {
+        let keep = (self.close.len() - 1).min(s.len());
+        let mut cut = (0..=keep)
+            .rev()
+            .map(|k| s.len() - k)
+            .find(|&c| s.is_char_boundary(c))
+            .unwrap_or(s.len());
+        if let Some((chan, _)) = self.chan {
+            cut = cut.min(s.len() - prefix_tail(s, chan));
+            if let Some(Err(j)) = self.channel_switch(s) {
+                cut = cut.min(j);
+            }
+        }
+        s[..cut].trim_end().len()
+    }
+
     /// Feed one token's text. Returns whatever can be attributed now; bytes
     /// that could still be part of a marker stay held until a later token or
     /// [`Self::finish`] settles them.
@@ -242,73 +332,100 @@ impl ReasoningSplit {
     /// [`Self::push`], appending to `r` / `c` (no allocation of its own once the hold has
     /// grown); returns whether each side was emitted.
     pub fn push_into(&mut self, text: &str, r: &mut String, c: &mut String) -> (bool, bool) {
-        if self.state == State::Answer {
+        if self.state == State::Answer && !self.reenter {
             // An empty delta is still emitted when there was no trace: a
             // partial UTF-8 token still gets a chunk, so the client's token
             // count stays accurate. That is the streamed path's existing contract.
             return (false, self.emit_answer(text, c));
         }
-        self.trace_tokens += 1;
-        self.hold.push_str(text);
-
-        if self.state == State::Deciding {
-            let trimmed = self.hold.trim_start();
-            if trimmed.starts_with(self.open) {
-                // The model opened a trace. The marker and the whitespace in
-                // front of it are framing, not answer.
-                let consumed = self.hold.len() - trimmed.len() + self.open.len();
-                self.hold.drain(..consumed);
-                self.state = State::Open;
-                self.had_trace = true;
-            } else if trimmed.is_empty() || self.open.starts_with(trimmed) {
-                // Nothing but whitespace yet, or still a possible prefix of
-                // `<think>` — wait for more.
-                //
-                // The whitespace case is load-bearing: settling on it would
-                // mean a model whose FIRST token is a newline and whose second
-                // is `<think>` never opens a trace at all, and the whole thing
-                // leaks into `content`. Qwen3 happens to emit `<think>` as one
-                // whole first token; nothing guarantees that tokenization.
-                return (false, false);
-            } else {
-                // Settled: this generation has no trace. Everything held is
-                // answer, and nothing is withheld from here on.
-                self.state = State::Answer;
-                self.trace_tokens = 0;
-                let out = std::mem::take(&mut self.hold);
-                let e = self.emit_answer(&out, c);
-                self.hold = out;
-                self.hold.clear();
-                return (false, e);
+        let mut counted = self.state != State::Answer;
+        if counted {
+            self.trace_tokens += 1;
+        }
+        let mut hold = std::mem::take(&mut self.hold);
+        hold.push_str(text);
+        let (mut er, mut ec) = (false, false);
+        let mut at = 0;
+        loop {
+            let rest = &hold[at..];
+            match self.state {
+                State::Deciding => {
+                    let trimmed = rest.trim_start();
+                    if trimmed.starts_with(self.open) {
+                        // The model opened a trace. The marker and the whitespace in
+                        // front of it are framing, not answer.
+                        at += rest.len() - trimmed.len() + self.open.len();
+                        self.open_block();
+                    } else if trimmed.is_empty() || self.open.starts_with(trimmed) {
+                        // Nothing but whitespace yet, or still a possible prefix of
+                        // `<think>` — wait for more.
+                        //
+                        // The whitespace case is load-bearing: settling on it would
+                        // mean a model whose FIRST token is a newline and whose second
+                        // is `<think>` never opens a trace at all, and the whole thing
+                        // leaks into `content`. Qwen3 happens to emit `<think>` as one
+                        // whole first token; nothing guarantees that tokenization.
+                        break;
+                    } else {
+                        // Settled: this generation has no trace (yet, when re-entrant).
+                        self.state = State::Answer;
+                        self.trace_tokens = 0;
+                        counted = false;
+                    }
+                }
+                State::Open => match self.trace_end(rest) {
+                    Some((i, n)) => {
+                        // Last piece of the block: trim only its END.
+                        er |= self.emit_reasoning(rest[..i].trim_end(), r);
+                        at += i + n;
+                        self.state = State::Answer;
+                    }
+                    None => {
+                        let cut = self.trace_cut(rest);
+                        er |= self.emit_reasoning(&rest[..cut], r);
+                        at += cut;
+                        break;
+                    }
+                },
+                State::Answer if !self.reenter => {
+                    ec |= self.emit_answer(rest, c);
+                    at = hold.len();
+                    break;
+                }
+                State::Answer => {
+                    let open = rest.find(self.open);
+                    match (open, rest.find(self.close)) {
+                        (Some(o), close) if close.is_none_or(|x| o < x) => {
+                            ec |= self.emit_answer(&rest[..o], c);
+                            at += o + self.open.len();
+                            self.open_block();
+                            self.trace_tokens +=
+                                std::mem::take(&mut self.held) + u64::from(!counted);
+                            counted = true;
+                        }
+                        (_, Some(x)) => {
+                            ec |= self.emit_answer(&rest[..x], c);
+                            at += x + self.close.len();
+                        }
+                        _ => {
+                            let keep =
+                                prefix_tail(rest, self.open).max(prefix_tail(rest, self.close));
+                            ec |= self.emit_answer(&rest[..rest.len() - keep], c);
+                            at += rest.len() - keep;
+                            self.held = if keep == 0 {
+                                0
+                            } else {
+                                self.held + u64::from(!counted)
+                            };
+                            break;
+                        }
+                    }
+                }
             }
         }
-
-        match self.hold.find(self.close) {
-            Some(i) => {
-                // Last piece of the trace: trim only its END.
-                let hold = std::mem::take(&mut self.hold);
-                let er = self.emit_reasoning(hold[..i].trim_end(), r);
-                self.state = State::Answer;
-                let ec = self.emit_answer(&hold[i + self.close.len()..], c);
-                self.hold = hold;
-                self.hold.clear();
-                (er, ec)
-            }
-            None => {
-                // Withhold only what could still begin the close marker.
-                let keep = (self.close.len() - 1).min(self.hold.len());
-                let cut = (0..=keep)
-                    .rev()
-                    .map(|k| self.hold.len() - k)
-                    .find(|&c| self.hold.is_char_boundary(c))
-                    .unwrap_or(self.hold.len());
-                let hold = std::mem::take(&mut self.hold);
-                let er = self.emit_reasoning(&hold[..cut], r);
-                self.hold = hold;
-                self.hold.drain(..cut);
-                (er, false)
-            }
-        }
+        hold.drain(..at);
+        self.hold = hold;
+        (er, ec)
     }
 
     /// Flush whatever is still held at the end of the generation.
@@ -365,6 +482,14 @@ pub fn split(mode: ReasoningMode, prompt_opens: bool, text: &str) -> (Option<Str
     }
     let reasoning = reasoning.trim().to_string();
     ((!reasoning.is_empty()).then_some(reasoning), content)
+}
+
+/// Length of the longest suffix of `s` that is a proper prefix of `m`.
+fn prefix_tail(s: &str, m: &str) -> usize {
+    (1..m.len().min(s.len() + 1))
+        .rev()
+        .find(|&k| s.is_char_boundary(s.len() - k) && m.starts_with(&s[s.len() - k..]))
+        .unwrap_or(0)
 }
 
 #[cfg(test)]
@@ -526,6 +651,28 @@ mod tests {
         assert!(!ReasoningMode::ThinkTag.prompt_opens("<|assistant|><think></think>"));
         // user text cannot reach the end
         assert!(!ReasoningMode::ThinkTag.prompt_opens("what is <think>?<|assistant|>"));
+    }
+
+    /// Single-token `<think>` markers (Qwen3): a stray close in the answer is framing, and a block
+    /// the model opens again after answering is trace; byte-by-byte agrees with whole.
+    #[test]
+    fn reentrant_think_tags_absorb_stray_closes_and_reopen() {
+        let text = "a</think>Ans</think> more<think>x</think>end";
+        let run = |pieces: &[&str]| {
+            let mut s = ReasoningSplit::new(ReasoningMode::ThinkTag, true);
+            s.allow_reentry();
+            let (mut r, mut c) = (String::new(), String::new());
+            for p in pieces {
+                s.push_into(p, &mut r, &mut c);
+            }
+            s.finish_into(&mut r, &mut c);
+            (r, c)
+        };
+        let whole = run(&[text]);
+        assert_eq!(whole, ("a\nx".to_string(), "Ans moreend".to_string()));
+        let bytes: Vec<String> = text.chars().map(String::from).collect();
+        let bytes: Vec<&str> = bytes.iter().map(String::as_str).collect();
+        assert_eq!(run(&bytes), whole);
     }
 
     #[test]

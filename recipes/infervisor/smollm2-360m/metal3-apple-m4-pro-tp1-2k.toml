@@ -1,0 +1,28 @@
+# SmolLM2-360M-Instruct on Apple Silicon (M4 Pro, 16 GPU cores): the laptop-node bundle. Metal
+# shaders are compiled on the serving machine from the packet, so the bundle carries no objset;
+# the tokenizer is the plow-generated `tokenizer.json`. Built by hand with `plowc --gpu m4pro` at
+# plow_git and first published to the beta registry on 2026-10-13; this recipe records that build.
+
+schema = "plow.recipe.v1"
+namespace = "infervisor"
+name = "smollm2-360m"
+label = "metal3-apple-m4-pro-tp1-2k"
+plow_git = "9f1ca46899b2f0297a022beb1046ba53f2976734"
+network = "smollm2-360m-instruct"
+
+[target]
+vendor = "apple"
+isa = "metal3"
+sku = "Apple M4 Pro"
+units = 16
+mem_bytes = 19069665280
+num_gpus = 1
+parallel = "tp"
+max_ctx = 2048
+
+[checkpoint]
+source = "hf:HuggingFaceTB/SmolLM2-360M-Instruct"
+revision = "a10cc1512eabd3dde888204e902eca88bddb4951"
+
+[cell]
+max_ctx = 2048
