@@ -238,3 +238,36 @@ The library's own split count depends on the batch composition, so its logits mo
 concurrent runs where native's do not. That is the spread seen in the c16 continuation metric:
 0.870-0.891 vs native 0.935 in three runs. At c1, which is deterministic, the library continues
 better than native (0.913 vs 0.891).
+
+### Page-table over-index (fixed 2026-10-29)
+
+On the TMA paged path (KV tile = one 64-row page), FA4's SM90 producer loads V at
+`page_table[b, n_block_min]` after its block loop, even for a split that has no blocks.
+`n_block_min = split_idx x ceil(range / splits)` can reach n + splits - 2 for a request of n pages.
+With `n_block_max == 0` the first load reads entry -1. The consumer skips those splits, but the
+loads still happen.
+
+Before the fix, the table rows were exactly n wide, so those reads fetched stale ids left by
+earlier launches. Under VMM, one such id named a page of a slot whose blocks had since been
+reclaimed. The result was a rare CUDA 700 in the 26B BF16 production mix: an SM read of an
+unmapped KV page, at a 3-row tail chunk running at a high split count.
+
+Now every row carries `MAX_SPLITS` (128) columns past the widest request, filled with the
+request's own last page, and the word before row 0 holds row 0's first page. In a test build,
+the entries past each row held page ids of unmapped slots. That build faulted on every 1-3-row
+tail chunk and every 128-row chunk at long context. The fixed planner runs clean over six
+production-mix runs. The non-TMA path (Qwen hd256) checks rows against kv_len before it reads
+the table.
+
+### Gemma-4 26B BF16 production mix (fixed planner, library arm vs native, same packet)
+
+| rate | arm | TTFT P99 per rep | TPOT P99 per rep | SLO met per rep |
+|---|---|---|---|---|
+| 1.8/s | native | 2360 / 1709 ms | 127 / 111 ms | 96.1 / 97.6% |
+| 1.8/s | library | 1681 / 1663 / 841 ms | 107 / 119 / 88 ms | 98.1 / 97.0 / 99.4% |
+| 2.7/s | native | 1839 / 3163 ms | 102 / 102 ms | 98.2 / 93.9% |
+| 2.7/s | library | 1803 / 8287 / 4304 ms | 105 / 99 / 76 ms | 97.8 / 78.9 / 86.6% |
+
+The library wins at 1.8/s. At 2.7/s, the recipe rate, the stack sits at its overload edge and
+the runs are bimodal: the library collapses in two of three repeats, native in one of two. The
+route is not adopted for this packet.
