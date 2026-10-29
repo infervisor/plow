@@ -47,8 +47,23 @@ duplicate them and is now an index only.
 | [25](25-dspark-pending.md) | **DSpark Block Drafter (pending)** | Pending support |
 | [27](27-kv-zero-copy.md) | **Zero-copy KV** | Shared pages for live and cached rows; measured results |
 | [28](28-library-attention.md) | **Library Attention** | Library attention kernels inside plowrt, per rung |
+| [29](29-techniques.md) | **Techniques** | Per technique: what the op computes, its packet ABI, kernels and objects, KV/state class, backends |
 
 ---
+
+## Techniques index
+
+Models share techniques, so the runtime is documented per technique ([29](29-techniques.md)); models are examples there.
+
+| Family | Techniques |
+|---|---|
+| Attention | [Causal GQA flash attention (prefill, split-KV decode, FP8 KV)](29-techniques.md#causal-gqa-flash-attention-prefill-split-kv-decode-fp8-kv), [Sliding-window attention and hybrid sliding/global layouts](29-techniques.md#sliding-window-attention-and-hybrid-slidingglobal-layouts), [KV-shared layers (KV-shared tail)](29-techniques.md#kv-shared-layers-kv-shared-tail), [Attention sinks and logit softcap](29-techniques.md#attention-sinks-and-logit-softcap), [Library attention route](29-techniques.md#library-attention-route) |
+| Latent, sparse and memory attention; residual-stream variants | [Multi-head latent attention (MLA)](29-techniques.md#multi-head-latent-attention-mla), [Sparse attention with a lightning indexer (DSA)](29-techniques.md#sparse-attention-with-a-lightning-indexer-dsa), [Compressed KV attention (learned pooling, CSA)](29-techniques.md#compressed-kv-attention-learned-pooling-csa), [Engram conditional memory (hashed n-gram lookup)](29-techniques.md#engram-conditional-memory-hashed-n-gram-lookup), [Hyper-connections (mHC: multi-stream residual)](29-techniques.md#hyper-connections-mhc-multi-stream-residual), [Attention residuals (AttnRes: softmax mix over block residuals)](29-techniques.md#attention-residuals-attnres-softmax-mix-over-block-residuals) |
+| Recurrent mixers | [Recurrent state (shared contract for the mixers below)](29-techniques.md#recurrent-state-shared-contract-for-the-mixers-below), [Short causal depthwise convolution (conv history)](29-techniques.md#short-causal-depthwise-convolution-conv-history), [Gated DeltaNet (GDN)](29-techniques.md#gated-deltanet-gdn), [Kimi Delta Attention (KDA)](29-techniques.md#kimi-delta-attention-kda), [Mamba-2 selective scan (SSD)](29-techniques.md#mamba-2-selective-scan-ssd) |
+| Mixture of experts | [MoE routing (router + top-k)](29-techniques.md#moe-routing-router--top-k), [MoE experts: GLU / down, shared experts, combine](29-techniques.md#moe-experts-glu--down-shared-experts-combine), [Expert parallelism](29-techniques.md#expert-parallelism), [Muse-style gated residual and norms](29-techniques.md#muse-style-gated-residual-and-norms) |
+| Precision and encoding | [FP8 weights, BF16 activations (W8A16)](29-techniques.md#fp8-weights-bf16-activations-w8a16), [FP8 weights and activations (W8A8)](29-techniques.md#fp8-weights-and-activations-w8a8), [Block-scaled FP8 (128x128 and 32x32 grids)](29-techniques.md#block-scaled-fp8-128x128-and-32x32-grids), [MXFP4](29-techniques.md#mxfp4), [FP8 KV cache](29-techniques.md#fp8-kv-cache), [Library GEMM routes (cuBLASLt)](29-techniques.md#library-gemm-routes-cublaslt) |
+| Multi-token drafting and speculative decode | [Chain drafter (MTP assistant)](29-techniques.md#chain-drafter-mtp-assistant), [Block drafter (DSpark)](29-techniques.md#block-drafter-dspark), [Verify and acceptance (runtime)](29-techniques.md#verify-and-acceptance-runtime) |
+| Media and speech inputs | [Multimodal soft tokens (vision and audio encoders)](29-techniques.md#multimodal-soft-tokens-vision-and-audio-encoders), [Encoder overlay rows](29-techniques.md#encoder-overlay-rows), [Speech front-ends and codecs (pointer)](29-techniques.md#speech-front-ends-and-codecs-pointer) |
 
 ## Workspace at a glance
 
