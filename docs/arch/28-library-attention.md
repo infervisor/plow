@@ -109,6 +109,24 @@ split workspace and 2 x 64 MiB per KV head of bf16 page pool.
 
 The 26B run sits inside the recipe's measured native spread (kl_trim 0.124-0.153, p95 0.91-1.08).
 
+### Promotion run (bin3, production packets 12B a0464475 / 26B caf6c4a4)
+
+Production-mix replay, 2 reps, same client and vLLM 0.29 arm as the recipes:
+
+| | TTFT P99 | vs vLLM | TPOT P99 | goodput | SLO met |
+|---|---|---|---|---|---|
+| 12B 2.7/s native (same binary) | 1338.5 ms | 1.19x | 105.4 ms | 9.05 req/s | 97.5% |
+| 12B 2.7/s library route | 1187.5 ms | 1.05x | 103.9 ms | 9.16 req/s | 98.4% |
+| 26B 1.8/s library route | 260.7 ms | 0.71x | 22.3 ms | 7.35 req/s | 100% |
+
+FP32 gate at c1/c8/c32 against same-concurrency vLLM peers (captured with the c16 peers' flags):
+
+* 26B: c1 and c8 pass; c32 passes 2 of 3 runs (kl_p95 1.216 / 0.972 / 0.939 vs limit 1.12;
+  native 3 of 3, kl_p95 0.98-1.05, kl_trim 0.145-0.153 vs library 0.134-0.151).
+* 12B: c8 and c32 pass; c1 fails: cont_decisive 40/46 vs the peer's 43/46 (limit 41). The c1
+  capture is deterministic and native passes it at 44/46, so the 4 free-run divergences are the
+  library route's: the bf16 page pool rounds each dequantized row (kernel rel-L2 2x native).
+
 ## 4. Open
 
 * FP32 gate at c1/c8/c32 and a production-mix screen for the hd512 route.
