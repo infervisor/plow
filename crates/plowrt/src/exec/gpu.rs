@@ -8242,6 +8242,7 @@ impl GpuEngine {
         // cache references. Prefix admission maps after lookup; every execution
         // path maps the rows it writes, including inactive decode rows.
         self.vmm_publish(b, self.pos[b]);
+        self.blocks_quiesce()?;
         self.trace_finish(b);
         let t_publish = t0.map(|t| t.elapsed());
         self.pos[b] = keep;
@@ -8435,6 +8436,9 @@ impl GpuEngine {
             if let Err(e) = self.be.memset_d8_async(base, 0, 4, &self.stream) {
                 tracing::warn!(slot = b, error = %e, "retire: pos_base reset failed");
             }
+        }
+        if let Err(e) = self.blocks_quiesce() {
+            tracing::warn!(slot = b, error = %e, "retire: store copy drain failed");
         }
         // The live ring goes back first: `begin_seq`'s pressure trim then sees that memory free
         // instead of evicting cached boundaries for it.
