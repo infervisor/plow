@@ -34,11 +34,11 @@ const UPSTREAM: [(&str, &str); 3] = [
 const DEFINED: [usize; 22] = [
     12, 12, 64, 4, 64, 4, 64, 4, 64, 4, 12, 12, 8, 12, 4, 4, 4, 4, 4, 4, 4, 4,
 ];
-/// Tensor-map bits the export's own encoder sets that `cuTensorMapEncodeTiled` (driver 595) does
-/// not: byte 8 bit 1 and byte 10 bit 5 (below one 64-row box the export leaves the latter to
-/// uninitialized stack). The exemplar check ignores exactly these; everything else must match.
-const ENCODER_ONLY_BITS: [(usize, u8); 2] = [(8, 0x02), (10, 0x20)];
-const TMAP_PARAMS: [usize; 4] = [2, 4, 6, 8];
+/// Flag-word bits the export's own tensor-map encoder sets and `cuTensorMapEncodeTiled` (driver
+/// 595) leaves clear: byte 8 bit 1, byte 10 bit 5. They change the kernel's output (measured: O
+/// rows differ without them), so every map carries them, making the first 64 bytes equal to the
+/// export's. Below one 64-row box the export takes byte 10 bit 5 from uninitialized stack.
+const EXPORT_FLAG_BITS: [(usize, u8); 2] = [(8, 0x02), (10, 0x20)];
 const BFLOAT16: u32 = 9;
 const SWIZZLE_32B: u32 = 1;
 const SWIZZLE_128B: u32 = 3;
@@ -64,7 +64,7 @@ struct Operands {
 fn build(be: &CudaBackend, l: &mut Launch, tokens: u64, nseq: u64, p: &Operands) -> Result<()> {
     build_with(
         &|base, heads, row, box0, swizzle| {
-            be.encode_tmap_tiled(
+            let mut m = be.encode_tmap_tiled(
                 BFLOAT16,
                 base,
                 &[128, tokens, heads],
@@ -75,7 +75,11 @@ fn build(be: &CudaBackend, l: &mut Launch, tokens: u64, nseq: u64, p: &Operands)
                 swizzle,
                 L2_PROMOTION_128B,
                 0,
-            )
+            )?;
+            for (b, bits) in EXPORT_FLAG_BITS {
+                m[b] |= bits;
+            }
+            Ok(m)
         },
         l,
         tokens,
@@ -174,34 +178,10 @@ fn load_kernel(be: &CudaBackend, path: &Path) -> Result<Kernel> {
         }
         let mut l = Launch::new(&kernel.layout);
         build(be, &mut l, tokens, nseq, &p)?;
-        l.matches(&driver_view(x))
+        l.matches(x)
             .map_err(|e| rejected(format!("exemplar tokens={tokens} nseq={nseq}: {e}")))?;
     }
     Ok(kernel)
-}
-
-/// `x` with [`ENCODER_ONLY_BITS`] cleared in its captured tensor maps.
-fn driver_view(x: &Exemplar) -> Exemplar {
-    let mut params = x.params.clone();
-    for i in TMAP_PARAMS {
-        for (b, bits) in ENCODER_ONLY_BITS {
-            let Some(cap) = params[i].get(2 * b..2 * b + 2) else {
-                continue;
-            };
-            if let Ok(v) = u8::from_str_radix(cap, 16) {
-                params[i].replace_range(2 * b..2 * b + 2, &format!("{:02x}", v & !bits));
-            }
-        }
-    }
-    Exemplar {
-        args: x.args.clone(),
-        grid: x.grid,
-        block: x.block,
-        smem: x.smem,
-        attrs: x.attrs.clone(),
-        kernel_attrs: x.kernel_attrs.clone(),
-        params,
-    }
 }
 
 fn exemplar_operands(x: &Exemplar) -> Result<(u64, u64, Operands)> {
