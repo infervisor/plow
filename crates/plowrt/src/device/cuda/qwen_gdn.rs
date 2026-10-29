@@ -35,9 +35,9 @@ const DEFINED: [usize; 22] = [
     12, 12, 64, 4, 64, 4, 64, 4, 64, 4, 12, 12, 8, 12, 4, 4, 4, 4, 4, 4, 4, 4,
 ];
 /// Flag-word bits the export's own tensor-map encoder sets and `cuTensorMapEncodeTiled` (driver
-/// 595) leaves clear: byte 8 bit 1, byte 10 bit 5. They change the kernel's output (measured: O
-/// rows differ without them), so every map carries them, making the first 64 bytes equal to the
-/// export's. Below one 64-row box the export takes byte 10 bit 5 from uninitialized stack.
+/// 595) leaves clear: byte 8 bit 1, byte 10 bit 5. Every map carries them so its first 64 bytes
+/// equal the export's (the descriptor the .so route ran). Below one 64-row box the export takes
+/// byte 10 bit 5 from uninitialized stack.
 const EXPORT_FLAG_BITS: [(usize, u8); 2] = [(8, 0x02), (10, 0x20)];
 const BFLOAT16: u32 = 9;
 const SWIZZLE_32B: u32 = 1;
