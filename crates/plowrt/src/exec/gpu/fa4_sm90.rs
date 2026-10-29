@@ -262,7 +262,13 @@ fn rows(g: Geometry, kv_heads: u32, total_q: u32) -> u32 {
 fn forward(be: &CudaBackend, g: Geometry, p: &Prepared, c: &Call) -> Result<Launch> {
     let kvh = p.kv_heads;
     let split = p.role == Role::Split;
-    let (d, h, t, s) = (g.head_dim, g.heads, c.total_q, c.splits);
+    // A whole-KV entry has no split extent: its scheduler runs one split.
+    let (d, h, t, s) = (
+        g.head_dim,
+        g.heads,
+        c.total_q,
+        if split { c.splits } else { 1 },
+    );
     let pack = g.pack(kvh);
     let qhpk = h / kvh;
     // Query heads per tile row group: KV heads when packed, else every query head.
@@ -303,12 +309,7 @@ fn forward(be: &CudaBackend, g: Geometry, p: &Prepared, c: &Call) -> Result<Laun
         };
         l.memref(base, c.cu_q, &[c.requests + 1], &[]);
         l.memref(base + 1, c.used_k, &[c.requests], &[]);
-        l.memref(
-            base + 2,
-            c.page_table,
-            &[c.requests, c.width],
-            &[u64::from(c.width)],
-        );
+        l.memref32(base + 2, c.page_table, &[c.requests, c.width], &[c.width]);
         let dtype = if g.f16 { TMAP_F16 } else { TMAP_BF16 };
         let tmap = |base: u64, dims: &[u64], strides: &[u64], boxes: &[u32]| {
             be.encode_tmap_tiled(
@@ -391,12 +392,7 @@ fn forward(be: &CudaBackend, g: Geometry, p: &Prepared, c: &Call) -> Result<Laun
         let base = if split { 5 } else { 4 };
         l.memref(base, c.cu_q, &[c.requests + 1], &[]);
         l.memref(base + 1, c.used_k, &[c.requests], &[]);
-        l.memref(
-            base + 2,
-            c.page_table,
-            &[c.requests, c.width],
-            &[u64::from(c.width)],
-        );
+        l.memref32(base + 2, c.page_table, &[c.requests, c.width], &[c.width]);
         tail = base + 3;
     }
     // softmax scale in log2 units, the two MMA atoms' accumulate flags, then the tile

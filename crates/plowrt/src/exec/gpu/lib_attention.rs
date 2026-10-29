@@ -669,6 +669,14 @@ impl LibAttention {
                 stream,
             )?;
         }
+        if site.heads != self.abi.heads
+            || (self.abi.layout == LibraryKvLayout::RowInterleaved
+                && head_stride != i64::from(self.abi.head_dim))
+        {
+            return Err(RuntimeError::Rejected(
+                "library attention: site geometry differs from the object's".into(),
+            ));
+        }
         let splits = l.splits(&self.abi, site.kv_heads, self.workspace.len);
         let rows_q = (site.q + l.head * row_bytes, (t0 - l.head) * row_bytes);
         let rows_o = (site.output + l.head * row_bytes, (t0 - l.head) * row_bytes);
@@ -696,15 +704,12 @@ impl LibAttention {
             splits,
             scale: site.scale,
         };
-        if site.heads != self.abi.heads
-            || (self.abi.layout == LibraryKvLayout::RowInterleaved
-                && head_stride != i64::from(self.abi.head_dim))
-        {
-            return Err(RuntimeError::Rejected(
-                "library attention: site geometry differs from the object's".into(),
-            ));
+        if let Err(e) = self.fa4.run(&self.be, site.kv_heads, &call, stream) {
+            if self.abi.f16 {
+                let _ = self.convert(rows_q, false, stream);
+            }
+            return Err(e);
         }
-        self.fa4.run(&self.be, site.kv_heads, &call, stream)?;
         if self.abi.f16 {
             self.convert(rows_o, false, stream)?;
             self.convert(rows_q, false, stream)?;
