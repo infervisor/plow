@@ -116,10 +116,35 @@ def check_rung_env(over: dict, build_json: dict, observed: dict) -> None:
 # Emit env keys that locate a tool on the build host rather than shape the
 # packet; a recipe states them for the build command, the checker ignores them.
 MACHINE_PATH_KNOBS = ("PLOW_VERIFY_BIN",)
+# nvcc's own environment: `[emit.env]` may state it (the -D set the emitted
+# kernels are compiled with). plowc's knob record does not carry it; the
+# campaign records the environment it ran plowc with in `build-record.json`
+# under `compilation.emit_env`, which is what it is checked against.
+TOOLCHAIN_ENV_KNOBS = ("NVCC_APPEND_FLAGS", "NVCC_PREPEND_FLAGS")
 
 
-def check_emit(recipe: dict, build_json: dict) -> list[str]:
-    """`[emit].env` against `build.json`'s own knob record."""
+def check_toolchain_env(requested: dict, record: dict | None) -> list[str]:
+    """The nvcc environment `[emit.env]` states, against the campaign's build
+    record: verified when the record is there, reported when it is not."""
+    notes = []
+    recorded = ((record or {}).get("compilation") or {}).get("emit_env")
+    for knob in TOOLCHAIN_ENV_KNOBS:
+        if knob not in requested:
+            continue
+        if recorded is None:
+            notes.append(f"emit: {knob} is not in the knob record and no build-record.json is beside the bundle — unverified")
+            continue
+        need(knob in recorded, f"emit: recipe requests {knob} but the build ran plowc with no such variable")
+        need(
+            str(recorded[knob]) == str(requested[knob]),
+            f"emit: contradictory {knob} — recipe says {requested[knob]!r}, build recorded {recorded[knob]!r}",
+        )
+    return notes
+
+
+def check_emit(recipe: dict, build_json: dict, record: dict | None = None) -> list[str]:
+    """`[emit].env` against `build.json`'s own knob record (and the nvcc
+    environment against the campaign's build record)."""
     rungs = recipe_rung_env(recipe)
     ec = build_json.get("emit_config")
     need(ec or not rungs, "emit: the recipe states [emit.rung_env] but build.json has no `emit_config` to verify it")
@@ -146,13 +171,17 @@ def check_emit(recipe: dict, build_json: dict) -> list[str]:
     for machine in MACHINE_PATH_KNOBS:
         requested.pop(machine, None)
         observed.pop(machine, None)
+    notes_tool = check_toolchain_env(requested, record)
+    for knob in TOOLCHAIN_ENV_KNOBS:
+        requested.pop(knob, None)
+        observed.pop(knob, None)
     exact_map(requested, observed, "emit")
     check_rung_env(rungs, build_json, observed)
 
     # The other direction, as a report rather than a refusal: a knob the build
     # replayed but the recipe does not mention is a reproduction gap.
     missing = sorted(set(observed) - set(requested) - {rung_env.ENV})
-    return [f"emit: build replayed {k}={observed[k]!r}, recipe does not state it" for k in missing]
+    return notes_tool + [f"emit: build replayed {k}={observed[k]!r}, recipe does not state it" for k in missing]
 
 
 # Knobs whose effect lands under another define. `build_gfx942.sh` turns
@@ -328,8 +357,10 @@ def check(recipe_path: Path, bundle: Path | None, objects: Path | None, strict: 
     if bundle:
         bj = rc.load_json(bundle / "build.json") if (bundle / "build.json").exists() else {}
         wj = rc.load_json(bundle / "weights.json") if (bundle / "weights.json").exists() else {}
+        rec_path = bundle.parent / "build-record.json"
+        rec = rc.load_json(rec_path) if rec_path.exists() else None
         check_target(recipe, bj, wj)
-        notes += check_emit(recipe, bj)
+        notes += check_emit(recipe, bj, rec)
     if objects:
         dp = objects / "build_defines.json"
         notes += check_objects(recipe, rc.load_json(dp) if dp.exists() else {})
