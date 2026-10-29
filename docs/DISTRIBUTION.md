@@ -267,7 +267,10 @@ bucket from `CLOUDFLARE_ACCOUNT_ID` and `CLOUDFLARE_R2_BUCKET`),
 `r2://<bucket>` or `r2://<account-id>/<bucket>`. Writes go through
 Cloudflare's REST API with `CLOUDFLARE_API_TOKEN`, or through R2's S3
 endpoint with `CLOUDFLARE_R2_ACCESS_KEY_ID` + `CLOUDFLARE_R2_SECRET_ACCESS_KEY`
-when no API token is set. `s3://<bucket>` is any S3 bucket from the `AWS_*`
+when no API token is set. The REST API has no multipart upload: a blob goes
+up in one PUT, which Cloudflare caps at about 300 MiB, so a bundle with a
+larger compressed packet (a speech encoder, a codec) needs the S3 keys, where
+blobs upload in parts. `s3://<bucket>` is any S3 bucket from the `AWS_*`
 environment (`AWS_ENDPOINT` for another S3-compatible service).
 `file:///dir` writes the same tree, which is how a release is inspected or
 mirrored by hand. The client is our fork of Apache `object_store`
