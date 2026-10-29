@@ -213,6 +213,7 @@
           pkgs = pkgsFor system;
           lib = pkgs.lib;
           isLinux = pkgs.stdenv.isLinux;
+          isDarwin = pkgs.stdenv.isDarwin;
           # The GPU toolchains only exist here: the ROCm SDK tarball is a
           # linux-x86_64 binary distribution.
           isGpuHost = system == "x86_64-linux";
@@ -521,7 +522,8 @@
           # release (CPU + dist; the GPU features are Linux-only), which is what
           # `install.sh` fetches there.
           plowrt-release = mkRelease {
-            features = lib.optionals isLinux [ "cuda" "hsa" ] ++ [ "cpu" "dist" ];
+            features = lib.optionals isLinux [ "cuda" "hsa" ]
+              ++ lib.optionals isDarwin [ "metal" ] ++ [ "cpu" "dist" ];
           };
         }
         // lib.optionalAttrs (system == "x86_64-linux") {
