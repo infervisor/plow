@@ -576,6 +576,15 @@ impl FillToken<'_> {
         self.store.seal_id(self.id);
     }
 
+    /// The fill's copy is queued on the stream every reader of the block's bytes before the seal
+    /// is ordered on: the caller seals ([`KvStore::seal_ids`]) or fails ([`KvStore::fail_ids`])
+    /// the block once that copy is known to have completed or failed. Until then it stays
+    /// `Filling`: never spilled, reclaimed, evicted or compacted.
+    pub fn defer(mut self) -> BlockId {
+        self.done = true;
+        self.id
+    }
+
     /// The fill did not complete: never serve these bytes; the next acquire refills.
     pub fn fail(mut self) {
         self.done = true;
@@ -916,6 +925,71 @@ impl KvStore {
         }
     }
 
+    /// Seal fills deferred by [`FillToken::defer`].
+    pub fn seal_ids(&self, ids: &[BlockId]) {
+        for &id in ids {
+            self.seal_id(id);
+        }
+    }
+
+    /// Fail fills deferred by [`FillToken::defer`].
+    pub fn fail_ids(&self, ids: &[BlockId]) {
+        for &id in ids {
+            self.fail_id(id);
+        }
+    }
+
+    /// [`Self::hold`] plus [`Self::gather_src`] of every block, under one lock acquisition: a
+    /// gather no longer takes the store lock once per block (each acquisition could wait
+    /// behind a spill or reap). `Err` (a block is gone) takes no hold.
+    pub fn hold_sources(self: &Arc<Self>, ids: Vec<BlockId>, out: &mut Vec<Src>) -> Result<Hold> {
+        out.clear();
+        let mut inner = self.inner.lock();
+        if ids.iter().any(|&id| inner.block(id).is_none()) {
+            return Err(RuntimeError::Rejected("kv store: no such block".into()));
+        }
+        // A deferred fill whose copy failed (`fail_ids`) is never served.
+        if ids
+            .iter()
+            .any(|&id| inner.block(id).is_some_and(|b| b.state == State::Failed))
+        {
+            return Err(RuntimeError::Rejected("kv store: block failed".into()));
+        }
+        inner.tick += 1;
+        let tick = inner.tick;
+        for &id in &ids {
+            let b = inner.block_mut(id).expect("checked above");
+            b.holds += 1;
+            b.tick = tick;
+            let (class, place) = (b.class, b.place);
+            out.push(match place {
+                Where::Device(s) | Where::Spilling { dev: s, .. } => Src {
+                    va: inner.classes[class].device.va(s),
+                    from_host: false,
+                    fence: None,
+                },
+                Where::Restoring { dev, fence, .. } => Src {
+                    va: inner.classes[class].device.va(dev),
+                    from_host: false,
+                    fence: Some(fence),
+                },
+                Where::Host(h) => {
+                    inner.stats.host_reads += 1;
+                    Src {
+                        va: inner.classes[class].host.va(h),
+                        from_host: true,
+                        fence: None,
+                    }
+                }
+            });
+        }
+        drop(inner);
+        Ok(Hold {
+            store: Arc::clone(self),
+            ids,
+        })
+    }
+
     fn unhold(&self, ids: &[BlockId]) {
         let mut inner = self.inner.lock();
         for &id in ids {
@@ -1024,6 +1098,22 @@ impl KvStore {
                 inner.block(id),
                 Some(Block {
                     place: Where::Restoring { .. },
+                    ..
+                })
+            )
+        })
+    }
+
+    /// Whether any of `ids` is not readable on the device without a wait: host-resident, or
+    /// with its restore in flight (landed ones are retired first).
+    pub fn off_device_any(&self, ids: &[BlockId]) -> bool {
+        let mut inner = self.inner.lock();
+        self.reap_restores(&mut inner);
+        ids.iter().any(|&id| {
+            matches!(
+                inner.block(id),
+                Some(Block {
+                    place: Where::Restoring { .. } | Where::Host(_),
                     ..
                 })
             )
@@ -1252,14 +1342,18 @@ impl KvStore {
     /// remain: an attach restores a host block ([`Self::ensure_device`]). Returns `true` when
     /// every block of `ids` is off the device afterwards (queued, already on the host, or not
     /// servable); `false` = the host tier is full, and whatever was queued stays queued.
+    ///
+    /// The lock is taken per block: a boundary's spill submits a copy per block (tens of
+    /// microseconds each), and a gather waiting for the lock behind a whole boundary waited
+    /// milliseconds.
     pub fn spill(&self, ids: &[BlockId]) -> bool {
-        let mut inner = self.inner.lock();
-        if inner.host_cap == 0 {
+        if self.inner.lock().host_cap == 0 {
             return false;
         }
-        let t0 = std::time::Instant::now();
         let mut all = true;
         for &id in ids {
+            let mut inner = self.inner.lock();
+            let t0 = std::time::Instant::now();
             let Some(b) = inner.block(id) else {
                 continue;
             };
@@ -1304,8 +1398,8 @@ impl KvStore {
                     all = false;
                 }
             }
+            inner.stats.spill_us += t0.elapsed().as_micros() as u64;
         }
-        inner.stats.spill_us += t0.elapsed().as_micros() as u64;
         all
     }
 

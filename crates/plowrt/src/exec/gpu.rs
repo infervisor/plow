@@ -2485,8 +2485,14 @@ enum PackedAdmission {
     /// Another slot is prefilling this prompt's shared prefix; admit once its checkpoint is
     /// published (`vmm_inflight_prefix`), or after [`INFLIGHT_WAIT_LIMIT`] regardless.
     WaitingPrefix(std::time::Instant),
+    /// The prompt's boundary is still coming back from the host tier; admit once its blocks are
+    /// on the device, or after [`RESTORE_WAIT_LIMIT`] regardless (the gather then waits on the
+    /// copy in the engine stream, stalling every other row).
+    WaitingRestore(std::time::Instant),
     Ready,
 }
+
+const RESTORE_WAIT_LIMIT: std::time::Duration = std::time::Duration::from_millis(250);
 
 /// A packed admission that ran out of device memory retries after this long.
 const KV_MEMORY_RETRY: std::time::Duration = std::time::Duration::from_millis(100);
@@ -2779,6 +2785,8 @@ pub struct GpuEngine {
     disconnected: Vec<bool>,
     /// Serve-manifest KV geometry, kept only under `PLOW_NV_DUMP_KV` ([`Self::dump_slot_kv`]).
     dump_kv_geo: Option<plow_asset::serve_manifest::KvGeometry>,
+    /// The serve manifest's KV geometry ([`Self::kv_pages_init`]).
+    kv_geo: Option<plow_asset::serve_manifest::KvGeometry>,
     /// A launch's host window is open ([`Self::token_batch_step_window`]): snapshot restores skip
     /// their stream drain and their holds wait in `deferred_attach` for the step's own drain.
     window_open: bool,
@@ -7580,6 +7588,7 @@ impl GpuEngine {
                 .nv_dump_kv
                 .as_ref()
                 .and(serve.manifest.kv.clone()),
+            kv_geo: serve.manifest.kv.clone(),
             window_open: false,
             deferred_attach: Vec::new(),
             window_event: None,
@@ -8058,16 +8067,23 @@ impl GpuEngine {
         };
         // `held` is read before the device query: a block the pre-mapper maps between the two
         // reads then counts in neither (free already shrank, held not yet grown), never in both.
-        let (held, floor) = if let Some(kv) = vmm.kv.as_ref() {
-            (kv.mapped_bytes(), kv.block_bytes())
-        } else if let Some(rings) = vmm.rings.as_ref() {
+        // A hybrid packet holds both: block-pool KV for its full layers and live sliding rings.
+        // Rings left out of `held` were charged twice, once as used device memory and again per
+        // request (`request_bytes`): 26B BF16 admitted ~21 of 32 slots under overload.
+        let rings_held = vmm.rings.as_ref().map(|rings| {
             let slot = rings.slot_charge();
             (
                 rings.stats().mapped_slots as u64 * slot + rings.spare_bytes(),
                 slot,
             )
-        } else {
-            return Some(budget);
+        });
+        let (held, floor) = match (vmm.kv.as_ref(), rings_held) {
+            (Some(kv), rings) => (
+                kv.mapped_bytes() + rings.map_or(0, |(bytes, _)| bytes),
+                kv.block_bytes(),
+            ),
+            (None, Some(rings)) => rings,
+            (None, None) => return Some(budget),
         };
         // The block store's slabs are cache the pool takes back on demand (`shrink` on the
         // OOM path), so they count as held like the multi-mapped cache blocks did; left out,
@@ -8160,6 +8176,7 @@ impl GpuEngine {
             )));
         }
         self.reset_packed_admission(b);
+        self.state_drop(b);
         // A retirement deferred behind a step that then failed (queue cleared) must not fire
         // against the request seated here now.
         if let Some(p) = self.pipe.as_mut() {
@@ -8442,8 +8459,11 @@ impl GpuEngine {
         // for its whole-block checkpoint (one attach + the tail) instead of recomputing the
         // shared rows beside it; bounded, and released when the owner publishes or retires.
         if self.vmm_prefix_enabled() && crate::config::RuntimeConfig::get().prefix_inflight_wait() {
+            // One deadline for both waits: alternating them must not restart either.
             let since = match self.packed_admission[b] {
-                PackedAdmission::WaitingPrefix(since) => since,
+                PackedAdmission::WaitingPrefix(since) | PackedAdmission::WaitingRestore(since) => {
+                    since
+                }
                 _ => std::time::Instant::now(),
             };
             if since.elapsed() < INFLIGHT_WAIT_LIMIT {
@@ -8460,6 +8480,23 @@ impl GpuEngine {
                     self.packed_admission[b] = PackedAdmission::WaitingPrefix(since);
                     return Ok(None);
                 }
+            }
+        }
+        if self.vmm_prefix_enabled() && self.pos[b] == 0 && !self.prefix_attach_off[b] {
+            let since = match self.packed_admission[b] {
+                PackedAdmission::WaitingPrefix(since) | PackedAdmission::WaitingRestore(since) => {
+                    since
+                }
+                _ => std::time::Instant::now(),
+            };
+            let restoring = since.elapsed() < RESTORE_WAIT_LIMIT
+                && self
+                    .vmm_prefix()
+                    .and_then(|(_, kv)| kv.attach_handle(prompt, self.staged_prefix[b].as_ref()))
+                    .is_some_and(|handle| self.blocks_restoring(handle));
+            if restoring {
+                self.packed_admission[b] = PackedAdmission::WaitingRestore(since);
+                return Ok(None);
             }
         }
         let host_t = pf_packlog_on().then(std::time::Instant::now);
@@ -13002,7 +13039,11 @@ impl GpuEngine {
                 "GDN prefill state operand is not a declared recurrent buffer of the library's slot stride".into(),
             ));
         }
-        let state = &self.devp[t[6] as usize];
+        let state_index = t[6] as usize;
+        if qwen_pack.is_empty() {
+            self.state_materialize(b, Some(state_index))?;
+        }
+        let state = &self.devp[state_index];
         if qwen_pack.is_empty() {
             let native = self
                 .qwen_prefill
@@ -13041,6 +13082,9 @@ impl GpuEngine {
             0
         };
         if ride > 0 {
+            for &(slot, _) in &qwen_pack[..ride] {
+                self.state_materialize(slot, Some(state_index))?;
+            }
             self.packed_gdn_ride(t, ride_ops.expect("checked"), state, &qwen_pack[..ride])?;
             if synchronize {
                 self.be.stream_synchronize(&self.stream).map_err(|e| {
@@ -13063,7 +13107,27 @@ impl GpuEngine {
                 "packed Qwen prefill exceeds the GDN state scratch".into(),
             ));
         }
-        self.packed_state_copy(init, state, scan, ride, true)?;
+        // An attached request whose state stayed in its block reads it from there (the attach
+        // copied none of it into the slot).
+        let sources: smallvec::SmallVec<[Option<u64>; 16]> = scan
+            .iter()
+            .map(|&(slot, _)| self.state_source(slot, state_index))
+            .collect();
+        if sources.iter().any(Option::is_some) {
+            let srcs: smallvec::SmallVec<[u64; 16]> = scan
+                .iter()
+                .zip(&sources)
+                .map(|(&(slot, _), src)| src.unwrap_or(state.base + slot as u64 * STRIDE))
+                .collect();
+            self.state_init_gather(&srcs)?;
+            for (&(slot, _), src) in scan.iter().zip(&sources) {
+                if src.is_some() {
+                    self.state_consumed(slot, state_index);
+                }
+            }
+        } else {
+            self.packed_state_copy(init, state, scan, ride, true)?;
+        }
         if synchronize {
             self.be.stream_synchronize(&self.stream).map_err(|e| {
                 tracing::warn!(error = %e, "packed GDN gather failed");

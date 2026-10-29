@@ -10,14 +10,15 @@
 //! multi-maps nothing (`VmmKv::enable_block_store(.., true)`); an attach maps the slot's own
 //! blocks (`ensure_rows`) and gathers every row into them.
 //!
-//! The copies are segment tables (one 16-byte-aligned run per tensor and head per block)
-//! executed by one `plow_kv_segcopy` launch on the engine stream (PTX embedded, driver-JIT at
-//! load); a backend without the kernel runs the table as a memcpy loop. Model kernels see only
+//! The copies are block descriptors (block address, slot row, slot) over a static per-class
+//! layout of (tensor, head) runs, executed by one `plow_kv_blockcopy` launch per class on the
+//! engine stream with the descriptors in the launch parameters (PTX embedded, driver-JIT at
+//! load); a backend without the kernel expands them into a memcpy loop. Model kernels see only
 //! the slot's rings and tracks, exactly as with the contiguous snapshots this replaces.
 
 use super::prefix::VmmServe;
 use super::GpuEngine;
-use crate::device::cuda::{CudaBackend, KernelFn, PinnedHost};
+use crate::device::cuda::{CudaBackend, CudaEvent, KernelFn};
 use crate::memory::kv_store::{
     chain_hashes, BlockId, ClassSpec, FillToken, Hold, KvStore, StoreStats,
 };
@@ -39,8 +40,12 @@ const SPILL_WAIT: std::time::Duration = std::time::Duration::from_millis(50);
 const SEED_CHAIN: u64 = 0x9e37_79b9_7f4a_7c15;
 const SEED_CHECK: u64 = 0xc2b2_ae3d_27d4_eb4f;
 const SEGCOPY_PTX: &str = include_str!("../../../../../runtime/nvidia/kv_segcopy.ptx");
-const SEGCOPY_ENTRY: &str = "plow_kv_segcopy";
+const SEGCOPY_ENTRY: &str = "plow_kv_blockcopy";
 const SEGCOPY_BLOCK: u32 = 256;
+/// Descriptors per launch (`PLOW_KV_DESCS` in `kv_segcopy.cu`).
+const DESCS: usize = 2032;
+/// State class runs are cut into chunks of this size (one CTA each).
+const STATE_CHUNK: u64 = 64 << 10;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Class {
@@ -52,14 +57,74 @@ enum Class {
     State,
 }
 
-/// One segment of a gather/scatter table (`plow_kv_seg` in `kv_segcopy.cu`).
+impl Class {
+    fn index(self) -> usize {
+        self as usize
+    }
+}
+
+/// One (tensor, head) run of a class (`plow_kv_layout` in `kv_segcopy.cu`): slot `s`, slot row
+/// `r` at `dev + s * slot_stride + r * row_bytes`; in the block at `block_off`, `bytes` long.
 #[repr(C)]
-#[derive(Clone, Copy)]
-struct Seg {
-    src: u64,
-    dst: u64,
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Layout {
+    dev: u64,
+    slot_stride: u64,
+    row_bytes: u32,
+    block_off: u32,
     bytes: u32,
     pad: u32,
+}
+
+/// One block of a copy (`plow_kv_desc`): its bytes, its first slot row, the slot.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+struct Desc {
+    block: u64,
+    row: u32,
+    slot: u32,
+}
+
+/// `plow_kv_blockcopy_args`: the launch parameters, copied by the driver at launch.
+#[repr(C)]
+struct CopyArgs {
+    layout: u64,
+    to_block: u32,
+    n: u32,
+    d: [Desc; DESCS],
+}
+
+/// Layout ranges past the four classes: the state class without the tensors the first packed
+/// prefill reads from the block itself ([`PendingState`]), and that read (block or slot state
+/// into the contiguous initial-state scratch, one descriptor per scanned request).
+const STATE_REST: usize = 4;
+const STATE_INIT: usize = 5;
+const RANGES: usize = 6;
+
+/// Every range's runs, uploaded once (the slot tensors never move); `ranges[r]` =
+/// `(first entry, entries)`.
+struct Layouts {
+    dev: Option<TableDev>,
+    host: Vec<Layout>,
+    ranges: [(u32, u32); RANGES],
+}
+
+/// Engine-stream work not known complete: once `done` retires, `ids` (deferred fills) seal
+/// and `holds` drop (every reader of those blocks is on the engine stream).
+struct PendingSeal {
+    done: CudaEvent,
+    ids: Vec<BlockId>,
+    holds: Vec<Hold>,
+}
+
+/// An attach whose recurrent state was not copied into the slot: the slot's first packed
+/// prefill reads each `left` tensor `(devp index, offset in the block)` straight from the
+/// held block into its initial-state scratch; anything else that would read the slot's state
+/// first copies the remaining tensors in ([`GpuEngine::state_materialize`]).
+struct PendingState {
+    hold: Hold,
+    va: u64,
+    left: Vec<(usize, u64)>,
 }
 
 /// A boundary's blocks: `(class, first row, block)` in the order the segments are built.
@@ -104,13 +169,7 @@ impl Drop for Deps<'_> {
     }
 }
 
-struct Table {
-    host: PinnedHost,
-    dev: TableDev,
-    cap: usize,
-}
-
-/// A table's device half, allocated and freed through the pool's `VmmOps` (its `Oom` mapping
+/// The layout's device copy, allocated and freed through the pool's `VmmOps` (its `Oom` mapping
 /// and provenance record, which `Backend::alloc` lacks); freed once, when dropped.
 struct TableDev {
     be: Arc<CudaBackend>,
@@ -159,6 +218,8 @@ pub struct BlockServeStats {
     pub restore_blocks: u64,
     pub restore_us: u64,
     pub gather_fenced_blocks: u64,
+    /// Publishes whose seal waited for the scatter's event instead of a stream drain.
+    pub seals_deferred: u64,
 }
 
 pub struct BlockServe {
@@ -174,7 +235,14 @@ pub struct BlockServe {
     handles: Mutex<FxHashMap<u64, Handle>>,
     next_handle: AtomicU64,
     kernel: Option<KernelFn>,
-    tables: Mutex<Vec<Option<Table>>>,
+    layouts: std::sync::OnceLock<Layouts>,
+    args: Mutex<Box<CopyArgs>>,
+    seals: Mutex<Vec<PendingSeal>>,
+    spare_events: Mutex<Vec<CudaEvent>>,
+    /// The state tensors a first packed prefill can read from a block (`(devp index, offset in
+    /// the block)`), set once by the engine; empty = every attach copies the whole state.
+    state_defer: std::sync::OnceLock<Vec<(usize, u64)>>,
+    pending_state: Mutex<Vec<Option<PendingState>>>,
     /// Transfer holds a launch-window gather keeps until the step's own drain
     /// ([`GpuEngine::flush_deferred_attach`]).
     held: Mutex<Vec<Vec<Hold>>>,
@@ -322,7 +390,17 @@ impl BlockServe {
             handles: Mutex::new(FxHashMap::default()),
             next_handle: AtomicU64::new(1),
             kernel,
-            tables: Mutex::new((0..batch).map(|_| None).collect()),
+            layouts: std::sync::OnceLock::new(),
+            args: Mutex::new(Box::new(CopyArgs {
+                layout: 0,
+                to_block: 0,
+                n: 0,
+                d: [Desc::default(); DESCS],
+            })),
+            seals: Mutex::new(Vec::new()),
+            spare_events: Mutex::new(Vec::new()),
+            state_defer: std::sync::OnceLock::new(),
+            pending_state: Mutex::new((0..batch).map(|_| None).collect()),
             held: Mutex::new((0..batch).map(|_| Vec::new()).collect()),
             _grower_stop: grower_stop,
             stats: Mutex::new(BlockServeStats::default()),
@@ -389,6 +467,14 @@ impl Drop for BlockServe {
         for hold in self.held.get_mut().drain(..).flatten() {
             hold.abandon();
         }
+        for p in self.pending_state.get_mut().drain(..).flatten() {
+            p.hold.abandon();
+        }
+        for p in self.seals.get_mut().drain(..) {
+            for hold in p.holds {
+                hold.abandon();
+            }
+        }
     }
 }
 
@@ -443,7 +529,7 @@ impl SnapBlocks for BlockServe {
             Some(h) => h.iter().map(|&(_, _, id)| id).collect(),
             None => return false,
         };
-        self.store.restoring_any(&ids)
+        self.store.off_device_any(&ids)
     }
 
     fn reap(&self) {
@@ -504,10 +590,14 @@ impl GpuEngine {
 
     /// Publish slot `b`'s boundary at `p_a` into the store: acquire its blocks (a boundary
     /// the pool evicts on a full store makes room), scatter the new ones from the rings and
-    /// tracks, seal them. Returns the handle and the bytes the new blocks added.
+    /// tracks. The new blocks seal once the scatter's event retires ([`Self::blocks_reap_seals`]):
+    /// until then only the engine stream, which orders every later gather behind the scatter,
+    /// can read them. Returns the handle and the bytes the new blocks added.
     pub(super) fn blocks_publish(&self, b: usize, p_a: u32) -> Result<(u64, u64)> {
         let t0 = std::time::Instant::now();
         let mut sync_us = 0u64;
+        self.blocks_reap_seals();
+        self.state_materialize(b, None)?;
         let (v, kv) = self.vmm_prefix().expect("block publish without prefix vmm");
         let bs = v.blocks.as_ref().expect("block publish without store");
         let toks = &self.seq_tokens[b][..p_a as usize];
@@ -522,7 +612,7 @@ impl GpuEngine {
         // On an error return `fills` drops first (the blocks fail), `deps` after (released).
         let mut deps = Deps::new(&bs.store, plan.len());
         let mut fills: Vec<FillToken> = Vec::new();
-        let mut segs: Vec<Seg> = Vec::new();
+        let mut descs: [Vec<Desc>; RANGES] = Default::default();
         let mut new_bytes = 0u64;
         for (class, row0, key_index) in plan {
             let ci = bs.class_index(class);
@@ -554,21 +644,32 @@ impl GpuEngine {
             if let Some(token) = acquired.fill {
                 fills.push(token);
                 new_bytes += bs.store.class_spec(ci).block_bytes();
-                self.block_segments(b, class, row0, acquired.va, true, &mut segs);
+                descs[class.index()].push(self.block_desc(b, class, row0, acquired.va));
             }
         }
-        if !segs.is_empty() {
-            // Drain even a partially submitted table: the blocks are sealed or released after
-            // the engine stream is done with them.
-            let copied = self.run_segments(b, &segs);
-            let ts = std::time::Instant::now();
-            let drained = self.be.stream_synchronize(&self.stream);
-            sync_us = ts.elapsed().as_micros() as u64;
-            copied.and(drained)?;
-        }
         let new_blocks = fills.len() as u64;
-        for token in fills {
-            token.seal();
+        if !fills.is_empty() {
+            let queued = self
+                .run_blocks(&descs, true)
+                .and_then(|()| self.blocks_seal_after(&fills));
+            match queued {
+                Ok(()) => {
+                    for token in fills {
+                        token.defer();
+                    }
+                }
+                Err(e) => {
+                    // Drain even a partially submitted copy: the blocks fail and are released
+                    // after the engine stream is done with them.
+                    let ts = std::time::Instant::now();
+                    let _ = self.be.stream_synchronize(&self.stream);
+                    sync_us = ts.elapsed().as_micros() as u64;
+                    drop(fills);
+                    drop(deps);
+                    bs.stats.lock().publish_sync_us += sync_us;
+                    return Err(e);
+                }
+            }
         }
         let handle = deps.into_handle();
         let id = bs.next_handle.fetch_add(1, Ordering::Relaxed);
@@ -581,15 +682,107 @@ impl GpuEngine {
             st.publish_us += us;
             st.publish_max_us = st.publish_max_us.max(us);
             st.publish_sync_us += sync_us;
+            if new_blocks > 0 {
+                st.seals_deferred += 1;
+            }
         }
         bs.handles.lock().insert(id, handle);
         Ok((id, new_bytes))
+    }
+
+    /// Record the event the fills of a just-queued scatter seal behind.
+    fn blocks_seal_after(&self, fills: &[FillToken]) -> Result<()> {
+        let bs = self.kv_blocks().expect("seal without store");
+        let done = match bs.spare_events.lock().pop() {
+            Some(e) => e,
+            None => self.be.event_create(false)?,
+        };
+        if let Err(e) = self.be.event_record(&done, &self.stream) {
+            bs.spare_events.lock().push(done);
+            return Err(e);
+        }
+        bs.seals.lock().push(PendingSeal {
+            done,
+            ids: fills.iter().map(FillToken::id).collect(),
+            holds: Vec::new(),
+        });
+        Ok(())
+    }
+
+    /// Drop `hold` once the engine stream passes this point (its reads were queued there).
+    fn blocks_release_after(&self, hold: Hold) {
+        let bs = self.kv_blocks().expect("release without store");
+        let done = match bs.spare_events.lock().pop() {
+            Some(e) => Ok(e),
+            None => self.be.event_create(false),
+        };
+        let recorded = done.and_then(|done| match self.be.event_record(&done, &self.stream) {
+            Ok(()) => Ok(done),
+            Err(e) => {
+                bs.spare_events.lock().push(done);
+                Err(e)
+            }
+        });
+        match recorded {
+            Ok(done) => bs.seals.lock().push(PendingSeal {
+                done,
+                ids: Vec::new(),
+                holds: vec![hold],
+            }),
+            Err(_) => {
+                // Completion unproven: drain, or keep the block pinned.
+                if self.be.stream_synchronize(&self.stream).is_ok() {
+                    drop(hold);
+                } else {
+                    hold.abandon();
+                }
+            }
+        }
+    }
+
+    /// Seal the deferred fills whose scatter retired (in queue order: one stream). A failed
+    /// query fails the remaining fills (their bytes are never served; the slots stay pinned as
+    /// `Failed` blocks the next acquire refills).
+    pub(crate) fn blocks_reap_seals(&self) {
+        let Some(bs) = self.kv_blocks() else {
+            return;
+        };
+        let finished: Vec<(PendingSeal, bool)> = {
+            let mut seals = bs.seals.lock();
+            let mut out = Vec::new();
+            while let Some(p) = seals.first() {
+                let ok = match self.be.event_query(&p.done) {
+                    Ok(true) => true,
+                    Ok(false) => break,
+                    Err(e) => {
+                        tracing::warn!(error = %e, "kv store: copy event failed");
+                        false
+                    }
+                };
+                out.push((seals.remove(0), ok));
+            }
+            out
+        };
+        for (p, ok) in finished {
+            if ok {
+                bs.store.seal_ids(&p.ids);
+                drop(p.holds);
+            } else {
+                // Never served; the blocks a failed copy may still touch stay pinned.
+                bs.store.fail_ids(&p.ids);
+                for hold in p.holds {
+                    hold.abandon();
+                }
+            }
+            bs.spare_events.lock().push(p.done);
+        }
     }
 
     /// Gather the boundary `handle` into slot `b`'s rings and tracks. Inside a launch window
     /// the copy is drained by the step and the blocks stay held until then.
     pub(super) fn blocks_gather(&self, b: usize, handle: u64) -> Result<()> {
         let t0 = std::time::Instant::now();
+        self.blocks_reap_seals();
         let (v, _) = self.vmm_prefix().expect("block gather without prefix vmm");
         let bs = v.blocks.as_ref().expect("block gather without store");
         let plan = bs
@@ -599,16 +792,22 @@ impl GpuEngine {
             .cloned()
             .ok_or_else(|| RuntimeError::Rejected("kv store: boundary vanished".into()))?;
         let ids: Vec<BlockId> = plan.iter().map(|&(_, _, id)| id).collect();
-        let hold = bs.store.hold(ids);
+        let mut srcs = Vec::with_capacity(ids.len());
+        let hold = bs.store.hold_sources(ids, &mut srcs)?;
         let mut fenced = 0u64;
+        // The recurrent state a first packed prefill reads from the block itself.
+        let defer = bs
+            .state_defer
+            .get()
+            .filter(|d| !d.is_empty() && bs.kernel.is_some());
+        let mut deferred: Option<(BlockId, u64)> = None;
         let copied = (|| {
-            let mut segs = Vec::new();
-            for &(class, row0, id) in &plan {
+            let mut descs: [Vec<Desc>; RANGES] = Default::default();
+            for (&(class, row0, id), src) in plan.iter().zip(&srcs) {
                 // The kernel reads a host-resident block in place (device-mapped tier) and a
                 // restoring one behind its copy fence; the memcpy fallback needs it on the
                 // device.
                 let va = if bs.kernel.is_some() {
-                    let src = bs.store.gather_src(id)?;
                     if let Some(fence) = src.fence {
                         self.be.fence_wait_on(fence, &self.stream)?;
                         fenced += 1;
@@ -617,14 +816,21 @@ impl GpuEngine {
                 } else {
                     bs.store.ensure_device(id)?
                 };
-                self.block_segments(b, class, row0, va, false, &mut segs);
+                let range = if class == Class::State && defer.is_some() && !src.from_host {
+                    deferred = Some((id, va));
+                    STATE_REST
+                } else {
+                    class.index()
+                };
+                descs[range].push(self.block_desc(b, class, row0, va));
             }
-            self.run_segments(b, &segs)
+            self.run_blocks(&descs, false)
         })();
         // Inside a launch window a successful gather is drained by the step
-        // (`flush_deferred_attach` drops the holds); every other outcome drains here.
+        // (`flush_deferred_attach` drops the holds); outside one the holds retire behind an
+        // event (consumers read the slot in stream order); a failure drains here.
         let mut sync_us = 0u64;
-        let copied = if copied.is_ok() && self.window_open {
+        let copied = if copied.is_ok() {
             copied
         } else {
             let ts = std::time::Instant::now();
@@ -632,9 +838,21 @@ impl GpuEngine {
             sync_us = ts.elapsed().as_micros() as u64;
             r
         };
+        if let (Ok(()), Some((id, va)), Some(left)) = (&copied, deferred, defer) {
+            let hold = bs.store.hold(vec![id]);
+            let old = bs.pending_state.lock()[b].replace(PendingState {
+                hold,
+                va,
+                left: left.clone(),
+            });
+            if let Some(old) = old {
+                self.blocks_release_after(old.hold);
+            }
+        }
         match copied {
             Ok(()) if self.window_open => bs.held.lock()[b].push(hold),
-            _ => drop(hold),
+            Ok(()) => self.blocks_release_after(hold),
+            Err(_) => drop(hold),
         }
         copied?;
         let mut st = bs.stats.lock();
@@ -648,104 +866,179 @@ impl GpuEngine {
         Ok(())
     }
 
+    /// Whether the boundary `handle` names still has blocks restoring from the host tier.
+    pub(super) fn blocks_restoring(&self, handle: u64) -> bool {
+        let Some(bs) = self.kv_blocks() else {
+            return false;
+        };
+        let Some(plan) = bs.handles.lock().get(&handle).cloned() else {
+            return false;
+        };
+        let ids: Vec<BlockId> = plan.iter().map(|&(_, _, id)| id).collect();
+        bs.store.restoring_any(&ids)
+    }
+
     pub(super) fn blocks_unhold(&self, b: usize) {
         if let Some(bs) = self.kv_blocks() {
             bs.unhold_slot(b);
         }
     }
 
-    /// The segments between slot `b`'s cache tensors and one block (`class`, rows from
-    /// `row0`) at `va`; `to_block` picks the direction. Layout per class, in this order:
-    /// window = `[slide layer][K,V][head][32 rows][hd]` then `[slide layer][Ks,Vs][head][32] f32`;
-    /// tail = `[track][head][32 rows][hd]` then `[full layer][Ks,Vs][head][32] f32`;
-    /// scale = `[full layer][Ks,Vs][head][block_rows] f32`.
-    fn block_segments(
-        &self,
-        b: usize,
-        class: Class,
-        row0: u32,
-        va: u64,
-        to_block: bool,
-        out: &mut Vec<Seg>,
-    ) {
-        let (v, kv) = self
-            .vmm_prefix()
-            .expect("block segments without prefix vmm");
-        let g = kv.geometry();
-        let mut off = va;
-        let mut seg = |dev: u64, bytes: u64| {
-            let (src, dst) = if to_block { (dev, off) } else { (off, dev) };
-            out.push(Seg {
-                src,
-                dst,
-                bytes: bytes as u32,
-                pad: 0,
-            });
-            off += bytes;
-        };
-        let rows = u64::from(ROWS_PER_BLOCK);
-        let r0 = u64::from(row0);
-        match class {
+    /// The descriptor of one block of slot `b` at `va` (`class`, rows from `row0`).
+    fn block_desc(&self, b: usize, class: Class, row0: u32, va: u64) -> Desc {
+        let row = match class {
             Class::Window => {
-                let hd_b = u64::from(g.hd_slide * g.elem_slide);
-                let ring = v.ring;
-                let slot_row = r0 % ring;
-                for &(ik, iv, stride) in &v.slide {
-                    for idx in [ik, iv] {
-                        let base = self.devp[idx].base + b as u64 * stride;
-                        for h in 0..u64::from(g.kvh_slide) {
-                            seg(base + (h * ring + slot_row) * hd_b, rows * hd_b);
-                        }
-                    }
-                }
-                for &(sk, sv) in &v.slide_scale {
-                    for idx in [sk, sv] {
-                        let base =
-                            self.devp[idx].base + b as u64 * u64::from(g.kvh_slide) * ring * 4;
-                        for h in 0..u64::from(g.kvh_slide) {
-                            seg(base + (h * ring + slot_row) * 4, rows * 4);
-                        }
+                let (v, _) = self.vmm_prefix().expect("window block without prefix vmm");
+                (u64::from(row0) % v.ring) as u32
+            }
+            Class::Tail | Class::Scale => row0,
+            Class::State => 0,
+        };
+        Desc {
+            block: va,
+            row,
+            slot: b as u32,
+        }
+    }
+
+    /// The runs of each class between a slot's cache tensors and one block, in the block's
+    /// byte order: window = `[slide layer][K,V][head][32 rows][hd]` then
+    /// `[slide layer][Ks,Vs][head][32] f32`; tail = `[track][head][32 rows][hd]` then
+    /// `[full layer][Ks,Vs][head][32] f32`; scale = `[full layer][Ks,Vs][head][block_rows] f32`;
+    /// state = every state tensor's slot bytes, in `STATE_CHUNK` pieces.
+    fn block_layouts(&self) -> Vec<Vec<Layout>> {
+        let (v, kv) = self.vmm_prefix().expect("block layouts without prefix vmm");
+        let g = kv.geometry();
+        let rows = u64::from(ROWS_PER_BLOCK);
+        let mut out: Vec<Vec<Layout>> = vec![Vec::new(); RANGES];
+        let push =
+            |list: &mut Vec<Layout>, dev: u64, slot_stride: u64, row_bytes: u64, bytes: u64| {
+                let block_off = list
+                    .last()
+                    .map_or(0, |l: &Layout| u64::from(l.block_off) + u64::from(l.bytes));
+                let fit =
+                    |v: u64| u32::try_from(v).expect("kv store: a block layout exceeds 4 GiB");
+                list.push(Layout {
+                    dev,
+                    slot_stride,
+                    row_bytes: fit(row_bytes),
+                    block_off: fit(block_off),
+                    bytes: fit(bytes),
+                    pad: 0,
+                });
+            };
+        {
+            let list = &mut out[Class::Window.index()];
+            let hd_b = u64::from(g.hd_slide * g.elem_slide);
+            let ring = v.ring;
+            for &(ik, iv, stride) in &v.slide {
+                for idx in [ik, iv] {
+                    for h in 0..u64::from(g.kvh_slide) {
+                        push(
+                            list,
+                            self.devp[idx].base + h * ring * hd_b,
+                            stride,
+                            hd_b,
+                            rows * hd_b,
+                        );
                     }
                 }
             }
-            Class::Tail => {
-                let row_bytes = u64::from(g.hd_full * g.elem);
-                let ctx = u64::from(g.max_ctx);
-                for &(index, _, _) in &v.tensor_tracks {
-                    for h in 0..u64::from(g.kvh_full) {
-                        let dev = self.devp[index].base
-                            + ((b as u64 * u64::from(g.kvh_full) + h) * ctx + r0) * row_bytes;
-                        seg(dev, rows * row_bytes);
+            let scale_stride = u64::from(g.kvh_slide) * ring * 4;
+            for &(sk, sv) in &v.slide_scale {
+                for idx in [sk, sv] {
+                    for h in 0..u64::from(g.kvh_slide) {
+                        push(
+                            list,
+                            self.devp[idx].base + h * ring * 4,
+                            scale_stride,
+                            4,
+                            rows * 4,
+                        );
                     }
-                }
-                for &(sk, sv) in &v.full_scale {
-                    for idx in [sk, sv] {
-                        let base = self.devp[idx].base + b as u64 * u64::from(g.kvh_full) * ctx * 4;
-                        for h in 0..u64::from(g.kvh_full) {
-                            seg(base + (h * ctx + r0) * 4, rows * 4);
-                        }
-                    }
-                }
-            }
-            Class::Scale => {
-                let ctx = u64::from(g.max_ctx);
-                let n = u64::from(kv.block_rows());
-                for &(sk, sv) in &v.full_scale {
-                    for idx in [sk, sv] {
-                        let base = self.devp[idx].base + b as u64 * u64::from(g.kvh_full) * ctx * 4;
-                        for h in 0..u64::from(g.kvh_full) {
-                            seg(base + (h * ctx + r0) * 4, n * 4);
-                        }
-                    }
-                }
-            }
-            Class::State => {
-                let bs = v.blocks.as_ref().expect("state class needs the store");
-                for &(index, per_slot) in &bs.state_tensors {
-                    seg(self.devp[index].base + b as u64 * per_slot, per_slot);
                 }
             }
         }
+        let ctx = u64::from(g.max_ctx);
+        {
+            let list = &mut out[Class::Tail.index()];
+            let row_bytes = u64::from(g.hd_full * g.elem);
+            let stride = u64::from(g.kvh_full) * ctx * row_bytes;
+            for &(index, _, _) in &v.tensor_tracks {
+                for h in 0..u64::from(g.kvh_full) {
+                    push(
+                        list,
+                        self.devp[index].base + h * ctx * row_bytes,
+                        stride,
+                        row_bytes,
+                        rows * row_bytes,
+                    );
+                }
+            }
+            for &(sk, sv) in &v.full_scale {
+                for idx in [sk, sv] {
+                    for h in 0..u64::from(g.kvh_full) {
+                        push(
+                            list,
+                            self.devp[idx].base + h * ctx * 4,
+                            u64::from(g.kvh_full) * ctx * 4,
+                            4,
+                            rows * 4,
+                        );
+                    }
+                }
+            }
+        }
+        {
+            let list = &mut out[Class::Scale.index()];
+            let n = u64::from(kv.block_rows());
+            for &(sk, sv) in &v.full_scale {
+                for idx in [sk, sv] {
+                    for h in 0..u64::from(g.kvh_full) {
+                        push(
+                            list,
+                            self.devp[idx].base + h * ctx * 4,
+                            u64::from(g.kvh_full) * ctx * 4,
+                            4,
+                            n * 4,
+                        );
+                    }
+                }
+            }
+        }
+        if let Some(bs) = v.blocks.as_ref() {
+            let defer = bs.state_defer.get().map_or(&[][..], Vec::as_slice);
+            for &(index, per_slot) in &bs.state_tensors {
+                let mut off = 0;
+                while off < per_slot {
+                    let bytes = STATE_CHUNK.min(per_slot - off);
+                    push(
+                        &mut out[Class::State.index()],
+                        self.devp[index].base + off,
+                        per_slot,
+                        0,
+                        bytes,
+                    );
+                    let entry = *out[Class::State.index()].last().expect("just pushed");
+                    if !defer.iter().any(|&(i, _)| i == index) {
+                        out[STATE_REST].push(entry);
+                    }
+                    off += bytes;
+                }
+            }
+            if let Some(init) = self.recurrent_initstate.filter(|_| !defer.is_empty()) {
+                // Request `i` (descriptor slot) of the scratch from its source state.
+                let stride = crate::device::cuda::qwen_gdn::STATE_BYTES;
+                let list = &mut out[STATE_INIT];
+                let mut off = 0;
+                while off < stride {
+                    let bytes = STATE_CHUNK.min(stride - off);
+                    push(list, self.devp[init].base + off, stride, 0, bytes);
+                    off += bytes;
+                }
+            }
+        }
+        out
     }
 
     /// Recurrent models: the chunk from `c0` must end exactly at the prompt-end boundary so
@@ -846,59 +1139,229 @@ impl GpuEngine {
         self.publish_boundary(b, pos, kind);
     }
 
-    /// Run a segment table on the engine stream: one kernel launch over slot `b`'s table
-    /// buffer, or a memcpy loop without the kernel. Drained by the caller.
-    fn run_segments(&self, b: usize, segs: &[Seg]) -> Result<()> {
-        let bs = self.kv_blocks().expect("segments without store");
-        {
-            let mut st = bs.stats.lock();
-            st.segments += segs.len() as u64;
-        }
-        let Some(f) = bs.kernel else {
-            for s in segs {
-                self.be
-                    .memcpy_dtod_async(s.dst, s.src, u64::from(s.bytes), &self.stream)?;
+    /// The state tensors a packed GDN prefill gathers into its initial-state scratch (the
+    /// declared state operands of the chain's external GDN segments), when the chain packs; their
+    /// offsets in a state block. Set once, before the layouts are built.
+    fn init_state_defer(&self) {
+        let Some(bs) = self.kv_blocks() else {
+            return;
+        };
+        bs.state_defer.get_or_init(|| {
+            let packs = self.qwen_prefill.as_ref().is_some_and(|g| g.varlen())
+                && self.recurrent_initstate.is_some();
+            if !packs || bs.state.is_none() {
+                return Vec::new();
             }
-            bs.stats.lock().memcpy_segments += segs.len() as u64;
+            let operands: Vec<usize> = self
+                .prefill
+                .iter()
+                .flat_map(|p| p.qwen_segments.iter().flatten())
+                .map(|inst| inst.t[6] as usize)
+                .collect();
+            let mut off = 0u64;
+            let mut out = Vec::new();
+            for &(index, per_slot) in &bs.state_tensors {
+                if per_slot == crate::device::cuda::qwen_gdn::STATE_BYTES
+                    && operands.contains(&index)
+                {
+                    out.push((index, off));
+                }
+                off += per_slot;
+            }
+            out
+        });
+    }
+
+    /// Where slot `b`'s first packed prefill reads `tensor`'s initial state from: the held
+    /// block, when the attach left it there.
+    pub(super) fn state_source(&self, b: usize, tensor: usize) -> Option<u64> {
+        let bs = self.kv_blocks()?;
+        let pending = bs.pending_state.lock();
+        let p = pending[b].as_ref()?;
+        p.left
+            .iter()
+            .find(|&&(i, _)| i == tensor)
+            .map(|&(_, off)| p.va + off)
+    }
+
+    /// Slot `b`'s first packed prefill read `tensor` from the block (queued on the engine
+    /// stream): the slot holds its state from here on.
+    pub(super) fn state_consumed(&self, b: usize, tensor: usize) {
+        let Some(bs) = self.kv_blocks() else {
+            return;
+        };
+        let done = {
+            let mut pending = bs.pending_state.lock();
+            let Some(p) = pending[b].as_mut() else {
+                return;
+            };
+            p.left.retain(|&(i, _)| i != tensor);
+            if p.left.is_empty() {
+                pending[b].take()
+            } else {
+                None
+            }
+        };
+        if let Some(p) = done {
+            self.blocks_release_after(p.hold);
+        }
+    }
+
+    /// Copy the state tensors slot `b` still reads from its attached block (`tensor`, or every
+    /// one) into the slot: whatever reads the slot's state other than the packed prefill's
+    /// gather (an unpacked chunk, a rider step, a publish) reads it there.
+    pub(crate) fn state_materialize(&self, b: usize, tensor: Option<usize>) -> Result<()> {
+        let Some(bs) = self.kv_blocks() else {
             return Ok(());
         };
-        let bytes = std::mem::size_of_val(segs);
-        let mut tables = bs.tables.lock();
-        let table = match tables[b].as_mut() {
-            Some(t) if t.cap >= segs.len() => t,
-            _ => {
-                let cap = segs.len().next_power_of_two().max(1024);
-                let host = self
-                    .be
-                    .host_alloc_pinned(cap * std::mem::size_of::<Seg>())?;
-                let dev = TableDev::alloc(&self.be, (cap * std::mem::size_of::<Seg>()) as u64)?;
-                tables[b] = Some(Table { host, dev, cap });
-                tables[b].as_mut().expect("just set")
+        let mut pending = bs.pending_state.lock();
+        let Some(p) = pending[b].as_mut() else {
+            return Ok(());
+        };
+        for &(index, off) in &p.left {
+            if tensor.is_some_and(|t| t != index) {
+                continue;
+            }
+            let per_slot = bs
+                .state_tensors
+                .iter()
+                .find(|&&(i, _)| i == index)
+                .map(|&(_, bytes)| bytes)
+                .expect("deferred tensor is a state tensor");
+            self.be.memcpy_dtod_async(
+                self.devp[index].base + b as u64 * per_slot,
+                p.va + off,
+                per_slot,
+                &self.stream,
+            )?;
+        }
+        p.left.retain(|&(i, _)| tensor.is_some_and(|t| t != i));
+        let done = if p.left.is_empty() {
+            pending[b].take()
+        } else {
+            None
+        };
+        drop(pending);
+        if let Some(p) = done {
+            self.blocks_release_after(p.hold);
+        }
+        Ok(())
+    }
+
+    /// Slot `b` starts a new sequence: its attached block is no longer read.
+    pub(crate) fn state_drop(&self, b: usize) {
+        let Some(bs) = self.kv_blocks() else {
+            return;
+        };
+        let p = bs.pending_state.lock()[b].take();
+        if let Some(p) = p {
+            self.blocks_release_after(p.hold);
+        }
+    }
+
+    /// The packed prefill's initial-state gather when a scanned request reads its state from
+    /// an attached block: request `i` of the contiguous scratch from `srcs[i]` (a block or a
+    /// slot state), one launch.
+    pub(super) fn state_init_gather(&self, srcs: &[u64]) -> Result<()> {
+        let mut descs: [Vec<Desc>; RANGES] = Default::default();
+        descs[STATE_INIT] = srcs
+            .iter()
+            .enumerate()
+            .map(|(i, &block)| Desc {
+                block,
+                row: 0,
+                slot: i as u32,
+            })
+            .collect();
+        self.run_blocks(&descs, false)
+    }
+
+    /// Run the descriptors of each class on the engine stream: one `plow_kv_blockcopy` launch
+    /// per class and `DESCS` descriptors (the driver copies the parameters at launch, so nothing
+    /// outlives the call), or the memcpy loop without the kernel. Drained by the caller.
+    fn run_blocks(&self, descs: &[Vec<Desc>; RANGES], to_block: bool) -> Result<()> {
+        let bs = self.kv_blocks().expect("block copy without store");
+        let layouts = match bs.layouts.get() {
+            Some(l) => l,
+            None => {
+                self.init_state_defer();
+                let lists = self.block_layouts();
+                let mut host = Vec::new();
+                let mut ranges = [(0u32, 0u32); RANGES];
+                for (c, list) in lists.into_iter().enumerate() {
+                    ranges[c] = (host.len() as u32, list.len() as u32);
+                    host.extend(list);
+                }
+                let dev = match bs.kernel {
+                    Some(_) if !host.is_empty() => {
+                        let bytes = std::mem::size_of_val(host.as_slice());
+                        let dev = TableDev::alloc(&self.be, bytes as u64)?;
+                        // SAFETY: `Layout` is plain `repr(C)` data, `bytes` long.
+                        let raw = unsafe {
+                            std::slice::from_raw_parts(host.as_ptr() as *const u8, bytes)
+                        };
+                        self.be.memcpy_htod(dev.va, raw)?;
+                        Some(dev)
+                    }
+                    _ => None,
+                };
+                let _ = bs.layouts.set(Layouts { dev, host, ranges });
+                bs.layouts.get().expect("just set")
             }
         };
-        // SAFETY: `Seg` is plain `repr(C)` data and the pinned buffer holds `cap >= len` of it.
-        unsafe {
-            std::ptr::copy_nonoverlapping(
-                segs.as_ptr() as *const u8,
-                table.host.as_mut_slice().as_mut_ptr(),
-                bytes,
-            );
+        let mut segments = 0u64;
+        let mut launches = 0u64;
+        for (range, d) in descs.iter().enumerate() {
+            let (first, count) = layouts.ranges[range];
+            if d.is_empty() || count == 0 {
+                continue;
+            }
+            segments += d.len() as u64 * u64::from(count);
+            match (bs.kernel, layouts.dev.as_ref()) {
+                (Some(f), Some(dev)) => {
+                    let mut args = bs.args.lock();
+                    for chunk in d.chunks(DESCS) {
+                        args.layout =
+                            dev.va + u64::from(first) * std::mem::size_of::<Layout>() as u64;
+                        args.to_block = u32::from(to_block);
+                        args.n = chunk.len() as u32;
+                        args.d[..chunk.len()].copy_from_slice(chunk);
+                        let mut params = [&mut **args as *mut CopyArgs as *mut c_void];
+                        self.be.launch_kernel_grid(
+                            f,
+                            [count, chunk.len() as u32, 1],
+                            SEGCOPY_BLOCK,
+                            0,
+                            &mut params,
+                            Some(&self.stream),
+                        )?;
+                        launches += 1;
+                    }
+                }
+                _ => {
+                    let runs = &layouts.host[first as usize..(first + count) as usize];
+                    for desc in d {
+                        for l in runs {
+                            let dev = l.dev
+                                + u64::from(desc.slot) * l.slot_stride
+                                + u64::from(desc.row) * u64::from(l.row_bytes);
+                            let blk = desc.block + u64::from(l.block_off);
+                            let (dst, src) = if to_block { (blk, dev) } else { (dev, blk) };
+                            self.be.memcpy_dtod_async(
+                                dst,
+                                src,
+                                u64::from(l.bytes),
+                                &self.stream,
+                            )?;
+                        }
+                    }
+                    bs.stats.lock().memcpy_segments += d.len() as u64 * u64::from(count);
+                }
+            }
         }
-        VmmOps::copy_htod(
-            &*self.be,
-            table.dev.va,
-            table.host.as_ptr() as u64,
-            bytes as u64,
-        )?;
-        let mut table_ptr = table.dev.va;
-        let mut n = segs.len() as u32;
-        let mut params = [
-            &mut table_ptr as *mut u64 as *mut c_void,
-            &mut n as *mut u32 as *mut c_void,
-        ];
-        self.be
-            .launch_kernel(f, n, SEGCOPY_BLOCK, 0, &mut params, Some(&self.stream))?;
-        bs.stats.lock().launches += 1;
+        let mut st = bs.stats.lock();
+        st.segments += segments;
+        st.launches += launches;
         Ok(())
     }
 }
@@ -1001,8 +1464,16 @@ mod tests {
     }
 
     #[test]
-    fn segment_layout_is_repr_c_24_bytes() {
-        assert_eq!(std::mem::size_of::<Seg>(), 24);
+    fn copy_parameters_match_the_kernel_and_fit_the_launch_limit() {
+        assert_eq!(std::mem::size_of::<Layout>(), 32);
+        assert_eq!(std::mem::size_of::<Desc>(), 16);
+        assert_eq!(std::mem::size_of::<CopyArgs>(), 16 + 16 * DESCS);
+        // CUDA 12.1+ kernel parameter limit.
+        assert!(std::mem::size_of::<CopyArgs>() <= 32764);
+        assert!(SEGCOPY_PTX.contains(&format!(
+            "plow_kv_blockcopy_param_0[{}]",
+            std::mem::size_of::<CopyArgs>()
+        )));
     }
 
     /// Device slots only: enough for the dependency set.

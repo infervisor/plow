@@ -218,6 +218,11 @@ impl GpuEngine {
                     "CUDA token batch cannot verify on a recurrent chain".into(),
                 ));
             }
+            // Only a prefill chunk reads an attached state from its block; a decode or verify row
+            // reads the slot.
+            for request in requests.iter().filter(|r| r.phase != Phase::Prefill) {
+                self.state_materialize(request.slot as usize, None)?;
+            }
             if requests.iter().any(|request| {
                 request.state_slot != request.slot
                     || request.selection != Selection::default()
@@ -600,6 +605,7 @@ impl GpuEngine {
     /// Complete the restores a launch window deferred: drain the stream, then release their
     /// snapshot holds. A failed drain keeps the holds: the copies' completion is unproven.
     pub(crate) fn flush_deferred_attach(&mut self) -> Result<()> {
+        self.blocks_reap_seals();
         if self.deferred_attach.is_empty() {
             return Ok(());
         }
