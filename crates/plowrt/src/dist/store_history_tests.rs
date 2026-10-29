@@ -3,7 +3,7 @@
 
 use super::*;
 
-const REF: &str = "dist.infervisor.ai/infervisor/kimi-k3";
+const REF: &str = "pdist.infervisor.ai/infervisor/kimi-k3";
 
 fn tmp(name: &str) -> PathBuf {
     let p = std::env::temp_dir().join(format!(

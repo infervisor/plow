@@ -23,6 +23,9 @@ pub mod pull;
 #[cfg(feature = "dist")]
 pub mod push;
 pub mod reference;
+/// `plowrt push-runtime`: record released binaries in a registry. Publish-side only.
+#[cfg(feature = "dist")]
+pub mod runtime;
 pub mod sign;
 pub mod sink;
 pub mod store;

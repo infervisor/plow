@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -42,6 +43,17 @@ def need(cond: bool, msg: str) -> None:
         raise Invalid(msg)
 
 
+def same_value(requested: object, observed: object) -> bool:
+    """A `{out}`, `{repo}` or `{hf:…}` placeholder names a path on the build
+    host, which the knob record holds expanded: match on the part the recipe
+    spells after it."""
+    want, got = str(requested), str(observed)
+    if want == got:
+        return True
+    m = re.match(r"\{(out|repo|hf:[^}]+)\}(.*)", want)
+    return bool(m) and got.endswith(m.group(2))
+
+
 def exact_map(requested: dict, observed: dict, surface: str) -> None:
     """Every requested knob must be observed with the same value.
 
@@ -52,7 +64,7 @@ def exact_map(requested: dict, observed: dict, surface: str) -> None:
     for knob, value in requested.items():
         need(knob in observed, f"{surface}: recipe requests {knob} but the build recorded no such knob")
         need(
-            str(observed[knob]) == str(value),
+            same_value(value, observed[knob]),
             f"{surface}: contradictory {knob} — recipe says {value!r}, build recorded "
             f"{observed[knob]!r}",
         )
@@ -101,8 +113,38 @@ def check_rung_env(over: dict, build_json: dict, observed: dict) -> None:
                 )
 
 
-def check_emit(recipe: dict, build_json: dict) -> list[str]:
-    """`[emit].env` against `build.json`'s own knob record."""
+# Emit env keys that locate a tool on the build host rather than shape the
+# packet; a recipe states them for the build command, the checker ignores them.
+MACHINE_PATH_KNOBS = ("PLOW_VERIFY_BIN",)
+# nvcc's own environment: `[emit.env]` may state it (the -D set the emitted
+# kernels are compiled with). plowc's knob record does not carry it; the
+# campaign records the environment it ran plowc with in `build-record.json`
+# under `compilation.emit_env`, which is what it is checked against.
+TOOLCHAIN_ENV_KNOBS = ("NVCC_APPEND_FLAGS", "NVCC_PREPEND_FLAGS")
+
+
+def check_toolchain_env(requested: dict, record: dict | None) -> list[str]:
+    """The nvcc environment `[emit.env]` states, against the campaign's build
+    record: verified when the record is there, reported when it is not."""
+    notes = []
+    recorded = ((record or {}).get("compilation") or {}).get("emit_env")
+    for knob in TOOLCHAIN_ENV_KNOBS:
+        if knob not in requested:
+            continue
+        if recorded is None:
+            notes.append(f"emit: {knob} is not in the knob record and no build-record.json is beside the bundle — unverified")
+            continue
+        need(knob in recorded, f"emit: recipe requests {knob} but the build ran plowc with no such variable")
+        need(
+            str(recorded[knob]) == str(requested[knob]),
+            f"emit: contradictory {knob} — recipe says {requested[knob]!r}, build recorded {recorded[knob]!r}",
+        )
+    return notes
+
+
+def check_emit(recipe: dict, build_json: dict, record: dict | None = None) -> list[str]:
+    """`[emit].env` against `build.json`'s own knob record (and the nvcc
+    environment against the campaign's build record)."""
     rungs = recipe_rung_env(recipe)
     ec = build_json.get("emit_config")
     need(ec or not rungs, "emit: the recipe states [emit.rung_env] but build.json has no `emit_config` to verify it")
@@ -123,13 +165,23 @@ def check_emit(recipe: dict, build_json: dict) -> list[str]:
         observed = {k: v for k, v in observed.items() if k != "PLOW_SPEC_DRAFT_DIR"}
         derived.pop("PLOW_SPEC_DRAFT_DIR")
     requested = {**derived, **((recipe.get("emit") or {}).get("env") or {})}
+    # Machine paths are not decisions: `PLOW_VERIFY_BIN` names where the Lean
+    # verifier lives on the build host and the knob record never carries it
+    # (the receipts beside the packet are what prove the verification ran).
+    for machine in MACHINE_PATH_KNOBS:
+        requested.pop(machine, None)
+        observed.pop(machine, None)
+    notes_tool = check_toolchain_env(requested, record)
+    for knob in TOOLCHAIN_ENV_KNOBS:
+        requested.pop(knob, None)
+        observed.pop(knob, None)
     exact_map(requested, observed, "emit")
     check_rung_env(rungs, build_json, observed)
 
     # The other direction, as a report rather than a refusal: a knob the build
     # replayed but the recipe does not mention is a reproduction gap.
     missing = sorted(set(observed) - set(requested) - {rung_env.ENV})
-    return [f"emit: build replayed {k}={observed[k]!r}, recipe does not state it" for k in missing]
+    return notes_tool + [f"emit: build replayed {k}={observed[k]!r}, recipe does not state it" for k in missing]
 
 
 # Knobs whose effect lands under another define. `build_gfx942.sh` turns
@@ -305,8 +357,10 @@ def check(recipe_path: Path, bundle: Path | None, objects: Path | None, strict: 
     if bundle:
         bj = rc.load_json(bundle / "build.json") if (bundle / "build.json").exists() else {}
         wj = rc.load_json(bundle / "weights.json") if (bundle / "weights.json").exists() else {}
+        rec_path = bundle.parent / "build-record.json"
+        rec = rc.load_json(rec_path) if rec_path.exists() else None
         check_target(recipe, bj, wj)
-        notes += check_emit(recipe, bj)
+        notes += check_emit(recipe, bj, rec)
     if objects:
         dp = objects / "build_defines.json"
         notes += check_objects(recipe, rc.load_json(dp) if dp.exists() else {})
@@ -416,6 +470,11 @@ def self_test() -> None:
         p = write(good)
         notes = check(p, bundle, objects, strict=False)
         assert not any("contradictory" in n for n in notes), notes
+        # A build-host path placeholder matches the path the record expanded it to.
+        assert same_value("{out}/prep/s3gen", "/nvme/build/chatterbox-h100/prep/s3gen")
+        assert same_value("{hf:ResembleAI/chatterbox}/t3", "/hf/hub/models--x/snapshots/abc/t3")
+        assert not same_value("{out}/prep/s3gen", "/nvme/build/other/prep/codec")
+        assert not same_value("1", "0")
         # PLOW_MXFP4 was replayed but not stated: reported, not fatal.
         assert any("PLOW_MXFP4" in n for n in notes), notes
 

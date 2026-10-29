@@ -747,18 +747,21 @@ fn bundle_rejects_structural_damage() {
 }
 
 #[test]
-fn unknown_fields_are_rejected_across_every_schema() {
+fn unknown_fields_are_ignored_across_every_schema() {
+    // A field added for a newer client must not make this build refuse the
+    // whole document: a registry is read by every plowrt ever released.
     let mut raw = serde_json::to_value(bundle()).unwrap();
     raw["surprise"] = serde_json::json!(1);
-    assert!(serde_json::from_value::<Bundle>(raw).is_err());
+    assert_eq!(serde_json::from_value::<Bundle>(raw).unwrap(), bundle());
 
     let mut raw = serde_json::to_value(objset()).unwrap();
     raw["objects"][0]["surprise"] = serde_json::json!(1);
-    assert!(serde_json::from_value::<ObjSet>(raw).is_err());
+    assert_eq!(serde_json::from_value::<ObjSet>(raw).unwrap(), objset());
 
     let mut raw = serde_json::to_value(index()).unwrap();
     raw["variants"][0]["surprise"] = serde_json::json!(1);
-    assert!(serde_json::from_value::<ModelIndex>(raw).is_err());
+    raw["variants"][0]["target"]["surprise"] = serde_json::json!({"nested": true});
+    assert_eq!(serde_json::from_value::<ModelIndex>(raw).unwrap(), index());
 }
 
 #[test]
@@ -928,4 +931,173 @@ fn variant_status_and_supersedes_invariants() {
     let mut v = base;
     v.parallel.n = 0;
     assert!(v.validate().is_err());
+}
+
+fn apple(sku: &str, cores: u32, mem: u64) -> Target {
+    Target {
+        vendor: "apple".into(),
+        isa: "metal3".into(),
+        sku: sku.into(),
+        units: cores,
+        mem_bytes: mem,
+    }
+}
+
+fn apple_live(sku: &str, cores: u32, mem: u64) -> LiveTarget {
+    LiveTarget {
+        vendor: "apple".into(),
+        isa: "metal3".into(),
+        sku: Some(sku.into()),
+        units: cores,
+        mem_bytes: mem,
+        gpus: 1,
+        toolchain: None,
+    }
+}
+
+#[test]
+fn an_apple_build_runs_on_any_chip_of_its_family_with_a_warning_off_its_own() {
+    let gib = 1u64 << 30;
+    let pro = variant(
+        "metal3-apple-m4-pro-tp1-2k",
+        1,
+        apple("Apple M4 Pro", 16, 24 * gib),
+        "tp",
+        1,
+    );
+    // On an M4 Max: selected, with a warning about the idle cores.
+    let table = assess(
+        std::slice::from_ref(&pro),
+        &apple_live("Apple M4 Max", 32, 36 * gib),
+        &Constraints::default(),
+    );
+    assert!(table[0].ok(), "{:?}", table[0].reject);
+    assert!(
+        table[0].warns.iter().any(|w| w.contains("serial dispatch")),
+        "{:?}",
+        table[0].warns
+    );
+    // On a base M4 (10 cores, 16 GiB): the core count is no bar either, and
+    // the memory check still applies to a different SKU: 24 GiB of
+    // recommended working set was built for, 16 GiB is here.
+    let table = assess(
+        std::slice::from_ref(&pro),
+        &apple_live("Apple M4", 10, 16 * gib),
+        &Constraints::default(),
+    );
+    assert!(
+        matches!(table[0].reject, Some(Reject::Mem { .. })),
+        "{:?}",
+        table[0].reject
+    );
+    let table = assess(
+        std::slice::from_ref(&pro),
+        &apple_live("Apple M4", 10, 24 * gib),
+        &Constraints::default(),
+    );
+    assert!(table[0].ok(), "{:?}", table[0].reject);
+    // A newer family: an M5 Pro with the same core count runs it, and is
+    // only ranked by its SKU and core gap.
+    let table = assess(
+        std::slice::from_ref(&pro),
+        &apple_live("Apple M5 Pro", 20, 32 * gib),
+        &Constraints::default(),
+    );
+    assert!(table[0].ok(), "{:?}", table[0].reject);
+    // On its own chip: no warning at all.
+    let table = assess(
+        std::slice::from_ref(&pro),
+        &apple_live("Apple M4 Pro", 16, 24 * gib),
+        &Constraints::default(),
+    );
+    assert!(table[0].ok() && table[0].warns.is_empty(), "{:?}", table[0]);
+    // A native build beats a newer generation of another chip's build:
+    // generations count builds of one label, and the Pro build would run
+    // serially on a Max.
+    let mut pro_g2 = pro.clone();
+    pro_g2.generation = 2;
+    pro_g2.variant_id = "pro-g2".into();
+    pro_g2.manifest = "manifests/metal3-apple-m4-pro-tp1-2k@g2".into();
+    let mut max = variant(
+        "metal3-apple-m4-max-tp1-2k",
+        1,
+        apple("Apple M4 Max", 32, 36 * gib),
+        "tp",
+        1,
+    );
+    max.status = Status::Emits;
+    max.measured = None;
+    let vs = vec![pro.clone(), pro_g2.clone(), max];
+    let on_max = apple_live("Apple M4 Max", 32, 36 * gib);
+    let picked = select(&vs, &on_max, &Constraints::default()).unwrap();
+    assert_eq!(picked.label, "metal3-apple-m4-max-tp1-2k");
+    // On the Pro, its own label's newest generation.
+    let on_pro = apple_live("Apple M4 Pro", 16, 24 * gib);
+    let picked = select(&vs, &on_pro, &Constraints::default()).unwrap();
+    assert_eq!(
+        (picked.label.as_str(), picked.generation),
+        ("metal3-apple-m4-pro-tp1-2k", 2)
+    );
+    // An NVIDIA part with more SMs than the build is still refused: the grid is baked in.
+    let h100 = variant(
+        "sm90a-h100-tp1",
+        1,
+        target("sm_90a", "H100 SXM5", 132, 80 * gib),
+        "tp",
+        1,
+    );
+    let table = assess(
+        std::slice::from_ref(&h100),
+        &live("sm_90a", "RTX 6000 Pro Blackwell", 188, 96 * gib, 1),
+        &Constraints::default(),
+    );
+    assert_eq!(
+        table[0].reject,
+        Some(Reject::Units {
+            want: 132,
+            live: 188
+        })
+    );
+}
+
+#[test]
+fn on_a_larger_chip_the_nearest_build_wins() {
+    let gib = 1u64 << 30;
+    let base = variant(
+        "metal3-apple-m4-tp1-2k",
+        1,
+        apple("Apple M4", 10, 16 * gib),
+        "tp",
+        1,
+    );
+    let pro = variant(
+        "metal3-apple-m4-pro-tp1-2k",
+        1,
+        apple("Apple M4 Pro", 16, 24 * gib),
+        "tp",
+        1,
+    );
+    let max_ = variant(
+        "metal3-apple-m4-max-tp1-2k",
+        1,
+        apple("Apple M4 Max", 32, 36 * gib),
+        "tp",
+        1,
+    );
+    let vs = vec![base, pro, max_];
+    let pick = select(
+        &vs,
+        &apple_live("Apple M4 Max", 32, 36 * gib),
+        &Constraints::default(),
+    )
+    .unwrap();
+    assert_eq!(pick.label, "metal3-apple-m4-max-tp1-2k");
+    // An M4 Max with no build of its own takes the Pro build, not the base one.
+    let pick = select(
+        &vs[..2],
+        &apple_live("Apple M4 Max", 32, 36 * gib),
+        &Constraints::default(),
+    )
+    .unwrap();
+    assert_eq!(pick.label, "metal3-apple-m4-pro-tp1-2k");
 }

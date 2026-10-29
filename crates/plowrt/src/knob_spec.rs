@@ -529,7 +529,7 @@ pub fn is_removed_env(env: &str) -> bool {
 pub const RUNTIME: &[KnobSpec] = &[
     KnobSpec::new("rt.rt_checkpoint", Some("PLOW_CHECKPOINT"), Layer::Runtime, Domain::Str, UNSET, OPT_IN),
     KnobSpec::new("rt.plow_home", Some("PLOW_HOME"), Layer::Runtime, Domain::Str, UNSET, OPT_IN),
-    KnobSpec::new("rt.registry", Some("PLOW_REGISTRY"), Layer::Runtime, Domain::Str, Default::Static(Val::Str("dist.infervisor.ai")), OPT_IN),
+    KnobSpec::new("rt.registry", Some("PLOW_REGISTRY"), Layer::Runtime, Domain::Str, Default::Static(Val::Str("pdist.infervisor.ai")), OPT_IN),
     KnobSpec::new("rt.prefetch", Some("PLOW_PREFETCH"), Layer::Runtime, USIZE, Default::Static(Val::Nat(256)), OPT_IN),
     KnobSpec::new("rt.prefetch_threads", Some("PLOW_PREFETCH_THREADS"), Layer::Runtime, USIZE, Default::Static(Val::Nat(16)), OPT_IN),
     KnobSpec::new("rt.weight_slab", Some("PLOW_WEIGHT_SLAB"), Layer::Runtime, Domain::Bool, ON, PROMOTED),

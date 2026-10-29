@@ -1028,7 +1028,7 @@ subcommands. `serve` reads the local store and never the network; see
 | var | default | effect |
 |---|---|---|
 | `PLOW_HOME` / `--plow-home` | `$HOME/.plow` | Root of the local asset store: `blobs/sha256/` (content-addressed), `refs/` (pins), `bundles/` (materialized directories `--assets` receives), `checkpoints/` (the farms `prepare` builds). |
-| `PLOW_REGISTRY` / `--registry` | `dist.infervisor.ai` | Where a bare model reference resolves. A `file://` URL or an absolute path selects a local mirror and needs no HTTP client, which is how an air-gapped host and every test fetch. |
+| `PLOW_REGISTRY` / `--registry` | `pdist.infervisor.ai` | Where a bare model reference resolves. A `file://` URL or an absolute path selects a local mirror and needs no HTTP client, which is how an air-gapped host and every test fetch. |
 
 `PLOW_CHECKPOINT` / `--rt-checkpoint` (below) doubles as `load`'s default
 checkpoint location, because the weights a bundle needs are the same weights

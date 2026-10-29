@@ -1014,6 +1014,38 @@ fn a_target_that_ships_objects_needs_them_somewhere() {
     assert!(e.contains("no *.elf, *.cubin or *.co found"), "{e}");
 }
 
+/// The GDN prefill library is loaded from beside the packet, so it travels
+/// in the bundle under its own role; any other `.so` is still unclaimed.
+#[test]
+fn the_gdn_prefill_library_has_a_role_and_other_shared_objects_do_not() {
+    assert_eq!(classify("libplow_gdn_prefill.so"), Some("host_library"));
+    assert_eq!(classify("libsomething.so"), None);
+}
+
+/// Nothing records a compiler for a runtime-compiled target, so its recipe
+/// may omit `toolchain`; a CUDA recipe without one is still refused (see
+/// `a_recipe_missing_an_identity_field_is_refused_by_name`).
+#[test]
+fn a_runtime_compiled_recipe_needs_no_toolchain() {
+    let assets = speech_assets("apple-no-toolchain");
+    let recipe = MINIMAL
+        .replace("vendor = \"nvidia\"", "vendor = \"apple\"")
+        .replace("isa = \"sm_90a\"", "isa = \"m4\"")
+        .replace("sku = \"H100 SXM5\"", "sku = \"M4 Max\"")
+        .replace("toolchain = \"cuda-13.4+gcc-13\"\n", "");
+    assert!(!recipe.contains("toolchain"), "{recipe}");
+    let p = write_recipe(&tmp("apple-no-toolchain"), &recipe);
+    let g = generate(
+        &p,
+        &assets,
+        None,
+        Overrides::default(),
+        &BundleArgs::default(),
+    )
+    .unwrap();
+    assert!(g.objset.is_none());
+}
+
 /// Apple's Metal shaders compile on the serving machine from the packet, so its
 /// bundle carries no objset and must not be handed an object directory.
 #[test]
@@ -1159,6 +1191,25 @@ fn rung_overrides_are_pinned_by_digest_and_sorted() {
         assert_eq!(r.sha256, sha256_bytes(&canonical_json(rung).unwrap()));
     }
 
+    // A field this plowrt does not know is part of the bytes a client
+    // verifies, so it is part of the digest.
+    let (max, p, rung) = &paths[0];
+    let mut whole = serde_json::to_value(rung).unwrap();
+    whole["from_a_newer_packer"] = serde_json::json!(true);
+    let extended = canonical_json(&whole).unwrap();
+    std::fs::write(p, &extended).unwrap();
+    let b = build_bundle(
+        &assets,
+        &veena(),
+        Some(&objset),
+        &BundleArgs {
+            lowrung: vec![(*max, p.clone())],
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    assert_eq!(b.objset.unwrap().lowrung[0].sha256, sha256_bytes(&extended));
+
     // A duplicate width is a mistake, not a last-writer-wins override.
     let e = build_bundle(
         &assets,
@@ -1238,4 +1289,18 @@ fn every_recipe_in_the_tree_is_readable() {
         files.len(),
         refused.join("\n")
     );
+}
+
+#[test]
+fn a_sidecar_packet_and_its_receipts_are_bundled_by_suffix() {
+    assert_eq!(super::classify("model.pkt"), Some("packet"));
+    assert_eq!(super::classify("codec.pkt"), Some("codec_packet"));
+    assert_eq!(super::classify("encoder.pkt"), Some("sidecar_packet"));
+    assert_eq!(super::classify("s3gen.pkt"), Some("sidecar_packet"));
+    assert_eq!(
+        super::classify("encoder.lean-checks.json"),
+        Some("sidecar_checks")
+    );
+    assert_eq!(super::classify("lean-checks.json"), Some("packet_checks"));
+    assert_eq!(super::classify("notes.txt"), None);
 }
