@@ -1602,6 +1602,8 @@ pub const RAW_ENV: &[KnobSpec] = &[
     KnobSpec::new("env.PLOW_BUILD_FA_GQA2_PAIR", Some("PLOW_BUILD_FA_GQA2_PAIR"), Layer::RawEnv, Domain::Str, UNSET, OPT_IN),
     KnobSpec::new("env.PLOW_BUILD_FP8KV_FA", Some("PLOW_BUILD_FP8KV_FA"), Layer::RawEnv, Domain::Bool, OFF, OPT_IN),
     KnobSpec::new("env.PLOW_BUILD_FP8KV_GEMM", Some("PLOW_BUILD_FP8KV_GEMM"), Layer::RawEnv, Domain::Bool, OFF, OPT_IN),
+    KnobSpec::new("env.PLOW_BUILD_FA4_HD512", Some("PLOW_BUILD_FA4_HD512"), Layer::RawEnv, Domain::Bool, OFF, OPT_IN),
+    KnobSpec::new("env.PLOW_FA4_PY", Some("PLOW_FA4_PY"), Layer::RawEnv, Domain::Str, UNSET, OPT_IN),
     KnobSpec::new("env.PLOW_BUILD_GEMM_SMEPI", Some("PLOW_BUILD_GEMM_SMEPI"), Layer::RawEnv, Domain::Bool, OFF, OPT_IN),
     KnobSpec::new("env.PLOW_BUILD_FATLITE", Some("PLOW_BUILD_FATLITE"), Layer::RawEnv, Domain::Str, UNSET, OPT_IN),
     KnobSpec::new("env.PLOW_BUILD_FATLITE_MOE", Some("PLOW_BUILD_FATLITE_MOE"), Layer::RawEnv, Domain::Str, UNSET, OPT_IN),

@@ -22,6 +22,7 @@ nix develop --command python3 scripts/gemma4_mtp_fp8.py "$CKPT"
 <!-- plow:recipe:objects -->
 ```bash
 nix develop --command env \
+  PLOW_BUILD_FA4_HD512=1 \
   PLOW_BUILD_FATLITE=1 \
   PLOW_BUILD_FA_GQA2_PAIR=0 \
   PLOW_BUILD_FP8KV_GEMM=1 \

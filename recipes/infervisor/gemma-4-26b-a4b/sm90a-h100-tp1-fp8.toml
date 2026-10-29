@@ -192,6 +192,22 @@ PLOW_BUILD_PFATTN_HD256_BKV32 = "0"
 PLOW_BUILD_PFATTN_HD256_GQA2_BKV32 = "0"
 PLOW_BUILD_PFATTN_HD512_PX4_BQ64 = "0"
 PLOW_BUILD_GEN_KERNELS = "attn_pf_hd256_sliding_fp8kv,attn_pf_hd512_fp8kv"
+# Global (hd512) prefill attention through the library route (plowrt exec/gpu/lib_attention.rs,
+# docs/arch/28): FlashAttention-4's SM90 forward exported AOT into objects/libplow_fa4_hd512.so plus
+# the FP8 KV page-gather objects/kv_dequant_sm90.cubin; plowrt routes every FlashPrefillFp8 hd512
+# segment through it when both files sit in the packet's objects dir (byte-reproducible builds;
+# the export needs PYREF with vLLM's vllm_flash_attn and the CuTe DSL). Qualified 2026-10-29 on
+# lib-attn bin3 4b261f8a, packet caf6c4a47ba6: one 16000-token prompt, packed prefill chunk
+# 128/512/1024/2048 2.32/0.74/0.51/0.42 -> 1.99/0.68/0.46/0.37 s (-15/-8/-8/-11%), bit-deterministic.
+# FP32 gate vs same-concurrency vLLM 0.28 peers: c1 PASS kl_trim 0.1214 (peer 0.1337) p95 0.868
+# (1.005) top1 0.9652 (0.9562) cont 0.8043 (0.7826); c8 PASS 0.1453 (0.1284) p95 0.919 (0.961)
+# top1 0.9652 (0.9602) cont 0.8478 (0.8696); c16 PASS 0.1381 p95 1.085 top1 0.9672; c32 2 of 3 PASS:
+# kl_p95 1.216/0.972/0.939 (limit 1.12 = peer 0.8945 x 1.25), kl_trim 0.151/0.146/0.134, against
+# native on the same binary 3 of 3 PASS kl_p95 1.051/0.985/0.981, kl_trim 0.151/0.145/0.153 (the
+# miss is the c32 re-roll, thresholds unchanged). Prod-fidelity replay 1.8/s, 2 reps, vs the vLLM
+# 0.29 arm: TTFT P99 260.7 ms (0.71x), TPOT P99 22.3 ms (0.69x), throughput 1.00x, SLO 100%.
+# Evidence: /opt/dlami/nvme/lava-tts/lib-attn/promo (gate-g26, ctl, prod-g26-lib).
+PLOW_BUILD_FA4_HD512 = "1"
 
 [emit_roles.env]
 PLOW_GEMMA4_SM90_W8A8_GEMM_GLU_ROLE = "0"
