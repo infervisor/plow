@@ -60,12 +60,21 @@
 # 0.99x, SLO met 99.8% vs 100%, TTFT/TPOT P99 2.89x / 1.49x; 2.7 sessions/s tok/s 0.98x, SLO met
 # 84.6% vs 98.4% (repeat 2 overloads: admissions held by the KV budget at ~21 of 32 slots), TTFT /
 # TPOT P99 19.1x / 0.66x.
+# 2026-10-29 (branch g26-stage-fusion, plow_git below = the emit commit, packet 7c33558ca3e7, plowrt
+# 65bfae769 = that commit + prod-next 949e3fdb9 with the store quiesce fix): a segmented decode
+# rung's router window (NormResidualNorm, router score, top-k, RmsNorm + align) runs as light
+# launches (plow_sm90a_light_router, same bodies, no knob). step_bench @8K B8/16/32 9.34 / 11.46 /
+# 15.84 -> 9.35 / 11.03 / 15.41 ms, token digests identical, ctx 4094/4095/8191 sweep clean; FP8
+# unchanged. FP32 gate PASS (kl_trim 0.0472 vs vLLM 0.0496, top1_decisive 0.9798, stage-fuse/gates/
+# bf16c-r4). Strict production mix vs vLLM 0.29, MATCHED + EQUIVALENT
+# (docs/bringup/results/gemma26b-h100-bf16-20261029): 1.8 sessions/s tok/s 0.98x, SLO met 97.4% vs
+# 100%; 2.7 sessions/s tok/s 1.00x, SLO met 95.2% vs 98.4%, TPOT P99 1.04x, TTFT P99 4.12x.
 schema = "plow.recipe.v1"
 namespace = "infervisor"
 name = "gemma-4-26b-a4b"
 label = "sm90a-h100-tp1-bf16"
 status = "validated"
-plow_git = "ecb90f0d1c999c2d6838eb58d84c5e52ff1c5098"
+plow_git = "afe7c9eaf084d44d59ac422b12c499099e16f775"
 network = "gemma4"
 
 [target]
