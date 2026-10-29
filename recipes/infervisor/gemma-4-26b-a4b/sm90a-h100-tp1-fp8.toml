@@ -182,7 +182,7 @@ PLOW_FP8_HEAD = "1"
 
 [objects]
 script = "scripts/build_sm90a_gemma4_segments.sh"
-role_files = ["gen_sm90a_attn_pf_hd256_sliding_fp8kv.cubin", "gen_sm90a_attn_pf_hd512_fp8kv.cubin"]
+role_files = ["gen_sm90a_attn_pf_hd256_sliding_fp8kv.cubin", "gen_sm90a_attn_pf_hd512_fp8kv.cubin", "plow_fa4_hd512.aot"]
 [objects.env]
 PLOW_BUILD_FATLITE = "1"
 PLOW_BUILD_W8A8 = "1"
@@ -193,10 +193,10 @@ PLOW_BUILD_PFATTN_HD256_GQA2_BKV32 = "0"
 PLOW_BUILD_PFATTN_HD512_PX4_BQ64 = "0"
 PLOW_BUILD_GEN_KERNELS = "attn_pf_hd256_sliding_fp8kv,attn_pf_hd512_fp8kv"
 # Global (hd512) prefill attention through the library route (plowrt exec/gpu/lib_attention.rs,
-# docs/arch/28): FlashAttention-4's SM90 forward exported AOT into objects/libplow_fa4_hd512.so plus
-# the FP8 KV page-gather objects/kv_dequant_sm90.cubin; plowrt routes every FlashPrefillFp8 hd512
-# segment through it when both files sit in the packet's objects dir (byte-reproducible builds;
-# the export needs PYREF with vLLM's vllm_flash_attn and the CuTe DSL). Qualified 2026-10-29 on
+# docs/arch/28): FlashAttention-4's SM90 forward exported AOT as cubins into
+# objects/plow_fa4_hd512.aot with the FP8 KV page-gather cubin, launched by plowrt itself
+# (scripts/fa4_aot/build.py); the packet declares the route on every FlashPrefillFp8 hd512 segment
+# (byte-reproducible builds; the export needs PYREF with vLLM's vllm_flash_attn and the CuTe DSL). Qualified 2026-10-29 on
 # lib-attn bin3 4b261f8a, packet caf6c4a47ba6: one 16000-token prompt, packed prefill chunk
 # 128/512/1024/2048 2.32/0.74/0.51/0.42 -> 1.99/0.68/0.46/0.37 s (-15/-8/-8/-11%), bit-deterministic.
 # FP32 gate vs same-concurrency vLLM 0.28 peers: c1 PASS kl_trim 0.1214 (peer 0.1337) p95 0.868
@@ -210,6 +210,9 @@ PLOW_BUILD_GEN_KERNELS = "attn_pf_hd256_sliding_fp8kv,attn_pf_hd512_fp8kv"
 PLOW_BUILD_FA4_HD512 = "1"
 
 [emit_roles.env]
+# The packet declares the library route on every prefill rung (lib-attn2; plowrt runs only what
+# the packet declares).
+PLOW_EMIT_ATTN_LIBRARY = "1"
 PLOW_GEMMA4_SM90_W8A8_GEMM_GLU_ROLE = "0"
 PLOW_GEMMA4_SM90_HD512_PX4_BQ64_ROLE = "0"
 PLOW_GEMMA4_SM90_HD256_GQA2_ROLE = "0"

@@ -1,17 +1,17 @@
 //! Library flash prefill attention for causal global layers: FlashAttention-4's SM90 forward,
-//! exported AOT into a C-ABI library (`libplow_fa4_hd512.so`: hd 512 over a head-major cache,
-//! scripts/build_sm90a_fa4_hd512.py; `libplow_fa4_hd256.so`: hd 256 over a row-interleaved cache,
-//! scripts/build_sm90a_fa4_hd256.py), reading 64-row pages through a page table. The object's
-//! ABI ([`LibraryAbi`]) names the geometry it computes. The packet declares the object
+//! exported AOT as cubins into a packet object (`plow_fa4_hd512.aot`: hd 512 over a head-major
+//! cache; `plow_fa4_hd256.aot`: hd 256 over a row-interleaved cache; scripts/fa4_aot/build.py)
+//! and launched by plowrt itself (`fa4_sm90.rs`), reading 64-row pages through a page table. The
+//! object's ABI ([`LibraryAbi`]) names the geometry it computes. The packet declares the object
 //! (`LIBRARY_PREFILL_ATTENTION`) and, per program, the segments it serves; their native role is
 //! the fallback for a launch outside the library's envelope (`begin_launch` decides before any
 //! work is enqueued).
 //!
 //! FP8 KV (one f32 scale per (position, KV head) row) has no library form, so per routed site the
-//! library's own gather (`plow_fa4_kv_gather`) first copies every request's rows `[0, kv_len)`
+//! object's adapter gather (`plow_kv_dequant_pages`) first copies every request's rows `[0, kv_len)`
 //! into the pool (`[kv head][page][64][512]`, the request's pages consecutive). The gather never
 //! reads a slot row at or past kv_len (live KV may leave it unmapped). A BF16 cache is read in
-//! place. The head-major entries load whole pages (TMA), so `plow_fa4_kv_zero_tail` zeroes rows
+//! place. The head-major entries load whole pages (TMA), so `plow_kv_zero_tail` zeroes rows
 //! `[kv_len, round_up(kv_len, 64))` first; the row-interleaved entries load row-predicated (no
 //! row at or past kv_len) and need none. The zeroed rows
 //! are private to the request: they share the 64-row page, and so the live-KV block (a power of
@@ -21,8 +21,10 @@
 //! One table upload per launch (`begin_launch`): cu_seqlens_q, kv lengths, the page table and the
 //! gather list; every routed site of the launch reuses it.
 
+use super::fa4_sm90::{Call, Fa4, Geometry};
 use super::*;
 use crate::asset::devblob::{DevProg, DevTensor};
+use crate::device::cuda::aot::Image;
 use std::ffi::c_void;
 
 use plow_asset::segment_roles::{LibraryAbi, LibraryKvLayout};
@@ -36,35 +38,6 @@ const POOL_PAGES: u32 = POOL_ROWS / PAGE;
 const MAX_REQUESTS: usize = 256;
 const STAGING: usize = 4;
 
-type Create = unsafe extern "C" fn(i32, *mut *mut c_void) -> i32;
-type Destroy = unsafe extern "C" fn(*mut c_void) -> i32;
-type Abi = unsafe extern "C" fn() -> u32;
-type Dtype = unsafe extern "C" fn() -> u32;
-type Gather = unsafe extern "C" fn(*const DequantArgs, *mut c_void) -> i32;
-type ZeroTail = unsafe extern "C" fn(*const ZeroTailArgs, *mut c_void) -> i32;
-type Convert = unsafe extern "C" fn(*mut c_void, u64, u32, *mut c_void) -> i32;
-type Run = unsafe extern "C" fn(
-    *mut c_void, // handle
-    u32,         // heads
-    u32,         // kv heads
-    u64,         // q
-    u64,         // k pages
-    u64,         // v pages
-    u64,         // out
-    i32,         // total q rows
-    i32,         // requests
-    u64,         // cu_seqlens_q
-    u64,         // kv lengths
-    u64,         // page table
-    i32,         // page table width
-    i32,         // pages
-    i64,         // KV head stride (elements)
-    f32,         // softmax scale
-    i32,         // KV splits (1 = whole-KV entry)
-    u64,         // split workspace
-    u64,         // workspace bytes
-    *mut c_void, // stream
-) -> i32;
 const WORKSPACE_BYTES: u64 = 128 << 20;
 /// Split-KV upper bound (the exported combine's log_max_splits 7).
 const MAX_SPLITS: u32 = 128;
@@ -263,18 +236,22 @@ impl Launch {
     }
 }
 
+/// The object's KV adapter kernels (runtime/nvidia/kv_dequant_sm90.cu).
+struct Adapters {
+    module: Option<Module>,
+    gather: KernelFn,
+    zero_tail: KernelFn,
+    convert: KernelFn,
+}
+/// The adapters' block size (kv_dequant_sm90.cu THREADS).
+const ADAPTER_THREADS: u32 = 256;
+
 pub(super) struct LibAttention {
     be: Arc<CudaBackend>,
-    /// `plow_fa4_create`'s handle, destroyed on unload or drop (before the library unmaps).
-    handle: Option<usize>,
-    _library: libloading::Library,
-    destroy: Destroy,
-    run: Run,
-    gather_fn: Gather,
-    zero_tail: ZeroTail,
-    convert_fn: Convert,
-    /// The declared geometry; `f16` (`plow_fa4_dtype` 1): the pool is fp16 and Q / O are
-    /// converted in place around each call.
+    fa4: Fa4,
+    adapters: Adapters,
+    /// The declared geometry; `f16`: the pool is fp16 and Q / O are converted in place around
+    /// each call.
     abi: LibraryAbi,
     /// FP8 sites' gather pool (empty in the direct mode).
     pool_k: DeviceMem,
@@ -285,7 +262,7 @@ pub(super) struct LibAttention {
     /// Device table: cu_q [MAX_REQUESTS + 1] | kv_len [MAX_REQUESTS] | gather [POOL_PAGES][3] |
     /// page table [MAX_REQUESTS][width].
     table: DeviceMem,
-    /// Split-KV partials (`plow_fa4_hd512_workspace`).
+    /// Split-KV partials: f32 O then LSE per (split, row, head).
     workspace: DeviceMem,
     staging: Vec<Staging>,
     staging_next: usize,
@@ -337,16 +314,6 @@ const PT_OFF: u64 = GATHER_OFF + POOL_PAGES as u64 * 12;
 /// The page table holds at most every pool page once per request row width.
 const TABLE_BYTES: u64 = PT_OFF + MAX_REQUESTS as u64 * POOL_PAGES as u64 * 4;
 
-fn check(rc: i32, what: &str) -> Result<()> {
-    match rc {
-        0 => Ok(()),
-        -1001 => Err(RuntimeError::Device(format!(
-            "{what}: the library already has a live handle (one engine per loaded library)"
-        ))),
-        rc => Err(RuntimeError::Device(format!("{what}: status {rc}"))),
-    }
-}
-
 impl LibAttention {
     /// The packet's declared library object (`assets_dir`-relative), hash- and ABI-checked.
     pub(super) fn load(
@@ -370,62 +337,35 @@ impl LibAttention {
         let declared = LibraryAbi::parse(&object.abi).ok_or_else(|| {
             RuntimeError::Rejected(format!("library attention ABI {} unsupported", object.abi))
         })?;
+        let image = Image::parse(image)?;
+        if image.manifest.abi != object.abi {
+            return Err(RuntimeError::Rejected(format!(
+                "{}: object states {}; the packet declares {}",
+                library.display(),
+                image.manifest.abi,
+                object.abi
+            )));
+        }
         be.bind()?;
-        // SAFETY: the hash-pinned library implements the plow_fa4 C ABI (3, checked below).
-        let lib = unsafe { libloading::Library::new(&library) }
-            .map_err(|e| RuntimeError::Device(format!("load {}: {e}", library.display())))?;
-        let sym = |name: &[u8]| {
-            RuntimeError::Device(format!(
-                "{} lacks {}",
-                library.display(),
-                String::from_utf8_lossy(&name[..name.len() - 1])
-            ))
+        let fa4 = Fa4::load(
+            be,
+            &image,
+            Geometry {
+                head_dim: declared.head_dim,
+                heads: declared.heads,
+                f16: declared.f16,
+            },
+        )?;
+        let adapters = {
+            let module = be.module_load(image.blob(image.entry("kv_adapters")?)?)?;
+            let f = |name: &str| be.get_function(&module, name);
+            Adapters {
+                gather: f("plow_kv_dequant_pages")?,
+                zero_tail: f("plow_kv_zero_tail")?,
+                convert: f("plow_cvt_rows")?,
+                module: Some(module),
+            }
         };
-        // SAFETY: symbol types match runtime/nvidia/fa4_hd512.cpp and kv_dequant_sm90.cu.
-        let (abi, dtype, create, destroy, run, gather_fn, zero_tail, convert_fn) = unsafe {
-            (
-                *lib.get::<Abi>(b"plow_fa4_abi\0")
-                    .map_err(|_| sym(b"plow_fa4_abi\0"))?,
-                *lib.get::<Dtype>(b"plow_fa4_dtype\0")
-                    .map_err(|_| sym(b"plow_fa4_dtype\0"))?,
-                *lib.get::<Create>(b"plow_fa4_create\0")
-                    .map_err(|_| sym(b"plow_fa4_create\0"))?,
-                *lib.get::<Destroy>(b"plow_fa4_destroy\0")
-                    .map_err(|_| sym(b"plow_fa4_destroy\0"))?,
-                *lib.get::<Run>(b"plow_fa4_run\0")
-                    .or_else(|_| lib.get::<Run>(b"plow_fa4_hd512_run\0"))
-                    .map_err(|_| sym(b"plow_fa4_run\0"))?,
-                *lib.get::<Gather>(b"plow_fa4_kv_gather\0")
-                    .map_err(|_| sym(b"plow_fa4_kv_gather\0"))?,
-                *lib.get::<ZeroTail>(b"plow_fa4_kv_zero_tail\0")
-                    .map_err(|_| sym(b"plow_fa4_kv_zero_tail\0"))?,
-                *lib.get::<Convert>(b"plow_fa4_convert\0")
-                    .map_err(|_| sym(b"plow_fa4_convert\0"))?,
-            )
-        };
-        // SAFETY: a NUL-terminated string the library exports (fa4_hd*.cpp `plow_fa4_caps`).
-        let caps = unsafe {
-            lib.get::<*const std::ffi::c_char>(b"plow_fa4_caps\0")
-                .ok()
-                .map(|p| std::ffi::CStr::from_ptr(*p).to_string_lossy().into_owned())
-        };
-        let stated = caps.as_deref().and_then(LibraryAbi::from_caps);
-        if stated.as_deref().and_then(LibraryAbi::parse).as_ref() != Some(&declared) {
-            return Err(RuntimeError::Rejected(format!(
-                "{}: library states {caps:?}; the packet declares {}",
-                library.display(),
-                object.abi
-            )));
-        }
-        // SAFETY: no arguments.
-        let (abi, dtype) = unsafe { (abi(), dtype()) };
-        if abi != 3 || dtype != u32::from(declared.f16) {
-            return Err(RuntimeError::Rejected(format!(
-                "{}: plow_fa4 ABI {abi} dtype {dtype}; the packet declares ABI 3 {}",
-                library.display(),
-                object.abi
-            )));
-        }
         let f16 = declared.f16;
         if direct.is_none() && !gathers(&declared) {
             return Err(RuntimeError::Rejected(format!(
@@ -467,15 +407,6 @@ impl LibAttention {
                 pending: false,
             });
         }
-        let mut handle = std::ptr::null_mut();
-        // SAFETY: out-pointer valid for the call.
-        check(
-            unsafe { create(be.device_ordinal as i32, &mut handle) },
-            "plow_fa4_create",
-        )?;
-        if handle.is_null() {
-            return Err(RuntimeError::Device("plow_fa4_create returned null".into()));
-        }
         tracing::info!(
             library = %library.display(),
             pool_mib = (2 * pool_bytes) >> 20,
@@ -485,13 +416,8 @@ impl LibAttention {
         );
         Ok(Self {
             be: Arc::clone(be),
-            handle: Some(handle as usize),
-            _library: lib,
-            destroy,
-            run,
-            gather_fn,
-            zero_tail,
-            convert_fn,
+            fa4,
+            adapters,
             abi: declared,
             pool_k,
             pool_v,
@@ -507,15 +433,11 @@ impl LibAttention {
     }
 
     pub(super) fn unload(mut self) -> Result<()> {
-        let rc = self.destroy_handle();
-        check(rc, "plow_fa4_destroy")
-    }
-
-    fn destroy_handle(&mut self) -> i32 {
-        // SAFETY: the handle came from plow_fa4_create and is taken, so destroyed once.
-        self.handle
-            .take()
-            .map_or(0, |h| unsafe { (self.destroy)(h as *mut c_void) })
+        self.fa4.unload(&self.be)?;
+        match self.adapters.module.take() {
+            Some(m) => self.be.module_unload(&m),
+            None => Ok(()),
+        }
     }
 
     /// Builds and uploads the launch's table. `false` = the launch is outside the envelope
@@ -694,9 +616,6 @@ impl LibAttention {
                 "library attention: KV heads exceed the pool".into(),
             ));
         }
-        let handle = self
-            .handle
-            .ok_or_else(|| RuntimeError::Rejected("library attention unloaded".into()))?;
         let (k_pages, v_pages, num_pages, head_stride) = match (self.direct, site.scales) {
             (Some(d), None) => {
                 // Rows past each kvlen up to its page end: zero, since the head-major entries
@@ -710,11 +629,16 @@ impl LibAttention {
                     kv_stride: site.kv_stride,
                     _pad: 0,
                 };
-                if self.abi.layout == LibraryKvLayout::HeadMajor {
-                    // SAFETY: args lives across the call; the launch copies it.
-                    check(
-                        unsafe { (self.zero_tail)(&args, stream.raw() as *mut c_void) },
-                        "plow_fa4_kv_zero_tail",
+                if self.abi.layout == LibraryKvLayout::HeadMajor && l.requests > 0 {
+                    let mut args = args;
+                    let mut params = [&mut args as *mut ZeroTailArgs as *mut c_void];
+                    self.be.launch_kernel_grid(
+                        self.adapters.zero_tail,
+                        [l.requests, site.kv_heads, 2],
+                        ADAPTER_THREADS,
+                        0,
+                        &mut params,
+                        Some(stream),
                     )?;
                 }
                 let (_, total, head_stride) = d.pages(&self.abi);
@@ -751,34 +675,36 @@ impl LibAttention {
         if self.abi.f16 {
             self.convert(rows_q, true, stream)?;
         }
-        // SAFETY: every pointer is a live device buffer sized above; the stream is ours.
-        check(
-            unsafe {
-                (self.run)(
-                    handle as *mut c_void,
-                    site.heads,
-                    site.kv_heads,
-                    site.q,
-                    k_pages,
-                    v_pages,
-                    site.output,
-                    l.rows as i32,
-                    l.requests as i32,
-                    self.table.base + CU_OFF,
-                    self.table.base + LEN_OFF,
-                    self.table.base + PT_OFF,
-                    l.width as i32,
-                    num_pages as i32,
-                    head_stride,
-                    site.scale,
-                    splits as i32,
-                    self.workspace.base,
-                    self.workspace.len,
-                    stream.raw() as *mut c_void,
-                )
-            },
-            "plow_fa4_run",
-        )?;
+        let opart = self.workspace.base;
+        let lse = opart
+            + u64::from(splits) * u64::from(l.rows) * u64::from(site.heads * self.abi.head_dim) * 4;
+        let call = Call {
+            q: site.q,
+            k: k_pages,
+            v: v_pages,
+            o: if splits > 1 { opart } else { site.output },
+            lse,
+            out: site.output,
+            cu_q: self.table.base + CU_OFF,
+            used_k: self.table.base + LEN_OFF,
+            page_table: self.table.base + PT_OFF,
+            total_q: l.rows,
+            requests: l.requests,
+            width: l.width,
+            pages: num_pages,
+            head_stride: head_stride as u64,
+            splits,
+            scale: site.scale,
+        };
+        if site.heads != self.abi.heads
+            || (self.abi.layout == LibraryKvLayout::RowInterleaved
+                && head_stride != i64::from(self.abi.head_dim))
+        {
+            return Err(RuntimeError::Rejected(
+                "library attention: site geometry differs from the object's".into(),
+            ));
+        }
+        self.fa4.run(&self.be, site.kv_heads, &call, stream)?;
         if self.abi.f16 {
             self.convert(rows_o, false, stream)?;
             self.convert(rows_q, false, stream)?;
@@ -808,10 +734,18 @@ impl LibAttention {
             pool_pages: POOL_PAGES,
             f16: u32::from(self.abi.f16),
         };
-        // SAFETY: args lives across the call; the launch copies it.
-        check(
-            unsafe { (self.gather_fn)(&args, stream.raw() as *mut c_void) },
-            "plow_fa4_kv_gather",
+        if l.pages == 0 || site.kv_heads == 0 {
+            return Ok(());
+        }
+        let mut args = args;
+        let mut params = [&mut args as *mut DequantArgs as *mut c_void];
+        self.be.launch_kernel_grid(
+            self.adapters.gather,
+            [l.pages, site.kv_heads, 2],
+            ADAPTER_THREADS,
+            0,
+            &mut params,
+            Some(stream),
         )
     }
 
@@ -822,23 +756,25 @@ impl LibAttention {
         to_f16: bool,
         stream: &CudaStream,
     ) -> Result<()> {
-        // SAFETY: a live device range of the routed site; the stream is ours.
-        check(
-            unsafe {
-                (self.convert_fn)(
-                    address as *mut c_void,
-                    bytes / 16,
-                    u32::from(to_f16),
-                    stream.raw() as *mut c_void,
-                )
-            },
-            "plow_fa4_convert",
+        let mut n8 = bytes / 16;
+        if n8 == 0 {
+            return Ok(());
+        }
+        let mut p = address;
+        let mut to = u32::from(to_f16);
+        let grid = n8.div_ceil(u64::from(ADAPTER_THREADS)).min(1056) as u32;
+        let mut params = [
+            &mut p as *mut u64 as *mut c_void,
+            &mut n8 as *mut u64 as *mut c_void,
+            &mut to as *mut u32 as *mut c_void,
+        ];
+        self.be.launch_kernel(
+            self.adapters.convert,
+            grid,
+            ADAPTER_THREADS,
+            0,
+            &mut params,
+            Some(stream),
         )
-    }
-}
-
-impl Drop for LibAttention {
-    fn drop(&mut self) {
-        let _ = self.destroy_handle();
     }
 }

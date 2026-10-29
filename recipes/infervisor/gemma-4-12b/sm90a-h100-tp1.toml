@@ -162,7 +162,7 @@ PLOW_QNORM_FUSE = "1"
 
 [objects]
 script = "scripts/build_sm90a_gemma4_segments.sh"
-role_files = ["gen_sm90a_attn_pf_hd256_sliding_fp8kv.cubin", "gen_sm90a_attn_pf_hd512_fp8kv.cubin"]
+role_files = ["gen_sm90a_attn_pf_hd256_sliding_fp8kv.cubin", "gen_sm90a_attn_pf_hd512_fp8kv.cubin", "plow_fa4_hd512.aot"]
 [objects.env]
 PLOW_BUILD_FATLITE = "1"
 NVCC_APPEND_FLAGS = "-DPLOW_NV_GLU_QUANT_CACHE=1 -DPLOW_NV_GLU_QUANT_WPR=1"
@@ -175,8 +175,9 @@ PLOW_BUILD_PFATTN_HD512_PX4_BQ64 = "0"
 PLOW_BUILD_GEN_KERNELS = "attn_pf_hd256_sliding_fp8kv,attn_pf_hd512_fp8kv"
 # Global (hd512) prefill attention through the library route with an fp16 page pool (plowrt
 # exec/gpu/lib_attention.rs, docs/arch/28): FlashAttention-4's SM90 forward exported AOT over fp16
-# into objects/libplow_fa4_hd512.so plus the FP8 KV page gather objects/kv_dequant_sm90.cubin (both
-# byte-reproducible; the export needs PYREF with vLLM's vllm_flash_attn and the CuTe DSL).
+# as cubins into objects/plow_fa4_hd512.aot with the FP8 KV page-gather cubin, launched by plowrt
+# itself (scripts/fa4_aot/build.py; byte-reproducible; the export needs PYREF with vLLM's
+# vllm_flash_attn and the CuTe DSL). Until 2026-10-29 the same cubins ran from a host library.
 # Qualified 2026-10-29 on lib-attn over prod-next b36fcf18c (bin6 aef05632), packet a0464475f8ab:
 # 16000-token prompt, packed prefill chunk 2048/1024/512/128 0.608/0.633/0.758/2.375 -> 0.549/0.572/
 # 0.677/1.813 s. Prod-fidelity replay 2.7/s, 2 reps, same binary: TTFT P99 826.7 -> 697.2 ms (0.62x
@@ -191,6 +192,9 @@ PLOW_BUILD_GEN_KERNELS = "attn_pf_hd256_sliding_fp8kv,attn_pf_hd512_fp8kv"
 PLOW_BUILD_FA4_HD512 = "f16"
 
 [emit_roles.env]
+# The packet declares the library route on every prefill rung (lib-attn2; plowrt runs only what
+# the packet declares).
+PLOW_EMIT_ATTN_LIBRARY = "1"
 PLOW_GEMMA4_SM90_W8A8_GEMM_GLU_ROLE = "0"
 PLOW_GEMMA4_SM90_HD512_PX4_BQ64_ROLE = "0"
 PLOW_GEMMA4_SM90_HD256_GQA2_ROLE = "0"

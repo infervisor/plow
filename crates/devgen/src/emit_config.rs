@@ -1670,8 +1670,9 @@ pub struct EmitConfig {
     #[arg(long, env = "PLOW_NO_GLU_FUSE", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
     pub no_glu_fuse: bool,
 
-    /// Serve this rung's lone global hd512 `FlashPrefill(Fp8)` segments with the library route
-    /// (`libplow_fa4_hd512.so` in the out dir; `library_attention.rs`). Per rung.
+    /// Serve this rung's lone causal global `FlashPrefill(Fp8)` segments with the library route
+    /// (`plow_fa4_hd512.aot` or `plow_fa4_hd256.aot` in the out dir; `library_attention.rs`).
+    /// Per rung.
     #[arg(long, env = "PLOW_EMIT_ATTN_LIBRARY", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
     pub attn_library: bool,
 

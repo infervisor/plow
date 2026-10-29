@@ -1,6 +1,7 @@
 //! Library prefill attention routes (`PLOW_EMIT_ATTN_LIBRARY`, per rung): the packet declares,
-//! per prefill program, which lone global hd512 `FlashPrefill(Fp8)` segments the library
-//! (`libplow_fa4_hd512.so` in the out dir) serves. The segments keep their native role as the
+//! per prefill program, which lone causal global `FlashPrefill(Fp8)` segments the library
+//! object (`plow_fa4_hd512.aot` or `plow_fa4_hd256.aot` in the out dir, scripts/fa4_aot/build.py)
+//! serves. The segments keep their native role as the
 //! declared fallback; the runtime executes exactly this declaration.
 
 use packet::dev::{DevOp, TENSOR_NONE};
@@ -12,24 +13,21 @@ use plow_asset::segment_roles::{
 use std::path::Path;
 
 /// Library objects the emitter looks for in the out dir, in order (at most one may be present).
-pub(crate) const FILES: [&str; 2] = ["libplow_fa4_hd512.so", "libplow_fa4_hd256.so"];
-/// `plow_fa4_caps` in runtime/nvidia/fa4_hd*.cpp: the dtype digit, then (hd256 and later)
-/// `:hd=..:heads=..:kv_heads=..:layout=..`; the bare form is the hd512 library.
-const CAPS: &[u8] = b"plow_fa4_caps:abi=3:dtype=";
+pub(crate) const FILES: [&str; 2] = ["plow_fa4_hd512.aot", "plow_fa4_hd256.aot"];
 
-/// The library's ABI string, from the capability marker it embeds.
+/// The object's ABI string, from its container manifest (`PLOWAOT1`, u32 length, JSON).
 fn library_abi(image: &[u8]) -> Result<String, String> {
-    let at = image
-        .windows(CAPS.len())
-        .position(|w| w == CAPS)
-        .ok_or("library carries no plow_fa4 ABI 3 capability marker")?;
-    let rest = &image[at..];
-    let end = rest
-        .iter()
-        .position(|&b| b == 0)
-        .ok_or("unterminated caps")?;
-    let caps = std::str::from_utf8(&rest[..end]).map_err(|_| "caps not UTF-8")?;
-    LibraryAbi::from_caps(caps).ok_or_else(|| format!("library capability {caps:?} unsupported"))
+    if image.len() < 12 || &image[..8] != b"PLOWAOT1" {
+        return Err("not a PLOWAOT1 kernel container".into());
+    }
+    let n = u32::from_le_bytes(image[8..12].try_into().expect("4 bytes")) as usize;
+    let manifest: serde_json::Value =
+        serde_json::from_slice(image.get(12..12 + n).ok_or("manifest past the end")?)
+            .map_err(|e| format!("manifest: {e}"))?;
+    let abi = manifest["abi"].as_str().ok_or("manifest names no abi")?;
+    LibraryAbi::parse(abi)
+        .map(|_| abi.to_string())
+        .ok_or_else(|| format!("library ABI {abi:?} unsupported"))
 }
 
 /// The runtime's site contract (plowrt `lib_attention::sites`): causal global attention of the
@@ -177,20 +175,15 @@ pub(crate) fn apply_output_object(
 #[cfg(test)]
 mod tests {
     #[test]
-    fn caps_marker_names_the_dtype() {
-        let mut image = b"\x7fELF....".to_vec();
-        image.extend_from_slice(b"plow_fa4_caps:abi=3:dtype=1\0");
-        assert_eq!(
-            super::library_abi(&image).as_deref(),
-            Ok(plow_asset::segment_roles::LIBRARY_FA4_HD512_F16_ABI)
-        );
-        assert!(super::library_abi(b"plow_fa4_caps:abi=2:dtype=0\0").is_err());
-        assert_eq!(
-            super::library_abi(
-                b"..plow_fa4_caps:abi=3:dtype=0:hd=256:heads=24:kv_heads=4:layout=ilv\0"
-            )
-            .as_deref(),
-            Ok("lib_flash_prefill_v1:fa4:hd=256:heads=24:kv_heads=4:layout=ilv:dtype=bf16")
-        );
+    fn container_manifest_names_the_abi() {
+        let abi = "lib_flash_prefill_v2:fa4:hd=256:heads=24:kv_heads=4:layout=ilv:dtype=bf16";
+        let manifest = format!(r#"{{"abi":"{abi}","entries":[]}}"#);
+        let mut image = b"PLOWAOT1".to_vec();
+        image.extend_from_slice(&(manifest.len() as u32).to_le_bytes());
+        image.extend_from_slice(manifest.as_bytes());
+        assert_eq!(super::library_abi(&image).as_deref(), Ok(abi));
+        assert!(super::library_abi(b"\x7fELF plow_fa4_caps:abi=3:dtype=0\0").is_err());
+        image[12 + manifest.find("v2").unwrap() + 1] = b'1';
+        assert!(super::library_abi(&image).is_err());
     }
 }

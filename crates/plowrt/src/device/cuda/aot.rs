@@ -123,7 +123,7 @@ impl Image {
 /// One loaded kernel with its parameter layout and the launch attributes its exemplars carry.
 pub(crate) struct Kernel {
     pub(crate) f: KernelFn,
-    _module: Module,
+    pub(crate) module: Module,
     pub(crate) layout: Vec<(usize, usize)>,
     pub(crate) attrs: Vec<(i32, i32)>,
 }
@@ -164,7 +164,7 @@ impl Kernel {
         }
         Ok(Kernel {
             f,
-            _module: module,
+            module,
             layout,
             attrs: first.attrs.iter().map(|&[a, v]| (a, v)).collect(),
         })
@@ -202,8 +202,10 @@ pub(crate) struct Launch {
     pub(crate) smem: u32,
     params: Vec<[u8; 128]>,
     layout: Vec<(usize, usize)>,
-    /// Bytes each parameter's builder wrote (exemplar checks compare only those).
+    /// Bytes each parameter's builder wrote, and bytes it declared padding (never read by the
+    /// kernel; a capture may hold stack residue there).
     written: Vec<Vec<bool>>,
+    padding: Vec<Vec<bool>>,
     /// Parameters holding a tensor map.
     tmaps: Vec<bool>,
 }
@@ -218,6 +220,7 @@ impl Launch {
             params: vec![[0u8; 128]; total.div_ceil(128)],
             layout: layout.to_vec(),
             written: layout.iter().map(|&(_, s)| vec![false; s]).collect(),
+            padding: layout.iter().map(|&(_, s)| vec![false; s]).collect(),
             tmaps: vec![false; layout.len()],
         }
     }
@@ -250,6 +253,42 @@ impl Launch {
 
     pub(crate) fn u64(&mut self, index: usize, at: usize, v: u64) {
         self.put(index, at, &v.to_le_bytes());
+    }
+
+    /// Declares bytes `[at, at + len)` of parameter `index` padding.
+    pub(crate) fn pad(&mut self, index: usize, at: usize, len: usize) {
+        self.padding[index][at..at + len].fill(true);
+    }
+
+    /// A memref parameter: pointer, i32 dynamic extents, then (8-aligned) i64 dynamic strides;
+    /// every other byte is padding.
+    pub(crate) fn memref(&mut self, index: usize, ptr: u64, shapes: &[u32], strides: &[u64]) {
+        self.u64(index, 0, ptr);
+        self.extents(index, 8, shapes, strides);
+    }
+
+    /// A coordinate tensor parameter: i32 dynamic extents (and i64 strides), no pointer.
+    pub(crate) fn coords(&mut self, index: usize, shapes: &[u32]) {
+        self.extents(index, 0, shapes, &[]);
+    }
+
+    fn extents(&mut self, index: usize, at: usize, shapes: &[u32], strides: &[u64]) {
+        let mut o = at;
+        for &v in shapes {
+            self.u32(index, o, v);
+            o += 4;
+        }
+        if !strides.is_empty() {
+            let aligned = o.next_multiple_of(8);
+            self.pad(index, o, aligned - o);
+            o = aligned;
+        }
+        for &v in strides {
+            self.u64(index, o, v);
+            o += 8;
+        }
+        let size = self.layout[index].1;
+        self.pad(index, o, size - o);
     }
 
     pub(crate) fn tmap(&mut self, index: usize, map: &[u8; 128]) {
@@ -292,6 +331,9 @@ impl Launch {
                 }
                 let want =
                     u8::from_str_radix(cap, 16).map_err(|e| format!("parameter {i}: {e}"))?;
+                if self.padding[i][b] && !self.written[i][b] {
+                    continue;
+                }
                 if !self.written[i][b] {
                     return Err(format!(
                         "parameter {i} byte {b}: captured {want:#04x}, not built"

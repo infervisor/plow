@@ -181,7 +181,7 @@ def main():
     for e, b in zip(entries, blobs):
         e["offset"], e["bytes"] = at, len(b)
         at += len(b)
-    layout = "hm" if hd512 else "ilv"
+    layout = "head_major" if hd512 else "ilv"
     kv = ",".join(str(k) for k in kvhs)
     manifest = {"format": 1, "host_stub": HOST_STUB, "host_stub_version": HOST_STUB_VERSION,
                 "upstream": upstream(),
