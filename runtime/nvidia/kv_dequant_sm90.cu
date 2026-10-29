@@ -10,7 +10,9 @@
 #include <cuda_fp8.h>
 #include <stdint.h>
 
+#ifndef PLOW_FA4_HOST
 extern "C" __device__ unsigned plow_kv_dequant_abi = 2;
+#endif
 
 // Mirrored by plowrt exec/gpu/lib_attention.rs `DequantArgs`.
 struct PlowKvDequant {

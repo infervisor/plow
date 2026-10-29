@@ -57,6 +57,12 @@ def main() -> int:
            str(adapters), *sorted(str(p) for p in obj.glob("fa4_hd512_*.o")), str(archive), "-lcuda"]
     print(" ".join(cmd), flush=True)
     subprocess.run(cmd, check=True)
+    # plowrt dlopens it with nothing else loaded: only libc symbols may stay unresolved.
+    undefined = subprocess.run(["nm", "-D", "--undefined-only", str(out / "libplow_fa4_hd512.so")],
+                               capture_output=True, text=True, check=True).stdout.splitlines()
+    unresolved = [l.split()[-1] for l in undefined if l.split()[0] == "U" and "@GLIBC" not in l]
+    if unresolved:
+        raise SystemExit(f"libplow_fa4_hd512.so leaves {unresolved} unresolved")
     return 0
 
 
