@@ -2199,6 +2199,8 @@ struct PrefillBucket {
     moe_lt_segments: Vec<Option<moe_lt::MoeLtRoute>>,
     /// `PLOW_PF_ATTN_GEMM`: `FlashPrefill` segments served by the vendor-GEMM route.
     attention_gemm_segments: Vec<Option<attention_gemm::Site>>,
+    /// `FlashPrefill(Fp8)` hd512 segments served by the library route (`lib_attention.rs`).
+    lib_attention_segments: Vec<Option<lib_attention::Site>>,
     /// `PlowProgram` kernarg (shares `tensors` + `gq_cursor` with the decode path).
     kernarg: DevProgram,
     /// Device instruction stream (patched per chunk over `inst_range`).
@@ -2483,8 +2485,14 @@ enum PackedAdmission {
     /// Another slot is prefilling this prompt's shared prefix; admit once its checkpoint is
     /// published (`vmm_inflight_prefix`), or after [`INFLIGHT_WAIT_LIMIT`] regardless.
     WaitingPrefix(std::time::Instant),
+    /// The prompt's boundary is still coming back from the host tier; admit once its blocks are
+    /// on the device, or after [`RESTORE_WAIT_LIMIT`] regardless (the gather then waits on the
+    /// copy in the engine stream, stalling every other row).
+    WaitingRestore(std::time::Instant),
     Ready,
 }
+
+const RESTORE_WAIT_LIMIT: std::time::Duration = std::time::Duration::from_millis(250);
 
 /// A packed admission that ran out of device memory retries after this long.
 const KV_MEMORY_RETRY: std::time::Duration = std::time::Duration::from_millis(100);
@@ -2777,6 +2785,8 @@ pub struct GpuEngine {
     disconnected: Vec<bool>,
     /// Serve-manifest KV geometry, kept only under `PLOW_NV_DUMP_KV` ([`Self::dump_slot_kv`]).
     dump_kv_geo: Option<plow_asset::serve_manifest::KvGeometry>,
+    /// The serve manifest's KV geometry ([`Self::kv_pages_init`]).
+    kv_geo: Option<plow_asset::serve_manifest::KvGeometry>,
     /// A launch's host window is open ([`Self::token_batch_step_window`]): snapshot restores skip
     /// their stream drain and their holds wait in `deferred_attach` for the step's own drain.
     window_open: bool,
@@ -2826,7 +2836,11 @@ pub struct GpuEngine {
     /// `PLOW_PF_ENTRY_TRACE`: per-(segment, block) stamps of a `-DPLOW_NV_ENTRY_TRACE=1` object.
     entry_trace: Option<DeviceMem>,
     attention_gemm: Option<attention_gemm::AttentionGemm>,
-    /// Request table of the prefill launch being enqueued, for `attention_gemm`.
+    lib_attention: Option<lib_attention::LibAttention>,
+    /// Whether the launch being enqueued runs its library attention sites (`begin_launch`).
+    lib_attention_routed: bool,
+    /// Request table of the prefill launch being enqueued, for `attention_gemm` and
+    /// `lib_attention`.
     attention_requests: Vec<attention_gemm::Request>,
     /// The packed GDN launch's gathered initial states (N slots), the recurrent section's
     /// `prefill_initstate`.
@@ -6736,6 +6750,27 @@ impl GpuEngine {
             }
             None
         };
+        let lib_attention = match lib_attention::LibAttention::paths(assets_dir) {
+            Some((library, object))
+                if prefill
+                    .iter()
+                    .any(|b| b.lib_attention_segments.iter().any(Option::is_some)) =>
+            {
+                let max_kv_heads = prefill
+                    .iter()
+                    .flat_map(|b| b.lib_attention_segments.iter().flatten())
+                    .map(|site| site.kv_heads())
+                    .max()
+                    .unwrap_or(1);
+                Some(lib_attention::LibAttention::load(
+                    &be,
+                    &library,
+                    &object,
+                    max_kv_heads,
+                )?)
+            }
+            _ => None,
+        };
 
         let mut packet_roles: [Option<PacketRole>; plow_asset::segment_roles::MAX_ROLE as usize] =
             std::array::from_fn(|_| None);
@@ -7553,6 +7588,7 @@ impl GpuEngine {
                 .nv_dump_kv
                 .as_ref()
                 .and(serve.manifest.kv.clone()),
+            kv_geo: serve.manifest.kv.clone(),
             window_open: false,
             deferred_attach: Vec::new(),
             window_event: None,
@@ -7576,6 +7612,8 @@ impl GpuEngine {
             pf_seg_prefix: false,
             entry_trace: None,
             attention_gemm,
+            lib_attention,
+            lib_attention_routed: false,
             attention_requests: Vec::new(),
             recurrent_initstate,
             recurrent_packs: qwen_packs,
@@ -8138,6 +8176,7 @@ impl GpuEngine {
             )));
         }
         self.reset_packed_admission(b);
+        self.state_drop(b);
         // A retirement deferred behind a step that then failed (queue cleared) must not fire
         // against the request seated here now.
         if let Some(p) = self.pipe.as_mut() {
@@ -8420,8 +8459,11 @@ impl GpuEngine {
         // for its whole-block checkpoint (one attach + the tail) instead of recomputing the
         // shared rows beside it; bounded, and released when the owner publishes or retires.
         if self.vmm_prefix_enabled() && crate::config::RuntimeConfig::get().prefix_inflight_wait() {
+            // One deadline for both waits: alternating them must not restart either.
             let since = match self.packed_admission[b] {
-                PackedAdmission::WaitingPrefix(since) => since,
+                PackedAdmission::WaitingPrefix(since) | PackedAdmission::WaitingRestore(since) => {
+                    since
+                }
                 _ => std::time::Instant::now(),
             };
             if since.elapsed() < INFLIGHT_WAIT_LIMIT {
@@ -8438,6 +8480,23 @@ impl GpuEngine {
                     self.packed_admission[b] = PackedAdmission::WaitingPrefix(since);
                     return Ok(None);
                 }
+            }
+        }
+        if self.vmm_prefix_enabled() && self.pos[b] == 0 && !self.prefix_attach_off[b] {
+            let since = match self.packed_admission[b] {
+                PackedAdmission::WaitingPrefix(since) | PackedAdmission::WaitingRestore(since) => {
+                    since
+                }
+                _ => std::time::Instant::now(),
+            };
+            let restoring = since.elapsed() < RESTORE_WAIT_LIMIT
+                && self
+                    .vmm_prefix()
+                    .and_then(|(_, kv)| kv.attach_handle(prompt, self.staged_prefix[b].as_ref()))
+                    .is_some_and(|handle| self.blocks_restoring(handle));
+            if restoring {
+                self.packed_admission[b] = PackedAdmission::WaitingRestore(since);
+                return Ok(None);
             }
         }
         let host_t = pf_packlog_on().then(std::time::Instant::now);
@@ -10846,6 +10905,7 @@ impl GpuEngine {
         // The decode route's owner when it has one (same stream; see its load).
         let mut moe_lt = moe_lt_shared;
         let attention_route = attention_gemm::object(assets_dir).is_some();
+        let lib_route = lib_attention::LibAttention::paths(assets_dir).is_some();
         for g in blob.prefill_progs() {
             // Wave-class segmented programs are legal exactly when the SegPf pair is
             // loaded: segments launch per class in order. Otherwise the coarse
@@ -11073,6 +11133,24 @@ impl GpuEngine {
             } else {
                 Vec::new()
             };
+            // The library route replaces the hd512 sites' native role (generated or not).
+            let lib_attention_segments = if lib_route
+                && seg_mode
+                && seg_class.len() > 1
+                && qwen_segments.is_empty()
+                && packet_kv_layout(&blob) == plow_asset::live_kv::LAYOUT_HEAD_MAJOR
+            {
+                let mut sites =
+                    lib_attention::sites(g, &blob.tensors, devp, blob.decode_prog()?.t as usize);
+                for (site, gemm) in sites.iter_mut().zip(&attention_gemm_segments) {
+                    if gemm.is_some() {
+                        *site = None;
+                    }
+                }
+                sites
+            } else {
+                Vec::new()
+            };
             // Lone norm / residual / GLU segments of the Lt-routed buckets: light launches.
             let light_segments = match light_pf {
                 Some(_)
@@ -11086,6 +11164,11 @@ impl GpuEngine {
                                 .flatten()
                                 .map(|p| p.instruction)
                                 .or(attention_gemm_segments
+                                    .get(seg)
+                                    .copied()
+                                    .flatten()
+                                    .map(|site| site.instruction))
+                                .or(lib_attention_segments
                                     .get(seg)
                                     .copied()
                                     .flatten()
@@ -11191,6 +11274,7 @@ impl GpuEngine {
                 && moe_instructions.is_empty()
                 && qwen_light.is_empty()
                 && attention_gemm_segments.iter().all(Option::is_none)
+                && lib_attention_segments.iter().all(Option::is_none)
             {
                 None
             } else {
@@ -11207,6 +11291,11 @@ impl GpuEngine {
                             .flatten()
                             .map(|p| p.instruction)
                             .or(attention_gemm_segments
+                                .get(seg)
+                                .copied()
+                                .flatten()
+                                .map(|site| site.instruction))
+                            .or(lib_attention_segments
                                 .get(seg)
                                 .copied()
                                 .flatten()
@@ -11558,6 +11647,7 @@ impl GpuEngine {
                 light_segments: light_routes,
                 moe_lt_segments,
                 attention_gemm_segments,
+                lib_attention_segments,
                 kernarg,
                 d_inst,
                 h_inst,
@@ -12027,7 +12117,7 @@ impl GpuEngine {
         self.be
             .memset_d8_async(ctr_base, 0, ctr_bytes, &self.stream)?;
 
-        if self.attention_gemm.is_some() {
+        if self.attention_gemm.is_some() || self.lib_attention.is_some() {
             self.attention_requests.clear();
             self.attention_requests
                 .push([0, real as u32, b as u32, (c0 + real) as u32]);
@@ -12305,24 +12395,35 @@ impl GpuEngine {
             self.ensure_seg_graph(bi, arg, 0..boundary)?;
             self.ensure_seg_graph(bi, arg, boundary..segments)?;
         }
-        if self.attention_gemm.is_some() {
-            for (start, end) in self.seg_graph_pieces(bi) {
-                self.ensure_seg_graph(bi, arg, start..end)?;
+        let gemm = self.attention_gemm.is_some();
+        let lib = self.lib_attention.is_some();
+        for (g, l) in [(gemm, false), (false, lib), (gemm, lib)] {
+            if g || l {
+                for (start, end) in self.seg_graph_pieces(bi, g, l) {
+                    self.ensure_seg_graph(bi, arg, start..end)?;
+                }
             }
         }
         Ok(())
     }
 
     /// The non-empty segment ranges between bucket `bi`'s routed attention segments.
-    fn seg_graph_pieces(&self, bi: usize) -> Vec<(usize, usize)> {
+    /// `gemm` / `lib`: which routes the launch runs.
+    fn seg_graph_pieces(&self, bi: usize, gemm: bool, lib: bool) -> Vec<(usize, usize)> {
         let bucket = &self.prefill[bi];
         let mut pieces = Vec::new();
         let mut start = 0;
         for seg in 0..bucket.seg_class.len() {
-            if bucket
-                .attention_gemm_segments
-                .get(seg)
-                .is_some_and(Option::is_some)
+            if (gemm
+                && bucket
+                    .attention_gemm_segments
+                    .get(seg)
+                    .is_some_and(Option::is_some))
+                || (lib
+                    && bucket
+                        .lib_attention_segments
+                        .get(seg)
+                        .is_some_and(Option::is_some))
             {
                 if start < seg {
                     pieces.push((start, seg));
@@ -12344,9 +12445,22 @@ impl GpuEngine {
         grouped: bool,
         rows: u32,
         index: &mut usize,
+        gemm: bool,
     ) -> Result<()> {
         for seg in range {
-            if let (Some(Some(site)), Some(route)) = (
+            if let (true, Some(Some(site)), Some(route)) = (
+                self.lib_attention_routed,
+                self.prefill[bi].lib_attention_segments.get(seg),
+                self.lib_attention.as_ref(),
+            ) {
+                route.run_site(site, &self.stream)?;
+                if let Some(riders) = self.riders.as_ref().filter(|r| r.rows() > 0) {
+                    riders.launch_after(&self.be, bi, seg + 1, &self.stream)?;
+                }
+                continue;
+            }
+            if let (true, Some(Some(site)), Some(route)) = (
+                gemm,
                 self.prefill[bi].attention_gemm_segments.get(seg),
                 self.attention_gemm.as_mut(),
             ) {
@@ -12925,7 +13039,11 @@ impl GpuEngine {
                 "GDN prefill state operand is not a declared recurrent buffer of the library's slot stride".into(),
             ));
         }
-        let state = &self.devp[t[6] as usize];
+        let state_index = t[6] as usize;
+        if qwen_pack.is_empty() {
+            self.state_materialize(b, Some(state_index))?;
+        }
+        let state = &self.devp[state_index];
         if qwen_pack.is_empty() {
             let native = self
                 .qwen_prefill
@@ -12964,6 +13082,9 @@ impl GpuEngine {
             0
         };
         if ride > 0 {
+            for &(slot, _) in &qwen_pack[..ride] {
+                self.state_materialize(slot, Some(state_index))?;
+            }
             self.packed_gdn_ride(t, ride_ops.expect("checked"), state, &qwen_pack[..ride])?;
             if synchronize {
                 self.be.stream_synchronize(&self.stream).map_err(|e| {
@@ -12986,7 +13107,27 @@ impl GpuEngine {
                 "packed Qwen prefill exceeds the GDN state scratch".into(),
             ));
         }
-        self.packed_state_copy(init, state, scan, ride, true)?;
+        // An attached request whose state stayed in its block reads it from there (the attach
+        // copied none of it into the slot).
+        let sources: smallvec::SmallVec<[Option<u64>; 16]> = scan
+            .iter()
+            .map(|&(slot, _)| self.state_source(slot, state_index))
+            .collect();
+        if sources.iter().any(Option::is_some) {
+            let srcs: smallvec::SmallVec<[u64; 16]> = scan
+                .iter()
+                .zip(&sources)
+                .map(|(&(slot, _), src)| src.unwrap_or(state.base + slot as u64 * STRIDE))
+                .collect();
+            self.state_init_gather(&srcs)?;
+            for (&(slot, _), src) in scan.iter().zip(&sources) {
+                if src.is_some() {
+                    self.state_consumed(slot, state_index);
+                }
+            }
+        } else {
+            self.packed_state_copy(init, state, scan, ride, true)?;
+        }
         if synchronize {
             self.be.stream_synchronize(&self.stream).map_err(|e| {
                 tracing::warn!(error = %e, "packed GDN gather failed");
@@ -13278,15 +13419,30 @@ impl GpuEngine {
             // launch runs the graph pieces between its attention segments; a pack of short
             // slices keeps the whole graph and the native kernel.
             let min_rows = rt.nv.pf_attn_gemm_min_rows;
-            let routed = self.attention_gemm.is_some()
+            let gemm_routed = self.attention_gemm.is_some()
                 && self.prefill[bi]
                     .attention_gemm_segments
                     .iter()
                     .any(Option::is_some)
                 && self.attention_requests.iter().any(|r| r[1] >= min_rows);
+            self.lib_attention_routed = false;
+            // A windowed body (pf_seg_window) keeps the native role.
+            if self.pf_seg_window.is_none()
+                && self.prefill[bi]
+                    .lib_attention_segments
+                    .iter()
+                    .any(Option::is_some)
+            {
+                if let Some(lib) = self.lib_attention.as_mut() {
+                    self.lib_attention_routed =
+                        lib.begin_launch(&self.attention_requests, tc as u32, &self.stream)?;
+                }
+            }
+            let lib_routed = self.lib_attention_routed;
+            let routed = gemm_routed || lib_routed;
             // One table upload per launch serves every routed segment; `false` = shapes the
             // grouped path cannot take, served per request instead.
-            let grouped = if routed {
+            let grouped = if gemm_routed {
                 let sites: Vec<attention_gemm::Site> = self.prefill[bi]
                     .attention_gemm_segments
                     .iter()
@@ -13316,12 +13472,12 @@ impl GpuEngine {
                     vec![(window.start, window.end)]
                 } else if routed && riding {
                     let riders = self.riders.as_ref().expect("riding");
-                    self.seg_graph_pieces(bi)
+                    self.seg_graph_pieces(bi, gemm_routed, lib_routed)
                         .into_iter()
                         .flat_map(|(start, end)| riders.split(bi, start, end))
                         .collect()
                 } else if routed {
-                    self.seg_graph_pieces(bi)
+                    self.seg_graph_pieces(bi, gemm_routed, lib_routed)
                 } else if riding {
                     self.riders
                         .as_ref()
@@ -13333,7 +13489,14 @@ impl GpuEngine {
                 let mut next = 0;
                 let rows = tc as u32;
                 for (start, end) in pieces {
-                    self.run_routed_segments(bi, next..start, grouped, rows, &mut routed_index)?;
+                    self.run_routed_segments(
+                        bi,
+                        next..start,
+                        grouped,
+                        rows,
+                        &mut routed_index,
+                        gemm_routed,
+                    )?;
                     self.ensure_seg_graph(bi, &arg, start..end)?;
                     let graph = self
                         .seg_graphs
@@ -13347,7 +13510,7 @@ impl GpuEngine {
                     next = end;
                 }
                 let rest = next..seg_class.len();
-                self.run_routed_segments(bi, rest, grouped, rows, &mut routed_index)?;
+                self.run_routed_segments(bi, rest, grouped, rows, &mut routed_index, gemm_routed)?;
                 if rt.nv.pf_entry_trace {
                     self.log_entry_trace(bi)?;
                 }
@@ -13400,7 +13563,15 @@ impl GpuEngine {
                     continue;
                 }
                 if let (true, Some(Some(site)), Some(route)) = (
-                    routed,
+                    lib_routed,
+                    self.prefill[bi].lib_attention_segments.get(seg),
+                    self.lib_attention.as_ref(),
+                ) {
+                    route.run_site(site, &self.stream)?;
+                    continue;
+                }
+                if let (true, Some(Some(site)), Some(route)) = (
+                    gemm_routed,
                     self.prefill[bi].attention_gemm_segments.get(seg),
                     self.attention_gemm.as_mut(),
                 ) {
@@ -14119,7 +14290,7 @@ impl GpuEngine {
             let b = &self.prefill[bi];
             (b.d_ctr.base, b.ctr_bytes, b.kernarg)
         };
-        if self.attention_gemm.is_some() {
+        if self.attention_gemm.is_some() || self.lib_attention.is_some() {
             self.attention_requests.clear();
             let mut q0 = 0u32;
             for (i, r) in reqs.iter().enumerate() {
@@ -15067,6 +15238,11 @@ impl Drop for GpuEngine {
                 report(&e, "unload attention softmax object");
             }
         }
+        if let Some(route) = self.lib_attention.take() {
+            if let Err(e) = route.unload() {
+                report(&e, "unload library attention");
+            }
+        }
         for (_, g) in self.seg_graphs.drain() {
             self.be.graph_destroy(g);
         }
@@ -15367,3 +15543,4 @@ use gen_role::load_generated_role;
 
 mod attention_gemm;
 mod cublaslt;
+mod lib_attention;

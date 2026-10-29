@@ -1,0 +1,62 @@
+// Page-gather dequantizer in front of a library attention kernel: plowrt's FP8 KV (e4m3, one f32
+// scale per (position, KV head) row, head-major [slot][kv head][kv_stride][hd]) -> a bf16 page
+// pool [kv head][pages][64][hd] the library reads through a page table. One CTA per (page, KV
+// head, K|V); rows past the request's kv_len are zero (the library loads whole pages and masks
+// their scores, and 0 * Inf would poison P.V). The source loads stop at kv_len: under live KV the
+// slot rows past it may be unmapped.
+#include <cuda_bf16.h>
+#include <cuda_fp8.h>
+#include <stdint.h>
+
+extern "C" __device__ unsigned plow_kv_dequant_abi = 1;
+
+// Mirrored by plowrt exec/gpu/lib_attention.rs `DequantArgs`.
+struct PlowKvDequant {
+    const uint8_t* k8;
+    const float* ks;
+    const uint8_t* v8;
+    const float* vs;
+    __nv_bfloat16* ko;
+    __nv_bfloat16* vo;
+    const int* pages;  // [n_pages][3]: slot, first source row, valid rows (1..64)
+    unsigned n_pages, kv_heads, kv_stride, pool_pages;  // pool_pages: one KV head's page count
+};
+
+constexpr int PAGE = 64;
+constexpr int HD = 512;
+constexpr int THREADS = 256;
+
+__device__ __forceinline__ float e4m3(uint8_t b) {
+    __nv_fp8_storage_t s = b;
+    return __half2float(__half(__nv_cvt_fp8_to_halfraw(s, __NV_E4M3)));
+}
+
+extern "C" __global__ __launch_bounds__(THREADS) void plow_kv_dequant_pages(
+    const __grid_constant__ PlowKvDequant a) {
+    const unsigned page = blockIdx.x, head = blockIdx.y, which = blockIdx.z;
+    if (page >= a.n_pages || head >= a.kv_heads) return;
+    const int slot = a.pages[3 * page], row0 = a.pages[3 * page + 1], valid = a.pages[3 * page + 2];
+    const uint8_t* src = which ? a.v8 : a.k8;
+    const float* scl = which ? a.vs : a.ks;
+    __nv_bfloat16* dst = (which ? a.vo : a.ko) +
+                         ((size_t)head * a.pool_pages + page) * PAGE * HD;
+    const size_t base_row = ((size_t)slot * a.kv_heads + head) * a.kv_stride + row0;
+    // 16 B (16 e4m3) per thread step: a row is 32 steps, a page 2048.
+    for (unsigned i = threadIdx.x; i < PAGE * HD / 16; i += THREADS) {
+        const unsigned r = i / (HD / 16), c = (i % (HD / 16)) * 16;
+        __align__(16) __nv_bfloat16 out[16];
+        if ((int)r < valid) {
+            const uint4 raw = *reinterpret_cast<const uint4*>(src + (base_row + r) * HD + c);
+            const float s = scl[base_row + r];
+            const uint8_t* b = reinterpret_cast<const uint8_t*>(&raw);
+#pragma unroll
+            for (int j = 0; j < 16; ++j) out[j] = __float2bfloat16(e4m3(b[j]) * s);
+        } else {
+#pragma unroll
+            for (int j = 0; j < 16; ++j) out[j] = __float2bfloat16(0.0f);
+        }
+        uint4* d = reinterpret_cast<uint4*>(dst + (size_t)r * HD + c);
+        d[0] = reinterpret_cast<const uint4*>(out)[0];
+        d[1] = reinterpret_cast<const uint4*>(out)[1];
+    }
+}

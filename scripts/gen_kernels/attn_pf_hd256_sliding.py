@@ -169,11 +169,12 @@ class Driver:
                                           None), "cuLaunchKernel")
         self._keep = (buf, params)
 
-    def tmap_kv3(self, base, rows, heads, box_rows):
+    def tmap_kv3(self, base, rows, heads, box_rows, ilv=False):
         m = (ctypes.c_uint8 * 128)()
-        gd = (ctypes.c_uint64 * 3)(D, rows, heads)
-        gs = (ctypes.c_uint64 * 2)(D * 2, rows * D * 2)
-        bd = (ctypes.c_uint32 * 3)(64, box_rows, 1)
+        # GEN_KV_ILV maps {256, n_kv_head, kv_stride}, box {64, 1, 32}.
+        gd = (ctypes.c_uint64 * 3)(*((D, heads, rows) if ilv else (D, rows, heads)))
+        gs = (ctypes.c_uint64 * 2)(D * 2, (heads if ilv else rows) * D * 2)
+        bd = (ctypes.c_uint32 * 3)(*((64, 1, box_rows) if ilv else (64, box_rows, 1)))
         es = (ctypes.c_uint32 * 3)(1, 1, 1)
         self.check(self.cu.cuTensorMapEncodeTiled(m, 9, 3, ctypes.c_void_p(base), gd, gs, bd, es,
                                                   0, 3, 2, 0), "tmap")
@@ -186,11 +187,12 @@ def pack(fields):
 
 
 class Case:
-    """Packet-shaped buffers. Q/O [seq_q][H][256]; K/V [slots][KVH][kv_stride][256], position p
-    of a request at ring row p & kv_mask; requests (q0, qlen, slot, kvlen) packed in order."""
+    """Packet-shaped buffers. Q/O [seq_q][H][256]; K/V [slots][KVH][kv_stride][256] (`ilv`: the
+    row-interleaved [slots][kv_stride][KVH][256] of GEN_KV_ILV objects), position p of a request
+    at ring row p & kv_mask; requests (q0, qlen, slot, kvlen) packed in order."""
 
     def __init__(self, drv, H, KVH, window, requests, seq_q=None, kv_stride=None, ring=True,
-                 slots=None, seed=0, qscale=None, fp8=False, spans=None):
+                 slots=None, seed=0, qscale=None, fp8=False, spans=None, ilv=False):
         torch = drv.torch
         self.drv, self.H, self.KVH, self.window, self.requests = drv, H, KVH, window, requests
         # Media spans per request, absolute [start, end) positions: rows of one span also attend
@@ -242,6 +244,11 @@ class Case:
                 self.k[slot][:, :kvlen] = kl.transpose(0, 1).to(bf)
                 self.v[slot][:, :kvlen] = vl.transpose(0, 1).to(bf)
             self.lin.append((kl, vl))
+        assert not (ilv and fp8), "the head-interleaved KV twin is bf16 only"
+        self.ilv = ilv
+        if ilv:
+            self.k = self.k.transpose(1, 2).contiguous()
+            self.v = self.v.transpose(1, 2).contiguous()
         self.o = torch.full((self.seq_q, H, D), float("nan"), device="cuda", dtype=bf)
         self.ext = None
         if spans is not None:
@@ -273,8 +280,8 @@ class Case:
             off = base - self.desc.data_ptr()
             ptrs = []
             for s in range(slots):
-                km = self.drv.tmap_kv3(self.k[s].data_ptr(), self.kv_stride, self.KVH, 32)
-                vm = self.drv.tmap_kv3(self.v[s].data_ptr(), self.kv_stride, self.KVH, 32)
+                km = self.drv.tmap_kv3(self.k[s].data_ptr(), self.kv_stride, self.KVH, 32, self.ilv)
+                vm = self.drv.tmap_kv3(self.v[s].data_ptr(), self.kv_stride, self.KVH, 32, self.ilv)
                 self.desc[off + 256 * s:off + 256 * s + 256] = torch.tensor(
                     list(km + vm), dtype=torch.uint8, device="cuda")
                 ptrs.append(base + 256 * s)
@@ -296,7 +303,7 @@ class Case:
                      p(self.v), p(self.o), ("p", mapkv), p(self.entries), p(self.counters),
                      p(self.counters), ("u", self.seq_q), ("u", 0), ("u", 0),
                      ("u", self.kv_stride), ("u", self.kv_mask), ("f", scale), ("u", self.H),
-                     ("u", self.KVH), ("u", self.window), ("u", 0)])
+                     ("u", self.KVH), ("u", self.window), ("u", 1 if self.ilv else 0)])
 
     def role14_args(self, tma=True):
         """Role 14's direct entry (PlowHd256Gqa2Direct, 112 B); `tma` builds the per-slot

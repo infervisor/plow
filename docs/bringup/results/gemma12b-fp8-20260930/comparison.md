@@ -692,3 +692,26 @@ env, `--prod-fidelity`, 2 reps per rate). The default tier peaked at 64 GiB RSS 
   The rank-sum p is about 0.34, and this step-bound recipe swings 3-13 s run to run. No cap set.
 
 Evidence: `/opt/dlami/nvme/lava-tts/g12-decode/g26/{fp8,bf16}-*`.
+
+## 2026-10-29: KV store copies off the engine thread (F1, docs/arch/27 §6.3)
+
+plowrt 575a313a4 (branch kv-f1-p0) vs its base prod-next b9be33db4. Same packet a0464475f8ab, recipe serve
+env with the 64 GiB host tier, `--prod-fidelity`, 2.7 sessions/s, 10 s think, 2 reps per arm, run
+back to back in one lease. Strict `campaign.py report` against the existing vLLM 0.29 arm
+(`strict-g12-23/vllm`).
+
+| arm | TTFT P99 (r1 / r2) | TPOT P99 (r1 / r2) | strict TTFT P99 | strict TPOT P99 | goodput | store time on the engine thread |
+|---|---|---|---|---|---|---|
+| prod-next b9be33db4 | 1001 / 1294 ms | 90.6 / 111.8 ms | 1147.5 ms (1.02x vLLM) | 101.23 ms (0.74x) | 99.6 / 96.4% | 13.0% of tick (gather 8.9 ms, 8.5 ms of it a stream drain) |
+| F1 575a313a4 | 699 / 956 ms | 54.9 / 82.0 ms | 827.6 ms (0.73x) | 68.47 ms (0.50x) | 100 / 99.9% | 0.53% (gather 63 µs, publish 310 µs, no drain) |
+
+- Both reps improve on every P99. Throughput 55,549 -> 55,972 tok/s; token hit rate unchanged
+  (79.2 / 79.3 vs 79.3 / 79.1%).
+- What moved: the gather's segment table became per-block descriptors in the launch parameters;
+  a gather outside a launch window and every publish retire their holds and seals behind an
+  event instead of draining the stream; host-resident boundaries restore on a worker thread
+  ahead of admission, and a packed admission waits up to 250 ms for an in-flight restore.
+- FP32 gate on the F1 binary: PASS (kl_trim_mean 0.0483, top1_decisive 0.9852, needle_acc 1).
+
+Evidence: `/opt/dlami/nvme/lava-tts/kv-f1p0/rep/g12-{pnext,f1c}-promo` (`report/`, `metrics_1s.tsv`),
+gate `/opt/dlami/nvme/lava-tts/kv-f1p0/gates/f1c/g12`.
