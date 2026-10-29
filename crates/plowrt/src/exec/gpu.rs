@@ -7453,6 +7453,7 @@ impl GpuEngine {
         // The floor is 2% of the device, at most half of what is free after load; a card the
         // rings nearly fill (26B: 5 GiB) keeps an eighth of it instead.
         let blocks = vmm.as_ref().and_then(|v| v.blocks.clone());
+        let mut store_room = None;
         if let Some(kv) = vmm
             .as_mut()
             .and_then(|v| v.kv.as_mut())
@@ -7473,6 +7474,7 @@ impl GpuEngine {
                     // shrinks it below that when the rings grow.
                     if let (0, Some(bs)) = (cache_cap, blocks.as_ref()) {
                         bs.set_device_cap(free.saturating_sub(floor));
+                        store_room = Some(free.saturating_sub(floor));
                         // Slot growth beyond the block pool creates blocks from free memory:
                         // the store stops a pool's worth above the floor so that does not
                         // trip the OOM path on every new slot.
@@ -7480,6 +7482,29 @@ impl GpuEngine {
                     }
                 }
             }
+        }
+        // Parked ring units come out of the free memory the store grows into: they may hold at
+        // most half of its device tier, so a wide batch parks fewer slots than it serves instead
+        // of starving the store.
+        if let (Some(room), Some(rings)) = (store_room, vmm.as_mut().and_then(|v| v.rings.as_mut()))
+        {
+            let charge = rings.slot_charge().max(1);
+            let slots = (room / 2 / charge).min(rings.slots() as u64);
+            rings.set_park_cap(slots * charge);
+            tracing::info!(
+                park_slots = slots,
+                slots = rings.slots(),
+                park_mib = (slots * charge) >> 20,
+                store_cap_mib = room >> 20,
+                "vmm prefix: live ring park bounded by the block store"
+            );
+        } else if let Some(rings) = vmm.as_ref().and_then(|v| v.rings.as_ref()) {
+            tracing::info!(
+                park_slots = rings.slots(),
+                slots = rings.slots(),
+                park_mib = (rings.slots() as u64 * rings.slot_charge()) >> 20,
+                "vmm prefix: live ring park unbounded (no pressure-sized block store)"
+            );
         }
         if let Some(v) = vmm.as_ref() {
             prefix::trace_init(v);
@@ -8595,7 +8620,7 @@ impl GpuEngine {
                 }
                 self.retire_slot(b, false);
                 let oom = matches!(error, RuntimeError::Oom(_)) || error.device_code() == Some(2);
-                // Parked live rings (`PLOW_VMM_RING_PARK`) hold device memory no request owns; when
+                // Parked live rings hold device memory no request owns; when
                 // releasing them freed memory, the request waits and retries even with no other
                 // request live.
                 let mut reclaimed = false;

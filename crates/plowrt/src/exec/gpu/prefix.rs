@@ -492,10 +492,14 @@ impl GpuEngine {
                 &tensors,
                 geo.batch as usize,
             )?;
-            let park = crate::config::RuntimeConfig::get().vmm_ring_park;
+            // Every released slot parks its ring units in place (bounded against the block store at
+            // arm time, `bound_ring_park`): remapping a slot's ring on readmission (unmap +
+            // cuMemCreate + map + set_access per unit, serial on the mux tick) cost 26B BF16 at
+            // 1.8 sessions/s TTFT P99 1688 ms against 680 ms with every slot parked.
+            let park = geo.batch;
             if crate::config::RuntimeConfig::get().vmm_ring_recycle {
                 rings.enable_handle_recycling(crate::memory::vmm::kv_pool_cap());
-            } else if park > 0 {
+            } else {
                 rings.enable_bounded_park(u64::from(park) * rings.slot_charge());
             }
             tracing::info!(
