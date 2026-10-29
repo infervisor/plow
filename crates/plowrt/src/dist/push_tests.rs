@@ -616,6 +616,56 @@ fn a_rung_override_needs_its_objset_published_first() {
 }
 
 #[test]
+fn a_rung_override_must_name_the_digest_of_the_bytes_the_registry_serves() {
+    let f = Fixture::new("lowrung-digest");
+    let g = f.generated();
+    let src = Sources {
+        assets: &f.assets,
+        objects: &f.assets,
+        checkpoint: None,
+    };
+    let served = br#"{"objset_id":"0123456789ab","newer_field":1}"#;
+    let path = f.registry.join("v1/objsets/0123456789ab.json");
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    std::fs::write(&path, served).unwrap();
+    let rung = |sha256: String| plow_asset::dist::LowRung {
+        max: 512,
+        objset_id: "0123456789ab".into(),
+        sha256,
+    };
+    let with = |l| {
+        let mut b = g.bundle.clone();
+        b.objset.as_mut().unwrap().lowrung.push(l);
+        b
+    };
+    let e = push(
+        &f.sink(),
+        with(rung("0".repeat(64))),
+        g.objset.clone(),
+        &src,
+        None,
+        &Trust::none(),
+        &Options::default(),
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(e.contains("the registry serves"), "{e}");
+    assert!(!f.has("v1/infervisor/veena/index.json"));
+
+    push(
+        &f.sink(),
+        with(rung(Digest::of(served).as_str().to_string())),
+        g.objset,
+        &src,
+        None,
+        &Trust::none(),
+        &Options::default(),
+    )
+    .unwrap();
+    assert!(f.has("v1/infervisor/veena/index.json"));
+}
+
+#[test]
 fn a_recipe_that_names_a_codec_needs_the_codec_packet() {
     let f = Fixture::new("codec");
     std::fs::write(
@@ -639,4 +689,167 @@ fn a_recipe_that_names_a_codec_needs_the_codec_packet() {
     std::fs::write(f.assets.join("codec.pkt"), b"PLOWDEV-codec").unwrap();
     let g = f.generated();
     assert!(g.bundle.files.iter().any(|x| x.role == "codec_packet"));
+}
+
+// --- listing ----------------------------------------------------------------
+
+fn catalog_of(f: &Fixture) -> serde_json::Value {
+    serde_json::from_slice(&f.read("catalog.json")).unwrap()
+}
+
+#[test]
+fn a_listed_row_omits_the_field_and_an_old_catalog_reads_as_listed() {
+    let f = Fixture::new("listed-default");
+    f.push(None, &Options::default());
+    let row = &catalog_of(&f)["models"][0];
+    assert!(
+        row.get("listed").is_none(),
+        "listed is the default and not written: {row}"
+    );
+    let c = super::catalog(&f.sink()).unwrap();
+    assert!(c.models[0].listed);
+
+    // A catalog written before the field existed.
+    let old =
+        br#"{"models":[{"namespace":"infervisor","name":"veena","hf":"maya-research/Veena"}]}"#;
+    let parsed: super::Catalog = serde_json::from_slice(old).unwrap();
+    assert!(parsed.models[0].listed);
+}
+
+#[test]
+fn an_unlisted_push_stays_unlisted_until_relisted() {
+    let f = Fixture::new("unlisted");
+    let out = f.push(
+        None,
+        &Options {
+            listed: Some(false),
+            ..Default::default()
+        },
+    );
+    assert_eq!(out.generation, 1);
+    assert_eq!(catalog_of(&f)["models"][0]["listed"], false);
+    // Published all the same: a client resolves it by name.
+    f.resolve(&Trust::none()).unwrap();
+
+    // A later push without the flag (a new generation here) keeps the row.
+    std::fs::write(f.assets.join("interp_sm90a.cubin"), b"ELF-cubin-v2").unwrap();
+    let g2 = f.push(None, &Options::default());
+    assert_eq!(g2.generation, 2);
+    assert_eq!(catalog_of(&f)["models"][0]["listed"], false);
+
+    // And an explicit relist on push, or `catalog list`, lifts it.
+    f.push(
+        None,
+        &Options {
+            listed: Some(true),
+            ..Default::default()
+        },
+    );
+    assert!(catalog_of(&f)["models"][0].get("listed").is_none());
+}
+
+#[test]
+fn catalog_list_and_unlist_write_only_the_row() {
+    use super::{set_listed, Listing};
+    let f = Fixture::new("catalog-set");
+    let key = SecretKey::generate("k").unwrap();
+    f.push(Some(&key), &Options::default());
+    let index_before = f.read("v1/infervisor/veena/index.json");
+    let sig = f.sig_key();
+
+    let sink = f.sink();
+    assert_eq!(
+        set_listed(&sink, "infervisor", "veena", false).unwrap(),
+        Listing::Changed
+    );
+    assert_eq!(catalog_of(&f)["models"][0]["listed"], false);
+    assert_eq!(
+        set_listed(&sink, "infervisor", "veena", false).unwrap(),
+        Listing::Unchanged
+    );
+    assert_eq!(
+        set_listed(&sink, "infervisor", "veena", true).unwrap(),
+        Listing::Changed
+    );
+    assert!(catalog_of(&f)["models"][0].get("listed").is_none());
+
+    // Nothing under v1/ moved: the signed index is byte-identical and its
+    // signature still verifies.
+    assert_eq!(f.read("v1/infervisor/veena/index.json"), index_before);
+    assert!(f.has(&sig));
+    f.resolve(&Trust(vec![key.public()])).unwrap();
+
+    // A name that was never published is refused, not reserved.
+    let e = set_listed(&sink, "infervisor", "nope", false)
+        .unwrap_err()
+        .to_string();
+    assert!(e.contains("nothing published"), "{e}");
+    assert_eq!(catalog_of(&f)["models"].as_array().unwrap().len(), 1);
+}
+
+#[test]
+fn unlisting_survives_the_catalog_being_rewritten_by_a_push() {
+    // A second model's push rewrites catalog.json; the first model's row,
+    // unlisted, is carried as is.
+    use super::set_listed;
+    let f = Fixture::new("catalog-carry");
+    f.push(None, &Options::default());
+    set_listed(&f.sink(), "infervisor", "veena", false).unwrap();
+    // Same build pushed again: the catalog row is "present and current"
+    // only if `listed` is part of what is compared.
+    let again = f.push(None, &Options::default());
+    assert!(again.unchanged);
+    assert_eq!(catalog_of(&f)["models"][0]["listed"], false);
+}
+
+/// An index or catalog row written by a newer publisher may carry fields this
+/// one does not know. A client reads past them; a publisher must not rewrite
+/// the document without them, so it refuses and names the field.
+#[test]
+fn a_document_with_a_field_this_publisher_does_not_know_is_not_rewritten() {
+    let f = Fixture::new("newer-fields");
+    f.push(None, &Options::default());
+    let index_key = "v1/infervisor/veena/index.json";
+    let mut index: serde_json::Value = serde_json::from_slice(&f.read(index_key)).unwrap();
+    index["variants"][0]["placement_hint"] = serde_json::json!("numa0");
+    std::fs::write(
+        f.registry.join(index_key),
+        serde_json::to_vec(&index).unwrap(),
+    )
+    .unwrap();
+    std::fs::write(f.assets.join("interp_sm90a.cubin"), b"ELF-cubin-v2").unwrap();
+    let src = Sources {
+        assets: &f.assets,
+        objects: &f.assets,
+        checkpoint: None,
+    };
+    let g = f.generated();
+    let e = push(
+        &f.sink(),
+        g.bundle,
+        g.objset,
+        &src,
+        None,
+        &Trust::none(),
+        &Options::default(),
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(e.contains("placement_hint"), "{e}");
+
+    // A known field at its default (the writer omits `listed: true`) is fine.
+    let row = r#"{"namespace":"infervisor","name":"a","hf":"o/a","description":"","listed":true"#;
+    let doc = |extra: &str| format!(r#"{{"models":[{row}{extra}}}]}}"#);
+    super::parse_to_rewrite::<super::Catalog>("catalog.json", doc("").as_bytes()).unwrap();
+    // An unknown field is refused whatever its value: an empty list or a
+    // null may mean something to the schema that wrote it.
+    for value in ["[]", "null", "{}", "true"] {
+        let e = super::parse_to_rewrite::<super::Catalog>(
+            "catalog.json",
+            doc(&format!(r#","future_field":{value}"#)).as_bytes(),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(e.contains("future_field"), "{value}: {e}");
+    }
 }

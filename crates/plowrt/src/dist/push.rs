@@ -45,6 +45,11 @@ pub struct Options<'a> {
     pub tok_s: Option<f64>,
     pub concurrency: Option<u32>,
     pub aliases: Vec<String>,
+    /// Whether listings show the model: `Some(false)` publishes it unlisted
+    /// (reachable by name, left out of `catalog.json` listings), `Some(true)`
+    /// relists it, `None` keeps what the catalog row says (listed, for a new
+    /// row).
+    pub listed: Option<bool>,
     /// Report what would be written, and write nothing.
     pub dry_run: bool,
 }
@@ -71,19 +76,91 @@ pub struct Outcome {
     pub unchanged: bool,
 }
 
-/// The catalog, `catalog.json`: model names only, for discovery.
+/// The catalog, `catalog.json`: model names only, for discovery. `load`
+/// never reads it; listings (the site, inferos, `plowrt catalog show`) do.
 #[derive(Clone, Debug, Default, PartialEq, serde::Serialize, serde::Deserialize)]
-struct Catalog {
-    models: Vec<CatalogEntry>,
+pub struct Catalog {
+    pub models: Vec<CatalogEntry>,
 }
 
 #[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
-struct CatalogEntry {
-    namespace: String,
-    name: String,
-    hf: String,
+pub struct CatalogEntry {
+    pub namespace: String,
+    pub name: String,
+    pub hf: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    description: Option<String>,
+    pub description: Option<String>,
+    /// `false` = unlisted: the model stays published and loads by name, but
+    /// listings leave it out. Absent means listed, so a catalog written
+    /// before the field existed, and a reader that predates it, agree.
+    #[serde(default = "yes", skip_serializing_if = "is_yes")]
+    pub listed: bool,
+}
+
+fn yes() -> bool {
+    true
+}
+
+fn is_yes(b: &bool) -> bool {
+    *b
+}
+
+/// Why `set_listed` wrote nothing.
+#[derive(Clone, Debug, PartialEq)]
+pub enum Listing {
+    Changed,
+    /// The row already said so.
+    Unchanged,
+}
+
+/// Read the catalog. Absent (nothing published yet) is empty.
+pub fn catalog(sink: &dyn Sink) -> Result<Catalog> {
+    match sink.get("catalog.json")? {
+        Some((raw, _)) => parse("catalog.json", &raw),
+        None => Ok(Catalog::default()),
+    }
+}
+
+/// List or unlist a published model: one conditional write on the catalog
+/// row, nothing under `v1/`. A model with no row is refused — publish it
+/// first; unlisting is not a way to reserve a name.
+pub fn set_listed(sink: &dyn Sink, namespace: &str, name: &str, listed: bool) -> Result<Listing> {
+    for _ in 0..4 {
+        let (mut catalog, cond) = match sink.get("catalog.json")? {
+            Some((raw, etag)) => (
+                parse_to_rewrite::<Catalog>("catalog.json", &raw)?,
+                Cond::IfMatch(etag),
+            ),
+            None => (Catalog::default(), Cond::IfNoneMatchAny),
+        };
+        let Some(row) = catalog
+            .models
+            .iter_mut()
+            .find(|m| m.namespace == namespace && m.name == name)
+        else {
+            return Err(dist(format!(
+                "{namespace}/{name} is not in {}'s catalog: nothing published under that name",
+                sink.describe()
+            )));
+        };
+        if row.listed == listed {
+            return Ok(Listing::Unchanged);
+        }
+        row.listed = listed;
+        if let Put::Stored(_) = put_bytes(
+            sink,
+            "catalog.json",
+            &canonical(&catalog)?,
+            "application/json",
+            cond,
+        )? {
+            return Ok(Listing::Changed);
+        }
+    }
+    Err(dist(format!(
+        "{}: catalog.json kept changing; run the command again",
+        sink.describe()
+    )))
 }
 
 /// Every blob a variant needs, digest → bytes.
@@ -178,6 +255,30 @@ fn parse<T: serde::de::DeserializeOwned>(what: &str, bytes: &[u8]) -> Result<T> 
         .map_err(|e| dist(format!("{what}: not valid JSON for this schema: {e}")))
 }
 
+/// Parse a document this publisher is about to rewrite (an index, the
+/// catalog, the runtime index). Readers are lenient, so a client a version
+/// behind still reads what a newer publisher wrote. A writer must not be: it
+/// would write the document back without the fields it does not know. Such a
+/// field is refused by name instead.
+pub(crate) fn parse_to_rewrite<T>(what: &str, bytes: &[u8]) -> Result<T>
+where
+    T: serde::de::DeserializeOwned,
+{
+    // Whatever the value: an unknown `[]` or `null` may mean something to the
+    // schema that wrote it, so only the type's own fields may be omitted.
+    let mut unknown = Vec::new();
+    let mut de = serde_json::Deserializer::from_slice(bytes);
+    let typed: T = serde_ignored::deserialize(&mut de, |path| unknown.push(path.to_string()))
+        .map_err(|e| dist(format!("{what}: not valid JSON for this schema: {e}")))?;
+    match unknown.first() {
+        Some(field) => Err(dist(format!(
+            "{what}: carries `{field}`, which this plowrt does not know and would drop on \
+             rewrite; publish with the plowrt that wrote it, or a newer one"
+        ))),
+        None => Ok(typed),
+    }
+}
+
 /// Compress for transport: the published blob is `.zst` when that is smaller,
 /// plain otherwise. Safetensors barely compress, so a large file gets the fast
 /// level; everything else the thorough one. Staged in `dir`, hashed as it is
@@ -270,10 +371,14 @@ fn ensure_catalog(
     bundle: &Bundle,
     hf: &str,
     description: Option<&str>,
+    listed: Option<bool>,
 ) -> Result<()> {
     for _ in 0..4 {
         let (mut catalog, cond) = match sink.get("catalog.json")? {
-            Some((raw, etag)) => (parse::<Catalog>("catalog.json", &raw)?, Cond::IfMatch(etag)),
+            Some((raw, etag)) => (
+                parse_to_rewrite::<Catalog>("catalog.json", &raw)?,
+                Cond::IfMatch(etag),
+            ),
             None => (Catalog::default(), Cond::IfNoneMatchAny),
         };
         let mine = |m: &CatalogEntry| m.namespace == bundle.namespace && m.name == bundle.name;
@@ -285,6 +390,7 @@ fn ensure_catalog(
             description: description
                 .map(str::to_string)
                 .or_else(|| existing.as_ref().and_then(|m| m.description.clone())),
+            listed: listed.unwrap_or(existing.as_ref().map_or(true, |m| m.listed)),
         };
         if existing.as_ref() == Some(&entry) {
             return Ok(());
@@ -372,7 +478,7 @@ pub fn push(
                     super::sign::verify(&raw, sig.as_deref(), trust)
                         .map_err(|e| dist(format!("{index_key}: {e}")))?;
                 }
-                Some((parse(&index_key, &raw)?, etag, raw))
+                Some((parse_to_rewrite(&index_key, &raw)?, etag, raw))
             }
             None => None,
         };
@@ -420,7 +526,7 @@ pub fn push(
                         }
                     }
                 }
-                ensure_catalog(sink, &bundle, &hf, opts.description)?;
+                ensure_catalog(sink, &bundle, &hf, opts.description, opts.listed)?;
                 return Ok(Outcome {
                     reference: format!(
                         "{}/{}:{}@g{}",
@@ -556,12 +662,23 @@ pub fn push(
         // expose a bundle whose dependencies the registry lacks.
         for l in bundle.objset.iter().flat_map(|o| &o.lowrung) {
             let key = format!("v1/objsets/{}.json", l.objset_id);
-            if sink.head(&key)?.is_none() {
+            let Some((published, _)) = sink.get(&key)? else {
                 return Err(dist(format!(
                     "{}: rung override {} names {key}, which is not published; a rung's \
                      objset is published before the bundle that depends on it",
                     sink.describe(),
                     l.max
+                )));
+            };
+            // A client checks the rung against the bytes served, so the
+            // bundle must name their digest, not that of a local copy.
+            let got = Digest::of(&published);
+            if got.as_str() != l.sha256 {
+                return Err(dist(format!(
+                    "{}: rung override {} records {} for {key}, the registry serves {got}",
+                    sink.describe(),
+                    l.max,
+                    l.sha256
                 )));
             }
         }
@@ -699,7 +816,7 @@ pub fn push(
         }
 
         // 6. The catalog.
-        ensure_catalog(sink, &bundle, &hf, opts.description)?;
+        ensure_catalog(sink, &bundle, &hf, opts.description, opts.listed)?;
 
         return Ok(Outcome {
             reference,

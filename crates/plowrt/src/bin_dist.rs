@@ -97,7 +97,7 @@ pub fn cmd_pull(model: &str, c: plow_asset::dist::Constraints, dry_run: bool) ->
     let f = dist::transport(&r.registry)?;
     let live = live();
     print_live(&live);
-    let resolved = pull::resolve_trusted(&*f, &r, &live, c, &trust()?)?;
+    let resolved = pull::resolve_trusted(&*f, &r, &live, c, &trust_for(&r.registry)?)?;
     let v = &resolved.variant;
     println!(
         "selected {}@g{} ({:?}), {} on {} x {}",
@@ -133,7 +133,7 @@ pub fn cmd_load(
     let f = dist::transport(&r.registry)?;
     let live = live();
     print_live(&live);
-    let resolved = pull::resolve_trusted(&*f, &r, &live, c, &trust()?)?;
+    let resolved = pull::resolve_trusted(&*f, &r, &live, c, &trust_for(&r.registry)?)?;
     let v = &resolved.variant;
     println!(
         "selected {}@g{} ({:?}) — {} on {} x {}",
@@ -207,7 +207,7 @@ pub fn cmd_show(model: &str) -> Result<(), Err> {
     let live = live();
     print_live(&live);
 
-    let idx = pull::index_trusted(&*f, &r, &trust()?)?;
+    let idx = pull::index_trusted(&*f, &r, &trust_for(&r.registry)?)?;
     println!(
         "{}/{}  hf:{} @{}",
         idx.namespace, idx.name, idx.hf, idx.revision
@@ -275,7 +275,8 @@ fn check_newer(
 ) -> Result<Option<(String, u32, u64)>, Err> {
     let r = parse(reference)?;
     let f = dist::transport(&r.registry)?;
-    let resolved = pull::resolve_trusted(&*f, &r, live, Default::default(), &trust()?)?;
+    let resolved =
+        pull::resolve_trusted(&*f, &r, live, Default::default(), &trust_for(&r.registry)?)?;
     if resolved.variant.variant_id == pinned {
         return Ok(None);
     }
@@ -303,7 +304,8 @@ pub fn cmd_upgrade(model: Option<&str>, all: bool, dry_run: bool) -> Result<(), 
     for pin in targets {
         let r = parse(&pin)?;
         let f = dist::transport(&r.registry)?;
-        let resolved = pull::resolve_trusted(&*f, &r, &live, Default::default(), &trust()?)?;
+        let resolved =
+            pull::resolve_trusted(&*f, &r, &live, Default::default(), &trust_for(&r.registry)?)?;
         let pinned = st.pinned(&pin);
         if pinned.as_deref() == Some(resolved.variant.variant_id.as_str()) {
             println!("{pin}: current at g{}", resolved.variant.generation);
@@ -808,11 +810,12 @@ fn upload(
 }
 
 /// The keys this machine accepts a model index from: `PLOW_TRUSTED_KEYS`.
-fn trust() -> Result<dist::sign::Trust, Err> {
-    match RuntimeConfig::signing_env().1 {
-        Some(list) => Ok(dist::sign::Trust::parse(&list)?),
-        None => Ok(dist::sign::Trust::none()),
-    }
+/// The keys `registry` is verified with: see [`dist::sign::Trust::for_registry`].
+fn trust_for(registry: &str) -> Result<dist::sign::Trust, Err> {
+    Ok(dist::sign::Trust::for_registry(
+        RuntimeConfig::signing_env().1.as_deref(),
+        registry,
+    )?)
 }
 
 /// Write a built variant straight into a registry: blobs, manifests, index,
@@ -848,7 +851,7 @@ pub fn cmd_push<'a>(
         objects: objects_dir,
         checkpoint: checkpoint_dir,
     };
-    let trust = trust()?;
+    let trust = trust_for(to)?;
     if key.is_some() && trust.is_empty() && !opts.dry_run {
         println!(
             "warning: PLOW_TRUSTED_KEYS is not set: the rows of the index already published \
@@ -1146,4 +1149,101 @@ max_ctx = 2048
             "a metadata change is a new build"
         );
     }
+}
+
+/// `plowrt catalog show`: every row of the registry's catalog.
+#[cfg(feature = "dist")]
+pub fn cmd_catalog_show(to: &str) -> Result<(), Err> {
+    let sink = dist::sink::sink(to)?;
+    let catalog = dist::push::catalog(&*sink)?;
+    if catalog.models.is_empty() {
+        println!("{}: no models published", sink.describe());
+        return Ok(());
+    }
+    for m in &catalog.models {
+        println!(
+            "{}/{:<28} {:<9} {}{}",
+            m.namespace,
+            m.name,
+            if m.listed { "listed" } else { "unlisted" },
+            m.hf,
+            m.description
+                .as_deref()
+                .map(|d| format!("  — {d}"))
+                .unwrap_or_default()
+        );
+    }
+    Ok(())
+}
+
+/// `plowrt catalog list|unlist <model>`: one write on the catalog row.
+#[cfg(feature = "dist")]
+pub fn cmd_catalog_set(to: &str, model: &str, listed: bool) -> Result<(), Err> {
+    let r = parse(model)?;
+    if r.label.is_some() || r.generation.is_some() {
+        return Err(format!(
+            "{model}: listing is per model; give `[<namespace>/]<name>` without a label or generation"
+        )
+        .into());
+    }
+    let sink = dist::sink::sink(to)?;
+    let verb = if listed { "listed" } else { "unlisted" };
+    match dist::push::set_listed(&*sink, &r.namespace, &r.name, listed)? {
+        dist::push::Listing::Changed => {
+            println!(
+                "{}/{}: now {verb} at {}",
+                r.namespace,
+                r.name,
+                sink.describe()
+            )
+        }
+        dist::push::Listing::Unchanged => {
+            println!(
+                "{}/{}: already {verb} at {}",
+                r.namespace,
+                r.name,
+                sink.describe()
+            )
+        }
+    }
+    Ok(())
+}
+
+/// `plowrt push-runtime`: see [`dist::runtime`].
+#[cfg(feature = "dist")]
+pub fn cmd_push_runtime(
+    releases: &[std::path::PathBuf],
+    to: &str,
+    opts: &dist::runtime::Options,
+) -> Result<(), Err> {
+    // Every directory is read and checked before the registry is touched.
+    let dirs = releases
+        .iter()
+        .map(|d| dist::runtime::ReleaseDir::read(d))
+        .collect::<Result<Vec<_>, _>>()?;
+    let sink = dist::sink::sink(to)?;
+    let out = dist::runtime::push_runtime(&*sink, &dirs, opts)?;
+    let verb = if opts.dry_run {
+        "would publish"
+    } else {
+        "published"
+    };
+    for (triple, bytes) in &out.uploaded {
+        println!(
+            "{verb} plowrt {} {triple} ({} MiB)",
+            out.version,
+            bytes >> 20
+        );
+    }
+    for triple in &out.adopted {
+        println!("already published: plowrt {} {triple}", out.version);
+    }
+    if !out.latest.is_empty() {
+        println!("latest: {}", out.latest);
+    }
+    if out.install_script {
+        println!("{verb} install.sh");
+    }
+    println!("registry: {}", sink.describe());
+    Ok(())
 }

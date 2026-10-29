@@ -196,7 +196,16 @@ fn respond(b: &ModelBundle, prompt: &str, pieces: &[&str]) -> (String, String) {
     let opens = mode.prompt_opens(prompt);
     let support = b.chat_template().map(|t| t.tools);
     let reenter = mode != ReasoningMode::None && b.think_markers().is_ok();
-    match response_stream(&Plan::default(), support, mode, opens, reenter, b, true, None) {
+    match response_stream(
+        &Plan::default(),
+        support,
+        mode,
+        opens,
+        reenter,
+        b,
+        true,
+        None,
+    ) {
         Some(mut ts) => {
             let (mut r, mut c) = (String::new(), String::new());
             let mut take = |st: crate::serve::tools::stream::Step| {

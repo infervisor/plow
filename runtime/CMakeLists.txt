@@ -125,7 +125,17 @@ add_test(NAME cpu_dev_golden COMMAND cpu_dev_golden_test)
 
 # Tier tests: each compares its tier's kernels against the golden tier on random inputs.
 # Guarded so the tree configures before a tier's test exists.
-foreach(tier avx512 avx512_attn avx512_gemm amx fp8 gptoss route route_key moe_gemma neon neon_attn neon_gemm neon_fp8)
+set(PLOW_CPU_TEST_TIERS gptoss route route_key)
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    # Uses Linux thread affinity and pthread barriers, including in --bench mode.
+    list(APPEND PLOW_CPU_TEST_TIERS moe_gemma)
+endif()
+if(CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64")
+    list(APPEND PLOW_CPU_TEST_TIERS avx512 avx512_attn avx512_gemm amx fp8)
+elseif(CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64|arm64")
+    list(APPEND PLOW_CPU_TEST_TIERS neon neon_attn neon_gemm neon_fp8)
+endif()
+foreach(tier IN LISTS PLOW_CPU_TEST_TIERS)
     if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/tests/cpu_dev_${tier}_test.c)
         add_executable(cpu_dev_${tier}_test tests/cpu_dev_${tier}_test.c)
         target_compile_options(cpu_dev_${tier}_test PRIVATE -Wall -Wextra -Werror -O2)
@@ -136,7 +146,7 @@ foreach(tier avx512 avx512_attn avx512_gemm amx fp8 gptoss route route_key moe_g
 endforeach()
 
 # Same MoE test at AMX-shaped geometry (K % 32 == 0, > 32 rows per expert, partial weight tiles).
-if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/tests/cpu_dev_moe_gemma_test.c)
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/tests/cpu_dev_moe_gemma_test.c)
     add_executable(cpu_dev_moe_gemma_big_test tests/cpu_dev_moe_gemma_test.c)
     target_compile_options(cpu_dev_moe_gemma_big_test PRIVATE -Wall -Wextra -Werror -O2 -DMOE_BIG=1)
     target_link_libraries(cpu_dev_moe_gemma_big_test PRIVATE plow_cpu_dev)

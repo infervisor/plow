@@ -8,6 +8,13 @@
 //!
 //! `LiveTarget` is a plain description of a probed machine so this crate needs
 //! no `hwspec` dependency; `plowrt` fills it from a `HardwareFingerprint`.
+//!
+//! The wire structs are LENIENT readers: a field this build does not know is
+//! ignored, never refused. A registry is read by every `plowrt` ever
+//! released, and a field added for a newer client must not make an older
+//! client refuse the whole index — which is what `deny_unknown_fields` did
+//! until 0.1.3. Strictness belongs to the `validate()` methods below and to
+//! the publisher, which writes only what this schema names.
 
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -46,7 +53,6 @@ pub enum Delta {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct Target {
     pub vendor: String,
     pub isa: String,
@@ -65,7 +71,6 @@ pub fn runtime_compiled(vendor: &str) -> bool {
 /// How work is spread across GPUs. An object, not a string, so a composite
 /// (`tp4pp2`) is expressible the day `plowc` stops refusing `--parallel pp`.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct Parallel {
     pub mode: String,
     pub n: u32,
@@ -78,7 +83,6 @@ impl Parallel {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct Build {
     pub plow_git: String,
     pub plowc: String,
@@ -93,7 +97,6 @@ pub struct Build {
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct Measured {
     pub tok_s: f64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -103,7 +106,6 @@ pub struct Measured {
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct Variant {
     pub variant_id: String,
     pub label: String,
@@ -134,7 +136,6 @@ pub struct Variant {
 
 /// `v1/<namespace>/<name>/index.json`.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct ModelIndex {
     pub schema: String,
     pub namespace: String,
@@ -151,7 +152,6 @@ pub struct ModelIndex {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct CheckpointRef {
     pub shards: u32,
     pub layout: String,
@@ -173,7 +173,6 @@ pub enum Provenance {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct FileRef {
     pub role: String,
     pub name: String,
@@ -182,7 +181,6 @@ pub struct FileRef {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct TokenizerRef {
     pub source: Provenance,
     pub file: String,
@@ -198,7 +196,6 @@ pub struct TokenizerRef {
 
 /// `v1/<ns>/<name>/manifests/<label>@g<n>` — one variant's manifest.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct Bundle {
     pub schema: String,
     pub namespace: String,
@@ -230,7 +227,6 @@ pub struct Bundle {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct BundleCheckpoint {
     /// `hf:<org>/<repo>`, fetched from Hugging Face; or [`DIST_SOURCE`], carried
     /// by the distribution itself as `files`.
@@ -252,7 +248,6 @@ pub const DIST_SOURCE: &str = "dist";
 /// One checkpoint file, published under `v1/blobs/sha256/<hex>` like a bundle
 /// file. `name` is its path in the snapshot, so it may nest.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct CheckpointFile {
     pub name: String,
     pub sha256: String,
@@ -260,7 +255,6 @@ pub struct CheckpointFile {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct BundleObjset {
     pub objset_id: String,
     pub manifest: String,
@@ -272,7 +266,6 @@ pub struct BundleObjset {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct LowRung {
     pub max: u32,
     pub objset_id: String,
@@ -286,7 +279,6 @@ pub struct LowRung {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct ObjSetObject {
     pub name: String,
     pub sha256: String,
@@ -301,7 +293,6 @@ pub struct ObjSetObject {
 
 /// `v1/objsets/<vendor>/<isa>/<sku>/<objset-id>.json`.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct ObjSet {
     pub schema: String,
     pub objset_id: String,
@@ -440,8 +431,17 @@ fn assess_one<'a>(v: &'a Variant, live: &LiveTarget, c: &Constraints) -> Assessm
         }
         // Mirrors the late check at `exec/amd.rs`: equal, or an exact multiple
         // under oversubscription. `stream_ofs`/`stream_len` are `[n_cu]` tables
-        // indexed by workgroup, so anything else silently drops streams.
-        let units_ok = v.target.units == live.units
+        // indexed by workgroup, so anything else silently drops streams. A
+        // runtime-compiled target (Apple) is the exception: its shaders are
+        // built on the machine, and when the core count is not the packet's
+        // the Metal engine dispatches the packet serially instead of as
+        // `n_cu` streams (`exec/apple`), which is correct on any chip of the
+        // family at some cost in throughput. So a build for one M-series part
+        // runs on every other (an M4 Pro build on an M4 Max, or on an M5);
+        // the SKU and the core gap only rank it below a closer build.
+        let runtime = runtime_compiled(&v.target.vendor);
+        let units_ok = runtime
+            || v.target.units == live.units
             || (c.oversub
                 && live.units != 0
                 && v.target.units > live.units
@@ -451,6 +451,12 @@ fn assess_one<'a>(v: &'a Variant, live: &LiveTarget, c: &Constraints) -> Assessm
                 want: v.target.units,
                 live: live.units,
             });
+        }
+        if runtime && live.units != v.target.units {
+            warns.push(format!(
+                "built for {} GPU cores, this has {}: serial dispatch, slower than a build for this chip",
+                v.target.units, live.units
+            ));
         }
         if !IMPLEMENTED_MODES.contains(&v.parallel.mode.as_str()) {
             return Some(Reject::ParallelMode {
@@ -533,16 +539,20 @@ pub fn assess<'a>(
     variants.iter().map(|v| assess_one(v, live, c)).collect()
 }
 
-/// Rank key, best first. Generation leads: a newer generation of one label is
-/// the same model on the same hardware, only built better.
-fn rank(v: &Variant, live: &LiveTarget) -> (u32, Status, bool, u32, i64) {
+/// Rank key across labels, best first. Hardware fit leads: on a
+/// runtime-compiled target a build for another core count runs serially, so
+/// the build for the nearest core count (this exact SKU on a tie) beats any
+/// status or speed. Generations are not compared here: they count builds of
+/// one label, and [`select`] keeps only each label's newest.
+fn rank(v: &Variant, live: &LiveTarget) -> (i64, bool, Status, u32, i64) {
     let exact_sku = live.sku.as_deref() == Some(v.target.sku.as_str());
+    let units_gap = -(i64::from(live.units) - i64::from(v.target.units)).abs();
     let tok_s = v
         .measured
         .as_ref()
         .map(|m| (m.tok_s * 1000.0) as i64)
         .unwrap_or(0);
-    (v.generation, v.status, exact_sku, v.parallel.n, tok_s)
+    (units_gap, exact_sku, v.status, v.parallel.n, tok_s)
 }
 
 /// Pick the best variant for this machine, or explain why none fits.
@@ -560,14 +570,23 @@ pub fn select<'a>(
     if ok.is_empty() {
         return Err(explain(&table, live));
     }
+    // Within a label the newest servable generation is the same build, only
+    // built better; older ones are out of the running.
+    let mut newest: BTreeMap<&str, u32> = BTreeMap::new();
+    for a in &ok {
+        let g = newest.entry(a.variant.label.as_str()).or_default();
+        *g = (*g).max(a.variant.generation);
+    }
+    ok.retain(|a| newest[a.variant.label.as_str()] == a.variant.generation);
     ok.sort_by_key(|a| std::cmp::Reverse(rank(a.variant, live)));
     if ok.len() > 1 && rank(ok[0].variant, live) == rank(ok[1].variant, live) {
         return Err(format!(
-            "ambiguous: {} and {} rank identically (generation {}, status {:?}, {} GPUs). \
+            "ambiguous: {}@g{} and {}@g{} rank identically (status {:?}, {} GPUs). \
              Name one explicitly with `:<label>@g<n>`.",
             ok[0].variant.label,
-            ok[1].variant.label,
             ok[0].variant.generation,
+            ok[1].variant.label,
+            ok[1].variant.generation,
             ok[0].variant.status,
             ok[0].variant.parallel.n
         ));

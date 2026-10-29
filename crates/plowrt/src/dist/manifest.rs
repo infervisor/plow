@@ -61,6 +61,11 @@ const ROLES: &[(&str, &str)] = &[
     // packet whose receipts are absent, so a bundle that drops them can never
     // be verified strictly for as long as it exists.
     ("lean-checks.json", "packet_checks"),
+    // The host-side GDN prefill library a Qwen3.5-family packet's prefill
+    // loads from beside it (`exec/gpu.rs`, `NativeGdn::load`): built per
+    // target by `scripts/build_sm90a_qwen_gdn.py`, so it is part of the
+    // build, not an object, and a bundle without it cannot prefill.
+    ("libplow_gdn_prefill.so", "host_library"),
 ];
 
 /// Suffixes that belong to the objset, not the bundle: exactly the three globs
@@ -410,16 +415,17 @@ pub fn read_recipe(path: &Path, over: Overrides<'_>) -> Result<Identity> {
         None => derived.to_string(),
     };
 
-    let toolchain = over
-        .toolchain
-        .map(str::to_string)
-        .or(t.toolchain)
-        .ok_or_else(|| {
-            bad(at(
+    // A runtime-compiled target (Apple) ships no objset, so nothing records a
+    // compiler: the shaders are built on the serving machine.
+    let toolchain =
+        match over.toolchain.map(str::to_string).or(t.toolchain) {
+            Some(v) => v,
+            None if runtime_compiled(&vendor) => String::new(),
+            None => return Err(bad(at(
                 "[target] has no `toolchain`: the objset records the compiler its objects were \
                  built with, and the recipe checker verifies it",
-            ))
-        })?;
+            ))),
+        };
 
     let max_ctx = t
         .max_ctx
@@ -1088,6 +1094,14 @@ fn classify(name: &str) -> Option<&'static str> {
     if name.ends_with(".lean-checks.json") {
         return Some("sidecar_checks");
     }
+    // The sidecar packets themselves: `encoder.pkt` (an ASR frontend),
+    // `s3gen.pkt`, ... — loaded by the packet runtimes beside `model.pkt`
+    // by their own names. `model.pkt` and `codec.pkt` matched the table
+    // above; anything else ending in `.pkt` is a sidecar, and dropping it
+    // publishes an ASR bundle that transcribes nothing.
+    if name.ends_with(".pkt") {
+        return Some("sidecar_packet");
+    }
     None
 }
 
@@ -1201,10 +1215,15 @@ fn build_lowrung(specs: &[(u32, PathBuf)]) -> Result<Vec<LowRung>> {
             serde_json::from_slice(&raw).map_err(|e| bad(format!("{}: {e}", path.display())))?;
         rung.validate()
             .map_err(|e| bad(format!("{}: {e}", path.display())))?;
+        // The digest covers the manifest as written, every field included:
+        // the typed parse drops fields this plowrt does not know, and a hash
+        // of that would not match the bytes the registry serves.
+        let whole: serde_json::Value =
+            serde_json::from_slice(&raw).map_err(|e| bad(format!("{}: {e}", path.display())))?;
         out.push(LowRung {
             max: *max,
             objset_id: rung.objset_id.clone(),
-            sha256: sha256_bytes(&canonical_json(&rung)?),
+            sha256: sha256_bytes(&canonical_json(&whole)?),
         });
     }
     out.sort_by_key(|r| r.max);

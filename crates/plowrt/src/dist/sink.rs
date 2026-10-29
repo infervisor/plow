@@ -226,6 +226,11 @@ mod remote {
     /// Bodies above this go up in parts of this size, so a checkpoint shard
     /// never sits in memory whole. R2 wants every part but the last equal.
     const PART: usize = 64 << 20;
+    /// Blobs up to this size go through the REST API as a single PUT.
+    const REST_SINGLE_PUT: usize = 2 << 30;
+    /// What Cloudflare's REST object API takes in one PUT (413 beyond it);
+    /// it has no multipart route, so a larger blob needs the S3 keys.
+    const REST_MAX_OBJECT: u64 = 300 << 20;
 
     /// The CLI runs `push` on its multi-thread runtime, which a nested
     /// `block_on` must step out of; a test calls in with no runtime at all.
@@ -242,6 +247,64 @@ mod remote {
         driver: Driver,
         name: String,
         part: usize,
+        /// The largest object the destination accepts, when it has a cap.
+        max_object: Option<u64>,
+        /// Reads done with a plain HTTP GET instead of the store client:
+        /// Cloudflare's REST object API sends a small body chunked, with no
+        /// Content-Length, which `object_store`'s header parsing refuses.
+        rest_read: Option<RestRead>,
+    }
+
+    /// The REST object API's object URL prefix and bearer token.
+    struct RestRead {
+        base: String,
+        token: String,
+    }
+
+    impl RestRead {
+        /// GET `key`; `None` when absent. The API has no HEAD route (405),
+        /// so an existence check is a GET whose body is dropped unread.
+        fn fetch(&self, key: &str) -> Result<Option<ureq::Response>> {
+            let url = format!("{}{key}", self.base);
+            let resp = ureq::AgentBuilder::new()
+                .timeout(std::time::Duration::from_secs(120))
+                .build()
+                .get(&url)
+                .set("Authorization", &format!("Bearer {}", self.token))
+                .call();
+            match resp {
+                Ok(r) => Ok(Some(r)),
+                Err(ureq::Error::Status(404, _)) => Ok(None),
+                Err(ureq::Error::Status(code, r)) => Err(dist(format!(
+                    "GET {url}: HTTP {code}: {}",
+                    r.into_string()
+                        .unwrap_or_default()
+                        .chars()
+                        .take(300)
+                        .collect::<String>()
+                ))),
+                Err(e) => Err(dist(format!("GET {url}: {e}"))),
+            }
+        }
+
+        fn head(&self, key: &str) -> Result<Option<String>> {
+            Ok(self
+                .fetch(key)?
+                .map(|r| r.header("etag").unwrap_or_default().to_string()))
+        }
+
+        fn get(&self, key: &str) -> Result<Option<(Vec<u8>, String)>> {
+            let Some(r) = self.fetch(key)? else {
+                return Ok(None);
+            };
+            let etag = r.header("etag").unwrap_or_default().to_string();
+            let mut body = Vec::new();
+            r.into_reader()
+                .take(1 << 30)
+                .read_to_end(&mut body)
+                .map_err(|e| dist(format!("{}{key}: {e}", self.base)))?;
+            Ok(Some((body, etag)))
+        }
     }
 
     impl StoreSink {
@@ -261,12 +324,20 @@ mod remote {
                 driver,
                 name,
                 part: PART,
+                max_object: None,
+                rest_read: None,
             })
         }
-
-        #[cfg(test)]
         fn with_part_size(mut self, part: usize) -> Self {
             self.part = part;
+            self
+        }
+        fn with_max_object(mut self, max: u64) -> Self {
+            self.max_object = Some(max);
+            self
+        }
+        fn with_rest_read(mut self, base: String, token: String) -> Self {
+            self.rest_read = Some(RestRead { base, token });
             self
         }
 
@@ -385,6 +456,9 @@ mod remote {
     impl Sink for StoreSink {
         fn head(&self, key: &str) -> Result<Option<String>> {
             let k = self.key(key)?;
+            if let Some(rest) = &self.rest_read {
+                return rest.head(k.as_ref());
+            }
             match self.block_on(self.store.head(&k)) {
                 Ok(m) => Ok(Some(m.e_tag.unwrap_or_default())),
                 Err(object_store::Error::NotFound { .. }) => Ok(None),
@@ -394,6 +468,9 @@ mod remote {
 
         fn get(&self, key: &str) -> Result<Option<(Vec<u8>, String)>> {
             let k = self.key(key)?;
+            if let Some(rest) = &self.rest_read {
+                return rest.get(k.as_ref());
+            }
             let got = self.block_on(async {
                 let r = self.store.get(&k).await?;
                 let etag = r.meta.e_tag.clone().unwrap_or_default();
@@ -415,6 +492,18 @@ mod remote {
             cond: Cond,
         ) -> Result<Put> {
             let k = self.key(key)?;
+            if let Some(max) = self.max_object {
+                if len > max {
+                    return Err(dist(format!(
+                        "{}/{key}: {len} bytes is above the {max} bytes Cloudflare's REST object \
+                         API takes in one PUT, and it has no multipart upload. Publish with the \
+                         S3 keys instead (CLOUDFLARE_R2_ACCESS_KEY_ID + \
+                         CLOUDFLARE_R2_SECRET_ACCESS_KEY, unset CLOUDFLARE_API_TOKEN), which \
+                         upload in parts; blobs already uploaded are kept and skipped on the re-run",
+                        self.name
+                    )));
+                }
+            }
             if len > self.part as u64 {
                 self.put_parts(key, &k, body, content_type, cond)
             } else {
@@ -455,14 +544,20 @@ mod remote {
         let bucket = bucket.ok_or_else(|| {
             dist("no R2 bucket: r2://<account-id>/<bucket> or CLOUDFLARE_R2_BUCKET".into())
         })?;
-        let store: Arc<dyn ObjectStore> = if env("CLOUDFLARE_API_TOKEN")
-            .or_else(|| env("CF_API_TOKEN"))
-            .is_some()
-        {
+        let token = env("CLOUDFLARE_API_TOKEN").or_else(|| env("CF_API_TOKEN"));
+        let rest = token.is_some();
+        let store: Arc<dyn ObjectStore> = if rest {
             Arc::new(
                 object_store::cloudflare::CloudflareR2Builder::from_env()
                     .with_account_id(&account)
                     .with_bucket_name(&bucket)
+                    // One PUT carries a whole blob (no multipart, below);
+                    // the client's 30 s default request timeout is far too
+                    // short for a 300 MiB packet on a home uplink.
+                    .with_client_options(
+                        object_store::ClientOptions::new()
+                            .with_timeout(std::time::Duration::from_secs(2 * 3600)),
+                    )
                     .build()
                     .map_err(|e| dist(format!("r2://{account}/{bucket}: {e}")))?,
             )
@@ -489,7 +584,23 @@ mod remote {
                     .map_err(|e| dist(format!("r2://{account}/{bucket}: {e}")))?,
             )
         };
-        Ok(Box::new(StoreSink::new(store)?))
+        let sink = StoreSink::new(store)?;
+        // The REST object API has no multipart route (`?uploads` answers
+        // "no route matches"), so through it a blob is one PUT; a ~300 MiB
+        // packet uploads that way in about a minute. The S3 endpoint keeps
+        // the default part size and multipart for anything larger.
+        Ok(Box::new(match token {
+            Some(token) => sink
+                .with_part_size(REST_SINGLE_PUT)
+                .with_max_object(REST_MAX_OBJECT)
+                .with_rest_read(
+                    format!(
+                        "https://api.cloudflare.com/client/v4/accounts/{account}/r2/buckets/{bucket}/objects/"
+                    ),
+                    token,
+                ),
+            None => sink,
+        }))
     }
 
     /// `s3://<bucket>`, with the standard `AWS_*` environment (region,
@@ -548,6 +659,27 @@ mod remote {
             assert_eq!(s.get("v1/x").unwrap().unwrap().0, b"two");
             let e = s.head("../x").unwrap_err().to_string();
             assert!(e.contains("not a relative key"), "{e}");
+        }
+
+        #[test]
+        fn a_destination_with_an_object_cap_refuses_a_larger_body_before_sending_it() {
+            let s = memory(PART).with_max_object(10);
+            assert!(matches!(
+                put(&s, "v1/fits", &[7u8; 10], Cond::IfNoneMatchAny),
+                Put::Stored(_)
+            ));
+            let e = s
+                .put(
+                    "v1/big",
+                    &mut &[7u8; 11][..],
+                    11,
+                    "application/octet-stream",
+                    Cond::IfNoneMatchAny,
+                )
+                .unwrap_err()
+                .to_string();
+            assert!(e.contains("S3 keys") && e.contains("11 bytes"), "{e}");
+            assert!(s.head("v1/big").unwrap().is_none(), "nothing was sent");
         }
 
         #[test]

@@ -5,7 +5,7 @@
  *
  *   ./cpu_dev_gptoss_test            run the comparisons (exit 1 on mismatch)
  *   ./cpu_dev_gptoss_test --bench    GEMV_MXFP4 N=5760 K=2880 M=1/4 + MoE decode B=1..8, 1 thread */
-#define _POSIX_C_SOURCE 199309L
+#define _POSIX_C_SOURCE 200112L
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>

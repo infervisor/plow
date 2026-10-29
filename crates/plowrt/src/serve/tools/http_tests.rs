@@ -1591,11 +1591,7 @@ async fn reasoning_stack_across_model_families() {
 
     // B. GLM-5.3: prompt already ends with <think>, so generation continues the trace
     let h_glm = harness_for("glm5.3");
-    h_glm.reply(&[
-        "GLM-5.3 deliberation.",
-        "</think>",
-        "GLM-5.3 response.",
-    ]);
+    h_glm.reply(&["GLM-5.3 deliberation.", "</think>", "GLM-5.3 response."]);
     let (code, v) = h_glm
         .json(json!({
             "messages": user("Hello"),
@@ -1612,12 +1608,7 @@ async fn reasoning_stack_across_model_families() {
 
     // C. Qwen3: enable_thinking switch and <think> separation
     let h_qwen = harness_for("qwen3");
-    h_qwen.reply(&[
-        "<think>",
-        "Qwen3 planning.",
-        "</think>",
-        "Qwen3 answer.",
-    ]);
+    h_qwen.reply(&["<think>", "Qwen3 planning.", "</think>", "Qwen3 answer."]);
     let (code, v) = h_qwen
         .json(json!({
             "messages": user("Explain quantum computing"),

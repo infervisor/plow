@@ -67,9 +67,8 @@ pub struct ModelBundle {
     /// Built on the first tool-calling request.
     special_text: std::sync::OnceLock<Arc<crate::serve::tools::SpecialText>>,
     reasoning_specials: std::sync::OnceLock<bool>,
-    think_markers: std::sync::OnceLock<
-        std::result::Result<Arc<crate::serve::think::ThinkMarkers>, String>,
-    >,
+    think_markers:
+        std::sync::OnceLock<std::result::Result<Arc<crate::serve::think::ThinkMarkers>, String>>,
     /// vLLM `--chat-template`, set once at startup; replaces the packet's template.
     template_override: std::sync::OnceLock<Arc<crate::serve::template::ChatTemplate>>,
 }
@@ -256,7 +255,9 @@ impl ModelBundle {
     pub fn override_chat_template(&self, t: &str) -> std::result::Result<(), String> {
         let (text, source) = match std::fs::read_to_string(t) {
             Ok(text) => (text, t.to_string()),
-            Err(_) if t.contains("{%") || t.contains("{{") => (t.to_string(), "--chat-template".into()),
+            Err(_) if t.contains("{%") || t.contains("{{") => {
+                (t.to_string(), "--chat-template".into())
+            }
             Err(e) => return Err(format!("{t}: {e}")),
         };
         let compiled = match &self.chat_template {

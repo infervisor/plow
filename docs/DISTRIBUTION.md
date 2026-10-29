@@ -64,7 +64,7 @@ v1/<namespace>/<name>/manifests/<label>@g<n>    # one variant → bundle.json
 v1/objsets/<objset-id>.json
 v1/blobs/sha256/<hex>[.zst]                     # shared by everything
 v1/runtime/index.json                           # released binaries, per triple
-catalog.json                                    # model names only
+catalog.json                                    # model names only (+ listed)
 ```
 
 Local (`$PLOW_HOME`, default `~/.plow`):
@@ -139,10 +139,13 @@ infervisor/kimi-k3  hf:moonshotai/Kimi-K3 @…
   gfx942-mi300x-tp4-18k@g1  emits        4 GPU  ctx 18432   RUNS
 ```
 
-Ranking: **generation first** — a newer generation of one label is the same model
-on the same hardware, only built better — then `validated` over `emits`, then an
-exact SKU match, then GPU count, then measured throughput. A tie is an error, not
-a coin flip.
+Ranking: within one label only its **newest** servable generation competes — a
+newer generation of a label is the same build, only built better. Across labels,
+**hardware fit first** (the build for the nearest core count, then an exact SKU
+match: on Apple a build for another core count runs serially, so a native M4 Max
+build beats a newer generation of an M4 Pro build on a Max), then `validated`
+over `emits`, then GPU count, then measured throughput. Generation numbers are
+never compared across labels. A tie is an error, not a coin flip.
 
 Two probe details worth knowing. On AMD the agent name *is* the ISA key
 (`HSA_AGENT_INFO_NAME` returns `gfx942`, the same string spliced into the kernel
@@ -161,9 +164,17 @@ and there is no pairing hash. `plowrt target --json` on such a machine prints
 the exact `target` a publisher records in the recipe's `[target]` — including
 `mem_bytes`, which a unified-memory part must state because `hwspec` records the
 smallest shipping configuration of each chip rather than this machine's memory;
-`plowrt pack` takes no objset for it. Selection is
-unchanged: the Metal device reports `apple`/`metal3`, the SKU hwspec names,
-its core count and the memory Metal will let it use.
+`plowrt pack` takes no objset for it, and its recipe needs no `toolchain`.
+The Metal device reports `apple`/`metal3`, its name as the SKU, its core
+count (from hwspec, or from `system_profiler` for a chip hwspec does not
+list yet) and the memory Metal will let it use. An Apple build is selected
+on **any** chip of the family: off the core count it was built for, the
+engine dispatches the packet serially instead of as `n_cu` streams, which
+is correct at some cost in throughput, so an M4 Pro build runs on an M4
+Max, a base M4 or an M5. The SKU and the core gap only rank it below a
+closer build; the memory check still applies. NVIDIA and AMD builds need
+the exact SM/CU count (their grids are baked into the objects), so an H100
+build runs on an H200 but not on a part with more SMs.
 
 ## Serving is offline
 
@@ -209,15 +220,53 @@ nix build .#plowrt-release --no-link --print-out-paths
 ```
 
 The tarball is deterministic (sorted, fixed mtime, no gzip timestamp) and its
-sha256 is computed at build time; the registry records both, with
-`release.json`, under `v1/runtime/<version>/<triple>/` and in
-`v1/runtime/index.json`. A build from a modified checkout carries `-dirty`
-and must not be published, because it names a commit it does not correspond
-to.
+sha256 is computed at build time. A dynamic Linux release is re-pointed at
+the host's loader (`/lib64/ld-linux-x86-64.so.2`) with its nix rpath removed
+inside the build, so the digest is of the bytes a host runs; it needs glibc
+2.38 or newer. A build from a modified checkout carries `-dirty` and is
+refused at publish, because it names a commit it does not correspond to.
+
+```
+plowrt push-runtime --release <nix output dir> [--release <another triple's>] \
+  [--install-script scripts/install.sh] [--keep-latest] [--dry-run] [--to r2://…]
+```
+
+records each output under `v1/runtime/<version>/<triple>/` (the tarball,
+its `.sha256`, `release.json`; create-only, so a version is never
+republished with other bytes), rewrites `v1/runtime/index.json` (every
+release and triple, newest first, for a models page) and `v1/runtime/latest`
+(the version string alone, always copied from the index's `latest` after the
+index write; each publisher re-reads the index after its own pointer write and
+corrects a write that landed late, so racing publishers, rollbacks included,
+cannot leave it behind the index), and publishes `scripts/install.sh` at the
+registry root when asked. The same credentials and conditional writes as
+`push`. A client installs with:
+
+```
+curl -fsSL https://pdist.infervisor.ai/install.sh | sh     # PLOWRT_VERSION=… pins
+```
+
+which reads `latest`, then that version's `release.json` for the machine's
+triple, verifies the tarball against its `.sha256`, and installs `plowrt`
+into `/usr/local/bin` or `~/.local/bin` (`PLOWRT_INSTALL_DIR` overrides).
 
 **Model assets**, which advance independently — a new generation needs no new
 binary — are published by `plowrt` alone, straight into the bucket a client
-reads. There is no service between the producer and the store:
+reads. There is no service between the producer and the store, and no
+wrapper script: the sequence is the recipe's build, its check, then `push`.
+
+```
+python3 scripts/campaign/campaign.py build recipes/<ns>/<name>/<label>.toml --out $OUT
+scripts/check_recipe.py recipes/<ns>/<name>/<label>.toml --bundle $OUT/assets --objects $OUT/objects --strict
+plowrt push --recipe recipes/<ns>/<name>/<label>.toml --assets $OUT/assets --objects $OUT/objects --dry-run
+plowrt push --recipe … --assets … --objects …           # same, for real
+plowrt show <name>                                       # from any machine: the generation is live
+```
+
+A measurement is not a condition of publishing: a build goes up as `emits`
+and is re-pushed as `validated` with `--tok-s` when it has been gated and
+measured. The registry carries what plow produced and nothing else; a
+checkpoint is always a Hugging Face reference, pinned to a commit.
 
 ```
 CLOUDFLARE_ACCOUNT_ID=… CLOUDFLARE_R2_BUCKET=… CLOUDFLARE_API_TOKEN=… \
@@ -232,12 +281,17 @@ bucket from `CLOUDFLARE_ACCOUNT_ID` and `CLOUDFLARE_R2_BUCKET`),
 `r2://<bucket>` or `r2://<account-id>/<bucket>`. Writes go through
 Cloudflare's REST API with `CLOUDFLARE_API_TOKEN`, or through R2's S3
 endpoint with `CLOUDFLARE_R2_ACCESS_KEY_ID` + `CLOUDFLARE_R2_SECRET_ACCESS_KEY`
-when no API token is set. `s3://<bucket>` is any S3 bucket from the `AWS_*`
+when no API token is set. The REST API has no multipart upload: a blob goes
+up in one PUT, which Cloudflare caps at about 300 MiB, so a bundle with a
+larger compressed packet (a speech encoder, a codec) needs the S3 keys, where
+blobs upload in parts. `s3://<bucket>` is any S3 bucket from the `AWS_*`
 environment (`AWS_ENDPOINT` for another S3-compatible service).
 `file:///dir` writes the same tree, which is how a release is inspected or
 mirrored by hand. The client is our fork of Apache `object_store`
 (`storyvis/object-store`, pinned by revision); it is pure Rust, so `plowrt`
-links nothing new. Both manifests are built from the recipe, which is the
+links nothing new. Through the REST API a read (the index, the catalog) is
+a plain HTTP GET by `plowrt` itself: that API sends a small body chunked,
+with no Content-Length, which the store client's header parsing refuses. Both manifests are built from the recipe, which is the
 only way to produce them: there is no flag that can disagree with what the
 recipe declares. The recipe's `plow_git` is the provenance a published build
 records; `--plow-git` exists only to reproduce a manifest whose recipe has
@@ -261,27 +315,60 @@ when it holds this very build (a push that died before its index write) and
 skipped when it holds another's. A push that died after the index is finished
 by the next run of the same build: it writes the missing signature and catalog
 row instead of reporting "unchanged". An objset name already holding other
-bytes, or a rung override whose objset is not published, is refused before the
-bundle is written. A bundle is also refused when the recipe says the model
+bytes, or a rung override whose objset is not published or whose recorded
+digest is not that of the served bytes, is refused before the bundle is
+written. Readers ignore fields they do not know, so an older client reads what
+a newer publisher wrote; a publisher does not: an index, catalog or runtime
+index carrying a field this `plowrt` does not know is refused (naming the
+field) rather than rewritten without it. A bundle is also refused when the recipe says the model
 serves with a file the build did not produce (`codec.pkt` for a `[checkpoint]
 codec`, `cublaslt_algos.jsonl` for `PLOW_LT_RUNG_ALGOS`).
 
 **Signing.** `plowrt keygen --name <key-name> --out <file>` makes an ed25519
-key; its public half is printed as `<key-name>:<base64>`. `push --key-file`
+key; its public half is printed as `<key-name>:<base64>`. The public registry
+at `pdist.infervisor.ai` is signed with
+`infervisor-2026:ESz+iXQToovy4GhRUgTHoUKUwMumUA/ls/4tAaEjL3M=`. `push --key-file`
 (or `PLOW_SIGNING_KEY`) writes the signature under `sigs/<sha256 of the
 index>.sig`, before the index itself: a reader fetches the signature of
 exactly the bytes it read, so no reader sees an index without its signature
 and two publishers' signatures cannot land on each other's index. A client
-with `PLOW_TRUSTED_KEYS=<name>:<base64>[,…]` refuses an index that is
-unsigned, signed by another key, or changed after signing; the index names
-every manifest by digest and each manifest its blobs, so this one signature
-covers the whole pull. A client with no trusted keys checks nothing, as
-before. `push` applies the same `PLOW_TRUSTED_KEYS` to the index already in
+refuses an index that is unsigned, signed by another key, or changed after
+signing; the index names every manifest by digest and each manifest its
+blobs, so this one signature covers the whole pull. Which keys: the public
+registry (the host `pdist.infervisor.ai`, or a push to the `pdist` R2 bucket:
+`r2://…/pdist`, or `r2://` with `CLOUDFLARE_R2_BUCKET=pdist`) is verified with
+the built-in publisher key above, with nothing to configure; `PLOW_TRUSTED_KEYS=<name>:<base64>[,…]` replaces that list for
+any registry (set but empty is an error, not "verify nothing"); any other
+registry — a `file://` mirror, a private bucket — is checked only when
+`PLOW_TRUSTED_KEYS` names its keys. `push` applies the same `PLOW_TRUSTED_KEYS` to the index already in
 the bucket, whose rows it carries into the new, signed index; with none set it
 warns that they are carried unverified, which is the bootstrap for a registry
 published before signing existed. Without a key, `push` to a bucket warns and
 publishes unsigned. A `file://` registry enforces the same conditional writes
 under `<dir>/.lock`.
+
+**Listing.** The catalog is for listings — the site, inferos, `plowrt
+catalog show`; `load` never reads it, a bare name resolves straight to
+`v1/<namespace>/<name>/index.json`. So which models the public sees is a
+catalog property, decided by whoever holds the bucket's write key and by
+nothing else: a row carries `"listed": false` to leave a published model out
+of listings while it still loads by name (absent means listed, so older
+catalogs and readers agree). `push --unlisted` publishes that way; a later
+push keeps the row as it is; `plowrt catalog unlist|list <model>` flips it
+with one `If-Match` write on `catalog.json` and nothing under `v1/`, so the
+signed index is untouched. A name never published is refused, not reserved.
+To withdraw one build, re-push its recipe as `status = "refused"` with a
+reason: `load` skips it and pinned `@g<n>` pulls still work. Retracting a
+whole model (deleting `v1/<namespace>/<name>/` and its row) is a by-hand
+operation; blobs are shared across models and are never deleted with it.
+
+The catalog is one object and is written on every push and listing change,
+each under `If-Match`, so publishers serialise on it and a lost race is
+re-read and retried (four times). At a hundred bytes a row that is tens of
+kilobytes for hundreds of models, read by listings only. It is not signed:
+a reader trusts it as far as it trusts the bucket's writers, and everything
+that matters to a `load` — the index, every manifest, every blob — is
+signed or content-addressed.
 
 `plowrt publish` (the registry's staged-upload API, `PLOW_PUBLISH_KEY`) is
 the transition path, kept until every model has been re-published with
