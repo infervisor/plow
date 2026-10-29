@@ -715,3 +715,30 @@ back to back in one lease. Strict `campaign.py report` against the existing vLLM
 
 Evidence: `/opt/dlami/nvme/lava-tts/kv-f1p0/rep/g12-{pnext,f1c}-promo` (`report/`, `metrics_1s.tsv`),
 gate `/opt/dlami/nvme/lava-tts/kv-f1p0/gates/f1c/g12`.
+
+## 2026-10-29: global (hd512) prefill attention through the FA4 library route, fp16 pool
+
+lib-attn on prod-next b36fcf18c (bin6 aef05632), packet a0464475f8ab with `objects/libplow_fa4_hd512.so`
+(fp16 variant, `PLOW_BUILD_FA4_HD512=f16`) and `objects/kv_dequant_sm90.cubin` beside it; docs/arch/28.
+Native arm = same binary and packet without the two files. Recipe serve env, `--prod-fidelity`,
+2.7 sessions/s, 2 reps per arm, back to back in one lease, strict `campaign.py report` against
+`strict-g12-23/vllm`.
+
+| arm | TTFT P99 (r1 / r2) | TPOT P99 (r1 / r2) | strict TTFT P99 | strict TPOT P99 | goodput | SLO met |
+|---|---|---|---|---|---|---|
+| native | 730 / 923 ms | 57.4 / 84.9 ms | 826.7 ms (0.73x vLLM) | 71.13 ms (0.52x) | 9.39 req/s | 99.9% |
+| FA4 route, fp16 pool | 657 / 738 ms | 52.9 / 72.5 ms | 697.2 ms (0.62x) | 62.69 ms (0.46x) | 9.41 req/s | 100.0% |
+
+- Prefill, one 16000-token prompt (step_bench packed prefill): chunk 2048/1024/512/128
+  0.608/0.633/0.758/2.375 -> 0.549/0.572/0.677/1.813 s (-10/-10/-11/-24%).
+- FP32 gate vs same-concurrency vLLM 0.28 peers: c1 PASS kl_trim 0.0678 (peer 0.0631), top1_decisive
+  0.9764 (0.9803), cont_decisive 41/46 (43; limit 41, at the limit; c1 is deterministic, native 44);
+  c8 PASS 0.0680 (0.0678), cont 40 (42); c32 PASS 0.0707 (0.0710), cont 39 (41). The relax-for-perf
+  check holds independently at c1: kl_trim 0.0678 <= 1.10 x 0.0631, top1 >= peer - 0.005, cont >= peer - 2.
+- The bf16 pool failed c1 (cont 40/46): it rounds every dequantized row to bf16.
+- Per-site dumps of the 15872-token natural case: route O vs an FP32 attention on the same inputs
+  rel-L2 1.69-1.73e-3 on all 56 hd512 sites (native kernel 1.7e-3). The natural-text KL difference
+  against native moves both ways per case (9 better, 11 worse of 20), a rounding re-roll.
+
+Evidence: `/opt/dlami/nvme/lava-tts/lib-attn/f1ab` (`prod-{nat,h16}/report`, `gate-h16`, `gate-nat`),
+`/opt/dlami/nvme/lava-tts/lib-attn/f16` (screen, `an-*.txt`, `qbench.*`, `kbench.*`).

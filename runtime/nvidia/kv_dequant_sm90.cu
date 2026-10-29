@@ -1,14 +1,16 @@
 // Page-gather dequantizer in front of a library attention kernel: plowrt's FP8 KV (e4m3, one f32
 // scale per (position, KV head) row, head-major [slot][kv head][kv_stride][hd]) -> a bf16 page
-// pool [kv head][pages][64][hd] the library reads through a page table. One CTA per (page, KV
+// pool [kv head][pages][64][hd] (bf16, or fp16 for an fp16 library) the library reads through a
+// page table. One CTA per (page, KV
 // head, K|V); rows past the request's kv_len are zero (the library loads whole pages and masks
 // their scores, and 0 * Inf would poison P.V). The source loads stop at kv_len: under live KV the
 // slot rows past it may be unmapped.
 #include <cuda_bf16.h>
+#include <cuda_fp16.h>
 #include <cuda_fp8.h>
 #include <stdint.h>
 
-extern "C" __device__ unsigned plow_kv_dequant_abi = 1;
+extern "C" __device__ unsigned plow_kv_dequant_abi = 2;
 
 // Mirrored by plowrt exec/gpu/lib_attention.rs `DequantArgs`.
 struct PlowKvDequant {
@@ -16,10 +18,11 @@ struct PlowKvDequant {
     const float* ks;
     const uint8_t* v8;
     const float* vs;
-    __nv_bfloat16* ko;
-    __nv_bfloat16* vo;
+    void* ko;
+    void* vo;
     const int* pages;  // [n_pages][3]: slot, first source row, valid rows (1..64)
     unsigned n_pages, kv_heads, kv_stride, pool_pages;  // pool_pages: one KV head's page count
+    unsigned f16;                                       // pool element: 0 bf16, 1 fp16
 };
 
 constexpr int PAGE = 64;
@@ -38,25 +41,43 @@ extern "C" __global__ __launch_bounds__(THREADS) void plow_kv_dequant_pages(
     const int slot = a.pages[3 * page], row0 = a.pages[3 * page + 1], valid = a.pages[3 * page + 2];
     const uint8_t* src = which ? a.v8 : a.k8;
     const float* scl = which ? a.vs : a.ks;
-    __nv_bfloat16* dst = (which ? a.vo : a.ko) +
-                         ((size_t)head * a.pool_pages + page) * PAGE * HD;
+    const size_t dst_off = ((size_t)head * a.pool_pages + page) * PAGE * HD;
+    uint16_t* dst = static_cast<uint16_t*>(which ? a.vo : a.ko) + dst_off;
     const size_t base_row = ((size_t)slot * a.kv_heads + head) * a.kv_stride + row0;
     // 16 B (16 e4m3) per thread step: a row is 32 steps, a page 2048.
     for (unsigned i = threadIdx.x; i < PAGE * HD / 16; i += THREADS) {
         const unsigned r = i / (HD / 16), c = (i % (HD / 16)) * 16;
-        __align__(16) __nv_bfloat16 out[16];
+        __align__(16) uint16_t out[16] = {};
         if ((int)r < valid) {
             const uint4 raw = *reinterpret_cast<const uint4*>(src + (base_row + r) * HD + c);
             const float s = scl[base_row + r];
             const uint8_t* b = reinterpret_cast<const uint8_t*>(&raw);
+            if (a.f16) {
 #pragma unroll
-            for (int j = 0; j < 16; ++j) out[j] = __float2bfloat16(e4m3(b[j]) * s);
-        } else {
+                for (int j = 0; j < 16; ++j) out[j] = __half_as_ushort(__float2half_rn(e4m3(b[j]) * s));
+            } else {
 #pragma unroll
-            for (int j = 0; j < 16; ++j) out[j] = __float2bfloat16(0.0f);
+                for (int j = 0; j < 16; ++j) out[j] = __bfloat16_as_ushort(__float2bfloat16(e4m3(b[j]) * s));
+            }
         }
         uint4* d = reinterpret_cast<uint4*>(dst + (size_t)r * HD + c);
         d[0] = reinterpret_cast<const uint4*>(out)[0];
         d[1] = reinterpret_cast<const uint4*>(out)[1];
+    }
+}
+
+// In-place bf16 <-> fp16 over `n8` groups of 8 elements (16 B aligned): an fp16 library's Q in
+// and O out. bf16 -> fp16 -> bf16 is exact for |x| < 65504 at fp16's normal range.
+extern "C" __global__ __launch_bounds__(THREADS) void plow_cvt_rows(uint4* p, unsigned long long n8,
+                                                                   unsigned to_f16) {
+    for (unsigned long long i = blockIdx.x * (unsigned long long)THREADS + threadIdx.x; i < n8;
+         i += (unsigned long long)gridDim.x * THREADS) {
+        uint4 v = p[i];
+        uint16_t* h = reinterpret_cast<uint16_t*>(&v);
+#pragma unroll
+        for (int j = 0; j < 8; ++j)
+            h[j] = to_f16 ? __half_as_ushort(__float2half_rn(__bfloat162float(__ushort_as_bfloat16(h[j]))))
+                          : __bfloat16_as_ushort(__float2bfloat16(__half2float(__ushort_as_half(h[j]))));
+        p[i] = v;
     }
 }
