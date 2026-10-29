@@ -10,6 +10,9 @@
 # c32/c64/c128 tok/s 374/353/353 vs 380/353/342, TTFT p99 -25/-2/-4%, TPOT p99 +9/+5/+6%;
 # 15K/128 c32 TTFT p50 2571 vs 3266 ms; 4K/128 c32 TTFT p50 626 vs 1072 ms. Label kept for history.
 # Compare against the 16K/32 request-chunk2048 recipe with matched traffic.
+# History: CUTLASS swap-AB FP8 decode projections on the routed 64-row rung (removed 2026-10-29,
+# never qualified on a production packet; dlopened a host marshaller): step_bench B64 ctx 4096
+# 22.84 -> 20.85 ms, ctx 15000 29.12 -> 27.13; 4K c128 out tok/s +1.7%.
 # 2026-10-05 GLU role off + 64-row decode cuBLASLt (+ plowrt 1088/4160 Lt routes, ride trim), served
 # REPS=2 total tok/s vs the final3 arm: 4K/128 c32/c128 +4.8/+6.5%, 15K/128 +4.0/+4.0%, agentic16k
 # c32/c64/c128 +3.5/+3.3/+10.8%. With plowrt 1a4e4f76 (GLU-quant and NormResidual+RmsNorm light
@@ -125,8 +128,6 @@ PLOW_BUILD_FA_GQA2_PAIR = "1"
 PLOW_BUILD_PFATTN_HD256_BKV32 = "1"
 PLOW_BUILD_PFATTN_HD256_GQA2_BKV32 = "1"
 PLOW_BUILD_PFATTN_HD512_PX4_BQ64 = "1"
-# CUTLASS swap-AB FP8 decode projections for the routed 64-row rung (PLOW_CUTLASS_FP8_DECODE).
-PLOW_BUILD_CUTLASS_FP8_DECODE = "1"
 
 [emit_roles.env]
 # GLU role off (Lt gate/up + fused GeGLU-quant): step_bench 1x4096 128.5 -> 126.8 ms, 1x15000
@@ -149,11 +150,6 @@ PLOW_DECODE_MAX_RUNG = "64"
 # Prefill FP8 Lt GEMMs with K <= 8192 (all but down) use fast accumulation: step_bench 1x4096
 # 118.5 -> 109.4 ms, 1x15000 538 -> 492; served 4K c32 out tok/s +4.2% (2026-10-05).
 PLOW_LT_FP8_FAST_ACCUM_MAX_K = "8192"
-# B64 decode projections on the packet's CUTLASS objects (cubin:host sha256, CUDA 12.9 + g++-14):
-# step_bench B64 ctx 4096 22.84 -> 20.85 ms, ctx 15000 29.12 -> 27.13; 4K c128 out tok/s +1.7%.
-# The objects build from the repo-relative source path, so any checkout reproduces these bytes
-# (the host library still follows the host compiler).
-PLOW_CUTLASS_FP8_DECODE = "7b20915928c280733108e64036efb981351d6802d0b96c971b5b5462224e1076:0852b6085c29c57ac263c27d61c09ec1621da58f18f93a2dc3e80f03d0587974"
 # Vendor-GEMM (cuBLASLt QK^T / softmax / PV) global prefill attention for every request of >= 128
 # rows instead of >= 1024: long-prefix chunks leave the px4 role (512 rows over 15.5K prefix
 # 37.5 -> 19.9 ms per chunk; 8x512 pack at prefix 12K 238 -> 142 ms); prefix-0 packs equal.

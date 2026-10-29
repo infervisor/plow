@@ -16,8 +16,8 @@ python3 scripts/campaign/campaign.py ledger  /nvme/run/<id>/c1/results.csv --cel
 0. **HARD RULE: screen on a single block first.** A kernel/fusion/route/knob candidate is
    measured on one block at the served shape, precision, flags, rung width and context against a
    calibrated roofline for that block (`docs/bringup/05-single-block-sweep.md`; NVIDIA
-   `block_run bench` + `block_roofline.py`, AMD `block-roofline` / `block-bench` / `block-ab`
-   below). Whole-network `step_bench` (`rung-sweep`), `gate` and serving grids run only for a
+   `build --block`, `block_run bench|prefill-bench`, `block_roofline.py --ceilings`,
+   `nv-block-ab`; AMD `block-roofline` / `block-bench` / `block-ab` below). Whole-network `step_bench` (`rung-sweep`), `gate` and serving grids run only for a
    block-level winner, and the campaign report starts with the block-vs-roofline table (block
    time, roofline floor, % of floor, delta vs current). Harness gaps:
    `docs/bringup/agent-tools.md` "HARD RULE". The baseline of every comparison is the

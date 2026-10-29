@@ -205,17 +205,10 @@ pub(crate) struct Lt {
     stored: std::collections::HashMap<StoredKey, Algo>,
     /// `PLOW_LT_ALGOS_WRITE`: append every load-time selection here.
     write: Option<std::path::PathBuf>,
-    /// `PLOW_CUTLASS_FP8_DECODE`: small-M FP8 decode projections.
-    cutlass_fp8: Option<Arc<super::cutlass_fp8::CutlassFp8>>,
 }
 
 impl Lt {
-    /// `objects`: the serving bundle's object dir (`asset::serve::objects_dir`), where the
-    /// `PLOW_CUTLASS_FP8_DECODE` library lives.
-    pub(crate) fn load(
-        be: &Arc<CudaBackend>,
-        objects: Option<&std::path::Path>,
-    ) -> Result<Arc<Self>> {
+    pub(crate) fn load(be: &Arc<CudaBackend>) -> Result<Arc<Self>> {
         be.bind()?;
         let api = Api::load()?;
         let workspace = be.alloc(0, 256 * 1024 * 1024)?;
@@ -248,19 +241,6 @@ impl Lt {
             );
         }
         let write = nv.lt_algos_write.as_deref().map(std::path::PathBuf::from);
-        let cutlass_fp8 = nv
-            .cutlass_fp8_decode
-            .as_deref()
-            .map(|pins| {
-                let dir = objects.ok_or_else(|| {
-                    RuntimeError::Rejected(
-                        "PLOW_CUTLASS_FP8_DECODE requires PLOW_PF_SEG_DIR or the bundle's objects/"
-                            .into(),
-                    )
-                })?;
-                super::cutlass_fp8::CutlassFp8::load(be, dir, pins)
-            })
-            .transpose()?;
         Ok(Arc::new(Self {
             be: be.clone(),
             api,
@@ -268,12 +248,7 @@ impl Lt {
             workspace,
             stored,
             write,
-            cutlass_fp8,
         }))
-    }
-
-    pub(crate) fn cutlass_fp8(&self) -> Option<&Arc<super::cutlass_fp8::CutlassFp8>> {
-        self.cutlass_fp8.as_ref()
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1607,7 +1582,7 @@ mod tests {
     #[ignore = "requires a leased SM90 GPU and cuBLASLt 12.9 or newer"]
     fn fp8_vector_scales_follow_rows_channels_and_plan_identity() -> Result<()> {
         let be = Arc::new(CudaBackend::new(0)?);
-        let lt = Lt::load(&be, None)?;
+        let lt = Lt::load(&be)?;
         let stream = be.stream_create()?;
         let (m, n, k) = (128usize, 512usize, 3840usize);
         let input = be.alloc(0, (m * k) as u64)?;

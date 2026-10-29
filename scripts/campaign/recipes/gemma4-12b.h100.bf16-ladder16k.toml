@@ -8,7 +8,7 @@
 #   cargo build --release -p plowc && cargo build --release -p plowrt --features cuda
 #   python3 scripts/campaign/campaign.py build <this> --out DIR [--hf-dir SNAPSHOT]
 #   python3 scripts/campaign/campaign.py serve <this> --assets DIR/assets --profile realtime|high_concurrency
-# `serve` leaves the prefix cache on (the PLOW_PREFIX_CACHE=0 below is the matched ladder's);
+# The prefix cache stays on for `serve` and the matched ladder alike.
 # PLOW_LIBCUDA / LD_LIBRARY_PATH below are this host's driver: override with --env elsewhere.
 
 [cell]
@@ -78,7 +78,7 @@ PLOW_EMIT_GEN_KERNELS = "attn_pf_hd256_sliding"
 # else: whole-block (2048-row) checkpoints, pressure eviction and the in-flight prefix wait are
 # the defaults (bd317b28; shared-system-prompt scenario 8 x 2048 + 256: C4 TTFT 291 -> 113 ms,
 # C16 541 -> 281, vLLM 121 / 283). Beside co-tenants raise PLOW_VMM_CACHE_MIN_FREE_MIB.
-PLOW_PREFIX_CACHE = "0"
+# Prefix cache stays on (policy: never disabled in a recipe; match the vLLM peer with its prefix caching on).
 # Serve defaults this recipe used to name: segment classing read from the packet
 # (PLOW_PF_SEG_PURE / PLOW_PF_SEG_FA512), split encode for the one-word BPE tokenizer
 # (PLOW_ENCODE_THREADS 16 / PLOW_ENCODE_SPLIT_MIN 512), the inline mux tick on CUDA, and the

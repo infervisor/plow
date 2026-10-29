@@ -1730,8 +1730,6 @@ pub(super) enum ProjectionBackend {
 enum ProjectionPlan {
     Lt(Arc<crate::device::cuda::lt::Plan>),
     Native(native_decode::Plan),
-    /// Operands are bound into the plan's Params blob.
-    Cutlass(crate::device::cuda::cutlass_fp8::Plan),
     Folded,
 }
 
@@ -1740,7 +1738,6 @@ impl ProjectionPlan {
         match self {
             Self::Lt(p) => p.run(input, weight, output, stream),
             Self::Native(p) => p.run(input, weight, output, stream),
-            Self::Cutlass(p) => p.run(stream),
             Self::Folded => Ok(()),
         }
     }
@@ -1932,7 +1929,6 @@ pub(super) fn prepare_routes(
     let mut plans = std::collections::HashMap::new();
     let mut pair_plans = std::collections::HashMap::new();
     let mut fp8_plans = 0usize;
-    let mut cutlass_plans = 0usize;
     let mut pairs = 0usize;
     let mut index = 0;
     while index < segments.len() {
@@ -2002,30 +1998,14 @@ pub(super) fn prepare_routes(
                 .nv
                 .lt_fp8_fast_accum_max_k
                 .is_some_and(|max_k| segment.k <= max_k);
-            let cutlass = match lt.cutlass_fp8().filter(|_| decode) {
-                Some(c) => c.plan(
-                    segment.m,
-                    segment.n,
-                    segment.k,
-                    [input, weight, output, scales[0], scales[1]],
-                    fast_k,
-                )?,
-                None => None,
-            };
-            let plan = match cutlass {
-                Some(plan) => {
-                    cutlass_plans += 1;
-                    ProjectionPlan::Cutlass(plan)
-                }
-                None => ProjectionPlan::Lt(lt.fp8_plan(
-                    segment.m,
-                    segment.n,
-                    segment.k,
-                    scales[1],
-                    scales[0],
-                    !decode && fast_k,
-                )?),
-            };
+            let plan = ProjectionPlan::Lt(lt.fp8_plan(
+                segment.m,
+                segment.n,
+                segment.k,
+                scales[1],
+                scales[0],
+                !decode && fast_k,
+            )?);
             fp8_plans += 1;
             insts[segment.instruction].op = DevOp::Nop as u16;
             routes.push(Some(CublasLtDecodeRoute {
@@ -2213,7 +2193,6 @@ pub(super) fn prepare_routes(
         projections = routes.iter().flatten().count(),
         plans = plans.len(),
         fp8_plans,
-        cutlass_plans,
         pairs,
         native = matches!(backend, ProjectionBackend::Native(_)),
         "projection routes prepared"

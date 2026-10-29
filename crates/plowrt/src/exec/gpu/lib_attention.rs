@@ -268,6 +268,7 @@ pub(super) struct LibAttention {
     staging_next: usize,
     launch: Option<Launch>,
     max_kv_heads: u32,
+    routed: u64,
     fallbacks: u64,
 }
 
@@ -428,8 +429,14 @@ impl LibAttention {
             staging_next: 0,
             launch: None,
             max_kv_heads,
+            routed: 0,
             fallbacks: 0,
         })
+    }
+
+    /// (launches the library served, launches that fell back to the native role).
+    pub(super) fn launch_counts(&self) -> (u64, u64) {
+        (self.routed, self.fallbacks)
     }
 
     pub(super) fn unload(mut self) -> Result<()> {
@@ -450,7 +457,9 @@ impl LibAttention {
         stream: &CudaStream,
     ) -> Result<bool> {
         let routed = self.plan(requests, rows, stream)?;
-        if !routed {
+        if routed {
+            self.routed += 1;
+        } else {
             self.fallbacks += 1;
             if self.fallbacks.is_power_of_two() {
                 tracing::warn!(
