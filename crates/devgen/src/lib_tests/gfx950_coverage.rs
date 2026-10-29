@@ -150,7 +150,9 @@ fn gemm_f32_standard_decode_ladder_uses_one_numeric_path() {
     };
     let src = std::fs::read_to_string(path).unwrap();
     assert!(src.contains("#define PLOW_GEMM_F32_STANDARD_DECODE_MAX_ROWS 32u"));
-    assert!(src.contains("PLOW_RUNTIME_ROWS(in->i[0]) <= PLOW_GEMM_F32_STANDARD_DECODE_MAX_ROWS"));
+    // Up to the cap the arm takes the GEMV path; only above it the tiled GEMM. Written as the
+    // tiled branch's guard since the GLM-5.3 MI350X campaign (83138e84).
+    assert!(src.contains("PLOW_RUNTIME_ROWS(in->i[0]) > PLOW_GEMM_F32_STANDARD_DECODE_MAX_ROWS"));
 }
 
 /// The gate refuses an opcode with no AMD arm. `GemvArgmax` is the real instance: it has no
@@ -319,6 +321,7 @@ const EMITTER_SRC: &[&str] = &[
     "kda.rs",
     "k3.rs",
     "mla/kimi_k3.rs",
+    "mla/dsv41.rs",
     "qwen35.rs",
     "muse.rs",
 ];

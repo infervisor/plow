@@ -9962,8 +9962,8 @@ fn dsv41_refusal(dir: &std::path::Path) -> String {
 
     out.push_str(
         " The runtime side is most of the way there -- mHC, the DSA indexer, the MXFP4 experts, \
-         the clamped SwiGLU, the CSA2 kernels (ops 212/213) and Engram (ops 214/215) all dispatch \
-         today. What the EMITTER still needs:",
+         the clamped SwiGLU dispatch today. The CSA2 (ops 212/213) and Engram (ops 214/215) \
+         device functions exist but have no interp.hip arm on AMD. What the EMITTER still needs:",
     );
     for (i, gap) in mla::dsv41_gaps(&cfg).iter().enumerate() {
         out.push_str(&format!(" ({}) {gap};", i + 1));
@@ -9984,11 +9984,11 @@ const GFX950_DISPATCHED: &[&str] = &[
     "PLOW_DOP_ATTN_SELECT",
     "PLOW_DOP_DCP_KV_PACK",
     "PLOW_DOP_DCP_KV_SCATTER",
-    "PLOW_DOP_COMPRESS_POOL",
-    "PLOW_DOP_COMPRESS_ROPE_QUANT",
+    // PLOW_DOP_COMPRESS_POOL / _COMPRESS_ROPE_QUANT / _ENGRAM_EMBED / _ENGRAM_GATE: their
+    // interp.hip arms went with fb042f80 (op_compress.h / op_engram.h still hold the device
+    // functions). Listed, a DeepSeek-V4.1 packet would pass the gate and write nothing; unlisted,
+    // it is refused until the arms are restored.
     "PLOW_DOP_DENSE_GLU_FP8_BLK",
-    "PLOW_DOP_ENGRAM_EMBED",
-    "PLOW_DOP_ENGRAM_GATE",
     "PLOW_DOP_DSA_POOL_COMPRESS",
     "PLOW_DOP_DSA_POOL_EXPAND",
     "PLOW_DOP_DSA_POOL_STASH",
@@ -10012,6 +10012,8 @@ const GFX950_DISPATCHED: &[&str] = &[
     "PLOW_DOP_GEMM_F32",
     "PLOW_DOP_GEMM_FP8",
     "PLOW_DOP_GEMM_FP8_BLK",
+    "PLOW_DOP_GEMM_FP8_BLOCK128",
+    "PLOW_DOP_GEMM_FP8_BLOCK128_SPLIT4",
     "PLOW_DOP_GEMM_FP8_MX",
     "PLOW_DOP_GEMM_GLU",
     "PLOW_DOP_GEMM_GLU_FP8",
@@ -10061,6 +10063,7 @@ const GFX950_DISPATCHED: &[&str] = &[
     "PLOW_DOP_KDA_STATE_STEP",
     "PLOW_DOP_KDA_STATE_STEP_G",
     "PLOW_DOP_LAYERNORM",
+    "PLOW_DOP_MLA_BMM_FP8",
     "PLOW_DOP_MLA_MERGE_FOLD",
     "PLOW_DOP_MLA_OUT_GATE",
     "PLOW_DOP_MOE_ALIGN_GEMMA_PF",
@@ -10071,6 +10074,7 @@ const GFX950_DISPATCHED: &[&str] = &[
     "PLOW_DOP_MOE_COMBINE_NORM_GEMMA_PF",
     "PLOW_DOP_MOE_COMBINE_PF",
     "PLOW_DOP_MOE_COMBINE_RESID_NORM_GEMMA",
+    "PLOW_DOP_MOE_DOWN_FP8_BLOCK128",
     "PLOW_DOP_MOE_EXPERT_DOWN",
     "PLOW_DOP_MOE_EXPERT_DOWN_FP8_BLK",
     "PLOW_DOP_MOE_EXPERT_DOWN_GEMMA",
@@ -10087,7 +10091,9 @@ const GFX950_DISPATCHED: &[&str] = &[
     "PLOW_DOP_MOE_GROUP_GLU_FP8_BLK",
     "PLOW_DOP_MOE_GROUP_GLU_GEMMA_PF",
     "PLOW_DOP_MOE_GROUP_GLU_GEMMA_PF_W8A8",
+    "PLOW_DOP_MOE_GLU_FP8_BLOCK128",
     "PLOW_DOP_MOE_GROUP_GLU_PF",
+    "PLOW_DOP_MOE_QUANT_FP8_BLOCK128",
     "PLOW_DOP_MOE_ROUTER",
     "PLOW_DOP_MOE_ROUTER_GEMMA",
     "PLOW_DOP_MOE_ROUTER_GEMMA_PF",
@@ -10104,6 +10110,7 @@ const GFX950_DISPATCHED: &[&str] = &[
     "PLOW_DOP_NORM_RESIDUAL_NORM",
     "PLOW_DOP_O_UV_FOLD",
     "PLOW_DOP_QUANT_FP8",
+    "PLOW_DOP_QUANT_FP8_BLOCK128",
     "PLOW_DOP_QWEN_GATED_NORM",
     "PLOW_DOP_QWEN_GDN_CONV",
     "PLOW_DOP_QWEN_GDN_CONV_PREFILL",
@@ -10121,6 +10128,7 @@ const GFX950_DISPATCHED: &[&str] = &[
     "PLOW_DOP_ROW_GATHER",
     "PLOW_DOP_SITU_GLU",
     "PLOW_DOP_SOFTCAP",
+    "PLOW_DOP_SUM4_BF16",
     "PLOW_DOP_XALLGATHER",
     "PLOW_DOP_XALLTOALL_HEADS",
     "PLOW_DOP_XARGMAX_FIN",
@@ -10130,6 +10138,7 @@ const GFX950_DISPATCHED: &[&str] = &[
     "PLOW_DOP_XREDUCE2",
     "PLOW_DOP_XREDUCESCATTER",
     "PLOW_DOP_XREDUCE_ADD_NORM",
+    "PLOW_DOP_ZERO_F32",
 ];
 
 /// Opcodes executed by isolated `AmdEngine` segments instead of `interp.hip`.
