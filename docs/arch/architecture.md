@@ -47,7 +47,7 @@ duplicate them and is now an index only.
 | [25](25-dspark-pending.md) | **DSpark Block Drafter (pending)** | Pending support |
 | [27](27-kv-zero-copy.md) | **Zero-copy KV** | Shared pages for live and cached rows; measured results |
 | [28](28-library-attention.md) | **Library Attention** | Library attention kernels inside plowrt, per rung |
-| [29](29-techniques.md) | **Techniques** | Per technique: what the op computes, its packet ABI, kernels and objects, KV/state class, backends |
+| [29](29-techniques.md) | **Techniques** | Per technique: what the op computes, its packet ABI, kernels and objects, KV/state class, backends; backend parity table (§8) with the gap per backend |
 
 ---
 
