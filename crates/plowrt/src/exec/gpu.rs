@@ -13356,8 +13356,7 @@ impl GpuEngine {
                         )?;
                     }
                     if lib_routed {
-                        if let Some(Some(site)) =
-                            self.prefill[bi].lib_attention_segments.get(start)
+                        if let Some(Some(site)) = self.prefill[bi].lib_attention_segments.get(start)
                         {
                             let lib = self.lib_attention.as_ref().expect("routed");
                             lib.run_site(site, &self.stream)?;

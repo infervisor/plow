@@ -66,6 +66,25 @@ pub struct LibraryAbi {
 }
 
 impl LibraryAbi {
+    /// The ABI string a library's `plow_fa4_caps` marker states (runtime/nvidia/fa4_hd*.cpp):
+    /// `plow_fa4_caps:abi=3:dtype=<0|1>[:hd=..:heads=..:kv_heads=..:layout=..]`, the bare form
+    /// being the hd512 library.
+    pub fn from_caps(caps: &str) -> Option<String> {
+        let rest = caps.strip_prefix("plow_fa4_caps:abi=3:dtype=")?;
+        let (dtype, geometry) = rest.split_once(':').unwrap_or((rest, ""));
+        let dtype = match dtype {
+            "0" => "bf16",
+            "1" => "f16",
+            _ => return None,
+        };
+        let abi = match (geometry.is_empty(), dtype) {
+            (true, "f16") => LIBRARY_FA4_HD512_F16_ABI.to_string(),
+            (true, _) => LIBRARY_FA4_HD512_BF16_ABI.to_string(),
+            _ => format!("{LIBRARY_ABI_PREFIX}{geometry}:dtype={dtype}"),
+        };
+        Self::parse(&abi).map(|_| abi)
+    }
+
     pub fn parse(abi: &str) -> Option<Self> {
         let hd512 = |f16| LibraryAbi {
             head_dim: 512,
@@ -999,7 +1018,10 @@ mod tests {
         assert!(parse("lib_flash_prefill_v1:fa4_hd512:fp8", r#","library":[1]"#).is_err());
         let qwen = "lib_flash_prefill_v1:fa4:hd=256:heads=24:kv_heads=4:layout=ilv:dtype=bf16";
         assert!(parse(qwen, r#","library":[1]"#).is_ok());
-        assert_eq!(LibraryAbi::parse(qwen).map(|a| a.format()).as_deref(), Some(qwen));
+        assert_eq!(
+            LibraryAbi::parse(qwen).map(|a| a.format()).as_deref(),
+            Some(qwen)
+        );
         assert_eq!(
             LibraryAbi::parse(LIBRARY_FA4_HD512_BF16_ABI).map(|a| a.kv_heads),
             Some(vec![1, 2])

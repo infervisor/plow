@@ -7,7 +7,7 @@ use packet::dev::{DevOp, TENSOR_NONE};
 use packet::devbuild::Model;
 use plow_asset::segment_roles::{
     LibraryAbi, LibraryKvLayout, ProgramRoles, SegmentObject, SegmentRoles,
-    LIBRARY_FA4_HD512_BF16_ABI, LIBRARY_FA4_HD512_F16_ABI, LIBRARY_PREFILL_ATTENTION, SECTION,
+    LIBRARY_PREFILL_ATTENTION, SECTION,
 };
 use std::path::Path;
 
@@ -23,27 +23,13 @@ fn library_abi(image: &[u8]) -> Result<String, String> {
         .windows(CAPS.len())
         .position(|w| w == CAPS)
         .ok_or("library carries no plow_fa4 ABI 3 capability marker")?;
-    let rest = &image[at + CAPS.len()..];
-    let end = rest.iter().position(|&b| b == 0).ok_or("unterminated caps")?;
+    let rest = &image[at..];
+    let end = rest
+        .iter()
+        .position(|&b| b == 0)
+        .ok_or("unterminated caps")?;
     let caps = std::str::from_utf8(&rest[..end]).map_err(|_| "caps not UTF-8")?;
-    let (dtype, geometry) = caps.split_once(':').unwrap_or((caps, ""));
-    let dtype = match dtype {
-        "0" => "bf16",
-        "1" => "f16",
-        _ => return Err(format!("unknown plow_fa4 dtype {dtype}")),
-    };
-    let abi = if geometry.is_empty() {
-        if dtype == "f16" {
-            LIBRARY_FA4_HD512_F16_ABI.to_string()
-        } else {
-            LIBRARY_FA4_HD512_BF16_ABI.to_string()
-        }
-    } else {
-        format!("lib_flash_prefill_v1:fa4:{geometry}:dtype={dtype}")
-    };
-    LibraryAbi::parse(&abi)
-        .map(|_| abi.clone())
-        .ok_or_else(|| format!("library capability {abi:?} unsupported"))
+    LibraryAbi::from_caps(caps).ok_or_else(|| format!("library capability {caps:?} unsupported"))
 }
 
 /// The runtime's site contract (plowrt `lib_attention::sites`): causal global attention of the
@@ -130,7 +116,11 @@ pub(crate) fn apply_output_object(
                 library.push(segment as u32);
             }
         }
-        let claimed = program.insts.iter().filter(|op| is_claimed(op, &abi)).count();
+        let claimed = program
+            .insts
+            .iter()
+            .filter(|op| is_claimed(op, &abi))
+            .count();
         if claimed == 0 {
             continue;
         }
@@ -192,12 +182,14 @@ mod tests {
         image.extend_from_slice(b"plow_fa4_caps:abi=3:dtype=1\0");
         assert_eq!(
             super::library_abi(&image).as_deref(),
-            Ok(super::LIBRARY_FA4_HD512_F16_ABI)
+            Ok(plow_asset::segment_roles::LIBRARY_FA4_HD512_F16_ABI)
         );
         assert!(super::library_abi(b"plow_fa4_caps:abi=2:dtype=0\0").is_err());
         assert_eq!(
-            super::library_abi(b"..plow_fa4_caps:abi=3:dtype=0:hd=256:heads=24:kv_heads=4:layout=ilv\0")
-                .as_deref(),
+            super::library_abi(
+                b"..plow_fa4_caps:abi=3:dtype=0:hd=256:heads=24:kv_heads=4:layout=ilv\0"
+            )
+            .as_deref(),
             Ok("lib_flash_prefill_v1:fa4:hd=256:heads=24:kv_heads=4:layout=ilv:dtype=bf16")
         );
     }

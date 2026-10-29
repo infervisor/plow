@@ -401,6 +401,20 @@ impl LibAttention {
                     .map_err(|_| sym(b"plow_fa4_convert\0"))?,
             )
         };
+        // SAFETY: a NUL-terminated string the library exports (fa4_hd*.cpp `plow_fa4_caps`).
+        let caps = unsafe {
+            lib.get::<*const std::ffi::c_char>(b"plow_fa4_caps\0")
+                .ok()
+                .map(|p| std::ffi::CStr::from_ptr(*p).to_string_lossy().into_owned())
+        };
+        let stated = caps.as_deref().and_then(LibraryAbi::from_caps);
+        if stated.as_deref().and_then(LibraryAbi::parse).as_ref() != Some(&declared) {
+            return Err(RuntimeError::Rejected(format!(
+                "{}: library states {caps:?}; the packet declares {}",
+                library.display(),
+                object.abi
+            )));
+        }
         // SAFETY: no arguments.
         let (abi, dtype) = unsafe { (abi(), dtype()) };
         if abi != 3 || dtype != u32::from(declared.f16) {
