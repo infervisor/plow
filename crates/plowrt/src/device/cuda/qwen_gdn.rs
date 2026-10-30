@@ -1,4 +1,4 @@
-use super::aot::{Exemplar, Image, Kernel, Launch};
+use super::aot::{Exemplar, Image, Kernel, Launch, Manifest};
 use super::{CudaBackend, CudaStream};
 use crate::{
     device::{Backend, DeviceMem},
@@ -94,21 +94,27 @@ type MapFn<'a> = &'a dyn Fn(u64, u64, u64, u32, u32) -> Result<[u8; 128]>;
 fn build_with(map: MapFn, l: &mut Launch, tokens: u64, nseq: u64, p: &Operands) -> Result<()> {
     let gate = (tokens * 48) as u32;
     let state = (nseq * 48 * 128 * 128) as u32;
+    // `{ptr, i32 extent}` tensors and the i64 shape slots the export fills as i32: the tails
+    // (`DEFINED`) are padding the kernel never loads (the builder's SASS proof).
     let ptr_len = |l: &mut Launch, i: usize, ptr: u64, n: u32| {
         l.u64(i, 0, ptr);
         l.u32(i, 8, n);
-        l.u32(i, 12, 0);
+        l.pad(i, 12, 4);
+    };
+    let shape = |l: &mut Launch, i: usize| {
+        l.u32(i, 0, tokens as u32);
+        l.pad(i, 4, 4);
     };
     ptr_len(l, 0, p.alpha, gate);
     ptr_len(l, 1, p.beta, gate);
     l.tmap(2, &map(p.q, 16, 4096, 64, SWIZZLE_128B)?);
-    l.u64(3, 0, tokens);
+    shape(l, 3);
     l.tmap(4, &map(p.k, 16, 4096, 64, SWIZZLE_128B)?);
-    l.u64(5, 0, tokens);
+    shape(l, 5);
     l.tmap(6, &map(p.v, 48, 12288, 64, SWIZZLE_128B)?);
-    l.u64(7, 0, tokens);
+    shape(l, 7);
     l.tmap(8, &map(p.o, 48, 12288, 16, SWIZZLE_32B)?);
-    l.u64(9, 0, tokens);
+    shape(l, 9);
     ptr_len(l, 10, p.state, state);
     ptr_len(l, 11, p.initial, state);
     l.u64(12, 0, p.maps);
@@ -145,7 +151,18 @@ fn load_kernel(be: &CudaBackend, path: &Path) -> Result<Kernel> {
         ))
     })?;
     let image = Image::parse(bytes)?;
-    let m = &image.manifest;
+    check_manifest(&image.manifest)?;
+    let entry = image.entry(ENTRY)?;
+    let kernel = Kernel::load(be, &image, entry)?;
+    for x in &entry.exemplars {
+        check_exemplar(&kernel.layout, x, |l, tokens, nseq, p| {
+            build(be, l, tokens, nseq, p)
+        })?;
+    }
+    Ok(kernel)
+}
+
+fn check_manifest(m: &Manifest) -> Result<()> {
     let upstream: Vec<(&str, &str)> = m
         .upstream
         .iter()
@@ -162,26 +179,30 @@ fn load_kernel(be: &CudaBackend, path: &Path) -> Result<Kernel> {
             m.host_stub, m.host_stub_version, m.abi
         )));
     }
-    let entry = image.entry(ENTRY)?;
-    let kernel = Kernel::load(be, &image, entry)?;
-    for x in &entry.exemplars {
-        let (tokens, nseq, p) = exemplar_operands(x)?;
-        if x.params.len() != DEFINED.len()
-            || x.params
-                .iter()
-                .zip(DEFINED)
-                .any(|(h, d)| h.get(..2 * d).is_none_or(|h| h.contains("..")))
-        {
-            return Err(rejected(format!(
-                "exemplar tokens={tokens} nseq={nseq} masks a defined parameter byte"
-            )));
-        }
-        let mut l = Launch::new(&kernel.layout);
-        build(be, &mut l, tokens, nseq, &p)?;
-        l.matches(x)
-            .map_err(|e| rejected(format!("exemplar tokens={tokens} nseq={nseq}: {e}")))?;
+    Ok(())
+}
+
+/// The stub must rebuild exemplar `x` (built through `build`) byte for byte, no defined byte masked.
+fn check_exemplar(
+    layout: &[(usize, usize)],
+    x: &Exemplar,
+    build: impl FnOnce(&mut Launch, u64, u64, &Operands) -> Result<()>,
+) -> Result<()> {
+    let (tokens, nseq, p) = exemplar_operands(x)?;
+    if x.params.len() != DEFINED.len()
+        || x.params
+            .iter()
+            .zip(DEFINED)
+            .any(|(h, d)| h.get(..2 * d).is_none_or(|h| h.contains("..")))
+    {
+        return Err(rejected(format!(
+            "exemplar tokens={tokens} nseq={nseq} masks a defined parameter byte"
+        )));
     }
-    Ok(kernel)
+    let mut l = Launch::new(layout);
+    build(&mut l, tokens, nseq, &p)?;
+    l.matches(x)
+        .map_err(|e| rejected(format!("exemplar tokens={tokens} nseq={nseq}: {e}")))
 }
 
 fn exemplar_operands(x: &Exemplar) -> Result<(u64, u64, Operands)> {
@@ -427,14 +448,16 @@ mod tests {
         std::array::from_fn(|i| DeviceMem::view((i as u64 + 1) << 30, 128 << 20))
     }
 
-    /// CPU: the stub rebuilds every exemplar's non-tensor-map bytes and config (tensor maps are
-    /// taken from the capture; `layer_dump` on a GPU checks the driver's encoding at load).
+    /// The manifest of the shipped object (`plow_gdn_prefill.aot` sha256 ca6b31b6c96015d2…, RC2
+    /// Qwen3.8 packets) through the loader's own checks: identity, then every exemplar rebuilt by
+    /// the stub and validated by `aot::Launch::matches` (tensor maps taken from the capture; the
+    /// driver encoding is checked at load on a GPU).
     #[test]
-    #[ignore = "GDN_AOT_DIR=<dir holding plow_gdn_prefill.aot>"]
-    fn stub_rebuilds_exemplar_scalars() {
-        let dir = std::path::PathBuf::from(std::env::var("GDN_AOT_DIR").expect("GDN_AOT_DIR"));
-        let image = Image::parse(std::fs::read(dir.join(OBJECT)).unwrap()).unwrap();
-        let e = image.entry(ENTRY).unwrap();
+    fn stub_rebuilds_shipped_exemplars() {
+        let m: Manifest =
+            serde_json::from_str(include_str!("testdata/plow_gdn_prefill.manifest.json")).unwrap();
+        check_manifest(&m).unwrap();
+        let e = m.entries.iter().find(|e| e.name == ENTRY).unwrap();
         let layout: Vec<(usize, usize)> = e
             .params
             .iter()
@@ -442,22 +465,22 @@ mod tests {
             .collect();
         assert_eq!(e.exemplars.len(), 3);
         for x in &e.exemplars {
-            let (tokens, nseq, p) = exemplar_operands(x).unwrap();
             let captured = |i: usize| -> [u8; 128] {
                 std::array::from_fn(|b| {
                     u8::from_str_radix(&x.params[i][2 * b..2 * b + 2], 16).unwrap_or(0)
                 })
             };
-            let map = |base: u64, _: u64, _: u64, _: u32, _: u32| {
-                let i = [p.q, p.k, p.v, p.o]
-                    .iter()
-                    .position(|&b| b == base)
-                    .unwrap();
-                Ok(captured(2 + 2 * i))
-            };
-            let mut l = Launch::new(&layout);
-            build_with(&map, &mut l, tokens, nseq, &p).unwrap();
-            l.matches(x).unwrap();
+            check_exemplar(&layout, x, |l, tokens, nseq, p| {
+                let map = |base: u64, _: u64, _: u64, _: u32, _: u32| {
+                    let i = [p.q, p.k, p.v, p.o]
+                        .iter()
+                        .position(|&b| b == base)
+                        .unwrap();
+                    Ok(captured(2 + 2 * i))
+                };
+                build_with(&map, l, tokens, nseq, p)
+            })
+            .unwrap();
         }
     }
 
