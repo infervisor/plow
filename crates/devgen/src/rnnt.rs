@@ -69,6 +69,7 @@ pub struct RnntPackets {
     frontend: Option<EmbeddedLogMelFrontend>,
     encoder_buckets: BTreeMap<u32, Vec<usize>>,
     stream: Option<StreamPrograms>,
+    chunk: Option<ChunkPrograms>,
     batched: Option<BatchedDecode>,
     /// Frames each TDT duration logit advances (`spec.durations` values).
     tdt_durations: Vec<u32>,
@@ -103,6 +104,85 @@ struct StreamPrograms {
     first: Vec<usize>,
     step: Vec<usize>,
     input: String,
+}
+
+/// Geometry of a batched cache-aware stream (see [`RnntPackets::add_chunk_stream`]).
+#[derive(Clone, Copy, Debug)]
+pub struct ChunkGeometry {
+    /// New encoder frames per stream per step (whole attention chunks).
+    pub rows: u32,
+    /// Attention left context in encoder frames.
+    pub left_rows: u32,
+    /// Cache-table rows: one per stream, the last a scratch row for padding items.
+    pub slots: u32,
+    /// Mel frames of a stream's first window (it keeps subsampled rows `0..rows`) and of its
+    /// later windows, whose leading `history` frames repeat the previous window's.
+    pub first_input_frames: u32,
+    pub step_input_frames: u32,
+    pub history_input_frames: u32,
+    /// Subsampled row of a later window where its new rows start.
+    pub step_keep_row0: u32,
+    /// First `act.rnnt.batch.encoder` row of the steps' joint rows, and the batched decode's
+    /// predictor slot for stream slot 0 (the slots below serve offline recordings).
+    pub encoder_row0: u32,
+    pub predictor_slot0: u32,
+}
+
+/// The programs of one batched stream width: `items` streams per launch.
+pub struct ChunkRung {
+    pub items: u32,
+    /// Subsampling of `items` first windows and of `items` later windows
+    /// (`asr_subsampling::lower_items`).
+    pub first: crate::asr_subsampling::SubsamplingPackets,
+    pub next: crate::asr_subsampling::SubsamplingPackets,
+    /// The encoder layers over the `items` streams (`conformer::append_chunk_step` with
+    /// [`CHUNK_INPUTS`]).
+    pub step: PacketPrefix,
+}
+
+struct ChunkPrograms {
+    geometry: ChunkGeometry,
+    init: usize,
+    /// (items, first-window, later-window and step program sequences), ascending.
+    rungs: Vec<(u32, [Vec<usize>; 3])>,
+    staging_rows: u32,
+}
+
+const CHUNK_FIRST: &str = "in.chunk.first";
+const CHUNK_NEXT: &str = "in.chunk.next";
+const CHUNK_JOINT: &str = "act.chunk.joint";
+
+/// Names of a batched stream step's per-step inputs.
+pub const CHUNK_INPUTS: crate::conformer::ChunkInputs<'static> = crate::conformer::ChunkInputs {
+    staging: "act.chunk.staging",
+    index: "in.chunk.index",
+    slot: "in.chunk.slot",
+    pos: "in.chunk.pos",
+    key_start: "in.chunk.key_start",
+    shift: "in.chunk.shift",
+};
+
+/// `Q8GemmF32` path `i7`: tiles at any row count.
+const Q8_TILES: u32 = 2;
+
+/// Every `Q8GemmF32` of `programs` takes `path`.
+fn pin_q8(model: &mut Model, programs: &[usize], path: u32) {
+    for &program in programs {
+        for inst in &mut model.progs[program].insts {
+            if DevOp::from_u16(inst.op) == Some(DevOp::Q8GemmF32) {
+                inst.i[7] = path;
+            }
+        }
+    }
+}
+
+fn rename(model: &mut Model, from: &str, to: &str) -> Result<(), String> {
+    model
+        .tensors
+        .iter_mut()
+        .find(|t| t.name == from)
+        .map(|t| t.name = to.into())
+        .ok_or_else(|| format!("tensor {from} is missing"))
 }
 
 /// Greedy decode of many recordings per launch (see [`RnntPackets::add_batched_decode`]).
@@ -252,6 +332,192 @@ impl RnntPackets {
             first,
             step,
             input,
+        });
+        Ok(())
+    }
+
+    /// Batched cache-aware stream steps. Per rung of `items` streams: `chunk.first.{items}` and
+    /// `chunk.next.{items}` subsample that many first windows (`in.chunk.first`) and later windows
+    /// (`in.chunk.next`) into the two halves of the staging table, and `chunk.step.{items}` runs
+    /// the encoder layers over `items` streams picked from it, then the joint encoder projection
+    /// into `act.rnnt.batch.encoder` from `encoder_row0`. Every Q8 GEMM takes tiles, so a stream's
+    /// rows do not depend on the batch. `chunk.init` fills the positions once.
+    pub fn add_chunk_stream(
+        &mut self,
+        geometry: ChunkGeometry,
+        init: Model,
+        rungs: Vec<ChunkRung>,
+        weights: &RnntWeights<'_>,
+    ) -> Result<(), String> {
+        let prompt_index = self
+            .compiled_prompt_index
+            .ok_or("a stream needs a compiled RNNT prompt")?;
+        let max_items = rungs.last().map_or(0, |rung| rung.items);
+        if self.chunk.is_some()
+            || rungs.first().is_none_or(|rung| rung.items == 0)
+            || !rungs.windows(2).all(|pair| pair[0].items < pair[1].items)
+            || geometry.rows == 0
+            || geometry.slots < 2
+        {
+            return Err("invalid batched RNNT stream".into());
+        }
+        let (rows, width, joint_width) = (
+            geometry.rows,
+            self.spec.encoder_width,
+            self.spec.joint_width,
+        );
+        let staging_rows = 2 * max_items * rows;
+        let n_cu = self.model.n_cu;
+        let mut sequences = Vec::with_capacity(rungs.len());
+        for rung in rungs {
+            let items = rung.items;
+            // A window kind's subsampling, then its items' new rows into its half of the staging.
+            let mut windows = |sub: crate::asr_subsampling::SubsamplingPackets,
+                               input: &str,
+                               keep_row0: u32,
+                               row0: u32|
+             -> Result<Vec<usize>, String> {
+                let frames = sub.output_frames;
+                if sub.output_width != width || keep_row0 + rows > frames {
+                    return Err("batched stream windows do not cover the step rows".into());
+                }
+                let source = sub.output;
+                let mut prefix = sub.into_prefix();
+                let conv_input = prefix.model.tensors[prefix.input as usize].name.clone();
+                rename(&mut prefix.model, &conv_input, input)?;
+                let mut b = builder(n_cu, prefix.model.tensors.clone());
+                let staging = b.tensor(
+                    CHUNK_INPUTS.staging,
+                    u64::from(staging_rows) * u64::from(width) * 4,
+                );
+                b.emit(DevOp::CopyColsF32, b.all(), &[], |d| {
+                    d.t[..2].copy_from_slice(&[staging, source]);
+                    d.i = [
+                        items,
+                        rows,
+                        width,
+                        width,
+                        keep_row0 * width,
+                        width,
+                        row0 * width,
+                        0,
+                    ];
+                    d.j = [frames * width, rows * width];
+                });
+                let mut model = prefix.model;
+                model.tensors = b.tensors();
+                let mut sequence = prefix.programs;
+                sequence.push(model.progs.len());
+                model.progs.push(b.finish());
+                model.prog_t.push(items * rows);
+                pin_q8(&mut model, &sequence, Q8_TILES);
+                graft(&mut self.model, model, &sequence)
+            };
+            let first = windows(rung.first, CHUNK_FIRST, 0, 0)?;
+            let next = windows(
+                rung.next,
+                CHUNK_NEXT,
+                geometry.step_keep_row0,
+                max_items * rows,
+            )?;
+            let prefix = rung.step;
+            if prefix.model.tensors[prefix.output as usize].bytes
+                != u64::from(items * rows) * u64::from(width) * 4
+            {
+                return Err("batched stream step rows do not match its rung".into());
+            }
+            let mut b = builder(n_cu, prefix.model.tensors.clone());
+            let spec = RnntSpec {
+                frames: items * rows,
+                ..self.spec
+            };
+            emit_encoder(
+                &mut b,
+                spec,
+                weights,
+                EncoderInput::Existing {
+                    tensor: prefix.output,
+                    prompt_index,
+                },
+            );
+            let mut model = prefix.model;
+            model.tensors = b.tensors();
+            let mut sequence = prefix.programs;
+            sequence.push(model.progs.len());
+            model.progs.push(b.finish());
+            model.prog_t.push(items * rows);
+            // Off the batch-1 encoder's tensors: the runtime sizes its frames by encoder_joint.
+            for (from, to) in [
+                ("act.rnnt.prompt_hidden", "act.chunk.prompt_hidden"),
+                ("act.rnnt.encoded", "act.chunk.encoded"),
+                ("act.rnnt.encoder_joint", CHUNK_JOINT),
+            ] {
+                rename(&mut model, from, to)?;
+            }
+            // The joint rows into the batched decode's encoder table (programs run in order).
+            let mut b = builder(n_cu, model.tensors.clone());
+            let joint = b.tensor(CHUNK_JOINT, bytes3(items * rows, joint_width, 4));
+            let table = b.tensor(
+                BATCH_ENCODER,
+                bytes3(geometry.encoder_row0 + max_items * rows, joint_width, 4),
+            );
+            b.emit(DevOp::CopyColsF32, b.all(), &[], |d| {
+                d.t[..2].copy_from_slice(&[table, joint]);
+                d.i = [
+                    1,
+                    items * rows,
+                    joint_width,
+                    joint_width,
+                    0,
+                    joint_width,
+                    geometry.encoder_row0 * joint_width,
+                    0,
+                ];
+            });
+            model.tensors = b.tensors();
+            sequence.push(model.progs.len());
+            model.progs.push(b.finish());
+            model.prog_t.push(items * rows);
+            pin_q8(&mut model, &sequence, Q8_TILES);
+            let step = graft(&mut self.model, model, &sequence)?;
+            sequences.push((items, [first, next, step]));
+        }
+        // The per-step inputs at the widest rung, whatever the steps declared.
+        let mut b = builder(n_cu, Vec::new());
+        b.tensor(CHUNK_INPUTS.index, u64::from(max_items * rows) * 4);
+        for name in [
+            CHUNK_INPUTS.slot,
+            CHUNK_INPUTS.pos,
+            CHUNK_INPUTS.key_start,
+            CHUNK_INPUTS.shift,
+        ] {
+            b.tensor(name, u64::from(max_items) * 4);
+        }
+        let inputs = Model {
+            n_cu,
+            target: 0,
+            tensors: b.tensors(),
+            progs: Vec::new(),
+            prog_t: Vec::new(),
+            kv_row_insts: Vec::new(),
+            gen: Vec::new(),
+        };
+        graft(&mut self.model, inputs, &[])?;
+        let init = graft(&mut self.model, init, &[0])?[0];
+        let shift = rows.to_ne_bytes();
+        for tensor in self
+            .model
+            .tensors
+            .iter_mut()
+            .filter(|t| t.name == CHUNK_INPUTS.shift)
+        {
+            tensor.init = Some(shift.repeat(tensor.bytes as usize / 4));
+        }
+        self.chunk = Some(ChunkPrograms {
+            geometry,
+            init,
+            rungs: sequences,
+            staging_rows,
         });
         Ok(())
     }
@@ -780,6 +1046,70 @@ impl RnntPackets {
                 parameters.insert(name.into(), u64::from(value));
             }
         }
+        if let Some(chunk) = &self.chunk {
+            let g = chunk.geometry;
+            programs.insert("chunk.init".into(), chunk.init as u32);
+            for (items, sequences) in &chunk.rungs {
+                for (kind, sequence) in ["first", "next", "step"].into_iter().zip(sequences) {
+                    for (stage, &program) in sequence.iter().enumerate() {
+                        programs.insert(format!("chunk.{kind}.{items}.{stage}"), program as u32);
+                    }
+                }
+            }
+            let max_items = chunk.rungs.last().map_or(0, |rung| rung.0);
+            for (role, name, frames) in [
+                ("chunk.input.first", CHUNK_FIRST, g.first_input_frames),
+                ("chunk.input.next", CHUNK_NEXT, g.step_input_frames),
+            ] {
+                let windows = u64::from(max_items) * u64::from(frames) * 4;
+                let bytes = self
+                    .model
+                    .tensors
+                    .iter()
+                    .find(|t| t.name == name)
+                    .map_or(0, |t| t.bytes);
+                if windows == 0 || bytes == 0 || bytes % windows != 0 {
+                    return Err(format!("{name} does not hold {max_items} windows"));
+                }
+                tensors.insert(
+                    role.into(),
+                    PipelineTensor {
+                        name: name.into(),
+                        dtype: PipelineDType::F32,
+                        shape: vec![u64::from(max_items), u64::from(frames), bytes / windows],
+                    },
+                );
+            }
+            for (role, name, count) in [
+                ("chunk.index", CHUNK_INPUTS.index, max_items * g.rows),
+                ("chunk.slot", CHUNK_INPUTS.slot, max_items),
+                ("chunk.pos", CHUNK_INPUTS.pos, max_items),
+                ("chunk.key_start", CHUNK_INPUTS.key_start, max_items),
+            ] {
+                tensors.insert(
+                    role.into(),
+                    PipelineTensor {
+                        name: name.into(),
+                        dtype: PipelineDType::U32,
+                        shape: vec![u64::from(count)],
+                    },
+                );
+            }
+            for (name, value) in [
+                ("chunk.rows", g.rows),
+                ("chunk.left_rows", g.left_rows),
+                ("chunk.slots", g.slots),
+                ("chunk.first_input_frames", g.first_input_frames),
+                ("chunk.step_input_frames", g.step_input_frames),
+                ("chunk.history_input_frames", g.history_input_frames),
+                ("chunk.staging_rows", chunk.staging_rows),
+                ("chunk.next_row0", max_items * g.rows),
+                ("chunk.encoder_row0", g.encoder_row0),
+                ("chunk.predictor_slot0", g.predictor_slot0),
+            ] {
+                parameters.insert(name.into(), u64::from(value));
+            }
+        }
         if let Some(batched) = &self.batched {
             let g = batched.geometry;
             for &(items, program) in &batched.predict {
@@ -1063,6 +1393,7 @@ fn lower_inner(
         frontend: None,
         encoder_buckets: BTreeMap::new(),
         stream: None,
+        chunk: None,
         batched: None,
         tdt_durations: Vec::new(),
         output: None,
@@ -1315,8 +1646,14 @@ fn emit_batched_predictor(
     let mut stored = None;
     let mut input = embedding;
     for (layer, weights) in w.lstm.iter().enumerate() {
-        let h_state = b.tensor(&format!("state.batch.rnnt.h.{layer}"), bytes3(g.slots, pw, 4));
-        let c_state = b.tensor(&format!("state.batch.rnnt.c.{layer}"), bytes3(g.slots, pw, 4));
+        let h_state = b.tensor(
+            &format!("state.batch.rnnt.h.{layer}"),
+            bytes3(g.slots, pw, 4),
+        );
+        let c_state = b.tensor(
+            &format!("state.batch.rnnt.c.{layer}"),
+            bytes3(g.slots, pw, 4),
+        );
         let h_prev = b.tensor("act.rnnt.batch.h_prev", lanes(pw));
         let c_prev = b.tensor("act.rnnt.batch.c_prev", lanes(pw));
         let gates = b.tensor("act.rnnt.batch.gates", lanes(4 * pw));
@@ -2163,5 +2500,197 @@ mod tests {
             8,
             "slot state stays out of the batch-1 predictor state"
         );
+    }
+
+    #[test]
+    fn chunk_stream_pins_tiles_and_publishes_its_roles() {
+        use crate::asr_subsampling::{
+            lower_items, Conv2dStage, ConvActivation, ConvKind, ConvWeight, Projection,
+            SubsamplingSpec,
+        };
+        use crate::conv2d::ConvLayout;
+        let weights = RnntWeights {
+            prompt_in: linear("prompt.in"),
+            prompt_out: linear("prompt.out"),
+            encoder: linear("joint.enc"),
+            embedding: "embed.weight",
+            lstm: &LSTM,
+            predictor: linear("joint.pred"),
+            output: linear("joint.out"),
+        };
+        let spec = RnntSpec {
+            frames: 3,
+            encoder_width: 32,
+            prompt_count: 4,
+            prompt_width: 64,
+            vocabulary: 64,
+            durations: 0,
+            predictor_width: 32,
+            joint_width: 32,
+            joint_batch: 3,
+        };
+        // One ReLU standing in for an encoder program: `rows` x 32 from `input` to `output`.
+        let stand_in = |input: &str, output: &str, rows: u32| -> PacketPrefix {
+            let mut b = builder(4, Vec::new());
+            let i = b.tensor(input, bytes3(rows, 32, 4));
+            let o = b.tensor(output, bytes3(rows, 32, 4));
+            b.emit(DevOp::ReluF32, b.all(), &[], |d| {
+                d.t[..2].copy_from_slice(&[o, i]);
+                d.i[0] = rows * 32;
+            });
+            let tensors = b.tensors();
+            PacketPrefix {
+                model: Model {
+                    n_cu: 4,
+                    target: 0,
+                    tensors,
+                    progs: vec![b.finish()],
+                    prog_t: vec![rows],
+                    kv_row_insts: Vec::new(),
+                    gen: Vec::new(),
+                },
+                programs: vec![0],
+                input: i,
+                output: o,
+                input_shape: vec![u64::from(rows), 32],
+            }
+        };
+        let mut packets = append(spec, &weights, stand_in("in.test", "act.test.x", 3), 0).unwrap();
+        let stage =
+            |name, kernel, stride, pad: (u32, u32), channels: (u32, u32), layout| Conv2dStage {
+                weight: name,
+                bias: name,
+                kernel,
+                stride,
+                width_stride: 0,
+                pad_before: pad.0,
+                pad_after: pad.1,
+                input_channels: channels.0,
+                output_channels: channels.1,
+                kind: ConvKind::Standard,
+                activation: ConvActivation::Relu,
+                output_layout: layout,
+                weight_type: ConvWeight::F16,
+            };
+        let stages = [
+            stage("conv.0", 3, 2, (2, 1), (1, 32), ConvLayout::ChannelsLast),
+            stage(
+                "conv.1",
+                1,
+                1,
+                (0, 0),
+                (32, 32),
+                ConvLayout::FrameChannelsWidth,
+            ),
+        ];
+        // 8 mel frames subsample to 5 rows, 12 to 7; a step keeps 2 rows per stream.
+        let subsample = |input_frames, items| {
+            let spec = SubsamplingSpec {
+                input_frames,
+                input_width: 7,
+            };
+            let projection = Projection {
+                weight: "projection.weight",
+                bias: "projection.bias",
+                output_width: 32,
+            };
+            lower_items(spec, &stages, projection, 4, items).unwrap()
+        };
+        let rung = |items| ChunkRung {
+            items,
+            first: subsample(8, items),
+            next: subsample(12, items),
+            step: stand_in(CHUNK_INPUTS.staging, "act.chunk.x", items * 2),
+        };
+        let geometry = ChunkGeometry {
+            rows: 2,
+            left_rows: 4,
+            slots: 3,
+            first_input_frames: 8,
+            step_input_frames: 12,
+            history_input_frames: 4,
+            step_keep_row0: 2,
+            encoder_row0: 6,
+            predictor_slot0: 2,
+        };
+        let init = stand_in("act.test.table", "act.stream.position.0", 1).model;
+        packets
+            .add_chunk_stream(geometry, init, vec![rung(1), rung(2)], &weights)
+            .unwrap();
+
+        let section = packets.pipeline_section(63, 10, 0).unwrap();
+        let metadata: plow_asset::packet_pipeline::PacketPipelines =
+            serde_json::from_slice(&section.data).unwrap();
+        let pipeline = &metadata.pipelines[0];
+        let program = |role: &str| &packets.model.progs[pipeline.programs[role] as usize];
+        let name = |t: u32| packets.model.tensors[t as usize].name.as_str();
+        let chunk: Vec<_> = pipeline
+            .programs
+            .keys()
+            .filter(|role| role.starts_with("chunk.") && *role != "chunk.init")
+            .collect();
+        assert_eq!(chunk.len(), 2 * 3 * 3);
+        let paths: Vec<_> = chunk
+            .iter()
+            .flat_map(|role| &program(role).insts)
+            .filter(|inst| DevOp::from_u16(inst.op) == Some(DevOp::Q8GemmF32))
+            .map(|inst| inst.i[7])
+            .collect();
+        // Each rung's two window projections and its joint encoder projection.
+        assert_eq!(paths, [Q8_TILES; 6]);
+        assert_eq!(name(program("chunk.first.2.0").insts[0].t[1]), CHUNK_FIRST);
+        assert_eq!(name(program("chunk.next.2.0").insts[0].t[1]), CHUNK_NEXT);
+        // First windows' rows 0.. into the staging's first half, later windows' rows 2.. into
+        // the second.
+        let first = &program("chunk.first.2.2").insts[0];
+        assert_eq!(
+            (first.i, first.j),
+            ([2, 2, 32, 32, 0, 32, 0, 0], [5 * 32, 2 * 32])
+        );
+        let next = &program("chunk.next.2.2").insts[0];
+        assert_eq!(
+            (next.i, next.j),
+            ([2, 2, 32, 32, 64, 32, 128, 0], [7 * 32, 2 * 32])
+        );
+        assert_eq!(name(next.t[0]), CHUNK_INPUTS.staging);
+        // The joint rows go to the batched decode's table from row 6, off the batch-1 tensors.
+        let copy = &program("chunk.step.2.2").insts[0];
+        assert_eq!(copy.i, [1, 4, 32, 32, 0, 32, 6 * 32, 0]);
+        assert_eq!(
+            (name(copy.t[0]), name(copy.t[1])),
+            (BATCH_ENCODER, CHUNK_JOINT)
+        );
+        let bytes = |n: &str| {
+            packets
+                .model
+                .tensors
+                .iter()
+                .find(|t| t.name == n)
+                .unwrap()
+                .bytes
+        };
+        assert_eq!(bytes("act.rnnt.encoder_joint"), bytes3(3, 32, 4));
+        assert_eq!(bytes(BATCH_ENCODER), bytes3(6 + 4, 32, 4));
+        let shift = packets
+            .model
+            .tensors
+            .iter()
+            .find(|t| t.name == CHUNK_INPUTS.shift)
+            .unwrap();
+        assert_eq!(
+            shift.init.as_deref(),
+            Some(&2u32.to_ne_bytes().repeat(2)[..])
+        );
+        assert_eq!(pipeline.tensors["chunk.input.first"].shape, [2, 8, 7]);
+        assert_eq!(pipeline.tensors["chunk.input.next"].shape, [2, 12, 7]);
+        assert_eq!(pipeline.tensors["chunk.index"].shape, [4]);
+        assert_eq!(pipeline.tensors["chunk.slot"].shape, [2]);
+        assert_eq!(pipeline.parameters["chunk.staging_rows"], 8);
+        assert_eq!(pipeline.parameters["chunk.next_row0"], 4);
+        assert_eq!(pipeline.parameters["chunk.predictor_slot0"], 2);
+        let init = stand_in("act.test.table", "act.stream.position.0", 1).model;
+        assert!(packets
+            .add_chunk_stream(geometry, init, vec![rung(1)], &weights)
+            .is_err());
     }
 }
