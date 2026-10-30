@@ -29,6 +29,7 @@ struct Encode {
     features: MelFeatures,
     /// A final's audio: encoded ahead of partials.
     urgent: bool,
+    queued: Instant,
     respond: oneshot::Sender<Result<Vec<f32>>>,
 }
 
@@ -39,20 +40,49 @@ struct Encode {
 /// final's encode wait out other models' ticks, 52 -> 212 ms p50 at 50 calls, where running
 /// alongside them costs less.)
 /// `cost_id`: the encoder's id in [`crate::sched::cost`]; launches are sized at `frame_us` of
-/// audio per feature frame.
+/// audio per feature frame. `inflight` (of `capacity` permits) counts the front's requests, for
+/// `PLOW_ASR_ENCODE_HOLD_MS`.
 fn encode_loop(
     rx: std::sync::mpsc::Receiver<Encode>,
     mut encoder: PacketAudioEncoder,
     cost_id: usize,
     frame_us: u32,
+    inflight: Arc<Semaphore>,
+    capacity: usize,
 ) {
     let audio_ms = |frames: usize| (frames as u64 * u64::from(frame_us) / 1000) as u32;
     let max_chunks = encoder.max_packed_chunks();
+    let config = crate::config::RuntimeConfig::get();
+    let hold = std::time::Duration::from_millis(config.asr_encode_hold_ms);
+    let hold_inflight = config.asr_encode_hold_inflight;
     let mut pending: std::collections::VecDeque<Encode> = Default::default();
     while let Ok(first) = rx.recv() {
         pending.push_back(first);
         while !pending.is_empty() {
             pending.extend(rx.try_iter());
+            if !hold.is_zero() && max_chunks > 0 {
+                let oldest = pending.iter().map(|job| job.queued).min().unwrap();
+                loop {
+                    let queued: usize = pending
+                        .iter()
+                        .map(|job| encoder.chunks(job.features.frames))
+                        .sum();
+                    let in_flight = capacity.saturating_sub(inflight.available_permits());
+                    let Some(left) = hold.checked_sub(oldest.elapsed()) else {
+                        break;
+                    };
+                    if queued >= max_chunks
+                        || in_flight <= pending.len()
+                        || in_flight < hold_inflight
+                    {
+                        break;
+                    }
+                    match rx.recv_timeout(left) {
+                        Ok(job) => pending.push_back(job),
+                        Err(_) => break,
+                    }
+                }
+            }
             pending.make_contiguous().sort_by_key(|job| !job.urgent);
             let mut chunks = 0;
             let n = pending
@@ -189,18 +219,21 @@ impl SharedAsr {
         let frame_us = prompt.frontend().frame_us();
         let alive = Arc::new(AtomicBool::new(true));
         let guard = Alive(Arc::clone(&alive));
+        let capacity = batch.saturating_mul(4).max(UPLOADS);
+        let inflight = Arc::new(Semaphore::new(capacity));
+        let held = Arc::clone(&inflight);
         std::thread::Builder::new()
             .name("plow-asr-encoder".into())
             .spawn(move || {
                 let _alive = guard;
-                encode_loop(rx, encoder, cost_id, frame_us)
+                encode_loop(rx, encoder, cost_id, frame_us, held, capacity)
             })
             .map_err(|e| RuntimeError::Msg(format!("spawn ASR encoder thread: {e}")))?;
         Ok(Self {
             prompt: Arc::new(prompt),
             encode: Mutex::new(Some(encode)),
             max_context,
-            inflight: Arc::new(Semaphore::new(batch.saturating_mul(4).max(UPLOADS))),
+            inflight,
             window_frames,
             slug: slug.to_owned(),
             alive,
@@ -257,6 +290,7 @@ impl SharedAsr {
             .send(Encode {
                 features,
                 urgent,
+                queued: Instant::now(),
                 respond: tx,
             })
             .map_err(|_| RuntimeError::Unavailable("ASR encoder thread is gone".into()))?;
@@ -495,6 +529,7 @@ impl SharedAsr {
                     encode: None,
                     frame_codes: Vec::new(),
                     frame_codes_per_row: 0,
+                    maya2_memory: None,
                 })),
                 prefix: None,
                 tenant: None,

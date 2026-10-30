@@ -235,6 +235,18 @@ pub struct RuntimeConfig {
     )]
     pub tts_admit_wait_ms: u64,
 
+    /// Voices a speech model serves, narrowing the model's own list: any other voice is refused
+    /// and the model card advertises only these. A deployment's choice; comma-separated. A model
+    /// sharing no voice with the list keeps its own, so one list names the voices of one model
+    /// among several. Unset = every voice the model has.
+    #[arg(
+        long = "tts-voice",
+        env = "PLOW_TTS_VOICES",
+        value_delimiter = ',',
+        global = true
+    )]
+    pub tts_voices: Vec<String>,
+
     /// Share of a streaming ASR session's time its partial transcripts may keep the model busy:
     /// after a partial that took `t`, the session's appends answer the previous partial's text
     /// until `t * (1 / duty - 1)` has passed. Idle, partials take far less than the 1 s append
@@ -257,6 +269,29 @@ pub struct RuntimeConfig {
         global = true
     )]
     pub asr_request_timeout_ms: u64,
+
+    /// Packed audio-encoder hold (ms): while `PLOW_ASR_ENCODE_HOLD_INFLIGHT` requests are in flight
+    /// and the queued audio is short of a full launch, the encoder waits up to this long from its
+    /// oldest queued request for more, trading that wait for fewer per-launch fixed costs. 0 =
+    /// launch whatever is queued.
+    #[arg(
+        long = "asr-encode-hold-ms",
+        env = "PLOW_ASR_ENCODE_HOLD_MS",
+        default_value_t = 0,
+        global = true
+    )]
+    pub asr_encode_hold_ms: u64,
+
+    /// Requests in flight (admitted, unanswered) at which `PLOW_ASR_ENCODE_HOLD_MS` applies: below
+    /// it the GPU has room, and a held request only waits.
+    #[arg(
+        long = "asr-encode-hold-inflight",
+        env = "PLOW_ASR_ENCODE_HOLD_INFLIGHT",
+        hide = true,
+        default_value_t = 32,
+        global = true
+    )]
+    pub asr_encode_hold_inflight: usize,
 
     /// Lean receipt qualification at packet load (`certificate_checks`): `off` keeps the
     /// pre-policy behavior, `report` logs every gap, `strict` refuses a packet with any gap.

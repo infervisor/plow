@@ -752,7 +752,7 @@ fn lower(
 const FUSED_OPS: usize = 12;
 
 /// Fold runs of `ops` consecutive single-segment programs into one program each, every op waiting
-/// for the previous one to retire: the order separate launches gave.
+/// for the previous one to retire (the order separate launches gave), except [`siblings`].
 fn fuse_programs(prefix: &mut PacketPrefix, ops: usize) -> Result<(), String> {
     use packet::dev::DevOp;
     let model = &mut prefix.model;
@@ -768,7 +768,7 @@ fn fuse_programs(prefix: &mut PacketPrefix, ops: usize) -> Result<(), String> {
         let mut builder = packet::devbuild::Builder::new(model.n_cu);
         builder.set_tensor_dedup(true);
         builder.adopt_tensors(model.tensors.clone());
-        let mut previous: Option<u32> = None;
+        let mut insts = Vec::new();
         for &p in run.iter() {
             let program = &model.progs[p];
             if program.gq_seg_ofs.len() != 2
@@ -791,15 +791,35 @@ fn fuse_programs(prefix: &mut PacketPrefix, ops: usize) -> Result<(), String> {
                 if cus.contains(&u32::MAX) {
                     return Err("Qwen audio op has an unplaced slice".into());
                 }
+                insts.push((inst, cus));
+            }
+        }
+        let mut before: Vec<u32> = Vec::new();
+        let mut k = 0;
+        while k < insts.len() {
+            let n = siblings(&insts[k..]);
+            let mut after = Vec::with_capacity(n);
+            for (m, (inst, cus)) in insts[k..k + n].iter().enumerate() {
                 let op = DevOp::from_u16(inst.op).ok_or("Qwen audio op is unknown")?;
-                let deps: Vec<u32> = previous.into_iter().collect();
-                previous = Some(builder.emit(op, cus, &deps, |fused| {
+                let cus = if n > 1 {
+                    (m * n_cu / n..(m + 1) * n_cu / n)
+                        .map(|cu| cu as u32)
+                        .collect()
+                } else {
+                    cus.clone()
+                };
+                after.push(builder.emit(op, cus, &before, |fused| {
                     fused.t = inst.t;
                     fused.i = inst.i;
                     fused.f = inst.f;
                     fused.j = inst.j;
+                    if n > 1 {
+                        fused.t[5] = packet::dev::TENSOR_NONE;
+                    }
                 }));
             }
+            before = after;
+            k += n;
         }
         let program = builder.finish();
         if program.gq_seg_ofs.len() != 2 {
@@ -822,6 +842,24 @@ fn fuse_programs(prefix: &mut PacketPrefix, ops: usize) -> Result<(), String> {
     model.prog_t = prog_t;
     prefix.programs = programs;
     Ok(())
+}
+
+/// Leading run of reference-split DenseGemmF32 ops on one source (Q/K/V): independent, so they
+/// share their predecessor as the only dependency and each runs on its own share of the CUs (its
+/// tiles planned for that share). Concurrent, they cannot share the packed split-K scratch (t5), so
+/// the fuser drops it (K <= 1024 never splits).
+fn siblings(insts: &[(&packet::dev::DevInst, Vec<u32>)]) -> usize {
+    let dense = |inst: &packet::dev::DevInst| {
+        inst.op == packet::dev::DevOp::DenseGemmF32 as u16 && inst.i[7] & 128 != 0
+    };
+    let first = insts[0].0;
+    if !dense(first) {
+        return 1;
+    }
+    insts
+        .iter()
+        .take_while(|(inst, _)| dense(inst) && inst.t[1] == first.t[1] && inst.t[0] != first.t[1])
+        .count()
 }
 
 pub fn qwen_audio_rows(frames: u32) -> u32 {

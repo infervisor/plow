@@ -1366,7 +1366,12 @@ pub const MAX_BODY_BYTES: usize = 64 * 1024 * 1024;
 pub fn app(state: Arc<AppState>) -> Router {
     let router = Router::new();
     #[cfg(feature = "cuda")]
-    let router = router.route("/v1/audio/speech", post(crate::tts::serving::speech));
+    let router = router
+        .route(
+            "/v1/audio/speech",
+            post(crate::tts::serving::speech).get(crate::tts::serving::ws_speech),
+        )
+        .route("/v1/tts/stream", get(crate::tts::serving::ws_speech));
     let router = router
         .route("/v1/chat/completions", post(chat::chat_completions))
         .route("/v1/requests/:id/reasoning_end", post(chat::reasoning_end))

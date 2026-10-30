@@ -26,6 +26,11 @@ pub mod text_encoder;
 #[cfg(feature = "cuda")]
 pub mod voice_cond;
 
+pub mod ecapa;
+pub mod maya2;
+pub mod maya2_text;
+pub(crate) mod stretch;
+
 use std::path::Path;
 
 use plow_asset::packet_pipeline::PacketPipeline;
@@ -45,6 +50,14 @@ pub struct SpeechContract {
     /// Named voices (`prompt.voices`, one per line); empty: a voice is known when its
     /// `voice_token` is one vocabulary token.
     pub voices: Vec<String>,
+    /// What `{voice}` renders as for a voice whose `prompt.voices` line is `name\trender`.
+    pub voice_renders: Vec<(String, String)>,
+    /// Values of the template's `{language}` (`prompt.languages`); empty: none.
+    pub languages: Vec<String>,
+    /// Longest text segment in frames (`tokens.segment_frames`).
+    pub segment_frames: Option<usize>,
+    /// Maya 2's host cb0 controller (`maya2.controller`).
+    pub maya2: Option<maya2::Controller>,
     pub prefix: Vec<u32>,
     pub suffix: Vec<u32>,
     pub stops: Vec<u32>,
@@ -122,8 +135,37 @@ impl SpeechContract {
             voices: p
                 .strings
                 .get("prompt.voices")
-                .map(|v| v.lines().map(str::to_owned).collect())
+                .map(|v| {
+                    v.lines()
+                        .map(|l| l.split_once('\t').map_or(l, |(n, _)| n).to_owned())
+                        .collect()
+                })
                 .unwrap_or_default(),
+            voice_renders: p
+                .strings
+                .get("prompt.voices")
+                .map(|v| {
+                    v.lines()
+                        .filter_map(|l| l.split_once('\t'))
+                        .map(|(n, r)| (n.to_owned(), r.to_owned()))
+                        .collect()
+                })
+                .unwrap_or_default(),
+            languages: p
+                .strings
+                .get("prompt.languages")
+                .map(|v| v.split_ascii_whitespace().map(str::to_owned).collect())
+                .unwrap_or_default(),
+            segment_frames: p
+                .parameters
+                .get("tokens.segment_frames")
+                .map(|&v| v as usize),
+            maya2: p
+                .strings
+                .get("maya2.controller")
+                .map(|j| maya2::Controller::parse(j))
+                .transpose()
+                .map_err(RuntimeError::Rejected)?,
             prefix: list("prompt.prefix")?,
             suffix: list("prompt.suffix")?,
             stops: list("stop")?,
@@ -195,13 +237,25 @@ impl SpeechContract {
     }
 
     /// The packet's prompt template; the tokenizer encodes it between prefix and suffix.
-    pub fn prompt_text(&self, voice: &str, instructions: Option<&str>, input: &str) -> String {
+    pub fn prompt_text(
+        &self,
+        voice: &str,
+        language: Option<&str>,
+        instructions: Option<&str>,
+        input: &str,
+    ) -> String {
         let ins = match (&self.instructions, instructions) {
             (Some(t), Some(i)) => t.replace("{instructions}", i),
             _ => String::new(),
         };
+        let voice = self
+            .voice_renders
+            .iter()
+            .find(|(n, _)| n == voice)
+            .map_or(voice, |(_, r)| r.as_str());
         self.prompt_template
             .replace("{voice}", voice)
+            .replace("{language}", language.unwrap_or_default())
             .replace("{instructions}", &ins)
             .replace("{input}", input)
     }
@@ -219,7 +273,10 @@ impl SpeechContract {
     /// Longest input whose [`Self::max_new_tokens`] the cap does not clip; a longer one is spoken
     /// as [`segments`] of at most this many characters.
     pub fn segment_chars(&self) -> usize {
-        let frames = self.max_new_tokens_cap.saturating_sub(21) / self.tokens_per_frame();
+        let mut frames = self.max_new_tokens_cap.saturating_sub(21) / self.tokens_per_frame();
+        if let Some(f) = self.segment_frames {
+            frames = frames.min(f);
+        }
         let fits = |c: usize| (c as f32 * self.per_char_frames) as usize <= frames;
         let mut c = (frames as f32 / self.per_char_frames) as usize;
         while c > 1 && !fits(c) {
@@ -251,25 +308,39 @@ impl SpeechContract {
         };
         voices.sort_unstable();
         voices.dedup();
-        api::SpeechSpec {
+        let mut spec = api::SpeechSpec {
             voices,
-            languages: Vec::new(),
-            default_language: None,
+            languages: self.languages.clone(),
+            // Maya 2 guesses a request's language from its script.
+            default_language: self
+                .languages
+                .first()
+                .filter(|_| self.maya2.is_none())
+                .cloned(),
             sample_rate: self.sample_rate,
             temperature: self.temperature,
             top_p: self.top_p,
             // Both depth samplers take at most 64 candidates; Fish's (SampleFishBf16) has no penalty.
-            repetition_penalty: (!self.depth || self.breeze_sampler)
+            // Maya 2's cb0 is drawn on the host over every class, with a presence penalty.
+            repetition_penalty: (!self.depth || self.breeze_sampler || self.maya2.is_some())
                 .then_some(self.repetition_penalty),
             max_tokens: self.max_new_tokens_cap,
             top_k: Some(self.top_k),
-            top_k_max: self.depth.then_some(64),
+            top_k_max: if self.maya2.is_some() {
+                Some(maya2::STOP + 1)
+            } else {
+                self.depth.then_some(64)
+            },
             // Breeze guides against the uninstructed prompt: w = s - 1, off by default.
             cfg_weight: self.depth_cfg().then_some(0.0),
             instructions: self.instructions.is_some(),
             voice_cloning: self.clone.is_some(),
             clone_transcript: true,
-        }
+            clone_audio_only: self.maya2.is_some(),
+            text_normalization: self.maya2.is_some(),
+        };
+        spec.narrow_voices(&crate::config::RuntimeConfig::get().tts_voices);
+        spec
     }
 
     /// Classifier-free guidance in the depth stage, contrasting with the prompt without its
@@ -643,6 +714,87 @@ pub(crate) fn wav_header(sample_rate: u32, data_bytes: u32) -> Vec<u8> {
     h.extend_from_slice(b"data");
     h.extend_from_slice(&data_bytes.to_le_bytes());
     h
+}
+
+/// A speech reply's output stage: the model's PCM at its own rate, written as s16le mono at the
+/// reply's. Fed in pieces, so one instance serves a whole stream — the resampler is the ASR
+/// frontend's, whose polyphase output does not depend on where the piece boundaries fall.
+pub(crate) struct OutPcm {
+    wav: bool,
+    rate: u32,
+    speed: f32,
+    /// `None` at the model's own speed; stretching runs before resampling, at the model's rate.
+    stretch: Option<stretch::Stretch>,
+    /// `None` when the reply is served at the model's own rate.
+    resampler: Option<crate::asr::frontend::Resampler>,
+}
+
+impl OutPcm {
+    pub fn new(from: u32, to: u32, speed: f32, wav: bool) -> std::result::Result<Self, String> {
+        let stretch = (speed != 1.0)
+            .then(|| stretch::Stretch::new(from, speed))
+            .transpose()?;
+        let resampler = (from != to)
+            .then(|| crate::asr::frontend::Resampler::to(from, to))
+            .transpose()?;
+        Ok(Self {
+            wav,
+            rate: to,
+            speed,
+            stretch,
+            resampler,
+        })
+    }
+
+    pub fn rate(&self) -> u32 {
+        self.rate
+    }
+
+    /// How much faster the reply plays than the model synthesized it: one model-rate sample buys
+    /// `1 / (rate * speed)` seconds of playback.
+    pub fn speed(&self) -> f32 {
+        self.speed
+    }
+
+    pub fn content_type(&self) -> &'static str {
+        if self.wav {
+            "audio/wav"
+        } else {
+            "audio/pcm"
+        }
+    }
+
+    /// The WAV header for `data_bytes` of audio; `None` on a raw `pcm` reply.
+    pub fn header(&self, data_bytes: u32) -> Option<Vec<u8>> {
+        self.wav.then(|| wav_header(self.rate, data_bytes))
+    }
+
+    pub fn push(&mut self, pcm: &[f32], out: &mut Vec<u8>) {
+        let stretched = self.stretch.as_mut().map(|s| s.push(pcm));
+        let pcm = stretched.as_deref().unwrap_or(pcm);
+        match &mut self.resampler {
+            Some(r) => pcm16(&r.push(pcm), out),
+            None => pcm16(pcm, out),
+        }
+    }
+
+    /// The stretch's last frame and the resampler's tail, neither of which a `push` could
+    /// complete: dropping them would clip the end of every stretched or resampled reply.
+    pub fn finish(&mut self, out: &mut Vec<u8>) {
+        let tail = self
+            .stretch
+            .as_mut()
+            .map(|s| s.finish())
+            .unwrap_or_default();
+        match &mut self.resampler {
+            Some(r) => {
+                let mut v = r.push(&tail);
+                v.extend(r.finish());
+                pcm16(&v, out);
+            }
+            None => pcm16(&tail, out),
+        }
+    }
 }
 
 #[cfg(test)]

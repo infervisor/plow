@@ -189,6 +189,24 @@ pub(crate) struct FrameEmbed {
     pub(crate) rows: u32,
     pub(crate) div: f32,
     pub(crate) depth: Option<FishDepth>,
+    /// Maya 2: every decode row is a frame row with no token row (`EmbedFrameBf16` mode bit 0), as
+    /// is a prefill row whose token is in `lo..lo + rows` (a cloning reference's frames); `norm` =
+    /// (fp32 weight, eps) RMS-normalises it (mode bit 1).
+    pub(crate) decode_only: bool,
+    pub(crate) norm: Option<(String, f32)>,
+}
+
+/// Maya 2 Native's DepthV2 (`maya2.depth.*`): `levels` codebooks after cb0, each level re-running its
+/// weight group's 4 LayerNorm/GELU blocks over the prefix (no RoPE; `level_emb` folded into the
+/// inputs), one fp16 head per level; `group_of_level[L - 1]` names level L's group.
+#[derive(Clone, Debug)]
+pub(crate) struct Maya2Depth {
+    pub(crate) levels: u32,
+    pub(crate) groups: u32,
+    pub(crate) group_of_level: Vec<u32>,
+    /// The depth sampler's engine-wide temperature and top-k (`maya2.sampling`).
+    pub(crate) temperature: f32,
+    pub(crate) top_k: u32,
 }
 
 /// Fish S2's per-frame depth transformer (`fish.depth.*`): `positions` steps over a fresh KV,
@@ -209,6 +227,7 @@ pub(crate) struct FishDepth {
     /// `SampleSmallF32` sampling (weights `breeze.depth.*`).
     pub(crate) breeze: bool,
     pub(crate) rope_scale: RopeScale,
+    pub(crate) maya2: Option<Maya2Depth>,
 }
 
 pub(crate) struct Cfg {
@@ -417,8 +436,11 @@ pub(crate) fn cfg_from(dir: &Path) -> Cfg {
                         high: sx("high_freq_factor"),
                         orig: sx("original_max_position_embeddings"),
                     },
+                    maya2: None,
                 }
             }),
+            decode_only: false,
+            norm: None,
         });
         c.encoder_overlay_rows = g("overlay_rows");
     }
@@ -729,7 +751,8 @@ fn cfg_llama_qwen(v: &Value, arch: Arch) -> Cfg {
         k_eq_v: false,
         tied: v["tie_word_embeddings"].as_bool().unwrap_or(false),
         prefix: "model.".to_string(),
-        encoder_overlay_rows: 0,
+        // Maya 2: host rows at its `<|audio|>` sentinels (a cloned speaker's anchor).
+        encoder_overlay_rows: v["maya2"]["overlay_rows"].as_u64().unwrap_or(0) as u32,
         mm_slab_rows: 0,
         mm_pad: 0,
         mm_spans: false,
@@ -745,40 +768,108 @@ fn cfg_llama_qwen(v: &Value, arch: Arch) -> Cfg {
         double_wide_mlp: false,
         head_rows: v["plow_head_rows"].as_u64().map_or(0, |r| r as u32),
         encoder: false,
-        frame: v.get("fish_s2").map(|f| {
-            let g = |k: &str| f[k].as_u64().unwrap_or_else(|| panic!("fish_s2.{k}")) as u32;
-            FrameEmbed {
-                table: "fish.codebook_embed.weight".into(),
-                codebooks: g("codebooks"),
-                cb_size: g("codebook_size"),
-                lo: g("semantic_base"),
-                rows: g("semantic_tokens"),
-                div: (1.0 / f["frame_scale"].as_f64().expect("fish_s2.frame_scale")) as f32,
-                depth: Some({
-                    let d = &f["depth"];
-                    let u = |k: &str| {
-                        d[k].as_u64().unwrap_or_else(|| panic!("fish_s2.depth.{k}")) as u32
-                    };
-                    let x = |k: &str| {
-                        d[k].as_f64().unwrap_or_else(|| panic!("fish_s2.depth.{k}")) as f32
-                    };
-                    assert!(d["qk_norm"] != true, "fish_s2.depth.qk_norm is unsupported");
-                    FishDepth {
-                        layers: u("layers"),
-                        hidden: u("hidden"),
-                        heads: u("heads"),
-                        kv_heads: u("kv_heads"),
-                        head_dim: u("head_dim"),
-                        inter: u("intermediate"),
-                        eps: x("eps"),
-                        theta: x("rope_theta"),
-                        positions: u("positions"),
-                        breeze: false,
-                        rope_scale: RopeScale::None,
-                    }
-                }),
-            }
+        frame: v
+            .get("fish_s2")
+            .map(|f| {
+                let g = |k: &str| f[k].as_u64().unwrap_or_else(|| panic!("fish_s2.{k}")) as u32;
+                FrameEmbed {
+                    table: "fish.codebook_embed.weight".into(),
+                    codebooks: g("codebooks"),
+                    cb_size: g("codebook_size"),
+                    lo: g("semantic_base"),
+                    rows: g("semantic_tokens"),
+                    div: (1.0 / f["frame_scale"].as_f64().expect("fish_s2.frame_scale")) as f32,
+                    depth: Some({
+                        let d = &f["depth"];
+                        let u = |k: &str| {
+                            d[k].as_u64().unwrap_or_else(|| panic!("fish_s2.depth.{k}")) as u32
+                        };
+                        let x = |k: &str| {
+                            d[k].as_f64().unwrap_or_else(|| panic!("fish_s2.depth.{k}")) as f32
+                        };
+                        assert!(d["qk_norm"] != true, "fish_s2.depth.qk_norm is unsupported");
+                        FishDepth {
+                            layers: u("layers"),
+                            hidden: u("hidden"),
+                            heads: u("heads"),
+                            kv_heads: u("kv_heads"),
+                            head_dim: u("head_dim"),
+                            inter: u("intermediate"),
+                            eps: x("eps"),
+                            theta: x("rope_theta"),
+                            positions: u("positions"),
+                            breeze: false,
+                            rope_scale: RopeScale::None,
+                            maya2: None,
+                        }
+                    }),
+                    decode_only: false,
+                    norm: None,
+                }
+            })
+            .or_else(|| v.get("maya2").map(maya2_frame)),
+    }
+}
+
+/// Maya 2 Native (`scripts/tts/maya2_prep.py`): decode rows embed the previous frame's 32 codes, RMS-
+/// normalised; the depth stage is DepthV2.
+fn maya2_frame(f: &Value) -> FrameEmbed {
+    let g = |k: &str| f[k].as_u64().unwrap_or_else(|| panic!("maya2.{k}")) as u32;
+    let d = &f["depth"];
+    let u = |k: &str| d[k].as_u64().unwrap_or_else(|| panic!("maya2.depth.{k}")) as u32;
+    let levels = u("levels");
+    let group_of_level: Vec<u32> = d["group_of_level"]
+        .as_array()
+        .expect("maya2.depth.group_of_level")
+        .iter()
+        .map(|x| x.as_u64().expect("maya2.depth.group_of_level") as u32)
+        .collect();
+    assert_eq!(
+        group_of_level.len() as u32,
+        levels,
+        "maya2.depth.group_of_level"
+    );
+    assert_eq!(
+        levels + 1,
+        g("codebooks"),
+        "maya2: one depth level per codebook after cb0"
+    );
+    FrameEmbed {
+        table: "maya2.codebook_embed.weight".into(),
+        codebooks: g("codebooks"),
+        cb_size: g("codebook_size"),
+        lo: g("frame_token_lo"),
+        rows: g("codebook_size"),
+        div: (1.0 / f["frame_scale"].as_f64().expect("maya2.frame_scale")) as f32,
+        depth: Some(FishDepth {
+            layers: u("layers"),
+            hidden: u("hidden"),
+            heads: u("heads"),
+            kv_heads: u("heads"),
+            head_dim: u("head_dim"),
+            inter: u("intermediate"),
+            eps: d["eps"].as_f64().expect("maya2.depth.eps") as f32,
+            theta: 0.0,
+            positions: levels + 1,
+            breeze: false,
+            rope_scale: RopeScale::None,
+            maya2: Some(Maya2Depth {
+                levels,
+                groups: u("groups"),
+                group_of_level,
+                temperature: f["sampling"]["depth_temperature"]
+                    .as_f64()
+                    .expect("maya2.sampling.depth_temperature") as f32,
+                top_k: f["sampling"]["depth_top_k"]
+                    .as_u64()
+                    .expect("maya2.sampling.depth_top_k") as u32,
+            }),
         }),
+        decode_only: true,
+        norm: Some((
+            "maya2.frame_norm.weight".into(),
+            f["frame_norm_eps"].as_f64().expect("maya2.frame_norm_eps") as f32,
+        )),
     }
 }
 

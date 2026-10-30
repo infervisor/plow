@@ -7613,7 +7613,7 @@ impl GpuEngine {
         engine.mm_spans = engine.handle_of("act.mm_span").is_some();
         engine.encoder = engine.handle_of("act.enc_out").is_some();
         engine.packed_terminal = packed_terminal::PackedTerminal::load(&engine)?;
-        engine.fish = fish_depth::FishDepth::load_if_present(&engine, &blob, &raw)?;
+        engine.fish = fish_depth::FishDepth::load_if_present(&engine, &blob, &raw, assets_dir)?;
         engine.shared_tail =
             shared_tail::SharedTail::load(&engine, &blob, kv_shared_tail_metadata.as_ref())?;
         engine.token_batch = token_batch::CudaTokenBatch::load(&engine);
@@ -7669,7 +7669,7 @@ impl GpuEngine {
             && !config.nv.pf_seg_time
             && !config.nv.pf_seg_fatonly
         {
-            let warmup_slots = engine.batch.min(4);
+            let warmup_slots = engine.batch;
             let t_warmup = std::time::Instant::now();
             // Routed buckets (attention-GEMM segments) are warmed too: the route only fires
             // for a slice >= pf_attn_gemm_min_rows, so a pack of short slices in a >= 1024-row

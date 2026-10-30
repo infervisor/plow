@@ -582,6 +582,10 @@ fn finish_job(job: AsrJob, result: crate::Result<Transcript>) {
     } else if result.is_ok() {
         metrics.completed.fetch_add(1, Ordering::Relaxed);
         metrics.first_transcript.duration(elapsed);
+        metrics.audio_duration_ms.fetch_add(
+            (job.samples.len() as u64 * 1000) / SAMPLE_RATE as u64,
+            Ordering::Relaxed,
+        );
     } else {
         metrics.errors.fetch_add(1, Ordering::Relaxed);
     }

@@ -17,6 +17,7 @@ are the same steps by hand):
 | Chatterbox Multilingual V3 | `recipes/infervisor/chatterbox-mtl/sm90a-h100-tp1.toml` |
 | Fish S2 Pro (non-commercial weights) | `recipes/infervisor/fish-s2-pro/sm90a-h100-tp1.toml` |
 | Fish S2 Pro on L4, beside Qwen3-ASR | `recipes/infervisor/fish-s2-pro/sm89-l4-tp1.toml` |
+| Maya 2 Native on L4 (Apache-2.0) | `recipes/infervisor/maya2-native/sm89-l4-tp1.toml` |
 | Breeze TTS 2 (non-commercial weights) | `recipes/infervisor/breeze-tts-2/sm90a-h100-tp1.toml` |
 | Qwen3-ASR | `recipes/infervisor/qwen3-asr/sm90a-h100-tp1.toml` |
 
@@ -181,9 +182,11 @@ With the recipe flags, the gate CER median is 0.005 (n=80). The step_bench diges
 veena40_1 at B=1/32/64/128, and E4B's are unchanged at B=1/64/128. In-model at B=128 ctx 384,
 o_proj on cuBLASLt takes 14.5 us per layer, against 9.3-10 us in torch.
 
-Voices are the checkpoint's speaker tags (`kavya`, `agastya`, `maitri`, `vinaya`).
-Defaults: temperature 0.4, top_p 0.9, no repetition penalty (device sampling; a
-penalty switches that request to host sampling).
+The checkpoint trains four speakers (`kavya`, `agastya`, `maitri`, `vinaya`), but the
+profile names no `voices`, so the card advertises all 11 `<spk_*>` tokens the tokenizer
+carries; the other seven are untrained vocabulary entries that synthesize in an arbitrary
+voice. Narrow the card with `--tts-voice`. Defaults: temperature 0.4, top_p 0.9, no
+repetition penalty (device sampling; a penalty switches that request to host sampling).
 
 ## Chatterbox
 
@@ -625,18 +628,21 @@ request takes two slots, so the 128-slot rung serves 64 Chatterbox requests; the
 `tts::api::SpeechSpec` from its packet (voices, languages and default, sample rate, sampling
 defaults, `max_tokens` cap, and which optional controls it takes); every request is checked against
 it in one order with one set of messages, then runs on the model's engine (`tts::serving`).
-`GET /v1/models` shows the spec as the card's `x_plow_speech`.
+`GET /v1/models` shows the spec as the card's `x_plow_speech`. `--tts-voice`
+(`PLOW_TTS_VOICES`, comma-separated) narrows a card to the voices one deployment serves, and
+every other voice is refused as unknown; a model sharing no voice with the list keeps its own.
 
 | Field | Every model |
 |---|---|
 | `model`, `input`, `voice` | required; `input` at most 4096 characters, spoken as sentence segments; `voice` one of the card's `voices` |
-| `response_format` | `wav` (default) or `pcm` (s16le mono at the card's `sample_rate`) |
+| `response_format` | `wav` (default) or `pcm` (s16le mono at the reply's sample rate) |
+| `sample_rate` | Hz the reply is resampled to, 8000..=48000; default the card's `sample_rate`. The model always synthesizes at its own rate (Veena's SNAC decoder is 24 kHz); this resamples on the way out, so 8 kHz telephony audio costs no quality beyond the band limit |
 | `stream` | chunked audio; the 200 and its headers go out with the first audio, so an error before any audio is a proper status and `server-timing` carries time to first audio |
 | `language` | one of the card's `languages` (default `default_language`); a model without languages rejects it |
 | `temperature`, `top_p` | honoured on every model (defaults: the card's `defaults`) |
 | `max_tokens` | the model's audio tokens per segment, 1..card `max_tokens` |
 | `seed` | same seed, text and settings at the same concurrency: same speech tokens (batched decode is not bitwise batch-invariant); whole and stream replies share those tokens, but the windowed stream codec differs from a whole decode (~2% rel-L2 on Veena); the stateful codecs (Fish S2, Breeze) match it to ~1e-5 rel-L2 (fp32 summation order, so not bitwise); SNAC codecs also draw their noise from the seed, so greedy (`temperature` 0) replies there share tokens but not PCM across seeds; unseeded requests sample anew |
-| `speed` | 1.0 only |
+| `speed` | 0.5..=2.0 (default 1.0): the reply is time-stretched by waveform-similarity overlap-add, which leaves the pitch where it was. 1.0 is a bypass, bit-identical to no `speed` at all. A stretched reply ends with a half-frame (15 ms) fade, the last frame having no successor to overlap |
 | `top_k`, `repetition_penalty`, `cfg_weight`, `instructions`, `ref_audio` + `ref_text` | optional controls: taken where the card declares them (`defaults.top_k`, `defaults.repetition_penalty`, `defaults.cfg_weight`, `instructions`, `voice_cloning`), else 400 naming the field; a sampler with a bounded top-k (`limits.top_k_max`, Fish S2) takes `top_k` in 1..that bound and cannot turn it off |
 | `ref_audio` + `ref_text` | voice cloning (Breeze, Fish S2): base64 or `data:` URL audio (wav, mp3, flac, ogg) of at most 20.48 s (Breeze) / 23.78 s (Fish) and its exact transcript; the reference encoder (`ref_encoder.pkt`) runs once per request on the engine thread before the first prefill chunk (the codes of the 16 most recent clips are kept by exact PCM, so a repeated clip skips the launch), and every segment's prompt opens with the contract's clone layout: transcript, reference frames, then an end frame (Breeze) or the system turn's close (Fish). The Fish encoder is FP32 and matches the official server's codes exactly (9.3 s clip: 200/200 frames, 105 ms on H100); the request never takes a session (its frame rows are placeholders until encoded) |
 
@@ -733,6 +739,16 @@ a whole encoder/codec/vocoder sequence (worse: a 166 ms S3Gen render then blocks
 
 ### L4: Qwen3-ASR + Silero VAD + Fish S2 Pro
 
+Pin the cuBLASLt prefill algorithms in production (`PLOW_LT_ALGOS=<table>`, written once with
+`PLOW_LT_ALGOS_WRITE=<table>` on the serving GPU). Timed at every start, near-tied candidates win by
+noise: across 30 starts on one L4, qwen3-asr's 512-row k/v pair picked algorithm 0 seven times and
+2 twenty-three times, and three other prefill shapes flip too. Two such pick sets differ on 9 of 466
+turns of the customer streaming eval; a pinned table gives the same transcripts after every restart.
+
+Compare ASR runs only under the service's own environment: `/etc/plow-asr.env` sets
+`PLOW_ASR_AUTO_LANGUAGES=English,Spanish`, and without it the same binary moves 30 of 466 turns
+(12.22% -> 12.85% WER on that eval).
+
 One `plowrt serve --assets <qwen3-asr> --assets <fish-s2-pro> --asr-vad-packet <vad.pkt>
 --co-sched rr` with `PLOW_VMM_LIVE=1` (the Fish L4 bundle's serve default; set it in the
 environment so the ASR bundle takes it too). Live KV commits a slot on admission (224 MiB ASR,
@@ -744,7 +760,7 @@ Fish codec arena is capped with `PLOW_EMIT_FISH_CODEC_MAX_ROWS=256` (7.5 -> 2.7 
 |---|---|---|
 | customer batch WER, README flags / prompt | 10.36% / 9.58% | 10.40% / 9.58% |
 | customer streaming WER, end of speech to final p50 / p95 | 12.98%, 128 / 344 ms | 13.01%, 125 / 340 ms |
-| Fish stream c1: TTFA, median RTF | 137 ms, 0.80 | |
+| Fish stream c1: TTFA, median RTF | 137 ms, 1.46 | |
 | Fish full c4: audio s/s | 2.07 | |
 | Fish CER (Whisper, n=44) | 0.000 | |
 
@@ -753,12 +769,81 @@ KV can grow (Fish evicted under ASR load, then a 16 s reload on the next speech 
 a stream that does not fit waits or gets 429. Mixed load (customer streaming ASR c2 + Fish stream
 c1 / full c4 / stream c4 bursts, 40 min): 0 evictions, 0 restarts, only the bursts' 429s; ASR WER
 unchanged (13.01% / 12.28%), ASR end of speech to final p95 2.2 s while TTS runs (p50 163 ms);
-Fish stream c1 RTF 1.5 while ASR runs (TTFA 140 ms).
+Fish stream c1 RTF 1.5 while ASR runs, 1.46 alone (TTFA 140 ms). The 0.80 first recorded here
+was `tts_bench.py` writing 44.1 kHz PCM at its 24 kHz fallback while the card was unbound.
 
-BF16 Fish decodes ~1 real-time stream on L4 (each frame reads the 8.5 GiB slow AR plus nine depth
-steps at 300 GB/s): real-time admission holds a second stream (`PLOW_TTS_ADMIT_WAIT_MS`, then
-429). Full requests batch. `PLOW_W8A16=1` emits on sm_89 (weights 8.5 -> 5.1 GiB) but its FP8
-decode faults there (the GemvFp8 arms are sm_120).
+BF16 Fish decodes below real time on L4 (each frame reads the 7.3 GB slow AR plus ten 4-layer
+depth passes, ~15 GB at 300 GB/s): real-time admission holds a second stream
+(`PLOW_TTS_ADMIT_WAIT_MS`, then 429). Full requests batch. W8A16 slow AR (`PLOW_W8A16=1`, e4m3
+per-channel twins from `perf-data/tools/quantize_fp8.py <slow> <twin> model.`, merged into one
+checkpoint the emit reads) runs on sm_89: the packet now requires `PLOW_NV_W8A16`, which builds the
+GemvFp8 / GemvGluFp8 arms into the hd128 object (they were inside the Gemma-only arms and trapped).
+
+### L4: every TTS bundle alone (2026-10-27, a9efb9a0 + W8A16)
+
+`recipes/infervisor/<model>/sm89-l4-tp1.toml`, one model per `plowrt serve`, `tts_bench.py`
+(sample rate from the card), Whisper turbo CER on CPU:
+
+| model | stream c1 RTF / TTFA | full c1 RTF | stream c4 | CER (n) | GPU after load |
+|---|---|---|---|---|---|
+| Chatterbox | 0.27 / 274 ms | 0.22 | 7.45 audio s/s, 0 refused | 0.000 (32) | 18.7 GB |
+| Chatterbox MTL | 0.29 / 274 ms | 0.24 | 8.04 audio s/s, 0 refused | 0.026 (32; per language <= 0.148) | 18.7 GB |
+| Fish S2 Pro BF16 | 1.46 / 138 ms | 1.48 | 0.73 audio s/s, 11/16 refused | 0.000 (21) | 14.0 GB |
+| Fish S2 Pro W8A16 | 1.15 / 124 ms | 1.16 | 1.29 audio s/s, 7/16 refused | 0.000 (25) | 12.8 GB |
+| Fish S2 Pro W8A16 + e4m3 depth (recipe) | 0.83 / 121 ms | 0.85 | 2.01 audio s/s, 2/16 refused | 0.000 (24) | 10.1 GB |
+| Maya 2 Native W8A16 (recipe, voice Siddhant) | 0.384 / 69 ms | | 6.36 audio s/s; c8 8.36 | 0.000 (32) | 6.4 GB |
+| Orpheus | 2.21 / 1.9 s | 2.21 | 13/16 refused | 0.000 (19) | 16.3 GB |
+| Veena | 2.21 / 1.9 s | 2.21 | 13/16 refused | 0.032 (19) | 16.3 GB |
+
+Fish's depth stage re-reads its four 2560-wide layers at each of the ten codebook positions (8.1 GB
+per frame in BF16, more than the 7.3 GB slow AR): under W8A16 both stream e4m3.
+
+Orpheus and Veena (Llama-3.2-3B, ~83 SNAC tokens per audio second) are weight-bandwidth bound
+below real time in BF16. Breeze TTS 2 does not emit for sm_89: its T5Gemma2 text encoder needs
+Gemma 3 norm-offset objects (sm_90a) and the fused one-split bf16-KV encoder prefill.
+
+### L4: Maya 2 Native
+
+`maya-research/maya2-native`: Qwen3-1.7B backbone (cb0 head of 2049 rows, class 2048 = stop) plus
+DepthV2 (31 levels in 11 weight groups, LayerNorm/GELU, no RoPE) and the Mimi decoder, 24 kHz.
+`scripts/tts/maya2_prep.py` folds the checkpoint (speaker anchor into the `<|audio|>` row, depth
+code embeddings, cross-attention constants) and writes `maya2_controller.json` from a `maya3`
+checkout (`--maya3-src`).
+
+- Depth stage: `fish_depth` aux programs with `Sampler::Maya2`, one per decode rung, launched on the
+  bundle's speech object over the engine's tensor table. Projections run on tensor cores
+  (`GemvF32Out` bit 10: x rounded to f16 after the LayerNorm prologue, as the reference serves it;
+  W streamed once per 64 rows). Teacher-forced vs the fp32 reference: logits rel 5.1e-4, argmax
+  agreement 0.9976.
+- cb0 controller on the host (`crates/plowrt/src/tts/maya2.rs`): presence penalty over 12 frames,
+  top-k with the stop class competing, argmax / p >= 0.35 / hazard >= 0.6 stop after `min_frames`,
+  stop-excluded draw, duration caps and the loop guard (stall / period, +4 stop boost, backstop) with
+  the reference's suspension windows; per-language frame and duration priors.
+- Prompt `<|lang:xx|>{Name}: text<|audio|>`: 20 named voices plus `plain`, 12 languages (guessed from
+  the script when `language` is omitted); input normalised as the reference server does
+  (`tts/maya2_text`, a port held to 16,087 parity cases; `normalize: false` opts out); 20 s
+  segments.
+- Cloning: `ref_audio` alone = `spk`, with `ref_text` = `icl_spk` (the reference's default). ECAPA
+  (`tts/ecapa.rs`, host) gives the speaker anchor (prefill overlay rows at the `<|audio|>`
+  sentinels) and the per-slot depth memory (`in.depth.cross.{l}`, `GemvF32Out` bit 9); `icl` frames
+  are prefill frame rows (ids 194549 + code), the AEOS input row id 194548. Speaker similarity to the
+  reference clip (ECAPA cosine): `spk` 0.38, `icl_spk` 0.69, named voices 0.05-0.20.
+
+Stream bench vs the official `maya3.server` on the same L4 (voice Siddhant, chatterbox set):
+
+| | plow (recipe) | maya3.server |
+|---|---|---|
+| c1 RTF / TTFA | 0.384 / 69 ms | 0.374 / 36 ms |
+| c4 | 6.36 audio s/s | 9.06 audio s/s |
+| c8 / c16 | 8.36 audio s/s (c8) | 27.1 audio s/s (c16) |
+| CER | 0.000 (32) | 0.000 (32) |
+| GPU | 6.4 GB | 11.4 GB |
+
+Depth dominates (23 of ~31 ms per c1 frame): ~900 interpreter ops per frame, single-row projections
+near 180 GB/s. Remaining fusions measured on the B1 sweep: attention folded into the o-projection
+prologue (124 ops, ~1.5 ms), one prefix gather per level (107 -> ~31 ops), K/V cache rows written by
+the qkv projection (~90 copies), split-K fused MLP (124 barriers); a dedicated per-level depth
+kernel is the larger step.
 
 ### Voice agent co-serve
 

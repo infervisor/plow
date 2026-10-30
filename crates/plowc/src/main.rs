@@ -2294,6 +2294,9 @@ fn build_cubin_from_manifest(
     if req.iter().any(|d| d.starts_with("PLOW_NV_W8A8")) {
         args.push("-DPLOW_NV_W8A8=ON".into());
     }
+    if req.iter().any(|d| d.starts_with("PLOW_NV_W8A16")) {
+        args.push("-DPLOW_NV_W8A16=ON".into());
+    }
     if req.iter().any(|d| d.starts_with("PLOW_FP8_KV")) {
         args.push("-DPLOW_FP8_KV=ON".into());
         args.push("-DPLOW_SM120_CUBIN_FP8KV=ON".into());

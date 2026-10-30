@@ -48,6 +48,10 @@ pub enum Sampler {
     /// `SampleSmallF32`: params (T, top_p, repetition penalty, CFG scale), `top_k` = `step` = one
     /// `[rows][2]` (top_k, step) tensor, `history` = a `[rows][ras_window]` u32 class bitmap.
     Breeze,
+    /// Maya 2 Native: the host samples cb0 from the backbone's logits (its controlled stop) and
+    /// stages it in `history` (u32 `[rows]`); the programs sample codebooks `1..` like Breeze's
+    /// depth levels (params, `[rows][2]` control) at [`Manifest::depth_sampling`].
+    Maya2,
 }
 
 /// `top_k` word role bits of a [`Manifest::pair_cfg`] sampler.
@@ -72,6 +76,13 @@ pub struct Manifest {
     /// the follower row (bit [`FOLLOW`]) samples nothing.
     #[serde(default)]
     pub pair_cfg: bool,
+    /// Maya 2: the depth levels' fixed (temperature as f32 bits, top-k).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub depth_sampling: Option<[u32; 2]>,
+    /// Maya 2: each depth layer's per-slot memory constant, f32 `[slots][hidden]`, written when a
+    /// request binds (the null memory's, or its speaker's).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub slot_memory: Vec<u16>,
     pub tensors: Tensors,
 }
 
