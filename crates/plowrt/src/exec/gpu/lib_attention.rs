@@ -26,8 +26,24 @@ use super::*;
 use crate::asset::devblob::{DevProg, DevTensor};
 use crate::device::cuda::aot::Image;
 use std::ffi::c_void;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use plow_asset::segment_roles::{LibraryAbi, LibraryKvLayout};
+
+/// Process-wide launch counts across engines: the shutdown path exits without unloading.
+static LOADED: AtomicBool = AtomicBool::new(false);
+static SERVED: AtomicU64 = AtomicU64::new(0);
+static FALLBACK: AtomicU64 = AtomicU64::new(0);
+
+/// (served, fallback) launches of every library route this process loaded; `None` = none.
+pub(crate) fn process_launch_counts() -> Option<(u64, u64)> {
+    LOADED.load(Ordering::Relaxed).then(|| {
+        (
+            SERVED.load(Ordering::Relaxed),
+            FALLBACK.load(Ordering::Relaxed),
+        )
+    })
+}
 
 /// Cadence of the served / fallback count line (also logged at unload).
 const STATS_EVERY: std::time::Duration = std::time::Duration::from_secs(60);
@@ -64,6 +80,10 @@ pub(super) struct Site {
 impl Site {
     pub(super) fn kv_heads(&self) -> u32 {
         self.kv_heads
+    }
+    /// Rows per slot of the site's cache.
+    pub(super) fn rows(&self) -> u32 {
+        self.kv_stride
     }
     /// `(kv heads, rows per slot)` of a BF16 site (the direct, adapter-free path).
     pub(super) fn direct_geometry(&self) -> Option<(u32, u32)> {
@@ -155,6 +175,18 @@ pub(super) fn sites(
         });
     }
     out
+}
+
+/// The adapter ABI `DequantArgs` / `ZeroTailArgs` and the `plow_cvt_rows` parameters mirror.
+const ADAPTER_ABI: u32 = 2;
+
+/// The `kv_adapters` cubin states the adapter ABI this host code was written against.
+fn check_adapter_abi(cubin: &[u8]) -> std::result::Result<(), String> {
+    match plow_asset::cubin::global_u32(cubin, "plow_kv_dequant_abi") {
+        Some(ADAPTER_ABI) => Ok(()),
+        Some(v) => Err(format!("KV adapter ABI {v}, plowrt speaks {ADAPTER_ABI}")),
+        None => Err("KV adapter cubin states no plow_kv_dequant_abi".into()),
+    }
 }
 
 /// FP8 KV reaches a library only through the hd512 head-major page gather.
@@ -261,6 +293,8 @@ pub(super) struct LibAttention {
     /// BF16 cache read in place: pages are the cache's own 64-row runs, `slot_pages` per slot
     /// (`kv heads * rows per slot / 64`, head stride `rows per slot` rows), `total_pages` in all.
     direct: Option<Direct>,
+    /// The source cache every routed site reads: requests outside it are refused.
+    cache: Cache,
     /// Device table: cu_q [MAX_REQUESTS + 1] | kv_len [MAX_REQUESTS] | gather [POOL_PAGES][3] |
     /// page table [MAX_REQUESTS][width].
     table: DeviceMem,
@@ -273,6 +307,28 @@ pub(super) struct LibAttention {
     routed: u64,
     fallbacks: u64,
     stats_at: std::time::Instant,
+}
+
+/// Slots and rows per slot of the KV caches the routed sites read (the smallest over sites).
+#[derive(Clone, Copy)]
+pub(super) struct Cache {
+    pub(super) slots: u32,
+    pub(super) rows: u32,
+}
+
+impl Cache {
+    /// Both paths read the source cache at (slot, rows [0, kv_len)): a request outside it is a
+    /// scheduler fault, refused before anything is enqueued.
+    fn check(&self, slot: u32, kv_len: u32) -> Result<()> {
+        if slot >= self.slots || kv_len > self.rows {
+            return Err(RuntimeError::Rejected(format!(
+                "library attention: request slot {slot} kv_len {kv_len} outside the cache \
+                 ({} slots x {} rows)",
+                self.slots, self.rows
+            )));
+        }
+        Ok(())
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -326,6 +382,7 @@ impl LibAttention {
         object: &SegmentObject,
         max_kv_heads: u32,
         direct: Option<Direct>,
+        cache: Cache,
     ) -> Result<Self> {
         let library = assets_dir.join(&object.file);
         let image = std::fs::read(&library)
@@ -361,7 +418,10 @@ impl LibAttention {
             },
         )?;
         let adapters = {
-            let module = be.module_load(image.blob(image.entry("kv_adapters")?)?)?;
+            let blob = image.blob(image.entry("kv_adapters")?)?;
+            check_adapter_abi(blob)
+                .map_err(|why| RuntimeError::Rejected(format!("{}: {why}", library.display())))?;
+            let module = be.module_load(blob)?;
             let f = |name: &str| be.get_function(&module, name);
             Adapters {
                 gather: f("plow_kv_dequant_pages")?,
@@ -377,7 +437,17 @@ impl LibAttention {
                 library.display()
             )));
         }
+        if cache.slots == 0 || cache.rows == 0 || cache.rows % PAGE != 0 {
+            return Err(RuntimeError::Rejected(
+                "library attention: source cache geometry".into(),
+            ));
+        }
         if let Some(d) = direct {
+            if (d.slots, d.kv_stride) != (cache.slots, cache.rows) {
+                return Err(RuntimeError::Rejected(
+                    "library attention: direct geometry differs from the source cache".into(),
+                ));
+            }
             if f16 {
                 return Err(RuntimeError::Rejected(format!(
                     "{}: a BF16 KV cache needs the bf16 library",
@@ -411,6 +481,7 @@ impl LibAttention {
                 pending: false,
             });
         }
+        LOADED.store(true, Ordering::Relaxed);
         tracing::info!(
             library = %library.display(),
             pool_mib = (2 * pool_bytes) >> 20,
@@ -426,6 +497,7 @@ impl LibAttention {
             pool_k,
             pool_v,
             direct,
+            cache,
             table,
             workspace,
             staging,
@@ -476,8 +548,10 @@ impl LibAttention {
         }
         if routed {
             self.routed += 1;
+            SERVED.fetch_add(1, Ordering::Relaxed);
         } else {
             self.fallbacks += 1;
+            FALLBACK.fetch_add(1, Ordering::Relaxed);
             if self.fallbacks.is_power_of_two() {
                 tracing::warn!(
                     fallbacks = self.fallbacks,
@@ -502,7 +576,8 @@ impl LibAttention {
         }
         let mut pages = 0u32;
         let mut width = 0u32;
-        for &[q0, qlen, _, kvlen] in requests {
+        for &[q0, qlen, slot, kvlen] in requests {
+            self.cache.check(slot, kvlen)?;
             if qlen == 0 || kvlen < qlen || q0.checked_add(qlen).is_none_or(|e| e > rows) {
                 return Ok(false);
             }
@@ -522,14 +597,6 @@ impl LibAttention {
                 > u64::from(POOL_PAGES) * MAX_REQUESTS as u64
         {
             return Ok(false);
-        }
-        if let Some(d) = self.direct {
-            if requests
-                .iter()
-                .any(|r| r[2] >= d.slots || r[3] > d.kv_stride)
-            {
-                return Ok(false);
-            }
         }
         // Requests are contiguous query rows (riders, if any, precede them).
         let mut cu = vec![requests[0][0] as i32];
@@ -639,6 +706,11 @@ impl LibAttention {
         let l = self
             .launch
             .ok_or_else(|| RuntimeError::Rejected("library attention without a launch".into()))?;
+        if site.kv_stride < self.cache.rows {
+            return Err(RuntimeError::Rejected(
+                "library attention: site cache shorter than the checked bound".into(),
+            ));
+        }
         if site.kv_heads > self.max_kv_heads {
             return Err(RuntimeError::Rejected(
                 "library attention: KV heads exceed the pool".into(),
@@ -809,5 +881,29 @@ impl LibAttention {
             &mut params,
             Some(stream),
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cache_bounds_refuse_slots_and_rows_outside() {
+        let cache = Cache {
+            slots: 4,
+            rows: 8192,
+        };
+        assert!(cache.check(3, 8192).is_ok());
+        assert!(cache.check(0, 0).is_ok());
+        assert!(cache.check(4, 1).is_err());
+        assert!(cache.check(0, 8193).is_err());
+        assert!(cache.check(u32::MAX, 1).is_err());
+    }
+
+    #[test]
+    fn adapter_abi_needs_the_stated_version() {
+        assert!(check_adapter_abi(b"not a cubin").is_err());
+        assert!(check_adapter_abi(&[]).is_err());
     }
 }

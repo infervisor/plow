@@ -2363,6 +2363,11 @@ pub const OBJECT_DEFINES: &[KnobSpec] = &[
     KnobSpec::new("def.PLOW_NV_ROPE_PF", None, Layer::ObjectDefine, Domain::Bool, OFF, OPT_IN),
     KnobSpec::new("def.PLOW_GEN_FP8_KV", None, Layer::ObjectDefine, Domain::Bool, OFF, OPT_IN),
     KnobSpec::new("def.PLOW_GEN_KV_ILV", None, Layer::ObjectDefine, Domain::Bool, OFF, OPT_IN),
+    KnobSpec::new("def.PLOW_CUTLASS_HOST", None, Layer::ObjectDefine, Domain::Bool, OFF, REMOVED),
+    KnobSpec::new("def.PLOW_FA4_DTYPE", None, Layer::ObjectDefine, Domain::Str, UNSET, REMOVED),
+    KnobSpec::new("def.PLOW_FA4_HOST", None, Layer::ObjectDefine, Domain::Bool, UNSET, REMOVED),
+    KnobSpec::new("def.PLOW_FA4_H", None, Layer::ObjectDefine, Domain::Str, UNSET, REMOVED),
+    KnobSpec::new("def.PLOW_FA4_KVH", None, Layer::ObjectDefine, Domain::Str, UNSET, REMOVED),
     KnobSpec::new("def.PLOW_NV_QUANT_WPR", None, Layer::ObjectDefine, Domain::Str, UNSET, OPT_IN),
     KnobSpec::new("def.PLOW_NV_QWEN_FOLD_STAGED", None, Layer::ObjectDefine, Domain::Str, UNSET, OPT_IN),
     KnobSpec::new("def.PLOW_NV_QWEN_GDN", None, Layer::ObjectDefine, Domain::Str, UNSET, OPT_IN),
@@ -2946,11 +2951,16 @@ mod tests {
         );
         for k in OBJECT_DEFINES {
             let name = k.name();
-            assert!(
-                runtime.iter().chain(&crates).any(|(_, t)| t.contains(name)),
-                "{} appears in no runtime or crate source: delete the line",
-                k.id
-            );
+            let used = runtime.iter().chain(&crates).any(|(_, t)| t.contains(name));
+            if k.status == Status::Removed {
+                assert!(!used, "{} is Removed but still used", k.id);
+            } else {
+                assert!(
+                    used,
+                    "{} appears in no runtime or crate source: mark it Removed",
+                    k.id
+                );
+            }
         }
     }
 
