@@ -565,7 +565,8 @@ impl GpuEngine {
                     eprintln!(
                         "PACKLOG PUBLISH capture_us={} shared_us={} done_us={} ends_us={} chunks={} completed={n_completed} ends={n_ends} \
                          pub_us={} pub_sync_us={} gather_us={} gather_sync_us={} grows={} grow_us={} shrinks={} shrink_us={} \
-                         spills={} spill_us={} evictions={} compactions={} restores={} frees={} free_us={}",
+                         spills={} spill_us={} evictions={} compactions={} restores={} frees={} free_us={} \
+                         pub_oom={} pub_reclaims={} reap_waits={} reap_us={}",
                         marks[0],
                         marks[1] - marks[0],
                         marks[2] - marks[1],
@@ -588,6 +589,10 @@ impl GpuEngine {
                             .load(std::sync::atomic::Ordering::Relaxed),
                         crate::memory::kv_store::DEVICE_FREE_US
                             .load(std::sync::atomic::Ordering::Relaxed),
+                        c(&|s| s.publish_oom),
+                        c(&|s| s.publish_reclaims),
+                        c(&|s| s.publish_reap_waits),
+                        c(&|s| s.publish_reap_us),
                     );
                 }
             }

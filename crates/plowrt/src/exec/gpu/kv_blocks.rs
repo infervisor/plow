@@ -220,6 +220,12 @@ pub struct BlockServeStats {
     pub gather_fenced_blocks: u64,
     /// Publishes whose seal waited for the scatter's event instead of a stream drain.
     pub seals_deferred: u64,
+    /// Block acquires a full device tier refused during publishes, the boundaries the pool
+    /// gave up for them, and the waits for queued spills (count and wall time).
+    pub publish_oom: u64,
+    pub publish_reclaims: u64,
+    pub publish_reap_waits: u64,
+    pub publish_reap_us: u64,
 }
 
 pub struct BlockServe {
@@ -632,14 +638,28 @@ impl GpuEngine {
                     // deadline per publish); else the pool gives up a boundary, unless enough
                     // spills are queued already (past the deadline the publish is refused rather
                     // than queueing a burst on the copy engine the engine's readbacks share).
-                    Err(RuntimeError::Oom(_))
-                        if bs.store.reap_wait(
+                    Err(e @ RuntimeError::Oom(_)) => {
+                        bs.stats.lock().publish_oom += 1;
+                        let tw = std::time::Instant::now();
+                        let landed = bs.store.reap_wait(
                             spill_deadline.saturating_duration_since(std::time::Instant::now()),
-                        ) || (bs.store.pending_spill_bytes()
+                        );
+                        {
+                            let mut st = bs.stats.lock();
+                            st.publish_reap_waits += 1;
+                            st.publish_reap_us += tw.elapsed().as_micros() as u64;
+                        }
+                        if landed {
+                            continue;
+                        }
+                        if bs.store.pending_spill_bytes()
                             < crate::memory::vmm::SPILL_AHEAD_INFLIGHT_BYTES
-                            && kv.reclaim_one()) =>
-                    {
-                        continue
+                            && kv.reclaim_one()
+                        {
+                            bs.stats.lock().publish_reclaims += 1;
+                            continue;
+                        }
+                        return Err(e);
                     }
                     Err(e) => return Err(e),
                 }
