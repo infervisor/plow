@@ -23,8 +23,8 @@ pub mod ref_encoder;
 pub mod serving;
 #[cfg(not(feature = "cuda"))]
 pub mod serving {
-    use std::path::Path;
     use crate::serve::AppState;
+    use std::path::Path;
 
     pub fn preload(_state: &AppState) -> Result<(), String> {
         Ok(())

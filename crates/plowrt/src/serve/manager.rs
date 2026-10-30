@@ -522,11 +522,7 @@ pub trait ManagerDevice: Send + Sync {
     /// Trim chunk pool to `keep_bytes`.
     fn pool_trim(&self, keep_bytes: u64) -> u64;
     /// Load an engine for `dir` and `ckpt`.
-    fn load_engine(
-        &self,
-        dir: &Path,
-        ckpt: &Path,
-    ) -> Result<crate::serve::engine::ServeEngine>;
+    fn load_engine(&self, dir: &Path, ckpt: &Path) -> Result<crate::serve::engine::ServeEngine>;
     /// Check whether sibling packets are resident.
     fn is_sibling_resident(&self, dir: &Path) -> bool;
     /// Whether this device backend supports tensor parallelism.
@@ -567,17 +563,15 @@ impl ManagerDevice for CudaManagerDevice {
     fn pool_trim(&self, keep_bytes: u64) -> u64 {
         VmmOps::pool_trim(&*self.be, keep_bytes)
     }
-    fn load_engine(
-        &self,
-        dir: &Path,
-        ckpt: &Path,
-    ) -> Result<crate::serve::engine::ServeEngine> {
+    fn load_engine(&self, dir: &Path, ckpt: &Path) -> Result<crate::serve::engine::ServeEngine> {
         let be = Arc::clone(&self.be);
         let mut engine = crate::exec::gpu::GpuEngine::load(be, dir, ckpt)?;
         if crate::config::RuntimeConfig::get().nv.spec {
             match engine.spec_serve_enable(dir) {
                 Ok(limits) => tracing::info!(?limits, "speculative decoding on"),
-                Err(e) => tracing::warn!(error = %e, "PLOW_SPEC set but speculative decoding unavailable"),
+                Err(e) => {
+                    tracing::warn!(error = %e, "PLOW_SPEC set but speculative decoding unavailable")
+                }
             }
         }
         Ok(crate::serve::engine::ServeEngine::Cuda(engine))
@@ -621,11 +615,7 @@ impl ManagerDevice for HsaManagerDevice {
     fn pool_trim(&self, keep_bytes: u64) -> u64 {
         VmmOps::pool_trim(&*self.be, keep_bytes)
     }
-    fn load_engine(
-        &self,
-        dir: &Path,
-        ckpt: &Path,
-    ) -> Result<crate::serve::engine::ServeEngine> {
+    fn load_engine(&self, dir: &Path, ckpt: &Path) -> Result<crate::serve::engine::ServeEngine> {
         let blob = crate::asset::devblob::DevBlob::find_in_dir(dir)?
             .ok_or_else(|| RuntimeError::Msg(format!("no blob in {}", dir.display())))?;
         let hsaco = crate::config::RuntimeConfig::get()
@@ -692,11 +682,7 @@ impl ManagerDevice for HostManagerDevice {
     fn pool_trim(&self, _keep_bytes: u64) -> u64 {
         0
     }
-    fn load_engine(
-        &self,
-        _dir: &Path,
-        _ckpt: &Path,
-    ) -> Result<crate::serve::engine::ServeEngine> {
+    fn load_engine(&self, _dir: &Path, _ckpt: &Path) -> Result<crate::serve::engine::ServeEngine> {
         Err(RuntimeError::Rejected(
             "Host/CPU dynamic engine loading not yet supported".into(),
         ))
@@ -748,7 +734,13 @@ impl ModelManager {
         models: Vec<(String, PathBuf, PathBuf)>,
         budget: Option<u64>,
     ) -> Result<ModelManager> {
-        Self::with_device(Arc::new(CudaManagerDevice::new(be)), state, mux_cfg, models, budget)
+        Self::with_device(
+            Arc::new(CudaManagerDevice::new(be)),
+            state,
+            mux_cfg,
+            models,
+            budget,
+        )
     }
 
     #[cfg(feature = "hsa")]
@@ -759,7 +751,13 @@ impl ModelManager {
         models: Vec<(String, PathBuf, PathBuf)>,
         budget: Option<u64>,
     ) -> Result<ModelManager> {
-        Self::with_device(Arc::new(HsaManagerDevice::new(be)), state, mux_cfg, models, budget)
+        Self::with_device(
+            Arc::new(HsaManagerDevice::new(be)),
+            state,
+            mux_cfg,
+            models,
+            budget,
+        )
     }
 
     /// Build the manager over any device implementing [`ManagerDevice`].
@@ -1594,12 +1592,10 @@ impl ModelManager {
         let pool_before = self.device.pool_bytes();
         let device = Arc::clone(&self.device);
         let (dir, ckpt) = (m.dir.clone(), m.ckpt.clone());
-        let engine = on_own_thread("plow-load", move || {
-            device.load_engine(&dir, &ckpt)
-        })
-        .await
-        .and_then(|engine| engine)
-        .map_err(EnsureError::Load)?;
+        let engine = on_own_thread("plow-load", move || device.load_engine(&dir, &ckpt))
+            .await
+            .and_then(|engine| engine)
+            .map_err(EnsureError::Load)?;
         #[cfg(feature = "cuda")]
         if let crate::serve::engine::ServeEngine::Cuda(ref gpu) = engine {
             mux::check_speech_packet(gpu).map_err(EnsureError::Load)?;
@@ -1628,10 +1624,7 @@ impl ModelManager {
             "planner: load measured"
         );
 
-        state.install_gpu_engine(
-            m.slug.clone(),
-            engine,
-        );
+        state.install_gpu_engine(m.slug.clone(), engine);
         // Sibling packets (ASR encoder, codec, vocoder) bind with the engine and before its mux,
         // so residency and the planner's charge cover them, a request never binds them itself,
         // and an eviction frees them.

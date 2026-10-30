@@ -492,9 +492,7 @@ async fn load_inner(state: Arc<AppState>, mut req: LoadRequest) -> Response {
             if newly_registered {
                 // The pairing is recorded first so the bundle's pin check and every HF-file read
                 // at load see the requested checkpoint.
-                if let Err(e) =
-                    crate::asset::serve::set_checkpoint(&dir, &ckpt)
-                {
+                if let Err(e) = crate::asset::serve::set_checkpoint(&dir, &ckpt) {
                     return err(StatusCode::CONFLICT, e);
                 }
                 if let Err(e) = state.registry.load(&dir, Some(req.model.clone())) {
@@ -605,7 +603,10 @@ async fn unload_inner(state: Arc<AppState>, mut req: UnloadRequest) -> Response 
                 .map(std::time::Duration::from_millis),
         };
         use crate::serve::manager::EnsureError;
-        let report = match mgr.unload_with_drain(&req.model, req.deregister, drain).await {
+        let report = match mgr
+            .unload_with_drain(&req.model, req.deregister, drain)
+            .await
+        {
             Ok(r) => r,
             Err(EnsureError::Load(e)) => return err(StatusCode::INTERNAL_SERVER_ERROR, e),
             Err(e) => return err(StatusCode::INTERNAL_SERVER_ERROR, e),

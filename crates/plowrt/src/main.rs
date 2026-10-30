@@ -4212,10 +4212,9 @@ async fn bringup_runtime(
                 // break any more: the count came from the driver, so this
                 // is a real failure on a device we were told exists.
                 Err(e) => {
-                    return Err(format!(
-                        "device {d} of {visible_count} visible will not open: {e}"
+                    return Err(
+                        format!("device {d} of {visible_count} visible will not open: {e}").into(),
                     )
-                    .into())
                 }
             }
         }

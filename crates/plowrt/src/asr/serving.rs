@@ -32,9 +32,9 @@ mod realtime;
 #[cfg(feature = "cuda")]
 mod shared;
 #[cfg(feature = "cuda")]
-pub use shared::{bind, preload, release};
-#[cfg(feature = "cuda")]
 pub(crate) use shared::is_audio_lm;
+#[cfg(feature = "cuda")]
+pub use shared::{bind, preload, release};
 
 #[cfg(not(feature = "cuda"))]
 pub(crate) fn is_audio_lm(_dir: &std::path::Path) -> crate::Result<bool> {
@@ -3224,7 +3224,8 @@ mod tests {
         let response = app.clone().oneshot(verbose_silent).await.unwrap();
         assert_eq!(response.status(), StatusCode::OK);
         let val: serde_json::Value =
-            serde_json::from_slice(&response.into_body().collect().await.unwrap().to_bytes()).unwrap();
+            serde_json::from_slice(&response.into_body().collect().await.unwrap().to_bytes())
+                .unwrap();
         assert_eq!(val["task"], "transcribe");
         assert_eq!(val["text"], "");
         assert_eq!(val["duration"], 1.0);
@@ -3516,12 +3517,15 @@ mod tests {
                 expected
             );
         }
-        let response = app.clone().oneshot(request("test", "verbose_json")).await.unwrap();
+        let response = app
+            .clone()
+            .oneshot(request("test", "verbose_json"))
+            .await
+            .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
-        let val: serde_json::Value = serde_json::from_slice(
-            &response.into_body().collect().await.unwrap().to_bytes(),
-        )
-        .unwrap();
+        let val: serde_json::Value =
+            serde_json::from_slice(&response.into_body().collect().await.unwrap().to_bytes())
+                .unwrap();
         assert_eq!(val["task"], "transcribe");
         assert_eq!(val["text"], "hello");
         assert_eq!(val["duration"], 0.5);

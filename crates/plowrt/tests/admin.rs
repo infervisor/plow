@@ -303,8 +303,9 @@ async fn version_endpoint_answers_with_current_version() {
 #[test]
 fn unload_request_deserializes_drain_timeout() {
     let req: plowrt::serve::admin::UnloadRequest = serde_json::from_str(
-        r#"{"model":"target-model","deregister":true,"drain_timeout_ms":15000}"#
-    ).unwrap();
+        r#"{"model":"target-model","deregister":true,"drain_timeout_ms":15000}"#,
+    )
+    .unwrap();
     assert_eq!(req.model, "target-model");
     assert!(req.deregister);
     assert_eq!(req.drain_timeout_ms, Some(15000));
@@ -324,7 +325,10 @@ async fn endpoints_are_cached_on_bundle_at_registration() {
 async fn portable_manager_unload_honors_drain_timeout() {
     let state = make_state();
     let mgr = plowrt::serve::portable::PortableManager::new(MuxConfig::default());
-    mgr.register("state-model".into(), std::path::PathBuf::from("/nonexistent"));
+    mgr.register(
+        "state-model".into(),
+        std::path::PathBuf::from("/nonexistent"),
+    );
     state.install_portable_manager(mgr);
 
     let req = plowrt::serve::admin::UnloadRequest {
@@ -388,14 +392,24 @@ async fn server_brings_up_cleanly_with_zero_assets() {
 
     let resp = router
         .clone()
-        .oneshot(Request::builder().uri("/health").body(Body::empty()).unwrap())
+        .oneshot(
+            Request::builder()
+                .uri("/health")
+                .body(Body::empty())
+                .unwrap(),
+        )
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
 
     let resp = router
         .clone()
-        .oneshot(Request::builder().uri("/v1/models").body(Body::empty()).unwrap())
+        .oneshot(
+            Request::builder()
+                .uri("/v1/models")
+                .body(Body::empty())
+                .unwrap(),
+        )
         .await
         .unwrap();
     let status = resp.status();
@@ -405,7 +419,12 @@ async fn server_brings_up_cleanly_with_zero_assets() {
     assert_eq!(val["data"].as_array().unwrap().len(), 0);
 
     let resp = router
-        .oneshot(Request::builder().uri("/v1/models/status").body(Body::empty()).unwrap())
+        .oneshot(
+            Request::builder()
+                .uri("/v1/models/status")
+                .body(Body::empty())
+                .unwrap(),
+        )
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
@@ -456,5 +475,3 @@ async fn load_without_assets_field_reports_clear_error_when_model_does_not_exist
     let body = body_string(resp).await;
     assert!(body.contains("not found locally") || body.contains("unknown model"));
 }
-
-
