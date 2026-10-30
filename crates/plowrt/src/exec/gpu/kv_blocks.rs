@@ -35,8 +35,6 @@ const CHUNK_BYTES: u64 = 8 << 20;
 /// Device headroom the spill-ahead thread keeps for publishes when a host tier is armed
 /// (`VmmKv::spawn_spill_ahead`): about a second of boundaries at the production rate.
 pub const SPILL_AHEAD_BYTES: u64 = 2 << 30;
-/// Longest a publish waits in all for queued spills to free device slots.
-const SPILL_WAIT: std::time::Duration = std::time::Duration::from_millis(50);
 const SEED_CHAIN: u64 = 0x9e37_79b9_7f4a_7c15;
 const SEED_CHECK: u64 = 0xc2b2_ae3d_27d4_eb4f;
 const SEGCOPY_PTX: &str = include_str!("../../../../../runtime/nvidia/kv_segcopy.ptx");
@@ -612,7 +610,6 @@ impl GpuEngine {
             SEED_CHECK,
         );
         let plan = bs.plan(p_a, kv.geometry().window);
-        let spill_deadline = t0 + SPILL_WAIT;
         // On an error return `fills` drops first (the blocks fail), `deps` after (released).
         let mut deps = Deps::new(&bs.store, plan.len());
         let mut fills: Vec<FillToken> = Vec::new();
@@ -628,16 +625,17 @@ impl GpuEngine {
             let acquired = loop {
                 match bs.store.acquire(ci, key) {
                     Ok(a) => break a,
-                    // Retired spills free device slots (queued ones are waited for, up to one
-                    // deadline per publish); else the pool gives up a boundary, unless enough
-                    // spills are queued already (past the deadline the publish is refused rather
-                    // than queueing a burst on the copy engine the engine's readbacks share).
+                    // Spills that already landed free device slots; else the pool gives up a
+                    // boundary, unless enough spills are queued already: then the publish is
+                    // refused (this prompt's prefix is not cached) rather than waiting. A publish
+                    // runs on the mux tick, and waiting there for queued spills (up to 50 ms per
+                    // publish) held 26B BF16 at 2.7 sessions/s in a backed-up state: ~25 ms per
+                    // completed prompt, TTFT P99 3-5 s in 3 of 6 runs.
                     Err(RuntimeError::Oom(_))
-                        if bs.store.reap_wait(
-                            spill_deadline.saturating_duration_since(std::time::Instant::now()),
-                        ) || (bs.store.pending_spill_bytes()
-                            < crate::memory::vmm::SPILL_AHEAD_INFLIGHT_BYTES
-                            && kv.reclaim_one()) =>
+                        if bs.store.reap_wait(std::time::Duration::ZERO)
+                            || (bs.store.pending_spill_bytes()
+                                < crate::memory::vmm::SPILL_AHEAD_INFLIGHT_BYTES
+                                && kv.reclaim_one()) =>
                     {
                         continue
                     }
