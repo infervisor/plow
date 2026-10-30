@@ -860,6 +860,9 @@ async fn ws_speech_session(
             }
         };
         req.stream = true;
+        let model_metrics = state.model_metrics(&req.model);
+        model_metrics.serving.tts.active.store(true, std::sync::atomic::Ordering::Relaxed);
+        model_metrics.serving.tts.websocket_sessions.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         if let Err(e) = ids.apply_body(&req.route()) {
             let _ = socket
                 .send(Message::Text(
@@ -1040,11 +1043,14 @@ async fn speech_with(
             None,
         );
     };
+    let model_metrics = state.model_metrics(&key);
+    model_metrics.serving.tts.active.store(true, std::sync::atomic::Ordering::Relaxed);
+    model_metrics.serving.tts.http_requests.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let mut run = crate::serve::turns::StageRun::start(
         ids,
         crate::serve::turns::Kind::Tts,
         &req.model,
-        Some(state.model_metrics(&key)),
+        Some(model_metrics),
         t_arrive,
         true,
     );
@@ -1352,6 +1358,9 @@ async fn speech_with(
             match later.judge(k, f, f > 0 && joiner.failed(&p), &mut tries) {
                 Verdict::Keep => {}
                 Verdict::Retry => {
+                    if let Some(m) = run.metrics() {
+                        m.serving.tts.watchdog_recovers.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    }
                     attempt += 1;
                     continue;
                 }
@@ -2095,6 +2104,19 @@ async fn stream_task(
     mut run: crate::serve::turns::StageRun,
 ) {
     use std::sync::atomic::Ordering::SeqCst;
+    struct ActiveGuard(Option<Arc<crate::obs::Metrics>>);
+    impl Drop for ActiveGuard {
+        fn drop(&mut self) {
+            if let Some(m) = &self.0 {
+                m.serving.tts.active_streams.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
+    }
+    if let Some(m) = run.metrics() {
+        m.serving.tts.active.store(true, std::sync::atomic::Ordering::Relaxed);
+        m.serving.tts.active_streams.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+    let _stream_guard = ActiveGuard(run.metrics().cloned());
     let mut head = Some(head);
     let c = model.contract.clone();
     // Playback, not model, rate: see `guided_stream_task`.
@@ -2221,6 +2243,9 @@ async fn stream_task(
             match msg {
                 None => break,
                 Some(SegMsg::Retry) => {
+                    if let Some(m) = run.metrics() {
+                        m.serving.tts.watchdog_recovers.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    }
                     (frames, emitted, skipping) = (Vec::new(), 0, false);
                     attempt += 1;
                     joiner.next_segment();
@@ -2245,7 +2270,12 @@ async fn stream_task(
         match msg {
             None => done = true,
             Some(SegMsg::End) => done = true,
-            Some(SegMsg::Err(e)) => return drop(out.send(Err(std::io::Error::other(e))).await),
+            Some(SegMsg::Err(e)) => {
+                if let Some(m) = run.metrics() {
+                    m.serving.tts.errors.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
+                return drop(out.send(Err(std::io::Error::other(e))).await);
+            }
             Some(SegMsg::Retry) => {}
             Some(SegMsg::Frame(f)) => {
                 frames.extend(f);
@@ -2381,11 +2411,19 @@ async fn stream_task(
                             let _ = h.send(run.headers());
                         }
                         if out.send(Ok(bytes)).await.is_err() {
+                            if let Some(m) = run.metrics() {
+                                m.serving.tts.cancelled.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            }
                             return; // client gone: dropping frx ends the drain, which cancels the slot
                         }
                     }
                 }
-                Err(e) => return drop(out.send(Err(std::io::Error::other(e))).await),
+                Err(e) => {
+                    if let Some(m) = run.metrics() {
+                        m.serving.tts.errors.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    }
+                    return drop(out.send(Err(std::io::Error::other(e))).await);
+                }
             }
             if windowed {
                 break;

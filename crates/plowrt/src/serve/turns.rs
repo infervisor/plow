@@ -637,6 +637,10 @@ impl StageRun {
         self.joined.as_ref().is_some_and(|j| j.continuing)
     }
 
+    pub fn metrics(&self) -> Option<&Arc<Metrics>> {
+        self.metrics.as_ref()
+    }
+
     fn device_now(&self) -> u64 {
         self.metrics.as_ref().map_or(0, |m| m.serving.device_us())
     }
@@ -667,6 +671,9 @@ impl StageRun {
             }
             if let Some(mm) = &self.metrics {
                 mm.serving.turn_stage[self.kind.index()].duration(took);
+                if self.kind == Kind::Tts {
+                    mm.serving.tts.first_audio.duration(took);
+                }
             }
         }
         let t = self.timing();
@@ -716,10 +723,21 @@ impl StageRun {
         }
         let now = Instant::now();
         self.done = Some(now);
-        if self.kind == Kind::Tts && self.first.is_some() && self.observed {
-            metrics()
-                .underrun
-                .duration(Duration::from_secs_f64(self.underrun_s.max(0.0)));
+        let took = now.saturating_duration_since(self.arrived);
+        if self.kind == Kind::Tts {
+            if let Some(mm) = &self.metrics {
+                mm.serving.tts.completed.fetch_add(1, Relaxed);
+                mm.serving.tts.e2e.duration(took);
+                mm.serving.tts.audio_duration_ms.fetch_add((self.audio_s * 1000.0) as u64, Relaxed);
+                if self.underrun_s > 0.0 {
+                    mm.serving.tts.playback_stalls.fetch_add(1, Relaxed);
+                }
+            }
+            if self.first.is_some() && self.observed {
+                metrics()
+                    .underrun
+                    .duration(Duration::from_secs_f64(self.underrun_s.max(0.0)));
+            }
         }
         if let Some(j) = &self.joined {
             let (kind, audio_s, underrun_s) = (self.kind, self.audio_s, self.underrun_s);
