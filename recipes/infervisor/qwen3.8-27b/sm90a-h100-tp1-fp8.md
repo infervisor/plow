@@ -1,6 +1,6 @@
 # qwen3.8-27b — sm90a-h100-tp1-fp8
 
-Status: **validated**. Reference: `infervisor/qwen3.8-27b:sm90a-h100-tp1-fp8`.
+Status: **emits**. Reference: `infervisor/qwen3.8-27b:sm90a-h100-tp1-fp8`.
 
 The command blocks below are generated from the recipe TOML by
 `scripts/render_recipe.py`; edit the TOML, not the blocks. Prose outside
@@ -30,7 +30,7 @@ nix develop --command env \
   PLOW_DECODE_BATCH=4 \
   PLOW_DECODE_BATCH_LADDER=1,2,4,8,16,32,48 \
   PLOW_EMIT_DECODE_CUBLASLT=1 \
-  PLOW_EMIT_DECODE_CUBLASLT_MIN_ROWS=2 \
+  PLOW_EMIT_DECODE_CUBLASLT_MIN_ROWS=1 \
   PLOW_EMIT_GEN_KERNELS=attn_pf_hd256_causal_ilv,attn_dec_hd256_gqa6_ilv \
   PLOW_EMIT_PACKED_PREFILL=1 \
   PLOW_EMIT_PREFILL_CUBLASLT=1 \
@@ -39,8 +39,7 @@ nix develop --command env \
   PLOW_NV_FA_RG_WIDE=1 \
   PLOW_NV_GEMV_K8_B1=1 \
   PLOW_NV_GEMV_REM_SPLIT=1 \
-  PLOW_QWEN_FP8_M1_TMA=1 \
-  PLOW_QWEN_GDN_ISOLATE=2 \
+  PLOW_QWEN_GDN_ISOLATE=1 \
   PLOW_QWEN_KV_INTERLEAVE=1 \
   PLOW_QWEN_PREFILL=128,1024,4096,8192 \
   PLOW_QWEN_SHARE_QUANT=1 \
@@ -62,7 +61,6 @@ nix develop --command env \
 #   eos = [248046, 248044]
 #   concurrency = [1, 8, 32]
 #   vllm_capture = {'c1': '{env:QWEN38_FP8_FP32_VLLM}', 'c8': '{env:QWEN38_FP8_FP32_VLLM_C8}', 'c32': '{env:QWEN38_FP8_FP32_VLLM_C32}'}
-#   cont_decisive_drop_max = 0.022
 ```
 <!-- /plow:recipe:gates -->
 

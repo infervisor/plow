@@ -20,9 +20,13 @@ pub mod chat;
 pub mod gemm_policy;
 pub mod logical_effects;
 
-/// The plowrt runtime contract a bundle emitted by this tree declares (`build.json`
-/// `runtime_requires.plowrt_contract`); plowrt refuses a bundle that declares a higher one.
-pub const RUNTIME_CONTRACT: u32 = 2;
+/// The plowrt runtime contract this tree implements; plowrt refuses a bundle whose `build.json`
+/// `runtime_requires.plowrt_contract` is higher.
+pub const RUNTIME_CONTRACT: u32 = RUNTIME_CONTRACT_FP8_BLOCK;
+/// The contract a bundle declares unless it uses a later feature.
+pub const RUNTIME_CONTRACT_BASE: u32 = 2;
+/// Block-scaled FP8 projections (`packet::dev::FP8_BLOCK_GROUP`) on cuBLASLt.
+pub const RUNTIME_CONTRACT_FP8_BLOCK: u32 = 3;
 
 // --- Shared domain enums -----------------------------------------------------
 

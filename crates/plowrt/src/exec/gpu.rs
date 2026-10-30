@@ -4997,6 +4997,22 @@ impl GpuEngine {
                     && td.init.is_none()
                     && is_checkpoint_tensor(i, &td.name, packed_prefill_metadata.as_ref())
                 {
+                    if let Some(wide) = ckpt.widened_f32(&td.name, td.bytes) {
+                        let wide = wide?;
+                        for (o, chunk) in wide.chunks(STAGE).enumerate() {
+                            let dst = mem.base + (o * STAGE) as u64;
+                            slab_commit_wait(
+                                &weight_slab,
+                                dst + chunk.len() as u64,
+                                &mut slab_wait_ms,
+                            )?;
+                            pipe.push(dst, chunk)?;
+                        }
+                        wb += td.bytes;
+                        nw += 1;
+                        devp.push(mem);
+                        continue;
+                    }
                     let src = ckpt.tensor(&td.name).ok_or_else(|| {
                         RuntimeError::Device(format!("MISSING WEIGHT: {}", td.name))
                     })?;

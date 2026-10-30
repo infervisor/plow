@@ -225,7 +225,7 @@ pub(crate) fn missing_weights(
             !caches.contains(i)
                 && t.init.is_none()
                 && is_checkpoint_tensor(*i, &t.name, packed.as_ref())
-                && !have.contains(&t.name)
+                && !have.contains(t.name.strip_prefix("f32/").unwrap_or(&t.name))
         })
         .map(|(_, t)| t.name.clone())
         .collect())
@@ -583,6 +583,42 @@ impl Checkpoint {
             .find(|e| e.fp8)?;
         let (map, off) = &self.shards[e.shard];
         Some((map.get(off + e.range.start..off + e.range.end)?, &e.shape))
+    }
+
+    /// The bytes of packet tensor `name` when it is an `f32/<source>` view: checkpoint tensor
+    /// `source` (BF16, widened exactly; F32, copied) as little-endian f32, `bytes` long. `None`
+    /// for any other name.
+    pub(crate) fn widened_f32(&self, name: &str, bytes: u64) -> Option<Result<Vec<u8>>> {
+        let source = name.strip_prefix("f32/")?;
+        Some((|| {
+            let e = self
+                .index
+                .get(source)
+                .ok_or_else(|| RuntimeError::Device(format!("MISSING WEIGHT: {source}")))?;
+            let (map, off) = &self.shards[e.shard];
+            let src = map
+                .get(off + e.range.start..off + e.range.end)
+                .ok_or_else(|| RuntimeError::Device(format!("{source}: range past the shard")))?;
+            let out: Vec<u8> = match e.dtype {
+                safetensors::Dtype::BF16 => src
+                    .chunks_exact(2)
+                    .flat_map(|b| [0, 0, b[0], b[1]])
+                    .collect(),
+                safetensors::Dtype::F32 => src.to_vec(),
+                other => {
+                    return Err(RuntimeError::Device(format!(
+                        "{name}: source {source} is {other:?}, not BF16/F32"
+                    )))
+                }
+            };
+            if out.len() as u64 != bytes {
+                return Err(RuntimeError::Device(format!(
+                    "SIZE MISMATCH {name} (want {bytes} got {})",
+                    out.len()
+                )));
+            }
+            Ok(out)
+        })())
     }
 
     /// Tensor bytes **and** shape — what a row-parallel shard needs.

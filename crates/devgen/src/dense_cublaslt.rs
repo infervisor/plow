@@ -413,10 +413,28 @@ fn prefill_eligible(model: &Model, op: &packet::dev::DevInst, rows: u32, profile
         Some(DevOp::GemmFp8 | DevOp::GemmMedFp8 | DevOp::GemmSmallFp8)
     ) {
         let rows = packet::devbuild::program_rows(rows);
+        // Block-scaled FP8: cuBLASLt runs the rows padded to 4 with 1x128 activation and 128x128
+        // weight scales (see `packet::dev::FP8_BLOCK_GROUP`).
+        let block = op.i[5] == packet::dev::FP8_BLOCK_GROUP;
+        let (lt_rows, scales) = if block {
+            let rows = rows.next_multiple_of(4);
+            let groups = u64::from(op.i[2] / 128);
+            (
+                rows,
+                [
+                    groups * u64::from(rows) * 4,
+                    u64::from(op.i[1] / 128) * groups * 4,
+                ],
+            )
+        } else {
+            (rows, [u64::from(rows) * 4, u64::from(op.i[1]) * 4])
+        };
         return op.blocks > 0
             && op.i[0] == rows
             && plow_asset::segment_roles::cublaslt_prefill_fp8(profile, rows, op.i[1], op.i[2])
-            && op.i[3..6].iter().all(|&value| value == 0)
+            && op.i[3..5].iter().all(|&value| value == 0)
+            && (op.i[5] == 0
+                || block && op.i[1] % 128 == 0 && op.i[2] % 128 == 0 && op.i[6..] == [0, 0])
             && op.t[5..]
                 .iter()
                 .all(|&tensor| tensor == packet::dev::TENSOR_NONE)
@@ -427,11 +445,11 @@ fn prefill_eligible(model: &Model, op: &packet::dev::DevInst, rows: u32, profile
                 .len()
                 == 5
             && [
-                (op.t[0], u64::from(rows) * u64::from(op.i[1]) * 2),
-                (op.t[1], u64::from(rows) * u64::from(op.i[2])),
+                (op.t[0], u64::from(lt_rows) * u64::from(op.i[1]) * 2),
+                (op.t[1], u64::from(lt_rows) * u64::from(op.i[2])),
                 (op.t[2], u64::from(op.i[1]) * u64::from(op.i[2])),
-                (op.t[3], u64::from(rows) * 4),
-                (op.t[4], u64::from(op.i[1]) * 4),
+                (op.t[3], scales[0]),
+                (op.t[4], scales[1]),
             ]
             .into_iter()
             .all(|(handle, bytes)| {
@@ -760,7 +778,17 @@ pub(crate) fn runtime_requires(model: &Model, sections: &[SectionData]) -> serde
     } else {
         None
     };
-    let mut out = serde_json::json!({ "plowrt_contract": plow_asset::RUNTIME_CONTRACT });
+    let block_fp8 = model
+        .progs
+        .iter()
+        .flat_map(|p| &p.insts)
+        .any(|d| d.op == DevOp::GemmFp8 as u16 && d.i[5] == packet::dev::FP8_BLOCK_GROUP);
+    let contract = if block_fp8 {
+        plow_asset::RUNTIME_CONTRACT_FP8_BLOCK
+    } else {
+        plow_asset::RUNTIME_CONTRACT_BASE
+    };
+    let mut out = serde_json::json!({ "plowrt_contract": contract });
     if let Some(version) = cublaslt {
         out["cublaslt"] = version.into();
     }
@@ -1137,11 +1165,11 @@ mod tests {
         );
         assert_eq!(
             runtime_requires(&ladder, &sections),
-            serde_json::json!({"plowrt_contract": plow_asset::RUNTIME_CONTRACT, "cublaslt": "12.0"})
+            serde_json::json!({"plowrt_contract": plow_asset::RUNTIME_CONTRACT_BASE, "cublaslt": "12.0"})
         );
         assert_eq!(
             runtime_requires(&ladder, &[]),
-            serde_json::json!({"plowrt_contract": plow_asset::RUNTIME_CONTRACT})
+            serde_json::json!({"plowrt_contract": plow_asset::RUNTIME_CONTRACT_BASE})
         );
         let root = std::env::temp_dir().join(format!("devgen-lt-store-{}", std::process::id()));
         let out = root.join("out");

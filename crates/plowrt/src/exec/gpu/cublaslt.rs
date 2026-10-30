@@ -10,6 +10,8 @@ pub(super) struct DecodeSegment {
     pub(super) output_bytes: u64,
     pub(super) input_bytes: u64,
     pub(super) weight_bytes: u64,
+    /// Block-scaled FP8 ([`packet::dev::FP8_BLOCK_GROUP`]): cuBLASLt runs `m` padded to 4.
+    pub(super) block: bool,
 }
 
 pub(super) struct CublasLtDecodeRoute {
@@ -1971,8 +1973,21 @@ pub(super) fn prepare_routes(
                     "FP8 projection cannot fold an output head".into(),
                 ));
             }
+            let lt_m = if segment.block {
+                segment.m.next_multiple_of(4)
+            } else {
+                segment.m
+            };
+            let elements = if segment.block {
+                [
+                    (segment.k / 128) * lt_m,
+                    (segment.n / 128) * (segment.k / 128),
+                ]
+            } else {
+                [segment.m, segment.n]
+            };
             let mut scales = [0; 2];
-            for (index, (handle, elements)) in [(op.t[3], segment.m), (op.t[4], segment.n)]
+            for (index, (handle, elements)) in [(op.t[3], elements[0]), (op.t[4], elements[1])]
                 .into_iter()
                 .enumerate()
             {
@@ -1999,12 +2014,13 @@ pub(super) fn prepare_routes(
                 .lt_fp8_fast_accum_max_k
                 .is_some_and(|max_k| segment.k <= max_k);
             let plan = ProjectionPlan::Lt(lt.fp8_plan(
-                segment.m,
+                lt_m,
                 segment.n,
                 segment.k,
                 scales[1],
                 scales[0],
-                !decode && fast_k,
+                !decode && fast_k && !segment.block,
+                segment.block,
             )?);
             fp8_plans += 1;
             insts[segment.instruction].op = DevOp::Nop as u16;
@@ -2511,10 +2527,13 @@ fn projection_segments(
                 }
             }
         };
-        let valid_immediates = match phase {
-            ProjectionPhase::Decode => op.i[3..].iter().all(|&value| value == 0),
-            ProjectionPhase::Prefill(_) => op.i[3..6].iter().all(|&value| value == 0),
+        let block = fp8 && op.i[5] == packet::dev::FP8_BLOCK_GROUP;
+        let end = match phase {
+            ProjectionPhase::Decode => op.i.len(),
+            ProjectionPhase::Prefill(_) => 6,
         };
+        let valid_immediates = (3..end).all(|j| op.i[j] == 0 || (block && j == 5))
+            && (!block || op.i[6..].iter().all(|&value| value == 0));
         if !valid_op
             || op.t[if fp8 { 5 } else { 3 }..]
                 .iter()
@@ -2533,14 +2552,19 @@ fn projection_segments(
             return Err(fail());
         }
         let [m, n, k] = [op.i[0], op.i[1], op.i[2]];
+        if block && (n % 128 != 0 || k % 128 != 0) {
+            return Err(fail());
+        }
+        // The rows cuBLASLt reads and writes (block route: padded to 4).
+        let lt_m = if block { m.next_multiple_of(4) } else { m };
         let bytes = |a: u32, b: u32| {
             u64::from(a)
                 .checked_mul(u64::from(b))
                 .and_then(|elements| elements.checked_mul(2))
                 .ok_or_else(fail)
         };
-        let output_bytes = bytes(m, n)?;
-        let input_bytes = bytes(m, k)? / if fp8 { 2 } else { 1 };
+        let output_bytes = bytes(lt_m, n)?;
+        let input_bytes = bytes(lt_m, k)? / if fp8 { 2 } else { 1 };
         let weight_bytes = bytes(n, k)? / if fp8 { 2 } else { 1 };
         if fp8 {
             if op.t[..5]
@@ -2552,7 +2576,15 @@ fn projection_segments(
             {
                 return Err(fail());
             }
-            for (handle, required) in [(op.t[3], u64::from(m) * 4), (op.t[4], u64::from(n) * 4)] {
+            let scales = if block {
+                [
+                    (op.t[3], u64::from(k / 128) * u64::from(lt_m) * 4),
+                    (op.t[4], u64::from(n / 128) * u64::from(k / 128) * 4),
+                ]
+            } else {
+                [(op.t[3], u64::from(m) * 4), (op.t[4], u64::from(n) * 4)]
+            };
+            for (handle, required) in scales {
                 if tensors
                     .get(handle as usize)
                     .is_none_or(|tensor| tensor.bytes < required)
@@ -2584,6 +2616,7 @@ fn projection_segments(
             output_bytes,
             input_bytes,
             weight_bytes,
+            block,
         });
     }
     Ok(routes)
@@ -2968,6 +3001,7 @@ mod tests {
                         output_bytes: u64::from(batch) * 48 * 2,
                         input_bytes: u64::from(batch) * 5120 * 2,
                         weight_bytes: 48 * 5120 * 2,
+                        block: false,
                     }),
                     None,
                 ]
