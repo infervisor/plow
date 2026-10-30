@@ -8,6 +8,8 @@
 //!   block_run <asset-dir> bench --batch 1,2,4,8 --ctx 128,512,1024,4096
 //!                              [--iters 100] [--warmup 10] [--prefill-iters 10]
 //!                              [--pf-chunk N] [--pf-cap ROWS]
+//!   block_run <asset-dir> decode-check [--batch B --ctx T --steps N --out y.npy]
+//!                              [--dump-tensors name,name --dump-dir dir]
 //!   block_run <asset-dir> mixed-check --rows 128 --decode 1
 //!   block_run <asset-dir> packed-check [--requests 16 --query-rows 128 --kv-base 4096]
 //!                                      [--dump-dir dir] [--dump-tensors name,name]
@@ -167,11 +169,11 @@ mod cuda {
         let mut args = std::env::args().skip(1);
         let asset = PathBuf::from(
             args.next()
-                .ok_or("usage: block_run <asset-dir> <check|bench|prefill-bench|mixed-check|packed-check> [flags]")?,
+                .ok_or("usage: block_run <asset-dir> <check|bench|prefill-bench|decode-check|mixed-check|packed-check> [flags]")?,
         );
         let verb = args
             .next()
-            .ok_or("usage: block_run <asset-dir> <check|bench|prefill-bench|mixed-check|packed-check> [flags]")?;
+            .ok_or("usage: block_run <asset-dir> <check|bench|prefill-bench|decode-check|mixed-check|packed-check> [flags]")?;
         let rest: Vec<String> = args.collect();
         let flag = |name: &str| -> Option<String> {
             rest.iter()
@@ -241,10 +243,11 @@ mod cuda {
                 }
                 Ok(())
             }
+            "decode-check" => decode_check(&mut e, hidden, &out_name, &flag),
             "mixed-check" => mixed_check(&mut e, &desc, hidden, &out_name, &flag),
             "packed-check" => packed_check(&mut e, &desc, hidden, &out_name, &flag),
             other => Err(format!(
-                "unknown verb {other:?} (check|bench|prefill-bench|mixed-check|packed-check)"
+                "unknown verb {other:?} (check|bench|prefill-bench|decode-check|mixed-check|packed-check)"
             )
             .into()),
         }
@@ -640,6 +643,68 @@ mod cuda {
             std::fs::write(dir.join(filename), data)?;
         }
         Ok(())
+    }
+
+    /// `decode-check --batch B --ctx T --steps N --out y.npy`: prefill B slots to T rows, then N
+    /// decode steps, each on a fresh seeded act.x of B rows; writes the N x B block outputs (byte
+    /// comparison of two decode routes on one packet).
+    fn decode_check(
+        e: &mut plowrt::exec::gpu::GpuEngine,
+        hidden: usize,
+        out_name: &str,
+        flag: &dyn Fn(&str) -> Option<String>,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let bsz: usize = flag("--batch").and_then(|s| s.parse().ok()).unwrap_or(1);
+        let t: usize = flag("--ctx").and_then(|s| s.parse().ok()).unwrap_or(1024);
+        let steps: usize = flag("--steps").and_then(|s| s.parse().ok()).unwrap_or(4);
+        if bsz == 0 || bsz > e.batch() || !e.has_prefill() {
+            return Err("decode-check needs 0 < batch <= engine batch and a prefill object".into());
+        }
+        let prompt: Vec<u32> = (0..t as u32).map(|i| 100 + (i % 1000)).collect();
+        let xin = synth(t, hidden);
+        let mut last = vec![0u32; bsz];
+        for (b, tok) in last.iter_mut().enumerate() {
+            e.begin_slot(b, t + steps + 2)?;
+            e.upload_activation("act.x", &xin)?;
+            *tok = e.prefill_slot(b, &prompt)?;
+        }
+        let rows = synth(steps * bsz, hidden);
+        let mut out = Vec::with_capacity(steps * bsz * hidden);
+        let mut toks = Vec::new();
+        for s in 0..steps {
+            e.upload_activation("act.x", &rows[s * bsz * hidden..(s + 1) * bsz * hidden])?;
+            let feeds: Vec<_> = last.iter().enumerate().map(|(b, &tk)| (b, tk)).collect();
+            e.step_slots(&feeds, &mut toks)?;
+            if toks.len() >= bsz {
+                last.copy_from_slice(&toks[..bsz]);
+            }
+            let y = e.download_activation(out_name)?;
+            out.extend_from_slice(&y[..bsz * hidden]);
+        }
+        let bad = out.iter().filter(|v| !v.is_finite()).count();
+        println!("decode-check: B={bsz} T={t} steps={steps} non-finite={bad}");
+        if let Some(p) = flag("--out") {
+            npy::write_f32(Path::new(&p), &[steps * bsz, hidden], &out)?;
+            println!("  wrote {p}");
+        }
+        // Raw allocations after the last step (`--dump-tensors a,b --dump-dir d`): d/<name>.bin.
+        if let (Some(names), Some(dir)) = (flag("--dump-tensors"), flag("--dump-dir")) {
+            std::fs::create_dir_all(&dir)?;
+            for name in names.split(',').map(str::trim).filter(|n| !n.is_empty()) {
+                let bytes = e
+                    .tensor_bytes(name)
+                    .ok_or_else(|| format!("unknown dump tensor {name:?}"))?;
+                let mut raw = vec![0u8; usize::try_from(bytes)?];
+                e.read_tensor(name, &mut raw)?;
+                std::fs::write(Path::new(&dir).join(format!("{name}.bin")), raw)?;
+            }
+            println!("  wrote tensor dumps to {dir}");
+        }
+        if bad == 0 {
+            Ok(())
+        } else {
+            Err("decode output contains non-finite values".into())
+        }
     }
 
     fn mixed_check(

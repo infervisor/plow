@@ -206,6 +206,14 @@ const QWEN_LIGHT_DECODE: Status = Status::Candidate {
     ],
 };
 
+/// A routed decode segment [producer -> QuantFp8 1x128 groups] as one `light_quant` launch.
+const LIGHT_QUANT: Status = Status::Candidate {
+    evidence: &[
+        "qwen-fp8-decode campaign (Qwen3.8-27B FP8 hub, H100): 4 interpreter windows per layer [norm|gate|glu -> group quant], 257 per step at 15-29 us (6.55 ms of 21.9 ms B1)",
+        "`=0` is the rollback to interpreter windows",
+    ],
+};
+
 /// Runtime knobs change no packet byte; their scope is the route a workload takes.
 /// G1 (review log #85) skips union segments inside the sparse prefill programs; the packet does not
 /// change, so the route is its whole scope.
@@ -690,6 +698,7 @@ pub const RUNTIME: &[KnobSpec] = &[
     KnobSpec::new("rt.prefill_light", Some("PLOW_PREFILL_LIGHT"), Layer::Runtime, Domain::Bool, ON, PROMOTED),
     KnobSpec::new("rt.qwen_light_occ", Some("PLOW_QWEN_LIGHT_OCC"), Layer::Runtime, U32, Default::Static(Val::Nat(4)), QWEN_LIGHT_DEFAULT),
     KnobSpec::new("rt.qwen_light_decode", Some("PLOW_QWEN_LIGHT_DECODE"), Layer::Runtime, Domain::Bool, ON, QWEN_LIGHT_DECODE),
+    KnobSpec::new("rt.light_quant", Some("PLOW_LIGHT_QUANT"), Layer::Runtime, Domain::Bool, ON, LIGHT_QUANT),
     KnobSpec::new("rt.qwen_pf_graph", Some("PLOW_QWEN_PF_GRAPH"), Layer::Runtime, Domain::Bool, ON, QWEN_PF_GRAPH),
     KnobSpec::new("rt.decode_lt_qkv", Some("PLOW_DECODE_LT_QKV"), Layer::Runtime, Domain::Bool, ON, PROMOTED),
     KnobSpec::new("rt.moe_pf_lt", Some("PLOW_MOE_PF_LT"), Layer::Runtime, U32, UNSET, MOE_LT_QUALIFIED),
