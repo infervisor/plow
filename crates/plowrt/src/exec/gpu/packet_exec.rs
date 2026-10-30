@@ -1,7 +1,8 @@
 //! A self-contained packet (weights embedded, no language-model step protocol) on the CUDA
 //! interpreter: the `PacketRuntime` for forward pipelines such as the Qwen3-ASR audio encoder.
 //! Every program runs as one cooperative launch per global-queue segment of the speech object
-//! (`interp_sm90a_speech.cubin` or `interp_sm89_speech.cubin`, the interpreter with the FP32 speech arms).
+//! (`interp_sm90a_speech.cubin`, `interp_sm120_speech.cubin` or `interp_sm89_speech.cubin`, the
+//! interpreter with the FP32 speech arms).
 
 use std::path::Path;
 use std::sync::Arc;
@@ -77,6 +78,16 @@ fn test_speech_object_resolution() {
     assert_eq!(speech_object((9, 0)).0, "interp_sm90a_speech.cubin");
     assert_eq!(speech_object((10, 0)).0, "interp_sm120_speech.cubin");
     assert_eq!(speech_object((12, 0)).0, "interp_sm120_speech.cubin");
+}
+
+#[cfg(test)]
+#[test]
+fn speech_object_symbols_follow_the_cmake_mangling() {
+    for cc in [(8, 9), (9, 0), (10, 0), (12, 0)] {
+        let (file, symbol) = speech_object(cc);
+        let stem = file.strip_suffix(".cubin").unwrap();
+        assert_eq!(symbol, format!("_Z{}{stem}11PlowProgram", stem.len()));
+    }
 }
 
 struct Program {

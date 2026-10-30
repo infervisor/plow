@@ -630,7 +630,10 @@ if(PLOW_SM120_CUBIN OR PLOW_SM90A_CUBIN OR PLOW_SM89_CUBIN)
     set(_ax_packed_seg_gemm -DPLOW_BUCKET_DECODE=0 -DPLOW_NV_PREFILL=1 -DPLOW_NV_SEGMENTS=1 -DPLOW_NV_SEG_GEMM=1 -DPLOW_NV_PACKED_REQUEST=1)
     # Second axis of the routed decode object: the decode axis minus the expert GEMV arms.
     set(_ax_routed -DPLOW_NV_DECODE_ROUTED=1)
-    set(_ax_speech -DPLOW_NV_SPEECH=1)
+    # A speech encoder never emits the Mamba scan, whose per-thread state array owns 1024 B of
+    # the frame: sm_120a speech stack 2112 -> 1080 B, encoder digests unchanged, rtx-5090 packed
+    # encoder launch at 10/20 chunks 0.3-0.4% faster.
+    set(_ax_speech -DPLOW_NV_SPEECH=1 -DPLOW_NV_MAMBA=0)
     set(_ax_gw -DPLOW_NV_GW_OBJECT=1)
     set(_ax_rs -DPLOW_NV_ROW_SLOT=1)
     set(_ax_gw_rs ${_ax_gw} ${_ax_rs})

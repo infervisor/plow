@@ -275,6 +275,47 @@ fn validates_direct_kv_ladder_and_rejects_stale_slot_addressing() {
     }
 }
 
+/// devgen PLOW_DECODE_HNR_FOLD=<rows>: the widest rung's FlashDecode writes the caches itself
+/// (t7 = the fold descriptor, no HeadNormRope), the narrower rungs keep their writers.
+#[test]
+fn validates_hnr_folded_widest_rung() {
+    let folded = |pos_word: u32| {
+        let mut blob = fixture();
+        for p in &mut blob.progs {
+            for d in &mut p.insts {
+                match DevOp::from_u16(d.op) {
+                    Some(DevOp::HeadNormRope) => d.i[2] = 128,
+                    Some(DevOp::FlashDecode) => d.i[6] = 128,
+                    Some(DevOp::FlashMerge) => d.i[3] = 128,
+                    _ => {}
+                }
+            }
+        }
+        for kv in &mut blob.tensors[3..5] {
+            kv.bytes = 16 * 1024 * 128 * 2;
+        }
+        let words = [7, 8, 8, 9, 9, 9, 9, pos_word, 0, 0, 1];
+        let init: Vec<u8> = words.iter().flat_map(|w: &u32| w.to_le_bytes()).collect();
+        blob.tensors.push(DevTensor {
+            name: "in.hnr_fold.desc.0".into(),
+            bytes: init.len() as u64,
+            init: Some(blob.init.len()..blob.init.len() + init.len()),
+        });
+        blob.init.extend(init);
+        let desc = (blob.tensors.len() - 1) as u16;
+        let widest = blob.progs.last_mut().unwrap();
+        widest.insts.drain(..2);
+        widest.insts[0].t[7] = desc;
+        widest.stream.truncate(2);
+        widest.gq_stream.truncate(2);
+        widest.stream_len = vec![2];
+        widest.gq_seg_ofs = vec![0, 2];
+        blob
+    };
+    assert!(validate_decode_ladder(&folded(0)).unwrap());
+    assert!(!validate_decode_ladder(&folded(1)).unwrap_or(false));
+}
+
 #[test]
 fn validates_channel_fp8_rows_and_preserves_projection_and_kv_checks() {
     for op in [DevOp::GemvFp8, DevOp::GemvGluFp8] {

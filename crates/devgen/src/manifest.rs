@@ -1150,6 +1150,12 @@ fn tuning(s: &Shapes, arch: &str) -> Map<String, Value> {
         t.insert("fa_rg".into(), json!(1));
         t.insert("fa_rg_wide".into(), json!(1));
     }
+    // * `gemv_pf_ops`: the decode object's pre-gate prefetch op set (PLOW_NV_GEMV_PF_OPS opt-in).
+    if arch.starts_with("sm_") && crate::emit_config::active().gemv_prefetch {
+        if let Some(v) = crate::emit_config::active().nv_gemv_pf_ops {
+            t.insert("gemv_pf_ops".into(), json!(v));
+        }
+    }
     // * `fa_v3_splitkv`: the fused v3 flash prefill carries the split-KV workspace (`fa_ws`).
     if s.fa_ws_slots > 0 {
         t.insert("fa_v3_splitkv".into(), json!(s.fa_ws_slots));
@@ -1358,6 +1364,62 @@ fn tuning(s: &Shapes, arch: &str) -> Map<String, Value> {
                 t.insert("gw_min_rows".into(), json!(32));
             }
         }
+    }
+    // GB202 (sm_120a): a dense hd <= 128 packet walks its B=1 GEMVs on the tensor cores too.
+    // Qwen3-ASR rtx-5090 step_bench ctx 512 B=1/8/16/32, PLOW_GEMV_PREFETCH on, token digests
+    // unchanged: 1.7B 2.722/3.091/3.469/4.270 -> 2.630/3.091/3.470/4.268 ms; 0.6B
+    // 1.433/1.662/2.038/2.917 -> 1.301/1.660/2.033/2.907.
+    if arch == "sm_120a"
+        && s.moe_down_inter == 0
+        && s.decode_batch >= 2
+        && !s.decode_gemv_k.is_empty()
+        && s.decode_gemv_k.iter().all(|k| k % 32 == 0)
+        && s.hd.iter().all(|&h| h <= 128)
+        && !s.ops_present.iter().any(|op| op.starts_with("Moe"))
+        && !s.ops_present.contains(&op_name(DevOp::GluStrided))
+    {
+        t.insert("gemv_mma_b1".into(), json!(1));
+    }
+    // * `gemv_k8_ops` (PLOW_NV_GEMV_K8_OPS opt-in): rungs 2..16 of those walks take the K-split
+    //   walk (op_gemv_k8_sm90.cuh, mma.sync only), which streams on ceil(N / 170) rows per block
+    //   where gvmma_partition leaves 42 blocks idle. Qwen3-ASR 1.7B rtx-5090 ctx 1024 B=1/4/16/32,
+    //   Gemv + GemvQkv (5): 2.707/3.022/4.026/5.394 -> 2.733/2.893/3.819/5.399 ms, token digests
+    //   unchanged; the 0.6B loses (B=16 +2.3%: N=1024 is 7 rows a block, the mma half empty).
+    if arch == "sm_120a"
+        && s.moe_down_inter == 0
+        && s.decode_batch >= 2
+        && s.decode_gemv_k.iter().all(|k| k % 32 == 0)
+    {
+        if let Some(v) = crate::emit_config::active().nv_gemv_k8_ops {
+            t.insert("gemv_k8_ops".into(), json!(v));
+        }
+    }
+    // * `norm_fold` (PLOW_DECODE_NORM_FOLD opt-in): the decode object carries the AddNorm fold
+    //   arms the packet's o_proj / down / GemvGlu / GemvQkv use.
+    if arch.starts_with("sm_") && crate::emit_config::active().decode_norm_fold {
+        assert_eq!(arch, "sm_120a", "PLOW_DECODE_NORM_FOLD: sm_120a decode objects only");
+        t.insert("norm_fold".into(), json!(1));
+    }
+    // * `hnr_fold` (PLOW_DECODE_HNR_FOLD opt-in): the decode object's FlashDecode carries the
+    //   HeadNormRope fold arm the packet's flash packets use.
+    if arch.starts_with("sm_") && crate::emit_config::active().decode_hnr_fold.unwrap_or(0) > 0 {
+        assert_eq!(arch, "sm_120a", "PLOW_DECODE_HNR_FOLD: sm_120a decode objects only");
+        t.insert("hnr_fold".into(), json!(1));
+    }
+    // * `gemv_xk` (PLOW_DECODE_GEMV_XK opt-in): the first rung whose Gemv walk splits K over blocks.
+    if let Some(rows) = crate::emit_config::active().decode_gemv_xk.filter(|&r| r > 0) {
+        if arch.starts_with("sm_") {
+            assert_eq!(arch, "sm_120a", "PLOW_DECODE_GEMV_XK: sm_120a decode objects only");
+            t.insert("gemv_xk".into(), json!(rows));
+            if crate::emit_config::active().decode_gemv_xk_qkv {
+                t.insert("gemv_xk_qkv".into(), json!(1));
+            }
+        }
+    }
+    // * `gemv_w_cs` (PLOW_DECODE_GEMV_W_CS opt-in): the GEMV walks load weights evict-first.
+    if arch.starts_with("sm_") && crate::emit_config::active().decode_gemv_w_cs {
+        assert_eq!(arch, "sm_120a", "PLOW_DECODE_GEMV_W_CS: sm_120a decode objects only");
+        t.insert("gemv_w_cs".into(), json!(1));
     }
     if sm90a && crate::emit_config::active().w8a8 && crate::emit_config::active().decode_cublaslt {
         t.insert("fp8_lt_decode".into(), json!(true));
@@ -3306,13 +3368,13 @@ pub fn config_header(manifest: &Value) -> String {
             // (op_gemv_mma.cuh). The dot8 walk is compute-bound above MM=1 — 100–366 GB/s at
             // M=16 vs 1.4–2.6 TB/s (experiments/gemv_mma_batch_h100.cu) — and the B=1 rung is
             // untouched, so a packet whose ladder reaches 2 turns it on for its objects. The walk is
-            // mma.sync m16n8k16 + 16-byte loads, so Ada (sm_89) takes it too, except in the speech
-            // object: its static reduction smem on top of the 96 KiB speech arena passes sm_89's
-            // 99 KiB block limit, and speech packets run no batched decode GEMVs.
+            // mma.sync m16n8k16 + 16-byte loads, so Ada (sm_89) and GB202 (sm_120a) take it too,
+            // except in the speech object: its static reduction smem on top of the 96 KiB speech
+            // arena passes their 99 KiB block limit, and speech packets run no batched decode GEMVs.
             let arch = manifest.get("arch").and_then(Value::as_str);
             if v >= 2 && arch == Some("sm_90a") {
                 out.push_str("#ifndef PLOW_NV_GEMV_MMA\n#define PLOW_NV_GEMV_MMA 1\n#endif\n");
-            } else if v >= 2 && arch == Some("sm_89") {
+            } else if v >= 2 && matches!(arch, Some("sm_89" | "sm_120a")) {
                 out.push_str(
                     "#if !PLOW_NV_SPEECH\n#ifndef PLOW_NV_GEMV_MMA\n#define PLOW_NV_GEMV_MMA 1\n#endif\n#endif\n",
                 );
@@ -3362,6 +3424,53 @@ pub fn config_header(manifest: &Value) -> String {
         }
         if t.get("kv_ilv").is_some() {
             out.push_str("#ifndef PLOW_NV_KV_ILV\n#define PLOW_NV_KV_ILV 1\n#endif\n");
+        }
+        // Measured in the decode object only; the speech and prefill objects keep their walks.
+        if manifest.get("arch").and_then(Value::as_str) == Some("sm_120a")
+            && t.get("gemv_mma_b1").is_some()
+        {
+            out.push_str(
+                "#if !PLOW_NV_SPEECH && !PLOW_NV_PREFILL\n#ifndef PLOW_NV_GEMV_MMA_B1\n#define PLOW_NV_GEMV_MMA_B1 1\n#endif\n#endif\n",
+            );
+        }
+        if let Some(v) = t.get("gemv_pf_ops").and_then(Value::as_u64) {
+            out.push_str(&format!(
+                "#ifndef PLOW_NV_GEMV_PF_OPS\n#define PLOW_NV_GEMV_PF_OPS {v}u\n#endif\n"
+            ));
+        }
+        if manifest.get("arch").and_then(Value::as_str) == Some("sm_120a") {
+            if let Some(v) = t.get("gemv_k8_ops").and_then(Value::as_u64) {
+                out.push_str(&format!(
+                    "#if !PLOW_NV_SPEECH && !PLOW_NV_PREFILL\n#ifndef PLOW_NV_GEMV_K8\n#define PLOW_NV_GEMV_K8 1\n#endif\n\
+                     #ifndef PLOW_NV_GEMV_K8_OPS\n#define PLOW_NV_GEMV_K8_OPS {v}u\n#endif\n\
+                     #ifndef PLOW_NV_GEMV_K8_MAX\n#define PLOW_NV_GEMV_K8_MAX 16\n#endif\n#endif\n"
+                ));
+            }
+            if t.get("norm_fold").is_some() {
+                out.push_str(
+                    "#if !PLOW_NV_SPEECH && !PLOW_NV_PREFILL\n#ifndef PLOW_NV_NORM_FOLD\n#define PLOW_NV_NORM_FOLD 1\n#endif\n#endif\n",
+                );
+            }
+            if t.get("hnr_fold").is_some() {
+                out.push_str(
+                    "#if !PLOW_NV_SPEECH && !PLOW_NV_PREFILL\n#ifndef PLOW_NV_HNR_FOLD\n#define PLOW_NV_HNR_FOLD 1\n#endif\n#endif\n",
+                );
+            }
+            if let Some(v) = t.get("gemv_xk").and_then(Value::as_u64) {
+                out.push_str(&format!(
+                    "#if !PLOW_NV_SPEECH && !PLOW_NV_PREFILL\n#ifndef PLOW_NV_GEMV_XK\n#define PLOW_NV_GEMV_XK {v}u\n#endif\n#endif\n"
+                ));
+            }
+            if t.get("gemv_xk_qkv").is_some() {
+                out.push_str(
+                    "#if !PLOW_NV_SPEECH && !PLOW_NV_PREFILL\n#ifndef PLOW_NV_GEMV_XK_QKV\n#define PLOW_NV_GEMV_XK_QKV 1\n#endif\n#endif\n",
+                );
+            }
+            if t.get("gemv_w_cs").is_some() {
+                out.push_str(
+                    "#if !PLOW_NV_SPEECH && !PLOW_NV_PREFILL\n#ifndef PLOW_NV_GEMV_W_CS\n#define PLOW_NV_GEMV_W_CS 1\n#endif\n#endif\n",
+                );
+            }
         }
         if manifest.get("arch").and_then(Value::as_str) == Some("sm_90a") {
             if let Some(ks) = t.get("xreg_k").and_then(Value::as_array) {

@@ -422,6 +422,17 @@ impl Manifest {
                     let qh = d.i[if prefill { 2 } else { 1 }];
                     require(qh > 0 && qh % c.heads == 0, "invalid query grouping")?;
                     let fp8 = c.scales.is_some();
+                    // devgen PLOW_DECODE_HNR_FOLD: t7 is the layer's fold descriptor and this
+                    // packet writes both halves' new rows at pos[b] (HeadNormRope's address).
+                    let hnr_fold = !prefill
+                        && op == DevOp::FlashDecode
+                        && !fp8
+                        && c.layout == LAYOUT_HEAD_MAJOR
+                        && c.hd == 128
+                        && d.t[7] != TENSOR_NONE16
+                        && tensor(d.t[7]).is_ok_and(|t| {
+                            t.name.starts_with("in.hnr_fold.desc.") && t.bytes == 44 && t.initialized
+                        });
                     let valid = if prefill {
                         op == if fp8 {
                             DevOp::FlashPrefillFp8
@@ -451,7 +462,7 @@ impl Manifest {
                             && match c.scales {
                                 Some(scales) => d.t[6..8] == scales,
                                 None => {
-                                    d.t[7] == TENSOR_NONE16
+                                    (d.t[7] == TENSOR_NONE16 || hnr_fold)
                                         && crate::mixed_step::validate_decode_slot_tensor(
                                             d.t[6],
                                             p.rows,
@@ -473,6 +484,12 @@ impl Manifest {
                     };
                     // A repeated reader of one pair is KV sharing (Gemma-4 E-series), same geometry.
                     require(valid, "attention reader contract")?;
+                    if hnr_fold {
+                        require(
+                            writes.insert(pair[0]) && writes.insert(pair[1]),
+                            "cache writer contract",
+                        )?;
+                    }
                     reads.insert(pair);
                 }
                 let span = (op == DevOp::FlashPrefillFp8)

@@ -271,17 +271,18 @@ impl PacketAudioEncoder {
                 "{total} audio chunks exceed the packed encoder"
             )));
         }
-        let programs = self
+        let (bucket, programs) = self
             .packed
             .iter()
             .find(|&&(chunks, _)| chunks >= total)
-            .map(|(_, p)| p.clone())
+            .map(|(chunks, p)| (*chunks, p.clone()))
             .unwrap();
         let chunk = self.chunking.chunk_frames;
         let chunk_rows = chunk.div_ceil(self.chunking.frame_stride);
         let mut input = vec![0.0f32; total * self.feature_bins * chunk];
         let mut table = vec![0u32];
-        let mut reference = vec![0u32; total * chunk_rows];
+        // Reference rows 0 mark the bucket's padding rows, which the dense split plan skips.
+        let mut reference = vec![0u32; bucket * chunk_rows];
         let mut spans = Vec::with_capacity(items.len());
         let mut first = 0;
         for features in items {
@@ -1328,5 +1329,65 @@ mod contract_tests {
         fill_context(&mut v, "hi \"there\"");
         assert_eq!(v[0]["content"], "hi \"there\"");
         assert_eq!(v[1]["content"][0]["type"], "audio");
+    }
+
+    /// Packed encoder rung bench: GPU us per launch and an output digest (equal digests = equal
+    /// bits) for each pass. `ENC_BENCH` = a model.pkt; `ENC_BENCH_PASSES` = `;`-separated
+    /// passes of `,`-separated frame counts; `ENC_BENCH_REPS` launches per pass.
+    #[test]
+    #[ignore]
+    fn packed_encoder_bench() {
+        let blob = std::path::PathBuf::from(std::env::var("ENC_BENCH").unwrap());
+        let path =
+            crate::exec::packet_runtime::stage_packet(&blob, "encoder.packet", "encoder.pkt")
+                .unwrap();
+        let mut encoder = PacketAudioEncoder::load(&path, "cuda").unwrap();
+        encoder.warm().unwrap();
+        let passes = std::env::var("ENC_BENCH_PASSES").unwrap_or_else(|_| {
+            "693,287;693,512,287,205,96;1600,1200,800,693,512,287,205,96".into()
+        });
+        let reps: usize = std::env::var("ENC_BENCH_REPS")
+            .ok()
+            .and_then(|r| r.parse().ok())
+            .unwrap_or(50);
+        let mut seed = 0x9e37_79b9u32;
+        for pass in passes.split(';') {
+            let features: Vec<MelFeatures> = pass
+                .split(',')
+                .map(|f| {
+                    let frames: usize = f.trim().parse().unwrap();
+                    let values = (0..frames * encoder.feature_bins)
+                        .map(|_| {
+                            seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                            (seed >> 8) as f32 / (1u32 << 23) as f32 - 1.0
+                        })
+                        .collect();
+                    MelFeatures { values, frames }
+                })
+                .collect();
+            let items: Vec<&MelFeatures> = features.iter().collect();
+            let mut us = Vec::with_capacity(reps);
+            let mut digest = 0;
+            for rep in 0..reps + 3 {
+                let rows = encoder.encode_packed(&items).unwrap();
+                if rep >= 3 {
+                    us.push(encoder.last_gpu_us());
+                }
+                digest = rows
+                    .iter()
+                    .flatten()
+                    .fold(0xcbf2_9ce4_8422_2325u64, |h, v| {
+                        (h ^ u64::from(v.to_bits())).wrapping_mul(0x100_0000_01b3)
+                    });
+            }
+            us.sort_by(f64::total_cmp);
+            let chunks: usize = features.iter().map(|f| encoder.chunks(f.frames)).sum();
+            println!(
+                "enc_bench chunks={chunks} items={} min_us={:.1} p50_us={:.1} digest={digest:016x}",
+                features.len(),
+                us[0],
+                us[us.len() / 2]
+            );
+        }
     }
 }

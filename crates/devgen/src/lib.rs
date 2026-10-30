@@ -1971,6 +1971,14 @@ struct Tn {
     // self-cleaning like `mrgc`. Carried in the fused prefill flash's t1 (mlpart, unused there).
     fa_ws: u32,
     hn: u32,
+    // [hidden / 8][32] f32 row-block sums of squares of the AddNorm fold (PLOW_DECODE_NORM_FOLD):
+    // the o_proj / down GEMV writes them, the GemvGlu / GemvQkv after it reads them. One tensor
+    // across layers (each producer sits behind the previous consumer). TENSOR_NONE otherwise.
+    nfp: u32,
+    // HeadNormRope fold (PLOW_DECODE_HNR_FOLD): per layer, the u32 descriptor FlashDecode's t7
+    // reads ({qg, kg, vg, gamma_q, gamma_k, cos, sin, pos, eps bits, qk_skip, v_skip}). Declared
+    // here because the decode rung builders' own tensors do not survive. Empty otherwise.
+    hnrd: Vec<u32>,
     // Gemma-4 E-series per-layer inputs (TENSOR_NONE elsewhere): the packed embedding table
     // [vocab][L*P], the context projection [L*P][H] and its norm gamma [P]; activations
     // `ple_raw` (token part), `ple_pp` (projection) and `ple` (combined) are [rows][L*P] bf16.
@@ -2454,6 +2462,11 @@ fn declare(
             TENSOR_NONE
         },
         hn: ac(b, "hn", (rows * c.hidden) as u64 * BF16),
+        nfp: if emit_config::active().decode_norm_fold && !emit_is_amd() && !emit_is_apple() {
+            ac(b, "nfp", c.hidden as u64 / 8 * 32 * F32)
+        } else {
+            TENSOR_NONE
+        },
         ple_tab: if c.ple > 0 {
             b.tensor(
                 &format!("{}embed_tokens_per_layer.weight", c.prefix),
@@ -2698,6 +2711,7 @@ fn declare(
         kcs: Vec::new(),
         vcs: Vec::new(),
         lw: Vec::new(),
+        hnrd: Vec::new(),
         fish: None,
         mtp: None,
         dspark: None,
@@ -3133,6 +3147,31 @@ fn declare(
         ));
     } else if emit_config::active().emit_spec {
         t.mtp = Some(mtp::declare(b, c, dbatch, t.rowslot != TENSOR_NONE));
+    }
+    if emit_config::active().decode_hnr_fold.unwrap_or(0) > 0 && !emit_is_amd() && !emit_is_apple() {
+        for l in 0..c.layers as usize {
+            let (cs, sn) = if c.is_full[l] {
+                (t.cos_f, t.sin_f)
+            } else {
+                (t.cos_s, t.sin_s)
+            };
+            let w = &t.lw[l];
+            let words = [
+                t.qg,
+                t.kg,
+                t.vg,
+                w.qn,
+                w.kn,
+                cs,
+                sn,
+                t.pos,
+                c.eps.to_bits(),
+                u32::from(!c.has_qk_norm),
+                u32::from(!c.has_v_norm),
+            ];
+            let desc = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+            t.hnrd.push(b.tensor_init(&format!("in.hnr_fold.desc.{l}"), desc));
+        }
     }
     t
 }
@@ -4908,6 +4947,45 @@ fn emit_phase(
         n.dspark.is_none() || (!block_mode && !hj && !fuse_nrn),
         "DSpark context needs whole-model, unsplit programs without the NRN fold"
     );
+    // ADDNORM FOLD (PLOW_DECODE_NORM_FOLD; op_gemv_mma.cuh GvFoldOut / GvFoldIn): both AddNorm
+    // packets of a layer and their gates leave the chain. o_proj / down add into `n.x` and write
+    // x * gamma to `n.hn` plus row-block sums of squares to `n.nfp`; the GemvGlu / GemvQkv that
+    // read `n.hn` scale by 1/rms. The last layer keeps its AddNorm (the final norm feeds the head).
+    // bf16 interpreter GEMVs on every rung it applies to, fused q|k|v and gate|up on every layer,
+    // hidden <= 2048 (the consumer reads K float4s of partials in one pass).
+    let norm_fold = decode
+        && fuse_norm
+        && !amd
+        && !emit_is_apple()
+        && n.nfp != TENSOR_NONE
+        && tp == 1
+        && !hj
+        && !block_mode
+        && !fp8
+        && !w8a8
+        && !mx4
+        && !affine_q4
+        && !c.moe
+        && c.ple == 0
+        && t <= 32
+        && !emit_config::active().decode_cublaslt_at(t)
+        && !emit_config::active().decode_native_tc
+        && !emit_config::active().no_fuse_qkv
+        && gemv_fused_input_fits(amd, t, c.hidden)
+        && c.hidden % 32 == 0
+        && c.hidden <= 2048
+        && block.clone().all(|l| {
+            let w = &n.lw[l];
+            let next = if l + 1 < block.end { n.lw[l + 1].g_in } else { n.fin };
+            !c.kv_is_shared(l)
+                && !(c.is_full[l] && c.k_eq_v)
+                && (c.heads / tp * if c.is_full[l] { c.hd_full } else { c.hd_slide }) % 32 == 0
+                && (c.inter_for_layer(l) / tp) % 32 == 0
+                && w.bo == TENSOR_NONE
+                && w.bd == TENSOR_NONE
+                && seam_fused(b, w.g_pa)
+                && seam_fused(b, next)
+        });
     // First layer of the trailing KV-shared run: a prefill program marks where its row-local
     // tail begins (plow_asset::kv_shared_tail).
     let shared_tail_start = (!block_mode && !hj && tp == 1 && block.end == c.layers as usize)
@@ -5362,6 +5440,10 @@ fn emit_phase(
                     d.i[2] = c.hidden;
                     d.i[3] = kd;
                     d.i[4] = kd;
+                    if norm_fold && l > block.start {
+                        d.t[7] = n.nfp; // AddNorm fold consumer: the previous down wrote x * gamma
+                        d.f[0] = c.eps;
+                    }
                 })
             };
             (c_q, c_k, c_v, v_src) = (fused, fused, fused, n.vg);
@@ -5671,7 +5753,20 @@ fn emit_phase(
         } else {
             0
         };
-        let c_qn = if fuse_hnr {
+        // HEADNORMROPE FOLD (PLOW_DECODE_HNR_FOLD; op_attention.cuh d_flash_decode `nrf`): no
+        // HeadNormRope packets; each flash item norms+ropes its GF q heads into smem, and the item
+        // whose split holds the new row writes k/v into the cache first. One item per KV head
+        // (gqa == GF) and pos[]-addressed writes (n_batch_kv armed) are kernel preconditions.
+        let hnr_fold = decode
+            && fuse_qkv
+            && l < n.hnrd.len()
+            && emit_config::active().decode_hnr_fold.is_some_and(|rows| t >= rows)
+            && !fp8_kv
+            && heads / kvh == gf
+            && hd == 128
+            && rope_pair == 0
+            && (t > 1 || seq_rows);
+        let c_qn = if fuse_hnr || hnr_fold {
             0 // no packet: the fold computes q's norm+rope in flash's staging
         } else {
             b.emit_dep(
@@ -5725,7 +5820,7 @@ fn emit_phase(
             && c_k == c_v
             && qk_skip == v_skip
             && emit_config::active().fuse_kv_hnr;
-        let c_kn = if fuse_hnr || shared {
+        let c_kn = if fuse_hnr || shared || hnr_fold {
             0
         } else {
             b.emit_dep(hn_op, hn_set(1), hn_dep(c_k, nk, kvh), |d| {
@@ -5771,7 +5866,7 @@ fn emit_phase(
                 }
             })
         };
-        if decode && !fuse_hnr && !shared {
+        if decode && !fuse_hnr && !shared && !hnr_fold {
             kv_rows.push(c_kn);
         }
         // v_norm: WEIGHTLESS (gamma NONE) and NO RoPE (cos NONE).
@@ -5785,7 +5880,7 @@ fn emit_phase(
         };
         let c_vn = if fuse_kv {
             c_kn // ONE instruction writes both rows; i[3] (the write row) is shared
-        } else if fuse_hnr || shared {
+        } else if fuse_hnr || shared || hnr_fold {
             0
         } else {
             b.emit_dep(hn_op, hn_set(2), vn_dep, |d| {
@@ -5809,7 +5904,7 @@ fn emit_phase(
                 }
             })
         };
-        if decode && !fuse_hnr && !shared && !fuse_kv {
+        if decode && !fuse_hnr && !shared && !fuse_kv && !hnr_fold {
             kv_rows.push(c_vn);
         }
         if n.dspark.is_some() && full && !shared {
@@ -5825,6 +5920,9 @@ fn emit_phase(
         // PREVIOUS decode step (a previous launch), so within this program flash depends only on
         // the three headnorms' work for its own head — not on all of them.
         let fa_dep = || -> Vec<Dep> {
+            if hnr_fold {
+                return vec![Dep::Coarse(c_q)];
+            }
             if shared {
                 return vec![Dep::Coarse(c_qn)];
             }
@@ -6005,6 +6103,9 @@ fn emit_phase(
                 d.t[6] = n.kcs[l];
                 d.t[7] = n.vcs[l]; // fp8-KV per-row scales (NONE in bf16 mode)
                                    // BATCH>1: n_batch = t (one query row per sequence, each with its own KV ring).
+                if hnr_fold {
+                    d.t[7] = n.hnrd[l];
+                }
                 d.i[0] = t;
                 d.i[1] = heads;
                 d.i[2] = kvh;
@@ -6227,6 +6328,22 @@ fn emit_phase(
                 &o_deps,
             );
             emit_xreduce(b, &mut xgate, decode, &xr_cus, c_op, n.og, xr_elems, tp, 0)
+        } else if norm_fold {
+            // AddNorm fold producer: x += o in place, hn = x * post_attention_layernorm gamma.
+            let co = b.emit(DevOp::Gemv, all.clone(), &o_deps, |d| {
+                d.t[0] = n.hn;
+                d.t[1] = n.at;
+                d.t[2] = w.wo;
+                d.t[3] = n.x;
+                d.t[4] = w.g_pa;
+                d.t[5] = n.nfp;
+                d.i[0] = tg;
+                d.i[1] = c.hidden;
+                d.i[2] = qd;
+                d.i[3] = 8;
+            });
+            rec(co);
+            co
         } else {
             let co = proj(
                 b,
@@ -6264,7 +6381,9 @@ fn emit_phase(
         // decode: x += o, then post_attention_layernorm(x) — fused into ONE AddNorm. Qwen/Llama
         // prefill keeps the split (T rows already parallelise the norm; a parallel agent owns it).
         let mut nrn1_fold = false;
-        let c_pf = if fuse_norm && seam_fused(b, w.g_pa) {
+        let c_pf = if norm_fold {
+            c_o
+        } else if fuse_norm && seam_fused(b, w.g_pa) {
             b.emit(DevOp::AddNorm, rows.clone(), &[c_o], |d| {
                 d.t[0] = n.hn;
                 d.t[1] = n.x;
@@ -6498,6 +6617,10 @@ fn emit_phase(
                     d.i[1] = inter_l;
                     d.i[2] = c.hidden;
                     d.i[5] = c.mlp_act; // 0 GeGLU (Gemma), 1 SwiGLU (Llama/Qwen)
+                    if norm_fold {
+                        d.t[7] = n.nfp; // AddNorm fold consumer: scale by 1/rms
+                        d.f[0] = c.eps;
+                    }
                     if nrn1_fold {
                         d.i[3] = n.xr; // resid_out: the ping-pong twin NRN2's fold reads
                         d.i[4] = n.og; // b: the attention output
@@ -6704,6 +6827,22 @@ fn emit_phase(
             emit_xreduce(
                 b, &mut xgate, decode, &xr_cus, c_dp, n.dg, xr_elems, tp, slot_b,
             )
+        } else if norm_fold && l + 1 < block.end {
+            // AddNorm fold producer: x += down in place, hn = x * the next input_layernorm gamma.
+            let cd = b.emit(DevOp::Gemv, all.clone(), &[dfu], |d| {
+                d.t[0] = n.hn;
+                d.t[1] = n.fu;
+                d.t[2] = w.wd;
+                d.t[3] = n.x;
+                d.t[4] = n.lw[l + 1].g_in;
+                d.t[5] = n.nfp;
+                d.i[0] = tg;
+                d.i[1] = c.hidden;
+                d.i[2] = inter_l;
+                d.i[3] = 8;
+            });
+            rec(cd);
+            cd
         } else {
             let cd = proj(
                 b,
@@ -7337,6 +7476,8 @@ fn emit_phase(
         dep = if let Some(ct) = moe_fused_tail {
             // op72 already produced the new residual (n.x) AND the next input norm (n.hn).
             ct
+        } else if norm_fold && l + 1 < block.end {
+            c_d // the fold producer wrote n.x, x * gamma and the partials
         } else if fuse_norm && seam_fused(b, next_norm) {
             // x += down; then normalise for the NEXT sublayer's attention (the next layer's
             // input_layernorm, or the model's final norm after the last layer). One packet does
@@ -9110,7 +9251,7 @@ fn cublaslt_emit_supported(
     has_decode_objects: bool,
 ) -> bool {
     capabilities.cublaslt_decode
-        && matches!(arch, "sm_90a" | "sm_89")
+        && matches!(arch, "sm_90a" | "sm_89" | "sm_120a")
         && tp == 1
         && !has_decode_objects
 }
@@ -9281,13 +9422,14 @@ pub fn run_verified(args: EmitArgs, verify: Option<VerifyHook>) {
                 || model_type == "qwen3_5")
                 && arch == "sm_90a"
                 || (model_type == "qwen3_asr" || model_type == "qwen3" || model_type == "llama" || model_type.starts_with("gemma4"))
-                    && arch == "sm_89")
+                    && arch == "sm_89"
+                || model_type == "qwen3_asr" && arch == "sm_120a")
                 && tp == 1
                 && (!emit_config::active().any_fp8_weights()
                     || ((model_type.starts_with("gemma4") || model_type == "qwen3_5")
                         && emit_config::active().w8a8))
                 && !emit_config::active().mxfp4,
-            "cuBLASLt prefill emission requires Gemma 4 / Qwen3.5 W8A8 or supported BF16 on single-GPU SM90 (Qwen3-ASR and Llama BF16 also on SM89)"
+            "cuBLASLt prefill emission requires Gemma 4 / Qwen3.5 W8A8 or supported BF16 on single-GPU SM90 (Qwen3-ASR and Llama BF16 also on SM89, Qwen3-ASR on SM120)"
         );
     }
     if emit_config::active().gemma4_sm90_gemm_glu_role {
