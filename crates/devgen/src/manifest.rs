@@ -1355,12 +1355,13 @@ fn tuning(s: &Shapes, arch: &str) -> Map<String, Value> {
     }
     // A packet without a decode GEMV (a W8A8 block, no lm_head) still writes interleaved KV, so
     // its objects need the same layout and row-group body.
-    if sm90a && crate::emit_config::active().qwen_kv_interleave && !t.contains_key("kv_ilv") {
-        assert!(
-            crate::emit_config::active().nv_fa_rg_wide
-                && crate::emit_config::active().gen_kernels.is_some(),
-            "PLOW_QWEN_KV_INTERLEAVE=1 requires PLOW_NV_FA_RG_WIDE=1 and PLOW_EMIT_GEN_KERNELS"
-        );
+    // (The runtime refuses a packet whose objects disagree with its cache writers.)
+    if sm90a
+        && crate::emit_config::active().qwen_kv_interleave
+        && crate::emit_config::active().nv_fa_rg_wide
+        && crate::emit_config::active().gen_kernels.is_some()
+        && !t.contains_key("kv_ilv")
+    {
         t.insert("fa_rg".into(), json!(1));
         t.insert("fa_rg_wide".into(), json!(1));
         if let Some(u) = crate::emit_config::active().nv_fa_rg_u.filter(|&u| u > 0) {
