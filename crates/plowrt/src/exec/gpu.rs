@@ -6808,12 +6808,18 @@ impl GpuEngine {
                         ))
                     }
                 };
+                // Every routed site reads `batch` slots of at least this many rows.
+                let cache = lib_attention::Cache {
+                    slots: batch as u32,
+                    rows: sites().map(|site| site.rows()).min().unwrap_or(0),
+                };
                 Some(lib_attention::LibAttention::load(
                     &be,
                     assets_dir,
                     object,
                     max_kv_heads,
                     direct,
+                    cache,
                 )?)
             }
             _ => None,
@@ -11228,34 +11234,35 @@ impl GpuEngine {
             };
             // The packet's declared library segments; their native role stays the fallback.
             let declared_library = declared_roles.map_or(&[][..], |(p, _)| &p.library[..]);
+            // The declaration is validated whether or not the route runs.
             let lib_attention_segments = if declared_library.is_empty() {
                 Vec::new()
-            } else if !config.nv.pf_attn_library {
-                tracing::info!(
-                    program_index,
-                    "PLOW_PF_ATTN_LIBRARY=0: declared native roles run"
-                );
-                Vec::new()
-            } else if let Some(abi) = declared_roles
-                .and_then(|(_, objects)| {
-                    objects.get(&plow_asset::segment_roles::LIBRARY_PREFILL_ATTENTION)
-                })
-                .and_then(|o| plow_asset::segment_roles::LibraryAbi::parse(&o.abi))
-                .filter(|abi| {
-                    // The Qwen chain launches segment by segment (or graph pieces cut at the
-                    // library segments); other prefill needs the segmented path.
-                    (!qwen_segments.is_empty() || (seg_mode && seg_class.len() > 1))
-                        && packet_kv_layout(&blob)
-                            == match abi.layout {
-                                plow_asset::segment_roles::LibraryKvLayout::HeadMajor => {
-                                    plow_asset::live_kv::LAYOUT_HEAD_MAJOR
-                                }
-                                plow_asset::segment_roles::LibraryKvLayout::RowInterleaved => {
-                                    plow_asset::live_kv::LAYOUT_ROW_INTERLEAVED
-                                }
-                            }
-                })
-            {
+            } else {
+                let abi = declared_roles
+                    .and_then(|(_, objects)| {
+                        objects.get(&plow_asset::segment_roles::LIBRARY_PREFILL_ATTENTION)
+                    })
+                    .and_then(|o| plow_asset::segment_roles::LibraryAbi::parse(&o.abi))
+                    .ok_or_else(|| {
+                        RuntimeError::Rejected(format!(
+                            "program {program_index}: declared library attention without a \
+                             supported library object"
+                        ))
+                    })?;
+                let layout = match abi.layout {
+                    plow_asset::segment_roles::LibraryKvLayout::HeadMajor => {
+                        plow_asset::live_kv::LAYOUT_HEAD_MAJOR
+                    }
+                    plow_asset::segment_roles::LibraryKvLayout::RowInterleaved => {
+                        plow_asset::live_kv::LAYOUT_ROW_INTERLEAVED
+                    }
+                };
+                if packet_kv_layout(&blob) != layout {
+                    return Err(RuntimeError::Rejected(format!(
+                        "program {program_index}: declared library attention reads a KV layout \
+                         the packet does not have"
+                    )));
+                }
                 let mut sites = lib_attention::sites(
                     g,
                     &blob.tensors,
@@ -11277,18 +11284,28 @@ impl GpuEngine {
                          not a library site"
                     )));
                 }
-                // The packet's selection wins over the runtime attention-GEMM knob.
-                for (gemm, site) in attention_gemm_segments.iter_mut().zip(&sites) {
-                    if site.is_some() {
-                        *gemm = None;
+                if !config.nv.pf_attn_library {
+                    tracing::info!(
+                        program_index,
+                        "PLOW_PF_ATTN_LIBRARY=0: declared native roles run"
+                    );
+                    Vec::new()
+                } else if !qwen_segments.is_empty() || (seg_mode && seg_class.len() > 1) {
+                    // The Qwen chain launches segment by segment (or graph pieces cut at the
+                    // library segments); other prefill needs the segmented path.
+                    // The packet's selection wins over the runtime attention-GEMM knob.
+                    for (gemm, site) in attention_gemm_segments.iter_mut().zip(&sites) {
+                        if site.is_some() {
+                            *gemm = None;
+                        }
                     }
+                    sites
+                } else {
+                    return Err(RuntimeError::Rejected(format!(
+                        "program {program_index}: declared library attention needs segmented \
+                         prefill (PLOW_PF_ATTN_LIBRARY=0 runs the native roles)"
+                    )));
                 }
-                sites
-            } else {
-                return Err(RuntimeError::Rejected(format!(
-                    "program {program_index}: declared library attention needs segmented prefill \
-                     over the library's KV layout (PLOW_PF_ATTN_LIBRARY=0 runs the native roles)"
-                )));
             };
             // Lone norm / residual / GLU segments of the Lt-routed buckets: light launches.
             let light_segments = match light_pf {
@@ -14918,6 +14935,12 @@ impl GpuEngine {
         }
         self.be
             .memset_d8_async(ctr_base, 0, ctr_bytes, &self.stream)
+    }
+
+    /// Library prefill attention launches of every engine in this process (served, fallback);
+    /// `None` when none loaded the route. For the shutdown audit line.
+    pub fn library_attention_process_launches() -> Option<(u64, u64)> {
+        lib_attention::process_launch_counts()
     }
 
     /// Library prefill attention launches since load: (served by the library, fell back to the
