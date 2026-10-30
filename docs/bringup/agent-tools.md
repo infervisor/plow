@@ -762,10 +762,10 @@ Each rule cost at least one campaign a day of misattributed results.
 * The prefix cache is always on (`PLOW_PREFIX_CACHE`, `PLOW_VMM_PREFIX`); `=0` is an attribution
   A/B, never a recipe or release setting. A prefix-cache cost is a plowrt bug to fix.
 * Packets declare the attention route per rung (native role vs library objects in the packet, e.g.
-  `PLOW_BUILD_FA4_HD512` puts the FA4 forward + `kv_dequant_sm90.cubin` in it); plowrt runs what the
-  packet declares. A route change is a re-emit and a re-gate, never a serve knob. The FA4 forward
-  is still a `libplow_fa4_*.so` today; it is being replaced by packet cubins (static runtime rule,
-  "Working rules"), so no new library route ships as a `.so`.
+  `PLOW_BUILD_FA4_HD512` puts `plow_fa4_hd512.aot`, the FA4 cubins plowrt launches itself, in
+  it); plowrt runs what the packet declares. A route change is a re-emit and a re-gate, never a
+  serve knob. An AOT library kernel ships as a packet cubin plus a host stub in plowrt
+  (`device/cuda/aot.rs`), never as a `.so` (static runtime rule, "Working rules").
 
 **KV reads and device faults**
 

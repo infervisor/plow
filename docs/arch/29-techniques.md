@@ -132,17 +132,18 @@ What it computes: the same causal/global attention as `FlashPrefill(Fp8)`, execu
 library kernel instead of the packet's native role. Today: FlashAttention-4's SM90 forward for
 hd512 global prefill layers with FP8 KV.
 Examples: `gemma4` 12B (fp16 pool) and 26B FP8 (bf16 pool) production recipes.
-Packet ABI: no new op. The packet's objects dir carries `libplow_fa4_hd512.so` and
-`kv_dequant_sm90.cubin` (emit-time `PLOW_BUILD_FA4_HD512 = 1 | f16`,
-`scripts/build_sm90a_fa4_hd512.py`); plowrt routes every hd512 `FlashPrefillFp8` site when both
-files are present (`crates/plowrt/src/exec/gpu/lib_attention.rs` `LIBRARY`, `DEQUANT_OBJECT`).
-Kernels and objects: the AOT library (C ABI, `plow_fa4_*`, ABI 2) plus the gather/dequant cubin
+Packet ABI: object 26 `LIBRARY_PREFILL_ATTENTION` (`plow_fa4_hd512.aot`, ABI
+`lib_flash_prefill_v2:fa4:...`) plus per-program `ProgramRoles.library` segments, declared by the
+emitter (`PLOW_EMIT_ATTN_LIBRARY`, `crates/devgen/src/library_attention.rs`). The object holds the
+forward/combine cubins with their recorded launch exemplars; plowrt launches them itself
+(`crates/plowrt/src/exec/gpu/fa4_sm90.rs`), no host library.
+Kernels and objects: the FA4 SM90 cubins (`scripts/fa4_aot/build.py`) plus the object's `kv_adapters` cubin
 that copies each request's rows `[0, kv_len)` into a bf16/fp16 page pool (64-row pages, 64K rows
 per KV head). One table upload per launch; a launch past the pool or 256 requests, or a windowed
 body, keeps the native role. Consumers' counter waits are rewritten to stream order at load.
 KV / state class: reads the slot KV through the gather into a transient pool; no persistent class.
-Status: CUDA sm_90a only, hd512, FP8 KV only. Other library routes (Qwen hd256) are not on
-prod-next.
+Status: CUDA sm_90a only. hd512 (Gemma FP8 KV through the pool, BF16 KV direct) and hd256
+(Qwen3.8 BF16, `plow_fa4_hd256.aot`, direct).
 Deeper: `28-library-attention.md`.
 
 
@@ -796,8 +797,8 @@ Packet ABI: `HeadNormRopeFp8` (37, `t6=scale f32[kv_head][ctx]`), `FlashDecodeFp
 `PLOW_FP8_KV_FULL`; object build `PLOW_BUILD_FP8KV_FA`, `PLOW_BUILD_FP8KV_GEMM`.
 Kernels and objects: `runtime/nvidia/op_attention*.cuh` in `interp_sm90a.cubin`; generated
 `gen_attn_pf_hd256_sliding_fp8kv.cu` / `attn_pf_hd512_fp8kv` roles; the library hd512 route
-gathers rows `[0, kv_len)` into a bf16 or fp16 page pool through `kv_dequant_sm90.cubin` before
-`libplow_fa4_hd512.so` (`crates/plowrt/src/exec/gpu/lib_attention.rs`, docs/arch/28).
+gathers rows `[0, kv_len)` into a bf16 or fp16 page pool through the object's `kv_adapters` cubin before
+the FA4 cubins of `plow_fa4_hd512.aot` (`crates/plowrt/src/exec/gpu/lib_attention.rs`, docs/arch/28).
 KV / state class: the scale tensors live beside each K/V track; in the block store the sliding
 rings' scales ride the 32-row window blocks and the full layers' scales the 32-row prefix
 (`Class::Tail`) blocks (`crates/plowrt/src/exec/gpu/kv_blocks.rs`).
@@ -998,7 +999,7 @@ fastconformer RNNT, fish-s2.
 
 - **KV-shared tail on gfx942**: needs a port of the runtime gather (`crates/plowrt/src/exec/gpu/shared_tail.rs` `shared_tail_enqueue`/`shared_tail_rows`) into `exec/amd.rs`, reading the same `kv_shared_tail` section (`crates/plow-asset/src/kv_shared_tail.rs`). No new device op: it reuses the flash ops over the source layer's cache.
 - **KV-shared tail on CPU**: the same gather in `serve/cpu_serve.rs`'s prefill path. Not verified whether any CPU emit carries the section.
-- **Library attention on sm_120**: needs an FA4 export for SM120 (`scripts/build_sm90a_fa4_hd512.py` targets the SM90 forward only) and a `kv_dequant` cubin built for sm_120 (`runtime/nvidia/kv_dequant_sm90.cu`). The host route `exec/gpu/lib_attention.rs` is arch-neutral apart from its object names.
+- **Library attention on sm_120**: needs an FA4 export for SM120 (`scripts/fa4_aot/build.py` exports the SM90 forward only) and a `kv_dequant` cubin built for sm_120 (`runtime/nvidia/kv_dequant_sm90.cu`). The host route `exec/gpu/lib_attention.rs` is arch-neutral apart from its object names.
 - **Library attention on gfx942**: needs a ROCm library with the plow_fa4 C ABI (abi 2: create, run, dtype, destroy; `lib_attention.rs:283-330`), e.g. a CK or aiter FMHA export, plus a HIP port of the FP8 page gather. The host route must also move into `exec/amd.rs`: one table upload per launch, consumer waits rewritten to stream order (`ordered_waits_for`), and the fallback to the native role.
 - **MLA on sm_90a**:
   - Decode: rebuild the sm_90a object with `-DPLOW_NV_MLA=1`. That brings in ops 50, 54 and 57 (`op_mla.cuh`). Their tuning (`d_flash_mla_decode<512,64,8>`) is sm_120's; sm_90a has no wgmma latent kernel.

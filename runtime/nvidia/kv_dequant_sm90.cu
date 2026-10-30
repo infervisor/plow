@@ -10,9 +10,7 @@
 #include <cuda_fp8.h>
 #include <stdint.h>
 
-#ifndef PLOW_FA4_HOST
 extern "C" __device__ unsigned plow_kv_dequant_abi = 2;
-#endif
 
 // Mirrored by plowrt exec/gpu/lib_attention.rs `DequantArgs`.
 struct PlowKvDequant {
@@ -105,26 +103,3 @@ extern "C" __global__ __launch_bounds__(THREADS) void plow_kv_zero_tail(const __
     const unsigned n16 = (end - len) * HD / 8;
     for (unsigned i = threadIdx.x; i < n16; i += THREADS) reinterpret_cast<uint4*>(base)[i] = make_uint4(0, 0, 0, 0);
 }
-
-#ifdef PLOW_FA4_HOST
-// Host launchers, linked into libplow_fa4_hd512.so (scripts/build_sm90a_fa4_hd512.py): the
-// adapters ship inside the library they serve. Each launches on the caller's stream and returns
-// the launch status; no allocation, no sync.
-extern "C" int plow_fa4_kv_gather(const PlowKvDequant* a, void* stream) {
-    if (!a || !a->n_pages || !a->kv_heads) return 0;
-    plow_kv_dequant_pages<<<dim3(a->n_pages, a->kv_heads, 2), THREADS, 0, (cudaStream_t)stream>>>(*a);
-    return (int)cudaGetLastError();
-}
-extern "C" int plow_fa4_kv_zero_tail(const PlowKvTail* a, void* stream) {
-    if (!a || !a->n || !a->kv_heads) return 0;
-    plow_kv_zero_tail<<<dim3(a->n, a->kv_heads, 2), THREADS, 0, (cudaStream_t)stream>>>(*a);
-    return (int)cudaGetLastError();
-}
-extern "C" int plow_fa4_convert(void* p, unsigned long long n8, unsigned to_f16, void* stream) {
-    if (!n8) return 0;
-    const unsigned long long blocks = (n8 + THREADS - 1) / THREADS;
-    plow_cvt_rows<<<(unsigned)(blocks < 1056 ? blocks : 1056), THREADS, 0, (cudaStream_t)stream>>>(
-        (uint4*)p, n8, to_f16);
-    return (int)cudaGetLastError();
-}
-#endif

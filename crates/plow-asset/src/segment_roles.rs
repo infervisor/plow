@@ -37,12 +37,9 @@ pub const MAX_ROLE: u8 = GENERATED_LAST;
 /// native role, which is the declared fallback). A program lists the segments the library serves
 /// in [`ProgramRoles::library`]; each is a lone `FlashPrefill(Fp8)` instruction.
 pub const LIBRARY_PREFILL_ATTENTION: u8 = 26;
-/// FlashAttention-4 SM90 hd512 forward (`libplow_fa4_hd512.so`, plow_fa4 C ABI 3) over bf16 or
-/// fp16 pages; the suffix is the library's element type (`plow_fa4_dtype`). Shorthand for
-/// [`LibraryAbi`] hd 512, 16 heads over 1 or 2 KV heads, head-major.
-pub const LIBRARY_FA4_HD512_BF16_ABI: &str = "lib_flash_prefill_v1:fa4_hd512:bf16";
-pub const LIBRARY_FA4_HD512_F16_ABI: &str = "lib_flash_prefill_v1:fa4_hd512:f16";
-const LIBRARY_ABI_PREFIX: &str = "lib_flash_prefill_v1:fa4:";
+/// Prefix of a library attention object's ABI: v2 = a cubin container (`PLOWAOT1`) plowrt
+/// launches itself; v1 (a host library) is retired and refused.
+const LIBRARY_ABI_PREFIX: &str = "lib_flash_prefill_v2:fa4:";
 
 /// KV cache layout a library reads in place or through its gather pool.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -55,7 +52,7 @@ pub enum LibraryKvLayout {
 
 /// What a library attention object computes: causal global attention of `heads` query heads
 /// over any of `kv_heads` KV heads at `head_dim`, on a `layout` cache, in `f16` or bf16.
-/// `lib_flash_prefill_v1:fa4:hd=256:heads=24:kv_heads=4:layout=ilv:dtype=bf16`.
+/// `lib_flash_prefill_v2:fa4:hd=256:heads=24:kv_heads=4:layout=ilv:dtype=bf16`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct LibraryAbi {
     pub head_dim: u32,
@@ -66,38 +63,7 @@ pub struct LibraryAbi {
 }
 
 impl LibraryAbi {
-    /// The ABI string a library's `plow_fa4_caps` marker states (runtime/nvidia/fa4_hd*.cpp):
-    /// `plow_fa4_caps:abi=3:dtype=<0|1>[:hd=..:heads=..:kv_heads=..:layout=..]`, the bare form
-    /// being the hd512 library.
-    pub fn from_caps(caps: &str) -> Option<String> {
-        let rest = caps.strip_prefix("plow_fa4_caps:abi=3:dtype=")?;
-        let (dtype, geometry) = rest.split_once(':').unwrap_or((rest, ""));
-        let dtype = match dtype {
-            "0" => "bf16",
-            "1" => "f16",
-            _ => return None,
-        };
-        let abi = match (geometry.is_empty(), dtype) {
-            (true, "f16") => LIBRARY_FA4_HD512_F16_ABI.to_string(),
-            (true, _) => LIBRARY_FA4_HD512_BF16_ABI.to_string(),
-            _ => format!("{LIBRARY_ABI_PREFIX}{geometry}:dtype={dtype}"),
-        };
-        Self::parse(&abi).map(|_| abi)
-    }
-
     pub fn parse(abi: &str) -> Option<Self> {
-        let hd512 = |f16| LibraryAbi {
-            head_dim: 512,
-            heads: 16,
-            kv_heads: vec![1, 2],
-            layout: LibraryKvLayout::HeadMajor,
-            f16,
-        };
-        match abi {
-            LIBRARY_FA4_HD512_BF16_ABI => return Some(hd512(false)),
-            LIBRARY_FA4_HD512_F16_ABI => return Some(hd512(true)),
-            _ => {}
-        }
         let fields: BTreeMap<&str, &str> = abi
             .strip_prefix(LIBRARY_ABI_PREFIX)?
             .split(':')
@@ -1002,34 +968,43 @@ mod tests {
     fn library_attention_is_declared_per_program_over_a_native_fallback() {
         let doc = |abi: &str, library: &str| {
             format!(
-                r#"{{"version":1,"objects":{{"26":{{"abi":"{abi}","file":"libplow_fa4_hd512.so","sha256":"{}"}}}},
+                r#"{{"version":1,"objects":{{"26":{{"abi":"{abi}","file":"plow_fa4_hd512.aot","sha256":"{}"}}}},
                 "programs":[{{"index":0,"roles":[0,0,0]{library}}}]}}"#,
                 "a".repeat(64)
             )
         };
         let parse =
             |abi: &str, library: &str| SegmentRoles::from_bytes(doc(abi, library).as_bytes());
-        assert!(parse(LIBRARY_FA4_HD512_BF16_ABI, r#","library":[1]"#).is_ok());
-        assert!(parse(LIBRARY_FA4_HD512_F16_ABI, r#","library":[0,2]"#).is_ok());
-        // Declared but unused, out of range, unordered, unknown ABI.
-        assert!(parse(LIBRARY_FA4_HD512_BF16_ABI, "").is_err());
-        assert!(parse(LIBRARY_FA4_HD512_BF16_ABI, r#","library":[3]"#).is_err());
-        assert!(parse(LIBRARY_FA4_HD512_BF16_ABI, r#","library":[2,1]"#).is_err());
-        assert!(parse("lib_flash_prefill_v1:fa4_hd512:fp8", r#","library":[1]"#).is_err());
-        let qwen = "lib_flash_prefill_v1:fa4:hd=256:heads=24:kv_heads=4:layout=ilv:dtype=bf16";
+        let hd512 =
+            "lib_flash_prefill_v2:fa4:hd=512:heads=16:kv_heads=1,2:layout=head_major:dtype=bf16";
+        let hd512_f16 =
+            "lib_flash_prefill_v2:fa4:hd=512:heads=16:kv_heads=1,2:layout=head_major:dtype=f16";
+        assert!(parse(hd512, r#","library":[1]"#).is_ok());
+        assert!(parse(hd512_f16, r#","library":[0,2]"#).is_ok());
+        // Declared but unused, out of range, unordered, unknown ABI, the retired host library.
+        assert!(parse(hd512, "").is_err());
+        assert!(parse(hd512, r#","library":[3]"#).is_err());
+        assert!(parse(hd512, r#","library":[2,1]"#).is_err());
+        assert!(parse("lib_flash_prefill_v1:fa4_hd512:bf16", r#","library":[1]"#).is_err());
+        assert!(parse(
+            "lib_flash_prefill_v1:fa4:hd=256:heads=24:kv_heads=4:layout=ilv:dtype=bf16",
+            r#","library":[1]"#
+        )
+        .is_err());
+        let qwen = "lib_flash_prefill_v2:fa4:hd=256:heads=24:kv_heads=4:layout=ilv:dtype=bf16";
         assert!(parse(qwen, r#","library":[1]"#).is_ok());
         assert_eq!(
             LibraryAbi::parse(qwen).map(|a| a.format()).as_deref(),
             Some(qwen)
         );
         assert_eq!(
-            LibraryAbi::parse(LIBRARY_FA4_HD512_BF16_ABI).map(|a| a.kv_heads),
+            LibraryAbi::parse(hd512).map(|a| a.kv_heads),
             Some(vec![1, 2])
         );
         for bad in [
-            "lib_flash_prefill_v1:fa4:hd=256:heads=24:kv_heads=5:layout=ilv:dtype=bf16",
-            "lib_flash_prefill_v1:fa4:hd=256:heads=24:kv_heads=4:layout=ilv:dtype=bf16:x=1",
-            "lib_flash_prefill_v1:fa4:heads=24:hd=256:kv_heads=4:layout=ilv:dtype=bf16",
+            "lib_flash_prefill_v2:fa4:hd=256:heads=24:kv_heads=5:layout=ilv:dtype=bf16",
+            "lib_flash_prefill_v2:fa4:hd=256:heads=24:kv_heads=4:layout=ilv:dtype=bf16:x=1",
+            "lib_flash_prefill_v2:fa4:heads=24:hd=256:kv_heads=4:layout=ilv:dtype=bf16",
         ] {
             assert!(LibraryAbi::parse(bad).is_none(), "{bad}");
         }

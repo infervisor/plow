@@ -15747,4 +15747,5 @@ use gen_role::load_generated_role;
 
 mod attention_gemm;
 mod cublaslt;
+mod fa4_sm90;
 mod lib_attention;
