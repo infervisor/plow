@@ -564,6 +564,52 @@ async fn load_with_assets_through_a_symlink_out_of_the_root_is_refused() {
     let _ = std::fs::remove_dir_all(root.parent().unwrap());
 }
 
+/// A `checkpoint` override is read by the load (weights, tokenizer, templates): it must sit
+/// under a root like the assets dir, whether the bundle is named by `assets` or by name.
+#[tokio::test]
+async fn a_checkpoint_override_outside_the_roots_is_refused() {
+    let (root, outside, router) = rooted("ckpt");
+    std::fs::create_dir_all(root.join("ckpt")).unwrap();
+    std::os::unix::fs::symlink(&outside, root.join("ckpt-link")).unwrap();
+    let inside = root.join("inside").display().to_string();
+    let send = |body: serde_json::Value| {
+        let router = router.clone();
+        async move {
+            let resp = router
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/v1/models/load")
+                        .header("content-type", "application/json")
+                        .body(Body::from(body.to_string()))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            let status = resp.status();
+            (status, body_string(resp).await)
+        }
+    };
+    for ckpt in [
+        outside.display().to_string(),
+        root.join("ckpt-link").display().to_string(),
+        root.join("../outside").display().to_string(),
+    ] {
+        for body in [
+            serde_json::json!({"model": "m", "assets": inside, "checkpoint": ckpt}),
+            serde_json::json!({"model": "inside", "checkpoint": ckpt}),
+        ] {
+            let (status, text) = send(body.clone()).await;
+            assert_eq!(status, StatusCode::FORBIDDEN, "{body}: {text}");
+        }
+    }
+    let ok = root.join("ckpt").display().to_string();
+    let (status, text) =
+        send(serde_json::json!({"model": "m", "assets": inside, "checkpoint": ok})).await;
+    assert_eq!(status, StatusCode::NOT_IMPLEMENTED, "{text}");
+    let _ = std::fs::remove_dir_all(root.parent().unwrap());
+}
+
 /// The startup allow-list: `--models-root`, the parents of the `--assets` dirs (a single-asset
 /// serve reaches its siblings with no flag), the store's `bundles/` — and never the working
 /// directory, whatever it is.

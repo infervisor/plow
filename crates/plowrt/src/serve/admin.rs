@@ -451,6 +451,15 @@ async fn load_inner(state: Arc<AppState>, mut req: LoadRequest) -> Response {
     // security boundary, and a boundary that only fires on builds which happen
     // to have a GPU manager is not one — the refusal must not depend on how far
     // the request would otherwise have got.
+    //
+    // A checkpoint override names a directory the load reads (weights, tokenizer, templates):
+    // held to the same allow-list as the assets dir.
+    if let Some(c) = req.checkpoint.take() {
+        match resolve_assets(&state, &c) {
+            Ok(dir) => req.checkpoint = Some(dir.display().to_string()),
+            Err(refusal) => return refusal,
+        }
+    }
     let (assets, checkpoint_override) = if let Some(d) = req.assets.as_deref() {
         match resolve_assets(&state, d) {
             Ok(dir) => (Some(dir), req.checkpoint.as_deref().map(PathBuf::from)),
