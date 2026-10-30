@@ -125,8 +125,8 @@ outlen = 128
 warmups = 2
 seed = 42
 tokenizer = "{env:QWEN38_FP8_CHECKPOINT}"
-# The served slug (the re-keyed checkpoint's basename), not "checkpoint".
-model_id = "Qwen3.8-27B-FP8"
+# The served slug (the checkpoint directory basename, lowercased), not "checkpoint".
+model_id = "qwen3.8-27b-fp8"
 gate_prompt = "<|im_start|>user\nWhat is the capital of France? Answer in one short sentence.<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
 
 # Served c1 (TMA M=1 acceleration, packet 6c31b3e822e097c5): vLLM 0.28 FP8 at the same cell
