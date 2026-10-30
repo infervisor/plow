@@ -36,6 +36,7 @@ nix develop --command env \
   PLOW_TTS_CODEC_DIR={out}/prep/codec \
   PLOW_TTS_PROFILE=fish \
   PLOW_VERIFY_BIN={repo}/lean-plow/.lake/build/bin/plow_verify \
+  PLOW_W8A16=1 \
   ./target/release/plowc \
   --hf-dir $CKPT \
   --served-name fish-s2-pro \
