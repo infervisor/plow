@@ -162,7 +162,9 @@ impl GpuEngine {
         requests: &[Request<'_>],
         output: &mut Vec<(u32, u32)>,
     ) -> Result<()> {
-        self.token_batch_step_inner(requests, output, None, None)
+        let r = self.token_batch_step_inner(requests, output, None, None);
+        self.note_step_result(r.is_err());
+        r
     }
 
     /// As [`Self::token_batch_step`], with `spec(slot)` rows drawn on the device by `plow_sample`
@@ -174,7 +176,9 @@ impl GpuEngine {
         output: &mut Vec<(u32, u32)>,
         spec: &dyn Fn(u32, u32) -> Option<DevSample>,
     ) -> Result<()> {
-        self.token_batch_step_inner(requests, output, Some(spec), None)
+        let r = self.token_batch_step_inner(requests, output, Some(spec), None);
+        self.note_step_result(r.is_err());
+        r
     }
 
     /// [`Self::token_batch_step`] (or `_sampled` with `spec`) that runs `window` on the host
@@ -188,7 +192,9 @@ impl GpuEngine {
         spec: Option<&dyn Fn(u32, u32) -> Option<DevSample>>,
         window: &mut dyn FnMut(&mut GpuEngine),
     ) -> Result<()> {
-        self.token_batch_step_inner(requests, output, spec, Some(window))
+        let r = self.token_batch_step_inner(requests, output, spec, Some(window));
+        self.note_step_result(r.is_err());
+        r
     }
 
     fn token_batch_step_inner(
