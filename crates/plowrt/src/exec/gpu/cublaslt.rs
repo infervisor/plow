@@ -2552,7 +2552,9 @@ fn projection_segments(
             return Err(fail());
         }
         let [m, n, k] = [op.i[0], op.i[1], op.i[2]];
-        if block && (n % 128 != 0 || k % 128 != 0) {
+        // cuBLASLt reads BLK128x128 weight-scale rows at a stride of K/128 rounded up to 4; the
+        // packed [N/128][K/128] grid matches it only when K/128 is a multiple of 4.
+        if block && (n % 128 != 0 || k % 512 != 0) {
             return Err(fail());
         }
         // The rows cuBLASLt reads and writes (block route: padded to 4).
