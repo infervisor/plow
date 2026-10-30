@@ -239,6 +239,9 @@ pub struct BlockServe {
     args: Mutex<Box<CopyArgs>>,
     seals: Mutex<Vec<PendingSeal>>,
     spare_events: Mutex<Vec<CudaEvent>>,
+    /// A store copy whose completion could not be proven: its slots are quarantined and every
+    /// later [`GpuEngine::blocks_quiesce`] fails with this fatal fault.
+    copy_failed: std::sync::OnceLock<crate::DeviceErrorInfo>,
     /// The state tensors a first packed prefill can read from a block (`(devp index, offset in
     /// the block)`), set once by the engine; empty = every attach copies the whole state.
     state_defer: std::sync::OnceLock<Vec<(usize, u64)>>,
@@ -399,6 +402,7 @@ impl BlockServe {
             })),
             seals: Mutex::new(Vec::new()),
             spare_events: Mutex::new(Vec::new()),
+            copy_failed: std::sync::OnceLock::new(),
             state_defer: std::sync::OnceLock::new(),
             pending_state: Mutex::new((0..batch).map(|_| None).collect()),
             held: Mutex::new((0..batch).map(|_| Vec::new()).collect()),
@@ -662,9 +666,15 @@ impl GpuEngine {
                     // Drain even a partially submitted copy: the blocks fail and are released
                     // after the engine stream is done with them.
                     let ts = std::time::Instant::now();
-                    let _ = self.be.stream_synchronize(&self.stream);
+                    let drained = self.be.stream_synchronize(&self.stream).is_ok();
                     sync_us = ts.elapsed().as_micros() as u64;
-                    drop(fills);
+                    if drained {
+                        drop(fills);
+                    } else {
+                        for token in fills {
+                            token.quarantine();
+                        }
+                    }
                     drop(deps);
                     bs.stats.lock().publish_sync_us += sync_us;
                     return Err(e);
@@ -741,8 +751,8 @@ impl GpuEngine {
     }
 
     /// Seal the deferred fills whose scatter retired (in queue order: one stream). A failed
-    /// query fails the remaining fills (their bytes are never served; the slots stay pinned as
-    /// `Failed` blocks the next acquire refills).
+    /// query quarantines the remaining fills (never served; their slots are never reused or
+    /// freed) and makes every later [`Self::blocks_quiesce`] fail.
     pub(crate) fn blocks_reap_seals(&self) {
         let Some(bs) = self.kv_blocks() else {
             return;
@@ -755,7 +765,20 @@ impl GpuEngine {
                     Ok(true) => true,
                     Ok(false) => break,
                     Err(e) => {
-                        tracing::warn!(error = %e, "kv store: copy event failed");
+                        tracing::error!(error = %e, "kv store: copy event failed");
+                        let info = match e.device_fault() {
+                            Some(i) => crate::DeviceErrorInfo {
+                                fatal: true,
+                                ..i.clone()
+                            },
+                            None => crate::DeviceErrorInfo {
+                                operation: "kv store copy event".into(),
+                                code: -1,
+                                name: e.to_string(),
+                                fatal: true,
+                            },
+                        };
+                        let _ = bs.copy_failed.set(info);
                         false
                     }
                 };
@@ -768,8 +791,9 @@ impl GpuEngine {
                 bs.store.seal_ids(&p.ids);
                 drop(p.holds);
             } else {
-                // Never served; the blocks a failed copy may still touch stay pinned.
-                bs.store.fail_ids(&p.ids);
+                // Never served; the blocks a failed copy may still touch stay pinned and the
+                // filled slots are never reused.
+                bs.store.quarantine_ids(&p.ids);
                 for hold in p.holds {
                     hold.abandon();
                 }
@@ -886,6 +910,9 @@ impl GpuEngine {
             return Ok(());
         };
         self.blocks_reap_seals();
+        if let Some(info) = bs.copy_failed.get() {
+            return Err(RuntimeError::DeviceFault { info: info.clone() });
+        }
         let ts = std::time::Instant::now();
         // Seals are recorded in engine-stream order: the newest covers every earlier copy, and
         // not the steps queued after it.
@@ -895,7 +922,11 @@ impl GpuEngine {
         };
         bs.stats.lock().publish_sync_us += ts.elapsed().as_micros() as u64;
         self.blocks_reap_seals();
-        r
+        r?;
+        match bs.copy_failed.get() {
+            Some(info) => Err(RuntimeError::DeviceFault { info: info.clone() }),
+            None => Ok(()),
+        }
     }
 
     pub(super) fn blocks_unhold(&self, b: usize) {

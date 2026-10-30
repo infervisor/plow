@@ -369,6 +369,11 @@ impl<T: Copy> Slab<T> {
         self.owner[slot.0 as usize] = Some(id);
     }
 
+    /// Take `slot` out of use for good: never handed out again, so its chunk is never released.
+    fn leak(&mut self, slot: Slot<T>) {
+        self.owner[slot.0 as usize] = None;
+    }
+
     /// Return `slot` to its chunk.
     fn put(&mut self, slot: Slot<T>) {
         self.owner[slot.0 as usize] = None;
@@ -512,6 +517,9 @@ struct Inner {
     /// Host slots of blocks being refilled on the device, kept until the fill seals: a failed
     /// refill goes back to its host bytes, which other boundaries still depend on.
     refilling: FxHashMap<BlockId, Slot<Host>>,
+    /// Device slots leaked under a copy whose completion is unproven ([`KvStore::quarantine_ids`]):
+    /// nonzero = the device chunks are never freed.
+    quarantined: u64,
     /// Pinned chunks per class allocated ahead by [`KvStore::host_grow_step`] (a pinned
     /// allocation costs ~4 ms per 8 MiB; under the pool lock it was the host tier's TTFT tail).
     host_spare: Vec<Vec<Chunk<Host>>>,
@@ -596,6 +604,12 @@ impl FillToken<'_> {
     pub fn fail(mut self) {
         self.done = true;
         self.store.fail_id(self.id);
+    }
+
+    /// The fill's copy may still be running: [`KvStore::quarantine_ids`].
+    pub fn quarantine(mut self) {
+        self.done = true;
+        self.store.quarantine_ids(&[self.id]);
     }
 }
 
@@ -695,6 +709,7 @@ impl KvStore {
                 spilling_bytes: 0,
                 restoring: VecDeque::new(),
                 refilling: FxHashMap::default(),
+                quarantined: 0,
                 host_spare: (0..n_classes).map(|_| Vec::new()).collect(),
                 tick: 0,
                 stats,
@@ -936,6 +951,50 @@ impl KvStore {
     pub fn seal_ids(&self, ids: &[BlockId]) {
         for &id in ids {
             self.seal_id(id);
+        }
+    }
+
+    /// Fills whose copy may still be writing their device slots (its completion could not be
+    /// proven): never served, and the slot is never reused or freed. A refill goes back to its
+    /// host bytes; any other block is forgotten, so the next acquire fills a fresh slot.
+    pub fn quarantine_ids(&self, ids: &[BlockId]) {
+        let mut inner = self.inner.lock();
+        for &id in ids {
+            let Some(b) = inner.block(id) else {
+                continue;
+            };
+            let (class, idle) = (b.class, b.dependents == 0);
+            let Where::Device(slot) = b.place else {
+                // Fills target device slots only.
+                inner.block_mut(id).expect("block").state = State::Failed;
+                continue;
+            };
+            inner.stats.fill_failures += 1;
+            inner.quarantined += 1;
+            inner.classes[class].device.leak(slot);
+            let bytes = inner.classes[class].spec.block_bytes();
+            let refill = inner.refilling.remove(&id);
+            let st = &mut inner.stats.classes[class];
+            st.device_blocks -= 1;
+            st.device_bytes -= bytes;
+            if let Some(h) = refill {
+                st.host_blocks += 1;
+                st.host_bytes += bytes;
+                let b = inner.block_mut(id).expect("block");
+                b.place = Where::Host(h);
+                b.state = State::Ready;
+                if idle {
+                    inner.host_reclaim[class].push_back(id);
+                }
+                continue;
+            }
+            let e = &mut inner.blocks[id.index()];
+            let b = e.block.take().expect("block");
+            if let Some(gen) = e.gen.checked_add(1) {
+                e.gen = gen;
+                inner.free_entries.push(id.index);
+            }
+            inner.index.remove(&(b.class, b.key));
         }
     }
 
@@ -1993,9 +2052,18 @@ impl Drop for KvStore {
             chunk.free(ops);
         }
         let inner = inner.get_mut();
+        let quarantined = inner.quarantined > 0;
+        if quarantined {
+            tracing::warn!(
+                slots = inner.quarantined,
+                "kv store: a fill copy is unproven, device chunks leaked"
+            );
+        }
         for c in &mut inner.classes {
             for chunk in c.device.chunks.drain(..).flatten() {
-                chunk.free(ops);
+                if !quarantined {
+                    chunk.free(ops);
+                }
             }
             for chunk in c.host.chunks.drain(..).flatten() {
                 chunk.free(ops);
@@ -2393,6 +2461,63 @@ mod tests {
         let b = s.acquire(0, key(1)).unwrap();
         assert!(b.fill.is_some() && b.id == a.id);
         assert_eq!(s.state(a.id), Some(State::Filling));
+    }
+
+    /// A seal event whose completion could not be proven: the copy may still write the slot,
+    /// so the block is never served or refilled in place and the slot is never reused or freed.
+    #[test]
+    fn an_unproven_fill_leaks_its_slot() {
+        let (ops, s) = store(2 * 32, 0); // chunk = 32 B = one block
+        let mut a = s.acquire(0, key(1)).unwrap();
+        let va = a.va;
+        let id = a.fill.take().expect("a fill").defer();
+        drop(a);
+        s.quarantine_ids(&[id]);
+        assert_eq!(s.state(id), None, "never served");
+        s.release(&[id]);
+        let mut b = s.acquire(0, key(1)).unwrap();
+        assert!(b.id != id && b.va != va, "refilled in a fresh slot");
+        seal(&mut b);
+        s.release(&[b.id]);
+        assert_eq!(
+            s.shrink(u64::MAX),
+            32,
+            "only the fresh slot's chunk goes back"
+        );
+        let c = acquire_sealed(&s, 0, key(2));
+        assert!(
+            s.acquire(0, key(3)).is_err(),
+            "the leaked slot is never handed out"
+        );
+        assert_eq!(s.stats().fill_failures, 1);
+        drop((b, c));
+        let freed = ops.freed.load(Ordering::SeqCst);
+        drop(s);
+        assert_eq!(
+            ops.freed.load(Ordering::SeqCst),
+            freed,
+            "device chunks leaked at drop"
+        );
+    }
+
+    #[test]
+    fn an_unproven_refill_goes_back_to_its_host_bytes() {
+        let (_ops, s) = store(2 * 32, 64);
+        let mut a = s.acquire(0, key(1)).unwrap();
+        seal(&mut a);
+        assert!(s.spill(&[a.id]));
+        s.reap();
+        let host_va = s.gather_src(a.id).unwrap().va;
+        let again = s.acquire(0, key(1)).unwrap();
+        let dev_va = again.va;
+        again.fill.expect("refill").quarantine();
+        assert_eq!(s.location(a.id), Some(Location::Host));
+        assert_eq!(s.state(a.id), Some(State::Ready));
+        assert_eq!(s.gather_src(a.id).unwrap().va, host_va);
+        assert_eq!(s.stats().classes[0].device_blocks, 0);
+        let mut b = s.acquire(0, key(2)).unwrap();
+        assert_ne!(b.va, dev_va, "the refill's slot is never reused");
+        seal(&mut b);
     }
 
     /// A boundary still depends on a host block a publish refills: the refill's failure must
