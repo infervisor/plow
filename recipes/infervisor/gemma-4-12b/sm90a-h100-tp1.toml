@@ -1,6 +1,10 @@
 # Gemma-4-12B-it FP8 (hub checkpoint, re-keyed) on H100 SXM5: FP8 W8A8 weights, FP8 per-token-head
 # KV, 16K context, 128 decode slots, prefix cache on. Production recipe for this model/GPU/precision.
 #
+# Checkpoint: hub HYPR4AI/Gemma-4-12B-it-FP8 @ eff0443cd167de86c7cf6ff6d2eb11d0cac3ad69 (model.safetensors
+# sha256 42af19bbd16c1b6a9996b01b13c558a79a3e4198f2fad3b1fafab7fb4c8bc3e9), re-keyed to plow's fp8/ contract
+# without requantizing (scripts/gemma4_fp8_hub_rekey.py); GEMMA12B_CHECKPOINT = the re-keyed dir.
+#
 #   PLOW_CAMPAIGN_NO_NIX=1 (box without nix only) \
 #   python3 scripts/campaign/campaign.py build recipes/infervisor/gemma-4-12b/sm90a-h100-tp1.toml --out <fresh dir>
 #
@@ -107,13 +111,15 @@ max_ctx = 16384
 toolchain = "cuda-12.9-nix"
 
 [checkpoint]
-source = "gemma-4-12b-it-fp8"
+source = "hf:HYPR4AI/Gemma-4-12B-it-FP8"
+revision = "eff0443cd167de86c7cf6ff6d2eb11d0cac3ad69"
+sha256 = { "model.safetensors" = "42af19bbd16c1b6a9996b01b13c558a79a3e4198f2fad3b1fafab7fb4c8bc3e9" }
 layout = "plow-fp8-hub-rekey"
 
 [cell]
 name = "gemma4-12b.h100.fp8kv-16k-c128"
-model = "gemma-4-12b-it-fp8 (compressed-tensors, re-keyed)"
-revision = "local"
+model = "HYPR4AI/Gemma-4-12B-it-FP8 (compressed-tensors, re-keyed)"
+revision = "eff0443cd167de86c7cf6ff6d2eb11d0cac3ad69"
 hf_dir = "{env:GEMMA12B_CHECKPOINT}"
 gpu = "H100 SXM5"
 arch = "sm_90a"
