@@ -131,8 +131,8 @@ const BATCH_ONES: &str = "in.rnnt.batch.ones";
 const BATCH_ROW_INDEX: &str = "in.rnnt.batch.row_index";
 const BATCH_ROW_SLOT: &str = "in.rnnt.batch.row_slot";
 const BATCH_IDS: &str = "act.rnnt.batch.ids";
-const BATCH_ENCODER: &str = "batch.rnnt.encoder";
-const BATCH_PREDICTOR: &str = "batch.rnnt.predictor";
+const BATCH_ENCODER: &str = "act.rnnt.batch.encoder";
+const BATCH_PREDICTOR: &str = "state.batch.rnnt.predictor";
 
 /// Append `programs` of `sub` to `main`, binding `sub`'s tensors to `main`'s by name (declared
 /// sizes grow to the larger; initializers must agree). Returns the new program indices.
@@ -261,7 +261,7 @@ impl RnntPackets {
     /// - `batch.predict.{P}`: the predictor for `P` recordings (`items` rungs), each reading and
     ///   writing its slot of `slots` predictor-state rows (the last a scratch slot for padding);
     /// - `batch.joint.{N}`: the joint for `N` (recording slot, encoder row) pairs (`rows` rungs),
-    ///   the rows read from `batch.rnnt.encoder` (`encoder_rows` rows the host fills).
+    ///   the rows read from `act.rnnt.batch.encoder` (`encoder_rows` rows the host fills).
     ///
     /// Every row computes exactly as in the batch-1 predictor and joint programs.
     pub fn add_batched_decode(
@@ -1315,8 +1315,8 @@ fn emit_batched_predictor(
     let mut stored = None;
     let mut input = embedding;
     for (layer, weights) in w.lstm.iter().enumerate() {
-        let h_state = b.tensor(&format!("batch.rnnt.h.{layer}"), bytes3(g.slots, pw, 4));
-        let c_state = b.tensor(&format!("batch.rnnt.c.{layer}"), bytes3(g.slots, pw, 4));
+        let h_state = b.tensor(&format!("state.batch.rnnt.h.{layer}"), bytes3(g.slots, pw, 4));
+        let c_state = b.tensor(&format!("state.batch.rnnt.c.{layer}"), bytes3(g.slots, pw, 4));
         let h_prev = b.tensor("act.rnnt.batch.h_prev", lanes(pw));
         let c_prev = b.tensor("act.rnnt.batch.c_prev", lanes(pw));
         let gates = b.tensor("act.rnnt.batch.gates", lanes(4 * pw));
@@ -2130,6 +2130,17 @@ mod tests {
         assert_eq!(
             ones.init.as_deref(),
             Some(&1u32.to_ne_bytes().repeat(2)[..])
+        );
+        let weights: Vec<_> = packets
+            .model
+            .tensors
+            .iter()
+            .filter(|t| packet::names::is_checkpoint_weight(&t.name))
+            .map(|t| t.name.as_str())
+            .collect();
+        assert!(
+            weights.iter().all(|name| !name.contains("batch")),
+            "batched decode tensors are looked up in the checkpoint: {weights:?}"
         );
 
         let section = packets.pipeline_section(63, 10, 0).unwrap();
