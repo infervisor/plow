@@ -144,13 +144,7 @@ impl Fa4 {
             )));
         }
         let mut entries = Vec::new();
-        for e in m.entries.iter().filter(|e| e.role != "adapters") {
-            let role = match e.role.as_str() {
-                "whole" => Role::Whole,
-                "split" => Role::Split,
-                "combine" => Role::Combine,
-                r => return Err(refuse(format!("entry {} role {r}", e.name))),
-            };
+        for (e, role) in kernel_entries(&m.entries).map_err(refuse)? {
             let kernel = Kernel::load(be, image, e)?;
             let first = &e.exemplars[0];
             let p = Prepared {
@@ -208,6 +202,37 @@ impl Fa4 {
         }
         Ok(())
     }
+}
+
+/// The name of the container's one adapter entry; `LibAttention::load` hash- and ABI-checks it.
+pub(super) const ADAPTERS: &str = "kv_adapters";
+
+/// The kernel entries with their roles. Every entry is a kernel this stub loads (hash, layout and
+/// exemplar checked) or the one `adapters` entry named [`ADAPTERS`]; anything else is refused.
+fn kernel_entries(entries: &[Entry]) -> std::result::Result<Vec<(&Entry, Role)>, String> {
+    let mut names = std::collections::BTreeSet::new();
+    let mut adapters = 0;
+    let mut kernels = Vec::new();
+    for e in entries {
+        if !names.insert(e.name.as_str()) {
+            return Err(format!("duplicate entry {}", e.name));
+        }
+        let role = match (e.role.as_str(), e.name.as_str()) {
+            ("adapters", ADAPTERS) => {
+                adapters += 1;
+                continue;
+            }
+            ("whole", _) => Role::Whole,
+            ("split", _) => Role::Split,
+            ("combine", _) => Role::Combine,
+            (r, name) => return Err(format!("entry {name} role {r}")),
+        };
+        kernels.push((e, role));
+    }
+    if adapters != 1 {
+        return Err(format!("no {ADAPTERS} entry"));
+    }
+    Ok(kernels)
 }
 
 /// The exemplar operands `capture_main.c` passes (fake addresses; nothing is dereferenced).
@@ -468,4 +493,57 @@ fn combine(g: Geometry, p: &Prepared, c: &Call) -> Launch {
     divmod(&mut l, 4, t);
     divmod(&mut l, 5, h);
     l
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn entry(name: &str, role: &str) -> Entry {
+        Entry {
+            name: name.into(),
+            role: role.into(),
+            kv_heads: 1,
+            symbol: String::new(),
+            params: Vec::new(),
+            sha256: String::new(),
+            offset: 0,
+            bytes: 0,
+            exemplars: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn every_entry_is_a_kernel_or_the_one_adapter_object() {
+        let ok = [
+            entry("w", "whole"),
+            entry("s", "split"),
+            entry("c", "combine"),
+            entry(ADAPTERS, "adapters"),
+        ];
+        let roles: Vec<Role> = kernel_entries(&ok).unwrap().iter().map(|e| e.1).collect();
+        assert_eq!(roles, [Role::Whole, Role::Split, Role::Combine]);
+        // An adapters-role entry under another name would bypass the adapter checks.
+        assert!(kernel_entries(&[
+            entry("w", "whole"),
+            entry("extra", "adapters"),
+            entry(ADAPTERS, "adapters")
+        ])
+        .is_err());
+        assert!(kernel_entries(&[
+            entry("w", "whole"),
+            entry(ADAPTERS, "adapters"),
+            entry(ADAPTERS, "adapters")
+        ])
+        .is_err());
+        assert!(kernel_entries(&[entry("w", "whole")]).is_err());
+        assert!(kernel_entries(&[entry(ADAPTERS, "whole")]).is_err());
+        assert!(kernel_entries(&[
+            entry("w", "whole"),
+            entry("w", "split"),
+            entry(ADAPTERS, "adapters")
+        ])
+        .is_err());
+        assert!(kernel_entries(&[entry("x", "decode"), entry(ADAPTERS, "adapters")]).is_err());
+    }
 }

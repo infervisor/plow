@@ -2455,6 +2455,15 @@ pub(super) fn prefill_segments(
     projection_segments(program, tensors, roles, ProjectionPhase::Prefill(profile))
 }
 
+/// The rows cuBLASLt reads and writes: the block-scaled route pads to 4.
+fn lt_rows(m: u32, block: bool) -> Option<u32> {
+    if block {
+        m.checked_next_multiple_of(4)
+    } else {
+        Some(m)
+    }
+}
+
 fn projection_segments(
     program: &DevProg,
     tensors: &[DevTensor],
@@ -2555,8 +2564,7 @@ fn projection_segments(
         if block && (n % 128 != 0 || k % 128 != 0) {
             return Err(fail());
         }
-        // The rows cuBLASLt reads and writes (block route: padded to 4).
-        let lt_m = if block { m.next_multiple_of(4) } else { m };
+        let lt_m = lt_rows(m, block).ok_or_else(fail)?;
         let bytes = |a: u32, b: u32| {
             u64::from(a)
                 .checked_mul(u64::from(b))
@@ -2626,6 +2634,15 @@ fn projection_segments(
 mod tests {
     use super::*;
     use packet::dev::{DevInst64, StreamEnt};
+
+    #[test]
+    fn block_fp8_row_padding_refuses_overflow() {
+        assert_eq!(lt_rows(5, true), Some(8));
+        assert_eq!(lt_rows(8, true), Some(8));
+        assert_eq!(lt_rows(u32::MAX - 3, true), Some(u32::MAX - 3));
+        assert_eq!(lt_rows(u32::MAX - 2, true), None);
+        assert_eq!(lt_rows(u32::MAX, false), Some(u32::MAX));
+    }
 
     #[test]
     fn prefill_light_launches_take_the_launch_tensor_table() {
