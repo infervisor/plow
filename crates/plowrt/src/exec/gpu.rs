@@ -8484,7 +8484,9 @@ impl GpuEngine {
             }
         }
         if let Err(e) = self.blocks_quiesce() {
-            tracing::warn!(slot = b, error = %e, "retire: store copy drain failed");
+            // A store copy may still read the rings: they stay mapped (leaked).
+            tracing::error!(slot = b, error = %e, "retire: store copy drain failed, rings kept");
+            return;
         }
         // The live ring goes back first: `begin_seq`'s pressure trim then sees that memory free
         // instead of evicting cached boundaries for it.
