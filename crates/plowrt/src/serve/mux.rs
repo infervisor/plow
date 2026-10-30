@@ -3504,7 +3504,7 @@ fn run_one_tick(
                                 .min(remaining)
                                 .min(pf_chunk_rows())
                                 .min(e.pf_request_max_rows())
-                                .min(e.state_capture_cut(i, request.prompt_ids.len(), start));
+                                .min(e.state_capture_cut(i, &request.prompt_ids, start));
                             if request.mm.as_deref().is_some_and(|j| j.spans()) {
                                 take = plow_asset::multimodal::span_safe_rows(
                                     &request.prompt_ids,
@@ -3705,8 +3705,9 @@ fn run_one_tick(
                             Ok(Some((_, false))) => {}
                             Err(err) => {
                                 note_fault(&mut tick_fault, &err);
-                                let owner = if slots[i].is_some() { i } else { i - 1 };
-                                fail_slot(&mut slots[owner], &arena, err);
+                                if let Some(owner) = pack_owner(&slots, i) {
+                                    fail_slot(&mut slots[owner], &arena, err);
+                                }
                                 continue;
                             }
                         }
@@ -4610,7 +4611,18 @@ fn run_one_tick(
             //  * A member may consume its prompt to the end. `token_batch_prefill_rows` does
             //    not hold the last token back, and the sampled ids for prompts that finish
             //    here follow the decode feeds in `output`.
-            if !rt.pf_defer_decode && !slo_on && e.token_batch_rows(1, 0, 1).is_some() {
+            // A live request asking for logprobs keeps the ordinary path on an engine whose token
+            // batch keeps no logits row for the tokens it samples.
+            if !rt.pf_defer_decode
+                && !slo_on
+                && e.token_batch_rows(1, 0, 1).is_some()
+                && (e.token_batch_logprobs()
+                    || !slots
+                        .iter()
+                        .take(b)
+                        .flatten()
+                        .any(|s| s.gen.params.logprobs.is_some()))
+            {
                 let feeds: Vec<(usize, u32)> = slots
                     .iter()
                     .enumerate()
@@ -6807,7 +6819,10 @@ fn gpu_prefill_batched_pass(
     completed.clear();
     *dev_sampled = false;
     let compact = e.has_packed_terminal();
-    let mut unified = e.token_batch_enabled();
+    // A CFG pair's partner row has no slot entry of its own, and its uncond logits are read at
+    // the owner's row + 1: the unified batch carries neither, so pairs take the ordinary path.
+    let mut unified =
+        e.token_batch_enabled() && !slots.iter().take(cap).flatten().any(|s| s.cfg.is_some());
     // Whether this tick's decode rows may still leave the launch for their own step
     // (`sched::ride`): decided once, when the launch's bucket is known.
     let mut ride_open = unified && !feeds.is_empty();
@@ -6996,9 +7011,9 @@ fn gpu_prefill_batched_pass(
                 if !e.packed_slot_ready(i) || s.step != 0 || n == 0 || pf_pos + withheld >= n {
                     return None;
                 }
-                let publish = e
-                    .pf_publish_cap(i, pf_pos)
-                    .min(e.state_capture_cut(i, n, pf_pos));
+                let publish =
+                    e.pf_publish_cap(i, pf_pos)
+                        .min(e.state_capture_cut(i, &s.prompt_ids, pf_pos));
                 let mut remaining = e
                     .pf_plan_slice(n - withheld - pf_pos, chunk_cap)
                     .min(publish);
@@ -7197,6 +7212,9 @@ fn gpu_prefill_batched_pass(
                 .map(|p| p.0)
                 .chain(feeds.iter().map(|f| f.0).filter(|_| unified)),
         );
+        // A token batch refused before its first launch left every slot as it was: its prompts
+        // run without riders and the riders take their own decode step, instead of failing.
+        let mut refused = false;
         let res = if unified {
             use plow_asset::token_batch::{Phase, Request, Selection};
             // A feed or pack entry whose slot vanished mid-tick is skipped, not a panic:
@@ -7234,6 +7252,7 @@ fn gpu_prefill_batched_pass(
                 })
             });
             let requests: smallvec::SmallVec<[_; 16]> = decode.chain(prefill).collect();
+            let stepped = pen_synced.is_ok();
             let result = if let Err(err) = pen_synced {
                 Err(err)
             } else if !window.is_empty() {
@@ -7263,6 +7282,11 @@ fn gpu_prefill_batched_pass(
                         .iter()
                         .map(|&(slot, token)| (slot as usize, token)),
                 );
+            } else if stepped
+                && e.token_batch_refused_before_launch()
+                && matches!(result, Err(crate::RuntimeError::Rejected(_)))
+            {
+                refused = true;
             }
             result
         } else {
@@ -7368,6 +7392,19 @@ fn gpu_prefill_batched_pass(
                     e.advance_prefill_turn(last_slot);
                 }
             }
+            Err(err) if refused => {
+                tracing::warn!(
+                    error = %err,
+                    riders = feeds.len(),
+                    packed = pack.len(),
+                    "gpu: token batch refused before launch; prefill runs without riders"
+                );
+                unified = false;
+                decode_rows = 0;
+                spans.clear();
+                *dev_sampled = false;
+                continue;
+            }
             Err(err) => {
                 // The shared launch failed — every packed request loses.
                 tracing::warn!(
@@ -7386,8 +7423,9 @@ fn gpu_prefill_batched_pass(
                     }
                 }
                 for &(i, _, _) in &pack {
-                    let owner = if slots[i].is_some() { i } else { i - 1 };
-                    fail_slot(&mut slots[owner], arena, fanout_err(&err, &msg));
+                    if let Some(owner) = pack_owner(slots, i) {
+                        fail_slot(&mut slots[owner], arena, fanout_err(&err, &msg));
+                    }
                     if unified {
                         e.retire_slot(i, false);
                     }
@@ -7780,6 +7818,19 @@ fn pack_row(slots: &[Option<Slot>], i: usize) -> Option<(&Slot, usize)> {
             Some((owner, owner.cfg.as_ref()?.partner_pf))
         }
     }
+}
+
+/// The request owning engine row `i`: its own slot, or the CFG owner of a pair's partner row.
+#[cfg(any(feature = "cuda", test))]
+fn pack_owner(slots: &[Option<Slot>], i: usize) -> Option<usize> {
+    if slots.get(i)?.is_some() {
+        return Some(i);
+    }
+    let owner = i.checked_sub(1)?;
+    slots[owner]
+        .as_ref()
+        .is_some_and(|s| s.cfg.is_some())
+        .then_some(owner)
 }
 
 #[cfg(any(feature = "cuda", test))]
@@ -10930,6 +10981,30 @@ mod tests {
         }
         let slots = vec![owner, None];
         assert_eq!(gpu_decode_feeds(&slots, 2), [(0, 7), (1, 7)]);
+    }
+
+    /// A failed launch fans out to each row's owner: a CFG partner row to its owner, an empty
+    /// row (slot 0 included) to nobody, never to an unrelated neighbour.
+    #[test]
+    fn pack_owner_names_the_cfg_owner_and_nobody_else() {
+        let (mut owner, _rx) = prefill_test_slot();
+        owner.as_mut().unwrap().cfg = Some(Box::new(CfgRun {
+            rng: None,
+            partner_pf: 0,
+            cond: Vec::new(),
+            uncond: Vec::new(),
+            scratch: Vec::new(),
+            dev_seeded: false,
+            uncond_hidden: Vec::new(),
+        }));
+        let (plain, _rx2) = prefill_test_slot();
+        let slots = vec![None, owner, None, plain, None];
+        assert_eq!(pack_owner(&slots, 0), None);
+        assert_eq!(pack_owner(&slots, 1), Some(1));
+        assert_eq!(pack_owner(&slots, 2), Some(1));
+        assert_eq!(pack_owner(&slots, 3), Some(3));
+        assert_eq!(pack_owner(&slots, 4), None);
+        assert_eq!(pack_owner(&slots, 9), None);
     }
 
     /// A packed launch stages each member's overlay rows at its launch offset, in pack order: a

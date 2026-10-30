@@ -245,16 +245,6 @@ const C_PF_SEG_GEMM_SMALL: &[Constraint] = &[Constraint {
     check: Check::Site,
 }];
 
-const C_CUTLASS_FP8_DECODE: &[Constraint] = &[Constraint {
-    id: "cutlass_fp8_decode_requires_seg_dir",
-    formula: F::Implies(
-        &F::Atom("rt.cutlass_fp8_decode", Cmp::Ne, Val::Unset),
-        &F::Atom("rt.pf_seg_dir", Cmp::Ne, Val::Unset),
-    ),
-    site: "crates/plowrt/src/device/cuda/lt.rs: PLOW_CUTLASS_FP8_DECODE requires PLOW_PF_SEG_DIR",
-    check: Check::Site,
-}];
-
 const C_CHANNEL_MLP_RUNTIME: &[Constraint] = &[Constraint {
     id: "channel_mlp_runtime_exclusive",
     formula: F::Implies(
@@ -299,9 +289,6 @@ type Reader = fn(&RuntimeConfig) -> Val<'_>;
 const READERS: &[(&str, Reader)] = &[
     ("rt.pf_seg_dir", |c| opt_str(&c.nv.pf_seg_dir)),
     ("rt.pf_seg_gemm_small", |c| opt_str(&c.nv.pf_seg_gemm_small)),
-    ("rt.cutlass_fp8_decode", |c| {
-        opt_str(&c.nv.cutlass_fp8_decode)
-    }),
     ("rt.mla_pf_v2", |c| Val::Bool(c.amd.mla_pf_v2)),
     ("rt.serial", |c| Val::Bool(c.apple.serial)),
     ("rt.ane_mlp", |c| Val::Bool(c.apple.ane_mlp)),
@@ -542,7 +529,6 @@ pub const RUNTIME: &[KnobSpec] = &[
     KnobSpec::new("rt.bf16_m4", Some("PLOW_METAL_BF16_M4"), Layer::Runtime, Domain::Bool, OFF, OPT_IN),
     KnobSpec::new("rt.bf16_m8", Some("PLOW_METAL_BF16_M8"), Layer::Runtime, Domain::Bool, OFF, OPT_IN),
     KnobSpec::new("rt.affine_q4_dir", Some("PLOW_AFFINE_Q4_DIR"), Layer::Runtime, Domain::Str, UNSET, OPT_IN),
-    KnobSpec::new("rt.token_batch", Some("PLOW_TOKEN_BATCH"), Layer::Runtime, Domain::Bool, ON, DIAG),
     KnobSpec::new("rt.prefix_cache", Some("PLOW_PREFIX_CACHE"), Layer::Runtime, Domain::Bool, ON, PROMOTED),
     KnobSpec::new("rt.tts_first_lookahead", Some("PLOW_TTS_FIRST_LOOKAHEAD"), Layer::Runtime, USIZE, Default::Static(Val::Nat(1)), OPT_IN),
     KnobSpec::new("rt.tts_stream_first_frames", Some("PLOW_TTS_STREAM_FIRST_FRAMES"), Layer::Runtime, USIZE, Default::Static(Val::Nat(1)), OPT_IN),
@@ -605,7 +591,6 @@ pub const RUNTIME: &[KnobSpec] = &[
     KnobSpec::new("rt.prefix_arm_end", Some("PLOW_PREFIX_ARM_END"), Layer::Runtime, Domain::Bool, OFF, DIAG),
     KnobSpec::new("rt.vmm_strict_publish", Some("PLOW_VMM_STRICT_PUBLISH"), Layer::Runtime, Domain::Bool, ON, DIAG),
     KnobSpec::new("rt.vmm_ring_recycle", Some("PLOW_VMM_RING_RECYCLE"), Layer::Runtime, Domain::Bool, OFF, DIAG),
-    KnobSpec::new("rt.vmm_ring_park", Some("PLOW_VMM_RING_PARK"), Layer::Runtime, U32, Default::Static(Val::Nat(0)), DIAG),
     KnobSpec::new("rt.pf_admit_overlap", Some("PLOW_PF_ADMIT_OVERLAP"), Layer::Runtime, Domain::Bool, OFF, DIAG),
     KnobSpec::new("rt.shed_queue_depth", Some("PLOW_SHED_QUEUE_DEPTH"), Layer::Runtime, U32, Default::Static(Val::Nat(0)), DIAG),
     KnobSpec::new("rt.rt_max_ctx", Some("PLOW_RT_MAX_CTX"), Layer::Runtime, USIZE, UNSET, OPT_IN),
@@ -693,7 +678,6 @@ pub const RUNTIME: &[KnobSpec] = &[
     KnobSpec::new("rt.lt_rung_algos", Some("PLOW_LT_RUNG_ALGOS"), Layer::Runtime, Domain::Bool, OFF, OPT_IN),
     KnobSpec::new("rt.lt_fp8_fast_accum_max_k", Some("PLOW_LT_FP8_FAST_ACCUM_MAX_K"), Layer::Runtime, U32, UNSET, OPT_IN),
     KnobSpec::new("rt.pf_norm_row_blocks", Some("PLOW_PF_NORM_ROW_BLOCKS"), Layer::Runtime, U32, Default::Static(Val::Nat(0)), OPT_IN),
-    KnobSpec::new("rt.cutlass_fp8_decode", Some("PLOW_CUTLASS_FP8_DECODE"), Layer::Runtime, Domain::Str, UNSET, OPT_IN).with(C_CUTLASS_FP8_DECODE),
     KnobSpec::new("rt.decode_light", Some("PLOW_DECODE_LIGHT"), Layer::Runtime, Domain::Bool, ON, PROMOTED),
     KnobSpec::new("rt.decode_light_flash", Some("PLOW_DECODE_LIGHT_FLASH"), Layer::Runtime, Domain::Bool, ON, PROMOTED),
     KnobSpec::new("rt.tb_split_attn", Some("PLOW_TB_SPLIT_ATTN"), Layer::Runtime, Domain::Bool, ON, PROMOTED),
@@ -724,6 +708,7 @@ pub const RUNTIME: &[KnobSpec] = &[
     KnobSpec::new("rt.pf_segment_gates", Some("PLOW_PF_SEGMENT_GATES"), Layer::Runtime, Domain::Bool, ON, DIAG),
     KnobSpec::new("rt.pf_entry_trace", Some("PLOW_PF_ENTRY_TRACE"), Layer::Runtime, Domain::Bool, OFF, DIAG),
     KnobSpec::new("rt.pf_seg_v2", Some("PLOW_PF_SEG_V2"), Layer::Runtime, Domain::Str, UNSET, OPT_IN),
+    KnobSpec::new("rt.pf_attn_library", Some("PLOW_PF_ATTN_LIBRARY"), Layer::Runtime, Domain::Bool, ON, PROMOTED),
     KnobSpec::new("rt.pf_attn_gemm", Some("PLOW_PF_ATTN_GEMM"), Layer::Runtime, Domain::Bool, UNSET, PF_ATTN_GEMM_AUTO),
     KnobSpec::new("rt.pf_attn_gemm_tile", Some("PLOW_PF_ATTN_GEMM_TILE"), Layer::Runtime, U32, Default::Static(Val::Nat(2048)), OPT_IN),
     KnobSpec::new("rt.pf_attn_gemm_min_rows", Some("PLOW_PF_ATTN_GEMM_MIN_ROWS"), Layer::Runtime, U32, Default::Static(Val::Nat(1024)), OPT_IN),
@@ -892,6 +877,7 @@ pub const RAW_ENV: &[KnobSpec] = &[
     KnobSpec::new("env.PLOW_AMD_DECODE_MIN_RUNG", Some("PLOW_AMD_DECODE_MIN_RUNG"), Layer::RawEnv, Domain::Str, UNSET, REMOVED),
     KnobSpec::new("env.PLOW_CFG_MULTISTEP", Some("PLOW_CFG_MULTISTEP"), Layer::RawEnv, Domain::Str, UNSET, REMOVED),
     KnobSpec::new("env.PLOW_CO_SCHED_QUANTUM", Some("PLOW_CO_SCHED_QUANTUM"), Layer::RawEnv, Domain::Str, UNSET, REMOVED),
+    KnobSpec::new("env.PLOW_CUTLASS_FP8_DECODE", Some("PLOW_CUTLASS_FP8_DECODE"), Layer::RawEnv, Domain::Str, UNSET, REMOVED),
     KnobSpec::new("env.PLOW_IDLE_DISPATCH", Some("PLOW_IDLE_DISPATCH"), Layer::RawEnv, Domain::Str, UNSET, REMOVED),
     KnobSpec::new("env.PLOW_MULTISTEP_ADAPTIVE", Some("PLOW_MULTISTEP_ADAPTIVE"), Layer::RawEnv, Domain::Str, UNSET, REMOVED),
     KnobSpec::new("env.PLOW_MUX_INLINE_TICK", Some("PLOW_MUX_INLINE_TICK"), Layer::RawEnv, Domain::Str, UNSET, REMOVED),
@@ -905,6 +891,7 @@ pub const RAW_ENV: &[KnobSpec] = &[
     KnobSpec::new("env.PLOW_PIPE_PREFILL", Some("PLOW_PIPE_PREFILL"), Layer::RawEnv, Domain::Str, UNSET, REMOVED),
     KnobSpec::new("env.PLOW_PREFIX_CACHE_OUTPUT", Some("PLOW_PREFIX_CACHE_OUTPUT"), Layer::RawEnv, Domain::Str, UNSET, REMOVED),
     KnobSpec::new("env.PLOW_KV_STORE", Some("PLOW_KV_STORE"), Layer::RawEnv, Domain::Str, UNSET, REMOVED),
+    KnobSpec::new("env.PLOW_VMM_RING_PARK", Some("PLOW_VMM_RING_PARK"), Layer::RawEnv, Domain::Str, UNSET, REMOVED),
     KnobSpec::new("env.PLOW_VMM_SNAP_PITCHED", Some("PLOW_VMM_SNAP_PITCHED"), Layer::RawEnv, Domain::Str, UNSET, REMOVED),
     KnobSpec::new("env.PLOW_VMM_SNAP_POOL", Some("PLOW_VMM_SNAP_POOL"), Layer::RawEnv, Domain::Str, UNSET, REMOVED),
     KnobSpec::new("env.PLOW_PREFIX_POLICY", Some("PLOW_PREFIX_POLICY"), Layer::RawEnv, Domain::Str, UNSET, REMOVED),
@@ -913,6 +900,7 @@ pub const RAW_ENV: &[KnobSpec] = &[
     KnobSpec::new("env.PLOW_RIDE_FIXED", Some("PLOW_RIDE_FIXED"), Layer::RawEnv, Domain::Str, UNSET, REMOVED),
     KnobSpec::new("env.PLOW_RUNG_FAST_PROBE", Some("PLOW_RUNG_FAST_PROBE"), Layer::RawEnv, Domain::Str, UNSET, REMOVED),
     KnobSpec::new("env.PLOW_SERVE_POLICY", Some("PLOW_SERVE_POLICY"), Layer::RawEnv, Domain::Str, UNSET, REMOVED),
+    KnobSpec::new("env.PLOW_TOKEN_BATCH", Some("PLOW_TOKEN_BATCH"), Layer::RawEnv, Domain::Str, UNSET, REMOVED),
     KnobSpec::new("env.PLOW_TOKEN_BATCH_SOLO", Some("PLOW_TOKEN_BATCH_SOLO"), Layer::RawEnv, Domain::Str, UNSET, REMOVED),
     KnobSpec::new("env.PLOW_PUBLISH_URL", Some("PLOW_PUBLISH_URL"), Layer::RawEnv, Domain::Str, UNSET, OPT_IN),
     KnobSpec::new("env.PLOW_PUBLISH_KEY", Some("PLOW_PUBLISH_KEY"), Layer::RawEnv, Domain::Str, UNSET, OPT_IN),
@@ -1072,6 +1060,12 @@ mod tests {
     /// measured with; migrate it to `PLOW_OBJECTIVE` (or an expert override) instead.
     #[test]
     fn recipes_and_launchers_set_no_removed_knob() {
+        // Removed runtime knobs whose name lives on as an object build define (devgen
+        // `def.PLOW_TOKEN_BATCH`), set by the gfx942 object build and its baseline.
+        const DEFINE_TWINS: &[&str] = &["PLOW_TOKEN_BATCH"];
+        let builds_objects = |p: &std::path::Path| {
+            p.ends_with("build_gfx942.sh") || p.ends_with("obj_baseline_gfx942.json")
+        };
         let removed: Vec<&str> = RAW_ENV
             .iter()
             .filter(|k| k.status == Status::Removed)
@@ -1088,6 +1082,7 @@ mod tests {
                 text.lines()
                     .flat_map(plow_tokens)
                     .filter(|t| removed.contains(t))
+                    .filter(|t| !(DEFINE_TWINS.contains(t) && builds_objects(path)))
                     .map(move |t| format!("{}: {t}", path.display()))
             })
             .collect();
@@ -1221,11 +1216,6 @@ mod tests {
             "gpu.rs",
             "PLOW_PF_SEG_GEMM_SMALL requires PLOW_PF_SEG_DIR",
             Site::Encoded("pf_seg_gemm_small_requires_seg_dir"),
-        ),
-        (
-            "lt.rs",
-            "PLOW_CUTLASS_FP8_DECODE requires PLOW_PF_SEG_DIR",
-            Site::Encoded("cutlass_fp8_decode_requires_seg_dir"),
         ),
         (
             "amd.rs",

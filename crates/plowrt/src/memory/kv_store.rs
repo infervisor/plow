@@ -42,6 +42,10 @@ pub trait StoreOps: Send + Sync {
     fn copy_dtod_batch(&self, copies: &[(u64, u64, u64)]) -> Result<()>;
     /// Free device bytes now; `None` where the backend cannot say.
     fn free_bytes(&self) -> Option<u64>;
+    /// Every queued copy has completed (`VmmOps::quiesce`).
+    fn quiesce(&self) -> Result<()> {
+        Ok(())
+    }
 }
 
 impl<T: VmmOps + ?Sized> StoreOps for T {
@@ -74,6 +78,9 @@ impl<T: VmmOps + ?Sized> StoreOps for T {
     }
     fn free_bytes(&self) -> Option<u64> {
         VmmOps::free_bytes(self)
+    }
+    fn quiesce(&self) -> Result<()> {
+        VmmOps::quiesce(self)
     }
 }
 
@@ -362,6 +369,11 @@ impl<T: Copy> Slab<T> {
         self.owner[slot.0 as usize] = Some(id);
     }
 
+    /// Take `slot` out of use for good: never handed out again, so its chunk is never released.
+    fn leak(&mut self, slot: Slot<T>) {
+        self.owner[slot.0 as usize] = None;
+    }
+
     /// Return `slot` to its chunk.
     fn put(&mut self, slot: Slot<T>) {
         self.owner[slot.0 as usize] = None;
@@ -502,6 +514,12 @@ struct Inner {
     spilling_bytes: u64,
     /// Blocks with an H2D copy in flight, oldest first ([`KvStore::restore_async`]).
     restoring: VecDeque<BlockId>,
+    /// Host slots of blocks being refilled on the device, kept until the fill seals: a failed
+    /// refill goes back to its host bytes, which other boundaries still depend on.
+    refilling: FxHashMap<BlockId, Slot<Host>>,
+    /// Device slots leaked under a copy whose completion is unproven ([`KvStore::quarantine_ids`]):
+    /// nonzero = the device chunks are never freed.
+    quarantined: u64,
     /// Pinned chunks per class allocated ahead by [`KvStore::host_grow_step`] (a pinned
     /// allocation costs ~4 ms per 8 MiB; under the pool lock it was the host tier's TTFT tail).
     host_spare: Vec<Vec<Chunk<Host>>>,
@@ -573,10 +591,25 @@ impl FillToken<'_> {
         self.store.seal_id(self.id);
     }
 
+    /// The fill's copy is queued on the stream every reader of the block's bytes before the seal
+    /// is ordered on: the caller seals ([`KvStore::seal_ids`]) or fails ([`KvStore::fail_ids`])
+    /// the block once that copy is known to have completed or failed. Until then it stays
+    /// `Filling`: never spilled, reclaimed, evicted or compacted.
+    pub fn defer(mut self) -> BlockId {
+        self.done = true;
+        self.id
+    }
+
     /// The fill did not complete: never serve these bytes; the next acquire refills.
     pub fn fail(mut self) {
         self.done = true;
         self.store.fail_id(self.id);
+    }
+
+    /// The fill's copy may still be running: [`KvStore::quarantine_ids`].
+    pub fn quarantine(mut self) {
+        self.done = true;
+        self.store.quarantine_ids(&[self.id]);
     }
 }
 
@@ -675,6 +708,8 @@ impl KvStore {
                 spilling: VecDeque::new(),
                 spilling_bytes: 0,
                 restoring: VecDeque::new(),
+                refilling: FxHashMap::default(),
+                quarantined: 0,
                 host_spare: (0..n_classes).map(|_| Vec::new()).collect(),
                 tick: 0,
                 stats,
@@ -754,7 +789,8 @@ impl KvStore {
         let tick = inner.tick;
         if let Some(&id) = inner.index.get(&(class, key)) {
             // A host-resident block is refilled from the rows being published (one more segment
-            // of the publish's launch), never copied back: the host slot goes.
+            // of the publish's launch), never copied back: the host slot goes once the fill
+            // seals.
             // A held host block is being read in place (a gather in flight): it stays where it
             // is and the publish takes it as present.
             let (refill, held_host) = match inner.block(id).map(|b| (b.place, b.holds)) {
@@ -768,7 +804,7 @@ impl KvStore {
                     let slot = self.device_slot(&mut inner, class)?;
                     let bytes = inner.classes[class].spec.block_bytes();
                     inner.classes[class].device.assign(slot, id);
-                    inner.classes[class].host.put(h);
+                    inner.refilling.insert(id, h);
                     let st = &mut inner.stats.classes[class];
                     st.host_blocks -= 1;
                     st.host_bytes -= bytes;
@@ -835,14 +871,41 @@ impl KvStore {
                 b.state = State::Ready;
             }
         }
+        if let Some(h) = inner.refilling.remove(&id) {
+            let class = inner.block(id).map(|b| b.class);
+            if let Some(class) = class {
+                inner.classes[class].host.put(h);
+            }
+        }
     }
 
+    /// A failed refill is back on the host, `Ready`: its host bytes never stopped being valid
+    /// and its other dependents keep reading them. Any other failed block is `Failed`.
     fn fail_id(&self, id: BlockId) {
         let mut inner = self.inner.lock();
-        if let Some(b) = inner.block_mut(id) {
-            b.state = State::Failed;
-        }
         inner.stats.fill_failures += 1;
+        let refill = inner.refilling.remove(&id);
+        let Some(b) = inner.block_mut(id) else {
+            return;
+        };
+        let (class, place, idle) = (b.class, b.place, b.dependents == 0);
+        match (refill, place) {
+            (Some(h), Where::Device(slot)) => {
+                b.place = Where::Host(h);
+                b.state = State::Ready;
+                if idle {
+                    inner.host_reclaim[class].push_back(id);
+                }
+                let bytes = inner.classes[class].spec.block_bytes();
+                inner.classes[class].device.put(slot);
+                let st = &mut inner.stats.classes[class];
+                st.device_blocks -= 1;
+                st.device_bytes -= bytes;
+                st.host_blocks += 1;
+                st.host_bytes += bytes;
+            }
+            _ => b.state = State::Failed,
+        }
     }
 
     pub fn state(&self, id: BlockId) -> Option<State> {
@@ -882,6 +945,115 @@ impl KvStore {
             store: Arc::clone(self),
             ids,
         }
+    }
+
+    /// Seal fills deferred by [`FillToken::defer`].
+    pub fn seal_ids(&self, ids: &[BlockId]) {
+        for &id in ids {
+            self.seal_id(id);
+        }
+    }
+
+    /// Fills whose copy may still be writing their device slots (its completion could not be
+    /// proven): never served, and the slot is never reused or freed. A refill goes back to its
+    /// host bytes; any other block is forgotten, so the next acquire fills a fresh slot.
+    pub fn quarantine_ids(&self, ids: &[BlockId]) {
+        let mut inner = self.inner.lock();
+        for &id in ids {
+            let Some(b) = inner.block(id) else {
+                continue;
+            };
+            let (class, idle) = (b.class, b.dependents == 0);
+            let Where::Device(slot) = b.place else {
+                // Fills target device slots only.
+                inner.block_mut(id).expect("block").state = State::Failed;
+                continue;
+            };
+            inner.stats.fill_failures += 1;
+            inner.quarantined += 1;
+            inner.classes[class].device.leak(slot);
+            let bytes = inner.classes[class].spec.block_bytes();
+            let refill = inner.refilling.remove(&id);
+            let st = &mut inner.stats.classes[class];
+            st.device_blocks -= 1;
+            st.device_bytes -= bytes;
+            if let Some(h) = refill {
+                st.host_blocks += 1;
+                st.host_bytes += bytes;
+                let b = inner.block_mut(id).expect("block");
+                b.place = Where::Host(h);
+                b.state = State::Ready;
+                if idle {
+                    inner.host_reclaim[class].push_back(id);
+                }
+                continue;
+            }
+            let e = &mut inner.blocks[id.index()];
+            let b = e.block.take().expect("block");
+            if let Some(gen) = e.gen.checked_add(1) {
+                e.gen = gen;
+                inner.free_entries.push(id.index);
+            }
+            inner.index.remove(&(b.class, b.key));
+        }
+    }
+
+    /// Fail fills deferred by [`FillToken::defer`].
+    pub fn fail_ids(&self, ids: &[BlockId]) {
+        for &id in ids {
+            self.fail_id(id);
+        }
+    }
+
+    /// [`Self::hold`] plus [`Self::gather_src`] of every block, under one lock acquisition: a
+    /// gather no longer takes the store lock once per block (each acquisition could wait
+    /// behind a spill or reap). `Err` (a block is gone) takes no hold.
+    pub fn hold_sources(self: &Arc<Self>, ids: Vec<BlockId>, out: &mut Vec<Src>) -> Result<Hold> {
+        out.clear();
+        let mut inner = self.inner.lock();
+        if ids.iter().any(|&id| inner.block(id).is_none()) {
+            return Err(RuntimeError::Rejected("kv store: no such block".into()));
+        }
+        // A deferred fill whose copy failed (`fail_ids`) is never served.
+        if ids
+            .iter()
+            .any(|&id| inner.block(id).is_some_and(|b| b.state == State::Failed))
+        {
+            return Err(RuntimeError::Rejected("kv store: block failed".into()));
+        }
+        inner.tick += 1;
+        let tick = inner.tick;
+        for &id in &ids {
+            let b = inner.block_mut(id).expect("checked above");
+            b.holds += 1;
+            b.tick = tick;
+            let (class, place) = (b.class, b.place);
+            out.push(match place {
+                Where::Device(s) | Where::Spilling { dev: s, .. } => Src {
+                    va: inner.classes[class].device.va(s),
+                    from_host: false,
+                    fence: None,
+                },
+                Where::Restoring { dev, fence, .. } => Src {
+                    va: inner.classes[class].device.va(dev),
+                    from_host: false,
+                    fence: Some(fence),
+                },
+                Where::Host(h) => {
+                    inner.stats.host_reads += 1;
+                    Src {
+                        va: inner.classes[class].host.va(h),
+                        from_host: true,
+                        fence: None,
+                    }
+                }
+            });
+        }
+        drop(inner);
+        Ok(Hold {
+            store: Arc::clone(self),
+            ids,
+        })
     }
 
     fn unhold(&self, ids: &[BlockId]) {
@@ -992,6 +1164,22 @@ impl KvStore {
                 inner.block(id),
                 Some(Block {
                     place: Where::Restoring { .. },
+                    ..
+                })
+            )
+        })
+    }
+
+    /// Whether any of `ids` is not readable on the device without a wait: host-resident, or
+    /// with its restore in flight (landed ones are retired first).
+    pub fn off_device_any(&self, ids: &[BlockId]) -> bool {
+        let mut inner = self.inner.lock();
+        self.reap_restores(&mut inner);
+        ids.iter().any(|&id| {
+            matches!(
+                inner.block(id),
+                Some(Block {
+                    place: Where::Restoring { .. } | Where::Host(_),
                     ..
                 })
             )
@@ -1166,6 +1354,9 @@ impl KvStore {
             e.gen = gen;
             inner.free_entries.push(id.index);
         }
+        if let Some(h) = inner.refilling.remove(&id) {
+            inner.classes[b.class].host.put(h);
+        }
         let bytes = inner.classes[b.class].spec.block_bytes();
         let c = &mut inner.classes[b.class];
         let st = &mut inner.stats.classes[b.class];
@@ -1217,14 +1408,18 @@ impl KvStore {
     /// remain: an attach restores a host block ([`Self::ensure_device`]). Returns `true` when
     /// every block of `ids` is off the device afterwards (queued, already on the host, or not
     /// servable); `false` = the host tier is full, and whatever was queued stays queued.
+    ///
+    /// The lock is taken per block: a boundary's spill submits a copy per block (tens of
+    /// microseconds each), and a gather waiting for the lock behind a whole boundary waited
+    /// milliseconds.
     pub fn spill(&self, ids: &[BlockId]) -> bool {
-        let mut inner = self.inner.lock();
-        if inner.host_cap == 0 {
+        if self.inner.lock().host_cap == 0 {
             return false;
         }
-        let t0 = std::time::Instant::now();
         let mut all = true;
         for &id in ids {
+            let mut inner = self.inner.lock();
+            let t0 = std::time::Instant::now();
             let Some(b) = inner.block(id) else {
                 continue;
             };
@@ -1269,8 +1464,8 @@ impl KvStore {
                     all = false;
                 }
             }
+            inner.stats.spill_us += t0.elapsed().as_micros() as u64;
         }
-        inner.stats.spill_us += t0.elapsed().as_micros() as u64;
         all
     }
 
@@ -1383,6 +1578,29 @@ impl KvStore {
             st.device_bytes -= bytes;
             st.host_blocks += 1;
             st.host_bytes += bytes;
+        }
+    }
+
+    /// Retire landed spills, waiting up to `limit` for one while any is queued: `true` = spilled
+    /// bytes retired (their device slots are free). A publish refused for want of a device slot calls
+    /// this before asking the pool for another victim: each victim's spill lands
+    /// asynchronously, and without the wait the retry loop spilled every device boundary in
+    /// turn and then took host-resident ones.
+    pub fn reap_wait(&self, limit: std::time::Duration) -> bool {
+        let t0 = std::time::Instant::now();
+        loop {
+            let before = self.inner.lock().spilling_bytes;
+            if before == 0 {
+                return false;
+            }
+            self.reap();
+            if self.inner.lock().spilling_bytes < before {
+                return true;
+            }
+            if t0.elapsed() >= limit {
+                return false;
+            }
+            std::thread::sleep(std::time::Duration::from_micros(200));
         }
     }
 
@@ -1824,13 +2042,28 @@ impl Drop for KvStore {
             ops, inner, frees, ..
         } = self;
         let ops: &dyn StoreOps = &**ops;
+        // A spill or restore queued after the engine's last sync (the spill-ahead and restore
+        // threads run until the pool drops) may still be copying: free nothing under it.
+        if let Err(e) = ops.quiesce() {
+            tracing::warn!(error = %e, "kv store: copies unproven at drop, chunks leaked");
+            return;
+        }
         for chunk in frees.get_mut().drain(..) {
             chunk.free(ops);
         }
         let inner = inner.get_mut();
+        let quarantined = inner.quarantined > 0;
+        if quarantined {
+            tracing::warn!(
+                slots = inner.quarantined,
+                "kv store: a fill copy is unproven, device chunks leaked"
+            );
+        }
         for c in &mut inner.classes {
             for chunk in c.device.chunks.drain(..).flatten() {
-                chunk.free(ops);
+                if !quarantined {
+                    chunk.free(ops);
+                }
             }
             for chunk in c.host.chunks.drain(..).flatten() {
                 chunk.free(ops);
@@ -2230,6 +2463,98 @@ mod tests {
         assert_eq!(s.state(a.id), Some(State::Filling));
     }
 
+    /// A seal event whose completion could not be proven: the copy may still write the slot,
+    /// so the block is never served or refilled in place and the slot is never reused or freed.
+    #[test]
+    fn an_unproven_fill_leaks_its_slot() {
+        let (ops, s) = store(2 * 32, 0); // chunk = 32 B = one block
+        let mut a = s.acquire(0, key(1)).unwrap();
+        let va = a.va;
+        let id = a.fill.take().expect("a fill").defer();
+        drop(a);
+        s.quarantine_ids(&[id]);
+        assert_eq!(s.state(id), None, "never served");
+        s.release(&[id]);
+        let mut b = s.acquire(0, key(1)).unwrap();
+        assert!(b.id != id && b.va != va, "refilled in a fresh slot");
+        seal(&mut b);
+        s.release(&[b.id]);
+        assert_eq!(
+            s.shrink(u64::MAX),
+            32,
+            "only the fresh slot's chunk goes back"
+        );
+        let c = acquire_sealed(&s, 0, key(2));
+        assert!(
+            s.acquire(0, key(3)).is_err(),
+            "the leaked slot is never handed out"
+        );
+        assert_eq!(s.stats().fill_failures, 1);
+        drop((b, c));
+        let freed = ops.freed.load(Ordering::SeqCst);
+        drop(s);
+        assert_eq!(
+            ops.freed.load(Ordering::SeqCst),
+            freed,
+            "device chunks leaked at drop"
+        );
+    }
+
+    #[test]
+    fn an_unproven_refill_goes_back_to_its_host_bytes() {
+        let (_ops, s) = store(2 * 32, 64);
+        let mut a = s.acquire(0, key(1)).unwrap();
+        seal(&mut a);
+        assert!(s.spill(&[a.id]));
+        s.reap();
+        let host_va = s.gather_src(a.id).unwrap().va;
+        let again = s.acquire(0, key(1)).unwrap();
+        let dev_va = again.va;
+        again.fill.expect("refill").quarantine();
+        assert_eq!(s.location(a.id), Some(Location::Host));
+        assert_eq!(s.state(a.id), Some(State::Ready));
+        assert_eq!(s.gather_src(a.id).unwrap().va, host_va);
+        assert_eq!(s.stats().classes[0].device_blocks, 0);
+        let mut b = s.acquire(0, key(2)).unwrap();
+        assert_ne!(b.va, dev_va, "the refill's slot is never reused");
+        seal(&mut b);
+    }
+
+    /// A boundary still depends on a host block a publish refills: the refill's failure must
+    /// leave those bytes servable (they were read as garbage from the fresh device slot).
+    #[test]
+    fn a_failed_refill_goes_back_to_its_host_bytes() {
+        let (_ops, s) = store(32, 64);
+        let mut a = s.acquire(0, key(1)).unwrap();
+        seal(&mut a);
+        assert!(s.spill(&[a.id]));
+        s.reap();
+        assert_eq!(s.location(a.id), Some(Location::Host));
+        let host_va = s.gather_src(a.id).unwrap().va;
+        let again = s.acquire(0, key(1)).unwrap();
+        assert!(again.fill.is_some(), "refilled on the device");
+        drop(again.fill);
+        s.release(&[a.id]);
+        assert_eq!(s.location(a.id), Some(Location::Host));
+        assert_eq!(s.state(a.id), Some(State::Ready));
+        let src = s.gather_src(a.id).unwrap();
+        assert!(src.from_host);
+        assert_eq!(src.va, host_va);
+        assert_eq!(
+            (
+                s.stats().classes[0].host_blocks,
+                s.stats().classes[0].device_blocks
+            ),
+            (1, 0)
+        );
+        // A sealed refill lets the host slot go.
+        let mut third = s.acquire(0, key(1)).unwrap();
+        seal(&mut third);
+        assert!(matches!(s.location(a.id), Some(Location::Device(_))));
+        assert_eq!(s.stats().classes[0].host_blocks, 0);
+        assert!(s.inner.lock().refilling.is_empty());
+    }
+
     #[test]
     fn spill_then_restore_round_trips_through_the_host_tier() {
         let (ops, s) = store(32, 64);
@@ -2283,6 +2608,29 @@ mod tests {
         assert_eq!(ops.htod.load(Ordering::SeqCst), 1);
         let _hold = s.hold(vec![a.id]);
         assert!(!s.spill(&[a.id]), "a held block stays");
+    }
+
+    #[test]
+    fn reap_wait_frees_the_slot_of_a_landed_spill_and_gives_up_on_a_stuck_one() {
+        let (ops, s) = store(32, 64);
+        let mut a = s.acquire(0, key(1)).unwrap();
+        seal(&mut a);
+        s.release(&[a.id]);
+        assert!(!s.reap_wait(std::time::Duration::ZERO), "nothing queued");
+        assert!(s.spill(&[a.id]));
+        ops.pending.store(true, Ordering::SeqCst);
+        assert!(
+            s.acquire(0, key(2)).is_err(),
+            "the spilling block keeps its slot"
+        );
+        assert!(
+            !s.reap_wait(std::time::Duration::from_millis(2)),
+            "still in flight"
+        );
+        ops.pending.store(false, Ordering::SeqCst);
+        assert!(s.reap_wait(std::time::Duration::from_millis(2)));
+        assert_eq!(s.location(a.id), Some(Location::Host));
+        assert!(s.acquire(0, key(2)).is_ok());
     }
 
     #[test]

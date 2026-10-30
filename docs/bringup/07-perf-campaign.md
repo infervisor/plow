@@ -3,8 +3,20 @@
 > Turn a serving recipe into a **defensible, reproducible number**. Measure
 > latency and throughput versus concurrency and context on the whole served
 > model, behind a correctness battery, and consolidate the decision into
-> `perf-data/SUMMARY.md`. This is the final stage: its output is a reviewed
+> the campaign's `docs/bringup/results/<campaign>/comparison.md`. This is the final stage: its output is a reviewed
 > campaign result, not another tuning round.
+
+> **HARD RULE.** Perf iteration happens on a single block (one layer or the
+> smallest span containing each touched layer kind, at the served shape,
+> precision, flags, rung width and context) against a calibrated
+> bandwidth/compute roofline for that block — [Stage 5](05-single-block-sweep.md)
+> and [agent-tools.md](agent-tools.md) "HARD RULE" name the harness and its
+> gaps. Whole-network `step_bench`, FP32 gates and the serving measurements of
+> this stage run only for candidates that already won at block level. Every
+> campaign report starts with the block-vs-roofline table: block time, roofline
+> floor, % of floor, delta vs current. The comparator is the same-concurrency
+> vLLM peer, never plowrt's own production packet, and a loss against it is open
+> perf work, not an accepted result.
 
 **Precondition:** Stage 6 complete — the model serves at its target concurrency
 with a recorded recipe (`plowrt serve` command line + `PLOW_*` knobs + measured
@@ -18,7 +30,7 @@ filled in and is part of the campaign header: a campaign is a statement about
 **Gate out (bringup complete):** the correctness battery passes (token-identity
 gate + at least one accuracy number), the performance targets are met and
 measured — same-session, uncontended, concurrency- and context-swept — and the
-campaign is consolidated in `perf-data/SUMMARY.md`. Raw files, logs, and
+campaign is consolidated in the campaign's `docs/bringup/results/<campaign>/comparison.md`. Raw files, logs, and
 commands remain in `$RESULTS` on campaign storage. When this gate passes, the
 model is brought up.
 
@@ -41,7 +53,11 @@ campaign at the recipe you gated on.
 Three properties separate a campaign number from a benchmark you can't trust:
 
 * **Same-session.** Both engines (plow and any comparator) measured in **one
-  lease, one session, on one box**, interleaved. A stored CSV is not a baseline:
+  lease, one session, on one box**, interleaved. Exception that saves GPU time:
+  a captured vLLM peer is reused, never recaptured for a screen, while its
+  recorded provenance (box, GPU, vLLM version and flags, client, traffic seeds;
+  `serving_comparison.py record`) matches the plow arm's; a final report still
+  goes through `campaign.py report`. A stored CSV without that provenance is not a baseline:
   one recorded campaign has a comparator number moving **33% (7.57 → 10.03 ms)**
   on re-measure, which silently re-rated every ratio in that directory
   (`perf-data/plow-gfx942/README.md`). Re-baselining both engines in one session
@@ -147,9 +163,10 @@ Before any number, confirm the box:
   already cost real campaigns: a client-only benchmark shell being mistaken for
   an engine (a CPU-only build measures nothing about the GPU), and the vendor's
   supported engine shipping only as a container image on a host with no
-  container runtime. If no sound comparator exists, say so **here**, scope the
-  campaign to self-comparison against plow's own prior revision, and do not let
-  a stored or cross-hardware number stand in for it later.
+  container runtime. If no sound comparator exists, say so **here**: the
+  campaign then makes no comparative or qualification claim (plow's own prior
+  revision is not a baseline), and a stored or cross-hardware number does not
+  stand in for it later.
 
 ### 1. Correctness battery (before ANY performance cell)
 
@@ -342,7 +359,7 @@ been recorded wrongly before:
 Write raw JSON/JSONL, logs, command manifests, binaries, and intermediate
 reducers to `$RESULTS` on campaign NVMe. Disposable screens may use `/dev/shm`.
 Do not make the repository an append-only raw-results store. After review,
-update `perf-data/SUMMARY.md` and retain only compact CSV inputs that directly
+update the campaign's `docs/bringup/results/<campaign>/comparison.md` and retain only compact CSV inputs that directly
 support its decisions. Every retained row names the external campaign location
 or the last Git commit containing its complete artifact set.
 
@@ -390,7 +407,7 @@ The model completes bringup when **all** hold:
    same-session number.
 4. **Swept, not single-point.** A concurrency ladder and a context ladder, not
    one cell.
-5. **Consolidated.** `perf-data/SUMMARY.md` contains the header, honesty banner,
+5. **Consolidated.** The campaign's `docs/bringup/results/<campaign>/comparison.md` contains the header, honesty banner,
    decision tables, per-model limiter, open-work list, and pointers to external
    raw evidence. Any retained CSV directly supports one of those entries.
 6. **The target is on the record.** The write-up names `$GPU`, `$ISA`, `$NCU`,
@@ -445,6 +462,8 @@ The model completes bringup when **all** hold:
 * **Standalone probes overstate** (THE PROBE LAW): in recorded cases a +15%
   probe was −3 ms in-model, and an isolated GEMV scored a lever 1.00× where the
   megakernel measured 1.43×. A campaign quotes only in-model, in-serve numbers.
+  This is not a licence to iterate on the whole network: the in-model screen is
+  the single block (Stage 5, tier 2), the probe law applies to tier-1 kernels.
 * **A number from another part is not a target.** Prior campaigns in
   `perf-data/` are attributed to the box they ran on; reuse their *method*, and
   re-measure their *values* on `$GPU`. Two parts at the same `$ISA` differ here
@@ -496,7 +515,7 @@ The unified campaign driver in `scripts/campaign/campaign.py` orchestrates the c
 |---|---|
 | `scripts/bench/plowbench-doctor.sh` | pre-flight environment & artifact verification (target-aware sm_90a/120/89 vs gfx942/950) |
 | `scripts/bench/plowbench.sh` | canonical bench library: port allocation, server lifecycle, arch detection, artifact checks |
-| `scripts/campaign/campaign.py` | unified campaign driver: `build`, `serve`, `bench`, `probe`, `cert`, `compare`, `roofline`, `loop`, `sweep`, `ledger` |
+| `scripts/campaign/campaign.py` | unified campaign driver: `build`, `qualify`, `serve`, `bench`, `probe`, `gate`, `report`, `rung-sweep`, `cert`, `compare`, `roofline`, `loop`, `sweep`, `ledger`, `block-*` (`--help`) |
 | `scripts/campaign/roofline.py` | roofline analysis, memory bandwidth/compute ceilings, and bottleneck diagnostics |
 | `crates/costmodel/src/roofline.rs` | in-tree Rust cost model roofline analysis module |
 | `perf-data/tools/gpulease` | advisory lease + contention audit (rc=76 = contended) |
@@ -508,7 +527,7 @@ The unified campaign driver in `scripts/campaign/campaign.py` orchestrates the c
 | `perf-data/consolidate_b2_ib.py`, `b2-ib/{slo_capacity,summarize}.py` | raw report JSON → `b2-concurrency-*.json`, max-users-under-SLO |
 | `scripts/bench_gsm8k.sh` | whole-stack accuracy battery (GSM8K 8-shot greedy) |
 | `$RESULTS` | external raw JSON/JSONL, logs, command manifests, and binary evidence |
-| `perf-data/SUMMARY.md` | consolidated decisions, current gaps, retained CSV inventory, and method changes |
+| `docs/bringup/results/<campaign>/comparison.md` + `comparison.csv` | qualified wins and matched serving rows (`perf-data/SUMMARY.md` was deleted in 3fdd322b); a final plow-vs-baseline table comes only from `campaign.py report` (`agent-tools.md`, "Final performance report (strict)") |
 
 Architecture reading: `docs/arch/06-runtime.md` (execution model),
 `docs/arch/11-tuning-coverage.md` and `docs/arch/12-using-the-tuner.md` (what the

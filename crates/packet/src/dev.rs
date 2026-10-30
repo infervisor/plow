@@ -188,8 +188,10 @@ pub enum DevOp {
     /// `t0=Opart(f32) t1=mlpart(f32) t2=Q t3=K t4=V t5=O_final?` ·
     /// `i0=n_q i1=n_kv i2=n_head i3=n_kv_head i4=q_pos0 i5=window i6=hd i7=nsplit` ·
     /// `f0=scale j0=kv_stride j1=kv_mask`.
-    /// `window = 0` is full causal. `hd` must be 256 or 512.
-    /// For Gemma `scale = 1.0` — there is NO `1/sqrt(head_dim)`.
+    /// `window = 0` is full causal. `hd` selects a compiled instantiation (64/128/256/512,
+    /// per backend and object); an `hd` with no arm traps. `f0 = scale` is applied as given:
+    /// the emitter supplies the model's softmax scale (e.g. 1.0 for Gemma-4, which has no
+    /// `1/sqrt(head_dim)`).
     ///
     /// This spec read `t0=O t1=Q t2=K t3=V` until 2026-07-29 and was STALE: it
     /// predates the split-K epilogue that added `Opart`/`mlpart` and moved the
@@ -576,14 +578,14 @@ pub enum DevOp {
     MoeGroupDownFp8Blk = 49,
 
     // ===== DeepSeek MLA (Multi-head Latent Attention) — flash READ path. =====
-    // Opcodes 50+, mirroring `runtime/common/dev_isa.h` (sparse-attn-design.md §4
-    // renumbered into the free band above MoE). The WRITE path reuses existing ops
+    // Opcodes 50+, mirroring `runtime/common/dev_isa.h` (the free band above MoE; design:
+    // docs/arch/29-techniques.md, MLA). The WRITE path reuses existing ops
     // (GEMV/GEMM for the c_kv/k_rope down-projections, HEADNORM_ROPE for the shared
     // rope key). These carry the latent geometry as compile-time-fixed operands; the
     // interpreter dispatches `d_flash_mla_decode<512,64,8>` (DK=kv_lora_rank=512,
     // DR=qk_rope_dim=64, GF=8 head-fusion). FLASH_MLA_MERGE is not a new opcode — the
     // latent-wide LSE merge reuses [`DevOp::FlashMerge`] at `hd=512`.
-    /// MLA latent flash decode (`sparse-attn-design.md §2.3`). Per head g, kv row j:
+    /// MLA latent flash decode. Per head g, kv row j:
     /// `score[g] = q_abs[g]·C_kv[j] + q_rope[g]·K_rope[j]`, online softmax, then
     /// `oacc[g] += p[g]·C_kv[j]` (PV accumulates on the latent). Emits latent-wide
     /// `(O_partial,m,l)` for [`DevOp::FlashMerge`] at `hd=512`; [`DevOp::OUvFold`]
@@ -614,22 +616,24 @@ pub enum DevOp {
     /// [`DevOp::FlashMlaDecodeFp8`] puts its per-row scale strip in `t7`. plowc refuses the
     /// combinations.
     FlashMlaDecode = 50,
-    /// MLA prefill MFMA twin — not yet built (reserved so the ABI is stable).
+    /// MLA latent prefill: AMD `exec_flash_mla_prefill` (interp.hip), emitted for Kimi K3's MLA
+    /// layers (`k3.rs`). No NVIDIA arm.
     FlashMlaPrefill = 51,
-    /// Per-head `W_uv` fold (`sparse-attn-design.md §2.5`): `o[b][h][v] =
+    /// Per-head `W_uv` fold: `o[b][h][v] =
     /// Σ_l O_latent[b][h][l]·W_uv[h][l][v]` — the O(n_q) query-side epilogue that folds
     /// the merged latent accumulator down to `v_head_dim`. `W_uv` is `[n_head][DK][V]`
     /// (l-major), the reduction runs `l=0..DK` in order (bit-exact to reference).
     /// `t0=O t1=Olat t2=Wuv` · `i0=n_batch i1=n_head i2=V`.
     OUvFold = 52,
 
-    // ===== Sparse top-k DSA (sparse-attn-design.md §3). =====
-    /// On-device top-k KV selection (`sparse-attn-design.md §3.2`) — the attention twin
+    // ===== Sparse top-k DSA (docs/arch/29-techniques.md, DSA). =====
+    /// On-device top-k KV selection — the attention twin
     /// of the MoE routing table. Scores the indexer queries against the index keys,
     /// keeps the top-k KV row indices per query (deterministic lowest-index tie-break),
-    /// writes the `idx` table [`DevOp::FlashGatherDecode`] reads. Reserved; body TBD.
+    /// writes the `idx` table [`DevOp::FlashGatherDecode`] reads. AMD body `d_attn_select`
+    /// (interp.hip); no emit site yet.
     AttnSelect = 53,
-    /// Gathered flash decode (`sparse-attn-design.md §3.3`) — the MLA latent flash
+    /// Gathered flash decode — the MLA latent flash
     /// reading ONLY the `top_k` selected latent rows via the `idx` table (the
     /// `GATHER=true` instantiation of `d_flash_mla_decode`). Everything else (absorbed
     /// score, online softmax, split, merge) is byte-identical to the dense MLA decode.
@@ -637,7 +641,7 @@ pub enum DevOp {
     /// t7=idx(i32)` · `i0=n_batch i1=n_head i2=kv_stride i4=nsplit i5=kv_mask i6=top_k` ·
     /// `f0=scale`.
     FlashGatherDecode = 54,
-    /// Gathered flash prefill — reserved, not yet built.
+    /// Gathered flash prefill: AMD `exec_flash_mla_prefill` with the gather table; no emit site yet.
     FlashGatherPrefill = 55,
 
     /// ROUTER TOP-K tail (the router SPLIT). The score matmul `logit = x·Wr` is now the ordinary
@@ -664,7 +668,7 @@ pub enum DevOp {
     /// `n_head`-wide slice — see `runtime/amd/interp.hip`'s `exec_mla_merge_fold`.
     MlaMergeFold = 57,
 
-    // ===== DSA lightning indexer (GLM-5.2 GlmMoeDsa; sparse-attn-design.md §3.1, arXiv 2512.02556
+    // ===== DSA lightning indexer (GLM-5.2 GlmMoeDsa; arXiv 2512.02556
     // eq.1). The two ops that PRODUCE the `idx` table [`DevOp::FlashGatherDecode`] gathers over —
     // scoring the pre-projected/pre-RoPE'd indexer q/k, then the top-k radix select. =====
     /// Lightning-indexer SCORE (`d_index_score`/`d_index_score_fast`). For every KV position `t`,
@@ -933,7 +937,7 @@ pub enum DevOp {
     // The chunked prefill scan of §7.6 is deliberately ABSENT. `KdaStateStep` takes a serial-`T`
     // loop, which is the reference `fused_recurrent` algorithm at any `T` and is exact; the
     // chunked form is a matmul-bound rewrite of a path that then already works. An opcode declared
-    // before its kernel exists is how op 90 became dead code.
+    // before its kernel exists is how op 90 ended up block-only (Nemotron-H extraction, sm_120).
     /// KDA causal depthwise short conv + SiLU over the concatenated `q|k|v` projections.
     ///
     /// Three independent width-`i2` depthwise convs over `H*D` channels each (`groups =
@@ -3271,6 +3275,11 @@ pub struct DevInst {
 /// Wire sentinel for an absent tensor operand in [`DevInst64::t`]. The u16 twin
 /// of [`TENSOR_NONE`]; usable handles are `0..0xFFFE`.
 pub const TENSOR_NONE16: u16 = 0xFFFF;
+
+/// `QuantFp8` `i3` / `GemmFp8` `i5`: block-scaled FP8 (the published checkpoints' format): 1x128
+/// activation groups (`QuantFp8` writes f32 scales `[K/128][i4]`, `i4` = rows padded to 4) and
+/// 128x128 weight blocks (`GemmFp8` `t4` = f32 `[N/128][K/128]`). Runs on cuBLASLt only.
+pub const FP8_BLOCK_GROUP: u32 = 128;
 
 /// One instruction, WIRE format. Fixed 64-byte stride — no variable-length
 /// records on device. Byte-for-byte mirror of `PlowDevInst` in

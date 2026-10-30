@@ -808,7 +808,7 @@ def cmd_reference(a):
                 weights=weights, dtype="float32", tf32=False, attention="fp32 chunked math",
                 dequant="fp8_e4m3 weight x per-channel or [128,128]-block scale in fp32", torch=torch.__version__,
                 transformers=transformers.__version__, device=(torch.cuda.get_device_name() + (" + host offload" if a.device == "offload" else "")) if dev == "cuda" else f"cpu ({torch.get_num_threads()} threads)",
-                utc=time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), top=TOP, eos=eos)
+                utc=time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), top=TOP, eos=sorted(eos))
     Path(a.out).write_text(json.dumps(dict(meta=meta, cases=cases)))
     print(f"reference: {len(cases)} cases -> {a.out} sha256 {file_sha(a.out)}")
 

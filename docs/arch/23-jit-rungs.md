@@ -127,8 +127,9 @@ faulted on the 1 KiB device stack), so a new width needs its own qualification r
 
 **Modular block packets are metadata only today.** `emit.block_packets` / `pf_modular` add a JSON
 section whose entries all name the same whole-model `program_idx`; no emitter sets
-`ProgramRole::ModularBlock`, `DevBlob::modular_block_progs` has no caller, and `rt.block_packets`,
-`rt.pf_modular` and `rt.block_stage` are declared but never read in `plowrt`. Real single-block
+`ProgramRole::ModularBlock` outside tests, `DevBlob::modular_block_progs` has no caller, and the
+knobs that control them are emit-side only (`emit.block_packets`, `emit.pf_modular`,
+`emit.block_stage` in `crates/devgen/src/knob_spec.rs`); `plowrt` reads none of them. Real single-block
 programs exist only as the `--block l..r` harness artifact. "Emit one block, reuse it for every
 layer" runs into per-layer tensor handles and immediates, cross-layer seam fusions (AddNorm uses
 the next layer's gamma; `fuse_nrn` is off in block mode), and Gemma-4's two layer kinds plus

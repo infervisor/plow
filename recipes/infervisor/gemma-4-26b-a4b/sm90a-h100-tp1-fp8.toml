@@ -2,11 +2,13 @@
 # 128 decode slots, prefix cache on. Production recipe for this model/GPU/precision.
 #
 # Checkpoint: hub LargitData/gemma-4-26b-a4b-it-fp8 @ 2398f3b38d1b2e56d14498f7da3a74bada8cddff
-# (compressed-tensors W8 per-channel / A8 dynamic per-token; shard sha256 aeb3c810..., e5efcdd2...),
+# (compressed-tensors W8 per-channel / A8 dynamic per-token; shard sha256 aeb3c810..., e5efcdd2...);
+# drafter: hub google/gemma-4-26B-A4B-it-assistant (model.safetensors sha256 006c8713...),
 # re-keyed to plow's fp8/ contract without requantizing:
 #   python3 scripts/gemma4_fp8_hub_rekey.py <hub snapshot> <re-keyed dir>
-#   python3 scripts/quantize_fp8_head.py <re-keyed dir> <re-keyed dir>   (PLOW_FP8_HEAD twin: writes the
-#   0.74 GB model-head.safetensors beside model.safetensors; plowrt refuses a packet whose checkpoint lacks it)
+# The packet loads the published weights only (2026-10-30 rule: no plow-converted tensors; exact BF16 -> F32
+# scale widening and renames are allowed). The lm_head is the published BF16 tied embedding; the drafter
+# is the published BF16 assistant (model-mtp.safetensors: renames plus the exact pre_projection split).
 #   PLOW_CAMPAIGN_NO_NIX=1 (box without nix only) PLOW_FP8_CKPT=<re-keyed dir> \
 #   python3 scripts/campaign/campaign.py build recipes/infervisor/gemma-4-26b-a4b/sm90a-h100-tp1-fp8.toml --out <fresh dir>
 #
@@ -65,13 +67,17 @@ max_ctx = 131072
 toolchain = "cuda-12.9"
 
 [checkpoint]
-source = "gemma-4-26b-a4b-it-fp8"
+source = "hf:LargitData/gemma-4-26b-a4b-it-fp8"
+revision = "2398f3b38d1b2e56d14498f7da3a74bada8cddff"
+sha256 = { "model-00001-of-00002.safetensors" = "aeb3c810035ce85853a1be7dd348f2f73d1417959d623a882e51522de7b1fdf1", "model-00002-of-00002.safetensors" = "e5efcdd24651d5061d49178ba88b86dac518729d25e84f1879d15570852806c6" }
+draft = "hf:google/gemma-4-26B-A4B-it-assistant"
+draft_sha256 = { "model.safetensors" = "006c8713b29b046e296c0f0b7c524aa9264ae07ae8b0c3888b9bc062242297ff" }
 layout = "plow-fp8-hub-rekey"
 
 [cell]
 name = "gemma4-26b-a4b.h100.fp8-16k-c128"
-model = "gemma-4-26b-a4b-it-fp8 (compressed-tensors, re-keyed)"
-revision = "local"
+model = "LargitData/gemma-4-26b-a4b-it-fp8 (compressed-tensors, re-keyed)"
+revision = "2398f3b38d1b2e56d14498f7da3a74bada8cddff"
 hf_dir = "{env:PLOW_FP8_CKPT}"
 gpu = "H100 SXM5"
 arch = "sm_90a"
@@ -118,6 +124,14 @@ PLOW_EMIT_DECODE_CUBLASLT = "1"
 # hit the production packet too: no clear regression vs production, but no c32 PASS either. Held until a
 # c32 gate policy (margin or baseline-relative acceptance) is decided. Evidence: /opt/dlami/nvme/lava-tts/route-sweep (B/g26fp8-lt64,
 # B/g26fp8-lt8, B/g26fp8-lt128, gates/g26fp8-lt64, gates/g26fp8-long, gates/g26fp8-c32, gates/g26fp8-c32r, peer32).
+# 2026-10-28, perf-for-accuracy rule (docs/bringup/agent-tools.md "Gate relaxation for significant
+# perf gains") at c32 vs the c32 peer: gain qualifies (rung 32 -9..-14%), accuracy does not. Bounds
+# kl_trim <= 0.1408, kl_p95 <= 0.950, top1_decisive >= 0.9602, cont_decisive >= 38 of 46, needle 1;
+# variant runs kl_trim 0.1502/0.1442/0.1422 (0 of 3), kl_p95 0.997/0.972/0.920 (1), top1_decisive
+# 0.9532/0.9582/0.9572 (0), cont_decisive 36/38/36 (1): no run within every bound -> NOT applied,
+# thresholds unchanged. The production control misses the same bounds (kl_trim 0.1434/0.1465/0.1518,
+# top1 0.9592/0.9622/0.9572, cont 36/37/37: 0 of 3), so at c32 this rule cannot separate the route
+# from the base packet; a baseline-relative c32 criterion stays a user decision.
 PLOW_EMIT_DECODE_CUBLASLT_MIN_ROWS = "32"
 PLOW_EMIT_DECODE_CUBLASLT_HEAD = "1"
 PLOW_EMIT_PREFILL_CUBLASLT = "1"
@@ -161,20 +175,10 @@ PLOW_EMIT_MOE_PF_LT = "1"
 # 0.9602 vs ctrl 0.9642; long gate PASS: kl_mean 0.1627 vs ctrl 0.1515 / vLLM 0.165, kl_p99 3.18, top1 0.9638.
 # Evidence: g26-pfrung REPORT.md sections 6 and 13-14 (res2, ab/g-p1, ab/gl-p1).
 PLOW_NO_GLU_FUSE = "1"
-# Decode lm_head on rungs 1-16 reads a per-row e4m3 twin of the tied embedding (GemvFp8 + SoftCap + Argmax; the
-# embedding gather, the prefill terminal and the cuBLASLt head at >= 32 rows keep bf16). Qualified 2026-10-17 on
-# the kit plowrt 16c08ef8: step_bench ctx 6144 B1/B2/B4/B8/B16 4.611/5.334/6.311/7.415/9.797 -> 4.403/5.093/
-# 6.120/7.162/9.614 ms, B32-128 digests identical. c16 FP32 gate 3+3 runs PASS: kl_trim_mean 0.1300/0.1307/0.1310
-# vs ctrl 0.1255/0.1298/0.1422, kl_p95 0.92/0.92/0.92 vs 0.83/0.85/1.03, top1_decisive 0.960/0.959/0.960 vs
-# 0.962/0.954/0.958, over 203/218/202 vs 200/202/211; c1 (deterministic) trim 0.1441 vs 0.1390, p95 0.99 vs 0.89,
-# top1 0.959 vs 0.962, within every c16 limit. Prod-fidelity replay 1.8/s: TPOT p50/p99 10.55/20.52 -> 9.88/19.39 ms,
-# TTFT p50/p99 45.9/247.0 -> 43.6/242.7 ms, cached 79.8%, 0 errors. A fused FP8 GemvArgmax measured slower than
-# this unfused chain (B2 +0.10 ms). Evidence: /opt/dlami/nvme/lava-tts/g26-perf-push/g26-lmhead-fp8.
-PLOW_FP8_HEAD = "1"
 
 [objects]
 script = "scripts/build_sm90a_gemma4_segments.sh"
-role_files = ["gen_sm90a_attn_pf_hd256_sliding_fp8kv.cubin", "gen_sm90a_attn_pf_hd512_fp8kv.cubin"]
+role_files = ["gen_sm90a_attn_pf_hd256_sliding_fp8kv.cubin", "gen_sm90a_attn_pf_hd512_fp8kv.cubin", "plow_fa4_hd512.aot"]
 [objects.env]
 PLOW_BUILD_FATLITE = "1"
 PLOW_BUILD_W8A8 = "1"
@@ -184,8 +188,27 @@ PLOW_BUILD_PFATTN_HD256_BKV32 = "0"
 PLOW_BUILD_PFATTN_HD256_GQA2_BKV32 = "0"
 PLOW_BUILD_PFATTN_HD512_PX4_BQ64 = "0"
 PLOW_BUILD_GEN_KERNELS = "attn_pf_hd256_sliding_fp8kv,attn_pf_hd512_fp8kv"
+# Global (hd512) prefill attention through the library route (plowrt exec/gpu/lib_attention.rs,
+# docs/arch/28): FlashAttention-4's SM90 forward exported AOT as cubins into
+# objects/plow_fa4_hd512.aot with the FP8 KV page-gather cubin, launched by plowrt itself
+# (scripts/fa4_aot/build.py); the packet declares the route on every FlashPrefillFp8 hd512 segment
+# (byte-reproducible builds; the export needs PYREF with vLLM's vllm_flash_attn and the CuTe DSL). Qualified 2026-10-29 on
+# lib-attn bin3 4b261f8a, packet caf6c4a47ba6: one 16000-token prompt, packed prefill chunk
+# 128/512/1024/2048 2.32/0.74/0.51/0.42 -> 1.99/0.68/0.46/0.37 s (-15/-8/-8/-11%), bit-deterministic.
+# FP32 gate vs same-concurrency vLLM 0.28 peers: c1 PASS kl_trim 0.1214 (peer 0.1337) p95 0.868
+# (1.005) top1 0.9652 (0.9562) cont 0.8043 (0.7826); c8 PASS 0.1453 (0.1284) p95 0.919 (0.961)
+# top1 0.9652 (0.9602) cont 0.8478 (0.8696); c16 PASS 0.1381 p95 1.085 top1 0.9672; c32 2 of 3 PASS:
+# kl_p95 1.216/0.972/0.939 (limit 1.12 = peer 0.8945 x 1.25), kl_trim 0.151/0.146/0.134, against
+# native on the same binary 3 of 3 PASS kl_p95 1.051/0.985/0.981, kl_trim 0.151/0.145/0.153 (the
+# miss is the c32 re-roll, thresholds unchanged). Prod-fidelity replay 1.8/s, 2 reps, vs the vLLM
+# 0.29 arm: TTFT P99 260.7 ms (0.71x), TPOT P99 22.3 ms (0.69x), throughput 1.00x, SLO 100%.
+# Evidence: /opt/dlami/nvme/lava-tts/lib-attn/promo (gate-g26, ctl, prod-g26-lib).
+PLOW_BUILD_FA4_HD512 = "1"
 
 [emit_roles.env]
+# The packet declares the library route on every prefill rung (lib-attn2; plowrt runs only what
+# the packet declares).
+PLOW_EMIT_ATTN_LIBRARY = "1"
 PLOW_GEMMA4_SM90_W8A8_GEMM_GLU_ROLE = "0"
 PLOW_GEMMA4_SM90_HD512_PX4_BQ64_ROLE = "0"
 PLOW_GEMMA4_SM90_HD256_GQA2_ROLE = "0"
@@ -210,7 +233,6 @@ PLOW_PF_INTERLEAVE = "0"
 PLOW_VMM_LIVE_RINGS = "1"
 PLOW_MULTISTEP = "0"
 PLOW_DECODE_MAX_RUNG = "128"
-PLOW_TOKEN_BATCH = "1"
 PLOW_LT_FP8_FAST_ACCUM_MAX_K = "8192"
 # Compact prefill terminal lm_head on the interpreter, not cuBLASLt (the rows=[128] terminal plan takes its own
 # algorithm). 2026-10-16 g26-attr3 on the 9641938b plowrt, c16 FP32 gate, all five serve knobs, 6 runs per arm vs
@@ -227,7 +249,6 @@ PLOW_LT_RUNG_ALGOS = "true"
 # 12 of 15 prompts vs 7 with it on.
 PLOW_PF_ITL_BUDGET_MS = "60"
 PLOW_DECODE_PIPELINE = "1"
-PLOW_VMM_RING_PARK = "8"
 PLOW_PF_ADMIT_OVERLAP = "1"
 PLOW_PF_ITL_FORCE = "0"
 PLOW_VMM_STRICT_PUBLISH = "1"
@@ -241,8 +262,8 @@ PLOW_VMM_STRICT_PUBLISH = "1"
 PLOW_KV_POOL_MIB = "2048"
 
 # Speculative decoding drafter (Gemma-4 assistant MTP, 4 layers over target layers 28/29 KV): emit = true builds span
-# verify (decode objects plus their `_rs` row-slot twins) and the draft programs into the packet, draft_fp8 = "all" binds
-# the per-row e4m3 twins of every draft GEMV and the head (model-mtp-fp8.safetensors), serve = true makes PLOW_SPEC=1 the
+# verify (decode objects plus their `_rs` row-slot twins) and the draft programs into the packet, the drafter reads the
+# published BF16 assistant weights (no FP8 twins since 2026-10-30), serve = true makes PLOW_SPEC=1 the
 # packet's serve default. Spec runs on pure decode ticks (no prefill, nothing queued) of <= 16 verify rows.
 # Qualified 2026-10-20 (g26-mtp P3, plowrt e41abda0; evidence /opt/dlami/nvme/lava-tts/g26-mtp/P3-DESIGN.md "Results",
 # p3/{g1,ga,gb,gc,s1}): plain decode on the twin packet = Kit 1 (ctx 6144 B1..B128 within noise, TOK_STREAM digests
@@ -258,7 +279,6 @@ draft_revision = "hub 6e5aaaf4; model.safetensors sha256 006c8713b29b046e296c0f0
 shard_sha256 = "9e899298473493a366df2548e5f4398e17237394df3b9715583457718048b314"
 k_max = 7
 rows = [1, 2, 4, 8, 16]
-draft_fp8 = "all"
 emit = true
 serve = true
 

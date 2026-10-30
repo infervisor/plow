@@ -10,6 +10,8 @@ pub(super) struct DecodeSegment {
     pub(super) output_bytes: u64,
     pub(super) input_bytes: u64,
     pub(super) weight_bytes: u64,
+    /// Block-scaled FP8 ([`packet::dev::FP8_BLOCK_GROUP`]): cuBLASLt runs `m` padded to 4.
+    pub(super) block: bool,
 }
 
 pub(super) struct CublasLtDecodeRoute {
@@ -368,6 +370,8 @@ pub(super) struct LightFunctions {
     /// `plow_<arch>_light_attn_s`: the hd256 attention alone, two blocks per SM.
     attn_s: Option<KernelFn>,
     fp8_flash256: Option<(KernelFn, u32)>,
+    /// `plow_<arch>_light_router`, its arena and `plow_light_router_ops` (the opcodes it runs).
+    router: Option<(KernelFn, u32, u32)>,
     /// `plow_<arch>_light_head` (unaligned lm_head tail).
     pub(super) head: Option<KernelFn>,
     /// `plow_<arch>_light_flash` (streamed hd128 FlashDecode) and its smem.
@@ -376,6 +380,8 @@ pub(super) struct LightFunctions {
     pub(super) prefill: Option<KernelFn>,
     /// `plow_light_pf_qwen_conv`: `light_pf` also runs the Qwen decode conv step.
     pub(super) prefill_conv: bool,
+    /// `plow_<arch>_light_qnorm`: a routed decode rung's QwenRmsNorm, register-resident rows.
+    pub(super) qwen_norm: Option<KernelFn>,
 }
 
 /// `FA_ST_THREADS`: eight row-group warps and the producer warp.
@@ -439,6 +445,10 @@ pub(super) fn light_functions(
         .get_function(module, &format!("plow_{arch}_light_pf"))
         .ok()
         .filter(|_| crate::config::RuntimeConfig::get().nv.prefill_light);
+    let qwen_norm = prefill.and_then(|_| {
+        be.get_function(module, &format!("plow_{arch}_light_qnorm"))
+            .ok()
+    });
     let prefill_conv = prefill.is_some()
         && be
             .module_global_u32(module, "plow_light_pf_qwen_conv")?
@@ -454,6 +464,17 @@ pub(super) fn light_functions(
             .ok()
     } else {
         None
+    };
+    let router = match (
+        be.module_global_u32(module, "plow_light_router_smem")?,
+        be.module_global_u32(module, "plow_light_router_ops")?,
+    ) {
+        (Some(smem), Some(ops)) if abi == Some(2) => {
+            let f = be.get_function(module, &format!("plow_{arch}_light_router"))?;
+            be.set_max_dynamic_smem(f, smem)?;
+            Some((f, smem, ops))
+        }
+        _ => None,
     };
     let attn_s = match be.get_function(module, &format!("plow_{arch}_light_attn_s")) {
         Ok(f) if crate::config::RuntimeConfig::get().nv.decode_light_attn_s => {
@@ -473,11 +494,30 @@ pub(super) fn light_functions(
         attn,
         attn_s,
         fp8_flash256,
+        router,
         head,
         flash,
         prefill,
         prefill_conv,
+        qwen_norm,
     }))
+}
+
+impl LightFunctions {
+    /// `Some(scoped)` when `plow_<arch>_light_router` runs `d` (`scoped`: a router-window opcode
+    /// that makes a segment a router window; RmsNorm and QuantFp8 only ride along).
+    fn router_op(&self, d: &packet::dev::DevInst64) -> Option<bool> {
+        let (_, _, ops) = self.router?;
+        let (bit, scoped) = match DevOp::from_u16(d.op)? {
+            DevOp::RmsNorm => (1, false),
+            DevOp::MoeRouterGemmaScoreFast => (2, true),
+            DevOp::MoeRouterGemmaTopk => (4, true),
+            DevOp::MoeAlignGemmaPf => (8, true),
+            DevOp::QuantFp8 => (16, false),
+            _ => return None,
+        };
+        (ops & bit != 0).then_some(scoped)
+    }
 }
 
 fn fp8_attention_tail(d: &packet::dev::DevInst64) -> bool {
@@ -602,6 +642,19 @@ pub(super) fn light_segments(
                 {
                     return Some((seg, vec![(inst, 0)]));
                 }
+            }
+            if functions.gemma
+                && insts.iter().any(|&i| {
+                    functions
+                        .router_op(&g.insts[i])
+                        .is_some_and(|scoped| scoped)
+                })
+                && insts.iter().all(|&i| {
+                    op(i) == Some(DevOp::NormResidualNorm)
+                        || functions.router_op(&g.insts[i]).is_some()
+                })
+            {
+                return Some((seg, insts.iter().map(|&i| (i, 0)).collect()));
             }
             let attn_hd = |hd: u32| functions.attn.is_some_and(|(_, _, hds)| hds.contains(&hd));
             let attn = functions.attn.is_some()
@@ -853,10 +906,12 @@ pub(super) fn qwen_light_instructions(light: &[(usize, Vec<usize>)]) -> Vec<(usi
         .collect()
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(super) fn add_qwen_light_routes(
     routes: &mut Vec<Option<LibraryRoute>>,
     be: &Arc<CudaBackend>,
     function: KernelFn,
+    norm: Option<KernelFn>,
     kernarg: DevProgram,
     g: &DevProg,
     light: &[(usize, Vec<usize>)],
@@ -866,9 +921,23 @@ pub(super) fn add_qwen_light_routes(
         if routes.len() <= *seg {
             routes.resize_with(seg + 1, || None);
         }
-        routes[*seg] = Some(LibraryRoute::Light(qwen_light_route(
-            be, function, kernarg, g, insts, grid,
-        )));
+        let mut route = qwen_light_route(be, function, kernarg, g, insts, grid);
+        if let Some(norm) = norm {
+            for launch in &mut route.launches {
+                let d = &g.insts[launch.instruction as usize];
+                // One block per row (i1 = rows): the body takes the block-per-row walk at any
+                // grid >= rows, and the 528-block light grid paid four waves of empty blocks.
+                // i0 = width; the register-resident walk covers 32 elements per thread.
+                if d.op == DevOp::QwenRmsNorm as u16
+                    && (1..=grid).contains(&d.i[1])
+                    && d.i[0] <= 32 * BLOCK
+                {
+                    launch.function = norm;
+                    launch.blocks = d.i[1];
+                }
+            }
+        }
+        routes[*seg] = Some(LibraryRoute::Light(route));
     }
 }
 
@@ -914,13 +983,23 @@ pub(super) fn prefill_glu_quant_route(
     route
 }
 
+/// Every layer's GLU quant writes the same activation, so another GLU quant naming it in its
+/// output slot (and nowhere else) is a writer, not a reader.
 fn glu_output_unread(g: &DevProg, inst: usize) -> bool {
     let output = g.insts[inst].t[1];
-    output != packet::dev::TENSOR_NONE16
+    let none = packet::dev::TENSOR_NONE16;
+    let glu_writer = |d: &packet::dev::DevInst64| {
+        d.op == DevOp::QuantFp8 as u16
+            && d.t[1] == output
+            && d.t[3] != none
+            && d.t[4] != none
+            && d.t.iter().filter(|&&t| t == output).count() == 1
+    };
+    output != none
         && g.insts
             .iter()
             .enumerate()
-            .all(|(i, d)| i == inst || !d.t.contains(&output))
+            .all(|(i, d)| i == inst || glu_writer(d) || !d.t.contains(&output))
 }
 
 /// Segments that are exactly a prefill NormResidual and the RmsNorm reading its output (the next
@@ -1216,6 +1295,20 @@ pub(super) fn add_light_routes(
     folds: &[ArgmaxFold],
     devp: &[DeviceMem],
 ) {
+    if functions.router.is_some() {
+        let router_segments = light
+            .iter()
+            .filter(|(_, levels)| {
+                levels.iter().any(|&(inst, n)| {
+                    n == 0
+                        && functions
+                            .router_op(&g.insts[inst])
+                            .is_some_and(|scoped| scoped)
+                })
+            })
+            .count();
+        tracing::info!(router_segments, "decode router windows as light launches");
+    }
     if functions.fp8_attn {
         let attention_segments = light
             .iter()
@@ -1337,22 +1430,33 @@ pub(super) fn add_light_routes(
                             smem,
                             direct,
                         },
-                        _ => LightLaunch {
-                            function: match (functions.tail, DevOp::from_u16(g.insts[inst].op)) {
+                        _ => {
+                            let (function, smem) = match (
+                                functions.tail,
+                                DevOp::from_u16(g.insts[inst].op),
+                                functions.router.filter(|_| {
+                                    n == 0 && functions.router_op(&g.insts[inst]).is_some()
+                                }),
+                            ) {
                                 (
                                     Some(tail),
                                     Some(DevOp::SoftCap | DevOp::Argmax | DevOp::ArgmaxFin),
-                                ) => tail,
-                                _ => functions.single,
-                            },
-                            xs,
-                            kind: LightKind::Single,
-                            instruction: inst as u32,
-                            blocks,
-                            block: BLOCK,
-                            smem: 0,
-                            direct,
-                        },
+                                    _,
+                                ) => (tail, 0),
+                                (_, _, Some((router, smem, _))) => (router, smem),
+                                _ => (functions.single, 0),
+                            };
+                            LightLaunch {
+                                function,
+                                xs,
+                                kind: LightKind::Single,
+                                instruction: inst as u32,
+                                blocks,
+                                block: BLOCK,
+                                smem,
+                                direct,
+                            }
+                        }
                     }
                 })
                 .collect::<Vec<LightLaunch>>(),
@@ -1628,8 +1732,6 @@ pub(super) enum ProjectionBackend {
 enum ProjectionPlan {
     Lt(Arc<crate::device::cuda::lt::Plan>),
     Native(native_decode::Plan),
-    /// Operands are bound into the plan's Params blob.
-    Cutlass(crate::device::cuda::cutlass_fp8::Plan),
     Folded,
 }
 
@@ -1638,7 +1740,6 @@ impl ProjectionPlan {
         match self {
             Self::Lt(p) => p.run(input, weight, output, stream),
             Self::Native(p) => p.run(input, weight, output, stream),
-            Self::Cutlass(p) => p.run(stream),
             Self::Folded => Ok(()),
         }
     }
@@ -1830,7 +1931,6 @@ pub(super) fn prepare_routes(
     let mut plans = std::collections::HashMap::new();
     let mut pair_plans = std::collections::HashMap::new();
     let mut fp8_plans = 0usize;
-    let mut cutlass_plans = 0usize;
     let mut pairs = 0usize;
     let mut index = 0;
     while index < segments.len() {
@@ -1873,8 +1973,21 @@ pub(super) fn prepare_routes(
                     "FP8 projection cannot fold an output head".into(),
                 ));
             }
+            let lt_m = if segment.block {
+                segment.m.next_multiple_of(4)
+            } else {
+                segment.m
+            };
+            let elements = if segment.block {
+                [
+                    (segment.k / 128) * lt_m,
+                    (segment.n / 128) * (segment.k / 128),
+                ]
+            } else {
+                [segment.m, segment.n]
+            };
             let mut scales = [0; 2];
-            for (index, (handle, elements)) in [(op.t[3], segment.m), (op.t[4], segment.n)]
+            for (index, (handle, elements)) in [(op.t[3], elements[0]), (op.t[4], elements[1])]
                 .into_iter()
                 .enumerate()
             {
@@ -1900,30 +2013,15 @@ pub(super) fn prepare_routes(
                 .nv
                 .lt_fp8_fast_accum_max_k
                 .is_some_and(|max_k| segment.k <= max_k);
-            let cutlass = match lt.cutlass_fp8().filter(|_| decode) {
-                Some(c) => c.plan(
-                    segment.m,
-                    segment.n,
-                    segment.k,
-                    [input, weight, output, scales[0], scales[1]],
-                    fast_k,
-                )?,
-                None => None,
-            };
-            let plan = match cutlass {
-                Some(plan) => {
-                    cutlass_plans += 1;
-                    ProjectionPlan::Cutlass(plan)
-                }
-                None => ProjectionPlan::Lt(lt.fp8_plan(
-                    segment.m,
-                    segment.n,
-                    segment.k,
-                    scales[1],
-                    scales[0],
-                    !decode && fast_k,
-                )?),
-            };
+            let plan = ProjectionPlan::Lt(lt.fp8_plan(
+                lt_m,
+                segment.n,
+                segment.k,
+                scales[1],
+                scales[0],
+                !decode && fast_k && !segment.block,
+                segment.block,
+            )?);
             fp8_plans += 1;
             insts[segment.instruction].op = DevOp::Nop as u16;
             routes.push(Some(CublasLtDecodeRoute {
@@ -2111,7 +2209,6 @@ pub(super) fn prepare_routes(
         projections = routes.iter().flatten().count(),
         plans = plans.len(),
         fp8_plans,
-        cutlass_plans,
         pairs,
         native = matches!(backend, ProjectionBackend::Native(_)),
         "projection routes prepared"
@@ -2358,6 +2455,15 @@ pub(super) fn prefill_segments(
     projection_segments(program, tensors, roles, ProjectionPhase::Prefill(profile))
 }
 
+/// The rows cuBLASLt reads and writes: the block-scaled route pads to 4.
+fn lt_rows(m: u32, block: bool) -> Option<u32> {
+    if block {
+        m.checked_next_multiple_of(4)
+    } else {
+        Some(m)
+    }
+}
+
 fn projection_segments(
     program: &DevProg,
     tensors: &[DevTensor],
@@ -2430,10 +2536,13 @@ fn projection_segments(
                 }
             }
         };
-        let valid_immediates = match phase {
-            ProjectionPhase::Decode => op.i[3..].iter().all(|&value| value == 0),
-            ProjectionPhase::Prefill(_) => op.i[3..6].iter().all(|&value| value == 0),
+        let block = fp8 && op.i[5] == packet::dev::FP8_BLOCK_GROUP;
+        let end = match phase {
+            ProjectionPhase::Decode => op.i.len(),
+            ProjectionPhase::Prefill(_) => 6,
         };
+        let valid_immediates = (3..end).all(|j| op.i[j] == 0 || (block && j == 5))
+            && (!block || op.i[6..].iter().all(|&value| value == 0));
         if !valid_op
             || op.t[if fp8 { 5 } else { 3 }..]
                 .iter()
@@ -2452,14 +2561,18 @@ fn projection_segments(
             return Err(fail());
         }
         let [m, n, k] = [op.i[0], op.i[1], op.i[2]];
+        if block && (n % 128 != 0 || k % 128 != 0) {
+            return Err(fail());
+        }
+        let lt_m = lt_rows(m, block).ok_or_else(fail)?;
         let bytes = |a: u32, b: u32| {
             u64::from(a)
                 .checked_mul(u64::from(b))
                 .and_then(|elements| elements.checked_mul(2))
                 .ok_or_else(fail)
         };
-        let output_bytes = bytes(m, n)?;
-        let input_bytes = bytes(m, k)? / if fp8 { 2 } else { 1 };
+        let output_bytes = bytes(lt_m, n)?;
+        let input_bytes = bytes(lt_m, k)? / if fp8 { 2 } else { 1 };
         let weight_bytes = bytes(n, k)? / if fp8 { 2 } else { 1 };
         if fp8 {
             if op.t[..5]
@@ -2471,7 +2584,15 @@ fn projection_segments(
             {
                 return Err(fail());
             }
-            for (handle, required) in [(op.t[3], u64::from(m) * 4), (op.t[4], u64::from(n) * 4)] {
+            let scales = if block {
+                [
+                    (op.t[3], u64::from(k / 128) * u64::from(lt_m) * 4),
+                    (op.t[4], u64::from(n / 128) * u64::from(k / 128) * 4),
+                ]
+            } else {
+                [(op.t[3], u64::from(m) * 4), (op.t[4], u64::from(n) * 4)]
+            };
+            for (handle, required) in scales {
                 if tensors
                     .get(handle as usize)
                     .is_none_or(|tensor| tensor.bytes < required)
@@ -2503,6 +2624,7 @@ fn projection_segments(
             output_bytes,
             input_bytes,
             weight_bytes,
+            block,
         });
     }
     Ok(routes)
@@ -2512,6 +2634,15 @@ fn projection_segments(
 mod tests {
     use super::*;
     use packet::dev::{DevInst64, StreamEnt};
+
+    #[test]
+    fn block_fp8_row_padding_refuses_overflow() {
+        assert_eq!(lt_rows(5, true), Some(8));
+        assert_eq!(lt_rows(8, true), Some(8));
+        assert_eq!(lt_rows(u32::MAX - 3, true), Some(u32::MAX - 3));
+        assert_eq!(lt_rows(u32::MAX - 2, true), None);
+        assert_eq!(lt_rows(u32::MAX, false), Some(u32::MAX));
+    }
 
     #[test]
     fn prefill_light_launches_take_the_launch_tensor_table() {
@@ -2689,6 +2820,33 @@ mod tests {
     }
 
     #[test]
+    fn glu_output_shared_by_layer_writers_is_unread() {
+        let (mut g, _) = fixture(128);
+        for i in [0, 1] {
+            g.insts[i].op = DevOp::QuantFp8 as u16;
+            g.insts[i].t[..5].copy_from_slice(&[10 + i as u16, 7, 20 + i as u16, 3, 4]);
+        }
+        g.insts[2].t = [packet::dev::TENSOR_NONE16; 8];
+        assert!(glu_output_unread(&g, 0) && glu_output_unread(&g, 1));
+        // A GLU quant naming it beyond its output slot, or missing gate or up, reads it.
+        for (slot, value) in [(3, 7), (5, 7), (4, packet::dev::TENSOR_NONE16)] {
+            let keep = g.insts[1].t[slot];
+            g.insts[1].t[slot] = value;
+            assert!(!glu_output_unread(&g, 0), "slot {slot}");
+            g.insts[1].t[slot] = keep;
+        }
+        // A plain quant reading it (t[1] = source, no gate/up) is a reader.
+        g.insts[2].op = DevOp::QuantFp8 as u16;
+        g.insts[2].t[1] = 7;
+        assert!(!glu_output_unread(&g, 0));
+        // So is any other op naming it.
+        g.insts[2].op = DevOp::Glu as u16;
+        g.insts[2].t[1] = packet::dev::TENSOR_NONE16;
+        g.insts[2].t[0] = 7;
+        assert!(!glu_output_unread(&g, 0));
+    }
+
+    #[test]
     fn prefill_glu_quant_requires_supported_shape_and_complete_segment() {
         let make = || {
             let (mut g, _) = fixture(128);
@@ -2860,6 +3018,7 @@ mod tests {
                         output_bytes: u64::from(batch) * 48 * 2,
                         input_bytes: u64::from(batch) * 5120 * 2,
                         weight_bytes: 48 * 5120 * 2,
+                        block: false,
                     }),
                     None,
                 ]

@@ -175,7 +175,8 @@ Tried and dropped:
 * HeadNormRope in `light_pf`. It saved another ~0.1%, but its digests differ from the prefill
   object's HeadNormRope.
 * Scheduler knobs:
-  * `--pf-batch`, `--pf-interleave-adaptive` and `--pf-interleave 0/4096` gave no gain.
+  * `--pf-batch`, `--pf-interleave-adaptive` (both since removed with their code paths) and
+    `--pf-interleave 0/4096` gave no gain.
   * `--pf-defer-decode` gave c64 +2% but c128 -3%, and a TTFT hit.
 
 With the recipe flags, the gate CER median is 0.005 (n=80). The step_bench digests are those of
@@ -206,8 +207,8 @@ guidance); `s3gen.pkt` renders audio on a render thread.
 Each token is drawn from the pair's logits with the packet's `lm.*` chain (guidance weight,
 repetition penalty, temperature, min_p, top_p). The host draws by default; `--cfg-device` /
 `PLOW_CFG_DEVICE=1` draws on the device (`plow_sample_cfg` in `sample_sm120.cubin`: same
-uniforms, per-slot penalty history, token written to both members; `--cfg-multistep` also runs
-pairs in the multi-step quantum). It stays off because it lost served aps at c16..c64 (H100: the
+uniforms, per-slot penalty history, token written to both members; the `--cfg-multistep`
+variant that ran pairs in the multi-step quantum is removed). It stays off because it lost served aps at c16..c64 (H100: the
 host draw's gap paced T3 so utterances closed in batches; without it S3Gen renders batch smaller).
 The repetition penalty applies once per distinct history token, as HF's
 `RepetitionPenaltyLogitsProcessor` (gather / scatter); applying it per occurrence (before

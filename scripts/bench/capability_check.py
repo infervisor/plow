@@ -9,6 +9,9 @@ item fails unless it is waived: `--waive` / PB_CAPABILITY_WAIVERS (comma-separat
 `[capabilities]` table of the recipe beside the assets (<assets>/../recipe.toml, as campaign.py
 build copies it), `name = "reason"`. `n/a` items are informational. Exit 1 on any FAIL.
 
+A recipe that requests a route at emit (PLOW_EMIT_ATTN_LIBRARY) fails on a packet that does not
+declare it, whatever the waivers.
+
 A campaign starts from the full plowrt feature set and measures removing routes; an `off` that
 nobody waived is a route the campaign would rediscover later as a "new technique".
 """
@@ -34,27 +37,60 @@ def waivers(assets: Path, extra: str) -> dict[str, str]:
     return out
 
 
+def requested_routes(assets: Path) -> dict[str, str]:
+    """Inventory items the recipe beside the assets requests at emit: {item: knob}."""
+    recipe = assets.parent / "recipe.toml"
+    found: dict[str, str] = {}
+
+    def walk(v):
+        if isinstance(v, dict):
+            for k, x in v.items():
+                if k == "PLOW_EMIT_ATTN_LIBRARY" and str(x).lower() not in ("", "0", "false", "off"):
+                    found["library_prefill_attention"] = k
+                walk(x)
+        elif isinstance(v, list):
+            for x in v:
+                walk(x)
+
+    if recipe.is_file():
+        try:
+            with recipe.open("rb") as f:
+                walk(tomllib.load(f))
+        except (tomllib.TOMLDecodeError, OSError):
+            pass
+    return found
+
+
 def main(argv: list[str]) -> int:
     if len(argv) < 3:
         print(__doc__.strip(), file=sys.stderr)
         return 2
     plowrt, assets = Path(argv[1]), Path(argv[2])
     extra = argv[argv.index("--waive") + 1] if "--waive" in argv else os.environ.get("PB_CAPABILITY_WAIVERS", "")
+    want = requested_routes(assets)
+    # Without a readable inventory a requested route cannot be shown declared: that fails.
+    unread = "FAIL" if want else "WARN"
     r = subprocess.run([str(plowrt), "inventory", str(assets), "--format", "json"], capture_output=True, text=True)
     if r.returncode != 0 or not r.stdout.strip():
         err = (r.stderr.strip().splitlines() or ["no output"])[-1][:160]
-        print(f"WARN\tplowrt inventory failed ({err}) — plowrt predates the subcommand, or the packet is not a devblob")
-        return 0
+        print(f"{unread}\tplowrt inventory failed ({err}) — plowrt predates the subcommand, or the packet is not a devblob")
+        return 1 if want else 0
     try:
         items = json.loads(r.stdout)
     except ValueError as e:
-        print(f"WARN\tplowrt inventory: malformed JSON ({e})")
-        return 0
+        print(f"{unread}\tplowrt inventory: malformed JSON ({e})")
+        return 1 if want else 0
     w = waivers(assets, extra)
     fails = 0
+    for name in sorted(set(want) - {it["name"] for it in items}):
+        fails += 1
+        print(f"FAIL\t{name}: the recipe requests it ({want[name]}) but the inventory has no such item")
     for it in items:
         name, state, detail = it["name"], it["state"], it["detail"]
-        if state == "on":
+        if name in want and state != "on":
+            fails += 1
+            print(f"FAIL\t{name}: the recipe requests it ({want[name]}) but the packet does not declare it: {detail}")
+        elif state == "on":
             print(f"ok\t{name}: {detail}")
         elif state == "not_applicable":
             print(f"ok\t{name}: n/a — {detail}")

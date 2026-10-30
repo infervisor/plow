@@ -1365,6 +1365,22 @@ fn tuning(s: &Shapes, arch: &str) -> Map<String, Value> {
             }
         }
     }
+    // A packet without a decode GEMV (a W8A8 block, no lm_head) still writes interleaved KV, so
+    // its objects need the same layout and row-group body.
+    // (The runtime refuses a packet whose objects disagree with its cache writers.)
+    if sm90a
+        && crate::emit_config::active().qwen_kv_interleave
+        && crate::emit_config::active().nv_fa_rg_wide
+        && crate::emit_config::active().gen_kernels.is_some()
+        && !t.contains_key("kv_ilv")
+    {
+        t.insert("fa_rg".into(), json!(1));
+        t.insert("fa_rg_wide".into(), json!(1));
+        if let Some(u) = crate::emit_config::active().nv_fa_rg_u.filter(|&u| u > 0) {
+            t.insert("fa_rg_u".into(), json!(u));
+        }
+        t.insert("kv_ilv".into(), json!(1));
+    }
     // GB202 (sm_120a): a dense hd <= 128 packet walks its B=1 GEMVs on the tensor cores too.
     // Qwen3-ASR rtx-5090 step_bench ctx 512 B=1/8/16/32, PLOW_GEMV_PREFETCH on, token digests
     // unchanged: 1.7B 2.722/3.091/3.469/4.270 -> 2.630/3.091/3.470/4.268 ms; 0.6B

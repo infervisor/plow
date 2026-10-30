@@ -499,7 +499,7 @@ static __device__ void d_qwen_sigmoid_gate(__nv_bfloat16* out, const __nv_bfloat
 // `WIDE` (the light entry only): the warp-per-row path stages S chunks per lane and splits a row
 // over up to four warps; inside the interpreter objects the staged chunks alone grew the decode
 // entry's stack 320 -> 800 B at the 255-register cap, so they keep the one-chunk walk.
-template <bool WIDE = false>
+template <bool WIDE = false, bool RESIDENT = false>
 static __device__ void d_qwen_rmsnorm(__nv_bfloat16* out, const __nv_bfloat16* in,
     const __nv_bfloat16* gamma, const int* active, unsigned dim, unsigned batch,
     float eps, float offset, unsigned slice, unsigned nblk, float* part,
@@ -585,6 +585,62 @@ static __device__ void d_qwen_rmsnorm(__nv_bfloat16* out, const __nv_bfloat16* i
                         o[j] = __float2bfloat16(__bfloat162float(p[j]) * inv * (__bfloat162float(pg[j]) + offset));
                     *(uint4*)(out + base + d) = *(const uint4*)o;
                 }
+            }
+        }
+        return;
+    }
+    // RESIDENT (the dedicated light_qnorm entry, decode rows): the row stays in registers (RB
+    // elements per thread, the same element -> thread map and ascending-k sum as the walk
+    // below, so the same bits). The walk was two dependent 2-byte load chains per row, ~18 us
+    // per 5120-wide norm.
+    constexpr unsigned RB = 32;
+    if constexpr (RESIDENT) if (dim <= RB * blockDim.x) {
+        for (unsigned row = slice; row < batch; row += nblk) {
+            if (active && active[row] <= 0) continue;
+            const size_t base = (size_t)row * dim;
+            float x[RB];
+#pragma unroll
+            for (unsigned k = 0; k < RB; k++) {
+                const unsigned d = threadIdx.x + k * blockDim.x;
+                x[k] = d < dim ? __bfloat162float(in[base + d]) : 0.f;
+            }
+            // The row's in/radd loads are issued before its residual stores, gamma's before the
+            // output stores: the pointers may alias (no restrict), so a load placed after a
+            // store waits for it (a 20-deep dependent chain per row). Each element is read and
+            // written by its own thread only (exact aliases of in/radd/rout are fine; shifted
+            // overlaps are not supported, as in the walk below).
+            if (radd) {
+                float a[RB];
+#pragma unroll
+                for (unsigned k = 0; k < RB; k++) {
+                    const unsigned d = threadIdx.x + k * blockDim.x;
+                    a[k] = d < dim ? __bfloat162float(radd[base + d]) : 0.f;
+                }
+#pragma unroll
+                for (unsigned k = 0; k < RB; k++) {
+                    const unsigned d = threadIdx.x + k * blockDim.x;
+                    if (d < dim) {
+                        const __nv_bfloat16 r = __float2bfloat16(x[k] + a[k]);
+                        rout[base + d] = r;
+                        x[k] = __bfloat162float(r);
+                    }
+                }
+            }
+            float g[RB];
+#pragma unroll
+            for (unsigned k = 0; k < RB; k++) {
+                const unsigned d = threadIdx.x + k * blockDim.x;
+                g[k] = d < dim ? __bfloat162float(gamma[d]) + offset : 0.f;
+            }
+            float sum = 0.f;
+#pragma unroll
+            for (unsigned k = 0; k < RB; k++)
+                if (threadIdx.x + k * blockDim.x < dim) sum += x[k] * x[k];
+            const float inv = rsqrtf(block_sum(sum, part) / dim + eps);
+#pragma unroll
+            for (unsigned k = 0; k < RB; k++) {
+                const unsigned d = threadIdx.x + k * blockDim.x;
+                if (d < dim) out[base + d] = __float2bfloat16(x[k] * inv * g[k]);
             }
         }
         return;
@@ -794,7 +850,10 @@ static __device__ __forceinline__ unsigned qwen_conv4_tile_rows(unsigned rows, u
     for (unsigned k = 1;; k++) {
         unsigned vt = (unsigned)((row_items + k * resident - 1) / (k * resident));
         vt = (vt + DEPTH - 1) / DEPTH * DEPTH;
-        if (vt < DEPTH) vt = DEPTH;
+        /* A tile past the first reads its three taps at rows t0-3..t0-1 of the chunk: t0 >= 3,
+         * else t0-3 wraps (unsigned) far outside the input. */
+        constexpr unsigned MIN_VT = (3u + DEPTH - 1u) / DEPTH * DEPTH;
+        if (vt < MIN_VT) vt = MIN_VT;
         if (vt <= 64) return vt;
     }
 }

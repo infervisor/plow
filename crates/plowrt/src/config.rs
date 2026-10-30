@@ -190,12 +190,6 @@ pub struct RuntimeConfig {
     #[arg(long = "fusion", env = "PLOW_FUSION", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
     pub fusion: bool,
 
-    /// Select unified token batching when the backend, model and object support it.
-    /// Unsupported configurations use ordinary execution; --fusion takes precedence.
-    /// Disable with --token-batch=false or PLOW_TOKEN_BATCH=0.
-    #[arg(long = "token-batch", env = "PLOW_TOKEN_BATCH", hide = true, default_value_t = true, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
-    pub token_batch: bool,
-
     /// Prefix reuse on compatible AMD and NVIDIA assets.
     #[arg(long = "prefix-cache", env = "PLOW_PREFIX_CACHE", default_value_t = true, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
     pub prefix_cache: bool,
@@ -663,19 +657,6 @@ pub struct RuntimeConfig {
     #[arg(long = "vmm-ring-recycle", env = "PLOW_VMM_RING_RECYCLE", hide = true, default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
     pub vmm_ring_recycle: bool,
 
-    /// CUDA VMM prefix live rings: keep up to N released slots' sliding-ring units mapped in
-    /// place (parked) instead of returning them to the driver. Readmitting a parked slot costs no
-    /// driver call (otherwise unmap + cuMemCreate + map + set_access per unit, ~8 ms a request on
-    /// Gemma-4 26B); held memory is bounded by N slots. 0 = off.
-    #[arg(
-        long = "vmm-ring-park",
-        env = "PLOW_VMM_RING_PARK",
-        default_value_t = 0,
-        hide = true,
-        global = true
-    )]
-    pub vmm_ring_park: u32,
-
     /// CUDA unified token batch: admit (begin_slot + prefix attach) requests the next launch
     /// takes while the current prefill launch runs on the device, instead of before it, whenever
     /// the launch is already full of admitted rows. Admission then costs no GPU time.
@@ -920,9 +901,9 @@ pub struct RuntimeConfig {
     pub vmm_publish_shared: bool,
 
     /// Pinned host memory (MiB) for the prefix cache's host tier (the second level of its
-    /// LRU: evicted boundaries spill there and attach from there). Unset = sized by the
-    /// host-reserve rule (`MemAvailable` minus an eighth of RAM, at least 16 GiB); `0` = no
-    /// host tier.
+    /// LRU: evicted boundaries spill there and attach from there). Unset = sized by
+    /// `memory::vmm::host_tier_default`: `MemAvailable` minus the host reserve (an eighth of RAM,
+    /// at least 16 GiB), capped at a quarter of RAM; `0` = no host tier.
     #[arg(
         long = "vmm-host-cache-mib",
         env = "PLOW_VMM_HOST_CACHE_MIB",
@@ -1710,6 +1691,11 @@ pub struct NvidiaRuntimeConfig {
     #[arg(long = "pf-attn-gemm-grouped", env = "PLOW_PF_ATTN_GEMM_GROUPED", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
     pub pf_attn_gemm_grouped: bool,
 
+    /// Run the packet-declared library prefill attention segments (`segment_roles.json`
+    /// `library`). `=0` runs their declared native roles instead (A/B and rollback).
+    #[arg(long = "pf-attn-library", env = "PLOW_PF_ATTN_LIBRARY", default_value_t = true, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
+    pub pf_attn_library: bool,
+
     /// Diagnostic: per-class wall attribution via one event pair per segment.
     #[arg(long = "pf-seg-time", env = "PLOW_PF_SEG_TIME", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
     pub pf_seg_time: bool,
@@ -1781,8 +1767,7 @@ pub struct NvidiaRuntimeConfig {
     /// `CUBLASLT_MATMUL_DESC_FAST_ACCUM` (wgmma accumulation without periodic FP32 promotion, as
     /// vLLM's CUTLASS FP8 kernels). Unset = off. H100 standalone at M=4096: q 102 -> 88 us,
     /// gate 374 -> 331 us; down (K 15360) unchanged with 2x the rel-L2, hence the K bound.
-    /// cuBLASLt decode rungs keep promoted accumulation (no measured gain at B=64); the CUTLASS
-    /// decode route (`--cutlass-fp8-decode`) applies the same K bound.
+    /// cuBLASLt decode rungs keep promoted accumulation (no measured gain at B=64).
     #[arg(
         long = "lt-fp8-fast-accum-max-k",
         env = "PLOW_LT_FP8_FAST_ACCUM_MAX_K",
@@ -1800,17 +1785,6 @@ pub struct NvidiaRuntimeConfig {
         global = true
     )]
     pub pf_norm_row_blocks: u32,
-
-    /// `<cubin sha256>:<host library sha256>` of `cutlass_fp8_decode_sm90.cubin` and its Params
-    /// marshaller `libplow_cutlass_fp8_decode_sm90.so` in `--pf-seg-dir`: routed FP8 W8A8 decode
-    /// projections with M <= 128 run those CUTLASS swap-AB kernels instead of cuBLASLt (no ~13 us
-    /// small-M floor). Other bytes are rejected. Unset = cuBLASLt.
-    #[arg(
-        long = "cutlass-fp8-decode",
-        env = "PLOW_CUTLASS_FP8_DECODE",
-        global = true
-    )]
-    pub cutlass_fp8_decode: Option<String>,
 
     /// A routed decode rung's one-instruction AddNorm / Glu segments run as ordinary launches
     /// of the decode object's light kernel instead of interpreter windows.
@@ -3439,29 +3413,6 @@ mod tests {
     }
 
     #[test]
-    fn token_batch_defaults_on_with_explicit_rollback() {
-        use clap::{Args, FromArgMatches};
-        let command = super::RuntimeConfig::augment_args(clap::Command::new("test"));
-        let arg = command
-            .get_arguments()
-            .find(|arg| arg.get_id() == "token_batch")
-            .unwrap();
-        assert_eq!(arg.get_default_values(), ["true"]);
-        for (flag, enabled) in [("--token-batch", true), ("--token-batch=false", false)] {
-            let matches = command
-                .clone()
-                .try_get_matches_from(["test", flag])
-                .unwrap();
-            assert_eq!(
-                super::RuntimeConfig::from_arg_matches(&matches)
-                    .unwrap()
-                    .token_batch,
-                enabled
-            );
-        }
-    }
-
-    #[test]
     fn fusion_is_an_opt_in_runtime_flag() {
         use clap::{Args, FromArgMatches};
         let command = super::RuntimeConfig::augment_args(clap::Command::new("test"));
@@ -3578,24 +3529,22 @@ mod tests {
     }
 
     #[test]
-    fn shared_prefix_and_token_batch_defaults_allow_independent_rollback() {
+    fn shared_prefix_defaults_on_with_rollback() {
         use clap::{Args, FromArgMatches};
         let command = super::RuntimeConfig::augment_args(clap::Command::new("test"));
-        for field in ["prefix_cache", "token_batch"] {
-            assert_eq!(
-                command
-                    .get_arguments()
-                    .find(|arg| arg.get_id() == field)
-                    .unwrap()
-                    .get_default_values(),
-                ["true"]
-            );
-        }
+        assert_eq!(
+            command
+                .get_arguments()
+                .find(|arg| arg.get_id() == "prefix_cache")
+                .unwrap()
+                .get_default_values(),
+            ["true"]
+        );
         let defaults = super::RuntimeConfig::from_arg_matches(
             &command.clone().try_get_matches_from(["test"]).unwrap(),
         )
         .unwrap();
-        assert!(defaults.prefix_cache && defaults.token_batch);
+        assert!(defaults.prefix_cache);
         assert!(!defaults.fusion && !defaults.pf_defer_decode);
         assert!(!defaults.pf_rotate());
         assert_eq!(defaults.objective, crate::serve::policy::Objective::Auto);
@@ -3620,7 +3569,6 @@ mod tests {
             .unwrap();
         let config = super::RuntimeConfig::from_arg_matches(&matches).unwrap();
         assert!(!config.prefix_cache);
-        assert!(config.token_batch);
         assert_eq!(config.vmm_cache_mib, Some(512));
         // Explicit MiB wins over the percentage, whatever the device size.
         assert_eq!(config.prefix_cache_cap_bytes(192 << 30), 512 << 20);

@@ -1618,6 +1618,11 @@ __device__ __forceinline__ void plow_exec(const PlowDevInst* in, void* const* T,
      * T16 classing v2: ALSO in the uni256 GEMM object — quant packets classed 8 merge the
      * [gate/up, gluquant, down] chain into ONE GEMM-class launch. */
     case PLOW_DOP_QUANT_FP8:
+        if (in->i[3]) {
+            d_quant_fp8_group((uint8_t*)TEN(0), (const __nv_bfloat16*)TEN(1), (float*)TEN(2),
+                              in->i[0], in->i[1], in->i[4], slice, nblk);
+            break;
+        }
         d_quant_fp8((uint8_t*)TEN(0), (__nv_bfloat16*)TEN(1), (float*)TEN(2), in->i[0],
                     in->i[1], slice, nblk, (const __nv_bfloat16*)TEN(3),
                     (const __nv_bfloat16*)TEN(4), in->i[2], arena);
@@ -2207,6 +2212,11 @@ __device__ __forceinline__ void plow_exec(const PlowDevInst* in, void* const* T,
 #if !PLOW_NV_PREFILL || PLOW_MIXED_STEP
 #if PLOW_NV_FP8_LT_DECODE && !PLOW_NV_PREFILL
     case PLOW_DOP_QUANT_FP8:
+        if (in->i[3]) {
+            d_quant_fp8_group((uint8_t*)TEN(0), (const __nv_bfloat16*)TEN(1), (float*)TEN(2),
+                              in->i[0], in->i[1], in->i[4], slice, nblk);
+            break;
+        }
         d_quant_fp8((uint8_t*)TEN(0), (__nv_bfloat16*)TEN(1), (float*)TEN(2),
             in->i[0], in->i[1], slice, nblk, (const __nv_bfloat16*)TEN(3),
             (const __nv_bfloat16*)TEN(4), in->i[2], arena);
@@ -2219,7 +2229,7 @@ __device__ __forceinline__ void plow_exec(const PlowDevInst* in, void* const* T,
  * body needs the 256-thread two-warpgroup layout and its staging ring in the arena. */
 #if !PLOW_NV_FP8_LT_DECODE
     case PLOW_DOP_QUANT_FP8:
-        if (!in->i[0] || in->i[0] > PGM90_FP8_DECODE_ROWS) { __trap(); break; }
+        if (!in->i[0] || in->i[0] > PGM90_FP8_DECODE_ROWS || in->i[3]) { __trap(); break; }
         d_quant_fp8((uint8_t*)TEN(0), (__nv_bfloat16*)TEN(1), (float*)TEN(2),
             in->i[0], in->i[1], slice, nblk);
         break;
@@ -3307,6 +3317,7 @@ __device__ __forceinline__ void plow_ws384_role_loop(const PlowProgram& prog, ui
 #if !PLOW_NV_SEG_M64N64 && !PLOW_NV_SEG_M64N128
         case PLOW_DOP_QUANT_FP8: {
             /* T36: consumer-warpgroup quant (producer skips) — quant packets classed 8. */
+            if (in->i[3]) { __trap(); break; } /* block-scaled groups: interpreter arms only */
             const unsigned nblk = in->blocks ? in->blocks : nblk_grid;
             d_quant_fp8_ws384<PROD>((uint8_t*)T[in->t[0]], (__nv_bfloat16*)T[in->t[1]],
                                     (float*)T[in->t[2]], in->i[0], in->i[1], e.slice, nblk,
@@ -4284,6 +4295,7 @@ extern "C" __global__ void __launch_bounds__(PLOW_NV_THREADS) PLOW_SYM(plow_sm12
         break;
 #if PLOW_NV_LIGHT_FP8_ATTN && PLOW_NV_W8A8
     case PLOW_DOP_QUANT_FP8:
+        if (in->i[3]) { __trap(); break; }
         d_quant_fp8((uint8_t*)LIGHT_TEN(0), (__nv_bfloat16*)LIGHT_TEN(1),
                     (float*)LIGHT_TEN(2), in->i[0], in->i[1], slice, nblk,
                     nullptr, nullptr, 0, part);
@@ -4310,6 +4322,85 @@ extern "C" __global__ void __launch_bounds__(PLOW_NV_THREADS) PLOW_SYM(plow_sm12
     }
 #undef LIGHT_TEN
 }
+#if PLOW_NV_GEMMA && PLOW_HAS_MOE_GEMMA && PLOW_NV_THREADS == 256
+/* The router window of a segmented decode rung (RmsNorm, router score + top-k, align, QuantFp8)
+ * as one ordinary launch per instruction: the plow_exec call of each opcode verbatim, on the
+ * instruction's own slices (grid = blocks), with a dynamic arena for the bodies that stage in
+ * it. `plow_light_router_ops` names the opcodes this object compiled (bit = order below). */
+#define PLOW_LR_NROW(v) ((v) ? (v) : 1u)
+#define PLOW_LR_ARENA (PLOW_MOE_XN_MAX * 4u + 1024u)
+extern "C" __device__ unsigned PLOW_SYM(plow_light_router_smem) = PLOW_LR_ARENA;
+extern "C" __device__ unsigned PLOW_SYM(plow_light_router_ops) =
+    1u
+#if PLOW_HAS_MOE_ROUTER_GEMMA_SCORE_FAST
+    | 2u
+#endif
+#if PLOW_HAS_MOE_ROUTER_GEMMA_TOPK
+    | 4u
+#endif
+#if defined(PLOW_NV_HOPPER) && PLOW_MOE_DEC_GROUP && PLOW_NV_GEMV_RB
+    | 8u
+#endif
+#if PLOW_NV_FP8_LT_DECODE && !PLOW_NV_PREFILL
+    | 16u
+#endif
+    ;
+extern "C" __global__ void __launch_bounds__(PLOW_NV_THREADS)
+    PLOW_SYM(plow_sm120_light_router)(const __grid_constant__ PlowLightOp a) {
+    extern __shared__ __align__(16) float arena[];
+    const PlowDevInst* in = &a.d;
+    const unsigned slice = blockIdx.x, nblk = gridDim.x;
+#define LR_TEN(k) (a.t[k])
+    switch (in->op) {
+    case PLOW_DOP_RMSNORM:
+        d_rmsnorm((__nv_bfloat16*)LR_TEN(0), (const __nv_bfloat16*)LR_TEN(1),
+                  (const __nv_bfloat16*)LR_TEN(2), in->i[0], in->i[1], in->fj[0].f, in->i[2], slice,
+                  nblk, arena, (uint8_t*)LR_TEN(3), (float*)LR_TEN(4));
+        break;
+#if PLOW_HAS_MOE_ROUTER_GEMMA_SCORE_FAST
+    case PLOW_DOP_MOE_ROUTER_GEMMA_SCORE_FAST:
+        d_moe_router_gemma_score_fast((float*)LR_TEN(0), (const __nv_bfloat16*)LR_TEN(1),
+                                      (const __nv_bfloat16*)LR_TEN(2),
+                                      (const __nv_bfloat16*)LR_TEN(3), in->i[0], in->i[1],
+                                      in->fj[0].f, in->fj[1].f, slice, nblk, PLOW_LR_NROW(in->i[2]),
+                                      arena);
+        break;
+#endif
+#if PLOW_HAS_MOE_ROUTER_GEMMA_TOPK
+    case PLOW_DOP_MOE_ROUTER_GEMMA_TOPK:
+        d_moe_router_gemma_topk((unsigned char*)LR_TEN(0), (const float*)LR_TEN(1),
+                                (const __nv_bfloat16*)LR_TEN(2), in->i[1], in->i[2],
+                                slice, nblk, PLOW_LR_NROW(in->i[3]), arena);
+        break;
+#endif
+#if defined(PLOW_NV_HOPPER) && PLOW_MOE_DEC_GROUP && PLOW_NV_GEMV_RB
+    case PLOW_DOP_MOE_ALIGN_GEMMA_PF:
+        if (in->i[0] >= in->i[3])
+            d_moe_align_gemma_pf((int*)LR_TEN(0), (const unsigned char*)LR_TEN(1), (unsigned*)LR_TEN(2),
+                                 (unsigned*)LR_TEN(3), (float*)LR_TEN(4), in->i[0], in->i[1], in->i[2],
+                                 slice, 1u);
+        break;
+#endif
+#if PLOW_NV_FP8_LT_DECODE && !PLOW_NV_PREFILL
+    case PLOW_DOP_QUANT_FP8:
+        if (in->i[3]) {
+            d_quant_fp8_group((uint8_t*)LR_TEN(0), (const __nv_bfloat16*)LR_TEN(1),
+                              (float*)LR_TEN(2), in->i[0], in->i[1], in->i[4], slice, nblk);
+            break;
+        }
+        d_quant_fp8((uint8_t*)LR_TEN(0), (__nv_bfloat16*)LR_TEN(1), (float*)LR_TEN(2),
+            in->i[0], in->i[1], slice, nblk, (const __nv_bfloat16*)LR_TEN(3),
+            (const __nv_bfloat16*)LR_TEN(4), in->i[2], arena);
+        break;
+#endif
+    default:
+        __trap();
+    }
+#undef LR_TEN
+}
+#undef PLOW_LR_NROW
+#undef PLOW_LR_ARENA
+#endif
 /* A prefill bucket's lone RmsNorm / Residual / SiLU Glu, as an ordinary launch like
  * plow_sm120_light: the prefill object's bodies (RmsNorm takes its warp-per-row path from 32
  * rows, as the prefill object does), so the outputs are the interpreter window's. */
@@ -4408,6 +4499,20 @@ extern "C" __global__ void PLOW_LIGHT_PF_BOUNDS PLOW_SYM(plow_sm120_light_pf)(Pl
 }
 #if PLOW_NV_QWEN_GDN
 extern "C" __device__ unsigned PLOW_SYM(plow_light_pf_qwen_conv) = 1;
+/* A routed decode rung's QwenRmsNorm on its own entry, one block per row: the register-resident
+ * row walk (d_qwen_rmsnorm<true, true>) spilled under light_pf's two-blocks-per-SM cap. */
+extern "C" __global__ void __launch_bounds__(PLOW_NV_THREADS)
+    PLOW_SYM(plow_sm120_light_qnorm)(PlowProgram prog, unsigned inst) {
+    __shared__ float part[32];
+    const PlowDevInst* in = prog.insts + inst;
+    void* const* T = prog.tensors;
+#define LIGHT_TEN(k) (in->t[k] == PLOW_TENSOR_NONE ? nullptr : T[in->t[k]])
+    if (in->op != PLOW_DOP_QWEN_RMSNORM) __trap();
+    d_qwen_rmsnorm<true, true>((__nv_bfloat16*)LIGHT_TEN(0), (const __nv_bfloat16*)LIGHT_TEN(1),
+        (const __nv_bfloat16*)LIGHT_TEN(2), (const int*)LIGHT_TEN(3), in->i[0], in->i[1],
+        in->fj[0].f, in->fj[1].f, blockIdx.x, gridDim.x, part, (const __nv_bfloat16*)LIGHT_TEN(4));
+#undef LIGHT_TEN
+}
 #endif
 #if PLOW_NV_GEMMA
 extern "C" __device__ unsigned PLOW_SYM(plow_light_gemma) = 1;

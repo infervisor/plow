@@ -56,8 +56,7 @@ pub(super) struct CudaTokenBatch {
 
 impl CudaTokenBatch {
     pub(super) fn load(e: &GpuEngine) -> Option<Self> {
-        (RuntimeConfig::get().token_batch
-            && !RuntimeConfig::get().fusion
+        (!RuntimeConfig::get().fusion
             && e.be.compute_capability() == (9, 0)
             && e.packed_prefill.is_some()
             && e.has_packed_terminal()
@@ -200,6 +199,7 @@ impl GpuEngine {
         mut window: Option<&mut dyn FnMut(&mut GpuEngine)>,
     ) -> Result<()> {
         output.clear();
+        self.tb_launched = false;
         let mut state = self.token_batch.take().ok_or_else(|| {
             RuntimeError::Rejected("CUDA unified token-batch capability unavailable".into())
         })?;
@@ -211,6 +211,18 @@ impl GpuEngine {
             .handle_of(plow_asset::multimodal::TABLE_TENSOR)
             .is_some();
         let result = (|| {
+            // A verify span's rejected drafts roll back by frontier only: a recurrent state the
+            // scan advanced past them cannot be taken back (`spec_enable` refuses such packets).
+            if self.recurrent.is_some() && requests.iter().any(|r| r.phase == Phase::Verify) {
+                return Err(RuntimeError::Rejected(
+                    "CUDA token batch cannot verify on a recurrent chain".into(),
+                ));
+            }
+            // Only a prefill chunk reads an attached state from its block; a decode or verify row
+            // reads the slot.
+            for request in requests.iter().filter(|r| r.phase != Phase::Prefill) {
+                self.state_materialize(request.slot as usize, None)?;
+            }
             if requests.iter().any(|request| {
                 request.state_slot != request.slot
                     || request.selection != Selection::default()
@@ -574,6 +586,13 @@ impl GpuEngine {
         result.and(flushed)
     }
 
+    /// Whether the last token batch stopped before its first device launch: no kernel touched
+    /// a slot's KV or recurrent state and no frontier moved. Only a host refusal
+    /// (`RuntimeError::Rejected`) from such a step may run its rows another way.
+    pub fn token_batch_refused_before_launch(&self) -> bool {
+        !self.tb_launched
+    }
+
     /// Inside a launch window: whether the launch is still running on the device.
     pub(crate) fn launch_in_flight(&self) -> bool {
         self.window_open
@@ -586,6 +605,7 @@ impl GpuEngine {
     /// Complete the restores a launch window deferred: drain the stream, then release their
     /// snapshot holds. A failed drain keeps the holds: the copies' completion is unproven.
     pub(crate) fn flush_deferred_attach(&mut self) -> Result<()> {
+        self.blocks_reap_seals();
         if self.deferred_attach.is_empty() {
             return Ok(());
         }
@@ -821,6 +841,7 @@ mod tests {
         e.begin_slot(slot, 257).unwrap();
         let before = e.pos.clone();
         assert!(e.token_batch_step(&[stale], &mut output).is_err());
+        assert!(e.token_batch_refused_before_launch());
         assert!(output.is_empty());
         assert_eq!(e.pos, before);
         let duplicate = request(&e, 123, slot, Phase::Prefill, &token, 1);

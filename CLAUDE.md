@@ -52,6 +52,10 @@ Read `docs/bringup/agent-tools.md` and `scripts/campaign/README.md` before writi
 benchmark, probe, gate or serve script. `scripts/` holds hundreds of scripts because campaigns
 kept writing throwaway probes and re-hitting the same environment failures on leased GPUs.
 
+* HARD RULE: perf candidates are screened on a single block vs its calibrated roofline before any
+  whole-network run; reports start with the block-vs-roofline table (agent-tools.md "HARD RULE").
+* Standing team rules (prefix cache on, one binary, packet contract, static runtime, vLLM-peer
+  judging, GPU budget, `prod-next` only, kernel reviews): agent-tools.md "Working rules".
 * If a tool does the job, use it. If it almost does, extend it in place and keep the extension.
   A new script is justified only for a capability no existing tool can express; it goes in the
   matching subdirectory, `source`s `scripts/bench/plowbench.sh` for port choice, readiness poll,

@@ -55,6 +55,7 @@ mod block;
 mod gemma4_gemm_glu_role;
 mod gemma4_w8a8_gemm_glu_role;
 mod gen_kernels;
+mod library_attention;
 mod serve_section;
 mod w8a16_prefill_role;
 use block::{parse_block, write_block_descriptor};
@@ -2176,6 +2177,9 @@ fn declare(
     merge_fold: bool,
 ) -> Tn {
     let affine_q4 = emit_config::active().affine_q4;
+    // A block packet has no token entry: the per-layer-input prologue (and its whole-model
+    // tables) is dropped, the in-block layers read `act.ple` as an input.
+    let partial = block != (0..c.layers as usize);
     if affine_q4 {
         assert!(
             c.hidden % 64 == 0 && c.inter % 64 == 0 && (c.heads * c.hd_full) % 64 == 0,
@@ -2467,7 +2471,7 @@ fn declare(
         } else {
             TENSOR_NONE
         },
-        ple_tab: if c.ple > 0 {
+        ple_tab: if c.ple > 0 && !partial {
             b.tensor(
                 &format!("{}embed_tokens_per_layer.weight", c.prefix),
                 (c.vocab as u64) * (c.layers * c.ple) as u64 * BF16,
@@ -2475,7 +2479,7 @@ fn declare(
         } else {
             TENSOR_NONE
         },
-        ple_proj: if c.ple > 0 {
+        ple_proj: if c.ple > 0 && !partial {
             b.tensor(
                 &format!("{}per_layer_model_projection.weight", c.prefix),
                 (c.layers * c.ple) as u64 * c.hidden as u64 * BF16,
@@ -2483,7 +2487,7 @@ fn declare(
         } else {
             TENSOR_NONE
         },
-        ple_norm: if c.ple > 0 {
+        ple_norm: if c.ple > 0 && !partial {
             b.tensor(
                 &format!("{}per_layer_projection_norm.weight", c.prefix),
                 c.ple as u64 * BF16,
@@ -4501,12 +4505,19 @@ fn emit_phase(
     // the RMSNorm that follows is scale-invariant); ple = (RMSNorm_P(ple_pp) * gamma + ple_raw) / sqrt(2).
     // Every layer's block then reads its P-column slice of `ple`. Emitted before the hetero
     // join so the CPU lane's rows see it.
-    assert!(
-        !(block_mode && (c.ple > 0 || c.kv_shared > 0)),
-        "block mode uploads act.x only: a per-layer-input or KV-shared model has no per-layer inputs \
-         or source caches inside one block"
-    );
-    let c_ple = if c.ple > 0 {
+    // Block mode uploads act.x only: the per-layer-input prologue needs token ids and the
+    // whole-model tables, so the block's layers read `act.ple` as an input (timing only).
+    if block_mode {
+        for l in block.clone().filter(|&l| c.kv_is_shared(l)) {
+            assert!(
+                block.contains(&c.kv_source(l)),
+                "block {block:?}: KV-shared layer {l} reads layer {}'s cache; start the block at or \
+                 before it",
+                c.kv_source(l)
+            );
+        }
+    }
+    let c_ple = if c.ple > 0 && !block_mode {
         let lp = c.layers * c.ple;
         let c_pe = b.emit(DevOp::Embed, rows.clone(), &[], |d| {
             d.t[0] = n.ple_raw;
@@ -4993,7 +5004,7 @@ fn emit_phase(
         });
     // First layer of the trailing KV-shared run: a prefill program marks where its row-local
     // tail begins (plow_asset::kv_shared_tail).
-    let shared_tail_start = (!block_mode && !hj && tp == 1 && block.end == c.layers as usize)
+    let shared_tail_start = (!hj && tp == 1 && block.end == c.layers as usize)
         .then(|| {
             (0..c.layers as usize)
                 .rev()
@@ -10140,9 +10151,10 @@ fn dsv41_refusal(dir: &std::path::Path) -> String {
     }
 
     out.push_str(
-        " The runtime side is most of the way there -- mHC, the DSA indexer, the MXFP4 experts, \
-         the clamped SwiGLU dispatch today. The CSA2 (ops 212/213) and Engram (ops 214/215) \
-         device functions exist but have no interp.hip arm on AMD. What the EMITTER still needs:",
+        " The runtime side is partly there -- mHC, the DSA indexer, the MXFP4 experts, the \
+         clamped SwiGLU and the CSA2 output de-rotation (op 213) dispatch today; the CSA2 \
+         compressor (ops 212/217) and Engram (ops 214/215) exist only as kernels \
+         (op_compress.h, op_engram.h) with no interpreter case yet. What the EMITTER still needs:",
     );
     for (i, gap) in mla::dsv41_gaps(&cfg).iter().enumerate() {
         out.push_str(&format!(" ({}) {gap};", i + 1));
@@ -11387,9 +11399,35 @@ fn emit_dense_gqa(
         let full = c.is_full[l0];
         let head_dim = if full { c.hd_full } else { c.hd_slide };
         let kv_heads = if full { c.kvh_full } else { c.kvh_slide };
-        let kv_tensors: Vec<String> = block
-            .clone()
+        let mut sources: Vec<usize> = block.clone().map(|l| c.kv_source(l)).collect();
+        sources.sort_unstable();
+        sources.dedup();
+        let kv_tensors: Vec<String> = sources
+            .iter()
             .flat_map(|l| [format!("kv.{l}.k"), format!("kv.{l}.v")])
+            .collect();
+        let kind: Vec<String> = block
+            .clone()
+            .flat_map(|l| {
+                let attn = if c.is_full[l] {
+                    "full_attn"
+                } else {
+                    "sliding_attn"
+                };
+                let attn = if c.kv_is_shared(l) {
+                    format!("{attn}_kv_shared")
+                } else {
+                    attn.into()
+                };
+                [
+                    attn,
+                    if c.moe {
+                        "moe_ffn".into()
+                    } else {
+                        "dense_ffn".into()
+                    },
+                ]
+            })
             .collect();
         let hidden = c.hidden as i64;
         let ckpt = dir
@@ -11402,7 +11440,7 @@ fn emit_dense_gqa(
             model: ckpt.clone(),
             arch: "gemma_dense".into(),
             layer: l0 as u32,
-            kind: vec!["dense_attn".into(), "dense_ffn".into()],
+            kind,
             hidden,
             dtype: if fp8 { "fp8".into() } else { "bf16".into() },
             dims: BlockDims {
@@ -11724,6 +11762,13 @@ fn emit_dense_gqa(
         )
         .unwrap_or_else(|error| panic!("Gemma-4 W8A8 GemmGlu object: {error}"));
         eprintln!("  Gemma-4 W8A8 GemmGlu: {selected} lean segments");
+    }
+    // Last: the declared library segments keep whatever native role the passes above chose.
+    let selected =
+        library_attention::apply_output_object(&m, &mut sections, std::path::Path::new(&out))
+            .unwrap_or_else(|error| panic!("library attention: {error}"));
+    if selected > 0 {
+        eprintln!("  library prefill attention: {selected} segments");
     }
     if let Some(live_position) = sections
         .iter()

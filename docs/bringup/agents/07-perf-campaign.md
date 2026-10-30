@@ -54,7 +54,12 @@ carries the caveat that makes it honest.
 
 If any is missing, **stop and report**. Do not run a campaign on a recipe that
 has not gated out of Stage 6, and do not quote a comparator ratio you cannot
-produce in the same session.
+produce in the same session or from a captured vLLM peer whose recorded
+provenance matches (reuse it; never recapture a vLLM arm for a screen). The
+comparator is the same-concurrency vLLM peer, never plowrt's own production
+packet. Candidates reach this stage only after winning at single-block level
+(`docs/bringup/agent-tools.md` "HARD RULE"); the report opens with that
+block-vs-roofline table.
 
 ## Fix the campaign plan first — everything is measured against it
 
@@ -183,7 +188,7 @@ recompile, do not re-run.
 ### 6. Consolidate the result
 
 Keep raw JSON/JSONL, logs, command manifests, and binaries in `$RESULTS` on
-campaign storage. Update `perf-data/SUMMARY.md` with the reviewed decision and
+campaign storage. Update the campaign's `docs/bringup/results/<campaign>/comparison.md` with the reviewed decision and
 retain only compact CSV inputs that directly support it. Do not commit a new
 per-experiment Markdown or JSON report. Match this structure:
 
@@ -212,7 +217,7 @@ Passes when **all** hold; otherwise the model is blocked with a specific blocker
 3. Same-session and uncontended: both engines one lease, every run `gpulease`
    rc=0, no stored baseline quoted as same-session.
 4. Swept: a concurrency ladder and a context ladder, not one cell.
-5. Consolidated in `perf-data/SUMMARY.md`; raw evidence and commands remain
+5. Consolidated in the campaign's `docs/bringup/results/<campaign>/comparison.md`; raw evidence and commands remain
    traceable in external `$RESULTS`, and any retained CSV supports the summary.
 6. The write-up names `$GPU`, `$ISA`, `$NCU`, `$NGPU`/`$PARALLEL`, `$MAXCTX`,
    the provenance of every denominator, and a `Scope:` line. An unscoped number
@@ -283,7 +288,7 @@ Passes when **all** hold; otherwise the model is blocked with a specific blocker
   trend, not a served point).
 * **Roofline**: `$COMPUTE_CEIL` / `$BW_BOUND` with their provenance and the
   achieved fraction of each; the honest per-model limiter.
-* **The record**: updated `perf-data/SUMMARY.md`, external `$RESULTS` location,
+* **The record**: updated the campaign's `docs/bringup/results/<campaign>/comparison.md`, external `$RESULTS` location,
   and the reproduction command per table.
 * **Real-vs-ideal caveats**: contention, stored-vs-same-session baselines,
   chat-route inflation, any comparator that could not be reproduced — everything

@@ -5121,6 +5121,7 @@ async fn serve(
             if let Some(path) = shutdown_socket {
                 let _ = std::fs::remove_file(path);
             }
+            log_library_attention_launches();
             plowrt::obs::logwriter::flush(LOG_FLUSH_TIMEOUT);
             std::process::exit(1);
         }
@@ -5137,6 +5138,7 @@ async fn serve(
                 let _ = std::fs::remove_file(path);
             }
             tracing::info!("shutdown: drained");
+            log_library_attention_launches();
             plowrt::obs::logwriter::flush(LOG_FLUSH_TIMEOUT);
             // Engine threads and blocking tick tasks never finish on their own; the runtime's
             // drop would wait on them forever.
@@ -5144,6 +5146,16 @@ async fn serve(
         }
     }
     Ok(())
+}
+
+/// The served / fallback audit line at exit: the exit skips the engines' unload, which logs it.
+fn log_library_attention_launches() {
+    #[cfg(feature = "cuda")]
+    if let Some((served, fallback)) =
+        plowrt::exec::gpu::GpuEngine::library_attention_process_launches()
+    {
+        tracing::info!(served, fallback, "library prefill attention launches");
+    }
 }
 
 /// `plowrt asr --port`: the cohort engine's routes over TCP and, optionally, a Unix socket, with

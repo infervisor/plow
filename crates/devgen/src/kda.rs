@@ -2356,7 +2356,7 @@ mod tests {
             assert!(
                 ops.contains(&(*op as u16)),
                 "{op:?} is not emitted — an opcode nothing \
-                    reaches is how Mamba2Scan became dead code"
+                    reaches is how Mamba2Scan stayed block-only"
             );
         }
         // ...and NOTHING from the other spelling, or the layer would run the chain twice.

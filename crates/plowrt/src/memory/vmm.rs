@@ -102,6 +102,12 @@ pub trait VmmOps: Send + Sync {
         None
     }
 
+    /// Block until every copy this backend queued on any stream has completed (teardown, before
+    /// the memory those copies touch is freed). Default: copies are complete on return.
+    fn quiesce(&self) -> Result<()> {
+        Ok(())
+    }
+
     /// Take every pooled physical chunk `(handle, bytes)` a previous
     /// [`VmmSlab`] kept via [`Self::pool_put`]. Re-mapping a pooled chunk is
     /// ~free (map+set_access, µs-class) where creating one pays the driver's
@@ -482,6 +488,19 @@ impl VmmRings {
     pub fn enable_bounded_park(&mut self, cap_bytes: u64) {
         self.enable_handle_recycling(cap_bytes);
         self.bounded = true;
+    }
+
+    /// Slots the rings serve.
+    pub fn slots(&self) -> usize {
+        self.mapped.len()
+    }
+
+    /// Set the bounded park's cap, releasing what it holds above it.
+    pub fn set_park_cap(&mut self, cap_bytes: u64) {
+        if self.bounded {
+            self.spare_cap = cap_bytes;
+            self.trim_spare();
+        }
     }
 
     /// Released units kept for reuse ([`Self::enable_handle_recycling`]), parked ones included.
@@ -1326,7 +1345,8 @@ pub trait SnapBlocks: Send + Sync {
     /// where they have not landed. Called at an attach and, ahead of it, by the arrival
     /// prefetch ([`VmmKv::prefetch`]).
     fn restore(&self, handle: u64) -> Result<()>;
-    /// A restore of the boundary's blocks is still in flight.
+    /// A block of the boundary is not readable on the device yet (host-resident, or its
+    /// restore in flight).
     fn restoring(&self, _handle: u64) -> bool {
         false
     }
@@ -1336,6 +1356,11 @@ pub trait SnapBlocks: Send + Sync {
     fn pending_spill_bytes(&self) -> u64;
     /// Device pressure: drop released blocks and give empty slabs back; bytes released.
     fn shrink(&self, bytes: u64) -> u64;
+    /// Boundaries carry recurrent state: one is publishable only while its slot's prefill stands
+    /// exactly at it.
+    fn captures_state(&self) -> bool {
+        false
+    }
 }
 
 impl SnapStore {
@@ -1386,6 +1411,9 @@ struct HostTier {
     quarantined: u32,
 }
 
+/// Spill copies in flight before a new boundary spill waits for them to land (the boundary that
+/// crosses it is queued whole).
+pub const SPILL_AHEAD_INFLIGHT_BYTES: u64 = 256 << 20;
 /// One pinned allocation per chunk of host tier slots.
 const HOST_CHUNK_BYTES: u64 = 1 << 30;
 /// Spills whose device buffer is still held; at the cap the oldest is waited for.
@@ -1675,7 +1703,22 @@ struct Shared {
     /// Bumped by every change to what [`rows_for`] can match (published blocks and snapshots), so
     /// a [`PrefixProbe`] reader may keep a prompt's rows until it moves.
     cache_gen: AtomicU64,
+    /// Block-store restores for the `vmm-restore` worker ([`VmmKv::spawn_spill_ahead`]); `None`
+    /// = no worker, prefetches restore inline.
+    restore_jobs: Mutex<Option<std::collections::VecDeque<RestoreJob>>>,
+    restore_cv: parking_lot::Condvar,
 }
+
+/// A queued block-store restore: a host-resident boundary (snapshot id), or the host-resident
+/// blocks of a device boundary (store handle; blocks it shares with a spilled boundary).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RestoreJob {
+    Snapshot(u64),
+    Blocks(u64),
+}
+
+/// Queue bound: a burst of arrivals beyond it restores at admission instead.
+const RESTORE_JOBS_MAX: usize = 256;
 
 fn cache_changed(s: &Shared) {
     s.cache_gen.fetch_add(1, Ordering::Release);
@@ -1702,6 +1745,11 @@ pub struct VmmKv {
     host_join: Option<std::thread::JoinHandle<()>>,
     /// [`Self::spawn_spill_ahead`]: stop flag + join.
     spill_ahead: Option<(
+        Arc<std::sync::atomic::AtomicBool>,
+        std::thread::JoinHandle<()>,
+    )>,
+    /// [`Self::spawn_spill_ahead`]'s restore worker: stop flag + join.
+    restorer: Option<(
         Arc<std::sync::atomic::AtomicBool>,
         std::thread::JoinHandle<()>,
     )>,
@@ -1861,6 +1909,8 @@ impl VmmKv {
             frontier: (0..batch).map(|_| AtomicU32::new(0)).collect(),
             generation: (0..batch).map(|_| AtomicU64::new(0)).collect(),
             cache_gen: AtomicU64::new(0),
+            restore_jobs: Mutex::new(None),
+            restore_cv: parking_lot::Condvar::new(),
         });
         let mut pool = VmmKv {
             prefix_reuse,
@@ -1872,6 +1922,7 @@ impl VmmKv {
             precreate: None,
             host_join: None,
             spill_ahead: None,
+            restorer: None,
         };
         {
             let mut inner = shared.inner.lock();
@@ -2470,6 +2521,17 @@ impl VmmKv {
         self.try_attach_keyed(seq, prompt, None)
     }
 
+    /// The block-store handle `prompt` would attach, when its boundary lives in the store.
+    pub fn attach_handle(&self, prompt: &[u32], key: Option<&PrefixKey>) -> Option<u64> {
+        let s = &self.shared;
+        let mut inner = s.inner.lock();
+        let id = attach_target(s, &mut inner, prompt, key)?;
+        match snap_ref(&inner, id)?.store {
+            SnapStore::Blocks { handle, .. } => Some(handle),
+            _ => None,
+        }
+    }
+
     /// [`Self::try_attach`] with the prompt's block hashes already computed (by the DP router);
     /// a key for another block size or prompt is ignored and the prompt hashed here.
     pub fn try_attach_keyed(
@@ -3061,6 +3123,10 @@ impl VmmKv {
             }
         }
         inner.cache.release(&hashes, m.blocks);
+        let state = inner
+            .block_store
+            .as_ref()
+            .is_some_and(|h| h.captures_state());
         let mut best: Option<(usize, u32, bool)> = None;
         for (owner, other) in inner.seqs.iter().enumerate() {
             if owner == seq || !inner.prefilling[owner] {
@@ -3079,7 +3145,11 @@ impl VmmKv {
                 .prompt_rows
                 .saturating_sub(lookback as usize)
                 .div_ceil(br);
-            let block_rows = if shared >= reachable {
+            // A recurrent model's owner captures a checkpoint only at a chunk end it has not
+            // passed yet (`state_capture_cut`).
+            let block_rows = if shared >= reachable
+                && !(state && shared * br <= frontier.get(owner).copied().unwrap_or(0) as usize)
+            {
                 (shared * br) as u32
             } else {
                 0
@@ -3365,8 +3435,14 @@ impl VmmKv {
             .spawn(move || {
                 while !flag.load(Ordering::Relaxed) {
                     store.reap();
-                    let spilled =
-                        store.device_headroom_bytes() < headroom && spill_ahead_step(&shared);
+                    // Spills in flight count as headroom already, and few are queued at once:
+                    // the copies share the device-to-host copy engine with the engine's own
+                    // readbacks, which waited behind GiB-sized spill bursts (ticks of 0.3-0.9 s
+                    // at c32 on Qwen3.8 BF16, 147 MiB state blocks).
+                    let pending = store.pending_spill_bytes();
+                    let spilled = pending < SPILL_AHEAD_INFLIGHT_BYTES
+                        && store.device_headroom_bytes() + pending < headroom
+                        && spill_ahead_step(&shared);
                     if !spilled {
                         std::thread::sleep(std::time::Duration::from_millis(2));
                     }
@@ -3375,6 +3451,46 @@ impl VmmKv {
         match spawned {
             Ok(j) => self.spill_ahead = Some((stop, j)),
             Err(e) => tracing::warn!(error = %e, "vmm: spill-ahead thread not started"),
+        }
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flag = Arc::clone(&stop);
+        // Arrival prefetches and admission-time restores queue here: each queues one H2D copy
+        // per host block (2-3 ms per boundary), which on the dispatcher delayed the next tick.
+        *self.shared.restore_jobs.lock() = Some(std::collections::VecDeque::new());
+        let shared = Arc::clone(&self.shared);
+        let spawned = std::thread::Builder::new()
+            .name("vmm-restore".into())
+            .spawn(move || {
+                while !flag.load(Ordering::Relaxed) {
+                    let job = {
+                        let mut jobs = shared.restore_jobs.lock();
+                        if jobs.as_ref().is_some_and(|q| q.is_empty()) {
+                            shared
+                                .restore_cv
+                                .wait_for(&mut jobs, std::time::Duration::from_millis(20));
+                        }
+                        jobs.as_mut().and_then(|q| q.pop_front())
+                    };
+                    match job {
+                        Some(RestoreJob::Snapshot(id)) => {
+                            restore_snapshot_blocks(&shared, id);
+                        }
+                        Some(RestoreJob::Blocks(handle)) => {
+                            let hook = shared.inner.lock().block_store.clone();
+                            if let Some(hook) = hook {
+                                let _ = hook.restore(handle);
+                            }
+                        }
+                        None => {}
+                    }
+                }
+            });
+        match spawned {
+            Ok(j) => self.restorer = Some((stop, j)),
+            Err(e) => {
+                *self.shared.restore_jobs.lock() = None;
+                tracing::warn!(error = %e, "vmm: restore worker not started");
+            }
         }
     }
 
@@ -3781,8 +3897,19 @@ impl PrefixProbe {
         let Some(id) = attach_target(s, &mut inner, prompt, key) else {
             return false;
         };
+        // With the restore worker the copies are queued off this (the dispatcher's) thread.
+        match snap_ref(&inner, id).map(|x| x.store) {
+            Some(SnapStore::Blocks {
+                state: BlockState::Host,
+                ..
+            }) if queue_restore(s, RestoreJob::Snapshot(id)) => return true,
+            Some(SnapStore::Blocks {
+                handle,
+                state: BlockState::Device,
+            }) if queue_restore(s, RestoreJob::Blocks(handle)) => return false,
+            _ => {}
+        }
         let snap = snap_mut(&mut inner, id).expect("found above");
-        let bytes = snap.bytes;
         let handle = match snap.store {
             SnapStore::Host(slot) => {
                 snap.store = SnapStore::Restoring(slot);
@@ -3793,64 +3920,27 @@ impl PrefixProbe {
                 return true;
             }
             SnapStore::Blocks {
-                handle,
                 state: BlockState::Host,
-            } => handle,
+                ..
+            } => {
+                drop(inner);
+                return restore_snapshot_blocks(s, id);
+            }
             // Blocks spilled with another boundary and shared by this one are host-resident
             // under a boundary the pool holds on the device: the store restores those too.
             SnapStore::Blocks {
                 handle,
                 state: BlockState::Device,
-            } => {
-                let hook = inner
-                    .block_store
-                    .clone()
-                    .expect("a block snapshot has a store");
-                drop(inner);
-                let _ = hook.restore(handle);
-                return false;
-            }
+            } => handle,
             _ => return false,
         };
-        snap.store = SnapStore::Blocks {
-            handle,
-            state: BlockState::Restoring,
-        };
-        snap.users += 1;
-        inner.stats.host_prefetches += 1;
         let hook = inner
             .block_store
             .clone()
             .expect("a block snapshot has a store");
         drop(inner);
-        let restored = hook.restore(handle);
-        let mut inner = s.inner.lock();
-        let tick = inner.snapshot_tick;
-        let snap = snap_mut(&mut inner, id).expect("held");
-        snap.users -= 1;
-        match restored {
-            Ok(()) => {
-                snap.store = SnapStore::Blocks {
-                    handle,
-                    state: BlockState::Device,
-                };
-                snap.last_used = tick;
-                inner.stats.host_snapshots -= 1;
-                inner.stats.host_snapshot_bytes -= bytes;
-                inner.stats.snapshot_bytes += bytes;
-                inner.stats.cache_bytes += bytes;
-                inner.stats.snapshots_restored += 1;
-            }
-            Err(error) => {
-                tracing::warn!(error = %error, "kv store: prefetch restore failed");
-                snap.store = SnapStore::Blocks {
-                    handle,
-                    state: BlockState::Host,
-                };
-            }
-        }
-        s.host_cv.notify_all();
-        true
+        let _ = hook.restore(handle);
+        false
     }
 
     /// The restore of the boundary `prompt` would attach is still in flight: the request is
@@ -3870,6 +3960,16 @@ impl PrefixProbe {
                 state: BlockState::Restoring,
                 ..
             }) => true,
+            // Not restored yet (its prefetch is queued, or was refused): queue it again; the
+            // gather would otherwise read it in place over the host link. Pending while it is
+            // host-resident (the caller bounds the wait), queued or not.
+            Some(SnapStore::Blocks {
+                state: BlockState::Host,
+                ..
+            }) => {
+                queue_restore(s, RestoreJob::Snapshot(id));
+                true
+            }
             Some(SnapStore::Blocks {
                 handle,
                 state: BlockState::Device,
@@ -3878,6 +3978,7 @@ impl PrefixProbe {
                 drop(inner);
                 let pending = hook.restoring(handle);
                 if pending {
+                    queue_restore(s, RestoreJob::Blocks(handle));
                     s.inner.lock().stats.restore_holds += 1;
                 }
                 return pending;
@@ -3893,6 +3994,79 @@ impl PrefixProbe {
     pub fn key(&self, prompt: &[u32]) -> PrefixKey {
         PrefixKey::new(prompt, self.0.block_rows)
     }
+}
+
+/// Queue `job` for the restore worker; `false` = no worker or the queue is full (the caller
+/// restores inline or not at all). A job already queued is not queued twice.
+fn queue_restore(s: &Shared, job: RestoreJob) -> bool {
+    let mut jobs = s.restore_jobs.lock();
+    let Some(q) = jobs.as_mut() else {
+        return false;
+    };
+    if !q.contains(&job) {
+        if q.len() >= RESTORE_JOBS_MAX {
+            return false;
+        }
+        q.push_back(job);
+        s.restore_cv.notify_one();
+    }
+    true
+}
+
+/// Restore the host-resident block-store boundary `id` (its blocks' H2D copies are queued by
+/// the store; a gather waits on their fences). `false` = it is not a host-resident boundary.
+fn restore_snapshot_blocks(s: &Shared, id: u64) -> bool {
+    let mut inner = s.inner.lock();
+    let Some(snap) = snap_mut(&mut inner, id) else {
+        return false;
+    };
+    let SnapStore::Blocks {
+        handle,
+        state: BlockState::Host,
+    } = snap.store
+    else {
+        return false;
+    };
+    let bytes = snap.bytes;
+    snap.store = SnapStore::Blocks {
+        handle,
+        state: BlockState::Restoring,
+    };
+    snap.users += 1;
+    inner.stats.host_prefetches += 1;
+    let hook = inner
+        .block_store
+        .clone()
+        .expect("a block snapshot has a store");
+    drop(inner);
+    let restored = hook.restore(handle);
+    let mut inner = s.inner.lock();
+    let tick = inner.snapshot_tick;
+    let snap = snap_mut(&mut inner, id).expect("held");
+    snap.users -= 1;
+    match restored {
+        Ok(()) => {
+            snap.store = SnapStore::Blocks {
+                handle,
+                state: BlockState::Device,
+            };
+            snap.last_used = tick;
+            inner.stats.host_snapshots -= 1;
+            inner.stats.host_snapshot_bytes -= bytes;
+            inner.stats.snapshot_bytes += bytes;
+            inner.stats.cache_bytes += bytes;
+            inner.stats.snapshots_restored += 1;
+        }
+        Err(error) => {
+            tracing::warn!(error = %error, "kv store: prefetch restore failed");
+            snap.store = SnapStore::Blocks {
+                handle,
+                state: BlockState::Host,
+            };
+        }
+    }
+    s.host_cv.notify_all();
+    true
 }
 
 /// The published boundary `prompt` would attach: the longest whose rows the prompt extends.
@@ -4559,6 +4733,11 @@ impl Drop for VmmKv {
         }
         if let Some((stop, j)) = self.spill_ahead.take() {
             stop.store(true, Ordering::Release);
+            let _ = j.join();
+        }
+        if let Some((stop, j)) = self.restorer.take() {
+            stop.store(true, Ordering::Release);
+            self.shared.restore_cv.notify_all();
             let _ = j.join();
         }
         if let Some(j) = self.host_join.take() {
@@ -5297,11 +5476,18 @@ pub(crate) fn host_mem_available() -> Option<(u64, u64)> {
 
 /// Host RAM the pinned tier leaves to the rest of the machine: an eighth of it, at least
 /// 16 GiB (pinned pages cannot be reclaimed; a co-tenant build must not OOM-kill the server).
-/// `host_tier_auto` is the tier the rule allows now: `MemAvailable` minus that reserve.
+/// `host_tier_auto` returns `(default tier capacity, host reserve)`; see [`host_tier_default`].
 pub(crate) fn host_tier_auto() -> Option<(u64, u64)> {
     let (avail, total) = host_mem_available()?;
-    let reserve = host_reserve(total);
-    Some((avail.saturating_sub(reserve), reserve))
+    Some((host_tier_default(avail, total), host_reserve(total)))
+}
+
+/// The unconfigured tier: `MemAvailable` less the reserve, and at most a quarter of the host.
+/// The tier never gives pages back, so filling the host to the reserve left a co-tenant
+/// compile (22-38 GB per process) nothing and the OOM killer took the server; the 12B prefix
+/// hit rate moved at most 0.2 pt between 64 GiB and 205 GiB on a 248 GiB host.
+pub(crate) fn host_tier_default(avail: u64, total: u64) -> u64 {
+    avail.saturating_sub(host_reserve(total)).min(total / 4)
 }
 
 pub(crate) fn host_reserve(total: u64) -> u64 {
@@ -6657,6 +6843,19 @@ pub fn hash_blocks(prompt: &[u32], block_rows: u32) -> Vec<BlockHash> {
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicI64, AtomicU64};
+
+    #[test]
+    fn host_tier_default_respects_cap_and_reserve() {
+        const GIB: u64 = 1 << 30;
+        // 248 GiB host, idle: a quarter, not everything above the 31 GiB reserve.
+        assert_eq!(host_tier_default(240 * GIB, 248 * GIB), 62 * GIB);
+        // Busy host: the reserve still binds below the quarter.
+        assert_eq!(host_tier_default(60 * GIB, 248 * GIB), 29 * GIB);
+        // Small host: the 16 GiB reserve floor.
+        assert_eq!(host_tier_default(30 * GIB, 32 * GIB), 8 * GIB);
+        assert_eq!(host_tier_default(20 * GIB, 32 * GIB), 4 * GIB);
+        assert_eq!(host_tier_default(10 * GIB, 32 * GIB), 0);
+    }
 
     fn live_blob() -> crate::asset::devblob::DevBlob {
         use crate::asset::devblob::{DevBlob, DevProg, DevTensor};
@@ -8643,6 +8842,32 @@ mod tests {
         let st = p.stats();
         assert_eq!((st.host_snapshots, st.snapshots_live), (2, 2));
         assert_eq!(p.cached_rows(&a), 16);
+        policy::check_tree(&p.shared.inner.lock());
+    }
+
+    /// With every store boundary on the host, device pressure has nothing to take: the radix
+    /// leaf fallback must not drop host-resident boundaries (it freed no device bytes and emptied
+    /// the host tier, one leaf per retry of a refused publish).
+    #[test]
+    fn reclaim_never_drops_host_resident_store_boundaries() {
+        let ops = Arc::new(MockVmm::default());
+        let p = pool(ops.clone());
+        p.enable_block_store(Arc::new(SpillBlocks), true);
+        for (i, base) in [0u32, 500].into_iter().enumerate() {
+            let t: Vec<u32> = (base..base + 17).collect();
+            p.try_attach(0, &t).unwrap();
+            p.ensure_rows(0, 17).unwrap();
+            p.publish_blocks(0, &t, 16, Kind::PROMPT_END, || Ok((7 + i as u64, 100)))
+                .unwrap();
+            p.begin_seq(0);
+        }
+        assert!(p.reclaim_one());
+        assert!(p.reclaim_one());
+        assert_eq!(p.stats().host_snapshots, 2);
+        assert!(!p.reclaim_one(), "nothing on the device");
+        let st = p.stats();
+        assert_eq!((st.snapshots_live, st.nodes_evicted), (2, 0));
+        assert_eq!(p.cached_rows(&(500..517).collect::<Vec<u32>>()), 16);
         policy::check_tree(&p.shared.inner.lock());
     }
 

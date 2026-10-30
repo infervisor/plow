@@ -1,6 +1,10 @@
 # Gemma-4-12B-it FP8 (hub checkpoint, re-keyed) on H100 SXM5: FP8 W8A8 weights, FP8 per-token-head
 # KV, 16K context, 128 decode slots, prefix cache on. Production recipe for this model/GPU/precision.
 #
+# Checkpoint: hub HYPR4AI/Gemma-4-12B-it-FP8 @ eff0443cd167de86c7cf6ff6d2eb11d0cac3ad69 (model.safetensors
+# sha256 42af19bbd16c1b6a9996b01b13c558a79a3e4198f2fad3b1fafab7fb4c8bc3e9), re-keyed to plow's fp8/ contract
+# without requantizing (scripts/gemma4_fp8_hub_rekey.py); GEMMA12B_CHECKPOINT = the re-keyed dir.
+#
 #   PLOW_CAMPAIGN_NO_NIX=1 (box without nix only) \
 #   python3 scripts/campaign/campaign.py build recipes/infervisor/gemma-4-12b/sm90a-h100-tp1.toml --out <fresh dir>
 #
@@ -69,7 +73,8 @@
 # (random-token rows): 29 riders 19-21 -> 21-26 agree, 8 riders 4-6 -> 1-3. FP32-reference gate
 # c16 PASS 3 of 4 runs (cont_decisive 41 / 43 / 41 / 40 of 46, floor 42/46 - 0.022 = 41/46; the
 # miss is one case, accepted as run-to-run spread with kl_trim 0.045-0.048 vs 0.056 before, vLLM
-# 0.065). Production
+# 0.065); 2026-10-28 the margin became the perf-for-accuracy rule's (peer - 2 cases, [gates]),
+# under which 5 of 5 runs pass. Production
 # mix vs vLLM 0.29 (MATCHED + EQUIVALENT): 1.8/s tok/s 0.99x, TTFT P99 1.24x, TPOT P99 0.99x; 2.7/s
 # 0.99x / 1.25x / 0.82x, goodput 9.005 vs 8.902 req/s, SLO met 97.2% vs 95.7% (was 87.7%). A ladder
 # without the rider spill rungs (1088/1152/2112/4160/4224) lost at 2.7/s (SLO met 89.7-97.1%).
@@ -106,13 +111,15 @@ max_ctx = 16384
 toolchain = "cuda-12.9-nix"
 
 [checkpoint]
-source = "gemma-4-12b-it-fp8"
+source = "hf:HYPR4AI/Gemma-4-12B-it-FP8"
+revision = "eff0443cd167de86c7cf6ff6d2eb11d0cac3ad69"
+sha256 = { "model.safetensors" = "42af19bbd16c1b6a9996b01b13c558a79a3e4198f2fad3b1fafab7fb4c8bc3e9" }
 layout = "plow-fp8-hub-rekey"
 
 [cell]
 name = "gemma4-12b.h100.fp8kv-16k-c128"
-model = "gemma-4-12b-it-fp8 (compressed-tensors, re-keyed)"
-revision = "local"
+model = "HYPR4AI/Gemma-4-12B-it-FP8 (compressed-tensors, re-keyed)"
+revision = "eff0443cd167de86c7cf6ff6d2eb11d0cac3ad69"
 hf_dir = "{env:GEMMA12B_CHECKPOINT}"
 gpu = "H100 SXM5"
 arch = "sm_90a"
@@ -161,7 +168,7 @@ PLOW_QNORM_FUSE = "1"
 
 [objects]
 script = "scripts/build_sm90a_gemma4_segments.sh"
-role_files = ["gen_sm90a_attn_pf_hd256_sliding_fp8kv.cubin", "gen_sm90a_attn_pf_hd512_fp8kv.cubin"]
+role_files = ["gen_sm90a_attn_pf_hd256_sliding_fp8kv.cubin", "gen_sm90a_attn_pf_hd512_fp8kv.cubin", "plow_fa4_hd512.aot"]
 [objects.env]
 PLOW_BUILD_FATLITE = "1"
 NVCC_APPEND_FLAGS = "-DPLOW_NV_GLU_QUANT_CACHE=1 -DPLOW_NV_GLU_QUANT_WPR=1"
@@ -172,8 +179,28 @@ PLOW_BUILD_PFATTN_HD256_BKV32 = "0"
 PLOW_BUILD_PFATTN_HD256_GQA2_BKV32 = "0"
 PLOW_BUILD_PFATTN_HD512_PX4_BQ64 = "0"
 PLOW_BUILD_GEN_KERNELS = "attn_pf_hd256_sliding_fp8kv,attn_pf_hd512_fp8kv"
+# Global (hd512) prefill attention through the library route with an fp16 page pool (plowrt
+# exec/gpu/lib_attention.rs, docs/arch/28): FlashAttention-4's SM90 forward exported AOT over fp16
+# as cubins into objects/plow_fa4_hd512.aot with the FP8 KV page-gather cubin, launched by plowrt
+# itself (scripts/fa4_aot/build.py; byte-reproducible; the export needs PYREF with vLLM's
+# vllm_flash_attn and the CuTe DSL). Until 2026-10-29 the same cubins ran from a host library.
+# Qualified 2026-10-29 on lib-attn over prod-next b36fcf18c (bin6 aef05632), packet a0464475f8ab:
+# 16000-token prompt, packed prefill chunk 2048/1024/512/128 0.608/0.633/0.758/2.375 -> 0.549/0.572/
+# 0.677/1.813 s. Prod-fidelity replay 2.7/s, 2 reps, same binary: TTFT P99 826.7 -> 697.2 ms (0.62x
+# vLLM 0.29), TPOT P99 71.1 -> 62.7 ms, goodput 9.39 -> 9.41 req/s, SLO 100%. FP32 gate vs same-
+# concurrency vLLM 0.28 peers, thresholds unchanged: c1 PASS kl_trim 0.0678 (peer 0.0631) top1 0.9764
+# (0.9803) cont 41/46 (43; limit 41: at the limit, c1 deterministic; native 44); c8 PASS 0.0680
+# (0.0678) cont 40 (42); c32 PASS 0.0707 (0.0710) cont 39 (41). Relax-for-perf rule also met at c1
+# (kl_trim <= 1.10x peer, top1 >= peer - 0.005, cont >= peer - 2). Per-site dumps of a 15872-token
+# natural case: route O vs FP32 attention rel-L2 1.69-1.73e-3 on all 56 sites (native 1.7e-3); the
+# natural-text KL shift vs native is a rounding re-roll (per case 9 better / 11 worse of 20). The
+# bf16 pool fails c1 (cont 40). Evidence: docs/bringup/results/gemma12b-fp8-20260930/comparison.md.
+PLOW_BUILD_FA4_HD512 = "f16"
 
 [emit_roles.env]
+# The packet declares the library route on every prefill rung (lib-attn2; plowrt runs only what
+# the packet declares).
+PLOW_EMIT_ATTN_LIBRARY = "1"
 PLOW_GEMMA4_SM90_W8A8_GEMM_GLU_ROLE = "0"
 PLOW_GEMMA4_SM90_HD512_PX4_BQ64_ROLE = "0"
 PLOW_GEMMA4_SM90_HD256_GQA2_ROLE = "0"
@@ -188,8 +215,18 @@ PLOW_PF_INTERLEAVE = "2048"
 PLOW_VMM_LIVE_RINGS = "0"
 PLOW_MULTISTEP = "0"
 PLOW_DECODE_MAX_RUNG = "128"
-PLOW_TOKEN_BATCH = "1"
 PLOW_PF_NORM_ROW_BLOCKS = "1152"
+# Host KV tier cap (2026-10-28, plowrt c0d9e0d5 + packet a0464475f8ab, 2.7/s production replay,
+# 2 reps). Unset, the tier pinned 205 GiB of a 248 GiB host and froze at the 31 GB reserve; a
+# co-tenant compile then OOM-killed the server. Prefix token hit per cell (1.8 r1 / 2.7 r1 /
+# 1.8 r2 / 2.7 r2): uncapped 78.3 / 76.8 / 79.6 / 77.6, 128 GiB 78.3 / 76.8 / 79.6 / 77.6,
+# 64 GiB 78.3 / 76.8 / 79.6 / 77.6, 32 GiB 78.0 / 75.8 / 79.3 / 74.1 (-3.5 pt). 2.7/s TTFT P99
+# vs vLLM: uncapped 3.00x (5.3 s in the tier-growth rep), 128 GiB 1.93x, 64 GiB 1.34x.
+PLOW_VMM_HOST_CACHE_MIB = "65536"
+# Not set: PLOW_LT_FP8_FAST_ACCUM_MAX_K=8192 (packed prefill 512..4096 rows -4..-8%). Under the
+# perf-for-accuracy rule ([gates]) it fails: c16 cont_decisive 42 / 38 / 39 of 46 vs floor 40 (1 of
+# 3; kl_trim 0.0526 / 0.0586 / 0.0587, top1_decisive 0.9852 / 0.9793 / 0.9803 within bounds),
+# 2026-10-28, /opt/dlami/nvme/lava-tts/{g12-decode/gates/fa-c16,fa-c16b,gate-policy/gates/g12-fa-c16c}.
 
 [bench]
 backend = "openai"
@@ -234,7 +271,17 @@ vllm_capture = "{env:GEMMA12B_FP32_VLLM}"
 # free-run flips 41-43 cases of 46 against the peer's 42, a different case set each run (one case
 # = 0.0217), while kl_mean 0.08 vs 0.13, over-0.1 116 vs 123 and top1_decisive 0.984 vs 0.982 beat
 # the vLLM capture every run.
-cont_decisive_drop_max = 0.022
+# Perf-for-accuracy relaxation (2026-10-28, docs/bringup/agent-tools.md "Gate relaxation for
+# significant perf gains"): 0.022 -> 0.044 = the peer minus 2 cases (40 of 46). Gain: packet
+# a0464475f8ab (pf2) packed prefill 7-23% faster on every rung (header, 2026-10-27). c16 runs of
+# that packet vs this peer (kl_trim <= 0.0718, kl_p95 <= 0.404, top1_decisive >= 0.9773,
+# cont_decisive >= 40, needle >= 1): kl_trim 0.0478 / 0.0473 / 0.0453 / 0.0471 / 0.0478, kl_p95
+# 0.315 / 0.287 / 0.317 / 0.292 / 0.315, top1_decisive 0.9843 / 0.9852 / 0.9872 / 0.9852 / 0.9843,
+# cont_decisive 40 / 41 / 43 / 41 / 40, needle 1: 5 of 5 within the rule (vLLM 0.0653 / 0.367 /
+# 0.9823 / 42 / 1; its second capture 0.0573 / 0.298 / 0.9882 / 42 / 1). The peer is vLLM 0.28;
+# no 0.29 FP32 capture exists for this model. Evidence: /opt/dlami/nvme/lava-tts/g12-decode/gates
+# (pf2-c16, pf2-c16b..d, d5-c16).
+cont_decisive_drop_max = 0.044
 
 [reference]
 csv = "perf-data/campaign/gemma4-12b.h100.reference-vllm028-fp8.csv"

@@ -1463,6 +1463,7 @@ pub const EMIT: &[KnobSpec] = &[
     KnobSpec::new("emit.moe_pf_w8a8_fq", Some("PLOW_MOE_PF_W8A8_FQ"), Layer::Emit, Domain::Bool, ON, PROMOTED),
     KnobSpec::new("emit.moe_stage1_body", Some("PLOW_MOE_STAGE1_BODY"), Layer::Emit, Domain::Bool, OFF, OPT_IN),
     KnobSpec::new("emit.moe_stage2_body", Some("PLOW_MOE_STAGE2_BODY"), Layer::Emit, Domain::Bool, OFF, OPT_IN),
+    KnobSpec::new("emit.attn_library", Some("PLOW_EMIT_ATTN_LIBRARY"), Layer::Emit, Domain::Bool, OFF, OPT_IN).per_rung(PREFILL_RUNGS),
     KnobSpec::new("emit.no_glu_fuse", Some("PLOW_NO_GLU_FUSE"), Layer::Emit, Domain::Bool, LT_GLU_DEFAULT, LT_GLU_QUALIFIED).per_rung(PREFILL_RUNGS),
     KnobSpec::new("emit.tma_gemm", Some("PLOW_TMA_GEMM"), Layer::Emit, Domain::Bool, OFF, OPT_IN),
     KnobSpec::new("emit.gemma4_sm90_gemm_glu_role", Some("PLOW_GEMMA4_SM90_GEMM_GLU_ROLE"), Layer::Emit, Domain::Bool, OFF, OPT_IN),
@@ -1609,6 +1610,8 @@ pub const RAW_ENV: &[KnobSpec] = &[
     KnobSpec::new("env.PLOW_BUILD_FA_GQA2_PAIR", Some("PLOW_BUILD_FA_GQA2_PAIR"), Layer::RawEnv, Domain::Str, UNSET, OPT_IN),
     KnobSpec::new("env.PLOW_BUILD_FP8KV_FA", Some("PLOW_BUILD_FP8KV_FA"), Layer::RawEnv, Domain::Bool, OFF, OPT_IN),
     KnobSpec::new("env.PLOW_BUILD_FP8KV_GEMM", Some("PLOW_BUILD_FP8KV_GEMM"), Layer::RawEnv, Domain::Bool, OFF, OPT_IN),
+    KnobSpec::new("env.PLOW_BUILD_FA4_HD512", Some("PLOW_BUILD_FA4_HD512"), Layer::RawEnv, Domain::Str, UNSET, OPT_IN),
+    KnobSpec::new("env.PLOW_FA4_PY", Some("PLOW_FA4_PY"), Layer::RawEnv, Domain::Str, UNSET, OPT_IN),
     KnobSpec::new("env.PLOW_BUILD_GEMM_SMEPI", Some("PLOW_BUILD_GEMM_SMEPI"), Layer::RawEnv, Domain::Bool, OFF, OPT_IN),
     KnobSpec::new("env.PLOW_BUILD_FATLITE", Some("PLOW_BUILD_FATLITE"), Layer::RawEnv, Domain::Str, UNSET, OPT_IN),
     KnobSpec::new("env.PLOW_BUILD_FATLITE_MOE", Some("PLOW_BUILD_FATLITE_MOE"), Layer::RawEnv, Domain::Str, UNSET, OPT_IN),
@@ -1679,6 +1682,8 @@ pub const RAW_ENV: &[KnobSpec] = &[
     KnobSpec::new("env.PLOW_TR_QUIET", Some("PLOW_TR_QUIET"), Layer::RawEnv, Domain::Str, UNSET, DIAG),
     KnobSpec::new("env.PLOW_TUNE_DUMP", Some("PLOW_TUNE_DUMP"), Layer::RawEnv, Domain::Str, UNSET, DIAG),
     KnobSpec::new("env.PLOW_UNISEG", Some("PLOW_UNISEG"), Layer::RawEnv, Domain::Str, UNSET, OPT_IN),
+    KnobSpec::new("env.PLOW_VERIFY_BIN", Some("PLOW_VERIFY_BIN"), Layer::RawEnv, Domain::Str, UNSET, DIAG),
+    KnobSpec::new("env.PLOW_VERIFY_DUMP", Some("PLOW_VERIFY_DUMP"), Layer::RawEnv, Domain::Str, UNSET, DIAG),
     KnobSpec::new("env.PLOW_W4A16", Some("PLOW_W4A16"), Layer::RawEnv, Domain::Str, UNSET, REMOVED),
     KnobSpec::new("env.PLOW_XR_NOSIG", Some("PLOW_XR_NOSIG"), Layer::RawEnv, Domain::Str, UNSET, OPT_IN),
     KnobSpec::new("env.PLOW_XR_SCHED_AG_U", Some("PLOW_XR_SCHED_AG_U"), Layer::RawEnv, Domain::Str, UNSET, OPT_IN),
@@ -2372,7 +2377,11 @@ pub const OBJECT_DEFINES: &[KnobSpec] = &[
     KnobSpec::new("def.PLOW_NV_ROPE_PF", None, Layer::ObjectDefine, Domain::Bool, OFF, OPT_IN),
     KnobSpec::new("def.PLOW_GEN_FP8_KV", None, Layer::ObjectDefine, Domain::Bool, OFF, OPT_IN),
     KnobSpec::new("def.PLOW_GEN_KV_ILV", None, Layer::ObjectDefine, Domain::Bool, OFF, OPT_IN),
-    KnobSpec::new("def.PLOW_CUTLASS_HOST", None, Layer::ObjectDefine, Domain::Bool, OFF, OPT_IN),
+    KnobSpec::new("def.PLOW_CUTLASS_HOST", None, Layer::ObjectDefine, Domain::Bool, OFF, REMOVED),
+    KnobSpec::new("def.PLOW_FA4_DTYPE", None, Layer::ObjectDefine, Domain::Str, UNSET, REMOVED),
+    KnobSpec::new("def.PLOW_FA4_HOST", None, Layer::ObjectDefine, Domain::Bool, UNSET, REMOVED),
+    KnobSpec::new("def.PLOW_FA4_H", None, Layer::ObjectDefine, Domain::Str, UNSET, REMOVED),
+    KnobSpec::new("def.PLOW_FA4_KVH", None, Layer::ObjectDefine, Domain::Str, UNSET, REMOVED),
     KnobSpec::new("def.PLOW_NV_QUANT_WPR", None, Layer::ObjectDefine, Domain::Str, UNSET, OPT_IN),
     KnobSpec::new("def.PLOW_NV_QWEN_FOLD_STAGED", None, Layer::ObjectDefine, Domain::Str, UNSET, OPT_IN),
     KnobSpec::new("def.PLOW_NV_QWEN_GDN", None, Layer::ObjectDefine, Domain::Str, UNSET, OPT_IN),
@@ -2864,6 +2873,7 @@ mod tests {
             "crates/packet/src",
             "crates/plowc/src",
             "crates/kernelcaps/src",
+            "crates/lean_verify/src",
         ] {
             files(&root().join(d), Some("rs"), &mut sources);
         }
@@ -2956,11 +2966,16 @@ mod tests {
         );
         for k in OBJECT_DEFINES {
             let name = k.name();
-            assert!(
-                runtime.iter().chain(&crates).any(|(_, t)| t.contains(name)),
-                "{} appears in no runtime or crate source: delete the line",
-                k.id
-            );
+            let used = runtime.iter().chain(&crates).any(|(_, t)| t.contains(name));
+            if k.status == Status::Removed {
+                assert!(!used, "{} is Removed but still used", k.id);
+            } else {
+                assert!(
+                    used,
+                    "{} appears in no runtime or crate source: mark it Removed",
+                    k.id
+                );
+            }
         }
     }
 
