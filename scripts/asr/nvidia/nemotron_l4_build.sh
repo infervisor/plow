@@ -25,10 +25,11 @@ cargo build --release -p plowrt --features cuda,gguf,dist --example asr_nemotron
 target=${CARGO_TARGET_DIR:-$repo/target}
 "$target/release/examples/asr_nemotron_pipeline_compile" "$gguf" "$buckets" "$out/nemotron.pkt" 16 "$n_cu"
 
-# Speech ops 163..178 plus 196 (CopyColsF32: the stream programs' [cache|new] windows); a packet
-# with stream programs fails on an object without bit 33.
+# Speech ops 163..178 plus 195 (GatherRowsF32: the batched decode's slot and row gathers) and 196
+# (CopyColsF32: the stream programs' [cache|new] windows); a packet fails on an object without
+# the bits its programs use. StreamTailF32 (222) is past the mask's range, always compiled.
 cmake -S runtime -B "$out/cmake" "-DPLOW_CUBIN_NVCC=$(command -v nvcc)" "-D$obj=ON" -DPLOW_CUBIN_SPEECH=ON "-DPLOW_CUBIN_ARCH=$arch" \
-  -DPLOW_CUBIN_GEMMA=OFF "-DPLOW_EXTRA_DEFINES=-DPLOW_SPEECH_OPS=0x20000ffffull" > "$out/cmake.log"
+  -DPLOW_CUBIN_GEMMA=OFF "-DPLOW_EXTRA_DEFINES=-DPLOW_SPEECH_OPS=0x30000ffffull" > "$out/cmake.log"
 cmake --build "$out/cmake" --target nv_cubins >> "$out/cmake.log"
 cp "$out/cmake/cubin/${stem}_speech.cubin" "$out/"
 cp "$gguf" "$out/tokenizer.q8_0.gguf"

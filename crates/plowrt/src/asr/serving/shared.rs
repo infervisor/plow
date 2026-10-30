@@ -661,7 +661,7 @@ fn models() -> &'static Fronts {
     M.get_or_init(Default::default)
 }
 
-fn is_audio_lm(dir: &Path) -> Result<bool> {
+pub(crate) fn is_audio_lm(dir: &Path) -> Result<bool> {
     let packet = dir.join("model.pkt");
     if !packet.is_file() {
         return Ok(false);
@@ -718,10 +718,7 @@ pub(super) fn serves_audio(state: &AppState, slug: &str) -> bool {
     let Ok(bundle) = state.registry.get(slug) else {
         return false;
     };
-    models()
-        .lock()
-        .iter()
-        .any(|((dir, _), m)| *dir == bundle.dir && m.is_some())
+    bundle.is_audio()
 }
 
 /// Bind instance `slug`'s front-end now (a no-op for a model that is not an audio LM or is bound).

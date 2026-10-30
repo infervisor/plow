@@ -361,8 +361,9 @@ impl Emitter<'_> {
         let block = quantized && self.c.block_fp8.is_some();
         let (op, w, scale) = if block {
             assert!(
-                n % 128 == 0 && k % 128 == 0,
-                "{name}: block-scaled FP8 needs 128-aligned N and K"
+                n % 128 == 0 && k % 512 == 0,
+                "{name}: block-scaled FP8 needs N % 128 == 0 and K % 512 == 0 (cuBLASLt reads the \
+                 weight scale rows at a 4-float stride; the widened grid is packed)"
             );
             // The hub tensors: e4m3 bytes verbatim, the BF16 128x128 scale grid widened to f32
             // at load (exact; `f32/` names a widened checkpoint tensor).

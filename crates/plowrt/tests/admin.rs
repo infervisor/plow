@@ -283,3 +283,195 @@ async fn lifecycle_operations_serialize_per_model_without_blocking_other_models(
     );
     drop(other);
 }
+
+#[tokio::test]
+async fn version_endpoint_answers_with_current_version() {
+    let resp = make_app()
+        .oneshot(
+            Request::builder()
+                .uri("/version")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let v: serde_json::Value = serde_json::from_str(&body_string(resp).await).unwrap();
+    assert_eq!(v["version"], env!("CARGO_PKG_VERSION"));
+}
+
+#[test]
+fn unload_request_deserializes_drain_timeout() {
+    let req: plowrt::serve::admin::UnloadRequest = serde_json::from_str(
+        r#"{"model":"target-model","deregister":true,"drain_timeout_ms":15000}"#,
+    )
+    .unwrap();
+    assert_eq!(req.model, "target-model");
+    assert!(req.deregister);
+    assert_eq!(req.drain_timeout_ms, Some(15000));
+}
+
+#[tokio::test]
+async fn endpoints_are_cached_on_bundle_at_registration() {
+    let state = make_state();
+    let bundle = state.registry.get("state-model").unwrap();
+    assert_eq!(bundle.endpoints(), &["chat/completions", "completions"]);
+    assert!(!bundle.is_speech());
+    assert!(!bundle.is_audio());
+}
+
+#[cfg(feature = "cpu")]
+#[tokio::test]
+async fn portable_manager_unload_honors_drain_timeout() {
+    let state = make_state();
+    let mgr = plowrt::serve::portable::PortableManager::new(MuxConfig::default());
+    mgr.register(
+        "state-model".into(),
+        std::path::PathBuf::from("/nonexistent"),
+    );
+    state.install_portable_manager(mgr);
+
+    let req = plowrt::serve::admin::UnloadRequest {
+        model: "state-model".into(),
+        deregister: false,
+        rank: None,
+        device: None,
+        drain_timeout_ms: Some(10),
+    };
+    let resp = state.portable_manager().unwrap().unload(&state, req).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+}
+
+#[tokio::test]
+async fn unloaded_asr_model_reports_audio_endpoints_in_catalogue() {
+    let n = DIR_SEQ.fetch_add(1, Ordering::Relaxed);
+    let dir = std::env::temp_dir().join(format!("plowrt_asr_test_{}_{n}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    common::write_bundle(&dir, "asr-model");
+    std::fs::write(dir.join("audio_lm_contract.json"), b"{}").unwrap();
+
+    let backend: Arc<dyn Backend> = Arc::new(CpuBackend::new(2));
+    let execset = Arc::new(ExecutorSet::bringup(backend).unwrap());
+    let registry = Registry::new();
+    registry.load(&dir, None).unwrap();
+    let state = Arc::new(AppState::new(registry, execset));
+    let app = app(state);
+
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .uri("/v1/models")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = body_string(resp).await;
+    let val: serde_json::Value = serde_json::from_str(&body).unwrap();
+    let m = val["data"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|m| m["id"] == "asr-model")
+        .expect("asr-model in catalogue");
+    assert_eq!(
+        m["x_plow_endpoints"],
+        serde_json::json!(["audio/transcriptions", "audio/transcriptions/stream"])
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
+async fn server_brings_up_cleanly_with_zero_assets() {
+    let backend: Arc<dyn Backend> = Arc::new(CpuBackend::new(2));
+    let execset = Arc::new(ExecutorSet::bringup(backend).unwrap());
+    let registry = Registry::new();
+    let state = Arc::new(AppState::new(registry, execset));
+    let router = app(Arc::clone(&state)).merge(plowrt::serve::admin_app(Arc::clone(&state)));
+
+    let resp = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/health")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let resp = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/v1/models")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let status = resp.status();
+    let body = body_string(resp).await;
+    assert_eq!(status, StatusCode::OK, "response body: {body}");
+    let val: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(val["data"].as_array().unwrap().len(), 0);
+
+    let resp = router
+        .oneshot(
+            Request::builder()
+                .uri("/v1/models/status")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+}
+
+#[tokio::test]
+async fn load_without_assets_field_finds_local_bundle_under_models_root() {
+    let n = DIR_SEQ.fetch_add(1, Ordering::Relaxed);
+    let root = std::env::temp_dir().join(format!("plowrt_root_{}_{n}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(&root).unwrap();
+    common::write_bundle(&root.join("dynamic-model"), "dynamic-model");
+
+    let backend: Arc<dyn Backend> = Arc::new(CpuBackend::new(2));
+    let execset = Arc::new(ExecutorSet::bringup(backend).unwrap());
+    let registry = Registry::new();
+    let state = Arc::new(AppState::new(registry, execset));
+    state.install_models_roots(vec![root.clone()]);
+
+    let router = plowrt::serve::admin_app(Arc::clone(&state));
+
+    let resp = router
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/models/load")
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"model":"dynamic-model"}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    let status = resp.status();
+    let body = body_string(resp).await;
+    // Without a GPU manager, the request successfully resolved the local bundle under models_root
+    // (advancing past 404 NOT_FOUND) and reached the manager stage (501 NOT_IMPLEMENTED).
+    assert_eq!(status, StatusCode::NOT_IMPLEMENTED, "response body: {body}");
+    assert!(body.contains("no model manager on this server"));
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[tokio::test]
+async fn load_without_assets_field_reports_clear_error_when_model_does_not_exist() {
+    let resp = post("/v1/models/load", r#"{"model":"non-existent-anywhere"}"#).await;
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    let body = body_string(resp).await;
+    assert!(body.contains("not found locally") || body.contains("unknown model"));
+}

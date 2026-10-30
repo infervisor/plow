@@ -2800,6 +2800,9 @@ pub struct GpuEngine {
     /// A launch's host window is open ([`Self::token_batch_step_window`]): snapshot restores skip
     /// their stream drain and their holds wait in `deferred_attach` for the step's own drain.
     window_open: bool,
+    /// A step entry point returned an error since the stream was last drained: kernels it
+    /// enqueued may still be queued and write slots `retire_slot` is about to unmap.
+    drain_before_unmap: bool,
     deferred_attach: Vec<usize>,
     /// Recorded after a windowed launch's id read-back: [`Self::launch_in_flight`].
     window_event: Option<CudaEvent>,
@@ -7699,6 +7702,7 @@ impl GpuEngine {
                 .and(serve.manifest.kv.clone()),
             kv_geo: serve.manifest.kv.clone(),
             window_open: false,
+            drain_before_unmap: false,
             deferred_attach: Vec::new(),
             window_event: None,
             step_events: None,
@@ -8456,6 +8460,11 @@ impl GpuEngine {
         }
     }
 
+    /// Step entry points report their outcome: a failed step may leave kernels queued.
+    fn note_step_result(&mut self, failed: bool) {
+        self.drain_before_unmap |= failed;
+    }
+
     pub fn retire_slot(&mut self, b: usize, cache_output: bool) {
         self.staged_prefix[b] = None;
         self.prefix_attach_off[b] = false;
@@ -8467,10 +8476,14 @@ impl GpuEngine {
         }
         // The unmaps below are host-side, outside stream order. A step that returned an error
         // can leave kernels queued that still write this slot (an unfed row writes its KV at
-        // `pos`); a launch window's work never touches a slot it retires.
-        if !self.window_open {
-            if let Err(e) = self.be.stream_synchronize(&self.stream) {
-                tracing::warn!(slot = b, error = %e, "retire: stream drain failed");
+        // `pos`); a launch window's work never touches a slot it retires. A successful step has
+        // read its ids back and a pipelined one defers the retirement above, so only the error
+        // case drains: draining every retirement stalled the decode pipeline behind the next
+        // queued launch (26B BF16 at 2.7 sessions/s: +30 ms on 40% of prefill ticks).
+        if self.drain_before_unmap && !self.window_open {
+            match self.be.stream_synchronize(&self.stream) {
+                Ok(()) => self.drain_before_unmap = false,
+                Err(e) => tracing::warn!(slot = b, error = %e, "retire: stream drain failed"),
             }
         }
         if self.pos[b] > 0 {
@@ -8675,6 +8688,8 @@ impl GpuEngine {
                         return Err(drain);
                     }
                 }
+                // A failed admission may have queued restores into this slot before it failed.
+                self.drain_before_unmap = true;
                 self.retire_slot(b, false);
                 let oom = matches!(error, RuntimeError::Oom(_)) || error.device_code() == Some(2);
                 // Parked live rings hold device memory no request owns; when
@@ -8831,6 +8846,17 @@ impl GpuEngine {
     /// rows keep the greedy `ARGMAX_FIN` token. `None`, an all-greedy `specs`,
     /// or no loaded sampler → the greedy path, byte-identical to before.
     pub fn step_slots_sampled(
+        &mut self,
+        feeds: &[(usize, u32)],
+        specs: Option<&[DevSample]>,
+        toks: &mut Vec<u32>,
+    ) -> Result<()> {
+        let r = self.step_slots_sampled_unchecked(feeds, specs, toks);
+        self.note_step_result(r.is_err());
+        r
+    }
+
+    fn step_slots_sampled_unchecked(
         &mut self,
         feeds: &[(usize, u32)],
         specs: Option<&[DevSample]>,
@@ -9446,6 +9472,19 @@ impl GpuEngine {
         cut: Option<&dyn Fn() -> bool>,
         out: &mut Vec<u32>,
     ) -> Result<usize> {
+        let r = self.multi_step_sampled_at_most_unchecked(feeds, requested, sample, cut, out);
+        self.note_step_result(r.is_err());
+        r
+    }
+
+    fn multi_step_sampled_at_most_unchecked(
+        &mut self,
+        feeds: &[(usize, u32)],
+        requested: usize,
+        sample: Option<(&[DevSample], &dyn Fn(usize, usize) -> f32)>,
+        cut: Option<&dyn Fn() -> bool>,
+        out: &mut Vec<u32>,
+    ) -> Result<usize> {
         out.clear();
         let cfg_steps = self.take_cfg_staged();
         let sample = sample.filter(|(specs, _)| specs.iter().any(|s| s.temp > 0.0));
@@ -9763,6 +9802,17 @@ impl GpuEngine {
         lookahead: bool,
         out: &mut Vec<(usize, u32)>,
     ) -> Result<()> {
+        let r = self.pipe_step_unchecked(feeds, lookahead, out);
+        self.note_step_result(r.is_err());
+        r
+    }
+
+    fn pipe_step_unchecked(
+        &mut self,
+        feeds: &[(usize, u32)],
+        lookahead: bool,
+        out: &mut Vec<(usize, u32)>,
+    ) -> Result<()> {
         out.clear();
         if feeds.is_empty() {
             return Ok(());
@@ -9806,6 +9856,12 @@ impl GpuEngine {
 
     /// Complete every queued pipelined step; `out` receives their `(slot, token)` in order.
     pub fn pipe_drain(&mut self, out: &mut Vec<(usize, u32)>) -> Result<()> {
+        let r = self.pipe_drain_unchecked(out);
+        self.note_step_result(r.is_err());
+        r
+    }
+
+    fn pipe_drain_unchecked(&mut self, out: &mut Vec<(usize, u32)>) -> Result<()> {
         out.clear();
         while self.pipe_busy() {
             self.pipe_complete(out)?;
@@ -11911,6 +11967,12 @@ impl GpuEngine {
     ///
     /// Requires `begin_slot()` to have validated the sequence budget first.
     pub fn prefill_slot(&mut self, b: usize, prompt: &[u32]) -> Result<u32> {
+        let r = self.prefill_slot_unchecked(b, prompt);
+        self.note_step_result(r.is_err());
+        r
+    }
+
+    fn prefill_slot_unchecked(&mut self, b: usize, prompt: &[u32]) -> Result<u32> {
         loop {
             match self.prefill_chunk(b, prompt, usize::MAX)? {
                 PrefillStep::Done(tok) => return Ok(tok),
@@ -11981,6 +12043,17 @@ impl GpuEngine {
     }
 
     pub fn prefill_chunk(&mut self, b: usize, prompt: &[u32], cap: usize) -> Result<PrefillStep> {
+        let r = self.prefill_chunk_unchecked(b, prompt, cap);
+        self.note_step_result(r.is_err());
+        r
+    }
+
+    fn prefill_chunk_unchecked(
+        &mut self,
+        b: usize,
+        prompt: &[u32],
+        cap: usize,
+    ) -> Result<PrefillStep> {
         // Unpacked, a staged bucket writes every stage at once: hold the chunk to one stage.
         let cap = cap.min(
             self.packed_prefill
@@ -14141,6 +14214,12 @@ impl GpuEngine {
     /// decode step of the last prompt token (`step_slots`), so no lm_head
     /// readback happens here.
     pub fn prefill_batched(&mut self, reqs: &[PfBatchReq]) -> Result<()> {
+        let r = self.prefill_batched_unchecked(reqs);
+        self.note_step_result(r.is_err());
+        r
+    }
+
+    fn prefill_batched_unchecked(&mut self, reqs: &[PfBatchReq]) -> Result<()> {
         let chunks =
             reqs.iter()
                 .map(|r| {

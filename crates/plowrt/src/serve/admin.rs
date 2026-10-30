@@ -69,6 +69,10 @@ pub struct UnloadRequest {
     /// Select the rank by the device its group starts at.
     #[serde(default)]
     pub device: Option<u32>,
+    /// Drain timeout in milliseconds for in-flight requests. `Some(0)` preempts immediately;
+    /// unset defaults to bounded drain via `PLOW_DRAIN_TIMEOUT_MS` (or 30 s).
+    #[serde(default)]
+    pub drain_timeout_ms: Option<u64>,
 }
 
 #[derive(Debug, Serialize)]
@@ -168,7 +172,6 @@ pub(super) fn err(status: StatusCode, msg: impl std::fmt::Display) -> Response {
         .into_response()
 }
 
-#[cfg(feature = "cuda")]
 const MIB: u64 = 1 << 20;
 
 /// Resolve a requested assets dir against the `--models-root` allow-list.
@@ -207,6 +210,175 @@ fn resolve_assets(state: &AppState, dir: &str) -> std::result::Result<PathBuf, R
     Ok(canon)
 }
 
+fn find_local_bundle(
+    state: &AppState,
+    model: &str,
+    req_checkpoint: Option<&str>,
+) -> Option<(PathBuf, PathBuf)> {
+    let has_model_files = |dir: &std::path::Path| {
+        dir.is_dir()
+            && (dir.join("manifest.toml").is_file()
+                || dir.join("weights.json").is_file()
+                || dir.join("config.json").is_file()
+                || dir.join("s3gen.pkt").is_file()
+                || dir.join("codec.pkt").is_file())
+    };
+
+    let p = std::path::Path::new(model);
+    if let Ok(canon) = p.canonicalize() {
+        if has_model_files(&canon) {
+            let ckpt = req_checkpoint
+                .map(PathBuf::from)
+                .unwrap_or_else(|| crate::asset::serve::checkpoint_dir(&canon));
+            return Some((canon, ckpt));
+        }
+    }
+
+    for root in state.models_roots() {
+        let cand = root.join(model);
+        if let Ok(canon) = cand.canonicalize() {
+            if has_model_files(&canon) {
+                let ckpt = req_checkpoint
+                    .map(PathBuf::from)
+                    .unwrap_or_else(|| crate::asset::serve::checkpoint_dir(&canon));
+                return Some((canon, ckpt));
+            }
+        }
+    }
+
+    if let Ok(st) = crate::dist::Store::open_default() {
+        if let Ok(r) = crate::dist::reference::parse(model) {
+            if let Some(variant_id) = st.pinned(&r.pin_key()) {
+                let bdir = st.root().join("bundles").join(&variant_id);
+                if has_model_files(&bdir) {
+                    let ckpt = req_checkpoint
+                        .map(PathBuf::from)
+                        .unwrap_or_else(|| crate::asset::serve::checkpoint_dir(&bdir));
+                    return Some((bdir, ckpt));
+                }
+            }
+        }
+        for p in st.list() {
+            if p.reference == model || p.reference.ends_with(&format!("/{}", model)) {
+                if has_model_files(&p.dir) {
+                    let ckpt = req_checkpoint
+                        .map(PathBuf::from)
+                        .unwrap_or_else(|| crate::asset::serve::checkpoint_dir(&p.dir));
+                    return Some((p.dir, ckpt));
+                }
+            }
+        }
+    }
+
+    None
+}
+
+#[cfg(feature = "dist")]
+async fn fetch_from_pdist_and_hf(
+    state: &AppState,
+    model: &str,
+    req_checkpoint: Option<&str>,
+) -> std::result::Result<(PathBuf, PathBuf), String> {
+    let model_str = model.to_string();
+    let req_ckpt = req_checkpoint.map(|s| s.to_string());
+    let backend = state.execset.backend().clone();
+
+    tokio::task::spawn_blocking(move || -> std::result::Result<(PathBuf, PathBuf), String> {
+        let mut r = crate::dist::reference::parse(&model_str)
+            .map_err(|e| format!("parse model reference {model_str:?}: {e}"))?;
+        if r.registry == crate::dist::reference::DEFAULT_REGISTRY {
+            r.registry = crate::config::RuntimeConfig::get().registry.clone();
+        }
+
+        let f = crate::dist::transport(&r.registry)
+            .map_err(|e| format!("connect to registry {}: {e}", r.registry))?;
+        let st = crate::dist::Store::open_default()
+            .map_err(|e| format!("open store: {e}"))?;
+        let _lock = st.lock().map_err(|e| format!("lock store: {e}"))?;
+
+        let live = crate::dist::live_target(&[backend]);
+        let trust = crate::dist::sign::Trust::for_registry(
+            crate::config::RuntimeConfig::signing_env().1.as_deref(),
+            &r.registry,
+        ).map_err(|e| format!("verify trust for {}: {e}", r.registry))?;
+
+        let c = plow_asset::dist::Constraints::default();
+        let resolved = crate::dist::pull::resolve_trusted(&*f, &r, &live, c, &trust)
+            .map_err(|e| format!("resolve variant for {model_str} from {}: {e}", r.registry))?;
+
+        let (dir, t) = crate::dist::pull::pull(&st, &*f, &resolved)
+            .map_err(|e| format!("pull bundle for {model_str}: {e}"))?;
+        tracing::info!(model = %model_str, transfer = %t, dir = %dir.display(), "pulled bundle from pdist");
+
+        let dist_snapshot = (resolved.bundle.checkpoint.source == plow_asset::dist::DIST_SOURCE)
+            .then(|| crate::dist::weights::dist_snapshot_path(st.root(), &resolved.bundle))
+            .transpose()
+            .map_err(|e| e.to_string())?;
+
+        let ckpt = req_ckpt
+            .map(PathBuf::from)
+            .or_else(|| crate::config::RuntimeConfig::get().checkpoint.clone().map(PathBuf::from))
+            .or(dist_snapshot)
+            .unwrap_or_else(|| crate::dist::prepare::farm_path(st.root(), &resolved.bundle));
+
+        let ckpt = if ckpt.is_dir() {
+            ckpt
+        } else if resolved.bundle.checkpoint.source.starts_with("hf:") {
+            let c = &resolved.bundle.checkpoint;
+            tracing::info!(
+                source = %c.source,
+                revision = %c.revision,
+                shards = c.shards,
+                "fetching checkpoint weights from Hugging Face"
+            );
+            crate::dist::weights::fetch(st.root(), &c.source, &c.revision, c.shards)
+                .map_err(|e| format!("fetch Hugging Face weights {}: {e}", c.source))?
+        } else {
+            return Err(format!(
+                "{} needs checkpoint {}, but it is not available locally or on Hugging Face",
+                model_str, resolved.bundle.checkpoint.source
+            ));
+        };
+
+        let farm = crate::dist::prepare::build(st.root(), &resolved.bundle, &dir, &ckpt)
+            .map_err(|e| format!("build checkpoint farm for {model_str}: {e}"))?;
+
+        let _ = st.pin(&r.pin_key(), &resolved.variant.variant_id);
+        tracing::info!(
+            model = %model_str,
+            bundle = %dir.display(),
+            checkpoint = %farm.dir.display(),
+            shards = farm.shards,
+            "prepared model bundle and checkpoint"
+        );
+        Ok((dir, farm.dir))
+    })
+    .await
+    .map_err(|e| format!("spawn_blocking join error: {e}"))?
+}
+
+#[cfg(not(feature = "dist"))]
+async fn fetch_from_pdist_and_hf(
+    _state: &AppState,
+    model: &str,
+    _req_checkpoint: Option<&str>,
+) -> std::result::Result<(PathBuf, PathBuf), String> {
+    Err(format!(
+        "model {model:?} is not available locally; downloading from pdist and Hugging Face requires plowrt built with --features dist"
+    ))
+}
+
+async fn resolve_or_fetch_assets(
+    state: &AppState,
+    model: &str,
+    req_checkpoint: Option<&str>,
+) -> std::result::Result<(PathBuf, PathBuf), String> {
+    if let Some(pair) = find_local_bundle(state, model, req_checkpoint) {
+        return Ok(pair);
+    }
+    fetch_from_pdist_and_hf(state, model, req_checkpoint).await
+}
+
 /// `POST /v1/models/load` — make a model resident, registering its assets dir
 /// first when the slug is new.
 pub async fn load(State(state): State<Arc<AppState>>, Json(req): Json<LoadRequest>) -> Response {
@@ -217,7 +389,7 @@ pub async fn load(State(state): State<Arc<AppState>>, Json(req): Json<LoadReques
 }
 async fn load_inner(state: Arc<AppState>, mut req: LoadRequest) -> Response {
     req.model = state.registry.resolve(&req.model).unwrap_or(req.model);
-    #[cfg(feature = "cuda")]
+    #[cfg(any(feature = "cuda", feature = "hsa", feature = "cpu"))]
     if let Some(keys) = dp_targets(&state, &req.model, req.rank, req.device) {
         return match keys {
             Ok(keys) => dp_load(&state, keys, req.evict).await,
@@ -229,23 +401,42 @@ async fn load_inner(state: Arc<AppState>, mut req: LoadRequest) -> Response {
     // security boundary, and a boundary that only fires on builds which happen
     // to have a GPU manager is not one — the refusal must not depend on how far
     // the request would otherwise have got.
-    let assets = match req.assets.as_deref().map(|d| resolve_assets(&state, d)) {
-        Some(Err(refusal)) => return refusal,
-        Some(Ok(dir)) => Some(dir),
-        None => None,
+    let (assets, checkpoint_override) = if let Some(d) = req.assets.as_deref() {
+        match resolve_assets(&state, d) {
+            Ok(dir) => (Some(dir), req.checkpoint.as_deref().map(PathBuf::from)),
+            Err(refusal) => return refusal,
+        }
+    } else if !state.registry.contains(&req.model) {
+        match resolve_or_fetch_assets(&state, &req.model, req.checkpoint.as_deref()).await {
+            Ok((dir, ckpt)) => (Some(dir), Some(ckpt)),
+            Err(e) => {
+                return err(
+                    StatusCode::NOT_FOUND,
+                    format_args!(
+                        "model {:?} not registered, not found locally, and download failed: {e}",
+                        req.model
+                    ),
+                );
+            }
+        }
+    } else {
+        (None, req.checkpoint.as_deref().map(PathBuf::from))
     };
 
     #[cfg(feature = "cpu")]
     if let Some(manager) = state.portable_manager() {
+        if let Some(ref ckpt) = checkpoint_override {
+            req.checkpoint = Some(ckpt.display().to_string());
+        }
         return manager.load(&state, req, assets).await;
     }
 
-    #[cfg(feature = "cuda")]
+    #[cfg(any(feature = "cuda", feature = "hsa", feature = "cpu"))]
     {
         if state.managers().is_empty() {
             return err(
                 StatusCode::NOT_IMPLEMENTED,
-                "no GPU model manager on this server",
+                "no model manager on this server",
             );
         }
 
@@ -277,7 +468,7 @@ async fn load_inner(state: Arc<AppState>, mut req: LoadRequest) -> Response {
         let Some((group, mgr)) = target else {
             return err(
                 StatusCode::NOT_IMPLEMENTED,
-                "no GPU model manager on this server",
+                "no model manager on this server",
             );
         };
 
@@ -295,25 +486,19 @@ async fn load_inner(state: Arc<AppState>, mut req: LoadRequest) -> Response {
                     );
                 }
             }
+            let ckpt = checkpoint_override
+                .or_else(|| req.checkpoint.as_ref().map(PathBuf::from))
+                .unwrap_or_else(|| crate::asset::serve::checkpoint_dir(&dir));
             if newly_registered {
                 // The pairing is recorded first so the bundle's pin check and every HF-file read
                 // at load see the requested checkpoint.
-                if let Some(c) = &req.checkpoint {
-                    if let Err(e) =
-                        crate::asset::serve::set_checkpoint(&dir, std::path::Path::new(c))
-                    {
-                        return err(StatusCode::CONFLICT, e);
-                    }
+                if let Err(e) = crate::asset::serve::set_checkpoint(&dir, &ckpt) {
+                    return err(StatusCode::CONFLICT, e);
                 }
                 if let Err(e) = state.registry.load(&dir, Some(req.model.clone())) {
                     return err(StatusCode::BAD_REQUEST, e);
                 }
             }
-            let ckpt = req
-                .checkpoint
-                .as_ref()
-                .map(PathBuf::from)
-                .unwrap_or_else(|| crate::asset::serve::checkpoint_dir(&dir));
             if let Err(e) = mgr.register(&req.model, dir, ckpt) {
                 if newly_registered {
                     let _ = state.registry.unload(&req.model);
@@ -339,7 +524,7 @@ async fn load_inner(state: Arc<AppState>, mut req: LoadRequest) -> Response {
         }
 
         use crate::serve::manager::EnsureError;
-        return match mgr.load(&req.model, req.evict).await {
+        match mgr.load(&req.model, req.evict).await {
             Ok(load_ms) => Json(LoadResponse {
                 model: req.model,
                 state: "resident",
@@ -353,14 +538,14 @@ async fn load_inner(state: Arc<AppState>, mut req: LoadRequest) -> Response {
             Err(e @ EnsureError::Unloaded) => err(StatusCode::CONFLICT, e),
             Err(EnsureError::Load(e)) => err(StatusCode::INTERNAL_SERVER_ERROR, e),
             Err(e @ EnsureError::SwitchTimeout(_)) => err(StatusCode::SERVICE_UNAVAILABLE, e),
-        };
+        }
     }
-    #[cfg(not(feature = "cuda"))]
+    #[cfg(not(any(feature = "cuda", feature = "hsa", feature = "cpu")))]
     {
-        let _ = (state, req, assets);
+        let _ = (state, req, assets, checkpoint_override);
         err(
             StatusCode::NOT_IMPLEMENTED,
-            "model load/unload needs a GPU backend",
+            "no model manager on this server",
         )
     }
 }
@@ -378,7 +563,7 @@ pub async fn unload(
 }
 async fn unload_inner(state: Arc<AppState>, mut req: UnloadRequest) -> Response {
     req.model = state.registry.resolve(&req.model).unwrap_or(req.model);
-    #[cfg(feature = "cuda")]
+    #[cfg(any(feature = "cuda", feature = "hsa", feature = "cpu"))]
     if let Some(keys) = dp_targets(&state, &req.model, req.rank, req.device) {
         if req.deregister {
             return err(
@@ -387,7 +572,7 @@ async fn unload_inner(state: Arc<AppState>, mut req: UnloadRequest) -> Response 
             );
         }
         return match keys {
-            Ok(keys) => dp_unload(&state, keys).await,
+            Ok(keys) => dp_unload(&state, keys, req.drain_timeout_ms).await,
             Err(refusal) => refusal,
         };
     }
@@ -396,7 +581,7 @@ async fn unload_inner(state: Arc<AppState>, mut req: UnloadRequest) -> Response 
     if let Some(manager) = state.portable_manager() {
         return manager.unload(&state, req).await;
     }
-    #[cfg(feature = "cuda")]
+    #[cfg(any(feature = "cuda", feature = "hsa", feature = "cpu"))]
     {
         let Some(mgr) = state.manager_for(&req.model).cloned() else {
             return err(
@@ -410,8 +595,18 @@ async fn unload_inner(state: Arc<AppState>, mut req: UnloadRequest) -> Response 
                 format_args!("unknown model {:?}", req.model),
             );
         }
+        let drain = match req.drain_timeout_ms {
+            Some(0) => None,
+            Some(ms) => Some(std::time::Duration::from_millis(ms)),
+            None => crate::config::RuntimeConfig::get()
+                .drain_timeout_ms()
+                .map(std::time::Duration::from_millis),
+        };
         use crate::serve::manager::EnsureError;
-        let report = match mgr.unload_and_deregister(&req.model, req.deregister).await {
+        let report = match mgr
+            .unload_with_drain(&req.model, req.deregister, drain)
+            .await
+        {
             Ok(r) => r,
             Err(EnsureError::Load(e)) => return err(StatusCode::INTERNAL_SERVER_ERROR, e),
             Err(e) => return err(StatusCode::INTERNAL_SERVER_ERROR, e),
@@ -427,19 +622,19 @@ async fn unload_inner(state: Arc<AppState>, mut req: UnloadRequest) -> Response 
         })
         .into_response();
     }
-    #[cfg(not(feature = "cuda"))]
+    #[cfg(not(any(feature = "cuda", feature = "hsa", feature = "cpu")))]
     {
-        let _ = (state, req);
+        let _ = state;
         err(
-            StatusCode::NOT_IMPLEMENTED,
-            "model load/unload needs a GPU backend",
+            StatusCode::NOT_FOUND,
+            format_args!("unknown model {:?}", req.model),
         )
     }
 }
 
 /// The instance keys a load/unload of `model` addresses, when it is a DP model or one of its
 /// ranks: `None` for an ordinary model.
-#[cfg(feature = "cuda")]
+#[cfg(any(feature = "cuda", feature = "hsa", feature = "cpu"))]
 fn dp_targets(
     state: &AppState,
     model: &str,
@@ -466,7 +661,7 @@ fn dp_targets(
     })
 }
 
-#[cfg(feature = "cuda")]
+#[cfg(any(feature = "cuda", feature = "hsa", feature = "cpu"))]
 async fn dp_load(state: &Arc<AppState>, keys: Vec<String>, evict: bool) -> Response {
     use crate::serve::manager::EnsureError;
     let mut load_ms = 0f64;
@@ -502,13 +697,21 @@ async fn dp_load(state: &Arc<AppState>, keys: Vec<String>, evict: bool) -> Respo
     .into_response()
 }
 
-#[cfg(feature = "cuda")]
-async fn dp_unload(state: &Arc<AppState>, keys: Vec<String>) -> Response {
-    let bound = std::time::Duration::from_millis(
-        crate::config::RuntimeConfig::get()
-            .drain_timeout_ms()
-            .unwrap_or(30_000),
-    );
+#[cfg(any(feature = "cuda", feature = "hsa", feature = "cpu"))]
+async fn dp_unload(
+    state: &Arc<AppState>,
+    keys: Vec<String>,
+    drain_timeout_ms: Option<u64>,
+) -> Response {
+    let bound = match drain_timeout_ms {
+        Some(0) => std::time::Duration::from_millis(0),
+        Some(ms) => std::time::Duration::from_millis(ms),
+        None => std::time::Duration::from_millis(
+            crate::config::RuntimeConfig::get()
+                .drain_timeout_ms()
+                .unwrap_or(30_000),
+        ),
+    };
     let mut total = UnloadResponse {
         model: keys.join(","),
         state: "unloaded",
@@ -518,27 +721,37 @@ async fn dp_unload(state: &Arc<AppState>, keys: Vec<String>) -> Response {
         pool_trimmed_mib: 0,
         deregistered: false,
     };
-    for key in &keys {
-        let _control = state.control_lock(key).await;
-        let Some(mgr) = state.manager_for(key).cloned() else {
-            return err(
-                StatusCode::NOT_FOUND,
-                format_args!("no model manager serves {key:?}"),
-            );
-        };
-        match mgr.unload_rank(key, bound).await {
+    let tasks: Vec<_> = keys
+        .into_iter()
+        .map(|key| {
+            let state = Arc::clone(state);
+            async move {
+                let _control = state.control_lock(&key).await;
+                let Some(mgr) = state.manager_for(&key).cloned() else {
+                    return Err(err(
+                        StatusCode::NOT_FOUND,
+                        format_args!("no model manager serves {key:?}"),
+                    ));
+                };
+                mgr.unload_rank(&key, bound).await.map_err(|e| {
+                    err(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        format_args!("{key}: {e}"),
+                    )
+                })
+            }
+        })
+        .collect();
+
+    for res in futures::future::join_all(tasks).await {
+        match res {
             Ok(r) => {
                 total.stop_ms = total.stop_ms.max(r.stop_ms);
-                total.unload_ms += r.unload_ms;
+                total.unload_ms = total.unload_ms.max(r.unload_ms);
                 total.freed_mib += r.freed / MIB;
                 total.pool_trimmed_mib += r.pool_trimmed / MIB;
             }
-            Err(e) => {
-                return err(
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    format_args!("{key}: {e}"),
-                )
-            }
+            Err(refusal) => return refusal,
         }
     }
     Json(total).into_response()
@@ -584,7 +797,7 @@ pub async fn status(State(state): State<Arc<AppState>>) -> Response {
                     .collect()
             }),
         };
-        #[cfg(feature = "cuda")]
+        #[cfg(any(feature = "cuda", feature = "hsa", feature = "cpu"))]
         if let Some(set) = dp {
             let mgr = state.manager_for(&set.ranks[0].key);
             entry.required_mib = mgr
@@ -594,7 +807,7 @@ pub async fn status(State(state): State<Arc<AppState>>) -> Response {
             models.push(entry);
             continue;
         }
-        #[cfg(feature = "cuda")]
+        #[cfg(any(feature = "cuda", feature = "hsa", feature = "cpu"))]
         if let Some(mgr) = state.manager_for(&slug) {
             entry.required_mib = mgr.required(&slug).map(|b| b / MIB);
             if let Some(plan) = mgr.plan(&slug) {
@@ -609,7 +822,7 @@ pub async fn status(State(state): State<Arc<AppState>>) -> Response {
 
     #[allow(unused_mut)]
     let mut groups: Vec<GroupStatus> = Vec::new();
-    #[cfg(feature = "cuda")]
+    #[cfg(any(feature = "cuda", feature = "hsa", feature = "cpu"))]
     for (i, mgr) in state.managers().iter().enumerate() {
         let (free, total) = mgr.device_mem_info().unwrap_or((0, 0));
         groups.push(GroupStatus {
@@ -632,7 +845,7 @@ pub async fn status(State(state): State<Arc<AppState>>) -> Response {
         register: false,
         eviction: false,
     };
-    #[cfg(feature = "cuda")]
+    #[cfg(any(feature = "cuda", feature = "hsa", feature = "cpu"))]
     if !state.managers().is_empty() {
         capabilities = ControlCapabilities {
             load: true,

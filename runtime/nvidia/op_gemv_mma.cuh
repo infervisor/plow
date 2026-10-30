@@ -493,8 +493,9 @@ __device__ __forceinline__ void gvmma_fold_scale(float (&acc)[NW][MT][4]) {
 /* Fragments of every unit's warps; a group's counter is reset by its last block. */
 __device__ float gvmma_xk_part[256u * PLOW_NV_WARPS * 32u * 8u];
 __device__ unsigned gvmma_xk_cnt[256];
-__device__ __forceinline__ unsigned gvmma_xk_sb(unsigned rows, unsigned N, unsigned K, unsigned nblk) {
-    if (rows < PLOW_NV_GEMV_XK || (N & 63u) || (K & 31u)) return 0u;
+__device__ __forceinline__ unsigned gvmma_xk_sb(unsigned rows, unsigned N, unsigned K, unsigned nblk,
+                                                bool single_tile = true) {
+    if (!single_tile || nblk < gridDim.x || rows < PLOW_NV_GEMV_XK || (N & 63u) || (K & 31u)) return 0u;
     const unsigned ng = N >> 6, nkb = K >> 5;
     unsigned sb = 8u;
     while (sb > 1u && (ng * sb > nblk || (nkb % sb) != 0u)) sb >>= 1;
@@ -563,7 +564,8 @@ __device__ __forceinline__ void gemv_rows_mma(__nv_bfloat16* __restrict__ C,
                                               unsigned N, unsigned K, unsigned slice,
                                               unsigned nblk,
                                               const __nv_bfloat16* __restrict__ bias = nullptr,
-                                              const GvFoldOut* fo = nullptr) {
+                                              const GvFoldOut* fo = nullptr,
+                                              bool single_tile = true) {
     static_assert(!FOLD || (!PLOW_NV_GEMV_MMA_PAIR && !PLOW_NV_GEMV_REM_SPLIT),
                   "the norm fold takes the split-K and plain walks only");
     const unsigned lane = threadIdx.x & PLOW_NV_LANE_MASK;
@@ -574,7 +576,7 @@ __device__ __forceinline__ void gemv_rows_mma(__nv_bfloat16* __restrict__ C,
     const unsigned nkb = K >> 5;
 #if PLOW_NV_GEMV_XK
     if constexpr (MT <= 2) {
-        if (const unsigned sb = gvmma_xk_sb(rows, N, K, nblk)) {
+        if (const unsigned sb = gvmma_xk_sb(rows, N, K, nblk, single_tile)) {
             if (slice < (N >> 6) * sb) gvmma_xk_unit<BIAS, MT, ONE, FOLD>(C, x, W, rows, N, K, slice, sb, bias, fo);
             return;
         }
@@ -896,7 +898,7 @@ __device__ __forceinline__ void gemv_qkv_rows_mma(
     const __nv_bfloat16* __restrict__ Wv, unsigned rows, unsigned Nq, unsigned Nk, unsigned Nv,
     unsigned K, unsigned slice, unsigned nblk, const __nv_bfloat16* __restrict__ bq = nullptr,
     const __nv_bfloat16* __restrict__ bk = nullptr, const __nv_bfloat16* __restrict__ bv = nullptr,
-    const GvFoldIn* fi = nullptr) {
+    const GvFoldIn* fi = nullptr, bool single_tile = true) {
     static_assert(!FOLD || !PLOW_NV_GEMV_REM_SPLIT, "the norm fold takes the plain walk only");
     const unsigned lane = threadIdx.x & PLOW_NV_LANE_MASK;
     const unsigned warp = threadIdx.x >> PLOW_NV_WARP_SHIFT;
@@ -904,7 +906,7 @@ __device__ __forceinline__ void gemv_qkv_rows_mma(
 #if PLOW_NV_GEMV_XK && PLOW_NV_GEMV_XK_QKV
     /* Cross-block split-K over the concatenated rows; a 64-row unit lies inside one matrix. */
     if constexpr (MT <= 2) {
-        if (const unsigned sb = ((Nq | Nk) & 63u) ? 0u : gvmma_xk_sb(rows, Nq + Nk + Nv, K, nblk)) {
+        if (const unsigned sb = ((Nq | Nk) & 63u) ? 0u : gvmma_xk_sb(rows, Nq + Nk + Nv, K, nblk, single_tile)) {
             if (slice < ((Nq + Nk + Nv) >> 6) * sb) {
                 const unsigned gn = (slice / sb) << 6;
                 const bool iq = gn < Nq, ik = !iq && gn < Nq + Nk;
