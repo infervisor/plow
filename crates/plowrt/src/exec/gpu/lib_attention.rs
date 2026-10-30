@@ -329,6 +329,10 @@ impl Cache {
         }
         Ok(())
     }
+
+    fn check_all(&self, requests: &[attention_gemm::Request]) -> Result<()> {
+        requests.iter().try_for_each(|r| self.check(r[2], r[3]))
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -571,13 +575,15 @@ impl LibAttention {
         stream: &CudaStream,
     ) -> Result<bool> {
         self.launch = None;
+        // Before any fallback decision: a request outside the cache is an error, never a
+        // silent native run.
+        self.cache.check_all(requests)?;
         if requests.is_empty() || requests.len() > MAX_REQUESTS {
             return Ok(false);
         }
         let mut pages = 0u32;
         let mut width = 0u32;
-        for &[q0, qlen, slot, kvlen] in requests {
-            self.cache.check(slot, kvlen)?;
+        for &[q0, qlen, _, kvlen] in requests {
             if qlen == 0 || kvlen < qlen || q0.checked_add(qlen).is_none_or(|e| e > rows) {
                 return Ok(false);
             }
@@ -899,6 +905,9 @@ mod tests {
         assert!(cache.check(4, 1).is_err());
         assert!(cache.check(0, 8193).is_err());
         assert!(cache.check(u32::MAX, 1).is_err());
+        // A request the planner would fall back on does not hide a later one outside the cache.
+        assert!(cache.check_all(&[[0, 0, 0, 0], [0, 1, 4, 1]]).is_err());
+        assert!(cache.check_all(&[[0, 1, 0, 1], [1, 1, 3, 8192]]).is_ok());
     }
 
     #[test]
