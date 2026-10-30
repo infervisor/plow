@@ -61,7 +61,6 @@ nix develop --command env \
 #   eos = [248046, 248044]
 #   concurrency = [1, 8, 32]
 #   vllm_capture = {'c1': '{env:QWEN38_FP8_FP32_VLLM}', 'c8': '{env:QWEN38_FP8_FP32_VLLM_C8}', 'c32': '{env:QWEN38_FP8_FP32_VLLM_C32}'}
-#   cont_decisive_drop_max = 0.022
 ```
 <!-- /plow:recipe:gates -->
 

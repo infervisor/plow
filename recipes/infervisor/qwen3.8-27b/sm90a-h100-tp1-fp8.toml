@@ -27,7 +27,7 @@ namespace = "infervisor"
 name = "qwen3.8-27b"
 label = "sm90a-h100-tp1-fp8"
 status = "validated"
-plow_git = "8b811e455ffed12486742718128efc439bc090ba"
+plow_git = "fb618c6c6f6deb45a0cb24bd0087ba97cf6236c8"
 network = "qwen3.5"
 
 [target]
@@ -129,41 +129,19 @@ tokenizer = "{env:QWEN38_FP8_CHECKPOINT}"
 model_id = "qwen3.8-27b-fp8"
 gate_prompt = "<|im_start|>user\nWhat is the capital of France? Answer in one short sentence.<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
 
-# Served c1 (TMA M=1 acceleration, packet 6c31b3e822e097c5): vLLM 0.28 FP8 at the same cell
-# 71.6 out tok/s, TPOT p50 12.3 ms, TTFT p50 194 ms, memory 71.6 GiB. Infervisor achieves
-# 39.5 out tok/s (+108% over non-TMA baseline 18.9 tok/s), TPOT p50 22.8 ms (2x speedup over
-# non-TMA 46.0 ms), TTFT p50 333 ms, memory 31.2 GiB (0.44x memory footprint vs vLLM, 56% less memory).
-# That packet's prefill object lacked PLOW_NV_FP8_PF_SCALE_WFIRST (arm guard relaxed).
-#
-# Served with the decode ladder (2026-10-25, packet f71e777dea4324ac, plowrt bin25, ISL 1000 /
-# OSL 128, 2 repeats; campaign.py report vs vLLM 0.29.0 serving the hub FP8, quality EQUIVALENT,
-# comparison NOT MATCHED on model version/precision by construction, see the header). Baseline ->
-# Infervisor: c1 total 669 -> 339 tok/s (0.51x), TTFT P99 128.7 -> 328.1 ms, TPOT P99 12.40 ->
-# 23.65 ms, peak memory 71.5 -> 39.6 GiB; c8 3913 -> 865 tok/s (0.22x), TTFT 542.7 -> 2876.7 ms,
-# TPOT 15.39 -> 79.29 ms; c32 8566 -> 1937 tok/s (0.23x), TTFT 1983 -> 10502 ms, TPOT 30.00 ->
-# 143.15 ms. c8 and c32 serve where the single-slot packet refused them, but the multi-row FP8
-# rungs sit far off the roofline (27.4 GiB of weights = 8.2 ms per step at 3.35 TB/s; measured
-# 23.6 ms at B=1, 59.6 at B=8, 106 at B=32 p50) and the prefill path is 3x vLLM's at c1: this
-# packet is NOT competitive with vLLM at any concurrency, and the BF16 recipe serves the same
-# model with better latency. Open items, in order: the B>=2 W8A8 decode rungs (the 128-row M
-# tile of d_gemm_w8a8_sm90 against 8-32 live rows), then the W8A8 prefill buckets.
-# Evidence: /opt/dlami/nvme/lava-tts/kvstore-scratch/qwenfp8-ladder3b-run.
-#
-# Prefix cache on, production mix (2026-10-28, plowrt 01685b29c, packet 2af45e892b75, llm_grid.sh
-# --prod, 0.45 sessions/s, 2 repeats, --prod-fidelity; qwenfp8-prefix/prod): no vLLM FP8 prod-mix arm
-# exists, and the numbers above are prefix-off single-turn, not prod mix. campaign.py report against
-# vLLM 0.29 serving the BF16 checkpoint on the same seeds (NOT MATCHED on model/precision, NOT
-# EQUIVALENT from the c8 gate miss; qwenfp8-prefix/report-vs-bf16vllm): tok/s 9769 vs 9874 (0.99x),
-# TTFT P99 1496 vs 1304 ms (1.15x), TPOT P99 81.2 vs 77.3 ms (1.05x; both P99s spread-flagged),
-# TTFT/TPOT P50 376/37.5 vs 264/26.7 ms, SLO met 99.3 vs 99.3 %, goodput 1.667 vs 1.683 req/s, prefix
-# token hit 76.4 % (78.0/74.7) vs 65.8 %, peak memory 77.8 vs 73.7 GiB.
+# Production mix (2026-10-30, plowrt fb618c6c6 on branch qwen-fp8-hub, packet 7af35fe6fee0, [serve.env]
+# below, cuBLASLt 13.4; llm_grid.sh --prod, 0.45 sessions/s, 2 repeats, --prod-fidelity; evidence
+# /opt/dlami/nvme/lava-tts/docs-review/fp8hub/qual/run/qwenfp8). FP32 gate PASS at c1/c8/c32 at the
+# default thresholds, every criterion ahead of the vLLM 0.29 hub-FP8 peer. campaign.py report against
+# vLLM 0.29 serving the same checkpoint (MATCHED, EQUIVALENT; report/comparison.md): total tok/s 9812 vs
+# 9920 (0.99x), TTFT P99 1556 vs 846 ms (1.84x), TPOT P99 88.1 vs 44.0 ms (2.00x; all P99s spread-
+# flagged), TTFT/TPOT P50 396/33.3 vs 199/16.0 ms, SLO met 98.5 vs 100 %, goodput 1.660 vs 1.703 req/s,
+# peak memory 77.9 vs 71.8 GiB, prefix token hit 75.3 %. Gate PASS, prod LOSES vs vLLM hub FP8: decode
+# step time is ~2x vLLM's (FlashInfer DeepGEMM block-scaled FP8 + CUDA graphs); decode attribution open.
 [measured]
-tok_s = 339
-p50_tpot_ms = 23.6
-concurrency = 1
-input_len = 1000
-output_len = 128
-client = "vllm 0.28.0 bench serve (qwen38-fp8-tma g1, 2 repeats, packet 6c31b3e822e097c5)"
+tok_s = 9812
+p50_tpot_ms = 33.3
+client = "llm_grid.sh --prod q450 (0.45 sessions/s, 2 repeats, packet 7af35fe6fee0, plowrt fb618c6c6)"
 
 [bench.profiles.realtime]
 in_lens = "128 1024 4096 7000 15000"
@@ -183,17 +161,6 @@ reference = "{env:QWEN38_FP32_REF}"
 eos = [248046, 248044]
 concurrency = [1, 8, 32]
 vllm_capture = { c1 = "{env:QWEN38_FP8_FP32_VLLM}", c8 = "{env:QWEN38_FP8_FP32_VLLM_C8}", c32 = "{env:QWEN38_FP8_FP32_VLLM_C32}" }
-# Measured 2026-10-26 (packet 5e8ebd0f9771b06e, slice-2 binary): one case of the 46 (0.0217,
-# nat-pride-128 at token 5) missed cont_decisive at c8 in one run and passed in the next, every KL
-# and top-1 criterion passing in both; nat-pride-8192 diverges in every batched run, vLLM's peers
-# included. The qualified result is the passing run at the default margin; whether this recipe
-# carries the BF16 recipe's 0.022 margin is an open gate-policy decision.
-# 2026-10-28: the perf-for-accuracy rule (docs/bringup/agent-tools.md "Gate relaxation for
-# significant perf gains") does not apply: the flip is on a re-emit with no kernel or route change
-# (c8 cont_decisive 44/45/44/45/44/45 of 46 over six runs vs the peer's 45), so there is no gain to
-# trade, and the current packet passes c1/c8/c32 at the default margin. Thresholds unchanged.
-# 2026-10-29 (user decision): one case of the 46 (0.022, the BF16 recipe's margin) for the
-# nat-pride-128 swing at c8. With it the prefix-on run (prod-next 01685b29c, packet 2af45e892b75,
-# c8 44/46 vs peer 45/46) passes; every KL and top-1 criterion beats the vLLM 0.29 peer.
-cont_decisive_drop_max = 0.022
+# 2026-10-30 (hub packet 7af35fe6fee0): cont_decisive 46/46 at c1/c8/c32 vs the peer's 45/45/43, so
+# the 0.022 margin the re-quantized packet carried is dropped; default thresholds.
 
