@@ -279,6 +279,42 @@ struct Adapters {
 }
 /// The adapters' block size (kv_dequant_sm90.cu THREADS).
 const ADAPTER_THREADS: u32 = 256;
+/// The adapter entry points: gather, zero tail, convert.
+const ADAPTER_SYMBOLS: [&str; 3] = [
+    "plow_kv_dequant_pages",
+    "plow_kv_zero_tail",
+    "plow_cvt_rows",
+];
+
+impl Adapters {
+    /// Loads the checked `kv_adapters` cubin and resolves every entry point; the module is
+    /// unloaded again if one is missing.
+    fn load(be: &CudaBackend, image: &Image) -> Result<Adapters> {
+        let module = be.module_load(image.blob(image.entry(ADAPTERS)?)?)?;
+        match ADAPTER_SYMBOLS.map(|name| be.get_function(&module, name)) {
+            [Ok(gather), Ok(zero_tail), Ok(convert)] => Ok(Adapters {
+                gather,
+                zero_tail,
+                convert,
+                module: Some(module),
+            }),
+            resolved => {
+                be.module_unload(&module)?;
+                Err(resolved
+                    .into_iter()
+                    .find_map(Result::err)
+                    .expect("a symbol failed to resolve"))
+            }
+        }
+    }
+
+    fn unload(&mut self, be: &CudaBackend) -> Result<()> {
+        match self.module.take() {
+            Some(m) => be.module_unload(&m),
+            None => Ok(()),
+        }
+    }
+}
 
 pub(super) struct LibAttention {
     be: Arc<CudaBackend>,
@@ -400,17 +436,27 @@ fn check_object(
     if adapters.role != "adapters" {
         return Err(format!("{ADAPTERS} role {}", adapters.role));
     }
-    check_adapter_abi(image.blob(adapters).map_err(|e| e.to_string())?)?;
+    let blob = image.blob(adapters).map_err(|e| e.to_string())?;
+    check_adapter_abi(blob)?;
+    let entries = plow_asset::cubin::inspect(blob)
+        .ok_or_else(|| format!("{ADAPTERS} is not a cubin"))?
+        .entries;
+    if let Some(missing) = ADAPTER_SYMBOLS
+        .iter()
+        .find(|name| !entries.iter().any(|e| e == *name))
+    {
+        return Err(format!("{ADAPTERS} has no entry {missing}"));
+    }
     Ok((image, declared))
 }
 
 /// Reads and checks the declared object and loads its FA4 entries (every kernel entry hash-,
-/// layout-, launch-config- and exemplar-checked).
+/// layout-, launch-config- and exemplar-checked) and its adapters (every symbol resolved).
 fn open(
     be: &Arc<CudaBackend>,
     assets_dir: &Path,
     object: &SegmentObject,
-) -> Result<(std::path::PathBuf, Image, LibraryAbi, Fa4)> {
+) -> Result<(std::path::PathBuf, LibraryAbi, Fa4, Adapters)> {
     let library = assets_dir.join(&object.file);
     let rejected = |why: String| RuntimeError::Rejected(format!("{}: {why}", library.display()));
     let bytes = std::fs::read(&library).map_err(|e| rejected(e.to_string()))?;
@@ -425,7 +471,14 @@ fn open(
             f16: declared.f16,
         },
     )?;
-    Ok((library, image, declared, fa4))
+    let mut fa4 = fa4;
+    match Adapters::load(be, &image) {
+        Ok(adapters) => Ok((library, declared, fa4, adapters)),
+        Err(e) => {
+            fa4.unload(be)?;
+            Err(e)
+        }
+    }
 }
 
 impl LibAttention {
@@ -436,11 +489,13 @@ impl LibAttention {
         assets_dir: &Path,
         object: &SegmentObject,
     ) -> Result<()> {
-        let (library, _, _, mut fa4) = open(be, assets_dir, object)?;
+        let (library, _, mut fa4, mut adapters) = open(be, assets_dir, object)?;
         fa4.unload(be)?;
+        adapters.unload(be)?;
         tracing::info!(
             library = %library.display(),
-            "library prefill attention object validated; no site routes to it"
+            adapter_symbols = ?ADAPTER_SYMBOLS,
+            "library prefill attention object validated (FA4 entries loaded, adapter symbols resolved); no site routes to it"
         );
         Ok(())
     }
@@ -454,18 +509,7 @@ impl LibAttention {
         direct: Option<Direct>,
         cache: Cache,
     ) -> Result<Self> {
-        let (library, image, declared, fa4) = open(be, assets_dir, object)?;
-        let adapters = {
-            let blob = image.blob(image.entry(ADAPTERS)?)?;
-            let module = be.module_load(blob)?;
-            let f = |name: &str| be.get_function(&module, name);
-            Adapters {
-                gather: f("plow_kv_dequant_pages")?,
-                zero_tail: f("plow_kv_zero_tail")?,
-                convert: f("plow_cvt_rows")?,
-                module: Some(module),
-            }
-        };
+        let (library, declared, fa4, adapters) = open(be, assets_dir, object)?;
         let f16 = declared.f16;
         if direct.is_none() && !gathers(&declared) {
             return Err(RuntimeError::Rejected(format!(
@@ -562,10 +606,7 @@ impl LibAttention {
     pub(super) fn unload(mut self) -> Result<()> {
         self.log_counts();
         self.fa4.unload(&self.be)?;
-        match self.adapters.module.take() {
-            Some(m) => self.be.module_unload(&m),
-            None => Ok(()),
-        }
+        self.adapters.unload(&self.be)
     }
 
     /// Builds and uploads the launch's table. `false` = the launch is outside the envelope
@@ -993,6 +1034,24 @@ mod tests {
         assert!(check(bytes.clone(), &declare(&bytes, "fa4:v1")).contains("unsupported"));
         let renamed = container(ABI, "whole", b"not a cubin");
         assert!(check(renamed.clone(), &declare(&renamed, ABI)).contains("role"));
+        // A cubin stating the adapter ABI must also carry every adapter entry point.
+        let abi_only = plow_asset::cubin::synthetic_elf(
+            ADAPTER_SYMBOLS[0],
+            &[("plow_kv_dequant_abi", ADAPTER_ABI)],
+            90,
+        );
+        let partial = container(ABI, "adapters", &abi_only);
+        assert_eq!(
+            check(partial.clone(), &declare(&partial, ABI)),
+            format!("{ADAPTERS} has no entry {}", ADAPTER_SYMBOLS[1])
+        );
+        let stale = plow_asset::cubin::synthetic_elf(
+            ADAPTER_SYMBOLS[0],
+            &[("plow_kv_dequant_abi", ADAPTER_ABI - 1)],
+            90,
+        );
+        let stale = container(ABI, "adapters", &stale);
+        assert!(check(stale.clone(), &declare(&stale, ABI)).contains("ABI"));
     }
 
     #[test]
