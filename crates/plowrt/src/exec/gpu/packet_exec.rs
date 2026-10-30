@@ -22,6 +22,10 @@ pub(super) fn speech_object(cc: (u32, u32)) -> (&'static str, &'static str) {
             "interp_sm89_speech.cubin",
             "_Z18interp_sm89_speech11PlowProgram",
         ),
+        (10, _) | (12, _) => (
+            "interp_sm120_speech.cubin",
+            "_Z19interp_sm120_speech11PlowProgram",
+        ),
         _ => (
             "interp_sm90a_speech.cubin",
             "_Z19interp_sm90a_speech11PlowProgram",
@@ -64,6 +68,15 @@ fn a_specialized_speech_object_must_cover_the_packet_ops() {
     assert!(missing_speech_ops(0b1011, 0b1111).is_empty());
     assert_eq!(missing_speech_ops(0b1011, 0b0011), vec![SPEECH_OP0 + 3]);
     assert_eq!(missing_speech_ops(1 << 41, 0), vec![204]);
+}
+
+#[cfg(test)]
+#[test]
+fn test_speech_object_resolution() {
+    assert_eq!(speech_object((8, 9)).0, "interp_sm89_speech.cubin");
+    assert_eq!(speech_object((9, 0)).0, "interp_sm90a_speech.cubin");
+    assert_eq!(speech_object((10, 0)).0, "interp_sm120_speech.cubin");
+    assert_eq!(speech_object((12, 0)).0, "interp_sm120_speech.cubin");
 }
 
 struct Program {
