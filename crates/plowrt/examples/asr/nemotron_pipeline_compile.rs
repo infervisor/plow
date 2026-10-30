@@ -17,9 +17,9 @@ use plowrt::asset::gguf::GgufFile;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<_> = std::env::args().collect();
-    if !(4..=9).contains(&args.len()) {
+    if !(4..=11).contains(&args.len()) {
         return Err(
-            "usage: asr_nemotron_pipeline_compile MODEL_GGUF FEATURE_FRAMES OUTPUT_PACKET [JOINT_BATCH] [N_CU] [TRAILING_ENCODER_FRAMES] [STREAM_ROWS] [DECODE_BATCH]"
+            "usage: asr_nemotron_pipeline_compile MODEL_GGUF FEATURE_FRAMES OUTPUT_PACKET [JOINT_BATCH] [N_CU] [TRAILING_ENCODER_FRAMES] [STREAM_ROWS] [DECODE_BATCH] [STREAM_SLOTS] [STREAM_BATCH]"
                 .into(),
         );
     }
@@ -140,8 +140,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             epsilon: first.output_norm.epsilon(),
         })
     };
-    let subsample = |input_frames| {
-        asr_subsampling::lower(
+    let subsample = |input_frames, items| {
+        asr_subsampling::lower_items(
             SubsamplingSpec {
                 input_frames,
                 input_width: 128,
@@ -153,10 +153,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 output_width: 1024,
             },
             n_cu,
+            items,
         )
     };
     let compile_capacity = |input_frames| -> Result<_, Box<dyn std::error::Error>> {
-        let subsampling = subsample(input_frames)?;
+        let subsampling = subsample(input_frames, 1)?;
         let frames = subsampling.output_frames;
         let conformer =
             conformer::append(conformer_spec(frames)?, &layers, subsampling.into_prefix())?;
@@ -192,12 +193,32 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let stream_rows = args
         .get(7)
         .map_or(Ok(u32::try_from(chunk_size)?), |v| v.parse::<u32>())?;
+    // Batched greedy decode: up to DECODE_BATCH recordings (default 32, 0 = none) per launch,
+    // each with a slot (one more for padding lanes) and a full-capacity encoder-table region.
+    let decode_batch = args.get(8).map_or(Ok(32), |v| v.parse::<u32>())?;
+    // Batched streams (they decode through the batched decode): STREAM_SLOTS open streams
+    // (default 256, 0 = none), up to STREAM_BATCH (default 128) per launch.
+    let stream_slots = args.get(9).map_or(Ok(256), |v| v.parse::<u32>())?;
+    let stream_batch = args.get(10).map_or(Ok(128), |v| v.parse::<u32>())?;
+    let chunk_items = if stream_rows != 0 && decode_batch != 0 && stream_slots != 0 {
+        stream_batch
+    } else {
+        0
+    };
+    let rungs = |max: u32| -> Vec<u32> {
+        let mut rungs: Vec<_> = (0..)
+            .map(|shift| 1u32 << shift)
+            .take_while(|&rung| rung < max)
+            .collect();
+        rungs.push(max);
+        rungs
+    };
     if stream_rows != 0 {
         const FACTOR: u32 = 8;
         const HISTORY: u32 = 16;
         let stream_prefix =
             |input_frames, keep_row0| -> Result<PacketPrefix, Box<dyn std::error::Error>> {
-                let subsampling = subsample(input_frames)?;
+                let subsampling = subsample(input_frames, 1)?;
                 let spec = conformer_spec(subsampling.output_frames)?;
                 Ok(conformer::append_stream_step(
                     spec,
@@ -222,25 +243,57 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             stream_prefix(FACTOR * stream_rows + HISTORY, HISTORY / FACTOR)?,
             &rnnt_weights,
         )?;
+        if chunk_items != 0 {
+            // Cache rows: one per stream, then a scratch row for padding items. The decode's
+            // predictor slots and encoder rows for streams follow the recordings'.
+            let slots = stream_slots + 1;
+            let staging_rows = 2 * chunk_items * stream_rows;
+            let chunk_rungs = rungs(chunk_items)
+                .into_iter()
+                .map(|items| -> Result<_, Box<dyn std::error::Error>> {
+                    Ok(rnnt::ChunkRung {
+                        items,
+                        first: subsample(FACTOR * stream_rows, items)?,
+                        next: subsample(FACTOR * stream_rows + HISTORY, items)?,
+                        step: conformer::append_chunk_step(
+                            spec,
+                            &layers,
+                            n_cu,
+                            items,
+                            stream_rows,
+                            slots,
+                            staging_rows,
+                            rnnt::CHUNK_INPUTS,
+                        )?,
+                    })
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            packets.add_chunk_stream(
+                rnnt::ChunkGeometry {
+                    rows: stream_rows,
+                    left_rows: conformer::stream_left_rows(&spec),
+                    slots,
+                    first_input_frames: FACTOR * stream_rows,
+                    step_input_frames: FACTOR * stream_rows + HISTORY,
+                    history_input_frames: HISTORY,
+                    step_keep_row0: HISTORY / FACTOR,
+                    encoder_row0: decode_batch * frames,
+                    predictor_slot0: decode_batch,
+                },
+                conformer::stream_init(spec, &layers, stream_rows, n_cu)?,
+                chunk_rungs,
+                &rnnt_weights,
+            )?;
+        }
     }
-    // Batched greedy decode: up to DECODE_BATCH recordings (default 32, 0 = none) per launch,
-    // each with a slot (one more for padding lanes) and a full-capacity encoder-table region.
-    let decode_batch = args.get(8).map_or(Ok(32), |v| v.parse::<u32>())?;
     if decode_batch != 0 {
-        let rungs = |max: u32| -> Vec<u32> {
-            let mut rungs: Vec<_> = (0..)
-                .map(|shift| 1u32 << shift)
-                .take_while(|&rung| rung < max)
-                .collect();
-            rungs.push(max);
-            rungs
-        };
+        let streams = if chunk_items != 0 { stream_slots } else { 0 };
         packets.add_batched_decode(
             &rnnt_weights,
-            decode_batch + 1,
-            decode_batch * frames,
-            &rungs(decode_batch),
-            &rungs(decode_batch * joint_batch),
+            decode_batch + streams + 1,
+            decode_batch * frames + chunk_items * stream_rows,
+            &rungs(decode_batch.max(chunk_items)),
+            &rungs((decode_batch * joint_batch).max(chunk_items * stream_rows)),
         )?;
     }
     packets.embed_weights(|name| {
@@ -324,6 +377,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             "feature_frame_capacities": feature_frame_capacities,
             "joint_batch": joint_batch,
             "decode_batch": decode_batch,
+            "stream_slots": if chunk_items != 0 { stream_slots } else { 0 },
+            "stream_batch": chunk_items,
             "n_cu": n_cu,
             "trailing_encoder_frames": trailing_encoder_frames,
             "output": args[3],
