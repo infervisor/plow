@@ -309,6 +309,12 @@ pub struct RuntimeConfig {
     #[arg(long = "asr-vad-packet", env = "PLOW_ASR_VAD_PACKET", global = true)]
     pub asr_vad_packet: Option<std::path::PathBuf>,
 
+    /// WebSocket finals from the session's batched encoder stream (packets with one): the stream
+    /// runs as audio arrives and its final decodes the offline transcription's rows. Off: each
+    /// final transcribes the whole recording again.
+    #[arg(long = "asr-stream-finals", env = "PLOW_ASR_STREAM_FINALS", default_value_t = true, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
+    pub asr_stream_finals: bool,
+
     /// Write spoken digit runs in transcripts as numerals (`asr::numerals`): "nine one eight seven
     /// three four one five three eight" becomes "918-734-1538".
     #[arg(long = "asr-numerals", env = "PLOW_ASR_NUMERALS", default_value_t = true, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]

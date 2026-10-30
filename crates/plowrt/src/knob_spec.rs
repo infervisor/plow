@@ -558,6 +558,7 @@ pub const RUNTIME: &[KnobSpec] = &[
     KnobSpec::new("rt.asr_context_max_tokens", Some("PLOW_ASR_CONTEXT_MAX_TOKENS"), Layer::Runtime, USIZE, Default::Static(Val::Nat(0)), OPT_IN),
     KnobSpec::new("rt.api_keys", Some("PLOW_API_KEYS"), Layer::Runtime, Domain::Str, UNSET, OPT_IN),
     KnobSpec::new("rt.asr_numerals", Some("PLOW_ASR_NUMERALS"), Layer::Runtime, Domain::Bool, ON, OPT_IN),
+    KnobSpec::new("rt.asr_stream_finals", Some("PLOW_ASR_STREAM_FINALS"), Layer::Runtime, Domain::Bool, ON, OPT_IN),
     KnobSpec::new("rt.asr_auto_languages", Some("PLOW_ASR_AUTO_LANGUAGES"), Layer::Runtime, Domain::Str, UNSET, OPT_IN),
     KnobSpec::new("rt.asr_vad_packet", Some("PLOW_ASR_VAD_PACKET"), Layer::Runtime, Domain::Str, UNSET, OPT_IN),
     KnobSpec::new("rt.asr_packets", Some("PLOW_ASR_PACKETS"), Layer::Runtime, Domain::Str, UNSET, OPT_IN),
