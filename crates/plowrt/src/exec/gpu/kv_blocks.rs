@@ -460,6 +460,17 @@ impl BlockServe {
     }
 }
 
+/// Release `hold` whatever `prior` (an earlier release) returned, then report the first
+/// error: returning early would drop `hold` while its copy may still read the blocks.
+fn then_release(
+    prior: Result<()>,
+    hold: Hold,
+    release: impl FnOnce(Hold) -> Result<()>,
+) -> Result<()> {
+    let r = release(hold);
+    prior.and(r)
+}
+
 /// The sticky fatal fault of a store copy whose completion could not be proven.
 #[derive(Default)]
 struct CopyLatch(std::sync::OnceLock<crate::DeviceErrorInfo>);
@@ -904,6 +915,8 @@ impl GpuEngine {
             sync_us = ts.elapsed().as_micros() as u64;
             r
         };
+        // Every hold is settled before an error returns: the gather may still read them.
+        let mut released = Ok(());
         if let (Ok(()), Some((id, va)), Some(left)) = (&copied, deferred, defer) {
             let hold = bs.store.hold(vec![id]);
             let old = bs.pending_state.lock()[b].replace(PendingState {
@@ -912,17 +925,18 @@ impl GpuEngine {
                 left: left.clone(),
             });
             if let Some(old) = old {
-                self.blocks_release_after(old.hold)?;
+                released = self.blocks_release_after(old.hold);
             }
         }
         match copied {
             Ok(()) if self.window_open => bs.held.lock()[b].push(hold),
-            Ok(()) => self.blocks_release_after(hold)?,
+            Ok(()) => released = then_release(released, hold, |h| self.blocks_release_after(h)),
             Err(e) => {
                 bs.copy_failed.settle_hold(hold, drained)?;
                 return Err(e);
             }
         }
+        released?;
         let mut st = bs.stats.lock();
         st.gathers += 1;
         let us = t0.elapsed().as_micros() as u64;
@@ -1672,6 +1686,39 @@ mod tests {
             "the held block is never reclaimed"
         );
         assert!(s.state(a.id).is_some());
+    }
+
+    /// A gather replacing a pending state hold whose release failed: the gather's own hold is
+    /// still released behind its event, not dropped by the early error return.
+    #[test]
+    fn a_failed_state_release_still_settles_the_gather_hold() {
+        let s = Arc::new(two_block_store());
+        let latch = CopyLatch::default();
+        let ids: Vec<_> = (1..=2)
+            .map(|i| {
+                let a = s.acquire(0, key(i)).unwrap();
+                a.fill.expect("new block").seal();
+                a.id
+            })
+            .collect();
+        s.release(&ids);
+        let prior = latch.settle_hold(s.hold(vec![ids[0]]), drain_failed());
+        let mut queued = Vec::new();
+        let r = then_release(prior, s.hold(vec![ids[1]]), |h| {
+            queued.push(h);
+            Ok(())
+        });
+        assert!(r.unwrap_err().is_fatal());
+        assert_eq!(queued.len(), 1, "the gather hold went behind its event");
+        assert!(
+            s.acquire(0, key(3)).is_err(),
+            "neither block is reclaimable"
+        );
+        drop(queued);
+        assert!(
+            s.acquire(0, key(3)).is_ok(),
+            "the released gather hold frees its block"
+        );
     }
 
     /// A dependency set dropped before the boundary is recorded releases its blocks (the slot
