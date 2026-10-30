@@ -197,7 +197,7 @@ impl SharedAsr {
             "encoder.packet",
             "encoder.pkt",
         )?;
-        let mut encoder = PacketAudioEncoder::load_on(&encoder_path, "cuda", device)?;
+        let mut encoder = PacketAudioEncoder::load_on(&encoder_path, "auto", device)?;
         let warm = Instant::now();
         encoder.warm()?;
         tracing::info!(
@@ -718,10 +718,14 @@ pub(super) fn serves_audio(state: &AppState, slug: &str) -> bool {
     let Ok(bundle) = state.registry.get(slug) else {
         return false;
     };
-    models()
+    if models()
         .lock()
         .iter()
         .any(|((dir, _), m)| *dir == bundle.dir && m.is_some())
+    {
+        return true;
+    }
+    is_audio_lm(&bundle.dir).unwrap_or(false)
 }
 
 /// Bind instance `slug`'s front-end now (a no-op for a model that is not an audio LM or is bound).

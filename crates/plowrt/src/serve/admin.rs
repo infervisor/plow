@@ -69,6 +69,10 @@ pub struct UnloadRequest {
     /// Select the rank by the device its group starts at.
     #[serde(default)]
     pub device: Option<u32>,
+    /// Drain timeout in milliseconds for in-flight requests. `Some(0)` preempts immediately;
+    /// unset defaults to bounded drain via `PLOW_DRAIN_TIMEOUT_MS` (or 30 s).
+    #[serde(default)]
+    pub drain_timeout_ms: Option<u64>,
 }
 
 #[derive(Debug, Serialize)]
@@ -168,7 +172,6 @@ pub(super) fn err(status: StatusCode, msg: impl std::fmt::Display) -> Response {
         .into_response()
 }
 
-#[cfg(feature = "cuda")]
 const MIB: u64 = 1 << 20;
 
 /// Resolve a requested assets dir against the `--models-root` allow-list.
@@ -217,7 +220,7 @@ pub async fn load(State(state): State<Arc<AppState>>, Json(req): Json<LoadReques
 }
 async fn load_inner(state: Arc<AppState>, mut req: LoadRequest) -> Response {
     req.model = state.registry.resolve(&req.model).unwrap_or(req.model);
-    #[cfg(feature = "cuda")]
+    #[cfg(any(feature = "cuda", feature = "hsa", feature = "cpu"))]
     if let Some(keys) = dp_targets(&state, &req.model, req.rank, req.device) {
         return match keys {
             Ok(keys) => dp_load(&state, keys, req.evict).await,
@@ -240,12 +243,12 @@ async fn load_inner(state: Arc<AppState>, mut req: LoadRequest) -> Response {
         return manager.load(&state, req, assets).await;
     }
 
-    #[cfg(feature = "cuda")]
+    #[cfg(any(feature = "cuda", feature = "hsa", feature = "cpu"))]
     {
         if state.managers().is_empty() {
             return err(
                 StatusCode::NOT_IMPLEMENTED,
-                "no GPU model manager on this server",
+                "no model manager on this server",
             );
         }
 
@@ -277,7 +280,7 @@ async fn load_inner(state: Arc<AppState>, mut req: LoadRequest) -> Response {
         let Some((group, mgr)) = target else {
             return err(
                 StatusCode::NOT_IMPLEMENTED,
-                "no GPU model manager on this server",
+                "no model manager on this server",
             );
         };
 
@@ -339,7 +342,7 @@ async fn load_inner(state: Arc<AppState>, mut req: LoadRequest) -> Response {
         }
 
         use crate::serve::manager::EnsureError;
-        return match mgr.load(&req.model, req.evict).await {
+        match mgr.load(&req.model, req.evict).await {
             Ok(load_ms) => Json(LoadResponse {
                 model: req.model,
                 state: "resident",
@@ -353,14 +356,14 @@ async fn load_inner(state: Arc<AppState>, mut req: LoadRequest) -> Response {
             Err(e @ EnsureError::Unloaded) => err(StatusCode::CONFLICT, e),
             Err(EnsureError::Load(e)) => err(StatusCode::INTERNAL_SERVER_ERROR, e),
             Err(e @ EnsureError::SwitchTimeout(_)) => err(StatusCode::SERVICE_UNAVAILABLE, e),
-        };
+        }
     }
-    #[cfg(not(feature = "cuda"))]
+    #[cfg(not(any(feature = "cuda", feature = "hsa", feature = "cpu")))]
     {
         let _ = (state, req, assets);
         err(
             StatusCode::NOT_IMPLEMENTED,
-            "model load/unload needs a GPU backend",
+            "no model manager on this server",
         )
     }
 }
@@ -378,7 +381,7 @@ pub async fn unload(
 }
 async fn unload_inner(state: Arc<AppState>, mut req: UnloadRequest) -> Response {
     req.model = state.registry.resolve(&req.model).unwrap_or(req.model);
-    #[cfg(feature = "cuda")]
+    #[cfg(any(feature = "cuda", feature = "hsa", feature = "cpu"))]
     if let Some(keys) = dp_targets(&state, &req.model, req.rank, req.device) {
         if req.deregister {
             return err(
@@ -387,7 +390,7 @@ async fn unload_inner(state: Arc<AppState>, mut req: UnloadRequest) -> Response 
             );
         }
         return match keys {
-            Ok(keys) => dp_unload(&state, keys).await,
+            Ok(keys) => dp_unload(&state, keys, req.drain_timeout_ms).await,
             Err(refusal) => refusal,
         };
     }
@@ -396,7 +399,7 @@ async fn unload_inner(state: Arc<AppState>, mut req: UnloadRequest) -> Response 
     if let Some(manager) = state.portable_manager() {
         return manager.unload(&state, req).await;
     }
-    #[cfg(feature = "cuda")]
+    #[cfg(any(feature = "cuda", feature = "hsa", feature = "cpu"))]
     {
         let Some(mgr) = state.manager_for(&req.model).cloned() else {
             return err(
@@ -410,8 +413,15 @@ async fn unload_inner(state: Arc<AppState>, mut req: UnloadRequest) -> Response 
                 format_args!("unknown model {:?}", req.model),
             );
         }
+        let drain = match req.drain_timeout_ms {
+            Some(0) => None,
+            Some(ms) => Some(std::time::Duration::from_millis(ms)),
+            None => crate::config::RuntimeConfig::get()
+                .drain_timeout_ms()
+                .map(std::time::Duration::from_millis),
+        };
         use crate::serve::manager::EnsureError;
-        let report = match mgr.unload_and_deregister(&req.model, req.deregister).await {
+        let report = match mgr.unload_with_drain(&req.model, req.deregister, drain).await {
             Ok(r) => r,
             Err(EnsureError::Load(e)) => return err(StatusCode::INTERNAL_SERVER_ERROR, e),
             Err(e) => return err(StatusCode::INTERNAL_SERVER_ERROR, e),
@@ -427,19 +437,19 @@ async fn unload_inner(state: Arc<AppState>, mut req: UnloadRequest) -> Response 
         })
         .into_response();
     }
-    #[cfg(not(feature = "cuda"))]
+    #[cfg(not(any(feature = "cuda", feature = "hsa", feature = "cpu")))]
     {
-        let _ = (state, req);
+        let _ = state;
         err(
-            StatusCode::NOT_IMPLEMENTED,
-            "model load/unload needs a GPU backend",
+            StatusCode::NOT_FOUND,
+            format_args!("unknown model {:?}", req.model),
         )
     }
 }
 
 /// The instance keys a load/unload of `model` addresses, when it is a DP model or one of its
 /// ranks: `None` for an ordinary model.
-#[cfg(feature = "cuda")]
+#[cfg(any(feature = "cuda", feature = "hsa", feature = "cpu"))]
 fn dp_targets(
     state: &AppState,
     model: &str,
@@ -466,7 +476,7 @@ fn dp_targets(
     })
 }
 
-#[cfg(feature = "cuda")]
+#[cfg(any(feature = "cuda", feature = "hsa", feature = "cpu"))]
 async fn dp_load(state: &Arc<AppState>, keys: Vec<String>, evict: bool) -> Response {
     use crate::serve::manager::EnsureError;
     let mut load_ms = 0f64;
@@ -502,13 +512,21 @@ async fn dp_load(state: &Arc<AppState>, keys: Vec<String>, evict: bool) -> Respo
     .into_response()
 }
 
-#[cfg(feature = "cuda")]
-async fn dp_unload(state: &Arc<AppState>, keys: Vec<String>) -> Response {
-    let bound = std::time::Duration::from_millis(
-        crate::config::RuntimeConfig::get()
-            .drain_timeout_ms()
-            .unwrap_or(30_000),
-    );
+#[cfg(any(feature = "cuda", feature = "hsa", feature = "cpu"))]
+async fn dp_unload(
+    state: &Arc<AppState>,
+    keys: Vec<String>,
+    drain_timeout_ms: Option<u64>,
+) -> Response {
+    let bound = match drain_timeout_ms {
+        Some(0) => std::time::Duration::from_millis(0),
+        Some(ms) => std::time::Duration::from_millis(ms),
+        None => std::time::Duration::from_millis(
+            crate::config::RuntimeConfig::get()
+                .drain_timeout_ms()
+                .unwrap_or(30_000),
+        ),
+    };
     let mut total = UnloadResponse {
         model: keys.join(","),
         state: "unloaded",
@@ -518,27 +536,37 @@ async fn dp_unload(state: &Arc<AppState>, keys: Vec<String>) -> Response {
         pool_trimmed_mib: 0,
         deregistered: false,
     };
-    for key in &keys {
-        let _control = state.control_lock(key).await;
-        let Some(mgr) = state.manager_for(key).cloned() else {
-            return err(
-                StatusCode::NOT_FOUND,
-                format_args!("no model manager serves {key:?}"),
-            );
-        };
-        match mgr.unload_rank(key, bound).await {
+    let tasks: Vec<_> = keys
+        .into_iter()
+        .map(|key| {
+            let state = Arc::clone(state);
+            async move {
+                let _control = state.control_lock(&key).await;
+                let Some(mgr) = state.manager_for(&key).cloned() else {
+                    return Err(err(
+                        StatusCode::NOT_FOUND,
+                        format_args!("no model manager serves {key:?}"),
+                    ));
+                };
+                mgr.unload_rank(&key, bound).await.map_err(|e| {
+                    err(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        format_args!("{key}: {e}"),
+                    )
+                })
+            }
+        })
+        .collect();
+
+    for res in futures::future::join_all(tasks).await {
+        match res {
             Ok(r) => {
                 total.stop_ms = total.stop_ms.max(r.stop_ms);
-                total.unload_ms += r.unload_ms;
+                total.unload_ms = total.unload_ms.max(r.unload_ms);
                 total.freed_mib += r.freed / MIB;
                 total.pool_trimmed_mib += r.pool_trimmed / MIB;
             }
-            Err(e) => {
-                return err(
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    format_args!("{key}: {e}"),
-                )
-            }
+            Err(refusal) => return refusal,
         }
     }
     Json(total).into_response()
@@ -584,7 +612,7 @@ pub async fn status(State(state): State<Arc<AppState>>) -> Response {
                     .collect()
             }),
         };
-        #[cfg(feature = "cuda")]
+        #[cfg(any(feature = "cuda", feature = "hsa", feature = "cpu"))]
         if let Some(set) = dp {
             let mgr = state.manager_for(&set.ranks[0].key);
             entry.required_mib = mgr
@@ -594,7 +622,7 @@ pub async fn status(State(state): State<Arc<AppState>>) -> Response {
             models.push(entry);
             continue;
         }
-        #[cfg(feature = "cuda")]
+        #[cfg(any(feature = "cuda", feature = "hsa", feature = "cpu"))]
         if let Some(mgr) = state.manager_for(&slug) {
             entry.required_mib = mgr.required(&slug).map(|b| b / MIB);
             if let Some(plan) = mgr.plan(&slug) {
@@ -609,7 +637,7 @@ pub async fn status(State(state): State<Arc<AppState>>) -> Response {
 
     #[allow(unused_mut)]
     let mut groups: Vec<GroupStatus> = Vec::new();
-    #[cfg(feature = "cuda")]
+    #[cfg(any(feature = "cuda", feature = "hsa", feature = "cpu"))]
     for (i, mgr) in state.managers().iter().enumerate() {
         let (free, total) = mgr.device_mem_info().unwrap_or((0, 0));
         groups.push(GroupStatus {
@@ -632,7 +660,7 @@ pub async fn status(State(state): State<Arc<AppState>>) -> Response {
         register: false,
         eviction: false,
     };
-    #[cfg(feature = "cuda")]
+    #[cfg(any(feature = "cuda", feature = "hsa", feature = "cpu"))]
     if !state.managers().is_empty() {
         capabilities = ControlCapabilities {
             load: true,

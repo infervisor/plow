@@ -283,3 +283,70 @@ async fn lifecycle_operations_serialize_per_model_without_blocking_other_models(
     );
     drop(other);
 }
+
+#[tokio::test]
+async fn version_endpoint_answers_with_current_version() {
+    let resp = make_app()
+        .oneshot(
+            Request::builder()
+                .uri("/version")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let v: serde_json::Value = serde_json::from_str(&body_string(resp).await).unwrap();
+    assert_eq!(v["version"], env!("CARGO_PKG_VERSION"));
+}
+
+#[test]
+fn unload_request_deserializes_drain_timeout() {
+    let req: plowrt::serve::admin::UnloadRequest = serde_json::from_str(
+        r#"{"model":"target-model","deregister":true,"drain_timeout_ms":15000}"#
+    ).unwrap();
+    assert_eq!(req.model, "target-model");
+    assert!(req.deregister);
+    assert_eq!(req.drain_timeout_ms, Some(15000));
+}
+
+#[tokio::test]
+async fn unloaded_asr_model_reports_audio_endpoints_in_catalogue() {
+    let n = DIR_SEQ.fetch_add(1, Ordering::Relaxed);
+    let dir = std::env::temp_dir().join(format!("plowrt_asr_test_{}_{n}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    common::write_bundle(&dir, "asr-model");
+    std::fs::write(dir.join("audio_lm_contract.json"), b"{}").unwrap();
+
+    let backend: Arc<dyn Backend> = Arc::new(CpuBackend::new(2));
+    let execset = Arc::new(ExecutorSet::bringup(backend).unwrap());
+    let registry = Registry::new();
+    registry.load(&dir, None).unwrap();
+    let state = Arc::new(AppState::new(registry, execset));
+    let app = app(state);
+
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .uri("/v1/models")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = body_string(resp).await;
+    let val: serde_json::Value = serde_json::from_str(&body).unwrap();
+    let m = val["data"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|m| m["id"] == "asr-model")
+        .expect("asr-model in catalogue");
+    assert_eq!(
+        m["x_plow_endpoints"],
+        serde_json::json!(["audio/transcriptions", "audio/transcriptions/stream"])
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+

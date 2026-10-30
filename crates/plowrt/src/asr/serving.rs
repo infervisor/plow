@@ -34,6 +34,17 @@ mod shared;
 #[cfg(feature = "cuda")]
 pub use shared::{bind, preload, release};
 
+#[cfg(not(feature = "cuda"))]
+pub fn bind(_state: &crate::serve::AppState, _slug: &str) -> crate::Result<()> {
+    Ok(())
+}
+#[cfg(not(feature = "cuda"))]
+pub fn preload(_state: &crate::serve::AppState, _slug: &str) -> crate::Result<()> {
+    Ok(())
+}
+#[cfg(not(feature = "cuda"))]
+pub fn release(_dir: &std::path::Path, _device: u8) {}
+
 const BATCH_FORMATION_WINDOW: Duration = Duration::from_millis(5);
 
 pub struct AsrServer {
@@ -953,6 +964,11 @@ pub fn packet_model_names() -> Vec<String> {
     names
 }
 
+#[cfg(not(feature = "cuda"))]
+pub fn packet_model_names() -> Vec<String> {
+    Vec::new()
+}
+
 /// No packet-model transcription queued or running (the serve drain condition).
 #[cfg(feature = "cuda")]
 pub fn packet_models_idle() -> bool {
@@ -962,10 +978,27 @@ pub fn packet_models_idle() -> bool {
     })
 }
 
+#[cfg(not(feature = "cuda"))]
+pub fn packet_models_idle() -> bool {
+    true
+}
+
 /// Whether `slug` serves `/v1/audio/transcriptions` on `plowrt serve`.
-#[cfg(feature = "cuda")]
 pub fn serves_audio(state: &crate::serve::AppState, slug: &str) -> bool {
-    shared::serves_audio(state, slug)
+    let Ok(bundle) = state.registry.get(slug) else {
+        return false;
+    };
+    if bundle.dir.join("audio_lm_contract.json").is_file() {
+        return true;
+    }
+    #[cfg(feature = "cuda")]
+    {
+        shared::serves_audio(state, slug)
+    }
+    #[cfg(not(feature = "cuda"))]
+    {
+        false
+    }
 }
 
 fn configured_vad() -> Option<Arc<crate::asr::vad::Vad>> {
@@ -1145,10 +1178,10 @@ async fn transcribe_upload(
     let format = fields
         .remove("response_format")
         .unwrap_or_else(|| "json".into());
-    if !matches!(format.as_str(), "json" | "text") {
+    if !matches!(format.as_str(), "json" | "text" | "verbose_json") {
         return failure(
             StatusCode::BAD_REQUEST,
-            "response_format must be json or text",
+            "response_format must be json, text or verbose_json",
         );
     }
     if fields
@@ -1336,6 +1369,8 @@ async fn transcribe_upload(
     if stream {
         opts.deltas = Some(delta_tx);
     }
+    let samples_len = samples.len();
+    let reply_lang = language.clone();
     let work = match route.submit(samples, language, context, cancel.0.clone(), opts) {
         Ok(work) => work,
         Err(SubmitError::Full) => return busy("ASR queue full"),
@@ -1401,6 +1436,16 @@ async fn transcribe_upload(
     }
     let mut response = match result {
         Ok(Ok(result)) if format == "text" => result.text.into_response(),
+        Ok(Ok(result)) if format == "verbose_json" => {
+            let dur = samples_len as f64 / SAMPLE_RATE as f64;
+            Json(json!({
+                "task": "transcribe",
+                "language": reply_lang.unwrap_or_else(|| "english".into()),
+                "duration": dur,
+                "text": result.text,
+            }))
+            .into_response()
+        }
         Ok(Ok(result)) if recorded => {
             Json(json!({"text":result.text,"final":finals,"offset":recorded_samples}))
                 .into_response()
@@ -3280,6 +3325,16 @@ mod tests {
                 expected
             );
         }
+        let response = app.clone().oneshot(request("test", "verbose_json")).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let val: serde_json::Value = serde_json::from_slice(
+            &response.into_body().collect().await.unwrap().to_bytes(),
+        )
+        .unwrap();
+        assert_eq!(val["task"], "transcribe");
+        assert_eq!(val["text"], "hello");
+        assert_eq!(val["duration"], 0.5);
+
         assert_eq!(
             app.clone()
                 .oneshot(request("missing", "json"))
