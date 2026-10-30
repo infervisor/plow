@@ -131,8 +131,8 @@ pub const RTX_5090: GpuSpec = GpuSpec {
         kind: MemKind::Gddr7,
         capacity: Bytes::gib(32),
         bandwidth: GBps(1792.0),
-        // Not measured on this part; a reported bound falls back to the datasheet peak.
-        bandwidth_measured: None,
+        // scripts/tts/hbm_bw.py read-reduce, 4 GiB buffers (copy: 1526 GB/s).
+        bandwidth_measured: Some(GBps(1672.0)),
         bus_width_bits: 512,
     },
     copy_engines: 2,

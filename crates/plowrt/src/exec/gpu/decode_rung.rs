@@ -235,18 +235,23 @@ fn validate_decode_ladder_impl(blob: &DevBlob, segmented: bool, routed: &[bool])
     let widest_rows = widest.t;
     let mut compatible = true;
     let mut same_shape = true;
-    let mut normalized = [Vec::new(), Vec::new(), Vec::new()];
+    let mut normalized: [Vec<_>; 6] = Default::default();
     for (index, g) in programs.iter().enumerate() {
         let folded = g.insts.iter().any(|d| {
             matches!(DevOp::from_u16(d.op), Some(DevOp::Gemv | DevOp::GemvGlu)) && d.i[3] == 4
         });
+        // devgen PLOW_DECODE_HNR_FOLD=<rows>: the rungs from `rows` up carry no HeadNormRope.
+        let hnr_folded = g
+            .insts
+            .iter()
+            .any(|d| d.op == DevOp::FlashDecode as u16 && d.t[7] != TENSOR_NONE16);
         let class = if routed.get(index).copied().unwrap_or(false) {
             1
         } else if folded {
             2
         } else {
             0
-        };
+        } + if hnr_folded { 3 } else { 0 };
         let normalized = &mut normalized[class];
         let logical = splitk.as_ref().map(|proof| &proof.canonical[index]);
         if let Some(proof) = &splitk {
@@ -477,6 +482,19 @@ fn validate_decode_ladder_impl(blob: &DevBlob, segmented: bool, routed: &[bool])
     {
         return Err(reject("runtime inputs do not cover physical slots"));
     }
+    // devgen PLOW_DECODE_HNR_FOLD: t7 names the fold descriptor (11 u32 words, word 7 = the
+    // position tensor) and the FlashDecode packet writes both caches' new rows at pos[b].
+    let hnr_fold = |d: &DevInst64| {
+        d.op == DevOp::FlashDecode as u16
+            && d.t[6] == TENSOR_NONE16
+            && d.i[6] == 128
+            && blob
+                .tensors
+                .get(d.t[7] as usize)
+                .and_then(|t| t.init.clone())
+                .and_then(|r| blob.init.get(r))
+                .is_some_and(|w| w.len() == 44 && w[28..32] == (pos as u32).to_le_bytes())
+    };
     let mut caches = std::collections::BTreeMap::new();
     let mut scales = std::collections::BTreeMap::new();
     for d in &widest.insts {
@@ -489,7 +507,7 @@ fn validate_decode_ladder_impl(blob: &DevBlob, segmented: bool, routed: &[bool])
         let fp8 = d.op == DevOp::FlashDecodeFp8 as u16;
         if !matches!(d.i[6], 64 | 128 | 256 | 512)
             || (fp8 && d.i[6] == 64)
-            || (!fp8 && (d.t[6] != TENSOR_NONE16 || d.t[7] != TENSOR_NONE16))
+            || (!fp8 && (d.t[6] != TENSOR_NONE16 || d.t[7] != TENSOR_NONE16) && !hnr_fold(d))
         {
             return Ok(false);
         }
@@ -654,6 +672,9 @@ fn validate_decode_ladder_impl(blob: &DevBlob, segmented: bool, routed: &[bool])
                         }
                         if (d.i[2], d.i[6], d.i[3], d.i[7]) != (heads, hd, stride, mask) {
                             return Err(reject("KV reader addressing changes across rungs"));
+                        }
+                        if hnr_fold(d) && !writes.insert(id) {
+                            return Err(reject("duplicate KV writer"));
                         }
                     }
                     Some(DevOp::HeadNormRope | DevOp::HeadNormRopeFp8) if operand == 0 => {

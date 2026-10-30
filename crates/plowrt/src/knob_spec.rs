@@ -534,6 +534,7 @@ pub const RUNTIME: &[KnobSpec] = &[
     KnobSpec::new("rt.tts_stream_first_frames", Some("PLOW_TTS_STREAM_FIRST_FRAMES"), Layer::Runtime, USIZE, Default::Static(Val::Nat(1)), OPT_IN),
     KnobSpec::new("rt.tts_realtime", Some("PLOW_TTS_REALTIME"), Layer::Runtime, Domain::Bool, ON, PROMOTED),
     KnobSpec::new("rt.tts_admit_wait_ms", Some("PLOW_TTS_ADMIT_WAIT_MS"), Layer::Runtime, USIZE, Default::Static(Val::Nat(6000)), OPT_IN),
+    KnobSpec::new("rt.tts_voices", Some("PLOW_TTS_VOICES"), Layer::Runtime, Domain::Str, UNSET, OPT_IN),
     KnobSpec::new("rt.tts_turn_batch", Some("PLOW_TTS_TURN_BATCH"), Layer::Runtime, USIZE, Default::Static(Val::Nat(16)), DIAG),
     KnobSpec::new("rt.render_yield_margin_ms", Some("PLOW_RENDER_YIELD_MARGIN_MS"), Layer::Runtime, USIZE, Default::Static(Val::Nat(5)), DIAG),
     KnobSpec::new("rt.overload", Some("PLOW_OVERLOAD"), Layer::Runtime, Domain::Bool, UNSET, DIAG),
@@ -541,6 +542,8 @@ pub const RUNTIME: &[KnobSpec] = &[
     KnobSpec::new("rt.overload_miss", Some("PLOW_OVERLOAD_MISS"), Layer::Runtime, Domain::Str, Default::Static(Val::Str("0.05,0.1,0.2")), DIAG),
     KnobSpec::new("rt.asr_partial_duty", Some("PLOW_ASR_PARTIAL_DUTY"), Layer::Runtime, Domain::Str, Default::Static(Val::Str("0.5")), DIAG),
     KnobSpec::new("rt.asr_request_timeout_ms", Some("PLOW_ASR_REQUEST_TIMEOUT_MS"), Layer::Runtime, USIZE, Default::Static(Val::Nat(120_000)), OPT_IN),
+    KnobSpec::new("rt.asr_encode_hold_ms", Some("PLOW_ASR_ENCODE_HOLD_MS"), Layer::Runtime, USIZE, Default::Static(Val::Nat(0)), OPT_IN),
+    KnobSpec::new("rt.asr_encode_hold_inflight", Some("PLOW_ASR_ENCODE_HOLD_INFLIGHT"), Layer::Runtime, USIZE, Default::Static(Val::Nat(32)), DIAG),
     // `strict` refuses every current production bundle until its listed gaps close
     // (docs/bringup/lean-correctness-inventory.md §9), so it stays opt-in.
     KnobSpec::new("rt.lean_qualify", Some("PLOW_LEAN_QUALIFY"), Layer::Runtime, Domain::Str, Default::Static(Val::Str("off")), OPT_IN),
@@ -905,6 +908,7 @@ pub const RAW_ENV: &[KnobSpec] = &[
     KnobSpec::new("env.PLOW_SIGNING_KEY", Some("PLOW_SIGNING_KEY"), Layer::RawEnv, Domain::Str, UNSET, OPT_IN),
     KnobSpec::new("env.PLOW_TRUSTED_KEYS", Some("PLOW_TRUSTED_KEYS"), Layer::RawEnv, Domain::Str, UNSET, OPT_IN),
     KnobSpec::new("env.PLOW_DEBUG_MAX_INST", Some("PLOW_DEBUG_MAX_INST"), Layer::RawEnv, Domain::Str, UNSET, DIAG),
+    KnobSpec::new("env.PLOW_ECAPA_DIR", Some("PLOW_ECAPA_DIR"), Layer::RawEnv, Domain::Str, UNSET, DIAG),
     KnobSpec::new("env.PLOW_THROUGHPUT_K", Some("PLOW_THROUGHPUT_K"), Layer::RawEnv, Domain::Str, UNSET, OPT_IN),
     KnobSpec::new("env.PLOW_DEV_SAMPLE", Some("PLOW_DEV_SAMPLE"), Layer::RawEnv, Domain::Str, UNSET, DIAG),
     KnobSpec::new("env.PLOW_DSA_VERIFY_CKPT", Some("PLOW_DSA_VERIFY_CKPT"), Layer::RawEnv, Domain::Str, UNSET, DIAG),

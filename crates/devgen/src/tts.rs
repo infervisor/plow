@@ -15,8 +15,13 @@ pub struct SpeechProfile {
     pub prompt_template: &'static str,
     /// A voice is valid when this renders to one vocabulary token, unless `voices` lists them.
     pub voice_token: &'static str,
-    /// Named voices (multi-token names); empty = any single-token `voice_token`.
+    /// Named voices (multi-token names); empty = any single-token `voice_token`. `name\trender`
+    /// renders `{voice}` as `render` instead of the name.
     pub voices: &'static [&'static str],
+    /// Values of the template's `{language}`, the first the default; empty = no language.
+    pub languages: &'static [&'static str],
+    /// Longest text segment in frames (0: up to `max_new_tokens_cap`).
+    pub segment_frames: u64,
     pub prefix: &'static [u64],
     pub suffix: &'static [u64],
     pub stops: &'static [u64],
@@ -38,7 +43,8 @@ pub struct SpeechProfile {
     /// (`audio_token_base + class`) whose `frame_codes` codes ride beside it.
     pub depth: bool,
     /// The depth stage's sampler: 0 = Fish (bf16 parameters, RAS, no penalty), 1 = Breeze
-    /// (f32 parameters, backbone repetition penalty).
+    /// (f32 parameters, backbone repetition penalty), 2 = Maya 2 (host cb0 controller with a
+    /// presence penalty and controlled stop; `repetition_penalty` is the presence penalty).
     pub depth_sampler: u64,
     /// Rendered into the template's `{instructions}` with `{instructions}` = the request's text.
     pub instructions: Option<&'static str>,
@@ -87,6 +93,8 @@ pub const VEENA: SpeechProfile = SpeechProfile {
     instructions: None,
     text_encoder: None,
     clone: None,
+    languages: &[],
+    segment_frames: 0,
 };
 
 /// canopylabs/orpheus-3b-0.1-ft (orpheus_tts `_format_prompt`): [SOH] BOS "voice: text" [EOT]
@@ -118,6 +126,8 @@ pub const ORPHEUS: SpeechProfile = SpeechProfile {
     instructions: None,
     text_encoder: None,
     clone: None,
+    languages: &[],
+    segment_frames: 0,
 };
 
 /// fishaudio/s2-pro (fish-speech `inference.py`, no reference): system "convert the provided text
@@ -161,6 +171,8 @@ pub const FISH: SpeechProfile = SpeechProfile {
         tail: Some(&[151645, 198, 151644, 872, 198]),
         eos_code: None,
     }),
+    languages: &[],
+    segment_frames: 0,
 };
 
 /// BreezeBlue/Breeze-TTS-2 (`breeze_infer/templates.py`): each text segment `<bos>[S0]text` (voice
@@ -200,7 +212,77 @@ pub const BREEZE: SpeechProfile = SpeechProfile {
         tail: None,
         eos_code: Some(0),
     }),
+    languages: &[],
+    segment_frames: 0,
 };
+
+/// maya-research/maya2-native (`maya3` prompt.py, engine.py): `<|lang:xx|>`, `{Name}: ` (the plain
+/// voice: nothing), the text, `<|audio|>` (its embedding row carries the speaker anchor) -> one cb0
+/// class per 12.5 Hz frame (2048 = stop) plus 31 depth codebooks, Mimi at 24 kHz. cb0: T 0.9,
+/// top-k 64, presence penalty 0.8 over 12 frames, controlled stop (`maya2.controller`); depth T 0.7,
+/// top-k 64; text in pieces of about 20 s.
+pub const MAYA2: SpeechProfile = SpeechProfile {
+    prompt_template: "<|lang:{language}|>{voice}{input}<|audio|>",
+    voice_token: "{voice}",
+    voices: &[
+        "Ahana\t{Ahana}: ",
+        "Vaidehi\t{Vaidehi}: ",
+        "Malini\t{Malini}: ",
+        "Charvi\t{Charvi}: ",
+        "Jahnavi\t{Jahnavi}: ",
+        "Anirban\t{Anirban}: ",
+        "Nakul\t{Nakul}: ",
+        "Vasant\t{Vasant}: ",
+        "Siddhant\t{Siddhant}: ",
+        "Satvik\t{Satvik}: ",
+        "Abhay\t{Abhay}: ",
+        "Nivedita\t{Nivedita}: ",
+        "Ishwari\t{Ishwari}: ",
+        "Ritvik\t{Ritvik}: ",
+        "Vrinda\t{Vrinda}: ",
+        "Sreekar\t{Sreekar}: ",
+        "Kayal\t{Kayal}: ",
+        "Shaunak\t{Shaunak}: ",
+        "Akshat\t{Akshat}: ",
+        "Tanushree\t{Tanushree}: ",
+        "plain\t",
+    ],
+    prefix: &[],
+    suffix: &[],
+    stops: &[2048],
+    sample_rate: 24000,
+    frame_codes: 32,
+    codebook: 2048,
+    frame_samples: 1920,
+    // Ids past the tokenizer (`maya2_prep.py`): a prompt row of id 194549 + c is a frame row.
+    audio_token_base: 194549,
+    per_char_frames: 0.9,
+    max_new_tokens_cap: 1500,
+    temperature: 0.9,
+    top_p: 1.0,
+    repetition_penalty: 0.8,
+    top_k: 64,
+    depth: true,
+    depth_sampler: 2,
+    instructions: None,
+    text_encoder: None,
+    // `icl` (`prompt.py`): `<|lang:A|>` transcript `<|audio|>`, the reference frames, the AEOS input
+    // row (id 194548), then the text's prompt; the null speaker anchor and depth memory.
+    clone: Some(CloneLayout {
+        head: Some(&[]),
+        mid: &[],
+        tail: Some(&[194548]),
+        eos_code: None,
+    }),
+    languages: &[
+        "en", "as", "bn", "gu", "hi", "kn", "ml", "mr", "or", "pa", "ta", "te",
+    ],
+    segment_frames: 250,
+};
+
+/// `maya2_controller.json` beside a Maya 2 checkpoint (`scripts/tts/maya2_prep.py`): the cb0
+/// controller, guard constants and per-language frame / duration priors.
+pub const MAYA2_CONTROLLER: &str = "maya2_controller.json";
 
 /// Chatterbox T3 (`tts.t3_cfg.v1`): a causal LM whose prefill rows are host embeddings (the
 /// `overlay` role, every row) and whose decode embedding adds a learned speech position counted
@@ -307,8 +389,9 @@ pub fn profile(name: &str) -> Result<&'static SpeechProfile, String> {
         "orpheus" => Ok(&ORPHEUS),
         "fish" => Ok(&FISH),
         "breeze" => Ok(&BREEZE),
+        "maya2" => Ok(&MAYA2),
         other => Err(format!(
-            "unknown tts profile {other:?} (known: veena, orpheus, fish, breeze)"
+            "unknown tts profile {other:?} (known: veena, orpheus, fish, breeze, maya2)"
         )),
     }
 }
@@ -318,6 +401,7 @@ pub fn speech_pipeline_section(
     spec: CausalPipelineSpec<'_>,
     p: &SpeechProfile,
     vocab: u32,
+    dir: &std::path::Path,
 ) -> Result<SectionData, String> {
     let audio_rows = if p.depth { 1 } else { p.frame_codes };
     if p.audio_token_base + audio_rows * p.codebook > u64::from(vocab) {
@@ -344,6 +428,18 @@ pub fn speech_pipeline_section(
         .insert("codec.packet".into(), CODEC_PACKET.into());
     if let Some(t) = p.instructions {
         pipe.strings.insert("prompt.instructions".into(), t.into());
+    }
+    if !p.languages.is_empty() {
+        pipe.strings
+            .insert("prompt.languages".into(), p.languages.join(" "));
+    }
+    if p.depth_sampler == 2 {
+        let path = dir.join(MAYA2_CONTROLLER);
+        let text =
+            std::fs::read_to_string(&path).map_err(|e| format!("{}: {e}", path.display()))?;
+        serde_json::from_str::<serde_json::Value>(&text)
+            .map_err(|e| format!("{}: {e}", path.display()))?;
+        pipe.strings.insert("maya2.controller".into(), text);
     }
     if let Some(t) = p.text_encoder {
         pipe.strings.insert("text.encoder".into(), t.into());
@@ -389,6 +485,9 @@ pub fn speech_pipeline_section(
         u64::from(p.per_char_frames.to_bits()),
     );
     put("tokens.max_new_cap".into(), p.max_new_tokens_cap);
+    if p.segment_frames > 0 {
+        put("tokens.segment_frames".into(), p.segment_frames);
+    }
     put(
         "sampling.temperature_f32".into(),
         u64::from(p.temperature.to_bits()),

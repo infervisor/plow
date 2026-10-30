@@ -317,10 +317,15 @@ struct StepIo {
     /// `stream.n.{k}` per time resolution (rows per frame from [`Bound::lengths`]).
     n: Vec<PacketTensor>,
     slots: usize,
+    /// Transformer rows per frame (`stream.transformer_rows_per_frame`, Mimi 2): `rope` covers the
+    /// rows and `row_pos` is each item's position in rows.
+    xf_rpf: usize,
+    row_pos: Option<PacketTensor>,
     codes_buf: Vec<u32>,
     slot_buf: Vec<u32>,
     pos_buf: Vec<u32>,
     rope_buf: Vec<u32>,
+    row_buf: Vec<u32>,
     n_buf: Vec<u32>,
     len_buf: Vec<u32>,
     pcm_buf: Vec<f32>,
@@ -823,9 +828,20 @@ fn bind(path: &Path, device: u8) -> Result<Bound, String> {
         let elems = |t: PacketTensor| vec![0u32; t.bytes / 4];
         let pos = pipeline.tensor("stream.pos").map_err(e)?;
         let rope = pipeline.tensor("stream.rope_pos").map_err(e)?;
+        let xf_rpf = pipeline
+            .parameter("stream.transformer_rows_per_frame")
+            .unwrap_or(1)
+            .max(1) as usize;
+        let row_pos = if xf_rpf > 1 {
+            Some(pipeline.tensor("stream.row_pos").map_err(e)?)
+        } else {
+            None
+        };
         let mut slot_buf = elems(slot);
         if steps.iter().any(|&(b, n, _)| {
-            b > slots.min(slot_buf.len()).min(pos.bytes / 4) || b * n > rope.bytes / 4
+            b > slots.min(slot_buf.len()).min(pos.bytes / 4)
+                || b * n * xf_rpf > rope.bytes / 4
+                || row_pos.is_some_and(|t| b > t.bytes / 4)
         }) {
             return Err("codec step capacity exceeds its stream slots or inputs".into());
         }
@@ -842,12 +858,15 @@ fn bind(path: &Path, device: u8) -> Result<Bound, String> {
         Some(StepIo {
             pos_buf: elems(pos),
             rope_buf: elems(rope),
+            row_buf: row_pos.map(elems).unwrap_or_default(),
             n_buf: elems(slot),
             slot,
             pos,
             rope,
             n,
             slots,
+            xf_rpf,
+            row_pos,
             codes_buf: Vec::new(),
             len_buf: Vec::new(),
             slot_buf,
@@ -1240,8 +1259,13 @@ impl Bound {
                 None => (spare.next().ok_or("no spare codec stream slot")?, 1, 0),
             };
             (io.slot_buf[b], io.pos_buf[b], io.n_buf[b]) = (slot, pos, n);
-            for r in 0..cn {
-                io.rope_buf[b * cn + r] = pos + r as u32;
+            let rows = cn * io.xf_rpf;
+            let row0 = pos * io.xf_rpf as u32;
+            for r in 0..rows {
+                io.rope_buf[b * rows + r] = row0 + r as u32;
+            }
+            if let Some(v) = io.row_buf.get_mut(b) {
+                *v = row0;
             }
         }
         let e = |x: crate::RuntimeError| x.to_string();
@@ -1254,6 +1278,10 @@ impl Bound {
             .map_err(e)?;
         rt.write_tensor(io.rope, bytemuck::cast_slice(&io.rope_buf))
             .map_err(e)?;
+        if let Some(t) = io.row_pos {
+            rt.write_tensor(t, bytemuck::cast_slice(&io.row_buf))
+                .map_err(e)?;
+        }
         for (&t, &(_, per_frame)) in io.n.iter().zip(&self.lengths) {
             io.len_buf.clear();
             io.len_buf.resize(t.bytes / 4, 0);

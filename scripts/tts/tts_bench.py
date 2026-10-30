@@ -57,6 +57,40 @@ def one(url, model, voice, text, stream, seed, extra):
     return dict(ttfa_s=ttfa, latency_s=total, audio_s=len(pcm) / 2 / SR, pcm=pcm)
 
 
+def one_ws(url, model, voice, text, seed, extra):
+    from websockets.sync.client import connect
+    ws_url = url.replace("http://", "ws://").replace("https://", "wss://") + "/v1/audio/speech"
+    body = dict(model=model, input=text, voice=voice, response_format="pcm", stream=True, seed=seed, **extra)
+    if PROMPT_SET == "chatterbox-mtl":
+        body["language"] = LANG_OF[text]
+    headers = {}
+    if SESSION:
+        headers["X-Session-Id"] = f"{SESSION}-{threading.get_ident()}"
+    t0 = time.perf_counter()
+    ttfa, chunks = None, []
+    try:
+        with connect(ws_url, additional_headers=headers, open_timeout=900, close_timeout=30, ping_interval=None, ping_timeout=None) as ws:
+            ws.send(json.dumps(body))
+            for message in ws:
+                if isinstance(message, bytes):
+                    if ttfa is None:
+                        ttfa = time.perf_counter() - t0
+                    chunks.append(message)
+                elif isinstance(message, str):
+                    data = json.loads(message)
+                    if "error" in data:
+                        print(f"ws error: {data['error']}", file=sys.stderr)
+                        break
+                    if data.get("done"):
+                        break
+    except Exception as e:
+        print(f"ws request failed: {e}", file=sys.stderr)
+        chunks = []
+    total = time.perf_counter() - t0
+    pcm = b"".join(chunks)
+    return dict(ttfa_s=ttfa, latency_s=total, audio_s=len(pcm) / 2 / SR, pcm=pcm)
+
+
 def pct(xs, q):
     xs = sorted(xs)
     return xs[min(len(xs) - 1, int(q * len(xs)))]
@@ -82,6 +116,7 @@ def main():
     ap.add_argument("--conc", type=int, default=1)
     ap.add_argument("--n", type=int, default=16)
     ap.add_argument("--stream", action="store_true")
+    ap.add_argument("--ws", action="store_true", help="use WebSocket streaming")
     ap.add_argument("--greedy", action="store_true")
     ap.add_argument("--repetition-penalty", type=float, default=None)
     ap.add_argument("--out", required=True)
@@ -98,7 +133,7 @@ def main():
     SR = card_sample_rate(args.url, args.model) or SR
     SESSION, PROMPT_SET = args.session, args.prompt_set
     os.makedirs(args.out, exist_ok=True)
-    tag = args.tag or f"{'stream' if args.stream else 'full'}_c{args.conc}"
+    tag = args.tag or f"{'ws' if args.ws else ('stream' if args.stream else 'full')}_c{args.conc}"
     extra = dict(temperature=0.0) if args.greedy else {}
     if args.repetition_penalty is not None:
         extra["repetition_penalty"] = args.repetition_penalty
@@ -116,11 +151,12 @@ def main():
     if args.voice:
         prompts = [(args.voice, t) for _, t in prompts]
     jobs = [(prompts[i % len(prompts)], i) for i in range(args.n)]
+    call_one = (lambda u, m, spk, txt, st, sd, ex: one_ws(u, m, spk, txt, sd, ex)) if args.ws else (lambda u, m, spk, txt, st, sd, ex: one(u, m, spk, txt, st, sd, ex))
     for (spk, text), i in jobs[: args.warmup]:
-        one(args.url, args.model, spk, text, args.stream, 1000 + i, per(i))
+        call_one(args.url, args.model, spk, text, args.stream or args.ws, 1000 + i, per(i))
     t0 = time.perf_counter()
     with cf.ThreadPoolExecutor(args.conc) as ex:
-        res = list(ex.map(lambda j: one(args.url, args.model, j[0][0], j[0][1], args.stream, j[1] + 1, per(j[1])), jobs))
+        res = list(ex.map(lambda j: call_one(args.url, args.model, j[0][0], j[0][1], args.stream or args.ws, j[1] + 1, per(j[1])), jobs))
     wall = time.perf_counter() - t0
     texts = {}
     rows = []
@@ -133,14 +169,27 @@ def main():
         rows.append(dict(i=i, speaker=spk, ttfa_s=r["ttfa_s"], latency_s=r["latency_s"], audio_s=r["audio_s"],
                          rtf=r["latency_s"] / r["audio_s"] if r["audio_s"] else None))
     ok = [r for r in rows if r["audio_s"] > 0]
+    if not ok:
+        summ = dict(tag=tag, url=args.url, conc=args.conc, n=len(rows), failed=len(rows), error="all requests failed")
+        print(json.dumps(summ), file=sys.stderr)
+        sys.exit(1)
     summ = dict(tag=tag, url=args.url, conc=args.conc, n=len(rows), failed=len(rows) - len(ok), stream=args.stream,
                 audio_s=sum(r["audio_s"] for r in ok), wall_s=wall,
                 audio_s_per_s=sum(r["audio_s"] for r in ok) / wall,
                 med_latency_s=statistics.median(r["latency_s"] for r in ok),
                 med_rtf=statistics.median(r["rtf"] for r in ok))
-    if args.stream:
+    if args.stream or args.ws:
         summ.update(med_ttfa_ms=1e3 * statistics.median(r["ttfa_s"] for r in ok),
-                    p90_ttfa_ms=1e3 * pct([r["ttfa_s"] for r in ok], 0.9))
+                    p90_ttfa_ms=1e3 * pct([r["ttfa_s"] for r in ok], 0.9),
+                    p99_ttfa_ms=1e3 * pct([r["ttfa_s"] for r in ok], 0.99))
+        if len(ok) > args.conc:
+            steady_ok = [r for r in rows[args.conc:] if r["audio_s"] > 0]
+            if steady_ok:
+                summ.update(
+                    steady_med_ttfa_ms=1e3 * statistics.median(r["ttfa_s"] for r in steady_ok),
+                    steady_p90_ttfa_ms=1e3 * pct([r["ttfa_s"] for r in steady_ok], 0.9),
+                    steady_p99_ttfa_ms=1e3 * pct([r["ttfa_s"] for r in steady_ok], 0.99),
+                )
     json.dump(dict(summary=summ, rows=rows), open(f"{args.out}/{tag}.json", "w"), indent=1)
     if texts:
         old = json.load(open(f"{args.out}/texts.json")) if os.path.exists(f"{args.out}/texts.json") else {}
