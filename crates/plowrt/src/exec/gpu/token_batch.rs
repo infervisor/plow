@@ -527,6 +527,13 @@ impl GpuEngine {
                 .map_err(|error| RuntimeError::Rejected(error.to_string()))?;
             self.spec_hidden_commit(true);
             if self.vmm_prefix_enabled() {
+                let clock = gpu.as_ref().map(|_| std::time::Instant::now());
+                let mut marks = [0u64; 4];
+                let mut mark = |i: usize| {
+                    if let Some(t) = clock {
+                        marks[i] = t.elapsed().as_micros() as u64;
+                    }
+                };
                 for chunk in &chunks {
                     let n = (self.pos[chunk.slot] as usize - chunk.c0).min(chunk.tokens.len());
                     self.seq_tokens[chunk.slot].extend_from_slice(&chunk.tokens[..n]);
@@ -534,15 +541,54 @@ impl GpuEngine {
                 for &(slot, prompt_len) in &prefill_members {
                     self.state_capture_publish(slot, prompt_len);
                 }
+                mark(0);
                 for chunk in &chunks {
                     self.vmm_publish_shared(chunk.slot, chunk.c0 as u32);
                 }
+                mark(1);
+                let n_completed = completed.len();
                 for slot in completed {
                     self.vmm_publish(slot, self.pos[slot].saturating_sub(1));
                     self.vmm_prefill_done(slot);
                 }
+                mark(2);
+                let n_ends = chunk_ends.len();
                 for (slot, rows) in chunk_ends {
                     self.vmm_publish(slot, rows);
+                }
+                mark(3);
+                if clock.is_some() {
+                    let st = self.kv_blocks().map(|bs| bs.stats());
+                    let c = |f: &dyn Fn(&super::kv_blocks::BlockServeStats) -> u64| {
+                        st.as_ref().map_or(0, f)
+                    };
+                    eprintln!(
+                        "PACKLOG PUBLISH capture_us={} shared_us={} done_us={} ends_us={} chunks={} completed={n_completed} ends={n_ends} \
+                         pub_us={} pub_sync_us={} gather_us={} gather_sync_us={} grows={} grow_us={} shrinks={} shrink_us={} \
+                         spills={} spill_us={} evictions={} compactions={} restores={} frees={} free_us={}",
+                        marks[0],
+                        marks[1] - marks[0],
+                        marks[2] - marks[1],
+                        marks[3] - marks[2],
+                        chunks.len(),
+                        c(&|s| s.publish_us),
+                        c(&|s| s.publish_sync_us),
+                        c(&|s| s.gather_us),
+                        c(&|s| s.gather_sync_us),
+                        c(&|s| s.store.device_grows),
+                        c(&|s| s.store.device_grow_us),
+                        c(&|s| s.store.shrinks),
+                        c(&|s| s.store.shrink_us),
+                        c(&|s| s.store.spills),
+                        c(&|s| s.store.spill_us),
+                        c(&|s| s.store.evictions),
+                        c(&|s| s.store.compactions),
+                        c(&|s| s.restores),
+                        crate::memory::kv_store::DEVICE_FREES
+                            .load(std::sync::atomic::Ordering::Relaxed),
+                        crate::memory::kv_store::DEVICE_FREE_US
+                            .load(std::sync::atomic::Ordering::Relaxed),
+                    );
                 }
             }
             if let Some(gpu) = gpu {

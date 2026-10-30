@@ -920,7 +920,11 @@ impl GpuEngine {
             Some(p) => self.be.event_synchronize(&p.done),
             None => return Ok(()),
         };
-        bs.stats.lock().publish_sync_us += ts.elapsed().as_micros() as u64;
+        let us = ts.elapsed().as_micros() as u64;
+        bs.stats.lock().publish_sync_us += us;
+        if crate::config::RuntimeConfig::get().pf_packlog {
+            eprintln!("PACKLOG QUIESCE us={us}");
+        }
         self.blocks_reap_seals();
         r?;
         match bs.copy_failed.get() {

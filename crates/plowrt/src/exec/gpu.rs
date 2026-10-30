@@ -8441,8 +8441,15 @@ impl GpuEngine {
         // can leave kernels queued that still write this slot (an unfed row writes its KV at
         // `pos`); a launch window's work never touches a slot it retires.
         if !self.window_open {
+            let t = pf_packlog_on().then(std::time::Instant::now);
             if let Err(e) = self.be.stream_synchronize(&self.stream) {
                 tracing::warn!(slot = b, error = %e, "retire: stream drain failed");
+            }
+            if let Some(t) = t {
+                eprintln!(
+                    "PACKLOG RETIRE slot={b} drain_us={}",
+                    t.elapsed().as_micros()
+                );
             }
         }
         if self.pos[b] > 0 {

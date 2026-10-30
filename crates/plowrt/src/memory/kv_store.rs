@@ -227,9 +227,19 @@ impl<T> Chunk<T> {
     }
 }
 
+/// Device chunk frees and their wall time, process-wide (`PLOW_PF_PACKLOG` attribution).
+pub static DEVICE_FREES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub static DEVICE_FREE_US: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 impl Chunk<Dev> {
     fn free(self, ops: &dyn StoreOps) {
+        let t = std::time::Instant::now();
         ops.free(self.va);
+        DEVICE_FREES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        DEVICE_FREE_US.fetch_add(
+            t.elapsed().as_micros() as u64,
+            std::sync::atomic::Ordering::Relaxed,
+        );
     }
 }
 
