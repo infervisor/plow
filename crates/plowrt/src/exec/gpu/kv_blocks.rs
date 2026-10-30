@@ -239,7 +239,7 @@ pub struct BlockServe {
     spare_events: Mutex<Vec<CudaEvent>>,
     /// A store copy whose completion could not be proven: its slots are quarantined and every
     /// later [`GpuEngine::blocks_quiesce`] fails with this fatal fault.
-    copy_failed: std::sync::OnceLock<crate::DeviceErrorInfo>,
+    copy_failed: CopyLatch,
     /// The state tensors a first packed prefill can read from a block (`(devp index, offset in
     /// the block)`), set once by the engine; empty = every attach copies the whole state.
     state_defer: std::sync::OnceLock<Vec<(usize, u64)>>,
@@ -400,7 +400,7 @@ impl BlockServe {
             })),
             seals: Mutex::new(Vec::new()),
             spare_events: Mutex::new(Vec::new()),
-            copy_failed: std::sync::OnceLock::new(),
+            copy_failed: CopyLatch::default(),
             state_defer: std::sync::OnceLock::new(),
             pending_state: Mutex::new((0..batch).map(|_| None).collect()),
             held: Mutex::new((0..batch).map(|_| Vec::new()).collect()),
@@ -457,6 +457,69 @@ impl BlockServe {
             Class::State => self.state,
         }
         .expect("planned class exists")
+    }
+}
+
+/// The sticky fatal fault of a store copy whose completion could not be proven.
+#[derive(Default)]
+struct CopyLatch(std::sync::OnceLock<crate::DeviceErrorInfo>);
+
+impl CopyLatch {
+    fn latch(&self, e: &RuntimeError, operation: &str) -> RuntimeError {
+        tracing::error!(error = %e, operation, "kv store: copy completion unproven");
+        let info = match e.device_fault() {
+            Some(i) => crate::DeviceErrorInfo {
+                fatal: true,
+                ..i.clone()
+            },
+            None => crate::DeviceErrorInfo {
+                operation: operation.into(),
+                code: -1,
+                name: e.to_string(),
+                fatal: true,
+            },
+        };
+        let _ = self.0.set(info);
+        self.check().expect_err("latched")
+    }
+
+    fn check(&self) -> Result<()> {
+        match self.0.get() {
+            Some(info) => Err(RuntimeError::DeviceFault { info: info.clone() }),
+            None => Ok(()),
+        }
+    }
+
+    /// Fills whose scatter failed to queue, after the drain: drained, they fail (the next
+    /// acquire refills); else the copy may still write them and they are quarantined.
+    fn settle_fills(&self, fills: Vec<FillToken<'_>>, drained: Result<()>) -> Result<()> {
+        match drained {
+            Ok(()) => {
+                drop(fills);
+                Ok(())
+            }
+            Err(e) => {
+                for token in fills {
+                    token.quarantine();
+                }
+                Err(self.latch(&e, "kv store scatter drain"))
+            }
+        }
+    }
+
+    /// A transfer hold whose copy's completion only a drain can prove: released when it
+    /// drained, else kept for good.
+    fn settle_hold(&self, hold: Hold, drained: Result<()>) -> Result<()> {
+        match drained {
+            Ok(()) => {
+                drop(hold);
+                Ok(())
+            }
+            Err(e) => {
+                hold.abandon();
+                Err(self.latch(&e, "kv store transfer drain"))
+            }
+        }
     }
 }
 
@@ -664,18 +727,12 @@ impl GpuEngine {
                     // Drain even a partially submitted copy: the blocks fail and are released
                     // after the engine stream is done with them.
                     let ts = std::time::Instant::now();
-                    let drained = self.be.stream_synchronize(&self.stream).is_ok();
+                    let drained = self.be.stream_synchronize(&self.stream);
                     sync_us = ts.elapsed().as_micros() as u64;
-                    if drained {
-                        drop(fills);
-                    } else {
-                        for token in fills {
-                            token.quarantine();
-                        }
-                    }
+                    let settled = bs.copy_failed.settle_fills(fills, drained);
                     drop(deps);
                     bs.stats.lock().publish_sync_us += sync_us;
-                    return Err(e);
+                    return Err(settled.err().unwrap_or(e));
                 }
             }
         }
@@ -718,7 +775,9 @@ impl GpuEngine {
     }
 
     /// Drop `hold` once the engine stream passes this point (its reads were queued there).
-    fn blocks_release_after(&self, hold: Hold) {
+    /// `Err` = neither an event nor a drain proves the reads done: the hold stays and the
+    /// fault is latched.
+    fn blocks_release_after(&self, hold: Hold) -> Result<()> {
         let bs = self.kv_blocks().expect("release without store");
         let done = match bs.spare_events.lock().pop() {
             Some(e) => Ok(e),
@@ -732,19 +791,17 @@ impl GpuEngine {
             }
         });
         match recorded {
-            Ok(done) => bs.seals.lock().push(PendingSeal {
-                done,
-                ids: Vec::new(),
-                holds: vec![hold],
-            }),
-            Err(_) => {
-                // Completion unproven: drain, or keep the block pinned.
-                if self.be.stream_synchronize(&self.stream).is_ok() {
-                    drop(hold);
-                } else {
-                    hold.abandon();
-                }
+            Ok(done) => {
+                bs.seals.lock().push(PendingSeal {
+                    done,
+                    ids: Vec::new(),
+                    holds: vec![hold],
+                });
+                Ok(())
             }
+            Err(_) => bs
+                .copy_failed
+                .settle_hold(hold, self.be.stream_synchronize(&self.stream)),
         }
     }
 
@@ -763,20 +820,7 @@ impl GpuEngine {
                     Ok(true) => true,
                     Ok(false) => break,
                     Err(e) => {
-                        tracing::error!(error = %e, "kv store: copy event failed");
-                        let info = match e.device_fault() {
-                            Some(i) => crate::DeviceErrorInfo {
-                                fatal: true,
-                                ..i.clone()
-                            },
-                            None => crate::DeviceErrorInfo {
-                                operation: "kv store copy event".into(),
-                                code: -1,
-                                name: e.to_string(),
-                                fatal: true,
-                            },
-                        };
-                        let _ = bs.copy_failed.set(info);
+                        bs.copy_failed.latch(&e, "kv store copy event");
                         false
                     }
                 };
@@ -852,11 +896,11 @@ impl GpuEngine {
         // (`flush_deferred_attach` drops the holds); outside one the holds retire behind an
         // event (consumers read the slot in stream order); a failure drains here.
         let mut sync_us = 0u64;
-        let copied = if copied.is_ok() {
-            copied
+        let drained = if copied.is_ok() {
+            Ok(())
         } else {
             let ts = std::time::Instant::now();
-            let r = copied.and(self.be.stream_synchronize(&self.stream));
+            let r = self.be.stream_synchronize(&self.stream);
             sync_us = ts.elapsed().as_micros() as u64;
             r
         };
@@ -868,15 +912,17 @@ impl GpuEngine {
                 left: left.clone(),
             });
             if let Some(old) = old {
-                self.blocks_release_after(old.hold);
+                self.blocks_release_after(old.hold)?;
             }
         }
         match copied {
             Ok(()) if self.window_open => bs.held.lock()[b].push(hold),
-            Ok(()) => self.blocks_release_after(hold),
-            Err(_) => drop(hold),
+            Ok(()) => self.blocks_release_after(hold)?,
+            Err(e) => {
+                bs.copy_failed.settle_hold(hold, drained)?;
+                return Err(e);
+            }
         }
-        copied?;
         let mut st = bs.stats.lock();
         st.gathers += 1;
         let us = t0.elapsed().as_micros() as u64;
@@ -908,9 +954,7 @@ impl GpuEngine {
             return Ok(());
         };
         self.blocks_reap_seals();
-        if let Some(info) = bs.copy_failed.get() {
-            return Err(RuntimeError::DeviceFault { info: info.clone() });
-        }
+        bs.copy_failed.check()?;
         let ts = std::time::Instant::now();
         // Seals are recorded in engine-stream order: the newest covers every earlier copy, and
         // not the steps queued after it.
@@ -919,12 +963,11 @@ impl GpuEngine {
             None => return Ok(()),
         };
         bs.stats.lock().publish_sync_us += ts.elapsed().as_micros() as u64;
-        self.blocks_reap_seals();
-        r?;
-        match bs.copy_failed.get() {
-            Some(info) => Err(RuntimeError::DeviceFault { info: info.clone() }),
-            None => Ok(()),
+        if let Err(e) = r {
+            return Err(bs.copy_failed.latch(&e, "kv store seal wait"));
         }
+        self.blocks_reap_seals();
+        bs.copy_failed.check()
     }
 
     pub(super) fn blocks_unhold(&self, b: usize) {
@@ -1251,7 +1294,8 @@ impl GpuEngine {
             }
         };
         if let Some(p) = done {
-            self.blocks_release_after(p.hold);
+            // A failure is latched: the next quiesce reports it.
+            let _ = self.blocks_release_after(p.hold);
         }
     }
 
@@ -1291,7 +1335,7 @@ impl GpuEngine {
         };
         drop(pending);
         if let Some(p) = done {
-            self.blocks_release_after(p.hold);
+            self.blocks_release_after(p.hold)?;
         }
         Ok(())
     }
@@ -1303,7 +1347,8 @@ impl GpuEngine {
         };
         let p = bs.pending_state.lock()[b].take();
         if let Some(p) = p {
-            self.blocks_release_after(p.hold);
+            // A failure is latched: the next quiesce reports it.
+            let _ = self.blocks_release_after(p.hold);
         }
     }
 
@@ -1576,6 +1621,57 @@ mod tests {
             chain: i,
             check: i,
         }
+    }
+
+    fn drain_failed() -> Result<()> {
+        Err(RuntimeError::Device("mock: stream drain failed".into()))
+    }
+
+    /// A scatter that failed to queue: drained, its fills fail and nothing latches; undrained,
+    /// they are quarantined and the latch turns every later check into a fatal fault.
+    #[test]
+    fn an_undrained_scatter_quarantines_its_fills_and_latches() {
+        let s = two_block_store();
+        let latch = CopyLatch::default();
+        let a = s.acquire(0, key(1)).unwrap();
+        latch
+            .settle_fills(vec![a.fill.expect("new block")], Ok(()))
+            .unwrap();
+        assert_eq!(s.state(a.id), Some(crate::memory::kv_store::State::Failed));
+        assert!(latch.check().is_ok());
+        let b = s.acquire(0, key(2)).unwrap();
+        let e = latch
+            .settle_fills(vec![b.fill.expect("new block")], drain_failed())
+            .unwrap_err();
+        assert!(e.is_fatal());
+        assert_eq!(s.state(b.id), None, "quarantined, never served");
+        assert!(latch.check().unwrap_err().is_fatal(), "sticky");
+    }
+
+    /// A transfer hold neither an event nor a drain retires stays for good and latches.
+    #[test]
+    fn an_undrained_hold_stays_and_latches() {
+        let s = Arc::new(two_block_store());
+        let latch = CopyLatch::default();
+        let a = s.acquire(0, key(1)).unwrap();
+        a.fill.expect("new block").seal();
+        s.release(&[a.id]);
+        latch.settle_hold(s.hold(vec![a.id]), Ok(())).unwrap();
+        assert!(latch.check().is_ok());
+        let e = latch
+            .settle_hold(s.hold(vec![a.id]), drain_failed())
+            .unwrap_err();
+        assert!(e.is_fatal() && latch.check().is_err());
+        s.acquire(0, key(2))
+            .unwrap()
+            .fill
+            .expect("new block")
+            .seal();
+        assert!(
+            s.acquire(0, key(3)).is_err(),
+            "the held block is never reclaimed"
+        );
+        assert!(s.state(a.id).is_some());
     }
 
     /// A dependency set dropped before the boundary is recorded releases its blocks (the slot
