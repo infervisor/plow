@@ -170,7 +170,6 @@ struct ChunkBinding {
     step_input_frames: usize,
     history_input_frames: usize,
     bins: usize,
-    staging_rows: u32,
     next_row0: usize,
     encoder_row0: usize,
     predictor_slot0: u32,
@@ -210,20 +209,39 @@ impl ChunkBinding {
             })
             .collect::<Result<Vec<_>>>()?;
         let slots = u32::try_from(param("chunk.slots")?).map_err(|_| invalid())?;
+        let (first, next) = (
+            pipeline.tensor("chunk.input.first")?,
+            pipeline.tensor("chunk.input.next")?,
+        );
+        let (index, slot) = (
+            pipeline.tensor("chunk.index")?,
+            pipeline.tensor("chunk.slot")?,
+        );
+        // Rows per step and window frames follow from the per-stream tensors' sizes.
+        let max_items = slot.bytes / 4;
+        let per_stream = |bytes: usize, unit: usize| {
+            (max_items != 0 && unit != 0 && bytes % (max_items * unit) == 0)
+                .then(|| bytes / (max_items * unit))
+                .ok_or_else(invalid)
+        };
+        let rows = per_stream(index.bytes, 4)?;
+        let first_input_frames = per_stream(first.bytes, bins * 4)?;
+        let step_input_frames = per_stream(next.bytes, bins * 4)?;
         let binding = Self {
-            first: pipeline.tensor("chunk.input.first")?,
-            next: pipeline.tensor("chunk.input.next")?,
-            index: pipeline.tensor("chunk.index")?,
-            slot: pipeline.tensor("chunk.slot")?,
+            first,
+            next,
+            index,
+            slot,
             pos: pipeline.tensor("chunk.pos")?,
             key_start: pipeline.tensor("chunk.key_start")?,
-            rows: param("chunk.rows")?,
+            rows,
             left_rows: param("chunk.left_rows")?,
-            first_input_frames: param("chunk.first_input_frames")?,
-            step_input_frames: param("chunk.step_input_frames")?,
-            history_input_frames: param("chunk.history_input_frames")?,
+            first_input_frames,
+            step_input_frames,
+            history_input_frames: step_input_frames
+                .checked_sub(first_input_frames)
+                .ok_or_else(invalid)?,
             bins,
-            staging_rows: u32::try_from(param("chunk.staging_rows")?).map_err(|_| invalid())?,
             next_row0: param("chunk.next_row0")?,
             encoder_row0: param("chunk.encoder_row0")?,
             predictor_slot0: u32::try_from(param("chunk.predictor_slot0")?)
@@ -234,21 +252,15 @@ impl ChunkBinding {
             lanes: Default::default(),
             rungs,
         };
-        let max_items = binding.rungs.last().map_or(0, |rung| rung.0);
         let streams = slots.saturating_sub(1);
-        let window_bytes = |frames: usize| max_items * frames * bins * 4;
-        if max_items == 0
+        if binding.rungs.last().is_none_or(|rung| rung.0 != max_items)
             || streams == 0
-            || binding.rows == 0
-            || bins == 0
-            || binding.first.bytes != window_bytes(binding.first_input_frames)
-            || binding.next.bytes != window_bytes(binding.step_input_frames)
-            || binding.index.bytes != max_items * binding.rows * 4
-            || [binding.slot, binding.pos, binding.key_start]
+            || rows == 0
+            || [binding.pos, binding.key_start]
                 .iter()
                 .any(|t| t.bytes != max_items * 4)
-            || binding.next_row0 < max_items * binding.rows
-            || binding.encoder_row0 + max_items * binding.rows > batch.encoder_rows as usize
+            || binding.next_row0 < max_items * rows
+            || binding.encoder_row0 + max_items * rows > batch.encoder_rows as usize
             || binding.predictor_slot0 + streams >= batch.slots
             || batch
                 .predict
@@ -726,7 +738,7 @@ impl PacketRnnt {
         }
         // Padding items read zeros (past the staging table, at a first step) into the scratch row.
         let lanes = chunk.rungs[step_rung].0;
-        index.resize(lanes * r, chunk.staging_rows);
+        index.resize(lanes * r, u32::MAX);
         slot.resize(lanes, chunk.scratch);
         pos.resize(lanes, 0);
         key_start.resize(lanes, left as u32);

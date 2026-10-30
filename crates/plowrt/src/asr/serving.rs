@@ -24,7 +24,7 @@ use super::{
         SAMPLE_RATE,
     },
     vad::{speech_samples, speech_segments},
-    FinalizationPolicy, Transcriber, Transcript, TranscriptionInput,
+    FinalizationPolicy, StreamPush, Transcriber, Transcript, TranscriptionInput,
 };
 use crate::serve::session::RequestIds;
 
@@ -110,6 +110,7 @@ pub(crate) struct AsrOpts {
     /// With a session: the decoder rows are retained for, and resumed from, its requests.
     pub ids: Option<RequestIds>,
     /// A partial of a growing recording: reuse (and extend) its completed windows' encoder rows.
+    /// On a final (routes with stream finals): the recording whose engine stream it ends.
     pub windows: Option<Arc<parking_lot::Mutex<WindowCache>>>,
     /// Transcript text deltas as the decoder produces them.
     pub deltas: Option<mpsc::UnboundedSender<String>>,
@@ -225,12 +226,16 @@ impl Route {
     ) -> Result<oneshot::Receiver<crate::Result<Transcript>>, SubmitError> {
         match self {
             Route::Cohort(mux) => {
-                let stream = opts
-                    .windows
-                    .as_ref()
-                    .filter(|_| !opts.final_pass)
-                    .map(Arc::downgrade);
-                mux.submit_with(samples, language, context, cancel, opts.deltas, stream)
+                let stream = opts.windows.as_ref().map(Arc::downgrade);
+                mux.submit_with(
+                    samples,
+                    language,
+                    context,
+                    cancel,
+                    opts.deltas,
+                    stream,
+                    opts.final_pass,
+                )
             }
             #[cfg(feature = "cuda")]
             Route::Shared(asr, mux, routed) => {
@@ -253,6 +258,12 @@ impl Route {
         }
         let _ = server;
         false
+    }
+
+    /// Whether finals come from the session's engine stream: its partials then run as audio
+    /// arrives, whether or not the client shows them.
+    fn stream_finals(&self) -> bool {
+        matches!(self, Route::Cohort(mux) if mux.stream_finals)
     }
 
     /// Whether this route keeps session state (retained decoder rows, appended audio).
@@ -321,6 +332,9 @@ fn collapse_repeats(text: &str) -> Option<String> {
 struct AsrMux {
     tx: mpsc::Sender<AsrJob>,
     metrics: Arc<crate::obs::Metrics>,
+    /// The engine's batched streams: how many can be open, and whether they answer finals.
+    stream_slots: Option<usize>,
+    stream_finals: bool,
 }
 
 struct AsrJob {
@@ -335,6 +349,8 @@ struct AsrJob {
     deltas: Option<mpsc::UnboundedSender<String>>,
     /// A partial of the recording this cache belongs to: continue its engine stream.
     stream: Option<std::sync::Weak<parking_lot::Mutex<WindowCache>>>,
+    /// A final: with `stream` (and stream finals), it ends the recording's engine stream.
+    finish: bool,
 }
 
 /// An engine stream (`Transcriber::stream_open`) following one recording's partials; closed once
@@ -346,38 +362,113 @@ struct OpenStream {
     pushed: usize,
 }
 
-/// A partial through the recording's stream: `None` when the engine has no stream (the caller then
-/// transcribes the whole recording).
-fn continue_stream(
+/// Audio a final may have left to push into its stream; past it the final transcribes offline.
+const FINAL_STREAM_LAG: usize = 2 * SAMPLE_RATE as usize;
+
+/// Jobs that continue their recording's engine stream: partials, and finals when the engine
+/// answers them from the stream. They go in waves of one job per stream, a wave's pushes stepping
+/// together. A job with no stream to take it (the engine has none, or a final whose stream is not
+/// open) goes to `offline`, to transcribe its whole recording.
+fn run_streams(
     engine: &mut dyn Transcriber,
     streams: &mut Vec<OpenStream>,
-    key: std::sync::Weak<parking_lot::Mutex<WindowCache>>,
-    job: &AsrJob,
-) -> Option<crate::Result<Transcript>> {
-    let index = match streams.iter().position(|open| open.key.ptr_eq(&key)) {
-        Some(index) if streams[index].pushed <= job.samples.len() => index,
-        found => {
-            if let Some(index) = found {
-                engine.stream_close(streams.swap_remove(index).id);
+    mut jobs: Vec<AsrJob>,
+    offline: &mut VecDeque<AsrJob>,
+) {
+    while !jobs.is_empty() {
+        let mut wave: Vec<(AsrJob, u64)> = Vec::with_capacity(jobs.len());
+        let mut later = Vec::new();
+        for job in jobs.drain(..) {
+            let key = job.stream.clone().expect("stream jobs");
+            if wave
+                .iter()
+                .any(|(queued, _)| queued.stream.as_ref().is_some_and(|k| k.ptr_eq(&key)))
+            {
+                later.push(job);
+                continue;
             }
-            let id = match engine.stream_open() {
-                Ok(Some(id)) => id,
-                Ok(None) => return None,
-                Err(error) => return Some(Err(error)),
+            if job.cancel.load(Ordering::Relaxed) {
+                finish_job(
+                    job,
+                    Err(crate::RuntimeError::Rejected("ASR cancelled".into())),
+                );
+                continue;
+            }
+            let id = match streams.iter().position(|open| open.key.ptr_eq(&key)) {
+                // A final far ahead of its stream goes offline: one pass beats many steps.
+                Some(index)
+                    if streams[index].pushed <= job.samples.len()
+                        && !(job.finish
+                            && job.samples.len() - streams[index].pushed > FINAL_STREAM_LAG) =>
+                {
+                    streams[index].id
+                }
+                found => {
+                    if let Some(index) = found {
+                        engine.stream_close(streams.swap_remove(index).id);
+                    }
+                    if job.finish {
+                        offline.push_back(AsrJob {
+                            stream: None,
+                            ..job
+                        });
+                        continue;
+                    }
+                    match engine.stream_open() {
+                        Ok(Some(id)) => {
+                            streams.push(OpenStream { key, id, pushed: 0 });
+                            id
+                        }
+                        Ok(None) => {
+                            offline.push_back(AsrJob {
+                                stream: None,
+                                ..job
+                            });
+                            continue;
+                        }
+                        Err(error) => {
+                            finish_job(job, Err(error));
+                            continue;
+                        }
+                    }
+                }
             };
-            streams.push(OpenStream { key, id, pushed: 0 });
-            streams.len() - 1
+            wave.push((job, id));
         }
-    };
-    let open = &mut streams[index];
-    let result = engine.stream_push(open.id, &job.samples[open.pushed..], &mut |_| {});
-    open.pushed = job.samples.len();
-    Some(result.and_then(|text| {
-        Ok(Transcript {
-            text,
-            language: engine.language(job.language.as_deref())?,
-        })
-    }))
+        jobs = later;
+        if wave.is_empty() {
+            continue;
+        }
+        let pushes: Vec<_> = wave
+            .iter()
+            .map(|(job, id)| {
+                let pushed = streams.iter().find(|o| o.id == *id).map_or(0, |o| o.pushed);
+                StreamPush {
+                    id: *id,
+                    samples: &job.samples[pushed..],
+                    finish: job.finish,
+                }
+            })
+            .collect();
+        let results = engine.stream_push_batch(&pushes);
+        drop(pushes);
+        for ((job, id), result) in wave.into_iter().zip(results) {
+            if let Some(index) = streams.iter().position(|o| o.id == id) {
+                if job.finish {
+                    streams.swap_remove(index);
+                } else {
+                    streams[index].pushed = job.samples.len();
+                }
+            }
+            let result = result.and_then(|text| {
+                Ok(Transcript {
+                    text,
+                    language: engine.language(job.language.as_deref())?,
+                })
+            });
+            finish_job(job, result);
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -391,7 +482,8 @@ impl AsrMux {
         Self::spawn_with(engine, Arc::new(crate::obs::Metrics::default()), 4)
     }
 
-    /// `min_queue` floors the ingress queue (four batches otherwise).
+    /// `min_queue` floors the ingress queue (four batches otherwise; an engine with batched streams
+    /// queues three jobs per stream slot: a partial and two finals).
     fn spawn_with(
         mut engine: Box<dyn Transcriber>,
         metrics: Arc<crate::obs::Metrics>,
@@ -401,34 +493,49 @@ impl AsrMux {
         let _ = crate::obs::serving::started_at_unix_ms();
         let batch_capacity = engine.batch_capacity().max(1);
         let finalization = engine.finalization_policy();
+        let stream_slots = engine.stream_slots();
+        let stream_finals =
+            engine.stream_finals() && crate::config::RuntimeConfig::get().asr_stream_finals;
         let ingress_capacity = batch_capacity.saturating_mul(4).max(min_queue);
-        let (tx, mut rx) = mpsc::channel::<AsrJob>(ingress_capacity);
+        let queue = ingress_capacity.max(stream_slots.unwrap_or(0).saturating_mul(3));
+        let (tx, mut rx) = mpsc::channel::<AsrJob>(queue);
         std::thread::Builder::new()
             .name("plow-asr-engine".into())
             .spawn(move || {
-                let mut cohort = VecDeque::with_capacity(batch_capacity);
+                let mut offline = VecDeque::with_capacity(batch_capacity);
                 let mut streams: Vec<OpenStream> = Vec::new();
-                while let Some(first) = rx.blocking_recv() {
-                    cohort.push_back(first);
-                    if batch_capacity > 1 {
-                        let deadline = Instant::now() + BATCH_FORMATION_WINDOW;
-                        while cohort.len() < batch_capacity {
-                            match rx.try_recv() {
-                                Ok(job) => cohort.push_back(job),
-                                Err(mpsc::error::TryRecvError::Disconnected) => break,
-                                Err(mpsc::error::TryRecvError::Empty) => {
-                                    let remaining =
-                                        deadline.saturating_duration_since(Instant::now());
-                                    if remaining.is_zero() {
-                                        break;
+                loop {
+                    let mut cohort = Vec::with_capacity(batch_capacity);
+                    if offline.is_empty() {
+                        let Some(first) = rx.blocking_recv() else {
+                            break;
+                        };
+                        cohort.push(first);
+                        if batch_capacity > 1 {
+                            let deadline = Instant::now() + BATCH_FORMATION_WINDOW;
+                            while cohort.len() < batch_capacity {
+                                match rx.try_recv() {
+                                    Ok(job) => cohort.push(job),
+                                    Err(mpsc::error::TryRecvError::Disconnected) => break,
+                                    Err(mpsc::error::TryRecvError::Empty) => {
+                                        let remaining =
+                                            deadline.saturating_duration_since(Instant::now());
+                                        if remaining.is_zero() {
+                                            break;
+                                        }
+                                        std::thread::sleep(
+                                            remaining.min(Duration::from_micros(100)),
+                                        );
                                     }
-                                    std::thread::sleep(remaining.min(Duration::from_micros(100)));
                                 }
                             }
                         }
-                        cohort
-                            .make_contiguous()
-                            .sort_by_key(|job| std::cmp::Reverse(job.samples.len()));
+                    }
+                    // Batched streams: every queued job joins, so its stream steps in this round.
+                    if stream_slots.is_some() {
+                        while let Ok(job) = rx.try_recv() {
+                            cohort.push(job);
+                        }
                     }
                     for job in &cohort {
                         let metrics = &job.metrics.serving.asr;
@@ -444,23 +551,23 @@ impl AsrMux {
                         }
                         live
                     });
-                    for job in std::mem::take(&mut cohort) {
-                        match job.stream.clone() {
-                            Some(key) => {
-                                match continue_stream(&mut *engine, &mut streams, key, &job) {
-                                    Some(result) => finish_job(job, result),
-                                    None => cohort.push_back(AsrJob {
-                                        stream: None,
-                                        ..job
-                                    }),
-                                }
-                            }
-                            None => cohort.push_back(job),
+                    let mut continuing = Vec::new();
+                    for job in cohort {
+                        match &job.stream {
+                            Some(_) if !job.finish || stream_finals => continuing.push(job),
+                            _ => offline.push_back(AsrJob {
+                                stream: None,
+                                ..job
+                            }),
                         }
                     }
-                    if cohort.is_empty() {
+                    run_streams(&mut *engine, &mut streams, continuing, &mut offline);
+                    // One batch of whole recordings per round: stream rounds go between them.
+                    let take = offline.len().min(batch_capacity);
+                    if take == 0 {
                         continue;
                     }
+                    let mut cohort: VecDeque<AsrJob> = offline.drain(..take).collect();
                     if let [job] = cohort.make_contiguous() {
                         if let Some(deltas) = job.deltas.clone() {
                             let job = cohort.pop_front().expect("one job");
@@ -484,6 +591,9 @@ impl AsrMux {
                             continue;
                         }
                     }
+                    cohort
+                        .make_contiguous()
+                        .sort_by_key(|job| std::cmp::Reverse(job.samples.len()));
                     let requests: Vec<_> = cohort
                         .iter()
                         .map(|job| TranscriptionInput {
@@ -512,7 +622,16 @@ impl AsrMux {
                 }
             })
             .expect("failed to spawn ASR engine thread");
-        (Self { tx, metrics }, ingress_capacity, finalization)
+        (
+            Self {
+                tx,
+                metrics,
+                stream_slots,
+                stream_finals,
+            },
+            ingress_capacity,
+            finalization,
+        )
     }
 
     fn submit(
@@ -522,7 +641,7 @@ impl AsrMux {
         context: String,
         cancel: Arc<AtomicBool>,
     ) -> Result<oneshot::Receiver<crate::Result<Transcript>>, SubmitError> {
-        self.submit_with(samples, language, context, cancel, None, None)
+        self.submit_with(samples, language, context, cancel, None, None, false)
     }
 
     fn submit_with(
@@ -533,6 +652,7 @@ impl AsrMux {
         cancel: Arc<AtomicBool>,
         deltas: Option<mpsc::UnboundedSender<String>>,
         stream: Option<std::sync::Weak<parking_lot::Mutex<WindowCache>>>,
+        finish: bool,
     ) -> Result<oneshot::Receiver<crate::Result<Transcript>>, SubmitError> {
         let permit = self.tx.try_reserve().map_err(|error| {
             self.metrics
@@ -556,6 +676,7 @@ impl AsrMux {
             respond,
             deltas,
             stream,
+            finish,
         };
         self.metrics
             .serving
@@ -642,6 +763,8 @@ impl Drop for Cancellation {
 impl AsrServer {
     pub fn new(model: String, engine: impl Transcriber + 'static) -> Arc<Self> {
         let (mux, ingress_capacity, finalization) = AsrMux::spawn(Box::new(engine));
+        // Each WebSocket session streams through one engine stream slot when it has them.
+        let sessions = mux.stream_slots.unwrap_or(ingress_capacity);
         Arc::new(Self {
             backend: Backend::Cohort {
                 model,
@@ -649,7 +772,7 @@ impl AsrServer {
                 finalization,
             },
             uploads: Arc::new(Semaphore::new(ingress_capacity)),
-            sessions: Arc::new(Semaphore::new(ingress_capacity)),
+            sessions: Arc::new(Semaphore::new(sessions)),
             shutdown: watch::channel(false).0,
             request_timeout: configured_timeout(),
             idle_timeout: IDLE_TIMEOUT,
@@ -1718,6 +1841,9 @@ const IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 /// window and resumes the connection's retained decoder rows; the cohort engine re-transcribes the
 /// whole buffer.
 const PARTIAL_STRIDE: usize = SAMPLE_RATE as usize;
+/// Audio between pushes into a session's engine stream when finals come from it: one 320 ms
+/// encoder step, so a final has a step or two of audio left to run.
+const STREAM_STRIDE: usize = SAMPLE_RATE as usize * 8 / 25;
 
 fn common_prefix_bytes(a: &str, b: &str) -> usize {
     a.char_indices()
@@ -1856,6 +1982,13 @@ async fn stream(
     let _metrics = AsrSessionMetrics::new(state.metrics(&start.model));
     let language = start.language.clone();
     let partials = start.partials;
+    // Finals from the engine stream: its partials run as audio arrives, shown or not.
+    let streaming = route.stream_finals();
+    let stride = if streaming {
+        STREAM_STRIDE
+    } else {
+        PARTIAL_STRIDE
+    };
     let session = ids.session.clone().unwrap_or_default();
     let windows: Arc<parking_lot::Mutex<WindowCache>> = Default::default();
     let request = |final_pass, turn_key: Option<crate::serve::turns::TurnKey>| AsrOpts {
@@ -1865,7 +1998,7 @@ async fn stream(
             turn_key,
             ..ids.with_new_request()
         }),
-        windows: (!final_pass).then(|| windows.clone()),
+        windows: (!final_pass || streaming).then(|| windows.clone()),
         deltas: None,
         report: None,
         ..Default::default()
@@ -1905,7 +2038,7 @@ async fn stream(
                 if let Err(error) = &result {
                     tracing::warn!(%error, samples = samples.len(), "ASR partial failed");
                 }
-                if let Ok(result) = result {
+                if let (true, Ok(result)) = (partials, result) {
                     revision += 1;
                     let stable = common_prefix_bytes(&last_partial, &result.text);
                     if !send(&mut socket, json!({"type":"partial","revision":revision,"text":result.text,
@@ -2117,7 +2250,7 @@ async fn stream(
             }
             return;
         }
-        if partials && pending.is_none() && samples.len() >= partial_at + PARTIAL_STRIDE {
+        if (partials || streaming) && pending.is_none() && samples.len() >= partial_at + stride {
             partial_at = samples.len();
             // A full queue skips this partial; the next stride retries.
             pending = route
@@ -2700,6 +2833,7 @@ mod tests {
                 Arc::new(AtomicBool::new(false)),
                 None,
                 stream,
+                false,
             )
             .unwrap()
         };
@@ -2781,6 +2915,7 @@ mod tests {
                 Arc::new(AtomicBool::new(false)),
                 Some(tx),
                 None,
+                false,
             )
             .unwrap()
             .await

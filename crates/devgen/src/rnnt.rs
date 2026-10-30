@@ -145,7 +145,6 @@ struct ChunkPrograms {
     init: usize,
     /// (items, first-window, later-window and step program sequences), ascending.
     rungs: Vec<(u32, [Vec<usize>; 3])>,
-    staging_rows: u32,
 }
 
 const CHUNK_FIRST: &str = "in.chunk.first";
@@ -358,6 +357,8 @@ impl RnntPackets {
             || !rungs.windows(2).all(|pair| pair[0].items < pair[1].items)
             || geometry.rows == 0
             || geometry.slots < 2
+            || geometry.step_input_frames
+                != geometry.first_input_frames + geometry.history_input_frames
         {
             return Err("invalid batched RNNT stream".into());
         }
@@ -517,7 +518,6 @@ impl RnntPackets {
             geometry,
             init,
             rungs: sequences,
-            staging_rows,
         });
         Ok(())
     }
@@ -1095,14 +1095,12 @@ impl RnntPackets {
                     },
                 );
             }
+            // The rest follows from the tensors (pipelines hold at most 64 parameters): rows per
+            // stream from `chunk.index` over `chunk.slot`, window frames from the inputs, and a
+            // later window repeats the frames it has beyond a first one.
             for (name, value) in [
-                ("chunk.rows", g.rows),
                 ("chunk.left_rows", g.left_rows),
                 ("chunk.slots", g.slots),
-                ("chunk.first_input_frames", g.first_input_frames),
-                ("chunk.step_input_frames", g.step_input_frames),
-                ("chunk.history_input_frames", g.history_input_frames),
-                ("chunk.staging_rows", chunk.staging_rows),
                 ("chunk.next_row0", max_items * g.rows),
                 ("chunk.encoder_row0", g.encoder_row0),
                 ("chunk.predictor_slot0", g.predictor_slot0),
@@ -2685,7 +2683,6 @@ mod tests {
         assert_eq!(pipeline.tensors["chunk.input.next"].shape, [2, 12, 7]);
         assert_eq!(pipeline.tensors["chunk.index"].shape, [4]);
         assert_eq!(pipeline.tensors["chunk.slot"].shape, [2]);
-        assert_eq!(pipeline.parameters["chunk.staging_rows"], 8);
         assert_eq!(pipeline.parameters["chunk.next_row0"], 4);
         assert_eq!(pipeline.parameters["chunk.predictor_slot0"], 2);
         let init = stand_in("act.test.table", "act.stream.position.0", 1).model;
