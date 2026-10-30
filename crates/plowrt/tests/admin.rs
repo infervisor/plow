@@ -350,3 +350,83 @@ async fn unloaded_asr_model_reports_audio_endpoints_in_catalogue() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+#[tokio::test]
+async fn server_brings_up_cleanly_with_zero_assets() {
+    let backend: Arc<dyn Backend> = Arc::new(CpuBackend::new(2));
+    let execset = Arc::new(ExecutorSet::bringup(backend).unwrap());
+    let registry = Registry::new();
+    let state = Arc::new(AppState::new(registry, execset));
+    let router = app(Arc::clone(&state)).merge(plowrt::serve::admin_app(Arc::clone(&state)));
+
+    let resp = router
+        .clone()
+        .oneshot(Request::builder().uri("/health").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let resp = router
+        .clone()
+        .oneshot(Request::builder().uri("/v1/models").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    let status = resp.status();
+    let body = body_string(resp).await;
+    assert_eq!(status, StatusCode::OK, "response body: {body}");
+    let val: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(val["data"].as_array().unwrap().len(), 0);
+
+    let resp = router
+        .oneshot(Request::builder().uri("/v1/models/status").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+}
+
+#[tokio::test]
+async fn load_without_assets_field_finds_local_bundle_under_models_root() {
+    let n = DIR_SEQ.fetch_add(1, Ordering::Relaxed);
+    let root = std::env::temp_dir().join(format!("plowrt_root_{}_{n}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(&root).unwrap();
+    common::write_bundle(&root.join("dynamic-model"), "dynamic-model");
+
+    let backend: Arc<dyn Backend> = Arc::new(CpuBackend::new(2));
+    let execset = Arc::new(ExecutorSet::bringup(backend).unwrap());
+    let registry = Registry::new();
+    let state = Arc::new(AppState::new(registry, execset));
+    state.install_models_roots(vec![root.clone()]);
+
+    let router = plowrt::serve::admin_app(Arc::clone(&state));
+
+    let resp = router
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/models/load")
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"model":"dynamic-model"}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    let status = resp.status();
+    let body = body_string(resp).await;
+    // Without a GPU manager, the request successfully resolved the local bundle under models_root
+    // (advancing past 404 NOT_FOUND) and reached the manager stage (501 NOT_IMPLEMENTED).
+    assert_eq!(status, StatusCode::NOT_IMPLEMENTED, "response body: {body}");
+    assert!(body.contains("no model manager on this server"));
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[tokio::test]
+async fn load_without_assets_field_reports_clear_error_when_model_does_not_exist() {
+    let resp = post("/v1/models/load", r#"{"model":"non-existent-anywhere"}"#).await;
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    let body = body_string(resp).await;
+    assert!(body.contains("not found locally") || body.contains("unknown model"));
+}
+
+

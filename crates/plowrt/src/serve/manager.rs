@@ -646,8 +646,18 @@ pub struct HostManagerDevice {
 }
 
 impl HostManagerDevice {
-    pub fn new(ordinal: u8) -> Self {
+    pub fn new() -> Self {
+        Self { ordinal: 0 }
+    }
+
+    pub fn with_ordinal(ordinal: u8) -> Self {
         Self { ordinal }
+    }
+}
+
+impl Default for HostManagerDevice {
+    fn default() -> Self {
+        Self::new()
     }
 }
 

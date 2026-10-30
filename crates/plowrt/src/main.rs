@@ -93,10 +93,9 @@ enum Cmd {
         backend: String,
     },
     /// Load compiled assets and serve the OpenAI-compatible API.
-    // A serve needs a source: a directory on disk, a reference in the local store, or a packet
-    // ASR model. Grouping them means the error names all of them, rather than telling a
-    // `--model` user that `--assets` is required.
-    #[command(group(clap::ArgGroup::new("model_source").required(true).multiple(true)
+    // A serve can start with models, or with none and receive models dynamically
+    // via /v1/models/load.
+    #[command(group(clap::ArgGroup::new("model_source").required(false).multiple(true)
         .args(["assets", "model", "asr_packets"])))]
     Serve {
         /// One or more compiled-model directories, each `DIR[,checkpoint=PATH][,slug=NAME]`: the
@@ -1773,7 +1772,7 @@ mod amd_bench_cli_tests {
     fn serve_accepts_a_packet_asr_model_alone() {
         let cli = Cli::try_parse_from(["plowrt", "serve", "--asr-packet", "asr=a.pkt"]).unwrap();
         assert!(matches!(cli.cmd, super::Cmd::Serve { ref assets, .. } if assets.is_empty()));
-        assert!(Cli::try_parse_from(["plowrt", "serve"]).is_err());
+        assert!(Cli::try_parse_from(["plowrt", "serve"]).is_ok());
     }
 
     #[test]
@@ -4062,6 +4061,25 @@ async fn bringup_runtime(
             .iter()
             .filter_map(|a| a.parent().map(std::path::Path::to_path_buf)),
     );
+    if let Ok(st) = plowrt::dist::Store::open_default() {
+        let store_root = st.root().to_path_buf();
+        if !roots.contains(&store_root) {
+            roots.push(store_root.clone());
+        }
+        let bundles = store_root.join("bundles");
+        if !roots.contains(&bundles) {
+            roots.push(bundles);
+        }
+    }
+    if let Ok(cwd) = std::env::current_dir() {
+        let models_dir = cwd.join("models");
+        if models_dir.is_dir() && !roots.contains(&models_dir) {
+            roots.push(models_dir);
+        }
+        if !roots.contains(&cwd) {
+            roots.push(cwd);
+        }
+    }
     state.install_models_roots(roots);
 
     // GPU-managed models: any bundle whose assets dir carries a PLOWDEV device
@@ -4139,8 +4157,86 @@ async fn bringup_runtime(
         // Keep CLI registration order (registry iteration is sorted by slug).
         models.sort_by_key(|(_, dir, _)| assets.iter().position(|a| a == dir));
 
-        if !models.is_empty() {
-            let budget = RuntimeConfig::get().nv.vram_budget_mib.map(|mib| mib << 20);
+        let budget = RuntimeConfig::get().nv.vram_budget_mib.map(|mib| mib << 20);
+
+        // Visible ordinals.
+        //
+        // `CUDA_VISIBLE_DEVICES` is applied by libcuda at `cuInit`, so the
+        // count below and every ordinal plowrt uses are ALREADY indices
+        // into the masked set — `--devices 1` means the second visible GPU,
+        // not physical GPU 1. That is the vendor's numbering and matching
+        // it is the point; the startup log prints both so the mapping is
+        // never something an operator has to infer.
+        let visible_count = cuda.device_count()?;
+        let mask = device::visibility::describe_env();
+        if !mask.is_empty() {
+            tracing::info!(
+                visible_devices = ?mask,
+                visible_count,
+                "visible-device mask in force; every ordinal below indexes the MASKED set"
+            );
+        }
+
+        let configured = RuntimeConfig::get().devices.clone();
+        // Validate against the visible set BEFORE opening anything, so an
+        // out-of-range ordinal reads as what it is rather than as a device
+        // that would not initialise.
+        if let Some(&bad) = configured.iter().find(|&&d| d >= visible_count) {
+            let hint = if mask.is_empty() {
+                String::new()
+            } else {
+                format!(" (a visible-device mask is in force: {mask:?})")
+            };
+            return Err(format!(
+                "--devices names device {bad}, but only {visible_count} device(s) are \
+                 visible to this process{hint}"
+            )
+            .into());
+        }
+
+        // STRICTLY the requested set: `--devices 1` must not serve on GPU
+        // 0. The already-open probe backend is reused only if its ordinal
+        // is actually in that set.
+        let probe_ordinal = u32::from(cuda.device_ordinal);
+        let wanted = placement::requested_ordinals(&configured, visible_count);
+        let mut backends: Vec<(u32, Arc<device::cuda::CudaBackend>)> =
+            Vec::with_capacity(wanted.len());
+        for d in wanted {
+            if d == probe_ordinal {
+                backends.push((d, Arc::clone(cuda)));
+                continue;
+            }
+            match device::cuda::CudaBackend::new(d as u8) {
+                Ok(b) => backends.push((d, Arc::new(b))),
+                // Enumerated but not usable. Not a "that was the last one"
+                // break any more: the count came from the driver, so this
+                // is a real failure on a device we were told exists.
+                Err(e) => {
+                    return Err(format!(
+                        "device {d} of {visible_count} visible will not open: {e}"
+                    )
+                    .into())
+                }
+            }
+        }
+        let visible: Vec<u32> = backends.iter().map(|(d, _)| *d).collect();
+
+        if models.is_empty() {
+            let mut managers = Vec::new();
+            for (_ord, be) in &backends {
+                let mgr = Arc::new(plowrt::serve::manager::ModelManager::new(
+                    Arc::clone(be),
+                    &state,
+                    mux_cfg,
+                    Vec::new(),
+                    budget,
+                )?);
+                managers.push(mgr);
+            }
+            let n_groups = managers.len().max(1);
+            state.install_managers(managers);
+            state.install_device_turns(n_groups, true);
+        } else {
             let policy: Place = RuntimeConfig::get().place;
 
             // Per-model footprint and TP degree, both from the blob header.
@@ -4162,68 +4258,6 @@ async fn bringup_runtime(
                     device: None,
                 });
             }
-
-            // Visible ordinals.
-            //
-            // `CUDA_VISIBLE_DEVICES` is applied by libcuda at `cuInit`, so the
-            // count below and every ordinal plowrt uses are ALREADY indices
-            // into the masked set — `--devices 1` means the second visible GPU,
-            // not physical GPU 1. That is the vendor's numbering and matching
-            // it is the point; the startup log prints both so the mapping is
-            // never something an operator has to infer.
-            let visible_count = cuda.device_count()?;
-            let mask = device::visibility::describe_env();
-            if !mask.is_empty() {
-                tracing::info!(
-                    visible_devices = ?mask,
-                    visible_count,
-                    "visible-device mask in force; every ordinal below indexes the MASKED set"
-                );
-            }
-
-            let configured = RuntimeConfig::get().devices.clone();
-            // Validate against the visible set BEFORE opening anything, so an
-            // out-of-range ordinal reads as what it is rather than as a device
-            // that would not initialise.
-            if let Some(&bad) = configured.iter().find(|&&d| d >= visible_count) {
-                let hint = if mask.is_empty() {
-                    String::new()
-                } else {
-                    format!(" (a visible-device mask is in force: {mask:?})")
-                };
-                return Err(format!(
-                    "--devices names device {bad}, but only {visible_count} device(s) are \
-                     visible to this process{hint}"
-                )
-                .into());
-            }
-
-            // STRICTLY the requested set: `--devices 1` must not serve on GPU
-            // 0. The already-open probe backend is reused only if its ordinal
-            // is actually in that set.
-            let probe_ordinal = u32::from(cuda.device_ordinal);
-            let wanted = placement::requested_ordinals(&configured, visible_count);
-            let mut backends: Vec<(u32, Arc<device::cuda::CudaBackend>)> =
-                Vec::with_capacity(wanted.len());
-            for d in wanted {
-                if d == probe_ordinal {
-                    backends.push((d, Arc::clone(cuda)));
-                    continue;
-                }
-                match device::cuda::CudaBackend::new(d as u8) {
-                    Ok(b) => backends.push((d, Arc::new(b))),
-                    // Enumerated but not usable. Not a "that was the last one"
-                    // break any more: the count came from the driver, so this
-                    // is a real failure on a device we were told exists.
-                    Err(e) => {
-                        return Err(format!(
-                            "device {d} of {visible_count} visible will not open: {e}"
-                        )
-                        .into())
-                    }
-                }
-            }
-            let visible: Vec<u32> = backends.iter().map(|(d, _)| *d).collect();
 
             let width = placement::grouping_width(&specs, visible.len())
                 .map_err(|e| -> Box<dyn std::error::Error> { e.to_string().into() })?;
@@ -4657,6 +4691,21 @@ async fn bringup_runtime(
             state.install_gpu_engine(slug, plowrt::serve::engine::ServeEngine::Cpu(eng));
         }
         state.install_portable_manager(portable);
+    }
+
+    #[cfg(any(feature = "cuda", feature = "hsa", feature = "cpu"))]
+    if state.managers().is_empty() {
+        let host_dev = Arc::new(plowrt::serve::manager::HostManagerDevice::new());
+        if let Ok(mgr) = plowrt::serve::manager::ModelManager::with_device(
+            host_dev,
+            &state,
+            mux_cfg,
+            Vec::new(),
+            None,
+        ) {
+            state.install_managers(vec![Arc::new(mgr)]);
+            state.install_device_turns(1, false);
+        }
     }
 
     // Backends without a placement pass serve ONE device set, so one turn covers
