@@ -4663,6 +4663,50 @@ async fn bringup_runtime(
                     state.install_gpu_engine(key, plowrt::serve::engine::ServeEngine::Amd(eng));
                 }
             }
+            let mut managers = Vec::with_capacity(layout.groups.len());
+            for (g, group) in layout.groups.iter().enumerate() {
+                let first = u8::try_from(group.first())
+                    .map_err(|_| "device ordinal out of range".to_string())?;
+                let be = Arc::new(plowrt::device::hsa::HsaBackend::new(first)?);
+                let group_models: Vec<(String, PathBuf, PathBuf)> = specs
+                    .iter()
+                    .enumerate()
+                    .filter(|(i, _)| layout.assignment[*i] == g)
+                    .filter_map(|(_, s)| {
+                        let bundle = state.registry.get(&s.model).ok()?;
+                        let ckpt = plowrt::asset::serve::checkpoint_dir(&bundle.dir);
+                        Some((s.slug.clone(), bundle.dir.clone(), ckpt))
+                    })
+                    .collect();
+                let mgr = Arc::new(plowrt::serve::manager::ModelManager::from_hsa(
+                    be,
+                    &state,
+                    mux_cfg,
+                    group_models,
+                    None,
+                )?);
+                managers.push(mgr);
+            }
+            state.install_managers(managers);
+        } else {
+            let mut managers = Vec::new();
+            for d in 0..visible as u8 {
+                if let Ok(be) = plowrt::device::hsa::HsaBackend::new(d) {
+                    if let Ok(mgr) = plowrt::serve::manager::ModelManager::from_hsa(
+                        Arc::new(be),
+                        &state,
+                        mux_cfg,
+                        Vec::new(),
+                        None,
+                    ) {
+                        managers.push(Arc::new(mgr));
+                    }
+                }
+            }
+            if !managers.is_empty() {
+                state.install_managers(managers);
+                state.install_device_turns(1, false);
+            }
         }
     }
 

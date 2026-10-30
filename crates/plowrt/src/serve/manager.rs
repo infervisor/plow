@@ -628,7 +628,19 @@ impl ManagerDevice for HsaManagerDevice {
     ) -> Result<crate::serve::engine::ServeEngine> {
         let blob = crate::asset::devblob::DevBlob::find_in_dir(dir)?
             .ok_or_else(|| RuntimeError::Msg(format!("no blob in {}", dir.display())))?;
-        let hsaco = dir.join("model.hsaco");
+        let hsaco = crate::config::RuntimeConfig::get()
+            .amd
+            .hsaco
+            .clone()
+            .map(PathBuf::from)
+            .unwrap_or_else(|| {
+                let own = dir.join("hsaco");
+                if own.is_dir() {
+                    own
+                } else {
+                    dir.to_path_buf()
+                }
+            });
         let first = self.be.device_ordinal;
         let engine = crate::serve::engine::AmdServe::load_on(&blob, &hsaco, Some(ckpt), first)?;
         Ok(crate::serve::engine::ServeEngine::Amd(engine))

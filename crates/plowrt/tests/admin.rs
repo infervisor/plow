@@ -311,6 +311,34 @@ fn unload_request_deserializes_drain_timeout() {
 }
 
 #[tokio::test]
+async fn endpoints_are_cached_on_bundle_at_registration() {
+    let state = make_state();
+    let bundle = state.registry.get("state-model").unwrap();
+    assert_eq!(bundle.endpoints(), &["chat/completions", "completions"]);
+    assert!(!bundle.is_speech());
+    assert!(!bundle.is_audio());
+}
+
+#[cfg(feature = "cpu")]
+#[tokio::test]
+async fn portable_manager_unload_honors_drain_timeout() {
+    let state = make_state();
+    let mgr = plowrt::serve::portable::PortableManager::new(MuxConfig::default());
+    mgr.register("state-model".into(), std::path::PathBuf::from("/nonexistent"));
+    state.install_portable_manager(mgr);
+
+    let req = plowrt::serve::admin::UnloadRequest {
+        model: "state-model".into(),
+        deregister: false,
+        rank: None,
+        device: None,
+        drain_timeout_ms: Some(10),
+    };
+    let resp = state.portable_manager().unwrap().unload(&state, req).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+}
+
+#[tokio::test]
 async fn unloaded_asr_model_reports_audio_endpoints_in_catalogue() {
     let n = DIR_SEQ.fetch_add(1, Ordering::Relaxed);
     let dir = std::env::temp_dir().join(format!("plowrt_asr_test_{}_{n}", std::process::id()));

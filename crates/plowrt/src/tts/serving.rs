@@ -175,25 +175,7 @@ pub fn serves_speech(state: &AppState, slug: &str) -> bool {
     let Ok(bundle) = state.registry.get(slug) else {
         return false;
     };
-    if guided_models()
-        .lock()
-        .iter()
-        .any(|((dir, _), g)| *dir == bundle.dir && g.is_some())
-        || speech_models()
-            .lock()
-            .iter()
-            .any(|((dir, _), m)| *dir == bundle.dir && m.is_some())
-    {
-        return true;
-    }
-    super::guided_lm::GuidedLmContract::load(&bundle.dir)
-        .ok()
-        .flatten()
-        .is_some()
-        || SpeechContract::load(&bundle.dir)
-            .ok()
-            .flatten()
-            .is_some()
+    bundle.is_speech()
 }
 
 enum Pipeline {
