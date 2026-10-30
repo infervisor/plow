@@ -5787,15 +5787,21 @@ impl GpuEngine {
             });
         let qwen_light_conv = light_functions.as_ref().is_some_and(|f| f.prefill_conv);
         let qwen_light_norm = light_functions.as_ref().and_then(|f| f.qwen_norm);
+        let light_quant = light_functions.as_ref().and_then(|f| f.quant);
+        let light_quant_tensors = light_quant.map(|_| &devp[..]);
         let main_qwen_light = match qwen_light_pf {
-            Some(_) if !cublaslt_segments.is_empty() => {
-                cublaslt::qwen_decode_light_segments(g, &main_folds, qwen_light_conv, |seg| {
+            Some(_) if !cublaslt_segments.is_empty() => cublaslt::qwen_decode_light_segments(
+                g,
+                &main_folds,
+                qwen_light_conv,
+                light_quant_tensors,
+                |seg| {
                     cublaslt_segments.get(seg).is_some_and(Option::is_some)
                         || gen_segments.get(seg).is_some_and(Option::is_some)
                         || moe_lt_segments.get(seg).is_some_and(Option::is_some)
                         || main_light.iter().any(|(s, _)| *s == seg)
-                })
-            }
+                },
+            ),
             _ => Vec::new(),
         };
         let ordered_waits = if cublaslt_enabled {
@@ -5978,6 +5984,7 @@ impl GpuEngine {
                 &be,
                 function,
                 qwen_light_norm,
+                light_quant,
                 kernarg,
                 g,
                 &main_qwen_light,
@@ -6120,7 +6127,7 @@ impl GpuEngine {
                         light.retain(|(seg, _)| gen_rung.get(*seg).is_none_or(Option::is_none));
                         let folds = cublaslt::argmax_folds(g, &segments, &devp, lt, head_kernel.as_ref());
                         let qwen_light = match qwen_light_pf {
-                            Some(_) => cublaslt::qwen_decode_light_segments(g, &folds, qwen_light_conv, |seg| {
+                            Some(_) => cublaslt::qwen_decode_light_segments(g, &folds, qwen_light_conv, light_quant_tensors, |seg| {
                                 segments.get(seg).is_some_and(Option::is_some)
                                     || gen_rung.get(seg).is_some_and(Option::is_some)
                                     || moe_segments.get(seg).is_some_and(Option::is_some)
@@ -6231,6 +6238,7 @@ impl GpuEngine {
                                 &be,
                                 function,
                                 qwen_light_norm,
+                                light_quant,
                                 rung.kernarg,
                                 g,
                                 &qwen_light,
@@ -11415,7 +11423,7 @@ impl GpuEngine {
                             .then_some(0)
                         })
                         .collect();
-                    cublaslt::qwen_light_segments(g, &library, false)
+                    cublaslt::qwen_light_segments(g, &library, false, None)
                 }
                 None => Vec::new(),
             };

@@ -1869,6 +1869,12 @@ pub struct NvidiaRuntimeConfig {
     #[arg(long = "qwen-light-decode", env = "PLOW_QWEN_LIGHT_DECODE", default_value_t = true, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
     pub qwen_light_decode: bool,
 
+    /// A routed decode segment [producer -> QuantFp8 in 1x128 groups] (RMSNorm, gated norm,
+    /// SiLU Glu, sigmoid gate) runs as one `plow_<arch>_light_quant` launch, one block per row,
+    /// instead of an interpreter window; needs the object's `plow_light_quant_abi` 1.
+    #[arg(long = "light-quant", env = "PLOW_LIGHT_QUANT", default_value_t = true, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
+    pub light_quant: bool,
+
     /// A packed Qwen3.5 prefill chunk's segments between its per-tick launches (the external GDN
     /// segments, the rider attention) replay as CUDA graph pieces captured once per bucket
     /// (needs `--pf-seg-graph`).

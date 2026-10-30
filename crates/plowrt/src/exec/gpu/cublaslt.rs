@@ -231,6 +231,8 @@ enum LightKind {
     Attn(u32),
     /// `light_flash`: the q, k, v HeadNormRope instructions it folds in, or all `!0`.
     Flash([u32; 4]),
+    /// `light_quant`: the QuantFp8 instruction the producer `instruction` feeds.
+    Quant(u32),
 }
 
 /// `PlowLightOp` (light ABI 2): an instruction with its tensor pointers resolved at load.
@@ -321,7 +323,7 @@ impl LightRoute {
             arg.tensors = tensors;
             let mut instruction = launch.instruction;
             let (mut count, mut hnr) = match launch.kind {
-                LightKind::Attn(n) => (n, [0; 4]),
+                LightKind::Attn(n) | LightKind::Quant(n) => (n, [0; 4]),
                 LightKind::Flash(h) => (0, h),
                 LightKind::Single | LightKind::NormQuant => (0, [0; 4]),
             };
@@ -337,6 +339,7 @@ impl LightRoute {
             ];
             let params = match launch.kind {
                 LightKind::Single | LightKind::NormQuant => &mut params[..2],
+                LightKind::Quant(_) => &mut params[..3],
                 _ => &mut params[..],
             };
             self.be.launch_kernel(
@@ -382,6 +385,17 @@ pub(super) struct LightFunctions {
     pub(super) prefill_conv: bool,
     /// `plow_<arch>_light_qnorm`: a routed decode rung's QwenRmsNorm, register-resident rows.
     pub(super) qwen_norm: Option<KernelFn>,
+    /// `plow_<arch>_light_quant` (`plow_light_quant_abi` 1, `PLOW_LIGHT_QUANT`): a decode segment
+    /// [producer -> QuantFp8 1x128 groups] as one launch (`light_quant_pair`), and
+    /// `plow_<arch>_light_quant_norm` for the RMSNorm producer.
+    pub(super) quant: Option<LightQuant>,
+}
+
+/// The `light_quant` entries of a decode object.
+#[derive(Clone, Copy)]
+pub(super) struct LightQuant {
+    pointwise: KernelFn,
+    norm: KernelFn,
 }
 
 /// `FA_ST_THREADS`: eight row-group warps and the producer warp.
@@ -449,6 +463,15 @@ pub(super) fn light_functions(
         be.get_function(module, &format!("plow_{arch}_light_qnorm"))
             .ok()
     });
+    let quant = match be.module_global_u32(module, "plow_light_quant_abi")? {
+        Some(LIGHT_QUANT_ABI) if crate::config::RuntimeConfig::get().nv.light_quant => {
+            Some(LightQuant {
+                pointwise: be.get_function(module, &format!("plow_{arch}_light_quant"))?,
+                norm: be.get_function(module, &format!("plow_{arch}_light_quant_norm"))?,
+            })
+        }
+        _ => None,
+    };
     let prefill_conv = prefill.is_some()
         && be
             .module_global_u32(module, "plow_light_pf_qwen_conv")?
@@ -500,6 +523,7 @@ pub(super) fn light_functions(
         prefill,
         prefill_conv,
         qwen_norm,
+        quant,
     }))
 }
 
@@ -738,12 +762,15 @@ pub(super) fn prefill_light_segments(
 /// The Qwen3.5 chain's interpreter segments made only of its prefill pointwise arms (and SiLU
 /// Glu / Residual), at most four instructions: `plow_<arch>_light_pf` of the PREFILL object runs
 /// them one launch each in program order (`qwen_light_route`).
+/// `quant` (the tensors, when `light_quant` runs): also the [producer, QuantFp8] pairs of
+/// `light_quant_pair`.
 pub(super) fn qwen_light_segments(
     g: &DevProg,
     library: &[Option<usize>],
     conv: bool,
+    quant: Option<&[DeviceMem]>,
 ) -> Vec<(usize, Vec<usize>)> {
-    light_segments_matching(g, library, 4, |d| match DevOp::from_u16(d.op) {
+    let mut light = light_segments_matching(g, library, 4, |d| match DevOp::from_u16(d.op) {
         Some(DevOp::QwenGdnConv) => conv,
         Some(
             DevOp::QwenRmsNorm
@@ -758,7 +785,128 @@ pub(super) fn qwen_light_segments(
         ) => true,
         Some(DevOp::Glu) => d.i[1] == 1,
         _ => false,
-    })
+    });
+    if let Some(devp) = quant {
+        light.extend(
+            (0..g.gq_seg_ofs.len().saturating_sub(1))
+                .filter(|&seg| library.get(seg).copied().flatten().is_none())
+                .filter_map(|seg| {
+                    let entries =
+                        &g.gq_stream[g.gq_seg_ofs[seg] as usize..g.gq_seg_ofs[seg + 1] as usize];
+                    light_quant_pair(g, entries, devp).map(|(p, q)| (seg, vec![p, q]))
+                }),
+        );
+        light.sort_unstable_by_key(|(seg, _)| *seg);
+    }
+    light
+}
+
+/// `plow_light_quant_abi` this runtime launches.
+const LIGHT_QUANT_ABI: u32 = 1;
+
+/// A segment that is exactly [producer, QuantFp8 of the producer's bf16 output in 1x128 groups],
+/// both instructions whole, which `light_quant` runs as one launch of one block per padded row:
+/// `(producer, quant)`. The producer must be one whose per-row body the kernel reproduces bit for
+/// bit (the interpreter's block-per-row RMSNorm, the per-head gated norm, SiLU Glu, the sigmoid
+/// gate) over exactly the quant's rows, and the quant's outputs must not overlap any producer
+/// operand: the fused launch drops the grid-wide round between the two.
+fn light_quant_pair(
+    g: &DevProg,
+    entries: &[packet::dev::StreamEnt],
+    devp: &[DeviceMem],
+) -> Option<(usize, usize)> {
+    let none = packet::dev::TENSOR_NONE16;
+    let p = entries.first()?.inst as usize;
+    let q = p + 1;
+    let (pd, qd) = (g.insts.get(p)?, g.insts.get(q)?);
+    let (pb, qb) = (usize::from(pd.blocks), usize::from(qd.blocks));
+    let whole = pb != 0
+        && qb != 0
+        && entries.len() == pb + qb
+        && entries[..pb]
+            .iter()
+            .enumerate()
+            .all(|(i, e)| e.inst as usize == p && e.slice as usize == i)
+        && entries[pb..]
+            .iter()
+            .enumerate()
+            .all(|(i, e)| e.inst as usize == q && e.slice as usize == i);
+    let (m, k, rp) = (qd.i[0], qd.i[1], qd.i[4]);
+    let quant = qd.op == DevOp::QuantFp8 as u16
+        && qd.i[2] == 0
+        && qd.i[3] == packet::dev::FP8_BLOCK_GROUP
+        && m > 0
+        && k > 0
+        && k % 128 == 0
+        && rp == m.next_multiple_of(4)
+        && qd.t[..3].iter().all(|&t| t != none)
+        && qd.t[3] == none
+        && qd.t[4] == none
+        && qd.t[1] == pd.t[0];
+    if !whole || !quant {
+        return None;
+    }
+    // Producer operands (slot, required bytes; 0 = any) and its shape agreement with the quant.
+    let row = u64::from(m) * u64::from(k) * 2;
+    let (shape, operands): (bool, &[(usize, u64)]) = match DevOp::from_u16(pd.op)? {
+        // Block-per-row: the interpreter's `batch <= nblk` path, width = K.
+        // Block-per-row in the kernel, at most 32 elements per thread.
+        DevOp::QwenRmsNorm => (
+            pd.i[0] == k && pd.i[1] == m && pb >= m as usize && k <= 32 * BLOCK,
+            &[(0, row), (1, row), (2, u64::from(k) * 2), (3, 0), (4, row)],
+        ),
+        // One head = one 128-wide group.
+        DevOp::QwenGatedNorm => (
+            pd.i[1] == 128 && pd.i[0].checked_mul(pd.i[1]) == Some(k) && pd.i[2] == m,
+            &[
+                (0, row),
+                (1, row),
+                (2, row),
+                (3, u64::from(pd.i[1]) * 2),
+                (4, 0),
+            ],
+        ),
+        DevOp::QwenSigmoidGate => (
+            pd.i[0] == k && pd.i[1] == m,
+            &[(0, row), (1, row), (2, row), (3, 0)],
+        ),
+        DevOp::Glu => (
+            pd.i[1] == 1 && u64::from(pd.i[0]) == u64::from(m) * u64::from(k),
+            &[(0, row), (1, row), (2, row)],
+        ),
+        _ => return None,
+    };
+    let required = |slot: usize| {
+        matches!(
+            (DevOp::from_u16(pd.op), slot),
+            (_, 0..=2) | (Some(DevOp::QwenGatedNorm), 3)
+        )
+    };
+    let range = |h: u16| devp.get(usize::from(h)).map(|t| (t.base, t.base + t.len));
+    let (xq, gs) = (range(qd.t[0])?, range(qd.t[2])?);
+    let fits = xq.1 - xq.0 >= u64::from(rp) * u64::from(k)
+        && gs.1 - gs.0 >= u64::from(k / 128) * u64::from(rp) * 4;
+    let disjoint = |a: (u64, u64), b: (u64, u64)| a.1 <= b.0 || b.1 <= a.0;
+    let operands_ok = operands.iter().all(|&(slot, bytes)| {
+        let h = pd.t[slot];
+        if h == none {
+            return !required(slot);
+        }
+        range(h).is_some_and(|r| r.1 - r.0 >= bytes && disjoint(r, xq) && disjoint(r, gs))
+    });
+    // The RMSNorm entry reads its operands through restrict pointers.
+    let restrict_ok = pd.op != DevOp::QwenRmsNorm as u16 || {
+        let ranges: Vec<_> = [0, 1, 2, 4]
+            .iter()
+            .filter(|&&slot| pd.t[slot] != none)
+            .filter_map(|&slot| range(pd.t[slot]))
+            .collect();
+        ranges
+            .iter()
+            .enumerate()
+            .all(|(i, &a)| ranges[i + 1..].iter().all(|&b| disjoint(a, b)))
+    };
+    (shape && fits && disjoint(xq, gs) && operands_ok && restrict_ok).then_some((p, q))
 }
 
 /// Segments of 1..=`max` whole instructions (every slice, ascending, in program order) that
@@ -891,12 +1039,13 @@ pub(super) fn qwen_decode_light_segments(
     g: &DevProg,
     folds: &[ArgmaxFold],
     conv: bool,
+    quant: Option<&[DeviceMem]>,
     taken: impl Fn(usize) -> bool,
 ) -> Vec<(usize, Vec<usize>)> {
     let library: Vec<Option<usize>> = (0..g.gq_seg_ofs.len().saturating_sub(1))
         .map(|seg| (taken(seg) || folds.iter().any(|f| f.segment == seg)).then_some(0))
         .collect();
-    qwen_light_segments(g, &library, conv)
+    qwen_light_segments(g, &library, conv, quant)
 }
 
 pub(super) fn qwen_light_instructions(light: &[(usize, Vec<usize>)]) -> Vec<(usize, usize)> {
@@ -912,6 +1061,7 @@ pub(super) fn add_qwen_light_routes(
     be: &Arc<CudaBackend>,
     function: KernelFn,
     norm: Option<KernelFn>,
+    quant: Option<LightQuant>,
     kernarg: DevProgram,
     g: &DevProg,
     light: &[(usize, Vec<usize>)],
@@ -920,6 +1070,32 @@ pub(super) fn add_qwen_light_routes(
     for (seg, insts) in light {
         if routes.len() <= *seg {
             routes.resize_with(seg + 1, || None);
+        }
+        if let ([p, q], Some(quant)) = (&insts[..], quant) {
+            let (pd, qd) = (&g.insts[*p], &g.insts[*q]);
+            if qd.op == DevOp::QuantFp8 as u16 {
+                let norm = pd.op == DevOp::QwenRmsNorm as u16;
+                routes[*seg] = Some(LibraryRoute::Light(LightRoute {
+                    be: Arc::clone(be),
+                    kernarg,
+                    launches: vec![LightLaunch {
+                        function: if norm { quant.norm } else { quant.pointwise },
+                        xs: LightX::default(),
+                        kind: LightKind::Quant(*q as u32),
+                        direct: None,
+                        instruction: *p as u32,
+                        blocks: if norm {
+                            qd.i[4]
+                        } else {
+                            (qd.i[4] * (qd.i[1] / 128)).div_ceil(BLOCK / 32)
+                        },
+                        block: BLOCK,
+                        smem: 0,
+                    }],
+                    _scratch: None,
+                }));
+                continue;
+            }
         }
         let mut route = qwen_light_route(be, function, kernarg, g, insts, grid);
         if let Some(norm) = norm {
