@@ -4045,41 +4045,15 @@ async fn bringup_runtime(
 
     let state = Arc::new(AppState::with_trace(registry, execset, trace));
 
-    // Where a control-plane load may take an assets dir from. Explicit
-    // `--models-root` entries, plus the parents of the dirs this process was
-    // started with — so the common case (serve two of the bundles that already
-    // live side by side) needs no extra flag, while an arbitrary path in a
-    // request body stays refused. `serve::admin` canonicalizes both sides
-    // before the prefix test.
-    let mut roots: Vec<PathBuf> = RuntimeConfig::get()
-        .models_root
-        .iter()
-        .map(PathBuf::from)
-        .collect();
-    roots.extend(
-        assets
-            .iter()
-            .filter_map(|a| a.parent().map(std::path::Path::to_path_buf)),
+    // Where a control-plane load may take an assets dir from (`admin::startup_models_roots`).
+    let store_bundles = plowrt::dist::Store::open_default()
+        .ok()
+        .map(|st| st.root().join("bundles"));
+    let roots = plowrt::serve::admin::startup_models_roots(
+        &RuntimeConfig::get().models_root,
+        &assets,
+        store_bundles,
     );
-    if let Ok(st) = plowrt::dist::Store::open_default() {
-        let store_root = st.root().to_path_buf();
-        if !roots.contains(&store_root) {
-            roots.push(store_root.clone());
-        }
-        let bundles = store_root.join("bundles");
-        if !roots.contains(&bundles) {
-            roots.push(bundles);
-        }
-    }
-    if let Ok(cwd) = std::env::current_dir() {
-        let models_dir = cwd.join("models");
-        if models_dir.is_dir() && !roots.contains(&models_dir) {
-            roots.push(models_dir);
-        }
-        if !roots.contains(&cwd) {
-            roots.push(cwd);
-        }
-    }
     state.install_models_roots(roots);
 
     // GPU-managed models: any bundle whose assets dir carries a PLOWDEV device

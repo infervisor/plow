@@ -864,8 +864,9 @@ pub struct RuntimeConfig {
     ///
     /// This is a security boundary, not ergonomics: loading a bundle loads and
     /// EXECUTES its cubins/hsaco, so an unconstrained path in a request body is
-    /// arbitrary code execution. Unset = only the assets dirs the process was
-    /// started with (their parents) are reachable.
+    /// arbitrary code execution. Always reachable as well: the parents of the
+    /// assets dirs the process was started with, and the local store's
+    /// `bundles/` (signature-checked pulls). Never the working directory.
     #[arg(
         long = "models-root",
         env = "PLOW_MODELS_ROOT",
