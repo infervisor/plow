@@ -1213,12 +1213,23 @@ impl ServingMetrics {
             |m: &Metrics, _| m.serving.tts.audio_duration_ms.load(Relaxed) as f64 / 1000.0
         );
         for (name, help, select) in [
-            ("plowrt_tts_first_audio_seconds", "Time from speech request arrival to first playable audio frame (TTFA).", (|m: &TtsMetrics| &m.first_audio) as fn(&TtsMetrics) -> &Histogram),
-            ("plowrt_tts_e2e_duration_seconds", "Time from speech request arrival to full utterance completion.", (|m: &TtsMetrics| &m.e2e) as fn(&TtsMetrics) -> &Histogram),
+            (
+                "plowrt_tts_first_audio_seconds",
+                "Time from speech request arrival to first playable audio frame (TTFA).",
+                (|m: &TtsMetrics| &m.first_audio) as fn(&TtsMetrics) -> &Histogram,
+            ),
+            (
+                "plowrt_tts_e2e_duration_seconds",
+                "Time from speech request arrival to full utterance completion.",
+                (|m: &TtsMetrics| &m.e2e) as fn(&TtsMetrics) -> &Histogram,
+            ),
         ] {
             family(out, name, "histogram", help);
             for ((_, m, _), labels) in models.iter().zip(&labels) {
-                if m.serving.tts.active.load(Relaxed) || m.serving.tts.http_requests.load(Relaxed) > 0 || m.serving.tts.websocket_sessions.load(Relaxed) > 0 {
+                if m.serving.tts.active.load(Relaxed)
+                    || m.serving.tts.http_requests.load(Relaxed) > 0
+                    || m.serving.tts.websocket_sessions.load(Relaxed) > 0
+                {
                     select(&m.serving.tts).write_seconds(out, name, labels);
                 }
             }
@@ -1572,7 +1583,10 @@ mod tests {
         m.serving.tts.playback_stalls.store(0, Relaxed);
         m.serving.tts.watchdog_recovers.store(1, Relaxed);
         m.serving.tts.audio_duration_ms.store(150_000, Relaxed);
-        m.serving.tts.first_audio.duration(Duration::from_millis(115));
+        m.serving
+            .tts
+            .first_audio
+            .duration(Duration::from_millis(115));
         m.serving.tts.e2e.duration(Duration::from_millis(500));
 
         m.serving.asr.cohort.store(true, Relaxed);

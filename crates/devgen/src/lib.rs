@@ -86,9 +86,9 @@ mod dspark;
 pub mod fish_codec;
 mod fish_depth;
 pub mod fish_encoder;
-pub mod maya2_depth;
 mod gemv_decode_role;
 pub mod manifest;
+pub mod maya2_depth;
 pub mod mimi_encoder;
 pub mod mm;
 pub mod modular;
@@ -3121,8 +3121,7 @@ fn declare(
             edns: ex4[3],
         });
     }
-    if c
-        .frame
+    if c.frame
         .as_ref()
         .and_then(|f| f.depth.as_ref())
         .is_some_and(|d| d.maya2.is_none())
@@ -3148,7 +3147,8 @@ fn declare(
     } else if emit_config::active().emit_spec {
         t.mtp = Some(mtp::declare(b, c, dbatch, t.rowslot != TENSOR_NONE));
     }
-    if emit_config::active().decode_hnr_fold.unwrap_or(0) > 0 && !emit_is_amd() && !emit_is_apple() {
+    if emit_config::active().decode_hnr_fold.unwrap_or(0) > 0 && !emit_is_amd() && !emit_is_apple()
+    {
         for l in 0..c.layers as usize {
             let (cs, sn) = if c.is_full[l] {
                 (t.cos_f, t.sin_f)
@@ -3170,7 +3170,8 @@ fn declare(
                 u32::from(!c.has_v_norm),
             ];
             let desc = words.iter().flat_map(|w| w.to_le_bytes()).collect();
-            t.hnrd.push(b.tensor_init(&format!("in.hnr_fold.desc.{l}"), desc));
+            t.hnrd
+                .push(b.tensor_init(&format!("in.hnr_fold.desc.{l}"), desc));
         }
     }
     t
@@ -4976,7 +4977,11 @@ fn emit_phase(
         && c.hidden <= 2048
         && block.clone().all(|l| {
             let w = &n.lw[l];
-            let next = if l + 1 < block.end { n.lw[l + 1].g_in } else { n.fin };
+            let next = if l + 1 < block.end {
+                n.lw[l + 1].g_in
+            } else {
+                n.fin
+            };
             !c.kv_is_shared(l)
                 && !(c.is_full[l] && c.k_eq_v)
                 && (c.heads / tp * if c.is_full[l] { c.hd_full } else { c.hd_slide }) % 32 == 0
@@ -5760,7 +5765,9 @@ fn emit_phase(
         let hnr_fold = decode
             && fuse_qkv
             && l < n.hnrd.len()
-            && emit_config::active().decode_hnr_fold.is_some_and(|rows| t >= rows)
+            && emit_config::active()
+                .decode_hnr_fold
+                .is_some_and(|rows| t >= rows)
             && !fp8_kv
             && heads / kvh == gf
             && hd == 128
@@ -11483,8 +11490,7 @@ fn emit_dense_gqa(
     }
     // Speech ops of auxiliary programs (not in `m.progs`), for the speech object's arm mask.
     let mut aux_speech_ops = 0u64;
-    if c
-        .frame
+    if c.frame
         .as_ref()
         .and_then(|f| f.depth.as_ref())
         .is_some_and(|d| d.maya2.is_some())
@@ -11870,7 +11876,12 @@ fn emit_dense_gqa(
         let fish = std::fs::read(dir.join("config.json"))
             .ok()
             .and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok())
-            .is_some_and(|v| matches!(v["model_type"].as_str(), Some("fish_dac" | "qwen3_tts_12hz" | "mimi_dac")));
+            .is_some_and(|v| {
+                matches!(
+                    v["model_type"].as_str(),
+                    Some("fish_dac" | "qwen3_tts_12hz" | "mimi_dac")
+                )
+            });
         let (model, section) = if fish {
             fish_codec::lower_fish_dac(
                 dir,

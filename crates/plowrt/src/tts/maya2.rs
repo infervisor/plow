@@ -102,7 +102,10 @@ pub fn detect_lang(text: &str) -> &'static str {
 }
 
 fn is_pause(ch: char) -> bool {
-    matches!(ch, ',' | ';' | ':' | '.' | '!' | '?' | '।' | '॥' | '…' | '-')
+    matches!(
+        ch,
+        ',' | ';' | ':' | '.' | '!' | '?' | '।' | '॥' | '…' | '-'
+    )
 }
 
 /// Python `str.isalnum() or "_"` (the `re` `\w` class).
@@ -117,7 +120,11 @@ impl Controller {
 
     /// (expected frames, their p99 residual) of `chars` characters.
     pub fn expected_frames(&self, lang: &str, chars: usize) -> (f32, f32) {
-        let [a, b, r] = self.frames_prior.get(lang).copied().unwrap_or(FRAMES_DEFAULT);
+        let [a, b, r] = self
+            .frames_prior
+            .get(lang)
+            .copied()
+            .unwrap_or(FRAMES_DEFAULT);
         (a + b * chars as f32, r)
     }
 
@@ -176,7 +183,14 @@ impl Controller {
 
     /// One text piece's frame budget and guard plan (`engine._plan`); `max_frames` is the
     /// request's own limit.
-    pub fn plan(&self, text: &str, lang: &str, max_frames: Option<usize>, cb0: Cb0, seed: u64) -> Plan {
+    pub fn plan(
+        &self,
+        text: &str,
+        lang: &str,
+        max_frames: Option<usize>,
+        cb0: Cb0,
+        seed: u64,
+    ) -> Plan {
         let g = &self.guard;
         let (ef, er) = self.expected_frames(lang, text.chars().count());
         let loose = g.hard_cap.min((2.0 * (ef + er) + 40.0) as u32);
@@ -250,8 +264,32 @@ impl Controller {
 /// `FILLER_RE` matches: a filler word not inside a longer word.
 fn fillers(chars: &[char]) -> Vec<usize> {
     const FIXED: &[&str] = &[
-        "uhh", "erm", "um", "ह्म्म", "ह्म", "हम्म", "उम्म", "उम", "ಹ್ಮ್", "ಉಮ್", "ஹ்ம்", "ம்ம்", "உம்", "উমম", "উম",
-        "হুম", "ଉମ୍", "ହମ୍", "ਹਮ", "ਉਮ", "હમ્મ", "ઉમ", "ఉమ్", "హ్మ్", "ഉം", "ഹ്മ്",
+        "uhh",
+        "erm",
+        "um",
+        "ह्म्म",
+        "ह्म",
+        "हम्म",
+        "उम्म",
+        "उम",
+        "ಹ್ಮ್",
+        "ಉಮ್",
+        "ஹ்ம்",
+        "ம்ம்",
+        "உம்",
+        "উমম",
+        "উম",
+        "হুম",
+        "ଉମ୍",
+        "ହମ୍",
+        "ਹਮ",
+        "ਉਮ",
+        "હમ્મ",
+        "ઉમ",
+        "ఉమ్",
+        "హ్మ్",
+        "ഉം",
+        "ഹ്മ്",
     ];
     let lower: Vec<char> = chars.iter().map(|c| c.to_ascii_lowercase()).collect();
     let mut out = Vec::new();
@@ -532,7 +570,11 @@ impl Slot {
     /// `guards.loop_detect_batch` for this slot.
     fn loop_hit(&self) -> bool {
         let g = self.plan.guard;
-        let (st, pw, n) = (g.stall as usize, g.period_win as usize, self.frames as usize);
+        let (st, pw, n) = (
+            g.stall as usize,
+            g.period_win as usize,
+            self.frames as usize,
+        );
         let w = &self.tail;
         if n < 12.max(st) || st == 0 || st > w.len() || pw > w.len() {
             return false;
@@ -589,7 +631,9 @@ fn matvec(w: &[f32], x: &[f32], b: Option<&[f32]>) -> Vec<f32> {
     let k = x.len();
     w.chunks_exact(k)
         .enumerate()
-        .map(|(n, row)| row.iter().zip(x).map(|(a, b)| a * b).sum::<f32>() + b.map_or(0.0, |b| b[n]))
+        .map(|(n, row)| {
+            row.iter().zip(x).map(|(a, b)| a * b).sum::<f32>() + b.map_or(0.0, |b| b[n])
+        })
         .collect()
 }
 
@@ -609,7 +653,8 @@ fn libm_erf(x: f32) -> f32 {
                         + t * (-0.186_288_06
                             + t * (0.278_868_07
                                 + t * (-1.135_203_98
-                                    + t * (1.488_515_87 + t * (-0.822_152_23 + t * 0.170_872_77)))))))))
+                                    + t * (1.488_515_87
+                                        + t * (-0.822_152_23 + t * 0.170_872_77)))))))))
             .exp();
     (if x >= 0.0 { y } else { -y }) as f32
 }
@@ -622,7 +667,9 @@ impl Speaker {
         let st = safetensors::SafeTensors::deserialize(&bytes)
             .map_err(|e| format!("{}: {e}", path.display()))?;
         let get = |name: &str| -> Result<Vec<f32>, String> {
-            let t = st.tensor(name).map_err(|e| format!("{}: {name}: {e}", path.display()))?;
+            let t = st
+                .tensor(name)
+                .map_err(|e| format!("{}: {name}: {e}", path.display()))?;
             if t.dtype() != safetensors::Dtype::F32 {
                 return Err(format!("{}: {name} is not f32", path.display()));
             }
@@ -655,7 +702,10 @@ impl Speaker {
 
     /// The `<|audio|>` sentinel's input row for this speaker: `bf16(embed + MLP(e))`.
     pub fn anchor_row(&self, e: &[f32; ECAPA_DIM]) -> Vec<f32> {
-        let h1: Vec<f32> = matvec(&self.fc1.0, e, Some(&self.fc1.1)).into_iter().map(gelu).collect();
+        let h1: Vec<f32> = matvec(&self.fc1.0, e, Some(&self.fc1.1))
+            .into_iter()
+            .map(gelu)
+            .collect();
         let a = matvec(&self.fc2.0, &h1, Some(&self.fc2.1));
         a.iter()
             .zip(&self.audio_row)
@@ -715,7 +765,11 @@ mod tests {
         assert_eq!(round_f16(1.0 + 3.0 / 4096.0), 1.0 + 1.0 / 1024.0);
         assert_eq!(round_bf16(1.0 + 1.0 / 512.0), 1.0);
         // torch.nn.functional.gelu(torch.tensor([1.0, -0.5, 3.0]))
-        for (x, y) in [(1.0f32, 0.841_344_7f32), (-0.5, -0.154_268_57), (3.0, 2.995_950_4)] {
+        for (x, y) in [
+            (1.0f32, 0.841_344_7f32),
+            (-0.5, -0.154_268_57),
+            (3.0, 2.995_950_4),
+        ] {
             assert!((gelu(x) - y).abs() < 1e-6, "{x}: {} vs {y}", gelu(x));
         }
     }

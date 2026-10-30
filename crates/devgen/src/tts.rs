@@ -274,7 +274,9 @@ pub const MAYA2: SpeechProfile = SpeechProfile {
         tail: Some(&[194548]),
         eos_code: None,
     }),
-    languages: &["en", "as", "bn", "gu", "hi", "kn", "ml", "mr", "or", "pa", "ta", "te"],
+    languages: &[
+        "en", "as", "bn", "gu", "hi", "kn", "ml", "mr", "or", "pa", "ta", "te",
+    ],
     segment_frames: 250,
 };
 
@@ -433,8 +435,8 @@ pub fn speech_pipeline_section(
     }
     if p.depth_sampler == 2 {
         let path = dir.join(MAYA2_CONTROLLER);
-        let text = std::fs::read_to_string(&path)
-            .map_err(|e| format!("{}: {e}", path.display()))?;
+        let text =
+            std::fs::read_to_string(&path).map_err(|e| format!("{}: {e}", path.display()))?;
         serde_json::from_str::<serde_json::Value>(&text)
             .map_err(|e| format!("{}: {e}", path.display()))?;
         pipe.strings.insert("maya2.controller".into(), text);

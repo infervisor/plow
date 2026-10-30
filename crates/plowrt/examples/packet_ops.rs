@@ -15,7 +15,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     for (i, inst) in p.insts.iter().enumerate() {
         let op = packet::dev::DevOp::from_u16(inst.op)
             .map_or_else(|| format!("op{}", inst.op), |o| format!("{o:?}"));
-        println!("{i} {op} rows={} i1={} i2={} flags={}", inst.i[0], inst.i[1], inst.i[2], inst.i[7]);
+        println!(
+            "{i} {op} rows={} i1={} i2={} flags={}",
+            inst.i[0], inst.i[1], inst.i[2], inst.i[7]
+        );
     }
     Ok(())
 }

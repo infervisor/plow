@@ -589,7 +589,9 @@ impl Maya2Speaker {
             })
         };
         load()
-            .inspect_err(|e| tracing::warn!(error = %e, "tts: maya2 speaker conditioning unavailable"))
+            .inspect_err(
+                |e| tracing::warn!(error = %e, "tts: maya2 speaker conditioning unavailable"),
+            )
             .ok()
     }
 
@@ -827,11 +829,7 @@ pub async fn ws_speech(
         })
 }
 
-async fn ws_speech_session(
-    state: Arc<AppState>,
-    mut socket: WebSocket,
-    mut ids: RequestIds,
-) {
+async fn ws_speech_session(state: Arc<AppState>, mut socket: WebSocket, mut ids: RequestIds) {
     while let Some(msg) = socket.recv().await {
         let text = match msg {
             Ok(Message::Text(t)) => t,
@@ -861,8 +859,16 @@ async fn ws_speech_session(
         };
         req.stream = true;
         let model_metrics = state.model_metrics(&req.model);
-        model_metrics.serving.tts.active.store(true, std::sync::atomic::Ordering::Relaxed);
-        model_metrics.serving.tts.websocket_sessions.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        model_metrics
+            .serving
+            .tts
+            .active
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        model_metrics
+            .serving
+            .tts
+            .websocket_sessions
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         if let Err(e) = ids.apply_body(&req.route()) {
             let _ = socket
                 .send(Message::Text(
@@ -926,9 +932,7 @@ async fn ws_speech_session(
         }
         if sent_any {
             let _ = socket
-                .send(Message::Text(
-                    serde_json::json!({"done": true}).to_string(),
-                ))
+                .send(Message::Text(serde_json::json!({"done": true}).to_string()))
                 .await;
         }
     }
@@ -1044,8 +1048,16 @@ async fn speech_with(
         );
     };
     let model_metrics = state.model_metrics(&key);
-    model_metrics.serving.tts.active.store(true, std::sync::atomic::Ordering::Relaxed);
-    model_metrics.serving.tts.http_requests.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    model_metrics
+        .serving
+        .tts
+        .active
+        .store(true, std::sync::atomic::Ordering::Relaxed);
+    model_metrics
+        .serving
+        .tts
+        .http_requests
+        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let mut run = crate::serve::turns::StageRun::start(
         ids,
         crate::serve::turns::Kind::Tts,
@@ -1359,7 +1371,10 @@ async fn speech_with(
                 Verdict::Keep => {}
                 Verdict::Retry => {
                     if let Some(m) = run.metrics() {
-                        m.serving.tts.watchdog_recovers.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        m.serving
+                            .tts
+                            .watchdog_recovers
+                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     }
                     attempt += 1;
                     continue;
@@ -1452,11 +1467,14 @@ fn ref_clip(
     let mut ids = clone.head.clone();
     // Maya 2 (`icl`): the transcript in its own language, no speaker name.
     let lang = c.maya2.as_ref().map(|_| super::maya2::detect_lang(text));
-    let voice = if c.maya2.is_some() { MAYA2_CLONE_VOICE } else { voice };
-    ids.extend(tok.encode_with_special_tokens(
-        &c.prompt_text(voice, lang, None, text.trim()),
-        false,
-    ));
+    let voice = if c.maya2.is_some() {
+        MAYA2_CLONE_VOICE
+    } else {
+        voice
+    };
+    ids.extend(
+        tok.encode_with_special_tokens(&c.prompt_text(voice, lang, None, text.trim()), false),
+    );
     ids.extend_from_slice(&clone.mid);
     if model.encoder.as_ref().is_some_and(|e| ids.len() > e.rows()) {
         return Err((
@@ -1576,9 +1594,12 @@ impl SegmentMaker {
             let mut ids = lead.clone();
             let cloned = self.reference.is_some() || self.speaker.is_some();
             let mut prompt = match (cloned, &c.maya2) {
-                (true, Some(_)) => {
-                    c.prompt_text(MAYA2_CLONE_VOICE, self.language.as_deref(), instructions, text)
-                }
+                (true, Some(_)) => c.prompt_text(
+                    MAYA2_CLONE_VOICE,
+                    self.language.as_deref(),
+                    instructions,
+                    text,
+                ),
                 _ => c.prompt_text(&self.voice, self.language.as_deref(), instructions, text),
             };
             if let (Some(r), Some(l)) = (&self.reference, &self.language) {
@@ -1660,7 +1681,9 @@ impl SegmentMaker {
             self.language.as_deref().unwrap_or("en"),
             self.max_tokens,
             cb0,
-            self.seed.wrapping_mul(1_000_003).wrapping_add(k as u64 * 7919),
+            self.seed
+                .wrapping_mul(1_000_003)
+                .wrapping_add(k as u64 * 7919),
         )
     }
 
@@ -2108,13 +2131,22 @@ async fn stream_task(
     impl Drop for ActiveGuard {
         fn drop(&mut self) {
             if let Some(m) = &self.0 {
-                m.serving.tts.active_streams.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+                m.serving
+                    .tts
+                    .active_streams
+                    .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
             }
         }
     }
     if let Some(m) = run.metrics() {
-        m.serving.tts.active.store(true, std::sync::atomic::Ordering::Relaxed);
-        m.serving.tts.active_streams.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        m.serving
+            .tts
+            .active
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        m.serving
+            .tts
+            .active_streams
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }
     let _stream_guard = ActiveGuard(run.metrics().cloned());
     let mut head = Some(head);
@@ -2244,7 +2276,10 @@ async fn stream_task(
                 None => break,
                 Some(SegMsg::Retry) => {
                     if let Some(m) = run.metrics() {
-                        m.serving.tts.watchdog_recovers.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        m.serving
+                            .tts
+                            .watchdog_recovers
+                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     }
                     (frames, emitted, skipping) = (Vec::new(), 0, false);
                     attempt += 1;
@@ -2272,7 +2307,10 @@ async fn stream_task(
             Some(SegMsg::End) => done = true,
             Some(SegMsg::Err(e)) => {
                 if let Some(m) = run.metrics() {
-                    m.serving.tts.errors.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    m.serving
+                        .tts
+                        .errors
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 }
                 return drop(out.send(Err(std::io::Error::other(e))).await);
             }
@@ -2412,7 +2450,10 @@ async fn stream_task(
                         }
                         if out.send(Ok(bytes)).await.is_err() {
                             if let Some(m) = run.metrics() {
-                                m.serving.tts.cancelled.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                m.serving
+                                    .tts
+                                    .cancelled
+                                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                             }
                             return; // client gone: dropping frx ends the drain, which cancels the slot
                         }
@@ -2420,7 +2461,10 @@ async fn stream_task(
                 }
                 Err(e) => {
                     if let Some(m) = run.metrics() {
-                        m.serving.tts.errors.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        m.serving
+                            .tts
+                            .errors
+                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     }
                     return drop(out.send(Err(std::io::Error::other(e))).await);
                 }

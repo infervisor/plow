@@ -219,7 +219,11 @@ pub(crate) enum Io {
     /// Inside an LM packet: row `r` gathers its bf16 final-norm hidden from `hn` (of `hidden_rows`
     /// rows) at `in.depth.hrow[r]`, takes the host-sampled cb0 from `act.depth.eidx.0`, and writes
     /// all codes (cb0 in column 0) to `codes[r]` (the next decode step's frame input).
-    Lm { hn: u32, hidden_rows: u32, codes: u32 },
+    Lm {
+        hn: u32,
+        hidden_rows: u32,
+        codes: u32,
+    },
 }
 
 impl Io {
@@ -253,7 +257,18 @@ impl Chain {
         w: &str,
         b: Option<&str>,
     ) -> Result<u32, String> {
-        self.dense_ep(x, out, rows, k, n, w, Epilogue { bias: b, ..Epilogue::NONE })
+        self.dense_ep(
+            x,
+            out,
+            rows,
+            k,
+            n,
+            w,
+            Epilogue {
+                bias: b,
+                ..Epilogue::NONE
+            },
+        )
     }
 
     /// `act(x @ w^T + bias + residual)`: GEMV-shaped (weight streaming) up to [`GEMV_ROWS`] rows,
@@ -270,7 +285,10 @@ impl Chain {
         mut ep: Epilogue<'_>,
     ) -> Result<u32, String> {
         let mut x = x;
-        if ep.x_bf16 || ep.bias_group > 0 || (rows <= GEMV_ROWS && (ep.ln.is_none() || k <= GEMV_LN_K)) {
+        if ep.x_bf16
+            || ep.bias_group > 0
+            || (rows <= GEMV_ROWS && (ep.ln.is_none() || k <= GEMV_LN_K))
+        {
             let deps = self.deps();
             let o = p_handle(&self.p, out);
             let wh = self.p.declare(w, u64::from(n) * u64::from(k) * 2);
@@ -279,26 +297,39 @@ impl Chain {
                 let mut wd = |s: &str| self.p.declare(&format!("{name}.{s}"), u64::from(k) * 4);
                 (wd("weight"), wd("bias"), eps)
             });
-            let flags = u32::from(!ep.x_bf16) | 2 | if bh.is_some() { 4 } else { 0 } | if ep.residual.is_some() { 8 } else { 0 }
+            let flags = u32::from(!ep.x_bf16)
+                | 2
+                | if bh.is_some() { 4 } else { 0 }
+                | if ep.residual.is_some() { 8 } else { 0 }
                 | if ep.gelu { 1 << 4 } else { 0 }
                 | if ln.is_some() { 1 << 8 } else { 0 }
                 | if ep.bias_group > 0 { 1 << 9 } else { 0 }
-                | if !ep.x_bf16 && rows >= MMA_ROWS && k % 64 == 0 { 1 << 10 } else { 0 };
+                | if !ep.x_bf16 && rows >= MMA_ROWS && k % 64 == 0 {
+                    1 << 10
+                } else {
+                    0
+                };
             let none = packet::dev::TENSOR_NONE;
-            let e = self.p.raw(DevOp::GemvF32Out, u64::from(self.n_cu.min(n / 8).max(1)), &deps, o, |i| {
-                i.t[..7].copy_from_slice(&[
-                    o,
-                    x,
-                    wh,
-                    bh.unwrap_or(none),
-                    ep.residual.unwrap_or(none),
-                    ln.map_or(none, |l| l.0),
-                    ln.map_or(none, |l| l.1),
-                ]);
-                i.i[..4].copy_from_slice(&[rows, n, k, ep.bias_group]);
-                i.i[7] = flags;
-                i.f[0] = ln.map_or(0.0, |l| l.2);
-            })?;
+            let e = self.p.raw(
+                DevOp::GemvF32Out,
+                u64::from(self.n_cu.min(n / 8).max(1)),
+                &deps,
+                o,
+                |i| {
+                    i.t[..7].copy_from_slice(&[
+                        o,
+                        x,
+                        wh,
+                        bh.unwrap_or(none),
+                        ep.residual.unwrap_or(none),
+                        ln.map_or(none, |l| l.0),
+                        ln.map_or(none, |l| l.1),
+                    ]);
+                    i.i[..4].copy_from_slice(&[rows, n, k, ep.bias_group]);
+                    i.i[7] = flags;
+                    i.f[0] = ln.map_or(0.0, |l| l.2);
+                },
+            )?;
             return Ok(self.done(e));
         }
         assert!(ep.bias_group == 0, "per-stream bias needs the GEMV path");
@@ -346,7 +377,15 @@ impl Chain {
         Ok(self.done(e))
     }
 
-    fn layer_norm(&mut self, x: u32, out: &str, rows: u32, width: u32, w: &str, eps: f32) -> Result<u32, String> {
+    fn layer_norm(
+        &mut self,
+        x: u32,
+        out: &str,
+        rows: u32,
+        width: u32,
+        w: &str,
+        eps: f32,
+    ) -> Result<u32, String> {
         let deps = self.deps();
         let e = self.p.layer_norm_f32(
             x,
@@ -366,7 +405,14 @@ impl Chain {
     }
 
     /// `a += b` over `rows x width`; `b_row_stride` 0 broadcasts one `[width]` row.
-    fn add(&mut self, a: u32, b: u32, rows: u32, width: u32, b_row_stride: u32) -> Result<(), String> {
+    fn add(
+        &mut self,
+        a: u32,
+        b: u32,
+        rows: u32,
+        width: u32,
+        b_row_stride: u32,
+    ) -> Result<(), String> {
         let deps = self.deps();
         let e = self.p.binary_f32(
             a,
@@ -403,7 +449,16 @@ impl Chain {
     }
 
     /// `out` row `b * out_stride + col0` = `emb[index[b]]` (fp16 table), for `rows` streams.
-    fn gather(&mut self, index: u32, out: &str, rows: u32, width: u32, vocab: u32, out_stride: u32, col0: u32) -> Result<u32, String> {
+    fn gather(
+        &mut self,
+        index: u32,
+        out: &str,
+        rows: u32,
+        width: u32,
+        vocab: u32,
+        out_stride: u32,
+        col0: u32,
+    ) -> Result<u32, String> {
         let deps = self.deps();
         let e = self.p.gather_rows_f32(
             &deps,
@@ -429,7 +484,12 @@ impl Chain {
     }
 }
 
-fn program_for(prefix: PacketPrefix, geo: &Geo, batch: u32, io: &Io) -> Result<PacketPrefix, String> {
+fn program_for(
+    prefix: PacketPrefix,
+    geo: &Geo,
+    batch: u32,
+    io: &Io,
+) -> Result<PacketPrefix, String> {
     let (dim, qkv_w, np) = (geo.dim, 3 * geo.dim, geo.positions());
     let n_cu = prefix.model.n_cu;
     let wp = io.weights();
@@ -441,14 +501,24 @@ fn program_for(prefix: PacketPrefix, geo: &Geo, batch: u32, io: &Io) -> Result<P
     };
     let x = p_handle(&c.p, "act.depth.x");
     let (h, codes, x_bf16) = match *io {
-        Io::Standalone => (p_handle(&c.p, "in.depth.h"), p_handle(&c.p, "out.depth.codes"), false),
-        Io::Lm { hn, hidden_rows, codes } => {
-            let hx = c.p.declare("act.depth.hx", u64::from(batch * geo.hidden_in) * 2);
+        Io::Standalone => (
+            p_handle(&c.p, "in.depth.h"),
+            p_handle(&c.p, "out.depth.codes"),
+            false,
+        ),
+        Io::Lm {
+            hn,
+            hidden_rows,
+            codes,
+        } => {
+            let hx =
+                c.p.declare("act.depth.hx", u64::from(batch * geo.hidden_in) * 2);
             let hrow = p_handle(&c.p, "in.depth.hrow");
-            let e = c.p.raw(DevOp::RowGather, u64::from(batch.min(n_cu)), &[], hx, |i| {
-                i.t[..3].copy_from_slice(&[hx, hn, hrow]);
-                i.i[..3].copy_from_slice(&[batch, geo.hidden_in, hidden_rows]);
-            })?;
+            let e =
+                c.p.raw(DevOp::RowGather, u64::from(batch.min(n_cu)), &[], hx, |i| {
+                    i.t[..3].copy_from_slice(&[hx, hn, hrow]);
+                    i.i[..3].copy_from_slice(&[batch, geo.hidden_in, hidden_rows]);
+                })?;
             c.done(e);
             let cb0 = p_handle(&c.p, "act.depth.eidx.0");
             let deps = c.deps();
@@ -611,7 +681,15 @@ fn program_for(prefix: PacketPrefix, geo: &Geo, batch: u32, io: &Io) -> Result<P
                 ln: Some((&n2, geo.eps)),
                 ..Epilogue::NONE
             };
-            let f = c.dense_ep(x, "act.depth.f", rows, dim, geo.inter, &w("f1.weight"), gelu)?;
+            let f = c.dense_ep(
+                x,
+                "act.depth.f",
+                rows,
+                dim,
+                geo.inter,
+                &w("f1.weight"),
+                gelu,
+            )?;
             // Inside an LM packet each slot has its own depth memory (the speaker's, or the null one).
             let (cross, bias_group) = match io {
                 Io::Standalone => (format!("{wp}.cross.{l}"), 0),
@@ -660,21 +738,21 @@ fn program_for(prefix: PacketPrefix, geo: &Geo, batch: u32, io: &Io) -> Result<P
         )?;
         if matches!(io, Io::Standalone) {
             c.copy(
-            logits,
-            "out.depth.logits",
-            CopyColsF32Stage {
-                output: TensorRef::Named("out.depth.logits"),
-                items: batch,
-                rows: 1,
-                cols: geo.codes,
-                in_item_stride: geo.codes,
-                in_stride: geo.codes,
-                in_offset: 0,
-                out_item_stride: geo.levels * geo.codes,
-                out_stride: geo.codes,
-                out_offset: (level - 1) * geo.codes,
-            },
-        )?;
+                logits,
+                "out.depth.logits",
+                CopyColsF32Stage {
+                    output: TensorRef::Named("out.depth.logits"),
+                    items: batch,
+                    rows: 1,
+                    cols: geo.codes,
+                    in_item_stride: geo.codes,
+                    in_stride: geo.codes,
+                    in_offset: 0,
+                    out_item_stride: geo.levels * geo.codes,
+                    out_stride: geo.codes,
+                    out_offset: (level - 1) * geo.codes,
+                },
+            )?;
         }
         let handles = [
             "in.depth.params",
@@ -685,20 +763,21 @@ fn program_for(prefix: PacketPrefix, geo: &Geo, batch: u32, io: &Io) -> Result<P
         .map(|n| p_handle(&c.p, n));
         let eidx = p_handle(&c.p, &format!("act.depth.eidx.{level}"));
         let deps = c.deps();
-        let e = c.p.raw(DevOp::SampleSmallF32, u64::from(batch), &deps, codes, |i| {
-            i.t = [
-                codes,
-                logits,
-                handles[0],
-                handles[1],
-                handles[2],
-                packet::dev::TENSOR_NONE,
-                handles[3],
-                eidx,
-            ];
-            i.i = [batch, geo.codes, geo.levels + 1, level, level, 0, 0, 0];
-            i.j[0] = level * geo.codes;
-        })?;
+        let e =
+            c.p.raw(DevOp::SampleSmallF32, u64::from(batch), &deps, codes, |i| {
+                i.t = [
+                    codes,
+                    logits,
+                    handles[0],
+                    handles[1],
+                    handles[2],
+                    packet::dev::TENSOR_NONE,
+                    handles[3],
+                    eidx,
+                ];
+                i.i = [batch, geo.codes, geo.levels + 1, level, level, 0, 0, 0];
+                i.j[0] = level * geo.codes;
+            })?;
         c.done(e);
     }
     Ok(c.p.finish(batch))
@@ -732,7 +811,11 @@ fn section(
             driver: DRIVER.into(),
             programs: roles,
             tensors: BTreeMap::from([
-                tensor("in.depth.h", PipelineDType::F32, vec![b, u64::from(geo.hidden_in)]),
+                tensor(
+                    "in.depth.h",
+                    PipelineDType::F32,
+                    vec![b, u64::from(geo.hidden_in)],
+                ),
                 tensor("act.depth.eidx.0", PipelineDType::U32, vec![b]),
                 tensor("in.depth.force", PipelineDType::U32, vec![b, cb]),
                 tensor("in.depth.params", PipelineDType::F32, vec![b, 4]),
@@ -771,7 +854,11 @@ fn section(
 
 /// Host-staged per-row tensors and scratch of the depth programs, sized for `bmax` rows.
 fn declare_io(b: &mut packet::devbuild::Builder, geo: &Geo, bmax: u32) {
-    let (b64, d, np) = (u64::from(bmax), u64::from(geo.dim), u64::from(geo.positions()));
+    let (b64, d, np) = (
+        u64::from(bmax),
+        u64::from(geo.dim),
+        u64::from(geo.positions()),
+    );
     let cb = u64::from(geo.levels + 1);
     for k in 0..geo.positions() {
         b.tensor(&format!("act.depth.eidx.{k}"), b64 * 4);
@@ -835,7 +922,10 @@ pub(crate) fn lm_sections(
     declare_io(&mut b, &geo, bmax);
     b.tensor("in.depth.hrow", u64::from(bmax) * 4);
     for l in 0..geo.layers {
-        b.tensor(&format!("in.depth.cross.{l}"), u64::from(bmax * geo.dim) * 4);
+        b.tensor(
+            &format!("in.depth.cross.{l}"),
+            u64::from(bmax * geo.dim) * 4,
+        );
         // The null speaker's memory: the runtime copies it into a slot's row at bind.
         b.tensor(&format!("maya2.depth.cross.{l}"), u64::from(geo.dim) * 4);
     }

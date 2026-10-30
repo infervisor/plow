@@ -1397,19 +1397,31 @@ fn tuning(s: &Shapes, arch: &str) -> Map<String, Value> {
     // * `norm_fold` (PLOW_DECODE_NORM_FOLD opt-in): the decode object carries the AddNorm fold
     //   arms the packet's o_proj / down / GemvGlu / GemvQkv use.
     if arch.starts_with("sm_") && crate::emit_config::active().decode_norm_fold {
-        assert_eq!(arch, "sm_120a", "PLOW_DECODE_NORM_FOLD: sm_120a decode objects only");
+        assert_eq!(
+            arch, "sm_120a",
+            "PLOW_DECODE_NORM_FOLD: sm_120a decode objects only"
+        );
         t.insert("norm_fold".into(), json!(1));
     }
     // * `hnr_fold` (PLOW_DECODE_HNR_FOLD opt-in): the decode object's FlashDecode carries the
     //   HeadNormRope fold arm the packet's flash packets use.
     if arch.starts_with("sm_") && crate::emit_config::active().decode_hnr_fold.unwrap_or(0) > 0 {
-        assert_eq!(arch, "sm_120a", "PLOW_DECODE_HNR_FOLD: sm_120a decode objects only");
+        assert_eq!(
+            arch, "sm_120a",
+            "PLOW_DECODE_HNR_FOLD: sm_120a decode objects only"
+        );
         t.insert("hnr_fold".into(), json!(1));
     }
     // * `gemv_xk` (PLOW_DECODE_GEMV_XK opt-in): the first rung whose Gemv walk splits K over blocks.
-    if let Some(rows) = crate::emit_config::active().decode_gemv_xk.filter(|&r| r > 0) {
+    if let Some(rows) = crate::emit_config::active()
+        .decode_gemv_xk
+        .filter(|&r| r > 0)
+    {
         if arch.starts_with("sm_") {
-            assert_eq!(arch, "sm_120a", "PLOW_DECODE_GEMV_XK: sm_120a decode objects only");
+            assert_eq!(
+                arch, "sm_120a",
+                "PLOW_DECODE_GEMV_XK: sm_120a decode objects only"
+            );
             t.insert("gemv_xk".into(), json!(rows));
             if crate::emit_config::active().decode_gemv_xk_qkv {
                 t.insert("gemv_xk_qkv".into(), json!(1));
@@ -1418,7 +1430,10 @@ fn tuning(s: &Shapes, arch: &str) -> Map<String, Value> {
     }
     // * `gemv_w_cs` (PLOW_DECODE_GEMV_W_CS opt-in): the GEMV walks load weights evict-first.
     if arch.starts_with("sm_") && crate::emit_config::active().decode_gemv_w_cs {
-        assert_eq!(arch, "sm_120a", "PLOW_DECODE_GEMV_W_CS: sm_120a decode objects only");
+        assert_eq!(
+            arch, "sm_120a",
+            "PLOW_DECODE_GEMV_W_CS: sm_120a decode objects only"
+        );
         t.insert("gemv_w_cs".into(), json!(1));
     }
     if sm90a && crate::emit_config::active().w8a8 && crate::emit_config::active().decode_cublaslt {

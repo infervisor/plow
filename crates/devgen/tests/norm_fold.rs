@@ -54,16 +54,25 @@ fn qwen3_norm_fold_drops_the_addnorm_packets() {
                 let lo = packet::devbuild::decode_rung_lo(&model.prog_t);
                 assert_eq!(&model.prog_t[lo..], &[1, 16, 32]);
                 for p in &model.progs[lo..] {
-                    let n = |f: &dyn Fn(&packet::dev::DevInst) -> bool| p.insts.iter().filter(|i| f(i)).count();
+                    let n = |f: &dyn Fn(&packet::dev::DevInst) -> bool| {
+                        p.insts.iter().filter(|i| f(i)).count()
+                    };
                     let op = |i: &packet::dev::DevInst, o: DevOp| i.op == o as u16;
-                    let reads = |i: &packet::dev::DevInst| i.t[7] as u32 == nfp && nfp != TENSOR_NONE;
+                    let reads =
+                        |i: &packet::dev::DevInst| i.t[7] as u32 == nfp && nfp != TENSOR_NONE;
                     assert_eq!(n(&|i| op(i, DevOp::AddNorm)), if fold { 1 } else { 4 });
                     assert_eq!(
                         n(&|i| op(i, DevOp::Gemv) && i.i[3] == 8 && i.t[5] as u32 == nfp),
                         if fold { 3 } else { 0 }
                     );
-                    assert_eq!(n(&|i| op(i, DevOp::GemvGlu) && reads(i)), if fold { 2 } else { 0 });
-                    assert_eq!(n(&|i| op(i, DevOp::GemvQkv) && reads(i)), if fold { 1 } else { 0 });
+                    assert_eq!(
+                        n(&|i| op(i, DevOp::GemvGlu) && reads(i)),
+                        if fold { 2 } else { 0 }
+                    );
+                    assert_eq!(
+                        n(&|i| op(i, DevOp::GemvQkv) && reads(i)),
+                        if fold { 1 } else { 0 }
+                    );
                 }
                 Ok(devgen::LeanReport::skipped("structural contract test"))
             })),

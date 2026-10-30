@@ -768,43 +768,46 @@ fn cfg_llama_qwen(v: &Value, arch: Arch) -> Cfg {
         double_wide_mlp: false,
         head_rows: v["plow_head_rows"].as_u64().map_or(0, |r| r as u32),
         encoder: false,
-        frame: v.get("fish_s2").map(|f| {
-            let g = |k: &str| f[k].as_u64().unwrap_or_else(|| panic!("fish_s2.{k}")) as u32;
-            FrameEmbed {
-                table: "fish.codebook_embed.weight".into(),
-                codebooks: g("codebooks"),
-                cb_size: g("codebook_size"),
-                lo: g("semantic_base"),
-                rows: g("semantic_tokens"),
-                div: (1.0 / f["frame_scale"].as_f64().expect("fish_s2.frame_scale")) as f32,
-                depth: Some({
-                    let d = &f["depth"];
-                    let u = |k: &str| {
-                        d[k].as_u64().unwrap_or_else(|| panic!("fish_s2.depth.{k}")) as u32
-                    };
-                    let x = |k: &str| {
-                        d[k].as_f64().unwrap_or_else(|| panic!("fish_s2.depth.{k}")) as f32
-                    };
-                    assert!(d["qk_norm"] != true, "fish_s2.depth.qk_norm is unsupported");
-                    FishDepth {
-                        layers: u("layers"),
-                        hidden: u("hidden"),
-                        heads: u("heads"),
-                        kv_heads: u("kv_heads"),
-                        head_dim: u("head_dim"),
-                        inter: u("intermediate"),
-                        eps: x("eps"),
-                        theta: x("rope_theta"),
-                        positions: u("positions"),
-                        breeze: false,
-                        rope_scale: RopeScale::None,
-                        maya2: None,
-                    }
-                }),
-                decode_only: false,
-                norm: None,
-            }
-        }).or_else(|| v.get("maya2").map(maya2_frame)),
+        frame: v
+            .get("fish_s2")
+            .map(|f| {
+                let g = |k: &str| f[k].as_u64().unwrap_or_else(|| panic!("fish_s2.{k}")) as u32;
+                FrameEmbed {
+                    table: "fish.codebook_embed.weight".into(),
+                    codebooks: g("codebooks"),
+                    cb_size: g("codebook_size"),
+                    lo: g("semantic_base"),
+                    rows: g("semantic_tokens"),
+                    div: (1.0 / f["frame_scale"].as_f64().expect("fish_s2.frame_scale")) as f32,
+                    depth: Some({
+                        let d = &f["depth"];
+                        let u = |k: &str| {
+                            d[k].as_u64().unwrap_or_else(|| panic!("fish_s2.depth.{k}")) as u32
+                        };
+                        let x = |k: &str| {
+                            d[k].as_f64().unwrap_or_else(|| panic!("fish_s2.depth.{k}")) as f32
+                        };
+                        assert!(d["qk_norm"] != true, "fish_s2.depth.qk_norm is unsupported");
+                        FishDepth {
+                            layers: u("layers"),
+                            hidden: u("hidden"),
+                            heads: u("heads"),
+                            kv_heads: u("kv_heads"),
+                            head_dim: u("head_dim"),
+                            inter: u("intermediate"),
+                            eps: x("eps"),
+                            theta: x("rope_theta"),
+                            positions: u("positions"),
+                            breeze: false,
+                            rope_scale: RopeScale::None,
+                            maya2: None,
+                        }
+                    }),
+                    decode_only: false,
+                    norm: None,
+                }
+            })
+            .or_else(|| v.get("maya2").map(maya2_frame)),
     }
 }
 
@@ -821,8 +824,16 @@ fn maya2_frame(f: &Value) -> FrameEmbed {
         .iter()
         .map(|x| x.as_u64().expect("maya2.depth.group_of_level") as u32)
         .collect();
-    assert_eq!(group_of_level.len() as u32, levels, "maya2.depth.group_of_level");
-    assert_eq!(levels + 1, g("codebooks"), "maya2: one depth level per codebook after cb0");
+    assert_eq!(
+        group_of_level.len() as u32,
+        levels,
+        "maya2.depth.group_of_level"
+    );
+    assert_eq!(
+        levels + 1,
+        g("codebooks"),
+        "maya2: one depth level per codebook after cb0"
+    );
     FrameEmbed {
         table: "maya2.codebook_embed.weight".into(),
         codebooks: g("codebooks"),

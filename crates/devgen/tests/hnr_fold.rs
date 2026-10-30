@@ -47,11 +47,19 @@ fn qwen3_hnr_fold_drops_the_headnorm_packets() {
                 whole_graph_fusions: devgen::WholeGraphFusionDecisions::default(),
             },
             Some(Box::new(move |model| {
-                let pos = model.tensors.iter().position(|t| t.name == "in.pos").unwrap() as u32;
+                let pos = model
+                    .tensors
+                    .iter()
+                    .position(|t| t.name == "in.pos")
+                    .unwrap() as u32;
                 let descs: Vec<u32> = (0..2)
                     .filter_map(|l| {
                         let name = format!("in.hnr_fold.desc.{l}");
-                        model.tensors.iter().position(|t| t.name == name).map(|i| i as u32)
+                        model
+                            .tensors
+                            .iter()
+                            .position(|t| t.name == name)
+                            .map(|i| i as u32)
                     })
                     .collect();
                 assert_eq!(descs.len(), if fold > 0 { 2 } else { 0 });
@@ -64,7 +72,11 @@ fn qwen3_hnr_fold_drops_the_headnorm_packets() {
                 assert_eq!(&model.prog_t[lo..], &[1, 16, 32]);
                 for (p, &rows) in model.progs[lo..].iter().zip(&model.prog_t[lo..]) {
                     let folded = fold > 0 && rows >= fold;
-                    let hnr = p.insts.iter().filter(|i| i.op == DevOp::HeadNormRope as u16).count();
+                    let hnr = p
+                        .insts
+                        .iter()
+                        .filter(|i| i.op == DevOp::HeadNormRope as u16)
+                        .count();
                     assert_eq!(hnr == 0, folded);
                     let fd: Vec<u32> = p
                         .insts
@@ -72,7 +84,14 @@ fn qwen3_hnr_fold_drops_the_headnorm_packets() {
                         .filter(|i| i.op == DevOp::FlashDecode as u16)
                         .map(|i| i.t[7] as u32)
                         .collect();
-                    assert_eq!(fd, if folded { descs.clone() } else { vec![TENSOR_NONE; 2] });
+                    assert_eq!(
+                        fd,
+                        if folded {
+                            descs.clone()
+                        } else {
+                            vec![TENSOR_NONE; 2]
+                        }
+                    );
                 }
                 Ok(devgen::LeanReport::skipped("structural contract test"))
             })),

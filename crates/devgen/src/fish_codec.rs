@@ -390,9 +390,7 @@ fn lower_programs(
         );
     // Mimi's transformer runs at xf_rows_per_frame rows per frame.
     let mut rows = max_rows * cfg.xf_rows_per_frame();
-    widest = widest.max(
-        u64::from(rows) * u64::from(cfg.dim.max(cfg.inter).max(3 * cfg.attn())),
-    );
+    widest = widest.max(u64::from(rows) * u64::from(cfg.dim.max(cfg.inter).max(3 * cfg.attn())));
     for &(stride, _) in &cfg.ups {
         rows *= stride;
         widest = widest.max(u64::from(rows) * u64::from(4 * cfg.latent));
@@ -1302,7 +1300,10 @@ fn mimi_program_for(
     });
     let pos = match &io {
         Some((io, _)) => io.rope_pos,
-        None => p.declare(&format!("c.codec.pos.b{batch}.f{frames}"), u64::from(nt) * 4),
+        None => p.declare(
+            &format!("c.codec.pos.b{batch}.f{frames}"),
+            u64::from(nt) * 4,
+        ),
     };
     let len = |k: usize| {
         if step {
@@ -1560,9 +1561,27 @@ fn mimi_program_for(
         s.dense(splits, at, "act.codec.b", nt, aw, dim, &w("wo_s"), None)?;
         s.binary(x, h, BinaryOp::Add, nt, dim)?;
         ln(&mut s, w("ln2"))?;
-        let g = s.dense(splits, h, "act.codec.c", nt, dim, cfg.inter, &w("fc1"), None)?;
+        let g = s.dense(
+            splits,
+            h,
+            "act.codec.c",
+            nt,
+            dim,
+            cfg.inter,
+            &w("fc1"),
+            None,
+        )?;
         s.unary(g, Activation::GeluErf, nt, cfg.inter)?;
-        s.dense(splits, g, "act.codec.b", nt, cfg.inter, dim, &w("fc2_s"), None)?;
+        s.dense(
+            splits,
+            g,
+            "act.codec.b",
+            nt,
+            cfg.inter,
+            dim,
+            &w("fc2_s"),
+            None,
+        )?;
         s.binary(x, h, BinaryOp::Add, nt, dim)?;
     }
 
@@ -1885,7 +1904,10 @@ mod tests {
         // Steps carry the transformer at 2 rows per frame: rope over rows, history per row.
         let rows = steps.iter().map(|&(b, n)| b * n).max().unwrap();
         assert_eq!(named("in.codec.stream.rope_pos"), u64::from(2 * rows) * 4);
-        assert!(model.tensors.iter().any(|t| t.name == "in.codec.stream.row_pos"));
+        assert!(model
+            .tensors
+            .iter()
+            .any(|t| t.name == "in.codec.stream.row_pos"));
         // Each layer carries window - 1 rows of K | V.
         assert_eq!(
             named("state.codec.kv0"),

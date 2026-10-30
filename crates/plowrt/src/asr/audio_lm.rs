@@ -436,7 +436,9 @@ impl AudioLmContract {
             })
         };
         use plow_asset::speech_contract as contract;
-        let policy = if decoder.parameters.get(contract::CONTRACT).copied() == Some(contract::ASR_CONTRACT) {
+        let policy = if decoder.parameters.get(contract::CONTRACT).copied()
+            == Some(contract::ASR_CONTRACT)
+        {
             contract::AudioLmPolicy::from_parameters(|name| decoder.parameters.get(name).copied())
                 .map_err(RuntimeError::Rejected)?
         } else {

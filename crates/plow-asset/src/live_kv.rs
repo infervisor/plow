@@ -431,7 +431,9 @@ impl Manifest {
                         && c.hd == 128
                         && d.t[7] != TENSOR_NONE16
                         && tensor(d.t[7]).is_ok_and(|t| {
-                            t.name.starts_with("in.hnr_fold.desc.") && t.bytes == 44 && t.initialized
+                            t.name.starts_with("in.hnr_fold.desc.")
+                                && t.bytes == 44
+                                && t.initialized
                         });
                     let valid = if prefill {
                         op == if fp8 {

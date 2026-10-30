@@ -26,8 +26,8 @@ pub mod text_encoder;
 #[cfg(feature = "cuda")]
 pub mod voice_cond;
 
-pub mod maya2;
 pub mod ecapa;
+pub mod maya2;
 pub mod maya2_text;
 pub(crate) mod stretch;
 

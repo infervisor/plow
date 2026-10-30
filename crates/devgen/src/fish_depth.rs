@@ -254,12 +254,16 @@ pub(crate) fn declare(b: &mut Builder, c: &Cfg, dbatch: u32) -> Tensors {
             .map(|l| {
                 let p = format!("layers.{l}.");
                 let i = u64::from(d.inter);
-                let mat = |b: &mut Builder, s: &str, n: u64| if fp8 { TENSOR_NONE } else { w(b, s, n) };
+                let mat =
+                    |b: &mut Builder, s: &str, n: u64| if fp8 { TENSOR_NONE } else { w(b, s, n) };
                 LayerW {
                     fp8: fp8.then(|| {
                         let mut t8 = |s: &str, out: u64, k: u64| {
                             let name = format!("fp8/{pre}.{p}{s}.weight");
-                            (b.tensor(&name, out * k), b.tensor(&format!("{name}_scale"), out * F32))
+                            (
+                                b.tensor(&name, out * k),
+                                b.tensor(&format!("{name}_scale"), out * F32),
+                            )
                         };
                         LayerW8 {
                             q: t8("self_attn.q_proj", qd, h),
@@ -549,14 +553,14 @@ fn program(
                     i.i[5] = 1;
                 }),
                 None => b.emit(DevOp::GemvGlu, all.clone(), &[c_r1], |i| {
-                i.t[0] = t.fu;
-                i.t[1] = t.xn;
-                i.t[2] = w.gate;
-                i.t[5] = w.up;
-                i.i[0] = rows;
-                i.i[1] = d.inter;
-                i.i[2] = d.hidden;
-                i.i[5] = 1;
+                    i.t[0] = t.fu;
+                    i.t[1] = t.xn;
+                    i.t[2] = w.gate;
+                    i.t[5] = w.up;
+                    i.i[0] = rows;
+                    i.i[1] = d.inter;
+                    i.i[2] = d.hidden;
+                    i.i[5] = 1;
                 }),
             };
             let c_d = match &w.fp8 {

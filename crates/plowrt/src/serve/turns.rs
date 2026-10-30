@@ -728,7 +728,10 @@ impl StageRun {
             if let Some(mm) = &self.metrics {
                 mm.serving.tts.completed.fetch_add(1, Relaxed);
                 mm.serving.tts.e2e.duration(took);
-                mm.serving.tts.audio_duration_ms.fetch_add((self.audio_s * 1000.0) as u64, Relaxed);
+                mm.serving
+                    .tts
+                    .audio_duration_ms
+                    .fetch_add((self.audio_s * 1000.0) as u64, Relaxed);
                 if self.underrun_s > 0.0 {
                     mm.serving.tts.playback_stalls.fetch_add(1, Relaxed);
                 }

@@ -187,8 +187,13 @@ impl SpeechSpec {
                 ))
             }
         };
-        let voice = if (req.voice == "default" || req.voice.is_empty()) && !self.voices.contains(&req.voice) {
-            self.voices.first().cloned().unwrap_or_else(|| req.voice.clone())
+        let voice = if (req.voice == "default" || req.voice.is_empty())
+            && !self.voices.contains(&req.voice)
+        {
+            self.voices
+                .first()
+                .cloned()
+                .unwrap_or_else(|| req.voice.clone())
         } else {
             req.voice.clone()
         };

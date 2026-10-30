@@ -73,10 +73,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             "stream decode {frames} frames in {:.3} ms",
             t.elapsed().as_secs_f64() * 1e3
         );
-        std::fs::write(
-            format!("{}.stream", args[5]),
-            bytemuck::cast_slice(&pcm),
-        )?;
+        std::fs::write(format!("{}.stream", args[5]), bytemuck::cast_slice(&pcm))?;
     }
     let t = std::time::Instant::now();
     for _ in 0..20 {

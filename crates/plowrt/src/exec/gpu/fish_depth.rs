@@ -83,10 +83,9 @@ impl SpeechFn {
                 )));
             }
         }
-        let smem = e
-            .be
-            .module_global_u32(&module, "plow_arena_bytes_speech")?
-            .unwrap_or(49152);
+        let smem =
+            e.be.module_global_u32(&module, "plow_arena_bytes_speech")?
+                .unwrap_or(49152);
         e.be.set_max_dynamic_smem(f, smem)?;
         if e.be.occupancy_blocks_per_sm(f, BLOCK, smem as usize)? * e.be.sm_count() < e.grid {
             return Err(reject("speech object cannot hold the cooperative grid"));
@@ -143,7 +142,10 @@ fn null_memory(e: &GpuEngine, m: &Manifest) -> Result<Vec<f32>> {
         }
         let mut b = vec![0u8; mem.len as usize];
         e.be.download(mem, 0, &mut b)?;
-        out.extend(b.chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])));
+        out.extend(
+            b.chunks_exact(4)
+                .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])),
+        );
     }
     if out.is_empty() {
         return Err(reject("maya2 depth stage without slot memory"));
@@ -203,22 +205,25 @@ impl FishDepth {
                 || e.vocab() <= crate::tts::maya2::STOP
                 || manifest.depth_sampling.is_none())
         {
-            return Err(reject("maya2 tensor sizes disagree with the program widths"));
+            return Err(reject(
+                "maya2 tensor sizes disagree with the program widths",
+            ));
         }
-        if !maya2 && (rows > e.batch
-            || !need(t.params, rows * 16)
-            || !need(t.seed, rows * 8)
-            || !need(t.history, e.batch * manifest.ras_window as usize * 4)
-            || !need(t.frame_codes, e.batch * k * 4)
-            || !need(
-                t.top_k,
-                rows * if manifest.sampler == Sampler::Breeze {
-                    8
-                } else {
-                    4
-                },
-            )
-            || [t.step, t.hidden_row].iter().any(|&h| !need(h, rows * 4)))
+        if !maya2
+            && (rows > e.batch
+                || !need(t.params, rows * 16)
+                || !need(t.seed, rows * 8)
+                || !need(t.history, e.batch * manifest.ras_window as usize * 4)
+                || !need(t.frame_codes, e.batch * k * 4)
+                || !need(
+                    t.top_k,
+                    rows * if manifest.sampler == Sampler::Breeze {
+                        8
+                    } else {
+                        4
+                    },
+                )
+                || [t.step, t.hidden_row].iter().any(|&h| !need(h, rows * 4)))
         {
             return Err(reject("tensor sizes disagree with the program widths"));
         }
@@ -324,11 +329,8 @@ impl GpuEngine {
         let width = mem.len() / layers;
         for (l, &h) in d.manifest.slot_memory.iter().enumerate() {
             let row: &[u8] = bytemuck::cast_slice(&mem[l * width..(l + 1) * width]);
-            self.be.upload(
-                &self.devp[usize::from(h)],
-                (slot * row.len()) as u64,
-                row,
-            )?;
+            self.be
+                .upload(&self.devp[usize::from(h)], (slot * row.len()) as u64, row)?;
         }
         Ok(())
     }
@@ -523,12 +525,20 @@ impl GpuEngine {
             .iter()
             .filter(|p| p.rows as usize >= width)
             .min_by_key(|p| p.rows)
-            .ok_or_else(|| reject(format!("no program covers slot {}", width.saturating_sub(1))))?;
+            .ok_or_else(|| {
+                reject(format!(
+                    "no program covers slot {}",
+                    width.saturating_sub(1)
+                ))
+            })?;
         let n = p.rows as usize;
         let k = d.manifest.codebooks as usize;
         let vocab = self.vocab();
         let m = d.maya2.as_mut().unwrap();
-        if rows.iter().any(|r| m.slots.get(r.slot).is_none_or(Option::is_none)) {
+        if rows
+            .iter()
+            .any(|r| m.slots.get(r.slot).is_none_or(Option::is_none))
+        {
             return Err(reject("maya2 row on an unbound slot"));
         }
         let l = &self.devp[self.t_logits];
@@ -572,7 +582,8 @@ impl GpuEngine {
                 #[cfg(feature = "hf-tokenizer")]
                 {
                     use rayon::prelude::*;
-                    let by_slot: Vec<Option<(Tick, u32)>> = m.slots
+                    let by_slot: Vec<Option<(Tick, u32)>> = m
+                        .slots
                         .par_iter_mut()
                         .enumerate()
                         .map(|(r, slot_opt)| {
@@ -599,7 +610,8 @@ impl GpuEngine {
                         .map(|row| {
                             let r = row.slot;
                             let slot = m.slots[r].as_mut().unwrap();
-                            let tick = slot.tick(&logits[r * vocab..r * vocab + STOP_ROWS], &mut m.scratch);
+                            let tick = slot
+                                .tick(&logits[r * vocab..r * vocab + STOP_ROWS], &mut m.scratch);
                             let code = match tick {
                                 Tick::Code(c) => c,
                                 Tick::Stop => slot.last,
@@ -613,7 +625,8 @@ impl GpuEngine {
                     .map(|row| {
                         let r = row.slot;
                         let slot = m.slots[r].as_mut().unwrap();
-                        let tick = slot.tick(&logits[r * vocab..r * vocab + STOP_ROWS], &mut m.scratch);
+                        let tick =
+                            slot.tick(&logits[r * vocab..r * vocab + STOP_ROWS], &mut m.scratch);
                         let code = match tick {
                             Tick::Code(c) => c,
                             Tick::Stop => slot.last,
