@@ -184,7 +184,9 @@ scripts** — they do not all agree today. `plowbench.sh` uses `$PB_VLLM` (above
 
 **Every GPU process goes through the queue**, never a raw `gpulease` and never a bare run. On the
 Gemma/H100 campaign use `scripts/bench/gpuq.py submit <label> <ngpu> <cmd...>` (FIFO, root
-`/tmp/plow-gpuq`, `status` lists jobs; submit restarts an idle-exited runner); the external
+`/tmp/plow-gpuq`, `status` lists jobs; submit restarts an idle-exited runner; each job's lease
+waits `GPU_LEASE_TIMEOUT` from the submitting shell, default 14400 s, so a job queued behind a
+serving lease does not time out); the external
 `submit.sh` queue in §8 is a separate lab workflow. A script that leases internally is not safe to
 run inside either queue unchanged.
 Put every required `PLOW_*` setting in the queued command (for example, `env PLOW_FOO=1 ...`);
@@ -368,7 +370,8 @@ Pitfalls this playbook exists for:
 * **Lease hygiene.** One lease per decision (one server start per packet), at most one queued
   waiter per agent: never stack duplicate waiters for the same job. A lease command that is a
   script must be executable (`chmod +x`; otherwise rc 126 after the wait). `GPU_LEASE_TIMEOUT`
-  (default 1800 s) bounds the wait for the cards. Never `pkill -f`/`pgrep -f` a pattern that occurs
+  bounds the wait for the cards (raw `gpulease` default 1800 s; `gpuq.py` jobs default 14400 s).
+  Never `pkill -f`/`pgrep -f` a pattern that occurs
   in your own command line or in the kill script's file name (it kills your own shell, exit 144):
   write the kill logic to a neutrally named script file and kill by pid. `gpulease` serves waiters FIFO (`gpulease --status` lists the queue) and
   runs the command in its own process group: the whole job tree stops when the command exits or
