@@ -2297,6 +2297,8 @@ struct Flight {
     run: crate::serve::turns::StageRun,
     /// Dropping the flight cancels its work.
     _cancel: Cancellation,
+    /// The segment's engine stream (stream finals) lives until its final is answered.
+    _stream: Option<Arc<parking_lot::Mutex<WindowCache>>>,
 }
 
 enum FrontEvent {
@@ -2342,6 +2344,14 @@ async fn continuous(
     let mut shutdown = state.shutdown.subscribe();
     let session = ids.session.clone().unwrap_or_default();
     let rate = start.sample_rate as usize;
+    // Finals from the engine stream: each segment's audio streams as it arrives, up to what the
+    // segment keeps when it closes; partials are shown only when asked for.
+    let streaming = route.stream_finals();
+    let stride = if streaming {
+        STREAM_STRIDE
+    } else {
+        PARTIAL_STRIDE
+    };
     let mut resampler = Resampler::new(start.sample_rate).expect("a listed stream rate");
     let mut endpointer = state.endpointer(
         EndpointConfig {
@@ -2369,7 +2379,8 @@ async fn continuous(
         report: None,
         ..Default::default()
     };
-    let launch = |segment: &Segment| -> Result<Flight, SubmitError> {
+    let launch = |(segment, stream): &(Segment, Option<Arc<parking_lot::Mutex<WindowCache>>>)|
+     -> Result<Flight, SubmitError> {
         let mut samples = segment.samples.clone();
         if samples.len() < SAMPLE_RATE as usize / 2 {
             samples.resize(SAMPLE_RATE as usize / 2, 0.0);
@@ -2394,7 +2405,7 @@ async fn continuous(
             start.language.clone(),
             start.prompt.clone(),
             cancel.0.clone(),
-            opts(true, run.key(), None, start.deltas.then_some(tx)),
+            opts(true, run.key(), stream.clone(), start.deltas.then_some(tx)),
         )?;
         Ok(Flight {
             segment: segment.index,
@@ -2408,11 +2419,26 @@ async fn continuous(
                 .map(|t| tokio::time::Instant::now() + t),
             run,
             _cancel: cancel,
+            _stream: stream.clone(),
         })
+    };
+    // A closed segment takes its engine stream along (stream finals).
+    let closed = |segments: Vec<Segment>,
+                  partial_segment: u64,
+                  windows: &Arc<parking_lot::Mutex<WindowCache>>| {
+        segments
+            .into_iter()
+            .map(|segment| {
+                let stream =
+                    (streaming && segment.index == partial_segment).then(|| windows.clone());
+                (segment, stream)
+            })
+            .collect::<Vec<_>>()
     };
     let mut credit = rate;
     let mut sequence = 0u64;
-    let mut waiting: VecDeque<Segment> = VecDeque::new();
+    let mut waiting: VecDeque<(Segment, Option<Arc<parking_lot::Mutex<WindowCache>>>)> =
+        VecDeque::new();
     let mut flights: VecDeque<Flight> = VecDeque::new();
     let mut emitted = 0u64;
     let mut finishing = false;
@@ -2548,7 +2574,7 @@ async fn continuous(
             Ok(result) = async { (&mut partial.as_mut().expect("guarded").2).await }, if partial.is_some() => {
                 let (segment, _, _) = partial.take().expect("guarded");
                 if let Ok(result) = result {
-                    if segment == partial_segment && segment >= emitted {
+                    if start.partials && segment == partial_segment && segment >= emitted {
                         revision += 1;
                         let stable = common_prefix_bytes(&last_partial, &result.text);
                         if !send(&mut socket, json!({"type":"partial","segment":segment,"revision":revision,
@@ -2596,17 +2622,21 @@ async fn continuous(
                     .chunks_exact(2)
                     .map(|b| i16::from_le_bytes([b[0], b[1]]) as f32 / 32768.0)
                     .collect();
-                waiting.extend(endpointer.push(&resampler.push(&pcm)));
-                if start.partials && partial.is_none() {
-                    if let Some((segment, audio)) = endpointer.open_audio() {
+                let segments = endpointer.push(&resampler.push(&pcm));
+                waiting.extend(closed(segments, partial_segment, &windows));
+                if (start.partials || streaming) && partial.is_none() {
+                    let open = if streaming {
+                        endpointer.open_kept_audio()
+                    } else {
+                        endpointer.open_audio()
+                    };
+                    if let Some((segment, audio)) = open {
                         if segment != partial_segment {
                             (partial_segment, partial_at, revision) = (segment, 0, 0);
                             last_partial.clear();
                             windows = Default::default();
                         }
-                        if audio.len()
-                            >= (partial_at + PARTIAL_STRIDE).max(SAMPLE_RATE as usize / 2)
-                        {
+                        if audio.len() >= (partial_at + stride).max(SAMPLE_RATE as usize / 2) {
                             partial_at = audio.len();
                             let cancel = Cancellation(Arc::new(AtomicBool::new(false)));
                             // A full queue skips this partial; the next stride retries.
@@ -2633,8 +2663,9 @@ async fn continuous(
                         finishing = true;
                         partial = None;
                         let tail = resampler.finish();
-                        waiting.extend(endpointer.push(&tail));
-                        waiting.extend(endpointer.finish());
+                        let mut segments = endpointer.push(&tail);
+                        segments.extend(endpointer.finish());
+                        waiting.extend(closed(segments, partial_segment, &windows));
                     }
                     Some("cancel") => return,
                     _ => {
