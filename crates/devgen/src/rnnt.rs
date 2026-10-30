@@ -69,6 +69,7 @@ pub struct RnntPackets {
     frontend: Option<EmbeddedLogMelFrontend>,
     encoder_buckets: BTreeMap<u32, Vec<usize>>,
     stream: Option<StreamPrograms>,
+    batched: Option<BatchedDecode>,
     /// Frames each TDT duration logit advances (`spec.durations` values).
     tdt_durations: Vec<u32>,
     /// Vocabulary, detokenizer and language (ASR contract 1); required by plowrt.
@@ -103,6 +104,35 @@ struct StreamPrograms {
     step: Vec<usize>,
     input: String,
 }
+
+/// Greedy decode of many recordings per launch (see [`RnntPackets::add_batched_decode`]).
+struct BatchedDecode {
+    geometry: BatchGeometry,
+    /// (recordings, program), ascending.
+    predict: Vec<(u32, usize)>,
+    /// (joint rows, program), ascending.
+    joint: Vec<(u32, usize)>,
+}
+
+#[derive(Clone, Copy)]
+struct BatchGeometry {
+    /// Predictor state rows; the last is a scratch slot for padding lanes.
+    slots: u32,
+    encoder_rows: u32,
+    /// The largest predictor and joint launches.
+    items: u32,
+    rows: u32,
+}
+
+const BATCH_TOKEN: &str = "in.rnnt.batch.token";
+const BATCH_STATE_INDEX: &str = "in.rnnt.batch.state_index";
+const BATCH_SLOT: &str = "in.rnnt.batch.slot";
+const BATCH_ONES: &str = "in.rnnt.batch.ones";
+const BATCH_ROW_INDEX: &str = "in.rnnt.batch.row_index";
+const BATCH_ROW_SLOT: &str = "in.rnnt.batch.row_slot";
+const BATCH_IDS: &str = "act.rnnt.batch.ids";
+const BATCH_ENCODER: &str = "batch.rnnt.encoder";
+const BATCH_PREDICTOR: &str = "batch.rnnt.predictor";
 
 /// Append `programs` of `sub` to `main`, binding `sub`'s tensors to `main`'s by name (declared
 /// sizes grow to the larger; initializers must agree). Returns the new program indices.
@@ -222,6 +252,82 @@ impl RnntPackets {
             first,
             step,
             input,
+        });
+        Ok(())
+    }
+
+    /// Greedy decode of many recordings per launch, the packet's last programs (after every
+    /// encoder bucket and the stream):
+    /// - `batch.predict.{P}`: the predictor for `P` recordings (`items` rungs), each reading and
+    ///   writing its slot of `slots` predictor-state rows (the last a scratch slot for padding);
+    /// - `batch.joint.{N}`: the joint for `N` (recording slot, encoder row) pairs (`rows` rungs),
+    ///   the rows read from `batch.rnnt.encoder` (`encoder_rows` rows the host fills).
+    ///
+    /// Every row computes exactly as in the batch-1 predictor and joint programs.
+    pub fn add_batched_decode(
+        &mut self,
+        weights: &RnntWeights<'_>,
+        slots: u32,
+        encoder_rows: u32,
+        items: &[u32],
+        rows: &[u32],
+    ) -> Result<(), String> {
+        let ascending = |rungs: &[u32]| {
+            !rungs.is_empty() && rungs[0] > 0 && rungs.is_sorted() && {
+                let mut unique = rungs.to_vec();
+                unique.dedup();
+                unique.len() == rungs.len()
+            }
+        };
+        if self.batched.is_some()
+            || self.spec.durations != 0
+            || slots < 2
+            || encoder_rows == 0
+            || !ascending(items)
+            || !ascending(rows)
+        {
+            return Err("invalid batched RNNT decode".into());
+        }
+        let geometry = BatchGeometry {
+            slots,
+            encoder_rows,
+            items: *items.last().unwrap(),
+            rows: *rows.last().unwrap(),
+        };
+        let n_cu = self.model.n_cu;
+        let mut tensors = self.model.tensors.clone();
+        let mut add = |emit: &dyn Fn(&mut Builder), shape: u32, model: &mut Model| {
+            let mut b = builder(n_cu, std::mem::take(&mut tensors));
+            emit(&mut b);
+            let program = b.finish();
+            tensors = program.tensors.clone();
+            model.progs.push(program);
+            model.prog_t.push(shape);
+            model.progs.len() - 1
+        };
+        let spec = self.spec;
+        let predict: Vec<_> = items
+            .iter()
+            .map(|&p| {
+                let emit = |b: &mut Builder| emit_batched_predictor(b, spec, weights, geometry, p);
+                (p, add(&emit, p, &mut self.model))
+            })
+            .collect();
+        let joint: Vec<_> = rows
+            .iter()
+            .map(|&n| {
+                let emit = |b: &mut Builder| emit_batched_joint(b, spec, weights, geometry, n);
+                (n, add(&emit, n, &mut self.model))
+            })
+            .collect();
+        for tensor in tensors.iter_mut().filter(|t| t.name == BATCH_ONES) {
+            tensor.init = Some(1u32.to_ne_bytes().repeat(tensor.bytes as usize / 4));
+        }
+        self.model.tensors = tensors;
+        self.batched = Some(BatchedDecode {
+            geometry,
+            predict,
+            joint,
         });
         Ok(())
     }
@@ -674,6 +780,43 @@ impl RnntPackets {
                 parameters.insert(name.into(), u64::from(value));
             }
         }
+        if let Some(batched) = &self.batched {
+            let g = batched.geometry;
+            for &(items, program) in &batched.predict {
+                programs.insert(format!("batch.predict.{items}"), program as u32);
+            }
+            for &(rows, program) in &batched.joint {
+                programs.insert(format!("batch.joint.{rows}"), program as u32);
+            }
+            let u32s = |role: &str, name: &str, count: u32| {
+                (
+                    role.to_owned(),
+                    PipelineTensor {
+                        name: name.into(),
+                        dtype: PipelineDType::U32,
+                        shape: vec![u64::from(count)],
+                    },
+                )
+            };
+            tensors.extend([
+                u32s("batch.token", BATCH_TOKEN, g.items),
+                u32s("batch.state_index", BATCH_STATE_INDEX, g.items),
+                u32s("batch.slot", BATCH_SLOT, g.items),
+                u32s("batch.row_index", BATCH_ROW_INDEX, g.rows),
+                u32s("batch.row_slot", BATCH_ROW_SLOT, g.rows),
+                u32s("batch.ids", BATCH_IDS, g.rows),
+            ]);
+            tensors.insert(
+                "batch.encoder".into(),
+                PipelineTensor {
+                    name: BATCH_ENCODER.into(),
+                    dtype: PipelineDType::F32,
+                    shape: vec![u64::from(g.encoder_rows), u64::from(self.spec.joint_width)],
+                },
+            );
+            parameters.insert("batch.slots".into(), u64::from(g.slots));
+            parameters.insert("batch.encoder_rows".into(), u64::from(g.encoder_rows));
+        }
         if !stages.is_empty() {
             if input_frames == 0 {
                 return Err("RNNT frame transform input is empty".into());
@@ -920,6 +1063,7 @@ fn lower_inner(
         frontend: None,
         encoder_buckets: BTreeMap::new(),
         stream: None,
+        batched: None,
         tdt_durations: Vec::new(),
         output: None,
     })
@@ -952,6 +1096,7 @@ fn emit_encoder(b: &mut Builder, s: RnntSpec, w: &RnntWeights<'_>, source: Encod
             s.frames,
             s.joint_width,
             s.encoder_width,
+            Q8_BY_ROWS,
             None,
         );
         return tensor;
@@ -1010,6 +1155,7 @@ fn emit_encoder(b: &mut Builder, s: RnntSpec, w: &RnntWeights<'_>, source: Encod
         s.frames,
         s.joint_width,
         s.encoder_width,
+        Q8_BY_ROWS,
         Some(p2),
     );
     input
@@ -1043,6 +1189,7 @@ fn emit_predictor(b: &mut Builder, s: RnntSpec, w: &RnntWeights<'_>, source: usi
             1,
             s.predictor_width * 4,
             s.predictor_width,
+            Q8_GEMV,
             Some(dep),
         );
         let hh = q8(
@@ -1053,6 +1200,7 @@ fn emit_predictor(b: &mut Builder, s: RnntSpec, w: &RnntWeights<'_>, source: usi
             1,
             s.predictor_width * 4,
             s.predictor_width,
+            Q8_GEMV,
             Some(dep),
         );
         let sum = b.emit(DevOp::ScaledAddF32, b.all(), &[ih, hh], |d| {
@@ -1078,6 +1226,7 @@ fn emit_predictor(b: &mut Builder, s: RnntSpec, w: &RnntWeights<'_>, source: usi
         1,
         s.joint_width,
         s.predictor_width,
+        Q8_GEMV,
         Some(dep),
     );
 }
@@ -1103,6 +1252,8 @@ fn emit_joint(b: &mut Builder, s: RnntSpec, w: &RnntWeights<'_>, bank: usize, fr
         d.t[..2].copy_from_slice(&[activation, activation]);
         d.i[0] = frames * s.joint_width;
     });
+    // The GEMV walk at every window size: a frame's logits never depend on how many frames the
+    // window holds, nor (batched decode) on how many recordings share the launch.
     let output = q8(
         b,
         logits,
@@ -1111,6 +1262,7 @@ fn emit_joint(b: &mut Builder, s: RnntSpec, w: &RnntWeights<'_>, bank: usize, fr
         frames,
         outputs,
         s.joint_width,
+        Q8_GEMV,
         Some(relu),
     );
     if s.durations == 0 {
@@ -1138,6 +1290,270 @@ fn emit_joint(b: &mut Builder, s: RnntSpec, w: &RnntWeights<'_>, bank: usize, fr
         });
         argmax(b, result, out, frames, cols, split);
     }
+}
+
+/// The batched predictor for `items` recordings: per recording `r`, the embedding of
+/// `token[r]` through the LSTM layers from the state of slot `state_index[r]` (zeros past the
+/// slots: a fresh recording), the new state and projected output then stored to slot `slot[r]`.
+fn emit_batched_predictor(
+    b: &mut Builder,
+    s: RnntSpec,
+    w: &RnntWeights<'_>,
+    g: BatchGeometry,
+    items: u32,
+) {
+    let pw = s.predictor_width;
+    let lanes = |width: u32| bytes3(g.items, width, 4);
+    let token = b.tensor(BATCH_TOKEN, u64::from(g.items) * 4);
+    let state_index = b.tensor(BATCH_STATE_INDEX, u64::from(g.items) * 4);
+    let slot = b.tensor(BATCH_SLOT, u64::from(g.items) * 4);
+    let ones = b.tensor(BATCH_ONES, u64::from(g.items) * 4);
+    let z = b.tensor("act.rnnt.batch.z", lanes(2 * pw.max(s.joint_width)));
+    let table = b.tensor(w.embedding, u64::from(s.vocabulary) * u64::from(pw) * 2);
+    let embedding = b.tensor("act.rnnt.batch.embedding", lanes(pw));
+    let mut dep = gather(b, embedding, table, token, items, pw, s.vocabulary, 1, &[]);
+    let mut stored = None;
+    let mut input = embedding;
+    for (layer, weights) in w.lstm.iter().enumerate() {
+        let h_state = b.tensor(&format!("batch.rnnt.h.{layer}"), bytes3(g.slots, pw, 4));
+        let c_state = b.tensor(&format!("batch.rnnt.c.{layer}"), bytes3(g.slots, pw, 4));
+        let h_prev = b.tensor("act.rnnt.batch.h_prev", lanes(pw));
+        let c_prev = b.tensor("act.rnnt.batch.c_prev", lanes(pw));
+        let gates = b.tensor("act.rnnt.batch.gates", lanes(4 * pw));
+        let recurrent = b.tensor("act.rnnt.batch.recurrent", lanes(4 * pw));
+        let h_new = b.tensor(&format!("act.rnnt.batch.h.{layer}"), lanes(pw));
+        let c_new = b.tensor(&format!("act.rnnt.batch.c.{layer}"), lanes(pw));
+        // `dep` (the previous layer's cell) follows every reader of the shared lane tensors.
+        let hp = gather(
+            b,
+            h_prev,
+            h_state,
+            state_index,
+            items,
+            pw,
+            g.slots,
+            0,
+            &[dep],
+        );
+        let cp = gather(
+            b,
+            c_prev,
+            c_state,
+            state_index,
+            items,
+            pw,
+            g.slots,
+            0,
+            &[dep],
+        );
+        let ih = q8(
+            b,
+            gates,
+            input,
+            weights.input,
+            items,
+            4 * pw,
+            pw,
+            Q8_GEMV,
+            Some(dep),
+        );
+        let hh = q8(
+            b,
+            recurrent,
+            h_prev,
+            weights.recurrent,
+            items,
+            4 * pw,
+            pw,
+            Q8_GEMV,
+            Some(hp),
+        );
+        let sum = b.emit(DevOp::ScaledAddF32, b.all(), &[ih, hh], |d| {
+            d.t[..3].copy_from_slice(&[gates, gates, recurrent]);
+            d.i[0] = items * 4 * pw;
+            d.f[0] = 1.0;
+        });
+        dep = b.emit(DevOp::LstmCellF32, b.all(), &[sum, cp], |d| {
+            d.t[..4].copy_from_slice(&[h_new, c_new, gates, c_prev]);
+            d.i[..2].copy_from_slice(&[pw, items]);
+        });
+        // The scratch `z` serializes the stores.
+        let h = store_rows(
+            b,
+            z,
+            h_state,
+            h_new,
+            slot,
+            ones,
+            items,
+            pw,
+            g.slots,
+            &[dep],
+            stored,
+        );
+        stored = Some(store_rows(
+            b,
+            z,
+            c_state,
+            c_new,
+            slot,
+            ones,
+            items,
+            pw,
+            g.slots,
+            &[h],
+            None,
+        ));
+        input = h_new;
+    }
+    let projected = b.tensor("act.rnnt.batch.projected", lanes(s.joint_width));
+    let proj = q8(
+        b,
+        projected,
+        input,
+        w.predictor,
+        items,
+        s.joint_width,
+        pw,
+        Q8_GEMV,
+        Some(dep),
+    );
+    let predictor = b.tensor(BATCH_PREDICTOR, bytes3(g.slots, s.joint_width, 4));
+    store_rows(
+        b,
+        z,
+        predictor,
+        projected,
+        slot,
+        ones,
+        items,
+        s.joint_width,
+        g.slots,
+        &[proj],
+        stored,
+    );
+}
+
+/// The batched joint for `rows` (recording, frame) pairs: encoder row `row_index[r]` plus the
+/// predictor output of slot `row_slot[r]` (zeros past either table), then as [`emit_joint`].
+fn emit_batched_joint(
+    b: &mut Builder,
+    s: RnntSpec,
+    w: &RnntWeights<'_>,
+    g: BatchGeometry,
+    rows: u32,
+) {
+    let jw = s.joint_width;
+    let row_index = b.tensor(BATCH_ROW_INDEX, u64::from(g.rows) * 4);
+    let row_slot = b.tensor(BATCH_ROW_SLOT, u64::from(g.rows) * 4);
+    let encoder = b.tensor(BATCH_ENCODER, bytes3(g.encoder_rows, jw, 4));
+    let predictor = b.tensor(BATCH_PREDICTOR, bytes3(g.slots, jw, 4));
+    let activation = b.tensor("act.rnnt.batch.joint", bytes3(g.rows, jw, 4));
+    let logits = b.tensor("act.rnnt.batch.logits", bytes3(g.rows, s.vocabulary, 4));
+    let ids = b.tensor(BATCH_IDS, u64::from(g.rows) * 4);
+    let encoded = gather(
+        b,
+        activation,
+        encoder,
+        row_index,
+        rows,
+        jw,
+        g.encoder_rows,
+        0,
+        &[],
+    );
+    // Accumulated onto the encoder row: the same sum BroadcastAddF32 forms.
+    let add = gather(
+        b,
+        activation,
+        predictor,
+        row_slot,
+        rows,
+        jw,
+        g.slots,
+        2,
+        &[encoded],
+    );
+    let relu = b.emit(DevOp::ReluF32, b.all(), &[add], |d| {
+        d.t[..2].copy_from_slice(&[activation, activation]);
+        d.i[0] = rows * jw;
+    });
+    let output = q8(
+        b,
+        logits,
+        activation,
+        w.output,
+        rows,
+        s.vocabulary,
+        jw,
+        Q8_GEMV,
+        Some(relu),
+    );
+    argmax(b, ids, logits, rows, s.vocabulary, output);
+}
+
+/// `out[r] = table[index[r]]` (zeros past `table_rows`) for `rows` rows of `width`; flags: 1 = f16
+/// table, 2 = add to `out`.
+#[allow(clippy::too_many_arguments)]
+fn gather(
+    b: &mut Builder,
+    out: u32,
+    table: u32,
+    index: u32,
+    rows: u32,
+    width: u32,
+    table_rows: u32,
+    flags: u32,
+    deps: &[u32],
+) -> u32 {
+    b.emit(
+        DevOp::GatherRowsF32,
+        repeated(n_cu(b), (rows * width).div_ceil(2048)),
+        deps,
+        |d| {
+            d.t[..3].copy_from_slice(&[out, table, index]);
+            d.i = [rows, width, table_rows, 1, 1, 1, 0, flags];
+        },
+    )
+}
+
+/// `state[slot[r]] = rows[r]` for `items` rows of `width`: a [`DevOp::StreamTailF32`] gather of
+/// `[state row | new row]` into the scratch `z`, then its store of `z`'s second row.
+#[allow(clippy::too_many_arguments)]
+fn store_rows(
+    b: &mut Builder,
+    z: u32,
+    state: u32,
+    rows: u32,
+    slot: u32,
+    ones: u32,
+    items: u32,
+    width: u32,
+    slots: u32,
+    deps: &[u32],
+    previous: Option<u32>,
+) -> u32 {
+    let deps: Vec<_> = deps.iter().copied().chain(previous).collect();
+    let gathered = b.emit(
+        DevOp::StreamTailF32,
+        repeated(n_cu(b), (items * 2 * width).div_ceil(2048)),
+        &deps,
+        |d| {
+            d.t[..6].copy_from_slice(&[z, rows, state, slot, ones, ones]);
+            d.i = [items, 1, 1, width, width, 0, width, 0];
+            d.j = [slots, 0];
+        },
+    );
+    b.emit(
+        DevOp::StreamTailF32,
+        repeated(n_cu(b), (items * width).div_ceil(2048)),
+        &[gathered],
+        |d| {
+            d.t[1..5].copy_from_slice(&[z, state, slot, ones]);
+            d.i = [items, 1, 1, width, width, 0, 0, 1];
+            d.j = [slots, 0];
+        },
+    )
 }
 
 fn argmax(b: &mut Builder, ids: u32, logits: u32, rows: u32, width: u32, dep: u32) -> u32 {
@@ -1177,6 +1593,11 @@ fn dense(
     )
 }
 
+/// `Q8GemmF32` kernel path (`i7`): by row count, or the GEMV walk at any row count.
+const Q8_BY_ROWS: u32 = 0;
+const Q8_GEMV: u32 = 1;
+
+#[allow(clippy::too_many_arguments)]
 fn q8(
     b: &mut Builder,
     out: u32,
@@ -1185,16 +1606,18 @@ fn q8(
     m: u32,
     n: u32,
     k: u32,
+    path: u32,
     dep: Option<u32>,
 ) -> u32 {
     let weight = b.tensor(w.weight, u64::from(n) * u64::from(k / 32) * 34);
     let bias = b.tensor(w.bias, u64::from(n) * 4);
     b.emit(
         DevOp::Q8GemmF32,
-        // At most 8 rows the kernel walks columns warp by warp (SPQ_GEMV_ROWS): every CU takes a share.
+        // The GEMV walk (at most 8 rows by row count) strides columns over warps: every CU takes a
+        // share.
         repeated(
             n_cu(b),
-            if m <= 8 {
+            if path == Q8_GEMV || m <= 8 {
                 n_cu(b)
             } else {
                 m.div_ceil(64) * n.div_ceil(64)
@@ -1204,6 +1627,7 @@ fn q8(
         |d| {
             d.t[..4].copy_from_slice(&[out, input, weight, bias]);
             d.i[..3].copy_from_slice(&[m, n, k]);
+            d.i[7] = path;
         },
     )
 }
@@ -1574,5 +1998,159 @@ mod tests {
         assert_eq!(pipeline.parameters["tdt.durations"], 5);
         assert_eq!(pipeline.parameters["tdt.duration.4"], 4);
         assert_eq!(pipeline.parameters["prompt_count"], 0);
+    }
+
+    fn linear(name: &'static str) -> LinearWeights<'static> {
+        LinearWeights {
+            weight: name,
+            bias: name,
+        }
+    }
+
+    static LSTM: [LstmWeights<'static>; 2] = [
+        LstmWeights {
+            input: LinearWeights {
+                weight: "lstm.ih.0",
+                bias: "lstm.ib.0",
+            },
+            recurrent: LinearWeights {
+                weight: "lstm.hh.0",
+                bias: "lstm.hb.0",
+            },
+        },
+        LstmWeights {
+            input: LinearWeights {
+                weight: "lstm.ih.1",
+                bias: "lstm.ib.1",
+            },
+            recurrent: LinearWeights {
+                weight: "lstm.hh.1",
+                bias: "lstm.hb.1",
+            },
+        },
+    ];
+
+    #[test]
+    fn batched_decode_shares_the_batch_one_kernel_paths() {
+        let weights = RnntWeights {
+            prompt_in: linear("prompt.in"),
+            prompt_out: linear("prompt.out"),
+            encoder: linear("joint.enc"),
+            embedding: "embed.weight",
+            lstm: &LSTM,
+            predictor: linear("joint.pred"),
+            output: linear("joint.out"),
+        };
+        let spec = RnntSpec {
+            frames: 3,
+            encoder_width: 32,
+            prompt_count: 4,
+            prompt_width: 64,
+            vocabulary: 64,
+            durations: 0,
+            predictor_width: 32,
+            joint_width: 32,
+            joint_batch: 3,
+        };
+        let mut packets = lower(spec, &weights, 4).unwrap();
+        assert!(packets
+            .add_batched_decode(&weights, 1, 6, &[1, 2], &[1, 4])
+            .is_err());
+        assert!(packets
+            .add_batched_decode(&weights, 3, 6, &[2, 1], &[1, 4])
+            .is_err());
+        packets
+            .add_batched_decode(&weights, 3, 6, &[1, 2], &[1, 4])
+            .unwrap();
+        assert!(packets
+            .add_batched_decode(&weights, 3, 6, &[1, 2], &[1, 4])
+            .is_err());
+        assert_eq!(packets.model.progs.len(), 13);
+
+        let ops = |program: usize| -> Vec<DevOp> {
+            packets.model.progs[program]
+                .insts
+                .iter()
+                .map(|inst| DevOp::from_u16(inst.op).unwrap())
+                .collect()
+        };
+        let q8_paths = |program: usize| -> Vec<u32> {
+            packets.model.progs[program]
+                .insts
+                .iter()
+                .filter(|inst| DevOp::from_u16(inst.op) == Some(DevOp::Q8GemmF32))
+                .map(|inst| inst.i[7])
+                .collect()
+        };
+        assert_eq!(q8_paths(0), [Q8_BY_ROWS]);
+        for program in 1..13 {
+            assert!(q8_paths(program).iter().all(|&path| path == Q8_GEMV));
+        }
+        use DevOp::{GatherRowsF32 as Gather, StreamTailF32 as Tail};
+        let layer = [
+            Gather,
+            Gather,
+            DevOp::Q8GemmF32,
+            DevOp::Q8GemmF32,
+            DevOp::ScaledAddF32,
+            DevOp::LstmCellF32,
+            Tail,
+            Tail,
+            Tail,
+            Tail,
+        ];
+        let predictor: Vec<_> = [Gather]
+            .into_iter()
+            .chain(layer)
+            .chain(layer)
+            .chain([DevOp::Q8GemmF32, Tail, Tail])
+            .collect();
+        assert_eq!(ops(9), predictor);
+        assert_eq!(ops(10), predictor);
+        assert_eq!(
+            ops(12),
+            [
+                Gather,
+                Gather,
+                DevOp::ReluF32,
+                DevOp::Q8GemmF32,
+                DevOp::ArgmaxF32
+            ]
+        );
+        let joint = &packets.model.progs[12].insts;
+        // Encoder rows past the table and slots past the scratch slot read as zeros.
+        assert_eq!(joint[0].i, [4, 32, 6, 1, 1, 1, 0, 0]);
+        assert_eq!(joint[1].i, [4, 32, 3, 1, 1, 1, 0, 2]);
+        let ones = packets
+            .model
+            .tensors
+            .iter()
+            .find(|t| t.name == BATCH_ONES)
+            .unwrap();
+        assert_eq!(
+            ones.init.as_deref(),
+            Some(&1u32.to_ne_bytes().repeat(2)[..])
+        );
+
+        let section = packets.pipeline_section(63, 10, 0).unwrap();
+        let metadata: plow_asset::packet_pipeline::PacketPipelines =
+            serde_json::from_slice(&section.data).unwrap();
+        let pipeline = &metadata.pipelines[0];
+        assert_eq!(pipeline.programs["batch.predict.2"], 10);
+        assert_eq!(pipeline.programs["batch.joint.4"], 12);
+        assert_eq!(pipeline.tensors["batch.token"].shape, [2]);
+        assert_eq!(pipeline.tensors["batch.ids"].shape, [4]);
+        assert_eq!(pipeline.tensors["batch.encoder"].shape, [6, 32]);
+        assert_eq!(pipeline.parameters["batch.slots"], 3);
+        assert_eq!(pipeline.parameters["batch.encoder_rows"], 6);
+        assert_eq!(
+            pipeline
+                .tensors
+                .keys()
+                .filter(|role| role.starts_with("predictor.state."))
+                .count(),
+            8,
+            "slot state stays out of the batch-1 predictor state"
+        );
     }
 }

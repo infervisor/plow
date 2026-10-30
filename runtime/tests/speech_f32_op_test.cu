@@ -312,9 +312,7 @@ static void t_gemm_bf16(unsigned m, unsigned n, unsigned k) {
     run("GemmF32 bf16 33x70x96", c, g_gemm_f32, {o}, FP32);
 }
 
-static void t_q8(unsigned m, unsigned n, unsigned k, unsigned act) {
-    Case c;
-    unsigned o = c.out((size_t)m * n), x = c.f32((size_t)(m + 1) * k, 1.f);
+static unsigned q8_weights(Case& c, unsigned n, unsigned k) {
     unsigned w = c.add((size_t)n * (k / 32) * 34);
     uint8_t* wp = c.host[w].data();
     for (size_t blk = 0; blk < (size_t)n * (k / 32); blk++) {
@@ -322,6 +320,13 @@ static void t_q8(unsigned m, unsigned n, unsigned k, unsigned act) {
         memcpy(wp + blk * 34, &s, 2);
         for (int i = 0; i < 32; i++) wp[blk * 34 + 2 + i] = (uint8_t)(int8_t)(127.f * rnd());
     }
+    return w;
+}
+
+static void t_q8(unsigned m, unsigned n, unsigned k, unsigned act) {
+    Case c;
+    unsigned o = c.out((size_t)m * n), x = c.f32((size_t)(m + 1) * k, 1.f);
+    unsigned w = q8_weights(c, n, k);
     unsigned b = c.f32(n, 0.3f);
     c.in.op = PLOW_DOP_Q8_GEMM_F32;
     c.in.t[0] = o; c.in.t[1] = x; c.in.t[2] = w; c.in.t[3] = b;
@@ -1401,6 +1406,45 @@ static void verdict(const char* name, const char* what, bool pass) {
     if (!pass) g_fail = 1;
 }
 
+/* Q8GemmF32 with a fixed path (i7): against the golden, and each of the first `m_small` rows bit
+ * for bit as in a launch of only those rows. */
+static void t_q8_path(unsigned path, unsigned m_small, unsigned m_big, unsigned n, unsigned k) {
+    char name[64];
+    snprintf(name, sizeof name, "Q8GemmF32 path %u %ux%ux%u", path, m_big, n, k);
+    Case c;
+    unsigned big = c.out((size_t)m_big * n), small = c.out((size_t)m_small * n);
+    unsigned x = c.f32((size_t)m_big * k, 1.f), w = q8_weights(c, n, k), b = c.f32(n, 0.3f);
+    c.in.op = PLOW_DOP_Q8_GEMM_F32;
+    c.in.t[0] = big; c.in.t[1] = x; c.in.t[2] = w; c.in.t[3] = b;
+    c.in.i[0] = m_big; c.in.i[1] = n; c.in.i[2] = k; c.in.i[7] = path;
+    run(name, c, g_q8_gemm_f32, {big}, FP32);
+    PlowDevInst alone = c.in;
+    alone.t[0] = small; alone.i[0] = m_small;
+    launch(alone, c.dev);
+    const std::vector<uint32_t> batched = fetch(c, big), own = fetch(c, small);
+    verdict(name, "rows alone == rows in the launch", std::equal(own.begin(), own.end(), batched.begin()));
+}
+
+/* Q8GemmF32 at Nemotron's shapes: the GEMV walk (path 1) against tiles (path 2) by row count. */
+static void bench_q8_paths() {
+    const unsigned shapes[][2] = {{1024, 1024}, {4096, 1024}, {1024, 4096}, {2048, 1024}, {13088, 640}, {2560, 640}};
+    for (const auto& shape : shapes) {
+        const unsigned n = shape[0], k = shape[1];
+        for (unsigned m : {1u, 4u, 8u, 16u, 32u, 64u, 128u, 256u}) {
+            for (unsigned path : {1u, 2u}) {
+                Case c;
+                unsigned o = c.out((size_t)m * n), x = c.f32((size_t)m * k, 1.f), w = q8_weights(c, n, k);
+                c.in.op = PLOW_DOP_Q8_GEMM_F32;
+                c.in.t[0] = o; c.in.t[1] = x; c.in.t[2] = w;
+                c.in.i[0] = m; c.in.i[1] = n; c.in.i[2] = k; c.in.i[7] = path;
+                char name[64];
+                snprintf(name, sizeof name, "Q8GemmF32 %s M=%u N=%u K=%u", path == 1 ? "gemv" : "tiles", m, n, k);
+                bench(name, c, 2.0 * m * n * k, (double)n * (k / 32) * 34);
+            }
+        }
+    }
+}
+
 /* Per-item prefix rows (AttentionF32 flags bit 5, t5 = pre_b per item). Separate Q/K/V; own K/V
  * rows past each item's length are NaN / 1e30; prefix rows no user of a block reads are NaN
  * (fp32 / tc routes) or, for h16, formatted tiles past the last one any user reads are NaN.
@@ -1734,6 +1778,10 @@ int main(int argc, char** argv) {
         bench_signal();
         return 0;
     }
+    if (argc > 1 && !strcmp(argv[1], "--bench-asr")) {
+        bench_q8_paths();
+        return 0;
+    }
     t_dense("DenseGemmF32 qwen q 300x1024x1024", 300, 1024, 1024, 1 | 4, 0, 0, 0, 0, true);
     t_dense("DenseGemmF32 gelu 200x512x384", 200, 512, 384, 2 | 4, 0, 0, 0, 0, true);
     t_dense("DenseGemmF32 f32w relu row0", 77, 130, 70, 0, 1, 3, 0, 0, true);
@@ -1747,6 +1795,9 @@ int main(int argc, char** argv) {
     t_dense_ref(1024, 7680, {104, 52, 156});
     t_q8(70, 130, 512, 0);
     t_q8(20, 96, 256, 1);
+    t_q8_path(1, 4, 20, 96, 256);
+    t_q8_path(1, 5, 37, 130, 512);
+    t_q8_path(2, 4, 70, 130, 512);
     /* Qwen3-ASR conv stages: NCFW in/out, f32 weights, GELU bf16; then other layouts/flags. */
     t_conv("Conv2dF32 qwen stage1", 2, 128, 100, 1, 48, 3, 2, 1, 1, 64 | 128 | (2 << 2) | (2 << 4));
     t_conv("Conv2dF32 qwen stage2", 2, 64, 50, 48, 64, 3, 2, 1, 1, 64 | 128 | (2 << 2) | (2 << 4));

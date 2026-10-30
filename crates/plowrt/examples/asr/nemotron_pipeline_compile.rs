@@ -17,9 +17,9 @@ use plowrt::asset::gguf::GgufFile;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<_> = std::env::args().collect();
-    if !(4..=8).contains(&args.len()) {
+    if !(4..=9).contains(&args.len()) {
         return Err(
-            "usage: asr_nemotron_pipeline_compile MODEL_GGUF FEATURE_FRAMES OUTPUT_PACKET [JOINT_BATCH] [N_CU] [TRAILING_ENCODER_FRAMES] [STREAM_ROWS]"
+            "usage: asr_nemotron_pipeline_compile MODEL_GGUF FEATURE_FRAMES OUTPUT_PACKET [JOINT_BATCH] [N_CU] [TRAILING_ENCODER_FRAMES] [STREAM_ROWS] [DECODE_BATCH]"
                 .into(),
         );
     }
@@ -223,6 +223,26 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             &rnnt_weights,
         )?;
     }
+    // Batched greedy decode: up to DECODE_BATCH recordings (default 32, 0 = none) per launch,
+    // each with a slot (one more for padding lanes) and a full-capacity encoder-table region.
+    let decode_batch = args.get(8).map_or(Ok(32), |v| v.parse::<u32>())?;
+    if decode_batch != 0 {
+        let rungs = |max: u32| -> Vec<u32> {
+            let mut rungs: Vec<_> = (0..)
+                .map(|shift| 1u32 << shift)
+                .take_while(|&rung| rung < max)
+                .collect();
+            rungs.push(max);
+            rungs
+        };
+        packets.add_batched_decode(
+            &rnnt_weights,
+            decode_batch + 1,
+            decode_batch * frames,
+            &rungs(decode_batch),
+            &rungs(decode_batch * joint_batch),
+        )?;
+    }
     packets.embed_weights(|name| {
         gguf.tensor(name)
             .map(|tensor| tensor.bytes.to_vec())
@@ -303,6 +323,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             "feature_frames": feature_frames,
             "feature_frame_capacities": feature_frame_capacities,
             "joint_batch": joint_batch,
+            "decode_batch": decode_batch,
             "n_cu": n_cu,
             "trailing_encoder_frames": trailing_encoder_frames,
             "output": args[3],

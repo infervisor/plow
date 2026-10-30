@@ -61,8 +61,75 @@ pub struct PacketRnnt {
     profiling: bool,
     last_profile: Option<RnntProfile>,
     stream: Option<StreamBinding>,
+    batch: Option<BatchBinding>,
     /// Vocabulary, detokenizer and language (ASR contract >= 1).
     output: Option<TokenOutput>,
+}
+
+/// The batched decode programs (`batch.*` pipeline roles): slot-indexed predictor state and a
+/// table of encoder rows the joint reads by index.
+struct BatchBinding {
+    /// (recordings, program) and (joint rows, program), ascending.
+    predict: Vec<(usize, usize)>,
+    joint: Vec<(usize, usize)>,
+    token: PacketTensor,
+    state_index: PacketTensor,
+    slot: PacketTensor,
+    row_index: PacketTensor,
+    row_slot: PacketTensor,
+    ids: PacketTensor,
+    encoder: PacketTensor,
+    /// Predictor state rows; the last is the scratch slot of padding lanes.
+    slots: u32,
+    encoder_rows: u32,
+}
+
+impl BatchBinding {
+    fn bind(pipeline: &BoundPacketPipeline, slots: u64, row_bytes: usize) -> Result<Self> {
+        let rungs = |prefix: &str| -> Vec<(usize, usize)> {
+            let mut rungs: Vec<_> = pipeline
+                .programs()
+                .filter_map(|(role, program)| {
+                    Some((role.strip_prefix(prefix)?.parse().ok()?, program))
+                })
+                .collect();
+            rungs.sort_unstable();
+            rungs
+        };
+        let invalid = || RuntimeError::Rejected("packet batched RNNT geometry is invalid".into());
+        let predict = rungs("batch.predict.");
+        let joint = rungs("batch.joint.");
+        let slots = u32::try_from(slots).map_err(|_| invalid())?;
+        let encoder_rows =
+            u32::try_from(pipeline.parameter("batch.encoder_rows")?).map_err(|_| invalid())?;
+        let binding = Self {
+            token: pipeline.tensor("batch.token")?,
+            state_index: pipeline.tensor("batch.state_index")?,
+            slot: pipeline.tensor("batch.slot")?,
+            row_index: pipeline.tensor("batch.row_index")?,
+            row_slot: pipeline.tensor("batch.row_slot")?,
+            ids: pipeline.tensor("batch.ids")?,
+            encoder: pipeline.tensor("batch.encoder")?,
+            predict,
+            joint,
+            slots,
+            encoder_rows,
+        };
+        let (Some(&(items, _)), Some(&(rows, _))) = (binding.predict.last(), binding.joint.last())
+        else {
+            return Err(invalid());
+        };
+        let lanes = [binding.token, binding.state_index, binding.slot];
+        let row_lanes = [binding.row_index, binding.row_slot, binding.ids];
+        if slots < 2
+            || lanes.iter().any(|t| t.bytes != items * 4)
+            || row_lanes.iter().any(|t| t.bytes != rows * 4)
+            || binding.encoder.bytes != encoder_rows as usize * row_bytes
+        {
+            return Err(invalid());
+        }
+        Ok(binding)
+    }
 }
 
 /// A cache-aware encoder stream (`stream.*` pipeline roles): each step turns one mel window into
@@ -251,6 +318,10 @@ impl PacketRnnt {
         } else {
             None
         };
+        let batch = pipeline
+            .optional_parameter("batch.slots")
+            .map(|slots| BatchBinding::bind(&pipeline, slots, row_bytes))
+            .transpose()?;
         let state_zeros = vec![0; states.iter().map(|state| state.bytes).max().unwrap_or(0)];
         let output = match pipeline.optional_parameter(speech_contract::CONTRACT) {
             None => None,
@@ -305,6 +376,7 @@ impl PacketRnnt {
             profiling: false,
             last_profile: None,
             stream,
+            batch,
             output,
         })
     }
@@ -507,6 +579,77 @@ impl PacketRnnt {
         valid_input_frames: usize,
         on_emit: &mut dyn FnMut(&[u32]),
     ) -> Result<Vec<u32>> {
+        let (encoder, frames) = self.encoder_for(valid_input_frames)?;
+        self.transcribe_input_with_encoder_frames(input, frames, encoder, on_emit)
+    }
+
+    /// Recordings one [`Self::transcribe_batch_input_frames`] call takes; 0 without the packet's
+    /// batched decode.
+    pub fn batch_capacity(&self) -> usize {
+        self.batch.as_ref().map_or(0, |batch| {
+            (batch.slots as usize - 1).min(batch.encoder_rows as usize / self.frames)
+        })
+    }
+
+    /// [`Self::transcribe_input_frames`] for several recordings (input, valid input frames): each
+    /// encoder runs alone, then one greedy decode steps them all together. Each recording's
+    /// tokens equal its own [`Self::transcribe_input_frames`].
+    pub fn transcribe_batch_input_frames(
+        &mut self,
+        inputs: &[(&[f32], usize)],
+    ) -> Result<Vec<Vec<u32>>> {
+        if inputs.is_empty() || inputs.len() > self.batch_capacity() {
+            return Err(RuntimeError::Rejected(format!(
+                "batched RNNT decode needs 1..={} recordings",
+                self.batch_capacity()
+            )));
+        }
+        let batch = self.batch.take().expect("checked by batch_capacity");
+        self.runtime.begin_execution()?;
+        let result = self.transcribe_batch_active(&batch, inputs);
+        let ended = self.runtime.end_execution();
+        self.batch = Some(batch);
+        result.and_then(|tokens| ended.map(|()| tokens))
+    }
+
+    fn transcribe_batch_active(
+        &mut self,
+        batch: &BatchBinding,
+        inputs: &[(&[f32], usize)],
+    ) -> Result<Vec<Vec<u32>>> {
+        let mut items = Vec::with_capacity(inputs.len());
+        for (index, &(input, valid_input_frames)) in inputs.iter().enumerate() {
+            let (encoder, frames) = self.encoder_for(valid_input_frames)?;
+            self.encode(input, frames, encoder)?;
+            let base = index * self.frames;
+            self.runtime.copy_tensor(
+                self.encoder_joint,
+                0,
+                batch.encoder,
+                base * self.row_bytes,
+                frames * self.row_bytes,
+            )?;
+            items.push(BatchItem::new(index as u32, base, frames, self.blank_id));
+        }
+        let mut execution = PacketBatchExecution {
+            runtime: &mut *self.runtime,
+            batch,
+            blank_id: self.blank_id,
+            lanes: Vec::new(),
+            ids: Vec::new(),
+        };
+        decode_batch(
+            &mut execution,
+            &mut items,
+            self.blank_id,
+            self.max_symbols_per_frame,
+            self.joint_batch_max,
+        )?;
+        Ok(items.into_iter().map(|item| item.tokens).collect())
+    }
+
+    /// The smallest encoder capacity holding `valid_input_frames`, and its valid encoder frames.
+    fn encoder_for(&self, valid_input_frames: usize) -> Result<(usize, usize)> {
         let encoder = self
             .encoder_programs
             .iter()
@@ -518,7 +661,27 @@ impl PacketRnnt {
             })?;
         let frames =
             self.valid_encoder_frames(valid_input_frames, self.encoder_programs[encoder].0)?;
-        self.transcribe_input_with_encoder_frames(input, frames, encoder, on_emit)
+        Ok((encoder, frames))
+    }
+
+    /// Run encoder `encoder` on `input`, leaving its rows in `encoder.joint`.
+    fn encode(&mut self, input: &[f32], frames: usize, encoder: usize) -> Result<()> {
+        if input.len() != self.input_elements() {
+            return Err(RuntimeError::Rejected(format!(
+                "packet RNNT input has {} elements, expected {}",
+                input.len(),
+                self.input_elements()
+            )));
+        }
+        self.runtime
+            .write_tensor(self.input, bytemuck::cast_slice(input))?;
+        if let Some(valid_rows) = self.valid_rows {
+            let valid = u32::try_from(frames)
+                .map_err(|_| RuntimeError::Rejected("encoder frame count overflows".into()))?;
+            self.runtime
+                .write_tensor(valid_rows, &valid.to_ne_bytes())?;
+        }
+        self.runtime.run_sequence(&self.encoder_programs[encoder].1)
     }
 
     fn transcribe_input_with_encoder_frames(
@@ -541,27 +704,11 @@ impl PacketRnnt {
         encoder: usize,
         on_emit: &mut dyn FnMut(&[u32]),
     ) -> Result<Vec<u32>> {
-        if input.len() != self.input_elements() {
-            return Err(RuntimeError::Rejected(format!(
-                "packet RNNT input has {} elements, expected {}",
-                input.len(),
-                self.input_elements()
-            )));
-        }
         for &state in &self.states {
             self.runtime
                 .write_tensor(state, &self.state_zeros[..state.bytes])?;
         }
-        self.runtime
-            .write_tensor(self.input, bytemuck::cast_slice(input))?;
-        if let Some(valid_rows) = self.valid_rows {
-            let valid = u32::try_from(frames)
-                .map_err(|_| RuntimeError::Rejected("encoder frame count overflows".into()))?;
-            self.runtime
-                .write_tensor(valid_rows, &valid.to_ne_bytes())?;
-        }
-        self.runtime
-            .run_sequence(&self.encoder_programs[encoder].1)?;
+        self.encode(input, frames, encoder)?;
         let mut profile = self.profiling.then(|| RnntProfile {
             encoder_runtime_us: self.runtime.last_run_us(),
             ..RnntProfile::default()
@@ -715,6 +862,220 @@ impl RnntExecution for PacketRnntExecution<'_> {
 
     fn commit_prediction(&mut self) {
         self.active_bank ^= 1;
+    }
+}
+
+/// One recording of a [`decode_batch`]: encoder rows `base..base + frames` of the batch encoder
+/// table, decoded with the predictor state of `slot`.
+pub struct BatchItem {
+    slot: u32,
+    base: usize,
+    frames: usize,
+    frame: usize,
+    symbols_at_frame: usize,
+    previous_token: u32,
+    /// The slot's predictor output is current (computed for `previous_token`).
+    predicted: bool,
+    /// The slot's state is not this recording's yet: the predictor starts from zeros.
+    fresh: bool,
+    tokens: Vec<u32>,
+}
+
+impl BatchItem {
+    pub fn new(slot: u32, base: usize, frames: usize, blank_id: u32) -> Self {
+        Self {
+            slot,
+            base,
+            frames,
+            frame: 0,
+            symbols_at_frame: 0,
+            previous_token: blank_id,
+            predicted: false,
+            fresh: true,
+            tokens: Vec::new(),
+        }
+    }
+
+    pub fn tokens(&self) -> &[u32] {
+        &self.tokens
+    }
+}
+
+/// A predictor lane of a batched step: embed `token` into the state of `slot` (zeros when `fresh`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct BatchPredict {
+    pub slot: u32,
+    pub token: u32,
+    pub fresh: bool,
+}
+
+/// Device side of [`decode_batch`].
+pub trait BatchedRnntExecution {
+    /// Joint rows one step evaluates at most.
+    fn max_rows(&self) -> usize;
+    /// Run the predictor lanes, then the joint for `rows` (slot, encoder row), writing each row's
+    /// argmax to `ids`.
+    fn step(
+        &mut self,
+        predict: &[BatchPredict],
+        rows: &[(u32, u32)],
+        ids: &mut [u32],
+    ) -> Result<()>;
+}
+
+/// [`GreedyRnnt::decode`] for many recordings per launch. Each step predicts for the recordings
+/// that emitted (or start) and evaluates up to `window` frames of every unfinished one; a joint
+/// row depends only on its frame and its recording's tokens, so each recording decodes exactly
+/// as it would alone.
+pub fn decode_batch(
+    execution: &mut dyn BatchedRnntExecution,
+    items: &mut [BatchItem],
+    blank_id: u32,
+    max_symbols_per_frame: usize,
+    window: usize,
+) -> Result<()> {
+    if max_symbols_per_frame == 0 || window == 0 || items.len() > execution.max_rows() {
+        return Err(RuntimeError::Rejected(
+            "invalid batched RNNT decode geometry".into(),
+        ));
+    }
+    let (mut predict, mut rows, mut spans, mut ids) =
+        (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+    loop {
+        let active = items.iter().filter(|item| item.frame < item.frames).count();
+        if active == 0 {
+            return Ok(());
+        }
+        let width = window.min(execution.max_rows() / active);
+        predict.clear();
+        rows.clear();
+        spans.clear();
+        for (index, item) in items.iter().enumerate() {
+            if item.frame >= item.frames {
+                continue;
+            }
+            if !item.predicted {
+                predict.push(BatchPredict {
+                    slot: item.slot,
+                    token: item.previous_token,
+                    fresh: item.fresh,
+                });
+            }
+            let count = width.min(item.frames - item.frame);
+            spans.push((index, rows.len(), count));
+            let first = item.base + item.frame;
+            rows.extend((first..first + count).map(|row| (item.slot, row as u32)));
+        }
+        ids.clear();
+        ids.resize(rows.len(), blank_id);
+        execution.step(&predict, &rows, &mut ids)?;
+        for &(index, start, count) in &spans {
+            let item = &mut items[index];
+            item.predicted = true;
+            item.fresh = false;
+            let evaluated = &ids[start..start + count];
+            let Some(offset) = evaluated.iter().position(|&token| token != blank_id) else {
+                item.frame += count;
+                item.symbols_at_frame = 0;
+                continue;
+            };
+            if offset != 0 {
+                item.symbols_at_frame = 0;
+            }
+            item.frame += offset;
+            let token = evaluated[offset];
+            item.tokens.push(token);
+            item.previous_token = token;
+            item.predicted = false;
+            item.symbols_at_frame += 1;
+            if item.symbols_at_frame == max_symbols_per_frame {
+                item.frame += 1;
+                item.symbols_at_frame = 0;
+            }
+        }
+    }
+}
+
+struct PacketBatchExecution<'a> {
+    runtime: &'a mut dyn PacketRuntime,
+    batch: &'a BatchBinding,
+    blank_id: u32,
+    lanes: Vec<u32>,
+    ids: Vec<u32>,
+}
+
+impl PacketBatchExecution<'_> {
+    /// The smallest rung holding `count`.
+    fn rung(rungs: &[(usize, usize)], count: usize) -> Result<(usize, usize)> {
+        rungs
+            .iter()
+            .copied()
+            .find(|&(capacity, _)| capacity >= count)
+            .ok_or_else(|| {
+                RuntimeError::Rejected(format!("no batched RNNT program holds {count} lanes"))
+            })
+    }
+
+    /// Write `values` then `pad` up to `count` lanes.
+    fn write(
+        &mut self,
+        tensor: PacketTensor,
+        values: impl Iterator<Item = u32>,
+        pad: u32,
+        count: usize,
+    ) -> Result<()> {
+        self.lanes.clear();
+        self.lanes.extend(values);
+        self.lanes.resize(count, pad);
+        self.runtime
+            .write_tensor_at(tensor, 0, bytemuck::cast_slice(&self.lanes))
+    }
+}
+
+impl BatchedRnntExecution for PacketBatchExecution<'_> {
+    fn max_rows(&self) -> usize {
+        self.batch.joint.last().map_or(0, |&(rows, _)| rows)
+    }
+
+    fn step(
+        &mut self,
+        predict: &[BatchPredict],
+        rows: &[(u32, u32)],
+        ids: &mut [u32],
+    ) -> Result<()> {
+        let batch = self.batch;
+        let mut programs = Vec::with_capacity(2);
+        if !predict.is_empty() {
+            let (lanes, program) = Self::rung(&batch.predict, predict.len())?;
+            // Padding lanes embed blank from zeros into the scratch slot.
+            let (beyond, scratch) = (batch.slots, batch.slots - 1);
+            self.write(
+                batch.token,
+                predict.iter().map(|p| p.token),
+                self.blank_id,
+                lanes,
+            )?;
+            let state = |p: &BatchPredict| if p.fresh { beyond } else { p.slot };
+            self.write(batch.state_index, predict.iter().map(state), beyond, lanes)?;
+            self.write(batch.slot, predict.iter().map(|p| p.slot), scratch, lanes)?;
+            programs.push(program);
+        }
+        let (count, program) = Self::rung(&batch.joint, rows.len())?;
+        // Padding rows read zeros: past the encoder table and past the slots.
+        self.write(
+            batch.row_index,
+            rows.iter().map(|r| r.1),
+            batch.encoder_rows,
+            count,
+        )?;
+        self.write(batch.row_slot, rows.iter().map(|r| r.0), batch.slots, count)?;
+        programs.push(program);
+        self.runtime.run_sequence(&programs)?;
+        self.ids.resize(count, 0);
+        self.runtime
+            .read_tensor_at(batch.ids, 0, bytemuck::cast_slice_mut(&mut self.ids))?;
+        ids.copy_from_slice(&self.ids[..rows.len()]);
+        Ok(())
     }
 }
 
@@ -1081,6 +1442,153 @@ mod tests {
             .with_tdt_durations(&[0, 1, 2, 3, 4]);
         assert_eq!(decoder.decode(&mut limited).unwrap(), [4, 4]);
         assert_eq!(limited.calls, [0, 0, 1]);
+    }
+
+    /// Mostly blank (13); now and then a token, sometimes several at one frame.
+    fn scripted(history: &[u32], frame: usize) -> u32 {
+        let h = history
+            .iter()
+            .fold(frame as u64 * 0x9e37_79b9 + 7, |h, &t| {
+                h.wrapping_mul(31).wrapping_add(u64::from(t) + 1)
+            });
+        let h = (h ^ (h >> 13)).wrapping_mul(0x5bd1_e995);
+        let h = h ^ (h >> 29);
+        if h % 3 == 0 {
+            1 + (h >> 8) as u32 % 7
+        } else {
+            13
+        }
+    }
+
+    /// One recording through the batch-1 interface: the joint sees the committed tokens and the
+    /// pending prediction's token.
+    struct ScriptedRecording {
+        frames: usize,
+        window: usize,
+        committed: Vec<u32>,
+        pending: Vec<u32>,
+    }
+
+    impl RnntExecution for ScriptedRecording {
+        fn frames(&self) -> usize {
+            self.frames
+        }
+
+        fn predict(&mut self, previous_token: u32) -> Result<()> {
+            self.pending = self.committed.clone();
+            self.pending.push(previous_token);
+            Ok(())
+        }
+
+        fn joint_argmax(&mut self, first_frame: usize, output: &mut [u32]) -> Result<usize> {
+            let rows = output.len().min(self.window);
+            for (row, out) in output[..rows].iter_mut().enumerate() {
+                *out = scripted(&self.pending, first_frame + row);
+            }
+            Ok(rows)
+        }
+
+        fn commit_prediction(&mut self) {
+            self.committed = self.pending.clone();
+        }
+    }
+
+    /// Slot states as token histories; rows are `base[slot] + frame`.
+    struct ScriptedBatch {
+        history: Vec<Vec<u32>>,
+        base: Vec<usize>,
+        max_rows: usize,
+        steps: usize,
+    }
+
+    impl BatchedRnntExecution for ScriptedBatch {
+        fn max_rows(&self) -> usize {
+            self.max_rows
+        }
+
+        fn step(
+            &mut self,
+            predict: &[BatchPredict],
+            rows: &[(u32, u32)],
+            ids: &mut [u32],
+        ) -> Result<()> {
+            assert!(rows.len() <= self.max_rows && rows.len() == ids.len());
+            self.steps += 1;
+            for p in predict {
+                let history = &mut self.history[p.slot as usize];
+                if p.fresh {
+                    history.clear();
+                }
+                history.push(p.token);
+            }
+            for (id, &(slot, row)) in ids.iter_mut().zip(rows) {
+                let slot = slot as usize;
+                *id = scripted(&self.history[slot], row as usize - self.base[slot]);
+            }
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn batched_decode_matches_each_recording_alone() {
+        let frames = [0, 1, 5, 17, 40, 3, 64, 9];
+        for (window, max_rows, max_symbols) in [(16, 64, 10), (1, 8, 2), (4, 12, 1), (16, 8, 3)] {
+            let mut alone = Vec::new();
+            for &n in &frames {
+                let mut recording = ScriptedRecording {
+                    frames: n,
+                    window: 3,
+                    committed: Vec::new(),
+                    pending: Vec::new(),
+                };
+                alone.push(
+                    GreedyRnnt::new(13, max_symbols)
+                        .unwrap()
+                        .decode(&mut recording)
+                        .unwrap(),
+                );
+            }
+            let base: Vec<usize> = frames
+                .iter()
+                .scan(0, |next, &n| {
+                    let base = *next;
+                    *next += n + 2;
+                    Some(base)
+                })
+                .collect();
+            let mut items: Vec<_> = frames
+                .iter()
+                .zip(&base)
+                .enumerate()
+                .map(|(slot, (&n, &base))| BatchItem::new(slot as u32, base, n, 13))
+                .collect();
+            let mut execution = ScriptedBatch {
+                history: vec![vec![99]; frames.len()],
+                base,
+                max_rows,
+                steps: 0,
+            };
+            decode_batch(&mut execution, &mut items, 13, max_symbols, window).unwrap();
+            for (item, expected) in items.iter().zip(&alone) {
+                assert_eq!(
+                    item.tokens(),
+                    &expected[..],
+                    "window {window} max_rows {max_rows}"
+                );
+            }
+            assert!(
+                alone.iter().map(Vec::len).sum::<usize>() > 10,
+                "the script emits"
+            );
+        }
+        let mut execution = ScriptedBatch {
+            history: vec![Vec::new(); 3],
+            base: vec![0; 3],
+            max_rows: 2,
+            steps: 0,
+        };
+        let mut items: Vec<_> = (0..3).map(|slot| BatchItem::new(slot, 0, 4, 13)).collect();
+        assert!(decode_batch(&mut execution, &mut items, 13, 10, 4).is_err());
     }
 
     #[test]

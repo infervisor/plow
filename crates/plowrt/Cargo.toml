@@ -367,6 +367,10 @@ path = "examples/asr/rnnt_packet.rs"
 required-features = ["gguf", "cpu"]
 
 [[example]]
+name = "asr_rnnt_batch_check"
+path = "examples/asr/rnnt_batch_check.rs"
+
+[[example]]
 name = "asr_nemotron_rnnt_compile"
 path = "examples/asr/nemotron_rnnt_compile.rs"
 required-features = ["gguf"]

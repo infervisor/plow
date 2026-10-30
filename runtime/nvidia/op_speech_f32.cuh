@@ -1359,7 +1359,10 @@ static __device__ __noinline__ void d_gemm_f32(float* __restrict__ out, const __
             SpRowBf16{w, k, k, vec && sp_aligned(w, 8)}, SpPlainEpi{out, n}, slice, nblk, arena);
 }
 
-/* Q8GemmF32 (163). k must be a multiple of 32 (Q8_0 block). */
+/* Q8GemmF32 (163). k must be a multiple of 32 (Q8_0 block). i7 fixes the kernel path: 0 = by row
+ * count (the GEMV walk at most SPQ_GEMV_ROWS rows, tiles above), 1 = the GEMV walk, 2 = tiles. The
+ * two paths round differently, so a fixed one keeps every row's result independent of how many
+ * rows share the launch. */
 struct SpQ8Epi {
     float* out; const float* bias; unsigned n, silu;
     __device__ void operator()(unsigned m, unsigned c, float acc) const {
@@ -1411,15 +1414,19 @@ static __device__ __forceinline__ void sp_q8_gemv(const float* __restrict__ x, c
 static __device__ __noinline__ void d_q8_gemm_f32(float* __restrict__ out, const float* __restrict__ x,
                                      const uint8_t* __restrict__ w, const float* __restrict__ bias,
                                      unsigned m, unsigned n, unsigned k, unsigned activation,
-                                     unsigned a_row0, unsigned slice, unsigned nblk, float* arena) {
+                                     unsigned a_row0, unsigned path, unsigned slice, unsigned nblk,
+                                     float* arena) {
     arena = sp_smem;
-    if (k & 31u) { __trap(); return; }
+    if ((k & 31u) || path > 2u) { __trap(); return; }
     x += (size_t)a_row0 * k;
     const SpRowF32 la{x, k, sp_aligned(x, 16)};
     const SpRowQ8 lb{w, k};
     const SpQ8Epi ep{out, bias, n, activation == 1u};
-    if (m <= SPQ_GEMV_ROWS) {
-        sp_q8_gemv(x, w, ep, m, n, k, slice, nblk);
+    if (path == 1u || (path == 0u && m <= SPQ_GEMV_ROWS)) {
+        /* Rows in groups of SPQ_GEMV_ROWS: each row sums exactly as it would in a launch of its own. */
+        for (unsigned r0 = 0; r0 < m; r0 += SPQ_GEMV_ROWS)
+            sp_q8_gemv(x + (size_t)r0 * k, w, SpQ8Epi{out + (size_t)r0 * n, bias, n, activation == 1u},
+                       m - r0 < SPQ_GEMV_ROWS ? m - r0 : SPQ_GEMV_ROWS, n, k, slice, nblk);
         return;
     }
     /* 64x64 tiles when 128x128 ones leave slices idle (the small-M conformer rows). */
@@ -5302,7 +5309,7 @@ static __device__ __noinline__ void d_speech_f32(const PlowDevInst* in, void* co
     switch (in->op) {
     SP_CASE(Q8_GEMM_F32)
         d_q8_gemm_f32((float*)SP_TEN(0), (const float*)SP_TEN(1), (const uint8_t*)SP_TEN(2), (const float*)SP_TEN(3),
-                      in->i[0], in->i[1], in->i[2], in->i[3], in->i[4], slice, nblk, arena);
+                      in->i[0], in->i[1], in->i[2], in->i[3], in->i[4], in->i[7], slice, nblk, arena);
         break;
     SP_CASE(LAYERNORM_F32)
         d_layernorm_f32((float*)SP_TEN(0), (const float*)SP_TEN(1), (const float*)SP_TEN(2), (const float*)SP_TEN(3),
