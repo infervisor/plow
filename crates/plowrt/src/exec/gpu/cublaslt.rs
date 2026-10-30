@@ -231,8 +231,6 @@ enum LightKind {
     Attn(u32),
     /// `light_flash`: the q, k, v HeadNormRope instructions it folds in, or all `!0`.
     Flash([u32; 4]),
-    /// `light_quant`: the QuantFp8 instruction the producer `instruction` feeds.
-    Quant(u32),
 }
 
 /// `PlowLightOp` (light ABI 2): an instruction with its tensor pointers resolved at load.
@@ -281,12 +279,44 @@ impl LightOp {
     }
 }
 
+/// `PlowLightQuantArgs` (interp_sm120.cu): `light_quant`'s producer and quant by value.
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct LightQuantArgs {
+    p: LightQuantOp,
+    q: LightQuantOp,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct LightQuantOp {
+    d: DevInst64,
+    t: [u64; 8],
+}
+
+const _: () = assert!(
+    std::mem::size_of::<DevInst64>() == 64
+        && std::mem::size_of::<LightQuantOp>() == 128
+        && std::mem::size_of::<LightQuantArgs>() == 256
+        && std::mem::align_of::<LightQuantArgs>() == 8
+);
+
+impl LightQuantOp {
+    fn resolve(d: &DevInst64, devp: &[DeviceMem]) -> Self {
+        let op = LightOp::resolve(d, devp);
+        Self { d: op.d, t: op.t }
+    }
+}
+
 struct LightLaunch {
     function: KernelFn,
     xs: LightX,
     kind: LightKind,
     /// Light ABI 2: the launch's instructions by value (`Single` = `op[0]`).
     direct: Option<Box<LightSpan>>,
+    /// `light_quant`'s arguments (its only parameter), resolved at load: decode routes only (one
+    /// tensor table; `run_with`'s per-slot table never reaches them).
+    quant: Option<Box<LightQuantArgs>>,
     instruction: u32,
     blocks: u32,
     block: u32,
@@ -302,6 +332,19 @@ impl LightRoute {
     /// table (kv.*, recurrent state) through its kernarg; the route's own copy is slot 0's.
     pub(super) fn run_with(&self, stream: &CudaStream, tensors: u64) -> Result<()> {
         for launch in &self.launches {
+            if let Some(args) = &launch.quant {
+                let mut args = **args;
+                let mut params = [&mut args as *mut LightQuantArgs as *mut std::ffi::c_void];
+                self.be.launch_kernel(
+                    launch.function,
+                    launch.blocks,
+                    launch.block,
+                    launch.smem,
+                    &mut params,
+                    Some(stream),
+                )?;
+                continue;
+            }
             if let Some(span) = &launch.direct {
                 let mut span = **span;
                 let mut op = span.op[0];
@@ -323,7 +366,7 @@ impl LightRoute {
             arg.tensors = tensors;
             let mut instruction = launch.instruction;
             let (mut count, mut hnr) = match launch.kind {
-                LightKind::Attn(n) | LightKind::Quant(n) => (n, [0; 4]),
+                LightKind::Attn(n) => (n, [0; 4]),
                 LightKind::Flash(h) => (0, h),
                 LightKind::Single | LightKind::NormQuant => (0, [0; 4]),
             };
@@ -339,7 +382,6 @@ impl LightRoute {
             ];
             let params = match launch.kind {
                 LightKind::Single | LightKind::NormQuant => &mut params[..2],
-                LightKind::Quant(_) => &mut params[..3],
                 _ => &mut params[..],
             };
             self.be.launch_kernel(
@@ -846,32 +888,44 @@ fn light_quant_pair(
     if !whole || !quant {
         return None;
     }
-    // Producer operands (slot, required bytes; 0 = any) and its shape agreement with the quant.
+    // Producer operands (slot, required bytes), its active mask slot and its shape agreement
+    // with the quant.
     let row = u64::from(m) * u64::from(k) * 2;
-    let (shape, operands): (bool, &[(usize, u64)]) = match DevOp::from_u16(pd.op)? {
-        // Block-per-row: the interpreter's `batch <= nblk` path, width = K.
-        // Block-per-row in the kernel, at most 32 elements per thread.
+    let mask = u64::from(m) * 4;
+    let (shape, active, operands): (bool, usize, &[(usize, u64)]) = match DevOp::from_u16(pd.op)? {
+        // The interpreter's block-per-row path (`batch <= nblk`), at most 32 elements per thread
+        // in the kernel.
         DevOp::QwenRmsNorm => (
             pd.i[0] == k && pd.i[1] == m && pb >= m as usize && k <= 32 * BLOCK,
-            &[(0, row), (1, row), (2, u64::from(k) * 2), (3, 0), (4, row)],
+            3,
+            &[
+                (0, row),
+                (1, row),
+                (2, u64::from(k) * 2),
+                (3, mask),
+                (4, row),
+            ],
         ),
         // One head = one 128-wide group.
         DevOp::QwenGatedNorm => (
             pd.i[1] == 128 && pd.i[0].checked_mul(pd.i[1]) == Some(k) && pd.i[2] == m,
+            4,
             &[
                 (0, row),
                 (1, row),
                 (2, row),
                 (3, u64::from(pd.i[1]) * 2),
-                (4, 0),
+                (4, mask),
             ],
         ),
         DevOp::QwenSigmoidGate => (
             pd.i[0] == k && pd.i[1] == m,
-            &[(0, row), (1, row), (2, row), (3, 0)],
+            3,
+            &[(0, row), (1, row), (2, row), (3, mask)],
         ),
         DevOp::Glu => (
             pd.i[1] == 1 && u64::from(pd.i[0]) == u64::from(m) * u64::from(k),
+            usize::MAX,
             &[(0, row), (1, row), (2, row)],
         ),
         _ => return None,
@@ -894,19 +948,28 @@ fn light_quant_pair(
         }
         range(h).is_some_and(|r| r.1 - r.0 >= bytes && disjoint(r, xq) && disjoint(r, gs))
     });
-    // The RMSNorm entry reads its operands through restrict pointers.
-    let restrict_ok = pd.op != DevOp::QwenRmsNorm as u16 || {
-        let ranges: Vec<_> = [0, 1, 2, 4]
+    let present = |slots: &[usize]| -> Vec<(u64, u64)> {
+        slots
             .iter()
-            .filter(|&&slot| pd.t[slot] != none)
+            .filter(|&&slot| slot < 8 && pd.t[slot] != none)
             .filter_map(|&slot| range(pd.t[slot]))
-            .collect();
-        ranges
-            .iter()
-            .enumerate()
-            .all(|(i, &a)| ranges[i + 1..].iter().all(|&b| disjoint(a, b)))
+            .collect()
     };
-    (shape && fits && disjoint(xq, gs) && operands_ok && restrict_ok).then_some((p, q))
+    let pairwise = |r: &[(u64, u64)]| {
+        r.iter()
+            .enumerate()
+            .all(|(i, &a)| r[i + 1..].iter().all(|&b| disjoint(a, b)))
+    };
+    // The RMSNorm entry reads its operands through restrict pointers; no producer writes its
+    // active mask.
+    let alias_ok = if pd.op == DevOp::QwenRmsNorm as u16 {
+        pairwise(&present(&[0, 1, 2, 3, 4]))
+    } else {
+        present(&[active])
+            .iter()
+            .all(|&a| present(&[0]).iter().all(|&o| disjoint(a, o)))
+    };
+    (shape && fits && disjoint(xq, gs) && operands_ok && alias_ok).then_some((p, q))
 }
 
 /// Segments of 1..=`max` whole instructions (every slice, ascending, in program order) that
@@ -1061,7 +1124,7 @@ pub(super) fn add_qwen_light_routes(
     be: &Arc<CudaBackend>,
     function: KernelFn,
     norm: Option<KernelFn>,
-    quant: Option<LightQuant>,
+    quant: Option<(LightQuant, &[DeviceMem])>,
     kernarg: DevProgram,
     g: &DevProg,
     light: &[(usize, Vec<usize>)],
@@ -1071,7 +1134,7 @@ pub(super) fn add_qwen_light_routes(
         if routes.len() <= *seg {
             routes.resize_with(seg + 1, || None);
         }
-        if let ([p, q], Some(quant)) = (&insts[..], quant) {
+        if let ([p, q], Some((quant, devp))) = (&insts[..], quant) {
             let (pd, qd) = (&g.insts[*p], &g.insts[*q]);
             if qd.op == DevOp::QuantFp8 as u16 {
                 let norm = pd.op == DevOp::QwenRmsNorm as u16;
@@ -1081,8 +1144,12 @@ pub(super) fn add_qwen_light_routes(
                     launches: vec![LightLaunch {
                         function: if norm { quant.norm } else { quant.pointwise },
                         xs: LightX::default(),
-                        kind: LightKind::Quant(*q as u32),
+                        kind: LightKind::Single,
                         direct: None,
+                        quant: Some(Box::new(LightQuantArgs {
+                            p: LightQuantOp::resolve(pd, devp),
+                            q: LightQuantOp::resolve(qd, devp),
+                        })),
                         instruction: *p as u32,
                         blocks: if norm {
                             qd.i[4]
@@ -1127,6 +1194,7 @@ fn prefill_light_launches(function: KernelFn, g: &DevProg, insts: &[usize]) -> V
             xs: LightX::default(),
             kind: LightKind::Single,
             direct: None,
+            quant: None,
             instruction: inst as u32,
             blocks: u32::from(g.insts[inst].blocks),
             block: BLOCK,
@@ -1527,6 +1595,7 @@ pub(super) fn add_light_routes(
                         xs: LightX::default(),
                         kind: LightKind::NormQuant,
                         direct: Some(Box::new(span)),
+                        quant: None,
                         instruction: *n as u32,
                         blocks: u32::from(g.insts[*n].blocks),
                         block: BLOCK,
@@ -1561,6 +1630,7 @@ pub(super) fn add_light_routes(
                     block: FLASH_BLOCK,
                     smem,
                     direct: None,
+                    quant: None,
                 })
         };
         let folded = folded_hnr(g, levels)
@@ -1605,6 +1675,7 @@ pub(super) fn add_light_routes(
                             block: BLOCK,
                             smem,
                             direct,
+                            quant: None,
                         },
                         _ => {
                             let (function, smem) = match (
@@ -1631,6 +1702,7 @@ pub(super) fn add_light_routes(
                                 block: BLOCK,
                                 smem,
                                 direct,
+                                quant: None,
                             }
                         }
                     }
@@ -1654,6 +1726,7 @@ pub(super) fn add_light_routes(
                     block: flash.block,
                     smem: flash.smem,
                     direct: Some(Box::new(span)),
+                    quant: None,
                 }]
             }
             [cap, amax, fin] => match capmax(functions, cap, amax) {
@@ -1734,6 +1807,7 @@ fn sliding(functions: &LightFunctions, launch: LightLaunch) -> LightLaunch {
                 blocks,
                 smem,
                 direct: Some(Box::new(span)),
+                quant: None,
                 ..launch
             };
         }
@@ -1768,6 +1842,7 @@ fn sliding(functions: &LightFunctions, launch: LightLaunch) -> LightLaunch {
         blocks,
         smem: ATTN_S_SMEM,
         direct: Some(Box::new(span)),
+        quant: None,
         ..launch
     }
 }
@@ -1775,6 +1850,7 @@ fn sliding(functions: &LightFunctions, launch: LightLaunch) -> LightLaunch {
 fn clone_launch(l: &LightLaunch) -> LightLaunch {
     LightLaunch {
         direct: l.direct.clone(),
+        quant: None,
         ..*l
     }
 }
@@ -1815,6 +1891,7 @@ fn capmax(
         block: BLOCK,
         smem: 0,
         direct: Some(Box::new(span)),
+        quant: None,
     })
 }
 

@@ -4546,19 +4546,29 @@ static __device__ __forceinline__ void lq_store4(uint8_t* xq, float* gs, size_t 
         (unsigned)pack_fp8_e4m3(q[0], q[1]) | ((unsigned)pack_fp8_e4m3(q[2], q[3]) << 16);
     if (lane == 0) gs[gi] = s;
 }
-#define LIGHT_TEN(k) (in->t[k] == PLOW_TENSOR_NONE ? nullptr : T[in->t[k]])
-/* The RMSNorm producer on its own entry: its register-resident row would otherwise set the
- * pointwise entry's register budget. */
+/* The producer and the quant by value with their tensor pointers resolved at load (null = absent):
+ * a launch starts on its operands, not on dependent loads of the instruction and tensor tables. */
+struct PlowLightQuantOp {
+    PlowDevInst d;
+    void* t[8];
+};
+struct PlowLightQuantArgs {
+    PlowLightQuantOp p, q;
+};
+static_assert(sizeof(PlowDevInst) == 64 && sizeof(PlowLightQuantOp) == 128 && sizeof(PlowLightQuantArgs) == 256,
+              "exec/gpu/cublaslt.rs LightQuantArgs layout");
+#define LIGHT_TEN(k) (a.p.t[k])
+/* The RMSNorm producer on its own entry: its register-held row would otherwise set the pointwise
+ * entry's register budget. */
 extern "C" __global__ void __launch_bounds__(PLOW_NV_THREADS)
-    PLOW_SYM(plow_sm120_light_quant_norm)(PlowProgram prog, unsigned inst, unsigned qinst) {
+    PLOW_SYM(plow_sm120_light_quant_norm)(const __grid_constant__ PlowLightQuantArgs a) {
     __shared__ float part[32];
     __shared__ float gmax[PLOW_NV_WARPS][32];
-    const PlowDevInst* in = prog.insts + inst;
-    const PlowDevInst* qd = prog.insts + qinst;
-    void* const* T = prog.tensors;
+    const PlowDevInst* in = &a.p.d;
+    const PlowDevInst* qd = &a.q.d;
     const unsigned M = qd->i[0], K = qd->i[1], Rp = qd->i[4], groups = K >> 7;
-    uint8_t* xq = (uint8_t*)T[qd->t[0]];
-    float* gs = (float*)T[qd->t[2]];
+    uint8_t* xq = (uint8_t*)a.q.t[0];
+    float* gs = (float*)a.q.t[2];
     const unsigned lane = threadIdx.x & 31u, warp = threadIdx.x >> 5;
     if (in->op != PLOW_DOP_QWEN_RMSNORM) __trap();
     {
@@ -4582,30 +4592,34 @@ extern "C" __global__ void __launch_bounds__(PLOW_NV_THREADS)
         const size_t base = (size_t)row * dim;
         /* d_qwen_rmsnorm's walk (element d on thread d % 256, ascending, block_sum); x holds the
          * residual row, then the bf16 output for the quant. */
+        constexpr unsigned NT = PLOW_NV_THREADS;
         float x[RB];
         if (active && active[row] <= 0) {
 #pragma unroll
             for (unsigned k = 0; k < RB; k++) {
-                const unsigned d = threadIdx.x + k * blockDim.x;
+                const unsigned d = threadIdx.x + k * NT;
                 x[k] = d < dim ? __bfloat162float(out[base + d]) : 0.f;
             }
         } else {
             /* Chunks of CH elements per thread: every load of a chunk is issued before its math
-             * (a per-element load -> store chain was ~1 us per element). */
+             * (a per-element load -> store chain was ~1 us per element); gamma is loaded with the
+             * row, ahead of the block reduction. */
             constexpr unsigned CH = 16;
-            float sum = 0.f;
+            float sum = 0.f, gm[RB];
 #pragma unroll
             for (unsigned c = 0; c < RB; c += CH) {
+                if (c * NT >= dim) break;
                 float a[CH];
 #pragma unroll
                 for (unsigned j = 0; j < CH; j++) {
-                    const unsigned d = threadIdx.x + (c + j) * blockDim.x;
+                    const unsigned d = threadIdx.x + (c + j) * NT;
                     x[c + j] = d < dim ? __bfloat162float(rin[base + d]) : 0.f;
                     a[j] = radd && d < dim ? __bfloat162float(radd[base + d]) : 0.f;
+                    gm[c + j] = d < dim ? __bfloat162float(gamma[d]) + offset : 0.f;
                 }
 #pragma unroll
                 for (unsigned j = 0; j < CH; j++) {
-                    const unsigned d = threadIdx.x + (c + j) * blockDim.x;
+                    const unsigned d = threadIdx.x + (c + j) * NT;
                     if (d >= dim) continue;
                     if (radd) {
                         const __nv_bfloat16 r = __float2bfloat16(x[c + j] + a[j]);
@@ -4617,29 +4631,21 @@ extern "C" __global__ void __launch_bounds__(PLOW_NV_THREADS)
             }
             const float inv = rsqrtf(block_sum(sum, part) / dim + eps);
 #pragma unroll
-            for (unsigned c = 0; c < RB; c += CH) {
-                float gm[CH];
-#pragma unroll
-                for (unsigned j = 0; j < CH; j++) {
-                    const unsigned d = threadIdx.x + (c + j) * blockDim.x;
-                    gm[j] = d < dim ? __bfloat162float(gamma[d]) + offset : 0.f;
-                }
-#pragma unroll
-                for (unsigned j = 0; j < CH; j++) {
-                    const unsigned d = threadIdx.x + (c + j) * blockDim.x;
-                    if (d < dim) {
-                        const __nv_bfloat16 v = __float2bfloat16(x[c + j] * inv * gm[j]);
-                        out[base + d] = v;
-                        x[c + j] = __bfloat162float(v);
-                    } else {
-                        x[c + j] = 0.f;
-                    }
+            for (unsigned k = 0; k < RB; k++) {
+                const unsigned d = threadIdx.x + k * NT;
+                if (d < dim) {
+                    const __nv_bfloat16 v = __float2bfloat16(x[k] * inv * gm[k]);
+                    out[base + d] = v;
+                    x[k] = __bfloat162float(v);
+                } else {
+                    x[k] = 0.f;
                 }
             }
         }
         /* Group (2k + half) = elements 256k + 128 half + [0, 128): warps 4 half .. 4 half + 3. */
 #pragma unroll
         for (unsigned k = 0; k < RB; k++) {
+            if (k * NT >= dim) break;
             const float m = warp_max32(fabsf(x[k]));
             if (lane == 0) gmax[warp][k] = m;
         }
@@ -4647,7 +4653,8 @@ extern "C" __global__ void __launch_bounds__(PLOW_NV_THREADS)
         const unsigned h = warp >> 2;
 #pragma unroll
         for (unsigned k = 0; k < RB; k++) {
-            const unsigned d = threadIdx.x + k * blockDim.x;
+            if (k * NT >= dim) break;
+            const unsigned d = threadIdx.x + k * NT;
             if (d >= dim) continue;
             const float amax = fmaxf(fmaxf(gmax[4 * h][k], gmax[4 * h + 1][k]),
                                      fmaxf(gmax[4 * h + 2][k], gmax[4 * h + 3][k]));
@@ -4658,13 +4665,12 @@ extern "C" __global__ void __launch_bounds__(PLOW_NV_THREADS)
     }
 }
 extern "C" __global__ void __launch_bounds__(PLOW_NV_THREADS)
-    PLOW_SYM(plow_sm120_light_quant)(PlowProgram prog, unsigned inst, unsigned qinst) {
-    const PlowDevInst* in = prog.insts + inst;
-    const PlowDevInst* qd = prog.insts + qinst;
-    void* const* T = prog.tensors;
+    PLOW_SYM(plow_sm120_light_quant)(const __grid_constant__ PlowLightQuantArgs a) {
+    const PlowDevInst* in = &a.p.d;
+    const PlowDevInst* qd = &a.q.d;
     const unsigned M = qd->i[0], K = qd->i[1], Rp = qd->i[4], groups = K >> 7;
-    uint8_t* xq = (uint8_t*)T[qd->t[0]];
-    float* gs = (float*)T[qd->t[2]];
+    uint8_t* xq = (uint8_t*)a.q.t[0];
+    float* gs = (float*)a.q.t[2];
     const unsigned lane = threadIdx.x & 31u, warp = threadIdx.x >> 5;
     const unsigned w = blockIdx.x * PLOW_NV_WARPS + warp;
     if (w >= Rp * groups) return;
@@ -4682,7 +4688,7 @@ extern "C" __global__ void __launch_bounds__(PLOW_NV_THREADS)
         const uint2 ru = *reinterpret_cast<const uint2*>((const __nv_bfloat16*)LIGHT_TEN(2) + at);
         const __nv_bfloat16* pg = reinterpret_cast<const __nv_bfloat16*>(&rg);
         const __nv_bfloat16* pu = reinterpret_cast<const __nv_bfloat16*>(&ru);
-        __nv_bfloat16 ob[4];
+        alignas(8) __nv_bfloat16 ob[4];
         float v[4];
 #pragma unroll
         for (int j = 0; j < 4; j++) {
@@ -4707,7 +4713,7 @@ extern "C" __global__ void __launch_bounds__(PLOW_NV_THREADS)
             const uint2 rg = *reinterpret_cast<const uint2*>((const __nv_bfloat16*)LIGHT_TEN(2) + at);
             const __nv_bfloat16* pi = reinterpret_cast<const __nv_bfloat16*>(&ri);
             const __nv_bfloat16* pg = reinterpret_cast<const __nv_bfloat16*>(&rg);
-            __nv_bfloat16 ob[4];
+            alignas(8) __nv_bfloat16 ob[4];
 #pragma unroll
             for (int j = 0; j < 4; j++) {
                 const float gt = __bfloat162float(__float2bfloat16(qwen_sigmoid(__bfloat162float(pg[j]))));
