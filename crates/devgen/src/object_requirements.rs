@@ -28,7 +28,9 @@ fn facts<'a>(m: &Model, programs: impl Iterator<Item = &'a usize>) -> Facts {
         for inst in &m.progs[index].insts {
             f.fp8_arms |= req::fp8_arm_op(inst.op);
             f.gdn |= req::gdn_op(inst.op);
-            f.fp8_gemm |= inst.op == DevOp::GemmFp8 as u16;
+            // Block-scaled FP8 GEMMs run on cuBLASLt only, never on an interpreter arm.
+            f.fp8_gemm |= inst.op == DevOp::GemmFp8 as u16
+                && inst.i[5] != packet::dev::FP8_BLOCK_GROUP;
         }
     }
     f
