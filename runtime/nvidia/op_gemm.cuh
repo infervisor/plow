@@ -1029,6 +1029,51 @@ static __device__ void d_gemv_qkv(__nv_bfloat16* __restrict__ Cq, __nv_bfloat16*
     });
 }
 
+#if PLOW_NV_NORM_FOLD && PLOW_NV_GEMV_MMA
+/* AddNorm fold walks (op_gemv_mma.cuh GvFoldOut / GvFoldIn): one tensor-core pass over all M <= 32
+ * rows, so a partial's row index is the activation row. */
+template <class F> __device__ __forceinline__ void gv_fold_walk(unsigned M, F f) {
+    if (M <= 8u) f(gv_mm<8>{});
+    else if (M <= 16u) f(gv_mm<16>{});
+    else f(gv_mm<32>{});
+}
+static __device__ void d_gemv_fold(__nv_bfloat16* __restrict__ C, const __nv_bfloat16* __restrict__ x,
+                                   const __nv_bfloat16* __restrict__ W, unsigned M, unsigned N,
+                                   unsigned K, unsigned slice, unsigned nblk, const GvFoldOut& fo) {
+    if (M > 32u || (K & 31u) || (N & 7u)) __trap();
+    gv_fold_walk(M, [&](auto mm) {
+        constexpr int MM = decltype(mm)::v;
+        gemv_rows_mma<false, (MM + 15) / 16, (MM <= 8), true>(C, x, W, M, N, K, slice, nblk, nullptr, &fo);
+    });
+}
+static __device__ void d_gemv_glu_fold(__nv_bfloat16* __restrict__ C, const __nv_bfloat16* __restrict__ x,
+                                       const __nv_bfloat16* __restrict__ Wg,
+                                       const __nv_bfloat16* __restrict__ Wu, unsigned M, unsigned N,
+                                       unsigned K, unsigned act, unsigned slice, unsigned nblk,
+                                       const GvFoldIn& fi) {
+    if (M > 32u || (K & 31u) || K > 2048u) __trap();
+    gv_fold_walk(M, [&](auto mm) {
+        constexpr int MM = decltype(mm)::v;
+        gemv_glu_rows_mma<(MM + 15) / 16, (MM <= 8), true>(C, x, Wg, Wu, M, N, K, act, slice, nblk, &fi);
+    });
+}
+static __device__ void d_gemv_qkv_fold(__nv_bfloat16* Cq, __nv_bfloat16* Ck, __nv_bfloat16* Cv,
+                                       const __nv_bfloat16* __restrict__ x,
+                                       const __nv_bfloat16* __restrict__ Wq,
+                                       const __nv_bfloat16* __restrict__ Wk,
+                                       const __nv_bfloat16* __restrict__ Wv, unsigned M, unsigned Nq,
+                                       unsigned Nk, unsigned Nv, unsigned K, unsigned slice,
+                                       unsigned nblk, const GvFoldIn& fi) {
+    if (M > 32u || (K & 31u) || K > 2048u || ((Nq | Nk) & 7u)) __trap();
+    gv_fold_walk(M, [&](auto mm) {
+        constexpr int MM = decltype(mm)::v;
+        gemv_qkv_rows_mma<false, (MM + 15) / 16, (MM <= 8), true>(Cq, Ck, Cv, x, Wq, Wk, Wv, M, Nq, Nk, Nv,
+                                                                   K, slice, nblk, nullptr, nullptr,
+                                                                   nullptr, &fi);
+    });
+}
+#endif
+
 /* Arena-aware M=1 decode QKV GEMV: x staged into smem. */
 static __device__ void d_gemv_qkv(__nv_bfloat16* __restrict__ Cq, __nv_bfloat16* __restrict__ Ck,
                            __nv_bfloat16* __restrict__ Cv, const __nv_bfloat16* __restrict__ x,

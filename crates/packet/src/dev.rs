@@ -2434,9 +2434,12 @@ pub enum DevOp {
     /// row r is a frame row when `frame_lo <= tokens[r] < frame_lo + frame_rows`, then
     /// `out[r] = bf16(bf16(table[tokens[r]] + bf16(sum_k cb_table[k*cb_size + codes[r*K + k]])) / div)`
     /// (torch's bf16 order: the codebook sum rounds once), else `out[r] = table[tokens[r]]`.
+    /// `i7` mode bits (Maya 2 feedback): bit 0 drops the token row (`bf16(bf16(sum) / div)`); bit 1
+    /// then RMS-normalises each frame row, `bf16(y * rsqrt(mean(y^2) + f1) * nw)` over the bf16 `y`,
+    /// fp32 math and weight `t5=nw(f32[width])`, one rounding (torch `nn.RMSNorm` on a bf16 input).
     /// `t0=out(bf16[rows,width]) t1=table(bf16[vocab,width]) t2=tokens(u32[rows])
-    /// t3=cb_table(bf16[K*cb_size,width]) t4=codes(u32[rows,K])` ·
-    /// `i0=rows i1=width i2=vocab i3=K i4=cb_size i5=frame_lo i6=frame_rows` · `f0=div`.
+    /// t3=cb_table(bf16[K*cb_size,width]) t4=codes(u32[rows,K]) t5=nw?` ·
+    /// `i0=rows i1=width i2=vocab i3=K i4=cb_size i5=frame_lo i6=frame_rows i7=mode` · `f0=div f1=eps`.
     /// A token >= vocab or a frame code >= cb_size traps.
     EmbedFrameBf16 = 218,
     /// Fish S2 sampling of a bf16 logit row (one block per row): the top `min(top_k[r], 64)`
@@ -2455,7 +2458,15 @@ pub enum DevOp {
     SampleFishBf16 = 219,
     /// Decode GEMV with an fp32 result: `C[m][n] = sum_k x[m][k] * W[n][k]`, bf16 operands, fp32
     /// products and accumulation, fp32 store (a reference that runs its head in fp32 on bf16
-    /// weights). `t0=C(f32[M,N]) t1=x(bf16[M,K]) t2=W(bf16[N,K])` · `i0=M i1=N i2=K` (K % 8 == 0).
+    /// weights). `flags` modes (Maya 2's depth projections; 0 = the above): bit 0 `x` is f32, bit 1
+    /// `W` is f16, bit 2 adds `bias(f32[N])`, bit 3 adds `residual(f32[M,N])` (may alias `C`), bits
+    /// 4-7 the activation applied last (1 = GELU erf): `C = act(x W^T + bias + residual)`; bit 8 (f32
+    /// x, f16 W, K <= 1024) LayerNorms each x row first, `(x - mean) * rsqrt(var + eps) * gamma +
+    /// beta`, fp32 two-pass statistics; bit 9 reads `bias(f32[M / i3, N])`, one row per `i3` rows;
+    /// bit 10 (f32 x, f16 W, K % 64 == 0) rounds x to f16 and multiplies on tensor cores (fp32
+    /// accumulation, any summation order), streaming W once per 64 rows.
+    /// `t0=C(f32[M,N]) t1=x(bf16[M,K]) t2=W(bf16[N,K]) t3=bias? t4=residual? t5=gamma? t6=beta?` ·
+    /// `i0=M i1=N i2=K i3=bias_group i7=flags` · `f0=eps` (K % 8 == 0).
     GemvF32Out = 220,
     /// Small-vocabulary sampling of an f32 logit row (one block per row; Breeze TTS): with a
     /// `bitmap`, classes whose bit is set take the HF repetition penalty (`l > 0 ? l / pen : l *

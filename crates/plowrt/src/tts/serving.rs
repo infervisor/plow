@@ -18,17 +18,19 @@ use std::sync::{Arc, OnceLock};
 use std::time::Instant;
 
 use axum::body::Body;
+use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::State;
 use axum::http::{header, HeaderName, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::Json;
+use futures::StreamExt;
 use parking_lot::Mutex;
 use serde::Deserialize;
 
 use super::api::{Checked, SpeechSpec};
 use super::codec::{Codec, Urgency};
 use super::realtime::Ticket;
-use super::{pcm16, wav_header, SpeechContract};
+use super::SpeechContract;
 use crate::serve::session::{InFlight, RequestIds};
 use crate::serve::stream::{self as stream_mod, StreamChunk};
 use crate::serve::AppState;
@@ -41,10 +43,15 @@ pub struct SpeechRequest {
     pub input: String,
     /// One of the model's voices (its `/v1/models` card: `x_plow_speech.voices`).
     pub voice: String,
-    /// `wav` (default) or `pcm` (raw s16le mono at the pipeline sample rate).
+    /// `wav` (default) or `pcm` (raw s16le mono at the reply's sample rate).
     #[serde(default)]
     pub response_format: Option<String>,
-    /// OpenAI `speed`; only 1.0 is supported.
+    /// Hz the reply is resampled to, within `MIN_OUT_RATE..=MAX_OUT_RATE`; default: the model's
+    /// own rate (its card's `x_plow_speech.sample_rate`).
+    #[serde(default)]
+    pub sample_rate: Option<u32>,
+    /// OpenAI `speed`, within `MIN_SPEED..=MAX_SPEED`: the reply is time-stretched without
+    /// moving its pitch. 1.0 (default) leaves the audio untouched.
     #[serde(default)]
     pub speed: Option<f32>,
     #[serde(default)]
@@ -71,6 +78,9 @@ pub struct SpeechRequest {
     pub ref_audio: Option<String>,
     #[serde(default)]
     pub ref_text: Option<String>,
+    /// Models that normalise text (card `text_normalization`): `false` speaks the input as given.
+    #[serde(default)]
+    pub normalize: Option<bool>,
     /// Same seed, text and settings: the same audio. Unseeded requests sample anew.
     #[serde(default)]
     pub seed: Option<u64>,
@@ -246,7 +256,7 @@ async fn speech_on_guided(
 ) -> Response {
     let lang = checked.language.clone();
     let voice = match (&req.ref_audio, w.clone_input()) {
-        (None, _) => super::guided_speech::Voice::Named(req.voice.clone()),
+        (None, _) => super::guided_speech::Voice::Named(checked.voice.clone()),
         (Some(audio), Some((rate, max))) => {
             let pcm = match reference_pcm(audio, rate, max) {
                 Ok(p) => p,
@@ -274,6 +284,15 @@ async fn speech_on_guided(
         session: None,
         ..ids.clone()
     };
+    let mut out_pcm = match super::OutPcm::new(
+        w.sample_rate,
+        checked.sample_rate,
+        checked.speed,
+        checked.wav,
+    ) {
+        Ok(o) => o,
+        Err(e) => return server_error(e),
+    };
     if req.stream {
         let first = match w.synthesize_stream(
             &mux,
@@ -292,11 +311,11 @@ async fn speech_on_guided(
         run.admitted(cache.and_then(|o| o.at));
         let (out_tx, out_rx) = tokio::sync::mpsc::channel(64);
         let (head_tx, head_rx) = tokio::sync::oneshot::channel();
-        let wav = checked.wav.then(|| wav_header(w.sample_rate, u32::MAX));
+        let header = out_pcm.header(u32::MAX);
         tokio::spawn(guided_stream_task(
-            w, mux, voice, segs, checked, later_ids, first, out_tx, head_tx, t_arrive, run,
+            w, mux, voice, segs, checked, out_pcm, later_ids, first, out_tx, head_tx, t_arrive, run,
         ));
-        return stream_response(out_rx, head_rx, wav, in_flight, cache).await;
+        return stream_response(out_rx, head_rx, header, in_flight, cache).await;
     }
     let (mut pcm, mut joiner) = (Vec::new(), super::Joins::new(w.sample_rate));
     let (mut tokens, mut t3_ms, mut s3gen_ms) = (0, 0.0, 0.0);
@@ -333,7 +352,7 @@ async fn speech_on_guided(
     run.first();
     run.done();
     let total = t_arrive.elapsed().as_secs_f64();
-    let audio_s = pcm.len() as f64 / f64::from(w.sample_rate);
+    let audio_s = pcm.len() as f64 / f64::from(w.sample_rate) / f64::from(checked.speed);
     tracing::info!(
         tokens,
         segments = segs.len(),
@@ -344,7 +363,7 @@ async fn speech_on_guided(
         rtf = total / audio_s,
         "tts: chatterbox speech"
     );
-    let mut response = whole_response(checked.wav, w.sample_rate, &pcm, t3_ms);
+    let mut response = whole_response(&mut out_pcm, &pcm, t3_ms);
     run.stamp(&mut response);
     if let Some(cache) = cache {
         cache.stamp(&mut response);
@@ -361,6 +380,7 @@ async fn guided_stream_task(
     voice: super::guided_speech::Voice,
     segs: Vec<String>,
     checked: Checked,
+    mut out_pcm: super::OutPcm,
     later_ids: RequestIds,
     mut ev: tokio::sync::mpsc::UnboundedReceiver<super::guided_speech::StreamEvent>,
     out: tokio::sync::mpsc::Sender<Result<Vec<u8>, std::io::Error>>,
@@ -369,7 +389,10 @@ async fn guided_stream_task(
     mut run: crate::serve::turns::StageRun,
 ) {
     use super::guided_speech::StreamEvent;
-    let sr = f64::from(w.sample_rate);
+    // The playback rate, not the model's: `speed` changes how much playback time each sample
+    // buys, which is what the lead, the realtime projection and the delivered-audio metrics all
+    // measure. At speed 1.0 this is the model's rate.
+    let sr = f64::from(w.sample_rate) * f64::from(out_pcm.speed());
     let mut head = Some(head);
     let mut joiner = super::Joins::new(w.sample_rate);
     // Samples sent and when the first went out (the client's playback clock).
@@ -417,7 +440,7 @@ async fn guided_stream_task(
                     playing.get_or_insert_with(Instant::now);
                     sent += fresh.len();
                     let mut bytes = Vec::with_capacity(fresh.len() * 2);
-                    pcm16(&fresh, &mut bytes);
+                    out_pcm.push(&fresh, &mut bytes);
                     if out.send(Ok(bytes)).await.is_err() {
                         return; // client gone: dropping `ev` frees the request's pair
                     }
@@ -436,6 +459,11 @@ async fn guided_stream_task(
                 }
             }
         }
+    }
+    let mut tail = Vec::new();
+    out_pcm.finish(&mut tail);
+    if !tail.is_empty() && out.send(Ok(tail)).await.is_err() {
+        return;
     }
     run.done();
     let total = t_arrive.elapsed().as_secs_f64();
@@ -492,27 +520,27 @@ async fn stream_response(
 }
 
 /// A whole reply: the audio and the same headers on every model.
-fn whole_response(wav: bool, sample_rate: u32, pcm: &[f32], lm_ms: f64) -> Response {
-    let mut out = if wav {
-        wav_header(sample_rate, (pcm.len() * 2) as u32)
-    } else {
-        Vec::new()
-    };
-    pcm16(pcm, &mut out);
-    let content_type = if wav { "audio/wav" } else { "audio/pcm" };
+fn whole_response(out: &mut super::OutPcm, pcm: &[f32], lm_ms: f64) -> Response {
+    let mut body = Vec::new();
+    out.push(pcm, &mut body);
+    out.finish(&mut body);
+    let audio_s = (body.len() / 2) as f64 / f64::from(out.rate());
+    let content_type = out.content_type();
+    let mut bytes = out.header(body.len() as u32).unwrap_or_default();
+    bytes.extend_from_slice(&body);
     (
         [
             (header::CONTENT_TYPE, content_type.to_string()),
             (
                 HeaderName::from_static("x-plow-audio-seconds"),
-                format!("{:.3}", pcm.len() as f64 / f64::from(sample_rate)),
+                format!("{audio_s:.3}"),
             ),
             (
                 HeaderName::from_static("x-plow-lm-ms"),
                 format!("{lm_ms:.1}"),
             ),
         ],
-        out,
+        bytes,
     )
         .into_response()
 }
@@ -526,6 +554,68 @@ pub struct SpeechModel {
     ref_encoder: Option<Arc<super::ref_encoder::RefEncoder>>,
     realtime: Arc<super::realtime::RealTime>,
     spec: OnceLock<SpeechSpec>,
+    /// Maya 2's cloned-speaker conditioning (`spk` / `icl_spk`), when the bundle carries it.
+    speaker: Option<Arc<Maya2Speaker>>,
+}
+
+/// ECAPA and the speaker tables of a Maya 2 bundle (`checkpoint/ecapa`, `checkpoint/speaker`).
+struct Maya2Speaker {
+    ecapa: super::ecapa::Ecapa,
+    tables: super::maya2::Speaker,
+    /// Conditionings by reference audio (base64 hash): a voice reused across requests embeds once.
+    cache: parking_lot::Mutex<std::collections::HashMap<u64, Arc<SpeakerCond>>>,
+}
+
+/// One cloned speaker's anchor row and depth memory.
+struct SpeakerCond {
+    anchor: Vec<f32>,
+    memory: Arc<[f32]>,
+}
+
+impl Maya2Speaker {
+    const CACHE: usize = 64;
+
+    fn load(assets: &Path) -> Option<Self> {
+        let ck = assets.join("checkpoint");
+        let (e, t) = (ck.join("ecapa"), ck.join("speaker"));
+        if !e.is_dir() || !t.is_dir() {
+            return None;
+        }
+        let load = || -> Result<Self, String> {
+            Ok(Maya2Speaker {
+                ecapa: super::ecapa::Ecapa::load(&e).map_err(|x| x.to_string())?,
+                tables: super::maya2::Speaker::load(&t)?,
+                cache: Default::default(),
+            })
+        };
+        load()
+            .inspect_err(
+                |e| tracing::warn!(error = %e, "tts: maya2 speaker conditioning unavailable"),
+            )
+            .ok()
+    }
+
+    /// The conditioning of `pcm` (24 kHz), keyed by its request encoding `key`.
+    fn cond(&self, key: &str, pcm: &[f32]) -> Result<Arc<SpeakerCond>, String> {
+        use std::hash::{Hash, Hasher};
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        key.hash(&mut h);
+        let k = h.finish();
+        if let Some(c) = self.cache.lock().get(&k) {
+            return Ok(Arc::clone(c));
+        }
+        let e = self.ecapa.embed(pcm)?;
+        let c = Arc::new(SpeakerCond {
+            anchor: self.tables.anchor_row(&e),
+            memory: self.tables.memory(&e).into(),
+        });
+        let mut cache = self.cache.lock();
+        if cache.len() >= Self::CACHE {
+            cache.clear();
+        }
+        cache.insert(k, Arc::clone(&c));
+        Ok(c)
+    }
 }
 
 impl SpeechModel {
@@ -593,6 +683,11 @@ pub fn speech_model(
                 contract.frame_samples as f64 / f64::from(contract.sample_rate),
                 contract.tokens_per_frame(),
             );
+            let speaker = contract
+                .maya2
+                .as_ref()
+                .and_then(|_| Maya2Speaker::load(assets))
+                .map(Arc::new);
             Some(Arc::new(SpeechModel {
                 contract,
                 codec,
@@ -600,6 +695,7 @@ pub fn speech_model(
                 ref_encoder,
                 realtime,
                 spec: OnceLock::new(),
+                speaker,
             }))
         }
     };
@@ -712,6 +808,136 @@ pub async fn speech(
     response
 }
 
+/// WebSocket streaming speech endpoint: accepts requests on `/v1/audio/speech` (GET upgrade)
+/// or `/v1/tts/stream`.
+pub async fn ws_speech(
+    State(state): State<Arc<AppState>>,
+    headers: axum::http::HeaderMap,
+    ws: WebSocketUpgrade,
+) -> Response {
+    let ids = match RequestIds::from_headers(&headers) {
+        Ok(ids) => ids,
+        Err(e) => return bad(e, "x-session-id"),
+    };
+    if let Some(r) = crate::serve::overload::gate(&ids) {
+        return r;
+    }
+    ws.max_message_size(1024 * 1024)
+        .max_frame_size(1024 * 1024)
+        .on_upgrade(move |socket| async move {
+            ws_speech_session(state, socket, ids).await;
+        })
+}
+
+async fn ws_speech_session(state: Arc<AppState>, mut socket: WebSocket, mut ids: RequestIds) {
+    while let Some(msg) = socket.recv().await {
+        let text = match msg {
+            Ok(Message::Text(t)) => t,
+            Ok(Message::Ping(p)) => {
+                let _ = socket.send(Message::Pong(p)).await;
+                continue;
+            }
+            Ok(Message::Close(_)) | Err(_) => break,
+            _ => continue,
+        };
+        let mut req: SpeechRequest = match serde_json::from_str(&text) {
+            Ok(r) => r,
+            Err(e) => {
+                let _ = socket
+                    .send(Message::Text(
+                        serde_json::json!({
+                            "error": {
+                                "message": e.to_string(),
+                                "type": "invalid_request_error"
+                            }
+                        })
+                        .to_string(),
+                    ))
+                    .await;
+                continue;
+            }
+        };
+        req.stream = true;
+        let model_metrics = state.model_metrics(&req.model);
+        model_metrics
+            .serving
+            .tts
+            .active
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        model_metrics
+            .serving
+            .tts
+            .websocket_sessions
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if let Err(e) = ids.apply_body(&req.route()) {
+            let _ = socket
+                .send(Message::Text(
+                    serde_json::json!({
+                        "error": {
+                            "message": e,
+                            "type": "invalid_request_error"
+                        }
+                    })
+                    .to_string(),
+                ))
+                .await;
+            continue;
+        }
+        let (report, mut report_rx) = ids.report();
+        let mut response = speech_with(
+            Arc::clone(&state),
+            Ok(Json(req)),
+            &ids,
+            report,
+            &mut report_rx,
+        )
+        .await;
+        ids.stamp(&mut response);
+
+        if !response.status().is_success() {
+            let bytes = match axum::body::to_bytes(response.into_body(), 64 * 1024).await {
+                Ok(b) => String::from_utf8_lossy(&b).into_owned(),
+                Err(e) => format!(r#"{{"error":{{"message":"{e}"}}}}"#),
+            };
+            let _ = socket.send(Message::Text(bytes)).await;
+            continue;
+        }
+
+        let mut stream = response.into_body().into_data_stream();
+        let mut sent_any = false;
+        loop {
+            tokio::select! {
+                chunk = stream.next() => {
+                    match chunk {
+                        Some(Ok(c)) if !c.is_empty() => {
+                            sent_any = true;
+                            if socket.send(Message::Binary(c.to_vec())).await.is_err() {
+                                break;
+                            }
+                        }
+                        Some(Ok(_)) => {}
+                        _ => break,
+                    }
+                }
+                msg = socket.recv() => {
+                    match msg {
+                        Some(Ok(Message::Ping(p))) => {
+                            let _ = socket.send(Message::Pong(p)).await;
+                        }
+                        Some(Ok(Message::Close(_))) | None => break,
+                        _ => {}
+                    }
+                }
+            }
+        }
+        if sent_any {
+            let _ = socket
+                .send(Message::Text(serde_json::json!({"done": true}).to_string()))
+                .await;
+        }
+    }
+}
+
 async fn speech_with(
     state: Arc<AppState>,
     req: Result<Json<SpeechRequest>, axum::extract::rejection::JsonRejection>,
@@ -821,11 +1047,22 @@ async fn speech_with(
             None,
         );
     };
+    let model_metrics = state.model_metrics(&key);
+    model_metrics
+        .serving
+        .tts
+        .active
+        .store(true, std::sync::atomic::Ordering::Relaxed);
+    model_metrics
+        .serving
+        .tts
+        .http_requests
+        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let mut run = crate::serve::turns::StageRun::start(
         ids,
         crate::serve::turns::Kind::Tts,
         &req.model,
-        Some(state.model_metrics(&key)),
+        Some(model_metrics),
         t_arrive,
         true,
     );
@@ -896,8 +1133,16 @@ async fn speech_with(
             "cfg_weight",
         );
     }
-    let voice = req.voice.clone();
-    let wav = checked.wav;
+    let voice = checked.voice.clone();
+    let mut out_pcm = match super::OutPcm::new(
+        c.sample_rate,
+        checked.sample_rate,
+        checked.speed,
+        checked.wav,
+    ) {
+        Ok(o) => o,
+        Err(e) => return server_error(e),
+    };
     let reference = match (&req.ref_audio, &req.ref_text, &model.ref_encoder) {
         (Some(audio), Some(text), Some(enc)) => {
             match ref_clip(&model, tok, &voice, enc, audio, text) {
@@ -909,10 +1154,46 @@ async fn speech_with(
     };
     // Past the cap the reference budget clips the audio: a longer input is spoken in order as
     // sentence-sized segments, each with its full budget.
+    // Maya 2 guesses an unnamed language from the text's script.
+    let language = checked.language.clone().or_else(|| {
+        c.maya2
+            .as_ref()
+            .map(|_| super::maya2::detect_lang(&req.input).to_owned())
+    });
+    // Maya 2 clones with the reference's ECAPA speaker (`icl_spk` with a transcript, `spk` without);
+    // a bundle without the speaker tables clones by `icl` alone and needs the transcript.
+    let speaker = match (&c.maya2, &req.ref_audio, &model.speaker, &model.ref_encoder) {
+        (Some(_), Some(audio), Some(sp), Some(enc)) => {
+            let pcm = match reference_pcm(audio, c.sample_rate, enc.max_samples()) {
+                Ok(p) => p,
+                Err((msg, param)) => return bad(msg, param),
+            };
+            match tokio::task::block_in_place(|| sp.cond(audio, &pcm)) {
+                Ok(cond) => Some(cond),
+                Err(e) => return bad(format!("reference audio: {e}"), "ref_audio"),
+            }
+        }
+        (Some(_), Some(_), None, _) if req.ref_text.is_none() => {
+            return bad(
+                "this bundle clones only with the reference's transcript; give `ref_text`",
+                "ref_text",
+            )
+        }
+        _ => None,
+    };
+    // Maya 2 speaks numbers, dates, currency, ... as its server does: normalised in the language.
+    let input = match (&c.maya2, &language) {
+        (Some(_), Some(lang)) if req.normalize != Some(false) => {
+            super::maya2_text::normalise_text(&req.input, lang)
+        }
+        _ => req.input.clone(),
+    };
     let maker = SegmentMaker {
         tok: Arc::clone(tok),
         contract: c.clone(),
         voice: voice.clone(),
+        language,
+        speaker,
         instructions: req
             .instructions
             .as_deref()
@@ -930,7 +1211,7 @@ async fn speech_with(
         seed: checked.seed,
     };
     let mut segs: Vec<Segment> = Vec::new();
-    for t in super::segments(&req.input, c.segment_chars()) {
+    for t in super::segments(&input, c.segment_chars()) {
         if !maker.make_fitting(t, &mut segs) {
             return bad(
                 "`instructions` leave no room for text in the text encoder's prompt",
@@ -1021,12 +1302,13 @@ async fn speech_with(
         let (head_tx, head_rx) = tokio::sync::oneshot::channel();
         let cache = crate::serve::session::CacheOutcome::received(report_rx.take()).await;
         run.admitted(cache.and_then(|o| o.at));
-        let header = wav.then(|| wav_header(c.sample_rate, u32::MAX));
+        let header = out_pcm.header(u32::MAX);
         tokio::spawn(stream_task(
             Arc::clone(&model),
             rx,
             later,
             ticket,
+            out_pcm,
             out_tx,
             head_tx,
             seed,
@@ -1088,6 +1370,12 @@ async fn speech_with(
             match later.judge(k, f, f > 0 && joiner.failed(&p), &mut tries) {
                 Verdict::Keep => {}
                 Verdict::Retry => {
+                    if let Some(m) = run.metrics() {
+                        m.serving
+                            .tts
+                            .watchdog_recovers
+                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    }
                     attempt += 1;
                     continue;
                 }
@@ -1106,7 +1394,7 @@ async fn speech_with(
     if frames == 0 {
         return server_error("model produced no audio frames");
     }
-    let audio_s = pcm.len() as f64 / f64::from(c.sample_rate);
+    let audio_s = pcm.len() as f64 / f64::from(c.sample_rate) / f64::from(checked.speed);
     let total = t_arrive.elapsed().as_secs_f64();
     tracing::info!(
         tokens = n_tokens,
@@ -1123,7 +1411,7 @@ async fn speech_with(
     run.admitted(cache.and_then(|o| o.at));
     run.first();
     run.done();
-    let mut response = whole_response(wav, c.sample_rate, &pcm, t_lm.as_secs_f64() * 1e3);
+    let mut response = whole_response(&mut out_pcm, &pcm, t_lm.as_secs_f64() * 1e3);
     run.stamp(&mut response);
     if let Some(cache) = cache {
         cache.stamp(&mut response);
@@ -1177,7 +1465,16 @@ fn ref_clip(
     };
     let tok = model.encoder.as_ref().map_or(tok, |e| &e.tok);
     let mut ids = clone.head.clone();
-    ids.extend(tok.encode_with_special_tokens(&c.prompt_text(voice, None, text.trim()), false));
+    // Maya 2 (`icl`): the transcript in its own language, no speaker name.
+    let lang = c.maya2.as_ref().map(|_| super::maya2::detect_lang(text));
+    let voice = if c.maya2.is_some() {
+        MAYA2_CLONE_VOICE
+    } else {
+        voice
+    };
+    ids.extend(
+        tok.encode_with_special_tokens(&c.prompt_text(voice, lang, None, text.trim()), false),
+    );
     ids.extend_from_slice(&clone.mid);
     if model.encoder.as_ref().is_some_and(|e| ids.len() > e.rows()) {
         return Err((
@@ -1187,6 +1484,7 @@ fn ref_clip(
     }
     Ok(RefClip {
         ids,
+        lang: lang.map(str::to_owned),
         frames: pcm.len().div_ceil(enc.frame_samples),
         eos: clone.eos_code,
         pcm,
@@ -1210,10 +1508,17 @@ struct Segment {
     reference: Option<Arc<RefClip>>,
     gen: crate::serve::GenParams,
     chars: usize,
+    /// Index of the segment in its request.
+    k: usize,
 }
+
+/// The voice a Maya 2 clone renders as: the plain prompt (`icl` names no speaker).
+const MAYA2_CLONE_VOICE: &str = "plain";
 
 /// A request's voice-cloning reference.
 struct RefClip {
+    /// Maya 2: the transcript's language; a text in the same language repeats no language tag.
+    lang: Option<String>,
     /// The transcript's prompt segment (encoder ids with a text encoder, else token ids): the
     /// contract's clone head, the transcript, its mid.
     ids: Vec<u32>,
@@ -1258,6 +1563,10 @@ struct SegmentMaker {
     tok: Arc<dyn crate::text::tokenizer::Tokenize>,
     contract: SpeechContract,
     voice: String,
+    /// The template's `{language}`.
+    language: Option<String>,
+    /// Maya 2: the cloned speaker's conditioning.
+    speaker: Option<Arc<SpeakerCond>>,
     instructions: Option<String>,
     encoder: Option<Arc<super::text_encoder::TextEncoder>>,
     reference: Option<Arc<RefClip>>,
@@ -1283,10 +1592,22 @@ impl SegmentMaker {
         };
         let ids = |instructions: Option<&str>| {
             let mut ids = lead.clone();
-            ids.extend(tok.encode_with_special_tokens(
-                &c.prompt_text(&self.voice, instructions, text),
-                false,
-            ));
+            let cloned = self.reference.is_some() || self.speaker.is_some();
+            let mut prompt = match (cloned, &c.maya2) {
+                (true, Some(_)) => c.prompt_text(
+                    MAYA2_CLONE_VOICE,
+                    self.language.as_deref(),
+                    instructions,
+                    text,
+                ),
+                _ => c.prompt_text(&self.voice, self.language.as_deref(), instructions, text),
+            };
+            if let (Some(r), Some(l)) = (&self.reference, &self.language) {
+                if r.lang.as_ref() == Some(l) {
+                    prompt = prompt.replacen(&format!("<|lang:{l}|>"), "", 1);
+                }
+            }
+            ids.extend(tok.encode_with_special_tokens(&prompt, false));
             ids.extend_from_slice(&c.suffix);
             ids
         };
@@ -1310,10 +1631,13 @@ impl SegmentMaker {
             prompt_ids = head;
         }
         let mut gen = crate::serve::GenParams::default();
-        gen.max_tokens = self
-            .max_tokens
-            .unwrap_or_else(|| c.max_new_tokens(text))
-            .min(c.max_new_tokens_cap);
+        gen.max_tokens = match &c.maya2 {
+            Some(_) => self.maya2_plan(text, k).cap as usize,
+            None => self
+                .max_tokens
+                .unwrap_or_else(|| c.max_new_tokens(text))
+                .min(c.max_new_tokens_cap),
+        };
         gen.params.temperature = self.temperature;
         gen.params.top_p = self.top_p;
         gen.params.repetition_penalty = self.repetition_penalty;
@@ -1333,11 +1657,36 @@ impl SegmentMaker {
             reference: self.reference.clone(),
             gen,
             chars: text.chars().count(),
+            k,
         }
     }
 }
 
 impl SegmentMaker {
+    /// Maya 2's controller plan for segment `k`: the request's cb0 sampling over the packet's
+    /// defaults, and the piece's frame budget and loop-guard windows.
+    fn maya2_plan(&self, text: &str, k: usize) -> super::maya2::Plan {
+        let c = &self.contract;
+        let ctl = c.maya2.as_ref().expect("maya2 contract");
+        let mut cb0 = ctl.cb0;
+        // `engine.py` clamps the temperature to [0.05, 2].
+        cb0.temperature = self.temperature.clamp(0.05, 2.0);
+        cb0.top_p = self.top_p;
+        cb0.presence_penalty = self.repetition_penalty;
+        if self.top_k > 0 {
+            cb0.top_k = self.top_k as u32;
+        }
+        ctl.plan(
+            text,
+            self.language.as_deref().unwrap_or("en"),
+            self.max_tokens,
+            cb0,
+            self.seed
+                .wrapping_mul(1_000_003)
+                .wrapping_add(k as u64 * 7919),
+        )
+    }
+
     /// Append `text`'s segments: a text-encoder prompt is one launch, so a segment whose prompt
     /// exceeds the encoder is halved (at whitespace when it can) until each fits. `false` when a
     /// single character does not fit.
@@ -1385,7 +1734,19 @@ impl SegmentMaker {
                 .chain(head as u32..(head + ids.len()) as u32)
                 .collect()
         };
-        let overlay_pos = s.enc_ids.as_deref().map_or(Vec::new(), rows);
+        let mut overlay_pos = s.enc_ids.as_deref().map_or(Vec::new(), rows);
+        // Maya 2's cloned speaker: its anchor row at the reference's and the text's `<|audio|>`
+        // sentinels (each the last row of its prompt span).
+        let mut overlay = Vec::new();
+        if let (Some(sp), Some(_)) = (&self.speaker, &c.maya2) {
+            if let Some(r) = &s.reference {
+                overlay_pos.push(r.ids.len() as u32 - 1);
+            }
+            overlay_pos.push(s.prompt_ids.len() as u32 - 1);
+            for _ in &overlay_pos {
+                overlay.extend_from_slice(&sp.anchor);
+            }
+        }
         let cfg = s.uncond_ids.as_ref().map(|ids| crate::serve::mux::CfgJob {
             uncond_overlay: Vec::new(),
             params: crate::text::sample::CfgParams {
@@ -1460,7 +1821,7 @@ impl SegmentMaker {
             let greedy = self.temperature <= 0.0;
             Ok(Some(Box::new(crate::serve::mux::SpeechJob {
                 cfg,
-                overlay: Vec::new(),
+                overlay,
                 overlay_pos,
                 encode,
                 frame_codes: Vec::new(),
@@ -1487,7 +1848,9 @@ impl SegmentMaker {
                     semantic_base: c.audio_token_base,
                     stop_class: c.codebook,
                     stop_token: c.stops[0],
+                    maya2: c.maya2.as_ref().map(|_| self.maya2_plan(&s.text, s.k)),
                 }),
+                maya2_memory: self.speaker.as_ref().map(|sp| Arc::clone(&sp.memory)),
                 ..Default::default()
             })))
         }
@@ -1756,6 +2119,7 @@ async fn stream_task(
     rx: stream_mod::ChunkReceiver,
     mut later: Later,
     ticket: Arc<Ticket>,
+    mut out_pcm: super::OutPcm,
     out: tokio::sync::mpsc::Sender<Result<Vec<u8>, std::io::Error>>,
     head: tokio::sync::oneshot::Sender<axum::http::HeaderMap>,
     seed: u64,
@@ -1763,9 +2127,32 @@ async fn stream_task(
     mut run: crate::serve::turns::StageRun,
 ) {
     use std::sync::atomic::Ordering::SeqCst;
+    struct ActiveGuard(Option<Arc<crate::obs::Metrics>>);
+    impl Drop for ActiveGuard {
+        fn drop(&mut self) {
+            if let Some(m) = &self.0 {
+                m.serving
+                    .tts
+                    .active_streams
+                    .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
+    }
+    if let Some(m) = run.metrics() {
+        m.serving
+            .tts
+            .active
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        m.serving
+            .tts
+            .active_streams
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+    let _stream_guard = ActiveGuard(run.metrics().cloned());
     let mut head = Some(head);
     let c = model.contract.clone();
-    let sr = f64::from(c.sample_rate);
+    // Playback, not model, rate: see `guided_stream_task`.
+    let sr = f64::from(c.sample_rate) * f64::from(out_pcm.speed());
     let (fc, fs) = (c.frame_codes, c.frame_samples);
     let n_segs = later.segs.len();
     let (ftx, mut frx) = tokio::sync::mpsc::unbounded_channel::<SegMsg>();
@@ -1888,6 +2275,12 @@ async fn stream_task(
             match msg {
                 None => break,
                 Some(SegMsg::Retry) => {
+                    if let Some(m) = run.metrics() {
+                        m.serving
+                            .tts
+                            .watchdog_recovers
+                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    }
                     (frames, emitted, skipping) = (Vec::new(), 0, false);
                     attempt += 1;
                     joiner.next_segment();
@@ -1912,7 +2305,15 @@ async fn stream_task(
         match msg {
             None => done = true,
             Some(SegMsg::End) => done = true,
-            Some(SegMsg::Err(e)) => return drop(out.send(Err(std::io::Error::other(e))).await),
+            Some(SegMsg::Err(e)) => {
+                if let Some(m) = run.metrics() {
+                    m.serving
+                        .tts
+                        .errors
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
+                return drop(out.send(Err(std::io::Error::other(e))).await);
+            }
             Some(SegMsg::Retry) => {}
             Some(SegMsg::Frame(f)) => {
                 frames.extend(f);
@@ -2035,7 +2436,7 @@ async fn stream_task(
                     emitted = upto;
                     if !fresh.is_empty() {
                         let mut bytes = Vec::new();
-                        pcm16(fresh, &mut bytes);
+                        out_pcm.push(fresh, &mut bytes);
                         if first.is_none() {
                             ticket.first_audio();
                         }
@@ -2048,11 +2449,25 @@ async fn stream_task(
                             let _ = h.send(run.headers());
                         }
                         if out.send(Ok(bytes)).await.is_err() {
+                            if let Some(m) = run.metrics() {
+                                m.serving
+                                    .tts
+                                    .cancelled
+                                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            }
                             return; // client gone: dropping frx ends the drain, which cancels the slot
                         }
                     }
                 }
-                Err(e) => return drop(out.send(Err(std::io::Error::other(e))).await),
+                Err(e) => {
+                    if let Some(m) = run.metrics() {
+                        m.serving
+                            .tts
+                            .errors
+                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    }
+                    return drop(out.send(Err(std::io::Error::other(e))).await);
+                }
             }
             if windowed {
                 break;
@@ -2071,6 +2486,11 @@ async fn stream_task(
             }
             judged = true;
         }
+    }
+    let mut tail = Vec::new();
+    out_pcm.finish(&mut tail);
+    if !tail.is_empty() && out.send(Ok(tail)).await.is_err() {
+        return;
     }
     run.done();
     tracing::info!(
