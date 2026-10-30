@@ -254,6 +254,11 @@ serve_env = { PLOW_DECODE_MAX_RUNG = "128" }
 
 # FP32-reference gate (scripts/llm/fp32_ref_gate.py): GEMMA12B_FP32_REF = the cached FP32 ref.json,
 # GEMMA12B_FP32_VLLM = the vLLM 0.28 capture against it (this box: /opt/dlami/nvme/lava-tts/fp32gate/).
+[rung_choices.PLOW_EMIT_ATTN_LIBRARY]
+# Library vs declared native role, every prefill rung (see the PLOW_BUILD_FA4_* comment above).
+label = "qualified"
+evidence = ["lib-attn 2026-10-29 bin6 aef05632, packet a0464475f8ab: chunk 2048/1024/512/128 0.608/0.633/0.758/2.375 -> 0.549/0.572/0.677/1.813 s; FP32 gate c1/c8/c32 PASS", "docs/bringup/results/gemma12b-fp8-20260930/comparison.md", "docs/arch/28-library-attention.md"]
+
 [measured]
 tok_s = 622.7
 p50_tpot_ms = 97.3
