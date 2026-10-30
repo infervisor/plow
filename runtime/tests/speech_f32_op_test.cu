@@ -1425,6 +1425,75 @@ static void t_q8_path(unsigned path, unsigned m_small, unsigned m_big, unsigned 
     verdict(name, "rows alone == rows in the launch", std::equal(own.begin(), own.end(), batched.begin()));
 }
 
+/* Item `b` of an [items][bytes] tensor as a tensor of its own. */
+static unsigned item_copy(Case& c, unsigned all, unsigned b, size_t bytes) {
+    unsigned id = c.add(bytes);
+    memcpy(c.host[id].data(), c.host[all].data() + b * bytes, bytes);
+    return id;
+}
+
+/* RelativeAttentionF32 over items (i6), each with its own key_start: against the golden, and each
+ * item bit for bit as in a launch of its own. */
+static void t_relative_items(const char* name, unsigned rows, unsigned width, unsigned heads, unsigned chunk,
+                             unsigned left, unsigned query_row0, std::vector<uint32_t> starts) {
+    Case c;
+    const unsigned items = (unsigned)starts.size();
+    const size_t n = (size_t)rows * width;
+    unsigned o = c.out(items * n), q = c.f32(items * n, 1.f), k = c.f32(items * n, 1.f), v = c.f32(items * n, 1.f);
+    unsigned p = c.f32((size_t)(2 * rows - 1) * width, 1.f), u = c.f32(width, 0.3f), bv = c.f32(width, 0.3f);
+    unsigned ks = c.u32(starts);
+    std::vector<PlowDevInst> alone;
+    for (unsigned b = 0; b < items; b++) {
+        PlowDevInst one;
+        memset(&one, 0, sizeof one);
+        for (auto& t : one.t) t = PLOW_TENSOR_NONE;
+        one.t[0] = c.out(n); one.t[1] = item_copy(c, q, b, n * 4); one.t[2] = item_copy(c, k, b, n * 4);
+        one.t[3] = item_copy(c, v, b, n * 4); one.t[7] = c.u32({starts[b]});
+        alone.push_back(one);
+    }
+    c.in.op = PLOW_DOP_RELATIVE_ATTENTION_F32;
+    c.in.t[0] = o; c.in.t[1] = q; c.in.t[2] = k; c.in.t[3] = v; c.in.t[4] = p; c.in.t[5] = u; c.in.t[6] = bv;
+    c.in.t[7] = ks;
+    c.in.i[0] = rows; c.in.i[1] = width; c.in.i[2] = heads; c.in.i[3] = chunk; c.in.i[4] = left;
+    c.in.i[5] = query_row0; c.in.i[6] = items;
+    run(name, c, g_relative_attention_f32, {o}, FP32);
+    const std::vector<uint32_t> batched = fetch(c, o);
+    bool same = true;
+    for (unsigned b = 0; b < items; b++) {
+        PlowDevInst one = c.in;
+        for (int t : {0, 1, 2, 3, 7}) one.t[t] = alone[b].t[t];
+        one.i[6] = 0;
+        launch(one, c.dev);
+        const std::vector<uint32_t> own = fetch(c, one.t[0]);
+        same = same && std::equal(own.begin(), own.end(), batched.begin() + b * n);
+    }
+    verdict(name, "each item == the item alone", same);
+}
+
+/* CausalDepthwiseConv1dF32 over items of item_rows rows (i3): against the golden, and each item bit
+ * for bit as in a launch of its own. */
+static void t_dwconv_items(unsigned items, unsigned item_rows, unsigned ch, unsigned kernel) {
+    const char* name = "CausalDepthwiseConv1dF32 items";
+    Case c;
+    const size_t n = (size_t)item_rows * ch;
+    unsigned o = c.out(items * n), x = c.f32(items * n, 1.f), w = c.f16((size_t)ch * kernel, 0.3f);
+    std::vector<std::pair<unsigned, unsigned>> alone;
+    for (unsigned b = 0; b < items; b++) alone.push_back({c.out(n), item_copy(c, x, b, n * 4)});
+    c.in.op = PLOW_DOP_CAUSAL_DEPTHWISE_CONV1D_F32; c.in.t[0] = o; c.in.t[1] = x; c.in.t[2] = w;
+    c.in.i[0] = items * item_rows; c.in.i[1] = ch; c.in.i[2] = kernel; c.in.i[3] = item_rows;
+    run(name, c, g_causal_depthwise_conv1d_f32, {o}, FP32);
+    const std::vector<uint32_t> batched = fetch(c, o);
+    bool same = true;
+    for (unsigned b = 0; b < items; b++) {
+        PlowDevInst one = c.in;
+        one.t[0] = alone[b].first; one.t[1] = alone[b].second; one.i[0] = item_rows; one.i[3] = 0;
+        launch(one, c.dev);
+        const std::vector<uint32_t> own = fetch(c, one.t[0]);
+        same = same && std::equal(own.begin(), own.end(), batched.begin() + b * n);
+    }
+    verdict(name, "each item == the item alone", same);
+}
+
 /* Q8GemmF32 at Nemotron's shapes: the GEMV walk (path 1) against tiles (path 2) by row count. */
 static void bench_q8_paths() {
     const unsigned shapes[][2] = {{1024, 1024}, {4096, 1024}, {1024, 4096}, {2048, 1024}, {13088, 640}, {2560, 640}};
@@ -1798,6 +1867,11 @@ int main(int argc, char** argv) {
     t_q8_path(1, 4, 20, 96, 256);
     t_q8_path(1, 5, 37, 130, 512);
     t_q8_path(2, 4, 70, 130, 512);
+    /* Nemotron's stream window: 14 chunks of 4 rows of keys, then the step's 4 query rows. */
+    t_relative_items("RelativeAttentionF32 stream items", 60, 1024, 8, 4, 14, 56, {56, 52, 0, 8, 56});
+    t_relative_items("RelativeAttentionF32 chunked items", 40, 256, 4, 8, 2, 0, {0, 3, 17});
+    t_relative_items("RelativeAttentionF32 full items", 21, 640, 2, 1, 0xFFFFFFFFu, 0, {21, 9, 15});
+    t_dwconv_items(5, 12, 1024, 9);
     /* Qwen3-ASR conv stages: NCFW in/out, f32 weights, GELU bf16; then other layouts/flags. */
     t_conv("Conv2dF32 qwen stage1", 2, 128, 100, 1, 48, 3, 2, 1, 1, 64 | 128 | (2 << 2) | (2 << 4));
     t_conv("Conv2dF32 qwen stage2", 2, 64, 50, 48, 64, 3, 2, 1, 1, 64 | 128 | (2 << 2) | (2 << 4));

@@ -664,14 +664,16 @@ G_K(g_causal_depthwise_conv1d_f32) {
     const float* x = PLOW_CPU_TEN(in, T, 1);
     const uint16_t* weight = PLOW_CPU_TEN(in, T, 2);
     const uint32_t rows = in->i[0], channels = in->i[1], kernel = in->i[2];
+    /* i3: rows per item (0 = one item); taps stop at the item's first row. */
+    const uint32_t item_rows = in->i[3] ? in->i[3] : rows;
     uint32_t lo, hi;
     g_range(rows * channels, slice, nblk, &lo, &hi);
     for (uint32_t index = lo; index < hi; index++) {
-        const uint32_t row = index / channels, channel = index % channels;
+        const uint32_t row = index / channels, channel = index % channels, item_row = row % item_rows;
         float sum = 0.0f;
         for (uint32_t tap = 0; tap < kernel; tap++) {
-            const int64_t source = (int64_t)row + tap + 1 - kernel;
-            if (source >= 0) sum += x[(size_t)source * channels + channel] *
+            const int64_t source = (int64_t)item_row + tap + 1 - kernel;
+            if (source >= 0) sum += x[(size_t)(row - item_row + source) * channels + channel] *
                                    f16_to_f32(weight[(size_t)channel * kernel + tap]);
         }
         out[index] = sum;
@@ -690,23 +692,35 @@ static float attention_score(const float* q, const float* k, const float* p,
 
 G_K(g_relative_attention_f32) {
     (void)ctx;
-    float* context = PLOW_CPU_TEN(in, T, 0);
-    const float* query = PLOW_CPU_TEN(in, T, 1);
-    const float* key = PLOW_CPU_TEN(in, T, 2);
-    const float* value = PLOW_CPU_TEN(in, T, 3);
+    float* context_items = PLOW_CPU_TEN(in, T, 0);
+    const float* query_items = PLOW_CPU_TEN(in, T, 1);
+    const float* key_items = PLOW_CPU_TEN(in, T, 2);
+    const float* value_items = PLOW_CPU_TEN(in, T, 3);
     const float* position = PLOW_CPU_TEN(in, T, 4);
     const float* bias_u = PLOW_CPU_TEN(in, T, 5);
     const float* bias_v = PLOW_CPU_TEN(in, T, 6);
     const uint32_t rows = in->i[0], width = in->i[1], heads = in->i[2];
     const uint32_t chunk = in->i[3], left_chunks = in->i[4], head_width = width / heads;
+    /* i6 items (0 = 1): q/k/v/context are [items][rows][width], each item its own sequence with its
+     * own t7 entry; the position rows are shared. */
+    const uint32_t items = in->i[6] ? in->i[6] : 1u;
     /* t7 (optional): chunked, keys before this row are not filled yet (a stream's first chunks);
      * full context, the valid rows of a padded bucket (later keys masked, later rows zero). */
-    const uint32_t t7 = in->t[7] != PLOW_TENSOR_NONE ? *(const uint32_t*)T[in->t[7]] : UINT32_MAX;
-    const uint32_t key0 = left_chunks != UINT32_MAX && t7 != UINT32_MAX ? t7 : 0u;
-    const uint32_t valid = left_chunks == UINT32_MAX && t7 < rows ? t7 : rows;
+    const uint32_t* starts = in->t[7] != PLOW_TENSOR_NONE ? (const uint32_t*)T[in->t[7]] : NULL;
     /* i5: only query rows from here on are wanted (a stream step's new rows). */
-    for (uint32_t item = in->i[5] * heads + slice; item < rows * heads; item += nblk) {
+    if (in->i[5] >= rows) return;
+    const uint32_t per_item = (rows - in->i[5]) * heads;
+    for (uint32_t unit = slice; unit < items * per_item; unit += nblk) {
+        const uint32_t b = unit / per_item, item = in->i[5] * heads + unit % per_item;
         const uint32_t qr = item / heads, head = item % heads;
+        const size_t base = (size_t)b * rows * width;
+        float* context = context_items + base;
+        const float* query = query_items + base;
+        const float* key = key_items + base;
+        const float* value = value_items + base;
+        const uint32_t t7 = starts ? starts[b] : UINT32_MAX;
+        const uint32_t key0 = left_chunks != UINT32_MAX && t7 != UINT32_MAX ? t7 : 0u;
+        const uint32_t valid = left_chunks == UINT32_MAX && t7 < rows ? t7 : rows;
         if (qr >= valid) {
             for (uint32_t col = 0; col < head_width; col++)
                 context[(size_t)qr * width + head * head_width + col] = 0.0f;

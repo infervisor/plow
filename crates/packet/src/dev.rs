@@ -1992,7 +1992,9 @@ pub enum DevOp {
     /// `t0=out t1=x` · `i0=rows i1=width`.
     GluF32 = 166,
     /// FP32 causal depthwise convolution with FP16 `[channels,kernel]` weights and zero left pad.
-    /// `t0=out t1=x t2=weight(f16)` · `i0=rows i1=channels i2=kernel`.
+    /// Rows come in items of `rows_per_item` (0 = one item); taps before an item's first row read
+    /// zero.
+    /// `t0=out t1=x t2=weight(f16)` · `i0=rows i1=channels i2=kernel i3=rows_per_item`.
     CausalDepthwiseConv1dF32 = 167,
     /// FP32 relative-position attention. Q/K/V/position/context are `[rows,width]`, position has
     /// `2*rows-1` rows, and u/v are `[heads,width/heads]`. `left_chunks = u32::MAX` selects full
@@ -2001,8 +2003,10 @@ pub enum DevOp {
     /// window); full attention: the valid rows of a padded input, so later keys are excluded and
     /// later context rows are written as zeros.
     /// `i5` (0 = all) skips the query rows before it; their context rows are not written.
+    /// `i6` items (0 = 1): Q/K/V/context are `[items,rows,width]`, each item its own sequence with
+    /// its own `t7` entry (`u32[items]`); the position rows are shared.
     /// `t0=context t1=query t2=key t3=value t4=position t5=bias_u t6=bias_v t7=key_start?` ·
-    /// `i0=rows i1=width i2=heads i3=chunk_size i4=left_chunks i5=query_row0`.
+    /// `i0=rows i1=width i2=heads i3=chunk_size i4=left_chunks i5=query_row0 i6=items`.
     RelativeAttentionF32 = 168,
     /// Elementwise FP32 SiLU: `out = x / (1 + exp(-x))`; output may alias input.
     /// `t0=out t1=x` · `i0=n`.
