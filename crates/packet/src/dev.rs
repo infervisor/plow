@@ -3265,6 +3265,11 @@ pub struct DevInst {
 /// of [`TENSOR_NONE`]; usable handles are `0..0xFFFE`.
 pub const TENSOR_NONE16: u16 = 0xFFFF;
 
+/// `QuantFp8` `i3` / `GemmFp8` `i5`: block-scaled FP8 (the published checkpoints' format): 1x128
+/// activation groups (`QuantFp8` writes f32 scales `[K/128][i4]`, `i4` = rows padded to 4) and
+/// 128x128 weight blocks (`GemmFp8` `t4` = f32 `[N/128][K/128]`). Runs on cuBLASLt only.
+pub const FP8_BLOCK_GROUP: u32 = 128;
+
 /// One instruction, WIRE format. Fixed 64-byte stride — no variable-length
 /// records on device. Byte-for-byte mirror of `PlowDevInst` in
 /// `runtime/common/dev_isa.h` (asserted by `tests/dev_abi.rs`).

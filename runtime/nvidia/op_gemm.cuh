@@ -2711,6 +2711,43 @@ static __device__ __forceinline__ void d_quant_fp8_cached(uint8_t* quantized, fl
 
 #endif
 
+/* Block-scaled FP8 activation quant (QuantFp8 i3 = 128): one warp per (row, 128-wide K group),
+ * f32 scale at gs[group * Rp + row] (the cuBLASLt VEC128_32F layout), Rp = rows padded to 4.
+ * Pad rows get zero bytes and scale so the padded GEMM rows stay finite. Scale and rounding
+ * follow vLLM per_token_group_quant_fp8: max(amax, 1e-10) / 448 and a true divide. */
+static __device__ void d_quant_fp8_group(uint8_t* __restrict__ xq, const __nv_bfloat16* __restrict__ x,
+                                         float* __restrict__ gs, unsigned M, unsigned K, unsigned Rp,
+                                         unsigned slice, unsigned nblk) {
+    const unsigned lane = threadIdx.x & PLOW_NV_LANE_MASK;
+    const unsigned warp = threadIdx.x >> PLOW_NV_WARP_SHIFT;
+    const unsigned groups = K >> 7;
+    for (unsigned w = slice * PLOW_NV_WARPS + warp; w < Rp * groups; w += nblk * PLOW_NV_WARPS) {
+        const unsigned row = w / groups, g = w - row * groups;
+        const size_t at = (size_t)row * K + g * 128u + lane * 4u;
+        if (row >= M) {
+            *reinterpret_cast<unsigned*>(xq + at) = 0u;
+            if (lane == 0) gs[g * Rp + row] = 0.0f;
+            continue;
+        }
+        const uint2 raw = *reinterpret_cast<const uint2*>(x + at);
+        const __nv_bfloat16* b = reinterpret_cast<const __nv_bfloat16*>(&raw);
+        float v[4], amax = 0.0f;
+#pragma unroll
+        for (int j = 0; j < 4; j++) {
+            v[j] = __bfloat162float(b[j]);
+            amax = fmaxf(amax, fabsf(v[j]));
+        }
+        amax = warp_max32(amax);
+        const float s = __fdiv_rn(fmaxf(amax, 1e-10f), 448.0f);
+        float q[4];
+#pragma unroll
+        for (int j = 0; j < 4; j++) q[j] = fminf(fmaxf(__fdiv_rn(v[j], s), -448.0f), 448.0f);
+        *reinterpret_cast<unsigned*>(xq + at) =
+            (unsigned)pack_fp8_e4m3(q[0], q[1]) | ((unsigned)pack_fp8_e4m3(q[2], q[3]) << 16);
+        if (lane == 0) gs[g * Rp + row] = s;
+    }
+}
+
 static __device__ void d_quant_fp8(uint8_t* __restrict__ xq, __nv_bfloat16* __restrict__ x,
                             float* __restrict__ ascale, unsigned M, unsigned K, unsigned slice,
                             unsigned nblk, const __nv_bfloat16* __restrict__ gate = nullptr,

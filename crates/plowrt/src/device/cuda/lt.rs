@@ -319,6 +319,7 @@ impl Lt {
         weight_scale: u64,
         input_scale: u64,
         fast_accum: bool,
+        block: bool,
     ) -> Result<Arc<Plan>> {
         self.be.bind()?;
         let mut plan = Plan {
@@ -331,7 +332,10 @@ impl Lt {
             algo: Algo::default(),
         };
         let mut raw = std::ptr::null_mut();
-        // CUDA 12.9: E4M3=28, BF16=14, OUTER_VEC_32F=3. A is W^T, B is X.
+        // CUDA 12.9: E4M3=28, BF16=14, OUTER_VEC_32F=3, VEC128_32F=4, BLK128x128_32F=5. A is W^T,
+        // B is X. Block route: weight scales [N/128][K/128], activation scales [K/128][m] (m
+        // padded to 4), measured exact against an f64 dequant on cuBLASLt 13.4 (sm_90).
+        let (a_mode, b_mode) = if block { (5, 4) } else { (3, 3) };
         // SAFETY: CUDA C ABI; Plan owns descriptors and the route retains the scale buffers.
         unsafe {
             check(
@@ -339,7 +343,7 @@ impl Lt {
                 "FP8 Lt descriptor",
             )?;
             plan.desc = raw as usize;
-            for (attr, value) in [(3, 1i32), (31, 3), (32, 3)] {
+            for (attr, value) in [(3, 1i32), (31, a_mode), (32, b_mode)] {
                 check(
                     (self.api.cublasLtMatmulDescSetAttribute)(
                         raw,
@@ -1603,8 +1607,10 @@ mod tests {
         be.upload(&weight, 0, &w)?;
         be.upload(&ws, 0, bytemuck::cast_slice(&scales))?;
         be.upload(&ws2, 0, bytemuck::cast_slice(&scales2))?;
-        let first = lt.fp8_plan(m as u32, n as u32, k as u32, ws.base, xs.base, false)?;
-        let second = lt.fp8_plan(m as u32, n as u32, k as u32, ws2.base, xs.base, false)?;
+        let first = lt.fp8_plan(m as u32, n as u32, k as u32, ws.base, xs.base, false, false)?;
+        let second = lt.fp8_plan(
+            m as u32, n as u32, k as u32, ws2.base, xs.base, false, false,
+        )?;
         for iteration in 1..=2 {
             let xscales: Vec<f32> = (0..m)
                 .map(|i| (1 + i % 8) as f32 * iteration as f32 / 16.0)

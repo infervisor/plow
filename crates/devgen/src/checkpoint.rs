@@ -188,6 +188,32 @@ fn shard_files(dir: &Path) -> Vec<PathBuf> {
             k.0
         );
     }
+    // Published checkpoints with their own shard names (Qwen3.8-27B-FP8: layers-N, mtp, outside):
+    // the index's file set, every file present.
+    if single.is_none() {
+        let index = dir.join("model.safetensors.index.json");
+        if let Ok(text) = std::fs::read_to_string(&index) {
+            let v: serde_json::Value =
+                serde_json::from_str(&text).unwrap_or_else(|e| panic!("{}: {e}", index.display()));
+            let files: std::collections::BTreeSet<&str> = v["weight_map"]
+                .as_object()
+                .unwrap_or_else(|| panic!("{}: no weight_map", index.display()))
+                .values()
+                .filter_map(serde_json::Value::as_str)
+                .collect();
+            let paths: Vec<PathBuf> = files.iter().map(|f| dir.join(f)).collect();
+            if let Some(missing) = paths.iter().find(|p| !p.is_file()) {
+                panic!(
+                    "{}: indexed shard {} missing",
+                    dir.display(),
+                    missing.display()
+                );
+            }
+            if !paths.is_empty() {
+                return paths;
+            }
+        }
+    }
     // THE fallback that was missing: single-file, no index (Gemma-4 12B).
     vec![single.unwrap_or_else(|| {
         panic!(

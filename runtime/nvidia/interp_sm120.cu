@@ -1614,6 +1614,11 @@ __device__ __forceinline__ void plow_exec(const PlowDevInst* in, void* const* T,
      * T16 classing v2: ALSO in the uni256 GEMM object — quant packets classed 8 merge the
      * [gate/up, gluquant, down] chain into ONE GEMM-class launch. */
     case PLOW_DOP_QUANT_FP8:
+        if (in->i[3]) {
+            d_quant_fp8_group((uint8_t*)TEN(0), (const __nv_bfloat16*)TEN(1), (float*)TEN(2),
+                              in->i[0], in->i[1], in->i[4], slice, nblk);
+            break;
+        }
         d_quant_fp8((uint8_t*)TEN(0), (__nv_bfloat16*)TEN(1), (float*)TEN(2), in->i[0],
                     in->i[1], slice, nblk, (const __nv_bfloat16*)TEN(3),
                     (const __nv_bfloat16*)TEN(4), in->i[2], arena);
@@ -2194,6 +2199,11 @@ __device__ __forceinline__ void plow_exec(const PlowDevInst* in, void* const* T,
 #if !PLOW_NV_PREFILL || PLOW_MIXED_STEP
 #if PLOW_NV_FP8_LT_DECODE && !PLOW_NV_PREFILL
     case PLOW_DOP_QUANT_FP8:
+        if (in->i[3]) {
+            d_quant_fp8_group((uint8_t*)TEN(0), (const __nv_bfloat16*)TEN(1), (float*)TEN(2),
+                              in->i[0], in->i[1], in->i[4], slice, nblk);
+            break;
+        }
         d_quant_fp8((uint8_t*)TEN(0), (__nv_bfloat16*)TEN(1), (float*)TEN(2),
             in->i[0], in->i[1], slice, nblk, (const __nv_bfloat16*)TEN(3),
             (const __nv_bfloat16*)TEN(4), in->i[2], arena);
@@ -2206,7 +2216,7 @@ __device__ __forceinline__ void plow_exec(const PlowDevInst* in, void* const* T,
  * body needs the 256-thread two-warpgroup layout and its staging ring in the arena. */
 #if !PLOW_NV_FP8_LT_DECODE
     case PLOW_DOP_QUANT_FP8:
-        if (!in->i[0] || in->i[0] > PGM90_FP8_DECODE_ROWS) { __trap(); break; }
+        if (!in->i[0] || in->i[0] > PGM90_FP8_DECODE_ROWS || in->i[3]) { __trap(); break; }
         d_quant_fp8((uint8_t*)TEN(0), (__nv_bfloat16*)TEN(1), (float*)TEN(2),
             in->i[0], in->i[1], slice, nblk);
         break;
@@ -3240,6 +3250,7 @@ __device__ __forceinline__ void plow_ws384_role_loop(const PlowProgram& prog, ui
 #if !PLOW_NV_SEG_M64N64 && !PLOW_NV_SEG_M64N128
         case PLOW_DOP_QUANT_FP8: {
             /* T36: consumer-warpgroup quant (producer skips) — quant packets classed 8. */
+            if (in->i[3]) { __trap(); break; } /* block-scaled groups: interpreter arms only */
             const unsigned nblk = in->blocks ? in->blocks : nblk_grid;
             d_quant_fp8_ws384<PROD>((uint8_t*)T[in->t[0]], (__nv_bfloat16*)T[in->t[1]],
                                     (float*)T[in->t[2]], in->i[0], in->i[1], e.slice, nblk,
@@ -4086,6 +4097,7 @@ extern "C" __global__ void __launch_bounds__(PLOW_NV_THREADS) PLOW_SYM(plow_sm12
         break;
 #if PLOW_NV_LIGHT_FP8_ATTN && PLOW_NV_W8A8
     case PLOW_DOP_QUANT_FP8:
+        if (in->i[3]) { __trap(); break; }
         d_quant_fp8((uint8_t*)LIGHT_TEN(0), (__nv_bfloat16*)LIGHT_TEN(1),
                     (float*)LIGHT_TEN(2), in->i[0], in->i[1], slice, nblk,
                     nullptr, nullptr, 0, part);
@@ -4173,6 +4185,11 @@ extern "C" __global__ void __launch_bounds__(PLOW_NV_THREADS)
 #endif
 #if PLOW_NV_FP8_LT_DECODE && !PLOW_NV_PREFILL
     case PLOW_DOP_QUANT_FP8:
+        if (in->i[3]) {
+            d_quant_fp8_group((uint8_t*)LR_TEN(0), (const __nv_bfloat16*)LR_TEN(1),
+                              (float*)LR_TEN(2), in->i[0], in->i[1], in->i[4], slice, nblk);
+            break;
+        }
         d_quant_fp8((uint8_t*)LR_TEN(0), (__nv_bfloat16*)LR_TEN(1), (float*)LR_TEN(2),
             in->i[0], in->i[1], slice, nblk, (const __nv_bfloat16*)LR_TEN(3),
             (const __nv_bfloat16*)LR_TEN(4), in->i[2], arena);
