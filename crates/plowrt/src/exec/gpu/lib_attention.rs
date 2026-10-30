@@ -21,7 +21,7 @@
 //! One table upload per launch (`begin_launch`): cu_seqlens_q, kv lengths, the page table and the
 //! gather list; every routed site of the launch reuses it.
 
-use super::fa4_sm90::{Call, Fa4, Geometry};
+use super::fa4_sm90::{Call, Fa4, Geometry, ADAPTERS};
 use super::*;
 use crate::asset::devblob::{DevProg, DevTensor};
 use crate::device::cuda::aot::Image;
@@ -378,7 +378,73 @@ const PT_OFF: u64 = GATHER_OFF + POOL_PAGES as u64 * 12;
 /// The page table holds at most every pool page once per request row width.
 const TABLE_BYTES: u64 = PT_OFF + MAX_REQUESTS as u64 * POOL_PAGES as u64 * 4;
 
+/// The declared object's bytes against the declaration: hash, ABI, container, entry roles and the
+/// adapter ABI. Host only.
+fn check_object(
+    bytes: Vec<u8>,
+    object: &SegmentObject,
+) -> std::result::Result<(Image, LibraryAbi), String> {
+    if object.sha256.as_deref() != Some(plow_asset::decode_objects::image_sha256(&bytes).as_str()) {
+        return Err("library attention object hash mismatch".into());
+    }
+    let declared = LibraryAbi::parse(&object.abi)
+        .ok_or_else(|| format!("library attention ABI {} unsupported", object.abi))?;
+    let image = Image::parse(bytes).map_err(|e| e.to_string())?;
+    if image.manifest.abi != object.abi {
+        return Err(format!(
+            "object states {}; the packet declares {}",
+            image.manifest.abi, object.abi
+        ));
+    }
+    let adapters = image.entry(ADAPTERS).map_err(|e| e.to_string())?;
+    if adapters.role != "adapters" {
+        return Err(format!("{ADAPTERS} role {}", adapters.role));
+    }
+    check_adapter_abi(image.blob(adapters).map_err(|e| e.to_string())?)?;
+    Ok((image, declared))
+}
+
+/// Reads and checks the declared object and loads its FA4 entries (every kernel entry hash-,
+/// layout-, launch-config- and exemplar-checked).
+fn open(
+    be: &Arc<CudaBackend>,
+    assets_dir: &Path,
+    object: &SegmentObject,
+) -> Result<(std::path::PathBuf, Image, LibraryAbi, Fa4)> {
+    let library = assets_dir.join(&object.file);
+    let rejected = |why: String| RuntimeError::Rejected(format!("{}: {why}", library.display()));
+    let bytes = std::fs::read(&library).map_err(|e| rejected(e.to_string()))?;
+    let (image, declared) = check_object(bytes, object).map_err(rejected)?;
+    be.bind()?;
+    let fa4 = Fa4::load(
+        be,
+        &image,
+        Geometry {
+            head_dim: declared.head_dim,
+            heads: declared.heads,
+            f16: declared.f16,
+        },
+    )?;
+    Ok((library, image, declared, fa4))
+}
+
 impl LibAttention {
+    /// Checks the declared object as `load` does when no site routes to it (`PLOW_PF_ATTN_LIBRARY=0`):
+    /// a packet never carries an object the runtime would refuse.
+    pub(super) fn validate(
+        be: &Arc<CudaBackend>,
+        assets_dir: &Path,
+        object: &SegmentObject,
+    ) -> Result<()> {
+        let (library, _, _, mut fa4) = open(be, assets_dir, object)?;
+        fa4.unload(be)?;
+        tracing::info!(
+            library = %library.display(),
+            "library prefill attention object validated; no site routes to it"
+        );
+        Ok(())
+    }
+
     /// The packet's declared library object (`assets_dir`-relative), hash- and ABI-checked.
     pub(super) fn load(
         be: &Arc<CudaBackend>,
@@ -388,43 +454,9 @@ impl LibAttention {
         direct: Option<Direct>,
         cache: Cache,
     ) -> Result<Self> {
-        let library = assets_dir.join(&object.file);
-        let image = std::fs::read(&library)
-            .map_err(|e| RuntimeError::Rejected(format!("{}: {e}", library.display())))?;
-        if object.sha256.as_deref()
-            != Some(plow_asset::decode_objects::image_sha256(&image).as_str())
-        {
-            return Err(RuntimeError::Rejected(format!(
-                "{}: library attention object hash mismatch",
-                library.display()
-            )));
-        }
-        let declared = LibraryAbi::parse(&object.abi).ok_or_else(|| {
-            RuntimeError::Rejected(format!("library attention ABI {} unsupported", object.abi))
-        })?;
-        let image = Image::parse(image)?;
-        if image.manifest.abi != object.abi {
-            return Err(RuntimeError::Rejected(format!(
-                "{}: object states {}; the packet declares {}",
-                library.display(),
-                image.manifest.abi,
-                object.abi
-            )));
-        }
-        be.bind()?;
-        let fa4 = Fa4::load(
-            be,
-            &image,
-            Geometry {
-                head_dim: declared.head_dim,
-                heads: declared.heads,
-                f16: declared.f16,
-            },
-        )?;
+        let (library, image, declared, fa4) = open(be, assets_dir, object)?;
         let adapters = {
-            let blob = image.blob(image.entry("kv_adapters")?)?;
-            check_adapter_abi(blob)
-                .map_err(|why| RuntimeError::Rejected(format!("{}: {why}", library.display())))?;
+            let blob = image.blob(image.entry(ADAPTERS)?)?;
             let module = be.module_load(blob)?;
             let f = |name: &str| be.get_function(&module, name);
             Adapters {
@@ -908,6 +940,59 @@ mod tests {
         // A request the planner would fall back on does not hide a later one outside the cache.
         assert!(cache.check_all(&[[0, 0, 0, 0], [0, 1, 4, 1]]).is_err());
         assert!(cache.check_all(&[[0, 1, 0, 1], [1, 1, 3, 8192]]).is_ok());
+    }
+
+    /// A PLOWAOT1 container with `kv_adapters` (role `role`) holding `blob`.
+    fn container(abi: &str, role: &str, blob: &[u8]) -> Vec<u8> {
+        let manifest = serde_json::json!({
+            "format": 1, "host_stub": "fa4_sm90_fwd", "host_stub_version": 1,
+            "upstream": {}, "abi": abi,
+            "entries": [{
+                "name": "kv_adapters", "role": role, "kv_heads": 0, "symbol": "", "params": [],
+                "sha256": plow_asset::decode_objects::image_sha256(blob),
+                "offset": 0, "bytes": blob.len(), "exemplars": [],
+            }],
+        })
+        .to_string();
+        let mut out = b"PLOWAOT1".to_vec();
+        out.extend_from_slice(&(manifest.len() as u32).to_le_bytes());
+        out.extend_from_slice(manifest.as_bytes());
+        out.extend_from_slice(blob);
+        out
+    }
+
+    #[test]
+    fn declared_object_is_checked_against_the_declaration() {
+        const ABI: &str =
+            "lib_flash_prefill_v2:fa4:hd=512:heads=16:kv_heads=1,2:layout=head_major:dtype=bf16";
+        let declare = |bytes: &[u8], abi: &str| SegmentObject {
+            abi: abi.into(),
+            file: "plow_fa4_hd512.aot".into(),
+            sha256: Some(plow_asset::decode_objects::image_sha256(bytes)),
+            promote_k512: None,
+            attention: None,
+            gemm: None,
+            decode_plan: None,
+        };
+        let check = |bytes: Vec<u8>, object: &SegmentObject| match check_object(bytes, object) {
+            Ok(_) => String::new(),
+            Err(why) => why,
+        };
+        let bytes = container(ABI, "adapters", b"not a cubin");
+        // Reaches the adapter ABI check, which a non-cubin blob fails.
+        assert!(check(bytes.clone(), &declare(&bytes, ABI)).contains("plow_kv_dequant_abi"));
+        let mut object = declare(&bytes, ABI);
+        object.sha256 = None;
+        assert!(check(bytes.clone(), &object).contains("hash"));
+        let mut tampered = bytes.clone();
+        *tampered.last_mut().unwrap() ^= 1;
+        assert!(check(tampered, &declare(&bytes, ABI)).contains("hash"));
+        let other = ABI.replace("heads=16", "heads=8");
+        let restated = container(&other, "adapters", b"not a cubin");
+        assert!(check(restated.clone(), &declare(&restated, ABI)).contains("declares"));
+        assert!(check(bytes.clone(), &declare(&bytes, "fa4:v1")).contains("unsupported"));
+        let renamed = container(ABI, "whole", b"not a cubin");
+        assert!(check(renamed.clone(), &declare(&renamed, ABI)).contains("role"));
     }
 
     #[test]

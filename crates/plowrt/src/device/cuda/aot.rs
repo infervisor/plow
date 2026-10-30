@@ -123,6 +123,41 @@ impl Image {
     }
 }
 
+/// What the driver reports for a loaded function, after its exemplar attributes are applied.
+pub(crate) struct FuncLimits {
+    pub(crate) max_threads: u32,
+    pub(crate) max_dynamic_smem: u32,
+    pub(crate) static_smem: u32,
+    pub(crate) smem_optin: u32,
+}
+
+/// A captured launch configuration the function can actually take; the host stub launches with it.
+pub(crate) fn check_config(
+    block: [u32; 3],
+    smem: u32,
+    l: &FuncLimits,
+) -> std::result::Result<(), String> {
+    let threads = block
+        .iter()
+        .try_fold(1u64, |n, &b| n.checked_mul(u64::from(b)))
+        .unwrap_or(u64::MAX);
+    if threads == 0 || threads > u64::from(l.max_threads) {
+        return Err(format!(
+            "block {block:?} outside the function's {} threads",
+            l.max_threads
+        ));
+    }
+    if smem > l.max_dynamic_smem
+        || u64::from(smem) + u64::from(l.static_smem) > u64::from(l.smem_optin)
+    {
+        return Err(format!(
+            "dynamic smem {smem} B (+ static {} B) outside the function's {} B / device {} B",
+            l.static_smem, l.max_dynamic_smem, l.smem_optin
+        ));
+    }
+    Ok(())
+}
+
 /// One loaded kernel with its parameter layout and the launch attributes its exemplars carry.
 pub(crate) struct Kernel {
     pub(crate) f: KernelFn,
@@ -168,6 +203,17 @@ impl Kernel {
         }
         for &[attribute, value] in &first.kernel_attrs {
             be.set_function_attribute(f, attribute, value)?;
+        }
+        let attribute = |a| be.function_attribute(f, a).map(|v| v.max(0) as u32);
+        let limits = FuncLimits {
+            max_threads: attribute(super::FUNC_ATTR_MAX_THREADS_PER_BLOCK)?,
+            max_dynamic_smem: attribute(super::FUNC_ATTR_MAX_DYNAMIC_SHARED_SIZE_BYTES)?,
+            static_smem: attribute(super::FUNC_ATTR_SHARED_SIZE_BYTES)?,
+            smem_optin: be.smem_optin(),
+        };
+        for x in &e.exemplars {
+            check_config(x.block, x.smem, &limits)
+                .map_err(|why| RuntimeError::Rejected(format!("AOT kernel {}: {why}", e.name)))?;
         }
         Ok(Kernel {
             f,
@@ -379,5 +425,32 @@ impl Launch {
             }
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn launch_config_must_fit_the_function() {
+        let l = FuncLimits {
+            max_threads: 384,
+            max_dynamic_smem: 232_448,
+            static_smem: 0,
+            smem_optin: 232_448,
+        };
+        assert!(check_config([384, 1, 1], 205_824, &l).is_ok());
+        assert!(check_config([385, 1, 1], 0, &l).is_err());
+        assert!(check_config([128, 4, 1], 0, &l).is_err());
+        assert!(check_config([0, 1, 1], 0, &l).is_err());
+        assert!(check_config([u32::MAX, u32::MAX, u32::MAX], 0, &l).is_err());
+        assert!(check_config([256, 1, 1], 232_449, &l).is_err());
+        let fixed = FuncLimits {
+            static_smem: 1024,
+            ..l
+        };
+        assert!(check_config([256, 1, 1], 231_424, &fixed).is_ok());
+        assert!(check_config([256, 1, 1], 231_425, &fixed).is_err());
     }
 }

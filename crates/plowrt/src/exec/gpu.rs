@@ -6838,7 +6838,11 @@ impl GpuEngine {
                     cache,
                 )?)
             }
-            _ => None,
+            Some(object) => {
+                lib_attention::LibAttention::validate(&be, assets_dir, object)?;
+                None
+            }
+            None => None,
         };
 
         let mut packet_roles: [Option<PacketRole>; plow_asset::segment_roles::MAX_ROLE as usize] =

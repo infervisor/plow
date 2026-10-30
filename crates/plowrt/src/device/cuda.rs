@@ -141,8 +141,9 @@ const ATTR_MAX_SHARED_MEMORY_PER_BLOCK_OPTIN: i32 = 97;
 /// same copy degrades to fault-driven migration.
 const ATTR_PAGEABLE_USES_HOST_PAGE_TABLES: i32 = 100;
 // CUfunction_attribute.
-const FUNC_ATTR_SHARED_SIZE_BYTES: i32 = 1;
-const FUNC_ATTR_MAX_DYNAMIC_SHARED_SIZE_BYTES: i32 = 8;
+pub(crate) const FUNC_ATTR_MAX_THREADS_PER_BLOCK: i32 = 0;
+pub(crate) const FUNC_ATTR_SHARED_SIZE_BYTES: i32 = 1;
+pub(crate) const FUNC_ATTR_MAX_DYNAMIC_SHARED_SIZE_BYTES: i32 = 8;
 /// `plow_small_copy` (shares the block store's embedded PTX).
 const SMALL_COPY_PTX: &str = include_str!("../../../../runtime/nvidia/kv_segcopy.ptx");
 /// Largest engine copy `plow_small_copy` takes instead of a cuMemcpy.
@@ -1104,6 +1105,23 @@ impl CudaBackend {
             self.check(rc, "cuFuncGetParamInfo")?;
             out.push((offset, size));
         }
+    }
+
+    /// `cuFuncGetAttribute(attribute, f)` (CUfunction_attribute ids).
+    pub fn function_attribute(&self, f: KernelFn, attribute: i32) -> Result<i32> {
+        self.bind()?;
+        let mut v = 0i32;
+        // SAFETY: valid function handle; `v` outlives the call.
+        self.check(
+            unsafe { (self.api.cuFuncGetAttribute)(&mut v, attribute, f.0 as CUfunction) },
+            "cuFuncGetAttribute",
+        )?;
+        Ok(v)
+    }
+
+    /// The device's per-block shared memory opt-in limit (static + dynamic).
+    pub fn smem_optin(&self) -> u32 {
+        self.smem_optin
     }
 
     /// `cuFuncSetAttribute(f, attribute, value)` (CUfunction_attribute ids).
