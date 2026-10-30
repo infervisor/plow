@@ -59,6 +59,7 @@ use parking_lot::{Mutex, RwLock};
 use rustc_hash::FxHashMap;
 
 use crate::asset::devblob::DevBlob;
+#[cfg(feature = "cuda")]
 use crate::device::cuda::CudaBackend;
 use crate::memory::vmm::VmmOps;
 use crate::serve::mux::{self, MuxConfig};
@@ -224,6 +225,7 @@ impl BlobPlan {
         for t in &blob.tensors {
             plan.add(&t.name, t.bytes);
         }
+        #[cfg(feature = "cuda")]
         if let Some((granularity, capability)) = device_vmm {
             let config = crate::config::RuntimeConfig::get();
             let manifest = match narrowed {
@@ -346,6 +348,8 @@ impl BlobPlan {
                 })? + crate::memory::vmm::kv_pool_cap();
             }
         }
+        #[cfg(not(feature = "cuda"))]
+        let _ = (device_vmm, checkpoint, narrowed);
         Ok(plan)
     }
 }
@@ -367,8 +371,8 @@ fn sidecar_bytes(pkt: &Path) -> Result<u64> {
     let mut total = 0u64;
     for (key, legacy) in [
         ("encoder.packet", "encoder.pkt"),
-        ("codec.packet", crate::tts::codec::PACKET),
-        ("vocoder.packet", crate::tts::guided_speech::VOCODER),
+        ("codec.packet", "codec.pkt"),
+        ("vocoder.packet", "s3gen.pkt"),
     ] {
         let name = match &asset {
             Some(asset) => asset.stage_file(key, legacy)?,
@@ -503,12 +507,211 @@ impl std::fmt::Display for EnsureError {
     }
 }
 
+/// The device abstraction required by [`ModelManager`].
+pub trait ManagerDevice: Send + Sync {
+    /// Device ordinal (GPU index).
+    fn device_ordinal(&self) -> u8;
+    /// Available and total device memory in bytes.
+    fn mem_info(&self) -> Result<(u64, u64)>;
+    /// Allocation granularity in bytes.
+    fn granularity(&self) -> Result<u64>;
+    /// Compute capability `(major, minor)`, or `None` if non-CUDA.
+    fn compute_capability(&self) -> Option<(u32, u32)>;
+    /// Bytes in physical chunk pool.
+    fn pool_bytes(&self) -> u64;
+    /// Trim chunk pool to `keep_bytes`.
+    fn pool_trim(&self, keep_bytes: u64) -> u64;
+    /// Load an engine for `dir` and `ckpt`.
+    fn load_engine(
+        &self,
+        dir: &Path,
+        ckpt: &Path,
+    ) -> Result<crate::serve::engine::ServeEngine>;
+    /// Check whether sibling packets are resident.
+    fn is_sibling_resident(&self, dir: &Path) -> bool;
+    /// Whether this device backend supports tensor parallelism.
+    fn supports_tp(&self) -> bool {
+        false
+    }
+}
+
+#[cfg(feature = "cuda")]
+pub struct CudaManagerDevice {
+    be: Arc<CudaBackend>,
+}
+
+#[cfg(feature = "cuda")]
+impl CudaManagerDevice {
+    pub fn new(be: Arc<CudaBackend>) -> Self {
+        Self { be }
+    }
+}
+
+#[cfg(feature = "cuda")]
+impl ManagerDevice for CudaManagerDevice {
+    fn device_ordinal(&self) -> u8 {
+        self.be.device_ordinal
+    }
+    fn mem_info(&self) -> Result<(u64, u64)> {
+        self.be.mem_info()
+    }
+    fn granularity(&self) -> Result<u64> {
+        self.be.granularity()
+    }
+    fn compute_capability(&self) -> Option<(u32, u32)> {
+        Some(self.be.compute_capability())
+    }
+    fn pool_bytes(&self) -> u64 {
+        VmmOps::pool_bytes(&*self.be)
+    }
+    fn pool_trim(&self, keep_bytes: u64) -> u64 {
+        VmmOps::pool_trim(&*self.be, keep_bytes)
+    }
+    fn load_engine(
+        &self,
+        dir: &Path,
+        ckpt: &Path,
+    ) -> Result<crate::serve::engine::ServeEngine> {
+        let be = Arc::clone(&self.be);
+        let mut engine = crate::exec::gpu::GpuEngine::load(be, dir, ckpt)?;
+        if crate::config::RuntimeConfig::get().nv.spec {
+            match engine.spec_serve_enable(dir) {
+                Ok(limits) => tracing::info!(?limits, "speculative decoding on"),
+                Err(e) => tracing::warn!(error = %e, "PLOW_SPEC set but speculative decoding unavailable"),
+            }
+        }
+        Ok(crate::serve::engine::ServeEngine::Cuda(engine))
+    }
+    fn is_sibling_resident(&self, dir: &Path) -> bool {
+        crate::exec::gpu::packet_exec::resident_in(dir, self.be.device_ordinal)
+    }
+}
+
+#[cfg(feature = "hsa")]
+pub struct HsaManagerDevice {
+    be: Arc<crate::device::hsa::HsaBackend>,
+}
+
+#[cfg(feature = "hsa")]
+impl HsaManagerDevice {
+    pub fn new(be: Arc<crate::device::hsa::HsaBackend>) -> Self {
+        Self { be }
+    }
+}
+
+#[cfg(feature = "hsa")]
+impl ManagerDevice for HsaManagerDevice {
+    fn device_ordinal(&self) -> u8 {
+        self.be.device_ordinal
+    }
+    fn mem_info(&self) -> Result<(u64, u64)> {
+        let free = self.be.free_bytes().unwrap_or(0);
+        let total = self.be.vram_bytes();
+        Ok((free, total))
+    }
+    fn granularity(&self) -> Result<u64> {
+        self.be.granularity()
+    }
+    fn compute_capability(&self) -> Option<(u32, u32)> {
+        None
+    }
+    fn pool_bytes(&self) -> u64 {
+        VmmOps::pool_bytes(&*self.be)
+    }
+    fn pool_trim(&self, keep_bytes: u64) -> u64 {
+        VmmOps::pool_trim(&*self.be, keep_bytes)
+    }
+    fn load_engine(
+        &self,
+        dir: &Path,
+        ckpt: &Path,
+    ) -> Result<crate::serve::engine::ServeEngine> {
+        let blob = crate::asset::devblob::DevBlob::find_in_dir(dir)?
+            .ok_or_else(|| RuntimeError::Msg(format!("no blob in {}", dir.display())))?;
+        let hsaco = crate::config::RuntimeConfig::get()
+            .amd
+            .hsaco
+            .clone()
+            .map(PathBuf::from)
+            .unwrap_or_else(|| {
+                let own = dir.join("hsaco");
+                if own.is_dir() {
+                    own
+                } else {
+                    dir.to_path_buf()
+                }
+            });
+        let first = self.be.device_ordinal;
+        let engine = crate::serve::engine::AmdServe::load_on(&blob, &hsaco, Some(ckpt), first)?;
+        Ok(crate::serve::engine::ServeEngine::Amd(engine))
+    }
+    fn is_sibling_resident(&self, _dir: &Path) -> bool {
+        false
+    }
+    fn supports_tp(&self) -> bool {
+        true
+    }
+}
+
+pub struct HostManagerDevice {
+    ordinal: u8,
+}
+
+impl HostManagerDevice {
+    pub fn new() -> Self {
+        Self { ordinal: 0 }
+    }
+
+    pub fn with_ordinal(ordinal: u8) -> Self {
+        Self { ordinal }
+    }
+}
+
+impl Default for HostManagerDevice {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl ManagerDevice for HostManagerDevice {
+    fn device_ordinal(&self) -> u8 {
+        self.ordinal
+    }
+    fn mem_info(&self) -> Result<(u64, u64)> {
+        Ok((32 * 1024 * 1024 * 1024, 64 * 1024 * 1024 * 1024))
+    }
+    fn granularity(&self) -> Result<u64> {
+        Ok(4096)
+    }
+    fn compute_capability(&self) -> Option<(u32, u32)> {
+        None
+    }
+    fn pool_bytes(&self) -> u64 {
+        0
+    }
+    fn pool_trim(&self, _keep_bytes: u64) -> u64 {
+        0
+    }
+    fn load_engine(
+        &self,
+        _dir: &Path,
+        _ckpt: &Path,
+    ) -> Result<crate::serve::engine::ServeEngine> {
+        Err(RuntimeError::Rejected(
+            "Host/CPU dynamic engine loading not yet supported".into(),
+        ))
+    }
+    fn is_sibling_resident(&self, _dir: &Path) -> bool {
+        false
+    }
+}
+
 /// The S1 model manager: residency, planner, switch orchestration.
 pub struct ModelManager {
     /// `Weak` breaks the `AppState ↔ manager` cycle; the state outlives every
     /// request, so upgrades only fail during process teardown.
     state: Weak<AppState>,
-    be: Arc<CudaBackend>,
+    device: Arc<dyn ManagerDevice>,
     mux_cfg: MuxConfig,
     /// Registered models. Behind a lock because the control plane registers
     /// new assets dirs while the server is live; cloned out of the lock at every
@@ -537,6 +740,7 @@ impl ModelManager {
     /// Build the manager for `(slug, assets dir, checkpoint dir)` triples —
     /// every registered bundle that ships a PLOWDEV blob. Parses each blob's
     /// plan up front (startup-only file reads).
+    #[cfg(feature = "cuda")]
     pub fn new(
         be: Arc<CudaBackend>,
         state: &Arc<AppState>,
@@ -544,14 +748,35 @@ impl ModelManager {
         models: Vec<(String, PathBuf, PathBuf)>,
         budget: Option<u64>,
     ) -> Result<ModelManager> {
+        Self::with_device(Arc::new(CudaManagerDevice::new(be)), state, mux_cfg, models, budget)
+    }
+
+    #[cfg(feature = "hsa")]
+    pub fn from_hsa(
+        be: Arc<crate::device::hsa::HsaBackend>,
+        state: &Arc<AppState>,
+        mux_cfg: MuxConfig,
+        models: Vec<(String, PathBuf, PathBuf)>,
+        budget: Option<u64>,
+    ) -> Result<ModelManager> {
+        Self::with_device(Arc::new(HsaManagerDevice::new(be)), state, mux_cfg, models, budget)
+    }
+
+    /// Build the manager over any device implementing [`ManagerDevice`].
+    pub fn with_device(
+        device: Arc<dyn ManagerDevice>,
+        state: &Arc<AppState>,
+        mux_cfg: MuxConfig,
+        models: Vec<(String, PathBuf, PathBuf)>,
+        budget: Option<u64>,
+    ) -> Result<ModelManager> {
         let mut managed = Vec::with_capacity(models.len());
         for (slug, dir, ckpt) in models {
-            check_single_device(&slug, &dir)?;
-            let plan = BlobPlan::from_dir_with_device(
-                &dir,
-                Some((be.granularity()?, be.compute_capability())),
-                Some(&ckpt),
-            )?;
+            check_device_tp(&*device, &slug, &dir)?;
+            let vmm = device
+                .compute_capability()
+                .and_then(|cap| device.granularity().ok().map(|g| (g, cap)));
+            let plan = BlobPlan::from_dir_with_device(&dir, vmm, Some(&ckpt))?;
             tracing::info!(
                 %slug,
                 weights_gib = gib(plan.weights_bytes),
@@ -580,7 +805,7 @@ impl ModelManager {
         }
         Ok(ModelManager {
             state: Arc::downgrade(state),
-            be,
+            device,
             mux_cfg,
             models: RwLock::new(managed),
             switch: tokio::sync::Mutex::new(()),
@@ -626,12 +851,12 @@ impl ModelManager {
                 dir.display()
             )));
         }
-        check_single_device(slug, &dir)?;
-        let plan = BlobPlan::from_dir_with_device(
-            &dir,
-            Some((self.be.granularity()?, self.be.compute_capability())),
-            Some(&ckpt),
-        )?;
+        check_device_tp(&*self.device, slug, &dir)?;
+        let vmm = self
+            .device
+            .compute_capability()
+            .and_then(|cap| self.device.granularity().ok().map(|g| (g, cap)));
+        let plan = BlobPlan::from_dir_with_device(&dir, vmm, Some(&ckpt))?;
         tracing::info!(
             %slug,
             dir = %dir.display(),
@@ -674,18 +899,18 @@ impl ModelManager {
 
     /// The device this manager's engines and their sibling packets run on.
     pub fn ordinal(&self) -> u8 {
-        self.be.device_ordinal
+        self.device.device_ordinal()
     }
 
     /// The device ordinals this manager's group covers. One today (a manager
     /// owns one backend); a tensor-parallel group would report its whole run.
     pub fn ordinals(&self) -> Vec<u32> {
-        vec![u32::from(self.be.device_ordinal)]
+        vec![u32::from(self.device.device_ordinal())]
     }
 
     /// Device free/total bytes, for capacity reporting on the control plane.
     pub fn device_mem_info(&self) -> Result<(u64, u64)> {
-        self.be.mem_info()
+        self.device.mem_info()
     }
 
     /// The parsed plan for `slug` (tests / capacity reporting).
@@ -800,7 +1025,7 @@ impl ModelManager {
     /// Effective free VRAM under the optional budget cap: with a budget B on a
     /// card of total T, pretend the card has only B — free' = free − (T − B).
     fn free_vram(&self) -> Result<u64> {
-        let (free, total) = self.be.mem_info()?;
+        let (free, total) = self.device.mem_info()?;
         Ok(match self.budget {
             Some(b) if b < total => free.saturating_sub(total - b),
             _ => free,
@@ -815,7 +1040,7 @@ impl ModelManager {
 
     /// The device (or budget) less every resident model's planned requirement.
     fn planned_headroom(&self) -> Result<u64> {
-        let (_, total) = self.be.mem_info()?;
+        let (_, total) = self.device.mem_info()?;
         let cap = self.budget.map_or(total, |b| b.min(total));
         let overhead = self.overhead.lock();
         let planned: u64 = self
@@ -953,7 +1178,7 @@ impl ModelManager {
         let reusable_cap = m.plan.slab_reusable();
         loop {
             loop {
-                let trimmed = VmmOps::pool_trim(&*self.be, reusable_cap);
+                let trimmed = self.device.pool_trim(reusable_cap);
                 if trimmed > 0 {
                     tracing::info!(
                         trimmed_mib = trimmed >> 20,
@@ -961,7 +1186,7 @@ impl ModelManager {
                     );
                 }
                 let avail = self
-                    .fit_capacity(VmmOps::pool_bytes(&*self.be))
+                    .fit_capacity(self.device.pool_bytes())
                     .map_err(EnsureError::Load)?;
                 if avail >= need {
                     break;
@@ -1000,7 +1225,7 @@ impl ModelManager {
                 Err(e) => return Err(e),
             }
         }
-        let (free, total) = self.be.mem_info().map_err(EnsureError::Load)?;
+        let (free, total) = self.device.mem_info().map_err(EnsureError::Load)?;
         report.vram_used = total - free;
         tracing::info!(
             %slug,
@@ -1052,13 +1277,28 @@ impl ModelManager {
         slug: &str,
         deregister: bool,
     ) -> std::result::Result<UnloadReport, EnsureError> {
+        self.unload_with_drain(slug, deregister, None).await
+    }
+
+    /// Unload this model with an optional graceful drain bound. `None` stops in-flight work
+    /// immediately; `Some(bound)` lets in-flight generations drain up to `bound`.
+    pub async fn unload_with_drain(
+        &self,
+        slug: &str,
+        deregister: bool,
+        drain: Option<Duration>,
+    ) -> std::result::Result<UnloadReport, EnsureError> {
         if deregister && self.state()?.dp_rank(slug).is_some() {
             return Err(EnsureError::Load(RuntimeError::Rejected(format!(
                 "{slug} is a DP rank; deregister its model instead"
             ))));
         }
+        let stop = match drain {
+            Some(bound) => Stop::Bounded(bound),
+            None => Stop::Now,
+        };
         let _g = self.switch.lock().await;
-        let report = self.unload_locked(slug, Stop::Now).await?;
+        let report = self.unload_locked(slug, stop).await?;
         if deregister {
             let state = self.state()?;
             let _ = state.registry.unload(slug);
@@ -1083,10 +1323,10 @@ impl ModelManager {
         // window rather than merely narrowing it.
         state.set_residency(slug, crate::serve::Residency::Unloading);
 
-        let (free_before, _) = self.be.mem_info().map_err(EnsureError::Load)?;
+        let (free_before, _) = self.device.mem_info().map_err(EnsureError::Load)?;
         let (stop_ms, unload_ms) = self.evict(slug, stop).await?;
-        let pool_trimmed = VmmOps::pool_trim(&*self.be, 0);
-        let (free_after, _) = self.be.mem_info().map_err(EnsureError::Load)?;
+        let pool_trimmed = self.device.pool_trim(0);
+        let (free_after, _) = self.device.mem_info().map_err(EnsureError::Load)?;
 
         state.set_residency(slug, crate::serve::Residency::Unloaded);
         self.last_use.lock().remove(slug);
@@ -1159,9 +1399,9 @@ impl ModelManager {
         let need = self.required(slug).expect("managed") + RESERVE;
         // Same accounting as the switch path: chunks the incoming slab cannot
         // consume have to be real free memory before the load.
-        VmmOps::pool_trim(&*self.be, m.plan.slab_reusable());
+        self.device.pool_trim(m.plan.slab_reusable());
         let avail = self
-            .fit_capacity(VmmOps::pool_bytes(&*self.be))
+            .fit_capacity(self.device.pool_bytes())
             .map_err(EnsureError::Load)?;
         if avail < need {
             return Err(EnsureError::WontFit { need, free: avail });
@@ -1195,7 +1435,7 @@ impl ModelManager {
                 return;
             };
             let m = mgr.managed(&slug).expect("candidate is managed");
-            VmmOps::pool_trim(&*mgr.be, m.plan.slab_reusable());
+            mgr.device.pool_trim(m.plan.slab_reusable());
             let t0 = Instant::now();
             match mgr.load_model(&m).await {
                 Ok(()) => {
@@ -1209,7 +1449,7 @@ impl ModelManager {
     /// Hottest (most-recently-requested) non-resident model whose requirement
     /// fits free VRAM plus usable pooled chunks — no eviction considered.
     fn preload_candidate(&self) -> Option<String> {
-        let pool = VmmOps::pool_bytes(&*self.be);
+        let pool = self.device.pool_bytes();
         let (free, headroom) = (self.free_vram().ok()?, self.planned_headroom().ok()?);
         let state = self.state.upgrade()?;
         let last_use = self.last_use.lock();
@@ -1291,7 +1531,7 @@ impl ModelManager {
             crate::tts::serving::release(&bundle.dir, device);
             // Their worker threads drop the packet runtimes once the last request lets go.
             let deadline = Instant::now() + SIDECAR_RELEASE_WAIT;
-            while crate::exec::gpu::packet_exec::resident_in(&bundle.dir, device) {
+            while self.device.is_sibling_resident(&bundle.dir) {
                 if Instant::now() > deadline {
                     tracing::error!(%slug, "sibling packets still resident after evict — VRAM leak");
                     break;
@@ -1300,7 +1540,7 @@ impl ModelManager {
             }
         }
         let unload_ms = ms(t1);
-        let (free, _) = self.be.mem_info().map_err(EnsureError::Load)?;
+        let (free, _) = self.device.mem_info().map_err(EnsureError::Load)?;
         tracing::info!(%slug, drain_ms, unload_ms, engine_ms, free_gib = gib(free), "model evicted");
         Ok((drain_ms, unload_ms))
     }
@@ -1350,26 +1590,22 @@ impl ModelManager {
             }
         }
 
-        let (free_before, _) = self.be.mem_info().map_err(EnsureError::Load)?;
-        let pool_before = VmmOps::pool_bytes(&*self.be);
-        let be = Arc::clone(&self.be);
+        let (free_before, _) = self.device.mem_info().map_err(EnsureError::Load)?;
+        let pool_before = self.device.pool_bytes();
+        let device = Arc::clone(&self.device);
         let (dir, ckpt) = (m.dir.clone(), m.ckpt.clone());
         let engine = on_own_thread("plow-load", move || {
-            let mut engine = crate::exec::gpu::GpuEngine::load(be, &dir, &ckpt)?;
-            if crate::config::RuntimeConfig::get().nv.spec {
-                match engine.spec_serve_enable(&dir) {
-                    Ok(limits) => tracing::info!(?limits, "speculative decoding on"),
-                    Err(e) => tracing::warn!(error = %e, "PLOW_SPEC set but speculative decoding unavailable"),
-                }
-            }
-            Ok(engine)
+            device.load_engine(&dir, &ckpt)
         })
         .await
         .and_then(|engine| engine)
         .map_err(EnsureError::Load)?;
-        mux::check_speech_packet(&engine).map_err(EnsureError::Load)?;
-        let (free_after, _) = self.be.mem_info().map_err(EnsureError::Load)?;
-        let pool_after = VmmOps::pool_bytes(&*self.be);
+        #[cfg(feature = "cuda")]
+        if let crate::serve::engine::ServeEngine::Cuda(ref gpu) = engine {
+            mux::check_speech_packet(gpu).map_err(EnsureError::Load)?;
+        }
+        let (free_after, _) = self.device.mem_info().map_err(EnsureError::Load)?;
+        let pool_after = self.device.pool_bytes();
 
         // First-load calibration: measured footprint minus the planned tensor
         // bytes = module/table/allocator overhead for this assets dir. Pool
@@ -1394,7 +1630,7 @@ impl ModelManager {
 
         state.install_gpu_engine(
             m.slug.clone(),
-            crate::serve::engine::ServeEngine::Cuda(engine),
+            engine,
         );
         // Sibling packets (ASR encoder, codec, vocoder) bind with the engine and before its mux,
         // so residency and the planner's charge cover them, a request never binds them itself,
@@ -1417,25 +1653,14 @@ impl ModelManager {
     }
 }
 
-/// Refuse a bundle compiled for tensor parallelism.
-///
-/// A `ModelManager` owns exactly ONE backend and `GpuEngine::load` takes one
-/// backend, so the CUDA serving engine is single-device. Placement can form a
-/// group several ordinals wide (`--place` sizes groups by the widest declared
-/// TP degree), but only the group's first device would ever be handed to the
-/// engine — so a TP4 bundle would load as if it were TP1: no peer buffers, no
-/// rank wiring, one quarter of the weights, and confident wrong output rather
-/// than an error.
-///
-/// AMD serves TP through `AmdServe`, which is deliberately not under this
-/// manager. Until a CUDA TP engine exists, refusing is the honest answer.
-fn check_single_device(slug: &str, dir: &Path) -> Result<()> {
+/// Refuse a bundle compiled for tensor parallelism when the device does not support TP.
+fn check_device_tp(device: &dyn ManagerDevice, slug: &str, dir: &Path) -> Result<()> {
     let tp = tp_degree(dir)?;
-    if tp > 1 {
+    if tp > 1 && !device.supports_tp() {
         return Err(RuntimeError::Rejected(format!(
-            "{slug} declares tensor-parallel degree {tp}, and the CUDA serving engine is \
+            "{slug} declares tensor-parallel degree {tp}, and this model manager device is \
              single-device (one backend per engine). Serving it here would load one shard \
-             and answer with it. Compile a TP1 bundle, or serve it on the AMD engine."
+             and answer with it. Compile a TP1 bundle, or serve it on a backend supporting TP (e.g. AMD HSA)."
         )));
     }
     Ok(())

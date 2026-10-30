@@ -23,7 +23,7 @@ mod golden_tests;
 #[allow(dead_code)]
 pub mod head;
 pub mod logprobs;
-#[cfg(feature = "cuda")]
+#[cfg(any(feature = "cuda", feature = "hsa", feature = "cpu"))]
 pub mod manager;
 pub mod mm;
 pub mod models;
@@ -545,7 +545,7 @@ pub struct AppState {
     /// manager holds is already per-card — one free-VRAM figure, one slab pool,
     /// one LRU order, one switch lock — so instancing it per group keeps a load
     /// on GPU 1 from serializing behind a switch on GPU 0.
-    #[cfg(feature = "cuda")]
+    #[cfg(any(feature = "cuda", feature = "hsa", feature = "cpu"))]
     managers: std::sync::OnceLock<Vec<Arc<manager::ModelManager>>>,
     /// slug → device-group index. The request path reads it to find the group
     /// serving a model; the control plane reports it. NOT vendor-gated: the
@@ -646,7 +646,7 @@ impl AppState {
             #[cfg(feature = "cuda")]
             kv_store: RwLock::new(FxHashMap::default()),
             mm: RwLock::new(FxHashMap::default()),
-            #[cfg(feature = "cuda")]
+            #[cfg(any(feature = "cuda", feature = "hsa", feature = "cpu"))]
             managers: std::sync::OnceLock::new(),
             slug_group: RwLock::new(FxHashMap::default()),
             turns: std::sync::OnceLock::new(),
@@ -787,7 +787,7 @@ impl AppState {
 
     /// Make some rank of `set` serve: a no-op while one does; otherwise load one whose residency
     /// admits (S1 switch on its group).
-    #[cfg(feature = "cuda")]
+    #[cfg(any(feature = "cuda", feature = "hsa", feature = "cpu"))]
     pub async fn dp_admit(&self, set: &dp::DpSet) -> std::result::Result<(), manager::EnsureError> {
         if set.ranks.iter().any(|r| r.is_up()) {
             return Ok(());
@@ -947,14 +947,14 @@ impl AppState {
     }
 
     /// Install the per-group residency managers (once, at startup).
-    #[cfg(feature = "cuda")]
+    #[cfg(any(feature = "cuda", feature = "hsa", feature = "cpu"))]
     pub fn install_managers(&self, m: Vec<Arc<manager::ModelManager>>) {
-        self.install_device_turns(m.len(), true);
+        self.install_device_turns(m.len(), cfg!(feature = "cuda"));
         let _ = self.managers.set(m);
     }
 
     /// Install one manager — the single-group case, and what tests use.
-    #[cfg(feature = "cuda")]
+    #[cfg(any(feature = "cuda", feature = "hsa", feature = "cpu"))]
     pub fn install_manager(&self, m: Arc<manager::ModelManager>) {
         self.install_managers(vec![m]);
     }
@@ -1036,7 +1036,7 @@ impl AppState {
     }
 
     /// Every installed manager, one per device group.
-    #[cfg(feature = "cuda")]
+    #[cfg(any(feature = "cuda", feature = "hsa", feature = "cpu"))]
     pub fn managers(&self) -> &[Arc<manager::ModelManager>] {
         self.managers.get().map(Vec::as_slice).unwrap_or(&[])
     }
@@ -1046,7 +1046,7 @@ impl AppState {
     /// Placement is the authority; the fallback scan exists for managers
     /// installed without a placement pass (tests, and the single-group case),
     /// and for a slug registered at runtime before its group was recorded.
-    #[cfg(feature = "cuda")]
+    #[cfg(any(feature = "cuda", feature = "hsa", feature = "cpu"))]
     pub fn manager_for(&self, slug: &str) -> Option<&Arc<manager::ModelManager>> {
         let managers = self.managers();
         if let Some(g) = self.slug_group(slug) {
@@ -1059,7 +1059,7 @@ impl AppState {
 
     /// The manager a NEW model should be registered with: the named group, or
     /// the one with the most free memory when the caller did not name one.
-    #[cfg(feature = "cuda")]
+    #[cfg(any(feature = "cuda", feature = "hsa", feature = "cpu"))]
     pub fn manager_for_new(
         &self,
         group: Option<usize>,
@@ -1378,6 +1378,13 @@ pub fn app(state: Arc<AppState>) -> Router {
         .route("/v1/completions", post(completion::completions))
         .route("/tokenize", post(tokenize::tokenize))
         .route("/detokenize", post(tokenize::detokenize))
+        .route("/v1/tokenize", post(tokenize::tokenize))
+        .route("/v1/detokenize", post(tokenize::detokenize))
+        .route("/models", get(models::list_models))
+        .route(
+            "/models/:id",
+            get(models::get_model).fallback(models::model_route_fallback),
+        )
         .route("/v1/models", get(models::list_models))
         // GET only, with a 404 fallback for every other method. The admin
         // routes live at `/v1/models/load|unload|status`, and a bare
@@ -1394,6 +1401,7 @@ pub fn app(state: Arc<AppState>) -> Router {
         // `/healthz`, so all of them got a 404 from a healthy server.
         .route("/health", get(healthz))
         .route("/healthz", get(healthz))
+        .route("/version", get(version_handler))
         .route("/metrics", get(metrics_handler))
         .route("/v1/metrics", get(metrics_snapshot_handler))
         .route("/trace", get(trace_handler))
@@ -1441,6 +1449,16 @@ async fn healthz(
             ),
         )
     }
+}
+
+/// `GET /version` — vLLM parity version endpoint.
+async fn version_handler() -> (axum::http::StatusCode, axum::Json<serde_json::Value>) {
+    (
+        axum::http::StatusCode::OK,
+        axum::Json(serde_json::json!({
+            "version": env!("CARGO_PKG_VERSION")
+        })),
+    )
 }
 
 /// Models that can no longer serve (a fatal device fault or an ASR encoder exit), and DP ranks

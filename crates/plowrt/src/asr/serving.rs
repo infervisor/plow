@@ -33,6 +33,24 @@ mod realtime;
 mod shared;
 #[cfg(feature = "cuda")]
 pub use shared::{bind, preload, release};
+#[cfg(feature = "cuda")]
+pub(crate) use shared::is_audio_lm;
+
+#[cfg(not(feature = "cuda"))]
+pub(crate) fn is_audio_lm(_dir: &std::path::Path) -> crate::Result<bool> {
+    Ok(false)
+}
+
+#[cfg(not(feature = "cuda"))]
+pub fn bind(_state: &crate::serve::AppState, _slug: &str) -> crate::Result<()> {
+    Ok(())
+}
+#[cfg(not(feature = "cuda"))]
+pub fn preload(_state: &crate::serve::AppState, _slug: &str) -> crate::Result<()> {
+    Ok(())
+}
+#[cfg(not(feature = "cuda"))]
+pub fn release(_dir: &std::path::Path, _device: u8) {}
 
 const BATCH_FORMATION_WINDOW: Duration = Duration::from_millis(5);
 
@@ -953,6 +971,11 @@ pub fn packet_model_names() -> Vec<String> {
     names
 }
 
+#[cfg(not(feature = "cuda"))]
+pub fn packet_model_names() -> Vec<String> {
+    Vec::new()
+}
+
 /// No packet-model transcription queued or running (the serve drain condition).
 #[cfg(feature = "cuda")]
 pub fn packet_models_idle() -> bool {
@@ -962,10 +985,17 @@ pub fn packet_models_idle() -> bool {
     })
 }
 
+#[cfg(not(feature = "cuda"))]
+pub fn packet_models_idle() -> bool {
+    true
+}
+
 /// Whether `slug` serves `/v1/audio/transcriptions` on `plowrt serve`.
-#[cfg(feature = "cuda")]
 pub fn serves_audio(state: &crate::serve::AppState, slug: &str) -> bool {
-    shared::serves_audio(state, slug)
+    let Ok(bundle) = state.registry.get(slug) else {
+        return false;
+    };
+    bundle.is_audio()
 }
 
 fn configured_vad() -> Option<Arc<crate::asr::vad::Vad>> {
@@ -1145,10 +1175,10 @@ async fn transcribe_upload(
     let format = fields
         .remove("response_format")
         .unwrap_or_else(|| "json".into());
-    if !matches!(format.as_str(), "json" | "text") {
+    if !matches!(format.as_str(), "json" | "text" | "verbose_json") {
         return failure(
             StatusCode::BAD_REQUEST,
-            "response_format must be json or text",
+            "response_format must be json, text or verbose_json",
         );
     }
     if fields
@@ -1244,6 +1274,16 @@ async fn transcribe_upload(
             )])
         } else if format == "text" {
             String::new().into_response()
+        } else if format == "verbose_json" {
+            let dur = samples.len() as f64 / SAMPLE_RATE as f64;
+            let lang = language.as_deref().unwrap_or("english");
+            Json(json!({
+                "task": "transcribe",
+                "language": lang,
+                "duration": dur,
+                "text": "",
+            }))
+            .into_response()
         } else {
             Json(json!({"text": ""})).into_response()
         };
@@ -1336,6 +1376,8 @@ async fn transcribe_upload(
     if stream {
         opts.deltas = Some(delta_tx);
     }
+    let samples_len = samples.len();
+    let reply_lang = language.clone();
     let work = match route.submit(samples, language, context, cancel.0.clone(), opts) {
         Ok(work) => work,
         Err(SubmitError::Full) => return busy("ASR queue full"),
@@ -1401,6 +1443,21 @@ async fn transcribe_upload(
     }
     let mut response = match result {
         Ok(Ok(result)) if format == "text" => result.text.into_response(),
+        Ok(Ok(result)) if format == "verbose_json" => {
+            let dur = samples_len as f64 / SAMPLE_RATE as f64;
+            let lang = result
+                .language
+                .as_deref()
+                .or(reply_lang.as_deref())
+                .unwrap_or("english");
+            Json(json!({
+                "task": "transcribe",
+                "language": lang,
+                "duration": dur,
+                "text": result.text,
+            }))
+            .into_response()
+        }
         Ok(Ok(result)) if recorded => {
             Json(json!({"text":result.text,"final":finals,"offset":recorded_samples}))
                 .into_response()
@@ -2993,6 +3050,19 @@ mod tests {
             &response.into_body().collect().await.unwrap().to_bytes()[..],
             br#"{"text":""}"#
         );
+        let verbose_silent = upload(
+            "/v1/audio/transcriptions",
+            &[("model", "test"), ("response_format", "verbose_json")],
+            &[0.0; 16_000],
+        );
+        let response = app.clone().oneshot(verbose_silent).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let val: serde_json::Value =
+            serde_json::from_slice(&response.into_body().collect().await.unwrap().to_bytes()).unwrap();
+        assert_eq!(val["task"], "transcribe");
+        assert_eq!(val["text"], "");
+        assert_eq!(val["duration"], 1.0);
+        assert_eq!(val["language"], "english");
         let response = app.clone().oneshot(text(&signal)).await.unwrap();
         assert_eq!(
             &response.into_body().collect().await.unwrap().to_bytes()[..],
@@ -3280,6 +3350,68 @@ mod tests {
                 expected
             );
         }
+        let response = app.clone().oneshot(request("test", "verbose_json")).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let val: serde_json::Value = serde_json::from_slice(
+            &response.into_body().collect().await.unwrap().to_bytes(),
+        )
+        .unwrap();
+        assert_eq!(val["task"], "transcribe");
+        assert_eq!(val["text"], "hello");
+        assert_eq!(val["duration"], 0.5);
+
+        struct MultilingualFake;
+        impl Transcriber for MultilingualFake {
+            fn language(&self, language: Option<&str>) -> crate::Result<Option<String>> {
+                Ok(match language {
+                    Some("zh") | Some("chinese") => Some("chinese".into()),
+                    Some(other) => Some(other.into()),
+                    None => Some("french".into()),
+                })
+            }
+            fn transcribe(
+                &mut self,
+                _: &[f32],
+                language: Option<&str>,
+                _: &str,
+                _: &AtomicBool,
+            ) -> crate::Result<Transcript> {
+                Ok(Transcript {
+                    text: "bonjour".into(),
+                    language: self.language(language)?,
+                })
+            }
+        }
+        let multi_app = AsrServer::new("multi".into(), MultilingualFake).router(false);
+        // Language omitted -> detected "french" reported
+        let req = upload(
+            "/v1/audio/transcriptions",
+            &[("model", "multi"), ("response_format", "verbose_json")],
+            &[0.1; 8000],
+        );
+        let resp = multi_app.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let val: serde_json::Value =
+            serde_json::from_slice(&resp.into_body().collect().await.unwrap().to_bytes()).unwrap();
+        assert_eq!(val["language"], "french");
+        assert_eq!(val["text"], "bonjour");
+
+        // Language supplied as "zh" -> normalized "chinese" reported
+        let req = upload(
+            "/v1/audio/transcriptions",
+            &[
+                ("model", "multi"),
+                ("language", "zh"),
+                ("response_format", "verbose_json"),
+            ],
+            &[0.1; 8000],
+        );
+        let resp = multi_app.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let val: serde_json::Value =
+            serde_json::from_slice(&resp.into_body().collect().await.unwrap().to_bytes()).unwrap();
+        assert_eq!(val["language"], "chinese");
+
         assert_eq!(
             app.clone()
                 .oneshot(request("missing", "json"))
