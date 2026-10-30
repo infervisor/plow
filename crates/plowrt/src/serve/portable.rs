@@ -15,7 +15,7 @@ use rustc_hash::FxHashMap;
 use std::{
     path::{Path, PathBuf},
     sync::Arc,
-    time::Instant,
+    time::{Duration, Instant},
 };
 
 pub struct PortableManager {
@@ -158,7 +158,26 @@ impl PortableManager {
         state.set_residency(&req.model, Residency::Unloading);
         let started = Instant::now();
         if let Some(m) = state.remove_mux(&req.model) {
-            m.preempt().await;
+            match req.drain_timeout_ms {
+                Some(0) => m.preempt().await,
+                Some(ms) => {
+                    let deadline = Duration::from_millis(ms);
+                    if tokio::time::timeout(deadline, m.drain()).await.is_err() {
+                        tracing::info!(model = %req.model, timeout_ms = ms, "drain deadline passed — preempting live generations");
+                        m.preempt().await;
+                    }
+                }
+                None => match crate::config::RuntimeConfig::get().drain_timeout_ms() {
+                    None => m.drain().await,
+                    Some(ms) => {
+                        let deadline = Duration::from_millis(ms);
+                        if tokio::time::timeout(deadline, m.drain()).await.is_err() {
+                            tracing::info!(model = %req.model, timeout_ms = ms, "drain deadline passed — preempting live generations");
+                            m.preempt().await;
+                        }
+                    }
+                },
+            }
         }
         let stop_ms = started.elapsed().as_secs_f64() * 1000.0;
         let started = Instant::now();

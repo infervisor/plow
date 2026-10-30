@@ -21,6 +21,25 @@ pub mod realtime;
 pub mod ref_encoder;
 #[cfg(feature = "cuda")]
 pub mod serving;
+#[cfg(not(feature = "cuda"))]
+pub mod serving {
+    use std::path::Path;
+    use crate::serve::AppState;
+
+    pub fn preload(_state: &AppState) -> Result<(), String> {
+        Ok(())
+    }
+    pub fn bind(_state: &AppState, _slug: &str) -> Result<(), String> {
+        Ok(())
+    }
+    pub fn release(_dir: &Path, _device: u8) {}
+    pub fn serves_speech(_slug: &str, _dir: &Path) -> bool {
+        false
+    }
+    pub fn speech_spec(_slug: &str, _dir: &Path) -> Option<serde_json::Value> {
+        None
+    }
+}
 #[cfg(feature = "cuda")]
 pub mod text_encoder;
 #[cfg(feature = "cuda")]

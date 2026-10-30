@@ -67,22 +67,17 @@ fn speech_card(state: &AppState, canonical: &str) -> Option<serde_json::Value> {
     }
 }
 
-/// The routes `canonical` serves: its card's `x_plow_endpoints`. Exact for a bound (resident)
-/// model; a managed model that is not resident reads as a text model until its switch binds it.
+/// The routes `canonical` serves: its card's `x_plow_endpoints`.
 pub(crate) fn endpoints(state: &AppState, canonical: &str) -> Vec<&'static str> {
-    #[cfg(feature = "cuda")]
-    if crate::tts::serving::serves_speech(state, canonical) {
-        // A speech LM's tokens are codec / speech ids: it serves audio, not text.
-        return vec!["audio/speech"];
-    } else if crate::asr::serving::serves_audio(state, canonical)
-        || crate::asr::serving::packet_model_names()
-            .iter()
-            .any(|n| n == canonical)
+    if let Ok(bundle) = state.registry.get(canonical) {
+        return bundle.endpoints().to_vec();
+    }
+    if crate::asr::serving::packet_model_names()
+        .iter()
+        .any(|n| n == canonical)
     {
-        // An audio LM's prompt contract needs audio: transcription only, as a packet ASR card.
         return vec!["audio/transcriptions", "audio/transcriptions/stream"];
     }
-    let _ = (state, canonical);
     vec!["chat/completions", "completions"]
 }
 

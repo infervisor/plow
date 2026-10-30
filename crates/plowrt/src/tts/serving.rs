@@ -36,7 +36,6 @@ use crate::serve::stream::{self as stream_mod, StreamChunk};
 use crate::serve::AppState;
 
 #[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct SpeechRequest {
     pub model: String,
     /// At most [`super::MAX_INPUT_CHARS`] characters; a long input is spoken as sentence segments.
@@ -176,14 +175,7 @@ pub fn serves_speech(state: &AppState, slug: &str) -> bool {
     let Ok(bundle) = state.registry.get(slug) else {
         return false;
     };
-    guided_models()
-        .lock()
-        .iter()
-        .any(|((dir, _), g)| *dir == bundle.dir && g.is_some())
-        || speech_models()
-            .lock()
-            .iter()
-            .any(|((dir, _), m)| *dir == bundle.dir && m.is_some())
+    bundle.is_speech()
 }
 
 enum Pipeline {
@@ -225,11 +217,17 @@ fn bind_pipeline(
 /// `slug`'s [`SpeechSpec`] when it serves speech (its `/v1/models` card).
 pub fn speech_spec(state: &AppState, slug: &str) -> Option<SpeechSpec> {
     let bundle = state.registry.get(slug).ok()?;
-    match bound_pipeline(&bundle.dir, state.ordinal_of(slug))? {
-        Pipeline::Guided(g) => Some(g.spec.clone()),
-        Pipeline::Speech(m) => Some(m.spec(&**bundle.tokenizer()).clone()),
-        Pipeline::None => None,
+    if let Some(pipe) = bound_pipeline(&bundle.dir, state.ordinal_of(slug)) {
+        return match pipe {
+            Pipeline::Guided(g) => Some(g.spec.clone()),
+            Pipeline::Speech(m) => Some(m.spec(&**bundle.tokenizer()).clone()),
+            Pipeline::None => None,
+        };
     }
+    if let Ok(Some(s)) = SpeechContract::load(&bundle.dir) {
+        return Some(s.spec(&**bundle.tokenizer()));
+    }
+    None
 }
 
 /// Forget `dir`'s speech pipeline on `device`: its vocoder/codec threads exit, freeing their
