@@ -8652,6 +8652,8 @@ impl GpuEngine {
                         return Err(drain);
                     }
                 }
+                // A failed admission may have queued restores into this slot before it failed.
+                self.drain_before_unmap = true;
                 self.retire_slot(b, false);
                 let oom = matches!(error, RuntimeError::Oom(_)) || error.device_code() == Some(2);
                 // Parked live rings hold device memory no request owns; when
