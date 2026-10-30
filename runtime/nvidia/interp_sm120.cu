@@ -3620,7 +3620,7 @@ __device__ __forceinline__ void plow_gemv_prefetch(const PlowDevInst* in, void* 
     case PLOW_DOP_GEMV:
 #if PLOW_NV_GEMV_XK
         if (in->i[3] == 0u || in->i[3] == 8u)
-            if (const unsigned sb = gvmma_xk_sb(in->i[0], in->i[1], in->i[2], nblk)) {
+            if (const unsigned sb = gvmma_xk_sb(in->i[0], in->i[1], in->i[2], nblk, in->i[0] <= GV_MM_MAX)) {
                 if (slice < (in->i[1] >> 6) * sb)
                     gvmma_pf_xk((PLOW_NV_GEMV_PF_OPS & 1u) ? W(2) : nullptr, in->i[3] == 8u ? W(3) : nullptr,
                                 in->i[3] == 8u ? W(4) : nullptr, in->i[0], in->i[1], in->i[2], slice, sb);
@@ -3642,7 +3642,7 @@ __device__ __forceinline__ void plow_gemv_prefetch(const PlowDevInst* in, void* 
     case PLOW_DOP_GEMV_QKV:
 #if PLOW_NV_GEMV_XK && PLOW_NV_GEMV_XK_QKV
         if (!((in->i[1] | in->i[3]) & 63u))
-            if (const unsigned sb = gvmma_xk_sb(in->i[0], in->i[1] + in->i[3] + in->i[4], in->i[2], nblk)) {
+            if (const unsigned sb = gvmma_xk_sb(in->i[0], in->i[1] + in->i[3] + in->i[4], in->i[2], nblk, in->i[0] <= GV_MM_MAX)) {
                 const unsigned gn = (slice / sb) << 6, nq = in->i[1], nqk = nq + in->i[3];
                 if ((PLOW_NV_GEMV_PF_OPS & 4u) && slice < ((nqk + in->i[4]) >> 6) * sb)
                     gvmma_pf_xk(gn < nq ? W(2) : gn < nqk ? W(4) : W(6), nullptr, nullptr, in->i[0], 0u, in->i[2],

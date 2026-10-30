@@ -829,7 +829,7 @@ pub async fn ws_speech(
         })
 }
 
-async fn ws_speech_session(state: Arc<AppState>, mut socket: WebSocket, mut ids: RequestIds) {
+async fn ws_speech_session(state: Arc<AppState>, mut socket: WebSocket, handshake_ids: RequestIds) {
     while let Some(msg) = socket.recv().await {
         let text = match msg {
             Ok(Message::Text(t)) => t,
@@ -869,6 +869,7 @@ async fn ws_speech_session(state: Arc<AppState>, mut socket: WebSocket, mut ids:
             .tts
             .websocket_sessions
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let mut ids = handshake_ids.with_new_request();
         if let Err(e) = ids.apply_body(&req.route()) {
             let _ = socket
                 .send(Message::Text(
@@ -905,6 +906,8 @@ async fn ws_speech_session(state: Arc<AppState>, mut socket: WebSocket, mut ids:
 
         let mut stream = response.into_body().into_data_stream();
         let mut sent_any = false;
+        let mut stream_err: Option<String> = None;
+        let mut clean_eof = false;
         loop {
             tokio::select! {
                 chunk = stream.next() => {
@@ -916,7 +919,14 @@ async fn ws_speech_session(state: Arc<AppState>, mut socket: WebSocket, mut ids:
                             }
                         }
                         Some(Ok(_)) => {}
-                        _ => break,
+                        Some(Err(e)) => {
+                            stream_err = Some(e.to_string());
+                            break;
+                        }
+                        None => {
+                            clean_eof = true;
+                            break;
+                        }
                     }
                 }
                 msg = socket.recv() => {
@@ -930,7 +940,19 @@ async fn ws_speech_session(state: Arc<AppState>, mut socket: WebSocket, mut ids:
                 }
             }
         }
-        if sent_any {
+        if let Some(err_msg) = stream_err {
+            let _ = socket
+                .send(Message::Text(
+                    serde_json::json!({
+                        "error": {
+                            "message": err_msg,
+                            "type": "server_error"
+                        }
+                    })
+                    .to_string(),
+                ))
+                .await;
+        } else if clean_eof && sent_any {
             let _ = socket
                 .send(Message::Text(serde_json::json!({"done": true}).to_string()))
                 .await;
@@ -2634,5 +2656,49 @@ mod tests {
                 assert_eq!(seen, (0..total).collect::<Vec<_>>());
             }
         }
+    }
+
+    /// Request identity is reset per WebSocket message: turns and budgets do not leak across
+    /// requests, and each message obtains a fresh request id.
+    #[test]
+    fn websocket_request_ids_reset_per_message() {
+        use crate::serve::session::{RequestIds, RouteFields};
+        use axum::http::HeaderMap;
+
+        let handshake = RequestIds::from_headers(&HeaderMap::new()).unwrap();
+        let r1 = RouteFields {
+            metadata: Some(
+                serde_json::json!({
+                    "turn_id": "turn-1",
+                    "turn_budget_ms": 500,
+                })
+                .as_object()
+                .unwrap()
+                .clone(),
+            ),
+            ..Default::default()
+        };
+        let mut msg1_ids = handshake.with_new_request();
+        msg1_ids.apply_body(&r1).unwrap();
+        assert_eq!(msg1_ids.turn.as_deref(), Some("turn-1"));
+        assert_eq!(msg1_ids.budget_ms, Some(500));
+
+        let r2 = RouteFields {
+            metadata: Some(
+                serde_json::json!({
+                    "turn_id": "turn-2",
+                    "turn_budget_ms": 1000,
+                })
+                .as_object()
+                .unwrap()
+                .clone(),
+            ),
+            ..Default::default()
+        };
+        let mut msg2_ids = handshake.with_new_request();
+        msg2_ids.apply_body(&r2).unwrap();
+        assert_eq!(msg2_ids.turn.as_deref(), Some("turn-2"));
+        assert_eq!(msg2_ids.budget_ms, Some(1000));
+        assert_ne!(msg1_ids.request, msg2_ids.request);
     }
 }
