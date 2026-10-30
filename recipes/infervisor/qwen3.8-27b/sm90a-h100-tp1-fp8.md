@@ -1,6 +1,6 @@
 # qwen3.8-27b — sm90a-h100-tp1-fp8
 
-Status: **validated**. Reference: `infervisor/qwen3.8-27b:sm90a-h100-tp1-fp8`.
+Status: **emits**. Reference: `infervisor/qwen3.8-27b:sm90a-h100-tp1-fp8`.
 
 The command blocks below are generated from the recipe TOML by
 `scripts/render_recipe.py`; edit the TOML, not the blocks. Prose outside
